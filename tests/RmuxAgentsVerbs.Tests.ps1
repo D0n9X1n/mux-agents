@@ -194,6 +194,21 @@ Describe 'RmuxAgents part 2 messages and stop' {
         [IO.File]::Exists((Join-Path $folder 'notice.json')) | Should Be $true
     }
 
+    It 'B1 an agent committed after the pane snapshot is not marked lost and keeps its real exit notice' {
+        $fake = New-T2Fake 'race'
+        $caller = Resolve-RmuxAgentCaller -P $fake
+        $folder = New-T2Agent -Fake $fake -Caller $caller -Name 'late'
+        # The list-panes snapshot misses the agent, but its pane is live and tagged when probed.
+        Add-FakeRmuxRule -Fake $fake -Match '#\{pane_id\}\|#\{@agent-id\}$' -StdOut "%9|aaaaaaaaaaaa`n"
+        $null = Invoke-T2Verb $fake @('list')
+        [IO.File]::Exists((Join-Path $folder 'notice.json')) | Should Be $false
+        @((Invoke-T2Verb $fake @('read')).Reply.messages).Count | Should Be 0
+        Write-RmuxAgentJson -Path (Join-Path $folder 'launcher.json') -Value ([ordered]@{ pid = 1; exitCode = 7 })
+        Add-FakeRmuxRule -Fake $fake -Match '#\{pane_id\}\|#\{@agent-id\}$' -StdOut "|`n"
+        $messages = @((Invoke-T2Verb $fake @('read')).Reply.messages)
+        "$($messages.Count) $(($messages[0].text -split "`n")[1])" | Should BeExactly '1 late exited with code 7.'
+    }
+
     It 'B5 stop closes the pane, stops the recorded tree and posts stopped once' {
         $fake = New-T2Fake 'stop'
         $caller = Resolve-RmuxAgentCaller -P $fake

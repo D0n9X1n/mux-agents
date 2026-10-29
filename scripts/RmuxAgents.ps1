@@ -1013,6 +1013,10 @@ function Update-RmuxAgentNotices {
         $record = Get-RmuxAgentRecord -P $P -Caller $Caller -Id $id
         if (-not $record -or $record.session -cne $Caller.Session) { continue }
         Use-RmuxAgentLock -LockKey "notice|$($Caller.ServerKey)|$id" -LockAction {
+            # The snapshot may predate a spawn that committed since: ask the agent's own pane before calling it gone.
+            # A gone pane answers with empty fields.
+            $probe = Invoke-RmuxAgentNative -P $P -Arguments @('display-message', '-p', '-t', $record.pane, '#{pane_id}|#{@agent-id}') -AllowFailure
+            if ($probe.ExitCode -eq 0 -and ([string]$probe.StdOut).TrimEnd("`r`n") -ceq "$($record.pane)|$id") { return }
             $exit = Read-RmuxAgentJson -Path (Join-Path $folder 'launcher.json')
             if ($exit -and $null -ne $exit.exitCode) { $null = Add-RmuxAgentNotice -P $P -Caller $Caller -Record $record -Kind exited -ExitCode $exit.exitCode }
             else { $null = Add-RmuxAgentNotice -P $P -Caller $Caller -Record $record -Kind lost }
