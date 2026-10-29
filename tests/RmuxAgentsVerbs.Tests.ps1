@@ -14,6 +14,8 @@ function New-T2Fake {
     $fake = New-FakeRmuxAgentProviders -Caller $Caller -Root (Join-Path $TestDrive $Name)
     Add-FakeRmuxRule -Fake $fake -Match '#\{pane_height\}$' -StdOut "40`n"
     Add-FakeRmuxRule -Fake $fake -Match '#\{session_id\}\|#\{@agent-id\}$' -StdOut "`$3|`n"
+    # A recorded agent pane that the snapshot missed answers the gone-pane probe as gone unless a test says otherwise.
+    Add-FakeRmuxRule -Fake $fake -Match '#\{pane_id\}\|#\{@agent-id\}$' -StdOut "|`n"
     $fake
 }
 
@@ -207,6 +209,19 @@ Describe 'RmuxAgents part 2 messages and stop' {
         Add-FakeRmuxRule -Fake $fake -Match '#\{pane_id\}\|#\{@agent-id\}$' -StdOut "|`n"
         $messages = @((Invoke-T2Verb $fake @('read')).Reply.messages)
         "$($messages.Count) $(($messages[0].text -split "`n")[1])" | Should BeExactly '1 late exited with code 7.'
+    }
+
+    It 'B1 a failed pane probe posts nothing; the next read decides' {
+        $fake = New-T2Fake 'probe failure'
+        $caller = Resolve-RmuxAgentCaller -P $fake
+        $folder = New-T2Agent -Fake $fake -Caller $caller -Name 'flaky'
+        Add-FakeRmuxRule -Fake $fake -Match '#\{pane_id\}\|#\{@agent-id\}$' -ExitCode 1
+        (Invoke-T2Verb $fake @('list')).Code | Should Be 0
+        [IO.File]::Exists((Join-Path $folder 'notice.json')) | Should Be $false
+        Write-RmuxAgentJson -Path (Join-Path $folder 'launcher.json') -Value ([ordered]@{ pid = 1; exitCode = 7 })
+        Add-FakeRmuxRule -Fake $fake -Match '#\{pane_id\}\|#\{@agent-id\}$' -StdOut "|`n"
+        $messages = @((Invoke-T2Verb $fake @('read')).Reply.messages)
+        "$($messages.Count) $(($messages[0].text -split "`n")[1])" | Should BeExactly '1 flaky exited with code 7.'
     }
 
     It 'B5 stop closes the pane, stops the recorded tree and posts stopped once' {
