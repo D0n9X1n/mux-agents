@@ -931,9 +931,9 @@ function ConvertTo-RmuxAgentMessageText {
 }
 
 function Add-RmuxAgentMail {
-    # Appends one message to Key's mailbox under the mailbox lock and returns its id. A torn last line (no LF) from an
-    # interrupted append is sealed first, so it never joins the new message. With MessageId, a mailbox whose complete,
-    # parsable lines already hold that id is left as it is, so a retried post is never delivered twice.
+    # Appends one message to Key's mailbox under the mailbox lock and returns its id. A last line without LF, left by an
+    # interrupted append, gets its LF first, so it never joins the new message; read skips it if it does not parse. With
+    # MessageId, a mailbox with a parsable line holding that id, the last line included, gets no second copy.
     param([Parameter(Mandatory)]$P, [Parameter(Mandatory)]$Caller, [Parameter(Mandatory)][string]$Key, [Parameter(Mandatory)][string]$From, [Parameter(Mandatory)][string]$FromPane, [Parameter(Mandatory)][AllowEmptyString()][string]$Body, [string]$MessageId)
     $state = Get-RmuxAgentStateDirectory -P $P -Caller $Caller
     $messageId = if ($MessageId) { $MessageId } else { [guid]::NewGuid().ToString('N').Substring(0, 8) }
@@ -943,13 +943,15 @@ function Add-RmuxAgentMail {
         # Assigned, not returned from an if: PowerShell would unroll the bytes, and an empty array would become $null.
         [byte[]]$existing = [byte[]]::new(0)
         if (Test-Path -LiteralPath $box) { $existing = [IO.File]::ReadAllBytes($box) }
-        $complete = [Array]::LastIndexOf($existing, [byte]10) + 1
-        if ($MessageId -and $complete) {
-            foreach ($stored in [Text.Encoding]::UTF8.GetString($existing, 0, $complete).Split("`n", [StringSplitOptions]::RemoveEmptyEntries)) {
-                if ((Test-RmuxAgentJsonLine $stored) -and (ConvertFrom-Json -InputObject $stored).id -ceq $MessageId) { return }
+        $torn = $existing.Length -gt ([Array]::LastIndexOf($existing, [byte]10) + 1)
+        if ($torn) { $line = "`n" + $line }
+        if ($MessageId) {
+            foreach ($stored in [Text.Encoding]::UTF8.GetString($existing).Split("`n", [StringSplitOptions]::RemoveEmptyEntries)) {
+                # Already delivered: only the missing LF is written, so read can return it.
+                if ((Test-RmuxAgentJsonLine $stored) -and (ConvertFrom-Json -InputObject $stored).id -ceq $MessageId) { $line = $(if ($torn) { "`n" } else { '' }); break }
             }
         }
-        if ($existing.Length -gt $complete) { $line = "`n" + $line }
+        if (-not $line) { return }
         $stream = [IO.File]::Open($box, [IO.FileMode]::Append, [IO.FileAccess]::Write, [IO.FileShare]::Read)
         try { $bytes = [Text.Encoding]::UTF8.GetBytes($line); $stream.Write($bytes, 0, $bytes.Length) } finally { $stream.Dispose() }
     }

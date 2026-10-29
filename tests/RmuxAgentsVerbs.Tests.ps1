@@ -181,6 +181,19 @@ Describe 'RmuxAgents part 2 messages and stop' {
         (@((Invoke-T2Verb $fake @('read')).Reply.messages) | ForEach-Object { ($_.text -split "`n")[1] }) -join '|' | Should BeExactly 'after'
     }
 
+    It 'B1 a complete notice line that lost only its LF is finished, not posted again' {
+        $fake = New-T2Fake 'no lf'
+        $caller = Resolve-RmuxAgentCaller -P $fake
+        $folder = New-T2Agent -Fake $fake -Caller $caller -Name 'done'
+        Write-RmuxAgentJson -Path (Join-Path $folder 'launcher.json') -Value ([ordered]@{ pid = 1; exitCode = 7 })
+        $box = [IO.Path]::Combine((Get-RmuxAgentStateDirectory -P $fake -Caller $caller), 'mail', 'pane-1.jsonl')
+        [IO.File]::WriteAllText($box, '{"id":"exit-aaaaaaaaaaaa","from":"done","pane":"%9","at":"x","body":"done exited with code 7."}')
+        (Invoke-T2Verb $fake @('list')).Code | Should Be 0
+        $messages = @((Invoke-T2Verb $fake @('read')).Reply.messages)
+        "$($messages.Count) $(($messages[0].text -split "`n")[1])" | Should BeExactly '1 done exited with code 7.'
+        [IO.File]::Exists((Join-Path $folder 'notice.json')) | Should Be $true
+    }
+
     It 'B5 stop closes the pane, stops the recorded tree and posts stopped once' {
         $fake = New-T2Fake 'stop'
         $caller = Resolve-RmuxAgentCaller -P $fake
