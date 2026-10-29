@@ -931,13 +931,16 @@ function ConvertTo-RmuxAgentMessageText {
 }
 
 function Add-RmuxAgentMail {
-    # Appends one message to Key's mailbox under the mailbox lock and returns its id.
-    param([Parameter(Mandatory)]$P, [Parameter(Mandatory)]$Caller, [Parameter(Mandatory)][string]$Key, [Parameter(Mandatory)][string]$From, [Parameter(Mandatory)][string]$FromPane, [Parameter(Mandatory)][AllowEmptyString()][string]$Body)
+    # Appends one message to Key's mailbox under the mailbox lock and returns its id. With MessageId, a mailbox that
+    # already holds that id is left as it is, so a retried post is never delivered twice.
+    param([Parameter(Mandatory)]$P, [Parameter(Mandatory)]$Caller, [Parameter(Mandatory)][string]$Key, [Parameter(Mandatory)][string]$From, [Parameter(Mandatory)][string]$FromPane, [Parameter(Mandatory)][AllowEmptyString()][string]$Body, [string]$MessageId)
     $state = Get-RmuxAgentStateDirectory -P $P -Caller $Caller
-    $messageId = [guid]::NewGuid().ToString('N').Substring(0, 8)
+    $messageId = if ($MessageId) { $MessageId } else { [guid]::NewGuid().ToString('N').Substring(0, 8) }
     $line = (ConvertTo-RmuxAgentJsonText ([ordered]@{ id = $messageId; from = $From; pane = $FromPane; at = (& $P.Now).ToString('o'); body = $Body })) + "`n"
     Use-RmuxAgentLock -LockKey "mail|$($Caller.ServerKey)|$Key" -LockAction {
-        $stream = [IO.File]::Open([IO.Path]::Combine($state, 'mail', "$Key.jsonl"), [IO.FileMode]::Append, [IO.FileAccess]::Write, [IO.FileShare]::Read)
+        $box = [IO.Path]::Combine($state, 'mail', "$Key.jsonl")
+        if ($MessageId -and (Test-Path -LiteralPath $box) -and [IO.File]::ReadAllText($box).Contains('{"id":"' + $MessageId + '"')) { return }
+        $stream = [IO.File]::Open($box, [IO.FileMode]::Append, [IO.FileAccess]::Write, [IO.FileShare]::Read)
         try { $bytes = [Text.Encoding]::UTF8.GetBytes($line); $stream.Write($bytes, 0, $bytes.Length) } finally { $stream.Dispose() }
     }
     $messageId
@@ -968,19 +971,20 @@ function Read-RmuxAgentMail {
 
 function Add-RmuxAgentNotice {
     # Posts the agent's one exit notice (exited, stopped or lost) to its parent's mailbox; false when already posted.
-    # The caller holds the notice lock for the agent.
+    # The caller holds the notice lock for the agent. The message goes first and notice.json last, so a failed post is
+    # retried by the next list, read or spawn; the fixed message id keeps a retry after a failed marker write single.
     param([Parameter(Mandatory)]$P, [Parameter(Mandatory)]$Caller, [Parameter(Mandatory)]$Record, [Parameter(Mandatory)][ValidateSet('exited', 'stopped', 'lost')][string]$Kind, $ExitCode)
     $folder = [IO.Path]::Combine($P.StateRoot, $Caller.ServerKey, 'agents', $Record.id)
     $marker = Join-Path $folder 'notice.json'
     if (Test-Path -LiteralPath $marker) { return $false }
-    Write-RmuxAgentJson -Path $marker -Value ([ordered]@{ kind = $Kind; exitCode = $ExitCode; at = (& $P.Now).ToString('o') })
     $body = switch ($Kind) {
         'exited' { "$($Record.name) exited with code $ExitCode." }
         'stopped' { "$($Record.name) was stopped." }
         'lost' { "$($Record.name) is gone: its pane closed without an exit record." }
     }
     $parentTag = if ($Record.parentAgentId) { [string]$Record.parentAgentId } else { '' }
-    $null = Add-RmuxAgentMail -P $P -Caller $Caller -Key (Get-RmuxAgentMailboxKey -Pane $Record.parentPane -Tag $parentTag) -From $Record.name -FromPane $Record.pane -Body $body
+    $null = Add-RmuxAgentMail -P $P -Caller $Caller -Key (Get-RmuxAgentMailboxKey -Pane $Record.parentPane -Tag $parentTag) -From $Record.name -FromPane $Record.pane -Body $body -MessageId "exit-$($Record.id)"
+    Write-RmuxAgentJson -Path $marker -Value ([ordered]@{ kind = $Kind; exitCode = $ExitCode; at = (& $P.Now).ToString('o') })
     $true
 }
 

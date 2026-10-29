@@ -150,6 +150,23 @@ Describe 'RmuxAgents part 2 messages and stop' {
         @((Invoke-T2Verb $fake @('read')).Reply.messages).Count | Should Be 0
     }
 
+    It 'B1 a notice whose mailbox append fails is posted on the next read, and a lost marker never posts twice' {
+        $fake = New-T2Fake 'notice retry'
+        $caller = Resolve-RmuxAgentCaller -P $fake
+        $folder = New-T2Agent -Fake $fake -Caller $caller -Name 'done'
+        Write-RmuxAgentJson -Path (Join-Path $folder 'launcher.json') -Value ([ordered]@{ pid = 1; exitCode = 7 })
+        $box = [IO.Path]::Combine((Get-RmuxAgentStateDirectory -P $fake -Caller $caller), 'mail', 'pane-1.jsonl')
+        $held = [IO.File]::Open($box, [IO.FileMode]::OpenOrCreate, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None)
+        try { (Invoke-T2Verb $fake @('list')).Code | Should Be 1 }
+        finally { $held.Dispose() }
+        [IO.File]::Exists((Join-Path $folder 'notice.json')) | Should Be $false
+        $null = Invoke-T2Verb $fake @('list')
+        Remove-Item -LiteralPath (Join-Path $folder 'notice.json')
+        $null = Invoke-T2Verb $fake @('list')
+        $messages = @((Invoke-T2Verb $fake @('read')).Reply.messages)
+        "$($messages.Count) $(($messages[0].text -split "`n")[1])" | Should BeExactly '1 done exited with code 7.'
+    }
+
     It 'B5 stop closes the pane, stops the recorded tree and posts stopped once' {
         $fake = New-T2Fake 'stop'
         $caller = Resolve-RmuxAgentCaller -P $fake
