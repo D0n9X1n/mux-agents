@@ -24,17 +24,17 @@ The current code depends on Terminal Profiles in these places, each to be replac
 - `RmuxAgents.ps1` dot-sources `config\powershell\RmuxStore.ps1` (1012 lines; the managed RMUX store) and AST-imports `Resolve-RmuxCommand` from `SharedProfile.ps1`. Replace with plain `rmux` calls on the caller's own socket.
 - State lives under `%LOCALAPPDATA%\TerminalProfiles\rmux-agents\state`, and lock mutexes are named `Local\TerminalProfiles-RmuxAgents-*`. Use an `rmux-agents` name.
 - The launcher runs the clients through the Terminal Profiles `cc`/`gg` wrappers. Call `claude` and `copilot` directly, with the flags kept in one place.
-- `spec.json` records the Terminal Profiles repository root. Record the plugin root.
+- `spec.json` records the Terminal Profiles repository root. Drop that field; the launcher finds the library beside itself.
 
 ## Requirements
 
-- PowerShell 7.
+- PowerShell 7.4 or later.
 - One of these multiplexers:
   - rmux 0.10.0 on Windows;
-  - tmux on Linux or macOS. The minimum version is not settled yet.
+  - tmux 3.2 or later on Linux, including WSL. 3.2 added `-N`, which stops a call from starting a new server.
 - Claude Code or GitHub Copilot CLI.
 
-tmux support is planned but not built yet. Inside rmux, both `RMUX` and `TMUX` are set, so `RMUX` decides which multiplexer is running.
+tmux support is planned but not built yet. Inside rmux, both `RMUX` and `TMUX` are set, so `RMUX` decides which multiplexer is running. macOS is refused in 0.1.0 because it cannot be tested here; tmux under MSYS2 or Cygwin on Windows is not supported.
 
 ## Install
 
