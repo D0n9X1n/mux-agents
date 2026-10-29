@@ -167,6 +167,20 @@ Describe 'RmuxAgents part 2 messages and stop' {
         "$($messages.Count) $(($messages[0].text -split "`n")[1])" | Should BeExactly '1 done exited with code 7.'
     }
 
+    It 'B1 a torn mailbox line is sealed, skipped and never counts as the notice' {
+        $fake = New-T2Fake 'torn'
+        $caller = Resolve-RmuxAgentCaller -P $fake
+        $folder = New-T2Agent -Fake $fake -Caller $caller -Name 'done'
+        Write-RmuxAgentJson -Path (Join-Path $folder 'launcher.json') -Value ([ordered]@{ pid = 1; exitCode = 7 })
+        $box = [IO.Path]::Combine((Get-RmuxAgentStateDirectory -P $fake -Caller $caller), 'mail', 'pane-1.jsonl')
+        [IO.File]::WriteAllText($box, '{"id":"exit-aaaaaaaaaaaa"')
+        (Invoke-T2Verb $fake @('list')).Code | Should Be 0
+        $messages = @((Invoke-T2Verb $fake @('read')).Reply.messages)
+        "$($messages.Count) $(($messages[0].text -split "`n")[1])" | Should BeExactly '1 done exited with code 7.'
+        $null = Invoke-T2Verb $fake @('send', '%1', '-Body', 'after')
+        (@((Invoke-T2Verb $fake @('read')).Reply.messages) | ForEach-Object { ($_.text -split "`n")[1] }) -join '|' | Should BeExactly 'after'
+    }
+
     It 'B5 stop closes the pane, stops the recorded tree and posts stopped once' {
         $fake = New-T2Fake 'stop'
         $caller = Resolve-RmuxAgentCaller -P $fake

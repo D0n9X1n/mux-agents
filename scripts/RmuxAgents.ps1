@@ -931,15 +931,25 @@ function ConvertTo-RmuxAgentMessageText {
 }
 
 function Add-RmuxAgentMail {
-    # Appends one message to Key's mailbox under the mailbox lock and returns its id. With MessageId, a mailbox that
-    # already holds that id is left as it is, so a retried post is never delivered twice.
+    # Appends one message to Key's mailbox under the mailbox lock and returns its id. A torn last line (no LF) from an
+    # interrupted append is sealed first, so it never joins the new message. With MessageId, a mailbox whose complete,
+    # parsable lines already hold that id is left as it is, so a retried post is never delivered twice.
     param([Parameter(Mandatory)]$P, [Parameter(Mandatory)]$Caller, [Parameter(Mandatory)][string]$Key, [Parameter(Mandatory)][string]$From, [Parameter(Mandatory)][string]$FromPane, [Parameter(Mandatory)][AllowEmptyString()][string]$Body, [string]$MessageId)
     $state = Get-RmuxAgentStateDirectory -P $P -Caller $Caller
     $messageId = if ($MessageId) { $MessageId } else { [guid]::NewGuid().ToString('N').Substring(0, 8) }
     $line = (ConvertTo-RmuxAgentJsonText ([ordered]@{ id = $messageId; from = $From; pane = $FromPane; at = (& $P.Now).ToString('o'); body = $Body })) + "`n"
     Use-RmuxAgentLock -LockKey "mail|$($Caller.ServerKey)|$Key" -LockAction {
         $box = [IO.Path]::Combine($state, 'mail', "$Key.jsonl")
-        if ($MessageId -and (Test-Path -LiteralPath $box) -and [IO.File]::ReadAllText($box).Contains('{"id":"' + $MessageId + '"')) { return }
+        # Assigned, not returned from an if: PowerShell would unroll the bytes, and an empty array would become $null.
+        [byte[]]$existing = [byte[]]::new(0)
+        if (Test-Path -LiteralPath $box) { $existing = [IO.File]::ReadAllBytes($box) }
+        $complete = [Array]::LastIndexOf($existing, [byte]10) + 1
+        if ($MessageId -and $complete) {
+            foreach ($stored in [Text.Encoding]::UTF8.GetString($existing, 0, $complete).Split("`n", [StringSplitOptions]::RemoveEmptyEntries)) {
+                if ((Test-RmuxAgentJsonLine $stored) -and (ConvertFrom-Json -InputObject $stored).id -ceq $MessageId) { return }
+            }
+        }
+        if ($existing.Length -gt $complete) { $line = "`n" + $line }
         $stream = [IO.File]::Open($box, [IO.FileMode]::Append, [IO.FileAccess]::Write, [IO.FileShare]::Read)
         try { $bytes = [Text.Encoding]::UTF8.GetBytes($line); $stream.Write($bytes, 0, $bytes.Length) } finally { $stream.Dispose() }
     }
@@ -961,7 +971,8 @@ function Read-RmuxAgentMail {
         if ($end -le $offset) { return , @() }
         $text = [Text.Encoding]::UTF8.GetString($bytes, [int]$offset, [int]($end - $offset))
         [IO.File]::WriteAllText($cursor, [string]$end)
-        , @($text.Split("`n", [StringSplitOptions]::RemoveEmptyEntries) | ForEach-Object { ConvertFrom-Json -InputObject $_ })
+        # A sealed torn line does not parse and is skipped, so one bad line never blocks the mailbox.
+        , @($text.Split("`n", [StringSplitOptions]::RemoveEmptyEntries) | Where-Object { Test-RmuxAgentJsonLine $_ } | ForEach-Object { ConvertFrom-Json -InputObject $_ })
     }
     foreach ($message in @($found)) {
         [ordered]@{ id = $message.id; from = $message.from; pane = $message.pane; at = $message.at
