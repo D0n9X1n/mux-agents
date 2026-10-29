@@ -4,45 +4,45 @@ A plugin for Claude Code and GitHub Copilot CLI. When the client runs inside an 
 
 ## Status
 
-Scaffold only; no code yet. The implementation is being built and reviewed in the Terminal Profiles repository (`config/rmux-agents/`, `tests/RmuxAgents*.Tests.ps1`). It moves here once part 1 (spawn, list, focus) passes its gate.
+0.1.0 runs on Windows with rmux 0.10.0. tmux on Linux is planned, not built. The code moved here from the Terminal Profiles repository and no longer depends on it.
 
-## Planned layout
+## Layout
 
 | Path | Job |
 |---|---|
 | `.claude-plugin/plugin.json`, `marketplace.json` | Plugin and marketplace manifests, read by Claude Code and Copilot CLI |
 | `skills/rmux-agents/SKILL.md` | The skill both clients load: verbs, the file-only rule, listening etiquette |
-| `scripts/rmux-agent.ps1` | Entry: one JSON object per call |
-| `scripts/RmuxAgents.ps1` | Library: caller, registry, locks, spawn, list, focus, send, read, stop |
-| `scripts/rmux-agent-launch.ps1` | Pane launcher: waits for the launch commit, then starts the client |
-| `tests/` | Pester tests on fakes, plus an isolated-server test |
+| `scripts/rmux-agent.ps1` | Entry: one verb per call, one JSON object out |
+| `scripts/RmuxAgents.ps1` | Library: caller, checks, registry, locks, spawn, list, focus, send, read, stop, launcher |
+| `scripts/rmux-agent-launcher.ps1` | Pane launcher: waits for the launch commit, then starts the client |
+| `tests/` | Pester 3.4 tests on fakes |
 
-## Making it general
+## How it works
 
-The current code depends on Terminal Profiles in these places, each to be replaced before or during the move:
-
-- `RmuxAgents.ps1` dot-sources `config\powershell\RmuxStore.ps1` (1012 lines; the managed RMUX store) and AST-imports `Resolve-RmuxCommand` from `SharedProfile.ps1`. Replace with plain `rmux` calls on the caller's own socket.
-- State lives under `%LOCALAPPDATA%\TerminalProfiles\rmux-agents\state`, and lock mutexes are named `Local\TerminalProfiles-RmuxAgents-*`. Use an `rmux-agents` name.
-- The launcher runs the clients through the Terminal Profiles `cc`/`gg` wrappers. Call `claude` and `copilot` directly, with the flags kept in one place.
-- `spec.json` records the Terminal Profiles repository root. Drop that field; the launcher finds the library beside itself.
+- `spawn` opens a detached window (or `-Split h|v` splits the caller's pane) running the launcher, tags the pane with `@agent-*` options, and records the agent under `%LOCALAPPDATA%\rmux-agents\state\<server key>\` (`RMUX_AGENTS_STATE` overrides it). A same-client child forks the caller's session; otherwise it starts brief-only.
+- Children run `claude --dangerously-skip-permissions --effort high` or `copilot --no-sandbox --allow-all`. So an agent may spawn only when its own token is not sandboxed, its live policy is full bypass, its client command lines carry only allowlisted flags, and its launch directory is confirmed; children start in that directory.
+- Messages go to per-pane mailboxes, never as keystrokes. `read -Wait` returns each message once. Every child posts exactly one exit notice to its parent: `exited`, `stopped` or `lost`.
+- At most 6 agents per session; children cannot spawn.
 
 ## Requirements
 
-- PowerShell 7.4 or later.
-- One of these multiplexers:
-  - rmux 0.10.0 on Windows;
-  - tmux 3.2 or later on Linux, including WSL. 3.2 added `-N`, which stops a call from starting a new server.
-- Claude Code or GitHub Copilot CLI.
+- Windows, PowerShell 7.4 or later.
+- rmux 0.10.0, with the caller inside an rmux pane.
+- Claude Code or GitHub Copilot CLI on `PATH` as `claude.exe` or `copilot.exe`.
 
-tmux support is planned but not built yet. Inside rmux, both `RMUX` and `TMUX` are set, so `RMUX` decides which multiplexer is running. macOS is refused in 0.1.0 because it cannot be tested here; tmux under MSYS2 or Cygwin on Windows is not supported.
+Inside rmux both `RMUX` and `TMUX` are set; `RMUX` wins. Other platforms are refused with check `platform`.
 
 ## Install
-
-Not installable yet. Once the code moves here:
 
 ```text
 claude plugin marketplace add <path-or-repository>
 claude plugin install rmux-agents@rmux-agents
 copilot plugin marketplace add <path-or-repository>
 copilot plugin install rmux-agents@rmux-agents
+```
+
+## Test
+
+```powershell
+pwsh -NoProfile -Command "Import-Module Pester -RequiredVersion 3.4.0; Invoke-Pester -Script ./tests"
 ```
