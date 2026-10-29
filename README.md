@@ -28,10 +28,13 @@ The current code depends on Terminal Profiles in these places, each to be replac
 
 ## Requirements
 
-- Windows, PowerShell 7, rmux 0.10.0.
+- PowerShell 7.
+- One of these multiplexers:
+  - rmux 0.10.0 on Windows;
+  - tmux on Linux or macOS. The minimum version is not settled yet.
 - Claude Code or GitHub Copilot CLI.
 
-Not yet planned: tmux, macOS and Linux.
+tmux support is planned but not built yet. Inside rmux, both `RMUX` and `TMUX` are set, so `RMUX` decides which multiplexer is running.
 
 ## Install
 
