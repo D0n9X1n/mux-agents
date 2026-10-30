@@ -65,6 +65,6 @@ jobs:
           TAG: ${{ github.ref_name }}
         run: |
           $options = @('release', 'create', $env:TAG, "mux-agents-$($env:TAG).zip", '--verify-tag', '--title', $env:TAG, '--generate-notes')
-          $notes = "docs/releases/$($env:TAG).md"
+          $notes = "wiki/Release-$($env:TAG).md"
           if (Test-Path -LiteralPath $notes) { $options += @('--notes-file', $notes) }
           gh @options

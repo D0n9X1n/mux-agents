@@ -467,10 +467,10 @@ Describe 'MuxAgents foundation release workflow' {
         })
         $sequence -join ' ; ' | Should BeExactly 'build ; upload plugin-zip mux-agents-${{ github.ref_name }}.zip error'
     }
-    It 'publish downloads the zip, then creates the release with generated notes plus docs/releases notes when present' {
+    It 'publish downloads the zip, then creates the release with generated notes plus the wiki release page when present' {
         $create = @(
             '$options = @(''release'', ''create'', $env:TAG, "mux-agents-$($env:TAG).zip", ''--verify-tag'', ''--title'', $env:TAG, ''--generate-notes'')'
-            '$notes = "docs/releases/$($env:TAG).md"'
+            '$notes = "wiki/Release-$($env:TAG).md"'
             'if (Test-Path -LiteralPath $notes) { $options += @(''--notes-file'', $notes) }'
             'gh @options'
         ) -join "`n"

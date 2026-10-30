@@ -16,4 +16,4 @@ Commits are authored and committed as `D0n9X1n <D0n9x1n@outlook.com>`. A pull re
 
 ## Releases
 
-Bump `version` in `.claude-plugin/plugin.json` on main, optionally add `docs/releases/v<version>.md`, then push tag `v<version>` on a main commit whose CI push run is green.
+Bump `version` in `.claude-plugin/plugin.json` on main, optionally add the release page `wiki/Release-v<version>.md` (and `wiki/Release-v<version>-zh-CN.md`), then push tag `v<version>` on a main commit whose CI push run is green.
