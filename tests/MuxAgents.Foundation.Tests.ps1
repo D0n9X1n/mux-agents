@@ -132,7 +132,8 @@ Describe 'MuxAgents foundation CI' {
     $steps = @(foreach ($job in @($jobs.Values)) { @($job.steps) })
     function Get-JobSteps([string]$Name) { if ($jobs -is [Collections.IDictionary] -and $jobs.Contains($Name)) { @($jobs[$Name].steps) } }
     function Get-RunLines($Step) { @("$($Step.run)" -split '\r?\n' | ForEach-Object { $_.Trim() } | Where-Object { $_ }) }
-    function Get-Keys($Map) { if ($Map -is [Collections.IDictionary]) { @($Map.Keys | ForEach-Object { "$_" }) } }
+    # get_Keys(), not .Keys: a YAML entry named keys would shadow the property and hide the real entries.
+    function Get-Keys($Map) { if ($Map -is [Collections.IDictionary]) { @($Map.get_Keys() | ForEach-Object { "$_" }) } }
     It 'is named CI' {
         "$($ci.name)" | Should BeExactly 'CI'
     }
@@ -146,10 +147,10 @@ Describe 'MuxAgents foundation CI' {
     }
     It 'grants contents read at the top and nothing beyond read in any job' {
         $top = $ci.permissions
-        "$($top -is [Collections.IDictionary]) $(@($top.Keys) -join ',') $($top.contents)" | Should BeExactly 'True contents read'
-        $wide = @(foreach ($name in @($jobs.Keys)) {
+        "$($top -is [Collections.IDictionary]) $(@($top.get_Keys()) -join ',') $($top.contents)" | Should BeExactly 'True contents read'
+        $wide = @(foreach ($name in @($jobs.get_Keys())) {
             $perm = $jobs[$name].permissions
-            if ($perm -is [Collections.IDictionary]) { foreach ($key in @($perm.Keys)) { if ("$($perm[$key])" -cnotin 'read', 'none') { "$name.$key=$($perm[$key])" } } }
+            if ($perm -is [Collections.IDictionary]) { foreach ($key in @($perm.get_Keys())) { if ("$($perm[$key])" -cnotin 'read', 'none') { "$name.$key=$($perm[$key])" } } }
             elseif ($null -ne $perm) { "$name=$perm" }
         })
         $wide -join ' ; ' | Should BeExactly ''
@@ -161,13 +162,13 @@ Describe 'MuxAgents foundation CI' {
         $concurrency.'cancel-in-progress' | Should BeExactly '${{ github.event_name == ''pull_request'' }}'
     }
     It 'has only the lint job on ubuntu and the test job on a three-OS matrix without fail-fast' {
-        "$(@($jobs.Keys | Sort-Object) -join ',') $($jobs.lint.'runs-on') $($jobs.test.'runs-on')" | Should BeExactly 'lint,test ubuntu-latest ${{ matrix.os }}'
+        "$(@($jobs.get_Keys() | Sort-Object) -join ',') $($jobs.lint.'runs-on') $($jobs.test.'runs-on')" | Should BeExactly 'lint,test ubuntu-latest ${{ matrix.os }}'
         @($jobs.test.strategy.matrix.os | Sort-Object) -join ',' | Should BeExactly 'macos-latest,ubuntu-latest,windows-latest'
         $failFast = $jobs.test.strategy.'fail-fast'
         "$($failFast -is [bool]) $failFast" | Should BeExactly 'True False'
     }
     It 'skips no job or matrix entry and lets no job or step fail or time out silently' {
-        $problems = @(foreach ($name in @($jobs.Keys)) {
+        $problems = @(foreach ($name in @($jobs.get_Keys())) {
             $job = $jobs[$name]
             if ($job.Contains('if')) { "$name if" }
             foreach ($key in @(Get-Keys $job.strategy.matrix | Where-Object { $_ -cin 'include', 'exclude' })) { "$name matrix $key" }
@@ -263,10 +264,10 @@ Describe 'MuxAgents foundation hygiene' {
             foreach ($item in $body) {
                 if ($item -isnot [Collections.IDictionary]) { $problems.Add("item $item"); continue }
                 $type = "$($item.type)"
-                if ($type -cnotin @($attributeKeys.Keys)) { $problems.Add("type $type"); continue }
+                if ($type -cnotin @($attributeKeys.get_Keys())) { $problems.Add("type $type"); continue }
                 $attributes = $item.attributes
                 if ($attributes -is [Collections.IDictionary]) {
-                    foreach ($key in @($attributes.Keys)) { if ("$key" -cnotin $attributeKeys[$type]) { $problems.Add("$type attribute $key") } }
+                    foreach ($key in @($attributes.get_Keys())) { if ("$key" -cnotin $attributeKeys[$type]) { $problems.Add("$type attribute $key") } }
                 } elseif ($null -ne $attributes) { $problems.Add("$type attributes") }
                 # An id is optional; when present it is a non-empty string, unique within the form.
                 if ($item.Contains('id')) {
@@ -281,7 +282,7 @@ Describe 'MuxAgents foundation hygiene' {
                 if ($item.Contains('validations')) {
                     $validations = $item.validations
                     if ($validations -isnot [Collections.IDictionary]) { $problems.Add("$type validations") }
-                    else { foreach ($key in @($validations.Keys)) { if ("$key" -cne 'required') { $problems.Add("$type validation $key") } } }
+                    else { foreach ($key in @($validations.get_Keys())) { if ("$key" -cne 'required') { $problems.Add("$type validation $key") } } }
                 }
             }
             foreach ($id in 'version', 'os', 'multiplexer', 'client') { if ($id -cnotin $ids) { $problems.Add("missing id $id") } }
