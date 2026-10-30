@@ -121,6 +121,23 @@ Describe 'MuxAgents wiki publisher' {
         $want = [BitConverter]::ToString([IO.File]::ReadAllBytes((Join-Path $source 'Home-zh-CN.md')))
         "$($run.Code) $([BitConverter]::ToString([IO.File]::ReadAllBytes((Join-Path $repo 'Home-zh-CN.md'))) -ceq $want) $(@(Invoke-WikiGit $repo status --porcelain).Count)" | Should BeExactly '0 True 0'
     }
+    It 'keeps pages whose names differ only in case apart, where the file system does' {
+        $source = Join-Path $TestDrive 'case-src'
+        $repo = Join-Path $TestDrive 'case-wiki'
+        $null = New-Item -ItemType Directory -Force -Path $source, $repo
+        # Windows folders are case-insensitive unless flagged; Linux folders always are case-sensitive; macOS ones usually are not.
+        if ($IsWindows) { foreach ($dir in $source, $repo) { $null = & fsutil.exe file setCaseSensitiveInfo $dir enable 2>&1 } }
+        [IO.File]::WriteAllText((Join-Path $source 'Page.md'), 'UPPER')
+        if (Test-Path -LiteralPath (Join-Path $source 'page.md')) { Set-ItResult -Skipped -Because 'this file system folds case'; return }
+        [IO.File]::WriteAllText((Join-Path $source 'page.md'), 'lower')
+        $null = & git -C $repo init -q -b master
+        Write-WikiFiles $repo @{ 'Page.md' = 'old upper' }
+        [IO.File]::WriteAllText((Join-Path $repo 'page.md'), 'old lower')
+        $null = Invoke-WikiGit $repo add --all
+        $null = Invoke-WikiGit $repo commit -q -m seed
+        $run = Invoke-WikiPublisher @('-Source', $source, '-WikiRepo', $repo, '-SourceSha', $sha)
+        "$($run.Code) $(@(Invoke-WikiGit $repo ls-files) -join ',') $(Invoke-WikiGit $repo show HEAD:Page.md) $(Invoke-WikiGit $repo show HEAD:page.md)" | Should BeExactly '0 Page.md,page.md UPPER lower'
+    }
     It 'exits 1 and leaves the wiki untouched when a page cannot be read' {
         $source = New-WikiSource 'locked-src' @{ 'Home.md' = 'new'; 'Other.md' = 'other' }
         $repo = New-WikiRepo 'locked-wiki' @{ 'Home.md' = 'old' }
@@ -170,7 +187,8 @@ Describe 'MuxAgents wiki publish workflow' {
     $steps = @(if ($publish.steps -is [Collections.IList]) { $publish.steps })
     # The comma keeps a one-element list a list; returned bare, it would unroll into its string.
     function Get-WikiValue($Map, [string]$Key) { if ($Map -is [Collections.IDictionary] -and $Map.Contains($Key)) { , $Map[$Key] } }
-    function Format-WikiMap($Map) { if ($Map -is [Collections.IDictionary]) { @($Map.Keys | Sort-Object | ForEach-Object { "$_=$($Map[$_])" }) -join ',' } else { "$Map" } }
+    # get_Keys(), not .Keys: a YAML entry named keys would shadow the property and hide the real entries.
+    function Format-WikiMap($Map) { if ($Map -is [Collections.IDictionary]) { @($Map.get_Keys() | Sort-Object | ForEach-Object { "$_=$($Map[$_])" }) -join ',' } else { "$Map" } }
     function Get-WikiStepKind($Step) {
         $run = "$(Get-WikiValue $Step 'run')".Trim()
         if ("$(Get-WikiValue $Step 'uses')".StartsWith('actions/checkout@', [StringComparison]::Ordinal)) { 'checkout' }
@@ -184,10 +202,10 @@ Describe 'MuxAgents wiki publish workflow' {
         $on = $workflow['on']
         $push = Get-WikiValue $on 'push'
         $branches = Get-WikiValue $push 'branches'
-        "$($workflow.name) | $(@($on.Keys | Sort-Object) -join ',') | $(@($push.Keys) -join ',') $($branches -is [Collections.IList]) $(@($branches) -join ',')" | Should BeExactly 'Publish wiki | push,workflow_dispatch | branches True main'
+        "$($workflow.name) | $(@($on.get_Keys() | Sort-Object) -join ',') | $(@($push.get_Keys()) -join ',') $($branches -is [Collections.IList]) $(@($branches) -join ',')" | Should BeExactly 'Publish wiki | push,workflow_dispatch | branches True main'
     }
     It 'reads contents at the top and writes contents only in its one job, publish' {
-        $grants = @("top:$(Format-WikiMap $workflow.permissions)") + @(foreach ($name in @($jobs.Keys)) { "${name}:$(Format-WikiMap $jobs[$name].permissions)" })
+        $grants = @("top:$(Format-WikiMap $workflow.permissions)") + @(foreach ($name in @($jobs.get_Keys())) { "${name}:$(Format-WikiMap $jobs[$name].permissions)" })
         $grants -join ' ; ' | Should BeExactly 'top:contents=read ; publish:contents=write'
     }
     It 'runs one publish at a time and never cancels one in progress' {

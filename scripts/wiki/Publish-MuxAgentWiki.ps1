@@ -18,15 +18,16 @@ if ($pages.Count -eq 0) { Stop-WikiPublish 1 "wiki source has no Markdown pages:
 
 # Every page is read before the destination changes, so a page that cannot be read leaves the wiki as it was.
 # A link could point outside wiki/, at the clone's token-bearing .git/config among others, so links are refused.
-$content = [ordered]@{}
+# A list, not a hashtable: hashtable keys fold case, and Page.md and page.md are two pages where the file system says so.
+$content = [Collections.Generic.List[object]]::new()
 foreach ($page in $pages) {
     if ($page.LinkTarget) { Stop-WikiPublish 1 "wiki page is a link, not a file: $($page.Name)" }
-    try { $content[$page.Name] = [IO.File]::ReadAllBytes($page.FullName) } catch { Stop-WikiPublish 1 "cannot read wiki page: $($page.Name)" }
+    try { $content.Add([pscustomobject]@{ Name = $page.Name; Bytes = [IO.File]::ReadAllBytes($page.FullName) }) } catch { Stop-WikiPublish 1 "cannot read wiki page: $($page.Name)" }
 }
 try {
     Get-ChildItem -LiteralPath $WikiRepo -File -Force -Filter '*.md' | Where-Object { $_.Extension -ceq '.md' } | Remove-Item -Force -ErrorAction Stop
     # Written, not copied: a copy keeps the source mtime, and git would take a same-size change in the same second for unchanged.
-    foreach ($name in $content.Keys) { [IO.File]::WriteAllBytes((Join-Path $WikiRepo $name), $content[$name]) }
+    foreach ($page in $content) { [IO.File]::WriteAllBytes((Join-Path $WikiRepo $page.Name), $page.Bytes) }
 } catch { Stop-WikiPublish 1 "cannot write the wiki destination: $($_.Exception.Message)" }
 git -C $WikiRepo add --all
 if ($LASTEXITCODE -ne 0) { Stop-WikiPublish 1 'git add failed in the wiki destination' }
