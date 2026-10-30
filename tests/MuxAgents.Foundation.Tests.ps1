@@ -361,3 +361,10 @@ Describe 'MuxAgents foundation release gate' {
         Invoke-FoundationGate -Runs @($prRun, $otherSha) | Should BeExactly "1 refused: no CI push run for $sha"
     }
 }
+
+Describe 'MuxAgents foundation package' {
+    It 'LICENSE is MIT and release tooling is export-ignored' {
+        [IO.File]::ReadAllLines((Join-Path $repoRoot 'LICENSE'))[0] | Should BeExactly 'MIT License'
+        [IO.File]::ReadAllText((Join-Path $repoRoot '.gitattributes')) | Should Match '(?m)^scripts/release export-ignore$'
+    }
+}
