@@ -1926,6 +1926,9 @@ Describe 'MuxAgents T1.6 spawn' -Tag 'windows' {
     function Set-T16Panes {
         # list-panes answers with Count agents named claude-<n>; Committed of them have commit.json.
         param($Fake, [int]$Count, [int]$Committed = $Count)
+        # Spawn refuses a state folder that other users can read, so the fixture builds it the way spawn does
+        # instead of inheriting the ACL of the test drive's parent (a shared temp folder on CI runners).
+        New-MuxAgentPrivateDirectory (Get-MuxAgentUserSid) (Join-Path $Fake.State 'agents')
         $lines = foreach ($n in 1..$Count) {
             $id = '{0:x12}' -f (0xa00 + $n)
             if ($n -le $Committed) {
