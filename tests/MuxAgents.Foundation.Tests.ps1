@@ -528,9 +528,10 @@ Describe 'MuxAgents foundation release workflow' {
             'gh @options'
         ) -join "`n"
         $sequence = @(Get-ReleaseSteps 'publish' | ForEach-Object {
-            if ("$($_.uses)" -cmatch '^actions/download-artifact@') { "download $($_.with.name)" }
+            if ("$($_.uses)" -cmatch '^actions/download-artifact@') { "download $(Format-ReleaseMap $_.with)" }
             elseif ((Get-ReleaseRunLines $_) -join "`n" -ceq $create) { "create $($_.env.GH_TOKEN) $($_.env.GH_REPO) $($_.env.TAG)" }
         })
-        $sequence -join ' ; ' | Should BeExactly 'download plugin-zip ; create ${{ github.token }} ${{ github.repository }} ${{ github.ref_name }}'
+        # The whole with map: a path key would move the zip away from the workspace root, where gh release create reads it.
+        $sequence -join ' ; ' | Should BeExactly 'download name=plugin-zip ; create ${{ github.token }} ${{ github.repository }} ${{ github.ref_name }}'
     }
 }
