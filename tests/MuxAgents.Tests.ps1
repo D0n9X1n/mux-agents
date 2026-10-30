@@ -1,8 +1,8 @@
 $repoRoot = Split-Path -Parent $PSScriptRoot
-. (Join-Path $repoRoot 'scripts\MuxAgents.ps1')
+. (Join-Path (Join-Path $repoRoot 'scripts') 'MuxAgents.ps1')
 . (Join-Path $PSScriptRoot 'MuxAgents.TestHelpers.ps1')
 
-Describe 'MuxAgents T1.1 dispatcher' {
+Describe 'MuxAgents T1.1 dispatcher' -Tag 'windows' {
     AfterAll {
         foreach ($verb in @('t11-throw', 't11-refuse', 't11-show', 't11-error', 't11-wrapped', 't11-format', 't11-format-inner')) { $script:MuxAgentVerbs.Remove($verb) }
     }
@@ -395,7 +395,7 @@ Describe 'MuxAgents T1.1 dispatcher' {
     }
 }
 
-Describe 'MuxAgents T1.2 caller' {
+Describe 'MuxAgents T1.2 caller' -Tag 'windows' {
     BeforeEach { $script:MuxAgentStoreContext = $null }
     AfterAll { $script:MuxAgentStoreContext = $null }
 
@@ -796,7 +796,7 @@ Describe 'MuxAgents T1.2 caller' {
 
 }
 
-Describe 'MuxAgents T1.3 registry' {
+Describe 'MuxAgents T1.3 registry' -Tag 'windows' {
     AfterAll { $script:MuxAgentVerbs.Remove('t13-state') }
 
     function Get-T13Refusal {
@@ -1211,7 +1211,7 @@ Describe 'MuxAgents T1.3 registry' {
     }
 }
 
-Describe 'MuxAgents T1.4 context' {
+Describe 'MuxAgents T1.4 context' -Tag 'windows' {
     $T14New = '12345678-9abc-4def-8123-456789abcdef'
     $T14Parent = '11111111-2222-4333-8444-555555555555'
 
@@ -1583,7 +1583,7 @@ Describe 'MuxAgents T1.4 context' {
     }
 }
 
-Describe 'MuxAgents T1.5 header' {
+Describe 'MuxAgents T1.5 header' -Tag 'windows' {
     $T15Id = '0123456789ab'
     $T15Claude = '11111111-2222-4333-8444-555555555555'
     $T15Copilot = '66666666-7777-4888-9999-aaaaaaaaaaaa'
@@ -1876,7 +1876,7 @@ Describe 'MuxAgents T1.5 header' {
     }
 }
 
-Describe 'MuxAgents T1.6 spawn' {
+Describe 'MuxAgents T1.6 spawn' -Tag 'windows' {
     function Get-T16Hash {
         param([string]$Text)
         $sha = [Security.Cryptography.SHA256]::Create()

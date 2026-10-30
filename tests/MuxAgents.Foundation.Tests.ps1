@@ -55,3 +55,14 @@ Describe 'MuxAgents foundation runner' {
         Invoke-FoundationRunner 'tagged' $suite | Should Be $(if ($IsWindows) { 1 } else { 0 })
     }
 }
+
+Describe 'MuxAgents foundation legacy suites' {
+    It 'tags every legacy Describe windows and dot-sources without backslashes' {
+        foreach ($name in 'MuxAgents.Tests.ps1', 'MuxAgentsVerbs.Tests.ps1') {
+            $lines = [IO.File]::ReadAllLines((Join-Path $testsRoot $name))
+            $describes = @($lines | Where-Object { $_ -match '^Describe ' })
+            "$name $($describes.Count -gt 0) $(@($describes | Where-Object { $_ -notmatch " -Tag 'windows' \{$" }).Count)" | Should BeExactly "$name True 0"
+            @($lines | Where-Object { $_ -match '^\. ' -and $_.Contains('\') }).Count | Should Be 0
+        }
+    }
+}
