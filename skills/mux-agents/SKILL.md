@@ -1,5 +1,5 @@
 ---
-name: rmux-agents
+name: mux-agents
 description: Start Claude Code or Copilot CLI agents in the current RMUX session with forked context, then list, focus, message and stop them.
 ---
 
@@ -9,7 +9,7 @@ Use this skill inside an RMUX pane on Windows; the tool refuses elsewhere.
 
 ## Entry
 
-`<entry>` is `scripts/rmux-agent.ps1` in this plugin: two folders above this file's folder (`<skill folder>/../../scripts/rmux-agent.ps1`). Use the absolute path with forward slashes. A spawned agent's first message gives its exact Reply and Listen commands.
+`<entry>` is `scripts/mux-agent.ps1` in this plugin: two folders above this file's folder (`<skill folder>/../../scripts/mux-agent.ps1`). Use the absolute path with forward slashes. A spawned agent's first message gives its exact Reply and Listen commands.
 
 ## Rules
 

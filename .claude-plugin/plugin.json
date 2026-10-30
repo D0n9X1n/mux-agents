@@ -1,5 +1,5 @@
 {
-  "name": "rmux-agents",
+  "name": "mux-agents",
   "version": "0.1.0",
   "description": "Start Claude Code or Copilot CLI agents in the current RMUX session with forked context, then list, focus, message and stop them.",
   "author": { "name": "Dongxin Tang" },
