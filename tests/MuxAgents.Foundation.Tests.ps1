@@ -66,3 +66,10 @@ Describe 'MuxAgents foundation legacy suites' {
         }
     }
 }
+
+Describe 'MuxAgents foundation docs' {
+    It 'README runs the tests through the runner on Pester 4.10.1' {
+        $text = [IO.File]::ReadAllText((Join-Path $repoRoot 'README.md'))
+        "$($text.Contains('pwsh -NoProfile -File tests/Invoke-MuxAgentTests.ps1')) $($text -match 'Pester 3\.4')" | Should Be 'True False'
+    }
+}

@@ -15,7 +15,7 @@ A plugin for Claude Code and GitHub Copilot CLI. When the client runs inside an 
 | `scripts/mux-agent.ps1` | Entry: one verb per call, one JSON object out |
 | `scripts/MuxAgents.ps1` | Library: caller, checks, registry, locks, spawn, list, focus, send, read, stop, launcher |
 | `scripts/mux-agent-launcher.ps1` | Pane launcher: waits for the launch commit, then starts the client |
-| `tests/` | Pester 3.4 tests on fakes |
+| `tests/` | Pester 4.10.1 tests on fakes; `Invoke-MuxAgentTests.ps1` runs them |
 
 ## How it works
 
@@ -43,6 +43,10 @@ copilot plugin install mux-agents@mux-agents
 
 ## Test
 
+Install Pester 4.10.1 once (`Install-Module Pester -RequiredVersion 4.10.1 -Scope CurrentUser`), then:
+
 ```powershell
-pwsh -NoProfile -Command "Import-Module Pester -RequiredVersion 3.4.0; Invoke-Pester -Script ./tests"
+pwsh -NoProfile -File tests/Invoke-MuxAgentTests.ps1
 ```
+
+Off Windows the suites tagged `windows` are skipped. The script exits 1 when any test fails.
