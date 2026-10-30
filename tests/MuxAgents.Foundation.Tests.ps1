@@ -129,9 +129,17 @@ Describe 'MuxAgents foundation CI' {
     $steps = @(foreach ($job in @($jobs.Values)) { @($job.steps) })
     function Get-JobSteps([string]$Name) { if ($jobs -is [Collections.IDictionary] -and $jobs.Contains($Name)) { @($jobs[$Name].steps) } }
     function Get-RunLines($Step) { @("$($Step.run)" -split '\r?\n' | ForEach-Object { $_.Trim() } | Where-Object { $_ }) }
-    It 'runs on pull requests and on pushes to main' {
+    function Get-Keys($Map) { if ($Map -is [Collections.IDictionary]) { @($Map.Keys | ForEach-Object { "$_" }) } }
+    It 'is named CI' {
+        "$($ci.name)" | Should BeExactly 'CI'
+    }
+    It 'runs on every pull request and on pushes to main, unfiltered' {
         $on = $ci['on']
-        "$($on -is [Collections.IDictionary]) $($on.Contains('pull_request')) $($on.Contains('push')) $(@($on.push.branches) -join ',')" | Should BeExactly 'True True True main'
+        $pr = if ($on -is [Collections.IDictionary] -and $on.Contains('pull_request')) { $on.pull_request }
+        $push = if ($on -is [Collections.IDictionary] -and $on.Contains('push')) { $on.push }
+        $prFilters = @(Get-Keys $pr | Where-Object { $_ -cin 'branches', 'branches-ignore', 'paths', 'paths-ignore', 'types' })
+        "$($on -is [Collections.IDictionary] -and $on.Contains('pull_request')) $(-not $pr -or $pr -is [Collections.IDictionary]) $($prFilters -join ',')" | Should BeExactly 'True True '
+        "$($push -is [Collections.IDictionary]) $(@(Get-Keys $push) -join ',') $(@($push.branches) -join ',')" | Should BeExactly 'True branches main'
     }
     It 'grants contents read at the top and nothing beyond read in any job' {
         $top = $ci.permissions
@@ -154,6 +162,20 @@ Describe 'MuxAgents foundation CI' {
         @($jobs.test.strategy.matrix.os) -join ',' | Should BeExactly 'ubuntu-latest,macos-latest,windows-latest'
         $failFast = $jobs.test.strategy.'fail-fast'
         "$($failFast -is [bool]) $failFast" | Should BeExactly 'True False'
+    }
+    It 'skips no job or matrix entry and lets no job or step fail or time out silently' {
+        $problems = @(foreach ($name in @($jobs.Keys)) {
+            $job = $jobs[$name]
+            if ($job.Contains('if')) { "$name if" }
+            foreach ($key in @(Get-Keys $job.strategy.matrix | Where-Object { $_ -cin 'include', 'exclude' })) { "$name matrix $key" }
+            foreach ($item in @(@($job) + @($job.steps))) {
+                if ($item -is [Collections.IDictionary]) {
+                    if ($item.Contains('continue-on-error')) { "$name $($item.name) continue-on-error" }
+                    if ($item.Contains('timeout-minutes') -and "$($item.'timeout-minutes')" -eq '0') { "$name $($item.name) timeout-minutes 0" }
+                }
+            }
+        })
+        $problems -join ' ; ' | Should BeExactly ''
     }
     It 'gates only the TEMP and TMP step, on Windows' {
         $gated = @($steps | Where-Object { $_.Contains('if') })
