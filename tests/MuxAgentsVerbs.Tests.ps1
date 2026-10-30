@@ -1,17 +1,17 @@
 $repoRoot = Split-Path -Parent $PSScriptRoot
-. (Join-Path $repoRoot 'scripts\RmuxAgents.ps1')
-. (Join-Path $PSScriptRoot 'RmuxAgents.TestHelpers.ps1')
+. (Join-Path $repoRoot 'scripts\MuxAgents.ps1')
+. (Join-Path $PSScriptRoot 'MuxAgents.TestHelpers.ps1')
 
 function Invoke-T2Verb {
     param([Parameter(Mandatory)]$Fake, [Parameter(Mandatory)][string[]]$Arguments)
-    $result = Invoke-RmuxAgentCommand -P $Fake -Arguments $Arguments
+    $result = Invoke-MuxAgentCommand -P $Fake -Arguments $Arguments
     [pscustomobject]@{ Code = $result.Code; Reply = ($result.Text | ConvertFrom-Json) }
 }
 
 function New-T2Fake {
     # Fake providers in their own folder, with the probes the part 2 and part 3 verbs add.
     param([Parameter(Mandatory)][string]$Name, [string]$Caller = 'human')
-    $fake = New-FakeRmuxAgentProviders -Caller $Caller -Root (Join-Path $TestDrive $Name)
+    $fake = New-FakeMuxAgentProviders -Caller $Caller -Root (Join-Path $TestDrive $Name)
     Add-FakeRmuxRule -Fake $fake -Match '#\{pane_height\}$' -StdOut "40`n"
     Add-FakeRmuxRule -Fake $fake -Match '#\{session_id\}\|#\{@agent-id\}$' -StdOut "`$3|`n"
     # A recorded agent pane that the snapshot missed answers the gone-pane probe as gone unless a test says otherwise.
@@ -22,16 +22,16 @@ function New-T2Fake {
 function New-T2Agent {
     # A committed agent of session $3 with its record; returns the agent folder.
     param([Parameter(Mandatory)]$Fake, [Parameter(Mandatory)]$Caller, [string]$Id = 'aaaaaaaaaaaa', [string]$Name = 'worker', [string]$Pane = '%9', [string]$ParentPane = '%1')
-    $state = Get-RmuxAgentStateDirectory -P $Fake -Caller $Caller
+    $state = Get-MuxAgentStateDirectory -P $Fake -Caller $Caller
     $folder = [IO.Path]::Combine($state, 'agents', $Id)
     $null = [IO.Directory]::CreateDirectory($folder)
-    Write-RmuxAgentJson -Path (Join-Path $folder 'record.json') -Value ([ordered]@{ schema = 1; id = $Id; name = $Name; client = 'claude'; sessionId = '0f11fc2f-2032-48ef-a920-4af2a8e5af50'
+    Write-MuxAgentJson -Path (Join-Path $folder 'record.json') -Value ([ordered]@{ schema = 1; id = $Id; name = $Name; client = 'claude'; sessionId = '0f11fc2f-2032-48ef-a920-4af2a8e5af50'
             context = 'brief'; reason = 'human'; session = '$3'; pane = $Pane; window = '@5'; parentPane = $ParentPane; parentAgent = $null; directory = $Fake.Cwd; createdAt = 'x' })
-    Write-RmuxAgentJson -Path (Join-Path $folder 'commit.json') -Value ([ordered]@{ committedAt = 'x' })
+    Write-MuxAgentJson -Path (Join-Path $folder 'commit.json') -Value ([ordered]@{ committedAt = 'x' })
     $folder
 }
 
-Describe 'RmuxAgents part 3 no widening' {
+Describe 'MuxAgents part 3 no widening' {
     It 'C1 every verb refuses a sandboxed or unreadable token before any rmux call' {
         foreach ($token in @(
                 [pscustomobject]@{ IsAppContainer = $true; IsRestricted = $false; IntegrityLevel = 'S-1-16-8192' },
@@ -50,9 +50,9 @@ Describe 'RmuxAgents part 3 no widening' {
     }
 
     It 'C1 the real token of this process is readable and at least Medium' {
-        $token = Get-RmuxAgentToken
+        $token = Get-MuxAgentToken
         $token.IntegrityLevel | Should Match '^S-1-16-\d+$'
-        { Assert-RmuxAgentToken -Token $token } | Should Not Throw
+        { Assert-MuxAgentToken -Token $token } | Should Not Throw
     }
 
     It 'C3 C2 C5 an admitted Claude agent spawns into its launch directory' {
@@ -111,14 +111,14 @@ Describe 'RmuxAgents part 3 no widening' {
     }
 }
 
-Describe 'RmuxAgents part 2 messages and stop' {
+Describe 'MuxAgents part 2 messages and stop' {
     It 'B2 B4 a message is sanitized, prefixed and read exactly once' {
         $fake = New-T2Fake 'mail'
         $send = Invoke-T2Verb $fake @('send', '%1', '-Body', ("a" + [char]27 + "[31mb`r`nc" + [char]7))
         "$($send.Code) $($send.Reply.pane)" | Should BeExactly '0 %1'
         $first = Invoke-T2Verb $fake @('read')
         @($first.Reply.messages).Count | Should Be 1
-        $first.Reply.messages[0].text | Should BeExactly "[rmux-agent from root (%1) #$($send.Reply.id)]`na[31mb`nc"
+        $first.Reply.messages[0].text | Should BeExactly "[mux-agent from root (%1) #$($send.Reply.id)]`na[31mb`nc"
         @((Invoke-T2Verb $fake @('read')).Reply.messages).Count | Should Be 0
         @($fake.Calls | Where-Object { $_[1] -in @('send-keys', 'paste-buffer') }).Count | Should Be 0
     }
@@ -142,9 +142,9 @@ Describe 'RmuxAgents part 2 messages and stop' {
 
     It 'B1 a gone agent gets exactly one notice: exited with its code, else lost' {
         $fake = New-T2Fake 'notice'
-        $caller = Resolve-RmuxAgentCaller -P $fake
+        $caller = Resolve-MuxAgentCaller -P $fake
         $exited = New-T2Agent -Fake $fake -Caller $caller -Id 'aaaaaaaaaaaa' -Name 'done'
-        Write-RmuxAgentJson -Path (Join-Path $exited 'launcher.json') -Value ([ordered]@{ pid = 1; exitCode = 7 })
+        Write-MuxAgentJson -Path (Join-Path $exited 'launcher.json') -Value ([ordered]@{ pid = 1; exitCode = 7 })
         $null = New-T2Agent -Fake $fake -Caller $caller -Id 'bbbbbbbbbbbb' -Name 'gone'
         $texts = @((Invoke-T2Verb $fake @('read')).Reply.messages | ForEach-Object { ($_.text -split "`n")[1] } | Sort-Object)
         ($texts -join '|') | Should BeExactly 'done exited with code 7.|gone is gone: its pane closed without an exit record.'
@@ -154,10 +154,10 @@ Describe 'RmuxAgents part 2 messages and stop' {
 
     It 'B1 a notice whose mailbox append fails is posted on the next read, and a lost marker never posts twice' {
         $fake = New-T2Fake 'notice retry'
-        $caller = Resolve-RmuxAgentCaller -P $fake
+        $caller = Resolve-MuxAgentCaller -P $fake
         $folder = New-T2Agent -Fake $fake -Caller $caller -Name 'done'
-        Write-RmuxAgentJson -Path (Join-Path $folder 'launcher.json') -Value ([ordered]@{ pid = 1; exitCode = 7 })
-        $box = [IO.Path]::Combine((Get-RmuxAgentStateDirectory -P $fake -Caller $caller), 'mail', 'pane-1.jsonl')
+        Write-MuxAgentJson -Path (Join-Path $folder 'launcher.json') -Value ([ordered]@{ pid = 1; exitCode = 7 })
+        $box = [IO.Path]::Combine((Get-MuxAgentStateDirectory -P $fake -Caller $caller), 'mail', 'pane-1.jsonl')
         $held = [IO.File]::Open($box, [IO.FileMode]::OpenOrCreate, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None)
         try { (Invoke-T2Verb $fake @('list')).Code | Should Be 1 }
         finally { $held.Dispose() }
@@ -171,10 +171,10 @@ Describe 'RmuxAgents part 2 messages and stop' {
 
     It 'B1 a torn mailbox line is sealed, skipped and never counts as the notice' {
         $fake = New-T2Fake 'torn'
-        $caller = Resolve-RmuxAgentCaller -P $fake
+        $caller = Resolve-MuxAgentCaller -P $fake
         $folder = New-T2Agent -Fake $fake -Caller $caller -Name 'done'
-        Write-RmuxAgentJson -Path (Join-Path $folder 'launcher.json') -Value ([ordered]@{ pid = 1; exitCode = 7 })
-        $box = [IO.Path]::Combine((Get-RmuxAgentStateDirectory -P $fake -Caller $caller), 'mail', 'pane-1.jsonl')
+        Write-MuxAgentJson -Path (Join-Path $folder 'launcher.json') -Value ([ordered]@{ pid = 1; exitCode = 7 })
+        $box = [IO.Path]::Combine((Get-MuxAgentStateDirectory -P $fake -Caller $caller), 'mail', 'pane-1.jsonl')
         [IO.File]::WriteAllText($box, '{"id":"exit-aaaaaaaaaaaa"')
         (Invoke-T2Verb $fake @('list')).Code | Should Be 0
         $messages = @((Invoke-T2Verb $fake @('read')).Reply.messages)
@@ -185,10 +185,10 @@ Describe 'RmuxAgents part 2 messages and stop' {
 
     It 'B1 a complete notice line that lost only its LF is finished, not posted again' {
         $fake = New-T2Fake 'no lf'
-        $caller = Resolve-RmuxAgentCaller -P $fake
+        $caller = Resolve-MuxAgentCaller -P $fake
         $folder = New-T2Agent -Fake $fake -Caller $caller -Name 'done'
-        Write-RmuxAgentJson -Path (Join-Path $folder 'launcher.json') -Value ([ordered]@{ pid = 1; exitCode = 7 })
-        $box = [IO.Path]::Combine((Get-RmuxAgentStateDirectory -P $fake -Caller $caller), 'mail', 'pane-1.jsonl')
+        Write-MuxAgentJson -Path (Join-Path $folder 'launcher.json') -Value ([ordered]@{ pid = 1; exitCode = 7 })
+        $box = [IO.Path]::Combine((Get-MuxAgentStateDirectory -P $fake -Caller $caller), 'mail', 'pane-1.jsonl')
         [IO.File]::WriteAllText($box, '{"id":"exit-aaaaaaaaaaaa","from":"done","pane":"%9","at":"x","body":"done exited with code 7."}')
         (Invoke-T2Verb $fake @('list')).Code | Should Be 0
         $messages = @((Invoke-T2Verb $fake @('read')).Reply.messages)
@@ -198,14 +198,14 @@ Describe 'RmuxAgents part 2 messages and stop' {
 
     It 'B1 an agent committed after the pane snapshot is not marked lost and keeps its real exit notice' {
         $fake = New-T2Fake 'race'
-        $caller = Resolve-RmuxAgentCaller -P $fake
+        $caller = Resolve-MuxAgentCaller -P $fake
         $folder = New-T2Agent -Fake $fake -Caller $caller -Name 'late'
         # The list-panes snapshot misses the agent, but its pane is live and tagged when probed.
         Add-FakeRmuxRule -Fake $fake -Match '#\{pane_id\}\|#\{@agent-id\}$' -StdOut "%9|aaaaaaaaaaaa`n"
         $null = Invoke-T2Verb $fake @('list')
         [IO.File]::Exists((Join-Path $folder 'notice.json')) | Should Be $false
         @((Invoke-T2Verb $fake @('read')).Reply.messages).Count | Should Be 0
-        Write-RmuxAgentJson -Path (Join-Path $folder 'launcher.json') -Value ([ordered]@{ pid = 1; exitCode = 7 })
+        Write-MuxAgentJson -Path (Join-Path $folder 'launcher.json') -Value ([ordered]@{ pid = 1; exitCode = 7 })
         Add-FakeRmuxRule -Fake $fake -Match '#\{pane_id\}\|#\{@agent-id\}$' -StdOut "|`n"
         $messages = @((Invoke-T2Verb $fake @('read')).Reply.messages)
         "$($messages.Count) $(($messages[0].text -split "`n")[1])" | Should BeExactly '1 late exited with code 7.'
@@ -213,12 +213,12 @@ Describe 'RmuxAgents part 2 messages and stop' {
 
     It 'B1 a failed pane probe posts nothing; the next read decides' {
         $fake = New-T2Fake 'probe failure'
-        $caller = Resolve-RmuxAgentCaller -P $fake
+        $caller = Resolve-MuxAgentCaller -P $fake
         $folder = New-T2Agent -Fake $fake -Caller $caller -Name 'flaky'
         Add-FakeRmuxRule -Fake $fake -Match '#\{pane_id\}\|#\{@agent-id\}$' -ExitCode 1
         (Invoke-T2Verb $fake @('list')).Code | Should Be 0
         [IO.File]::Exists((Join-Path $folder 'notice.json')) | Should Be $false
-        Write-RmuxAgentJson -Path (Join-Path $folder 'launcher.json') -Value ([ordered]@{ pid = 1; exitCode = 7 })
+        Write-MuxAgentJson -Path (Join-Path $folder 'launcher.json') -Value ([ordered]@{ pid = 1; exitCode = 7 })
         Add-FakeRmuxRule -Fake $fake -Match '#\{pane_id\}\|#\{@agent-id\}$' -StdOut "|`n"
         $messages = @((Invoke-T2Verb $fake @('read')).Reply.messages)
         "$($messages.Count) $(($messages[0].text -split "`n")[1])" | Should BeExactly '1 flaky exited with code 7.'
@@ -226,12 +226,12 @@ Describe 'RmuxAgents part 2 messages and stop' {
 
     It 'B5 stop closes the pane, stops the recorded tree and posts stopped once' {
         $fake = New-T2Fake 'stop'
-        $caller = Resolve-RmuxAgentCaller -P $fake
+        $caller = Resolve-MuxAgentCaller -P $fake
         $null = New-T2Agent -Fake $fake -Caller $caller
         Add-FakeRmuxRule -Fake $fake -Match '^-N list-panes ' -StdOut "%1|@1|100||`n%9|@5|300|aaaaaaaaaaaa|worker`n"
-        $fake.Rows.Add((New-FakeRmuxAgentRow 300 900 $fake.Pwsh 'pwsh launcher'))
-        $fake.Rows.Add((New-FakeRmuxAgentRow 310 300 'C:\x\claude.exe' 'claude'))
-        $fake.Rows.Add((New-FakeRmuxAgentRow 320 100 'C:\x\other.exe' 'unrelated'))
+        $fake.Rows.Add((New-FakeMuxAgentRow 300 900 $fake.Pwsh 'pwsh launcher'))
+        $fake.Rows.Add((New-FakeMuxAgentRow 310 300 'C:\x\claude.exe' 'claude'))
+        $fake.Rows.Add((New-FakeMuxAgentRow 320 100 'C:\x\other.exe' 'unrelated'))
         $fake.Survivors.Add(310)
         $run = Invoke-T2Verb $fake @('stop', 'worker')
         "$($run.Code) $($run.Reply.survivors) $($run.Reply.resume)" | Should BeExactly '0 1 claude --resume 0f11fc2f-2032-48ef-a920-4af2a8e5af50'
@@ -243,7 +243,7 @@ Describe 'RmuxAgents part 2 messages and stop' {
 
     It 'B5 an agent that is not the parent cannot stop' {
         $fake = New-T2Fake 'stop parent' -Caller claude
-        $caller = Resolve-RmuxAgentCaller -P $fake
+        $caller = Resolve-MuxAgentCaller -P $fake
         $null = New-T2Agent -Fake $fake -Caller $caller -ParentPane '%7'
         Add-FakeRmuxRule -Fake $fake -Match '^-N list-panes ' -StdOut "%9|@5|300|aaaaaaaaaaaa|worker`n"
         (Invoke-T2Verb $fake @('stop', 'worker')).Reply.check | Should BeExactly 'parent'
@@ -251,70 +251,70 @@ Describe 'RmuxAgents part 2 messages and stop' {
     }
 }
 
-Describe 'RmuxAgents launcher and transport' {
+Describe 'MuxAgents launcher and transport' {
     It 'A4 the launcher runs no client on abort and records the client exit code otherwise' {
         $fake = New-T2Fake 'launcher'
         $folder = [IO.Directory]::CreateDirectory((Join-Path $TestDrive 'launcher\agents\cccccccccccc')).FullName
         $spec = Join-Path $folder 'spec.json'
-        Write-RmuxAgentJson -Path $spec -Value ([ordered]@{ schema = 1; client = 'claude'; args = @('--session-id', 's', 'the prompt') })
+        Write-MuxAgentJson -Path $spec -Value ([ordered]@{ schema = 1; client = 'claude'; args = @('--session-id', 's', 'the prompt') })
         $calls = [Collections.Generic.List[object]]::new()
         $client = { param([string[]]$ClientArguments) $calls.Add($ClientArguments); $global:LASTEXITCODE = 7 }
-        Write-RmuxAgentJson -Path (Join-Path $folder 'abort.json') -Value @{ x = 1 }
-        Invoke-RmuxAgentLauncher -P $fake -Spec $spec -Client $client | Should Be 1
-        "$($calls.Count) $((Read-RmuxAgentJson -Path (Join-Path $folder 'launcher.json')).aborted)" | Should BeExactly '0 True'
+        Write-MuxAgentJson -Path (Join-Path $folder 'abort.json') -Value @{ x = 1 }
+        Invoke-MuxAgentLauncher -P $fake -Spec $spec -Client $client | Should Be 1
+        "$($calls.Count) $((Read-MuxAgentJson -Path (Join-Path $folder 'launcher.json')).aborted)" | Should BeExactly '0 True'
 
         Remove-Item -LiteralPath (Join-Path $folder 'abort.json')
-        Write-RmuxAgentJson -Path (Join-Path $folder 'commit.json') -Value @{ x = 1 }
-        Invoke-RmuxAgentLauncher -P $fake -Spec $spec -Client $client | Should Be 7
+        Write-MuxAgentJson -Path (Join-Path $folder 'commit.json') -Value @{ x = 1 }
+        Invoke-MuxAgentLauncher -P $fake -Spec $spec -Client $client | Should Be 7
         ($calls[0] -join ' ') | Should BeExactly '--dangerously-skip-permissions --effort high --session-id s the prompt'
-        (Read-RmuxAgentJson -Path (Join-Path $folder 'launcher.json')).exitCode | Should Be 7
-        Invoke-RmuxAgentLauncher -P $fake -Spec $spec -Client { throw 'boom' } | Should Be 1
+        (Read-MuxAgentJson -Path (Join-Path $folder 'launcher.json')).exitCode | Should Be 7
+        Invoke-MuxAgentLauncher -P $fake -Spec $spec -Client { throw 'boom' } | Should Be 1
     }
 
     It 'A4 the launcher gives up after 30 s with no commit' {
         $fake = New-T2Fake 'commit wait'
         $folder = [IO.Directory]::CreateDirectory((Join-Path $TestDrive 'commit wait\agent')).FullName
         $start = $fake.Clock
-        Wait-RmuxAgentCommit -P $fake -AgentDirectory $folder | Should Be $false
+        Wait-MuxAgentCommit -P $fake -AgentDirectory $folder | Should Be $false
         [int]($fake.Clock - $start).TotalSeconds | Should Be 30
     }
 
     It 'A4 the scrub removes exactly the client identity variables' {
-        $names = @($script:RmuxAgentScrub) + @('ANTHROPIC_BASE_URL')
+        $names = @($script:MuxAgentScrub) + @('ANTHROPIC_BASE_URL')
         $saved = @{}
         foreach ($name in $names) { $saved[$name] = [Environment]::GetEnvironmentVariable($name); [Environment]::SetEnvironmentVariable($name, 'x') }
         try {
-            Clear-RmuxAgentIdentity
-            @($script:RmuxAgentScrub | Where-Object { [Environment]::GetEnvironmentVariable($_) }).Count | Should Be 0
+            Clear-MuxAgentIdentity
+            @($script:MuxAgentScrub | Where-Object { [Environment]::GetEnvironmentVariable($_) }).Count | Should Be 0
             [Environment]::GetEnvironmentVariable('ANTHROPIC_BASE_URL') | Should BeExactly 'x'
-            $script:RmuxAgentScrub.Count | Should Be 12
+            $script:MuxAgentScrub.Count | Should Be 12
         }
         finally { foreach ($name in $names) { [Environment]::SetEnvironmentVariable($name, $saved[$name]) } }
     }
 
     It 'P1 state root, hash vector and lock names carry no Terminal Profiles name' {
-        Get-RmuxAgentStateRoot -Environment @{ RMUX_AGENTS_STATE = 'D:\s'; LOCALAPPDATA = 'C:\l' } | Should BeExactly 'D:\s'
-        Get-RmuxAgentStateRoot -Environment @{ LOCALAPPDATA = 'C:\l' } | Should BeExactly 'C:\l\rmux-agents\state'
-        Get-RmuxAgentHash 'abc' | Should BeExactly 'ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad'
+        Get-MuxAgentStateRoot -Environment @{ MUX_AGENTS_STATE = 'D:\s'; LOCALAPPDATA = 'C:\l' } | Should BeExactly 'D:\s'
+        Get-MuxAgentStateRoot -Environment @{ LOCALAPPDATA = 'C:\l' } | Should BeExactly 'C:\l\mux-agents\state'
+        Get-MuxAgentHash 'abc' | Should BeExactly 'ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad'
         foreach ($file in Get-ChildItem (Join-Path $repoRoot 'scripts') -Filter *.ps1) { [IO.File]::ReadAllText($file.FullName) | Should Not Match 'TerminalProfiles' }
     }
 
     It 'A1 rmux calls need -N and run the server image with -S' {
         $fake = New-T2Fake 'transport'
         $fake.Rows[0].Path = 'C:\rmux here\rmux.exe'
-        Resolve-RmuxAgentExecutable -P $fake | Should BeExactly 'C:\rmux here\rmux.exe'
+        Resolve-MuxAgentExecutable -P $fake | Should BeExactly 'C:\rmux here\rmux.exe'
         $failure = $null
-        try { $null = Invoke-RmuxAgentRmux -P $fake -Arguments @('list-panes') } catch { $failure = $_.Exception.Message }
-        $failure | Should BeExactly 'rmux-agent: every rmux call must start with -N'
+        try { $null = Invoke-MuxAgentRmux -P $fake -Arguments @('list-panes') } catch { $failure = $_.Exception.Message }
+        $failure | Should BeExactly 'mux-agent: every rmux call must start with -N'
     }
 
     It 'A7 native calls round-trip UTF-8 and quoted arguments and time out' {
         $stub = Join-Path $TestDrive 'echo.ps1'
         [IO.File]::WriteAllText($stub, '[Console]::OutputEncoding = [Text.UTF8Encoding]::new($false); [Console]::Out.Write($args -join "|"); if ($args[0] -eq "sleep") { Start-Sleep 5 }')
         $pwsh = Join-Path $PSHOME 'pwsh.exe'
-        (Invoke-RmuxAgentProcess -FilePath $pwsh -Arguments @('-NoProfile', '-File', $stub, ([string][char]0xE9), 'a "b" c\')).StdOut | Should BeExactly ([string][char]0xE9 + '|a "b" c\')
+        (Invoke-MuxAgentProcess -FilePath $pwsh -Arguments @('-NoProfile', '-File', $stub, ([string][char]0xE9), 'a "b" c\')).StdOut | Should BeExactly ([string][char]0xE9 + '|a "b" c\')
         $failure = $null
-        try { $null = Invoke-RmuxAgentProcess -FilePath $pwsh -Arguments @('-NoProfile', '-File', $stub, 'sleep') -TimeoutMilliseconds 500 } catch { $failure = $_.Exception.GetType().Name }
+        try { $null = Invoke-MuxAgentProcess -FilePath $pwsh -Arguments @('-NoProfile', '-File', $stub, 'sleep') -TimeoutMilliseconds 500 } catch { $failure = $_.Exception.GetType().Name }
         $failure | Should BeExactly 'TimeoutException'
     }
 }

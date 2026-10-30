@@ -1,10 +1,10 @@
 {
-  "name": "rmux-agents",
-  "description": "rmux-agents marketplace: one plugin for Claude Code and GitHub Copilot CLI.",
+  "name": "mux-agents",
+  "description": "mux-agents marketplace: one plugin for Claude Code and GitHub Copilot CLI.",
   "owner": { "name": "Dongxin Tang" },
   "plugins": [
     {
-      "name": "rmux-agents",
+      "name": "mux-agents",
       "source": "./",
       "description": "Start, list, focus, message and stop Claude Code or Copilot CLI agents in the current RMUX session."
     }
