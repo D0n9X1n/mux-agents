@@ -312,8 +312,8 @@ Describe 'MuxAgents foundation hygiene' {
         @($checklist | Where-Object { $lines -cnotcontains $_ }) -join ' ; ' | Should BeExactly ''
         # A GitHub merge re-authors the commit, so neither document may offer one.
         "$(($contributing -join "`n").Contains('gh pr merge')) $([IO.File]::ReadAllText($template).Contains('gh pr merge'))" | Should BeExactly 'False False'
-        # The push is never forced: no --force, no -f flag, no +refspec.
-        @(@($contributing) + @($lines) | Where-Object { $_.Contains('git push') -and $_ -cmatch '--force|(?<![\w-])-f(?![\w-])|\s\+[^\s`]*:' }) -join ' ; ' | Should BeExactly ''
+        # The push is never forced: no --force, no -f flag, no +refspec, bare or quoted.
+        @(@($contributing) + @($lines) | Where-Object { $_.Contains('git push') -and $_ -cmatch '--force|(?<![\w-])-f(?![\w-])|(^|[\s"''`])\+\S' }) -join ' ; ' | Should BeExactly ''
         $text = [IO.File]::ReadAllText($template)
         @('## Summary', '## Type', '## Closes', '## Test plan', '## Merge checklist' | Where-Object { -not $text.Contains($_) }).Count | Should Be 0
     }
