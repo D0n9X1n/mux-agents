@@ -1,0 +1,32 @@
+name: Feature request
+description: Something mux-agents should do
+labels: [enhancement]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: "Problem and proposed behavior"
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: "mux-agents version"
+      placeholder: "0.1.0"
+  - type: input
+    id: os
+    attributes:
+      label: "OS and version"
+  - type: input
+    id: multiplexer
+    attributes:
+      label: "Multiplexer and version"
+      placeholder: "rmux 0.10.0"
+  - type: dropdown
+    id: client
+    attributes:
+      label: "Client"
+      options:
+        - "Claude Code"
+        - "GitHub Copilot CLI"
+        - "Both"

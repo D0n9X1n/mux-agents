@@ -1,5 +1,5 @@
 $repoRoot = Split-Path -Parent $PSScriptRoot
-. (Join-Path $repoRoot 'scripts\MuxAgents.ps1')
+. (Join-Path (Join-Path $repoRoot 'scripts') 'MuxAgents.ps1')
 . (Join-Path $PSScriptRoot 'MuxAgents.TestHelpers.ps1')
 
 function Invoke-T2Verb {
@@ -31,7 +31,7 @@ function New-T2Agent {
     $folder
 }
 
-Describe 'MuxAgents part 3 no widening' {
+Describe 'MuxAgents part 3 no widening' -Tag 'windows' {
     It 'C1 every verb refuses a sandboxed or unreadable token before any rmux call' {
         foreach ($token in @(
                 [pscustomobject]@{ IsAppContainer = $true; IsRestricted = $false; IntegrityLevel = 'S-1-16-8192' },
@@ -111,7 +111,7 @@ Describe 'MuxAgents part 3 no widening' {
     }
 }
 
-Describe 'MuxAgents part 2 messages and stop' {
+Describe 'MuxAgents part 2 messages and stop' -Tag 'windows' {
     It 'B2 B4 a message is sanitized, prefixed and read exactly once' {
         $fake = New-T2Fake 'mail'
         $send = Invoke-T2Verb $fake @('send', '%1', '-Body', ("a" + [char]27 + "[31mb`r`nc" + [char]7))
@@ -251,7 +251,7 @@ Describe 'MuxAgents part 2 messages and stop' {
     }
 }
 
-Describe 'MuxAgents launcher and transport' {
+Describe 'MuxAgents launcher and transport' -Tag 'windows' {
     It 'A4 the launcher runs no client on abort and records the client exit code otherwise' {
         $fake = New-T2Fake 'launcher'
         $folder = [IO.Directory]::CreateDirectory((Join-Path $TestDrive 'launcher\agents\cccccccccccc')).FullName

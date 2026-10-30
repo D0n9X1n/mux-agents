@@ -29,7 +29,7 @@ Fix the name before anyone installs it, and give every later pull request CI on 
 - `package` (`needs: validate`, read-only): `git archive` of `.claude-plugin`, `skills`, `scripts`, `hooks` (when present), `README.md`, `LICENSE` into `mux-agents-<tag>.zip`, uploaded as an artifact.
 - `publish` (`needs: [validate, package]`), the only job with `contents: write`: `gh release create <tag>` with the zip, `--generate-notes`, and `docs/releases/<tag>.md` prepended when present.
 
-**Merge procedure** (no branch protection on this plan), in `CONTRIBUTING.md` and the PR template: read `gh pr view <n> --json headRefOid,statusCheckRollup`; every check on that head SHA must be `SUCCESS`, with `lint` and all three `test` jobs present; then `gh pr merge <n> --squash --match-head-commit <sha>`, so a newer push cannot be merged unchecked.
+**Merge procedure** (no branch protection on this plan), in `CONTRIBUTING.md` and the PR template: read `gh pr view <n> --json headRefOid,statusCheckRollup`; every check on that head SHA must be `SUCCESS`, with `lint` and all three `test` jobs present; then `git fetch origin <sha>` and `git push origin <sha>:main` (not forced), so only the checked head lands and only as a fast-forward; GitHub then marks the PR merged. Commits are authored as `D0n9X1n <D0n9x1n@outlook.com>`; a GitHub merge would re-author them (user requirement, 2026-10-30).
 
 **Hygiene.** From SonicTerm: issue templates `bug.yml` and `feature.yml` (version, OS, multiplexer, client), a PR template (summary, type, closed issue, test plan, merge checklist), `dependabot.yml` for `github-actions` monthly.
 
@@ -69,5 +69,4 @@ Unix support (B); side bar (C); README rewrite, icon, launch (D); Pester 5; bran
 | Read-only token; write only in `publish` | SonicTerm `release.yml` (read 2026-10-30) | Same | `permissions: contents: read` |
 | Actions pinned by SHA; Dependabot monthly | SonicTerm `ci.yml`, `dependabot.yml` | Same | `actions/checkout@3d3c42e… # v7.0.1` |
 | Tag on `main` with a successful CI push run | SonicTerm `validate-release-tag` | Same, as a tested script | `merge-base --is-ancestor`; runs query |
-| Pinned tool verified by SHA-256 | SonicTerm `install-pinned-tool.sh` | Inline step | pinned digest |
 | Pester 4 legacy `Should` on pwsh 7 | local Pester 4.10.1 run | Keeps 562 assertions | 179 passed / 0 failed |
