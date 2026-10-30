@@ -983,7 +983,7 @@ function Read-MuxAgentMail {
 }
 
 function Add-MuxAgentNotice {
-    # Posts the agent's one exit notice (exited, stopped or lost) to its parent's mailbox; false when already posted.
+    # Posts the agent's one exit notice (exited, stopped or lost) to its parent pane's mailbox, pane-<n>; false when already posted.
     # The caller holds the notice lock for the agent. The message goes first and notice.json last, so a failed post is
     # retried by the next list, read or spawn; the fixed message id keeps a retry after a failed marker write single.
     param([Parameter(Mandatory)]$P, [Parameter(Mandatory)]$Caller, [Parameter(Mandatory)]$Record, [Parameter(Mandatory)][ValidateSet('exited', 'stopped', 'lost')][string]$Kind, $ExitCode)
@@ -995,8 +995,7 @@ function Add-MuxAgentNotice {
         'stopped' { "$($Record.name) was stopped." }
         'lost' { "$($Record.name) is gone: its pane closed without an exit record." }
     }
-    $parentTag = if ($Record.parentAgentId) { [string]$Record.parentAgentId } else { '' }
-    $null = Add-MuxAgentMail -P $P -Caller $Caller -Key (Get-MuxAgentMailboxKey -Pane $Record.parentPane -Tag $parentTag) -From $Record.name -FromPane $Record.pane -Body $body -MessageId "exit-$($Record.id)"
+    $null = Add-MuxAgentMail -P $P -Caller $Caller -Key (Get-MuxAgentMailboxKey -Pane $Record.parentPane -Tag '') -From $Record.name -FromPane $Record.pane -Body $body -MessageId "exit-$($Record.id)"
     Write-MuxAgentJson -Path $marker -Value ([ordered]@{ kind = $Kind; exitCode = $ExitCode; at = (& $P.Now).ToString('o') })
     $true
 }

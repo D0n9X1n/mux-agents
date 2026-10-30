@@ -21,3 +21,18 @@ Describe 'MuxAgents foundation rename' {
         "$LASTEXITCODE $($hits -join ' ; ')" | Should BeExactly '1 '
     }
 }
+
+Describe 'MuxAgents foundation notice' {
+    It 'posts the exit notice to pane-<n> of parentPane even with a valid parentAgentId' {
+        $state = [IO.Path]::Combine($TestDrive, 'root', 'key')
+        $null = New-Item -ItemType Directory -Force -Path (Join-Path $state 'mail'), ([IO.Path]::Combine($state, 'agents', 'bbbbbbbbbbbb'))
+        Mock Get-MuxAgentStateDirectory { [IO.Path]::Combine($TestDrive, 'root', 'key') }
+        $p = [pscustomobject]@{ StateRoot = (Join-Path $TestDrive 'root'); Now = { [DateTime]::UtcNow } }
+        $caller = [pscustomobject]@{ ServerKey = 'key'; Session = '$3' }
+        $record = [pscustomobject]@{ id = 'bbbbbbbbbbbb'; name = 'worker'; pane = '%9'; parentPane = '%7'; parentAgentId = '0123456789ab' }
+        Add-MuxAgentNotice -P $p -Caller $caller -Record $record -Kind exited -ExitCode 0 | Should Be $true
+        $mail = Join-Path $state 'mail'
+        "$(Test-Path (Join-Path $mail 'pane-7.jsonl')) $(Test-Path (Join-Path $mail '0123456789ab.jsonl'))" | Should Be 'True False'
+        (Get-Content (Join-Path $mail 'pane-7.jsonl') | ConvertFrom-Json).body | Should BeExactly 'worker exited with code 0.'
+    }
+}
