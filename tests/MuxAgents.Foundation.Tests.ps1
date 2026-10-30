@@ -266,10 +266,16 @@ Describe 'MuxAgents foundation hygiene' {
                 if ($attributes -is [Collections.IDictionary]) {
                     foreach ($key in @($attributes.Keys)) { if ("$key" -cnotin $attributeKeys[$type]) { $problems.Add("$type attribute $key") } }
                 } elseif ($null -ne $attributes) { $problems.Add("$type attributes") }
+                # An id is optional; when present it is a non-empty string, unique within the form.
+                if ($item.Contains('id')) {
+                    if (-not ($item.id -is [string] -and $item.id)) { $problems.Add("$type id") }
+                    elseif ($ids -ccontains $item.id) { $problems.Add("duplicate id $($item.id)") }
+                    else { $ids.Add($item.id) }
+                }
                 if ($type -cne 'markdown') {
-                    if ($item.id -is [string] -and $item.id) { $ids.Add($item.id) } else { $problems.Add("$type id") }
                     if (-not ($attributes.label -is [string] -and $attributes.label.Trim())) { $problems.Add("$type label") }
                 }
+                if ($type -cin 'dropdown', 'checkboxes' -and -not ($attributes.options -is [Collections.IList] -and @($attributes.options).Count -gt 0)) { $problems.Add("$type options") }
                 if ($item.Contains('validations')) {
                     $validations = $item.validations
                     if ($validations -isnot [Collections.IDictionary]) { $problems.Add("$type validations") }
