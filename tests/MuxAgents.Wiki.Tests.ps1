@@ -1,6 +1,7 @@
-# Wiki tests: the publisher that mirrors wiki/ into the GitHub wiki repository. Untagged: they run on every OS.
+# Wiki tests: the publisher that mirrors wiki/ into the GitHub wiki repository, and its workflow. Untagged: they run on every OS.
 $repoRoot = Split-Path -Parent $PSScriptRoot
 $pwsh = [Diagnostics.Process]::GetCurrentProcess().MainModule.FileName
+Import-Module powershell-yaml -RequiredVersion 0.4.12
 
 Describe 'MuxAgents wiki publisher' {
     $publisher = [IO.Path]::Combine($repoRoot, 'scripts', 'wiki', 'Publish-MuxAgentWiki.ps1')
@@ -111,5 +112,66 @@ Describe 'MuxAgents wiki publisher' {
         $seeded = Invoke-WikiGit $remote rev-parse master
         $run = Invoke-WikiPublisher @('-Source', $source, '-WikiRepo', $repo, '-SourceSha', $sha)
         "$($run.Code) $((Invoke-WikiGit $remote rev-parse master) -ceq $seeded) $((Invoke-WikiGit $repo rev-parse HEAD) -cne $seeded)" | Should BeExactly '0 True True'
+    }
+}
+
+Describe 'MuxAgents wiki publish workflow' {
+    $workflowPath = [IO.Path]::Combine($repoRoot, '.github', 'workflows', 'publish-wiki.yml')
+    $workflow = if (Test-Path -LiteralPath $workflowPath) { ConvertFrom-Yaml -Ordered ([IO.File]::ReadAllText($workflowPath)) } else { [ordered]@{} }
+    $jobs = if ($workflow.jobs -is [Collections.IDictionary]) { $workflow.jobs } else { [ordered]@{} }
+    $publish = if ($jobs.Contains('publish')) { $jobs['publish'] } else { [ordered]@{} }
+    $steps = @(if ($publish.steps -is [Collections.IList]) { $publish.steps })
+    # The comma keeps a one-element list a list; returned bare, it would unroll into its string.
+    function Get-WikiValue($Map, [string]$Key) { if ($Map -is [Collections.IDictionary] -and $Map.Contains($Key)) { , $Map[$Key] } }
+    function Format-WikiMap($Map) { if ($Map -is [Collections.IDictionary]) { @($Map.Keys | Sort-Object | ForEach-Object { "$_=$($Map[$_])" }) -join ',' } else { "$Map" } }
+    function Get-WikiStepKind($Step) {
+        $run = "$(Get-WikiValue $Step 'run')".Trim()
+        if ("$(Get-WikiValue $Step 'uses')".StartsWith('actions/checkout@', [StringComparison]::Ordinal)) { 'checkout' }
+        elseif ($run.StartsWith('git clone ', [StringComparison]::Ordinal)) { 'clone' }
+        elseif ("$(Get-WikiValue $Step 'id')" -ceq 'mirror') { 'mirror' }
+        elseif ($run.Contains(' push ')) { 'push' }
+        else { 'other' }
+    }
+    function Get-WikiStep([string]$Kind) { @($steps | Where-Object { (Get-WikiStepKind $_) -ceq $Kind }) }
+    It 'is named Publish wiki and runs only on pushes to main and by hand' {
+        $on = $workflow['on']
+        $push = Get-WikiValue $on 'push'
+        $branches = Get-WikiValue $push 'branches'
+        "$($workflow.name) | $(@($on.Keys | Sort-Object) -join ',') | $(@($push.Keys) -join ',') $($branches -is [Collections.IList]) $(@($branches) -join ',')" | Should BeExactly 'Publish wiki | push,workflow_dispatch | branches True main'
+    }
+    It 'reads contents at the top and writes contents only in its one job, publish' {
+        $grants = @("top:$(Format-WikiMap $workflow.permissions)") + @(foreach ($name in @($jobs.Keys)) { "${name}:$(Format-WikiMap $jobs[$name].permissions)" })
+        $grants -join ' ; ' | Should BeExactly 'top:contents=read ; publish:contents=write'
+    }
+    It 'runs one publish at a time and never cancels one in progress' {
+        $concurrency = $workflow.concurrency
+        $cancel = Get-WikiValue $concurrency 'cancel-in-progress'
+        "$($concurrency -is [Collections.IDictionary]) $($concurrency.group) $($cancel -is [bool]) $cancel" | Should BeExactly 'True publish-wiki True False'
+    }
+    It 'publishes only from refs/heads/main, on ubuntu-latest' {
+        "$(Get-WikiValue $publish 'if') | $(Get-WikiValue $publish 'runs-on')" | Should BeExactly "github.ref == 'refs/heads/main' | ubuntu-latest"
+    }
+    It 'checks out, clones, mirrors, then pushes' {
+        @($steps | ForEach-Object { Get-WikiStepKind $_ }) -join ',' | Should BeExactly 'checkout,clone,mirror,push'
+    }
+    It 'pins checkout to a commit SHA with a version comment and does not persist credentials' {
+        $uses = @($steps | Where-Object { $_ -is [Collections.IDictionary] -and $_.Contains('uses') } | ForEach-Object { "$($_.uses)" })
+        $uses -join ' ; ' | Should BeExactly 'actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1'
+        $lines = @(if (Test-Path -LiteralPath $workflowPath) { [IO.File]::ReadAllLines($workflowPath) | Where-Object { $_ -match '^\s*(-\s+)?uses:' } })
+        "$($lines.Count) $(@($lines | Where-Object { $_ -notmatch '\s#\s*v\d' }) -join ' ; ')" | Should BeExactly "$($uses.Count) "
+        $persist = @(Get-WikiStep 'checkout' | ForEach-Object { Get-WikiValue $_.with 'persist-credentials' })
+        "$($persist.Count) $($persist[0] -is [bool]) $($persist[0])" | Should BeExactly '1 True False'
+    }
+    It 'clones the wiki repository into wiki-repo with the workflow token' {
+        $clone = @(Get-WikiStep 'clone' | ForEach-Object { "$($_.run)".Trim() + " | $(Get-WikiValue $_.env 'GH_TOKEN') | $(Get-WikiValue $_ 'shell')" })
+        $clone -join ' ; ' | Should BeExactly 'git clone "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.wiki.git" wiki-repo | ${{ secrets.GITHUB_TOKEN }} | '
+    }
+    It 'runs the publisher in pwsh as step mirror' {
+        $mirror = @(Get-WikiStep 'mirror' | ForEach-Object { "$(Get-WikiValue $_ 'shell') | " + "$($_.run)".Trim() })
+        $mirror -join ' ; ' | Should BeExactly 'pwsh | ./scripts/wiki/Publish-MuxAgentWiki.ps1 -Source wiki -WikiRepo wiki-repo -SourceSha $env:GITHUB_SHA'
+    }
+    It 'pushes the mirror to the wiki master only when it changed' {
+        $push = @(Get-WikiStep 'push' | ForEach-Object { "$(Get-WikiValue $_ 'if') | " + "$($_.run)".Trim() })
+        $push -join ' ; ' | Should BeExactly "steps.mirror.outputs.changed == 'true' | git -C wiki-repo push origin HEAD:master"
     }
 }
