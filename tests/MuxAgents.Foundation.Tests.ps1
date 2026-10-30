@@ -438,10 +438,11 @@ Describe 'MuxAgents foundation release workflow' {
     $releasePath = [IO.Path]::Combine($repoRoot, '.github', 'workflows', 'release.yml')
     $release = if (Test-Path -LiteralPath $releasePath) { ConvertFrom-Yaml -Ordered ([IO.File]::ReadAllText($releasePath)) } else { [ordered]@{} }
     $jobs = if ($release.jobs -is [Collections.IDictionary]) { $release.jobs } else { [ordered]@{} }
-    $jobNames = @($jobs.Keys)
+    $jobNames = @($jobs.get_Keys())
     function Get-ReleaseSteps([string]$Name) { if ($jobs.Contains($Name)) { @($jobs[$Name].steps) } }
     function Get-ReleaseRunLines($Step) { @("$($Step.run)" -split '\r?\n' | ForEach-Object { $_.Trim() } | Where-Object { $_ }) }
-    function Format-ReleaseMap($Map) { if ($Map -is [Collections.IDictionary]) { @($Map.Keys | Sort-Object | ForEach-Object { "$_=$($Map[$_])" }) -join ',' } else { "$Map" } }
+    # get_Keys(), not .Keys: a YAML entry named keys would shadow the property and hide the real entries.
+    function Format-ReleaseMap($Map) { if ($Map -is [Collections.IDictionary]) { @($Map.get_Keys() | Sort-Object | ForEach-Object { "$_=$($Map[$_])" }) -join ',' } else { "$Map" } }
     $steps = @(foreach ($name in $jobNames) { Get-ReleaseSteps $name })
     It 'runs only on pushes of v<major>.<minor>.<patch> tags' {
         $on = $release['on']
@@ -449,7 +450,7 @@ Describe 'MuxAgents foundation release workflow' {
         # Assigned, not taken from an if expression, which would unroll a one-element list into its string.
         $tags = $null
         if ($push -is [Collections.IDictionary]) { $tags = $push.tags }
-        "$($on -is [Collections.IDictionary]) $(@($on.Keys) -join ',') $($push -is [Collections.IDictionary]) $(@($push.Keys) -join ',') $($tags -is [Collections.IList]) $(@($tags).Count) $(@($tags) -join ',')" | Should BeExactly 'True push True tags True 1 v[0-9]+.[0-9]+.[0-9]+'
+        "$($on -is [Collections.IDictionary]) $(@($on.get_Keys()) -join ',') $($push -is [Collections.IDictionary]) $(@($push.get_Keys()) -join ',') $($tags -is [Collections.IList]) $(@($tags).Count) $(@($tags) -join ',')" | Should BeExactly 'True push True tags True 1 v[0-9]+.[0-9]+.[0-9]+'
     }
     It 'reads contents at the top, also reads actions in validate and writes contents only in publish' {
         @($jobNames | Sort-Object) -join ',' | Should BeExactly 'package,publish,validate'
