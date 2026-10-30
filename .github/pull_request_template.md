@@ -11,4 +11,4 @@ Closes #
 
 ## Merge checklist
 - [ ] `gh pr view <n> --json headRefOid,statusCheckRollup`: every check on headRefOid is SUCCESS; `lint`, `test (ubuntu-latest)`, `test (macos-latest)` and `test (windows-latest)` are present
-- [ ] `git push origin <sha>:main`, with `<sha>` the checked headRefOid; not forced, so it lands only on the current `main`
+- [ ] `git fetch origin <sha>`, then `git push origin <sha>:main`, with `<sha>` the checked headRefOid; not forced, so it lands only on the current `main`
