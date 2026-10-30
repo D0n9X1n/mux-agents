@@ -192,11 +192,11 @@ Describe 'MuxAgents foundation CI' {
         $other = @($conditions | Where-Object { -not [object]::ReferenceEquals($_.Step, $temp[0]) -or $_.Condition -cne "runner.os == 'Windows'" } | ForEach-Object { "$($_.Step.name): $($_.Condition)" })
         "$($temp.Count) $($other -join ' ; ')" | Should BeExactly '1 '
     }
-    It 'pins every action to a full commit SHA with a comment' {
+    It 'pins every action to a full commit SHA with a version comment' {
         $uses = @($steps | Where-Object { $_.Contains('uses') } | ForEach-Object { "$($_.uses)" })
         "$($uses.Count -gt 0) $(@($uses | Where-Object { $_ -cnotmatch '^[\w.-]+/[\w.-]+@[0-9a-f]{40}$' }) -join ' ; ')" | Should BeExactly 'True '
         $lines = @([IO.File]::ReadAllLines($ciPath) | Where-Object { $_ -match '^\s*(-\s+)?uses:' })
-        "$($lines.Count) $(@($lines | Where-Object { $_ -notmatch '@[0-9a-f]{40}\s+#\s*\S' }) -join ' ; ')" | Should BeExactly "$($uses.Count) "
+        "$($lines.Count) $(@($lines | Where-Object { $_ -notmatch '@[0-9a-f]{40}\s+#\s*v?\d+(\.\d+)*\b' }) -join ' ; ')" | Should BeExactly "$($uses.Count) "
     }
     It 'checks out the repository in lint and test before any run step' {
         $late = @(foreach ($name in 'lint', 'test') {
@@ -312,9 +312,31 @@ Describe 'MuxAgents foundation hygiene' {
         @($checklist | Where-Object { $lines -cnotcontains $_ }) -join ' ; ' | Should BeExactly ''
         # A GitHub merge re-authors the commit, so neither document may offer one.
         "$(($contributing -join "`n").Contains('gh pr merge')) $([IO.File]::ReadAllText($template).Contains('gh pr merge'))" | Should BeExactly 'False False'
-        # The push is never forced.
-        @(@($contributing) + @($lines) | Where-Object { $_.Contains('git push') -and $_ -cmatch '--force|\s-f\s' }) -join ' ; ' | Should BeExactly ''
+        # The push is never forced: no --force, no -f flag, no +refspec.
+        @(@($contributing) + @($lines) | Where-Object { $_.Contains('git push') -and $_ -cmatch '--force|(?<![\w-])-f(?![\w-])|\s\+[^\s`]*:' }) -join ' ; ' | Should BeExactly ''
         $text = [IO.File]::ReadAllText($template)
         @('## Summary', '## Type', '## Closes', '## Test plan', '## Merge checklist' | Where-Object { -not $text.Contains($_) }).Count | Should Be 0
+    }
+    # The tests above check what the spec requires; this one pins the files as reviewed, so any other change to them
+    # fails until it is reviewed and the hash updated. ci.yml is hashed with its action pins blanked, so a Dependabot
+    # SHA bump passes; the pin test checks the pins.
+    It 'keeps ci.yml, the issue forms and the PR template as reviewed' {
+        function Get-ReviewedHash([string]$Path, [switch]$Pins) {
+            $text = [IO.File]::ReadAllText((Join-Path $repoRoot $Path)) -replace "`r`n", "`n"
+            if ($Pins) { $text = $text -replace '@[0-9a-f]{40} # v\d+(\.\d+)*', '@<pin>' }
+            [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData([Text.Encoding]::UTF8.GetBytes($text))).ToLowerInvariant()
+        }
+        $actual = @(
+            "ci.yml=$(Get-ReviewedHash '.github/workflows/ci.yml' -Pins)"
+            "bug.yml=$(Get-ReviewedHash '.github/ISSUE_TEMPLATE/bug.yml')"
+            "feature.yml=$(Get-ReviewedHash '.github/ISSUE_TEMPLATE/feature.yml')"
+            "pull_request_template.md=$(Get-ReviewedHash '.github/pull_request_template.md')"
+        )
+        $actual -join ' ; ' | Should BeExactly (@(
+                'ci.yml=9c6c72287ca005fb59d817f6037bc2739e654edcbcaff07780b65f8259e600ac'
+                'bug.yml=017ee31a64ba465010af2ab3fa839339ec28b7170dd3ce9df66e632e2561898a'
+                'feature.yml=c70bb8bff8d86a444995e16a182b20e4c635e1cd4002b47482dc571980f999c1'
+                'pull_request_template.md=91780120628ac4776e768af3bac521f4500f9d88298fdbc20718abfa1279ec60'
+            ) -join ' ; ')
     }
 }
