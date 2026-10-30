@@ -8,6 +8,10 @@ Commits are authored and committed as `D0n9X1n <D0n9x1n@outlook.com>`. A pull re
 
 `pwsh -NoProfile -File tests/Invoke-MuxAgentTests.ps1` (Pester 4.10.1) must pass on Windows. CI runs it on Linux, macOS and Windows.
 
+## Documentation
+
+`wiki/` is the source of truth for documentation; the repository has no `docs/` folder. Every page is written in English and Chinese, as `Page.md` and `Page-zh-CN.md`, and links to its twin at the top. Link pages by page name, as in `[Home](Home)`. The Publish wiki workflow mirrors `wiki/*.md` to the GitHub wiki on every push to `main`.
+
 ## Merge procedure
 
 1. `gh pr view <n> --json headRefOid,statusCheckRollup`

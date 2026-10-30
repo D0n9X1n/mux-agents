@@ -208,3 +208,16 @@ Describe 'MuxAgents wiki pages' {
         @(& git -C $repoRoot ls-files -- docs) -join ',' | Should BeExactly ''
     }
 }
+
+Describe 'MuxAgents wiki contributor docs' {
+    It 'CONTRIBUTING has a Documentation section naming wiki/, both page names and the Publish wiki workflow' {
+        $lines = [IO.File]::ReadAllLines((Join-Path $repoRoot 'CONTRIBUTING.md'))
+        $start = [array]::IndexOf($lines, '## Documentation')
+        $section = if ($start -ge 0) { @($lines[($start + 1)..($lines.Count - 1)] | ForEach-Object -Begin { $open = $true } -Process { if ($_ -match '^## ') { $open = $false }; if ($open) { $_ } }) -join "`n" } else { '' }
+        "$($start -ge 0) $(@('`wiki/`', '`Page.md`', '`Page-zh-CN.md`', 'Publish wiki', 'main' | Where-Object { -not $section.Contains($_) }) -join ' ; ')" | Should BeExactly 'True '
+    }
+    It 'README Layout table has a wiki/ row and a scripts/wiki/ row' {
+        $lines = [IO.File]::ReadAllLines((Join-Path $repoRoot 'README.md'))
+        @('| `wiki/` |', '| `scripts/wiki/` |' | ForEach-Object { $prefix = $_; @($lines | Where-Object { $_.StartsWith($prefix, [StringComparison]::Ordinal) }).Count }) -join ',' | Should BeExactly '1,1'
+    }
+}

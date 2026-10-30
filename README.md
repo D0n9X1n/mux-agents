@@ -16,6 +16,8 @@ A plugin for Claude Code and GitHub Copilot CLI. When the client runs inside an 
 | `scripts/MuxAgents.ps1` | Library: caller, checks, registry, locks, spawn, list, focus, send, read, stop, launcher |
 | `scripts/mux-agent-launcher.ps1` | Pane launcher: waits for the launch commit, then starts the client |
 | `tests/` | Pester 4.10.1 tests on fakes; `Invoke-MuxAgentTests.ps1` runs them |
+| `wiki/` | Documentation, the source of the GitHub wiki: every page in English (`Page.md`) and Chinese (`Page-zh-CN.md`) |
+| `scripts/wiki/` | Wiki publisher run by the Publish wiki workflow; not in the plugin zip |
 
 ## How it works
 
