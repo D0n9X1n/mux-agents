@@ -7,11 +7,21 @@ Describe 'MuxAgents icon' {
         $result = foreach ($pair in @(@('mux-agents.svg', '0 0 512 512'), @('mux-agents-16.svg', '0 0 16 16'))) {
             $path = Join-Path $iconRoot $pair[0]
             if (-not (Test-Path -LiteralPath $path)) { "$($pair[0]) missing"; continue }
-            $text = [IO.File]::ReadAllText($path)
-            $svg = ([xml]$text).DocumentElement
+            $doc = [xml][IO.File]::ReadAllText($path)
+            $svg = $doc.DocumentElement
             $square = $svg.viewBox -ceq $pair[1]
             $titled = $svg.title -ceq 'mux-agents'
-            $closed = $text -notmatch '(?i)<script|href=|url\((?!#)'
+            # Walk the parsed document, not its text: only drawing elements in the SVG namespace, no doctype or
+            # processing instruction, no href or on* attribute, and url() only to an id inside the file.
+            $drawing = 'svg', 'title', 'defs', 'linearGradient', 'stop', 'rect', 'path', 'circle'
+            $closed = $null -eq $doc.DocumentType
+            foreach ($node in $doc.SelectNodes('//node()')) {
+                if ($node.NodeType -in 'Text', 'Whitespace', 'SignificantWhitespace', 'Comment') { continue }
+                if ($node.NodeType -ne 'Element' -or $node.NamespaceURI -cne 'http://www.w3.org/2000/svg' -or $node.LocalName -cnotin $drawing) { $closed = $false; continue }
+                foreach ($attribute in $node.Attributes) {
+                    if ($attribute.LocalName -ieq 'href' -or $attribute.LocalName -imatch '^on' -or $attribute.Value -imatch 'url\(\s*(?!#)') { $closed = $false }
+                }
+            }
             '{0} {1} {2} {3} {4}' -f $pair[0], $svg.LocalName, $square, $titled, $closed
         }
         $result -join ' ; ' | Should BeExactly 'mux-agents.svg svg True True True ; mux-agents-16.svg svg True True True'
