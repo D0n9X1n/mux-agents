@@ -374,7 +374,7 @@ Describe 'MuxAgents foundation release gate' {
 }
 
 Describe 'MuxAgents foundation package' {
-    It 'LICENSE is the full MIT text and release tooling is export-ignored' {
+    It 'LICENSE is the full MIT text and release tooling, the wiki publisher and the wiki are export-ignored' {
         $mit = @(
             'MIT License'
             ''
@@ -399,7 +399,8 @@ Describe 'MuxAgents foundation package' {
             'SOFTWARE.'
         ) -join "`n"
         ([IO.File]::ReadAllText((Join-Path $repoRoot 'LICENSE')) -replace '\r\n', "`n").TrimEnd("`n") | Should BeExactly $mit
-        [IO.File]::ReadAllText((Join-Path $repoRoot '.gitattributes')) | Should Match '(?m)^scripts/release export-ignore$'
+        $attributes = [IO.File]::ReadAllLines((Join-Path $repoRoot '.gitattributes'))
+        @('scripts/release export-ignore', 'scripts/wiki export-ignore', 'wiki export-ignore' | Where-Object { $attributes -cnotcontains $_ }) -join ' ; ' | Should BeExactly ''
     }
     It 'zips only the plugin files of a commit' {
         $zip = Join-Path $TestDrive 'plugin.zip'
@@ -407,8 +408,8 @@ Describe 'MuxAgents foundation package' {
         $LASTEXITCODE | Should Be 0
         $out = Join-Path $TestDrive 'plugin'
         Expand-Archive -LiteralPath $zip -DestinationPath $out
-        $seen = foreach ($path in '.claude-plugin/plugin.json', '.claude-plugin/marketplace.json', 'skills/mux-agents/SKILL.md', 'scripts/mux-agent.ps1', 'scripts/MuxAgents.ps1', 'scripts/mux-agent-launcher.ps1', 'README.md', 'LICENSE', 'tests', '.github', 'scripts/release') { "$path=$(Test-Path -LiteralPath (Join-Path $out $path))" }
-        $seen -join ' ' | Should BeExactly '.claude-plugin/plugin.json=True .claude-plugin/marketplace.json=True skills/mux-agents/SKILL.md=True scripts/mux-agent.ps1=True scripts/MuxAgents.ps1=True scripts/mux-agent-launcher.ps1=True README.md=True LICENSE=True tests=False .github=False scripts/release=False'
+        $seen = foreach ($path in '.claude-plugin/plugin.json', '.claude-plugin/marketplace.json', 'skills/mux-agents/SKILL.md', 'scripts/mux-agent.ps1', 'scripts/MuxAgents.ps1', 'scripts/mux-agent-launcher.ps1', 'README.md', 'LICENSE', 'tests', '.github', 'scripts/release', 'scripts/wiki', 'wiki') { "$path=$(Test-Path -LiteralPath (Join-Path $out $path))" }
+        $seen -join ' ' | Should BeExactly '.claude-plugin/plugin.json=True .claude-plugin/marketplace.json=True skills/mux-agents/SKILL.md=True scripts/mux-agent.ps1=True scripts/MuxAgents.ps1=True scripts/mux-agent-launcher.ps1=True README.md=True LICENSE=True tests=False .github=False scripts/release=False scripts/wiki=False wiki=False'
     }
     It 'includes hooks only when the commit has them' {
         $fixture = Join-Path $TestDrive 'pkg-repo'
