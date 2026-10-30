@@ -3,3 +3,4 @@
 scripts/release export-ignore
 scripts/wiki export-ignore
 wiki export-ignore
+assets export-ignore

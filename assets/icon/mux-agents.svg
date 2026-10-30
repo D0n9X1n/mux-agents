@@ -1,0 +1,21 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-label="mux-agents">
+  <title>mux-agents</title>
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#1e293b"/>
+      <stop offset="1" stop-color="#0b1220"/>
+    </linearGradient>
+  </defs>
+  <rect width="512" height="512" rx="112" fill="url(#bg)"/>
+  <!-- main pane: the session you talk to -->
+  <rect x="72" y="96" width="220" height="320" rx="28" fill="#0f172a" stroke="#334155" stroke-width="12"/>
+  <path d="M120 206 L168 256 L120 306" fill="none" stroke="#e2e8f0" stroke-width="28" stroke-linecap="round" stroke-linejoin="round"/>
+  <rect x="186" y="290" width="62" height="24" rx="12" fill="#e2e8f0"/>
+  <!-- agent panes -->
+  <rect x="316" y="96" width="124" height="92" rx="24" fill="#0f172a" stroke="#334155" stroke-width="12"/>
+  <rect x="316" y="210" width="124" height="92" rx="24" fill="#0f172a" stroke="#334155" stroke-width="12"/>
+  <rect x="316" y="324" width="124" height="92" rx="24" fill="#0f172a" stroke="#334155" stroke-width="12"/>
+  <circle cx="378" cy="142" r="22" fill="#2dd4bf"/>
+  <circle cx="378" cy="256" r="22" fill="#fbbf24"/>
+  <circle cx="378" cy="370" r="22" fill="#a78bfa"/>
+</svg>

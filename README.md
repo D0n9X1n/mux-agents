@@ -1,3 +1,5 @@
+<p align="center"><img src="assets/icon/mux-agents.svg" width="128" height="128" alt="mux-agents icon"></p>
+
 # mux-agents
 
 A plugin for Claude Code and GitHub Copilot CLI. When the client runs inside an RMUX pane, it can start other Claude Code or Copilot CLI agents in new windows or panes of the same session, with forked context, then list, focus, message and stop them.

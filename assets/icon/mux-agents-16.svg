@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" role="img" aria-label="mux-agents">
+  <title>mux-agents</title>
+  <rect x="0.5" y="0.5" width="15" height="15" rx="3.5" fill="#0f172a" stroke="#475569"/>
+  <path d="M3.2 5.2 L5.6 8 L3.2 10.8" fill="none" stroke="#e2e8f0" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>
+  <circle cx="11.5" cy="4.5" r="1.6" fill="#2dd4bf"/>
+  <circle cx="11.5" cy="8" r="1.6" fill="#fbbf24"/>
+  <circle cx="11.5" cy="11.5" r="1.6" fill="#a78bfa"/>
+</svg>
