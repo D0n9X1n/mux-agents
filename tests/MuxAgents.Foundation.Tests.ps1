@@ -340,3 +340,24 @@ Describe 'MuxAgents foundation hygiene' {
             ) -join ' ; ')
     }
 }
+
+Describe 'MuxAgents foundation release gate' {
+    $gate = [IO.Path]::Combine($repoRoot, 'scripts', 'release', 'Test-MuxAgentRelease.ps1')
+    $sha = 'a' * 40
+    $green = [pscustomobject]@{ conclusion = 'success'; head_sha = $sha; event = 'push' }
+    $red = [pscustomobject]@{ conclusion = 'failure'; head_sha = $sha; event = 'push' }
+    function Invoke-FoundationGate([bool]$OnMain = $true, [object[]]$Runs = @($green), [string]$Version = '0.1.0') {
+        $line = & $gate -Tag 'v0.1.0' -Sha $sha -IsAncestorOfMain $OnMain -Runs $Runs -ManifestVersion $Version
+        "$LASTEXITCODE $line"
+    }
+    It 'passes an on-main tag with a green CI push run and a matching version' { Invoke-FoundationGate | Should BeExactly "0 release ok: v0.1.0 at $sha" }
+    It 'refuses a tag that is not on main' { Invoke-FoundationGate -OnMain $false | Should BeExactly '1 refused: v0.1.0 is not on main' }
+    It 'refuses a tag with no CI push run' { Invoke-FoundationGate -Runs @() | Should BeExactly "1 refused: no CI push run for $sha" }
+    It 'refuses a tag whose CI push runs all failed' { Invoke-FoundationGate -Runs @($red) | Should BeExactly "1 refused: no successful CI push run for $sha" }
+    It 'refuses a plugin.json version that differs from the tag' { Invoke-FoundationGate -Version '0.2.0' | Should BeExactly '1 refused: plugin.json version 0.2.0 does not match v0.1.0' }
+    It 'counts only push runs for this sha' {
+        $prRun = [pscustomobject]@{ conclusion = 'success'; head_sha = $sha; event = 'pull_request' }
+        $otherSha = [pscustomobject]@{ conclusion = 'success'; head_sha = ('b' * 40); event = 'push' }
+        Invoke-FoundationGate -Runs @($prRun, $otherSha) | Should BeExactly "1 refused: no CI push run for $sha"
+    }
+}
