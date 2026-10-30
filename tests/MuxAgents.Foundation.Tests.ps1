@@ -190,6 +190,18 @@ Describe 'MuxAgents foundation CI' {
         $lines = @([IO.File]::ReadAllLines($ciPath) | Where-Object { $_ -match '^\s*(-\s+)?uses:' })
         "$($lines.Count) $(@($lines | Where-Object { $_ -notmatch '\s#\s*v\d' }) -join ' ; ')" | Should BeExactly "$($uses.Count) "
     }
+    It 'checks out the repository in lint and test before any run step' {
+        $late = @(foreach ($name in 'lint', 'test') {
+            $jobSteps = @(Get-JobSteps $name)
+            $checkout = -1; $firstRun = -1
+            for ($i = 0; $i -lt $jobSteps.Count; $i++) {
+                if ($checkout -lt 0 -and "$($jobSteps[$i].uses)" -cmatch '^actions/checkout@') { $checkout = $i }
+                if ($firstRun -lt 0 -and $jobSteps[$i].Contains('run')) { $firstRun = $i }
+            }
+            if ($checkout -lt 0 -or ($firstRun -ge 0 -and $firstRun -lt $checkout)) { $name }
+        })
+        $late -join ',' | Should BeExactly ''
+    }
     It 'lint installs actionlint 1.7.12 strictly against its SHA-256 and runs it' {
         $lint = @(Get-JobSteps 'lint')
         $expected = @(
