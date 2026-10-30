@@ -189,14 +189,21 @@ Describe 'MuxAgents foundation CI' {
         $lines = @([IO.File]::ReadAllLines($ciPath) | Where-Object { $_ -match '^\s*(-\s+)?uses:' })
         "$($lines.Count) $(@($lines | Where-Object { $_ -notmatch '\s#\s*v\d' }) -join ' ; ')" | Should BeExactly "$($uses.Count) "
     }
-    It 'lint checks the actionlint 1.7.12 download, runs it and parses both manifests' {
+    It 'lint installs actionlint 1.7.12 strictly against its SHA-256 and runs it' {
         $lint = @(Get-JobSteps 'lint')
-        $url = 'https://github.com/rhysd/actionlint/releases/download/v1.7.12/actionlint_1.7.12_linux_amd64.tar.gz'
-        $check = 'echo ''8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8  actionlint.tar.gz'' | sha256sum -c -'
-        $install = @($lint | Where-Object { $runLines = Get-RunLines $_; @($runLines | Where-Object { $_.StartsWith('curl ') -and $_.Contains($url) }).Count -gt 0 -and $runLines -ccontains $check })
+        $expected = @(
+            'set -euo pipefail'
+            'curl -fsSLo actionlint.tar.gz https://github.com/rhysd/actionlint/releases/download/v1.7.12/actionlint_1.7.12_linux_amd64.tar.gz'
+            'echo ''8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8  actionlint.tar.gz'' | sha256sum -c -'
+            'tar -xzf actionlint.tar.gz actionlint'
+        ) -join "`n"
+        $install = @($lint | Where-Object { (Get-RunLines $_) -join "`n" -ceq $expected })
         $run = @($lint | Where-Object { "$($_.run)" -ceq './actionlint -color' })
-        $manifest = @($lint | Where-Object { $text = "$($_.run)"; $_.shell -ceq 'pwsh' -and $text.Contains('.claude-plugin/plugin.json') -and $text.Contains('.claude-plugin/marketplace.json') -and $text -cmatch '\|\s*ConvertFrom-Json\b' })
-        "$($install.Count -gt 0) $($run.Count -gt 0) $($manifest.Count -gt 0)" | Should BeExactly 'True True True'
+        "$($install.Count) $($run.Count)" | Should BeExactly '1 1'
+    }
+    It 'lint parses both manifests' {
+        $manifest = @(Get-JobSteps 'lint' | Where-Object { $text = "$($_.run)"; $_.shell -ceq 'pwsh' -and $text.Contains('.claude-plugin/plugin.json') -and $text.Contains('.claude-plugin/marketplace.json') -and $text -cmatch '\|\s*ConvertFrom-Json\b' })
+        $manifest.Count -gt 0 | Should Be $true
     }
     It 'test points TEMP and TMP at RUNNER_TEMP, installs the pinned modules and runs the runner last' {
         $test = @(Get-JobSteps 'test')
