@@ -88,3 +88,33 @@ Describe 'MuxAgents foundation CI' {
         "$($uses.Count -gt 0) $(@($uses | Where-Object { $_ -notmatch '@[0-9a-f]{40} # v\d' }) -join ' ; ')" | Should BeExactly 'True '
     }
 }
+
+Describe 'MuxAgents foundation hygiene' {
+    It 'issue templates ask version, OS, multiplexer and client; dependabot updates actions monthly' {
+        foreach ($name in 'bug.yml', 'feature.yml') {
+            $text = [IO.File]::ReadAllText([IO.Path]::Combine($repoRoot, '.github', 'ISSUE_TEMPLATE', $name))
+            "$name $(@('version', 'os', 'multiplexer', 'client' | Where-Object { $text -notmatch "id: $_\b" }))" | Should BeExactly "$name "
+        }
+        $bot = [IO.File]::ReadAllText([IO.Path]::Combine($repoRoot, '.github', 'dependabot.yml'))
+        "$($bot -match 'package-ecosystem: github-actions') $($bot -match 'interval: monthly')" | Should Be 'True True'
+    }
+    It 'issue forms are block style with only GitHub form attribute keys and quoted text' {
+        $allowed = 'label', 'description', 'placeholder', 'value', 'options', 'render', 'multiple', 'default'
+        foreach ($name in 'bug.yml', 'feature.yml') {
+            $lines = [IO.File]::ReadAllLines([IO.Path]::Combine($repoRoot, '.github', 'ISSUE_TEMPLATE', $name))
+            # No flow mappings anywhere: a comma inside one silently becomes a new key.
+            @($lines | Where-Object { $_ -match '\{' }).Count | Should Be 0
+            # Only the direct children of each attributes: block; validations: and its required: are not attributes.
+            $keys = [Collections.Generic.List[string]]::new()
+            $inside = $false
+            foreach ($line in $lines) {
+                if ($line -match '^    attributes:\s*$') { $inside = $true; continue }
+                if ($inside -and $line -match '^ {0,4}\S') { $inside = $false }
+                if ($inside -and $line -match '^      ([^\s:][^:]*):') { $keys.Add($Matches[1]) }
+            }
+            "$name $($keys.Count -gt 0) $(@($keys | Where-Object { $_ -cnotin $allowed }) -join ',')" | Should BeExactly "$name True "
+            $text = @($lines | Where-Object { $_ -match '^      (label|description|placeholder): ' })
+            @($text | Where-Object { $_ -notmatch ': "[^"]*"$' }) -join ' ; ' | Should BeExactly ''
+        }
+    }
+}

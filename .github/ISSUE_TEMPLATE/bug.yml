@@ -1,0 +1,41 @@
+name: Bug report
+description: Something mux-agents does wrong
+labels: [bug]
+body:
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: "What happened"
+      description: "What you ran, what you expected, and the JSON reply you got"
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: "mux-agents version"
+      placeholder: "0.1.0"
+    validations:
+      required: true
+  - type: input
+    id: os
+    attributes:
+      label: "OS and version"
+      placeholder: "Windows 11 24H2"
+    validations:
+      required: true
+  - type: input
+    id: multiplexer
+    attributes:
+      label: "Multiplexer and version"
+      placeholder: "rmux 0.10.0"
+    validations:
+      required: true
+  - type: dropdown
+    id: client
+    attributes:
+      label: "Client"
+      options:
+        - "Claude Code"
+        - "GitHub Copilot CLI"
+    validations:
+      required: true
