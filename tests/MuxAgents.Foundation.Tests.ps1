@@ -117,4 +117,16 @@ Describe 'MuxAgents foundation hygiene' {
             @($text | Where-Object { $_ -notmatch ': "[^"]*"$' }) -join ' ; ' | Should BeExactly ''
         }
     }
+    It 'CONTRIBUTING and the PR template carry the merge procedure' {
+        $template = [IO.Path]::Combine($repoRoot, '.github', 'pull_request_template.md')
+        foreach ($path in (Join-Path $repoRoot 'CONTRIBUTING.md'), $template) {
+            $text = [IO.File]::ReadAllText($path)
+            "$($text.Contains('gh pr view <n> --json headRefOid,statusCheckRollup')) $($text.Contains('gh pr merge <n> --squash --match-head-commit <sha>'))" | Should Be 'True True'
+            # The prerequisites, not just the commands: every check SUCCESS on the head, and the four checks present.
+            "$($text -match 'every check on (that )?`?headRefOid`? is `?SUCCESS`?')" | Should Be 'True'
+            @('lint', 'test (ubuntu-latest)', 'test (macos-latest)', 'test (windows-latest)' | Where-Object { -not $text.Contains($_) }) -join ',' | Should BeExactly ''
+        }
+        $text = [IO.File]::ReadAllText($template)
+        @('## Summary', '## Type', '## Closes', '## Test plan', '## Merge checklist' | Where-Object { -not $text.Contains($_) }).Count | Should Be 0
+    }
 }
