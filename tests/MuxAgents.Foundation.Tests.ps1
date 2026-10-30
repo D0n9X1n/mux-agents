@@ -102,7 +102,9 @@ Describe 'MuxAgents foundation legacy suites' {
         foreach ($name in 'MuxAgents.Tests.ps1', 'MuxAgentsVerbs.Tests.ps1') {
             $lines = [IO.File]::ReadAllLines((Join-Path $testsRoot $name))
             $describes = @($lines | Where-Object { $_ -match '^\s*Describe\b' })
-            "$name $($describes.Count -gt 0) $(@($describes | Where-Object { $_ -notmatch " -Tag 'windows' \{$" }).Count)" | Should BeExactly "$name True 0"
+            # -Tag 'windows', -Tag "windows" or -Tag windows, any spacing, then the opening brace.
+            $tagged = '\s-Tag\s+([''"]?)windows\1\s*\{\s*$'
+            "$name $($describes.Count -gt 0) $(@($describes | Where-Object { $_ -notmatch $tagged }).Count)" | Should BeExactly "$name True 0"
             @($lines | Where-Object { $_ -match '^\. ' -and $_.Contains('\') }).Count | Should Be 0
         }
     }
