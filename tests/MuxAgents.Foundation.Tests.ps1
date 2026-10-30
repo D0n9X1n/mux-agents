@@ -73,3 +73,18 @@ Describe 'MuxAgents foundation docs' {
         "$($text.Contains('pwsh -NoProfile -File tests/Invoke-MuxAgentTests.ps1')) $($text -match 'Pester 3\.4')" | Should Be 'True False'
     }
 }
+
+Describe 'MuxAgents foundation CI' {
+    It 'ci.yml has the triggers, pins, lint and the three-OS test matrix' {
+        $text = [IO.File]::ReadAllText([IO.Path]::Combine($repoRoot, '.github', 'workflows', 'ci.yml'))
+        $expected = @('(?m)^  pull_request:', '(?m)^    branches: \[main\]', '(?m)^permissions:\r?\n  contents: read',
+            'cancel-in-progress: \$\{\{ github\.event_name == ''pull_request'' \}\}',
+            '(?m)^  group: ci-\$\{\{ github\.event_name \}\}-\$\{\{ github\.event\.pull_request\.number \|\| github\.sha \}\}$', 'actionlint_1\.7\.12_linux_amd64\.tar\.gz',
+            '8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8  actionlint\.tar\.gz', 'plugin\.json', 'marketplace\.json',
+            'fail-fast: false', 'os: \[ubuntu-latest, macos-latest, windows-latest\]', 'Install-Module Pester -RequiredVersion 4\.10\.1',
+            'TEMP=\$env:RUNNER_TEMP', 'TMP=\$env:RUNNER_TEMP', 'pwsh -NoProfile -File tests/Invoke-MuxAgentTests\.ps1')
+        @($expected | Where-Object { $text -notmatch $_ }) -join ' ; ' | Should BeExactly ''
+        $uses = @([regex]::Matches($text, '(?m)^\s*- uses: .*$') | ForEach-Object Value)
+        "$($uses.Count -gt 0) $(@($uses | Where-Object { $_ -notmatch '@[0-9a-f]{40} # v\d' }) -join ' ; ')" | Should BeExactly 'True '
+    }
+}
