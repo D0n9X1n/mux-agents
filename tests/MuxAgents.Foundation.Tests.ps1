@@ -399,3 +399,85 @@ Describe 'MuxAgents foundation package' {
         $result -join ' ' | Should BeExactly 'HEAD~1=0,False HEAD=0,True'
     }
 }
+
+Describe 'MuxAgents foundation release workflow' {
+    $releasePath = [IO.Path]::Combine($repoRoot, '.github', 'workflows', 'release.yml')
+    $release = if (Test-Path -LiteralPath $releasePath) { ConvertFrom-Yaml -Ordered ([IO.File]::ReadAllText($releasePath)) } else { [ordered]@{} }
+    $jobs = if ($release.jobs -is [Collections.IDictionary]) { $release.jobs } else { [ordered]@{} }
+    $jobNames = @($jobs.Keys)
+    function Get-ReleaseSteps([string]$Name) { if ($jobs.Contains($Name)) { @($jobs[$Name].steps) } }
+    function Get-ReleaseRunLines($Step) { @("$($Step.run)" -split '\r?\n' | ForEach-Object { $_.Trim() } | Where-Object { $_ }) }
+    function Format-ReleaseMap($Map) { if ($Map -is [Collections.IDictionary]) { @($Map.Keys | Sort-Object | ForEach-Object { "$_=$($Map[$_])" }) -join ',' } else { "$Map" } }
+    function Test-ReleaseOrder([string]$Text, [string[]]$Fragments) {
+        $at = 0
+        foreach ($fragment in $Fragments) {
+            $found = $Text.IndexOf($fragment, $at, [StringComparison]::Ordinal)
+            if ($found -lt 0) { return $false }
+            $at = $found + $fragment.Length
+        }
+        $true
+    }
+    $steps = @(foreach ($name in $jobNames) { Get-ReleaseSteps $name })
+    It 'runs only on pushes of v<major>.<minor>.<patch> tags' {
+        $on = $release['on']
+        $push = if ($on -is [Collections.IDictionary] -and $on.Contains('push')) { $on.push }
+        # Assigned, not taken from an if expression, which would unroll a one-element list into its string.
+        $tags = $null
+        if ($push -is [Collections.IDictionary]) { $tags = $push.tags }
+        "$($on -is [Collections.IDictionary]) $(@($on.Keys) -join ',') $($push -is [Collections.IDictionary]) $(@($push.Keys) -join ',') $($tags -is [Collections.IList]) $(@($tags).Count) $(@($tags) -join ',')" | Should BeExactly 'True push True tags True 1 v[0-9]+.[0-9]+.[0-9]+'
+    }
+    It 'reads contents at the top, also reads actions in validate and writes contents only in publish' {
+        @($jobNames | Sort-Object) -join ',' | Should BeExactly 'package,publish,validate'
+        $grants = @("top:$(Format-ReleaseMap $release.permissions)") + @(foreach ($name in 'validate', 'package', 'publish') { "${name}:$(Format-ReleaseMap $jobs[$name].permissions)" })
+        $grants -join ' ; ' | Should BeExactly 'top:contents=read ; validate:actions=read,contents=read ; package:contents=read ; publish:contents=write'
+    }
+    It 'packages after validate and publishes after both, every job on ubuntu-latest' {
+        $package = $jobs['package']; $publish = $jobs['publish']
+        "$($package.needs -is [string]) $($package.needs) $($publish.needs -is [Collections.IList]) $(@($publish.needs) -join ',')" | Should BeExactly 'True validate True validate,package'
+        "$($jobNames.Count) $(@($jobNames | Where-Object { "$($jobs[$_].'runs-on')" -cne 'ubuntu-latest' }) -join ',')" | Should BeExactly '3 '
+    }
+    It 'gates no job and no step with if' {
+        $gated = @(foreach ($name in $jobNames) {
+            if ($jobs[$name] -is [Collections.IDictionary] -and $jobs[$name].Contains('if')) { $name }
+            foreach ($step in @(Get-ReleaseSteps $name)) { if ($step -is [Collections.IDictionary] -and $step.Contains('if')) { "$name step $($step.name)$($step.uses)" } }
+        })
+        "$($steps.Count -gt 0) $($gated -join ' ; ')" | Should BeExactly 'True '
+    }
+    It 'pins every action to a commit SHA and checks out without persisted credentials, validate with full history' {
+        $uses = @($steps | Where-Object { $_.Contains('uses') } | ForEach-Object { "$($_.uses)" })
+        "$($uses.Count -gt 0) $(@($uses | Where-Object { $_ -cnotmatch '^[\w.-]+/[\w.-]+@[0-9a-f]{40}$' }) -join ' ; ')" | Should BeExactly 'True '
+        $lines = @(if (Test-Path -LiteralPath $releasePath) { [IO.File]::ReadAllLines($releasePath) | Where-Object { $_ -match '^\s*(-\s+)?uses:' } })
+        "$($lines.Count) $(@($lines | Where-Object { $_ -notmatch '\s#\s*v\d' }) -join ' ; ')" | Should BeExactly "$($uses.Count) "
+        $checkouts = @(foreach ($name in $jobNames) { foreach ($step in @(Get-ReleaseSteps $name)) { if ("$($step.uses)".StartsWith('actions/checkout@', [StringComparison]::Ordinal)) { [pscustomobject]@{ Job = $name; Step = $step } } } })
+        $kept = @($checkouts | Where-Object { $persist = $_.Step.with.'persist-credentials'; -not ($persist -is [bool] -and -not $persist) } | ForEach-Object { $_.Job })
+        "$($checkouts.Count -gt 0) $($kept -join ',')" | Should BeExactly 'True '
+        $depth = @($checkouts | Where-Object { $_.Job -ceq 'validate' } | ForEach-Object { $_.Step.with.'fetch-depth' })
+        "$($depth.Count) $($depth[0] -is [int]) $($depth[0])" | Should BeExactly '1 True 0'
+    }
+    It 'validate resolves the tag, asks main, reads CI push runs and exits with the gate' {
+        $fragments = 'git rev-parse "$($env:TAG)^{commit}"', 'git merge-base --is-ancestor $sha origin/main', '$onMain = $LASTEXITCODE -eq 0', 'actions/workflows/ci.yml/runs?head_sha=$sha&event=push', './scripts/release/Test-MuxAgentRelease.ps1 -Tag $env:TAG -Sha $sha -IsAncestorOfMain $onMain -Runs $runs -ManifestVersion $version'
+        $gates = @(Get-ReleaseSteps 'validate' | Where-Object { $_.Contains('run') -and (Test-ReleaseOrder "$($_.run)" $fragments) } | ForEach-Object { $runLines = Get-ReleaseRunLines $_; "$($runLines[-1]) $($_.env.GH_TOKEN) $($_.env.TAG)" })
+        "$($gates.Count) $($gates -join ' ; ')" | Should BeExactly '1 exit $LASTEXITCODE ${{ github.token }} ${{ github.ref_name }}'
+    }
+    It 'package builds the zip of the tagged commit, then uploads it and fails when it is missing' {
+        $build = './scripts/release/New-MuxAgentPackage.ps1 -Ref $env:GITHUB_SHA -OutFile "mux-agents-$env:GITHUB_REF_NAME.zip"'
+        $sequence = @(Get-ReleaseSteps 'package' | ForEach-Object {
+            if ("$($_.run)".TrimEnd() -ceq $build) { 'build' }
+            elseif ("$($_.uses)" -cmatch '^actions/upload-artifact@') { "upload $($_.with.name) $($_.with.path) $($_.with.'if-no-files-found')" }
+        })
+        $sequence -join ' ; ' | Should BeExactly 'build ; upload plugin-zip mux-agents-${{ github.ref_name }}.zip error'
+    }
+    It 'publish downloads the zip, then creates the release with generated notes plus docs/releases notes when present' {
+        $create = @(
+            '$options = @(''release'', ''create'', $env:TAG, "mux-agents-$($env:TAG).zip", ''--verify-tag'', ''--title'', $env:TAG, ''--generate-notes'')'
+            '$notes = "docs/releases/$($env:TAG).md"'
+            'if (Test-Path -LiteralPath $notes) { $options += @(''--notes-file'', $notes) }'
+            'gh @options'
+        ) -join "`n"
+        $sequence = @(Get-ReleaseSteps 'publish' | ForEach-Object {
+            if ("$($_.uses)" -cmatch '^actions/download-artifact@') { "download $($_.with.name)" }
+            elseif ((Get-ReleaseRunLines $_) -join "`n" -ceq $create) { "create $($_.env.GH_TOKEN) $($_.env.GH_REPO) $($_.env.TAG)" }
+        })
+        $sequence -join ' ; ' | Should BeExactly 'download plugin-zip ; create ${{ github.token }} ${{ github.repository }} ${{ github.ref_name }}'
+    }
+}

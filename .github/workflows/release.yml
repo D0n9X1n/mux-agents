@@ -1,0 +1,70 @@
+name: Release
+on:
+  push:
+    tags: ['v[0-9]+.[0-9]+.[0-9]+']
+permissions:
+  contents: read
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Tag on main, green CI push run, matching version
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          $sha = git rev-parse "$($env:TAG)^{commit}"
+          git merge-base --is-ancestor $sha origin/main
+          $onMain = $LASTEXITCODE -eq 0
+          $runs = @(gh api "repos/$env:GITHUB_REPOSITORY/actions/workflows/ci.yml/runs?head_sha=$sha&event=push&per_page=100" --jq '.workflow_runs[] | {conclusion, head_sha, event}' | ForEach-Object { $_ | ConvertFrom-Json })
+          $version = (Get-Content -Raw .claude-plugin/plugin.json | ConvertFrom-Json).version
+          & ./scripts/release/Test-MuxAgentRelease.ps1 -Tag $env:TAG -Sha $sha -IsAncestorOfMain $onMain -Runs $runs -ManifestVersion $version
+          exit $LASTEXITCODE
+  package:
+    needs: validate
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Build the plugin zip
+        shell: pwsh
+        run: ./scripts/release/New-MuxAgentPackage.ps1 -Ref $env:GITHUB_SHA -OutFile "mux-agents-$env:GITHUB_REF_NAME.zip"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: plugin-zip
+          path: mux-agents-${{ github.ref_name }}.zip
+          if-no-files-found: error
+  publish:
+    needs: [validate, package]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: plugin-zip
+      - name: Create the release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          $options = @('release', 'create', $env:TAG, "mux-agents-$($env:TAG).zip", '--verify-tag', '--title', $env:TAG, '--generate-notes')
+          $notes = "docs/releases/$($env:TAG).md"
+          if (Test-Path -LiteralPath $notes) { $options += @('--notes-file', $notes) }
+          gh @options
