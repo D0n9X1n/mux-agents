@@ -69,6 +69,32 @@ Describe 'MuxAgents foundation runner' {
         $suite = "Describe 'win' -Tag 'windows' { It 'fails' { 1 | Should Be 2 } }`nDescribe 'all' { It 'passes' { 1 | Should Be 1 } }"
         Invoke-FoundationRunner 'tagged' $suite | Should Be $(if ($IsWindows) { 1 } else { 0 })
     }
+    It 'with no -Path discovers every *.Tests.ps1 under tests' {
+        # A child pwsh runs the runner with Invoke-Pester aliased to a recorder, so no suite runs and nothing recurses.
+        # The recorder logs the -Script it was given, then the files Pester 4.10.1's own discovery resolves from it.
+        $record = Join-Path $TestDrive 'discovered.txt'
+        $probe = Join-Path $TestDrive 'probe.ps1'
+        [IO.File]::WriteAllLines($probe, [string[]]@(
+            'param([string]$Runner, [string]$Record)'
+            '$global:discoveryRecord = $Record'
+            'Import-Module Pester -RequiredVersion 4.10.1'
+            'function global:Get-DiscoveredTestScripts($Script) {'
+            '    $lines = @((Resolve-Path -LiteralPath $Script).ProviderPath) + @(& (Get-Module Pester) { param($p) ResolveTestScripts $p } $Script | ForEach-Object { $_.Path })'
+            '    [IO.File]::WriteAllLines($global:discoveryRecord, [string[]]$lines)'
+            '    [pscustomobject]@{ FailedCount = 0 }'
+            '}'
+            'Set-Alias -Name Invoke-Pester -Value Get-DiscoveredTestScripts -Scope Global'
+            '& $Runner'
+        ))
+        $null = & $pwsh -NoProfile -File $probe -Runner $runner -Record $record
+        $lines = if (Test-Path -LiteralPath $record) { @([IO.File]::ReadAllLines($record)) } else { @('no record') }
+        $separators = [char[]]'\/'
+        $lines[0].TrimEnd($separators) | Should BeExactly ([IO.Path]::GetFullPath($testsRoot).TrimEnd($separators))
+        $expected = @(Get-ChildItem -LiteralPath $testsRoot -Recurse -File -Filter '*.Tests.ps1' | ForEach-Object { $_.FullName } | Sort-Object)
+        $found = @($lines | Select-Object -Skip 1 | Sort-Object)
+        "$($found -join ' ; ')" | Should BeExactly "$($expected -join ' ; ')"
+        @('MuxAgents.Tests.ps1', 'MuxAgentsVerbs.Tests.ps1' | Where-Object { $_ -notin @($found | ForEach-Object { Split-Path -Leaf $_ }) }).Count | Should Be 0
+    }
 }
 
 Describe 'MuxAgents foundation legacy suites' {
