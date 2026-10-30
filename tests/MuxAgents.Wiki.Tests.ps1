@@ -113,6 +113,53 @@ Describe 'MuxAgents wiki publisher' {
         $run = Invoke-WikiPublisher @('-Source', $source, '-WikiRepo', $repo, '-SourceSha', $sha)
         "$($run.Code) $((Invoke-WikiGit $remote rev-parse master) -ceq $seeded) $((Invoke-WikiGit $repo rev-parse HEAD) -cne $seeded)" | Should BeExactly '0 True True'
     }
+    It 'mirrors Chinese pages byte for byte' {
+        $body = "# 百科`n`n侧边栏与代理：``mux-agent list``。`n"
+        $source = New-WikiSource 'utf8-src' @{ 'Home-zh-CN.md' = $body }
+        $repo = New-WikiRepo 'utf8-wiki' @{ 'Home-zh-CN.md' = 'old' }
+        $run = Invoke-WikiPublisher @('-Source', $source, '-WikiRepo', $repo, '-SourceSha', $sha)
+        $want = [BitConverter]::ToString([IO.File]::ReadAllBytes((Join-Path $source 'Home-zh-CN.md')))
+        "$($run.Code) $([BitConverter]::ToString([IO.File]::ReadAllBytes((Join-Path $repo 'Home-zh-CN.md'))) -ceq $want) $(@(Invoke-WikiGit $repo status --porcelain).Count)" | Should BeExactly '0 True 0'
+    }
+    It 'exits 1 and leaves the wiki untouched when a page cannot be read' {
+        $source = New-WikiSource 'locked-src' @{ 'Home.md' = 'new'; 'Other.md' = 'other' }
+        $repo = New-WikiRepo 'locked-wiki' @{ 'Home.md' = 'old' }
+        $before = Invoke-WikiGit $repo rev-parse HEAD
+        $locked = Join-Path $source 'Home.md'
+        $hold = $null
+        try {
+            if ($IsWindows) { $hold = [IO.File]::Open($locked, 'Open', 'ReadWrite', 'None') } else { [IO.File]::SetUnixFileMode($locked, [IO.UnixFileMode]::None) }
+            $run = Invoke-WikiPublisher @('-Source', $source, '-WikiRepo', $repo, '-SourceSha', $sha)
+        } finally {
+            if ($hold) { $hold.Dispose() } else { [IO.File]::SetUnixFileMode($locked, [IO.UnixFileMode]'UserRead, UserWrite') }
+        }
+        "$($run.Code) $($run.Lines[-1]) $((Invoke-WikiGit $repo rev-parse HEAD) -ceq $before) $(@(Invoke-WikiGit $repo status --porcelain).Count)" | Should BeExactly "1 cannot read wiki page: Home.md True 0"
+    }
+    It 'exits 1 when Source and WikiRepo are the same directory' {
+        $repo = New-WikiRepo 'self-wiki' @{ 'Home.md' = 'home' }
+        $before = Invoke-WikiGit $repo rev-parse HEAD
+        $run = Invoke-WikiPublisher @('-Source', $repo, '-WikiRepo', $repo, '-SourceSha', $sha)
+        "$($run.Code) $($run.Lines -join ' | ') $((Invoke-WikiGit $repo rev-parse HEAD) -ceq $before) $(@(Invoke-WikiGit $repo status --porcelain).Count)" | Should BeExactly "1 wiki source and destination are the same directory: $repo True 0"
+    }
+    It 'exits 1 and commits nothing when a page is a symbolic link' {
+        $source = New-WikiSource 'link-src' @{ 'Home.md' = 'home' }
+        $secret = New-WikiSource 'link-secret' @{ 'config' = 'token=FAKE_TOKEN' }
+        $null = New-Item -ItemType SymbolicLink -Path (Join-Path $source 'Leak.md') -Target (Join-Path $secret 'config')
+        $repo = New-WikiRepo 'link-wiki' @{ 'Home.md' = 'old' }
+        $before = Invoke-WikiGit $repo rev-parse HEAD
+        $run = Invoke-WikiPublisher @('-Source', $source, '-WikiRepo', $repo, '-SourceSha', $sha)
+        "$($run.Code) $($run.Lines -join ' | ') $((Invoke-WikiGit $repo rev-parse HEAD) -ceq $before) $(@(Invoke-WikiGit $repo status --porcelain).Count) $(Test-Path -LiteralPath (Join-Path $repo 'Leak.md'))" | Should BeExactly '1 wiki page is a link, not a file: Leak.md True 0 False'
+    }
+    It 'resolves relative paths against the PowerShell location, not the process directory' {
+        $base = Join-Path $TestDrive 'rel'
+        $null = New-Item -ItemType Directory -Force -Path $base
+        $null = New-WikiSource 'rel/wiki' @{ 'Home.md' = 'new' }
+        $repo = New-WikiRepo 'rel/wiki-repo' @{ 'Home.md' = 'old' }
+        $decoy = New-WikiSource 'decoy' @{ 'wiki-repo/Home.md' = 'decoy' }
+        $script = "Set-Location -LiteralPath '$base'; [Environment]::CurrentDirectory = '$decoy'; & '$publisher' -Source wiki -WikiRepo wiki-repo -SourceSha $sha; exit `$LASTEXITCODE"
+        $null = & $pwsh -NoProfile -Command $script 2>&1
+        "$LASTEXITCODE $(Invoke-WikiGit $repo show HEAD:Home.md) $(@(Invoke-WikiGit $repo status --porcelain).Count) $([IO.File]::ReadAllText([IO.Path]::Combine($decoy, 'wiki-repo', 'Home.md')))" | Should BeExactly '0 new 0 decoy'
+    }
 }
 
 Describe 'MuxAgents wiki publish workflow' {
@@ -203,6 +250,28 @@ Describe 'MuxAgents wiki pages' {
     }
     It 'Home links the design pages in its own language' {
         "$((Get-WikiLinks 'Home') -ccontains 'Design-Foundation') $((Get-WikiLinks 'Home-zh-CN') -ccontains 'Design-Foundation-zh-CN')" | Should BeExactly 'True True'
+    }
+    It 'keeps wiki/ flat: no folders, since the mirror publishes top-level pages only' {
+        @(if (Test-Path -LiteralPath $wikiRoot) { Get-ChildItem -LiteralPath $wikiRoot -Directory -Force | ForEach-Object { $_.Name } }) -join ',' | Should BeExactly ''
+        @(& git -C $repoRoot ls-files -- wiki | Where-Object { $_ -match '^wiki/.+/' }) -join ',' | Should BeExactly ''
+    }
+    It 'Home states the platforms and what is not built yet, in both languages' {
+        $status = foreach ($page in 'Home', 'Home-zh-CN') { @([IO.File]::ReadAllLines((Join-Path $wikiRoot "$page.md")) | Where-Object { $_ -match '^v0\.1\.0 ' }) -join ' / ' }
+        $status -join ' ; ' | Should BeExactly 'v0.1.0 is in progress. Today the code runs on Windows with rmux 0.10.0. tmux on Linux and macOS (#1) and the side bar (#4) are being built; neither is in the code yet. ; v0.1.0 正在开发中。目前代码在 Windows 上配合 rmux 0.10.0 运行。Linux 和 macOS 上的 tmux 支持（#1）与侧边栏（#4）正在构建，都还没有进入代码。'
+    }
+    It 'Design-Foundation keeps its sections, and its Chinese twin matches it line for line' {
+        $en = [IO.File]::ReadAllLines((Join-Path $wikiRoot 'Design-Foundation.md'))
+        @($en | Where-Object { $_ -match '^## ' }) -join ',' | Should BeExactly '## Purpose,## Decisions,## Changes,## Component map,## Behavior and its tests,## Must-pass,## Non-goals,## Prior art'
+        $zh = [IO.File]::ReadAllLines((Join-Path $wikiRoot 'Design-Foundation-zh-CN.md'))
+        $drift = @(for ($i = 0; $i -lt [Math]::Max($en.Count, $zh.Count); $i++) {
+            $a = "$($en[$i])"; $b = "$($zh[$i])"
+            $codeA = @([regex]::Matches($a, '`[^`]+`|\d+(\.\d+)*') | ForEach-Object Value | Sort-Object -Unique) -join ' '
+            $codeB = @([regex]::Matches($b, '`[^`]+`|\d+(\.\d+)*') | ForEach-Object Value | Sort-Object -Unique) -join ' '
+            $shape = { param($l) if (-not $l.Trim()) { 'blank' } elseif ($l -match '^(#+|\||-|\d+\.) ?') { $Matches[1] } else { 'text' } }
+            $prose = $b.Trim() -and $b -notmatch '^\[[^\]]+\]\([^)]+\)$' -and $b -notmatch '^\|[-|]+\|$'
+            if ((& $shape $a) -cne (& $shape $b) -or $codeA -cne $codeB -or ($prose -and $b -notmatch '\p{IsCJKUnifiedIdeographs}')) { $i + 1 }
+        })
+        "$($en.Count) $($zh.Count) $($drift -join ',')" | Should BeExactly "$($en.Count) $($en.Count) "
     }
     It 'tracks no path under docs/' {
         @(& git -C $repoRoot ls-files -- docs) -join ',' | Should BeExactly ''
