@@ -112,9 +112,10 @@ Describe 'MuxAgents foundation docs' {
     It 'README Test section installs Pester 4.10.1 and powershell-yaml 0.4.12 and runs the runner' {
         $lines = [IO.File]::ReadAllLines((Join-Path $repoRoot 'README.md'))
         $start = [array]::IndexOf($lines, '## Test')
-        $section = if ($start -ge 0) { @($lines[($start + 1)..($lines.Count - 1)] | ForEach-Object -Begin { $open = $true } -Process { if ($_ -match '^## ') { $open = $false }; if ($open) { $_ } }) -join "`n" } else { '' }
-        $expected = 'Install-Module Pester -RequiredVersion 4.10.1', 'Install-Module powershell-yaml -RequiredVersion 0.4.12', 'pwsh -NoProfile -File tests/Invoke-MuxAgentTests.ps1'
-        "$($start -ge 0) $(@($expected | Where-Object { -not $section.Contains($_) }) -join ' ; ')" | Should BeExactly 'True '
+        $section = if ($start -ge 0) { @($lines[($start + 1)..($lines.Count - 1)] | ForEach-Object -Begin { $open = $true } -Process { if ($_ -match '^## ') { $open = $false }; if ($open) { $_ } }) } else { @() }
+        # Each command is a whole line; a version must not continue (4.10.1.1 is another version).
+        $expected = '^Install-Module Pester -RequiredVersion 4\.10\.1(\s|$)', '^Install-Module powershell-yaml -RequiredVersion 0\.4\.12(\s|$)', '^pwsh -NoProfile -File tests/Invoke-MuxAgentTests\.ps1$'
+        "$($start -ge 0) $(@($expected | Where-Object { $pattern = $_; @($section | Where-Object { $_.Trim() -cmatch $pattern }).Count -eq 0 }) -join ' ; ')" | Should BeExactly 'True '
     }
     It 'README names no Pester version but 4.10.1' {
         $versions = @([regex]::Matches([IO.File]::ReadAllText((Join-Path $repoRoot 'README.md')), 'Pester\b[^\d\r\n]*(\d+(?:\.\d+)*)') | ForEach-Object { $_.Groups[1].Value })
@@ -201,9 +202,16 @@ Describe 'MuxAgents foundation CI' {
         $run = @($lint | Where-Object { "$($_.run)" -ceq './actionlint -color' })
         "$($install.Count) $($run.Count)" | Should BeExactly '1 1'
     }
-    It 'lint parses both manifests' {
-        $manifest = @(Get-JobSteps 'lint' | Where-Object { $text = "$($_.run)"; $_.shell -ceq 'pwsh' -and $text.Contains('.claude-plugin/plugin.json') -and $text.Contains('.claude-plugin/marketplace.json') -and $text -cmatch '\|\s*ConvertFrom-Json\b' })
-        $manifest.Count -gt 0 | Should Be $true
+    It 'lint parses each manifest by name in pwsh' {
+        $script = 'foreach ($file in ''.claude-plugin/plugin.json'', ''.claude-plugin/marketplace.json'') { $null = Get-Content -Raw $file | ConvertFrom-Json }'
+        @(Get-JobSteps 'lint' | Where-Object { $_.shell -ceq 'pwsh' -and "$($_.run)".Trim() -ceq $script }).Count | Should Be 1
+    }
+    It 'runs every step written in PowerShell under pwsh' {
+        # PowerShell-only syntax: $env:, $null, foreach (...), or a Verb-Noun cmdlet that is not part of a path.
+        $powershell = '\$env:|\$null\b|\bforeach\s*\(|(?<![\w./\\-])[A-Z][a-z]+-[A-Z]\w*(?![\w.])'
+        $missing = @($steps | Where-Object { "$($_.run)" -cmatch $powershell -and $_.shell -cne 'pwsh' } | ForEach-Object { "$($_.name)" })
+        $temp = @(Get-JobSteps 'test' | Where-Object { "$($_.run)".Contains('"TEMP=$env:RUNNER_TEMP"') -and $_.shell -ceq 'pwsh' })
+        "$($missing -join ' ; ') $($temp.Count)" | Should BeExactly ' 1'
     }
     It 'test points TEMP and TMP at RUNNER_TEMP, installs the pinned modules and runs the runner last' {
         $test = @(Get-JobSteps 'test')
@@ -211,8 +219,8 @@ Describe 'MuxAgents foundation CI' {
         $pwshLines = @($test | Where-Object { $_.shell -ceq 'pwsh' } | ForEach-Object { Get-RunLines $_ })
         $tempEnv = $tempLines -ccontains '"TEMP=$env:RUNNER_TEMP" >> $env:GITHUB_ENV'
         $tmpEnv = $tempLines -ccontains '"TMP=$env:RUNNER_TEMP" >> $env:GITHUB_ENV'
-        $pester = @($pwshLines | Where-Object { $_ -cmatch '^Install-Module Pester -RequiredVersion 4\.10\.1\b' }).Count -gt 0
-        $yaml = @($pwshLines | Where-Object { $_ -cmatch '^Install-Module powershell-yaml -RequiredVersion 0\.4\.12\b' }).Count -gt 0
+        $pester = @($pwshLines | Where-Object { $_ -cmatch '^Install-Module Pester -RequiredVersion 4\.10\.1(\s|$)' }).Count -gt 0
+        $yaml = @($pwshLines | Where-Object { $_ -cmatch '^Install-Module powershell-yaml -RequiredVersion 0\.4\.12(\s|$)' }).Count -gt 0
         "$tempEnv $tmpEnv $pester $yaml" | Should BeExactly 'True True True True'
         $last = if ($test.Count -gt 0) { $test[-1].run }
         "$last" | Should BeExactly 'pwsh -NoProfile -File tests/Invoke-MuxAgentTests.ps1'
