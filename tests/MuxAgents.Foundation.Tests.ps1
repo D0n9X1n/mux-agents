@@ -37,3 +37,21 @@ Describe 'MuxAgents foundation notice' {
         (Get-Content (Join-Path $mail 'pane-7.jsonl') | ConvertFrom-Json).body | Should BeExactly 'worker exited with code 0.'
     }
 }
+
+Describe 'MuxAgents foundation runner' {
+    $runner = Join-Path $testsRoot 'Invoke-MuxAgentTests.ps1'
+    function Invoke-FoundationRunner([string]$Name, [string]$Suite) {
+        $sample = Join-Path $TestDrive $Name
+        $null = New-Item -ItemType Directory -Force -Path $sample
+        [IO.File]::WriteAllText((Join-Path $sample 'Sample.Tests.ps1'), $Suite)
+        $null = & $pwsh -NoProfile -File $runner -Path $sample
+        $LASTEXITCODE
+    }
+    It 'exits 1 when any test fails' {
+        Invoke-FoundationRunner 'failing' "Describe 'sample' { It 'fails' { 1 | Should Be 2 } }" | Should Be 1
+    }
+    It 'skips suites tagged windows only off Windows' {
+        $suite = "Describe 'win' -Tag 'windows' { It 'fails' { 1 | Should Be 2 } }`nDescribe 'all' { It 'passes' { 1 | Should Be 1 } }"
+        Invoke-FoundationRunner 'tagged' $suite | Should Be $(if ($IsWindows) { 1 } else { 0 })
+    }
+}
