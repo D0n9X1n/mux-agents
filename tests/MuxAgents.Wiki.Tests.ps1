@@ -175,3 +175,36 @@ Describe 'MuxAgents wiki publish workflow' {
         $push -join ' ; ' | Should BeExactly "steps.mirror.outputs.changed == 'true' | git -C wiki-repo push origin HEAD:master"
     }
 }
+
+Describe 'MuxAgents wiki pages' {
+    $wikiRoot = Join-Path $repoRoot 'wiki'
+    $pages = @(if (Test-Path -LiteralPath $wikiRoot) { Get-ChildItem -LiteralPath $wikiRoot -File -Filter '*.md' | Where-Object { $_.Extension -ceq '.md' } | ForEach-Object { $_.BaseName } | Sort-Object })
+    $english = @($pages | Where-Object { -not $_.EndsWith('-zh-CN', [StringComparison]::Ordinal) })
+    $chinese = @($pages | Where-Object { $_.EndsWith('-zh-CN', [StringComparison]::Ordinal) })
+    function Get-WikiTwin([string]$Page) { if ($Page.EndsWith('-zh-CN', [StringComparison]::Ordinal)) { $Page.Substring(0, $Page.Length - 6) } else { "$Page-zh-CN" } }
+    function Get-WikiLinks([string]$Page) { @([regex]::Matches([IO.File]::ReadAllText((Join-Path $wikiRoot "$Page.md")), '\[[^\]]*\]\(([^)\s]+)\)') | ForEach-Object { $_.Groups[1].Value }) }
+    It 'has Home and Design-Foundation in English and Chinese' {
+        @('Home', 'Home-zh-CN', 'Design-Foundation', 'Design-Foundation-zh-CN' | Where-Object { $_ -cnotin $pages }) -join ',' | Should BeExactly ''
+    }
+    It 'pairs every English page with its -zh-CN page and back' {
+        "$($pages.Count -gt 0) $(@($pages | Where-Object { (Get-WikiTwin $_) -cnotin $pages }) -join ',')" | Should BeExactly 'True '
+    }
+    It 'links every page to its twin within its first five lines' {
+        $missing = @(foreach ($page in $pages) {
+            $head = @([IO.File]::ReadAllLines((Join-Path $wikiRoot "$page.md")) | Select-Object -First 5) -join "`n"
+            if (-not $head.Contains("($(Get-WikiTwin $page))")) { $page }
+        })
+        "$($english.Count -gt 0) $($chinese.Count -gt 0) $($missing -join ',')" | Should BeExactly 'True True '
+    }
+    It 'points every page link inside wiki/ at an existing page' {
+        $links = @(foreach ($page in $pages) { foreach ($link in Get-WikiLinks $page) { if ($link -notmatch '^([a-z][a-z0-9+.-]*:|#)') { [pscustomobject]@{ Page = $page; Target = ($link -split '#', 2)[0] } } } })
+        $broken = @($links | Where-Object { $_.Target -cnotin $pages } | ForEach-Object { "$($_.Page)->$($_.Target)" })
+        "$($links.Count -gt 0) $($broken -join ' ; ')" | Should BeExactly 'True '
+    }
+    It 'Home links the design pages in its own language' {
+        "$((Get-WikiLinks 'Home') -ccontains 'Design-Foundation') $((Get-WikiLinks 'Home-zh-CN') -ccontains 'Design-Foundation-zh-CN')" | Should BeExactly 'True True'
+    }
+    It 'tracks no path under docs/' {
+        @(& git -C $repoRoot ls-files -- docs) -join ',' | Should BeExactly ''
+    }
+}

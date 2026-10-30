@@ -1,5 +1,7 @@
 # Foundation for v0.1.0: rename, CI, release
 
+[简体中文](Design-Foundation-zh-CN)
+
 Sub-project A of milestone v0.1.0: #3 rename, #6 `parentAgentId`, #2 CI, #5 release. Sub-projects B (#1), C (#4) and D (#7–#9) build on it.
 
 ## Purpose
@@ -27,7 +29,7 @@ Fix the name before anyone installs it, and give every later pull request CI on 
 **Release (#5).** `.github/workflows/release.yml` on tags `v[0-9]+.[0-9]+.[0-9]+`, jobs chained by `needs`:
 - `validate` (read-only) runs `scripts/release/Test-MuxAgentRelease.ps1`, which takes the tag, the tag SHA, the `origin/main` ancestry answer, the `ci.yml` push runs for that SHA, and the manifest version, and exits 1 naming the first failure: not on `main`, no successful CI run, or version mismatch.
 - `package` (`needs: validate`, read-only): `git archive` of `.claude-plugin`, `skills`, `scripts`, `hooks` (when present), `README.md`, `LICENSE` into `mux-agents-<tag>.zip`, uploaded as an artifact.
-- `publish` (`needs: [validate, package]`), the only job with `contents: write`: `gh release create <tag>` with the zip, `--generate-notes`, and `docs/releases/<tag>.md` prepended when present.
+- `publish` (`needs: [validate, package]`), the only job with `contents: write`: `gh release create <tag>` with the zip, `--generate-notes`, and `wiki/Release-<tag>.md` prepended when present.
 
 **Merge procedure** (no branch protection on this plan), in `CONTRIBUTING.md` and the PR template: read `gh pr view <n> --json headRefOid,statusCheckRollup`; every check on that head SHA must be `SUCCESS`, with `lint` and all three `test` jobs present; then `git fetch origin <sha>` and `git push origin <sha>:main` (not forced), so only the checked head lands and only as a fast-forward; GitHub then marks the PR merged. Commits are authored as `D0n9X1n <D0n9x1n@outlook.com>`; a GitHub merge would re-author them (user requirement, 2026-10-30).
 
@@ -50,7 +52,7 @@ All in `MuxAgents.Foundation.Tests.ps1` unless noted; every one runs in the must
 - `pwsh -File scripts/mux-agent.ps1` with no verb prints JSON with `check` `usage` and a message naming `mux-agent`, exit 2 (Windows); on Linux and macOS it prints `check` `platform`, exit 2.
 - With `MUX_AGENTS_STATE` unset and `RMUX_AGENTS_STATE` set, the state root is `%LOCALAPPDATA%\mux-agents\state`; with `MUX_AGENTS_STATE` set, that wins.
 - A notice for a record with `parentAgentId` = a valid 12-hex id and `parentPane` `%7` lands in `mail/pane-7.jsonl` and not in `mail/<id>.jsonl`.
-- `git grep -n -E 'rmux-agent|RmuxAgent|RMUX_AGENTS'` over tracked files outside `docs/specs` returns nothing. Tests that need an old name (this scan, the ignored variable) build it from fragments, e.g. `'R' + 'MUX_AGENTS_STATE'`, so the scan has no exceptions.
+- `git grep -n -E 'rmux-agent|RmuxAgent|RMUX_AGENTS'` over tracked files outside `wiki/Design-Foundation.md` and `wiki/Design-Foundation-zh-CN.md` returns nothing. Tests that need an old name (this scan, the ignored variable) build it from fragments, e.g. `'R' + 'MUX_AGENTS_STATE'`, so the scan has no exceptions.
 - `Test-MuxAgentRelease.ps1`: passes for an on-main SHA with a successful run and matching version; exits 1 with a distinct reason for off-main, no run, only failed runs, and a version mismatch (one test each).
 - `release.yml` declares `publish` with `needs` containing `validate` and `package` (asserted by parsing the YAML text in a test).
 

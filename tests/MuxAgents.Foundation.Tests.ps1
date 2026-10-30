@@ -17,9 +17,10 @@ Describe 'MuxAgents foundation rename' {
         Get-MuxAgentStateRoot -Environment @{ $old = 'D:\old'; LOCALAPPDATA = 'C:\l' } | Should BeExactly ([IO.Path]::Combine('C:\l', 'mux-agents', 'state'))
         Get-MuxAgentStateRoot -Environment @{ $old = 'D:\old'; MUX_AGENTS_STATE = 'D:\s'; LOCALAPPDATA = 'C:\l' } | Should BeExactly 'D:\s'
     }
-    It 'no old name in tracked files outside docs/specs' {
+    It 'no old name in tracked files outside the two Design-Foundation wiki pages' {
         $pattern = ('r' + 'mux-agent') + '|' + ('R' + 'muxAgent') + '|' + ('R' + 'MUX_AGENTS')
-        $hits = @(& git -C $repoRoot grep -n -E $pattern -- . ':(exclude)docs/specs')
+        # The design record of the rename names the old project; nothing else may.
+        $hits = @(& git -C $repoRoot grep -n -E $pattern -- . ':(exclude,literal)wiki/Design-Foundation.md' ':(exclude,literal)wiki/Design-Foundation-zh-CN.md')
         "$LASTEXITCODE $($hits -join ' ; ')" | Should BeExactly '1 '
     }
 }
