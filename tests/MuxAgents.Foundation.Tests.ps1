@@ -360,11 +360,45 @@ Describe 'MuxAgents foundation release gate' {
         $otherSha = [pscustomobject]@{ conclusion = 'success'; head_sha = ('b' * 40); event = 'push' }
         Invoke-FoundationGate -Runs @($prRun, $otherSha) | Should BeExactly "1 refused: no CI push run for $sha"
     }
+    It 'names the first failure in the order main, CI run, version' {
+        $first = foreach ($case in @(
+                @{ OnMain = $false; Runs = @(); Version = '0.2.0' },
+                @{ OnMain = $true; Runs = @(); Version = '0.2.0' },
+                @{ OnMain = $true; Runs = @($red); Version = '0.2.0' }
+            )) { Invoke-FoundationGate @case }
+        $first -join ' ; ' | Should BeExactly "1 refused: v0.1.0 is not on main ; 1 refused: no CI push run for $sha ; 1 refused: no successful CI push run for $sha"
+    }
+    It 'passes when a successful CI push run sits beside a failed one' {
+        (Invoke-FoundationGate -Runs @($red, $green)), (Invoke-FoundationGate -Runs @($green, $red)) -join ' ; ' | Should BeExactly "0 release ok: v0.1.0 at $sha ; 0 release ok: v0.1.0 at $sha"
+    }
 }
 
 Describe 'MuxAgents foundation package' {
-    It 'LICENSE is MIT and release tooling is export-ignored' {
-        [IO.File]::ReadAllLines((Join-Path $repoRoot 'LICENSE'))[0] | Should BeExactly 'MIT License'
+    It 'LICENSE is the full MIT text and release tooling is export-ignored' {
+        $mit = @(
+            'MIT License'
+            ''
+            'Copyright (c) 2026 Dongxin Tang'
+            ''
+            'Permission is hereby granted, free of charge, to any person obtaining a copy'
+            'of this software and associated documentation files (the "Software"), to deal'
+            'in the Software without restriction, including without limitation the rights'
+            'to use, copy, modify, merge, publish, distribute, sublicense, and/or sell'
+            'copies of the Software, and to permit persons to whom the Software is'
+            'furnished to do so, subject to the following conditions:'
+            ''
+            'The above copyright notice and this permission notice shall be included in all'
+            'copies or substantial portions of the Software.'
+            ''
+            'THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR'
+            'IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,'
+            'FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE'
+            'AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER'
+            'LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,'
+            'OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE'
+            'SOFTWARE.'
+        ) -join "`n"
+        ([IO.File]::ReadAllText((Join-Path $repoRoot 'LICENSE')) -replace '\r\n', "`n").TrimEnd("`n") | Should BeExactly $mit
         [IO.File]::ReadAllText((Join-Path $repoRoot '.gitattributes')) | Should Match '(?m)^scripts/release export-ignore$'
     }
     It 'zips only the plugin files of a commit' {
@@ -373,8 +407,8 @@ Describe 'MuxAgents foundation package' {
         $LASTEXITCODE | Should Be 0
         $out = Join-Path $TestDrive 'plugin'
         Expand-Archive -LiteralPath $zip -DestinationPath $out
-        $seen = foreach ($path in '.claude-plugin/plugin.json', 'skills/mux-agents/SKILL.md', 'scripts/mux-agent.ps1', 'scripts/MuxAgents.ps1', 'scripts/mux-agent-launcher.ps1', 'README.md', 'LICENSE', 'tests', '.github', 'scripts/release') { "$path=$(Test-Path -LiteralPath (Join-Path $out $path))" }
-        $seen -join ' ' | Should BeExactly '.claude-plugin/plugin.json=True skills/mux-agents/SKILL.md=True scripts/mux-agent.ps1=True scripts/MuxAgents.ps1=True scripts/mux-agent-launcher.ps1=True README.md=True LICENSE=True tests=False .github=False scripts/release=False'
+        $seen = foreach ($path in '.claude-plugin/plugin.json', '.claude-plugin/marketplace.json', 'skills/mux-agents/SKILL.md', 'scripts/mux-agent.ps1', 'scripts/MuxAgents.ps1', 'scripts/mux-agent-launcher.ps1', 'README.md', 'LICENSE', 'tests', '.github', 'scripts/release') { "$path=$(Test-Path -LiteralPath (Join-Path $out $path))" }
+        $seen -join ' ' | Should BeExactly '.claude-plugin/plugin.json=True .claude-plugin/marketplace.json=True skills/mux-agents/SKILL.md=True scripts/mux-agent.ps1=True scripts/MuxAgents.ps1=True scripts/mux-agent-launcher.ps1=True README.md=True LICENSE=True tests=False .github=False scripts/release=False'
     }
     It 'includes hooks only when the commit has them' {
         $fixture = Join-Path $TestDrive 'pkg-repo'
@@ -408,15 +442,6 @@ Describe 'MuxAgents foundation release workflow' {
     function Get-ReleaseSteps([string]$Name) { if ($jobs.Contains($Name)) { @($jobs[$Name].steps) } }
     function Get-ReleaseRunLines($Step) { @("$($Step.run)" -split '\r?\n' | ForEach-Object { $_.Trim() } | Where-Object { $_ }) }
     function Format-ReleaseMap($Map) { if ($Map -is [Collections.IDictionary]) { @($Map.Keys | Sort-Object | ForEach-Object { "$_=$($Map[$_])" }) -join ',' } else { "$Map" } }
-    function Test-ReleaseOrder([string]$Text, [string[]]$Fragments) {
-        $at = 0
-        foreach ($fragment in $Fragments) {
-            $found = $Text.IndexOf($fragment, $at, [StringComparison]::Ordinal)
-            if ($found -lt 0) { return $false }
-            $at = $found + $fragment.Length
-        }
-        $true
-    }
     $steps = @(foreach ($name in $jobNames) { Get-ReleaseSteps $name })
     It 'runs only on pushes of v<major>.<minor>.<patch> tags' {
         $on = $release['on']
@@ -454,10 +479,35 @@ Describe 'MuxAgents foundation release workflow' {
         $depth = @($checkouts | Where-Object { $_.Job -ceq 'validate' } | ForEach-Object { $_.Step.with.'fetch-depth' })
         "$($depth.Count) $($depth[0] -is [int]) $($depth[0])" | Should BeExactly '1 True 0'
     }
-    It 'validate resolves the tag, asks main, reads CI push runs and exits with the gate' {
-        $fragments = 'git rev-parse "$($env:TAG)^{commit}"', 'if ($sha -cne $env:GITHUB_SHA) { "refused: $($env:TAG) does not point at $env:GITHUB_SHA"; exit 1 }', 'git merge-base --is-ancestor $sha origin/main', '$onMain = $LASTEXITCODE -eq 0', 'actions/workflows/ci.yml/runs?head_sha=$sha&event=push', './scripts/release/Test-MuxAgentRelease.ps1 -Tag $env:TAG -Sha $sha -IsAncestorOfMain $onMain -Runs $runs -ManifestVersion $version'
-        $gates = @(Get-ReleaseSteps 'validate' | Where-Object { $_.Contains('run') -and (Test-ReleaseOrder "$($_.run)" $fragments) } | ForEach-Object { $runLines = Get-ReleaseRunLines $_; "$($runLines[-1]) $($_.env.GH_TOKEN) $($_.env.TAG)" })
-        "$($gates.Count) $($gates -join ' ; ')" | Should BeExactly '1 exit $LASTEXITCODE ${{ github.token }} ${{ github.ref_name }}'
+    It 'validate resolves the tag, asks main, reads CI push runs and the manifest version, and exits with the gate' {
+        $gate = @(
+            '$sha = git rev-parse "$($env:TAG)^{commit}"'
+            'if ($sha -cne $env:GITHUB_SHA) { "refused: $($env:TAG) does not point at $env:GITHUB_SHA"; exit 1 }'
+            'git merge-base --is-ancestor $sha origin/main'
+            '$onMain = $LASTEXITCODE -eq 0'
+            '$runs = @(gh api "repos/$env:GITHUB_REPOSITORY/actions/workflows/ci.yml/runs?head_sha=$sha&event=push&per_page=100" --jq ''.workflow_runs[] | {conclusion, head_sha, event}'' | ForEach-Object { $_ | ConvertFrom-Json })'
+            '$version = (Get-Content -Raw .claude-plugin/plugin.json | ConvertFrom-Json).version'
+            '& ./scripts/release/Test-MuxAgentRelease.ps1 -Tag $env:TAG -Sha $sha -IsAncestorOfMain $onMain -Runs $runs -ManifestVersion $version'
+            'exit $LASTEXITCODE'
+        ) -join "`n"
+        $gates = @(Get-ReleaseSteps 'validate' | Where-Object { $_.Contains('run') } | ForEach-Object { if ((Get-ReleaseRunLines $_) -join "`n" -ceq $gate) { "gate $($_.env.GH_TOKEN) $($_.env.TAG)" } else { 'other' } })
+        $gates -join ' ; ' | Should BeExactly 'gate ${{ github.token }} ${{ github.ref_name }}'
+    }
+    It 'starts every job with a checkout, runs every script in pwsh and lets no job or step continue on error' {
+        $shape = foreach ($name in 'validate', 'package', 'publish') {
+            $kinds = @(Get-ReleaseSteps $name | ForEach-Object {
+                if ("$($_.uses)".StartsWith('actions/checkout@', [StringComparison]::Ordinal)) { 'checkout' }
+                elseif ($_.Contains('run')) { "run:$($_.shell)" }
+                else { 'action' }
+            })
+            "${name}=$($kinds -join ',')"
+        }
+        $shape -join ' ; ' | Should BeExactly 'validate=checkout,run:pwsh ; package=checkout,run:pwsh,action ; publish=checkout,action,run:pwsh'
+        $loose = @(foreach ($name in $jobNames) {
+            if ($jobs[$name] -is [Collections.IDictionary] -and $jobs[$name].Contains('continue-on-error')) { $name }
+            foreach ($step in @(Get-ReleaseSteps $name)) { if ($step -is [Collections.IDictionary] -and $step.Contains('continue-on-error')) { "$name step $($step.name)$($step.uses)" } }
+        })
+        "$($steps.Count -gt 0) $($loose -join ' ; ')" | Should BeExactly 'True '
     }
     It 'package builds the zip of the tagged commit, then uploads it and fails when it is missing' {
         $build = './scripts/release/New-MuxAgentPackage.ps1 -Ref $env:GITHUB_SHA -OutFile "mux-agents-$env:GITHUB_REF_NAME.zip"'
