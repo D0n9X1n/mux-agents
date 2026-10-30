@@ -367,4 +367,35 @@ Describe 'MuxAgents foundation package' {
         [IO.File]::ReadAllLines((Join-Path $repoRoot 'LICENSE'))[0] | Should BeExactly 'MIT License'
         [IO.File]::ReadAllText((Join-Path $repoRoot '.gitattributes')) | Should Match '(?m)^scripts/release export-ignore$'
     }
+    It 'zips only the plugin files of a commit' {
+        $zip = Join-Path $TestDrive 'plugin.zip'
+        & ([IO.Path]::Combine($repoRoot, 'scripts', 'release', 'New-MuxAgentPackage.ps1')) -Ref HEAD -OutFile $zip
+        $LASTEXITCODE | Should Be 0
+        $out = Join-Path $TestDrive 'plugin'
+        Expand-Archive -LiteralPath $zip -DestinationPath $out
+        $seen = foreach ($path in '.claude-plugin/plugin.json', 'skills/mux-agents/SKILL.md', 'scripts/mux-agent.ps1', 'scripts/MuxAgents.ps1', 'scripts/mux-agent-launcher.ps1', 'README.md', 'LICENSE', 'tests', '.github', 'scripts/release') { "$path=$(Test-Path -LiteralPath (Join-Path $out $path))" }
+        $seen -join ' ' | Should BeExactly '.claude-plugin/plugin.json=True skills/mux-agents/SKILL.md=True scripts/mux-agent.ps1=True scripts/MuxAgents.ps1=True scripts/mux-agent-launcher.ps1=True README.md=True LICENSE=True tests=False .github=False scripts/release=False'
+    }
+    It 'includes hooks only when the commit has them' {
+        $fixture = Join-Path $TestDrive 'pkg-repo'
+        $null = New-Item -ItemType Directory -Force -Path ([IO.Path]::Combine($fixture, 'scripts', 'release')), (Join-Path $fixture '.claude-plugin'), (Join-Path $fixture 'skills'), (Join-Path $fixture 'hooks')
+        Copy-Item ([IO.Path]::Combine($repoRoot, 'scripts', 'release', 'New-MuxAgentPackage.ps1')) ([IO.Path]::Combine($fixture, 'scripts', 'release'))
+        foreach ($file in '.claude-plugin/plugin.json', 'skills/s.md', 'scripts/x.ps1', 'README.md', 'LICENSE') { [IO.File]::WriteAllText((Join-Path $fixture $file), 'x') }
+        $null = & git -C $fixture init -q -b main
+        $null = & git -C $fixture -c user.name=t -c user.email=t@t add -- .claude-plugin skills scripts README.md LICENSE
+        $null = & git -C $fixture -c user.name=t -c user.email=t@t commit -q -m one
+        [IO.File]::WriteAllText([IO.Path]::Combine($fixture, 'hooks', 'hooks.json'), '{}')
+        $null = & git -C $fixture -c user.name=t -c user.email=t@t add -- hooks
+        $null = & git -C $fixture -c user.name=t -c user.email=t@t commit -q -m two
+        $packager = [IO.Path]::Combine($fixture, 'scripts', 'release', 'New-MuxAgentPackage.ps1')
+        $result = foreach ($ref in 'HEAD~1', 'HEAD') {
+            $zip = Join-Path $TestDrive "hooks-$($ref -replace '\W', '').zip"
+            & $packager -Ref $ref -OutFile $zip
+            $code = $LASTEXITCODE
+            $out = Join-Path $TestDrive "hooks-$($ref -replace '\W', '')"
+            Expand-Archive -LiteralPath $zip -DestinationPath $out
+            "$ref=$code,$(Test-Path -LiteralPath ([IO.Path]::Combine($out, 'hooks', 'hooks.json')))"
+        }
+        $result -join ' ' | Should BeExactly 'HEAD~1=0,False HEAD=0,True'
+    }
 }
