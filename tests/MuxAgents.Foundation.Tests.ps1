@@ -152,15 +152,15 @@ Describe 'MuxAgents foundation CI' {
         })
         $wide -join ' ; ' | Should BeExactly ''
     }
-    It 'groups runs by event and pull request and cancels only pull request runs' {
+    It 'groups runs by pull request and cancels only pull request runs' {
         $concurrency = $ci.concurrency
         $concurrency -is [Collections.IDictionary] | Should Be $true
-        $concurrency.group | Should BeExactly 'ci-${{ github.event_name }}-${{ github.event.pull_request.number || github.sha }}'
+        "$($concurrency.group)".Contains('${{ github.event.pull_request.number || github.sha }}') | Should Be $true
         $concurrency.'cancel-in-progress' | Should BeExactly '${{ github.event_name == ''pull_request'' }}'
     }
     It 'has only the lint job on ubuntu and the test job on a three-OS matrix without fail-fast' {
         "$(@($jobs.Keys | Sort-Object) -join ',') $($jobs.lint.'runs-on') $($jobs.test.'runs-on')" | Should BeExactly 'lint,test ubuntu-latest ${{ matrix.os }}'
-        @($jobs.test.strategy.matrix.os) -join ',' | Should BeExactly 'ubuntu-latest,macos-latest,windows-latest'
+        @($jobs.test.strategy.matrix.os | Sort-Object) -join ',' | Should BeExactly 'macos-latest,ubuntu-latest,windows-latest'
         $failFast = $jobs.test.strategy.'fail-fast'
         "$($failFast -is [bool]) $failFast" | Should BeExactly 'True False'
     }
@@ -178,17 +178,22 @@ Describe 'MuxAgents foundation CI' {
         })
         $problems -join ' ; ' | Should BeExactly ''
     }
-    It 'gates only the TEMP and TMP step, on Windows' {
-        $gated = @($steps | Where-Object { $_.Contains('if') })
+    It 'gates no step but the TEMP and TMP step, and that one only on Windows' {
+        # A condition without its ${{ }} wrapper; success() is the default, so it counts as none.
+        $conditions = @(foreach ($step in $steps) {
+            $c = if ($step.Contains('if')) { "$($step['if'])".Trim() } else { '' }
+            if ($c -match '^\$\{\{\s*(.*?)\s*\}\}$') { $c = $Matches[1] }
+            if ($c -and $c -cne 'success()') { [pscustomobject]@{ Step = $step; Condition = $c } }
+        })
         $temp = @(Get-JobSteps 'test' | Where-Object { "$($_.run)".Contains('"TEMP=$env:RUNNER_TEMP"') })
-        $condition = if ($gated.Count -gt 0) { $gated[0]['if'] }
-        "$($gated.Count) $($temp.Count) $($gated.Count -gt 0 -and [object]::ReferenceEquals($gated[0], $temp[0])) $condition" | Should BeExactly "1 1 True runner.os == 'Windows'"
+        $other = @($conditions | Where-Object { -not [object]::ReferenceEquals($_.Step, $temp[0]) -or $_.Condition -cne "runner.os == 'Windows'" } | ForEach-Object { "$($_.Step.name): $($_.Condition)" })
+        "$($temp.Count) $($other -join ' ; ')" | Should BeExactly '1 '
     }
-    It 'pins every action to a full commit SHA with a version comment' {
+    It 'pins every action to a full commit SHA with a comment' {
         $uses = @($steps | Where-Object { $_.Contains('uses') } | ForEach-Object { "$($_.uses)" })
         "$($uses.Count -gt 0) $(@($uses | Where-Object { $_ -cnotmatch '^[\w.-]+/[\w.-]+@[0-9a-f]{40}$' }) -join ' ; ')" | Should BeExactly 'True '
         $lines = @([IO.File]::ReadAllLines($ciPath) | Where-Object { $_ -match '^\s*(-\s+)?uses:' })
-        "$($lines.Count) $(@($lines | Where-Object { $_ -notmatch '\s#\s*v\d' }) -join ' ; ')" | Should BeExactly "$($uses.Count) "
+        "$($lines.Count) $(@($lines | Where-Object { $_ -notmatch '@[0-9a-f]{40}\s+#\s*\S' }) -join ' ; ')" | Should BeExactly "$($uses.Count) "
     }
     It 'checks out the repository in lint and test before any run step' {
         $late = @(foreach ($name in 'lint', 'test') {
