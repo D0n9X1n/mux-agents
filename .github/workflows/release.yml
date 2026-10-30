@@ -22,6 +22,7 @@ jobs:
           TAG: ${{ github.ref_name }}
         run: |
           $sha = git rev-parse "$($env:TAG)^{commit}"
+          if ($sha -cne $env:GITHUB_SHA) { "refused: $($env:TAG) does not point at $env:GITHUB_SHA"; exit 1 }
           git merge-base --is-ancestor $sha origin/main
           $onMain = $LASTEXITCODE -eq 0
           $runs = @(gh api "repos/$env:GITHUB_REPOSITORY/actions/workflows/ci.yml/runs?head_sha=$sha&event=push&per_page=100" --jq '.workflow_runs[] | {conclusion, head_sha, event}' | ForEach-Object { $_ | ConvertFrom-Json })
@@ -64,6 +65,8 @@ jobs:
           GH_REPO: ${{ github.repository }}
           TAG: ${{ github.ref_name }}
         run: |
+          $line = @(git ls-remote origin "refs/tags/$($env:TAG)" "refs/tags/$($env:TAG)^{}")[-1]
+          if (-not $line -or ($line -split '\s+')[0] -cne $env:GITHUB_SHA) { "refused: $($env:TAG) no longer points at $env:GITHUB_SHA"; exit 1 }
           $options = @('release', 'create', $env:TAG, "mux-agents-$($env:TAG).zip", '--verify-tag', '--title', $env:TAG, '--generate-notes')
           $notes = "wiki/Release-$($env:TAG).md"
           if (Test-Path -LiteralPath $notes) { $options += @('--notes-file', $notes) }

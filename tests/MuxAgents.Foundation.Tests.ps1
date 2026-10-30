@@ -455,7 +455,7 @@ Describe 'MuxAgents foundation release workflow' {
         "$($depth.Count) $($depth[0] -is [int]) $($depth[0])" | Should BeExactly '1 True 0'
     }
     It 'validate resolves the tag, asks main, reads CI push runs and exits with the gate' {
-        $fragments = 'git rev-parse "$($env:TAG)^{commit}"', 'git merge-base --is-ancestor $sha origin/main', '$onMain = $LASTEXITCODE -eq 0', 'actions/workflows/ci.yml/runs?head_sha=$sha&event=push', './scripts/release/Test-MuxAgentRelease.ps1 -Tag $env:TAG -Sha $sha -IsAncestorOfMain $onMain -Runs $runs -ManifestVersion $version'
+        $fragments = 'git rev-parse "$($env:TAG)^{commit}"', 'if ($sha -cne $env:GITHUB_SHA) { "refused: $($env:TAG) does not point at $env:GITHUB_SHA"; exit 1 }', 'git merge-base --is-ancestor $sha origin/main', '$onMain = $LASTEXITCODE -eq 0', 'actions/workflows/ci.yml/runs?head_sha=$sha&event=push', './scripts/release/Test-MuxAgentRelease.ps1 -Tag $env:TAG -Sha $sha -IsAncestorOfMain $onMain -Runs $runs -ManifestVersion $version'
         $gates = @(Get-ReleaseSteps 'validate' | Where-Object { $_.Contains('run') -and (Test-ReleaseOrder "$($_.run)" $fragments) } | ForEach-Object { $runLines = Get-ReleaseRunLines $_; "$($runLines[-1]) $($_.env.GH_TOKEN) $($_.env.TAG)" })
         "$($gates.Count) $($gates -join ' ; ')" | Should BeExactly '1 exit $LASTEXITCODE ${{ github.token }} ${{ github.ref_name }}'
     }
@@ -469,6 +469,9 @@ Describe 'MuxAgents foundation release workflow' {
     }
     It 'publish downloads the zip, then creates the release with generated notes plus the wiki release page when present' {
         $create = @(
+            # The tag must still name the commit validate approved and package archived, read at publish time.
+            '$line = @(git ls-remote origin "refs/tags/$($env:TAG)" "refs/tags/$($env:TAG)^{}")[-1]'
+            'if (-not $line -or ($line -split ''\s+'')[0] -cne $env:GITHUB_SHA) { "refused: $($env:TAG) no longer points at $env:GITHUB_SHA"; exit 1 }'
             '$options = @(''release'', ''create'', $env:TAG, "mux-agents-$($env:TAG).zip", ''--verify-tag'', ''--title'', $env:TAG, ''--generate-notes'')'
             '$notes = "wiki/Release-$($env:TAG).md"'
             'if (Test-Path -LiteralPath $notes) { $options += @(''--notes-file'', $notes) }'
