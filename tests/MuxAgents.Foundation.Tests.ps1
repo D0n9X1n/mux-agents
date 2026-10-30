@@ -7,8 +7,9 @@ $pwsh = [Diagnostics.Process]::GetCurrentProcess().MainModule.FileName
 Describe 'MuxAgents foundation rename' {
     It 'entry with no verb answers usage on Windows and platform elsewhere, exit 2' {
         $reply = & $pwsh -NoProfile -File ([IO.Path]::Combine($repoRoot, 'scripts', 'mux-agent.ps1')) | ConvertFrom-Json
-        $expected = if ($IsWindows) { '2 usage True' } else { '2 platform True' }
-        "$LASTEXITCODE $($reply.check) $($reply.message -match '\bmux-agents?\b')" | Should BeExactly $expected
+        # Windows names the command (singular); elsewhere the platform refusal names the product.
+        $expected, $pattern = if ($IsWindows) { '2 usage True', '^usage: mux-agent <' } else { '2 platform True', '^mux-agents ' }
+        "$LASTEXITCODE $($reply.check) $($reply.message -cmatch $pattern)" | Should BeExactly $expected
     }
     It 'state root reads MUX_AGENTS_STATE and ignores the old variable' {
         $old = 'R' + 'MUX_AGENTS_STATE'
