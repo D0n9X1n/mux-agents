@@ -39,11 +39,11 @@ Describe 'MuxAgents foundation notice' {
 
 Describe 'MuxAgents foundation runner' {
     $runner = Join-Path $testsRoot 'Invoke-MuxAgentTests.ps1'
-    function Invoke-FoundationRunner([string]$Name, [string]$Suite) {
+    function Invoke-FoundationRunner([string]$Name, [string]$Suite, [switch]$Integration) {
         $sample = Join-Path $TestDrive $Name
         $null = New-Item -ItemType Directory -Force -Path $sample
         [IO.File]::WriteAllText((Join-Path $sample 'Sample.Tests.ps1'), $Suite)
-        $null = & $pwsh -NoProfile -File $runner -Path $sample
+        $null = & $pwsh -NoProfile -File $runner -Path $sample @(if ($Integration) { '-Integration' })
         $LASTEXITCODE
     }
     It 'runs the suites on Pester 4.10.1' {
@@ -74,6 +74,16 @@ Describe 'MuxAgents foundation runner' {
         $code = Invoke-FoundationRunner 'os-tags' ($suite + "`nDescribe 'all' { It 'passes' { 1 | Should Be 1 } }")
         $ran = @(Get-ChildItem -LiteralPath $marks -File | ForEach-Object { $_.Name } | Sort-Object) -join ','
         "$code $ran" | Should BeExactly "0 $(if ($IsWindows) { 'windows' } elseif ($IsLinux) { 'linux' } else { 'macos' })" }
+    It 'skips integration suites by default; -Integration runs only them and fails unless one passed and none was skipped' {
+        $flip = "Describe 'it' -Tag 'integration' { It 'fails' { 1 | Should Be 2 } }`nDescribe 'unit' { It 'passes' { 1 | Should Be 1 } }"
+        $only = "Describe 'it' -Tag 'integration' { It 'passes' { 1 | Should Be 1 } }`nDescribe 'unit' { It 'fails' { 1 | Should Be 2 } }"
+        $none = "Describe 'unit' { It 'passes' { 1 | Should Be 1 } }"
+        $skip = "Describe 'it' -Tag 'integration' { It 'passes' { 1 | Should Be 1 }; It 'skipped' -Skip { 1 | Should Be 1 } }"
+        $allSkip = "Describe 'it' -Tag 'integration' { It 'skipped' -Skip { 1 | Should Be 1 } }"
+        "$(Invoke-FoundationRunner 'it-default' $flip) $(Invoke-FoundationRunner 'it-on' $flip -Integration) $(Invoke-FoundationRunner 'it-only' $only -Integration) $(Invoke-FoundationRunner 'it-none' $none -Integration) $(Invoke-FoundationRunner 'it-skip' $skip -Integration) $(Invoke-FoundationRunner 'it-allskip' $allSkip -Integration)" | Should BeExactly '0 1 0 1 1 1' }
+    It '-Integration also fails a run with an inconclusive integration test beside a passing one' {
+        $inconclusive = "Describe 'it' -Tag 'integration' { It 'passes' { 1 | Should Be 1 }; It 'inconclusive' { Set-ItResult -Inconclusive -Because 'no answer' } }"
+        "$(Invoke-FoundationRunner 'it-inconclusive-default' $inconclusive) $(Invoke-FoundationRunner 'it-inconclusive' $inconclusive -Integration)" | Should BeExactly '0 1' }
     It 'with no -Path discovers every *.Tests.ps1 under tests' {
         # A child pwsh runs the runner with Invoke-Pester aliased to a recorder, so no suite runs and nothing recurses.
         # The recorder logs the -Script it was given, then the files Pester 4.10.1's own discovery resolves from it.
