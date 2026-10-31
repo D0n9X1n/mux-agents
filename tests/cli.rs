@@ -45,6 +45,8 @@ fn no_args_usage_exit_2() {
     assert_eq!(mux_agent(&["-Text"]), all);
 }
 
+// What the parser hands the verb (canonical names, values, -Text, every verb's bounds) is checked by the
+// unit tests in src/cli.rs; these check the bytes and exit code the entry produces.
 #[test]
 fn verb_and_flags_match_without_case() {
     assert_eq!(

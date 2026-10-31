@@ -3,6 +3,9 @@
 
 use std::process::Command;
 
+// Console.Out.WriteLine's line end: exactly one, as the entry writes it.
+const NL: &str = if cfg!(windows) { "\r\n" } else { "\n" };
+
 #[test]
 fn dispatch_panic_prints_internal_and_hides_payload() {
     let out = Command::new(env!("CARGO_BIN_EXE_mux-agent"))
@@ -14,8 +17,10 @@ fn dispatch_panic_prints_internal_and_hides_payload() {
     let stdout = String::from_utf8(out.stdout).unwrap();
     let stderr = String::from_utf8(out.stderr).unwrap();
     assert_eq!(
-        stdout.trim_end_matches(['\r', '\n']),
-        r#"{"ok":false,"verb":"list","code":1,"check":"internal","message":"unexpected error (panic)"}"#
+        stdout,
+        format!(
+            r#"{{"ok":false,"verb":"list","code":1,"check":"internal","message":"unexpected error (panic)"}}{NL}"#
+        )
     );
     assert_eq!(stderr, "");
     assert_eq!(out.status.code(), Some(1));

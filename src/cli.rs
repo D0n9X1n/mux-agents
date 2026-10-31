@@ -4,7 +4,7 @@ use std::panic::{self, AssertUnwindSafe};
 
 use serde_json::{Map, Value};
 
-use crate::ctx::Env;
+use crate::ctx::Ctx;
 use crate::error::{Refusal, Res, refuse};
 use crate::json;
 
@@ -31,8 +31,8 @@ impl Request {
     }
 }
 
-/// A verb's reply fields after `ok` and `verb`.
-pub type Handler = fn(&Request) -> Res<Map<String, Value>>;
+/// A verb's reply fields after `ok` and `verb`, computed against the call's providers.
+pub type Handler = fn(&Ctx, &Request) -> Res<Map<String, Value>>;
 
 pub struct VerbDef {
     pub name: &'static str,
@@ -44,7 +44,7 @@ pub struct VerbDef {
     pub handler: Handler,
 }
 
-fn not_wired(_: &Request) -> Res<Map<String, Value>> {
+fn not_wired(_: &Ctx, _: &Request) -> Res<Map<String, Value>> {
     refuse(1, "internal", "not wired")
 }
 
@@ -196,13 +196,12 @@ fn failure(verb: Option<&str>, refusal: &Refusal) -> Map<String, Value> {
     reply
 }
 
-fn dispatch(def: &VerbDef, request: &Request, env: &Env) -> Res<Map<String, Value>> {
+fn dispatch(def: &VerbDef, request: &Request, ctx: &Ctx) -> Res<Map<String, Value>> {
     #[cfg(feature = "test-panic")]
-    if env.get("MUX_AGENTS_TEST_PANIC") == Some("dispatch") {
+    if ctx.env.get("MUX_AGENTS_TEST_PANIC") == Some("dispatch") {
         panic!("PANIC-PAYLOAD-7f3a");
     }
-    let _ = env;
-    let data = (def.handler)(request)?;
+    let data = (def.handler)(ctx, request)?;
     let mut reply = Map::new();
     reply.insert("ok".into(), true.into());
     reply.insert("verb".into(), def.name.into());
@@ -212,11 +211,11 @@ fn dispatch(def: &VerbDef, request: &Request, env: &Env) -> Res<Map<String, Valu
 
 /// Parse, run the verb and map the outcome to exit code 0, 1 or 2 and the reply text, never echoing an
 /// error's own text. A panic in the verb is 1 `internal`; unwinding has already released its locks.
-pub fn run(args: &[String], env: &Env) -> (u8, String) {
+pub fn run(args: &[String], ctx: &Ctx) -> (u8, String) {
     let (verb, text, outcome) = match parse(args) {
         Err(refusal) => (None, false, Err(refusal)),
         Ok((def, request)) => {
-            let outcome = panic::catch_unwind(AssertUnwindSafe(|| dispatch(def, &request, env)))
+            let outcome = panic::catch_unwind(AssertUnwindSafe(|| dispatch(def, &request, ctx)))
                 .unwrap_or_else(|_| refuse(1, "internal", "unexpected error (panic)"));
             (Some(def.name), request.text, outcome)
         }
@@ -231,4 +230,157 @@ pub fn run(args: &[String], env: &Env) -> (u8, String) {
         json::to_stdout(&Value::Object(reply))
     };
     (code, out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::testing::Fakes;
+
+    fn args(tokens: &[&str]) -> Vec<String> {
+        tokens.iter().map(|t| t.to_string()).collect()
+    }
+
+    fn parsed(tokens: &[&str]) -> Request {
+        parse(&args(tokens)).unwrap().1
+    }
+
+    fn usage_of(tokens: &[&str]) -> (u8, &'static str) {
+        match parse(&args(tokens)) {
+            Ok((_, request)) => panic!("parsed: {request:?}"),
+            Err(refusal) => (refusal.code, refusal.check),
+        }
+    }
+
+    fn probe(ctx: &Ctx, request: &Request) -> Res<Map<String, Value>> {
+        let mut data = Map::new();
+        data.insert("alive".into(), ctx.os.is_alive(42).into());
+        data.insert("pid".into(), ctx.pid.into());
+        data.insert("args".into(), request.positional.len().into());
+        Ok(data)
+    }
+
+    #[test]
+    fn handler_receives_ctx() {
+        let fakes = Fakes::default();
+        fakes.alive(42);
+        let ctx = fakes.ctx();
+        let def = VerbDef {
+            name: "probe",
+            values: &[],
+            switches: &[],
+            min: 0,
+            max: 1,
+            usage: "usage: probe",
+            handler: probe,
+        };
+        let request = Request {
+            verb: "probe",
+            values: Vec::new(),
+            switches: Vec::new(),
+            positional: vec!["x".into()],
+            text: false,
+        };
+        let reply = dispatch(&def, &request, &ctx).unwrap();
+        assert_eq!(
+            Value::Object(reply).to_string(),
+            r#"{"ok":true,"verb":"probe","alive":true,"pid":4242,"args":1}"#
+        );
+        assert_eq!(fakes.os_calls(), ["is_alive 42"]);
+    }
+
+    #[test]
+    fn matched_switches_take_canonical_names() {
+        let list = parsed(&["LIST", "-all", "-TEXT"]);
+        assert_eq!(
+            (list.verb, list.switches.as_slice(), list.text),
+            ("list", &["All"][..], true)
+        );
+        let spawn = parsed(&["spawn", "-client", "claude", "-NOFORK"]);
+        assert_eq!(spawn.verb, "spawn");
+        assert_eq!(spawn.values, [("Client", "claude".to_string())]);
+        assert_eq!(spawn.switches, ["NoFork"]);
+        assert!(spawn.switch("NoFork") && !spawn.text);
+        let sidebar = parsed(&["Sidebar", "-close"]);
+        assert_eq!(
+            (sidebar.verb, sidebar.switches.as_slice()),
+            ("sidebar", &["Close"][..])
+        );
+    }
+
+    #[test]
+    fn value_flag_takes_next_token_whatever_it_looks_like() {
+        let spawn = parsed(&["spawn", "-Client", "claude", "-Task", "-Text"]);
+        assert_eq!(
+            spawn.values,
+            [
+                ("Client", "claude".to_string()),
+                ("Task", "-Text".to_string())
+            ]
+        );
+        assert_eq!(spawn.value("Task"), Some("-Text"));
+        assert!(!spawn.text);
+        assert!(spawn.positional.is_empty());
+    }
+
+    // A valid argv for each verb, positionals at the verb's minimum.
+    fn valid(verb: &str) -> Vec<&'static str> {
+        match verb {
+            "focus" | "send" | "stop" => vec!["a"],
+            _ => vec![],
+        }
+    }
+
+    #[test]
+    fn text_is_accepted_by_every_verb() {
+        let names: Vec<_> = VERBS.iter().map(|d| d.name).collect();
+        assert_eq!(
+            names,
+            [
+                "spawn", "list", "focus", "send", "read", "stop", "status", "sidebar", "watch"
+            ]
+        );
+        for name in names {
+            let mut tokens = vec![name];
+            tokens.extend(valid(name));
+            assert!(!parsed(&tokens).text, "{name}");
+            tokens.push("-Text");
+            let request = parsed(&tokens);
+            assert_eq!((request.verb, request.text), (name, true), "{name}");
+        }
+    }
+
+    #[test]
+    fn positional_bounds_of_every_verb() {
+        // MuxAgents.ps1:1673-1681.
+        let bounds = [
+            ("spawn", 0, 0),
+            ("list", 0, 0),
+            ("focus", 1, 1),
+            ("send", 1, 1),
+            ("read", 0, 1),
+            ("stop", 1, 1),
+            ("status", 0, 0),
+            ("sidebar", 0, 0),
+            ("watch", 0, 0),
+        ];
+        assert_eq!(bounds.len(), VERBS.len());
+        let pos = ["p1", "p2", "p3"];
+        for (name, min, max) in bounds {
+            let def = VERBS.iter().find(|d| d.name == name).unwrap();
+            assert_eq!((def.min, def.max), (min, max), "{name}");
+            let call = |n: usize| {
+                let mut tokens = vec![name];
+                tokens.extend(&pos[..n]);
+                tokens
+            };
+            if min > 0 {
+                assert_eq!(usage_of(&call(min - 1)), (2, "usage"), "{name} below");
+            }
+            assert_eq!(usage_of(&call(max + 1)), (2, "usage"), "{name} above");
+            for n in min..=max {
+                assert_eq!(parsed(&call(n)).positional, &pos[..n], "{name} {n}");
+            }
+        }
+    }
 }
