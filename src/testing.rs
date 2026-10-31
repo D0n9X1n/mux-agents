@@ -8,7 +8,8 @@ use std::time::{Duration, SystemTime};
 use crate::ctx::{Clock, Ctx, Env};
 use crate::error::Res;
 use crate::mux::{Mux, Output};
-use crate::proc::Os;
+use crate::parse::Client;
+use crate::proc::{Left, Opened, Os, Row, Signals, Token};
 
 struct Rule {
     contains: String,
@@ -17,7 +18,7 @@ struct Rule {
 
 #[derive(Default)]
 struct Log {
-    alive: Vec<u32>,
+    rows: Vec<Row>,
     os_calls: Vec<String>,
     rules: Vec<Rule>,
     mux_calls: Vec<Vec<String>>,
@@ -30,8 +31,9 @@ struct Log {
 pub struct Fakes(Rc<RefCell<Log>>);
 
 impl Fakes {
-    pub fn alive(&self, pid: u32) {
-        self.0.borrow_mut().alive.push(pid);
+    /// A process the fake table lists, opens and answers `row` for.
+    pub fn process(&self, row: Row) {
+        self.0.borrow_mut().rows.push(row);
     }
 
     /// The first rule whose text appears in the space-joined argv answers; anything else exits 0 with no output.
@@ -75,11 +77,78 @@ impl Fakes {
     }
 }
 
+impl Fakes {
+    fn os_call(&self, call: String) {
+        self.0.borrow_mut().os_calls.push(call);
+    }
+
+    fn listed(&self, pid: u32) -> Option<Row> {
+        self.0.borrow().rows.iter().find(|r| r.pid == pid).cloned()
+    }
+}
+
+// Every answer comes from the registered rows; nothing is ever killed, a shell or a client.
 impl Os for Fakes {
-    fn is_alive(&self, pid: u32) -> bool {
-        let mut log = self.0.borrow_mut();
-        log.os_calls.push(format!("is_alive {pid}"));
-        log.alive.contains(&pid)
+    fn row(&self, pid: u32) -> Option<Row> {
+        self.os_call(format!("row {pid}"));
+        self.listed(pid)
+    }
+
+    fn table(&self) -> std::io::Result<Vec<Row>> {
+        self.os_call("table".into());
+        Ok(self.0.borrow().rows.clone())
+    }
+
+    fn open(&self, pid: u32) -> Option<Opened> {
+        self.os_call(format!("open {pid}"));
+        self.listed(pid).map(|r| Opened::new(r.pid, r.start, None))
+    }
+
+    fn kill(&self, opened: Opened) -> bool {
+        self.os_call(format!("kill {}", opened.pid));
+        false
+    }
+
+    fn cwd(&self, pid: u32) -> Option<String> {
+        self.os_call(format!("cwd {pid}"));
+        None
+    }
+
+    fn client_of(&self, row: &Row) -> Option<Client> {
+        self.os_call(format!("client_of {}", row.pid));
+        None
+    }
+
+    fn is_shell(&self, row: &Row) -> bool {
+        self.os_call(format!("is_shell {}", row.pid));
+        false
+    }
+
+    fn same_start(&self, opened: i64, listed: i64) -> bool {
+        opened == listed
+    }
+
+    fn stop_report(&self, _: &[Left]) -> serde_json::Map<String, serde_json::Value> {
+        serde_json::Map::new()
+    }
+
+    fn token(&self) -> Option<Token> {
+        None
+    }
+
+    fn sandbox(&self) -> Signals {
+        Signals::default()
+    }
+}
+
+/// A row with no path or argv.
+pub fn row(pid: u32, ppid: u32, start: i64) -> Row {
+    Row {
+        pid,
+        ppid,
+        start,
+        path: None,
+        argv: None,
     }
 }
 

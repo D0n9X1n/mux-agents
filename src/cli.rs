@@ -254,7 +254,7 @@ mod tests {
 
     fn probe(ctx: &Ctx, request: &Request) -> Res<Map<String, Value>> {
         let mut data = Map::new();
-        data.insert("alive".into(), ctx.os.is_alive(42).into());
+        data.insert("alive".into(), ctx.os.row(42).is_some().into());
         data.insert("pid".into(), ctx.pid.into());
         data.insert("args".into(), request.positional.len().into());
         Ok(data)
@@ -263,7 +263,7 @@ mod tests {
     #[test]
     fn handler_receives_ctx() {
         let fakes = Fakes::default();
-        fakes.alive(42);
+        fakes.process(crate::testing::row(42, 1, 4200));
         let ctx = fakes.ctx();
         let def = VerbDef {
             name: "probe",
@@ -286,7 +286,7 @@ mod tests {
             Value::Object(reply).to_string(),
             r#"{"ok":true,"verb":"probe","alive":true,"pid":4242,"args":1}"#
         );
-        assert_eq!(fakes.os_calls(), ["is_alive 42"]);
+        assert_eq!(fakes.os_calls(), ["row 42"]);
     }
 
     #[test]

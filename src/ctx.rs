@@ -99,12 +99,12 @@ mod tests {
     #[test]
     fn fake_os_and_mux_record_calls() {
         let fakes = testing::Fakes::default();
-        fakes.alive(42);
+        fakes.process(testing::row(42, 1, 4200));
         fakes.mux_rule("kill-pane", 1, "", "SECRET");
         let ctx = fakes.ctx();
 
-        assert!(ctx.os.is_alive(42));
-        assert!(!ctx.os.is_alive(7));
+        assert_eq!(ctx.os.row(42), Some(testing::row(42, 1, 4200)));
+        assert_eq!(ctx.os.row(7), None);
         let mux = ctx.mux.borrow();
         let mux = mux.as_ref().unwrap();
         let listed = mux.run(&["-N", "list-panes", "-a"]).unwrap();
@@ -113,7 +113,7 @@ mod tests {
         assert_eq!((killed.code, killed.stderr.as_str()), (1, "SECRET"));
         ctx.clock.sleep(std::time::Duration::from_millis(250));
 
-        assert_eq!(fakes.os_calls(), ["is_alive 42", "is_alive 7"]);
+        assert_eq!(fakes.os_calls(), ["row 42", "row 7"]);
         assert_eq!(
             fakes.mux_calls(),
             [
