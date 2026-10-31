@@ -152,6 +152,29 @@ mod tests {
         assert_eq!(names(dir.path()), ["record.json"]);
     }
 
+    // The new bytes go to a new inode that replaces the name: a reader holding the old file still reads the old
+    // bytes, and the old inode is never truncated or rewritten in place.
+    #[cfg(unix)]
+    #[test]
+    fn write_json_replaces_never_truncates() {
+        use std::io::{Seek, SeekFrom};
+        use std::os::unix::fs::MetadataExt;
+        let dir = TempDir::new();
+        let path = dir.path().join("record.json");
+        write_json(&path, &json!({"n": 1, "pad": "old old old"})).unwrap();
+        let mut reader = File::open(&path).unwrap();
+        let before = reader.metadata().unwrap().ino();
+        write_json(&path, &json!({"n": 2})).unwrap();
+        let mut old = String::new();
+        reader.read_to_string(&mut old).unwrap();
+        assert_eq!(old, r#"{"n":1,"pad":"old old old"}"#);
+        reader.seek(SeekFrom::Start(0)).unwrap();
+        assert_eq!(reader.metadata().unwrap().len(), old.len() as u64);
+        assert_ne!(std::fs::metadata(&path).unwrap().ino(), before);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), r#"{"n":2}"#);
+        assert_eq!(names(dir.path()), ["record.json"]);
+    }
+
     #[test]
     fn write_json_failed_replace_keeps_old_bytes() {
         let dir = TempDir::new();
@@ -181,6 +204,24 @@ mod tests {
         assert_eq!(read_json(&dir.path().join("gone/none.json")).unwrap(), None);
         let path = file(&dir, "r.json", "\u{feff}{\"name\":\"\u{e9}\"}".as_bytes());
         assert_eq!(read_json(&path).unwrap(), Some(json!({"name": "\u{e9}"})));
+    }
+
+    // Only a missing file or folder is `None`; a folder at the name or bytes that are not JSON are errors.
+    #[test]
+    fn read_json_folder_or_malformed_is_internal() {
+        let dir = TempDir::new();
+        std::fs::create_dir(dir.path().join("folder.json")).unwrap();
+        let refused = read_json(&dir.path().join("folder.json")).unwrap_err();
+        assert_eq!((refused.code, refused.check), (1, "internal"));
+        for bad in [&b"{\"n\":"[..], b"", b"\xff{}", b"{} {}"] {
+            let path = file(&dir, "bad.json", bad);
+            let refused = read_json(&path).unwrap_err();
+            assert_eq!(
+                (refused.code, refused.check, refused.message.as_str()),
+                (1, "internal", "unexpected error (state file is not JSON)"),
+                "{bad:?}"
+            );
+        }
     }
 
     #[test]
@@ -249,6 +290,32 @@ mod tests {
             refused.message,
             "a task or brief file is larger than 10 bytes"
         );
+    }
+
+    // -TaskFile 16 KB, -BriefFile 1 MB, -BodyFile 64 KB: exactly the limit reads, one byte more refuses and
+    // names the limit.
+    #[test]
+    fn read_text_limits_are_exact() {
+        assert_eq!((TASK_MAX, BRIEF_MAX, BODY_MAX), (16_384, 1_048_576, 65_536));
+        let dir = TempDir::new();
+        for (max, name) in [
+            (TASK_MAX, "16384"),
+            (BRIEF_MAX, "1048576"),
+            (BODY_MAX, "65536"),
+        ] {
+            let at = file(&dir, "at.md", &vec![b'a'; max as usize]);
+            assert_eq!(read_text(&at, max).unwrap().len(), max as usize, "{max}");
+            let over = file(&dir, "over.md", &vec![b'a'; max as usize + 1]);
+            let refused = read_text(&over, max).unwrap_err();
+            assert_eq!(
+                (refused.code, refused.check, refused.message),
+                (
+                    2,
+                    "usage",
+                    format!("a task or brief file is larger than {name} bytes")
+                )
+            );
+        }
     }
 
     #[cfg(windows)]

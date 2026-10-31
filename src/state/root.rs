@@ -1,6 +1,6 @@
 //! The state root from the environment (MuxAgents.ps1:116-123, MuxAgents.Unix.ps1:191-215).
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::ctx::Env;
 use crate::error::{Refusal, Res, refuse};
@@ -65,6 +65,16 @@ pub fn root(env: &Env, os: OsKind) -> Res<PathBuf> {
 /// `path` with realpath applied to its longest existing prefix; the missing rest is kept. `path` must be
 /// absolute and free of `.` and `..`, so the kept rest cannot leave the resolved prefix.
 pub(crate) fn real_prefix(path: &str) -> Res<PathBuf> {
+    real_prefix_with(path, |p| p.try_exists(), |p| std::fs::canonicalize(p))
+}
+
+/// `real_prefix` with the existence probe and realpath given, so tests can fail either. A failed probe or
+/// realpath refuses; the unresolved path is never used.
+pub(crate) fn real_prefix_with(
+    path: &str,
+    exists: impl Fn(&Path) -> std::io::Result<bool>,
+    realpath: impl Fn(&Path) -> std::io::Result<PathBuf>,
+) -> Res<PathBuf> {
     let parts: Vec<&str> = path.split('/').filter(|p| !p.is_empty()).collect();
     if !path.starts_with('/')
         || path.contains(['\r', '\n'])
@@ -77,13 +87,13 @@ pub(crate) fn real_prefix(path: &str) -> Res<PathBuf> {
     let mut count = parts.len();
     // try_exists follows links, so a dangling link counts as missing, as Test-Path did.
     loop {
-        match prefix(count).try_exists() {
+        match exists(&prefix(count)) {
             Ok(true) => break,
             Ok(false) if count > 0 => count -= 1,
             _ => return unresolved(),
         }
     }
-    let Ok(mut real) = std::fs::canonicalize(prefix(count)) else {
+    let Ok(mut real) = realpath(&prefix(count)) else {
         return unresolved();
     };
     if !real.is_absolute() || real.to_string_lossy().contains(['\r', '\n']) {
@@ -190,6 +200,54 @@ mod tests {
             root(&Env::from_pairs(xdg), OsKind::Unix).unwrap(),
             real.join("mux-agents/state")
         );
+    }
+
+    // Tests.ps1 (UnixState): a probe or realpath that fails refuses, verbatim; the unresolved path is never used.
+    #[cfg(unix)]
+    #[test]
+    fn root_unresolvable_prefix_refuses() {
+        let unresolved = state("the state folder path cannot be resolved");
+        let dir = crate::testing::TempDir::new();
+        let looped = dir.path().join("loop");
+        std::os::unix::fs::symlink(&looped, &looped).unwrap();
+        for path in [looped.join("s"), looped.clone()] {
+            let state = path.to_str().unwrap();
+            assert_eq!(
+                refused(&env(&[("MUX_AGENTS_STATE", state)]), OsKind::Unix),
+                unresolved,
+                "{path:?}"
+            );
+        }
+
+        let at = |exists: fn(&Path) -> std::io::Result<bool>,
+                  realpath: fn(&Path) -> std::io::Result<PathBuf>| {
+            match real_prefix_with("/r/state/k", exists, realpath) {
+                Ok(path) => (0, "ok", path.to_string_lossy().into_owned()),
+                Err(r) => (r.code, r.check, r.message),
+            }
+        };
+        fn denied() -> std::io::Error {
+            std::io::Error::from(std::io::ErrorKind::PermissionDenied)
+        }
+        let canon = |_: &Path| Ok(PathBuf::from("/canon"));
+        // Only `/r` exists; it resolves to /canon.
+        let only_r = |p: &Path| Ok(p == Path::new("/r") || p == Path::new("/"));
+        assert_eq!(at(only_r, canon), (0, "ok", "/canon/state/k".into()));
+        // The probe fails, at the full path or at a shorter prefix: no realpath runs.
+        let no_realpath = |_: &Path| -> std::io::Result<PathBuf> { panic!("realpath ran") };
+        assert_eq!(at(|_| Err(denied()), no_realpath), unresolved);
+        let fails_at_r = |p: &Path| {
+            if p == Path::new("/r") {
+                Err(denied())
+            } else {
+                Ok(false)
+            }
+        };
+        assert_eq!(at(fails_at_r, no_realpath), unresolved);
+        // realpath fails, or answers a relative or multi-line path.
+        assert_eq!(at(only_r, |_| Err(denied())), unresolved);
+        assert_eq!(at(only_r, |_| Ok(PathBuf::from("canon"))), unresolved);
+        assert_eq!(at(only_r, |_| Ok(PathBuf::from("/a\nb"))), unresolved);
     }
 
     #[test]

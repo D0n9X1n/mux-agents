@@ -379,6 +379,87 @@ pub(crate) mod tests {
         assert_eq!(run(&root, &[&agents, &mail]), "ok");
     }
 
+    // UnixState.Tests.ps1:334: under each umask, mkdir(2) makes the folder no wider than 0700 and chmod then
+    // restores the owner bits the umask cleared. The umask is per process, so a child runs `umask_child`.
+    #[test]
+    fn creates_missing_at_0700_under_umask() {
+        for (umask, made) in [
+            (0o000, 0o700),
+            (0o077, 0o700),
+            (0o177, 0o600),
+            (0o777, 0o000),
+        ] {
+            let dir = TempDir::new();
+            let root = dir.path().join("state");
+            let out = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "state::private_unix::tests::umask_child",
+                    "--exact",
+                    "--ignored",
+                    "--nocapture",
+                    "--test-threads=1",
+                ])
+                .env("MUX_AGENT_TEST_UMASK", format!("{umask:o}"))
+                .env("MUX_AGENT_TEST_ROOT", &root)
+                .output()
+                .unwrap();
+            let stdout = String::from_utf8(out.stdout).unwrap();
+            let line = stdout
+                .lines()
+                .find_map(|l| l.split_once("UMASK-RESULT ").map(|(_, r)| r))
+                .unwrap_or_else(|| panic!("no result: {stdout}"));
+            let step = format!("mkdir {made:o} chmod 700");
+            let want = format!("{step}; {step}; {step}; {step}; ok");
+            assert_eq!(line, want, "umask {umask:o}");
+            for path in [
+                &root,
+                &root.join("k"),
+                &root.join("k/agents"),
+                &root.join("k/mail"),
+            ] {
+                assert_eq!(mode(path), Some(0o700), "umask {umask:o} {path:?}");
+            }
+        }
+    }
+
+    // Run only by `creates_missing_at_0700_under_umask`, in its own process.
+    #[test]
+    #[ignore = "a child of creates_missing_at_0700_under_umask"]
+    fn umask_child() {
+        use std::cell::RefCell;
+        struct Observe(RefCell<Vec<String>>);
+        impl Steps for Observe {
+            fn mkdir(&self, path: &Path) -> io::Result<()> {
+                Real.mkdir(path)?;
+                let made = mode(path).unwrap();
+                self.0.borrow_mut().push(format!("mkdir {made:o}"));
+                Ok(())
+            }
+            fn chmod(&self, path: &Path) -> io::Result<()> {
+                Real.chmod(path)?;
+                let last = self.0.borrow_mut().pop().unwrap();
+                let now = mode(path).unwrap();
+                self.0.borrow_mut().push(format!("{last} chmod {now:o}"));
+                Ok(())
+            }
+        }
+        let (Ok(umask), Some(root)) = (
+            std::env::var("MUX_AGENT_TEST_UMASK"),
+            std::env::var_os("MUX_AGENT_TEST_ROOT"),
+        ) else {
+            return;
+        };
+        let root = PathBuf::from(root);
+        // SAFETY: umask has no preconditions; this process runs only this test.
+        unsafe { libc::umask(u32::from_str_radix(&umask, 8).unwrap() as libc::mode_t) };
+        let steps = Observe(RefCell::new(Vec::new()));
+        let (agents, mail) = (root.join("k/agents"), root.join("k/mail"));
+        let got = message(private_dirs_with(&steps, &root, &[&root, &agents, &mail]));
+        let mut steps = steps.0.into_inner();
+        steps.push(got);
+        println!("UMASK-RESULT {}", steps.join("; "));
+    }
+
     #[test]
     fn mode_755_refuses_state() {
         let dir = TempDir::new();
@@ -389,6 +470,44 @@ pub(crate) mod tests {
         assert_eq!(mode(&k), None);
         set_mode(&root, 0o1700);
         assert_eq!(run(&root, &[&k]), "the state folder mode is 1700, not 700");
+    }
+
+    // A folder below the root gets the full check, not the parent rule: a 0755 one or one of another owner
+    // refuses, and a later path in the same call is not made.
+    #[test]
+    fn descendant_not_private_refuses() {
+        struct Owner<'a>(&'a Path);
+        impl Steps for Owner<'_> {
+            fn lstat(&self, path: &Path) -> io::Result<Stat> {
+                let mut stat = Real.lstat(path)?;
+                if path == self.0 {
+                    stat.uid = if self.uid() == 0 { 1 } else { 0 };
+                }
+                Ok(stat)
+            }
+        }
+        let dir = TempDir::new();
+        let root = dir.path().join("state");
+        mkdir_mode(&root, 0o700);
+        let (open, owned, later) = (root.join("open"), root.join("owned"), root.join("later"));
+        mkdir_mode(&open, 0o755);
+        mkdir_mode(&owned, 0o700);
+        assert_eq!(
+            run(&root, &[&open.join("k"), &later]),
+            "the state folder mode is 755, not 700"
+        );
+        let steps = Owner(&owned);
+        assert_eq!(
+            message(private_dirs_with(
+                &steps,
+                &root,
+                &[&owned.join("k"), &later]
+            )),
+            "the state folder has another owner"
+        );
+        for path in [open.join("k"), owned.join("k"), later] {
+            assert_eq!(mode(&path), None, "{path:?}");
+        }
     }
 
     #[test]
@@ -460,6 +579,36 @@ pub(crate) mod tests {
             let usr = Path::new("/usr");
             assert_eq!(run(usr, &[usr]), "the state folder has another owner");
         }
+    }
+
+    // A real walk with one folder above the root reported as another user's: the walk compares each owner
+    // with the effective uid, and refuses before making anything.
+    #[test]
+    fn foreign_ancestor_refuses_before_create() {
+        struct Foreign<'a>(&'a Path);
+        impl Steps for Foreign<'_> {
+            fn lstat(&self, path: &Path) -> io::Result<Stat> {
+                let mut stat = Real.lstat(path)?;
+                if path == self.0 {
+                    stat.uid = self.uid() + 1;
+                }
+                Ok(stat)
+            }
+        }
+        let dir = TempDir::new();
+        let above = dir.path().join("above");
+        mkdir_mode(&above, 0o755);
+        let root = above.join("state");
+        assert_eq!(
+            message(private_dirs_with(
+                &Foreign(&above),
+                &root,
+                &[&root.join("k")]
+            )),
+            "a folder above the state folder has another owner"
+        );
+        assert_eq!(mode(&root), None);
+        assert_eq!(run(&root, &[&root.join("k")]), "ok");
     }
 
     #[test]
@@ -570,10 +719,14 @@ pub(crate) mod tests {
 
     #[test]
     fn acl_read_error_refuses_state() {
-        struct NoAcl;
-        impl Steps for NoAcl {
-            fn acl(&self, _: &Path) -> io::Result<Acl> {
-                Err(io::Error::from(io::ErrorKind::PermissionDenied))
+        // Only the given path's ACL read fails.
+        struct NoAcl<'a>(&'a Path);
+        impl Steps for NoAcl<'_> {
+            fn acl(&self, path: &Path) -> io::Result<Acl> {
+                if path == self.0 {
+                    return Err(io::Error::from(io::ErrorKind::PermissionDenied));
+                }
+                Real.acl(path)
             }
         }
         struct NoReal;
@@ -585,8 +738,24 @@ pub(crate) mod tests {
         let dir = TempDir::new();
         let root = dir.path().join("state");
         mkdir_mode(&root, 0o700);
-        for steps in [&NoAcl as &dyn Steps, &NoReal] {
-            assert_eq!(message(private_dirs_with(steps, &root, &[&root])), CHECKED);
+        let k = root.join("k");
+        // The state folder's own ACL.
+        assert_eq!(
+            message(private_dirs_with(&NoAcl(&root), &root, &[&k])),
+            CHECKED
+        );
+        assert_eq!(mode(&k), None);
+        assert_eq!(
+            message(private_dirs_with(&NoReal, &root, &[&root])),
+            CHECKED
+        );
+        // A folder above the root: only macOS reads ACLs there.
+        let above = message(private_dirs_with(&NoAcl(dir.path()), &root, &[&k]));
+        if cfg!(target_os = "macos") {
+            assert_eq!(above, CHECKED);
+            assert_eq!(mode(&k), None);
+        } else {
+            assert_eq!(above, "ok");
         }
     }
 
@@ -688,28 +857,84 @@ pub(crate) mod tests {
         assert_eq!(mode(&root.join("k")), Some(0o700));
     }
 
-    // CI only: needs setfacl and a file system with POSIX ACLs.
+    // UnixState.Tests.ps1:426: a deny ACE that folders inherit passes the parent check, but the new root
+    // inherits it and refuses before anything is made in it.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn inherited_ace_refuses_new_root() {
+        let dir = TempDir::new();
+        let parent = dir.path().join("parent");
+        mkdir_mode(&parent, 0o755);
+        chmod_a(&parent, "everyone deny chown,directory_inherit");
+        let root = parent.join("state");
+        assert_eq!(
+            run(&root, &[&root.join("k")]),
+            "the state folder has an extended ACL"
+        );
+        assert_eq!(mode(&root), Some(0o700));
+        assert!(crate::state::acl::read(&root).unwrap().extended);
+        assert_eq!(mode(&root.join("k")), None);
+    }
+
+    // An allow ACE outranks the sticky bit: an owned 1777 folder with one still refuses before creating.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn sticky_ancestor_allow_ace_refuses() {
+        let dir = TempDir::new();
+        let above = dir.path().join("above");
+        mkdir_mode(&above, 0o1777);
+        let root = above.join("state");
+        assert_eq!(run(&root, &[&root.join("k")]), "ok");
+        std::fs::remove_dir_all(&root).unwrap();
+        chmod_a(&above, "everyone allow add_subdirectory,delete_child");
+        assert_eq!(
+            run(&root, &[&root.join("k")]),
+            "a folder above the state folder has an ACL entry that is not a deny"
+        );
+        assert_eq!(mode(&root), None);
+    }
+
+    // CI only: needs setfacl and a file system with POSIX ACLs. Each ACL is checked on its own at mode 0700, so
+    // the mode refusal cannot stand in for the ACL one.
     #[cfg(target_os = "linux")]
     #[test]
     fn linux_setfacl_refuses_state() {
+        let installed = std::process::Command::new("setfacl")
+            .arg("--version")
+            .output()
+            .is_ok();
+        if !installed {
+            eprintln!("setfacl is not installed; skipped");
+            return;
+        }
         let setfacl = |args: &[&str], path: &Path| {
-            std::process::Command::new("setfacl")
+            let out = std::process::Command::new("setfacl")
                 .args(args)
                 .arg(path)
-                .status()
-                .is_ok_and(|s| s.success())
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "setfacl {args:?}: {out:?}");
         };
         let dir = TempDir::new();
         let (access, default) = (dir.path().join("access"), dir.path().join("default"));
         for root in [&access, &default] {
             assert_eq!(run(root, &[root]), "ok");
         }
-        if !setfacl(&["-m", "u:65534:rx"], &access) || !setfacl(&["-d", "-m", "u::rwx"], &default) {
-            eprintln!("setfacl is not available; skipped");
-            return;
-        }
-        for root in [&access, &default] {
-            assert_eq!(run(root, &[root]), "the state folder has an extended ACL");
-        }
+        // A named user entry recomputes the mask into the group bits; chmod 0700 sets them back, as the
+        // PowerShell test does, and leaves the ACL.
+        setfacl(&["-m", "u:65534:rx"], &access);
+        set_mode(&access, 0o700);
+        assert_eq!(mode(&access), Some(0o700));
+        assert_eq!(
+            run(&access, &[&access]),
+            "the state folder has an extended ACL"
+        );
+        // A default ACL alone leaves the mode at 0700.
+        setfacl(&["-d", "-m", "u::rwx"], &default);
+        assert_eq!(mode(&default), Some(0o700));
+        assert_eq!(
+            run(&default, &[&default]),
+            "the state folder has an extended ACL"
+        );
     }
 }

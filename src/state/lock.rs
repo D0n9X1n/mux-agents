@@ -275,6 +275,11 @@ mod tests {
     }
 
     #[test]
+    fn lock_wait_is_15_seconds() {
+        assert_eq!(LOCK_WAIT, Duration::from_secs(15));
+    }
+
+    #[test]
     fn windows_mutex_name_is_local_muxagents_32hex() {
         assert_eq!(
             mutex_name("abc"),
@@ -304,6 +309,32 @@ mod tests {
 
         fn state(message: &str) -> (u8, &'static str, String) {
             (1, "state", message.into())
+        }
+
+        // A child forked by another test thread (a Command spawn) holds a copy of every open file description,
+        // and so any flock on it, from fork until exec closes it (O_CLOEXEC acts only at exec). A lock released
+        // here can therefore stay held for a moment, so a check right after a release retries in real time for
+        // up to 5 s; the ctx clock's sleep does not wait.
+        fn eventually<T>(mut attempt: impl FnMut() -> Res<T>) -> Res<T> {
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            loop {
+                let got = attempt();
+                if got.is_ok() || std::time::Instant::now() >= deadline {
+                    return got;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+
+        // Whether a fresh descriptor can take the lock now, retried as `eventually` says.
+        fn free_after_release(path: &Path) -> bool {
+            eventually(|| {
+                let probe = File::open(path)?;
+                probe
+                    .try_lock()
+                    .map_err(|_| refuse::<()>(2, "lock", "held").unwrap_err())
+            })
+            .is_ok()
         }
 
         const PARTS: [&str; 4] = [".local", "state", "mux-agents", "locks"];
@@ -500,21 +531,52 @@ mod tests {
             // Another key is another file.
             assert_eq!(with_lock_in(&ctx, &root, "other", wait, || Ok(1)), Ok(1));
             drop(holder);
-            // A child forked by another test thread (a Command spawn) holds a copy of the holder's open file
-            // description, and so its flock, from fork until exec closes it (O_CLOEXEC acts only at exec).
-            // The lock is then released a moment after the drop, so the re-lock retries in real time; the
-            // ctx clock's sleep does not wait.
-            let deadline = std::time::Instant::now() + Duration::from_secs(5);
-            let relocked = loop {
-                let got = with_lock_in(&ctx, &root, "k", wait, || Ok(2));
-                if got.is_ok() || std::time::Instant::now() >= deadline {
-                    break got;
-                }
-                std::thread::sleep(Duration::from_millis(10));
-            };
+            let relocked = eventually(|| with_lock_in(&ctx, &root, "k", wait, || Ok(2)));
             assert_eq!(relocked, Ok(2));
             // The file stays.
             assert!(path.is_file());
+        }
+
+        // The lock is held while the action runs: another descriptor cannot take it then.
+        #[test]
+        fn held_while_action_runs() {
+            let dir = TempDir::new();
+            let root = dir.path().join("locks");
+            let ctx = Fakes::default().ctx();
+            let path = lock_path(&root, "k");
+            let inside = with_lock_in(&ctx, &root, "k", LOCK_WAIT, || {
+                let probe = File::open(&path).unwrap();
+                Ok(matches!(
+                    probe.try_lock(),
+                    Err(std::fs::TryLockError::WouldBlock)
+                ))
+            });
+            assert_eq!(inside, Ok(true));
+        }
+
+        // `with_lock`'s own wait: 1500 back-offs of 10 ms on the ctx clock, then the refusal; the action never
+        // runs.
+        #[test]
+        fn default_wait_is_1500_back_offs() {
+            let dir = TempDir::new();
+            let (home, _) = home_with(&dir, 0);
+            let fakes = Fakes::default();
+            let ctx = fakes.ctx();
+            assert_eq!(with_lock_under(&ctx, &home, "k", || Ok(())), Ok(()));
+            let root = home.join(PARTS.join("/"));
+            let holder = File::open(lock_path(&root, "k")).unwrap();
+            holder.lock().unwrap();
+            let ran = Cell::new(false);
+            let refused = with_lock_under(&ctx, &home, "k", || {
+                ran.set(true);
+                Ok(())
+            });
+            assert_eq!(
+                refusal(refused),
+                (2, "lock", "timed out waiting for the agent lock".into())
+            );
+            assert!(!ran.get());
+            assert_eq!(fakes.slept(), vec![10; 1500]);
         }
 
         #[test]
@@ -527,16 +589,16 @@ mod tests {
                 with_lock_in(&ctx, &root, "k", wait, || -> Res<()> { panic!("inside") })
             }));
             assert!(panicked.is_err());
-            let probe = File::open(lock_path(&root, "k")).unwrap();
-            probe.try_lock().unwrap();
-            drop(probe);
-            assert_eq!(with_lock_in(&ctx, &root, "k", wait, || Ok(())), Ok(()));
+            assert!(free_after_release(&lock_path(&root, "k")));
+            let again = eventually(|| with_lock_in(&ctx, &root, "k", wait, || Ok(())));
+            assert_eq!(again, Ok(()));
             // A refusal inside the guard releases it too.
             let refused = with_lock_in(&ctx, &root, "k", wait, || -> Res<()> {
                 refuse(2, "name", "taken")
             });
             assert_eq!(refusal(refused), (2, "name", "taken".into()));
-            assert_eq!(with_lock_in(&ctx, &root, "k", wait, || Ok(())), Ok(()));
+            let again = eventually(|| with_lock_in(&ctx, &root, "k", wait, || Ok(())));
+            assert_eq!(again, Ok(()));
         }
 
         #[cfg(feature = "test-panic")]
@@ -554,8 +616,7 @@ mod tests {
                 })
             }));
             assert!(panicked.is_err() && !ran.get());
-            let probe = File::open(lock_path(&root, "k")).unwrap();
-            probe.try_lock().unwrap();
+            assert!(free_after_release(&lock_path(&root, "k")));
         }
 
         #[test]
@@ -607,21 +668,66 @@ mod tests {
         use super::*;
         use crate::testing::Fakes;
         use std::panic::{AssertUnwindSafe, catch_unwind};
-        use windows_sys::Win32::Foundation::{CloseHandle, WAIT_OBJECT_0};
-        use windows_sys::Win32::System::Threading::{CreateMutexW, WaitForSingleObject};
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use windows_sys::Win32::Foundation::{
+            CloseHandle, WAIT_ABANDONED, WAIT_OBJECT_0, WAIT_TIMEOUT,
+        };
+        use windows_sys::Win32::System::Threading::{
+            CreateMutexW, ReleaseMutex, WaitForSingleObject,
+        };
 
         fn key() -> String {
             format!("test-{}", crate::util::hex_id().unwrap())
         }
 
-        // Runs `with_lock_timeout` on another thread, with its own fakes (they are not Send).
-        fn try_elsewhere(key: &str, wait: Duration) -> Res<u8> {
+        fn wide_name(key: &str) -> Vec<u16> {
+            mutex_name(key).encode_utf16().chain([0]).collect()
+        }
+
+        // An independent handle to the key's mutex, not owned; it keeps the named object alive.
+        fn open(key: &str) -> usize {
+            let name = wide_name(key);
+            // SAFETY: `name` is NUL-terminated; the handle is closed by the caller.
+            let mutex = unsafe { CreateMutexW(std::ptr::null(), 0, name.as_ptr()) };
+            assert!(!mutex.is_null());
+            mutex as usize
+        }
+
+        // What another thread's zero wait on the key's mutex returns; it releases what it took.
+        fn wait_elsewhere(key: &str) -> u32 {
             let key = key.to_owned();
             std::thread::spawn(move || {
-                with_lock_timeout(&Fakes::default().ctx(), &key, wait, || Ok(1))
+                let mutex = open(&key) as _;
+                // SAFETY: a live mutex handle, released only if taken, closed once.
+                unsafe {
+                    let got = WaitForSingleObject(mutex, 0);
+                    if got == WAIT_OBJECT_0 || got == WAIT_ABANDONED {
+                        ReleaseMutex(mutex);
+                    }
+                    CloseHandle(mutex);
+                    got
+                }
             })
             .join()
             .unwrap()
+        }
+
+        // Runs `with_lock_timeout` on another thread, with its own fakes (they are not Send); whether its
+        // action ran, and the result.
+        fn try_elsewhere(key: &str, wait: Duration) -> (bool, Res<u8>) {
+            let key = key.to_owned();
+            let ran = Arc::new(AtomicBool::new(false));
+            let seen = ran.clone();
+            let got = std::thread::spawn(move || {
+                with_lock_timeout(&Fakes::default().ctx(), &key, wait, || {
+                    seen.store(true, Ordering::SeqCst);
+                    Ok(1)
+                })
+            })
+            .join()
+            .unwrap();
+            (ran.load(Ordering::SeqCst), got)
         }
 
         #[test]
@@ -629,21 +735,26 @@ mod tests {
             let key = key();
             let ctx = Fakes::default().ctx();
             let wait = Duration::from_millis(200);
-            let refused =
-                with_lock_timeout(&ctx, &key, LOCK_WAIT, || Ok(try_elsewhere(&key, wait)))
-                    .unwrap()
-                    .unwrap_err();
+            let (inside, (ran, refused)) = with_lock_timeout(&ctx, &key, LOCK_WAIT, || {
+                Ok((wait_elsewhere(&key), try_elsewhere(&key, wait)))
+            })
+            .unwrap();
+            // Held while the action runs: another thread's wait times out.
+            assert_eq!(inside, WAIT_TIMEOUT);
+            let refused = refused.unwrap_err();
             assert_eq!(
                 (refused.code, refused.check, refused.message.as_str()),
                 (2, "lock", "timed out waiting for the agent lock")
             );
-            assert_eq!(try_elsewhere(&key, wait), Ok(1));
+            assert!(!ran);
+            assert_eq!(try_elsewhere(&key, wait), (true, Ok(1)));
         }
 
         #[test]
         fn windows_mutex_abandoned_counts_as_held() {
             let key = key();
-            let name: Vec<u16> = mutex_name(&key).encode_utf16().chain([0]).collect();
+            let keep = open(&key);
+            let name = wide_name(&key);
             // A thread takes the mutex and exits holding it; its handle stays open here.
             let handle = std::thread::spawn(move || {
                 // SAFETY: test-only; the handle is returned and closed below.
@@ -654,20 +765,33 @@ mod tests {
             })
             .join()
             .unwrap();
-            assert_eq!(try_elsewhere(&key, Duration::from_millis(200)), Ok(1));
-            // SAFETY: the handle from the thread above, closed once.
-            unsafe { CloseHandle(handle as _) };
+            assert_eq!(
+                try_elsewhere(&key, Duration::from_millis(200)),
+                (true, Ok(1))
+            );
+            // Recovered and released: the next wait gets it outright, not abandoned.
+            assert_eq!(wait_elsewhere(&key), WAIT_OBJECT_0);
+            // SAFETY: the handles from above, closed once.
+            unsafe {
+                CloseHandle(handle as _);
+                CloseHandle(keep as _);
+            }
         }
 
         #[test]
         fn windows_mutex_released_after_unwind() {
             let key = key();
+            // Kept open across the unwind, so the object outlives the guard's handle and the wait below sees
+            // whether the guard released it (WAIT_OBJECT_0) or left it held or abandoned.
+            let keep = open(&key);
             let ctx = Fakes::default().ctx();
             let panicked = catch_unwind(AssertUnwindSafe(|| {
                 with_lock_timeout(&ctx, &key, LOCK_WAIT, || -> Res<()> { panic!("inside") })
             }));
             assert!(panicked.is_err());
-            assert_eq!(try_elsewhere(&key, Duration::from_millis(200)), Ok(1));
+            assert_eq!(wait_elsewhere(&key), WAIT_OBJECT_0);
+            // SAFETY: the handle from above, closed once.
+            unsafe { CloseHandle(keep as _) };
         }
     }
 }

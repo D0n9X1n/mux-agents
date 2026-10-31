@@ -351,6 +351,21 @@ mod tests {
         }
         // A null DACL grants everyone everything.
         assert_eq!(message(decide_acl(USER, USER, None)), shared);
+        // An allow entry inherited from the folder above counts as much as an explicit one.
+        const INHERITED_ACE: u8 = 0x10;
+        for flags in [INHERITED_ACE, INHERITED_ACE | 3] {
+            let inherited = Ace {
+                allow: true,
+                flags,
+                sid: Some("S-1-5-21-1-2-3-1002".into()),
+            };
+            let dacl = [allow(USER), allow(SYSTEM), inherited];
+            assert_eq!(
+                message(decide_acl(USER, USER, Some(&dacl))),
+                shared,
+                "{flags:#x}"
+            );
+        }
     }
 
     #[test]
@@ -416,8 +431,10 @@ mod tests {
     fn creates_protected_dacl() {
         use windows_sys::Win32::Security::Authorization::{GetNamedSecurityInfoW, SE_FILE_OBJECT};
         use windows_sys::Win32::Security::{
-            DACL_SECURITY_INFORMATION, GetSecurityDescriptorControl, SE_DACL_PROTECTED,
+            ACCESS_ALLOWED_ACE, ACL, DACL_SECURITY_INFORMATION, GetAce,
+            GetSecurityDescriptorControl, SE_DACL_PROTECTED,
         };
+        use windows_sys::Win32::Storage::FileSystem::FILE_ALL_ACCESS;
         let dir = crate::testing::TempDir::new();
         let (a, b) = (dir.path().join("a"), dir.path().join("a").join("b"));
         assert_eq!(message(private_dirs(&[&b])), "ok");
@@ -433,8 +450,11 @@ mod tests {
             assert!(dacl.iter().all(|a| a.allow && a.flags == 3), "{dacl:?}");
             let name = win::wide(path.as_os_str()).unwrap();
             let mut sd = std::ptr::null_mut();
+            let mut acl: *mut ACL = std::ptr::null_mut();
             let (mut control, mut revision) = (0u16, 0u32);
-            // SAFETY: test-only read of the descriptor's control bits; the descriptor is leaked.
+            let mut masks = Vec::new();
+            // SAFETY: test-only read of the descriptor's control bits and each ACE's access mask (an
+            // ACCESS_ALLOWED_ACE, checked above); the descriptor is leaked.
             unsafe {
                 let status = GetNamedSecurityInfoW(
                     name.as_ptr(),
@@ -442,7 +462,7 @@ mod tests {
                     DACL_SECURITY_INFORMATION,
                     std::ptr::null_mut(),
                     std::ptr::null_mut(),
-                    std::ptr::null_mut(),
+                    &mut acl,
                     std::ptr::null_mut(),
                     &mut sd,
                 );
@@ -451,8 +471,15 @@ mod tests {
                     GetSecurityDescriptorControl(sd, &mut control, &mut revision),
                     0
                 );
+                for index in 0..u32::from((*acl).AceCount) {
+                    let mut ace = std::ptr::null_mut();
+                    assert_ne!(GetAce(acl, index, &mut ace), 0);
+                    masks.push((*(ace as *const ACCESS_ALLOWED_ACE)).Mask);
+                }
             }
             assert_ne!(control & SE_DACL_PROTECTED, 0);
+            // Full control (FA) for each of the user, SYSTEM and Administrators.
+            assert_eq!(masks, [FILE_ALL_ACCESS; 3], "{path:?}");
         }
         let file = dir.path().join("f");
         std::fs::write(&file, b"").unwrap();
