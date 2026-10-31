@@ -70,6 +70,13 @@ Describe 'MuxAgents foundation runner' {
         $suite = "Describe 'win' -Tag 'windows' { It 'fails' { 1 | Should Be 2 } }`nDescribe 'all' { It 'passes' { 1 | Should Be 1 } }"
         Invoke-FoundationRunner 'tagged' $suite | Should Be $(if ($IsWindows) { 1 } else { 0 })
     }
+    It 'runs only the suites tagged for this OS, plus untagged ones' {
+        $marks = Join-Path $TestDrive 'os-marks'
+        $null = New-Item -ItemType Directory -Force -Path $marks; $quoted = $marks.Replace("'", "''")
+        $suite = (@('windows', 'linux', 'macos') | ForEach-Object { "Describe '$_' -Tag '$_' { It 'marks' { [IO.File]::WriteAllText((Join-Path '$quoted' '$_'), 'x') } }" }) -join "`n"
+        $code = Invoke-FoundationRunner 'os-tags' ($suite + "`nDescribe 'all' { It 'passes' { 1 | Should Be 1 } }")
+        $ran = @(Get-ChildItem -LiteralPath $marks -File | ForEach-Object { $_.Name } | Sort-Object) -join ','
+        "$code $ran" | Should BeExactly "0 $(if ($IsWindows) { 'windows' } elseif ($IsLinux) { 'linux' } else { 'macos' })" }
     It 'with no -Path discovers every *.Tests.ps1 under tests' {
         # A child pwsh runs the runner with Invoke-Pester aliased to a recorder, so no suite runs and nothing recurses.
         # The recorder logs the -Script it was given, then the files Pester 4.10.1's own discovery resolves from it.
