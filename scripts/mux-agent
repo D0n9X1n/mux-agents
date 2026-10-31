@@ -1,0 +1,25 @@
+#!/bin/sh
+# mux-agent entry shim: runs the first usable binary of MUX_AGENTS_BIN, scripts/bin/<os>-<arch>/mux-agent and
+# target/release/mux-agent, passing every argument and the exit code through. With none usable it prints an entry
+# refusal and exits 1. POSIX sh; the only subprocess is uname.
+
+case $0 in */*) here=${0%/*} ;; *) here=. ;; esac
+plugin=$here/..
+
+u=$(uname -sm)
+case ${u% *} in Darwin) os=macos ;; Linux) os=linux ;; *) os=${u% *} ;; esac
+case ${u##* } in arm64 | aarch64) arch=aarch64 ;; x86_64 | amd64) arch=x86_64 ;; *) arch=${u##* } ;; esac
+
+# A regular file that is executable, or becomes so with chmod +x.
+usable() {
+  [ -n "$1" ] && [ -f "$1" ] || return 1
+  [ -x "$1" ] || chmod +x "$1" 2>/dev/null
+  [ -x "$1" ]
+}
+
+for bin in "${MUX_AGENTS_BIN-}" "$plugin/scripts/bin/$os-$arch/mux-agent" "$plugin/target/release/mux-agent"; do
+  if usable "$bin"; then exec "$bin" "$@"; fi
+done
+
+printf '{"ok":false,"verb":null,"code":1,"check":"entry","message":"no usable mux-agent binary for %s-%s"}\n' "$os" "$arch"
+exit 1
