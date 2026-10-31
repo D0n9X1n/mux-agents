@@ -100,7 +100,8 @@ Describe 'MuxAgents runtime override on linux' -Tag 'linux' {
 function Get-RuntimeCaseBuild {
     # Unix names are case-sensitive: the exact name decides the gate and the pane forward alike, a lowercase one neither.
     $names = 'MUX_AGENTS_ALLOW_AFFECTED_DOTNET', 'mux_agents_allow_affected_dotnet'
-    $saved = @{}; foreach ($n in $names + 'MUX_AGENTS_STATE') { $saved[$n] = [Environment]::GetEnvironmentVariable($n) }
+    # Ordinal: @{} ignores case, so the two names would share one slot. Object values: a [string] slot turns an unset $null into ''.
+    $saved = [Collections.Generic.Dictionary[string, object]]::new([StringComparer]::Ordinal); foreach ($n in $names + 'MUX_AGENTS_STATE') { $saved[$n] = [Environment]::GetEnvironmentVariable($n) }
     $lock = $script:MuxAgentLockName; $p = $script:MuxAgentProviders
     $state = Join-Path $TestDrive 'case-state'; $null = [IO.Directory]::CreateDirectory($state)
     try {
