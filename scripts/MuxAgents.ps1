@@ -251,13 +251,14 @@ function Get-MuxAgentPlatformMembers {
             $sid = Get-MuxAgentUserSid
             foreach ($path in $Paths) { New-MuxAgentPrivateDirectory $sid $path }
         }
-        LockName = { param([string]$LockKey) 'Local\MuxAgents-' + (Get-MuxAgentHash $LockKey).Substring(0, 32) }
+        LockName = $script:MuxAgentWindowsLockName
         ClientImage = { param([string]$Client) "$Client.exe" }
         IsUnder = { param([string]$Root, [string]$Full) $Full.StartsWith([IO.Path]::GetFullPath($Root).TrimEnd('\') + '\', [StringComparison]::OrdinalIgnoreCase) }
     }
 }
+$script:MuxAgentWindowsLockName = { param([string]$LockKey) 'Local\MuxAgents-' + (Get-MuxAgentHash $LockKey).Substring(0, 32) }
 # Locks use the Windows name until New-MuxAgentProviders installs the selected platform's LockName.
-$script:MuxAgentLockName = (Get-MuxAgentPlatformMembers -Platform windows).LockName
+$script:MuxAgentLockName = $script:MuxAgentWindowsLockName
 
 function Resolve-MuxAgentExecutable {
     # The rmux image the caller's server runs (by the server PID in RMUX, then TMUX), else the first rmux.exe on PATH.
@@ -363,10 +364,24 @@ function ConvertTo-MuxAgentFailure {
     for ($e = $ErrorRecord.Exception; $e; $e = $e.InnerException) { if ($e.Data.Contains('MuxAgentCode')) { $failure.code = [int]$e.Data['MuxAgentCode']; $failure.check = [string]$e.Data['MuxAgentCheck']; $failure.message = $e.Message; break } }
     $failure }
 function Initialize-MuxAgentProviders {
-    # New-MuxAgentProviders for the entry and the launcher: a refusal while building comes back as Failure, never thrown.
-    param([Parameter(Mandatory)][string]$Entry)
+    # The runtime check (#25), then New-MuxAgentProviders, for the entry and the launcher: a refusal comes back as Failure,
+    # never thrown, and keeps the advisory; P.Advisory is the override's advisory text or $null.
+    param([Parameter(Mandatory)][string]$Entry, [AllowEmptyString()][string]$Platform = (Get-MuxAgentPlatform), [AllowEmptyString()][string]$RuntimeVersion = (Get-MuxAgentRuntimeVersion))
     $ErrorActionPreference = 'Stop'
-    try { [pscustomobject]@{ P = (New-MuxAgentProviders -Entry $Entry); Failure = $null } } catch { [pscustomobject]@{ P = $null; Failure = (ConvertTo-MuxAgentFailure $_) } } }
+    $advisory = $null
+    try {
+        $advisory = Get-MuxAgentRuntimeAdvisory -Platform $Platform -Version $RuntimeVersion -Environment ([Environment]::GetEnvironmentVariables())
+        $providers = New-MuxAgentProviders -Entry $Entry
+        # Add-Member: a providers object without the property (a test stub) would refuse a plain assignment.
+        Add-Member -InputObject $providers -NotePropertyName Advisory -NotePropertyValue $advisory -Force
+        [pscustomobject]@{ P = $providers; Failure = $null }
+    }
+    catch {
+        $failure = ConvertTo-MuxAgentFailure $_
+        if ($advisory) { $failure['advisory'] = $advisory }
+        [pscustomobject]@{ P = $null; Failure = $failure }
+    }
+}
 
 function Invoke-MuxAgentNative {
     # The only rmux path: every call starts with -N (never start a server); a failure never echoes stderr.
