@@ -10,6 +10,8 @@ if [ -n "$sid" ]; then
   "$MUX_IT_PWSH" -NoProfile -File "$MUX_IT_ENTRY" send parent -BodyFile "$d/$sid.reply" > "$d/$sid.send.json" 2>&1
   : > "$d/$sid.sent"
   "$MUX_IT_PWSH" -NoProfile -File "$MUX_IT_ENTRY" spawn -Client claude -TaskFile "$d/$sid.task" > "$d/$sid.spawn.json" 2>&1
+  echo 'checking the side bar' > "$d/$sid.status"
+  "$MUX_IT_PWSH" -NoProfile -File "$MUX_IT_ENTRY" status -BodyFile "$d/$sid.status" > "$d/$sid.status.json" 2>&1
   : > "$d/$sid.done"
 else
   echo "$MUX_IT_TTY" > "$d/root.tty"
