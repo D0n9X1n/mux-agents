@@ -1498,9 +1498,17 @@ function Set-MuxAgentConsoleUtf8 {
     try { [Console]::OutputEncoding = [Text.UTF8Encoding]::new($false) } catch { }
 }
 
+function Test-MuxAgentOutputTerminal {
+    # True when this process's stdout is a terminal (a tmux pane's tty, an rmux pane's console), not a pipe or a file.
+    -not [Console]::IsOutputRedirected
+}
+
 function Invoke-MuxAgentWatch {
-    # The side-bar pane's process: draws the caller session's board until its pane closes.
+    # The side-bar pane's process: draws the caller session's board until its pane closes. Refuses unless stdout is a
+    # terminal: a terminal whose pane closed fails the next write, but a write to a pipe whose reader closed can still
+    # succeed, and with the pane alive nothing else would end the loop.
     param([Parameter(Mandatory)]$P, [Parameter(Mandatory)]$Request)
+    if (-not (Test-MuxAgentOutputTerminal)) { Exit-MuxAgentCommand 2 'usage' 'watch draws only to a terminal: it runs in the side-bar pane' }
     $caller = Resolve-MuxAgentCaller -P $P
     Set-MuxAgentConsoleUtf8
     $ended = Start-MuxAgentWatch -P $P -Caller $caller -Write (New-MuxAgentFrameWriter -Stream ([Console]::OpenStandardOutput()))
@@ -1509,12 +1517,20 @@ function Invoke-MuxAgentWatch {
 
 function Find-MuxAgentSidebar {
     # The caller session's first pane with @agent-role sidebar and no @agent-id ({Pane, Window}), else $null. An agent
-    # pane that also carries the role is never the bar. Reads only.
+    # pane that also carries the role is never the bar. list-panes only names candidates: an option value may hold a
+    # newline and so forge a line. Each candidate is asked alone and must answer exactly '<pane>|<window>|sidebar||end'
+    # (ordinal), which no role or id with a newline or control character, and no pane with an id, can produce. Reads only.
     param([Parameter(Mandatory)]$P, [Parameter(Mandatory)]$Caller)
     $listed = Invoke-MuxAgentNative -P $P -Arguments @('list-panes', '-s', '-t', $Caller.Session, '-F', '#{pane_id}|#{window_id}|#{@agent-role}|#{@agent-id}')
+    $seen = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
     foreach ($line in ([string]$listed.StdOut -split "`r?`n")) {
-        $pane, $window, $role, $id = $line -split '\|', 4
-        if ($role -ceq 'sidebar' -and [string]::IsNullOrEmpty($id) -and $pane -match '^%\d+$') { return [pscustomobject]@{ Pane = $pane; Window = $window } }
+        if ($line -cnotmatch '^(%\d+)\|@\d+\|sidebar(\||$)') { continue }
+        $pane = $Matches[1]
+        if (-not $seen.Add($pane)) { continue }
+        $probe = try { Invoke-MuxAgentNative -P $P -Arguments @('display-message', '-p', '-t', $pane, '#{pane_id}|#{window_id}|#{@agent-role}|#{@agent-id}|end') -AllowFailure } catch { $null }
+        if ($null -eq $probe -or $probe.ExitCode -ne 0) { continue }
+        $answer = ([string]$probe.StdOut) -replace '\r?\n\z', ''
+        if ($answer -cmatch '^(%\d+)\|(@\d+)\|sidebar\|\|end\z' -and [string]::Equals($Matches[1], $pane, [StringComparison]::Ordinal)) { return [pscustomobject]@{ Pane = $pane; Window = $Matches[2] } }
     }
     $null
 }

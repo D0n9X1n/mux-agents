@@ -17,13 +17,19 @@ function Add-SidebarMux {
     # Stateful list-panes / split-window / set-option / kill-pane: a table pane -> 'role|agent-id'. %1 (the caller) has
     # neither, %2 role 'other'. -Open adds the bar %7; -AgentBar adds %3, an agent pane that also has role sidebar.
     # SplitError fails every split with that stderr; -RefuseSize fails only a split holding -l, with rmux 0.10.0's
-    # words. TagFail and KillFail are 'exit' (exit 1) or 'throw' (TimeoutException, as a timed-out call).
-    param($Fake, [switch]$Open, [switch]$AgentBar, [switch]$RefuseSize, [string]$SplitError, [string]$TagFail, [string]$KillFail)
+    # words. TagFail and KillFail are 'exit' (exit 1) or 'throw' (TimeoutException, as a timed-out call). Extra adds
+    # panes as given ('role|agent-id', which may hold a newline or a control character). A single-pane display-message
+    # answers from the same table, as the finder's confirmation.
+    param($Fake, [switch]$Open, [switch]$AgentBar, [switch]$RefuseSize, [string]$SplitError, [string]$TagFail, [string]$KillFail, [hashtable]$Extra)
     $panes = [ordered]@{ '%1' = '|'; '%2' = 'other|' }
     if ($AgentBar) { $panes['%3'] = 'sidebar|cccccccccccc' }
     if ($Open) { $panes['%7'] = 'sidebar|' }
+    if ($Extra) { foreach ($key in $Extra.Keys) { $panes[$key] = $Extra[$key] } }
     $fail = { param($How) if ($How -ceq 'throw') { throw [TimeoutException]::new('slow') }; [pscustomobject]@{ ExitCode = 1; StdOut = ''; StdErr = "no server`n" } }
     Add-FakeRmuxRule -Fake $Fake -Match '^-N list-panes .*#\{@agent-role\}\|#\{@agent-id\}$' -Script { [pscustomobject]@{ ExitCode = 0; StdErr = ''; StdOut = (@($panes.Keys | ForEach-Object { "$_|@5|$($panes[$_])`n" }) -join '') } }.GetNewClosure()
+    Add-FakeRmuxRule -Fake $Fake -Match '^-N display-message -p -t %\d+ #\{pane_id\}\|#\{window_id\}\|#\{@agent-role\}\|#\{@agent-id\}\|end$' -Script {
+        param($a) $p = $a[4]
+        [pscustomobject]@{ ExitCode = 0; StdErr = ''; StdOut = $(if ($panes.Contains($p)) { "$p|@5|$($panes[$p])|end`n" } else { "||||end`n" }) } }.GetNewClosure()
     Add-FakeRmuxRule -Fake $Fake -Match '^-N split-window ' -Script {
         param($a)
         if ($SplitError) { return [pscustomobject]@{ ExitCode = 1; StdOut = ''; StdErr = "$SplitError`n" } }
@@ -243,6 +249,20 @@ Describe 'MuxAgents sidebar watch verb' {
         "$($request.Verb) $($request.Handler) $($request.Options.Count)" | Should BeExactly 'watch Invoke-MuxAgentWatch 0'
         $run = Invoke-SidebarVerb (New-SidebarFake 'watch usage') @('watch', 'x')
         "$($run.Code) $($run.Reply.check) $($run.Reply.message)" | Should BeExactly '2 usage usage: mux-agent watch [-Text]' }
+    Context 'output not a terminal' {
+        Mock Test-MuxAgentOutputTerminal { $false }
+        Mock Start-MuxAgentWatch { 'started' }
+        It 'refuses before drawing when its output is not a terminal, where a closed reader would not end it' {
+            # Catches: watch started on a pipe (a write to a pipe whose reader closed can succeed, so the loop never ends).
+            $run = Invoke-SidebarVerb (New-SidebarFake 'watch pipe') @('watch')
+            "$($run.Code) $($run.Reply.check) $($run.Reply.message)" | Should BeExactly '2 usage watch draws only to a terminal: it runs in the side-bar pane'
+            Assert-MockCalled Start-MuxAgentWatch -Times 0 -Exactly -Scope It } }
+    It 'Test-MuxAgentOutputTerminal is false in a process whose output is a pipe' {
+        # Catches: a check that is always true. A child pwsh's stdout here is the pipe this test reads.
+        $pwsh = [Diagnostics.Process]::GetCurrentProcess().MainModule.FileName
+        $library = Join-Path (Join-Path $repoRoot 'scripts') 'MuxAgents.ps1'
+        $out = & $pwsh -NoProfile -Command ". '$library'; Test-MuxAgentOutputTerminal"
+        "$out" | Should BeExactly 'False' }
     It 'switches the real console encoding to UTF-8, so the glyphs leave as UTF-8 bytes, and the test restores it' {
         # A child pwsh: its console starts on ASCII, Set-MuxAgentConsoleUtf8 runs, the child reports the code page and
         # writes the bar glyphs through Console.Out; the parent reads the raw bytes. The child restores its encoding in a
@@ -269,6 +289,7 @@ finally { [Console]::OutputEncoding = $saved }
         $done = $child.WaitForExit(60000); $copy.Wait(10000) | Out-Null
         "$done $($child.ExitCode) $([Convert]::ToHexString($bytes.ToArray()))" | Should BeExactly ('True 0 ' + [Convert]::ToHexString([Text.Encoding]::ASCII.GetBytes('20127>65001|')) + 'E2978FE2978BC2B7') }
     Context 'watch handler spies' {
+        Mock Test-MuxAgentOutputTerminal { $true }   # Pester's own stdout is a pipe
         It 'sets the console to UTF-8, then runs the loop for its own pane on a stdout frame writer, and replies how it ended' {
             # Catches: the console set after the writer, the writer built on another stream, another pane, the end not replied.
             $fake = New-SidebarFake 'watch verb' -Pane '%7'
@@ -334,6 +355,20 @@ Describe 'MuxAgents sidebar verb' {
         $open = Invoke-SidebarVerb $fake @('sidebar')
         "$($close.Code) $($close.Reply.closed) $(Get-SidebarCount $fake 'kill-pane') | $($open.Code) $($open.Reply.pane) $($open.Reply.opened) $(Get-SidebarCount $fake 'split-window')" | Should BeExactly '0 False 0 | 0 %7 True 1'
         Get-SidebarRoles $panes | Should BeExactly '%1=|,%2=other|,%3=sidebar|cccccccccccc,%7=sidebar|' }
+    It 'never closes a pane that only looks like a bar in list-panes: a newline in a role or id, an ESC in the role, a forged line' {
+        # Catches: a finder that trusts list-panes lines (a newline in an option value forges a bar line with no id), a
+        # culture-aware role compare (it ignores ESC, so side<ESC>bar equals sidebar).
+        $cases = [ordered]@{
+            'role newline' = @{ '%3' = "sidebar`nmore|cccccccccccc" }
+            'id newline' = @{ '%3' = "sidebar|`ncccccccccccc" }
+            'role escape' = @{ '%3' = "side$([char]27)bar|" }
+            'forged line' = @{ '%3' = "other|x`n%2|@5|sidebar|" } }
+        $n = 0
+        $answers = foreach ($name in $cases.Keys) {
+            $n++; $fake = New-SidebarFake "forged $n"; $null = Add-SidebarMux $fake -Extra $cases[$name]
+            $close = Invoke-SidebarVerb $fake @('sidebar', '-Close')
+            "$name=$($close.Code) $($close.Reply.closed) $(Get-SidebarCount $fake 'kill-pane')" }
+        ($answers -join ';') | Should BeExactly 'role newline=0 False 0;id newline=0 False 0;role escape=0 False 0;forged line=0 False 0' }
     It '-Close whose kill fails or throws refuses sidebar, names the pane, and never answers closed' {
         # Catches: closed true after a failed kill, a thrown kill escaping as internal, the pane not named.
         $answers = foreach ($how in 'exit', 'throw') {
@@ -387,6 +422,9 @@ Add-FakeRmuxRule -Fake $fake -Match '^-N split-window ' -Script {
     $pane = Use-RaceState { param($panes) $id = '%' + (7 + @($panes.Keys | Where-Object { [int]$_.Substring(1) -ge 7 }).Count); $panes[$id] = '|'; $id }
     [pscustomobject]@{ ExitCode = 0; StdOut = "$pane|@5`n"; StdErr = '' } }
 Add-FakeRmuxRule -Fake $fake -Match '^-N set-option ' -Script { param($a) $null = Use-RaceState { param($panes, $argv) $panes[$argv[4]] = "$($argv[6])|" } $a; $null }
+Add-FakeRmuxRule -Fake $fake -Match '^-N display-message -p -t %\d+ #\{pane_id\}\|#\{window_id\}\|#\{@agent-role\}\|#\{@agent-id\}\|end$' -Script {
+    param($a) $text = Use-RaceState { param($panes, $argv) $p = $argv[4]; if ($panes.Contains($p)) { "$p|@5|$($panes[$p])|end`n" } else { "||||end`n" } } $a
+    [pscustomobject]@{ ExitCode = 0; StdOut = $text; StdErr = '' } }
 [IO.File]::WriteAllText((Join-Path $Race "ready-$PID"), '')
 for ($i = 0; $i -lt 600 -and -not (Test-Path -LiteralPath (Join-Path $Race 'go')); $i++) { Start-Sleep -Milliseconds 50 }
 $r = Invoke-MuxAgentCommand -P $fake -Arguments @('sidebar')
