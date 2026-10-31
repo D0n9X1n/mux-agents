@@ -54,8 +54,17 @@ async function openAfterSpawn($: EngineInterface, command: string, stdout: strin
   if (mux && isSpawn(command, stdout)) await openPane($)
 }
 
-// After the pane closed: stop its refresh, so a later open starts one new timer.
-function stopRefresh() {
+// After a close of the pane: stop its refresh only when the pane is really gone, so a later open starts one new timer.
+// A close refused below, or answered without closing, leaves the pane listed and its refresh running. When the list
+// cannot be read the refresh runs on: a spare list every 3 s costs less than a pane that stops updating.
+async function stopRefreshIfGone($: EngineInterface) {
+  let panes
+  try {
+    panes = await $.ui.panes()
+  } catch {
+    return
+  }
+  if (panes.some(p => p.id === PANE)) return
   ticking?.cancel()
   ticking = undefined
 }
@@ -86,10 +95,10 @@ export const register: Register = on => {
     }
     return ran
   })
-  // Any origin (the person, a plugin): the close goes on first, so a hook below that keeps the pane open keeps its refresh.
+  // Any origin (the person, a plugin): the close goes on first; its answer is returned unchanged.
   on('ui.close', async ($, e, next) => {
     const closed = await next(e)
-    if (e.id === PANE) stopRefresh()
+    if (e.id === PANE) await stopRefreshIfGone($)
     return closed
   })
   // Every string drawn here comes from parseList, so it is already cleaned.
