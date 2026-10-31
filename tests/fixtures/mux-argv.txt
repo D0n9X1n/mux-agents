@@ -1,0 +1,111 @@
+# Multiplexer argv per verb, after `<mux> -S <socket>`: one call per line, tokens joined by one space.
+# Written by hand from scripts/MuxAgents.ps1 at a96b866 (lines per call below), adapted only where the spec
+# changed: a pane runs `<exe> launcher <spec>` or `<exe> watch` (D4), and the tagged-pane list frames each row
+# with a fresh per-call marker.
+# Placeholders: <marker> the 32-hex marker, <state> the state root, <cwd> the caller's cwd, <exe> the binary,
+# <id> the new agent's id, <spec> its spec.json. `-e MUX_AGENTS_STATE=<state>` is the Unix pane environment;
+# a Windows pane has none.
+# :370 caller probe; :539 tagged-pane list; :1188 gone probe of agent %8 (committed, no notice, not listed).
+
+[spawn -Client claude -Task hi]
+-N display-message -p -t %1 #{pid}|#{pane_pid}|#{session_id}|#{window_id}|#{@agent-id}
+-N list-panes -s -t $3 -F <marker>|#{pane_id}|#{window_id}|#{pane_pid}|#{@agent-id}|#{@agent-name}|<marker>
+# :800-804
+-N new-window -d -P -F #{pane_id}|#{window_id} -t $3: -n claude-1 -e MUX_AGENTS_STATE=<state> -c <cwd> <exe> launcher <spec>
+# :808-809
+-N set-option -p -t %12 @agent-id <id> ; set-option -p -t %12 @agent-name claude-1 ; set-option -p -t %12 @agent-parent %1 ; set-option -p -t %12 @agent-context brief:human
+
+[spawn -Client copilot -Task hi -Split v -Name helper]
+-N display-message -p -t %1 #{pid}|#{pane_pid}|#{session_id}|#{window_id}|#{@agent-id}
+-N list-panes -s -t $3 -F <marker>|#{pane_id}|#{window_id}|#{pane_pid}|#{@agent-id}|#{@agent-name}|<marker>
+# :800, 804
+-N split-window -d -v -P -F #{pane_id}|#{window_id} -t %1 -e MUX_AGENTS_STATE=<state> -c <cwd> <exe> launcher <spec>
+-N set-option -p -t %12 @agent-id <id> ; set-option -p -t %12 @agent-name helper ; set-option -p -t %12 @agent-parent %1 ; set-option -p -t %12 @agent-context brief:human
+
+[spawn -Client claude -Task hi, tagging fails]
+-N display-message -p -t %1 #{pid}|#{pane_pid}|#{session_id}|#{window_id}|#{@agent-id}
+-N list-panes -s -t $3 -F <marker>|#{pane_id}|#{window_id}|#{pane_pid}|#{@agent-id}|#{@agent-name}|<marker>
+-N new-window -d -P -F #{pane_id}|#{window_id} -t $3: -n claude-1 -e MUX_AGENTS_STATE=<state> -c <cwd> <exe> launcher <spec>
+-N set-option -p -t %12 @agent-id <id> ; set-option -p -t %12 @agent-name claude-1 ; set-option -p -t %12 @agent-parent %1 ; set-option -p -t %12 @agent-context brief:human
+# :823
+-N kill-pane -t %12
+
+[spawn -Client claude -TaskFile t.md -BriefFile b.md, from a Claude agent]
+-N display-message -p -t %1 #{pid}|#{pane_pid}|#{session_id}|#{window_id}|#{@agent-id}
+# :950, 954 (C2: the pane's mode line)
+-N display-message -p -t %1 #{pane_height}
+-N capture-pane -p -t %1
+
+[list]
+-N display-message -p -t %1 #{pid}|#{pane_pid}|#{session_id}|#{window_id}|#{@agent-id}
+-N list-panes -s -t $3 -F <marker>|#{pane_id}|#{window_id}|#{pane_pid}|#{@agent-id}|#{@agent-name}|<marker>
+-N display-message -p -t %8 #{pane_id}|#{@agent-id}
+
+[list -All]
+-N display-message -p -t %1 #{pid}|#{pane_pid}|#{session_id}|#{window_id}|#{@agent-id}
+-N list-panes -s -t $3 -F <marker>|#{pane_id}|#{window_id}|#{pane_pid}|#{@agent-id}|#{@agent-name}|<marker>
+-N display-message -p -t %8 #{pane_id}|#{@agent-id}
+
+[focus worker]
+-N display-message -p -t %1 #{pid}|#{pane_pid}|#{session_id}|#{window_id}|#{@agent-id}
+-N list-panes -s -t $3 -F <marker>|#{pane_id}|#{window_id}|#{pane_pid}|#{@agent-id}|#{@agent-name}|<marker>
+# :1282-1283
+-N select-window -t @5
+-N select-pane -t %9
+
+[send worker -Body hi]
+-N display-message -p -t %1 #{pid}|#{pane_pid}|#{session_id}|#{window_id}|#{@agent-id}
+-N list-panes -s -t $3 -F <marker>|#{pane_id}|#{window_id}|#{pane_pid}|#{@agent-id}|#{@agent-name}|<marker>
+# :1316
+-N display-message -p -t %9 #{session_id}|#{@agent-id}
+
+[read]
+-N display-message -p -t %1 #{pid}|#{pane_pid}|#{session_id}|#{window_id}|#{@agent-id}
+-N list-panes -s -t $3 -F <marker>|#{pane_id}|#{window_id}|#{pane_pid}|#{@agent-id}|#{@agent-name}|<marker>
+-N display-message -p -t %8 #{pane_id}|#{@agent-id}
+
+[read worker -Lines 5]
+-N display-message -p -t %1 #{pid}|#{pane_pid}|#{session_id}|#{window_id}|#{@agent-id}
+-N list-panes -s -t $3 -F <marker>|#{pane_id}|#{window_id}|#{pane_pid}|#{@agent-id}|#{@agent-name}|<marker>
+# :1366
+-N capture-pane -p -J -t %9 -S -5
+
+[stop worker]
+-N display-message -p -t %1 #{pid}|#{pane_pid}|#{session_id}|#{window_id}|#{@agent-id}
+-N list-panes -s -t $3 -F <marker>|#{pane_id}|#{window_id}|#{pane_pid}|#{@agent-id}|#{@agent-name}|<marker>
+# :1409
+-N kill-pane -t %9
+
+[status -BodyFile s.md, from a Claude agent]
+-N display-message -p -t %1 #{pid}|#{pane_pid}|#{session_id}|#{window_id}|#{@agent-id}
+
+[sidebar]
+-N display-message -p -t %1 #{pid}|#{pane_pid}|#{session_id}|#{window_id}|#{@agent-id}
+# :1526
+-N list-panes -s -t $3 -F #{pane_id}|#{window_id}|#{@agent-role}|#{@agent-id}
+# :1578-1579
+-N split-window -d -h -P -F #{pane_id}|#{window_id} -t %1 -e MUX_AGENTS_STATE=<state> -l 42 <exe> watch
+# :1584
+-N set-option -p -t %13 @agent-role sidebar
+
+[sidebar, -l refused]
+-N display-message -p -t %1 #{pid}|#{pane_pid}|#{session_id}|#{window_id}|#{@agent-id}
+-N list-panes -s -t $3 -F #{pane_id}|#{window_id}|#{@agent-role}|#{@agent-id}
+-N split-window -d -h -P -F #{pane_id}|#{window_id} -t %1 -e MUX_AGENTS_STATE=<state> -l 42 <exe> watch
+# :1580
+-N split-window -d -h -P -F #{pane_id}|#{window_id} -t %1 -e MUX_AGENTS_STATE=<state> <exe> watch
+-N set-option -p -t %13 @agent-role sidebar
+
+[sidebar -Close]
+-N display-message -p -t %1 #{pid}|#{pane_pid}|#{session_id}|#{window_id}|#{@agent-id}
+-N list-panes -s -t $3 -F #{pane_id}|#{window_id}|#{@agent-role}|#{@agent-id}
+# :1532
+-N display-message -p -t %13 #{pane_id}|#{window_id}|#{@agent-role}|#{@agent-id}|end
+# :1555
+-N kill-pane -t %13
+
+[watch, one frame]
+-N display-message -p -t %1 #{pid}|#{pane_pid}|#{session_id}|#{window_id}|#{@agent-id}
+# :1482
+-N display-message -p -t %1 #{pane_id}|#{@agent-role}
+-N list-panes -s -t $3 -F <marker>|#{pane_id}|#{window_id}|#{pane_pid}|#{@agent-id}|#{@agent-name}|<marker>

@@ -1,0 +1,225 @@
+//! Repository rules checked over the source text (spec D3: one module starts processes).
+//!
+//! The rule: outside `#[cfg(test)]` items, `Command::new` and `process::Command` appear only in `src/spawn.rs`.
+//! Every `.rs` file under `src/` is scanned except `src/bin/fake-client.rs` (the live tests' stand-in client, built
+//! only with the `live` feature). An item is test-only when `#[cfg(test)]` (exactly) stands before it at any depth;
+//! the item runs to its first `;` or its matching `}` outside brackets. Comments, strings and char literals are
+//! blanked first, so a brace or the name inside them neither counts nor hides code.
+
+use std::path::{Path, PathBuf};
+
+const ALLOWED: &str = "src/spawn.rs";
+const EXCLUDED: &str = "src/bin/fake-client.rs";
+const NAMES: [&str; 2] = ["Command::new", "process::Command"];
+
+fn ident(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_'
+}
+
+/// The byte after a string, raw string or char literal starting at `i`, or none when none starts there.
+fn literal_end(b: &[u8], i: usize) -> Option<usize> {
+    let at = |k: usize| b.get(k).copied();
+    match b[i] {
+        b'"' => {
+            let mut k = i + 1;
+            while k < b.len() && b[k] != b'"' {
+                k += if b[k] == b'\\' { 2 } else { 1 };
+            }
+            Some((k + 1).min(b.len()))
+        }
+        // r"..", r#".."#, br".."; not the end of an identifier such as `for`.
+        b'r' if i == 0 || !ident(b[i - 1]) || (b[i - 1] == b'b' && (i < 2 || !ident(b[i - 2]))) => {
+            let hashes = b[i + 1..].iter().take_while(|&&c| c == b'#').count();
+            if at(i + 1 + hashes) != Some(b'"') {
+                return None;
+            }
+            let close: Vec<u8> = std::iter::once(b'"')
+                .chain(std::iter::repeat_n(b'#', hashes))
+                .collect();
+            let body = i + 2 + hashes;
+            let end = b[body..]
+                .windows(close.len())
+                .position(|w| w == close.as_slice())
+                .map_or(b.len(), |p| body + p + close.len());
+            Some(end)
+        }
+        // '\n', '\u{..}', '\'' or one char; anything else is a lifetime.
+        b'\'' => {
+            if at(i + 1) == Some(b'\\') {
+                let close = b[i + 3..].iter().position(|&c| c == b'\'')?;
+                return Some(i + 3 + close + 1);
+            }
+            let lead = at(i + 1)?;
+            let len = match lead {
+                0x00..=0x7f => 1,
+                0xc0..=0xdf => 2,
+                0xe0..=0xef => 3,
+                _ => 4,
+            };
+            (at(i + 1 + len) == Some(b'\'')).then_some(i + 2 + len)
+        }
+        _ => None,
+    }
+}
+
+/// `src` with comments, strings and char literals turned to spaces (line ends kept), byte for byte.
+fn mask(src: &str) -> String {
+    let b = src.as_bytes();
+    let mut out = b.to_vec();
+    let blank = |out: &mut Vec<u8>, from: usize, to: usize| {
+        for c in &mut out[from..to] {
+            if *c != b'\n' {
+                *c = b' ';
+            }
+        }
+    };
+    let mut i = 0;
+    while i < b.len() {
+        let next = b.get(i + 1).copied();
+        let end = if b[i] == b'/' && next == Some(b'/') {
+            b[i..]
+                .iter()
+                .position(|&c| c == b'\n')
+                .map_or(b.len(), |p| i + p)
+        } else if b[i] == b'/' && next == Some(b'*') {
+            // Block comments nest.
+            let (mut depth, mut k) = (0, i);
+            while k < b.len() {
+                if b[k..].starts_with(b"/*") {
+                    depth += 1;
+                    k += 2;
+                } else if b[k..].starts_with(b"*/") {
+                    depth -= 1;
+                    k += 2;
+                    if depth == 0 {
+                        break;
+                    }
+                } else {
+                    k += 1;
+                }
+            }
+            k
+        } else if let Some(end) = literal_end(b, i) {
+            end
+        } else {
+            i += 1;
+            continue;
+        };
+        blank(&mut out, i, end);
+        i = end;
+    }
+    String::from_utf8(out).expect("only whole literals and comments are blanked")
+}
+
+/// The code of `src` (masked) with every `#[cfg(test)]` item blanked: from the attribute to the item's first `;`
+/// or its matching `}`, outside `()` and `[]`.
+fn without_tests(src: &str) -> String {
+    const GATE: &str = "#[cfg(test)]";
+    let mut code = mask(src).into_bytes();
+    let mut from = 0;
+    while let Some(found) = String::from_utf8_lossy(&code[from..]).find(GATE) {
+        let start = from + found;
+        let (mut depth, mut end) = (0i32, code.len());
+        for (k, &c) in code.iter().enumerate().skip(start + GATE.len()) {
+            match c {
+                b'(' | b'[' | b'{' => depth += 1,
+                b')' | b']' => depth -= 1,
+                b'}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        end = k + 1;
+                        break;
+                    }
+                }
+                b';' if depth == 0 => {
+                    end = k + 1;
+                    break;
+                }
+                _ => {}
+            }
+        }
+        for c in &mut code[start..end] {
+            if *c != b'\n' {
+                *c = b' ';
+            }
+        }
+        from = end;
+    }
+    String::from_utf8(code).expect("only whole items are blanked")
+}
+
+/// How many process-spawn names the non-test code of `src` holds.
+fn spawn_sites(src: &str) -> usize {
+    let code = without_tests(src);
+    NAMES.iter().map(|name| code.matches(name).count()).sum()
+}
+
+fn rust_files(dir: &Path, out: &mut Vec<PathBuf>) {
+    for entry in std::fs::read_dir(dir).unwrap() {
+        let path = entry.unwrap().path();
+        if path.is_dir() {
+            rust_files(&path, out);
+        } else if path.extension().is_some_and(|e| e == "rs") {
+            out.push(path);
+        }
+    }
+}
+
+#[test]
+fn scanner_skips_test_items_comments_and_strings() {
+    let src = r##"
+use std::process::Command;
+// Command::new in a comment
+/* nested /* Command::new */ still a comment */
+fn real<'a>(x: &'a str) -> [u8; 2] {
+    let _ = "Command::new {";
+    let _ = r#"process::Command }"#;
+    let _ = '{';
+    Command::new(x);
+    [0; 2]
+}
+#[cfg(test)]
+use std::process::Command as Std;
+#[cfg(test)]
+mod tests {
+    fn f() { let s = "}"; std::process::Command::new("x"); }
+}
+mod inner {
+    #[cfg(test)]
+    fn helper() { Command::new("y"); }
+    fn kept() { Command::new("z"); }
+}
+"##;
+    // `use std::process::Command`, `Command::new(x)` and `Command::new("z")`.
+    assert_eq!(spawn_sites(src), 3);
+    assert_eq!(
+        mask("a \"b{\" 'c' // d\ne").len(),
+        "a \"b{\" 'c' // d\ne".len()
+    );
+    assert!(!mask("x = \"{\";").contains('{'));
+}
+
+#[test]
+fn process_spawn_only_in_spawn_rs() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mut files = Vec::new();
+    rust_files(&root.join("src"), &mut files);
+    files.sort();
+    let mut found = Vec::new();
+    for file in files {
+        let name = file
+            .strip_prefix(root)
+            .unwrap()
+            .to_string_lossy()
+            .replace('\\', "/");
+        if name == EXCLUDED {
+            continue;
+        }
+        let sites = spawn_sites(&std::fs::read_to_string(&file).unwrap());
+        if sites > 0 {
+            found.push(name);
+        }
+    }
+    // spawn.rs itself must be found, or the scan proves nothing.
+    assert_eq!(found, [ALLOWED]);
+}

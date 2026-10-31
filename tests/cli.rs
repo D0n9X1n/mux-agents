@@ -4,12 +4,29 @@ use std::process::Command;
 
 const NL: &str = if cfg!(windows) { "\r\n" } else { "\n" };
 
+// Never inside the caller's own multiplexer: no endpoint, so no call can reach a real server.
+fn command(args: &[&str]) -> Command {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_mux-agent"));
+    command.args(args);
+    for name in [
+        "MUX_AGENTS_TEST_PANIC",
+        "TMUX",
+        "RMUX",
+        "TMUX_PANE",
+        "SANDBOX_RUNTIME",
+        "MUX_AGENTS_STATE",
+    ] {
+        command.env_remove(name);
+    }
+    command
+}
+
 fn mux_agent(args: &[&str]) -> (i32, String, String) {
-    let out = Command::new(env!("CARGO_BIN_EXE_mux-agent"))
-        .args(args)
-        .env_remove("MUX_AGENTS_TEST_PANIC")
-        .output()
-        .unwrap();
+    output(command(args))
+}
+
+fn output(mut command: Command) -> (i32, String, String) {
+    let out = command.output().unwrap();
     let text = |bytes: Vec<u8>| String::from_utf8(bytes).unwrap();
     (
         out.status.code().unwrap(),
@@ -24,10 +41,10 @@ fn usage(message: &str) -> (i32, String, String) {
     (2, line, String::new())
 }
 
-// Handlers are stubs until they are wired, so a request that parses reaches this refusal.
-fn not_wired(verb: &str) -> (i32, String, String) {
+// Outside a multiplexer pane, a request that parses and passes its own checks reaches this refusal.
+fn endpoint(verb: &str) -> (i32, String, String) {
     let line = format!(
-        r#"{{"ok":false,"verb":"{verb}","code":1,"check":"internal","message":"not wired"}}{NL}"#
+        r#"{{"ok":false,"verb":"{verb}","code":1,"check":"endpoint","message":"not inside an rmux pane"}}{NL}"#
     );
     (1, line, String::new())
 }
@@ -53,19 +70,23 @@ fn verb_and_flags_match_without_case() {
         mux_agent(&["LIST", "-all", "-TEXT"]),
         (
             1,
-            format!("code: 1\ncheck: internal\nmessage: not wired{NL}"),
+            format!("code: 1\ncheck: endpoint\nmessage: not inside an rmux pane{NL}"),
             String::new()
         )
     );
-    assert_eq!(mux_agent(&["List", "-ALL"]), not_wired("list"));
+    assert_eq!(mux_agent(&["List", "-ALL"]), endpoint("list"));
+    // No task: the verb's own usage refusal, so the verb is named.
+    let spawn_usage = format!(
+        r#"{{"ok":false,"verb":"spawn","code":2,"check":"usage","message":"{SPAWN}"}}{NL}"#
+    );
     assert_eq!(
         mux_agent(&["spawn", "-client", "claude", "-NOFORK"]),
-        not_wired("spawn")
+        (2, spawn_usage, String::new())
     );
     // A value flag takes the next token whatever it looks like, so this -Text is the task.
     assert_eq!(
         mux_agent(&["spawn", "-Client", "claude", "-Task", "-Text"]),
-        not_wired("spawn")
+        endpoint("spawn")
     );
 }
 
@@ -96,13 +117,55 @@ fn unknown_dash_token_is_usage() {
 fn positional_bounds() {
     assert_eq!(mux_agent(&["focus"]), usage(FOCUS));
     assert_eq!(mux_agent(&["focus", "a", "b"]), usage(FOCUS));
-    assert_eq!(mux_agent(&["focus", "a"]), not_wired("focus"));
+    assert_eq!(mux_agent(&["focus", "a"]), endpoint("focus"));
     assert_eq!(mux_agent(&["list", "x"]), usage(LIST));
-    assert_eq!(mux_agent(&["read"]), not_wired("read"));
-    assert_eq!(mux_agent(&["read", "a", "-Lines", "5"]), not_wired("read"));
+    assert_eq!(mux_agent(&["read"]), endpoint("read"));
+    assert_eq!(mux_agent(&["read", "a", "-Lines", "5"]), endpoint("read"));
     assert_eq!(mux_agent(&["read", "a", "b"]), usage(READ));
     assert_eq!(
         mux_agent(&["watch", ""]),
         usage("usage: mux-agent watch [-Text]")
     );
+}
+
+#[test]
+fn list_outside_mux_refuses_endpoint_1() {
+    assert_eq!(mux_agent(&["list"]), endpoint("list"));
+    assert_eq!(mux_agent(&["list", "-All"]), endpoint("list"));
+}
+
+// The hidden pane entry reads only a spec.json inside the state root; it is not a verb, so its refusal goes to
+// stderr, not a JSON reply.
+#[test]
+fn launcher_relative_spec_exit_2() {
+    let (code, stdout, stderr) = mux_agent(&["launcher", "spec.json"]);
+    assert_eq!(
+        (code, stdout.as_str(), stderr.trim_end()),
+        (
+            2,
+            "",
+            "mux-agent: the launch spec is outside the state folder"
+        )
+    );
+}
+
+// The state root is resolved only for a call that parsed; a bad one refuses with no verb, as the reference did.
+#[cfg(unix)]
+#[test]
+fn relative_state_root_refuses_state_1() {
+    let mut call = command(&["list"]);
+    call.env("MUX_AGENTS_STATE", "relative/state");
+    assert_eq!(
+        output(call),
+        (
+            1,
+            format!(
+                r#"{{"ok":false,"verb":null,"code":1,"check":"state","message":"MUX_AGENTS_STATE is not an absolute path"}}{NL}"#
+            ),
+            String::new()
+        )
+    );
+    let mut bogus = command(&["bogus"]);
+    bogus.env("MUX_AGENTS_STATE", "relative/state");
+    assert_eq!(output(bogus).0, 2);
 }
