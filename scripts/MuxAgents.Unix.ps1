@@ -126,13 +126,13 @@ function Open-MuxAgentUnixProcess { param([int]$Id, [Parameter(Mandatory)]$Kerne
     if ($null -eq $start) { if ($fd -ge 0) { $null = & $Kernel.Close $fd }; return $null }
     [pscustomobject]@{ Id = $Id; Start = $start; Process = $null; Fd = $fd } }
 # Kill on Unix: SIGKILL only through the pidfd bound at Open, which cannot reach a reused PID; true when it exited within 5 s.
-# Without a pidfd nothing is sent: true only when the exit is shown within 5 s (IsGone: ESRCH, or the pid now has another
-# start). An unreadable start or a probe that cannot tell is not an exit, so the pid is reported.
+# Without a pidfd nothing is sent: true only when IsGone shows the exit (ESRCH) within 5 s. A pid that now has another start,
+# an unreadable start or a probe that cannot tell is not proof, so the pid is reported.
 function Stop-MuxAgentUnixProcess { param([Parameter(Mandatory)]$Opened, [Parameter(Mandatory)]$Kernel)
     if ($Opened.Fd -ge 0) { try { $null = & $Kernel.SendKill $Opened.Fd; return [bool](& $Kernel.WaitExit $Opened.Fd 5000) } finally { $null = & $Kernel.Close $Opened.Fd } }
     for ($round = 0; $round -lt 50; $round++) {
-        $null = & $Kernel.Sleep 100; $now = & $Kernel.ReadStart $Opened.Id
-        if (($null -ne $now -and $now -ne $Opened.Start) -or (& $Kernel.IsGone $Opened.Id)) { return $true } }
+        $null = & $Kernel.Sleep 100
+        if (& $Kernel.IsGone $Opened.Id) { return $true } }
     $false }
 # ClaudeDirectory (C5) on Unix: the agent's kernel cwd, read between two starts equal to the caller's. ~/.claude/sessions/<pid>.json
 # is "no session" only when the read proves it missing (FileNotFoundException or DirectoryNotFoundException); File.Exists is not
