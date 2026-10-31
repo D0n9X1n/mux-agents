@@ -15,6 +15,7 @@ pub mod mux;
 pub mod parse;
 pub mod proc;
 pub mod sandbox;
+pub mod sidebar;
 pub mod spawn;
 pub mod state;
 #[cfg(test)]

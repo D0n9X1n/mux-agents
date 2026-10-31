@@ -66,7 +66,7 @@ fn context_name(context: Context) -> &'static str {
     }
 }
 
-fn utf8(path: &Path) -> Res<&str> {
+pub(crate) fn utf8(path: &Path) -> Res<&str> {
     path.to_str()
         .ok_or_else(|| Refusal::internal("a path is not UTF-8"))
 }
@@ -389,7 +389,7 @@ fn private_folder(ctx: &Ctx, folder: &Path) -> Res<()> {
 }
 
 /// `^(%\d+)\|(@\d+)$` after trailing CR and LF are cut.
-fn pane_and_window(stdout: &str) -> Option<(String, String)> {
+pub(crate) fn pane_and_window(stdout: &str) -> Option<(String, String)> {
     let (pane, window) = stdout.trim_end_matches(['\r', '\n']).split_once('|')?;
     let numbered = |text: &str, mark: char| {
         text.strip_prefix(mark)
