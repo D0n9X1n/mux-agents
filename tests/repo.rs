@@ -357,17 +357,47 @@ fn repo_file(path: &str) -> String {
     std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join(path)).unwrap()
 }
 
-/// The lines of job `name` in a workflow: from `  name:` to the next two-space key, trimmed, blanks dropped.
+/// `line` without its `#` comment: a `#` that starts a word outside quotes, as in YAML and sh. Enough for
+/// workflow lines; `${#x}` and `a#b` are not comments.
+fn strip_comment(line: &str) -> &str {
+    let (mut single, mut double) = (false, false);
+    let mut prev = ' ';
+    for (i, c) in line.char_indices() {
+        match c {
+            '\'' if !double => single = !single,
+            '"' if !single => double = !double,
+            '#' if !single && !double && prev.is_whitespace() => return &line[..i],
+            _ => {}
+        }
+        prev = c;
+    }
+    line
+}
+
+/// The code lines of job `name` in a workflow: from `  name:` to the next two-space key, comments stripped,
+/// trimmed, blanks dropped.
 fn job_lines(workflow: &str, name: &str) -> Vec<String> {
     let head = format!("  {name}:");
     let mut lines = workflow.lines().skip_while(|l| l.trim_end() != head);
     assert!(lines.next().is_some(), "no job {name}");
     lines
         .take_while(|l| l.is_empty() || l.starts_with("   "))
-        .map(str::trim)
+        .map(|l| strip_comment(l).trim())
         .filter(|l| !l.is_empty())
         .map(String::from)
         .collect()
+}
+
+/// Index of the first code line holding `needle`, when it refuses: that line, or the next code line of the same
+/// step, runs `exit 1`. None when no code line holds `needle` or it does not exit.
+fn refusal(lines: &[String], needle: &str) -> Option<usize> {
+    let at = lines.iter().position(|l| l.contains(needle))?;
+    let step_end = lines[at + 1..]
+        .iter()
+        .position(|l| l.starts_with("- "))
+        .map_or(lines.len(), |p| at + 1 + p);
+    let exits = |l: &String| l.contains("exit 1");
+    (exits(&lines[at]) || lines[at + 1..step_end].first().is_some_and(exits)).then_some(at)
 }
 
 /// Index of the first line of `lines` containing `needle`.
@@ -401,7 +431,7 @@ fn release_validate_checks_tag_sha() {
     let release = repo_file(".github/workflows/release.yml");
     let validate = job_lines(&release, "validate");
     let resolve = line_of(&validate, r#"git rev-parse "$TAG^{commit}""#);
-    let refuse = line_of(&validate, r#"!= "$GITHUB_SHA""#);
+    let refuse = refusal(&validate, r#"!= "$GITHUB_SHA""#).expect("validate refuses a moved tag");
     let gate = line_of(&validate, "scripts/release/gate.sh");
     assert!(resolve < refuse && refuse < gate, "{validate:#?}");
     // contents: write appears once, in publish; nothing runs PowerShell.
@@ -419,7 +449,7 @@ fn release_publish_rechecks_remote_tag() {
         &publish,
         r#"git ls-remote origin "refs/tags/$TAG" "refs/tags/$TAG^{}""#,
     );
-    let refuse = line_of(&publish, "no longer points at");
+    let refuse = refusal(&publish, "no longer points at").expect("publish refuses a moved tag");
     let add = line_of(&publish, "git add -f scripts/bin");
     let push = line_of(&publish, "git push");
     let create = line_of(&publish, "gh release create");
@@ -434,4 +464,85 @@ fn release_publish_rechecks_remote_tag() {
         release.matches("persist-credentials: false").count(),
         checkouts
     );
+}
+
+// The guard tests above must fail when a refusal is commented out or no longer exits.
+#[test]
+fn release_refusal_needs_live_exit() {
+    let job = |body: &str| {
+        let workflow =
+            format!("jobs:\n  j:\n    steps:\n      - run: |\n{body}      - run: next\n");
+        job_lines(&workflow, "j")
+    };
+    let needle = r#"!= "$GITHUB_SHA""#;
+    let live = r#"          if [ "$sha" != "$GITHUB_SHA" ]; then echo refused; exit 1; fi"#;
+    assert!(refusal(&job(&format!("{live}\n")), needle).is_some());
+    assert!(
+        refusal(
+            &job(&format!("{}\n", live.replacen("if", "# if", 1))),
+            needle
+        )
+        .is_none()
+    );
+    assert!(
+        refusal(
+            &job(&format!("{}\n", live.replace("exit 1", "true"))),
+            needle
+        )
+        .is_none()
+    );
+    let split = "          if [ \"$sha\" != \"$GITHUB_SHA\" ]; then echo refused\n            exit 1\n          fi\n";
+    assert!(refusal(&job(split), needle).is_some());
+    let commented = "          if [ \"$sha\" != \"$GITHUB_SHA\" ]; then echo refused\n            # exit 1\n          fi\n";
+    assert!(refusal(&job(commented), needle).is_none());
+    // `${#x}`, a quoted `#` and a word holding `#` are code.
+    assert_eq!(
+        strip_comment(r#"n=${#x} "a # b" c#d # note"#),
+        r#"n=${#x} "a # b" c#d "#
+    );
+}
+
+#[test]
+fn release_publish_keeps_dist_monotonic() {
+    let release = repo_file(".github/workflows/release.yml");
+    let publish = job_lines(&release, "publish");
+    // One publish at a time, and a queued one is never cancelled.
+    assert!(
+        publish.contains(&"group: release-dist".to_string()),
+        "{publish:#?}"
+    );
+    assert!(
+        publish.contains(&"cancel-in-progress: false".to_string()),
+        "{publish:#?}"
+    );
+    // The dist decision refuses before anything is added or pushed; the push leases the dist it read.
+    let decide = refusal(&publish, "scripts/release/gate.sh --dist")
+        .expect("publish refuses an older release");
+    let add = line_of(&publish, "git add -f scripts/bin");
+    let push = line_of(&publish, "git push");
+    assert!(decide < add && add < push, "{publish:#?}");
+    assert!(
+        publish[push].contains("--force-with-lease=refs/heads/dist:"),
+        "{}",
+        publish[push]
+    );
+    assert!(!release.contains(" --force ") && !release.contains("push --force\n"));
+}
+
+// A token on a command line is visible to every process on the runner; git reads it from the environment instead.
+#[test]
+fn release_token_never_in_argv() {
+    let release = repo_file(".github/workflows/release.yml");
+    for line in release.lines().map(strip_comment) {
+        for bad in ["x-access-token:$", "${{ secrets", "TOKEN@", "TOKEN}@"] {
+            assert!(!line.contains(bad), "{bad:?} in {line}");
+        }
+        for (at, _) in line.match_indices("://") {
+            let url: String = line[at..]
+                .chars()
+                .take_while(|c| !c.is_whitespace() && !matches!(c, '"' | '\''))
+                .collect();
+            assert!(!url.contains('@'), "credentials in URL {url}");
+        }
+    }
 }

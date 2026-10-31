@@ -39,8 +39,13 @@ src=$?
 if [ "$prc" = 0 ] && [ "$src" = 0 ] && [ "$(wc -l <"$sums" 2>/dev/null | tr -d ' ')" = 1 ] \
   && grep -q " \*\{0,1\}$os-$arch/mux-agent$exe\$" "$sums"; then ok sha256sums_match; else bad sha256sums_match "rc=$src $check"; fi
 
-# Outside a multiplexer the shim reaches the packaged binary, which refuses with check endpoint.
-out=$(unset TMUX RMUX TMUX_PANE MUX_AGENTS_BIN; "$root/scripts/mux-agent" list 2>&1)
+# Outside a multiplexer the shim reaches the packaged binary, which refuses with check endpoint. Windows runs the
+# cmd shim, as a Windows caller does: from its own directory, so the root's space never meets cmd's quote rules.
+if [ "$os" = windows ]; then
+  out=$(unset TMUX RMUX TMUX_PANE MUX_AGENTS_BIN; cd "$root/scripts" && cmd.exe //d //c mux-agent.cmd list 2>&1)
+else
+  out=$(unset TMUX RMUX TMUX_PANE MUX_AGENTS_BIN; "$root/scripts/mux-agent" list 2>&1)
+fi
 rc=$?
 case $out in
   '{"ok":false,'*'"check":"endpoint"'*) shape=yes ;;
@@ -127,6 +132,10 @@ printf '[%s,%s]' "$green" "$red" >"$g/green-red.json"
 printf '[%s,%s]' "$(run_json success $sha40 pull_request)" "$(run_json success $other40 push)" >"$g/not-push.json"
 printf 'not json' >"$g/broken.json"
 printf '{"workflow_runs":[%s]}' "$green" >"$g/object.json"
+# More than one JSON document: each must refuse, never sum to a pass.
+printf '[]\n[]\n' >"$g/two-empty.json"
+printf '[%s]\n[%s]\n' "$green" "$green" >"$g/two-green.json"
+printf '[%s] junk' "$green" >"$g/green-junk.json"
 
 # gate_line <on-main> <runs file> <version>: "<exit> <stdout>".
 gate_line() { line=$(sh "$gate" v0.1.0 $sha40 "$1" "$g/$2" "$3" 2>/dev/null); echo "$? $line"; }
@@ -146,6 +155,10 @@ got=$(
   gate_line true broken.json 0.1.0
   gate_line true object.json 0.1.0
   gate_line maybe green.json 0.1.0
+  gate_line true two-empty.json 0.1.0
+  gate_line true two-green.json 0.1.0
+  gate_line true green-junk.json 0.1.0
+  gate_line true missing.json 0.1.0
 )
 want="$okline
 1 refused: v0.1.0 is not on main
@@ -160,9 +173,54 @@ $okline
 $okline
 1 refused: cannot read CI runs from $g/broken.json
 1 refused: cannot read CI runs from $g/object.json
-2 "
+2 
+1 refused: cannot read CI runs from $g/two-empty.json
+1 refused: cannot read CI runs from $g/two-green.json
+1 refused: cannot read CI runs from $g/green-junk.json
+1 refused: cannot read CI runs from $g/missing.json"
 if [ "$got" = "$want" ]; then ok gate_cases; else bad gate_cases "got:
 $got"; fi
+
+# --- dist only moves forward -----------------------------------------------------------------------------------
+# dist_line <new version> <new sha> <dist version> <dist sha>: "<exit> <stdout>" from gate.sh's dist_decision.
+dist_line() {
+  # shellcheck source=scripts/release/gate.sh
+  line=$(MUX_GATE_LIB=1 . "$gate" && dist_decision "$@" 2>/dev/null)
+  echo "$? $line"
+}
+got=$(
+  dist_line 0.3.0 $sha40 0.2.0 $other40
+  dist_line 0.10.0 $sha40 0.9.9 $other40
+  dist_line 1.0.0 $sha40 0.99.99 $other40
+  dist_line 0.2.1 $sha40 0.2.0 $other40
+  dist_line 0.1.0 $sha40 '' ''
+  dist_line 0.2.0 $sha40 0.2.0 $sha40
+  dist_line 0.2.0 $sha40 0.2.0 $other40
+  dist_line 0.2.0 $sha40 0.3.0 $other40
+  dist_line 0.9.9 $sha40 0.10.0 $other40
+  dist_line 0.3 $sha40 0.2.0 $other40
+  dist_line 0.03.0 $sha40 0.2.0 $other40
+  dist_line 0.3.0 $sha40 1.2.3.4 $other40
+  dist_line 0.3.0 $sha40 0.2.0 ''
+)
+want="0 push
+0 push
+0 push
+0 push
+0 push
+0 same
+1 refused: dist already holds 0.2.0 from $other40
+1 refused: dist holds 0.3.0, newer than 0.2.0
+1 refused: dist holds 0.10.0, newer than 0.9.9
+1 refused: 0.3 is not a release version
+1 refused: 0.03.0 is not a release version
+1 refused: dist version 1.2.3.4 is not a release version
+1 refused: dist holds 0.2.0 but no source commit"
+cli=$(sh "$gate" --dist 0.2.0 $sha40 0.3.0 $other40 2>/dev/null; echo " rc=$?")
+if [ "$got" = "$want" ] && [ "$cli" = "refused: dist holds 0.3.0, newer than 0.2.0
+ rc=1" ]; then ok dist_only_moves_forward; else bad dist_only_moves_forward "got:
+$got
+cli: $cli"; fi
 
 # --- assemble over a fake six-directory layout ------------------------------------------------------------------
 a="$tmp/assemble"
