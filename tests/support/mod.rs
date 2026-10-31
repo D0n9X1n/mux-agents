@@ -7,13 +7,16 @@
 //!   MUX_IT_ENTRY=<the mux-agent binary>, plus USER, LOGNAME and LANG when set. So no TMUX, RMUX, MUX_AGENTS_STATE,
 //!   XDG_STATE_HOME or CLAUDE_*/COPILOT_* of the caller's own session reaches a pane. `<dir>/bin` holds `claude` and
 //!   `copilot`, copies of the fake-client binary. A mux that is not installed is skipped with a message (None).
-//! - Every later call is `<mux> -S <socket> -N …`. Dropping the server (or `kill`) writes `<dir>/quit`, kills the
-//!   server, waits for its pid to go (SIGKILL after 5 s) and removes the socket.
+//! - Every later call is `<mux> -S <socket> -N …`. Dropping the server (or `kill`) snapshots every descendant of the
+//!   server, writes `<dir>/quit`, kills the server, waits for its pid to go (SIGKILL after 5 s), waits for each
+//!   descendant to go (SIGKILL, same start only, after 5 s), removes the socket, then removes the lock files whose
+//!   keys name this server (`<passwd home>/.local/state/mux-agents/locks/<hex>.lock`; mux-agent never removes one).
+//!   Only keys built from this server's own key are touched, so no other lock is.
 //! - Files the harness waits on are written whole: shell lines write `<name>.tmp` and `mv` it into place, and the fake
 //!   client renames its files into place.
 #![allow(dead_code)]
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
 use std::os::unix::fs::DirBuilderExt;
 use std::path::{Path, PathBuf};
@@ -142,10 +145,21 @@ pub struct Server {
     pane_pid: u32,
     // Counters for the shell lines' output files and the fake clients' command replies.
     runs: u32,
+    jobs: u32,
+    lines: u32,
     clients_seen: usize,
     replies: HashMap<u64, u32>,
+    // The server key mux-agent derives: sha256("<socket>|<pid>|<start>")[..16]; empty when the start is unreadable.
+    key: String,
     killed: bool,
 }
+
+/// A background mux-agent run in the root pane's shell (`Server::bg`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Job(u32);
+
+/// One background run for `Server::bg`: mux-agent's arguments, variables to set and variables to unset.
+pub type Run<'a> = (&'a [&'a str], &'a [(&'a str, &'a str)], &'a [&'a str]);
 
 impl Server {
     /// A server whose one pane runs `sh` in `<dir>/work`, or None (with a message) when `mux` is not installed.
@@ -205,8 +219,11 @@ impl Server {
             pane: String::new(),
             pane_pid: 0,
             runs: 0,
+            jobs: 0,
+            lines: 0,
             clients_seen: 0,
             replies: HashMap::new(),
+            key: String::new(),
             killed: false,
         };
         assert!(out.status.success(), "{mux:?} new-session: {out:?}");
@@ -216,6 +233,11 @@ impl Server {
         server.pane = fields[0].to_string();
         server.pane_pid = fields[1].parse().unwrap();
         server.pid = fields[2].parse().unwrap();
+        if let Some(opened) = mux_agent::proc::host().open(server.pid) {
+            let start = opened.start;
+            let id = format!("{}|{}|{start}", server.socket.display(), server.pid);
+            server.key = mux_agent::util::sha256_hex(id)[..16].to_string();
+        }
         Some(server)
     }
 
@@ -243,6 +265,16 @@ impl Server {
 
     pub fn pane_pid(&self) -> u32 {
         self.pane_pid
+    }
+
+    /// The private temp dir (`MUX_IT_DIR`).
+    pub fn dir(&self) -> &Path {
+        &self.dir
+    }
+
+    /// The server key mux-agent names this server's state folder and lock keys by.
+    pub fn key(&self) -> &str {
+        &self.key
     }
 
     /// `<mux> -S <socket> -N <args>`; panics unless it succeeds, and answers its stdout.
@@ -288,8 +320,19 @@ impl Server {
         })
     }
 
-    fn wait<T>(&self, what: &str, mut ready: impl FnMut() -> Option<T>) -> T {
-        let end = Instant::now() + WAIT;
+    /// Polls `ready` for up to 30 s; on timeout panics naming `what`, with the root pane's screen.
+    pub fn wait<T>(&self, what: &str, ready: impl FnMut() -> Option<T>) -> T {
+        self.wait_up_to(WAIT, what, ready)
+    }
+
+    /// `wait` with its own limit.
+    pub fn wait_up_to<T>(
+        &self,
+        limit: Duration,
+        what: &str,
+        mut ready: impl FnMut() -> Option<T>,
+    ) -> T {
+        let end = Instant::now() + limit;
         loop {
             if let Some(found) = ready() {
                 return found;
@@ -306,6 +349,17 @@ impl Server {
         }
     }
 
+    /// Has the root pane's shell run `line` by typing `. '<dir>/line.<n>.sh'`. A long line is never typed: keys that
+    /// arrive before the shell reads its first prompt wait in the tty's cooked-mode buffer, which keeps only 1024
+    /// bytes on macOS (MAX_CANON) and drops the rest, Enter included. Sourced, the line runs in the shell itself, so
+    /// `&`, `$!` and job control are as if typed.
+    fn type_line(&mut self, line: &str) {
+        self.lines += 1;
+        let path = self.dir.join(format!("line.{}.sh", self.lines));
+        write_atomic(&path, format!("{line}\n"));
+        self.send_keys(&format!(". {}", quote(path.to_str().unwrap())));
+    }
+
     /// Runs `line` in the root pane's shell with stdout to a file renamed into place once the line is done.
     fn shell(&mut self, line: &str) -> (String, String) {
         self.runs += 1;
@@ -316,7 +370,7 @@ impl Server {
             quote(err.to_str().unwrap()),
             quote(tmp.to_str().unwrap()),
         );
-        self.send_keys(&format!(
+        self.type_line(&format!(
             "{line} > {tmp_q} 2> {err_q}; echo $? >> {err_q}; mv {tmp_q} {out_q}"
         ));
         let name = out.file_name().unwrap().to_str().unwrap().to_string();
@@ -329,30 +383,134 @@ impl Server {
         self.shell("env").0
     }
 
-    /// Runs the mux-agent binary in the root pane as `env <vars> <mux-agent> <args>` and answers its exit code and
-    /// JSON reply. `vars` reach only this call; the pane's own env is the server's (see `start`).
-    pub fn run(&mut self, args: &[&str], vars: &[(&str, &str)]) -> (i32, Value) {
+    /// `env [-u <name>]... <vars> <bin> <args>`, each token quoted for sh.
+    fn line(bin: &str, args: &[&str], vars: &[(&str, &str)], unset: &[&str]) -> String {
         let mut line = String::from("env");
+        for name in unset {
+            line.push_str(" -u ");
+            line.push_str(&quote(name));
+        }
         for (name, value) in vars {
             line.push(' ');
             line.push_str(&quote(&format!("{name}={value}")));
         }
         line.push(' ');
-        line.push_str(&quote(env!("CARGO_BIN_EXE_mux-agent")));
+        line.push_str(&quote(bin));
         for arg in args {
             line.push(' ');
             line.push_str(&quote(arg));
         }
-        let (stdout, err) = self.shell(&line);
-        let code = err.lines().last().and_then(|c| c.trim().parse().ok());
-        let reply = serde_json::from_str(&stdout);
-        match (code, reply) {
-            (Some(code), Ok(reply)) => (code, reply),
-            _ => panic!(
-                "{:?} {args:?}: stdout {stdout:?}, stderr and code {err:?}",
+        line
+    }
+
+    /// Runs the mux-agent binary in the root pane as `env <vars> <mux-agent> <args>` and answers its exit code and
+    /// JSON reply. `vars` reach only this call; the pane's own env is the server's (see `start`).
+    pub fn run(&mut self, args: &[&str], vars: &[(&str, &str)]) -> (i32, Value) {
+        let (code, stdout, stderr) = self.run_raw(env!("CARGO_BIN_EXE_mux-agent"), args, vars, &[]);
+        match serde_json::from_str(&stdout) {
+            Ok(reply) => (code, reply),
+            Err(_) => panic!(
+                "{:?} {args:?}: stdout {stdout:?}, stderr {stderr:?}, code {code}",
                 self.mux
             ),
         }
+    }
+
+    /// Runs `bin` in the root pane as `env -u <unset>... <vars> <bin> <args>`; answers its exit code, stdout and
+    /// stderr exactly.
+    pub fn run_raw(
+        &mut self,
+        bin: &str,
+        args: &[&str],
+        vars: &[(&str, &str)],
+        unset: &[&str],
+    ) -> (i32, String, String) {
+        let (stdout, err) = self.shell(&Self::line(bin, args, vars, unset));
+        // The shell appended `$?` and a LF after whatever the program wrote to stderr.
+        let body = err.strip_suffix('\n').unwrap_or(&err);
+        let (stderr, code) = match body.rfind('\n') {
+            Some(at) => (&body[..=at], &body[at + 1..]),
+            None => ("", body),
+        };
+        let code = code
+            .trim()
+            .parse()
+            .unwrap_or_else(|_| panic!("{:?} {args:?}: no exit code in {err:?}", self.mux));
+        (code, stdout, stderr.to_string())
+    }
+
+    /// Starts each `(args, vars, unset)` mux-agent run in the background of the root pane's shell, all from one
+    /// line so they start together; returns once every job's pid is recorded. Each job's subshell is its own
+    /// process group (the shell has job control), so the caller chain is mux-agent > sh > sh > pane.
+    pub fn bg(&mut self, runs: &[Run]) -> Vec<Job> {
+        let mut line = String::new();
+        let mut jobs = Vec::new();
+        for (args, vars, unset) in runs {
+            self.jobs += 1;
+            let job = Job(self.jobs);
+            let file = |ext: &str| quote(self.job_file(job, ext).to_str().unwrap());
+            let command = Self::line(env!("CARGO_BIN_EXE_mux-agent"), args, vars, unset);
+            line.push_str(&format!(
+                "( {command} > {tmp} 2> {err}; echo $? >> {err}; mv {tmp} {out} ) & echo $! > {ptmp}; mv {ptmp} {pid}; ",
+                tmp = file("tmp"),
+                err = file("err"),
+                out = file("out"),
+                ptmp = file("ptmp"),
+                pid = file("pid"),
+            ));
+            jobs.push(job);
+        }
+        self.type_line(line.trim_end());
+        for job in &jobs {
+            self.job_pid(*job);
+        }
+        jobs
+    }
+
+    fn job_file(&self, job: Job, ext: &str) -> PathBuf {
+        self.dir.join(format!("bg.{}.{ext}", job.0))
+    }
+
+    /// The background job's subshell pid.
+    pub fn job_pid(&self, job: Job) -> u32 {
+        let name = format!("bg.{}.pid", job.0);
+        self.wait_file(&name).trim().parse().unwrap()
+    }
+
+    /// Whether the job has finished (its stdout is in place).
+    pub fn job_done(&self, job: Job) -> bool {
+        self.job_file(job, "out").exists()
+    }
+
+    /// Waits up to `limit` for the job; answers its exit code and JSON reply.
+    pub fn job_wait(&self, job: Job, limit: Duration) -> (i32, Value) {
+        let out = self.job_file(job, "out");
+        let stdout = self.wait_up_to(limit, &format!("background job {}", job.0), || {
+            std::fs::read_to_string(&out).ok()
+        });
+        let err = std::fs::read_to_string(self.job_file(job, "err")).unwrap();
+        let code = err.lines().last().and_then(|c| c.trim().parse().ok());
+        match (code, serde_json::from_str(&stdout)) {
+            (Some(code), Ok(reply)) => (code, reply),
+            _ => panic!(
+                "{:?} job {}: stdout {stdout:?}, stderr and code {err:?}",
+                self.mux, job.0
+            ),
+        }
+    }
+
+    /// The fake client started with `--session-id <sid>`: its `client.<pid>.json` record.
+    pub fn client_by_session(&self, sid: &str) -> Value {
+        let log = self.dir.join("clients.log");
+        self.wait(&format!("client of session {sid}"), || {
+            let text = std::fs::read_to_string(&log).ok()?;
+            text.lines().find_map(|pid| {
+                let path = self.dir.join(format!("client.{}.json", pid.trim()));
+                let record: Value =
+                    serde_json::from_str(&std::fs::read_to_string(path).ok()?).ok()?;
+                (record["sessionId"] == sid).then_some(record)
+            })
+        })
     }
 
     /// The next fake client to start: its `client.<pid>.json` record.
@@ -388,12 +546,19 @@ impl Server {
         write_atomic(&self.dir.join("quit"), "");
     }
 
-    /// Ends the fake clients and the server, and removes the socket. Idempotent.
+    /// Ends the fake clients, every process the server started and the server, removes the socket and this server's
+    /// lock files. Idempotent.
     pub fn kill(&mut self) {
         if self.killed {
             return;
         }
         self.killed = true;
+        let sessions = self.sessions();
+        let descendants = if self.pid != 0 {
+            descendants(self.pid)
+        } else {
+            Vec::new()
+        };
         let _ = std::fs::write(self.dir.join("quit"), "");
         let _ = self.try_call(&["kill-server"]);
         if self.pid != 0 {
@@ -406,7 +571,170 @@ impl Server {
                 unsafe { libc::kill(self.pid as libc::pid_t, libc::SIGKILL) };
             }
         }
+        reap(&descendants);
         let _ = std::fs::remove_file(&self.socket);
+        // Only once nothing of this server can hold or take a lock.
+        let left = self.remove_locks(&sessions);
+        if !left.is_empty() && !std::thread::panicking() {
+            panic!("{:?}: lock files left: {left:?}", self.mux);
+        }
+    }
+
+    /// The server's session ids (`$0`, …), plus `$0`-`$3` in case it no longer answers.
+    fn sessions(&self) -> Vec<String> {
+        let mut ids: Vec<String> = (0..4).map(|n| format!("${n}")).collect();
+        let out = self.try_call(&["list-sessions", "-F", "#{session_id}"]);
+        for id in String::from_utf8_lossy(&out.stdout).lines() {
+            if !ids.iter().any(|known| known == id) {
+                ids.push(id.to_string());
+            }
+        }
+        ids
+    }
+
+    /// Every lock key mux-agent may have made for this server: spawn and sidebar per session, notice and agent per
+    /// agent id, mail per agent id and per `pane-<n>`. The server keys are this server's own and any state folder
+    /// key found under the private dir (a folder holding server.json). Removes each lock file that exists and
+    /// answers the paths that still exist afterwards.
+    fn remove_locks(&self, sessions: &[String]) -> Vec<PathBuf> {
+        let Some(root) = lock_root() else {
+            return Vec::new();
+        };
+        let (mut keys, mut ids) = (HashSet::new(), HashSet::new());
+        if !self.key.is_empty() {
+            keys.insert(self.key.clone());
+        }
+        scan(&self.dir, 0, &mut keys, &mut ids);
+        let mut paths = Vec::new();
+        for key in &keys {
+            for session in sessions {
+                for kind in ["spawn", "sidebar"] {
+                    paths.push(lock_file(&root, &format!("{kind}|{key}|{session}")));
+                }
+            }
+            for id in &ids {
+                for kind in ["notice", "agent", "mail"] {
+                    paths.push(lock_file(&root, &format!("{kind}|{key}|{id}")));
+                }
+            }
+            for pane in 0..256 {
+                paths.push(lock_file(&root, &format!("mail|{key}|pane-{pane}")));
+            }
+        }
+        let mut removed = 0;
+        for path in &paths {
+            if std::fs::remove_file(path).is_ok() {
+                removed += 1;
+            }
+        }
+        eprintln!(
+            "{:?}: removed {removed} lock file(s) of server key(s) {keys:?}",
+            self.mux
+        );
+        paths.into_iter().filter(|p| p.exists()).collect()
+    }
+}
+
+/// `<root>/<32 hex of sha256(key)>.lock`, as mux-agent names it.
+pub fn lock_file(root: &Path, key: &str) -> PathBuf {
+    mux_agent::state::lock::lock_path(root, key)
+}
+
+/// `<passwd home, resolved>/.local/state/mux-agents/locks`: the per-user lock root mux-agent uses whatever HOME is.
+pub fn lock_root() -> Option<PathBuf> {
+    use std::ffi::CStr;
+    use std::os::unix::ffi::OsStrExt;
+    let mut buf = vec![0 as libc::c_char; 16 * 1024];
+    // SAFETY: an all-zero passwd is a valid out value; getpwuid_r fills it from `buf`.
+    let mut pwd: libc::passwd = unsafe { std::mem::zeroed() };
+    let mut found = std::ptr::null_mut();
+    // SAFETY: `pwd`, `buf` (with its length) and `found` are valid for the call.
+    let rc = unsafe {
+        libc::getpwuid_r(
+            libc::geteuid(),
+            &mut pwd,
+            buf.as_mut_ptr(),
+            buf.len(),
+            &mut found,
+        )
+    };
+    if rc != 0 || found.is_null() || pwd.pw_dir.is_null() {
+        return None;
+    }
+    // SAFETY: pw_dir points at a NUL-terminated string inside `buf`, still live.
+    let home = unsafe { CStr::from_ptr(pwd.pw_dir) };
+    let home = std::fs::canonicalize(std::ffi::OsStr::from_bytes(home.to_bytes())).ok()?;
+    Some(home.join(".local/state/mux-agents/locks"))
+}
+
+/// State folder keys (the name of a folder holding server.json) and agent ids (folders in an `agents` folder) under
+/// `dir`, links never followed.
+fn scan(dir: &Path, depth: u32, keys: &mut HashSet<String>, ids: &mut HashSet<String>) {
+    if depth > 8 {
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let Ok(kind) = entry.file_type() else {
+            continue;
+        };
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if kind.is_file() && name == "server.json" {
+            if let Some(key) = dir.file_name() {
+                keys.insert(key.to_string_lossy().into_owned());
+            }
+        } else if kind.is_dir() {
+            if dir.file_name().is_some_and(|n| n == "agents") {
+                ids.insert(name);
+            }
+            scan(&entry.path(), depth + 1, keys, ids);
+        }
+    }
+}
+
+/// Every descendant of `pid` with its start, from one process table.
+fn descendants(pid: u32) -> Vec<(u32, Option<i64>)> {
+    let Ok(table) = mux_agent::proc::host().table() else {
+        return Vec::new();
+    };
+    let mut found = Vec::new();
+    let mut queue = vec![pid];
+    let mut seen = HashSet::from([pid]);
+    while let Some(parent) = queue.pop() {
+        for row in table.iter().filter(|r| r.ppid == parent) {
+            if seen.insert(row.pid) {
+                found.push((row.pid, row.start));
+                queue.push(row.pid);
+            }
+        }
+    }
+    found
+}
+
+/// The start of `pid` now, if it is open-able.
+pub fn start_of(pid: u32) -> Option<i64> {
+    mux_agent::proc::host().open(pid).map(|o| o.start)
+}
+
+/// Waits up to 5 s for each process to go, then SIGKILLs any still there with its recorded start (never a reused
+/// pid), and waits again.
+fn reap(processes: &[(u32, Option<i64>)]) {
+    let still = |&&(pid, start): &&(u32, Option<i64>)| {
+        alive(pid) && start.is_some() && start_of(pid) == start
+    };
+    let end = Instant::now() + Duration::from_secs(5);
+    while processes.iter().any(|p| still(&p)) && Instant::now() < end {
+        std::thread::sleep(POLL);
+    }
+    for (pid, _) in processes.iter().filter(still) {
+        // SAFETY: a descendant of this test's private server, its start unchanged since the snapshot.
+        unsafe { libc::kill(*pid as libc::pid_t, libc::SIGKILL) };
+    }
+    let end = Instant::now() + Duration::from_secs(5);
+    while processes.iter().any(|p| still(&p)) && Instant::now() < end {
+        std::thread::sleep(POLL);
     }
 }
 
