@@ -61,3 +61,33 @@ Describe 'MuxAgents lock probe' {
         }
     }
 }
+Describe 'MuxAgents lock order' {
+    It 'the entry and the launcher build providers before the first command that can take a lock, so that lock uses LockName' {
+        # Commands that reach Use-MuxAgentLock, from the function bodies of the script libraries; Invoke-MuxAgentCommand
+        # reaches every handler given to Register-MuxAgentVerb. An entry gate that takes no lock may run first (B4).
+        $calls = @{}; $handlers = [Collections.Generic.List[string]]::new()
+        foreach ($library in 'MuxAgents.ps1', 'MuxAgents.Unix.ps1') {
+            $tree = [Management.Automation.Language.Parser]::ParseFile((Join-Path (Join-Path $repoRoot 'scripts') $library), [ref]$null, [ref]$null)
+            foreach ($definition in $tree.FindAll({ param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] }, $true)) {
+                $calls[$definition.Name] = @($definition.Body.FindAll({ param($node) $node -is [Management.Automation.Language.CommandAst] }, $true) | ForEach-Object { "$($_.GetCommandName())" })
+            }
+            foreach ($register in $tree.FindAll({ param($node) $node -is [Management.Automation.Language.CommandAst] -and "$($node.GetCommandName())" -ceq 'Register-MuxAgentVerb' }, $true)) {
+                $elements = $register.CommandElements
+                for ($index = 1; $index -lt $elements.Count - 1; $index++) { if ("$($elements[$index])" -ceq '-Handler') { $handlers.Add($elements[$index + 1].SafeGetValue()) } }
+            }
+        }
+        $calls['Invoke-MuxAgentCommand'] = @($calls['Invoke-MuxAgentCommand']) + $handlers
+        $locking = [Collections.Generic.HashSet[string]]::new([string[]]@('Use-MuxAgentLock'))
+        do { $grew = $false; foreach ($name in $calls.Keys) { if (-not $locking.Contains($name) -and @($calls[$name] | Where-Object { $locking.Contains($_) }).Count) { $grew = $locking.Add($name) -or $grew } } } while ($grew)
+        $answers = foreach ($name in 'mux-agent.ps1', 'mux-agent-launcher.ps1') {
+            $ast = [Management.Automation.Language.Parser]::ParseFile((Join-Path (Join-Path $repoRoot 'scripts') $name), [ref]$null, [ref]$null)
+            # Ordered by where each call ends: an inner call used as an argument ends, and runs, before its outer call.
+            $commands = @($ast.FindAll({ param($node) $node -is [Management.Automation.Language.CommandAst] }, $true) | Sort-Object { $_.Extent.EndOffset })
+            $providers = $commands | Where-Object { "$($_.GetCommandName())" -ceq 'New-MuxAgentProviders' } | Select-Object -First 1
+            $lock = $commands | Where-Object { $locking.Contains("$($_.GetCommandName())") } | Select-Object -First 1
+            $order = if (-not $providers -or -not $lock) { 'missing' } elseif ($providers.Extent.EndOffset -lt $lock.Extent.EndOffset) { 'before' } else { 'after' }
+            "$name New-MuxAgentProviders $order $($lock.GetCommandName())"
+        }
+        "$($handlers.Count) $($locking.Contains('Invoke-MuxAgentCommand')) $($locking.Contains('New-MuxAgentProviders'))|$($answers -join '|')" | Should BeExactly '7 True False|mux-agent.ps1 New-MuxAgentProviders before Invoke-MuxAgentCommand|mux-agent-launcher.ps1 New-MuxAgentProviders before Add-MuxAgentNotice'
+    }
+}
