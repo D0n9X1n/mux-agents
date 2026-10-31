@@ -1135,17 +1135,51 @@ function Find-MuxAgentPane {
     $pane
 }
 
+function Get-MuxAgentUnreadCounts {
+    # Unread messages in Key's mailbox per '<from>|<pane>', read under the mailbox lock; never moves the offset or creates a folder.
+    param([Parameter(Mandatory)]$P, [Parameter(Mandatory)]$Caller, [Parameter(Mandatory)][string]$Key)
+    $mail = [IO.Path]::Combine($P.StateRoot, $Caller.ServerKey, 'mail')
+    $text = Use-MuxAgentLock -LockKey "mail|$($Caller.ServerKey)|$Key" -LockAction { (Get-MuxAgentUnreadText -Box (Join-Path $mail "$Key.jsonl") -Cursor (Join-Path $mail "$Key.offset")).Text }
+    $counts = @{}
+    foreach ($message in @(ConvertFrom-MuxAgentMailText ([string]$text))) { $from = "$($message.from)|$($message.pane)"; $counts[$from] = 1 + [int]$counts[$from] }
+    $counts
+}
+
+function New-MuxAgentBoardRow {
+    # One list row. status.json and last-sent.json are read under the agent lock that status and send write with; an
+    # unreadable one is skipped. Doing never comes from the screen.
+    param([Parameter(Mandatory)]$P, [Parameter(Mandatory)]$Caller, [Parameter(Mandatory)]$Record, [string]$Pane, [string]$Window, [string]$State, [hashtable]$Unread)
+    $folder = [IO.Path]::Combine($P.StateRoot, $Caller.ServerKey, 'agents', $Record.id)
+    $files = @{}
+    Use-MuxAgentLock -LockKey "agent|$($Caller.ServerKey)|$($Record.id)" -LockAction {
+        foreach ($name in 'status', 'last-sent') { $files[$name] = try { Read-MuxAgentJson -Path (Join-Path $folder "$name.json") } catch { $null } }
+    }
+    $doing = Select-MuxAgentDoing -Status $files['status'].text -Message $files['last-sent'].line -Task $Record.taskLine
+    [ordered]@{ name = $Record.name; client = $Record.client; pane = $Pane; window = $Window; context = $Record.context; parent = $Record.parentPane; sessionId = $Record.sessionId
+        directory = $Record.directory; createdAt = $Record.createdAt; state = $State; doing = $doing.doing; doingFrom = $doing.doingFrom
+        age = (Get-MuxAgentAge -CreatedAt $Record.createdAt -Now (& $P.Now)); unread = [int]$Unread["$($Record.name)|$Pane"] }
+}
+
+function Get-MuxAgentBoard {
+    # The side-bar feed of Caller's session: the running count and live agents in pane order. Unread is ReaderKey's.
+    # Locks one at a time: notice locks (Update-MuxAgentNotices), the reader's mail lock, then each row's agent lock.
+    param([Parameter(Mandatory)]$P, [Parameter(Mandatory)]$Caller, [Parameter(Mandatory)][string]$ReaderKey, [switch]$All)
+    Update-MuxAgentNotices -P $P -Caller $Caller
+    $unread = Get-MuxAgentUnreadCounts -P $P -Caller $Caller -Key $ReaderKey
+    $panes = @(Get-MuxAgentPanes -P $P -Caller $Caller)
+    $live = @(foreach ($pane in $panes) {
+            $record = Get-MuxAgentRecord -P $P -Caller $Caller -Id $pane.Id
+            if (-not $record -or $record.session -cne $Caller.Session) { continue }
+            New-MuxAgentBoardRow -P $P -Caller $Caller -Record $record -Pane $pane.Pane -Window $pane.Window -State 'running' -Unread $unread
+        })
+    [ordered]@{ running = $live.Count; agents = $live }
+}
+
 function Invoke-MuxAgentList {
+    # The board as the caller's pane sees it: unread from its own mailbox (an agent's id, else pane-<n>).
     param([Parameter(Mandatory)]$P, [Parameter(Mandatory)]$Request)
     $caller = Resolve-MuxAgentCaller -P $P
-    Update-MuxAgentNotices -P $P -Caller $caller
-    $agents = foreach ($pane in @(Get-MuxAgentPanes -P $P -Caller $caller)) {
-        $record = Get-MuxAgentRecord -P $P -Caller $caller -Id $pane.Id
-        if (-not $record -or $record.session -cne $caller.Session) { continue }
-        [ordered]@{ name = $record.name; client = $record.client; pane = $pane.Pane; window = $pane.Window; context = $record.context
-            parent = $record.parentPane; sessionId = $record.sessionId; directory = $record.directory; createdAt = $record.createdAt }
-    }
-    [ordered]@{ agents = @($agents) }
+    Get-MuxAgentBoard -P $P -Caller $caller -ReaderKey (Get-MuxAgentMailboxKey -Pane $caller.Pane -Tag $caller.AgentTag) -All:([bool]$Request.Options['All'])
 }
 
 function Invoke-MuxAgentFocus {

@@ -182,3 +182,89 @@ Describe 'MuxAgents board writers' -Tag 'windows' {
                 "$($run.Code) $($global:boardHolds -join ';') | $($global:boardEvents -join ';') | $((Read-MuxAgentJson -Path (Join-Path $folder 'last-sent.json')).line)" |
                     Should BeExactly "0 1=agent|$server|aaaaaaaaaaaa;2=mail|$server|pane-1 | append in [1=agent|$server|aaaaaaaaaaaa];last-sent in [1=agent|$server|aaaaaaaaaaaa] | ok" }
             finally { Remove-Variable -Name boardHolds, boardOpen, boardEvents, boardLock, boardMail, boardWrite -Scope Global } } } }
+
+Describe 'MuxAgents board list' -Tag 'windows' {
+    # Pester 4 keeps a Mock until its Describe or Context ends: the no-op writer below lives only in this Context, so the
+    # later tests in this Describe write state for real.
+    Context 'list without state writes' {
+        It 'lists exact old and new fields in a fixed key order, with no capture-pane, no state write and the offset unmoved' {
+            # Catches: a field from the wrong source (window from the record, not the pane), exitCode or any other key added, unread keyed by
+            # name only, an age off by one, a capture-pane (screen scraping) or a state write while listing, read losing a message.
+            $fake = New-BoardFake 'list'; $null = New-BoardAgent $fake
+            $null = New-BoardAgent $fake -Id 'bbbbbbbbbbbb' -Name 'idle' -Pane '%8' -Client 'copilot' -TaskLine '' -AgeSeconds 5
+            Add-FakeRmuxRule -Fake $fake -Match '^-N list-panes ' -StdOut "%9|@6|300|aaaaaaaaaaaa|worker`n%8|@7|301|bbbbbbbbbbbb|idle`n"
+            $caller = Resolve-MuxAgentCaller -P $fake
+            foreach ($from in @(@('worker', '%9'), @('worker', '%9'), @('idle', '%8'), @('worker', '%4'))) { $null = Add-MuxAgentMail -P $fake -Caller $caller -Key 'pane-1' -From $from[0] -FromPane $from[1] -Body 'x' }
+            Mock Write-MuxAgentJson { }
+            $fake.Calls.Clear()
+            $run = Invoke-BoardVerb $fake @('list'); $null = Get-MuxAgentBoard -P $fake -Caller $caller -ReaderKey 'pane-1' -All
+            $rows = @($run.Reply.agents | ForEach-Object { (@($_.PSObject.Properties | ForEach-Object { "$($_.Name)=$(if ($_.Name -eq 'createdAt') { ([DateTime]$_.Value).ToUniversalTime().ToString('o') } else { $_.Value })" }) -join ',') })
+            $tail = "context=brief,parent=%1,sessionId=0f11fc2f-2032-48ef-a920-4af2a8e5af50,directory=$($fake.Cwd)"
+            "$($run.Code) $($run.Reply.running) $(@($run.Reply.PSObject.Properties.Name) -join ',') $($rows -join ';')" | Should BeExactly ("0 2 ok,verb,running,agents name=worker,client=claude,pane=%9,window=@6,$tail,createdAt=2026-10-29T11:56:00.0000000Z,state=running,doing=build it,doingFrom=task,age=240,unread=2;" +
+                "name=idle,client=copilot,pane=%8,window=@7,$tail,createdAt=2026-10-29T11:59:55.0000000Z,state=running,doing=,doingFrom=,age=5,unread=1")
+            Assert-MockCalled Write-MuxAgentJson -Exactly 0
+            "$(@($fake.Calls | Where-Object { $_[1] -eq 'capture-pane' }).Count) $(@((Invoke-BoardVerb $fake @('read')).Reply.messages).Count)" | Should BeExactly '0 4' } }
+    It 'doing follows the newest of two sends and two statuses; a corrupt status.json is skipped; a blank send falls to the task' {
+        # Catches: a write that appends instead of replacing, the first status or message kept, a corrupt file failing list, the old message
+        # used after a blank send, a temp file left, a no-op writer mock leaking out of the Context above (no status or last-sent file).
+        $fake = New-BoardFake 'doing' -Caller claude -Tag 'aaaaaaaaaaaa'; $folder = New-BoardAgent $fake -Pane '%1'
+        Add-FakeRmuxRule -Fake $fake -Match '^-N list-panes ' -StdOut "%1|@1|100|aaaaaaaaaaaa|worker`n"
+        $seen = foreach ($step in @(@('send', 'sent one'), @('send', 'sent two'), @('status', 'status one'), @('status', 'status two'), @('bad', '{bad'), @('send', ' '))) {
+            $fake.Clock = $fake.Clock.AddSeconds(10)
+            if ($step[0] -eq 'bad') { [IO.File]::WriteAllText((Join-Path $folder 'status.json'), $step[1]) }
+            else { [IO.File]::WriteAllText((Join-Path $fake.Cwd 'b.md'), $step[1]); $null = Invoke-BoardVerb $fake (@(if ($step[0] -eq 'send') { 'send', 'parent' } else { 'status' }) + @('-BodyFile', 'b.md')) }
+            $row = (Invoke-BoardVerb $fake @('list')).Reply.agents[0]; "$($row.doingFrom)=$($row.doing)" }
+        $lastSent = [IO.File]::ReadAllText((Join-Path $folder 'last-sent.json'))
+        "$($seen -join ';')|$((Get-ChildItem -LiteralPath $folder -Name | Sort-Object) -join ',')|$lastSent" |
+            Should BeExactly 'message=sent one;message=sent two;status=status one;status=status two;message=sent two;task=build it|commit.json,last-sent.json,record.json,status.json|{"line":"","at":"2026-10-29T12:01:00.0000000Z"}' }
+    It 'counts only messages after the cursor and leaves the cursor bytes unchanged' {
+        # Catches: consumed messages counted, list moving or rewriting the cursor.
+        $fake = New-BoardFake 'cursor'; $null = New-BoardAgent $fake; Add-FakeRmuxRule -Fake $fake -Match '^-N list-panes ' -StdOut "%9|@5|300|aaaaaaaaaaaa|worker`n"
+        $caller = Resolve-MuxAgentCaller -P $fake
+        foreach ($n in 1..3) { $null = Add-MuxAgentMail -P $fake -Caller $caller -Key 'pane-1' -From 'worker' -FromPane '%9' -Body "m$n" }
+        $consumed = @((Invoke-BoardVerb $fake @('read')).Reply.messages).Count
+        $null = Add-MuxAgentMail -P $fake -Caller $caller -Key 'pane-1' -From 'worker' -FromPane '%9' -Body 'm4'
+        $cursor = [IO.Path]::Combine((Get-BoardState $fake), 'mail', 'pane-1.offset'); $before = Get-BoardHex $cursor
+        $counts = @(1..2 | ForEach-Object { (Invoke-BoardVerb $fake @('list')).Reply.agents[0].unread })
+        "$consumed $($counts -join ',') $((Get-BoardHex $cursor) -ceq $before)" | Should BeExactly '3 1,1 True' }
+    It 'each reader counts its own mailbox: two human panes and a tagged agent, no cursor written' {
+        # Catches: a fixed reader key, an agent read as pane-<n> instead of its id, a cursor written by list.
+        $fake = New-BoardFake 'boxes'; $null = New-BoardAgent $fake; $caller = Resolve-MuxAgentCaller -P $fake
+        foreach ($seed in @(@('pane-1', 1), @('pane-2', 2), @('aaaaaaaaaaaa', 3))) { foreach ($n in 1..$seed[1]) { $null = Add-MuxAgentMail -P $fake -Caller $caller -Key $seed[0] -From 'worker' -FromPane '%9' -Body 'x' } }
+        $counts = foreach ($reader in @(@('human', '', '%1'), @('human', '', '%2'), @('claude', 'aaaaaaaaaaaa', '%9'))) {
+            $view = New-BoardFake 'boxes' -Caller $reader[0] -Tag $reader[1] -Pane $reader[2]
+            Add-FakeRmuxRule -Fake $view -Match '^-N list-panes ' -StdOut "%9|@5|300|aaaaaaaaaaaa|worker`n"; (Invoke-BoardVerb $view @('list')).Reply.agents[0].unread }
+        "$($counts -join ',') $(@(Get-ChildItem -LiteralPath ([IO.Path]::Combine((Get-BoardState $fake), 'mail')) -Filter '*.offset').Count)" | Should BeExactly '1,2,3 0' }
+    It 'counts with no mailbox without creating state' {
+        # Catches: a state folder created by counting.
+        $empty = New-BoardFake 'no state'
+        "$((Get-MuxAgentUnreadCounts -P $empty -Caller (Resolve-MuxAgentCaller -P $empty) -Key 'pane-1').Count) $(Test-Path -LiteralPath $empty.StateRoot)" | Should BeExactly '0 False' }
+    Context 'row reader spy' {
+        It 'reads status.json and last-sent.json while the row''s agent lock is held' {
+            # Catches: the reads outside the lock (acquire and release, then read), the lock under another key. The spy asks a
+            # second thread whether the agent mutex is owned while each file is read.
+            $fake = New-BoardFake 'row lock'; $folder = New-BoardAgent $fake; Add-FakeRmuxRule -Fake $fake -Match '^-N list-panes ' -StdOut "%9|@5|300|aaaaaaaaaaaa|worker`n"
+            Write-MuxAgentJson -Path (Join-Path $folder 'status.json') -Value ([ordered]@{ text = 'testing'; at = 'x' })
+            Write-MuxAgentJson -Path (Join-Path $folder 'last-sent.json') -Value ([ordered]@{ line = 'sent'; at = 'x' })
+            $global:boardLock = Get-BoardLockName $fake 'agent' 'aaaaaaaaaaaa'
+            $global:boardSeen = [Collections.Generic.List[string]]::new()
+            $global:boardRead = ${function:Read-MuxAgentJson}
+            Mock Read-MuxAgentJson { $global:boardSeen.Add("$(Split-Path -Leaf $Path) held=$(Test-BoardLockHeld $global:boardLock)"); & $global:boardRead -Path $Path } -ParameterFilter { $Path -like '*status.json' -or $Path -like '*last-sent.json' }
+            try {
+                $row = (Invoke-BoardVerb $fake @('list')).Reply.agents[0]
+                "$($global:boardSeen -join ';') $($row.doingFrom)=$($row.doing)" | Should BeExactly 'status.json held=True;last-sent.json held=True status=testing' }
+            finally { Remove-Variable -Name boardLock, boardSeen, boardRead -Scope Global } } }
+    Context 'unread reader spy' {
+        It 'counts unread mail while the reader''s mailbox lock is held' {
+            # Catches: the unread reader called without Use-MuxAgentLock, the lock under another key. The spy asks a second
+            # thread whether the mailbox mutex is owned while the reader runs.
+            $fake = New-BoardFake 'unread lock'; $null = New-BoardAgent $fake; Add-FakeRmuxRule -Fake $fake -Match '^-N list-panes ' -StdOut "%9|@5|300|aaaaaaaaaaaa|worker`n"
+            $null = Add-MuxAgentMail -P $fake -Caller (Resolve-MuxAgentCaller -P $fake) -Key 'pane-1' -From 'worker' -FromPane '%9' -Body 'x'
+            $global:boardLock = Get-BoardLockName $fake 'mail' 'pane-1'
+            $global:boardSeen = [Collections.Generic.List[string]]::new()
+            $global:boardUnread = ${function:Get-MuxAgentUnreadText}
+            Mock Get-MuxAgentUnreadText { $global:boardSeen.Add("$(Split-Path -Leaf $Box) held=$(Test-BoardLockHeld $global:boardLock)"); & $global:boardUnread -Box $Box -Cursor $Cursor }
+            try {
+                $row = (Invoke-BoardVerb $fake @('list')).Reply.agents[0]
+                "$($global:boardSeen -join ';') $($row.unread)" | Should BeExactly 'pane-1.jsonl held=True 1' }
+            finally { Remove-Variable -Name boardLock, boardSeen, boardUnread -Scope Global } } } }
