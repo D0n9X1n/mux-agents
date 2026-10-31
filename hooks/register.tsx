@@ -58,4 +58,23 @@ export const register: Register = on => {
     }
     return ran
   })
+  // Every string drawn here comes from parseList, so it is already cleaned.
+  on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
+    const { Box, Text } = $.ui.resolve(e)
+    const b = await read($, board)
+    return (
+      <Box flexDirection="column">
+        <Text>mux-agents · {b.running} running{b.failed ? ' · refresh failed' : ''}</Text>
+        {b.agents.map(a => {
+          const ended = a.state !== 'running'
+          return (
+            <Box flexDirection="column">
+              <Text dimColor={ended || undefined}>{ended ? '○' : '●'} {a.name}  {a.client}  {ended ? `${a.state}  ` : ''}{formatAge(a.age)}</Text>
+              {a.doing ? <Text dimColor>  {a.doing}</Text> : null}
+            </Box>
+          )
+        })}
+      </Box>
+    )
+  })
 }

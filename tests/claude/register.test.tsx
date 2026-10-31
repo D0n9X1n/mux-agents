@@ -135,3 +135,45 @@ test('a refresh never overlaps: a run held 4000 ms delays the next until it sett
   await clock.advance(2000)
   expect([seen.argv.length, seen.settled]).toEqual([2, 2])
 })
+
+test('/mux-agents opens the pane and a stubbed list draws the count and rows', async ($, on) => {
+  const { seen } = world(on, { TMUX: 'x' }, [ran(0, LIST)])
+  await $.session.start(START)
+  await $.command.run({ command: 'mux-agents' })
+  expect(seen.opened).toEqual([{ id: 'mux-agents', title: 'Agents' }])
+  for (const surface of ['terminal', 'desktop'] as const) {
+    const ui = await $.ui.mount({ ...PANE, surface })
+    expect(await header(ui)).toBe('mux-agents · 1 running')
+    const live = await ui.find({ type: 'Text', text: /claude-1/ })
+    expect([live?.text, live?.props.dimColor]).toEqual(['● claude-1  claude  4m', undefined])
+    const doing = await ui.find({ type: 'Text', text: /build it/ })
+    expect([doing?.text, doing?.props.dimColor]).toEqual(['  build it', true])
+    const copilot = await ui.find({ type: 'Text', text: /copilot-1/ })
+    expect([copilot?.text, copilot?.props.dimColor]).toEqual(['○ copilot-1  copilot  exited  15m', true])
+    await ui.unmount()
+  }
+})
+
+test('ended rows are dimmed and named by state: exited, stopped and lost', async ($, on) => {
+  world(on, { TMUX: 'x' }, [ran(0, list(0, [row('a', 'exited', null, 60), row('b', 'stopped', null, 60), row('c', 'lost', null, 60)]))])
+  await $.session.start(START)
+  await $.command.run({ command: 'mux-agents' })
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  const rows = []
+  for (const name of ['a', 'b', 'c']) { const t = await ui.find({ type: 'Text', text: new RegExp(`^○ ${name} `) }); rows.push(`${t?.text}|${t?.props.dimColor}`) }
+  expect(rows).toEqual(['○ a  claude  exited  1m|true', '○ b  claude  stopped  1m|true', '○ c  claude  lost  1m|true'])
+  await ui.unmount()
+})
+
+test('the pane draws a board whose name and doing hold ESC, BEL and C1, with none of them drawn', async ($, on) => {
+  world(on, { TMUX: 'x' }, [ran(0, list(1, [row('ev\u001b[31mil\u0007', 'running', 'do\u009bne\tnow\u007f', 5)]))])
+  await $.session.start(START)
+  await $.command.run({ command: 'mux-agents' })
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  const texts = (await ui.findAll({ type: 'Text' })).map((t: { text: string }) => t.text)
+  const controls = texts.flatMap((t: string) => [...t].map(c => c.codePointAt(0)!).filter(c => c < 0x20 || (c >= 0x7f && c <= 0x9f)))
+  expect(controls).toEqual([])
+  expect(texts).toContain('● ev[31mil  claude  5s')
+  expect(texts).toContain('  done now')
+  await ui.unmount()
+})
