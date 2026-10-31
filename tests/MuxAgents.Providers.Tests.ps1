@@ -299,3 +299,57 @@ Describe 'MuxAgents providers sandbox' {
         finally { $script:MuxAgentVerbs.Remove('tp-ok') }
     }
 }
+Describe 'MuxAgents providers launcher' {
+    It 'windows ClientImage adds .exe; IsUnder compares the full root plus separator, any case' {
+        $members = Get-MuxAgentPlatformMembers -Platform windows
+        $root = [IO.Path]::GetFullPath($TestDrive).TrimEnd('\') + '\'
+        "$(& $members.ClientImage 'claude')|$(& $members.IsUnder $TestDrive ($root + 'a'))|$(& $members.IsUnder $TestDrive ($root.ToUpperInvariant() + 'a'))|$(& $members.IsUnder $TestDrive ($root.TrimEnd('\') + 'x\a'))|$(& $members.IsUnder $TestDrive $root.TrimEnd('\'))" | Should BeExactly 'claude.exe|True|True|False|False'
+    }
+    It 'Test-MuxAgentSpecPath asks IsUnder with StateRoot and takes only spec.json' {
+        $fake = New-FakeMuxAgentProviders
+        $roots = [Collections.Generic.List[string]]::new()
+        $fake.IsUnder = { param($Root, $Full) $roots.Add($Root); $Full.StartsWith('A/') }.GetNewClosure()
+        "$(Test-MuxAgentSpecPath -P $fake -Full 'A/x/spec.json') $(Test-MuxAgentSpecPath -P $fake -Full 'A/x/Spec.json') $(Test-MuxAgentSpecPath -P $fake -Full 'B/spec.json') $($roots[0] -ceq $fake.StateRoot)" | Should BeExactly 'True False False True'
+    }
+    Context 'launcher with a recorded PATH lookup' {
+        It 'the launcher looks the client up on PATH by the name ClientImage returns' {
+            # The launcher clears the client identity variables in this process, as it does in a pane.
+            $global:providersLooked = [Collections.Generic.List[string]]::new()
+            Mock Get-Command { $global:providersLooked.Add("$Name"); $null }
+            $fake = New-FakeMuxAgentProviders
+            $images = [Collections.Generic.List[string]]::new()
+            $fake.ClientImage = { param($Client) $images.Add($Client); 'mux-spy-image' }.GetNewClosure()
+            $folder = Join-Path $TestDrive 'launch'
+            Write-FakeMuxAgentFile (Join-Path $folder 'spec.json') @('{"client":"claude","args":[]}'); Write-FakeMuxAgentFile (Join-Path $folder 'commit.json') @('{}')
+            $errors = [IO.StringWriter]::new(); $console = [Console]::Error
+            [Console]::SetError($errors)
+            try { $code = Invoke-MuxAgentLauncher -P $fake -Spec (Join-Path $folder 'spec.json') }
+            finally { [Console]::SetError($console) }
+            try { "$code|$($images -join ',')|$($global:providersLooked -join ',')|$($errors.ToString().Trim())" | Should BeExactly '1|claude|mux-spy-image|mux-agent: mux-spy-image is not on PATH' }
+            finally { Remove-Variable -Name providersLooked -Scope Global }
+        }
+    }
+    It 'scripts/mux-agent-launcher.ps1 checks the spec path with Test-MuxAgentSpecPath' {
+        # A copy of the real launcher runs in a child pwsh next to a stub library: the real core, then a fake
+        # factory and a Test-MuxAgentSpecPath spy that accepts a spec outside the state root, which the old inline
+        # check refuses on every OS. The stub launcher body exits 7; a refusal exits 2.
+        $bin = Join-Path $TestDrive 'launcher-bin'
+        $null = [IO.Directory]::CreateDirectory($bin)
+        Copy-Item -LiteralPath (Join-Path $repoRoot 'scripts/mux-agent-launcher.ps1') -Destination $bin
+        $record = Join-Path $TestDrive 'spec-check.txt'
+        $spec = [IO.Path]::Combine($TestDrive, 'elsewhere', 'spec.json')
+        $core = [IO.Path]::Combine($repoRoot, 'scripts', 'MuxAgents.ps1').Replace("'", "''")
+        [IO.File]::WriteAllLines((Join-Path $bin 'MuxAgents.ps1'), [string[]]@(
+            ". '$core'"
+            "function New-MuxAgentProviders { param(`$Entry) [pscustomobject]@{ StateRoot = '$(([IO.Path]::Combine($TestDrive, 'state')).Replace("'", "''"))' } }"
+            "function Test-MuxAgentSpecPath { param(`$P, `$Full) [IO.File]::WriteAllText('$($record.Replace("'", "''"))', ""`$(`$P.StateRoot)|`$Full""); `$true }"
+            'function Assert-MuxAgentNoReparse { param($Path) }'
+            'function Invoke-MuxAgentLauncher { param($P, $Spec) 7 }'
+        ))
+        $pwsh = [Diagnostics.Process]::GetCurrentProcess().MainModule.FileName
+        $null = & $pwsh -NoProfile -File (Join-Path $bin 'mux-agent-launcher.ps1') $spec 2>$null
+        $code = $LASTEXITCODE
+        $seen = if (Test-Path -LiteralPath $record) { [IO.File]::ReadAllText($record) } else { 'not called' }
+        "$code|$seen" | Should BeExactly "7|$([IO.Path]::Combine($TestDrive, 'state'))|$([IO.Path]::GetFullPath($spec))"
+    }
+}

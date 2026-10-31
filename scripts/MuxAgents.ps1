@@ -1228,6 +1228,12 @@ function Wait-MuxAgentCommit {
     }
 }
 
+function Test-MuxAgentSpecPath {
+    # True for a spec.json (exact case) that IsUnder places inside the state root.
+    param([Parameter(Mandatory)]$P, [Parameter(Mandatory)][string]$Full)
+    (& $P.IsUnder $P.StateRoot $Full) -and [IO.Path]::GetFileName($Full) -ceq 'spec.json'
+}
+
 function Invoke-MuxAgentLauncher {
     # Waits for the launch commit, then runs the client once in this console and records its exit code. No retry.
     param([Parameter(Mandatory)]$P, [Parameter(Mandatory)][string]$Spec, [scriptblock]$Client)
@@ -1250,9 +1256,10 @@ function Invoke-MuxAgentLauncher {
     else {
         $arguments = [string[]](@($script:MuxAgentClientFlags[$launch.client]) + @($launch.args))
         if (-not $Client) {
-            $executable = (Get-Command "$($launch.client).exe" -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1).Source
+            $image = & $P.ClientImage $launch.client
+            $executable = (Get-Command $image -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1).Source
             $length = if ($executable) { $executable.Length + 3 + (Get-MuxAgentCommandLineLength -Arguments $arguments) }
-            if (-not $executable) { [Console]::Error.WriteLine("mux-agent: $($launch.client).exe is not on PATH") }
+            if (-not $executable) { [Console]::Error.WriteLine("mux-agent: $image is not on PATH") }
             elseif ($length -gt 32767) { [Console]::Error.WriteLine("mux-agent: the client command line is too long ($length characters)") }
             else {
                 # Started without redirection so the client owns the pane's console: '& exe' inside this function

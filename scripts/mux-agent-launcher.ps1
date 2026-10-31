@@ -5,9 +5,8 @@ param([Parameter(Mandatory)][string]$Spec)
 
 $P = New-MuxAgentProviders -Entry (Join-Path $PSScriptRoot 'mux-agent.ps1')
 # Only a spec.json inside an agent folder of the state root, with no junction or link on the way, is read.
-$root = [IO.Path]::GetFullPath($P.StateRoot).TrimEnd('\') + '\'
 $full = [IO.Path]::GetFullPath($Spec)
-if (-not $full.StartsWith($root, [StringComparison]::OrdinalIgnoreCase) -or [IO.Path]::GetFileName($full) -cne 'spec.json') {
+if (-not (Test-MuxAgentSpecPath -P $P -Full $full)) {
     [Console]::Error.WriteLine('mux-agent: the launch spec is outside the state folder')
     exit 2
 }
