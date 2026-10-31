@@ -2,12 +2,15 @@
 Describe 'MuxAgents integration tmux' -Tag 'integration' {
     . (Join-Path $PSScriptRoot 'MuxAgents.IntegrationHarness.ps1')
     $repoRoot = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
+    # Pester 4 runs each It inline here, while AfterAll runs outside this scope, where the harness functions and $server
+    # do not exist; so the server stops in this finally, after the last It.
+    $server = $null
+    try {
     $server = Start-MuxAgentItServer -Root (Join-Path $TestDrive 'it') -Driver (Join-Path $PSScriptRoot 'Driver.ps1')
     $dir = $server.Dir; $sid = $server.SessionId; Wait-MuxAgentItFile "$dir/done" 300
     $results = @{}; if (Test-Path "$dir/results.jsonl") { foreach ($line in [IO.File]::ReadAllLines("$dir/results.jsonl")) { $r = $line | ConvertFrom-Json; $results[$r.step] = $r } }
     function Get-ItWorker([string]$Step, [string]$Ext) { [IO.File]::ReadAllText("$dir/$($results[$Step].reply.sessionId).$Ext") }
     function Get-ItActive([string]$Name) { @([IO.File]::ReadAllLines("$dir/$Name.txt") | Where-Object { $_.EndsWith('|1|1') } | ForEach-Object { ($_ -split '\|')[0] }) -join ',' }
-    AfterAll { Stop-MuxAgentItServer $server }
     It 'runs unsandboxed by the production signals, with a built fake, a terminal at the root and a finished driver' {
         . "$repoRoot/scripts/MuxAgents.ps1"
         $signal = if ($IsLinux) { "NoNewPrivs=$(@([IO.File]::ReadAllLines('/proc/self/status') -cmatch '^NoNewPrivs:\s*0$').Count)" } else { Import-MuxAgentUnixNative; "sandbox_check=$([MuxAgentUnixNative]::SandboxCheck())" }
@@ -50,4 +53,6 @@ Describe 'MuxAgents integration tmux' -Tag 'integration' {
         . "$repoRoot/scripts/MuxAgents.ps1"
         $probe = foreach ($s in $server.Socket, "$($server.Socket).none") { Invoke-MuxAgentProcess -FilePath (Get-Command tmux).Source -Arguments @('-S', $s, '-N', 'display-message', '-p', '-t', $results['spawn-window'].reply.pane, '#{pane_id}|#{@agent-id}') }
         "$(Test-MuxAgentPaneGone $probe[0]) $(Test-MuxAgentPaneGone $probe[1])" | Should BeExactly 'True False' }
+    }
+    finally { if ($server) { Stop-MuxAgentItServer $server } }
 }
