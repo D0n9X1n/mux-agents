@@ -111,15 +111,17 @@ fn argv(pid: u32, buf: &mut [u8]) -> Option<Vec<String>> {
     parse::procargs2(&buf[..size.min(buf.len())])
 }
 
+// Start re-read last, so a pid reused between the reads gives no row rather than a mixed one.
 fn row_with(pid: u32, buf: &mut [u8]) -> Option<Row> {
-    let info = bsdinfo(pid)?;
-    Some(Row {
+    seam::read_row(
         pid,
-        ppid: info.pbi_ppid,
-        start: start_of(&info)?,
-        path: path(pid),
-        argv: argv(pid, buf),
-    })
+        |pid| {
+            let info = bsdinfo(pid)?;
+            Some((info.pbi_ppid, start_of(&info)?))
+        },
+        path,
+        |pid| argv(pid, buf),
+    )
 }
 
 impl ProcSource for MacOs {
@@ -135,6 +137,9 @@ impl ProcSource for MacOs {
         false
     }
     fn wait_exit(&self, _: &Handle, _: u32) -> bool {
+        false
+    }
+    fn alive(&self, _: &Handle) -> bool {
         false
     }
     fn probe(&self, pid: u32) -> i32 {
@@ -329,6 +334,9 @@ mod tests {
         }
         fn wait_exit(&self, handle: &Handle, ms: u32) -> bool {
             MacOs.wait_exit(handle, ms)
+        }
+        fn alive(&self, handle: &Handle) -> bool {
+            MacOs.alive(handle)
         }
         fn probe(&self, pid: u32) -> i32 {
             MacOs.probe(pid)

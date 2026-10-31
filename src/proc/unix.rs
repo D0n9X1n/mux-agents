@@ -91,6 +91,19 @@ impl super::seam::ProcSource for PidfdSource {
         crate::parse::poll_shows_exit(count, item.revents)
     }
 
+    fn alive(&self, handle: &Self::H) -> bool {
+        use std::os::fd::AsRawFd;
+        let mut item = libc::pollfd {
+            fd: handle.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: one live pollfd, no wait.
+        let count = unsafe { libc::poll(&mut item, 1, 0) };
+        // Only "nothing ready" is alive; an exit, an error or a bad fd is not.
+        count == 0
+    }
+
     fn probe(&self, pid: u32) -> i32 {
         probe(pid)
     }

@@ -25,20 +25,16 @@ fn argv(pid: u32) -> Option<Vec<String>> {
     parse::linux_cmdline(&std::fs::read(format!("/proc/{pid}/cmdline")).ok()?)
 }
 
+// (ppid, start) from /proc/<pid>/stat, which names its own pid; anything else is not this row.
+fn head(pid: u32) -> Option<(u32, i64)> {
+    let stat = parse::linux_stat(&std::fs::read(format!("/proc/{pid}/stat")).ok()?)?;
+    (stat.pid == pid).then_some((stat.ppid, stat.start))
+}
+
 impl Os for Linux {
+    // Start re-read last, so a pid reused between the reads gives no row rather than a mixed one.
     fn row(&self, pid: u32) -> Option<Row> {
-        let stat = parse::linux_stat(&std::fs::read(format!("/proc/{pid}/stat")).ok()?)?;
-        // The stat file names its own pid; anything else is not this row.
-        if stat.pid != pid {
-            return None;
-        }
-        Some(Row {
-            pid,
-            ppid: stat.ppid,
-            start: stat.start,
-            path: link(pid, "exe"),
-            argv: argv(pid),
-        })
+        seam::read_row(pid, head, |pid| link(pid, "exe"), argv)
     }
 
     /// Every numeric /proc entry whose stat reads; one that exits mid-read is skipped.
@@ -194,6 +190,9 @@ mod tests {
         }
         fn wait_exit(&self, handle: &Handle, ms: u32) -> bool {
             PidfdSource.wait_exit(handle, ms)
+        }
+        fn alive(&self, handle: &Handle) -> bool {
+            PidfdSource.alive(handle)
         }
         fn probe(&self, pid: u32) -> i32 {
             PidfdSource.probe(pid)

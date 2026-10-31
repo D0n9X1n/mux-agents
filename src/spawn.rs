@@ -4,7 +4,9 @@ use std::fs::OpenOptions;
 use std::io::{self, Read, Write};
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
+#[cfg(windows)]
 use std::sync::mpsc::{self, RecvTimeoutError};
+#[cfg(windows)]
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -37,73 +39,213 @@ pub fn captured(path: &Path, args: &[&str], timeout: Duration) -> io::Result<Out
     own_group(&mut command);
     let mut child = command.spawn()?;
     let deadline = Instant::now() + timeout;
+    let [stdout, stderr] = collect(&mut child, deadline)?;
+    let code = exit_code(child.wait()?);
+    Ok(Out {
+        code,
+        stdout: String::from_utf8_lossy(&stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&stderr).into_owned(),
+    })
+}
 
-    // Reader threads, so a full stderr pipe never stalls a child that is still writing stdout.
-    let (tx, rx) = mpsc::channel();
-    let pipes: [Option<Box<dyn Read + Send>>; 2] = [
-        child
-            .stdout
-            .take()
-            .map(|p| Box::new(p) as Box<dyn Read + Send>),
-        child
-            .stderr
-            .take()
-            .map(|p| Box::new(p) as Box<dyn Read + Send>),
+fn timed_out() -> io::Error {
+    io::Error::new(io::ErrorKind::TimedOut, "mux-agent: native call timed out")
+}
+
+/// Both pipes to their end and the exit seen (not reaped), or the group killed and an error. One thread polls
+/// both pipes, so a full stderr never stalls a child still writing stdout, and nothing outlives the call: on a
+/// timeout the pipes close here even when a process outside the group still holds their other ends.
+#[cfg(unix)]
+fn collect(child: &mut Child, deadline: Instant) -> io::Result<[Vec<u8>; 2]> {
+    use std::os::fd::{AsRawFd, OwnedFd};
+    let pipes = [
+        child.stdout.take().map(OwnedFd::from),
+        child.stderr.take().map(OwnedFd::from),
     ];
-    for (index, pipe) in pipes.into_iter().enumerate() {
-        let tx = tx.clone();
-        let mut pipe = pipe.expect("both pipes were requested");
-        thread::spawn(move || {
-            let mut bytes = Vec::new();
-            let _ = pipe.read_to_end(&mut bytes);
-            let _ = tx.send((index, bytes));
-        });
-    }
-    drop(tx);
-
-    let mut outputs: [Option<Vec<u8>>; 2] = [None, None];
-    let mut done = false;
+    let mut pipes = pipes.map(|p| Some(std::fs::File::from(p.expect("both pipes were requested"))));
+    let mut outputs = [Vec::new(), Vec::new()];
+    let mut buf = vec![0u8; 64 * 1024];
     let mut step = FIRST_STEP;
+    let mut done = false;
     loop {
         if !done {
-            done = match exited(&mut child) {
+            done = match exited(child) {
                 Ok(done) => done,
                 Err(error) => {
-                    kill_tree(&mut child);
+                    kill_tree(child);
                     return Err(error);
                 }
             };
         }
-        if done && outputs.iter().all(Option::is_some) {
-            let code = exit_code(child.wait()?);
-            let [stdout, stderr] =
-                outputs.map(|o| String::from_utf8_lossy(&o.unwrap_or_default()).into_owned());
-            return Ok(Out {
-                code,
-                stdout,
-                stderr,
-            });
+        if done && pipes.iter().all(Option::is_none) {
+            return Ok(outputs);
         }
         let now = Instant::now();
         if now >= deadline {
-            // The readers are left behind: a pipe a killed process held closes, one a stray process holds never does.
-            kill_tree(&mut child);
-            return Err(io::Error::new(
-                io::ErrorKind::TimedOut,
-                "mux-agent: native call timed out",
-            ));
+            kill_tree(child);
+            return Err(timed_out());
+        }
+        // The exit cannot be polled, so the wait is short and grows; output wakes it at once.
+        let wait = step.min(deadline - now).max(Duration::from_millis(1));
+        // The open pipes' indices, and a pollfd for each in the same order.
+        let open: Vec<usize> = (0..2).filter(|&i| pipes[i].is_some()).collect();
+        let mut fds: Vec<libc::pollfd> = open
+            .iter()
+            .filter_map(|&i| pipes[i].as_ref())
+            .map(|pipe| libc::pollfd {
+                fd: pipe.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            })
+            .collect();
+        // SAFETY: `fds` holds `fds.len()` live pollfds; with none, poll only sleeps.
+        let ready = unsafe {
+            libc::poll(
+                fds.as_mut_ptr(),
+                fds.len() as libc::nfds_t,
+                wait.as_millis() as libc::c_int,
+            )
+        };
+        if ready < 0 {
+            let error = io::Error::last_os_error();
+            if error.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            kill_tree(child);
+            return Err(error);
+        }
+        if ready == 0 {
+            step = (step * 2).min(MAX_STEP);
+            continue;
+        }
+        for (&index, item) in open.iter().zip(&fds) {
+            if item.revents == 0 {
+                continue;
+            }
+            let Some(pipe) = pipes[index].as_mut() else {
+                continue;
+            };
+            // Ready, so one read does not block: data, or 0 at the end once every writer closed.
+            match pipe.read(&mut buf) {
+                Ok(0) => pipes[index] = None,
+                Ok(n) => outputs[index].extend_from_slice(&buf[..n]),
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                Err(error) => {
+                    kill_tree(child);
+                    return Err(error);
+                }
+            }
+        }
+    }
+}
+
+/// Windows pipes cannot be polled, so a thread reads each. Each thread sends its pipe back with its bytes, so the
+/// handle stays open until the thread is joined; on a timeout CancelIoEx aborts the pending read (std reads child
+/// pipes with ReadFileEx and an alertable wait), so no thread or handle outlives the call.
+#[cfg(windows)]
+fn collect(child: &mut Child, deadline: Instant) -> io::Result<[Vec<u8>; 2]> {
+    use std::os::windows::io::AsRawHandle;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    type Pipe = Box<dyn Read + Send>;
+    let stop = Arc::new(AtomicBool::new(false));
+    let (tx, rx) = mpsc::channel::<(usize, Vec<u8>, Pipe)>();
+    let out = child.stdout.take().expect("both pipes were requested");
+    let err = child.stderr.take().expect("both pipes were requested");
+    let handles = [out.as_raw_handle() as isize, err.as_raw_handle() as isize];
+    let pipes: [Pipe; 2] = [Box::new(out), Box::new(err)];
+    let readers: Vec<thread::JoinHandle<()>> = pipes
+        .into_iter()
+        .enumerate()
+        .map(|(index, mut pipe)| {
+            let (tx, stop) = (tx.clone(), stop.clone());
+            thread::spawn(move || {
+                let mut bytes = Vec::new();
+                let mut buf = vec![0u8; 64 * 1024];
+                // Any error ends the read, so a cancelled one cannot be retried forever.
+                while !stop.load(Ordering::SeqCst) {
+                    match pipe.read(&mut buf) {
+                        Ok(0) => break,
+                        Ok(n) => bytes.extend_from_slice(&buf[..n]),
+                        Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                        Err(_) => break,
+                    }
+                }
+                let _ = tx.send((index, bytes, pipe));
+            })
+        })
+        .collect();
+    drop(tx);
+
+    let mut outputs: [Option<Vec<u8>>; 2] = [None, None];
+    // Held until the readers are joined, so their handles are never closed under a cancel.
+    let mut returned: Vec<Pipe> = Vec::new();
+    let mut done = false;
+    let mut step = FIRST_STEP;
+    let result = loop {
+        if !done {
+            done = match exited(child) {
+                Ok(done) => done,
+                Err(error) => {
+                    kill_tree(child);
+                    break Err(error);
+                }
+            };
+        }
+        if done && outputs.iter().all(Option::is_some) {
+            break Ok(outputs.clone().map(Option::unwrap_or_default));
+        }
+        let now = Instant::now();
+        if now >= deadline {
+            kill_tree(child);
+            break Err(timed_out());
         }
         let wait = step.min(deadline - now);
         match rx.recv_timeout(wait) {
-            Ok((index, bytes)) => outputs[index] = Some(bytes),
+            Ok((index, bytes, pipe)) => {
+                outputs[index] = Some(bytes);
+                returned.push(pipe);
+            }
             Err(RecvTimeoutError::Timeout) => step = (step * 2).min(MAX_STEP),
-            // Both pipes are read; only the exit is left to see.
             Err(RecvTimeoutError::Disconnected) => {
                 thread::sleep(wait);
                 step = (step * 2).min(MAX_STEP);
             }
         }
+    };
+    if result.is_err() {
+        stop.store(true, Ordering::SeqCst);
+        // Repeated, since a read may start between the flag and a cancel; bounded, since the flag ends it.
+        for _ in 0..CANCEL_ROUNDS {
+            if readers.iter().all(thread::JoinHandle::is_finished) {
+                break;
+            }
+            for (index, reader) in readers.iter().enumerate() {
+                if !reader.is_finished() {
+                    // SAFETY: the pipe is alive (owned by the reader or in `rx`/`returned` until the join below);
+                    // a null OVERLAPPED cancels every read on it.
+                    unsafe { CancelIoEx(handles[index] as _, std::ptr::null()) };
+                }
+            }
+            thread::sleep(MAX_STEP / 10);
+        }
     }
+    for reader in readers {
+        let _ = reader.join();
+    }
+    drop(returned);
+    drop(rx);
+    result
+}
+
+#[cfg(windows)]
+const CANCEL_ROUNDS: u32 = 200;
+
+// kernel32; windows-sys has it only under Win32_System_IO, which nothing else here needs.
+#[cfg(windows)]
+unsafe extern "system" {
+    fn CancelIoEx(file: *mut core::ffi::c_void, overlapped: *const core::ffi::c_void) -> i32;
 }
 
 /// The client on the caller's own console (MuxAgents.ps1:1650-1659): stdio inherited, `remove` taken out of its
@@ -234,6 +376,18 @@ mod tests {
     }
 
     #[test]
+    fn captured_drains_both_pipes_past_their_buffers() {
+        // 1 MiB to each stream, stderr first: far past a pipe's buffer, so it ends only if both are read as they fill.
+        let script =
+            "head -c 1048576 /dev/zero | tr '\\0' e >&2; head -c 1048576 /dev/zero | tr '\\0' o";
+        let out = sh(script, Duration::from_secs(10)).unwrap();
+        assert_eq!(out.code, 0);
+        assert_eq!((out.stdout.len(), out.stderr.len()), (1 << 20, 1 << 20));
+        assert!(out.stdout.bytes().all(|b| b == b'o'));
+        assert!(out.stderr.bytes().all(|b| b == b'e'));
+    }
+
+    #[test]
     fn captured_runs_in_home() {
         let out = sh("pwd -P", Duration::from_secs(5)).unwrap();
         let home = std::fs::canonicalize(std::env::home_dir().unwrap()).unwrap();
@@ -268,6 +422,76 @@ mod tests {
             !alive
         });
         assert!(gone, "grandchild {pid} survived");
+    }
+
+    fn open_fds() -> usize {
+        // /dev/fd lists this process's descriptors on Linux and macOS; reading it opens one more, every time.
+        std::fs::read_dir("/dev/fd").unwrap().count()
+    }
+
+    #[cfg(target_os = "macos")]
+    fn threads() -> usize {
+        let mut info = std::mem::MaybeUninit::<libc::proc_taskinfo>::zeroed();
+        let size = size_of::<libc::proc_taskinfo>() as libc::c_int;
+        // SAFETY: the buffer is one proc_taskinfo of `size` bytes.
+        let got = unsafe {
+            libc::proc_pidinfo(
+                libc::getpid(),
+                libc::PROC_PIDTASKINFO,
+                0,
+                info.as_mut_ptr().cast(),
+                size,
+            )
+        };
+        assert_eq!(got, size);
+        // SAFETY: zeroed is valid and the call filled it.
+        unsafe { info.assume_init() }.pti_threadnum as usize
+    }
+
+    #[cfg(target_os = "linux")]
+    fn threads() -> usize {
+        std::fs::read_dir("/proc/self/task").unwrap().count()
+    }
+
+    #[test]
+    fn timeout_leaves_no_reader_or_descriptor_behind() {
+        // In a process of its own, so other tests' threads and descriptors do not move the counts.
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "spawn::tests::timeout_leak_child",
+                "--exact",
+                "--ignored",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(stdout.contains("NO-LEAK"), "{stdout}\n{stderr}");
+    }
+
+    #[test]
+    #[ignore = "a child of timeout_leaves_no_reader_or_descriptor_behind"]
+    fn timeout_leak_child() {
+        // `set -m` puts the sleeper in a group of its own, so the timeout's killpg misses it and it keeps both
+        // pipes open for 30 s.
+        let dir = TempDir::new();
+        let pids = dir.path().join("pids");
+        let script = format!("set -m; sleep 30 & echo $! >> '{}'; wait", pids.display());
+        let baseline = (open_fds(), threads());
+        let mut counts = Vec::new();
+        for _ in 0..8 {
+            let error = sh(&script, Duration::from_millis(200)).unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+            counts.push((open_fds(), threads()));
+        }
+        for pid in std::fs::read_to_string(&pids).unwrap().split_whitespace() {
+            // SAFETY: SIGKILL to the sleepers this test started.
+            unsafe { libc::kill(pid.parse().unwrap(), libc::SIGKILL) };
+        }
+        assert_eq!(counts, vec![baseline; 8]);
+        println!("NO-LEAK");
     }
 
     #[test]

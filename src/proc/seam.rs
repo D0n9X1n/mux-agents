@@ -8,11 +8,35 @@ pub trait ProcSource {
     fn open_handle(&self, pid: u32) -> Option<Self::H>;
     fn send_kill(&self, handle: &Self::H) -> bool;
     fn wait_exit(&self, handle: &Self::H, ms: u32) -> bool;
+    /// False once the handle's process exited, or when that cannot be told.
+    fn alive(&self, handle: &Self::H) -> bool;
     /// kill(pid, 0): 0 when the process exists, else errno.
     fn probe(&self, pid: u32) -> i32;
     fn sleep(&self, ms: u64) {
         std::thread::sleep(Duration::from_millis(ms));
     }
+}
+
+/// One row whose fields all belong to one process. They are read by pid in separate calls, so the start is read
+/// again last: a pid reused in between shows another start (or none), and the row is unreadable. Only the start
+/// is compared; a parent that changed is a reparent, not reuse. `head` gives (ppid, start).
+pub fn read_row(
+    pid: u32,
+    head: impl Fn(u32) -> Option<(u32, i64)>,
+    path: impl FnOnce(u32) -> Option<String>,
+    argv: impl FnOnce(u32) -> Option<Vec<String>>,
+) -> Option<super::Row> {
+    let (ppid, start) = head(pid)?;
+    let path = path(pid);
+    let argv = argv(pid);
+    let (_, again) = head(pid)?;
+    (again == start).then_some(super::Row {
+        pid,
+        ppid,
+        start,
+        path,
+        argv,
+    })
 }
 
 /// A process held for a kill. It owns its handle, so dropping it closes the handle.
@@ -44,6 +68,11 @@ const POLL_MS: u64 = 100;
 pub fn open_with<S: ProcSource>(src: &S, pid: u32) -> Option<Opened<S::H>> {
     let handle = src.open_handle(pid);
     let start = src.read_start(pid)?;
+    // The start was read by pid. Only a handle still alive after that read proves the pid was not reused in
+    // between: a process that has not exited keeps its pid.
+    if handle.as_ref().is_some_and(|h| !src.alive(h)) {
+        return None;
+    }
     Some(Opened::new(pid, start, handle))
 }
 
@@ -99,6 +128,8 @@ mod tests {
         handle: bool,
         start: Option<i64>,
         exits: bool,
+        // The handle's process exited before `alive` asked.
+        exited: bool,
         // Probe answers in turn; the last one repeats.
         probes: Vec<i32>,
     }
@@ -129,6 +160,10 @@ mod tests {
                 .push(format!("wait {} {ms}", handle.0));
             self.exits
         }
+        fn alive(&self, handle: &FakeHandle) -> bool {
+            self.log.borrow_mut().push(format!("alive {}", handle.0));
+            !self.exited
+        }
         fn probe(&self, pid: u32) -> i32 {
             let mut log = self.log.borrow_mut();
             let round = log.iter().filter(|c| c.starts_with("probe")).count();
@@ -138,6 +173,51 @@ mod tests {
         fn sleep(&self, ms: u64) {
             self.log.borrow_mut().push(format!("sleep {ms}"));
         }
+    }
+
+    // Head reads answer in turn; path and argv are the replacement's when the pid was reused in between.
+    fn row_reads(heads: Vec<Option<(u32, i64)>>) -> (Option<crate::proc::Row>, Vec<String>) {
+        let log: Log = Rc::default();
+        let round = RefCell::new(0);
+        let row = read_row(
+            7,
+            |pid| {
+                log.borrow_mut().push(format!("head {pid}"));
+                let mut round = round.borrow_mut();
+                *round += 1;
+                heads[*round - 1]
+            },
+            |pid| {
+                log.borrow_mut().push(format!("path {pid}"));
+                Some("/bin/sh".into())
+            },
+            |pid| {
+                log.borrow_mut().push(format!("argv {pid}"));
+                Some(vec!["sh".into()])
+            },
+        );
+        let calls = log.borrow().clone();
+        (row, calls)
+    }
+
+    #[test]
+    fn row_rejects_pid_reused_between_reads() {
+        // Start 100 read first; the path and argv came from a replacement with start 200: not one process.
+        let (row, calls) = row_reads(vec![Some((1, 100)), Some((1, 200))]);
+        assert_eq!(row, None);
+        assert_eq!(calls, ["head 7", "path 7", "argv 7", "head 7"]);
+        // Gone by the second read.
+        assert_eq!(row_reads(vec![Some((1, 100)), None]).0, None);
+        // Gone at the first: nothing else is read.
+        let (row, calls) = row_reads(vec![None]);
+        assert_eq!((row, calls), (None, vec!["head 7".to_string()]));
+        // The same start both times: one process. A parent that changed (a reparent) is not reuse.
+        let row = row_reads(vec![Some((1, 100)), Some((9, 100))]).0.unwrap();
+        assert_eq!(
+            (row.pid, row.ppid, row.start, row.path.as_deref()),
+            (7, 1, 100, Some("/bin/sh"))
+        );
+        assert_eq!(row.argv, Some(vec!["sh".to_string()]));
     }
 
     #[test]
@@ -160,9 +240,9 @@ mod tests {
             (opened.pid, opened.start, opened.handle().is_some()),
             (7, 1500, true)
         );
-        assert_eq!(src.calls(), ["handle 7", "start 7"]);
+        assert_eq!(src.calls(), ["handle 7", "start 7", "alive 7"]);
         drop(opened);
-        assert_eq!(src.calls(), ["handle 7", "start 7", "close 7"]);
+        assert_eq!(src.calls(), ["handle 7", "start 7", "alive 7", "close 7"]);
 
         // No handle (macOS): the start alone is enough to open.
         let src = Fake {
@@ -225,7 +305,7 @@ mod tests {
             Err(Reason::Start)
         ));
         // Rejected, the fd closed at once and nothing was signalled.
-        assert_eq!(src.calls(), ["handle 7", "start 7", "close 7"]);
+        assert_eq!(src.calls(), ["handle 7", "start 7", "alive 7", "close 7"]);
 
         // No process at all is `open`; the same start is held with its fd.
         let none = hold::<FakeHandle>(None, listed, |a, b| a == b);
@@ -237,7 +317,29 @@ mod tests {
         };
         let held = hold(open_with(&src, 7), listed, |a, b| a == b).unwrap();
         assert!(held.handle().is_some());
-        assert_eq!(src.calls(), ["handle 7", "start 7"]);
+        assert_eq!(src.calls(), ["handle 7", "start 7", "alive 7"]);
+    }
+
+    #[test]
+    fn open_rejects_handle_whose_process_exited_before_the_start_read() {
+        // The pidfd holds the original (start 100); it exits and is reaped, and the pid is reused (start 200)
+        // before read_start. The start read is the replacement's, so the open must not stand: a kill through the
+        // fd would see the original's exit and report the replacement killed.
+        let src = Fake {
+            handle: true,
+            start: Some(200),
+            exited: true,
+            exits: true,
+            ..Fake::default()
+        };
+        assert!(open_with(&src, 7).is_none());
+        assert_eq!(src.calls(), ["handle 7", "start 7", "alive 7", "close 7"]);
+        // Nothing to kill, so no success can be reported for the replacement.
+        assert!(
+            !src.calls()
+                .iter()
+                .any(|c| c.starts_with("kill") || c.starts_with("wait"))
+        );
     }
 
     #[test]
