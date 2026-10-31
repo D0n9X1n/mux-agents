@@ -1,13 +1,14 @@
 import { atom, read, update } from 'claude-code'
-import type { EngineInterface, Register } from 'claude-code'
+import type { EngineInterface, Register, Timer } from 'claude-code'
 
 import { EMPTY, formatAge, isSpawn, parseList } from './board'
 
 const PANE = 'mux-agents'
 // Change the shape tag when the board's fields change: it declines what an earlier version stored.
 const board = atom({ plugin: 'mux-agents', key: 'board' } as const, EMPTY, { shape: 'board-1' })
-// Per module load (a hot reload drops the timer and resets both): one timer, and at most one list run at a time.
-let ticking = false
+// Per module load (a hot reload drops the timer and resets both): the one refresh timer while the pane is open, and at
+// most one list run at a time.
+let ticking: Timer | undefined
 let busy = false
 
 async function refresh($: EngineInterface) {
@@ -36,10 +37,15 @@ async function refresh($: EngineInterface) {
 async function openPane($: EngineInterface) {
   await $.ui.open({ id: PANE, title: 'Agents' })
   if (!ticking) {
-    ticking = true
-    $.clock.every(3000, () => refresh($))
+    ticking = $.clock.every(3000, () => refresh($))
     await refresh($)
   }
+}
+
+// After the pane closed: stop its refresh, so a later open starts one new timer.
+function stopRefresh() {
+  ticking?.cancel()
+  ticking = undefined
 }
 
 export const register: Register = on => {
@@ -66,6 +72,12 @@ export const register: Register = on => {
       if (mux && isSpawn(String((e as { command?: unknown }).command ?? ''), typeof stdout === 'string' ? stdout : undefined)) await openPane($)
     }
     return ran
+  })
+  // Any origin (the person, a plugin): the close goes on first, so a hook below that keeps the pane open keeps its refresh.
+  on('ui.close', async ($, e, next) => {
+    const closed = await next(e)
+    if (e.id === PANE) stopRefresh()
+    return closed
   })
   // Every string drawn here comes from parseList, so it is already cleaned.
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
