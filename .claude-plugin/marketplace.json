@@ -5,7 +5,7 @@
   "plugins": [
     {
       "name": "mux-agents",
-      "source": "./",
+      "source": { "source": "github", "repo": "D0n9X1n/mux-agents", "ref": "dist" },
       "description": "Start Claude Code and Copilot CLI agents in tmux or rmux panes, see what each is doing, message them and stop them."
     }
   ]
