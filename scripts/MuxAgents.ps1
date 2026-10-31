@@ -98,15 +98,7 @@ function Invoke-MuxAgentCommand {
         if ($null -ne $data) { foreach ($key in $data.Keys) { $result[$key] = $data[$key] } }
         $code = 0
     }
-    catch {
-        $code = 1
-        $check = 'internal'
-        $message = 'unexpected error (' + $_.Exception.GetBaseException().GetType().FullName + ')'
-        for ($exception = $_.Exception; $exception; $exception = $exception.InnerException) {
-            if ($exception.Data.Contains('MuxAgentCode')) { $code = [int]$exception.Data['MuxAgentCode']; $check = [string]$exception.Data['MuxAgentCheck']; $message = $exception.Message; break }
-        }
-        $result = [ordered]@{ ok = $false; verb = $verb; code = $code; check = $check; message = $message }
-    }
+    catch { $result = ConvertTo-MuxAgentFailure $_ $verb; $code = $result.code }
     [pscustomobject]@{ Code = $code; Text = (Format-MuxAgentResult -Data $result -Text:$text) }
 }
 
@@ -135,6 +127,12 @@ function Get-MuxAgentPlatform {
     param([bool]$OnWindows = $IsWindows, [bool]$OnLinux = $IsLinux, [bool]$OnMacOS = $IsMacOS)
     if ($OnWindows) { 'windows' } elseif ($OnLinux) { 'linux' } elseif ($OnMacOS) { 'macos' }
 }
+
+function Get-MuxAgentEntryRefusal {
+    # The entry's one-line reply on a platform mux-agents does not run on; $null on windows, linux and macos.
+    param([AllowEmptyString()][string]$Platform)
+    if ($Platform -cin 'windows', 'linux', 'macos') { return $null }
+    ConvertTo-MuxAgentJsonText ([ordered]@{ ok = $false; verb = $null; code = 2; check = 'platform'; message = $script:MuxAgentPlatformMessage }) }
 
 function Get-MuxAgentPlatformMembers {
     # The OS members of $P (the contract): Windows today's code; linux and macos the B2/B3 bodies; anything else refuses 2 'platform'.
@@ -319,6 +317,18 @@ function New-MuxAgentProviders {
     $script:MuxAgentProviders = $providers
     $providers
 }
+
+function ConvertTo-MuxAgentFailure {
+    # A caught error as the failure reply: a typed refusal keeps its code, check and message; anything else is 1 internal.
+    param([Parameter(Mandatory)][Management.Automation.ErrorRecord]$ErrorRecord, $Verb)
+    $failure = [ordered]@{ ok = $false; verb = $Verb; code = 1; check = 'internal'; message = 'unexpected error (' + $ErrorRecord.Exception.GetBaseException().GetType().FullName + ')' }
+    for ($e = $ErrorRecord.Exception; $e; $e = $e.InnerException) { if ($e.Data.Contains('MuxAgentCode')) { $failure.code = [int]$e.Data['MuxAgentCode']; $failure.check = [string]$e.Data['MuxAgentCheck']; $failure.message = $e.Message; break } }
+    $failure }
+function Initialize-MuxAgentProviders {
+    # New-MuxAgentProviders for the entry and the launcher: a refusal while building comes back as Failure, never thrown.
+    param([Parameter(Mandatory)][string]$Entry)
+    $ErrorActionPreference = 'Stop'
+    try { [pscustomobject]@{ P = (New-MuxAgentProviders -Entry $Entry); Failure = $null } } catch { [pscustomobject]@{ P = $null; Failure = (ConvertTo-MuxAgentFailure $_) } } }
 
 function Invoke-MuxAgentNative {
     # The only rmux path: every call starts with -N (never start a server); a failure never echoes stderr.

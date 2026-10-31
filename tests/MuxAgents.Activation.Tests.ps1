@@ -103,3 +103,25 @@ Describe 'MuxAgents activation gone pane' {
             $ran = try { Update-MuxAgentNotices -P $fake -Caller $caller; 'ran' } catch { 'threw' }
             "$ran/$([IO.File]::Exists((Join-Path $folder 'notice.json')))" }
         ($answers -join ',') | Should BeExactly 'ran/True,ran/False,ran/False,ran/False,threw/False' } }
+Describe 'MuxAgents activation entry' {
+    It 'refuses every platform but windows, linux and macos with one platform line' {
+        $answers = foreach ($name in 'windows', 'linux', 'macos', 'freebsd', 'Windows', '') { "$(Get-MuxAgentEntryRefusal -Platform $name)" }
+        $line = '{"ok":false,"verb":null,"code":2,"check":"platform","message":"mux-agents 0.1.0 runs on Windows, Linux and macOS only"}'
+        ($answers -join ';') | Should BeExactly ";;;$line;$line;$line" }
+    It 'the entry asks the gate before it builds providers and tests no OS flag itself' {
+        $lines = [IO.File]::ReadAllLines((Join-Path $repoRoot 'scripts/mux-agent.ps1'))
+        $gate = [array]::IndexOf($lines, '$refusal = Get-MuxAgentEntryRefusal -Platform (Get-MuxAgentPlatform)')
+        $build = [array]::FindIndex($lines, [Predicate[string]] { param($l) $l.Contains('Initialize-MuxAgentProviders') })
+        "$($gate -ge 0) $($gate -lt $build) $(@($lines | Where-Object { $_ -match '\$Is(Windows|Linux|MacOS)' }).Count)" | Should BeExactly 'True True 0' } }
+Describe 'MuxAgents activation provider refusals' {
+    It 'the entry and the launcher print a state-root refusal as the one JSON reply, with its exit code' {
+        $pwsh = [Diagnostics.Process]::GetCurrentProcess().MainModule.FileName
+        $saved = @{ MUX_AGENTS_STATE = $env:MUX_AGENTS_STATE; LOCALAPPDATA = $env:LOCALAPPDATA }
+        # Unix: a relative MUX_AGENTS_STATE refuses 1 'state' (B3). Windows: no LOCALAPPDATA throws inside the factory.
+        if ($IsWindows) { $env:MUX_AGENTS_STATE = $null; $env:LOCALAPPDATA = $null; $want = '1 1 internal False 1' } else { $env:MUX_AGENTS_STATE = 'relative/state'; $want = '1 1 state False 1' }
+        try {
+            $answers = foreach ($pair in @(@('mux-agent.ps1', 'list'), @('mux-agent-launcher.ps1', 'x/spec.json'))) {
+                $lines = @(& $pwsh -NoProfile -File (Join-Path $repoRoot "scripts/$($pair[0])") $pair[1]); $reply = $lines[0] | ConvertFrom-Json
+                "$LASTEXITCODE $($reply.code) $($reply.check) $($reply.ok) $($lines.Count)" } }
+        finally { foreach ($k in $saved.Keys) { [Environment]::SetEnvironmentVariable($k, $saved[$k]) } }
+        ($answers -join ';') | Should BeExactly "$want;$want" } }

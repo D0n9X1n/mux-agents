@@ -3,7 +3,9 @@
 param([Parameter(Mandatory)][string]$Spec)
 . (Join-Path $PSScriptRoot 'MuxAgents.ps1')
 
-$P = New-MuxAgentProviders -Entry (Join-Path $PSScriptRoot 'mux-agent.ps1')
+$built = Initialize-MuxAgentProviders -Entry (Join-Path $PSScriptRoot 'mux-agent.ps1')
+if ($built.Failure) { [Console]::Out.WriteLine((Format-MuxAgentResult -Data $built.Failure)); exit $built.Failure.code }
+$P = $built.P
 # Only a spec.json inside an agent folder of the state root, with no junction or link on the way, is read.
 $full = [IO.Path]::GetFullPath($Spec)
 if (-not (Test-MuxAgentSpecPath -P $P -Full $full)) {

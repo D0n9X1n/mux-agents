@@ -6,12 +6,9 @@ $pwsh = [Diagnostics.Process]::GetCurrentProcess().MainModule.FileName
 Import-Module powershell-yaml -RequiredVersion 0.4.12
 
 Describe 'MuxAgents foundation rename' {
-    It 'entry with no verb answers usage on Windows and platform elsewhere, exit 2' {
+    It 'entry with no verb answers usage on every OS, exit 2' {
         $reply = & $pwsh -NoProfile -File ([IO.Path]::Combine($repoRoot, 'scripts', 'mux-agent.ps1')) | ConvertFrom-Json
-        # Windows names the command (singular); elsewhere the platform refusal names the product.
-        $expected, $pattern = if ($IsWindows) { '2 usage True', '^usage: mux-agent <' } else { '2 platform True', '^mux-agents ' }
-        "$LASTEXITCODE $($reply.check) $($reply.message -cmatch $pattern)" | Should BeExactly $expected
-    }
+        "$LASTEXITCODE $($reply.check) $($reply.message -cmatch '^usage: mux-agent <')" | Should BeExactly '2 usage True' }
     It 'state root reads MUX_AGENTS_STATE and ignores the old variable' {
         $old = 'R' + 'MUX_AGENTS_STATE'
         Get-MuxAgentStateRoot -Environment @{ $old = 'D:\old'; LOCALAPPDATA = 'C:\l' } | Should BeExactly ([IO.Path]::Combine('C:\l', 'mux-agents', 'state'))
