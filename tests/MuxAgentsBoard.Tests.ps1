@@ -1,4 +1,4 @@
-# Side-bar feed tests (C1). Untagged Describes are OS-neutral; -Tag 'windows' ones lose the tag once B makes the fakes OS-neutral.
+# Side-bar feed tests (C1). Untagged: every OS; the verb flows use the running platform's fake (-Native).
 $repoRoot = Split-Path -Parent $PSScriptRoot
 $helpers = Join-Path $PSScriptRoot 'MuxAgents.TestHelpers.ps1'
 . (Join-Path (Join-Path $repoRoot 'scripts') 'MuxAgents.ps1')
@@ -9,7 +9,7 @@ function Get-BoardReply { param($Fake, [string[]]$Arguments) $r = Invoke-BoardVe
 function New-BoardFake {
     # Fake providers under TestDrive\Name (same Name, same state); Pane is the caller's pane, Tag its @agent-id.
     param([string]$Name, [string]$Caller = 'human', [string]$Tag = '', [string]$Pane = '%1')
-    $fake = New-FakeMuxAgentProviders -Caller $Caller -Root (Join-Path $TestDrive $Name)
+    $fake = New-FakeMuxAgentProviders -Caller $Caller -Root (Join-Path $TestDrive $Name) -Native
     foreach ($variable in 'TMUX_PANE', 'RMUX_PANE') { $fake.Env[$variable] = $Pane }
     Add-FakeRmuxRule -Fake $fake -Match '#\{window_id\}\|#\{@agent-id\}$' -StdOut "900|100|`$3|@1|$Tag`n"
     Add-FakeRmuxRule -Fake $fake -Match '#\{session_id\}\|#\{@agent-id\}$' -StdOut "`$3|`n"
@@ -122,7 +122,7 @@ Describe 'MuxAgents board verb table' {
     It 'registers list -All' {
         # Catches: -All unregistered.
         (ConvertFrom-MuxAgentArgs -Arguments @('list', '-All')).Options['All'] | Should Be $true } }
-Describe 'MuxAgents board status verb' -Tag 'windows' {
+Describe 'MuxAgents board status verb' {
     It 'stores the cleaned first line, cut to 80, for a Claude and a Copilot agent' {
         # Catches: no C1 strip before storage (U+009B bytes C29B stored), no cut, a non-atomic or misplaced file, a Copilot caller refused.
         $results = foreach ($client in 'claude', 'copilot') {
@@ -168,7 +168,7 @@ Describe 'MuxAgents board status verb' -Tag 'windows' {
                 "$($run.Code) $($global:boardSeen -join ';') $((Read-MuxAgentJson -Path (Join-Path $folder 'status.json')).text)" | Should BeExactly '0 status.json held=True step' }
             finally { Remove-Variable -Name boardLock, boardSeen, boardWrite -Scope Global } } } }
 
-Describe 'MuxAgents board writers' -Tag 'windows' {
+Describe 'MuxAgents board writers' {
     It 'spawn stores the cleaned task line cut to 80' {
         # Catches: no taskLine, no C1 strip (U+009B kept in record.json), no cut, the whole task stored.
         $fake = New-BoardFake 'spawn'
@@ -218,7 +218,7 @@ Describe 'MuxAgents board writers' -Tag 'windows' {
                     Should BeExactly "0 1=agent|$server|aaaaaaaaaaaa;2=mail|$server|pane-1 | append in [1=agent|$server|aaaaaaaaaaaa];last-sent in [1=agent|$server|aaaaaaaaaaaa] | ok" }
             finally { Remove-Variable -Name boardHolds, boardOpen, boardEvents, boardLock, boardMail, boardWrite -Scope Global } } } }
 
-Describe 'MuxAgents board list' -Tag 'windows' {
+Describe 'MuxAgents board list' {
     # Pester 4 keeps a Mock until its Describe or Context ends: the no-op writer below lives only in this Context, so the
     # later tests in this Describe write state for real.
     Context 'list without state writes' {
@@ -304,7 +304,7 @@ Describe 'MuxAgents board list' -Tag 'windows' {
                 "$($global:boardSeen -join ';') $($row.unread)" | Should BeExactly 'pane-1.jsonl held=True 1' }
             finally { Remove-Variable -Name boardLock, boardSeen, boardUnread -Scope Global } } } }
 
-Describe 'MuxAgents board ended' -Tag 'windows' {
+Describe 'MuxAgents board ended' {
     It '-All adds exited, stopped and lost agents of this session, newest notice first; plain list omits them' {
         # Catches: order by id or folder (ids b, c, d here sort unlike their notice times), another session listed, exitCode exposed, ended rows in plain list.
         $fake = New-BoardFake 'ended'; $null = New-BoardAgent $fake

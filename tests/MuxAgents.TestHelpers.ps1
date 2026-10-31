@@ -21,13 +21,16 @@ function Write-FakeMuxAgentFile {
 }
 
 function New-FakeMuxAgentProviders {
-    param([ValidateSet('human', 'claude', 'copilot')][string]$Caller = 'human', [string]$Root = $TestDrive)
+    # -Native: the running platform's members, paths and endpoint (Unix: TMUX socket, basenames, Unix state folders and
+    # lock names); on Windows it is the default fake. Without it the fake is the Windows one on every OS.
+    param([ValidateSet('human', 'claude', 'copilot')][string]$Caller = 'human', [string]$Root = $TestDrive, [switch]$Native)
     $homeDirectory = Join-Path $Root 'fake home'
     $work = Join-Path $Root 'fake work'
     foreach ($directory in @($homeDirectory, $work)) { $null = [IO.Directory]::CreateDirectory($directory) }
-    $pwsh = Join-Path $PSHOME 'pwsh.exe'
+    $unix = $Native -and -not $IsWindows
+    $pwsh = if ($unix) { [IO.Path]::Combine($PSHOME, 'pwsh') } else { Join-Path $PSHOME 'pwsh.exe' }
     $environment = [hashtable]::new([StringComparer]::OrdinalIgnoreCase)
-    foreach ($name in @('RMUX', 'TMUX')) { $environment[$name] = '\\.\pipe\rmux-test,900,0' }
+    if ($unix) { $environment['TMUX'] = '/tmp/tmux-test/default,900,0' } else { foreach ($name in @('RMUX', 'TMUX')) { $environment[$name] = '\\.\pipe\rmux-test,900,0' } }
     foreach ($name in @('RMUX_PANE', 'TMUX_PANE')) { $environment[$name] = '%1' }
 
     $rows = [Collections.Generic.List[object]]::new()
@@ -48,6 +51,8 @@ function New-FakeMuxAgentProviders {
         $callerParent = 170
     }
     $rows.Add((New-FakeMuxAgentRow 200 $callerParent $pwsh ('"' + $pwsh + '" -NoProfile -File mux-agent.ps1')))
+    # Unix rows carry the image basename without .exe under /x (tmux, pwsh, bash, claude, copilot).
+    if ($unix) { foreach ($row in $rows) { $row.Path = '/x/' + [IO.Path]::GetFileNameWithoutExtension(([string]$row.Path).Replace('\', '/')) } }
 
     # The Claude mode row is the last non-blank screen row, under the statusline rows.
     $screen = @('> build the dispatcher', '', 'Done.', '', ('-' * 40), '> ', ('-' * 40), '   Time 12:00:00 | Run 2m',
@@ -93,21 +98,28 @@ function New-FakeMuxAgentProviders {
         [pscustomobject]@{ ExitCode = 0; StdOut = ''; StdErr = '' }
     }.GetNewClosure()
     # The production OS members the fake does not replace; a test swaps one for a spy by assigning it.
-    $os = Get-MuxAgentPlatformMembers -Platform windows
+    $os = Get-MuxAgentPlatformMembers -Platform $(if ($unix) { Get-MuxAgentPlatform } else { 'windows' })
     foreach ($key in $os.Keys) { if (-not $fake.PSObject.Properties[$key]) { Add-Member -InputObject $fake -NotePropertyName $key -NotePropertyValue $os[$key] } }
-    Add-FakeMuxAgentFixtures -Fake $fake -Caller $Caller -Work $work
+    if ($unix) {
+        # B3's walk needs the canonical root; locks use the platform name, as New-MuxAgentProviders installs it.
+        $fake.StateRoot = Resolve-MuxAgentUnixRealPath -Path $fake.StateRoot
+        $private = ${function:New-MuxAgentUnixPrivateDirectories}
+        $fake.PrivateDirectories = { param([string[]]$Paths) & $private -Root $fake.StateRoot -Paths $Paths }.GetNewClosure()
+        $script:MuxAgentLockName = $os.LockName
+    }
+    Add-FakeMuxAgentFixtures -Fake $fake -Caller $Caller -Work $work -Unix:$unix
     $fake
 }
 
 function Add-FakeMuxAgentFixtures {
     # The calling client's session files, ending in complete records; tests that need partial
     # or invalid lines append them to the paths in $Fake.Fixtures.
-    param([Parameter(Mandatory)]$Fake, [string]$Caller, [string]$Work)
+    param([Parameter(Mandatory)]$Fake, [string]$Caller, [string]$Work, [switch]$Unix)
     if ($Caller -eq 'claude') {
         $session = '11111111-2222-4333-8444-555555555555'
         foreach ($pair in @(@('CLAUDECODE', '1'), @('CLAUDE_CODE_ENTRYPOINT', 'cli'), @('CLAUDE_CODE_SESSION_ID', $session), @('CLAUDE_PID', '150'))) { $Fake.Env[$pair[0]] = $pair[1] }
-        $Fake.Fixtures.ClaudeTranscript = Join-Path $Fake.Home ".claude\projects\fake-work\$session.jsonl"
-        $Fake.Fixtures.ClaudeSession = Join-Path $Fake.Home '.claude\sessions\150.json'
+        $Fake.Fixtures.ClaudeTranscript = if ($Unix) { [IO.Path]::Combine($Fake.Home, '.claude', 'projects', 'fake-work', "$session.jsonl") } else { Join-Path $Fake.Home ".claude\projects\fake-work\$session.jsonl" }
+        $Fake.Fixtures.ClaudeSession = if ($Unix) { [IO.Path]::Combine($Fake.Home, '.claude', 'sessions', '150.json') } else { Join-Path $Fake.Home '.claude\sessions\150.json' }
         Write-FakeMuxAgentFile $Fake.Fixtures.ClaudeTranscript @(
             (ConvertTo-Json -Compress -Depth 5 ([ordered]@{ type = 'permission-mode'; permissionMode = 'bypassPermissions'; sessionId = $session })),
             (ConvertTo-Json -Compress -Depth 5 ([ordered]@{ type = 'user'; sessionId = $session; message = [ordered]@{ role = 'user'; content = 'build the dispatcher' } })))
@@ -116,7 +128,7 @@ function Add-FakeMuxAgentFixtures {
     if ($Caller -eq 'copilot') {
         $session = '66666666-7777-4888-9999-aaaaaaaaaaaa'
         foreach ($pair in @(@('COPILOT_CLI', '1'), @('COPILOT_AGENT_SESSION_ID', $session))) { $Fake.Env[$pair[0]] = $pair[1] }
-        $folder = Join-Path $Fake.Home ".copilot\session-state\$session"
+        $folder = if ($Unix) { [IO.Path]::Combine($Fake.Home, '.copilot', 'session-state', $session) } else { Join-Path $Fake.Home ".copilot\session-state\$session" }
         $Fake.Fixtures.CopilotWorkspace = Join-Path $folder 'workspace.yaml'
         $Fake.Fixtures.CopilotEvents = Join-Path $folder 'events.jsonl'
         $ids = @('e0000000-0000-4000-8000-000000000001', 'e0000000-0000-4000-8000-000000000002', 'e0000000-0000-4000-8000-000000000003')
