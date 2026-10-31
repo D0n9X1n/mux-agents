@@ -26,6 +26,12 @@ jobs:
       - name: Manifests parse as JSON
         shell: pwsh
         run: foreach ($file in '.claude-plugin/plugin.json', '.claude-plugin/marketplace.json') { $null = Get-Content -Raw $file | ConvertFrom-Json }
+      - name: Install Claude Code 2.1.310
+        run: npm install --global @anthropic-ai/claude-code@2.1.310
+      - name: claude plugin validate
+        run: claude plugin validate .
+      - name: claude plugin test
+        run: claude plugin test .
   test:
     strategy:
       fail-fast: false
