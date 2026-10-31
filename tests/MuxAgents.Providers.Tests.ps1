@@ -165,3 +165,24 @@ Describe 'MuxAgents providers argv and claude directory' {
         Get-ProvidersRefusal { Get-MuxAgentLaunchDirectory -P $fake -Caller $caller } | Should BeExactly "2 directory the caller's launch directory cannot be confirmed"
     }
 }
+Describe 'MuxAgents providers client identity' {
+    It 'windows ClientOf names claude or copilot by image name, any case' {
+        $clientOf = (Get-MuxAgentPlatformMembers -Platform windows).ClientOf
+        (@(foreach ($path in '/u/claude.exe', '/x/Copilot.EXE', '/x/claude', '/x/claude.exe.bak', '/x/node.exe', $null) { "$(& $clientOf ([pscustomobject]@{ Path = $path }))" }) -join ',') | Should BeExactly 'claude,copilot,,,,'
+    }
+    It 'a claude.exe row that ClientOf rejects is no client for the caller' {
+        $fake = New-ProvidersAgentFake
+        $fake.ClientOf = { param($Row) $null }; $fake.IsShell = { param($Row) $true }
+        $caller = Resolve-MuxAgentCaller -P $fake
+        "$($caller.Kind)|$($caller.Client)|$($null -eq $caller.Agent)" | Should BeExactly 'human||True'
+    }
+    It 'the agent, its client and the spawn flags check follow ClientOf, not the image name' {
+        $fake = New-ProvidersAgentFake
+        foreach ($row in $fake.Rows) { if ($row.Pid -eq 150) { $row.Path = '/x/agent-bin' } elseif ($row.Pid -eq 100) { $row.Path = '/x/copilot.exe' } }
+        $fake.ClientOf = { param($Row) if ($Row.Pid -eq 150) { 'claude' } }
+        $fake.Argv = { param($Row) if ($Row.Pid -eq 150) { @('claude', '--model') } else { @('x', "--argv-of-$($Row.Pid)") } }
+        $caller = Resolve-MuxAgentCaller -P $fake
+        "$($caller.Kind)|$($caller.Client)|$($caller.Agent.Pid)" | Should BeExactly 'agent|claude|150'
+        Get-ProvidersRefusal { Assert-MuxAgentSpawnAllowed -P $fake -Caller $caller } | Should BeExactly "2 policy the caller's live policy is not full bypass"
+    }
+}

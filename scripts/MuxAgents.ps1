@@ -338,11 +338,11 @@ function Resolve-MuxAgentCaller {
         $row = if ($parent.Start -le $row.Start) { $parent }
     }
     if ($row.Pid -ne $panePid) { Exit-MuxAgentCommand 1 'caller' 'caller is not below its rmux pane' }
-    # The nearest claude.exe or copilot.exe above the caller, by path, is the agent; only shells may run in between
+    # The nearest row that $P.ClientOf names above the caller is the agent; only shells may run in between
     # (for a human, up to and including the pane).
     $agentIndex = 0
     for ($index = 1; $index -lt $chain.Count; $index++) {
-        if ([IO.Path]::GetFileName($chain[$index].Path) -in @('claude.exe', 'copilot.exe')) { $agentIndex = $index; break }
+        if (& $P.ClientOf $chain[$index]) { $agentIndex = $index; break }
     }
     $last = if ($agentIndex) { $agentIndex - 1 } else { $chain.Count - 1 }
     for ($index = 1; $index -le $last; $index++) {
@@ -358,7 +358,7 @@ function Resolve-MuxAgentCaller {
     }
     [pscustomobject]@{
         Kind = if ($agent) { 'agent' } else { 'human' }
-        Client = if ($agent) { [IO.Path]::GetFileNameWithoutExtension($agent.Path).ToLowerInvariant() }
+        Client = if ($agent) { & $P.ClientOf $chain[$agentIndex] }
         Agent = $agent; Chain = $chain.ToArray(); Pane = $pane; Window = $window; Session = $session
         ServerPid = [int]$serverPid; ServerStart = $server.Start; Socket = $socket; ServerKey = $serverKey; AgentTag = $tag
     }
@@ -940,7 +940,7 @@ function Assert-MuxAgentSpawnAllowed {
     $agentArgv = @()
     for ($index = $agentIndex; $index -ge 0 -and $index -lt $Caller.Chain.Count; $index++) {
         $row = $Caller.Chain[$index]
-        if ([IO.Path]::GetFileName($row.Path) -notin @('claude.exe', 'copilot.exe')) { continue }
+        if (-not (& $P.ClientOf $row)) { continue }
         $argv = try { @(& $P.Argv $row) } catch { Exit-MuxAgentCommand 2 'flags' 'a client command line cannot be read' }
         if ($index -eq $agentIndex) { $agentArgv = $argv }
         foreach ($argument in @($argv | Select-Object -Skip 1)) {
