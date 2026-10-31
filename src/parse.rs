@@ -76,6 +76,8 @@ const VNODE_CWD_AT: usize = 152;
 const MAXPATHLEN: usize = 1024;
 
 /// The cwd from proc_vnodepathinfo; a short read, an empty or unterminated path, or one that is not UTF-8 is none.
+/// Non-UTF-8 is refused deliberately (fail closed): a lossily decoded path cannot name a real directory, and the
+/// directory check would refuse it either way.
 pub fn vnode_cwd(info: &[u8], returned: i32) -> Option<String> {
     if returned != VNODE_INFO_SIZE as i32 || info.len() < VNODE_INFO_SIZE {
         return None;
@@ -97,7 +99,8 @@ pub fn poll_shows_exit(count: i32, revents: i16) -> bool {
 }
 
 /// CommandLineToArgvW's split, ported from Wine's (verified against Windows by its conformance tests). An empty
-/// line gives none: Windows would answer the caller's own path, which no process row means.
+/// line gives none, deliberately (fail closed): every real process has an argv[0], and Windows would answer the
+/// caller's own path, which is wrong data for another process.
 pub fn windows_argv(line: &str) -> Vec<String> {
     let s: Vec<char> = line.chars().collect();
     let blank = |c: char| c == ' ' || c == '\t';
@@ -485,6 +488,7 @@ mod tests {
         let mut long = vec![0u8; VNODE_INFO_SIZE];
         long[152..152 + 1024].fill(b'a');
         assert_eq!(vnode_cwd(&long, 2352), None);
+        // Kept by choice: not UTF-8 is none, not a lossy path with U+FFFD in it (fail closed).
         let mut bad = vec![0u8; VNODE_INFO_SIZE];
         bad[152..155].copy_from_slice(b"/\xff/");
         assert_eq!(vnode_cwd(&bad, 2352), None);
@@ -648,7 +652,9 @@ mod tests {
         for (line, want) in table {
             assert_eq!(windows_argv(line), strings(want), "{line:?}");
         }
-        // Windows answers an empty line with the caller's own path; no row's argv comes from that.
+        // Kept by choice: an empty line is no argv at all, read as unreadable (fail closed). A real process always
+        // has an argv[0], and CommandLineToArgvW would answer the CALLER's own exe path, which is wrong data for
+        // another process.
         assert_eq!(windows_argv(""), Vec::<String>::new());
     }
 
@@ -792,6 +798,55 @@ mod tests {
     }
 
     #[test]
+    fn node_option_allowlists_are_the_reference_lists() {
+        // Unix.ps1:31, verbatim: these and no others are passed over.
+        let assignments = [
+            "max-old-space-size",
+            "max-semi-space-size",
+            "stack-size",
+            "require",
+            "import",
+            "loader",
+            "experimental-loader",
+            "conditions",
+            "title",
+            "unhandled-rejections",
+        ];
+        let flags = [
+            "--no-warnings",
+            "--no-deprecation",
+            "--enable-source-maps",
+            "--trace-warnings",
+            "--preserve-symlinks",
+            "--preserve-symlinks-main",
+            "--expose-gc",
+        ];
+        assert_eq!(NODE_ALLOWED_ASSIGNMENTS, assignments);
+        assert_eq!(NODE_ALLOWED_FLAGS, flags);
+        let loader = "/l/@github/copilot/npm-loader.js";
+        let script =
+            |option: &str| node_script(&strings(&["node", option, loader])).map(str::to_string);
+        for name in assignments {
+            let option = format!("--{name}=1");
+            assert_eq!(script(&option).as_deref(), Some(loader), "{option}");
+            // Only as --name=value; alone it may take the next argument.
+            assert_eq!(script(&format!("--{name}")), None, "--{name}");
+        }
+        for flag in flags {
+            assert_eq!(script(flag).as_deref(), Some(loader), "{flag}");
+            assert_eq!(script(&format!("{flag}=1")), None, "{flag}=1");
+        }
+        for unlisted in [
+            "--unrequested=1",
+            "--unrequested-flag",
+            "--Title=x",
+            "--no-warning",
+        ] {
+            assert_eq!(script(unlisted), None, "{unlisted}");
+        }
+    }
+
+    #[test]
     fn unix_client_by_path() {
         // Unix.Tests.ps1:44-74: realpath follows these links, else answers the path; pid 401's cwd is /p, 402's /q.
         let loader = "/usr/local/lib/node_modules/@github/copilot/npm-loader.js";
@@ -799,6 +854,8 @@ mod tests {
             "/broken" => None,
             "/usr/local/bin/copilot" | "bin/copilot" => Some(loader.to_string()),
             "/p/bin/copilot" => Some("/p/node_modules/@github/copilot/npm-loader.js".to_string()),
+            // Spelled as the loader, a link to an ordinary app: the canonical path decides.
+            "/x/@github/copilot/npm-loader.js" => Some("/srv/app.js".to_string()),
             other => Some(other.to_string()),
         };
         let client = |path: Option<&str>, argv: &[&str], cwd: Option<&str>| {
@@ -866,8 +923,9 @@ mod tests {
             client(node, &["node", "bin/copilot"], None),
             client(node, &["node", "bin/copilot"], Some("relative")),
             client(node, &["node", ""], Some("/p")),
+            client(node, &["node", "/x/@github/copilot/npm-loader.js"], None),
         ];
-        assert_eq!(none, [None; 20]);
+        assert_eq!(none, [None; 21]);
         // An unreadable argv is no node client; the cwd is read only for a relative script.
         assert_eq!(unix_client(node, None, || None, realpath), None);
         let read = std::cell::Cell::new(false);

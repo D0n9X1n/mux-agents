@@ -23,8 +23,8 @@ const FIRST_STEP: Duration = Duration::from_millis(1);
 const MAX_STEP: Duration = Duration::from_millis(50);
 
 /// One bounded call (MuxAgents.ps1:262-288): stdin closed, output read to the end, working directory home. The
-/// call is done once the process exited and both pipes closed; past `timeout` its process group (Unix) or the
-/// process (Windows) is killed and the call fails with `TimedOut`.
+/// call is done once the process exited and both pipes closed; past `timeout` its tree is killed, as the reference's
+/// Kill($true) did (its process group on Unix, its job object on Windows), and the call fails with `TimedOut`.
 pub fn captured(path: &Path, args: &[&str], timeout: Duration) -> io::Result<Out> {
     audit(path)?;
     let mut command = Command::new(path);
@@ -38,8 +38,9 @@ pub fn captured(path: &Path, args: &[&str], timeout: Duration) -> io::Result<Out
     }
     own_group(&mut command);
     let mut child = command.spawn()?;
+    let tree = Tree::new(&mut child);
     let deadline = Instant::now() + timeout;
-    let [stdout, stderr] = collect(&mut child, deadline)?;
+    let [stdout, stderr] = collect(&mut child, &tree, deadline)?;
     let code = exit_code(child.wait()?);
     Ok(Out {
         code,
@@ -56,7 +57,7 @@ fn timed_out() -> io::Error {
 /// both pipes, so a full stderr never stalls a child still writing stdout, and nothing outlives the call: on a
 /// timeout the pipes close here even when a process outside the group still holds their other ends.
 #[cfg(unix)]
-fn collect(child: &mut Child, deadline: Instant) -> io::Result<[Vec<u8>; 2]> {
+fn collect(child: &mut Child, tree: &Tree, deadline: Instant) -> io::Result<[Vec<u8>; 2]> {
     use std::os::fd::{AsRawFd, OwnedFd};
     let pipes = [
         child.stdout.take().map(OwnedFd::from),
@@ -72,7 +73,7 @@ fn collect(child: &mut Child, deadline: Instant) -> io::Result<[Vec<u8>; 2]> {
             done = match exited(child) {
                 Ok(done) => done,
                 Err(error) => {
-                    kill_tree(child);
+                    kill_tree(child, tree);
                     return Err(error);
                 }
             };
@@ -82,7 +83,7 @@ fn collect(child: &mut Child, deadline: Instant) -> io::Result<[Vec<u8>; 2]> {
         }
         let now = Instant::now();
         if now >= deadline {
-            kill_tree(child);
+            kill_tree(child, tree);
             return Err(timed_out());
         }
         // The exit cannot be polled, so the wait is short and grows; output wakes it at once.
@@ -111,7 +112,7 @@ fn collect(child: &mut Child, deadline: Instant) -> io::Result<[Vec<u8>; 2]> {
             if error.kind() == io::ErrorKind::Interrupted {
                 continue;
             }
-            kill_tree(child);
+            kill_tree(child, tree);
             return Err(error);
         }
         if ready == 0 {
@@ -131,7 +132,7 @@ fn collect(child: &mut Child, deadline: Instant) -> io::Result<[Vec<u8>; 2]> {
                 Ok(n) => outputs[index].extend_from_slice(&buf[..n]),
                 Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
                 Err(error) => {
-                    kill_tree(child);
+                    kill_tree(child, tree);
                     return Err(error);
                 }
             }
@@ -143,7 +144,7 @@ fn collect(child: &mut Child, deadline: Instant) -> io::Result<[Vec<u8>; 2]> {
 /// handle stays open until the thread is joined; on a timeout CancelIoEx aborts the pending read (std reads child
 /// pipes with ReadFileEx and an alertable wait), so no thread or handle outlives the call.
 #[cfg(windows)]
-fn collect(child: &mut Child, deadline: Instant) -> io::Result<[Vec<u8>; 2]> {
+fn collect(child: &mut Child, tree: &Tree, deadline: Instant) -> io::Result<[Vec<u8>; 2]> {
     use std::os::windows::io::AsRawHandle;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -188,7 +189,7 @@ fn collect(child: &mut Child, deadline: Instant) -> io::Result<[Vec<u8>; 2]> {
             done = match exited(child) {
                 Ok(done) => done,
                 Err(error) => {
-                    kill_tree(child);
+                    kill_tree(child, tree);
                     break Err(error);
                 }
             };
@@ -198,7 +199,7 @@ fn collect(child: &mut Child, deadline: Instant) -> io::Result<[Vec<u8>; 2]> {
         }
         let now = Instant::now();
         if now >= deadline {
-            kill_tree(child);
+            kill_tree(child, tree);
             break Err(timed_out());
         }
         let wait = step.min(deadline - now);
@@ -260,6 +261,57 @@ pub fn attached(path: &Path, args: &[String], remove: &[&str]) -> io::Result<i32
     Ok(exit_code(command.status()?))
 }
 
+/// What a timeout kills: on Unix the child's own process group, which needs nothing held.
+#[cfg(unix)]
+struct Tree;
+
+#[cfg(unix)]
+impl Tree {
+    fn new(_: &mut Child) -> Tree {
+        Tree
+    }
+}
+
+/// On Windows a job object holding the child, assigned right after the spawn; what the child starts joins it. A
+/// child that exits or already sits in a job that refuses nesting before the assignment leaves none, and a timeout
+/// then kills only the child. Kill-on-close, so nothing in the job outlives the call's handle to it.
+#[cfg(windows)]
+struct Tree(Option<std::os::windows::io::OwnedHandle>);
+
+#[cfg(windows)]
+impl Tree {
+    fn new(child: &mut Child) -> Tree {
+        use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+        use windows_sys::Win32::System::JobObjects::{
+            AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+            JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
+            SetInformationJobObject,
+        };
+        // SAFETY: an anonymous job with default security; null on failure.
+        let raw = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
+        if raw.is_null() {
+            return Tree(None);
+        }
+        // SAFETY: a fresh job handle nothing else owns.
+        let job = unsafe { OwnedHandle::from_raw_handle(raw) };
+        let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+        limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        // SAFETY: one JOBOBJECT_EXTENDED_LIMIT_INFORMATION of the size passed.
+        let limited = unsafe {
+            SetInformationJobObject(
+                job.as_raw_handle(),
+                JobObjectExtendedLimitInformation,
+                (&raw const limits).cast(),
+                size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+            )
+        } != 0;
+        // SAFETY: a live job and the child's live process handle.
+        let assigned = limited
+            && unsafe { AssignProcessToJobObject(job.as_raw_handle(), child.as_raw_handle()) } != 0;
+        Tree(assigned.then_some(job))
+    }
+}
+
 #[cfg(unix)]
 fn own_group(command: &mut Command) {
     use std::os::unix::process::CommandExt;
@@ -304,15 +356,22 @@ fn exited(child: &mut Child) -> io::Result<bool> {
 }
 
 #[cfg(unix)]
-fn kill_tree(child: &mut Child) {
+fn kill_tree(child: &mut Child, _: &Tree) {
     // SAFETY: the group is the unreaped child's own, so its id cannot name anyone else's group yet.
     unsafe { libc::killpg(child.id() as libc::pid_t, libc::SIGKILL) };
     let _ = child.wait();
 }
 
-// Only the child: its descendants would need a job object assigned before it runs.
+// The job and all it holds; the child also directly, in case it never joined the job.
 #[cfg(windows)]
-fn kill_tree(child: &mut Child) {
+fn kill_tree(child: &mut Child, tree: &Tree) {
+    use std::os::windows::io::AsRawHandle;
+    if let Some(job) = &tree.0 {
+        // SAFETY: a live job handle; 1 is the exit code its processes leave with.
+        unsafe {
+            windows_sys::Win32::System::JobObjects::TerminateJobObject(job.as_raw_handle(), 1)
+        };
+    }
     let _ = child.kill();
     let _ = child.wait();
 }
@@ -350,80 +409,312 @@ fn audit_to(dir: &Path, path: &Path) -> io::Result<()> {
     log.write_all(format!("{}\n", path.display()).as_bytes())
 }
 
-#[cfg(all(test, unix))]
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::testing::TempDir;
-    use std::time::Instant;
+    use std::path::PathBuf;
+    use std::process::Command as Std;
 
-    const SH: &str = "/bin/sh";
+    // Every probe runs the test binary on one ignored test of its own, which acts only when it finds this marker
+    // among its arguments, so a bare `--ignored` run passes over them.
+    const PROBE: &str = "mux-spawn-probe";
 
-    fn sh(script: &str, timeout: Duration) -> io::Result<Out> {
-        captured(Path::new(SH), &["-c", script], timeout)
+    fn probing() -> bool {
+        std::env::args().any(|a| a == PROBE)
+    }
+
+    // The argument after the marker, when the caller passed one.
+    fn probe_arg() -> PathBuf {
+        let args: Vec<String> = std::env::args().collect();
+        let at = args.iter().position(|a| a == PROBE).unwrap();
+        PathBuf::from(&args[at + 1])
+    }
+
+    fn me() -> PathBuf {
+        std::env::current_exe().unwrap()
+    }
+
+    fn probe_args(test: &str, extra: &[&str]) -> Vec<String> {
+        let mut args: Vec<String> = [
+            &format!("spawn::tests::{test}"),
+            "--exact",
+            "--ignored",
+            "--nocapture",
+            "--test-threads=1",
+            PROBE,
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        args.extend(extra.iter().map(|s| s.to_string()));
+        args
+    }
+
+    // `captured` on one probe of this binary.
+    fn probe(test: &str, extra: &[&str], timeout: Duration) -> io::Result<Out> {
+        let args = probe_args(test, extra);
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
+        captured(&me(), &args, timeout)
     }
 
     #[test]
-    fn captured_closes_stdin_and_reads_utf8() {
-        // `cat` returns at once only when stdin is closed; the output keeps non-ASCII text and both streams.
-        let out = sh(
-            "cat; printf 'h\\303\\251llo \\344\\270\\255'; printf 'err\\377' >&2; exit 3",
-            Duration::from_secs(5),
-        )
-        .unwrap();
-        assert_eq!(out.code, 3);
-        assert_eq!(out.stdout, "héllo 中");
-        assert_eq!(out.stderr, "err\u{fffd}");
+    #[ignore = "a probe the spawn tests start"]
+    fn probe_report() {
+        if !probing() {
+            return;
+        }
+        let mut input = Vec::new();
+        let read = io::stdin().read_to_end(&mut input);
+        let cwd = std::fs::canonicalize(std::env::current_dir().unwrap()).unwrap();
+        // From a fresh line: libtest's "test ... " prefix precedes it.
+        let report = format!(
+            "\nSTDIN {:?} {:?}\nGONE {:?}\nKEPT {:?}\nCWD {:?}\nTEXT h\u{e9}llo \u{4e2d}\n",
+            read.is_ok(),
+            String::from_utf8_lossy(&input),
+            std::env::var_os("MUX_SPAWN_GONE"),
+            std::env::var_os("MUX_SPAWN_KEPT"),
+            cwd,
+        );
+        io::stdout().write_all(report.as_bytes()).unwrap();
+        io::stdout().flush().unwrap();
+        io::stderr().write_all(b"ERR\xff\n").unwrap();
+        io::stderr().flush().unwrap();
+        std::process::exit(7);
+    }
+
+    #[test]
+    #[ignore = "a probe the spawn tests start"]
+    fn probe_drain() {
+        if !probing() {
+            return;
+        }
+        // 1 MiB to each stream, stderr first: far past a pipe's buffer.
+        io::stderr().write_all(&[b'E'; 1 << 20]).unwrap();
+        io::stdout().write_all(&[b'O'; 1 << 20]).unwrap();
+        io::stdout().flush().unwrap();
+    }
+
+    #[test]
+    #[ignore = "a probe the spawn tests start"]
+    fn probe_tree() {
+        if !probing() {
+            return;
+        }
+        // A descendant with stdio of its own, so only a tree kill reaches it; its pid goes to the given folder.
+        let dir = probe_arg();
+        let mut child = Std::new(me())
+            .args(probe_args("probe_sleep", &[]))
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let temp = dir.join("pid.tmp");
+        std::fs::write(&temp, child.id().to_string()).unwrap();
+        std::fs::rename(&temp, dir.join("pid")).unwrap();
+        // Its 30 s sleep holds this probe too, until the tree is killed.
+        child.wait().unwrap();
+    }
+
+    #[test]
+    #[ignore = "a probe the spawn tests start"]
+    fn probe_sleep() {
+        if probing() {
+            std::thread::sleep(Duration::from_secs(30));
+        }
+    }
+
+    #[cfg(unix)]
+    fn alive(pid: u32) -> bool {
+        // SAFETY: kill with signal 0 only probes the pid.
+        unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
+    }
+
+    #[cfg(windows)]
+    fn alive(pid: u32) -> bool {
+        use windows_sys::Win32::Foundation::{CloseHandle, WAIT_TIMEOUT};
+        use windows_sys::Win32::System::Threading::{
+            OpenProcess, PROCESS_SYNCHRONIZE, WaitForSingleObject,
+        };
+        // SAFETY: plain open; null when the process is gone.
+        let handle = unsafe { OpenProcess(PROCESS_SYNCHRONIZE, 0, pid) };
+        if handle.is_null() {
+            return false;
+        }
+        // SAFETY: a live handle, closed once below.
+        let running = unsafe { WaitForSingleObject(handle, 0) } == WAIT_TIMEOUT;
+        // SAFETY: the handle opened above.
+        unsafe { CloseHandle(handle) };
+        running
+    }
+
+    #[test]
+    fn captured_reports_utf8_code_cwd_and_closed_stdin() {
+        let out = probe("probe_report", &[], Duration::from_secs(10)).unwrap();
+        assert_eq!(out.code, 7, "{out:?}");
+        assert!(out.stdout.contains("STDIN true \"\"\n"), "{}", out.stdout);
+        assert!(out.stdout.contains("TEXT héllo 中\n"), "{}", out.stdout);
+        // Invalid bytes are replaced.
+        assert!(out.stderr.contains("ERR\u{fffd}\n"), "{}", out.stderr);
+        let home = std::fs::canonicalize(std::env::home_dir().unwrap()).unwrap();
+        assert!(
+            out.stdout.contains(&format!("CWD {home:?}\n")),
+            "{}",
+            out.stdout
+        );
     }
 
     #[test]
     fn captured_drains_both_pipes_past_their_buffers() {
-        // 1 MiB to each stream, stderr first: far past a pipe's buffer, so it ends only if both are read as they fill.
-        let script =
-            "head -c 1048576 /dev/zero | tr '\\0' e >&2; head -c 1048576 /dev/zero | tr '\\0' o";
-        let out = sh(script, Duration::from_secs(10)).unwrap();
+        let out = probe("probe_drain", &[], Duration::from_secs(10)).unwrap();
         assert_eq!(out.code, 0);
-        assert_eq!((out.stdout.len(), out.stderr.len()), (1 << 20, 1 << 20));
-        assert!(out.stdout.bytes().all(|b| b == b'o'));
-        assert!(out.stderr.bytes().all(|b| b == b'e'));
+        assert_eq!(out.stdout.matches('O').count(), 1 << 20);
+        assert_eq!(out.stderr.matches('E').count(), 1 << 20);
     }
 
     #[test]
-    fn captured_runs_in_home() {
-        let out = sh("pwd -P", Duration::from_secs(5)).unwrap();
-        let home = std::fs::canonicalize(std::env::home_dir().unwrap()).unwrap();
-        assert_eq!(out.stdout.trim_end(), home.to_str().unwrap());
+    fn captured_stdin_is_closed_even_when_ours_stays_open() {
+        // In a process whose stdin is a pipe held open with data in it: a child that inherited it would read the
+        // data and then wait for more, so the call would time out.
+        let mut child = Std::new(me())
+            .args([
+                "spawn::tests::stdin_held_child",
+                "--exact",
+                "--ignored",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut stdin = child.stdin.take().unwrap();
+        stdin.write_all(b"OPEN\n").unwrap();
+        stdin.flush().unwrap();
+        let mut stdout = String::new();
+        child
+            .stdout
+            .take()
+            .unwrap()
+            .read_to_string(&mut stdout)
+            .unwrap();
+        let mut stderr = String::new();
+        child
+            .stderr
+            .take()
+            .unwrap()
+            .read_to_string(&mut stderr)
+            .unwrap();
+        child.wait().unwrap();
+        drop(stdin);
+        assert!(
+            stdout.contains("HELD STDIN true \"\""),
+            "{stdout}\n{stderr}"
+        );
     }
 
     #[test]
-    fn captured_timeout_kills_and_errs() {
-        // The grandchild proves the whole group is killed, not just the direct child.
+    #[ignore = "a child of captured_stdin_is_closed_even_when_ours_stays_open"]
+    fn stdin_held_child() {
+        match probe("probe_report", &[], Duration::from_secs(5)) {
+            Ok(out) => {
+                let line = out.stdout.lines().find(|l| l.starts_with("STDIN"));
+                println!("HELD {}", line.unwrap_or("none"));
+            }
+            Err(error) => println!("HELD error {error}"),
+        }
+    }
+
+    #[test]
+    fn captured_timeout_kills_the_tree_and_errs() {
+        // The descendant proves the whole tree is killed (MuxAgents.ps1:283, Kill($true)), not just the child.
         let dir = TempDir::new();
-        let file = dir.path().join("grandchild");
-        let script = format!("sleep 30 & echo $! > '{}'; wait", file.display());
         let started = Instant::now();
-        let error = sh(&script, Duration::from_millis(300)).unwrap_err();
+        let error = probe(
+            "probe_tree",
+            &[dir.path().to_str().unwrap()],
+            Duration::from_millis(1500),
+        )
+        .unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::TimedOut);
         assert!(
-            started.elapsed() < Duration::from_secs(3),
+            started.elapsed() < Duration::from_secs(6),
             "{:?}",
             started.elapsed()
         );
-        let pid: i32 = std::fs::read_to_string(&file)
-            .unwrap()
+        let pid: u32 = std::fs::read_to_string(dir.path().join("pid"))
+            .expect("the probe started its descendant in time")
             .trim()
             .parse()
             .unwrap();
-        let gone = (0..50).any(|_| {
-            // SAFETY: kill with signal 0 only probes the pid.
-            let alive = unsafe { libc::kill(pid, 0) } == 0;
+        let gone = (0..100).any(|_| {
+            let alive = alive(pid);
             if alive {
                 std::thread::sleep(Duration::from_millis(50));
             }
             !alive
         });
-        assert!(gone, "grandchild {pid} survived");
+        assert!(gone, "descendant {pid} survived");
     }
 
+    #[test]
+    fn attached_inherits_stdio_and_removes_env() {
+        let mut child = Std::new(me())
+            .args([
+                "spawn::tests::attached_child",
+                "--exact",
+                "--ignored",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env("MUX_SPAWN_GONE", "x")
+            .env("MUX_SPAWN_KEPT", "y")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        // Fed and closed, so a child that read the inherited stdin sees exactly this.
+        child.stdin.take().unwrap().write_all(b"FED\n").unwrap();
+        let out = child.wait_with_output().unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(stdout.contains("STDIN true \"FED\\n\"\n"), "{stdout}");
+        // Removed is absent, not empty.
+        assert!(stdout.contains("GONE None\n"), "{stdout}");
+        assert!(stdout.contains("KEPT Some(\"y\")\n"), "{stdout}");
+        assert!(stderr.contains("ERR"), "{stderr}");
+        assert!(stdout.contains("ATTACHED-CODE 7"), "{stdout}");
+    }
+
+    #[test]
+    #[ignore = "a child of attached_inherits_stdio_and_removes_env"]
+    fn attached_child() {
+        let code = attached(&me(), &probe_args("probe_report", &[]), &["MUX_SPAWN_GONE"]).unwrap();
+        println!("ATTACHED-CODE {code}");
+    }
+
+    #[test]
+    fn attached_returns_exit_code_and_missing_program_errs() {
+        let missing = std::env::temp_dir()
+            .join("nonexistent-mux-agent-x")
+            .join("x");
+        assert!(attached(&missing, &[], &[]).is_err());
+        assert!(captured(&missing, &[], Duration::from_secs(5)).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn attached_signal_exit_is_128_plus_signal() {
+        let run = |script: &str| attached(Path::new("/bin/sh"), &["-c".into(), script.into()], &[]);
+        assert_eq!(run("exit 7").unwrap(), 7);
+        // A signal leaves as 128 + signal, the code .NET's Process.ExitCode gave the reference.
+        assert_eq!(run("kill -9 $$").unwrap(), 137);
+    }
+
+    #[cfg(unix)]
     fn open_fds() -> usize {
         // /dev/fd lists this process's descriptors on Linux and macOS; reading it opens one more, every time.
         std::fs::read_dir("/dev/fd").unwrap().count()
@@ -453,10 +744,11 @@ mod tests {
         std::fs::read_dir("/proc/self/task").unwrap().count()
     }
 
+    #[cfg(unix)]
     #[test]
     fn timeout_leaves_no_reader_or_descriptor_behind() {
         // In a process of its own, so other tests' threads and descriptors do not move the counts.
-        let out = std::process::Command::new(std::env::current_exe().unwrap())
+        let out = Std::new(me())
             .args([
                 "spawn::tests::timeout_leak_child",
                 "--exact",
@@ -471,6 +763,7 @@ mod tests {
         assert!(stdout.contains("NO-LEAK"), "{stdout}\n{stderr}");
     }
 
+    #[cfg(unix)]
     #[test]
     #[ignore = "a child of timeout_leaves_no_reader_or_descriptor_behind"]
     fn timeout_leak_child() {
@@ -482,7 +775,12 @@ mod tests {
         let baseline = (open_fds(), threads());
         let mut counts = Vec::new();
         for _ in 0..8 {
-            let error = sh(&script, Duration::from_millis(200)).unwrap_err();
+            let error = captured(
+                Path::new("/bin/sh"),
+                &["-c", &script],
+                Duration::from_millis(200),
+            )
+            .unwrap_err();
             assert_eq!(error.kind(), io::ErrorKind::TimedOut);
             counts.push((open_fds(), threads()));
         }
@@ -494,55 +792,39 @@ mod tests {
         println!("NO-LEAK");
     }
 
+    #[cfg(feature = "live")]
     #[test]
-    fn attached_inherits_stdio_and_removes_env() {
-        let out = std::process::Command::new(std::env::current_exe().unwrap())
+    fn live_audit_appends_each_spawn() {
+        // MUX_IT_DIR is set only in a child test process, never in this multithreaded one.
+        let dir = TempDir::new();
+        let out = Std::new(me())
             .args([
-                "spawn::tests::attached_child",
+                "spawn::tests::live_audit_child",
                 "--exact",
                 "--ignored",
                 "--nocapture",
                 "--test-threads=1",
             ])
-            .env("MUX_SPAWN_GONE", "x")
-            .env("MUX_SPAWN_KEPT", "y")
+            .env("MUX_IT_DIR", dir.path())
             .output()
             .unwrap();
         let stdout = String::from_utf8_lossy(&out.stdout);
-        let stderr = String::from_utf8_lossy(&out.stderr);
-        assert!(stdout.contains("ATTACHED gone=[] kept=[y]"), "{stdout}");
-        assert!(stderr.contains("ATTACHED-ERR"), "{stderr}");
-        assert!(stdout.contains("ATTACHED-CODE 0"), "{stdout}");
-    }
-
-    #[test]
-    #[ignore = "a child of attached_inherits_stdio_and_removes_env"]
-    fn attached_child() {
-        let script = "echo \"ATTACHED gone=[$MUX_SPAWN_GONE] kept=[$MUX_SPAWN_KEPT]\"; echo ATTACHED-ERR >&2";
-        let code = attached(
-            Path::new(SH),
-            &["-c".into(), script.into()],
-            &["MUX_SPAWN_GONE"],
-        )
-        .unwrap();
-        println!("ATTACHED-CODE {code}");
-    }
-
-    #[test]
-    fn attached_returns_exit_code() {
-        let run = |script: &str| attached(Path::new(SH), &["-c".into(), script.into()], &[]);
-        assert_eq!(run("exit 7").unwrap(), 7);
-        // A signal leaves as 128 + signal, the code .NET's Process.ExitCode gave the reference.
-        assert_eq!(run("kill -9 $$").unwrap(), 137);
-        assert!(attached(Path::new("/nonexistent/mux-agent-x"), &[], &[]).is_err());
+        assert!(stdout.contains("AUDITED"), "{stdout}");
+        let log = std::fs::read_to_string(dir.path().join("spawned.log")).unwrap_or_default();
+        let line = format!("{}\n", me().display());
+        assert_eq!(log, line.repeat(2));
     }
 
     #[cfg(feature = "live")]
     #[test]
-    fn live_audit_appends_program_path() {
-        let dir = TempDir::new();
-        audit_to(dir.path(), Path::new(SH)).unwrap();
-        let log = std::fs::read_to_string(dir.path().join("spawned.log")).unwrap();
-        assert_eq!(log, format!("{SH}\n"));
+    #[ignore = "a child of live_audit_appends_each_spawn"]
+    fn live_audit_child() {
+        if std::env::var_os("MUX_IT_DIR").is_none() {
+            return;
+        }
+        for _ in 0..2 {
+            probe("probe_report", &[], Duration::from_secs(10)).unwrap();
+        }
+        println!("AUDITED");
     }
 }

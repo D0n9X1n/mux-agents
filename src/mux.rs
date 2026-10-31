@@ -173,13 +173,18 @@ pub struct RealMux {
 impl RealMux {
     /// The endpoint, then the binary (one process row, not the table), then its version gate.
     pub fn connect(ctx: &Ctx) -> Res<RealMux> {
+        RealMux::connect_within(ctx, VERSION_TIMEOUT)
+    }
+
+    /// `connect` with `-V` bounded by `version_timeout`; a `-V` that fails to start or times out is no version.
+    fn connect_within(ctx: &Ctx, version_timeout: Duration) -> Res<RealMux> {
         let Some(endpoint) = endpoint(&ctx.env, crate::state::root::HOST) else {
             return refuse(1, "endpoint", "not inside an rmux pane");
         };
         let image = ctx.os.row(endpoint.server_pid).and_then(|row| row.path);
         let rmux_set = ctx.env.get("RMUX").is_some_and(|v| !v.is_empty());
         let (bin, kind) = binary(image.as_deref(), rmux_set, ctx.env.get("PATH"))?;
-        let version = crate::spawn::captured(&bin, &["-V"], VERSION_TIMEOUT).ok();
+        let version = crate::spawn::captured(&bin, &["-V"], version_timeout).ok();
         gate(kind, version.as_ref())?;
         Ok(RealMux {
             bin,
@@ -229,7 +234,8 @@ pub fn native(ctx: &Ctx, args: &[&str], allow_failure: bool) -> Res<Output> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testing::Fakes;
+    use crate::testing::{Fakes, TempDir};
+    use std::time::Instant;
 
     fn refusal<T: std::fmt::Debug>(result: Res<T>) -> (u8, &'static str, String) {
         let refusal = result.unwrap_err();
@@ -364,63 +370,115 @@ mod tests {
         );
     }
 
-    #[cfg(unix)]
-    fn tool(dir: &Path, name: &str, script: &str) -> PathBuf {
-        use std::os::unix::fs::PermissionsExt;
-        let path = dir.join(name);
-        std::fs::write(&path, format!("#!/bin/sh\n{script}\n")).unwrap();
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    const EXE: &str = if cfg!(windows) { ".exe" } else { "" };
+
+    // An empty file named `name` (`name.exe` on Windows), executable on Unix.
+    fn tool_file(dir: &Path, name: &str) -> PathBuf {
+        let path = dir.join(format!("{name}{EXE}"));
+        std::fs::write(&path, "").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
         path
     }
 
-    #[cfg(unix)]
+    // A PATH value in the host's syntax: `:` apart on Unix, `;` on Windows.
+    fn path_of(dirs: &[&Path]) -> String {
+        std::env::join_paths(dirs).unwrap().into_string().unwrap()
+    }
+
     #[test]
     fn binary_rmux_on_path_when_rmux_set_else_tmux() {
-        let (a, b) = (
-            crate::testing::TempDir::new(),
-            crate::testing::TempDir::new(),
-        );
-        let rmux = tool(a.path(), "rmux", "");
-        let tmux = tool(b.path(), "tmux", "");
-        tool(b.path(), "rmux", "");
-        // Not executable: skipped.
-        std::fs::write(a.path().join("tmux"), "").unwrap();
-        let path = format!("{}:{}", a.path().display(), b.path().display());
+        let (a, b) = (TempDir::new(), TempDir::new());
+        let rmux = tool_file(a.path(), "rmux");
+        let tmux = tool_file(b.path(), "tmux");
+        tool_file(b.path(), "rmux");
+        let path = path_of(&[a.path(), b.path()]);
         assert_eq!(binary(None, true, Some(&path)), Ok((rmux, Kind::Rmux)));
+        let other = if cfg!(windows) {
+            "C:\\bin\\bash.exe"
+        } else {
+            "/usr/bin/bash"
+        };
         assert_eq!(
-            binary(Some("/usr/bin/bash"), false, Some(&path)),
+            binary(Some(other), false, Some(&path)),
             Ok((tmux, Kind::Tmux))
         );
-        let only_tmux = b.path().display().to_string();
-        std::fs::remove_file(b.path().join("rmux")).unwrap();
+        std::fs::remove_file(b.path().join(format!("rmux{EXE}"))).unwrap();
+        let only_tmux = path_of(&[b.path()]);
         assert_eq!(
             refusal(binary(None, true, Some(&only_tmux))),
-            (1, "endpoint", "rmux was not found".into())
+            (1, "endpoint", format!("rmux{EXE} was not found"))
         );
         assert_eq!(
             refusal(binary(None, false, None)),
-            (1, "endpoint", "tmux was not found".into())
+            (1, "endpoint", format!("tmux{EXE} was not found"))
         );
     }
 
     #[cfg(unix)]
     #[test]
+    fn path_lookup_skips_files_that_are_not_executable() {
+        let (a, b) = (TempDir::new(), TempDir::new());
+        std::fs::write(a.path().join("tmux"), "").unwrap();
+        let tmux = tool_file(b.path(), "tmux");
+        let path = path_of(&[a.path(), b.path()]);
+        assert_eq!(find_on_path("tmux", &path), Some(tmux));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_path_takes_only_the_exe_name() {
+        let (a, b) = (TempDir::new(), TempDir::new());
+        std::fs::write(a.path().join("tmux"), "").unwrap();
+        std::fs::write(a.path().join("tmux.cmd"), "").unwrap();
+        let tmux = tool_file(b.path(), "tmux");
+        let path = path_of(&[a.path(), b.path()]);
+        assert!(path.contains(';'), "{path}");
+        assert_eq!(binary(None, false, Some(&path)), Ok((tmux, Kind::Tmux)));
+    }
+
+    // `target` relative to the cwd; none when they share no drive and root (Windows).
+    fn relative_to_cwd(target: &Path) -> Option<PathBuf> {
+        use std::path::Component;
+        let cwd = std::fs::canonicalize(std::env::current_dir().unwrap()).unwrap();
+        let cwd: Vec<Component> = cwd.components().collect();
+        let target: Vec<Component> = target.components().collect();
+        let common = cwd.iter().zip(&target).take_while(|(a, b)| a == b).count();
+        let lead = target
+            .iter()
+            .take_while(|c| !matches!(c, Component::Normal(_)))
+            .count();
+        if common < lead {
+            return None;
+        }
+        let mut relative = PathBuf::new();
+        for _ in common..cwd.len() {
+            relative.push("..");
+        }
+        for component in &target[common..] {
+            relative.push(component);
+        }
+        Some(relative)
+    }
+
+    #[test]
     fn path_lookup_skips_relative_entries() {
-        let dir = crate::testing::TempDir::new();
-        let tmux = tool(dir.path(), "tmux", "");
+        let dir = TempDir::new();
+        let tmux = tool_file(dir.path(), "tmux");
+        let name = format!("tmux{EXE}");
+        let Some(relative) = relative_to_cwd(dir.path()) else {
+            eprintln!("skipped: the temp folder is on another drive than the cwd");
+            return;
+        };
         // The same folder by a relative path from the test's cwd.
-        let cwd = std::env::current_dir().unwrap();
-        let up = "../".repeat(cwd.components().count() - 1);
-        let relative = format!(
-            "{up}{}",
-            dir.path().display().to_string().trim_start_matches('/')
-        );
-        assert!(Path::new(&relative).join("tmux").is_file());
-        assert_eq!(find_on_path("tmux", &format!("{relative}::.")), None);
-        assert_eq!(
-            find_on_path("tmux", &format!("{relative}:{}", dir.path().display())),
-            Some(tmux)
-        );
+        assert!(relative.is_relative() && relative.join(&name).is_file());
+        let skipped = path_of(&[&relative, Path::new(""), Path::new(".")]);
+        assert_eq!(find_on_path(&name, &skipped), None);
+        let found = path_of(&[&relative, dir.path()]);
+        assert_eq!(find_on_path(&name, &found), Some(tmux));
     }
 
     fn version(code: i32, stdout: &str) -> Output {
@@ -497,68 +555,185 @@ mod tests {
         assert!(gate(Kind::Rmux, Some(&version(0, "tmux 3.8"))).is_err());
     }
 
+    // The caller's socket, with a space in it, so an argument split at whitespace shows.
+    const SOCKET: &str = if cfg!(windows) {
+        r"\\.\pipe\my mux"
+    } else {
+        "/tmp/my mux"
+    };
+
     // A ctx whose server pid 900 runs `image` (none: no such row) with RMUX or TMUX set.
-    #[cfg(unix)]
-    fn ctx_for(fakes: &Fakes, image: Option<&Path>, var: &str, path: &Path) -> Ctx {
+    fn ctx_for(fakes: &Fakes, image: Option<&Path>, var: &str, path: &str) -> Ctx {
         let mut row = crate::testing::row(900, 1, 9);
         row.path = image.map(|p| p.display().to_string());
         fakes.process(row);
         let mut ctx = fakes.ctx();
-        ctx.env = Env::from_pairs([
-            (var, "/tmp/s,900,0".to_string()),
-            ("PATH", path.display().to_string()),
-        ]);
+        ctx.env = Env::from_pairs([(var, format!("{SOCKET},900,0")), ("PATH", path.to_string())]);
         *ctx.mux.borrow_mut() = None;
         ctx
     }
 
-    // A "tmux" or "rmux" that answers -V with `version`, logs each other call's argv and echoes it; `fail` exits 3.
-    #[cfg(unix)]
+    // The stand-in for rmux and tmux, one program on every host. `-V` answers the `<stem>.version` file beside it
+    // ("fail" exits 1, "hang" sleeps 30 s); any other call appends its argv to `calls` beside it, each argument
+    // NUL-terminated and the call ended by a newline, echoes the same to stdout, and exits 3 when an argument holds
+    // "fail" or sleeps 5 s first when one holds "slow".
+    const FAKE_MUX: &str = r#"
+use std::io::Write;
+use std::time::Duration;
+fn main() {
+    let exe = std::env::current_exe().unwrap();
+    let dir = exe.parent().unwrap();
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.first().map(String::as_str) == Some("-V") {
+        let stem = exe.file_stem().unwrap().to_str().unwrap();
+        let version = std::fs::read_to_string(dir.join(format!("{stem}.version"))).unwrap_or_default();
+        match version.trim() {
+            "fail" => {
+                println!("tmux 3.4");
+                std::process::exit(1);
+            }
+            "hang" => std::thread::sleep(Duration::from_secs(30)),
+            version => println!("{version}"),
+        }
+        return;
+    }
+    let mut call = String::new();
+    for arg in &args {
+        call.push_str(arg);
+        call.push('\0');
+    }
+    call.push('\n');
+    let mut log = std::fs::OpenOptions::new().create(true).append(true).open(dir.join("calls")).unwrap();
+    log.write_all(call.as_bytes()).unwrap();
+    if args.iter().any(|a| a.contains("fail")) {
+        std::process::exit(3);
+    }
+    if args.iter().any(|a| a.contains("slow")) {
+        std::thread::sleep(Duration::from_secs(5));
+    }
+    std::io::stdout().write_all(call.as_bytes()).unwrap();
+}
+"#;
+
+    // Built once per source with this toolchain's rustc, beside the test binary.
+    fn fake_mux_program() -> &'static Path {
+        static BUILT: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+        BUILT.get_or_init(|| {
+            let deps = std::env::current_exe()
+                .unwrap()
+                .parent()
+                .unwrap()
+                .to_path_buf();
+            let hash = &crate::util::sha256_hex(FAKE_MUX)[..16];
+            let built = deps.join(format!("mux-agent-fake-mux-{hash}{EXE}"));
+            if built.is_file() {
+                return built;
+            }
+            let work = deps.join(format!("mux-agent-fake-mux-{hash}-{}", std::process::id()));
+            std::fs::create_dir_all(&work).unwrap();
+            let source = work.join("fake.rs");
+            std::fs::write(&source, FAKE_MUX).unwrap();
+            let out = work.join(format!("fake{EXE}"));
+            let rustc = Path::new(env!("CARGO")).with_file_name(format!("rustc{EXE}"));
+            let rustc = if rustc.is_file() {
+                rustc
+            } else {
+                PathBuf::from("rustc")
+            };
+            let status = std::process::Command::new(rustc)
+                .args(["--edition=2021", "-o"])
+                .arg(&out)
+                .arg(&source)
+                .status()
+                .unwrap();
+            assert!(status.success(), "the fake mux did not build");
+            // Another test process may have won the race; both built the same program.
+            let _ = std::fs::rename(&out, &built);
+            let _ = std::fs::remove_dir_all(&work);
+            assert!(built.is_file());
+            built
+        })
+    }
+
     fn fake_mux(dir: &Path, name: &str, version: &str) -> PathBuf {
-        let log = dir.join("calls");
-        let script = format!(
-            "if [ \"$1\" = -V ]; then echo '{version}'; exit 0; fi\n\
-             echo \"$*\" >> '{log}'\n\
-             case \"$*\" in *fail*) exit 3;; *slow*) sleep 5;; esac\n\
-             echo \"$*\"",
-            log = log.display()
-        );
-        tool(dir, name, &script)
+        let path = dir.join(format!("{name}{EXE}"));
+        std::fs::copy(fake_mux_program(), &path).unwrap();
+        std::fs::write(dir.join(format!("{name}.version")), version).unwrap();
+        path
     }
 
-    #[cfg(unix)]
-    fn calls(dir: &Path) -> String {
-        std::fs::read_to_string(dir.join("calls")).unwrap_or_default()
+    // Calls as the fake records them, one argv each.
+    fn split(text: &str) -> Vec<Vec<String>> {
+        text.lines()
+            .map(|line| line.split_terminator('\0').map(String::from).collect())
+            .collect()
     }
 
-    #[cfg(unix)]
+    fn calls(dir: &Path) -> Vec<Vec<String>> {
+        split(&std::fs::read_to_string(dir.join("calls")).unwrap_or_default())
+    }
+
+    fn argv(items: &[&str]) -> Vec<String> {
+        items.iter().map(|s| s.to_string()).collect()
+    }
+
     #[test]
     fn real_mux_prefixes_s_socket_n() {
-        let dir = crate::testing::TempDir::new();
+        let dir = TempDir::new();
         let bin = fake_mux(dir.path(), "tmux", "tmux 3.4");
         let fakes = Fakes::default();
-        let ctx = ctx_for(&fakes, Some(&bin), "TMUX", Path::new("/nonexistent"));
+        let ctx = ctx_for(&fakes, Some(&bin), "TMUX", "");
         let mux = RealMux::connect(&ctx).unwrap();
-        let out = mux.run(&["-N", "list-panes", "-a"]).unwrap();
-        assert_eq!(
-            (out.code, out.stdout.as_str()),
-            (0, "-S /tmp/s -N list-panes -a\n")
-        );
+        // Each argument arrives whole, spaces and all.
+        let out = mux
+            .run(&["-N", "send-keys", "-t", "%1", "echo a b"])
+            .unwrap();
+        let sent = argv(&["-S", SOCKET, "-N", "send-keys", "-t", "%1", "echo a b"]);
+        assert_eq!(out.code, 0);
+        assert_eq!(split(&out.stdout), std::slice::from_ref(&sent));
         // Without a leading -N nothing starts.
         for bad in [&["list-panes"][..], &[], &["-S", "x", "-N"]] {
             assert_eq!(refusal(mux.run(bad)).1, "internal");
         }
-        assert_eq!(calls(dir.path()), "-S /tmp/s -N list-panes -a\n");
+        assert_eq!(calls(dir.path()), [sent]);
 
         // native connects on first use, adds -N and refuses a failed call without echoing it.
         let listed = native(&ctx, &["display-message", "-p", "x"], false).unwrap();
-        assert_eq!(listed.stdout, "-S /tmp/s -N display-message -p x\n");
+        assert_eq!(
+            split(&listed.stdout),
+            [argv(&["-S", SOCKET, "-N", "display-message", "-p", "x"])]
+        );
         assert_eq!(
             refusal(native(&ctx, &["fail"], false)),
             (1, "rmux", "rmux call failed".into())
         );
         assert_eq!(native(&ctx, &["fail"], true).unwrap().code, 3);
         assert!(ctx.mux.borrow().is_some());
+    }
+
+    #[test]
+    fn failed_or_timed_out_version_refuses_endpoint() {
+        let dir = TempDir::new();
+        let fakes = Fakes::default();
+        let required = (1, "endpoint", OLD_TMUX.to_string());
+        let bin = fake_mux(dir.path(), "tmux", "fail");
+        let ctx = ctx_for(&fakes, Some(&bin), "TMUX", "");
+        let kind = |within: Duration| RealMux::connect_within(&ctx, within).map(|m| m.kind());
+        // -V exits 1, though its text would pass.
+        assert_eq!(refusal(kind(VERSION_TIMEOUT)), required);
+        // -V past its timeout is killed and refused, not a panic.
+        std::fs::write(dir.path().join("tmux.version"), "hang").unwrap();
+        let started = Instant::now();
+        assert_eq!(refusal(kind(Duration::from_millis(500))), required);
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "{:?}",
+            started.elapsed()
+        );
+        // A server image that is gone cannot start.
+        std::fs::remove_file(&bin).unwrap();
+        assert_eq!(refusal(kind(VERSION_TIMEOUT)), required);
+        assert!(calls(dir.path()).is_empty());
     }
 
     #[test]
@@ -589,13 +764,12 @@ mod tests {
         assert!(fakes.os_calls().is_empty());
     }
 
-    #[cfg(unix)]
     #[test]
     fn timeout_refuses_endpoint_did_not_answer() {
-        let dir = crate::testing::TempDir::new();
+        let dir = TempDir::new();
         let bin = fake_mux(dir.path(), "tmux", "tmux 3.4");
         let fakes = Fakes::default();
-        let ctx = ctx_for(&fakes, Some(&bin), "TMUX", Path::new("/nonexistent"));
+        let ctx = ctx_for(&fakes, Some(&bin), "TMUX", "");
         let mut mux = RealMux::connect(&ctx).unwrap();
         mux.timeout = Duration::from_millis(200);
         let did_not_answer = (
@@ -609,15 +783,15 @@ mod tests {
         assert_eq!(refusal(mux.run(&["-N", "list-panes"])), did_not_answer);
     }
 
-    #[cfg(unix)]
     #[test]
     fn kind_is_rmux_or_tmux() {
-        let dir = crate::testing::TempDir::new();
+        let dir = TempDir::new();
         let rmux = fake_mux(dir.path(), "rmux", "rmux 0.10.0");
         let tmux = fake_mux(dir.path(), "tmux", "tmux 3.8");
+        let path = path_of(&[dir.path()]);
         let kind = |image: Option<&Path>, var: &str| {
             let fakes = Fakes::default();
-            RealMux::connect(&ctx_for(&fakes, image, var, dir.path())).map(|m| m.kind())
+            RealMux::connect(&ctx_for(&fakes, image, var, &path)).map(|m| m.kind())
         };
         assert_eq!(kind(Some(&rmux), "TMUX"), Ok(Kind::Rmux));
         assert_eq!(kind(Some(&tmux), "RMUX"), Ok(Kind::Tmux));
@@ -625,7 +799,7 @@ mod tests {
         assert_eq!(kind(None, "RMUX"), Ok(Kind::Rmux));
         assert_eq!(kind(None, "TMUX"), Ok(Kind::Tmux));
         // A tmux binary that answers as rmux is refused.
-        let liar = crate::testing::TempDir::new();
+        let liar = TempDir::new();
         let fake = fake_mux(liar.path(), "tmux", "rmux 0.10.0");
         assert_eq!(
             kind(Some(&fake), "TMUX"),

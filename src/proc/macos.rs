@@ -290,6 +290,56 @@ mod tests {
         assert_eq!(MacOs.read_start(child.id()), None);
     }
 
+    // p_starttime by another road than libproc: sysctl KERN_PROC_PID's kinfo_proc, whose extern_proc opens with
+    // the union holding it (sys/proc.h): tv_sec at byte 0, tv_usec at byte 8. 648 bytes on 64-bit macOS.
+    fn kinfo_start(pid: u32) -> (i64, i32) {
+        const KINFO_PROC_SIZE: usize = 648;
+        let mut mib = [
+            libc::CTL_KERN,
+            libc::KERN_PROC,
+            libc::KERN_PROC_PID,
+            pid as c_int,
+        ];
+        let mut buf = [0u8; KINFO_PROC_SIZE];
+        let mut size = buf.len();
+        // SAFETY: a four-name read into `buf`, whose length `size` gives.
+        let read = unsafe {
+            libc::sysctl(
+                mib.as_mut_ptr(),
+                4,
+                buf.as_mut_ptr().cast(),
+                &mut size,
+                null_mut(),
+                0,
+            )
+        };
+        assert_eq!((read, size), (0, KINFO_PROC_SIZE), "kinfo_proc of {pid}");
+        let sec = i64::from_ne_bytes(buf[0..8].try_into().unwrap());
+        let usec = i32::from_ne_bytes(buf[8..12].try_into().unwrap());
+        (sec, usec)
+    }
+
+    #[test]
+    fn start_is_p_starttime_to_the_microsecond() {
+        let mut child = sleeper(Path::new("/"));
+        let pids = [me(), std::os::unix::process::parent_id(), child.id()];
+        let both: Vec<_> = pids
+            .iter()
+            .map(|&pid| {
+                let (sec, usec) = kinfo_start(pid);
+                (
+                    MacOs.read_start(pid),
+                    Some(sec * 1_000_000 + i64::from(usec)),
+                )
+            })
+            .collect();
+        child.kill().unwrap();
+        child.wait().unwrap();
+        for (pid, (ours, theirs)) in pids.iter().zip(both) {
+            assert_eq!(ours, theirs, "pid {pid}");
+        }
+    }
+
     #[test]
     fn argv_of_self_matches_env_args() {
         let argv = MacOs.row(me()).unwrap().argv.unwrap();
@@ -366,8 +416,39 @@ mod tests {
     }
 
     #[test]
+    fn production_kill_sends_nothing_and_succeeds_only_after_the_exit() {
+        // Exited by another route, 500 ms in; MacOs::kill may report it gone only after that, and must not have
+        // signalled it first.
+        let mut child = sleeper(Path::new("/"));
+        let opened = MacOs.open(child.id()).unwrap();
+        let other_route = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(500));
+            let untouched = child.try_wait().unwrap().is_none();
+            child.kill().unwrap();
+            child.wait().unwrap();
+            untouched
+        });
+        let started = std::time::Instant::now();
+        let gone = MacOs.kill(opened);
+        let waited = started.elapsed();
+        assert!(
+            other_route.join().unwrap(),
+            "MacOs::kill signalled the child"
+        );
+        assert!(gone);
+        assert!(
+            waited >= std::time::Duration::from_millis(500),
+            "{waited:?}"
+        );
+    }
+
+    #[test]
     fn same_start_exact() {
         assert!(MacOs.same_start(1_793_318_401_234_567, 1_793_318_401_234_567));
+        // Adjacent values: no rounding, halving or tolerance.
+        assert!(MacOs.same_start(1009, 1009));
+        assert!(!MacOs.same_start(1008, 1009));
+        assert!(!MacOs.same_start(1009, 1008));
         assert!(!MacOs.same_start(1_793_318_401_234_567, 1_793_318_401_234_560));
         assert!(!MacOs.same_start(1009, 1000));
     }
