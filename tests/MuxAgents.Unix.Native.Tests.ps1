@@ -14,6 +14,13 @@ function Test-NativeLoaderLink($Kernel) {
     $loader = Join-Path $TestDrive 'lib/node_modules/@github/copilot/npm-loader.js'; $null = New-Item -ItemType File -Force -Path $loader
     $bin = Join-Path $TestDrive 'bin'; $null = New-Item -ItemType Directory -Force -Path $bin; $null = [IO.File]::CreateSymbolicLink((Join-Path $bin 'copilot'), '../lib/node_modules/@github/copilot/npm-loader.js')
     "$(Get-MuxAgentUnixClient -Row ([pscustomobject]@{ Path = '/usr/bin/node'; Argv = [string[]]@('node', (Join-Path $bin 'copilot')) }) -Kernel $Kernel)" }
+# ResolveFile is realpath: a directory alias named @github/copilot resolves to the real folder, so an ordinary app behind it is no
+# client; a path that does not exist gives nothing.
+function Test-NativeRealPath($Kernel) {
+    $app = Join-Path $TestDrive 'app'; $null = New-Item -ItemType Directory -Force -Path $app; $file = Join-Path $app 'npm-loader.js'; [IO.File]::WriteAllText($file, '')
+    $aliases = Join-Path $TestDrive 'aliases/@github'; $null = New-Item -ItemType Directory -Force -Path $aliases; $null = [IO.Directory]::CreateSymbolicLink((Join-Path $aliases 'copilot'), $app)
+    $alias = Join-Path $aliases 'copilot/npm-loader.js'
+    "$((& $Kernel.ResolveFile $alias) -ceq (Get-NativeRealPath $file))|[$(& $Kernel.ResolveFile (Join-Path $TestDrive 'missing.js'))]|[$(Get-MuxAgentUnixClient -Row ([pscustomobject]@{ Path = '/usr/bin/node'; Argv = [string[]]@('node', $alias) }) -Kernel $Kernel)]" }
 # IsGone on a live child, the same child once killed and reaped (WaitForExit reaps it), and pid 1, which a non-root runner may not
 # signal (EPERM: the probe fails, so not gone). The raw probe of pid 1 is shown, so a run as root (errno 0) cannot pass unnoticed.
 function Test-NativeGone($Kernel, [scriptblock]$Probe) {
@@ -37,6 +44,12 @@ Describe 'MuxAgents unix native linux' -Tag 'linux' {
     It 'kills a real child through its pidfd' {
         $kernel = New-MuxAgentLinuxKernel; $child = Start-NativeChild $TestDrive; $opened = Open-MuxAgentUnixProcess -Id $child.Id -Kernel $kernel
         "$($opened.Fd -ge 0) $(Stop-MuxAgentUnixProcess -Opened $opened -Kernel $kernel) $($child.WaitForExit(5000)) $($child.ExitCode)" | Should BeExactly 'True True True 137' }
+    It 'PidfdExited: false for a live child and for an fd that is not open (POLLNVAL), true once the child is killed' {
+        Import-MuxAgentUnixNative; $child = Start-NativeChild $TestDrive; $fd = [MuxAgentUnixNative]::PidfdOpen($child.Id)
+        try {
+            $live = [MuxAgentUnixNative]::PidfdExited($fd, 0); $invalid = [MuxAgentUnixNative]::PidfdExited(1000000, 0); $null = [MuxAgentUnixNative]::PidfdKill($fd)
+            "$($fd -ge 0) $live $invalid $([MuxAgentUnixNative]::PidfdExited($fd, 5000))" | Should BeExactly 'True False False True' }
+        finally { if ($fd -ge 0) { [MuxAgentUnixNative]::Close($fd) }; if (-not $child.HasExited) { $child.Kill() }; $child.WaitForExit() } }
     It 'IsGone: a live child is not gone, the reaped child is (ESRCH), and pid 1 that the probe may not signal (EPERM) is not' {
         Test-NativeGone (New-MuxAgentLinuxKernel) { param([int]$Id) [MuxAgentUnixNative]::ProbeLinux($Id) } | Should BeExactly 'False True 3 False 1' }
     It 'refuses C5 when the sessions folder cannot be searched, though File.Exists says no file' { Test-NativeDeniedSession | Should BeExactly 'False|denied|' }
@@ -48,7 +61,8 @@ Describe 'MuxAgents unix native linux' -Tag 'linux' {
         $child = [Diagnostics.Process]::Start('/usr/bin/perl', [string[]]@('-e', 'sleep 60', ''))
         try { $argv = @(& (New-MuxAgentLinuxKernel).ReadCmdline $child.Id); "$($argv.Count)|$($argv[1])|[$($argv[3])]" | Should BeExactly '4|-e|[]' }
         finally { $child.Kill(); $child.WaitForExit() } }
-    It 'resolves a real loader link to copilot' { Test-NativeLoaderLink (New-MuxAgentLinuxKernel) | Should BeExactly 'copilot' } }
+    It 'resolves a real loader link to copilot' { Test-NativeLoaderLink (New-MuxAgentLinuxKernel) | Should BeExactly 'copilot' }
+    It 'resolves a script through a directory alias to its real path, so the alias is no client' { Test-NativeRealPath (New-MuxAgentLinuxKernel) | Should BeExactly 'True|[]|[]' } }
 Describe 'MuxAgents unix native macos' -Tag 'macos' {
     It 'lists a real child with its parent, path, argv, start and cwd' { Test-NativeRow { param($k) Get-MuxAgentMacProcessTable -Kernel $k } (New-MuxAgentMacKernel) { param($Id) $r = 0L; [Math]::DivRem([Diagnostics.Process]::GetProcessById($Id).StartTime.ToUniversalTime().Ticks - [DateTime]::UnixEpoch.Ticks, 10L, [ref]$r) } | Should BeExactly 'True True 2 60 True True' }
     It 'never signals a real child and reports it' {
@@ -59,4 +73,5 @@ Describe 'MuxAgents unix native macos' -Tag 'macos' {
         Test-NativeGone (New-MuxAgentMacKernel) { param([int]$Id) [MuxAgentUnixNative]::ProbeMac($Id) } | Should BeExactly 'False True 3 False 1' }
     It 'refuses C5 when the sessions folder cannot be searched, though File.Exists says no file' { Test-NativeDeniedSession | Should BeExactly 'False|denied|' }
     It 'sandbox_check reports no sandbox for the runner' { "$(& (New-MuxAgentMacKernel).SandboxCheck)|$(try { Assert-MuxAgentMacSandbox -Environment @{} -Kernel (New-MuxAgentMacKernel); 'none' } catch { $_.Exception.Message })" | Should BeExactly '0|none' }
-    It 'resolves a real loader link to copilot' { Test-NativeLoaderLink (New-MuxAgentMacKernel) | Should BeExactly 'copilot' } }
+    It 'resolves a real loader link to copilot' { Test-NativeLoaderLink (New-MuxAgentMacKernel) | Should BeExactly 'copilot' }
+    It 'resolves a script through a directory alias to its real path, so the alias is no client' { Test-NativeRealPath (New-MuxAgentMacKernel) | Should BeExactly 'True|[]|[]' } }

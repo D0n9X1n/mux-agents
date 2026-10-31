@@ -15,6 +15,8 @@ Describe 'MuxAgents unix native parsers' {
             $bytes = New-UnixProcArgs $case[0] $case[1]; $answers += "$($null -eq [MuxAgentUnixNative]::ParseProcArgs($bytes, $bytes.Length))" }
         $answers += "$($null -eq [MuxAgentUnixNative]::ParseProcArgs($good, 28))|$($null -eq [MuxAgentUnixNative]::ParseProcArgs($good, 3))"
         ($answers -join ';') | Should BeExactly 'sleep 60;sleep 60 A=1;True;True;True;True|True' }
+    It 'PollShowsExit: exit only for one entry with POLLIN and neither POLLERR nor POLLNVAL' {
+        ((@(@(1, 1), @(1, 17), @(0, 0), @(1, 32), @(1, 33), @(1, 9), @(1, 16), @(-1, 0)) | ForEach-Object { "$([MuxAgentUnixNative]::PollShowsExit($_[0], $_[1]))" }) -join ',') | Should BeExactly 'True,True,False,False,False,False,False,False' }
     It 'ParseVnodeCwd reads the cdir path at byte 152 of a 2352-byte proc_vnodepathinfo, else nothing' {
         $info = [byte[]]::new(2352); $path = [Text.Encoding]::UTF8.GetBytes('/Users/me/work')
         [Array]::Copy($path, 0, $info, 152, $path.Length); [Array]::Copy($path, 0, $info, 1328, 6)
@@ -56,6 +58,10 @@ Describe 'MuxAgents unix client identity' {
         "$(Get-UnixClient '/usr/bin/node' @('node', '--require', 'hook.js', $loader)),$(Get-UnixClient '/usr/bin/node' @('node', '--loader', 'hook.mjs', $loader))" | Should BeExactly 'copilot,copilot' }
     It 'names no client when the loader is only the value of --require or --loader and the script is another file' {
         "[$(Get-UnixClient '/usr/bin/node' @('node', '--require', $loader, '/srv/app.js'))],[$(Get-UnixClient '/usr/bin/node' @('node', '--loader', $loader, '/srv/app.js'))]" | Should BeExactly '[],[]' }
+    It 'skips an --option=value and the known flags that take no value' {
+        "$(Get-UnixClient '/usr/bin/node' @('node', '--max-old-space-size=4096', '--enable-source-maps', '--no-deprecation', $loader))" | Should BeExactly 'copilot' }
+    It 'names no client after any other option, which may take the loader as its value' {
+        "[$(Get-UnixClient '/usr/bin/node' @('node', '--conditions', $loader, '/srv/app.js'))],[$(Get-UnixClient '/usr/bin/node' @('node', '-C', $loader, '/srv/app.js'))],[$(Get-UnixClient '/usr/bin/node' @('node', '--some-new-flag', $loader))]" | Should BeExactly '[],[],[]' }
     It 'names no client for argv[0] alone, another exe, other case, eval code, an option value, another script, or an unreadable path or cwd' {
         $answers = @((Get-UnixClient '/usr/bin/sleep' @('claude')), (Get-UnixClient '/usr/bin/bash' @('copilot', '--allow-all')), (Get-UnixClient '/usr/bin/claude.exe' @('claude')),
             (Get-UnixClient '/opt/Claude' @('claude')), (Get-UnixClient '/x/claude/versionsX/1' @('claude')), (Get-UnixClient '/usr/bin/copilot-cli' @('copilot')),
@@ -121,9 +127,9 @@ Describe 'MuxAgents unix kernels' {
     It 'each kernel has exactly its reads, and the fake has every one' {
         $linux = @((New-MuxAgentLinuxKernel).PSObject.Properties.Name | Sort-Object); $mac = @((New-MuxAgentMacKernel).PSObject.Properties.Name | Sort-Object); $fake = @((New-UnixFakeKernel).PSObject.Properties.Name)
         "$($linux -join ',')|$($mac -join ',')|$(@(($linux + $mac) | Where-Object { $_ -notin $fake }).Count)" | Should BeExactly 'Close,IsGone,ListIds,PidfdOpen,ReadCmdline,ReadCwd,ReadExe,ReadStart,ReadStat,ReadStatus,ResolveFile,SendKill,Sleep,WaitExit|Close,IsGone,ListPs,PidfdOpen,ReadArgv,ReadCwd,ReadPath,ReadStart,ResolveFile,SandboxCheck,SendKill,Sleep,WaitExit|0' }
-    It 'macOS opens no pidfd and signals nothing; ResolveFile gives a plain file its full path' {
-        $mac = New-MuxAgentMacKernel; $file = Join-Path $TestDrive 'plain.js'; [IO.File]::WriteAllText($file, '')
-        "$(& $mac.PidfdOpen 1)|$(& $mac.SendKill 3)|$(& $mac.WaitExit 3 0)|$((& $mac.ResolveFile $file) -ceq [IO.Path]::GetFullPath($file))" | Should BeExactly '-1|False|False|True' }
+    It 'macOS opens no pidfd and signals nothing' {
+        $mac = New-MuxAgentMacKernel
+        "$(& $mac.PidfdOpen 1)|$(& $mac.SendKill 3)|$(& $mac.WaitExit 3 0)" | Should BeExactly '-1|False|False' }
     It 'IsGone is true only for ESRCH from kill(pid, 0) on that pid; EPERM, another errno or a probe that throws is not gone' {
         $probes = @({ param($Id) 0 }, { param($Id) 1 }, { param($Id) if ($Id -eq 300) { 3 } else { 0 } }, { param($Id) 22 }, { param($Id) throw [DllNotFoundException]::new('libc') })
         $answers = foreach ($probe in $probes) { "$(Test-MuxAgentUnixGone -Probe $probe -Id 300)" }

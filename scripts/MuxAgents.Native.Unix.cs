@@ -10,7 +10,18 @@ public static class MuxAgentUnixNative {
     // pidfd_open 434 and pidfd_send_signal 424 (x86_64 and arm64 share the asm-generic numbers since 5.1). A pidfd polls readable once its process exited.
     public static int PidfdOpen(int pid) { long fd = syscall(434, pid, 0, 0, 0); return fd < 0 ? -1 : (int)fd; }
     public static bool PidfdKill(int fd) { return syscall(424, fd, 9, 0, 0) == 0; }
-    public static bool PidfdExited(int fd, int milliseconds) { int[] item = { fd, 1 }; return poll(item, 1, milliseconds) == 1; }
+    // struct pollfd { int fd; short events; short revents; }: events POLLIN 1 in the low half of item[1], revents in the high half.
+    public static bool PidfdExited(int fd, int milliseconds) { int[] item = { fd, 1 }; int count = poll(item, 1, milliseconds); return PollShowsExit(count, (item[1] >> 16) & 0xFFFF); }
+    // Exit is one ready entry with POLLIN 1 set and none of POLLERR 8 or POLLNVAL 32 (an fd that is not open); POLLHUP 16 may join POLLIN.
+    public static bool PollShowsExit(int count, int revents) { return count == 1 && (revents & 1) != 0 && (revents & (8 | 32)) == 0; }
+    // realpath(3) into our own PATH_MAX buffer (4096 on Linux, 1024 on macOS): every link in every component resolved; null on failure.
+    [DllImport("libc.so.6", EntryPoint = "realpath")] static extern IntPtr LinuxRealPath([MarshalAs(UnmanagedType.LPUTF8Str)] string path, byte[] resolved);
+    [DllImport("/usr/lib/libSystem.dylib", EntryPoint = "realpath")] static extern IntPtr MacRealPath([MarshalAs(UnmanagedType.LPUTF8Str)] string path, byte[] resolved);
+    public static string RealPathLinux(string path) { byte[] buffer = new byte[4097]; return ReadRealPath(LinuxRealPath(path, buffer), buffer); }
+    public static string RealPathMac(string path) { byte[] buffer = new byte[4097]; return ReadRealPath(MacRealPath(path, buffer), buffer); }
+    static string ReadRealPath(IntPtr result, byte[] buffer) {
+        if (result == IntPtr.Zero) return null;
+        int end = Array.IndexOf(buffer, (byte)0); return end <= 0 ? null : Encoding.UTF8.GetString(buffer, 0, end); }
     public static void Close(int fd) { LinuxClose(fd); }
     // kill(pid, 0) sends no signal; it only checks the pid. 0 when the process exists, else errno: ESRCH 3 is "no such process"
     // (3 on Linux and macOS); EPERM 1 means it exists under another user. A pid below 1 names a group, so it is EINVAL 22 here.

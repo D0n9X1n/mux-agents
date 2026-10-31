@@ -16,19 +16,24 @@ function Get-MuxAgentUnixArgv { param($Row)
 function Get-MuxAgentUnixStopReport { param($Left)
     $pids = [int[]]@($Left | Where-Object { $null -ne $_ } | ForEach-Object { [int]$_.Pid })
     [ordered]@{ survivors = $pids.Count; survivorPids = $pids } }
-# The script node runs: the first argument after node that is not an option; -r/--require/--import/--loader take the next
-# argument; '--' ends options. $null for -e/-p/--eval/--print (or a short-option cluster holding e or p) or for no script.
+# The script node runs: the first argument after node that is not an option; '--' ends options. Options are read fail-closed:
+# -r/--require/--import/--loader skip the next argument, an --option=value or a known flag without a value is skipped, and any
+# other option (it may take the next argument as its value, as --conditions does) gives $null. $null too for -e/-p/--eval/--print
+# (or a short-option cluster holding e or p) or for no script.
 function Get-MuxAgentUnixNodeScript { param([string[]]$Argv)
     for ($index = 1; $index -lt $Argv.Count; $index++) {
         $item = $Argv[$index]
         if ($item -ceq '--') { return $(if ($index + 1 -lt $Argv.Count) { $Argv[$index + 1] }) }
         if ($item -cmatch '^(--(eval|print)(=|$)|-[A-Za-z]*[ep][A-Za-z]*$)') { return $null }
         if ($item -cin @('-r', '--require', '--import', '--loader')) { $index++; continue }
-        if (-not $item.StartsWith('-')) { return $item } }
+        if (-not $item.StartsWith('-')) { return $item }
+        if ($item -cmatch '^--[a-z0-9-]+=' -or $item -cin @('--no-warnings', '--no-deprecation', '--enable-source-maps', '--trace-warnings', '--preserve-symlinks', '--preserve-symlinks-main', '--expose-gc')) { continue }
+        return $null }
     $null }
 # ClientOf on Unix, by the real executable path: claude under */claude/versions/* or named claude; copilot named copilot, or node
-# whose script resolves to @github/copilot/npm-loader.js. A relative script resolves against that process's own cwd (the C5
-# reader); an unreadable cwd or link is no match. Case-sensitive.
+# whose script's realpath (every link in every component resolved) ends in @github/copilot/npm-loader.js, so a directory alias
+# named @github/copilot is not enough. A relative script resolves against that process's own cwd (the C5 reader); an unreadable
+# cwd or a path realpath cannot resolve is no match. Case-sensitive.
 function Get-MuxAgentUnixClient { param($Row, [Parameter(Mandatory)]$Kernel)
     $path = "$($Row.Path)"; $file = [IO.Path]::GetFileName($path)
     if ($path -clike '*/claude/versions/*' -or $file -ceq 'claude') { return 'claude' }
@@ -80,7 +85,6 @@ function Get-MuxAgentMacProcessTable {
 function Test-MuxAgentUnixGone { param([Parameter(Mandatory)][scriptblock]$Probe, [int]$Id)
     $errno = try { [int](& $Probe $Id) } catch { -1 }
     $errno -eq 3 }
-function Get-MuxAgentUnixLinkTarget { param([string]$Path) $target = [IO.File]::ResolveLinkTarget($Path, $true); if ($target) { $target.FullName } else { [IO.Path]::GetFullPath($Path) } }
 # The Linux reads: /proc and pidfd. Read members return $null when unreadable, except ReadStat and ReadStatus, which throw.
 function New-MuxAgentLinuxKernel { [pscustomobject]@{
     ListIds = { foreach ($d in [IO.Directory]::EnumerateDirectories('/proc')) { $n = 0; if ([int]::TryParse([IO.Path]::GetFileName($d), [ref]$n)) { $n } } }
@@ -89,7 +93,7 @@ function New-MuxAgentLinuxKernel { [pscustomobject]@{
     ReadCmdline = { param([int]$Id) ConvertFrom-MuxAgentLinuxCmdline -Bytes ([IO.File]::ReadAllBytes("/proc/$Id/cmdline")) }
     ReadStart = { param([int]$Id) try { (ConvertFrom-MuxAgentLinuxStat -Text ([IO.File]::ReadAllText("/proc/$Id/stat"))).Start } catch { $null } }
     ReadCwd = { param([int]$Id) try { [IO.Directory]::ResolveLinkTarget("/proc/$Id/cwd", $false).FullName } catch { $null } }
-    ResolveFile = { param($Path) Get-MuxAgentUnixLinkTarget -Path $Path }
+    ResolveFile = { param($Path) Import-MuxAgentUnixNative; [MuxAgentUnixNative]::RealPathLinux($Path) }
     IsGone = { param([int]$Id) Test-MuxAgentUnixGone -Id $Id -Probe { param([int]$Id) Import-MuxAgentUnixNative; [MuxAgentUnixNative]::ProbeLinux($Id) } }
     PidfdOpen = { param([int]$Id) Import-MuxAgentUnixNative; [MuxAgentUnixNative]::PidfdOpen($Id) }; SendKill = { param([int]$Fd) [MuxAgentUnixNative]::PidfdKill($Fd) }
     WaitExit = { param([int]$Fd, [int]$Milliseconds) [MuxAgentUnixNative]::PidfdExited($Fd, $Milliseconds) }; Close = { param([int]$Fd) [MuxAgentUnixNative]::Close($Fd) }
@@ -101,7 +105,7 @@ function New-MuxAgentMacKernel { [pscustomobject]@{
     ReadPath = { param([int]$Id) try { [Diagnostics.Process]::GetProcessById($Id).MainModule.FileName } catch { $null } }
     ReadArgv = { param([int]$Id) Import-MuxAgentUnixNative; [MuxAgentUnixNative]::ProcArgs($Id) }
     ReadCwd = { param([int]$Id) try { Import-MuxAgentUnixNative; [MuxAgentUnixNative]::Cwd($Id) } catch { $null } }
-    SandboxCheck = { Import-MuxAgentUnixNative; [MuxAgentUnixNative]::SandboxCheck() }; ResolveFile = { param($Path) Get-MuxAgentUnixLinkTarget -Path $Path }
+    SandboxCheck = { Import-MuxAgentUnixNative; [MuxAgentUnixNative]::SandboxCheck() }; ResolveFile = { param($Path) Import-MuxAgentUnixNative; [MuxAgentUnixNative]::RealPathMac($Path) }
     IsGone = { param([int]$Id) Test-MuxAgentUnixGone -Id $Id -Probe { param([int]$Id) Import-MuxAgentUnixNative; [MuxAgentUnixNative]::ProbeMac($Id) } }
     PidfdOpen = { param([int]$Id) -1 }; SendKill = { param([int]$Fd) $false }; WaitExit = { param([int]$Fd, [int]$Milliseconds) $false }; Close = { param([int]$Fd) }
     Sleep = { param([int]$Milliseconds) Start-Sleep -Milliseconds $Milliseconds } } }
