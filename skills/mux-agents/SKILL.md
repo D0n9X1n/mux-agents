@@ -16,6 +16,7 @@ Use this skill inside an RMUX pane on Windows; the tool refuses elsewhere.
 - Put free text only in files: `-TaskFile`, `-BriefFile` and `-BodyFile`.
 - Agent callers always pass `-BriefFile`, because a fork can fall back to brief-only.
 - Report results to your parent with `send parent`.
+- As a spawned agent, run `status -BodyFile <file>` each time you start a step of your task.
 - Never type into panes.
 - Run `focus` only when the user asks.
 - Children cannot spawn.
@@ -25,15 +26,19 @@ Use this skill inside an RMUX pane on Windows; the tool refuses elsewhere.
 ```
 pwsh -NoProfile -File "<entry>" spawn -Client <client> -TaskFile <task-file> -BriefFile <brief-file>
 pwsh -NoProfile -File "<entry>" list
+pwsh -NoProfile -File "<entry>" list -All
 pwsh -NoProfile -File "<entry>" focus <name>
 pwsh -NoProfile -File "<entry>" send <name> -BodyFile <body-file>
 pwsh -NoProfile -File "<entry>" send parent -BodyFile <body-file>
+pwsh -NoProfile -File "<entry>" status -BodyFile <status-file>
 pwsh -NoProfile -File "<entry>" read -Wait <seconds>
 pwsh -NoProfile -File "<entry>" read <name> -Lines <n>
 pwsh -NoProfile -File "<entry>" stop <name>
 ```
 
 `spawn` also takes `-Name <name>`, `-Split h|v` (split your pane instead of a new window) and `-NoFork`.
+
+`list` shows each live agent's state, what it is doing and its unread count; `list -All` adds the ended agents (at most 10, newest first).
 
 ## Listening
 

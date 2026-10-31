@@ -293,3 +293,9 @@ Describe 'MuxAgents board ended' -Tag 'windows' {
         Add-FakeRmuxRule -Fake $fake -Match '^-N list-panes ' -StdOut "%9|@5|300|ffffffffffff|worker`n"
         $all = (Invoke-BoardVerb $fake @('list', '-All')).Reply
         "$($all.running) $(@($all.agents).Count) $(@($all.agents | ForEach-Object name) -join ',')" | Should BeExactly '1 11 worker,a0,a5,a10,a3,a8,a1,a6,a11,a4,a9' } }
+
+Describe 'MuxAgents board skill' { It 'teaches status per step and list -All' {
+        # Catches: a missing or reworded rule, command or note.
+        $lines = [IO.File]::ReadAllLines([IO.Path]::Combine($repoRoot, 'skills', 'mux-agents', 'SKILL.md'))
+        (@('- As a spawned agent, run `status -BodyFile <file>` each time you start a step of your task.', 'pwsh -NoProfile -File "<entry>" status -BodyFile <status-file>', 'pwsh -NoProfile -File "<entry>" list -All',
+            '`list` shows each live agent''s state, what it is doing and its unread count; `list -All` adds the ended agents (at most 10, newest first).') | Where-Object { $_ -cnotin $lines }) -join ' ; ' | Should BeExactly '' } }
