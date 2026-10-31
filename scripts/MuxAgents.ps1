@@ -1510,6 +1510,18 @@ function Find-MuxAgentSidebar {
     $null
 }
 
+function Test-MuxAgentSizeRefusal {
+    # Whether a failed split refused only its -l size, by the multiplexer's own words on stderr: rmux 0.10.0
+    # "invalid split size '<n>': ..."; tmux 3.2+ "size invalid" or "size too small"; either "command split-window:
+    # unknown flag -l" (both captured 2026-10-30 on a private server). Anything else is a real failure.
+    param($Result)
+    if ($null -eq $Result -or $Result.ExitCode -eq 0) { return $false }
+    foreach ($line in ([string]$Result.StdErr -split "`r?`n")) {
+        if ($line -cmatch "^(invalid split size '.*'|size invalid|size too small|command split-window: unknown flag -l)") { return $true }
+    }
+    $false
+}
+
 function Close-MuxAgentSidebarPane {
     # Kills Pane; true only when rmux answered 0. A refused or thrown kill is false.
     param([Parameter(Mandatory)]$P, [Parameter(Mandatory)][string]$Pane)
@@ -1537,10 +1549,16 @@ function Invoke-MuxAgentSidebar {
         if ($found) { return [ordered]@{ pane = $found.Pane; window = $found.Window; opened = $false } }
         $command = @($P.Pwsh, '-NoProfile', '-File', $P.Entry, 'watch')
         $split = @('split-window', '-d', '-h', '-P', '-F', '#{pane_id}|#{window_id}', '-t', $caller.Pane) + @(Get-MuxAgentPaneEnvironment -P $P)
-        $created = Invoke-MuxAgentNative -P $P -Arguments ($split + @('-l', '42') + $command)
+        $created = Invoke-MuxAgentNative -P $P -Arguments ($split + @('-l', '42') + $command) -AllowFailure
+        if (Test-MuxAgentSizeRefusal $created) { $created = Invoke-MuxAgentNative -P $P -Arguments ($split + $command) -AllowFailure }
+        if ($created.ExitCode -ne 0) { Exit-MuxAgentCommand 1 'rmux' 'rmux call failed' }
         if (-not (([string]$created.StdOut).TrimEnd("`r`n") -match '^(%\d+)\|(@\d+)$')) { Exit-MuxAgentCommand 1 'rmux' 'rmux did not name the side-bar pane' }
         $pane = $Matches[1]; $window = $Matches[2]
-        $null = Invoke-MuxAgentNative -P $P -Arguments @('set-option', '-p', '-t', $pane, '@agent-role', 'sidebar')
+        $tagged = try { Invoke-MuxAgentNative -P $P -Arguments @('set-option', '-p', '-t', $pane, '@agent-role', 'sidebar') -AllowFailure } catch { $null }
+        if ($null -eq $tagged -or $tagged.ExitCode -ne 0) {
+            if (Close-MuxAgentSidebarPane -P $P -Pane $pane) { Exit-MuxAgentCommand 1 'rmux' "the side-bar pane $pane could not be tagged; it was closed" }
+            Exit-MuxAgentCommand 1 'sidebar' "the side-bar pane $pane could not be tagged or closed; close it with kill-pane -t $pane"
+        }
         [ordered]@{ pane = $pane; window = $window; opened = $true }
     }
 }

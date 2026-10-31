@@ -412,3 +412,48 @@ Describe 'MuxAgents sidebar callers' {
             "$($runs -join ' / ') | $(Get-SidebarCalls $fake)| $(Get-SidebarRoles $panes)" }
         $refused = '2 tagged an agent pane cannot open the side bar'
         ($results -join ';') | Should BeExactly ((@("$refused / $refused | | %1=|,%2=other|,%7=sidebar|") * 3) -join ';') } }
+
+Describe 'MuxAgents sidebar split failures' {
+    It 'knows the size refusals by their captured rmux and tmux words and nothing else' {
+        # Catches: any failure taken for a size refusal, any 'unknown flag' (-Q) taken for -l, a success taken for a refusal.
+        $answers = foreach ($case in @(@(1, "invalid split size '42': invalid digit found in string`r`n"), @(1, "size invalid`n"), @(1, "size too small`n"), @(1, "command split-window: unknown flag -l`n"),
+                @(1, "command split-window: unknown flag -Q`n"), @(1, "permission denied`n"), @(1, "no space for new pane`n"), @(1, "can't find window: x`n"), @(0, "size invalid`n"), @(1, ''))) {
+            "$(Test-MuxAgentSizeRefusal ([pscustomobject]@{ ExitCode = $case[0]; StdOut = ''; StdErr = $case[1] }))" }
+        "$($answers -join ',') $(Test-MuxAgentSizeRefusal $null)" | Should BeExactly 'True,True,True,True,False,False,False,False,False,False False' }
+    It 'retries without -l when the multiplexer refused the size, then tags the pane' {
+        # Catches: no retry, a retry that drops -h, -d or the caller target, a retry that keeps -l, no tag after the retry.
+        $fake = New-SidebarFake 'retry'; $panes = Add-SidebarMux $fake -RefuseSize
+        $run = Invoke-SidebarVerb $fake @('sidebar')
+        $splits = @($fake.Calls | Where-Object { $_[1] -eq 'split-window' } | ForEach-Object { $_ -join ' ' })
+        "$($run.Code) $($run.Reply.pane) $($run.Reply.opened) $($splits.Count)" | Should BeExactly '0 %7 True 2'
+        $splits[0] | Should BeExactly "-N split-window -d -h -P -F #{pane_id}|#{window_id} -t %1$(Get-SidebarPaneEnvironment $fake) -l 42 $($fake.Pwsh) -NoProfile -File $($fake.Entry) watch"
+        $splits[1] | Should BeExactly "-N split-window -d -h -P -F #{pane_id}|#{window_id} -t %1$(Get-SidebarPaneEnvironment $fake) $($fake.Pwsh) -NoProfile -File $($fake.Entry) watch"
+        Get-SidebarRoles $panes | Should BeExactly '%1=|,%2=other|,%7=sidebar|' }
+    It 'any other split failure refuses after exactly one split and tags nothing' {
+        # Catches: a retry on any failure (2 splits for permission denied), the failure swallowed, a tag on no pane.
+        $answers = foreach ($stderr in 'permission denied', "can't find window: x", 'command split-window: unknown flag -Q') {
+            $fake = New-SidebarFake "no split $($stderr.Length)"; $null = Add-SidebarMux $fake -SplitError $stderr
+            $run = Invoke-SidebarVerb $fake @('sidebar')
+            "$($run.Code) $($run.Reply.check) $($run.Reply.message) $(Get-SidebarCount $fake 'split-window') $(Get-SidebarCount $fake 'set-option')" }
+        ($answers -join ';') | Should BeExactly ((@('1 rmux rmux call failed 1 0') * 3) -join ';') }
+    It 'a size refusal whose retry also fails refuses after exactly two splits' {
+        # Catches: endless retries, the second failure swallowed (a reply without a pane).
+        $fake = New-SidebarFake 'two splits'; $null = Add-SidebarMux $fake -SplitError "invalid split size '42': invalid digit found in string"
+        $run = Invoke-SidebarVerb $fake @('sidebar')
+        "$($run.Code) $($run.Reply.check) $(Get-SidebarCount $fake 'split-window') $(Get-SidebarCount $fake 'set-option')" | Should BeExactly '1 rmux 2 0' }
+    It 'a tag that fails or throws kills the new pane and says so' {
+        # Catches: no kill after a thrown tag (the throw escapes as 1 internal, the untagged pane stays), the kill aimed elsewhere.
+        $answers = foreach ($how in 'exit', 'throw') {
+            $fake = New-SidebarFake "tag $how"; $panes = Add-SidebarMux $fake -TagFail $how
+            $run = Invoke-SidebarVerb $fake @('sidebar')
+            "$($run.Code) $($run.Reply.check) $($run.Reply.message) | $(@($fake.Calls | Where-Object { $_[1] -eq 'kill-pane' } | ForEach-Object { $_ -join ' ' }) -join ';') | $(Get-SidebarRoles $panes)" }
+        $killed = '1 rmux the side-bar pane %7 could not be tagged; it was closed | -N kill-pane -t %7 | %1=|,%2=other|'
+        ($answers -join ';') | Should BeExactly "$killed;$killed" }
+    It 'a tag and a kill that both fail refuse sidebar, name the pane to close, and never say it was closed' {
+        # Catches: 'it was closed' after a failed kill, a thrown kill escaping as 1 internal, the pane not named.
+        $answers = foreach ($how in @(@('exit', 'exit'), @('throw', 'throw'), @('exit', 'throw'))) {
+            $fake = New-SidebarFake "tag kill $($how -join '-')"; $panes = Add-SidebarMux $fake -TagFail $how[0] -KillFail $how[1]
+            $run = Invoke-SidebarVerb $fake @('sidebar')
+            "$($run.Code) $($run.Reply.check) $($run.Reply.message) | $(Get-SidebarRoles $panes)" }
+        $left = '1 sidebar the side-bar pane %7 could not be tagged or closed; close it with kill-pane -t %7 | %1=|,%2=other|,%7=|'
+        ($answers -join ';') | Should BeExactly "$left;$left;$left" } }
