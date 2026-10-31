@@ -285,11 +285,12 @@ Describe 'MuxAgents launcher and transport' -Tag 'windows' {
         foreach ($name in $names) { $saved[$name] = [Environment]::GetEnvironmentVariable($name); [Environment]::SetEnvironmentVariable($name, 'x') }
         try {
             Clear-MuxAgentIdentity
-            @($script:MuxAgentScrub | Where-Object { [Environment]::GetEnvironmentVariable($_) }).Count | Should Be 0
+            # Absent, not empty: an empty CLAUDECODE= is still a set variable.
+            @($script:MuxAgentScrub | Where-Object { $null -ne [Environment]::GetEnvironmentVariable($_) }).Count | Should Be 0
             [Environment]::GetEnvironmentVariable('ANTHROPIC_BASE_URL') | Should BeExactly 'x'
             $script:MuxAgentScrub.Count | Should Be 12
         }
-        finally { foreach ($name in $names) { [Environment]::SetEnvironmentVariable($name, $saved[$name]) } }
+        finally { foreach ($name in $names) { [Environment]::SetEnvironmentVariable($name, $(if ($null -eq $saved[$name]) { [NullString]::Value } else { $saved[$name] })) } }
     }
 
     It 'P1 state root, hash vector and lock names carry no Terminal Profiles name' {

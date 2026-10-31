@@ -2,6 +2,11 @@
 # Only the server inherits HOME, PATH and MUX_IT_*; this process gets its variables back. The server has no
 # MUX_AGENTS_STATE: the root pane sets it from MUX_IT_STATE, as a user would in their own shell, so each new pane gets
 # it only if spawn passes it.
+function Set-MuxAgentItVariable {
+    # Sets Name to Value, or removes it when Value is $null.
+    param([Parameter(Mandatory)][string]$Name, [AllowNull()]$Value)
+    if ($null -eq $Value) { [Environment]::SetEnvironmentVariable($Name, [NullString]::Value) } else { [Environment]::SetEnvironmentVariable($Name, [string]$Value) }
+}
 function Start-MuxAgentItServer {
     param([Parameter(Mandatory)][string]$Root, [Parameter(Mandatory)][string]$Driver)
     $here = $PSScriptRoot; $repo = Split-Path -Parent (Split-Path -Parent $here); $sid = [guid]::NewGuid().ToString()
@@ -17,9 +22,11 @@ function Start-MuxAgentItServer {
     $sock = "/tmp/mux-it-$PID-$([guid]::NewGuid().ToString('N').Substring(0, 6)).sock"
     $set = [ordered]@{ HOME = "$Root/home"; PATH = "$Root/bin:$env:PATH"; MUX_AGENTS_STATE = $null; TMUX = $null; TMUX_PANE = $null
         MUX_IT_DIR = $Root; MUX_IT_STATE = "$Root/state"; MUX_IT_PWSH = [IO.Path]::Combine($PSHOME, 'pwsh'); MUX_IT_ENTRY = "$repo/scripts/mux-agent.ps1"; MUX_IT_DRIVER = $Driver; MUX_IT_SOCKET = $sock }
-    $saved = @{}; foreach ($k in $set.Keys) { $saved[$k] = [Environment]::GetEnvironmentVariable($k); [Environment]::SetEnvironmentVariable($k, $set[$k]) }
+    # Set-MuxAgentItVariable removes a variable for $null: PowerShell passes $null to a [string] parameter as '', and
+    # .NET keeps an empty variable, so tmux would inherit MUX_AGENTS_STATE= and TMUX= instead of none.
+    $saved = @{}; foreach ($k in $set.Keys) { $saved[$k] = [Environment]::GetEnvironmentVariable($k); Set-MuxAgentItVariable $k $set[$k] }
     try { & tmux -S $sock -f /dev/null new-session -d -x 200 -y 50 -c "$Root/work" -e "CLAUDE_CODE_SESSION_ID=$sid" -e 'CLAUDE_CODE_ENTRYPOINT=cli' "$Root/bin/claude" --dangerously-skip-permissions; $started = $LASTEXITCODE -eq 0 }
-    finally { foreach ($k in $saved.Keys) { [Environment]::SetEnvironmentVariable($k, $saved[$k]) } }
+    finally { foreach ($k in $saved.Keys) { Set-MuxAgentItVariable $k $saved[$k] } }
     [pscustomobject]@{ Dir = $Root; Socket = $sock; SessionId = $sid; Built = $built; Started = $started }
 }
 function Wait-MuxAgentItFile { param([string]$Path, [int]$Seconds = 240) for ($i = 0; $i -lt $Seconds * 2 -and -not (Test-Path -LiteralPath $Path); $i++) { Start-Sleep -Milliseconds 500 } }

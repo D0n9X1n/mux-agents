@@ -1423,8 +1423,9 @@ $script:MuxAgentScrub = @('CLAUDECODE', 'CLAUDE_CODE_SESSION_ID', 'CLAUDE_CODE_M
     'CLAUDE_CODE_SESSION_ATTENDED', 'CLAUDE_CODE_ENTRYPOINT', 'CLAUDE_CODE_EXECPATH', 'CLAUDE_PID', 'CLAUDE_EFFORT', 'COPILOT_AGENT_SESSION_ID', 'COPILOT_CLI')
 
 function Clear-MuxAgentIdentity {
-    # Removes the parent's client identity variables from this process only.
-    foreach ($name in $script:MuxAgentScrub) { [Environment]::SetEnvironmentVariable($name, $null) }
+    # Removes the parent's client identity variables from this process only. [NullString]::Value, not $null: PowerShell
+    # passes $null to a [string] parameter as '', and .NET on Unix keeps an empty variable instead of removing it.
+    foreach ($name in $script:MuxAgentScrub) { [Environment]::SetEnvironmentVariable($name, [NullString]::Value) }
 }
 
 function Wait-MuxAgentCommit {

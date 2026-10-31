@@ -279,7 +279,7 @@ Describe 'MuxAgents T1.1 dispatcher' -Tag 'windows' {
         $name = 'RMUX_AGENT_T11_' + [guid]::NewGuid().ToString('N')
         [Environment]::SetEnvironmentVariable($name, 'marker value', 'Process')
         try { $providers = New-MuxAgentProviders -Entry (Join-Path $repoRoot 'scripts\mux-agent.ps1') }
-        finally { [Environment]::SetEnvironmentVariable($name, $null, 'Process') }
+        finally { [Environment]::SetEnvironmentVariable($name, [NullString]::Value, 'Process') }
         "[$($providers.Env[$name])]" | Should BeExactly '[marker value]'
         $providers.Entry | Should BeExactly (Join-Path $repoRoot 'scripts\mux-agent.ps1')
         $providers.Launcher | Should BeExactly (Join-Path $repoRoot 'scripts\mux-agent-launcher.ps1')

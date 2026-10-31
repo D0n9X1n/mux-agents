@@ -123,7 +123,7 @@ Describe 'MuxAgents activation provider refusals' {
             $answers = foreach ($pair in @(@('mux-agent.ps1', 'list'), @('mux-agent-launcher.ps1', 'x/spec.json'))) {
                 $lines = @(& $pwsh -NoProfile -File (Join-Path $repoRoot "scripts/$($pair[0])") $pair[1]); $reply = $lines[0] | ConvertFrom-Json
                 "$LASTEXITCODE $($reply.code) $($reply.check) $($reply.ok) $($lines.Count)" } }
-        finally { foreach ($k in $saved.Keys) { [Environment]::SetEnvironmentVariable($k, $saved[$k]) } }
+        finally { foreach ($k in $saved.Keys) { [Environment]::SetEnvironmentVariable($k, $(if ($null -eq $saved[$k]) { [NullString]::Value } else { $saved[$k] })) } }
         ($answers -join ';') | Should BeExactly "$want;$want" } }
 Describe 'MuxAgents activation pane environment' {
     It 'passes the selected state root to a new Unix pane with -e, and nothing on Windows' {
