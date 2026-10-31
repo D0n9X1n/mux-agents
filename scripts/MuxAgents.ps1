@@ -1458,6 +1458,31 @@ function Format-MuxAgentBoard {
     $lines -join "`n"
 }
 
+function New-MuxAgentFrameWriter {
+    # A writer of whole frames to Stream as UTF-8 without BOM, flushed; a closed stream throws, which ends watch.
+    param([Parameter(Mandatory)][IO.Stream]$Stream)
+    $encoding = [Text.UTF8Encoding]::new($false)
+    { param([string]$Frame) $bytes = $encoding.GetBytes($Frame); $Stream.Write($bytes, 0, $bytes.Length); $Stream.Flush() }.GetNewClosure()
+}
+
+function Start-MuxAgentWatch {
+    # The side-bar loop for Caller's pane. Each tick: ask the pane itself, read the board (-All -WithExitCode), write
+    # ANSI home and clear plus the board, sleep 2 s. Ends 'pane-closed' when the probe answers gone (B4's rule) and
+    # 'output-closed' when a write throws. A failed or thrown probe is unknown, not gone. A failed board read still
+    # writes a frame (the last board and 'refresh failed'), so a closed terminal is found even when nothing else answers.
+    param([Parameter(Mandatory)]$P, [Parameter(Mandatory)]$Caller, [Parameter(Mandatory)][scriptblock]$Write)
+    $reader = Get-MuxAgentMailboxKey -Pane $Caller.Pane -Tag $Caller.AgentTag
+    $clear = [string][char]27 + '[H' + [string][char]27 + '[2J'
+    $last = "mux-agents $([char]0x00B7) ? running"
+    while ($true) {
+        $probe = try { Invoke-MuxAgentNative -P $P -Arguments @('display-message', '-p', '-t', $Caller.Pane, '#{pane_id}|#{@agent-role}') -AllowFailure } catch { $null }
+        if (Test-MuxAgentPaneGone $probe) { return 'pane-closed' }
+        $text = try { $last = Format-MuxAgentBoard (Get-MuxAgentBoard -P $P -Caller $Caller -ReaderKey $reader -All -WithExitCode); $last } catch { $last + "`nrefresh failed" }
+        try { & $Write ($clear + $text.Replace("`n", "`r`n") + "`r`n") } catch { return 'output-closed' }
+        & $P.Sleep 2000
+    }
+}
+
 # The pane launcher.
 
 $script:MuxAgentScrub = @('CLAUDECODE', 'CLAUDE_CODE_SESSION_ID', 'CLAUDE_CODE_MESSAGING_SOCKET', 'CLAUDE_CODE_MESSAGING_TOKEN', 'CLAUDE_CODE_CHILD_SESSION',

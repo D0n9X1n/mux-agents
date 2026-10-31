@@ -160,3 +160,61 @@ Describe 'MuxAgents sidebar board' {
         $text = Format-MuxAgentBoard (Get-MuxAgentBoard -P $fake -Caller (Resolve-MuxAgentCaller -P $fake) -ReaderKey 'pane-1' -All -WithExitCode)
         "$([regex]::IsMatch($text, '[\x00-\x09\x0B-\x1F\x7F\u0080-\u009F]'))" | Should BeExactly 'False'
         $text | Should BeExactly "mux-agents $d 2 running`n$f w[31mone  claude  4m`n  fix[2Jit`n$f two  claude  4m`n  st]2;tatus`n$o gone[H  exited 2" } }
+
+Describe 'MuxAgents sidebar watch loop' {
+    $e = [char]27; $d = [char]0x00B7; $f = [char]0x25CF; $o = [char]0x25CB
+    $board = "mux-agents $d 1 running`r`n$f worker  claude  4m`r`n  testing the parser`r`n$o done  exited 0`r`n"
+    $frame = "$e[H$e[2J$board"
+    $write = { param($Frames) { param($Frame) $Frames.Add($Frame); if ($Frames.Count -gt 5) { throw 'runaway' } }.GetNewClosure() }
+    It 'asks its own pane each tick, draws the -All board after home and clear every 2 s, and ends when the pane is gone' {
+        # Catches: no -All (no done row), no -WithExitCode, no home/clear, LF without CR, another interval, another pane or format probed, drawing before the probe, no sleep.
+        $fake = New-SidebarWatchFake 'watch' -Probes 'live', 'live', 'gone'
+        $frames = [Collections.Generic.List[string]]::new()
+        $ended = Start-MuxAgentWatch -P $fake -Caller (Resolve-MuxAgentCaller -P $fake) -Write (& $write $frames)
+        "$ended $($frames.Count) $(($fake.Clock - [DateTime]::new(2026, 10, 29, 12, 0, 0, [DateTimeKind]::Utc)).TotalMilliseconds) $(Get-SidebarProbes $fake)" | Should BeExactly 'pane-closed 2 4000 3'
+        # Ordinal: -ceq compares by culture, which ignores ESC, so a frame without its escapes would still be equal.
+        "$([string]::Equals($frames[0], $frame, [StringComparison]::Ordinal)) $([string]::Equals($frames[1], $frame, [StringComparison]::Ordinal))" | Should BeExactly 'True True' }
+    It 'a thrown or failed probe is unknown, not gone: the loop draws on until the pane answers gone' {
+        # Catches: a thrown probe ending or crashing the loop, a failed probe (exit 1) counted as gone.
+        $fake = New-SidebarWatchFake 'watch probe' -Probes 'throw', 'fail', 'live', 'gone'
+        $frames = [Collections.Generic.List[string]]::new()
+        $ended = Start-MuxAgentWatch -P $fake -Caller (Resolve-MuxAgentCaller -P $fake) -Write (& $write $frames)
+        "$ended $($frames.Count) $(Get-SidebarProbes $fake)" | Should BeExactly 'pane-closed 3 4' }
+    It 'ends when its output fails, before sleeping' {
+        # Catches: a write error swallowed (3 probes), the error thrown out of watch, a sleep before the return.
+        $fake = New-SidebarWatchFake 'watch output' -Probes 'live', 'live', 'gone'
+        $ended = Start-MuxAgentWatch -P $fake -Caller (Resolve-MuxAgentCaller -P $fake) -Write { param($Frame) throw [IO.IOException]::new('EIO') }
+        "$ended $(Get-SidebarProbes $fake) $($fake.Clock.ToString('o'))" | Should BeExactly 'output-closed 1 2026-10-29T12:00:00.0000000Z' }
+    It 'the frame writer writes UTF-8 without BOM and throws once its stream is closed' {
+        # Catches: a BOM, another encoding, a writer that swallows a closed stream.
+        $stream = [IO.MemoryStream]::new(); $writer = New-MuxAgentFrameWriter -Stream $stream
+        & $writer ('a' + [char]0x25CF + [char]0x00B7 + "`r`n")
+        $hex = [Convert]::ToHexString($stream.ToArray()); $stream.Dispose()
+        "$hex $(try { & $writer 'b'; 'wrote' } catch { 'threw' })" | Should BeExactly '61E2978FC2B70D0A threw' }
+    Context 'board read failures' {
+        It 'a failed board read still writes a frame: the last board and refresh failed; the board is read as the bar pane with -All -WithExitCode' {
+            # Catches: a failed read skipping its frame (a dead terminal never found), the last board dropped, another
+            # reader key, -All or -WithExitCode not passed, a board error ending or escaping the loop.
+            $fake = New-SidebarWatchFake 'watch board' -Probes 'live', 'live', 'live', 'gone'
+            $global:sidebarBoardCalls = [Collections.Generic.List[string]]::new()
+            $global:sidebarBoard = ${function:Get-MuxAgentBoard}
+            Mock Get-MuxAgentBoard {
+                $global:sidebarBoardCalls.Add("$ReaderKey all=$([bool]$All) exit=$([bool]$WithExitCode)")
+                if ($global:sidebarBoardCalls.Count -ne 2) { throw [TimeoutException]::new('lock') }
+                & $global:sidebarBoard -P $P -Caller $Caller -ReaderKey $ReaderKey -All:$All -WithExitCode:$WithExitCode }
+            try {
+                $frames = [Collections.Generic.List[string]]::new()
+                $ended = Start-MuxAgentWatch -P $fake -Caller (Resolve-MuxAgentCaller -P $fake) -Write (& $write $frames)
+                "$ended $($frames.Count) $(@($global:sidebarBoardCalls | Select-Object -Unique) -join ';')" | Should BeExactly 'pane-closed 3 pane-7 all=True exit=True'
+                $frames[0] | Should BeExactly "$e[H$e[2Jmux-agents $d ? running`r`nrefresh failed`r`n"
+                $frames[1] | Should BeExactly $frame
+                $frames[2] | Should BeExactly "$e[H$e[2J$($board)refresh failed`r`n" }
+            finally { Remove-Variable -Name sidebarBoardCalls, sidebarBoard -Scope Global } }
+        It 'with the probe failing, the board read failing and the writer throwing IOException, it ends at the first tick' {
+            # Catches: no frame written when the board read fails (the loop never meets the dead terminal: runaway after 5
+            # sleeps), a failed probe taken as gone (pane-closed), the write error swallowed.
+            $fake = New-SidebarWatchFake 'watch dead' -Probes 'fail'
+            Stop-SidebarRunaway $fake
+            Mock Get-MuxAgentBoard { throw [TimeoutException]::new('lock') }
+            $ended = try { Start-MuxAgentWatch -P $fake -Caller (Resolve-MuxAgentCaller -P $fake) -Write { param($Frame) throw [IO.IOException]::new('EIO') } } catch { "threw $($_.Exception.Message)" }
+            "$ended $(Get-SidebarProbes $fake) $($fake.Clock.ToString('o'))" | Should BeExactly 'output-closed 1 2026-10-29T12:00:00.0000000Z' } } }
