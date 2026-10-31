@@ -93,3 +93,14 @@ Describe 'MuxAgents runtime override on linux' -Tag 'linux' {
     It 'builds real providers on an affected version with the override and sets P.Advisory' { Get-RuntimeOverrideBuild | Should BeExactly "True linux$overrideWant" } }
 Describe 'MuxAgents runtime override on macos' -Tag 'macos' {
     It 'builds real providers on an affected version with the override and sets P.Advisory' { Get-RuntimeOverrideBuild | Should BeExactly "True macos$overrideWant" } }
+Describe 'MuxAgents runtime replies' {
+    It 'adds advisory last to success and failure replies, and -Text prints advisory: <text>, only when P.Advisory is set' {
+        Register-MuxAgentVerb -Verb 'rt-ok' -Handler { param($P, $Request) [ordered]@{ value = 'v' } } -Usage 'usage: rt-ok'
+        Register-MuxAgentVerb -Verb 'rt-no' -Handler { param($P, $Request) Exit-MuxAgentCommand 2 'usage' 'rt refused' } -Usage 'usage: rt-no'
+        try {
+            $fake = New-FakeMuxAgentProviders
+            $got = foreach ($advisory in $null, 'ADV') { $fake.Advisory = $advisory
+                foreach ($argv in @(@('rt-ok'), @('rt-ok', '-Text'), @('rt-no'), @('rt-no', '-Text'))) { $r = Invoke-MuxAgentCommand -P $fake -Arguments $argv; "$($r.Code)|$($r.Text)" } }
+            ($got -join "`n") | Should BeExactly ((@('0|{"ok":true,"verb":"rt-ok","value":"v"}', '0|value: v', '2|{"ok":false,"verb":"rt-no","code":2,"check":"usage","message":"rt refused"}', "2|code: 2`ncheck: usage`nmessage: rt refused",
+                '0|{"ok":true,"verb":"rt-ok","value":"v","advisory":"ADV"}', "0|value: v`nadvisory: ADV", '2|{"ok":false,"verb":"rt-no","code":2,"check":"usage","message":"rt refused","advisory":"ADV"}', "2|code: 2`ncheck: usage`nmessage: rt refused`nadvisory: ADV")) -join "`n") }
+        finally { $script:MuxAgentVerbs.Remove('rt-ok'); $script:MuxAgentVerbs.Remove('rt-no') } } }

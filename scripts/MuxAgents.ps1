@@ -99,6 +99,8 @@ function Invoke-MuxAgentCommand {
         $code = 0
     }
     catch { $result = ConvertTo-MuxAgentFailure $_ $verb; $code = $result.code }
+    # The runtime advisory (#25) rides on every reply, success or failure, as its last field.
+    if ($P.Advisory) { $result['advisory'] = [string]$P.Advisory }
     [pscustomobject]@{ Code = $code; Text = (Format-MuxAgentResult -Data $result -Text:$text) }
 }
 
