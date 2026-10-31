@@ -284,8 +284,9 @@ Describe 'MuxAgents foundation CI' {
         $pester = @($pwshLines | Where-Object { $_ -cmatch '^Install-Module Pester -RequiredVersion 4\.10\.1(\s|$)' }).Count -gt 0
         $yaml = @($pwshLines | Where-Object { $_ -cmatch '^Install-Module powershell-yaml -RequiredVersion 0\.4\.12(\s|$)' }).Count -gt 0
         "$tempEnv $tmpEnv $pester $yaml" | Should BeExactly 'True True True True'
-        $last = if ($test.Count -gt 0) { $test[-1].run }
-        "$last" | Should BeExactly 'pwsh -NoProfile -File tests/Invoke-MuxAgentTests.ps1'
+        # The Pester runner is the last pwsh step; the Rust steps follow it.
+        $last = @($test | Where-Object { $_.shell -ceq 'pwsh' }) | Select-Object -Last 1
+        "$($last.run)" | Should BeExactly 'pwsh -NoProfile -File tests/Invoke-MuxAgentTests.ps1'
     }
     It 'integration installs tmux and Pester 4.10.1, then runs only the integration suites last' {
         $it = @(Get-JobSteps 'integration'); $lines = @($it | ForEach-Object { Get-RunLines $_ })
@@ -380,7 +381,7 @@ Describe 'MuxAgents foundation hygiene' {
             "pull_request_template.md=$(Get-ReviewedHash '.github/pull_request_template.md')"
         )
         $actual -join ' ; ' | Should BeExactly (@(
-                'ci.yml=7ed48e76957abf7bddef545f0b601af81e2bb68f8e5b3dcbf28a832b694fb2bf'
+                'ci.yml=9dda3efdce369256dfdc8d91b946c02f0a778fdffb92111a42f3662e9bbc45d7'
                 'bug.yml=017ee31a64ba465010af2ab3fa839339ec28b7170dd3ce9df66e632e2561898a'
                 'feature.yml=c70bb8bff8d86a444995e16a182b20e4c635e1cd4002b47482dc571980f999c1'
                 'pull_request_template.md=84df40d505453b1ed0938b730278c8a8ac5a8b04923b996ae2d3c09a501f3f1b'
