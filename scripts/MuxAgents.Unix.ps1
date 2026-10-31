@@ -116,3 +116,21 @@ function Assert-MuxAgentMacSandbox { param($Environment, [Parameter(Mandatory)]$
     if ("$($Environment['SANDBOX_RUNTIME'])" -ceq '1') { Exit-MuxAgentCommand 2 'sandbox' 'SANDBOX_RUNTIME=1 is set' }
     $result = try { [int](& $Kernel.SandboxCheck) } catch { Exit-MuxAgentCommand 2 'sandbox' 'sandbox_check failed' }
     if ($result -ne 0) { Exit-MuxAgentCommand 2 'sandbox' 'sandbox_check reports a sandbox' } }
+# Open on Unix: the pidfd first (-1 on macOS or without pidfd), then the start, so the start belongs to the process the fd holds.
+# Pidfd lifetime: a row that SameStart rejects keeps the fd this returns. B1's Invoke-MuxAgentStop passes only the two starts to
+# SameStart and drops the handle, so no Unix member sees it; closing it needs a core Release member that B2 does not add. The fd
+# ends when mux-agent exits (one verb per process); a pidfd pins no pid number and signals nothing. The server identity
+# (& $P.Open $serverPid) and the agent check in Resolve-MuxAgentCaller likewise hold their fd, never signalled, until exit.
+function Open-MuxAgentUnixProcess { param([int]$Id, [Parameter(Mandatory)]$Kernel)
+    $fd = [int](& $Kernel.PidfdOpen $Id); $start = & $Kernel.ReadStart $Id
+    if ($null -eq $start) { if ($fd -ge 0) { $null = & $Kernel.Close $fd }; return $null }
+    [pscustomobject]@{ Id = $Id; Start = $start; Process = $null; Fd = $fd } }
+# Kill on Unix: SIGKILL only through the pidfd bound at Open, which cannot reach a reused PID; true when it exited within 5 s.
+# Without a pidfd nothing is sent: true only when the exit is shown within 5 s (IsGone: ESRCH, or the pid now has another
+# start). An unreadable start or a probe that cannot tell is not an exit, so the pid is reported.
+function Stop-MuxAgentUnixProcess { param([Parameter(Mandatory)]$Opened, [Parameter(Mandatory)]$Kernel)
+    if ($Opened.Fd -ge 0) { try { $null = & $Kernel.SendKill $Opened.Fd; return [bool](& $Kernel.WaitExit $Opened.Fd 5000) } finally { $null = & $Kernel.Close $Opened.Fd } }
+    for ($round = 0; $round -lt 50; $round++) {
+        $null = & $Kernel.Sleep 100; $now = & $Kernel.ReadStart $Opened.Id
+        if (($null -ne $now -and $now -ne $Opened.Start) -or (& $Kernel.IsGone $Opened.Id)) { return $true } }
+    $false }

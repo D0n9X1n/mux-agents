@@ -139,3 +139,64 @@ Describe 'MuxAgents unix sandbox' {
         $answers = foreach ($case in @(@('1', 0), @('', 1), @('', -1), @('', $null), @('', 0))) {
             $k = New-UnixFakeKernel; $k.Sandbox = $case[1]; Get-UnixRefusal { Assert-MuxAgentMacSandbox -Environment @{ SANDBOX_RUNTIME = $case[0] } -Kernel $k } }
         ($answers -join ';') | Should BeExactly '2 sandbox SANDBOX_RUNTIME=1 is set;2 sandbox sandbox_check reports a sandbox;2 sandbox sandbox_check reports a sandbox;2 sandbox sandbox_check failed;none' } }
+function New-UnixStopFake {
+    # B1 T8's stop scenario (agent 'worker', pane %9, tree 300 -> 310, 320); Unix Open, Kill, SameStart, StopReport over $global:unixStopKernel.
+    $fake = New-FakeMuxAgentProviders; $fake.PrivateDirectories = { param([string[]]$Paths) foreach ($path in $Paths) { $null = [IO.Directory]::CreateDirectory($path) } }
+    Add-FakeRmuxRule -Fake $fake -Match '#\{session_id\}\|#\{@agent-id\}$' -StdOut "`$3|`n"
+    $folder = [IO.Path]::Combine((Get-MuxAgentStateDirectory -P $fake -Caller (Resolve-MuxAgentCaller -P $fake)), 'agents', 'aaaaaaaaaaaa'); $null = [IO.Directory]::CreateDirectory($folder)
+    Write-MuxAgentJson -Path (Join-Path $folder 'record.json') -Value ([ordered]@{ schema = 1; id = 'aaaaaaaaaaaa'; name = 'worker'; client = 'claude'; sessionId = '0f11fc2f-2032-48ef-a920-4af2a8e5af50'; context = 'brief'; reason = 'human'; session = '$3'; pane = '%9'; window = '@5'; parentPane = '%1'; parentAgent = $null; directory = $fake.Cwd; createdAt = 'x' })
+    Write-MuxAgentJson -Path (Join-Path $folder 'commit.json') -Value ([ordered]@{ committedAt = 'x' })
+    Add-FakeRmuxRule -Fake $fake -Match '^-N list-panes ' -StdOut "%1|@1|100||`n%9|@5|300|aaaaaaaaaaaa|worker`n"
+    foreach ($row in @(@(300, 900, '/usr/bin/pwsh'), @(310, 300, '/usr/bin/claude'), @(320, 300, '/usr/bin/sleep'))) { $fake.Rows.Add((New-FakeMuxAgentRow $row[0] $row[1] $row[2] 'x')) }
+    foreach ($id in 900, 300, 310, 320) { $global:unixStopKernel.Live[$id] = $id * 10 }   # the fake rows' starts, so the server key is unchanged
+    $fake.Open = { param([int]$Id) Open-MuxAgentUnixProcess -Id $Id -Kernel $global:unixStopKernel }; $fake.Kill = { param($Opened) Stop-MuxAgentUnixProcess -Opened $Opened -Kernel $global:unixStopKernel }
+    $fake.SameStart = { param($Opened, $Listed) Test-MuxAgentUnixSameStart $Opened $Listed }; $fake.StopReport = { param($Left) Get-MuxAgentUnixStopReport -Left $Left }
+    $fake }
+Describe 'MuxAgents unix open and kill' {
+    It 'Open takes the pidfd first, then the start; a pid gone before or after pidfd_open opens nothing and leaks no fd' {
+        $k = New-UnixFakeKernel; $k.Live[300] = 3000; $k.Live[301] = 3010; $k.OnOpen = { param($Id) if ($Id -eq 301) { $k.Live.Remove(301) } }.GetNewClosure()
+        $opened = Open-MuxAgentUnixProcess -Id 300 -Kernel $k
+        "$($opened.Id) $($opened.Start) $($opened.Fd) $($null -eq $opened.Process)|$($null -eq (Open-MuxAgentUnixProcess -Id 301 -Kernel $k))|$($null -eq (Open-MuxAgentUnixProcess -Id 302 -Kernel $k))|$($k.Log -join ',')|$($k.Closed -join ',')" | Should BeExactly '300 3000 1000 True|True|True|pidfd 300,start 300,pidfd 301,start 301,pidfd 302,start 302|1001' }
+    It 'Kill sends SIGKILL on the opened pidfd, waits for exit and closes the fd' {
+        $k = New-UnixFakeKernel; $k.Live[300] = 3000; $opened = Open-MuxAgentUnixProcess -Id 300 -Kernel $k
+        "$(Stop-MuxAgentUnixProcess -Opened $opened -Kernel $k)|$($k.Sent -join ',')|$($k.Closed -join ',')|$($k.Live.ContainsKey(300))" | Should BeExactly 'True|300/3000|1000|False' }
+    It 'a PID reused after the last check is never signalled: the fd stays bound to the old process' {
+        $k = New-UnixFakeKernel; $k.Live[300] = 3000; $opened = Open-MuxAgentUnixProcess -Id 300 -Kernel $k; $k.Live[300] = 4444
+        "$(Stop-MuxAgentUnixProcess -Opened $opened -Kernel $k)|$($k.Sent.Count)|$($k.Live[300])" | Should BeExactly 'True|0|4444' }
+    It 'without a pidfd Kill sends nothing; only a pid that is gone, or now has another start, counts as exited; an unreadable start does not' {
+        $k = New-UnixFakeKernel; $k.Pidfd = $false; foreach ($id in 300, 310, 320, 330) { $k.Live[$id] = $id * 10 }
+        $k.OnSleep = { param($Count) if ($Count -eq 3) { $k.Live[300] = 3999 }; if ($Count -eq 4) { $k.Live.Remove(330) } }.GetNewClosure()
+        $h = @{}; foreach ($id in 300, 310, 320, 330) { $h[$id] = Open-MuxAgentUnixProcess -Id $id -Kernel $k }; $k.Unreadable[320] = $true
+        $answers = foreach ($id in 300, 330, 310, 320) { "$(Stop-MuxAgentUnixProcess -Opened $h[$id] -Kernel $k)/$($k.Sleeps)" }
+        "$($h[300].Fd) $($answers -join ' ')|$(@($k.Log | Where-Object { $_ -like 'send*' }).Count)|$($k.Closed.Count)|$($k.Live.ContainsKey(320))" | Should BeExactly '-1 True/3 True/4 False/54 False/104|0|0|True' }
+    It 'with a pidfd, a live process that SIGKILL and the exit wait both fail on is not killed; the fd is still closed' {
+        $k = New-UnixFakeKernel; $k.Live[300] = 3000; $opened = Open-MuxAgentUnixProcess -Id 300 -Kernel $k
+        $k.SendKill = { param([int]$Fd) $k.Log.Add("send $Fd"); $false }.GetNewClosure(); $k.WaitExit = { param([int]$Fd, [int]$Milliseconds) $false }
+        "$(Stop-MuxAgentUnixProcess -Opened $opened -Kernel $k)|$(@($k.Log | Where-Object { $_ -like 'send*' }) -join ',')|$($k.Closed -join ',')|$($k.Live[300])" | Should BeExactly 'False|send 1000|1000|3000' } }
+Describe 'MuxAgents unix stop' {
+    Context 'linux' {
+        It 'kills only through pidfds; a start that differs after pidfd_open sends nothing and is reported' {
+            $global:unixStopKernel = New-UnixFakeKernel
+            try {
+                $fake = New-UnixStopFake; $global:unixStopKernel.OnOpen = { param($Id) if ($Id -eq 320) { $global:unixStopKernel.Live[320] = 3999 } }
+                $reply = (Invoke-MuxAgentCommand -P $fake -Arguments @('stop', 'worker')).Text | ConvertFrom-Json
+                "$(@($global:unixStopKernel.Sent | Sort-Object) -join ',')|$($reply.survivors)|$(@($reply.survivorPids) -join ',')|$($global:unixStopKernel.Live[320])|$(@($reply.PSObject.Properties.Name) -join ',')" | Should BeExactly '300/3000,310/3100|1|320|3999|ok,verb,name,pane,survivors,survivorPids,directory,resume' }
+            finally { Remove-Variable -Name unixStopKernel -Scope Global } } }
+    Context 'macos and no pidfd' {
+        It 'signals nothing and lists only what kill-pane left' {
+            $global:unixStopKernel = New-UnixFakeKernel; $global:unixStopKernel.Pidfd = $false
+            try {
+                $fake = New-UnixStopFake
+                Add-FakeRmuxRule -Fake $fake -Match '^-N kill-pane ' -Script { param($Arguments) $global:unixStopKernel.Live.Remove(300); $global:unixStopKernel.Live.Remove(320); $null }
+                $reply = (Invoke-MuxAgentCommand -P $fake -Arguments @('stop', 'worker')).Text | ConvertFrom-Json
+                "$(@($global:unixStopKernel.Log | Where-Object { $_ -like 'send*' }).Count)|$($reply.survivors)|$(@($reply.survivorPids) -join ',')|$($global:unixStopKernel.Sleeps)" | Should BeExactly '0|1|310|52' }
+            finally { Remove-Variable -Name unixStopKernel -Scope Global } } }
+    Context 'linux kill fails' {
+        It 'reports every row not killed: the rejected start and both failed kills' {
+            $global:unixStopKernel = New-UnixFakeKernel
+            try {
+                $fake = New-UnixStopFake; $global:unixStopKernel.OnOpen = { param($Id) if ($Id -eq 320) { $global:unixStopKernel.Live[320] = 3999 } }
+                $global:unixStopKernel.SendKill = { param([int]$Fd) $false }; $global:unixStopKernel.WaitExit = { param([int]$Fd, [int]$Milliseconds) $false }
+                $reply = (Invoke-MuxAgentCommand -P $fake -Arguments @('stop', 'worker')).Text | ConvertFrom-Json
+                "$($reply.survivors)|$(@($reply.survivorPids) -join ',')|$(@($global:unixStopKernel.Live.Keys | Sort-Object) -join ',')" | Should BeExactly '3|320,300,310|300,310,320,900' }
+            finally { Remove-Variable -Name unixStopKernel -Scope Global } } } }
