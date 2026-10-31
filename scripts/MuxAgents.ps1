@@ -346,7 +346,7 @@ function Resolve-MuxAgentCaller {
     }
     $last = if ($agentIndex) { $agentIndex - 1 } else { $chain.Count - 1 }
     for ($index = 1; $index -le $last; $index++) {
-        if ([IO.Path]::GetFileName($chain[$index].Path) -notin @('pwsh.exe', 'powershell.exe', 'cmd.exe', 'bash.exe', 'sh.exe')) { Exit-MuxAgentCommand 2 'caller' 'caller runs under a non-shell process' }
+        if (-not (& $P.IsShell $chain[$index])) { Exit-MuxAgentCommand 2 'caller' 'caller runs under a non-shell process' }
     }
     $agent = $null
     if ($agentIndex) {

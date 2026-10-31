@@ -115,3 +115,17 @@ Describe 'MuxAgents providers endpoint and mux' {
         "$($caller.ServerPid)|$($caller.ServerStart)|$($caller.ServerKey)" | Should BeExactly "931|9317|$((Get-MuxAgentHash '/tmp/tmux-1000/default|931|9317').Substring(0, 16))"
     }
 }
+Describe 'MuxAgents providers shells' {
+    It 'windows IsShell allows exactly five shell images, any case' {
+        $isShell = (Get-MuxAgentPlatformMembers -Platform windows).IsShell
+        (@(foreach ($name in 'pwsh.exe', 'PowerShell.exe', 'cmd.exe', 'bash.exe', 'sh.exe', 'fish', 'pwsh', 'node.exe') { "$(& $isShell ([pscustomobject]@{ Path = "/bin/$name" }))" }) -join ',') | Should BeExactly 'True,True,True,True,True,False,False,False'
+    }
+    It 'Resolve-MuxAgentCaller accepts a shell only IsShell knows and refuses what IsShell rejects' {
+        $fake = New-FakeMuxAgentProviders
+        $fake.Rows[1].Path = '/usr/bin/fish'
+        $fake.IsShell = { param($Row) [IO.Path]::GetFileName($Row.Path) -in @('fish') }
+        (Resolve-MuxAgentCaller -P $fake).Kind | Should BeExactly 'human'
+        $fake.IsShell = { param($Row) $false }
+        Get-ProvidersRefusal { Resolve-MuxAgentCaller -P $fake } | Should BeExactly '2 caller caller runs under a non-shell process'
+    }
+}
