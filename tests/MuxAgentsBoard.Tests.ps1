@@ -331,3 +331,22 @@ Describe 'MuxAgents board skill' { It 'teaches status per step and list -All' {
         $lines = [IO.File]::ReadAllLines([IO.Path]::Combine($repoRoot, 'skills', 'mux-agents', 'SKILL.md'))
         (@('- As a spawned agent, run `status -BodyFile <file>` each time you start a step of your task.', 'pwsh -NoProfile -File "<entry>" status -BodyFile <status-file>', 'pwsh -NoProfile -File "<entry>" list -All',
             '`list` shows each live agent''s state, what it is doing and its unread count; `list -All` adds the ended agents (at most 10, newest first).') | Where-Object { $_ -cnotin $lines }) -join ' ; ' | Should BeExactly '' } }
+
+Describe 'MuxAgents board pane fixtures' { It 'tests/claude/spawn-replies.ts holds the real spawn replies, JSON and -Text, success and tagged refusal' {
+        # Catches: a hand-written or stale fixture the Claude Code pane tests would trust (the TS runner cannot start pwsh).
+        # The random id and sessionId are fixed to the values the fixture file uses.
+        $source = [IO.File]::ReadAllText([IO.Path]::Combine($repoRoot, 'tests', 'claude', 'spawn-replies.ts'))
+        $fixture = [ordered]@{}
+        foreach ($m in [regex]::Matches($source, '(?m)^export const (\w+) = ("(?:[^"\\]|\\.)*")$')) { $fixture[$m.Groups[1].Value] = ConvertFrom-Json $m.Groups[2].Value }
+        $want = [ordered]@{}
+        foreach ($text in $false, $true) {
+            $arguments = @('spawn', '-Client', 'claude', '-Task', 'build it') + @(if ($text) { '-Text' })
+            $kind = if ($text) { 'TEXT' } else { 'JSON' }
+            $ok = Invoke-MuxAgentCommand -P (New-BoardFake "fixture ok $kind") -Arguments $arguments
+            $no = Invoke-MuxAgentCommand -P (New-BoardFake "fixture tagged $kind" -Tag 'aaaaaaaaaaaa') -Arguments $arguments
+            $want["SPAWN_$kind"] = "$($ok.Code)|" + ($ok.Text -replace '(?<=("id":"|(?m)^id: ))[0-9a-f]{12}', '0123456789ab' -replace '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}', '00000000-0000-4000-8000-000000000000')
+            $want["TAGGED_$kind"] = "$($no.Code)|$($no.Text)"
+        }
+        $codes = @{ SPAWN_JSON = 0; SPAWN_TEXT = 0; TAGGED_JSON = 2; TAGGED_TEXT = 2 }
+        $got = [ordered]@{}; foreach ($key in $want.Keys) { $got[$key] = "$($codes[$key])|$($fixture[$key])" }
+        (@($want.Keys | ForEach-Object { "$_=$($want[$_])" }) -join "`n") | Should BeExactly (@($got.Keys | ForEach-Object { "$_=$($got[$_])" }) -join "`n") } }
