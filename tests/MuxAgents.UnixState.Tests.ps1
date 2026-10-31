@@ -200,3 +200,59 @@ Describe 'MuxAgents unix path facts' {
         }
     }
 }
+Describe 'MuxAgents unix private folders' {
+    Context 'steps mocked' {
+        Mock Get-MuxAgentUnixUserId { $global:unixStateCalls.Add('id'); '501' }
+        Mock New-MuxAgentUnixDirectory { param($Path) $global:unixStateCalls.Add("new $Path"); $global:unixStateMissing.Remove($Path) }
+        Mock Get-MuxAgentUnixPathFacts { param($Path) $global:unixStateCalls.Add("facts $Path"); [pscustomobject]@{ Path = $Path; Kind = 'directory'; Identity = '1:2'; Mode = $(if ($global:unixStateModes.ContainsKey($Path)) { $global:unixStateModes[$Path] } else { 448 }); Owner = $(if ($Path -like '*/agents') { '0' } else { '501' }); Listing = 'drwx------'; Aces = @(); Real = $Path } }
+        # A folder above the root: '<owner> <mode>' from unixStateAbove, else root-owned 0755.
+        Mock Get-MuxAgentUnixStat { param($Path) $global:unixStateCalls.Add("stat $Path"); $owner, $mode = $(if ($global:unixStateAbove.ContainsKey($Path)) { $global:unixStateAbove[$Path] } else { '0 493' }) -split ' '; [pscustomobject]@{ Identity = '1:1'; Mode = [int]$mode; Owner = $owner; Text = "1:1 $mode $owner" } }
+        $run = { param($Root, $Missing, $Modes, $Paths, $Above = @{})
+            $global:unixStateCalls = [Collections.Generic.List[string]]::new(); $global:unixStateMissing = [Collections.Generic.HashSet[string]]::new([string[]]$Missing); $global:unixStateModes = $Modes; $global:unixStateAbove = $Above
+            "$(Get-UnixStateRefusal { New-MuxAgentUnixPrivateDirectories -Root $Root -Paths $Paths })|$($global:unixStateCalls -join ';')" }
+        It 'walks each path top-down, creates what is missing, checks the root, all below it and all it created once each, and stops at the first refusal' {
+            try {
+                & $run '/r/s' @('/r', '/r/s', '/r/s/k', '/r/s/k/mail') @{} @('/r/s/k', '/r/s/k/mail') | Should BeExactly 'ok|id;stat /;new /r;facts /r;new /r/s;facts /r/s;new /r/s/k;facts /r/s/k;new /r/s/k/mail;facts /r/s/k/mail'
+                & $run '/r/s' @('/r/s/k') @{ '/r/s' = 511 } @('/r/s/k') | Should BeExactly '1 state the state folder mode is 777, not 700|id;stat /;new /r;stat /r;new /r/s;facts /r/s'
+                $global:unixStateMissing.Contains('/r/s/k') | Should Be $true
+                & $run '/r/s' @() @{} @('/r/s/k/agents', '/r/s/k/mail') | Should BeExactly '1 state the state folder has another owner|id;stat /;new /r;stat /r;new /r/s;facts /r/s;new /r/s/k;facts /r/s/k;new /r/s/k/agents;facts /r/s/k/agents'
+                $bad = foreach ($pair in @(@('/r/s', '/r/x'), @('/r/s', '/r/s2/k'), @('/r/s', '/r/s/../x'), @('/r/s', '/r/s//k'), @('/r/s', '/r/s/./k'), @('/r/s', '/r/s/k/'), @('r/s', 'r/s/k'))) { & $run $pair[0] @() @{} @($pair[1]) }
+                ($bad | Select-Object -Unique) -join ';' | Should BeExactly '1 state the state folder path is outside the state root|'
+            }
+            finally { Remove-Variable unixStateCalls, unixStateMissing, unixStateModes, unixStateAbove -Scope Global -ErrorAction SilentlyContinue }
+        }
+        It 'checks every existing folder from / down to the root parent: owned by root or the user, not group- or other-writable unless sticky' {
+            try {
+                # '<owner> <mode>' of the existing /r (or /): 0777 another uid, 1777 root, 0755 another uid, 0777 root, 0775 and 0757 ours, 0755 ours, 1777 another uid, / of another uid.
+                $cases = @(@{ '/r' = '502 511' }, @{ '/r' = '0 1023' }, @{ '/r' = '502 493' }, @{ '/r' = '0 511' }, @{ '/r' = '501 509' }, @{ '/r' = '501 495' }, @{ '/r' = '501 493' }, @{ '/r' = '502 1023' }, @{ '/' = '502 493' })
+                $answers = foreach ($above in $cases) { & $run '/r/s' @('/r/s', '/r/s/k') @{} @('/r/s/k') $above }
+                $owner = '1 state a folder above the state folder has another owner|id;stat /;new /r;stat /r'; $open = '1 state a folder above the state folder is writable by others|id;stat /;new /r;stat /r'
+                $made = 'ok|id;stat /;new /r;stat /r;new /r/s;facts /r/s;new /r/s/k;facts /r/s/k'
+                ($answers -join '#') | Should BeExactly (@($owner, $made, $owner, $open, $open, $open, $made, $owner, '1 state a folder above the state folder has another owner|id;stat /') -join '#')
+            }
+            finally { Remove-Variable unixStateCalls, unixStateMissing, unixStateModes, unixStateAbove -Scope Global -ErrorAction SilentlyContinue }
+        }
+    }
+    Context 'creation steps mocked' {
+        Mock Get-MuxAgentUnixEntry { param($Path) $global:unixStateCalls.Add("entry $Path"); if ($global:unixStateEntry -ceq 'throw') { throw [UnauthorizedAccessException]::new('lstat failed') }; $global:unixStateEntry }
+        Mock Invoke-MuxAgentUnixMkdir { param($Path, $Mode) $global:unixStateCalls.Add("mkdir $Path $([int]$Mode)"); if ($global:unixStateFail -ceq 'mkdir') { throw [IO.IOException]::new('mkdir failed') } }
+        Mock Invoke-MuxAgentUnixChmod { param($Path, $Mode) $global:unixStateCalls.Add("chmod $Path $([int]$Mode)"); if ($global:unixStateFail -ceq 'chmod') { throw [UnauthorizedAccessException]::new('chmod failed') } }
+        It 'creates a missing folder by mkdir 0700 then chmod 0700, leaves any existing entry, and refuses a failed entry read, mkdir or chmod' {
+            try {
+                $answers = foreach ($case in @('missing|', 'directory|', 'link|', 'file|', 'throw|', 'missing|mkdir', 'missing|chmod')) {
+                    $global:unixStateEntry, $global:unixStateFail = $case -split '\|'; $global:unixStateCalls = [Collections.Generic.List[string]]::new()
+                    "$(Get-UnixStateRefusal { New-MuxAgentUnixDirectory -Path '/r/s/k' })|$($global:unixStateCalls -join ',')"
+                }
+                $created = '1 state the state folder cannot be created|entry /r/s/k,mkdir /r/s/k 448'
+                ($answers -join '#') | Should BeExactly (@('ok True|entry /r/s/k,mkdir /r/s/k 448,chmod /r/s/k 448', 'ok False|entry /r/s/k', 'ok False|entry /r/s/k', 'ok False|entry /r/s/k', '1 state the state folder cannot be checked|entry /r/s/k', $created, "$created,chmod /r/s/k 448") -join '#')
+            }
+            finally { Remove-Variable unixStateEntry, unixStateFail, unixStateCalls -Scope Global -ErrorAction SilentlyContinue }
+        }
+    }
+    It 'makes folders only through one mkdir that passes the mode, so a folder is never created wider' {
+        $file = [Management.Automation.Language.Parser]::ParseFile((Join-Path (Join-Path $repoRoot 'scripts') 'MuxAgents.Unix.ps1'), [ref]$null, [ref]$null)
+        $all = @($file.FindAll({ param($n) $n -is [Management.Automation.Language.InvokeMemberExpressionAst] -and "$($n.Member)" -ceq 'CreateDirectory' }, $true))
+        $mkdir = @((Get-Command Invoke-MuxAgentUnixMkdir).ScriptBlock.Ast.FindAll({ param($n) $n -is [Management.Automation.Language.InvokeMemberExpressionAst] -and "$($n.Member)" -ceq 'CreateDirectory' }, $true))
+        "$($all.Count) $($mkdir.Count) $(@($mkdir[0].Arguments).Count) $($mkdir[0].Arguments[1])" | Should BeExactly '1 1 2 $Mode'
+    }
+}

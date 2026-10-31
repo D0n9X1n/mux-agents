@@ -222,6 +222,16 @@ function Get-MuxAgentUnixUserId {
     if ($id -cnotmatch '^\d+\z') { Exit-MuxAgentCommand 1 'state' 'the user id cannot be read' }
     $id
 }
+function Get-MuxAgentUnixStat {
+    # One stat of Path itself (lstat semantics on both OSes): dev:inode, the full mode with setuid, setgid and sticky
+    # bits, and the owner uid, plus the verbatim Text for comparing two reads. A failed or out-of-form read refuses.
+    param([Parameter(Mandatory)][string]$Path, [string]$Platform = (Get-MuxAgentPlatform))
+    $message = 'the state folder cannot be checked'
+    $statArgs = if ($Platform -ceq 'macos') { @('-f', '%d:%i %Mp%Lp %u', '--', $Path) } else { @('-c', '%d:%i %a %u', '--', $Path) }
+    $text = Invoke-MuxAgentUnixTool -FilePath 'stat' -Arguments $statArgs -Message $message
+    if ($text -cnotmatch '^(\d+:\d+) ([0-7]{3,4}) (\d+)\z') { Exit-MuxAgentCommand 1 'state' $message }
+    [pscustomobject]@{ Identity = $Matches[1]; Mode = [Convert]::ToInt32($Matches[2], 8); Owner = $Matches[3]; Text = $text }
+}
 function Get-MuxAgentUnixPathFacts {
     # The facts Assert-MuxAgentUnixPrivate decides on, bound to one folder: stat (dev:inode, mode, uid; lstat
     # semantics), ls -ld (macOS ls -lde: ACE lines, inherited ones too) and realpath, then stat again, which must be
@@ -232,10 +242,8 @@ function Get-MuxAgentUnixPathFacts {
     $facts = [pscustomobject]@{ Path = $Path; Kind = $kind; Identity = $null; Mode = $null; Owner = $null; Listing = ''; Aces = @(); Real = $null }
     if ($kind -cne 'directory') { return $facts }
     $macos = $Platform -ceq 'macos'
-    $statArgs = if ($macos) { @('-f', '%d:%i %Mp%Lp %u', '--', $Path) } else { @('-c', '%d:%i %a %u', '--', $Path) }
-    $first = Invoke-MuxAgentUnixTool -FilePath 'stat' -Arguments $statArgs -Message $message
-    if ($first -cnotmatch '^(\d+:\d+) ([0-7]{3,4}) (\d+)\z') { Exit-MuxAgentCommand 1 'state' $message }
-    $facts.Identity = $Matches[1]; $facts.Mode = [Convert]::ToInt32($Matches[2], 8); $facts.Owner = $Matches[3]
+    $first = Get-MuxAgentUnixStat -Path $Path -Platform $Platform
+    $facts.Identity = $first.Identity; $facts.Mode = $first.Mode; $facts.Owner = $first.Owner
     $lines = @((Invoke-MuxAgentUnixTool -FilePath 'ls' -Arguments @($(if ($macos) { '-lde' } else { '-ld' }), '--', $Path) -Message $message) -split '\n')
     # The permission field position by position: type d, then r w x per class, with s/S (owner, group) or t/T (other).
     if ($lines[0] -cnotmatch '^(d[r-][w-][xsS-][r-][w-][xsS-][r-][w-][xtT-][+@.]?)\s+\d+\s') { Exit-MuxAgentCommand 1 'state' $message }
@@ -243,7 +251,64 @@ function Get-MuxAgentUnixPathFacts {
     $facts.Aces = @($lines | Select-Object -Skip 1)
     $facts.Real = Invoke-MuxAgentUnixTool -FilePath 'realpath' -Arguments @('--', $Path) -Message $message
     if (-not $facts.Real.StartsWith('/') -or $facts.Real -match '[\r\n]') { Exit-MuxAgentCommand 1 'state' $message }
-    $second = Invoke-MuxAgentUnixTool -FilePath 'stat' -Arguments $statArgs -Message $message
-    if ($second -cne $first) { Exit-MuxAgentCommand 1 'state' 'the state folder changed while it was checked' }
+    $second = Get-MuxAgentUnixStat -Path $Path -Platform $Platform
+    if ($second.Text -cne $first.Text) { Exit-MuxAgentCommand 1 'state' 'the state folder changed while it was checked' }
     $facts
+}
+function Assert-MuxAgentUnixParent {
+    # A folder above the state root, as OpenSSH StrictModes checks one: owned by root or User, and not group- or
+    # other-writable unless the sticky bit is set (as /tmp is). Refuses 1 'state' otherwise.
+    param([Parameter(Mandatory)]$Stat, [Parameter(Mandatory)][string]$User)
+    if ($Stat.Owner -cne '0' -and $Stat.Owner -cne $User) { Exit-MuxAgentCommand 1 'state' 'a folder above the state folder has another owner' }
+    if (($Stat.Mode -band 18) -and -not ($Stat.Mode -band 512)) { Exit-MuxAgentCommand 1 'state' 'a folder above the state folder is writable by others' }
+}
+function Invoke-MuxAgentUnixMkdir {
+    # The one mkdir of the Unix state code: the mode is given to mkdir itself, so the folder is never created wider.
+    param([Parameter(Mandatory)][string]$Path, [Parameter(Mandatory)][IO.UnixFileMode]$Mode)
+    $null = [IO.Directory]::CreateDirectory($Path, $Mode)
+}
+function Invoke-MuxAgentUnixChmod {
+    # chmod of one folder: restores the bits the umask cleared at mkdir.
+    param([Parameter(Mandatory)][string]$Path, [Parameter(Mandatory)][IO.UnixFileMode]$Mode)
+    [IO.File]::SetUnixFileMode($Path, $Mode)
+}
+function New-MuxAgentUnixDirectory {
+    # Creates Path when nothing is there (lstat), at 0700 in the mkdir call itself, so it is never wider; then chmod
+    # 0700 restores what the umask cleared. Returns whether it created Path. An existing entry, link or not, is left
+    # for the caller's check. A failed entry read, mkdir or chmod refuses 1 'state'.
+    param([Parameter(Mandatory)][string]$Path)
+    $kind = try { Get-MuxAgentUnixEntry -Path $Path } catch { Exit-MuxAgentCommand 1 'state' 'the state folder cannot be checked' }
+    if ($kind -cne 'missing') { return $false }
+    $private = [IO.UnixFileMode]'UserRead, UserWrite, UserExecute'
+    try { Invoke-MuxAgentUnixMkdir -Path $Path -Mode $private } catch { Exit-MuxAgentCommand 1 'state' 'the state folder cannot be created' }
+    try { Invoke-MuxAgentUnixChmod -Path $Path -Mode $private } catch { Exit-MuxAgentCommand 1 'state' 'the state folder cannot be created' }
+    $true
+}
+function New-MuxAgentUnixPrivateDirectories {
+    # B4: the PrivateDirectories member, given the selected StateRoot as Root. Walks each path from / down. Every
+    # existing folder above the root is checked as Assert-MuxAgentUnixParent says; each missing folder is created at
+    # 0700; the root, every folder below it and every folder this call created get the full check. Each folder is
+    # checked once per call, before anything is made inside it. Refuses 1 'state' at the first failure.
+    param([Parameter(Mandatory)][string]$Root, [Parameter(Mandatory)][string[]]$Paths)
+    foreach ($path in $Paths) {
+        $inside = $path -ceq $Root -or $path.StartsWith($Root + '/', [StringComparison]::Ordinal)
+        $parts = @($path.Substring(1).Split('/'))
+        if (-not $Root.StartsWith('/') -or -not $inside -or $parts -contains '' -or $parts -contains '.' -or $parts -contains '..') { Exit-MuxAgentCommand 1 'state' 'the state folder path is outside the state root' }
+    }
+    $user = Get-MuxAgentUnixUserId
+    Assert-MuxAgentUnixParent -Stat (Get-MuxAgentUnixStat -Path '/') -User $user
+    $checked = [Collections.Generic.HashSet[string]]::new([string[]]@('/'))
+    foreach ($path in $Paths) {
+        $prefix = ''
+        foreach ($part in $path.Substring(1).Split('/')) {
+            $prefix += '/' + $part
+            if ($checked.Contains($prefix)) { continue }
+            $created = New-MuxAgentUnixDirectory -Path $prefix
+            if ($created -or $prefix -ceq $Root -or $prefix.StartsWith($Root + '/', [StringComparison]::Ordinal)) {
+                Assert-MuxAgentUnixPrivate -Facts (Get-MuxAgentUnixPathFacts -Path $prefix) -User $user
+            }
+            else { Assert-MuxAgentUnixParent -Stat (Get-MuxAgentUnixStat -Path $prefix) -User $user }
+            $null = $checked.Add($prefix)
+        }
+    }
 }
