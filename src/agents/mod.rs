@@ -196,11 +196,18 @@ pub(crate) mod fixture {
             crate::caller::resolve(&self.ctx).unwrap()
         }
 
-        /// What `list-panes` answers, one `<pane>|<window>|<pid>|<id>|<name>` per row.
+        /// What `list-panes` answers, one `<pane>|<window>|<pid>|<id>|<name>` per row, expanded into the call's
+        /// own `-F` format as the multiplexer would.
         pub fn panes(&self, rows: &[&str]) {
-            let mut out = rows.join("\n");
-            out.push('\n');
-            self.fakes.mux_first("list-panes", 0, &out, "");
+            let rows: Vec<String> = rows.iter().map(|r| r.to_string()).collect();
+            self.fakes.mux_script("list-panes", move |argv| {
+                let rows: Vec<&str> = rows.iter().map(String::as_str).collect();
+                Ok(crate::mux::Output {
+                    code: 0,
+                    stdout: listed(argv, &rows, "\n"),
+                    stderr: String::new(),
+                })
+            });
         }
 
         pub fn state(&self) -> PathBuf {
@@ -249,6 +256,42 @@ pub(crate) mod fixture {
             let args: Vec<String> = args.iter().map(|a| a.to_string()).collect();
             crate::cli::parse(&args).unwrap().1
         }
+    }
+
+    /// `rows` (`<pane>|<window>|<pid>|<id>|<name>`, the name to the end and free to hold `|` or LF) expanded
+    /// into the `-F` format of `argv`, each row ended by `sep`. A name's LF lands in the output as it would.
+    pub fn listed(argv: &[String], rows: &[&str], sep: &str) -> String {
+        let format = argv
+            .iter()
+            .skip_while(|a| *a != "-F")
+            .nth(1)
+            .cloned()
+            .unwrap_or_default();
+        rows.iter()
+            .map(|row| {
+                let mut fields = row.splitn(5, '|');
+                let mut next = || fields.next().unwrap_or("").to_string();
+                let (pane, window, pid, id, name) = (next(), next(), next(), next(), next());
+                let line = format
+                    .replace("#{pane_id}", &pane)
+                    .replace("#{window_id}", &window)
+                    .replace("#{pane_pid}", &pid)
+                    .replace("#{@agent-id}", &id)
+                    .replace("#{@agent-name}", &name);
+                format!("{line}{sep}")
+            })
+            .collect()
+    }
+
+    /// Whether `call` is the session's tagged-pane list: its rows framed by one fresh 32-hex marker.
+    pub fn list_call(call: &[String]) -> bool {
+        let prefix = ["-N", "list-panes", "-s", "-t", "$3", "-F"];
+        let marker = call.get(6).and_then(|f| f.split('|').next()).unwrap_or("");
+        call.len() == 7
+            && call[..6] == prefix[..]
+            && marker.len() == 32
+            && marker.bytes().all(|b| b.is_ascii_hexdigit())
+            && call[6] == super::registry::list_format(marker)
     }
 
     pub fn write(path: &std::path::Path, value: Value) {

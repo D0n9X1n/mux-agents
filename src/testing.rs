@@ -36,6 +36,8 @@ type Report = fn(&[Left]) -> serde_json::Map<String, serde_json::Value>;
 struct Log {
     rows: Vec<Row>,
     os_calls: Vec<String>,
+    // OS and multiplexer calls in one order: OS calls as recorded, multiplexer calls as `mux <argv>`.
+    events: Vec<String>,
     rules: Vec<Rule>,
     mux_calls: Vec<Vec<String>>,
     slept: Vec<u64>,
@@ -172,6 +174,11 @@ impl Fakes {
         self.0.borrow_mut().signals = Some(signals);
     }
 
+    /// OS and multiplexer calls in the order they were made.
+    pub fn events(&self) -> Vec<String> {
+        self.0.borrow().events.clone()
+    }
+
     pub fn os_calls(&self) -> Vec<String> {
         self.0.borrow().os_calls.clone()
     }
@@ -200,6 +207,7 @@ impl Fakes {
         let mut log = self.0.borrow_mut();
         log.os_calls.clear();
         log.mux_calls.clear();
+        log.events.clear();
         log.slept.clear();
         log.locks.clear();
     }
@@ -228,7 +236,9 @@ impl Fakes {
 
 impl Fakes {
     fn os_call(&self, call: String) {
-        self.0.borrow_mut().os_calls.push(call);
+        let mut log = self.0.borrow_mut();
+        log.events.push(call.clone());
+        log.os_calls.push(call);
     }
 
     fn lock_event(&self, sign: char, key: &str) {
@@ -354,6 +364,7 @@ impl Mux for Fakes {
         let answer = {
             let mut log = self.0.borrow_mut();
             log.mux_calls.push(argv.clone());
+            log.events.push(format!("mux {line}"));
             log.rules
                 .iter()
                 .find(|r| line.contains(&r.contains))

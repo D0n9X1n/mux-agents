@@ -526,6 +526,35 @@ mod tests {
     }
 
     #[test]
+    fn read_mail_reads_inside_the_lock() {
+        // A message that lands just before the lock is taken is read with the others, and the cursor moves past it.
+        let w = World::human("");
+        let caller = w.caller();
+        let mail = w.state().join("mail");
+        for body in ["one", "two"] {
+            add_mail(&w.ctx, &caller, "pane-1", "worker", "%9", body, None).unwrap();
+        }
+        let mailbox = mail.join("pane-1.jsonl");
+        let key = format!("+mail|{}|pane-1", caller.server_key);
+        let (target, done) = (mailbox.clone(), std::cell::Cell::new(false));
+        w.fakes.lock_probe(move |event| {
+            if event == key && !done.replace(true) {
+                let line = r#"{"id":"m3","from":"worker","pane":"%9","at":"x","body":"three"}"#;
+                append(&target, format!("{line}\n").as_bytes()).unwrap();
+            }
+            String::new()
+        });
+        let messages = read_mail(&w.ctx, &caller, "pane-1").unwrap();
+        let bodies: Vec<String> = messages
+            .iter()
+            .map(|m| text(m.get("text")).rsplit('\n').next().unwrap().to_string())
+            .collect();
+        assert_eq!(bodies, ["one", "two", "three"]);
+        let end = std::fs::metadata(&mailbox).unwrap().len();
+        assert_eq!(read(&mail.join("pane-1.offset")), end.to_string());
+    }
+
+    #[test]
     fn unread_counts_by_from_and_pane_without_state() {
         let w = World::human("");
         let caller = w.caller();

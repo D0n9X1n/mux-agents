@@ -17,7 +17,7 @@ use crate::error::{Refusal, Res, refuse};
 use crate::mux::native;
 use crate::proc::seam::hold;
 use crate::proc::{Left, Reason, Row};
-use crate::state::fs::{BODY_MAX, read_text, write_json};
+use crate::state::fs::{BODY_MAX, read_json, read_text, write_json};
 
 /// Appends a message to a live agent's, the parent's or a session pane's mailbox. Never types into a pane.
 pub fn send(ctx: &Ctx, request: &Request) -> Res<Map<String, Value>> {
@@ -194,12 +194,43 @@ pub fn stop(ctx: &Ctx, request: &Request) -> Res<Map<String, Value>> {
         .pid
         .parse()
         .map_err(|_| Refusal::internal("the pane pid is not a number"))?;
+    let launcher = server_dir(ctx, &caller)
+        .join("agents")
+        .join(&pane.id)
+        .join("launcher.json");
     let left = lock(ctx, &lock_key("notice", &caller, &pane.id), || {
         let table = ctx.os.table()?;
+        // The pane's process must be the agent's own launcher: the pid and start it recorded. A pane pid reused since
+        // (or a launcher that never recorded itself) is never walked: only the pane is closed.
+        let recorded = read_json(&launcher)
+            .ok()
+            .flatten()
+            .and_then(|l| Some((l.get("pid")?.as_u64()?, l.get("start")?.as_i64()?)));
+        let listed = table
+            .iter()
+            .find(|row| row.pid == root)
+            .and_then(|row| row.start);
+        let unverified = match recorded {
+            None => Some(Reason::Open),
+            Some((pid, start))
+                if pid == u64::from(root)
+                    && listed.is_some_and(|listed| ctx.os.same_start(start, listed)) =>
+            {
+                None
+            }
+            Some(_) => Some(Reason::Start),
+        };
         // Every tree row that is not killed is left with its reason: not opened, another start, or a failed kill.
         let mut left = Vec::new();
         let mut held = Vec::new();
         for row in tree(&table, root) {
+            if let Some(reason) = unverified {
+                left.push(Left {
+                    pid: row.pid,
+                    reason,
+                });
+                continue;
+            }
             match hold(ctx.os.open(row.pid), row.start, |a, b| {
                 ctx.os.same_start(a, b)
             }) {
@@ -538,21 +569,25 @@ mod tests {
         w.file("b.md", b"ok");
         let caller = w.caller();
         let sent = w.folder(ID).join("last-sent.json");
+        let mailbox = w.state().join("mail").join("pane-4.jsonl");
         let seen = sent.clone();
-        w.fakes
-            .lock_probe(move |_| format!("sent={}", seen.exists()));
+        w.fakes.lock_probe(move |_| {
+            let mailed = std::fs::metadata(&mailbox).is_ok_and(|m| m.len() > 0);
+            format!("sent={} mailed={mailed}", seen.exists())
+        });
         w.fakes.clear_log();
         assert!(run(&w, send, &["send", "parent", "-BodyFile", "b.md"]).starts_with("ok "));
         let agent = lock_key("agent", &caller, ID);
         let mail = lock_key("mail", &caller, "pane-4");
-        // One hold of the sender's lock around the append and the last-sent write.
+        // One hold of the sender's lock around the append and the last-sent write; the append inside the
+        // recipient's mail lock.
         assert_eq!(
             w.fakes.locks(),
             [
-                format!("+{agent} sent=false"),
-                format!("+{mail} sent=false"),
-                format!("-{mail} sent=false"),
-                format!("-{agent} sent=true")
+                format!("+{agent} sent=false mailed=false"),
+                format!("+{mail} sent=false mailed=false"),
+                format!("-{mail} sent=false mailed=true"),
+                format!("-{agent} sent=true mailed=true")
             ]
         );
         // A human sender takes only the recipient's mail lock.
@@ -693,7 +728,12 @@ mod tests {
         } else {
             World::human("")
         };
-        w.agent_record("bbbbbbbbbbbb", fields);
+        let folder = w.agent_record("bbbbbbbbbbbb", fields);
+        // The launcher in pane %9 recorded its own pid and start.
+        write(
+            &folder.join("launcher.json"),
+            json!({"pid": 300, "start": 3000, "startedAt": "x"}),
+        );
         w.panes(&["%9|@5|300|bbbbbbbbbbbb|worker"]);
         w
     }
@@ -758,6 +798,11 @@ mod tests {
                 "kill 310", "kill 320", "kill 311", "kill 321"
             ]
         );
+        // OS and multiplexer calls in one order: the last open, then kill-pane, then the first kill.
+        let events = w.fakes.events();
+        let at = |event: &str| events.iter().position(|e| e == event).expect(event);
+        assert!(at("open 321") < at("mux -N kill-pane -t %9"), "{events:?}");
+        assert!(at("mux -N kill-pane -t %9") < at("kill 300"), "{events:?}");
         let kill_pane: Vec<_> = w
             .fakes
             .mux_calls()
@@ -799,6 +844,10 @@ mod tests {
 
         // Two rows that name each other as parent: each is walked once.
         let w = stop_world(false, json!({}));
+        write(
+            &w.folder("bbbbbbbbbbbb").join("launcher.json"),
+            json!({"pid": 300, "start": 5}),
+        );
         w.fakes.process(testing::row(300, 301, 5));
         w.fakes.process(testing::row(301, 300, 5));
         w.fakes.clear_log();
@@ -811,6 +860,55 @@ mod tests {
                 .count(),
             2
         );
+    }
+
+    #[test]
+    fn stop_verifies_pane_process_before_walking() {
+        // A pane pid of 0 or 1 is no agent: nothing is read, walked or killed.
+        for pid in [0, 1] {
+            let w = stop_world(false, json!({}));
+            w.panes(&[&format!("%9|@5|{pid}|bbbbbbbbbbbb|worker")]);
+            w.fakes.process(testing::row(1, 0, 1));
+            w.fakes.process(testing::row(300, 1, 3000));
+            w.fakes.kill_ok(1);
+            w.fakes.clear_log();
+            assert_eq!(run(&w, stop, &["stop", "worker"]), NONE, "{pid}");
+            assert!(proc_calls(&w).is_empty(), "{pid}");
+            assert!(!mux_verbs(&w).iter().any(|v| v == "kill-pane"), "{pid}");
+        }
+        // The pane pid was reused (another start than launcher.json's), or launcher.json names another pid or
+        // none: only the pane is closed, and its tree is left as survivors.
+        for (launcher, reason) in [
+            (Some(json!({"pid": 300, "start": 2500})), "start"),
+            (Some(json!({"pid": 301, "start": 3000})), "start"),
+            (Some(json!({"pid": 300})), "open"),
+            (None, "open"),
+        ] {
+            let w = stop_world(false, json!({}));
+            let file = w.folder("bbbbbbbbbbbb").join("launcher.json");
+            match &launcher {
+                Some(record) => write(&file, record.clone()),
+                None => std::fs::remove_file(&file).unwrap(),
+            }
+            w.fakes.process(testing::row(300, 900, 3000));
+            w.fakes.process(testing::row(310, 300, 3100));
+            w.fakes.kill_ok(300);
+            w.fakes.kill_ok(310);
+            w.fakes.stop_report_with(left_report);
+            w.fakes.clear_log();
+            let reply = run(&w, stop, &["stop", "worker"]);
+            let left = format!(r#""left":["300 {reason}","310 {reason}"]"#);
+            assert!(reply.contains(&left), "{launcher:?} {reply}");
+            assert_eq!(proc_calls(&w), ["table"], "{launcher:?}");
+            let kill_pane: Vec<_> = w
+                .fakes
+                .mux_calls()
+                .into_iter()
+                .filter(|c| c[1] == "kill-pane")
+                .collect();
+            assert_eq!(kill_pane, [["-N", "kill-pane", "-t", "%9"]], "{launcher:?}");
+            assert_eq!(read_mail_of(&w, "pane-1"), ["worker was stopped."]);
+        }
     }
 
     #[test]

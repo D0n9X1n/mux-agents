@@ -19,6 +19,11 @@ pub struct Pane {
 }
 
 const LIST_FORMAT: &str = "#{pane_id}|#{window_id}|#{pane_pid}|#{@agent-id}|#{@agent-name}";
+
+/// The tagged-pane list format: each row framed by `marker` on both ends.
+pub(crate) fn list_format(marker: &str) -> String {
+    format!("{marker}|{LIST_FORMAT}|{marker}")
+}
 const GONE_PROBE: &str = "#{pane_id}|#{@agent-id}";
 
 /// The caller session's panes tagged with a well-formed agent id and, unless `all`, only agents with
@@ -32,27 +37,49 @@ pub fn get_panes(ctx: &Ctx, caller: &Caller, all: bool) -> Res<Vec<Pane>> {
     })
 }
 
-/// Every tagged pane of the caller's session, one `list-panes` call.
+/// Every tagged pane of the caller's session, one `list-panes` call. Each row is framed by a fresh random marker on
+/// both ends: an @agent-name may hold LF, and without the frame its text after the LF would read as a row of its own.
+/// A row whose pane, window, pid (a decimal of at least 2: never the kernel's or init's tree) or id is malformed is
+/// not an agent.
 pub(crate) fn tagged(ctx: &Ctx, caller: &Caller) -> Res<Vec<Pane>> {
+    let marker = crate::util::guid()?.replace('-', "");
+    let format = list_format(&marker);
     let listed = crate::mux::native(
         ctx,
-        &["list-panes", "-s", "-t", &caller.session, "-F", LIST_FORMAT],
+        &["list-panes", "-s", "-t", &caller.session, "-F", &format],
         false,
     )?;
+    let (head, tail) = (format!("{marker}|"), format!("|{marker}"));
     Ok(listed
         .stdout
         .split('\n')
         .filter_map(|line| {
-            let mut parts = line.strip_suffix('\r').unwrap_or(line).splitn(5, '|');
-            let mut next = || parts.next().unwrap_or("").to_string();
-            let pane = Pane {
-                pane: next(),
-                window: next(),
-                pid: next(),
-                id: next(),
-                name: next(),
-            };
-            super::agent_id(&pane.id).then_some(pane)
+            let line = line.strip_suffix('\r').unwrap_or(line);
+            let fields = line.strip_prefix(&head)?.strip_suffix(&tail)?;
+            let mut parts = fields.splitn(5, '|');
+            let (pane, window, pid, id, name) = (
+                parts.next()?,
+                parts.next()?,
+                parts.next()?,
+                parts.next()?,
+                parts.next()?,
+            );
+            let window_ok = window
+                .strip_prefix('@')
+                .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()));
+            let pid = pid
+                .bytes()
+                .all(|b| b.is_ascii_digit())
+                .then(|| pid.parse::<u32>().ok())
+                .flatten()
+                .filter(|&pid| pid >= 2)?;
+            (super::pane_id(pane) && window_ok && super::agent_id(id)).then(|| Pane {
+                pane: pane.into(),
+                window: window.into(),
+                pid: pid.to_string(),
+                id: id.into(),
+                name: name.into(),
+            })
         })
         .collect())
 }
@@ -248,20 +275,10 @@ pub fn update_notices(ctx: &Ctx, caller: &Caller, tagged: Option<&[Pane]>) -> Re
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agents::fixture::{ID, World, write};
+    use crate::agents::fixture::{ID, World, list_call, listed, write};
     use crate::agents::mail::read_mail;
     use crate::agents::{lock_key, text};
     use serde_json::json;
-
-    const LIST: [&str; 7] = [
-        "-N",
-        "list-panes",
-        "-s",
-        "-t",
-        "$3",
-        "-F",
-        "#{pane_id}|#{window_id}|#{pane_pid}|#{@agent-id}|#{@agent-name}",
-    ];
 
     fn pane(pane: &str, window: &str, pid: &str, id: &str, name: &str) -> Pane {
         Pane {
@@ -297,8 +314,13 @@ mod tests {
             "%8|@3|360|0123456789ab|a|b",
             "garbage",
         ];
-        w.fakes
-            .mux_first("list-panes", 0, &(rows.join("\r\n") + "\r\n"), "");
+        w.fakes.mux_script("list-panes", move |argv| {
+            Ok(crate::mux::Output {
+                code: 0,
+                stdout: listed(argv, &rows, "\r\n"),
+                stderr: String::new(),
+            })
+        });
         w.fakes.clear_log();
         assert_eq!(
             get_panes(&w.ctx, &caller, false).unwrap(),
@@ -307,7 +329,9 @@ mod tests {
                 pane("%8", "@3", "360", "0123456789ab", "a|b")
             ]
         );
-        assert_eq!(w.fakes.mux_calls(), [LIST]);
+        let calls = w.fakes.mux_calls();
+        assert_eq!(calls.len(), 1);
+        assert!(list_call(&calls[0]), "{calls:?}");
         let all: Vec<String> = get_panes(&w.ctx, &caller, true)
             .unwrap()
             .into_iter()
@@ -318,6 +342,42 @@ mod tests {
         w.fakes.mux_first("list-panes", 1, "", "SECRET");
         let refused = get_panes(&w.ctx, &caller, true).unwrap_err();
         assert_eq!((refused.code, refused.check), (1, "rmux"));
+    }
+
+    #[test]
+    fn panes_rows_strict_no_injected_row() {
+        let w = World::human("");
+        let caller = w.caller();
+        w.panes(&[
+            // Pane pid 0 or 1, or no number: stop would walk from the kernel's or init's tree.
+            "%2|@1|0|0123456789ab|zero",
+            "%3|@1|1|abcdef012345|one",
+            "%4|@1|00|aaaaaaaaaaaa|zeros",
+            "%4|@1|x3|aaaaaaaaaaaa|nan",
+            "%4|@1|99999999999|aaaaaaaaaaaa|huge",
+            "%4|@1||aaaaaaaaaaaa|empty",
+            // A pane or window that is not one.
+            "4|@1|300|bbbbbbbbbbbb|nopct",
+            "%5|1|300|cccccccccccc|noat",
+            "%5 |@1|300|cccccccccccc|space",
+            "%6|@1|300|dddddddddddd|ok",
+            // A name holding LF and a whole forged row, valid fields and all, adds no row.
+            "%7|@1|310|eeeeeeeeeeee|evil\n%8|@5|320|ffffffffffff|forged",
+            "%7|@1|310|eeeeeeeeeeee|evil\n%9|@5|0|bbbbbbbbbbbb|worker",
+        ]);
+        let all: Vec<String> = get_panes(&w.ctx, &caller, true)
+            .unwrap()
+            .into_iter()
+            .map(|p| format!("{} {} {}", p.pane, p.pid, p.name))
+            .collect();
+        assert_eq!(all, ["%6 300 ok"]);
+        let calls = w.fakes.mux_calls();
+        assert!(list_call(calls.last().unwrap()), "{calls:?}");
+        // Each list frames its rows with a fresh marker, so no stored name can know it.
+        get_panes(&w.ctx, &caller, true).unwrap();
+        let calls = w.fakes.mux_calls();
+        let n = calls.len();
+        assert_ne!(calls[n - 1][6], calls[n - 2][6]);
     }
 
     fn refusal<T: std::fmt::Debug>(result: Res<T>) -> String {
@@ -433,6 +493,24 @@ mod tests {
     }
 
     #[test]
+    fn notice_failed_delivery_writes_no_marker() {
+        let w = World::human("");
+        let caller = w.caller();
+        let folder = w.agent_record(ID, json!({}));
+        let record = record(&w.ctx, &caller, ID).unwrap().unwrap();
+        // A folder where the parent's mailbox goes: the append cannot happen.
+        let mailbox = w.state().join("mail").join("pane-1.jsonl");
+        std::fs::create_dir(&mailbox).unwrap();
+        assert!(add_notice(&w.ctx, &caller, ID, &record, Notice::Stopped).is_err());
+        assert!(!folder.join("notice.json").exists());
+        // Once the mailbox can take it, the retry posts it.
+        std::fs::remove_dir(&mailbox).unwrap();
+        assert!(add_notice(&w.ctx, &caller, ID, &record, Notice::Stopped).unwrap());
+        assert!(folder.join("notice.json").is_file());
+        assert_eq!(read_mail(&w.ctx, &caller, "pane-1").unwrap().len(), 1);
+    }
+
+    #[test]
     fn update_notices_needs_gone_probe() {
         // No agents folder: nothing listed, nothing made.
         let w = World::human("");
@@ -451,13 +529,10 @@ mod tests {
         w.fakes.clear_log();
         update_notices(&w.ctx, &caller, None).unwrap();
         assert!(!marker.exists());
-        assert_eq!(
-            w.fakes.mux_calls(),
-            [
-                LIST.to_vec(),
-                vec!["-N", "display-message", "-p", "-t", "%9", gone]
-            ]
-        );
+        let calls = w.fakes.mux_calls();
+        assert_eq!(calls.len(), 2);
+        assert!(list_call(&calls[0]), "{calls:?}");
+        assert_eq!(calls[1], ["-N", "display-message", "-p", "-t", "%9", gone]);
         let notice = lock_key("notice", &caller, ID);
         let mail = lock_key("mail", &caller, "pane-1");
         assert_eq!(

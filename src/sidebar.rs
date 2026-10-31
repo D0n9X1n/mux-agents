@@ -597,10 +597,15 @@ mod tests {
         let w = watch_world(&["live", "live", "live", "gone"]);
         let listed = Rc::new(Cell::new(0));
         let seen = listed.clone();
-        w.fakes.mux_script("list-panes", move |_| {
+        w.fakes.mux_script("list-panes", move |argv| {
             seen.set(seen.get() + 1);
             if seen.get() == 2 {
-                Ok(out(0, "%9|@5|300|aaaaaaaaaaaa|worker\n", ""))
+                let rows = ["%9|@5|300|aaaaaaaaaaaa|worker"];
+                Ok(out(
+                    0,
+                    &crate::agents::fixture::listed(argv, &rows, "\n"),
+                    "",
+                ))
             } else {
                 Ok(out(1, "", "lock"))
             }

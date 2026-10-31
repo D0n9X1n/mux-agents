@@ -330,16 +330,9 @@ mod tests {
         // Compared as text: the order of keys is part of the reply.
         assert_eq!(Value::Object(reply).to_string(), want.to_string());
         // One multiplexer call (no probe, no capture-pane), no state write, the offset unmoved.
-        let list: Vec<&str> = vec![
-            "-N",
-            "list-panes",
-            "-s",
-            "-t",
-            "$3",
-            "-F",
-            "#{pane_id}|#{window_id}|#{pane_pid}|#{@agent-id}|#{@agent-name}",
-        ];
-        assert_eq!(w.fakes.mux_calls(), [list]);
+        let calls = w.fakes.mux_calls();
+        assert_eq!(calls.len(), 1);
+        assert!(crate::agents::fixture::list_call(&calls[0]), "{calls:?}");
         assert_eq!(tree(&w.state()), before);
         assert_eq!(read_mail(&w.ctx, &caller, "pane-1").unwrap().len(), 4);
     }
@@ -492,6 +485,43 @@ mod tests {
                 .unwrap()
                 .iter()
                 .any(|row| row.get("exitCode").is_some())
+        );
+    }
+
+    #[test]
+    fn board_reads_inside_their_locks() {
+        let w = World::human("");
+        let caller = w.caller();
+        let live = w.agent_record(ID, json!({}));
+        w.panes(&["%9|@5|300|aaaaaaaaaaaa|worker"]);
+        let mailbox = w.state().join("mail").join("pane-1.jsonl");
+        let (agent, mail) = (
+            lock_key("agent", &caller, ID),
+            lock_key("mail", &caller, "pane-1"),
+        );
+        let sent = live.join("last-sent.json");
+        // last-sent.json exists only while the agent lock is held; a message lands as the mail lock is taken.
+        w.fakes.lock_probe(move |event| {
+            if event == format!("+{agent}") {
+                write(&sent, json!({"line": "fresh", "at": "x"}));
+            } else if event == format!("-{agent}") {
+                std::fs::remove_file(&sent).unwrap();
+            } else if event == format!("+{mail}") {
+                let line = r#"{"id":"m1","from":"worker","pane":"%9","at":"x","body":"hi"}"#;
+                let mut file = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&mailbox)
+                    .unwrap();
+                std::io::Write::write_all(&mut file, format!("{line}\n").as_bytes()).unwrap();
+            }
+            String::new()
+        });
+        let reply = board(&w.ctx, &caller, "pane-1", false, false).unwrap();
+        let row = &reply["agents"][0];
+        assert_eq!(
+            (&row["doing"], &row["doingFrom"], &row["unread"]),
+            (&json!("fresh"), &json!("message"), &json!(1))
         );
     }
 
