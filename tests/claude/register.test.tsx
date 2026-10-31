@@ -17,14 +17,21 @@ const header = async (ui: any) => (await ui.find({ type: 'Text', text: /running/
 // The engine beneath the plugin. Each hook answers a call on $ with { value }.
 // process.run answers from `runs` in order, the last repeating; `{ holdMs, answer }` answers after holdMs on the mock clock.
 // tool.call answers with `stdout` as the tool's result, `text` as what the model reads and `isError` as the result's mark.
-// `answers` replaces the engine's answer to command.register or ui.open, for instance with `{ deny }`.
-type Answers = { register?: object; open?: object }
+// `answers` replaces the engine's answer to command.register or ui.open, for instance with `{ deny }`; `openHoldMs`
+// answers ui.open after that long on the mock clock; `denyWrites` refuses that many state writes first.
+type Answers = { register?: object; open?: object; openHoldMs?: number; denyWrites?: number }
 function world(on: any, env: Record<string, string>, runs: object[], tool: { stdout: string; text: string; isError?: boolean } = { stdout: SPAWN_JSON, text: SPAWN_JSON }, answers: Answers = {}) {
   const seen = { registered: [] as object[], opened: [] as object[], argv: [] as string[][], init: [] as unknown[], status: [] as (string | undefined)[], settled: 0 }
   mock.env(on, env)
   const clock = mock.clock(on)
   on('command.register', (_: unknown, e: object) => { seen.registered.push({ ...e }); return answers.register ?? { value: { command: 'mux-agents-pane' } } })
-  on('ui.open', (_: unknown, e: object) => { seen.opened.push({ ...e }); return answers.open ?? { value: { isPlaced: true } } })
+  on('ui.open', async (_: unknown, e: object) => {
+    seen.opened.push({ ...e })
+    if (answers.openHoldMs) await clock.sleep(answers.openHoldMs)
+    return answers.open ?? { value: { isPlaced: true } }
+  })
+  let denyWrites = answers.denyWrites ?? 0
+  if (denyWrites) on('state.set', (_: unknown, e: unknown, next: (e: unknown) => unknown) => (denyWrites-- > 0 ? { deny: 'disk full' } : next(e)))
   on('ui.status', (_: unknown, e: { text?: string }) => { seen.status.push(e.text); return { value: undefined } })
   on('process.run', async (_: unknown, e: { argv: string[]; init?: unknown }) => {
     seen.argv.push([...e.argv]); seen.init.push(e.init)
@@ -57,72 +64,82 @@ test('a refused command.register still lets session.start finish, and a spawn st
 })
 
 test('a Bash spawn inside rmux opens Agents, runs the exact list command and sets the status', async ($, on) => {
-  const { seen } = world(on, { RMUX: 'x' }, [ran(0, LIST)])
+  const { seen, clock } = world(on, { RMUX: 'x' }, [ran(0, LIST)])
   let root = ''
   on('classic.SessionStart', (_: unknown, e: { cwd: string }) => { root = e.cwd; return {} })
   await ($ as any).classic.SessionStart({ source: 'startup' })
   await $.session.start(START)
   await $.tool.call({ tool: 'Bash', command: SPAWN })
+  await clock.settle()
   expect(seen.opened).toEqual([{ id: 'mux-agents', title: 'Agents' }])
   expect(seen.argv).toEqual([['pwsh', '-NoProfile', '-File', `${root}/scripts/mux-agent.ps1`, 'list', '-All']])
   expect(seen.status).toEqual(['agents: 1'])
 })
 
 test('no pane and no refresh without TMUX or RMUX', async ($, on) => {
-  const { seen } = world(on, {}, [ran(0, LIST)])
+  const { seen, clock } = world(on, {}, [ran(0, LIST)])
   await $.session.start(START)
   await $.tool.call({ tool: 'Bash', command: SPAWN })
+  await clock.settle()
   expect(seen.opened).toEqual([])
   expect(seen.argv).toEqual([])
 })
 
 test('inside tmux, a Bash call that is not a spawn opens nothing', async ($, on) => {
-  const { seen } = world(on, { TMUX: 'x' }, [ran(0, LIST)], { stdout: 'a.txt\n', text: 'a.txt\n' })
+  const { seen, clock } = world(on, { TMUX: 'x' }, [ran(0, LIST)], { stdout: 'a.txt\n', text: 'a.txt\n' })
   await $.session.start(START)
   await $.tool.call({ tool: 'Bash', command: 'ls' })
+  await clock.settle()
   expect(seen.opened).toEqual([])
 })
 
 test('inside tmux, a tagged child refused by spawn opens nothing', async ($, on) => {
-  const { seen } = world(on, { TMUX: 'x' }, [ran(0, LIST)], { stdout: TAGGED_JSON, text: TAGGED_JSON })
+  const { seen, clock } = world(on, { TMUX: 'x' }, [ran(0, LIST)], { stdout: TAGGED_JSON, text: TAGGED_JSON })
   await $.session.start(START)
   await $.tool.call({ tool: 'Bash', command: SPAWN })
+  await clock.settle()
   expect(seen.opened).toEqual([])
 })
 
 test('a real spawn -Text success opens the pane', async ($, on) => {
-  const { seen } = world(on, { TMUX: 'x' }, [ran(0, LIST)], { stdout: `${SPAWN_TEXT}\n`, text: `${SPAWN_TEXT}\n` })
+  const { seen, clock } = world(on, { TMUX: 'x' }, [ran(0, LIST)], { stdout: `${SPAWN_TEXT}\n`, text: `${SPAWN_TEXT}\n` })
   await $.session.start(START)
   await $.tool.call({ tool: 'Bash', command: `${SPAWN} -Text` })
+  await clock.settle()
   expect(seen.opened).toEqual([{ id: 'mux-agents', title: 'Agents' }])
 })
 
 test('a real spawn -Text tagged refusal opens nothing', async ($, on) => {
-  const { seen } = world(on, { TMUX: 'x' }, [ran(0, LIST)], { stdout: `${TAGGED_TEXT}\n`, text: `${TAGGED_TEXT}\n` })
+  const { seen, clock } = world(on, { TMUX: 'x' }, [ran(0, LIST)], { stdout: `${TAGGED_TEXT}\n`, text: `${TAGGED_TEXT}\n` })
   await $.session.start(START)
   await $.tool.call({ tool: 'Bash', command: `${SPAWN} -Text` })
+  await clock.settle()
   expect(seen.opened).toEqual([])
 })
 
 test('a spawn whose tool result is an error opens nothing, even with a spawn reply in stdout', async ($, on) => {
-  const { seen } = world(on, { TMUX: 'x' }, [ran(0, LIST)], { stdout: SPAWN_JSON, text: SPAWN_JSON, isError: true })
+  const { seen, clock } = world(on, { TMUX: 'x' }, [ran(0, LIST)], { stdout: SPAWN_JSON, text: SPAWN_JSON, isError: true })
   await $.session.start(START)
   await $.tool.call({ tool: 'Bash', command: SPAWN })
+  await clock.settle()
   expect(seen.opened).toEqual([])
 })
 
 test('the spawn reply is read from the tool result, not the text the model reads', async ($, on) => {
-  const { seen } = world(on, { TMUX: 'x' }, [ran(0, LIST)], { stdout: 'nothing here', text: SPAWN_JSON })
+  const { seen, clock } = world(on, { TMUX: 'x' }, [ran(0, LIST)], { stdout: 'nothing here', text: SPAWN_JSON })
   await $.session.start(START)
   await $.tool.call({ tool: 'Bash', command: SPAWN })
+  await clock.settle()
   expect(seen.opened).toEqual([])
 })
 
 test('a PowerShell spawn opens the pane; a second spawn starts no second refresh', async ($, on) => {
-  const { seen } = world(on, { TMUX: 'x' }, [ran(0, LIST)])
+  const { seen, clock } = world(on, { TMUX: 'x' }, [ran(0, LIST)])
   await $.session.start(START)
   await $.tool.call({ tool: 'PowerShell', command: `& "C:/p/scripts/mux-agent.ps1" spawn -Client copilot` })
+  await clock.settle()
   await $.tool.call({ tool: 'PowerShell', command: `& "C:/p/scripts/mux-agent.ps1" spawn -Client copilot` })
+  await clock.settle()
   expect(seen.opened.length).toBe(2)
   expect(seen.argv.length).toBe(1)
 })
@@ -150,10 +167,73 @@ test('a refresh never overlaps: a run held 4000 ms delays the next until it sett
   expect([seen.argv.length, seen.settled]).toEqual([2, 2])
 })
 
-test('/mux-agents-pane opens the pane and a stubbed list draws the count and rows', async ($, on) => {
-  const { seen } = world(on, { TMUX: 'x' }, [ran(0, LIST)])
+test('a spawn\'s tool result does not wait for the first refresh', async ($, on) => {
+  const { seen, clock } = world(on, { TMUX: 'x' }, [{ holdMs: 4000, answer: ran(0, LIST) }, ran(0, LIST)])
+  await $.session.start(START)
+  let done = false
+  const call = $.tool.call({ tool: 'Bash', command: SPAWN }).then(r => { done = true; return r })
+  await clock.settle()
+  expect([done, seen.opened.length, seen.argv.length, seen.settled]).toEqual([true, 1, 1, 0])
+  const result: any = await call
+  expect([result?.result?.stdout, result?.text]).toEqual([SPAWN_JSON, SPAWN_JSON])
+  await clock.advance(4000)
+  expect(seen.settled).toBe(1)
+})
+
+test('a spawn whose pane cannot open still returns the tool result unchanged', async ($, on) => {
+  const { seen, clock } = world(on, { TMUX: 'x' }, [ran(0, LIST)], undefined, { open: { deny: 'no pane here' } })
+  await $.session.start(START)
+  let outcome: any
+  try { outcome = await $.tool.call({ tool: 'Bash', command: SPAWN }) } catch (err) { outcome = `threw ${String(err)}` }
+  await clock.settle()
+  expect([outcome?.result?.stdout, outcome?.text, outcome?.isError]).toEqual([SPAWN_JSON, SPAWN_JSON, undefined])
+  expect([seen.opened.length, seen.argv.length]).toEqual([1, 0])
+})
+
+test('a spawn\'s tool result does not wait for the pane to open', async ($, on) => {
+  const { seen, clock } = world(on, { TMUX: 'x' }, [ran(0, LIST)], undefined, { openHoldMs: 4000 })
+  await $.session.start(START)
+  let done = false
+  const call = $.tool.call({ tool: 'Bash', command: SPAWN }).then(r => { done = true; return r })
+  await clock.settle()
+  expect([done, seen.opened.length, seen.argv.length]).toEqual([true, 1, 0])
+  await call
+  await clock.advance(4000)
+  expect(seen.argv.length).toBe(1)
+})
+
+test('a refresh whose board write is refused leaves the pane working, and the next refresh draws', async ($, on) => {
+  const { seen, clock } = world(on, { TMUX: 'x' }, [ran(0, LIST)], undefined, { denyWrites: 1 })
   await $.session.start(START)
   await $.command.run({ command: 'mux-agents-pane' })
+  await clock.settle()
+  expect([seen.argv.length, seen.status]).toEqual([1, []])
+  await clock.advance(3000)
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  expect([seen.argv.length, seen.status, await header(ui)]).toEqual([2, ['agents: 1'], 'mux-agents · 1 running'])
+  await ui.unmount()
+})
+
+test('/mux-agents-pane answers before the first refresh settles, and the board appears once it does', async ($, on) => {
+  const { seen, clock } = world(on, { TMUX: 'x' }, [{ holdMs: 4000, answer: ran(0, LIST) }, ran(0, LIST)])
+  await $.session.start(START)
+  let done = false
+  const run = $.command.run({ command: 'mux-agents-pane' }).then(r => { done = true; return r })
+  await clock.settle()
+  expect([done, seen.opened]).toEqual([true, [{ id: 'mux-agents', title: 'Agents' }]])
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  expect(await header(ui)).toBe('mux-agents · 0 running')
+  await clock.advance(4000)
+  expect(await header(ui)).toBe('mux-agents · 1 running')
+  await run
+  await ui.unmount()
+})
+
+test('/mux-agents-pane opens the pane and a stubbed list draws the count and rows', async ($, on) => {
+  const { seen, clock } = world(on, { TMUX: 'x' }, [ran(0, LIST)])
+  await $.session.start(START)
+  await $.command.run({ command: 'mux-agents-pane' })
+  await clock.settle()
   expect(seen.opened).toEqual([{ id: 'mux-agents', title: 'Agents' }])
   for (const surface of ['terminal', 'desktop'] as const) {
     const ui = await $.ui.mount({ ...PANE, surface })
@@ -169,9 +249,10 @@ test('/mux-agents-pane opens the pane and a stubbed list draws the count and row
 })
 
 test('ended rows are dimmed and named by state: exited, stopped and lost', async ($, on) => {
-  world(on, { TMUX: 'x' }, [ran(0, list(0, [row('a', 'exited', null, 60), row('b', 'stopped', null, 60), row('c', 'lost', null, 60)]))])
+  const { clock } = world(on, { TMUX: 'x' }, [ran(0, list(0, [row('a', 'exited', null, 60), row('b', 'stopped', null, 60), row('c', 'lost', null, 60)]))])
   await $.session.start(START)
   await $.command.run({ command: 'mux-agents-pane' })
+  await clock.settle()
   const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
   const rows = []
   for (const name of ['a', 'b', 'c']) { const t = await ui.find({ type: 'Text', text: new RegExp(`^○ ${name} `) }); rows.push(`${t?.text}|${t?.props.dimColor}`) }
@@ -180,9 +261,10 @@ test('ended rows are dimmed and named by state: exited, stopped and lost', async
 })
 
 test('the pane draws a board whose name and doing hold ESC, BEL and C1, with none of them drawn', async ($, on) => {
-  world(on, { TMUX: 'x' }, [ran(0, list(1, [row('ev\u001b[31mil\u0007', 'running', 'do\u009bne\tnow\u007f', 5)]))])
+  const { clock } = world(on, { TMUX: 'x' }, [ran(0, list(1, [row('ev\u001b[31mil\u0007', 'running', 'do\u009bne\tnow\u007f', 5)]))])
   await $.session.start(START)
   await $.command.run({ command: 'mux-agents-pane' })
+  await clock.settle()
   const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
   const texts = (await ui.findAll({ type: 'Text' })).map((t: { text: string }) => t.text)
   const controls = texts.flatMap((t: string) => [...t].map(c => c.codePointAt(0)!).filter(c => c < 0x20 || (c >= 0x7f && c <= 0x9f)))

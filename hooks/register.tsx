@@ -34,12 +34,24 @@ async function refresh($: EngineInterface) {
   }
 }
 
+// A refresh started and not awaited: a rejection (a failed state write) is dropped, and the next tick tries again.
+function startRefresh($: EngineInterface) {
+  refresh($).catch(() => {})
+}
+
+// Opens the pane; the first refresh runs on its own, so neither /mux-agents-pane nor a tool result waits for list.
 async function openPane($: EngineInterface) {
   await $.ui.open({ id: PANE, title: 'Agents' })
   if (!ticking) {
-    ticking = $.clock.every(3000, () => refresh($))
-    await refresh($)
+    ticking = $.clock.every(3000, () => startRefresh($))
+    startRefresh($)
   }
+}
+
+// After a Bash or PowerShell call: opens the pane when the call was a successful spawn inside tmux or rmux.
+async function openAfterSpawn($: EngineInterface, command: string, stdout: string | undefined) {
+  const mux = (await $.env.get('TMUX')) || (await $.env.get('RMUX'))
+  if (mux && isSpawn(command, stdout)) await openPane($)
 }
 
 // After the pane closed: stop its refresh, so a later open starts one new timer.
@@ -63,13 +75,14 @@ export const register: Register = on => {
     await openPane($)
     return { text: 'Agents pane opened.' }
   })
+  // The pane never delays or changes the tool result: the spawn check and the open run on their own, and any rejection
+  // ($.env.get, $.ui.open) is dropped.
   on('tool.call', async ($, e, next) => {
     const ran = await next(e)
     const tool = String(e.tool)
     if ((tool === 'Bash' || tool === 'PowerShell') && ran.deny === undefined && ran.isError !== true) {
-      const mux = (await $.env.get('TMUX')) || (await $.env.get('RMUX'))
       const stdout = (ran.result as { stdout?: unknown } | undefined)?.stdout
-      if (mux && isSpawn(String((e as { command?: unknown }).command ?? ''), typeof stdout === 'string' ? stdout : undefined)) await openPane($)
+      openAfterSpawn($, String((e as { command?: unknown }).command ?? ''), typeof stdout === 'string' ? stdout : undefined).catch(() => {})
     }
     return ran
   })
