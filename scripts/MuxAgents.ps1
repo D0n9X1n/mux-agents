@@ -135,6 +135,72 @@ function Get-MuxAgentPlatform {
     if ($OnWindows) { 'windows' } elseif ($OnLinux) { 'linux' } elseif ($OnMacOS) { 'macos' }
 }
 
+function Get-MuxAgentPlatformMembers {
+    # The OS members of $P (the contract). Windows: today's code. Any other platform refuses 2 'platform' until B4.
+    param([AllowEmptyString()][string]$Platform)
+    if ($Platform -cne 'windows') { Exit-MuxAgentCommand 2 'platform' 'mux-agents 0.1.0 runs on Windows with rmux only' }
+    [ordered]@{
+        Platform = 'windows'
+        Pwsh = (Join-Path $PSHOME 'pwsh.exe')
+        Processes = { Get-MuxAgentProcessTable }
+        Open = {
+            param([int]$Id)
+            $process = Get-Process -Id $Id -ErrorAction SilentlyContinue
+            if (-not $process) { return $null }
+            # get_Handle opens and keeps the process handle, so the id cannot be reused while it is held. Call the
+            # accessors: a PowerShell property read turns a failing getter into $null instead of throwing.
+            $start = try { $null = $process.get_Handle(); $process.get_StartTime().ToFileTimeUtc() } catch { $null }
+            [pscustomobject]@{ Id = $Id; Start = $start; Process = $process }
+        }
+        Kill = {
+            param($Opened)
+            # Process.Kill is asynchronous; report whether the opened process exited within 5 s.
+            try {
+                if (-not $Opened.Process.HasExited) { $Opened.Process.Kill() }
+                $Opened.Process.WaitForExit(5000)
+            }
+            catch { $false }
+        }
+        Token = { Get-MuxAgentToken }
+        Sandbox = { param($P) Assert-MuxAgentToken -Token (& $P.Token) }
+        Endpoint = {
+            param($Environment)
+            $endpoint = if ($Environment['RMUX']) { $Environment['RMUX'] } else { $Environment['TMUX'] }
+            if ($endpoint -match '^(\\\\\.\\pipe\\[^,\r\n]+),(\d+),\d+$') { [pscustomobject]@{ Socket = $Matches[1]; ServerPid = $Matches[2] } }
+        }
+        Mux = { param($P) Resolve-MuxAgentExecutable -P $P }
+        ClientOf = {
+            param($Row)
+            $file = [IO.Path]::GetFileName($Row.Path)
+            if ($file -in @('claude.exe', 'copilot.exe')) { [IO.Path]::GetFileNameWithoutExtension($file).ToLowerInvariant() }
+        }
+        IsShell = { param($Row) [IO.Path]::GetFileName($Row.Path) -in @('pwsh.exe', 'powershell.exe', 'cmd.exe', 'bash.exe', 'sh.exe') }
+        # Open keeps 100 ns and the CIM row whole microseconds; an unreadable start is never the same.
+        SameStart = { param($Opened, $Listed) $null -ne $Opened -and ($Opened - $Opened % 10) -eq $Listed }
+        Argv = { param($Row) @(Split-MuxAgentCommandLine -CommandLine ([string]$Row.CommandLine)) }
+        ClaudeDirectory = {
+            param($P, $Caller)
+            $session = Read-MuxAgentJson -Path ([IO.Path]::Combine($P.Home, '.claude', 'sessions', "$($Caller.Agent.Pid).json"))
+            # procStart is a FILETIME; compare at whole microseconds like the process table.
+            $start = [long]$session.procStart
+            $same = ($start - $start % 10) -eq ($Caller.Agent.Start - $Caller.Agent.Start % 10)
+            if ($same -and $session.sessionId -ceq $P.Env['CLAUDE_CODE_SESSION_ID']) { [string]$session.cwd }
+        }
+        StopReport = { param([int[]]$Left) [ordered]@{ survivors = $Left.Count } }
+        StateRootOf = { param($Environment) Get-MuxAgentStateRoot -Environment $Environment }
+        PrivateDirectories = {
+            param([string[]]$Paths)
+            $sid = Get-MuxAgentUserSid
+            foreach ($path in $Paths) { New-MuxAgentPrivateDirectory $sid $path }
+        }
+        LockName = { param([string]$LockKey) 'Local\MuxAgents-' + (Get-MuxAgentHash $LockKey).Substring(0, 32) }
+        ClientImage = { param([string]$Client) "$Client.exe" }
+        IsUnder = { param([string]$Root, [string]$Full) $Full.StartsWith([IO.Path]::GetFullPath($Root).TrimEnd('\') + '\', [StringComparison]::OrdinalIgnoreCase) }
+    }
+}
+# Locks use the Windows name until New-MuxAgentProviders installs the selected platform's LockName.
+$script:MuxAgentLockName = (Get-MuxAgentPlatformMembers -Platform windows).LockName
+
 function Resolve-MuxAgentExecutable {
     # The rmux image the caller's server runs (by the server PID in RMUX, then TMUX), else the first rmux.exe on PATH.
     param([Parameter(Mandatory)]$P)
@@ -197,41 +263,20 @@ function New-MuxAgentProviders {
     $Entry = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($Entry)
     $environment = [hashtable]::new([StringComparer]::OrdinalIgnoreCase)
     foreach ($item in [Environment]::GetEnvironmentVariables().GetEnumerator()) { $environment[[string]$item.Key] = [string]$item.Value }
-    $providers = [pscustomobject]@{
-        Env = $environment
-        Pid = $PID
-        Cwd = (Get-Location -PSProvider FileSystem).ProviderPath
-        Home = $HOME
-        StateRoot = (Get-MuxAgentStateRoot -Environment $environment)
-        Entry = $Entry
-        Launcher = [IO.Path]::Combine([IO.Path]::GetDirectoryName($Entry), 'mux-agent-launcher.ps1')
-        Pwsh = (Join-Path $PSHOME 'pwsh.exe')
-        RmuxPath = $null
-        Processes = { Get-MuxAgentProcessTable }
-        Open = {
-            param([int]$Id)
-            $process = Get-Process -Id $Id -ErrorAction SilentlyContinue
-            if (-not $process) { return $null }
-            # get_Handle opens and keeps the process handle, so the id cannot be reused while it is held. Call the
-            # accessors: a PowerShell property read turns a failing getter into $null instead of throwing.
-            $start = try { $null = $process.get_Handle(); $process.get_StartTime().ToFileTimeUtc() } catch { $null }
-            [pscustomobject]@{ Id = $Id; Start = $start; Process = $process }
-        }
-        Kill = {
-            param($Opened)
-            # Process.Kill is asynchronous; report whether the opened process exited within 5 s.
-            try {
-                if (-not $Opened.Process.HasExited) { $Opened.Process.Kill() }
-                $Opened.Process.WaitForExit(5000)
-            }
-            catch { $false }
-        }
-        Rmux = { param([string[]]$Arguments) Invoke-MuxAgentRmux -P $script:MuxAgentProviders -Arguments $Arguments }
-        Token = { Get-MuxAgentToken }
-        Now = { [DateTime]::UtcNow }
-        Sleep = { param([int]$Milliseconds) Start-Sleep -Milliseconds $Milliseconds }
-        Admitted = $false
-    }
+    $members = [ordered]@{ Env = $environment; Pid = $PID; Cwd = (Get-Location -PSProvider FileSystem).ProviderPath; Home = $HOME }
+    # The only OS branch: the members of the running platform (any other platform refuses 2 'platform').
+    $os = Get-MuxAgentPlatformMembers -Platform (Get-MuxAgentPlatform)
+    foreach ($key in $os.Keys) { $members[$key] = $os[$key] }
+    $members.StateRoot = & $os.StateRootOf $environment
+    $members.Entry = $Entry
+    $members.Launcher = [IO.Path]::Combine([IO.Path]::GetDirectoryName($Entry), 'mux-agent-launcher.ps1')
+    $members.RmuxPath = $null
+    $members.Rmux = { param([string[]]$Arguments) Invoke-MuxAgentRmux -P $script:MuxAgentProviders -Arguments $Arguments }
+    $members.Now = { [DateTime]::UtcNow }
+    $members.Sleep = { param([int]$Milliseconds) Start-Sleep -Milliseconds $Milliseconds }
+    $members.Admitted = $false
+    $script:MuxAgentLockName = $os.LockName
+    $providers = [pscustomobject]$members
     # The Rmux member reads the endpoint from the latest providers and caches the resolved rmux image on them. A
     # closure would hide the script's functions from it.
     $script:MuxAgentProviders = $providers

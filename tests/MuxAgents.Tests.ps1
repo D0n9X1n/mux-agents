@@ -129,14 +129,15 @@ Describe 'MuxAgents T1.1 dispatcher' -Tag 'windows' {
 
     It 'A1 production providers have the planned members' {
         $providers = New-MuxAgentProviders -Entry (Join-Path $repoRoot 'scripts\mux-agent.ps1')
-        $planned = @('Env', 'Pid', 'Cwd', 'Home', 'StateRoot', 'Entry', 'Launcher', 'Pwsh', 'Processes', 'Open', 'Kill', 'Rmux', 'RmuxPath', 'Token', 'Now', 'Sleep', 'Admitted')
+        $planned = @('Env', 'Pid', 'Cwd', 'Home', 'StateRoot', 'Entry', 'Launcher', 'Pwsh', 'Processes', 'Open', 'Kill', 'Rmux', 'RmuxPath', 'Token', 'Now', 'Sleep', 'Admitted', 'Platform', 'Sandbox', 'Endpoint', 'Mux', 'ClientOf', 'IsShell', 'SameStart', 'Argv', 'ClaudeDirectory', 'StopReport', 'StateRootOf', 'PrivateDirectories', 'LockName', 'ClientImage', 'IsUnder')
         (@($providers.PSObject.Properties.Name | Sort-Object) -join ',') | Should BeExactly (@($planned | Sort-Object) -join ',')
         "$($providers.Env['PATH'] -eq $env:Path) $($providers.Env['path'] -eq $env:Path)" | Should Be 'True True'
         "$($providers.Pid -eq $PID) $($providers.Cwd -eq (Get-Location -PSProvider FileSystem).ProviderPath) $($providers.Home -eq $HOME)" | Should Be 'True True True'
         $providers.StateRoot | Should BeExactly (Join-Path $env:LOCALAPPDATA 'mux-agents\state')
         $now = & $providers.Now
         "$($now.Kind) $([Math]::Abs(($now - [DateTime]::UtcNow).TotalSeconds) -lt 5) $($providers.Admitted.GetType().Name) $($providers.Admitted)" | Should BeExactly 'Utc True Boolean False'
-        "$(@('Processes', 'Rmux', 'Token') | ForEach-Object { $providers.$_ -is [scriptblock] })" | Should Be 'True True True'
+        "$(@('Processes', 'Rmux', 'Token', 'Sandbox', 'Endpoint', 'Mux', 'ClientOf', 'IsShell', 'SameStart', 'Argv', 'ClaudeDirectory', 'StopReport', 'StateRootOf', 'PrivateDirectories', 'LockName', 'ClientImage', 'IsUnder') | ForEach-Object { $providers.$_ -is [scriptblock] })" | Should Be ((@(1..17) | ForEach-Object { 'True' }) -join ' ')
+        $providers.Platform | Should BeExactly 'windows'
     }
 
     It 'A1 production Open and Kill' {

@@ -92,6 +92,9 @@ function New-FakeMuxAgentProviders {
         }
         [pscustomobject]@{ ExitCode = 0; StdOut = ''; StdErr = '' }
     }.GetNewClosure()
+    # The production OS members the fake does not replace; a test swaps one for a spy by assigning it.
+    $os = Get-MuxAgentPlatformMembers -Platform windows
+    foreach ($key in $os.Keys) { if (-not $fake.PSObject.Properties[$key]) { Add-Member -InputObject $fake -NotePropertyName $key -NotePropertyValue $os[$key] } }
     Add-FakeMuxAgentFixtures -Fake $fake -Caller $Caller -Work $work
     $fake
 }
