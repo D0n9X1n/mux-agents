@@ -16,3 +16,8 @@ Describe 'MuxAgents runtime verdict' {
             @('10.0.13-weird.1', 'affected'), @('10.0.13x', 'affected'), @('99999999999.0.0', 'affected'), @("10.0.14`n", 'affected'), @('', 'affected'), @("$([char]0x0661)0.0.14", 'affected'), @('11.0.0-rc.0000000002.1', 'fixed'), @('11.0.0-rc.99999999999.1', 'fixed'), @('11.0.0-rc.01.1', 'affected'))
         $got = foreach ($c in $cases) { "$($c[0])=$(Get-MuxAgentRuntimeVerdict -Version $c[0])" }
         ($got -join ';') | Should BeExactly ((@($cases | ForEach-Object { "$($_[0])=$($_[1])" })) -join ';') } }
+Describe 'MuxAgents runtime version' {
+    It 'reads the informational version of the assembly holding [object], whose numeric part is [Environment]::Version' {
+        $live = [Reflection.CustomAttributeExtensions]::GetCustomAttribute([object].Assembly, [Reflection.AssemblyInformationalVersionAttribute]).InformationalVersion
+        $read = Get-MuxAgentRuntimeVersion
+        "$($read -ceq $live) $(($read -split '[-+]', 2)[0] -ceq [Environment]::Version.ToString(3)) $($read -cne $PSVersionTable.PSVersion.ToString())" | Should BeExactly 'True True True' } }

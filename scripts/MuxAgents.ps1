@@ -128,6 +128,11 @@ function Get-MuxAgentPlatform {
     if ($OnWindows) { 'windows' } elseif ($OnLinux) { 'linux' } elseif ($OnMacOS) { 'macos' }
 }
 
+function Get-MuxAgentRuntimeVersion {
+    # The running .NET's informational version (the assembly holding [object]); never $PSVersionTable (#25).
+    [object].Assembly.GetCustomAttributes([Reflection.AssemblyInformationalVersionAttribute], $false)[0].InformationalVersion
+}
+
 function Get-MuxAgentRuntimeVerdict {
     # fixed or affected for a .NET informational version under GHSA-2j93-m82w-73j2 (#25); anything unparsed is affected.
     # ASCII only first: .NET's \d also matches other scripts' digits. \z, not $, which accepts a final LF.
