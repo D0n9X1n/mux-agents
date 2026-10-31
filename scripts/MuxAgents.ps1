@@ -976,6 +976,20 @@ function ConvertTo-MuxAgentMessageText {
     [regex]::Replace($Text.Replace("`r`n", "`n"), '[\x00-\x08\x0B-\x1F\x7F]', '')
 }
 
+function ConvertTo-MuxAgentDoingLine {
+    # One side-bar line, cleaned before storage: C0 (but LF), DEL and C1 removed, then the first non-blank line, tabs as
+    # spaces, trimmed, at most 80 characters without splitting a surrogate pair; '' when every line is blank.
+    param([Parameter(Mandatory)][AllowEmptyString()][string]$Text)
+    $clean = [regex]::Replace((ConvertTo-MuxAgentMessageText $Text), '[\u0080-\u009F]', '')
+    foreach ($line in $clean.Split("`n")) {
+        $line = $line.Replace("`t", ' ').Trim()
+        if (-not $line) { continue }
+        if ($line.Length -gt 80) { $line = $line.Substring(0, $(if ([char]::IsHighSurrogate($line[79])) { 79 } else { 80 })) }
+        return $line
+    }
+    ''
+}
+
 function Add-MuxAgentMail {
     # Appends one message to Key's mailbox under the mailbox lock and returns its id. A last line without LF, left by an
     # interrupted append, gets its LF first, so it never joins the new message; read skips it if it does not parse. With
