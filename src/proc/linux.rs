@@ -149,7 +149,7 @@ mod tests {
         let before = uptime_ticks();
         let mut child = sleeper();
         let after = uptime_ticks();
-        let start = Linux.row(child.id()).map(|r| r.start);
+        let start = Linux.row(child.id()).and_then(|r| r.start);
         let opened = Linux.open(child.id()).map(|o| o.start);
         child.kill().unwrap();
         child.wait().unwrap();

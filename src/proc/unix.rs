@@ -118,7 +118,7 @@ mod tests {
         Row {
             pid: 1,
             ppid: 0,
-            start: 0,
+            start: Some(0),
             path: path.map(str::to_string),
             argv: None,
         }

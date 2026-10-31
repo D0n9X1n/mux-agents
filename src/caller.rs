@@ -156,7 +156,10 @@ pub fn resolve(ctx: &Ctx) -> Res<Caller> {
                 .open(row.pid)
                 .ok_or_else(|| caller_refusal(1, "agent start is unreadable"))?;
             // A start other than the listed one is a pid reused after the walk read it.
-            if !ctx.os.same_start(opened.start, row.start) {
+            if !row
+                .start
+                .is_some_and(|listed| ctx.os.same_start(opened.start, listed))
+            {
                 return Err(caller_refusal(1, "agent process changed"));
             }
             Some(Agent {
@@ -187,10 +190,11 @@ pub fn resolve(ctx: &Ctx) -> Res<Caller> {
 }
 
 /// The caller's own row, then up to 64 parents, one row read each, ending at the pane. A parent that started
-/// after its child is a reused pid and ends the walk, as does a missing row; a cycle ends at the cap.
+/// after its child is a reused pid and ends the walk, as does a missing row or one without a start (it cannot be
+/// ordered); a cycle ends at the cap.
 fn walk(ctx: &Ctx, pane_pid: u32) -> Res<Vec<Row>> {
     let mut chain = Vec::new();
-    let mut next = ctx.os.row(ctx.pid);
+    let mut next = ctx.os.row(ctx.pid).filter(|row| row.start.is_some());
     while let Some(row) = next {
         let (pid, ppid, start) = (row.pid, row.ppid, row.start);
         chain.push(row);
@@ -200,7 +204,11 @@ fn walk(ctx: &Ctx, pane_pid: u32) -> Res<Vec<Row>> {
         if chain.len() > MAX_PARENTS {
             break;
         }
-        next = ctx.os.row(ppid).filter(|parent| parent.start <= start);
+        // Both starts are known here, so the comparison is between numbers.
+        next = ctx
+            .os
+            .row(ppid)
+            .filter(|parent| parent.start.is_some() && parent.start <= start);
     }
     Err(caller_refusal(1, "caller is not below its rmux pane"))
 }
@@ -482,6 +490,25 @@ mod tests {
         same.shell(SHELL);
         same.mux_rule("display-message", 0, "900|100|$3|@1|\n", "");
         assert_eq!(outcome(run(&same)), "Human");
+    }
+
+    #[test]
+    fn walk_unknown_start_is_unreadable() {
+        // A row listed without a start cannot be ordered against its child, so it ends the walk like a missing one.
+        let shell = human();
+        shell.process(testing::unknown_start(SHELL, PANE));
+        let own = human();
+        own.process(testing::unknown_start(CALLER, SHELL));
+        let pane = human();
+        pane.process(testing::unknown_start(PANE, SERVER));
+        // The fakes answer the first listed row of a pid, so the unknown one goes first.
+        for fakes in [shell, own, pane] {
+            fakes.prefer_last();
+            assert_eq!(
+                outcome(run(&fakes)),
+                "1 caller caller is not below its rmux pane"
+            );
+        }
     }
 
     // caller > `hops` shells > pane.

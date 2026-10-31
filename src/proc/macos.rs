@@ -276,7 +276,7 @@ mod tests {
         let before = epoch_micros();
         let mut child = sleeper(Path::new("/"));
         let after = epoch_micros();
-        let first = MacOs.row(child.id()).map(|r| r.start);
+        let first = MacOs.row(child.id()).and_then(|r| r.start);
         let again = MacOs.read_start(child.id());
         child.kill().unwrap();
         child.wait().unwrap();

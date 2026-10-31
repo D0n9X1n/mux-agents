@@ -33,7 +33,7 @@ pub fn read_row(
     (again == start).then_some(super::Row {
         pid,
         ppid,
-        start,
+        start: Some(start),
         path,
         argv,
     })
@@ -77,13 +77,16 @@ pub fn open_with<S: ProcSource>(src: &S, pid: u32) -> Option<Opened<S::H>> {
 }
 
 /// Keeps an opened process only when its start is the listed one: a pid reused between listing and opening is
-/// another process, left as `start`, and its handle closes here without a signal.
+/// another process, left as `start`, and its handle closes here without a signal. A row listed without a start
+/// cannot be matched, so it is left as `open` whatever the open found.
 pub fn hold<H>(
     opened: Option<Opened<H>>,
-    listed: i64,
+    listed: Option<i64>,
     same: impl Fn(i64, i64) -> bool,
 ) -> Result<Opened<H>, super::Reason> {
-    let opened = opened.ok_or(super::Reason::Open)?;
+    let (Some(opened), Some(listed)) = (opened, listed) else {
+        return Err(super::Reason::Open);
+    };
     if same(opened.start, listed) {
         Ok(opened)
     } else {
@@ -215,7 +218,7 @@ mod tests {
         let row = row_reads(vec![Some((1, 100)), Some((9, 100))]).0.unwrap();
         assert_eq!(
             (row.pid, row.ppid, row.start, row.path.as_deref()),
-            (7, 1, 100, Some("/bin/sh"))
+            (7, 1, Some(100), Some("/bin/sh"))
         );
         assert_eq!(row.argv, Some(vec!["sh".to_string()]));
     }
@@ -301,23 +304,37 @@ mod tests {
         let opened = open_with(&src, 7);
         assert_eq!(opened.as_ref().map(|o| o.start), Some(2000));
         assert!(matches!(
-            hold(opened, listed, |a, b| a == b),
+            hold(opened, Some(listed), |a, b| a == b),
             Err(Reason::Start)
         ));
         // Rejected, the fd closed at once and nothing was signalled.
         assert_eq!(src.calls(), ["handle 7", "start 7", "alive 7", "close 7"]);
 
         // No process at all is `open`; the same start is held with its fd.
-        let none = hold::<FakeHandle>(None, listed, |a, b| a == b);
+        let none = hold::<FakeHandle>(None, Some(listed), |a, b| a == b);
         assert!(matches!(none, Err(Reason::Open)));
         let src = Fake {
             handle: true,
             start: Some(listed),
             ..Fake::default()
         };
-        let held = hold(open_with(&src, 7), listed, |a, b| a == b).unwrap();
+        let held = hold(open_with(&src, 7), Some(listed), |a, b| a == b).unwrap();
         assert!(held.handle().is_some());
         assert_eq!(src.calls(), ["handle 7", "start 7", "alive 7"]);
+    }
+
+    #[test]
+    fn hold_refuses_unknown_start() {
+        // A row listed without a start (Windows: a process this user cannot open) is never trusted or killed,
+        // even when an open succeeds: its handle closes at once.
+        let src = Fake {
+            handle: true,
+            start: Some(1500),
+            ..Fake::default()
+        };
+        let held = hold(open_with(&src, 7), None, |a, b| a == b);
+        assert!(matches!(held, Err(Reason::Open)));
+        assert_eq!(src.calls(), ["handle 7", "start 7", "alive 7", "close 7"]);
     }
 
     #[test]

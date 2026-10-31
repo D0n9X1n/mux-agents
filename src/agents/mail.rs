@@ -17,12 +17,10 @@ pub fn mailbox_key(pane: &str, tag: &str) -> Res<String> {
     if super::agent_id(tag) {
         return Ok(tag.to_string());
     }
-    match pane.strip_prefix('%') {
-        Some(n) if !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()) => {
-            Ok(format!("pane-{n}"))
-        }
-        _ => refuse(2, "target", "not a pane"),
+    if !super::pane_id(pane) {
+        return refuse(2, "target", "not a pane");
     }
+    Ok(format!("pane-{}", &pane[1..]))
 }
 
 /// LF line ends; ESC and the other C0 controls except LF and TAB, and DEL, removed.

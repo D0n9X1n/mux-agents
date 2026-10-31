@@ -10,6 +10,7 @@ use crate::error::{Refusal, Res};
 
 pub mod board;
 pub mod mail;
+pub mod message;
 pub mod registry;
 pub mod view;
 
@@ -65,6 +66,12 @@ pub(crate) fn lock_key(kind: &str, caller: &Caller, key: &str) -> String {
 /// `^[0-9a-f]{12}$`: an agent id, safe as a folder or mailbox name.
 pub(crate) fn agent_id(text: &str) -> bool {
     text.len() == 12 && text.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+/// `^%\d+$` with ASCII digits and no final LF.
+pub(crate) fn pane_id(text: &str) -> bool {
+    text.strip_prefix('%')
+        .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
 }
 
 /// `^[a-z][a-z0-9-]{0,23}\z`.

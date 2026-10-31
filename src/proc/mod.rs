@@ -15,12 +15,13 @@ pub mod seam;
 pub mod unix;
 pub mod windows;
 
-/// One process. `start` is the kernel's own unit (spec D1); `path` the real executable; `argv` none when unreadable.
+/// One process. `start` is the kernel's own unit (spec D1), none when the process cannot be opened (a Windows
+/// Toolhelp row kept so stop's walk reaches its children); `path` the real executable; `argv` none when unreadable.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Row {
     pub pid: u32,
     pub ppid: u32,
-    pub start: i64,
+    pub start: Option<i64>,
     pub path: Option<String>,
     pub argv: Option<Vec<String>>,
 }

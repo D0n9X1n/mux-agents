@@ -205,7 +205,7 @@ mod win {
         Some(Row {
             pid,
             ppid: ppid_of(&handle)?,
-            start: start_of(&handle)?,
+            start: Some(start_of(&handle)?),
             path: path_of(&handle),
             argv: argv_of(&handle),
         })
@@ -292,9 +292,15 @@ mod win {
             // SAFETY: a live snapshot and one entry with its size set.
             let mut more = unsafe { Process32FirstW(raw(&snap), &mut entry) } != 0;
             while more {
-                if let Some(row) = row_of(entry.th32ProcessID) {
-                    rows.push(row);
-                }
+                // A process this user cannot open keeps Toolhelp's pid and ppid with no start, so stop's walk
+                // passes through it to children it can open; with no start it is never trusted or killed.
+                rows.push(row_of(entry.th32ProcessID).unwrap_or(Row {
+                    pid: entry.th32ProcessID,
+                    ppid: entry.th32ParentProcessID,
+                    start: None,
+                    path: None,
+                    argv: None,
+                }));
                 // SAFETY: as above.
                 more = unsafe { Process32NextW(raw(&snap), &mut entry) } != 0;
             }
@@ -406,7 +412,9 @@ mod win {
             let listed = table.iter().find(|r| r.pid == me()).unwrap();
             assert_eq!((listed.ppid, listed.start), (row.ppid, row.start));
             assert!(table.iter().any(|r| r.pid == row.ppid));
-            assert_eq!(Windows.open(me()).map(|o| o.start), Some(row.start));
+            assert_eq!(Windows.open(me()).map(|o| o.start), row.start);
+            // Idle (pid 0) never opens; the table keeps it, without a start.
+            assert!(table.iter().any(|r| r.pid == 0 && r.start.is_none()));
             assert_eq!(Windows.row(0), None);
             assert!(Windows.open(0).is_none());
             assert_eq!(Windows.cwd(me()), None);
@@ -435,7 +443,7 @@ mod win {
             let opened = Windows.open(child.id()).unwrap();
             let listed = Windows.table().unwrap();
             let listed = listed.iter().find(|r| r.pid == child.id()).unwrap();
-            assert!(Windows.same_start(opened.start, listed.start));
+            assert!(Windows.same_start(opened.start, listed.start.unwrap()));
             assert!(Windows.kill(opened));
             assert!(child.try_wait().unwrap().is_some());
         }

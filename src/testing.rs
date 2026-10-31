@@ -20,6 +20,9 @@ struct Rule {
 // Sees each lock event (`+key` or `-key`) and answers text to record with it.
 type Probe = Rc<dyn Fn(&str) -> String>;
 
+// What `stop_report` answers for the rows stop left.
+type Report = fn(&[Left]) -> serde_json::Map<String, serde_json::Value>;
+
 #[derive(Default)]
 struct Log {
     rows: Vec<Row>,
@@ -39,6 +42,9 @@ struct Log {
     // `+key` on taking a lock and `-key` on releasing it, each followed by the probe's answer when one is set.
     locks: Vec<String>,
     held: Vec<String>,
+    // Pids whose kill shows an exit; any other kill fails.
+    kills: Vec<u32>,
+    report: Option<Report>,
     probe: Option<Probe>,
 }
 
@@ -112,6 +118,26 @@ impl Fakes {
             .entry(pid)
             .or_default()
             .extend(starts.iter().copied());
+    }
+
+    /// A kill of this pid shows the exit.
+    pub fn kill_ok(&self, pid: u32) {
+        self.0.borrow_mut().kills.push(pid);
+    }
+
+    /// What `stop_report` answers; none answers an empty map.
+    pub fn stop_report_with(
+        &self,
+        report: fn(&[Left]) -> serde_json::Map<String, serde_json::Value>,
+    ) {
+        self.0.borrow_mut().report = Some(report);
+    }
+
+    /// Moves the last listed row to the front, so `row` answers it for its pid.
+    pub fn prefer_last(&self) {
+        let mut log = self.0.borrow_mut();
+        let last = log.rows.pop().expect("a listed row");
+        log.rows.insert(0, last);
     }
 
     /// What the fake OS says about a sandbox.
@@ -229,13 +255,15 @@ impl Os for Fakes {
             .and_then(VecDeque::pop_front);
         match queued {
             Some(start) => start.map(|start| Opened::new(pid, start, None)),
-            None => self.listed(pid).map(|r| Opened::new(r.pid, r.start, None)),
+            None => self
+                .listed(pid)
+                .and_then(|r| r.start.map(|start| Opened::new(r.pid, start, None))),
         }
     }
 
     fn kill(&self, opened: Opened) -> bool {
         self.os_call(format!("kill {}", opened.pid));
-        false
+        self.0.borrow().kills.contains(&opened.pid)
     }
 
     fn cwd(&self, pid: u32) -> Option<String> {
@@ -257,8 +285,9 @@ impl Os for Fakes {
         opened == listed
     }
 
-    fn stop_report(&self, _: &[Left]) -> serde_json::Map<String, serde_json::Value> {
-        serde_json::Map::new()
+    fn stop_report(&self, left: &[Left]) -> serde_json::Map<String, serde_json::Value> {
+        let report = self.0.borrow().report;
+        report.map_or_else(serde_json::Map::new, |report| report(left))
     }
 
     fn token(&self) -> Option<Token> {
@@ -272,12 +301,20 @@ impl Os for Fakes {
     }
 }
 
+/// A row whose start is unknown (Windows: listed by Toolhelp but not openable).
+pub fn unknown_start(pid: u32, ppid: u32) -> Row {
+    Row {
+        start: None,
+        ..row(pid, ppid, 0)
+    }
+}
+
 /// A row with no path or argv.
 pub fn row(pid: u32, ppid: u32, start: i64) -> Row {
     Row {
         pid,
         ppid,
-        start,
+        start: Some(start),
         path: None,
         argv: None,
     }
