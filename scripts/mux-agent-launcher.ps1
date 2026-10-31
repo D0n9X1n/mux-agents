@@ -6,6 +6,8 @@ param([Parameter(Mandatory)][string]$Spec)
 $built = Initialize-MuxAgentProviders -Entry (Join-Path $PSScriptRoot 'mux-agent.ps1')
 if ($built.Failure) { [Console]::Out.WriteLine((Format-MuxAgentResult -Data $built.Failure)); exit $built.Failure.code }
 $P = $built.P
+# The runtime advisory (#25) goes to stderr before anything else runs in the pane.
+if ($P.Advisory) { [Console]::Error.WriteLine("mux-agent: $($P.Advisory)") }
 # Only a spec.json inside an agent folder of the state root, with no junction or link on the way, is read.
 $full = [IO.Path]::GetFullPath($Spec)
 if (-not (Test-MuxAgentSpecPath -P $P -Full $full)) {

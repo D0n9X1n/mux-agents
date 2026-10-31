@@ -104,3 +104,35 @@ Describe 'MuxAgents runtime replies' {
             ($got -join "`n") | Should BeExactly ((@('0|{"ok":true,"verb":"rt-ok","value":"v"}', '0|value: v', '2|{"ok":false,"verb":"rt-no","code":2,"check":"usage","message":"rt refused"}', "2|code: 2`ncheck: usage`nmessage: rt refused",
                 '0|{"ok":true,"verb":"rt-ok","value":"v","advisory":"ADV"}', "0|value: v`nadvisory: ADV", '2|{"ok":false,"verb":"rt-no","code":2,"check":"usage","message":"rt refused","advisory":"ADV"}', "2|code: 2`ncheck: usage`nmessage: rt refused`nadvisory: ADV")) -join "`n") }
         finally { $script:MuxAgentVerbs.Remove('rt-ok'); $script:MuxAgentVerbs.Remove('rt-no') } } }
+function Invoke-RuntimeScript {
+    # A copy of scripts/<Script> in its own folder next to a stub library (the real core, then Lines); 'exit|stdout|stderr'.
+    param([string]$Name, [string]$Script, [string[]]$Arguments, [string[]]$Lines)
+    $bin = Join-Path $TestDrive $Name; $null = [IO.Directory]::CreateDirectory($bin)
+    Copy-Item -LiteralPath ([IO.Path]::Combine($repoRoot, 'scripts', $Script)) -Destination $bin
+    $core = [IO.Path]::Combine($repoRoot, 'scripts', 'MuxAgents.ps1').Replace("'", "''")
+    [IO.File]::WriteAllLines((Join-Path $bin 'MuxAgents.ps1'), [string[]](@(". '$core'") + $Lines))
+    $pwsh = [Diagnostics.Process]::GetCurrentProcess().MainModule.FileName
+    $out = [Collections.Generic.List[string]]::new(); $err = [Collections.Generic.List[string]]::new()
+    foreach ($item in @(& $pwsh -NoProfile -File (Join-Path $bin $Script) @Arguments 2>&1)) { if ($item -is [Management.Automation.ErrorRecord]) { $err.Add("$item") } else { $out.Add("$item") } }
+    "$LASTEXITCODE|$($out -join ' ')|$($err -join ' ')" }
+Describe 'MuxAgents runtime entry and launcher' {
+    It 'the launcher writes the advisory to stderr; the entry and the launcher print a refusal with its advisory' {
+        $linux = "function Get-MuxAgentPlatform { 'linux' }"; $old = "function Get-MuxAgentRuntimeVersion { '10.0.12' }"; $new = "function Get-MuxAgentRuntimeVersion { '10.0.14' }"
+        $built = "function New-MuxAgentProviders { param(`$Entry) [pscustomobject]@{ StateRoot = 's' } }"; $state = "function New-MuxAgentProviders { param(`$Entry) Exit-MuxAgentCommand 2 'state' 'stub state refusal' }"
+        $tail = 'function Test-MuxAgentSpecPath { param($P, $Full) $true }', 'function Assert-MuxAgentNoReparse { param($Path) }', 'function Invoke-MuxAgentLauncher { param($P, $Spec) 7 }'
+        $spec = [IO.Path]::Combine($TestDrive, 'state', 'k', 'agents', 'a', 'spec.json')
+        $saved = $env:MUX_AGENTS_ALLOW_AFFECTED_DOTNET
+        try {
+            Set-RuntimeOverride '1'
+            $got = @((Invoke-RuntimeScript 'l-adv' 'mux-agent-launcher.ps1' @($spec) (@($linux, $old, $built) + $tail)),
+                (Invoke-RuntimeScript 'l-state' 'mux-agent-launcher.ps1' @($spec) (@($linux, $old, $state) + $tail)),
+                (Invoke-RuntimeScript 'e-state' 'mux-agent.ps1' @('list') @($linux, $old, $state)))
+            Set-RuntimeOverride $null
+            $got += @((Invoke-RuntimeScript 'l-fixed' 'mux-agent-launcher.ps1' @($spec) (@($linux, $new, $built) + $tail)),
+                (Invoke-RuntimeScript 'e-refused' 'mux-agent.ps1' @('list') @($linux, $old, $built)),
+                (Invoke-RuntimeScript 'l-refused' 'mux-agent-launcher.ps1' @($spec) (@($linux, $old, $built) + $tail))) }
+        finally { Set-RuntimeOverride $saved }
+        $adv = '.NET 10.0.12 is affected by GHSA-2j93-m82w-73j2; running because MUX_AGENTS_ALLOW_AFFECTED_DOTNET=1.'
+        $stateReply = "{`"ok`":false,`"verb`":null,`"code`":2,`"check`":`"state`",`"message`":`"stub state refusal`",`"advisory`":`"$adv`"}"
+        $refusal = '{"ok":false,"verb":null,"code":2,"check":"runtime","message":"mux-agents refuses .NET 10.0.12 on linux: GHSA-2j93-m82w-73j2 (CVE-2026-96231). Install PowerShell 7.4.21, 7.5.12, 7.6.7 or later, or set MUX_AGENTS_ALLOW_AFFECTED_DOTNET=1 to run anyway."}'
+        ($got -join "`n") | Should BeExactly ((@("7||mux-agent: $adv", "2|$stateReply|", "2|$stateReply|", '7||', "2|$refusal|", "2|$refusal|")) -join "`n") } }
