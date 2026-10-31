@@ -197,35 +197,39 @@ fn word_at(text: &str, at: usize, name: &str) -> bool {
 }
 
 /// Whether a compacted use tree imports `Command` from `process`: by name (aliased or not, grouped or nested at
-/// any depth) or by a glob.
+/// any depth), by a glob, or through a renamed `process` module whose later paths the scan cannot follow.
 fn imports_command(tree: &str) -> bool {
-    tree.match_indices("process::").any(|(at, _)| {
-        if at > 0 && ident(tree.as_bytes()[at - 1]) {
-            return false;
-        }
-        let rest = &tree[at + "process::".len()..];
-        if !rest.starts_with('{') {
-            return rest.starts_with('*') || word_at(rest, 0, "Command");
-        }
-        // The group's own braces, to the one that closes it.
-        let mut depth = 0;
-        let close = rest
-            .char_indices()
-            .find(|&(_, c)| {
-                depth += match c {
-                    '{' => 1,
-                    '}' => -1,
-                    _ => 0,
-                };
-                depth == 0
-            })
-            .map_or(rest.len(), |(k, _)| k);
-        let group = &rest[..close];
-        group.contains('*')
-            || group
-                .match_indices("Command")
-                .any(|(k, _)| word_at(group, k, "Command"))
-    })
+    let renamed = tree
+        .match_indices("process as ")
+        .any(|(at, _)| at == 0 || !ident(tree.as_bytes()[at - 1]));
+    renamed
+        || tree.match_indices("process::").any(|(at, _)| {
+            if at > 0 && ident(tree.as_bytes()[at - 1]) {
+                return false;
+            }
+            let rest = &tree[at + "process::".len()..];
+            if !rest.starts_with('{') {
+                return rest.starts_with('*') || word_at(rest, 0, "Command");
+            }
+            // The group's own braces, to the one that closes it.
+            let mut depth = 0;
+            let close = rest
+                .char_indices()
+                .find(|&(_, c)| {
+                    depth += match c {
+                        '{' => 1,
+                        '}' => -1,
+                        _ => 0,
+                    };
+                    depth == 0
+                })
+                .map_or(rest.len(), |(k, _)| k);
+            let group = &rest[..close];
+            group.contains('*')
+                || group
+                    .match_indices("Command")
+                    .any(|(k, _)| word_at(group, k, "Command"))
+        })
 }
 
 /// How many process-spawn sites the non-test code of `src` holds: each `use` that imports `std::process::Command`
@@ -305,6 +309,9 @@ fn scanner_flags_every_command_import() {
         "use std::{io, process::{Command, Stdio}};",
         "use std::process::{*};",
         "use std::{ process :: Command };",
+        // A renamed module hides a later `use p::Command as Other`, so the rename itself is the site.
+        "use std::process as p;\nuse p::Command as Other;\nfn f() { Other::new(\"x\"); }",
+        "use std::{io, process as p};",
     ] {
         assert_eq!(spawn_sites(src), 1, "{src}");
     }
