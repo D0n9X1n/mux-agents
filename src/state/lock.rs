@@ -6,6 +6,8 @@ use std::time::Duration;
 
 use crate::ctx::Ctx;
 use crate::error::{Res, refuse};
+#[cfg(unix)]
+use crate::state::private_unix::{Real, Steps};
 
 pub const LOCK_WAIT: Duration = Duration::from_secs(15);
 
@@ -38,16 +40,60 @@ fn timed_out<T>() -> Res<T> {
 
 /// `<home of the effective uid>/.local/state/mux-agents/locks`. The home comes from the passwd entry, never
 /// from HOME, XDG_STATE_HOME or MUX_AGENTS_STATE, so every state root of one user shares the locks.
+///
+/// Only the home is resolved: the passwd entry is trusted and may be a link (/home on macOS). Below it each
+/// existing component is read with lstat, never followed: a link, a file, another owner or group or other
+/// write refuses 1 `state`, so no other user can repoint a component and split one key across two lock
+/// files. The walk stops at the first missing component; `with_lock_in` makes the rest at 0700 and checks
+/// `locks` as a state folder.
 #[cfg(unix)]
-pub fn lock_root() -> Res<PathBuf> {
-    let home = passwd_home()?;
-    let Some(home) = home.to_str().filter(|h| h.starts_with('/')) else {
-        return refuse(1, "state", "the home folder of the user cannot be read");
+pub(crate) fn lock_root(steps: &dyn Steps, home: &Path) -> Res<PathBuf> {
+    let unreadable = || refuse(1, "state", "the home folder of the user cannot be read");
+    if !home.is_absolute() {
+        return unreadable();
+    }
+    let Ok(mut path) = steps.realpath(home) else {
+        return unreadable();
     };
-    crate::state::root::real_prefix(&format!(
-        "{}/.local/state/mux-agents/locks",
-        home.trim_end_matches('/')
-    ))
+    if !path.is_absolute() {
+        return unreadable();
+    }
+    let uid = steps.uid();
+    // `locks` itself is left to `with_lock_in`, which refuses a link there and checks it as a state folder.
+    let above = [".local", "state", "mux-agents"];
+    for (index, part) in above.iter().enumerate() {
+        path.push(part);
+        if !owned_dir(steps, &path, uid)? {
+            path.extend(&above[index + 1..]);
+            break;
+        }
+    }
+    path.push("locks");
+    Ok(path)
+}
+
+// Whether `path` is an existing folder of `uid` that no one else can write; `false` when nothing is there.
+#[cfg(unix)]
+fn owned_dir(steps: &dyn Steps, path: &Path, uid: u32) -> Res<bool> {
+    use crate::state::private_unix::Kind;
+    let state = |message: &str| refuse(1, "state", message.to_owned());
+    let Ok(stat) = steps.lstat(path) else {
+        return state("the state folder cannot be checked");
+    };
+    match stat.kind {
+        Kind::Missing => return Ok(false),
+        Kind::Link => return state("the state folder path has a link"),
+        Kind::File => return state("the state folder path is a file"),
+        Kind::Dir => {}
+    }
+    if stat.uid != uid {
+        return state("a folder above the state folder has another owner");
+    }
+    // No sticky exception: another user could still make a missing component below it.
+    if stat.mode & 0o022 != 0 {
+        return state("a folder above the state folder is writable by others");
+    }
+    Ok(true)
 }
 
 #[cfg(unix)]
@@ -87,7 +133,18 @@ fn passwd_home() -> Res<PathBuf> {
 /// lock before the mailbox lock.
 #[cfg(unix)]
 pub fn with_lock<T>(ctx: &Ctx, key: &str, f: impl FnOnce() -> Res<T>) -> Res<T> {
-    with_lock_in(ctx, &lock_root()?, key, LOCK_WAIT, f)
+    with_lock_under(ctx, &passwd_home()?, key, f)
+}
+
+/// `with_lock` for a given passwd home, so tests never touch the real one.
+#[cfg(unix)]
+pub(crate) fn with_lock_under<T>(
+    ctx: &Ctx,
+    home: &Path,
+    key: &str,
+    f: impl FnOnce() -> Res<T>,
+) -> Res<T> {
+    with_lock_in(ctx, &lock_root(&Real, home)?, key, LOCK_WAIT, f)
 }
 
 /// `with_lock` under an explicit lock root, so tests never touch the real one.
@@ -249,19 +306,50 @@ mod tests {
             (1, "state", message.into())
         }
 
+        const PARTS: [&str; 4] = [".local", "state", "mux-agents", "locks"];
+
+        fn mkdir_mode(path: &Path, mode: u32) {
+            std::fs::create_dir(path).unwrap();
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+        }
+
+        // A private home with the first `depth` lock-root components made at 0700; the deepest one made.
+        fn home_with(dir: &TempDir, depth: usize) -> (PathBuf, PathBuf) {
+            let home = dir.path().join("home");
+            mkdir_mode(&home, 0o700);
+            let mut path = home.clone();
+            for part in &PARTS[..depth] {
+                path.push(part);
+                mkdir_mode(&path, 0o700);
+            }
+            (home, path)
+        }
+
+        // The root comes from the passwd home alone: HOME, XDG_STATE_HOME, MUX_AGENTS_STATE and the ctx's own
+        // home and state root all point at a decoy, which stays empty.
         #[test]
         fn lock_root_ignores_home_xdg_and_state() {
-            let fakes = Fakes::default();
-            let mut ctx = fakes.ctx();
+            let dir = TempDir::new();
+            let (home, _) = home_with(&dir, 0);
+            let decoy = dir.path().join("decoy");
+            mkdir_mode(&decoy, 0o700);
+            let d = decoy.to_str().unwrap();
+            let mut ctx = Fakes::default().ctx();
             ctx.env = Env::from_pairs([
-                ("HOME", "/tmp/x"),
-                ("XDG_STATE_HOME", "/tmp/x/xdg"),
-                ("MUX_AGENTS_STATE", "/tmp/x/state"),
+                ("HOME", d.to_owned()),
+                ("XDG_STATE_HOME", format!("{d}/xdg")),
+                ("MUX_AGENTS_STATE", format!("{d}/state")),
             ]);
-            ctx.home = "/tmp/x".into();
-            // The passwd entry of the effective uid, read here by the non-reentrant call.
+            ctx.home = decoy.clone();
+            ctx.state_root = decoy.join("state");
+            assert_eq!(with_lock_under(&ctx, &home, "k", || Ok(5)), Ok(5));
+            assert!(lock_path(&home.join(PARTS.join("/")), "k").is_file());
+            assert_eq!(std::fs::read_dir(&decoy).unwrap().count(), 0);
+
+            // `with_lock` passes the home of the effective uid's passwd entry, read here by the non-reentrant
+            // call. Resolving it only reads: nothing is made under the real home.
             // SAFETY: getpwuid's result is read at once, before any other passwd call on this thread.
-            let home = unsafe {
+            let passwd = unsafe {
                 let pw = libc::getpwuid(libc::geteuid());
                 assert!(!pw.is_null());
                 std::ffi::CStr::from_ptr((*pw).pw_dir)
@@ -269,16 +357,114 @@ mod tests {
                     .unwrap()
                     .to_owned()
             };
-            let want = crate::state::root::real_prefix(&format!(
-                "{}/.local/state/mux-agents/locks",
-                home.trim_end_matches('/')
-            ))
-            .unwrap();
-            // Only computed: nothing is created under the real home.
-            let got = lock_root().unwrap();
-            assert_eq!(got, want);
-            assert!(got.ends_with(".local/state/mux-agents/locks"));
-            assert!(!got.starts_with("/tmp/x"));
+            assert_eq!(passwd_home(), Ok(PathBuf::from(&passwd)));
+            let want = std::fs::canonicalize(&passwd)
+                .unwrap()
+                .join(".local/state/mux-agents/locks");
+            assert_eq!(lock_root(&Real, &passwd_home().unwrap()), Ok(want));
+        }
+
+        // Moving `.local/state` (or any component below the home) to a link would split one key across two
+        // lock files between calls, so a link anywhere below the home refuses and nothing is made past it.
+        #[test]
+        fn lock_root_symlinked_component_refuses() {
+            for (depth, part) in PARTS.iter().enumerate() {
+                let dir = TempDir::new();
+                let (home, above) = home_with(&dir, depth);
+                let elsewhere = dir.path().join("elsewhere");
+                mkdir_mode(&elsewhere, 0o700);
+                symlink(&elsewhere, above.join(part)).unwrap();
+                let ctx = Fakes::default().ctx();
+                let ran = Cell::new(false);
+                let refused = with_lock_under(&ctx, &home, "k", || {
+                    ran.set(true);
+                    Ok(())
+                });
+                assert_eq!(
+                    refusal(refused),
+                    state("the state folder path has a link"),
+                    "{part}"
+                );
+                assert!(!ran.get());
+                assert_eq!(std::fs::read_dir(&elsewhere).unwrap().count(), 0);
+            }
+        }
+
+        // The sticky bit does not help here: another user could still make a missing component.
+        #[test]
+        fn lock_root_writable_component_refuses() {
+            let open = state("a folder above the state folder is writable by others");
+            for depth in 1..PARTS.len() {
+                for bits in [0o1777, 0o1770, 0o775, 0o757] {
+                    let dir = TempDir::new();
+                    let (home, deepest) = home_with(&dir, depth);
+                    std::fs::set_permissions(&deepest, std::fs::Permissions::from_mode(bits))
+                        .unwrap();
+                    let refused = lock_root(&Real, &home);
+                    assert_eq!(refusal(refused), open, "{deepest:?} {bits:o}");
+                    let locks = home.join(PARTS.join("/"));
+                    assert!(!locks.exists(), "{deepest:?} {bits:o}");
+                }
+            }
+        }
+
+        // A component of another owner, injected: the walk compares the owner with the effective uid.
+        #[test]
+        fn lock_root_foreign_component_refuses() {
+            struct Foreign<'a>(&'a Path);
+            impl Steps for Foreign<'_> {
+                fn lstat(&self, path: &Path) -> std::io::Result<crate::state::private_unix::Stat> {
+                    let mut stat = Real.lstat(path)?;
+                    if path == self.0 {
+                        stat.uid = self.uid() + 1;
+                    }
+                    Ok(stat)
+                }
+            }
+            for depth in 1..PARTS.len() {
+                let dir = TempDir::new();
+                let (home, deepest) = home_with(&dir, depth);
+                let refused = lock_root(&Foreign(&deepest), &home);
+                assert_eq!(
+                    refusal(refused),
+                    state("a folder above the state folder has another owner"),
+                    "{deepest:?}"
+                );
+                assert!(!home.join(PARTS.join("/")).exists());
+            }
+        }
+
+        // The passwd home may itself be a link (/home -> /System/Volumes/Data/home); it is resolved once.
+        #[test]
+        fn lock_root_follows_symlinked_home() {
+            let dir = TempDir::new();
+            let real = dir.path().join("real");
+            mkdir_mode(&real, 0o700);
+            let home = dir.path().join("home");
+            symlink(&real, &home).unwrap();
+            let want = real.join(PARTS.join("/"));
+            let ctx = Fakes::default().ctx();
+            assert_eq!(with_lock_under(&ctx, &home, "k", || Ok(3)), Ok(3));
+            assert!(lock_path(&want, "k").is_file());
+            assert_eq!(lock_root(&Real, &home), Ok(want.clone()));
+            for path in [real.join(".local"), real.join(".local/state"), want] {
+                assert_eq!(
+                    std::fs::symlink_metadata(&path).unwrap().mode() & 0o7777,
+                    0o700,
+                    "{path:?}"
+                );
+            }
+        }
+
+        // A home that is missing or not absolute refuses; nothing is made in its place.
+        #[test]
+        fn lock_root_missing_home_refuses() {
+            let unreadable = state("the home folder of the user cannot be read");
+            let dir = TempDir::new();
+            let missing = dir.path().join("gone");
+            assert_eq!(refusal(lock_root(&Real, &missing)), unreadable);
+            assert!(!missing.exists());
+            assert_eq!(refusal(lock_root(&Real, Path::new("rel/home"))), unreadable);
         }
 
         #[test]
