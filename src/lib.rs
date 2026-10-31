@@ -10,6 +10,7 @@ pub mod cli;
 pub mod ctx;
 pub mod error;
 pub mod json;
+pub mod launcher;
 pub mod mux;
 pub mod parse;
 pub mod proc;
