@@ -1230,9 +1230,10 @@ function New-MuxAgentBoardRow {
 
 function Get-MuxAgentBoard {
     # The side-bar feed of Caller's session: the running count, live agents in pane order and, with -All, the session's
-    # ended agents, newest notice first, at most 10. Unread is ReaderKey's.
+    # ended agents, newest notice first, at most 10. Unread is ReaderKey's. -WithExitCode (watch only) adds each ended
+    # row's exitCode from its notice.json.
     # Locks one at a time: notice locks (Update-MuxAgentNotices), the reader's mail lock, then each row's agent lock.
-    param([Parameter(Mandatory)]$P, [Parameter(Mandatory)]$Caller, [Parameter(Mandatory)][string]$ReaderKey, [switch]$All)
+    param([Parameter(Mandatory)]$P, [Parameter(Mandatory)]$Caller, [Parameter(Mandatory)][string]$ReaderKey, [switch]$All, [switch]$WithExitCode)
     Update-MuxAgentNotices -P $P -Caller $Caller
     $unread = Get-MuxAgentUnreadCounts -P $P -Caller $Caller -Key $ReaderKey
     $panes = @(Get-MuxAgentPanes -P $P -Caller $Caller)
@@ -1255,11 +1256,13 @@ function Get-MuxAgentBoard {
                     $record = Get-MuxAgentRecord -P $P -Caller $Caller -Id $id
                     if (-not $record -or $record.session -cne $Caller.Session -or $record.id -cne $id) { continue }
                     $at = ConvertTo-MuxAgentUtc $notice.at
-                    [pscustomobject]@{ At = $(if ($null -eq $at) { [DateTime]::MinValue } else { $at }); Id = $id; Kind = [string]$notice.kind; Record = $record }
+                    [pscustomobject]@{ At = $(if ($null -eq $at) { [DateTime]::MinValue } else { $at }); Id = $id; Kind = [string]$notice.kind; Record = $record; ExitCode = $notice.exitCode }
                 }
             })
         $ended = @($found | Sort-Object -Property @{ Expression = 'At'; Descending = $true }, @{ Expression = 'Id' } | Select-Object -First 10 | ForEach-Object {
-                New-MuxAgentBoardRow -P $P -Caller $Caller -Record $_.Record -Pane $_.Record.pane -Window $_.Record.window -State $_.Kind -Unread $unread
+                $row = New-MuxAgentBoardRow -P $P -Caller $Caller -Record $_.Record -Pane $_.Record.pane -Window $_.Record.window -State $_.Kind -Unread $unread
+                if ($WithExitCode) { $row['exitCode'] = $_.ExitCode }
+                $row
             })
     }
     [ordered]@{ running = $live.Count; agents = @($live) + $ended }

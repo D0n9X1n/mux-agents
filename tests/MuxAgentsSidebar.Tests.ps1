@@ -136,3 +136,27 @@ Describe 'MuxAgents sidebar format' {
         $text = Format-MuxAgentBoard $board
         "$([regex]::IsMatch($text, '[\x00-\x09\x0B-\x1F\x7F\u0080-\u009F]'))" | Should BeExactly 'False'
         $text | Should BeExactly "mux-agents $d 1 running`n$f a[2Jb  claude  4m`n  do]0;xing" } }
+
+Describe 'MuxAgents sidebar board' {
+    It '-WithExitCode adds exitCode from notice.json to ended rows only; without it no row has the key' {
+        # Catches: exitCode on live rows, the notice's code dropped, the key added without the switch.
+        $fake = New-SidebarFake 'exit codes'; $null = New-SidebarAgent $fake
+        $null = New-SidebarAgent $fake -Id 'bbbbbbbbbbbb' -Name 'done' -Pane '%8' -Kind 'exited' -ExitCode 3
+        $null = New-SidebarAgent $fake -Id 'cccccccccccc' -Name 'halted' -Pane '%6' -Kind 'stopped'
+        Add-FakeRmuxRule -Fake $fake -Match '^-N list-panes .*#\{@agent-name\}$' -StdOut "%9|@5|300|aaaaaaaaaaaa|worker`n"
+        $caller = Resolve-MuxAgentCaller -P $fake
+        $with = Get-MuxAgentBoard -P $fake -Caller $caller -ReaderKey 'pane-1' -All -WithExitCode
+        $without = Get-MuxAgentBoard -P $fake -Caller $caller -ReaderKey 'pane-1' -All
+        $show = { param($row) "$($row.name)=$(if ($row.Contains('exitCode')) { if ($null -eq $row.exitCode) { 'null' } else { $row.exitCode } } else { '-' })" }
+        "$(@($with.agents | ForEach-Object { & $show $_ }) -join ',') | $(@($without.agents | ForEach-Object { & $show $_ }) -join ',')" | Should BeExactly 'worker=-,done=3,halted=null | worker=-,done=-,halted=-' }
+    It 'draws a board read from hostile state files with no ESC, BEL or C1 byte' {
+        # Catches: a name from record.json drawn uncleaned; Format trusting the stored task line or status.
+        $e = [char]27; $d = [char]0x00B7; $f = [char]0x25CF; $o = [char]0x25CB
+        $fake = New-SidebarFake 'hostile'
+        $null = New-SidebarAgent $fake -Name ("w$e[31m" + [char]0x9B + 'one' + [char]7) -TaskLine ("fix$e[2J" + [char]0x85 + 'it' + [char]7)
+        $null = New-SidebarAgent $fake -Id 'dddddddddddd' -Name 'two' -Pane '%6' -Status ("st$e]2;t" + [char]7 + 'atus' + [char]0x9C)
+        $null = New-SidebarAgent $fake -Id 'bbbbbbbbbbbb' -Name ("gone$e[H" + [char]0x9F) -Pane '%8' -Kind 'exited' -ExitCode 2
+        Add-FakeRmuxRule -Fake $fake -Match '^-N list-panes .*#\{@agent-name\}$' -StdOut "%9|@5|300|aaaaaaaaaaaa|w`n%6|@5|301|dddddddddddd|two`n"
+        $text = Format-MuxAgentBoard (Get-MuxAgentBoard -P $fake -Caller (Resolve-MuxAgentCaller -P $fake) -ReaderKey 'pane-1' -All -WithExitCode)
+        "$([regex]::IsMatch($text, '[\x00-\x09\x0B-\x1F\x7F\u0080-\u009F]'))" | Should BeExactly 'False'
+        $text | Should BeExactly "mux-agents $d 2 running`n$f w[31mone  claude  4m`n  fix[2Jit`n$f two  claude  4m`n  st]2;tatus`n$o gone[H  exited 2" } }
