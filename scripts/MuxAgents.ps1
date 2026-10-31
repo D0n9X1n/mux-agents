@@ -90,7 +90,7 @@ function Invoke-MuxAgentCommand {
         $verb = $request.Verb
         $text = $request.Text
         # Every verb refuses a sandboxed caller before any rmux call.
-        if (-not $P.Admitted) { Assert-MuxAgentToken -Token (& $P.Token) }
+        if (-not $P.Admitted) { & $P.Sandbox $P }
         $data = & $request.Handler -P $P -Request $request
         if ($null -ne $data -and $data -isnot [Collections.IDictionary]) { throw [InvalidOperationException]::new('verb result must be one dictionary') }
         $result = [ordered]@{ ok = $true; verb = $verb }

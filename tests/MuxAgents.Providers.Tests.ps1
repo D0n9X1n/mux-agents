@@ -274,3 +274,28 @@ Describe 'MuxAgents providers start comparison and stop report' {
         "$($reply.ok)|$(@($reply.left) -join ',')" | Should BeExactly 'True|300:start:/x/pwsh,310:kill:/x/claude,320:open:/x/node'
     }
 }
+Describe 'MuxAgents providers sandbox' {
+    It 'windows Sandbox refuses an AppContainer, restricted, below-Medium or unreadable token' {
+        $sandbox = (Get-MuxAgentPlatformMembers -Platform windows).Sandbox
+        $answers = foreach ($token in @([pscustomobject]@{ IsAppContainer = $true; IsRestricted = $false; IntegrityLevel = 'S-1-16-8192' }, [pscustomobject]@{ IsAppContainer = $false; IsRestricted = $true; IntegrityLevel = 'S-1-16-8192' }, [pscustomobject]@{ IsAppContainer = $false; IsRestricted = $false; IntegrityLevel = 'S-1-16-4096' }, $null, [pscustomobject]@{ IsAppContainer = $false; IsRestricted = $false; IntegrityLevel = 'S-1-16-8192' })) {
+            $holder = [pscustomobject]@{ Token = { $token }.GetNewClosure() }; Get-ProvidersRefusal { & $sandbox $holder }
+        }
+        ($answers -join ';') | Should BeExactly (((@(1..4) | ForEach-Object { '2 sandbox the caller runs in a sandbox or below Medium integrity' }) + 'none') -join ';')
+    }
+    It 'the dispatcher calls Sandbox once, with $P, only for a caller that is not admitted, and keeps its refusal' {
+        $fake = New-FakeMuxAgentProviders
+        $calls = [Collections.Generic.List[string]]::new()
+        $fake.Sandbox = { param($P) $calls.Add([string]$P.Home) }.GetNewClosure()
+        Register-MuxAgentVerb -Verb 'tp-ok' -Handler { param($P, $Request) [ordered]@{ ran = 'yes' } } -Usage 'tp-ok'
+        try {
+            $admitted = (Invoke-MuxAgentCommand -P $fake -Arguments @('tp-ok')).Code; $before = $calls.Count
+            $fake.Admitted = $false
+            $open = (Invoke-MuxAgentCommand -P $fake -Arguments @('tp-ok')).Code
+            "$admitted $before $open $($calls.Count) $($calls[0] -ceq $fake.Home)" | Should BeExactly '0 0 0 1 True'
+            $fake.Sandbox = { param($P) Exit-MuxAgentCommand 2 'sandbox' 'spy sandbox' }
+            $refused = Invoke-MuxAgentCommand -P $fake -Arguments @('tp-ok')
+            "$($refused.Code) $(($refused.Text | ConvertFrom-Json).message) $($fake.Calls.Count)" | Should BeExactly '2 spy sandbox 0'
+        }
+        finally { $script:MuxAgentVerbs.Remove('tp-ok') }
+    }
+}
