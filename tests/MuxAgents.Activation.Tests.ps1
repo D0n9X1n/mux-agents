@@ -126,6 +126,9 @@ Describe 'MuxAgents activation provider refusals' {
         finally { foreach ($k in $saved.Keys) { [Environment]::SetEnvironmentVariable($k, $(if ($null -eq $saved[$k]) { [NullString]::Value } else { $saved[$k] })) } }
         ($answers -join ';') | Should BeExactly "$want;$want" } }
 Describe 'MuxAgents activation pane environment' {
-    It 'passes the selected state root to a new Unix pane with -e, and nothing on Windows' {
-        $answers = foreach ($platform in 'windows', 'linux', 'macos') { "[$(@(Get-MuxAgentPaneEnvironment -P ([pscustomobject]@{ Platform = $platform; StateRoot = '/s p/state' })) -join '|')]" }
-        ($answers -join ';') | Should BeExactly '[];[-e|MUX_AGENTS_STATE=/s p/state];[-e|MUX_AGENTS_STATE=/s p/state]' } }
+    It 'passes the state root, and the override when the caller has exactly 1, to a new Unix pane with -e; nothing on Windows' {
+        $answers = foreach ($platform in 'windows', 'linux', 'macos') { foreach ($value in '1', '0', $null, "1$([char]0x200B)") { foreach ($advisory in $null, 'ADV') {
+            $vars = @{}; if ($null -ne $value) { $vars['MUX_AGENTS_ALLOW_AFFECTED_DOTNET'] = $value }
+            "[$(@(Get-MuxAgentPaneEnvironment -P ([pscustomobject]@{ Platform = $platform; StateRoot = '/s p/state'; Env = $vars; Advisory = $advisory })) -join '|')]" } } }
+        $w = '[]'; $s = '[-e|MUX_AGENTS_STATE=/s p/state]'; $o = '[-e|MUX_AGENTS_STATE=/s p/state|-e|MUX_AGENTS_ALLOW_AFFECTED_DOTNET=1]'
+        ($answers -join ';') | Should BeExactly ((@($w) * 8 + @($o, $o, $s, $s, $s, $s, $s, $s) * 2) -join ';') } }

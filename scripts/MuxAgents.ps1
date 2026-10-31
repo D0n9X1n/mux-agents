@@ -279,10 +279,12 @@ function Resolve-MuxAgentExecutable {
 function Get-MuxAgentPaneEnvironment {
     # The environment arguments for a new agent pane. On Unix a pane gets the tmux server's environment, not the caller's,
     # so a MUX_AGENTS_STATE or XDG_STATE_HOME set in the caller's shell would not reach the launcher, which would pick
-    # another state root and refuse the spec; the selected root goes in with -e. Windows: none (unchanged).
+    # another state root and refuse the spec; the selected root goes in with -e, and MUX_AGENTS_ALLOW_AFFECTED_DOTNET=1
+    # when the caller has it (#25). Windows: none (unchanged).
     param([Parameter(Mandatory)]$P)
     if ($P.Platform -ceq 'windows') { return }
     '-e'; "MUX_AGENTS_STATE=$($P.StateRoot)"
+    if ([string]::Equals([string]$P.Env['MUX_AGENTS_ALLOW_AFFECTED_DOTNET'], '1', [StringComparison]::Ordinal)) { '-e'; 'MUX_AGENTS_ALLOW_AFFECTED_DOTNET=1' }
 }
 
 function Find-MuxAgentApplication {
