@@ -9,6 +9,7 @@ pub mod error;
 pub mod json;
 pub mod mux;
 pub mod proc;
+pub mod state;
 #[cfg(test)]
 pub(crate) mod testing;
 pub mod util;

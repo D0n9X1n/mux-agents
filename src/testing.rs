@@ -1,7 +1,7 @@
 //! Recording fakes for the `Ctx` seams; clones share one log, so a test keeps a handle after boxing them.
 
 use std::cell::RefCell;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::time::{Duration, SystemTime};
 
@@ -108,5 +108,27 @@ impl Clock for Fakes {
         let ms = duration.as_millis() as u64;
         log.slept.push(ms);
         log.now_ms += ms;
+    }
+}
+
+/// A fresh folder under the canonical temp dir (macOS /var is a link to /private/var), removed on drop.
+pub struct TempDir(PathBuf);
+
+impl TempDir {
+    pub fn new() -> TempDir {
+        let base = std::fs::canonicalize(std::env::temp_dir()).unwrap();
+        let path = base.join(format!("mux-agent-test-{}", crate::util::hex_id().unwrap()));
+        std::fs::create_dir(&path).unwrap();
+        TempDir(path)
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for TempDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
     }
 }

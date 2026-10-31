@@ -20,6 +20,17 @@ pub fn refuse<T>(code: u8, check: &'static str, message: impl Into<String>) -> R
     })
 }
 
+impl Refusal {
+    /// 1 `internal` with a fixed reason, worded like the io and panic ones.
+    pub fn internal(reason: &str) -> Refusal {
+        Refusal {
+            code: 1,
+            check: "internal",
+            message: format!("unexpected error ({reason})"),
+        }
+    }
+}
+
 impl From<io::Error> for Refusal {
     // The kind only: an io message can carry paths or other text the reply must not echo.
     fn from(error: io::Error) -> Self {
