@@ -530,19 +530,398 @@ fn release_publish_keeps_dist_monotonic() {
 }
 
 // A token on a command line is visible to every process on the runner; git reads it from the environment instead.
-#[test]
-fn release_token_never_in_argv() {
-    let release = repo_file(".github/workflows/release.yml");
-    for line in release.lines().map(strip_comment) {
+fn assert_token_off_argv(path: &str) {
+    for line in repo_file(path).lines().map(strip_comment) {
         for bad in ["x-access-token:$", "${{ secrets", "TOKEN@", "TOKEN}@"] {
-            assert!(!line.contains(bad), "{bad:?} in {line}");
+            assert!(!line.contains(bad), "{path}: {bad:?} in {line}");
         }
         for (at, _) in line.match_indices("://") {
             let url: String = line[at..]
                 .chars()
                 .take_while(|c| !c.is_whitespace() && !matches!(c, '"' | '\''))
                 .collect();
-            assert!(!url.contains('@'), "credentials in URL {url}");
+            assert!(!url.contains('@'), "{path}: credentials in URL {url}");
+        }
+    }
+}
+
+#[test]
+fn release_token_never_in_argv() {
+    assert_token_off_argv(".github/workflows/release.yml");
+}
+
+// The wiki publish workflow: the sh publisher mirrors wiki/ into a plain clone; git reads the token from the
+// credential helper environment on the clone and the push, never from a URL.
+#[test]
+fn wiki_publish_runs_sh_with_token_off_argv() {
+    let wiki = repo_file(".github/workflows/publish-wiki.yml");
+    let publish = job_lines(&wiki, "publish");
+    let clone = line_of(
+        &publish,
+        r#"git clone "https://github.com/${GITHUB_REPOSITORY}.wiki.git" wiki-repo"#,
+    );
+    let mirror = line_of(
+        &publish,
+        r#"sh scripts/wiki/publish.sh wiki wiki-repo "$GITHUB_SHA""#,
+    );
+    let push = line_of(&publish, "git -C wiki-repo push origin HEAD:master");
+    assert!(clone < mirror && mirror < push, "{publish:#?}");
+    // The helper is set on the clone's and the push's steps only, not the job: the publisher never sees the token.
+    let helper = r#"GIT_CONFIG_VALUE_1: '!f() { echo username=x-access-token; echo "password=$GH_TOKEN"; }; f'"#;
+    let helpers: Vec<usize> = publish
+        .iter()
+        .enumerate()
+        .filter(|(_, l)| l.as_str() == helper)
+        .map(|(i, _)| i)
+        .collect();
+    assert_eq!(helpers.len(), 2, "{publish:#?}");
+    assert!(
+        helpers[0] < clone && clone < mirror && mirror < helpers[1] && helpers[1] < push,
+        "{publish:#?}"
+    );
+    assert_token_off_argv(".github/workflows/publish-wiki.yml");
+}
+
+// Workflow rules over every file in .github/workflows, read as text: two-space YAML, one key per line. A block is a
+// key line and every line after it indented deeper; comments are stripped and blank lines dropped first.
+
+const CI: &str = ".github/workflows/ci.yml";
+const RELEASE: &str = ".github/workflows/release.yml";
+const WIKI: &str = ".github/workflows/publish-wiki.yml";
+
+/// Every workflow as (path from the repo root, text), sorted by path.
+fn workflows() -> Vec<(String, String)> {
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join(".github/workflows");
+    let mut out: Vec<(String, String)> = std::fs::read_dir(dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().into_string().unwrap())
+        .filter(|n| n.ends_with(".yml") || n.ends_with(".yaml"))
+        .map(|n| {
+            let path = format!(".github/workflows/{n}");
+            let text = repo_file(&path);
+            (path, text)
+        })
+        .collect();
+    out.sort();
+    out
+}
+
+fn indent(line: &str) -> usize {
+    line.len() - line.trim_start().len()
+}
+
+/// The code lines of a workflow, indentation kept: comments stripped, trailing blanks trimmed, blank lines dropped.
+fn code_lines(text: &str) -> Vec<String> {
+    text.lines()
+        .map(|l| strip_comment(l).trim_end().to_string())
+        .filter(|l| !l.trim().is_empty())
+        .collect()
+}
+
+/// The first block whose key line is exactly `head`, indentation included; empty when there is none.
+fn block(lines: &[String], head: &str) -> Vec<String> {
+    let Some(at) = lines.iter().position(|l| l == head) else {
+        return Vec::new();
+    };
+    let depth = indent(head);
+    lines[at..at + 1]
+        .iter()
+        .chain(lines[at + 1..].iter().take_while(|l| indent(l) > depth))
+        .cloned()
+        .collect()
+}
+
+/// The job names of a workflow, in order.
+fn jobs(lines: &[String]) -> Vec<String> {
+    block(lines, "jobs:")
+        .iter()
+        .skip(1)
+        .filter(|l| indent(l) == 2)
+        .map(|l| l.trim().trim_end_matches(':').to_string())
+        .collect()
+}
+
+/// Job `name`'s block, looked up under `jobs:` only.
+fn job(lines: &[String], name: &str) -> Vec<String> {
+    let found = block(&block(lines, "jobs:"), &format!("  {name}:"));
+    assert!(!found.is_empty(), "no job {name}");
+    found
+}
+
+/// A job's steps, each its `- ` line and the lines under it.
+fn steps(job: &[String]) -> Vec<Vec<String>> {
+    let mut out: Vec<Vec<String>> = Vec::new();
+    for line in block(job, "    steps:").iter().skip(1) {
+        if line.starts_with("      - ") {
+            out.push(vec![line.clone()]);
+        } else if let Some(step) = out.last_mut() {
+            step.push(line.clone());
+        }
+    }
+    out
+}
+
+/// The value of a step's own key (`uses`, `run`, `shell`, ...), not one nested under `with:` or `env:`.
+fn step_value<'a>(step: &'a [String], key: &str) -> Option<&'a str> {
+    let head = format!("{key}:");
+    let first = step[0].trim_start().strip_prefix("- ").unwrap();
+    std::iter::once(first)
+        .chain(
+            step[1..]
+                .iter()
+                .filter(|l| indent(l) == 8)
+                .map(|l| l.trim()),
+        )
+        .find_map(|l| l.strip_prefix(head.as_str()).map(str::trim))
+}
+
+/// A job's `needs:`, as names.
+fn needs(job: &[String]) -> Vec<String> {
+    job.iter()
+        .filter(|l| indent(l) == 4)
+        .find_map(|l| l.trim().strip_prefix("needs:"))
+        .map(|v| {
+            v.trim()
+                .trim_start_matches('[')
+                .trim_end_matches(']')
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+// A failing step that does not fail the job is a check that cannot go red.
+#[test]
+fn no_continue_on_error() {
+    for (path, text) in workflows() {
+        for line in code_lines(&text) {
+            assert!(!line.contains("continue-on-error"), "{path}: {line}");
+        }
+    }
+}
+
+// Nothing is published unless the tag passed validate and every binary built.
+#[test]
+fn publish_needs_validate_and_build() {
+    let release = code_lines(&repo_file(RELEASE));
+    assert_eq!(jobs(&release), ["validate", "build", "publish"]);
+    assert!(needs(&job(&release, "validate")).is_empty());
+    assert_eq!(needs(&job(&release, "build")), ["validate"]);
+    assert_eq!(needs(&job(&release, "publish")), ["validate", "build"]);
+}
+
+// Each workflow reads contents at the top; a write grant lives only on the one job that pushes.
+#[test]
+fn permissions_minimal_per_job() {
+    const WRITERS: [(&str, &str); 2] = [(WIKI, "publish"), (RELEASE, "publish")];
+    for (path, text) in workflows() {
+        let lines = code_lines(&text);
+        assert_eq!(
+            block(&lines, "permissions:").join("\n"),
+            "permissions:\n  contents: read",
+            "{path}"
+        );
+        for line in &lines {
+            assert!(
+                !line.contains("write-all") && !line.contains("read-all"),
+                "{path}: {line}"
+            );
+        }
+        for name in jobs(&lines) {
+            let grants = block(&job(&lines, &name), "    permissions:");
+            let writes: Vec<&str> = grants
+                .iter()
+                .skip(1)
+                .map(|l| l.trim())
+                .filter(|g| !g.ends_with(": read") && !g.ends_with(": none"))
+                .collect();
+            let want: &[&str] = if WRITERS.contains(&(path.as_str(), name.as_str())) {
+                &["contents: write"]
+            } else {
+                &[]
+            };
+            assert_eq!(writes, want, "{path} job {name}");
+        }
+    }
+}
+
+// A persisted checkout token is readable by every later step of the job.
+#[test]
+fn checkout_persist_credentials_false() {
+    for (path, text) in workflows() {
+        let lines = code_lines(&text);
+        // Every checkout in the text is a step the parser found, so none escapes the check.
+        let mut seen = 0;
+        let total = lines
+            .iter()
+            .filter(|l| l.contains("actions/checkout@"))
+            .count();
+        for name in jobs(&lines) {
+            for step in steps(&job(&lines, &name)) {
+                if step_value(&step, "uses").is_some_and(|u| u.starts_with("actions/checkout@")) {
+                    seen += 1;
+                    let with = block(&step, "        with:");
+                    assert!(
+                        with.iter()
+                            .any(|l| l.trim() == "persist-credentials: false"),
+                        "{path} job {name}: {step:#?}"
+                    );
+                }
+            }
+        }
+        assert!(
+            seen > 0 && seen == total,
+            "{path}: {seen} of {total} checkouts"
+        );
+    }
+}
+
+// CI runs on every pull request and every push to main; a release on a version tag; the wiki on main and by hand.
+#[test]
+fn required_triggers() {
+    let paths: Vec<String> = workflows().into_iter().map(|(p, _)| p).collect();
+    assert_eq!(paths, [CI, WIKI, RELEASE]);
+    let on = |path: &str| block(&code_lines(&repo_file(path)), "on:").join("\n");
+    assert_eq!(
+        on(CI),
+        "on:\n  pull_request:\n  push:\n    branches: [main]"
+    );
+    assert_eq!(
+        on(RELEASE),
+        "on:\n  push:\n    tags: ['v[0-9]+.[0-9]+.[0-9]+']"
+    );
+    assert_eq!(
+        on(WIKI),
+        "on:\n  push:\n    branches: [main]\n  workflow_dispatch:"
+    );
+}
+
+// Branch protection requires lint, test (<os>) for three OSes and integration (<os>) for two: the job ids and matrices
+// make those names, and a job-level name: would rename them.
+#[test]
+fn ci_test_job_named_test() {
+    let ci = code_lines(&repo_file(CI));
+    let names = jobs(&ci);
+    for want in ["lint", "test", "integration"] {
+        assert!(names.iter().any(|n| n == want), "{names:?}");
+    }
+    for name in &names {
+        let renamed = job(&ci, name)
+            .iter()
+            .any(|l| indent(l) == 4 && l.trim_start().starts_with("name:"));
+        assert!(!renamed, "job {name} has a name:");
+    }
+    let lint = job(&ci, "lint");
+    assert!(lint.iter().any(|l| l == "    runs-on: ubuntu-latest"));
+    assert!(block(&lint, "    strategy:").is_empty());
+    for (name, oses) in [
+        ("test", "[ubuntu-latest, macos-latest, windows-latest]"),
+        ("integration", "[ubuntu-latest, macos-latest]"),
+    ] {
+        let j = job(&ci, name);
+        assert_eq!(
+            block(&j, "    strategy:").join("\n"),
+            format!("    strategy:\n      fail-fast: false\n      matrix:\n        os: {oses}"),
+            "job {name}"
+        );
+        assert!(
+            j.iter().any(|l| l == "    runs-on: ${{ matrix.os }}"),
+            "job {name}"
+        );
+    }
+}
+
+// What each CI job runs, in order: the Rust gates and the shims on every OS, the live, release and wiki suites on
+// Linux and macOS, the scripts' lint, and a check of every release target.
+#[test]
+fn ci_jobs_run_cargo_and_sh() {
+    let ci = repo_file(CI);
+    let ordered = |name: &str, wants: &[&str]| {
+        let lines = job_lines(&ci, name);
+        let at: Vec<usize> = wants.iter().map(|w| line_of(&lines, w)).collect();
+        assert!(at.windows(2).all(|p| p[0] < p[1]), "job {name}: {at:?}");
+    };
+    ordered(
+        "test",
+        &[
+            "cargo fmt --check",
+            "cargo clippy --all-targets --features test-panic --locked -- -D warnings",
+            "cargo test --features test-panic --locked",
+            "cargo build --release --locked",
+            "cargo test --release --features test-panic --locked --test panic",
+        ],
+    );
+    let test = job_lines(&ci, "test");
+    line_of(&test, "sh tests/shim.sh");
+    line_of(&test, r"cmd //d //c 'tests\shim.cmd'");
+    line_of(&test, r"cmd //d //c 'scripts\mux-agent.cmd' list");
+    line_of(&test, r#"echo "TEMP=$RUNNER_TEMP" >> "$GITHUB_ENV""#);
+    ordered(
+        "integration",
+        &[
+            "sh scripts/dev/tmux32.sh",
+            "cargo test --features live,test-panic --locked --test live",
+            "sh tests/release.sh",
+            "sh tests/wiki.sh",
+        ],
+    );
+    ordered(
+        "lint",
+        &[
+            "./actionlint",
+            "jq . .claude-plugin/plugin.json .claude-plugin/marketplace.json",
+            "xargs -0 shellcheck",
+            "@anthropic-ai/claude-code@2.1.310",
+            "claude plugin validate .",
+            "claude plugin test .",
+        ],
+    );
+    let cross = job_lines(&ci, "cross");
+    line_of(
+        &cross,
+        r#"cargo check --all-targets --locked --target "$target""#,
+    );
+    for target in [
+        "x86_64-unknown-linux-gnu",
+        "aarch64-unknown-linux-musl",
+        "x86_64-pc-windows-msvc",
+        "aarch64-pc-windows-msvc",
+    ] {
+        line_of(&cross, target);
+    }
+}
+
+// No PowerShell anywhere: none named, and none by default, since a Windows run step without a shell runs pwsh.
+#[test]
+fn no_pwsh_in_workflows() {
+    for (path, text) in workflows() {
+        let lower = text.to_lowercase();
+        for bad in ["pwsh", "powershell", ".ps1", "install-module"] {
+            assert!(!lower.contains(bad), "{path} names {bad}");
+        }
+        let lines = code_lines(&text);
+        for name in jobs(&lines) {
+            let j = job(&lines, &name);
+            // A job runs on Windows when its runs-on or its matrix names a Windows runner.
+            let on_windows = j
+                .iter()
+                .filter(|l| l.trim_start().starts_with("runs-on:"))
+                .chain(block(&j, "    strategy:").iter())
+                .any(|l| l.contains("windows-latest") || l.contains("windows-20"));
+            if !on_windows {
+                continue;
+            }
+            for step in steps(&j) {
+                if step_value(&step, "run").is_some() {
+                    assert_eq!(
+                        step_value(&step, "shell"),
+                        Some("bash"),
+                        "{path} job {name}: {step:#?}"
+                    );
+                }
+            }
         }
     }
 }

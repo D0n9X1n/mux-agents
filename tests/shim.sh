@@ -32,6 +32,7 @@ reset() {
 # fake <path> <label> [exit]: prints the label, then one argv entry per line wrapped in [ ], then exits.
 fake() {
   mkdir -p "$(dirname "$1")"
+  # shellcheck disable=SC2016 # "$@" and "$a" belong to the fake script
   printf '#!/bin/sh\necho %s\nfor a in "$@"; do printf "[%%s]\\n" "$a"; done\nexit %s\n' "$2" "${3:-0}" >"$1"
   chmod +x "$1"
 }
@@ -74,6 +75,7 @@ expect directory_skipped "tier3
 
 # A root-owned file that is not executable cannot be fixed by chmod, so the shim moves on. Root could fix it.
 target=/etc/hosts
+# shellcheck disable=SC3067 # test -O is in dash, bash, ksh, zsh and busybox sh, every sh this runs under
 if [ "$(id -u)" = 0 ]; then
   echo "skip unfixable_skipped (running as uid 0)"
 elif [ ! -f "$target" ] || [ -x "$target" ] || [ -O "$target" ]; then
@@ -84,7 +86,9 @@ else
 [y]" ] && [ ! -x "$target" ]; then ok unfixable_skipped; else bad unfixable_skipped "rc=$rc out=$out"; fi
 fi
 
-reset; fake "$tier3" tier3; run send 'a b' '' "it's" '"q"' '$HOME' '*' 'x  y'
+reset; fake "$tier3" tier3
+# shellcheck disable=SC2016 # '$HOME' is a literal argument the shim must pass through unexpanded
+run send 'a b' '' "it's" '"q"' '$HOME' '*' 'x  y'
 expect spaces_in_root_and_args "tier3
 [send]
 [a b]

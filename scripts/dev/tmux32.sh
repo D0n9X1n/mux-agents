@@ -21,7 +21,7 @@ if [ -x "$bin" ] && [ "$("$bin" -V 2>/dev/null)" = "tmux $version" ]; then
 fi
 
 mkdir -p "$out"
-rm -rf "$out/download" "$out/src" "$out/bin" "$out/share"
+rm -rf "${out:?}/download" "${out:?}/src" "${out:?}/bin" "${out:?}/share"
 mkdir "$out/download" "$out/src"
 tarball="$out/download/tmux-$version.tar.gz"
 
