@@ -99,6 +99,8 @@ function Invoke-MuxAgentCommand {
         $code = 0
     }
     catch { $result = ConvertTo-MuxAgentFailure $_ $verb; $code = $result.code }
+    # The runtime advisory (#25) rides on every reply, success or failure, as its last field.
+    if ($P.Advisory) { $result['advisory'] = [string]$P.Advisory }
     [pscustomobject]@{ Code = $code; Text = (Format-MuxAgentResult -Data $result -Text:$text) }
 }
 
@@ -126,6 +128,35 @@ function Get-MuxAgentPlatform {
     # windows, linux or macos for the given OS flags (default: this process), else $null.
     param([bool]$OnWindows = $IsWindows, [bool]$OnLinux = $IsLinux, [bool]$OnMacOS = $IsMacOS)
     if ($OnWindows) { 'windows' } elseif ($OnLinux) { 'linux' } elseif ($OnMacOS) { 'macos' }
+}
+
+function Get-MuxAgentRuntimeVersion {
+    # The running .NET's informational version (the assembly holding [object]); never $PSVersionTable (#25).
+    [object].Assembly.GetCustomAttributes([Reflection.AssemblyInformationalVersionAttribute], $false)[0].InformationalVersion
+}
+
+function Get-MuxAgentRuntimeVerdict {
+    # fixed or affected for a .NET informational version under GHSA-2j93-m82w-73j2 (#25); anything unparsed is affected.
+    # ASCII only first: .NET's \d also matches other scripts' digits. \z, not $, which accepts a final LF.
+    param([AllowEmptyString()][string]$Version)
+    if ($Version -cmatch '[^\x00-\x7F]' -or $Version -cnotmatch '^(\d{1,9})\.(\d{1,9})\.(\d{1,9})(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]*)?\z') { return 'affected' }
+    $major = [int]$Matches[1]; $minor = [int]$Matches[2]; $patch = [int]$Matches[3]
+    $label = if ($Matches[4]) { $Matches[4].Substring(1) } else { '' }
+    $ga = $label -ceq '' -or $label.StartsWith('servicing.', [StringComparison]::Ordinal)
+    $rc = if ($label -cmatch '^rc\.(\d+)\.') { $digits = $Matches[1].TrimStart([char]'0'); if ($digits.Length -gt 1) { 2 } else { [int]('0' + $digits) } } elseif ($label -cmatch '^(preview|alpha|beta)\.') { 0 } else { -1 }
+    if (-not $ga -and $rc -lt 0) { return 'affected' }
+    $fixed = $major -ge 12 -or ($minor -eq 0 -and (($ga -and (($major -eq 8 -and $patch -ge 32) -or ($major -eq 9 -and $patch -ge 21) -or ($major -eq 10 -and $patch -ge 13) -or $major -eq 11)) -or ($major -eq 11 -and $rc -ge 2)))
+    if ($fixed) { 'fixed' } else { 'affected' }
+}
+
+function Get-MuxAgentRuntimeAdvisory {
+    # $null on Windows or a fixed .NET; on an affected Linux or macOS .NET, the advisory text when the override is exactly
+    # 1, else a 2 'runtime' refusal (#25).
+    param([AllowEmptyString()][string]$Platform, [AllowEmptyString()][string]$Version, [Parameter(Mandatory)][Collections.IDictionary]$Environment)
+    if ($Platform -cnotin 'linux', 'macos' -or (Get-MuxAgentRuntimeVerdict -Version $Version) -ceq 'fixed') { return $null }
+    # Ordinal: -ceq is culture-aware and would take '1' followed by an ignorable character such as U+200B.
+    if ([string]::Equals([string]$Environment['MUX_AGENTS_ALLOW_AFFECTED_DOTNET'], '1', [StringComparison]::Ordinal)) { return ".NET $Version is affected by GHSA-2j93-m82w-73j2; running because MUX_AGENTS_ALLOW_AFFECTED_DOTNET=1." }
+    Exit-MuxAgentCommand 2 'runtime' "mux-agents refuses .NET $Version on ${Platform}: GHSA-2j93-m82w-73j2 (CVE-2026-96231). Install PowerShell 7.4.21, 7.5.12, 7.6.7 or later, or set MUX_AGENTS_ALLOW_AFFECTED_DOTNET=1 to run anyway."
 }
 
 function Get-MuxAgentEntryRefusal {
@@ -222,13 +253,14 @@ function Get-MuxAgentPlatformMembers {
             $sid = Get-MuxAgentUserSid
             foreach ($path in $Paths) { New-MuxAgentPrivateDirectory $sid $path }
         }
-        LockName = { param([string]$LockKey) 'Local\MuxAgents-' + (Get-MuxAgentHash $LockKey).Substring(0, 32) }
+        LockName = $script:MuxAgentWindowsLockName
         ClientImage = { param([string]$Client) "$Client.exe" }
         IsUnder = { param([string]$Root, [string]$Full) $Full.StartsWith([IO.Path]::GetFullPath($Root).TrimEnd('\') + '\', [StringComparison]::OrdinalIgnoreCase) }
     }
 }
+$script:MuxAgentWindowsLockName = { param([string]$LockKey) 'Local\MuxAgents-' + (Get-MuxAgentHash $LockKey).Substring(0, 32) }
 # Locks use the Windows name until New-MuxAgentProviders installs the selected platform's LockName.
-$script:MuxAgentLockName = (Get-MuxAgentPlatformMembers -Platform windows).LockName
+$script:MuxAgentLockName = $script:MuxAgentWindowsLockName
 
 function Resolve-MuxAgentExecutable {
     # The rmux image the caller's server runs (by the server PID in RMUX, then TMUX), else the first rmux.exe on PATH.
@@ -247,10 +279,12 @@ function Resolve-MuxAgentExecutable {
 function Get-MuxAgentPaneEnvironment {
     # The environment arguments for a new agent pane. On Unix a pane gets the tmux server's environment, not the caller's,
     # so a MUX_AGENTS_STATE or XDG_STATE_HOME set in the caller's shell would not reach the launcher, which would pick
-    # another state root and refuse the spec; the selected root goes in with -e. Windows: none (unchanged).
+    # another state root and refuse the spec; the selected root goes in with -e, and MUX_AGENTS_ALLOW_AFFECTED_DOTNET=1
+    # when Initialize found it (#25). Windows: none (unchanged).
     param([Parameter(Mandatory)]$P)
     if ($P.Platform -ceq 'windows') { return }
     '-e'; "MUX_AGENTS_STATE=$($P.StateRoot)"
+    if ($P.AllowAffectedDotnet) { '-e'; 'MUX_AGENTS_ALLOW_AFFECTED_DOTNET=1' }
 }
 
 function Find-MuxAgentApplication {
@@ -334,10 +368,28 @@ function ConvertTo-MuxAgentFailure {
     for ($e = $ErrorRecord.Exception; $e; $e = $e.InnerException) { if ($e.Data.Contains('MuxAgentCode')) { $failure.code = [int]$e.Data['MuxAgentCode']; $failure.check = [string]$e.Data['MuxAgentCheck']; $failure.message = $e.Message; break } }
     $failure }
 function Initialize-MuxAgentProviders {
-    # New-MuxAgentProviders for the entry and the launcher: a refusal while building comes back as Failure, never thrown.
-    param([Parameter(Mandatory)][string]$Entry)
+    # The runtime check (#25), then New-MuxAgentProviders, for the entry and the launcher: a refusal comes back as Failure,
+    # never thrown, and keeps the advisory; P.Advisory is the override's advisory text or $null. P.AllowAffectedDotnet comes
+    # from the same snapshot the gate read: $P.Env ignores case, so a mux_agents_... name could otherwise mask or fake it.
+    param([Parameter(Mandatory)][string]$Entry, [AllowEmptyString()][string]$Platform = (Get-MuxAgentPlatform), [AllowEmptyString()][string]$RuntimeVersion = (Get-MuxAgentRuntimeVersion))
     $ErrorActionPreference = 'Stop'
-    try { [pscustomobject]@{ P = (New-MuxAgentProviders -Entry $Entry); Failure = $null } } catch { [pscustomobject]@{ P = $null; Failure = (ConvertTo-MuxAgentFailure $_) } } }
+    $advisory = $null
+    try {
+        $environment = [Environment]::GetEnvironmentVariables()
+        $advisory = Get-MuxAgentRuntimeAdvisory -Platform $Platform -Version $RuntimeVersion -Environment $environment
+        $allow = [string]::Equals([string]$environment['MUX_AGENTS_ALLOW_AFFECTED_DOTNET'], '1', [StringComparison]::Ordinal)
+        $providers = New-MuxAgentProviders -Entry $Entry
+        # Add-Member: a providers object without the property (a test stub) would refuse a plain assignment.
+        Add-Member -InputObject $providers -NotePropertyName Advisory -NotePropertyValue $advisory -Force
+        Add-Member -InputObject $providers -NotePropertyName AllowAffectedDotnet -NotePropertyValue $allow -Force
+        [pscustomobject]@{ P = $providers; Failure = $null }
+    }
+    catch {
+        $failure = ConvertTo-MuxAgentFailure $_
+        if ($advisory) { $failure['advisory'] = $advisory }
+        [pscustomobject]@{ P = $null; Failure = $failure }
+    }
+}
 
 function Invoke-MuxAgentNative {
     # The only rmux path: every call starts with -N (never start a server); a failure never echoes stderr.
@@ -514,12 +566,27 @@ function Read-MuxAgentJson {
     ConvertFrom-Json -InputObject $text
 }
 
+# Seams for Use-MuxAgentLock (#25): the named-mutex factory and the pause before its one retry.
+$script:MuxAgentNewMutex = { param([string]$Name) [Threading.Mutex]::new($false, $Name) }
+$script:MuxAgentLockSleep = { param([int]$Milliseconds) Start-Sleep -Milliseconds $Milliseconds }
+$script:MuxAgentLockCreateMessage = 'could not create the agent lock (a named mutex); set XDG_RUNTIME_DIR to a folder you own'
+
 function Use-MuxAgentLock {
     # Runs LockAction under the named mutex for LockKey and returns its output. An abandoned mutex counts as held;
     # a timeout refuses 2 'lock'. Callers take the session lock before the mailbox lock. The Lock prefix keeps these
-    # names from shadowing the caller variables that LockAction reads.
+    # names from shadowing the caller variables that LockAction reads. Creation is retried once after 100 ms on
+    # IOException, UnauthorizedAccessException or WaitHandleCannotBeOpenedException (#25); the name, the wait and the
+    # action never are.
     param([Parameter(Mandatory)][string]$LockKey, [Parameter(Mandatory)][scriptblock]$LockAction, [int]$LockTimeoutMilliseconds = 15000)
-    $lockMutex = [Threading.Mutex]::new($false, (& $script:MuxAgentLockName $LockKey))
+    $lockName = & $script:MuxAgentLockName $LockKey
+    $lockMutex = $null
+    for ($lockTry = 1; -not $lockMutex; $lockTry++) {
+        try { $lockMutex = & $script:MuxAgentNewMutex $lockName }
+        catch [IO.IOException], [UnauthorizedAccessException], [Threading.WaitHandleCannotBeOpenedException] {
+            if ($lockTry -ge 2) { Exit-MuxAgentCommand 2 'lock' $script:MuxAgentLockCreateMessage }
+            & $script:MuxAgentLockSleep 100
+        }
+    }
     $lockHeld = $false
     try {
         try { $lockHeld = $lockMutex.WaitOne($LockTimeoutMilliseconds) } catch [Threading.AbandonedMutexException] { $lockHeld = $true }
@@ -1487,6 +1554,7 @@ function Start-MuxAgentWatch {
         $failed = -not $live
         $text = try { $last = Format-MuxAgentBoard (Get-MuxAgentBoard -P $P -Caller $Caller -ReaderKey $reader -All -WithExitCode); $last } catch { $failed = $true; $last }
         if ($failed) { $text += "`nrefresh failed" }
+        if ($P.Advisory) { $text += "`nadvisory: GHSA-2j93-m82w-73j2" }
         try { & $Write ($clear + $text.Replace("`n", "`r`n") + "`r`n") } catch { return 'output-closed' }
         & $P.Sleep 2000
     }

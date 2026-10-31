@@ -270,8 +270,8 @@ Describe 'MuxAgents wiki pages' {
         })
         if ($en.Count -ne $zh.Count -or $drift.Count) { "$($en.Count) $($zh.Count) $($drift -join ',')" } else { '' }
     }
-    It 'has Home, the three design pages and the v0.1.0 release notes in English and Chinese' {
-        @('Home', 'Home-zh-CN', 'Design-Foundation', 'Design-Foundation-zh-CN', 'Design-Cross-Platform', 'Design-Cross-Platform-zh-CN', 'Design-Side-Bar', 'Design-Side-Bar-zh-CN', 'Release-v0.1.0', 'Release-v0.1.0-zh-CN' | Where-Object { $_ -cnotin $pages }) -join ',' | Should BeExactly ''
+    It 'has Home, the four design pages and the v0.1.0 release notes in English and Chinese' {
+        @('Home', 'Home-zh-CN', 'Design-Foundation', 'Design-Foundation-zh-CN', 'Design-Cross-Platform', 'Design-Cross-Platform-zh-CN', 'Design-Side-Bar', 'Design-Side-Bar-zh-CN', 'Design-Runtime-Check', 'Design-Runtime-Check-zh-CN', 'Release-v0.1.0', 'Release-v0.1.0-zh-CN' | Where-Object { $_ -cnotin $pages }) -join ',' | Should BeExactly ''
     }
     It 'pairs every English page with its -zh-CN page and back' {
         "$($pages.Count -gt 0) $(@($pages | Where-Object { (Get-WikiTwin $_) -cnotin $pages }) -join ',')" | Should BeExactly 'True '
@@ -290,7 +290,7 @@ Describe 'MuxAgents wiki pages' {
         "$($links.Count -gt 0) $($broken -join ' ; ')" | Should BeExactly 'True '
     }
     It 'Home links the design pages and the release notes in its own language' {
-        $want = @{ 'Home' = @('Design-Foundation', 'Design-Cross-Platform', 'Design-Side-Bar', 'Release-v0.1.0'); 'Home-zh-CN' = @('Design-Foundation-zh-CN', 'Design-Cross-Platform-zh-CN', 'Design-Side-Bar-zh-CN', 'Release-v0.1.0-zh-CN') }
+        $want = @{ 'Home' = @('Design-Foundation', 'Design-Cross-Platform', 'Design-Side-Bar', 'Design-Runtime-Check', 'Release-v0.1.0'); 'Home-zh-CN' = @('Design-Foundation-zh-CN', 'Design-Cross-Platform-zh-CN', 'Design-Side-Bar-zh-CN', 'Design-Runtime-Check-zh-CN', 'Release-v0.1.0-zh-CN') }
         (@(foreach ($page in 'Home', 'Home-zh-CN') { $links = Get-WikiLinks $page; @($want[$page] | Where-Object { $links -cnotcontains $_ }) -join ',' }) -join ';') | Should BeExactly ';'
     }
     It 'keeps wiki/ flat: no folders, since the mirror publishes top-level pages only' {
@@ -301,14 +301,23 @@ Describe 'MuxAgents wiki pages' {
         $status = foreach ($page in 'Home', 'Home-zh-CN') { @([IO.File]::ReadAllLines((Join-Path $wikiRoot "$page.md")) | Where-Object { $_ -match '^v0\.1\.0 ' }) -join ' / ' }
         $status -join ' ; ' | Should BeExactly 'v0.1.0 runs on Windows with rmux 0.10.0 and on Linux and macOS with tmux 3.2 or later. It shows a side bar (#4): a multiplexer split for every client and a pane in Claude Code. ; v0.1.0 在 Windows 上配合 rmux 0.10.0 运行，在 Linux 和 macOS 上配合 tmux 3.2 或更高版本运行。它提供侧边栏（#4）：每个客户端都可用的多路复用器分屏，以及 Claude Code 中的窗格。'
     }
-    It 'Home, the release notes and the README state the .NET named-mutex advisory as published, in both languages' {
-        # Catches: a lock limitation that understates GHSA-2j93-m82w-73j2 (file overwrite, loosened permissions, privilege gain).
+    It 'the v0.1.0 release notes keep the named-mutex limitation they shipped with, in both languages' {
+        # Catches: release notes rewritten to claim the runtime check, which the v0.1.0 zip predates.
         $en = 'On Linux and macOS, .NET older than 8.0.32, 9.0.21 or 10.0.13 has an elevation-of-privilege flaw in its named mutexes ([GHSA-2j93-m82w-73j2](https://github.com/advisories/GHSA-2j93-m82w-73j2)), which mux-agents uses for its `lock` check: another local user can erase or replace file contents, loosen folder permissions or gain higher privileges, and can make mux-agent commands time out with check `lock`. Check with `[Environment]::Version` in pwsh and use a PowerShell built on a fixed .NET.'
         $zh = '在 Linux 和 macOS 上，早于 8.0.32、9.0.21 或 10.0.13 的 .NET 在命名互斥体中存在权限提升漏洞（[GHSA-2j93-m82w-73j2](https://github.com/advisories/GHSA-2j93-m82w-73j2)），mux-agents 的 `lock` 检查就使用命名互斥体：其他本地用户可以清除或替换文件内容、放宽文件夹权限或获得更高权限，还可以让 mux-agent 命令以 `lock` 检查超时。请在 pwsh 中用 `[Environment]::Version` 检查，并使用基于已修复 .NET 的 PowerShell。'
-        $want = [ordered]@{ 'wiki/Home.md' = $en; 'wiki/Home-zh-CN.md' = $zh; 'wiki/Release-v0.1.0.md' = $en; 'wiki/Release-v0.1.0-zh-CN.md' = $zh; 'README.md' = $en }
-        (@(foreach ($path in $want.Keys) { [IO.File]::ReadAllLines((Join-Path $repoRoot $path)) -ccontains $want[$path] }) -join ' ') | Should BeExactly 'True True True True True'
-        (@(foreach ($path in $want.Keys) { if ([IO.File]::ReadAllText((Join-Path $repoRoot $path)).Contains('Nothing leaks')) { $path } }) -join ',') | Should BeExactly ''
-    }
+        "$([IO.File]::ReadAllLines((Join-Path $wikiRoot 'Release-v0.1.0.md')) -ccontains $en) $([IO.File]::ReadAllLines((Join-Path $wikiRoot 'Release-v0.1.0-zh-CN.md')) -ccontains $zh)" | Should BeExactly 'True True' }
+    It 'README and Home state the runtime refusal, the fixed PowerShell versions and the override, in both languages' {
+        # Catches: a lock paragraph without the refusal, the fixed versions or the override, or one claiming v0.1.0 checks.
+        $en = 'On Linux and macOS, .NET 8.0.0–8.0.31, 9.0.0–9.0.20, 10.0.0–10.0.12 and 11.0 previews through RC 1 have an elevation-of-privilege flaw in their named mutexes ([GHSA-2j93-m82w-73j2](https://github.com/advisories/GHSA-2j93-m82w-73j2)), which mux-agents uses for its `lock` check: another local user can erase or replace file contents, loosen folder permissions or gain higher privileges. mux-agent after v0.1.0 refuses such a .NET with check `runtime`; the v0.1.0 release does not check. Install PowerShell 7.4.21, 7.5.12, 7.6.7 or later, or set `MUX_AGENTS_ALLOW_AFFECTED_DOTNET=1` to run anyway; replies then carry `advisory`.'
+        $zh = '在 Linux 和 macOS 上，.NET 8.0.0–8.0.31、9.0.0–9.0.20、10.0.0–10.0.12 以及 11.0 预览版到 RC 1 在命名互斥体中存在权限提升漏洞（[GHSA-2j93-m82w-73j2](https://github.com/advisories/GHSA-2j93-m82w-73j2)），mux-agents 的 `lock` 检查就使用命名互斥体：其他本地用户可以清除或替换文件内容、放宽文件夹权限或获得更高权限。v0.1.0 之后的 mux-agent 以 `runtime` 检查拒绝这样的 .NET；v0.1.0 发布版不做此检查。请安装 PowerShell 7.4.21、7.5.12、7.6.7 或更高版本，或设置 `MUX_AGENTS_ALLOW_AFFECTED_DOTNET=1` 以继续运行；此时回复带有 `advisory`。'
+        $want = [ordered]@{ 'wiki/Home.md' = $en; 'wiki/Home-zh-CN.md' = $zh; 'README.md' = $en }
+        (@(foreach ($path in $want.Keys) { [IO.File]::ReadAllLines((Join-Path $repoRoot $path)) -ccontains $want[$path] }) -join ' ') | Should BeExactly 'True True True'
+        (@(foreach ($path in 'wiki/Home.md', 'wiki/Home-zh-CN.md', 'wiki/Release-v0.1.0.md', 'wiki/Release-v0.1.0-zh-CN.md', 'README.md') { if ([IO.File]::ReadAllText((Join-Path $repoRoot $path)).Contains('Nothing leaks')) { $path } }) -join ',') | Should BeExactly '' }
+    It 'Design-Runtime-Check keeps its sections and names the override and the seams; its Chinese twin matches it line for line' {
+        @([IO.File]::ReadAllLines((Join-Path $wikiRoot 'Design-Runtime-Check.md')) | Where-Object { $_ -match '^## ' }) -join ',' | Should BeExactly '## Purpose,## Decisions (PM''s calls under the goal "address all issues"),## Version rule,## Behavior,## Component map,## Tests,## Must-pass,## Non-goals,## Prior art'
+        $found = foreach ($page in 'Design-Runtime-Check', 'Design-Runtime-Check-zh-CN') { $text = [IO.File]::ReadAllText((Join-Path $wikiRoot "$page.md")); "$page missing=$(@('`MUX_AGENTS_ALLOW_AFFECTED_DOTNET`', '`$script:MuxAgentNewMutex`', '`Get-MuxAgentRuntimeVerdict -Version <s>`' | Where-Object { -not $text.Contains($_) }) -join ',')" }
+        $found -join ' ; ' | Should BeExactly 'Design-Runtime-Check missing= ; Design-Runtime-Check-zh-CN missing='
+        Get-WikiDrift 'Design-Runtime-Check' | Should BeExactly '' }
     It 'Design-Foundation keeps its sections, and its Chinese twin matches it line for line' {
         $en = [IO.File]::ReadAllLines((Join-Path $wikiRoot 'Design-Foundation.md'))
         @($en | Where-Object { $_ -match '^## ' }) -join ',' | Should BeExactly '## Purpose,## Decisions,## Changes,## Component map,## Behavior and its tests,## Must-pass,## Non-goals,## Prior art'

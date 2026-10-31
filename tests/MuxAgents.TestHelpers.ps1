@@ -70,7 +70,7 @@ function New-FakeMuxAgentProviders {
     $fake = [pscustomobject]@{
         Env = $environment; Pid = 200; Cwd = $work; Home = $homeDirectory; StateRoot = (Join-Path $Root 'fake state')
         Entry = (Join-Path $script:FakeMuxAgentsDirectory 'mux-agent.ps1'); Launcher = (Join-Path $script:FakeMuxAgentsDirectory 'mux-agent-launcher.ps1')
-        Pwsh = $pwsh; Processes = $null; Open = $null; Kill = $null; Rmux = $null; RmuxPath = $null; Token = $null; Now = $null; Sleep = $null; Admitted = $true
+        Pwsh = $pwsh; Processes = $null; Open = $null; Kill = $null; Rmux = $null; RmuxPath = $null; Token = $null; Now = $null; Sleep = $null; Admitted = $true; Advisory = $null; AllowAffectedDotnet = $false
         Rows = $rows; Rules = $rules; Calls = [Collections.Generic.List[object]]::new(); Clock = [DateTime]::new(2026, 10, 29, 12, 0, 0, [DateTimeKind]::Utc)
         Killed = [Collections.Generic.List[int]]::new(); Survivors = [Collections.Generic.List[int]]::new(); OpenResults = @{}; Fixtures = [ordered]@{}
         TokenInfo = [pscustomobject]@{ IsAppContainer = $false; IsRestricted = $false; IntegrityLevel = 'S-1-16-8192' }

@@ -39,6 +39,14 @@ Describe 'MuxAgents icon' {
         }
         $result -join ' ' | Should BeExactly '16=True,16x16 32=True,32x32 64=True,64x64 128=True,128x128 256=True,256x256 512=True,512x512'
     }
+    It 'has the social preview at 1280x640, the size GitHub asks for, beside the icon' {
+        # Catches: a lost or resized preview, so the owner can upload it from the repository (Settings, Social preview).
+        $path = [IO.Path]::Combine($repoRoot, 'assets', 'social', 'mux-agents-social.png')
+        $bytes = if (Test-Path -LiteralPath $path) { [IO.File]::ReadAllBytes($path) } else { [byte[]]::new(24) }
+        $width = ([int]$bytes[16] -shl 24) -bor ([int]$bytes[17] -shl 16) -bor ([int]$bytes[18] -shl 8) -bor [int]$bytes[19]
+        $height = ([int]$bytes[20] -shl 24) -bor ([int]$bytes[21] -shl 16) -bor ([int]$bytes[22] -shl 8) -bor [int]$bytes[23]
+        "$([BitConverter]::ToString($bytes, 0, 8) -ceq '89-50-4E-47-0D-0A-1A-0A') ${width}x$height $($bytes.Length -le 1MB)" | Should BeExactly 'True 1280x640 True'
+    }
     It 'README opens with the icon above the title' {
         $lines = [IO.File]::ReadAllLines((Join-Path $repoRoot 'README.md'))
         "$($lines[0]) | $($lines[2])" | Should BeExactly '<p align="center"><img src="https://raw.githubusercontent.com/D0n9X1n/mux-agents/main/assets/icon/mux-agents.svg" width="128" height="128" alt="mux-agents icon"></p> | # mux-agents'
