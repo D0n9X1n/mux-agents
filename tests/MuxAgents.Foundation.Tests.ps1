@@ -150,6 +150,13 @@ Describe 'MuxAgents foundation docs' {
         $market = [IO.File]::ReadAllText([IO.Path]::Combine($repoRoot, '.claude-plugin', 'marketplace.json')) | ConvertFrom-Json
         $install = @('claude plugin marketplace add D0n9X1n/mux-agents', 'claude plugin install mux-agents@mux-agents', 'copilot plugin marketplace add D0n9X1n/mux-agents', 'copilot plugin install mux-agents@mux-agents')
         "$($readme[4] -ceq $tagline) $($plugin.description -ceq $tagline) $(@($market.plugins)[0].description -ceq $tagline) $(@($install | Where-Object { $readme -cnotcontains $_ }).Count)" | Should BeExactly 'True True True 0' }
+    It 'README links and images by absolute URL, and its spawn example passes the brief a Claude caller needs' {
+        # Catches: a relative link or image that breaks in the release zip (assets/ is export-ignored, CONTRIBUTING.md
+        # is not a plugin file), and a spawn example that a Claude caller would see refused with check brief.
+        $text = [IO.File]::ReadAllText((Join-Path $repoRoot 'README.md'))
+        $targets = @([regex]::Matches($text, '\]\(([^)\s]+)\)|\bsrc="([^"]+)"') | ForEach-Object { if ($_.Groups[1].Success) { $_.Groups[1].Value } else { $_.Groups[2].Value } })
+        "$($targets.Count -gt 0) $(@($targets | Where-Object { $_ -notmatch '^https://' }) -join ',')" | Should BeExactly 'True '
+        @([IO.File]::ReadAllLines((Join-Path $repoRoot 'README.md')) | Where-Object { $_.StartsWith('| `spawn` |') -and $_.Contains('-BriefFile') }).Count | Should Be 1 }
     It 'README carries no Windows-only line left from before Linux and macOS' {
         # Catches: claude.exe or copilot.exe as the only names, a Windows-only state root, a placeholder source.
         $text = [IO.File]::ReadAllText((Join-Path $repoRoot 'README.md'))

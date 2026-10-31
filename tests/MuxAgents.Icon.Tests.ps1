@@ -41,7 +41,7 @@ Describe 'MuxAgents icon' {
     }
     It 'README opens with the icon above the title' {
         $lines = [IO.File]::ReadAllLines((Join-Path $repoRoot 'README.md'))
-        "$($lines[0]) | $($lines[2])" | Should BeExactly '<p align="center"><img src="assets/icon/mux-agents.svg" width="128" height="128" alt="mux-agents icon"></p> | # mux-agents'
+        "$($lines[0]) | $($lines[2])" | Should BeExactly '<p align="center"><img src="https://raw.githubusercontent.com/D0n9X1n/mux-agents/main/assets/icon/mux-agents.svg" width="128" height="128" alt="mux-agents icon"></p> | # mux-agents'
     }
     It 'keeps assets out of the plugin zip' {
         [IO.File]::ReadAllText((Join-Path $repoRoot '.gitattributes')) | Should Match '(?m)^assets export-ignore$'

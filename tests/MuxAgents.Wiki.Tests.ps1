@@ -279,7 +279,8 @@ Describe 'MuxAgents wiki pages' {
     It 'links every page to its twin within its first five lines' {
         $missing = @(foreach ($page in $pages) {
             $head = @([IO.File]::ReadAllLines((Join-Path $wikiRoot "$page.md")) | Select-Object -First 5) -join "`n"
-            if (-not $head.Contains("($(Get-WikiTwin $page))")) { $page }
+            # The release notes become a release body on github.com, so they link their twin by absolute URL.
+            if (-not ($head.Contains("($(Get-WikiTwin $page))") -or $head.Contains("(https://github.com/D0n9X1n/mux-agents/wiki/$(Get-WikiTwin $page))"))) { $page }
         })
         "$($english.Count -gt 0) $($chinese.Count -gt 0) $($missing -join ',')" | Should BeExactly 'True True '
     }
@@ -300,10 +301,14 @@ Describe 'MuxAgents wiki pages' {
         $status = foreach ($page in 'Home', 'Home-zh-CN') { @([IO.File]::ReadAllLines((Join-Path $wikiRoot "$page.md")) | Where-Object { $_ -match '^v0\.1\.0 ' }) -join ' / ' }
         $status -join ' ; ' | Should BeExactly 'v0.1.0 runs on Windows with rmux 0.10.0 and on Linux and macOS with tmux 3.2 or later. It shows a side bar (#4): a multiplexer split for every client and a pane in Claude Code. ; v0.1.0 在 Windows 上配合 rmux 0.10.0 运行，在 Linux 和 macOS 上配合 tmux 3.2 或更高版本运行。它提供侧边栏（#4）：每个客户端都可用的多路复用器分屏，以及 Claude Code 中的窗格。'
     }
-    It 'Home states the Linux and macOS lock limitation of older .NET, in both languages' {
-        $want = @{ 'Home' = 'On Linux and macOS with .NET older than 8.0.32, 9.0.21 or 10.0.13, another local user can make mux-agent commands time out with check lock. Nothing leaks and no state is damaged. Use a current PowerShell.'
-            'Home-zh-CN' = '在 Linux 和 macOS 上，如果 .NET 早于 8.0.32、9.0.21 或 10.0.13，其他本地用户可以让 mux-agent 命令以 lock 检查超时。不会泄露内容，也不会损坏状态。请使用最新的 PowerShell。' }
-        (@(foreach ($page in 'Home', 'Home-zh-CN') { [IO.File]::ReadAllLines((Join-Path $wikiRoot "$page.md")) -ccontains $want[$page] }) -join ' ') | Should BeExactly 'True True' }
+    It 'Home, the release notes and the README state the .NET named-mutex advisory as published, in both languages' {
+        # Catches: a lock limitation that understates GHSA-2j93-m82w-73j2 (file overwrite, loosened permissions, privilege gain).
+        $en = 'On Linux and macOS, .NET older than 8.0.32, 9.0.21 or 10.0.13 has an elevation-of-privilege flaw in its named mutexes ([GHSA-2j93-m82w-73j2](https://github.com/advisories/GHSA-2j93-m82w-73j2)), which mux-agents uses for its `lock` check: another local user can erase or replace file contents, loosen folder permissions or gain higher privileges, and can make mux-agent commands time out with check `lock`. Check with `[Environment]::Version` in pwsh and use a PowerShell built on a fixed .NET.'
+        $zh = '在 Linux 和 macOS 上，早于 8.0.32、9.0.21 或 10.0.13 的 .NET 在命名互斥体中存在权限提升漏洞（[GHSA-2j93-m82w-73j2](https://github.com/advisories/GHSA-2j93-m82w-73j2)），mux-agents 的 `lock` 检查就使用命名互斥体：其他本地用户可以清除或替换文件内容、放宽文件夹权限或获得更高权限，还可以让 mux-agent 命令以 `lock` 检查超时。请在 pwsh 中用 `[Environment]::Version` 检查，并使用基于已修复 .NET 的 PowerShell。'
+        $want = [ordered]@{ 'wiki/Home.md' = $en; 'wiki/Home-zh-CN.md' = $zh; 'wiki/Release-v0.1.0.md' = $en; 'wiki/Release-v0.1.0-zh-CN.md' = $zh; 'README.md' = $en }
+        (@(foreach ($path in $want.Keys) { [IO.File]::ReadAllLines((Join-Path $repoRoot $path)) -ccontains $want[$path] }) -join ' ') | Should BeExactly 'True True True True True'
+        (@(foreach ($path in $want.Keys) { if ([IO.File]::ReadAllText((Join-Path $repoRoot $path)).Contains('Nothing leaks')) { $path } }) -join ',') | Should BeExactly ''
+    }
     It 'Design-Foundation keeps its sections, and its Chinese twin matches it line for line' {
         $en = [IO.File]::ReadAllLines((Join-Path $wikiRoot 'Design-Foundation.md'))
         @($en | Where-Object { $_ -match '^## ' }) -join ',' | Should BeExactly '## Purpose,## Decisions,## Changes,## Component map,## Behavior and its tests,## Must-pass,## Non-goals,## Prior art'
@@ -319,14 +324,17 @@ Describe 'MuxAgents wiki pages' {
         $found -join ' ; ' | Should BeExactly 'Design-Cross-Platform missing= ; Design-Cross-Platform-zh-CN missing='
         Get-WikiDrift 'Design-Cross-Platform' | Should BeExactly ''
     }
-    It 'Release-v0.1.0 names the release zip and the install commands; its Chinese twin matches it line for line' {
-        # Catches: a zip name the release workflow does not build, an install line that drifts from the README, drift.
+    It 'Release-v0.1.0 names the release zip, all four install commands and only absolute links; its Chinese twin matches it line for line' {
+        # Catches: a zip name the release workflow does not build, an install line that drifts from the README, a
+        # wiki-relative link that breaks once the page is the GitHub release body, drift.
+        $install = 'claude plugin marketplace add D0n9X1n/mux-agents', 'claude plugin install mux-agents@mux-agents', 'copilot plugin marketplace add D0n9X1n/mux-agents', 'copilot plugin install mux-agents@mux-agents'
         $found = foreach ($page in 'Release-v0.1.0', 'Release-v0.1.0-zh-CN') {
             $lines = [IO.File]::ReadAllLines((Join-Path $wikiRoot "$page.md"))
             $text = $lines -join "`n"
-            "$page zip=$($text.Contains('`mux-agents-v0.1.0.zip`')) install=$(@('claude plugin marketplace add D0n9X1n/mux-agents', 'copilot plugin install mux-agents@mux-agents' | Where-Object { $lines -cnotcontains $_ }).Count)"
+            "$page zip=$($text.Contains('`mux-agents-v0.1.0.zip`')) install=$(@($install | Where-Object { $lines -cnotcontains $_ }).Count) relative=$(@(Get-WikiLinks $page | Where-Object { $_ -notmatch '^https://' }) -join ',')"
         }
-        $found -join ' ; ' | Should BeExactly 'Release-v0.1.0 zip=True install=0 ; Release-v0.1.0-zh-CN zip=True install=0'
+        $found -join ' ; ' | Should BeExactly 'Release-v0.1.0 zip=True install=0 relative= ; Release-v0.1.0-zh-CN zip=True install=0 relative='
+        (@(foreach ($page in 'Release-v0.1.0', 'Release-v0.1.0-zh-CN') { [IO.File]::ReadAllLines((Join-Path $wikiRoot "$page.md"))[2] }) -join ' ; ') | Should BeExactly '[简体中文](https://github.com/D0n9X1n/mux-agents/wiki/Release-v0.1.0-zh-CN) ; [English](https://github.com/D0n9X1n/mux-agents/wiki/Release-v0.1.0)'
         Get-WikiDrift 'Release-v0.1.0' | Should BeExactly ''
     }
     It 'Design-Side-Bar states the pane and watch as built, keeps its sections, and its Chinese twin matches it line for line' {

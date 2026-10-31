@@ -1,6 +1,6 @@
 # mux-agents v0.1.0 release notes
 
-[简体中文](Release-v0.1.0-zh-CN)
+[简体中文](https://github.com/D0n9X1n/mux-agents/wiki/Release-v0.1.0-zh-CN)
 
 Start Claude Code and Copilot CLI agents in tmux or rmux panes, see what each is doing, message them and stop them.
 
@@ -34,6 +34,6 @@ The release also carries `mux-agents-v0.1.0.zip`, the plugin files of this tag.
 
 ## Known limits
 
-On Linux and macOS with .NET older than 8.0.32, 9.0.21 or 10.0.13, another local user can make mux-agent commands time out with check `lock`. Nothing leaks and no state is damaged. Use a current PowerShell.
+On Linux and macOS, .NET older than 8.0.32, 9.0.21 or 10.0.13 has an elevation-of-privilege flaw in its named mutexes ([GHSA-2j93-m82w-73j2](https://github.com/advisories/GHSA-2j93-m82w-73j2)), which mux-agents uses for its `lock` check: another local user can erase or replace file contents, loosen folder permissions or gain higher privileges, and can make mux-agent commands time out with check `lock`. Check with `[Environment]::Version` in pwsh and use a PowerShell built on a fixed .NET.
 
 The Claude Code `Agents` pane was checked in a live session on Windows only: `/mux-agents-pane` opens it and it draws the board. Opening it after a live `spawn`, closing it by hand, and the pane on Linux and macOS are covered by tests, not by a live session.

@@ -1,4 +1,4 @@
-<p align="center"><img src="assets/icon/mux-agents.svg" width="128" height="128" alt="mux-agents icon"></p>
+<p align="center"><img src="https://raw.githubusercontent.com/D0n9X1n/mux-agents/main/assets/icon/mux-agents.svg" width="128" height="128" alt="mux-agents icon"></p>
 
 # mux-agents
 
@@ -10,7 +10,7 @@ mux-agents is a plugin for Claude Code and GitHub Copilot CLI. From a chat runni
 
 0.1.0 runs on Windows with rmux 0.10.0, and on Linux and macOS with tmux 3.2 or later. The code moved here from the Terminal Profiles repository and no longer depends on it.
 
-On Linux and macOS with .NET older than 8.0.32, 9.0.21 or 10.0.13, another local user can make mux-agent commands time out with check `lock`. Nothing leaks and no state is damaged. Use a current PowerShell.
+On Linux and macOS, .NET older than 8.0.32, 9.0.21 or 10.0.13 has an elevation-of-privilege flaw in its named mutexes ([GHSA-2j93-m82w-73j2](https://github.com/advisories/GHSA-2j93-m82w-73j2)), which mux-agents uses for its `lock` check: another local user can erase or replace file contents, loosen folder permissions or gain higher privileges, and can make mux-agent commands time out with check `lock`. Check with `[Environment]::Version` in pwsh and use a PowerShell built on a fixed .NET.
 
 ## Quick start
 
@@ -25,11 +25,11 @@ Then ask in the chat, for example: "spawn a Copilot agent to write the tests for
 
 ## Commands
 
-Every command is `pwsh -NoProfile -File <plugin>/scripts/mux-agent.ps1 <verb> …` and prints one JSON object (`-Text` prints lines instead). An agent passes free text in a file (`-TaskFile`, `-BodyFile`), never on the command line.
+Every command is `pwsh -NoProfile -File <plugin>/scripts/mux-agent.ps1 <verb> …` and prints one JSON object (`-Text` prints lines instead). An agent passes free text in a file (`-TaskFile`, `-BriefFile`, `-BodyFile`), never on the command line.
 
 | verb | example | what it does |
 |---|---|---|
-| `spawn` | `spawn -Client copilot -TaskFile task.md -Split h` | start an agent in a new window, or a split with `-Split h\|v` |
+| `spawn` | `spawn -Client copilot -TaskFile task.md -BriefFile brief.md -Split h` | start an agent in a new window, or a split with `-Split h\|v` |
 | `list` | `list -All` | live agents, what each is doing, unread messages; `-All` adds ended ones |
 | `status` | `status -BodyFile step.txt` | an agent says what it is doing now |
 | `send` | `send claude-1 -BodyFile note.md`, `send parent -BodyFile result.md` | post a message to an agent or to your parent |
@@ -122,6 +122,6 @@ Each OS skips the suites tagged for the other OSes. Suites tagged integration ru
 ## More
 
 - [Wiki](https://github.com/D0n9X1n/mux-agents/wiki): design pages and release notes, in English and Chinese.
-- [Contributing](CONTRIBUTING.md): layout, tests and how changes land.
+- [Contributing](https://github.com/D0n9X1n/mux-agents/blob/main/CONTRIBUTING.md): layout, tests and how changes land.
 
 MIT licensed.

@@ -8,7 +8,7 @@ mux-agents 是 Claude Code 和 GitHub Copilot CLI 的插件。客户端在 rmux 
 
 v0.1.0 在 Windows 上配合 rmux 0.10.0 运行，在 Linux 和 macOS 上配合 tmux 3.2 或更高版本运行。它提供侧边栏（#4）：每个客户端都可用的多路复用器分屏，以及 Claude Code 中的窗格。
 
-在 Linux 和 macOS 上，如果 .NET 早于 8.0.32、9.0.21 或 10.0.13，其他本地用户可以让 mux-agent 命令以 lock 检查超时。不会泄露内容，也不会损坏状态。请使用最新的 PowerShell。
+在 Linux 和 macOS 上，早于 8.0.32、9.0.21 或 10.0.13 的 .NET 在命名互斥体中存在权限提升漏洞（[GHSA-2j93-m82w-73j2](https://github.com/advisories/GHSA-2j93-m82w-73j2)），mux-agents 的 `lock` 检查就使用命名互斥体：其他本地用户可以清除或替换文件内容、放宽文件夹权限或获得更高权限，还可以让 mux-agent 命令以 `lock` 检查超时。请在 pwsh 中用 `[Environment]::Version` 检查，并使用基于已修复 .NET 的 PowerShell。
 
 ## 设计
 

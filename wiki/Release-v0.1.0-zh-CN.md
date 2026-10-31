@@ -1,6 +1,6 @@
 # mux-agents v0.1.0 发布说明
 
-[English](Release-v0.1.0)
+[English](https://github.com/D0n9X1n/mux-agents/wiki/Release-v0.1.0)
 
 在 tmux 或 rmux 窗格中启动 Claude Code 和 Copilot CLI 代理，查看每个代理在做什么，给它们发消息并停止它们。
 
@@ -34,6 +34,6 @@ copilot plugin install mux-agents@mux-agents
 
 ## 已知限制
 
-在 Linux 和 macOS 上，如果 .NET 早于 8.0.32、9.0.21 或 10.0.13，其他本地用户可以让 mux-agent 命令以 `lock` 检查超时。不会泄露内容，也不会损坏状态。请使用最新的 PowerShell。
+在 Linux 和 macOS 上，早于 8.0.32、9.0.21 或 10.0.13 的 .NET 在命名互斥体中存在权限提升漏洞（[GHSA-2j93-m82w-73j2](https://github.com/advisories/GHSA-2j93-m82w-73j2)），mux-agents 的 `lock` 检查就使用命名互斥体：其他本地用户可以清除或替换文件内容、放宽文件夹权限或获得更高权限，还可以让 mux-agent 命令以 `lock` 检查超时。请在 pwsh 中用 `[Environment]::Version` 检查，并使用基于已修复 .NET 的 PowerShell。
 
 Claude Code 的 `Agents` 窗格只在 Windows 上的实际会话中检查过：`/mux-agents-pane` 能打开它并绘制面板。实际 `spawn` 之后自动打开、手动关闭，以及 Linux 和 macOS 上的窗格，由测试覆盖，未在实际会话中检查。
