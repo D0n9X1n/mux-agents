@@ -117,3 +117,16 @@ Describe 'MuxAgents unix macos process table' {
         foreach ($r in $fake.Rows) { if ($r.Pid -eq 150) { $r.Path = '/x/claude'; Add-Member -InputObject $r -NotePropertyName Argv -NotePropertyValue $row.Argv -Force } }
         $fake.ClientOf = { param($Row) if ($Row.Pid -eq 150) { 'claude' } }; $fake.IsShell = { param($Row) $true }; $fake.Argv = { param($Row) Get-MuxAgentUnixArgv -Row $Row }
         "$($null -eq $row.Argv)|$(Get-UnixRefusal { Assert-MuxAgentSpawnAllowed -P $fake -Caller (Resolve-MuxAgentCaller -P $fake) })" | Should BeExactly 'True|2 flags a client command line cannot be read' } }
+Describe 'MuxAgents unix kernels' {
+    It 'each kernel has exactly its reads, and the fake has every one' {
+        $linux = @((New-MuxAgentLinuxKernel).PSObject.Properties.Name | Sort-Object); $mac = @((New-MuxAgentMacKernel).PSObject.Properties.Name | Sort-Object); $fake = @((New-UnixFakeKernel).PSObject.Properties.Name)
+        "$($linux -join ',')|$($mac -join ',')|$(@(($linux + $mac) | Where-Object { $_ -notin $fake }).Count)" | Should BeExactly 'Close,IsGone,ListIds,PidfdOpen,ReadCmdline,ReadCwd,ReadExe,ReadStart,ReadStat,ReadStatus,ResolveFile,SendKill,Sleep,WaitExit|Close,IsGone,ListPs,PidfdOpen,ReadArgv,ReadCwd,ReadPath,ReadStart,ResolveFile,SandboxCheck,SendKill,Sleep,WaitExit|0' }
+    It 'macOS opens no pidfd and signals nothing; ResolveFile gives a plain file its full path' {
+        $mac = New-MuxAgentMacKernel; $file = Join-Path $TestDrive 'plain.js'; [IO.File]::WriteAllText($file, '')
+        "$(& $mac.PidfdOpen 1)|$(& $mac.SendKill 3)|$(& $mac.WaitExit 3 0)|$((& $mac.ResolveFile $file) -ceq [IO.Path]::GetFullPath($file))" | Should BeExactly '-1|False|False|True' }
+    It 'IsGone is true only for ESRCH from kill(pid, 0) on that pid; EPERM, another errno or a probe that throws is not gone' {
+        $probes = @({ param($Id) 0 }, { param($Id) 1 }, { param($Id) if ($Id -eq 300) { 3 } else { 0 } }, { param($Id) 22 }, { param($Id) throw [DllNotFoundException]::new('libc') })
+        $answers = foreach ($probe in $probes) { "$(Test-MuxAgentUnixGone -Probe $probe -Id 300)" }
+        "$($answers -join ',')|$(Test-MuxAgentUnixGone -Probe $probes[2] -Id 301)" | Should BeExactly 'False,False,True,False,False|False' }
+    It 'each production IsGone answers not gone for this live process, whether its probe runs (its own OS) or fails (no such libc)' {
+        "$(& (New-MuxAgentLinuxKernel).IsGone $PID)|$(& (New-MuxAgentMacKernel).IsGone $PID)" | Should BeExactly 'False|False' } }

@@ -12,6 +12,12 @@ public static class MuxAgentUnixNative {
     public static bool PidfdKill(int fd) { return syscall(424, fd, 9, 0, 0) == 0; }
     public static bool PidfdExited(int fd, int milliseconds) { int[] item = { fd, 1 }; return poll(item, 1, milliseconds) == 1; }
     public static void Close(int fd) { LinuxClose(fd); }
+    // kill(pid, 0) sends no signal; it only checks the pid. 0 when the process exists, else errno: ESRCH 3 is "no such process"
+    // (3 on Linux and macOS); EPERM 1 means it exists under another user. A pid below 1 names a group, so it is EINVAL 22 here.
+    [DllImport("libc.so.6", EntryPoint = "kill", SetLastError = true)] static extern int LinuxSignal(int pid, int signal);
+    [DllImport("/usr/lib/libSystem.dylib", EntryPoint = "kill", SetLastError = true)] static extern int MacSignal(int pid, int signal);
+    public static int ProbeLinux(int pid) { if (pid < 1) return 22; return LinuxSignal(pid, 0) == 0 ? 0 : Marshal.GetLastPInvokeError(); }
+    public static int ProbeMac(int pid) { if (pid < 1) return 22; return MacSignal(pid, 0) == 0 ? 0 : Marshal.GetLastPInvokeError(); }
     public static string[] ProcArgs(int pid) {  // CTL_KERN 1, KERN_PROCARGS2 49
         byte[] buffer = new byte[1 << 20]; UIntPtr size = (UIntPtr)buffer.Length;
         return sysctl(new int[] { 1, 49, pid }, 3, buffer, ref size, IntPtr.Zero, UIntPtr.Zero) != 0 ? null : ParseProcArgs(buffer, (int)size); }

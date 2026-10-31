@@ -75,3 +75,33 @@ function Get-MuxAgentMacProcessTable {
         $id = [int]$Matches[1]; $parent = [int]$Matches[2]; $start = & $Kernel.ReadStart $id
         if ($null -eq $start) { continue }
         New-MuxAgentUnixRow -ProcessId $id -ParentId $parent -Start $start -Path (& $Kernel.ReadPath $id) -Argv (Read-MuxAgentUnixArgv -Reader $Kernel.ReadArgv -Id $id) } }
+# IsGone on Unix: true only when kill(pid, 0) reports ESRCH (no such process). Success, EPERM (alive under another user), any
+# other errno, or a probe that cannot run is not shown gone, so a Kill without a pidfd returns $false and the pid is reported.
+function Test-MuxAgentUnixGone { param([Parameter(Mandatory)][scriptblock]$Probe, [int]$Id)
+    $errno = try { [int](& $Probe $Id) } catch { -1 }
+    $errno -eq 3 }
+function Get-MuxAgentUnixLinkTarget { param([string]$Path) $target = [IO.File]::ResolveLinkTarget($Path, $true); if ($target) { $target.FullName } else { [IO.Path]::GetFullPath($Path) } }
+# The Linux reads: /proc and pidfd. Read members return $null when unreadable, except ReadStat and ReadStatus, which throw.
+function New-MuxAgentLinuxKernel { [pscustomobject]@{
+    ListIds = { foreach ($d in [IO.Directory]::EnumerateDirectories('/proc')) { $n = 0; if ([int]::TryParse([IO.Path]::GetFileName($d), [ref]$n)) { $n } } }
+    ReadStat = { param([int]$Id) [IO.File]::ReadAllText("/proc/$Id/stat") }; ReadStatus = { [IO.File]::ReadAllText('/proc/self/status') }
+    ReadExe = { param([int]$Id) try { [IO.File]::ResolveLinkTarget("/proc/$Id/exe", $false).FullName } catch { $null } }
+    ReadCmdline = { param([int]$Id) ConvertFrom-MuxAgentLinuxCmdline -Bytes ([IO.File]::ReadAllBytes("/proc/$Id/cmdline")) }
+    ReadStart = { param([int]$Id) try { (ConvertFrom-MuxAgentLinuxStat -Text ([IO.File]::ReadAllText("/proc/$Id/stat"))).Start } catch { $null } }
+    ReadCwd = { param([int]$Id) try { [IO.Directory]::ResolveLinkTarget("/proc/$Id/cwd", $false).FullName } catch { $null } }
+    ResolveFile = { param($Path) Get-MuxAgentUnixLinkTarget -Path $Path }
+    IsGone = { param([int]$Id) Test-MuxAgentUnixGone -Id $Id -Probe { param([int]$Id) Import-MuxAgentUnixNative; [MuxAgentUnixNative]::ProbeLinux($Id) } }
+    PidfdOpen = { param([int]$Id) Import-MuxAgentUnixNative; [MuxAgentUnixNative]::PidfdOpen($Id) }; SendKill = { param([int]$Fd) [MuxAgentUnixNative]::PidfdKill($Fd) }
+    WaitExit = { param([int]$Fd, [int]$Milliseconds) [MuxAgentUnixNative]::PidfdExited($Fd, $Milliseconds) }; Close = { param([int]$Fd) [MuxAgentUnixNative]::Close($Fd) }
+    Sleep = { param([int]$Milliseconds) Start-Sleep -Milliseconds $Milliseconds } } }
+# The macOS reads: ps, Process, KERN_PROCARGS2, sandbox_check, proc_pidinfo, kill(pid, 0). No pidfd exists: PidfdOpen is -1 and nothing is signalled.
+function New-MuxAgentMacKernel { [pscustomobject]@{
+    ListPs = { $run = Invoke-MuxAgentProcess -FilePath '/bin/ps' -Arguments @('-A', '-o', 'pid=,ppid='); if ($run.ExitCode -ne 0) { throw 'mux-agent: ps failed' }; $run.StdOut }
+    ReadStart = { param([int]$Id) try { Import-MuxAgentUnixNative; [MuxAgentUnixNative]::EpochMicros([Diagnostics.Process]::GetProcessById($Id).StartTime) } catch { $null } }
+    ReadPath = { param([int]$Id) try { [Diagnostics.Process]::GetProcessById($Id).MainModule.FileName } catch { $null } }
+    ReadArgv = { param([int]$Id) Import-MuxAgentUnixNative; [MuxAgentUnixNative]::ProcArgs($Id) }
+    ReadCwd = { param([int]$Id) try { Import-MuxAgentUnixNative; [MuxAgentUnixNative]::Cwd($Id) } catch { $null } }
+    SandboxCheck = { Import-MuxAgentUnixNative; [MuxAgentUnixNative]::SandboxCheck() }; ResolveFile = { param($Path) Get-MuxAgentUnixLinkTarget -Path $Path }
+    IsGone = { param([int]$Id) Test-MuxAgentUnixGone -Id $Id -Probe { param([int]$Id) Import-MuxAgentUnixNative; [MuxAgentUnixNative]::ProbeMac($Id) } }
+    PidfdOpen = { param([int]$Id) -1 }; SendKill = { param([int]$Fd) $false }; WaitExit = { param([int]$Fd, [int]$Milliseconds) $false }; Close = { param([int]$Fd) }
+    Sleep = { param([int]$Milliseconds) Start-Sleep -Milliseconds $Milliseconds } } }
