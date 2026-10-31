@@ -2,7 +2,7 @@
 //! for the launch commit, runs the client once in this pane, records its exit code and posts one `exited` notice.
 
 use std::io;
-use std::path::{Component, Path, PathBuf};
+use std::path::{Component, Path};
 use std::time::Duration;
 
 use serde_json::{Map, Value, json};
@@ -15,6 +15,7 @@ use crate::ctx::Ctx;
 use crate::error::{Refusal, Res};
 use crate::parse::cmdline_length;
 use crate::state::fs::{read_json, write_json};
+use crate::state::root::{HOST, OsKind};
 use crate::util::utc_o;
 
 /// The parent's client identity, taken out of the client's environment (MuxAgents.ps1:1595-1596).
@@ -62,7 +63,7 @@ pub(crate) fn run(ctx: &Ctx, spec: &str, err: &mut dyn FnMut(&str), start: Start
         err(OUTSIDE);
         return 2;
     }
-    if canonical(given).as_deref() != Some(given) {
+    if !std::fs::canonicalize(given).is_ok_and(|real| same_path(&real, spec, HOST)) {
         err(LINK);
         return 2;
     }
@@ -111,16 +112,24 @@ fn lexically_under(root: &Path, path: &Path) -> bool {
     path.next().is_some()
 }
 
-/// The resolved path, without Windows' `\\?\` prefix; none when it cannot be resolved.
-fn canonical(path: &Path) -> Option<PathBuf> {
-    let real = std::fs::canonicalize(path).ok()?;
-    #[cfg(windows)]
-    if let Some(plain) = real.to_str().and_then(|r| r.strip_prefix(r"\\?\"))
-        && !plain.starts_with("UNC\\")
-    {
-        return Some(PathBuf::from(plain));
+/// Whether `given` is already the canonical path `resolved`, so no link or junction lies on the way. Windows:
+/// canonicalize answers `\\?\C:\...` whatever the caller typed, and NTFS names ignore case, so both sides drop a
+/// drive's `\\?\` and compare ignoring case; an 8.3 short name still differs and refuses. Unix: exact bytes.
+fn same_path(resolved: &Path, given: &str, os: OsKind) -> bool {
+    let Some(resolved) = resolved.to_str() else {
+        return false;
+    };
+    match os {
+        OsKind::Unix => resolved == given,
+        OsKind::Windows => {
+            // A UNC answer (`\\?\UNC\...`) keeps its prefix, so it never equals a drive path.
+            let plain = |p: &str| match p.strip_prefix(r"\\?\") {
+                Some(rest) if !rest.starts_with(r"UNC\") => rest.to_lowercase(),
+                _ => p.to_lowercase(),
+            };
+            plain(resolved) == plain(given)
+        }
     }
-    Some(real)
 }
 
 fn launch(
@@ -301,6 +310,17 @@ mod tests {
     // A committed agent of session $3 whose spec names `client` with `args`, and a PATH holding both clients.
     fn setup(client: &str, args: Value) -> Launch {
         let mut w = World::human("");
+        // A real root comes from %LOCALAPPDATA% as `C:\...`; the temp dir's `\\?\C:\...` would fold `..` away on join,
+        // so the dotted spec below would name the real one.
+        #[cfg(windows)]
+        if let Some(plain) = w
+            .ctx
+            .state_root
+            .to_str()
+            .and_then(|r| r.strip_prefix(r"\\?\"))
+        {
+            w.ctx.state_root = PathBuf::from(plain);
+        }
         let folder = w.agent_record(ID, json!({}));
         let state = w.state();
         write(
@@ -385,6 +405,48 @@ mod tests {
         let notice: Value =
             serde_json::from_slice(&std::fs::read(l.folder.join("notice.json")).unwrap()).unwrap();
         notice["kind"].clone()
+    }
+
+    // The link check's decision, as text, so the Windows rules run on every host.
+    #[test]
+    fn windows_spec_path_comparison() {
+        use crate::state::root::OsKind::{Unix, Windows};
+        let same = |resolved: &str, given: &str, os| same_path(Path::new(resolved), given, os);
+        let spec = r"C:\Users\me\AppData\Local\mux-agents\state\k\agents\a\spec.json";
+        // canonicalize answers `\\?\C:\...`; the given path has no prefix, or has it too.
+        let resolved = format!(r"\\?\{spec}");
+        assert!(same(&resolved, spec, Windows));
+        assert!(same(&resolved, &resolved, Windows));
+        assert!(same(spec, spec, Windows));
+        // NTFS names ignore case: a drive letter or folder typed in another case is the same file.
+        assert!(same(&resolved, &spec.to_lowercase(), Windows));
+        assert!(same(&resolved, &spec.replace("C:", "c:"), Windows));
+        // A junction or link resolves elsewhere; an 8.3 short name resolves to its long name. Both refuse.
+        let elsewhere = r"\\?\D:\elsewhere\agents\a\spec.json";
+        assert!(!same(elsewhere, spec, Windows));
+        assert!(!same(
+            &resolved,
+            r"C:\Users\RUNNER~1\AppData\Local\mux-agents\state\k\agents\a\spec.json",
+            Windows
+        ));
+        // A UNC answer keeps its prefix, so it never equals a drive path.
+        assert!(!same(
+            r"\\?\UNC\srv\share\spec.json",
+            r"\\srv\share\spec.json",
+            Windows
+        ));
+        // Unix: exact bytes, no prefix and no case folding.
+        assert!(same(
+            "/s/k/agents/a/spec.json",
+            "/s/k/agents/a/spec.json",
+            Unix
+        ));
+        assert!(!same(
+            "/s/k/agents/a/spec.json",
+            "/S/k/agents/a/spec.json",
+            Unix
+        ));
+        assert!(!same(r"\\?\/s/spec.json", "/s/spec.json", Unix));
     }
 
     #[test]
