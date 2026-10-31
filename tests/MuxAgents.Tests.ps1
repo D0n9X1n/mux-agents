@@ -1970,6 +1970,15 @@ Describe 'MuxAgents T1.6 spawn' -Tag 'windows' {
         (Read-MuxAgentJson -Path ([IO.Path]::Combine($fake.State, 'agents', $run.Reply.id, 'record.json'))).directory | Should BeExactly $fake.Cwd
     }
 
+    Context 'pane environment' {
+        Mock Get-MuxAgentPaneEnvironment { '-e'; 'MUX_AGENTS_STATE=marker' }
+        It 'A2 passes the pane environment before -c' {
+            $fake = New-T16Fake
+            $run = Invoke-T16Spawn $fake @('-Client', 'claude', '-Task', 'hi')
+            Get-T16Calls $fake 'new-window' | Should BeExactly (Get-T16Launch $fake $run.Reply.id @('new-window', '-d', '-P', '-F', '#{pane_id}|#{window_id}', '-t', '$3:', '-n', 'claude-1', '-e', 'MUX_AGENTS_STATE=marker'))
+        }
+    }
+
     It 'A2 tagged caller pane refused' {
         foreach ($tag in @('0123456789ab', 'x')) {
             $fake = New-T16Fake

@@ -23,6 +23,11 @@ Describe 'MuxAgents integration tmux' -Tag 'integration' {
         foreach ($step in 'spawn-window', 'spawn-split') {
             $s = $results[$step].reply.sessionId
             "$((@((Get-ItWorker $step 'argv') -split "`n") | Select-Object -First 8) -join ' ')|$((Get-ItWorker $step 'tty').Trim())" | Should BeExactly "--dangerously-skip-permissions --effort high --resume $sid --fork-session --session-id $s|yes" } }
+    It 'a state root set only in the caller reaches each new pane; the tmux server does not carry it' {
+        $null = & tmux -S $server.Socket show-environment -g MUX_AGENTS_STATE 2>$null; $serverHas = $LASTEXITCODE -eq 0
+        $want = "$(& realpath -- "$dir/state")"
+        $got = foreach ($step in 'spawn-window', 'spawn-split') { "$(& realpath -- (Get-ItWorker $step 'state').Trim())" }
+        "$serverHas $($got -join ',')" | Should BeExactly "False $want,$want" }
     It 'list, send and read <name> answer, and send reaches the agent mailbox' {
         "$((@($results['list'].reply.agents.name) | Sort-Object) -join ',') $($results['send'].code) $(@($results['read-pane'].reply.text -split "`n" | ForEach-Object Trim) -ccontains 'worker ready')" | Should BeExactly 'w1,w2 0 True'
         $box = Get-ChildItem "$dir/state" -Recurse -Filter "$($results['spawn-window'].reply.id).jsonl" | Select-Object -First 1

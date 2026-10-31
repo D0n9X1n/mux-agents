@@ -244,6 +244,15 @@ function Resolve-MuxAgentExecutable {
     Exit-MuxAgentCommand 1 'endpoint' 'rmux.exe was not found'
 }
 
+function Get-MuxAgentPaneEnvironment {
+    # The environment arguments for a new agent pane. On Unix a pane gets the tmux server's environment, not the caller's,
+    # so a MUX_AGENTS_STATE or XDG_STATE_HOME set in the caller's shell would not reach the launcher, which would pick
+    # another state root and refuse the spec; the selected root goes in with -e. Windows: none (unchanged).
+    param([Parameter(Mandatory)]$P)
+    if ($P.Platform -ceq 'windows') { return }
+    '-e'; "MUX_AGENTS_STATE=$($P.StateRoot)"
+}
+
 function Find-MuxAgentApplication {
     # The first application named Name on PATH, or $null.
     param([Parameter(Mandatory)][string]$Name)
@@ -792,7 +801,7 @@ function Invoke-MuxAgentSpawn {
             else { @('new-window', '-d', '-P', '-F', '#{pane_id}|#{window_id}', '-t', "$($caller.Session):", '-n', $name) }
             # From here a pane may exist, so any failure is a launch failure.
             $launched = $true
-            $created = Invoke-MuxAgentNative -P $P -Arguments ($target + @('-c', $directory, $P.Pwsh, '-NoProfile', '-File', $P.Launcher, $spec))
+            $created = Invoke-MuxAgentNative -P $P -Arguments ($target + @(Get-MuxAgentPaneEnvironment -P $P) + @('-c', $directory, $P.Pwsh, '-NoProfile', '-File', $P.Launcher, $spec))
             if (-not (([string]$created.StdOut).TrimEnd("`r`n") -match '^(%\d+)\|(@\d+)$')) { Exit-MuxAgentCommand 1 'launch' 'rmux did not name the new pane' }
             $pane = $Matches[1]
             $window = $Matches[2]

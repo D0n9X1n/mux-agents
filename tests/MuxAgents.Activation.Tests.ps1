@@ -125,3 +125,7 @@ Describe 'MuxAgents activation provider refusals' {
                 "$LASTEXITCODE $($reply.code) $($reply.check) $($reply.ok) $($lines.Count)" } }
         finally { foreach ($k in $saved.Keys) { [Environment]::SetEnvironmentVariable($k, $saved[$k]) } }
         ($answers -join ';') | Should BeExactly "$want;$want" } }
+Describe 'MuxAgents activation pane environment' {
+    It 'passes the selected state root to a new Unix pane with -e, and nothing on Windows' {
+        $answers = foreach ($platform in 'windows', 'linux', 'macos') { "[$(@(Get-MuxAgentPaneEnvironment -P ([pscustomobject]@{ Platform = $platform; StateRoot = '/s p/state' })) -join '|')]" }
+        ($answers -join ';') | Should BeExactly '[];[-e|MUX_AGENTS_STATE=/s p/state];[-e|MUX_AGENTS_STATE=/s p/state]' } }

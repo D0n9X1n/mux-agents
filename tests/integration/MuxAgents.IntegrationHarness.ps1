@@ -1,5 +1,7 @@
 # Integration harness: a private tmux server whose root pane runs the compiled fake claude (a full-bypass agent caller).
-# Only the server inherits HOME, PATH, MUX_AGENTS_STATE and MUX_IT_*; this process gets its variables back.
+# Only the server inherits HOME, PATH and MUX_IT_*; this process gets its variables back. The server has no
+# MUX_AGENTS_STATE: the root pane sets it from MUX_IT_STATE, as a user would in their own shell, so each new pane gets
+# it only if spawn passes it.
 function Start-MuxAgentItServer {
     param([Parameter(Mandatory)][string]$Root, [Parameter(Mandatory)][string]$Driver)
     $here = $PSScriptRoot; $repo = Split-Path -Parent (Split-Path -Parent $here); $sid = [guid]::NewGuid().ToString()
@@ -13,8 +15,8 @@ function Start-MuxAgentItServer {
     [IO.File]::WriteAllText("$Root/bin/id", (@('#!/bin/sh', '[ -n "$MUX_IT_DIR" ] && echo "$PPID" >> "$MUX_IT_DIR/id.log"', "exec '$id' `"`$@`"") -join "`n") + "`n")
     [IO.File]::SetUnixFileMode("$Root/bin/id", [IO.UnixFileMode]'UserRead, UserWrite, UserExecute, GroupRead, GroupExecute, OtherRead, OtherExecute')
     $sock = "/tmp/mux-it-$PID-$([guid]::NewGuid().ToString('N').Substring(0, 6)).sock"
-    $set = [ordered]@{ HOME = "$Root/home"; PATH = "$Root/bin:$env:PATH"; MUX_AGENTS_STATE = "$Root/state"; TMUX = $null; TMUX_PANE = $null
-        MUX_IT_DIR = $Root; MUX_IT_PWSH = [IO.Path]::Combine($PSHOME, 'pwsh'); MUX_IT_ENTRY = "$repo/scripts/mux-agent.ps1"; MUX_IT_DRIVER = $Driver; MUX_IT_SOCKET = $sock }
+    $set = [ordered]@{ HOME = "$Root/home"; PATH = "$Root/bin:$env:PATH"; MUX_AGENTS_STATE = $null; TMUX = $null; TMUX_PANE = $null
+        MUX_IT_DIR = $Root; MUX_IT_STATE = "$Root/state"; MUX_IT_PWSH = [IO.Path]::Combine($PSHOME, 'pwsh'); MUX_IT_ENTRY = "$repo/scripts/mux-agent.ps1"; MUX_IT_DRIVER = $Driver; MUX_IT_SOCKET = $sock }
     $saved = @{}; foreach ($k in $set.Keys) { $saved[$k] = [Environment]::GetEnvironmentVariable($k); [Environment]::SetEnvironmentVariable($k, $set[$k]) }
     try { & tmux -S $sock -f /dev/null new-session -d -x 200 -y 50 -c "$Root/work" -e "CLAUDE_CODE_SESSION_ID=$sid" -e 'CLAUDE_CODE_ENTRYPOINT=cli' "$Root/bin/claude" --dangerously-skip-permissions; $started = $LASTEXITCODE -eq 0 }
     finally { foreach ($k in $saved.Keys) { [Environment]::SetEnvironmentVariable($k, $saved[$k]) } }
