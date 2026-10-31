@@ -302,14 +302,16 @@ function Add-UnixStateNativeTests {
         $answers = foreach ($path in "$root/link", "$root/dangling", "$root/link/k") { Get-UnixStateRefusal { New-MuxAgentUnixPrivateDirectories -Root $root -Paths @($path) } }
         "$($answers -join '|')|$(Get-UnixStateMode "$root/nowhere")" | Should BeExactly '1 state the state folder path has a link|1 state the state folder path has a link|1 state the state folder path has a link|missing'
     }
-    It 'refuses when a link appears after the entry check, and leaves the link target mode as it was' {
-        $base = New-UnixStateNativeRoot; $null = [IO.Directory]::CreateDirectory($base); [IO.File]::SetUnixFileMode($base, [IO.UnixFileMode]448)
-        $target = "$base/target"; $null = [IO.Directory]::CreateDirectory($target); [IO.File]::SetUnixFileMode($target, [IO.UnixFileMode]493)
-        $null = [IO.Directory]::CreateSymbolicLink("$base/k", $target)
-        $made = try { Invoke-MuxAgentUnixMkdir -Path "$base/k" -Mode ([IO.UnixFileMode]448); 'made' } catch { 'refused' }
-        Mock Get-MuxAgentUnixEntry { 'missing' }   # the link appears after the entry read
-        $answer = Get-UnixStateRefusal { New-MuxAgentUnixDirectory -Path "$base/k" }
-        "$made|$answer|$(Get-UnixStateMode $target)" | Should BeExactly 'refused|1 state the state folder cannot be created|755'
+    Context 'a link appears after the entry check' {   # a Pester 4 Mock lasts to the end of its Context
+        Mock Get-MuxAgentUnixEntry { 'missing' }
+        It 'refuses when a link appears after the entry check, and leaves the link target mode as it was' {
+            $base = New-UnixStateNativeRoot; $null = [IO.Directory]::CreateDirectory($base); [IO.File]::SetUnixFileMode($base, [IO.UnixFileMode]448)
+            $target = "$base/target"; $null = [IO.Directory]::CreateDirectory($target); [IO.File]::SetUnixFileMode($target, [IO.UnixFileMode]493)
+            $null = [IO.Directory]::CreateSymbolicLink("$base/k", $target)
+            $made = try { Invoke-MuxAgentUnixMkdir -Path "$base/k" -Mode ([IO.UnixFileMode]448); 'made' } catch { 'refused' }
+            $answer = Get-UnixStateRefusal { New-MuxAgentUnixDirectory -Path "$base/k" }
+            "$made|$answer|$(Get-UnixStateMode $target)" | Should BeExactly 'refused|1 state the state folder cannot be created|755'
+        }
     }
     It 'refuses a folder of another owner' {
         if ((Get-MuxAgentUnixUserId) -ceq '0') { Set-ItResult -Skipped -Because 'the tests run as root, who owns /usr'; return }
