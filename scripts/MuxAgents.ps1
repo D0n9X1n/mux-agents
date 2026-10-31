@@ -216,6 +216,12 @@ function Resolve-MuxAgentExecutable {
     Exit-MuxAgentCommand 1 'endpoint' 'rmux.exe was not found'
 }
 
+function Find-MuxAgentApplication {
+    # The first application named Name on PATH, or $null.
+    param([Parameter(Mandatory)][string]$Name)
+    $found = Get-Command $Name -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($found) { $found.Source } }
+
 function Invoke-MuxAgentProcess {
     # One bounded native call: argv through ArgumentList, stdin closed, UTF-8 output, working directory $HOME. A
     # timeout kills the process tree and throws.
@@ -1442,3 +1448,6 @@ Register-MuxAgentVerb -Verb 'send' -Handler 'Invoke-MuxAgentSend' -Values @('Bod
 Register-MuxAgentVerb -Verb 'read' -Handler 'Invoke-MuxAgentRead' -Values @('Wait', 'Lines') -Min 0 -Max 1 -Usage 'usage: mux-agent read [-Wait <seconds>] | read <name> [-Lines <n>] [-Text]'
 Register-MuxAgentVerb -Verb 'stop' -Handler 'Invoke-MuxAgentStop' -Min 1 -Max 1 -Usage 'usage: mux-agent stop <name> [-Text]'
 Register-MuxAgentVerb -Verb 'status' -Handler 'Invoke-MuxAgentStatus' -Values @('Body', 'BodyFile') -Usage 'usage: mux-agent status (-Body <text> | -BodyFile <path>) [-Text]'
+
+# Unix member bodies (B2, B3, B4); they load everywhere and run only in the linux and macos member sets.
+. (Join-Path $PSScriptRoot 'MuxAgents.Unix.ps1')

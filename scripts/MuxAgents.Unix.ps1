@@ -332,3 +332,18 @@ function New-MuxAgentUnixPrivateDirectories {
         }
     }
 }
+function Resolve-MuxAgentUnixMux {
+    # The tmux the caller's server runs (the executable of the Endpoint server pid), else the first tmux on PATH.
+    # tmux older than 3.2 has no -N, so it and an unreadable -V refuse 1 'endpoint'.
+    param([Parameter(Mandatory)]$P)
+    $image = $null
+    $parsed = & $P.Endpoint $P.Env
+    if ($parsed) {
+        $server = @(& $P.Processes | Where-Object Pid -EQ ([int]$parsed.ServerPid)) | Select-Object -First 1
+        if ($server.Path -and [IO.Path]::GetFileName($server.Path) -ceq 'tmux') { $image = $server.Path } }
+    if (-not $image) { $image = Find-MuxAgentApplication -Name 'tmux' }
+    if (-not $image) { Exit-MuxAgentCommand 1 'endpoint' 'tmux was not found' }
+    $version = try { Invoke-MuxAgentProcess -FilePath $image -Arguments @('-V') -TimeoutMilliseconds 5000 } catch { $null }
+    $ok = $version -and $version.ExitCode -eq 0 -and ([string]$version.StdOut).Trim() -cmatch '^tmux (?:next-)?(\d+)\.(\d+)'
+    if (-not $ok -or [int]$Matches[1] -lt 3 -or ([int]$Matches[1] -eq 3 -and [int]$Matches[2] -lt 2)) { Exit-MuxAgentCommand 1 'endpoint' 'tmux 3.2 or later is required' }
+    $image }
