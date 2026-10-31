@@ -12,7 +12,7 @@ Describe 'MuxAgents runtime verdict' {
     It 'calls only GA or RC 2+ builds at or past the fixed patch fixed, and anything malformed affected' {
         $cases = @(@('8.0.31', 'affected'), @('8.0.32', 'fixed'), @('9.0.20', 'affected'), @('9.0.21', 'fixed'), @('10.0.12', 'affected'), @('10.0.13', 'fixed'),
             @('10.0.14-servicing.26522.126+0427b9a', 'fixed'), @('11.0.0-preview.7.1', 'affected'), @('11.0.0-rc.1.26425.128', 'affected'), @('11.0.0-rc.2.26504.105', 'fixed'),
-            @('11.0.0-rc.10.1', 'fixed'), @('11.0.0', 'fixed'), @('11.0.1-servicing.1', 'fixed'), @('12.0.0', 'fixed'), @('7.0.20', 'affected'), @('10.1.0', 'affected'),
+            @('11.0.0-rc.10.1', 'fixed'), @('11.0.0', 'fixed'), @('11.0.1-servicing.1', 'fixed'), @('12.0.0', 'fixed'), @('12.0.0-preview.1', 'fixed'), @('12.0.0-weird', 'affected'), @('13.0.0', 'fixed'), @('11.1.0-rc.2.1', 'affected'), @('7.0.20', 'affected'), @('10.1.0', 'affected'),
             @('10.0.13-weird.1', 'affected'), @('10.0.13x', 'affected'), @('99999999999.0.0', 'affected'), @("10.0.14`n", 'affected'), @('', 'affected'), @("$([char]0x0661)0.0.14", 'affected'), @('11.0.0-rc.0000000002.1', 'fixed'), @('11.0.0-rc.99999999999.1', 'fixed'), @('11.0.0-rc.01.1', 'affected'))
         $got = foreach ($c in $cases) { "$($c[0])=$(Get-MuxAgentRuntimeVerdict -Version $c[0])" }
         ($got -join ';') | Should BeExactly ((@($cases | ForEach-Object { "$($_[0])=$($_[1])" })) -join ';') } }
@@ -116,10 +116,11 @@ function Invoke-RuntimeScript {
     foreach ($item in @(& $pwsh -NoProfile -File (Join-Path $bin $Script) @Arguments 2>&1)) { if ($item -is [Management.Automation.ErrorRecord]) { $err.Add("$item") } else { $out.Add("$item") } }
     "$LASTEXITCODE|$($out -join ' ')|$($err -join ' ')" }
 Describe 'MuxAgents runtime entry and launcher' {
-    It 'the launcher writes the advisory to stderr; the entry and the launcher print a refusal with its advisory' {
+    It 'the launcher writes the advisory to stderr before the client runs; the entry and the launcher print a refusal with its advisory and start no client' {
+        # The stub client writes 'client ran' to stderr: its place shows the advisory came first, its absence that no client started.
         $linux = "function Get-MuxAgentPlatform { 'linux' }"; $old = "function Get-MuxAgentRuntimeVersion { '10.0.12' }"; $new = "function Get-MuxAgentRuntimeVersion { '10.0.14' }"
         $built = "function New-MuxAgentProviders { param(`$Entry) [pscustomobject]@{ StateRoot = 's' } }"; $state = "function New-MuxAgentProviders { param(`$Entry) Exit-MuxAgentCommand 2 'state' 'stub state refusal' }"
-        $tail = 'function Test-MuxAgentSpecPath { param($P, $Full) $true }', 'function Assert-MuxAgentNoReparse { param($Path) }', 'function Invoke-MuxAgentLauncher { param($P, $Spec) 7 }'
+        $tail = 'function Test-MuxAgentSpecPath { param($P, $Full) $true }', 'function Assert-MuxAgentNoReparse { param($Path) }', 'function Invoke-MuxAgentLauncher { param($P, $Spec) [Console]::Error.WriteLine(''client ran''); 7 }'
         $spec = [IO.Path]::Combine($TestDrive, 'state', 'k', 'agents', 'a', 'spec.json')
         $saved = $env:MUX_AGENTS_ALLOW_AFFECTED_DOTNET
         try {
@@ -135,4 +136,4 @@ Describe 'MuxAgents runtime entry and launcher' {
         $adv = '.NET 10.0.12 is affected by GHSA-2j93-m82w-73j2; running because MUX_AGENTS_ALLOW_AFFECTED_DOTNET=1.'
         $stateReply = "{`"ok`":false,`"verb`":null,`"code`":2,`"check`":`"state`",`"message`":`"stub state refusal`",`"advisory`":`"$adv`"}"
         $refusal = '{"ok":false,"verb":null,"code":2,"check":"runtime","message":"mux-agents refuses .NET 10.0.12 on linux: GHSA-2j93-m82w-73j2 (CVE-2026-96231). Install PowerShell 7.4.21, 7.5.12, 7.6.7 or later, or set MUX_AGENTS_ALLOW_AFFECTED_DOTNET=1 to run anyway."}'
-        ($got -join "`n") | Should BeExactly ((@("7||mux-agent: $adv", "2|$stateReply|", "2|$stateReply|", '7||', "2|$refusal|", "2|$refusal|")) -join "`n") } }
+        ($got -join "`n") | Should BeExactly ((@("7||mux-agent: $adv client ran", "2|$stateReply|", "2|$stateReply|", '7||client ran', "2|$refusal|", "2|$refusal|")) -join "`n") } }
