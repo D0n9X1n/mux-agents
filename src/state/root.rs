@@ -64,7 +64,7 @@ pub fn root(env: &Env, os: OsKind) -> Res<PathBuf> {
 
 /// `path` with realpath applied to its longest existing prefix; the missing rest is kept. `path` must be
 /// absolute and free of `.` and `..`, so the kept rest cannot leave the resolved prefix.
-fn real_prefix(path: &str) -> Res<PathBuf> {
+pub(crate) fn real_prefix(path: &str) -> Res<PathBuf> {
     let parts: Vec<&str> = path.split('/').filter(|p| !p.is_empty()).collect();
     if !path.starts_with('/')
         || path.contains(['\r', '\n'])
