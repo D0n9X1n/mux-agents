@@ -89,7 +89,7 @@ Describe 'MuxAgents lock order' {
             $early = if ($build.Count) { @($lock | Where-Object { $_.Extent.StartOffset -lt $build[0].Extent.EndOffset }) } else { $lock }
             "$name $($build.Count) $($lock.Count -gt 0) $($early.Count)"
         }
-        "$($script:MuxAgentVerbs.Count) $($locking.Contains('Invoke-MuxAgentCommand')) $($locking.Contains('Initialize-MuxAgentProviders')) $($locking.Contains('New-MuxAgentProviders'))|$($answers -join '|')" | Should BeExactly '8 True False False|mux-agent.ps1 1 True 0|mux-agent-launcher.ps1 1 True 0'
+        "$($script:MuxAgentVerbs.Count) $($locking.Contains('Invoke-MuxAgentCommand')) $($locking.Contains('Initialize-MuxAgentProviders')) $($locking.Contains('New-MuxAgentProviders'))|$($answers -join '|')" | Should BeExactly '9 True False False|mux-agent.ps1 1 True 0|mux-agent-launcher.ps1 1 True 0'
     }
 }
 function Set-UnixStateReplies {

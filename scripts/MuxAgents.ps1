@@ -1498,6 +1498,52 @@ function Invoke-MuxAgentWatch {
     [ordered]@{ pane = $caller.Pane; ended = $ended }
 }
 
+function Find-MuxAgentSidebar {
+    # The caller session's first pane with @agent-role sidebar and no @agent-id ({Pane, Window}), else $null. An agent
+    # pane that also carries the role is never the bar. Reads only.
+    param([Parameter(Mandatory)]$P, [Parameter(Mandatory)]$Caller)
+    $listed = Invoke-MuxAgentNative -P $P -Arguments @('list-panes', '-s', '-t', $Caller.Session, '-F', '#{pane_id}|#{window_id}|#{@agent-role}|#{@agent-id}')
+    foreach ($line in ([string]$listed.StdOut -split "`r?`n")) {
+        $pane, $window, $role, $id = $line -split '\|', 4
+        if ($role -ceq 'sidebar' -and [string]::IsNullOrEmpty($id) -and $pane -match '^%\d+$') { return [pscustomobject]@{ Pane = $pane; Window = $window } }
+    }
+    $null
+}
+
+function Close-MuxAgentSidebarPane {
+    # Kills Pane; true only when rmux answered 0. A refused or thrown kill is false.
+    param([Parameter(Mandatory)]$P, [Parameter(Mandatory)][string]$Pane)
+    $killed = try { Invoke-MuxAgentNative -P $P -Arguments @('kill-pane', '-t', $Pane) -AllowFailure } catch { $null }
+    $null -ne $killed -and $killed.ExitCode -eq 0
+}
+
+function Invoke-MuxAgentSidebar {
+    # sidebar [-Close]: one side bar per session, under the session's sidebar lock. Opens a 42-column split beside the
+    # caller running watch (again without -l only when the multiplexer refused the size), tagged @agent-role sidebar;
+    # an existing bar is returned with opened false; -Close kills it. Refused only from a tagged child pane. A bar is
+    # reported closed only when its kill succeeded. The split carries the pane environment (Unix: the state root), so
+    # watch reads the caller's state.
+    param([Parameter(Mandatory)]$P, [Parameter(Mandatory)]$Request)
+    $caller = Resolve-MuxAgentCaller -P $P
+    $close = [bool]$Request.Options['Close']
+    Use-MuxAgentLock -LockKey "sidebar|$($caller.ServerKey)|$($caller.Session)" -LockAction {
+        $found = Find-MuxAgentSidebar -P $P -Caller $caller
+        if ($close) {
+            if (-not $found) { return [ordered]@{ pane = $null; closed = $false } }
+            if (-not (Close-MuxAgentSidebarPane -P $P -Pane $found.Pane)) { Exit-MuxAgentCommand 1 'sidebar' "the side bar $($found.Pane) did not close; close it with kill-pane -t $($found.Pane)" }
+            return [ordered]@{ pane = $found.Pane; closed = $true }
+        }
+        if ($found) { return [ordered]@{ pane = $found.Pane; window = $found.Window; opened = $false } }
+        $command = @($P.Pwsh, '-NoProfile', '-File', $P.Entry, 'watch')
+        $split = @('split-window', '-d', '-h', '-P', '-F', '#{pane_id}|#{window_id}', '-t', $caller.Pane) + @(Get-MuxAgentPaneEnvironment -P $P)
+        $created = Invoke-MuxAgentNative -P $P -Arguments ($split + @('-l', '42') + $command)
+        if (-not (([string]$created.StdOut).TrimEnd("`r`n") -match '^(%\d+)\|(@\d+)$')) { Exit-MuxAgentCommand 1 'rmux' 'rmux did not name the side-bar pane' }
+        $pane = $Matches[1]; $window = $Matches[2]
+        $null = Invoke-MuxAgentNative -P $P -Arguments @('set-option', '-p', '-t', $pane, '@agent-role', 'sidebar')
+        [ordered]@{ pane = $pane; window = $window; opened = $true }
+    }
+}
+
 # The pane launcher.
 
 $script:MuxAgentScrub = @('CLAUDECODE', 'CLAUDE_CODE_SESSION_ID', 'CLAUDE_CODE_MESSAGING_SOCKET', 'CLAUDE_CODE_MESSAGING_TOKEN', 'CLAUDE_CODE_CHILD_SESSION',
@@ -1585,6 +1631,7 @@ Register-MuxAgentVerb -Verb 'send' -Handler 'Invoke-MuxAgentSend' -Values @('Bod
 Register-MuxAgentVerb -Verb 'read' -Handler 'Invoke-MuxAgentRead' -Values @('Wait', 'Lines') -Min 0 -Max 1 -Usage 'usage: mux-agent read [-Wait <seconds>] | read <name> [-Lines <n>] [-Text]'
 Register-MuxAgentVerb -Verb 'stop' -Handler 'Invoke-MuxAgentStop' -Min 1 -Max 1 -Usage 'usage: mux-agent stop <name> [-Text]'
 Register-MuxAgentVerb -Verb 'status' -Handler 'Invoke-MuxAgentStatus' -Values @('Body', 'BodyFile') -Usage 'usage: mux-agent status (-Body <text> | -BodyFile <path>) [-Text]'
+Register-MuxAgentVerb -Verb 'sidebar' -Handler 'Invoke-MuxAgentSidebar' -Switches @('Close') -Usage 'usage: mux-agent sidebar [-Close] [-Text]'
 Register-MuxAgentVerb -Verb 'watch' -Handler 'Invoke-MuxAgentWatch' -Usage 'usage: mux-agent watch [-Text]'
 
 # Unix member bodies (B2, B3, B4); they load everywhere and run only in the linux and macos member sets.

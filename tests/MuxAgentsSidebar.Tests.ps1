@@ -263,3 +263,133 @@ finally { [Console]::OutputEncoding = $saved }
                 $run = Invoke-SidebarVerb $fake @('watch')
                 "$($global:sidebarOrder -join ';') | $($run.Code) $($run.Reply.pane) $($run.Reply.ended)" | Should BeExactly 'utf8;writer True;watch %7 True | 0 %7 pane-closed' }
             finally { Remove-Variable -Name sidebarOrder -Scope Global } } } }
+
+# The watch split's pane environment as the argv text after the caller target: '' on Windows, ' -e MUX_AGENTS_STATE=<root>' on Unix.
+function Get-SidebarPaneEnvironment { param($Fake) $environment = @(Get-MuxAgentPaneEnvironment -P $Fake); if ($environment.Count) { ' ' + ($environment -join ' ') } else { '' } }
+
+Describe 'MuxAgents sidebar verb' {
+    It 'registers sidebar with -Close' {
+        # Catches: sidebar unregistered, -Close missing, a positional accepted.
+        $request = ConvertFrom-MuxAgentArgs -Arguments @('sidebar', '-Close')
+        "$($request.Verb) $($request.Handler) $($request.Options['Close'])" | Should BeExactly 'sidebar Invoke-MuxAgentSidebar True'
+        $run = Invoke-SidebarVerb (New-SidebarFake 'sidebar usage') @('sidebar', 'x')
+        "$($run.Code) $($run.Reply.check) $($run.Reply.message)" | Should BeExactly '2 usage usage: mux-agent sidebar [-Close] [-Text]' }
+    It 'opens a 42-column split beside the caller running watch, tagged @agent-role sidebar and nothing else' {
+        # Catches: -v for -h, no -d, another size, the split not at the caller pane, no watch argument, another entry,
+        # another tag key or value, an @agent-id set (it would count toward the cap and list), the search not session-wide.
+        $fake = New-SidebarFake 'open'; $panes = Add-SidebarMux $fake
+        $run = Invoke-SidebarVerb $fake @('sidebar')
+        "$($run.Code) $($run.Reply.pane) $($run.Reply.window) $($run.Reply.opened) $(@($run.Reply.PSObject.Properties.Name) -join ',')" | Should BeExactly '0 %7 @5 True ok,verb,pane,window,opened'
+        Get-SidebarCalls $fake | Should BeExactly ("$script:SidebarList`n" +
+            "-N split-window -d -h -P -F #{pane_id}|#{window_id} -t %1$(Get-SidebarPaneEnvironment $fake) -l 42 $($fake.Pwsh) -NoProfile -File $($fake.Entry) watch`n" +
+            '-N set-option -p -t %7 @agent-role sidebar')
+        Get-SidebarRoles $panes | Should BeExactly '%1=|,%2=other|,%7=sidebar|' }
+    Context 'sidebar pane environment' {
+        It 'passes the pane environment to the watch split, so the bar reads the caller''s state root' {
+            # Catches: a split without Get-MuxAgentPaneEnvironment (on Linux and macOS a tmux pane gets the server's
+            # environment, so watch would read another state root and show no agent), the arguments after -l or the command.
+            Mock Get-MuxAgentPaneEnvironment { '-e'; 'MUX_AGENTS_STATE=marker' }
+            $fake = New-SidebarFake 'open env'; $null = Add-SidebarMux $fake
+            $run = Invoke-SidebarVerb $fake @('sidebar')
+            "$($run.Code) $(@($fake.Calls | Where-Object { $_[1] -eq 'split-window' } | ForEach-Object { $_ -join ' ' }) -join ';')" |
+                Should BeExactly "0 -N split-window -d -h -P -F #{pane_id}|#{window_id} -t %1 -e MUX_AGENTS_STATE=marker -l 42 $($fake.Pwsh) -NoProfile -File $($fake.Entry) watch" } }
+    It 'a second call, from another pane of the session, returns the same pane with opened false and splits nothing' {
+        # Catches: a second bar, the search limited to the caller pane, opened true on reuse.
+        $fake = New-SidebarFake 'reuse'; $panes = Add-SidebarMux $fake -Open
+        $fake.Env['TMUX_PANE'] = '%2'; $fake.Env['RMUX_PANE'] = '%2'
+        $run = Invoke-SidebarVerb $fake @('sidebar')
+        "$($run.Code) $($run.Reply.pane) $($run.Reply.window) $($run.Reply.opened)" | Should BeExactly '0 %7 @5 False'
+        Get-SidebarCalls $fake | Should BeExactly $script:SidebarList
+        Get-SidebarRoles $panes | Should BeExactly '%1=|,%2=other|,%7=sidebar|' }
+    It '-Close kills the side bar; with none it answers closed false and kills nothing' {
+        # Catches: -Close ignored (opens one), killing the caller pane or the other-role pane, a kill when there is none.
+        $fake = New-SidebarFake 'close'; $panes = Add-SidebarMux $fake -Open
+        $first = Invoke-SidebarVerb $fake @('sidebar', '-Close'); $calls = Get-SidebarCalls $fake; $fake.Calls.Clear()
+        $second = Invoke-SidebarVerb $fake @('sidebar', '-Close')
+        "$($first.Code) $($first.Reply.pane) $($first.Reply.closed) | $($second.Code) $($second.Reply.pane) $($second.Reply.closed)" | Should BeExactly '0 %7 True | 0  False'
+        $calls | Should BeExactly "$script:SidebarList`n-N kill-pane -t %7"
+        Get-SidebarCalls $fake | Should BeExactly $script:SidebarList
+        Get-SidebarRoles $panes | Should BeExactly '%1=|,%2=other|' }
+    It 'never reuses or closes an agent pane that also has @agent-role sidebar' {
+        # Catches: a finder that ignores @agent-id (reuse returns %3 with opened false; -Close kills the agent %3).
+        $fake = New-SidebarFake 'agent bar'; $panes = Add-SidebarMux $fake -AgentBar
+        $close = Invoke-SidebarVerb $fake @('sidebar', '-Close')
+        $open = Invoke-SidebarVerb $fake @('sidebar')
+        "$($close.Code) $($close.Reply.closed) $(Get-SidebarCount $fake 'kill-pane') | $($open.Code) $($open.Reply.pane) $($open.Reply.opened) $(Get-SidebarCount $fake 'split-window')" | Should BeExactly '0 False 0 | 0 %7 True 1'
+        Get-SidebarRoles $panes | Should BeExactly '%1=|,%2=other|,%3=sidebar|cccccccccccc,%7=sidebar|' }
+    It '-Close whose kill fails or throws refuses sidebar, names the pane, and never answers closed' {
+        # Catches: closed true after a failed kill, a thrown kill escaping as internal, the pane not named.
+        $answers = foreach ($how in 'exit', 'throw') {
+            $fake = New-SidebarFake "close $how"; $panes = Add-SidebarMux $fake -Open -KillFail $how
+            $run = Invoke-SidebarVerb $fake @('sidebar', '-Close')
+            "$($run.Code) $($run.Reply.check) $($run.Reply.message) $($null -eq $run.Reply.closed) $(Get-SidebarRoles $panes)" }
+        $refused = '1 sidebar the side bar %7 did not close; close it with kill-pane -t %7 True %1=|,%2=other|,%7=sidebar|'
+        ($answers -join ';') | Should BeExactly "$refused;$refused" }
+    Context 'sidebar lock spy' {
+        It 'finds, splits and tags inside one hold of the session''s sidebar lock' {
+            # Catches: no lock, the lock under another key, the search outside the hold.
+            $fake = New-SidebarFake 'lock'; $null = Add-SidebarMux $fake
+            $server = (Resolve-MuxAgentCaller -P $fake).ServerKey
+            $global:sidebarHolds = [Collections.Generic.List[string]]::new(); $global:sidebarHeld = $false
+            $global:sidebarLock = ${function:Use-MuxAgentLock}
+            Mock Use-MuxAgentLock { $global:sidebarHolds.Add($LockKey); $global:sidebarHeld = $true; try { & $global:sidebarLock -LockKey $LockKey -LockAction $LockAction } finally { $global:sidebarHeld = $false } }
+            $rmux = $fake.Rmux
+            $fake.Rmux = { param([string[]]$Arguments) $global:sidebarHolds.Add("$($Arguments[1]) held=$($global:sidebarHeld)"); & $rmux $Arguments }.GetNewClosure()
+            try {
+                $run = Invoke-SidebarVerb $fake @('sidebar')
+                "$($run.Code) $($global:sidebarHolds -join ';')" | Should BeExactly "0 display-message held=False;sidebar|$server|`$3;list-panes held=True;split-window held=True;set-option held=True" }
+            finally { Remove-Variable -Name sidebarHolds, sidebarHeld, sidebarLock -Scope Global } } } }
+
+Describe 'MuxAgents sidebar contention' {
+    # The child: the -Native fake, whose pane table lives in Race/panes.json behind a file lock, so two processes share it.
+    # Its list-panes waits up to 3 s for the other process to list too: without one shared sidebar lock both list an
+    # empty session and both split; with it, the second process lists only after the first has tagged its bar.
+    $raceChild = @'
+param([string]$Repo, [string]$Root, [string]$Race)
+$ErrorActionPreference = 'Stop'
+. (Join-Path (Join-Path $Repo 'scripts') 'MuxAgents.ps1'); . (Join-Path (Join-Path $Repo 'tests') 'MuxAgents.TestHelpers.ps1')
+$global:RaceDir = $Race
+function global:Use-RaceState([scriptblock]$Action, $Argv) {
+    $handle = $null
+    for ($i = 0; $i -lt 400 -and -not $handle; $i++) { try { $handle = [IO.File]::Open((Join-Path $global:RaceDir 'fake.lock'), 'OpenOrCreate', 'ReadWrite', 'None') } catch { Start-Sleep -Milliseconds 25 } }
+    if (-not $handle) { throw 'fake lock' }
+    try {
+        $file = Join-Path $global:RaceDir 'panes.json'; $panes = [ordered]@{}
+        foreach ($p in ([IO.File]::ReadAllText($file) | ConvertFrom-Json).PSObject.Properties) { $panes[$p.Name] = [string]$p.Value }
+        $out = & $Action $panes $Argv
+        [IO.File]::WriteAllText($file, (ConvertTo-Json -InputObject $panes -Compress)); $out }
+    finally { $handle.Dispose() } }
+$fake = New-FakeMuxAgentProviders -Root $Root -Native
+Add-FakeRmuxRule -Fake $fake -Match '#\{window_id\}\|#\{@agent-id\}$' -StdOut "900|100|`$3|@1|`n"
+Add-FakeRmuxRule -Fake $fake -Match '^-N list-panes .*#\{@agent-role\}\|#\{@agent-id\}$' -Script {
+    $text = Use-RaceState { param($panes) @($panes.Keys | ForEach-Object { "$_|@5|$($panes[$_])`n" }) -join '' }
+    [IO.File]::WriteAllText((Join-Path $global:RaceDir "listed-$PID"), '')
+    for ($i = 0; $i -lt 30 -and @(Get-ChildItem -LiteralPath $global:RaceDir -Filter 'listed-*').Count -lt 2; $i++) { Start-Sleep -Milliseconds 100 }
+    [pscustomobject]@{ ExitCode = 0; StdOut = $text; StdErr = '' } }
+Add-FakeRmuxRule -Fake $fake -Match '^-N split-window ' -Script {
+    $pane = Use-RaceState { param($panes) $id = '%' + (7 + @($panes.Keys | Where-Object { [int]$_.Substring(1) -ge 7 }).Count); $panes[$id] = '|'; $id }
+    [pscustomobject]@{ ExitCode = 0; StdOut = "$pane|@5`n"; StdErr = '' } }
+Add-FakeRmuxRule -Fake $fake -Match '^-N set-option ' -Script { param($a) $null = Use-RaceState { param($panes, $argv) $panes[$argv[4]] = "$($argv[6])|" } $a; $null }
+[IO.File]::WriteAllText((Join-Path $Race "ready-$PID"), '')
+for ($i = 0; $i -lt 600 -and -not (Test-Path -LiteralPath (Join-Path $Race 'go')); $i++) { Start-Sleep -Milliseconds 50 }
+$r = Invoke-MuxAgentCommand -P $fake -Arguments @('sidebar')
+[IO.File]::WriteAllText((Join-Path $Race "reply-$PID"), "$($r.Code)|$($r.Text)")
+'@
+    It 'two processes that run sidebar at once get one pane: one opens it, the other is handed the same pane' {
+        # Catches: no lock, or a lock name that differs per process (for example sidebar|<pid>|...): both list an empty
+        # session, both split (%7 and %8) and both answer opened true.
+        $race = Join-Path $TestDrive 'race'; $null = [IO.Directory]::CreateDirectory($race)
+        [IO.File]::WriteAllText((Join-Path $race 'panes.json'), '{"%1":"|","%2":"other|"}')
+        $child = Join-Path $TestDrive 'race-child.ps1'; [IO.File]::WriteAllText($child, $raceChild)
+        $pwsh = [Diagnostics.Process]::GetCurrentProcess().MainModule.FileName
+        $procs = foreach ($n in 1, 2) {
+            $info = [Diagnostics.ProcessStartInfo]::new($pwsh)
+            foreach ($argument in '-NoProfile', '-File', $child, $repoRoot, (Join-Path $TestDrive 'race fake'), $race) { $info.ArgumentList.Add($argument) }
+            $info.UseShellExecute = $false; $info.RedirectStandardOutput = $true; $info.RedirectStandardError = $true; $info.CreateNoWindow = $true
+            $process = [Diagnostics.Process]::Start($info); $null = $process.StandardOutput.ReadToEndAsync(); $null = $process.StandardError.ReadToEndAsync(); $process }
+        for ($i = 0; $i -lt 600 -and @(Get-ChildItem -LiteralPath $race -Filter 'ready-*').Count -lt 2; $i++) { Start-Sleep -Milliseconds 100 }
+        [IO.File]::WriteAllText((Join-Path $race 'go'), '')
+        $exited = @($procs | ForEach-Object { $_.WaitForExit(90000) })
+        $replies = @(Get-ChildItem -LiteralPath $race -Filter 'reply-*' | ForEach-Object { $code, $json = [IO.File]::ReadAllText($_.FullName) -split '\|', 2; $r = $json | ConvertFrom-Json; [pscustomobject]@{ Code = $code; Pane = $r.pane; Opened = $r.opened } })
+        $bars = @(([IO.File]::ReadAllText((Join-Path $race 'panes.json')) | ConvertFrom-Json).PSObject.Properties | Where-Object { $_.Value -ceq 'sidebar|' } | ForEach-Object Name)
+        "$($exited -join ',') $(@($replies | ForEach-Object Code) -join ',') $(@($replies | ForEach-Object Opened | Sort-Object) -join ',') $(@($replies | ForEach-Object Pane | Select-Object -Unique) -join ',') $($bars -join ',')" | Should BeExactly 'True,True 0,0 False,True %7 %7' } }
