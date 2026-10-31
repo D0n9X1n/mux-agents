@@ -176,12 +176,11 @@ Describe 'MuxAgents foundation CI' {
         "$($concurrency.group)".Contains('${{ github.event.pull_request.number || github.sha }}') | Should Be $true
         $concurrency.'cancel-in-progress' | Should BeExactly '${{ github.event_name == ''pull_request'' }}'
     }
-    It 'has only the lint job on ubuntu and the test job on a three-OS matrix without fail-fast' {
-        "$(@($jobs.get_Keys() | Sort-Object) -join ',') $($jobs.lint.'runs-on') $($jobs.test.'runs-on')" | Should BeExactly 'lint,test ubuntu-latest ${{ matrix.os }}'
-        @($jobs.test.strategy.matrix.os | Sort-Object) -join ',' | Should BeExactly 'macos-latest,ubuntu-latest,windows-latest'
-        $failFast = $jobs.test.strategy.'fail-fast'
-        "$($failFast -is [bool]) $failFast" | Should BeExactly 'True False'
-    }
+    It 'has lint on ubuntu, test on three OSes and integration on ubuntu and macos, without fail-fast or job names' {
+        "$(@($jobs.get_Keys() | Sort-Object) -join ',') $($jobs.lint.'runs-on') $($jobs.test.'runs-on') $($jobs.integration.'runs-on')" | Should BeExactly 'integration,lint,test ubuntu-latest ${{ matrix.os }} ${{ matrix.os }}'
+        "$(@($jobs.test.strategy.matrix.os | Sort-Object) -join ',') $(@($jobs.integration.strategy.matrix.os | Sort-Object) -join ',')" | Should BeExactly 'macos-latest,ubuntu-latest,windows-latest macos-latest,ubuntu-latest'
+        # No name: key, so the checks stay 'test (<os>)' and 'integration (<os>)' as branch protection requires.
+        "$($jobs.test.strategy.'fail-fast') $($jobs.integration.strategy.'fail-fast') $($jobs.test.Contains('name')) $($jobs.integration.Contains('name'))" | Should BeExactly 'False False False False' }
     It 'skips no job or matrix entry and lets no job or step fail or time out silently' {
         $problems = @(foreach ($name in @($jobs.get_Keys())) {
             $job = $jobs[$name]
@@ -214,7 +213,7 @@ Describe 'MuxAgents foundation CI' {
         "$($lines.Count) $(@($lines | Where-Object { $_ -notmatch '@[0-9a-f]{40}\s+#\s*v?\d+(\.\d+)*\b' }) -join ' ; ')" | Should BeExactly "$($uses.Count) "
     }
     It 'checks out the repository in lint and test before any run step' {
-        $late = @(foreach ($name in 'lint', 'test') {
+        $late = @(foreach ($name in 'lint', 'test', 'integration') {
             $jobSteps = @(Get-JobSteps $name)
             $checkout = -1; $firstRun = -1
             for ($i = 0; $i -lt $jobSteps.Count; $i++) {
@@ -260,6 +259,11 @@ Describe 'MuxAgents foundation CI' {
         $last = if ($test.Count -gt 0) { $test[-1].run }
         "$last" | Should BeExactly 'pwsh -NoProfile -File tests/Invoke-MuxAgentTests.ps1'
     }
+    It 'integration installs tmux and Pester 4.10.1, then runs only the integration suites last' {
+        $it = @(Get-JobSteps 'integration'); $lines = @($it | ForEach-Object { Get-RunLines $_ })
+        $install = 'if [ "$RUNNER_OS" = Linux ]; then sudo apt-get update && sudo apt-get install -y tmux; else brew install tmux; fi'
+        "$($lines -ccontains $install) $($lines -ccontains 'tmux -V') $(@($lines | Where-Object { $_ -cmatch '^Install-Module Pester -RequiredVersion 4\.10\.1(\s|$)' }).Count)" | Should BeExactly 'True True 1'
+        "$(if ($it.Count) { $it[-1].run })" | Should BeExactly 'pwsh -NoProfile -File tests/Invoke-MuxAgentTests.ps1 -Path tests/integration -Integration' }
 }
 
 Describe 'MuxAgents foundation hygiene' {
@@ -348,7 +352,7 @@ Describe 'MuxAgents foundation hygiene' {
             "pull_request_template.md=$(Get-ReviewedHash '.github/pull_request_template.md')"
         )
         $actual -join ' ; ' | Should BeExactly (@(
-                'ci.yml=9c6c72287ca005fb59d817f6037bc2739e654edcbcaff07780b65f8259e600ac'
+                'ci.yml=18abca5b43930cd96c3286e5b2a3106299edcfad30e3fae9c28e53398ee6fa10'
                 'bug.yml=017ee31a64ba465010af2ab3fa839339ec28b7170dd3ce9df66e632e2561898a'
                 'feature.yml=c70bb8bff8d86a444995e16a182b20e4c635e1cd4002b47482dc571980f999c1'
                 'pull_request_template.md=91780120628ac4776e768af3bac521f4500f9d88298fdbc20718abfa1279ec60'
