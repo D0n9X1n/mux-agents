@@ -1417,6 +1417,44 @@ function Invoke-MuxAgentStop {
     $result
 }
 
+# Side bar (C2): the board text, the watch loop and the sidebar pane.
+
+function ConvertTo-MuxAgentBoardText {
+    # A board field made safe to draw: C0 (LF included), DEL and C1 removed, so no field can move the cursor or add a line.
+    param($Value)
+    [regex]::Replace([string]$Value, '[\x00-\x1F\x7F\u0080-\u009F]', '')
+}
+
+function Format-MuxAgentAge {
+    # Whole seconds as 59s, 59m, 23h or 1d; '?' when unknown.
+    param($Seconds)
+    if ($null -eq $Seconds) { return '?' }
+    $s = [long]$Seconds
+    if ($s -lt 60) { "${s}s" } elseif ($s -lt 3600) { "$([long][Math]::Floor($s / 60))m" } elseif ($s -lt 86400) { "$([long][Math]::Floor($s / 3600))h" } else { "$([long][Math]::Floor($s / 86400))d" }
+}
+
+function Format-MuxAgentBoard {
+    # The side-bar text of a board (Get-MuxAgentBoard): the count line, then per live agent its line and an indented
+    # doing line, per ended agent one line. Every printed field, state included, is cleaned first; lines are joined with LF.
+    param([Parameter(Mandatory)]$Board)
+    $lines = [Collections.Generic.List[string]]::new()
+    $lines.Add("mux-agents $([char]0x00B7) $([int]$Board.running) running")
+    foreach ($row in @($Board.agents)) {
+        if ($null -eq $row) { continue }
+        $name = ConvertTo-MuxAgentBoardText $row.name
+        $state = ConvertTo-MuxAgentBoardText $row.state
+        if ($state -ceq 'running') {
+            $lines.Add("$([char]0x25CF) $name  $(ConvertTo-MuxAgentBoardText $row.client)  $(Format-MuxAgentAge $row.age)")
+            $doing = (ConvertTo-MuxAgentBoardText $row.doing).Trim()
+            if ($doing) { $lines.Add("  $doing") }
+            continue
+        }
+        $ended = if ($state -ceq 'exited' -and $null -ne $row.exitCode) { "exited $(ConvertTo-MuxAgentBoardText $row.exitCode)" } else { $state }
+        $lines.Add("$([char]0x25CB) $name  $ended")
+    }
+    $lines -join "`n"
+}
+
 # The pane launcher.
 
 $script:MuxAgentScrub = @('CLAUDECODE', 'CLAUDE_CODE_SESSION_ID', 'CLAUDE_CODE_MESSAGING_SOCKET', 'CLAUDE_CODE_MESSAGING_TOKEN', 'CLAUDE_CODE_CHILD_SESSION',

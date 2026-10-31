@@ -93,3 +93,46 @@ Describe 'MuxAgents sidebar native fake' {
         $switch = (Get-Command New-FakeMuxAgentProviders).Parameters.ContainsKey('Native')
         "$($kinds -join ',') $($fake.Platform -ceq $platform) $((& $script:MuxAgentLockName 'k') -ceq (& $members.LockName 'k')) $([IO.Directory]::Exists((Join-Path $state 'mail'))) $((New-FakeMuxAgentProviders -Root (Join-Path $TestDrive 'default')).Platform) $switch" |
             Should BeExactly 'human/,agent/claude,agent/copilot True True True windows True' } }
+
+Describe 'MuxAgents sidebar format' {
+    $d = [char]0x00B7; $f = [char]0x25CF; $o = [char]0x25CB; $e = [char]27
+    $controls = -join @(@(0..31) + 127 + @(128..159) | ForEach-Object { [char]$_ })
+    It 'draws the count line, live rows with an indented doing line and ended rows with their end' {
+        # Catches: count from agents.Count (6), no blank doing skipped, exit code 0 dropped (falsy), exit code on stopped, state not shown.
+        $board = [ordered]@{ running = 2; agents = @(
+                [ordered]@{ name = 'claude-1'; client = 'claude'; state = 'running'; doing = 'parse the config'; age = 240 },
+                [ordered]@{ name = 'idle'; client = 'copilot'; state = 'running'; doing = $null; age = 5 },
+                [ordered]@{ name = 'copilot-1'; client = 'copilot'; state = 'exited'; exitCode = 0; age = 900 },
+                [ordered]@{ name = 'crashed'; client = 'claude'; state = 'exited'; exitCode = $null; age = 60 },
+                [ordered]@{ name = 'halted'; client = 'claude'; state = 'stopped'; exitCode = 7; age = 60 },
+                [ordered]@{ name = 'vanished'; client = 'claude'; state = 'lost'; age = 60 }) }
+        Format-MuxAgentBoard $board | Should BeExactly "mux-agents $d 2 running`n$f claude-1  claude  4m`n  parse the config`n$f idle  copilot  5s`n$o copilot-1  exited 0`n$o crashed  exited`n$o halted  stopped`n$o vanished  lost" }
+    It 'draws only the count line for an empty board' {
+        # Catches: a header that needs an agent, a trailing LF, a null row drawn.
+        Format-MuxAgentBoard ([ordered]@{ running = 0; agents = @() }) | Should BeExactly "mux-agents $d 0 running" }
+    It 'shows age as whole seconds, minutes, hours or days, and ? when unknown' {
+        # Catches: Round for Floor (3599 -> 60m), an off-by-one bucket edge, a null age shown as 0s.
+        (@(foreach ($s in 0, 59, 60, 3599, 3600, 86399, 86400, $null) { Format-MuxAgentAge $s }) -join ',') | Should BeExactly '0s,59s,1m,59m,1h,23h,1d,?' }
+    It 'removes every C0, DEL and C1 code point, one at a time, and keeps the code points next to them' {
+        # Catches: a narrowed cleaner that keeps U+001F or U+0080 (or any one code point), a cleaner that eats U+0020, U+007E or U+00A0.
+        # Ordinal: -cne and BeExactly compare by culture, which ignores most control characters ("a`u{1F}b" -ceq 'ab').
+        $kept = foreach ($code in @(0..31) + 127 + @(128..159)) {
+            $text = Format-MuxAgentBoard ([ordered]@{ running = 0; agents = @([ordered]@{ name = "a$([char]$code)b"; state = 'lost' }) })
+            if (-not [string]::Equals($text, "mux-agents $d 0 running`n$o ab  lost", [StringComparison]::Ordinal)) { '{0:X4}' -f $code } }
+        "[$(@($kept) -join ',')] $(Format-MuxAgentBoard ([ordered]@{ running = 0; agents = @([ordered]@{ name = "a b~$([char]0xA0)c"; state = 'lost' }) }))" | Should BeExactly "[] mux-agents $d 0 running`n$o a b~$([char]0xA0)c  lost" }
+    It 'cleans every printed field, state included, so field controls and a field LF never add a row or move the cursor' {
+        # Catches: no cleaning in the ended-state branch (state printed raw), state compared before cleaning (a running
+        # row drawn as ended), client or exit code not cleaned, LF kept (5 lines become more).
+        $board = [ordered]@{ running = 1; agents = @(
+                [ordered]@{ name = "w${controls}1"; client = "cl${controls}aude"; state = "run${controls}ning"; doing = "do${controls}ing"; age = 240 },
+                [ordered]@{ name = "x${controls}2"; state = "exi${controls}ted"; exitCode = "3$controls" },
+                [ordered]@{ name = "y${controls}3"; state = "lo${controls}st" }) }
+        $text = Format-MuxAgentBoard $board
+        "$([regex]::IsMatch($text, '[\x00-\x09\x0B-\x1F\x7F\u0080-\u009F]')) $(@($text.Split("`n")).Count)" | Should BeExactly 'False 5'
+        $text | Should BeExactly "mux-agents $d 1 running`n$f w1  claude  4m`n  doing`n$o x2  exited 3`n$o y3  lost" }
+    It 'leaves the printable rest of an escape sequence as text' {
+        # Catches: ESC kept (a live sequence), BEL or C1 kept. BeExactly alone ignores them (culture compare), hence the match.
+        $board = [ordered]@{ running = 1; agents = @([ordered]@{ name = "a$e[2J" + [char]0x9B + 'b' + [char]7; client = 'claude'; state = 'running'; doing = "do$e]0;x" + [char]7 + 'ing'; age = 240 }) }
+        $text = Format-MuxAgentBoard $board
+        "$([regex]::IsMatch($text, '[\x00-\x09\x0B-\x1F\x7F\u0080-\u009F]'))" | Should BeExactly 'False'
+        $text | Should BeExactly "mux-agents $d 1 running`n$f a[2Jb  claude  4m`n  do]0;xing" } }
