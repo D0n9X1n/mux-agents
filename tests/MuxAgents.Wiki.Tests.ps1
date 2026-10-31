@@ -275,8 +275,12 @@ Describe 'MuxAgents wiki pages' {
     }
     It 'Home states the platforms and what is not built yet, in both languages' {
         $status = foreach ($page in 'Home', 'Home-zh-CN') { @([IO.File]::ReadAllLines((Join-Path $wikiRoot "$page.md")) | Where-Object { $_ -match '^v0\.1\.0 ' }) -join ' / ' }
-        $status -join ' ; ' | Should BeExactly 'v0.1.0 is in progress. Today the code runs on Windows with rmux 0.10.0. tmux on Linux and macOS (#1) and the side bar (#4) are being built; neither is in the code yet. ; v0.1.0 正在开发中。目前代码在 Windows 上配合 rmux 0.10.0 运行。Linux 和 macOS 上的 tmux 支持（#1）与侧边栏（#4）正在构建，都还没有进入代码。'
+        $status -join ' ; ' | Should BeExactly 'v0.1.0 is in progress. The code runs on Windows with rmux 0.10.0 and on Linux and macOS with tmux 3.2 or later. The side bar (#4) is being built and is not in the code yet. ; v0.1.0 正在开发中。代码在 Windows 上配合 rmux 0.10.0 运行，在 Linux 和 macOS 上配合 tmux 3.2 或更高版本运行。侧边栏（#4）正在构建，还没有进入代码。'
     }
+    It 'Home states the Linux and macOS lock limitation of older .NET, in both languages' {
+        $want = @{ 'Home' = 'On Linux and macOS with .NET older than 8.0.32, 9.0.21 or 10.0.13, another local user can make mux-agent commands time out with check lock. Nothing leaks and no state is damaged. Use a current PowerShell.'
+            'Home-zh-CN' = '在 Linux 和 macOS 上，如果 .NET 早于 8.0.32、9.0.21 或 10.0.13，其他本地用户可以让 mux-agent 命令以 lock 检查超时。不会泄露内容，也不会损坏状态。请使用最新的 PowerShell。' }
+        (@(foreach ($page in 'Home', 'Home-zh-CN') { [IO.File]::ReadAllLines((Join-Path $wikiRoot "$page.md")) -ccontains $want[$page] }) -join ' ') | Should BeExactly 'True True' }
     It 'Design-Foundation keeps its sections, and its Chinese twin matches it line for line' {
         $en = [IO.File]::ReadAllLines((Join-Path $wikiRoot 'Design-Foundation.md'))
         @($en | Where-Object { $_ -match '^## ' }) -join ',' | Should BeExactly '## Purpose,## Decisions,## Changes,## Component map,## Behavior and its tests,## Must-pass,## Non-goals,## Prior art'
