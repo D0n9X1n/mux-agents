@@ -192,6 +192,14 @@ Describe 'MuxAgents sidebar watch loop' {
         "$ended $($frames.Count) $(Get-SidebarProbes $fake)" | Should BeExactly 'pane-closed 3 4'
         $marked = "$e[H$e[2J$($board)refresh failed`r`n"
         "$([string]::Equals($frames[0], $marked, [StringComparison]::Ordinal)) $([string]::Equals($frames[1], $marked, [StringComparison]::Ordinal)) $([string]::Equals($frames[2], $frame, [StringComparison]::Ordinal))" | Should BeExactly 'True True True' }
+    It 'ends each frame with advisory: GHSA-2j93-m82w-73j2 when P.Advisory is set, after refresh failed' {
+        # Catches: no advisory line, the advisory before refresh failed, the full advisory text instead of the id.
+        $fake = New-SidebarWatchFake 'watch advisory' -Probes 'live', 'fail', 'gone'
+        $fake.Advisory = 'ADV'
+        $frames = [Collections.Generic.List[string]]::new()
+        $ended = Start-MuxAgentWatch -P $fake -Caller (Resolve-MuxAgentCaller -P $fake) -Write (& $write $frames)
+        $tail = "advisory: GHSA-2j93-m82w-73j2`r`n"
+        "$ended $($frames.Count) $([string]::Equals($frames[0], "$e[H$e[2J$board$tail", [StringComparison]::Ordinal)) $([string]::Equals($frames[1], "$e[H$e[2J$($board)refresh failed`r`n$tail", [StringComparison]::Ordinal))" | Should BeExactly 'pane-closed 2 True True' }
     It 'ends probe-failed after 30 unknown probes in a row, even when every write succeeds' {
         # Catches: no bound (a pipe whose reader closed accepts writes, so the loop never ends: runaway), another bound.
         $fake = New-SidebarWatchFake 'watch unanswered' -Probes 'fail'

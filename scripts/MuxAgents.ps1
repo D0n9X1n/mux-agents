@@ -1533,6 +1533,7 @@ function Start-MuxAgentWatch {
         $failed = -not $live
         $text = try { $last = Format-MuxAgentBoard (Get-MuxAgentBoard -P $P -Caller $Caller -ReaderKey $reader -All -WithExitCode); $last } catch { $failed = $true; $last }
         if ($failed) { $text += "`nrefresh failed" }
+        if ($P.Advisory) { $text += "`nadvisory: GHSA-2j93-m82w-73j2" }
         try { & $Write ($clear + $text.Replace("`n", "`r`n") + "`r`n") } catch { return 'output-closed' }
         & $P.Sleep 2000
     }
