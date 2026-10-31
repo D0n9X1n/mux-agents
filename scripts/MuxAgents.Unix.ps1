@@ -210,3 +210,40 @@ function Assert-MuxAgentUnixPrivate {
     if ([int]$Facts.Mode -ne 448) { Exit-MuxAgentCommand 1 'state' "the state folder mode is $([Convert]::ToString([int]$Facts.Mode, 8)), not 700" }
     if ("$($Facts.Listing)".Contains('+') -or @($Facts.Aces).Count) { Exit-MuxAgentCommand 1 'state' 'the state folder has an extended ACL' }
 }
+function Get-MuxAgentUnixEntry {
+    # What Path itself is, without following a final link (lstat): link, directory, file or missing.
+    param([Parameter(Mandatory)][string]$Path)
+    $info = [IO.FileInfo]::new($Path)
+    if ($null -ne $info.LinkTarget) { 'link' } elseif ([IO.Directory]::Exists($Path)) { 'directory' } elseif ($info.Exists) { 'file' } else { 'missing' }
+}
+function Get-MuxAgentUnixUserId {
+    # The effective uid as digits (id -u).
+    $id = Invoke-MuxAgentUnixTool -FilePath 'id' -Arguments @('-u') -Message 'the user id cannot be read'
+    if ($id -cnotmatch '^\d+\z') { Exit-MuxAgentCommand 1 'state' 'the user id cannot be read' }
+    $id
+}
+function Get-MuxAgentUnixPathFacts {
+    # The facts Assert-MuxAgentUnixPrivate decides on, bound to one folder: stat (dev:inode, mode, uid; lstat
+    # semantics), ls -ld (macOS ls -lde: ACE lines, inherited ones too) and realpath, then stat again, which must be
+    # equal. Any failed or out-of-form read, or a folder that vanishes, refuses: an unreadable signal never passes.
+    param([Parameter(Mandatory)][string]$Path, [string]$Platform = (Get-MuxAgentPlatform))
+    $message = 'the state folder cannot be checked'
+    $kind = try { Get-MuxAgentUnixEntry -Path $Path } catch { Exit-MuxAgentCommand 1 'state' $message }
+    $facts = [pscustomobject]@{ Path = $Path; Kind = $kind; Identity = $null; Mode = $null; Owner = $null; Listing = ''; Aces = @(); Real = $null }
+    if ($kind -cne 'directory') { return $facts }
+    $macos = $Platform -ceq 'macos'
+    $statArgs = if ($macos) { @('-f', '%d:%i %Mp%Lp %u', '--', $Path) } else { @('-c', '%d:%i %a %u', '--', $Path) }
+    $first = Invoke-MuxAgentUnixTool -FilePath 'stat' -Arguments $statArgs -Message $message
+    if ($first -cnotmatch '^(\d+:\d+) ([0-7]{3,4}) (\d+)\z') { Exit-MuxAgentCommand 1 'state' $message }
+    $facts.Identity = $Matches[1]; $facts.Mode = [Convert]::ToInt32($Matches[2], 8); $facts.Owner = $Matches[3]
+    $lines = @((Invoke-MuxAgentUnixTool -FilePath 'ls' -Arguments @($(if ($macos) { '-lde' } else { '-ld' }), '--', $Path) -Message $message) -split '\n')
+    # The permission field position by position: type d, then r w x per class, with s/S (owner, group) or t/T (other).
+    if ($lines[0] -cnotmatch '^(d[r-][w-][xsS-][r-][w-][xsS-][r-][w-][xtT-][+@.]?)\s+\d+\s') { Exit-MuxAgentCommand 1 'state' $message }
+    $facts.Listing = $Matches[1]
+    $facts.Aces = @($lines | Select-Object -Skip 1)
+    $facts.Real = Invoke-MuxAgentUnixTool -FilePath 'realpath' -Arguments @('--', $Path) -Message $message
+    if (-not $facts.Real.StartsWith('/') -or $facts.Real -match '[\r\n]') { Exit-MuxAgentCommand 1 'state' $message }
+    $second = Invoke-MuxAgentUnixTool -FilePath 'stat' -Arguments $statArgs -Message $message
+    if ($second -cne $first) { Exit-MuxAgentCommand 1 'state' 'the state folder changed while it was checked' }
+    $facts
+}

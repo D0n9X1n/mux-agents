@@ -154,3 +154,49 @@ Describe 'MuxAgents unix private decision' {
         ($answers -join ';') | Should BeExactly 'ok;1 state the state folder path has a link;1 state the state folder path is a file;1 state the state folder is missing;1 state the state folder path has a link;1 state the state folder has another owner;1 state the state folder has another owner;1 state the state folder mode is 755, not 700;1 state the state folder mode is 4700, not 700;1 state the state folder mode is 1700, not 700;1 state the state folder mode is 600, not 700;1 state the state folder has an extended ACL;1 state the state folder has an extended ACL;ok;ok'
     }
 }
+Describe 'MuxAgents unix path facts' {
+    Context 'native reads mocked' {
+        Mock Get-MuxAgentUnixEntry { param($Path) if ($global:unixStateEntry -ceq 'throw') { throw [IO.IOException]::new('lstat failed') }; $global:unixStateEntry }
+        Mock Invoke-MuxAgentProcess { param($FilePath, $Arguments) Get-UnixStateReply -FilePath $FilePath -Arguments $Arguments }
+        It 'reads stat, ls and realpath, then stat again, with the flags of each OS, and the uid with id -u' {
+            $global:unixStateEntry = 'directory'
+            try {
+                $answers = foreach ($platform in 'linux', 'macos') {
+                    Set-UnixStateReplies @{ stat = "0|66:12 1700 501`n"; ls = "0|drwx-----T+ 2 u staff 64 Oct 1 12:00 /r/a+b`n 0: group:everyone inherited allow list`n"; realpath = "0|/r/a+b`n"; id = "0|501`n" }
+                    $f = Get-MuxAgentUnixPathFacts -Path '/r/a+b' -Platform $platform
+                    "$($f.Kind) $($f.Identity) $($f.Mode) $($f.Owner) $($f.Listing) [$(@($f.Aces) -join '|')] $($f.Real) $(Get-MuxAgentUnixUserId)|$($global:unixStateCalls -join ';')"
+                }
+                $same = 'directory 66:12 960 501 drwx-----T+ [ 0: group:everyone inherited allow list] /r/a+b 501'
+                ($answers -join '#') | Should BeExactly "$same|stat -c %d:%i %a %u -- /r/a+b;ls -ld -- /r/a+b;realpath -- /r/a+b;stat -c %d:%i %a %u -- /r/a+b;id -u#$same|stat -f %d:%i %Mp%Lp %u -- /r/a+b;ls -lde -- /r/a+b;realpath -- /r/a+b;stat -f %d:%i %Mp%Lp %u -- /r/a+b;id -u"
+            }
+            finally { Remove-Variable unixStateEntry, unixStateCalls, unixStateReplies -Scope Global -ErrorAction SilentlyContinue }
+        }
+        It 'reads nothing for a link, file or missing path, and refuses every failed, malformed, vanished or changed read' {
+            $good = @{ stat = '0|66:12 700 501'; ls = '0|drwx------ 2 u g 64 x /r/k'; realpath = '0|/r/k'; id = '0|501' }
+            try {
+                $quiet = foreach ($kind in 'link', 'file', 'missing') { $global:unixStateEntry = $kind; Set-UnixStateReplies $good; $f = Get-MuxAgentUnixPathFacts -Path '/r/k' -Platform linux; "$($f.Kind)/$($f.Identity)/$($global:unixStateCalls.Count)" }
+                $global:unixStateEntry = 'directory'
+                $bad = @(@{ stat = '1|66:12 700 501' }, @{ stat = 'throw' }, @{ stat = '0|66:12 700' }, @{ stat = '0|66:12 700 501 x' }, @{ ls = '0|d' }, @{ ls = '0|' }, @{ ls = '0|total 0' }, @{ ls = '0|-rw------- 1 u g 0 x /r/k' }, @{ realpath = '0|r/k' }, @{ realpath = "0|/r/k`n/x" }, @{ stat = @('0|66:12 700 501', '1|') }, @{ stat = @('0|66:12 700 501', '0|66:13 700 501') }, @{ stat = @('0|66:12 700 501', '0|66:12 777 501') })
+                $answers = @(foreach ($case in $bad) { $replies = $good.Clone(); foreach ($key in $case.Keys) { $replies[$key] = $case[$key] }; Set-UnixStateReplies $replies; Get-UnixStateRefusal { Get-MuxAgentUnixPathFacts -Path '/r/k' -Platform linux } })
+                $global:unixStateEntry = 'throw'; $answers += Get-UnixStateRefusal { Get-MuxAgentUnixPathFacts -Path '/r/k' -Platform linux }
+                foreach ($id in '0|5 01', '1|501', '0|501 ') { Set-UnixStateReplies @{ id = $id }; $answers += Get-UnixStateRefusal { Get-MuxAgentUnixUserId } }
+                $checked = '1 state the state folder cannot be checked'; $changed = '1 state the state folder changed while it was checked'
+                "$($quiet -join ',')|$($answers -join ';')" | Should BeExactly ('link//0,file//0,missing//0|' + ((@(1..11 | ForEach-Object { $checked }) + @($changed, $changed, $checked) + @(1..3 | ForEach-Object { '1 state the user id cannot be read' })) -join ';'))
+            }
+            finally { Remove-Variable unixStateEntry, unixStateCalls, unixStateReplies -Scope Global -ErrorAction SilentlyContinue }
+        }
+        It 'reads the ls permission field position by position and refuses full-length fields no file system prints' {
+            $global:unixStateEntry = 'directory'
+            try {
+                $fields = @('drwx------', 'd--x--x--t', 'drwsr-Sr-T.', 'drwx------@', 'drrrrrrrrr', 'dwwwwwwwww', 'dxxxxxxxxx', 'dtttttttttt', 'drwtrwxrwx', 'drwxrwxrws', 'dSwxrwxrwx', 'drwxrwxrwx-', 'drwx------x', 'drwx------++')
+                $answers = foreach ($field in $fields) {
+                    Set-UnixStateReplies @{ stat = '0|66:12 700 501'; ls = "0|$field 2 u g 64 x /r/k"; realpath = '0|/r/k' }
+                    Get-UnixStateRefusal { (Get-MuxAgentUnixPathFacts -Path '/r/k' -Platform linux).Listing }
+                }
+                $checked = '1 state the state folder cannot be checked'
+                ($answers -join ';') | Should BeExactly ((@('ok drwx------', 'ok d--x--x--t', 'ok drwsr-Sr-T.', 'ok drwx------@') + @(1..10 | ForEach-Object { $checked })) -join ';')
+            }
+            finally { Remove-Variable unixStateEntry, unixStateCalls, unixStateReplies -Scope Global -ErrorAction SilentlyContinue }
+        }
+    }
+}
