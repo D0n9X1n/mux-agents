@@ -280,11 +280,11 @@ function Get-MuxAgentPaneEnvironment {
     # The environment arguments for a new agent pane. On Unix a pane gets the tmux server's environment, not the caller's,
     # so a MUX_AGENTS_STATE or XDG_STATE_HOME set in the caller's shell would not reach the launcher, which would pick
     # another state root and refuse the spec; the selected root goes in with -e, and MUX_AGENTS_ALLOW_AFFECTED_DOTNET=1
-    # when the caller has it (#25). Windows: none (unchanged).
+    # when Initialize found it (#25). Windows: none (unchanged).
     param([Parameter(Mandatory)]$P)
     if ($P.Platform -ceq 'windows') { return }
     '-e'; "MUX_AGENTS_STATE=$($P.StateRoot)"
-    if ([string]::Equals([string]$P.Env['MUX_AGENTS_ALLOW_AFFECTED_DOTNET'], '1', [StringComparison]::Ordinal)) { '-e'; 'MUX_AGENTS_ALLOW_AFFECTED_DOTNET=1' }
+    if ($P.AllowAffectedDotnet) { '-e'; 'MUX_AGENTS_ALLOW_AFFECTED_DOTNET=1' }
 }
 
 function Find-MuxAgentApplication {
@@ -369,15 +369,19 @@ function ConvertTo-MuxAgentFailure {
     $failure }
 function Initialize-MuxAgentProviders {
     # The runtime check (#25), then New-MuxAgentProviders, for the entry and the launcher: a refusal comes back as Failure,
-    # never thrown, and keeps the advisory; P.Advisory is the override's advisory text or $null.
+    # never thrown, and keeps the advisory; P.Advisory is the override's advisory text or $null. P.AllowAffectedDotnet comes
+    # from the same snapshot the gate read: $P.Env ignores case, so a mux_agents_... name could otherwise mask or fake it.
     param([Parameter(Mandatory)][string]$Entry, [AllowEmptyString()][string]$Platform = (Get-MuxAgentPlatform), [AllowEmptyString()][string]$RuntimeVersion = (Get-MuxAgentRuntimeVersion))
     $ErrorActionPreference = 'Stop'
     $advisory = $null
     try {
-        $advisory = Get-MuxAgentRuntimeAdvisory -Platform $Platform -Version $RuntimeVersion -Environment ([Environment]::GetEnvironmentVariables())
+        $environment = [Environment]::GetEnvironmentVariables()
+        $advisory = Get-MuxAgentRuntimeAdvisory -Platform $Platform -Version $RuntimeVersion -Environment $environment
+        $allow = [string]::Equals([string]$environment['MUX_AGENTS_ALLOW_AFFECTED_DOTNET'], '1', [StringComparison]::Ordinal)
         $providers = New-MuxAgentProviders -Entry $Entry
         # Add-Member: a providers object without the property (a test stub) would refuse a plain assignment.
         Add-Member -InputObject $providers -NotePropertyName Advisory -NotePropertyValue $advisory -Force
+        Add-Member -InputObject $providers -NotePropertyName AllowAffectedDotnet -NotePropertyValue $allow -Force
         [pscustomobject]@{ P = $providers; Failure = $null }
     }
     catch {

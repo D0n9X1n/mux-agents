@@ -60,7 +60,13 @@ Describe 'MuxAgents runtime initialize' {
                 $got = foreach ($c in @(@('linux', '10.0.12'), @('windows', '10.0.12'), @('macos', '10.0.14'))) { $b = Initialize-MuxAgentProviders -Entry 'x/mux-agent.ps1' -Platform $c[0] -RuntimeVersion $c[1]; "$($null -eq $b.Failure) [$($b.P.Advisory)]" } }
             finally { Set-RuntimeOverride $saved }
             ($got -join ';') | Should BeExactly 'True [.NET 10.0.12 is affected by GHSA-2j93-m82w-73j2; running because MUX_AGENTS_ALLOW_AFFECTED_DOTNET=1.];True [];True []'
-            Assert-MockCalled New-MuxAgentProviders -ParameterFilter { $Entry -ceq 'x/mux-agent.ps1' } -Times 3 -Exactly -Scope It } }
+            Assert-MockCalled New-MuxAgentProviders -ParameterFilter { $Entry -ceq 'x/mux-agent.ps1' } -Times 3 -Exactly -Scope It }
+        It 'sets P.AllowAffectedDotnet from the environment the gate read: exactly 1, ordinal' {
+            $saved = $env:MUX_AGENTS_ALLOW_AFFECTED_DOTNET
+            try { $got = foreach ($value in '1', '0', "1$([char]0x200B)", $null) { Set-RuntimeOverride $value
+                    "$((Initialize-MuxAgentProviders -Entry 'x/mux-agent.ps1' -Platform linux -RuntimeVersion '10.0.14').P.AllowAffectedDotnet)" } }
+            finally { Set-RuntimeOverride $saved }
+            ($got -join ' ') | Should BeExactly 'True False False False' } }
     It 'defaults Platform and RuntimeVersion to the live readers; the entry and launcher pass only -Entry; only Initialize calls New-MuxAgentProviders' {
         $params = (Get-Command Initialize-MuxAgentProviders -CommandType Function).ScriptBlock.Ast.Body.ParamBlock.Parameters
         (@($params | ForEach-Object { "$($_.Name.VariablePath.UserPath)=$($_.DefaultValue.Extent.Text)" }) -join ' ') | Should BeExactly 'Entry= Platform=(Get-MuxAgentPlatform) RuntimeVersion=(Get-MuxAgentRuntimeVersion)'
@@ -91,6 +97,27 @@ function Get-RuntimeOverrideBuild {
 $overrideWant = ' .NET 10.0.12 is affected by GHSA-2j93-m82w-73j2; running because MUX_AGENTS_ALLOW_AFFECTED_DOTNET=1.'
 Describe 'MuxAgents runtime override on linux' -Tag 'linux' {
     It 'builds real providers on an affected version with the override and sets P.Advisory' { Get-RuntimeOverrideBuild | Should BeExactly "True linux$overrideWant" } }
+function Get-RuntimeCaseBuild {
+    # Unix names are case-sensitive: the exact name decides the gate and the pane forward alike, a lowercase one neither.
+    $names = 'MUX_AGENTS_ALLOW_AFFECTED_DOTNET', 'mux_agents_allow_affected_dotnet'
+    $saved = @{}; foreach ($n in $names + 'MUX_AGENTS_STATE') { $saved[$n] = [Environment]::GetEnvironmentVariable($n) }
+    $lock = $script:MuxAgentLockName; $p = $script:MuxAgentProviders
+    $state = Join-Path $TestDrive 'case-state'; $null = [IO.Directory]::CreateDirectory($state)
+    try {
+        $env:MUX_AGENTS_STATE = $state
+        $got = foreach ($pair in @(@('1', '0'), @($null, '1'))) {
+            [Environment]::SetEnvironmentVariable($names[0], $(if ($null -eq $pair[0]) { [NullString]::Value } else { $pair[0] }))
+            [Environment]::SetEnvironmentVariable($names[1], $pair[1])
+            $b = Initialize-MuxAgentProviders -Entry (Join-Path $repoRoot 'scripts/mux-agent.ps1') -RuntimeVersion '10.0.12'
+            if ($b.Failure) { "refused $($b.Failure.check)" } else { "$(@(Get-MuxAgentPaneEnvironment -P $b.P) -contains 'MUX_AGENTS_ALLOW_AFFECTED_DOTNET=1')" } }
+        $got -join ' ' }
+    finally {
+        foreach ($n in $saved.Keys) { [Environment]::SetEnvironmentVariable($n, $(if ($null -eq $saved[$n]) { [NullString]::Value } else { $saved[$n] })) }
+        $script:MuxAgentLockName = $lock; $script:MuxAgentProviders = $p } }
+Describe 'MuxAgents runtime override case on linux' -Tag 'linux' {
+    It 'forwards the override the gate read, not a differently cased name' { Get-RuntimeCaseBuild | Should BeExactly 'True refused runtime' } }
+Describe 'MuxAgents runtime override case on macos' -Tag 'macos' {
+    It 'forwards the override the gate read, not a differently cased name' { Get-RuntimeCaseBuild | Should BeExactly 'True refused runtime' } }
 Describe 'MuxAgents runtime override on macos' -Tag 'macos' {
     It 'builds real providers on an affected version with the override and sets P.Advisory' { Get-RuntimeOverrideBuild | Should BeExactly "True macos$overrideWant" } }
 Describe 'MuxAgents runtime replies' {

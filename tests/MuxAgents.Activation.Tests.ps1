@@ -126,9 +126,11 @@ Describe 'MuxAgents activation provider refusals' {
         finally { foreach ($k in $saved.Keys) { [Environment]::SetEnvironmentVariable($k, $(if ($null -eq $saved[$k]) { [NullString]::Value } else { $saved[$k] })) } }
         ($answers -join ';') | Should BeExactly "$want;$want" } }
 Describe 'MuxAgents activation pane environment' {
-    It 'passes the state root, and the override when the caller has exactly 1, to a new Unix pane with -e; nothing on Windows' {
-        $answers = foreach ($platform in 'windows', 'linux', 'macos') { foreach ($value in '1', '0', $null, "1$([char]0x200B)") { foreach ($advisory in $null, 'ADV') {
+    It 'passes the state root, and the override when Initialize found it, to a new Unix pane with -e; nothing on Windows' {
+        # Catches: forwarding from $P.Env, a copy that ignores case, so a mux_agents_... name could mask or fake the
+        # variable the gate read (#25). AllowAffectedDotnet decides; the Env value never does.
+        $answers = foreach ($platform in 'windows', 'linux', 'macos') { foreach ($allow in $true, $false) { foreach ($value in '1', '0', $null) {
             $vars = @{}; if ($null -ne $value) { $vars['MUX_AGENTS_ALLOW_AFFECTED_DOTNET'] = $value }
-            "[$(@(Get-MuxAgentPaneEnvironment -P ([pscustomobject]@{ Platform = $platform; StateRoot = '/s p/state'; Env = $vars; Advisory = $advisory })) -join '|')]" } } }
+            "[$(@(Get-MuxAgentPaneEnvironment -P ([pscustomobject]@{ Platform = $platform; StateRoot = '/s p/state'; Env = $vars; AllowAffectedDotnet = $allow })) -join '|')]" } } }
         $w = '[]'; $s = '[-e|MUX_AGENTS_STATE=/s p/state]'; $o = '[-e|MUX_AGENTS_STATE=/s p/state|-e|MUX_AGENTS_ALLOW_AFFECTED_DOTNET=1]'
-        ($answers -join ';') | Should BeExactly ((@($w) * 8 + @($o, $o, $s, $s, $s, $s, $s, $s) * 2) -join ';') } }
+        ($answers -join ';') | Should BeExactly ((@($w) * 6 + (@($o) * 3 + @($s) * 3) * 2) -join ';') } }
