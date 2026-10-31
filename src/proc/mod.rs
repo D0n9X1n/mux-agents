@@ -6,6 +6,8 @@ use serde_json::{Map, Value};
 
 use crate::parse::Client;
 
+#[cfg(target_os = "linux")]
+pub mod linux;
 #[cfg(target_os = "macos")]
 pub mod macos;
 pub mod seam;
@@ -76,17 +78,22 @@ pub fn host() -> Box<dyn Os> {
     Box::new(macos::MacOs)
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(target_os = "linux")]
+pub fn host() -> Box<dyn Os> {
+    Box::new(linux::Linux)
+}
+
+#[cfg(windows)]
 pub fn host() -> Box<dyn Os> {
     Box::new(Pending)
 }
 
-// Temporary by design: the Linux (T13) and Windows (T14) tables replace it. Any question leaves as 1 `internal`
+// Temporary by design: the Windows (T14) table replaces it. Any question leaves as 1 `internal`
 // rather than act on a made-up answer.
-#[cfg(not(target_os = "macos"))]
+#[cfg(windows)]
 struct Pending;
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(windows)]
 impl Os for Pending {
     fn row(&self, _: u32) -> Option<Row> {
         unimplemented!("no process table yet")
