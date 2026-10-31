@@ -186,3 +186,38 @@ Describe 'MuxAgents providers client identity' {
         Get-ProvidersRefusal { Assert-MuxAgentSpawnAllowed -P $fake -Caller $caller } | Should BeExactly "2 policy the caller's live policy is not full bypass"
     }
 }
+Describe 'MuxAgents providers state and locks' {
+    It 'windows StateRootOf and LockName are the Windows code' {
+        $members = Get-MuxAgentPlatformMembers -Platform windows
+        "$(& $members.StateRootOf @{ LOCALAPPDATA = 'L' })|$(& $members.StateRootOf @{ MUX_AGENTS_STATE = 'S'; LOCALAPPDATA = 'L' })|$(& $members.LockName 'k')" | Should BeExactly "$([IO.Path]::Combine('L', 'mux-agents', 'state'))|S|Local\MuxAgents-$((Get-MuxAgentHash 'k').Substring(0, 32))"
+    }
+    Context 'windows PrivateDirectories with recorded natives' {
+        It 'windows PrivateDirectories reads the SID once and makes each folder private with it' {
+            $members = Get-MuxAgentPlatformMembers -Platform windows
+            $global:providersCalls = [Collections.Generic.List[string]]::new()
+            Mock Get-MuxAgentUserSid { $global:providersCalls.Add('sid'); 'S-1-5-21-9' }
+            Mock New-MuxAgentPrivateDirectory { param($Sid, $Path) $global:providersCalls.Add("$Sid|$Path") }
+            try { & $members.PrivateDirectories -Paths @('A', 'A/agents'); ($global:providersCalls -join ';') | Should BeExactly 'sid;S-1-5-21-9|A;S-1-5-21-9|A/agents' }
+            finally { Remove-Variable -Name providersCalls -Scope Global }
+        }
+    }
+    It 'Get-MuxAgentStateDirectory passes its three folders to PrivateDirectories' {
+        $fake = New-FakeMuxAgentProviders
+        $seen = [Collections.Generic.List[string]]::new()
+        $fake.PrivateDirectories = { param([string[]]$Paths) $seen.AddRange($Paths) }.GetNewClosure()
+        $state = Join-Path $fake.StateRoot '0123456789abcdef'
+        Get-MuxAgentStateDirectory -P $fake -Caller ([pscustomobject]@{ ServerKey = '0123456789abcdef' }) | Should BeExactly $state
+        ($seen -join ';') | Should BeExactly "$state;$(Join-Path $state 'agents');$(Join-Path $state 'mail')"
+    }
+    It 'Use-MuxAgentLock names its mutex with the installed LockName' {
+        $saved = $script:MuxAgentLockName
+        $keys = [Collections.Generic.List[string]]::new()
+        $spyName = 'MuxAgentsSpy-' + [guid]::NewGuid().ToString('N')
+        $script:MuxAgentLockName = { param([string]$LockKey) $keys.Add($LockKey); $spyName }.GetNewClosure()
+        try {
+            $held = Use-MuxAgentLock -LockKey 'probe-key' -LockAction { $probe = $null; $found = [Threading.Mutex]::TryOpenExisting($spyName, [ref]$probe); if ($probe) { $probe.Dispose() }; $found }
+            "$held|$($keys -join ',')" | Should BeExactly 'True|probe-key'
+        }
+        finally { $script:MuxAgentLockName = $saved }
+    }
+}

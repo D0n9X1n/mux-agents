@@ -423,9 +423,8 @@ function Get-MuxAgentStateDirectory {
     # <StateRoot>\<ServerKey> and its agents and mail folders, each private to the current user, SYSTEM and
     # Administrators. An existing folder with a wider ACL is refused, not repaired.
     param([Parameter(Mandatory)]$P, [Parameter(Mandatory)]$Caller)
-    $sid = Get-MuxAgentUserSid
     $state = Join-Path $P.StateRoot $Caller.ServerKey
-    foreach ($folder in @($state, (Join-Path $state 'agents'), (Join-Path $state 'mail'))) { New-MuxAgentPrivateDirectory $sid $folder }
+    $null = & $P.PrivateDirectories -Paths @($state, (Join-Path $state 'agents'), (Join-Path $state 'mail'))
     $state
 }
 
@@ -464,7 +463,7 @@ function Use-MuxAgentLock {
     # a timeout refuses 2 'lock'. Callers take the session lock before the mailbox lock. The Lock prefix keeps these
     # names from shadowing the caller variables that LockAction reads.
     param([Parameter(Mandatory)][string]$LockKey, [Parameter(Mandatory)][scriptblock]$LockAction, [int]$LockTimeoutMilliseconds = 15000)
-    $lockMutex = [Threading.Mutex]::new($false, 'Local\MuxAgents-' +(Get-MuxAgentHash $LockKey).Substring(0, 32))
+    $lockMutex = [Threading.Mutex]::new($false, (& $script:MuxAgentLockName $LockKey))
     $lockHeld = $false
     try {
         try { $lockHeld = $lockMutex.WaitOne($LockTimeoutMilliseconds) } catch [Threading.AbandonedMutexException] { $lockHeld = $true }
