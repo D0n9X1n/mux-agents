@@ -15,7 +15,7 @@ Commits are authored and committed as `D0n9X1n <D0n9x1n@outlook.com>`. A pull re
 ## Merge procedure
 
 1. `gh pr view <n> --json headRefOid,statusCheckRollup`
-2. Every check on that `headRefOid` is `SUCCESS`, and `lint`, `test (ubuntu-latest)`, `test (macos-latest)` and `test (windows-latest)` are all present.
+2. Every check on that `headRefOid` is `SUCCESS`, and `lint`, `test (ubuntu-latest)`, `test (macos-latest)`, `test (windows-latest)`, `integration (ubuntu-latest)` and `integration (macos-latest)` are all present.
 3. `git fetch origin <sha>`, then `git push origin <sha>:main`, with `<sha>` the `headRefOid` from step 1. The push is not forced, so it lands only when `<sha>` builds on the current `main`; GitHub then marks the pull request merged.
 
 ## Releases

@@ -317,7 +317,7 @@ Describe 'MuxAgents foundation hygiene' {
         $contributing = [IO.File]::ReadAllLines((Join-Path $repoRoot 'CONTRIBUTING.md'))
         $expected = @(
             '1. `gh pr view <n> --json headRefOid,statusCheckRollup`'
-            '2. Every check on that `headRefOid` is `SUCCESS`, and `lint`, `test (ubuntu-latest)`, `test (macos-latest)` and `test (windows-latest)` are all present.'
+            '2. Every check on that `headRefOid` is `SUCCESS`, and `lint`, `test (ubuntu-latest)`, `test (macos-latest)`, `test (windows-latest)`, `integration (ubuntu-latest)` and `integration (macos-latest)` are all present.'
             '3. `git fetch origin <sha>`, then `git push origin <sha>:main`, with `<sha>` the `headRefOid` from step 1. The push is not forced, so it lands only when `<sha>` builds on the current `main`; GitHub then marks the pull request merged.'
             'Commits are authored and committed as `D0n9X1n <D0n9x1n@outlook.com>`. A pull request lands by fast-forwarding `main` to its tested head, never through a GitHub merge, which would re-author it.'
         )
@@ -325,7 +325,7 @@ Describe 'MuxAgents foundation hygiene' {
         $template = [IO.Path]::Combine($repoRoot, '.github', 'pull_request_template.md')
         $lines = [IO.File]::ReadAllLines($template)
         $checklist = @(
-            '- [ ] `gh pr view <n> --json headRefOid,statusCheckRollup`: every check on headRefOid is SUCCESS; `lint`, `test (ubuntu-latest)`, `test (macos-latest)` and `test (windows-latest)` are present'
+            '- [ ] `gh pr view <n> --json headRefOid,statusCheckRollup`: every check on headRefOid is SUCCESS; `lint`, `test (ubuntu-latest)`, `test (macos-latest)`, `test (windows-latest)`, `integration (ubuntu-latest)` and `integration (macos-latest)` are present'
             '- [ ] `git fetch origin <sha>`, then `git push origin <sha>:main`, with `<sha>` the checked headRefOid; not forced, so it lands only on the current `main`'
         )
         @($checklist | Where-Object { $lines -cnotcontains $_ }) -join ' ; ' | Should BeExactly ''
@@ -355,7 +355,7 @@ Describe 'MuxAgents foundation hygiene' {
                 'ci.yml=18abca5b43930cd96c3286e5b2a3106299edcfad30e3fae9c28e53398ee6fa10'
                 'bug.yml=017ee31a64ba465010af2ab3fa839339ec28b7170dd3ce9df66e632e2561898a'
                 'feature.yml=c70bb8bff8d86a444995e16a182b20e4c635e1cd4002b47482dc571980f999c1'
-                'pull_request_template.md=91780120628ac4776e768af3bac521f4500f9d88298fdbc20718abfa1279ec60'
+                'pull_request_template.md=84df40d505453b1ed0938b730278c8a8ac5a8b04923b996ae2d3c09a501f3f1b'
             ) -join ' ; ')
     }
     It 'tags every integration Describe integration, and no script reads the test variables' {
