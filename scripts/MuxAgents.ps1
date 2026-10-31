@@ -1195,6 +1195,25 @@ function Invoke-MuxAgentSend {
     [ordered]@{ to = $target; pane = $pane; id = $messageId }
 }
 
+function Invoke-MuxAgentStatus {
+    # An agent's one-line status in status.json in its folder, written under its agent lock. Only an agent pane with
+    # its own record in this session reports status, and only from a file.
+    param([Parameter(Mandatory)]$P, [Parameter(Mandatory)]$Request)
+    $options = $Request.Options
+    if ($options.Contains('Body') -eq $options.Contains('BodyFile')) { Exit-MuxAgentCommand 2 'usage' $script:MuxAgentVerbs['status'].Usage }
+    $caller = Resolve-MuxAgentCaller -P $P
+    $record = if ($caller.Kind -eq 'agent' -and $caller.AgentTag) { Get-MuxAgentRecord -P $P -Caller $caller -Id $caller.AgentTag }
+    if (-not $record -or $record.id -cne $caller.AgentTag -or $record.session -cne $caller.Session) { Exit-MuxAgentCommand 2 'target' 'only an agent reports status' }
+    if ($options.Contains('Body')) { Exit-MuxAgentCommand 2 'usage' 'agents pass free text only in files: use -BodyFile' }
+    $text = ConvertTo-MuxAgentDoingLine (Read-MuxAgentText -Path ([IO.Path]::Combine($P.Cwd, $options['BodyFile'])) -MaxBytes 64KB)
+    if (-not $text) { Exit-MuxAgentCommand 2 'usage' 'the status is empty' }
+    $folder = [IO.Path]::Combine((Get-MuxAgentStateDirectory -P $P -Caller $caller), 'agents', $record.id)
+    Use-MuxAgentLock -LockKey "agent|$($caller.ServerKey)|$($record.id)" -LockAction {
+        Write-MuxAgentJson -Path (Join-Path $folder 'status.json') -Value ([ordered]@{ text = $text; at = (& $P.Now).ToString('o') })
+    }
+    [ordered]@{ name = $record.name; text = $text }
+}
+
 function Invoke-MuxAgentRead {
     # read [-Wait <s>]: the caller's unread messages, waiting up to 600 s for one. read <name> [-Lines n]: the pane tail.
     param([Parameter(Mandatory)]$P, [Parameter(Mandatory)]$Request)
@@ -1349,3 +1368,4 @@ Register-MuxAgentVerb -Verb 'focus' -Handler 'Invoke-MuxAgentFocus' -Min 1 -Max 
 Register-MuxAgentVerb -Verb 'send' -Handler 'Invoke-MuxAgentSend' -Values @('Body', 'BodyFile') -Min 1 -Max 1 -Usage 'usage: mux-agent send <name|parent|%pane> (-Body <text> | -BodyFile <path>) [-Text]'
 Register-MuxAgentVerb -Verb 'read' -Handler 'Invoke-MuxAgentRead' -Values @('Wait', 'Lines') -Min 0 -Max 1 -Usage 'usage: mux-agent read [-Wait <seconds>] | read <name> [-Lines <n>] [-Text]'
 Register-MuxAgentVerb -Verb 'stop' -Handler 'Invoke-MuxAgentStop' -Min 1 -Max 1 -Usage 'usage: mux-agent stop <name> [-Text]'
+Register-MuxAgentVerb -Verb 'status' -Handler 'Invoke-MuxAgentStatus' -Values @('Body', 'BodyFile') -Usage 'usage: mux-agent status (-Body <text> | -BodyFile <path>) [-Text]'
