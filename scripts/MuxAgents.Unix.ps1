@@ -165,11 +165,25 @@ function Get-MuxAgentUnixLockName {
     param([Parameter(Mandatory)][string]$LockKey, [Parameter(Mandatory)][string]$User)
     "Global\MuxAgents-$User-" + (Get-MuxAgentHash $LockKey).Substring(0, 32)
 }
+function Resolve-MuxAgentUnixToolPath {
+    # The full path of a tool for Invoke-MuxAgentUnixTool: the first file named Name in a fully qualified PATH folder.
+    # A bare name is never started: .NET on Unix looks in the current directory before PATH, so a file of that name in
+    # the caller's project would run. Empty, '.' and relative PATH entries are skipped. None found refuses 1 'state'.
+    param([Parameter(Mandatory)][string]$Name, [AllowEmptyString()][string]$SearchPath = $env:PATH, [Parameter(Mandatory)][string]$Message)
+    foreach ($folder in $SearchPath.Split([IO.Path]::PathSeparator)) {
+        if (-not [IO.Path]::IsPathFullyQualified($folder)) { continue }
+        $candidate = [IO.Path]::Combine($folder, $Name)
+        if ([IO.File]::Exists($candidate)) { return $candidate }
+    }
+    Exit-MuxAgentCommand 1 'state' $Message
+}
 function Invoke-MuxAgentUnixTool {
-    # One native call of the Unix state code: stdout without its final newline (other whitespace is data), or a
-    # refusal 1 'state' with Message when the call cannot start, times out, exits non-zero or prints nothing.
+    # One native call of the Unix state code, by the tool's full path from PATH: stdout without its final newline (other
+    # whitespace is data), or a refusal 1 'state' with Message when the tool is not on PATH, the call cannot start,
+    # times out, exits non-zero or prints nothing.
     param([Parameter(Mandatory)][string]$FilePath, [Parameter(Mandatory)][string[]]$Arguments, [Parameter(Mandatory)][string]$Message)
-    $result = try { Invoke-MuxAgentProcess -FilePath $FilePath -Arguments $Arguments -TimeoutMilliseconds 5000 } catch { $null }
+    $image = Resolve-MuxAgentUnixToolPath -Name $FilePath -Message $Message
+    $result = try { Invoke-MuxAgentProcess -FilePath $image -Arguments $Arguments -TimeoutMilliseconds 5000 } catch { $null }
     $text = if ($result) { "$($result.StdOut)" -replace '\n\z', '' } else { '' }
     if (-not $result -or $result.ExitCode -ne 0 -or -not $text) { Exit-MuxAgentCommand 1 'state' $Message }
     $text

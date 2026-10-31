@@ -99,12 +99,36 @@ function Set-UnixStateReplies {
     foreach ($tool in $Replies.Keys) { $global:unixStateReplies[$tool] = [Collections.Generic.Queue[string]]::new([string[]]@($Replies[$tool])) }
 }
 function Get-UnixStateReply {
+    # Logged and answered by the tool's file name; the contexts mock Resolve-MuxAgentUnixToolPath to /usr/bin/<name>.
     param([string]$FilePath, [string[]]$Arguments)
-    $global:unixStateCalls.Add("$FilePath $($Arguments -join ' ')")
-    $queue = $global:unixStateReplies[$FilePath]; $reply = if ($queue.Count -gt 1) { $queue.Dequeue() } else { $queue.Peek() }
+    $tool = [IO.Path]::GetFileName($FilePath)
+    $global:unixStateCalls.Add("$tool $($Arguments -join ' ')")
+    $queue = $global:unixStateReplies[$tool]; $reply = if ($queue.Count -gt 1) { $queue.Dequeue() } else { $queue.Peek() }
     if ($reply -ceq 'throw') { throw [ComponentModel.Win32Exception]::new('spawn failed') }
     $code, $text = $reply -split '\|', 2
     [pscustomobject]@{ ExitCode = [int]$code; StdOut = $text; StdErr = '' }
+}
+Describe 'MuxAgents unix tool path' {
+    It 'takes a tool only from a fully qualified PATH folder; empty, dot and relative entries are skipped even when the file is there' {
+        $cwd = Join-Path $TestDrive 'cwd'; $good = Join-Path $TestDrive 'good'
+        foreach ($folder in $cwd, (Join-Path $cwd 'rel'), $good) { $null = [IO.Directory]::CreateDirectory($folder); [IO.File]::WriteAllText((Join-Path $folder 'tool'), '') }
+        $sep = [IO.Path]::PathSeparator; $before = [Environment]::CurrentDirectory
+        try {
+            [Environment]::CurrentDirectory = $cwd
+            $found = Get-UnixStateRefusal { Resolve-MuxAgentUnixToolPath -Name 'tool' -SearchPath (@('', '.', 'rel', $good) -join $sep) -Message 'no tool' }
+            $none = Get-UnixStateRefusal { Resolve-MuxAgentUnixToolPath -Name 'tool' -SearchPath (@('', '.', 'rel') -join $sep) -Message 'no tool' }
+            "$found|$none" | Should BeExactly "ok $(Join-Path $good 'tool')|1 state no tool"
+        }
+        finally { [Environment]::CurrentDirectory = $before }
+    }
+    Context 'tool started by full path' {
+        Mock Resolve-MuxAgentUnixToolPath { param($Name) "/usr/bin/$Name" }
+        Mock Invoke-MuxAgentProcess { param($FilePath, $Arguments) $global:unixToolStarted = $FilePath; [pscustomobject]@{ ExitCode = 0; StdOut = "501`n"; StdErr = '' } }
+        It 'starts the resolved full path, never the bare name' {
+            try { "$(Invoke-MuxAgentUnixTool -FilePath 'id' -Arguments @('-u') -Message 'm')|$global:unixToolStarted" | Should BeExactly '501|/usr/bin/id' }
+            finally { Remove-Variable unixToolStarted -Scope Global -ErrorAction SilentlyContinue }
+        }
+    }
 }
 Describe 'MuxAgents unix state root' {
     Context 'resolver mocked' {
@@ -120,6 +144,7 @@ Describe 'MuxAgents unix state root' {
         }
     }
     Context 'realpath mocked' {
+        Mock Resolve-MuxAgentUnixToolPath { param($Name) "/usr/bin/$Name" }
         Mock Invoke-MuxAgentProcess { param($FilePath, $Arguments) Get-UnixStateReply -FilePath $FilePath -Arguments $Arguments }
         It 'resolves the longest existing prefix, keeps the rest and every space, and refuses a failed or malformed answer or path' {
             Set-UnixStateReplies @{ realpath = @("0|/canon`n", "0|/`n", "0|/r/state `n", '1|/canon', "0|canon`n", "0|/a`n/b`n", '0|', 'throw') }
@@ -133,6 +158,7 @@ Describe 'MuxAgents unix state root' {
         }
     }
     Context 'prefix probe throws' {
+        Mock Resolve-MuxAgentUnixToolPath { param($Name) "/usr/bin/$Name" }
         Mock Invoke-MuxAgentProcess { param($FilePath, $Arguments) Get-UnixStateReply -FilePath $FilePath -Arguments $Arguments }
         Mock Test-Path { throw [UnauthorizedAccessException]::new('denied') }
         It 'refuses when the existing-prefix probe throws, and runs no realpath' {
@@ -166,6 +192,7 @@ Describe 'MuxAgents unix private decision' {
 Describe 'MuxAgents unix path facts' {
     Context 'native reads mocked' {
         Mock Get-MuxAgentUnixEntry { param($Path) if ($global:unixStateEntry -ceq 'throw') { throw [IO.IOException]::new('lstat failed') }; $global:unixStateEntry }
+        Mock Resolve-MuxAgentUnixToolPath { param($Name) "/usr/bin/$Name" }
         Mock Invoke-MuxAgentProcess { param($FilePath, $Arguments) Get-UnixStateReply -FilePath $FilePath -Arguments $Arguments }
         It 'reads stat, ls and realpath, then stat again, with the flags of each OS, and the uid with id -u' {
             $global:unixStateEntry = 'directory'
@@ -294,6 +321,16 @@ function New-UnixStateNativeRoot {
 }
 function Get-UnixStateMode([string]$Path) { if ([IO.Directory]::Exists($Path)) { [Convert]::ToString([int][IO.File]::GetUnixFileMode($Path), 8) } else { 'missing' } }
 function Add-UnixStateNativeTests {
+    It 'runs id from PATH, not a file named id in the current directory, even with . first on PATH' {
+        $cwd = Join-Path $TestDrive ([guid]::NewGuid().ToString('N')); $null = [IO.Directory]::CreateDirectory($cwd)
+        $planted = Join-Path $cwd 'id'; [IO.File]::WriteAllText($planted, "#!/bin/sh`necho 99999`n"); [IO.File]::SetUnixFileMode($planted, [IO.UnixFileMode]448)
+        $uid = "$(& /usr/bin/id -u)"; $before = [Environment]::CurrentDirectory; $path = $env:PATH
+        try {
+            [Environment]::CurrentDirectory = $cwd; $env:PATH = ".$([IO.Path]::PathSeparator)$path"
+            "$(Get-MuxAgentUnixUserId)" | Should BeExactly $uid
+        }
+        finally { [Environment]::CurrentDirectory = $before; $env:PATH = $path }
+    }
     It 'creates the root, the folder above it and every folder below it at exactly 0700 under umask 177' {
         $above = New-UnixStateNativeRoot; $root = "$above/state"
         $probe = Join-Path $TestDrive 'umask-probe.ps1'
