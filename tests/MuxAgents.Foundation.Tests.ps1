@@ -428,25 +428,31 @@ Describe 'MuxAgents foundation package' {
         $attributes = [IO.File]::ReadAllLines((Join-Path $repoRoot '.gitattributes'))
         @('scripts/release export-ignore', 'scripts/wiki export-ignore', 'wiki export-ignore' | Where-Object { $attributes -cnotcontains $_ }) -join ' ; ' | Should BeExactly ''
     }
+    It 'plugin.json names the pane state contract and hooks.json names register.tsx' {
+        $manifest = Get-Content -Raw ([IO.Path]::Combine($repoRoot, '.claude-plugin', 'plugin.json')) | ConvertFrom-Json
+        $hooks = Get-Content -Raw ([IO.Path]::Combine($repoRoot, 'hooks', 'hooks.json')) | ConvertFrom-Json
+        "$($manifest.types) $(@($hooks.modules) -join ',') $(Test-Path -LiteralPath ([IO.Path]::Combine($repoRoot, 'types', 'index.d.ts')))" | Should BeExactly './types/index.d.ts ./register.tsx True'
+    }
     It 'zips only the plugin files of a commit' {
         $zip = Join-Path $TestDrive 'plugin.zip'
         & ([IO.Path]::Combine($repoRoot, 'scripts', 'release', 'New-MuxAgentPackage.ps1')) -Ref HEAD -OutFile $zip
         $LASTEXITCODE | Should Be 0
         $out = Join-Path $TestDrive 'plugin'
         Expand-Archive -LiteralPath $zip -DestinationPath $out
-        $seen = foreach ($path in '.claude-plugin/plugin.json', '.claude-plugin/marketplace.json', 'skills/mux-agents/SKILL.md', 'scripts/mux-agent.ps1', 'scripts/MuxAgents.ps1', 'scripts/mux-agent-launcher.ps1', 'README.md', 'LICENSE', 'tests', '.github', 'scripts/release', 'scripts/wiki', 'wiki') { "$path=$(Test-Path -LiteralPath (Join-Path $out $path))" }
-        $seen -join ' ' | Should BeExactly '.claude-plugin/plugin.json=True .claude-plugin/marketplace.json=True skills/mux-agents/SKILL.md=True scripts/mux-agent.ps1=True scripts/MuxAgents.ps1=True scripts/mux-agent-launcher.ps1=True README.md=True LICENSE=True tests=False .github=False scripts/release=False scripts/wiki=False wiki=False'
+        $seen = foreach ($path in '.claude-plugin/plugin.json', '.claude-plugin/marketplace.json', 'skills/mux-agents/SKILL.md', 'scripts/mux-agent.ps1', 'scripts/MuxAgents.ps1', 'scripts/mux-agent-launcher.ps1', 'hooks/hooks.json', 'hooks/register.tsx', 'hooks/board.ts', 'types/index.d.ts', 'README.md', 'LICENSE', 'tests', '.github', 'scripts/release', 'scripts/wiki', 'wiki') { "$path=$(Test-Path -LiteralPath (Join-Path $out $path))" }
+        $seen -join ' ' | Should BeExactly '.claude-plugin/plugin.json=True .claude-plugin/marketplace.json=True skills/mux-agents/SKILL.md=True scripts/mux-agent.ps1=True scripts/MuxAgents.ps1=True scripts/mux-agent-launcher.ps1=True hooks/hooks.json=True hooks/register.tsx=True hooks/board.ts=True types/index.d.ts=True README.md=True LICENSE=True tests=False .github=False scripts/release=False scripts/wiki=False wiki=False'
     }
-    It 'includes hooks only when the commit has them' {
+    It 'includes hooks and types only when the commit has them' {
         $fixture = Join-Path $TestDrive 'pkg-repo'
-        $null = New-Item -ItemType Directory -Force -Path ([IO.Path]::Combine($fixture, 'scripts', 'release')), (Join-Path $fixture '.claude-plugin'), (Join-Path $fixture 'skills'), (Join-Path $fixture 'hooks')
+        $null = New-Item -ItemType Directory -Force -Path ([IO.Path]::Combine($fixture, 'scripts', 'release')), (Join-Path $fixture '.claude-plugin'), (Join-Path $fixture 'skills'), (Join-Path $fixture 'hooks'), (Join-Path $fixture 'types')
         Copy-Item ([IO.Path]::Combine($repoRoot, 'scripts', 'release', 'New-MuxAgentPackage.ps1')) ([IO.Path]::Combine($fixture, 'scripts', 'release'))
         foreach ($file in '.claude-plugin/plugin.json', 'skills/s.md', 'scripts/x.ps1', 'README.md', 'LICENSE') { [IO.File]::WriteAllText((Join-Path $fixture $file), 'x') }
         $null = & git -C $fixture init -q -b main
         $null = & git -C $fixture -c user.name=t -c user.email=t@t add -- .claude-plugin skills scripts README.md LICENSE
         $null = & git -C $fixture -c user.name=t -c user.email=t@t commit -q -m one
         [IO.File]::WriteAllText([IO.Path]::Combine($fixture, 'hooks', 'hooks.json'), '{}')
-        $null = & git -C $fixture -c user.name=t -c user.email=t@t add -- hooks
+        [IO.File]::WriteAllText([IO.Path]::Combine($fixture, 'types', 'index.d.ts'), 'x')
+        $null = & git -C $fixture -c user.name=t -c user.email=t@t add -- hooks types
         $null = & git -C $fixture -c user.name=t -c user.email=t@t commit -q -m two
         $packager = [IO.Path]::Combine($fixture, 'scripts', 'release', 'New-MuxAgentPackage.ps1')
         $result = foreach ($ref in 'HEAD~1', 'HEAD') {
@@ -455,9 +461,9 @@ Describe 'MuxAgents foundation package' {
             $code = $LASTEXITCODE
             $out = Join-Path $TestDrive "hooks-$($ref -replace '\W', '')"
             Expand-Archive -LiteralPath $zip -DestinationPath $out
-            "$ref=$code,$(Test-Path -LiteralPath ([IO.Path]::Combine($out, 'hooks', 'hooks.json')))"
+            "$ref=$code,$(Test-Path -LiteralPath ([IO.Path]::Combine($out, 'hooks', 'hooks.json'))),$(Test-Path -LiteralPath ([IO.Path]::Combine($out, 'types', 'index.d.ts')))"
         }
-        $result -join ' ' | Should BeExactly 'HEAD~1=0,False HEAD=0,True'
+        $result -join ' ' | Should BeExactly 'HEAD~1=0,False,False HEAD=0,True,True'
     }
 }
 
@@ -561,5 +567,25 @@ Describe 'MuxAgents foundation release workflow' {
         })
         # The whole with map: a path key would move the zip away from the workspace root, where gh release create reads it.
         $sequence -join ' ; ' | Should BeExactly 'download name=plugin-zip ; create ${{ github.token }} ${{ github.repository }} ${{ github.ref_name }}'
+    }
+}
+
+Describe 'MuxAgents foundation Claude Code pane' {
+    It 'runs the list invocation register.tsx builds, pwsh from PATH, and gets one JSON endpoint refusal outside a multiplexer' {
+        # Every OS runs the entry now, so the run reaches the caller check: list, exit 1, check endpoint. Catches a changed
+        # script path (pwsh prints its usage text) and a changed verb (usage, exit 2) on every runner.
+        $source = [IO.File]::ReadAllText([IO.Path]::Combine($repoRoot, 'hooks', 'register.tsx'))
+        $m = [regex]::Match($source, '\$\.process\.run\(\[([^\]]*)\]')
+        $argv = @([regex]::Matches($m.Groups[1].Value, '''([^'']*)''|`\$\{\$\.plugin\.root\}([^`]*)`') | ForEach-Object { if ($_.Groups[1].Success) { $_.Groups[1].Value } else { $repoRoot + $_.Groups[2].Value } })
+        $saved = @{ TMUX = $env:TMUX; RMUX = $env:RMUX }
+        try {
+            foreach ($name in $saved.Keys) { [Environment]::SetEnvironmentVariable($name, [NullString]::Value) }
+            $exe = (Get-Command $argv[0] -CommandType Application -ErrorAction Stop | Select-Object -First 1).Source
+            $lines = @(& $exe @($argv | Select-Object -Skip 1))
+            $code = $LASTEXITCODE
+        }
+        finally { foreach ($name in $saved.Keys) { [Environment]::SetEnvironmentVariable($name, $(if ($null -eq $saved[$name]) { [NullString]::Value } else { $saved[$name] })) } }
+        $reply = $lines[0] | ConvertFrom-Json
+        "$($argv.Count) $($lines.Count) $code $($reply.ok) $($reply.verb) $($reply.check)" | Should BeExactly '6 1 1 False list endpoint'
     }
 }
