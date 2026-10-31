@@ -159,3 +159,9 @@ function Get-MuxAgentUnixClaudeDirectory { param([Parameter(Mandatory)]$P, [Para
     if ($missing) { return $cwd }
     $session = try { ConvertFrom-Json -InputObject $text -NoEnumerate } catch { $null }
     if ($session -is [System.Management.Automation.PSCustomObject] -and $session.cwd -is [string] -and $session.cwd -ceq $cwd) { $cwd } }
+function Get-MuxAgentUnixLockName {
+    # The Unix mutex name for LockKey and the effective uid User (B4: the LockName member). No prefix means Local\,
+    # which on Unix is one session, and every tmux pane is its own session; Global\ spans sessions, the uid users.
+    param([Parameter(Mandatory)][string]$LockKey, [Parameter(Mandatory)][string]$User)
+    "Global\MuxAgents-$User-" + (Get-MuxAgentHash $LockKey).Substring(0, 32)
+}
