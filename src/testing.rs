@@ -33,6 +33,27 @@ struct Log {
     cwds: HashMap<u32, String>,
     // Starts `open` answers in turn (none: unreadable) before it falls back to the row's own.
     opens: HashMap<u32, VecDeque<Option<i64>>>,
+    // `+key` on taking a lock and `-key` on releasing it, each followed by the probe's answer when one is set.
+    locks: Vec<String>,
+    held: Vec<String>,
+    probe: Option<Rc<dyn Fn() -> String>>,
+}
+
+thread_local! {
+    // The fakes whose ctx was made last on this thread; `locked` records into them.
+    static CURRENT: RefCell<Option<Fakes>> = const { RefCell::new(None) };
+}
+
+/// Stands in for `state::lock::with_lock` in tests: records the hold in the current fakes and runs `f`. A
+/// second hold of a held key panics, as the real lock would time out on it.
+pub fn locked<T>(key: &str, f: impl FnOnce() -> Res<T>) -> Res<T> {
+    let fakes = CURRENT
+        .with(|current| current.borrow().clone())
+        .expect("a lock taken before Fakes::ctx on this thread");
+    fakes.lock_event('+', key);
+    let out = f();
+    fakes.lock_event('-', key);
+    out
 }
 
 #[derive(Clone, Default)]
@@ -55,6 +76,14 @@ impl Fakes {
             contains: contains.into(),
             output,
         });
+    }
+
+    /// A rule checked before every earlier one, so a test can change an answer mid-way.
+    pub fn mux_first(&self, contains: &str, code: i32, stdout: &str, stderr: &str) {
+        self.mux_rule(contains, code, stdout, stderr);
+        let mut log = self.0.borrow_mut();
+        let rule = log.rules.pop().expect("pushed above");
+        log.rules.insert(0, rule);
     }
 
     /// The client `client_of` names for this pid.
@@ -99,7 +128,27 @@ impl Fakes {
         self.0.borrow().slept.clone()
     }
 
+    /// The lock events `locked` recorded, in order.
+    pub fn locks(&self) -> Vec<String> {
+        self.0.borrow().locks.clone()
+    }
+
+    /// Runs at every lock event; its answer is added to the event, so a test sees state while a lock is held.
+    pub fn lock_probe(&self, probe: impl Fn() -> String + 'static) {
+        self.0.borrow_mut().probe = Some(Rc::new(probe));
+    }
+
+    /// Forgets the recorded OS, multiplexer, sleep and lock calls.
+    pub fn clear_log(&self) {
+        let mut log = self.0.borrow_mut();
+        log.os_calls.clear();
+        log.mux_calls.clear();
+        log.slept.clear();
+        log.locks.clear();
+    }
+
     pub fn ctx(&self) -> Ctx {
+        CURRENT.with(|current| *current.borrow_mut() = Some(self.clone()));
         Ctx {
             env: Env::default(),
             pid: 4242,
@@ -118,6 +167,27 @@ impl Fakes {
 impl Fakes {
     fn os_call(&self, call: String) {
         self.0.borrow_mut().os_calls.push(call);
+    }
+
+    fn lock_event(&self, sign: char, key: &str) {
+        if sign == '+' {
+            assert!(
+                !self.0.borrow().held.iter().any(|k| k == key),
+                "lock {key} taken while held"
+            );
+        }
+        let probe = self.0.borrow().probe.clone();
+        let seen = probe.map(|probe| probe());
+        let mut log = self.0.borrow_mut();
+        if sign == '+' {
+            log.held.push(key.into());
+        } else {
+            log.held.retain(|k| k != key);
+        }
+        log.locks.push(match seen {
+            Some(seen) => format!("{sign}{key} {seen}"),
+            None => format!("{sign}{key}"),
+        });
     }
 
     fn listed(&self, pid: u32) -> Option<Row> {
