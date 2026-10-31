@@ -263,9 +263,12 @@ function Assert-MuxAgentUnixParent {
     if (($Stat.Mode -band 18) -and -not ($Stat.Mode -band 512)) { Exit-MuxAgentCommand 1 'state' 'a folder above the state folder is writable by others' }
 }
 function Invoke-MuxAgentUnixMkdir {
-    # The one mkdir of the Unix state code: the mode is given to mkdir itself, so the folder is never created wider.
-    param([Parameter(Mandatory)][string]$Path, [Parameter(Mandatory)][IO.UnixFileMode]$Mode)
-    $null = [IO.Directory]::CreateDirectory($Path, $Mode)
+    # The one mkdir of the Unix state code: mkdir(2) with the mode, so the folder is never created wider. It throws when
+    # anything is already at Path, a link included, so a link put there after the entry check is never followed.
+    param([Parameter(Mandatory)][string]$Path, [Parameter(Mandatory)][IO.UnixFileMode]$Mode, [string]$Platform = (Get-MuxAgentPlatform))
+    Import-MuxAgentUnixNative
+    $errno = if ($Platform -ceq 'macos') { [MuxAgentUnixNative]::MkdirMac($Path, [int]$Mode) } else { [MuxAgentUnixNative]::MkdirLinux($Path, [int]$Mode) }
+    if ($errno -ne 0) { throw [IO.IOException]::new("mkdir failed: errno $errno") }
 }
 function Invoke-MuxAgentUnixChmod {
     # chmod of one folder: restores the bits the umask cleared at mkdir.
@@ -275,7 +278,9 @@ function Invoke-MuxAgentUnixChmod {
 function New-MuxAgentUnixDirectory {
     # Creates Path when nothing is there (lstat), at 0700 in the mkdir call itself, so it is never wider; then chmod
     # 0700 restores what the umask cleared. Returns whether it created Path. An existing entry, link or not, is left
-    # for the caller's check. A failed entry read, mkdir or chmod refuses 1 'state'.
+    # for the caller's check. A failed entry read, mkdir or chmod refuses 1 'state'; mkdir fails on an entry that
+    # appeared after the entry read. Once mkdir succeeded, chmod reaches that folder: its parent was checked first
+    # (ours at 0700, or sticky), so no other user can rename or replace it.
     param([Parameter(Mandatory)][string]$Path)
     $kind = try { Get-MuxAgentUnixEntry -Path $Path } catch { Exit-MuxAgentCommand 1 'state' 'the state folder cannot be checked' }
     if ($kind -cne 'missing') { return $false }

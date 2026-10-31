@@ -23,6 +23,13 @@ public static class MuxAgentUnixNative {
         if (result == IntPtr.Zero) return null;
         int end = Array.IndexOf(buffer, (byte)0); return end <= 0 ? null : Encoding.UTF8.GetString(buffer, 0, end); }
     public static void Close(int fd) { LinuxClose(fd); }
+    // mkdir(2): fails with EEXIST on any existing entry, a link included, and never follows a final link (unlike
+    // Directory.CreateDirectory, which succeeds when the path is already a directory or a link to one). 0, else errno.
+    // mode_t is 32-bit on Linux and 16-bit on macOS.
+    [DllImport("libc.so.6", EntryPoint = "mkdir", SetLastError = true)] static extern int LinuxMkdir([MarshalAs(UnmanagedType.LPUTF8Str)] string path, uint mode);
+    [DllImport("/usr/lib/libSystem.dylib", EntryPoint = "mkdir", SetLastError = true)] static extern int MacMkdir([MarshalAs(UnmanagedType.LPUTF8Str)] string path, ushort mode);
+    public static int MkdirLinux(string path, int mode) { return LinuxMkdir(path, (uint)mode) == 0 ? 0 : Marshal.GetLastPInvokeError(); }
+    public static int MkdirMac(string path, int mode) { return MacMkdir(path, (ushort)mode) == 0 ? 0 : Marshal.GetLastPInvokeError(); }
     // kill(pid, 0) sends no signal; it only checks the pid. 0 when the process exists, else errno: ESRCH 3 is "no such process"
     // (3 on Linux and macOS); EPERM 1 means it exists under another user. A pid below 1 names a group, so it is EINVAL 22 here.
     [DllImport("libc.so.6", EntryPoint = "kill", SetLastError = true)] static extern int LinuxSignal(int pid, int signal);

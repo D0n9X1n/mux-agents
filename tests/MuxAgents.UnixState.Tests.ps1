@@ -249,11 +249,13 @@ Describe 'MuxAgents unix private folders' {
             finally { Remove-Variable unixStateEntry, unixStateFail, unixStateCalls -Scope Global -ErrorAction SilentlyContinue }
         }
     }
-    It 'makes folders only through one mkdir that passes the mode, so a folder is never created wider' {
+    It 'makes folders only through mkdir(2) with the mode, never CreateDirectory, which succeeds on an existing folder or link' {
         $file = [Management.Automation.Language.Parser]::ParseFile((Join-Path (Join-Path $repoRoot 'scripts') 'MuxAgents.Unix.ps1'), [ref]$null, [ref]$null)
-        $all = @($file.FindAll({ param($n) $n -is [Management.Automation.Language.InvokeMemberExpressionAst] -and "$($n.Member)" -ceq 'CreateDirectory' }, $true))
-        $mkdir = @((Get-Command Invoke-MuxAgentUnixMkdir).ScriptBlock.Ast.FindAll({ param($n) $n -is [Management.Automation.Language.InvokeMemberExpressionAst] -and "$($n.Member)" -ceq 'CreateDirectory' }, $true))
-        "$($all.Count) $($mkdir.Count) $(@($mkdir[0].Arguments).Count) $($mkdir[0].Arguments[1])" | Should BeExactly '1 1 2 $Mode'
+        $member = { param($Name) { param($n) $n -is [Management.Automation.Language.InvokeMemberExpressionAst] -and "$($n.Member)" -cmatch $Name }.GetNewClosure() }
+        $create = @($file.FindAll((& $member '^CreateDirectory$'), $true))
+        $all = @($file.FindAll((& $member '^Mkdir(Linux|Mac)$'), $true))
+        $mkdir = @((Get-Command Invoke-MuxAgentUnixMkdir).ScriptBlock.Ast.FindAll((& $member '^Mkdir(Linux|Mac)$'), $true))
+        "$($create.Count) $($all.Count) $(@($mkdir | ForEach-Object { "$($_.Member) $($_.Arguments[1])" }) -join ',')" | Should BeExactly '0 2 MkdirMac [int]$Mode,MkdirLinux [int]$Mode'
     }
 }
 function New-UnixStateNativeRoot {
@@ -299,6 +301,15 @@ function Add-UnixStateNativeTests {
         $null = [IO.Directory]::CreateSymbolicLink("$root/dangling", "$root/nowhere")
         $answers = foreach ($path in "$root/link", "$root/dangling", "$root/link/k") { Get-UnixStateRefusal { New-MuxAgentUnixPrivateDirectories -Root $root -Paths @($path) } }
         "$($answers -join '|')|$(Get-UnixStateMode "$root/nowhere")" | Should BeExactly '1 state the state folder path has a link|1 state the state folder path has a link|1 state the state folder path has a link|missing'
+    }
+    It 'refuses when a link appears after the entry check, and leaves the link target mode as it was' {
+        $base = New-UnixStateNativeRoot; $null = [IO.Directory]::CreateDirectory($base); [IO.File]::SetUnixFileMode($base, [IO.UnixFileMode]448)
+        $target = "$base/target"; $null = [IO.Directory]::CreateDirectory($target); [IO.File]::SetUnixFileMode($target, [IO.UnixFileMode]493)
+        $null = [IO.Directory]::CreateSymbolicLink("$base/k", $target)
+        $made = try { Invoke-MuxAgentUnixMkdir -Path "$base/k" -Mode ([IO.UnixFileMode]448); 'made' } catch { 'refused' }
+        Mock Get-MuxAgentUnixEntry { 'missing' }   # the link appears after the entry read
+        $answer = Get-UnixStateRefusal { New-MuxAgentUnixDirectory -Path "$base/k" }
+        "$made|$answer|$(Get-UnixStateMode $target)" | Should BeExactly 'refused|1 state the state folder cannot be created|755'
     }
     It 'refuses a folder of another owner' {
         if ((Get-MuxAgentUnixUserId) -ceq '0') { Set-ItResult -Skipped -Because 'the tests run as root, who owns /usr'; return }
