@@ -19,8 +19,10 @@ function Add-SidebarMux {
     # SplitError fails every split with that stderr; -RefuseSize fails only a split holding -l, with rmux 0.10.0's
     # words. TagFail and KillFail are 'exit' (exit 1) or 'throw' (TimeoutException, as a timed-out call). Extra adds
     # panes as given ('role|agent-id', which may hold a newline or a control character). A single-pane display-message
-    # answers from the same table, as the finder's confirmation.
-    param($Fake, [switch]$Open, [switch]$AgentBar, [switch]$RefuseSize, [string]$SplitError, [string]$TagFail, [string]$KillFail, [hashtable]$Extra)
+    # answers from the same table, as the finder's confirmation; ProbeFail ('exit' or 'throw') fails that confirmation,
+    # the first ProbeFailTimes times only.
+    param($Fake, [switch]$Open, [switch]$AgentBar, [switch]$RefuseSize, [string]$SplitError, [string]$TagFail, [string]$KillFail, [hashtable]$Extra, [string]$ProbeFail, [int]$ProbeFailTimes = [int]::MaxValue)
+    $probeFails = @($ProbeFailTimes)
     $panes = [ordered]@{ '%1' = '|'; '%2' = 'other|' }
     if ($AgentBar) { $panes['%3'] = 'sidebar|cccccccccccc' }
     if ($Open) { $panes['%7'] = 'sidebar|' }
@@ -29,6 +31,7 @@ function Add-SidebarMux {
     Add-FakeRmuxRule -Fake $Fake -Match '^-N list-panes .*#\{@agent-role\}\|#\{@agent-id\}$' -Script { [pscustomobject]@{ ExitCode = 0; StdErr = ''; StdOut = (@($panes.Keys | ForEach-Object { "$_|@5|$($panes[$_])`n" }) -join '') } }.GetNewClosure()
     Add-FakeRmuxRule -Fake $Fake -Match '^-N display-message -p -t %\d+ #\{pane_id\}\|#\{window_id\}\|#\{@agent-role\}\|#\{@agent-id\}\|end$' -Script {
         param($a) $p = $a[4]
+        if ($ProbeFail -and $probeFails[0] -gt 0) { $probeFails[0]--; return (& $fail $ProbeFail) }
         [pscustomobject]@{ ExitCode = 0; StdErr = ''; StdOut = $(if ($panes.Contains($p)) { "$p|@5|$($panes[$p])|end`n" } else { "||||end`n" }) } }.GetNewClosure()
     Add-FakeRmuxRule -Fake $Fake -Match '^-N split-window ' -Script {
         param($a)
@@ -369,6 +372,13 @@ Describe 'MuxAgents sidebar verb' {
             $close = Invoke-SidebarVerb $fake @('sidebar', '-Close')
             "$name=$($close.Code) $($close.Reply.closed) $(Get-SidebarCount $fake 'kill-pane')" }
         ($answers -join ';') | Should BeExactly 'role newline=0 False 0;id newline=0 False 0;role escape=0 False 0;forged line=0 False 0' }
+    It 'a candidate whose confirmation fails or throws refuses: no second bar is opened and nothing is closed; the next good call reuses it' {
+        # Catches: an unknown candidate taken as absent (sidebar splits %8 beside the bar %7; -Close answers no bar).
+        $answers = foreach ($how in 'exit', 'throw') {
+            $fake = New-SidebarFake "probe $how"; $panes = Add-SidebarMux $fake -Open -ProbeFail $how -ProbeFailTimes 2
+            $open = Invoke-SidebarVerb $fake @('sidebar'); $close = Invoke-SidebarVerb $fake @('sidebar', '-Close'); $again = Invoke-SidebarVerb $fake @('sidebar')
+            "$how=$($open.Code) $($open.Reply.check) $($close.Code) $($close.Reply.check) $($again.Code) $($again.Reply.pane) $($again.Reply.opened) $(Get-SidebarCount $fake 'split-window') $(Get-SidebarCount $fake 'set-option') $(Get-SidebarCount $fake 'kill-pane') $(Get-SidebarRoles $panes)" }
+        ($answers -join ';') | Should BeExactly 'exit=1 sidebar 1 sidebar 0 %7 False 0 0 0 %1=|,%2=other|,%7=sidebar|;throw=1 sidebar 1 sidebar 0 %7 False 0 0 0 %1=|,%2=other|,%7=sidebar|' }
     It '-Close whose kill fails or throws refuses sidebar, names the pane, and never answers closed' {
         # Catches: closed true after a failed kill, a thrown kill escaping as internal, the pane not named.
         $answers = foreach ($how in 'exit', 'throw') {

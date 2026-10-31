@@ -1519,7 +1519,9 @@ function Find-MuxAgentSidebar {
     # The caller session's first pane with @agent-role sidebar and no @agent-id ({Pane, Window}), else $null. An agent
     # pane that also carries the role is never the bar. list-panes only names candidates: an option value may hold a
     # newline and so forge a line. Each candidate is asked alone and must answer exactly '<pane>|<window>|sidebar||end'
-    # (ordinal), which no role or id with a newline or control character, and no pane with an id, can produce. Reads only.
+    # (ordinal), which no role or id with a newline or control character, and no pane with an id, can produce. A candidate
+    # whose probe fails or throws is unknown, not absent: it refuses 1 'sidebar', so a passing failure cannot open a second
+    # bar or hide the one to close. Reads only.
     param([Parameter(Mandatory)]$P, [Parameter(Mandatory)]$Caller)
     $listed = Invoke-MuxAgentNative -P $P -Arguments @('list-panes', '-s', '-t', $Caller.Session, '-F', '#{pane_id}|#{window_id}|#{@agent-role}|#{@agent-id}')
     $seen = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
@@ -1528,7 +1530,7 @@ function Find-MuxAgentSidebar {
         $pane = $Matches[1]
         if (-not $seen.Add($pane)) { continue }
         $probe = try { Invoke-MuxAgentNative -P $P -Arguments @('display-message', '-p', '-t', $pane, '#{pane_id}|#{window_id}|#{@agent-role}|#{@agent-id}|end') -AllowFailure } catch { $null }
-        if ($null -eq $probe -or $probe.ExitCode -ne 0) { continue }
+        if ($null -eq $probe -or $probe.ExitCode -ne 0) { Exit-MuxAgentCommand 1 'sidebar' "pane $pane could not be checked as the side bar; try again" }
         $answer = ([string]$probe.StdOut) -replace '\r?\n\z', ''
         if ($answer -cmatch '^(%\d+)\|(@\d+)\|sidebar\|\|end\z' -and [string]::Equals($Matches[1], $pane, [StringComparison]::Ordinal)) { return [pscustomobject]@{ Pane = $pane; Window = $Matches[2] } }
     }
