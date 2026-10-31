@@ -186,7 +186,8 @@ function Get-MuxAgentPlatformMembers {
             $same = ($start - $start % 10) -eq ($Caller.Agent.Start - $Caller.Agent.Start % 10)
             if ($same -and $session.sessionId -ceq $P.Env['CLAUDE_CODE_SESSION_ID']) { [string]$session.cwd }
         }
-        StopReport = { param([int[]]$Left) [ordered]@{ survivors = $Left.Count } }
+        # Left holds every tree row stop did not kill ({Pid, Reason open|start|kill, Row}); survivors counts the failed kills.
+        StopReport = { param($Left) [ordered]@{ survivors = @($Left | Where-Object { $_.Reason -ceq 'kill' }).Count } }
         StateRootOf = { param($Environment) Get-MuxAgentStateRoot -Environment $Environment }
         PrivateDirectories = {
             param([string[]]$Paths)
@@ -352,8 +353,8 @@ function Resolve-MuxAgentCaller {
     if ($agentIndex) {
         $opened = & $P.Open $chain[$agentIndex].Pid
         if ($null -eq $opened.Start) { Exit-MuxAgentCommand 1 'caller' 'agent start is unreadable' }
-        # Open keeps 100 ns and the CIM row whole microseconds; any other start is a PID reused after the snapshot.
-        if (($opened.Start - $opened.Start % 10) -ne $chain[$agentIndex].Start) { Exit-MuxAgentCommand 1 'caller' 'agent process changed' }
+        # A start that SameStart rejects is a PID reused after the snapshot.
+        if (-not (& $P.SameStart $opened.Start $chain[$agentIndex].Start)) { Exit-MuxAgentCommand 1 'caller' 'agent process changed' }
         $agent = [pscustomobject]@{ Pid = $chain[$agentIndex].Pid; Start = $opened.Start; Path = $chain[$agentIndex].Path }
     }
     [pscustomobject]@{
@@ -1172,7 +1173,7 @@ function Invoke-MuxAgentStop {
     $record = Get-MuxAgentRecord -P $P -Caller $caller -Id $pane.Id
     if (-not $record) { Exit-MuxAgentCommand 2 'target' 'no live agent has that name' }
     if ($caller.Kind -eq 'agent' -and $record.parentPane -cne $caller.Pane) { Exit-MuxAgentCommand 2 'parent' 'only the parent or a human can stop this agent' }
-    $survivors = Use-MuxAgentLock -LockKey "notice|$($caller.ServerKey)|$($record.id)" -LockAction {
+    $left = Use-MuxAgentLock -LockKey "notice|$($caller.ServerKey)|$($record.id)" -LockAction {
         $table = @{}
         foreach ($process in & $P.Processes) { $table[$process.Pid] = $process }
         $tree = [Collections.Generic.List[object]]::new()
@@ -1183,15 +1184,26 @@ function Invoke-MuxAgentStop {
             if ($table.ContainsKey($current)) { $tree.Add($table[$current]) }
             foreach ($row in $table.Values) { if ($row.ParentPid -eq $current -and $row.Pid -ne $current -and $row.Start -ge $table[$current].Start) { $queue.Enqueue($row.Pid) } }
         }
-        $opened = @(foreach ($row in $tree) { $handle = & $P.Open $row.Pid; if ($handle -and $null -ne $handle.Start -and ($handle.Start - $handle.Start % 10) -eq $row.Start) { $handle } })
+        # Every tree row that is not killed goes to StopReport with its reason: not opened, another start, or a failed kill.
+        $left = [Collections.Generic.List[object]]::new()
+        $opened = @(foreach ($row in $tree) {
+                $handle = & $P.Open $row.Pid
+                if (-not $handle) { $left.Add([pscustomobject]@{ Pid = [int]$row.Pid; Reason = 'open'; Row = $row }) }
+                elseif (-not (& $P.SameStart $handle.Start $row.Start)) { $left.Add([pscustomobject]@{ Pid = [int]$row.Pid; Reason = 'start'; Row = $row }) }
+                else { [pscustomobject]@{ Handle = $handle; Row = $row } }
+            })
         $null = Invoke-MuxAgentNative -P $P -Arguments @('kill-pane', '-t', $pane.Pane) -AllowFailure
-        $left = 0
-        foreach ($handle in $opened) { if (-not (& $P.Kill $handle)) { $left++ } }
+        foreach ($item in $opened) { if (-not (& $P.Kill $item.Handle)) { $left.Add([pscustomobject]@{ Pid = [int]$item.Row.Pid; Reason = 'kill'; Row = $item.Row }) } }
         $null = Add-MuxAgentNotice -P $P -Caller $caller -Record $record -Kind stopped
-        $left
+        , $left.ToArray()
     }
     $resume = if ($record.client -eq 'claude') { "claude --resume $($record.sessionId)" } else { "copilot --resume $($record.sessionId)" }
-    [ordered]@{ name = $record.name; pane = $pane.Pane; survivors = $survivors; directory = $record.directory; resume = $resume }
+    $result = [ordered]@{ name = $record.name; pane = $pane.Pane }
+    $report = & $P.StopReport $left
+    foreach ($key in $report.Keys) { $result[$key] = $report[$key] }
+    $result.directory = $record.directory
+    $result.resume = $resume
+    $result
 }
 
 # The pane launcher.

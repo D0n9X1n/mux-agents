@@ -221,3 +221,56 @@ Describe 'MuxAgents providers state and locks' {
         finally { $script:MuxAgentLockName = $saved }
     }
 }
+Describe 'MuxAgents providers start comparison and stop report' {
+    function New-ProvidersStopLeft {
+        param([int]$ProcessId, [string]$Reason)
+        [pscustomobject]@{ Pid = $ProcessId; Reason = $Reason; Row = $null }
+    }
+    function New-ProvidersStopFake {
+        # A human caller and the committed agent 'worker' in pane %9. Its tree is pane 300 (pwsh), 310 (claude) and
+        # 320 (node). The listed starts have nonzero units digits, so a rounded start never equals one.
+        $fake = New-FakeMuxAgentProviders
+        $fake.PrivateDirectories = { param([string[]]$Paths) foreach ($path in $Paths) { $null = [IO.Directory]::CreateDirectory($path) } }
+        Add-FakeRmuxRule -Fake $fake -Match '#\{session_id\}\|#\{@agent-id\}$' -StdOut "`$3|`n"
+        $folder = [IO.Path]::Combine((Get-MuxAgentStateDirectory -P $fake -Caller (Resolve-MuxAgentCaller -P $fake)), 'agents', 'aaaaaaaaaaaa'); $null = [IO.Directory]::CreateDirectory($folder)
+        Write-MuxAgentJson -Path (Join-Path $folder 'record.json') -Value ([ordered]@{ schema = 1; id = 'aaaaaaaaaaaa'; name = 'worker'; client = 'claude'; sessionId = '0f11fc2f-2032-48ef-a920-4af2a8e5af50'; context = 'brief'; reason = 'human'; session = '$3'; pane = '%9'; window = '@5'; parentPane = '%1'; parentAgent = $null; directory = $fake.Cwd; createdAt = 'x' })
+        Write-MuxAgentJson -Path (Join-Path $folder 'commit.json') -Value ([ordered]@{ committedAt = 'x' })
+        Add-FakeRmuxRule -Fake $fake -Match '^-N list-panes ' -StdOut "%1|@1|100||`n%9|@5|300|aaaaaaaaaaaa|worker`n"
+        $fake.Rows.Add((New-FakeMuxAgentRow 300 900 '/x/pwsh' 'pwsh')); $fake.Rows.Add((New-FakeMuxAgentRow 310 300 '/x/claude' 'claude')); $fake.Rows.Add((New-FakeMuxAgentRow 320 300 '/x/node' 'node'))
+        foreach ($row in $fake.Rows) { if ($row.Pid -eq 300) { $row.Start = 3002 } elseif ($row.Pid -eq 310) { $row.Start = 3107 } elseif ($row.Pid -eq 320) { $row.Start = 3205 } }
+        $fake.OpenResults[300] = [pscustomobject]@{ Id = 300; Start = 3007; Process = $null }; $fake.OpenResults[310] = [pscustomobject]@{ Id = 310; Start = 3104; Process = $null }; $fake.OpenResults[320] = $null
+        $fake.Survivors.Add(310)
+        $fake
+    }
+    It 'windows SameStart rounds the Open start to microseconds; StopReport counts only the rows a kill left' {
+        $members = Get-MuxAgentPlatformMembers -Platform windows
+        $left = @((New-ProvidersStopLeft 310 'kill'), (New-ProvidersStopLeft 320 'start'), (New-ProvidersStopLeft 330 'open'), (New-ProvidersStopLeft 340 'kill'))
+        "$(& $members.SameStart 1009 1000) $(& $members.SameStart 1010 1000) $(& $members.SameStart $null 0)|$(@((& $members.StopReport $left).Keys) -join ',') $((& $members.StopReport $left).survivors) $((& $members.StopReport @()).survivors) $((& $members.StopReport $null).survivors)" | Should BeExactly 'True False False|survivors 2 0 0'
+    }
+    It 'the caller passes the opened start and the listed start to SameStart unchanged and refuses when it says no' {
+        $fake = New-ProvidersAgentFake
+        foreach ($row in $fake.Rows) { if ($row.Pid -eq 150) { $row.Start = 1503 } }
+        $fake.OpenResults[150] = [pscustomobject]@{ Id = 150; Start = 1509; Process = $null }
+        $seen = [Collections.Generic.List[string]]::new()
+        $fake.SameStart = { param($Opened, $Listed) $seen.Add("$Opened/$Listed"); $true }.GetNewClosure()
+        "$((Resolve-MuxAgentCaller -P $fake).Agent.Start)|$($seen -join ',')" | Should BeExactly '1509|1509/1503'
+        $fake.SameStart = { param($Opened, $Listed) $false }
+        Get-ProvidersRefusal { Resolve-MuxAgentCaller -P $fake } | Should BeExactly '1 caller agent process changed'
+    }
+    It 'stop passes the opened and listed starts to SameStart unchanged, kills only what it accepts and replies with StopReport' {
+        $fake = New-ProvidersStopFake
+        $seen = [Collections.Generic.List[string]]::new()
+        $fake.SameStart = { param($Opened, $Listed) $seen.Add("$Opened/$Listed"); $Opened -eq 3104 }.GetNewClosure()
+        $fake.StopReport = { param($Left) [ordered]@{ survivors = 7; survivorPids = @($Left | ForEach-Object Pid | Sort-Object) } }
+        $reply = (Invoke-MuxAgentCommand -P $fake -Arguments @('stop', 'worker')).Text | ConvertFrom-Json
+        "$(@($seen | Sort-Object) -join ',')|$(@($fake.Killed) -join ',')|$($reply.survivors)|$(@($reply.survivorPids) -join ',')|$(@($reply.PSObject.Properties.Name) -join ',')" | Should BeExactly '3007/3002,3104/3107|310|7|300,310,320|ok,verb,name,pane,survivors,survivorPids,directory,resume'
+    }
+    It 'stop hands StopReport every tree row it did not kill: a changed start, an unopenable row and a failed kill' {
+        $fake = New-ProvidersStopFake
+        # 300 opens with another start, 320 cannot be opened and 310 survives its kill.
+        $fake.SameStart = { param($Opened, $Listed) $Opened -eq 3104 }
+        $fake.StopReport = { param($Left) [ordered]@{ left = @($Left | Sort-Object Pid | ForEach-Object { "$($_.Pid):$($_.Reason):$($_.Row.Path)" }) } }
+        $reply = (Invoke-MuxAgentCommand -P $fake -Arguments @('stop', 'worker')).Text | ConvertFrom-Json
+        "$($reply.ok)|$(@($reply.left) -join ',')" | Should BeExactly 'True|300:start:/x/pwsh,310:kill:/x/claude,320:open:/x/node'
+    }
+}
