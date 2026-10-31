@@ -2468,7 +2468,7 @@ Describe 'MuxAgents T1.6 spawn' -Tag 'windows' {
         function Get-MuxAgentUserSid { $log.Add("state free $(& $free)"); & $userSid }
         function Write-MuxAgentJson { param($Path, $Value) $log.Add("$([IO.Path]::GetFileName($Path)) free $(& $free)"); & $writeJson -Path $Path -Value $Value }
         (Invoke-T16Spawn $fake @('-Client', 'claude', '-Task', 'hi')).Code | Should Be 0
-        ($log -join ', ') | Should BeExactly 'state free False, server.json free False, spec.json free False, record.json free False, commit.json free False'
+        ($log -join ', ') | Should BeExactly 'state free False, server.json free False, state free False, spec.json free False, record.json free False, commit.json free False'
     }
 
     It 'A2 parentAgent holds a Copilot caller session and the exact start' {

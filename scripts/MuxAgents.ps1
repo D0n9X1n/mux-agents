@@ -736,7 +736,8 @@ function Invoke-MuxAgentSpawn {
             if (1024 + (Get-MuxAgentCommandLineLength -Arguments ([string[]]($script:MuxAgentClientFlags[$client] + $arguments))) -gt 32767) {
                 Exit-MuxAgentCommand 2 'usage' 'task is too long for the client command line'
             }
-            $null = [IO.Directory]::CreateDirectory($folder)
+            # The agent folder is made private by the platform member, as the state, agents and mail folders are.
+            $null = & $P.PrivateDirectories -Paths @($folder)
             if ($briefPath) { [IO.File]::WriteAllText($briefPath, $brief) }
             $spec = Join-Path $folder 'spec.json'
             Write-MuxAgentJson -Path $spec -Value ([ordered]@{ schema = 1; stateDirectory = $state; id = $id

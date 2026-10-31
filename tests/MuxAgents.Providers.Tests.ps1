@@ -209,6 +209,30 @@ Describe 'MuxAgents providers state and locks' {
         Get-MuxAgentStateDirectory -P $fake -Caller ([pscustomobject]@{ ServerKey = '0123456789abcdef' }) | Should BeExactly $state
         ($seen -join ';') | Should BeExactly "$state;$(Join-Path $state 'agents');$(Join-Path $state 'mail')"
     }
+    It 'spawn makes the new agent folder through PrivateDirectories, and its refusal stops the launch' {
+        # The spy creates the state, agents and mail folders and refuses the agent folder itself, so a spawn
+        # that still creates that folder on its own launches a pane instead of refusing.
+        $fake = New-FakeMuxAgentProviders
+        Add-FakeRmuxRule -Fake $fake -Match '#\{pane_height\}$' -StdOut "40`n"
+        Add-FakeRmuxRule -Fake $fake -Match '#\{session_id\}\|#\{@agent-id\}$' -StdOut "`$3|`n"
+        $seen = [Collections.Generic.List[string]]::new()
+        # Captured here: a GetNewClosure block cannot see functions dot-sourced into this test file.
+        $refuse = ${function:Exit-MuxAgentCommand}
+        $fake.PrivateDirectories = {
+            param([string[]]$Paths)
+            foreach ($path in $Paths) {
+                $seen.Add($path)
+                if ((Split-Path -Leaf $path) -match '^[0-9a-f]{12}$') { & $refuse 1 'state' 'spy refuses the agent folder' }
+                $null = [IO.Directory]::CreateDirectory($path)
+            }
+        }.GetNewClosure()
+        $task = Join-Path $fake.Cwd 'task.md'; [IO.File]::WriteAllText($task, 'do it')
+        $result = Invoke-MuxAgentCommand -P $fake -Arguments @('spawn', '-Client', 'claude', '-TaskFile', $task, '-BriefFile', $task)
+        $reply = $result.Text | ConvertFrom-Json
+        $leaf = @($seen | Where-Object { (Split-Path -Leaf $_) -match '^[0-9a-f]{12}$' })
+        $launches = @($fake.Calls | Where-Object { $_[1] -in @('new-window', 'split-window') }).Count
+        "$($result.Code)|$($reply.check)|$($leaf.Count)|$(Split-Path -Leaf (Split-Path -Parent "$($leaf[0])"))|$launches|$(if ($leaf) { [IO.Directory]::Exists($leaf[0]) })" | Should BeExactly '1|state|1|agents|0|False'
+    }
     It 'Use-MuxAgentLock names its mutex with the installed LockName' {
         $saved = $script:MuxAgentLockName
         $keys = [Collections.Generic.List[string]]::new()
@@ -351,5 +375,25 @@ Describe 'MuxAgents providers launcher' {
         $code = $LASTEXITCODE
         $seen = if (Test-Path -LiteralPath $record) { [IO.File]::ReadAllText($record) } else { 'not called' }
         "$code|$seen" | Should BeExactly "7|$([IO.Path]::Combine($TestDrive, 'state'))|$([IO.Path]::GetFullPath($spec))"
+    }
+    It 'scripts/mux-agent-launcher.ps1 exits 2 and never runs the launcher when Test-MuxAgentSpecPath refuses' {
+        # Same harness, with a spy that refuses. The launcher body records a file if it runs at all.
+        $bin = Join-Path $TestDrive 'launcher-refuse'
+        $null = [IO.Directory]::CreateDirectory($bin)
+        Copy-Item -LiteralPath (Join-Path $repoRoot 'scripts/mux-agent-launcher.ps1') -Destination $bin
+        $ran = Join-Path $TestDrive 'launcher-ran.txt'
+        $spec = [IO.Path]::Combine($TestDrive, 'state', 'agents', 'a', 'spec.json')
+        $core = [IO.Path]::Combine($repoRoot, 'scripts', 'MuxAgents.ps1').Replace("'", "''")
+        [IO.File]::WriteAllLines((Join-Path $bin 'MuxAgents.ps1'), [string[]]@(
+            ". '$core'"
+            "function New-MuxAgentProviders { param(`$Entry) [pscustomobject]@{ StateRoot = '$(([IO.Path]::Combine($TestDrive, 'state')).Replace("'", "''"))' } }"
+            'function Test-MuxAgentSpecPath { param($P, $Full) $false }'
+            'function Assert-MuxAgentNoReparse { param($Path) }'
+            "function Invoke-MuxAgentLauncher { param(`$P, `$Spec) [IO.File]::WriteAllText('$($ran.Replace("'", "''"))', 'ran'); 7 }"
+        ))
+        $pwsh = [Diagnostics.Process]::GetCurrentProcess().MainModule.FileName
+        $errors = @(& $pwsh -NoProfile -File (Join-Path $bin 'mux-agent-launcher.ps1') $spec 2>&1 | ForEach-Object { "$_" })
+        $code = $LASTEXITCODE
+        "$code|$($errors -join ' ')|$(Test-Path -LiteralPath $ran)" | Should BeExactly '2|mux-agent: the launch spec is outside the state folder|False'
     }
 }
