@@ -24,7 +24,7 @@
   - `unread`：调用者尚未读取的、来自该代理的消息数。计数不会移动调用者的读取偏移。
   - `-All` 加入本会话已结束的代理，最新的在前，最多 10 个。
   - 结果增加 `running`，即存活代理的数量。
-- **`sidebar [-Close]`。** 只有从带标签的子窗格（设置了 `AgentTag`）运行时才拒绝（`tagged`）；Claude Code 或 Copilot 主聊天（未带标签的代理调用者）和普通 shell 都可以运行。在调用者旁打开 `split-window -d -h -l 42`，运行 `pwsh -NoProfile -File <entry> watch`（若 rmux 拒绝 `-l`，则去掉它重试），标签为 `@agent-role sidebar`。每个会话一个：已存在时返回它并带 `opened: false`；`-Close` 关闭它。它没有 `@agent-id`，所以不计入上限，也不出现在 `list` 中。
+- **`sidebar [-Close]`。** 只有从带标签的子窗格（设置了 `AgentTag`）运行时才拒绝（`tagged`）；Claude Code 或 Copilot 主聊天（未带标签的代理调用者）和普通 shell 都可以运行。在调用者旁打开 `split-window -d -h -l 42`，运行 `pwsh -NoProfile -File <entry> watch`（若 rmux 拒绝 `-l`，则去掉它重试），标签为 `@agent-role sidebar`。每个会话一个：已存在时返回它并带 `opened: false`；`-Close` 关闭它。每个候选窗格都由它自己的探测确认，无法检查的候选窗格以 `1 sidebar` 拒绝，而不是视为不存在。它没有 `@agent-id`，所以不计入上限，也不出现在 `list` 中。
 - **`watch`。** 侧边栏循环：每 2 秒询问它自己的窗格，在进程内读取数据源并重绘（ANSI 归位并清屏）一行计数 `mux-agents · 3 running`，然后为每个代理绘制 `● claude-1  claude  4m` 和缩进的 `doing` 行；已结束的代理显示 `○ copilot-1  exited 0`。由纯函数 `Format-MuxAgentBoard` 生成文本。读取面板失败或对其窗格的探测没有应答之后绘制的帧以 `refresh failed` 结尾。窗格消失时它以 `pane-closed` 结束，写入失败时以 `output-closed` 结束，连续 30 次探测没有应答（一分钟）后以 `probe-failed` 结束。它只向终端绘制：标准输出被重定向时它以 `usage` 拒绝，所以它只作为侧边栏窗格自己的命令运行。
 
 `spawn` 把 `taskLine`（任务的第一个非空行，80 个字符）写入 `record.json`。代理的 `send` 在发送者的文件夹中写入 `last-sent.json`（`line`、`at`）。每个 `doing` 来源（状态、最后一行、任务行）在存储前都经过 `ConvertTo-MuxAgentMessageText` 并去掉制表符，`Format-MuxAgentBoard` 在绘制前再次去除 C0、DEL 和 C1 控制字符。
