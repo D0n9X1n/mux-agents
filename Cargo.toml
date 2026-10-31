@@ -1,0 +1,38 @@
+[package]
+name = "mux-agent"
+version = "0.2.0"
+edition = "2024"
+rust-version = "1.89"
+license = "MIT"
+publish = false
+
+[[bin]]
+name = "mux-agent"
+path = "src/main.rs"
+
+[[bin]]
+name = "fake-client"
+path = "src/bin/fake-client.rs"
+required-features = ["live"]
+
+[features]
+# MUX_AGENTS_TEST_PANIC=dispatch|lock panics there.
+test-panic = []
+# tests/live.rs, the fake-client bin and the spawn audit log.
+live = []
+
+[dependencies]
+serde_json = { version = "1.0.145", features = ["preserve_order"] }
+sha2 = "0.11"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2.177"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Threading", "Win32_System_Diagnostics_ToolHelp", "Win32_Security", "Win32_Security_Authorization", "Win32_Security_Cryptography", "Win32_Storage_FileSystem", "Win32_System_Console", "Wdk_System_Threading"] }
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
+panic = "unwind"

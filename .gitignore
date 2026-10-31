@@ -4,3 +4,7 @@
 # Local browser captures and test output.
 /.playwright-mcp/
 /TestResults/
+
+# Cargo build output and local plans and specs.
+/target/
+/docs/
