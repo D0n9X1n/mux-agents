@@ -1146,6 +1146,12 @@ function Add-MuxAgentNotice {
     $true
 }
 
+function Test-MuxAgentPaneGone {
+    # A gone pane answers display-message with exit 0 and empty fields (rmux 0.10.0, tmux 3.2+). A failed, timed-out
+    # or other answer is no proof, so the agent waits for the next sweep.
+    param($Probe)
+    $null -ne $Probe -and $Probe.ExitCode -eq 0 -and ([string]$Probe.StdOut).TrimEnd("`r`n") -ceq '|' }
+
 function Update-MuxAgentNotices {
     # Posts 'lost' for each committed agent of the caller's session whose pane is gone and that has no notice yet.
     param([Parameter(Mandatory)]$P, [Parameter(Mandatory)]$Caller)
@@ -1161,7 +1167,7 @@ function Update-MuxAgentNotices {
             # The snapshot may predate a spawn that committed since: ask the agent's own pane before calling it gone.
             # Only a clean answer with an empty pane id means gone; a live pane or a failed probe waits for the next try.
             $probe = Invoke-MuxAgentNative -P $P -Arguments @('display-message', '-p', '-t', $record.pane, '#{pane_id}|#{@agent-id}') -AllowFailure
-            if ($probe.ExitCode -ne 0 -or -not ([string]$probe.StdOut).StartsWith('|')) { return }
+            if (-not (Test-MuxAgentPaneGone $probe)) { return }
             $exit = Read-MuxAgentJson -Path (Join-Path $folder 'launcher.json')
             if ($exit -and $null -ne $exit.exitCode) { $null = Add-MuxAgentNotice -P $P -Caller $Caller -Record $record -Kind exited -ExitCode $exit.exitCode }
             else { $null = Add-MuxAgentNotice -P $P -Caller $Caller -Record $record -Kind lost }

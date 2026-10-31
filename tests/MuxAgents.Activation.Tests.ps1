@@ -86,3 +86,20 @@ Describe 'MuxAgents activation unix members' {
             finally { $script:MuxAgentProviders = $saved; $script:MuxAgentUnixKernel = $null; $script:MuxAgentUnixUser = $null } }
     }
 }
+Describe 'MuxAgents activation gone pane' {
+    It 'only a clean probe that answers an empty pane id and tag is gone' {
+        $answers = foreach ($probe in @(@(0, "|`n"), @(0, '|'), @(1, "|`n"), @(0, "%9|aaaaaaaaaaaa`n"), @(0, "|x`n"), @(0, ''))) { "$(Test-MuxAgentPaneGone ([pscustomobject]@{ ExitCode = $probe[0]; StdOut = $probe[1] }))" }
+        "$($answers -join ',') $(Test-MuxAgentPaneGone $null)" | Should BeExactly 'True,True,False,False,False,False False' }
+    It 'the notice sweep posts lost only on a gone answer, never on a failed or thrown probe' {
+        $answers = foreach ($case in @(@(0, "|`n"), @(1, "|`n"), @(1, "can't find pane: %9`n"), @(0, "|x`n"), @(0, 'throw'))) {
+            $fake = New-FakeMuxAgentProviders -Root (Join-Path $TestDrive ([guid]::NewGuid().ToString('N')))
+            $fake.PrivateDirectories = { param([string[]]$Paths) foreach ($path in $Paths) { $null = [IO.Directory]::CreateDirectory($path) } }
+            $caller = Resolve-MuxAgentCaller -P $fake
+            $folder = [IO.Path]::Combine((Get-MuxAgentStateDirectory -P $fake -Caller $caller), 'agents', 'aaaaaaaaaaaa'); $null = [IO.Directory]::CreateDirectory($folder)
+            Write-MuxAgentJson -Path (Join-Path $folder 'record.json') -Value ([ordered]@{ schema = 1; id = 'aaaaaaaaaaaa'; name = 'worker'; client = 'claude'; sessionId = '0f11fc2f-2032-48ef-a920-4af2a8e5af50'; context = 'brief'; reason = 'human'; session = '$3'; pane = '%9'; window = '@5'; parentPane = '%1'; parentAgent = $null; directory = $fake.Cwd; createdAt = 'x' })
+            Write-MuxAgentJson -Path (Join-Path $folder 'commit.json') -Value ([ordered]@{ committedAt = 'x' })
+            if ($case[1] -ceq 'throw') { Add-FakeRmuxRule -Fake $fake -Match '#\{pane_id\}\|#\{@agent-id\}$' -Script { throw [TimeoutException]::new('slow') } }
+            else { Add-FakeRmuxRule -Fake $fake -Match '#\{pane_id\}\|#\{@agent-id\}$' -ExitCode $case[0] -StdOut $case[1] }
+            $ran = try { Update-MuxAgentNotices -P $fake -Caller $caller; 'ran' } catch { 'threw' }
+            "$ran/$([IO.File]::Exists((Join-Path $folder 'notice.json')))" }
+        ($answers -join ',') | Should BeExactly 'ran/True,ran/False,ran/False,ran/False,threw/False' } }
