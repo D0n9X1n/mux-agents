@@ -147,6 +147,16 @@ function Get-MuxAgentRuntimeVerdict {
     if ($fixed) { 'fixed' } else { 'affected' }
 }
 
+function Get-MuxAgentRuntimeAdvisory {
+    # $null on Windows or a fixed .NET; on an affected Linux or macOS .NET, the advisory text when the override is exactly
+    # 1, else a 2 'runtime' refusal (#25).
+    param([AllowEmptyString()][string]$Platform, [AllowEmptyString()][string]$Version, [Parameter(Mandatory)][Collections.IDictionary]$Environment)
+    if ($Platform -cnotin 'linux', 'macos' -or (Get-MuxAgentRuntimeVerdict -Version $Version) -ceq 'fixed') { return $null }
+    # Ordinal: -ceq is culture-aware and would take '1' followed by an ignorable character such as U+200B.
+    if ([string]::Equals([string]$Environment['MUX_AGENTS_ALLOW_AFFECTED_DOTNET'], '1', [StringComparison]::Ordinal)) { return ".NET $Version is affected by GHSA-2j93-m82w-73j2; running because MUX_AGENTS_ALLOW_AFFECTED_DOTNET=1." }
+    Exit-MuxAgentCommand 2 'runtime' "mux-agents refuses .NET $Version on ${Platform}: GHSA-2j93-m82w-73j2 (CVE-2026-96231). Install PowerShell 7.4.21, 7.5.12, 7.6.7 or later, or set MUX_AGENTS_ALLOW_AFFECTED_DOTNET=1 to run anyway."
+}
+
 function Get-MuxAgentEntryRefusal {
     # The entry's one-line reply on a platform mux-agents does not run on; $null on windows, linux and macos.
     param([AllowEmptyString()][string]$Platform)

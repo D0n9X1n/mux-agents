@@ -21,3 +21,12 @@ Describe 'MuxAgents runtime version' {
         $live = [Reflection.CustomAttributeExtensions]::GetCustomAttribute([object].Assembly, [Reflection.AssemblyInformationalVersionAttribute]).InformationalVersion
         $read = Get-MuxAgentRuntimeVersion
         "$($read -ceq $live) $(($read -split '[-+]', 2)[0] -ceq [Environment]::Version.ToString(3)) $($read -cne $PSVersionTable.PSVersion.ToString())" | Should BeExactly 'True True True' } }
+Describe 'MuxAgents runtime advisory' {
+    It 'returns $null on Windows or a fixed .NET, the advisory for an exact 1, and refuses 2 runtime otherwise' {
+        $got = foreach ($c in @(@('windows', '10.0.12', 'unset'), @('linux', '10.0.13', 'unset'), @('linux', '10.0.13', '1'), @('macos', '10.0.13', '1'), @('linux', '10.0.12', '1'), @('macos', '10.0.12', '1'),
+                @('linux', '10.0.12', 'true'), @('linux', '10.0.12', '0'), @('linux', '10.0.12', ''), @('macos', '10.0.12', 'unset'), @('macos', '10.0.13', 'unset'), @('linux', '10.0.12', "1$([char]0x200B)"))) {
+            $vars = @{}; if ($c[2] -cne 'unset') { $vars['MUX_AGENTS_ALLOW_AFFECTED_DOTNET'] = $c[2] }
+            Get-RuntimeOutcome { Get-MuxAgentRuntimeAdvisory -Platform $c[0] -Version $c[1] -Environment $vars } }
+        $text = 'text .NET 10.0.12 is affected by GHSA-2j93-m82w-73j2; running because MUX_AGENTS_ALLOW_AFFECTED_DOTNET=1.'
+        $refuse = { param($os) "2 runtime mux-agents refuses .NET 10.0.12 on ${os}: GHSA-2j93-m82w-73j2 (CVE-2026-96231). Install PowerShell 7.4.21, 7.5.12, 7.6.7 or later, or set MUX_AGENTS_ALLOW_AFFECTED_DOTNET=1 to run anyway." }
+        ($got -join "`n") | Should BeExactly ((@('null', 'null', 'null', 'null', $text, $text, (& $refuse linux), (& $refuse linux), (& $refuse linux), (& $refuse macos), 'null', (& $refuse linux))) -join "`n") } }
