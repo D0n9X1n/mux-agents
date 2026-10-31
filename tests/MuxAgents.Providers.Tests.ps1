@@ -129,3 +129,39 @@ Describe 'MuxAgents providers shells' {
         Get-ProvidersRefusal { Resolve-MuxAgentCaller -P $fake } | Should BeExactly '2 caller caller runs under a non-shell process'
     }
 }
+Describe 'MuxAgents providers argv and claude directory' {
+    Context 'windows Argv with a recorded split' {
+        It 'windows Argv returns the split elements of the row command line as an array' {
+            Mock Split-MuxAgentCommandLine { param($CommandLine) @(('<' + $CommandLine + '>'), 'x') }
+            $argv = (Get-MuxAgentPlatformMembers -Platform windows).Argv
+            $full = & $argv ([pscustomobject]@{ CommandLine = '"C:/c.exe" --model m' })
+            $empty = & $argv ([pscustomobject]@{ CommandLine = $null })
+            "$($full.Count)|$($full[0])|$($full[1])|$($empty.Count)|$($empty[0])|$($empty[1])" | Should BeExactly '2|<"C:/c.exe" --model m>|x|2|<>|x'
+        }
+    }
+    It 'Assert-MuxAgentSpawnAllowed reads client argv from Argv and refuses when it throws' {
+        $fake = New-ProvidersAgentFake
+        $fake.Argv = { param($Row) @('claude', "--argv-of-$($Row.Pid)") }
+        $caller = Resolve-MuxAgentCaller -P $fake
+        Get-ProvidersRefusal { Assert-MuxAgentSpawnAllowed -P $fake -Caller $caller } | Should BeExactly '2 flags the flag --argv-of-150 is not allowed for a spawning agent'
+        $fake.Argv = { param($Row) throw 'unreadable' }
+        Get-ProvidersRefusal { Assert-MuxAgentSpawnAllowed -P $fake -Caller $caller } | Should BeExactly '2 flags a client command line cannot be read'
+    }
+    It 'windows ClaudeDirectory takes cwd from sessions/<pid>.json only on equal microsecond start and session id' {
+        $fake = New-FakeMuxAgentProviders
+        Write-FakeMuxAgentFile ([IO.Path]::Combine($fake.Home, '.claude', 'sessions', '150.json')) @('{"sessionId":"s1","cwd":"/w","procStart":"1503"}')
+        $dir = (Get-MuxAgentPlatformMembers -Platform windows).ClaudeDirectory
+        $answers = foreach ($pair in @(@(1509, 's1'), @(1500, 's1'), @(1510, 's1'), @(1500, 's2'))) {
+            $fake.Env['CLAUDE_CODE_SESSION_ID'] = $pair[1]; "$(& $dir $fake ([pscustomobject]@{ Agent = [pscustomobject]@{ Pid = 150; Start = $pair[0] } }))"
+        }
+        ($answers -join ',') | Should BeExactly '/w,/w,,'
+    }
+    It 'Get-MuxAgentLaunchDirectory takes the Claude directory from ClaudeDirectory' {
+        $fake = New-FakeMuxAgentProviders
+        $fake.ClaudeDirectory = { param($P, $Caller) if ($Caller.Agent.Pid -eq 4242) { [string]$TestDrive } }
+        $caller = [pscustomobject]@{ Client = 'claude'; Agent = [pscustomobject]@{ Pid = 4242; Start = 1 } }
+        "$(Get-MuxAgentLaunchDirectory -P $fake -Caller $caller)" | Should BeExactly ([string]$TestDrive)
+        $caller.Agent.Pid = 4243
+        Get-ProvidersRefusal { Get-MuxAgentLaunchDirectory -P $fake -Caller $caller } | Should BeExactly "2 directory the caller's launch directory cannot be confirmed"
+    }
+}

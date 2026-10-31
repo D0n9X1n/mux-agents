@@ -918,13 +918,7 @@ function Get-MuxAgentLaunchDirectory {
     param([Parameter(Mandatory)]$P, [Parameter(Mandatory)]$Caller)
     $directory = $null
     try {
-        if ($Caller.Client -eq 'claude') {
-            $session = Read-MuxAgentJson -Path ([IO.Path]::Combine($P.Home, '.claude', 'sessions', "$($Caller.Agent.Pid).json"))
-            # procStart is a FILETIME; compare at whole microseconds like the process table.
-            $start = [long]$session.procStart
-            $same = ($start - $start % 10) -eq ($Caller.Agent.Start - $Caller.Agent.Start % 10)
-            if ($same -and $session.sessionId -ceq $P.Env['CLAUDE_CODE_SESSION_ID']) { $directory = [string]$session.cwd }
-        }
+        if ($Caller.Client -eq 'claude') { $directory = & $P.ClaudeDirectory $P $Caller }
         else {
             $session = [string]$P.Env['COPILOT_AGENT_SESSION_ID']
             if ($session -match $script:MuxAgentSessionIdPattern) {
@@ -947,7 +941,7 @@ function Assert-MuxAgentSpawnAllowed {
     for ($index = $agentIndex; $index -ge 0 -and $index -lt $Caller.Chain.Count; $index++) {
         $row = $Caller.Chain[$index]
         if ([IO.Path]::GetFileName($row.Path) -notin @('claude.exe', 'copilot.exe')) { continue }
-        $argv = try { @(Split-MuxAgentCommandLine -CommandLine ([string]$row.CommandLine)) } catch { Exit-MuxAgentCommand 2 'flags' 'a client command line cannot be read' }
+        $argv = try { @(& $P.Argv $row) } catch { Exit-MuxAgentCommand 2 'flags' 'a client command line cannot be read' }
         if ($index -eq $agentIndex) { $agentArgv = $argv }
         foreach ($argument in @($argv | Select-Object -Skip 1)) {
             if (-not $argument.StartsWith('-')) { continue }
