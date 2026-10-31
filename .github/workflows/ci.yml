@@ -59,8 +59,11 @@ jobs:
         run: pwsh -NoProfile -File tests/Invoke-MuxAgentTests.ps1
       # The Rust rewrite's own tests, so its Linux and Windows code runs on those hosts.
       - name: Rust 1.95.0
+        shell: bash
         run: rustup toolchain install 1.95.0 --profile minimal --component clippy,rustfmt && rustup default 1.95.0
+      # bash -e on every OS: under pwsh only the last command's exit code counts, which hid a Windows failure.
       - name: Rust tests
+        shell: bash
         run: |
           cargo fmt --check
           cargo clippy --all-targets --features test-panic --locked -- -D warnings

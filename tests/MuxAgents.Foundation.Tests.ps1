@@ -381,7 +381,7 @@ Describe 'MuxAgents foundation hygiene' {
             "pull_request_template.md=$(Get-ReviewedHash '.github/pull_request_template.md')"
         )
         $actual -join ' ; ' | Should BeExactly (@(
-                'ci.yml=9dda3efdce369256dfdc8d91b946c02f0a778fdffb92111a42f3662e9bbc45d7'
+                'ci.yml=5dcd7a83c2ba6e582ea58f3beed0f4a6014925dab3890bec4c4c8d4e008def21'
                 'bug.yml=017ee31a64ba465010af2ab3fa839339ec28b7170dd3ce9df66e632e2561898a'
                 'feature.yml=c70bb8bff8d86a444995e16a182b20e4c635e1cd4002b47482dc571980f999c1'
                 'pull_request_template.md=84df40d505453b1ed0938b730278c8a8ac5a8b04923b996ae2d3c09a501f3f1b'
