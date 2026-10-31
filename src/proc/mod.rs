@@ -13,6 +13,7 @@ pub mod macos;
 pub mod seam;
 #[cfg(unix)]
 pub mod unix;
+pub mod windows;
 
 /// One process. `start` is the kernel's own unit (spec D1); `path` the real executable; `argv` none when unreadable.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -85,47 +86,5 @@ pub fn host() -> Box<dyn Os> {
 
 #[cfg(windows)]
 pub fn host() -> Box<dyn Os> {
-    Box::new(Pending)
-}
-
-// Temporary by design: the Windows (T14) table replaces it. Any question leaves as 1 `internal`
-// rather than act on a made-up answer.
-#[cfg(windows)]
-struct Pending;
-
-#[cfg(windows)]
-impl Os for Pending {
-    fn row(&self, _: u32) -> Option<Row> {
-        unimplemented!("no process table yet")
-    }
-    fn table(&self) -> io::Result<Vec<Row>> {
-        unimplemented!("no process table yet")
-    }
-    fn open(&self, _: u32) -> Option<Opened> {
-        unimplemented!("no process table yet")
-    }
-    fn kill(&self, _: Opened) -> bool {
-        unimplemented!("no process table yet")
-    }
-    fn cwd(&self, _: u32) -> Option<String> {
-        unimplemented!("no process table yet")
-    }
-    fn client_of(&self, _: &Row) -> Option<Client> {
-        unimplemented!("no process table yet")
-    }
-    fn is_shell(&self, _: &Row) -> bool {
-        unimplemented!("no process table yet")
-    }
-    fn same_start(&self, _: i64, _: i64) -> bool {
-        unimplemented!("no process table yet")
-    }
-    fn stop_report(&self, _: &[Left]) -> Map<String, Value> {
-        unimplemented!("no process table yet")
-    }
-    fn token(&self) -> Option<Token> {
-        unimplemented!("no process table yet")
-    }
-    fn sandbox(&self) -> Signals {
-        unimplemented!("no process table yet")
-    }
+    Box::new(windows::Windows)
 }
