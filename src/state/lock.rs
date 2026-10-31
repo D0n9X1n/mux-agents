@@ -157,6 +157,16 @@ pub(crate) fn with_lock_in<T>(
     f: impl FnOnce() -> Res<T>,
 ) -> Res<T> {
     use std::fs::TryLockError;
+    // A flock belongs to the open file description, which a child forked while it is held shares until it
+    // execs (O_CLOEXEC acts only at exec), so closing our descriptor alone can leave the lock held. Unlocking
+    // releases it for every holder of the description; Drop runs on return, on `Err` and while unwinding.
+    struct Held<'a>(&'a std::fs::File);
+    impl Drop for Held<'_> {
+        fn drop(&mut self) {
+            // Nothing to report it to; the close that follows releases what it can.
+            let _ = self.0.unlock();
+        }
+    }
     crate::state::private_unix::private_dirs(root, &[root])?;
     let file = open_lock(&lock_path(root, key))?;
     let mut waited = Duration::ZERO;
@@ -171,7 +181,8 @@ pub(crate) fn with_lock_in<T>(
             Err(TryLockError::Error(e)) => return Err(e.into()),
         }
     }
-    // Closing `file` releases the lock, on return and while unwinding alike.
+    // Unlocked before `file` closes, as the Windows guard releases the mutex before its handle closes.
+    let _held = Held(&file);
     test_panic(ctx);
     f()
 }
@@ -256,6 +267,7 @@ pub(crate) fn with_lock_timeout<T>(
         WAIT_TIMEOUT => return timed_out(),
         _ => return Err(std::io::Error::last_os_error().into()),
     }
+    // Same order as Unix: released on return, on `Err` and while unwinding, before the handle closes.
     let _held = Held(&mutex);
     test_panic(ctx);
     f()
@@ -311,30 +323,14 @@ mod tests {
             (1, "state", message.into())
         }
 
-        // A child forked by another test thread (a Command spawn) holds a copy of every open file description,
-        // and so any flock on it, from fork until exec closes it (O_CLOEXEC acts only at exec). A lock released
-        // here can therefore stay held for a moment, so a check right after a release retries in real time for
-        // up to 5 s; the ctx clock's sleep does not wait.
-        fn eventually<T>(mut attempt: impl FnMut() -> Res<T>) -> Res<T> {
-            let deadline = std::time::Instant::now() + Duration::from_secs(5);
-            loop {
-                let got = attempt();
-                if got.is_ok() || std::time::Instant::now() >= deadline {
-                    return got;
-                }
-                std::thread::sleep(Duration::from_millis(10));
+        // Whether a fresh descriptor can take the lock right now; it unlocks what it took.
+        fn free_now(path: &Path) -> bool {
+            let probe = File::open(path).unwrap();
+            let got = probe.try_lock().is_ok();
+            if got {
+                probe.unlock().unwrap();
             }
-        }
-
-        // Whether a fresh descriptor can take the lock now, retried as `eventually` says.
-        fn free_after_release(path: &Path) -> bool {
-            eventually(|| {
-                let probe = File::open(path)?;
-                probe
-                    .try_lock()
-                    .map_err(|_| refuse::<()>(2, "lock", "held").unwrap_err())
-            })
-            .is_ok()
+            got
         }
 
         const PARTS: [&str; 4] = [".local", "state", "mux-agents", "locks"];
@@ -530,9 +526,9 @@ mod tests {
             assert_eq!(fakes.slept(), [10; 20]);
             // Another key is another file.
             assert_eq!(with_lock_in(&ctx, &root, "other", wait, || Ok(1)), Ok(1));
+            holder.unlock().unwrap();
             drop(holder);
-            let relocked = eventually(|| with_lock_in(&ctx, &root, "k", wait, || Ok(2)));
-            assert_eq!(relocked, Ok(2));
+            assert_eq!(with_lock_in(&ctx, &root, "k", wait, || Ok(2)), Ok(2));
             // The file stays.
             assert!(path.is_file());
         }
@@ -577,6 +573,7 @@ mod tests {
             );
             assert!(!ran.get());
             assert_eq!(fakes.slept(), vec![10; 1500]);
+            holder.unlock().unwrap();
         }
 
         #[test]
@@ -589,16 +586,105 @@ mod tests {
                 with_lock_in(&ctx, &root, "k", wait, || -> Res<()> { panic!("inside") })
             }));
             assert!(panicked.is_err());
-            assert!(free_after_release(&lock_path(&root, "k")));
-            let again = eventually(|| with_lock_in(&ctx, &root, "k", wait, || Ok(())));
-            assert_eq!(again, Ok(()));
+            assert!(free_now(&lock_path(&root, "k")));
+            assert_eq!(with_lock_in(&ctx, &root, "k", wait, || Ok(())), Ok(()));
             // A refusal inside the guard releases it too.
             let refused = with_lock_in(&ctx, &root, "k", wait, || -> Res<()> {
                 refuse(2, "name", "taken")
             });
             assert_eq!(refusal(refused), (2, "name", "taken".into()));
-            let again = eventually(|| with_lock_in(&ctx, &root, "k", wait, || Ok(())));
-            assert_eq!(again, Ok(()));
+            assert_eq!(with_lock_in(&ctx, &root, "k", wait, || Ok(())), Ok(()));
+        }
+
+        // A child forked while the lock is held, parked before exec: it shares the lock file's open file
+        // description, and so its flock, until it exits. Dropping releases it (and waits), even mid-assert.
+        struct ParkedChild {
+            pid: libc::pid_t,
+            release: libc::c_int,
+        }
+
+        impl ParkedChild {
+            fn fork() -> Self {
+                let mut fds = [0 as libc::c_int; 2];
+                // SAFETY: `fds` has room for the two descriptors pipe writes.
+                assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+                let [wait_on, release] = fds;
+                // SAFETY: the child makes only async-signal-safe calls (close, read, _exit): no allocation,
+                // no std I/O, no unwinding.
+                let pid = unsafe { libc::fork() };
+                if pid == 0 {
+                    // SAFETY: as above; the child never returns from this block.
+                    unsafe {
+                        libc::close(release);
+                        let mut byte = 0u8;
+                        while libc::read(wait_on, (&raw mut byte).cast(), 1) < 0 {}
+                        libc::_exit(0);
+                    }
+                }
+                // SAFETY: the parent's copy of the read end, closed once.
+                unsafe { libc::close(wait_on) };
+                assert!(pid > 0, "fork failed");
+                Self { pid, release }
+            }
+
+            // Whether the child has not exited yet.
+            fn alive(&self) -> bool {
+                let mut status = 0;
+                // SAFETY: our own child; WNOHANG returns 0 while it runs and does not reap it then.
+                unsafe { libc::waitpid(self.pid, &mut status, libc::WNOHANG) == 0 }
+            }
+        }
+
+        impl Drop for ParkedChild {
+            fn drop(&mut self) {
+                let mut status = 0;
+                // SAFETY: the write end, closed once (EOF releases the child too); then our own child is reaped.
+                unsafe {
+                    libc::write(self.release, [1u8].as_ptr().cast(), 1);
+                    libc::close(self.release);
+                    libc::waitpid(self.pid, &mut status, 0);
+                }
+            }
+        }
+
+        // With the child still parked, the lock is free at once: a fresh descriptor takes it without
+        // blocking, and the next `with_lock_in` runs its action without a single back-off.
+        fn assert_free_while_parked(root: &Path, child: &ParkedChild) {
+            assert!(
+                free_now(&lock_path(root, "k")),
+                "lock still held after release"
+            );
+            let fakes = Fakes::default();
+            let again = with_lock_in(&fakes.ctx(), root, "k", LOCK_WAIT, || Ok(9));
+            assert_eq!((again, fakes.slept()), (Ok(9), vec![]));
+            assert!(child.alive(), "the child exited before the checks");
+        }
+
+        #[test]
+        fn release_while_forked_child_holds_fd() {
+            let dir = TempDir::new();
+            let root = dir.path().join("locks");
+            let ctx = Fakes::default().ctx();
+            let child =
+                with_lock_in(&ctx, &root, "k", LOCK_WAIT, || Ok(ParkedChild::fork())).unwrap();
+            assert_free_while_parked(&root, &child);
+        }
+
+        #[test]
+        fn release_after_panic_while_forked_child_holds_fd() {
+            let dir = TempDir::new();
+            let root = dir.path().join("locks");
+            let ctx = Fakes::default().ctx();
+            let child = std::cell::RefCell::new(None);
+            let panicked = catch_unwind(AssertUnwindSafe(|| {
+                with_lock_in(&ctx, &root, "k", LOCK_WAIT, || -> Res<()> {
+                    *child.borrow_mut() = Some(ParkedChild::fork());
+                    panic!("inside")
+                })
+            }));
+            assert!(panicked.is_err());
+            let child = child.into_inner().unwrap();
+            assert_free_while_parked(&root, &child);
         }
 
         #[cfg(feature = "test-panic")]
@@ -616,7 +702,7 @@ mod tests {
                 })
             }));
             assert!(panicked.is_err() && !ran.get());
-            assert!(free_after_release(&lock_path(&root, "k")));
+            assert!(free_now(&lock_path(&root, "k")));
         }
 
         #[test]
