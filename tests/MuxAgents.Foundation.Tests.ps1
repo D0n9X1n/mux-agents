@@ -354,6 +354,9 @@ Describe 'MuxAgents foundation hygiene' {
                 'pull_request_template.md=91780120628ac4776e768af3bac521f4500f9d88298fdbc20718abfa1279ec60'
             ) -join ' ; ')
     }
+    It 'tags every integration Describe integration, and no script reads the test variables' {
+        $untagged = @(Get-ChildItem -LiteralPath (Join-Path $testsRoot 'integration') -Filter '*.Tests.ps1' | ForEach-Object { [IO.File]::ReadAllLines($_.FullName) } | Where-Object { $_ -match '^\s*Describe\b' -and $_ -notmatch "\s-Tag\s+'integration'\s*\{\s*$" })
+        "$($untagged.Count) $(@(& git -C $repoRoot grep -n 'MUX_IT_' -- scripts).Count)" | Should BeExactly '0 0' }
 }
 
 Describe 'MuxAgents foundation release gate' {
