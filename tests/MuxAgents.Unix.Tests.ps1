@@ -58,10 +58,12 @@ Describe 'MuxAgents unix client identity' {
         "$(Get-UnixClient '/usr/bin/node' @('node', '--require', 'hook.js', $loader)),$(Get-UnixClient '/usr/bin/node' @('node', '--loader', 'hook.mjs', $loader))" | Should BeExactly 'copilot,copilot' }
     It 'names no client when the loader is only the value of --require or --loader and the script is another file' {
         "[$(Get-UnixClient '/usr/bin/node' @('node', '--require', $loader, '/srv/app.js'))],[$(Get-UnixClient '/usr/bin/node' @('node', '--loader', $loader, '/srv/app.js'))]" | Should BeExactly '[],[]' }
-    It 'skips an --option=value and the known flags that take no value' {
+    It 'skips an allowlisted --option=value and the known flags that take no value' {
         "$(Get-UnixClient '/usr/bin/node' @('node', '--max-old-space-size=4096', '--enable-source-maps', '--no-deprecation', $loader))" | Should BeExactly 'copilot' }
     It 'names no client after any other option, which may take the loader as its value' {
         "[$(Get-UnixClient '/usr/bin/node' @('node', '--conditions', $loader, '/srv/app.js'))],[$(Get-UnixClient '/usr/bin/node' @('node', '-C', $loader, '/srv/app.js'))],[$(Get-UnixClient '/usr/bin/node' @('node', '--some-new-flag', $loader))]" | Should BeExactly '[],[],[]' }
+    It 'names no client after an --option=value that is not allowlisted: --run=<script> runs a package script, not the loader' {
+        "[$(Get-UnixClient '/usr/bin/node' @('node', '--run=probe', $loader))],[$(Get-UnixClient '/usr/bin/node' @('node', '--input-type=module', $loader))],[$(Get-UnixClient '/usr/bin/node' @('node', '--test', $loader))]" | Should BeExactly '[],[],[]' }
     It 'names no client for argv[0] alone, another exe, other case, eval code, an option value, another script, or an unreadable path or cwd' {
         $answers = @((Get-UnixClient '/usr/bin/sleep' @('claude')), (Get-UnixClient '/usr/bin/bash' @('copilot', '--allow-all')), (Get-UnixClient '/usr/bin/claude.exe' @('claude')),
             (Get-UnixClient '/opt/Claude' @('claude')), (Get-UnixClient '/x/claude/versionsX/1' @('claude')), (Get-UnixClient '/usr/bin/copilot-cli' @('copilot')),

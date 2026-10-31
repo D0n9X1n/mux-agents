@@ -17,9 +17,10 @@ function Get-MuxAgentUnixStopReport { param($Left)
     $pids = [int[]]@($Left | Where-Object { $null -ne $_ } | ForEach-Object { [int]$_.Pid })
     [ordered]@{ survivors = $pids.Count; survivorPids = $pids } }
 # The script node runs: the first argument after node that is not an option; '--' ends options. Options are read fail-closed:
-# -r/--require/--import/--loader skip the next argument, an --option=value or a known flag without a value is skipped, and any
-# other option (it may take the next argument as its value, as --conditions does) gives $null. $null too for -e/-p/--eval/--print
-# (or a short-option cluster holding e or p) or for no script.
+# -r/--require/--import/--loader skip the next argument; an allowlisted --option=value or flag without a value, none of which
+# changes what node runs, is skipped; any other option gives $null: it may take the next argument as its value (--conditions)
+# or run something else (--run=<script>, --check, --test). $null too for -e/-p/--eval/--print (or a short-option cluster holding
+# e or p) or for no script.
 function Get-MuxAgentUnixNodeScript { param([string[]]$Argv)
     for ($index = 1; $index -lt $Argv.Count; $index++) {
         $item = $Argv[$index]
@@ -27,7 +28,7 @@ function Get-MuxAgentUnixNodeScript { param([string[]]$Argv)
         if ($item -cmatch '^(--(eval|print)(=|$)|-[A-Za-z]*[ep][A-Za-z]*$)') { return $null }
         if ($item -cin @('-r', '--require', '--import', '--loader')) { $index++; continue }
         if (-not $item.StartsWith('-')) { return $item }
-        if ($item -cmatch '^--[a-z0-9-]+=' -or $item -cin @('--no-warnings', '--no-deprecation', '--enable-source-maps', '--trace-warnings', '--preserve-symlinks', '--preserve-symlinks-main', '--expose-gc')) { continue }
+        if ($item -cmatch '^--(max-old-space-size|max-semi-space-size|stack-size|require|import|loader|experimental-loader|conditions|title|unhandled-rejections)=' -or $item -cin @('--no-warnings', '--no-deprecation', '--enable-source-maps', '--trace-warnings', '--preserve-symlinks', '--preserve-symlinks-main', '--expose-gc')) { continue }
         return $null }
     $null }
 # ClientOf on Unix, by the real executable path: claude under */claude/versions/* or named claude; copilot named copilot, or node
