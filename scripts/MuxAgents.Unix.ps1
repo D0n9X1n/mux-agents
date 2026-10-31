@@ -165,3 +165,37 @@ function Get-MuxAgentUnixLockName {
     param([Parameter(Mandatory)][string]$LockKey, [Parameter(Mandatory)][string]$User)
     "Global\MuxAgents-$User-" + (Get-MuxAgentHash $LockKey).Substring(0, 32)
 }
+function Invoke-MuxAgentUnixTool {
+    # One native call of the Unix state code: stdout without its final newline (other whitespace is data), or a
+    # refusal 1 'state' with Message when the call cannot start, times out, exits non-zero or prints nothing.
+    param([Parameter(Mandatory)][string]$FilePath, [Parameter(Mandatory)][string[]]$Arguments, [Parameter(Mandatory)][string]$Message)
+    $result = try { Invoke-MuxAgentProcess -FilePath $FilePath -Arguments $Arguments -TimeoutMilliseconds 5000 } catch { $null }
+    $text = if ($result) { "$($result.StdOut)" -replace '\n\z', '' } else { '' }
+    if (-not $result -or $result.ExitCode -ne 0 -or -not $text) { Exit-MuxAgentCommand 1 'state' $Message }
+    $text
+}
+function Resolve-MuxAgentUnixRealPath {
+    # Path with realpath applied to its longest existing prefix; the missing rest is kept. Path must be absolute and
+    # free of . and .. segments, so the kept rest cannot leave the resolved prefix. A prefix probe that throws refuses.
+    param([Parameter(Mandatory)][string]$Path)
+    $parts = @($Path.Split('/', [StringSplitOptions]::RemoveEmptyEntries))
+    if (-not $Path.StartsWith('/') -or $Path -match '[\r\n]' -or $parts -contains '.' -or $parts -contains '..') { Exit-MuxAgentCommand 1 'state' 'the state folder path is not absolute' }
+    $count = $parts.Count
+    try { while ($count -gt 0 -and -not (Test-Path -LiteralPath ('/' + (@($parts | Select-Object -First $count) -join '/')))) { $count-- } }
+    catch { Exit-MuxAgentCommand 1 'state' 'the state folder path cannot be resolved' }
+    $real = Invoke-MuxAgentUnixTool -FilePath 'realpath' -Arguments @('--', ('/' + (@($parts | Select-Object -First $count) -join '/'))) -Message 'the state folder path cannot be resolved'
+    if (-not $real.StartsWith('/') -or $real -match '[\r\n]') { Exit-MuxAgentCommand 1 'state' 'the state folder path cannot be resolved' }
+    $rest = @($parts | Select-Object -Skip $count)
+    if ($rest.Count) { $real.TrimEnd('/') + '/' + ($rest -join '/') } else { $real }
+}
+function Get-MuxAgentUnixStateRoot {
+    # B4: the StateRootOf member. MUX_AGENTS_STATE (absolute, else refused), else $XDG_STATE_HOME/mux-agents/state (an
+    # absolute value only, as the XDG spec says), else $HOME/.local/state/mux-agents/state; canonical via realpath.
+    param([Parameter(Mandatory)][Collections.IDictionary]$Environment)
+    $state = [string]$Environment['MUX_AGENTS_STATE']; $xdg = [string]$Environment['XDG_STATE_HOME']; $homePath = [string]$Environment['HOME']
+    $path = if ($state) { if (-not $state.StartsWith('/')) { Exit-MuxAgentCommand 1 'state' 'MUX_AGENTS_STATE is not an absolute path' }; $state }
+    elseif ($xdg.StartsWith('/')) { $xdg.TrimEnd('/') + '/mux-agents/state' }
+    elseif ($homePath.StartsWith('/')) { $homePath.TrimEnd('/') + '/.local/state/mux-agents/state' }
+    else { Exit-MuxAgentCommand 1 'state' 'HOME is not an absolute path' }
+    Resolve-MuxAgentUnixRealPath -Path $path
+}

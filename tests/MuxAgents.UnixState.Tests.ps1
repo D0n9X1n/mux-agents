@@ -91,3 +91,55 @@ Describe 'MuxAgents lock order' {
         "$($handlers.Count) $($locking.Contains('Invoke-MuxAgentCommand')) $($locking.Contains('New-MuxAgentProviders'))|$($answers -join '|')" | Should BeExactly '7 True False|mux-agent.ps1 New-MuxAgentProviders before Invoke-MuxAgentCommand|mux-agent-launcher.ps1 New-MuxAgentProviders before Add-MuxAgentNotice'
     }
 }
+function Set-UnixStateReplies {
+    # Per tool, a queue of verbatim 'exitcode|stdout' answers ('throw': the call cannot start); the last one repeats.
+    param([Parameter(Mandatory)][hashtable]$Replies)
+    $global:unixStateCalls = [Collections.Generic.List[string]]::new(); $global:unixStateReplies = @{}
+    foreach ($tool in $Replies.Keys) { $global:unixStateReplies[$tool] = [Collections.Generic.Queue[string]]::new([string[]]@($Replies[$tool])) }
+}
+function Get-UnixStateReply {
+    param([string]$FilePath, [string[]]$Arguments)
+    $global:unixStateCalls.Add("$FilePath $($Arguments -join ' ')")
+    $queue = $global:unixStateReplies[$FilePath]; $reply = if ($queue.Count -gt 1) { $queue.Dequeue() } else { $queue.Peek() }
+    if ($reply -ceq 'throw') { throw [ComponentModel.Win32Exception]::new('spawn failed') }
+    $code, $text = $reply -split '\|', 2
+    [pscustomobject]@{ ExitCode = [int]$code; StdOut = $text; StdErr = '' }
+}
+Describe 'MuxAgents unix state root' {
+    Context 'resolver mocked' {
+        Mock Resolve-MuxAgentUnixRealPath { param($Path) "real:$Path" }
+        It 'takes MUX_AGENTS_STATE, else an absolute XDG_STATE_HOME, else HOME, never LOCALAPPDATA, and resolves the choice' {
+            $answers = foreach ($environment in @(@{ MUX_AGENTS_STATE = '/s'; XDG_STATE_HOME = '/x'; HOME = '/h' }, @{ XDG_STATE_HOME = '/x/'; HOME = '/h' }, @{ XDG_STATE_HOME = 'rel'; HOME = '/h/' }, @{ HOME = '/h'; LOCALAPPDATA = '/l' }, @{ HOME = 'h' }, @{})) {
+                Get-UnixStateRefusal { Get-MuxAgentUnixStateRoot -Environment $environment }
+            }
+            ($answers -join ';') | Should BeExactly 'ok real:/s;ok real:/x/mux-agents/state;ok real:/h/.local/state/mux-agents/state;ok real:/h/.local/state/mux-agents/state;1 state HOME is not an absolute path;1 state HOME is not an absolute path'
+        }
+        It 'refuses a relative MUX_AGENTS_STATE instead of falling back to XDG_STATE_HOME or HOME' {
+            Get-UnixStateRefusal { Get-MuxAgentUnixStateRoot -Environment @{ MUX_AGENTS_STATE = 'relative'; XDG_STATE_HOME = '/x'; HOME = '/h' } } | Should BeExactly '1 state MUX_AGENTS_STATE is not an absolute path'
+        }
+    }
+    Context 'realpath mocked' {
+        Mock Invoke-MuxAgentProcess { param($FilePath, $Arguments) Get-UnixStateReply -FilePath $FilePath -Arguments $Arguments }
+        It 'resolves the longest existing prefix, keeps the rest and every space, and refuses a failed or malformed answer or path' {
+            Set-UnixStateReplies @{ realpath = @("0|/canon`n", "0|/`n", "0|/r/state `n", '1|/canon', "0|canon`n", "0|/a`n/b`n", '0|', 'throw') }
+            $missing = '/mux-b3-' + [guid]::NewGuid().ToString('N')
+            try {
+                $answers = foreach ($path in @(@(1..8 | ForEach-Object { "$missing/a/b" }) + @('rel/a', '/x/../y', '/x/./y'))) { Get-UnixStateRefusal { Resolve-MuxAgentUnixRealPath -Path $path } }
+                ($answers -join ';') | Should BeExactly ((@("ok /canon$missing/a/b", "ok $missing/a/b", "ok /r/state $missing/a/b") + @(1..5 | ForEach-Object { '1 state the state folder path cannot be resolved' }) + @(1..3 | ForEach-Object { '1 state the state folder path is not absolute' })) -join ';')
+                ($global:unixStateCalls -join ';') | Should BeExactly ((@(1..8 | ForEach-Object { 'realpath -- /' })) -join ';')
+            }
+            finally { Remove-Variable unixStateCalls, unixStateReplies -Scope Global -ErrorAction SilentlyContinue }
+        }
+    }
+    Context 'prefix probe throws' {
+        Mock Invoke-MuxAgentProcess { param($FilePath, $Arguments) Get-UnixStateReply -FilePath $FilePath -Arguments $Arguments }
+        Mock Test-Path { throw [UnauthorizedAccessException]::new('denied') }
+        It 'refuses when the existing-prefix probe throws, and runs no realpath' {
+            Set-UnixStateReplies @{ realpath = "0|/canon`n" }
+            try {
+                "$(Get-UnixStateRefusal { Resolve-MuxAgentUnixRealPath -Path '/r/state' })|$($global:unixStateCalls.Count)" | Should BeExactly '1 state the state folder path cannot be resolved|0'
+            }
+            finally { Remove-Variable unixStateCalls, unixStateReplies -Scope Global -ErrorAction SilentlyContinue }
+        }
+    }
+}
