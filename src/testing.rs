@@ -1,6 +1,7 @@
 //! Recording fakes for the `Ctx` seams; clones share one log, so a test keeps a handle after boxing them.
 
 use std::cell::RefCell;
+use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::time::{Duration, SystemTime};
@@ -27,6 +28,10 @@ struct Log {
     signals: Option<Signals>,
     // Milliseconds since the epoch; sleeping advances it.
     now_ms: u64,
+    clients: HashMap<u32, Client>,
+    shells: Vec<u32>,
+    // Starts `open` answers in turn (none: unreadable) before it falls back to the row's own.
+    opens: HashMap<u32, VecDeque<Option<i64>>>,
 }
 
 #[derive(Clone, Default)]
@@ -49,6 +54,26 @@ impl Fakes {
             contains: contains.into(),
             output,
         });
+    }
+
+    /// The client `client_of` names for this pid.
+    pub fn client(&self, pid: u32, client: Client) {
+        self.0.borrow_mut().clients.insert(pid, client);
+    }
+
+    /// A pid `is_shell` answers true for.
+    pub fn shell(&self, pid: u32) {
+        self.0.borrow_mut().shells.push(pid);
+    }
+
+    /// The starts the next `open` calls of this pid answer, in order; none is an unreadable start.
+    pub fn opens(&self, pid: u32, starts: &[Option<i64>]) {
+        self.0
+            .borrow_mut()
+            .opens
+            .entry(pid)
+            .or_default()
+            .extend(starts.iter().copied());
     }
 
     /// What the fake OS says about a sandbox.
@@ -94,7 +119,7 @@ impl Fakes {
     }
 }
 
-// Every answer comes from the registered rows; nothing is ever killed, a shell or a client.
+// Every answer comes from the registered rows and per-pid answers; nothing is ever killed.
 impl Os for Fakes {
     fn row(&self, pid: u32) -> Option<Row> {
         self.os_call(format!("row {pid}"));
@@ -108,7 +133,16 @@ impl Os for Fakes {
 
     fn open(&self, pid: u32) -> Option<Opened> {
         self.os_call(format!("open {pid}"));
-        self.listed(pid).map(|r| Opened::new(r.pid, r.start, None))
+        let queued = self
+            .0
+            .borrow_mut()
+            .opens
+            .get_mut(&pid)
+            .and_then(VecDeque::pop_front);
+        match queued {
+            Some(start) => start.map(|start| Opened::new(pid, start, None)),
+            None => self.listed(pid).map(|r| Opened::new(r.pid, r.start, None)),
+        }
     }
 
     fn kill(&self, opened: Opened) -> bool {
@@ -123,12 +157,12 @@ impl Os for Fakes {
 
     fn client_of(&self, row: &Row) -> Option<Client> {
         self.os_call(format!("client_of {}", row.pid));
-        None
+        self.0.borrow().clients.get(&row.pid).copied()
     }
 
     fn is_shell(&self, row: &Row) -> bool {
         self.os_call(format!("is_shell {}", row.pid));
-        false
+        self.0.borrow().shells.contains(&row.pid)
     }
 
     fn same_start(&self, opened: i64, listed: i64) -> bool {
