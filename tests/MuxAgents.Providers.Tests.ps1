@@ -29,10 +29,9 @@ Describe 'MuxAgents providers contract' {
         (@($members.Keys | Sort-Object) -join ',') | Should BeExactly 'Argv,ClaudeDirectory,ClientImage,ClientOf,Endpoint,IsShell,IsUnder,Kill,LockName,Mux,Open,Platform,PrivateDirectories,Processes,Pwsh,SameStart,Sandbox,StateRootOf,StopReport,Token'
         "$($members.Platform) $([IO.Path]::GetFileName($members.Pwsh)) $(@($members.Keys | Where-Object { $_ -notin 'Platform', 'Pwsh' -and $members[$_] -isnot [scriptblock] }).Count)" | Should BeExactly 'windows pwsh.exe 0'
     }
-    It 'refuses every other platform with the platform check' {
-        $answers = foreach ($name in 'linux', 'macos', '') { Get-ProvidersRefusal { Get-MuxAgentPlatformMembers -Platform $name } }
-        ($answers -join ';') | Should BeExactly ((@(1..3) | ForEach-Object { '2 platform mux-agents 0.1.0 runs on Windows with rmux only' }) -join ';')
-    }
+    It 'refuses every platform but windows, linux and macos with the platform check' {
+        $answers = foreach ($name in 'freebsd', 'Linux', '') { Get-ProvidersRefusal { Get-MuxAgentPlatformMembers -Platform $name } }
+        ($answers -join ';') | Should BeExactly ((@(1..3) | ForEach-Object { '2 platform mux-agents 0.1.0 runs on Windows, Linux and macOS only' }) -join ';') }
     # Pester 4 keeps a Mock until its Describe or Context ends, so each mocking test has its own Context.
     Context 'factory with a spy member set' {
         It 'the factory asks for the running platform, installs every selected member by reference and derives StateRoot and the lock name from it' {
@@ -50,14 +49,12 @@ Describe 'MuxAgents providers contract' {
             finally { $script:MuxAgentLockName = $saved; Remove-Variable -Name providersSpySet, providersAsked -Scope Global }
         }
     }
-    Context 'factory on another platform' {
-        It 'the real factory refuses a platform other than windows with the platform check' {
-            Mock Get-MuxAgentPlatform { 'linux' }
+    Context 'factory on an unknown platform' {
+        It 'the real factory refuses a platform other than windows, linux and macos with the platform check' {
+            Mock Get-MuxAgentPlatform { 'freebsd' }
             $saved = $script:MuxAgentLockName
-            try { Get-ProvidersRefusal { New-MuxAgentProviders -Entry (Join-Path $repoRoot 'scripts/mux-agent.ps1') } | Should BeExactly '2 platform mux-agents 0.1.0 runs on Windows with rmux only' }
-            finally { $script:MuxAgentLockName = $saved }
-        }
-    }
+            try { Get-ProvidersRefusal { New-MuxAgentProviders -Entry (Join-Path $repoRoot 'scripts/mux-agent.ps1') } | Should BeExactly '2 platform mux-agents 0.1.0 runs on Windows, Linux and macOS only' }
+            finally { $script:MuxAgentLockName = $saved } } }
     It 'fake providers carry every OS member: fakes for Processes, Open, Kill and Token, production text for the rest' {
         $fake = New-FakeMuxAgentProviders
         $members = Get-MuxAgentPlatformMembers -Platform windows

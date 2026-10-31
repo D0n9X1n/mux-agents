@@ -38,3 +38,51 @@ Describe 'MuxAgents activation tmux' {
         Mock Invoke-MuxAgentProcess { throw 'must not run' }
         It 'refuses endpoint when neither the server nor PATH has tmux, without running anything' {
             Get-ActivationRefusal { Resolve-MuxAgentUnixMux -P (New-ActivationMuxFake -ServerPath '/usr/bin/bash') } | Should BeExactly '1 endpoint tmux was not found' } } }
+Describe 'MuxAgents activation unix members' {
+    It 'linux and macos carry the windows keys; ClientImage, Pwsh and Token are the Unix ones' {
+        $keys = (@((Get-MuxAgentPlatformMembers -Platform windows).Keys | Sort-Object) -join ',')
+        $answers = foreach ($name in 'linux', 'macos') {
+            $m = Get-MuxAgentPlatformMembers -Platform $name
+            "$($m.Platform) $((@($m.Keys | Sort-Object) -join ',') -ceq $keys) $(& $m.ClientImage 'claude') $(& $m.ClientImage 'copilot') $($m.Pwsh -ceq [IO.Path]::Combine($PSHOME, 'pwsh')) $($null -eq (& $m.Token))" }
+        ($answers -join ';') | Should BeExactly 'linux True claude copilot True True;macos True claude copilot True True'
+    }
+    It 'IsUnder compares ordinally below the root plus one slash' {
+        $answers = foreach ($name in 'linux', 'macos') {
+            $isUnder = (Get-MuxAgentPlatformMembers -Platform $name).IsUnder
+            (@(foreach ($pair in @(@('/s/state', '/s/state/k/a/spec.json'), @('/s/state/', '/s/state/k'), @('/s/state', '/S/state/k'), @('/s/state', '/s/statex/k'), @('/s/state', '/s/state'))) { "$(& $isUnder $pair[0] $pair[1])" }) -join ',') }
+        ($answers -join ';') | Should BeExactly 'True,True,False,False,False;True,True,False,False,False'
+    }
+    It 'StopReport reports every row stop left, whatever its Reason, with survivors and survivorPids' {
+        $left = @(foreach ($pair in @(@(310, 'open'), @(320, 'start'), @(330, 'kill'))) { [pscustomobject]@{ Pid = $pair[0]; Reason = $pair[1]; Row = [pscustomobject]@{ Pid = $pair[0] } } })
+        $answers = foreach ($name in 'linux', 'macos') {
+            $report = & (Get-MuxAgentPlatformMembers -Platform $name).StopReport $left; $none = & (Get-MuxAgentPlatformMembers -Platform $name).StopReport @()
+            "$(@($report.Keys) -join ',') $($report.survivors) $(@($report.survivorPids) -join ',') $($none.survivors) [$(@($none.survivorPids) -join ',')]" }
+        ($answers -join ';') | Should BeExactly 'survivors,survivorPids 3 310,320,330 0 [];survivors,survivorPids 3 310,320,330 0 []'
+    }
+    Context 'wiring' {
+        $global:activationWired = [Collections.Generic.List[string]]::new()
+        Mock New-MuxAgentLinuxKernel { 'K-linux' }; Mock New-MuxAgentMacKernel { 'K-macos' }
+        Mock Get-MuxAgentLinuxProcessTable { $global:activationWired.Add("Processes linux $Kernel") }; Mock Get-MuxAgentMacProcessTable { $global:activationWired.Add("Processes macos $Kernel") }
+        Mock Open-MuxAgentUnixProcess { $global:activationWired.Add("Open $Id $Kernel") }; Mock Stop-MuxAgentUnixProcess { $global:activationWired.Add("Kill $Opened $Kernel") }
+        Mock Assert-MuxAgentLinuxSandbox { $global:activationWired.Add("Sandbox linux $($Environment['K']) $Kernel") }; Mock Assert-MuxAgentMacSandbox { $global:activationWired.Add("Sandbox macos $($Environment['K']) $Kernel") }
+        Mock Get-MuxAgentUnixEndpoint { $global:activationWired.Add("Endpoint $($Environment['K'])") }; Mock Resolve-MuxAgentUnixMux { $global:activationWired.Add("Mux $P") }
+        Mock Get-MuxAgentUnixClient { $global:activationWired.Add("ClientOf $Row $Kernel") }; Mock Test-MuxAgentUnixShell { $global:activationWired.Add("IsShell $Row") }
+        Mock Test-MuxAgentUnixSameStart { $global:activationWired.Add("SameStart $Opened $Listed") }; Mock Get-MuxAgentUnixArgv { $global:activationWired.Add("Argv $Row") }
+        Mock Get-MuxAgentUnixClaudeDirectory { $global:activationWired.Add("ClaudeDirectory $P $Caller $Kernel") }; Mock Get-MuxAgentUnixStopReport { $global:activationWired.Add("StopReport $(@($Left) -join '/')") }
+        Mock Get-MuxAgentUnixStateRoot { $global:activationWired.Add("StateRootOf $($Environment['K'])") }; Mock New-MuxAgentUnixPrivateDirectories { $global:activationWired.Add("PrivateDirectories $Root $($Paths -join '/')") }
+        Mock Get-MuxAgentUnixUserId { $global:activationWired.Add('uid'); '501' }; Mock Get-MuxAgentUnixLockName { $global:activationWired.Add("LockName $LockKey $User") }
+        It 'each Unix member calls its own function with its arguments and the platform kernel; the uid is read once' {
+            $saved = $script:MuxAgentProviders
+            try {
+                $script:MuxAgentProviders = [pscustomobject]@{ StateRoot = '/root' }
+                foreach ($name in 'linux', 'macos') {
+                    $global:activationWired.Clear(); $script:MuxAgentUnixUser = $null
+                    $m = Get-MuxAgentPlatformMembers -Platform $name
+                    $null = & $m.Processes; $null = & $m.Open 7; $null = & $m.Kill 'o'; $null = & $m.Sandbox ([pscustomobject]@{ Env = @{ K = 'e' } }); $null = & $m.Endpoint @{ K = 'e' }
+                    $null = & $m.Mux 'p'; $null = & $m.ClientOf 'r1'; $null = & $m.IsShell 'r2'; $null = & $m.SameStart 5 5; $null = & $m.Argv 'r3'; $null = & $m.ClaudeDirectory 'p' 'c'
+                    $null = & $m.StopReport @('a', 'b'); $null = & $m.StateRootOf @{ K = 's' }; $null = & $m.PrivateDirectories @('a', 'b'); $null = & $m.LockName 'k'; $null = & $m.LockName 'j'
+                    "$name|$($global:activationWired -join ',')" | Should BeExactly "$name|Processes $name K-$name,Open 7 K-$name,Kill o K-$name,Sandbox $name e K-$name,Endpoint e,Mux p,ClientOf r1 K-$name,IsShell r2,SameStart 5 5,Argv r3,ClaudeDirectory p c K-$name,StopReport a/b,StateRootOf s,PrivateDirectories /root a/b,uid,LockName k 501,LockName j 501"
+                } }
+            finally { $script:MuxAgentProviders = $saved; $script:MuxAgentUnixKernel = $null; $script:MuxAgentUnixUser = $null } }
+    }
+}

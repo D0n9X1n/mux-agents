@@ -9,6 +9,7 @@ $script:MuxAgentVerbs = @{}
 $script:MuxAgentSessionIdPattern = '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\z'
 # The only characters an Entry may hold, since the header puts it inside double quotes that pwsh and bash expand.
 $script:MuxAgentEntryPattern = '^[\p{L}\p{Nd} _\\/:.()-]+\z'
+$script:MuxAgentPlatformMessage = 'mux-agents 0.1.0 runs on Windows, Linux and macOS only'
 
 function Register-MuxAgentVerb {
     # Handler is a scriptblock or function name called with -P and -Request; it returns one dictionary or nothing.
@@ -136,9 +137,38 @@ function Get-MuxAgentPlatform {
 }
 
 function Get-MuxAgentPlatformMembers {
-    # The OS members of $P (the contract). Windows: today's code. Any other platform refuses 2 'platform' until B4.
+    # The OS members of $P (the contract): Windows today's code; linux and macos the B2/B3 bodies; anything else refuses 2 'platform'.
     param([AllowEmptyString()][string]$Platform)
-    if ($Platform -cne 'windows') { Exit-MuxAgentCommand 2 'platform' 'mux-agents 0.1.0 runs on Windows with rmux only' }
+    if ($Platform -cin 'linux', 'macos') {
+        # One kernel per process; the members read it from script scope (B2). Only Processes and Sandbox differ by OS.
+        $script:MuxAgentUnixKernel = if ($Platform -ceq 'linux') { New-MuxAgentLinuxKernel } else { New-MuxAgentMacKernel }
+        return [ordered]@{
+            Platform = $Platform
+            Pwsh = [IO.Path]::Combine($PSHOME, 'pwsh')
+            Processes = if ($Platform -ceq 'linux') { { Get-MuxAgentLinuxProcessTable -Kernel $script:MuxAgentUnixKernel } } else { { Get-MuxAgentMacProcessTable -Kernel $script:MuxAgentUnixKernel } }
+            Open = { param([int]$Id) Open-MuxAgentUnixProcess -Id $Id -Kernel $script:MuxAgentUnixKernel }
+            Kill = { param($Opened) Stop-MuxAgentUnixProcess -Opened $Opened -Kernel $script:MuxAgentUnixKernel }
+            Token = { $null }
+            Sandbox = if ($Platform -ceq 'linux') { { param($P) Assert-MuxAgentLinuxSandbox -Environment $P.Env -Kernel $script:MuxAgentUnixKernel } } else { { param($P) Assert-MuxAgentMacSandbox -Environment $P.Env -Kernel $script:MuxAgentUnixKernel } }
+            Endpoint = { param($Environment) Get-MuxAgentUnixEndpoint -Environment $Environment }
+            Mux = { param($P) Resolve-MuxAgentUnixMux -P $P }
+            ClientOf = { param($Row) Get-MuxAgentUnixClient -Row $Row -Kernel $script:MuxAgentUnixKernel }
+            IsShell = { param($Row) Test-MuxAgentUnixShell -Row $Row }
+            SameStart = { param($Opened, $Listed) Test-MuxAgentUnixSameStart -Opened $Opened -Listed $Listed }
+            Argv = { param($Row) Get-MuxAgentUnixArgv -Row $Row }
+            ClaudeDirectory = { param($P, $Caller) Get-MuxAgentUnixClaudeDirectory -P $P -Caller $Caller -Kernel $script:MuxAgentUnixKernel }
+            StopReport = { param($Left) Get-MuxAgentUnixStopReport -Left $Left }
+            StateRootOf = { param($Environment) Get-MuxAgentUnixStateRoot -Environment $Environment }
+            # The factory sets $script:MuxAgentProviders after StateRoot, so Root is the selected state root (B3).
+            PrivateDirectories = { param([string[]]$Paths) New-MuxAgentUnixPrivateDirectories -Root $script:MuxAgentProviders.StateRoot -Paths $Paths }
+            # Global\MuxAgents-<uid>-<hash> (B3); the uid is read once per process, at the first lock.
+            LockName = { param([string]$LockKey) if (-not $script:MuxAgentUnixUser) { $script:MuxAgentUnixUser = Get-MuxAgentUnixUserId }; Get-MuxAgentUnixLockName -LockKey $LockKey -User $script:MuxAgentUnixUser }
+            ClientImage = { param([string]$Client) $Client }
+            # StateRoot is canonical (realpath) on Unix, so no GetFullPath here.
+            IsUnder = { param([string]$Root, [string]$Full) $base = $Root.TrimEnd('/') + '/'; $Full.Length -gt $base.Length -and $Full.StartsWith($base, [StringComparison]::Ordinal) }
+        }
+    }
+    if ($Platform -cne 'windows') { Exit-MuxAgentCommand 2 'platform' $script:MuxAgentPlatformMessage }
     [ordered]@{
         Platform = 'windows'
         Pwsh = (Join-Path $PSHOME 'pwsh.exe')
