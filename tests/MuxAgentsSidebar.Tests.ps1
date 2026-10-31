@@ -200,6 +200,21 @@ Describe 'MuxAgents sidebar watch loop' {
         $ended = Start-MuxAgentWatch -P $fake -Caller (Resolve-MuxAgentCaller -P $fake) -Write (& $write $frames)
         $tail = "advisory: GHSA-2j93-m82w-73j2`r`n"
         "$ended $($frames.Count) $([string]::Equals($frames[0], "$e[H$e[2J$board$tail", [StringComparison]::Ordinal)) $([string]::Equals($frames[1], "$e[H$e[2J$($board)refresh failed`r`n$tail", [StringComparison]::Ordinal))" | Should BeExactly 'pane-closed 2 True True' }
+    Context 'board read fails' {
+        # Pester 4 keeps a Mock to the end of its Context. Reads 1 and 3 throw; read 2 returns an empty board.
+        Mock Get-MuxAgentBoard { $global:sidebarBoardReads++; if ($global:sidebarBoardReads -ne 2) { throw [IO.IOException]::new('state') }; [ordered]@{ running = 0; agents = @() } }
+        It 'keeps the advisory line on a frame whose board read failed, first and after a good frame' {
+            # Catches: an advisory dropped on the fallback frame (the '?' board or the last good one) after refresh failed.
+            $global:sidebarBoardReads = 0
+            try {
+                $fake = New-SidebarWatchFake 'watch advisory board' -Probes 'live', 'live', 'live', 'gone'
+                $fake.Advisory = 'ADV'
+                $frames = [Collections.Generic.List[string]]::new()
+                $ended = Start-MuxAgentWatch -P $fake -Caller (Resolve-MuxAgentCaller -P $fake) -Write (& $write $frames) }
+            finally { Remove-Variable sidebarBoardReads -Scope Global -ErrorAction SilentlyContinue }
+            $tail = "advisory: GHSA-2j93-m82w-73j2`r`n"; $empty = (Format-MuxAgentBoard ([ordered]@{ running = 0; agents = @() })).Replace("`n", "`r`n") + "`r`n"
+            $want = @("$e[H$e[2Jmux-agents $([char]0x00B7) ? running`r`nrefresh failed`r`n$tail", "$e[H$e[2J$empty$tail", "$e[H$e[2J$($empty)refresh failed`r`n$tail")
+            "$ended $($frames.Count) $(@(0..2 | ForEach-Object { [string]::Equals($frames[$_], $want[$_], [StringComparison]::Ordinal) }) -join ' ')" | Should BeExactly 'pane-closed 3 True True True' } }
     It 'ends probe-failed after 30 unknown probes in a row, even when every write succeeds' {
         # Catches: no bound (a pipe whose reader closed accepts writes, so the loop never ends: runaway), another bound.
         $fake = New-SidebarWatchFake 'watch unanswered' -Probes 'fail'
