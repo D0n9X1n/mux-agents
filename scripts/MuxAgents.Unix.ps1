@@ -134,3 +134,23 @@ function Stop-MuxAgentUnixProcess { param([Parameter(Mandatory)]$Opened, [Parame
         $null = & $Kernel.Sleep 100; $now = & $Kernel.ReadStart $Opened.Id
         if (($null -ne $now -and $now -ne $Opened.Start) -or (& $Kernel.IsGone $Opened.Id)) { return $true } }
     $false }
+# ClaudeDirectory (C5) on Unix: the agent's kernel cwd, read between two starts equal to the caller's. ~/.claude/sessions/<pid>.json
+# is "no session" only when the read proves it missing (FileNotFoundException or DirectoryNotFoundException); File.Exists is not
+# used, as it is false on access errors and for a folder. A file that is present must parse to an object whose cwd is a non-empty
+# string equal to that cwd; anything else (unreadable, a folder, over 1 MB, malformed) refuses. sessionId/procStart stay
+# Windows-only (claude-code#36213).
+function Get-MuxAgentUnixClaudeDirectory { param([Parameter(Mandatory)]$P, [Parameter(Mandatory)]$Caller, [Parameter(Mandatory)]$Kernel)
+    $id = [int]$Caller.Agent.Pid; $want = $Caller.Agent.Start
+    if (-not (Test-MuxAgentUnixSameStart (& $Kernel.ReadStart $id) $want)) { return $null }
+    $cwd = try { "$(& $Kernel.ReadCwd $id)" } catch { '' }
+    if (-not $cwd -or -not (Test-MuxAgentUnixSameStart (& $Kernel.ReadStart $id) $want)) { return $null }
+    $file = [IO.Path]::Combine($P.Home, '.claude', 'sessions', "$id.json")
+    $missing = $false; $text = $null
+    try {
+        $stream = [IO.File]::OpenRead($file)
+        try { if ($stream.Length -le 1MB) { $text = [IO.StreamReader]::new($stream).ReadToEnd() } } finally { $stream.Dispose() } }
+    catch [IO.FileNotFoundException], [IO.DirectoryNotFoundException] { $missing = $true }
+    catch { $text = $null }
+    if ($missing) { return $cwd }
+    $session = try { ConvertFrom-Json -InputObject $text -NoEnumerate } catch { $null }
+    if ($session -is [System.Management.Automation.PSCustomObject] -and $session.cwd -is [string] -and $session.cwd -ceq $cwd) { $cwd } }

@@ -200,3 +200,32 @@ Describe 'MuxAgents unix stop' {
                 $reply = (Invoke-MuxAgentCommand -P $fake -Arguments @('stop', 'worker')).Text | ConvertFrom-Json
                 "$($reply.survivors)|$(@($reply.survivorPids) -join ',')|$(@($global:unixStopKernel.Live.Keys | Sort-Object) -join ',')" | Should BeExactly '3|320,300,310|300,310,320,900' }
             finally { Remove-Variable -Name unixStopKernel -Scope Global } } } }
+Describe 'MuxAgents unix claude directory' {
+    $caller = [pscustomobject]@{ Agent = [pscustomobject]@{ Pid = 150; Start = 1500 } }
+    # Each case gets its own fake home root, so no session file leaks between cases.
+    function New-UnixC5Home([string]$Name, $Session) {
+        $fake = New-FakeMuxAgentProviders -Root (Join-Path $TestDrive $Name)
+        if ($null -ne $Session) { $file = [IO.Path]::Combine($fake.Home, '.claude', 'sessions', '150.json'); $null = [IO.Directory]::CreateDirectory([IO.Path]::GetDirectoryName($file)); [IO.File]::WriteAllText($file, $Session) }
+        $fake }
+    function New-UnixC5Kernel { $k = New-UnixFakeKernel; $k.Live[150] = 1500; $k.Cwd[150] = '/w'; $k }
+    It 'with no session file takes the kernel cwd read between two equal starts' {
+        $k = New-UnixC5Kernel
+        "$(Get-MuxAgentUnixClaudeDirectory -P (New-UnixC5Home 'c5-none' $null) -Caller $caller -Kernel $k)|$($k.Log -join ',')" | Should BeExactly '/w|start 150,cwd 150,start 150' }
+    It 'a session file must be an object whose cwd is a non-empty string equal to the kernel cwd; sessionId and procStart are not read' {
+        $cases = [ordered]@{ agree = '{"cwd":"/w","sessionId":"s9","procStart":"1"}'; other = '{"cwd":"/x"}'; case = '{"cwd":"/W"}'; 'null' = 'null'; 'false' = 'false'; array = '[]'; wrapped = '[{"cwd":"/w"}]'
+            empty = ''; nocwd = '{"sessionId":"s9"}'; number = '{"cwd":7}'; list = '{"cwd":["/w"]}'; blank = '{"cwd":""}'; broken = '{"cwd":' }
+        $answers = foreach ($name in $cases.Keys) { "$name=$(Get-MuxAgentUnixClaudeDirectory -P (New-UnixC5Home "c5-$name" $cases[$name]) -Caller $caller -Kernel (New-UnixC5Kernel))" }
+        ($answers -join ',') | Should BeExactly 'agree=/w,other=,case=,null=,false=,array=,wrapped=,empty=,nocwd=,number=,list=,blank=,broken=' }
+    It 'only a proven missing session file is no session: a folder named <pid>.json or a file it cannot read refuses' {
+        $folder = New-UnixC5Home 'c5-folder' $null; $null = [IO.Directory]::CreateDirectory([IO.Path]::Combine($folder.Home, '.claude', 'sessions', '150.json'))
+        $locked = New-UnixC5Home 'c5-locked' '{"cwd":"/w"}'; $nofile = New-UnixC5Home 'c5-nofile' $null; $null = [IO.Directory]::CreateDirectory([IO.Path]::Combine($nofile.Home, '.claude', 'sessions'))
+        $lock = [IO.File]::Open([IO.Path]::Combine($locked.Home, '.claude', 'sessions', '150.json'), 'Open', 'ReadWrite', 'None')
+        try { $answers = foreach ($case in @(@('folder', $folder), @('locked', $locked), @('nofile', $nofile), @('nodir', (New-UnixC5Home 'c5-nodir' $null)))) { "$($case[0])=$(Get-MuxAgentUnixClaudeDirectory -P $case[1] -Caller $caller -Kernel (New-UnixC5Kernel))" } }
+        finally { $lock.Dispose() }
+        ($answers -join ',') | Should BeExactly 'folder=,locked=,nofile=/w,nodir=/w' }
+    It 'refuses when the start changes around the cwd read, belongs to another process, or the cwd is unreadable' {
+        $answers = foreach ($case in 'moved', 'other', 'nocwd', 'same') {
+            $k = New-UnixC5Kernel; if ($case -eq 'other') { $k.Live[150] = 1501 }; if ($case -eq 'nocwd') { $k.Cwd.Remove(150) }
+            if ($case -eq 'moved') { $k.ReadCwd = { param([int]$Id) $k.Live[150] = 1777; '/w' }.GetNewClosure() }
+            "$case=$(Get-MuxAgentUnixClaudeDirectory -P (New-UnixC5Home "c5-race-$case" $null) -Caller $caller -Kernel $k)" }
+        ($answers -join ',') | Should BeExactly 'moved=,other=,nocwd=,same=/w' } }
