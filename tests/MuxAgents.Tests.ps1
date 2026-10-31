@@ -2080,7 +2080,7 @@ Describe 'MuxAgents T1.6 spawn' -Tag 'windows' {
                     'set-option', '-p', '-t', '%9', '@agent-id', $reply.id, ';', 'set-option', '-p', '-t', '%9', '@agent-name', 'claude-1', ';',
                     'set-option', '-p', '-t', '%9', '@agent-parent', '%1', ';', 'set-option', '-p', '-t', '%9', '@agent-context', 'brief:human')))
         $expected = [ordered]@{ schema = 1; id = $reply.id; name = 'claude-1'; client = 'claude'; sessionId = $reply.sessionId; context = 'brief'; reason = 'human'
-            session = '$3'; pane = '%9'; window = '@5'; parentPane = '%1'; parentAgent = $null; directory = $fake.Cwd; createdAt = '2026-10-29T12:00:00.0000000Z' }
+            session = '$3'; pane = '%9'; window = '@5'; parentPane = '%1'; parentAgent = $null; directory = $fake.Cwd; taskLine = 'hi'; createdAt = '2026-10-29T12:00:00.0000000Z' }
         [IO.File]::ReadAllText([IO.Path]::Combine($fake.State, 'agents', $reply.id, 'record.json')) | Should BeExactly (ConvertTo-Json -Compress -InputObject $expected)
         # A Claude caller records its client, pid, exact start and session.
         $fake = New-T16Fake -Caller 'claude'

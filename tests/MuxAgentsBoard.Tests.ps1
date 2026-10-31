@@ -132,3 +132,53 @@ Describe 'MuxAgents board status verb' -Tag 'windows' {
                 $run = Invoke-BoardVerb $fake @('status', '-BodyFile', 's.md')
                 "$($run.Code) $($global:boardSeen -join ';') $((Read-MuxAgentJson -Path (Join-Path $folder 'status.json')).text)" | Should BeExactly '0 status.json held=True step' }
             finally { Remove-Variable -Name boardLock, boardSeen, boardWrite -Scope Global } } } }
+
+Describe 'MuxAgents board writers' -Tag 'windows' {
+    It 'spawn stores the cleaned task line cut to 80' {
+        # Catches: no taskLine, no C1 strip (U+009B kept in record.json), no cut, the whole task stored.
+        $fake = New-BoardFake 'spawn'
+        $run = Invoke-BoardVerb $fake @('spawn', '-Client', 'claude', '-Task', ("`n fix" + [char]27 + '[1m' + [char]0x9B + "`tthe build " + ('q' * 90) + "`nthen test"))
+        $text = [IO.File]::ReadAllText([IO.Path]::Combine((Get-BoardState $fake), 'agents', $run.Reply.id, 'record.json'))
+        "$($run.Code) $((ConvertFrom-Json $text).taskLine) $($text.Contains([string][char]0x9B))" | Should BeExactly ('0 fix[1m the build ' + ('q' * 63) + ' False') }
+    It 'an agent send stores its cleaned first line for Claude and Copilot; a blank send stores an empty line; a human send none' {
+        # Catches: no C1 strip, no write for one client, a blank send skipped (old line kept), a write for a human sender.
+        $sentHex = Get-BoardJsonHex '{"line":"done: all green","at":"2026-10-29T12:00:00.0000000Z"}'
+        $blankHex = Get-BoardJsonHex '{"line":"","at":"2026-10-29T12:00:05.0000000Z"}'
+        $results = foreach ($client in 'claude', 'copilot') {
+            $fake = New-BoardFake "sent $client" -Caller $client -Tag 'aaaaaaaaaaaa'; $folder = New-BoardAgent $fake -Client $client -Pane '%1'
+            [IO.File]::WriteAllText((Join-Path $fake.Cwd 'b.md'), "`r`ndone:" + [char]0x9B + "`tall green" + [char]7 + "`nmore")
+            [IO.File]::WriteAllText((Join-Path $fake.Cwd 'blank.md'), " `n")
+            $first = Invoke-BoardVerb $fake @('send', 'parent', '-BodyFile', 'b.md'); $one = Get-BoardHex (Join-Path $folder 'last-sent.json')
+            $fake.Clock = $fake.Clock.AddSeconds(5); $second = Invoke-BoardVerb $fake @('send', 'parent', '-BodyFile', 'blank.md')
+            $two = Get-BoardHex (Join-Path $folder 'last-sent.json')
+            "$($first.Code)$($second.Code) $($one -ceq $sentHex) $($two -ceq $blankHex)" }
+        $human = New-BoardFake 'sent human'
+        $humanCode = (Invoke-BoardVerb $human @('send', '%1', '-Body', 'hello')).Code
+        ($results -join ';') + " $humanCode $(@(Get-ChildItem -LiteralPath $human.StateRoot -Recurse -Filter 'last-sent.json').Count)" | Should BeExactly '00 True True;00 True True 0 0' }
+    It 'a failed last-sent write still delivers the message' {
+        # Catches: the write error turned into a send failure.
+        $fake = New-BoardFake 'sent blocked' -Caller claude -Tag 'aaaaaaaaaaaa'; $folder = New-BoardAgent $fake -Pane '%1'
+        $null = [IO.Directory]::CreateDirectory((Join-Path $folder 'last-sent.json')); [IO.File]::WriteAllText((Join-Path $fake.Cwd 'b.md'), 'ok')
+        $run = Invoke-BoardVerb $fake @('send', 'parent', '-BodyFile', 'b.md')
+        "$($run.Code) $((Get-Content -LiteralPath ([IO.Path]::Combine((Get-BoardState $fake), 'mail', 'pane-1.jsonl')) | ConvertFrom-Json).body)" | Should BeExactly '0 ok' }
+    Context 'sender lock spy' {
+        It 'appends and writes last-sent.json inside one hold of the sender''s agent lock' {
+            # Forces the order instead of racing: spies number each Use-MuxAgentLock hold and record which holds are open
+            # when the append and the last-sent write run. Catches: two separate holds (one per call), the append or the
+            # write outside the sender lock, the sender lock under another key, a direct WriteAllText (no writer call).
+            $fake = New-BoardFake 'sent lock' -Caller claude -Tag 'aaaaaaaaaaaa'; $folder = New-BoardAgent $fake -Pane '%1'
+            [IO.File]::WriteAllText((Join-Path $fake.Cwd 'b.md'), 'ok')
+            $server = (Resolve-MuxAgentCaller -P $fake).ServerKey
+            $global:boardHolds = [Collections.Generic.List[string]]::new(); $global:boardOpen = [Collections.Generic.List[string]]::new()
+            $global:boardEvents = [Collections.Generic.List[string]]::new()
+            $global:boardLock = ${function:Use-MuxAgentLock}; $global:boardMail = ${function:Add-MuxAgentMail}; $global:boardWrite = ${function:Write-MuxAgentJson}
+            Mock Use-MuxAgentLock {
+                $hold = "$($global:boardHolds.Count + 1)"; $global:boardHolds.Add("$hold=$LockKey"); $global:boardOpen.Add("$hold=$LockKey")
+                try { & $global:boardLock -LockKey $LockKey -LockAction $LockAction } finally { $null = $global:boardOpen.Remove("$hold=$LockKey") } }
+            Mock Add-MuxAgentMail { $global:boardEvents.Add("append in [$($global:boardOpen -join ',')]"); & $global:boardMail -P $P -Caller $Caller -Key $Key -From $From -FromPane $FromPane -Body $Body }
+            Mock Write-MuxAgentJson { $global:boardEvents.Add("last-sent in [$($global:boardOpen -join ',')]"); & $global:boardWrite -Path $Path -Value $Value } -ParameterFilter { $Path -like '*last-sent.json' }
+            try {
+                $run = Invoke-BoardVerb $fake @('send', 'parent', '-BodyFile', 'b.md')
+                "$($run.Code) $($global:boardHolds -join ';') | $($global:boardEvents -join ';') | $((Read-MuxAgentJson -Path (Join-Path $folder 'last-sent.json')).line)" |
+                    Should BeExactly "0 1=agent|$server|aaaaaaaaaaaa;2=mail|$server|pane-1 | append in [1=agent|$server|aaaaaaaaaaaa];last-sent in [1=agent|$server|aaaaaaaaaaaa] | ok" }
+            finally { Remove-Variable -Name boardHolds, boardOpen, boardEvents, boardLock, boardMail, boardWrite -Scope Global } } } }

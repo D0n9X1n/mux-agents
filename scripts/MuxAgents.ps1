@@ -758,7 +758,7 @@ function Invoke-MuxAgentSpawn {
             }
             Write-MuxAgentJson -Path (Join-Path $folder 'record.json') -Value ([ordered]@{ schema = 1; id = $id; name = $name; client = $client; sessionId = $sessionId
                     context = $plan.Context; reason = $plan.Reason; session = $caller.Session; pane = $pane; window = $window; parentPane = $caller.Pane
-                    parentAgent = $parentAgent; directory = $directory; createdAt = (& $P.Now).ToString('o') })
+                    parentAgent = $parentAgent; directory = $directory; taskLine = (ConvertTo-MuxAgentDoingLine $task); createdAt = (& $P.Now).ToString('o') })
             Write-MuxAgentJson -Path (Join-Path $folder 'commit.json') -Value ([ordered]@{ committedAt = (& $P.Now).ToString('o') })
         }
         catch {
@@ -1191,7 +1191,17 @@ function Invoke-MuxAgentSend {
         Exit-MuxAgentCommand 2 'target' 'the recipient is not a live pane of this session'
     }
     $key = Get-MuxAgentMailboxKey -Pane $pane -Tag $Matches[2]
-    $messageId = Add-MuxAgentMail -P $P -Caller $caller -Key $key -From $self.Name -FromPane $caller.Pane -Body $body
+    $deliver = {
+        $sentId = Add-MuxAgentMail -P $P -Caller $caller -Key $key -From $self.Name -FromPane $caller.Pane -Body $body
+        if ($self.Record) {
+            # Best effort, inside the sender lock, so last-sent.json names the last appended message; '' for a blank body.
+            $folder = [IO.Path]::Combine($P.StateRoot, $caller.ServerKey, 'agents', $self.Record.id)
+            try { Write-MuxAgentJson -Path (Join-Path $folder 'last-sent.json') -Value ([ordered]@{ line = (ConvertTo-MuxAgentDoingLine $body); at = (& $P.Now).ToString('o') }) } catch { }
+        }
+        $sentId
+    }
+    # Lock order: the sender's agent lock, then (inside Add-MuxAgentMail) the recipient's mail lock.
+    $messageId = if ($self.Record) { Use-MuxAgentLock -LockKey "agent|$($caller.ServerKey)|$($self.Record.id)" -LockAction $deliver } else { & $deliver }
     [ordered]@{ to = $target; pane = $pane; id = $messageId }
 }
 
