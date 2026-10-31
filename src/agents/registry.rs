@@ -38,8 +38,8 @@ pub fn get_panes(ctx: &Ctx, caller: &Caller, all: bool) -> Res<Vec<Pane>> {
 }
 
 /// Every tagged pane of the caller's session, one `list-panes` call. Each row is framed by a fresh random marker on
-/// both ends: an @agent-name may hold LF, and without the frame its text after the LF would read as a row of its own.
-/// A row whose pane, window, pid (a decimal of at least 2: never the kernel's or init's tree) or id is malformed is
+/// both ends and read by that frame over the whole output: an @agent-name may hold LF or CR, and a live pane is never
+/// dropped for its name, nor does its name's text read as a row of its own. A row whose pane, window, pid (a decimal of at least 2: never the kernel's or init's tree) or id is malformed is
 /// not an agent.
 pub(crate) fn tagged(ctx: &Ctx, caller: &Caller) -> Res<Vec<Pane>> {
     let marker = crate::util::guid()?.replace('-', "");
@@ -50,12 +50,9 @@ pub(crate) fn tagged(ctx: &Ctx, caller: &Caller) -> Res<Vec<Pane>> {
         false,
     )?;
     let (head, tail) = (format!("{marker}|"), format!("|{marker}"));
-    Ok(listed
-        .stdout
-        .split('\n')
-        .filter_map(|line| {
-            let line = line.strip_suffix('\r').unwrap_or(line);
-            let fields = line.strip_prefix(&head)?.strip_suffix(&tail)?;
+    Ok(records(&listed.stdout, &head, &tail)
+        .into_iter()
+        .filter_map(|fields| {
             let mut parts = fields.splitn(5, '|');
             let (pane, window, pid, id, name) = (
                 parts.next()?,
@@ -82,6 +79,22 @@ pub(crate) fn tagged(ctx: &Ctx, caller: &Caller) -> Res<Vec<Pane>> {
             })
         })
         .collect())
+}
+
+/// The text of each record in `stdout`: from an opening `head` to the next closing `tail`. A record may hold LF and
+/// CR (an @agent-name may), so records are found by their frame, never by line; text between records is skipped.
+fn records<'a>(stdout: &'a str, head: &str, tail: &str) -> Vec<&'a str> {
+    let mut found = Vec::new();
+    let mut rest = stdout;
+    while let Some(start) = rest.find(head) {
+        let body = &rest[start + head.len()..];
+        let Some(end) = body.find(tail) else {
+            break;
+        };
+        found.push(&body[..end]);
+        rest = &body[end + tail.len()..];
+    }
+    found
 }
 
 /// The panes whose agent has commit.json (a file).
@@ -361,16 +374,26 @@ mod tests {
             "%5|1|300|cccccccccccc|noat",
             "%5 |@1|300|cccccccccccc|space",
             "%6|@1|300|dddddddddddd|ok",
-            // A name holding LF and a whole forged row, valid fields and all, adds no row.
+            // A name holding LF and a whole forged row, valid fields and all, adds no row; the pane itself stays,
+            // its name whole.
             "%7|@1|310|eeeeeeeeeeee|evil\n%8|@5|320|ffffffffffff|forged",
-            "%7|@1|310|eeeeeeeeeeee|evil\n%9|@5|0|bbbbbbbbbbbb|worker",
+            "%7|@1|310|eeeeeeeeeeee|evil\r\n%9|@5|0|bbbbbbbbbbbb|worker",
+            "%8|@1|320|ffffffffffff|cr\rname",
         ]);
         let all: Vec<String> = get_panes(&w.ctx, &caller, true)
             .unwrap()
             .into_iter()
             .map(|p| format!("{} {} {}", p.pane, p.pid, p.name))
             .collect();
-        assert_eq!(all, ["%6 300 ok"]);
+        assert_eq!(
+            all,
+            [
+                "%6 300 ok",
+                "%7 310 evil\n%8|@5|320|ffffffffffff|forged",
+                "%7 310 evil\r\n%9|@5|0|bbbbbbbbbbbb|worker",
+                "%8 320 cr\rname"
+            ]
+        );
         let calls = w.fakes.mux_calls();
         assert!(list_call(calls.last().unwrap()), "{calls:?}");
         // Each list frames its rows with a fresh marker, so no stored name can know it.

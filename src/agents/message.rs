@@ -200,8 +200,10 @@ pub fn stop(ctx: &Ctx, request: &Request) -> Res<Map<String, Value>> {
         .join("launcher.json");
     let left = lock(ctx, &lock_key("notice", &caller, &pane.id), || {
         let table = ctx.os.table()?;
-        // The pane's process must be the agent's own launcher: the pid and start it recorded. A pane pid reused since
-        // (or a launcher that never recorded itself) is never walked: only the pane is closed.
+        // The pane's process must be the agent's own launcher: launcher.json's pid and start, the table's start, and
+        // the start of the process the pid opens now, all one. A launcher that never recorded itself, or a pane pid
+        // reused since (in the table or at the open), is never walked: only the pane is closed, and every tree row is
+        // left unverified.
         let recorded = read_json(&launcher)
             .ok()
             .flatten()
@@ -210,35 +212,40 @@ pub fn stop(ctx: &Ctx, request: &Request) -> Res<Map<String, Value>> {
             .iter()
             .find(|row| row.pid == root)
             .and_then(|row| row.start);
-        let unverified = match recorded {
-            None => Some(Reason::Open),
-            Some((pid, start))
-                if pid == u64::from(root)
-                    && listed.is_some_and(|listed| ctx.os.same_start(start, listed)) =>
+        let launcher_root = match (recorded, listed) {
+            (Some((pid, start)), Some(listed))
+                if pid == u64::from(root) && ctx.os.same_start(start, listed) =>
             {
-                None
+                ctx.os.open(root).filter(|opened| {
+                    ctx.os.same_start(opened.start, start)
+                        && ctx.os.same_start(opened.start, listed)
+                })
             }
-            Some(_) => Some(Reason::Start),
+            _ => None,
         };
-        // Every tree row that is not killed is left with its reason: not opened, another start, or a failed kill.
+        let tree = tree(&table, root);
+        // Every tree row that is not killed is left with its reason: unverified, not opened, another start, or a
+        // failed kill.
         let mut left = Vec::new();
         let mut held = Vec::new();
-        for row in tree(&table, root) {
-            if let Some(reason) = unverified {
-                left.push(Left {
-                    pid: row.pid,
-                    reason,
-                });
-                continue;
-            }
-            match hold(ctx.os.open(row.pid), row.start, |a, b| {
-                ctx.os.same_start(a, b)
-            }) {
-                Ok(opened) => held.push(opened),
-                Err(reason) => left.push(Left {
-                    pid: row.pid,
-                    reason,
-                }),
+        match launcher_root {
+            None => left.extend(tree.iter().map(|row| Left {
+                pid: row.pid,
+                reason: Reason::Unverified,
+            })),
+            Some(opened) => {
+                held.push(opened);
+                for row in tree.iter().filter(|row| row.pid != root) {
+                    match hold(ctx.os.open(row.pid), row.start, |a, b| {
+                        ctx.os.same_start(a, b)
+                    }) {
+                        Ok(opened) => held.push(opened),
+                        Err(reason) => left.push(Left {
+                            pid: row.pid,
+                            reason,
+                        }),
+                    }
+                }
             }
         }
         native(ctx, &["kill-pane", "-t", &pane.pane], true)?;
@@ -878,11 +885,11 @@ mod tests {
         }
         // The pane pid was reused (another start than launcher.json's), or launcher.json names another pid or
         // none: only the pane is closed, and its tree is left as survivors.
-        for (launcher, reason) in [
-            (Some(json!({"pid": 300, "start": 2500})), "start"),
-            (Some(json!({"pid": 301, "start": 3000})), "start"),
-            (Some(json!({"pid": 300})), "open"),
-            (None, "open"),
+        for launcher in [
+            Some(json!({"pid": 300, "start": 2500})),
+            Some(json!({"pid": 301, "start": 3000})),
+            Some(json!({"pid": 300})),
+            None,
         ] {
             let w = stop_world(false, json!({}));
             let file = w.folder("bbbbbbbbbbbb").join("launcher.json");
@@ -897,8 +904,8 @@ mod tests {
             w.fakes.stop_report_with(left_report);
             w.fakes.clear_log();
             let reply = run(&w, stop, &["stop", "worker"]);
-            let left = format!(r#""left":["300 {reason}","310 {reason}"]"#);
-            assert!(reply.contains(&left), "{launcher:?} {reply}");
+            let left = r#""left":["300 unverified","310 unverified"]"#;
+            assert!(reply.contains(left), "{launcher:?} {reply}");
             assert_eq!(proc_calls(&w), ["table"], "{launcher:?}");
             let kill_pane: Vec<_> = w
                 .fakes
@@ -907,6 +914,36 @@ mod tests {
                 .filter(|c| c[1] == "kill-pane")
                 .collect();
             assert_eq!(kill_pane, [["-N", "kill-pane", "-t", "%9"]], "{launcher:?}");
+            assert_eq!(read_mail_of(&w, "pane-1"), ["worker was stopped."]);
+        }
+    }
+
+    #[test]
+    fn stop_root_reused_at_open_kills_pane_only() {
+        // launcher.json and the table agree on pid 300 at 3000, but the pid opened is another process (4000), or
+        // none: the tree is never walked, only the pane closes, and every tree row is left unverified.
+        for opened in [Some(4000), None] {
+            let w = stop_world(false, json!({}));
+            w.fakes.process(testing::row(300, 900, 3000));
+            w.fakes.process(testing::row(310, 300, 5000));
+            w.fakes.opens(300, &[opened]);
+            w.fakes.kill_ok(300);
+            w.fakes.kill_ok(310);
+            w.fakes.stop_report_with(left_report);
+            w.fakes.clear_log();
+            let reply = run(&w, stop, &["stop", "worker"]);
+            assert!(
+                reply.contains(r#""left":["300 unverified","310 unverified"]"#),
+                "{opened:?} {reply}"
+            );
+            assert_eq!(proc_calls(&w), ["table", "open 300"], "{opened:?}");
+            let kill_pane: Vec<_> = w
+                .fakes
+                .mux_calls()
+                .into_iter()
+                .filter(|c| c[1] == "kill-pane")
+                .collect();
+            assert_eq!(kill_pane, [["-N", "kill-pane", "-t", "%9"]], "{opened:?}");
             assert_eq!(read_mail_of(&w, "pane-1"), ["worker was stopped."]);
         }
     }
@@ -966,6 +1003,24 @@ mod tests {
             run(&w, stop, &["stop", "worker"]),
             format!(
                 r#"ok {{"name":"worker","pane":"%9","survivors":1,"directory":"/work","resume":"claude --resume {SESSION_ID}"}}"#
+            )
+        );
+        // An unverified tree (the pane pid's start is not launcher.json's): nothing was killed, so every tree row
+        // is a survivor.
+        let w = stop_world(false, json!({}));
+        write(
+            &w.folder("bbbbbbbbbbbb").join("launcher.json"),
+            json!({"pid": 300, "start": 2500}),
+        );
+        w.fakes.process(testing::row(300, 900, 3000));
+        w.fakes.process(testing::row(310, 300, 3100));
+        w.fakes.kill_ok(300);
+        w.fakes.kill_ok(310);
+        w.fakes.stop_report_with(crate::proc::windows::stop_report);
+        assert_eq!(
+            run(&w, stop, &["stop", "worker"]),
+            format!(
+                r#"ok {{"name":"worker","pane":"%9","survivors":2,"directory":"/work","resume":"claude --resume {SESSION_ID}"}}"#
             )
         );
     }

@@ -359,10 +359,7 @@ impl Launch<'_> {
             "taskLine": doing_line(&self.task), "createdAt": utc_o(ctx.clock.now())});
         write_json(&agent.folder.join("record.json"), &record)?;
         // Last: only a committed agent is live.
-        write_json(
-            &agent.folder.join("commit.json"),
-            &json!({"committedAt": utc_o(ctx.clock.now())}),
-        )?;
+        commit(ctx, &agent.folder)?;
         let mut reply = Map::new();
         reply.insert("name".into(), agent.name.clone().into());
         reply.insert("id".into(), agent.id.clone().into());
@@ -374,6 +371,35 @@ impl Launch<'_> {
         reply.insert("reason".into(), agent.plan.reason.into());
         Ok(reply)
     }
+}
+
+/// commit.json, the last write: from here the agent is live.
+fn commit(ctx: &Ctx, folder: &Path) -> Res<()> {
+    #[cfg(test)]
+    COMMIT_PROBE.with(|probe| {
+        if let Some(probe) = probe.borrow().as_ref() {
+            probe(folder);
+        }
+    });
+    write_json(
+        &folder.join("commit.json"),
+        &json!({"committedAt": utc_o(ctx.clock.now())}),
+    )
+}
+
+#[cfg(test)]
+type CommitProbe = Box<dyn Fn(&Path)>;
+
+#[cfg(test)]
+thread_local! {
+    // Sees the agent folder just before commit.json is written.
+    static COMMIT_PROBE: std::cell::RefCell<Option<CommitProbe>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Sets (or clears) the probe that sees the agent folder at the moment commit.json is written.
+#[cfg(test)]
+fn commit_probe(probe: Option<CommitProbe>) {
+    COMMIT_PROBE.with(|slot| *slot.borrow_mut() = probe);
 }
 
 /// Made private like the state, agents and mail folders.
@@ -598,11 +624,12 @@ const NOT_LETTERS: [u32; 536] = [
 mod tests {
     use super::*;
     use crate::agents::copilot::session_folder;
-    use crate::agents::fixture::{CLAUDE, World};
+    use crate::agents::fixture::{CLAUDE, PANE, World};
     use crate::checks::Context;
     use crate::ctx::Env;
     use crate::mux::{Kind as MuxKind, Output};
     use crate::parse::cmdline_length;
+    use crate::proc::Row;
     use serde_json::json;
     use std::cell::RefCell;
     use std::path::PathBuf;
@@ -627,6 +654,78 @@ mod tests {
         let mut w = ready(World::agent(""));
         w.ctx.admitted = true;
         w
+    }
+
+    // An agent caller (session OLD) that passes C3, C2 and C5 for real, launched in `<temp>/launch`, not its cwd. A
+    // Claude agent runs in bypass mode with a transcript and a session file; a Copilot agent was launched with
+    // --allow-all and its session has workspace.yaml (with its id line only when `id_line`) and events.jsonl.
+    fn admitted(client: Client, id_line: bool) -> (World, PathBuf) {
+        let mut w = ready(World::agent(""));
+        let base = w.ctx.cwd.parent().unwrap().to_path_buf();
+        let launch = base.join("launch");
+        std::fs::create_dir(&launch).unwrap();
+        let cwd = launch.to_str().unwrap().to_string();
+        w.ctx.home = base.join("home");
+        let mut env: Vec<(String, String)> = w
+            .ctx
+            .env
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        let argv = match client {
+            Client::Claude => {
+                env.push(("CLAUDE_CODE_SESSION_ID".into(), OLD.into()));
+                env.push(("CLAUDE_CODE_ENTRYPOINT".into(), "cli".into()));
+                let project = w.ctx.home.join(".claude").join("projects").join("p");
+                std::fs::create_dir_all(&project).unwrap();
+                std::fs::write(
+                    project.join(format!("{OLD}.jsonl")),
+                    "{\"type\":\"permission-mode\",\"permissionMode\":\"bypassPermissions\"}\n",
+                )
+                .unwrap();
+                let sessions = w.ctx.home.join(".claude").join("sessions");
+                std::fs::create_dir_all(&sessions).unwrap();
+                let session = json!({"cwd": cwd, "procStart": 1500, "sessionId": OLD});
+                std::fs::write(sessions.join(format!("{CLAUDE}.json")), session.to_string())
+                    .unwrap();
+                w.fakes.kernel_cwd(CLAUDE, &cwd);
+                // A pane no client has sized: the transcript decides alone.
+                w.fakes.mux_rule("#{pane_height}", 0, "2\n", "");
+                ["claude", "--dangerously-skip-permissions"]
+            }
+            Client::Copilot => {
+                env.push(("COPILOT_AGENT_SESSION_ID".into(), OLD.into()));
+                w.fakes.client(CLAUDE, Client::Copilot);
+                let source = session_folder(&w.ctx.home, OLD);
+                std::fs::create_dir_all(&source).unwrap();
+                let id = if id_line {
+                    format!("id: {OLD}\n")
+                } else {
+                    String::new()
+                };
+                std::fs::write(source.join("workspace.yaml"), format!("{id}cwd: {cwd}\n")).unwrap();
+                std::fs::write(
+                    source.join("events.jsonl"),
+                    format!(
+                        "{{\"type\":\"session.start\",\"data\":{{\"sessionId\":\"{OLD}\"}}}}\n"
+                    ),
+                )
+                .unwrap();
+                ["copilot", "--allow-all"]
+            }
+        };
+        w.ctx.env = Env::from_pairs(env);
+        w.fakes.process(Row {
+            pid: CLAUDE,
+            ppid: PANE,
+            start: Some(1500),
+            path: None,
+            argv: Some(argv.map(String::from).to_vec()),
+        });
+        w.fakes.prefer_last();
+        w.file("t.md", b"task");
+        w.file("b.md", b"brief");
+        (w, launch)
     }
 
     fn run(w: &World, args: &[&str]) -> String {
@@ -833,6 +932,19 @@ mod tests {
         .unwrap();
         let expected = json!({"socket": caller.socket, "serverPid": caller.server_pid, "serverStart": caller.server_start});
         assert_eq!(server, expected.to_string());
+        // A live pane whose name holds LF (or CR) still counts: six panes, one named `worker6\nhidden`, refuse a 7th.
+        for name in ["worker6\nhidden", "worker6\r\nhidden", "worker6\rhidden"] {
+            let w = human();
+            let mut six = rows(5);
+            six.push(format!("%26|@26|306|000000000a06|{name}"));
+            w.panes(&six.iter().map(String::as_str).collect::<Vec<_>>());
+            assert_eq!(
+                run(&w, &["-Client", "claude", "-Task", "hi"]),
+                "2 cap the session already has 6 live agents",
+                "{name:?}"
+            );
+            assert!(calls(&w, "new-window").is_empty(), "{name:?}");
+        }
         // Five leave room for a sixth, named after the taken ones.
         let w = human();
         let five = rows(5);
@@ -1176,6 +1288,177 @@ mod tests {
                 [json!("--session-id"), ok["sessionId"].clone()]
             );
         }
+        // An agent caller, admitted by C3, C2 and C5: the launch directory they verified (not its cwd) is the pane's
+        // -c and the record's directory, and the client arguments are whole for each client and context.
+        for (client, no_fork) in [
+            (Client::Claude, false),
+            (Client::Claude, true),
+            (Client::Copilot, false),
+            (Client::Copilot, true),
+        ] {
+            let (w, launch) = admitted(client, true);
+            assert_ne!(launch, w.ctx.cwd);
+            let mut args = vec![
+                "-Client",
+                client_name(client),
+                "-TaskFile",
+                "t.md",
+                "-BriefFile",
+                "b.md",
+            ];
+            if no_fork {
+                args.push("-NoFork");
+            }
+            let ok = reply(&run(&w, &args));
+            let new = ok["sessionId"].as_str().unwrap();
+            let folder = agents_dir(&w).join(ok["id"].as_str().unwrap());
+            let spec = folder.join("spec.json");
+            let prompt = read_json(&spec)["prompt"].clone();
+            let expected = match (client, no_fork) {
+                (Client::Claude, false) => {
+                    json!([
+                        "--resume",
+                        OLD,
+                        "--fork-session",
+                        "--session-id",
+                        new,
+                        prompt
+                    ])
+                }
+                (Client::Claude, true) => json!(["--session-id", new, prompt]),
+                (Client::Copilot, false) => json!(["--resume", new, "-i", prompt]),
+                (Client::Copilot, true) => json!(["--session-id", new, "-i", prompt]),
+            };
+            let case = format!("{client:?} no-fork {no_fork}");
+            assert_eq!(read_json(&spec)["args"], expected, "{case}");
+            let context = if no_fork { "brief" } else { "fork" };
+            assert_eq!(ok["context"], context, "{case}");
+            let window = calls(&w, "new-window");
+            assert_eq!(window.len(), 1, "{case}");
+            let tail: Vec<&str> = window[0][window[0].len() - 5..]
+                .iter()
+                .map(String::as_str)
+                .collect();
+            assert_eq!(
+                tail,
+                [
+                    "-c",
+                    launch.to_str().unwrap(),
+                    "/bin/mux-agent",
+                    "launcher",
+                    spec.to_str().unwrap()
+                ],
+                "{case}"
+            );
+            assert_eq!(
+                read_json(&folder.join("record.json"))["directory"],
+                launch.to_str().unwrap(),
+                "{case}"
+            );
+        }
+    }
+
+    #[test]
+    fn header_names_parent_transcript() {
+        // A cross-client agent starts brief-only; its header names the parent's own transcript: Claude's project
+        // JSONL or Copilot's events.jsonl.
+        for (parent, child) in [(Client::Claude, "copilot"), (Client::Copilot, "claude")] {
+            let (w, _) = admitted(parent, true);
+            let transcript = match parent {
+                Client::Claude => w
+                    .ctx
+                    .home
+                    .join(".claude")
+                    .join("projects")
+                    .join("p")
+                    .join(format!("{OLD}.jsonl")),
+                Client::Copilot => session_folder(&w.ctx.home, OLD).join("events.jsonl"),
+            };
+            let ok = reply(&run(
+                &w,
+                &["-Client", child, "-TaskFile", "t.md", "-BriefFile", "b.md"],
+            ));
+            assert_eq!(ok["reason"], "cross-client", "{parent:?}");
+            let folder = agents_dir(&w).join(ok["id"].as_str().unwrap());
+            let prompt = read_json(&folder.join("spec.json"))["prompt"].clone();
+            let slashes = |p: &Path| p.to_str().unwrap().replace('\\', "/");
+            assert_eq!(
+                prompt.as_str().unwrap().split('\n').nth(2).unwrap(),
+                format!(
+                    "Context: brief-only (cross-client); brief: {}; parent transcript: {}",
+                    slashes(&folder.join("brief.md")),
+                    slashes(&transcript)
+                ),
+                "{parent:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn copilot_copy_failed_starts_brief() {
+        // The session copy fails its check (workspace.yaml has no id line): the fork turns brief-only, so an agent
+        // caller must pass -BriefFile; nothing is launched or copied without it.
+        let (w, _) = admitted(Client::Copilot, false);
+        let sessions = session_folder(&w.ctx.home, OLD)
+            .parent()
+            .unwrap()
+            .to_path_buf();
+        let names = || {
+            let mut names: Vec<String> = std::fs::read_dir(&sessions)
+                .unwrap()
+                .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+                .collect();
+            names.sort();
+            names
+        };
+        assert_eq!(
+            run(&w, &["-Client", "copilot", "-TaskFile", "t.md"]),
+            "2 brief this agent starts brief-only, so an agent caller passes -BriefFile"
+        );
+        assert!(calls(&w, "new-window").is_empty());
+        assert!(agent_folders(&w).is_empty());
+        assert_eq!(names(), [OLD]);
+        // With a brief it starts a fresh session, and says why everywhere.
+        let ok = reply(&run(
+            &w,
+            &[
+                "-Client",
+                "copilot",
+                "-TaskFile",
+                "t.md",
+                "-BriefFile",
+                "b.md",
+            ],
+        ));
+        assert_eq!(
+            (&ok["context"], &ok["reason"]),
+            (&json!("brief"), &json!("copy-verification-failed"))
+        );
+        assert_eq!(names(), [OLD]);
+        let new = ok["sessionId"].as_str().unwrap();
+        let folder = agents_dir(&w).join(ok["id"].as_str().unwrap());
+        let spec = read_json(&folder.join("spec.json"));
+        let prompt = spec["prompt"].clone();
+        assert_eq!(spec["args"], json!(["--session-id", new, "-i", prompt]));
+        let tags = &calls(&w, "set-option")[0];
+        assert_eq!(
+            tags[tags.len() - 2..],
+            ["@agent-context", "brief:copy-verification-failed"]
+        );
+        let slashes = |p: &Path| p.to_str().unwrap().replace('\\', "/");
+        assert_eq!(
+            prompt.as_str().unwrap().split('\n').nth(2).unwrap(),
+            format!(
+                "Context: brief-only (copy-verification-failed); brief: {}; parent transcript: {}",
+                slashes(&folder.join("brief.md")),
+                slashes(&session_folder(&w.ctx.home, OLD).join("events.jsonl"))
+            )
+        );
+        let record = read_json(&folder.join("record.json"));
+        assert_eq!(
+            (&record["context"], &record["reason"]),
+            (&json!("brief"), &json!("copy-verification-failed"))
+        );
     }
 
     #[test]
@@ -1331,12 +1614,25 @@ mod tests {
             ));
             Ok(Output::default())
         });
+        // At the moment commit.json is written, record.json is already there and commit.json is not yet.
+        let seen = log.clone();
+        commit_probe(Some(Box::new(move |folder: &Path| {
+            seen.borrow_mut().push(format!(
+                "commit: record {} commit {}",
+                folder.join("record.json").is_file(),
+                folder.join("commit.json").exists()
+            ));
+        })));
         w.fakes.clear_log();
         let ok = reply(&run(&w, &["-Client", "claude", "-Task", "hi"]));
         let id = ok["id"].as_str().unwrap();
         assert_eq!(
             *log.borrow(),
-            ["launch spec true", "tag record false commit false"]
+            [
+                "launch spec true",
+                "tag record false commit false",
+                "commit: record true commit false"
+            ]
         );
         let caller = w.caller();
         assert_eq!(
@@ -1404,7 +1700,11 @@ mod tests {
                 "reason"
             ]
         );
-        // A record that cannot be written is never committed: the launch aborts and the pane closes.
+        // A record that cannot be written is never committed: the launch aborts and the pane closes, and no commit
+        // was ever written.
+        let commits = Rc::new(RefCell::new(0));
+        let seen = commits.clone();
+        commit_probe(Some(Box::new(move |_: &Path| *seen.borrow_mut() += 1)));
         let w = human();
         let dir = agents_dir(&w);
         w.fakes.mux_script("set-option", move |argv| {
@@ -1418,5 +1718,7 @@ mod tests {
         let folder = agents_dir(&w).join(&agent_folders(&w)[0]);
         assert!(folder.join("abort.json").is_file() && !folder.join("commit.json").exists());
         assert_eq!(calls(&w, "kill-pane").len(), 1);
+        assert_eq!(*commits.borrow(), 0);
+        commit_probe(None);
     }
 }

@@ -1132,5 +1132,34 @@ mod tests {
             ]
         );
         assert_eq!(roles(&panes), "%1=|,%2=other|,%7=sidebar|");
+        // The pane command is two arguments, the exe (spaces and all) then `watch`, never one joined string.
+        let (mut w, _) = sidebar_world("", Mux::default());
+        w.ctx.exe = std::path::PathBuf::from("/opt/mux agents/bin/mux-agent");
+        assert!(run(&w, &[]).starts_with("ok "));
+        let split: Vec<Vec<String>> = w
+            .fakes
+            .mux_calls()
+            .into_iter()
+            .filter(|c| c[1] == "split-window")
+            .collect();
+        let mut expected: Vec<String> = [
+            "-N",
+            "split-window",
+            "-d",
+            "-h",
+            "-P",
+            "-F",
+            "#{pane_id}|#{window_id}",
+            "-t",
+            "%1",
+        ]
+        .map(String::from)
+        .to_vec();
+        expected.extend(crate::agents::spawn::pane_env(
+            w.ctx.state_root.to_str().unwrap(),
+            crate::state::root::HOST,
+        ));
+        expected.extend(["-l", "42", "/opt/mux agents/bin/mux-agent", "watch"].map(String::from));
+        assert_eq!(split, [expected]);
     }
 }

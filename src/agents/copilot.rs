@@ -362,4 +362,71 @@ mod tests {
         assert!(!copy_session(home.path(), OLD, NEW));
         assert_eq!(std::fs::read_dir(home.path()).unwrap().count(), 0);
     }
+
+    // Whether any real file below `folder` holds `needle`; links are not followed, so only copies count.
+    #[cfg(unix)]
+    fn holds(folder: &Path, needle: &[u8]) -> bool {
+        std::fs::read_dir(folder).unwrap().any(|entry| {
+            let path = entry.unwrap().path();
+            let kind = std::fs::symlink_metadata(&path).unwrap().file_type();
+            if kind.is_dir() {
+                holds(&path, needle)
+            } else if kind.is_file() {
+                let bytes = std::fs::read(&path).unwrap();
+                bytes.windows(needle.len()).any(|w| w == needle)
+            } else {
+                false
+            }
+        })
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn copilot_copy_refuses_links() {
+        use std::os::unix::fs::symlink;
+        const SECRET: &[u8] = b"outside-secret";
+        // A session folder that is itself a link to a well-formed session elsewhere: refused, nothing made.
+        let s = session();
+        let outside = TempDir::new();
+        let real = outside.path().join("session");
+        std::fs::rename(&s.source, &real).unwrap();
+        std::fs::write(real.join("secret.txt"), SECRET).unwrap();
+        symlink(&real, &s.source).unwrap();
+        let before = tree(outside.path());
+        assert!(!copy_session(s.home.path(), OLD, NEW));
+        assert_eq!(names(s.target.parent().unwrap()), [OLD]);
+        assert!(!holds(s.home.path(), SECRET));
+        assert_eq!(tree(outside.path()), before);
+
+        // A linked file or folder anywhere below the session: refused, the temp folder removed, nothing of the
+        // link's target copied.
+        type Link = fn(&Path, &Path);
+        let links: [(&str, Link); 3] = [
+            ("top file", |source, outside| {
+                symlink(outside.join("secret.txt"), source.join("notes.txt")).unwrap()
+            }),
+            ("nested file", |source, outside| {
+                std::fs::create_dir(source.join("checkpoints")).unwrap();
+                symlink(
+                    outside.join("secret.txt"),
+                    source.join("checkpoints").join("index.jsonl"),
+                )
+                .unwrap()
+            }),
+            ("folder", |source, outside| {
+                symlink(outside, source.join("files")).unwrap()
+            }),
+        ];
+        for (name, link) in links {
+            let s = session();
+            let outside = TempDir::new();
+            std::fs::write(outside.path().join("secret.txt"), SECRET).unwrap();
+            link(&s.source, outside.path());
+            let before = tree(outside.path());
+            assert!(!copy_session(s.home.path(), OLD, NEW), "{name}");
+            assert_eq!(names(s.target.parent().unwrap()), [OLD], "{name}");
+            assert!(!holds(s.target.parent().unwrap(), SECRET), "{name}");
+            assert_eq!(tree(outside.path()), before, "{name}");
+        }
+    }
 }

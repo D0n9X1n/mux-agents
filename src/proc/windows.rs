@@ -21,9 +21,13 @@ pub fn token_admits(token: Option<Token>) -> bool {
     token.is_some_and(|t| !t.app_container && !t.restricted && t.integrity_rid >= 8192)
 }
 
-/// Windows counts only the failed kills as survivors (MuxAgents.ps1:218).
+/// Windows counts the processes stop did not kill but may still run: failed kills (MuxAgents.ps1:218) and every row
+/// of a tree that was never walked. A row that would not open or showed another start is gone or not the agent's.
 pub fn stop_report(left: &[Left]) -> Map<String, Value> {
-    let failed = left.iter().filter(|l| l.reason == Reason::Kill).count();
+    let failed = left
+        .iter()
+        .filter(|l| matches!(l.reason, Reason::Kill | Reason::Unverified))
+        .count();
     let mut report = Map::new();
     report.insert("survivors".into(), failed.into());
     report
@@ -534,11 +538,12 @@ mod tests {
             (320, Reason::Start),
             (330, Reason::Open),
             (340, Reason::Kill),
+            (350, Reason::Unverified),
         ]
         .map(|(pid, reason)| Left { pid, reason });
         assert_eq!(
             Value::Object(stop_report(&left)).to_string(),
-            r#"{"survivors":2}"#
+            r#"{"survivors":3}"#
         );
         assert_eq!(
             Value::Object(stop_report(&[])).to_string(),

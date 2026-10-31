@@ -40,6 +40,8 @@ pub enum Reason {
     Open,
     Start,
     Kill,
+    /// The pane's process is not the launcher launcher.json recorded, so its tree was never opened or killed.
+    Unverified,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
