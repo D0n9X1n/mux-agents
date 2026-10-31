@@ -148,10 +148,103 @@ fn without_tests(src: &str) -> String {
     String::from_utf8(code).expect("only whole items are blanked")
 }
 
-/// How many process-spawn names the non-test code of `src` holds.
+/// The spans of the `use` declarations in masked `code`: the keyword to its `;`, holding only a use tree's
+/// characters (so `impl Trait + use<'a>` is not one).
+fn use_decls(code: &[u8]) -> Vec<(usize, usize)> {
+    let tree = |c: &u8| ident(*c) || c.is_ascii_whitespace() || b":{},*".contains(c);
+    let mut spans = Vec::new();
+    let mut i = 0;
+    while let Some(found) = code[i..].windows(3).position(|w| w == b"use") {
+        let start = i + found;
+        i = start + 3;
+        let word =
+            (start == 0 || !ident(code[start - 1])) && code.get(i).is_some_and(|c| !ident(*c));
+        let Some(semi) = code[i..].iter().position(|&c| c == b';') else {
+            break;
+        };
+        if word && code[i..i + semi].iter().all(tree) {
+            spans.push((start, i + semi + 1));
+            i += semi + 1;
+        }
+    }
+    spans
+}
+
+/// A use tree with whitespace dropped, except one space between two identifiers (`Command as Other`).
+fn compact(tree: &[u8]) -> String {
+    let mut out = String::new();
+    let mut gap = false;
+    for &c in tree {
+        if c.is_ascii_whitespace() {
+            gap = true;
+            continue;
+        }
+        if gap && ident(c) && out.bytes().last().is_some_and(ident) {
+            out.push(' ');
+        }
+        gap = false;
+        out.push(c as char);
+    }
+    out
+}
+
+/// Whether the word `name` starts at byte `at` of `text`.
+fn word_at(text: &str, at: usize, name: &str) -> bool {
+    let b = text.as_bytes();
+    text[at..].starts_with(name)
+        && (at == 0 || !ident(b[at - 1]))
+        && b.get(at + name.len()).is_none_or(|c| !ident(*c))
+}
+
+/// Whether a compacted use tree imports `Command` from `process`: by name (aliased or not, grouped or nested at
+/// any depth) or by a glob.
+fn imports_command(tree: &str) -> bool {
+    tree.match_indices("process::").any(|(at, _)| {
+        if at > 0 && ident(tree.as_bytes()[at - 1]) {
+            return false;
+        }
+        let rest = &tree[at + "process::".len()..];
+        if !rest.starts_with('{') {
+            return rest.starts_with('*') || word_at(rest, 0, "Command");
+        }
+        // The group's own braces, to the one that closes it.
+        let mut depth = 0;
+        let close = rest
+            .char_indices()
+            .find(|&(_, c)| {
+                depth += match c {
+                    '{' => 1,
+                    '}' => -1,
+                    _ => 0,
+                };
+                depth == 0
+            })
+            .map_or(rest.len(), |(k, _)| k);
+        let group = &rest[..close];
+        group.contains('*')
+            || group
+                .match_indices("Command")
+                .any(|(k, _)| word_at(group, k, "Command"))
+    })
+}
+
+/// How many process-spawn sites the non-test code of `src` holds: each `use` that imports `std::process::Command`
+/// in any form (named, aliased, grouped, glob), and each `Command::new` or `process::Command` path outside one.
 fn spawn_sites(src: &str) -> usize {
-    let code = without_tests(src);
-    NAMES.iter().map(|name| code.matches(name).count()).sum()
+    let mut code = without_tests(src).into_bytes();
+    let mut imports = 0;
+    for (start, end) in use_decls(&code) {
+        if imports_command(&compact(&code[start..end])) {
+            imports += 1;
+        }
+        code[start..end].fill(b' ');
+    }
+    let code = String::from_utf8(code).expect("only whole declarations are blanked");
+    imports
+        + NAMES
+            .iter()
+            .map(|name| code.matches(name).count())
+            .sum::<usize>()
 }
 
 fn rust_files(dir: &Path, out: &mut Vec<PathBuf>) {
@@ -197,6 +290,32 @@ mod inner {
         "a \"b{\" 'c' // d\ne".len()
     );
     assert!(!mask("x = \"{\";").contains('{'));
+}
+
+// Every way a `use` can bring in `Command` (aliased, grouped, nested, spaced, glob) is a site; other imports from
+// std::process and names that only start with `Command` are not.
+#[test]
+fn scanner_flags_every_command_import() {
+    for src in [
+        "use std::process::{Command as Other};\nfn run() { Other::new(\"x\"); }",
+        "use std::process::{self, Command};",
+        "use std::process::*;",
+        "pub(crate) use std::process::{\n    Child,\n    Command,\n};",
+        "use std :: process :: { Stdio, Command as C };",
+        "use std::{io, process::{Command, Stdio}};",
+        "use std::process::{*};",
+        "use std::{ process :: Command };",
+    ] {
+        assert_eq!(spawn_sites(src), 1, "{src}");
+    }
+    for src in [
+        "use std::process::{ExitCode, Stdio};",
+        "use std::process::{self};\nfn f() -> process::ExitCode { process::ExitCode::SUCCESS }",
+        "fn reuse() { let used = 1; }",
+        "#[cfg(test)]\nuse std::process::{Command as Other};",
+    ] {
+        assert_eq!(spawn_sites(src), 0, "{src}");
+    }
 }
 
 #[test]

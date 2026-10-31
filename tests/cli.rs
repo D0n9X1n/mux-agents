@@ -149,23 +149,58 @@ fn launcher_relative_spec_exit_2() {
     );
 }
 
-// The state root is resolved only for a call that parsed; a bad one refuses with no verb, as the reference did.
+// The providers are built before the arguments are parsed, as the reference's entry did, so a bad state root
+// refuses with no verb even for a call that would not parse.
 #[cfg(unix)]
 #[test]
 fn relative_state_root_refuses_state_1() {
+    let want = (
+        1,
+        format!(
+            r#"{{"ok":false,"verb":null,"code":1,"check":"state","message":"MUX_AGENTS_STATE is not an absolute path"}}{NL}"#
+        ),
+        String::new(),
+    );
+    for args in [&["list"][..], &["bogus"], &["list", "-Text"], &[]] {
+        let mut call = command(args);
+        call.env("MUX_AGENTS_STATE", "relative/state");
+        assert_eq!(output(call), want, "{args:?}");
+    }
+}
+
+// A relative HOME would resolve against the cwd, where a planted transcript could pass a check; with a valid state
+// root it still refuses before any verb runs.
+#[cfg(unix)]
+#[test]
+fn relative_home_refuses_state_1() {
+    let state = std::env::temp_dir();
+    assert!(state.is_absolute());
     let mut call = command(&["list"]);
-    call.env("MUX_AGENTS_STATE", "relative/state");
+    call.env("MUX_AGENTS_STATE", &state)
+        .env("HOME", "relative/home");
     assert_eq!(
         output(call),
         (
             1,
             format!(
-                r#"{{"ok":false,"verb":null,"code":1,"check":"state","message":"MUX_AGENTS_STATE is not an absolute path"}}{NL}"#
+                r#"{{"ok":false,"verb":null,"code":1,"check":"state","message":"HOME is not an absolute path"}}{NL}"#
             ),
             String::new()
         )
     );
-    let mut bogus = command(&["bogus"]);
-    bogus.env("MUX_AGENTS_STATE", "relative/state");
-    assert_eq!(output(bogus).0, 2);
+}
+
+// `watch` reaches its own handler through the verb table: with stdout a pipe it refuses as only watch does.
+#[test]
+fn watch_dispatches_to_watch_handler() {
+    assert_eq!(
+        mux_agent(&["watch"]),
+        (
+            2,
+            format!(
+                r#"{{"ok":false,"verb":"watch","code":2,"check":"usage","message":"watch draws only to a terminal: it runs in the side-bar pane"}}{NL}"#
+            ),
+            String::new()
+        )
+    );
 }

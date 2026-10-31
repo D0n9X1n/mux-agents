@@ -18,6 +18,8 @@ usable() {
 }
 
 for bin in "${MUX_AGENTS_BIN-}" "$plugin/scripts/bin/$os-$arch/mux-agent" "$plugin/target/release/mux-agent"; do
+  # A name with no slash is a file in the cwd, so exec runs the file checked rather than searching PATH.
+  case $bin in '' | */*) ;; *) bin=./$bin ;; esac
   if usable "$bin"; then exec "$bin" "$@"; fi
 done
 

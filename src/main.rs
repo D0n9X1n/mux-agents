@@ -39,7 +39,8 @@ fn exe() -> Res<PathBuf> {
     Ok(real)
 }
 
-// The providers, built only once a call has parsed. The multiplexer connects on first use.
+// The providers, built before the arguments are parsed, as the reference entry did. The multiplexer connects on
+// first use.
 fn ctx() -> Res<Ctx> {
     let env = Env::from_os(std::env::vars_os());
     let state_root = root(&env, HOST)?;

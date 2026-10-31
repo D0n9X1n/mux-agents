@@ -208,16 +208,16 @@ fn dispatch(def: &VerbDef, request: &Request, ctx: &Ctx) -> Res<Map<String, Valu
     Ok(reply)
 }
 
-/// Parse, build the providers, run the verb and map the outcome to exit code 0, 1 or 2 and the reply text, never
-/// echoing an error's own text. The providers are built only for a call that parsed; one that cannot be built
-/// replies as JSON with no verb, as the reference's provider failure did. A panic in the verb is 1 `internal`;
+/// Build the providers, parse, run the verb and map the outcome to exit code 0, 1 or 2 and the reply text, never
+/// echoing an error's own text. The providers come first, as in the reference's entry (mux-agent.ps1): one that
+/// cannot be built replies as JSON with no verb, whatever the arguments. A panic in the verb is 1 `internal`;
 /// unwinding has already released its locks.
 pub fn run<C: Borrow<Ctx>>(args: &[String], ctx: impl FnOnce() -> Res<C>) -> (u8, String) {
-    let (verb, text, outcome) = match parse(args) {
+    let (verb, text, outcome) = match ctx() {
         Err(refusal) => (None, false, Err(refusal)),
-        Ok((def, request)) => match ctx() {
+        Ok(ctx) => match parse(args) {
             Err(refusal) => (None, false, Err(refusal)),
-            Ok(ctx) => {
+            Ok((def, request)) => {
                 let outcome =
                     panic::catch_unwind(AssertUnwindSafe(|| dispatch(def, &request, ctx.borrow())))
                         .unwrap_or_else(|_| refuse(1, "internal", "unexpected error (panic)"));
@@ -760,9 +760,8 @@ mod tests {
         assert!(VERBS.iter().all(|d| d.name != "launcher"));
         let (code, check) = usage_of(&["launcher", "/s/spec.json"]);
         assert_eq!((code, check), (2, "usage"));
-        let (code, out) = run(&args(&["launcher", "/s/spec.json"]), || -> Res<Ctx> {
-            panic!("a refused call builds no providers")
-        });
+        let w = World::human("");
+        let (code, out) = call(&w, &["launcher", "/s/spec.json"]);
         assert_eq!(code, 2);
         assert!(!out.contains("launcher"), "{out}");
         // Only the exact `launcher <spec>` reaches the pane launcher.

@@ -122,14 +122,27 @@ fn same_path(resolved: &Path, given: &str, os: OsKind) -> bool {
     match os {
         OsKind::Unix => resolved == given,
         OsKind::Windows => {
-            // A UNC answer (`\\?\UNC\...`) keeps its prefix, so it never equals a drive path.
-            let plain = |p: &str| match p.strip_prefix(r"\\?\") {
-                Some(rest) if !rest.starts_with(r"UNC\") => rest.to_lowercase(),
-                _ => p.to_lowercase(),
-            };
+            // A spec on a share never runs: either side UNC refuses before any comparison.
+            if unc(resolved) || unc(given) {
+                return false;
+            }
+            let plain = |p: &str| p.strip_prefix(r"\\?\").unwrap_or(p).to_lowercase();
             plain(resolved) == plain(given)
         }
     }
+}
+
+/// A Windows path that starts with two separators (`\\srv\share`, `\\?\UNC\...`, `//srv/share`, `\\.\...`) other
+/// than a drive's `\\?\C:`.
+fn unc(path: &str) -> bool {
+    let b = path.as_bytes();
+    let sep = |i: usize| matches!(b.get(i), Some(b'\\' | b'/'));
+    if !(sep(0) && sep(1)) {
+        return false;
+    }
+    let drive =
+        b.len() >= 6 && b[2] == b'?' && sep(3) && b[4].is_ascii_alphabetic() && b[5] == b':';
+    !drive
 }
 
 fn launch(
@@ -429,12 +442,19 @@ mod tests {
             r"C:\Users\RUNNER~1\AppData\Local\mux-agents\state\k\agents\a\spec.json",
             Windows
         ));
-        // A UNC answer keeps its prefix, so it never equals a drive path.
+        // A UNC spec always refuses, whatever form either side takes, even when both sides agree.
+        let unc = r"\\?\UNC\srv\share\spec.json";
+        let plain_unc = r"\\srv\share\spec.json";
+        assert!(!same(unc, plain_unc, Windows));
+        assert!(!same(unc, unc, Windows));
+        assert!(!same(plain_unc, plain_unc, Windows));
+        assert!(!same(r"\\?\unc\srv\share\spec.json", unc, Windows));
         assert!(!same(
-            r"\\?\UNC\srv\share\spec.json",
-            r"\\srv\share\spec.json",
+            "//srv/share/spec.json",
+            "//srv/share/spec.json",
             Windows
         ));
+        assert!(!same(&resolved, plain_unc, Windows));
         // Unix: exact bytes, no prefix and no case folding.
         assert!(same(
             "/s/k/agents/a/spec.json",

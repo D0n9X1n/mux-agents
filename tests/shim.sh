@@ -100,6 +100,12 @@ if [ "$rc" = 7 ] && [ "$out" = "tier3
 [stop]
 [z]" ]; then ok exit_code_forwarded; else bad exit_code_forwarded "rc=$rc out=$out"; fi
 
+# A MUX_AGENTS_BIN with no slash names a file in the cwd, the one checked, never a namesake on PATH.
+reset; fake "$tmp/cwd/qa-bin" in-cwd; fake "$tmp/path/qa-bin" on-path; export MUX_AGENTS_BIN=qa-bin
+out=$(cd "$tmp/cwd" && PATH="$tmp/path:$PATH" "$shim" go); rc=$?
+expect bare_bin_runs_cwd_file "in-cwd
+[go]"
+
 reset; export MUX_AGENTS_BIN="$tmp/missing"; run list
 want="{\"ok\":false,\"verb\":null,\"code\":1,\"check\":\"entry\",\"message\":\"no usable mux-agent binary for $os-$arch\"}"
 if [ "$rc" = 1 ] && [ "$out" = "$want" ]; then ok none_usable_prints_entry_json_exit_1; else bad none_usable_prints_entry_json_exit_1 "rc=$rc out=$out"; fi
