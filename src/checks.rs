@@ -484,13 +484,66 @@ fn read_small(path: &Path) -> Result<Vec<u8>, bool> {
 fn json_object(bytes: &[u8]) -> Option<serde_json::Map<String, serde_json::Value>> {
     let text = bytes.strip_prefix(b"\xef\xbb\xbf").unwrap_or(bytes);
     let value: serde_json::Value = serde_json::from_slice(text).ok()?;
-    if case_collides(&value) {
+    // serde_json keeps the last of two equal keys, so an exact duplicate is found in the text itself.
+    if case_collides(&value) || duplicate_key(std::str::from_utf8(text).ok()?) {
         return None;
     }
     match value {
         serde_json::Value::Object(map) => Some(map),
         _ => None,
     }
+}
+
+/// Whether an object at any depth names one key twice, escapes decoded. Runs only on text serde_json already
+/// parsed, so the scan needs no error handling: it tracks objects and arrays and reads each object's keys.
+fn duplicate_key(text: &str) -> bool {
+    use std::collections::HashSet;
+    // One entry per open object (its keys so far) or array (none).
+    let mut open: Vec<Option<HashSet<String>>> = Vec::new();
+    // Whether the next string in the innermost object is a key.
+    let mut expect_key = false;
+    let bytes = text.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'{' => {
+                open.push(Some(HashSet::new()));
+                expect_key = true;
+            }
+            b'[' => {
+                open.push(None);
+                expect_key = false;
+            }
+            b'}' | b']' => {
+                open.pop();
+                expect_key = false;
+            }
+            b',' => expect_key = matches!(open.last(), Some(Some(_))),
+            b':' => expect_key = false,
+            b'"' => {
+                let start = i;
+                i += 1;
+                while bytes[i] != b'"' {
+                    i += if bytes[i] == b'\\' { 2 } else { 1 };
+                }
+                if expect_key {
+                    let Ok(key) = serde_json::from_str::<String>(&text[start..=i]) else {
+                        // A key serde_json read but String cannot hold (a lone surrogate): refuse.
+                        return true;
+                    };
+                    if let Some(Some(keys)) = open.last_mut()
+                        && !keys.insert(key)
+                    {
+                        return true;
+                    }
+                    expect_key = false;
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    false
 }
 
 /// Whether an object at any depth has two keys equal but for case, which ConvertFrom-Json refuses: `cwd` and `CWD`
@@ -1313,6 +1366,61 @@ mod tests {
             run(&format!(r#"{{"cwd":{quoted},"meta":{{"a":1,"b":2}}}}"#)),
             found(work.path())
         );
+    }
+
+    #[test]
+    fn directory_session_file_duplicate_key_refuses() {
+        // An exact duplicate key is malformed: a second value must never stand beside the one checked.
+        let (home, work) = (TempDir::new(), TempDir::new());
+        let cwd = work.path().to_str().unwrap();
+        let quoted = serde_json::to_string(cwd).unwrap();
+        let file = sessions(home.path()).join("150.json");
+        let unix = |contents: &str| {
+            std::fs::write(&file, contents).unwrap();
+            unix_directory(home.path(), &[Some(1500), Some(1500)], Some(cwd)).0
+        };
+        let refused = [
+            format!(r#"{{"cwd":"/other","cwd":{quoted}}}"#),
+            format!(r#"{{"cwd":{quoted},"cwd":"/other"}}"#),
+            format!(r#"{{"cwd":{quoted},"cwd":{quoted}}}"#),
+            format!(r#"{{"cwd":{quoted},"meta":{{"a":1,"a":2}}}}"#),
+            format!(r#"{{"cwd":{quoted},"list":[{{"k":1,"k":2}}]}}"#),
+            // An escaped key is the same key.
+            format!(r#"{{"cwd":"/other","c\u0077d":{quoted}}}"#),
+        ];
+        for contents in &refused {
+            assert_eq!(unix(contents), UNCONFIRMED, "{contents}");
+        }
+        // The same key in different objects, or as a value, is no duplicate.
+        for contents in [
+            format!(r#"{{"cwd":{quoted},"a":{{"cwd":1}},"b":{{"cwd":2}}}}"#),
+            format!(r#"{{"cwd":{quoted},"note":"cwd","list":[{{"k":1}},{{"k":2}}]}}"#),
+        ] {
+            assert_eq!(unix(&contents), found(work.path()), "{contents}");
+        }
+        // Windows reads the same file for the same decision.
+        let caller = agent_caller(Client::Claude, Some(&["claude"]));
+        let windows = |contents: &str| {
+            std::fs::write(&file, contents).unwrap();
+            let fakes = Fakes::default();
+            let env = [("CLAUDE_CODE_SESSION_ID", SID)];
+            answer(launch_directory(
+                &ctx_at(&fakes, home.path(), &env),
+                &caller,
+                OsKind::Windows,
+            ))
+        };
+        let good = format!(r#"{{"sessionId":"{SID}","cwd":{quoted},"procStart":"1500"}}"#);
+        assert_eq!(windows(&good), found(work.path()));
+        for contents in [
+            format!(r#"{{"sessionId":"{SID}","cwd":"/other","cwd":{quoted},"procStart":"1500"}}"#),
+            format!(
+                r#"{{"sessionId":"{OTHER_SID}","sessionId":"{SID}","cwd":{quoted},"procStart":"1500"}}"#
+            ),
+            format!(r#"{{"sessionId":"{SID}","cwd":{quoted},"procStart":"9","procStart":"1500"}}"#),
+        ] {
+            assert_eq!(windows(&contents), UNCONFIRMED, "{contents}");
+        }
     }
 
     #[test]
