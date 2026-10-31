@@ -53,6 +53,9 @@ Install Pester 4.10.1 and powershell-yaml 0.4.12 once, then run the tests:
 Install-Module Pester -RequiredVersion 4.10.1 -Scope CurrentUser
 Install-Module powershell-yaml -RequiredVersion 0.4.12 -Scope CurrentUser
 pwsh -NoProfile -File tests/Invoke-MuxAgentTests.ps1
+claude plugin test .
 ```
+
+With Claude Code 2.1.310 or later, `claude plugin test .` runs the pane's tests.
 
 Each OS skips the suites tagged for the other OSes. Suites tagged integration run only with -Integration, on Linux or macOS with tmux 3.2+ and cc: pwsh -NoProfile -File tests/Invoke-MuxAgentTests.ps1 -Path tests/integration -Integration. The script exits 1 when any test fails.
