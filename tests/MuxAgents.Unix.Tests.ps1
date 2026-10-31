@@ -130,3 +130,12 @@ Describe 'MuxAgents unix kernels' {
         "$($answers -join ',')|$(Test-MuxAgentUnixGone -Probe $probes[2] -Id 301)" | Should BeExactly 'False,False,True,False,False|False' }
     It 'each production IsGone answers not gone for this live process, whether its probe runs (its own OS) or fails (no such libc)' {
         "$(& (New-MuxAgentLinuxKernel).IsGone $PID)|$(& (New-MuxAgentMacKernel).IsGone $PID)" | Should BeExactly 'False|False' } }
+Describe 'MuxAgents unix sandbox' {
+    It 'linux refuses SANDBOX_RUNTIME=1, unreadable status, no NoNewPrivs line or NoNewPrivs 1, naming the signal' {
+        $answers = foreach ($case in @(@('1', "NoNewPrivs:`t0`n"), @('', $null), @('', "Name:`tx`n"), @('', "Name:`tx`nNoNewPrivs:`t1`n"), @('0', "NoNewPrivs:`t0`n"))) {
+            $k = New-UnixFakeKernel; $k.Status = $case[1]; Get-UnixRefusal { Assert-MuxAgentLinuxSandbox -Environment @{ SANDBOX_RUNTIME = $case[0] } -Kernel $k } }
+        ($answers -join ';') | Should BeExactly '2 sandbox SANDBOX_RUNTIME=1 is set;2 sandbox /proc/self/status is unreadable;2 sandbox NoNewPrivs is unreadable;2 sandbox NoNewPrivs is set;none' }
+    It 'macos refuses SANDBOX_RUNTIME=1, a non-zero sandbox_check or a failed one, naming the signal' {
+        $answers = foreach ($case in @(@('1', 0), @('', 1), @('', -1), @('', $null), @('', 0))) {
+            $k = New-UnixFakeKernel; $k.Sandbox = $case[1]; Get-UnixRefusal { Assert-MuxAgentMacSandbox -Environment @{ SANDBOX_RUNTIME = $case[0] } -Kernel $k } }
+        ($answers -join ';') | Should BeExactly '2 sandbox SANDBOX_RUNTIME=1 is set;2 sandbox sandbox_check reports a sandbox;2 sandbox sandbox_check reports a sandbox;2 sandbox sandbox_check failed;none' } }

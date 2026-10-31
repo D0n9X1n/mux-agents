@@ -105,3 +105,14 @@ function New-MuxAgentMacKernel { [pscustomobject]@{
     IsGone = { param([int]$Id) Test-MuxAgentUnixGone -Id $Id -Probe { param([int]$Id) Import-MuxAgentUnixNative; [MuxAgentUnixNative]::ProbeMac($Id) } }
     PidfdOpen = { param([int]$Id) -1 }; SendKill = { param([int]$Fd) $false }; WaitExit = { param([int]$Fd, [int]$Milliseconds) $false }; Close = { param([int]$Fd) }
     Sleep = { param([int]$Milliseconds) Start-Sleep -Milliseconds $Milliseconds } } }
+# Sandbox (C1) on Linux: refuses 2 'sandbox' for SANDBOX_RUNTIME=1, an unreadable /proc/self/status or NoNewPrivs set, naming the signal.
+function Assert-MuxAgentLinuxSandbox { param($Environment, [Parameter(Mandatory)]$Kernel)
+    if ("$($Environment['SANDBOX_RUNTIME'])" -ceq '1') { Exit-MuxAgentCommand 2 'sandbox' 'SANDBOX_RUNTIME=1 is set' }
+    $status = try { "$(& $Kernel.ReadStatus)" } catch { Exit-MuxAgentCommand 2 'sandbox' '/proc/self/status is unreadable' }
+    if ($status -notmatch '(?m)^NoNewPrivs:[ \t]*(\d+)[ \t]*$') { Exit-MuxAgentCommand 2 'sandbox' 'NoNewPrivs is unreadable' }
+    if ($Matches[1] -ne '0') { Exit-MuxAgentCommand 2 'sandbox' 'NoNewPrivs is set' } }
+# Sandbox (C1) on macOS: refuses 2 'sandbox' for SANDBOX_RUNTIME=1, or sandbox_check(getpid(), NULL, 0) non-zero or failing.
+function Assert-MuxAgentMacSandbox { param($Environment, [Parameter(Mandatory)]$Kernel)
+    if ("$($Environment['SANDBOX_RUNTIME'])" -ceq '1') { Exit-MuxAgentCommand 2 'sandbox' 'SANDBOX_RUNTIME=1 is set' }
+    $result = try { [int](& $Kernel.SandboxCheck) } catch { Exit-MuxAgentCommand 2 'sandbox' 'sandbox_check failed' }
+    if ($result -ne 0) { Exit-MuxAgentCommand 2 'sandbox' 'sandbox_check reports a sandbox' } }
