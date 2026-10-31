@@ -57,6 +57,15 @@ jobs:
       - name: Tests
         shell: pwsh
         run: pwsh -NoProfile -File tests/Invoke-MuxAgentTests.ps1
+      # The Rust rewrite's own tests, so its Linux and Windows code runs on those hosts.
+      - name: Rust 1.95.0
+        run: rustup toolchain install 1.95.0 --profile minimal --component clippy,rustfmt && rustup default 1.95.0
+      - name: Rust tests
+        run: |
+          cargo fmt --check
+          cargo clippy --all-targets --features test-panic --locked -- -D warnings
+          cargo test --features test-panic --locked
+          cargo test --release --features test-panic --locked --test panic
   integration:
     strategy:
       fail-fast: false
