@@ -106,6 +106,12 @@ Describe 'MuxAgents board mail reader' {
         # ignores C1 controls, so 'a' + U+009C + 'b' -ceq 'ab' is true.
         $all = -join (0x80..0x9F | ForEach-Object { [char]$_ })
         $out = ConvertTo-MuxAgentDoingLine ("a" + $all + "b")
+        (($out.ToCharArray() | ForEach-Object { '{0:X4}' -f [int]$_ }) -join ' ') | Should BeExactly '0061 0062' }
+    It 'removes every C0 control but LF and TAB, and DEL, from a doing line' {
+        # Catches: DEL or a C0 control dropped from the cleaner's class. Code points again, as culture-aware
+        # comparison ignores DEL.
+        $c0 = -join ((0x00..0x08) + (0x0B..0x1F) + 0x7F | ForEach-Object { [char]$_ })
+        $out = ConvertTo-MuxAgentDoingLine ("a" + $c0 + "b")
         (($out.ToCharArray() | ForEach-Object { '{0:X4}' -f [int]$_ }) -join ' ') | Should BeExactly '0061 0062' } }
 
 Describe 'MuxAgents board verb table' {
