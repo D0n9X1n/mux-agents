@@ -199,3 +199,14 @@ function Get-MuxAgentUnixStateRoot {
     else { Exit-MuxAgentCommand 1 'state' 'HOME is not an absolute path' }
     Resolve-MuxAgentUnixRealPath -Path $path
 }
+function Assert-MuxAgentUnixPrivate {
+    # The Unix privacy decision on gathered facts: refuses 1 'state' at the first failed check, in this order.
+    param([Parameter(Mandatory)]$Facts, [Parameter(Mandatory)][string]$User)
+    if ($Facts.Kind -ceq 'link') { Exit-MuxAgentCommand 1 'state' 'the state folder path has a link' }
+    if ($Facts.Kind -ceq 'file') { Exit-MuxAgentCommand 1 'state' 'the state folder path is a file' }
+    if ($Facts.Kind -cne 'directory') { Exit-MuxAgentCommand 1 'state' 'the state folder is missing' }
+    if ($Facts.Real -cne $Facts.Path) { Exit-MuxAgentCommand 1 'state' 'the state folder path has a link' }
+    if ($Facts.Owner -cne $User) { Exit-MuxAgentCommand 1 'state' 'the state folder has another owner' }
+    if ([int]$Facts.Mode -ne 448) { Exit-MuxAgentCommand 1 'state' "the state folder mode is $([Convert]::ToString([int]$Facts.Mode, 8)), not 700" }
+    if ("$($Facts.Listing)".Contains('+') -or @($Facts.Aces).Count) { Exit-MuxAgentCommand 1 'state' 'the state folder has an extended ACL' }
+}

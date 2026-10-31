@@ -143,3 +143,14 @@ Describe 'MuxAgents unix state root' {
         }
     }
 }
+Describe 'MuxAgents unix private decision' {
+    It 'passes only an unlinked 0700 directory of the user with no extended ACL, and names the first failed check' {
+        $base = @{ Path = '/r/k'; Kind = 'directory'; Identity = '66:12'; Mode = 448; Owner = '501'; Listing = 'drwx------'; Aces = @(); Real = '/r/k' }
+        $cases = @(@{}, @{ Kind = 'link'; Owner = $null }, @{ Kind = 'file' }, @{ Kind = 'missing' }, @{ Real = '/p/k'; Owner = '0'; Mode = 493 }, @{ Owner = '0'; Mode = 493 }, @{ Owner = '5010' }, @{ Mode = 493; Listing = 'drwxr-xr-x+' }, @{ Mode = 2496 }, @{ Mode = 960 }, @{ Mode = 384 }, @{ Listing = 'drwx------+' }, @{ Aces = @(' 0: group:everyone inherited allow list') }, @{ Listing = 'drwx------.' }, @{ Listing = 'drwx------@' })
+        $answers = foreach ($case in $cases) {
+            $facts = $base.Clone(); foreach ($key in $case.Keys) { $facts[$key] = $case[$key] }
+            Get-UnixStateRefusal { Assert-MuxAgentUnixPrivate -Facts ([pscustomobject]$facts) -User '501' }
+        }
+        ($answers -join ';') | Should BeExactly 'ok;1 state the state folder path has a link;1 state the state folder path is a file;1 state the state folder is missing;1 state the state folder path has a link;1 state the state folder has another owner;1 state the state folder has another owner;1 state the state folder mode is 755, not 700;1 state the state folder mode is 4700, not 700;1 state the state folder mode is 1700, not 700;1 state the state folder mode is 600, not 700;1 state the state folder has an extended ACL;1 state the state folder has an extended ACL;ok;ok'
+    }
+}
