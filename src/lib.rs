@@ -5,6 +5,7 @@ compile_error!("mux-agent runs on Windows, Linux and macOS only");
 
 pub mod ctx;
 pub mod error;
+pub mod json;
 pub mod mux;
 pub mod proc;
 #[cfg(test)]
