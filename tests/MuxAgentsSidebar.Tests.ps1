@@ -218,3 +218,48 @@ Describe 'MuxAgents sidebar watch loop' {
             Mock Get-MuxAgentBoard { throw [TimeoutException]::new('lock') }
             $ended = try { Start-MuxAgentWatch -P $fake -Caller (Resolve-MuxAgentCaller -P $fake) -Write { param($Frame) throw [IO.IOException]::new('EIO') } } catch { "threw $($_.Exception.Message)" }
             "$ended $(Get-SidebarProbes $fake) $($fake.Clock.ToString('o'))" | Should BeExactly 'output-closed 1 2026-10-29T12:00:00.0000000Z' } } }
+
+Describe 'MuxAgents sidebar watch verb' {
+    It 'registers watch with no arguments' {
+        # Catches: watch unregistered, positionals or options accepted.
+        $request = ConvertFrom-MuxAgentArgs -Arguments @('watch')
+        "$($request.Verb) $($request.Handler) $($request.Options.Count)" | Should BeExactly 'watch Invoke-MuxAgentWatch 0'
+        $run = Invoke-SidebarVerb (New-SidebarFake 'watch usage') @('watch', 'x')
+        "$($run.Code) $($run.Reply.check) $($run.Reply.message)" | Should BeExactly '2 usage usage: mux-agent watch [-Text]' }
+    It 'switches the real console encoding to UTF-8, so the glyphs leave as UTF-8 bytes, and the test restores it' {
+        # A child pwsh: its console starts on ASCII, Set-MuxAgentConsoleUtf8 runs, the child reports the code page and
+        # writes the bar glyphs through Console.Out; the parent reads the raw bytes. The child restores its encoding in a
+        # finally. Catches: a no-op setter (20127 and '???' = 3F3F3F), another encoding (a BOM or other bytes).
+        $script = Join-Path $TestDrive 'utf8-child.ps1'
+        [IO.File]::WriteAllText($script, @'
+param([string]$Library)
+. $Library
+$saved = [Console]::OutputEncoding
+try {
+    [Console]::OutputEncoding = [Text.Encoding]::ASCII
+    $before = [Console]::OutputEncoding.CodePage
+    Set-MuxAgentConsoleUtf8
+    [Console]::Out.Write("$before>$([Console]::OutputEncoding.CodePage)|" + [char]0x25CF + [char]0x25CB + [char]0x00B7)
+    [Console]::Out.Flush()
+}
+finally { [Console]::OutputEncoding = $saved }
+'@)
+        $info = [Diagnostics.ProcessStartInfo]::new([Diagnostics.Process]::GetCurrentProcess().MainModule.FileName)
+        foreach ($argument in '-NoProfile', '-File', $script, (Join-Path (Join-Path $repoRoot 'scripts') 'MuxAgents.ps1')) { $info.ArgumentList.Add($argument) }
+        $info.UseShellExecute = $false; $info.RedirectStandardOutput = $true; $info.RedirectStandardError = $true; $info.CreateNoWindow = $true
+        $child = [Diagnostics.Process]::Start($info)
+        $bytes = [IO.MemoryStream]::new(); $copy = $child.StandardOutput.BaseStream.CopyToAsync($bytes); $null = $child.StandardError.ReadToEndAsync()
+        $done = $child.WaitForExit(60000); $copy.Wait(10000) | Out-Null
+        "$done $($child.ExitCode) $([Convert]::ToHexString($bytes.ToArray()))" | Should BeExactly ('True 0 ' + [Convert]::ToHexString([Text.Encoding]::ASCII.GetBytes('20127>65001|')) + 'E2978FE2978BC2B7') }
+    Context 'watch handler spies' {
+        It 'sets the console to UTF-8, then runs the loop for its own pane on a stdout frame writer, and replies how it ended' {
+            # Catches: the console set after the writer, the writer built on another stream, another pane, the end not replied.
+            $fake = New-SidebarFake 'watch verb' -Pane '%7'
+            $global:sidebarOrder = [Collections.Generic.List[string]]::new()
+            Mock Set-MuxAgentConsoleUtf8 { $global:sidebarOrder.Add('utf8') }
+            Mock New-MuxAgentFrameWriter { $global:sidebarOrder.Add("writer $($Stream.GetType().Name -ne 'MemoryStream')"); { param($Frame) } }
+            Mock Start-MuxAgentWatch { $global:sidebarOrder.Add("watch $($Caller.Pane) $($Write -is [scriptblock])"); 'pane-closed' }
+            try {
+                $run = Invoke-SidebarVerb $fake @('watch')
+                "$($global:sidebarOrder -join ';') | $($run.Code) $($run.Reply.pane) $($run.Reply.ended)" | Should BeExactly 'utf8;writer True;watch %7 True | 0 %7 pane-closed' }
+            finally { Remove-Variable -Name sidebarOrder -Scope Global } } } }

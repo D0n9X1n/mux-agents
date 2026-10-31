@@ -1483,6 +1483,21 @@ function Start-MuxAgentWatch {
     }
 }
 
+function Set-MuxAgentConsoleUtf8 {
+    # The Windows console starts on an OEM code page, which would draw the side-bar glyphs as '?'. A console that
+    # refuses keeps its page: the bar still runs.
+    try { [Console]::OutputEncoding = [Text.UTF8Encoding]::new($false) } catch { }
+}
+
+function Invoke-MuxAgentWatch {
+    # The side-bar pane's process: draws the caller session's board until its pane closes.
+    param([Parameter(Mandatory)]$P, [Parameter(Mandatory)]$Request)
+    $caller = Resolve-MuxAgentCaller -P $P
+    Set-MuxAgentConsoleUtf8
+    $ended = Start-MuxAgentWatch -P $P -Caller $caller -Write (New-MuxAgentFrameWriter -Stream ([Console]::OpenStandardOutput()))
+    [ordered]@{ pane = $caller.Pane; ended = $ended }
+}
+
 # The pane launcher.
 
 $script:MuxAgentScrub = @('CLAUDECODE', 'CLAUDE_CODE_SESSION_ID', 'CLAUDE_CODE_MESSAGING_SOCKET', 'CLAUDE_CODE_MESSAGING_TOKEN', 'CLAUDE_CODE_CHILD_SESSION',
@@ -1570,6 +1585,7 @@ Register-MuxAgentVerb -Verb 'send' -Handler 'Invoke-MuxAgentSend' -Values @('Bod
 Register-MuxAgentVerb -Verb 'read' -Handler 'Invoke-MuxAgentRead' -Values @('Wait', 'Lines') -Min 0 -Max 1 -Usage 'usage: mux-agent read [-Wait <seconds>] | read <name> [-Lines <n>] [-Text]'
 Register-MuxAgentVerb -Verb 'stop' -Handler 'Invoke-MuxAgentStop' -Min 1 -Max 1 -Usage 'usage: mux-agent stop <name> [-Text]'
 Register-MuxAgentVerb -Verb 'status' -Handler 'Invoke-MuxAgentStatus' -Values @('Body', 'BodyFile') -Usage 'usage: mux-agent status (-Body <text> | -BodyFile <path>) [-Text]'
+Register-MuxAgentVerb -Verb 'watch' -Handler 'Invoke-MuxAgentWatch' -Usage 'usage: mux-agent watch [-Text]'
 
 # Unix member bodies (B2, B3, B4); they load everywhere and run only in the linux and macos member sets.
 . (Join-Path $PSScriptRoot 'MuxAgents.Unix.ps1')
