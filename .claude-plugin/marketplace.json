@@ -6,7 +6,7 @@
     {
       "name": "mux-agents",
       "source": "./",
-      "description": "Start, list, focus, message and stop Claude Code or Copilot CLI agents in the current RMUX session."
+      "description": "Start Claude Code and Copilot CLI agents in tmux or rmux panes, see what each is doing, message them and stop them."
     }
   ]
 }

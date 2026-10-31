@@ -250,11 +250,18 @@ Describe 'MuxAgents wiki pages' {
     function Get-WikiLinks([string]$Page) { @([regex]::Matches([IO.File]::ReadAllText((Join-Path $wikiRoot "$Page.md")), '\[[^\]]*\]\(([^)\s]+)\)') | ForEach-Object { $_.Groups[1].Value }) }
     function Get-WikiDrift([string]$Page) {
         # '' when Page-zh-CN matches Page line for line: the same count and, per line, the same shape, the same code
-        # spans and numbers, and Chinese prose; else '<en lines> <zh lines> <drifting line numbers>'.
+        # spans and numbers, and Chinese prose; inside a ``` fence the lines are identical instead. Else
+        # '<en lines> <zh lines> <drifting line numbers>'.
         $en = [IO.File]::ReadAllLines((Join-Path $wikiRoot "$Page.md"))
         $zh = [IO.File]::ReadAllLines((Join-Path $wikiRoot "$Page-zh-CN.md"))
+        $fenced = $false
         $drift = @(for ($i = 0; $i -lt [Math]::Max($en.Count, $zh.Count); $i++) {
             $a = "$($en[$i])"; $b = "$($zh[$i])"
+            if ($a.StartsWith('```') -or $fenced) {
+                if ($a.StartsWith('```')) { $fenced = -not $fenced }
+                if ($a -cne $b) { $i + 1 }
+                continue
+            }
             $codeA = @([regex]::Matches($a, '`[^`]+`|\d+(\.\d+)*') | ForEach-Object Value | Sort-Object -Unique) -join ' '
             $codeB = @([regex]::Matches($b, '`[^`]+`|\d+(\.\d+)*') | ForEach-Object Value | Sort-Object -Unique) -join ' '
             $shape = { param($l) if (-not $l.Trim()) { 'blank' } elseif ($l -match '^(#+|\||-|\d+\.) ?') { $Matches[1] } else { 'text' } }
@@ -263,8 +270,8 @@ Describe 'MuxAgents wiki pages' {
         })
         if ($en.Count -ne $zh.Count -or $drift.Count) { "$($en.Count) $($zh.Count) $($drift -join ',')" } else { '' }
     }
-    It 'has Home, Design-Foundation and Design-Side-Bar in English and Chinese' {
-        @('Home', 'Home-zh-CN', 'Design-Foundation', 'Design-Foundation-zh-CN', 'Design-Side-Bar', 'Design-Side-Bar-zh-CN' | Where-Object { $_ -cnotin $pages }) -join ',' | Should BeExactly ''
+    It 'has Home, the three design pages and the v0.1.0 release notes in English and Chinese' {
+        @('Home', 'Home-zh-CN', 'Design-Foundation', 'Design-Foundation-zh-CN', 'Design-Cross-Platform', 'Design-Cross-Platform-zh-CN', 'Design-Side-Bar', 'Design-Side-Bar-zh-CN', 'Release-v0.1.0', 'Release-v0.1.0-zh-CN' | Where-Object { $_ -cnotin $pages }) -join ',' | Should BeExactly ''
     }
     It 'pairs every English page with its -zh-CN page and back' {
         "$($pages.Count -gt 0) $(@($pages | Where-Object { (Get-WikiTwin $_) -cnotin $pages }) -join ',')" | Should BeExactly 'True '
@@ -281,16 +288,17 @@ Describe 'MuxAgents wiki pages' {
         $broken = @($links | Where-Object { $_.Target -cnotin $pages } | ForEach-Object { "$($_.Page)->$($_.Target)" })
         "$($links.Count -gt 0) $($broken -join ' ; ')" | Should BeExactly 'True '
     }
-    It 'Home links the design pages in its own language' {
-        "$((Get-WikiLinks 'Home') -ccontains 'Design-Foundation') $((Get-WikiLinks 'Home-zh-CN') -ccontains 'Design-Foundation-zh-CN') $((Get-WikiLinks 'Home') -ccontains 'Design-Side-Bar') $((Get-WikiLinks 'Home-zh-CN') -ccontains 'Design-Side-Bar-zh-CN')" | Should BeExactly 'True True True True'
+    It 'Home links the design pages and the release notes in its own language' {
+        $want = @{ 'Home' = @('Design-Foundation', 'Design-Cross-Platform', 'Design-Side-Bar', 'Release-v0.1.0'); 'Home-zh-CN' = @('Design-Foundation-zh-CN', 'Design-Cross-Platform-zh-CN', 'Design-Side-Bar-zh-CN', 'Release-v0.1.0-zh-CN') }
+        (@(foreach ($page in 'Home', 'Home-zh-CN') { $links = Get-WikiLinks $page; @($want[$page] | Where-Object { $links -cnotcontains $_ }) -join ',' }) -join ';') | Should BeExactly ';'
     }
     It 'keeps wiki/ flat: no folders, since the mirror publishes top-level pages only' {
         @(if (Test-Path -LiteralPath $wikiRoot) { Get-ChildItem -LiteralPath $wikiRoot -Directory -Force | ForEach-Object { $_.Name } }) -join ',' | Should BeExactly ''
         @(& git -C $repoRoot ls-files -- wiki | Where-Object { $_ -match '^wiki/.+/' }) -join ',' | Should BeExactly ''
     }
-    It 'Home states the platforms and what is not built yet, in both languages' {
+    It 'Home states the platforms and the side bar of v0.1.0, in both languages' {
         $status = foreach ($page in 'Home', 'Home-zh-CN') { @([IO.File]::ReadAllLines((Join-Path $wikiRoot "$page.md")) | Where-Object { $_ -match '^v0\.1\.0 ' }) -join ' / ' }
-        $status -join ' ; ' | Should BeExactly 'v0.1.0 is in progress. The code runs on Windows with rmux 0.10.0 and on Linux and macOS with tmux 3.2 or later. The side bar (#4) is in the code: a multiplexer split for every client and a pane in Claude Code. ; v0.1.0 正在开发中。代码在 Windows 上配合 rmux 0.10.0 运行，在 Linux 和 macOS 上配合 tmux 3.2 或更高版本运行。侧边栏（#4）已进入代码：每个客户端都可用的多路复用器分屏，以及 Claude Code 中的窗格。'
+        $status -join ' ; ' | Should BeExactly 'v0.1.0 runs on Windows with rmux 0.10.0 and on Linux and macOS with tmux 3.2 or later. It shows a side bar (#4): a multiplexer split for every client and a pane in Claude Code. ; v0.1.0 在 Windows 上配合 rmux 0.10.0 运行，在 Linux 和 macOS 上配合 tmux 3.2 或更高版本运行。它提供侧边栏（#4）：每个客户端都可用的多路复用器分屏，以及 Claude Code 中的窗格。'
     }
     It 'Home states the Linux and macOS lock limitation of older .NET, in both languages' {
         $want = @{ 'Home' = 'On Linux and macOS with .NET older than 8.0.32, 9.0.21 or 10.0.13, another local user can make mux-agent commands time out with check lock. Nothing leaks and no state is damaged. Use a current PowerShell.'
@@ -300,6 +308,26 @@ Describe 'MuxAgents wiki pages' {
         $en = [IO.File]::ReadAllLines((Join-Path $wikiRoot 'Design-Foundation.md'))
         @($en | Where-Object { $_ -match '^## ' }) -join ',' | Should BeExactly '## Purpose,## Decisions,## Changes,## Component map,## Behavior and its tests,## Must-pass,## Non-goals,## Prior art'
         Get-WikiDrift 'Design-Foundation' | Should BeExactly ''
+    }
+    It 'Design-Cross-Platform keeps its sections and states the Unix rules as built; its Chinese twin matches it line for line' {
+        # Catches: a lost section, a stale rule (the old Local\ lock name, kill on a start re-read, chmod-only folders), drift.
+        @([IO.File]::ReadAllLines((Join-Path $wikiRoot 'Design-Cross-Platform.md')) | Where-Object { $_ -match '^## ' }) -join ',' | Should BeExactly '## Purpose,## Decisions,## Unix provider members,## Changed behavior,## Component map,## Tests,## Must-pass,## Non-goals,## Prior art'
+        $found = foreach ($page in 'Design-Cross-Platform', 'Design-Cross-Platform-zh-CN') {
+            $text = [IO.File]::ReadAllText((Join-Path $wikiRoot "$page.md"))
+            "$page missing=$(@('`Global\MuxAgents-<uid>-<hash>`', '`mkdir(2)`', '`tmux -e`', '`realpath`', 'ESRCH' | Where-Object { -not $text.Contains($_) }) -join ',')"
+        }
+        $found -join ' ; ' | Should BeExactly 'Design-Cross-Platform missing= ; Design-Cross-Platform-zh-CN missing='
+        Get-WikiDrift 'Design-Cross-Platform' | Should BeExactly ''
+    }
+    It 'Release-v0.1.0 names the release zip and the install commands; its Chinese twin matches it line for line' {
+        # Catches: a zip name the release workflow does not build, an install line that drifts from the README, drift.
+        $found = foreach ($page in 'Release-v0.1.0', 'Release-v0.1.0-zh-CN') {
+            $lines = [IO.File]::ReadAllLines((Join-Path $wikiRoot "$page.md"))
+            $text = $lines -join "`n"
+            "$page zip=$($text.Contains('`mux-agents-v0.1.0.zip`')) install=$(@('claude plugin marketplace add D0n9X1n/mux-agents', 'copilot plugin install mux-agents@mux-agents' | Where-Object { $lines -cnotcontains $_ }).Count)"
+        }
+        $found -join ' ; ' | Should BeExactly 'Release-v0.1.0 zip=True install=0 ; Release-v0.1.0-zh-CN zip=True install=0'
+        Get-WikiDrift 'Release-v0.1.0' | Should BeExactly ''
     }
     It 'Design-Side-Bar states the pane and watch as built, keeps its sections, and its Chinese twin matches it line for line' {
         # Catches: a blanked or stale line (the pane's types, the -Text reply, the test files, watch's three ends and its

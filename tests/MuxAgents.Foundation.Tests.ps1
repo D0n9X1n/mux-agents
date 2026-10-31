@@ -142,6 +142,18 @@ Describe 'MuxAgents foundation docs' {
         $readme = [IO.File]::ReadAllLines((Join-Path $repoRoot 'README.md')); $skill = [IO.File]::ReadAllLines([IO.Path]::Combine($repoRoot, 'skills', 'mux-agents', 'SKILL.md'))
         $lines = '0.1.0 runs on Windows with rmux 0.10.0, and on Linux and macOS with tmux 3.2 or later. The code moved here from the Terminal Profiles repository and no longer depends on it.', '- Windows, Linux or macOS, PowerShell 7.4 or later.', '- rmux 0.10.0 on Windows, or tmux 3.2 or later on Linux and macOS, with the caller inside a pane.'
         "$(@($lines | Where-Object { $readme -cnotcontains $_ }).Count) $($skill -ccontains 'Use this skill inside an RMUX pane on Windows or a tmux 3.2+ pane on Linux or macOS; the tool refuses elsewhere.')" | Should BeExactly '0 True' }
+    It 'README, plugin.json and the marketplace entry share one tagline; install names the repository' {
+        # Catches: a manifest left on the old RMUX-only line, a README tagline that drifts, a placeholder install source.
+        $tagline = 'Start Claude Code and Copilot CLI agents in tmux or rmux panes, see what each is doing, message them and stop them.'
+        $readme = [IO.File]::ReadAllLines((Join-Path $repoRoot 'README.md'))
+        $plugin = [IO.File]::ReadAllText([IO.Path]::Combine($repoRoot, '.claude-plugin', 'plugin.json')) | ConvertFrom-Json
+        $market = [IO.File]::ReadAllText([IO.Path]::Combine($repoRoot, '.claude-plugin', 'marketplace.json')) | ConvertFrom-Json
+        $install = @('claude plugin marketplace add D0n9X1n/mux-agents', 'claude plugin install mux-agents@mux-agents', 'copilot plugin marketplace add D0n9X1n/mux-agents', 'copilot plugin install mux-agents@mux-agents')
+        "$($readme[4] -ceq $tagline) $($plugin.description -ceq $tagline) $(@($market.plugins)[0].description -ceq $tagline) $(@($install | Where-Object { $readme -cnotcontains $_ }).Count)" | Should BeExactly 'True True True 0' }
+    It 'README carries no Windows-only line left from before Linux and macOS' {
+        # Catches: claude.exe or copilot.exe as the only names, a Windows-only state root, a placeholder source.
+        $text = [IO.File]::ReadAllText((Join-Path $repoRoot 'README.md'))
+        "$(@('`claude.exe`', '`copilot.exe`', '<path-or-repository>', 'RMUX session' | Where-Object { $text.Contains($_) }) -join ',')|$($text.Contains('~/.local/state/mux-agents/state'))" | Should BeExactly '|True' }
 }
 
 Describe 'MuxAgents foundation CI' {
