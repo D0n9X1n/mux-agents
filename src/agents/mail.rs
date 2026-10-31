@@ -498,7 +498,7 @@ mod tests {
         let cursor = mail.join("pane-1.offset");
         let seen = cursor.clone();
         w.fakes
-            .lock_probe(move || std::fs::read_to_string(&seen).unwrap_or_else(|_| "none".into()));
+            .lock_probe(move |_| std::fs::read_to_string(&seen).unwrap_or_else(|_| "none".into()));
         w.fakes.clear_log();
         let messages = read_mail(&w.ctx, &caller, "pane-1").unwrap();
         let end = std::fs::metadata(mail.join("pane-1.jsonl")).unwrap().len();

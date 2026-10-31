@@ -6,10 +6,12 @@ use serde_json::Value;
 
 use crate::caller::Caller;
 use crate::ctx::Ctx;
-use crate::error::Res;
+use crate::error::{Refusal, Res};
 
+pub mod board;
 pub mod mail;
 pub mod registry;
+pub mod view;
 
 /// `<root>/<serverKey>`; reads use it as is and never create it.
 pub(crate) fn server_dir(ctx: &Ctx, caller: &Caller) -> PathBuf {
@@ -39,6 +41,21 @@ pub(crate) fn lock<T>(ctx: &Ctx, key: &str, f: impl FnOnce() -> Res<T>) -> Res<T
 pub(crate) fn lock<T>(_: &Ctx, key: &str, f: impl FnOnce() -> Res<T>) -> Res<T> {
     crate::testing::locked(key, f)
 }
+
+/// 2 `usage` with the verb's usage line.
+pub(crate) fn usage(verb: &str) -> Refusal {
+    let line = crate::cli::VERBS
+        .iter()
+        .find(|v| v.name == verb)
+        .map_or("", |v| v.usage);
+    Refusal {
+        code: 2,
+        check: "usage",
+        message: line.into(),
+    }
+}
+
+pub(crate) const FILES_ONLY: &str = "agents pass free text only in files: use -BodyFile";
 
 /// `<kind>|<serverKey>|<key>`.
 pub(crate) fn lock_key(kind: &str, caller: &Caller, key: &str) -> String {
@@ -159,6 +176,13 @@ pub(crate) mod fixture {
             }
         }
 
+        /// Sets the fake clock to a `YYYY-MM-DDTHH:MM:SS...Z` time at or after its own.
+        pub fn clock(&self, utc: &str) {
+            let at = crate::util::parse_utc(utc).unwrap();
+            self.fakes
+                .advance(at.duration_since(self.ctx.clock.now()).unwrap());
+        }
+
         pub fn caller(&self) -> Caller {
             crate::caller::resolve(&self.ctx).unwrap()
         }
@@ -200,6 +224,21 @@ pub(crate) mod fixture {
             }
             write(&folder.join("record.json"), record);
             folder
+        }
+    }
+
+    impl World {
+        /// A file in the caller's cwd.
+        pub fn file(&self, name: &str, bytes: &[u8]) -> PathBuf {
+            let path = self.ctx.cwd.join(name);
+            std::fs::write(&path, bytes).unwrap();
+            path
+        }
+
+        /// A parsed call, as the dispatcher hands it to a handler.
+        pub fn request(&self, args: &[&str]) -> crate::cli::Request {
+            let args: Vec<String> = args.iter().map(|a| a.to_string()).collect();
+            crate::cli::parse(&args).unwrap().1
         }
     }
 

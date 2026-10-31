@@ -17,6 +17,9 @@ struct Rule {
     output: Output,
 }
 
+// Sees each lock event (`+key` or `-key`) and answers text to record with it.
+type Probe = Rc<dyn Fn(&str) -> String>;
+
 #[derive(Default)]
 struct Log {
     rows: Vec<Row>,
@@ -36,7 +39,7 @@ struct Log {
     // `+key` on taking a lock and `-key` on releasing it, each followed by the probe's answer when one is set.
     locks: Vec<String>,
     held: Vec<String>,
-    probe: Option<Rc<dyn Fn() -> String>>,
+    probe: Option<Probe>,
 }
 
 thread_local! {
@@ -133,8 +136,9 @@ impl Fakes {
         self.0.borrow().locks.clone()
     }
 
-    /// Runs at every lock event; its answer is added to the event, so a test sees state while a lock is held.
-    pub fn lock_probe(&self, probe: impl Fn() -> String + 'static) {
+    /// Runs at every lock event with the event (`+key` or `-key`); a non-empty answer is added to the event, so a
+    /// test sees, or changes, state while a lock is held.
+    pub fn lock_probe(&self, probe: impl Fn(&str) -> String + 'static) {
         self.0.borrow_mut().probe = Some(Rc::new(probe));
     }
 
@@ -145,6 +149,11 @@ impl Fakes {
         log.mux_calls.clear();
         log.slept.clear();
         log.locks.clear();
+    }
+
+    /// Moves the clock on without a sleep.
+    pub fn advance(&self, by: Duration) {
+        self.0.borrow_mut().now_ms += by.as_millis() as u64;
     }
 
     pub fn ctx(&self) -> Ctx {
@@ -177,7 +186,10 @@ impl Fakes {
             );
         }
         let probe = self.0.borrow().probe.clone();
-        let seen = probe.map(|probe| probe());
+        let event = format!("{sign}{key}");
+        let seen = probe
+            .map(|probe| probe(&event))
+            .filter(|seen| !seen.is_empty());
         let mut log = self.0.borrow_mut();
         if sign == '+' {
             log.held.push(key.into());
@@ -185,8 +197,8 @@ impl Fakes {
             log.held.retain(|k| k != key);
         }
         log.locks.push(match seen {
-            Some(seen) => format!("{sign}{key} {seen}"),
-            None => format!("{sign}{key}"),
+            Some(seen) => format!("{event} {seen}"),
+            None => event,
         });
     }
 

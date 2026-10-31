@@ -393,7 +393,7 @@ mod tests {
         let marker = folder.join("notice.json");
         let seen = marker.clone();
         w.fakes
-            .lock_probe(move || format!("marker={}", seen.exists()));
+            .lock_probe(move |_| format!("marker={}", seen.exists()));
         assert!(add_notice(&w.ctx, &caller, ID, &record, Notice::Stopped).unwrap());
         let mail = lock_key("mail", &caller, "pane-1");
         assert_eq!(
