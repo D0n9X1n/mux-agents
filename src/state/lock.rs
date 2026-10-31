@@ -314,7 +314,19 @@ mod tests {
             // Another key is another file.
             assert_eq!(with_lock_in(&ctx, &root, "other", wait, || Ok(1)), Ok(1));
             drop(holder);
-            assert_eq!(with_lock_in(&ctx, &root, "k", wait, || Ok(2)), Ok(2));
+            // A child forked by another test thread (a Command spawn) holds a copy of the holder's open file
+            // description, and so its flock, from fork until exec closes it (O_CLOEXEC acts only at exec).
+            // The lock is then released a moment after the drop, so the re-lock retries in real time; the
+            // ctx clock's sleep does not wait.
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            let relocked = loop {
+                let got = with_lock_in(&ctx, &root, "k", wait, || Ok(2));
+                if got.is_ok() || std::time::Instant::now() >= deadline {
+                    break got;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            };
+            assert_eq!(relocked, Ok(2));
             // The file stays.
             assert!(path.is_file());
         }
