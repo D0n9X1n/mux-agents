@@ -9,7 +9,9 @@ Use this skill inside an RMUX pane on Windows or a tmux 3.2+ pane on Linux or ma
 
 ## Entry
 
-`<entry>` is `scripts/mux-agent.ps1` in this plugin: two folders above this file's folder (`<skill folder>/../../scripts/mux-agent.ps1`). Use the absolute path with forward slashes. A spawned agent's first message gives its exact Reply and Listen commands.
+`<entry>` is `scripts/mux-agent` in this plugin (`scripts/mux-agent.cmd` on Windows): two folders above this file's folder (`<skill folder>/../../scripts/mux-agent`). Use the absolute path with forward slashes. A spawned agent's first message gives its exact Reply and Listen commands.
+
+The commands below, and the Reply and Listen lines, run as-is in the Bash tool. In PowerShell, prefix `& ` (`& "<exe>" send parent …`).
 
 ## Rules
 
@@ -25,18 +27,18 @@ Use this skill inside an RMUX pane on Windows or a tmux 3.2+ pane on Linux or ma
 ## Commands
 
 ```
-pwsh -NoProfile -File "<entry>" spawn -Client <client> -TaskFile <task-file> -BriefFile <brief-file>
-pwsh -NoProfile -File "<entry>" list
-pwsh -NoProfile -File "<entry>" list -All
-pwsh -NoProfile -File "<entry>" focus <name>
-pwsh -NoProfile -File "<entry>" send <name> -BodyFile <body-file>
-pwsh -NoProfile -File "<entry>" send parent -BodyFile <body-file>
-pwsh -NoProfile -File "<entry>" status -BodyFile <status-file>
-pwsh -NoProfile -File "<entry>" read -Wait <seconds>
-pwsh -NoProfile -File "<entry>" read <name> -Lines <n>
-pwsh -NoProfile -File "<entry>" stop <name>
-pwsh -NoProfile -File "<entry>" sidebar
-pwsh -NoProfile -File "<entry>" sidebar -Close
+"<entry>" spawn -Client <client> -TaskFile <task-file> -BriefFile <brief-file>
+"<entry>" list
+"<entry>" list -All
+"<entry>" focus <name>
+"<entry>" send <name> -BodyFile <body-file>
+"<entry>" send parent -BodyFile <body-file>
+"<entry>" status -BodyFile <status-file>
+"<entry>" read -Wait <seconds>
+"<entry>" read <name> -Lines <n>
+"<entry>" stop <name>
+"<entry>" sidebar
+"<entry>" sidebar -Close
 ```
 
 `spawn` also takes `-Name <name>`, `-Split h|v` (split your pane instead of a new window) and `-NoFork`.
@@ -57,11 +59,12 @@ pwsh -NoProfile -File "<entry>" sidebar -Close
 
 ## Refusals
 
-- `sandbox`: the caller's token is unreadable, AppContainer, restricted or below Medium integrity.
+- `entry`: no usable `mux-agent` binary for this OS and architecture.
+- `sandbox`: the caller runs in a sandbox: `SANDBOX_RUNTIME=1`, a macOS sandbox, Linux `NoNewPrivs`, or a Windows token that is unreadable, AppContainer, restricted or below Medium integrity.
 - `policy`: the caller's live policy is unreadable or is neither bypass nor allow-all.
-- `flags`: a flag outside the allowlist on any `claude.exe` or `copilot.exe` command line from the agent up to the pane.
+- `flags`: a flag outside the allowlist, or an unreadable command line, on any `claude` or `copilot` process from the agent up to the pane.
 - `directory`: the caller's launch directory cannot be confirmed.
 - `tagged`: a spawn or a side bar from an agent pane; children cannot spawn or open the side bar.
 - `cap`: 6 live agents in the session.
 - `name`: a bad or taken name.
-- Other check names: `brief`, `target`, `parent`, `endpoint`, `state` and `lock`.
+- Other check names: `brief`, `target`, `parent`, `endpoint`, `state`, `lock`, `caller`, `usage` and `internal`.

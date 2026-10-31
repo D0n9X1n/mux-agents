@@ -104,5 +104,32 @@ reset; export MUX_AGENTS_BIN="$tmp/missing"; run list
 want="{\"ok\":false,\"verb\":null,\"code\":1,\"check\":\"entry\",\"message\":\"no usable mux-agent binary for $os-$arch\"}"
 if [ "$rc" = 1 ] && [ "$out" = "$want" ]; then ok none_usable_prints_entry_json_exit_1; else bad none_usable_prints_entry_json_exit_1 "rc=$rc out=$out"; fi
 
+# Every line of SKILL.md's Commands block runs through the shim with <entry> expanded to it and each placeholder to a
+# fixture; the recording fake must log exactly the line's own words.
+reset; fake "$tier1" tier1; export MUX_AGENTS_BIN="$tier1"
+fx="$tmp/fx"; mkdir -p "$fx"; : >"$fx/task.md"; : >"$fx/brief.md"; : >"$fx/body.md"; : >"$fx/status.md"
+block=$(awk '/^## Commands/ { c = 1; next } c && /^```/ { if (f) exit; f = 1; next } c && f' "$repo/skills/mux-agents/SKILL.md")
+prefix="\"$shim\" "
+n=0; why=
+set -f
+while IFS= read -r line; do
+  n=$((n + 1))
+  case $line in '"<entry>" '*) ;; *) why="$why; not run as \"<entry>\": $line"; continue ;; esac
+  line=$(printf '%s\n' "$line" | sed -e "s#<entry>#$shim#" -e 's#<client>#claude#g' -e 's#<name>#claude-1#g' \
+    -e 's#<seconds>#600#g' -e 's#<n>#20#g' -e "s#<task-file>#$fx/task.md#g" -e "s#<brief-file>#$fx/brief.md#g" \
+    -e "s#<body-file>#$fx/body.md#g" -e "s#<status-file>#$fx/status.md#g")
+  case $line in *'<'*) why="$why; unexpanded placeholder: $line"; continue ;; esac
+  want=tier1
+  for w in ${line#"$prefix"}; do want="$want
+[$w]"; done
+  got=$(eval "$line" </dev/null)
+  [ "$got" = "$want" ] || why="$why; $line logged: $got"
+done <<END_BLOCK
+$block
+END_BLOCK
+set +f
+unset MUX_AGENTS_BIN
+if [ "$n" = 12 ] && [ -z "$why" ]; then ok skill_commands_run_through_shim; else bad skill_commands_run_through_shim "$n commands$why"; fi
+
 echo "$pass passed, $fail failed"
 [ "$fail" = 0 ]

@@ -72,8 +72,34 @@ test('a Bash spawn inside rmux opens Agents, runs the exact list command and set
   await $.tool.call({ tool: 'Bash', command: SPAWN })
   await clock.settle()
   expect(seen.opened).toEqual([{ id: 'mux-agents', title: 'Agents' }])
-  expect(seen.argv).toEqual([['pwsh', '-NoProfile', '-File', `${root}/scripts/mux-agent.ps1`, 'list', '-All']])
+  expect(seen.argv).toEqual([['sh', `${root}/scripts/mux-agent`, 'list', '-All']])
   expect(seen.status).toEqual(['agents: 1'])
+})
+
+// The plugin root as the engine reports it, read through a classic SessionStart's cwd.
+async function pluginRoot($: any, on: any) {
+  let root = ''
+  on('classic.SessionStart', (_: unknown, e: { cwd: string }) => { root = e.cwd; return {} })
+  await $.classic.SessionStart({ source: 'startup' })
+  return root
+}
+
+test('list argv on Windows_NT is cmd.exe /d /c <root>\\scripts\\mux-agent.cmd list -All', async ($, on) => {
+  const { seen, clock } = world(on, { RMUX: 'x', OS: 'Windows_NT' }, [ran(0, LIST)])
+  const root = await pluginRoot($, on)
+  await $.session.start(START)
+  await $.tool.call({ tool: 'PowerShell', command: SPAWN })
+  await clock.settle()
+  expect(seen.argv).toEqual([['cmd.exe', '/d', '/c', `${root}\\scripts\\mux-agent.cmd`, 'list', '-All']])
+})
+
+test('list argv elsewhere is sh <root>/scripts/mux-agent list -All', async ($, on) => {
+  const { seen, clock } = world(on, { TMUX: 'x', OS: 'Darwin' }, [ran(0, LIST)])
+  const root = await pluginRoot($, on)
+  await $.session.start(START)
+  await $.tool.call({ tool: 'Bash', command: SPAWN })
+  await clock.settle()
+  expect(seen.argv).toEqual([['sh', `${root}/scripts/mux-agent`, 'list', '-All']])
 })
 
 test('no pane and no refresh without TMUX or RMUX', async ($, on) => {

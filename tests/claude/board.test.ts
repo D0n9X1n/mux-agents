@@ -23,6 +23,30 @@ test('isSpawn accepts a Windows path with backslashes, quoted or not', () => {
   expect(isSpawn('& C:\\p\\scripts\\mux-agent.ps1 spawn -Client claude', SPAWN_JSON)).toBe(true)
 })
 
+test('isSpawn accepts mux-agent, mux-agent.cmd and mux-agent.exe spawn', () => {
+  expect(isSpawn('"/p/plug in/scripts/mux-agent" spawn -Client claude', SPAWN_JSON)).toBe(true)
+  expect(isSpawn('/p/scripts/mux-agent spawn', SPAWN_JSON)).toBe(true)
+  expect(isSpawn('sh /p/scripts/mux-agent "spawn"', SPAWN_JSON)).toBe(true)
+  expect(isSpawn('& "C:\\p\\scripts\\mux-agent.cmd" spawn -Client copilot', SPAWN_JSON)).toBe(true)
+  expect(isSpawn('cmd.exe /d /c C:/p/scripts/MUX-AGENT.CMD spawn', SPAWN_JSON)).toBe(true)
+  expect(isSpawn("'C:/p/target/release/mux-agent.exe' spawn", SPAWN_JSON)).toBe(true)
+  expect(isSpawn('mux-agent.exe spawn -Text', SPAWN_TEXT)).toBe(true)
+})
+
+test('isSpawn still accepts mux-agent.ps1 spawn', () => {
+  expect(isSpawn('pwsh -NoProfile -File "C:/p/scripts/mux-agent.ps1" spawn', SPAWN_JSON)).toBe(true)
+})
+
+test('isSpawn rejects mux-agents spawn and mux-agent list', () => {
+  expect(isSpawn('/p/scripts/mux-agents spawn', SPAWN_JSON)).toBe(false)
+  expect(isSpawn('mux-agents spawn', SPAWN_JSON)).toBe(false)
+  expect(isSpawn('/p/scripts/mux-agent list', LISTED)).toBe(false)
+  expect(isSpawn('/p/scripts/mux-agent.cmd list', SPAWN_JSON)).toBe(false)
+  expect(isSpawn('/p/scripts/xmux-agent spawn', SPAWN_JSON)).toBe(false)
+  expect(isSpawn('/p/scripts/mux-agent.sh spawn', SPAWN_JSON)).toBe(false)
+  expect(isSpawn('/p/scripts/mux-agent spawn', TAGGED_JSON)).toBe(false)
+})
+
 test('isSpawn rejects a bare mention, another verb or file, and every refused, mixed or missing reply', () => {
   expect(isSpawn('grep -n "mux-agent.ps1 spawn" README.md', 'README.md:27:pwsh -File "<entry>" spawn')).toBe(false)
   expect(isSpawn(`${E} spawner`, SPAWN_JSON)).toBe(false)

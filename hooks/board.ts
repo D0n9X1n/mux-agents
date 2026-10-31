@@ -3,9 +3,10 @@ import type { MuxAgentsBoard } from '../types/index'
 
 export const EMPTY: MuxAgentsBoard = { running: 0, agents: [], failed: false }
 
-// The entry as a whole file name (after the start, a slash, a backslash, whitespace or a quote), then the verb spawn;
-// either may be quoted. Covers `pwsh -File <path> spawn`, `& <path> spawn` and Windows paths.
-const ENTRY = /(^|[\\/\s"'])mux-agent\.ps1["']?\s+["']?spawn["']?(\s|$)/i
+// The entry as a whole file name (after the start, a slash, a backslash, whitespace or a quote): the shim mux-agent,
+// mux-agent.cmd, the binary mux-agent.exe or the old mux-agent.ps1; then the verb spawn. Either may be quoted. Covers
+// `<path> spawn`, `sh <path> spawn`, `pwsh -File <path> spawn`, `& <path> spawn` and Windows paths.
+const ENTRY = /(^|[\\/\s"'])mux-agent(\.ps1|\.cmd|\.exe)?["']?\s+["']?spawn["']?(\s|$)/i
 // Format-MuxAgentResult -Text for a successful spawn: ok and verb are left out, the record's fields are printed in order.
 // A refusal prints code, check and message instead, so it never matches.
 const TEXT_SPAWN = /^name: .+\nid: [0-9a-f]{12}\npane: %\d+\nwindow: @\d+\nclient: (claude|copilot)\nsessionId: .*\ncontext: .+\nreason: .+$/m
@@ -26,7 +27,7 @@ export function isSpawnReply(output: string): boolean {
   return text.split('\n').some(line => isJsonSpawnReply(line.trim())) || TEXT_SPAWN.test(text)
 }
 
-// True when the command ran mux-agent.ps1 spawn and the tool's stdout holds a successful spawn reply.
+// True when the command ran the entry's spawn and the tool's stdout holds a successful spawn reply.
 export function isSpawn(command: string, stdout: string | undefined): boolean {
   return ENTRY.test(command) && isSpawnReply(stdout ?? '')
 }

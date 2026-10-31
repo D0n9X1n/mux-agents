@@ -11,13 +11,23 @@ const board = atom({ plugin: 'mux-agents', key: 'board' } as const, EMPTY, { sha
 let ticking: Timer | undefined
 let busy = false
 
-async function refresh($: EngineInterface) {
+// The entry shim's `list -All`. Hooks have no `process`, so the OS comes from the environment; an unreadable OS is
+// taken as not Windows.
+async function listArgv($: EngineInterface): Promise<string[]> {
+  const root = $.plugin.root
+  let os
+  try { os = await $.env.get('OS') } catch { os = undefined }
+  if (os === 'Windows_NT') return ['cmd.exe', '/d', '/c', `${root}\\scripts\\mux-agent.cmd`, 'list', '-All']
+  return ['sh', `${root}/scripts/mux-agent`, 'list', '-All']
+}
+
+async function refresh($: EngineInterface, argv: string[]) {
   if (busy) return
   busy = true
   try {
     let next
     try {
-      const ran = await $.process.run(['pwsh', '-NoProfile', '-File', `${$.plugin.root}/scripts/mux-agent.ps1`, 'list', '-All'], { timeoutMs: 10000 })
+      const ran = await $.process.run(argv, { timeoutMs: 10000 })
       next = parseList(ran.exitCode, ran.stdout)
     } catch {
       next = undefined
@@ -35,16 +45,18 @@ async function refresh($: EngineInterface) {
 }
 
 // A refresh started and not awaited: a rejection (a failed state write) is dropped, and the next tick tries again.
-function startRefresh($: EngineInterface) {
-  refresh($).catch(() => {})
+function startRefresh($: EngineInterface, argv: string[]) {
+  refresh($, argv).catch(() => {})
 }
 
 // Opens the pane; the first refresh runs on its own, so neither /mux-agents-pane nor a tool result waits for list.
 async function openPane($: EngineInterface) {
   await $.ui.open({ id: PANE, title: 'Agents' })
+  // Read once per open, before the check, so the check and the timer's start stay together.
+  const argv = await listArgv($)
   if (!ticking) {
-    ticking = $.clock.every(3000, () => startRefresh($))
-    startRefresh($)
+    ticking = $.clock.every(3000, () => startRefresh($, argv))
+    startRefresh($, argv)
   }
 }
 
