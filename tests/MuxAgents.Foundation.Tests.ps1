@@ -138,6 +138,10 @@ Describe 'MuxAgents foundation docs' {
         $versions = @([regex]::Matches([IO.File]::ReadAllText((Join-Path $repoRoot 'README.md')), 'Pester\b[^\d\r\n]*(\d+(?:\.\d+)*)') | ForEach-Object { $_.Groups[1].Value })
         "$($versions.Count -gt 0) $(@($versions | Where-Object { $_ -cne '4.10.1' }) -join ',')" | Should BeExactly 'True '
     }
+    It 'README and the skill name every platform and its multiplexer' {
+        $readme = [IO.File]::ReadAllLines((Join-Path $repoRoot 'README.md')); $skill = [IO.File]::ReadAllLines([IO.Path]::Combine($repoRoot, 'skills', 'mux-agents', 'SKILL.md'))
+        $lines = '0.1.0 runs on Windows with rmux 0.10.0, and on Linux and macOS with tmux 3.2 or later. The code moved here from the Terminal Profiles repository and no longer depends on it.', '- Windows, Linux or macOS, PowerShell 7.4 or later.', '- rmux 0.10.0 on Windows, or tmux 3.2 or later on Linux and macOS, with the caller inside a pane.'
+        "$(@($lines | Where-Object { $readme -cnotcontains $_ }).Count) $($skill -ccontains 'Use this skill inside an RMUX pane on Windows or a tmux 3.2+ pane on Linux or macOS; the tool refuses elsewhere.')" | Should BeExactly '0 True' }
 }
 
 Describe 'MuxAgents foundation CI' {

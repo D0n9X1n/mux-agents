@@ -2,11 +2,11 @@
 
 # mux-agents
 
-A plugin for Claude Code and GitHub Copilot CLI. When the client runs inside an RMUX pane, it can start other Claude Code or Copilot CLI agents in new windows or panes of the same session, with forked context, then list, focus, message and stop them.
+A plugin for Claude Code and GitHub Copilot CLI. When the client runs inside an RMUX or tmux pane, it can start other Claude Code or Copilot CLI agents in new windows or panes of the same session, with forked context, then list, focus, message and stop them.
 
 ## Status
 
-0.1.0 runs on Windows with rmux 0.10.0. tmux on Linux is planned, not built. The code moved here from the Terminal Profiles repository and no longer depends on it.
+0.1.0 runs on Windows with rmux 0.10.0, and on Linux and macOS with tmux 3.2 or later. The code moved here from the Terminal Profiles repository and no longer depends on it.
 
 ## Layout
 
@@ -30,8 +30,8 @@ A plugin for Claude Code and GitHub Copilot CLI. When the client runs inside an 
 
 ## Requirements
 
-- Windows, PowerShell 7.4 or later.
-- rmux 0.10.0, with the caller inside an rmux pane.
+- Windows, Linux or macOS, PowerShell 7.4 or later.
+- rmux 0.10.0 on Windows, or tmux 3.2 or later on Linux and macOS, with the caller inside a pane.
 - Claude Code or GitHub Copilot CLI on `PATH` as `claude.exe` or `copilot.exe`.
 
 Inside rmux both `RMUX` and `TMUX` are set; `RMUX` wins. Other platforms are refused with check `platform`.
@@ -55,4 +55,4 @@ Install-Module powershell-yaml -RequiredVersion 0.4.12 -Scope CurrentUser
 pwsh -NoProfile -File tests/Invoke-MuxAgentTests.ps1
 ```
 
-Off Windows the suites tagged `windows` are skipped. The script exits 1 when any test fails.
+Each OS skips the suites tagged for the other OSes. Suites tagged integration run only with -Integration, on Linux or macOS with tmux 3.2+ and cc: pwsh -NoProfile -File tests/Invoke-MuxAgentTests.ps1 -Path tests/integration -Integration. The script exits 1 when any test fails.

@@ -1,11 +1,11 @@
 ---
 name: mux-agents
-description: Start Claude Code or Copilot CLI agents in the current RMUX session with forked context, then list, focus, message and stop them.
+description: Start Claude Code or Copilot CLI agents in the current RMUX or tmux session with forked context, then list, focus, message and stop them.
 ---
 
 ## When to use
 
-Use this skill inside an RMUX pane on Windows; the tool refuses elsewhere.
+Use this skill inside an RMUX pane on Windows or a tmux 3.2+ pane on Linux or macOS; the tool refuses elsewhere.
 
 ## Entry
 
