@@ -393,3 +393,22 @@ $r = Invoke-MuxAgentCommand -P $fake -Arguments @('sidebar')
         $replies = @(Get-ChildItem -LiteralPath $race -Filter 'reply-*' | ForEach-Object { $code, $json = [IO.File]::ReadAllText($_.FullName) -split '\|', 2; $r = $json | ConvertFrom-Json; [pscustomobject]@{ Code = $code; Pane = $r.pane; Opened = $r.opened } })
         $bars = @(([IO.File]::ReadAllText((Join-Path $race 'panes.json')) | ConvertFrom-Json).PSObject.Properties | Where-Object { $_.Value -ceq 'sidebar|' } | ForEach-Object Name)
         "$($exited -join ',') $(@($replies | ForEach-Object Code) -join ',') $(@($replies | ForEach-Object Opened | Sort-Object) -join ',') $(@($replies | ForEach-Object Pane | Select-Object -Unique) -join ',') $($bars -join ',')" | Should BeExactly 'True,True 0,0 False,True %7 %7' } }
+
+Describe 'MuxAgents sidebar callers' {
+    It 'an untagged Claude caller, an untagged Copilot caller and a shell each open, reuse, close and reopen it' {
+        # Catches: a refusal keyed on Kind (agent) or Client instead of the pane tag; a fake that lost its client (guard column).
+        $results = foreach ($caller in 'human', 'claude', 'copilot') {
+            $fake = New-SidebarFake "callers $caller" -Caller $caller; $null = Add-SidebarMux $fake
+            $who = Resolve-MuxAgentCaller -P $fake
+            $runs = foreach ($arguments in @(@('sidebar'), @('sidebar'), @('sidebar', '-Close'), @('sidebar'))) { $r = Invoke-SidebarVerb $fake $arguments; "$($r.Code):$($r.Reply.pane):$($r.Reply.opened)$($r.Reply.closed)" }
+            "$caller $($who.Kind)/$($who.Client) $($runs -join ',') $(Get-SidebarCount $fake 'split-window') $(Get-SidebarCount $fake 'kill-pane')" }
+        ($results -join ';') | Should BeExactly ('human human/ 0:%7:True,0:%7:False,0:%7:True,0:%7:True 2 1;' +
+            'claude agent/claude 0:%7:True,0:%7:False,0:%7:True,0:%7:True 2 1;copilot agent/copilot 0:%7:True,0:%7:False,0:%7:True,0:%7:True 2 1') }
+    It 'refuses tagged from a tagged child pane, for open and -Close, before any other rmux call' {
+        # Catches: no refusal (a child opens a bar), -Close not refused, the refusal after the lock or list-panes, a tagged human pane let through.
+        $results = foreach ($case in @(@('claude', 'aaaaaaaaaaaa'), @('copilot', 'bbbbbbbbbbbb'), @('human', 'cccccccccccc'))) {
+            $fake = New-SidebarFake "tagged $($case[0])" -Caller $case[0] -Tag $case[1]; $panes = Add-SidebarMux $fake -Open
+            $runs = foreach ($arguments in @(@('sidebar'), @('sidebar', '-Close'))) { $r = Invoke-SidebarVerb $fake $arguments; "$($r.Code) $($r.Reply.check) $($r.Reply.message)" }
+            "$($runs -join ' / ') | $(Get-SidebarCalls $fake)| $(Get-SidebarRoles $panes)" }
+        $refused = '2 tagged an agent pane cannot open the side bar'
+        ($results -join ';') | Should BeExactly ((@("$refused / $refused | | %1=|,%2=other|,%7=sidebar|") * 3) -join ';') } }

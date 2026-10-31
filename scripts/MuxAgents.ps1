@@ -1525,6 +1525,7 @@ function Invoke-MuxAgentSidebar {
     # watch reads the caller's state.
     param([Parameter(Mandatory)]$P, [Parameter(Mandatory)]$Request)
     $caller = Resolve-MuxAgentCaller -P $P
+    if ($caller.AgentTag) { Exit-MuxAgentCommand 2 'tagged' 'an agent pane cannot open the side bar' }
     $close = [bool]$Request.Options['Close']
     Use-MuxAgentLock -LockKey "sidebar|$($caller.ServerKey)|$($caller.Session)" -LockAction {
         $found = Find-MuxAgentSidebar -P $P -Caller $caller
