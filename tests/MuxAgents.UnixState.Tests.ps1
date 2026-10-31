@@ -256,3 +256,93 @@ Describe 'MuxAgents unix private folders' {
         "$($all.Count) $($mkdir.Count) $(@($mkdir[0].Arguments).Count) $($mkdir[0].Arguments[1])" | Should BeExactly '1 1 2 $Mode'
     }
 }
+function New-UnixStateNativeRoot {
+    # A canonical, missing folder under TestDrive (on macOS TestDrive sits under /var, a link to /private/var).
+    Resolve-MuxAgentUnixRealPath -Path (Join-Path $TestDrive ([guid]::NewGuid().ToString('N')))
+}
+function Get-UnixStateMode([string]$Path) { if ([IO.Directory]::Exists($Path)) { [Convert]::ToString([int][IO.File]::GetUnixFileMode($Path), 8) } else { 'missing' } }
+function Add-UnixStateNativeTests {
+    It 'creates the root, the folder above it and every folder below it at exactly 0700 under umask 177' {
+        $above = New-UnixStateNativeRoot; $root = "$above/state"
+        $probe = Join-Path $TestDrive 'umask-probe.ps1'
+        [IO.File]::WriteAllLines($probe, [string[]]@(
+            'param([string]$Scripts, [string]$Root)'
+            'foreach ($name in "MuxAgents.ps1", "MuxAgents.Unix.ps1") { . (Join-Path $Scripts $name) }'
+            '$paths = @((Split-Path -Parent $Root), $Root, "$Root/k", "$Root/k/agents", "$Root/k/mail")'
+            '$refusal = try { New-MuxAgentUnixPrivateDirectories -Root $Root -Paths @($paths[2], $paths[3], $paths[4]); "ok" } catch { $_.Exception.Message }'
+            '$modes = foreach ($path in $paths) { if ([IO.Directory]::Exists($path)) { [Convert]::ToString([int][IO.File]::GetUnixFileMode($path), 8) } else { "missing" } }'
+            '"$($modes -join " ") $refusal"'
+        ))
+        $out = & sh -c 'umask 177; exec "$0" "$@"' $pwsh -NoProfile -File $probe -Scripts (Join-Path $repoRoot 'scripts') -Root $root
+        "$out" | Should BeExactly '700 700 700 700 700 ok'
+    }
+    It 'refuses a 0777 root before creating anything in it, and leaves 0755, 1700, file and file/k as they are' {
+        $wide = New-UnixStateNativeRoot; $null = [IO.Directory]::CreateDirectory($wide); [IO.File]::SetUnixFileMode($wide, [IO.UnixFileMode]511)
+        $wideAnswer = Get-UnixStateRefusal { New-MuxAgentUnixPrivateDirectories -Root $wide -Paths @("$wide/k") }
+        $root = New-UnixStateNativeRoot; $null = [IO.Directory]::CreateDirectory($root); [IO.File]::SetUnixFileMode($root, [IO.UnixFileMode]448)
+        $open = "$root/open"; $sticky = "$root/sticky"; $file = "$root/file"
+        foreach ($pair in @(@($open, 493), @($sticky, 960))) { $null = [IO.Directory]::CreateDirectory($pair[0]); [IO.File]::SetUnixFileMode($pair[0], [IO.UnixFileMode]$pair[1]) }
+        [IO.File]::WriteAllText($file, 'x')
+        $answers = foreach ($path in $open, $sticky, $file, "$file/k") { Get-UnixStateRefusal { New-MuxAgentUnixPrivateDirectories -Root $root -Paths @($path) } }
+        "$wideAnswer|$(Get-UnixStateMode "$wide/k")|$($answers -join '|')|$(Get-UnixStateMode $open) $(Get-UnixStateMode $sticky)" | Should BeExactly '1 state the state folder mode is 777, not 700|missing|1 state the state folder mode is 755, not 700|1 state the state folder mode is 1700, not 700|1 state the state folder path is a file|1 state the state folder path is a file|755 1700'
+    }
+    It 'refuses a root below a folder that is 0777 and not sticky, and creates one below a sticky 1777 folder' {
+        $open = New-UnixStateNativeRoot; $null = [IO.Directory]::CreateDirectory($open); [IO.File]::SetUnixFileMode($open, [IO.UnixFileMode]511)
+        $sticky = New-UnixStateNativeRoot; $null = [IO.Directory]::CreateDirectory($sticky); [IO.File]::SetUnixFileMode($sticky, [IO.UnixFileMode]1023)
+        $answers = foreach ($parent in $open, $sticky) { Get-UnixStateRefusal { New-MuxAgentUnixPrivateDirectories -Root "$parent/state" -Paths @("$parent/state/k") } }
+        "$($answers -join '|')|$(Get-UnixStateMode $open) $(Get-UnixStateMode "$open/state") $(Get-UnixStateMode $sticky) $(Get-UnixStateMode "$sticky/state/k")" | Should BeExactly '1 state a folder above the state folder is writable by others|ok|777 missing 1777 700'
+    }
+    It 'refuses a leaf link, a dangling link and an inner link with lstat semantics' {
+        $root = New-UnixStateNativeRoot; $null = [IO.Directory]::CreateDirectory("$root/real/k", [IO.UnixFileMode]448)
+        foreach ($path in $root, "$root/real", "$root/real/k") { [IO.File]::SetUnixFileMode($path, [IO.UnixFileMode]448) }
+        $null = [IO.Directory]::CreateSymbolicLink("$root/link", "$root/real")
+        $null = [IO.Directory]::CreateSymbolicLink("$root/dangling", "$root/nowhere")
+        $answers = foreach ($path in "$root/link", "$root/dangling", "$root/link/k") { Get-UnixStateRefusal { New-MuxAgentUnixPrivateDirectories -Root $root -Paths @($path) } }
+        "$($answers -join '|')|$(Get-UnixStateMode "$root/nowhere")" | Should BeExactly '1 state the state folder path has a link|1 state the state folder path has a link|1 state the state folder path has a link|missing'
+    }
+    It 'refuses a folder of another owner' {
+        if ((Get-MuxAgentUnixUserId) -ceq '0') { Set-ItResult -Skipped -Because 'the tests run as root, who owns /usr'; return }
+        Get-UnixStateRefusal { Assert-MuxAgentUnixPrivate -Facts (Get-MuxAgentUnixPathFacts -Path '/usr') -User (Get-MuxAgentUnixUserId) } | Should BeExactly '1 state the state folder has another owner'
+    }
+    It 'canonicalizes a linked or trailing-space root and keeps the missing tail' {
+        $base = New-UnixStateNativeRoot; $null = [IO.Directory]::CreateDirectory("$base/real")
+        $real = "$base/real"; $null = [IO.Directory]::CreateSymbolicLink("$base/link", $real)
+        $spaced = "$base/state "; $null = [IO.Directory]::CreateDirectory($spaced, [IO.UnixFileMode]448); [IO.File]::SetUnixFileMode($spaced, [IO.UnixFileMode]448)
+        $root = Get-MuxAgentUnixStateRoot -Environment @{ MUX_AGENTS_STATE = $spaced }
+        $made = Get-UnixStateRefusal { New-MuxAgentUnixPrivateDirectories -Root $root -Paths @("$root/k") }
+        "$(Get-MuxAgentUnixStateRoot -Environment @{ MUX_AGENTS_STATE = "$base/link/s" })|$(Get-MuxAgentUnixStateRoot -Environment @{ XDG_STATE_HOME = "$base/link"; HOME = '/nonexistent' })|$root|$made $(Get-UnixStateMode "$root/k")" | Should BeExactly "$real/s|$real/mux-agents/state|$spaced|ok 700"
+    }
+}
+Describe 'MuxAgents unix state on Linux' -Tag 'linux' {
+    Add-UnixStateNativeTests
+    It 'refuses a 0700 folder that carries a POSIX ACL' {
+        if (-not (Get-Command setfacl -CommandType Application -ErrorAction SilentlyContinue)) { Set-ItResult -Skipped -Because 'setfacl is not installed'; return }
+        $root = New-UnixStateNativeRoot
+        $before = Get-UnixStateRefusal { New-MuxAgentUnixPrivateDirectories -Root $root -Paths @($root) }
+        $exists = [IO.Directory]::Exists($root)
+        $exists | Should Be $true
+        $out = "$(& setfacl -m u:nobody:rwx -- $root 2>&1)"; $code = $LASTEXITCODE
+        if ($code -ne 0 -and $out -match 'Operation not supported') { Set-ItResult -Skipped -Because 'this file system takes no POSIX ACL'; return }
+        [IO.File]::SetUnixFileMode($root, [IO.UnixFileMode]448)
+        $facts = Get-MuxAgentUnixPathFacts -Path $root
+        "$before|$exists|$code|$([Convert]::ToString([int]$facts.Mode, 8)) $($facts.Listing)|$(Get-UnixStateRefusal { New-MuxAgentUnixPrivateDirectories -Root $root -Paths @($root) })" | Should BeExactly 'ok|True|0|700 drwx------+|1 state the state folder has an extended ACL'
+    }
+}
+Describe 'MuxAgents unix state on macOS' -Tag 'macos' {
+    Add-UnixStateNativeTests
+    It 'refuses a 0700 folder with an ACE' {
+        $root = New-UnixStateNativeRoot
+        $before = Get-UnixStateRefusal { New-MuxAgentUnixPrivateDirectories -Root $root -Paths @($root) }
+        & chmod +a 'everyone allow read' $root; $code = $LASTEXITCODE
+        $facts = Get-MuxAgentUnixPathFacts -Path $root
+        "$before|$code $([Convert]::ToString([int]$facts.Mode, 8)) $(@($facts.Aces).Count)|$(Get-UnixStateRefusal { New-MuxAgentUnixPrivateDirectories -Root $root -Paths @($root) })" | Should BeExactly 'ok|0 700 1|1 state the state folder has an extended ACL'
+    }
+    It 'refuses a new 0700 root that inherits an ACE, and creates nothing below it' {
+        $parent = New-UnixStateNativeRoot; $null = [IO.Directory]::CreateDirectory($parent)
+        & chmod +a 'everyone allow list,search,file_inherit,directory_inherit' $parent; $code = $LASTEXITCODE
+        $root = "$parent/state"
+        $refusal = Get-UnixStateRefusal { New-MuxAgentUnixPrivateDirectories -Root $root -Paths @("$root/k") }
+        $facts = Get-MuxAgentUnixPathFacts -Path $root
+        "$code|$refusal|$(Get-UnixStateMode $root) $(@($facts.Aces | Where-Object { $_ -match 'inherited' }).Count) $(Get-UnixStateMode "$root/k")" | Should BeExactly '0|1 state the state folder has an extended ACL|700 1 missing'
+    }
+}
