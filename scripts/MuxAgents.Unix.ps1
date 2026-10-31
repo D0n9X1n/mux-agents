@@ -255,12 +255,27 @@ function Get-MuxAgentUnixPathFacts {
     if ($second.Text -cne $first.Text) { Exit-MuxAgentCommand 1 'state' 'the state folder changed while it was checked' }
     $facts
 }
+function Get-MuxAgentUnixParentAces {
+    # The ACL entries of a folder above the state root: macOS ls -lde lines after the header; none on Linux, where a
+    # POSIX ACL's write rights show in the group bits (the mask) and the sticky rule ignores ACLs. A failed or
+    # malformed read refuses 1 'state'.
+    param([Parameter(Mandatory)][string]$Path, [string]$Platform = (Get-MuxAgentPlatform))
+    if ($Platform -cne 'macos') { return }
+    $message = 'the state folder cannot be checked'
+    $lines = @((Invoke-MuxAgentUnixTool -FilePath 'ls' -Arguments @('-lde', '--', $Path) -Message $message) -split '\n')
+    if ($lines[0] -cnotmatch '^d[r-][w-][xsS-][r-][w-][xsS-][r-][w-][xtT-][+@.]?\s+\d+\s') { Exit-MuxAgentCommand 1 'state' $message }
+    $lines | Select-Object -Skip 1
+}
 function Assert-MuxAgentUnixParent {
     # A folder above the state root, as OpenSSH StrictModes checks one: owned by root or User, and not group- or
-    # other-writable unless the sticky bit is set (as /tmp is). Refuses 1 'state' otherwise.
-    param([Parameter(Mandatory)]$Stat, [Parameter(Mandatory)][string]$User)
+    # other-writable unless the sticky bit is set (as /tmp is). On macOS an allow ACE (add_subdirectory, delete_child)
+    # outranks both the mode and the sticky bit, so only deny entries pass; any other ACE line refuses. Refuses 1 'state'.
+    param([Parameter(Mandatory)]$Stat, [Parameter(Mandatory)][string]$User, [string[]]$Aces = @())
     if ($Stat.Owner -cne '0' -and $Stat.Owner -cne $User) { Exit-MuxAgentCommand 1 'state' 'a folder above the state folder has another owner' }
     if (($Stat.Mode -band 18) -and -not ($Stat.Mode -band 512)) { Exit-MuxAgentCommand 1 'state' 'a folder above the state folder is writable by others' }
+    foreach ($ace in $Aces) {
+        if ($ace -cnotmatch '^\s*\d+: .+ (inherited )?deny [a-z_,]+\z') { Exit-MuxAgentCommand 1 'state' 'a folder above the state folder has an ACL entry that is not a deny' }
+    }
 }
 function Invoke-MuxAgentUnixMkdir {
     # The one mkdir of the Unix state code: mkdir(2) with the mode, so the folder is never created wider. It throws when
@@ -301,7 +316,7 @@ function New-MuxAgentUnixPrivateDirectories {
         if (-not $Root.StartsWith('/') -or -not $inside -or $parts -contains '' -or $parts -contains '.' -or $parts -contains '..') { Exit-MuxAgentCommand 1 'state' 'the state folder path is outside the state root' }
     }
     $user = Get-MuxAgentUnixUserId
-    Assert-MuxAgentUnixParent -Stat (Get-MuxAgentUnixStat -Path '/') -User $user
+    Assert-MuxAgentUnixParent -Stat (Get-MuxAgentUnixStat -Path '/') -User $user -Aces (Get-MuxAgentUnixParentAces -Path '/')
     $checked = [Collections.Generic.HashSet[string]]::new([string[]]@('/'))
     foreach ($path in $Paths) {
         $prefix = ''
@@ -312,7 +327,7 @@ function New-MuxAgentUnixPrivateDirectories {
             if ($created -or $prefix -ceq $Root -or $prefix.StartsWith($Root + '/', [StringComparison]::Ordinal)) {
                 Assert-MuxAgentUnixPrivate -Facts (Get-MuxAgentUnixPathFacts -Path $prefix) -User $user
             }
-            else { Assert-MuxAgentUnixParent -Stat (Get-MuxAgentUnixStat -Path $prefix) -User $user }
+            else { Assert-MuxAgentUnixParent -Stat (Get-MuxAgentUnixStat -Path $prefix) -User $user -Aces (Get-MuxAgentUnixParentAces -Path $prefix) }
             $null = $checked.Add($prefix)
         }
     }

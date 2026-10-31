@@ -153,6 +153,14 @@ Describe 'MuxAgents unix private decision' {
         }
         ($answers -join ';') | Should BeExactly 'ok;1 state the state folder path has a link;1 state the state folder path is a file;1 state the state folder is missing;1 state the state folder path has a link;1 state the state folder has another owner;1 state the state folder has another owner;1 state the state folder mode is 755, not 700;1 state the state folder mode is 4700, not 700;1 state the state folder mode is 1700, not 700;1 state the state folder mode is 600, not 700;1 state the state folder has an extended ACL;1 state the state folder has an extended ACL;ok;ok'
     }
+    It 'passes a folder above the root only when every ACL entry is a deny; an allow, a name hiding deny, or an unreadable line refuses' {
+        $stat = [pscustomobject]@{ Owner = '0'; Mode = 493 }
+        $cases = @(@(), @(' 0: group:everyone deny delete'), @(' 0: group:everyone inherited deny delete,chown', ' 1: user:me deny write'), @(' 0: user:other allow add_subdirectory,delete_child'),
+            @(' 0: group:everyone inherited allow list'), @(' 0: user:a deny b allow write'), @('garbage'), @(' 0: group:everyone deny delete', ''))
+        $answers = foreach ($aces in $cases) { Get-UnixStateRefusal { Assert-MuxAgentUnixParent -Stat $stat -User '501' -Aces $aces } }
+        $refused = '1 state a folder above the state folder has an ACL entry that is not a deny'
+        ($answers -join ';') | Should BeExactly (@('ok', 'ok', 'ok', $refused, $refused, $refused, $refused, $refused) -join ';')
+    }
 }
 Describe 'MuxAgents unix path facts' {
     Context 'native reads mocked' {
@@ -185,6 +193,16 @@ Describe 'MuxAgents unix path facts' {
             }
             finally { Remove-Variable unixStateEntry, unixStateCalls, unixStateReplies -Scope Global -ErrorAction SilentlyContinue }
         }
+        It 'reads the ACL entries of a folder above the root with ls -lde on macOS only, and refuses a failed or malformed read' {
+            try {
+                Set-UnixStateReplies @{ ls = "0|drwxr-xr-x+ 5 root wheel 160 x /r`n 0: group:everyone deny delete`n" }
+                $linux = @(Get-MuxAgentUnixParentAces -Path '/r' -Platform linux); $linuxCalls = $global:unixStateCalls.Count
+                $mac = @(Get-MuxAgentUnixParentAces -Path '/r' -Platform macos); $macCalls = $global:unixStateCalls -join ';'
+                $answers = foreach ($ls in '1|', '0|', '0|total 0', '0|-rw-r--r-- 1 u g 0 x /r') { Set-UnixStateReplies @{ ls = $ls }; Get-UnixStateRefusal { Get-MuxAgentUnixParentAces -Path '/r' -Platform macos } }
+                "$($linux.Count) $linuxCalls|$macCalls|$($mac.Count)[$($mac -join '|')]|$($answers -join ';')" | Should BeExactly ('0 0|ls -lde -- /r|1[ 0: group:everyone deny delete]|' + ((1..4 | ForEach-Object { '1 state the state folder cannot be checked' }) -join ';'))
+            }
+            finally { Remove-Variable unixStateCalls, unixStateReplies -Scope Global -ErrorAction SilentlyContinue }
+        }
         It 'reads the ls permission field position by position and refuses full-length fields no file system prints' {
             $global:unixStateEntry = 'directory'
             try {
@@ -207,8 +225,10 @@ Describe 'MuxAgents unix private folders' {
         Mock Get-MuxAgentUnixPathFacts { param($Path) $global:unixStateCalls.Add("facts $Path"); [pscustomobject]@{ Path = $Path; Kind = 'directory'; Identity = '1:2'; Mode = $(if ($global:unixStateModes.ContainsKey($Path)) { $global:unixStateModes[$Path] } else { 448 }); Owner = $(if ($Path -like '*/agents') { '0' } else { '501' }); Listing = 'drwx------'; Aces = @(); Real = $Path } }
         # A folder above the root: '<owner> <mode>' from unixStateAbove, else root-owned 0755.
         Mock Get-MuxAgentUnixStat { param($Path) $global:unixStateCalls.Add("stat $Path"); $owner, $mode = $(if ($global:unixStateAbove.ContainsKey($Path)) { $global:unixStateAbove[$Path] } else { '0 493' }) -split ' '; [pscustomobject]@{ Identity = '1:1'; Mode = [int]$mode; Owner = $owner; Text = "1:1 $mode $owner" } }
-        $run = { param($Root, $Missing, $Modes, $Paths, $Above = @{})
-            $global:unixStateCalls = [Collections.Generic.List[string]]::new(); $global:unixStateMissing = [Collections.Generic.HashSet[string]]::new([string[]]$Missing); $global:unixStateModes = $Modes; $global:unixStateAbove = $Above
+        # The ACL entries of a folder above the root: from unixStateAces, else none.
+        Mock Get-MuxAgentUnixParentAces { param($Path) if ($global:unixStateAces.ContainsKey($Path)) { $global:unixStateAces[$Path] } }
+        $run = { param($Root, $Missing, $Modes, $Paths, $Above = @{}, $Aces = @{})
+            $global:unixStateCalls = [Collections.Generic.List[string]]::new(); $global:unixStateMissing = [Collections.Generic.HashSet[string]]::new([string[]]$Missing); $global:unixStateModes = $Modes; $global:unixStateAbove = $Above; $global:unixStateAces = $Aces
             "$(Get-UnixStateRefusal { New-MuxAgentUnixPrivateDirectories -Root $Root -Paths $Paths })|$($global:unixStateCalls -join ';')" }
         It 'walks each path top-down, creates what is missing, checks the root, all below it and all it created once each, and stops at the first refusal' {
             try {
@@ -230,7 +250,16 @@ Describe 'MuxAgents unix private folders' {
                 $made = 'ok|id;stat /;new /r;stat /r;new /r/s;facts /r/s;new /r/s/k;facts /r/s/k'
                 ($answers -join '#') | Should BeExactly (@($owner, $made, $owner, $open, $open, $open, $made, $owner, '1 state a folder above the state folder has another owner|id;stat /') -join '#')
             }
-            finally { Remove-Variable unixStateCalls, unixStateMissing, unixStateModes, unixStateAbove -Scope Global -ErrorAction SilentlyContinue }
+            finally { Remove-Variable unixStateCalls, unixStateMissing, unixStateModes, unixStateAbove, unixStateAces -Scope Global -ErrorAction SilentlyContinue }
+        }
+        It 'refuses a folder above the root with an ACL entry that is not a deny, before creating anything below it' {
+            try {
+                $cases = @(@{ '/r' = @(' 0: group:everyone deny delete') }, @{ '/r' = @(' 0: user:other allow add_subdirectory,delete_child') }, @{ '/' = @(' 0: group:everyone inherited allow list') })
+                $answers = foreach ($aces in $cases) { & $run '/r/s' @('/r/s', '/r/s/k') @{} @('/r/s/k') @{} $aces }
+                $refused = '1 state a folder above the state folder has an ACL entry that is not a deny'
+                ($answers -join '#') | Should BeExactly (@('ok|id;stat /;new /r;stat /r;new /r/s;facts /r/s;new /r/s/k;facts /r/s/k', "$refused|id;stat /;new /r;stat /r", "$refused|id;stat /") -join '#')
+            }
+            finally { Remove-Variable unixStateCalls, unixStateMissing, unixStateModes, unixStateAbove, unixStateAces -Scope Global -ErrorAction SilentlyContinue }
         }
     }
     Context 'creation steps mocked' {
@@ -350,9 +379,15 @@ Describe 'MuxAgents unix state on macOS' -Tag 'macos' {
         $facts = Get-MuxAgentUnixPathFacts -Path $root
         "$before|$code $([Convert]::ToString([int]$facts.Mode, 8)) $(@($facts.Aces).Count)|$(Get-UnixStateRefusal { New-MuxAgentUnixPrivateDirectories -Root $root -Paths @($root) })" | Should BeExactly 'ok|0 700 1|1 state the state folder has an extended ACL'
     }
+    It 'refuses a root below a folder with an allow ACE, before creating anything below that folder' {
+        $parent = New-UnixStateNativeRoot; $null = [IO.Directory]::CreateDirectory($parent)
+        & chmod +a 'everyone allow add_subdirectory,delete_child' $parent; $code = $LASTEXITCODE
+        $refusal = Get-UnixStateRefusal { New-MuxAgentUnixPrivateDirectories -Root "$parent/state" -Paths @("$parent/state/k") }
+        "$code|$refusal|$(Get-UnixStateMode "$parent/state")" | Should BeExactly '0|1 state a folder above the state folder has an ACL entry that is not a deny|missing'
+    }
     It 'refuses a new 0700 root that inherits an ACE, and creates nothing below it' {
         $parent = New-UnixStateNativeRoot; $null = [IO.Directory]::CreateDirectory($parent)
-        & chmod +a 'everyone allow list,search,file_inherit,directory_inherit' $parent; $code = $LASTEXITCODE
+        & chmod +a 'everyone deny chown,directory_inherit' $parent; $code = $LASTEXITCODE   # a deny passes the parent check; the root inherits it
         $root = "$parent/state"
         $refusal = Get-UnixStateRefusal { New-MuxAgentUnixPrivateDirectories -Root $root -Paths @("$root/k") }
         $facts = Get-MuxAgentUnixPathFacts -Path $root
