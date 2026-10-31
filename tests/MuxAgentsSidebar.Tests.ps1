@@ -457,3 +457,14 @@ Describe 'MuxAgents sidebar split failures' {
             "$($run.Code) $($run.Reply.check) $($run.Reply.message) | $(Get-SidebarRoles $panes)" }
         $left = '1 sidebar the side-bar pane %7 could not be tagged or closed; close it with kill-pane -t %7 | %1=|,%2=other|,%7=|'
         ($answers -join ';') | Should BeExactly "$left;$left;$left" } }
+
+Describe 'MuxAgents sidebar docs' {
+    It 'the skill teaches Copilot CLI callers to open the side bar and names the tagged refusal; the README names the verbs' {
+        # Catches: a missing or reworded skill line or command, the old tagged line kept, the README library row not updated.
+        $skill = [IO.File]::ReadAllLines([IO.Path]::Combine($repoRoot, 'skills', 'mux-agents', 'SKILL.md'))
+        $readme = [IO.File]::ReadAllLines((Join-Path $repoRoot 'README.md'))
+        $want = @('- In Copilot CLI, run `sidebar` once after your first `spawn`: a narrow pane beside you shows how many agents run and what each is doing. `sidebar -Close` closes it.',
+            'pwsh -NoProfile -File "<entry>" sidebar', 'pwsh -NoProfile -File "<entry>" sidebar -Close', '- `tagged`: a spawn or a side bar from an agent pane; children cannot spawn or open the side bar.')
+        $row = @($readme | Where-Object { $_.StartsWith('| `scripts/MuxAgents.ps1` |', [StringComparison]::Ordinal) }) -join ''
+        "$(@($want | Where-Object { $_ -cnotin $skill }) -join ' ; ')|$row" |
+            Should BeExactly '|| `scripts/MuxAgents.ps1` | Library: caller, checks, registry, locks, spawn, list, focus, send, read, stop, status, sidebar, watch, launcher |' } }

@@ -17,6 +17,7 @@ Use this skill inside an RMUX pane on Windows or a tmux 3.2+ pane on Linux or ma
 - Agent callers always pass `-BriefFile`, because a fork can fall back to brief-only.
 - Report results to your parent with `send parent`.
 - As a spawned agent, run `status -BodyFile <file>` each time you start a step of your task.
+- In Copilot CLI, run `sidebar` once after your first `spawn`: a narrow pane beside you shows how many agents run and what each is doing. `sidebar -Close` closes it.
 - Never type into panes.
 - Run `focus` only when the user asks.
 - Children cannot spawn.
@@ -34,6 +35,8 @@ pwsh -NoProfile -File "<entry>" status -BodyFile <status-file>
 pwsh -NoProfile -File "<entry>" read -Wait <seconds>
 pwsh -NoProfile -File "<entry>" read <name> -Lines <n>
 pwsh -NoProfile -File "<entry>" stop <name>
+pwsh -NoProfile -File "<entry>" sidebar
+pwsh -NoProfile -File "<entry>" sidebar -Close
 ```
 
 `spawn` also takes `-Name <name>`, `-Split h|v` (split your pane instead of a new window) and `-NoFork`.
@@ -58,7 +61,7 @@ pwsh -NoProfile -File "<entry>" stop <name>
 - `policy`: the caller's live policy is unreadable or is neither bypass nor allow-all.
 - `flags`: a flag outside the allowlist on any `claude.exe` or `copilot.exe` command line from the agent up to the pane.
 - `directory`: the caller's launch directory cannot be confirmed.
-- `tagged`: a spawn from an agent pane; children cannot spawn.
+- `tagged`: a spawn or a side bar from an agent pane; children cannot spawn or open the side bar.
 - `cap`: 6 live agents in the session.
 - `name`: a bad or taken name.
 - Other check names: `brief`, `target`, `parent`, `endpoint`, `state` and `lock`.
