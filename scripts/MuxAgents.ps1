@@ -1468,16 +1468,25 @@ function New-MuxAgentFrameWriter {
 function Start-MuxAgentWatch {
     # The side-bar loop for Caller's pane. Each tick: ask the pane itself, read the board (-All -WithExitCode), write
     # ANSI home and clear plus the board, sleep 2 s. Ends 'pane-closed' when the probe answers gone (B4's rule) and
-    # 'output-closed' when a write throws. A failed or thrown probe is unknown, not gone. A failed board read still
-    # writes a frame (the last board and 'refresh failed'), so a closed terminal is found even when nothing else answers.
+    # 'output-closed' when a write throws. A failed or thrown probe is unknown, not gone: that frame says 'refresh
+    # failed', and after 30 unknown probes in a row (a minute with no answer from the multiplexer) it ends
+    # 'probe-failed', since a write to a pipe whose reader closed can still succeed and would never end the loop. A probe
+    # that names this pane resets the count. A failed board read still writes a frame (the last board and 'refresh
+    # failed'), so a closed terminal is found even when nothing else answers.
     param([Parameter(Mandatory)]$P, [Parameter(Mandatory)]$Caller, [Parameter(Mandatory)][scriptblock]$Write)
     $reader = Get-MuxAgentMailboxKey -Pane $Caller.Pane -Tag $Caller.AgentTag
     $clear = [string][char]27 + '[H' + [string][char]27 + '[2J'
     $last = "mux-agents $([char]0x00B7) ? running"
+    $unknown = 0
     while ($true) {
         $probe = try { Invoke-MuxAgentNative -P $P -Arguments @('display-message', '-p', '-t', $Caller.Pane, '#{pane_id}|#{@agent-role}') -AllowFailure } catch { $null }
         if (Test-MuxAgentPaneGone $probe) { return 'pane-closed' }
-        $text = try { $last = Format-MuxAgentBoard (Get-MuxAgentBoard -P $P -Caller $Caller -ReaderKey $reader -All -WithExitCode); $last } catch { $last + "`nrefresh failed" }
+        $live = $null -ne $probe -and $probe.ExitCode -eq 0 -and ([string]$probe.StdOut).StartsWith("$($Caller.Pane)|", [StringComparison]::Ordinal)
+        $unknown = if ($live) { 0 } else { $unknown + 1 }
+        if ($unknown -ge 30) { return 'probe-failed' }
+        $failed = -not $live
+        $text = try { $last = Format-MuxAgentBoard (Get-MuxAgentBoard -P $P -Caller $Caller -ReaderKey $reader -All -WithExitCode); $last } catch { $failed = $true; $last }
+        if ($failed) { $text += "`nrefresh failed" }
         try { & $Write ($clear + $text.Replace("`n", "`r`n") + "`r`n") } catch { return 'output-closed' }
         & $P.Sleep 2000
     }

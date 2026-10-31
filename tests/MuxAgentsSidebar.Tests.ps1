@@ -174,12 +174,29 @@ Describe 'MuxAgents sidebar watch loop' {
         "$ended $($frames.Count) $(($fake.Clock - [DateTime]::new(2026, 10, 29, 12, 0, 0, [DateTimeKind]::Utc)).TotalMilliseconds) $(Get-SidebarProbes $fake)" | Should BeExactly 'pane-closed 2 4000 3'
         # Ordinal: -ceq compares by culture, which ignores ESC, so a frame without its escapes would still be equal.
         "$([string]::Equals($frames[0], $frame, [StringComparison]::Ordinal)) $([string]::Equals($frames[1], $frame, [StringComparison]::Ordinal))" | Should BeExactly 'True True' }
-    It 'a thrown or failed probe is unknown, not gone: the loop draws on until the pane answers gone' {
-        # Catches: a thrown probe ending or crashing the loop, a failed probe (exit 1) counted as gone.
+    It 'a thrown or failed probe is unknown, not gone: its frame says refresh failed, and the loop draws on until the pane answers gone' {
+        # Catches: a thrown probe ending or crashing the loop, a failed probe (exit 1) counted as gone, a failed probe
+        # drawn as a normal board, a live probe still marked failed.
         $fake = New-SidebarWatchFake 'watch probe' -Probes 'throw', 'fail', 'live', 'gone'
         $frames = [Collections.Generic.List[string]]::new()
         $ended = Start-MuxAgentWatch -P $fake -Caller (Resolve-MuxAgentCaller -P $fake) -Write (& $write $frames)
-        "$ended $($frames.Count) $(Get-SidebarProbes $fake)" | Should BeExactly 'pane-closed 3 4' }
+        "$ended $($frames.Count) $(Get-SidebarProbes $fake)" | Should BeExactly 'pane-closed 3 4'
+        $marked = "$e[H$e[2J$($board)refresh failed`r`n"
+        "$([string]::Equals($frames[0], $marked, [StringComparison]::Ordinal)) $([string]::Equals($frames[1], $marked, [StringComparison]::Ordinal)) $([string]::Equals($frames[2], $frame, [StringComparison]::Ordinal))" | Should BeExactly 'True True True' }
+    It 'ends probe-failed after 30 unknown probes in a row, even when every write succeeds' {
+        # Catches: no bound (a pipe whose reader closed accepts writes, so the loop never ends: runaway), another bound.
+        $fake = New-SidebarWatchFake 'watch unanswered' -Probes 'fail'
+        Stop-SidebarRunaway $fake -Max 100
+        $frames = [Collections.Generic.List[string]]::new()
+        $ended = try { Start-MuxAgentWatch -P $fake -Caller (Resolve-MuxAgentCaller -P $fake) -Write { param($Frame) $frames.Add($Frame) }.GetNewClosure() } catch { "threw $($_.Exception.Message)" }
+        "$ended $($frames.Count) $(Get-SidebarProbes $fake)" | Should BeExactly 'probe-failed 29 30' }
+    It 'a probe that names its pane resets the count of unknown probes' {
+        # Catches: the count never reset (probe-failed at the 30th unknown probe in total).
+        $fake = New-SidebarWatchFake 'watch reset' -Probes (@(1..29 | ForEach-Object { 'fail' }) + @('live') + @(1..29 | ForEach-Object { 'fail' }) + @('gone'))
+        Stop-SidebarRunaway $fake -Max 100
+        $frames = [Collections.Generic.List[string]]::new()
+        $ended = try { Start-MuxAgentWatch -P $fake -Caller (Resolve-MuxAgentCaller -P $fake) -Write { param($Frame) $frames.Add($Frame) }.GetNewClosure() } catch { "threw $($_.Exception.Message)" }
+        "$ended $($frames.Count) $(Get-SidebarProbes $fake)" | Should BeExactly 'pane-closed 59 60' }
     It 'ends when its output fails, before sleeping' {
         # Catches: a write error swallowed (3 probes), the error thrown out of watch, a sleep before the return.
         $fake = New-SidebarWatchFake 'watch output' -Probes 'live', 'live', 'gone'
