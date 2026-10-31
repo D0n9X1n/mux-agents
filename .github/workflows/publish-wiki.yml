@@ -19,14 +19,30 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      # git's credential helper reads the token from this environment when git runs it; no command line or
+      # .git/config holds it. Only the clone and the push get it; the publisher never does.
       - name: Clone the wiki repository
+        shell: bash
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: git clone "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.wiki.git" wiki-repo
+          GH_TOKEN: ${{ github.token }}
+          GIT_CONFIG_COUNT: 2
+          GIT_CONFIG_KEY_0: credential.helper
+          GIT_CONFIG_VALUE_0: ''
+          GIT_CONFIG_KEY_1: credential.helper
+          GIT_CONFIG_VALUE_1: '!f() { echo username=x-access-token; echo "password=$GH_TOKEN"; }; f'
+        run: git clone "https://github.com/${GITHUB_REPOSITORY}.wiki.git" wiki-repo
       - name: Mirror wiki/ into it
         id: mirror
-        shell: pwsh
-        run: ./scripts/wiki/Publish-MuxAgentWiki.ps1 -Source wiki -WikiRepo wiki-repo -SourceSha $env:GITHUB_SHA
+        shell: bash
+        run: sh scripts/wiki/publish.sh wiki wiki-repo "$GITHUB_SHA"
       - name: Push the mirror
         if: steps.mirror.outputs.changed == 'true'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GIT_CONFIG_COUNT: 2
+          GIT_CONFIG_KEY_0: credential.helper
+          GIT_CONFIG_VALUE_0: ''
+          GIT_CONFIG_KEY_1: credential.helper
+          GIT_CONFIG_VALUE_1: '!f() { echo username=x-access-token; echo "password=$GH_TOKEN"; }; f'
         run: git -C wiki-repo push origin HEAD:master

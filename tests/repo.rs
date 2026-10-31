@@ -530,19 +530,54 @@ fn release_publish_keeps_dist_monotonic() {
 }
 
 // A token on a command line is visible to every process on the runner; git reads it from the environment instead.
-#[test]
-fn release_token_never_in_argv() {
-    let release = repo_file(".github/workflows/release.yml");
-    for line in release.lines().map(strip_comment) {
+fn assert_token_off_argv(path: &str) {
+    for line in repo_file(path).lines().map(strip_comment) {
         for bad in ["x-access-token:$", "${{ secrets", "TOKEN@", "TOKEN}@"] {
-            assert!(!line.contains(bad), "{bad:?} in {line}");
+            assert!(!line.contains(bad), "{path}: {bad:?} in {line}");
         }
         for (at, _) in line.match_indices("://") {
             let url: String = line[at..]
                 .chars()
                 .take_while(|c| !c.is_whitespace() && !matches!(c, '"' | '\''))
                 .collect();
-            assert!(!url.contains('@'), "credentials in URL {url}");
+            assert!(!url.contains('@'), "{path}: credentials in URL {url}");
         }
     }
+}
+
+#[test]
+fn release_token_never_in_argv() {
+    assert_token_off_argv(".github/workflows/release.yml");
+}
+
+// The wiki publish workflow: the sh publisher mirrors wiki/ into a plain clone; git reads the token from the
+// credential helper environment on the clone and the push, never from a URL.
+#[test]
+fn wiki_publish_runs_sh_with_token_off_argv() {
+    let wiki = repo_file(".github/workflows/publish-wiki.yml");
+    let publish = job_lines(&wiki, "publish");
+    let clone = line_of(
+        &publish,
+        r#"git clone "https://github.com/${GITHUB_REPOSITORY}.wiki.git" wiki-repo"#,
+    );
+    let mirror = line_of(
+        &publish,
+        r#"sh scripts/wiki/publish.sh wiki wiki-repo "$GITHUB_SHA""#,
+    );
+    let push = line_of(&publish, "git -C wiki-repo push origin HEAD:master");
+    assert!(clone < mirror && mirror < push, "{publish:#?}");
+    // The helper is set on the clone's and the push's steps only, not the job: the publisher never sees the token.
+    let helper = r#"GIT_CONFIG_VALUE_1: '!f() { echo username=x-access-token; echo "password=$GH_TOKEN"; }; f'"#;
+    let helpers: Vec<usize> = publish
+        .iter()
+        .enumerate()
+        .filter(|(_, l)| l.as_str() == helper)
+        .map(|(i, _)| i)
+        .collect();
+    assert_eq!(helpers.len(), 2, "{publish:#?}");
+    assert!(
+        helpers[0] < clone && clone < mirror && mirror < helpers[1] && helpers[1] < push,
+        "{publish:#?}"
+    );
+    assert_token_off_argv(".github/workflows/publish-wiki.yml");
 }
