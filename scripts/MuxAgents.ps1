@@ -129,6 +129,12 @@ function Get-MuxAgentStateRoot {
     [IO.Path]::Combine([string]$Environment['LOCALAPPDATA'], 'mux-agents', 'state')
 }
 
+function Get-MuxAgentPlatform {
+    # windows, linux or macos for the given OS flags (default: this process), else $null.
+    param([bool]$OnWindows = $IsWindows, [bool]$OnLinux = $IsLinux, [bool]$OnMacOS = $IsMacOS)
+    if ($OnWindows) { 'windows' } elseif ($OnLinux) { 'linux' } elseif ($OnMacOS) { 'macos' }
+}
+
 function Resolve-MuxAgentExecutable {
     # The rmux image the caller's server runs (by the server PID in RMUX, then TMUX), else the first rmux.exe on PATH.
     param([Parameter(Mandatory)]$P)
