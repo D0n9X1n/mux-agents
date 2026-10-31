@@ -248,8 +248,23 @@ Describe 'MuxAgents wiki pages' {
     $chinese = @($pages | Where-Object { $_.EndsWith('-zh-CN', [StringComparison]::Ordinal) })
     function Get-WikiTwin([string]$Page) { if ($Page.EndsWith('-zh-CN', [StringComparison]::Ordinal)) { $Page.Substring(0, $Page.Length - 6) } else { "$Page-zh-CN" } }
     function Get-WikiLinks([string]$Page) { @([regex]::Matches([IO.File]::ReadAllText((Join-Path $wikiRoot "$Page.md")), '\[[^\]]*\]\(([^)\s]+)\)') | ForEach-Object { $_.Groups[1].Value }) }
-    It 'has Home and Design-Foundation in English and Chinese' {
-        @('Home', 'Home-zh-CN', 'Design-Foundation', 'Design-Foundation-zh-CN' | Where-Object { $_ -cnotin $pages }) -join ',' | Should BeExactly ''
+    function Get-WikiDrift([string]$Page) {
+        # '' when Page-zh-CN matches Page line for line: the same count and, per line, the same shape, the same code
+        # spans and numbers, and Chinese prose; else '<en lines> <zh lines> <drifting line numbers>'.
+        $en = [IO.File]::ReadAllLines((Join-Path $wikiRoot "$Page.md"))
+        $zh = [IO.File]::ReadAllLines((Join-Path $wikiRoot "$Page-zh-CN.md"))
+        $drift = @(for ($i = 0; $i -lt [Math]::Max($en.Count, $zh.Count); $i++) {
+            $a = "$($en[$i])"; $b = "$($zh[$i])"
+            $codeA = @([regex]::Matches($a, '`[^`]+`|\d+(\.\d+)*') | ForEach-Object Value | Sort-Object -Unique) -join ' '
+            $codeB = @([regex]::Matches($b, '`[^`]+`|\d+(\.\d+)*') | ForEach-Object Value | Sort-Object -Unique) -join ' '
+            $shape = { param($l) if (-not $l.Trim()) { 'blank' } elseif ($l -match '^(#+|\||-|\d+\.) ?') { $Matches[1] } else { 'text' } }
+            $prose = $b.Trim() -and $b -notmatch '^\[[^\]]+\]\([^)]+\)$' -and $b -notmatch '^\|[-|]+\|$'
+            if ((& $shape $a) -cne (& $shape $b) -or $codeA -cne $codeB -or ($prose -and $b -notmatch '\p{IsCJKUnifiedIdeographs}')) { $i + 1 }
+        })
+        if ($en.Count -ne $zh.Count -or $drift.Count) { "$($en.Count) $($zh.Count) $($drift -join ',')" } else { '' }
+    }
+    It 'has Home, Design-Foundation and Design-Side-Bar in English and Chinese' {
+        @('Home', 'Home-zh-CN', 'Design-Foundation', 'Design-Foundation-zh-CN', 'Design-Side-Bar', 'Design-Side-Bar-zh-CN' | Where-Object { $_ -cnotin $pages }) -join ',' | Should BeExactly ''
     }
     It 'pairs every English page with its -zh-CN page and back' {
         "$($pages.Count -gt 0) $(@($pages | Where-Object { (Get-WikiTwin $_) -cnotin $pages }) -join ',')" | Should BeExactly 'True '
@@ -267,7 +282,7 @@ Describe 'MuxAgents wiki pages' {
         "$($links.Count -gt 0) $($broken -join ' ; ')" | Should BeExactly 'True '
     }
     It 'Home links the design pages in its own language' {
-        "$((Get-WikiLinks 'Home') -ccontains 'Design-Foundation') $((Get-WikiLinks 'Home-zh-CN') -ccontains 'Design-Foundation-zh-CN')" | Should BeExactly 'True True'
+        "$((Get-WikiLinks 'Home') -ccontains 'Design-Foundation') $((Get-WikiLinks 'Home-zh-CN') -ccontains 'Design-Foundation-zh-CN') $((Get-WikiLinks 'Home') -ccontains 'Design-Side-Bar') $((Get-WikiLinks 'Home-zh-CN') -ccontains 'Design-Side-Bar-zh-CN')" | Should BeExactly 'True True True True'
     }
     It 'keeps wiki/ flat: no folders, since the mirror publishes top-level pages only' {
         @(if (Test-Path -LiteralPath $wikiRoot) { Get-ChildItem -LiteralPath $wikiRoot -Directory -Force | ForEach-Object { $_.Name } }) -join ',' | Should BeExactly ''
@@ -275,7 +290,7 @@ Describe 'MuxAgents wiki pages' {
     }
     It 'Home states the platforms and what is not built yet, in both languages' {
         $status = foreach ($page in 'Home', 'Home-zh-CN') { @([IO.File]::ReadAllLines((Join-Path $wikiRoot "$page.md")) | Where-Object { $_ -match '^v0\.1\.0 ' }) -join ' / ' }
-        $status -join ' ; ' | Should BeExactly 'v0.1.0 is in progress. The code runs on Windows with rmux 0.10.0 and on Linux and macOS with tmux 3.2 or later. The side bar (#4) is being built and is not in the code yet. ; v0.1.0 正在开发中。代码在 Windows 上配合 rmux 0.10.0 运行，在 Linux 和 macOS 上配合 tmux 3.2 或更高版本运行。侧边栏（#4）正在构建，还没有进入代码。'
+        $status -join ' ; ' | Should BeExactly 'v0.1.0 is in progress. The code runs on Windows with rmux 0.10.0 and on Linux and macOS with tmux 3.2 or later. The side bar (#4) is in the code: a multiplexer split for every client and a pane in Claude Code. ; v0.1.0 正在开发中。代码在 Windows 上配合 rmux 0.10.0 运行，在 Linux 和 macOS 上配合 tmux 3.2 或更高版本运行。侧边栏（#4）已进入代码：每个客户端都可用的多路复用器分屏，以及 Claude Code 中的窗格。'
     }
     It 'Home states the Linux and macOS lock limitation of older .NET, in both languages' {
         $want = @{ 'Home' = 'On Linux and macOS with .NET older than 8.0.32, 9.0.21 or 10.0.13, another local user can make mux-agent commands time out with check lock. Nothing leaks and no state is damaged. Use a current PowerShell.'
@@ -284,16 +299,20 @@ Describe 'MuxAgents wiki pages' {
     It 'Design-Foundation keeps its sections, and its Chinese twin matches it line for line' {
         $en = [IO.File]::ReadAllLines((Join-Path $wikiRoot 'Design-Foundation.md'))
         @($en | Where-Object { $_ -match '^## ' }) -join ',' | Should BeExactly '## Purpose,## Decisions,## Changes,## Component map,## Behavior and its tests,## Must-pass,## Non-goals,## Prior art'
-        $zh = [IO.File]::ReadAllLines((Join-Path $wikiRoot 'Design-Foundation-zh-CN.md'))
-        $drift = @(for ($i = 0; $i -lt [Math]::Max($en.Count, $zh.Count); $i++) {
-            $a = "$($en[$i])"; $b = "$($zh[$i])"
-            $codeA = @([regex]::Matches($a, '`[^`]+`|\d+(\.\d+)*') | ForEach-Object Value | Sort-Object -Unique) -join ' '
-            $codeB = @([regex]::Matches($b, '`[^`]+`|\d+(\.\d+)*') | ForEach-Object Value | Sort-Object -Unique) -join ' '
-            $shape = { param($l) if (-not $l.Trim()) { 'blank' } elseif ($l -match '^(#+|\||-|\d+\.) ?') { $Matches[1] } else { 'text' } }
-            $prose = $b.Trim() -and $b -notmatch '^\[[^\]]+\]\([^)]+\)$' -and $b -notmatch '^\|[-|]+\|$'
-            if ((& $shape $a) -cne (& $shape $b) -or $codeA -cne $codeB -or ($prose -and $b -notmatch '\p{IsCJKUnifiedIdeographs}')) { $i + 1 }
-        })
-        "$($en.Count) $($zh.Count) $($drift -join ',')" | Should BeExactly "$($en.Count) $($en.Count) "
+        Get-WikiDrift 'Design-Foundation' | Should BeExactly ''
+    }
+    It 'Design-Side-Bar states the pane and watch as built, keeps its sections, and its Chinese twin matches it line for line' {
+        # Catches: a blanked or stale line (the pane's types, the -Text reply, the test files, watch's three ends and its
+        # terminal rule), a lost section and drift between the languages.
+        $en = [IO.File]::ReadAllLines((Join-Path $wikiRoot 'Design-Side-Bar.md'))
+        @($en | Where-Object { $_ -match '^## ' }) -join ',' | Should BeExactly '## Purpose,## Decisions (PM''s calls under the release goal),## Verbs,## Claude Code pane,## Skill,## Component map,## Tests,## Must-pass,## Non-goals,## Prior art'
+        $found = foreach ($page in 'Design-Side-Bar', 'Design-Side-Bar-zh-CN') {
+            $text = [IO.File]::ReadAllText((Join-Path $wikiRoot "$page.md")) -replace "`r`n", "`n"
+            $missing = @('`types/index.d.ts`', '`-Text`', '`pane-closed`', '`output-closed`', '`probe-failed`', '`usage`', '`tests/claude/register.test.tsx`', '`tests/claude/board.test.ts`', '`claude plugin test .`' | Where-Object { -not $text.Contains($_) })
+            "$page blank-run=$($text.Contains("`n`n`n")) missing=$($missing -join ',')"
+        }
+        $found -join ' ; ' | Should BeExactly 'Design-Side-Bar blank-run=False missing= ; Design-Side-Bar-zh-CN blank-run=False missing='
+        Get-WikiDrift 'Design-Side-Bar' | Should BeExactly ''
     }
     It 'tracks no path under docs/' {
         @(& git -C $repoRoot ls-files -- docs) -join ',' | Should BeExactly ''
