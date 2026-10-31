@@ -562,12 +562,27 @@ function Read-MuxAgentJson {
     ConvertFrom-Json -InputObject $text
 }
 
+# Seams for Use-MuxAgentLock (#25): the named-mutex factory and the pause before its one retry.
+$script:MuxAgentNewMutex = { param([string]$Name) [Threading.Mutex]::new($false, $Name) }
+$script:MuxAgentLockSleep = { param([int]$Milliseconds) Start-Sleep -Milliseconds $Milliseconds }
+$script:MuxAgentLockCreateMessage = 'could not create the agent lock (a named mutex); set XDG_RUNTIME_DIR to a folder you own'
+
 function Use-MuxAgentLock {
     # Runs LockAction under the named mutex for LockKey and returns its output. An abandoned mutex counts as held;
     # a timeout refuses 2 'lock'. Callers take the session lock before the mailbox lock. The Lock prefix keeps these
-    # names from shadowing the caller variables that LockAction reads.
+    # names from shadowing the caller variables that LockAction reads. Creation is retried once after 100 ms on
+    # IOException, UnauthorizedAccessException or WaitHandleCannotBeOpenedException (#25); the name, the wait and the
+    # action never are.
     param([Parameter(Mandatory)][string]$LockKey, [Parameter(Mandatory)][scriptblock]$LockAction, [int]$LockTimeoutMilliseconds = 15000)
-    $lockMutex = [Threading.Mutex]::new($false, (& $script:MuxAgentLockName $LockKey))
+    $lockName = & $script:MuxAgentLockName $LockKey
+    $lockMutex = $null
+    for ($lockTry = 1; -not $lockMutex; $lockTry++) {
+        try { $lockMutex = & $script:MuxAgentNewMutex $lockName }
+        catch [IO.IOException], [UnauthorizedAccessException], [Threading.WaitHandleCannotBeOpenedException] {
+            if ($lockTry -ge 2) { Exit-MuxAgentCommand 2 'lock' $script:MuxAgentLockCreateMessage }
+            & $script:MuxAgentLockSleep 100
+        }
+    }
     $lockHeld = $false
     try {
         try { $lockHeld = $lockMutex.WaitOne($LockTimeoutMilliseconds) } catch [Threading.AbandonedMutexException] { $lockHeld = $true }
