@@ -12,9 +12,18 @@ use crate::mux::{Kind, Mux, Output};
 use crate::parse::Client;
 use crate::proc::{Left, Opened, Os, Row, Signals, Token};
 
+// Answers a matching call from its argv: stateful fakes (a pane table, a queue of probe answers, a failure).
+type Script = Rc<dyn Fn(&[String]) -> Res<Output>>;
+
+#[derive(Clone)]
+enum Answer {
+    Fixed(Output),
+    Script(Script),
+}
+
 struct Rule {
     contains: String,
-    output: Output,
+    answer: Answer,
 }
 
 // Sees each lock event (`+key` or `-key`) and answers text to record with it.
@@ -46,6 +55,8 @@ struct Log {
     kills: Vec<u32>,
     report: Option<Report>,
     probe: Option<Probe>,
+    // What `Mux::kind` answers; none is tmux.
+    kind: Option<Kind>,
 }
 
 thread_local! {
@@ -83,8 +94,24 @@ impl Fakes {
         };
         self.0.borrow_mut().rules.push(Rule {
             contains: contains.into(),
-            output,
+            answer: Answer::Fixed(output),
         });
+    }
+
+    /// A rule checked before every other, answered by `script` from the call's argv.
+    pub fn mux_script(&self, contains: &str, script: impl Fn(&[String]) -> Res<Output> + 'static) {
+        self.0.borrow_mut().rules.insert(
+            0,
+            Rule {
+                contains: contains.into(),
+                answer: Answer::Script(Rc::new(script)),
+            },
+        );
+    }
+
+    /// The multiplexer `Mux::kind` names.
+    pub fn mux_kind(&self, kind: Kind) {
+        self.0.borrow_mut().kind = Some(kind);
     }
 
     /// A rule checked before every earlier one, so a test can change an answer mid-way.
@@ -322,20 +349,26 @@ pub fn row(pid: u32, ppid: u32, start: i64) -> Row {
 
 impl Mux for Fakes {
     fn run(&self, args: &[&str]) -> Res<Output> {
-        let mut log = self.0.borrow_mut();
-        log.mux_calls
-            .push(args.iter().map(|a| a.to_string()).collect());
+        let argv: Vec<String> = args.iter().map(|a| a.to_string()).collect();
         let line = args.join(" ");
-        Ok(log
-            .rules
-            .iter()
-            .find(|r| line.contains(&r.contains))
-            .map(|r| r.output.clone())
-            .unwrap_or_default())
+        let answer = {
+            let mut log = self.0.borrow_mut();
+            log.mux_calls.push(argv.clone());
+            log.rules
+                .iter()
+                .find(|r| line.contains(&r.contains))
+                .map(|r| r.answer.clone())
+        };
+        // The log is released first, so a script may read the fakes.
+        match answer {
+            None => Ok(Output::default()),
+            Some(Answer::Fixed(output)) => Ok(output),
+            Some(Answer::Script(script)) => script(&argv),
+        }
     }
 
     fn kind(&self) -> Kind {
-        Kind::Tmux
+        self.0.borrow().kind.unwrap_or(Kind::Tmux)
     }
 }
 

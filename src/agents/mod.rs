@@ -9,9 +9,11 @@ use crate::ctx::Ctx;
 use crate::error::{Refusal, Res};
 
 pub mod board;
+pub mod copilot;
 pub mod mail;
 pub mod message;
 pub mod registry;
+pub mod spawn;
 pub mod view;
 
 /// `<root>/<serverKey>`; reads use it as is and never create it.

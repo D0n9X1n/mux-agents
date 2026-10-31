@@ -284,7 +284,7 @@ fn claude_policy(ctx: &Ctx, caller: &Caller) -> Res<bool> {
 }
 
 /// ~/.claude/projects/<folder>/<session>.jsonl when exactly one project folder has it.
-fn claude_transcript(home: &Path, session: &str) -> std::io::Result<Option<PathBuf>> {
+pub(crate) fn claude_transcript(home: &Path, session: &str) -> std::io::Result<Option<PathBuf>> {
     let projects = home.join(".claude").join("projects");
     if !projects.is_dir() {
         return Ok(None);
