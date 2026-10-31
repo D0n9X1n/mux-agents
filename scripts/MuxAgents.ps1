@@ -248,10 +248,10 @@ function Invoke-MuxAgentRmux {
     # process starts, so nothing here can create a server.
     param([Parameter(Mandatory)]$P, [string[]]$Arguments)
     if (-not $Arguments -or $Arguments[0] -cne '-N') { throw [InvalidOperationException]::new('mux-agent: every rmux call must start with -N') }
-    $endpoint = if ($P.Env['RMUX']) { $P.Env['RMUX'] } else { $P.Env['TMUX'] }
-    if (-not ($endpoint -match '^(\\\\\.\\pipe\\[^,\r\n]+),\d+,\d+$')) { Exit-MuxAgentCommand 1 'endpoint' 'not inside an rmux pane' }
-    $socket = $Matches[1]
-    if (-not $P.RmuxPath) { $P.RmuxPath = Resolve-MuxAgentExecutable -P $P }
+    $parsed = & $P.Endpoint $P.Env
+    if (-not $parsed) { Exit-MuxAgentCommand 1 'endpoint' 'not inside an rmux pane' }
+    $socket = $parsed.Socket
+    if (-not $P.RmuxPath) { $P.RmuxPath = & $P.Mux $P }
     try { Invoke-MuxAgentProcess -FilePath $P.RmuxPath -Arguments (@('-S', $socket) + $Arguments) -TimeoutMilliseconds 15000 }
     catch { Exit-MuxAgentCommand 1 'endpoint' 'the rmux endpoint did not answer' }
 }
@@ -303,10 +303,10 @@ function Resolve-MuxAgentCaller {
     # endpoint or pane, 1 'caller' when the caller is not below its pane or its agent's start is unreadable or changed,
     # and 2 'caller' for a non-shell in between. Chain holds the walked rows, command lines included, and stays in memory.
     param([Parameter(Mandatory)]$P)
-    $endpoint = if ($P.Env['RMUX']) { $P.Env['RMUX'] } else { $P.Env['TMUX'] }
-    if (-not ($endpoint -match '^(\\\\\.\\pipe\\[^,\r\n]+),(\d+),\d+$')) { Exit-MuxAgentCommand 1 'endpoint' 'not inside an rmux pane' }
-    $socket = $Matches[1]
-    $serverPid = $Matches[2]
+    $parsed = & $P.Endpoint $P.Env
+    if (-not $parsed) { Exit-MuxAgentCommand 1 'endpoint' 'not inside an rmux pane' }
+    $socket = $parsed.Socket
+    $serverPid = $parsed.ServerPid
     $pane = $P.Env['TMUX_PANE']
     if ($pane -notmatch '^%\d+$') { Exit-MuxAgentCommand 1 'endpoint' 'not inside an rmux pane' }
     # rmux 0.10.0 answers a probe of a gone pane with exit 0 and empty fields, so the row itself is validated.

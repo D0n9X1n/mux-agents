@@ -64,3 +64,54 @@ Describe 'MuxAgents providers contract' {
         (@($members.Keys | Where-Object { -not $fake.PSObject.Properties[$_] -or [string]$fake.$_ -cne [string]$members[$_] } | Sort-Object) -join ',') | Should BeExactly 'Kill,Open,Processes,Token'
     }
 }
+Describe 'MuxAgents providers endpoint and mux' {
+    It 'windows Endpoint reads RMUX before TMUX, keeps the pid as text, takes only pipes; Mux resolves the server image' {
+        $members = Get-MuxAgentPlatformMembers -Platform windows
+        $answers = foreach ($env in @(@{ RMUX = '\\.\pipe\a,0900,1'; TMUX = '\\.\pipe\b,7,0' }, @{ TMUX = '\\.\pipe\b,7,0' }, @{ TMUX = '/tmp/tmux-1000/default,7,0' }, @{ RMUX = '\\.\pipe\a,7,-1' }, @{})) {
+            $parsed = & $members.Endpoint $env; if ($parsed) { "$($parsed.Socket)|$($parsed.ServerPid)" } else { 'none' }
+        }
+        ($answers -join ';') | Should BeExactly '\\.\pipe\a|0900;\\.\pipe\b|7;none;none;none'
+        $fake = New-FakeMuxAgentProviders
+        $fake.Rows[0].Path = '/srv/rmux.exe'
+        & $members.Mux $fake | Should BeExactly '/srv/rmux.exe'
+    }
+    Context 'transport with a recorded native call' {
+        It 'Invoke-MuxAgentRmux passes the Endpoint socket as -S and runs the image Mux names' {
+            Mock Invoke-MuxAgentProcess { param($FilePath, $Arguments) [pscustomobject]@{ ExitCode = 0; StdOut = "$FilePath $($Arguments -join ' ')"; StdErr = '' } }
+            $fake = New-FakeMuxAgentProviders
+            $fake.Endpoint = { param($Environment) [pscustomobject]@{ Socket = '/tmp/tmux-1000/default'; ServerPid = '900' } }
+            $fake.Mux = { param($P) '/spy/tmux' }
+            "$((Invoke-MuxAgentRmux -P $fake -Arguments @('-N', 'list-panes')).StdOut)|$($fake.RmuxPath)" | Should BeExactly '/spy/tmux -S /tmp/tmux-1000/default -N list-panes|/spy/tmux'
+        }
+    }
+    Context 'transport without an endpoint' {
+        It 'Invoke-MuxAgentRmux refuses a null Endpoint before resolving the image or making a native call' {
+            $global:providersNative = [Collections.Generic.List[string]]::new()
+            Mock Invoke-MuxAgentProcess { $global:providersNative.Add("process $FilePath"); [pscustomobject]@{ ExitCode = 0; StdOut = ''; StdErr = '' } }
+            Mock Resolve-MuxAgentExecutable { $global:providersNative.Add('resolve'); '/spy/resolved' }
+            try {
+                $fake = New-FakeMuxAgentProviders
+                $fake.Endpoint = { param($Environment) $null }
+                $fake.Mux = { param($P) $global:providersNative.Add('mux'); '/spy/tmux' }
+                "$(Get-ProvidersRefusal { Invoke-MuxAgentRmux -P $fake -Arguments @('-N', 'list-panes') })|$($global:providersNative -join ',')|$($null -eq $fake.RmuxPath)" | Should BeExactly '1 endpoint not inside an rmux pane||True'
+            }
+            finally { Remove-Variable -Name providersNative -Scope Global }
+        }
+    }
+    It 'Resolve-MuxAgentCaller keys the server by the Endpoint socket and refuses when Endpoint finds none' {
+        $fake = New-FakeMuxAgentProviders
+        $fake.Endpoint = { param($Environment) [pscustomobject]@{ Socket = '/tmp/tmux-1000/default'; ServerPid = '900' } }
+        "$((Resolve-MuxAgentCaller -P $fake).ServerKey)" | Should BeExactly (Get-MuxAgentHash '/tmp/tmux-1000/default|900|9000').Substring(0, 16)
+        $fake.Endpoint = { param($Environment) $null }
+        Get-ProvidersRefusal { Resolve-MuxAgentCaller -P $fake } | Should BeExactly '1 endpoint not inside an rmux pane'
+    }
+    It 'Resolve-MuxAgentCaller takes the server pid from Endpoint, not from the environment' {
+        # The fake environment names server 900; the provider names 931, and the probe and Open agree with the provider.
+        $fake = New-FakeMuxAgentProviders
+        $fake.Endpoint = { param($Environment) [pscustomobject]@{ Socket = '/tmp/tmux-1000/default'; ServerPid = '931' } }
+        Add-FakeRmuxRule -Fake $fake -Match '^-N display-message ' -StdOut ('931|100|$3|@1|' + "`n")
+        $fake.OpenResults[931] = [pscustomobject]@{ Id = 931; Start = 9317; Process = $null }
+        $caller = Resolve-MuxAgentCaller -P $fake
+        "$($caller.ServerPid)|$($caller.ServerStart)|$($caller.ServerKey)" | Should BeExactly "931|9317|$((Get-MuxAgentHash '/tmp/tmux-1000/default|931|9317').Substring(0, 16))"
+    }
+}
