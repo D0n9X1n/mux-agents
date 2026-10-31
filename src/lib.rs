@@ -4,6 +4,7 @@
 compile_error!("mux-agent runs on Windows, Linux and macOS only");
 
 pub mod caller;
+pub mod checks;
 pub mod cli;
 pub mod ctx;
 pub mod error;

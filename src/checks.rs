@@ -1,0 +1,1339 @@
+//! Spawn checks: the agent name, the context plan, and for an agent caller C3 (flags), C2 (policy) and C5
+//! (directory) (MuxAgents.ps1:548-578, 912-1012; Unix.ps1:142-161).
+
+use std::path::{Path, PathBuf};
+
+use crate::caller::{Agent, Caller, Kind};
+use crate::ctx::{Ctx, Env};
+use crate::error::{Refusal, Res};
+use crate::parse::Client;
+use crate::state::root::OsKind;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Context {
+    Fork,
+    Brief,
+}
+
+/// How a new agent starts: from the caller's session (fork, `parent_session`) or from a brief, and why.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Plan {
+    pub context: Context,
+    pub reason: &'static str,
+    pub parent_session: Option<String>,
+}
+
+const NAME_MAX: usize = 24;
+const RESERVED: [&str; 3] = ["parent", "root", "all"];
+// The session file and workspace.yaml read at most this, like every state file.
+const FILE_MAX: u64 = crate::state::fs::STATE_MAX;
+
+// C3: the flags an agent's client command lines may carry, named by their text before '='.
+const CLAUDE_FLAGS: [&str; 13] = [
+    "--model",
+    "--add-dir",
+    "--session-id",
+    "--continue",
+    "-r",
+    "--resume",
+    "-n",
+    "--name",
+    "-c",
+    "--dangerously-skip-permissions",
+    "--permission-mode",
+    "--effort",
+    "--fork-session",
+];
+const COPILOT_FLAGS: [&str; 20] = [
+    "--model",
+    "--add-dir",
+    "--session-id",
+    "--continue",
+    "-r",
+    "--resume",
+    "-n",
+    "--name",
+    "--allow-all",
+    "--yolo",
+    "--no-sandbox",
+    "--allow-all-tools",
+    "--allow-all-paths",
+    "--allow-all-urls",
+    "--reasoning-effort",
+    "--autopilot",
+    "-i",
+    "--interactive",
+    "-p",
+    "--prompt",
+];
+
+fn client_name(client: Client) -> &'static str {
+    match client {
+        Client::Claude => "claude",
+        Client::Copilot => "copilot",
+    }
+}
+
+fn refusal(code: u8, check: &'static str, message: String) -> Refusal {
+    Refusal {
+        code,
+        check,
+        message,
+    }
+}
+
+/// A lowercase 8-4-4-4-12 GUID. The reference matched it ignoring case, so upper hex passes too; it only ever
+/// names a file or a `--resume` value, and no separator can get through.
+pub fn session_id(text: &str) -> bool {
+    let groups: Vec<&str> = text.split('-').collect();
+    groups.iter().map(|g| g.len()).eq([8, 4, 4, 4, 12])
+        && groups
+            .iter()
+            .all(|g| g.bytes().all(|b| b.is_ascii_hexdigit()))
+}
+
+/// The requested name after the pattern, reserved and taken checks, or `<client>-<n>` with the smallest free n
+/// when none is requested. Taken names compare without case.
+pub fn resolve_name(requested: Option<&str>, client: Client, taken: &[&str]) -> Res<String> {
+    let is_taken = |name: &str| {
+        let name = name.to_lowercase();
+        taken.iter().any(|t| t.to_lowercase() == name)
+    };
+    let Some(name) = requested else {
+        let client = client_name(client);
+        let free = (1u64..)
+            .map(|n| format!("{client}-{n}"))
+            .find(|name| !is_taken(name));
+        return Ok(free.expect("fewer taken names than numbers"));
+    };
+    let mut bytes = name.bytes();
+    let well_formed = bytes.next().is_some_and(|b| b.is_ascii_lowercase())
+        && bytes.all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+        && name.len() <= NAME_MAX;
+    if !well_formed {
+        return Err(refusal(
+            2,
+            "name",
+            "agent names are 1-24 lowercase letters, digits or hyphens, starting with a letter"
+                .into(),
+        ));
+    }
+    if RESERVED.contains(&name) {
+        return Err(refusal(2, "name", "agent name is reserved".into()));
+    }
+    if is_taken(name) {
+        return Err(refusal(2, "name", "agent name is taken".into()));
+    }
+    Ok(name.to_string())
+}
+
+/// Fork (the new agent starts from the caller's session) only for a same-client agent with a well-formed session
+/// id; a Claude fork also needs the interactive entrypoint `cli`, since a fork of a -p or SDK session fails
+/// interactively with API 400.
+pub fn context_plan(caller: &Caller, client: Client, env: &Env, no_fork: bool) -> Plan {
+    let variable = match client {
+        Client::Claude => "CLAUDE_CODE_SESSION_ID",
+        Client::Copilot => "COPILOT_AGENT_SESSION_ID",
+    };
+    let parent = env.get(variable).unwrap_or("");
+    let reason = if no_fork {
+        Some("no-fork")
+    } else if caller.kind == Kind::Human {
+        Some("human")
+    } else if caller.client != Some(client) {
+        Some("cross-client")
+    } else if !session_id(parent) {
+        Some("no-session-id")
+    } else if client == Client::Claude && env.get("CLAUDE_CODE_ENTRYPOINT") != Some("cli") {
+        Some("not-interactive")
+    } else {
+        None
+    };
+    match reason {
+        Some(reason) => Plan {
+            context: Context::Brief,
+            reason,
+            parent_session: None,
+        },
+        None => Plan {
+            context: Context::Fork,
+            reason: "same-client",
+            parent_session: Some(parent.to_string()),
+        },
+    }
+}
+
+/// C3, C2 and C5 for an agent caller, in that order; returns the launch directory. Refusals name only the check
+/// (and for C3 the flag).
+pub fn assert_spawn_allowed(ctx: &Ctx, caller: &Caller) -> Res<PathBuf> {
+    let (Some(agent), Some(client)) = (&caller.agent, caller.client) else {
+        return Err(Refusal::internal("spawn checks need an agent caller"));
+    };
+    let allowed: &[&str] = match client {
+        Client::Claude => &CLAUDE_FLAGS,
+        Client::Copilot => &COPILOT_FLAGS,
+    };
+    let start = caller
+        .chain
+        .iter()
+        .position(|row| row.pid == agent.pid)
+        .ok_or_else(|| Refusal::internal("the agent is not in its chain"))?;
+    let mut agent_argv: &[String] = &[];
+    // The agent and every client row above it up to the pane.
+    for (index, row) in caller.chain.iter().enumerate().skip(start) {
+        if ctx.os.client_of(row).is_none() {
+            continue;
+        }
+        let argv = row
+            .argv
+            .as_deref()
+            .ok_or_else(|| refusal(2, "flags", "a client command line cannot be read".into()))?;
+        if index == start {
+            agent_argv = argv;
+        }
+        for argument in argv.iter().skip(1).filter(|a| a.starts_with('-')) {
+            let flag = argument.split('=').next().unwrap_or(argument);
+            if !allowed.contains(&flag) {
+                return Err(refusal(
+                    2,
+                    "flags",
+                    format!("the flag {flag} is not allowed for a spawning agent"),
+                ));
+            }
+        }
+    }
+    if !policy(ctx, caller, agent_argv)? {
+        return Err(refusal(
+            2,
+            "policy",
+            "the caller's live policy is not full bypass".into(),
+        ));
+    }
+    launch_directory(ctx, caller, crate::state::root::HOST)
+}
+
+/// C2: whether the caller's live policy is full bypass.
+fn policy(ctx: &Ctx, caller: &Caller, agent_argv: &[String]) -> Res<bool> {
+    match caller.client {
+        Some(Client::Claude) => claude_policy(ctx, caller),
+        _ => Ok(copilot_policy(ctx, agent_argv)?),
+    }
+}
+
+fn contains_ignoring_case(text: &str, needle: &str) -> bool {
+    text.to_ascii_lowercase().contains(needle)
+}
+
+/// `^\{"type":"permission-mode","permissionMode":"([A-Za-z]+)"`, ignoring case like the reference's -match.
+fn permission_mode_line(line: &str) -> bool {
+    const HEAD: &str = r#"{"type":"permission-mode","permissionmode":""#;
+    let lower = line.to_ascii_lowercase();
+    lower.strip_prefix(HEAD).is_some_and(|rest| {
+        let letters = rest.bytes().take_while(u8::is_ascii_alphabetic).count();
+        letters > 0 && rest.as_bytes().get(letters) == Some(&b'"')
+    })
+}
+
+/// Claude: the latest transcript permission-mode, then the pane's mode line, which catches a Shift+Tab the
+/// transcript has not recorded yet.
+fn claude_policy(ctx: &Ctx, caller: &Caller) -> Res<bool> {
+    let session = ctx.env.get("CLAUDE_CODE_SESSION_ID").unwrap_or("");
+    if !session_id(session) {
+        return Ok(false);
+    }
+    let Some(transcript) = claude_transcript(&ctx.home, session)? else {
+        return Ok(false);
+    };
+    let line = last_line(&transcript, r#""permission-mode""#, permission_mode_line)?;
+    if !line.is_some_and(|l| {
+        l.starts_with(r#"{"type":"permission-mode","permissionMode":"bypassPermissions""#)
+    }) {
+        return Ok(false);
+    }
+    let pane = caller.pane.as_str();
+    let size = crate::mux::native(
+        ctx,
+        &["display-message", "-p", "-t", pane, "#{pane_height}"],
+        true,
+    )?;
+    let Some(height) = (size.code == 0)
+        .then(|| size.stdout.trim().parse::<i32>().ok())
+        .flatten()
+    else {
+        return Ok(false);
+    };
+    // A pane no client has sized shows no mode line, so the transcript decides alone.
+    if height < 3 {
+        return Ok(true);
+    }
+    let screen = crate::mux::native(ctx, &["capture-pane", "-p", "-t", pane], true)?;
+    if screen.code != 0 {
+        return Ok(false);
+    }
+    let rows: Vec<&str> = screen
+        .stdout
+        .split('\n')
+        .map(|row| row.strip_suffix('\r').unwrap_or(row))
+        .filter(|row| !row.trim().is_empty())
+        .collect();
+    let tail = &rows[rows.len().saturating_sub(4)..];
+    Ok(tail
+        .iter()
+        .any(|row| contains_ignoring_case(row, "bypass permissions on")))
+}
+
+/// ~/.claude/projects/<folder>/<session>.jsonl when exactly one project folder has it.
+fn claude_transcript(home: &Path, session: &str) -> std::io::Result<Option<PathBuf>> {
+    let projects = home.join(".claude").join("projects");
+    if !projects.is_dir() {
+        return Ok(None);
+    }
+    let mut found = Vec::new();
+    for entry in std::fs::read_dir(&projects)? {
+        let folder = entry?.path();
+        let transcript = folder.join(format!("{session}.jsonl"));
+        if folder.is_dir() && transcript.is_file() {
+            found.push(transcript);
+        }
+    }
+    Ok(if found.len() == 1 { found.pop() } else { None })
+}
+
+/// The last line holding `needle` that `matches` accepts. Read a line at a time: transcripts grow large. Lines
+/// end at LF, CR LF or a lone CR, as .NET's ReadLine split them.
+fn last_line(
+    path: &Path,
+    needle: &str,
+    matches: impl Fn(&str) -> bool,
+) -> std::io::Result<Option<String>> {
+    use std::io::BufRead;
+    let mut reader = std::io::BufReader::new(std::fs::File::open(path)?);
+    let (mut last, mut buf, mut first) = (None, Vec::new(), true);
+    while reader.read_until(b'\n', &mut buf)? > 0 {
+        let mut chunk = buf.as_slice();
+        if first {
+            chunk = chunk.strip_prefix(b"\xef\xbb\xbf").unwrap_or(chunk);
+            first = false;
+        }
+        let text = String::from_utf8_lossy(chunk.strip_suffix(b"\n").unwrap_or(chunk));
+        for line in text.split('\r') {
+            if line.contains(needle) && matches(line) {
+                last = Some(line.to_string());
+            }
+        }
+        buf.clear();
+    }
+    Ok(last)
+}
+
+/// Copilot: the latest permissions event (with none, an allow-all flag at launch), and never plan mode.
+fn copilot_policy(ctx: &Ctx, agent_argv: &[String]) -> std::io::Result<bool> {
+    let session = ctx.env.get("COPILOT_AGENT_SESSION_ID").unwrap_or("");
+    if !session_id(session) {
+        return Ok(false);
+    }
+    let events = copilot_folder(&ctx.home, session).join("events.jsonl");
+    if !events.is_file() {
+        return Ok(false);
+    }
+    let permissions = last_line(&events, "session.permissions_changed", |line| {
+        contains_ignoring_case(line, r#""type":"session.permissions_changed""#)
+    })?;
+    let allow_all = match permissions {
+        Some(line) => contains_ignoring_case(&line, r#""allowallpermissions":true"#),
+        None => agent_argv.iter().any(|arg| {
+            let flag = arg.split('=').next().unwrap_or(arg);
+            flag == "--allow-all" || flag == "--yolo"
+        }),
+    };
+    if !allow_all {
+        return Ok(false);
+    }
+    let mode = last_line(&events, "session.mode_changed", |line| {
+        contains_ignoring_case(line, r#""type":"session.mode_changed""#)
+    })?;
+    Ok(!mode.is_some_and(|line| contains_ignoring_case(&line, r#""plan""#)))
+}
+
+fn copilot_folder(home: &Path, session: &str) -> PathBuf {
+    home.join(".copilot").join("session-state").join(session)
+}
+
+/// C5: the agent's launch directory. Anything missing or different refuses 2 `directory`. A relative directory
+/// refuses too: it would resolve against our own cwd, not the agent's.
+fn launch_directory(ctx: &Ctx, caller: &Caller, os: OsKind) -> Res<PathBuf> {
+    let directory = match (caller.client, &caller.agent) {
+        (Some(Client::Claude), Some(agent)) => match os {
+            OsKind::Windows => windows_claude_directory(ctx, agent),
+            OsKind::Unix => unix_claude_directory(ctx, agent),
+        },
+        (Some(Client::Copilot), _) => copilot_directory(ctx),
+        _ => None,
+    };
+    match directory.map(PathBuf::from) {
+        Some(path) if path.is_absolute() && path.is_dir() => Ok(path),
+        _ => Err(refusal(
+            2,
+            "directory",
+            "the caller's launch directory cannot be confirmed".into(),
+        )),
+    }
+}
+
+fn claude_session_file(ctx: &Ctx, pid: u32) -> PathBuf {
+    ctx.home
+        .join(".claude")
+        .join("sessions")
+        .join(format!("{pid}.json"))
+}
+
+/// The file's bytes up to `FILE_MAX`; `Err(true)` when it is proved missing, `Err(false)` for any other failure
+/// (unreadable, a folder, oversized).
+fn read_small(path: &Path) -> Result<Vec<u8>, bool> {
+    use std::io::Read;
+    let file = std::fs::File::open(path).map_err(|e| e.kind() == std::io::ErrorKind::NotFound)?;
+    let mut bytes = Vec::new();
+    file.take(FILE_MAX + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| false)?;
+    if bytes.len() as u64 > FILE_MAX {
+        return Err(false);
+    }
+    Ok(bytes)
+}
+
+fn json_object(bytes: &[u8]) -> Option<serde_json::Map<String, serde_json::Value>> {
+    let text = bytes.strip_prefix(b"\xef\xbb\xbf").unwrap_or(bytes);
+    match serde_json::from_slice(text).ok()? {
+        serde_json::Value::Object(map) => Some(map),
+        _ => None,
+    }
+}
+
+/// Windows: ~/.claude/sessions/<pid>.json must carry the agent's start (a FILETIME, compared at whole
+/// microseconds like the process table) and this session's id.
+fn windows_claude_directory(ctx: &Ctx, agent: &Agent) -> Option<String> {
+    let session = json_object(&read_small(&claude_session_file(ctx, agent.pid)).ok()?)?;
+    let start = match session.get("procStart")? {
+        serde_json::Value::String(text) => text.trim().parse::<i64>().ok()?,
+        number => number.as_i64()?,
+    };
+    if start - start % 10 != agent.start - agent.start % 10 {
+        return None;
+    }
+    let id = session.get("sessionId")?.as_str()?;
+    // Both sides present: an unset variable never matches a missing id.
+    if ctx.env.get("CLAUDE_CODE_SESSION_ID") != Some(id) {
+        return None;
+    }
+    Some(session.get("cwd")?.as_str()?.to_string())
+}
+
+/// Unix: the agent's kernel cwd, read between two starts equal to the agent's. A session file proved missing
+/// leaves the kernel cwd; one that is present must be an object whose cwd equals it, and any other failure
+/// (permission, a folder, oversized, malformed) refuses (Unix.ps1:142-161). sessionId and procStart stay
+/// Windows-only (claude-code#36213).
+fn unix_claude_directory(ctx: &Ctx, agent: &Agent) -> Option<String> {
+    let same = || {
+        ctx.os
+            .open(agent.pid)
+            .is_some_and(|o| o.start == agent.start)
+    };
+    if !same() {
+        return None;
+    }
+    let cwd = ctx.os.cwd(agent.pid).filter(|cwd| !cwd.is_empty())?;
+    if !same() {
+        return None;
+    }
+    match read_small(&claude_session_file(ctx, agent.pid)) {
+        Err(true) => Some(cwd),
+        Err(false) => None,
+        Ok(bytes) => {
+            let session = json_object(&bytes)?;
+            (session.get("cwd")?.as_str()? == cwd).then_some(cwd)
+        }
+    }
+}
+
+/// Copilot: the first `cwd: ` line of the session's workspace.yaml, quotes and blanks trimmed.
+fn copilot_directory(ctx: &Ctx) -> Option<String> {
+    let session = ctx.env.get("COPILOT_AGENT_SESSION_ID").unwrap_or("");
+    if !session_id(session) {
+        return None;
+    }
+    let bytes = read_small(&copilot_folder(&ctx.home, session).join("workspace.yaml")).ok()?;
+    let bytes = bytes.strip_prefix(b"\xef\xbb\xbf").unwrap_or(&bytes);
+    let text = String::from_utf8_lossy(bytes);
+    let line = text
+        .split(['\r', '\n'])
+        .find(|line| line.starts_with("cwd: "))?;
+    let directory = line[5..].trim().trim_matches(['"', '\'']);
+    (!directory.is_empty()).then(|| directory.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::proc::Row;
+    use crate::testing::{self, Fakes, TempDir};
+
+    const SID: &str = "11111111-2222-4333-8444-555555555555";
+    const OTHER_SID: &str = "99999999-2222-4333-8444-555555555555";
+    const CLAUDE: u32 = 150;
+    const UNCONFIRMED: &str = "2 directory the caller's launch directory cannot be confirmed";
+
+    fn strings(items: &[&str]) -> Vec<String> {
+        items.iter().map(|s| s.to_string()).collect()
+    }
+
+    fn argv_row(pid: u32, ppid: u32, start: i64, argv: Option<&[&str]>) -> Row {
+        Row {
+            argv: argv.map(strings),
+            ..testing::row(pid, ppid, start)
+        }
+    }
+
+    // caller 4242 > shell 170 > agent 150 > pane 100.
+    fn agent_caller(client: Client, agent_argv: Option<&[&str]>) -> Caller {
+        let chain = vec![
+            argv_row(4242, 170, 2000, Some(&["mux-agent", "spawn"])),
+            argv_row(170, CLAUDE, 1700, Some(&["bash"])),
+            argv_row(CLAUDE, 100, 1500, agent_argv),
+            argv_row(100, 900, 1000, Some(&["bash"])),
+        ];
+        Caller {
+            kind: Kind::Agent,
+            client: Some(client),
+            agent: Some(Agent {
+                pid: CLAUDE,
+                start: 1500,
+                path: None,
+            }),
+            chain,
+            pane: "%1".into(),
+            window: "@1".into(),
+            session: "$3".into(),
+            server_pid: 900,
+            server_start: 1,
+            socket: "/tmp/rmux".into(),
+            server_key: "0123456789abcdef".into(),
+            agent_tag: String::new(),
+        }
+    }
+
+    fn human_caller() -> Caller {
+        Caller {
+            kind: Kind::Human,
+            client: None,
+            agent: None,
+            ..agent_caller(Client::Claude, Some(&["claude"]))
+        }
+    }
+
+    fn answer<T: std::fmt::Debug>(result: Res<T>) -> String {
+        match result {
+            Ok(value) => format!("{value:?}"),
+            Err(r) => format!("{} {} {}", r.code, r.check, r.message),
+        }
+    }
+
+    // ---- names and context
+
+    #[test]
+    fn name_rules_reserved_taken_auto_n() {
+        let name = |requested: Option<&str>, client, taken: &[&str]| {
+            answer(resolve_name(requested, client, taken))
+        };
+        assert_eq!(name(None, Client::Claude, &[]), "\"claude-1\"");
+        assert_eq!(
+            name(
+                None,
+                Client::Copilot,
+                &["copilot-1", "COPILOT-2", "copilot-4"]
+            ),
+            "\"copilot-3\""
+        );
+        let ok = "a".repeat(24);
+        for good in ["a", "worker", "w-2", "a-", ok.as_str()] {
+            assert_eq!(
+                name(Some(good), Client::Claude, &[]),
+                format!("{good:?}"),
+                "{good}"
+            );
+        }
+        let pattern = "2 name agent names are 1-24 lowercase letters, digits or hyphens, starting with a letter";
+        let long = "a".repeat(25);
+        for bad in [
+            "",
+            "1a",
+            "-a",
+            "Worker",
+            "a_b",
+            "a b",
+            "a\n",
+            "\u{212a}",
+            "é",
+            long.as_str(),
+        ] {
+            assert_eq!(name(Some(bad), Client::Claude, &[]), pattern, "{bad:?}");
+        }
+        for reserved in ["parent", "root", "all"] {
+            assert_eq!(
+                name(Some(reserved), Client::Claude, &[]),
+                "2 name agent name is reserved"
+            );
+        }
+        // Taken names compare without case.
+        assert_eq!(
+            name(Some("worker"), Client::Claude, &["other", "WORKER"]),
+            "2 name agent name is taken"
+        );
+    }
+
+    #[test]
+    fn context_plan_reasons() {
+        let plan = |caller: &Caller, client, pairs: &[(&str, &str)], no_fork| {
+            let p = context_plan(
+                caller,
+                client,
+                &Env::from_pairs(pairs.iter().copied()),
+                no_fork,
+            );
+            format!(
+                "{:?} {} {}",
+                p.context,
+                p.reason,
+                p.parent_session.as_deref().unwrap_or("-")
+            )
+        };
+        let claude = agent_caller(Client::Claude, Some(&["claude"]));
+        let copilot = agent_caller(Client::Copilot, Some(&["copilot"]));
+        let cli = [
+            ("CLAUDE_CODE_SESSION_ID", SID),
+            ("CLAUDE_CODE_ENTRYPOINT", "cli"),
+        ];
+        assert_eq!(
+            plan(&claude, Client::Claude, &cli, false),
+            format!("Fork same-client {SID}")
+        );
+        assert_eq!(plan(&claude, Client::Claude, &cli, true), "Brief no-fork -");
+        assert_eq!(
+            plan(&human_caller(), Client::Claude, &cli, false),
+            "Brief human -"
+        );
+        assert_eq!(
+            plan(&claude, Client::Copilot, &cli, false),
+            "Brief cross-client -"
+        );
+        for bad in [
+            "",
+            "not-a-guid",
+            "11111111-2222-4333-8444-55555555555",
+            "x1111111-2222-4333-8444-555555555555",
+        ] {
+            let env = [
+                ("CLAUDE_CODE_SESSION_ID", bad),
+                ("CLAUDE_CODE_ENTRYPOINT", "cli"),
+            ];
+            assert_eq!(
+                plan(&claude, Client::Claude, &env, false),
+                "Brief no-session-id -",
+                "{bad:?}"
+            );
+        }
+        assert_eq!(
+            plan(
+                &claude,
+                Client::Claude,
+                &[("CLAUDE_CODE_ENTRYPOINT", "cli")],
+                false
+            ),
+            "Brief no-session-id -"
+        );
+        // Only the interactive entrypoint, exactly, forks a Claude session.
+        for entry in [None, Some("sdk-ts"), Some("CLI")] {
+            let mut env = vec![("CLAUDE_CODE_SESSION_ID", SID)];
+            env.extend(entry.map(|e| ("CLAUDE_CODE_ENTRYPOINT", e)));
+            assert_eq!(
+                plan(&claude, Client::Claude, &env, false),
+                "Brief not-interactive -",
+                "{entry:?}"
+            );
+        }
+        // Copilot needs no entrypoint and reads its own variable.
+        assert_eq!(
+            plan(
+                &copilot,
+                Client::Copilot,
+                &[("COPILOT_AGENT_SESSION_ID", SID)],
+                false
+            ),
+            format!("Fork same-client {SID}")
+        );
+        assert_eq!(
+            plan(&copilot, Client::Copilot, &cli, false),
+            "Brief no-session-id -"
+        );
+    }
+
+    // ---- C3
+
+    // Claude flags pass when the next check, policy, is the one that refuses (no session id here).
+    const NEXT: &str = "2 policy the caller's live policy is not full bypass";
+
+    fn flags(client: Client, agent_argv: Option<&[&str]>, extra: Option<Row>) -> String {
+        let fakes = Fakes::default();
+        fakes.client(CLAUDE, client);
+        let mut caller = agent_caller(client, agent_argv);
+        if let Some(row) = extra {
+            fakes.client(row.pid, Client::Copilot);
+            caller.chain.insert(3, row);
+        }
+        answer(assert_spawn_allowed(&fakes.ctx(), &caller))
+    }
+
+    #[test]
+    fn flags_refuses_unlisted_flag_names_it() {
+        let refused = flags(
+            Client::Claude,
+            Some(&[
+                "claude",
+                "--model",
+                "opus",
+                "--settings=/secret path/s.json",
+            ]),
+            None,
+        );
+        assert_eq!(
+            refused,
+            "2 flags the flag --settings is not allowed for a spawning agent"
+        );
+        assert!(!refused.contains("secret"));
+        // Case-sensitive, and the caller's own client list decides.
+        assert_eq!(
+            flags(Client::Claude, Some(&["claude", "--Model"]), None),
+            "2 flags the flag --Model is not allowed for a spawning agent"
+        );
+        assert_eq!(
+            flags(Client::Claude, Some(&["claude", "--yolo"]), None),
+            "2 flags the flag --yolo is not allowed for a spawning agent"
+        );
+        assert_eq!(
+            flags(
+                Client::Copilot,
+                Some(&["copilot", "--dangerously-skip-permissions"]),
+                None
+            ),
+            "2 flags the flag --dangerously-skip-permissions is not allowed for a spawning agent"
+        );
+        // argv[0] and anything not starting with '-' are not flags; every listed flag passes.
+        let listed = [
+            "-claude",
+            "task",
+            "--model=opus",
+            "--add-dir",
+            "/x",
+            "--session-id",
+            SID,
+            "--continue",
+            "-r",
+            "--resume",
+            "-n",
+            "--name",
+            "-c",
+            "--dangerously-skip-permissions",
+            "--permission-mode=bypassPermissions",
+            "--effort",
+            "--fork-session",
+        ];
+        assert_eq!(flags(Client::Claude, Some(&listed), None), NEXT);
+        let copilot = [
+            "copilot",
+            "--model",
+            "--add-dir",
+            "--session-id",
+            "--continue",
+            "-r",
+            "--resume",
+            "-n",
+            "--name",
+            "--allow-all",
+            "--yolo",
+            "--no-sandbox",
+            "--allow-all-tools",
+            "--allow-all-paths",
+            "--allow-all-urls",
+            "--reasoning-effort=high",
+            "--autopilot",
+            "-i",
+            "--interactive",
+            "-p",
+            "--prompt",
+        ];
+        assert_eq!(flags(Client::Copilot, Some(&copilot), None), NEXT);
+        // A client row above the agent is checked too; a non-client row is not.
+        let above = argv_row(120, 100, 1200, Some(&["copilot", "--secret-flag"]));
+        assert_eq!(
+            flags(Client::Claude, Some(&["claude"]), Some(above)),
+            "2 flags the flag --secret-flag is not allowed for a spawning agent"
+        );
+        let mut caller = agent_caller(Client::Claude, Some(&["claude"]));
+        caller.chain[3].argv = Some(strings(&["bash", "--login"]));
+        caller.chain[1].argv = None;
+        let fakes = Fakes::default();
+        fakes.client(CLAUDE, Client::Claude);
+        assert_eq!(answer(assert_spawn_allowed(&fakes.ctx(), &caller)), NEXT);
+    }
+
+    #[test]
+    fn flags_unreadable_argv_refuses() {
+        let unreadable = "2 flags a client command line cannot be read";
+        assert_eq!(flags(Client::Claude, None, None), unreadable);
+        let above = argv_row(120, 100, 1200, None);
+        assert_eq!(
+            flags(Client::Claude, Some(&["claude"]), Some(above)),
+            unreadable
+        );
+        // A human caller never reaches these checks.
+        let fakes = Fakes::default();
+        assert_eq!(
+            answer(assert_spawn_allowed(&fakes.ctx(), &human_caller())),
+            "1 internal unexpected error (spawn checks need an agent caller)"
+        );
+    }
+
+    // ---- C2
+
+    struct Claude {
+        transcript: Vec<String>,
+        height: Option<&'static str>,
+        screen: Option<&'static str>,
+        sid: &'static str,
+        folders: usize,
+    }
+
+    impl Default for Claude {
+        fn default() -> Self {
+            Claude {
+                transcript: vec![mode("bypassPermissions")],
+                height: Some("40\n"),
+                screen: Some("work\n\n  ⏵⏵ bypass permissions on (shift+tab to cycle)\n\n"),
+                sid: SID,
+                folders: 1,
+            }
+        }
+    }
+
+    fn mode(name: &str) -> String {
+        format!(r#"{{"type":"permission-mode","permissionMode":"{name}","sessionId":"{SID}"}}"#)
+    }
+
+    fn claude_policy(case: Claude) -> String {
+        let home = TempDir::new();
+        for folder in 0..case.folders {
+            let project = home
+                .path()
+                .join(".claude/projects")
+                .join(format!("p{folder}"));
+            std::fs::create_dir_all(&project).unwrap();
+            std::fs::write(
+                project.join(format!("{SID}.jsonl")),
+                case.transcript.join("\n") + "\n",
+            )
+            .unwrap();
+        }
+        let fakes = Fakes::default();
+        match case.height {
+            Some(out) => fakes.mux_rule("#{pane_height}", 0, out, ""),
+            None => fakes.mux_rule("#{pane_height}", 1, "", ""),
+        }
+        match case.screen {
+            Some(out) => fakes.mux_rule("capture-pane", 0, out, ""),
+            None => fakes.mux_rule("capture-pane", 1, "", ""),
+        }
+        let mut ctx = fakes.ctx();
+        ctx.home = home.path().to_path_buf();
+        ctx.env = Env::from_pairs([("CLAUDE_CODE_SESSION_ID", case.sid)]);
+        let caller = agent_caller(Client::Claude, Some(&["claude"]));
+        let result = answer(policy(&ctx, &caller, &[]));
+        let calls = fakes.mux_calls();
+        if result == "true" && case.screen.is_some() {
+            assert_eq!(
+                calls,
+                [
+                    vec!["-N", "display-message", "-p", "-t", "%1", "#{pane_height}"],
+                    vec!["-N", "capture-pane", "-p", "-t", "%1"]
+                ]
+            );
+        }
+        result
+    }
+
+    #[test]
+    fn policy_claude_transcript_and_mode_line() {
+        assert_eq!(claude_policy(Claude::default()), "true");
+        // The latest permission-mode line decides, exactly.
+        for (lines, want) in [
+            (vec![mode("default"), mode("bypassPermissions")], "true"),
+            (vec![mode("bypassPermissions"), mode("default")], "false"),
+            (
+                vec![mode("bypassPermissions"), mode("acceptEdits")],
+                "false",
+            ),
+            (vec![mode("BypassPermissions")], "false"),
+            (
+                vec![
+                    mode("bypassPermissions"),
+                    "{\"type\":\"user\",\"text\":\"permission-mode\"}".into(),
+                ],
+                "true",
+            ),
+            (
+                vec![
+                    mode("bypassPermissions"),
+                    " {\"type\":\"permission-mode\",\"permissionMode\":\"default\"}".into(),
+                ],
+                "true",
+            ),
+            (vec!["{\"type\":\"user\"}".into()], "false"),
+            (vec![], "false"),
+        ] {
+            let case = Claude {
+                transcript: lines.clone(),
+                ..Claude::default()
+            };
+            assert_eq!(claude_policy(case), want, "{lines:?}");
+        }
+        // A pane under 3 rows shows no mode line, so the transcript decides alone.
+        for height in ["2\n", " 0 "] {
+            let case = Claude {
+                height: Some(height),
+                screen: None,
+                ..Claude::default()
+            };
+            assert_eq!(claude_policy(case), "true", "{height:?}");
+        }
+        let small_pane = Claude {
+            height: Some("2\n"),
+            transcript: vec![mode("default")],
+            ..Claude::default()
+        };
+        assert_eq!(claude_policy(small_pane), "false");
+        for height in [None, Some("x\n"), Some("\n")] {
+            let case = Claude {
+                height,
+                ..Claude::default()
+            };
+            assert_eq!(claude_policy(case), "false", "{height:?}");
+        }
+        // The last 4 non-blank rows must show the mode, any case.
+        for (screen, want) in [
+            (Some("BYPASS PERMISSIONS ON\na\n\n \nb\nc\n"), "true"),
+            (Some("bypass permissions on\na\nb\nc\nd\n"), "false"),
+            (Some("> \n  ? for shortcuts\n"), "false"),
+            (Some("bypass permissions off\r\n"), "false"),
+            (None, "false"),
+        ] {
+            let case = Claude {
+                screen,
+                ..Claude::default()
+            };
+            assert_eq!(claude_policy(case), want, "{screen:?}");
+        }
+        // A malformed session id or a transcript in no project, or in two, is not bypass.
+        for sid in ["", "not-a-session"] {
+            assert_eq!(
+                claude_policy(Claude {
+                    sid,
+                    ..Claude::default()
+                }),
+                "false"
+            );
+        }
+        for folders in [0, 2] {
+            assert_eq!(
+                claude_policy(Claude {
+                    folders,
+                    ..Claude::default()
+                }),
+                "false"
+            );
+        }
+    }
+
+    fn copilot_policy(events: Option<&[&str]>, argv: &[&str]) -> String {
+        let home = TempDir::new();
+        if let Some(events) = events {
+            let folder = home.path().join(".copilot/session-state").join(SID);
+            std::fs::create_dir_all(&folder).unwrap();
+            std::fs::write(folder.join("events.jsonl"), events.join("\n")).unwrap();
+        }
+        let fakes = Fakes::default();
+        let mut ctx = fakes.ctx();
+        ctx.home = home.path().to_path_buf();
+        ctx.env = Env::from_pairs([("COPILOT_AGENT_SESSION_ID", SID)]);
+        let caller = agent_caller(Client::Copilot, Some(argv));
+        let result = answer(policy(&ctx, &caller, &strings(argv)));
+        assert!(fakes.mux_calls().is_empty());
+        result
+    }
+
+    #[test]
+    fn policy_copilot_permissions_and_plan_mode() {
+        let allow = |on: bool| {
+            format!(
+                r#"{{"type":"session.permissions_changed","data":{{"allowAllPermissions":{on}}}}}"#
+            )
+        };
+        let plan = r#"{"type":"session.mode_changed","data":{"newMode":"plan"}}"#;
+        let interactive = r#"{"type":"session.mode_changed","data":{"newMode":"interactive"}}"#;
+        let start = r#"{"type":"session.start"}"#;
+        let (on, off) = (allow(true), allow(false));
+        let copilot = ["copilot"];
+        // The latest permissions event decides; with none, an allow-all flag at launch.
+        assert_eq!(copilot_policy(Some(&[&on]), &copilot), "true");
+        assert_eq!(copilot_policy(Some(&[&on, &off]), &copilot), "false");
+        assert_eq!(copilot_policy(Some(&[&off, &on]), &copilot), "true");
+        assert_eq!(
+            copilot_policy(Some(&[&off]), &["copilot", "--yolo"]),
+            "false"
+        );
+        assert_eq!(copilot_policy(Some(&[start]), &copilot), "false");
+        for flag in ["--yolo", "--allow-all", "--allow-all=true"] {
+            assert_eq!(
+                copilot_policy(Some(&[start]), &["copilot", flag]),
+                "true",
+                "{flag}"
+            );
+        }
+        assert_eq!(
+            copilot_policy(Some(&[start]), &["copilot", "--allow-all-tools"]),
+            "false"
+        );
+        // Plan mode is never bypass; a later mode change out of it is.
+        assert_eq!(copilot_policy(Some(&[&on, plan]), &copilot), "false");
+        assert_eq!(
+            copilot_policy(Some(&[plan, &on, interactive]), &copilot),
+            "true"
+        );
+        // No events file is not bypass.
+        assert_eq!(copilot_policy(None, &["copilot", "--yolo"]), "false");
+    }
+
+    // ---- C5
+
+    fn ctx_at(fakes: &Fakes, home: &Path, env: &[(&str, &str)]) -> Ctx {
+        let mut ctx = fakes.ctx();
+        ctx.home = home.to_path_buf();
+        ctx.env = Env::from_pairs(env.iter().copied());
+        ctx
+    }
+
+    fn sessions(home: &Path) -> PathBuf {
+        let folder = home.join(".claude/sessions");
+        std::fs::create_dir_all(&folder).unwrap();
+        folder
+    }
+
+    fn found(path: &Path) -> String {
+        format!("{path:?}")
+    }
+
+    #[test]
+    fn directory_windows_session_json_start_and_id() {
+        let (home, work) = (TempDir::new(), TempDir::new());
+        let caller = agent_caller(Client::Claude, Some(&["claude"]));
+        let write = |session: serde_json::Value| {
+            std::fs::write(sessions(home.path()).join("150.json"), session.to_string()).unwrap();
+        };
+        let run = |env: &[(&str, &str)]| {
+            let fakes = Fakes::default();
+            answer(launch_directory(
+                &ctx_at(&fakes, home.path(), env),
+                &caller,
+                OsKind::Windows,
+            ))
+        };
+        let env = [("CLAUDE_CODE_SESSION_ID", SID)];
+        let cwd = work.path().to_str().unwrap();
+        // procStart is a FILETIME compared at whole microseconds, as text or a number.
+        for start in [
+            serde_json::json!("1500"),
+            serde_json::json!(1509),
+            serde_json::json!(1500),
+        ] {
+            write(
+                serde_json::json!({"pid": 150, "sessionId": SID, "cwd": cwd, "procStart": start}),
+            );
+            assert_eq!(run(&env), found(work.path()), "{start}");
+        }
+        for session in [
+            serde_json::json!({"sessionId": SID, "cwd": cwd, "procStart": "1510"}),
+            serde_json::json!({"sessionId": SID, "cwd": cwd, "procStart": "x"}),
+            serde_json::json!({"sessionId": SID, "cwd": cwd}),
+            serde_json::json!({"sessionId": OTHER_SID, "cwd": cwd, "procStart": "1500"}),
+            serde_json::json!({"cwd": cwd, "procStart": "1500"}),
+            serde_json::json!({"sessionId": SID, "cwd": 7, "procStart": "1500"}),
+            serde_json::json!({"sessionId": SID, "procStart": "1500"}),
+            serde_json::json!({"sessionId": SID, "cwd": "relative", "procStart": "1500"}),
+            serde_json::json!([1]),
+        ] {
+            write(session.clone());
+            assert_eq!(run(&env), UNCONFIRMED, "{session}");
+        }
+        // No session id in the environment never matches, nor does a missing file.
+        write(serde_json::json!({"cwd": cwd, "procStart": "1500"}));
+        assert_eq!(run(&[]), UNCONFIRMED);
+        std::fs::remove_file(sessions(home.path()).join("150.json")).unwrap();
+        assert_eq!(run(&env), UNCONFIRMED);
+    }
+
+    // The Unix C5 read for agent 150 whose opens answer `starts` and whose kernel cwd is `cwd`.
+    fn unix_directory(
+        home: &Path,
+        starts: &[Option<i64>],
+        cwd: Option<&str>,
+    ) -> (String, Vec<String>) {
+        let fakes = Fakes::default();
+        fakes.opens(CLAUDE, starts);
+        if let Some(cwd) = cwd {
+            fakes.kernel_cwd(CLAUDE, cwd);
+        }
+        let caller = agent_caller(Client::Claude, Some(&["claude"]));
+        let ctx = ctx_at(&fakes, home, &[]);
+        (
+            answer(launch_directory(&ctx, &caller, OsKind::Unix)),
+            fakes.os_calls(),
+        )
+    }
+
+    #[test]
+    fn directory_unix_cwd_between_two_starts() {
+        let (home, work) = (TempDir::new(), TempDir::new());
+        let cwd = work.path().to_str().unwrap();
+        let (result, calls) = unix_directory(home.path(), &[Some(1500), Some(1500)], Some(cwd));
+        assert_eq!(result, found(work.path()));
+        assert_eq!(calls, ["open 150", "cwd 150", "open 150"]);
+        for starts in [
+            [Some(1501), Some(1500)],
+            [Some(1500), Some(1501)],
+            [None, Some(1500)],
+            [Some(1500), None],
+        ] {
+            assert_eq!(
+                unix_directory(home.path(), &starts, Some(cwd)).0,
+                UNCONFIRMED,
+                "{starts:?}"
+            );
+        }
+        assert_eq!(
+            unix_directory(home.path(), &[Some(1500), Some(1500)], None).0,
+            UNCONFIRMED
+        );
+        assert_eq!(
+            unix_directory(home.path(), &[Some(1500), Some(1500)], Some("")).0,
+            UNCONFIRMED
+        );
+        // A cwd that is gone is not a launch directory.
+        let gone = work.path().join("gone");
+        assert_eq!(
+            unix_directory(home.path(), &[Some(1500), Some(1500)], gone.to_str()).0,
+            UNCONFIRMED
+        );
+    }
+
+    fn with_session_file(contents: &[u8]) -> (String, TempDir, TempDir) {
+        let (home, work) = (TempDir::new(), TempDir::new());
+        std::fs::write(sessions(home.path()).join("150.json"), contents).unwrap();
+        let cwd = work.path().to_str().unwrap();
+        let result = unix_directory(home.path(), &[Some(1500), Some(1500)], Some(cwd)).0;
+        (result, home, work)
+    }
+
+    #[test]
+    fn directory_session_file_cwd_mismatch_refuses() {
+        let (result, _home, _work) = with_session_file(br#"{"cwd":"/somewhere/else"}"#);
+        assert_eq!(result, UNCONFIRMED);
+        let (home, work) = (TempDir::new(), TempDir::new());
+        let cwd = work.path().to_str().unwrap();
+        let session = serde_json::json!({"pid": 150, "cwd": cwd, "sessionId": OTHER_SID});
+        std::fs::write(sessions(home.path()).join("150.json"), session.to_string()).unwrap();
+        // sessionId and procStart stay Windows-only (claude-code#36213); the cwd must equal the kernel's.
+        assert_eq!(
+            unix_directory(home.path(), &[Some(1500), Some(1500)], Some(cwd)).0,
+            found(work.path())
+        );
+    }
+
+    #[test]
+    fn directory_session_file_malformed_refuses() {
+        for contents in [
+            &b""[..],
+            b"not json",
+            b"[]",
+            b"\"cwd\"",
+            b"{\"cwd\":7}",
+            b"{\"cwd\":\"\"}",
+            b"{\"cwd\":null}",
+            b"{}",
+            b"{\"cwd\":\"/x\"",
+            b"\xff\xfe{}",
+        ] {
+            let (result, _home, _work) = with_session_file(contents);
+            assert_eq!(
+                result,
+                UNCONFIRMED,
+                "{:?}",
+                String::from_utf8_lossy(contents)
+            );
+        }
+    }
+
+    #[test]
+    fn directory_session_file_oversize_refuses() {
+        let (home, work) = (TempDir::new(), TempDir::new());
+        let cwd = work.path().to_str().unwrap();
+        let body = serde_json::json!({"cwd": cwd}).to_string();
+        let file = sessions(home.path()).join("150.json");
+        // Exactly 1 MB is read; one byte more is not.
+        let fits = format!("{body}{}", " ".repeat((1 << 20) - body.len()));
+        std::fs::write(&file, &fits).unwrap();
+        let run = || unix_directory(home.path(), &[Some(1500), Some(1500)], Some(cwd)).0;
+        assert_eq!(run(), found(work.path()));
+        std::fs::write(&file, format!("{fits} ")).unwrap();
+        assert_eq!(run(), UNCONFIRMED);
+    }
+
+    #[test]
+    fn directory_session_file_is_directory_refuses() {
+        let (home, work) = (TempDir::new(), TempDir::new());
+        std::fs::create_dir(sessions(home.path()).join("150.json")).unwrap();
+        let cwd = work.path().to_str().unwrap();
+        assert_eq!(
+            unix_directory(home.path(), &[Some(1500), Some(1500)], Some(cwd)).0,
+            UNCONFIRMED
+        );
+    }
+
+    #[test]
+    fn directory_session_file_absent_uses_kernel_cwd() {
+        let (home, work) = (TempDir::new(), TempDir::new());
+        let cwd = work.path().to_str().unwrap();
+        let run = || unix_directory(home.path(), &[Some(1500), Some(1500)], Some(cwd)).0;
+        // No sessions folder, then a folder without this pid's file.
+        assert_eq!(run(), found(work.path()));
+        std::fs::write(sessions(home.path()).join("151.json"), "{}").unwrap();
+        assert_eq!(run(), found(work.path()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn directory_session_file_unreadable_refuses() {
+        use std::os::unix::fs::PermissionsExt;
+        // SAFETY: geteuid only reads the caller's id.
+        if unsafe { libc::geteuid() } == 0 {
+            return; // root reads a 000 file
+        }
+        let (home, work) = (TempDir::new(), TempDir::new());
+        let cwd = work.path().to_str().unwrap();
+        let file = sessions(home.path()).join("150.json");
+        std::fs::write(&file, serde_json::json!({"cwd": cwd}).to_string()).unwrap();
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let result = unix_directory(home.path(), &[Some(1500), Some(1500)], Some(cwd)).0;
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(result, UNCONFIRMED);
+    }
+
+    fn copilot_directory(yaml: Option<&str>, sid: &str) -> String {
+        let home = TempDir::new();
+        if let Some(yaml) = yaml {
+            let folder = home.path().join(".copilot/session-state").join(SID);
+            std::fs::create_dir_all(&folder).unwrap();
+            std::fs::write(folder.join("workspace.yaml"), yaml).unwrap();
+        }
+        let fakes = Fakes::default();
+        let ctx = ctx_at(&fakes, home.path(), &[("COPILOT_AGENT_SESSION_ID", sid)]);
+        let caller = agent_caller(Client::Copilot, Some(&["copilot"]));
+        let result = answer(launch_directory(&ctx, &caller, crate::state::root::HOST));
+        assert!(fakes.os_calls().is_empty());
+        result
+    }
+
+    #[test]
+    fn directory_copilot_workspace_yaml_cwd() {
+        let work = TempDir::new();
+        let cwd = work.path().to_str().unwrap();
+        let yaml = format!("id: {SID}\r\ncwd: {cwd}  \r\ncwd: /elsewhere\r\nsummary: x\r\n");
+        assert_eq!(copilot_directory(Some(&yaml), SID), found(work.path()));
+        // The first line starting exactly `cwd: ` decides.
+        let yaml = format!("  cwd: /elsewhere\nCWD: /elsewhere\ncwd: {cwd}\n");
+        assert_eq!(copilot_directory(Some(&yaml), SID), found(work.path()));
+        let gone = work.path().join("gone");
+        let yaml = format!("cwd: {}\n", gone.display());
+        assert_eq!(copilot_directory(Some(&yaml), SID), UNCONFIRMED);
+        assert_eq!(copilot_directory(Some("cwd: relative\n"), SID), UNCONFIRMED);
+    }
+
+    #[test]
+    fn directory_copilot_workspace_yaml_quoted_cwd() {
+        let work = TempDir::new();
+        let cwd = work.path().to_str().unwrap();
+        for yaml in [
+            format!("cwd: \"{cwd}\"\n"),
+            format!("cwd: '{cwd}'\n"),
+            format!("cwd:  \"'{cwd}'\" \n"),
+            format!("\u{feff}cwd: {cwd}"),
+        ] {
+            assert_eq!(
+                copilot_directory(Some(&yaml), SID),
+                found(work.path()),
+                "{yaml:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn directory_copilot_workspace_yaml_missing_refuses() {
+        let work = TempDir::new();
+        let yaml = format!("cwd: {}\n", work.path().display());
+        assert_eq!(copilot_directory(None, SID), UNCONFIRMED);
+        assert_eq!(copilot_directory(Some("id: x\n"), SID), UNCONFIRMED);
+        assert_eq!(copilot_directory(Some("cwd: \n"), SID), UNCONFIRMED);
+        // A malformed session id never builds a path.
+        assert_eq!(copilot_directory(Some(&yaml), "../x"), UNCONFIRMED);
+        assert_eq!(copilot_directory(Some(&yaml), ""), UNCONFIRMED);
+    }
+
+    #[test]
+    fn directory_missing_refuses_2() {
+        // A launch directory that names a file, or none at all, refuses 2 directory through the whole check.
+        let (home, work) = (TempDir::new(), TempDir::new());
+        let file = work.path().join("file");
+        std::fs::write(&file, "x").unwrap();
+        let yaml_folder = home.path().join(".copilot/session-state").join(SID);
+        std::fs::create_dir_all(&yaml_folder).unwrap();
+        std::fs::write(
+            yaml_folder.join("workspace.yaml"),
+            format!("cwd: {}\n", file.display()),
+        )
+        .unwrap();
+        let events =
+            r#"{"type":"session.permissions_changed","data":{"allowAllPermissions":true}}"#;
+        std::fs::write(yaml_folder.join("events.jsonl"), events).unwrap();
+        let fakes = Fakes::default();
+        fakes.client(CLAUDE, Client::Copilot);
+        let ctx = ctx_at(&fakes, home.path(), &[("COPILOT_AGENT_SESSION_ID", SID)]);
+        let caller = agent_caller(Client::Copilot, Some(&["copilot"]));
+        assert_eq!(answer(assert_spawn_allowed(&ctx, &caller)), UNCONFIRMED);
+        std::fs::write(
+            yaml_folder.join("workspace.yaml"),
+            format!("cwd: {}\n", work.path().display()),
+        )
+        .unwrap();
+        assert_eq!(
+            answer(assert_spawn_allowed(&ctx, &caller)),
+            found(work.path())
+        );
+    }
+}

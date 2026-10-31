@@ -30,6 +30,7 @@ struct Log {
     now_ms: u64,
     clients: HashMap<u32, Client>,
     shells: Vec<u32>,
+    cwds: HashMap<u32, String>,
     // Starts `open` answers in turn (none: unreadable) before it falls back to the row's own.
     opens: HashMap<u32, VecDeque<Option<i64>>>,
 }
@@ -64,6 +65,11 @@ impl Fakes {
     /// A pid `is_shell` answers true for.
     pub fn shell(&self, pid: u32) {
         self.0.borrow_mut().shells.push(pid);
+    }
+
+    /// The kernel cwd `Os::cwd` answers for this pid.
+    pub fn kernel_cwd(&self, pid: u32, cwd: &str) {
+        self.0.borrow_mut().cwds.insert(pid, cwd.into());
     }
 
     /// The starts the next `open` calls of this pid answer, in order; none is an unreadable start.
@@ -152,7 +158,7 @@ impl Os for Fakes {
 
     fn cwd(&self, pid: u32) -> Option<String> {
         self.os_call(format!("cwd {pid}"));
-        None
+        self.0.borrow().cwds.get(&pid).cloned()
     }
 
     fn client_of(&self, row: &Row) -> Option<Client> {
