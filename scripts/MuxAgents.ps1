@@ -128,6 +128,20 @@ function Get-MuxAgentPlatform {
     if ($OnWindows) { 'windows' } elseif ($OnLinux) { 'linux' } elseif ($OnMacOS) { 'macos' }
 }
 
+function Get-MuxAgentRuntimeVerdict {
+    # fixed or affected for a .NET informational version under GHSA-2j93-m82w-73j2 (#25); anything unparsed is affected.
+    # ASCII only first: .NET's \d also matches other scripts' digits. \z, not $, which accepts a final LF.
+    param([AllowEmptyString()][string]$Version)
+    if ($Version -cmatch '[^\x00-\x7F]' -or $Version -cnotmatch '^(\d{1,9})\.(\d{1,9})\.(\d{1,9})(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]*)?\z') { return 'affected' }
+    $major = [int]$Matches[1]; $minor = [int]$Matches[2]; $patch = [int]$Matches[3]
+    $label = if ($Matches[4]) { $Matches[4].Substring(1) } else { '' }
+    $ga = $label -ceq '' -or $label.StartsWith('servicing.', [StringComparison]::Ordinal)
+    $rc = if ($label -cmatch '^rc\.(\d+)\.') { $digits = $Matches[1].TrimStart([char]'0'); if ($digits.Length -gt 1) { 2 } else { [int]('0' + $digits) } } elseif ($label -cmatch '^(preview|alpha|beta)\.') { 0 } else { -1 }
+    if (-not $ga -and $rc -lt 0) { return 'affected' }
+    $fixed = $major -ge 12 -or ($minor -eq 0 -and (($ga -and (($major -eq 8 -and $patch -ge 32) -or ($major -eq 9 -and $patch -ge 21) -or ($major -eq 10 -and $patch -ge 13) -or $major -eq 11)) -or ($major -eq 11 -and $rc -ge 2)))
+    if ($fixed) { 'fixed' } else { 'affected' }
+}
+
 function Get-MuxAgentEntryRefusal {
     # The entry's one-line reply on a platform mux-agents does not run on; $null on windows, linux and macos.
     param([AllowEmptyString()][string]$Platform)
