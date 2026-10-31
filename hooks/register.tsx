@@ -21,7 +21,10 @@ async function refresh($: EngineInterface) {
     } catch {
       next = undefined
     }
-    if (!next) return
+    if (!next) {
+      await update($, board, last => ({ ...last, failed: true }))
+      return
+    }
     const fresh = next
     await update($, board, () => ({ ...fresh, failed: false }))
     $.ui.status(`agents: ${fresh.running}`)
