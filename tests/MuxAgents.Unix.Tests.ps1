@@ -40,3 +40,27 @@ Describe 'MuxAgents unix pure members' {
         $full = Get-MuxAgentUnixStopReport -Left $left; $none = Get-MuxAgentUnixStopReport -Left @()
         $windows = & (Get-MuxAgentPlatformMembers -Platform windows).StopReport $left
         "$(@($full.Keys) -join ',')|$($full.survivors)|$($full.survivorPids -join ',')|$($full.survivorPids.GetType().Name)|$($none.survivors)|$($none.survivorPids.Count)|$($none.survivorPids.GetType().Name)|$($windows.survivors)" | Should BeExactly 'survivors,survivorPids|3|310,320,330|Int32[]|0|0|Int32[]|1' } }
+Describe 'MuxAgents unix client identity' {
+    $loader = '/usr/local/lib/node_modules/@github/copilot/npm-loader.js'
+    $links = @{ '/usr/local/bin/copilot' = $loader; '/p/bin/copilot' = '/p/node_modules/@github/copilot/npm-loader.js'; 'bin/copilot' = $loader }
+    $cwds = @{ 401 = '/p'; 402 = '/q' }
+    $kernel = [pscustomobject]@{ ResolveFile = { param($Path) if ($Path -eq '/broken') { throw 'loop' }; if ($links.ContainsKey($Path)) { $links[$Path] } else { $Path } }.GetNewClosure()
+        ReadCwd = { param([int]$Id) $cwds[$Id] }.GetNewClosure() }
+    function Get-UnixClient($Path, [string[]]$Argv, [int]$Id = 400) { "$(Get-MuxAgentUnixClient -Row ([pscustomobject]@{ Pid = $Id; Path = $Path; Argv = $Argv }) -Kernel $kernel)" }
+    It 'names claude by */claude/versions/* or basename claude, copilot by basename or by node running the loader' {
+        (@((Get-UnixClient '/home/u/.local/share/claude/versions/2.1.3' @('claude')), (Get-UnixClient '/opt/claude' @('x')), (Get-UnixClient '/usr/bin/copilot' @('copilot')),
+            (Get-UnixClient '/usr/bin/node' @('node', '/usr/local/bin/copilot', '--allow-all')), (Get-UnixClient '/usr/bin/node' @('node', $loader)),
+            (Get-UnixClient '/usr/bin/node' @('node', '--no-warnings', $loader)), (Get-UnixClient '/usr/bin/node' @('node', '-r', 'hook.js', '--import', 'x.mjs', '--', $loader)),
+            (Get-UnixClient '/usr/bin/node' @('node', 'bin/copilot') 401)) -join ',') | Should BeExactly 'claude,claude,copilot,copilot,copilot,copilot,copilot,copilot' }
+    It 'skips the value of --require and --loader: the real loader after either is copilot' {
+        "$(Get-UnixClient '/usr/bin/node' @('node', '--require', 'hook.js', $loader)),$(Get-UnixClient '/usr/bin/node' @('node', '--loader', 'hook.mjs', $loader))" | Should BeExactly 'copilot,copilot' }
+    It 'names no client when the loader is only the value of --require or --loader and the script is another file' {
+        "[$(Get-UnixClient '/usr/bin/node' @('node', '--require', $loader, '/srv/app.js'))],[$(Get-UnixClient '/usr/bin/node' @('node', '--loader', $loader, '/srv/app.js'))]" | Should BeExactly '[],[]' }
+    It 'names no client for argv[0] alone, another exe, other case, eval code, an option value, another script, or an unreadable path or cwd' {
+        $answers = @((Get-UnixClient '/usr/bin/sleep' @('claude')), (Get-UnixClient '/usr/bin/bash' @('copilot', '--allow-all')), (Get-UnixClient '/usr/bin/claude.exe' @('claude')),
+            (Get-UnixClient '/opt/Claude' @('claude')), (Get-UnixClient '/x/claude/versionsX/1' @('claude')), (Get-UnixClient '/usr/bin/copilot-cli' @('copilot')),
+            (Get-UnixClient '/usr/bin/node' @('node', '/srv/app.js')), (Get-UnixClient '/usr/bin/node' @('node', '/x/@github/copilot/npm-loader.js.bak')),
+            (Get-UnixClient '/usr/bin/bun' @('bun', '/usr/local/bin/copilot')), (Get-UnixClient '/usr/bin/node' @('node')), (Get-UnixClient '/usr/bin/node' @('node', '/broken')), (Get-UnixClient $null @('claude')),
+            (Get-UnixClient '/usr/bin/node' @('node', '-e', 'require(1)', $loader)), (Get-UnixClient '/usr/bin/node' @('node', '-p', '1', $loader)), (Get-UnixClient '/usr/bin/node' @('node', '--eval=1', $loader)),
+            (Get-UnixClient '/usr/bin/node' @('node', '-r', $loader, '/srv/app.js')), (Get-UnixClient '/usr/bin/node' @('node', 'bin/copilot') 402), (Get-UnixClient '/usr/bin/node' @('node', 'bin/copilot') 403))
+        ($answers -join ',') | Should BeExactly (',' * 17) } }
