@@ -244,10 +244,11 @@ fn claude_policy(ctx: &Ctx, caller: &Caller) -> Res<bool> {
     let Some(transcript) = claude_transcript(&ctx.home, session)? else {
         return Ok(false);
     };
-    let line = last_line(&transcript, r#""permission-mode""#, permission_mode_line)?;
-    if !line.is_some_and(|l| {
-        l.starts_with(r#"{"type":"permission-mode","permissionMode":"bypassPermissions""#)
-    }) {
+    let Scan::Found(line) = last_line(&transcript, r#""permission-mode""#, permission_mode_line)?
+    else {
+        return Ok(false);
+    };
+    if !line.starts_with(r#"{"type":"permission-mode","permissionMode":"bypassPermissions""#) {
         return Ok(false);
     }
     let pane = caller.pane.as_str();
@@ -299,31 +300,103 @@ fn claude_transcript(home: &Path, session: &str) -> std::io::Result<Option<PathB
     Ok(if found.len() == 1 { found.pop() } else { None })
 }
 
-/// The last line holding `needle` that `matches` accepts. Read a line at a time: transcripts grow large. Lines
-/// end at LF, CR LF or a lone CR, as .NET's ReadLine split them.
-fn last_line(
-    path: &Path,
-    needle: &str,
-    matches: impl Fn(&str) -> bool,
-) -> std::io::Result<Option<String>> {
-    use std::io::BufRead;
+/// What a transcript scan found. `Undecodable` is a file no decoder accepts; callers refuse on it and never fall
+/// back to anything else.
+#[derive(Debug, PartialEq, Eq)]
+enum Scan {
+    Found(String),
+    Missing,
+    Undecodable,
+}
+
+/// The text of `bytes` as .NET's StreamReader reads it: a UTF-8, UTF-16 or UTF-32 BOM names the encoding (UTF-32 LE
+/// is tried before UTF-16 LE, whose BOM it starts with), else UTF-8. `None` when the bytes are not valid in it: a
+/// replaced character could hide the very line a check looks for.
+fn decode(bytes: &[u8]) -> Option<String> {
+    if let Some(rest) = bytes.strip_prefix(b"\xef\xbb\xbf") {
+        return String::from_utf8(rest.to_vec()).ok();
+    }
+    if let Some(rest) = bytes.strip_prefix(b"\xff\xfe\x00\x00") {
+        return utf32(rest, u32::from_le_bytes);
+    }
+    if let Some(rest) = bytes.strip_prefix(b"\x00\x00\xfe\xff") {
+        return utf32(rest, u32::from_be_bytes);
+    }
+    if let Some(rest) = bytes.strip_prefix(b"\xff\xfe") {
+        return utf16(rest, u16::from_le_bytes);
+    }
+    if let Some(rest) = bytes.strip_prefix(b"\xfe\xff") {
+        return utf16(rest, u16::from_be_bytes);
+    }
+    String::from_utf8(bytes.to_vec()).ok()
+}
+
+fn utf16(bytes: &[u8], unit: fn([u8; 2]) -> u16) -> Option<String> {
+    if !bytes.len().is_multiple_of(2) {
+        return None;
+    }
+    let units: Vec<u16> = bytes.chunks_exact(2).map(|c| unit([c[0], c[1]])).collect();
+    String::from_utf16(&units).ok()
+}
+
+fn utf32(bytes: &[u8], scalar: fn([u8; 4]) -> u32) -> Option<String> {
+    if !bytes.len().is_multiple_of(4) {
+        return None;
+    }
+    bytes
+        .chunks_exact(4)
+        .map(|c| char::from_u32(scalar([c[0], c[1], c[2], c[3]])))
+        .collect()
+}
+
+/// The last line holding `needle` that `matches` accepts. Lines end at LF, CR LF or a lone CR, as .NET's ReadLine
+/// split them. A file without a UTF-16 or UTF-32 BOM is read a line at a time (transcripts grow large); since LF
+/// never falls inside a UTF-8 character, a strict check of every line is a strict check of the file.
+fn last_line(path: &Path, needle: &str, matches: impl Fn(&str) -> bool) -> std::io::Result<Scan> {
+    use std::io::{BufRead, Read};
     let mut reader = std::io::BufReader::new(std::fs::File::open(path)?);
-    let (mut last, mut buf, mut first) = (None, Vec::new(), true);
-    while reader.read_until(b'\n', &mut buf)? > 0 {
-        let mut chunk = buf.as_slice();
-        if first {
-            chunk = chunk.strip_prefix(b"\xef\xbb\xbf").unwrap_or(chunk);
-            first = false;
-        }
-        let text = String::from_utf8_lossy(chunk.strip_suffix(b"\n").unwrap_or(chunk));
-        for line in text.split('\r') {
+    let mut head = Vec::new();
+    (&mut reader).take(4).read_to_end(&mut head)?;
+    let wide = head.starts_with(b"\xff\xfe")
+        || head.starts_with(b"\xfe\xff")
+        || head == b"\x00\x00\xfe\xff";
+    let mut last = None;
+    let mut keep = |text: &str| {
+        for line in text.split('\n').flat_map(|line| line.split('\r')) {
             if line.contains(needle) && matches(line) {
                 last = Some(line.to_string());
             }
         }
-        buf.clear();
+    };
+    if wide {
+        let mut bytes = head;
+        reader.read_to_end(&mut bytes)?;
+        let Some(text) = decode(&bytes) else {
+            return Ok(Scan::Undecodable);
+        };
+        keep(&text);
+    } else {
+        let mut buf = head.strip_prefix(b"\xef\xbb\xbf").unwrap_or(&head).to_vec();
+        loop {
+            let ended = reader.read_until(b'\n', &mut buf)? == 0;
+            if buf.is_empty() {
+                break;
+            }
+            let complete = ended || buf.ends_with(b"\n");
+            if !complete {
+                continue;
+            }
+            let Ok(text) = std::str::from_utf8(&buf) else {
+                return Ok(Scan::Undecodable);
+            };
+            keep(text);
+            buf.clear();
+            if ended {
+                break;
+            }
+        }
     }
-    Ok(last)
+    Ok(last.map_or(Scan::Missing, Scan::Found))
 }
 
 /// Copilot: the latest permissions event (with none, an allow-all flag at launch), and never plan mode.
@@ -340,8 +413,10 @@ fn copilot_policy(ctx: &Ctx, agent_argv: &[String]) -> std::io::Result<bool> {
         contains_ignoring_case(line, r#""type":"session.permissions_changed""#)
     })?;
     let allow_all = match permissions {
-        Some(line) => contains_ignoring_case(&line, r#""allowallpermissions":true"#),
-        None => agent_argv.iter().any(|arg| {
+        Scan::Found(line) => contains_ignoring_case(&line, r#""allowallpermissions":true"#),
+        // Only a file that decodes and has no permissions event falls back to the launch flags.
+        Scan::Undecodable => false,
+        Scan::Missing => agent_argv.iter().any(|arg| {
             let flag = arg.split('=').next().unwrap_or(arg);
             flag == "--allow-all" || flag == "--yolo"
         }),
@@ -352,7 +427,11 @@ fn copilot_policy(ctx: &Ctx, agent_argv: &[String]) -> std::io::Result<bool> {
     let mode = last_line(&events, "session.mode_changed", |line| {
         contains_ignoring_case(line, r#""type":"session.mode_changed""#)
     })?;
-    Ok(!mode.is_some_and(|line| contains_ignoring_case(&line, r#""plan""#)))
+    Ok(match mode {
+        Scan::Found(line) => !contains_ignoring_case(&line, r#""plan""#),
+        Scan::Missing => true,
+        Scan::Undecodable => false,
+    })
 }
 
 fn copilot_folder(home: &Path, session: &str) -> PathBuf {
@@ -404,9 +483,27 @@ fn read_small(path: &Path) -> Result<Vec<u8>, bool> {
 
 fn json_object(bytes: &[u8]) -> Option<serde_json::Map<String, serde_json::Value>> {
     let text = bytes.strip_prefix(b"\xef\xbb\xbf").unwrap_or(bytes);
-    match serde_json::from_slice(text).ok()? {
+    let value: serde_json::Value = serde_json::from_slice(text).ok()?;
+    if case_collides(&value) {
+        return None;
+    }
+    match value {
         serde_json::Value::Object(map) => Some(map),
         _ => None,
+    }
+}
+
+/// Whether an object at any depth has two keys equal but for case, which ConvertFrom-Json refuses: `cwd` and `CWD`
+/// would otherwise let a second value stand beside the one checked.
+fn case_collides(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::Object(map) => {
+            let mut seen = std::collections::HashSet::new();
+            map.keys().any(|key| !seen.insert(key.to_uppercase()))
+                || map.values().any(case_collides)
+        }
+        serde_json::Value::Array(items) => items.iter().any(case_collides),
+        _ => false,
     }
 }
 
@@ -463,8 +560,7 @@ fn copilot_directory(ctx: &Ctx) -> Option<String> {
         return None;
     }
     let bytes = read_small(&copilot_folder(&ctx.home, session).join("workspace.yaml")).ok()?;
-    let bytes = bytes.strip_prefix(b"\xef\xbb\xbf").unwrap_or(&bytes);
-    let text = String::from_utf8_lossy(bytes);
+    let text = decode(&bytes)?;
     let line = text
         .split(['\r', '\n'])
         .find(|line| line.starts_with("cwd: "))?;
@@ -807,6 +903,8 @@ mod tests {
 
     struct Claude {
         transcript: Vec<String>,
+        // The file's bytes instead of the transcript lines as UTF-8.
+        bytes: Option<Vec<u8>>,
         height: Option<&'static str>,
         screen: Option<&'static str>,
         sid: &'static str,
@@ -817,6 +915,7 @@ mod tests {
         fn default() -> Self {
             Claude {
                 transcript: vec![mode("bypassPermissions")],
+                bytes: None,
                 height: Some("40\n"),
                 screen: Some("work\n\n  ⏵⏵ bypass permissions on (shift+tab to cycle)\n\n"),
                 sid: SID,
@@ -837,11 +936,9 @@ mod tests {
                 .join(".claude/projects")
                 .join(format!("p{folder}"));
             std::fs::create_dir_all(&project).unwrap();
-            std::fs::write(
-                project.join(format!("{SID}.jsonl")),
-                case.transcript.join("\n") + "\n",
-            )
-            .unwrap();
+            let text = case.transcript.join("\n") + "\n";
+            let bytes = case.bytes.clone().unwrap_or_else(|| text.into_bytes());
+            std::fs::write(project.join(format!("{SID}.jsonl")), bytes).unwrap();
         }
         let fakes = Fakes::default();
         match case.height {
@@ -963,11 +1060,16 @@ mod tests {
     }
 
     fn copilot_policy(events: Option<&[&str]>, argv: &[&str]) -> String {
+        let bytes = events.map(|lines| lines.join("\n").into_bytes());
+        copilot_policy_bytes(bytes.as_deref(), argv)
+    }
+
+    fn copilot_policy_bytes(events: Option<&[u8]>, argv: &[&str]) -> String {
         let home = TempDir::new();
         if let Some(events) = events {
             let folder = home.path().join(".copilot/session-state").join(SID);
             std::fs::create_dir_all(&folder).unwrap();
-            std::fs::write(folder.join("events.jsonl"), events.join("\n")).unwrap();
+            std::fs::write(folder.join("events.jsonl"), events).unwrap();
         }
         let fakes = Fakes::default();
         let mut ctx = fakes.ctx();
@@ -1071,6 +1173,8 @@ mod tests {
         for session in [
             serde_json::json!({"sessionId": SID, "cwd": cwd, "procStart": "1510"}),
             serde_json::json!({"sessionId": SID, "cwd": cwd, "procStart": "x"}),
+            // Keys equal but for case: ConvertFrom-Json refuses the object.
+            serde_json::json!({"sessionId": SID, "cwd": cwd, "CWD": "/different", "procStart": "1500"}),
             serde_json::json!({"sessionId": SID, "cwd": cwd}),
             serde_json::json!({"sessionId": OTHER_SID, "cwd": cwd, "procStart": "1500"}),
             serde_json::json!({"cwd": cwd, "procStart": "1500"}),
@@ -1188,6 +1292,27 @@ mod tests {
                 String::from_utf8_lossy(contents)
             );
         }
+        // Keys equal but for case, at any depth: ConvertFrom-Json refuses the object, so the file is malformed.
+        let (home, work) = (TempDir::new(), TempDir::new());
+        let cwd = work.path().to_str().unwrap();
+        let quoted = serde_json::to_string(cwd).unwrap();
+        let file = sessions(home.path()).join("150.json");
+        let run = |contents: &str| {
+            std::fs::write(&file, contents).unwrap();
+            unix_directory(home.path(), &[Some(1500), Some(1500)], Some(cwd)).0
+        };
+        for contents in [
+            format!(r#"{{"cwd":{quoted},"CWD":"/different"}}"#),
+            format!(r#"{{"CWD":"/different","cwd":{quoted}}}"#),
+            format!(r#"{{"cwd":{quoted},"meta":{{"a":1,"A":2}}}}"#),
+            format!(r#"{{"cwd":{quoted},"list":[{{"k":1,"K":2}}]}}"#),
+        ] {
+            assert_eq!(run(&contents), UNCONFIRMED, "{contents}");
+        }
+        assert_eq!(
+            run(&format!(r#"{{"cwd":{quoted},"meta":{{"a":1,"b":2}}}}"#)),
+            found(work.path())
+        );
     }
 
     #[test]
@@ -1246,6 +1371,10 @@ mod tests {
     }
 
     fn copilot_directory(yaml: Option<&str>, sid: &str) -> String {
+        copilot_directory_bytes(yaml.map(str::as_bytes), sid)
+    }
+
+    fn copilot_directory_bytes(yaml: Option<&[u8]>, sid: &str) -> String {
         let home = TempDir::new();
         if let Some(yaml) = yaml {
             let folder = home.path().join(".copilot/session-state").join(SID);
@@ -1335,5 +1464,228 @@ mod tests {
             answer(assert_spawn_allowed(&ctx, &caller)),
             found(work.path())
         );
+    }
+
+    // ---- review pins: encodings, boundaries and which rows are checked
+
+    const BOMS: [&str; 5] = ["utf-8", "utf-16le", "utf-16be", "utf-32le", "utf-32be"];
+
+    // `text` behind the BOM that names its encoding.
+    fn bom(name: &str, text: &str) -> Vec<u8> {
+        let units = |big: bool| -> Vec<u8> {
+            text.encode_utf16()
+                .flat_map(|u| {
+                    if big {
+                        u.to_be_bytes()
+                    } else {
+                        u.to_le_bytes()
+                    }
+                })
+                .collect()
+        };
+        let scalars = |big: bool| -> Vec<u8> {
+            text.chars()
+                .flat_map(|c| {
+                    let n = c as u32;
+                    if big {
+                        n.to_be_bytes()
+                    } else {
+                        n.to_le_bytes()
+                    }
+                })
+                .collect()
+        };
+        let (head, body): (&[u8], Vec<u8>) = match name {
+            "utf-8" => (b"\xef\xbb\xbf", text.as_bytes().to_vec()),
+            "utf-16le" => (b"\xff\xfe", units(false)),
+            "utf-16be" => (b"\xfe\xff", units(true)),
+            "utf-32le" => (b"\xff\xfe\x00\x00", scalars(false)),
+            "utf-32be" => (b"\x00\x00\xfe\xff", scalars(true)),
+            _ => unreachable!("{name}"),
+        };
+        [head, &body].concat()
+    }
+
+    // Bytes no decoder accepts: a bad UTF-8 byte, an odd UTF-16 length, a lone surrogate, a UTF-32 non-scalar.
+    fn undecodable(text: &str) -> Vec<Vec<u8>> {
+        let mut bad = text.as_bytes().to_vec();
+        bad.extend(b"note \xff\n");
+        let mut odd = bom("utf-16le", text);
+        odd.push(b'x');
+        let mut lone = bom("utf-16le", text);
+        lone.extend([0x00, 0xd8]);
+        let mut big = bom("utf-32le", text);
+        big.extend(0x0011_0000u32.to_le_bytes());
+        vec![bad, odd, lone, big]
+    }
+
+    #[test]
+    fn policy_claude_transcript_bom_decoded_fail_closed() {
+        let bypass = mode("bypassPermissions") + "\n";
+        let back = format!("{}\n{}\n", mode("bypassPermissions"), mode("default"));
+        let case = |bytes: Vec<u8>| Claude {
+            bytes: Some(bytes),
+            ..Claude::default()
+        };
+        for name in BOMS {
+            assert_eq!(claude_policy(case(bom(name, &bypass))), "true", "{name}");
+            assert_eq!(claude_policy(case(bom(name, &back))), "false", "{name}");
+        }
+        for bytes in undecodable(&bypass) {
+            assert_eq!(claude_policy(case(bytes.clone())), "false", "{bytes:?}");
+        }
+    }
+
+    #[test]
+    fn policy_copilot_events_bom_decoded_fail_closed() {
+        let allow = |on: bool| {
+            format!(
+                "{{\"type\":\"session.permissions_changed\",\"data\":{{\"allowAllPermissions\":{on}}}}}\n"
+            )
+        };
+        for name in BOMS {
+            // The event decides; the launch flag is never the fallback while an event exists.
+            assert_eq!(
+                copilot_policy_bytes(Some(&bom(name, &allow(false))), &["copilot", "--yolo"]),
+                "false",
+                "{name}"
+            );
+            assert_eq!(
+                copilot_policy_bytes(Some(&bom(name, &allow(true))), &["copilot"]),
+                "true",
+                "{name}"
+            );
+        }
+        // An events file that does not decode refuses; it never falls back to --yolo.
+        for bytes in undecodable(&allow(false)) {
+            assert_eq!(
+                copilot_policy_bytes(Some(&bytes), &["copilot", "--yolo"]),
+                "false",
+                "{bytes:?}"
+            );
+        }
+        let torn = b"{\"type\":\"session.\xffpermissions_changed\",\"data\":{\"allowAllPermissions\":false}}\n";
+        assert_eq!(
+            copilot_policy_bytes(Some(torn), &["copilot", "--yolo"]),
+            "false"
+        );
+    }
+
+    #[test]
+    fn directory_copilot_workspace_yaml_bom_decoded() {
+        let work = TempDir::new();
+        let yaml = format!("id: x\ncwd: {}\n", work.path().display());
+        for name in BOMS {
+            assert_eq!(
+                copilot_directory_bytes(Some(&bom(name, &yaml)), SID),
+                found(work.path()),
+                "{name}"
+            );
+        }
+        for bytes in undecodable(&yaml) {
+            assert_eq!(
+                copilot_directory_bytes(Some(&bytes), SID),
+                UNCONFIRMED,
+                "{bytes:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn flags_caller_allowlist_on_every_client_row_to_the_pane() {
+        // Reference :992-1007: rows from the agent to the pane, each client row against the CALLER's list. A Copilot
+        // ancestor of a Claude agent may not carry --yolo, a Copilot flag.
+        let above = argv_row(120, 100, 1200, Some(&["copilot", "--yolo"]));
+        assert_eq!(
+            flags(Client::Claude, Some(&["claude"]), Some(above)),
+            "2 flags the flag --yolo is not allowed for a spawning agent"
+        );
+        // The pane's own row, the last of the chain, is checked when it is a client.
+        let mut caller = agent_caller(Client::Claude, Some(&["claude"]));
+        caller.chain[3].argv = Some(strings(&["claude", "--settings=x"]));
+        let fakes = Fakes::default();
+        fakes.client(CLAUDE, Client::Claude);
+        fakes.client(100, Client::Claude);
+        assert_eq!(
+            answer(assert_spawn_allowed(&fakes.ctx(), &caller)),
+            "2 flags the flag --settings is not allowed for a spawning agent"
+        );
+    }
+
+    #[test]
+    fn policy_claude_height_3_reads_mode_line() {
+        // Three rows is a sized pane: the mode line is read and decides, not the transcript alone.
+        let off = Claude {
+            height: Some("3\n"),
+            screen: Some("> \n"),
+            ..Claude::default()
+        };
+        assert_eq!(claude_policy(off), "false");
+        let on = Claude {
+            height: Some("3\n"),
+            ..Claude::default()
+        };
+        assert_eq!(claude_policy(on), "true");
+    }
+
+    #[test]
+    fn policy_copilot_launch_flag_through_spawn_gate() {
+        let (home, work) = (TempDir::new(), TempDir::new());
+        let folder = home.path().join(".copilot/session-state").join(SID);
+        std::fs::create_dir_all(&folder).unwrap();
+        let yaml = format!("cwd: {}\n", work.path().display());
+        std::fs::write(folder.join("workspace.yaml"), yaml).unwrap();
+        // No permissions event: the agent's own launch flags decide.
+        std::fs::write(
+            folder.join("events.jsonl"),
+            "{\"type\":\"session.start\"}\n",
+        )
+        .unwrap();
+        let run = |argv: &[&str]| {
+            let fakes = Fakes::default();
+            fakes.client(CLAUDE, Client::Copilot);
+            let ctx = ctx_at(&fakes, home.path(), &[("COPILOT_AGENT_SESSION_ID", SID)]);
+            answer(assert_spawn_allowed(
+                &ctx,
+                &agent_caller(Client::Copilot, Some(argv)),
+            ))
+        };
+        for flag in ["--allow-all", "--yolo"] {
+            assert_eq!(run(&["copilot", flag]), found(work.path()), "{flag}");
+        }
+        assert_eq!(run(&["copilot"]), NEXT);
+    }
+
+    #[test]
+    fn directory_session_cwd_case_differs_refuses() {
+        let (home, work) = (TempDir::new(), TempDir::new());
+        let cwd = work.path().to_str().unwrap();
+        let shouted = cwd.to_uppercase();
+        assert_ne!(shouted, cwd);
+        let session = serde_json::json!({"cwd": shouted}).to_string();
+        std::fs::write(sessions(home.path()).join("150.json"), session).unwrap();
+        assert_eq!(
+            unix_directory(home.path(), &[Some(1500), Some(1500)], Some(cwd)).0,
+            UNCONFIRMED
+        );
+    }
+
+    #[test]
+    fn directory_windows_session_id_case_sensitive() {
+        // The reference compares with -ceq; a session id with letters shows the case.
+        let (home, work) = (TempDir::new(), TempDir::new());
+        let sid = "abcdef12-2222-4333-8444-555555555555";
+        let cwd = work.path().to_str().unwrap();
+        let caller = agent_caller(Client::Claude, Some(&["claude"]));
+        let run = |file_sid: &str| {
+            let session =
+                serde_json::json!({"sessionId": file_sid, "cwd": cwd, "procStart": "1500"});
+            std::fs::write(sessions(home.path()).join("150.json"), session.to_string()).unwrap();
+            let fakes = Fakes::default();
+            let ctx = ctx_at(&fakes, home.path(), &[("CLAUDE_CODE_SESSION_ID", sid)]);
+            answer(launch_directory(&ctx, &caller, OsKind::Windows))
+        };
+        assert_eq!(run(sid), found(work.path()));
+        assert_eq!(run(&sid.to_uppercase()), UNCONFIRMED);
     }
 }

@@ -511,6 +511,52 @@ mod tests {
         }
     }
 
+    #[test]
+    fn walk_stops_at_reused_intermediate_parent() {
+        // caller > 171 > shell 170 > pane: a shell that started after its child 171 is a reused pid, even though it
+        // is not the pane.
+        let build = |shell_start: i64| {
+            let fakes = Fakes::default();
+            fakes.process(testing::row(SERVER, 1, SERVER_START));
+            fakes.process(testing::row(PANE, SERVER, 1000));
+            fakes.process(testing::row(SHELL, PANE, shell_start));
+            fakes.process(testing::row(171, SHELL, 1800));
+            fakes.process(testing::row(CALLER, 171, 2000));
+            for pid in [PANE, SHELL, 171] {
+                fakes.shell(pid);
+            }
+            fakes.mux_rule("display-message", 0, "900|100|$3|@1|\n", "");
+            fakes
+        };
+        assert_eq!(
+            outcome(run(&build(1801))),
+            "1 caller caller is not below its rmux pane"
+        );
+        assert_eq!(outcome(run(&build(1800))), "Human");
+    }
+
+    #[test]
+    fn nearest_client_is_the_agent() {
+        // caller > shell > claude 150 > copilot 120 > pane: the nearest client is the agent; above it anything may run.
+        let fakes = Fakes::default();
+        fakes.process(testing::row(SERVER, 1, SERVER_START));
+        fakes.process(testing::row(PANE, SERVER, 1000));
+        fakes.process(testing::row(120, PANE, 1200));
+        fakes.process(testing::row(CLAUDE, 120, 1500));
+        fakes.process(testing::row(SHELL, CLAUDE, 1700));
+        fakes.process(testing::row(CALLER, SHELL, 2000));
+        fakes.shell(SHELL);
+        fakes.client(CLAUDE, Client::Claude);
+        fakes.client(120, Client::Copilot);
+        fakes.mux_rule("display-message", 0, "900|100|$3|@1|\n", "");
+        let caller = run(&fakes).unwrap();
+        assert_eq!(
+            (caller.client, caller.agent.as_ref().map(|a| a.pid)),
+            (Some(Client::Claude), Some(CLAUDE))
+        );
+        assert_eq!(chain(&caller), [CALLER, SHELL, CLAUDE, 120, PANE]);
+    }
+
     // caller > `hops` shells > pane.
     fn tall(hops: u32) -> Fakes {
         let fakes = Fakes::default();
