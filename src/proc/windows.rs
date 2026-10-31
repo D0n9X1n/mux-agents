@@ -357,7 +357,7 @@ mod win {
         }
 
         fn sandbox(&self) -> Signals {
-            unimplemented!("sandbox signals come with T15")
+            Signals::Token(self.token())
         }
     }
 

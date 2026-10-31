@@ -23,6 +23,8 @@ struct Log {
     rules: Vec<Rule>,
     mux_calls: Vec<Vec<String>>,
     slept: Vec<u64>,
+    // What sandbox() answers; none is an unsandboxed macOS.
+    signals: Option<Signals>,
     // Milliseconds since the epoch; sleeping advances it.
     now_ms: u64,
 }
@@ -47,6 +49,11 @@ impl Fakes {
             contains: contains.into(),
             output,
         });
+    }
+
+    /// What the fake OS says about a sandbox.
+    pub fn signals(&self, signals: Signals) {
+        self.0.borrow_mut().signals = Some(signals);
     }
 
     pub fn os_calls(&self) -> Vec<String> {
@@ -137,7 +144,9 @@ impl Os for Fakes {
     }
 
     fn sandbox(&self) -> Signals {
-        Signals::default()
+        self.os_call("sandbox".into());
+        let signals = self.0.borrow().signals.clone();
+        signals.unwrap_or(Signals::SandboxCheck(0))
     }
 }
 

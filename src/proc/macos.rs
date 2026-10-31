@@ -14,6 +14,12 @@ use crate::parse::{self, Client};
 
 pub struct MacOs;
 
+// libsystem_sandbox, part of libSystem; the libc crate does not declare it.
+unsafe extern "C" {
+    fn sandbox_check(pid: libc::pid_t, operation: *const libc::c_char, filter: c_int, ...)
+    -> c_int;
+}
+
 // The reference's buffer when kern.argmax cannot be read.
 const ARGMAX_FALLBACK: usize = 1 << 20;
 // Room for pids that start between counting and listing.
@@ -218,7 +224,8 @@ impl Os for MacOs {
     }
 
     fn sandbox(&self) -> Signals {
-        unimplemented!("sandbox signals come with T15")
+        // SAFETY: the caller's own pid, no operation and SANDBOX_FILTER_NONE, so no variadic arguments follow.
+        Signals::SandboxCheck(unsafe { sandbox_check(libc::getpid(), std::ptr::null(), 0) })
     }
 }
 

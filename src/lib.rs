@@ -10,6 +10,7 @@ pub mod json;
 pub mod mux;
 pub mod parse;
 pub mod proc;
+pub mod sandbox;
 pub mod spawn;
 pub mod state;
 #[cfg(test)]

@@ -55,9 +55,16 @@ pub struct Token {
     pub integrity_rid: u32,
 }
 
-/// What the OS says about a sandbox around the caller (T15 fills it in).
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct Signals {}
+/// What the OS says about a sandbox around the caller; `sandbox::decide` judges it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Signals {
+    /// macOS: sandbox_check(getpid(), NULL, 0), non-zero inside a sandbox.
+    SandboxCheck(i32),
+    /// Linux: /proc/self/status, none when unreadable.
+    Status(Option<String>),
+    /// Windows: the caller's token, none when unreadable.
+    Token(Option<Token>),
+}
 
 pub trait Os {
     fn row(&self, pid: u32) -> Option<Row>;

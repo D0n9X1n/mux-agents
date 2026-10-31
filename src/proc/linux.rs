@@ -101,7 +101,7 @@ impl Os for Linux {
     }
 
     fn sandbox(&self) -> Signals {
-        unimplemented!("sandbox signals come with T15")
+        Signals::Status(std::fs::read_to_string("/proc/self/status").ok())
     }
 }
 
