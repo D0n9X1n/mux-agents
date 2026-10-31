@@ -17,3 +17,16 @@ Describe 'MuxAgents board text' {
     It 'answers empty for blank text' {
         # Catches: a whitespace or control-only line kept.
         ConvertTo-MuxAgentDoingLine (" `t`r`n" + [char]0x9B + "`n") | Should BeExactly '' } }
+
+Describe 'MuxAgents board sources' {
+    It 'takes status, then the last sent line, then the task line; a blank one falls through' {
+        # Catches: swapped order; an empty last-sent line ('') taken instead of the task; stored text not cleaned again.
+        $order = foreach ($case in @(@('s', 'm', 't'), @('', 'm', 't'), @(' ', '', 't'), @($null, $null, $null), @(("a`tb" + [char]0x9B + "`nc"), 'm', 't'))) {
+            $doing = Select-MuxAgentDoing -Status $case[0] -Message $case[1] -Task $case[2]; "$($doing.doingFrom)=$($doing.doing)" }
+        ($order -join ';') | Should BeExactly 'status=s;message=m;task=t;=;status=a b' }
+    It 'gives age in whole seconds since createdAt, never negative, null when unreadable' {
+        # Catches: Round for Floor, no clamp, no UTC conversion, a ConvertFrom-Json DateTime refused.
+        $now = [DateTime]::new(2026, 10, 29, 12, 0, 0, [DateTimeKind]::Utc)
+        $ages = foreach ($created in @('2026-10-29T11:55:59.4000000Z', '2026-10-29T12:00:05.0000000Z', '2026-10-29T13:59:00+02:00', (ConvertFrom-Json '{"t":"2026-10-29T11:59:00.0000000Z"}').t, 'x', $null)) {
+            $age = Get-MuxAgentAge -CreatedAt $created -Now $now; if ($null -eq $age) { 'null' } else { "$($age.GetType().Name):$age" } }
+        ($ages -join ' ') | Should BeExactly 'Int32:240 Int32:0 Int32:60 Int32:60 null null' } }

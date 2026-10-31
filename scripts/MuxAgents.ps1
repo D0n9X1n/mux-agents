@@ -990,6 +990,35 @@ function ConvertTo-MuxAgentDoingLine {
     ''
 }
 
+function Select-MuxAgentDoing {
+    # What an agent is doing: its last status, else the first line of its last sent message, else of its task. Each is
+    # cleaned again; a blank one falls through.
+    param($Status, $Message, $Task)
+    foreach ($source in @(@('status', $Status), @('message', $Message), @('task', $Task))) {
+        if ($null -eq $source[1]) { continue }
+        $line = ConvertTo-MuxAgentDoingLine ([string]$source[1])
+        if ($line) { return [ordered]@{ doing = $line; doingFrom = $source[0] } }
+    }
+    [ordered]@{ doing = $null; doingFrom = $null }
+}
+
+function ConvertTo-MuxAgentUtc {
+    # A state-file time (ISO 8601 text, or the DateTime ConvertFrom-Json makes of it) as UTC; $null when unreadable.
+    param($Value)
+    $time = [DateTime]::MinValue
+    if ($Value -is [DateTime]) { $time = $Value }
+    elseif ($Value -isnot [string] -or -not [DateTime]::TryParse($Value, [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::RoundtripKind, [ref]$time)) { return $null }
+    if ($time.Kind -eq [DateTimeKind]::Utc) { $time } else { $time.ToUniversalTime() }
+}
+
+function Get-MuxAgentAge {
+    # Whole seconds from CreatedAt to Now, at least 0; $null when CreatedAt is unreadable.
+    param($CreatedAt, [Parameter(Mandatory)][DateTime]$Now)
+    $created = ConvertTo-MuxAgentUtc $CreatedAt
+    if ($null -eq $created) { return $null }
+    [int][Math]::Max(0, [Math]::Floor(($Now - $created).TotalSeconds))
+}
+
 function Add-MuxAgentMail {
     # Appends one message to Key's mailbox under the mailbox lock and returns its id. A last line without LF, left by an
     # interrupted append, gets its LF first, so it never joins the new message; read skips it if it does not parse. With
