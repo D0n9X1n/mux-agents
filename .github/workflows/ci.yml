@@ -21,11 +21,20 @@ jobs:
           curl -fsSLo actionlint.tar.gz https://github.com/rhysd/actionlint/releases/download/v1.7.12/actionlint_1.7.12_linux_amd64.tar.gz
           echo '8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8  actionlint.tar.gz' | sha256sum -c -
           tar -xzf actionlint.tar.gz actionlint
+      - name: Install shellcheck
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y shellcheck
+          shellcheck --version
       - name: actionlint
         run: ./actionlint -color
       - name: Manifests parse as JSON
-        shell: pwsh
-        run: foreach ($file in '.claude-plugin/plugin.json', '.claude-plugin/marketplace.json') { $null = Get-Content -Raw $file | ConvertFrom-Json }
+        run: jq . .claude-plugin/plugin.json .claude-plugin/marketplace.json >/dev/null
+      - name: shellcheck the sh scripts
+        run: |
+          set -euo pipefail
+          git ls-files -z 'scripts/*.sh' scripts/mux-agent 'tests/*.sh' | xargs -0 shellcheck
       - name: Install Claude Code 2.1.310
         run: npm install --global @anthropic-ai/claude-code@2.1.310
       - name: claude plugin validate
@@ -44,31 +53,76 @@ jobs:
           persist-credentials: false
       - name: Point TEMP and TMP at RUNNER_TEMP (the default is an 8.3 path)
         if: runner.os == 'Windows'
-        shell: pwsh
+        shell: bash
         run: |
-          "TEMP=$env:RUNNER_TEMP" >> $env:GITHUB_ENV
-          "TMP=$env:RUNNER_TEMP" >> $env:GITHUB_ENV
-      - name: Install Pester 4.10.1
-        shell: pwsh
-        run: Install-Module Pester -RequiredVersion 4.10.1 -Force -SkipPublisherCheck -Scope CurrentUser
-      - name: Install powershell-yaml 0.4.12
-        shell: pwsh
-        run: Install-Module powershell-yaml -RequiredVersion 0.4.12 -Force -Scope CurrentUser
-      - name: Tests
-        shell: pwsh
-        run: pwsh -NoProfile -File tests/Invoke-MuxAgentTests.ps1
-      # The Rust rewrite's own tests, so its Linux and Windows code runs on those hosts.
+          set -euo pipefail
+          echo "TEMP=$RUNNER_TEMP" >> "$GITHUB_ENV"
+          echo "TMP=$RUNNER_TEMP" >> "$GITHUB_ENV"
       - name: Rust 1.95.0
         shell: bash
-        run: rustup toolchain install 1.95.0 --profile minimal --component clippy,rustfmt && rustup default 1.95.0
-      # bash -e on every OS: under pwsh only the last command's exit code counts, which hid a Windows failure.
+        run: |
+          set -euo pipefail
+          rustup toolchain install 1.95.0 --profile minimal --component clippy,rustfmt
+          rustup default 1.95.0
+      # bash -e on every OS, so the first failing command fails the step.
       - name: Rust tests
         shell: bash
         run: |
+          set -euo pipefail
           cargo fmt --check
           cargo clippy --all-targets --features test-panic --locked -- -D warnings
           cargo test --features test-panic --locked
-          cargo test --release --features test-panic --locked --test panic
+      - name: Release build
+        shell: bash
+        run: cargo build --release --locked
+      # Outside a multiplexer the cmd shim reaches target\release\mux-agent.exe, which refuses with check endpoint.
+      - name: Windows shim reaches the release binary
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          unset TMUX RMUX TMUX_PANE MUX_AGENTS_BIN
+          rc=0
+          out=$(cmd //d //c 'scripts\mux-agent.cmd' list 2>&1) || rc=$?
+          echo "$out"
+          if [ "$rc" != 1 ]; then echo "expected exit 1, got $rc"; exit 1; fi
+          case $out in *'"check":"endpoint"'*) ;; *) echo 'expected check endpoint'; exit 1 ;; esac
+      - name: Release panic test
+        shell: bash
+        run: cargo test --release --features test-panic --locked --test panic
+      - name: Shim tests (sh)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: sh tests/shim.sh
+      # shim.cmd builds its stub with the .NET Framework csc.exe; its last line counts the failures.
+      - name: Shim tests (cmd)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          rc=0
+          out=$(cmd //d //c 'tests\shim.cmd' 2>&1) || rc=$?
+          echo "$out"
+          if [ "$rc" != 0 ] || [ "$(printf '%s\n' "$out" | tail -n 1 | tr -d '\r')" != '0 failed' ]; then exit 1; fi
+  cross:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Rust 1.95.0 and the release targets
+        run: |
+          set -euo pipefail
+          rustup toolchain install 1.95.0 --profile minimal
+          rustup default 1.95.0
+          rustup target add x86_64-unknown-linux-gnu aarch64-unknown-linux-musl x86_64-pc-windows-msvc aarch64-pc-windows-msvc
+      # check only: no linker for the other targets is needed.
+      - name: cargo check every target
+        run: |
+          set -euo pipefail
+          for target in x86_64-unknown-linux-gnu aarch64-unknown-linux-musl x86_64-pc-windows-msvc aarch64-pc-windows-msvc; do
+            cargo check --all-targets --locked --target "$target"
+          done
   integration:
     strategy:
       fail-fast: false
@@ -79,14 +133,33 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - name: Install tmux 3.2 or later
+      - name: Install tmux and the tmux 3.2a build dependencies
         run: |
           set -euo pipefail
-          if [ "$RUNNER_OS" = Linux ]; then sudo apt-get update && sudo apt-get install -y tmux; else brew install tmux; fi
+          if [ "$RUNNER_OS" = Linux ]; then
+            sudo apt-get update
+            sudo apt-get install -y tmux libevent-dev libncurses-dev bison pkg-config build-essential
+          else
+            brew install tmux libevent pkg-config
+          fi
           tmux -V
-      - name: Install Pester 4.10.1
-        shell: pwsh
-        run: Install-Module Pester -RequiredVersion 4.10.1 -Force -SkipPublisherCheck -Scope CurrentUser
-      - name: Integration tests
-        shell: pwsh
-        run: pwsh -NoProfile -File tests/Invoke-MuxAgentTests.ps1 -Path tests/integration -Integration
+      - name: Rust 1.95.0
+        run: |
+          set -euo pipefail
+          rustup toolchain install 1.95.0 --profile minimal
+          rustup default 1.95.0
+          # tests/release.sh cross-builds the other Apple arch on macOS.
+          if [ "$RUNNER_OS" = macOS ]; then rustup target add x86_64-apple-darwin aarch64-apple-darwin; fi
+      - name: Build tmux 3.2a
+        run: |
+          set -euo pipefail
+          out=$(sh scripts/dev/tmux32.sh)
+          line=$(printf '%s\n' "$out" | tail -n 1)
+          case $line in MUX_AGENTS_TMUX32=/*) ;; *) echo "unexpected: $line"; exit 1 ;; esac
+          echo "$line" >> "$GITHUB_ENV"
+      - name: Live tests
+        run: cargo test --features live,test-panic --locked --test live
+      - name: Release script tests
+        run: sh tests/release.sh
+      - name: Wiki publisher tests
+        run: sh tests/wiki.sh
