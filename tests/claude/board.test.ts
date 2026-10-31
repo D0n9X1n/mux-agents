@@ -54,6 +54,7 @@ test('parseList maps every failure to undefined and cleans every string', () => 
   expect(parseList(1, good)).toBe(undefined)
   expect(parseList(0, 'not json')).toBe(undefined)
   expect(parseList(0, '{"ok":false,"verb":"list","code":1,"check":"endpoint"}')).toBe(undefined)
+  expect(parseList(0, '{"ok":false,"verb":"list","running":1,"agents":[]}')).toBe(undefined)
   expect(parseList(0, '{"ok":true,"verb":"list","agents":[]}')).toBe(undefined)
   expect(parseList(0, '{"ok":true,"verb":"list","running":0}')).toBe(undefined)
   const dirty = JSON.stringify({ ok: true, running: 1, agents: [{ name: 'a\u001b', client: 'c\u0007', state: 's\u009b', doing: 'd\te', age: 1 }] })

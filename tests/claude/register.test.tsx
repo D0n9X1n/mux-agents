@@ -219,6 +219,20 @@ test('output that is not JSON with exit 0 after a good board keeps that board, m
   await ui.unmount()
 })
 
+test('an otherwise valid board with ok false after a good board keeps that board, marked refresh failed', async ($, on) => {
+  const notOk = JSON.stringify({ ok: false, verb: 'list', running: 2, agents: [row('claude-9', 'running', 'other', 5)] })
+  const { seen, clock } = world(on, { TMUX: 'x' }, [ran(0, LIST), ran(0, notOk)])
+  await $.session.start(START)
+  await $.command.run({ command: 'mux-agents' })
+  await clock.advance(3000)
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  expect(await header(ui)).toBe('mux-agents · 1 running · refresh failed')
+  expect((await ui.find({ type: 'Text', text: /claude-1/ }))?.text).toBe('● claude-1  claude  4m')
+  expect(await ui.find({ type: 'Text', text: /claude-9/ })).toBe(undefined)
+  expect(seen.status).toEqual(['agents: 1'])
+  await ui.unmount()
+})
+
 test('a process rejection right after a good board keeps that board, marked refresh failed', async ($, on) => {
   const { clock } = world(on, { TMUX: 'x' }, [ran(0, LIST), { deny: 'cannot start' }])
   await $.session.start(START)
