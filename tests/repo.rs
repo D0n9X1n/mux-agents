@@ -223,3 +223,89 @@ fn process_spawn_only_in_spawn_rs() {
     // spawn.rs itself must be found, or the scan proves nothing.
     assert_eq!(found, [ALLOWED]);
 }
+
+// Release rules (spec D7): `main` is source-only; the marketplace installs the `dist` ref, which the release
+// workflow writes as the tagged tree plus `scripts/bin/` and its `SHA256SUMS`.
+
+fn repo_file(path: &str) -> String {
+    std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join(path)).unwrap()
+}
+
+/// The lines of job `name` in a workflow: from `  name:` to the next two-space key, trimmed, blanks dropped.
+fn job_lines(workflow: &str, name: &str) -> Vec<String> {
+    let head = format!("  {name}:");
+    let mut lines = workflow.lines().skip_while(|l| l.trim_end() != head);
+    assert!(lines.next().is_some(), "no job {name}");
+    lines
+        .take_while(|l| l.is_empty() || l.starts_with("   "))
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .map(String::from)
+        .collect()
+}
+
+/// Index of the first line of `lines` containing `needle`.
+fn line_of(lines: &[String], needle: &str) -> usize {
+    lines
+        .iter()
+        .position(|l| l.contains(needle))
+        .unwrap_or_else(|| panic!("no line contains {needle:?} in {lines:#?}"))
+}
+
+#[test]
+fn marketplace_pins_dist_ref() {
+    let market: serde_json::Value =
+        serde_json::from_str(&repo_file(".claude-plugin/marketplace.json")).unwrap();
+    let plugins = market["plugins"].as_array().unwrap();
+    assert_eq!(plugins.len(), 1);
+    assert_eq!(
+        plugins[0]["source"],
+        serde_json::json!({"source": "github", "repo": "D0n9X1n/mux-agents", "ref": "dist"})
+    );
+    // main never carries the packaged binaries.
+    assert!(
+        repo_file(".gitignore")
+            .lines()
+            .any(|l| l == "/scripts/bin/")
+    );
+}
+
+#[test]
+fn release_validate_checks_tag_sha() {
+    let release = repo_file(".github/workflows/release.yml");
+    let validate = job_lines(&release, "validate");
+    let resolve = line_of(&validate, r#"git rev-parse "$TAG^{commit}""#);
+    let refuse = line_of(&validate, r#"!= "$GITHUB_SHA""#);
+    let gate = line_of(&validate, "scripts/release/gate.sh");
+    assert!(resolve < refuse && refuse < gate, "{validate:#?}");
+    // contents: write appears once, in publish; nothing runs PowerShell.
+    assert_eq!(release.matches("contents: write").count(), 1);
+    assert!(job_lines(&release, "publish").contains(&"contents: write".to_string()));
+    assert!(!release.contains("pwsh") && !release.contains(".ps1"));
+}
+
+#[test]
+fn release_publish_rechecks_remote_tag() {
+    let release = repo_file(".github/workflows/release.yml");
+    let publish = job_lines(&release, "publish");
+    let assemble = line_of(&publish, "package.sh --assemble scripts/bin");
+    let remote = line_of(
+        &publish,
+        r#"git ls-remote origin "refs/tags/$TAG" "refs/tags/$TAG^{}""#,
+    );
+    let refuse = line_of(&publish, "no longer points at");
+    let add = line_of(&publish, "git add -f scripts/bin");
+    let push = line_of(&publish, "git push");
+    let create = line_of(&publish, "gh release create");
+    assert!(
+        assemble < remote && remote < refuse && refuse < add && add < push && push < create,
+        "{publish:#?}"
+    );
+    // Every checkout leaves no credentials behind.
+    let checkouts = release.matches("actions/checkout@").count();
+    assert!(checkouts > 0);
+    assert_eq!(
+        release.matches("persist-credentials: false").count(),
+        checkouts
+    );
+}

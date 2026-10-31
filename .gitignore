@@ -8,3 +8,6 @@
 # Cargo build output and local plans and specs.
 /target/
 /docs/
+
+# Packaged binaries: built by scripts/release/package.sh, committed only on the dist ref.
+/scripts/bin/

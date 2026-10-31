@@ -16,38 +16,58 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
       - name: Tag on main, green CI push run, matching version
-        shell: pwsh
+        shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ github.ref_name }}
         run: |
-          $sha = git rev-parse "$($env:TAG)^{commit}"
-          if ($sha -cne $env:GITHUB_SHA) { "refused: $($env:TAG) does not point at $env:GITHUB_SHA"; exit 1 }
-          git merge-base --is-ancestor $sha origin/main
-          $onMain = $LASTEXITCODE -eq 0
-          $runs = @(gh api "repos/$env:GITHUB_REPOSITORY/actions/workflows/ci.yml/runs?head_sha=$sha&event=push&per_page=100" --jq '.workflow_runs[] | {conclusion, head_sha, event}' | ForEach-Object { $_ | ConvertFrom-Json })
-          $version = (Get-Content -Raw .claude-plugin/plugin.json | ConvertFrom-Json).version
-          & ./scripts/release/Test-MuxAgentRelease.ps1 -Tag $env:TAG -Sha $sha -IsAncestorOfMain $onMain -Runs $runs -ManifestVersion $version
-          exit $LASTEXITCODE
-  package:
+          set -euo pipefail
+          sha=$(git rev-parse "$TAG^{commit}")
+          if [ "$sha" != "$GITHUB_SHA" ]; then echo "refused: $TAG does not point at $GITHUB_SHA"; exit 1; fi
+          if git merge-base --is-ancestor "$sha" origin/main; then on_main=true; else on_main=false; fi
+          gh api "repos/$GITHUB_REPOSITORY/actions/workflows/ci.yml/runs?head_sha=$sha&event=push&per_page=100" --jq '[.workflow_runs[] | {conclusion, head_sha, event}]' >"$RUNNER_TEMP/runs.json"
+          version=$(jq -r .version .claude-plugin/plugin.json)
+          sh scripts/release/gate.sh "$TAG" "$sha" "$on_main" "$RUNNER_TEMP/runs.json" "$version"
+  build:
     needs: validate
-    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - { runner: macos-latest, target: aarch64-apple-darwin, os: macos, arch: aarch64 }
+          - { runner: macos-latest, target: x86_64-apple-darwin, os: macos, arch: x86_64 }
+          - { runner: ubuntu-latest, target: x86_64-unknown-linux-musl, os: linux, arch: x86_64 }
+          - { runner: ubuntu-24.04-arm, target: aarch64-unknown-linux-musl, os: linux, arch: aarch64 }
+          - { runner: windows-latest, target: x86_64-pc-windows-msvc, os: windows, arch: x86_64 }
+          - { runner: windows-latest, target: aarch64-pc-windows-msvc, os: windows, arch: aarch64 }
+    runs-on: ${{ matrix.runner }}
     permissions:
       contents: read
+    env:
+      TARGET: ${{ matrix.target }}
+      OS: ${{ matrix.os }}
+      ARCH: ${{ matrix.arch }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - name: Build the plugin zip
-        shell: pwsh
-        run: ./scripts/release/New-MuxAgentPackage.ps1 -Ref $env:GITHUB_SHA -OutFile "mux-agents-$env:GITHUB_REF_NAME.zip"
+      - name: Rust 1.95.0 and the target
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup toolchain install 1.95.0 --profile minimal --target "$TARGET"
+          rustup default 1.95.0
+          if [ "$RUNNER_OS" = Linux ]; then sudo apt-get update && sudo apt-get install -y musl-tools; fi
+      - name: Package
+        shell: bash
+        run: sh scripts/release/package.sh --target "$TARGET" --os "$OS" --arch "$ARCH" --out package
+      # Only the binary: publish writes the one SHA256SUMS over all six.
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: plugin-zip
-          path: mux-agents-${{ github.ref_name }}.zip
+          name: ${{ matrix.os }}-${{ matrix.arch }}
+          path: package/${{ matrix.os }}-${{ matrix.arch }}/mux-agent*
           if-no-files-found: error
   publish:
-    needs: [validate, package]
+    needs: [validate, build]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -55,19 +75,30 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      # Each artifact lands in scripts/bin/<os>-<arch>/.
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
-          name: plugin-zip
-      - name: Create the release
-        shell: pwsh
+          path: scripts/bin
+      # dist is a release ref: each release force-updates it to the tagged tree plus scripts/bin.
+      - name: Commit the binaries to dist and create the release
+        shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
           TAG: ${{ github.ref_name }}
         run: |
-          $line = @(git ls-remote origin "refs/tags/$($env:TAG)" "refs/tags/$($env:TAG)^{}")[-1]
-          if (-not $line -or ($line -split '\s+')[0] -cne $env:GITHUB_SHA) { "refused: $($env:TAG) no longer points at $env:GITHUB_SHA"; exit 1 }
-          $options = @('release', 'create', $env:TAG, "mux-agents-$($env:TAG).zip", '--verify-tag', '--title', $env:TAG, '--generate-notes')
-          $notes = "wiki/Release-$($env:TAG).md"
-          if (Test-Path -LiteralPath $notes) { $options += @('--notes-file', $notes) }
-          gh @options
+          set -euo pipefail
+          # Artifacts drop the executable bit.
+          chmod 0755 scripts/bin/*/mux-agent*
+          sh scripts/release/package.sh --assemble scripts/bin
+          if [ "$(wc -l <scripts/bin/SHA256SUMS)" -ne 6 ]; then echo "refused: expected 6 binaries"; cat scripts/bin/SHA256SUMS; exit 1; fi
+          # The tag must still name the commit validate approved and build packaged, read just before pushing.
+          line=$(git ls-remote origin "refs/tags/$TAG" "refs/tags/$TAG^{}" | tail -n 1)
+          if [ "$(printf '%s\n' "$line" | cut -f1)" != "$GITHUB_SHA" ]; then echo "refused: $TAG no longer points at $GITHUB_SHA"; exit 1; fi
+          git add -f scripts/bin
+          git -c user.name='github-actions[bot]' -c user.email='41898282+github-actions[bot]@users.noreply.github.com' commit -q -m "dist $TAG"
+          git push --force "https://x-access-token:$GH_TOKEN@github.com/$GITHUB_REPOSITORY.git" HEAD:refs/heads/dist
+          options=(--verify-tag --title "$TAG" --generate-notes)
+          notes="wiki/Release-$TAG.md"
+          if [ -f "$notes" ]; then options+=(--notes-file "$notes"); fi
+          gh release create "$TAG" "${options[@]}"
