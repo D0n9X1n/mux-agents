@@ -103,3 +103,17 @@ Describe 'MuxAgents unix linux process table' {
         $enc = [Text.Encoding]::UTF8
         $a = @(ConvertFrom-MuxAgentLinuxCmdline -Bytes $enc.GetBytes("node`0script.js`0`0")); $c = @(ConvertFrom-MuxAgentLinuxCmdline -Bytes $enc.GetBytes("a b`0"))
         "$($a.Count)|$($a -join '/')|$($null -eq (ConvertFrom-MuxAgentLinuxCmdline -Bytes $enc.GetBytes("claude`0--model")))|$($c.Count)|$($c[0])|$($null -eq (ConvertFrom-MuxAgentLinuxCmdline -Bytes ([byte[]]@())))" | Should BeExactly '3|node/script.js/|True|1|a b|True' } }
+Describe 'MuxAgents unix macos process table' {
+    It 'takes pid and ppid from ps, start and path from Process, argv from KERN_PROCARGS2; skips a pid that exited' {
+        $k = New-UnixFakeKernel; $k.Ps = "  PID  PPID`n  400     1`n  401   400`n  402   400`n"; $k.Live[400] = 1793318401234567; $k.Live[402] = 7
+        $k.Path[400] = '/usr/local/bin/copilot'; $k.Argv[400] = [string[]]@('copilot')
+        (@(Get-MuxAgentMacProcessTable -Kernel $k | ForEach-Object { Format-UnixRow $_ }) -join ';') | Should BeExactly '400 1 1793318401234567 /usr/local/bin/copilot [copilot] String[]1;402 400 7  [] null' }
+    It 'an argv layout that does not match argc (empty argv[0], then --forbidden and the environment) is unreadable, so C3 refuses' {
+        Import-MuxAgentUnixNative
+        $bytes = New-UnixProcArgs 2 "/bin/x`0`0`0--forbidden`0A=1`0B=2`0"
+        $k = New-UnixFakeKernel; $k.Ps = "  150   100`n"; $k.Live[150] = 1500; $k.Path[150] = '/x/claude'; $k.Argv[150] = [MuxAgentUnixNative]::ParseProcArgs($bytes, $bytes.Length)
+        $row = @(Get-MuxAgentMacProcessTable -Kernel $k)[0]
+        $fake = New-FakeMuxAgentProviders -Caller claude
+        foreach ($r in $fake.Rows) { if ($r.Pid -eq 150) { $r.Path = '/x/claude'; Add-Member -InputObject $r -NotePropertyName Argv -NotePropertyValue $row.Argv -Force } }
+        $fake.ClientOf = { param($Row) if ($Row.Pid -eq 150) { 'claude' } }; $fake.IsShell = { param($Row) $true }; $fake.Argv = { param($Row) Get-MuxAgentUnixArgv -Row $Row }
+        "$($null -eq $row.Argv)|$(Get-UnixRefusal { Assert-MuxAgentSpawnAllowed -P $fake -Caller (Resolve-MuxAgentCaller -P $fake) })" | Should BeExactly 'True|2 flags a client command line cannot be read' } }

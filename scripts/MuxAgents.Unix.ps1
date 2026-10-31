@@ -67,3 +67,11 @@ function Get-MuxAgentLinuxProcessTable { param([Parameter(Mandatory)]$Kernel)
         if (-not $stat) { continue }
         $path = try { & $Kernel.ReadExe $id } catch { $null }
         New-MuxAgentUnixRow -ProcessId $stat.Pid -ParentId $stat.ParentPid -Start $stat.Start -Path $path -Argv (Read-MuxAgentUnixArgv -Reader $Kernel.ReadCmdline -Id $id) } }
+function Get-MuxAgentMacProcessTable {
+    # Processes on macOS: pid and ppid from ps; start (microseconds) and real path from Process; argv from KERN_PROCARGS2.
+    param([Parameter(Mandatory)]$Kernel)
+    foreach ($line in "$(& $Kernel.ListPs)" -split "`n") {
+        if ($line -notmatch '^\s*(\d+)\s+(\d+)\s*$') { continue }
+        $id = [int]$Matches[1]; $parent = [int]$Matches[2]; $start = & $Kernel.ReadStart $id
+        if ($null -eq $start) { continue }
+        New-MuxAgentUnixRow -ProcessId $id -ParentId $parent -Start $start -Path (& $Kernel.ReadPath $id) -Argv (Read-MuxAgentUnixArgv -Reader $Kernel.ReadArgv -Id $id) } }
