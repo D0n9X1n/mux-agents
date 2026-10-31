@@ -10,7 +10,7 @@ mux-agents is a plugin for Claude Code and GitHub Copilot CLI. From a chat runni
 
 0.1.0 runs on Windows with rmux 0.10.0, and on Linux and macOS with tmux 3.2 or later. The code moved here from the Terminal Profiles repository and no longer depends on it.
 
-On Linux and macOS, .NET older than 8.0.32, 9.0.21 or 10.0.13 has an elevation-of-privilege flaw in its named mutexes ([GHSA-2j93-m82w-73j2](https://github.com/advisories/GHSA-2j93-m82w-73j2)), which mux-agents uses for its `lock` check: another local user can erase or replace file contents, loosen folder permissions or gain higher privileges, and can make mux-agent commands time out with check `lock`. Check with `[Environment]::Version` in pwsh and use a PowerShell built on a fixed .NET.
+On Linux and macOS, .NET 8.0.0–8.0.31, 9.0.0–9.0.20, 10.0.0–10.0.12 and 11.0 previews through RC 1 have an elevation-of-privilege flaw in their named mutexes ([GHSA-2j93-m82w-73j2](https://github.com/advisories/GHSA-2j93-m82w-73j2)), which mux-agents uses for its `lock` check: another local user can erase or replace file contents, loosen folder permissions or gain higher privileges. mux-agent after v0.1.0 refuses such a .NET with check `runtime`; the v0.1.0 release does not check. Install PowerShell 7.4.21, 7.5.12, 7.6.7 or later, or set `MUX_AGENTS_ALLOW_AFFECTED_DOTNET=1` to run anyway; replies then carry `advisory`.
 
 ## Quick start
 
