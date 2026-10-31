@@ -33,7 +33,7 @@
 
 `hooks/hooks.json` 指定 `hooks/register.tsx`，`plugin.json` 指定声明窗格状态的 `types/index.d.ts`：
 
-- **打开时机：** 一次运行 `mux-agent.ps1 spawn`、不是错误且输出含成功 spawn 回复（JSON 或 `-Text`）的 `Bash` 或 `PowerShell` `tool.call` 之后，且设置了 `TMUX` 或 `RMUX` 时：`$.ui.open({ id: 'mux-agents', title: 'Agents' })`。`/mux-agents` 可按需打开它。子代理从不 spawn，所以只有发起会话会打开它。
+- **打开时机：** 一次运行 `mux-agent.ps1 spawn`、不是错误且输出含成功 spawn 回复（JSON 或 `-Text`）的 `Bash` 或 `PowerShell` `tool.call` 之后，且设置了 `TMUX` 或 `RMUX` 时：`$.ui.open({ id: 'mux-agents', title: 'Agents' })`。`/mux-agents-pane` 可按需打开它（`/mux-agents` 归技能所有）。子代理从不 spawn，所以只有发起会话会打开它。
 - **刷新：** `$.clock.every(3000)` 把 `$.process.run([pwsh, -NoProfile, -File, <plugin root>/scripts/mux-agent.ps1, list, -All])` 的结果写入一个 atom，并设置 `$.ui.status('agents: <running>')`。一次刷新只在上一次结束后开始；每次运行 10 秒超时。
 - **绘制：** 计数行，然后每个代理的名称、客户端、暗色的 `doing` 和存活时长；已结束的代理变暗；刷新失败时保留上一次的面板，并标注 `refresh failed`。绘制的每个字符串都去掉 C0、DEL 和 C1 控制字符，制表符变成空格。
 
@@ -49,7 +49,7 @@
 | `Get-MuxAgentBoard` | 数据源 | 类似 `list` 的字典 | `Invoke-MuxAgentList`、通知、邮箱 | 列 | 替身提供程序 |
 | `Format-MuxAgentBoard` | `watch` 的文本 | 面板 → 字符串 | 无 | 布局 | 纯单元测试 |
 | `Invoke-MuxAgentSidebar` / `Watch` | 打开、查找、关闭分屏；循环 | 动词 | `Invoke-MuxAgentNative`、窗格标签 | 尺寸 | 替身 rmux 规则；tmux 集成测试 |
-| `hooks/register.tsx` | Claude Code 窗格 | `/mux-agents`；spawn 时自动打开 | 插件 mod API | 绘制 | `claude plugin test` |
+| `hooks/register.tsx` | Claude Code 窗格 | `/mux-agents-pane`；spawn 时自动打开 | 插件 mod API | 绘制 | `claude plugin test` |
 
 ## 测试
 

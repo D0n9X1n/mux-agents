@@ -308,7 +308,7 @@ Describe 'MuxAgents wiki pages' {
         @($en | Where-Object { $_ -match '^## ' }) -join ',' | Should BeExactly '## Purpose,## Decisions (PM''s calls under the release goal),## Verbs,## Claude Code pane,## Skill,## Component map,## Tests,## Must-pass,## Non-goals,## Prior art'
         $found = foreach ($page in 'Design-Side-Bar', 'Design-Side-Bar-zh-CN') {
             $text = [IO.File]::ReadAllText((Join-Path $wikiRoot "$page.md")) -replace "`r`n", "`n"
-            $missing = @('`types/index.d.ts`', '`-Text`', '`pane-closed`', '`output-closed`', '`probe-failed`', '`usage`', '`1 sidebar`', '`tests/claude/register.test.tsx`', '`tests/claude/board.test.ts`', '`claude plugin test .`' | Where-Object { -not $text.Contains($_) })
+            $missing = @('`types/index.d.ts`', '`-Text`', '`pane-closed`', '`output-closed`', '`probe-failed`', '`usage`', '`1 sidebar`', '`/mux-agents-pane`', '`tests/claude/register.test.tsx`', '`tests/claude/board.test.ts`', '`claude plugin test .`' | Where-Object { -not $text.Contains($_) })
             "$page blank-run=$($text.Contains("`n`n`n")) missing=$($missing -join ',')"
         }
         $found -join ' ; ' | Should BeExactly 'Design-Side-Bar blank-run=False missing= ; Design-Side-Bar-zh-CN blank-run=False missing='

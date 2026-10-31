@@ -43,11 +43,17 @@ async function openPane($: EngineInterface) {
 }
 
 export const register: Register = on => {
+  // The skill skills/mux-agents owns /mux-agents, so the pane command has a name of its own. A refused registration
+  // (another owner of the name) leaves the session and the open-on-spawn path working.
   on('session.start', async ($, e, next) => {
-    await $.command.register({ name: 'mux-agents', description: 'Show the mux-agents board in a pane' })
+    try {
+      await $.command.register({ name: 'mux-agents-pane', description: 'Show the mux-agents board in a pane' })
+    } catch {
+      // The pane still opens after a spawn; only the command is missing.
+    }
     return next(e)
   })
-  on('command.run', { command: 'mux-agents' }, async $ => {
+  on('command.run', { command: 'mux-agents-pane' }, async $ => {
     await openPane($)
     return { text: 'Agents pane opened.' }
   })

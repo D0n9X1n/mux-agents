@@ -33,7 +33,7 @@ In the main chat session, show a side bar with the agent count and one line per 
 
 `hooks/hooks.json` names `hooks/register.tsx`, and `plugin.json` names `types/index.d.ts`, which declares the pane's state:
 
-- **Opens** after a `Bash` or `PowerShell` `tool.call` that runs `mux-agent.ps1 spawn`, is not an error and whose output holds a successful spawn reply (JSON or `-Text`), when `TMUX` or `RMUX` is set: `$.ui.open({ id: 'mux-agents', title: 'Agents' })`. `/mux-agents` opens it on demand. Children never spawn, so only the starting session opens it.
+- **Opens** after a `Bash` or `PowerShell` `tool.call` that runs `mux-agent.ps1 spawn`, is not an error and whose output holds a successful spawn reply (JSON or `-Text`), when `TMUX` or `RMUX` is set: `$.ui.open({ id: 'mux-agents', title: 'Agents' })`. `/mux-agents-pane` opens it on demand (the skill owns `/mux-agents`). Children never spawn, so only the starting session opens it.
 - **Refresh:** `$.clock.every(3000)` runs `$.process.run([pwsh, -NoProfile, -File, <plugin root>/scripts/mux-agent.ps1, list, -All])` into an atom and sets `$.ui.status('agents: <running>')`. A refresh starts only after the previous one has settled; each run times out after 10 s.
 - **Draws** the count line, then per agent name, client, a dim `doing` and age; ended agents dimmed; a failed refresh keeps the last board, marked `refresh failed`. Every drawn string loses C0, DEL and C1 controls, and tabs become spaces.
 
@@ -49,7 +49,7 @@ In the main chat session, show a side bar with the agent count and one line per 
 | `Get-MuxAgentBoard` | the feed | dictionary like `list` | `Invoke-MuxAgentList`, notices, mailboxes | columns | fake providers |
 | `Format-MuxAgentBoard` | text for `watch` | board → string | none | layout | pure unit tests |
 | `Invoke-MuxAgentSidebar` / `Watch` | open, find, close the split; loop | verbs | `Invoke-MuxAgentNative`, pane tags | size | fake rmux rules; tmux integration |
-| `hooks/register.tsx` | Claude Code pane | `/mux-agents`; auto-open on spawn | plugin mod API | drawing | `claude plugin test` |
+| `hooks/register.tsx` | Claude Code pane | `/mux-agents-pane`; auto-open on spawn | plugin mod API | drawing | `claude plugin test` |
 
 ## Tests
 

@@ -576,6 +576,16 @@ Describe 'MuxAgents foundation release workflow' {
 }
 
 Describe 'MuxAgents foundation Claude Code pane' {
+    It 'registers the pane command under a name no skill and not the plugin owns, and answers that name' {
+        # Catches: a pane command named like the plugin or a skill (Claude Code 2.1.316 refuses "/mux-agents": the skill
+        # skills/mux-agents owns it), and a command.run matcher that answers another name.
+        $source = [IO.File]::ReadAllText([IO.Path]::Combine($repoRoot, 'hooks', 'register.tsx'))
+        $registered = [regex]::Match($source, '\$\.command\.register\(\{\s*name:\s*''([^'']+)''').Groups[1].Value
+        $answered = [regex]::Match($source, 'on\(''command\.run'',\s*\{\s*command:\s*''([^'']+)''').Groups[1].Value
+        $plugin = (Get-Content -Raw ([IO.Path]::Combine($repoRoot, '.claude-plugin', 'plugin.json')) | ConvertFrom-Json).name
+        $skills = @(Get-ChildItem -LiteralPath (Join-Path $repoRoot 'skills') -Directory | ForEach-Object { $_.Name })
+        "$registered $answered $($registered -cin @($skills + $plugin))" | Should BeExactly 'mux-agents-pane mux-agents-pane False'
+    }
     It 'runs the list invocation register.tsx builds, pwsh from PATH, and gets one JSON endpoint refusal outside a multiplexer' {
         # Every OS runs the entry now, so the run reaches the caller check: list, exit 1, check endpoint. Catches a changed
         # script path (pwsh prints its usage text) and a changed verb (usage, exit 2) on every runner.
