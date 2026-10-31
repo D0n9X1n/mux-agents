@@ -80,7 +80,33 @@ Describe 'MuxAgents board mail reader' {
         [IO.File]::WriteAllText($box, "{`"id`":`"1`"}`n"); [IO.File]::WriteAllText($cursor, '11')
         $atEnd = Get-MuxAgentUnreadText -Box $box -Cursor $cursor
         "$($missing.End)|$($missing.Text)|$($atEnd.End)|$($atEnd.Text)" | Should BeExactly '0||11|'
-        (@(ConvertFrom-MuxAgentMailText "{`"id`":`"a`"}`n{bad`n`n{`"id`":`"b`"}`n") | ForEach-Object id) -join ',' | Should BeExactly 'a,b' } }
+        (@(ConvertFrom-MuxAgentMailText "{`"id`":`"a`"}`n{bad`n`n{`"id`":`"b`"}`n") | ForEach-Object id) -join ',' | Should BeExactly 'a,b' }
+    It 'with -Tolerant counts from the start when the offset is not a number, out of range or inside a line' {
+        # Catches: list failing on a corrupt offset (FormatException), or hiding unread mail behind an offset past
+        # the end or in the middle of a line; the offset file rewritten.
+        $box = Join-Path $TestDrive 't.jsonl'
+        [IO.File]::WriteAllText($box, "{`"id`":`"1`"}`n{`"id`":`"2`"}`n")
+        $seen = foreach ($value in 'garbage', '-5', '999', '1', '', '11') {
+            $cursor = Join-Path $TestDrive "t-$([guid]::NewGuid().ToString('N')).offset"
+            [IO.File]::WriteAllText($cursor, $value)
+            $unread = Get-MuxAgentUnreadText -Box $box -Cursor $cursor -Tolerant
+            "$value=$(@(ConvertFrom-MuxAgentMailText $unread.Text | ForEach-Object id) -join ',')/$([IO.File]::ReadAllText($cursor))"
+        }
+        ($seen -join ';') | Should BeExactly 'garbage=1,2/garbage;-5=1,2/-5;999=1,2/999;1=1,2/1;=1,2/;11=2/11' }
+    It 'list counts unread mail through a damaged offset file instead of failing' {
+        # Catches: Get-MuxAgentUnreadCounts calling the reader without -Tolerant (list fails with FormatException).
+        $root = Join-Path $TestDrive 'counts'
+        $mail = [IO.Path]::Combine($root, 'k', 'mail'); $null = [IO.Directory]::CreateDirectory($mail)
+        [IO.File]::WriteAllText((Join-Path $mail 'pane-1.jsonl'), "{`"id`":`"1`",`"from`":`"w`",`"pane`":`"%9`"}`n{`"id`":`"2`",`"from`":`"w`",`"pane`":`"%9`"}`n")
+        [IO.File]::WriteAllText((Join-Path $mail 'pane-1.offset'), 'garbage')
+        $counts = Get-MuxAgentUnreadCounts -P ([pscustomobject]@{ StateRoot = $root }) -Caller ([pscustomobject]@{ ServerKey = 'k' }) -Key 'pane-1'
+        "$($counts['w|%9'])|$([IO.File]::ReadAllText((Join-Path $mail 'pane-1.offset')))" | Should BeExactly '2|garbage' }
+    It 'removes every C1 control, U+0080 to U+009F, from a doing line' {
+        # Catches: a narrowed range such as [\u0080-\u009B]. Compared as code points: culture-aware string comparison
+        # ignores C1 controls, so 'a' + U+009C + 'b' -ceq 'ab' is true.
+        $all = -join (0x80..0x9F | ForEach-Object { [char]$_ })
+        $out = ConvertTo-MuxAgentDoingLine ("a" + $all + "b")
+        (($out.ToCharArray() | ForEach-Object { '{0:X4}' -f [int]$_ }) -join ' ') | Should BeExactly '0061 0062' } }
 
 Describe 'MuxAgents board verb table' {
     It 'registers status with -Body and -BodyFile' {

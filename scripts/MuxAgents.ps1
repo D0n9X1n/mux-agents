@@ -1049,12 +1049,19 @@ function Add-MuxAgentMail {
 
 function Get-MuxAgentUnreadText {
     # The mailbox's complete lines after its read offset, and the byte offset after them (the old offset when none).
-    # Reads only: the caller holds the mailbox lock and moves the offset if it consumes the lines.
-    param([Parameter(Mandatory)][string]$Box, [Parameter(Mandatory)][string]$Cursor)
+    # Reads only: the caller holds the mailbox lock and moves the offset if it consumes the lines. With -Tolerant (list),
+    # an offset that is not a number, lies outside the mailbox or falls inside a line counts from the start instead, so
+    # a damaged offset file never fails list or hides unread mail.
+    param([Parameter(Mandatory)][string]$Box, [Parameter(Mandatory)][string]$Cursor, [switch]$Tolerant)
     $offset = 0L
-    if (Test-Path -LiteralPath $Cursor) { $offset = [long]([IO.File]::ReadAllText($Cursor).Trim()) }
+    if (Test-Path -LiteralPath $Cursor) {
+        $raw = [IO.File]::ReadAllText($Cursor).Trim()
+        if ($Tolerant) { if (-not [long]::TryParse($raw, [Globalization.NumberStyles]::None, [Globalization.CultureInfo]::InvariantCulture, [ref]$offset)) { $offset = 0L } }
+        else { $offset = [long]$raw }
+    }
     if (-not (Test-Path -LiteralPath $Box)) { return [pscustomobject]@{ Text = ''; End = $offset } }
     $bytes = [IO.File]::ReadAllBytes($Box)
+    if ($Tolerant -and ($offset -gt $bytes.Length -or ($offset -gt 0 -and $bytes[$offset - 1] -ne 10))) { $offset = 0L }
     $end = [Array]::LastIndexOf($bytes, [byte]10) + 1
     if ($end -le $offset) { return [pscustomobject]@{ Text = ''; End = $offset } }
     [pscustomobject]@{ Text = [Text.Encoding]::UTF8.GetString($bytes, [int]$offset, [int]($end - $offset)); End = [long]$end }
@@ -1139,7 +1146,7 @@ function Get-MuxAgentUnreadCounts {
     # Unread messages in Key's mailbox per '<from>|<pane>', read under the mailbox lock; never moves the offset or creates a folder.
     param([Parameter(Mandatory)]$P, [Parameter(Mandatory)]$Caller, [Parameter(Mandatory)][string]$Key)
     $mail = [IO.Path]::Combine($P.StateRoot, $Caller.ServerKey, 'mail')
-    $text = Use-MuxAgentLock -LockKey "mail|$($Caller.ServerKey)|$Key" -LockAction { (Get-MuxAgentUnreadText -Box (Join-Path $mail "$Key.jsonl") -Cursor (Join-Path $mail "$Key.offset")).Text }
+    $text = Use-MuxAgentLock -LockKey "mail|$($Caller.ServerKey)|$Key" -LockAction { (Get-MuxAgentUnreadText -Box (Join-Path $mail "$Key.jsonl") -Cursor (Join-Path $mail "$Key.offset") -Tolerant).Text }
     $counts = @{}
     foreach ($message in @(ConvertFrom-MuxAgentMailText ([string]$text))) { $from = "$($message.from)|$($message.pane)"; $counts[$from] = 1 + [int]$counts[$from] }
     $counts
