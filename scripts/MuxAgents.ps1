@@ -1161,7 +1161,8 @@ function New-MuxAgentBoardRow {
 }
 
 function Get-MuxAgentBoard {
-    # The side-bar feed of Caller's session: the running count and live agents in pane order. Unread is ReaderKey's.
+    # The side-bar feed of Caller's session: the running count, live agents in pane order and, with -All, the session's
+    # ended agents, newest notice first, at most 10. Unread is ReaderKey's.
     # Locks one at a time: notice locks (Update-MuxAgentNotices), the reader's mail lock, then each row's agent lock.
     param([Parameter(Mandatory)]$P, [Parameter(Mandatory)]$Caller, [Parameter(Mandatory)][string]$ReaderKey, [switch]$All)
     Update-MuxAgentNotices -P $P -Caller $Caller
@@ -1172,7 +1173,28 @@ function Get-MuxAgentBoard {
             if (-not $record -or $record.session -cne $Caller.Session) { continue }
             New-MuxAgentBoardRow -P $P -Caller $Caller -Record $record -Pane $pane.Pane -Window $pane.Window -State 'running' -Unread $unread
         })
-    [ordered]@{ running = $live.Count; agents = $live }
+    $ended = @()
+    if ($All) {
+        $agents = [IO.Path]::Combine($P.StateRoot, $Caller.ServerKey, 'agents')
+        $liveIds = @($panes | ForEach-Object Id)
+        $found = @(if ([IO.Directory]::Exists($agents)) {
+                foreach ($folder in [IO.Directory]::GetDirectories($agents)) {
+                    $id = [IO.Path]::GetFileName($folder)
+                    if ($id -in $liveIds) { continue }
+                    # notice.json is written once (Add-MuxAgentNotice refuses a second), so it is read without the lock.
+                    $notice = Read-MuxAgentJson -Path (Join-Path $folder 'notice.json')
+                    if (-not $notice -or $notice.kind -cnotin @('exited', 'stopped', 'lost')) { continue }
+                    $record = Get-MuxAgentRecord -P $P -Caller $Caller -Id $id
+                    if (-not $record -or $record.session -cne $Caller.Session -or $record.id -cne $id) { continue }
+                    $at = ConvertTo-MuxAgentUtc $notice.at
+                    [pscustomobject]@{ At = $(if ($null -eq $at) { [DateTime]::MinValue } else { $at }); Id = $id; Kind = [string]$notice.kind; Record = $record }
+                }
+            })
+        $ended = @($found | Sort-Object -Property @{ Expression = 'At'; Descending = $true }, @{ Expression = 'Id' } | Select-Object -First 10 | ForEach-Object {
+                New-MuxAgentBoardRow -P $P -Caller $Caller -Record $_.Record -Pane $_.Record.pane -Window $_.Record.window -State $_.Kind -Unread $unread
+            })
+    }
+    [ordered]@{ running = $live.Count; agents = @($live) + $ended }
 }
 
 function Invoke-MuxAgentList {
@@ -1407,7 +1429,7 @@ function Invoke-MuxAgentLauncher {
 }
 
 Register-MuxAgentVerb -Verb 'spawn' -Handler 'Invoke-MuxAgentSpawn' -Values @('Client', 'Task', 'TaskFile', 'BriefFile', 'Name', 'Split') -Switches @('NoFork') -Usage 'usage: mux-agent spawn -Client <claude|copilot> [-Task <text>] [-TaskFile <path>] [-BriefFile <path>] [-Name <name>] [-Split <value>] [-NoFork] [-Text]'
-Register-MuxAgentVerb -Verb 'list' -Handler 'Invoke-MuxAgentList' -Usage 'usage: mux-agent list [-Text]'
+Register-MuxAgentVerb -Verb 'list' -Handler 'Invoke-MuxAgentList' -Switches @('All') -Usage 'usage: mux-agent list [-All] [-Text]'
 Register-MuxAgentVerb -Verb 'focus' -Handler 'Invoke-MuxAgentFocus' -Min 1 -Max 1 -Usage 'usage: mux-agent focus <name> [-Text]'
 Register-MuxAgentVerb -Verb 'send' -Handler 'Invoke-MuxAgentSend' -Values @('Body', 'BodyFile') -Min 1 -Max 1 -Usage 'usage: mux-agent send <name|parent|%pane> (-Body <text> | -BodyFile <path>) [-Text]'
 Register-MuxAgentVerb -Verb 'read' -Handler 'Invoke-MuxAgentRead' -Values @('Wait', 'Lines') -Min 0 -Max 1 -Usage 'usage: mux-agent read [-Wait <seconds>] | read <name> [-Lines <n>] [-Text]'

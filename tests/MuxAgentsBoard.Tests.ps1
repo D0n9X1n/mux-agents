@@ -86,7 +86,10 @@ Describe 'MuxAgents board verb table' {
     It 'registers status with -Body and -BodyFile' {
         # Catches: status unregistered or registered without -BodyFile.
         $request = ConvertFrom-MuxAgentArgs -Arguments @('status', '-BodyFile', 'a b.md', '-Text')
-        "$($request.Verb) $($request.Options['BodyFile']) $($request.Text)" | Should BeExactly 'status a b.md True' } }
+        "$($request.Verb) $($request.Options['BodyFile']) $($request.Text)" | Should BeExactly 'status a b.md True' }
+    It 'registers list -All' {
+        # Catches: -All unregistered.
+        (ConvertFrom-MuxAgentArgs -Arguments @('list', '-All')).Options['All'] | Should Be $true } }
 Describe 'MuxAgents board status verb' -Tag 'windows' {
     It 'stores the cleaned first line, cut to 80, for a Claude and a Copilot agent' {
         # Catches: no C1 strip before storage (U+009B bytes C29B stored), no cut, a non-atomic or misplaced file, a Copilot caller refused.
@@ -268,3 +271,25 @@ Describe 'MuxAgents board list' -Tag 'windows' {
                 $row = (Invoke-BoardVerb $fake @('list')).Reply.agents[0]
                 "$($global:boardSeen -join ';') $($row.unread)" | Should BeExactly 'pane-1.jsonl held=True 1' }
             finally { Remove-Variable -Name boardLock, boardSeen, boardUnread -Scope Global } } } }
+
+Describe 'MuxAgents board ended' -Tag 'windows' {
+    It '-All adds exited, stopped and lost agents of this session, newest notice first; plain list omits them' {
+        # Catches: order by id or folder (ids b, c, d here sort unlike their notice times), another session listed, exitCode exposed, ended rows in plain list.
+        $fake = New-BoardFake 'ended'; $null = New-BoardAgent $fake
+        foreach ($end in @(@('bbbbbbbbbbbb', 'done', 'exited', 3, '11:59', '$3'), @('cccccccccccc', 'halted', 'stopped', $null, '11:50', '$3'), @('dddddddddddd', 'vanished', 'lost', $null, '11:55', '$3'), @('eeeeeeeeeeee', 'other', 'exited', 0, '11:58', '$4'))) {
+            $folder = New-BoardAgent $fake -Id $end[0] -Name $end[1] -Pane '%7' -Session $end[5]
+            Write-MuxAgentJson -Path (Join-Path $folder 'notice.json') -Value ([ordered]@{ kind = $end[2]; exitCode = $end[3]; at = "2026-10-29T$($end[4]):00.0000000Z" }) }
+        Add-FakeRmuxRule -Fake $fake -Match '^-N list-panes ' -StdOut "%9|@5|300|aaaaaaaaaaaa|worker`n"
+        $all = (Invoke-BoardVerb $fake @('list', '-All')).Reply
+        $plain = @((Invoke-BoardVerb $fake @('list')).Reply.agents | ForEach-Object name) -join ','
+        "$($all.running) $(@($all.agents | ForEach-Object { "$($_.name)=$($_.state)" }) -join ',') $(@($all.agents | Where-Object { $_.PSObject.Properties.Name -contains 'exitCode' }).Count) $plain" |
+            Should BeExactly '1 worker=running,done=exited,vanished=lost,halted=stopped 0 worker' }
+    It '-All keeps the live row and exactly the 10 newest of 12 ended agents' {
+        # Catches: no cap, a cap of 10 rows including the live one, a cap applied before sorting (ids here are in neither time order).
+        $fake = New-BoardFake 'cap'; $null = New-BoardAgent $fake -Id 'ffffffffffff'
+        foreach ($n in 0..11) {
+            $folder = New-BoardAgent $fake -Id ('{0:x12}' -f $n) -Name "a$n" -Pane "%$(20 + $n)"
+            Write-MuxAgentJson -Path (Join-Path $folder 'notice.json') -Value ([ordered]@{ kind = 'stopped'; exitCode = $null; at = $fake.Clock.AddMinutes(-((($n * 5) % 12) + 1)).ToString('o') }) }
+        Add-FakeRmuxRule -Fake $fake -Match '^-N list-panes ' -StdOut "%9|@5|300|ffffffffffff|worker`n"
+        $all = (Invoke-BoardVerb $fake @('list', '-All')).Reply
+        "$($all.running) $(@($all.agents).Count) $(@($all.agents | ForEach-Object name) -join ',')" | Should BeExactly '1 11 worker,a0,a5,a10,a3,a8,a1,a6,a11,a4,a9' } }
