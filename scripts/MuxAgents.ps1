@@ -1047,6 +1047,26 @@ function Add-MuxAgentMail {
     $messageId
 }
 
+function Get-MuxAgentUnreadText {
+    # The mailbox's complete lines after its read offset, and the byte offset after them (the old offset when none).
+    # Reads only: the caller holds the mailbox lock and moves the offset if it consumes the lines.
+    param([Parameter(Mandatory)][string]$Box, [Parameter(Mandatory)][string]$Cursor)
+    $offset = 0L
+    if (Test-Path -LiteralPath $Cursor) { $offset = [long]([IO.File]::ReadAllText($Cursor).Trim()) }
+    if (-not (Test-Path -LiteralPath $Box)) { return [pscustomobject]@{ Text = ''; End = $offset } }
+    $bytes = [IO.File]::ReadAllBytes($Box)
+    $end = [Array]::LastIndexOf($bytes, [byte]10) + 1
+    if ($end -le $offset) { return [pscustomobject]@{ Text = ''; End = $offset } }
+    [pscustomobject]@{ Text = [Text.Encoding]::UTF8.GetString($bytes, [int]$offset, [int]($end - $offset)); End = [long]$end }
+}
+
+function ConvertFrom-MuxAgentMailText {
+    # The parsed messages of mailbox text; a sealed torn line does not parse and is skipped, so one bad line never
+    # blocks the mailbox.
+    param([Parameter(Mandatory)][AllowEmptyString()][string]$Text)
+    $Text.Split("`n", [StringSplitOptions]::RemoveEmptyEntries) | Where-Object { Test-MuxAgentJsonLine $_ } | ForEach-Object { ConvertFrom-Json -InputObject $_ }
+}
+
 function Read-MuxAgentMail {
     # Every unread message of Key's mailbox in arrival order; the read offset moves past them under the mailbox lock.
     param([Parameter(Mandatory)]$P, [Parameter(Mandatory)]$Caller, [Parameter(Mandatory)][string]$Key)
@@ -1054,16 +1074,10 @@ function Read-MuxAgentMail {
     $box = [IO.Path]::Combine($state, 'mail', "$Key.jsonl")
     $cursor = [IO.Path]::Combine($state, 'mail', "$Key.offset")
     $found = Use-MuxAgentLock -LockKey "mail|$($Caller.ServerKey)|$Key" -LockAction {
-        $offset = 0L
-        if (Test-Path -LiteralPath $cursor) { $offset = [long]([IO.File]::ReadAllText($cursor).Trim()) }
-        if (-not (Test-Path -LiteralPath $box)) { return , @() }
-        $bytes = [IO.File]::ReadAllBytes($box)
-        $end = [Array]::LastIndexOf($bytes, [byte]10) + 1
-        if ($end -le $offset) { return , @() }
-        $text = [Text.Encoding]::UTF8.GetString($bytes, [int]$offset, [int]($end - $offset))
-        [IO.File]::WriteAllText($cursor, [string]$end)
-        # A sealed torn line does not parse and is skipped, so one bad line never blocks the mailbox.
-        , @($text.Split("`n", [StringSplitOptions]::RemoveEmptyEntries) | Where-Object { Test-MuxAgentJsonLine $_ } | ForEach-Object { ConvertFrom-Json -InputObject $_ })
+        $unread = Get-MuxAgentUnreadText -Box $box -Cursor $cursor
+        if (-not $unread.Text) { return , @() }
+        [IO.File]::WriteAllText($cursor, [string]$unread.End)
+        , @(ConvertFrom-MuxAgentMailText $unread.Text)
     }
     foreach ($message in @($found)) {
         [ordered]@{ id = $message.id; from = $message.from; pane = $message.pane; at = $message.at

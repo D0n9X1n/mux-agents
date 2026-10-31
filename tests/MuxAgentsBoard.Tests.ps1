@@ -30,3 +30,19 @@ Describe 'MuxAgents board sources' {
         $ages = foreach ($created in @('2026-10-29T11:55:59.4000000Z', '2026-10-29T12:00:05.0000000Z', '2026-10-29T13:59:00+02:00', (ConvertFrom-Json '{"t":"2026-10-29T11:59:00.0000000Z"}').t, 'x', $null)) {
             $age = Get-MuxAgentAge -CreatedAt $created -Now $now; if ($null -eq $age) { 'null' } else { "$($age.GetType().Name):$age" } }
         ($ages -join ' ') | Should BeExactly 'Int32:240 Int32:0 Int32:60 Int32:60 null null' } }
+
+Describe 'MuxAgents board mail reader' {
+    It 'returns the complete lines after the offset and leaves the offset alone' {
+        # Catches: the offset written by the reader, the torn last line returned, the offset ignored.
+        $box = Join-Path $TestDrive 'r.jsonl'; $cursor = Join-Path $TestDrive 'r.offset'
+        [IO.File]::WriteAllText($box, "{`"id`":`"1`"}`n{`"id`":`"2`"}`n{`"id`":`"3`""); [IO.File]::WriteAllText($cursor, '11')
+        $unread = Get-MuxAgentUnreadText -Box $box -Cursor $cursor
+        "$($unread.End)|$($unread.Text)|$([IO.File]::ReadAllText($cursor))" | Should BeExactly "22|{`"id`":`"2`"}`n|11" }
+    It 'answers nothing for a missing mailbox or an offset at the end, and parses only whole JSON lines' {
+        # Catches: a missing file thrown on, text past the end returned, a bad line parsed.
+        $missing = Get-MuxAgentUnreadText -Box (Join-Path $TestDrive 'none.jsonl') -Cursor (Join-Path $TestDrive 'none.offset')
+        $box = Join-Path $TestDrive 'e.jsonl'; $cursor = Join-Path $TestDrive 'e.offset'
+        [IO.File]::WriteAllText($box, "{`"id`":`"1`"}`n"); [IO.File]::WriteAllText($cursor, '11')
+        $atEnd = Get-MuxAgentUnreadText -Box $box -Cursor $cursor
+        "$($missing.End)|$($missing.Text)|$($atEnd.End)|$($atEnd.Text)" | Should BeExactly '0||11|'
+        (@(ConvertFrom-MuxAgentMailText "{`"id`":`"a`"}`n{bad`n`n{`"id`":`"b`"}`n") | ForEach-Object id) -join ',' | Should BeExactly 'a,b' } }
