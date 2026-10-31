@@ -141,8 +141,9 @@ fn collect(child: &mut Child, tree: &Tree, deadline: Instant) -> io::Result<[Vec
 }
 
 /// Windows pipes cannot be polled, so a thread reads each. Each thread sends its pipe back with its bytes, so the
-/// handle stays open until the thread is joined; on a timeout CancelIoEx aborts the pending read (std reads child
-/// pipes with ReadFileEx and an alertable wait), so no thread or handle outlives the call.
+/// handle stays open while it may still be cancelled; on a timeout CancelIoEx aborts the pending read (std reads
+/// child pipes with ReadFileEx and an alertable wait). A timed-out call returns within about a second of the kill,
+/// whatever its readers do; see the cleanup below.
 #[cfg(windows)]
 fn collect(child: &mut Child, tree: &Tree, deadline: Instant) -> io::Result<[Vec<u8>; 2]> {
     use std::os::windows::io::AsRawHandle;
@@ -215,9 +216,18 @@ fn collect(child: &mut Child, tree: &Tree, deadline: Instant) -> io::Result<[Vec
             }
         }
     };
+    // After an error the job is already terminated, so every writer in the tree is closed and each pending read ends
+    // with a broken pipe; the cancels end a read whose writer is still open elsewhere. A reader may pass its flag
+    // check and only then submit a read, after the last cancel; if a writer outside the job (one that escaped it, or
+    // a child the job could not take) keeps that pipe open, the read waits on it. So the readers are joined only once
+    // finished and any other is detached: it owns its pipe and shares nothing but `stop` and a sender, whose send
+    // fails once `rx` is dropped, so it closes its pipe and ends when that writer goes, and the call never waits on
+    // it. Every CancelIoEx comes before `rx` is dropped, while each pipe is held by its running reader or by `rx` or
+    // `returned`, so no cancel can reach a closed or reused handle.
     if result.is_err() {
         stop.store(true, Ordering::SeqCst);
-        // Repeated, since a read may start between the flag and a cancel; bounded, since the flag ends it.
+        // Repeated, since a read may start between the flag and a cancel; bounded, so a read that starts after the
+        // last one costs only its detached reader.
         for _ in 0..CANCEL_ROUNDS {
             if readers.iter().all(thread::JoinHandle::is_finished) {
                 break;
@@ -233,7 +243,9 @@ fn collect(child: &mut Child, tree: &Tree, deadline: Instant) -> io::Result<[Vec
         }
     }
     for reader in readers {
-        let _ = reader.join();
+        if reader.is_finished() {
+            let _ = reader.join();
+        }
     }
     drop(returned);
     drop(rx);
@@ -501,13 +513,22 @@ mod tests {
         if !probing() {
             return;
         }
-        // A descendant with stdio of its own, so only a tree kill reaches it; its pid goes to the given folder.
+        // A descendant, so only a tree kill reaches it; its pid goes to the given folder. With "inherit" it holds
+        // this probe's stdout and stderr, the call's pipes, else stdio of its own.
         let dir = probe_arg();
+        let inherit = std::env::args().any(|a| a == "inherit");
+        let stdio = || {
+            if inherit {
+                Stdio::inherit()
+            } else {
+                Stdio::null()
+            }
+        };
         let mut child = Std::new(me())
             .args(probe_args("probe_sleep", &[]))
             .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stdout(stdio())
+            .stderr(stdio())
             .spawn()
             .unwrap();
         let temp = dir.join("pid.tmp");
@@ -630,17 +651,27 @@ mod tests {
     #[test]
     fn captured_timeout_kills_the_tree_and_errs() {
         // The descendant proves the whole tree is killed (MuxAgents.ps1:283, Kill($true)), not just the child.
+        timeout_kills_tree(false);
+    }
+
+    #[test]
+    fn captured_timeout_returns_while_a_descendant_holds_the_pipes() {
+        // The descendant holds the writers of both pipes: the call still ends within the timeout and a small bound.
+        timeout_kills_tree(true);
+    }
+
+    fn timeout_kills_tree(inherit: bool) {
         let dir = TempDir::new();
+        let mut extra = vec![dir.path().to_str().unwrap()];
+        if inherit {
+            extra.push("inherit");
+        }
         let started = Instant::now();
-        let error = probe(
-            "probe_tree",
-            &[dir.path().to_str().unwrap()],
-            Duration::from_millis(1500),
-        )
-        .unwrap_err();
+        let error = probe("probe_tree", &extra, Duration::from_millis(1500)).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        // 1.5 s, then at most about 1 s of cancels on Windows.
         assert!(
-            started.elapsed() < Duration::from_secs(6),
+            started.elapsed() < Duration::from_secs(4),
             "{:?}",
             started.elapsed()
         );

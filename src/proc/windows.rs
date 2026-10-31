@@ -413,6 +413,17 @@ mod win {
         }
 
         #[test]
+        fn row_of_child_names_this_process_as_parent() {
+            // The ppid read independently of the table: a child this process started.
+            let mut child = sleeper();
+            let row = Windows.row(child.id());
+            child.kill().unwrap();
+            child.wait().unwrap();
+            let row = row.unwrap();
+            assert_eq!((row.pid, row.ppid), (child.id(), me()));
+        }
+
+        #[test]
         fn argv_of_self() {
             let argv = Windows.row(me()).unwrap().argv.unwrap();
             assert_eq!(argv, std::env::args().collect::<Vec<_>>());
