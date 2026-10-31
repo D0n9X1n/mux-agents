@@ -7,7 +7,7 @@ use std::time::{Duration, SystemTime};
 
 use crate::ctx::{Clock, Ctx, Env};
 use crate::error::Res;
-use crate::mux::{Mux, Output};
+use crate::mux::{Kind, Mux, Output};
 use crate::parse::Client;
 use crate::proc::{Left, Opened, Os, Row, Signals, Token};
 
@@ -164,6 +164,10 @@ impl Mux for Fakes {
             .find(|r| line.contains(&r.contains))
             .map(|r| r.output.clone())
             .unwrap_or_default())
+    }
+
+    fn kind(&self) -> Kind {
+        Kind::Tmux
     }
 }
 
