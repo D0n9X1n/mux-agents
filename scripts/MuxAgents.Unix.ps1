@@ -40,3 +40,30 @@ function Get-MuxAgentUnixClient { param($Row, [Parameter(Mandatory)]$Kernel)
         if (-not $script.StartsWith('/')) { $cwd = "$(& $Kernel.ReadCwd ([int]$Row.Pid))"; if (-not $cwd.StartsWith('/')) { throw 'cwd' }; $script = $cwd.TrimEnd('/') + '/' + $script }
         "$(& $Kernel.ResolveFile $script)" } catch { '' }
     if ($target.EndsWith('/@github/copilot/npm-loader.js', [StringComparison]::Ordinal)) { 'copilot' } }
+# /proc/<pid>/stat: comm may hold spaces, ')' and newlines, so fields are read after the last ')'. Every field through starttime
+# (field 22) and the one after it must be present, so a starttime cut short is refused. starttime is raw ticks.
+function ConvertFrom-MuxAgentLinuxStat { param([AllowNull()][string]$Text)
+    $close = "$Text".LastIndexOf(')'); $open = "$Text".IndexOf(' (')
+    if ($open -lt 1 -or $close -lt $open) { return $null }
+    $fields = $Text.Substring($close + 1).Trim().Split(' '); $id = 0; $parent = 0; $start = 0L
+    if ($fields.Count -lt 21 -or -not [int]::TryParse($Text.Substring(0, $open), [ref]$id) -or -not [int]::TryParse($fields[1], [ref]$parent) -or -not [long]::TryParse($fields[19], [ref]$start)) { return $null }
+    [pscustomobject]@{ Pid = $id; ParentPid = $parent; Start = $start } }
+# /proc/<pid>/cmdline: NUL-terminated strings. The data must end in NUL; exactly that terminator is dropped, so empty trailing
+# arguments survive. No final NUL: unreadable ($null).
+function ConvertFrom-MuxAgentLinuxCmdline { param([AllowNull()][byte[]]$Bytes)
+    if ($null -eq $Bytes -or $Bytes.Length -eq 0 -or $Bytes[-1] -ne 0) { return $null }
+    [Text.Encoding]::UTF8.GetString($Bytes, 0, $Bytes.Length - 1).Split([char]0) }
+# One process row. Argv is the kernel argv ($null when unreadable); CommandLine only joins it for display.
+function New-MuxAgentUnixRow { param([int]$ProcessId, [int]$ParentId, [long]$Start, $Path, [AllowNull()][string[]]$Argv)
+    [pscustomobject]@{ Pid = $ProcessId; ParentPid = $ParentId; Start = $Start; Path = $Path; CommandLine = $(if ($null -ne $Argv) { $Argv -join ' ' }); Argv = $Argv } }
+# The kernel argv of one pid as string[] (empty strings kept), or $null when unreadable or empty (a kernel thread).
+function Read-MuxAgentUnixArgv { param([Parameter(Mandatory)][scriptblock]$Reader, [int]$Id)
+    $argv = $null; try { $argv = [string[]]@(& $Reader $Id | Where-Object { $null -ne $_ }) } catch { }
+    if ($argv.Count) { , $argv } }
+# Processes on Linux: /proc/[0-9]* stat, exe link, cmdline; a pid that exits mid-read is skipped.
+function Get-MuxAgentLinuxProcessTable { param([Parameter(Mandatory)]$Kernel)
+    foreach ($id in & $Kernel.ListIds) {
+        $stat = try { ConvertFrom-MuxAgentLinuxStat -Text (& $Kernel.ReadStat $id) } catch { $null }
+        if (-not $stat) { continue }
+        $path = try { & $Kernel.ReadExe $id } catch { $null }
+        New-MuxAgentUnixRow -ProcessId $stat.Pid -ParentId $stat.ParentPid -Start $stat.Start -Path $path -Argv (Read-MuxAgentUnixArgv -Reader $Kernel.ReadCmdline -Id $id) } }

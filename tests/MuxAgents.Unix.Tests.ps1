@@ -64,3 +64,42 @@ Describe 'MuxAgents unix client identity' {
             (Get-UnixClient '/usr/bin/node' @('node', '-e', 'require(1)', $loader)), (Get-UnixClient '/usr/bin/node' @('node', '-p', '1', $loader)), (Get-UnixClient '/usr/bin/node' @('node', '--eval=1', $loader)),
             (Get-UnixClient '/usr/bin/node' @('node', '-r', $loader, '/srv/app.js')), (Get-UnixClient '/usr/bin/node' @('node', 'bin/copilot') 402), (Get-UnixClient '/usr/bin/node' @('node', 'bin/copilot') 403))
         ($answers -join ',') | Should BeExactly (',' * 17) } }
+# Fake kernel: Unreadable[pid] makes ReadStart return $null while the pid stays in Live (alive).
+function New-UnixFakeKernel {
+    $k = [pscustomobject]@{ Stat = @{}; Exe = @{}; Cmdline = @{}; Ps = ''; Path = @{}; Argv = @{}; Live = @{}; Cwd = @{}; Status = "Name:`tpwsh`nNoNewPrivs:`t0`n"; Sandbox = 0
+        Pidfd = $true; Fds = @{}; NextFd = 1000; Sent = [Collections.Generic.List[string]]::new(); Closed = [Collections.Generic.List[int]]::new(); Log = [Collections.Generic.List[string]]::new(); Sleeps = 0; OnOpen = $null; OnSleep = $null; Unreadable = @{} }
+    $members = [ordered]@{
+        ListIds = { @($k.Stat.Keys) }; ReadStat = { param([int]$Id) if ($null -eq $k.Stat[$Id]) { throw 'gone' }; $k.Stat[$Id] }
+        ReadExe = { param([int]$Id) $k.Exe[$Id] }; ReadCmdline = { param([int]$Id) $k.Cmdline[$Id] }
+        ListPs = { $k.Ps }; ReadPath = { param([int]$Id) $k.Path[$Id] }; ReadArgv = { param([int]$Id) $k.Argv[$Id] }
+        ReadStart = { param([int]$Id) $k.Log.Add("start $Id"); if ($k.Unreadable.ContainsKey($Id)) { return $null }; $k.Live[$Id] }; ReadCwd = { param([int]$Id) $k.Log.Add("cwd $Id"); $k.Cwd[$Id] }
+        ReadStatus = { if ($null -eq $k.Status) { throw 'denied' }; $k.Status }; SandboxCheck = { if ($null -eq $k.Sandbox) { throw 'no sandbox_check' }; $k.Sandbox }
+        ResolveFile = { param($Path) $Path }; IsGone = { param([int]$Id) -not $k.Live.ContainsKey($Id) }
+        PidfdOpen = { param([int]$Id) $k.Log.Add("pidfd $Id"); if (-not $k.Pidfd -or -not $k.Live.ContainsKey($Id)) { return -1 }; $fd = $k.NextFd; $k.NextFd = $fd + 1; $k.Fds[$fd] = "$Id/$($k.Live[$Id])"; if ($k.OnOpen) { & $k.OnOpen $Id }; $fd }
+        SendKill = { param([int]$Fd) $k.Log.Add("send $Fd"); $id, $start = "$($k.Fds[$Fd])" -split '/'; if ($id -and $k.Live.ContainsKey([int]$id) -and "$($k.Live[[int]$id])" -eq $start) { $k.Sent.Add($k.Fds[$Fd]); $k.Live.Remove([int]$id); $true } else { $false } }
+        WaitExit = { param([int]$Fd, [int]$Milliseconds) $id, $start = "$($k.Fds[$Fd])" -split '/'; -not ($id -and $k.Live.ContainsKey([int]$id) -and "$($k.Live[[int]$id])" -eq $start) }
+        Close = { param([int]$Fd) $k.Closed.Add($Fd) }; Sleep = { param([int]$Milliseconds) $k.Sleeps++; if ($k.OnSleep) { & $k.OnSleep $k.Sleeps } } }
+    foreach ($name in $members.Keys) { Add-Member -InputObject $k -NotePropertyName $name -NotePropertyValue $members[$name].GetNewClosure() }
+    $k }
+# A /proc/<pid>/stat line: starttime is field 22, the 20th field after the last ')'.
+function New-UnixStatLine([int]$Id, [string]$Comm, [int]$Parent, [long]$Start) { "$Id ($Comm) S $Parent $Id $Id 0 -1 4194560 100 0 0 0 5 3 0 0 20 0 1 0 $Start 1000000 200 0" }
+function Format-UnixRow($Row) { "$($Row.Pid) $($Row.ParentPid) $($Row.Start) $($Row.Path) [$($Row.CommandLine)] $(if ($null -ne $Row.Argv) { "$($Row.Argv.GetType().Name)$($Row.Argv.Count)" } else { 'null' })" }
+Describe 'MuxAgents unix linux process table' {
+    It 'reads pid, parent and raw start after the last ), the exe link and argv; skips a pid that exited' {
+        $k = New-UnixFakeKernel
+        $k.Stat[300] = New-UnixStatLine 300 'a) (b' 100 4321; $k.Exe[300] = '/usr/bin/node'; $k.Cmdline[300] = [string[]]@('node', '/x/loader.js')
+        $k.Stat[301] = $null; $k.Stat[302] = New-UnixStatLine 302 'sleep' 300 99; $k.Cmdline[302] = [string[]]@('sleep'); $k.Stat[303] = New-UnixStatLine 303 'kworker/0:1' 2 5
+        (@(Get-MuxAgentLinuxProcessTable -Kernel $k | Sort-Object Pid | ForEach-Object { Format-UnixRow $_ }) -join ';') | Should BeExactly '300 100 4321 /usr/bin/node [node /x/loader.js] String[]2;302 300 99  [sleep] String[]1;303 2 5  [] null' }
+    It 'parses a comm holding ") (" and a newline to the exact pid, ppid and raw start' {
+        $stat = ConvertFrom-MuxAgentLinuxStat -Text (New-UnixStatLine 300 "a) (b`nc" 100 4321)
+        "$($stat.Pid) $($stat.ParentPid) $($stat.Start)" | Should BeExactly '300 100 4321' }
+    It 'rejects stat text cut inside starttime or missing a field: no row and no client' {
+        $line = New-UnixStatLine 300 'claude' 100 4321; $cut = $line.Substring(0, $line.IndexOf(' 4321 ') + 3)
+        $k = New-UnixFakeKernel; $k.Stat[300] = $cut; $k.Exe[300] = '/opt/claude'; $k.Cmdline[300] = [string[]]@('claude')
+        $rows = @(Get-MuxAgentLinuxProcessTable -Kernel $k)
+        $bad = @($cut, 'x', '300 (sh) S 100', '', 'abc (sh) S 1 1 1 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 77 1') | ForEach-Object { "$($null -eq (ConvertFrom-MuxAgentLinuxStat -Text $_))" }
+        "$($rows.Count)|$(@($rows | Where-Object { Get-MuxAgentUnixClient -Row $_ -Kernel $k }).Count)|$($bad -join ',')" | Should BeExactly '0|0|True,True,True,True,True' }
+    It 'the production cmdline splitter splits only on NUL, drops exactly the final terminator and refuses data without it' {
+        $enc = [Text.Encoding]::UTF8
+        $a = @(ConvertFrom-MuxAgentLinuxCmdline -Bytes $enc.GetBytes("node`0script.js`0`0")); $c = @(ConvertFrom-MuxAgentLinuxCmdline -Bytes $enc.GetBytes("a b`0"))
+        "$($a.Count)|$($a -join '/')|$($null -eq (ConvertFrom-MuxAgentLinuxCmdline -Bytes $enc.GetBytes("claude`0--model")))|$($c.Count)|$($c[0])|$($null -eq (ConvertFrom-MuxAgentLinuxCmdline -Bytes ([byte[]]@())))" | Should BeExactly '3|node/script.js/|True|1|a b|True' } }
