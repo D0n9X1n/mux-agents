@@ -214,6 +214,8 @@ struct Launch<'a> {
 struct Agent {
     id: String,
     name: String,
+    // The identity hue from `hue_for`, kept in record.json as `color`.
+    color: &'static str,
     session: String,
     plan: Plan,
     folder: PathBuf,
@@ -254,6 +256,7 @@ impl Launch<'_> {
             .chain(recorded.iter().map(String::as_str))
             .collect();
         let name = resolve_name(self.requested, self.client, &self.task, &taken)?;
+        let color = hue_for(ctx, caller, &live)?;
         let mut plan = context_plan(caller, self.client, &ctx.env, self.no_fork);
         let session = guid()?;
         let id = hex_id()?;
@@ -282,6 +285,7 @@ impl Launch<'_> {
             folder: state.join("agents").join(&id),
             id,
             name,
+            color,
             session,
             plan,
             copied,
@@ -455,7 +459,8 @@ impl Launch<'_> {
             "session": caller.session, "pane": new_pane, "window": window, "parentPane": caller.pane,
             "parentAgent": parent_agent, "directory": utf8(&self.directory)?,
             "taskLine": doing_line(&self.task), "createdAt": utc_o(ctx.clock.now())});
-        // No model is the client's own.
+        record["color"] = agent.color.into();
+        // No model is the client's own; a chosen one is the record's last field.
         if let Some(model) = self.model {
             record["model"] = model.into();
         }
@@ -474,6 +479,32 @@ impl Launch<'_> {
         reply.insert("model".into(), self.model.unwrap_or("inherited").into());
         Ok(reply)
     }
+}
+
+/// The new agent's identity hue (#37): the palette hue least used by the session's live agents (their recorded
+/// hue, else their name's), ties by palette order. Read under the spawn lock; a record that is not the session's
+/// own, or cannot be read, counts nothing.
+fn hue_for(ctx: &Ctx, caller: &Caller, live: &[registry::Pane]) -> Res<&'static str> {
+    let mut used = [0usize; crate::paint::PALETTE.len()];
+    for pane in live {
+        let Some(record) = registry::record(ctx, caller, &pane.id).ok().flatten() else {
+            continue;
+        };
+        if record.get("session").and_then(Value::as_str) != Some(caller.session.as_str()) {
+            continue;
+        }
+        let hue = crate::paint::identity(
+            record.get("color").and_then(Value::as_str),
+            &text(record.get("name")),
+        );
+        if let Some(at) = crate::paint::PALETTE.iter().position(|p| *p == hue) {
+            used[at] += 1;
+        }
+    }
+    let least = (0..used.len())
+        .min_by_key(|&at| (used[at], at))
+        .unwrap_or(0);
+    Ok(crate::paint::PALETTE[least])
 }
 
 /// commit.json, the last write: from here the agent is live.
@@ -1191,6 +1222,76 @@ mod tests {
         w.panes(&five.iter().map(String::as_str).collect::<Vec<_>>());
         let ok = reply(&run(&w, &["-Client", "claude", "-Task", "just it"]));
         assert_eq!(ok["name"], "claude-6");
+    }
+
+    // The new agent's record.json: the one folder `before` did not have.
+    fn new_record(w: &World, before: &[String]) -> Value {
+        let new: Vec<String> = agent_folders(w)
+            .into_iter()
+            .filter(|f| !before.contains(f))
+            .collect();
+        assert_eq!(new.len(), 1, "{new:?}");
+        read_json(&agents_dir(w).join(&new[0]).join("record.json"))
+    }
+
+    #[test]
+    fn spawn_colors_the_least_used_hue_of_live_agents() {
+        let spawn_color = |w: &World| {
+            let before = agent_folders(w);
+            let ok = run(w, &["-Client", "claude", "-Task", "hi", "-Name", "new"]);
+            assert!(ok.starts_with("ok "), "{ok}");
+            new_record(w, &before)["color"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        };
+        // None live: the first hue.
+        let w = human();
+        assert_eq!(spawn_color(&w), "blue");
+        // The least used hue of the live agents, ties by palette order.
+        for (colors, want) in [
+            (&["blue"][..], "magenta"),
+            (&["blue", "magenta"], "bright-blue"),
+            (&["magenta", "blue"], "bright-blue"),
+            (
+                &["blue", "magenta", "bright-blue", "bright-magenta"],
+                "blue",
+            ),
+            (
+                &["blue", "blue", "magenta", "bright-blue", "bright-magenta"],
+                "magenta",
+            ),
+        ] {
+            let w = human();
+            let mut panes = Vec::new();
+            for (n, color) in colors.iter().enumerate() {
+                let id = format!("{:012x}", 0xd00 + n);
+                w.agent_record(&id, json!({"name": format!("a{n}"), "color": color}));
+                panes.push(format!("%{}|@5|{}|{id}|a{n}", 30 + n, 330 + n));
+            }
+            w.panes(&panes.iter().map(String::as_str).collect::<Vec<_>>());
+            assert_eq!(spawn_color(&w), want, "{colors:?}");
+        }
+        // A ended (blue, not live) and B live (magenta): C gets blue.
+        let w = human();
+        ended(&w, "000000000e01", json!({"name": "a", "color": "blue"}));
+        w.agent_record("000000000e02", json!({"name": "b", "color": "magenta"}));
+        w.panes(&["%31|@5|331|000000000e02|b"]);
+        assert_eq!(spawn_color(&w), "blue");
+        // Another session's record on a listed pane does not count; a live agent with no color counts its name's hue.
+        let w = human();
+        w.agent_record(
+            "000000000e03",
+            json!({"name": "x", "color": "blue", "session": "$4"}),
+        );
+        let hashed = crate::paint::identity(None, "worker");
+        w.agent_record("000000000e04", json!({"name": "worker"}));
+        w.panes(&[
+            "%31|@5|331|000000000e03|x",
+            "%32|@5|332|000000000e04|worker",
+        ]);
+        let want = if hashed == "blue" { "magenta" } else { "blue" };
+        assert_eq!(spawn_color(&w), want);
     }
 
     // An ended agent, noticed so reap leaves it be; its name is taken until the state root is cleared.
@@ -2544,7 +2645,7 @@ mod tests {
             "sessionId": ok["sessionId"], "context": "brief", "reason": "human", "session": "$3",
             "pane": "%9", "window": "@5", "parentPane": "%1", "parentAgent": null,
             "directory": w.ctx.cwd.to_str().unwrap(), "taskLine": "hi",
-            "createdAt": "1970-01-01T00:00:00.0000000Z"});
+            "createdAt": "1970-01-01T00:00:00.0000000Z", "color": "blue"});
         assert_eq!(
             std::fs::read_to_string(folder.join("record.json")).unwrap(),
             record.to_string()

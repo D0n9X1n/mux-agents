@@ -33,8 +33,8 @@ pub fn select_doing(
     (Value::Null, Value::Null)
 }
 
-/// `{running, agents}` for the caller's session: live agents in pane order and, with `all`, the session's ended
-/// agents, newest notice first, at most 10. Unread is `reader`'s. `with_exit` (watch only) adds each ended row's
+/// `{running, agents}` for the caller's session: live agents in pane order and, with `all`, `endedTotal` (every
+/// ended agent of the session) and the session's ended agents, newest notice first, at most 10. Unread is `reader`'s. `with_exit` (watch only) adds each ended row's
 /// exitCode from its notice.json. Locks one at a time: notice locks, the reader's mail lock, then each row's
 /// agent lock.
 pub fn board(
@@ -74,8 +74,10 @@ pub fn board(
         )?);
     }
     let running = agents.len();
+    let mut ended_total = None;
     if all {
         let mut ended = ended(ctx, caller, &panes)?;
+        ended_total = Some(ended.len());
         // Newest first (an unreadable time is oldest), then by id.
         ended.sort_by(|a, b| b.at.cmp(&a.at).then_with(|| a.id.cmp(&b.id)));
         for end in ended.into_iter().take(ENDED_MAX) {
@@ -94,6 +96,9 @@ pub fn board(
     }
     let mut reply = Map::new();
     reply.insert("running".into(), running.into());
+    if let Some(total) = ended_total {
+        reply.insert("endedTotal".into(), total.into());
+    }
     reply.insert(
         "agents".into(),
         Value::Array(agents.into_iter().map(Value::Object).collect()),
@@ -243,6 +248,12 @@ impl Rows<'_> {
         row.insert("unread".into(), unread.into());
         // Last, so the -Text columns before it keep their places; null is the client's own model.
         row.insert("model".into(), field("model"));
+        // The identity hue: the recorded one, else the name's.
+        let recorded = record.get("color").and_then(Value::as_str);
+        row.insert(
+            "color".into(),
+            crate::paint::identity(recorded, &name).into(),
+        );
         Ok(row)
     }
 }
@@ -332,7 +343,7 @@ mod tests {
         let caller = w.caller();
         w.agent_record(
             ID,
-            json!({"createdAt": "2026-10-29T11:56:00.0000000Z", "model": "sonnet"}),
+            json!({"createdAt": "2026-10-29T11:56:00.0000000Z", "model": "sonnet", "color": "magenta"}),
         );
         w.agent_record(
             "bbbbbbbbbbbb",
@@ -363,16 +374,17 @@ mod tests {
                    from: Value,
                    age,
                    unread,
-                   model: Value| {
+                   model: Value,
+                   color: &str| {
             json!({"name": name, "client": client, "pane": pane, "window": window, "context": "brief",
                 "parent": "%1", "sessionId": SESSION_ID, "directory": "/work", "createdAt": created,
                 "state": "running", "doing": doing, "doingFrom": from, "age": age, "unread": unread,
-                "model": model})
+                "model": model, "color": color})
         };
-        // A record without a model (the client's own) lists null.
+        // A record without a model (the client's own) lists null; one without a color gets its name's hue.
         let want = json!({"running": 2, "agents": [
-            row("worker", "claude", "%9", "@6", "2026-10-29T11:56:00.0000000Z", json!("build it"), json!("task"), 240, 2, json!("sonnet")),
-            row("idle", "copilot", "%8", "@7", "2026-10-29T11:59:55.0000000Z", Value::Null, Value::Null, 5, 1, Value::Null)
+            row("worker", "claude", "%9", "@6", "2026-10-29T11:56:00.0000000Z", json!("build it"), json!("task"), 240, 2, json!("sonnet"), "magenta"),
+            row("idle", "copilot", "%8", "@7", "2026-10-29T11:59:55.0000000Z", Value::Null, Value::Null, 5, 1, Value::Null, crate::paint::identity(None, "idle"))
         ]});
         // Compared as text: the order of keys is part of the reply.
         assert_eq!(Value::Object(reply).to_string(), want.to_string());
@@ -442,6 +454,10 @@ mod tests {
         let (w, caller) = ended_world();
         let all = board(&w.ctx, &caller, "pane-1", true, false).unwrap();
         assert_eq!(all["running"], 1);
+        // Every ended agent of the session, lost ones included; other sessions, odd kinds and foreign records not.
+        assert_eq!(all["endedTotal"], 5);
+        let keys: Vec<&str> = all.keys().map(String::as_str).collect();
+        assert_eq!(keys, ["running", "endedTotal", "agents"]);
         // Newest notice first, ties by id, an unreadable time last.
         assert_eq!(
             names(&all),
@@ -456,6 +472,8 @@ mod tests {
         );
         let plain = board(&w.ctx, &caller, "pane-1", false, false).unwrap();
         assert_eq!(names(&plain), ["worker=running"]);
+        // Without -All the reply is unchanged: no endedTotal.
+        assert!(plain.get("endedTotal").is_none());
 
         // The live row and exactly the 10 newest of 12 ended agents.
         let w = World::human("");
@@ -477,6 +495,8 @@ mod tests {
             );
         }
         let all = board(&w.ctx, &caller, "pane-1", true, false).unwrap();
+        // Uncapped: 12 ended, 10 rows.
+        assert_eq!(all["endedTotal"], 12);
         let got: Vec<String> = names(&all)
             .into_iter()
             .map(|n| n.split('=').next().unwrap().to_string())
@@ -519,7 +539,7 @@ mod tests {
         let rows = all["agents"].as_array().unwrap();
         let lost = rows[0].as_object().unwrap();
         assert_eq!(lost["name"], "vanished");
-        // After the 15 row fields, so they keep their places.
+        // After the 16 row fields, so they keep their places.
         assert_eq!(
             lost.iter().map(|(k, v)| (k.as_str(), v)).next_back(),
             Some(("closedBy", &json!("pane")))

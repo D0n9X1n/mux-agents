@@ -86,7 +86,7 @@ pub static VERBS: &[VerbDef] = &[
         max: 0,
         usage: "usage: mux-agent list [-All] [-Text]",
         handler: crate::agents::view::list,
-        text: json::to_text,
+        text: crate::agents::view::list_text,
     },
     VerbDef {
         name: "focus",

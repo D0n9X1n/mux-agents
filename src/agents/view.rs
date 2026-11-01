@@ -20,6 +20,17 @@ pub fn list(ctx: &Ctx, request: &Request) -> Res<Map<String, Value>> {
     board(ctx, &caller, &reader, request.switch("All"), false)
 }
 
+/// `list -Text`: the rows as `json::to_text` prints them, without the `color` column (the hue styles the name).
+pub fn list_text(reply: &Map<String, Value>) -> String {
+    let mut shown = reply.clone();
+    if let Some(Value::Array(rows)) = shown.get_mut("agents") {
+        for row in rows.iter_mut().filter_map(Value::as_object_mut) {
+            row.remove("color");
+        }
+    }
+    crate::json::to_text(&shown)
+}
+
 pub fn focus(ctx: &Ctx, request: &Request) -> Res<Map<String, Value>> {
     let caller = resolve(ctx)?;
     let pane = find_pane(ctx, &caller, first(request))?;
