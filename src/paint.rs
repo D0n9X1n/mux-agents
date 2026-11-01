@@ -1,5 +1,7 @@
 //! Terminal text for the side bar and `list -Text` (#37): the color switches, the 16 named ANSI colors, display
-//! columns (wide East Asian characters 2, combining marks 0) and cutting to a width.
+//! columns (from the `unicode-width` crate) and cutting to a width on whole clusters.
+
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::ctx::Env;
 
@@ -107,79 +109,50 @@ pub fn identity(recorded: Option<&str>, name: &str) -> &'static str {
     PALETTE[(hash % PALETTE.len() as u32) as usize]
 }
 
-// Zero-width: combining marks, zero-width spaces and joiners, variation selectors.
-const ZERO: &[(u32, u32)] = &[
-    (0x0300, 0x036f),
-    (0x0483, 0x0489),
-    (0x0591, 0x05bd),
-    (0x0610, 0x061a),
-    (0x064b, 0x065f),
-    (0x0e31, 0x0e31),
-    (0x0e34, 0x0e3a),
-    (0x0e47, 0x0e4e),
-    (0x1ab0, 0x1aff),
-    (0x1dc0, 0x1dff),
-    (0x200b, 0x200f),
-    (0x20d0, 0x20ff),
-    (0xfe00, 0xfe0f),
-    (0xfe20, 0xfe2f),
-    (0xe0100, 0xe01ef),
-];
-
-// Two columns: East Asian Wide and Fullwidth blocks, and emoji.
-const WIDE: &[(u32, u32)] = &[
-    (0x1100, 0x115f),
-    (0x2e80, 0x303e),
-    (0x3041, 0x33ff),
-    (0x3400, 0x4dbf),
-    (0x4e00, 0x9fff),
-    (0xa000, 0xa4cf),
-    (0xac00, 0xd7a3),
-    (0xf900, 0xfaff),
-    (0xfe30, 0xfe4f),
-    (0xff00, 0xff60),
-    (0xffe0, 0xffe6),
-    (0x1f300, 0x1f64f),
-    (0x1f900, 0x1f9ff),
-    (0x20000, 0x3fffd),
-];
-
-/// Columns of one character.
-pub fn char_width(c: char) -> usize {
-    let code = u32::from(c);
-    let within = |table: &[(u32, u32)]| table.iter().any(|&(lo, hi)| (lo..=hi).contains(&code));
-    if c < ' ' || within(ZERO) {
-        0
-    } else if within(WIDE) {
-        2
-    } else {
-        1
-    }
-}
-
-/// Columns of `text`.
+/// Columns of `text` as the `unicode-width` crate counts them (UAX #11, not CJK: Ambiguous is 1; emoji presentation
+/// and ZWJ sequences 2; combining marks and zero-width characters 0). Agent text is cleaned of controls first.
 pub fn width(text: &str) -> usize {
-    text.chars().map(char_width).sum()
+    UnicodeWidthStr::width(text)
 }
 
-/// `text` within `max` columns: as is when it fits, else cut with `...` (or cut bare when `max` is under 4).
+/// The byte ends of `text`'s clusters: a character with the zero-width ones after it, and a joiner with the character
+/// it joins, so a cut never parts a mark, a selector or an emoji sequence from its base.
+fn cluster_ends(text: &str) -> Vec<usize> {
+    let mut ends = Vec::new();
+    let mut prev: Option<char> = None;
+    for (at, c) in text.char_indices() {
+        let joins = c.width().unwrap_or(0) == 0 || prev == Some('\u{200d}');
+        if prev.is_some() && !joins {
+            ends.push(at);
+        }
+        prev = Some(c);
+    }
+    if !text.is_empty() {
+        ends.push(text.len());
+    }
+    ends
+}
+
+/// The longest run of whole clusters at the start of `text` within `max` columns.
+pub fn fit(text: &str, max: usize) -> &str {
+    let mut kept = "";
+    for end in cluster_ends(text) {
+        if width(&text[..end]) > max {
+            break;
+        }
+        kept = &text[..end];
+    }
+    kept
+}
+
+/// `text` within `max` columns: as is when it fits, else cut on whole clusters with `...` (or cut bare when `max` is
+/// under 4).
 pub fn cut(text: &str, max: usize) -> String {
     if width(text) <= max {
         return text.to_string();
     }
     let (budget, tail) = if max < 4 { (max, "") } else { (max - 3, "...") };
-    let mut out = String::new();
-    let mut used = 0;
-    for c in text.chars() {
-        let w = char_width(c);
-        if used + w > budget {
-            break;
-        }
-        used += w;
-        out.push(c);
-    }
-    out.push_str(tail);
-    out
+    format!("{}{tail}", fit(text, budget))
 }
 
 #[cfg(test)]
@@ -334,15 +307,34 @@ mod tests {
     }
 
     #[test]
-    fn widths_count_columns() {
-        assert_eq!(width("abc"), 3);
-        assert_eq!(width("\u{754c}\u{754c}"), 4);
-        assert_eq!(width("e\u{301}"), 1);
-        assert_eq!(width("\u{ac00}\u{ff21}\u{3042}"), 6);
-        assert_eq!(width("\u{1f600}"), 2);
-        // The bar's glyphs are single width.
-        assert_eq!(width("\u{25c9}\u{25cc}\u{2713}\u{2717}\u{2709}"), 5);
-        assert_eq!(width("\u{200b}\u{fe0f}\u{20dd}"), 0);
+    fn widths_match_a_fixed_table() {
+        // Columns written out by hand (UAX #11 and emoji presentation), never computed by the code under test.
+        let table: &[(&str, usize)] = &[
+            ("a", 1),
+            ("abc", 3),
+            ("\u{754c}", 2),
+            ("\u{ac00}\u{ff21}\u{3042}", 6),
+            // A vertical form and an emoji: two columns each.
+            ("\u{fe10}", 2),
+            ("\u{1f680}", 2),
+            ("\u{1f600}", 2),
+            // A text-default heart is 1; with VS16 it is an emoji, 2. A ZWJ sequence is one emoji.
+            ("\u{2764}", 1),
+            ("\u{2764}\u{fe0f}", 2),
+            ("\u{1f469}\u{200d}\u{1f4bb}", 2),
+            // A combining mark and a zero-width space take no column.
+            ("e\u{301}", 1),
+            ("\u{301}", 0),
+            ("\u{200b}", 0),
+            // The bar's glyphs, and the Ambiguous `·` and `…`, are single width (not CJK).
+            ("\u{25c9}\u{25cc}\u{2713}\u{2717}\u{2709}", 5),
+            ("\u{b7}\u{2026}", 2),
+        ];
+        for &(text, want) in table {
+            assert_eq!(width(text), want, "{text:?}");
+        }
+        assert_eq!(width(&"\u{fe10}".repeat(30)), 60);
+        assert_eq!(width(&"\u{1f680}".repeat(30)), 60);
     }
 
     #[test]
@@ -363,5 +355,21 @@ mod tests {
         assert_eq!(cut(&marks, 5), "e\u{301}e\u{301}...");
         assert_eq!(width(&cut(&marks, 5)), 5);
         assert_eq!(cut(&marks, 30), marks);
+        // Two-column forms and emoji are cut whole, never split from their selector or joiner.
+        assert_eq!(
+            cut(&"\u{fe10}".repeat(30), 9),
+            "\u{fe10}\u{fe10}\u{fe10}..."
+        );
+        assert_eq!(
+            cut(&"\u{1f680}".repeat(30), 9),
+            "\u{1f680}\u{1f680}\u{1f680}..."
+        );
+        assert_eq!(
+            cut(&"\u{2764}\u{fe0f}".repeat(20), 8),
+            "\u{2764}\u{fe0f}\u{2764}\u{fe0f}..."
+        );
+        let coder = "\u{1f469}\u{200d}\u{1f4bb}";
+        assert_eq!(cut(&coder.repeat(10), 9), format!("{}...", coder.repeat(3)));
+        assert_eq!(cut(&"a\u{200b}".repeat(10), 5), "a\u{200b}a\u{200b}...");
     }
 }

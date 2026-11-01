@@ -190,18 +190,15 @@ fn cut_row(row: Row, max: usize) -> Row {
     let mut out = Vec::new();
     let mut used = 0;
     for (text, style) in row {
-        let mut kept = String::new();
-        for c in text.chars() {
-            let w = paint::char_width(c);
-            if used + w > budget {
-                kept.push_str(tail);
-                out.push((kept, style));
-                return out;
-            }
+        let w = paint::width(&text);
+        if used + w <= budget {
             used += w;
-            kept.push(c);
+            out.push((text, style));
+            continue;
         }
-        out.push((kept, style));
+        let kept = paint::fit(&text, budget - used);
+        out.push((format!("{kept}{tail}"), style));
+        return out;
     }
     out
 }
@@ -1615,6 +1612,70 @@ mod tests {
             (crate::paint::width(&rows[3]), crate::paint::width(&rows[6])),
             (38, 39)
         );
+    }
+
+    // Columns of the samples below, written out by hand: never the code under test.
+    fn sample_columns(text: &str) -> usize {
+        let chars: Vec<char> = text.chars().collect();
+        let mut total = 0;
+        for (at, &c) in chars.iter().enumerate() {
+            let after_zwj = at > 0 && chars[at - 1] == '\u{200d}';
+            total += match c {
+                '\u{301}' | '\u{200b}' | '\u{200d}' | '\u{fe0f}' => 0,
+                _ if after_zwj => 0,
+                '\u{2764}' if chars.get(at + 1) == Some(&'\u{fe0f}') => 2,
+                '\u{754c}' | '\u{fe10}' | '\u{1f680}' | '\u{1f469}' | '\u{1f4bb}' => 2,
+                _ => 1,
+            };
+        }
+        total
+    }
+
+    #[test]
+    fn layout_counts_emoji_and_vertical_forms_by_their_columns() {
+        let coder = "\u{1f469}\u{200d}\u{1f4bb}";
+        // Each sample's doing line at W = 40: 3 columns of indent, then at most 33 columns of whole clusters and `...`
+        // (16 two-column clusters make 32: a 17th would not fit, so the row is 38 columns).
+        let samples: [(&str, usize, usize); 6] = [
+            ("\u{fe10}", 16, 38),
+            ("\u{1f680}", 16, 38),
+            ("\u{2764}\u{fe0f}", 16, 38),
+            (coder, 16, 38),
+            ("e\u{301}", 33, 39),
+            ("a\u{200b}", 33, 39),
+        ];
+        for (sample, kept, columns) in samples {
+            let board = json!({"running": 1, "endedTotal": 0, "agents": [
+                {"name": "w", "state": "running", "doing": sample.repeat(40), "age": 5, "unread": 0}
+            ]});
+            let rows = plain(&board, W40);
+            assert_eq!(
+                rows[3],
+                format!("   {}...", sample.repeat(kept)),
+                "{sample:?}"
+            );
+            assert_eq!(sample_columns(&rows[3]), columns, "{sample:?}");
+        }
+        // A name of rockets is cut by columns too, and every row of every sample fits each width.
+        let rockets = json!({"running": 1, "endedTotal": 0, "agents": [
+            {"name": "\u{1f680}".repeat(20), "state": "running", "doing": "\u{fe10}".repeat(40), "age": 5, "unread": 0}
+        ]});
+        // 38 columns: glyph and space (2), the name cut to 22 (9 rockets and `...`, 21), 3 spaces, `working   5s`.
+        assert_eq!(
+            plain(&rockets, W40)[2],
+            format!(" \u{25c9} {}...   working   5s", "\u{1f680}".repeat(9))
+        );
+        for width in [55, 40, 20, 13, 12] {
+            for (sample, _, _) in samples {
+                let board = json!({"running": 1, "endedTotal": 1, "agents": [
+                    {"name": sample.repeat(12), "state": "running", "doing": sample.repeat(40), "age": 5, "unread": 0},
+                    {"name": sample.repeat(12), "state": "stopped", "age": 60}
+                ]});
+                for row in plain(&board, Size { width, height: 40 }) {
+                    assert!(sample_columns(&row) <= width, "{width} {sample:?}: {row:?}");
+                }
+            }
+        }
     }
 
     #[test]
