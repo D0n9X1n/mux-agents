@@ -197,8 +197,8 @@
 
 [watch, one frame]
 -N display-message -p -t %1 #{pid}|#{pane_pid}|#{session_id}|#{window_id}|#{@agent-id}
-# :1482
--N display-message -p -t %1 #{pane_id}|#{@agent-role}
+# :1482; S2 (#37): the probe also reads the pane's size, so each frame is laid out at its actual width and height
+-N display-message -p -t %1 #{pane_id}|#{@agent-role}|#{pane_width}|#{pane_height}
 # 0.2.3 (S1, #47): only the watch the record names, by its own pane and process, reads its window and repairs it;
 # the record is proven like any other: its pane runs this watch's pid, and the pid is this watch with that start
 -N show-options -qv -t $3 @mux-agents-sidebar-id

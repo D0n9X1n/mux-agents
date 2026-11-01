@@ -403,10 +403,13 @@ exec claude --dangerously-skip-permissions
             self.dir.join(format!("frames.{}", &bar[1..]))
         }
 
-        /// The bar's redraws since `open_bar`: each frame starts with home and clear.
+        /// The bar's redraws since `open_bar`: each frame starts with synchronized output on and home (S2.8).
         fn frames(&self, bar: &str) -> usize {
             std::fs::read(self.frames_path(bar)).map_or(0, |bytes| {
-                bytes.windows(7).filter(|w| *w == b"\x1b[H\x1b[2J").count()
+                bytes
+                    .windows(11)
+                    .filter(|w| *w == b"\x1b[?2026h\x1b[H")
+                    .count()
             })
         }
 
