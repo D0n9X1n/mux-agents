@@ -722,6 +722,16 @@ mod tests {
         assert_eq!(read_mail(&w.ctx, &caller, "pane-1").unwrap().len(), 1);
     }
 
+    // (the stored message's body, its kind and exitCode if any, the notice tried, notice.json's three fields after)
+    type Delivered = (&'static str, Option<Value>, Notice, (Value, Value, Value));
+    // (createdAt, launcher.json, notice.json already, the marker's kind and code after if any)
+    type Uncommitted = (
+        &'static str,
+        Option<Value>,
+        bool,
+        Option<(&'static str, Value)>,
+    );
+
     // notice.json as (kind, exitCode, closedBy).
     fn marker_of(folder: &std::path::Path) -> (Value, Value, Value) {
         let marker = crate::state::fs::read_json(&folder.join("notice.json"))
@@ -758,7 +768,7 @@ mod tests {
     fn notice_follows_the_message_already_delivered() {
         let gone = "worker is gone: its pane closed without an exit record.";
         // (the stored message's body and fields, the notice this post tries, the notice.json it must write)
-        let cases: Vec<(&str, Option<Value>, Notice, (Value, Value, Value))> = vec![
+        let cases: Vec<Delivered> = vec![
             // A message with kind and exitCode decides, whatever this post says.
             (
                 "worker was stopped.",
@@ -1186,7 +1196,7 @@ mod tests {
             "2026-10-29T11:59:30.0000000Z",
         );
         // (createdAt, launcher.json, notice.json already, the marker kind and code after, a message posted)
-        let cases: Vec<(&str, Option<Value>, bool, Option<(&str, Value)>)> = vec![
+        let cases: Vec<Uncommitted> = vec![
             (old, None, false, Some(("lost", Value::Null))),
             (
                 old,

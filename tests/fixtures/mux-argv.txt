@@ -107,6 +107,9 @@
 [stop worker]
 -N display-message -p -t %1 #{pid}|#{pane_pid}|#{session_id}|#{window_id}|#{@agent-id}
 -N list-panes -s -t $3 -F <marker>|#{pane_id}|#{window_id}|#{pane_pid}|#{pane_dead}|#{@agent-id}|#{@agent-name}|<marker>
+# 0.2.2: stop reaps first (the gone probe of %8), then re-checks its own pane under the notice lock
+-N display-message -p -t %8 #{pane_id}|#{@agent-id}
+-N display-message -p -t %9 #{pane_id}|#{@agent-id}
 # :1409
 -N kill-pane -t %9
 

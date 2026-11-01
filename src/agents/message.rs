@@ -173,32 +173,46 @@ const POLL: Duration = Duration::from_millis(500);
 const TREE_MAX: usize = 256;
 
 /// Closes a live agent's pane, then stops any survivor of the pane's process tree (same pid and start only). Its
-/// parent or a human may stop it. Posts the `stopped` notice and returns the resume command.
+/// parent or a human may stop it. Posts the `stopped` notice and returns the resume command. Runs a reap first. A
+/// name with no live agent but an ended one (the newest, any of them) answers `already:<state>` and closes nothing;
+/// so does a live one found ended under its notice lock, before any kill or signal: a notice already posted, or its
+/// pane gone (then noticed here, as a reap would).
 pub fn stop(ctx: &Ctx, request: &Request) -> Res<Map<String, Value>> {
     let caller = resolve(ctx)?;
-    let pane = find_pane(ctx, &caller, first(request))?;
-    let Some(record) = registry::record(ctx, &caller, &pane.id)? else {
-        return refuse(2, "target", "no live agent has that name");
-    };
-    if caller.kind == Kind::Agent
-        && record.get("parentPane").and_then(Value::as_str) != Some(caller.pane.as_str())
-    {
-        return refuse(
-            2,
-            "parent",
-            "only the parent or a human can stop this agent",
-        );
+    let name = first(request);
+    let none = || refuse(2, "target", "no live agent has that name");
+    if !super::agent_name(name) {
+        return none();
     }
+    let live = registry::live_after_reap(ctx, &caller)?;
+    let Some(pane) = live.iter().find(|p| p.name == name).cloned() else {
+        return match super::board::newest_ended(ctx, &caller, &live, name)? {
+            Some((_, record, state)) => {
+                parent_or_human(&caller, &record)?;
+                let pane = text(record.get("pane"));
+                Ok(already(&record, pane, &state))
+            }
+            None => none(),
+        };
+    };
+    let Some(record) = registry::record(ctx, &caller, &pane.id)? else {
+        return none();
+    };
+    parent_or_human(&caller, &record)?;
     // A pane pid that is not a number would walk from pid 0, whose "children" are unrelated processes.
     let root: u32 = pane
         .pid
         .parse()
         .map_err(|_| Refusal::internal("the pane pid is not a number"))?;
-    let launcher = server_dir(ctx, &caller)
-        .join("agents")
-        .join(&pane.id)
-        .join("launcher.json");
+    let folder = server_dir(ctx, &caller).join("agents").join(&pane.id);
+    let launcher = folder.join("launcher.json");
+    let marker = folder.join("notice.json");
     let left = lock(ctx, &lock_key("notice", &caller, &pane.id), || {
+        // Ended since it was resolved: a notice is there, or the pane is gone and gets its one notice now.
+        registry::post_if_gone(ctx, &caller, &pane.id, &record)?;
+        if let Some(notice) = read_json(&marker)? {
+            return Ok(Err(text(notice.get("kind"))));
+        }
         let table = ctx.os.table()?;
         // The pane's process must be the agent's own launcher: launcher.json's pid and start, the table's start, and
         // the start of the process the pid opens now, all one. A launcher that never recorded itself, or a pane pid
@@ -259,14 +273,12 @@ pub fn stop(ctx: &Ctx, request: &Request) -> Res<Map<String, Value>> {
             }
         }
         add_notice(ctx, &caller, &pane.id, &record, Notice::Stopped)?;
-        Ok(left)
+        Ok(Ok(left))
     })?;
-    let client = if text(record.get("client")).eq_ignore_ascii_case("claude") {
-        "claude"
-    } else {
-        "copilot"
+    let left = match left {
+        Ok(left) => left,
+        Err(state) => return Ok(already(&record, pane.pane, &state)),
     };
-    let resume = format!("{client} --resume {}", text(record.get("sessionId")));
     let mut reply = Map::new();
     reply.insert(
         "name".into(),
@@ -278,8 +290,49 @@ pub fn stop(ctx: &Ctx, request: &Request) -> Res<Map<String, Value>> {
         "directory".into(),
         record.get("directory").cloned().unwrap_or(Value::Null),
     );
-    reply.insert("resume".into(), resume.into());
+    reply.insert("resume".into(), resume(&record).into());
     Ok(reply)
+}
+
+/// Refuses an agent caller that is not the record's parent.
+fn parent_or_human(caller: &crate::caller::Caller, record: &Value) -> Res<()> {
+    if caller.kind == Kind::Agent
+        && record.get("parentPane").and_then(Value::as_str) != Some(caller.pane.as_str())
+    {
+        return refuse(
+            2,
+            "parent",
+            "only the parent or a human can stop this agent",
+        );
+    }
+    Ok(())
+}
+
+/// `<client> --resume <sessionId>`.
+fn resume(record: &Value) -> String {
+    let client = if text(record.get("client")).eq_ignore_ascii_case("claude") {
+        "claude"
+    } else {
+        "copilot"
+    };
+    format!("{client} --resume {}", text(record.get("sessionId")))
+}
+
+/// The reply for an agent that had already ended: nothing closed, signalled or noticed.
+fn already(record: &Value, pane: String, state: &str) -> Map<String, Value> {
+    let mut reply = Map::new();
+    reply.insert(
+        "name".into(),
+        record.get("name").cloned().unwrap_or(Value::Null),
+    );
+    reply.insert("pane".into(), pane.into());
+    reply.insert("already".into(), state.into());
+    reply.insert(
+        "directory".into(),
+        record.get("directory").cloned().unwrap_or(Value::Null),
+    );
+    reply.insert("resume".into(), resume(record).into());
+    reply
 }
 
 /// The pane's process and its descendants, breadth first, at most 256. A child that started before its parent is
@@ -1121,5 +1174,161 @@ mod tests {
                 "table", "open 300", "open 310", "open 320", "kill 300", "kill 320"
             ]
         );
+    }
+
+    fn kill_panes(w: &World) -> usize {
+        w.fakes
+            .mux_calls()
+            .iter()
+            .filter(|c| c[1] == "kill-pane" || c[1] == "if-shell")
+            .count()
+    }
+
+    // The parent's mailbox lines as stored, without moving the read offset.
+    fn stored(w: &World) -> usize {
+        let path = w.state().join("mail").join("pane-1.jsonl");
+        std::fs::read_to_string(path)
+            .unwrap_or_default()
+            .lines()
+            .count()
+    }
+
+    #[test]
+    fn stop_an_ended_agent_answers_already() {
+        for (kind, code) in [
+            ("exited", json!(3)),
+            ("stopped", Value::Null),
+            ("lost", Value::Null),
+        ] {
+            let w = World::human("");
+            let folder = w.agent_record("bbbbbbbbbbbb", json!({}));
+            write(
+                &folder.join("notice.json"),
+                json!({"kind": kind, "exitCode": code, "at": "2026-10-29T11:00:00.0000000Z"}),
+            );
+            w.panes(&[]);
+            w.fakes.clear_log();
+            let before = std::fs::read(folder.join("notice.json")).unwrap();
+            assert_eq!(
+                run(&w, stop, &["stop", "worker"]),
+                format!(
+                    r#"ok {{"name":"worker","pane":"%9","already":"{kind}","directory":"/work","resume":"claude --resume {SESSION_ID}"}}"#
+                ),
+                "{kind}"
+            );
+            // No kill, no signal, no notice.
+            assert_eq!(kill_panes(&w), 0, "{kind}");
+            assert!(proc_calls(&w).is_empty(), "{kind}");
+            assert_eq!(std::fs::read(folder.join("notice.json")).unwrap(), before);
+            assert_eq!(stored(&w), 0, "{kind}");
+        }
+        // Only its parent or a human, as for a live one.
+        let w = World::agent(ID);
+        w.uncommitted(ID, json!({"name": "me", "pane": "%1"}));
+        let folder = w.agent_record("bbbbbbbbbbbb", json!({"parentPane": "%7"}));
+        write(
+            &folder.join("notice.json"),
+            json!({"kind": "lost", "exitCode": null, "at": "x"}),
+        );
+        w.panes(&[]);
+        assert_eq!(
+            run(&w, stop, &["stop", "worker"]),
+            "2 parent only the parent or a human can stop this agent"
+        );
+    }
+
+    #[test]
+    fn stop_picks_live_then_newest_ended() {
+        // A live agent and an ended one with one name: the live one is stopped.
+        let w = stop_world(false, json!({}));
+        let ended = w.agent_record("cccccccccccc", json!({"pane": "%4"}));
+        write(
+            &ended.join("notice.json"),
+            json!({"kind": "lost", "exitCode": null, "at": "2026-10-29T11:59:00.0000000Z"}),
+        );
+        w.fakes.process(testing::row(300, 900, 3000));
+        w.fakes.kill_ok(300);
+        let reply = run(&w, stop, &["stop", "worker"]);
+        assert!(!reply.contains("already"), "{reply}");
+        assert_eq!(read_mail_of(&w, "pane-1"), ["worker was stopped."]);
+
+        // Two ended `worker`s beyond the 10 shown, 11 newer agents ahead of them: the newer of the two answers.
+        let w = World::human("");
+        for n in 0..11u32 {
+            let folder = w.agent_record(
+                &format!("{n:012x}"),
+                json!({"name": format!("a{n}"), "pane": format!("%{}", 20 + n)}),
+            );
+            write(
+                &folder.join("notice.json"),
+                json!({"kind": "stopped", "exitCode": null, "at": format!("2026-10-29T11:{:02}:00.0000000Z", 10 + n)}),
+            );
+        }
+        for (id, pane, kind, at) in [
+            ("bbbbbbbbbbbb", "%8", "stopped", "10:00"),
+            ("cccccccccccc", "%7", "exited", "10:30"),
+        ] {
+            let folder = w.agent_record(id, json!({"pane": pane}));
+            write(
+                &folder.join("notice.json"),
+                json!({"kind": kind, "exitCode": 0, "at": format!("2026-10-29T{at}:00.0000000Z")}),
+            );
+        }
+        w.panes(&[]);
+        let reply = run(&w, stop, &["stop", "worker"]);
+        assert!(
+            reply.contains(r#""pane":"%7","already":"exited""#),
+            "{reply}"
+        );
+        // No match at all: target, as before.
+        assert_eq!(run(&w, stop, &["stop", "nobody"]), NONE);
+    }
+
+    #[test]
+    fn stop_rechecks_under_the_notice_lock() {
+        // A reap posts its notice while stop waits for the lock: already, no kill, no signal, no second notice.
+        let w = stop_world(false, json!({}));
+        w.fakes.process(testing::row(300, 900, 3000));
+        w.fakes.kill_ok(300);
+        let caller = w.caller();
+        let notice = lock_key("notice", &caller, "bbbbbbbbbbbb");
+        let marker = w.folder("bbbbbbbbbbbb").join("notice.json");
+        let (raced, ctx_marker) = (std::cell::Cell::new(false), marker.clone());
+        w.fakes.lock_probe(move |event| {
+            if event == format!("+{notice}") && !raced.get() {
+                raced.set(true);
+                write(
+                    &ctx_marker,
+                    json!({"kind": "exited", "exitCode": 0, "at": "x"}),
+                );
+            }
+            String::new()
+        });
+        w.fakes.clear_log();
+        let reply = run(&w, stop, &["stop", "worker"]);
+        assert!(reply.contains(r#""already":"exited""#), "{reply}");
+        assert_eq!(kill_panes(&w), 0);
+        assert!(proc_calls(&w).is_empty());
+        assert_eq!(stored(&w), 0);
+
+        // The pane closed (no launcher notice) after stop resolved it: stop posts the one notice itself, lost.
+        let w = stop_world(false, json!({}));
+        w.fakes.process(testing::row(300, 900, 3000));
+        w.fakes.kill_ok(300);
+        w.fakes
+            .mux_rule("-t %9 #{pane_id}|#{@agent-id}", 0, "|\n", "");
+        w.fakes.clear_log();
+        let reply = run(&w, stop, &["stop", "worker"]);
+        assert!(reply.contains(r#""already":"lost""#), "{reply}");
+        assert_eq!(kill_panes(&w), 0);
+        assert!(proc_calls(&w).is_empty());
+        assert_eq!(
+            read_mail_of(&w, "pane-1"),
+            ["worker is gone: its pane closed without an exit record."]
+        );
+        let written = crate::state::fs::read_json(&w.folder("bbbbbbbbbbbb").join("notice.json"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(written["closedBy"], "pane");
     }
 }

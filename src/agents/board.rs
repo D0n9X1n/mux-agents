@@ -104,6 +104,25 @@ pub fn board(
 const ENDED_MAX: usize = 10;
 const ENDED: [&str; 3] = ["exited", "stopped", "lost"];
 
+/// The newest ended agent named `name` of the caller's session that is not live, as (id, record, state): any of
+/// them, not only the 10 a board shows. Newest notice first, then by id, as the board orders them.
+pub(crate) fn newest_ended(
+    ctx: &Ctx,
+    caller: &Caller,
+    live: &[Pane],
+    name: &str,
+) -> Res<Option<(String, Value, String)>> {
+    let mut ended: Vec<Ended> = ended(ctx, caller, live)?
+        .into_iter()
+        .filter(|end| end.record.get("name").and_then(Value::as_str) == Some(name))
+        .collect();
+    ended.sort_by(|a, b| b.at.cmp(&a.at).then_with(|| a.id.cmp(&b.id)));
+    Ok(ended
+        .into_iter()
+        .next()
+        .map(|end| (end.id, end.record, end.kind)))
+}
+
 fn same_session(record: &Value, caller: &Caller) -> bool {
     record.get("session").and_then(Value::as_str) == Some(caller.session.as_str())
 }
@@ -502,7 +521,7 @@ mod tests {
         assert_eq!(lost["name"], "vanished");
         // After the 15 row fields, so they keep their places.
         assert_eq!(
-            lost.iter().map(|(k, v)| (k.as_str(), v)).last(),
+            lost.iter().map(|(k, v)| (k.as_str(), v)).next_back(),
             Some(("closedBy", &json!("pane")))
         );
         assert!(rows[1].get("closedBy").is_none(), "{}", rows[1]);
