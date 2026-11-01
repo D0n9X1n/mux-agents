@@ -230,7 +230,19 @@ impl Server {
             start: None,
             killed: false,
         };
-        assert!(out.status.success(), "{mux:?} new-session: {out:?}");
+        // Seen once on rmux 0.10.0 under the parallel suite and never reproduced (5 full runs, 2 suites at once,
+        // 64 threads): "failed to spawn pane shell: pty syscall failed: Unknown error: -6". Named, not retried.
+        let pty =
+            mux == Mux::Rmux && String::from_utf8_lossy(&out.stderr).contains("pty syscall failed");
+        assert!(
+            out.status.success(),
+            "{mux:?} new-session: {out:?}{}",
+            if pty {
+                " (a transient pty-allocation failure inside rmux, not mux-agent; not retried)"
+            } else {
+                ""
+            }
+        );
         let panes = server.call(&["list-panes", "-a", "-F", "#{pane_id} #{pane_pid} #{pid}"]);
         let fields: Vec<&str> = panes.split_whitespace().collect();
         assert_eq!(fields.len(), 3, "{mux:?} list-panes: {panes:?}");
@@ -754,7 +766,7 @@ impl Drop for Server {
 }
 
 /// SIGKILLs each process still alive with its recorded start, on drop; a test's own sentinels only.
-struct Sentinels(Vec<(u32, Option<i64>)>);
+pub struct Sentinels(pub Vec<(u32, Option<i64>)>);
 
 impl Drop for Sentinels {
     fn drop(&mut self) {

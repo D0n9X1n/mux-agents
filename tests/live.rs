@@ -970,7 +970,11 @@ exec claude --dangerously-skip-permissions
         );
     }
 
-    // stop closes each pane and leaves no process of it: no quit file, no kill bypass.
+    // stop closes each pane and leaves no process of it unaccounted for: no quit file, no kill bypass. w1's worker
+    // has a child that outlives the pane (its own session, SIGHUP ignored), so kill-pane's hangup never ends it and
+    // only stop's tree walk can. With a pidfd (Linux) stop kills it and reports no survivor. Without one (macOS) the
+    // proc layer never signals a pid (MacOs::kill, pinned in src/proc/macos.rs), so stop must report it as the one
+    // survivor, and it is still there.
     fn stop_leaves_no_surviving_process(mux: Mux) {
         let Some(mut live) = Live::human(mux) else {
             return;
@@ -983,14 +987,44 @@ exec claude --dangerously-skip-permissions
             pids.push(launcher["pid"].as_u64().unwrap() as u32);
             panes.push(s(&w["pane"]).to_string());
         }
+        let worker = u64::from(pids[0]);
+        let (code, detached) = live.server.command(worker, &["@detach"]);
+        assert_eq!(code, 0, "{mux:?} {detached}");
+        let child = detached["pid"].as_u64().unwrap() as u32;
+        let child_start = support::start_of(child);
+        // Killed when the test ends, whatever happened: it outlives the server and is outside its tree by then.
+        let _child = support::Sentinels(vec![(child, child_start)]);
+        let row = mux_agent::proc::host()
+            .row(child)
+            .expect("the detached child");
+        assert_eq!(
+            u64::from(row.ppid),
+            worker,
+            "{mux:?}: not the worker's child"
+        );
         for name in ["w1", "w2"] {
             let (code, stop) = live.run(&["stop", name]);
             assert_eq!(code, 0, "{mux:?} {stop}");
+            let survivors = if name == "w1" && cfg!(target_os = "macos") {
+                json!([child])
+            } else {
+                json!([])
+            };
             assert_eq!(
                 (&stop["survivors"], &stop["survivorPids"]),
-                (&json!(0), &json!([])),
-                "{mux:?}"
+                (&json!(survivors.as_array().unwrap().len()), &survivors),
+                "{mux:?} {name}"
             );
+        }
+        let child_left = || support::alive(child) && support::start_of(child) == child_start;
+        if cfg!(target_os = "macos") {
+            assert!(
+                child_left(),
+                "{mux:?}: stop signalled a pid without a pidfd"
+            );
+        } else {
+            eventually(Duration::from_secs(10), || !child_left());
+            assert!(!child_left(), "{mux:?}: the child outlived stop");
         }
         for pane in &panes {
             live.wait_gone(pane);
