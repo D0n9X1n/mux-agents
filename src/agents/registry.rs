@@ -130,6 +130,30 @@ pub fn record(ctx: &Ctx, caller: &Caller, id: &str) -> Res<Option<Value>> {
     Ok(crate::state::fs::read_json(&path)?.filter(Value::is_object))
 }
 
+/// The name of every agent record of the caller's session under this state root, live or ended, any age: a name
+/// is never reused in its session. A record that is unreadable, or whose id is not its folder's, names none.
+pub(crate) fn recorded_names(ctx: &Ctx, caller: &Caller) -> Res<Vec<String>> {
+    let agents = super::server_dir(ctx, caller).join("agents");
+    let entries = match std::fs::read_dir(&agents) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(e.into()),
+    };
+    let mut names = Vec::new();
+    for entry in entries {
+        let Some(id) = entry?.file_name().to_str().map(str::to_string) else {
+            continue;
+        };
+        let Ok(Some(record)) = own_record(ctx, caller, &id) else {
+            continue;
+        };
+        if let Some(name) = record.get("name").and_then(Value::as_str) {
+            names.push(name.to_string());
+        }
+    }
+    Ok(names)
+}
+
 /// The live committed agent named `name` in the caller's session; refuses 2 `target` otherwise.
 pub fn find_pane(ctx: &Ctx, caller: &Caller, name: &str) -> Res<Pane> {
     let none = || refuse(2, "target", "no live agent has that name");

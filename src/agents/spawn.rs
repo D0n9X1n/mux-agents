@@ -246,7 +246,13 @@ impl Launch<'_> {
         if live.len() >= CAP {
             return refuse(2, "cap", "the session already has 6 live agents");
         }
-        let taken: Vec<&str> = live.iter().map(|p| p.name.as_str()).collect();
+        // Taken: the live panes' names and every recorded name of the session in this state root.
+        let recorded = registry::recorded_names(ctx, caller)?;
+        let taken: Vec<&str> = live
+            .iter()
+            .map(|p| p.name.as_str())
+            .chain(recorded.iter().map(String::as_str))
+            .collect();
         let name = resolve_name(self.requested, self.client, &self.task, &taken)?;
         let mut plan = context_plan(caller, self.client, &ctx.env, self.no_fork);
         let session = guid()?;
@@ -1168,6 +1174,66 @@ mod tests {
         w.panes(&five.iter().map(String::as_str).collect::<Vec<_>>());
         let ok = reply(&run(&w, &["-Client", "claude", "-Task", "just it"]));
         assert_eq!(ok["name"], "claude-6");
+    }
+
+    // An ended agent, noticed so reap leaves it be; its name is taken until the state root is cleared.
+    fn ended(w: &World, id: &str, fields: Value) {
+        let folder = w.agent_record(id, fields);
+        crate::agents::fixture::write(
+            &folder.join("notice.json"),
+            json!({"kind": "exited", "at": "1970-01-01T00:00:00.0000000Z"}),
+        );
+    }
+
+    #[test]
+    fn ended_agents_names_stay_taken() {
+        // An ended `add-subtract`: a task deriving it gets -2; with -2 live too, -3.
+        let w = human();
+        ended(&w, "000000000b01", json!({"name": "add-subtract"}));
+        let ok = reply(&run(&w, &["-Client", "claude", "-Task", "Add subtract"]));
+        assert_eq!(ok["name"], "add-subtract-2");
+        let w = human();
+        ended(&w, "000000000b01", json!({"name": "add-subtract"}));
+        w.panes(&["%21|@21|321|000000000b02|add-subtract-2"]);
+        let ok = reply(&run(&w, &["-Client", "claude", "-Task", "add subtract"]));
+        assert_eq!(ok["name"], "add-subtract-3");
+        // Eleven ended, more than a board shows: the oldest name is still taken, by -Name too, without case.
+        let w = human();
+        for n in 1..=11u32 {
+            let at = format!("1970-01-01T00:00:{n:02}.0000000Z");
+            ended(
+                &w,
+                &format!("{:012x}", 0xc00 + n),
+                json!({"name": format!("w{n}"), "createdAt": at}),
+            );
+        }
+        assert_eq!(
+            run(&w, &["-Client", "claude", "-Task", "hi", "-Name", "w1"]),
+            "2 name agent name is taken, try w1-2"
+        );
+        assert!(calls(&w, "new-window").is_empty());
+        ended(&w, "000000000b03", json!({"name": "Worker"}));
+        assert_eq!(
+            run(&w, &["-Client", "claude", "-Task", "hi", "-Name", "worker"]),
+            "2 name agent name is taken, try worker-2"
+        );
+        // Another session's record, a record whose id is not its folder's, and an unreadable one name nothing.
+        let w = human();
+        ended(
+            &w,
+            "000000000b04",
+            json!({"name": "add-subtract", "session": "$4"}),
+        );
+        ended(
+            &w,
+            "000000000b05",
+            json!({"name": "add-subtract", "id": "000000000b06"}),
+        );
+        let broken = w.folder("000000000b07");
+        std::fs::create_dir_all(&broken).unwrap();
+        std::fs::write(broken.join("record.json"), "{").unwrap();
+        let ok = reply(&run(&w, &["-Client", "claude", "-Task", "add subtract"]));
+        assert_eq!(ok["name"], "add-subtract");
     }
 
     #[test]
