@@ -213,6 +213,9 @@ fn failure(verb: Option<&str>, refusal: &Refusal) -> Map<String, Value> {
     reply.insert("code".into(), refusal.code.into());
     reply.insert("check".into(), refusal.check.into());
     reply.insert("message".into(), refusal.message.clone().into());
+    if let Some(reason) = refusal.reason {
+        reply.insert("reason".into(), reason.into());
+    }
     reply
 }
 
@@ -837,6 +840,42 @@ mod tests {
         assert_eq!((code, out), (2, reply_fixture("TAGGED_JSON")));
         let (code, out) = call(&w, &["spawn", "-Client", "claude", "-Task", "hi", "-Text"]);
         assert_eq!((code, out), (2, reply_fixture("TAGGED_TEXT")));
+    }
+
+    #[test]
+    fn policy_refusal_reason_follows_message() {
+        let home = TempDir::new();
+        let w = claude_world(&home);
+        w.fakes
+            .mux_first("capture-pane", 0, "work\n  \u{23f8} plan mode on\n", "");
+        let spawn = [
+            "spawn",
+            "-Client",
+            "claude",
+            "-TaskFile",
+            "t.md",
+            "-BriefFile",
+            "b.md",
+        ];
+        let message = "the caller's live policy is not full bypass (screen: other mode)";
+        assert_eq!(
+            call(&w, &spawn),
+            (
+                2,
+                format!(
+                    r#"{{"ok":false,"verb":"spawn","code":2,"check":"policy","message":"{message}","reason":"screen: other mode"}}"#
+                )
+            )
+        );
+        let mut text = spawn.to_vec();
+        text.push("-Text");
+        assert_eq!(
+            call(&w, &text),
+            (
+                2,
+                format!("code: 2\ncheck: policy\nmessage: {message}\nreason: screen: other mode")
+            )
+        );
     }
 
     #[test]

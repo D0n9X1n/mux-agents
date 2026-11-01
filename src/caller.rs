@@ -92,6 +92,7 @@ fn endpoint_refusal(message: &str) -> Refusal {
         code: 1,
         check: "endpoint",
         message: message.into(),
+        reason: None,
     }
 }
 
@@ -100,6 +101,7 @@ fn caller_refusal(code: u8, message: &str) -> Refusal {
         code,
         check: "caller",
         message: message.into(),
+        reason: None,
     }
 }
 
