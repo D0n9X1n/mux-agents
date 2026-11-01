@@ -1255,7 +1255,7 @@ mod tests {
             format!("2 name agent record {id} cannot be read, so names cannot be checked");
         // A case's name and how it breaks the record.
         type Case<'a> = (&'a str, &'a dyn Fn(&World));
-        let cases: [Case; 5] = [
+        let cases: [Case; 7] = [
             ("not JSON", &|w| {
                 let folder = w.folder(id);
                 std::fs::create_dir_all(&folder).unwrap();
@@ -1273,6 +1273,17 @@ mod tests {
                 ended(w, id, json!({"name": "w", "id": "000000000b06"}));
             }),
             ("no name", &|w| ended(w, id, json!({"name": null}))),
+            // Only a record that names another session is skipped; one naming none could be this session's.
+            ("no session", &|w| {
+                ended(w, id, json!({"name": "w"}));
+                let path = w.folder(id).join("record.json");
+                let mut record = read_json(&path);
+                record.as_object_mut().unwrap().remove("session");
+                crate::agents::fixture::write(&path, record);
+            }),
+            ("a session that is not a string", &|w| {
+                ended(w, id, json!({"name": "w", "session": 3}))
+            }),
         ];
         for (case, make) in cases {
             let w = human();
