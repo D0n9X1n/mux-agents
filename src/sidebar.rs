@@ -23,6 +23,8 @@ const TICK: Duration = Duration::from_millis(2000);
 const UNKNOWN_MAX: u32 = 30;
 // The bar's own pane, its label and its size, read each tick (S2.1: the layout follows the actual pane).
 const WATCH_PROBE: &str = "#{pane_id}|#{@agent-role}|#{pane_width}|#{pane_height}";
+// The bar's own size, read again after the keeper moved or resized it, so the frame fits the pane as it is now.
+const SIZE_FORMAT: &str = "#{pane_id}|#{pane_width}|#{pane_height}";
 // What the bar's split answers: its pane, window and process (#47: the bar is that process, not its label).
 const SPLIT_FORMAT: &str = "#{pane_id}|#{window_id}|#{pane_pid}";
 // The proof read of the recorded pane: alive, and still the recorded process.
@@ -740,6 +742,8 @@ struct Keeper {
     failures: u32,
     // While repair is paused: the layout it paused on and when.
     paused: Option<(String, SystemTime)>,
+    // Whether this tick resized or moved the bar: its size is then read again before the frame is laid out.
+    acted: bool,
 }
 
 impl Keeper {
@@ -747,11 +751,22 @@ impl Keeper {
         self.paused.is_some()
     }
 
+    /// The bar's width as last set, when one was.
+    fn width(&self) -> Option<usize> {
+        self.applied.map(|window| bar_width(window) as usize)
+    }
+
     /// One read of the bar's window. A failed or malformed read, or one without the bar, does nothing; so does a
     /// zoomed window, since resizing a pane unzooms it. A pause re-arms when the layout changed or 60 s passed. A bar
     /// in place gets its width when the window's width differs from the one last applied for; a bar out of place is
-    /// repaired unless paused.
-    fn tick(&mut self, ctx: &Ctx, bar: &str) {
+    /// repaired unless paused. True when it resized or moved the bar.
+    fn tick(&mut self, ctx: &Ctx, bar: &str) -> bool {
+        self.acted = false;
+        self.check(ctx, bar);
+        self.acted
+    }
+
+    fn check(&mut self, ctx: &Ctx, bar: &str) {
         let Some(layout) = read_layout(ctx, bar) else {
             return;
         };
@@ -793,6 +808,7 @@ impl Keeper {
     /// Sets the bar's width for a window `window` wide; remembered only when the multiplexer took it.
     fn resize(&mut self, ctx: &Ctx, bar: &str, window: u32) {
         let width = bar_width(window).to_string();
+        self.acted = true;
         if native(ctx, &["resize-pane", "-t", bar, "-x", &width], true).is_ok_and(|r| r.code == 0) {
             self.applied = Some(window);
         }
@@ -818,6 +834,7 @@ impl Keeper {
             self.fail(shape, now);
             return;
         }
+        self.acted = true;
         self.applied = None;
         self.resize(ctx, bar, layout.width);
         if let Some(active) = active {
@@ -870,6 +887,18 @@ fn probe_size(probe: &Output) -> Option<Size> {
     (width >= 1 && height >= 1).then_some(Size { width, height })
 }
 
+/// The bar's own size, read again (read only); none unless the answer names the bar and parses.
+fn read_size(ctx: &Ctx, bar: &str) -> Option<Size> {
+    let read = native(
+        ctx,
+        &["display-message", "-p", "-t", bar, SIZE_FORMAT],
+        true,
+    )
+    .ok()
+    .filter(|read| read.code == 0 && read.stdout.starts_with(&format!("{bar}|")))?;
+    probe_size(&read)
+}
+
 /// The side-bar loop for the caller's pane. Each tick asks the pane itself (and its size) and, when it answers,
 /// keeps it at the right edge of its window (`Keeper`; by its own pane, not its tag, since rmux 0.10.0's
 /// rotate-window leaves pane options behind), reads the board (ended rows with their exit codes, waiting and the
@@ -911,8 +940,16 @@ pub fn run_watch(
         if let Some(read) = live.and_then(probe_size) {
             size = read;
         }
-        if live.is_some() && own_record(ctx, caller) {
-            keeper.tick(ctx, &caller.pane);
+        if live.is_some() && own_record(ctx, caller) && keeper.tick(ctx, &caller.pane) {
+            // The keeper resized or moved the bar: lay out at its size now, else at the width it set.
+            match read_size(ctx, &caller.pane) {
+                Some(read) => size = read,
+                None => {
+                    if let Some(width) = keeper.width() {
+                        size.width = width;
+                    }
+                }
+            }
         }
         let mut failed = live.is_none();
         match board(ctx, caller, &reader, true, true) {
@@ -2030,6 +2067,8 @@ mod tests {
                 };
                 match answer {
                     "live" => Ok(out(0, "%7|sidebar|40|24\n", "")),
+                    // The pane 55 columns wide, as a drag or the split leaves it before the keeper acts.
+                    "wide" => Ok(out(0, "%7|sidebar|55|24\n", "")),
                     // The pane 4 rows high.
                     "short" => Ok(out(0, "%7|sidebar|40|4\n", "")),
                     // The pane itself, without the bar's tag: watch run by hand in some pane.
@@ -2401,7 +2440,38 @@ mod tests {
             win.active = id;
             Ok(Output::default())
         });
+        // The bar's size as the window has it now (after any move or resize).
+        let s = shared.clone();
+        w.fakes.mux_script(SIZE_FORMAT, move |argv| {
+            let win = s.borrow();
+            Ok(match win.panes.iter().find(|p| p.id == argv[4]) {
+                Some(p) => out(0, &format!("{}|{}|{}\n", p.id, p.width, p.height), ""),
+                None => out(1, "", "can't find pane\n"),
+            })
+        });
         (w, shared)
+    }
+
+    #[test]
+    fn the_frame_is_laid_out_after_the_keeper_resized_the_bar() {
+        // The probe reads 55 columns; the window is 136, so the keeper sets the bar to 40 before the frame is drawn.
+        // The frame is the 40-column one, never a 54-column header in a 40-column pane.
+        let wide = || {
+            let mut win = win("%1", vec![r("%1", 0, 0, 80, 50), r("%7", 81, 0, 55, 50)]);
+            win.width = 136;
+            win
+        };
+        let (w, state) = keep_world(&["wide", "gone"], wide());
+        let (ended, frames) = watch_run(&w);
+        assert_eq!(ended, "pane-closed");
+        assert_eq!(kept(&w), [RESIZE]);
+        assert_eq!(state.borrow().panes[1].width, 40);
+        assert_eq!(frames, [board_frame()]);
+        // When the size cannot be read again, the width the keeper set is used.
+        let (w, _) = keep_world(&["wide", "gone"], wide());
+        w.fakes.mux_first(SIZE_FORMAT, 1, "", "no server");
+        let (_, frames) = watch_run(&w);
+        assert_eq!(frames, [board_frame()]);
     }
 
     // The lock's own calls: move-pane, resize-pane, the active check and select-pane.
