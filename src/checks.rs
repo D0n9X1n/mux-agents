@@ -1950,14 +1950,17 @@ mod tests {
 
     #[test]
     fn policy_claude_lowest_mode_line_decides() {
-        // Any other mode below an older bypass badge refuses, its words in any case.
+        // Any other mode below an older bypass badge refuses at once, its words in any case: one capture, no sleep.
         for badge in OTHER_BADGES {
             for badge in [badge.to_string(), badge.to_uppercase()] {
                 let case = Claude {
                     screen: Some(format!("{BYPASS}\nwork\n  {badge} (shift+tab to cycle)\n")),
                     ..Claude::default()
                 };
-                assert_eq!(claude_policy(case), "screen: other mode", "{badge}");
+                let (_home, fakes, ctx) = claude_setup(&case);
+                assert_eq!(claude_answer(&ctx), "screen: other mode", "{badge}");
+                assert_eq!(fakes.slept(), Vec::<u64>::new(), "{badge}");
+                assert_eq!(captures(&fakes), 1, "{badge}");
             }
         }
         // Text naming bypass is no mode line: alone it shows no mode, and below another mode it hides nothing.
