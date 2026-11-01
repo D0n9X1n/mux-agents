@@ -101,7 +101,17 @@ test('parseList maps every failure to undefined and cleans every string', () => 
   expect(parseList(0, '{"ok":true,"verb":"list","agents":[]}')).toBe(undefined)
   expect(parseList(0, '{"ok":true,"verb":"list","running":0}')).toBe(undefined)
   const dirty = JSON.stringify({ ok: true, running: 1, agents: [{ name: 'a\u001b', client: 'c\u0007', state: 's\u009b', doing: 'd\te', age: 1 }] })
-  expect(parseList(0, dirty)).toEqual({ running: 1, agents: [{ name: 'a', client: 'c', state: 's', doing: 'd e', age: 1 }] })
+  expect(parseList(0, dirty)).toEqual({ running: 1, agents: [{ name: 'a', client: 'c', state: 's', doing: 'd e', age: 1, model: null }] })
+})
+
+test('parseList keeps a chosen model, cleaned, and null for an inherited one', () => {
+  const rows = [
+    { name: 'a', client: 'claude', state: 'running', doing: null, age: 1, model: 'son\u001bnet' },
+    { name: 'b', client: 'claude', state: 'running', doing: null, age: 1, model: null },
+    { name: 'c', client: 'claude', state: 'running', doing: null, age: 1 },
+  ]
+  const parsed = parseList(0, JSON.stringify({ ok: true, verb: 'list', running: 3, agents: rows }))
+  expect(parsed?.agents.map(a => a.model)).toEqual(['sonnet', null, null])
 })
 
 test('formatAge uses s, m and h, floored', () => {
