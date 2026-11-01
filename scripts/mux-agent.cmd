@@ -1,7 +1,8 @@
 @echo off
 rem mux-agent entry shim: runs the first usable binary of MUX_AGENTS_BIN, scripts\bin\windows-<arch>\mux-agent.exe and
 rem target\release\mux-agent.exe, passing every argument and the exit code through. With none usable it prints an entry
-rem refusal and exits 1. No labels or goto: the repo checks this file out with LF endings, where label search is unreliable.
+rem refusal and exits 1. No labels or goto: git stores this file with LF endings (checked out CRLF), and a copy taken
+rem from the store or an archive keeps LF, where label search is unreliable.
 setlocal
 set "ARCH=%PROCESSOR_ARCHITECTURE%"
 if defined PROCESSOR_ARCHITEW6432 set "ARCH=%PROCESSOR_ARCHITEW6432%"

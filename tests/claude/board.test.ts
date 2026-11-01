@@ -3,7 +3,7 @@ import { expect, test } from 'claude-code/testing'
 import { clean, formatAge, isSpawn, parseList } from '../../hooks/board'
 import { SPAWN_JSON, SPAWN_TEXT, TAGGED_JSON, TAGGED_TEXT } from './spawn-replies'
 
-const E = 'pwsh -File "C:/p/scripts/mux-agent.ps1"'
+const E = 'sh "/p/scripts/mux-agent"'
 const LISTED = '{"ok":true,"verb":"list","running":0,"agents":[]}'
 
 test('isSpawn accepts every spawn form with a real spawn reply, JSON or -Text', () => {

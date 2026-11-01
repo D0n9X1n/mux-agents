@@ -925,3 +925,745 @@ fn no_pwsh_in_workflows() {
         }
     }
 }
+
+// Docs, version and repo rules (0.2.0): one version everywhere, nothing needs PowerShell, the README and the skill
+// name every platform, the wiki comes in English and Chinese twins, and the checks ported from the Pester suites of
+// a96b866 (icons, action pins, export-ignore, merge procedure, old name, wiki) live on here.
+
+const OWNER_WIKI: &str = "https://github.com/D0n9X1n/mux-agents/wiki/";
+
+/// Runs git in the repository: (exit 0, stdout).
+fn git(args: &[&str]) -> (bool, String) {
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(env!("CARGO_MANIFEST_DIR"))
+        .args(args)
+        .output()
+        .unwrap();
+    (
+        out.status.success(),
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+    )
+}
+
+fn tracked() -> Vec<String> {
+    git(&["ls-files"]).1.lines().map(String::from).collect()
+}
+
+/// A file's lines, CR dropped.
+fn file_lines(path: &str) -> Vec<String> {
+    repo_file(path)
+        .lines()
+        .map(|l| l.trim_end_matches('\r').to_string())
+        .collect()
+}
+
+fn json_file(path: &str) -> serde_json::Value {
+    serde_json::from_str(&repo_file(path)).unwrap()
+}
+
+/// `version` of Cargo.toml's [package] table.
+fn cargo_version() -> String {
+    let mut in_package = false;
+    for line in file_lines("Cargo.toml") {
+        let line = line.trim();
+        if line.starts_with('[') {
+            in_package = line == "[package]";
+        } else if in_package && let Some(v) = line.strip_prefix("version = \"") {
+            return v.trim_end_matches('"').to_string();
+        }
+    }
+    panic!("no [package] version in Cargo.toml");
+}
+
+/// Whether a line names PowerShell in any spelling: the shell, its files, its module tooling or Pester.
+fn names_powershell(line: &str) -> bool {
+    let l = line.to_lowercase();
+    [
+        "pwsh",
+        "powershell",
+        ".ps1",
+        ".psm1",
+        "install-module",
+        "pester",
+    ]
+    .iter()
+    .any(|w| l.contains(w))
+}
+
+/// The README may name PowerShell only to say none is needed.
+fn readme_line_ok(line: &str) -> bool {
+    let l = line.to_lowercase();
+    l.contains("no powershell")
+        && !["pwsh", ".ps1", ".psm1", "install-module", "pester"]
+            .iter()
+            .any(|w| l.contains(w))
+}
+
+/// The one PowerShell line the skill keeps: how a PowerShell caller runs the entry.
+const SKILL_PWSH_NOTE: &str = "The commands below, and the Reply and Listen lines, run as-is in the Bash tool. In PowerShell, prefix `& ` (`& \"<exe>\" send parent …`).";
+
+/// Hooks and their tests may name the old `mux-agent.ps1` (spawn detection keeps accepting a 0.1 command line) and
+/// Claude Code's `PowerShell` tool, whose calls the pane watches as it watches Bash.
+fn hook_line_ok(line: &str) -> bool {
+    line.to_lowercase().contains("mux-agent.ps1")
+        || line.contains(r"\.ps1")
+        || line.contains("'PowerShell'")
+        || line.contains("Bash or PowerShell")
+}
+
+#[test]
+fn plugin_version_is_0_2_0_and_matches_cargo() {
+    assert_eq!(json_file(".claude-plugin/plugin.json")["version"], "0.2.0");
+    assert_eq!(cargo_version(), "0.2.0");
+    let lock = repo_file("Cargo.lock").replace("\r\n", "\n");
+    assert!(
+        lock.contains("name = \"mux-agent\"\nversion = \"0.2.0\"\n"),
+        "Cargo.lock does not hold mux-agent 0.2.0"
+    );
+}
+
+#[test]
+fn no_pwsh_in_readme_skill_contributing_hooks() {
+    let mut bad = Vec::new();
+    for line in file_lines("README.md") {
+        if names_powershell(&line) && !readme_line_ok(&line) {
+            bad.push(format!("README.md: {line}"));
+        }
+    }
+    for line in file_lines("skills/mux-agents/SKILL.md") {
+        if names_powershell(&line) && line != SKILL_PWSH_NOTE {
+            bad.push(format!("SKILL.md: {line}"));
+        }
+    }
+    for path in ["CONTRIBUTING.md", ".github/pull_request_template.md"] {
+        for line in file_lines(path) {
+            if names_powershell(&line) {
+                bad.push(format!("{path}: {line}"));
+            }
+        }
+    }
+    for path in tracked().iter().filter(|p| {
+        p.starts_with("hooks/") || p.starts_with("tests/claude/") || p.starts_with("types/")
+    }) {
+        for line in file_lines(path) {
+            if names_powershell(&line) && !hook_line_ok(&line) {
+                bad.push(format!("{path}: {line}"));
+            }
+        }
+    }
+    assert!(bad.is_empty(), "{bad:#?}");
+    // The skill keeps its note; the pane runs the shim, never PowerShell; spawn detection still takes 0.1 lines.
+    assert!(file_lines("skills/mux-agents/SKILL.md").contains(&SKILL_PWSH_NOTE.to_string()));
+    let register = repo_file("hooks/register.tsx");
+    assert!(register.contains(
+        r"return ['cmd.exe', '/d', '/c', `${root}\\scripts\\mux-agent.cmd`, 'list', '-All']"
+    ));
+    assert!(register.contains("return ['sh', `${root}/scripts/mux-agent`, 'list', '-All']"));
+    assert!(repo_file("hooks/board.ts").contains(r"mux-agent(\.ps1|\.cmd|\.exe)?"));
+}
+
+#[test]
+fn readme_skill_name_every_platform_and_mux() {
+    let readme = file_lines("README.md");
+    let platforms = "- rmux 0.10 or later on macOS, Linux or Windows, or tmux 3.2 or later on macOS or Linux, with the caller inside a pane.";
+    assert!(
+        readme.contains(&platforms.to_string()),
+        "README requirements line"
+    );
+    assert!(
+        readme.iter().any(|l| l.contains("macOS")
+            && l.contains("Linux")
+            && l.contains("Windows")
+            && l.contains("no PowerShell")),
+        "README says it runs natively without PowerShell"
+    );
+    let skill = file_lines("skills/mux-agents/SKILL.md");
+    let when = skill
+        .iter()
+        .find(|l| l.starts_with("Use this skill inside "))
+        .expect("skill's when-to-use line");
+    for word in ["RMUX", "tmux 3.2", "Windows", "Linux", "macOS"] {
+        assert!(when.contains(word), "skill line lacks {word}: {when}");
+    }
+}
+
+#[test]
+fn tagline_shared() {
+    let readme = file_lines("README.md");
+    assert_eq!(readme[2], "# mux-agents");
+    // The tagline is the first paragraph after the title.
+    let tagline = &readme[4];
+    assert!(!tagline.is_empty() && readme[3].is_empty() && readme[5].is_empty());
+    assert_eq!(
+        json_file(".claude-plugin/plugin.json")["description"],
+        *tagline
+    );
+    assert_eq!(
+        json_file(".claude-plugin/marketplace.json")["plugins"][0]["description"],
+        *tagline
+    );
+}
+
+/// Every `](target)` and `src="target"` in a Markdown text.
+fn link_targets(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for (at, _) in text.match_indices("](") {
+        let rest = &text[at + 2..];
+        let end = rest.find([')', ' ', '\n', '\t']).unwrap_or(rest.len());
+        out.push(rest[..end].to_string());
+    }
+    for (at, _) in text.match_indices("src=\"") {
+        let rest = &text[at + 5..];
+        out.push(rest[..rest.find('"').unwrap_or(rest.len())].to_string());
+    }
+    out
+}
+
+#[test]
+fn readme_links_absolute() {
+    // A relative link breaks on the marketplace page and in a packaged copy (assets/ is export-ignored).
+    let targets = link_targets(&repo_file("README.md"));
+    assert!(!targets.is_empty());
+    let relative: Vec<&String> = targets
+        .iter()
+        .filter(|t| !t.starts_with("https://"))
+        .collect();
+    assert!(relative.is_empty(), "{relative:?}");
+    // The spawn example passes the brief an agent caller needs.
+    assert_eq!(
+        file_lines("README.md")
+            .iter()
+            .filter(|l| l.starts_with("| `spawn` |") && l.contains("-BriefFile"))
+            .count(),
+        1
+    );
+}
+
+/// The wiki pages, by name without `.md`, sorted. wiki/ is flat: the mirror publishes top-level pages only.
+fn wiki_pages() -> Vec<String> {
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("wiki");
+    let mut pages = Vec::new();
+    for entry in std::fs::read_dir(dir).unwrap() {
+        let entry = entry.unwrap();
+        let name = entry.file_name().into_string().unwrap();
+        assert!(
+            entry.file_type().unwrap().is_file(),
+            "wiki/{name} is not a file"
+        );
+        let page = name.strip_suffix(".md");
+        pages.push(page.unwrap_or_else(|| panic!("wiki/{name}")).to_string());
+    }
+    pages.sort();
+    pages
+}
+
+fn twin(page: &str) -> String {
+    match page.strip_suffix("-zh-CN") {
+        Some(english) => english.to_string(),
+        None => format!("{page}-zh-CN"),
+    }
+}
+
+fn wiki_text(page: &str) -> String {
+    repo_file(&format!("wiki/{page}.md")).replace("\r\n", "\n")
+}
+
+#[test]
+fn wiki_pairs_and_links() {
+    let pages = wiki_pages();
+    let (zh, en): (Vec<&String>, Vec<&String>) = pages.iter().partition(|p| p.ends_with("-zh-CN"));
+    assert!(!en.is_empty() && !zh.is_empty());
+    let mut bad = Vec::new();
+    for page in &pages {
+        let other = twin(page);
+        if !pages.contains(&other) {
+            bad.push(format!("{page}: no twin {other}"));
+        }
+        let text = wiki_text(page);
+        let head: String = text.lines().take(5).collect::<Vec<_>>().join("\n");
+        if !head.contains(&format!("({other})"))
+            && !head.contains(&format!("({OWNER_WIKI}{other})"))
+        {
+            bad.push(format!(
+                "{page}: no link to {other} in its first five lines"
+            ));
+        }
+        for target in link_targets(&text) {
+            let scheme = target.split_once(':').is_some_and(|(s, _)| {
+                !s.is_empty()
+                    && s.chars()
+                        .all(|c| c.is_ascii_alphanumeric() || "+.-".contains(c))
+            });
+            if page.starts_with("Release-") && !target.starts_with("https://") {
+                // Release notes become a release body on github.com, where a wiki-relative link breaks.
+                bad.push(format!("{page}: relative link {target}"));
+            } else if !scheme && !target.starts_with('#') {
+                let name = target.split('#').next().unwrap();
+                if !pages.iter().any(|p| p == name) {
+                    bad.push(format!("{page}: broken link {target}"));
+                }
+            }
+        }
+    }
+    // Home links every page of its language.
+    for (home, list) in [("Home", &en), ("Home-zh-CN", &zh)] {
+        let targets = link_targets(&wiki_text(home));
+        for page in list.iter().filter(|p| p.as_str() != home) {
+            if !targets.iter().any(|t| t == *page) {
+                bad.push(format!("{home} does not link {page}"));
+            }
+        }
+    }
+    let nested: Vec<String> = git(&["ls-files", "wiki"])
+        .1
+        .lines()
+        .filter(|p| p.matches('/').count() > 1)
+        .map(String::from)
+        .collect();
+    assert!(nested.is_empty(), "{nested:?}");
+    assert!(bad.is_empty(), "{bad:#?}");
+}
+
+/// The code spans and numbers of a line, sorted and deduplicated: `` `[^`]+` `` and `\d+(\.\d+)*`.
+fn spans_and_numbers(line: &str) -> Vec<String> {
+    let c: Vec<char> = line.chars().collect();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < c.len() {
+        if c[i] == '`' {
+            if let Some(len) = c[i + 1..].iter().position(|&x| x == '`').filter(|&n| n > 0) {
+                out.push(c[i..i + len + 2].iter().collect());
+                i += len + 2;
+                continue;
+            }
+        } else if c[i].is_ascii_digit() {
+            let start = i;
+            while i < c.len() && c[i].is_ascii_digit() {
+                i += 1;
+            }
+            while i + 1 < c.len() && c[i] == '.' && c[i + 1].is_ascii_digit() {
+                i += 1;
+                while i < c.len() && c[i].is_ascii_digit() {
+                    i += 1;
+                }
+            }
+            out.push(c[start..i].iter().collect());
+            continue;
+        }
+        i += 1;
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// What a line is: blank, a heading level, a table row, a list item, a numbered item, or text.
+fn shape(line: &str) -> String {
+    if line.trim().is_empty() {
+        return "blank".into();
+    }
+    let hashes = line.chars().take_while(|&c| c == '#').count();
+    if hashes > 0 {
+        return "#".repeat(hashes);
+    }
+    if line.starts_with('|') || line.starts_with('-') {
+        return line[..1].to_string();
+    }
+    let digits = line.chars().take_while(|c| c.is_ascii_digit()).count();
+    if digits > 0 && line[digits..].starts_with('.') {
+        return format!("{}.", &line[..digits]);
+    }
+    "text".into()
+}
+
+fn cjk(line: &str) -> bool {
+    line.chars().any(|c| ('\u{4e00}'..='\u{9fff}').contains(&c))
+}
+
+/// Whether a line is one Markdown link and nothing else: `[text](target)`.
+fn only_link(line: &str) -> bool {
+    let Some(rest) = line.strip_prefix('[') else {
+        return false;
+    };
+    let Some(close) = rest.find(']') else {
+        return false;
+    };
+    let target = &rest[close + 1..];
+    close > 0
+        && target.len() > 2
+        && target.starts_with('(')
+        && target.ends_with(')')
+        && !target[1..target.len() - 1].contains(')')
+}
+
+/// Lines (1-based) where `<page>-zh-CN` drifts from `page`: each line has the same shape, code spans and numbers and,
+/// when it is prose, Chinese text; a fenced block is identical. A count mismatch is reported as line 0.
+fn drift(page: &str) -> Vec<usize> {
+    let en: Vec<String> = wiki_text(page).lines().map(String::from).collect();
+    let zh: Vec<String> = wiki_text(&twin(page)).lines().map(String::from).collect();
+    let mut out = Vec::new();
+    if en.len() != zh.len() {
+        out.push(0);
+    }
+    let mut fenced = false;
+    for i in 0..en.len().max(zh.len()) {
+        let a = en.get(i).map_or("", String::as_str);
+        let b = zh.get(i).map_or("", String::as_str);
+        if a.starts_with("```") || fenced {
+            if a.starts_with("```") {
+                fenced = !fenced;
+            }
+            if a != b {
+                out.push(i + 1);
+            }
+            continue;
+        }
+        let t = b.trim();
+        let separator =
+            t.starts_with('|') && t.ends_with('|') && t.chars().all(|c| c == '|' || c == '-');
+        let prose = !t.is_empty() && !only_link(t) && !separator;
+        if shape(a) != shape(b)
+            || spans_and_numbers(a) != spans_and_numbers(b)
+            || (prose && !cjk(b))
+        {
+            out.push(i + 1);
+        }
+    }
+    out
+}
+
+#[test]
+fn zh_twins_match_line_counts() {
+    let mut bad = Vec::new();
+    for page in wiki_pages().iter().filter(|p| !p.ends_with("-zh-CN")) {
+        let lines = drift(page);
+        if !lines.is_empty() {
+            bad.push(format!("{page}: {lines:?}"));
+        }
+        // Every design page records the Rust port in a section of its own, at the same line in both languages.
+        if page.starts_with("Design-") {
+            let en: Vec<String> = wiki_text(page).lines().map(String::from).collect();
+            let zh: Vec<String> = wiki_text(&twin(page)).lines().map(String::from).collect();
+            match en.iter().position(|l| l == "## Rust (0.2.0)") {
+                Some(at) if zh.get(at).is_some_and(|l| l.starts_with("## Rust")) => {}
+                _ => bad.push(format!(
+                    "{page}: no ## Rust (0.2.0) section matched in its twin"
+                )),
+            }
+        }
+    }
+    assert!(bad.is_empty(), "{bad:#?}");
+}
+
+// A tag can be moved; a commit cannot. The comment says which release the commit is.
+#[test]
+fn action_pins_are_40_hex_with_version_comment() {
+    let mut seen = 0;
+    for (path, text) in workflows() {
+        for line in text.lines() {
+            let t = line.trim_start();
+            let t = t.strip_prefix("- ").unwrap_or(t).trim_start();
+            let Some(rest) = t.strip_prefix("uses:") else {
+                continue;
+            };
+            seen += 1;
+            let (action, comment) = rest.split_once(" #").unwrap_or((rest, ""));
+            let pinned = action.trim().split_once('@').is_some_and(|(name, sha)| {
+                name.split('/').count() >= 2
+                    && sha.len() == 40
+                    && sha.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+            });
+            let comment = comment.trim();
+            let version = comment.strip_prefix('v').unwrap_or(comment);
+            let version = version.split_whitespace().next().unwrap_or("");
+            let versioned = version
+                .split('.')
+                .all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()));
+            assert!(pinned && versioned, "{path}: {line}");
+        }
+    }
+    assert!(seen > 0);
+}
+
+#[test]
+fn icons_png_sizes_svg_title() {
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/icon");
+    for (name, view_box) in [
+        ("mux-agents.svg", "0 0 512 512"),
+        ("mux-agents-16.svg", "0 0 16 16"),
+    ] {
+        let svg = std::fs::read_to_string(dir.join(name)).unwrap();
+        assert!(
+            svg.trim_start()
+                .starts_with("<svg xmlns=\"http://www.w3.org/2000/svg\""),
+            "{name}"
+        );
+        assert!(svg.contains(&format!("viewBox=\"{view_box}\"")), "{name}");
+        assert!(svg.contains("<title>mux-agents</title>"), "{name}");
+        // Comments are not markup: drop them, then no script, outside reference, doctype, processing instruction
+        // or event handler.
+        let mut svg = svg;
+        while let Some(start) = svg.find("<!--") {
+            let end = svg[start..]
+                .find("-->")
+                .unwrap_or_else(|| panic!("{name}: unclosed comment"));
+            svg.replace_range(start..start + end + 3, "");
+        }
+        let lower = svg.to_lowercase();
+        for bad in [
+            "<script",
+            "href",
+            "<!doctype",
+            "<?",
+            "<foreignobject",
+            "<image",
+            "<use",
+        ] {
+            assert!(!lower.contains(bad), "{name} holds {bad}");
+        }
+        assert!(
+            !lower
+                .split_whitespace()
+                .any(|w| w.starts_with("on") && w.contains('=')),
+            "{name} holds an event handler"
+        );
+        // url() only to an id inside the file.
+        for (at, _) in lower.match_indices("url(") {
+            assert!(
+                lower[at + 4..].trim_start().starts_with('#'),
+                "{name}: outside url()"
+            );
+        }
+        // Only drawing elements.
+        for (at, _) in svg.match_indices('<') {
+            let tag: String = svg[at + 1..]
+                .trim_start_matches('/')
+                .chars()
+                .take_while(|c| c.is_ascii_alphanumeric())
+                .collect();
+            assert!(
+                [
+                    "svg",
+                    "title",
+                    "defs",
+                    "linearGradient",
+                    "stop",
+                    "rect",
+                    "path",
+                    "circle"
+                ]
+                .contains(&tag.as_str()),
+                "{name}: <{tag}>"
+            );
+        }
+    }
+    for size in [16u32, 32, 64, 128, 256, 512] {
+        let png = std::fs::read(dir.join(format!("mux-agents-{size}.png"))).unwrap();
+        assert_eq!(
+            png[..8],
+            [0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a],
+            "{size}"
+        );
+        // IHDR width and height, big-endian, at bytes 16 and 20.
+        let be = |at: usize| u32::from_be_bytes(png[at..at + 4].try_into().unwrap());
+        assert_eq!((be(16), be(20)), (size, size), "{size}");
+    }
+    assert_eq!(
+        file_lines("README.md")[0],
+        r#"<p align="center"><img src="https://raw.githubusercontent.com/D0n9X1n/mux-agents/main/assets/icon/mux-agents.svg" width="128" height="128" alt="mux-agents icon"></p>"#
+    );
+}
+
+#[test]
+fn export_ignore_rules() {
+    let attributes = file_lines(".gitattributes");
+    for want in [
+        "scripts/release export-ignore",
+        "scripts/wiki export-ignore",
+        "scripts/dev export-ignore",
+        "wiki export-ignore",
+        "assets export-ignore",
+        "scripts/mux-agent text eol=lf",
+        "*.sh text eol=lf",
+        "*.cmd text eol=crlf",
+    ] {
+        assert!(attributes.contains(&want.to_string()), "{want}");
+    }
+    // As git reads them, every line applied.
+    let attr = |name: &str, path: &str| {
+        let out = git(&["check-attr", name, "--", path]).1;
+        out.trim().rsplit(": ").next().unwrap().to_string()
+    };
+    for path in [
+        "scripts/release",
+        "scripts/wiki",
+        "scripts/dev",
+        "wiki",
+        "assets",
+    ] {
+        assert_eq!(attr("export-ignore", path), "set", "{path}");
+    }
+    for path in [
+        "scripts/mux-agent",
+        "scripts/mux-agent.cmd",
+        "hooks",
+        "skills",
+        ".claude-plugin",
+    ] {
+        assert_eq!(attr("export-ignore", path), "unspecified", "{path}");
+    }
+    assert_eq!(attr("eol", "scripts/mux-agent"), "lf");
+    assert_eq!(attr("eol", "scripts/release/gate.sh"), "lf");
+    assert_eq!(attr("eol", "scripts/mux-agent.cmd"), "crlf");
+    assert_eq!(attr("eol", "tests/shim.cmd"), "crlf");
+}
+
+/// The commands CI runs that a contributor runs before a pull request, each as ci.yml spells it.
+const MUST_PASS: [&str; 13] = [
+    "cargo fmt --check",
+    "cargo clippy --all-targets --features test-panic --locked -- -D warnings",
+    "cargo test --features test-panic --locked",
+    "cargo build --release --locked",
+    "cargo test --release --features test-panic --locked --test panic",
+    "sh tests/shim.sh",
+    "sh scripts/dev/tmux32.sh",
+    "cargo test --features live,test-panic --locked --test live",
+    "sh tests/release.sh",
+    "sh tests/wiki.sh",
+    "claude plugin validate .",
+    "claude plugin test .",
+    "git ls-files -z 'scripts/*.sh' scripts/mux-agent 'tests/*.sh' | xargs -0 shellcheck",
+];
+
+#[test]
+fn contributing_and_pr_template_merge_sentences() {
+    let contributing = file_lines("CONTRIBUTING.md");
+    for want in [
+        "1. `gh pr view <n> --json headRefOid,statusCheckRollup`",
+        "2. Every check on that `headRefOid` is `SUCCESS`, and `lint`, `test (ubuntu-latest)`, `test (macos-latest)`, `test (windows-latest)`, `integration (ubuntu-latest)` and `integration (macos-latest)` are all present.",
+        "3. `git fetch origin <sha>`, then `git push origin <sha>:main`, with `<sha>` the `headRefOid` from step 1. The push is not forced, so it lands only when `<sha>` builds on the current `main`; GitHub then marks the pull request merged.",
+        "Commits are authored and committed as `D0n9X1n <D0n9x1n@outlook.com>`. A pull request lands by fast-forwarding `main` to its tested head, never through a GitHub merge, which would re-author it.",
+    ] {
+        assert!(
+            contributing.contains(&want.to_string()),
+            "CONTRIBUTING: {want}"
+        );
+    }
+    let template = file_lines(".github/pull_request_template.md");
+    for want in [
+        "- [ ] `gh pr view <n> --json headRefOid,statusCheckRollup`: every check on headRefOid is SUCCESS; `lint`, `test (ubuntu-latest)`, `test (macos-latest)`, `test (windows-latest)`, `integration (ubuntu-latest)` and `integration (macos-latest)` are present",
+        "- [ ] `git fetch origin <sha>`, then `git push origin <sha>:main`, with `<sha>` the checked headRefOid; not forced, so it lands only on the current `main`",
+    ] {
+        assert!(template.contains(&want.to_string()), "template: {want}");
+    }
+    for heading in [
+        "## Summary",
+        "## Type",
+        "## Closes",
+        "## Test plan",
+        "## Merge checklist",
+    ] {
+        assert!(template.contains(&heading.to_string()), "{heading}");
+    }
+    // A GitHub merge re-authors; a forced push could land an untested head.
+    for line in contributing.iter().chain(&template) {
+        assert!(!line.contains("gh pr merge"), "{line}");
+        if line.contains("git push") {
+            let forced = line.contains("--force")
+                || line
+                    .split([' ', '`', '"', '\''])
+                    .any(|w| w == "-f" || (w.starts_with('+') && w.len() > 1));
+            assert!(!forced, "{line}");
+        }
+    }
+    // Must-pass: every command CI runs, listed for contributors, and still in ci.yml.
+    let text = repo_file("CONTRIBUTING.md");
+    let ci = repo_file(CI);
+    for cmd in MUST_PASS {
+        assert!(text.contains(cmd), "CONTRIBUTING lacks {cmd}");
+        assert!(ci.contains(cmd), "ci.yml lacks {cmd}");
+    }
+    assert!(text.contains("actionlint") && text.contains(r"tests\shim.cmd"));
+    let plan = repo_file(".github/pull_request_template.md");
+    assert!(plan.contains("cargo test --features test-panic --locked"));
+}
+
+#[test]
+fn old_name_absent_outside_foundation_pages() {
+    // Built from fragments, so this file does not match itself. The design record of the rename may name it.
+    let old = ["r", "mux-agent|R", "muxAgent|R", "MUX_AGENTS"].concat();
+    let (found, hits) = git(&[
+        "grep",
+        "-n",
+        "-E",
+        &old,
+        "--",
+        ".",
+        ":(exclude,literal)wiki/Design-Foundation.md",
+        ":(exclude,literal)wiki/Design-Foundation-zh-CN.md",
+    ]);
+    assert!(!found && hits.is_empty(), "{hits}");
+}
+
+#[test]
+fn tracks_no_docs_path() {
+    let (_, out) = git(&["ls-files", "--", "docs"]);
+    assert!(out.is_empty(), "{out}");
+}
+
+#[test]
+fn readme_notes_dist_pin() {
+    // The marketplace installs ref dist, which the first 0.2.0 release creates.
+    let readme = file_lines("README.md");
+    assert!(
+        readme.iter().any(|l| l.contains("`dist`")
+            && l.contains("marketplace")
+            && l.contains("first 0.2.0 release")),
+        "README does not note the dist pin"
+    );
+}
+
+#[test]
+fn no_powershell_needed() {
+    let files = tracked();
+    let scripts: Vec<&String> = files
+        .iter()
+        .filter(|p| {
+            [".ps1", ".psm1", ".psd1", ".cs"]
+                .iter()
+                .any(|e| p.ends_with(e))
+        })
+        .collect();
+    assert!(scripts.is_empty(), "{scripts:?}");
+    let mut bad = Vec::new();
+    for path in files.iter().filter(|p| {
+        ["scripts/", ".github/", ".claude-plugin/"]
+            .iter()
+            .any(|d| p.starts_with(d))
+            || ["Cargo.toml", "CONTRIBUTING.md"].contains(&p.as_str())
+    }) {
+        let full = Path::new(env!("CARGO_MANIFEST_DIR")).join(path);
+        let Ok(text) = std::fs::read_to_string(full) else {
+            continue; // not text
+        };
+        for line in text.lines() {
+            if names_powershell(line) {
+                bad.push(format!("{path}: {line}"));
+            }
+        }
+    }
+    for path in files.iter().filter(|p| p.starts_with("hooks/")) {
+        for line in file_lines(path) {
+            if names_powershell(&line) && !hook_line_ok(&line) {
+                bad.push(format!("{path}: {line}"));
+            }
+        }
+    }
+    for line in file_lines("README.md") {
+        if names_powershell(&line) && !readme_line_ok(&line) {
+            bad.push(format!("README.md: {line}"));
+        }
+    }
+    assert!(bad.is_empty(), "{bad:#?}");
+}

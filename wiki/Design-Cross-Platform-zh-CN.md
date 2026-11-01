@@ -71,3 +71,13 @@
 | `-N` 从不启动服务器；对已消失窗格的 `display-message` 以 0 退出且字段为空 | tmux 3.2 CHANGES；tmux 3.6 探测 | 与 rmux 规则相同 | 调研 |
 | 先杀，再核查残留进程 | uzi | `stop` 只通过 `pidfd` 杀残留进程 | 调研 |
 | `/proc` 启动节拍、按最后一个 `)` 解析；bwrap `NoNewPrivs`、sandbox-runtime `SANDBOX_RUNTIME=1` | proc_pid_stat(5)；WSL 测试；sandbox-runtime | 身份与 C1 信号 | 调研 |
+
+## Rust 实现（0.2.0）
+
+0.2.0 在 Rust 中保留这些规则，并支持 macOS 和 Linux 上的 rmux。
+
+- **入口。** `scripts/mux-agent`（POSIX sh）或 `scripts\mux-agent.cmd` 依次尝试 `MUX_AGENTS_BIN`、`scripts/bin/<os>-<arch>/mux-agent[.exe]` 和 `target/release/mux-agent[.exe]`，运行第一个可用的；都不可用时打印 JSON `entry` 拒绝并以 1 退出。
+- **锁。** 在 Unix 上，锁是 passwd 主目录下 `.local/state/mux-agents/locks` 中的文件，用 `File::try_lock` 获取；Windows 使用命名互斥体 `Local\MuxAgents-<hex>`。锁按用户划分，同一用户的所有状态根共用它们，`GHSA-2j93-m82w-73j2` 不再适用。
+- **进程层。** 不启动辅助进程：Linux 读取 `/proc` 并通过 `pidfd` 结束进程；macOS 使用 `proc_pidinfo`、`KERN_PROCARGS2` 和 `sandbox_check`；Windows 使用 Toolhelp、`GetProcessTimes`、`ProcessCommandLineInformation`、进程令牌和 DACL。
+- **交付。** `main` 只有源码。标签 `v<version>` 把六个二进制文件构建到 `scripts/bin/`，附带一个 `SHA256SUMS`，并提交到 `.claude-plugin/marketplace.json` 固定的 `dist` 分支；`dist` 只会移到更新的版本。
+- **多路复用器。** 设置了 `RMUX` 时端点取 `RMUX`，否则取 `TMUX`。服务器映像名为 rmux 或 tmux 时，二进制文件就是该映像；否则设置了 `RMUX` 时取 `PATH` 上的 `rmux`，再否则取 `tmux`。`tmux -V` 低于 3.2 或 `rmux -V` 低于 0.10 时以 `endpoint` 拒绝。每次调用都是 `<mux> -S <socket> -N …`。

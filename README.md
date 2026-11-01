@@ -8,24 +8,26 @@ mux-agents is a plugin for Claude Code and GitHub Copilot CLI. From a chat runni
 
 ## Status
 
-0.1.0 runs on Windows with rmux 0.10.0, and on Linux and macOS with tmux 3.2 or later. The code moved here from the Terminal Profiles repository and no longer depends on it.
+0.2.0 is one native binary, `mux-agent`, built from Rust for macOS, Linux and Windows, with no PowerShell or .NET runtime to start. It keeps the commands, the state folder and the safety checks of 0.1.
 
-On Linux and macOS, .NET 8.0.0–8.0.31, 9.0.0–9.0.20, 10.0.0–10.0.12 and 11.0 previews through RC 1 have an elevation-of-privilege flaw in their named mutexes ([GHSA-2j93-m82w-73j2](https://github.com/advisories/GHSA-2j93-m82w-73j2)), which mux-agents uses for its `lock` check: another local user can erase or replace file contents, loosen folder permissions or gain higher privileges. mux-agent after v0.1.0 refuses such a .NET with check `runtime`; the v0.1.0 release does not check. Install PowerShell 7.4.21, 7.5.12, 7.6.7 or later, or set `MUX_AGENTS_ALLOW_AFFECTED_DOTNET=1` to run anyway; replies then carry `advisory`.
+The .NET named-mutex advisory [GHSA-2j93-m82w-73j2](https://github.com/advisories/GHSA-2j93-m82w-73j2), which affected the `lock` check of 0.1 on Linux and macOS, is fixed in 0.2.0: Unix locks are now files under your home folder (`~/.local/state/mux-agents/locks`, taken with `File::try_lock`), and Windows uses a named mutex `Local\MuxAgents-<hex>`.
+
+The marketplace installs the `dist` branch, which holds the prebuilt binaries; it takes effect once the first 0.2.0 release creates `dist`.
 
 ## Quick start
 
 Start the multiplexer, then the client inside it:
 
 ```sh
-tmux        # Linux and macOS; on Windows: rmux
+tmux        # or: rmux
 claude      # or: copilot
 ```
 
-Then ask in the chat, for example: "spawn a Copilot agent to write the tests for parser.ps1, and open the side bar". The skill turns that into the commands below.
+Then ask in the chat, for example: "spawn a Copilot agent to write the tests for parser.rs, and open the side bar". The skill turns that into the commands below.
 
 ## Commands
 
-Every command is `pwsh -NoProfile -File <plugin>/scripts/mux-agent.ps1 <verb> …` and prints one JSON object (`-Text` prints lines instead). An agent passes free text in a file (`-TaskFile`, `-BriefFile`, `-BodyFile`), never on the command line.
+Every command is `<plugin>/scripts/mux-agent <verb> …` (`<plugin>\scripts\mux-agent.cmd <verb> …` on Windows) and prints one JSON object (`-Text` prints lines instead). An agent passes free text in a file (`-TaskFile`, `-BriefFile`, `-BodyFile`), never on the command line.
 
 | verb | example | what it does |
 |---|---|---|
@@ -55,7 +57,7 @@ mux-agents · 2 running
 
 ## How it works
 
-- `spawn` opens a detached window (or `-Split h|v` splits the caller's pane) running the launcher, tags the pane with `@agent-*` options, and records the agent in the state folder: `MUX_AGENTS_STATE` if set, else `%LOCALAPPDATA%\mux-agents\state` on Windows and `$XDG_STATE_HOME/mux-agents/state` or `~/.local/state/mux-agents/state` on Linux and macOS.
+- `spawn` opens a detached window (or `-Split h|v` splits the caller's pane) running `<binary> launcher <spec.json>` by the binary's absolute path, tags the pane with `@agent-*` options, and records the agent in the state folder: `MUX_AGENTS_STATE` if set, else `%LOCALAPPDATA%\mux-agents\state` on Windows and `$XDG_STATE_HOME/mux-agents/state` or `~/.local/state/mux-agents/state` on Linux and macOS.
 - Children run `claude --dangerously-skip-permissions --effort high` or `copilot --no-sandbox --allow-all`.
 - Messages go to per-pane mailboxes, never as keystrokes. `read -Wait` returns each message once. Every child posts exactly one exit notice to its parent: `exited`, `stopped` or `lost`.
 
@@ -72,11 +74,11 @@ Agents start with permission prompts off, so mux-agents never gives an agent mor
 
 ## Requirements
 
-- Windows, Linux or macOS, PowerShell 7.4 or later.
-- rmux 0.10.0 on Windows, or tmux 3.2 or later on Linux and macOS, with the caller inside a pane.
+- macOS, Linux or Windows, x86_64 or aarch64; no PowerShell or .NET needed.
+- rmux 0.10 or later on macOS, Linux or Windows, or tmux 3.2 or later on macOS or Linux, with the caller inside a pane.
 - Claude Code or GitHub Copilot CLI on `PATH` (`claude` or `copilot`; `.exe` on Windows).
 
-Inside rmux both `RMUX` and `TMUX` are set; `RMUX` wins. Other platforms are refused with check `platform`.
+Inside rmux both `RMUX` and `TMUX` may be set; `RMUX` wins. Outside a pane every verb is refused with check `endpoint`.
 
 ## Install
 
@@ -87,37 +89,32 @@ copilot plugin marketplace add D0n9X1n/mux-agents
 copilot plugin install mux-agents@mux-agents
 ```
 
-Each [release](https://github.com/D0n9X1n/mux-agents/releases) also carries the plugin files as `mux-agents-<tag>.zip`.
-
 ## Layout
 
 | Path | Job |
 |---|---|
 | `.claude-plugin/plugin.json`, `marketplace.json` | Plugin and marketplace manifests, read by Claude Code and Copilot CLI |
 | `skills/mux-agents/SKILL.md` | The skill both clients load: verbs, the file-only rule, listening etiquette |
-| `scripts/mux-agent.ps1` | Entry: one verb per call, one JSON object out |
-| `scripts/MuxAgents.ps1` | Library: caller, checks, registry, locks, spawn, list, focus, send, read, stop, status, sidebar, watch, launcher |
-| `scripts/MuxAgents.Unix.ps1`, `MuxAgents.Native.Unix.cs` | Linux and macOS: processes, sandbox, kill, state folders and locks |
-| `scripts/mux-agent-launcher.ps1` | Pane launcher: waits for the launch commit, then starts the client |
+| `scripts/mux-agent`, `scripts/mux-agent.cmd` | Entry shims: run the packaged binary for this OS and architecture |
+| `src/` | The `mux-agent` binary: verbs, checks, state, locks, the process layer, the launcher and the side bar |
 | `hooks/`, `types/` | The Claude Code `Agents` pane and its state contract |
-| `tests/` | Pester 4.10.1 tests on fakes; `Invoke-MuxAgentTests.ps1` runs them; `tests/claude/` holds the pane's tests |
+| `tests/` | Rust tests, the shim, release and wiki sh tests, and `tests/claude/` for the pane |
 | `wiki/` | Documentation, the source of the GitHub wiki: every page in English (`Page.md`) and Chinese (`Page-zh-CN.md`) |
-| `scripts/wiki/` | Wiki publisher run by the Publish wiki workflow; not in the plugin zip |
+| `scripts/wiki/` | Wiki publisher run by the Publish wiki workflow |
+| `scripts/release/`, `scripts/dev/` | Release packaging and gates; developer benchmarks and tools |
 
 ## Test
 
-Install Pester 4.10.1 and powershell-yaml 0.4.12 once, then run the tests:
+With Rust 1.95.0:
 
-```powershell
-Install-Module Pester -RequiredVersion 4.10.1 -Scope CurrentUser
-Install-Module powershell-yaml -RequiredVersion 0.4.12 -Scope CurrentUser
-pwsh -NoProfile -File tests/Invoke-MuxAgentTests.ps1
+```sh
+cargo test --features test-panic --locked
+cargo build --release --locked
+sh tests/shim.sh
 claude plugin test .
 ```
 
-With Claude Code 2.1.310 or later, `claude plugin test .` runs the pane's tests.
-
-Each OS skips the suites tagged for the other OSes. Suites tagged integration run only with -Integration, on Linux or macOS with tmux 3.2+ and cc: pwsh -NoProfile -File tests/Invoke-MuxAgentTests.ps1 -Path tests/integration -Integration. The script exits 1 when any test fails.
+[CONTRIBUTING](https://github.com/D0n9X1n/mux-agents/blob/main/CONTRIBUTING.md) lists every command CI runs.
 
 ## More
 

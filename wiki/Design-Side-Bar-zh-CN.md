@@ -77,3 +77,13 @@
 |---|---|---|---|
 | 用窗格用户选项携带代理状态 | ntm `@ntm_agent_mail_state` | 与 `@agent-role` 和 `status` 作用相同 | 调研 |
 | 状态来自代理写入的文件 | Claude Code 代理团队收件箱 | 相同：`status.json`、邮箱 | 调研 |
+
+## Rust 实现（0.2.0）
+
+0.2.0 保留数据源、窗格和分屏；侧边栏和代理窗格直接运行二进制文件。
+
+- **入口。** `scripts/mux-agent`（POSIX sh）或 `scripts\mux-agent.cmd` 依次尝试 `MUX_AGENTS_BIN`、`scripts/bin/<os>-<arch>/mux-agent[.exe]` 和 `target/release/mux-agent[.exe]`，运行第一个可用的；都不可用时打印 JSON `entry` 拒绝并以 1 退出。
+- **锁。** 在 Unix 上，锁是 passwd 主目录下 `.local/state/mux-agents/locks` 中的文件，用 `File::try_lock` 获取；Windows 使用命名互斥体 `Local\MuxAgents-<hex>`。锁按用户划分，同一用户的所有状态根共用它们，`GHSA-2j93-m82w-73j2` 不再适用。
+- **进程层。** 不启动辅助进程：Linux 读取 `/proc` 并通过 `pidfd` 结束进程；macOS 使用 `proc_pidinfo`、`KERN_PROCARGS2` 和 `sandbox_check`；Windows 使用 Toolhelp、`GetProcessTimes`、`ProcessCommandLineInformation`、进程令牌和 DACL。
+- **交付。** `main` 只有源码。标签 `v<version>` 把六个二进制文件构建到 `scripts/bin/`，附带一个 `SHA256SUMS`，并提交到 `.claude-plugin/marketplace.json` 固定的 `dist` 分支；`dist` 只会移到更新的版本。
+- **窗格。** 代理窗格运行 `<exe> launcher <spec.json>`，侧边栏运行 `<exe> watch`，都使用二进制文件的绝对路径，所以窗格一直使用它启动时的二进制文件。Claude Code 窗格运行 `sh <root>/scripts/mux-agent list -All`，当 `OS` 为 `Windows_NT` 时运行 `cmd.exe /d /c <root>\scripts\mux-agent.cmd list -All`；遇到运行 `mux-agent.ps1 … spawn` 的 0.1 命令行时仍会打开。

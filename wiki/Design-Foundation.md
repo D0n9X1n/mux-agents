@@ -72,3 +72,13 @@ Unix support (B); side bar (C); README rewrite, icon, launch (D); Pester 5; bran
 | Actions pinned by SHA; Dependabot monthly | SonicTerm `ci.yml`, `dependabot.yml` | Same | `actions/checkout@3d3c42e… # v7.0.1` |
 | Tag on `main` with a successful CI push run | SonicTerm `validate-release-tag` | Same, as a tested script | `merge-base --is-ancestor`; runs query |
 | Pester 4 legacy `Should` on pwsh 7 | local Pester 4.10.1 run | Keeps 562 assertions | 179 passed / 0 failed |
+
+## Rust (0.2.0)
+
+0.2.0 replaces the PowerShell scripts with one Rust binary, `mux-agent`, and keeps the verbs, the state folder and the refusal names.
+
+- **Entry.** `scripts/mux-agent` (POSIX sh) or `scripts\mux-agent.cmd` runs the first usable of `MUX_AGENTS_BIN`, `scripts/bin/<os>-<arch>/mux-agent[.exe]` and `target/release/mux-agent[.exe]`; with none it prints a JSON `entry` refusal and exits 1.
+- **Locks.** On Unix a lock is a file under the passwd home's `.local/state/mux-agents/locks`, taken with `File::try_lock`; Windows uses a named mutex `Local\MuxAgents-<hex>`. Locks are per user, so every state root of one user shares them, and `GHSA-2j93-m82w-73j2` no longer applies.
+- **Process layer.** No helper processes: Linux reads `/proc` and kills through `pidfd`; macOS uses `proc_pidinfo`, `KERN_PROCARGS2` and `sandbox_check`; Windows uses Toolhelp, `GetProcessTimes`, `ProcessCommandLineInformation`, the process token and DACLs.
+- **Delivery.** `main` is source only. A tag `v<version>` builds six binaries into `scripts/bin/` with one `SHA256SUMS` and commits them on the `dist` branch, which `.claude-plugin/marketplace.json` pins; `dist` only moves to a newer version.
+- **Tests and release.** `cargo test`, the sh tests under `tests/` and `claude plugin test .` replace the Pester suites; `scripts/release/gate.sh` replaces `Test-MuxAgentRelease.ps1` with the same refusals in the same order.

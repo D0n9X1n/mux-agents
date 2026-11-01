@@ -72,3 +72,13 @@ Unix 支持（B）；侧边栏（C）；README 重写、图标、上线（D）�
 | Actions 按 SHA 固定；Dependabot 每月 | SonicTerm `ci.yml`、`dependabot.yml` | 相同 | `actions/checkout@3d3c42e… # v7.0.1` |
 | 标签在 `main` 上且有成功的 CI push 运行 | SonicTerm `validate-release-tag` | 相同，做成一个有测试的脚本 | `merge-base --is-ancestor`；运行查询 |
 | 在 pwsh 7 上用 Pester 4 旧版 `Should` | 本地 Pester 4.10.1 运行 | 保留 562 个断言 | 179 通过 / 0 失败 |
+
+## Rust 实现（0.2.0）
+
+0.2.0 用一个 Rust 二进制文件 `mux-agent` 取代 PowerShell 脚本，保留动词、状态文件夹和拒绝名称。
+
+- **入口。** `scripts/mux-agent`（POSIX sh）或 `scripts\mux-agent.cmd` 依次尝试 `MUX_AGENTS_BIN`、`scripts/bin/<os>-<arch>/mux-agent[.exe]` 和 `target/release/mux-agent[.exe]`，运行第一个可用的；都不可用时打印 JSON `entry` 拒绝并以 1 退出。
+- **锁。** 在 Unix 上，锁是 passwd 主目录下 `.local/state/mux-agents/locks` 中的文件，用 `File::try_lock` 获取；Windows 使用命名互斥体 `Local\MuxAgents-<hex>`。锁按用户划分，同一用户的所有状态根共用它们，`GHSA-2j93-m82w-73j2` 不再适用。
+- **进程层。** 不启动辅助进程：Linux 读取 `/proc` 并通过 `pidfd` 结束进程；macOS 使用 `proc_pidinfo`、`KERN_PROCARGS2` 和 `sandbox_check`；Windows 使用 Toolhelp、`GetProcessTimes`、`ProcessCommandLineInformation`、进程令牌和 DACL。
+- **交付。** `main` 只有源码。标签 `v<version>` 把六个二进制文件构建到 `scripts/bin/`，附带一个 `SHA256SUMS`，并提交到 `.claude-plugin/marketplace.json` 固定的 `dist` 分支；`dist` 只会移到更新的版本。
+- **测试与发布。** `cargo test`、`tests/` 下的 sh 测试和 `claude plugin test .` 取代 Pester 套件；`scripts/release/gate.sh` 取代 `Test-MuxAgentRelease.ps1`，拒绝原因和顺序相同。

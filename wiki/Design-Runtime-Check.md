@@ -68,3 +68,13 @@ Replacing the named mutex; v0.1.1; Windows; other overrides.
 | .NET `UnsafeDefaultMutexScopeGlobal` | opting out of the secure default says so |
 | .NET SDK NETSDK1238 | a warning on a vulnerable runtime, kept as `advisory` |
 | npm `engine-strict` | refusal off by default: rejected |
+
+## Rust (0.2.0)
+
+0.2.0 runs no .NET, so the advisory this page answers no longer applies.
+
+- **Entry.** `scripts/mux-agent` (POSIX sh) or `scripts\mux-agent.cmd` runs the first usable of `MUX_AGENTS_BIN`, `scripts/bin/<os>-<arch>/mux-agent[.exe]` and `target/release/mux-agent[.exe]`; with none it prints a JSON `entry` refusal and exits 1.
+- **Locks.** On Unix a lock is a file under the passwd home's `.local/state/mux-agents/locks`, taken with `File::try_lock`; Windows uses a named mutex `Local\MuxAgents-<hex>`. Locks are per user, so every state root of one user shares them, and `GHSA-2j93-m82w-73j2` no longer applies.
+- **Process layer.** No helper processes: Linux reads `/proc` and kills through `pidfd`; macOS uses `proc_pidinfo`, `KERN_PROCARGS2` and `sandbox_check`; Windows uses Toolhelp, `GetProcessTimes`, `ProcessCommandLineInformation`, the process token and DACLs.
+- **Delivery.** `main` is source only. A tag `v<version>` builds six binaries into `scripts/bin/` with one `SHA256SUMS` and commits them on the `dist` branch, which `.claude-plugin/marketplace.json` pins; `dist` only moves to a newer version.
+- **Runtime check.** The `runtime` check, `advisory` and `MUX_AGENTS_ALLOW_AFFECTED_DOTNET` are gone: nothing reads the variable, and no reply carries `advisory`.

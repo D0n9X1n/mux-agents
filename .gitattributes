@@ -1,6 +1,11 @@
 * text=auto eol=lf
 *.png binary
+# The sh shim and every sh script run with LF; cmd.exe reads its scripts with CRLF.
+scripts/mux-agent text eol=lf
+*.sh text eol=lf
+*.cmd text eol=crlf
 scripts/release export-ignore
 scripts/wiki export-ignore
+scripts/dev export-ignore
 wiki export-ignore
 assets export-ignore
