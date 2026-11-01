@@ -20,6 +20,35 @@ pub fn list(ctx: &Ctx, request: &Request) -> Res<Map<String, Value>> {
     board(ctx, &caller, &reader, request.switch("All"), false)
 }
 
+/// `list -Text`: the rows as `json::to_text` prints them, without the `color` column. With `color`, a live agent's
+/// name is painted in its identity hue (as the side bar paints it) and an ended one's dim; the name is cleaned first.
+pub fn list_text(reply: &Map<String, Value>, color: bool) -> String {
+    use crate::paint::{Style, hue, identity, paint};
+    let mut shown = reply.clone();
+    if let Some(Value::Array(rows)) = shown.get_mut("agents") {
+        for row in rows.iter_mut().filter_map(Value::as_object_mut) {
+            let recorded = row.remove("color");
+            if !color {
+                continue;
+            }
+            let name = crate::paint::clean(&super::text(row.get("name")));
+            let style = if row.get("state").and_then(Value::as_str) == Some("running") {
+                Style {
+                    color: hue(identity(recorded.as_ref().and_then(Value::as_str), &name)),
+                    ..Style::default()
+                }
+            } else {
+                Style {
+                    dim: true,
+                    ..Style::default()
+                }
+            };
+            row.insert("name".into(), paint(&name, style, true).into());
+        }
+    }
+    crate::json::to_text(&shown)
+}
+
 pub fn focus(ctx: &Ctx, request: &Request) -> Res<Map<String, Value>> {
     let caller = resolve(ctx)?;
     let pane = find_pane(ctx, &caller, first(request))?;
@@ -69,7 +98,12 @@ pub fn status(ctx: &Ctx, request: &Request) -> Res<Map<String, Value>> {
         .join("status.json");
     let at = crate::util::utc_o(ctx.clock.now());
     lock(ctx, &lock_key("agent", &caller, tag), || {
-        write_json(&file, &json!({"text": text, "at": at}))
+        write_json(&file, &json!({"text": text, "at": at}))?;
+        // A status is work: the agent no longer waits.
+        if let Some(folder) = file.parent() {
+            super::message::clear_waiting(folder);
+        }
+        Ok(())
     })?;
     let mut reply = Map::new();
     reply.insert(

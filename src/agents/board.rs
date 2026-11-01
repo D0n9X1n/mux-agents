@@ -6,7 +6,7 @@ use std::time::SystemTime;
 
 use serde_json::{Map, Value};
 
-use super::mail::{doing_line, unread_counts};
+use super::mail::{doing_line, mailbox_key, unread_counts};
 use super::registry::{self, Pane};
 use crate::caller::Caller;
 use crate::ctx::Ctx;
@@ -33,16 +33,18 @@ pub fn select_doing(
     (Value::Null, Value::Null)
 }
 
-/// `{running, agents}` for the caller's session: live agents in pane order and, with `all`, the session's ended
-/// agents, newest notice first, at most 10. Unread is `reader`'s. `with_exit` (watch only) adds each ended row's
-/// exitCode from its notice.json. Locks one at a time: notice locks, the reader's mail lock, then each row's
+/// `{running, agents}` for the caller's session: live agents in pane order and, with `all`, `endedTotal` (every
+/// ended agent of the session) and the session's ended agents, newest notice first, at most 10. Unread is
+/// `reader`'s. `watch` (the bar's feed) adds each ended row's exitCode from its notice.json and each live row's
+/// `waiting` (S2.4), and a live row's unread is instead its own messages still unread in its parent's mailbox (S2.5;
+/// `reader` unused). Locks one at a time: notice locks, the reader's (or each parent's) mail lock, then each row's
 /// agent lock.
 pub fn board(
     ctx: &Ctx,
     caller: &Caller,
     reader: &str,
     all: bool,
-    with_exit: bool,
+    watch: bool,
 ) -> Res<Map<String, Value>> {
     // One list-panes for the notices, the live rows and the ended filter; list runs every 3 s. A reap that killed a
     // pane or posted a notice makes that snapshot stale, so the panes are listed again.
@@ -50,32 +52,49 @@ pub fn board(
     if registry::reap(ctx, caller, Some(&tagged), false)? {
         tagged = registry::tagged(ctx, caller)?;
     }
-    let rows = Rows {
-        ctx,
-        caller,
-        unread: unread_counts(ctx, caller, reader)?,
-        now: ctx.clock.now(),
-    };
-    let panes = registry::committed(ctx, caller, tagged);
-    let mut agents = Vec::new();
+    let panes = registry::committed(ctx, caller, tagged.clone());
+    let mut live = Vec::new();
     for pane in &panes {
         let Some(record) = registry::record(ctx, caller, &pane.id)? else {
             continue;
         };
-        if !same_session(&record, caller) {
-            continue;
+        if same_session(&record, caller) {
+            live.push((pane, record));
         }
-        agents.push(rows.row(
-            &pane.id,
-            &record,
-            pane.pane.clone(),
-            &pane.window,
-            "running",
-        )?);
+    }
+    // The mailboxes whose unread counts: the reader's, or (watch) each live agent's parent's, in key order.
+    let mut keys: Vec<String> = if watch {
+        live.iter()
+            .filter_map(|(_, record)| parent_key(record, &tagged))
+            .collect()
+    } else {
+        vec![reader.to_string()]
+    };
+    keys.sort();
+    keys.dedup();
+    let mut unread = HashMap::new();
+    for key in keys {
+        let counts = unread_counts(ctx, caller, &key)?;
+        unread.insert(key, counts);
+    }
+    let rows = Rows {
+        ctx,
+        caller,
+        unread,
+        reader: (!watch).then(|| reader.to_string()),
+        tagged: &tagged,
+        now: ctx.clock.now(),
+        watch,
+    };
+    let mut agents = Vec::new();
+    for (pane, record) in &live {
+        agents.push(rows.row(&pane.id, record, pane.pane.clone(), &pane.window, "running")?);
     }
     let running = agents.len();
+    let mut ended_total = None;
     if all {
         let mut ended = ended(ctx, caller, &panes)?;
+        ended_total = Some(ended.len());
         // Newest first (an unreadable time is oldest), then by id.
         ended.sort_by(|a, b| b.at.cmp(&a.at).then_with(|| a.id.cmp(&b.id)));
         for end in ended.into_iter().take(ENDED_MAX) {
@@ -86,7 +105,7 @@ pub fn board(
             if let Some(closed) = end.closed_by {
                 row.insert("closedBy".into(), closed.into());
             }
-            if with_exit {
+            if watch {
                 row.insert("exitCode".into(), end.code);
             }
             agents.push(row);
@@ -94,6 +113,9 @@ pub fn board(
     }
     let mut reply = Map::new();
     reply.insert("running".into(), running.into());
+    if let Some(total) = ended_total {
+        reply.insert("endedTotal".into(), total.into());
+    }
     reply.insert(
         "agents".into(),
         Value::Array(agents.into_iter().map(Value::Object).collect()),
@@ -121,6 +143,17 @@ pub(crate) fn newest_ended(
         .into_iter()
         .next()
         .map(|end| (end.id, end.record, end.kind)))
+}
+
+/// The mailbox of an agent's parent pane: the agent id it is tagged with when it is a listed agent pane, else
+/// `pane-<n>` (as `send parent` delivers); none for a malformed pane.
+fn parent_key(record: &Value, tagged: &[Pane]) -> Option<String> {
+    let parent = super::text(record.get("parentPane"));
+    let tag = tagged
+        .iter()
+        .find(|p| p.pane == parent)
+        .map_or("", |p| p.id.as_str());
+    mailbox_key(&parent, tag).ok()
 }
 
 fn same_session(record: &Value, caller: &Caller) -> bool {
@@ -187,8 +220,13 @@ fn ended(ctx: &Ctx, caller: &Caller, live: &[Pane]) -> Res<Vec<Ended>> {
 struct Rows<'a> {
     ctx: &'a Ctx,
     caller: &'a Caller,
-    unread: HashMap<String, usize>,
+    // Per mailbox key, its unread counts by `<from>|<pane>`.
+    unread: HashMap<String, HashMap<String, usize>>,
+    // The one mailbox every row counts in; none in watch mode, where each row counts in its parent's.
+    reader: Option<String>,
+    tagged: &'a [Pane],
     now: SystemTime,
+    watch: bool,
 }
 
 impl Rows<'_> {
@@ -205,10 +243,20 @@ impl Rows<'_> {
         let folder = super::server_dir(self.ctx, self.caller)
             .join("agents")
             .join(id);
-        let (status, sent) =
+        let (status, sent, waiting) =
             super::lock(self.ctx, &super::lock_key("agent", self.caller, id), || {
                 let read = |name: &str| read_json(&folder.join(name)).ok().flatten();
-                Ok((read("status.json"), read("last-sent.json")))
+                let status = read("status.json");
+                // Only a live row of the bar's feed reads its waiting files.
+                let waiting = (self.watch && state == "running").then(|| {
+                    let at = status
+                        .as_ref()
+                        .and_then(|s| s.get("at"))
+                        .and_then(Value::as_str)
+                        .and_then(parse_utc);
+                    super::message::waiting_now(self.ctx, &folder, at)
+                });
+                Ok((status, read("last-sent.json"), waiting))
             })?;
         let (doing, from) = select_doing(
             status.as_ref().and_then(|s| s.get("text")),
@@ -221,9 +269,13 @@ impl Rows<'_> {
             .get("createdAt")
             .and_then(Value::as_str)
             .and_then(|created| age_seconds(created, self.now));
-        let unread = self
-            .unread
-            .get(&format!("{name}|{pane}"))
+        let mailbox = match &self.reader {
+            Some(reader) => Some(reader.clone()),
+            None => parent_key(record, self.tagged),
+        };
+        let unread = mailbox
+            .and_then(|key| self.unread.get(&key))
+            .and_then(|counts| counts.get(&format!("{name}|{pane}")))
             .copied()
             .unwrap_or(0);
         let mut row = Map::new();
@@ -243,6 +295,15 @@ impl Rows<'_> {
         row.insert("unread".into(), unread.into());
         // Last, so the -Text columns before it keep their places; null is the client's own model.
         row.insert("model".into(), field("model"));
+        // The identity hue: the recorded one, else the name's.
+        let recorded = record.get("color").and_then(Value::as_str);
+        row.insert(
+            "color".into(),
+            crate::paint::identity(recorded, &name).into(),
+        );
+        if let Some(waiting) = waiting {
+            row.insert("waiting".into(), waiting.into());
+        }
         Ok(row)
     }
 }
@@ -332,7 +393,7 @@ mod tests {
         let caller = w.caller();
         w.agent_record(
             ID,
-            json!({"createdAt": "2026-10-29T11:56:00.0000000Z", "model": "sonnet"}),
+            json!({"createdAt": "2026-10-29T11:56:00.0000000Z", "model": "sonnet", "color": "magenta"}),
         );
         w.agent_record(
             "bbbbbbbbbbbb",
@@ -363,16 +424,17 @@ mod tests {
                    from: Value,
                    age,
                    unread,
-                   model: Value| {
+                   model: Value,
+                   color: &str| {
             json!({"name": name, "client": client, "pane": pane, "window": window, "context": "brief",
                 "parent": "%1", "sessionId": SESSION_ID, "directory": "/work", "createdAt": created,
                 "state": "running", "doing": doing, "doingFrom": from, "age": age, "unread": unread,
-                "model": model})
+                "model": model, "color": color})
         };
-        // A record without a model (the client's own) lists null.
+        // A record without a model (the client's own) lists null; one without a color gets its name's hue.
         let want = json!({"running": 2, "agents": [
-            row("worker", "claude", "%9", "@6", "2026-10-29T11:56:00.0000000Z", json!("build it"), json!("task"), 240, 2, json!("sonnet")),
-            row("idle", "copilot", "%8", "@7", "2026-10-29T11:59:55.0000000Z", Value::Null, Value::Null, 5, 1, Value::Null)
+            row("worker", "claude", "%9", "@6", "2026-10-29T11:56:00.0000000Z", json!("build it"), json!("task"), 240, 2, json!("sonnet"), "magenta"),
+            row("idle", "copilot", "%8", "@7", "2026-10-29T11:59:55.0000000Z", Value::Null, Value::Null, 5, 1, Value::Null, crate::paint::identity(None, "idle"))
         ]});
         // Compared as text: the order of keys is part of the reply.
         assert_eq!(Value::Object(reply).to_string(), want.to_string());
@@ -442,6 +504,10 @@ mod tests {
         let (w, caller) = ended_world();
         let all = board(&w.ctx, &caller, "pane-1", true, false).unwrap();
         assert_eq!(all["running"], 1);
+        // Every ended agent of the session, lost ones included; other sessions, odd kinds and foreign records not.
+        assert_eq!(all["endedTotal"], 5);
+        let keys: Vec<&str> = all.keys().map(String::as_str).collect();
+        assert_eq!(keys, ["running", "endedTotal", "agents"]);
         // Newest notice first, ties by id, an unreadable time last.
         assert_eq!(
             names(&all),
@@ -456,6 +522,8 @@ mod tests {
         );
         let plain = board(&w.ctx, &caller, "pane-1", false, false).unwrap();
         assert_eq!(names(&plain), ["worker=running"]);
+        // Without -All the reply is unchanged: no endedTotal.
+        assert!(plain.get("endedTotal").is_none());
 
         // The live row and exactly the 10 newest of 12 ended agents.
         let w = World::human("");
@@ -477,6 +545,8 @@ mod tests {
             );
         }
         let all = board(&w.ctx, &caller, "pane-1", true, false).unwrap();
+        // Uncapped: 12 ended, 10 rows.
+        assert_eq!(all["endedTotal"], 12);
         let got: Vec<String> = names(&all)
             .into_iter()
             .map(|n| n.split('=').next().unwrap().to_string())
@@ -519,7 +589,7 @@ mod tests {
         let rows = all["agents"].as_array().unwrap();
         let lost = rows[0].as_object().unwrap();
         assert_eq!(lost["name"], "vanished");
-        // After the 15 row fields, so they keep their places.
+        // After the 16 row fields, so they keep their places.
         assert_eq!(
             lost.iter().map(|(k, v)| (k.as_str(), v)).next_back(),
             Some(("closedBy", &json!("pane")))
@@ -722,5 +792,123 @@ mod tests {
             (&row["doing"], &row["doingFrom"]),
             (&json!("sent"), &json!("message"))
         );
+    }
+
+    #[test]
+    fn watch_shows_waiting_only_for_a_live_newer_read() {
+        let w = World::human("");
+        w.clock(NOW);
+        let caller = w.caller();
+        let folder = w.agent_record(ID, json!({}));
+        w.panes(&["%9|@5|300|aaaaaaaaaaaa|worker"]);
+        // The agent's `read -Wait`: pid 700, started at 7000.
+        w.fakes.process(crate::testing::row(700, 300, 7000));
+        let wait = |name: u32, pid: u32, start: i64, since: &str| {
+            write(
+                &folder.join(format!("waiting-{name}.json")),
+                json!({"pid": pid, "start": start, "since": format!("2026-10-29T{since}.0000000Z")}),
+            )
+        };
+        let status = |at: &str| {
+            write(
+                &folder.join("status.json"),
+                json!({"text": "x", "at": format!("2026-10-29T{at}.0000000Z")}),
+            )
+        };
+        let waiting = || {
+            let reply = board(&w.ctx, &caller, "pane-1", true, true).unwrap();
+            reply["agents"][0]["waiting"].clone()
+        };
+        let files = || {
+            let mut names: Vec<String> = std::fs::read_dir(&folder)
+                .unwrap()
+                .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+                .filter(|n| n.starts_with("waiting-"))
+                .collect();
+            names.sort();
+            names
+        };
+        assert_eq!(waiting(), json!(false));
+        // A live read, with no status or an older one.
+        wait(700, 700, 7000, "11:59:00");
+        assert_eq!(waiting(), json!(true));
+        status("11:58:00");
+        assert_eq!(waiting(), json!(true));
+        // A status since the read began: working, and the live read's file stays.
+        status("11:59:30");
+        assert_eq!(waiting(), json!(false));
+        assert_eq!(files(), ["waiting-700.json"]);
+        std::fs::remove_file(folder.join("status.json")).unwrap();
+        // The pid reused by another process (another start): not waiting, deleted.
+        wait(700, 700, 6999, "11:59:00");
+        assert_eq!(waiting(), json!(false));
+        assert_eq!(files(), Vec::<String>::new());
+        // The read was killed: its pid is gone, the file left behind is deleted.
+        wait(701, 701, 7010, "11:59:00");
+        assert_eq!(waiting(), json!(false));
+        assert_eq!(files(), Vec::<String>::new());
+        // An unreadable file, or one naming another pid than its own name, is deleted.
+        std::fs::write(folder.join("waiting-702.json"), "{bad").unwrap();
+        wait(703, 700, 7000, "11:59:00");
+        assert_eq!(waiting(), json!(false));
+        assert_eq!(files(), Vec::<String>::new());
+        // Only the bar's feed says waiting; list's rows are unchanged.
+        wait(700, 700, 7000, "11:59:00");
+        let list = board(&w.ctx, &caller, "pane-1", true, false).unwrap();
+        assert!(list["agents"][0].get("waiting").is_none());
+        assert_eq!(files(), ["waiting-700.json"]);
+    }
+
+    #[test]
+    fn watch_unread_is_the_agents_mail_in_its_parents_mailbox() {
+        let w = World::human("");
+        w.clock(NOW);
+        let caller = w.caller();
+        // worker (%9) reports to the human pane %1; child (%8) reports to worker, an agent, whose mailbox is its id.
+        w.agent_record(ID, json!({}));
+        w.agent_record(
+            "bbbbbbbbbbbb",
+            json!({"name": "child", "pane": "%8", "parentPane": "%9"}),
+        );
+        w.panes(&[
+            "%9|@5|300|aaaaaaaaaaaa|worker",
+            "%8|@5|301|bbbbbbbbbbbb|child",
+        ]);
+        for _ in 0..2 {
+            add_mail(&w.ctx, &caller, "pane-1", "worker", "%9", "x", None).unwrap();
+        }
+        add_mail(&w.ctx, &caller, ID, "child", "%8", "y", None).unwrap();
+        // To a sibling's mailbox: not the parent's, so no badge.
+        add_mail(&w.ctx, &caller, "pane-2", "worker", "%9", "z", None).unwrap();
+        // The bar's own pane (pane-7) has no mail; its reader is not used.
+        let unread = || {
+            let reply = board(&w.ctx, &caller, "pane-7", true, true).unwrap();
+            reply["agents"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|r| format!("{}={}", r["name"].as_str().unwrap(), r["unread"]))
+                .collect::<Vec<_>>()
+        };
+        let mail = w.state().join("mail");
+        let offsets = || {
+            std::fs::read_dir(&mail)
+                .unwrap()
+                .filter(|e| {
+                    let path = e.as_ref().unwrap().path();
+                    path.extension().is_some_and(|x| x == "offset")
+                })
+                .count()
+        };
+        assert_eq!(unread(), ["worker=2", "child=1"]);
+        // Drawing moves no cursor.
+        assert_eq!(offsets(), 0);
+        assert_eq!(read_mail(&w.ctx, &caller, "pane-1").unwrap().len(), 2);
+        assert_eq!(unread(), ["worker=0", "child=1"]);
+        assert_eq!(read_mail(&w.ctx, &caller, ID).unwrap().len(), 1);
+        assert_eq!(unread(), ["worker=0", "child=0"]);
+        // list keeps the calling reader's unread.
+        let list = board(&w.ctx, &caller, "pane-2", false, false).unwrap();
+        assert_eq!(list["agents"][0]["unread"], 1);
     }
 }

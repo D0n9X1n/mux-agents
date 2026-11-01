@@ -36,6 +36,11 @@ pub fn to_text(reply: &Map<String, Value>) -> String {
     lines.join("\n")
 }
 
+/// `to_text` as a `-Text` renderer: these lines are never colored.
+pub fn lines(reply: &Map<String, Value>, _color: bool) -> String {
+    to_text(reply)
+}
+
 fn row(value: &Value) -> String {
     match value {
         Value::Object(fields) => fields.values().map(cell).collect::<Vec<_>>().join("  "),

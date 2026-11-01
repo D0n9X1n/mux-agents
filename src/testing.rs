@@ -369,6 +369,7 @@ impl Fakes {
             mux: RefCell::new(Some(Box::new(self.clone()))),
             clock: Box::new(self.clone()),
             admitted: false,
+            tty: false,
         }
     }
 }

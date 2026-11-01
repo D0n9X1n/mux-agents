@@ -60,15 +60,29 @@ flowchart LR
 在 Claude Code 中，第一次成功 `spawn` 后（或用 `/mux-agents-pane`）会在聊天旁打开 `Agents` 窗格，每 3 秒刷新一次。在任何客户端中，第一次成功 `spawn` 还会在你的窗口右边缘打开一个占满整个高度、宽为窗口五分之一（至少 40 列）的分屏，每 2 秒重绘一次；之后的启动复用它，`sidebar -Close` 在本会话剩余时间内关闭它，`sidebar` 重新打开它：
 
 ```text
-mux-agents · 2 running
-● claude-1  claude  4m
-  running the parser tests (14/20 pass)
-● copilot-1  copilot  1m
-  reviewing src/spawn.rs
-○ claude-2  exited 0
+ mux-agents         3 running / 7 ended
+
+ ◉ add-subtract [sonnet]   working  42s
+   Adding subtract(a, b) under add i...
+
+ ◌ test-calc  ✉ 1          waiting   3m
+   Done: test_calc.py passed, exit 0
+
+ ◉ fix-ci-flake            working  11m
+   Re-running tests/test_watch.rs wi...
+
+ ended -------------------------------
+ ✓ docs-usage                 done  18m
+ ✗ bump-deps              exit 101  25m
+ - spike-rmux              stopped   1h
+   +4 more  (list -All)
 ```
 
 “正在做的事”是代理最近用 `status` 报告的内容，否则是它最后一条消息的第一行，否则是它的任务。
+
+每个运行中的代理显示它的状态、用自己颜色显示的名字、选定模型时的 `[model]`，以及其父窗格还有 N 条来自它的未读消息时的 `✉ N`。`◉ working`（绿色）表示正在执行任务；`◌ waiting`（青色）表示代理正在 `read -Wait` 中等待父窗格，直到它发送消息或报告 `status`。之后是已结束的代理，最新的 3 个：`✓ done`（以 0 退出）、`✗ exit N`（红色）、`- stopped`（黄色）；`+K more` 统计其余的，`list -All` 会列出它们。启动代理时会选取本会话运行中代理用得最少的名字颜色（蓝、品红、亮蓝、亮品红；绝不与状态颜色相同），`list -Text` 也用同样的颜色显示名字。
+
+侧边栏每次重绘都按窗格的实际大小排版，绝不换行：过长的文字用 `...` 截断；窗格太矮时先去掉空行，再去掉已结束的行，然后去掉最早代理的“正在做的事”行和整行；标题始终保留。颜色依次遵循 `NO_COLOR`（关）、`FORCE_COLOR` 或 `CLICOLOR_FORCE`（开）、然后 `TERM=dumb`（关）；`MUX_AGENTS_ASCII=1` 用 `* o + x m -` 代替符号。每次重绘都在原处改写各行（不整屏清除），所以侧边栏不会闪烁；在 `TERM=dumb` 下则输出普通的帧。
 
 在标签页模式下，侧边栏留在你启动代理的窗口里，而不在每个代理的窗口里。`sidebar -Close` 只关闭这个多路复用器侧边栏；Claude Code 的 `Agents` 窗格与它无关。
 

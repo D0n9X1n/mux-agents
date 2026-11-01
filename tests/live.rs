@@ -403,10 +403,13 @@ exec claude --dangerously-skip-permissions
             self.dir.join(format!("frames.{}", &bar[1..]))
         }
 
-        /// The bar's redraws since `open_bar`: each frame starts with home and clear.
+        /// The bar's redraws since `open_bar`: each frame starts with synchronized output on and home (S2.8).
         fn frames(&self, bar: &str) -> usize {
             std::fs::read(self.frames_path(bar)).map_or(0, |bytes| {
-                bytes.windows(7).filter(|w| *w == b"\x1b[H\x1b[2J").count()
+                bytes
+                    .windows(11)
+                    .filter(|w| *w == b"\x1b[?2026h\x1b[H")
+                    .count()
             })
         }
 
@@ -1451,15 +1454,10 @@ exec claude --dangerously-skip-permissions
         assert_eq!(live.mailbox(&live.root_box()).len(), 1, "{mux:?}");
     }
 
-    // A bar's row: `^. w[12]  claude  \d+[sm]$`.
+    // A bar's live row (S2.1): `◉ w[12] … working <n>[sm]`.
     fn bar_row(line: &str) -> bool {
-        let Some(rest) = line.strip_prefix("\u{25cf} ") else {
-            return false;
-        };
-        let Some(age) = rest
-            .strip_prefix("w1  claude  ")
-            .or_else(|| rest.strip_prefix("w2  claude  "))
-        else {
+        let words: Vec<&str> = line.split_whitespace().collect();
+        let ["\u{25c9}", "w1" | "w2", "working", age] = words[..] else {
             return false;
         };
         age.len() >= 2
@@ -1467,12 +1465,140 @@ exec claude --dangerously-skip-permissions
             && age[..age.len() - 1].bytes().all(|b| b.is_ascii_digit())
     }
 
+    // A live row's state word, by the agent's name.
+    fn bar_word(screen: &str, name: &str) -> Option<String> {
+        screen.lines().find_map(|line| {
+            let words: Vec<&str> = line.split_whitespace().collect();
+            (words.get(1) == Some(&name))
+                .then(|| words.get(2).map(|w| w.to_string()))
+                .flatten()
+        })
+    }
+
     fn bar_ready(screen: &str) -> bool {
-        let lines: Vec<&str> = screen.lines().map(str::trim_end).collect();
+        let lines: Vec<&str> = screen.lines().map(str::trim).collect();
         let count = |f: &dyn Fn(&str) -> bool| lines.iter().filter(|l| f(l)).count();
-        count(&|l| l == "mux-agents \u{b7} 2 running") == 1
-            && count(&|l| l == "  checking the side bar") == 2
+        let header = ["mux-agents", "2", "running", "/", "0", "ended"];
+        count(&|l| l.split_whitespace().eq(header)) == 1
+            && count(&|l| l == "checking the side bar") == 2
             && count(&bar_row) == 2
+    }
+
+    // Every captured row fits the bar's width in display columns, and no control text leaked onto the screen.
+    fn bar_clean(live: &Live, bar: &str, screen: &str) {
+        let width: usize = live.field(bar, "#{pane_width}").parse().unwrap();
+        for line in screen.lines() {
+            assert!(
+                mux_agent::paint::width(line) <= width,
+                "{:?}: {line:?} is wider than {width}",
+                live.mux()
+            );
+            assert!(
+                !line.contains('\u{1b}')
+                    && !line.contains("2026")
+                    && !line.contains("[K")
+                    && !line.contains("[J")
+                    && !line.contains("|sidebar|"),
+                "{:?}: stray text {line:?}",
+                live.mux()
+            );
+        }
+    }
+
+    // S2 (QA round 2): a doing line of emoji ZWJ sequences, which tmux 3.2a draws part by part (4 columns each), never
+    // wraps: after the bar redrew, its first row is still the header and no row is wider than the pane.
+    fn bar_keeps_its_header_with_emoji_sequences(mux: Mux) {
+        let Some(mut live) = Live::human(mux) else {
+            return;
+        };
+        let w1 = live.spawn("w1", &[]);
+        let bar = s(&w1["sidebar"]).to_string();
+        let pid = live.worker_pid(&w1);
+        let coder = "\u{1f469}\u{200d}\u{1f4bb}";
+        std::fs::write(live.dir.join("emoji.txt"), coder.repeat(16)).unwrap();
+        let (code, status) = live
+            .server
+            .command(pid, &["status", "-BodyFile", "{dir}/emoji.txt"]);
+        assert_eq!(code, 0, "{mux:?} {status}");
+        let mut screen = String::new();
+        let drawn = eventually(Duration::from_secs(30), || {
+            screen = live.call(&["capture-pane", "-p", "-t", &bar]);
+            screen.contains('\u{1f4bb}')
+        });
+        assert!(drawn, "{mux:?}: the bar shows:\n{screen}");
+        // Two more redraws (a tick is 2 s): a wrapped row would have scrolled the header off by now.
+        std::thread::sleep(Duration::from_millis(4500));
+        screen = live.call(&["capture-pane", "-p", "-t", &bar]);
+        let first = screen.lines().next().unwrap_or_default();
+        assert!(
+            first.trim_start().starts_with("mux-agents") && first.contains("running"),
+            "{mux:?}: the first row is {first:?}:\n{screen}"
+        );
+        // Not wrapped: the doing line is one row, and every drawn row starts with the bar's margin (a wrapped rest
+        // would start at column 0).
+        let rows: Vec<&str> = screen.lines().filter(|l| !l.trim().is_empty()).collect();
+        assert_eq!(
+            rows.iter().filter(|l| l.contains('\u{1f4bb}')).count(),
+            1,
+            "{mux:?}: wrapped:\n{screen}"
+        );
+        assert!(
+            rows.iter().all(|l| l.starts_with(' ')),
+            "{mux:?}: wrapped:\n{screen}"
+        );
+        assert!(screen.contains('\u{1f4bb}'), "{mux:?}:\n{screen}");
+        bar_clean(&live, &bar, &screen);
+    }
+
+    // S2: the bar draws in color at its pane's size with nothing stray; an agent in `read -Wait` shows `waiting`
+    // until mail wakes it, then `working` again, and its waiting file is gone.
+    fn bar_shows_waiting_then_working(mux: Mux) {
+        let Some(mut live) = Live::human(mux) else {
+            return;
+        };
+        let w1 = live.spawn("w1", &[]);
+        let w2 = live.spawn("w2", &[]);
+        let bar = s(&w1["sidebar"]).to_string();
+        let pid = live.worker_pid(&w1);
+        live.worker_pid(&w2);
+        // w1's client runs `read -Wait 60` from its own pane (its first command, so its reply is number 1).
+        support::write_atomic(&live.dir.join(format!("cmd.{pid}")), "read\t-Wait\t60\n");
+        let mut screen = String::new();
+        let waiting = eventually(Duration::from_secs(30), || {
+            screen = live.call(&["capture-pane", "-p", "-t", &bar]);
+            bar_word(&screen, "w1").as_deref() == Some("waiting")
+                && bar_word(&screen, "w2").as_deref() == Some("working")
+        });
+        assert!(waiting, "{mux:?}: the bar shows:\n{screen}");
+        bar_clean(&live, &bar, &screen);
+        let folder = live.agent_dir(s(&w1["id"]));
+        let files = || -> Vec<String> {
+            std::fs::read_dir(&folder)
+                .unwrap()
+                .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+                .filter(|n| n.starts_with("waiting-"))
+                .collect()
+        };
+        assert_eq!(files().len(), 1, "{mux:?}");
+        let escaped = live.call(&["capture-pane", "-e", "-p", "-t", &bar]);
+        assert!(
+            escaped.contains("mux-agents") && escaped.contains('\u{1b}'),
+            "{mux:?}: no color in {escaped:?}"
+        );
+        let (code, sent) = live.run(&["send", "w1", "-Body", "go"]);
+        assert_eq!(code, 0, "{mux:?} {sent}");
+        let reply = live.dir.join(format!("reply.{pid}.1.json"));
+        assert!(
+            eventually(Duration::from_secs(30), || reply.is_file()),
+            "{mux:?}: the read did not return"
+        );
+        let back = eventually(Duration::from_secs(30), || {
+            screen = live.call(&["capture-pane", "-p", "-t", &bar]);
+            bar_word(&screen, "w1").as_deref() == Some("working")
+        });
+        assert!(back, "{mux:?}: the bar shows:\n{screen}");
+        assert_eq!(files(), Vec::<String>::new(), "{mux:?}");
+        bar_clean(&live, &bar, &screen);
     }
 
     // The first spawn opens one bar at the right edge, `bar_width` columns, showing the count and each status,
@@ -2074,7 +2200,8 @@ exec claude --dangerously-skip-permissions
         live.server.send_keys_to(pane, &line);
         live.server.wait("the manual watch to draw", || {
             live.call(&["capture-pane", "-p", "-t", pane])
-                .contains("mux-agents \u{b7}")
+                .lines()
+                .any(|l| l.trim_start().starts_with("mux-agents") && l.contains(" running"))
                 .then_some(())
         });
     }
@@ -2106,15 +2233,24 @@ exec claude --dangerously-skip-permissions
         let (code, all) = live.run(&["list", "-All"]);
         assert_eq!(code, 0, "{mux:?} {all}");
         let keys = |v: &Value| v.as_object().unwrap().keys().cloned().collect::<Vec<_>>();
-        assert_eq!(keys(&all), ["ok", "verb", "running", "agents"], "{mux:?}");
         assert_eq!(
-            (&all["ok"], &all["verb"], &all["running"]),
-            (&json!(true), &json!("list"), &json!(1)),
+            keys(&all),
+            ["ok", "verb", "running", "endedTotal", "agents"],
+            "{mux:?}"
+        );
+        assert_eq!(
+            (
+                &all["ok"],
+                &all["verb"],
+                &all["running"],
+                &all["endedTotal"]
+            ),
+            (&json!(true), &json!("list"), &json!(1), &json!(1)),
             "{mux:?}"
         );
         let rows = all["agents"].as_array().unwrap();
         assert_eq!(rows.len(), 2, "{mux:?} {all}");
-        const ROW: [&str; 15] = [
+        const ROW: [&str; 16] = [
             "name",
             "client",
             "pane",
@@ -2130,6 +2266,7 @@ exec claude --dangerously-skip-permissions
             "age",
             "unread",
             "model",
+            "color",
         ];
         // w2's stop notice is unread in the root's mailbox, from w2's pane.
         for (row, (w, state, unread)) in rows.iter().zip([(&w1, "running", 0), (&w2, "stopped", 1)])
@@ -3026,6 +3163,8 @@ exec claude --dangerously-skip-permissions
                     spawn_races_keep_one_bar,
                     gone_pane_closed_by_each_trigger,
                     bar_drops_a_gone_agent,
+                    bar_shows_waiting_then_working,
+                    bar_keeps_its_header_with_emoji_sequences,
                     dead_pane_closed_by_one_conditional,
                 ]
             );

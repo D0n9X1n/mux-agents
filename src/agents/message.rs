@@ -2,7 +2,8 @@
 
 use std::collections::{HashSet, VecDeque};
 use std::ops::RangeInclusive;
-use std::time::Duration;
+use std::path::{Path, PathBuf};
+use std::time::{Duration, SystemTime};
 
 use serde_json::{Map, Value, json};
 
@@ -76,6 +77,10 @@ pub fn send(ctx: &Ctx, request: &Request) -> Res<Map<String, Value>> {
                 .join("last-sent.json");
             let at = crate::util::utc_o(ctx.clock.now());
             let _ = write_json(&file, &json!({"line": doing_line(&body), "at": at}));
+            // A message sent is the agent's step done: it no longer waits.
+            if let Some(folder) = file.parent() {
+                clear_waiting(folder);
+            }
         }
         Ok(id)
     };
@@ -152,6 +157,11 @@ pub fn read(ctx: &Ctx, request: &Request) -> Res<Map<String, Value>> {
         return Ok(reply);
     }
     let me = self_of(ctx, &caller)?;
+    // Removed on every return, mail, timeout or error, when this guard drops.
+    let _waiting = match &me.record {
+        Some(_) if wait > 0 => Waiting::start(ctx, &caller, &me.key),
+        _ => None,
+    };
     let deadline = ctx.clock.now() + Duration::from_secs(wait as u64);
     let messages = loop {
         reap(ctx, &caller, None, false)?;
@@ -167,6 +177,109 @@ pub fn read(ctx: &Ctx, request: &Request) -> Res<Map<String, Value>> {
         Value::Array(messages.into_iter().map(Value::Object).collect()),
     );
     Ok(reply)
+}
+
+/// `agents/<id>/waiting-<pid>.json`: the agent's `read -Wait` run by process `pid` (S2.4).
+fn waiting_file(folder: &Path, pid: u32) -> PathBuf {
+    folder.join(format!("waiting-{pid}.json"))
+}
+
+/// The pid a waiting file's name holds; none for any other file.
+fn waiting_pid(name: &str) -> Option<u32> {
+    let digits = name.strip_prefix("waiting-")?.strip_suffix(".json")?;
+    (!digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()))
+        .then(|| digits.parse().ok())
+        .flatten()
+}
+
+/// Every waiting file in an agent's folder, with the pid its name holds.
+fn waiting_files(folder: &Path) -> Vec<(u32, PathBuf)> {
+    let Ok(entries) = std::fs::read_dir(folder) else {
+        return Vec::new();
+    };
+    entries
+        .filter_map(Result::ok)
+        .filter_map(|e| {
+            let pid = waiting_pid(e.file_name().to_str()?)?;
+            Some((pid, e.path()))
+        })
+        .collect()
+}
+
+/// Removes all of an agent's waiting files; its caller holds the agent lock. Best effort.
+pub(crate) fn clear_waiting(folder: &Path) {
+    for (_, file) in waiting_files(folder) {
+        let _ = std::fs::remove_file(file);
+    }
+}
+
+/// Whether the agent waits: some waiting file's pid is alive with its recorded start, and the file is newer than
+/// `status_at` (none: no status). A file whose process is gone or reused, or that cannot be read, is deleted. The
+/// caller holds the agent lock.
+pub(crate) fn waiting_now(ctx: &Ctx, folder: &Path, status_at: Option<SystemTime>) -> bool {
+    let mut waiting = false;
+    for (pid, file) in waiting_files(folder) {
+        let marker = read_json(&file).ok().flatten();
+        let field = |name: &str| marker.as_ref().and_then(|m| m.get(name));
+        let since = field("since")
+            .and_then(Value::as_str)
+            .and_then(crate::util::parse_utc);
+        let start = field("start").and_then(Value::as_i64);
+        let named = field("pid").and_then(Value::as_u64) == Some(u64::from(pid));
+        let alive =
+            named && start.is_some() && ctx.os.row(pid).is_some_and(|row| row.start == start);
+        let Some(since) = since.filter(|_| alive) else {
+            let _ = std::fs::remove_file(&file);
+            continue;
+        };
+        if status_at.is_none_or(|at| since > at) {
+            waiting = true;
+        }
+    }
+    waiting
+}
+
+/// The caller's own waiting file while its `read -Wait` runs; removed under the agent lock when dropped.
+struct Waiting<'a> {
+    ctx: &'a Ctx,
+    key: String,
+    file: PathBuf,
+}
+
+impl<'a> Waiting<'a> {
+    /// Writes `{pid, start, since}` under the agent lock before the first poll. Best effort: no file without a
+    /// known start time (it could not be told from a reused pid) or when the write fails.
+    fn start(ctx: &'a Ctx, caller: &crate::caller::Caller, id: &str) -> Option<Waiting<'a>> {
+        let start = ctx.os.row(ctx.pid)?.start?;
+        let file = waiting_file(&server_dir(ctx, caller).join("agents").join(id), ctx.pid);
+        let since = crate::util::utc_o(ctx.clock.now());
+        let key = lock_key("agent", caller, id);
+        lock(ctx, &key, || {
+            write_json(
+                &file,
+                &json!({"pid": ctx.pid, "start": start, "since": since}),
+            )
+        })
+        .ok()?;
+        Some(Waiting { ctx, key, file })
+    }
+}
+
+impl Drop for Waiting<'_> {
+    fn drop(&mut self) {
+        // While unwinding, the file goes without the lock, so a second panic cannot abort.
+        if std::thread::panicking() {
+            let _ = std::fs::remove_file(&self.file);
+            return;
+        }
+        let removed = lock(self.ctx, &self.key, || {
+            let _ = std::fs::remove_file(&self.file);
+            Ok(())
+        });
+        if removed.is_err() {
+            let _ = std::fs::remove_file(&self.file);
+        }
+    }
 }
 
 const POLL: Duration = Duration::from_millis(500);
@@ -1364,5 +1477,128 @@ mod tests {
             assert!(proc_calls(&w).is_empty(), "{noticed}");
             assert_eq!(stored(&w), usize::from(!noticed), "{noticed}");
         }
+    }
+
+    // ---- waiting (S2.4)
+
+    const SINCE: &str = "2026-10-29T12:00:00.0000000Z";
+
+    // An agent caller (pid 4242, started 2000) whose own pane %1 is listed live, at SINCE.
+    fn waiting_world() -> World {
+        let w = agent_world();
+        w.panes(&["%1|@1|100|aaaaaaaaaaaa|worker"]);
+        w.clock(SINCE);
+        w
+    }
+
+    // The waiting files in the caller's folder, by name.
+    fn waiting_names(w: &World) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(w.folder(ID))
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|n| n.starts_with("waiting-"))
+            .collect();
+        names.sort();
+        names
+    }
+
+    fn other_wait(w: &World) {
+        write(
+            &w.folder(ID).join("waiting-77.json"),
+            json!({"pid": 77, "start": 770, "since": SINCE}),
+        );
+    }
+
+    #[test]
+    fn read_wait_marks_the_agent_waiting_until_it_returns() {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+        let mine = format!(r#"{{"pid":4242,"start":2000,"since":"{SINCE}"}}"#);
+        // A timeout: written under the agent lock before the first poll, there at every poll, gone after.
+        let w = waiting_world();
+        other_wait(&w);
+        let file = w.folder(ID).join("waiting-4242.json");
+        let seen = Rc::new(RefCell::new(Vec::new()));
+        let (probe, during) = (file.clone(), seen.clone());
+        w.fakes.sleep_probe(move |_| {
+            during
+                .borrow_mut()
+                .push(std::fs::read_to_string(&probe).ok())
+        });
+        let agent = lock_key("agent", &w.caller(), ID);
+        w.fakes.clear_log();
+        assert_eq!(
+            run(&w, read, &["read", "-Wait", "1"]),
+            r#"ok {"messages":[]}"#
+        );
+        assert_eq!(*seen.borrow(), vec![Some(mine.clone()); 2]);
+        let locks = w.fakes.locks();
+        assert_eq!(locks[..2], [format!("+{agent}"), format!("-{agent}")]);
+        assert_eq!(
+            locks[locks.len() - 2..],
+            [format!("+{agent}"), format!("-{agent}")]
+        );
+        // An overlapping wait keeps its own file.
+        assert_eq!(waiting_names(&w), ["waiting-77.json"]);
+
+        // Mail ends the wait and the file goes.
+        let w = waiting_world();
+        let mailbox = w.state().join("mail").join(format!("{ID}.jsonl"));
+        let file = w.folder(ID).join("waiting-4242.json");
+        let probe = file.clone();
+        w.fakes.sleep_probe(move |_| {
+            assert!(probe.is_file());
+            std::fs::write(
+                &mailbox,
+                "{\"id\":\"1\",\"from\":\"p\",\"pane\":\"%4\",\"at\":\"x\",\"body\":\"go\"}\n",
+            )
+            .unwrap();
+        });
+        let reply = run(&w, read, &["read", "-Wait", "600"]);
+        assert!(reply.contains(r#"\ngo""#), "{reply}");
+        assert_eq!(waiting_names(&w), Vec::<String>::new());
+
+        // A failed mail read or a failed notice pass (the reap's pane list) removes it too.
+        let w = waiting_world();
+        w.fakes.lock_timeout("mail|");
+        assert!(run(&w, read, &["read", "-Wait", "5"]).starts_with("2 lock"));
+        assert_eq!(waiting_names(&w), Vec::<String>::new());
+        let w = waiting_world();
+        w.fakes.mux_first("list-panes", 1, "", "down");
+        assert!(run(&w, read, &["read", "-Wait", "5"]).starts_with("1 "));
+        assert_eq!(waiting_names(&w), Vec::<String>::new());
+
+        // -Wait 0 never waits, so it marks nothing.
+        let w = waiting_world();
+        let agent = lock_key("agent", &w.caller(), ID);
+        w.fakes.clear_log();
+        run(&w, read, &["read"]);
+        assert!(!w.fakes.locks().iter().any(|l| l.contains(&agent)));
+
+        // A human caller writes nothing.
+        let w = World::human("");
+        w.state();
+        w.fakes.sleep_probe(|_| {});
+        run(&w, read, &["read", "-Wait", "1"]);
+        let agents = w.state().join("agents");
+        assert_eq!(std::fs::read_dir(agents).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn send_and_status_clear_every_waiting_file() {
+        let w = waiting_world();
+        for pid in [4242, 77] {
+            write(
+                &w.folder(ID).join(format!("waiting-{pid}.json")),
+                json!({"pid": pid, "start": 1, "since": SINCE}),
+            );
+        }
+        w.file("b.md", b"done");
+        assert!(run(&w, send, &["send", "parent", "-BodyFile", "b.md"]).starts_with("ok "));
+        assert_eq!(waiting_names(&w), Vec::<String>::new());
+        other_wait(&w);
+        let status = crate::agents::view::status;
+        assert!(run(&w, status, &["status", "-BodyFile", "b.md"]).starts_with("ok "));
+        assert_eq!(waiting_names(&w), Vec::<String>::new());
     }
 }

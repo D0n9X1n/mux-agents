@@ -13,14 +13,18 @@ use crate::agents::spawn::{pane_env, utf8};
 use crate::agents::{lock, lock_key, pane_id, text};
 use crate::caller::{Caller, resolve};
 use crate::cli::Request;
-use crate::ctx::Ctx;
+use crate::ctx::{Ctx, Env};
 use crate::error::{Res, refuse};
 use crate::mux::{Output, native};
+use crate::paint::{self, Color, Style};
 
 const TICK: Duration = Duration::from_millis(2000);
 // A minute of ticks with no answer from the multiplexer: a write to a pipe whose reader closed can still succeed.
 const UNKNOWN_MAX: u32 = 30;
-const WATCH_PROBE: &str = "#{pane_id}|#{@agent-role}";
+// The bar's own pane, its label and its size, read each tick (S2.1: the layout follows the actual pane).
+const WATCH_PROBE: &str = "#{pane_id}|#{@agent-role}|#{pane_width}|#{pane_height}";
+// The bar's own size, read again after the keeper moved or resized it, so the frame fits the pane as it is now.
+const SIZE_FORMAT: &str = "#{pane_id}|#{pane_width}|#{pane_height}";
 // What the bar's split answers: its pane, window and process (#47: the bar is that process, not its label).
 const SPLIT_FORMAT: &str = "#{pane_id}|#{window_id}|#{pane_pid}";
 // The proof read of the recorded pane: alive, and still the recorded process.
@@ -30,7 +34,6 @@ pub const GONE_FORMAT: &str = "#{pane_id}|#{pane_pid}";
 // Each pane of the session and whether it carries the side-bar label, compared by the server: a label value with a
 // newline or `|` cannot forge a line.
 const LABEL_FORMAT: &str = "#{pane_id}|#{==:#{@agent-role},sidebar}";
-const CLEAR: &str = "\u{1b}[H\u{1b}[2J";
 // The bar is a fifth of its window, never narrower than this.
 const MIN_WIDTH: u32 = 40;
 // The bar's window, one row per pane (S1.3), with the zoom flag: a zoomed window is left alone.
@@ -38,8 +41,8 @@ const LAYOUT: &str = "#{pane_id}|#{pane_active}|#{pane_at_right}|#{pane_at_top}|
 // Repairs that may fail in a row before repair pauses, and how long a pause lasts when the layout does not change.
 const REPAIR_TRIES: u32 = 3;
 const REARM: Duration = Duration::from_secs(60);
-// The bar's last line while repair is paused, dim.
-const PAUSED: &str = "\u{1b}[2mlayout: repair paused\u{1b}[0m";
+// The bar's last line while repair is paused (drawn dim).
+const PAUSED: &str = "layout: repair paused";
 // `off` once `sidebar -Close` ran in the session; unset again by `sidebar`.
 const OPTION: &str = "@mux-agents-sidebar";
 // The session's bar as `<pane> <pid> <start>`, written only by `open` once the split's process is this binary
@@ -94,10 +97,7 @@ fn find_or_open(ctx: &Ctx, caller: &Caller) -> Res<(String, String, bool)> {
 
 /// A board field made safe to draw: C0 (LF included), DEL and C1 removed, so no field moves the cursor or adds a line.
 fn clean(value: Option<&Value>) -> String {
-    text(value)
-        .chars()
-        .filter(|&c| !(c < ' ' || ('\u{7f}'..='\u{9f}').contains(&c)))
-        .collect()
+    paint::clean(&text(value))
 }
 
 /// Whole seconds as 59s, 59m, 23h or 1d; `?` when unknown.
@@ -113,49 +113,531 @@ pub fn format_age(seconds: Option<&Value>) -> String {
     }
 }
 
-/// The count line, then per live agent its line (with ` [<model>]` after the client when one was chosen) and an
-/// indented doing line, per ended agent one line, except a lost one (its pane is gone). Every printed field, state
-/// included, is cleaned first; lines are joined with LF.
-pub fn format_board(board: &Map<String, Value>) -> String {
-    let running = board.get("running").and_then(Value::as_i64).unwrap_or(0);
-    let mut lines = vec![format!("mux-agents \u{b7} {running} running")];
+/// How the bar draws (S2.7, S2.8): SGR color, ASCII glyphs, and no cursor or mode controls on a dumb terminal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Look {
+    pub color: bool,
+    pub ascii: bool,
+    pub dumb: bool,
+}
+
+impl Look {
+    /// The switches from the environment, for output that is a terminal when `tty`.
+    pub fn from_env(env: &Env, tty: bool) -> Look {
+        Look {
+            color: paint::color_on(env, tty),
+            ascii: paint::ascii(env),
+            dumb: paint::dumb(env),
+        }
+    }
+}
+
+/// The bar's pane in columns and rows, read each tick.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Size {
+    pub width: usize,
+    pub height: usize,
+}
+
+// Until the pane answers its size: the bar's narrowest width and a common height.
+const FALLBACK: Size = Size {
+    width: MIN_WIDTH as usize,
+    height: 24,
+};
+// Ended agents drawn before `+K more`.
+const ENDED_SHOWN: usize = 3;
+const PLAIN: Style = Style {
+    bold: false,
+    dim: false,
+    color: None,
+};
+const BOLD: Style = Style {
+    bold: true,
+    ..PLAIN
+};
+const DIM: Style = Style { dim: true, ..PLAIN };
+const BADGE: Style = Style {
+    bold: true,
+    color: Some(Color::Blue),
+    ..PLAIN
+};
+const MAIL: &str = "\u{2709}";
+
+const fn hued(color: Color) -> Style {
+    Style {
+        color: Some(color),
+        ..PLAIN
+    }
+}
+
+// Cleaned text in one style; a row is its spans, an empty row a blank line.
+type Span = (String, Style);
+type Row = Vec<Span>;
+
+fn span(text: impl Into<String>, style: Style) -> Span {
+    (text.into(), style)
+}
+
+fn row_width(row: &[Span]) -> usize {
+    row.iter().map(|(text, _)| paint::width(text)).sum()
+}
+
+/// `row` within `max` columns: whole when it fits, else cut with `...` in the style of the span it cuts (bare under
+/// 4 columns).
+fn cut_row(row: Row, max: usize) -> Row {
+    if row_width(&row) <= max {
+        return row;
+    }
+    let (budget, tail) = if max < 4 { (max, "") } else { (max - 3, "...") };
+    let mut out = Vec::new();
+    let mut used = 0;
+    for (text, style) in row {
+        let w = paint::width(&text);
+        if used + w <= budget {
+            used += w;
+            out.push((text, style));
+            continue;
+        }
+        let kept = paint::fit(&text, budget - used);
+        out.push((format!("{kept}{tail}"), style));
+        return out;
+    }
+    out
+}
+
+/// A row as text, with SGR only when `color`; agent text was cleaned before it became a span.
+fn render(row: &[Span], color: bool) -> String {
+    row.iter()
+        .map(|(text, style)| paint::paint(text, *style, color))
+        .collect()
+}
+
+/// An agent's state as the bar draws it (S2.3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Kind {
+    Working,
+    Waiting,
+    Done,
+    Exit,
+    Stopped,
+    Other,
+}
+
+impl Kind {
+    /// Single-width glyphs (UAX #11 Neutral), or ASCII.
+    fn glyph(self, ascii: bool) -> &'static str {
+        match (self, ascii) {
+            (Kind::Working, false) => "\u{25c9}",
+            (Kind::Working, true) => "*",
+            (Kind::Waiting, false) => "\u{25cc}",
+            (Kind::Waiting, true) => "o",
+            (Kind::Done, false) => "\u{2713}",
+            (Kind::Done, true) => "+",
+            (Kind::Exit, false) => "\u{2717}",
+            (Kind::Exit, true) => "x",
+            (Kind::Stopped | Kind::Other, _) => "-",
+        }
+    }
+
+    fn style(self) -> Style {
+        match self {
+            Kind::Working => hued(Color::Green),
+            Kind::Waiting => hued(Color::Cyan),
+            Kind::Done | Kind::Other => DIM,
+            Kind::Exit => hued(Color::Red),
+            Kind::Stopped => hued(Color::Yellow),
+        }
+    }
+}
+
+/// The right side of an agent's line: its state word, then its age right-aligned.
+fn right(kind: Kind, word: &str, age: &str) -> Row {
+    vec![span(word, kind.style()), span(format!(" {age:>4}"), PLAIN)]
+}
+
+/// One agent's line in `cols` columns: `<glyph> <name><model><badge>` left, `right` right-aligned. Short of room the
+/// model goes first, then the name is cut; with no room for the right side the left is cut alone.
+fn agent_line(glyph: Span, name: Span, model: Row, badge: Row, right: Row, cols: usize) -> Row {
+    let fixed = paint::width(&glyph.0) + 1 + row_width(&badge);
+    let right_w = row_width(&right);
+    let assemble = |name: Span, model: &[Span]| -> Row {
+        let used = fixed + paint::width(&name.0) + row_width(model) + right_w;
+        let mut row = vec![glyph.clone(), span(" ", PLAIN), name];
+        row.extend(model.iter().cloned());
+        row.extend(badge.iter().cloned());
+        row.push(span(" ".repeat(cols - used), PLAIN));
+        row.extend(right.iter().cloned());
+        row
+    };
+    let name_w = paint::width(&name.0);
+    if fixed + name_w + row_width(&model) + 2 + right_w <= cols {
+        return assemble(name, &model);
+    }
+    if fixed + name_w + 2 + right_w <= cols {
+        return assemble(name, &[]);
+    }
+    if fixed + 2 + right_w + 4 <= cols {
+        let room = cols - fixed - 2 - right_w;
+        return assemble((paint::cut(&name.0, room), name.1), &[]);
+    }
+    let mut row = vec![glyph, span(" ", PLAIN), name];
+    row.extend(badge);
+    cut_row(row, cols)
+}
+
+/// The one-column margin every content row starts with.
+fn margin(mut row: Row) -> Row {
+    row.insert(0, span(" ", PLAIN));
+    row
+}
+
+/// A dim line under an agent's name: its doing line, `+K more`, `+J more running`.
+fn indented(text: &str, cols: usize) -> Row {
+    vec![span("   ", PLAIN), span(paint::cut(text, cols - 2), DIM)]
+}
+
+/// One live agent: its line, its doing line and its age (the oldest drop first).
+struct Live {
+    line: Row,
+    doing: Option<Row>,
+    age: Option<i64>,
+}
+
+/// The rows a board can draw, before the height decides which are kept.
+struct Parts {
+    header: Row,
+    live: Vec<Live>,
+    ended: Vec<Row>,
+    // Ended agents not among `ended` (lost ones included).
+    ended_more: usize,
+    // Whether the session has ended agents: the separator.
+    ended_any: bool,
+    nothing: bool,
+    notes: Vec<Row>,
+}
+
+/// Which parts are kept (S2.1's overflow order, in reverse).
+struct Shape {
+    gaps: usize,
+    doing: Vec<bool>,
+    shown: Vec<bool>,
+    live_more: bool,
+    ended: usize,
+    folded: bool,
+    sep: bool,
+    nothing: bool,
+    notes: usize,
+}
+
+fn live_row(row: &Map<String, Value>, cols: usize, look: Look) -> Live {
+    let kind = if row.get("waiting") == Some(&Value::Bool(true)) {
+        Kind::Waiting
+    } else {
+        Kind::Working
+    };
+    let name = clean(row.get("name"));
+    let hue = paint::hue(paint::identity(
+        row.get("color").and_then(Value::as_str),
+        &name,
+    ));
+    let model = clean(row.get("model"));
+    let model = if model.is_empty() {
+        Vec::new()
+    } else {
+        vec![span(format!(" [{model}]"), DIM)]
+    };
+    let unread = row.get("unread").and_then(Value::as_u64).unwrap_or(0);
+    let badge = if unread > 0 {
+        let mail = if look.ascii { "m" } else { MAIL };
+        vec![span("  ", PLAIN), span(format!("{mail} {unread}"), BADGE)]
+    } else {
+        Vec::new()
+    };
+    let word = if kind == Kind::Waiting {
+        "waiting"
+    } else {
+        "working"
+    };
+    let line = agent_line(
+        span(kind.glyph(look.ascii), kind.style()),
+        span(
+            name,
+            Style {
+                color: hue,
+                ..PLAIN
+            },
+        ),
+        model,
+        badge,
+        right(kind, word, &format_age(row.get("age"))),
+        cols,
+    );
+    let doing = clean(row.get("doing"));
+    let doing = doing.trim();
+    Live {
+        line: margin(line),
+        doing: (!doing.is_empty()).then(|| indented(doing, cols)),
+        age: row.get("age").and_then(Value::as_i64),
+    }
+}
+
+/// `mux-agents` bold, then the counts right-aligned when they fit.
+fn header(counts: &str, cols: usize) -> Row {
+    let title = span("mux-agents", BOLD);
+    let width = paint::width(counts);
+    if 10 + 2 + width > cols {
+        return margin(vec![title]);
+    }
+    margin(vec![
+        title,
+        span(" ".repeat(cols - 10 - width), PLAIN),
+        span(counts, PLAIN),
+    ])
+}
+
+fn parts(board: Option<&Map<String, Value>>, notes: &[&str], cols: usize, look: Look) -> Parts {
+    let notes = notes
+        .iter()
+        .map(|note| margin(vec![span(paint::cut(note, cols), DIM)]))
+        .collect();
+    let Some(board) = board else {
+        return Parts {
+            header: header("? running", cols),
+            live: Vec::new(),
+            ended: Vec::new(),
+            ended_more: 0,
+            ended_any: false,
+            nothing: false,
+            notes,
+        };
+    };
     let rows = board.get("agents").and_then(Value::as_array);
+    let (mut live, mut ended, mut counted) = (Vec::new(), Vec::new(), 0);
     for row in rows.map_or(&[][..], Vec::as_slice) {
         let Some(row) = row.as_object() else {
             continue;
         };
-        let name = clean(row.get("name"));
+        // Every printed field, state included, is cleaned first.
         let state = clean(row.get("state"));
         if state == "running" {
-            let model = clean(row.get("model"));
-            let tag = if model.is_empty() {
-                String::new()
-            } else {
-                format!(" [{model}]")
-            };
-            lines.push(format!(
-                "\u{25cf} {name}  {}{tag}  {}",
-                clean(row.get("client")),
-                format_age(row.get("age"))
-            ));
-            let doing = clean(row.get("doing"));
-            let doing = doing.trim();
-            if !doing.is_empty() {
-                lines.push(format!("  {doing}"));
-            }
+            live.push(live_row(row, cols, look));
             continue;
         }
-        // A lost agent's pane is gone, so there is nothing to act on: list -All keeps it, the bar does not.
-        if state == "lost" {
-            continue;
-        }
-        let ended = match row.get("exitCode").filter(|code| !code.is_null()) {
-            Some(code) if state == "exited" => format!("exited {}", clean(Some(code))),
-            _ => state,
+        counted += 1;
+        let (kind, word) = match state.as_str() {
+            // A lost agent's pane is gone: counted, never drawn.
+            "lost" => continue,
+            "exited" => match row.get("exitCode").filter(|code| !code.is_null()) {
+                Some(code) if clean(Some(code)) == "0" => (Kind::Done, "done".to_string()),
+                Some(code) => (Kind::Exit, format!("exit {}", clean(Some(code)))),
+                None => (Kind::Exit, "exit ?".to_string()),
+            },
+            "stopped" => (Kind::Stopped, state.clone()),
+            _ => (Kind::Other, state.clone()),
         };
-        lines.push(format!("\u{25cb} {name}  {ended}"));
+        let line = agent_line(
+            span(kind.glyph(look.ascii), kind.style()),
+            span(clean(row.get("name")), DIM),
+            Vec::new(),
+            Vec::new(),
+            right(kind, &word, &format_age(row.get("age"))),
+            cols,
+        );
+        ended.push(margin(line));
     }
-    lines.join("\n")
+    let total = board
+        .get("endedTotal")
+        .and_then(Value::as_u64)
+        .map_or(counted, |total| total as usize);
+    ended.truncate(ENDED_SHOWN);
+    let running = board.get("running").and_then(Value::as_i64).unwrap_or(0);
+    Parts {
+        header: header(&format!("{running} running / {total} ended"), cols),
+        nothing: live.is_empty(),
+        live,
+        ended_more: total.saturating_sub(ended.len()),
+        ended,
+        ended_any: total > 0,
+        notes,
+    }
+}
+
+/// The kept parts as rows: blocks (header, each live agent, `+J more running`, `No agents running.`, the ended
+/// section, the notes) with a blank line between the first `gaps` pairs of them.
+fn assemble(parts: &Parts, shape: &Shape, cols: usize) -> Vec<Row> {
+    let mut blocks: Vec<Vec<Row>> = vec![vec![parts.header.clone()]];
+    for (at, live) in parts.live.iter().enumerate() {
+        if !shape.shown[at] {
+            continue;
+        }
+        let mut block = vec![live.line.clone()];
+        if let Some(doing) = live.doing.as_ref().filter(|_| shape.doing[at]) {
+            block.push(doing.clone());
+        }
+        blocks.push(block);
+    }
+    let hidden = shape.shown.iter().filter(|shown| !**shown).count();
+    if hidden > 0 && shape.live_more {
+        blocks.push(vec![indented(&format!("+{hidden} more running"), cols)]);
+    }
+    if shape.nothing {
+        blocks.push(vec![margin(vec![span(
+            paint::cut("No agents running.", cols),
+            DIM,
+        )])]);
+    }
+    let mut ended = Vec::new();
+    if shape.sep {
+        ended.push(margin(vec![span(
+            format!("ended {}", "-".repeat(cols - 7)),
+            DIM,
+        )]));
+    }
+    ended.extend(parts.ended[..shape.ended].iter().cloned());
+    let more = parts.ended_more + parts.ended.len() - shape.ended;
+    if more > 0 && shape.folded {
+        ended.push(indented(&format!("+{more} more  (list -All)"), cols));
+    }
+    if !ended.is_empty() {
+        blocks.push(ended);
+    }
+    if shape.notes > 0 {
+        blocks.push(parts.notes[..shape.notes].to_vec());
+    }
+    let mut rows = Vec::new();
+    for (at, block) in blocks.into_iter().enumerate() {
+        if at > 0 && at <= shape.gaps {
+            rows.push(Vec::new());
+        }
+        rows.extend(block);
+    }
+    rows
+}
+
+/// Drops the next part in S2.1's overflow order: blank lines (the lowest first), ended rows (folded into `+K more`),
+/// the separator, doing lines of the oldest live agents, whole oldest live agents (into `+J more running`), then the
+/// summaries, `No agents running.` and the notes. False when only the header is left.
+fn drop_one(parts: &Parts, shape: &mut Shape) -> bool {
+    if shape.gaps > 0 {
+        shape.gaps -= 1;
+        return true;
+    }
+    if shape.ended > 0 {
+        shape.ended -= 1;
+        return true;
+    }
+    if shape.sep {
+        shape.sep = false;
+        return true;
+    }
+    // The oldest of those still flagged: an unknown age is oldest, a tie goes to the later pane.
+    let oldest = |flags: &[bool]| {
+        (0..flags.len())
+            .filter(|&at| flags[at])
+            .max_by_key(|&at| (parts.live[at].age.unwrap_or(i64::MAX), at))
+    };
+    if let Some(at) = oldest(&shape.doing) {
+        shape.doing[at] = false;
+        return true;
+    }
+    if let Some(at) = oldest(&shape.shown) {
+        shape.shown[at] = false;
+        return true;
+    }
+    if shape.folded && parts.ended_more + parts.ended.len() > shape.ended {
+        shape.folded = false;
+        return true;
+    }
+    if shape.live_more && shape.shown.iter().any(|shown| !shown) {
+        shape.live_more = false;
+        return true;
+    }
+    if shape.nothing {
+        shape.nothing = false;
+        return true;
+    }
+    if shape.notes > 0 {
+        shape.notes -= 1;
+        return true;
+    }
+    false
+}
+
+/// The board's rows at the bar's actual size (S2.1): at most `height` rows, each at most `width` display columns
+/// (one column is left free at the right, so no row ends in a pending wrap). Under 12 columns, the header only.
+/// `None` is a board never read: the header says `? running`.
+fn layout(board: Option<&Map<String, Value>>, notes: &[&str], size: Size, look: Look) -> Vec<Row> {
+    if size.width < 12 {
+        let max = size.width.saturating_sub(1).max(1);
+        return vec![cut_row(vec![span("mux-agents", BOLD)], max)];
+    }
+    let cols = size.width - 2;
+    let parts = parts(board, notes, cols, look);
+    let mut shape = Shape {
+        gaps: 0,
+        doing: parts.live.iter().map(|live| live.doing.is_some()).collect(),
+        shown: vec![true; parts.live.len()],
+        live_more: true,
+        ended: parts.ended.len(),
+        folded: true,
+        sep: parts.ended_any,
+        nothing: parts.nothing,
+        notes: parts.notes.len(),
+    };
+    shape.gaps = usize::MAX;
+    shape.gaps = assemble(&parts, &shape, cols)
+        .iter()
+        .filter(|row| row.is_empty())
+        .count();
+    loop {
+        let mut rows = assemble(&parts, &shape, cols);
+        if rows.len() <= size.height || !drop_one(&parts, &mut shape) {
+            rows.truncate(size.height.max(1));
+            return rows;
+        }
+    }
+}
+
+/// The board as text rows, SGR only when `look.color`; for tests and screenshots.
+pub fn format_board(
+    board: Option<&Map<String, Value>>,
+    notes: &[&str],
+    size: Size,
+    look: Look,
+) -> Vec<String> {
+    layout(board, notes, size, look)
+        .iter()
+        .map(|row| render(row, look.color))
+        .collect()
+}
+
+/// One frame (S2.8): synchronized output on, cursor home, each row then erase-to-end-of-line (only a row narrower
+/// than the pane has anything to erase), erase-below, synchronized output off; no full clear per tick. The cursor
+/// never moves below the last row, so the pane never scrolls. With `TERM=dumb`: the rows and a blank line, with no
+/// cursor or mode control (SGR still follows the color switches).
+fn frame(rows: &[Row], size: Size, look: Look) -> String {
+    let lines: Vec<String> = rows.iter().map(|row| render(row, look.color)).collect();
+    if look.dumb {
+        return format!("{}\r\n\r\n", lines.join("\r\n"));
+    }
+    let mut out = String::from("\u{1b}[?2026h\u{1b}[H");
+    for (at, (row, line)) in rows.iter().zip(&lines).enumerate() {
+        if at > 0 {
+            out.push_str("\r\n");
+        }
+        out.push_str(line);
+        if row_width(row) < size.width {
+            out.push_str("\u{1b}[K");
+        }
+    }
+    let last_full = rows.last().is_some_and(|row| row_width(row) >= size.width);
+    if rows.len() < size.height {
+        out.push_str("\r\n\u{1b}[J");
+    } else if !last_full {
+        out.push_str("\u{1b}[J");
+    }
+    out.push_str("\u{1b}[?2026l");
+    out
 }
 
 /// A gone pane answers exit 0 and empty fields; anything else is no proof.
@@ -260,6 +742,8 @@ struct Keeper {
     failures: u32,
     // While repair is paused: the layout it paused on and when.
     paused: Option<(String, SystemTime)>,
+    // Whether this tick resized or moved the bar: its size is then read again before the frame is laid out.
+    acted: bool,
 }
 
 impl Keeper {
@@ -267,11 +751,22 @@ impl Keeper {
         self.paused.is_some()
     }
 
+    /// The bar's width as last set, when one was.
+    fn width(&self) -> Option<usize> {
+        self.applied.map(|window| bar_width(window) as usize)
+    }
+
     /// One read of the bar's window. A failed or malformed read, or one without the bar, does nothing; so does a
     /// zoomed window, since resizing a pane unzooms it. A pause re-arms when the layout changed or 60 s passed. A bar
     /// in place gets its width when the window's width differs from the one last applied for; a bar out of place is
-    /// repaired unless paused.
-    fn tick(&mut self, ctx: &Ctx, bar: &str) {
+    /// repaired unless paused. True when it resized or moved the bar.
+    fn tick(&mut self, ctx: &Ctx, bar: &str) -> bool {
+        self.acted = false;
+        self.check(ctx, bar);
+        self.acted
+    }
+
+    fn check(&mut self, ctx: &Ctx, bar: &str) {
         let Some(layout) = read_layout(ctx, bar) else {
             return;
         };
@@ -313,6 +808,7 @@ impl Keeper {
     /// Sets the bar's width for a window `window` wide; remembered only when the multiplexer took it.
     fn resize(&mut self, ctx: &Ctx, bar: &str, window: u32) {
         let width = bar_width(window).to_string();
+        self.acted = true;
         if native(ctx, &["resize-pane", "-t", bar, "-x", &width], true).is_ok_and(|r| r.code == 0) {
             self.applied = Some(window);
         }
@@ -338,6 +834,7 @@ impl Keeper {
             self.fail(shape, now);
             return;
         }
+        self.acted = true;
         self.applied = None;
         self.resize(ctx, bar, layout.width);
         if let Some(active) = active {
@@ -375,12 +872,40 @@ fn in_place(bar: &Pane) -> bool {
     bar.at_right && bar.at_top && bar.at_bottom
 }
 
-/// The side-bar loop for the caller's pane. Each tick asks the pane itself and, when it answers, keeps it at the right
-/// edge of its window (`Keeper`; by its own pane, not its tag, since rmux 0.10.0's rotate-window leaves pane options
-/// behind), reads the board (ended rows with their exit codes), writes home, clear and the board (and `layout: repair
-/// paused` while repair is paused), then sleeps 2 s. Ends `pane-closed` when the probe answers gone, `output-closed`
-/// when a write fails and `probe-failed` after 30 unknown probes in a row. A failed board read still draws the last
-/// board marked `refresh failed`, so a dead terminal is found even when nothing else answers.
+/// Whether the watch probe answered a gone pane: exit 0 and only empty fields.
+fn watch_gone(probe: &Output) -> bool {
+    let line = probe.stdout.trim_end_matches(['\r', '\n']);
+    probe.code == 0 && !line.is_empty() && line.chars().all(|c| c == '|')
+}
+
+/// The pane's size from the watch probe's last two fields; none unless both are numbers of at least 1.
+fn probe_size(probe: &Output) -> Option<Size> {
+    let line = probe.stdout.trim_end_matches(['\r', '\n']);
+    let mut fields = line.rsplitn(3, '|');
+    let height = fields.next()?.parse::<usize>().ok()?;
+    let width = fields.next()?.parse::<usize>().ok()?;
+    (width >= 1 && height >= 1).then_some(Size { width, height })
+}
+
+/// The bar's own size, read again (read only); none unless the answer names the bar and parses.
+fn read_size(ctx: &Ctx, bar: &str) -> Option<Size> {
+    let read = native(
+        ctx,
+        &["display-message", "-p", "-t", bar, SIZE_FORMAT],
+        true,
+    )
+    .ok()
+    .filter(|read| read.code == 0 && read.stdout.starts_with(&format!("{bar}|")))?;
+    probe_size(&read)
+}
+
+/// The side-bar loop for the caller's pane. Each tick asks the pane itself (and its size) and, when it answers,
+/// keeps it at the right edge of its window (`Keeper`; by its own pane, not its tag, since rmux 0.10.0's
+/// rotate-window leaves pane options behind), reads the board (ended rows with their exit codes, waiting and the
+/// parent's unread), lays it out at the pane's size (and `layout: repair paused` while repair is paused), writes the
+/// frame, then sleeps 2 s. Ends `pane-closed` when the probe answers gone, `output-closed` when a write fails and
+/// `probe-failed` after 30 unknown probes in a row. A failed board read still draws the last board marked `refresh
+/// failed`, so a dead terminal is found even when nothing else answers.
 pub fn run_watch(
     ctx: &Ctx,
     caller: &Caller,
@@ -389,8 +914,11 @@ pub fn run_watch(
     // The caller's pane is already a well-formed id, so this never fails.
     let reader = mailbox_key(&caller.pane, &caller.agent_tag).unwrap_or_default();
     let own = format!("{}|", caller.pane);
+    // watch draws only to a terminal (watch_on refuses otherwise).
+    let look = Look::from_env(&ctx.env, true);
     let mut keeper = Keeper::default();
-    let mut last = "mux-agents \u{b7} ? running".to_string();
+    let mut last: Option<Map<String, Value>> = None;
+    let mut size = FALLBACK;
     let mut unknown = 0;
     loop {
         let probe = native(
@@ -399,33 +927,44 @@ pub fn run_watch(
             true,
         )
         .ok();
-        if probe.as_ref().is_some_and(gone) {
+        if probe.as_ref().is_some_and(watch_gone) {
             return "pane-closed";
         }
         let live = probe
             .as_ref()
-            .is_some_and(|p| p.code == 0 && p.stdout.starts_with(&own));
-        unknown = if live { 0 } else { unknown + 1 };
+            .filter(|p| p.code == 0 && p.stdout.starts_with(&own));
+        unknown = if live.is_some() { 0 } else { unknown + 1 };
         if unknown >= UNKNOWN_MAX {
             return "probe-failed";
         }
-        if live && own_record(ctx, caller) {
-            keeper.tick(ctx, &caller.pane);
+        if let Some(read) = live.and_then(probe_size) {
+            size = read;
         }
-        let mut failed = !live;
+        if live.is_some() && own_record(ctx, caller) && keeper.tick(ctx, &caller.pane) {
+            // The keeper resized or moved the bar: lay out at its size now, else at the width it set.
+            match read_size(ctx, &caller.pane) {
+                Some(read) => size = read,
+                None => {
+                    if let Some(width) = keeper.width() {
+                        size.width = width;
+                    }
+                }
+            }
+        }
+        let mut failed = live.is_none();
         match board(ctx, caller, &reader, true, true) {
-            Ok(board) => last = format_board(&board),
+            Ok(board) => last = Some(board),
             Err(_) => failed = true,
         }
-        let mut text = last.clone();
+        let mut notes = Vec::new();
         if failed {
-            text.push_str("\nrefresh failed");
+            notes.push("refresh failed");
         }
         if keeper.paused() {
-            text.push('\n');
-            text.push_str(PAUSED);
+            notes.push(PAUSED);
         }
-        if write(&format!("{CLEAR}{}\r\n", text.replace('\n', "\r\n"))).is_err() {
+        let rows = layout(last.as_ref(), &notes, size, look);
+        if write(&frame(&rows, size, look)).is_err() {
             return "output-closed";
         }
         ctx.clock.sleep(TICK);
@@ -902,9 +1441,6 @@ mod tests {
     use std::collections::VecDeque;
     use std::rc::Rc;
 
-    const DOT: char = '\u{b7}';
-    const FULL: char = '\u{25cf}';
-    const OPEN: char = '\u{25cb}';
     const READ_RECORD: &str = "-N show-options -qv -t $3 @mux-agents-sidebar-id";
     const CLEAR_RECORD: &str = "-N set-option -u -t $3 @mux-agents-sidebar-id";
     const LABELS: &str = "-N list-panes -s -t $3 -F #{pane_id}|#{==:#{@agent-role},sidebar}";
@@ -924,89 +1460,560 @@ mod tests {
         }
     }
 
-    fn board(value: Value) -> Map<String, Value> {
-        value.as_object().unwrap().clone()
+    // ---- the bar's layout (S2.1-S2.9)
+
+    const W40: Size = Size {
+        width: 40,
+        height: 40,
+    };
+    const PLAIN_LOOK: Look = Look {
+        color: false,
+        ascii: false,
+        dumb: false,
+    };
+
+    // A row of a 40-column bar: `left` after the margin, `right` ending one column short of the edge.
+    fn pad(left: &str, right: &str) -> String {
+        let used = left.chars().count() + right.chars().count();
+        format!(" {left}{}{right}", " ".repeat(38 - used))
+    }
+
+    fn plain(board: &Value, size: Size) -> Vec<String> {
+        format_board(board.as_object(), &[], size, PLAIN_LOOK)
+    }
+
+    // Text without its SGR sequences; any other ESC sequence is left in place.
+    fn strip_sgr(text: &str) -> String {
+        let mut out = String::new();
+        let mut rest = text;
+        while let Some(at) = rest.find("\u{1b}[") {
+            let after = &rest[at + 2..];
+            let Some(end) = after.find('m') else { break };
+            if !after[..end]
+                .bytes()
+                .all(|b| b.is_ascii_digit() || b == b';')
+            {
+                out.push_str(&rest[..at + 2]);
+                rest = after;
+                continue;
+            }
+            out.push_str(&rest[..at]);
+            rest = &after[end + 1..];
+        }
+        out.push_str(rest);
+        out
+    }
+
+    // The issue's mock-up: three live agents (one waiting, with an unread message), 7 ended of which the feed has 4.
+    fn mock() -> Value {
+        json!({"running": 3, "endedTotal": 7, "agents": [
+            {"name": "add-subtract", "state": "running", "doing": "Adding subtract(a, b) under add in calc.py", "age": 42, "unread": 0, "color": "blue", "waiting": false},
+            {"name": "test-calc", "state": "running", "doing": "Done: test_calc.py passed, exit 0", "age": 180, "unread": 1, "color": "magenta", "waiting": true},
+            {"name": "fix-ci-flake", "state": "running", "doing": "Re-running tests/test_watch.rs with --nocapture", "age": 660, "unread": 0, "color": "bright-blue", "waiting": false},
+            {"name": "docs-usage", "state": "exited", "exitCode": 0, "age": 1080},
+            {"name": "bump-deps", "state": "exited", "exitCode": 101, "age": 1500},
+            {"name": "spike-rmux", "state": "stopped", "exitCode": null, "age": 3600},
+            {"name": "older", "state": "stopped", "exitCode": null, "age": 7200}
+        ]})
     }
 
     #[test]
-    fn format_board_lines_and_cleaning() {
-        let text = format_board(&board(json!({"running": 2, "agents": [
-            {"name": "claude-1", "client": "claude", "state": "running", "doing": "parse the config", "age": 240},
-            {"name": "idle", "client": "copilot", "state": "running", "doing": null, "age": 5},
-            {"name": "copilot-1", "client": "copilot", "state": "exited", "exitCode": 0, "age": 900},
-            {"name": "crashed", "client": "claude", "state": "exited", "exitCode": null, "age": 60},
-            {"name": "halted", "client": "claude", "state": "stopped", "exitCode": 7, "age": 60},
-            {"name": "vanished", "client": "claude", "state": "lost", "age": 60},
-            null
-        ]})));
-        // A lost agent's pane is gone: nothing to act on, so the bar draws no row for it.
+    fn layout_draws_the_mock_up() {
         assert_eq!(
-            text,
-            format!(
-                "mux-agents {DOT} 2 running\n{FULL} claude-1  claude  4m\n  parse the config\n{FULL} idle  copilot  5s\n\
-                 {OPEN} copilot-1  exited 0\n{OPEN} crashed  exited\n{OPEN} halted  stopped"
-            )
+            plain(&mock(), W40),
+            [
+                pad("mux-agents", "3 running / 7 ended"),
+                String::new(),
+                pad("\u{25c9} add-subtract", "working  42s"),
+                "   Adding subtract(a, b) under add i...".to_string(),
+                String::new(),
+                pad("\u{25cc} test-calc  \u{2709} 1", "waiting   3m"),
+                "   Done: test_calc.py passed, exit 0".to_string(),
+                String::new(),
+                pad("\u{25c9} fix-ci-flake", "working  11m"),
+                "   Re-running tests/test_watch.rs wi...".to_string(),
+                String::new(),
+                format!(" ended {}", "-".repeat(31)),
+                pad("\u{2713} docs-usage", "done  18m"),
+                pad("\u{2717} bump-deps", "exit 101  25m"),
+                pad("- spike-rmux", "stopped   1h"),
+                "   +4 more  (list -All)".to_string(),
+            ]
         );
+    }
+
+    #[test]
+    fn layout_nothing_running_and_more_ended() {
+        // Nothing live: `No agents running.`, even with ended agents. A lost one is counted, never drawn.
+        let ended = json!({"running": 0, "endedTotal": 3, "agents": [
+            {"name": "gone", "state": "lost", "age": 60},
+            {"name": "halted", "state": "stopped", "exitCode": null, "age": 60},
+            {"name": "crashed", "state": "exited", "exitCode": null, "age": null}
+        ]});
         assert_eq!(
-            format_board(&board(json!({"running": 0, "agents": []}))),
-            format!("mux-agents {DOT} 0 running")
+            plain(&ended, W40),
+            [
+                pad("mux-agents", "0 running / 3 ended"),
+                String::new(),
+                " No agents running.".to_string(),
+                String::new(),
+                format!(" ended {}", "-".repeat(31)),
+                pad("- halted", "stopped   1m"),
+                pad("\u{2717} crashed", "exit ?    ?"),
+                "   +1 more  (list -All)".to_string(),
+            ]
         );
-        // Every C0, DEL and C1 code point goes, one at a time; its neighbours and U+00A0 stay.
-        let mut kept = Vec::new();
-        for code in (0u32..32).chain([127]).chain(128..160) {
-            let name = format!("a{}b", char::from_u32(code).unwrap());
-            let text = format_board(&board(
-                json!({"running": 0, "agents": [{"name": name, "state": "stopped"}]}),
-            ));
-            if text != format!("mux-agents {DOT} 0 running\n{OPEN} ab  stopped") {
-                kept.push(format!("{code:04X}"));
+        let empty = json!({"running": 0, "endedTotal": 0, "agents": []});
+        assert_eq!(
+            plain(&empty, W40),
+            [
+                pad("mux-agents", "0 running / 0 ended"),
+                String::new(),
+                " No agents running.".to_string(),
+            ]
+        );
+        // 12 ended, of which the feed carries 10: `12 ended`, 3 rows, `+9 more`.
+        let rows: Vec<Value> = (0..10)
+            .map(|n| json!({"name": format!("a{n}"), "state": "stopped", "age": 60}))
+            .collect();
+        let twelve = json!({"running": 0, "endedTotal": 12, "agents": rows});
+        let got = plain(&twelve, W40);
+        assert_eq!(got[0], pad("mux-agents", "0 running / 12 ended"));
+        assert_eq!(
+            got[got.len() - 4..],
+            [
+                pad("- a0", "stopped   1m"),
+                pad("- a1", "stopped   1m"),
+                pad("- a2", "stopped   1m"),
+                "   +9 more  (list -All)".to_string()
+            ]
+        );
+        // A board never read.
+        assert_eq!(
+            format_board(None, &["refresh failed"], W40, PLAIN_LOOK),
+            [
+                pad("mux-agents", "? running"),
+                String::new(),
+                " refresh failed".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn layout_fits_any_width_in_display_columns() {
+        let mut long = mock();
+        long["agents"][0]["name"] = json!("a-very-long-agent-name-xx");
+        long["agents"][0]["model"] = json!("claude-sonnet-4-5[1m]");
+        long["agents"][1]["unread"] = json!(12345);
+        for width in [40, 55, 20, 13, 12, 11, 10, 4, 2, 1] {
+            for board in [mock(), long.clone()] {
+                let rows = plain(&board, Size { width, height: 40 });
+                for row in &rows {
+                    assert!(crate::paint::width(row) <= width, "{width}: {row:?}");
+                }
+                assert_eq!(rows.len() == 1, width < 12, "{width}: {rows:?}");
             }
         }
-        assert_eq!(kept, Vec::<String>::new());
-        // Every printed field is cleaned, state included, before it is compared.
-        let controls: String = (0u32..32)
-            .chain([127])
-            .chain(128..160)
-            .map(|c| char::from_u32(c).unwrap())
-            .collect();
-        let text = format_board(&board(json!({"running": 1, "agents": [
-            {"name": format!("w{controls}1"), "client": format!("cl{controls}aude"), "state": format!("run{controls}ning"), "doing": format!("do{controls}ing"), "age": 240},
-            {"name": format!("x{controls}2"), "state": format!("exi{controls}ted"), "exitCode": format!("3{controls}")},
-            {"name": format!("y{controls}3"), "state": format!("sto{controls}pped")},
-            {"name": format!("z{controls}4"), "state": format!("lo{controls}st")}
-        ]})));
-        // A state that reads `lost` once cleaned draws no row either.
+        // Below 12 columns, the header only, cut to the width.
+        let tiny = |width| plain(&mock(), Size { width, height: 9 });
         assert_eq!(
-            text,
-            format!(
-                "mux-agents {DOT} 1 running\n{FULL} w1  claude  4m\n  doing\n{OPEN} x2  exited 3\n{OPEN} y3  stopped"
-            )
+            [tiny(11), tiny(10), tiny(4), tiny(1)],
+            [["mux-agents"], ["mux-ag..."], ["mux"], ["m"]]
         );
-        // An escape sequence keeps only its printable rest.
-        let text = format_board(&board(json!({"running": 1, "agents": [
-            {"name": "a\u{1b}[2J\u{9b}b\u{7}", "client": "claude", "state": "running", "doing": "do\u{1b}]0;x\u{7}ing", "age": 240}
-        ]})));
+        // Short of room the model goes first, then the name is cut; wider, the model is kept.
+        let rows = plain(&long, W40);
         assert_eq!(
-            text,
-            format!("mux-agents {DOT} 1 running\n{FULL} a[2Jb  claude  4m\n  do]0;xing")
+            rows[2],
+            pad("\u{25c9} a-very-long-agent-n...", "working  42s")
+        );
+        let rows = plain(
+            &long,
+            Size {
+                width: 80,
+                height: 40,
+            },
+        );
+        assert!(
+            rows[2].contains("a-very-long-agent-name-xx [claude-sonnet-4-5[1m]]"),
+            "{}",
+            rows[2]
+        );
+        // Doing lines of wide characters or combining marks are cut by display columns.
+        let mut wide = mock();
+        wide["agents"][0]["doing"] = json!("\u{754c}".repeat(30));
+        wide["agents"][1]["doing"] = json!("e\u{301}".repeat(40));
+        let rows = plain(&wide, W40);
+        assert_eq!(rows[3], format!("   {}...", "\u{754c}".repeat(16)));
+        assert_eq!(rows[6], format!("   {}...", "e\u{301}".repeat(33)));
+        assert_eq!(
+            (crate::paint::width(&rows[3]), crate::paint::width(&rows[6])),
+            (38, 39)
         );
     }
 
+    // Columns of the samples below, written out by hand: never the code under test. A ZWJ sequence counts each part,
+    // as a multiplexer that does not cluster it draws them.
+    fn sample_columns(text: &str) -> usize {
+        let chars: Vec<char> = text.chars().collect();
+        let mut total = 0;
+        for (at, &c) in chars.iter().enumerate() {
+            total += match c {
+                '\u{301}' | '\u{200b}' | '\u{200d}' | '\u{fe0f}' => 0,
+                '\u{2764}' if chars.get(at + 1) == Some(&'\u{fe0f}') => 2,
+                '\u{754c}' | '\u{fe10}' | '\u{1f680}' | '\u{1f469}' | '\u{1f4bb}' => 2,
+                _ => 1,
+            };
+        }
+        total
+    }
+
     #[test]
-    fn format_board_tags_a_chosen_model() {
-        // A live agent's chosen model follows its client; inherited (null) or ended shows none. It is cleaned too.
-        let text = format_board(&board(json!({"running": 2, "agents": [
-            {"name": "w1", "client": "claude", "state": "running", "doing": null, "age": 5, "model": "sonnet"},
-            {"name": "w2", "client": "copilot", "state": "running", "doing": null, "age": 5, "model": null},
-            {"name": "w3", "client": "claude", "state": "running", "doing": null, "age": 5, "model": "op\u{1b}us"},
-            {"name": "w4", "client": "claude", "state": "stopped", "age": 5, "model": "sonnet"}
-        ]})));
+    fn layout_never_under_counts_a_zwj_sequence() {
+        // 16 of `👩‍💻` (4 columns each, part by part) as a name and a doing line at W = 40: every row fits.
+        let coder = "\u{1f469}\u{200d}\u{1f4bb}";
+        let board = json!({"running": 1, "endedTotal": 1, "agents": [
+            {"name": coder.repeat(16), "state": "running", "doing": coder.repeat(16), "age": 5, "unread": 0},
+            {"name": coder.repeat(16), "state": "stopped", "age": 60}
+        ]});
+        let rows = plain(&board, W40);
+        for row in &rows {
+            assert!(sample_columns(row) <= 40, "{row:?}");
+        }
+        assert_eq!(rows[3], format!("   {}...", coder.repeat(8)));
+        assert_eq!(sample_columns(&rows[3]), 38);
+    }
+
+    #[test]
+    fn layout_counts_emoji_and_vertical_forms_by_their_columns() {
+        let coder = "\u{1f469}\u{200d}\u{1f4bb}";
+        // Each sample's doing line at W = 40: 3 columns of indent, then at most 33 columns of whole clusters and `...`
+        // (16 two-column clusters make 32: a 17th would not fit, so the row is 38 columns; 8 four-column `👩‍💻` too).
+        let samples: [(&str, usize, usize); 6] = [
+            ("\u{fe10}", 16, 38),
+            ("\u{1f680}", 16, 38),
+            ("\u{2764}\u{fe0f}", 16, 38),
+            (coder, 8, 38),
+            ("e\u{301}", 33, 39),
+            ("a\u{200b}", 33, 39),
+        ];
+        for (sample, kept, columns) in samples {
+            let board = json!({"running": 1, "endedTotal": 0, "agents": [
+                {"name": "w", "state": "running", "doing": sample.repeat(40), "age": 5, "unread": 0}
+            ]});
+            let rows = plain(&board, W40);
+            assert_eq!(
+                rows[3],
+                format!("   {}...", sample.repeat(kept)),
+                "{sample:?}"
+            );
+            assert_eq!(sample_columns(&rows[3]), columns, "{sample:?}");
+        }
+        // A name of rockets is cut by columns too, and every row of every sample fits each width.
+        let rockets = json!({"running": 1, "endedTotal": 0, "agents": [
+            {"name": "\u{1f680}".repeat(20), "state": "running", "doing": "\u{fe10}".repeat(40), "age": 5, "unread": 0}
+        ]});
+        // 38 columns: glyph and space (2), the name cut to 22 (9 rockets and `...`, 21), 3 spaces, `working   5s`.
         assert_eq!(
-            text,
+            plain(&rockets, W40)[2],
+            format!(" \u{25c9} {}...   working   5s", "\u{1f680}".repeat(9))
+        );
+        for width in [55, 40, 20, 13, 12] {
+            for (sample, _, _) in samples {
+                let board = json!({"running": 1, "endedTotal": 1, "agents": [
+                    {"name": sample.repeat(12), "state": "running", "doing": sample.repeat(40), "age": 5, "unread": 0},
+                    {"name": sample.repeat(12), "state": "stopped", "age": 60}
+                ]});
+                for row in plain(&board, Size { width, height: 40 }) {
+                    assert!(sample_columns(&row) <= width, "{width} {sample:?}: {row:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn layout_keeps_to_the_pane_height_in_overflow_order() {
+        // 6 live agents (w6 oldest) and 3 ended at H = 10: blank lines go, the ended rows fold into `+3 more`, the
+        // separator goes, then the doing lines of the oldest four.
+        let mut agents: Vec<Value> = (1..=6)
+            .map(|n| json!({"name": format!("w{n}"), "state": "running", "doing": format!("doing {n}"), "age": n * 10, "unread": 0}))
+            .collect();
+        for n in 1..=3 {
+            agents.push(json!({"name": format!("e{n}"), "state": "stopped", "age": 60}));
+        }
+        let board = json!({"running": 6, "endedTotal": 3, "agents": agents});
+        let live = |n: u32| {
+            let age = format_age(Some(&json!(n * 10)));
+            pad(&format!("\u{25c9} w{n}"), &format!("working {age:>4}"))
+        };
+        assert_eq!(
+            plain(
+                &board,
+                Size {
+                    width: 40,
+                    height: 10
+                }
+            ),
+            [
+                pad("mux-agents", "6 running / 3 ended"),
+                live(1),
+                "   doing 1".to_string(),
+                live(2),
+                "   doing 2".to_string(),
+                live(3),
+                live(4),
+                live(5),
+                live(6),
+                "   +3 more  (list -All)".to_string(),
+            ]
+        );
+        // 1 live and 1 ended at H = 3, 2, 1: the live agent folds into `+1 more running`, then the summaries go; the
+        // header is the last row kept.
+        let board = json!({"running": 1, "endedTotal": 1, "agents": [
+            {"name": "w", "state": "running", "doing": "x", "age": 5, "unread": 0},
+            {"name": "e", "state": "stopped", "age": 60}
+        ]});
+        let header = pad("mux-agents", "1 running / 1 ended");
+        let at = |height| plain(&board, Size { width: 40, height });
+        assert_eq!(at(7).len(), 7);
+        assert_eq!(
+            at(3),
+            [
+                header.clone(),
+                pad("\u{25c9} w", "working   5s"),
+                "   +1 more  (list -All)".to_string()
+            ]
+        );
+        assert_eq!(at(2), [header.clone(), "   +1 more running".to_string()]);
+        assert_eq!(at(1), [header]);
+        // The mock-up at every height keeps the header first and never more rows than the pane.
+        for height in 1..=20 {
+            let rows = plain(&mock(), Size { width: 40, height });
+            assert!(rows.len() <= height, "{height}");
+            assert_eq!(rows[0], pad("mux-agents", "3 running / 7 ended"));
+        }
+    }
+
+    #[test]
+    fn layout_colors_by_state_and_identity() {
+        let color = Look {
+            color: true,
+            ..PLAIN_LOOK
+        };
+        let mut board = mock();
+        board["agents"][0]["model"] = json!("sonnet");
+        board["agents"][1]["unread"] = json!(2);
+        let size = Size {
+            width: 60,
+            height: 40,
+        };
+        let rows = format_board(board.as_object(), &[], size, color);
+        let sgr = |codes: &str, text: &str| format!("\u{1b}[{codes}m{text}\u{1b}[0m");
+        let starts = |at: usize, want: String| {
+            assert!(rows[at].starts_with(&want), "{at}: {:?}", rows[at]);
+        };
+        starts(0, format!(" {}", sgr("1", "mux-agents")));
+        starts(
+            2,
             format!(
-                "mux-agents {DOT} 2 running\n{FULL} w1  claude [sonnet]  5s\n{FULL} w2  copilot  5s\n\
-                 {FULL} w3  claude [opus]  5s\n{OPEN} w4  stopped"
+                " {} {}{}",
+                sgr("32", "\u{25c9}"),
+                sgr("34", "add-subtract"),
+                sgr("2", " [sonnet]")
+            ),
+        );
+        assert!(rows[2].ends_with(&format!("{}  42s", sgr("32", "working"))));
+        assert_eq!(
+            rows[3],
+            format!(
+                "   {}",
+                sgr("2", "Adding subtract(a, b) under add in calc.py")
             )
+        );
+        starts(
+            5,
+            format!(
+                " {} {}  {}",
+                sgr("36", "\u{25cc}"),
+                sgr("35", "test-calc"),
+                sgr("1;34", "\u{2709} 2")
+            ),
+        );
+        assert!(rows[5].contains(&sgr("36", "waiting")));
+        starts(
+            8,
+            format!(" {} {}", sgr("32", "\u{25c9}"), sgr("94", "fix-ci-flake")),
+        );
+        assert_eq!(
+            rows[11],
+            format!(" {}", sgr("2", &format!("ended {}", "-".repeat(51))))
+        );
+        starts(
+            12,
+            format!(" {} {}", sgr("2", "\u{2713}"), sgr("2", "docs-usage")),
+        );
+        assert!(rows[12].contains(&sgr("2", "done")));
+        starts(
+            13,
+            format!(" {} {}", sgr("31", "\u{2717}"), sgr("2", "bump-deps")),
+        );
+        assert!(rows[13].contains(&sgr("31", "exit 101")));
+        starts(
+            14,
+            format!(" {} {}", sgr("33", "-"), sgr("2", "spike-rmux")),
+        );
+        assert!(rows[14].contains(&sgr("33", "stopped")));
+        assert_eq!(rows[15], format!("   {}", sgr("2", "+4 more  (list -All)")));
+        // Without the SGR they are the plain rows.
+        let plain_rows = format_board(board.as_object(), &[], size, PLAIN_LOOK);
+        assert_eq!(
+            rows.iter().map(|r| strip_sgr(r)).collect::<Vec<_>>(),
+            plain_rows
+        );
+        // A row without a color takes its name's hue, as list -Text does.
+        board["agents"][0].as_object_mut().unwrap().remove("color");
+        let rows = format_board(board.as_object(), &[], size, color);
+        let hue = match crate::paint::identity(None, "add-subtract") {
+            "blue" => "34",
+            "magenta" => "35",
+            "bright-blue" => "94",
+            _ => "95",
+        };
+        assert!(rows[2].contains(&sgr(hue, "add-subtract")), "{:?}", rows[2]);
+    }
+
+    #[test]
+    fn layout_ascii_glyphs() {
+        let ascii = Look {
+            ascii: true,
+            ..PLAIN_LOOK
+        };
+        let mut board = mock();
+        board["agents"][1]["unread"] = json!(2);
+        let rows = format_board(board.as_object(), &[], W40, ascii);
+        let glyphs: Vec<&str> = [2, 5, 8, 12, 13, 14]
+            .iter()
+            .map(|&at| &rows[at][1..2])
+            .collect();
+        assert_eq!(glyphs, ["*", "o", "*", "+", "x", "-"]);
+        assert!(rows[5].contains("test-calc  m 2"), "{}", rows[5]);
+        assert!(rows[3].ends_with("..."));
+        assert!(rows.iter().all(|r| r.is_ascii()), "{rows:?}");
+    }
+
+    #[test]
+    fn agent_text_never_reaches_the_frame_as_controls() {
+        let evil = "a\u{1b}[31mred\u{1b}]8;;http://x\u{7}link\u{1b}]8;;\u{7}\u{9b}2J\u{85}\u{7f}z";
+        let board = json!({"running": 1, "endedTotal": 1, "agents": [
+            {"name": evil, "state": "running", "doing": evil, "model": evil, "age": 5, "unread": 0, "color": evil},
+            {"name": evil, "state": "exited", "exitCode": evil, "age": 5}
+        ]});
+        let size = Size {
+            width: 200,
+            height: 40,
+        };
+        for look in [
+            PLAIN_LOOK,
+            Look {
+                color: true,
+                ..PLAIN_LOOK
+            },
+        ] {
+            let text = frame(&layout(board.as_object(), &[], size, look), size, look);
+            // Only the frame's own controls and SGR are escapes; nothing else is a control.
+            let rest = strip_sgr(
+                &[
+                    "\u{1b}[?2026h",
+                    "\u{1b}[?2026l",
+                    "\u{1b}[H",
+                    "\u{1b}[K",
+                    "\u{1b}[J",
+                ]
+                .iter()
+                .fold(text.replace("\r\n", "\n"), |t, c| t.replace(c, "")),
+            );
+            let bad: Vec<char> = rest
+                .chars()
+                .filter(|&c| c != '\n' && (c < ' ' || ('\u{7f}'..='\u{9f}').contains(&c)))
+                .collect();
+            assert_eq!(bad, Vec::<char>::new(), "{rest:?}");
+            assert!(rest.contains("a[31mred]8;;http://xlink]8;;2Jz"), "{rest:?}");
+        }
+        // Every C0, DEL and C1 code point goes, one at a time, before the width is counted.
+        for code in (0u32..32).chain([127]).chain(128..160) {
+            let name = format!("a{}b", char::from_u32(code).unwrap());
+            let board = json!({"running": 0, "endedTotal": 1, "agents": [{"name": name, "state": "stopped", "age": 60}]});
+            assert_eq!(
+                plain(&board, W40)[5],
+                pad("- ab", "stopped   1m"),
+                "{code:04X}"
+            );
+        }
+    }
+
+    #[test]
+    fn frame_bytes() {
+        let size = Size {
+            width: 40,
+            height: 20,
+        };
+        let rows = layout(mock().as_object(), &[], size, PLAIN_LOOK);
+        let text = frame(&rows, size, PLAIN_LOOK);
+        let (head, tail) = ("\u{1b}[?2026h\u{1b}[H", "\r\n\u{1b}[J\u{1b}[?2026l");
+        assert!(text.starts_with(head) && text.ends_with(tail), "{text:?}");
+        assert!(!text.contains("\u{1b}[2J"));
+        let body = &text[head.len()..text.len() - tail.len()];
+        let lines: Vec<&str> = body.split("\r\n").collect();
+        assert_eq!(lines.len(), 16);
+        assert!(lines.iter().all(|l| l.ends_with("\u{1b}[K")), "{lines:?}");
+        // At the pane's height the cursor stays on the last row: no line feed after it, so nothing scrolls.
+        let short = Size {
+            width: 40,
+            height: 3,
+        };
+        let text = frame(
+            &layout(mock().as_object(), &[], short, PLAIN_LOOK),
+            short,
+            PLAIN_LOOK,
+        );
+        assert_eq!(text.matches("\r\n").count(), 2);
+        assert!(text.ends_with("\u{1b}[K\u{1b}[J\u{1b}[?2026l"), "{text:?}");
+        // TERM=dumb: the rows and a blank line, no ESC; forced color keeps SGR only.
+        let dumb = Look {
+            dumb: true,
+            ..PLAIN_LOOK
+        };
+        let text = frame(&rows, size, dumb);
+        let plain_rows = format_board(mock().as_object(), &[], size, PLAIN_LOOK);
+        assert_eq!(text, format!("{}\r\n\r\n", plain_rows.join("\r\n")));
+        assert!(!text.contains('\u{1b}'));
+        let forced = Look {
+            dumb: true,
+            color: true,
+            ..PLAIN_LOOK
+        };
+        let text = frame(&layout(mock().as_object(), &[], size, forced), size, forced);
+        assert!(text.contains("\u{1b}[1mmux-agents\u{1b}[0m"));
+        assert!(!strip_sgr(&text).contains('\u{1b}'), "{text:?}");
+        // The switches from the environment.
+        let env = |pairs: &[(&str, &str)]| {
+            crate::ctx::Env::from_pairs(pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())))
+        };
+        let look = |color, ascii, dumb| Look { color, ascii, dumb };
+        assert_eq!(
+            [
+                Look::from_env(&env(&[("TERM", "dumb")]), true),
+                Look::from_env(&env(&[("TERM", "dumb"), ("FORCE_COLOR", "1")]), true),
+                Look::from_env(&env(&[("NO_COLOR", "1"), ("MUX_AGENTS_ASCII", "1")]), true),
+                Look::from_env(&env(&[]), true),
+                Look::from_env(&env(&[]), false),
+            ],
+            [
+                look(false, false, true),
+                look(true, false, true),
+                look(false, true, false),
+                look(true, false, false),
+                look(false, false, false),
+            ]
         );
     }
 
@@ -1045,6 +2052,8 @@ mod tests {
         for pair in env.iter_mut().filter(|(k, _)| k == "TMUX_PANE") {
             pair.1 = "%7".into();
         }
+        // Plain frames: the watch draws to a terminal, so it would color.
+        env.push(("NO_COLOR".into(), "1".into()));
         let mut w = w;
         w.ctx.env = crate::ctx::Env::from_pairs(env);
         w.clock("1970-01-01T00:04:00Z");
@@ -1072,10 +2081,14 @@ mod tests {
                     *queue.front().unwrap()
                 };
                 match answer {
-                    "live" => Ok(out(0, "%7|sidebar\n", "")),
+                    "live" => Ok(out(0, "%7|sidebar|40|24\n", "")),
+                    // The pane 55 columns wide, as a drag or the split leaves it before the keeper acts.
+                    "wide" => Ok(out(0, "%7|sidebar|55|24\n", "")),
+                    // The pane 4 rows high.
+                    "short" => Ok(out(0, "%7|sidebar|40|4\n", "")),
                     // The pane itself, without the bar's tag: watch run by hand in some pane.
-                    "untagged" => Ok(out(0, "%7|\n", "")),
-                    "gone" => Ok(out(0, "|\n", "")),
+                    "untagged" => Ok(out(0, "%7||40|24\n", "")),
+                    "gone" => Ok(out(0, "|||\n", "")),
                     "fail" => Ok(out(1, "", "no server")),
                     _ => refuse(1, "endpoint", "the rmux endpoint did not answer"),
                 }
@@ -1087,7 +2100,7 @@ mod tests {
         w.fakes
             .mux_calls()
             .iter()
-            .filter(|c| c.last().is_some_and(|a| a == "#{pane_id}|#{@agent-role}"))
+            .filter(|c| c.last().is_some_and(|a| a == WATCH_PROBE))
             .count()
     }
 
@@ -1103,10 +2116,66 @@ mod tests {
         (ended, frames)
     }
 
-    fn board_frame() -> String {
+    // The watch world's board at 40x24, plain.
+    fn board_rows() -> Vec<String> {
+        vec![
+            pad("mux-agents", "1 running / 1 ended"),
+            String::new(),
+            pad("\u{25c9} worker", "working   4m"),
+            "   testing the parser".into(),
+            String::new(),
+            format!(" ended {}", "-".repeat(31)),
+            pad("\u{2713} done", "done   4m"),
+        ]
+    }
+
+    // A frame of `rows` in a 40-column pane `height` rows high.
+    fn screen(rows: &[String], height: usize) -> String {
+        let lines: Vec<String> = rows
+            .iter()
+            .map(|r| {
+                if crate::paint::width(r) < 40 {
+                    format!("{r}\u{1b}[K")
+                } else {
+                    r.clone()
+                }
+            })
+            .collect();
+        let end = if rows.len() < height {
+            "\r\n\u{1b}[J"
+        } else {
+            "\u{1b}[J"
+        };
         format!(
-            "\u{1b}[H\u{1b}[2Jmux-agents {DOT} 1 running\r\n{FULL} worker  claude  4m\r\n  testing the parser\r\n{OPEN} done  exited 0\r\n"
+            "\u{1b}[?2026h\u{1b}[H{}{end}\u{1b}[?2026l",
+            lines.join("\r\n")
         )
+    }
+
+    fn board_frame() -> String {
+        screen(&board_rows(), 24)
+    }
+
+    // The board with notes under it, after a blank line.
+    fn noted_frame(notes: &[&str]) -> String {
+        let mut rows = board_rows();
+        rows.push(String::new());
+        rows.extend(notes.iter().map(|n| format!(" {n}")));
+        screen(&rows, 24)
+    }
+
+    #[test]
+    fn watch_follows_the_pane_size_each_tick() {
+        let w = watch_world(&["live", "short", "live", "gone"]);
+        let (ended, frames) = watch_run(&w);
+        assert_eq!(ended, "pane-closed");
+        let short = [
+            pad("mux-agents", "1 running / 1 ended"),
+            pad("\u{25c9} worker", "working   4m"),
+            "   testing the parser".to_string(),
+            "   +1 more  (list -All)".to_string(),
+        ];
+        assert_eq!(frames, [board_frame(), screen(&short, 4), board_frame()]);
     }
 
     #[test]
@@ -1120,7 +2189,7 @@ mod tests {
         // A thrown or failed probe is unknown, not gone: its frame says refresh failed.
         let w = watch_world(&["throw", "fail", "live", "gone"]);
         let (ended, frames) = watch_run(&w);
-        let marked = format!("{}refresh failed\r\n", board_frame());
+        let marked = noted_frame(&["refresh failed"]);
         assert_eq!(ended, "pane-closed");
         assert_eq!(frames, [marked.clone(), marked, board_frame()]);
         assert_eq!(probes(&w), 4);
@@ -1184,9 +2253,16 @@ mod tests {
         assert_eq!(
             frames,
             [
-                format!("\u{1b}[H\u{1b}[2Jmux-agents {DOT} ? running\r\nrefresh failed\r\n"),
+                screen(
+                    &[
+                        pad("mux-agents", "? running"),
+                        String::new(),
+                        " refresh failed".to_string()
+                    ],
+                    24
+                ),
                 board_frame(),
-                format!("{}refresh failed\r\n", board_frame()),
+                noted_frame(&["refresh failed"]),
             ]
         );
         // The board is read as the bar's pane, with the ended rows and their exit codes.
@@ -1379,7 +2455,38 @@ mod tests {
             win.active = id;
             Ok(Output::default())
         });
+        // The bar's size as the window has it now (after any move or resize).
+        let s = shared.clone();
+        w.fakes.mux_script(SIZE_FORMAT, move |argv| {
+            let win = s.borrow();
+            Ok(match win.panes.iter().find(|p| p.id == argv[4]) {
+                Some(p) => out(0, &format!("{}|{}|{}\n", p.id, p.width, p.height), ""),
+                None => out(1, "", "can't find pane\n"),
+            })
+        });
         (w, shared)
+    }
+
+    #[test]
+    fn the_frame_is_laid_out_after_the_keeper_resized_the_bar() {
+        // The probe reads 55 columns; the window is 136, so the keeper sets the bar to 40 before the frame is drawn.
+        // The frame is the 40-column one, never a 54-column header in a 40-column pane.
+        let wide = || {
+            let mut win = win("%1", vec![r("%1", 0, 0, 80, 50), r("%7", 81, 0, 55, 50)]);
+            win.width = 136;
+            win
+        };
+        let (w, state) = keep_world(&["wide", "gone"], wide());
+        let (ended, frames) = watch_run(&w);
+        assert_eq!(ended, "pane-closed");
+        assert_eq!(kept(&w), [RESIZE]);
+        assert_eq!(state.borrow().panes[1].width, 40);
+        assert_eq!(frames, [board_frame()]);
+        // When the size cannot be read again, the width the keeper set is used.
+        let (w, _) = keep_world(&["wide", "gone"], wide());
+        w.fakes.mux_first(SIZE_FORMAT, 1, "", "no server");
+        let (_, frames) = watch_run(&w);
+        assert_eq!(frames, [board_frame()]);
     }
 
     // The lock's own calls: move-pane, resize-pane, the active check and select-pane.
@@ -1408,7 +2515,7 @@ mod tests {
     }
 
     fn paused_frame() -> String {
-        format!("{}{PAUSED}\r\n", board_frame())
+        noted_frame(&[PAUSED])
     }
 
     #[test]
@@ -1590,10 +2697,7 @@ mod tests {
             let (_, frames) = watch_run(&w);
             assert_eq!(moves(&w), moved, "{skip}");
             // The skipped minute ages the agents too, so only each frame's last line is compared.
-            let marked: Vec<bool> = frames
-                .iter()
-                .map(|f| f.ends_with(&format!("{PAUSED}\r\n")))
-                .collect();
+            let marked: Vec<bool> = frames.iter().map(|f| f.contains(PAUSED)).collect();
             let mut want = vec![false, false];
             want.extend((2..5).map(|i| i < paused));
             assert_eq!(marked, want, "{skip}");

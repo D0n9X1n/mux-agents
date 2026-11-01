@@ -54,6 +54,7 @@ fn ctx() -> Res<Ctx> {
         mux: RefCell::new(None),
         clock: Box::new(SystemClock),
         admitted: false,
+        tty: std::io::IsTerminal::is_terminal(&std::io::stdout()),
         env,
     })
 }

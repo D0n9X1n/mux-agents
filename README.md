@@ -31,7 +31,7 @@ Start Claude Code and Copilot CLI agents in tmux or rmux panes, see what each is
 
 <table>
   <tr>
-    <td width="50%"><img src="https://raw.githubusercontent.com/D0n9X1n/mux-agents/main/assets/preview/mux-agents-sidebar.png" alt="The side bar: three running agents with what each is doing, one exited"></td>
+    <td width="50%"><img src="https://raw.githubusercontent.com/D0n9X1n/mux-agents/main/assets/preview/mux-agents-sidebar.png" alt="The side bar: three live agents in their own colors, two working and one waiting with an unread message, each with what it is doing; then three ended agents (done, exit 101, stopped) and +4 more"></td>
     <td width="50%"><img src="https://raw.githubusercontent.com/D0n9X1n/mux-agents/main/assets/preview/mux-agents-list.png" alt="mux-agent list answering one JSON object with each agent's state and current step"></td>
   </tr>
   <tr>
