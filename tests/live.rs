@@ -333,17 +333,23 @@ exec claude --dangerously-skip-permissions
 
         /// The bar's width by S1: `max(40, window / 5)` of the width its window reads now.
         fn bar_width(&self, bar: &str) -> String {
-            let window: u32 = self.field(bar, "#{window_width}").parse().unwrap();
+            let window: u32 = self.num(bar, "#{window_width}");
             mux_agent::sidebar::bar_width(window).to_string()
         }
 
         /// The bar's place as `<at right>|<at top>|<at bottom>|<width>`: `1|1|1|<bar_width>` when it is locked to
         /// the right edge, full height, at its width.
         fn bar_place(&self, bar: &str) -> String {
-            self.field(
-                bar,
-                "#{pane_at_right}|#{pane_at_top}|#{pane_at_bottom}|#{pane_width}",
-            )
+            let format = "#{pane_at_right}|#{pane_at_top}|#{pane_at_bottom}|#{pane_width}";
+            let end = Instant::now() + Duration::from_secs(5);
+            loop {
+                // Never empty when read: see `num`.
+                let place = self.field(bar, format);
+                if place.matches('|').count() == 3 || Instant::now() >= end {
+                    return place;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
         }
 
         /// What `bar_place` answers for a bar in place.
@@ -452,6 +458,26 @@ exec claude --dangerously-skip-permissions
             self.call(&["display-message", "-p", "-t", target, format])
                 .trim_end()
                 .to_string()
+        }
+
+        /// A number `field` answers, read again until it parses: tmux 3.2a can answer `display-message -p` with
+        /// success and no output (seen on a loaded CI runner), and a missing pane already fails in `call`. After 5 s
+        /// it fails with every pane's place.
+        fn num<T: std::str::FromStr>(&self, target: &str, format: &str) -> T {
+            let end = Instant::now() + Duration::from_secs(5);
+            loop {
+                let got = self.field(target, format);
+                if let Ok(n) = got.parse() {
+                    return n;
+                }
+                assert!(
+                    Instant::now() < end,
+                    "{:?}: {target} {format} = {got:?}; panes {:?}",
+                    self.server.mux(),
+                    self.panes("#{pane_id}|#{pane_dead}|#{pane_left}|#{pane_right}|#{pane_pid}|#{@agent-role}")
+                );
+                std::thread::sleep(Duration::from_millis(50));
+            }
         }
 
         /// `list-panes -a -F <format>`, one row each.
@@ -885,7 +911,7 @@ exec claude --dangerously-skip-permissions
             argv[5]
         );
         assert_eq!(client["cwd"], live.path("work"), "{mux:?}");
-        let pane_pid: u64 = live.field(pane, "#{pane_pid}").parse().unwrap();
+        let pane_pid: u64 = live.num(pane, "#{pane_pid}");
         assert_eq!(client["ppid"], pane_pid, "{mux:?}");
         let launcher = json_file(&folder.join("launcher.json"));
         assert_eq!(launcher["pid"], pane_pid, "{mux:?}");
@@ -942,7 +968,7 @@ exec claude --dangerously-skip-permissions
                 "{mux:?}"
             );
             let pane = s(&w["pane"]);
-            let pane_pid: u64 = live.field(pane, "#{pane_pid}").parse().unwrap();
+            let pane_pid: u64 = live.num(pane, "#{pane_pid}");
             assert_eq!(client["ppid"], pane_pid, "{mux:?}");
             let launcher = json_file(&live.agent_dir(s(&w["id"])).join("launcher.json"));
             assert_eq!(launcher["pid"], pane_pid, "{mux:?}");
@@ -1486,7 +1512,7 @@ exec claude --dangerously-skip-permissions
 
     // Every captured row fits the bar's width in display columns, and no control text leaked onto the screen.
     fn bar_clean(live: &Live, bar: &str, screen: &str) {
-        let width: usize = live.field(bar, "#{pane_width}").parse().unwrap();
+        let width: usize = live.num(bar, "#{pane_width}");
         for line in screen.lines() {
             assert!(
                 mux_agent::paint::width(line) <= width,
@@ -1713,8 +1739,7 @@ exec claude --dangerously-skip-permissions
             );
             assert_eq!(live.bars().len(), 1, "{mux:?}");
             let agent = s(&spawned["pane"]);
-            let edge =
-                |pane: &str, format: &str| -> u32 { live.field(pane, format).parse().unwrap() };
+            let edge = |pane: &str, format: &str| -> u32 { live.num(pane, format) };
             assert!(
                 edge(agent, "#{pane_right}") < edge(&bar, "#{pane_left}"),
                 "{mux:?} placement {placement}: the agent is not left of the bar"
@@ -1779,7 +1804,7 @@ exec claude --dangerously-skip-permissions
             active,
             "{mux:?}: the repair moved focus"
         );
-        let edge = |pane: &str, format: &str| -> u32 { live.field(pane, format).parse().unwrap() };
+        let edge = |pane: &str, format: &str| -> u32 { live.num(pane, format) };
         assert!(
             edge(&lines[0], "#{pane_right}") < edge(&bar, "#{pane_left}"),
             "{mux:?}: the new pane is not left of the bar"
@@ -2058,7 +2083,7 @@ exec claude --dangerously-skip-permissions
             (0, &json!(false), &json!(bar)),
             "{mux:?}: the bar is not proven: {open}"
         );
-        let pid: u32 = live.field(&bar, "#{pane_pid}").parse().unwrap();
+        let pid: u32 = live.num(&bar, "#{pane_pid}");
         live.call(&["respawn-pane", "-k", "-t", &bar, "sleep", "1000"]);
         let new = live.field(&bar, "#{pane_pid}");
         assert_ne!(new, pid.to_string(), "{mux:?}");
@@ -2093,9 +2118,9 @@ exec claude --dangerously-skip-permissions
             (0, &json!(false), &json!(bar)),
             "{mux:?}: the bar is not proven: {open}"
         );
-        let pid: u32 = live.field(&bar, "#{pane_pid}").parse().unwrap();
+        let pid: u32 = live.num(&bar, "#{pane_pid}");
         live.call(&["respawn-pane", "-k", "-t", &bar, "sleep", "1000"]);
-        let new: u32 = live.field(&bar, "#{pane_pid}").parse().unwrap();
+        let new: u32 = live.num(&bar, "#{pane_pid}");
         assert_ne!(new, pid, "{mux:?}");
         live.call(&["resize-pane", "-t", &bar, "-x", "60"]);
         let width = live.field(&bar, "#{pane_width}");
@@ -2131,9 +2156,9 @@ exec claude --dangerously-skip-permissions
             (0, &json!(false), &json!(bar)),
             "{mux:?}: the bar is not proven: {open}"
         );
-        let pid: u32 = live.field(&bar, "#{pane_pid}").parse().unwrap();
+        let pid: u32 = live.num(&bar, "#{pane_pid}");
         live.call(&["respawn-pane", "-k", "-t", &bar, "sleep", "1000"]);
-        let new: u32 = live.field(&bar, "#{pane_pid}").parse().unwrap();
+        let new: u32 = live.num(&bar, "#{pane_pid}");
         assert_ne!(new, pid, "{mux:?}");
         live.call(&["set-option", "-p", "-u", "-t", &bar, "@agent-role"]);
         assert_eq!(live.field(&bar, "#{@agent-role}"), "", "{mux:?}");
