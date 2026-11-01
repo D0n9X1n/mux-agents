@@ -137,11 +137,17 @@ printf '[]\n[]\n' >"$g/two-empty.json"
 printf '[%s]\n[%s]\n' "$green" "$green" >"$g/two-green.json"
 printf '[%s] junk' "$green" >"$g/green-junk.json"
 
-# gate_line <on-main> <runs file> <version>: "<exit> <stdout>".
-gate_line() { line=$(sh "$gate" v0.1.0 $sha40 "$1" "$g/$2" "$3" 2>/dev/null); echo "$? $line"; }
+# gate_line <on-main> <runs file> <plugin version> [<cargo version>]: "<exit> <stdout>". The Cargo version defaults
+# to the plugin version.
+gate_line() { line=$(sh "$gate" v0.1.0 $sha40 "$1" "$g/$2" "$3" "${4-$3}" 2>/dev/null); echo "$? $line"; }
 okline="0 release ok: v0.1.0 at $sha40"
 got=$(
   gate_line true green.json 0.1.0
+  gate_line true green.json 0.1.0 0.2.0
+  gate_line true green.json 0.2.0 0.3.0
+  gate_line true green.json 0.1.0 ''
+  gate_line false green.json 0.1.0 0.2.0
+  line=$(sh "$gate" v0.1.0 $sha40 true "$g/green.json" 0.1.0 2>/dev/null); echo "$? $line"
   gate_line false green.json 0.1.0
   gate_line true none.json 0.1.0
   gate_line true red.json 0.1.0
@@ -161,6 +167,11 @@ got=$(
   gate_line true missing.json 0.1.0
 )
 want="$okline
+1 refused: Cargo.toml version 0.2.0 does not match v0.1.0
+1 refused: plugin.json version 0.2.0 does not match v0.1.0
+1 refused: Cargo.toml version  does not match v0.1.0
+1 refused: v0.1.0 is not on main
+2 
 1 refused: v0.1.0 is not on main
 1 refused: no CI push run for $sha40
 1 refused: no successful CI push run for $sha40

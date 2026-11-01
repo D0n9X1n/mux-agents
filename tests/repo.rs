@@ -1667,3 +1667,234 @@ fn no_powershell_needed() {
     }
     assert!(bad.is_empty(), "{bad:#?}");
 }
+
+// Upgrade path (spec D10): every release carries one version in its tag, plugin.json and Cargo.toml, and moves dist;
+// a user upgrades with one command per client and keeps the state, mail and lock formats of 0.2.x.
+
+/// Runs `sh scripts/release/gate.sh <args>` with a green CI push run for `sha`: (exit code, stdout).
+#[cfg(unix)]
+fn run_gate(args: &[&str]) -> (i32, String) {
+    let dir = std::env::temp_dir().join(format!("mux-gate-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let runs = dir.join("runs.json");
+    std::fs::write(
+        &runs,
+        r#"[{"conclusion":"success","head_sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","event":"push"}]"#,
+    )
+    .unwrap();
+    let mut argv: Vec<String> = args.iter().map(|a| a.to_string()).collect();
+    argv.insert(3, runs.to_str().unwrap().to_string());
+    let out = std::process::Command::new("sh")
+        .arg(Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts/release/gate.sh"))
+        .args(&argv)
+        .output()
+        .unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+    (
+        out.status.code().unwrap_or(-1),
+        String::from_utf8_lossy(&out.stdout).trim().to_string(),
+    )
+}
+
+#[test]
+fn release_gate_requires_tag_eq_plugin_eq_cargo_version() {
+    // validate reads both versions and gives both to the gate.
+    let release = repo_file(RELEASE);
+    let validate = job_lines(&release, "validate");
+    line_of(
+        &validate,
+        "version=$(jq -r .version .claude-plugin/plugin.json)",
+    );
+    let cargo = line_of(&validate, "cargo_version=$(");
+    assert!(
+        validate[cargo].contains("Cargo.toml"),
+        "{}",
+        validate[cargo]
+    );
+    let gate = line_of(
+        &validate,
+        r#"sh scripts/release/gate.sh "$TAG" "$sha" "$on_main" "$RUNNER_TEMP/runs.json" "$version" "$cargo_version""#,
+    );
+    assert!(cargo < gate, "{validate:#?}");
+    #[cfg(unix)]
+    {
+        let sha = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let ok = format!("release ok: v0.2.0 at {sha}");
+        assert_eq!(
+            run_gate(&["v0.2.0", sha, "true", "0.2.0", "0.2.0"]),
+            (0, ok)
+        );
+        assert_eq!(
+            run_gate(&["v0.2.0", sha, "true", "0.2.0", "0.2.1"]),
+            (
+                1,
+                "refused: Cargo.toml version 0.2.1 does not match v0.2.0".into()
+            )
+        );
+        assert_eq!(
+            run_gate(&["v0.2.0", sha, "true", "0.2.1", "0.2.0"]),
+            (
+                1,
+                "refused: plugin.json version 0.2.1 does not match v0.2.0".into()
+            )
+        );
+        assert_eq!(
+            run_gate(&["v0.2.0", sha, "true", "0.2.0", ""]),
+            (
+                1,
+                "refused: Cargo.toml version  does not match v0.2.0".into()
+            )
+        );
+        // Five arguments, as before Cargo.toml was checked, is a usage error.
+        assert_eq!(run_gate(&["v0.2.0", sha, "true", "0.2.0"]).0, 2);
+    }
+}
+
+#[test]
+fn readme_has_one_line_upgrade_for_both_clis() {
+    let readme = file_lines("README.md");
+    for want in [
+        "claude plugin update mux-agents@mux-agents",
+        "copilot plugin update mux-agents",
+    ] {
+        assert!(
+            readme.contains(&want.to_string()),
+            "README lacks the line {want}"
+        );
+    }
+}
+
+#[test]
+fn readme_shows_auto_update_opt_in() {
+    // Claude Code leaves auto-update off for a third-party marketplace; the user turns it on in /plugin.
+    let readme = file_lines("README.md");
+    assert!(
+        readme.iter().any(|l| l.contains("`/plugin`")
+            && l.contains("**Marketplaces**")
+            && l.contains("**Enable auto-update**")),
+        "README does not show where to enable auto-update"
+    );
+    assert!(
+        readme
+            .iter()
+            .any(|l| l.contains("auto-update") && l.contains("off by default")),
+        "README does not say auto-update starts off"
+    );
+}
+
+#[test]
+fn release_moves_dist_with_new_plugin_version() {
+    // publish reads the tagged plugin.json, lets the gate compare it with dist's, and only then commits dist.
+    let release = repo_file(RELEASE);
+    let publish = job_lines(&release, "publish");
+    let dist_version = line_of(
+        &publish,
+        r#"dist_version=$(git show "$dist:.claude-plugin/plugin.json" | jq -r .version)"#,
+    );
+    let version = line_of(
+        &publish,
+        "version=$(jq -r .version .claude-plugin/plugin.json)",
+    );
+    let decide = line_of(
+        &publish,
+        r#"sh scripts/release/gate.sh --dist "$version" "$GITHUB_SHA" "$dist_version" "$dist_sha""#,
+    );
+    let commit = line_of(&publish, r#"commit -q -m "dist $TAG""#);
+    assert!(
+        dist_version < decide && version < decide && decide < commit,
+        "{publish:#?}"
+    );
+    // And a real Claude Code moves an install to the new version on one update, from a relative source and on the
+    // same ref.
+    let upgrade = repo_file("tests/upgrade.sh");
+    for case in ["migrate_relative_to_dist", "bump_on_same_ref"] {
+        assert!(upgrade.contains(case), "tests/upgrade.sh lacks {case}");
+    }
+    assert!(upgrade.contains("command claude plugin update \"mux-agents@$mkt\""));
+    assert!(!upgrade.contains("MUX_AGENTS_BIN="));
+}
+
+#[test]
+fn state_and_lock_format_pinned() {
+    // 0.2.x keeps the state root, the record, launcher and mail files, and the lock names, so an upgrade within
+    // 0.2.x finds every agent and message and serializes with panes still on the older binary.
+    let src = |path: &str| repo_file(path).replace("\r\n", "\n");
+    let root = src("src/state/root.rs");
+    assert!(root.contains("\"{}/.local/state/mux-agents/state\","));
+    assert!(root.contains(r#"Ok(format!("{local}{sep}mux-agents\\state").into())"#));
+    let lock = src("src/state/lock.rs");
+    for want in [
+        "crate::util::sha256_hex(key)[..32].to_owned()",
+        r#"root.join(format!("{}.lock", key_hex(key)))"#,
+        r#"format!(r"Local\MuxAgents-{}", key_hex(key))"#,
+        r#"let above = [".local", "state", "mux-agents"];"#,
+        r#"path.push("locks");"#,
+        r#"PathBuf::from("/r/locks/ba7816bf8f01cfea414140de5dae2223.lock")"#,
+        r#"r"Local\MuxAgents-ba7816bf8f01cfea414140de5dae2223""#,
+    ] {
+        assert!(lock.contains(want), "src/state/lock.rs lacks {want}");
+    }
+    assert!(src("src/agents/mod.rs").contains(r#"format!("{kind}|{}|{key}", caller.server_key)"#));
+    let mail = src("src/agents/mail.rs");
+    assert!(mail.contains(r#"mail.join(format!("{key}.jsonl"))"#));
+    assert!(mail.contains(r#"mail.join(format!("{key}.offset"))"#));
+    assert!(mail.contains(r#"Ok(format!("pane-{}", &pane[1..]))"#));
+    let registry = src("src/agents/registry.rs");
+    assert!(registry.contains(r#".join("record.json")"#));
+    assert!(registry.contains(r#".join("launcher.json")"#));
+    // The README promises it.
+    assert!(
+        file_lines("README.md")
+            .iter()
+            .any(|l| l.contains("0.2.x") && l.contains("state folder") && l.contains("lock")),
+        "README does not say 0.2.x keeps the state and lock formats"
+    );
+}
+
+/// The lines of the `## <heading>` section of a Markdown text, without the heading.
+fn section(text: &str, heading: &str) -> Vec<String> {
+    let head = format!("## {heading}");
+    text.lines()
+        .skip_while(|l| l.trim_end() != head)
+        .skip(1)
+        .take_while(|l| !l.starts_with("## "))
+        .map(String::from)
+        .collect()
+}
+
+#[test]
+fn readme_upgrade_lifecycle() {
+    // From 0.1: close the side bar and stop every agent first (the 0.1 mutex and the 0.2 lock files do not
+    // serialize), then update, then restart the sessions; panes keep the binary path they started with.
+    let readme = repo_file("README.md").replace("\r\n", "\n");
+    let upgrade = section(&readme, "Upgrade");
+    assert!(!upgrade.is_empty(), "README has no ## Upgrade section");
+    let at = |needle: &str| {
+        upgrade
+            .iter()
+            .position(|l| l.contains(needle))
+            .unwrap_or_else(|| panic!("## Upgrade lacks {needle}: {upgrade:#?}"))
+    };
+    let close = at("sidebar -Close");
+    let stop = at("`stop`");
+    let update = at("claude plugin update mux-agents@mux-agents");
+    let restart = at("Restart");
+    assert!(
+        close < stop && stop < update && update < restart,
+        "{upgrade:#?}"
+    );
+    at("absolute path");
+    at("do not serialize");
+    // The release notes say the same, in both languages.
+    for page in ["Release-v0.2.0", "Release-v0.2.0-zh-CN"] {
+        let text = wiki_text(page);
+        for needle in [
+            "sidebar -Close",
+            "`stop`",
+            "claude plugin update mux-agents@mux-agents",
+            "copilot plugin update mux-agents",
+        ] {
+            assert!(text.contains(needle), "{page} lacks {needle}");
+        }
+    }
+}

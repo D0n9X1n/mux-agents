@@ -1,9 +1,9 @@
 #!/bin/sh
 # Release gates. Each reads only its arguments (and the runs file) and writes one line.
-#   gate.sh <tag> <sha> <on-main: true|false> <runs.json> <manifest-version>
+#   gate.sh <tag> <sha> <on-main: true|false> <runs.json> <plugin.json version> <Cargo.toml version>
 #     exit 0 when <tag> may be released, else exit 1 naming the first failed check, in the order main, CI push run,
-#     version. runs.json must be exactly one JSON array of CI workflow runs (conclusion, head_sha, event); anything
-#     else, or any jq failure, refuses.
+#     plugin.json version, Cargo.toml version: the tag must be v<version> of both. runs.json must be exactly one JSON
+#     array of CI workflow runs (conclusion, head_sha, event); anything else, or any jq failure, refuses.
 #   gate.sh --dist <version> <sha> <dist version> <dist sha>
 #     whether the dist ref may move to <version> built from <sha>: "push" when dist is absent (empty dist version) or
 #     older, "same" when dist already holds <version> from <sha> (a rerun), else exit 1 with "refused: ...".
@@ -49,13 +49,13 @@ dist_decision() {
 }
 
 usage() {
-  echo 'usage: gate.sh <tag> <sha> <true|false> <runs.json> <manifest-version> | gate.sh --dist <version> <sha> <dist version> <dist sha>' >&2
+  echo 'usage: gate.sh <tag> <sha> <true|false> <runs.json> <plugin-version> <cargo-version> | gate.sh --dist <version> <sha> <dist version> <dist sha>' >&2
   exit 2
 }
 
-# release_gate <tag> <sha> <on-main> <runs.json> <manifest-version>
+# release_gate <tag> <sha> <on-main> <runs.json> <plugin.json version> <Cargo.toml version>
 release_gate() {
-  tag=$1 sha=$2 on_main=$3 runs=$4 version=$5
+  tag=$1 sha=$2 on_main=$3 runs=$4 version=$5 cargo_version=$6
   [ -n "$tag" ] && [ -n "$sha" ] || usage
   case $on_main in true | false) ;; *) echo "gate.sh: on-main must be true or false, not $on_main" >&2; exit 2 ;; esac
 
@@ -77,6 +77,7 @@ release_gate() {
   [ "${counts% *}" != 0 ] || refuse "no CI push run for $sha"
   [ "${counts#* }" != 0 ] || refuse "no successful CI push run for $sha"
   [ "v$version" = "$tag" ] || refuse "plugin.json version $version does not match $tag"
+  [ "v$cargo_version" = "$tag" ] || refuse "Cargo.toml version $cargo_version does not match $tag"
 
   echo "release ok: $tag at $sha"
 }
@@ -88,7 +89,7 @@ main() {
     dist_decision "$@"
     return 0
   fi
-  [ $# -eq 5 ] || usage
+  [ $# -eq 6 ] || usage
   release_gate "$@"
 }
 

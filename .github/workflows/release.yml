@@ -27,7 +27,9 @@ jobs:
           if git merge-base --is-ancestor "$sha" origin/main; then on_main=true; else on_main=false; fi
           gh api "repos/$GITHUB_REPOSITORY/actions/workflows/ci.yml/runs?head_sha=$sha&event=push&per_page=100" --jq '[.workflow_runs[] | {conclusion, head_sha, event}]' >"$RUNNER_TEMP/runs.json"
           version=$(jq -r .version .claude-plugin/plugin.json)
-          sh scripts/release/gate.sh "$TAG" "$sha" "$on_main" "$RUNNER_TEMP/runs.json" "$version"
+          # The version of Cargo.toml's [package] table; empty when there is none, which the gate refuses.
+          cargo_version=$(awk '/^\[/ { p = ($0 == "[package]") } p && /^version = "/ { gsub(/^version = "|"$/, ""); print; exit }' Cargo.toml)
+          sh scripts/release/gate.sh "$TAG" "$sha" "$on_main" "$RUNNER_TEMP/runs.json" "$version" "$cargo_version"
   build:
     needs: validate
     strategy:
