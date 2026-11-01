@@ -2006,6 +2006,227 @@ exec claude --dangerously-skip-permissions
         assert_eq!(live.bars().len(), 1, "{mux:?} {:?}", live.bars());
     }
 
+    // The messages in the root's mailbox for agent `w`'s exit, as stored.
+    fn exit_messages(live: &Live, w: &Value) -> Vec<Value> {
+        let exit = format!("exit-{}", s(&w["id"]));
+        live.mailbox(&live.root_box())
+            .into_iter()
+            .filter(|m| m["id"] == exit.as_str())
+            .collect()
+    }
+
+    // Agent `w` ended with one `lost` notice closed by its pane: notice.json, one message, gone from list and in
+    // list -All as lost.
+    fn one_lost_notice(live: &mut Live, w: &Value) {
+        let mux = live.mux();
+        let name = s(&w["name"]).to_string();
+        let notice = json_file(&live.agent_dir(s(&w["id"])).join("notice.json"));
+        assert_eq!(
+            (&notice["kind"], &notice["closedBy"]),
+            (&json!("lost"), &json!("pane")),
+            "{mux:?} {name} {notice}"
+        );
+        let messages = exit_messages(live, w);
+        assert_eq!(messages.len(), 1, "{mux:?} {name} {messages:?}");
+        assert_eq!(messages[0]["kind"], "lost", "{mux:?} {name}");
+        let (code, list) = live.run(&["list"]);
+        assert_eq!(code, 0, "{mux:?} {list}");
+        assert!(!names(&list).contains(&name), "{mux:?} {name} {list}");
+        let (_, all) = live.run(&["list", "-All"]);
+        let row = all["agents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|a| a["name"] == name.as_str())
+            .cloned()
+            .unwrap_or_else(|| panic!("{mux:?}: {name} is not in list -All: {all}"));
+        assert_eq!(
+            (&row["state"], &row["closedBy"]),
+            (&json!("lost"), &json!("pane")),
+            "{mux:?} {row}"
+        );
+        assert_eq!(exit_messages(live, w).len(), 1, "{mux:?} {name}");
+    }
+
+    // Spawns a tab agent and a split agent and kills both panes from outside, as a user closing them would.
+    fn two_killed(live: &mut Live, n: u32) -> [Value; 2] {
+        let tab = live.spawn(&format!("v{n}"), &["-Tab"]);
+        let split = live.spawn(&format!("v{}", n + 1), &["-Split", "h"]);
+        for w in [&tab, &split] {
+            live.worker_pid(w);
+        }
+        for w in [&tab, &split] {
+            live.call(&["kill-pane", "-t", s(&w["pane"])]);
+            live.wait_gone(s(&w["pane"]));
+        }
+        [tab, split]
+    }
+
+    // With the bar off, each of list, read, read <other>, spawn and stop <other> alone closes a tab agent and a split
+    // agent whose panes were killed: one `lost` notice each, closed by the pane. stop on a killed agent answers
+    // already lost.
+    fn gone_pane_closed_by_each_trigger(mux: Mux) {
+        let Some(mut live) = Live::human(mux) else {
+            return;
+        };
+        live.close_bar();
+        let other = live.spawn("other", &[]);
+        live.worker_pid(&other);
+        let mut n = 1;
+        for trigger in ["list", "read", "read other", "spawn", "stop other"] {
+            let killed = two_killed(&mut live, n);
+            n += 2;
+            for w in &killed {
+                assert!(
+                    !live.agent_dir(s(&w["id"])).join("notice.json").exists(),
+                    "{mux:?} {trigger}: noticed before the trigger"
+                );
+            }
+            let (code, reply) = match trigger {
+                "spawn" => (0, live.spawn("fresh", &[])),
+                _ => {
+                    let args: Vec<&str> = trigger.split(' ').collect();
+                    live.run(&args)
+                }
+            };
+            assert_eq!(code, 0, "{mux:?} {trigger}: {reply}");
+            for w in &killed {
+                assert!(
+                    live.agent_dir(s(&w["id"])).join("notice.json").is_file(),
+                    "{mux:?} {trigger}: {} not closed",
+                    s(&w["name"])
+                );
+            }
+            for w in &killed {
+                one_lost_notice(&mut live, w);
+            }
+        }
+        // stop on an agent whose pane was just killed: its one notice, and already lost.
+        let w = live.spawn("last", &[]);
+        live.worker_pid(&w);
+        live.call(&["kill-pane", "-t", s(&w["pane"])]);
+        live.wait_gone(s(&w["pane"]));
+        let (code, stop) = live.run(&["stop", "last"]);
+        assert_eq!(
+            (code, &stop["already"]),
+            (0, &json!("lost")),
+            "{mux:?} {stop}"
+        );
+        one_lost_notice(&mut live, &w);
+        let (code, again) = live.run(&["stop", "last"]);
+        assert_eq!(
+            (code, &again["already"]),
+            (0, &json!("lost")),
+            "{mux:?} {again}"
+        );
+        assert_eq!(exit_messages(&live, &w).len(), 1, "{mux:?}");
+    }
+
+    // With the bar on and no command run, the bar's own tick closes an agent whose pane was killed: its row goes and
+    // its one notice is posted.
+    fn bar_drops_a_gone_agent(mux: Mux) {
+        let Some(mut live) = Live::human(mux) else {
+            return;
+        };
+        let w1 = live.spawn("w1", &[]);
+        let w2 = live.spawn("w2", &[]);
+        let bar = s(&w1["sidebar"]).to_string();
+        live.worker_pid(&w1);
+        live.worker_pid(&w2);
+        let row = |screen: &str, name: &str| {
+            screen
+                .lines()
+                .any(|l| l.split_whitespace().nth(1) == Some(name))
+        };
+        let mut screen = String::new();
+        let drawn = eventually(Duration::from_secs(30), || {
+            screen = live.call(&["capture-pane", "-p", "-t", &bar]);
+            row(&screen, "w1") && row(&screen, "w2")
+        });
+        assert!(drawn, "{mux:?}: the bar shows:\n{screen}");
+        live.call(&["kill-pane", "-t", s(&w1["pane"])]);
+        let marker = live.agent_dir(s(&w1["id"])).join("notice.json");
+        let dropped = eventually(Duration::from_secs(30), || {
+            screen = live.call(&["capture-pane", "-p", "-t", &bar]);
+            marker.is_file() && !row(&screen, "w1") && row(&screen, "w2")
+        });
+        assert!(dropped, "{mux:?}: the bar shows:\n{screen}");
+        let notice = json_file(&marker);
+        assert_eq!(
+            (&notice["kind"], &notice["closedBy"]),
+            (&json!("lost"), &json!("pane")),
+            "{mux:?} {notice}"
+        );
+        assert_eq!(exit_messages(&live, &w1).len(), 1, "{mux:?}");
+    }
+
+    // remain-on-exit keeps an ended agent's pane dead: list kills it by the one conditional and posts no second
+    // notice. The conditional keeps a dead pane retagged since and a live pane with the agent's tag.
+    fn dead_pane_closed_by_one_conditional(mux: Mux) {
+        let Some(mut live) = Live::human(mux) else {
+            return;
+        };
+        live.close_bar();
+        live.call(&["set-option", "-g", "remain-on-exit", "on"]);
+        live.call(&["set-environment", "-g", "MUX_IT_EXIT", "5"]);
+        let quit_dead = |live: &mut Live, w: &Value| {
+            let pid = live.worker_pid(w);
+            support::write_atomic(&live.dir.join(format!("quit.{pid}")), "");
+            live.server.wait_file(&format!("exited.{pid}"));
+            let pane = s(&w["pane"]).to_string();
+            live.server.wait("the pane to be dead", || {
+                (live.field(&pane, "#{pane_dead}") == "1").then_some(())
+            });
+        };
+        let w1 = live.spawn("w1", &[]);
+        quit_dead(&mut live, &w1);
+        // The launcher posted `exited 5` before it ended; list closes the pane and posts nothing more.
+        let (code, list) = live.run(&["list"]);
+        assert_eq!(code, 0, "{mux:?} {list}");
+        assert!(!names(&list).contains(&"w1".to_string()), "{mux:?} {list}");
+        live.wait_gone(s(&w1["pane"]));
+        let notice = json_file(&live.agent_dir(s(&w1["id"])).join("notice.json"));
+        assert_eq!(
+            (&notice["kind"], &notice["exitCode"]),
+            (&json!("exited"), &json!(5)),
+            "{mux:?} {notice}"
+        );
+        assert_eq!(exit_messages(&live, &w1).len(), 1, "{mux:?}");
+
+        let w2 = live.spawn("w2", &[]);
+        let w3 = live.spawn("w3", &[]);
+        live.worker_pid(&w3);
+        quit_dead(&mut live, &w2);
+        let (p2, p3) = (s(&w2["pane"]).to_string(), s(&w3["pane"]).to_string());
+        let conditional = |live: &Live, pane: &str, id: &str| {
+            let argv = mux_agent::agents::registry::kill_if_dead(pane, id);
+            let argv: Vec<&str> = argv.iter().map(String::as_str).collect();
+            live.call(&argv);
+        };
+        let listed = |live: &Live, pane: &str| live.panes("#{pane_id}").iter().any(|p| p == pane);
+        // Retagged since it was listed: kept.
+        live.call(&["set-option", "-p", "-t", &p2, "@agent-id", "bbbbbbbbbbbb"]);
+        conditional(&live, &p2, s(&w2["id"]));
+        assert!(
+            listed(&live, &p2),
+            "{mux:?}: a retagged dead pane was killed"
+        );
+        // Live with the agent's own tag: kept.
+        conditional(&live, &p3, s(&w3["id"]));
+        assert!(listed(&live, &p3), "{mux:?}: a live pane was killed");
+        // Tagged again: list closes it.
+        live.call(&["set-option", "-p", "-t", &p2, "@agent-id", s(&w2["id"])]);
+        let (code, list) = live.run(&["list"]);
+        assert_eq!(
+            (code, names(&list)),
+            (0, vec!["w3".to_string()]),
+            "{mux:?} {list}"
+        );
+        live.wait_gone(&p2);
+        assert_eq!(exit_messages(&live, &w2).len(), 1, "{mux:?}");
+        assert!(listed(&live, &p3), "{mux:?}");
+    }
+
     // One test fn per scenario, each on its own fresh server.
     macro_rules! tests_on {
         ($module:ident, $mux:ident, [$($name:ident),* $(,)?]) => {
@@ -2047,6 +2268,9 @@ exec claude --dangerously-skip-permissions
                     placement_is_per_session,
                     spawn_bar_once_reused_and_close_stays_closed,
                     spawn_races_keep_one_bar,
+                    gone_pane_closed_by_each_trigger,
+                    bar_drops_a_gone_agent,
+                    dead_pane_closed_by_one_conditional,
                 ]
             );
         };
