@@ -11,7 +11,8 @@
 //!   server, writes `<dir>/quit`, kills the server, waits for its pid to go (SIGKILL after 5 s), waits for each
 //!   descendant to go (SIGKILL, same start only, after 5 s), removes the socket, then removes the lock files whose
 //!   keys name this server (`<passwd home>/.local/state/mux-agents/locks/<hex>.lock`; mux-agent never removes one).
-//!   Only keys built from this server's own key are touched, so no other lock is.
+//!   Only keys built from this server's own key are touched, so no other lock is. The server's pid is trusted only
+//!   while it has the start read at `start`: a reused pid is neither walked nor signalled.
 //! - Files the harness waits on are written whole: shell lines write `<name>.tmp` and `mv` it into place, and the fake
 //!   client renames its files into place.
 #![allow(dead_code)]
@@ -151,6 +152,8 @@ pub struct Server {
     replies: HashMap<u64, u32>,
     // The server key mux-agent derives: sha256("<socket>|<pid>|<start>")[..16]; empty when the start is unreadable.
     key: String,
+    // The server's start as read at `start`; teardown signals the pid only while it still has this start.
+    start: Option<i64>,
     killed: bool,
 }
 
@@ -224,6 +227,7 @@ impl Server {
             clients_seen: 0,
             replies: HashMap::new(),
             key: String::new(),
+            start: None,
             killed: false,
         };
         assert!(out.status.success(), "{mux:?} new-session: {out:?}");
@@ -235,6 +239,7 @@ impl Server {
         server.pid = fields[2].parse().unwrap();
         if let Some(opened) = mux_agent::proc::host().open(server.pid) {
             let start = opened.start;
+            server.start = Some(start);
             let id = format!("{}|{}|{start}", server.socket.display(), server.pid);
             server.key = mux_agent::util::sha256_hex(id)[..16].to_string();
         }
@@ -554,22 +559,23 @@ impl Server {
         }
         self.killed = true;
         let sessions = self.sessions();
-        let descendants = if self.pid != 0 {
+        // A pid whose start is not the one recorded at `start` (or was never readable) is another process: its tree
+        // is never collected and it is never signalled.
+        let descendants = if same_process(self.pid, self.start) {
             descendants(self.pid)
         } else {
             Vec::new()
         };
         let _ = std::fs::write(self.dir.join("quit"), "");
         let _ = self.try_call(&["kill-server"]);
-        if self.pid != 0 {
-            let end = Instant::now() + Duration::from_secs(5);
-            while alive(self.pid) && Instant::now() < end {
-                std::thread::sleep(POLL);
-            }
-            if alive(self.pid) {
-                // SAFETY: the pid is this test's own private server.
-                unsafe { libc::kill(self.pid as libc::pid_t, libc::SIGKILL) };
-            }
+        let end = Instant::now() + Duration::from_secs(5);
+        while same_process(self.pid, self.start) && Instant::now() < end {
+            std::thread::sleep(POLL);
+        }
+        // Checked again right before the signal; without a pidfd (macOS) this is the narrowest window there is.
+        if same_process(self.pid, self.start) {
+            // SAFETY: the pid still has the start this test's private server had.
+            unsafe { libc::kill(self.pid as libc::pid_t, libc::SIGKILL) };
         }
         reap(&descendants);
         let _ = std::fs::remove_file(&self.socket);
@@ -718,12 +724,15 @@ pub fn start_of(pid: u32) -> Option<i64> {
     mux_agent::proc::host().open(pid).map(|o| o.start)
 }
 
+/// Whether `pid` is still the process that had `start`: alive with that start now. An unknown start is never.
+fn same_process(pid: u32, start: Option<i64>) -> bool {
+    pid != 0 && start.is_some() && alive(pid) && start_of(pid) == start
+}
+
 /// Waits up to 5 s for each process to go, then SIGKILLs any still there with its recorded start (never a reused
 /// pid), and waits again.
 fn reap(processes: &[(u32, Option<i64>)]) {
-    let still = |&&(pid, start): &&(u32, Option<i64>)| {
-        alive(pid) && start.is_some() && start_of(pid) == start
-    };
+    let still = |&&(pid, start): &&(u32, Option<i64>)| same_process(pid, start);
     let end = Instant::now() + Duration::from_secs(5);
     while processes.iter().any(|p| still(&p)) && Instant::now() < end {
         std::thread::sleep(POLL);
@@ -742,4 +751,80 @@ impl Drop for Server {
     fn drop(&mut self) {
         self.kill();
     }
+}
+
+/// SIGKILLs each process still alive with its recorded start, on drop; a test's own sentinels only.
+struct Sentinels(Vec<(u32, Option<i64>)>);
+
+impl Drop for Sentinels {
+    fn drop(&mut self) {
+        for &(pid, start) in &self.0 {
+            if start.is_some() && start_of(pid) == start {
+                // SAFETY: a process this test started, its start unchanged.
+                unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
+            }
+        }
+    }
+}
+
+// The reviewer's case: the private server exited and its pid now names an unrelated process (a `/bin/sh` sentinel
+// with a `/bin/sleep` child). Teardown signals neither, whether the recorded start is another process's or unknown.
+#[test]
+fn teardown_never_signals_a_reused_server_pid() {
+    // A real start, then its process gone: the start an exited server recorded.
+    let mut gone = Command::new("/bin/sleep").arg("60").spawn().unwrap();
+    let gone_start = start_of(gone.id()).expect("the start of a live sleep");
+    gone.kill().unwrap();
+    gone.wait().unwrap();
+
+    let mut sentinel = Command::new("/bin/sh")
+        .args(["-c", "/bin/sleep 60 & wait"])
+        .spawn()
+        .unwrap();
+    let pid = sentinel.id();
+    let mut guard = Sentinels(vec![(pid, start_of(pid))]);
+    let end = Instant::now() + WAIT;
+    let child = loop {
+        if let Some(&child) = descendants(pid).first() {
+            break child;
+        }
+        assert!(Instant::now() < end, "the sentinel's sleep never started");
+        std::thread::sleep(POLL);
+    };
+    guard.0.push(child);
+    assert_ne!(start_of(pid), Some(gone_start));
+
+    for recorded in [Some(gone_start), None] {
+        let dir = Dir::new();
+        let mut server = Server {
+            mux: Mux::Tmux38,
+            // Answers every call with exit 1, as a server that is gone does.
+            bin: PathBuf::from("/usr/bin/false"),
+            dir: dir.path().to_path_buf(),
+            socket: dir.join("s"),
+            pid,
+            pane: "%0".into(),
+            pane_pid: 0,
+            runs: 0,
+            jobs: 0,
+            lines: 0,
+            clients_seen: 0,
+            replies: HashMap::new(),
+            key: String::new(),
+            start: recorded,
+            killed: false,
+        };
+        server.kill();
+        assert_eq!(
+            sentinel.try_wait().unwrap(),
+            None,
+            "teardown signalled the replacement process (recorded start {recorded:?})"
+        );
+        assert!(
+            alive(child.0) && start_of(child.0) == child.1,
+            "teardown signalled the replacement's child (recorded start {recorded:?})"
+        );
+    }
+    drop(guard);
+    let _ = sentinel.wait();
 }
