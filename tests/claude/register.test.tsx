@@ -489,6 +489,30 @@ for (const attach of [false, true]) {
   })
 }
 
+// A tick that fires while the last list still runs checks eligibility all the same (QA #43); only a second list waits.
+test('a tick during a held list, eligibility lost with no attach: retired at that tick, and no new list', async ($, on) => {
+  const w = world(on, { TMUX: 'x' }, [{ holdMs: 4000, answer: ran(0, LIST) }, ran(0, LIST)])
+  await $.session.start(START)
+  await $.command.run({ command: 'mux-agents-pane' })
+  await w.clock.settle()
+  w.live.surfaces = ['terminal', 'desktop']
+  await w.clock.advance(3000)
+  expect([w.seen.argv.length, w.seen.settled, w.seen.closed, [...w.seen.panes]]).toEqual([1, 0, ['mux-agents'], []])
+  await w.clock.advance(1000)
+  await stillStopped($, w, 1)
+})
+
+test('a tick during a held list, still eligible: no overlapping list, and the timer keeps going', async ($, on) => {
+  const w = world(on, { TMUX: 'x' }, [{ holdMs: 4000, answer: ran(0, LIST) }, ran(0, LIST)])
+  await $.session.start(START)
+  await $.command.run({ command: 'mux-agents-pane' })
+  await w.clock.settle()
+  await w.clock.advance(3000)
+  expect([w.seen.argv.length, w.seen.settled, w.seen.closed, [...w.seen.panes]]).toEqual([1, 0, [], ['mux-agents']])
+  await w.clock.advance(3000)
+  expect([w.seen.argv.length, w.seen.settled, w.seen.closed]).toEqual([2, 2, []])
+})
+
 for (const below of ['deny', 'keep'] as const) {
   test(`a close ${below === 'deny' ? 'refused' : 'answered without closing'} below still leaves the refresh cancelled`, async ($, on) => {
     const w = world(on, { TMUX: 'x' }, [ran(0, LIST)], undefined, { close: below })

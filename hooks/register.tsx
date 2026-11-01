@@ -54,17 +54,18 @@ async function listArgv($: EngineInterface): Promise<string[]> {
   return ['sh', `${root}/scripts/mux-agent`, 'list', '-All']
 }
 
-// One list run for `timer`. Eligibility is checked right before list runs; a timer already cancelled runs nothing.
+// One list run for `timer`. Eligibility is checked first on every tick, even while the last list still runs, and right
+// before list runs; a timer already cancelled runs nothing. `busy` only keeps a second list from overlapping.
 async function refresh($: EngineInterface, argv: string[], timer: Timer) {
+  const ok = await eligible($)
+  if (ticking !== timer) return
+  if (!ok) {
+    await retire($)
+    return
+  }
   if (busy) return
   busy = true
   try {
-    const ok = await eligible($)
-    if (ticking !== timer) return
-    if (!ok) {
-      await retire($)
-      return
-    }
     let next
     try {
       const ran = await $.process.run(argv, { timeoutMs: 10000 })
