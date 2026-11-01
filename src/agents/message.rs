@@ -532,6 +532,8 @@ mod tests {
     use crate::agents::fixture::{CLAUDE, ID, SESSION_ID, World, launch_command, write};
     use crate::agents::lock_key;
     use crate::agents::view::focus;
+    use crate::mux::Output;
+    use crate::proc::Os;
     use crate::testing;
     use serde_json::json;
 
@@ -1744,5 +1746,283 @@ mod tests {
         let status = crate::agents::view::status;
         assert!(run(&w, status, &["status", "-BodyFile", "b.md"]).starts_with("ok "));
         assert_eq!(waiting_names(&w), Vec::<String>::new());
+    }
+
+    // ---- #48: agents found by their pane and exact launch, never by their tags
+
+    // rmux rotated the window: the root %1 carries A's tag, A's pane %9 carries B's, B's pane %8 none. The caller is
+    // `pane` (tagged `tag`); every pane answers live in session $3.
+    fn rotated(tag: &str, pane: &str) -> World {
+        let mut w = World::human(tag);
+        let tmux = w.ctx.env.get("TMUX").unwrap().to_string();
+        w.ctx.env = crate::ctx::Env::from_pairs([("TMUX", tmux), ("TMUX_PANE", pane.to_string())]);
+        w.agent_record(ID, json!({"name": "a", "pane": "%9", "parentPane": "%1"}));
+        w.agent_record(
+            "bbbbbbbbbbbb",
+            json!({"name": "b", "pane": "%8", "parentPane": "%1"}),
+        );
+        w.panes(&[
+            "%1|@1|100|aaaaaaaaaaaa|a",
+            "%9|@5|300|bbbbbbbbbbbb|b",
+            "%8|@5|301||",
+            "%2|@1|102||",
+        ]);
+        w.recipients_live();
+        w
+    }
+
+    #[test]
+    fn rotated_tags_never_redirect_a_verb() {
+        // From a clean pane, every verb reaches A at %9 and A's mailbox.
+        let mut w = rotated("", "%2");
+        emulate_pane9(&w, &launch_command("%9"));
+        w.fakes.mux_rule("#{window_active}", 0, "%9|1|1|1\n", "");
+        w.fakes.mux_rule("show-buffer", 0, "a's screen\n", "");
+        let list = crate::agents::view::list(&w.ctx, &w.request(&["list"])).unwrap();
+        let rows: Vec<String> = list["agents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| {
+                format!(
+                    "{}@{}",
+                    r["name"].as_str().unwrap(),
+                    r["pane"].as_str().unwrap()
+                )
+            })
+            .collect();
+        assert_eq!(rows, ["a@%9", "b@%8"]);
+        assert_eq!(
+            run(&w, read, &["read", "a"]),
+            r#"ok {"name":"a","pane":"%9","text":"a's screen"}"#
+        );
+        assert_eq!(
+            run(&w, focus, &["focus", "a"]),
+            r#"ok {"name":"a","pane":"%9","window":"@5"}"#
+        );
+        let sent = run(&w, send, &["send", "a", "-Body", "hi"]);
+        assert!(sent.starts_with(r#"ok {"to":"a","pane":"%9""#), "{sent}");
+        assert_eq!(read_mail_of(&w, ID), ["hi"]);
+        assert!(read_mail_of(&w, "bbbbbbbbbbbb").is_empty());
+        let stopped = run(&w, stop, &["stop", "a"]);
+        assert!(
+            stopped.starts_with(r#"ok {"name":"a","pane":"%9""#),
+            "{stopped}"
+        );
+        // Only A's own launch at %9 was killed; the root carrying A's tag never was.
+        assert_eq!(pane_kills(&w), [kill9()]);
+
+        // #48 test 2: then B, tagless, is still addressable, and its own pane is B.
+        w.panes(&["%1|@1|100|aaaaaaaaaaaa|a", "%8|@5|301||", "%2|@1|102||"]);
+        let sent = run(&w, send, &["send", "b", "-Body", "to b"]);
+        assert!(sent.starts_with(r#"ok {"to":"b","pane":"%8""#), "{sent}");
+        assert_eq!(read_mail_of(&w, "bbbbbbbbbbbb"), ["to b"]);
+        let tmux = w.ctx.env.get("TMUX").unwrap().to_string();
+        w.ctx.env = crate::ctx::Env::from_pairs([("TMUX", tmux), ("TMUX_PANE", "%8".into())]);
+        let caller = w.caller();
+        let s = registry::Snapshot::take(&w.ctx, &caller).unwrap();
+        assert!(matches!(s.own(&caller), registry::Own::Agent(ref p) if p.id == "bbbbbbbbbbbb"));
+        // B's parent %1 carries A's tag: its mailbox is still pane-1.
+        let sent = run(&w, send, &["send", "parent", "-Body", "done"]);
+        assert!(
+            sent.starts_with(r#"ok {"to":"parent","pane":"%1""#),
+            "{sent}"
+        );
+        assert_eq!(read_mail_of(&w, "pane-1").last().unwrap(), "done");
+    }
+
+    #[test]
+    fn a_rotated_tag_on_the_root_is_no_identity() {
+        // The root %1 carries A's tag: it is no agent, so it neither sends as A nor spawns, and list reads pane-1.
+        let w = rotated(ID, "%1");
+        assert_eq!(
+            run(&w, send, &["send", "a", "-Body", "x"]),
+            "2 parent this agent pane has no record"
+        );
+        assert_eq!(
+            run(
+                &w,
+                crate::agents::spawn::spawn,
+                &["spawn", "-Client", "claude", "-Task", "hi"]
+            ),
+            "2 tagged an agent pane cannot spawn agents"
+        );
+        let caller = w.caller();
+        add_mail(&w.ctx, &caller, "pane-1", "a", "%9", "for root", None).unwrap();
+        for _ in 0..2 {
+            add_mail(&w.ctx, &caller, ID, "a", "%9", "for a", None).unwrap();
+        }
+        let list = crate::agents::view::list(&w.ctx, &w.request(&["list"])).unwrap();
+        assert_eq!(list["agents"][0]["name"], "a");
+        assert_eq!(list["agents"][0]["unread"], 1);
+        assert!(read_mail_of(&w, ID).len() == 2);
+    }
+
+    #[test]
+    fn stop_never_kills_a_pane_replaced_after_it_was_resolved() {
+        let w = stop_world(false, json!({}));
+        w.fakes.process(testing::row(300, 900, 3000));
+        w.fakes.kill_ok(300);
+        let pane = emulate_pane9(&w, &launch_command("%9"));
+        // Respawned (another command) while stop waits for the notice lock.
+        let replace = pane.clone();
+        let notice = lock_key("notice", &w.caller(), "bbbbbbbbbbbb");
+        w.fakes.lock_probe(move |event| {
+            if event == format!("+{notice}") {
+                *replace.borrow_mut() = Some("sh".into());
+            }
+            String::new()
+        });
+        w.fakes.clear_log();
+        assert_eq!(
+            run(&w, stop, &["stop", "worker"]),
+            format!("1 target {NOT_ITS_LAUNCH}")
+        );
+        // The conditional ran and held nothing: the replacement lives, nothing was signalled or noticed.
+        assert_eq!(pane_kills(&w), [kill9()]);
+        assert_eq!(pane.borrow().as_deref(), Some("sh"));
+        assert!(!proc_calls(&w).iter().any(|c| c.starts_with("kill ")));
+        assert!(!w.folder("bbbbbbbbbbbb").join("notice.json").exists());
+        assert_eq!(stored(&w), 0);
+    }
+
+    #[test]
+    fn read_and_focus_never_act_on_a_replaced_pane() {
+        let w = World::human("");
+        w.agent_record(ID, json!({}));
+        w.panes(&["%9|@5|300|aaaaaaaaaaaa|worker"]);
+        let live = registry::Launch {
+            command: launch_command("%9"),
+            pid: None,
+        }
+        .live();
+        // When the server checks, %9 runs `sh` (replaced), and it is restored right after: the condition never holds.
+        let acted = std::rc::Rc::new(std::cell::Cell::new(false));
+        let seen = acted.clone();
+        let sh = registry::Launch {
+            command: "sh".into(),
+            pid: None,
+        }
+        .live();
+        w.fakes.mux_script("if-shell", move |argv| {
+            assert_eq!(argv[5], live);
+            if argv[5] == sh {
+                seen.set(true);
+            }
+            Ok(Output::default())
+        });
+        let captured = acted.clone();
+        w.fakes.mux_script("show-buffer", move |_| {
+            Ok(Output {
+                code: if captured.get() { 0 } else { 1 },
+                stdout: if captured.get() {
+                    "text\n".into()
+                } else {
+                    String::new()
+                },
+                stderr: "no buffer".into(),
+            })
+        });
+        // Read back after the select: restored, so live and its launch again, but never selected.
+        w.fakes.mux_rule("#{window_active}", 0, "%9|0|0|1\n", "");
+        w.fakes.clear_log();
+        assert_eq!(
+            run(&w, read, &["read", "worker"]),
+            "2 target the agent's pane is no longer its launch"
+        );
+        assert_eq!(mux_verbs(&w).last().unwrap(), "delete-buffer");
+        assert_eq!(
+            run(&w, focus, &["focus", "worker"]),
+            "2 target the agent's pane is no longer its launch"
+        );
+        assert!(!acted.get());
+    }
+
+    // A 0.2.0-0.2.2 worker (no startCommand) at %9, its launcher pid 300 started 3000, run as `<other exe> launcher
+    // <its spec>`; the multiplexer kills %9 only for a conditional naming pid 300.
+    fn legacy_stop_world() -> (World, std::rc::Rc<std::cell::Cell<bool>>) {
+        let w = stop_world(false, json!({}));
+        w.legacy("bbbbbbbbbbbb");
+        let spec = w.folder("bbbbbbbbbbbb").join("spec.json");
+        w.fakes.process(Row {
+            pid: 300,
+            ppid: 900,
+            start: Some(3000),
+            path: Some("/old/mux-agent".into()),
+            argv: Some(vec![
+                "/old/mux-agent".into(),
+                "launcher".into(),
+                spec.to_str().unwrap().into(),
+            ]),
+        });
+        w.fakes.kill_ok(300);
+        let killed = std::rc::Rc::new(std::cell::Cell::new(false));
+        let kill = killed.clone();
+        w.fakes.mux_script("if-shell", move |argv| {
+            if argv[5].contains("#{==:#{pane_pid},300}") && argv[6] == "kill-pane -t %9" {
+                kill.set(true);
+            }
+            Ok(Output::default())
+        });
+        let gone = killed.clone();
+        w.fakes
+            .mux_script("-t %9 #{pane_id}|#{@agent-id}", move |_| {
+                Ok(Output {
+                    code: 0,
+                    stdout: if gone.get() { "|\n" } else { "%9|\n" }.into(),
+                    stderr: String::new(),
+                })
+            });
+        (w, killed)
+    }
+
+    #[test]
+    fn a_legacy_record_is_stopped_only_while_its_launcher_is_proven() {
+        // Proven: the kill is bound to its command and its pid, and the launcher is signalled.
+        let (w, killed) = legacy_stop_world();
+        let reply = run(&w, stop, &["stop", "worker"]);
+        assert!(reply.starts_with(r#"ok {"name":"worker""#), "{reply}");
+        assert!(killed.get());
+        assert!(proc_calls(&w).contains(&"kill 300".to_string()));
+        // The pid kept but its start or its command changed between resolve and stop: refused before any kill.
+        for change in ["start", "command"] {
+            let (w, killed) = legacy_stop_world();
+            let fakes = w.fakes.clone();
+            let notice = lock_key("notice", &w.caller(), "bbbbbbbbbbbb");
+            let change = change.to_string();
+            w.fakes.lock_probe(move |event| {
+                if event == format!("+{notice}") {
+                    let mut row = fakes
+                        .table()
+                        .unwrap()
+                        .into_iter()
+                        .find(|r| r.pid == 300)
+                        .unwrap();
+                    if change == "start" {
+                        row.start = Some(3001);
+                    } else {
+                        row.argv = Some(vec!["/old/mux-agent".into(), "watch".into()]);
+                    }
+                    fakes.forget(300);
+                    fakes.process(row);
+                }
+                String::new()
+            });
+            w.fakes.clear_log();
+            assert_eq!(
+                run(&w, stop, &["stop", "worker"]),
+                format!("1 target {NOT_ITS_LAUNCH}")
+            );
+            assert!(pane_kills(&w).is_empty());
+            assert!(!killed.get());
+            assert!(!proc_calls(&w).iter().any(|c| c.starts_with("kill ")));
+            assert!(!w.folder("bbbbbbbbbbbb").join("notice.json").exists());
+        }
+        // A dead 0.2.x pane is never killed.
+        let (w, killed) = legacy_stop_world();
+        w.panes_dead(&["%9|@5||bbbbbbbbbbbb|worker"], &["%9"]);
+        w.fakes.clear_log();
+        assert!(!reap(&w.ctx, &w.caller(), None, false).unwrap());
+        assert!(pane_kills(&w).is_empty() && !killed.get());
     }
 }

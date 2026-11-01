@@ -2841,4 +2841,102 @@ mod tests {
         assert_eq!(*commits.borrow(), 0);
         commit_probe(None);
     }
+
+    #[test]
+    fn reservations_count_once_and_their_names_stay_taken() {
+        // Five tagged panes with no record here (another state root's agents, or launches in progress), one tag on
+        // two panes: five places, never six.
+        let w = human();
+        let mut panes = rows(5);
+        panes.push(format!("%40|@40|340|{:012x}|claude-1", 0xa01));
+        w.panes(&panes.iter().map(String::as_str).collect::<Vec<_>>());
+        // Their names are taken, as opaque names.
+        assert_eq!(
+            run(
+                &w,
+                &["-Client", "claude", "-Task", "hi", "-Name", "claude-3"]
+            ),
+            "2 name agent name is taken, try claude-3-2"
+        );
+        let ok = reply(&run(&w, &["-Client", "claude", "-Task", "hi"]));
+        assert_eq!(ok["name"], "hi");
+        // A running agent whose pane carries a reserved id's tag (rotated there) counts once, as itself: six.
+        let w = human();
+        w.agent_record(
+            "000000000d01",
+            json!({"name": "mine", "pane": "%30", "color": "blue"}),
+        );
+        let mut panes = rows(5);
+        panes.push(format!("%30|@30|330|{:012x}|claude-1", 0xa01));
+        w.panes(&panes.iter().map(String::as_str).collect::<Vec<_>>());
+        assert_eq!(
+            run(&w, &["-Client", "claude", "-Task", "hi"]),
+            "2 cap the session already has 6 live agents"
+        );
+        // Tags never name a running agent's name: `mine` is taken by its record, the tag's `claude-1` by the
+        // reservation.
+        let w = human();
+        w.agent_record("000000000d01", json!({"name": "mine", "pane": "%30"}));
+        w.panes(&[&format!("%30|@30|330|{:012x}|claude-1", 0xa01)]);
+        for name in ["mine", "claude-1"] {
+            assert!(
+                run(&w, &["-Client", "claude", "-Task", "hi", "-Name", name])
+                    .starts_with("2 name agent name is taken"),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn rollback_keeps_a_replacement_and_closes_its_own_launch_live_or_dead() {
+        let ours = "/bin/mux-agent launcher /s/spec.json";
+        // (what %9 runs when the rollback's conditional is checked, killed, the reply)
+        for (now, killed, want) in [
+            (
+                ours,
+                true,
+                "1 launch the agent did not start; its pane was closed",
+            ),
+            ("sh", false, "1 launch the agent did not start"),
+        ] {
+            let w = human();
+            w.fakes.mux_first("set-option", 1, "", "no pane");
+            let pane = Rc::new(RefCell::new(Some(now.to_string())));
+            let state = pane.clone();
+            w.fakes.mux_script("if-shell", move |argv| {
+                let mut held = state.borrow_mut();
+                let holds = held.as_ref().is_some_and(|command| {
+                    let launch = registry::Launch {
+                        command: command.clone(),
+                        pid: None,
+                    };
+                    argv[5] == launch.launched()
+                });
+                if holds {
+                    *held = None;
+                }
+                Ok(Output::default())
+            });
+            let probed = pane.clone();
+            w.fakes
+                .mux_script("-t %9 #{pane_id}|#{@agent-id}", move |_| {
+                    Ok(Output {
+                        code: 0,
+                        stdout: if probed.borrow().is_some() {
+                            "%9|\n"
+                        } else {
+                            "|\n"
+                        }
+                        .into(),
+                        stderr: String::new(),
+                    })
+                });
+            assert_eq!(
+                run(&w, &["-Client", "claude", "-Task", "hi"]),
+                want,
+                "{now}"
+            );
+            assert_eq!(pane.borrow().is_none(), killed, "{now}");
+        }
+    }
 }

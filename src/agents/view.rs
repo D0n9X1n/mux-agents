@@ -384,4 +384,39 @@ mod tests {
             .count();
         assert_eq!(offsets, 0);
     }
+
+    #[test]
+    fn list_of_six_agents_is_one_pane_list() {
+        // #48 test 10: six running agents, their tags rotated one place: one list-panes, every row by its own pane.
+        let w = World::human("");
+        let mut rows = Vec::new();
+        for n in 0..6u32 {
+            let id = format!("{:012x}", 0xe00 + n);
+            let pane = format!("%{}", 30 + n);
+            w.agent_record(&id, json!({"name": format!("w{n}"), "pane": pane}));
+            let tag = format!("{:012x}", 0xe00 + (n + 1) % 6);
+            rows.push(format!("{pane}|@5|{}|{tag}|w{}", 330 + n, (n + 1) % 6));
+        }
+        w.panes(&rows.iter().map(String::as_str).collect::<Vec<_>>());
+        w.fakes.clear_log();
+        let reply = list(&w.ctx, &w.request(&["list"])).unwrap();
+        let got: Vec<String> = reply["agents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| {
+                format!(
+                    "{}@{}",
+                    r["name"].as_str().unwrap(),
+                    r["pane"].as_str().unwrap()
+                )
+            })
+            .collect();
+        assert_eq!(
+            got,
+            ["w0@%30", "w1@%31", "w2@%32", "w3@%33", "w4@%34", "w5@%35"]
+        );
+        let verbs: Vec<String> = w.fakes.mux_calls().iter().map(|c| c[1].clone()).collect();
+        assert_eq!(verbs, ["display-message", "list-panes"]);
+    }
 }

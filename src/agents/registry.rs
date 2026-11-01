@@ -1182,6 +1182,23 @@ mod tests {
     }
 
     #[test]
+    fn two_own_records_on_one_pane_are_no_identity() {
+        // Pane ids are never reused within a server, so two own records naming one pane cannot both be it: the pane
+        // fails closed as unproven, never either agent.
+        let w = World::agent("");
+        w.agent_record(ID, json!({"name": "me", "pane": "%1"}));
+        let ended = w.agent_record("bbbbbbbbbbbb", json!({"name": "old", "pane": "%1"}));
+        write(&ended.join("notice.json"), json!({"kind": "stopped"}));
+        w.panes(&["%1|@1|100||"]);
+        let (caller, s) = (w.caller(), snapshot(&w));
+        assert_eq!(s.own(&caller), Own::Unproven);
+        assert_eq!(
+            refusal(self_of(&caller, &s)),
+            "2 parent this pane's agent cannot be proven to run here"
+        );
+    }
+
+    #[test]
     fn find_pane_named_committed_live() {
         let w = World::human("");
         let caller = w.caller();
