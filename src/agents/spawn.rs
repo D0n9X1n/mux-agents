@@ -247,7 +247,7 @@ impl Launch<'_> {
             return refuse(2, "cap", "the session already has 6 live agents");
         }
         let taken: Vec<&str> = live.iter().map(|p| p.name.as_str()).collect();
-        let name = resolve_name(self.requested, self.client, &taken)?;
+        let name = resolve_name(self.requested, self.client, &self.task, &taken)?;
         let mut plan = context_plan(caller, self.client, &ctx.env, self.no_fork);
         let session = guid()?;
         let id = hex_id()?;
@@ -1158,11 +1158,15 @@ mod tests {
             );
             assert!(calls(&w, "new-window").is_empty(), "{name:?}");
         }
-        // Five leave room for a sixth, named after the taken ones.
+        // Five leave room for a sixth; a task of stopwords names it after the taken ones.
         let w = human();
         let five = rows(5);
         w.panes(&five.iter().map(String::as_str).collect::<Vec<_>>());
-        let ok = reply(&run(&w, &["-Client", "claude", "-Task", "hi"]));
+        let ok = reply(&run(&w, &["-Client", "claude", "-Task", "do it"]));
+        assert_eq!(ok["name"], "do");
+        let w = human();
+        w.panes(&five.iter().map(String::as_str).collect::<Vec<_>>());
+        let ok = reply(&run(&w, &["-Client", "claude", "-Task", "just it"]));
         assert_eq!(ok["name"], "claude-6");
     }
 
@@ -1196,7 +1200,7 @@ mod tests {
             .mux_rule("-t %26 #{pane_id}|#{@agent-id}", 0, "|\n", "");
         let ok = reply(&run(&w, &["-Client", "claude", "-Task", "hi"]));
         assert!(killed.get());
-        assert_eq!(ok["name"], "claude-6");
+        assert_eq!(ok["name"], "hi");
         assert!(folder.join("notice.json").is_file());
 
         // An uncommitted agent over 60 s old whose pane is gone: noticed inside the spawn lock, never taken twice.
@@ -1212,7 +1216,7 @@ mod tests {
             .mux_rule("-t %7 #{pane_id}|#{@agent-id}", 0, "|\n", "");
         w.fakes.clear_log();
         let ok = reply(&run(&w, &["-Client", "claude", "-Task", "hi"]));
-        assert_eq!(ok["name"], "claude-6");
+        assert_eq!(ok["name"], "hi");
         assert!(stale.join("notice.json").is_file());
         let spawn = format!("spawn|{}|$3", w.caller().server_key);
         let held: Vec<String> = w
@@ -1441,7 +1445,7 @@ mod tests {
             // The model's two arguments count toward the limit like every other.
             for model in [&[][..], &["-Model", "sonnet"]] {
                 let w = human();
-                let mut args = vec!["-Client", client, "-Task", "x"];
+                let mut args = vec!["-Client", client, "-Task", "x", "-Name", "w"];
                 args.extend(model);
                 let ok = reply(&run(&w, &args));
                 let spec = read_json(
@@ -1464,7 +1468,7 @@ mod tests {
                 let fit = format!("{}{}", "\"".repeat(room / 2), "x".repeat(room % 2));
                 for (task, fits) in [(fit.clone(), true), (format!("{fit}x"), false)] {
                     let w = human();
-                    let mut args = vec!["-Client", client, "-Task", &task];
+                    let mut args = vec!["-Client", client, "-Task", &task, "-Name", "w"];
                     args.extend(model);
                     let text = run(&w, &args);
                     if fits {
@@ -1500,7 +1504,7 @@ mod tests {
             "-t",
             "$3:",
             "-n",
-            "claude-1",
+            "hi",
         ]
         .map(String::from)
         .to_vec();
@@ -2275,7 +2279,7 @@ mod tests {
             "-t",
             "%9",
             "@agent-name",
-            "claude-1",
+            "hi",
             ";",
             "set-option",
             "-p",
@@ -2295,7 +2299,7 @@ mod tests {
         .to_vec();
         assert_eq!(calls(&w, "set-option"), [tags]);
         let folder = agents.join(id);
-        let record = json!({"schema": 1, "id": id, "name": "claude-1", "client": "claude",
+        let record = json!({"schema": 1, "id": id, "name": "hi", "client": "claude",
             "sessionId": ok["sessionId"], "context": "brief", "reason": "human", "session": "$3",
             "pane": "%9", "window": "@5", "parentPane": "%1", "parentAgent": null,
             "directory": w.ctx.cwd.to_str().unwrap(), "taskLine": "hi",

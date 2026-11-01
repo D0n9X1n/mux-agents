@@ -93,19 +93,32 @@ pub fn session_id(text: &str) -> bool {
             .all(|g| g.bytes().all(|b| b.is_ascii_hexdigit()))
 }
 
-/// The requested name after the pattern, reserved and taken checks, or `<client>-<n>` with the smallest free n
-/// when none is requested. Taken names compare without case.
-pub fn resolve_name(requested: Option<&str>, client: Client, taken: &[&str]) -> Res<String> {
+/// The requested name after the pattern, reserved and taken checks (a taken one refuses with the first free
+/// suffix), or one derived from the task: its first words that say what it does, made free with `-2`, `-3`, ...;
+/// `<client>-<n>` with the smallest free n when the task gives none. Taken names compare without case.
+pub fn resolve_name(
+    requested: Option<&str>,
+    client: Client,
+    task: &str,
+    taken: &[&str],
+) -> Res<String> {
     let is_taken = |name: &str| {
         let name = name.to_lowercase();
         taken.iter().any(|t| t.to_lowercase() == name)
     };
     let Some(name) = requested else {
-        let client = client_name(client);
-        let free = (1u64..)
-            .map(|n| format!("{client}-{n}"))
-            .find(|name| !is_taken(name));
-        return Ok(free.expect("fewer taken names than numbers"));
+        let base = task_words(task);
+        if base.is_empty() || RESERVED.contains(&base.as_str()) {
+            let client = client_name(client);
+            let free = (1u64..)
+                .map(|n| format!("{client}-{n}"))
+                .find(|name| !is_taken(name));
+            return Ok(free.expect("fewer taken names than numbers"));
+        }
+        if !is_taken(&base) {
+            return Ok(base);
+        }
+        return Ok(free_suffix(&base, &is_taken));
     };
     let mut bytes = name.bytes();
     let well_formed = bytes.next().is_some_and(|b| b.is_ascii_lowercase())
@@ -123,9 +136,63 @@ pub fn resolve_name(requested: Option<&str>, client: Client, taken: &[&str]) -> 
         return Err(refusal(2, "name", "agent name is reserved".into()));
     }
     if is_taken(name) {
-        return Err(refusal(2, "name", "agent name is taken".into()));
+        let free = free_suffix(name, &is_taken);
+        return Err(refusal(
+            2,
+            "name",
+            format!("agent name is taken, try {free}"),
+        ));
     }
     Ok(name.to_string())
+}
+
+const STOPWORDS: [&str; 28] = [
+    "please", "a", "an", "the", "to", "and", "of", "for", "in", "on", "with", "this", "that", "it",
+    "is", "be", "can", "could", "you", "i", "we", "me", "my", "just", "then", "now", "agent",
+    "task",
+];
+
+/// The task lowercased and split on anything but a-z and 0-9, stopwords dropped: up to 3 words joined by `-`
+/// while the name stays within 24 and starts with a letter; empty when even the first word does not.
+fn task_words(task: &str) -> String {
+    let lower = task.to_ascii_lowercase();
+    let words = lower
+        .split(|c: char| !(c.is_ascii_lowercase() || c.is_ascii_digit()))
+        .filter(|word| !word.is_empty() && !STOPWORDS.contains(word));
+    let mut name = String::new();
+    for word in words.take(3) {
+        let next = if name.is_empty() {
+            word.to_string()
+        } else {
+            format!("{name}-{word}")
+        };
+        if next.len() > NAME_MAX || !next.starts_with(|c: char| c.is_ascii_lowercase()) {
+            break;
+        }
+        name = next;
+    }
+    name
+}
+
+/// The first `<base>-N` from N = 2 that is neither taken nor reserved, the base cut at a word boundary (else at
+/// the limit) so the name fits in 24, with no `-` left before the suffix.
+fn free_suffix(base: &str, is_taken: &dyn Fn(&str) -> bool) -> String {
+    let free = (2u64..)
+        .map(|n| {
+            let suffix = format!("-{n}");
+            let room = NAME_MAX.saturating_sub(suffix.len());
+            let cut = if base.len() <= room || base.as_bytes()[room] == b'-' {
+                &base[..base.len().min(room)]
+            } else {
+                match base[..room].rfind('-') {
+                    Some(at) if at > 0 => &base[..at],
+                    _ => &base[..room],
+                }
+            };
+            format!("{}{suffix}", cut.trim_end_matches('-'))
+        })
+        .find(|name| !is_taken(name) && !RESERVED.contains(&name.as_str()));
+    free.expect("fewer taken names than numbers")
 }
 
 /// Fork (the new agent starts from the caller's session) only for a same-client agent with a well-formed session
@@ -795,7 +862,7 @@ mod tests {
     #[test]
     fn name_rules_reserved_taken_auto_n() {
         let name = |requested: Option<&str>, client, taken: &[&str]| {
-            answer(resolve_name(requested, client, taken))
+            answer(resolve_name(requested, client, "", taken))
         };
         assert_eq!(name(None, Client::Claude, &[]), "\"claude-1\"");
         assert_eq!(
@@ -836,11 +903,97 @@ mod tests {
                 "2 name agent name is reserved"
             );
         }
-        // Taken names compare without case.
+        // Taken names compare without case; the refusal names the first free suffix.
         assert_eq!(
             name(Some("worker"), Client::Claude, &["other", "WORKER"]),
-            "2 name agent name is taken"
+            "2 name agent name is taken, try worker-2"
         );
+        assert_eq!(
+            name(Some("worker"), Client::Claude, &["worker", "Worker-2"]),
+            "2 name agent name is taken, try worker-3"
+        );
+        // A trailing hyphen is cut before the suffix; a 24-character name is cut at the limit to fit it.
+        assert_eq!(
+            name(Some("a-"), Client::Claude, &["a-"]),
+            "2 name agent name is taken, try a-2"
+        );
+        assert_eq!(
+            name(Some(ok.as_str()), Client::Claude, &[ok.as_str()]),
+            format!("2 name agent name is taken, try {}-2", "a".repeat(22))
+        );
+    }
+
+    #[test]
+    fn names_derive_from_the_task() {
+        let name =
+            |task: &str, taken: &[&str]| answer(resolve_name(None, Client::Claude, task, taken));
+        let task = "Please add a subtract function to calc.py";
+        assert_eq!(name(task, &[]), "\"add-subtract-function\"");
+        // Lowercased, split on anything but a-z and 0-9; a digit word after the first is kept.
+        assert_eq!(name("Fix 2 BUGS_in parser.rs", &[]), "\"fix-2-bugs\"");
+        assert_eq!(name("Écrire un test", &[]), "\"crire-un-test\"");
+        // Reserved, stopwords only, empty, or no first word that fits or starts with a letter: <client>-N.
+        for task in [
+            "parent",
+            "Root!",
+            "all",
+            "Please, could you just...",
+            "",
+            "the agent task, now",
+            "2 bugs to fix",
+            &"x".repeat(25),
+        ] {
+            assert_eq!(name(task, &["claude-2"]), "\"claude-1\"", "{task:?}");
+        }
+        assert_eq!(
+            answer(resolve_name(
+                None,
+                Client::Copilot,
+                "parent",
+                &["copilot-1"]
+            )),
+            "\"copilot-2\""
+        );
+        // Words are kept while the name stays within 24.
+        assert_eq!(
+            name("rewrite sessions locking module", &[]),
+            "\"rewrite-sessions-locking\""
+        );
+        assert_eq!(
+            name("rewrite sessionstore locking", &[]),
+            "\"rewrite-sessionstore\""
+        );
+        // Taken (any case): the first free -N, from -2.
+        assert_eq!(
+            name("add subtract", &["add-subtract"]),
+            "\"add-subtract-2\""
+        );
+        assert_eq!(
+            name("add subtract", &["ADD-SUBTRACT", "add-subtract-2"]),
+            "\"add-subtract-3\""
+        );
+        // A 24-character base is cut at a word boundary so <base>-N fits, and each cut is checked again.
+        let long = ["rewrite-sessions-locking"];
+        assert_eq!(
+            name("rewrite sessions locking", &long),
+            "\"rewrite-sessions-2\""
+        );
+        assert_eq!(
+            name(
+                "rewrite sessions locking",
+                &["rewrite-sessions-locking", "rewrite-sessions-2"]
+            ),
+            "\"rewrite-sessions-3\""
+        );
+        // One word too long for a suffix is cut at the limit.
+        let word = "abcdefghijklmnopqrstuvwx";
+        assert_eq!(name(word, &[word]), "\"abcdefghijklmnopqrstuv-2\"");
+        let taken: Vec<String> = (2..=10)
+            .map(|n| format!("abcdefghijklmnopqrstuv-{n}"))
+            .chain([word.to_string()])
+            .collect();
+        let taken: Vec<&str> = taken.iter().map(String::as_str).collect();
+        assert_eq!(name(word, &taken), "\"abcdefghijklmnopqrstu-10\"");
     }
 
     #[test]
