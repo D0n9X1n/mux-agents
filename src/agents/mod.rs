@@ -259,8 +259,68 @@ pub(crate) mod fixture {
             for (key, value) in fields.as_object().unwrap() {
                 record[key] = value.clone();
             }
+            // Its pane's launch, unless the fields name one.
+            if record.get("startCommand").is_none() {
+                let pane = record["pane"].as_str().unwrap_or("").to_string();
+                record["startCommand"] = launch_command(&pane).into();
+            }
             write(&folder.join("record.json"), record);
             folder
+        }
+
+        /// Makes agent `id`'s record a 0.2.0-0.2.2 one: no `startCommand`.
+        pub fn legacy(&self, id: &str) {
+            let path = self.folder(id).join("record.json");
+            let mut record = crate::state::fs::read_json(&path).unwrap().unwrap();
+            record.as_object_mut().unwrap().remove("startCommand");
+            write(&path, record);
+        }
+
+        /// spawn's probe after the tags answers every pane as still the launch its reply named.
+        pub fn launches_hold(&self) {
+            self.fakes
+                .mux_script("}|#{==:#{pane_start_command},", |argv| {
+                    let pane = argv
+                        .iter()
+                        .skip_while(|a| *a != "-t")
+                        .nth(1)
+                        .cloned()
+                        .unwrap_or_default();
+                    Ok(crate::mux::Output {
+                        code: 0,
+                        stdout: format!("{pane}|1\n"),
+                        stderr: String::new(),
+                    })
+                });
+        }
+
+        /// The recipient probe answers every pane as a live pane of session $3.
+        pub fn recipients_live(&self) {
+            self.fakes.mux_script("#{pane_id}|#{session_id}", |argv| {
+                let pane = argv
+                    .iter()
+                    .skip_while(|a| *a != "-t")
+                    .nth(1)
+                    .cloned()
+                    .unwrap_or_default();
+                Ok(crate::mux::Output {
+                    code: 0,
+                    stdout: format!("{pane}|$3\n"),
+                    stderr: String::new(),
+                })
+            });
+        }
+
+        /// What `list-panes` answers, row by row.
+        pub fn pane_rows(&self, rows: &[Listed]) {
+            let rows = rows.to_vec();
+            self.fakes.mux_script("list-panes", move |argv| {
+                Ok(crate::mux::Output {
+                    code: 0,
+                    stdout: listed_rows(argv, &rows, "\n"),
+                    stderr: String::new(),
+                })
+            });
         }
     }
 
@@ -279,14 +339,58 @@ pub(crate) mod fixture {
         }
     }
 
-    /// `rows` (`<pane>|<window>|<pid>|<id>|<name>`, the name to the end and free to hold `|` or LF) expanded
-    /// into the `-F` format of `argv`, each row ended by `sep`. A name's LF lands in the output as it would.
+    /// The fixture's launch command of an agent whose pane is `pane`: what its record's `startCommand` holds and
+    /// what the pane list answers for that pane, unless a test says otherwise.
+    pub fn launch_command(pane: &str) -> String {
+        format!(
+            "/bin/mux-agent launcher /state/agents/{}/spec.json",
+            pane.trim_start_matches('%')
+        )
+    }
+
+    /// One pane as the fake `list-panes` answers it.
+    #[derive(Clone, Debug)]
+    pub struct Listed {
+        pub pane: String,
+        pub window: String,
+        pub pid: String,
+        pub dead: bool,
+        pub command: String,
+        pub tag: String,
+        pub name: String,
+    }
+
+    /// `<pane>|<window>|<pid>|<id>|<name>` (the name to the end, free to hold `|` or LF), started by its
+    /// `launch_command`, dead when listed in `dead`.
+    pub fn row_of(row: &str, dead: &[&str]) -> Listed {
+        let mut fields = row.splitn(5, '|');
+        let mut next = || fields.next().unwrap_or("").to_string();
+        let (pane, window, pid, tag, name) = (next(), next(), next(), next(), next());
+        Listed {
+            dead: dead.contains(&pane.as_str()),
+            command: launch_command(&pane),
+            pane,
+            window,
+            pid,
+            tag,
+            name,
+        }
+    }
+
+    /// `rows` expanded into the `-F` format of `argv`, each row ended by `sep`.
     pub fn listed(argv: &[String], rows: &[&str], sep: &str) -> String {
         listed_dead(argv, rows, sep, &[])
     }
 
     /// As `listed`, with `#{pane_dead}` 1 for the panes in `dead` and 0 for the others.
     pub fn listed_dead(argv: &[String], rows: &[&str], sep: &str, dead: &[&str]) -> String {
+        let rows: Vec<Listed> = rows.iter().map(|r| row_of(r, dead)).collect();
+        listed_rows(argv, &rows, sep)
+    }
+
+    /// `rows` expanded into the `-F` format of `argv` as the multiplexer would: each field's text as is, in one
+    /// pass, so no field's text is read as a placeholder.
+    pub fn listed_rows(argv: &[String], rows: &[Listed], sep: &str) -> String {
         let format = argv
             .iter()
             .skip_while(|a| *a != "-F")
@@ -295,30 +399,37 @@ pub(crate) mod fixture {
             .unwrap_or_default();
         rows.iter()
             .map(|row| {
-                let mut fields = row.splitn(5, '|');
-                let mut next = || fields.next().unwrap_or("").to_string();
-                let (pane, window, pid, id, name) = (next(), next(), next(), next(), next());
-                let is_dead = if dead.contains(&pane.as_str()) {
-                    "1"
-                } else {
-                    "0"
-                };
-                let line = format
-                    .replace("#{pane_dead}", is_dead)
-                    .replace("#{pane_id}", &pane)
-                    .replace("#{window_id}", &window)
-                    .replace("#{pane_pid}", &pid)
-                    .replace("#{@agent-id}", &id)
-                    .replace("#{@agent-name}", &name);
+                let fields = [
+                    ("#{pane_id}", row.pane.as_str()),
+                    ("#{window_id}", &row.window),
+                    ("#{pane_pid}", &row.pid),
+                    ("#{pane_dead}", if row.dead { "1" } else { "0" }),
+                    ("#{pane_start_command}", &row.command),
+                    ("#{@agent-id}", &row.tag),
+                    ("#{@agent-name}", &row.name),
+                ];
+                let mut line = String::new();
+                let mut rest = format.as_str();
+                'scan: while let Some(c) = rest.chars().next() {
+                    for (key, value) in fields {
+                        if let Some(after) = rest.strip_prefix(key) {
+                            line.push_str(value);
+                            rest = after;
+                            continue 'scan;
+                        }
+                    }
+                    line.push(c);
+                    rest = &rest[c.len_utf8()..];
+                }
                 format!("{line}{sep}")
             })
             .collect()
     }
 
-    /// Whether `call` is the session's tagged-pane list: its rows framed by one fresh 32-hex marker.
+    /// Whether `call` is the session's pane list: every field framed by one fresh 32-hex marker.
     pub fn list_call(call: &[String]) -> bool {
         let prefix = ["-N", "list-panes", "-s", "-t", "$3", "-F"];
-        let marker = call.get(6).and_then(|f| f.split('|').next()).unwrap_or("");
+        let marker = call.get(6).map_or("", |f| f.get(..32).unwrap_or(""));
         call.len() == 7
             && call[..6] == prefix[..]
             && marker.len() == 32

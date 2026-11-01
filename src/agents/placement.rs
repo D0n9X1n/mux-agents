@@ -7,7 +7,7 @@ use super::{text, usage};
 use crate::caller::{Caller, resolve};
 use crate::cli::Request;
 use crate::ctx::Ctx;
-use crate::error::{Res, refuse};
+use crate::error::Res;
 use crate::mux::native;
 
 const OPTION: &str = "@mux-agents-placement";
@@ -37,9 +37,11 @@ pub fn placement(ctx: &Ctx, request: &Request) -> Res<Map<String, Value>> {
         Some(value) => Some(known(value).ok_or_else(|| usage("placement"))?),
     };
     let caller = resolve(ctx)?;
-    if !caller.agent_tag.is_empty() {
-        return refuse(2, "tagged", "an agent pane cannot choose where agents open");
-    }
+    super::registry::untagged(
+        ctx,
+        &caller,
+        "an agent pane cannot choose where agents open",
+    )?;
     let (placement, source) = match value {
         Some(value) => {
             native(
@@ -73,6 +75,7 @@ pub fn placement_text(reply: &Map<String, Value>, _color: bool) -> String {
 mod tests {
     use crate::agents::fixture::{ID, World};
     use crate::proc::Signals;
+    use serde_json::json;
 
     const READ: &str = "-N show-options -qv -t $3 @mux-agents-placement";
 
@@ -82,12 +85,12 @@ mod tests {
         crate::cli::run(&args, || Ok(&w.ctx))
     }
 
-    // Every multiplexer call but the caller probe, as text.
+    // Every multiplexer call but the caller probe and the pane list proving the caller is no agent, as text.
     fn calls(w: &World) -> Vec<String> {
         w.fakes
             .mux_calls()
             .iter()
-            .filter(|c| c[1] != "display-message")
+            .filter(|c| c[1] != "display-message" && c[1] != "list-panes")
             .map(|c| c.join(" "))
             .collect()
     }
@@ -208,6 +211,12 @@ mod tests {
                 );
                 assert!(calls(&w).is_empty(), "{args:?} {tag}");
             }
+            // A tagless pane that is an agent's own (its tag rotated away by rmux) refuses too.
+            let w = World::human("");
+            w.agent_record(ID, json!({"pane": "%1"}));
+            w.panes(&["%1|@1|100||"]);
+            assert_eq!(call(&w, args).0, 2, "{args:?}");
+            assert!(calls(&w).is_empty(), "{args:?}");
         }
     }
 

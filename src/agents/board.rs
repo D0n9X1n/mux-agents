@@ -33,42 +33,30 @@ pub fn select_doing(
     (Value::Null, Value::Null)
 }
 
-/// `{running, agents}` for the caller's session: live agents in pane order and, with `all`, `endedTotal` (every
-/// ended agent of the session) and the session's ended agents, newest notice first, at most 10. Unread is
-/// `reader`'s. `watch` (the bar's feed) adds each ended row's exitCode from its notice.json and each live row's
-/// `waiting` (S2.4), and a live row's unread is instead its own messages still unread in its parent's mailbox (S2.5;
-/// `reader` unused). Locks one at a time: notice locks, the reader's (or each parent's) mail lock, then each row's
-/// agent lock.
-pub fn board(
-    ctx: &Ctx,
-    caller: &Caller,
-    reader: &str,
-    all: bool,
-    watch: bool,
-) -> Res<Map<String, Value>> {
+/// `{running, agents}` for the caller's session: running agents in pane order and, with `all`, `endedTotal` (every
+/// ended agent of the session) and the session's ended agents, newest notice first, at most 10. Unread is the
+/// caller's own mailbox's: a running agent's pane reads its id's, any other pane `pane-<n>`, as the same snapshot
+/// shows it (a tag never names a reader). `watch` (the bar's feed) adds each ended row's exitCode from its
+/// notice.json and each live row's `waiting` (S2.4), and a live row's unread is instead its own messages still unread
+/// in its parent's mailbox (S2.5). Locks one at a time: notice locks, the reader's (or each parent's) mail lock, then
+/// each row's agent lock.
+pub fn board(ctx: &Ctx, caller: &Caller, all: bool, watch: bool) -> Res<Map<String, Value>> {
     // One list-panes for the notices, the live rows and the ended filter; list runs every 3 s. A reap that killed a
     // pane or posted a notice makes that snapshot stale, so the panes are listed again.
-    let mut tagged = registry::tagged(ctx, caller)?;
-    if registry::reap(ctx, caller, Some(&tagged), false)? {
-        tagged = registry::tagged(ctx, caller)?;
-    }
-    let panes = registry::committed(ctx, caller, tagged.clone());
-    let mut live = Vec::new();
-    for pane in &panes {
-        let Some(record) = registry::record(ctx, caller, &pane.id)? else {
-            continue;
-        };
-        if same_session(&record, caller) {
-            live.push((pane, record));
-        }
-    }
+    let snapshot = registry::live_after_reap(ctx, caller)?;
+    let panes = snapshot.running();
+    let reader = match snapshot.own(caller) {
+        registry::Own::Agent(me) => me.id,
+        _ => mailbox_key(&caller.pane, "")?,
+    };
     // The mailboxes whose unread counts: the reader's, or (watch) each live agent's parent's, in key order.
     let mut keys: Vec<String> = if watch {
-        live.iter()
-            .filter_map(|(_, record)| parent_key(record, &tagged))
+        panes
+            .iter()
+            .filter_map(|pane| parent_key(&pane.record, &panes))
             .collect()
     } else {
-        vec![reader.to_string()]
+        vec![reader.clone()]
     };
     keys.sort();
     keys.dedup();
@@ -81,14 +69,20 @@ pub fn board(
         ctx,
         caller,
         unread,
-        reader: (!watch).then(|| reader.to_string()),
-        tagged: &tagged,
+        reader: (!watch).then_some(reader),
+        running: &panes,
         now: ctx.clock.now(),
         watch,
     };
     let mut agents = Vec::new();
-    for (pane, record) in &live {
-        agents.push(rows.row(&pane.id, record, pane.pane.clone(), &pane.window, "running")?);
+    for pane in &panes {
+        agents.push(rows.row(
+            &pane.id,
+            &pane.record,
+            pane.pane.clone(),
+            &pane.window,
+            "running",
+        )?);
     }
     let running = agents.len();
     let mut ended_total = None;
@@ -145,15 +139,15 @@ pub(crate) fn newest_ended(
         .map(|end| (end.id, end.record, end.kind)))
 }
 
-/// The mailbox of an agent's parent pane: the agent id it is tagged with when it is a listed agent pane, else
-/// `pane-<n>` (as `send parent` delivers); none for a malformed pane.
-fn parent_key(record: &Value, tagged: &[Pane]) -> Option<String> {
+/// The mailbox of an agent's parent pane: the running agent's id there, else `pane-<n>` (as `send parent`
+/// delivers); none for a malformed pane. Never a tag.
+fn parent_key(record: &Value, running: &[Pane]) -> Option<String> {
     let parent = super::text(record.get("parentPane"));
-    let tag = tagged
+    let id = running
         .iter()
         .find(|p| p.pane == parent)
         .map_or("", |p| p.id.as_str());
-    mailbox_key(&parent, tag).ok()
+    mailbox_key(&parent, id).ok()
 }
 
 fn same_session(record: &Value, caller: &Caller) -> bool {
@@ -224,7 +218,7 @@ struct Rows<'a> {
     unread: HashMap<String, HashMap<String, usize>>,
     // The one mailbox every row counts in; none in watch mode, where each row counts in its parent's.
     reader: Option<String>,
-    tagged: &'a [Pane],
+    running: &'a [Pane],
     now: SystemTime,
     watch: bool,
 }
@@ -271,7 +265,7 @@ impl Rows<'_> {
             .and_then(|created| age_seconds(created, self.now));
         let mailbox = match &self.reader {
             Some(reader) => Some(reader.clone()),
-            None => parent_key(record, self.tagged),
+            None => parent_key(record, self.running),
         };
         let unread = mailbox
             .and_then(|key| self.unread.get(&key))
@@ -414,7 +408,7 @@ mod tests {
         }
         let before = tree(&w.state());
         w.fakes.clear_log();
-        let reply = board(&w.ctx, &caller, "pane-1", false, false).unwrap();
+        let reply = board(&w.ctx, &caller, false, false).unwrap();
         let row = |name,
                    client,
                    pane,
@@ -502,7 +496,7 @@ mod tests {
     #[test]
     fn ended_newest_first_max_10() {
         let (w, caller) = ended_world();
-        let all = board(&w.ctx, &caller, "pane-1", true, false).unwrap();
+        let all = board(&w.ctx, &caller, true, false).unwrap();
         assert_eq!(all["running"], 1);
         // Every ended agent of the session, lost ones included; other sessions, odd kinds and foreign records not.
         assert_eq!(all["endedTotal"], 5);
@@ -520,7 +514,7 @@ mod tests {
                 "late=lost"
             ]
         );
-        let plain = board(&w.ctx, &caller, "pane-1", false, false).unwrap();
+        let plain = board(&w.ctx, &caller, false, false).unwrap();
         assert_eq!(names(&plain), ["worker=running"]);
         // Without -All the reply is unchanged: no endedTotal.
         assert!(plain.get("endedTotal").is_none());
@@ -544,7 +538,7 @@ mod tests {
                 json!({"kind": "stopped", "exitCode": null, "at": at}),
             );
         }
-        let all = board(&w.ctx, &caller, "pane-1", true, false).unwrap();
+        let all = board(&w.ctx, &caller, true, false).unwrap();
         // Uncapped: 12 ended, 10 rows.
         assert_eq!(all["endedTotal"], 12);
         let got: Vec<String> = names(&all)
@@ -585,7 +579,7 @@ mod tests {
             write(&folder.join("notice.json"), notice);
         }
         w.panes(&[]);
-        let all = board(&w.ctx, &caller, "pane-1", true, false).unwrap();
+        let all = board(&w.ctx, &caller, true, false).unwrap();
         let rows = all["agents"].as_array().unwrap();
         let lost = rows[0].as_object().unwrap();
         assert_eq!(lost["name"], "vanished");
@@ -596,7 +590,7 @@ mod tests {
         );
         assert!(rows[1].get("closedBy").is_none(), "{}", rows[1]);
         // The watch feed puts exitCode last, after it.
-        let watch = board(&w.ctx, &caller, "pane-1", true, true).unwrap();
+        let watch = board(&w.ctx, &caller, true, true).unwrap();
         let keys: Vec<&str> = watch["agents"][0]
             .as_object()
             .unwrap()
@@ -609,7 +603,7 @@ mod tests {
     #[test]
     fn with_exit_code_only_for_watch() {
         let (w, caller) = ended_world();
-        let watch = board(&w.ctx, &caller, "pane-1", true, true).unwrap();
+        let watch = board(&w.ctx, &caller, true, true).unwrap();
         let codes: Vec<String> = watch["agents"]
             .as_array()
             .unwrap()
@@ -637,7 +631,7 @@ mod tests {
                 "late=null"
             ]
         );
-        let list = board(&w.ctx, &caller, "pane-1", true, false).unwrap();
+        let list = board(&w.ctx, &caller, true, false).unwrap();
         assert!(
             !list["agents"]
                 .as_array()
@@ -676,7 +670,7 @@ mod tests {
             }
             String::new()
         });
-        let reply = board(&w.ctx, &caller, "pane-1", false, false).unwrap();
+        let reply = board(&w.ctx, &caller, false, false).unwrap();
         let row = &reply["agents"][0];
         assert_eq!(
             (&row["doing"], &row["doingFrom"], &row["unread"]),
@@ -721,7 +715,7 @@ mod tests {
         });
         w.fakes.mux_rule("#{pane_id}|#{@agent-id}", 0, "|\n", "");
         w.fakes.clear_log();
-        let reply = board(&w.ctx, &caller, "pane-1", true, false).unwrap();
+        let reply = board(&w.ctx, &caller, true, false).unwrap();
         assert!(killed.get());
         assert_eq!(
             (names(&reply), &reply["running"]),
@@ -757,7 +751,7 @@ mod tests {
             String::new()
         });
         w.fakes.clear_log();
-        let reply = board(&w.ctx, &caller, "pane-1", false, false).unwrap();
+        let reply = board(&w.ctx, &caller, false, false).unwrap();
         let notice = lock_key("notice", &caller, "bbbbbbbbbbbb");
         let mail = lock_key("mail", &caller, "pane-1");
         assert_eq!(
@@ -786,7 +780,7 @@ mod tests {
             json!({"line": "sent", "at": "x"}),
         );
         w.fakes.lock_probe(|_| String::new());
-        let reply = board(&w.ctx, &caller, "pane-1", false, false).unwrap();
+        let reply = board(&w.ctx, &caller, false, false).unwrap();
         let row = &reply["agents"][0];
         assert_eq!(
             (&row["doing"], &row["doingFrom"]),
@@ -816,7 +810,7 @@ mod tests {
             )
         };
         let waiting = || {
-            let reply = board(&w.ctx, &caller, "pane-1", true, true).unwrap();
+            let reply = board(&w.ctx, &caller, true, true).unwrap();
             reply["agents"][0]["waiting"].clone()
         };
         let files = || {
@@ -854,7 +848,7 @@ mod tests {
         assert_eq!(files(), Vec::<String>::new());
         // Only the bar's feed says waiting; list's rows are unchanged.
         wait(700, 700, 7000, "11:59:00");
-        let list = board(&w.ctx, &caller, "pane-1", true, false).unwrap();
+        let list = board(&w.ctx, &caller, true, false).unwrap();
         assert!(list["agents"][0].get("waiting").is_none());
         assert_eq!(files(), ["waiting-700.json"]);
     }
@@ -882,7 +876,7 @@ mod tests {
         add_mail(&w.ctx, &caller, "pane-2", "worker", "%9", "z", None).unwrap();
         // The bar's own pane (pane-7) has no mail; its reader is not used.
         let unread = || {
-            let reply = board(&w.ctx, &caller, "pane-7", true, true).unwrap();
+            let reply = board(&w.ctx, &caller, true, true).unwrap();
             reply["agents"]
                 .as_array()
                 .unwrap()
@@ -907,8 +901,35 @@ mod tests {
         assert_eq!(unread(), ["worker=0", "child=1"]);
         assert_eq!(read_mail(&w.ctx, &caller, ID).unwrap().len(), 1);
         assert_eq!(unread(), ["worker=0", "child=0"]);
-        // list keeps the calling reader's unread.
-        let list = board(&w.ctx, &caller, "pane-2", false, false).unwrap();
+        // list keeps the calling reader's unread: the caller's own pane-1, never the bar's parents.
+        add_mail(&w.ctx, &caller, "pane-1", "worker", "%9", "w", None).unwrap();
+        let list = board(&w.ctx, &caller, false, false).unwrap();
         assert_eq!(list["agents"][0]["unread"], 1);
+    }
+
+    #[test]
+    fn a_dead_launch_a_failed_kill_left_is_not_running() {
+        // #48 test 5: reap's conditional kill of the dead launch %9 failed (or the server kept the pane): the pane
+        // is still listed dead, so it is no board row and no target.
+        let w = World::human("");
+        let caller = w.caller();
+        w.agent_record(ID, json!({}));
+        w.panes_dead(&["%9|@5|300|aaaaaaaaaaaa|worker"], &["%9"]);
+        w.fakes.mux_rule("if-shell", 1, "", "no server");
+        w.fakes
+            .mux_rule("-t %9 #{pane_id}|#{@agent-id}", 0, "%9|aaaaaaaaaaaa\n", "");
+        let reply = board(&w.ctx, &caller, true, false).unwrap();
+        assert_eq!(reply["running"], 0);
+        assert!(names(&reply).is_empty(), "{reply:?}");
+        let killed = w
+            .fakes
+            .mux_calls()
+            .iter()
+            .filter(|c| c[1] == "if-shell")
+            .count();
+        assert!(killed >= 1);
+        let found = registry::find_pane(&w.ctx, &caller, "worker").unwrap_err();
+        assert_eq!((found.code, found.check), (2, "target"));
+        assert!(!w.folder(ID).join("notice.json").exists());
     }
 }

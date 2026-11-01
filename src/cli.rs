@@ -526,12 +526,11 @@ mod tests {
         let cwd = w.ctx.cwd.to_str().unwrap().to_string();
         let exe = w.ctx.exe.to_str().unwrap().to_string();
         let calls = w.fakes.mux_calls();
-        // The new agent's id, as its tags name it.
-        let id = calls
-            .iter()
-            .flat_map(|c| c.windows(2))
-            .find(|pair| pair[0] == "@agent-id")
-            .map(|pair| pair[1].clone());
+        // The new agent's id, as its tags name it (inside the bound tag command: `@agent-id <id>`).
+        let id = calls.iter().flatten().find_map(|t| {
+            let rest = &t[t.find("@agent-id ")? + "@agent-id ".len()..];
+            rest.get(..12).map(str::to_string)
+        });
         let spec = id.as_ref().map(|id| {
             w.ctx
                 .state_root
@@ -546,12 +545,18 @@ mod tests {
         let env = format!("MUX_AGENTS_STATE={state}");
         let mut out = format!("[{scenario}]\n");
         for c in &calls {
-            let marker = list_call(c).then(|| c[6].split('|').next().unwrap().to_string());
+            let marker = list_call(c).then(|| c[6][..32].to_string());
             let tokens: Vec<String> = c
                 .iter()
                 .map(|t| {
-                    // A token with spaces (if-shell's command, the bar's record) is written quoted.
+                    // A private capture buffer's random name is written `<buffer>`.
+                    let t = &buffer_placeholder(t);
+                    // A token with spaces (if-shell's command, the bar's record) is written quoted, its id as <id>.
                     if t.contains(' ') {
+                        let t = match &id {
+                            Some(id) => t.replace(id.as_str(), "<id>"),
+                            None => t.clone(),
+                        };
                         return format!("'{t}'");
                     }
                     if Some(t) == spec.as_ref() {
@@ -577,7 +582,35 @@ mod tests {
         out
     }
 
+    // `t` with every `mux-agents-<32 hex>` (a read's private buffer) written `<buffer>`.
+    fn buffer_placeholder(t: &str) -> String {
+        const HEAD: &str = "mux-agents-";
+        let mut out = String::new();
+        let mut rest = t;
+        while let Some(at) = rest.find(HEAD) {
+            let after = &rest[at + HEAD.len()..];
+            let hex = after
+                .get(..32)
+                .filter(|h| h.bytes().all(|b| b.is_ascii_hexdigit()));
+            out.push_str(&rest[..at]);
+            match hex {
+                Some(_) => {
+                    out.push_str("<buffer>");
+                    rest = &after[32..];
+                }
+                None => {
+                    out.push_str(HEAD);
+                    rest = after;
+                }
+            }
+        }
+        out.push_str(rest);
+        out
+    }
+
     // A human caller in %1 with live agent `worker` (%9) and a committed agent (%8) whose pane is gone from the list.
+    // The multiplexer answers each pane live in session $3, shows %9 focused, and takes %9 when a conditional kill
+    // names its live launch.
     fn agents_world() -> World {
         let w = World::human("");
         w.agent_record(ID, json!({"name": "worker", "pane": "%9", "window": "@5"}));
@@ -586,18 +619,52 @@ mod tests {
             json!({"name": "gone", "pane": "%8", "window": "@4"}),
         );
         w.panes(&["%9|@5|300|aaaaaaaaaaaa|worker"]);
+        w.recipients_live();
+        w.fakes.mux_rule("#{window_active}", 0, "%9|1|1|1\n", "");
+        let killed = std::rc::Rc::new(std::cell::Cell::new(false));
+        let kill = killed.clone();
+        w.fakes.mux_script("if-shell", move |argv| {
+            if argv.last().is_some_and(|a| a == "kill-pane -t %9") {
+                kill.set(true);
+            }
+            Ok(Output::default())
+        });
         w.fakes
-            .mux_rule("#{session_id}|#{@agent-id}", 0, "$3|aaaaaaaaaaaa\n", "");
+            .mux_script("-t %9 #{pane_id}|#{@agent-id}", move |_| {
+                let stdout = if killed.get() {
+                    "|\n"
+                } else {
+                    "%9|aaaaaaaaaaaa\n"
+                };
+                Ok(Output {
+                    code: 0,
+                    stdout: stdout.into(),
+                    stderr: String::new(),
+                })
+            });
+        w.fakes
+            .mux_rule("show-buffer", 0, "line one\nline two\n", "");
         w
     }
 
     // The agent's pane is %12; the side bar's split, the only call running `watch`, answers %13 in the caller's window.
     fn spawn_world() -> World {
         let w = World::human("");
+        w.launches_hold();
         bar_process(&w);
-        w.fakes.mux_rule("new-window", 0, "%12|@7\n", "");
+        w.fakes.mux_rule(
+            "new-window",
+            0,
+            "%12|@7|/bin/mux-agent launcher /s/spec.json\n",
+            "",
+        );
         w.fakes.mux_rule("watch", 0, "%13|@1|113\n", "");
-        w.fakes.mux_rule("split-window", 0, "%12|@7\n", "");
+        w.fakes.mux_rule(
+            "split-window",
+            0,
+            "%12|@7|/bin/mux-agent launcher /s/spec.json\n",
+            "",
+        );
         w
     }
 
@@ -743,6 +810,7 @@ mod tests {
         record(&agents_world(), "stop worker", &["stop", "worker"], 0);
         let w = World::agent(ID);
         w.agent_record(ID, json!({"pane": "%1"}));
+        w.panes(&["%1|@1|100|aaaaaaaaaaaa|worker"]);
         w.file("s.md", b"parsing the config");
         record(
             &w,
@@ -871,7 +939,12 @@ mod tests {
         // The bar opened (%13), turned off by `sidebar -Close`, and unproven after the commit (its proof failed).
         let open = || {
             let w = spawn_world();
-            w.fakes.mux_first("new-window", 0, "%9|@5\n", "");
+            w.fakes.mux_first(
+                "new-window",
+                0,
+                "%9|@5|/bin/mux-agent launcher /s/spec.json\n",
+                "",
+            );
             w
         };
         let off = || {
