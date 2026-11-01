@@ -23,6 +23,7 @@ mux-agents 是 Claude Code 和 GitHub Copilot CLI 的插件。客户端在 rmux 
 
 ## 发布
 
+- [v0.2.2](Release-v0.2.2-zh-CN) — 一眼看懂且固定在右侧的侧边栏；代理按任务命名；丢失的代理自动关闭；仅限终端 CLI
 - [v0.2.1](Release-v0.2.1-zh-CN) — 用 `placement` 按会话选择标签页或窗格；侧边栏自动打开
 - [v0.2.0](Release-v0.2.0-zh-CN) — 适用于 macOS、Linux 和 Windows 的单个原生二进制文件，不需要 PowerShell；Unix 上使用文件锁
 - [v0.1.0](Release-v0.1.0-zh-CN) — 首个发布：在 Windows、Linux 和 macOS 上提供 spawn、list、status、send、read、focus、stop 和侧边栏

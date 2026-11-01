@@ -4,6 +4,10 @@ All notable changes to mux-agents. The format follows [Keep a Changelog](https:/
 
 ## [Unreleased]
 
+## [0.2.2] - 2026-11-01
+
+A side bar you can read at a glance and that stays on the right, agents named after their task, lost agents closed on their own, `spawn -Model`, and nothing in the desktop app. [Release notes](https://github.com/D0n9X1n/mux-agents/wiki/Release-v0.2.2).
+
 ### Added
 
 - `spawn -Model <model>` chooses the new agent's model (a name or alias such as `sonnet` or `sonnet[1m]`); it reaches the client as `--model <model>`. The spawn reply names `model` after `reason` (`inherited` without `-Model`), `record.json` keeps it, `list` rows carry it (null when inherited), and the side bar and the Claude Code `Agents` pane show `[<model>]` after a live agent's client. ([#41](https://github.com/D0n9X1n/mux-agents/issues/41))
@@ -65,7 +69,8 @@ One native Rust binary replaces the PowerShell implementation: no PowerShell or 
 
 The first release: `spawn`, `list`, `status`, `send`, `read`, `focus`, `stop` and the side bar on Windows (rmux) and on Linux and macOS (tmux), written in PowerShell 7.4. [Release notes](https://github.com/D0n9X1n/mux-agents/wiki/Release-v0.1.0).
 
-[Unreleased]: https://github.com/D0n9X1n/mux-agents/compare/v0.2.1...HEAD
+[Unreleased]: https://github.com/D0n9X1n/mux-agents/compare/v0.2.2...HEAD
+[0.2.2]: https://github.com/D0n9X1n/mux-agents/compare/v0.2.1...v0.2.2
 [0.2.1]: https://github.com/D0n9X1n/mux-agents/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/D0n9X1n/mux-agents/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/D0n9X1n/mux-agents/releases/tag/v0.1.0
