@@ -22,16 +22,24 @@ const header = async (ui: any) => (await ui.find({ type: 'Text', text: /running/
 // answers a close beneath the plugin: the engine closing the pane (default), a hook refusing it, or a hook answering
 // without closing.
 // `live` is what the session reads now, changed by a test at any point: its surfaces (`'reject'` refuses the read), the
-// environment, and the names whose env.get is refused. `seen.panes` is the roster: panes opened and not yet closed.
+// environment, the names whose env.get is refused, and `holds`: each holds one read of its name made while the pane is
+// listed, for `ms` on the mock clock, after letting `skip` such reads through. `seen.panes` is the roster: panes opened
+// and not yet closed.
 type Answers = { register?: object; open?: object; openHoldMs?: number; denyWrites?: number; close?: 'close' | 'deny' | 'keep' }
-type Live = { surfaces: string[] | 'reject'; env: Record<string, string>; deny: string[] }
+type Hold = { name: string; ms: number; skip?: number }
+type Live = { surfaces: string[] | 'reject'; env: Record<string, string>; deny: string[]; holds: Hold[] }
 function world(on: any, env: Record<string, string>, runs: object[], tool: { stdout: string; text: string; isError?: boolean } = { stdout: SPAWN_JSON, text: SPAWN_JSON }, answers: Answers = {}) {
   const seen = { registered: [] as object[], opened: [] as object[], closed: [] as string[], panes: new Set<string>(), argv: [] as string[][], init: [] as unknown[], status: [] as (string | undefined)[], settled: 0 }
-  const live: Live = { surfaces: ['terminal'], env: { ...env }, deny: [] }
-  on('env.get', (_: unknown, e: { name: string }) => (live.deny.includes(e.name) ? { deny: 'unreadable' } : { value: live.env[e.name] }))
+  const live: Live = { surfaces: ['terminal'], env: { ...env }, deny: [], holds: [] }
+  const clock = mock.clock(on)
+  on('env.get', async (_: unknown, e: { name: string }) => {
+    const hold = seen.panes.size ? live.holds.find(h => h.name === e.name) : undefined
+    if (hold && hold.skip) hold.skip--
+    else if (hold) { live.holds.splice(live.holds.indexOf(hold), 1); await clock.sleep(hold.ms) }
+    return live.deny.includes(e.name) ? { deny: 'unreadable' } : { value: live.env[e.name] }
+  })
   on('session.surfaces', () => (live.surfaces === 'reject' ? { deny: 'unreadable' } : { value: [...live.surfaces] }))
   on('session.attach', (_: unknown, e: { clientId: string }) => ({ clientId: e.clientId }))
-  const clock = mock.clock(on)
   on('command.register', (_: unknown, e: object) => { seen.registered.push({ ...e }); return answers.register ?? { value: { command: 'mux-agents-pane' } } })
   on('ui.open', async (_: unknown, e: { id: string }) => {
     seen.opened.push({ ...e })
@@ -192,6 +200,8 @@ test('list runs once on open, then once at each 3000 ms boundary', async ($, on)
   const { seen, clock } = world(on, { TMUX: 'x' }, [ran(0, LIST)])
   await $.session.start(START)
   await $.command.run({ command: 'mux-agents-pane' })
+  // The first refresh checks eligibility before list runs, so it is counted once that check settles.
+  await clock.settle()
   const counts = [seen.argv.length]
   for (const step of [2999, 1, 2999, 1]) { await clock.advance(step); counts.push(seen.argv.length) }
   expect(counts).toEqual([1, 1, 2, 2, 3])
@@ -439,6 +449,42 @@ for (const attach of [false, true]) {
     const answered: any = await run
     await w.clock.settle()
     expect([answered?.text, w.seen.opened.length, w.seen.argv.length, [...w.seen.panes]]).toEqual([NOT_HERE, 1, 0, []])
+    await stillStopped($, w, 0)
+  })
+}
+
+// A read the open or the first refresh waits on outlives the eligibility seen before it (QA #43): the surfaces turn to
+// terminal and desktop while it is held, with and without the desktop's attach event.
+async function lostDuringRead($: any, w: ReturnType<typeof world>, hold: Hold, attach: boolean) {
+  await $.session.start(START)
+  w.live.holds.push(hold)
+  const run = $.command.run({ command: 'mux-agents-pane' })
+  await w.clock.advance(1000)
+  w.live.surfaces = ['terminal', 'desktop']
+  if (attach) await $.session.attach({ surface: 'desktop', clientId: 'd1' })
+  await w.clock.advance(1000)
+  const answered: any = await run
+  await w.clock.settle()
+  return answered?.text
+}
+
+for (const name of ['OS', 'CLAUDE_CODE_REMOTE']) {
+  for (const attach of [false, true]) {
+    test(`eligibility lost while the open waits on ${name} (${attach ? 'with' : 'without'} an attach): no list, no timer, the pane ends closed`, async ($, on) => {
+      const w = world(on, { TMUX: 'x' }, [ran(0, LIST)])
+      const answered = await lostDuringRead($, w, { name, ms: 2000 }, attach)
+      expect([answered, w.seen.argv.length, [...w.seen.panes]]).toEqual([NOT_HERE, 0, []])
+      await stillStopped($, w, 0)
+    })
+  }
+}
+
+for (const attach of [false, true]) {
+  test(`eligibility lost while the first refresh checks it (${attach ? 'with' : 'without'} an attach): no list, no timer, the pane ends closed`, async ($, on) => {
+    const w = world(on, { TMUX: 'x' }, [ran(0, LIST)])
+    // The open's own check reads CLAUDE_CODE_REMOTE first; the refresh's read is the one held.
+    const answered = await lostDuringRead($, w, { name: 'CLAUDE_CODE_REMOTE', ms: 2000, skip: 1 }, attach)
+    expect([answered, w.seen.argv.length, [...w.seen.panes]]).toEqual(['Agents pane opened.', 0, []])
     await stillStopped($, w, 0)
   })
 }
