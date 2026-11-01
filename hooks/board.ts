@@ -48,6 +48,7 @@ export function parseList(exitCode: number, stdout: string): Omit<MuxAgentsBoard
   const agents = r.agents.map((a: Record<string, unknown>) => ({
     name: clean(String(a.name ?? '')), client: clean(String(a.client ?? '')), state: clean(String(a.state ?? '')),
     doing: typeof a.doing === 'string' ? clean(a.doing) : null, age: typeof a.age === 'number' ? a.age : 0,
+    model: typeof a.model === 'string' ? clean(a.model) : null,
   }))
   return { running: r.running, agents }
 }

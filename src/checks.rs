@@ -79,6 +79,7 @@ fn refusal(code: u8, check: &'static str, message: String) -> Refusal {
         code,
         check,
         message,
+        reason: None,
     }
 }
 
@@ -202,22 +203,27 @@ pub fn assert_spawn_allowed(ctx: &Ctx, caller: &Caller) -> Res<PathBuf> {
             }
         }
     }
-    if !policy(ctx, caller, agent_argv)? {
-        return Err(refusal(
-            2,
-            "policy",
-            "the caller's live policy is not full bypass".into(),
-        ));
-    }
+    policy(ctx, caller, agent_argv)?;
     launch_directory(ctx, caller, crate::state::root::HOST)
 }
 
-/// C2: whether the caller's live policy is full bypass.
-fn policy(ctx: &Ctx, caller: &Caller, agent_argv: &[String]) -> Res<bool> {
-    match caller.client {
-        Some(Client::Claude) => claude_policy(ctx, caller),
-        _ => Ok(copilot_policy(ctx, agent_argv)?),
-    }
+const NOT_BYPASS: &str = "the caller's live policy is not full bypass";
+
+/// C2: refuses 2 `policy` unless the caller's live policy is full bypass. A Claude refusal names the half that
+/// failed and why, in its message and as its reason.
+fn policy(ctx: &Ctx, caller: &Caller, agent_argv: &[String]) -> Res<()> {
+    let reason = match caller.client {
+        Some(Client::Claude) => match claude_policy(ctx, caller) {
+            Ok(()) => return Ok(()),
+            Err(reason) => reason,
+        },
+        _ if copilot_policy(ctx, agent_argv)? => return Ok(()),
+        _ => return Err(refusal(2, "policy", NOT_BYPASS.into())),
+    };
+    Err(Refusal {
+        reason: Some(reason),
+        ..refusal(2, "policy", format!("{NOT_BYPASS} ({reason})"))
+    })
 }
 
 fn contains_ignoring_case(text: &str, needle: &str) -> bool {
@@ -234,53 +240,131 @@ fn permission_mode_line(line: &str) -> bool {
     })
 }
 
+// A read that finds no mode yet (a transcript or a footer being written) is tried this often, this far apart.
+const MODE_READS: usize = 3;
+const MODE_RETRY: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// `read` until it answers anything but `Err(retry)`, at most `MODE_READS` times; its last answer.
+fn retried(
+    ctx: &Ctx,
+    retry: &'static str,
+    read: impl Fn() -> Result<(), &'static str>,
+) -> Result<(), &'static str> {
+    let mut answer = read();
+    for _ in 1..MODE_READS {
+        if answer != Err(retry) {
+            break;
+        }
+        ctx.clock.sleep(MODE_RETRY);
+        answer = read();
+    }
+    answer
+}
+
 /// Claude: the latest transcript permission-mode, then the pane's mode line, which catches a Shift+Tab the
-/// transcript has not recorded yet.
-fn claude_policy(ctx: &Ctx, caller: &Caller) -> Res<bool> {
+/// transcript has not recorded yet. `Err` names the half that is not bypass and why. Only a missing mode is read
+/// again; anything else is final. Every read that fails is a reason too, never a refusal of its own.
+fn claude_policy(ctx: &Ctx, caller: &Caller) -> Result<(), &'static str> {
     let session = ctx.env.get("CLAUDE_CODE_SESSION_ID").unwrap_or("");
     if !session_id(session) {
-        return Ok(false);
+        return Err("transcript: no session id");
     }
-    let Some(transcript) = claude_transcript(&ctx.home, session)? else {
-        return Ok(false);
-    };
-    let Scan::Found(line) = last_line(&transcript, r#""permission-mode""#, permission_mode_line)?
-    else {
-        return Ok(false);
-    };
-    if !line.starts_with(r#"{"type":"permission-mode","permissionMode":"bypassPermissions""#) {
-        return Ok(false);
-    }
+    retried(ctx, "transcript: no mode", || transcript_mode(ctx, session))?;
     let pane = caller.pane.as_str();
+    // A call that fails outright (a timeout, a lost server) reads nothing, like one that exits non-zero.
     let size = crate::mux::native(
         ctx,
         &["display-message", "-p", "-t", pane, "#{pane_height}"],
         true,
-    )?;
-    let Some(height) = (size.code == 0)
-        .then(|| size.stdout.trim().parse::<i32>().ok())
-        .flatten()
-    else {
-        return Ok(false);
-    };
+    );
+    let height = size
+        .ok()
+        .filter(|size| size.code == 0)
+        .and_then(|size| size.stdout.trim().parse::<i32>().ok())
+        .ok_or("screen: unreadable")?;
     // A pane no client has sized shows no mode line, so the transcript decides alone.
     if height < 3 {
-        return Ok(true);
+        return Ok(());
     }
-    let screen = crate::mux::native(ctx, &["capture-pane", "-p", "-t", pane], true)?;
-    if screen.code != 0 {
-        return Ok(false);
+    retried(ctx, "screen: no mode line", || pane_mode(ctx, pane))
+}
+
+/// Whether the session's transcript last recorded bypass.
+fn transcript_mode(ctx: &Ctx, session: &str) -> Result<(), &'static str> {
+    // A transcript, or a projects folder, that cannot be read shows no mode, like one being written.
+    let transcript = claude_transcript(&ctx.home, session)
+        .map_err(|_| "transcript: no mode")?
+        .ok_or("transcript: not found")?;
+    // A transcript no decoder accepts shows no mode, like one without a permission-mode line.
+    let Ok(Scan::Found(line)) =
+        last_line(&transcript, r#""permission-mode""#, permission_mode_line)
+    else {
+        return Err("transcript: no mode");
+    };
+    if !line.starts_with(r#"{"type":"permission-mode","permissionMode":"bypassPermissions""#) {
+        return Err("transcript: other mode");
     }
+    Ok(())
+}
+
+/// Whether the pane's lowest mode line is bypass.
+fn pane_mode(ctx: &Ctx, pane: &str) -> Result<(), &'static str> {
+    // -J gives back a footer the pane's width wrapped as one row.
+    let screen = crate::mux::native(ctx, &["capture-pane", "-p", "-J", "-t", pane], true)
+        .ok()
+        .filter(|screen| screen.code == 0)
+        .ok_or("screen: unreadable")?;
+    match screen_mode(&screen.stdout) {
+        Some(Mode::Bypass) => Ok(()),
+        Some(Mode::Other) => Err("screen: other mode"),
+        None => Err("screen: no mode line"),
+    }
+}
+
+// How many non-blank rows at the bottom of the pane are searched for its mode line: the footer, with a spinner, a
+// background task, a queued hint and a status line below it.
+const MODE_ROWS: usize = 8;
+
+// Claude Code's footer badges, each the start of a mode line.
+const BYPASS_BADGE: &str = "⏵⏵ bypass permissions on";
+const OTHER_BADGES: [&str; 5] = [
+    "⏵⏵ accept edits on",
+    "⏵⏵ auto mode on",
+    "⏵⏵ don't ask on",
+    "⏸ plan mode on",
+    "⏸ manual mode on",
+];
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Mode {
+    Bypass,
+    Other,
+}
+
+/// The mode a row shows when, after leading whitespace, it starts with a footer badge (words in any case, anything
+/// after it); prompt, quoted or mid-sentence text never does.
+fn mode_line(row: &str) -> Option<Mode> {
+    let row = row.trim_start().to_lowercase();
+    if row.starts_with(BYPASS_BADGE) {
+        Some(Mode::Bypass)
+    } else if OTHER_BADGES.iter().any(|badge| row.starts_with(badge)) {
+        Some(Mode::Other)
+    } else {
+        None
+    }
+}
+
+/// The lowest mode line among the screen's last `MODE_ROWS` non-blank rows.
+fn screen_mode(screen: &str) -> Option<Mode> {
     let rows: Vec<&str> = screen
-        .stdout
         .split('\n')
         .map(|row| row.strip_suffix('\r').unwrap_or(row))
         .filter(|row| !row.trim().is_empty())
         .collect();
-    let tail = &rows[rows.len().saturating_sub(4)..];
-    Ok(tail
+    rows[rows.len().saturating_sub(MODE_ROWS)..]
         .iter()
-        .any(|row| contains_ignoring_case(row, "bypass permissions on")))
+        .rev()
+        .find_map(|row| mode_line(row))
 }
 
 /// ~/.claude/projects/<folder>/<session>.jsonl when exactly one project folder has it.
@@ -687,6 +771,25 @@ mod tests {
         }
     }
 
+    // C2's answer: `true`, the reason a Claude refusal names, `false` for a refusal naming none (Copilot's), else the
+    // refusal. A reason is always the message's suffix.
+    fn policy_answer(result: Res<()>) -> String {
+        match result {
+            Ok(()) => "true".into(),
+            Err(r) if r.check == "policy" => match r.reason {
+                Some(reason) => {
+                    assert_eq!(r.message, format!("{POLICY} ({reason})"));
+                    reason.into()
+                }
+                None => {
+                    assert_eq!(r.message, POLICY);
+                    "false".into()
+                }
+            },
+            Err(r) => format!("{} {} {}", r.code, r.check, r.message),
+        }
+    }
+
     // ---- names and context
 
     #[test]
@@ -828,8 +931,11 @@ mod tests {
 
     // ---- C3
 
-    // Claude flags pass when the next check, policy, is the one that refuses (no session id here).
+    const POLICY: &str = "the caller's live policy is not full bypass";
+    // Flags pass when the next check, policy, is the one that refuses (no session id here).
     const NEXT: &str = "2 policy the caller's live policy is not full bypass";
+    const NEXT_CLAUDE: &str =
+        "2 policy the caller's live policy is not full bypass (transcript: no session id)";
 
     fn flags(client: Client, agent_argv: Option<&[&str]>, extra: Option<Row>) -> String {
         let fakes = Fakes::default();
@@ -896,7 +1002,7 @@ mod tests {
             "--effort",
             "--fork-session",
         ];
-        assert_eq!(flags(Client::Claude, Some(&listed), None), NEXT);
+        assert_eq!(flags(Client::Claude, Some(&listed), None), NEXT_CLAUDE);
         let copilot = [
             "copilot",
             "--model",
@@ -932,7 +1038,10 @@ mod tests {
         caller.chain[1].argv = None;
         let fakes = Fakes::default();
         fakes.client(CLAUDE, Client::Claude);
-        assert_eq!(answer(assert_spawn_allowed(&fakes.ctx(), &caller)), NEXT);
+        assert_eq!(
+            answer(assert_spawn_allowed(&fakes.ctx(), &caller)),
+            NEXT_CLAUDE
+        );
     }
 
     #[test]
@@ -959,7 +1068,7 @@ mod tests {
         // The file's bytes instead of the transcript lines as UTF-8.
         bytes: Option<Vec<u8>>,
         height: Option<&'static str>,
-        screen: Option<&'static str>,
+        screen: Option<String>,
         sid: &'static str,
         folders: usize,
     }
@@ -970,7 +1079,7 @@ mod tests {
                 transcript: vec![mode("bypassPermissions")],
                 bytes: None,
                 height: Some("40\n"),
-                screen: Some("work\n\n  ⏵⏵ bypass permissions on (shift+tab to cycle)\n\n"),
+                screen: Some(format!("work\n\n{BYPASS}\n\n")),
                 sid: SID,
                 folders: 1,
             }
@@ -981,7 +1090,10 @@ mod tests {
         format!(r#"{{"type":"permission-mode","permissionMode":"{name}","sessionId":"{SID}"}}"#)
     }
 
-    fn claude_policy(case: Claude) -> String {
+    const BYPASS: &str = "  ⏵⏵ bypass permissions on (shift+tab to cycle)";
+
+    // The case's home, fakes and ctx; its answer is `claude_answer`.
+    fn claude_setup(case: &Claude) -> (TempDir, Fakes, Ctx) {
         let home = TempDir::new();
         for folder in 0..case.folders {
             let project = home
@@ -998,22 +1110,31 @@ mod tests {
             Some(out) => fakes.mux_rule("#{pane_height}", 0, out, ""),
             None => fakes.mux_rule("#{pane_height}", 1, "", ""),
         }
-        match case.screen {
+        match &case.screen {
             Some(out) => fakes.mux_rule("capture-pane", 0, out, ""),
             None => fakes.mux_rule("capture-pane", 1, "", ""),
         }
         let mut ctx = fakes.ctx();
         ctx.home = home.path().to_path_buf();
         ctx.env = Env::from_pairs([("CLAUDE_CODE_SESSION_ID", case.sid)]);
+        (home, fakes, ctx)
+    }
+
+    fn claude_answer(ctx: &Ctx) -> String {
         let caller = agent_caller(Client::Claude, Some(&["claude"]));
-        let result = answer(policy(&ctx, &caller, &[]));
+        policy_answer(policy(ctx, &caller, &[]))
+    }
+
+    fn claude_policy(case: Claude) -> String {
+        let (_home, fakes, ctx) = claude_setup(&case);
+        let result = claude_answer(&ctx);
         let calls = fakes.mux_calls();
         if result == "true" && case.screen.is_some() {
             assert_eq!(
                 calls,
                 [
                     vec!["-N", "display-message", "-p", "-t", "%1", "#{pane_height}"],
-                    vec!["-N", "capture-pane", "-p", "-t", "%1"]
+                    vec!["-N", "capture-pane", "-p", "-J", "-t", "%1"]
                 ]
             );
         }
@@ -1026,12 +1147,15 @@ mod tests {
         // The latest permission-mode line decides, exactly.
         for (lines, want) in [
             (vec![mode("default"), mode("bypassPermissions")], "true"),
-            (vec![mode("bypassPermissions"), mode("default")], "false"),
+            (
+                vec![mode("bypassPermissions"), mode("default")],
+                "transcript: other mode",
+            ),
             (
                 vec![mode("bypassPermissions"), mode("acceptEdits")],
-                "false",
+                "transcript: other mode",
             ),
-            (vec![mode("BypassPermissions")], "false"),
+            (vec![mode("BypassPermissions")], "transcript: other mode"),
             (
                 vec![
                     mode("bypassPermissions"),
@@ -1046,8 +1170,8 @@ mod tests {
                 ],
                 "true",
             ),
-            (vec!["{\"type\":\"user\"}".into()], "false"),
-            (vec![], "false"),
+            (vec!["{\"type\":\"user\"}".into()], "transcript: no mode"),
+            (vec![], "transcript: no mode"),
         ] {
             let case = Claude {
                 transcript: lines.clone(),
@@ -1069,24 +1193,28 @@ mod tests {
             transcript: vec![mode("default")],
             ..Claude::default()
         };
-        assert_eq!(claude_policy(small_pane), "false");
+        assert_eq!(claude_policy(small_pane), "transcript: other mode");
         for height in [None, Some("x\n"), Some("\n")] {
             let case = Claude {
                 height,
                 ..Claude::default()
             };
-            assert_eq!(claude_policy(case), "false", "{height:?}");
+            assert_eq!(claude_policy(case), "screen: unreadable", "{height:?}");
         }
-        // The last 4 non-blank rows must show the mode, any case.
+        // The lowest mode line in the last 8 non-blank rows must be the bypass badge, any case.
         for (screen, want) in [
-            (Some("BYPASS PERMISSIONS ON\na\n\n \nb\nc\n"), "true"),
-            (Some("bypass permissions on\na\nb\nc\nd\n"), "false"),
-            (Some("> \n  ? for shortcuts\n"), "false"),
-            (Some("bypass permissions off\r\n"), "false"),
-            (None, "false"),
+            (Some("⏵⏵ BYPASS PERMISSIONS ON\na\n\n \nb\nc\n"), "true"),
+            (Some("  ⏵⏵ bypass permissions on\r\nwork\r\n"), "true"),
+            (Some("bypass permissions on\na\n"), "screen: no mode line"),
+            (Some("> \n  ? for shortcuts\n"), "screen: no mode line"),
+            (
+                Some("⏵⏵ bypass permissions off\r\n"),
+                "screen: no mode line",
+            ),
+            (None, "screen: unreadable"),
         ] {
             let case = Claude {
-                screen,
+                screen: screen.map(String::from),
                 ..Claude::default()
             };
             assert_eq!(claude_policy(case), want, "{screen:?}");
@@ -1098,7 +1226,7 @@ mod tests {
                     sid,
                     ..Claude::default()
                 }),
-                "false"
+                "transcript: no session id"
             );
         }
         for folders in [0, 2] {
@@ -1107,7 +1235,7 @@ mod tests {
                     folders,
                     ..Claude::default()
                 }),
-                "false"
+                "transcript: not found"
             );
         }
     }
@@ -1129,7 +1257,7 @@ mod tests {
         ctx.home = home.path().to_path_buf();
         ctx.env = Env::from_pairs([("COPILOT_AGENT_SESSION_ID", SID)]);
         let caller = agent_caller(Client::Copilot, Some(argv));
-        let result = answer(policy(&ctx, &caller, &strings(argv)));
+        let result = policy_answer(policy(&ctx, &caller, &strings(argv)));
         assert!(fakes.mux_calls().is_empty());
         result
     }
@@ -1637,10 +1765,19 @@ mod tests {
         };
         for name in BOMS {
             assert_eq!(claude_policy(case(bom(name, &bypass))), "true", "{name}");
-            assert_eq!(claude_policy(case(bom(name, &back))), "false", "{name}");
+            assert_eq!(
+                claude_policy(case(bom(name, &back))),
+                "transcript: other mode",
+                "{name}"
+            );
         }
+        // A transcript no decoder accepts shows no mode.
         for bytes in undecodable(&bypass) {
-            assert_eq!(claude_policy(case(bytes.clone())), "false", "{bytes:?}");
+            assert_eq!(
+                claude_policy(case(bytes.clone())),
+                "transcript: no mode",
+                "{bytes:?}"
+            );
         }
     }
 
@@ -1725,15 +1862,355 @@ mod tests {
         // Three rows is a sized pane: the mode line is read and decides, not the transcript alone.
         let off = Claude {
             height: Some("3\n"),
-            screen: Some("> \n"),
+            screen: Some("> \n".into()),
             ..Claude::default()
         };
-        assert_eq!(claude_policy(off), "false");
+        assert_eq!(claude_policy(off), "screen: no mode line");
         let on = Claude {
             height: Some("3\n"),
             ..Claude::default()
         };
         assert_eq!(claude_policy(on), "true");
+    }
+
+    // `badge` under a work row, then `below` non-blank rows, each after a blank one.
+    fn below_badge(badge: &str, below: usize) -> String {
+        let mut screen = format!("work\n{badge}\n");
+        for n in 1..=below {
+            screen.push_str(&format!("\nrow {n}\n"));
+        }
+        screen
+    }
+
+    const OTHER_BADGES: [&str; 5] = [
+        "⏵⏵ accept edits on",
+        "⏵⏵ auto mode on",
+        "⏵⏵ don't ask on",
+        "⏸ plan mode on",
+        "⏸ manual mode on",
+    ];
+
+    // Rows that name bypass but are not a mode line: a prompt, a quote, text before the badge, no glyph.
+    const NOT_MODE_LINES: [&str; 4] = [
+        "❯ bypass permissions on",
+        "\"bypass permissions on\" is quoted",
+        "x ⏵⏵ bypass permissions on",
+        "bypass permissions on",
+    ];
+
+    #[test]
+    fn policy_claude_mode_line_in_last_8_rows() {
+        // A spinner, a background task, a queued hint and a status line below the footer leave it in view; blank
+        // rows between are not counted.
+        for below in 4..=7 {
+            let case = Claude {
+                screen: Some(below_badge(BYPASS, below)),
+                ..Claude::default()
+            };
+            assert_eq!(claude_policy(case), "true", "{below}");
+        }
+        let case = Claude {
+            screen: Some(below_badge(BYPASS, 8)),
+            ..Claude::default()
+        };
+        assert_eq!(claude_policy(case), "screen: no mode line");
+    }
+
+    #[test]
+    fn policy_claude_wrapped_badge_joined_by_j() {
+        // A 60-column pane wraps the footer and four status rows; only -J gives each row back whole.
+        let rows: Vec<String> = [format!("{BYPASS} · {}", "x".repeat(80))]
+            .into_iter()
+            .chain(std::iter::repeat_n("s".repeat(100), 4))
+            .collect();
+        let (_home, fakes, ctx) = claude_setup(&Claude::default());
+        fakes.mux_script("capture-pane", move |argv| {
+            let joined = argv.iter().any(|a| a == "-J");
+            let mut screen = String::new();
+            for row in &rows {
+                let chars: Vec<char> = row.chars().collect();
+                let width = if joined { chars.len() } else { 60 };
+                for part in chars.chunks(width) {
+                    screen.extend(part);
+                    screen.push('\n');
+                }
+            }
+            Ok(crate::mux::Output {
+                code: 0,
+                stdout: screen,
+                stderr: String::new(),
+            })
+        });
+        assert_eq!(claude_answer(&ctx), "true");
+        assert_eq!(
+            fakes.mux_calls().last().unwrap(),
+            &["-N", "capture-pane", "-p", "-J", "-t", "%1"]
+        );
+    }
+
+    #[test]
+    fn policy_claude_lowest_mode_line_decides() {
+        // Any other mode below an older bypass badge refuses at once, its words in any case: one capture, no sleep.
+        for badge in OTHER_BADGES {
+            for badge in [badge.to_string(), badge.to_uppercase()] {
+                let case = Claude {
+                    screen: Some(format!("{BYPASS}\nwork\n  {badge} (shift+tab to cycle)\n")),
+                    ..Claude::default()
+                };
+                let (_home, fakes, ctx) = claude_setup(&case);
+                assert_eq!(claude_answer(&ctx), "screen: other mode", "{badge}");
+                assert_eq!(fakes.slept(), Vec::<u64>::new(), "{badge}");
+                assert_eq!(captures(&fakes), 1, "{badge}");
+            }
+        }
+        // Text naming bypass is no mode line: alone it shows no mode, and below another mode it hides nothing.
+        for row in NOT_MODE_LINES {
+            let alone = Claude {
+                screen: Some(format!("work\n{row}\n")),
+                ..Claude::default()
+            };
+            assert_eq!(claude_policy(alone), "screen: no mode line", "{row}");
+            let below = Claude {
+                screen: Some(format!("⏵⏵ accept edits on\n{row}\n")),
+                ..Claude::default()
+            };
+            assert_eq!(claude_policy(below), "screen: other mode", "{row}");
+        }
+        // Anything may follow a badge.
+        let case = Claude {
+            screen: Some(format!("{BYPASS}\n")),
+            ..Claude::default()
+        };
+        assert_eq!(claude_policy(case), "true");
+    }
+
+    // capture-pane answers `screens` in turn, the last repeating.
+    fn screens_in_turn(fakes: &Fakes, screens: &[String]) {
+        let screens = screens.to_vec();
+        let next = std::cell::Cell::new(0);
+        fakes.mux_script("capture-pane", move |_| {
+            let n = next.get();
+            next.set(n + 1);
+            Ok(crate::mux::Output {
+                code: 0,
+                stdout: screens[n.min(screens.len() - 1)].clone(),
+                stderr: String::new(),
+            })
+        });
+    }
+
+    fn captures(fakes: &Fakes) -> usize {
+        fakes
+            .mux_calls()
+            .iter()
+            .filter(|c| c[1] == "capture-pane")
+            .count()
+    }
+
+    #[test]
+    fn policy_claude_retries_only_a_missing_mode() {
+        let (work, badge) = ("work\n".to_string(), format!("{BYPASS}\n"));
+        // No mode row on any read: 3 captures, 250 ms apart.
+        let (_home, fakes, ctx) = claude_setup(&Claude::default());
+        screens_in_turn(&fakes, std::slice::from_ref(&work));
+        assert_eq!(claude_answer(&ctx), "screen: no mode line");
+        assert_eq!((captures(&fakes), fakes.slept()), (3, vec![250, 250]));
+        // A footer drawn by the second read passes.
+        let (_home, fakes, ctx) = claude_setup(&Claude::default());
+        screens_in_turn(&fakes, &[work.clone(), badge.clone()]);
+        assert_eq!(claude_answer(&ctx), "true");
+        assert_eq!((captures(&fakes), fakes.slept()), (2, vec![250]));
+        // A transcript with no mode line on any read: 3 reads, 2 sleeps, and the pane is never asked.
+        let empty = Claude {
+            transcript: vec![],
+            ..Claude::default()
+        };
+        let (_home, fakes, ctx) = claude_setup(&empty);
+        assert_eq!(claude_answer(&ctx), "transcript: no mode");
+        assert_eq!(fakes.slept(), [250, 250]);
+        assert!(fakes.mux_calls().is_empty());
+        // A mode line written after the first or the second sleep is read, and the screen decides next.
+        for after in [1, 2] {
+            let (home, fakes, ctx) = claude_setup(&empty);
+            let transcript = home.path().join(format!(".claude/projects/p0/{SID}.jsonl"));
+            fakes.sleep_probe(move |count| {
+                if count == after {
+                    std::fs::write(&transcript, mode("bypassPermissions") + "\n").unwrap();
+                }
+            });
+            assert_eq!(claude_answer(&ctx), "true", "{after}");
+            assert_eq!(fakes.slept(), vec![250; after], "{after}");
+            assert_eq!(captures(&fakes), 1, "{after}");
+        }
+        // Every other outcome is final: one read, no sleep.
+        for (case, reason) in [
+            (
+                Claude {
+                    sid: "",
+                    ..Claude::default()
+                },
+                "transcript: no session id",
+            ),
+            (
+                Claude {
+                    folders: 0,
+                    ..Claude::default()
+                },
+                "transcript: not found",
+            ),
+            (
+                Claude {
+                    transcript: vec![mode("default")],
+                    ..Claude::default()
+                },
+                "transcript: other mode",
+            ),
+            (
+                Claude {
+                    screen: None,
+                    ..Claude::default()
+                },
+                "screen: unreadable",
+            ),
+            (
+                Claude {
+                    screen: Some("⏸ plan mode on\n".into()),
+                    ..Claude::default()
+                },
+                "screen: other mode",
+            ),
+        ] {
+            // A screen reason read the pane once; a transcript reason never reached it.
+            let screen = reason.starts_with("screen");
+            let (_home, fakes, ctx) = claude_setup(&case);
+            assert_eq!(claude_answer(&ctx), reason);
+            assert_eq!(fakes.slept(), Vec::<u64>::new(), "{reason}");
+            assert_eq!(captures(&fakes), usize::from(screen), "{reason}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn policy_claude_unreadable_transcript_shows_no_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = |path: &Path, bits: u32| {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(bits)).unwrap()
+        };
+        // The transcript, then the projects folder, made unreadable: a refusal with its reason, read 3 times.
+        for folder in [false, true] {
+            let (home, fakes, ctx) = claude_setup(&Claude::default());
+            let projects = home.path().join(".claude/projects");
+            let locked = if folder {
+                projects
+            } else {
+                projects.join(format!("p0/{SID}.jsonl"))
+            };
+            mode(&locked, 0o000);
+            let answer = claude_answer(&ctx);
+            mode(&locked, 0o755);
+            assert_eq!(answer, "transcript: no mode", "{folder}");
+            assert_eq!(fakes.slept(), [250, 250], "{folder}");
+            assert!(fakes.mux_calls().is_empty(), "{folder}");
+        }
+    }
+
+    #[test]
+    fn policy_claude_failed_screen_call_is_unreadable() {
+        // A multiplexer call that fails outright (a timeout, an exec failure) is an unreadable screen, never an
+        // endpoint refusal, and is final.
+        for (call, captured) in [("#{pane_height}", 0), ("capture-pane", 1)] {
+            let (_home, fakes, ctx) = claude_setup(&Claude::default());
+            fakes.mux_script(call, |_| {
+                crate::error::refuse(1, "endpoint", "rmux did not answer")
+            });
+            assert_eq!(claude_answer(&ctx), "screen: unreadable", "{call}");
+            assert_eq!(fakes.slept(), Vec::<u64>::new(), "{call}");
+            assert_eq!(captures(&fakes), captured, "{call}");
+        }
+    }
+
+    #[test]
+    fn policy_refusal_names_its_reason() {
+        let cases = [
+            (
+                Claude {
+                    sid: "",
+                    ..Claude::default()
+                },
+                "transcript: no session id",
+            ),
+            (
+                Claude {
+                    folders: 0,
+                    ..Claude::default()
+                },
+                "transcript: not found",
+            ),
+            (
+                Claude {
+                    transcript: vec![],
+                    ..Claude::default()
+                },
+                "transcript: no mode",
+            ),
+            (
+                Claude {
+                    transcript: vec![mode("plan")],
+                    ..Claude::default()
+                },
+                "transcript: other mode",
+            ),
+            (
+                Claude {
+                    screen: None,
+                    ..Claude::default()
+                },
+                "screen: unreadable",
+            ),
+            (
+                Claude {
+                    screen: Some("work\n".into()),
+                    ..Claude::default()
+                },
+                "screen: no mode line",
+            ),
+            (
+                Claude {
+                    screen: Some("⏸ plan mode on\n".into()),
+                    ..Claude::default()
+                },
+                "screen: other mode",
+            ),
+        ];
+        for (case, reason) in cases {
+            let (_home, fakes, ctx) = claude_setup(&case);
+            fakes.client(CLAUDE, Client::Claude);
+            let caller = agent_caller(Client::Claude, Some(&["claude"]));
+            let refused = assert_spawn_allowed(&ctx, &caller).unwrap_err();
+            assert_eq!(
+                (
+                    refused.code,
+                    refused.check,
+                    refused.message.as_str(),
+                    refused.reason
+                ),
+                (
+                    2,
+                    "policy",
+                    format!("{POLICY} ({reason})").as_str(),
+                    Some(reason)
+                ),
+            );
+        }
+        // Copilot's refusal is unchanged: no reason.
+        let fakes = Fakes::default();
+        fakes.client(CLAUDE, Client::Copilot);
+        let copilot = agent_caller(Client::Copilot, Some(&["copilot"]));
+        let refused = assert_spawn_allowed(&fakes.ctx(), &copilot).unwrap_err();
+        assert_eq!(
+            (refused.check, refused.message.as_str(), refused.reason),
+            ("policy", POLICY, None)
+        );
     }
 
     #[test]

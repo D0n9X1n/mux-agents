@@ -90,8 +90,9 @@ pub fn format_age(seconds: Option<&Value>) -> String {
     }
 }
 
-/// The count line, then per live agent its line and an indented doing line, per ended agent one line. Every printed
-/// field, state included, is cleaned first; lines are joined with LF.
+/// The count line, then per live agent its line (with ` [<model>]` after the client when one was chosen) and an
+/// indented doing line, per ended agent one line. Every printed field, state included, is cleaned first; lines are
+/// joined with LF.
 pub fn format_board(board: &Map<String, Value>) -> String {
     let running = board.get("running").and_then(Value::as_i64).unwrap_or(0);
     let mut lines = vec![format!("mux-agents \u{b7} {running} running")];
@@ -103,8 +104,14 @@ pub fn format_board(board: &Map<String, Value>) -> String {
         let name = clean(row.get("name"));
         let state = clean(row.get("state"));
         if state == "running" {
+            let model = clean(row.get("model"));
+            let tag = if model.is_empty() {
+                String::new()
+            } else {
+                format!(" [{model}]")
+            };
             lines.push(format!(
-                "\u{25cf} {name}  {}  {}",
+                "\u{25cf} {name}  {}{tag}  {}",
                 clean(row.get("client")),
                 format_age(row.get("age"))
             ));
@@ -495,6 +502,24 @@ mod tests {
         assert_eq!(
             text,
             format!("mux-agents {DOT} 1 running\n{FULL} a[2Jb  claude  4m\n  do]0;xing")
+        );
+    }
+
+    #[test]
+    fn format_board_tags_a_chosen_model() {
+        // A live agent's chosen model follows its client; inherited (null) or ended shows none. It is cleaned too.
+        let text = format_board(&board(json!({"running": 2, "agents": [
+            {"name": "w1", "client": "claude", "state": "running", "doing": null, "age": 5, "model": "sonnet"},
+            {"name": "w2", "client": "copilot", "state": "running", "doing": null, "age": 5, "model": null},
+            {"name": "w3", "client": "claude", "state": "running", "doing": null, "age": 5, "model": "op\u{1b}us"},
+            {"name": "w4", "client": "claude", "state": "stopped", "age": 5, "model": "sonnet"}
+        ]})));
+        assert_eq!(
+            text,
+            format!(
+                "mux-agents {DOT} 2 running\n{FULL} w1  claude [sonnet]  5s\n{FULL} w2  copilot  5s\n\
+                 {FULL} w3  claude [opus]  5s\n{OPEN} w4  stopped"
+            )
         );
     }
 

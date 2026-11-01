@@ -2,12 +2,14 @@
 
 use std::io;
 
-/// Code 1 (cannot run) or 2 (usage or policy), a short check name and a message safe to print.
+/// Code 1 (cannot run) or 2 (usage or policy), a short check name and a message safe to print. A check that can
+/// fail for more than one reason may name it, as the reply's `reason` after `message`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Refusal {
     pub code: u8,
     pub check: &'static str,
     pub message: String,
+    pub reason: Option<&'static str>,
 }
 
 pub type Res<T> = Result<T, Refusal>;
@@ -17,6 +19,7 @@ pub fn refuse<T>(code: u8, check: &'static str, message: impl Into<String>) -> R
         code,
         check,
         message: message.into(),
+        reason: None,
     })
 }
 
@@ -27,6 +30,7 @@ impl Refusal {
             code: 1,
             check: "internal",
             message: format!("unexpected error ({reason})"),
+            reason: None,
         }
     }
 }
@@ -38,6 +42,7 @@ impl From<io::Error> for Refusal {
             code: 1,
             check: "internal",
             message: format!("unexpected error ({:?})", error.kind()),
+            reason: None,
         }
     }
 }

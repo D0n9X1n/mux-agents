@@ -2,7 +2,8 @@ import { expect, test } from 'claude-code/testing'
 
 import { clean, formatAge, isSpawn, parseList } from '../../hooks/board'
 import {
-  SPAWN_ERROR_JSON, SPAWN_ERROR_TEXT, SPAWN_JSON, SPAWN_OFF_JSON, SPAWN_OFF_TEXT, SPAWN_TEXT, TAGGED_JSON, TAGGED_TEXT,
+  SPAWN_ERROR_JSON, SPAWN_ERROR_TEXT, SPAWN_JSON, SPAWN_MODEL_JSON, SPAWN_MODEL_TEXT, SPAWN_OFF_JSON, SPAWN_OFF_TEXT, SPAWN_TEXT,
+  TAGGED_JSON, TAGGED_TEXT,
 } from './spawn-replies'
 
 const E = 'sh "/p/scripts/mux-agent"'
@@ -24,6 +25,15 @@ test('isSpawn accepts a spawn whose side bar is off or failed after the commit, 
   for (const reply of [SPAWN_OFF_JSON, SPAWN_ERROR_JSON, SPAWN_OFF_TEXT, SPAWN_ERROR_TEXT]) {
     expect(isSpawn(`${E} spawn`, reply)).toBe(true)
     expect(isSpawn(`${E} spawn -Text`, `${reply.replace(/\n/g, '\r\n')}\r\n`)).toBe(true)
+  }
+})
+
+test('isSpawn accepts a spawn reply naming its model, inherited or chosen, JSON or -Text', () => {
+  expect(SPAWN_TEXT).toContain('\nreason: human\nmodel: inherited\n')
+  expect(SPAWN_MODEL_TEXT).toContain('\nreason: human\nmodel: sonnet\n')
+  for (const reply of [SPAWN_JSON, SPAWN_MODEL_JSON, SPAWN_TEXT, SPAWN_MODEL_TEXT]) {
+    expect(isSpawn(`${E} spawn -Model sonnet`, reply)).toBe(true)
+    expect(isSpawn(`${E} spawn -Model sonnet -Text`, `${reply.replace(/\n/g, '\r\n')}\r\n`)).toBe(true)
   }
 })
 
@@ -91,7 +101,17 @@ test('parseList maps every failure to undefined and cleans every string', () => 
   expect(parseList(0, '{"ok":true,"verb":"list","agents":[]}')).toBe(undefined)
   expect(parseList(0, '{"ok":true,"verb":"list","running":0}')).toBe(undefined)
   const dirty = JSON.stringify({ ok: true, running: 1, agents: [{ name: 'a\u001b', client: 'c\u0007', state: 's\u009b', doing: 'd\te', age: 1 }] })
-  expect(parseList(0, dirty)).toEqual({ running: 1, agents: [{ name: 'a', client: 'c', state: 's', doing: 'd e', age: 1 }] })
+  expect(parseList(0, dirty)).toEqual({ running: 1, agents: [{ name: 'a', client: 'c', state: 's', doing: 'd e', age: 1, model: null }] })
+})
+
+test('parseList keeps a chosen model, cleaned, and null for an inherited one', () => {
+  const rows = [
+    { name: 'a', client: 'claude', state: 'running', doing: null, age: 1, model: 'son\u001bnet' },
+    { name: 'b', client: 'claude', state: 'running', doing: null, age: 1, model: null },
+    { name: 'c', client: 'claude', state: 'running', doing: null, age: 1 },
+  ]
+  const parsed = parseList(0, JSON.stringify({ ok: true, verb: 'list', running: 3, agents: rows }))
+  expect(parsed?.agents.map(a => a.model)).toEqual(['sonnet', null, null])
 })
 
 test('formatAge uses s, m and h, floored', () => {

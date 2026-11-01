@@ -54,9 +54,9 @@
 
 [spawn -Client claude -TaskFile t.md -BriefFile b.md, from a Claude agent]
 -N display-message -p -t %1 #{pid}|#{pane_pid}|#{session_id}|#{window_id}|#{@agent-id}
-# :950, 954 (C2: the pane's mode line)
+# :950, 954 (C2: the pane's mode line); 0.2.2: -J joins a wrapped footer
 -N display-message -p -t %1 #{pane_height}
--N capture-pane -p -t %1
+-N capture-pane -p -J -t %1
 
 # placement is new in 0.2.1 (no reference line): a session user option on the caller's session.
 [placement]

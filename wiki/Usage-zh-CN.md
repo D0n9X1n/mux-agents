@@ -39,7 +39,7 @@ flowchart LR
 
 | 动词 | 示例 | 作用 |
 |---|---|---|
-| `spawn` | `spawn -Client copilot -TaskFile task.md -BriefFile brief.md -Split h` | 按会话的 `placement` 启动代理（默认是新窗口）；`-Split h\|v` 或 `-Tab` 只决定这一次 |
+| `spawn` | `spawn -Client copilot -TaskFile task.md -BriefFile brief.md -Split h` | 按会话的 `placement` 启动代理（默认是新窗口）；`-Split h\|v` 或 `-Tab` 只决定这一次；`-Model <model>` 指定它的模型（否则用客户端的默认模型） |
 | `placement` | `placement h`，`placement tab` | 本会话之后 `spawn` 在哪里打开代理：`tab`（新窗口，默认）、`h` 或 `v`（在你旁边分屏） |
 | `list` | `list -All` | 存活的代理、各自在做什么、未读消息；`-All` 加上已结束的 |
 | `status` | `status -BodyFile step.txt` | 代理报告自己当前在做什么 |
@@ -121,7 +121,7 @@ copilot plugin marketplace update mux-agents && copilot plugin update mux-agents
 | `entry` | 没有适用于此操作系统和架构的 `mux-agent` 二进制文件 | 从插件市场重新安装插件，或按上文从源码构建 |
 | `endpoint` | 不在多路复用器窗格中，或 tmux 低于 3.2、rmux 低于 0.10 | 在 tmux 3.2+ 或 rmux 0.10+ 中启动客户端 |
 | `sandbox` | 调用者在沙箱中运行（`SANDBOX_RUNTIME=1`、macOS 沙箱、Linux `NoNewPrivs`、受限的 Windows 令牌） | 在沙箱外运行客户端 |
-| `policy` | 调用者没有以绕过权限或全部允许的方式运行 | Claude Code：绕过权限（`--dangerously-skip-permissions` 或 Shift+Tab）；Copilot CLI：`--allow-all` |
+| `policy` | 调用者没有以绕过权限或全部允许的方式运行；对 Claude Code，`reason` 指明哪一半未通过：`transcript: no session id`、`transcript: not found`、`transcript: no mode`、`transcript: other mode`、`screen: unreadable`、`screen: no mode line` 或 `screen: other mode` | Claude Code：绕过权限（`--dangerously-skip-permissions` 或 Shift+Tab），并让页脚标记 `⏵⏵ bypass permissions on` 出现在窗格的最后 8 行内；Copilot CLI：`--allow-all` |
 | `cap` | 此会话中已有 6 个存活代理 | `stop` 其中一个 |
 | `tagged` | 代理尝试启动代理、打开侧边栏或设置 `placement` | 只有顶层聊天可以启动代理 |
 

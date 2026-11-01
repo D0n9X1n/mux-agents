@@ -343,6 +343,7 @@ pub(crate) mod tests {
                 code: 1,
                 check: "state",
                 message,
+                ..
             }) => message,
             Err(other) => panic!("{other:?}"),
         }

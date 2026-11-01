@@ -320,6 +320,7 @@ mod tests {
                 code,
                 check,
                 message,
+                ..
             }) => format!("{code} {check} {message}"),
         }
     }

@@ -274,6 +274,19 @@ test('/mux-agents-pane opens the pane and a stubbed list draws the count and row
   }
 })
 
+test('a live agent\'s chosen model follows its client; an inherited one shows nothing', async ($, on) => {
+  const rows = [{ ...row('w1', 'running', null, 240), model: 'sonnet' }, { ...row('w2', 'running', null, 5), model: null }]
+  const { clock } = world(on, { TMUX: 'x' }, [ran(0, list(2, rows))])
+  await $.session.start(START)
+  await $.command.run({ command: 'mux-agents-pane' })
+  await clock.settle()
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  const texts = (await ui.findAll({ type: 'Text' })).map((t: { text: string }) => t.text)
+  expect(texts).toContain('● w1  claude [sonnet]  4m')
+  expect(texts).toContain('● w2  claude  5s')
+  await ui.unmount()
+})
+
 test('ended rows are dimmed and named by state: exited, stopped and lost', async ($, on) => {
   const { clock } = world(on, { TMUX: 'x' }, [ran(0, list(0, [row('a', 'exited', null, 60), row('b', 'stopped', null, 60), row('c', 'lost', null, 60)]))])
   await $.session.start(START)

@@ -806,7 +806,8 @@ fn main() {
             Err(Refusal {
                 code: 1,
                 check: "endpoint",
-                message: OLD_TMUX.into()
+                message: OLD_TMUX.into(),
+                reason: None,
             })
         );
         assert_eq!(Fakes::default().kind(), Kind::Tmux);

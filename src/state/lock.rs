@@ -321,6 +321,7 @@ mod tests {
                 code,
                 check,
                 message,
+                ..
             } = result.unwrap_err();
             (code, check, message)
         }

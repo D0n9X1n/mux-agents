@@ -39,7 +39,7 @@ You rarely type these: the skill runs them for you. Every command is `<plugin>/s
 
 | verb | example | what it does |
 |---|---|---|
-| `spawn` | `spawn -Client copilot -TaskFile task.md -BriefFile brief.md -Split h` | start an agent where the session's `placement` says (a new window by default); `-Split h\|v` or `-Tab` decides for this one |
+| `spawn` | `spawn -Client copilot -TaskFile task.md -BriefFile brief.md -Split h` | start an agent where the session's `placement` says (a new window by default); `-Split h\|v` or `-Tab` decides for this one; `-Model <model>` picks its model (else the client's default) |
 | `placement` | `placement h`, `placement tab` | where `spawn` opens agents for the rest of the session: `tab` (a new window, the default), `h` or `v` (a split beside you) |
 | `list` | `list -All` | live agents, what each is doing, unread messages; `-All` adds ended ones |
 | `status` | `status -BodyFile step.txt` | an agent says what it is doing now |
@@ -121,7 +121,7 @@ Every refusal is one JSON line with `check` naming the cause:
 | `entry` | no `mux-agent` binary for this OS and architecture | reinstall the plugin from the marketplace, or build from source as above |
 | `endpoint` | not inside a multiplexer pane, or tmux older than 3.2 or rmux older than 0.10 | start the client inside tmux 3.2+ or rmux 0.10+ |
 | `sandbox` | the caller runs in a sandbox (`SANDBOX_RUNTIME=1`, a macOS sandbox, Linux `NoNewPrivs`, a restricted Windows token) | run the client outside the sandbox |
-| `policy` | the caller is not in bypass or allow-all | Claude Code: bypass permissions (`--dangerously-skip-permissions` or Shift+Tab); Copilot CLI: `--allow-all` |
+| `policy` | the caller is not in bypass or allow-all; for Claude Code, `reason` says which half failed: `transcript: no session id`, `transcript: not found`, `transcript: no mode`, `transcript: other mode`, `screen: unreadable`, `screen: no mode line` or `screen: other mode` | Claude Code: bypass permissions (`--dangerously-skip-permissions` or Shift+Tab), with the footer badge `⏵⏵ bypass permissions on` in the pane's last 8 rows; Copilot CLI: `--allow-all` |
 | `cap` | 6 agents already live in this session | `stop` one |
 | `tagged` | an agent tried to spawn, open the side bar or set `placement` | only the top-level chat spawns |
 

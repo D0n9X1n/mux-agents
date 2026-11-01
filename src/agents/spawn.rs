@@ -27,6 +27,7 @@ const COPILOT_FLAGS: [&str; 2] = ["--no-sandbox", "--allow-all"];
 pub(crate) const CMDLINE_MAX: usize = 32767;
 const EXE_RESERVE: usize = 1024;
 const CAP: usize = 6;
+const MODEL_MAX: usize = 64;
 const PANE_FORMAT: &str = "#{pane_id}|#{window_id}";
 const ENTRY: &str =
     "mux-agent entry path may hold only letters, digits, spaces and _ \\ / : . ( ) -";
@@ -69,6 +70,15 @@ fn context_name(context: Context) -> &'static str {
     }
 }
 
+/// `^[A-Za-z0-9][A-Za-z0-9._\[\]-]{0,63}$`: a model name or alias (`sonnet`, `sonnet[1m]`), never a flag or a
+/// second argument.
+fn model_name(model: &str) -> bool {
+    let mut bytes = model.bytes();
+    bytes.next().is_some_and(|b| b.is_ascii_alphanumeric())
+        && bytes.all(|b| b.is_ascii_alphanumeric() || b".-_[]".contains(&b))
+        && model.len() <= MODEL_MAX
+}
+
 pub(crate) fn utf8(path: &Path) -> Res<&str> {
     path.to_str()
         .ok_or_else(|| Refusal::internal("a path is not UTF-8"))
@@ -84,11 +94,16 @@ pub struct Identity<'a> {
 pub fn spawn(ctx: &Ctx, request: &Request) -> Res<Map<String, Value>> {
     let split = request.value("Split");
     let tab = request.switch("Tab");
+    let model = request.value("Model");
     let one_task = request.value("Task").is_some() != request.value("TaskFile").is_some();
     let Some(client) = request.value("Client").and_then(client_named) else {
         return Err(usage("spawn"));
     };
-    if !one_task || !split.is_none_or(|s| s == "h" || s == "v") || (tab && split.is_some()) {
+    if !one_task
+        || !split.is_none_or(|s| s == "h" || s == "v")
+        || (tab && split.is_some())
+        || !model.is_none_or(model_name)
+    {
         return Err(usage("spawn"));
     }
     let caller = resolve(ctx)?;
@@ -134,6 +149,7 @@ pub fn spawn(ctx: &Ctx, request: &Request) -> Res<Map<String, Value>> {
         caller: &caller,
         client,
         requested: request.value("Name"),
+        model,
         no_fork: request.switch("NoFork"),
         task,
         brief,
@@ -185,6 +201,8 @@ struct Launch<'a> {
     caller: &'a Caller,
     client: Client,
     requested: Option<&'a str>,
+    // None: the client's own default.
+    model: Option<&'a str>,
     no_fork: bool,
     task: String,
     brief: Option<String>,
@@ -301,7 +319,13 @@ impl Launch<'_> {
             transcript.as_deref(),
         )?;
         let prompt = format!("{}\n\n{}", lines.join("\n"), self.task);
-        let args = client_args(self.client, &agent.plan, &agent.session, &prompt);
+        let args = client_args(
+            self.client,
+            &agent.plan,
+            &agent.session,
+            self.model,
+            &prompt,
+        );
         let mut argv: Vec<&str> = client_flags(self.client).to_vec();
         argv.extend(args.iter().map(String::as_str));
         if EXE_RESERVE + cmdline_length(&argv) > CMDLINE_MAX {
@@ -399,11 +423,15 @@ impl Launch<'_> {
         };
         let client = client_name(self.client);
         let context = context_name(agent.plan.context);
-        let record = json!({"schema": 1, "id": agent.id, "name": agent.name, "client": client,
+        let mut record = json!({"schema": 1, "id": agent.id, "name": agent.name, "client": client,
             "sessionId": agent.session, "context": context, "reason": agent.plan.reason,
             "session": caller.session, "pane": new_pane, "window": window, "parentPane": caller.pane,
             "parentAgent": parent_agent, "directory": utf8(&self.directory)?,
             "taskLine": doing_line(&self.task), "createdAt": utc_o(ctx.clock.now())});
+        // No model is the client's own.
+        if let Some(model) = self.model {
+            record["model"] = model.into();
+        }
         write_json(&agent.folder.join("record.json"), &record)?;
         // Last: only a committed agent is live.
         commit(ctx, &agent.folder)?;
@@ -416,6 +444,7 @@ impl Launch<'_> {
         reply.insert("sessionId".into(), agent.session.clone().into());
         reply.insert("context".into(), context.into());
         reply.insert("reason".into(), agent.plan.reason.into());
+        reply.insert("model".into(), self.model.unwrap_or("inherited").into());
         Ok(reply)
     }
 }
@@ -472,8 +501,15 @@ pub(crate) fn pane_and_window(stdout: &str) -> Option<(String, String)> {
 }
 
 /// The client arguments after its flags. A Claude fork resumes and forks the parent into `session`; a Copilot fork
-/// resumes `session`, the copy made for it. A brief starts `session` fresh.
-fn client_args(client: Client, plan: &Plan, session: &str, prompt: &str) -> Vec<String> {
+/// resumes `session`, the copy made for it. A brief starts `session` fresh. A chosen model comes before the prompt
+/// (for Copilot before `-i`, which takes it).
+fn client_args(
+    client: Client,
+    plan: &Plan,
+    session: &str,
+    model: Option<&str>,
+    prompt: &str,
+) -> Vec<String> {
     let mut args: Vec<String> = match (plan.context, client) {
         (Context::Fork, Client::Claude) => vec![
             "--resume".into(),
@@ -485,6 +521,9 @@ fn client_args(client: Client, plan: &Plan, session: &str, prompt: &str) -> Vec<
         (Context::Fork, Client::Copilot) => vec!["--resume".into(), session.into()],
         (Context::Brief, _) => vec!["--session-id".into(), session.into()],
     };
+    if let Some(model) = model {
+        args.extend(["--model".into(), model.into()]);
+    }
     if client == Client::Copilot {
         args.push("-i".into());
     }
@@ -528,6 +567,7 @@ pub fn header(
             code: 1,
             check: "entry",
             message: ENTRY.into(),
+            reason: None,
         })?
         .replace('\\', "/");
     let mux = match ctx.mux.borrow().as_ref().map(|mux| mux.kind()) {
@@ -926,6 +966,125 @@ mod tests {
     }
 
     #[test]
+    fn model_value_checked_before_any_call() {
+        let usage = format!("2 usage {}", crate::agents::usage("spawn").message);
+        let long = "a".repeat(65);
+        for model in ["-x", "a b", long.as_str(), "", ".x", "a;b", "a/b", "\u{e9}"] {
+            let w = human();
+            assert_eq!(
+                run(&w, &["-Client", "claude", "-Task", "hi", "-Model", model]),
+                usage,
+                "{model}"
+            );
+            assert!(w.fakes.mux_calls().is_empty(), "{model}");
+            assert!(!w.ctx.state_root.exists(), "{model}");
+        }
+        let max = "a".repeat(64);
+        for model in ["sonnet", "sonnet[1m]", "claude-opus-4.5_x", max.as_str()] {
+            let w = human();
+            let ok = reply(&run(
+                &w,
+                &["-Client", "claude", "-Task", "hi", "-Model", model],
+            ));
+            let spec = read_json(
+                &agents_dir(&w)
+                    .join(ok["id"].as_str().unwrap())
+                    .join("spec.json"),
+            );
+            assert_eq!(
+                spec["args"].as_array().unwrap()[..4],
+                [
+                    json!("--session-id"),
+                    ok["sessionId"].clone(),
+                    json!("--model"),
+                    json!(model)
+                ],
+                "{model}"
+            );
+        }
+    }
+
+    #[test]
+    fn model_reaches_every_client_and_plan() {
+        for (client, no_fork) in [
+            (Client::Claude, false),
+            (Client::Claude, true),
+            (Client::Copilot, false),
+            (Client::Copilot, true),
+        ] {
+            let case = format!("{client:?} no-fork {no_fork}");
+            let (w, launch) = admitted(client, true);
+            let mut args = vec![
+                "-Client",
+                client_name(client),
+                "-TaskFile",
+                "t.md",
+                "-BriefFile",
+                "b.md",
+                "-Model",
+                "sonnet",
+            ];
+            if no_fork {
+                args.push("-NoFork");
+            }
+            let ok = reply(&run(&w, &args));
+            let new = ok["sessionId"].as_str().unwrap();
+            let spec = read_json(
+                &agents_dir(&w)
+                    .join(ok["id"].as_str().unwrap())
+                    .join("spec.json"),
+            );
+            let prompt = spec["prompt"].clone();
+            // Before the prompt; for Copilot before -i, which takes the prompt.
+            let expected = match (client, no_fork) {
+                (Client::Claude, false) => json!([
+                    "--resume",
+                    OLD,
+                    "--fork-session",
+                    "--session-id",
+                    new,
+                    "--model",
+                    "sonnet",
+                    prompt
+                ]),
+                (Client::Claude, true) => {
+                    json!(["--session-id", new, "--model", "sonnet", prompt])
+                }
+                (Client::Copilot, false) => {
+                    json!(["--resume", new, "--model", "sonnet", "-i", prompt])
+                }
+                (Client::Copilot, true) => {
+                    json!(["--session-id", new, "--model", "sonnet", "-i", prompt])
+                }
+            };
+            assert_eq!(spec["args"], expected, "{case}");
+            // The child, a caller in its turn, passes the flags check with its whole command line.
+            let mut argv = vec![client_name(client).to_string()];
+            argv.extend(client_flags(client).iter().map(|f| f.to_string()));
+            argv.extend(
+                spec["args"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|a| a.as_str().unwrap().to_string()),
+            );
+            w.fakes.process(Row {
+                pid: CLAUDE,
+                ppid: PANE,
+                start: Some(1500),
+                path: None,
+                argv: Some(argv),
+            });
+            w.fakes.prefer_last();
+            assert_eq!(
+                assert_spawn_allowed(&w.ctx, &w.caller()),
+                Ok(launch),
+                "{case}"
+            );
+        }
+    }
+
+    #[test]
     fn tagged_caller_refuses() {
         for tag in ["0123456789ab", "x"] {
             let w = ready(World::human(tag));
@@ -1205,37 +1364,45 @@ mod tests {
                 client_flags(Client::Claude).len() + client_flags(Client::Copilot).len(),
                 5
             );
-            let w = human();
-            let ok = reply(&run(&w, &["-Client", client, "-Task", "x"]));
-            let spec = read_json(
-                &agents_dir(&w)
-                    .join(ok["id"].as_str().unwrap())
-                    .join("spec.json"),
-            );
-            let mut argv: Vec<&str> = flags.to_vec();
-            argv.extend(
-                spec["args"]
-                    .as_array()
-                    .unwrap()
-                    .iter()
-                    .map(|a| a.as_str().unwrap()),
-            );
-            let base = 1024 + cmdline_length(&argv);
-            // Each '"' costs 2 on the command line; the 'x' it replaces cost 1. Exactly 32767 fits.
-            let room = 32768 - base;
-            let fit = format!("{}{}", "\"".repeat(room / 2), "x".repeat(room % 2));
-            for (task, fits) in [(fit.clone(), true), (format!("{fit}x"), false)] {
+            // The model's two arguments count toward the limit like every other.
+            for model in [&[][..], &["-Model", "sonnet"]] {
                 let w = human();
-                let text = run(&w, &["-Client", client, "-Task", &task]);
-                if fits {
-                    assert!(text.starts_with("ok "), "{client} {}", task.len());
-                } else {
-                    assert_eq!(
-                        text, "2 usage task is too long for the client command line",
-                        "{client}"
-                    );
-                    assert!(calls(&w, "new-window").is_empty());
-                    assert!(agent_folders(&w).is_empty());
+                let mut args = vec!["-Client", client, "-Task", "x"];
+                args.extend(model);
+                let ok = reply(&run(&w, &args));
+                let spec = read_json(
+                    &agents_dir(&w)
+                        .join(ok["id"].as_str().unwrap())
+                        .join("spec.json"),
+                );
+                let mut argv: Vec<&str> = flags.to_vec();
+                argv.extend(
+                    spec["args"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .map(|a| a.as_str().unwrap()),
+                );
+                assert_eq!(argv.contains(&"--model"), !model.is_empty(), "{client}");
+                let base = 1024 + cmdline_length(&argv);
+                // Each '"' costs 2 on the command line; the 'x' it replaces cost 1. Exactly 32767 fits.
+                let room = 32768 - base;
+                let fit = format!("{}{}", "\"".repeat(room / 2), "x".repeat(room % 2));
+                for (task, fits) in [(fit.clone(), true), (format!("{fit}x"), false)] {
+                    let w = human();
+                    let mut args = vec!["-Client", client, "-Task", &task];
+                    args.extend(model);
+                    let text = run(&w, &args);
+                    if fits {
+                        assert!(text.starts_with("ok "), "{client} {model:?} {}", task.len());
+                    } else {
+                        assert_eq!(
+                            text, "2 usage task is too long for the client command line",
+                            "{client} {model:?}"
+                        );
+                        assert!(calls(&w, "new-window").is_empty());
+                        assert!(agent_folders(&w).is_empty());
+                    }
                 }
             }
         }
@@ -1565,7 +1732,7 @@ mod tests {
         assert_eq!(first["sidebar"], "%13");
         assert_eq!(
             keys(&first)[8..],
-            ["placement", "placementSource", "sidebar"]
+            ["model", "placement", "placementSource", "sidebar"]
         );
         assert_eq!(
             w.fakes.locks(),
@@ -1645,7 +1812,13 @@ mod tests {
             );
             assert_eq!(
                 keys(&ok)[8..],
-                ["placement", "placementSource", "sidebar", "sidebarError"],
+                [
+                    "model",
+                    "placement",
+                    "placementSource",
+                    "sidebar",
+                    "sidebarError"
+                ],
                 "{case}"
             );
             // The agent is live: committed, with its record.
@@ -2073,11 +2246,30 @@ mod tests {
                 "sessionId",
                 "context",
                 "reason",
+                "model",
                 "placement",
                 "placementSource",
                 "sidebar"
             ]
         );
+        assert_eq!(ok["model"], "inherited");
+        // A chosen model is recorded last and replied after reason; with none the record has no model.
+        let w = human();
+        let ok = reply(&run(
+            &w,
+            &["-Client", "claude", "-Task", "hi", "-Model", "sonnet"],
+        ));
+        assert_eq!(ok["model"], "sonnet");
+        let record = read_json(
+            &agents_dir(&w)
+                .join(ok["id"].as_str().unwrap())
+                .join("record.json"),
+        );
+        assert_eq!(
+            record.as_object().unwrap().keys().next_back().unwrap(),
+            "model"
+        );
+        assert_eq!(record["model"], "sonnet");
         // A record that cannot be written is never committed: the launch aborts and the pane closes, and no commit
         // was ever written.
         let commits = Rc::new(RefCell::new(0));

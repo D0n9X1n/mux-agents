@@ -36,7 +36,13 @@ fn harness_starts_private_server_and_runs_shell() {
 
         // The root pane is `sh`, and it answers keys.
         server.send_keys(&format!("echo $$ > {}/shell.pid", dir.path().display()));
-        let shell = server.wait_file("shell.pid");
+        // The shell's `>` creates the file before echo writes it: wait for the whole line.
+        let pid_file = dir.path().join("shell.pid");
+        let shell = server.wait("shell.pid", || {
+            std::fs::read_to_string(&pid_file)
+                .ok()
+                .filter(|t| t.ends_with('\n'))
+        });
         assert_eq!(shell.trim(), server.pane_pid().to_string(), "{mux:?}");
 
         // The harness's env reaches the pane, and nothing of the caller's own session does.
@@ -159,7 +165,7 @@ mod e2e {
     const LONG: Duration = Duration::from_secs(60);
     // Run by the root pane's shell: a session file as Claude writes it, the mode line on the screen, then the client.
     const ROOT_SH: &str = r#"printf '{"pid":%s,"sessionId":"%s","cwd":"%s"}\n' "$$" "$CLAUDE_CODE_SESSION_ID" "$(pwd -P)" > "$HOME/.claude/sessions/$$.json"
-echo 'bypass permissions on (shift+tab to cycle)'
+echo '  ⏵⏵ bypass permissions on (shift+tab to cycle)'
 exec claude --dangerously-skip-permissions
 "#;
 
@@ -1372,7 +1378,7 @@ exec claude --dangerously-skip-permissions
         );
         let rows = all["agents"].as_array().unwrap();
         assert_eq!(rows.len(), 2, "{mux:?} {all}");
-        const ROW: [&str; 14] = [
+        const ROW: [&str; 15] = [
             "name",
             "client",
             "pane",
@@ -1387,6 +1393,7 @@ exec claude --dangerously-skip-permissions
             "doingFrom",
             "age",
             "unread",
+            "model",
         ];
         // w2's stop notice is unread in the root's mailbox, from w2's pane.
         for (row, (w, state, unread)) in rows.iter().zip([(&w1, "running", 0), (&w2, "stopped", 1)])
@@ -1395,7 +1402,7 @@ exec claude --dangerously-skip-permissions
             let want = json!({
                 "name": w["name"], "client": "claude", "pane": w["pane"], "window": w["window"], "context": "brief",
                 "parent": root, "sessionId": w["sessionId"], "directory": live.path("work"), "state": state,
-                "doing": "say hi", "doingFrom": "task", "unread": unread,
+                "doing": "say hi", "doingFrom": "task", "unread": unread, "model": null,
             });
             for (field, value) in want.as_object().unwrap() {
                 assert_eq!(&row[field], value, "{mux:?} {row}");
@@ -1409,6 +1416,43 @@ exec claude --dangerously-skip-permissions
         assert_eq!(
             (code, names(&plain), &plain["running"]),
             (0, vec!["w1".to_string()], &json!(1)),
+            "{mux:?}"
+        );
+    }
+
+    // spawn -Model: the reply names it, record.json keeps it, the client gets --model before its prompt and list shows
+    // it; without -Model the model is inherited and listed as null.
+    fn spawn_model_recorded_and_listed(mux: Mux) {
+        let Some(mut live) = Live::human(mux) else {
+            return;
+        };
+        let w1 = live.spawn("w1", &["-Model", "sonnet"]);
+        assert_eq!(w1["model"], "sonnet", "{mux:?} {w1}");
+        let record = json_file(&live.agent_dir(s(&w1["id"])).join("record.json"));
+        assert_eq!(record["model"], "sonnet", "{mux:?} {record}");
+        let client = live.server.client_by_session(s(&w1["sessionId"]));
+        let argv = strings(&client["argv"]);
+        assert_eq!(argv.len(), 8, "{mux:?} {argv:?}");
+        assert_eq!(
+            argv[3..7],
+            ["--session-id", s(&w1["sessionId"]), "--model", "sonnet"],
+            "{mux:?}"
+        );
+        let w2 = live.spawn("w2", &[]);
+        assert_eq!(w2["model"], "inherited", "{mux:?} {w2}");
+        let record = json_file(&live.agent_dir(s(&w2["id"])).join("record.json"));
+        assert!(record.get("model").is_none(), "{mux:?} {record}");
+        let (code, list) = live.run(&["list"]);
+        assert_eq!(code, 0, "{mux:?} {list}");
+        let models: Vec<(&str, &Value)> = list["agents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| (s(&row["name"]), &row["model"]))
+            .collect();
+        assert_eq!(
+            models,
+            [("w1", &json!("sonnet")), ("w2", &Value::Null)],
             "{mux:?}"
         );
     }
@@ -1444,13 +1488,13 @@ exec claude --dangerously-skip-permissions
         );
         let w2 = live.spawn("w2", &[]);
         assert_eq!(s(&w2["context"]), "fork", "{mux:?}");
-        // The mode line scrolled out of the screen's last rows (a Shift+Tab the transcript has not recorded yet).
+        // The mode line scrolled out of the screen's last 8 rows (a Shift+Tab the transcript has not recorded yet).
         let pid = live.root_pid;
-        for n in 1..=5 {
+        for n in 1..=8 {
             live.server.send_keys(&format!("noise {n}"));
         }
         live.server
-            .wait_line(&format!("input.{pid}.log"), "noise 5");
+            .wait_line(&format!("input.{pid}.log"), "noise 8");
         let (code, refused) = live.try_spawn("w3", &[]);
         assert_eq!(
             (code, &refused["check"]),
@@ -1999,6 +2043,7 @@ exec claude --dangerously-skip-permissions
                     sidebar_opens_42_columns_and_closes,
                     list_all_json_shape,
                     agent_caller_forks_with_bypass_evidence,
+                    spawn_model_recorded_and_listed,
                     placement_is_per_session,
                     spawn_bar_once_reused_and_close_stays_closed,
                     spawn_races_keep_one_bar,

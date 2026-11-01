@@ -5,7 +5,7 @@ import { EMPTY, formatAge, isSpawn, parseList } from './board'
 
 const PANE = 'mux-agents'
 // Change the shape tag when the board's fields change: it declines what an earlier version stored.
-const board = atom({ plugin: 'mux-agents', key: 'board' } as const, EMPTY, { shape: 'board-1' })
+const board = atom({ plugin: 'mux-agents', key: 'board' } as const, EMPTY, { shape: 'board-2' })
 // Per module load (a hot reload drops the timer and resets both): the one refresh timer while the pane is open, and at
 // most one list run at a time.
 let ticking: Timer | undefined
@@ -122,9 +122,11 @@ export const register: Register = on => {
         <Text>mux-agents · {b.running} running{b.failed ? ' · refresh failed' : ''}</Text>
         {b.agents.map(a => {
           const ended = a.state !== 'running'
+          // A live agent's chosen model follows its client.
+          const tag = !ended && a.model ? ` [${a.model}]` : ''
           return (
             <Box flexDirection="column">
-              <Text dimColor={ended || undefined}>{ended ? '○' : '●'} {a.name}  {a.client}  {ended ? `${a.state}  ` : ''}{formatAge(a.age)}</Text>
+              <Text dimColor={ended || undefined}>{ended ? '○' : '●'} {a.name}  {a.client}{tag}  {ended ? `${a.state}  ` : ''}{formatAge(a.age)}</Text>
               {a.doing ? <Text dimColor>  {a.doing}</Text> : null}
             </Box>
           )
