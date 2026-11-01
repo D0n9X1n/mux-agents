@@ -36,7 +36,13 @@ fn harness_starts_private_server_and_runs_shell() {
 
         // The root pane is `sh`, and it answers keys.
         server.send_keys(&format!("echo $$ > {}/shell.pid", dir.path().display()));
-        let shell = server.wait_file("shell.pid");
+        // The shell's `>` creates the file before echo writes it: wait for the whole line.
+        let pid_file = dir.path().join("shell.pid");
+        let shell = server.wait("shell.pid", || {
+            std::fs::read_to_string(&pid_file)
+                .ok()
+                .filter(|t| t.ends_with('\n'))
+        });
         assert_eq!(shell.trim(), server.pane_pid().to_string(), "{mux:?}");
 
         // The harness's env reaches the pane, and nothing of the caller's own session does.
