@@ -4,6 +4,10 @@ All notable changes to mux-agents. The format follows [Keep a Changelog](https:/
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-11-01
+
+Choose tabs or panes per session, and the side bar opens on its own. [Release notes](https://github.com/D0n9X1n/mux-agents/wiki/Release-v0.2.1).
+
 ### Added
 
 - `placement tab|h|v` chooses, for the rest of the session, whether `spawn` opens agents as tabs (new windows) or as panes beside you; `placement` alone shows the choice. It is a multiplexer session option, so nothing is written to disk. `spawn -Tab` (new) or `-Split h|v` overrides it for one spawn, and the spawn reply names `placement` and `placementSource`.
@@ -44,6 +48,7 @@ One native Rust binary replaces the PowerShell implementation: no PowerShell or 
 
 The first release: `spawn`, `list`, `status`, `send`, `read`, `focus`, `stop` and the side bar on Windows (rmux) and on Linux and macOS (tmux), written in PowerShell 7.4. [Release notes](https://github.com/D0n9X1n/mux-agents/wiki/Release-v0.1.0).
 
-[Unreleased]: https://github.com/D0n9X1n/mux-agents/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/D0n9X1n/mux-agents/compare/v0.2.1...HEAD
+[0.2.1]: https://github.com/D0n9X1n/mux-agents/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/D0n9X1n/mux-agents/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/D0n9X1n/mux-agents/releases/tag/v0.1.0
