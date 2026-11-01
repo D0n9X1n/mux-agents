@@ -728,16 +728,26 @@ fn kill_bar(ctx: &Ctx, pane: &str, pid: u32) -> bool {
     .is_ok_and(|probe| gone(&probe))
 }
 
-/// The conditional kill of `pane`: the server kills it only while it is alive and still runs `pid`.
-pub fn kill_command(pane: &str, pid: u32) -> Vec<String> {
+/// `command`, run by the server against `pane` only while it is alive and still runs `pid`.
+fn bound(pane: &str, pid: u32, command: String) -> Vec<String> {
     vec![
         "if-shell".into(),
         "-F".into(),
         "-t".into(),
         pane.into(),
         format!("#{{&&:#{{==:#{{pane_dead}},0}},#{{==:#{{pane_pid}},{pid}}}}}"),
-        format!("kill-pane -t {pane}"),
+        command,
     ]
+}
+
+/// The conditional kill of `pane`: the server kills it only while it is alive and still runs `pid`.
+pub fn kill_command(pane: &str, pid: u32) -> Vec<String> {
+    bound(pane, pid, format!("kill-pane -t {pane}"))
+}
+
+/// The conditional resize of `pane` to `width` columns, only while it is alive and still runs `pid`.
+pub fn resize_command(pane: &str, pid: u32, width: &str) -> Vec<String> {
+    bound(pane, pid, format!("resize-pane -t {pane} -x {width}"))
 }
 
 /// The split's answer: pane, window and pid.
@@ -766,7 +776,7 @@ fn new_watch(ctx: &Ctx, pid: u32) -> Option<i64> {
 
 /// Splits the bar at the right edge of the caller's window, full height (`-f -h`), with the pane environment (Unix:
 /// the state root) so watch reads the caller's state. The bar is `bar_width` of the window (40 when the width cannot
-/// be read), asked for with -l and set again with resize-pane, since rmux ignores -l; a refused resize is left to
+/// be read), asked for with -l and set again by a pid-bound resize-pane, since rmux ignores -l; a refused resize is left to
 /// the next watch tick. `-d` keeps the active pane. The split's process must be this binary `watch` (else nothing is
 /// killed and the open refuses); then the pane is labelled and recorded as `<pane> <pid> <start>`. A bar that cannot
 /// be labelled or recorded is closed by the guarded kill, which spares a pane that runs anything else by then. The
@@ -836,7 +846,10 @@ fn open(ctx: &Ctx, caller: &Caller) -> Res<(String, String)> {
             ),
         );
     }
-    let _ = native(ctx, &["resize-pane", "-t", &pane, "-x", &width], true);
+    // Bound to the checked pid like the kill: a pane replaced since is never resized.
+    let resize = resize_command(&pane, pid, &width);
+    let resize: Vec<&str> = resize.iter().map(String::as_str).collect();
+    let _ = native(ctx, &resize, true);
     // Proven last: a pane replaced after the check (a hook on the label, say) is never reported as the bar.
     if proven(ctx, &pane, pid, start).is_none() {
         let _ = native(
@@ -1816,15 +1829,22 @@ mod tests {
                 return failed(how);
             }
             let pane = argv[4].clone();
+            let want = argv[5].split("#{pane_pid},").nth(1).unwrap();
+            let want = want.trim_end_matches('}').to_string();
+            if let Some(width) = argv[6].strip_prefix(&format!("resize-pane -t {pane} -x ")) {
+                let alive = get(&p, &format!("dead {pane}")).is_none();
+                if alive && get(&p, &format!("pid {pane}")).as_deref() == Some(want.as_str()) {
+                    set(&p, &format!("width {pane}"), width.to_string());
+                }
+                return Ok(Output::default());
+            }
             assert_eq!(argv[6], format!("kill-pane -t {pane}"));
             if r.get() == Some("kill") {
                 r.set(None);
                 respawn(&p, &fakes, &pane);
             }
-            let want = argv[5].split("#{pane_pid},").nth(1).unwrap();
-            let want = want.trim_end_matches('}');
             let alive = get(&p, &format!("dead {pane}")).is_none();
-            if alive && get(&p, &format!("pid {pane}")).as_deref() == Some(want) {
+            if alive && get(&p, &format!("pid {pane}")).as_deref() == Some(want.as_str()) {
                 unset(&p, &pane);
                 unset(&p, &format!("pid {pane}"));
             }
@@ -1954,7 +1974,13 @@ mod tests {
 
     // Kills tried: the conditional kill, or a plain kill-pane (never used).
     fn closes(w: &World) -> usize {
-        count(w, "kill-pane") + count(w, "if-shell")
+        let conditional = w
+            .fakes
+            .mux_calls()
+            .iter()
+            .filter(|c| c[1] == "if-shell" && c.last().is_some_and(|a| a.starts_with("kill-pane")))
+            .count();
+        count(w, "kill-pane") + conditional
     }
 
     fn proofs(w: &World) -> usize {
@@ -1993,6 +2019,13 @@ mod tests {
 
     const RESIZE: &str = "-N resize-pane -t %7 -x 40";
 
+    /// open's resize of the new bar, as the multiplexer receives it: only while the pane runs `pid`.
+    fn resize_line(pane: &str, pid: u32, width: u32) -> String {
+        format!(
+            "-N if-shell -F -t {pane} #{{&&:#{{==:#{{pane_dead}},0}},#{{==:#{{pane_pid}},{pid}}}}} resize-pane -t {pane} -x {width}"
+        )
+    }
+
     // The calls of an open that finds no bar: record, labels, split, label, record, resize.
     fn opened(w: &World) -> Vec<String> {
         vec![
@@ -2001,7 +2034,7 @@ mod tests {
             split_line(w, true),
             TAG7.into(),
             RECORD7.into(),
-            RESIZE.into(),
+            resize_line("%7", 107, 40),
         ]
     }
 
@@ -2045,7 +2078,7 @@ mod tests {
         let mut want = vec![ON.to_string()];
         want.extend(opened(&w));
         want[3] = split_line(&w, true).replace("-l 40", "-l 50");
-        want[6] = "-N resize-pane -t %7 -x 50".into();
+        want[6] = resize_line("%7", 107, 50);
         assert_eq!(calls(&w), want);
         // An unreadable width (a failed probe, a non-number) opens the narrowest bar, 40.
         for answer in [(1, ""), (0, "wide\n"), (0, "")] {
@@ -2056,11 +2089,11 @@ mod tests {
                 .into_iter()
                 .filter(|c| c.contains("resize-pane"))
                 .collect();
-            assert_eq!(resized, [RESIZE], "{answer:?}");
+            assert_eq!(resized, [resize_line("%7", 107, 40)], "{answer:?}");
         }
         // A refused resize still opens the bar: the next watch tick sizes it.
         let (w, _) = sidebar_world("", Mux::default());
-        w.fakes.mux_rule("resize-pane", 1, "", "no such pane\n");
+        w.fakes.mux_first("resize-pane", 1, "", "no such pane\n");
         assert_eq!(
             run(&w, &[]),
             r#"ok {"pane":"%7","window":"@5","opened":true}"#
@@ -2080,6 +2113,7 @@ mod tests {
         assert_eq!(calls(&w), want);
         assert_eq!(record(&panes).as_deref(), Some("%7 107 1070"));
         assert_eq!(option(&panes), None);
+        assert_eq!(get(&panes, "width %7").as_deref(), Some("40"));
         let events = w.fakes.events();
         let read = events.iter().position(|e| e == "row 107").unwrap();
         let written = events
@@ -2291,9 +2325,13 @@ mod tests {
         let all: Vec<String> = w.fakes.mux_calls().iter().map(|c| c.join(" ")).collect();
         let at = |line: &str| all.iter().position(|c| c == line).unwrap();
         let proof = format!("-N display-message -p -t %7 {PROOF}");
+        let resize = resize_line("%7", 107, 40);
         assert!(
-            at(RECORD7) < at(RESIZE) && at(RESIZE) < at(&proof) && at(&proof) < at(CLEAR_RECORD)
+            at(RECORD7) < at(&resize) && at(&resize) < at(&proof) && at(&proof) < at(CLEAR_RECORD)
         );
+        // The replacement keeps its width: the only resize is bound to the pid that was checked.
+        assert_eq!(get(&panes, "width %7"), None);
+        assert_eq!(count(&w, "resize-pane"), 0);
         // ensure as a spawn runs it opens nothing either: the pane carries the label but is not the bar.
         assert_eq!(ensure_run(&w), refused(&["%7"]));
         assert_eq!(count(&w, "split-window"), 1);
@@ -2321,7 +2359,13 @@ mod tests {
                 .collect();
             assert_eq!(closed, [close_line("%7", 107)], "{how}");
             assert_eq!(
-                (count(&w, "kill-pane"), count(&w, "resize-pane")),
+                (
+                    count(&w, "kill-pane"),
+                    calls(&w)
+                        .iter()
+                        .filter(|c| c.contains("resize-pane"))
+                        .count()
+                ),
                 (0, 0),
                 "{how}"
             );
@@ -2499,7 +2543,7 @@ mod tests {
                 format!("+sidebar|{key}|$3 display-message"),
                 format!(
                     "-sidebar|{key}|$3 display-message,set-option,show-options,list-panes,display-message,\
-                     split-window,set-option,set-option,resize-pane,display-message"
+                     split-window,set-option,set-option,if-shell,display-message"
                 ),
             ]
         );
@@ -2591,7 +2635,7 @@ mod tests {
         assert_eq!(splits, [split_line(&w, true), split_line(&w, false)]);
         assert_eq!(roles(&panes), "%1=|,%2=other|,%7=sidebar|");
         // Without -l the multiplexer picks the width, so the resize sizes it.
-        assert_eq!(calls(&w).last().map(String::as_str), Some(RESIZE));
+        assert_eq!(calls(&w).last(), Some(&resize_line("%7", 107, 40)));
         // Any other failure refuses after exactly one split; a refused retry after exactly two.
         for stderr in [
             "permission denied",
@@ -2738,7 +2782,7 @@ mod tests {
             let inside = if disabled {
                 "show-options"
             } else {
-                "show-options,show-options,list-panes,display-message,split-window,set-option,set-option,resize-pane,\
+                "show-options,show-options,list-panes,display-message,split-window,set-option,set-option,if-shell,\
                  display-message"
             };
             assert_eq!(
@@ -2860,7 +2904,8 @@ mod tests {
             w.fakes.locks()[1],
             format!(
                 "-sidebar|{key}|$3 {ON},-N set-option -p -t %8 @agent-role sidebar,\
-                 -N set-option -t $3 @mux-agents-sidebar-id %8 108 1080"
+                 -N set-option -t $3 @mux-agents-sidebar-id %8 108 1080,{}",
+                resize_line("%8", 108, 40)
             )
         );
         assert_eq!(ensure_run(&w), "existing %8");

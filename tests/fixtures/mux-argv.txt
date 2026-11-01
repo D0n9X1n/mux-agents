@@ -31,7 +31,7 @@
 # 0.2.3 (#47): pid 113 is this binary `watch`, so the bar is recorded as <pane> <pid> <start>
 -N set-option -t $3 @mux-agents-sidebar-id '%13 113 1130'
 # rmux ignores -l, so the bar is sized again
--N resize-pane -t %13 -x 40
+-N if-shell -F -t %13 #{&&:#{==:#{pane_dead},0},#{==:#{pane_pid},113}} 'resize-pane -t %13 -x 40'
 # 0.2.3 (#47): proven last, so a pane replaced during open is never reported as the bar
 -N display-message -p -t %13 #{pane_id}|#{window_id}|#{pane_dead}|#{pane_pid}
 
@@ -53,7 +53,7 @@
 # 0.2.3 (#47): pid 113 is this binary `watch`, so the bar is recorded as <pane> <pid> <start>
 -N set-option -t $3 @mux-agents-sidebar-id '%13 113 1130'
 # rmux ignores -l, so the bar is sized again
--N resize-pane -t %13 -x 40
+-N if-shell -F -t %13 #{&&:#{==:#{pane_dead},0},#{==:#{pane_pid},113}} 'resize-pane -t %13 -x 40'
 # 0.2.3 (#47): proven last, so a pane replaced during open is never reported as the bar
 -N display-message -p -t %13 #{pane_id}|#{window_id}|#{pane_dead}|#{pane_pid}
 
@@ -155,7 +155,7 @@
 -N set-option -p -t %13 @agent-role sidebar
 # 0.2.3 (#47): pid 113 is this binary `watch`, so the bar is recorded as <pane> <pid> <start>
 -N set-option -t $3 @mux-agents-sidebar-id '%13 113 1130'
--N resize-pane -t %13 -x 40
+-N if-shell -F -t %13 #{&&:#{==:#{pane_dead},0},#{==:#{pane_pid},113}} 'resize-pane -t %13 -x 40'
 # 0.2.3 (#47): proven last, so a pane replaced during open is never reported as the bar
 -N display-message -p -t %13 #{pane_id}|#{window_id}|#{pane_dead}|#{pane_pid}
 
@@ -173,7 +173,7 @@
 # 0.2.3 (#47): pid 113 is this binary `watch`, so the bar is recorded as <pane> <pid> <start>
 -N set-option -t $3 @mux-agents-sidebar-id '%13 113 1130'
 # the multiplexer chose the width, so the resize sets it
--N resize-pane -t %13 -x 40
+-N if-shell -F -t %13 #{&&:#{==:#{pane_dead},0},#{==:#{pane_pid},113}} 'resize-pane -t %13 -x 40'
 # 0.2.3 (#47): proven last, so a pane replaced during open is never reported as the bar
 -N display-message -p -t %13 #{pane_id}|#{window_id}|#{pane_dead}|#{pane_pid}
 

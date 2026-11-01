@@ -1953,6 +1953,45 @@ exec claude --dangerously-skip-permissions
         assert!(live.panes("#{pane_id}").contains(&bar), "{mux:?}");
     }
 
+    // T9-QA round 2, live: a bar replaced between a passing proof and open's resize keeps its width under the exact
+    // pid-bound resize the code sends (`resize_command`); bound to the replacement's own pid, the same command does
+    // resize it, so the guard is the pid and nothing else.
+    fn replaced_bar_is_not_resized(mux: Mux) {
+        let Some(mut live) = Live::human(mux) else {
+            return;
+        };
+        let bar = live.open_bar();
+        let (code, open) = live.run(&["sidebar"]);
+        assert_eq!(
+            (code, &open["opened"], &open["pane"]),
+            (0, &json!(false), &json!(bar)),
+            "{mux:?}: the bar is not proven: {open}"
+        );
+        let pid: u32 = live.field(&bar, "#{pane_pid}").parse().unwrap();
+        live.call(&["respawn-pane", "-k", "-t", &bar, "sleep", "1000"]);
+        let new: u32 = live.field(&bar, "#{pane_pid}").parse().unwrap();
+        assert_ne!(new, pid, "{mux:?}");
+        live.call(&["resize-pane", "-t", &bar, "-x", "60"]);
+        let width = live.field(&bar, "#{pane_width}");
+        assert_ne!(
+            width, "40",
+            "{mux:?}: the replacement could not be resized away from 40"
+        );
+        let resize = |pid: u32| {
+            let args = mux_agent::sidebar::resize_command(&bar, pid, "40");
+            let args: Vec<&str> = args.iter().map(String::as_str).collect();
+            live.call(&args);
+        };
+        resize(pid);
+        assert_eq!(
+            live.field(&bar, "#{pane_width}"),
+            width,
+            "{mux:?}: the replacement was resized"
+        );
+        resize(new);
+        assert_eq!(live.field(&bar, "#{pane_width}"), "40", "{mux:?}");
+    }
+
     // T9-QA 2, live: a record forged for a watch run by hand, naming its own pane and its own pid with a stale start
     // or its real one, proves nothing: that pane runs the shell, not the watch. The manual watch moves nothing.
     fn forged_record_does_not_make_a_manual_watch_keep(mux: Mux) {
@@ -2942,6 +2981,7 @@ exec claude --dangerously-skip-permissions
                     manual_watch_moves_nothing,
                     manual_watch_without_a_bar_moves_nothing,
                     replaced_between_proof_and_kill_survives,
+                    replaced_bar_is_not_resized,
                     forged_record_does_not_make_a_manual_watch_keep,
                     list_all_json_shape,
                     agent_caller_forks_with_bypass_evidence,
