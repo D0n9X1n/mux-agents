@@ -1505,6 +1505,51 @@ exec claude --dangerously-skip-permissions
         }
     }
 
+    // S2 (QA round 2): a doing line of emoji ZWJ sequences, which tmux 3.2a draws part by part (4 columns each), never
+    // wraps: after the bar redrew, its first row is still the header and no row is wider than the pane.
+    fn bar_keeps_its_header_with_emoji_sequences(mux: Mux) {
+        let Some(mut live) = Live::human(mux) else {
+            return;
+        };
+        let w1 = live.spawn("w1", &[]);
+        let bar = s(&w1["sidebar"]).to_string();
+        let pid = live.worker_pid(&w1);
+        let coder = "\u{1f469}\u{200d}\u{1f4bb}";
+        std::fs::write(live.dir.join("emoji.txt"), coder.repeat(16)).unwrap();
+        let (code, status) = live
+            .server
+            .command(pid, &["status", "-BodyFile", "{dir}/emoji.txt"]);
+        assert_eq!(code, 0, "{mux:?} {status}");
+        let mut screen = String::new();
+        let drawn = eventually(Duration::from_secs(30), || {
+            screen = live.call(&["capture-pane", "-p", "-t", &bar]);
+            screen.contains('\u{1f4bb}')
+        });
+        assert!(drawn, "{mux:?}: the bar shows:\n{screen}");
+        // Two more redraws (a tick is 2 s): a wrapped row would have scrolled the header off by now.
+        std::thread::sleep(Duration::from_millis(4500));
+        screen = live.call(&["capture-pane", "-p", "-t", &bar]);
+        let first = screen.lines().next().unwrap_or_default();
+        assert!(
+            first.trim_start().starts_with("mux-agents") && first.contains("running"),
+            "{mux:?}: the first row is {first:?}:\n{screen}"
+        );
+        // Not wrapped: the doing line is one row, and every drawn row starts with the bar's margin (a wrapped rest
+        // would start at column 0).
+        let rows: Vec<&str> = screen.lines().filter(|l| !l.trim().is_empty()).collect();
+        assert_eq!(
+            rows.iter().filter(|l| l.contains('\u{1f4bb}')).count(),
+            1,
+            "{mux:?}: wrapped:\n{screen}"
+        );
+        assert!(
+            rows.iter().all(|l| l.starts_with(' ')),
+            "{mux:?}: wrapped:\n{screen}"
+        );
+        assert!(screen.contains('\u{1f4bb}'), "{mux:?}:\n{screen}");
+        bar_clean(&live, &bar, &screen);
+    }
+
     // S2: the bar draws in color at its pane's size with nothing stray; an agent in `read -Wait` shows `waiting`
     // until mail wakes it, then `working` again, and its waiting file is gone.
     fn bar_shows_waiting_then_working(mux: Mux) {
@@ -3119,6 +3164,7 @@ exec claude --dangerously-skip-permissions
                     gone_pane_closed_by_each_trigger,
                     bar_drops_a_gone_agent,
                     bar_shows_waiting_then_working,
+                    bar_keeps_its_header_with_emoji_sequences,
                     dead_pane_closed_by_one_conditional,
                 ]
             );
