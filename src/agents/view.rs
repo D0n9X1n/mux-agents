@@ -60,13 +60,17 @@ pub fn focus(ctx: &Ctx, request: &Request) -> Res<Map<String, Value>> {
         format!("select-window -t {p} ; select-pane -t {p}"),
     );
     let select: Vec<&str> = select.iter().map(String::as_str).collect();
-    native(ctx, &select, true)?;
+    // Only the read-back decides: a select that failed, or a read that failed as a call, is no proof of focus.
+    let _ = native(ctx, &select, true);
     let probe = format!(
         "#{{pane_id}}|#{{window_active}}|#{{pane_active}}|{}",
         pane.launch.live()
     );
-    let read = native(ctx, &["display-message", "-p", "-t", p, &probe], true)?;
-    if read.code != 0 || read.stdout.trim_end_matches(['\r', '\n']) != format!("{p}|1|1|1") {
+    let focused =
+        native(ctx, &["display-message", "-p", "-t", p, &probe], true).is_ok_and(|read| {
+            read.code == 0 && read.stdout.trim_end_matches(['\r', '\n']) == format!("{p}|1|1|1")
+        });
+    if !focused {
         return refuse(2, "target", "the agent's pane is no longer its launch");
     }
     let mut reply = Map::new();
@@ -418,5 +422,25 @@ mod tests {
         );
         let verbs: Vec<String> = w.fakes.mux_calls().iter().map(|c| c[1].clone()).collect();
         assert_eq!(verbs, ["display-message", "list-panes"]);
+    }
+
+    #[test]
+    fn focus_read_back_that_fails_to_run_is_a_target_refusal() {
+        // D9: the read-back after the select fails as a call (no server, a timeout): `2 target`, never another check.
+        let w = World::human("");
+        w.agent_record(ID, json!({}));
+        w.panes(&["%9|@5|300|aaaaaaaaaaaa|worker"]);
+        w.fakes.mux_script("#{window_active}", |_| {
+            Err(crate::error::Refusal {
+                code: 1,
+                check: "endpoint",
+                message: "rmux endpoint did not answer".into(),
+                reason: None,
+            })
+        });
+        assert_eq!(
+            run(&w, focus, &["focus", "worker"]),
+            "2 target the agent's pane is no longer its launch"
+        );
     }
 }

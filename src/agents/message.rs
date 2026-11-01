@@ -195,10 +195,10 @@ fn capture(ctx: &Ctx, pane: &registry::Pane, lines: i32) -> Res<String> {
         native(ctx, &argv, true).and_then(|_| native(ctx, &["show-buffer", "-b", &buffer], true));
     // Always, whatever happened: a buffer left behind would hold the pane's text.
     let _ = native(ctx, &["delete-buffer", "-b", &buffer], true);
-    let captured = captured?;
-    if captured.code != 0 {
+    // No buffer, or a call that failed as a call: nothing proves the text is the agent's.
+    let Some(captured) = captured.ok().filter(|c| c.code == 0) else {
         return refuse(2, "target", "the agent's pane is no longer its launch");
-    }
+    };
     let all: Vec<&str> = captured
         .stdout
         .trim_end_matches(['\r', '\n'])
@@ -2024,5 +2024,70 @@ mod tests {
         w.fakes.clear_log();
         assert!(!reap(&w.ctx, &w.caller(), None, false).unwrap());
         assert!(pane_kills(&w).is_empty() && !killed.get());
+    }
+
+    // A call that fails as a call: no server, a timeout.
+    fn lost_server() -> Refusal {
+        Refusal {
+            code: 1,
+            check: "endpoint",
+            message: "rmux endpoint did not answer".into(),
+            reason: None,
+        }
+    }
+
+    #[test]
+    fn stop_whose_gone_proof_fails_to_run_signals_and_notices_nothing() {
+        // D7: the probe under the notice lock answers live, the one after the conditional kill fails as a call.
+        let w = stop_world(false, json!({}));
+        w.fakes.process(testing::row(300, 900, 3000));
+        w.fakes.kill_ok(300);
+        let probes = std::rc::Rc::new(std::cell::Cell::new(0));
+        let n = probes.clone();
+        w.fakes
+            .mux_script("-t %9 #{pane_id}|#{@agent-id}", move |_| {
+                n.set(n.get() + 1);
+                if n.get() == 1 {
+                    Ok(Output {
+                        code: 0,
+                        stdout: "%9|bbbbbbbbbbbb\n".into(),
+                        stderr: String::new(),
+                    })
+                } else {
+                    Err(lost_server())
+                }
+            });
+        w.fakes.clear_log();
+        assert_eq!(
+            run(&w, stop, &["stop", "worker"]),
+            format!("1 target {NOT_ITS_LAUNCH}")
+        );
+        assert_eq!(probes.get(), 2);
+        assert_eq!(pane_kills(&w), [kill9()]);
+        assert!(!proc_calls(&w).iter().any(|c| c.starts_with("kill ")));
+        assert!(!w.folder("bbbbbbbbbbbb").join("notice.json").exists());
+        assert_eq!(stored(&w), 0);
+    }
+
+    #[test]
+    fn read_deletes_its_buffer_whatever_call_fails() {
+        // D9: the conditional capture or show-buffer fails as a call: `2 target`, and delete-buffer still runs.
+        for failing in ["if-shell", "show-buffer"] {
+            let w = World::human("");
+            w.agent_record(ID, json!({}));
+            w.panes(&["%9|@5|300|aaaaaaaaaaaa|worker"]);
+            w.fakes.mux_rule("show-buffer", 0, "text\n", "");
+            w.fakes.mux_script(failing, |_| Err(lost_server()));
+            w.fakes.clear_log();
+            assert_eq!(
+                run(&w, read, &["read", "worker"]),
+                "2 target the agent's pane is no longer its launch",
+                "{failing}"
+            );
+            let calls = w.fakes.mux_calls();
+            let last = calls.last().unwrap();
+            assert_eq!(last[1], "delete-buffer", "{failing} {calls:?}");
+            assert!(last[3].starts_with("mux-agents-"), "{failing}");
+        }
     }
 }

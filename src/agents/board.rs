@@ -906,4 +906,30 @@ mod tests {
         let list = board(&w.ctx, &caller, false, false).unwrap();
         assert_eq!(list["agents"][0]["unread"], 1);
     }
+
+    #[test]
+    fn a_dead_launch_a_failed_kill_left_is_not_running() {
+        // #48 test 5: reap's conditional kill of the dead launch %9 failed (or the server kept the pane): the pane
+        // is still listed dead, so it is no board row and no target.
+        let w = World::human("");
+        let caller = w.caller();
+        w.agent_record(ID, json!({}));
+        w.panes_dead(&["%9|@5|300|aaaaaaaaaaaa|worker"], &["%9"]);
+        w.fakes.mux_rule("if-shell", 1, "", "no server");
+        w.fakes
+            .mux_rule("-t %9 #{pane_id}|#{@agent-id}", 0, "%9|aaaaaaaaaaaa\n", "");
+        let reply = board(&w.ctx, &caller, true, false).unwrap();
+        assert_eq!(reply["running"], 0);
+        assert!(names(&reply).is_empty(), "{reply:?}");
+        let killed = w
+            .fakes
+            .mux_calls()
+            .iter()
+            .filter(|c| c[1] == "if-shell")
+            .count();
+        assert!(killed >= 1);
+        let found = registry::find_pane(&w.ctx, &caller, "worker").unwrap_err();
+        assert_eq!((found.code, found.check), (2, "target"));
+        assert!(!w.folder(ID).join("notice.json").exists());
+    }
 }
