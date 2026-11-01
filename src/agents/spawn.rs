@@ -1,6 +1,7 @@
 //! spawn: checks the request and caller, then under the session's spawn lock: cap, name, context, files, pane,
 //! tags, record.json and last commit.json; only a committed agent is live (MuxAgents.ps1:641-833).
 
+use std::panic::{self, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
 
 use serde_json::{Map, Value, json};
@@ -144,8 +145,11 @@ pub fn spawn(ctx: &Ctx, request: &Request) -> Res<Map<String, Value>> {
     })?;
     reply.insert("placement".into(), placement.into());
     reply.insert("placementSource".into(), source.into());
-    // The agent is committed and the spawn lock released: the bar is best effort and never fails the spawn.
-    match sidebar::ensure(ctx, &caller) {
+    // The agent is committed and the spawn lock released: the bar is best effort and never fails the spawn, not
+    // even by a panic, which unwinding has already freed the sidebar lock from.
+    let bar = panic::catch_unwind(AssertUnwindSafe(|| sidebar::ensure(ctx, &caller)))
+        .unwrap_or_else(|_| refuse(1, "internal", "unexpected error (panic)"));
+    match bar {
         Ok(Bar::Opened(pane) | Bar::Existing(pane)) => {
             reply.insert("sidebar".into(), pane.into());
         }
@@ -1653,6 +1657,17 @@ mod tests {
                 assert_eq!(bar_splits(&w), 0, "{case}");
             }
         }
+        // A panic in the bar is caught there too: the committed agent's reply still goes out, so no retry adds one.
+        let (w, _) = bar_on();
+        w.fakes
+            .mux_script("@mux-agents-sidebar", |_| panic!("PANIC-PAYLOAD-bar"));
+        let ok = reply(&run(&w, &["-Client", "claude", "-Task", "hi"]));
+        assert_eq!(
+            (&ok["sidebar"], &ok["sidebarError"]),
+            (&Value::Null, &json!("unexpected error (panic)"))
+        );
+        let folder = agents_dir(&w).join(ok["id"].as_str().unwrap());
+        assert!(folder.join("commit.json").is_file());
         let (w, _) = bar_on();
         w.fakes.lock_timeout("sidebar|");
         assert!(run(&w, &["-Client", "claude", "-Task", "hi"]).starts_with("ok "));
