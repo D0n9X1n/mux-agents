@@ -317,8 +317,9 @@ pub fn kill_if_dead(pane: &str, id: &str) -> Vec<String> {
 ///   else `lost`.
 /// - An uncommitted agent created over 60 s ago, likewise (its dead pane killed, then noticed unless it is), but
 ///   only under the session's spawn lock (taken here unless `spawn_lock_held`, as inside spawn) and then its notice
-///   lock, and only while it is still uncommitted and still that old. Lock order: spawn, then notice. A spawn lock
-///   held elsewhere is a launch in progress: those agents wait for the next try, and reap does not fail for it.
+///   lock, and only while it is still uncommitted and still that old. Lock order: spawn, then notice. Outside spawn
+///   the spawn lock is tried once, never waited for: held elsewhere, it is a launch in progress, so those agents
+///   wait for a later trigger and reap returns at once.
 ///
 /// `tagged` is a list-panes snapshot the caller already has; without one, panes are listed only when some agent
 /// could need a notice or its launcher recorded an exit (its pane may be dead). A pid is never signalled.
@@ -415,9 +416,7 @@ pub fn reap(
         })
         .collect();
     if !candidates.is_empty() {
-        let ran = std::cell::Cell::new(false);
         let close = || -> Res<bool> {
-            ran.set(true);
             let mut did = false;
             for (id, dead) in &candidates {
                 let Some(record) = own_record(ctx, caller, id)? else {
@@ -441,22 +440,19 @@ pub fn reap(
             }
             Ok(did)
         };
-        // Locks are not reentrant: inside spawn, which holds the spawn lock, it is never taken again. Another spawn
-        // holding it is a launch in progress: its candidates wait for the next try, and the caller never fails for it.
-        let closed = if spawn_lock_held {
-            close()
+        // Locks are not reentrant: inside spawn, which holds the spawn lock, it is never taken again. Elsewhere it is
+        // tried once, never waited for: another spawn holding it is a launch in progress, so its candidates wait for
+        // a later trigger and list, read and the side bar return at once.
+        acted |= if spawn_lock_held {
+            close()?
         } else {
-            super::lock(
+            super::try_lock(
                 ctx,
                 &super::lock_key("spawn", caller, &caller.session),
                 close,
-            )
+            )?
+            .unwrap_or(false)
         };
-        match closed {
-            Ok(did) => acted |= did,
-            Err(refusal) if refusal.check == "lock" && !ran.get() => {}
-            Err(refusal) => return Err(refusal),
-        }
     }
     Ok(acted)
 }
@@ -1424,6 +1420,105 @@ mod tests {
             } else {
                 assert!(!locks.contains(&format!("+{notice}")), "{label} {locks:?}");
             }
+        }
+    }
+
+    // Another spawn holds the session's spawn lock while an uncommitted agent over 60 s old has its pane gone, or
+    // dead: list never waits for that lock. It returns at once with no cleanup; a later list, the lock free, closes
+    // the agent with exactly one notice.
+    #[test]
+    fn list_never_waits_for_a_busy_spawn_lock() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::time::{Duration, Instant};
+        for dead in [false, true] {
+            let w = World::human("");
+            w.clock(NOW);
+            let caller = w.caller();
+            let folder = w.uncommitted(ID, json!({"createdAt": "2026-10-29T11:58:00.0000000Z"}));
+            let killed = std::rc::Rc::new(std::cell::Cell::new(false));
+            let listed_now = killed.clone();
+            w.fakes.mux_script("list-panes", move |argv| {
+                let rows: &[&str] = if dead && !listed_now.get() {
+                    &["%9|@5|300|aaaaaaaaaaaa|worker"]
+                } else {
+                    &[]
+                };
+                Ok(crate::mux::Output {
+                    code: 0,
+                    stdout: crate::agents::fixture::listed_dead(argv, rows, "\n", &["%9"]),
+                    stderr: String::new(),
+                })
+            });
+            let kill = killed.clone();
+            w.fakes.mux_script("if-shell", move |_| {
+                kill.set(true);
+                Ok(crate::mux::Output {
+                    code: 0,
+                    stdout: String::new(),
+                    stderr: String::new(),
+                })
+            });
+            let probed = killed.clone();
+            w.fakes.mux_script("#{pane_id}|#{@agent-id}", move |_| {
+                let stdout = if dead && !probed.get() {
+                    "%9|aaaaaaaaaaaa\n"
+                } else {
+                    "|\n"
+                };
+                Ok(crate::mux::Output {
+                    code: 0,
+                    stdout: stdout.into(),
+                    stderr: String::new(),
+                })
+            });
+            let gate = Arc::new(crate::testing::Gate::default());
+            w.fakes.share_locks(gate.clone());
+            let spawn = lock_key("spawn", &caller, "$3");
+            let release = AtomicBool::new(false);
+            let took = std::thread::scope(|scope| {
+                let holder = scope.spawn(|| {
+                    // Another process's spawn, mid-launch: its own fakes, the same lock.
+                    let other = World::human("");
+                    other.fakes.share_locks(gate.clone());
+                    crate::agents::lock(&other.ctx, &spawn, || {
+                        let end = Instant::now() + Duration::from_secs(3);
+                        while !release.load(Ordering::SeqCst) && Instant::now() < end {
+                            std::thread::sleep(Duration::from_millis(1));
+                        }
+                        Ok(())
+                    })
+                    .unwrap();
+                });
+                let end = Instant::now() + Duration::from_secs(5);
+                while !gate.held(&spawn) {
+                    assert!(Instant::now() < end, "the spawn lock was never held");
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                w.fakes.clear_log();
+                let at = Instant::now();
+                let reply = crate::agents::view::list(&w.ctx, &w.request(&["list"]));
+                let took = at.elapsed();
+                release.store(true, Ordering::SeqCst);
+                holder.join().unwrap();
+                assert!(reply.is_ok(), "dead={dead} {reply:?}");
+                took
+            });
+            assert!(
+                took < Duration::from_secs(1),
+                "dead={dead}: list waited {took:?} for the spawn lock"
+            );
+            assert!(w.fakes.slept().is_empty(), "dead={dead}");
+            assert!(!folder.join("notice.json").exists(), "dead={dead}");
+            assert!(!killed.get(), "dead={dead}");
+            assert!(stored(&w).is_empty(), "dead={dead}");
+            // The lock free: the next list closes it, once; the one after posts nothing more.
+            for _ in 0..2 {
+                crate::agents::view::list(&w.ctx, &w.request(&["list"])).unwrap();
+            }
+            assert_eq!(killed.get(), dead, "dead={dead}");
+            assert_eq!(marker_of(&folder).0, json!("lost"), "dead={dead}");
+            assert_eq!(stored(&w).len(), 1, "dead={dead}");
         }
     }
 

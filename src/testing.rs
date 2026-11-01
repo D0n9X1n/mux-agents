@@ -103,6 +103,16 @@ impl Gate {
         state.held.push(key.into());
     }
 
+    /// Takes `key` when no thread holds it, never waiting; false when it is held.
+    fn try_take(&self, key: &str) -> bool {
+        let mut state = self.state.lock().unwrap();
+        if state.held.iter().any(|k| k == key) {
+            return false;
+        }
+        state.held.push(key.into());
+        true
+    }
+
     fn give(&self, key: &str) {
         self.state.lock().unwrap().held.retain(|k| k != key);
         self.freed.notify_all();
@@ -164,6 +174,27 @@ pub fn locked<T>(key: &str, f: impl FnOnce() -> Res<T>) -> Res<T> {
         gate.give(key);
     }
     out
+}
+
+/// Stands in for `state::lock::try_with_lock`: one attempt, never waiting. A key set by `lock_timeout`, or held by
+/// another thread through a shared `Gate`, is busy (recorded as `?key`) and answers `None` without running `f`.
+pub fn try_locked<T>(key: &str, f: impl FnOnce() -> Res<T>) -> Res<Option<T>> {
+    let fakes = CURRENT
+        .with(|current| current.borrow().clone())
+        .expect("a lock taken before Fakes::ctx on this thread");
+    let busy_here = fakes.0.borrow().timeouts.iter().any(|t| key.starts_with(t));
+    let gate = fakes.0.borrow().gate.clone();
+    if busy_here || gate.as_ref().is_some_and(|gate| !gate.try_take(key)) {
+        fakes.0.borrow_mut().locks.push(format!("?{key}"));
+        return Ok(None);
+    }
+    fakes.lock_event('+', key);
+    let out = f();
+    fakes.lock_event('-', key);
+    if let Some(gate) = &gate {
+        gate.give(key);
+    }
+    out.map(Some)
 }
 
 #[derive(Clone, Default)]
