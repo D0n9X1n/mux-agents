@@ -80,7 +80,12 @@ pub fn status(ctx: &Ctx, request: &Request) -> Res<Map<String, Value>> {
         .join("status.json");
     let at = crate::util::utc_o(ctx.clock.now());
     lock(ctx, &lock_key("agent", &caller, tag), || {
-        write_json(&file, &json!({"text": text, "at": at}))
+        write_json(&file, &json!({"text": text, "at": at}))?;
+        // A status is work: the agent no longer waits.
+        if let Some(folder) = file.parent() {
+            super::message::clear_waiting(folder);
+        }
+        Ok(())
     })?;
     let mut reply = Map::new();
     reply.insert(

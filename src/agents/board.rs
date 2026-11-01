@@ -34,15 +34,16 @@ pub fn select_doing(
 }
 
 /// `{running, agents}` for the caller's session: live agents in pane order and, with `all`, `endedTotal` (every
-/// ended agent of the session) and the session's ended agents, newest notice first, at most 10. Unread is `reader`'s. `with_exit` (watch only) adds each ended row's
-/// exitCode from its notice.json. Locks one at a time: notice locks, the reader's mail lock, then each row's
+/// ended agent of the session) and the session's ended agents, newest notice first, at most 10. Unread is
+/// `reader`'s. `watch` (the bar's feed) adds each ended row's exitCode from its notice.json and each live row's
+/// `waiting` (S2.4). Locks one at a time: notice locks, the reader's mail lock, then each row's
 /// agent lock.
 pub fn board(
     ctx: &Ctx,
     caller: &Caller,
     reader: &str,
     all: bool,
-    with_exit: bool,
+    watch: bool,
 ) -> Res<Map<String, Value>> {
     // One list-panes for the notices, the live rows and the ended filter; list runs every 3 s. A reap that killed a
     // pane or posted a notice makes that snapshot stale, so the panes are listed again.
@@ -55,6 +56,7 @@ pub fn board(
         caller,
         unread: unread_counts(ctx, caller, reader)?,
         now: ctx.clock.now(),
+        watch,
     };
     let panes = registry::committed(ctx, caller, tagged);
     let mut agents = Vec::new();
@@ -88,7 +90,7 @@ pub fn board(
             if let Some(closed) = end.closed_by {
                 row.insert("closedBy".into(), closed.into());
             }
-            if with_exit {
+            if watch {
                 row.insert("exitCode".into(), end.code);
             }
             agents.push(row);
@@ -194,6 +196,7 @@ struct Rows<'a> {
     caller: &'a Caller,
     unread: HashMap<String, usize>,
     now: SystemTime,
+    watch: bool,
 }
 
 impl Rows<'_> {
@@ -210,10 +213,20 @@ impl Rows<'_> {
         let folder = super::server_dir(self.ctx, self.caller)
             .join("agents")
             .join(id);
-        let (status, sent) =
+        let (status, sent, waiting) =
             super::lock(self.ctx, &super::lock_key("agent", self.caller, id), || {
                 let read = |name: &str| read_json(&folder.join(name)).ok().flatten();
-                Ok((read("status.json"), read("last-sent.json")))
+                let status = read("status.json");
+                // Only a live row of the bar's feed reads its waiting files.
+                let waiting = (self.watch && state == "running").then(|| {
+                    let at = status
+                        .as_ref()
+                        .and_then(|s| s.get("at"))
+                        .and_then(Value::as_str)
+                        .and_then(parse_utc);
+                    super::message::waiting_now(self.ctx, &folder, at)
+                });
+                Ok((status, read("last-sent.json"), waiting))
             })?;
         let (doing, from) = select_doing(
             status.as_ref().and_then(|s| s.get("text")),
@@ -254,6 +267,9 @@ impl Rows<'_> {
             "color".into(),
             crate::paint::identity(recorded, &name).into(),
         );
+        if let Some(waiting) = waiting {
+            row.insert("waiting".into(), waiting.into());
+        }
         Ok(row)
     }
 }
@@ -742,5 +758,70 @@ mod tests {
             (&row["doing"], &row["doingFrom"]),
             (&json!("sent"), &json!("message"))
         );
+    }
+
+    #[test]
+    fn watch_shows_waiting_only_for_a_live_newer_read() {
+        let w = World::human("");
+        w.clock(NOW);
+        let caller = w.caller();
+        let folder = w.agent_record(ID, json!({}));
+        w.panes(&["%9|@5|300|aaaaaaaaaaaa|worker"]);
+        // The agent's `read -Wait`: pid 700, started at 7000.
+        w.fakes.process(crate::testing::row(700, 300, 7000));
+        let wait = |name: u32, pid: u32, start: i64, since: &str| {
+            write(
+                &folder.join(format!("waiting-{name}.json")),
+                json!({"pid": pid, "start": start, "since": format!("2026-10-29T{since}.0000000Z")}),
+            )
+        };
+        let status = |at: &str| {
+            write(
+                &folder.join("status.json"),
+                json!({"text": "x", "at": format!("2026-10-29T{at}.0000000Z")}),
+            )
+        };
+        let waiting = || {
+            let reply = board(&w.ctx, &caller, "pane-1", true, true).unwrap();
+            reply["agents"][0]["waiting"].clone()
+        };
+        let files = || {
+            let mut names: Vec<String> = std::fs::read_dir(&folder)
+                .unwrap()
+                .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+                .filter(|n| n.starts_with("waiting-"))
+                .collect();
+            names.sort();
+            names
+        };
+        assert_eq!(waiting(), json!(false));
+        // A live read, with no status or an older one.
+        wait(700, 700, 7000, "11:59:00");
+        assert_eq!(waiting(), json!(true));
+        status("11:58:00");
+        assert_eq!(waiting(), json!(true));
+        // A status since the read began: working, and the live read's file stays.
+        status("11:59:30");
+        assert_eq!(waiting(), json!(false));
+        assert_eq!(files(), ["waiting-700.json"]);
+        std::fs::remove_file(folder.join("status.json")).unwrap();
+        // The pid reused by another process (another start): not waiting, deleted.
+        wait(700, 700, 6999, "11:59:00");
+        assert_eq!(waiting(), json!(false));
+        assert_eq!(files(), Vec::<String>::new());
+        // The read was killed: its pid is gone, the file left behind is deleted.
+        wait(701, 701, 7010, "11:59:00");
+        assert_eq!(waiting(), json!(false));
+        assert_eq!(files(), Vec::<String>::new());
+        // An unreadable file, or one naming another pid than its own name, is deleted.
+        std::fs::write(folder.join("waiting-702.json"), "{bad").unwrap();
+        wait(703, 700, 7000, "11:59:00");
+        assert_eq!(waiting(), json!(false));
+        assert_eq!(files(), Vec::<String>::new());
+        // Only the bar's feed says waiting; list's rows are unchanged.
+        wait(700, 700, 7000, "11:59:00");
+        let list = board(&w.ctx, &caller, "pane-1", true, false).unwrap();
+        assert!(list["agents"][0].get("waiting").is_none());
+        assert_eq!(files(), ["waiting-700.json"]);
     }
 }
