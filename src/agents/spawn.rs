@@ -1906,11 +1906,20 @@ mod tests {
         }
     }
 
-    // A human caller whose session keeps its bar: the bar's split answers %13 in the caller's window @1, and from
-    // then on the session's list and the bar's probe name it. `open` says whether the bar is there.
+    // A human caller whose session keeps its bar: the bar's split answers %13 in the caller's window @1, run by pid
+    // 113 (`<exe> watch`, start 1130), and from then on the session's record, the bar's proof and the label list name
+    // it. `open` says whether the bar is there.
     fn bar_on() -> (World, Rc<Cell<bool>>) {
         let w = World::human("");
         w.fakes.mux_rule("new-window", 0, "%9|@5\n", "");
+        let exe = w.ctx.exe.display().to_string();
+        w.fakes.process(crate::proc::Row {
+            pid: 113,
+            ppid: 900,
+            start: Some(1130),
+            path: Some(exe.clone()),
+            argv: Some(vec![exe, "watch".into()]),
+        });
         let open = Rc::new(Cell::new(false));
         let seen = open.clone();
         w.fakes.mux_script("split-window", move |argv| {
@@ -1920,21 +1929,50 @@ mod tests {
             }
             Ok(Output {
                 code: 0,
-                stdout: if bar { "%13|@1\n" } else { "%9|@5\n" }.into(),
+                stdout: if bar { "%13|@1|113\n" } else { "%9|@5\n" }.into(),
+                stderr: String::new(),
+            })
+        });
+        let record = Rc::new(RefCell::new(String::new()));
+        w.fakes.mux_script("@mux-agents-sidebar-id", move |argv| {
+            let mut record = record.borrow_mut();
+            let stdout = match (argv[1].as_str(), argv[2].as_str()) {
+                ("show-options", _) if !record.is_empty() => format!("{record}\n"),
+                ("set-option", "-u") => {
+                    record.clear();
+                    String::new()
+                }
+                ("set-option", _) => {
+                    *record = argv[5].clone();
+                    String::new()
+                }
+                _ => String::new(),
+            };
+            Ok(Output {
+                code: 0,
+                stdout,
+                stderr: String::new(),
+            })
+        });
+        let seen = open.clone();
+        w.fakes.mux_script("#{pane_dead}|#{pane_pid}", move |_| {
+            Ok(Output {
+                code: 0,
+                stdout: if seen.get() {
+                    "%13|@1|0|113\n"
+                } else {
+                    "|||\n"
+                }
+                .into(),
                 stderr: String::new(),
             })
         });
         let seen = open.clone();
         w.fakes
-            .mux_script("#{@agent-role}|#{@agent-id}", move |argv| {
-                let stdout = match (argv[1].as_str(), seen.get()) {
-                    ("list-panes", true) => "%13|@1|sidebar|\n",
-                    ("display-message", true) => "%13|@1|sidebar||end\n",
-                    _ => "",
-                };
+            .mux_script("#{==:#{@agent-role},sidebar}", move |_| {
                 Ok(Output {
                     code: 0,
-                    stdout: stdout.into(),
+                    stdout: if seen.get() { "%13|1\n" } else { "" }.into(),
                     stderr: String::new(),
                 })
             });
@@ -2018,12 +2056,12 @@ mod tests {
 
     #[test]
     fn sidebar_failure_after_commit_still_spawns() {
-        let unknown = "pane %13 could not be checked as the side bar; try again";
+        let unknown = crate::sidebar::unproven(&["%13".to_string()]);
         for (case, message) in [
             ("lock", "timed out waiting for the agent lock"),
             ("option exit", "rmux call failed"),
             ("option throw", "the rmux endpoint did not answer"),
-            ("probe", unknown),
+            ("probe", unknown.as_str()),
             ("open", "rmux call failed"),
         ] {
             let (w, open) = bar_on();
@@ -2034,8 +2072,16 @@ mod tests {
                     refuse(1, "endpoint", "the rmux endpoint did not answer")
                 }),
                 "probe" => {
+                    // A recorded bar whose proof cannot be read: its label refuses a second bar.
                     open.set(true);
-                    w.fakes.mux_first("|end", 1, "", "no server");
+                    w.fakes.mux_first(
+                        "show-options -qv -t $3 @mux-agents-sidebar-id",
+                        0,
+                        "%13 113 1130\n",
+                        "",
+                    );
+                    w.fakes
+                        .mux_first("#{pane_dead}|#{pane_pid}", 1, "", "no server");
                 }
                 _ => w.fakes.mux_script("split-window", |argv| {
                     let bar = argv.last().is_some_and(|a| a == "watch");

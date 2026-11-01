@@ -546,7 +546,10 @@ mod tests {
             let tokens: Vec<String> = c
                 .iter()
                 .map(|t| {
-                    assert!(!t.contains(' '), "a token with a space: {t:?}");
+                    // A token with spaces (if-shell's command, the bar's record) is written quoted.
+                    if t.contains(' ') {
+                        return format!("'{t}'");
+                    }
                     if Some(t) == spec.as_ref() {
                         "<spec>".into()
                     } else if Some(t) == id.as_ref() {
@@ -587,8 +590,9 @@ mod tests {
     // The agent's pane is %12; the side bar's split, the only call running `watch`, answers %13 in the caller's window.
     fn spawn_world() -> World {
         let w = World::human("");
+        bar_process(&w);
         w.fakes.mux_rule("new-window", 0, "%12|@7\n", "");
-        w.fakes.mux_rule("watch", 0, "%13|@1\n", "");
+        w.fakes.mux_rule("watch", 0, "%13|@1|113\n", "");
         w.fakes.mux_rule("split-window", 0, "%12|@7\n", "");
         w
     }
@@ -631,8 +635,21 @@ mod tests {
 
     fn sidebar_world() -> World {
         let w = World::human("");
-        w.fakes.mux_rule("split-window", 0, "%13|@1\n", "");
+        bar_process(&w);
+        w.fakes.mux_rule("split-window", 0, "%13|@1|113\n", "");
         w
+    }
+
+    // The bar's process: pid 113, `<exe> watch`, start 1130.
+    fn bar_process(w: &World) {
+        let exe = w.ctx.exe.display().to_string();
+        w.fakes.process(crate::proc::Row {
+            pid: 113,
+            ppid: 900,
+            start: Some(1130),
+            path: Some(exe.clone()),
+            argv: Some(vec![exe, "watch".into()]),
+        });
     }
 
     #[test]
@@ -730,14 +747,25 @@ mod tests {
         });
         record(&w, "sidebar, -l refused", &["sidebar"], 0);
         let w = World::human("");
-        w.fakes.mux_rule("|end", 0, "%13|@1|sidebar||end\n", "");
-        w.fakes.mux_rule("list-panes", 0, "%13|@1|sidebar|\n", "");
+        bar_process(&w);
+        w.fakes.mux_rule(
+            "show-options -qv -t $3 @mux-agents-sidebar-id",
+            0,
+            "%13 113 1130\n",
+            "",
+        );
+        w.fakes
+            .mux_rule("#{pane_dead}|#{pane_pid}", 0, "%13|@1|0|113\n", "");
+        w.fakes.mux_rule("#{pane_id}|#{pane_pid}", 0, "|\n", "");
         record(&w, "sidebar -Close", &["sidebar", "-Close"], 0);
         // watch draws only to a terminal, so its one frame is drawn through watch_on; a closed output ends it. The
-        // pane answers its probe, so the frame reads its window's layout first.
+        // pane answers its probe and the record names it and this process (4242), so the frame reads its window's
+        // layout first.
         let w = World::human("");
         w.fakes
             .mux_rule("#{pane_id}|#{@agent-role}", 0, "%1|sidebar\n", "");
+        w.fakes
+            .mux_rule("@mux-agents-sidebar-id", 0, "%1 4242 1\n", "");
         w.fakes.clear_log();
         let request = w.request(&["watch"]);
         let reply = crate::sidebar::watch_on(&w.ctx, &request, true, &mut |_| {
@@ -815,7 +843,7 @@ mod tests {
 
     #[test]
     fn spawn_replies_fixture_matches() {
-        // The bar opened (%13), turned off by `sidebar -Close`, and unknown after the commit (its probe failed).
+        // The bar opened (%13), turned off by `sidebar -Close`, and unproven after the commit (its proof failed).
         let open = || {
             let w = spawn_world();
             w.fakes.mux_first("new-window", 0, "%9|@5\n", "");
@@ -828,9 +856,17 @@ mod tests {
         };
         let failed = || {
             let w = open();
+            // A recorded bar whose proof cannot be read, and its label: no second bar.
+            w.fakes.mux_first(
+                "show-options -qv -t $3 @mux-agents-sidebar-id",
+                0,
+                "%13 113 1130\n",
+                "",
+            );
             w.fakes
-                .mux_first("#{@agent-role}|#{@agent-id}", 0, "%13|@1|sidebar|\n", "");
-            w.fakes.mux_first("|end", 1, "", "no server");
+                .mux_first("#{pane_dead}|#{pane_pid}", 1, "", "no server");
+            w.fakes
+                .mux_first("#{==:#{@agent-role},sidebar}", 0, "%13|1\n", "");
             w
         };
         // A fixture's name, its world and the -Model it spawns with.
