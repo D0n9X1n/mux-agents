@@ -3076,24 +3076,25 @@ exec claude --dangerously-skip-permissions
         live.worker_pid(&w3);
         quit_dead(&mut live, &w2);
         let (p2, p3) = (s(&w2["pane"]).to_string(), s(&w3["pane"]).to_string());
-        let conditional = |live: &Live, pane: &str, id: &str| {
-            let argv = mux_agent::agents::registry::kill_if_dead(pane, id);
+        // The conditional of an agent's own launch: its record's startCommand, the pane dead. Tags play no part.
+        let launch = |live: &Live, w: &Value| {
+            let record = json_file(&live.agent_dir(s(&w["id"])).join("record.json"));
+            mux_agent::agents::registry::Launch {
+                command: s(&record["startCommand"]).to_string(),
+                pid: None,
+            }
+        };
+        let conditional = |live: &Live, pane: &str, w: &Value| {
+            let argv = mux_agent::agents::registry::kill_if_dead(pane, &launch(live, w));
             let argv: Vec<&str> = argv.iter().map(String::as_str).collect();
             live.call(&argv);
         };
         let listed = |live: &Live, pane: &str| live.panes("#{pane_id}").iter().any(|p| p == pane);
-        // Retagged since it was listed: kept.
-        live.call(&["set-option", "-p", "-t", &p2, "@agent-id", "bbbbbbbbbbbb"]);
-        conditional(&live, &p2, s(&w2["id"]));
-        assert!(
-            listed(&live, &p2),
-            "{mux:?}: a retagged dead pane was killed"
-        );
-        // Live with the agent's own tag: kept.
-        conditional(&live, &p3, s(&w3["id"]));
+        // Live with its own launch: kept.
+        conditional(&live, &p3, &w3);
         assert!(listed(&live, &p3), "{mux:?}: a live pane was killed");
-        // Tagged again: list closes it.
-        live.call(&["set-option", "-p", "-t", &p2, "@agent-id", s(&w2["id"])]);
+        // Its tag moved to another pane (as rmux's rotate-window leaves it): list still closes the dead launch.
+        live.call(&["set-option", "-p", "-t", &p2, "@agent-id", "bbbbbbbbbbbb"]);
         let (code, list) = live.run(&["list"]);
         assert_eq!(
             (code, names(&list)),
@@ -3103,6 +3104,134 @@ exec claude --dangerously-skip-permissions
         live.wait_gone(&p2);
         assert_eq!(exit_messages(&live, &w2).len(), 1, "{mux:?}");
         assert!(listed(&live, &p3), "{mux:?}");
+        // A replacement (respawned with another command, then dead): kept by the conditional and by list.
+        let w4 = live.spawn("w4", &[]);
+        live.worker_pid(&w4);
+        let p4 = s(&w4["pane"]).to_string();
+        live.call(&["respawn-pane", "-k", "-t", &p4, "true"]);
+        live.server.wait("the replacement to be dead", || {
+            (live.field(&p4, "#{pane_dead}") == "1").then_some(())
+        });
+        conditional(&live, &p4, &w4);
+        assert!(
+            listed(&live, &p4),
+            "{mux:?}: a replaced dead pane was killed"
+        );
+        let (code, list) = live.run(&["list"]);
+        assert_eq!(
+            (code, names(&list)),
+            (0, vec!["w3".to_string()]),
+            "{mux:?} {list}"
+        );
+        assert!(listed(&live, &p4), "{mux:?}: list killed a replacement");
+        assert!(listed(&live, &p3), "{mux:?}");
+    }
+
+    // #48 test 9: two split agents, then rotate-window (rmux leaves the @agent-* tags at their places; tmux moves them
+    // with the panes). From a clean pane in another window, list, read, focus and send reach each agent by its own
+    // pane; stop closes only that agent's pane; the other is still reachable and the user's pane lives on.
+    fn rotated_window_reaches_each_agent_by_its_pane(mux: Mux) {
+        let Some(mut live) = Live::human(mux) else {
+            return;
+        };
+        live.close_bar();
+        let root = live.server.pane().to_string();
+        let w1 = live.spawn("w1", &["-Split", "h"]);
+        let w2 = live.spawn("w2", &["-Split", "v"]);
+        let (p1, p2) = (s(&w1["pane"]).to_string(), s(&w2["pane"]).to_string());
+        let (pid1, pid2) = (live.worker_pid(&w1), live.worker_pid(&w2));
+        let session = live.field(&root, "#{session_id}");
+        let clean = live
+            .call(&[
+                "new-window",
+                "-d",
+                "-P",
+                "-F",
+                "#{pane_id}",
+                "-t",
+                &format!("{session}:"),
+                "sh",
+            ])
+            .trim()
+            .to_string();
+        live.call(&["rotate-window", "-t", &root]);
+        let tags = live.panes("#{pane_id}|#{@agent-name}");
+        eprintln!("{mux:?} after rotate-window: {tags:?}");
+
+        let (code, list) = live.run_in(&clean, &["list"]);
+        assert_eq!(code, 0, "{mux:?} {list}");
+        let rows: BTreeSet<String> = list["agents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|a| format!("{}@{}", s(&a["name"]), s(&a["pane"])))
+            .collect();
+        let want: BTreeSet<String> = [format!("w1@{p1}"), format!("w2@{p2}")].into();
+        assert_eq!(rows, want, "{mux:?} {list}");
+
+        for (w, pane, pid) in [(&w1, &p1, pid1), (&w2, &p2, pid2)] {
+            let name = s(&w["name"]);
+            // read <name> is that agent's own screen.
+            let line = format!("{name} screen");
+            live.call(&["send-keys", "-t", pane, "-l", &line]);
+            live.call(&["send-keys", "-t", pane, "Enter"]);
+            live.server.wait_line(&format!("input.{pid}.log"), &line);
+            let (code, read) = live.run_in(&clean, &["read", name, "-Lines", "20"]);
+            assert_eq!((code, &read["pane"]), (0, &json!(pane)), "{mux:?} {read}");
+            assert!(
+                s(&read["text"]).lines().any(|l| l.trim() == line),
+                "{mux:?} {name}: {read}"
+            );
+            // focus selects that agent's own pane.
+            let (code, focused) = live.run_in(&clean, &["focus", name]);
+            assert_eq!(
+                (code, &focused["pane"]),
+                (0, &json!(pane)),
+                "{mux:?} {focused}"
+            );
+            assert_eq!(live.active(pane), *pane, "{mux:?} {name}");
+            // send reaches that agent's own mailbox.
+            let body = format!("to {name}");
+            let (code, sent) = live.run_in(&clean, &["send", name, "-Body", &body]);
+            assert_eq!((code, &sent["pane"]), (0, &json!(pane)), "{mux:?} {sent}");
+            let mail = live.mailbox(s(&w["id"]));
+            assert!(
+                mail.iter().any(|m| m["body"] == body.as_str()),
+                "{mux:?} {name}: {mail:?}"
+            );
+        }
+
+        // stop w1 closes only w1's pane.
+        let (code, stop) = live.run_in(&clean, &["stop", "w1"]);
+        assert_eq!((code, &stop["pane"]), (0, &json!(p1)), "{mux:?} {stop}");
+        live.wait_gone(&p1);
+        let panes = live.panes("#{pane_id}");
+        for pane in [&root, &p2, &clean] {
+            assert!(
+                panes.contains(pane),
+                "{mux:?}: {pane} was closed: {panes:?}"
+            );
+        }
+        // w2 is still reachable.
+        let (code, list) = live.run_in(&clean, &["list"]);
+        assert_eq!(
+            (code, names(&list)),
+            (0, vec!["w2".to_string()]),
+            "{mux:?} {list}"
+        );
+        let (code, sent) = live.run_in(&clean, &["send", "w2", "-Body", "still here"]);
+        assert_eq!((code, &sent["pane"]), (0, &json!(p2)), "{mux:?} {sent}");
+        let (code, read) = live.run_in(&clean, &["read", "w2", "-Lines", "20"]);
+        assert_eq!((code, &read["pane"]), (0, &json!(p2)), "{mux:?} {read}");
+        // A root left carrying an agent's tag is no agent: it cannot send as one.
+        if !live.field(&root, "#{@agent-id}").is_empty() {
+            let (code, refused) = live.run(&["send", "w2", "-Body", "x"]);
+            assert_eq!(
+                (code, &refused["check"]),
+                (2, &json!("parent")),
+                "{mux:?} {refused}"
+            );
+        }
     }
 
     // One test fn per scenario, each on its own fresh server.
@@ -3166,6 +3295,7 @@ exec claude --dangerously-skip-permissions
                     bar_shows_waiting_then_working,
                     bar_keeps_its_header_with_emoji_sequences,
                     dead_pane_closed_by_one_conditional,
+                    rotated_window_reaches_each_agent_by_its_pane,
                 ]
             );
         };
