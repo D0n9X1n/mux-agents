@@ -44,9 +44,12 @@ pub fn board(
     all: bool,
     with_exit: bool,
 ) -> Res<Map<String, Value>> {
-    // One list-panes for the notices, the live rows and the ended filter; list runs every 3 s.
-    let tagged = registry::tagged(ctx, caller)?;
-    registry::reap(ctx, caller, Some(&tagged), false)?;
+    // One list-panes for the notices, the live rows and the ended filter; list runs every 3 s. A reap that killed a
+    // pane or posted a notice makes that snapshot stale, so the panes are listed again.
+    let mut tagged = registry::tagged(ctx, caller)?;
+    if registry::reap(ctx, caller, Some(&tagged), false)? {
+        tagged = registry::tagged(ctx, caller)?;
+    }
     let rows = Rows {
         ctx,
         caller,
@@ -539,6 +542,58 @@ mod tests {
             (&row["doing"], &row["doingFrom"], &row["unread"]),
             (&json!("fresh"), &json!("message"), &json!(1))
         );
+    }
+
+    #[test]
+    fn board_lists_again_after_reap_acted() {
+        use std::cell::Cell;
+        use std::rc::Rc;
+        let w = World::human("");
+        let caller = w.caller();
+        let folder = w.agent_record(ID, json!({}));
+        write(
+            &folder.join("launcher.json"),
+            json!({"pid": 300, "exitCode": 0}),
+        );
+        // %9 is listed dead until the conditional kill ran; then it is gone.
+        let killed = Rc::new(Cell::new(false));
+        let gone = killed.clone();
+        w.fakes.mux_script("list-panes", move |argv| {
+            let rows: &[&str] = if gone.get() {
+                &[]
+            } else {
+                &["%9|@5|300|aaaaaaaaaaaa|worker"]
+            };
+            Ok(crate::mux::Output {
+                code: 0,
+                stdout: crate::agents::fixture::listed_dead(argv, rows, "\n", &["%9"]),
+                stderr: String::new(),
+            })
+        });
+        let kill = killed.clone();
+        w.fakes.mux_script("if-shell", move |_| {
+            kill.set(true);
+            Ok(crate::mux::Output {
+                code: 0,
+                stdout: String::new(),
+                stderr: String::new(),
+            })
+        });
+        w.fakes.mux_rule("#{pane_id}|#{@agent-id}", 0, "|\n", "");
+        w.fakes.clear_log();
+        let reply = board(&w.ctx, &caller, "pane-1", true, false).unwrap();
+        assert!(killed.get());
+        assert_eq!(
+            (names(&reply), &reply["running"]),
+            (vec!["worker=exited".to_string()], &json!(0))
+        );
+        let lists = w
+            .fakes
+            .mux_calls()
+            .iter()
+            .filter(|c| crate::agents::fixture::list_call(c))
+            .count();
+        assert_eq!(lists, 2);
     }
 
     #[test]
