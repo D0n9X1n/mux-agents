@@ -2,7 +2,8 @@ import { expect, test } from 'claude-code/testing'
 
 import { clean, formatAge, isSpawn, parseList } from '../../hooks/board'
 import {
-  SPAWN_ERROR_JSON, SPAWN_ERROR_TEXT, SPAWN_JSON, SPAWN_OFF_JSON, SPAWN_OFF_TEXT, SPAWN_TEXT, TAGGED_JSON, TAGGED_TEXT,
+  SPAWN_ERROR_JSON, SPAWN_ERROR_TEXT, SPAWN_JSON, SPAWN_MODEL_JSON, SPAWN_MODEL_TEXT, SPAWN_OFF_JSON, SPAWN_OFF_TEXT, SPAWN_TEXT,
+  TAGGED_JSON, TAGGED_TEXT,
 } from './spawn-replies'
 
 const E = 'sh "/p/scripts/mux-agent"'
@@ -24,6 +25,15 @@ test('isSpawn accepts a spawn whose side bar is off or failed after the commit, 
   for (const reply of [SPAWN_OFF_JSON, SPAWN_ERROR_JSON, SPAWN_OFF_TEXT, SPAWN_ERROR_TEXT]) {
     expect(isSpawn(`${E} spawn`, reply)).toBe(true)
     expect(isSpawn(`${E} spawn -Text`, `${reply.replace(/\n/g, '\r\n')}\r\n`)).toBe(true)
+  }
+})
+
+test('isSpawn accepts a spawn reply naming its model, inherited or chosen, JSON or -Text', () => {
+  expect(SPAWN_TEXT).toContain('\nreason: human\nmodel: inherited\n')
+  expect(SPAWN_MODEL_TEXT).toContain('\nreason: human\nmodel: sonnet\n')
+  for (const reply of [SPAWN_JSON, SPAWN_MODEL_JSON, SPAWN_TEXT, SPAWN_MODEL_TEXT]) {
+    expect(isSpawn(`${E} spawn -Model sonnet`, reply)).toBe(true)
+    expect(isSpawn(`${E} spawn -Model sonnet -Text`, `${reply.replace(/\n/g, '\r\n')}\r\n`)).toBe(true)
   }
 })
 

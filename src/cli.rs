@@ -785,8 +785,11 @@ mod tests {
     }
 
     // A spawn through the entry, JSON or -Text, with its random id and session id fixed.
-    fn spawn_reply(w: &World, text: bool) -> (u8, String) {
+    fn spawn_reply(w: &World, model: Option<&str>, text: bool) -> (u8, String) {
         let mut args = vec!["spawn", "-Client", "claude", "-Task", "hi"];
+        if let Some(model) = model {
+            args.extend(["-Model", model]);
+        }
         if text {
             args.push("-Text");
         }
@@ -827,16 +830,19 @@ mod tests {
             w.fakes.mux_first("|end", 1, "", "no server");
             w
         };
-        let cases: [(&str, &dyn Fn() -> World); 3] = [
-            ("SPAWN", &open),
-            ("SPAWN_OFF", &off),
-            ("SPAWN_ERROR", &failed),
+        // A fixture's name, its world and the -Model it spawns with.
+        type Case<'a> = (&'a str, &'a dyn Fn() -> World, Option<&'a str>);
+        let cases: [Case; 4] = [
+            ("SPAWN", &open, None),
+            ("SPAWN_OFF", &off, None),
+            ("SPAWN_ERROR", &failed, None),
+            ("SPAWN_MODEL", &open, Some("sonnet")),
         ];
-        for (name, world) in cases {
+        for (name, world, model) in cases {
             for (text, kind) in [(false, "JSON"), (true, "TEXT")] {
                 let fixture = format!("{name}_{kind}");
                 assert_eq!(
-                    spawn_reply(&world(), text),
+                    spawn_reply(&world(), model, text),
                     (0, reply_fixture(&fixture)),
                     "{fixture}"
                 );
@@ -882,6 +888,22 @@ mod tests {
             (
                 2,
                 format!("code: 2\ncheck: policy\nmessage: {message}\nreason: screen: other mode")
+            )
+        );
+    }
+
+    #[test]
+    fn list_text_shows_the_model() {
+        let w = World::human("");
+        w.agent_record(ID, json!({"model": "sonnet"}));
+        w.panes(&["%9|@5|300|aaaaaaaaaaaa|worker"]);
+        let (code, out) = call(&w, &["list", "-Text"]);
+        assert_eq!(code, 0, "{out}");
+        assert_eq!(
+            out,
+            format!(
+                "running: 1\nworker  claude  %9  @5  brief  %1  {}  /work  1970-01-01T00:00:00.0000000Z  running  build it  task  0  0  sonnet",
+                crate::agents::fixture::SESSION_ID
             )
         );
     }

@@ -423,11 +423,15 @@ impl Launch<'_> {
         };
         let client = client_name(self.client);
         let context = context_name(agent.plan.context);
-        let record = json!({"schema": 1, "id": agent.id, "name": agent.name, "client": client,
+        let mut record = json!({"schema": 1, "id": agent.id, "name": agent.name, "client": client,
             "sessionId": agent.session, "context": context, "reason": agent.plan.reason,
             "session": caller.session, "pane": new_pane, "window": window, "parentPane": caller.pane,
             "parentAgent": parent_agent, "directory": utf8(&self.directory)?,
             "taskLine": doing_line(&self.task), "createdAt": utc_o(ctx.clock.now())});
+        // No model is the client's own.
+        if let Some(model) = self.model {
+            record["model"] = model.into();
+        }
         write_json(&agent.folder.join("record.json"), &record)?;
         // Last: only a committed agent is live.
         commit(ctx, &agent.folder)?;
@@ -440,6 +444,7 @@ impl Launch<'_> {
         reply.insert("sessionId".into(), agent.session.clone().into());
         reply.insert("context".into(), context.into());
         reply.insert("reason".into(), agent.plan.reason.into());
+        reply.insert("model".into(), self.model.unwrap_or("inherited").into());
         Ok(reply)
     }
 }
@@ -1727,7 +1732,7 @@ mod tests {
         assert_eq!(first["sidebar"], "%13");
         assert_eq!(
             keys(&first)[8..],
-            ["placement", "placementSource", "sidebar"]
+            ["model", "placement", "placementSource", "sidebar"]
         );
         assert_eq!(
             w.fakes.locks(),
@@ -1807,7 +1812,13 @@ mod tests {
             );
             assert_eq!(
                 keys(&ok)[8..],
-                ["placement", "placementSource", "sidebar", "sidebarError"],
+                [
+                    "model",
+                    "placement",
+                    "placementSource",
+                    "sidebar",
+                    "sidebarError"
+                ],
                 "{case}"
             );
             // The agent is live: committed, with its record.
@@ -2235,11 +2246,30 @@ mod tests {
                 "sessionId",
                 "context",
                 "reason",
+                "model",
                 "placement",
                 "placementSource",
                 "sidebar"
             ]
         );
+        assert_eq!(ok["model"], "inherited");
+        // A chosen model is recorded last and replied after reason; with none the record has no model.
+        let w = human();
+        let ok = reply(&run(
+            &w,
+            &["-Client", "claude", "-Task", "hi", "-Model", "sonnet"],
+        ));
+        assert_eq!(ok["model"], "sonnet");
+        let record = read_json(
+            &agents_dir(&w)
+                .join(ok["id"].as_str().unwrap())
+                .join("record.json"),
+        );
+        assert_eq!(
+            record.as_object().unwrap().keys().next_back().unwrap(),
+            "model"
+        );
+        assert_eq!(record["model"], "sonnet");
         // A record that cannot be written is never committed: the launch aborts and the pane closes, and no commit
         // was ever written.
         let commits = Rc::new(RefCell::new(0));

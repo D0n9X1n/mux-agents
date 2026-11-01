@@ -210,6 +210,8 @@ impl Rows<'_> {
         row.insert("doingFrom".into(), from);
         row.insert("age".into(), age.map_or(Value::Null, Value::from));
         row.insert("unread".into(), unread.into());
+        // Last, so the -Text columns before it keep their places; null is the client's own model.
+        row.insert("model".into(), field("model"));
         Ok(row)
     }
 }
@@ -297,7 +299,10 @@ mod tests {
         let w = World::human("");
         w.clock(NOW);
         let caller = w.caller();
-        w.agent_record(ID, json!({"createdAt": "2026-10-29T11:56:00.0000000Z"}));
+        w.agent_record(
+            ID,
+            json!({"createdAt": "2026-10-29T11:56:00.0000000Z", "model": "sonnet"}),
+        );
         w.agent_record(
             "bbbbbbbbbbbb",
             json!({"name": "idle", "pane": "%8", "client": "copilot", "taskLine": "",
@@ -318,14 +323,25 @@ mod tests {
         let before = tree(&w.state());
         w.fakes.clear_log();
         let reply = board(&w.ctx, &caller, "pane-1", false, false).unwrap();
-        let row = |name, client, pane, window, created, doing: Value, from: Value, age, unread| {
+        let row = |name,
+                   client,
+                   pane,
+                   window,
+                   created,
+                   doing: Value,
+                   from: Value,
+                   age,
+                   unread,
+                   model: Value| {
             json!({"name": name, "client": client, "pane": pane, "window": window, "context": "brief",
                 "parent": "%1", "sessionId": SESSION_ID, "directory": "/work", "createdAt": created,
-                "state": "running", "doing": doing, "doingFrom": from, "age": age, "unread": unread})
+                "state": "running", "doing": doing, "doingFrom": from, "age": age, "unread": unread,
+                "model": model})
         };
+        // A record without a model (the client's own) lists null.
         let want = json!({"running": 2, "agents": [
-            row("worker", "claude", "%9", "@6", "2026-10-29T11:56:00.0000000Z", json!("build it"), json!("task"), 240, 2),
-            row("idle", "copilot", "%8", "@7", "2026-10-29T11:59:55.0000000Z", Value::Null, Value::Null, 5, 1)
+            row("worker", "claude", "%9", "@6", "2026-10-29T11:56:00.0000000Z", json!("build it"), json!("task"), 240, 2, json!("sonnet")),
+            row("idle", "copilot", "%8", "@7", "2026-10-29T11:59:55.0000000Z", Value::Null, Value::Null, 5, 1, Value::Null)
         ]});
         // Compared as text: the order of keys is part of the reply.
         assert_eq!(Value::Object(reply).to_string(), want.to_string());
