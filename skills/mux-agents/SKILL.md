@@ -1,6 +1,6 @@
 ---
 name: mux-agents
-description: Terminal CLI only: needs a tmux or rmux pane. Start Claude Code or Copilot CLI agents in the current RMUX or tmux session with forked context, then list, focus, message and stop them.
+description: "Terminal CLI only: needs a tmux or rmux pane. Start Claude Code or Copilot CLI agents in the current RMUX or tmux session with forked context, then list, focus, message and stop them."
 ---
 
 ## When to use
