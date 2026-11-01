@@ -45,7 +45,7 @@ The commands below, and the Reply and Listen lines, run as-is in the Bash tool. 
 "<entry>" sidebar -Close
 ```
 
-`spawn` opens where `placement` says (a new window by default). It also takes `-Name <name>`, `-Split h|v` or `-Tab` (this spawn only, over the placement) and `-NoFork`.
+`spawn` opens where `placement` says (a new window by default). It also takes `-Name <name>`, `-Split h|v` or `-Tab` (this spawn only, over the placement) and `-NoFork`. Pass `-Model <model>` (for example `sonnet`, `opus` or `sonnet[1m]`) only when the user names a model; without it the agent uses its client's default.
 
 `list` shows each live agent's state, what it is doing and its unread count; `list -All` adds the ended agents (at most 10, newest first).
 
@@ -65,7 +65,7 @@ The commands below, and the Reply and Listen lines, run as-is in the Bash tool. 
 
 - `entry`: no usable `mux-agent` binary for this OS and architecture.
 - `sandbox`: the caller runs in a sandbox: `SANDBOX_RUNTIME=1`, a macOS sandbox, Linux `NoNewPrivs`, or a Windows token that is unreadable, AppContainer, restricted or below Medium integrity.
-- `policy`: the caller's live policy is unreadable or is neither bypass nor allow-all.
+- `policy`: the caller's live policy is unreadable or is neither bypass nor allow-all. For Claude Code, `reason` says whether the transcript or the screen failed and why (for example `screen: no mode line`).
 - `flags`: a flag outside the allowlist, or an unreadable command line, on any `claude` or `copilot` process from the agent up to the pane.
 - `directory`: the caller's launch directory cannot be confirmed.
 - `tagged`: a spawn or a side bar from an agent pane; children cannot spawn or open the side bar.
