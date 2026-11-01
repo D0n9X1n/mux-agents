@@ -8,7 +8,6 @@ use std::time::{Duration, SystemTime};
 use serde_json::{Map, Value};
 
 use crate::agents::board::board;
-use crate::agents::mail::mailbox_key;
 use crate::agents::spawn::{pane_env, utf8};
 use crate::agents::{lock, lock_key, pane_id, text};
 use crate::caller::{Caller, resolve};
@@ -911,8 +910,6 @@ pub fn run_watch(
     caller: &Caller,
     write: &mut dyn FnMut(&str) -> io::Result<()>,
 ) -> &'static str {
-    // The caller's pane is already a well-formed id, so this never fails.
-    let reader = mailbox_key(&caller.pane, &caller.agent_tag).unwrap_or_default();
     let own = format!("{}|", caller.pane);
     // watch draws only to a terminal (watch_on refuses otherwise).
     let look = Look::from_env(&ctx.env, true);
@@ -952,7 +949,7 @@ pub fn run_watch(
             }
         }
         let mut failed = live.is_none();
-        match board(ctx, caller, &reader, true, true) {
+        match board(ctx, caller, true, true) {
             Ok(board) => last = Some(board),
             Err(_) => failed = true,
         }
@@ -1026,9 +1023,7 @@ fn console_utf8() {}
 /// spawn's `ensure` never reopens a bar a returned -Close closed. Refused only from a tagged pane.
 pub fn sidebar(ctx: &Ctx, request: &Request) -> Res<Map<String, Value>> {
     let caller = resolve(ctx)?;
-    if !caller.agent_tag.is_empty() {
-        return refuse(2, "tagged", "an agent pane cannot open the side bar");
-    }
+    crate::agents::registry::untagged(ctx, &caller, "an agent pane cannot open the side bar")?;
     let close = request.switch("Close");
     lock(ctx, &lock_key("sidebar", &caller, &caller.session), || {
         let mut reply = Map::new();
@@ -3102,12 +3097,22 @@ mod tests {
         }
     }
 
+    // The agent snapshot's pane list, which proves the caller's pane is no agent's before the bar is touched (#48).
+    fn snapshot_list(call: &[String]) -> bool {
+        call[1] == "list-panes"
+            && call
+                .last()
+                .is_some_and(|f| f.contains("#{pane_start_command}"))
+    }
+
     // Calls on panes only: the session options' reads and writes are not counted.
     fn count(w: &World, verb: &str) -> usize {
         w.fakes
             .mux_calls()
             .iter()
-            .filter(|c| c[1] == verb && !c.iter().any(|a| a == OPTION || a == RECORD))
+            .filter(|c| {
+                c[1] == verb && !snapshot_list(c) && !c.iter().any(|a| a == OPTION || a == RECORD)
+            })
             .count()
     }
 
@@ -3135,7 +3140,7 @@ mod tests {
         w.fakes
             .mux_calls()
             .iter()
-            .filter(|c| c[1] != "display-message")
+            .filter(|c| c[1] != "display-message" && !snapshot_list(c))
             .map(|c| c.join(" "))
             .collect()
     }
@@ -3715,9 +3720,9 @@ mod tests {
         assert_eq!(
             w.fakes.locks(),
             [
-                format!("+sidebar|{key}|$3 display-message"),
+                format!("+sidebar|{key}|$3 display-message,list-panes"),
                 format!(
-                    "-sidebar|{key}|$3 display-message,set-option,show-options,list-panes,display-message,\
+                    "-sidebar|{key}|$3 display-message,list-panes,set-option,show-options,list-panes,display-message,\
                      split-window,if-shell,display-message,set-option,if-shell,display-message"
                 ),
             ]

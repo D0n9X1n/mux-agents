@@ -28,7 +28,7 @@ pub(crate) const CMDLINE_MAX: usize = 32767;
 const EXE_RESERVE: usize = 1024;
 const CAP: usize = 6;
 const MODEL_MAX: usize = 64;
-const PANE_FORMAT: &str = "#{pane_id}|#{window_id}";
+const PANE_FORMAT: &str = "#{pane_id}|#{window_id}|#{pane_start_command}";
 const ENTRY: &str =
     "mux-agent entry path may hold only letters, digits, spaces and _ \\ / : . ( ) -";
 
@@ -107,9 +107,7 @@ pub fn spawn(ctx: &Ctx, request: &Request) -> Res<Map<String, Value>> {
         return Err(usage("spawn"));
     }
     let caller = resolve(ctx)?;
-    if !caller.agent_tag.is_empty() {
-        return refuse(2, "tagged", "an agent pane cannot spawn agents");
-    }
+    registry::untagged(ctx, &caller, "an agent pane cannot spawn agents")?;
     // Relative files are the caller's; the task travels on the client command line, so it stays at 16 KB.
     let task = match (request.value("Task"), request.value("TaskFile")) {
         (Some(_), _) if caller.kind == Kind::Agent => {
@@ -239,24 +237,26 @@ impl Launch<'_> {
             &state.join("server.json"),
             &json!({"socket": caller.socket, "serverPid": caller.server_pid, "serverStart": caller.server_start}),
         )?;
-        // Every tagged pane counts, committed or not, so a launch in progress holds its place. Gone agents and dead
-        // panes are closed first, inside this spawn lock (never taken again), and the panes listed again after.
-        let mut live = registry::tagged(ctx, caller)?;
-        if registry::reap(ctx, caller, Some(&live), true)? {
-            live = registry::tagged(ctx, caller)?;
+        // Every own record whose pane is there counts, and every reservation (a tagged id with no own record here: a
+        // launch in progress, or another state root's agent), each id once. Gone agents and dead launches are closed
+        // first, inside this spawn lock (never taken again), and the panes listed again after.
+        let mut snapshot = registry::Snapshot::take(ctx, caller)?;
+        if registry::reap(ctx, caller, Some(&snapshot), true)? {
+            snapshot = registry::Snapshot::take(ctx, caller)?;
         }
-        if live.len() >= CAP {
+        if snapshot.count() >= CAP {
             return refuse(2, "cap", "the session already has 6 live agents");
         }
-        // Taken: the live panes' names and every recorded name of the session in this state root.
+        // Taken: every recorded name of the session in this state root, and the names reservations' tags carry.
         let recorded = registry::recorded_names(ctx, caller)?;
-        let taken: Vec<&str> = live
+        let reserved = snapshot.reserved_names();
+        let taken: Vec<&str> = recorded
             .iter()
-            .map(|p| p.name.as_str())
-            .chain(recorded.iter().map(String::as_str))
+            .chain(reserved.iter())
+            .map(String::as_str)
             .collect();
         let name = resolve_name(self.requested, self.client, &self.task, &taken)?;
-        let color = hue_for(ctx, caller, &live)?;
+        let color = hue_for(&snapshot);
         let mut plan = context_plan(caller, self.client, &ctx.env, self.no_fork);
         let session = guid()?;
         let id = hex_id()?;
@@ -298,19 +298,39 @@ impl Launch<'_> {
                 return Err(refusal);
             }
         };
-        let mut pane = None;
+        let mut pane: Option<Created> = None;
         self.start(&agent, &spec, &mut pane).or_else(|_| {
             // Each cleanup step runs on its own: a failing one skips none of the others and never hides the refusal.
             let at = utc_o(ctx.clock.now());
             let _ = write_json(
                 &agent.folder.join("abort.json"),
-                &json!({"abortedAt": at, "pane": pane}),
+                &json!({"abortedAt": at, "pane": pane.as_ref().map(|p| p.pane.clone())}),
             );
-            if let Some(pane) = &pane {
-                let _ = native(ctx, &["kill-pane", "-t", pane], true);
-            }
+            // Only the pane the creation reply named, while it is still that launch (live or dead), is killed; only
+            // a fresh probe showing it gone says it was closed.
+            let closed = pane
+                .as_ref()
+                .filter(|p| !p.command.is_empty())
+                .is_some_and(|p| {
+                    let launch = registry::Launch {
+                        command: p.command.clone(),
+                        pid: None,
+                    };
+                    let kill = registry::bound(
+                        &p.pane,
+                        launch.launched(),
+                        format!("kill-pane -t {}", p.pane),
+                    );
+                    let kill: Vec<&str> = kill.iter().map(String::as_str).collect();
+                    let _ = native(ctx, &kill, true);
+                    registry::pane_gone(ctx, &p.pane).unwrap_or(false)
+                });
             agent.remove_copy();
-            refuse(1, "launch", "the agent did not start; its pane was closed")
+            if closed {
+                refuse(1, "launch", "the agent did not start; its pane was closed")
+            } else {
+                refuse(1, "launch", "the agent did not start")
+            }
         })
     }
 
@@ -369,7 +389,7 @@ impl Launch<'_> {
         &self,
         agent: &Agent,
         spec: &Path,
-        pane: &mut Option<String>,
+        pane: &mut Option<Created>,
     ) -> Res<Map<String, Value>> {
         let (ctx, caller) = (self.ctx, self.caller);
         let session_target = format!("{}:", caller.session);
@@ -407,9 +427,20 @@ impl Launch<'_> {
             utf8(spec)?,
         ]);
         let created = native(ctx, &argv, false)?;
-        let (new_pane, window) = pane_and_window(&created.stdout)
+        let reply = created_pane(&created.stdout)
             .ok_or_else(|| Refusal::internal("rmux did not name the new pane"))?;
-        *pane = Some(new_pane.clone());
+        let (new_pane, window, start_command) = (
+            reply.pane.clone(),
+            reply.window.clone(),
+            reply.command.clone(),
+        );
+        *pane = Some(reply);
+        // The pane is the agent's only while it runs this exact command: none named, it is never the agent's.
+        if start_command.is_empty() {
+            return Err(Refusal::internal(
+                "rmux did not name the new pane's command",
+            ));
+        }
         let context = format!("{}:{}", context_name(agent.plan.context), agent.plan.reason);
         let tags = [
             ("@agent-id", agent.id.as_str()),
@@ -460,6 +491,8 @@ impl Launch<'_> {
             "parentAgent": parent_agent, "directory": utf8(&self.directory)?,
             "taskLine": doing_line(&self.task), "createdAt": utc_o(ctx.clock.now())});
         record["color"] = agent.color.into();
+        // The exact command the pane started, as the multiplexer renders it: the agent is the pane running it (#48).
+        record["startCommand"] = start_command.into();
         // No model is the client's own; a chosen one is the record's last field.
         if let Some(model) = self.model {
             record["model"] = model.into();
@@ -481,18 +514,16 @@ impl Launch<'_> {
     }
 }
 
-/// The new agent's identity hue (#37): the palette hue least used by the session's live agents (their recorded
-/// hue, else their name's), ties by palette order. Read under the spawn lock; a record that is not the session's
-/// own, or cannot be read, counts nothing.
-fn hue_for(ctx: &Ctx, caller: &Caller, live: &[registry::Pane]) -> Res<&'static str> {
+/// The new agent's identity hue (#37): the palette hue least used by the session's counted own agents (their
+/// recorded hue, else their name's), ties by palette order. Read under the spawn lock.
+fn hue_for(snapshot: &registry::Snapshot) -> &'static str {
     let mut used = [0usize; crate::paint::PALETTE.len()];
-    for pane in live {
-        let Some(record) = registry::record(ctx, caller, &pane.id).ok().flatten() else {
-            continue;
-        };
-        if record.get("session").and_then(Value::as_str) != Some(caller.session.as_str()) {
-            continue;
-        }
+    for agent in snapshot
+        .agents
+        .iter()
+        .filter(|a| a.class != registry::Class::Gone)
+    {
+        let record = &agent.record;
         let hue = crate::paint::identity(
             record.get("color").and_then(Value::as_str),
             &text(record.get("name")),
@@ -504,7 +535,7 @@ fn hue_for(ctx: &Ctx, caller: &Caller, live: &[registry::Pane]) -> Res<&'static 
     let least = (0..used.len())
         .min_by_key(|&at| (used[at], at))
         .unwrap_or(0);
-    Ok(crate::paint::PALETTE[least])
+    crate::paint::PALETTE[least]
 }
 
 /// commit.json, the last write: from here the agent is live.
@@ -548,14 +579,34 @@ fn private_folder(ctx: &Ctx, folder: &Path) -> Res<()> {
     Ok(())
 }
 
-/// `^(%\d+)\|(@\d+)$` after trailing CR and LF are cut.
-pub(crate) fn pane_and_window(stdout: &str) -> Option<(String, String)> {
-    let (pane, window) = stdout.trim_end_matches(['\r', '\n']).split_once('|')?;
+/// The new pane as its creation reply names it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Created {
+    pub pane: String,
+    pub window: String,
+    // `#{pane_start_command}`, as the multiplexer renders it; may be empty.
+    pub command: String,
+}
+
+/// `^(%\d+)\|(@\d+)\|(.*)$` after one final LF (and a CR before it) is cut: the start command runs to the end and may
+/// hold `|`, but no CR or LF (a reply of more than one line names no pane).
+pub(crate) fn created_pane(stdout: &str) -> Option<Created> {
+    let line = stdout.strip_suffix('\n').unwrap_or(stdout);
+    let line = line.strip_suffix('\r').unwrap_or(line);
+    if line.contains(['\r', '\n']) {
+        return None;
+    }
+    let mut parts = line.splitn(3, '|');
+    let (pane, window, command) = (parts.next()?, parts.next()?, parts.next()?);
     let numbered = |text: &str, mark: char| {
         text.strip_prefix(mark)
             .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
     };
-    (numbered(pane, '%') && numbered(window, '@')).then(|| (pane.into(), window.into()))
+    (numbered(pane, '%') && numbered(window, '@')).then(|| Created {
+        pane: pane.into(),
+        window: window.into(),
+        command: command.into(),
+    })
 }
 
 /// The client arguments after its flags. A Claude fork resumes and forks the parent into `session`; a Copilot fork
@@ -788,8 +839,18 @@ mod tests {
 
     // The session's bar is off, so a spawn opens none; `bar_on` keeps one.
     fn ready(w: World) -> World {
-        w.fakes.mux_rule("new-window", 0, "%9|@5\n", "");
-        w.fakes.mux_rule("split-window", 0, "%9|@5\n", "");
+        w.fakes.mux_rule(
+            "new-window",
+            0,
+            "%9|@5|/bin/mux-agent launcher /s/spec.json\n",
+            "",
+        );
+        w.fakes.mux_rule(
+            "split-window",
+            0,
+            "%9|@5|/bin/mux-agent launcher /s/spec.json\n",
+            "",
+        );
         w.fakes.mux_rule("@mux-agents-sidebar", 0, "off\n", "");
         w
     }
@@ -1000,7 +1061,7 @@ mod tests {
             full.extend(args);
             w.fakes.clear_log();
             assert_eq!(run(&w, &full), format!("2 usage {message}"), "{args:?}");
-            assert_eq!(verbs(&w), ["display-message"], "{args:?}");
+            assert_eq!(verbs(&w), ["display-message", "list-panes"], "{args:?}");
             assert!(!w.ctx.state_root.exists(), "{args:?}");
         }
         // At the limits, and with an empty brief, it spawns.
@@ -1165,7 +1226,7 @@ mod tests {
             run(&w, &["-Client", "claude", "-Task", "x"]),
             "2 usage agents pass free text only in files: use -TaskFile"
         );
-        assert_eq!(verbs(&w), ["display-message"]);
+        assert_eq!(verbs(&w), ["display-message", "list-panes"]);
         assert!(!w.ctx.state_root.exists());
     }
 
@@ -1268,7 +1329,7 @@ mod tests {
             let mut panes = Vec::new();
             for (n, color) in colors.iter().enumerate() {
                 let id = format!("{:012x}", 0xd00 + n);
-                w.agent_record(&id, json!({"name": format!("a{n}"), "color": color}));
+                w.agent_record(&id, json!({"name": format!("a{n}"), "color": color, "pane": format!("%{}", 30 + n)}));
                 panes.push(format!("%{}|@5|{}|{id}|a{n}", 30 + n, 330 + n));
             }
             w.panes(&panes.iter().map(String::as_str).collect::<Vec<_>>());
@@ -1277,7 +1338,10 @@ mod tests {
         // A ended (blue, not live) and B live (magenta): C gets blue.
         let w = human();
         ended(&w, "000000000e01", json!({"name": "a", "color": "blue"}));
-        w.agent_record("000000000e02", json!({"name": "b", "color": "magenta"}));
+        w.agent_record(
+            "000000000e02",
+            json!({"name": "b", "color": "magenta", "pane": "%31"}),
+        );
         w.panes(&["%31|@5|331|000000000e02|b"]);
         assert_eq!(spawn_color(&w), "blue");
         // Another session's record on a listed pane does not count; a live agent with no color counts its name's hue.
@@ -1767,7 +1831,7 @@ mod tests {
             "-d",
             "-P",
             "-F",
-            "#{pane_id}|#{window_id}",
+            "#{pane_id}|#{window_id}|#{pane_start_command}",
             "-t",
             "$3:",
             "-n",
@@ -1829,7 +1893,7 @@ mod tests {
                 &format!("-{split}"),
                 "-P",
                 "-F",
-                "#{pane_id}|#{window_id}",
+                "#{pane_id}|#{window_id}|#{pane_start_command}",
                 "-t",
                 "%1",
             ]
@@ -2014,7 +2078,12 @@ mod tests {
     // it. `open` says whether the bar is there.
     fn bar_on() -> (World, Rc<Cell<bool>>) {
         let w = World::human("");
-        w.fakes.mux_rule("new-window", 0, "%9|@5\n", "");
+        w.fakes.mux_rule(
+            "new-window",
+            0,
+            "%9|@5|/bin/mux-agent launcher /s/spec.json\n",
+            "",
+        );
         let exe = w.ctx.exe.display().to_string();
         w.fakes.process(crate::proc::Row {
             pid: 113,
@@ -2032,7 +2101,12 @@ mod tests {
             }
             Ok(Output {
                 code: 0,
-                stdout: if bar { "%13|@1|113\n" } else { "%9|@5\n" }.into(),
+                stdout: if bar {
+                    "%13|@1|113\n"
+                } else {
+                    "%9|@5|/bin/mux-agent launcher /s/spec.json\n"
+                }
+                .into(),
                 stderr: String::new(),
             })
         });
@@ -2197,7 +2271,12 @@ mod tests {
                     let bar = argv.last().is_some_and(|a| a == "watch");
                     Ok(Output {
                         code: i32::from(bar),
-                        stdout: if bar { "" } else { "%9|@5\n" }.into(),
+                        stdout: if bar {
+                            ""
+                        } else {
+                            "%9|@5|/bin/mux-agent launcher /s/spec.json\n"
+                        }
+                        .into(),
                         stderr: "no space for new pane\n".into(),
                     })
                 }),
@@ -2428,14 +2507,35 @@ mod tests {
 
     #[test]
     fn failure_after_launch_writes_abort_kills_pane() {
-        for kill in [0, 1] {
+        // The kill is bound to the creation reply's start command alone (the pane live or dead), and only a gone
+        // probe after it says the pane was closed.
+        let kill = [
+            "-N",
+            "if-shell",
+            "-F",
+            "-t",
+            "%9",
+            "#{==:#{pane_start_command},/bin/mux-agent launcher /s/spec.json}",
+            "kill-pane -t %9",
+        ]
+        .map(String::from)
+        .to_vec();
+        for (gone, want) in [
+            (
+                "|\n",
+                "1 launch the agent did not start; its pane was closed",
+            ),
+            ("%9|\n", "1 launch the agent did not start"),
+            ("", "1 launch the agent did not start"),
+        ] {
             let w = human();
             w.fakes.mux_first("set-option", 1, "", "no pane");
-            w.fakes.mux_first("kill-pane", kill, "", "");
+            w.fakes
+                .mux_first("-t %9 #{pane_id}|#{@agent-id}", 0, gone, "");
             assert_eq!(
                 run(&w, &["-Client", "claude", "-Task", "hi"]),
-                "1 launch the agent did not start; its pane was closed",
-                "{kill}"
+                want,
+                "{gone:?}"
             );
             let folder = agents_dir(&w).join(&agent_folders(&w)[0]);
             assert_eq!(
@@ -2444,24 +2544,40 @@ mod tests {
             );
             assert!(!folder.join("record.json").exists() && !folder.join("commit.json").exists());
             assert_eq!(
-                calls(&w, "kill-pane"),
-                [["-N", "kill-pane", "-t", "%9"].map(String::from).to_vec()]
+                calls(&w, "if-shell"),
+                std::slice::from_ref(&kill),
+                "{gone:?}"
             );
+            assert!(calls(&w, "kill-pane").is_empty(), "{gone:?}");
         }
+        // A reply naming the pane but no start command: never the agent's, so it is not killed and not claimed.
+        let w = human();
+        w.fakes.mux_first("new-window", 0, "%9|@5|\n", "");
+        assert_eq!(
+            run(&w, &["-Client", "claude", "-Task", "hi"]),
+            "1 launch the agent did not start"
+        );
+        let folder = agents_dir(&w).join(&agent_folders(&w)[0]);
+        assert_eq!(
+            std::fs::read_to_string(folder.join("abort.json")).unwrap(),
+            r#"{"abortedAt":"1970-01-01T00:00:00.0000000Z","pane":"%9"}"#
+        );
+        assert!(calls(&w, "if-shell").is_empty() && calls(&w, "set-option").is_empty());
         // A failed or garbled launch names no pane: abort.json says null and nothing is killed or tagged.
         for (code, out) in [
-            (1, "%9|@5\n"),
+            (1, "%9|@5|/bin/mux-agent launcher /s/spec.json\n"),
             (0, ""),
-            (0, "%9|@5\n%10|@6\n"),
+            (0, "%9|@5|/bin/mux-agent launcher /s/spec.json\n%10|@6\n"),
+            (0, "%9|@5\n"),
             (0, "%9|@5;kill-server\n"),
-            (0, "#{pane_id}|@5\n"),
-            (0, "%9 |@5\n"),
+            (0, "#{pane_id}|@5|x\n"),
+            (0, "%9 |@5|x\n"),
         ] {
             let w = human();
             w.fakes.mux_first("new-window", code, out, "");
             assert_eq!(
                 run(&w, &["-Client", "claude", "-Task", "hi"]),
-                "1 launch the agent did not start; its pane was closed",
+                "1 launch the agent did not start",
                 "{out:?}"
             );
             let folder = agents_dir(&w).join(&agent_folders(&w)[0]);
@@ -2469,13 +2585,23 @@ mod tests {
                 std::fs::read_to_string(folder.join("abort.json")).unwrap(),
                 r#"{"abortedAt":"1970-01-01T00:00:00.0000000Z","pane":null}"#
             );
-            assert!(calls(&w, "kill-pane").is_empty() && calls(&w, "set-option").is_empty());
+            assert!(calls(&w, "if-shell").is_empty() && calls(&w, "set-option").is_empty());
         }
-        // A CRLF line end is not garbled.
+        // A CRLF line end is not garbled, and the start command may hold `|`; record.json keeps it exactly.
         let w = human();
-        w.fakes.mux_first("new-window", 0, "%9|@5\r\n", "");
+        w.fakes.mux_first(
+            "new-window",
+            0,
+            "%9|@5|/b/mux|agent launcher /s/spec.json\r\n",
+            "",
+        );
         let ok = reply(&run(&w, &["-Client", "claude", "-Task", "hi"]));
         assert_eq!((&ok["pane"], &ok["window"]), (&json!("%9"), &json!("@5")));
+        let folder = agents_dir(&w).join(&agent_folders(&w)[0]);
+        assert_eq!(
+            read_json(&folder.join("record.json"))["startCommand"],
+            "/b/mux|agent launcher /s/spec.json"
+        );
         // A Copilot fork's copy is deleted when the launch fails, and kept when it commits.
         for fail in [true, false] {
             let mut w = agent();
@@ -2508,10 +2634,7 @@ mod tests {
                 .collect();
             sessions.sort();
             if fail {
-                assert_eq!(
-                    text,
-                    "1 launch the agent did not start; its pane was closed"
-                );
+                assert_eq!(text, "1 launch the agent did not start");
                 assert_eq!(sessions, [OLD]);
             } else {
                 let ok = reply(&text);
@@ -2547,7 +2670,7 @@ mod tests {
             let _ = &dir;
             Ok(Output {
                 code: 0,
-                stdout: "%9|@5\n".into(),
+                stdout: "%9|@5|/bin/mux-agent launcher /s/spec.json\n".into(),
                 stderr: String::new(),
             })
         });
@@ -2647,7 +2770,8 @@ mod tests {
             "sessionId": ok["sessionId"], "context": "brief", "reason": "human", "session": "$3",
             "pane": "%9", "window": "@5", "parentPane": "%1", "parentAgent": null,
             "directory": w.ctx.cwd.to_str().unwrap(), "taskLine": "hi",
-            "createdAt": "1970-01-01T00:00:00.0000000Z", "color": "blue"});
+            "createdAt": "1970-01-01T00:00:00.0000000Z", "color": "blue",
+            "startCommand": "/bin/mux-agent launcher /s/spec.json"});
         assert_eq!(
             std::fs::read_to_string(folder.join("record.json")).unwrap(),
             record.to_string()
@@ -2705,13 +2829,15 @@ mod tests {
             }
             Ok(Output::default())
         });
+        w.fakes
+            .mux_first("-t %9 #{pane_id}|#{@agent-id}", 0, "|\n", "");
         assert_eq!(
             run(&w, &["-Client", "claude", "-Task", "hi"]),
             "1 launch the agent did not start; its pane was closed"
         );
         let folder = agents_dir(&w).join(&agent_folders(&w)[0]);
         assert!(folder.join("abort.json").is_file() && !folder.join("commit.json").exists());
-        assert_eq!(calls(&w, "kill-pane").len(), 1);
+        assert_eq!(calls(&w, "if-shell").len(), 1);
         assert_eq!(*commits.borrow(), 0);
         commit_probe(None);
     }

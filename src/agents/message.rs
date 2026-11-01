@@ -7,8 +7,8 @@ use std::time::{Duration, SystemTime};
 
 use serde_json::{Map, Value, json};
 
-use super::mail::{add_mail, doing_line, mailbox_key, message_text, read_mail};
-use super::registry::{self, Notice, add_notice, find_pane, reap, self_of};
+use super::mail::{add_mail, doing_line, message_text, read_mail};
+use super::registry::{self, Notice, add_notice, reap, self_of};
 use super::view::first;
 use super::{FILES_ONLY, lock, lock_key, pane_id, server_dir, text, usage};
 use crate::caller::{Kind, resolve};
@@ -36,8 +36,14 @@ pub fn send(ctx: &Ctx, request: &Request) -> Res<Map<String, Value>> {
     if body.len() as u64 > BODY_MAX {
         return refuse(2, "usage", "the message is larger than 64 KB");
     }
-    let me = self_of(ctx, &caller)?;
     let target = first(request);
+    // A malformed name refuses before any pane is listed.
+    if target != "parent" && !pane_id(target) && !super::agent_name(target) {
+        return refuse(2, "target", "no live agent has that name");
+    }
+    // One snapshot names the sender and the recipient; a tag never names either.
+    let snapshot = registry::Snapshot::take(ctx, &caller)?;
+    let me = self_of(&caller, &snapshot)?;
     let pane = if target == "parent" {
         match &me.record {
             Some(record) => text(record.get("parentPane")),
@@ -46,27 +52,33 @@ pub fn send(ctx: &Ctx, request: &Request) -> Res<Map<String, Value>> {
     } else if pane_id(target) {
         target.to_string()
     } else {
-        find_pane(ctx, &caller, target)?.pane
+        if !super::agent_name(target) {
+            return refuse(2, "target", "no live agent has that name");
+        }
+        match snapshot.find(target) {
+            Some(agent) => agent.pane,
+            None => return refuse(2, "target", "no live agent has that name"),
+        }
     };
+    // The pane must be a live pane of this session; its mailbox is the running agent's there, else `pane-<n>`.
     let probe = native(
         ctx,
         &["display-message", "-p", "-t", &pane, RECIPIENT],
         true,
     )?;
-    // `^(\$\d+)\|(.*)$` after trailing CR and LF are cut: the tag runs to the end and holds no LF.
     let line = probe.stdout.trim_end_matches(['\r', '\n']);
-    let recipient = (probe.code == 0 && !line.contains('\n'))
-        .then(|| line.split_once('|'))
-        .flatten()
-        .filter(|(session, _)| *session == caller.session && pane_session(session));
-    let Some((_, tag)) = recipient else {
+    let live = probe.code == 0
+        && line.split_once('|').is_some_and(|(at, session)| {
+            at == pane && session == caller.session && pane_session(session)
+        });
+    if !live {
         return refuse(
             2,
             "target",
             "the recipient is not a live pane of this session",
         );
-    };
-    let key = mailbox_key(&pane, tag)?;
+    }
+    let key = registry::mailbox_of(&snapshot, &pane)?;
     let deliver = || {
         let id = add_mail(ctx, &caller, &key, &me.name, &caller.pane, &body, None)?;
         if me.record.is_some() {
@@ -96,7 +108,7 @@ pub fn send(ctx: &Ctx, request: &Request) -> Res<Map<String, Value>> {
     Ok(reply)
 }
 
-const RECIPIENT: &str = "#{session_id}|#{@agent-id}";
+const RECIPIENT: &str = "#{pane_id}|#{session_id}";
 
 fn pane_session(text: &str) -> bool {
     text.strip_prefix('$')
@@ -138,33 +150,24 @@ pub fn read(ctx: &Ctx, request: &Request) -> Res<Map<String, Value>> {
     let mut reply = Map::new();
     if named {
         let pane = registry::find_reaped(ctx, &caller, first(request))?;
-        let start = format!("-{lines}");
-        let captured = native(
-            ctx,
-            &["capture-pane", "-p", "-J", "-t", &pane.pane, "-S", &start],
-            false,
-        )?;
-        let all: Vec<&str> = captured
-            .stdout
-            .trim_end_matches(['\r', '\n'])
-            .split('\n')
-            .map(|line| line.strip_suffix('\r').unwrap_or(line))
-            .collect();
-        let tail = all[all.len().saturating_sub(lines as usize)..].join("\n");
+        let tail = capture(ctx, &pane, lines)?;
         reply.insert("name".into(), pane.name.into());
         reply.insert("pane".into(), pane.pane.into());
         reply.insert("text".into(), tail.into());
         return Ok(reply);
     }
-    let me = self_of(ctx, &caller)?;
+    // One snapshot names the reader and serves the first reap.
+    let snapshot = registry::Snapshot::take(ctx, &caller)?;
+    let me = self_of(&caller, &snapshot)?;
     // Removed on every return, mail, timeout or error, when this guard drops.
     let _waiting = match &me.record {
         Some(_) if wait > 0 => Waiting::start(ctx, &caller, &me.key),
         _ => None,
     };
     let deadline = ctx.clock.now() + Duration::from_secs(wait as u64);
+    let mut first_pass = Some(snapshot);
     let messages = loop {
-        reap(ctx, &caller, None, false)?;
+        reap(ctx, &caller, first_pass.take().as_ref(), false)?;
         let messages = read_mail(ctx, &caller, &me.key)?;
         if !messages.is_empty() || ctx.clock.now() >= deadline {
             break messages;
@@ -177,6 +180,32 @@ pub fn read(ctx: &Ctx, request: &Request) -> Res<Map<String, Value>> {
         Value::Array(messages.into_iter().map(Value::Object).collect()),
     );
     Ok(reply)
+}
+
+/// The last `lines` lines of a running agent's pane, captured by the server into a private buffer only while the
+/// pane is still its live launch (one `if-shell`), then read and deleted. No buffer (the check failed) refuses 2
+/// `target`: a pane replaced in between is never read.
+fn capture(ctx: &Ctx, pane: &registry::Pane, lines: i32) -> Res<String> {
+    let buffer = format!("mux-agents-{}", crate::util::guid()?.replace('-', ""));
+    let p = pane.pane.as_str();
+    let command = format!("capture-pane -J -t {p} -b {buffer} -S -{lines}");
+    let argv = registry::bound(p, pane.launch.live(), command);
+    let argv: Vec<&str> = argv.iter().map(String::as_str).collect();
+    let captured =
+        native(ctx, &argv, true).and_then(|_| native(ctx, &["show-buffer", "-b", &buffer], true));
+    // Always, whatever happened: a buffer left behind would hold the pane's text.
+    let _ = native(ctx, &["delete-buffer", "-b", &buffer], true);
+    let captured = captured?;
+    if captured.code != 0 {
+        return refuse(2, "target", "the agent's pane is no longer its launch");
+    }
+    let all: Vec<&str> = captured
+        .stdout
+        .trim_end_matches(['\r', '\n'])
+        .split('\n')
+        .map(|line| line.strip_suffix('\r').unwrap_or(line))
+        .collect();
+    Ok(all[all.len().saturating_sub(lines as usize)..].join("\n"))
 }
 
 /// `agents/<id>/waiting-<pid>.json`: the agent's `read -Wait` run by process `pid` (S2.4).
@@ -284,6 +313,8 @@ impl Drop for Waiting<'_> {
 
 const POLL: Duration = Duration::from_millis(500);
 const TREE_MAX: usize = 256;
+const NOT_ITS_LAUNCH: &str =
+    "the agent's pane is no longer its own launch, so nothing was closed or signalled";
 
 /// Closes a live agent's pane, then stops any survivor of the pane's process tree (same pid and start only). Its
 /// parent or a human may stop it. Posts the `stopped` notice and returns the resume command. Runs a reap first. A
@@ -297,7 +328,8 @@ pub fn stop(ctx: &Ctx, request: &Request) -> Res<Map<String, Value>> {
     if !super::agent_name(name) {
         return none();
     }
-    let live = registry::live_after_reap(ctx, &caller)?;
+    let snapshot = registry::live_after_reap(ctx, &caller)?;
+    let live = snapshot.running();
     let Some(pane) = live.iter().find(|p| p.name == name).cloned() else {
         return match super::board::newest_ended(ctx, &caller, &live, name)? {
             Some((_, record, state)) => {
@@ -308,9 +340,7 @@ pub fn stop(ctx: &Ctx, request: &Request) -> Res<Map<String, Value>> {
             None => none(),
         };
     };
-    let Some(record) = registry::record(ctx, &caller, &pane.id)? else {
-        return none();
-    };
+    let record = pane.record.clone();
     parent_or_human(&caller, &record)?;
     let folder = server_dir(ctx, &caller).join("agents").join(&pane.id);
     let launcher = folder.join("launcher.json");
@@ -327,6 +357,13 @@ pub fn stop(ctx: &Ctx, request: &Request) -> Res<Map<String, Value>> {
             .pid
             .parse()
             .map_err(|_| Refusal::internal("the pane pid is not a number"))?;
+        // A 0.2.x record (no startCommand) is its launch only while its launcher is proven: checked again here,
+        // before any kill.
+        if let Some(pid) = pane.launch.pid
+            && (pid != root || !registry::proven_launcher(ctx, &caller, &pane.id, pid))
+        {
+            return refuse(1, "target", NOT_ITS_LAUNCH);
+        }
         let table = ctx.os.table()?;
         // The pane's process must be the agent's own launcher: launcher.json's pid and start, the table's start, and
         // the start of the process the pid opens now, all one. A launcher that never recorded itself, or a pane pid
@@ -376,7 +413,19 @@ pub fn stop(ctx: &Ctx, request: &Request) -> Res<Map<String, Value>> {
                 }
             }
         }
-        native(ctx, &["kill-pane", "-t", &pane.pane], true)?;
+        // The server kills the pane only while it is still this live launch, in the same command; a fresh probe then
+        // decides. Not proven gone (replaced in between, or the probe failed): nothing is signalled, nothing noticed.
+        let kill = registry::bound(
+            &pane.pane,
+            pane.launch.live(),
+            format!("kill-pane -t {}", pane.pane),
+        );
+        let kill: Vec<&str> = kill.iter().map(String::as_str).collect();
+        let _ = native(ctx, &kill, true);
+        if !registry::pane_gone(ctx, &pane.pane).unwrap_or(false) {
+            drop(held);
+            return refuse(1, "target", NOT_ITS_LAUNCH);
+        }
         for opened in held {
             let pid = opened.pid;
             if !ctx.os.kill(opened) {
@@ -480,7 +529,7 @@ fn tree(table: &[Row], root: u32) -> Vec<&Row> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agents::fixture::{CLAUDE, ID, SESSION_ID, World, write};
+    use crate::agents::fixture::{CLAUDE, ID, SESSION_ID, World, launch_command, write};
     use crate::agents::lock_key;
     use crate::agents::view::focus;
     use crate::testing;
@@ -488,7 +537,7 @@ mod tests {
 
     type Handler = fn(&Ctx, &Request) -> Res<Map<String, Value>>;
 
-    const PROBE: &str = "#{session_id}|#{@agent-id}";
+    const PROBE: &str = "#{pane_id}|#{session_id}";
     const NONE: &str = "2 target no live agent has that name";
 
     fn run(w: &World, handler: Handler, args: &[&str]) -> String {
@@ -564,7 +613,7 @@ mod tests {
         w.panes(&["%9|@5|300|aaaaaaaaaaaa|worker"]);
         w.fakes.clear_log();
         assert_eq!(run(&w, stop, &["stop", "worker"]), NONE);
-        assert!(!mux_verbs(&w).iter().any(|v| v == "kill-pane"));
+        assert!(pane_kills(&w).is_empty());
     }
 
     #[test]
@@ -575,8 +624,8 @@ mod tests {
             run(&w, send, &["send", "parent", "-Body", "x"]),
             "2 parent only an agent has a parent"
         );
-        // No recipient probe, nothing written.
-        assert_eq!(mux_verbs(&w), ["display-message"]);
+        // One pane list names the sender; no recipient probe, nothing written.
+        assert_eq!(mux_verbs(&w), ["display-message", "list-panes"]);
         assert!(!w.ctx.state_root.exists());
     }
 
@@ -587,7 +636,7 @@ mod tests {
             let w = World::human(tag);
             w.agent_record(ID, json!({}));
             w.panes(&["%9|@5|300|aaaaaaaaaaaa|worker"]);
-            w.fakes.mux_first(PROBE, 0, "$3|\n", "");
+            w.recipients_live();
             for args in [
                 &["send", "parent", "-Body", "x"][..],
                 &["send", "%1", "-Body", "x"],
@@ -612,11 +661,13 @@ mod tests {
         }
     }
 
-    // An agent pane %1 with its record, tagged ID, whose parent is %4; the recipient probe answers session $3.
+    // An agent pane %1, running agent ID by its record and launch, whose parent is %4; the recipient probe answers
+    // every pane live in session $3.
     fn agent_world() -> World {
         let w = World::agent(ID);
         w.agent_record(ID, json!({"pane": "%1", "parentPane": "%4"}));
-        w.fakes.mux_first(PROBE, 0, "$3|\n", "");
+        w.panes(&["%1|@1|100|aaaaaaaaaaaa|worker"]);
+        w.recipients_live();
         w
     }
 
@@ -649,7 +700,7 @@ mod tests {
         assert_eq!(messages, ["ok"]);
         // A human may pass -Body.
         let w = World::human("");
-        w.fakes.mux_first(PROBE, 0, "$3|\n", "");
+        w.recipients_live();
         assert!(run(&w, send, &["send", "%1", "-Body", "hi"]).starts_with("ok "));
     }
 
@@ -671,7 +722,7 @@ mod tests {
     #[test]
     fn send_64kb_limit() {
         let w = World::human("");
-        w.fakes.mux_first(PROBE, 0, "$3|\n", "");
+        w.recipients_live();
         let big = "the message is larger than 64 KB";
         let send_body = |body: &str| {
             let args = ["send", "%1", "-Body", body];
@@ -701,14 +752,15 @@ mod tests {
     fn send_target_other_session_refuses() {
         let refused = "2 target the recipient is not a live pane of this session";
         for (code, out) in [
-            (0, "$4|\n"),
-            (1, "$3|\n"),
+            (0, "%5|$4\n"),
+            (1, "%5|$3\n"),
             (0, ""),
             (0, "|\n"),
-            (0, "$3\n"),
-            (0, "$3|\nmore\n"),
-            (0, "$03|\n"),
-            (0, "3|\n"),
+            (0, "%5\n"),
+            (0, "%6|$3\n"),
+            (0, "%5|$3\nmore\n"),
+            (0, "%5|$03|\n"),
+            (0, "%5|3\n"),
         ] {
             let w = World::human("");
             w.fakes.mux_first(PROBE, code, out, "");
@@ -719,22 +771,25 @@ mod tests {
             );
             assert!(!w.ctx.state_root.exists(), "{out:?}");
         }
-        // The probe goes to the named pane; an agent pane's mailbox is its id, any other is pane-<n>.
+        // The probe goes to the named pane and never reads a tag; a running agent's pane is its id's mailbox, any
+        // other pane (whatever tag it carries) is pane-<n>.
         let w = World::human("");
-        w.fakes.mux_first(PROBE, 0, "$3|bbbbbbbbbbbb\r\n", "");
+        w.agent_record("bbbbbbbbbbbb", json!({"pane": "%5"}));
+        w.panes(&["%5|@5|300|cccccccccccc|other", "%6|@5|301|bbbbbbbbbbbb|w"]);
+        w.recipients_live();
         w.fakes.clear_log();
         assert!(
             run(&w, send, &["send", "%5", "-Body", "x"])
                 .starts_with(r#"ok {"to":"%5","pane":"%5""#)
         );
         assert_eq!(
-            w.fakes.mux_calls()[1],
+            w.fakes.mux_calls()[2],
             ["-N", "display-message", "-p", "-t", "%5", PROBE]
         );
         assert_eq!(read_mail_of(&w, "bbbbbbbbbbbb"), ["x"]);
-        w.fakes.mux_first(PROBE, 0, "$3|\n", "");
-        run(&w, send, &["send", "%5", "-Body", "y"]);
-        assert_eq!(read_mail_of(&w, "pane-5"), ["y"]);
+        run(&w, send, &["send", "%6", "-Body", "y"]);
+        assert_eq!(read_mail_of(&w, "pane-6"), ["y"]);
+        assert!(read_mail_of(&w, "cccccccccccc").is_empty());
     }
 
     #[test]
@@ -766,7 +821,7 @@ mod tests {
         );
         // A human sender takes only the recipient's mail lock.
         let w = World::human("");
-        w.fakes.mux_first(PROBE, 0, "$3|\n", "");
+        w.recipients_live();
         let mail = lock_key("mail", &w.caller(), "pane-1");
         w.fakes.clear_log();
         run(&w, send, &["send", "%1", "-Body", "x"]);
@@ -799,7 +854,7 @@ mod tests {
         assert_eq!(read_mail_of(&w, "pane-4").last().unwrap(), "still");
         // A human writes none.
         let w = World::human("");
-        w.fakes.mux_first(PROBE, 0, "$3|\n", "");
+        w.recipients_live();
         run(&w, send, &["send", "%1", "-Body", "x"]);
         let agents = w.state().join("agents");
         assert_eq!(std::fs::read_dir(agents).unwrap().count(), 0);
@@ -818,7 +873,7 @@ mod tests {
         assert!(w.fakes.mux_calls().is_empty());
         // .NET's int.TryParse: a sign and white space around are fine.
         for wait in ["0", "600", "+5", " 7 ", "-0"] {
-            w.fakes.mux_first(PROBE, 0, "$3|\n", "");
+            w.recipients_live();
             run(&w, send, &["send", "%1", "-Body", "m"]);
             let reply = run(&w, read, &["read", "-Wait", wait]);
             assert!(reply.contains("\\nm\""), "{wait:?} {reply}");
@@ -851,7 +906,9 @@ mod tests {
                 "list-panes",
                 "display-message",
                 "list-panes",
-                "capture-pane"
+                "if-shell",
+                "show-buffer",
+                "delete-buffer"
             ]
         );
         let notice = w.folder("bbbbbbbbbbbb").join("notice.json");
@@ -882,11 +939,16 @@ mod tests {
         assert_eq!(run(&w, read, &["read", "-Lines", "5"]), usage);
         assert!(w.fakes.mux_calls().is_empty());
         w.fakes
-            .mux_first("capture-pane", 0, "one\r\ntwo\n\nthree\r\n\n", "");
+            .mux_first("show-buffer", 0, "one\r\ntwo\n\nthree\r\n\n", "");
         assert_eq!(
             run(&w, read, &["read", "worker", "-Lines", "2"]),
             r#"ok {"name":"worker","pane":"%9","text":"\nthree"}"#
         );
+        let live = registry::Launch {
+            command: launch_command("%9"),
+            pid: None,
+        }
+        .live();
         for (args, s) in [
             (&["read", "worker"][..], "-60"),
             (&["read", "worker", "-Lines", "2000"], "-2000"),
@@ -894,16 +956,36 @@ mod tests {
         ] {
             w.fakes.clear_log();
             assert!(run(&w, read, args).starts_with("ok "));
+            // Captured by the server only while %9 is still its live launch, into a private buffer that is read and
+            // then deleted.
+            let calls = w.fakes.mux_calls();
+            let n = calls.len();
+            let capture = &calls[n - 3];
             assert_eq!(
-                w.fakes.mux_calls().last().unwrap(),
-                &["-N", "capture-pane", "-p", "-J", "-t", "%9", "-S", s]
+                capture[..6],
+                ["-N", "if-shell", "-F", "-t", "%9", live.as_str()]
             );
+            let command: Vec<&str> = capture[6].split(' ').collect();
+            assert_eq!(command[..4], ["capture-pane", "-J", "-t", "%9"]);
+            assert_eq!((command[4], command[6], command[7]), ("-b", "-S", s));
+            let buffer = command[5];
+            assert!(
+                buffer
+                    .strip_prefix("mux-agents-")
+                    .is_some_and(|h| h.len() == 32),
+                "{buffer}"
+            );
+            assert_eq!(calls[n - 2], ["-N", "show-buffer", "-b", buffer]);
+            assert_eq!(calls[n - 1], ["-N", "delete-buffer", "-b", buffer]);
         }
-        w.fakes.mux_first("capture-pane", 1, "", "SECRET");
+        // No buffer (the pane was not its launch when the server checked): nothing read, the buffer still deleted.
+        w.fakes.mux_first("show-buffer", 1, "", "no buffer");
+        w.fakes.clear_log();
         assert_eq!(
             run(&w, read, &["read", "worker"]),
-            "1 rmux rmux call failed"
+            "2 target the agent's pane is no longer its launch"
         );
+        assert_eq!(mux_verbs(&w).last().unwrap(), "delete-buffer");
     }
 
     #[test]
@@ -947,7 +1029,68 @@ mod tests {
             json!({"pid": 300, "start": 3000, "startedAt": "x"}),
         );
         w.panes(&["%9|@5|300|bbbbbbbbbbbb|worker"]);
+        emulate_pane9(&w, &launch_command("%9"));
         w
+    }
+
+    // The multiplexer's pane %9: live, running `command` (shared, so a test can replace it); a conditional kill takes
+    // it only when its condition is %9's live launch as it is now, and the gone probe then answers empty fields.
+    fn emulate_pane9(w: &World, command: &str) -> std::rc::Rc<std::cell::RefCell<Option<String>>> {
+        let pane = std::rc::Rc::new(std::cell::RefCell::new(Some(command.to_string())));
+        let state = pane.clone();
+        w.fakes.mux_script("if-shell", move |argv| {
+            let mut held = state.borrow_mut();
+            let holds = held.as_ref().is_some_and(|command| {
+                let launch = registry::Launch {
+                    command: command.clone(),
+                    pid: None,
+                };
+                argv[5] == launch.live()
+            });
+            if holds && argv[6] == "kill-pane -t %9" {
+                *held = None;
+            }
+            Ok(crate::mux::Output::default())
+        });
+        let state = pane.clone();
+        w.fakes
+            .mux_script("-t %9 #{pane_id}|#{@agent-id}", move |_| {
+                let stdout = if state.borrow().is_some() {
+                    "%9|bbbbbbbbbbbb\n"
+                } else {
+                    "|\n"
+                };
+                Ok(crate::mux::Output {
+                    code: 0,
+                    stdout: stdout.into(),
+                    stderr: String::new(),
+                })
+            });
+        pane
+    }
+
+    // The conditional kill of %9 as the multiplexer receives it: only while it is still its live launch.
+    fn kill9() -> Vec<String> {
+        let launch = registry::Launch {
+            command: launch_command("%9"),
+            pid: None,
+        };
+        let mut argv = vec!["-N".to_string()];
+        argv.extend(registry::bound(
+            "%9",
+            launch.live(),
+            "kill-pane -t %9".into(),
+        ));
+        argv
+    }
+
+    // Every kill of a pane sent to the multiplexer.
+    fn pane_kills(w: &World) -> Vec<Vec<String>> {
+        w.fakes
+            .mux_calls()
+            .into_iter()
+            .filter(|c| c[1] == "kill-pane" || c.last().is_some_and(|a| a.starts_with("kill-pane")))
+            .collect()
     }
 
     // The table, open and kill calls of the stop walk; resolve's opens of the server and the caller's agent are
@@ -1013,15 +1156,16 @@ mod tests {
         // OS and multiplexer calls in one order: the last open, then kill-pane, then the first kill.
         let events = w.fakes.events();
         let at = |event: &str| events.iter().position(|e| e == event).expect(event);
-        assert!(at("open 321") < at("mux -N kill-pane -t %9"), "{events:?}");
-        assert!(at("mux -N kill-pane -t %9") < at("kill 300"), "{events:?}");
+        let kill_event = format!("mux {}", kill9().join(" "));
+        assert!(at("open 321") < at(&kill_event), "{events:?}");
+        assert!(at(&kill_event) < at("kill 300"), "{events:?}");
         let kill_pane: Vec<_> = w
             .fakes
             .mux_calls()
             .into_iter()
-            .filter(|c| c[1] == "kill-pane")
+            .filter(|c| c.last().is_some_and(|a| a.starts_with("kill-pane")))
             .collect();
-        assert_eq!(kill_pane, [["-N", "kill-pane", "-t", "%9"]]);
+        assert_eq!(kill_pane, [kill9()]);
         let notice = lock_key("notice", &caller, "bbbbbbbbbbbb");
         let mail = lock_key("mail", &caller, "pane-1");
         assert_eq!(
@@ -1086,7 +1230,7 @@ mod tests {
             w.fakes.clear_log();
             assert_eq!(run(&w, stop, &["stop", "worker"]), NONE, "{pid}");
             assert!(proc_calls(&w).is_empty(), "{pid}");
-            assert!(!mux_verbs(&w).iter().any(|v| v == "kill-pane"), "{pid}");
+            assert!(pane_kills(&w).is_empty(), "{pid}");
         }
         // The pane pid was reused (another start than launcher.json's), or launcher.json names another pid or
         // none: only the pane is closed, and its tree is left as survivors.
@@ -1116,9 +1260,9 @@ mod tests {
                 .fakes
                 .mux_calls()
                 .into_iter()
-                .filter(|c| c[1] == "kill-pane")
+                .filter(|c| c.last().is_some_and(|a| a.starts_with("kill-pane")))
                 .collect();
-            assert_eq!(kill_pane, [["-N", "kill-pane", "-t", "%9"]], "{launcher:?}");
+            assert_eq!(kill_pane, [kill9()], "{launcher:?}");
             assert_eq!(read_mail_of(&w, "pane-1"), ["worker was stopped."]);
         }
     }
@@ -1146,9 +1290,9 @@ mod tests {
                 .fakes
                 .mux_calls()
                 .into_iter()
-                .filter(|c| c[1] == "kill-pane")
+                .filter(|c| c.last().is_some_and(|a| a.starts_with("kill-pane")))
                 .collect();
-            assert_eq!(kill_pane, [["-N", "kill-pane", "-t", "%9"]], "{opened:?}");
+            assert_eq!(kill_pane, [kill9()], "{opened:?}");
             assert_eq!(read_mail_of(&w, "pane-1"), ["worker was stopped."]);
         }
     }
@@ -1257,7 +1401,7 @@ mod tests {
             "2 parent only the parent or a human can stop this agent"
         );
         assert!(proc_calls(&w).is_empty());
-        assert!(!mux_verbs(&w).iter().any(|v| v == "kill-pane"));
+        assert!(pane_kills(&w).is_empty());
         assert!(!w.folder("bbbbbbbbbbbb").join("notice.json").exists());
         // Its parent (pane %1) may stop it, and so may a human, whoever the parent is.
         let w = stop_world(true, json!({"parentPane": "%1"}));
@@ -1430,7 +1574,7 @@ mod tests {
         w.fakes.process(testing::row(300, 900, 3000));
         w.fakes.kill_ok(300);
         w.fakes
-            .mux_rule("-t %9 #{pane_id}|#{@agent-id}", 0, "|\n", "");
+            .mux_first("-t %9 #{pane_id}|#{@agent-id}", 0, "|\n", "");
         w.fakes.clear_log();
         let reply = run(&w, stop, &["stop", "worker"]);
         assert!(reply.contains(r#""already":"lost""#), "{reply}");
@@ -1463,7 +1607,7 @@ mod tests {
             // The conditional kill ran but the pane is still listed (as a respawn or a slow server would leave it);
             // its probe answers gone.
             w.fakes
-                .mux_rule("-t %9 #{pane_id}|#{@agent-id}", 0, "|\n", "");
+                .mux_first("-t %9 #{pane_id}|#{@agent-id}", 0, "|\n", "");
             w.fakes.clear_log();
             let reply = run(&w, stop, &["stop", "worker"]);
             assert!(

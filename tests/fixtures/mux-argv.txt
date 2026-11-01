@@ -3,18 +3,23 @@
 # changed: a pane runs `<exe> launcher <spec>` or `<exe> watch` (D4), and the tagged-pane list frames each row
 # with a fresh per-call marker.
 # Placeholders: <marker> the 32-hex marker, <state> the state root, <cwd> the caller's cwd, <exe> the binary,
-# <id> the new agent's id, <spec> its spec.json. `-e MUX_AGENTS_STATE=<state>` is the Unix pane environment;
-# a Windows pane has none.
+# <id> the new agent's id, <spec> its spec.json, <buffer> a read's private buffer (mux-agents-<32 hex>).
+# `-e MUX_AGENTS_STATE=<state>` is the Unix pane environment; a Windows pane has none.
 # :370 caller probe; :539 tagged-pane list; :1188 gone probe of agent %8 (committed, no notice, not listed).
 # 0.2.2: the tagged-pane list also reads #{pane_dead}, so reap can close a pane remain-on-exit kept.
+# 0.2.3 (#48): agents are found by their pane and the exact command it started, never by their tags. The pane list
+# reads every pane with #{pane_start_command}, every field framed by the marker; every action on an agent's pane is
+# one `if-shell -F` that holds only while the pane is still that launch.
 
 [spawn -Client claude -Task hi]
 -N display-message -p -t %1 #{pid}|#{pane_pid}|#{session_id}|#{window_id}|#{@agent-id}
+# 0.2.3 (#48): the caller's pane carries no agent tag and is no agent record's pane
+-N list-panes -s -t $3 -F <marker>#{pane_id}<marker>#{window_id}<marker>#{pane_pid}<marker>#{pane_dead}<marker>#{pane_start_command}<marker>#{@agent-id}<marker>#{@agent-name}<marker>
 # 0.2.1: no -Split or -Tab, so the session's placement is read, before the spawn lock
 -N show-options -qv -t $3 @mux-agents-placement
--N list-panes -s -t $3 -F <marker>|#{pane_id}|#{window_id}|#{pane_pid}|#{pane_dead}|#{@agent-id}|#{@agent-name}|<marker>
-# :800-804
--N new-window -d -P -F #{pane_id}|#{window_id} -t $3: -n hi -e MUX_AGENTS_STATE=<state> -c <cwd> <exe> launcher <spec>
+-N list-panes -s -t $3 -F <marker>#{pane_id}<marker>#{window_id}<marker>#{pane_pid}<marker>#{pane_dead}<marker>#{pane_start_command}<marker>#{@agent-id}<marker>#{@agent-name}<marker>
+# :800-804; 0.2.3 (#48): the reply also names the pane's start command, kept in record.json as startCommand
+-N new-window -d -P -F #{pane_id}|#{window_id}|#{pane_start_command} -t $3: -n hi -e MUX_AGENTS_STATE=<state> -c <cwd> <exe> launcher <spec>
 # :808-809; 0.2.2: the agent's pane is titled with its name in the tag call (focus unchanged), then a best-effort
 # call keeps the client from retitling it (tmux 3.2a has no allow-set-title and refuses it; the spawn goes on)
 -N set-option -p -t %12 @agent-id <id> ; set-option -p -t %12 @agent-name hi ; set-option -p -t %12 @agent-parent %1 ; set-option -p -t %12 @agent-context brief:human ; select-pane -T hi -t %12
@@ -38,9 +43,10 @@
 
 [spawn -Client copilot -Task hi -Split v -Name helper]
 -N display-message -p -t %1 #{pid}|#{pane_pid}|#{session_id}|#{window_id}|#{@agent-id}
--N list-panes -s -t $3 -F <marker>|#{pane_id}|#{window_id}|#{pane_pid}|#{pane_dead}|#{@agent-id}|#{@agent-name}|<marker>
+-N list-panes -s -t $3 -F <marker>#{pane_id}<marker>#{window_id}<marker>#{pane_pid}<marker>#{pane_dead}<marker>#{pane_start_command}<marker>#{@agent-id}<marker>#{@agent-name}<marker>
+-N list-panes -s -t $3 -F <marker>#{pane_id}<marker>#{window_id}<marker>#{pane_pid}<marker>#{pane_dead}<marker>#{pane_start_command}<marker>#{@agent-id}<marker>#{@agent-name}<marker>
 # :800, 804
--N split-window -d -v -P -F #{pane_id}|#{window_id} -t %1 -e MUX_AGENTS_STATE=<state> -c <cwd> <exe> launcher <spec>
+-N split-window -d -v -P -F #{pane_id}|#{window_id}|#{pane_start_command} -t %1 -e MUX_AGENTS_STATE=<state> -c <cwd> <exe> launcher <spec>
 -N set-option -p -t %12 @agent-id <id> ; set-option -p -t %12 @agent-name helper ; set-option -p -t %12 @agent-parent %1 ; set-option -p -t %12 @agent-context brief:human ; select-pane -T helper -t %12
 -N set-option -p -t %12 allow-set-title off
 -N show-options -qv -t $3 @mux-agents-sidebar
@@ -61,10 +67,11 @@
 
 [spawn -Client claude -Task hi, placement h, side bar off]
 -N display-message -p -t %1 #{pid}|#{pane_pid}|#{session_id}|#{window_id}|#{@agent-id}
+-N list-panes -s -t $3 -F <marker>#{pane_id}<marker>#{window_id}<marker>#{pane_pid}<marker>#{pane_dead}<marker>#{pane_start_command}<marker>#{@agent-id}<marker>#{@agent-name}<marker>
 -N show-options -qv -t $3 @mux-agents-placement
--N list-panes -s -t $3 -F <marker>|#{pane_id}|#{window_id}|#{pane_pid}|#{pane_dead}|#{@agent-id}|#{@agent-name}|<marker>
+-N list-panes -s -t $3 -F <marker>#{pane_id}<marker>#{window_id}<marker>#{pane_pid}<marker>#{pane_dead}<marker>#{pane_start_command}<marker>#{@agent-id}<marker>#{@agent-name}<marker>
 # the stored placement: a split beside the caller, as -Split h
--N split-window -d -h -P -F #{pane_id}|#{window_id} -t %1 -e MUX_AGENTS_STATE=<state> -c <cwd> <exe> launcher <spec>
+-N split-window -d -h -P -F #{pane_id}|#{window_id}|#{pane_start_command} -t %1 -e MUX_AGENTS_STATE=<state> -c <cwd> <exe> launcher <spec>
 -N set-option -p -t %12 @agent-id <id> ; set-option -p -t %12 @agent-name hi ; set-option -p -t %12 @agent-parent %1 ; set-option -p -t %12 @agent-context brief:human ; select-pane -T hi -t %12
 -N set-option -p -t %12 allow-set-title off
 # off after sidebar -Close: read, nothing opened
@@ -72,15 +79,19 @@
 
 [spawn -Client claude -Task hi, tagging fails]
 -N display-message -p -t %1 #{pid}|#{pane_pid}|#{session_id}|#{window_id}|#{@agent-id}
+-N list-panes -s -t $3 -F <marker>#{pane_id}<marker>#{window_id}<marker>#{pane_pid}<marker>#{pane_dead}<marker>#{pane_start_command}<marker>#{@agent-id}<marker>#{@agent-name}<marker>
 -N show-options -qv -t $3 @mux-agents-placement
--N list-panes -s -t $3 -F <marker>|#{pane_id}|#{window_id}|#{pane_pid}|#{pane_dead}|#{@agent-id}|#{@agent-name}|<marker>
--N new-window -d -P -F #{pane_id}|#{window_id} -t $3: -n hi -e MUX_AGENTS_STATE=<state> -c <cwd> <exe> launcher <spec>
+-N list-panes -s -t $3 -F <marker>#{pane_id}<marker>#{window_id}<marker>#{pane_pid}<marker>#{pane_dead}<marker>#{pane_start_command}<marker>#{@agent-id}<marker>#{@agent-name}<marker>
+-N new-window -d -P -F #{pane_id}|#{window_id}|#{pane_start_command} -t $3: -n hi -e MUX_AGENTS_STATE=<state> -c <cwd> <exe> launcher <spec>
 -N set-option -p -t %12 @agent-id <id> ; set-option -p -t %12 @agent-name hi ; set-option -p -t %12 @agent-parent %1 ; set-option -p -t %12 @agent-context brief:human ; select-pane -T hi -t %12
-# :823
--N kill-pane -t %12
+# :823; 0.2.3 (#48): killed only while it still runs the command the reply named (live or dead), then probed: only
+# a gone pane is reported closed
+-N if-shell -F -t %12 '#{==:#{pane_start_command},/bin/mux-agent launcher /s/spec.json}' 'kill-pane -t %12'
+-N display-message -p -t %12 #{pane_id}|#{@agent-id}
 
 [spawn -Client claude -TaskFile t.md -BriefFile b.md, from a Claude agent]
 -N display-message -p -t %1 #{pid}|#{pane_pid}|#{session_id}|#{window_id}|#{@agent-id}
+-N list-panes -s -t $3 -F <marker>#{pane_id}<marker>#{window_id}<marker>#{pane_pid}<marker>#{pane_dead}<marker>#{pane_start_command}<marker>#{@agent-id}<marker>#{@agent-name}<marker>
 # :950, 954 (C2: the pane's mode line); 0.2.2: -J joins a wrapped footer
 -N display-message -p -t %1 #{pane_height}
 -N capture-pane -p -J -t %1
@@ -88,62 +99,73 @@
 # placement is new in 0.2.1 (no reference line): a session user option on the caller's session.
 [placement]
 -N display-message -p -t %1 #{pid}|#{pane_pid}|#{session_id}|#{window_id}|#{@agent-id}
+-N list-panes -s -t $3 -F <marker>#{pane_id}<marker>#{window_id}<marker>#{pane_pid}<marker>#{pane_dead}<marker>#{pane_start_command}<marker>#{@agent-id}<marker>#{@agent-name}<marker>
 -N show-options -qv -t $3 @mux-agents-placement
 
 [placement h]
 -N display-message -p -t %1 #{pid}|#{pane_pid}|#{session_id}|#{window_id}|#{@agent-id}
+-N list-panes -s -t $3 -F <marker>#{pane_id}<marker>#{window_id}<marker>#{pane_pid}<marker>#{pane_dead}<marker>#{pane_start_command}<marker>#{@agent-id}<marker>#{@agent-name}<marker>
 -N set-option -t $3 @mux-agents-placement h
 
 [list]
 -N display-message -p -t %1 #{pid}|#{pane_pid}|#{session_id}|#{window_id}|#{@agent-id}
--N list-panes -s -t $3 -F <marker>|#{pane_id}|#{window_id}|#{pane_pid}|#{pane_dead}|#{@agent-id}|#{@agent-name}|<marker>
+-N list-panes -s -t $3 -F <marker>#{pane_id}<marker>#{window_id}<marker>#{pane_pid}<marker>#{pane_dead}<marker>#{pane_start_command}<marker>#{@agent-id}<marker>#{@agent-name}<marker>
 -N display-message -p -t %8 #{pane_id}|#{@agent-id}
 
 [list -All]
 -N display-message -p -t %1 #{pid}|#{pane_pid}|#{session_id}|#{window_id}|#{@agent-id}
--N list-panes -s -t $3 -F <marker>|#{pane_id}|#{window_id}|#{pane_pid}|#{pane_dead}|#{@agent-id}|#{@agent-name}|<marker>
+-N list-panes -s -t $3 -F <marker>#{pane_id}<marker>#{window_id}<marker>#{pane_pid}<marker>#{pane_dead}<marker>#{pane_start_command}<marker>#{@agent-id}<marker>#{@agent-name}<marker>
 -N display-message -p -t %8 #{pane_id}|#{@agent-id}
 
 [focus worker]
 -N display-message -p -t %1 #{pid}|#{pane_pid}|#{session_id}|#{window_id}|#{@agent-id}
--N list-panes -s -t $3 -F <marker>|#{pane_id}|#{window_id}|#{pane_pid}|#{pane_dead}|#{@agent-id}|#{@agent-name}|<marker>
-# :1282-1283
--N select-window -t @5
--N select-pane -t %9
+-N list-panes -s -t $3 -F <marker>#{pane_id}<marker>#{window_id}<marker>#{pane_pid}<marker>#{pane_dead}<marker>#{pane_start_command}<marker>#{@agent-id}<marker>#{@agent-name}<marker>
+# :1282-1283; 0.2.3 (#48): the window and pane are selected only while %9 is still its live launch, then read back:
+# active in the active window, live and that launch
+-N if-shell -F -t %9 '#{&&:#{==:#{pane_dead},0},#{==:#{pane_start_command},/bin/mux-agent launcher /state/agents/9/spec.json}}' 'select-window -t %9 ; select-pane -t %9'
+-N display-message -p -t %9 '#{pane_id}|#{window_active}|#{pane_active}|#{&&:#{==:#{pane_dead},0},#{==:#{pane_start_command},/bin/mux-agent launcher /state/agents/9/spec.json}}'
 
 [send worker -Body hi]
 -N display-message -p -t %1 #{pid}|#{pane_pid}|#{session_id}|#{window_id}|#{@agent-id}
--N list-panes -s -t $3 -F <marker>|#{pane_id}|#{window_id}|#{pane_pid}|#{pane_dead}|#{@agent-id}|#{@agent-name}|<marker>
-# :1316
--N display-message -p -t %9 #{session_id}|#{@agent-id}
+-N list-panes -s -t $3 -F <marker>#{pane_id}<marker>#{window_id}<marker>#{pane_pid}<marker>#{pane_dead}<marker>#{pane_start_command}<marker>#{@agent-id}<marker>#{@agent-name}<marker>
+# :1316; 0.2.3 (#48): a live pane of this session; the mailbox is the running agent's there, never a tag's
+-N display-message -p -t %9 #{pane_id}|#{session_id}
 
 [read]
 -N display-message -p -t %1 #{pid}|#{pane_pid}|#{session_id}|#{window_id}|#{@agent-id}
--N list-panes -s -t $3 -F <marker>|#{pane_id}|#{window_id}|#{pane_pid}|#{pane_dead}|#{@agent-id}|#{@agent-name}|<marker>
+-N list-panes -s -t $3 -F <marker>#{pane_id}<marker>#{window_id}<marker>#{pane_pid}<marker>#{pane_dead}<marker>#{pane_start_command}<marker>#{@agent-id}<marker>#{@agent-name}<marker>
 -N display-message -p -t %8 #{pane_id}|#{@agent-id}
 
 [read worker -Lines 5]
 -N display-message -p -t %1 #{pid}|#{pane_pid}|#{session_id}|#{window_id}|#{@agent-id}
--N list-panes -s -t $3 -F <marker>|#{pane_id}|#{window_id}|#{pane_pid}|#{pane_dead}|#{@agent-id}|#{@agent-name}|<marker>
+-N list-panes -s -t $3 -F <marker>#{pane_id}<marker>#{window_id}<marker>#{pane_pid}<marker>#{pane_dead}<marker>#{pane_start_command}<marker>#{@agent-id}<marker>#{@agent-name}<marker>
 # 0.2.2: a named read reaps first, on the same list: the gone probe of %8
 -N display-message -p -t %8 #{pane_id}|#{@agent-id}
-# :1366
--N capture-pane -p -J -t %9 -S -5
+# :1366; 0.2.3 (#48): captured into a private buffer only while %9 is still its live launch, read, then deleted
+-N if-shell -F -t %9 '#{&&:#{==:#{pane_dead},0},#{==:#{pane_start_command},/bin/mux-agent launcher /state/agents/9/spec.json}}' 'capture-pane -J -t %9 -b <buffer> -S -5'
+-N show-buffer -b <buffer>
+-N delete-buffer -b <buffer>
 
 [stop worker]
 -N display-message -p -t %1 #{pid}|#{pane_pid}|#{session_id}|#{window_id}|#{@agent-id}
--N list-panes -s -t $3 -F <marker>|#{pane_id}|#{window_id}|#{pane_pid}|#{pane_dead}|#{@agent-id}|#{@agent-name}|<marker>
+-N list-panes -s -t $3 -F <marker>#{pane_id}<marker>#{window_id}<marker>#{pane_pid}<marker>#{pane_dead}<marker>#{pane_start_command}<marker>#{@agent-id}<marker>#{@agent-name}<marker>
 # 0.2.2: stop reaps first (the gone probe of %8), then re-checks its own pane under the notice lock
 -N display-message -p -t %8 #{pane_id}|#{@agent-id}
 -N display-message -p -t %9 #{pane_id}|#{@agent-id}
-# :1409
--N kill-pane -t %9
+# :1409; 0.2.3 (#48): killed only while %9 is still its live launch, then probed: only a gone pane is signalled
+# and noticed
+-N if-shell -F -t %9 '#{&&:#{==:#{pane_dead},0},#{==:#{pane_start_command},/bin/mux-agent launcher /state/agents/9/spec.json}}' 'kill-pane -t %9'
+-N display-message -p -t %9 #{pane_id}|#{@agent-id}
 
 [status -BodyFile s.md, from a Claude agent]
 -N display-message -p -t %1 #{pid}|#{pane_pid}|#{session_id}|#{window_id}|#{@agent-id}
+# 0.2.3 (#48): the caller's pane is a running agent's own pane
+-N list-panes -s -t $3 -F <marker>#{pane_id}<marker>#{window_id}<marker>#{pane_pid}<marker>#{pane_dead}<marker>#{pane_start_command}<marker>#{@agent-id}<marker>#{@agent-name}<marker>
 
 [sidebar]
 -N display-message -p -t %1 #{pid}|#{pane_pid}|#{session_id}|#{window_id}|#{@agent-id}
+# 0.2.3 (#48): the caller's pane carries no agent tag and is no agent record's pane
+-N list-panes -s -t $3 -F <marker>#{pane_id}<marker>#{window_id}<marker>#{pane_pid}<marker>#{pane_dead}<marker>#{pane_start_command}<marker>#{@agent-id}<marker>#{@agent-name}<marker>
 # 0.2.1: sidebar turns the bar back on for the session, inside the sidebar lock
 -N set-option -u -t $3 @mux-agents-sidebar
 # :1526
@@ -164,6 +186,7 @@
 
 [sidebar, -l refused]
 -N display-message -p -t %1 #{pid}|#{pane_pid}|#{session_id}|#{window_id}|#{@agent-id}
+-N list-panes -s -t $3 -F <marker>#{pane_id}<marker>#{window_id}<marker>#{pane_pid}<marker>#{pane_dead}<marker>#{pane_start_command}<marker>#{@agent-id}<marker>#{@agent-name}<marker>
 -N set-option -u -t $3 @mux-agents-sidebar
 # 0.2.3 (#47): no recorded bar, and no labelled pane anywhere in the session
 -N show-options -qv -t $3 @mux-agents-sidebar-id
@@ -183,6 +206,7 @@
 
 [sidebar -Close]
 -N display-message -p -t %1 #{pid}|#{pane_pid}|#{session_id}|#{window_id}|#{@agent-id}
+-N list-panes -s -t $3 -F <marker>#{pane_id}<marker>#{window_id}<marker>#{pane_pid}<marker>#{pane_dead}<marker>#{pane_start_command}<marker>#{@agent-id}<marker>#{@agent-name}<marker>
 # 0.2.1: off first, inside the sidebar lock, so no spawn reopens the bar
 -N set-option -t $3 @mux-agents-sidebar off
 # 0.2.3 (#47): the recorded bar, proven by one read (alive, the recorded pid) and its process (alive, the same start,
@@ -204,4 +228,4 @@
 -N show-options -qv -t $3 @mux-agents-sidebar-id
 -N display-message -p -t %1 #{pane_id}|#{window_id}|#{pane_dead}|#{pane_pid}
 -N list-panes -t %1 -F #{pane_id}|#{pane_active}|#{pane_at_right}|#{pane_at_top}|#{pane_at_bottom}|#{pane_width}|#{window_width}|#{pane_left}|#{pane_top}|#{window_zoomed_flag}
--N list-panes -s -t $3 -F <marker>|#{pane_id}|#{window_id}|#{pane_pid}|#{pane_dead}|#{@agent-id}|#{@agent-name}|<marker>
+-N list-panes -s -t $3 -F <marker>#{pane_id}<marker>#{window_id}<marker>#{pane_pid}<marker>#{pane_dead}<marker>#{pane_start_command}<marker>#{@agent-id}<marker>#{@agent-name}<marker>

@@ -3,7 +3,7 @@
 use serde_json::{Map, Value, json};
 
 use super::board::board;
-use super::mail::{doing_line, mailbox_key};
+use super::mail::doing_line;
 use super::registry::{self, find_pane};
 use super::{FILES_ONLY, lock, lock_key, state_dir, usage};
 use crate::caller::{Kind, resolve};
@@ -13,11 +13,10 @@ use crate::error::{Res, refuse};
 use crate::mux::native;
 use crate::state::fs::{BODY_MAX, read_text, write_json};
 
-/// The board as the caller's pane sees it: unread from its own mailbox (an agent's id, else `pane-<n>`).
+/// The board as the caller's pane sees it: unread from its own mailbox (a running agent's id, else `pane-<n>`).
 pub fn list(ctx: &Ctx, request: &Request) -> Res<Map<String, Value>> {
     let caller = resolve(ctx)?;
-    let reader = mailbox_key(&caller.pane, &caller.agent_tag)?;
-    board(ctx, &caller, &reader, request.switch("All"), false)
+    board(ctx, &caller, request.switch("All"), false)
 }
 
 /// `list -Text`: the rows as `json::to_text` prints them, without the `color` column. With `color`, a live agent's
@@ -49,11 +48,27 @@ pub fn list_text(reply: &Map<String, Value>, color: bool) -> String {
     crate::json::to_text(&shown)
 }
 
+/// Selects a running agent's window and pane, only while its pane is still its live launch (checked by the server in
+/// the same command), then reads it back: the pane must be active in the active window, live and still that launch.
 pub fn focus(ctx: &Ctx, request: &Request) -> Res<Map<String, Value>> {
     let caller = resolve(ctx)?;
     let pane = find_pane(ctx, &caller, first(request))?;
-    native(ctx, &["select-window", "-t", &pane.window], false)?;
-    native(ctx, &["select-pane", "-t", &pane.pane], false)?;
+    let p = pane.pane.as_str();
+    let select = registry::bound(
+        p,
+        pane.launch.live(),
+        format!("select-window -t {p} ; select-pane -t {p}"),
+    );
+    let select: Vec<&str> = select.iter().map(String::as_str).collect();
+    native(ctx, &select, true)?;
+    let probe = format!(
+        "#{{pane_id}}|#{{window_active}}|#{{pane_active}}|{}",
+        pane.launch.live()
+    );
+    let read = native(ctx, &["display-message", "-p", "-t", p, &probe], true)?;
+    if read.code != 0 || read.stdout.trim_end_matches(['\r', '\n']) != format!("{p}|1|1|1") {
+        return refuse(2, "target", "the agent's pane is no longer its launch");
+    }
     let mut reply = Map::new();
     reply.insert("name".into(), pane.name.into());
     reply.insert("pane".into(), pane.pane.into());
@@ -74,17 +89,18 @@ pub fn status(ctx: &Ctx, request: &Request) -> Res<Map<String, Value>> {
         return Err(usage("status"));
     }
     let caller = resolve(ctx)?;
-    let tag = caller.agent_tag.as_str();
-    let record = match caller.kind {
-        Kind::Agent if !tag.is_empty() => registry::record(ctx, &caller, tag)?,
-        _ => None,
+    // Only a running agent's own pane, as one snapshot shows it: never its tag.
+    let me = match caller.kind {
+        Kind::Agent => match registry::Snapshot::take(ctx, &caller)?.own(&caller) {
+            registry::Own::Agent(me) => Some(me),
+            _ => None,
+        },
+        Kind::Human => None,
     };
-    let Some(record) = record.filter(|r| {
-        r.get("id").and_then(Value::as_str) == Some(tag)
-            && r.get("session").and_then(Value::as_str) == Some(caller.session.as_str())
-    }) else {
+    let Some(me) = me else {
         return refuse(2, "target", "only an agent reports status");
     };
+    let (tag, record) = (me.id.as_str(), &me.record);
     let Some(body_file) = body_file else {
         return refuse(2, "usage", FILES_ONLY);
     };
@@ -137,30 +153,75 @@ mod tests {
         let w = World::human("");
         w.agent_record(ID, json!({}));
         w.panes(&["%9|@5|300|aaaaaaaaaaaa|worker"]);
+        w.fakes.mux_rule("#{window_active}", 0, "%9|1|1|1\n", "");
         w.fakes.clear_log();
         assert_eq!(
             run(&w, focus, &["focus", "worker"]),
             r#"ok {"name":"worker","pane":"%9","window":"@5"}"#
         );
+        let live = registry::Launch {
+            command: crate::agents::fixture::launch_command("%9"),
+            pid: None,
+        }
+        .live();
         let calls = w.fakes.mux_calls();
+        assert_eq!(calls[1][1], "list-panes");
+        // One server-side command selects the window and the pane only while %9 is still its live launch; a read
+        // then proves it active, live and that launch.
         assert_eq!(
             calls[2..],
             [
-                vec!["-N", "select-window", "-t", "@5"],
-                vec!["-N", "select-pane", "-t", "%9"]
+                vec![
+                    "-N".to_string(),
+                    "if-shell".into(),
+                    "-F".into(),
+                    "-t".into(),
+                    "%9".into(),
+                    live.clone(),
+                    "select-window -t %9 ; select-pane -t %9".into()
+                ],
+                vec![
+                    "-N".to_string(),
+                    "display-message".into(),
+                    "-p".into(),
+                    "-t".into(),
+                    "%9".into(),
+                    format!("#{{pane_id}}|#{{window_active}}|#{{pane_active}}|{live}")
+                ]
             ]
         );
-        assert_eq!(calls[1][1], "list-panes");
-        // A failed select-window stops before the pane.
-        w.fakes.mux_first("select-window", 1, "", "SECRET");
-        w.fakes.clear_log();
-        assert_eq!(
-            run(&w, focus, &["focus", "worker"]),
-            "1 rmux rmux call failed"
-        );
-        assert!(!w.fakes.mux_calls().iter().any(|c| c[1] == "select-pane"));
+        // Replaced between the list and the select (the condition failed: not active, or not its launch), or a
+        // failed read: refused.
+        for (code, out) in [
+            (0, "%9|1|1|0\n"),
+            (0, "%9|0|1|1\n"),
+            (0, "%9|1|0|1\n"),
+            (0, "|||\n"),
+            (1, "%9|1|1|1\n"),
+        ] {
+            w.fakes.mux_first("#{window_active}", code, out, "");
+            assert_eq!(
+                run(&w, focus, &["focus", "worker"]),
+                "2 target the agent's pane is no longer its launch",
+                "{code} {out:?}"
+            );
+        }
         assert_eq!(
             run(&w, focus, &["focus", "nobody"]),
+            "2 target no live agent has that name"
+        );
+        // A rotated tag names nobody: worker's pane is still %9.
+        w.panes(&[
+            "%9|@5|300|bbbbbbbbbbbb|other",
+            "%8|@5|301|aaaaaaaaaaaa|worker",
+        ]);
+        w.fakes.mux_first("#{window_active}", 0, "%9|1|1|1\n", "");
+        assert_eq!(
+            run(&w, focus, &["focus", "worker"]),
+            r#"ok {"name":"worker","pane":"%9","window":"@5"}"#
+        );
+        assert_eq!(
+            run(&w, focus, &["focus", "other"]),
             "2 target no live agent has that name"
         );
     }
@@ -172,19 +233,42 @@ mod tests {
         // A human pane with a tag and a record.
         let w = World::human(ID);
         w.agent_record(ID, json!({"pane": "%1"}));
+        w.panes(&["%1|@1|100|aaaaaaaaaaaa|worker"]);
         assert_eq!(run(&w, status, &missing), target);
         assert_eq!(run(&w, status, &["status", "-Body", "x"]), target);
         // An agent pane with no tag, a tag without a record, a record of another session or of another id.
         assert_eq!(run(&World::agent(""), status, &missing), target);
         assert_eq!(run(&World::agent("bbbbbbbbbbbb"), status, &missing), target);
         let w = World::agent(ID);
-        w.agent_record(ID, json!({"session": "$4"}));
+        w.panes(&["%1|@1|100|aaaaaaaaaaaa|worker"]);
+        w.agent_record(ID, json!({"session": "$4", "pane": "%1"}));
         assert_eq!(run(&w, status, &missing), target);
-        w.agent_record(ID, json!({"id": "bbbbbbbbbbbb"}));
+        w.agent_record(ID, json!({"id": "bbbbbbbbbbbb", "pane": "%1"}));
         assert_eq!(run(&w, status, &missing), target);
+        // Tagged with the agent's id but not its pane (the tag rotated here), or its own pane not its launch.
+        let w = World::agent(ID);
+        w.agent_record(ID, json!({"pane": "%9"}));
+        w.panes(&["%1|@1|100|aaaaaaaaaaaa|worker", "%9|@5|300||"]);
+        assert_eq!(run(&w, status, &missing), target);
+        let w = World::agent("");
+        w.agent_record(ID, json!({"pane": "%1", "startCommand": "something else"}));
+        w.panes(&["%1|@1|100||"]);
+        assert_eq!(run(&w, status, &missing), target);
+
+        // The agent's own pane, tagless (rmux moved its tag): still itself.
+        let w = World::agent("");
+        let folder = w.agent_record(ID, json!({"pane": "%1"}));
+        w.panes(&["%1|@1|100||"]);
+        w.file("s.md", b"tagless");
+        assert_eq!(
+            run(&w, status, &["status", "-BodyFile", "s.md"]),
+            r#"ok {"name":"worker","text":"tagless"}"#
+        );
+        assert!(folder.join("status.json").is_file());
 
         let w = World::agent(ID);
         let folder = w.agent_record(ID, json!({"pane": "%1"}));
+        w.panes(&["%1|@1|100|aaaaaaaaaaaa|worker"]);
         let usage = "2 usage usage: mux-agent status (-Body <text> | -BodyFile <path>) [-Text]";
         w.file("blank.md", " \t\r\n\u{9b}\u{7}\n".as_bytes());
         w.fakes.clear_log();
@@ -249,7 +333,7 @@ mod tests {
         let mut w = World::human("");
         let caller = w.caller();
         w.agent_record(ID, json!({}));
-        let ended = w.agent_record("bbbbbbbbbbbb", json!({"name": "done"}));
+        let ended = w.agent_record("bbbbbbbbbbbb", json!({"name": "done", "pane": "%7"}));
         write(
             &ended.join("notice.json"),
             json!({"kind": "stopped", "exitCode": null, "at": "x"}),
@@ -267,14 +351,23 @@ mod tests {
         assert_eq!(rows(&w, &["list"])[0]["unread"], 1);
         assert_eq!(rows(&w, &["list"]).len(), 1);
         assert_eq!(rows(&w, &["list", "-All"]).len(), 2);
-        // Another human pane reads pane-2; a tagged pane reads its id.
+        // Another human pane reads pane-2, whatever tag it carries: a tag never names the reader.
         let tmux = w.ctx.env.get("TMUX").unwrap().to_string();
-        w.ctx.env = Env::from_pairs([("TMUX", tmux), ("TMUX_PANE", "%2".into())]);
+        w.ctx.env = Env::from_pairs([("TMUX", tmux.clone()), ("TMUX_PANE", "%2".into())]);
         assert_eq!(rows(&w, &["list"])[0]["unread"], 2);
         w.fakes.mux_first(
             "#{pid}|#{pane_pid}|#{session_id}|#{window_id}|#{@agent-id}",
             0,
             "900|100|$3|@1|aaaaaaaaaaaa\n",
+            "",
+        );
+        assert_eq!(rows(&w, &["list"])[0]["unread"], 2);
+        // The running agent's own pane reads its id, tagged or not.
+        w.ctx.env = Env::from_pairs([("TMUX", tmux), ("TMUX_PANE", "%9".into())]);
+        w.fakes.mux_first(
+            "#{pid}|#{pane_pid}|#{session_id}|#{window_id}|#{@agent-id}",
+            0,
+            "900|100|$3|@1|\n",
             "",
         );
         assert_eq!(rows(&w, &["list"])[0]["unread"], 3);
