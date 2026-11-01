@@ -65,6 +65,75 @@ struct Log {
     timeouts: Vec<String>,
     // What `Mux::kind` answers; none is tmux.
     kind: Option<Kind>,
+    // Shared with another thread's fakes by `share_locks`: a held key blocks there, as the real lock does.
+    gate: Option<std::sync::Arc<Gate>>,
+}
+
+/// Locks two fakes on two threads contend for, as two processes contend for the real lock: a key held by one blocks
+/// the other until it is given back. Counts each wait, so a test can show the contention happened.
+#[derive(Default)]
+pub struct Gate {
+    state: std::sync::Mutex<GateState>,
+    freed: std::sync::Condvar,
+}
+
+#[derive(Default)]
+struct GateState {
+    held: Vec<String>,
+    waiting: HashMap<String, usize>,
+    waited: HashMap<String, usize>,
+}
+
+impl Gate {
+    /// Takes `key`, waiting (up to 10 s, then panics) while another thread holds it.
+    fn take(&self, key: &str) {
+        let mut state = self.state.lock().unwrap();
+        if state.held.iter().any(|k| k == key) {
+            *state.waiting.entry(key.into()).or_default() += 1;
+            *state.waited.entry(key.into()).or_default() += 1;
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            while state.held.iter().any(|k| k == key) {
+                let left = deadline
+                    .checked_duration_since(std::time::Instant::now())
+                    .unwrap_or_else(|| panic!("lock {key} held for over 10 s"));
+                state = self.freed.wait_timeout(state, left).unwrap().0;
+            }
+            *state.waiting.entry(key.into()).or_default() -= 1;
+        }
+        state.held.push(key.into());
+    }
+
+    fn give(&self, key: &str) {
+        self.state.lock().unwrap().held.retain(|k| k != key);
+        self.freed.notify_all();
+    }
+
+    /// Whether `key` is held now.
+    pub fn held(&self, key: &str) -> bool {
+        self.state.lock().unwrap().held.iter().any(|k| k == key)
+    }
+
+    /// How many threads wait for `key` now.
+    pub fn waiting(&self, key: &str) -> usize {
+        self.state
+            .lock()
+            .unwrap()
+            .waiting
+            .get(key)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    /// How many times a thread had to wait for `key`.
+    pub fn waited(&self, key: &str) -> usize {
+        self.state
+            .lock()
+            .unwrap()
+            .waited
+            .get(key)
+            .copied()
+            .unwrap_or(0)
+    }
 }
 
 thread_local! {
@@ -74,7 +143,7 @@ thread_local! {
 
 /// Stands in for `state::lock::with_lock` in tests: records the hold in the current fakes and runs `f`. A
 /// second hold of a held key panics, as the real lock would time out on it; a key set by `lock_timeout` refuses
-/// 2 `lock` as the real lock does after its wait.
+/// 2 `lock` as the real lock does after its wait. With a shared `Gate`, a key another thread holds is waited for.
 pub fn locked<T>(key: &str, f: impl FnOnce() -> Res<T>) -> Res<T> {
     let fakes = CURRENT
         .with(|current| current.borrow().clone())
@@ -84,9 +153,16 @@ pub fn locked<T>(key: &str, f: impl FnOnce() -> Res<T>) -> Res<T> {
         fakes.0.borrow_mut().locks.push(format!("!{key}"));
         return crate::error::refuse(2, "lock", "timed out waiting for the agent lock");
     }
+    let gate = fakes.0.borrow().gate.clone();
+    if let Some(gate) = &gate {
+        gate.take(key);
+    }
     fakes.lock_event('+', key);
     let out = f();
     fakes.lock_event('-', key);
+    if let Some(gate) = &gate {
+        gate.give(key);
+    }
     out
 }
 
@@ -222,6 +298,11 @@ impl Fakes {
     /// Every later lock whose key starts with `prefix` times out (recorded as `!key`) without running its body.
     pub fn lock_timeout(&self, prefix: &str) {
         self.0.borrow_mut().timeouts.push(prefix.into());
+    }
+
+    /// Later locks go through `gate`, which another thread's fakes share: a key one holds blocks the other.
+    pub fn share_locks(&self, gate: std::sync::Arc<Gate>) {
+        self.0.borrow_mut().gate = Some(gate);
     }
 
     /// Forgets the recorded OS, multiplexer, sleep and lock calls.
