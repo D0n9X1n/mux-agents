@@ -566,6 +566,26 @@ fn wiki_publish_runs_sh_with_token_off_argv() {
     );
     let push = line_of(&publish, "git -C wiki-repo push origin HEAD:master");
     assert!(clone < mirror && mirror < push, "{publish:#?}");
+    // The push runs exactly when the mirror step reports a change: its id and the push's condition must agree.
+    let id = publish
+        .iter()
+        .position(|l| l == "id: mirror")
+        .unwrap_or_else(|| panic!("no step has exactly `id: mirror`: {publish:#?}"));
+    let gate = line_of(&publish, "if: steps.mirror.outputs.changed == 'true'");
+    assert!(
+        clone < id && id < mirror && mirror < gate && gate < push,
+        "{publish:#?}"
+    );
+    // No other step condition can skip the clone, mirror or push.
+    assert_eq!(
+        publish
+            .iter()
+            .skip_while(|l| !l.starts_with("steps:"))
+            .filter(|l| l.starts_with("if:"))
+            .count(),
+        1,
+        "{publish:#?}"
+    );
     // The helper is set on the clone's and the push's steps only, not the job: the publisher never sees the token.
     let helper = r#"GIT_CONFIG_VALUE_1: '!f() { echo username=x-access-token; echo "password=$GH_TOKEN"; }; f'"#;
     let helpers: Vec<usize> = publish
