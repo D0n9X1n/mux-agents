@@ -1272,6 +1272,26 @@ fn skill_always_names_its_agents() {
 }
 
 #[test]
+fn skill_always_names_its_agents() {
+    // Callers always pass -Name with a short kebab name, and the spawn example in the Commands block shows it.
+    let skill = file_lines("skills/mux-agents/SKILL.md");
+    assert!(
+        skill
+            .iter()
+            .any(|l| l.starts_with("- ") && l.contains("Always pass `-Name <short-kebab-name>`")),
+        "SKILL.md's rules tell callers to always pass -Name"
+    );
+    let spawn = skill
+        .iter()
+        .find(|l| l.starts_with("\"<entry>\" spawn "))
+        .expect("SKILL.md's spawn example");
+    assert!(
+        spawn.contains(" -Name <name>"),
+        "spawn example lacks -Name: {spawn}"
+    );
+}
+
+#[test]
 fn tagline_shared() {
     let readme = file_lines("README.md");
     assert_eq!(readme[2], "# mux-agents");
