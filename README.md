@@ -21,7 +21,7 @@ Start Claude Code and Copilot CLI agents in tmux or rmux panes, see what each is
 
 ## Features
 
-- **Helpers in panes you can see.** Ask in your chat; each agent opens in its own window or split of your session.
+- **Helpers in panes you can see.** Ask in your chat; choose once per session whether agents open as tabs or as panes beside you, and the side bar opens on its own.
 - **They start with your context.** A same-client agent forks your conversation; any other agent starts from a brief you write.
 - **A live side bar.** How many agents run and what each is doing right now.
 - **Mailboxes, not keystrokes.** Agents report back through files; nothing ever types into another pane.

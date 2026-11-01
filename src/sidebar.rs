@@ -26,6 +26,48 @@ const CONFIRM_FORMAT: &str = "#{pane_id}|#{window_id}|#{@agent-role}|#{@agent-id
 const PANE_FORMAT: &str = "#{pane_id}|#{window_id}";
 const CLEAR: &str = "\u{1b}[H\u{1b}[2J";
 const WIDTH: &str = "42";
+// `off` once `sidebar -Close` ran in the session; unset again by `sidebar`.
+const OPTION: &str = "@mux-agents-sidebar";
+
+/// What `ensure` found: a bar it opened, the session's bar, or none because the session turned it off.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Bar {
+    Opened(String),
+    Existing(String),
+    Disabled,
+}
+
+/// The bar a spawn keeps open: under the session's sidebar lock, nothing when the session's option says `off`,
+/// else the session's bar, found or opened beside the caller. A failed read or probe refuses and opens nothing.
+pub fn ensure(ctx: &Ctx, caller: &Caller) -> Res<Bar> {
+    lock(ctx, &lock_key("sidebar", caller, &caller.session), || {
+        let read = native(
+            ctx,
+            &["show-options", "-qv", "-t", &caller.session, OPTION],
+            false,
+        )?;
+        if read.stdout.trim_end_matches(['\r', '\n']) == "off" {
+            return Ok(Bar::Disabled);
+        }
+        let (pane, _, opened) = find_or_open(ctx, caller)?;
+        Ok(if opened {
+            Bar::Opened(pane)
+        } else {
+            Bar::Existing(pane)
+        })
+    })
+}
+
+/// The session's bar as (pane, window, opened): the one found, else a new one beside the caller.
+fn find_or_open(ctx: &Ctx, caller: &Caller) -> Res<(String, String, bool)> {
+    match find_sidebar(ctx, caller)? {
+        Some((pane, window)) => Ok((pane, window, false)),
+        None => {
+            let (pane, window) = open(ctx, caller)?;
+            Ok((pane, window, true))
+        }
+    }
+}
 
 /// A board field made safe to draw: C0 (LF included), DEL and C1 removed, so no field moves the cursor or adds a line.
 fn clean(value: Option<&Value>) -> String {
@@ -183,7 +225,8 @@ fn console_utf8() {}
 /// `sidebar [-Close]`: one bar per session, under the session's sidebar lock. Opens a 42-column split beside the
 /// caller running watch (again without -l only when the multiplexer refused the size), tagged @agent-role sidebar;
 /// an existing bar is returned with opened false; -Close kills it, and reports closed only when the kill answered 0.
-/// Refused only from a tagged pane.
+/// -Close first sets the session's @mux-agents-sidebar `off` and `sidebar` unsets it, both inside the lock, so a
+/// spawn's `ensure` never reopens a bar a returned -Close closed. Refused only from a tagged pane.
 pub fn sidebar(ctx: &Ctx, request: &Request) -> Res<Map<String, Value>> {
     let caller = resolve(ctx)?;
     if !caller.agent_tag.is_empty() {
@@ -191,14 +234,30 @@ pub fn sidebar(ctx: &Ctx, request: &Request) -> Res<Map<String, Value>> {
     }
     let close = request.switch("Close");
     lock(ctx, &lock_key("sidebar", &caller, &caller.session), || {
-        let found = find_sidebar(ctx, &caller)?;
         let mut reply = Map::new();
-        match (close, found) {
-            (true, None) => {
+        if !close {
+            native(
+                ctx,
+                &["set-option", "-u", "-t", &caller.session, OPTION],
+                false,
+            )?;
+            let (pane, window, opened) = find_or_open(ctx, &caller)?;
+            reply.insert("pane".into(), pane.into());
+            reply.insert("window".into(), window.into());
+            reply.insert("opened".into(), opened.into());
+            return Ok(reply);
+        }
+        native(
+            ctx,
+            &["set-option", "-t", &caller.session, OPTION, "off"],
+            false,
+        )?;
+        match find_sidebar(ctx, &caller)? {
+            None => {
                 reply.insert("pane".into(), Value::Null);
                 reply.insert("closed".into(), false.into());
             }
-            (true, Some((pane, _))) => {
+            Some((pane, _)) => {
                 if !close_pane(ctx, &pane) {
                     return refuse(
                         1,
@@ -210,17 +269,6 @@ pub fn sidebar(ctx: &Ctx, request: &Request) -> Res<Map<String, Value>> {
                 }
                 reply.insert("pane".into(), pane.into());
                 reply.insert("closed".into(), true.into());
-            }
-            (false, Some((pane, window))) => {
-                reply.insert("pane".into(), pane.into());
-                reply.insert("window".into(), window.into());
-                reply.insert("opened".into(), false.into());
-            }
-            (false, None) => {
-                let (pane, window) = open(ctx, &caller)?;
-                reply.insert("pane".into(), pane.into());
-                reply.insert("window".into(), window.into());
-                reply.insert("opened".into(), true.into());
             }
         }
         Ok(reply)
@@ -373,6 +421,9 @@ mod tests {
     const LIST: &str =
         "-N list-panes -s -t $3 -F #{pane_id}|#{window_id}|#{@agent-role}|#{@agent-id}";
     const CONFIRM: &str = "#{pane_id}|#{window_id}|#{@agent-role}|#{@agent-id}|end";
+    const READ_OPTION: &str = "-N show-options -qv -t $3 @mux-agents-sidebar";
+    const OFF: &str = "-N set-option -t $3 @mux-agents-sidebar off";
+    const ON: &str = "-N set-option -u -t $3 @mux-agents-sidebar";
 
     fn out(code: i32, stdout: &str, stderr: &str) -> Output {
         Output {
@@ -649,11 +700,14 @@ mod tests {
 
     // ---- sidebar
 
-    /// A stateful pane table: pane -> `role|agent-id`. %1 (the caller) has neither, %2 role `other`.
+    /// A stateful pane table: pane -> `role|agent-id`. %1 (the caller) has neither, %2 role `other`. The session
+    /// option @mux-agents-sidebar is kept in the same table under its own name.
     #[derive(Default)]
     struct Mux {
         extra: Vec<(&'static str, String)>,
         open: bool,
+        disabled: bool,
+        option_fail: Option<&'static str>,
         agent_bar: bool,
         refuse_size: bool,
         split_error: Option<&'static str>,
@@ -692,6 +746,7 @@ mod tests {
         panes
             .borrow()
             .iter()
+            .filter(|(p, _)| p.starts_with('%'))
             .map(|(p, v)| format!("{p}={v}"))
             .collect::<Vec<_>>()
             .join(",")
@@ -710,12 +765,16 @@ mod tests {
             table.push(("%7".into(), "sidebar|".into()));
         }
         table.extend(mux.extra.iter().map(|(p, v)| (p.to_string(), v.clone())));
+        if mux.disabled {
+            table.push((OPTION.into(), "off".into()));
+        }
         let panes: Panes = Rc::new(RefCell::new(table));
         let p = panes.clone();
         w.fakes.mux_script("list-panes", move |_| {
             let text: String = p
                 .borrow()
                 .iter()
+                .filter(|(pane, _)| pane.starts_with('%'))
                 .map(|(pane, v)| format!("{pane}|@5|{v}\n"))
                 .collect();
             Ok(out(0, &text, ""))
@@ -777,7 +836,39 @@ mod tests {
             p.borrow_mut().retain(|(pane, _)| pane != &argv[3]);
             Ok(Output::default())
         });
+        // Checked before the pane rules: read, set (`-t $3 <option> off`) and unset (`-u -t $3 <option>`).
+        let (p, option_fail) = (panes.clone(), mux.option_fail);
+        w.fakes.mux_script(OPTION, move |argv| {
+            if let Some(how) = option_fail {
+                return failed(how);
+            }
+            if argv[1] == "show-options" {
+                let value = get(&p, OPTION).map_or(String::new(), |v| format!("{v}\n"));
+                return Ok(out(0, &value, ""));
+            }
+            if argv[2] == "-u" {
+                p.borrow_mut().retain(|(key, _)| key != OPTION);
+            } else {
+                set(&p, OPTION, argv[5].clone());
+            }
+            Ok(Output::default())
+        });
         (w, panes)
+    }
+
+    fn option(panes: &Panes) -> Option<String> {
+        get(panes, OPTION)
+    }
+
+    // ensure as the caller, after its probe: `opened <pane>`, `existing <pane>`, `disabled` or the refusal.
+    fn ensure_run(w: &World) -> String {
+        let caller = w.caller();
+        match ensure(&w.ctx, &caller) {
+            Ok(Bar::Opened(pane)) => format!("opened {pane}"),
+            Ok(Bar::Existing(pane)) => format!("existing {pane}"),
+            Ok(Bar::Disabled) => "disabled".into(),
+            Err(r) => format!("{} {} {}", r.code, r.check, r.message),
+        }
     }
 
     fn run(w: &World, args: &[&str]) -> String {
@@ -789,8 +880,13 @@ mod tests {
         }
     }
 
+    // Calls on panes only: the session option's reads and writes are not counted.
     fn count(w: &World, verb: &str) -> usize {
-        w.fakes.mux_calls().iter().filter(|c| c[1] == verb).count()
+        w.fakes
+            .mux_calls()
+            .iter()
+            .filter(|c| c[1] == verb && !c.iter().any(|a| a == OPTION))
+            .count()
     }
 
     // Every call but the probes, as text.
@@ -833,7 +929,7 @@ mod tests {
             run(&w, &[]),
             r#"ok {"pane":"%7","window":"@5","opened":false}"#
         );
-        assert_eq!(calls(&w), [LIST]);
+        assert_eq!(calls(&w), [ON, LIST]);
         assert_eq!(roles(&panes), "%1=|,%2=other|,%7=sidebar|");
         // An agent pane that also carries the role is never the bar.
         let (w, panes) = sidebar_world(
@@ -927,7 +1023,9 @@ mod tests {
             w.fakes.locks(),
             [
                 format!("+sidebar|{key}|$3 display-message"),
-                format!("-sidebar|{key}|$3 display-message,list-panes,split-window,set-option"),
+                format!(
+                    "-sidebar|{key}|$3 display-message,set-option,list-panes,split-window,set-option"
+                ),
             ]
         );
     }
@@ -1093,11 +1191,11 @@ mod tests {
             },
         );
         assert_eq!(run(&w, &["-Close"]), r#"ok {"pane":"%7","closed":true}"#);
-        assert_eq!(calls(&w), [LIST, "-N kill-pane -t %7"]);
+        assert_eq!(calls(&w), [OFF, LIST, "-N kill-pane -t %7"]);
         assert_eq!(roles(&panes), "%1=|,%2=other|");
         w.fakes.clear_log();
         assert_eq!(run(&w, &["-Close"]), r#"ok {"pane":null,"closed":false}"#);
-        assert_eq!(calls(&w), [LIST]);
+        assert_eq!(calls(&w), [OFF, LIST]);
         for how in ["exit", "throw"] {
             let (w, panes) = sidebar_world(
                 "",
@@ -1126,6 +1224,7 @@ mod tests {
         assert_eq!(
             calls(&w),
             [
+                ON.to_string(),
                 LIST.to_string(),
                 split_line(&w, true),
                 "-N set-option -p -t %7 @agent-role sidebar".into()
@@ -1161,5 +1260,206 @@ mod tests {
         ));
         expected.extend(["-l", "42", "/opt/mux agents/bin/mux-agent", "watch"].map(String::from));
         assert_eq!(split, [expected]);
+    }
+
+    // ---- ensure
+
+    #[test]
+    fn ensure_opens_one_bar_then_finds_it() {
+        let (w, panes) = sidebar_world("", Mux::default());
+        assert_eq!(ensure_run(&w), "opened %7");
+        assert_eq!(
+            calls(&w),
+            [
+                READ_OPTION.to_string(),
+                LIST.into(),
+                split_line(&w, true),
+                "-N set-option -p -t %7 @agent-role sidebar".into()
+            ]
+        );
+        w.fakes.clear_log();
+        assert_eq!(ensure_run(&w), "existing %7");
+        assert_eq!(calls(&w), [READ_OPTION, LIST]);
+        assert_eq!(roles(&panes), "%1=|,%2=other|,%7=sidebar|");
+        // ensure only reads the option.
+        assert_eq!(option(&panes), None);
+    }
+
+    #[test]
+    fn ensure_reads_option_under_sidebar_lock() {
+        for disabled in [false, true] {
+            let (w, _) = sidebar_world(
+                "",
+                Mux {
+                    disabled,
+                    ..Mux::default()
+                },
+            );
+            let caller = w.caller();
+            w.fakes.clear_log();
+            let fakes = w.fakes.clone();
+            w.fakes.lock_probe(move |_| {
+                fakes
+                    .mux_calls()
+                    .iter()
+                    .map(|c| c[1].clone())
+                    .collect::<Vec<_>>()
+                    .join(",")
+            });
+            assert!(ensure(&w.ctx, &caller).is_ok());
+            let key = caller.server_key;
+            let inside = if disabled {
+                "show-options"
+            } else {
+                "show-options,list-panes,split-window,set-option"
+            };
+            assert_eq!(
+                w.fakes.locks(),
+                [
+                    format!("+sidebar|{key}|$3"),
+                    format!("-sidebar|{key}|$3 {inside}")
+                ],
+                "{disabled}"
+            );
+        }
+    }
+
+    #[test]
+    fn ensure_disabled_opens_nothing() {
+        for open in [false, true] {
+            let (w, panes) = sidebar_world(
+                "",
+                Mux {
+                    open,
+                    disabled: true,
+                    ..Mux::default()
+                },
+            );
+            let before = roles(&panes);
+            assert_eq!(ensure_run(&w), "disabled", "{open}");
+            assert_eq!(calls(&w), [READ_OPTION], "{open}");
+            assert_eq!(roles(&panes), before, "{open}");
+        }
+    }
+
+    #[test]
+    fn ensure_failure_refuses_and_opens_no_second_bar() {
+        // A candidate that cannot be checked is unknown, not absent.
+        for how in ["exit", "throw"] {
+            let (w, panes) = sidebar_world(
+                "",
+                Mux {
+                    open: true,
+                    probe_fail: Some((how, 1)),
+                    ..Mux::default()
+                },
+            );
+            assert_eq!(
+                ensure_run(&w),
+                "1 sidebar pane %7 could not be checked as the side bar; try again",
+                "{how}"
+            );
+            assert_eq!(count(&w, "split-window"), 0, "{how}");
+            assert_eq!(roles(&panes), "%1=|,%2=other|,%7=sidebar|", "{how}");
+        }
+        // An option that cannot be read may say off: nothing is listed or opened.
+        for how in ["exit", "throw"] {
+            let (w, _) = sidebar_world(
+                "",
+                Mux {
+                    option_fail: Some(how),
+                    ..Mux::default()
+                },
+            );
+            assert!(ensure_run(&w).starts_with("1 "), "{how}");
+            assert_eq!(calls(&w), [READ_OPTION], "{how}");
+        }
+        // A split that fails opens nothing.
+        let (w, panes) = sidebar_world(
+            "",
+            Mux {
+                split_error: Some("no space for new pane"),
+                ..Mux::default()
+            },
+        );
+        assert_eq!(ensure_run(&w), "1 rmux rmux call failed");
+        assert_eq!(roles(&panes), "%1=|,%2=other|");
+    }
+
+    #[test]
+    fn close_disables_and_sidebar_enables_under_the_lock() {
+        let (w, panes) = sidebar_world(
+            "",
+            Mux {
+                open: true,
+                ..Mux::default()
+            },
+        );
+        let fakes = w.fakes.clone();
+        w.fakes.lock_probe(move |event| {
+            if event.starts_with('-') {
+                fakes
+                    .mux_calls()
+                    .iter()
+                    .filter(|c| c[1] == "set-option" || c[1] == "kill-pane")
+                    .map(|c| c.join(" "))
+                    .collect::<Vec<_>>()
+                    .join(",")
+            } else {
+                String::new()
+            }
+        });
+        assert_eq!(run(&w, &["-Close"]), r#"ok {"pane":"%7","closed":true}"#);
+        // Off is written inside the lock, before the kill.
+        let key = w.caller().server_key;
+        assert_eq!(
+            w.fakes.locks()[1],
+            format!("-sidebar|{key}|$3 {OFF},-N kill-pane -t %7")
+        );
+        assert_eq!(option(&panes), Some("off".into()));
+        // Once close has returned, ensure (as a spawn runs it) opens nothing.
+        w.fakes.clear_log();
+        assert_eq!(ensure_run(&w), "disabled");
+        assert_eq!(count(&w, "split-window"), 0);
+        assert_eq!(roles(&panes), "%1=|,%2=other|");
+        // sidebar turns it back on, inside the lock, and opens the bar.
+        w.fakes.clear_log();
+        assert_eq!(
+            run(&w, &[]),
+            r#"ok {"pane":"%7","window":"@5","opened":true}"#
+        );
+        assert_eq!(option(&panes), None);
+        assert_eq!(
+            w.fakes.locks()[1],
+            format!("-sidebar|{key}|$3 {ON},-N set-option -p -t %7 @agent-role sidebar")
+        );
+        assert_eq!(ensure_run(&w), "existing %7");
+    }
+
+    #[test]
+    fn option_write_failure_refuses_before_any_pane_call() {
+        for args in [&["-Close"][..], &[]] {
+            for how in ["exit", "throw"] {
+                let (w, panes) = sidebar_world(
+                    "",
+                    Mux {
+                        open: true,
+                        option_fail: Some(how),
+                        ..Mux::default()
+                    },
+                );
+                assert!(run(&w, args).starts_with("1 "), "{args:?} {how}");
+                assert_eq!(
+                    (count(&w, "list-panes"), count(&w, "kill-pane")),
+                    (0, 0),
+                    "{args:?} {how}"
+                );
+                assert_eq!(
+                    roles(&panes),
+                    "%1=|,%2=other|,%7=sidebar|",
+                    "{args:?} {how}"
+                );
+            }
+        }
     }
 }

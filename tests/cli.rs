@@ -49,14 +49,16 @@ fn endpoint(verb: &str) -> (i32, String, String) {
     (1, line, String::new())
 }
 
-const SPAWN: &str = "usage: mux-agent spawn -Client <claude|copilot> [-Task <text>] [-TaskFile <path>] [-BriefFile <path>] [-Name <name>] [-Split <value>] [-NoFork] [-Text]";
+const SPAWN: &str = "usage: mux-agent spawn -Client <claude|copilot> [-Task <text>] [-TaskFile <path>] [-BriefFile <path>] [-Name <name>] [-Split <value>] [-Tab] [-NoFork] [-Text]";
 const LIST: &str = "usage: mux-agent list [-All] [-Text]";
 const FOCUS: &str = "usage: mux-agent focus <name> [-Text]";
 const READ: &str = "usage: mux-agent read [-Wait <seconds>] | read <name> [-Lines <n>] [-Text]";
 
 #[test]
 fn no_args_usage_exit_2() {
-    let all = usage("usage: mux-agent <focus|list|read|send|sidebar|spawn|status|stop|watch> ...");
+    let all = usage(
+        "usage: mux-agent <focus|list|placement|read|send|sidebar|spawn|status|stop|watch> ...",
+    );
     assert_eq!(mux_agent(&[]), all);
     assert_eq!(mux_agent(&["bogus", "-Text"]), all);
     assert_eq!(mux_agent(&["-Text"]), all);

@@ -1,7 +1,12 @@
-// Spawn replies printed by mux-agent (JSON and -Text), success and the tagged refusal.
+// Spawn replies printed by mux-agent (JSON and -Text): success with the side bar open, turned off and failed after
+// the commit, and the tagged refusal.
 // Pinned by src/cli.rs `spawn_replies_fixture_matches`, which runs a real spawn over the fakes and fails on any drift.
 // The random id and sessionId are fixed to 0123456789ab and 00000000-0000-4000-8000-000000000000.
-export const SPAWN_JSON = "{\"ok\":true,\"verb\":\"spawn\",\"name\":\"claude-1\",\"id\":\"0123456789ab\",\"pane\":\"%9\",\"window\":\"@5\",\"client\":\"claude\",\"sessionId\":\"00000000-0000-4000-8000-000000000000\",\"context\":\"brief\",\"reason\":\"human\"}"
+export const SPAWN_JSON = "{\"ok\":true,\"verb\":\"spawn\",\"name\":\"claude-1\",\"id\":\"0123456789ab\",\"pane\":\"%9\",\"window\":\"@5\",\"client\":\"claude\",\"sessionId\":\"00000000-0000-4000-8000-000000000000\",\"context\":\"brief\",\"reason\":\"human\",\"placement\":\"tab\",\"placementSource\":\"default\",\"sidebar\":\"%13\"}"
+export const SPAWN_OFF_JSON = "{\"ok\":true,\"verb\":\"spawn\",\"name\":\"claude-1\",\"id\":\"0123456789ab\",\"pane\":\"%9\",\"window\":\"@5\",\"client\":\"claude\",\"sessionId\":\"00000000-0000-4000-8000-000000000000\",\"context\":\"brief\",\"reason\":\"human\",\"placement\":\"tab\",\"placementSource\":\"default\",\"sidebar\":null}"
+export const SPAWN_ERROR_JSON = "{\"ok\":true,\"verb\":\"spawn\",\"name\":\"claude-1\",\"id\":\"0123456789ab\",\"pane\":\"%9\",\"window\":\"@5\",\"client\":\"claude\",\"sessionId\":\"00000000-0000-4000-8000-000000000000\",\"context\":\"brief\",\"reason\":\"human\",\"placement\":\"tab\",\"placementSource\":\"default\",\"sidebar\":null,\"sidebarError\":\"pane %13 could not be checked as the side bar; try again\"}"
 export const TAGGED_JSON = "{\"ok\":false,\"verb\":\"spawn\",\"code\":2,\"check\":\"tagged\",\"message\":\"an agent pane cannot spawn agents\"}"
-export const SPAWN_TEXT = "name: claude-1\nid: 0123456789ab\npane: %9\nwindow: @5\nclient: claude\nsessionId: 00000000-0000-4000-8000-000000000000\ncontext: brief\nreason: human"
+export const SPAWN_TEXT = "name: claude-1\nid: 0123456789ab\npane: %9\nwindow: @5\nclient: claude\nsessionId: 00000000-0000-4000-8000-000000000000\ncontext: brief\nreason: human\nplacement: tab\nplacementSource: default\nsidebar %13"
+export const SPAWN_OFF_TEXT = "name: claude-1\nid: 0123456789ab\npane: %9\nwindow: @5\nclient: claude\nsessionId: 00000000-0000-4000-8000-000000000000\ncontext: brief\nreason: human\nplacement: tab\nplacementSource: default\nsidebar off"
+export const SPAWN_ERROR_TEXT = "name: claude-1\nid: 0123456789ab\npane: %9\nwindow: @5\nclient: claude\nsessionId: 00000000-0000-4000-8000-000000000000\ncontext: brief\nreason: human\nplacement: tab\nplacementSource: default\nsidebar error: pane %13 could not be checked as the side bar; try again"
 export const TAGGED_TEXT = "code: 2\ncheck: tagged\nmessage: an agent pane cannot spawn agents"

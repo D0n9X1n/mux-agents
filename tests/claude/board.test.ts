@@ -1,7 +1,9 @@
 import { expect, test } from 'claude-code/testing'
 
 import { clean, formatAge, isSpawn, parseList } from '../../hooks/board'
-import { SPAWN_JSON, SPAWN_TEXT, TAGGED_JSON, TAGGED_TEXT } from './spawn-replies'
+import {
+  SPAWN_ERROR_JSON, SPAWN_ERROR_TEXT, SPAWN_JSON, SPAWN_OFF_JSON, SPAWN_OFF_TEXT, SPAWN_TEXT, TAGGED_JSON, TAGGED_TEXT,
+} from './spawn-replies'
 
 const E = 'sh "/p/scripts/mux-agent"'
 const LISTED = '{"ok":true,"verb":"list","running":0,"agents":[]}'
@@ -16,6 +18,13 @@ test('isSpawn accepts every spawn form with a real spawn reply, JSON or -Text', 
   expect(isSpawn(`${E} spawn`, `${SPAWN_JSON}\r\n`)).toBe(true)
   expect(isSpawn(`${E} spawn -Text`, SPAWN_TEXT)).toBe(true)
   expect(isSpawn(`${E} spawn -Text`, `${SPAWN_TEXT.replace(/\n/g, '\r\n')}\r\n`)).toBe(true)
+})
+
+test('isSpawn accepts a spawn whose side bar is off or failed after the commit, JSON or -Text', () => {
+  for (const reply of [SPAWN_OFF_JSON, SPAWN_ERROR_JSON, SPAWN_OFF_TEXT, SPAWN_ERROR_TEXT]) {
+    expect(isSpawn(`${E} spawn`, reply)).toBe(true)
+    expect(isSpawn(`${E} spawn -Text`, `${reply.replace(/\n/g, '\r\n')}\r\n`)).toBe(true)
+  }
 })
 
 test('isSpawn accepts a Windows path with backslashes, quoted or not', () => {

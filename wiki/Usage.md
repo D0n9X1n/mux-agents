@@ -39,20 +39,23 @@ You rarely type these: the skill runs them for you. Every command is `<plugin>/s
 
 | verb | example | what it does |
 |---|---|---|
-| `spawn` | `spawn -Client copilot -TaskFile task.md -BriefFile brief.md -Split h` | start an agent in a new window, or a split with `-Split h\|v` |
+| `spawn` | `spawn -Client copilot -TaskFile task.md -BriefFile brief.md -Split h` | start an agent where the session's `placement` says (a new window by default); `-Split h\|v` or `-Tab` decides for this one |
+| `placement` | `placement h`, `placement tab` | where `spawn` opens agents for the rest of the session: `tab` (a new window, the default), `h` or `v` (a split beside you) |
 | `list` | `list -All` | live agents, what each is doing, unread messages; `-All` adds ended ones |
 | `status` | `status -BodyFile step.txt` | an agent says what it is doing now |
 | `send` | `send claude-1 -BodyFile note.md`, `send parent -BodyFile result.md` | post a message to an agent or to your parent |
 | `read` | `read -Wait 600`, `read claude-1 -Lines 40` | wait for your messages, or read an agent's pane |
 | `focus` | `focus claude-1` | switch the multiplexer to an agent's pane |
 | `stop` | `stop claude-1` | close an agent's pane and its processes |
-| `sidebar` | `sidebar`, `sidebar -Close` | open or close the side-bar split |
+| `sidebar` | `sidebar`, `sidebar -Close` | reopen the side-bar split, or close it for the rest of the session |
 
 Exit code 0 means ok, 1 an error and 2 a refusal or usage error; on failure, `check` names the cause.
 
+Choose where agents open once per session: `placement h` (or `v`) splits your pane for every later `spawn`, `placement tab` goes back to new windows, and `placement` alone shows the choice. It lives on the multiplexer session, so it ends with the session and nothing is written to disk; `-Split h|v` or `-Tab` on one `spawn` overrides it.
+
 ## Side bar
 
-In Claude Code, an `Agents` pane beside the chat opens after the first successful `spawn` (or with `/mux-agents-pane`) and refreshes every 3 seconds. In any client, `sidebar` opens a split 42 columns wide that redraws every 2 seconds:
+In Claude Code, an `Agents` pane beside the chat opens after the first successful `spawn` (or with `/mux-agents-pane`) and refreshes every 3 seconds. In any client, the first successful `spawn` also opens a split 42 columns wide beside you that redraws every 2 seconds; later spawns reuse it, `sidebar -Close` closes it for the rest of the session and `sidebar` opens it again:
 
 ```text
 mux-agents · 2 running
@@ -64,6 +67,8 @@ mux-agents · 2 running
 ```
 
 "Doing" is what the agent last reported with `status`, else the first line of its last message, else its task.
+
+In tab mode the bar stays in the window you spawned from, not in each agent's window. `sidebar -Close` closes only this multiplexer bar; the Claude Code `Agents` pane is separate.
 
 ## Safety checks
 
@@ -118,11 +123,12 @@ Every refusal is one JSON line with `check` naming the cause:
 | `sandbox` | the caller runs in a sandbox (`SANDBOX_RUNTIME=1`, a macOS sandbox, Linux `NoNewPrivs`, a restricted Windows token) | run the client outside the sandbox |
 | `policy` | the caller is not in bypass or allow-all | Claude Code: bypass permissions (`--dangerously-skip-permissions` or Shift+Tab); Copilot CLI: `--allow-all` |
 | `cap` | 6 agents already live in this session | `stop` one |
-| `tagged` | an agent tried to spawn or open the side bar | only the top-level chat spawns |
+| `tagged` | an agent tried to spawn, open the side bar or set `placement` | only the top-level chat spawns |
 
 ## How it works
 
-- `spawn` opens a detached window (or `-Split h|v` splits the caller's pane) running `<binary> launcher <spec.json>` by the binary's absolute path, tags the pane with `@agent-*` options, and records the agent in the state folder: `MUX_AGENTS_STATE` if set, else `%LOCALAPPDATA%\mux-agents\state` on Windows and `$XDG_STATE_HOME/mux-agents/state` or `~/.local/state/mux-agents/state` on Linux and macOS.
+- `spawn` opens a detached window (or, by `-Split h|v` or the session's `placement`, splits the caller's pane) running `<binary> launcher <spec.json>` by the binary's absolute path, tags the pane with `@agent-*` options, and records the agent in the state folder: `MUX_AGENTS_STATE` if set, else `%LOCALAPPDATA%\mux-agents\state` on Windows and `$XDG_STATE_HOME/mux-agents/state` or `~/.local/state/mux-agents/state` on Linux and macOS.
+- Once the agent is committed, `spawn` finds or opens the session's side bar under the side bar's own lock; a failure there is reported as `sidebarError` and never fails the spawn.
 - Messages go to per-pane mailboxes, never as keystrokes. `read -Wait` returns each message once. Every child posts exactly one exit notice to its parent: `exited`, `stopped` or `lost`.
 - Locks are per user: on Unix, files under `~/.local/state/mux-agents/locks`; on Windows, a named mutex `Local\MuxAgents-<hex>`. This fixes the .NET named-mutex advisory [GHSA-2j93-m82w-73j2](https://github.com/advisories/GHSA-2j93-m82w-73j2) that affected 0.1 on Linux and macOS.
 - `list` with six live agents averages about 23 ms (`scripts/dev/bench-list.sh`, tmux 3.8 on an Apple silicon Mac).

@@ -39,20 +39,23 @@ flowchart LR
 
 | 动词 | 示例 | 作用 |
 |---|---|---|
-| `spawn` | `spawn -Client copilot -TaskFile task.md -BriefFile brief.md -Split h` | 在新窗口中启动代理，或用 `-Split h\|v` 分屏启动 |
+| `spawn` | `spawn -Client copilot -TaskFile task.md -BriefFile brief.md -Split h` | 按会话的 `placement` 启动代理（默认是新窗口）；`-Split h\|v` 或 `-Tab` 只决定这一次 |
+| `placement` | `placement h`，`placement tab` | 本会话之后 `spawn` 在哪里打开代理：`tab`（新窗口，默认）、`h` 或 `v`（在你旁边分屏） |
 | `list` | `list -All` | 存活的代理、各自在做什么、未读消息；`-All` 加上已结束的 |
 | `status` | `status -BodyFile step.txt` | 代理报告自己当前在做什么 |
 | `send` | `send claude-1 -BodyFile note.md`，`send parent -BodyFile result.md` | 给某个代理或你的父代理发消息 |
 | `read` | `read -Wait 600`，`read claude-1 -Lines 40` | 等待你的消息，或读取某个代理的窗格 |
 | `focus` | `focus claude-1` | 让多路复用器切换到某个代理的窗格 |
 | `stop` | `stop claude-1` | 关闭代理的窗格及其进程 |
-| `sidebar` | `sidebar`，`sidebar -Close` | 打开或关闭侧边栏分屏 |
+| `sidebar` | `sidebar`，`sidebar -Close` | 重新打开侧边栏分屏，或在本会话剩余时间内关闭它 |
 
 退出码 0 表示成功，1 表示错误，2 表示拒绝或用法错误；失败时由 `check` 指明原因。
 
+每个会话选一次代理在哪里打开：`placement h`（或 `v`）让之后每次 `spawn` 都拆分你的窗格，`placement tab` 改回新窗口，单独的 `placement` 显示当前选择。它保存在多路复用器会话上，随会话结束，不写入磁盘；单次 `spawn` 上的 `-Split h|v` 或 `-Tab` 会覆盖它。
+
 ## 侧边栏
 
-在 Claude Code 中，第一次成功 `spawn` 后（或用 `/mux-agents-pane`）会在聊天旁打开 `Agents` 窗格，每 3 秒刷新一次。在任何客户端中，`sidebar` 会打开一个 42 列宽的分屏，每 2 秒重绘一次：
+在 Claude Code 中，第一次成功 `spawn` 后（或用 `/mux-agents-pane`）会在聊天旁打开 `Agents` 窗格，每 3 秒刷新一次。在任何客户端中，第一次成功 `spawn` 还会在你旁边打开一个 42 列宽的分屏，每 2 秒重绘一次；之后的启动复用它，`sidebar -Close` 在本会话剩余时间内关闭它，`sidebar` 重新打开它：
 
 ```text
 mux-agents · 2 running
@@ -64,6 +67,8 @@ mux-agents · 2 running
 ```
 
 “正在做的事”是代理最近用 `status` 报告的内容，否则是它最后一条消息的第一行，否则是它的任务。
+
+在标签页模式下，侧边栏留在你启动代理的窗口里，而不在每个代理的窗口里。`sidebar -Close` 只关闭这个多路复用器侧边栏；Claude Code 的 `Agents` 窗格与它无关。
 
 ## 安全检查
 
@@ -118,11 +123,12 @@ copilot plugin marketplace update mux-agents && copilot plugin update mux-agents
 | `sandbox` | 调用者在沙箱中运行（`SANDBOX_RUNTIME=1`、macOS 沙箱、Linux `NoNewPrivs`、受限的 Windows 令牌） | 在沙箱外运行客户端 |
 | `policy` | 调用者没有以绕过权限或全部允许的方式运行 | Claude Code：绕过权限（`--dangerously-skip-permissions` 或 Shift+Tab）；Copilot CLI：`--allow-all` |
 | `cap` | 此会话中已有 6 个存活代理 | `stop` 其中一个 |
-| `tagged` | 代理尝试启动代理或打开侧边栏 | 只有顶层聊天可以启动代理 |
+| `tagged` | 代理尝试启动代理、打开侧边栏或设置 `placement` | 只有顶层聊天可以启动代理 |
 
 ## 工作原理
 
-- `spawn` 打开一个分离的窗口（或用 `-Split h|v` 拆分调用者的窗格），按二进制文件的绝对路径运行 `<binary> launcher <spec.json>`，用 `@agent-*` 选项标记窗格，并在状态文件夹中记录代理：若设置了 `MUX_AGENTS_STATE` 则用它，否则 Windows 上为 `%LOCALAPPDATA%\mux-agents\state`，Linux 和 macOS 上为 `$XDG_STATE_HOME/mux-agents/state` 或 `~/.local/state/mux-agents/state`。
+- `spawn` 打开一个分离的窗口（或按 `-Split h|v` 或会话的 `placement` 拆分调用者的窗格），按二进制文件的绝对路径运行 `<binary> launcher <spec.json>`，用 `@agent-*` 选项标记窗格，并在状态文件夹中记录代理：若设置了 `MUX_AGENTS_STATE` 则用它，否则 Windows 上为 `%LOCALAPPDATA%\mux-agents\state`，Linux 和 macOS 上为 `$XDG_STATE_HOME/mux-agents/state` 或 `~/.local/state/mux-agents/state`。
+- 代理提交后，`spawn` 在侧边栏自己的锁下找到或打开会话的侧边栏；那里的失败以 `sidebarError` 报告，从不让启动失败。
 - 消息进入每个窗格的邮箱，从不作为按键输入。`read -Wait` 每条消息只返回一次。每个子代理恰好向父代理发送一条退出通知：`exited`、`stopped` 或 `lost`。
 - 锁按用户划分：Unix 上是 `~/.local/state/mux-agents/locks` 下的文件；Windows 上是命名互斥体 `Local\MuxAgents-<hex>`。这修复了 .NET 命名互斥体公告 [GHSA-2j93-m82w-73j2](https://github.com/advisories/GHSA-2j93-m82w-73j2)，它曾影响 0.1 在 Linux 和 macOS 上的版本。
 - 有六个存活代理时，`list` 平均约 23 ms（`scripts/dev/bench-list.sh`，Apple 芯片 Mac 上的 tmux 3.8）。

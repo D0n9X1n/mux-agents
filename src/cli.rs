@@ -35,6 +35,9 @@ impl Request {
 /// A verb's reply fields after `ok` and `verb`, computed against the call's providers.
 pub type Handler = fn(&Ctx, &Request) -> Res<Map<String, Value>>;
 
+/// A successful reply as `-Text` lines; a refusal is always `json::to_text`.
+pub type Text = fn(&Map<String, Value>) -> String;
+
 pub struct VerbDef {
     pub name: &'static str,
     pub values: &'static [&'static str],
@@ -43,17 +46,29 @@ pub struct VerbDef {
     pub max: usize,
     pub usage: &'static str,
     pub handler: Handler,
+    pub text: Text,
 }
 
 pub static VERBS: &[VerbDef] = &[
     VerbDef {
         name: "spawn",
         values: &["Client", "Task", "TaskFile", "BriefFile", "Name", "Split"],
-        switches: &["NoFork"],
+        switches: &["NoFork", "Tab"],
         min: 0,
         max: 0,
-        usage: "usage: mux-agent spawn -Client <claude|copilot> [-Task <text>] [-TaskFile <path>] [-BriefFile <path>] [-Name <name>] [-Split <value>] [-NoFork] [-Text]",
+        usage: "usage: mux-agent spawn -Client <claude|copilot> [-Task <text>] [-TaskFile <path>] [-BriefFile <path>] [-Name <name>] [-Split <value>] [-Tab] [-NoFork] [-Text]",
         handler: crate::agents::spawn::spawn,
+        text: crate::agents::spawn::spawn_text,
+    },
+    VerbDef {
+        name: "placement",
+        values: &[],
+        switches: &[],
+        min: 0,
+        max: 1,
+        usage: "usage: mux-agent placement [tab|h|v] [-Text]",
+        handler: crate::agents::placement::placement,
+        text: crate::agents::placement::placement_text,
     },
     VerbDef {
         name: "list",
@@ -63,6 +78,7 @@ pub static VERBS: &[VerbDef] = &[
         max: 0,
         usage: "usage: mux-agent list [-All] [-Text]",
         handler: crate::agents::view::list,
+        text: json::to_text,
     },
     VerbDef {
         name: "focus",
@@ -72,6 +88,7 @@ pub static VERBS: &[VerbDef] = &[
         max: 1,
         usage: "usage: mux-agent focus <name> [-Text]",
         handler: crate::agents::view::focus,
+        text: json::to_text,
     },
     VerbDef {
         name: "send",
@@ -81,6 +98,7 @@ pub static VERBS: &[VerbDef] = &[
         max: 1,
         usage: "usage: mux-agent send <name|parent|%pane> (-Body <text> | -BodyFile <path>) [-Text]",
         handler: crate::agents::message::send,
+        text: json::to_text,
     },
     VerbDef {
         name: "read",
@@ -90,6 +108,7 @@ pub static VERBS: &[VerbDef] = &[
         max: 1,
         usage: "usage: mux-agent read [-Wait <seconds>] | read <name> [-Lines <n>] [-Text]",
         handler: crate::agents::message::read,
+        text: json::to_text,
     },
     VerbDef {
         name: "stop",
@@ -99,6 +118,7 @@ pub static VERBS: &[VerbDef] = &[
         max: 1,
         usage: "usage: mux-agent stop <name> [-Text]",
         handler: crate::agents::message::stop,
+        text: json::to_text,
     },
     VerbDef {
         name: "status",
@@ -108,6 +128,7 @@ pub static VERBS: &[VerbDef] = &[
         max: 0,
         usage: "usage: mux-agent status (-Body <text> | -BodyFile <path>) [-Text]",
         handler: crate::agents::view::status,
+        text: json::to_text,
     },
     VerbDef {
         name: "sidebar",
@@ -117,6 +138,7 @@ pub static VERBS: &[VerbDef] = &[
         max: 0,
         usage: "usage: mux-agent sidebar [-Close] [-Text]",
         handler: crate::sidebar::sidebar,
+        text: json::to_text,
     },
     VerbDef {
         name: "watch",
@@ -126,6 +148,7 @@ pub static VERBS: &[VerbDef] = &[
         max: 0,
         usage: "usage: mux-agent watch [-Text]",
         handler: crate::sidebar::watch,
+        text: json::to_text,
     },
 ];
 
@@ -213,7 +236,7 @@ fn dispatch(def: &VerbDef, request: &Request, ctx: &Ctx) -> Res<Map<String, Valu
 /// cannot be built replies as JSON with no verb, whatever the arguments. A panic in the verb is 1 `internal`;
 /// unwinding has already released its locks.
 pub fn run<C: Borrow<Ctx>>(args: &[String], ctx: impl FnOnce() -> Res<C>) -> (u8, String) {
-    let (verb, text, outcome) = match ctx() {
+    let (def, text, outcome) = match ctx() {
         Err(refusal) => (None, false, Err(refusal)),
         Ok(ctx) => match parse(args) {
             Err(refusal) => (None, false, Err(refusal)),
@@ -221,16 +244,20 @@ pub fn run<C: Borrow<Ctx>>(args: &[String], ctx: impl FnOnce() -> Res<C>) -> (u8
                 let outcome =
                     panic::catch_unwind(AssertUnwindSafe(|| dispatch(def, &request, ctx.borrow())))
                         .unwrap_or_else(|_| refuse(1, "internal", "unexpected error (panic)"));
-                (Some(def.name), request.text, outcome)
+                (Some(def), request.text, outcome)
             }
         },
     };
-    let (code, reply) = match outcome {
-        Ok(reply) => (0, reply),
-        Err(refusal) => (refusal.code, failure(verb, &refusal)),
+    let (code, reply, lines): (u8, _, Text) = match outcome {
+        Ok(reply) => (0, reply, def.map_or(json::to_text, |d| d.text)),
+        Err(refusal) => (
+            refusal.code,
+            failure(def.map(|d| d.name), &refusal),
+            json::to_text,
+        ),
     };
     let out = if text {
-        json::to_text(&reply)
+        lines(&reply)
     } else {
         json::to_stdout(&Value::Object(reply))
     };
@@ -304,6 +331,7 @@ mod tests {
             max: 1,
             usage: "usage: probe",
             handler: probe,
+            text: json::to_text,
         };
         let request = Request {
             verb: "probe",
@@ -369,7 +397,16 @@ mod tests {
         assert_eq!(
             names,
             [
-                "spawn", "list", "focus", "send", "read", "stop", "status", "sidebar", "watch"
+                "spawn",
+                "placement",
+                "list",
+                "focus",
+                "send",
+                "read",
+                "stop",
+                "status",
+                "sidebar",
+                "watch"
             ]
         );
         for name in names {
@@ -387,6 +424,7 @@ mod tests {
         // MuxAgents.ps1:1673-1681.
         let bounds = [
             ("spawn", 0, 0),
+            ("placement", 0, 1),
             ("list", 0, 0),
             ("focus", 1, 1),
             ("send", 1, 1),
@@ -431,6 +469,7 @@ mod tests {
     fn valid_call(verb: &str) -> Vec<&'static str> {
         match verb {
             "spawn" => vec!["spawn", "-Client", "claude", "-Task", "hi"],
+            "placement" => vec!["placement", "h"],
             "list" => vec!["list"],
             "focus" => vec!["focus", "worker"],
             "send" => vec!["send", "worker", "-Body", "hi"],
@@ -534,9 +573,11 @@ mod tests {
         w
     }
 
+    // The agent's pane is %12; the side bar's split, the only call running `watch`, answers %13 in the caller's window.
     fn spawn_world() -> World {
         let w = World::human("");
         w.fakes.mux_rule("new-window", 0, "%12|@7\n", "");
+        w.fakes.mux_rule("watch", 0, "%13|@1\n", "");
         w.fakes.mux_rule("split-window", 0, "%12|@7\n", "");
         w
     }
@@ -608,6 +649,15 @@ mod tests {
             0,
         );
         let w = spawn_world();
+        w.fakes.mux_first("@mux-agents-placement", 0, "h\n", "");
+        w.fakes.mux_first("@mux-agents-sidebar", 0, "off\n", "");
+        record(
+            &w,
+            "spawn -Client claude -Task hi, placement h, side bar off",
+            &["spawn", "-Client", "claude", "-Task", "hi"],
+            0,
+        );
+        let w = spawn_world();
         w.fakes.mux_first("set-option", 1, "", "no such pane");
         record(
             &w,
@@ -630,6 +680,8 @@ mod tests {
             ],
             2,
         );
+        record(&World::human(""), "placement", &["placement"], 0);
+        record(&World::human(""), "placement h", &["placement", "h"], 0);
         record(&agents_world(), "list", &["list"], 0);
         record(&agents_world(), "list -All", &["list", "-All"], 0);
         record(&agents_world(), "focus worker", &["focus", "worker"], 0);
@@ -721,31 +773,64 @@ mod tests {
             .replace(session, "00000000-0000-4000-8000-000000000000")
     }
 
+    // A spawn through the entry, JSON or -Text, with its random id and session id fixed.
+    fn spawn_reply(w: &World, text: bool) -> (u8, String) {
+        let mut args = vec!["spawn", "-Client", "claude", "-Task", "hi"];
+        if text {
+            args.push("-Text");
+        }
+        let (code, out) = call(w, &args);
+        let (id, session) = if text {
+            let field = |name: &str| {
+                out.lines()
+                    .find_map(|l| l.strip_prefix(&format!("{name}: ")))
+                    .unwrap()
+                    .to_string()
+            };
+            (field("id"), field("sessionId"))
+        } else {
+            let reply: Value = serde_json::from_str(&out).unwrap();
+            let field = |name: &str| reply[name].as_str().unwrap().to_string();
+            (field("id"), field("sessionId"))
+        };
+        (code, fixed_ids(&out, &id, &session))
+    }
+
     #[test]
     fn spawn_replies_fixture_matches() {
-        let w = spawn_world();
-        w.fakes.mux_first("new-window", 0, "%9|@5\n", "");
-        let (code, out) = call(&w, &["spawn", "-Client", "claude", "-Task", "hi"]);
-        assert_eq!(code, 0, "{out}");
-        let reply: Value = serde_json::from_str(&out).unwrap();
-        let (id, session) = (
-            reply["id"].as_str().unwrap(),
-            reply["sessionId"].as_str().unwrap(),
-        );
-        assert_eq!(fixed_ids(&out, id, session), reply_fixture("SPAWN_JSON"));
-
-        let w = spawn_world();
-        w.fakes.mux_first("new-window", 0, "%9|@5\n", "");
-        let (code, out) = call(&w, &["spawn", "-Client", "claude", "-Task", "hi", "-Text"]);
-        assert_eq!(code, 0, "{out}");
-        let field = |name: &str| {
-            out.lines()
-                .find_map(|l| l.strip_prefix(&format!("{name}: ")))
-                .unwrap()
-                .to_string()
+        // The bar opened (%13), turned off by `sidebar -Close`, and unknown after the commit (its probe failed).
+        let open = || {
+            let w = spawn_world();
+            w.fakes.mux_first("new-window", 0, "%9|@5\n", "");
+            w
         };
-        let (id, session) = (field("id"), field("sessionId"));
-        assert_eq!(fixed_ids(&out, &id, &session), reply_fixture("SPAWN_TEXT"));
+        let off = || {
+            let w = open();
+            w.fakes.mux_first("@mux-agents-sidebar", 0, "off\n", "");
+            w
+        };
+        let failed = || {
+            let w = open();
+            w.fakes
+                .mux_first("#{@agent-role}|#{@agent-id}", 0, "%13|@1|sidebar|\n", "");
+            w.fakes.mux_first("|end", 1, "", "no server");
+            w
+        };
+        let cases: [(&str, &dyn Fn() -> World); 3] = [
+            ("SPAWN", &open),
+            ("SPAWN_OFF", &off),
+            ("SPAWN_ERROR", &failed),
+        ];
+        for (name, world) in cases {
+            for (text, kind) in [(false, "JSON"), (true, "TEXT")] {
+                let fixture = format!("{name}_{kind}");
+                assert_eq!(
+                    spawn_reply(&world(), text),
+                    (0, reply_fixture(&fixture)),
+                    "{fixture}"
+                );
+            }
+        }
 
         let w = World::human(ID);
         let (code, out) = call(&w, &["spawn", "-Client", "claude", "-Task", "hi"]);

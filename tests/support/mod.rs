@@ -6,7 +6,8 @@
 //!   from a cleared environment: HOME=<dir>/home, PATH=<dir>/bin:<PATH>, TMPDIR=<dir>/tmp, MUX_IT_DIR=<dir>,
 //!   MUX_IT_ENTRY=<the mux-agent binary>, plus USER, LOGNAME and LANG when set. So no TMUX, RMUX, MUX_AGENTS_STATE,
 //!   XDG_STATE_HOME or CLAUDE_*/COPILOT_* of the caller's own session reaches a pane. `<dir>/bin` holds `claude` and
-//!   `copilot`, copies of the fake-client binary. A mux that is not installed is skipped with a message (None).
+//!   `copilot`, copies of the fake-client binary. A mux that is not installed is skipped with a message (None),
+//!   unless MUX_AGENTS_LIVE_REQUIRE (`tmux,tmux32,rmux`, any subset) names it: then the test fails instead.
 //! - Every later call is `<mux> -S <socket> -N …`. Dropping the server (or `kill`) snapshots every descendant of the
 //!   server, writes `<dir>/quit`, kills the server, waits for its pid to go (SIGKILL after 5 s), waits for each
 //!   descendant to go (SIGKILL, same start only, after 5 s), removes the socket, then removes the lock files whose
@@ -44,6 +45,15 @@ pub enum Mux {
 impl Mux {
     pub const ALL: [Mux; 3] = [Mux::Tmux38, Mux::Tmux32, Mux::Rmux];
 
+    /// The name MUX_AGENTS_LIVE_REQUIRE spells it by.
+    pub fn name(self) -> &'static str {
+        match self {
+            Mux::Tmux38 => "tmux",
+            Mux::Tmux32 => "tmux32",
+            Mux::Rmux => "rmux",
+        }
+    }
+
     /// The variable a pane's endpoint is read from: RMUX when set, else TMUX.
     pub fn endpoint_var(self) -> &'static str {
         match self {
@@ -52,8 +62,8 @@ impl Mux {
         }
     }
 
-    /// The binary, canonical, or why this mux is skipped.
-    fn binary(self) -> Result<PathBuf, String> {
+    /// The binary, canonical, and its `-V` answer; or why this mux is skipped.
+    fn binary(self) -> Result<(PathBuf, String), String> {
         let (bin, version) = match self {
             Mux::Tmux38 => (on_path("tmux").ok_or("no tmux on PATH")?, "tmux "),
             Mux::Rmux => (on_path("rmux").ok_or("no rmux on PATH")?, "rmux "),
@@ -70,7 +80,7 @@ impl Mux {
         let reported = out.map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string());
         match reported {
             // A set MUX_AGENTS_TMUX32 that is not tmux 3.2a is a broken setup, not a skip.
-            Ok(v) if v.starts_with(version) => Ok(bin),
+            Ok(v) if v.starts_with(version) => Ok((bin, v)),
             other if self == Mux::Tmux32 => panic!("{}: -V answered {other:?}", bin.display()),
             other => Err(format!("{} -V answered {other:?}", bin.display())),
         }
@@ -168,13 +178,7 @@ pub type Run<'a> = (&'a [&'a str], &'a [(&'a str, &'a str)], &'a [&'a str]);
 impl Server {
     /// A server whose one pane runs `sh` in `<dir>/work`, or None (with a message) when `mux` is not installed.
     pub fn start(mux: Mux, dir: &Dir) -> Option<Server> {
-        let bin = match mux.binary() {
-            Ok(bin) => bin,
-            Err(why) => {
-                eprintln!("skipping {mux:?}: {why}");
-                return None;
-            }
-        };
+        let (bin, _) = available(mux)?;
         let fake = env!("CARGO_BIN_EXE_fake-client");
         for name in ["claude", "copilot"] {
             std::fs::copy(fake, dir.join("bin").join(name)).unwrap();
@@ -314,8 +318,14 @@ impl Server {
 
     /// Types `text` literally into the root pane, then Enter.
     pub fn send_keys(&self, text: &str) {
-        self.call(&["send-keys", "-t", &self.pane, "-l", text]);
-        self.call(&["send-keys", "-t", &self.pane, "Enter"]);
+        let pane = self.pane.clone();
+        self.send_keys_to(&pane, text);
+    }
+
+    /// Types `text` literally into `pane`, then Enter.
+    pub fn send_keys_to(&self, pane: &str, text: &str) {
+        self.call(&["send-keys", "-t", pane, "-l", text]);
+        self.call(&["send-keys", "-t", pane, "Enter"]);
     }
 
     /// The root pane's screen.
@@ -372,14 +382,26 @@ impl Server {
     /// bytes on macOS (MAX_CANON) and drops the rest, Enter included. Sourced, the line runs in the shell itself, so
     /// `&`, `$!` and job control are as if typed.
     fn type_line(&mut self, line: &str) {
+        let pane = self.pane.clone();
+        self.type_line_in(&pane, line);
+    }
+
+    /// `type_line` in `pane`'s shell.
+    fn type_line_in(&mut self, pane: &str, line: &str) {
         self.lines += 1;
         let path = self.dir.join(format!("line.{}.sh", self.lines));
         write_atomic(&path, format!("{line}\n"));
-        self.send_keys(&format!(". {}", quote(path.to_str().unwrap())));
+        self.send_keys_to(pane, &format!(". {}", quote(path.to_str().unwrap())));
     }
 
     /// Runs `line` in the root pane's shell with stdout to a file renamed into place once the line is done.
     fn shell(&mut self, line: &str) -> (String, String) {
+        let pane = self.pane.clone();
+        self.shell_in(&pane, line)
+    }
+
+    /// `shell` in `pane`'s shell.
+    fn shell_in(&mut self, pane: &str, line: &str) -> (String, String) {
         self.runs += 1;
         let file = |ext: &str| self.dir.join(format!("run.{}.{ext}", self.runs));
         let (out, err, tmp) = (file("out"), file("err"), file("tmp"));
@@ -388,9 +410,10 @@ impl Server {
             quote(err.to_str().unwrap()),
             quote(tmp.to_str().unwrap()),
         );
-        self.type_line(&format!(
-            "{line} > {tmp_q} 2> {err_q}; echo $? >> {err_q}; mv {tmp_q} {out_q}"
-        ));
+        self.type_line_in(
+            pane,
+            &format!("{line} > {tmp_q} 2> {err_q}; echo $? >> {err_q}; mv {tmp_q} {out_q}"),
+        );
         let name = out.file_name().unwrap().to_str().unwrap().to_string();
         let stdout = self.wait_file(&name);
         (stdout, std::fs::read_to_string(err).unwrap())
@@ -424,11 +447,18 @@ impl Server {
     /// Runs the mux-agent binary in the root pane as `env <vars> <mux-agent> <args>` and answers its exit code and
     /// JSON reply. `vars` reach only this call; the pane's own env is the server's (see `start`).
     pub fn run(&mut self, args: &[&str], vars: &[(&str, &str)]) -> (i32, Value) {
-        let (code, stdout, stderr) = self.run_raw(env!("CARGO_BIN_EXE_mux-agent"), args, vars, &[]);
+        let pane = self.pane.clone();
+        self.run_in(&pane, args, vars)
+    }
+
+    /// `run` from `pane`'s shell: any pane of this server whose process is `sh`.
+    pub fn run_in(&mut self, pane: &str, args: &[&str], vars: &[(&str, &str)]) -> (i32, Value) {
+        let line = Self::line(env!("CARGO_BIN_EXE_mux-agent"), args, vars, &[]);
+        let (stdout, err) = self.shell_in(pane, &line);
         match serde_json::from_str(&stdout) {
-            Ok(reply) => (code, reply),
+            Ok(reply) => (code_of(&err).unwrap_or(-1), reply),
             Err(_) => panic!(
-                "{:?} {args:?}: stdout {stdout:?}, stderr {stderr:?}, code {code}",
+                "{:?} {args:?} in {pane}: stdout {stdout:?}, stderr and code {err:?}",
                 self.mux
             ),
         }
@@ -842,4 +872,56 @@ fn teardown_never_signals_a_reused_server_pid() {
     }
     drop(guard);
     let _ = sentinel.wait();
+}
+
+/// The exit code the shell appended as the last line of a run's stderr file.
+fn code_of(err: &str) -> Option<i32> {
+    err.lines().last().and_then(|c| c.trim().parse().ok())
+}
+
+/// The multiplexers a comma-separated MUX_AGENTS_LIVE_REQUIRE names (`tmux`, `tmux32`, `rmux`); an unknown name is an
+/// error, so a misspelt gate never passes as an empty one.
+pub fn required(list: &str) -> Result<Vec<Mux>, String> {
+    list.split(',')
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(|name| {
+            Mux::ALL
+                .into_iter()
+                .find(|mux| mux.name() == name)
+                .ok_or_else(|| format!("MUX_AGENTS_LIVE_REQUIRE: unknown multiplexer {name:?}"))
+        })
+        .collect()
+}
+
+/// The binary and its `-V` answer, or None with a skip message. A multiplexer MUX_AGENTS_LIVE_REQUIRE names is never
+/// skipped: it fails the test instead. The gate is opt-in, so CI without rmux or tmux 3.2a still skips them.
+pub fn available(mux: Mux) -> Option<(PathBuf, String)> {
+    let list = std::env::var("MUX_AGENTS_LIVE_REQUIRE").unwrap_or_default();
+    let gate = required(&list).unwrap_or_else(|why| panic!("{why}"));
+    match mux.binary() {
+        Ok(found) => Some(found),
+        Err(why) if gate.contains(&mux) => {
+            panic!("MUX_AGENTS_LIVE_REQUIRE names {} but {why}", mux.name())
+        }
+        Err(why) => {
+            eprintln!("skipping {mux:?}: {why}");
+            None
+        }
+    }
+}
+
+#[test]
+fn require_list_names_each_multiplexer() {
+    assert_eq!(required(""), Ok(vec![]));
+    assert_eq!(required(" , "), Ok(vec![]));
+    assert_eq!(
+        required("tmux,tmux32,rmux"),
+        Ok(vec![Mux::Tmux38, Mux::Tmux32, Mux::Rmux])
+    );
+    assert_eq!(required(" rmux , tmux "), Ok(vec![Mux::Rmux, Mux::Tmux38]));
+    // A misspelt name is an error, never a silently empty gate.
+    for bad in ["tmux3.2", "TMUX", "rmux,tmux38", "all"] {
+        assert!(required(bad).is_err(), "{bad}");
+    }
 }

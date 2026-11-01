@@ -139,7 +139,7 @@ $block
 END_BLOCK
 set +f
 unset MUX_AGENTS_BIN
-if [ "$n" = 12 ] && [ -z "$why" ]; then ok skill_commands_run_through_shim; else bad skill_commands_run_through_shim "$n commands$why"; fi
+if [ "$n" = 15 ] && [ -z "$why" ]; then ok skill_commands_run_through_shim; else bad skill_commands_run_through_shim "$n commands$why"; fi
 
 echo "$pass passed, $fail failed"
 [ "$fail" = 0 ]
