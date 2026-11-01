@@ -23,6 +23,7 @@ The .NET named-mutex advisory [GHSA-2j93-m82w-73j2](https://github.com/advisorie
 
 ## Releases
 
+- [v0.2.2](Release-v0.2.2) — a side bar you can read at a glance, locked to the right; agents named after their task; lost agents close on their own; terminal CLI only
 - [v0.2.1](Release-v0.2.1) — tabs or panes per session with `placement`; the side bar opens on its own
 - [v0.2.0](Release-v0.2.0) — one native binary for macOS, Linux and Windows, no PowerShell; file locks on Unix
 - [v0.1.0](Release-v0.1.0) — the first release: spawn, list, status, send, read, focus, stop and the side bar on Windows, Linux and macOS
