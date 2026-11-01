@@ -57,6 +57,8 @@ struct Log {
     kills: Vec<u32>,
     report: Option<Report>,
     probe: Option<Probe>,
+    // Lock keys starting with one of these time out, as a lock held elsewhere for 15 s would.
+    timeouts: Vec<String>,
     // What `Mux::kind` answers; none is tmux.
     kind: Option<Kind>,
 }
@@ -67,11 +69,17 @@ thread_local! {
 }
 
 /// Stands in for `state::lock::with_lock` in tests: records the hold in the current fakes and runs `f`. A
-/// second hold of a held key panics, as the real lock would time out on it.
+/// second hold of a held key panics, as the real lock would time out on it; a key set by `lock_timeout` refuses
+/// 2 `lock` as the real lock does after its wait.
 pub fn locked<T>(key: &str, f: impl FnOnce() -> Res<T>) -> Res<T> {
     let fakes = CURRENT
         .with(|current| current.borrow().clone())
         .expect("a lock taken before Fakes::ctx on this thread");
+    let timed_out = fakes.0.borrow().timeouts.iter().any(|t| key.starts_with(t));
+    if timed_out {
+        fakes.0.borrow_mut().locks.push(format!("!{key}"));
+        return crate::error::refuse(2, "lock", "timed out waiting for the agent lock");
+    }
     fakes.lock_event('+', key);
     let out = f();
     fakes.lock_event('-', key);
@@ -200,6 +208,11 @@ impl Fakes {
     /// test sees, or changes, state while a lock is held.
     pub fn lock_probe(&self, probe: impl Fn(&str) -> String + 'static) {
         self.0.borrow_mut().probe = Some(Rc::new(probe));
+    }
+
+    /// Every later lock whose key starts with `prefix` times out (recorded as `!key`) without running its body.
+    pub fn lock_timeout(&self, prefix: &str) {
+        self.0.borrow_mut().timeouts.push(prefix.into());
     }
 
     /// Forgets the recorded OS, multiplexer, sleep and lock calls.

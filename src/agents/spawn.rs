@@ -7,7 +7,7 @@ use serde_json::{Map, Value, json};
 
 use super::mail::doing_line;
 use super::placement::{DEFAULT as DEFAULT_PLACEMENT, read_placement};
-use super::{copilot, lock, lock_key, registry, state_dir, usage};
+use super::{copilot, lock, lock_key, registry, state_dir, text, usage};
 use crate::caller::{Caller, Kind, resolve};
 use crate::checks::{Context, Plan, assert_spawn_allowed, context_plan, resolve_name, session_id};
 use crate::cli::Request;
@@ -15,6 +15,7 @@ use crate::ctx::Ctx;
 use crate::error::{Refusal, Res, refuse};
 use crate::mux::{Kind as MuxKind, native};
 use crate::parse::{Client, cmdline_length};
+use crate::sidebar::{self, Bar};
 use crate::state::fs::{BRIEF_MAX, TASK_MAX, read_text, write_json};
 use crate::state::root::OsKind;
 use crate::util::{guid, hex_id, utc_o};
@@ -143,7 +144,35 @@ pub fn spawn(ctx: &Ctx, request: &Request) -> Res<Map<String, Value>> {
     })?;
     reply.insert("placement".into(), placement.into());
     reply.insert("placementSource".into(), source.into());
+    // The agent is committed and the spawn lock released: the bar is best effort and never fails the spawn.
+    match sidebar::ensure(ctx, &caller) {
+        Ok(Bar::Opened(pane) | Bar::Existing(pane)) => {
+            reply.insert("sidebar".into(), pane.into());
+        }
+        Ok(Bar::Disabled) => {
+            reply.insert("sidebar".into(), Value::Null);
+        }
+        Err(refusal) => {
+            reply.insert("sidebar".into(), Value::Null);
+            reply.insert("sidebarError".into(), refusal.message.into());
+        }
+    }
     Ok(reply)
+}
+
+/// The reply's `key: value` lines, then `sidebar <pane>`, `sidebar off` or `sidebar error: <message>`.
+pub fn spawn_text(reply: &Map<String, Value>) -> String {
+    let fields: Map<String, Value> = reply
+        .iter()
+        .filter(|(key, _)| *key != "sidebar" && *key != "sidebarError")
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect();
+    let bar = match (reply.get("sidebarError"), reply.get("sidebar")) {
+        (Some(error), _) => format!("sidebar error: {}", text(Some(error))),
+        (None, Some(Value::String(pane))) => format!("sidebar {pane}"),
+        _ => "sidebar off".into(),
+    };
+    format!("{}\n{bar}", crate::json::to_text(&fields))
 }
 
 /// A checked request, run under the spawn lock.
@@ -645,7 +674,7 @@ mod tests {
     use crate::parse::cmdline_length;
     use crate::proc::Row;
     use serde_json::json;
-    use std::cell::RefCell;
+    use std::cell::{Cell, RefCell};
     use std::path::PathBuf;
     use std::rc::Rc;
 
@@ -653,9 +682,11 @@ mod tests {
     const ENTRY: &str =
         "1 entry mux-agent entry path may hold only letters, digits, spaces and _ \\ / : . ( ) -";
 
+    // The session's bar is off, so a spawn opens none; `bar_on` keeps one.
     fn ready(w: World) -> World {
         w.fakes.mux_rule("new-window", 0, "%9|@5\n", "");
         w.fakes.mux_rule("split-window", 0, "%9|@5\n", "");
+        w.fakes.mux_rule("@mux-agents-sidebar", 0, "off\n", "");
         w
     }
 
@@ -1462,6 +1493,180 @@ mod tests {
         }
     }
 
+    // A human caller whose session keeps its bar: the bar's split answers %13 in the caller's window @1, and from
+    // then on the session's list and the bar's probe name it. `open` says whether the bar is there.
+    fn bar_on() -> (World, Rc<Cell<bool>>) {
+        let w = World::human("");
+        w.fakes.mux_rule("new-window", 0, "%9|@5\n", "");
+        let open = Rc::new(Cell::new(false));
+        let seen = open.clone();
+        w.fakes.mux_script("split-window", move |argv| {
+            let bar = argv.last().is_some_and(|a| a == "watch");
+            if bar {
+                seen.set(true);
+            }
+            Ok(Output {
+                code: 0,
+                stdout: if bar { "%13|@1\n" } else { "%9|@5\n" }.into(),
+                stderr: String::new(),
+            })
+        });
+        let seen = open.clone();
+        w.fakes
+            .mux_script("#{@agent-role}|#{@agent-id}", move |argv| {
+                let stdout = match (argv[1].as_str(), seen.get()) {
+                    ("list-panes", true) => "%13|@1|sidebar|\n",
+                    ("display-message", true) => "%13|@1|sidebar||end\n",
+                    _ => "",
+                };
+                Ok(Output {
+                    code: 0,
+                    stdout: stdout.into(),
+                    stderr: String::new(),
+                })
+            });
+        (w, open)
+    }
+
+    // The splits that ran the side bar.
+    fn bar_splits(w: &World) -> usize {
+        calls(w, "split-window")
+            .iter()
+            .filter(|c| c.last().is_some_and(|a| a == "watch"))
+            .count()
+    }
+
+    fn keys(reply: &Value) -> Vec<String> {
+        reply.as_object().unwrap().keys().cloned().collect()
+    }
+
+    #[test]
+    fn spawn_keeps_one_bar_after_commit() {
+        let (w, _) = bar_on();
+        let agents = agents_dir(&w);
+        let key = w.caller().server_key;
+        w.fakes.lock_probe(move |event| {
+            if !event.starts_with("+sidebar") {
+                return String::new();
+            }
+            // The agent is committed, and the spawn lock released, before the bar is looked for.
+            let committed = std::fs::read_dir(&agents).map_or(0, |dir| {
+                dir.flatten()
+                    .filter(|e| e.path().join("commit.json").is_file())
+                    .count()
+            });
+            format!("committed {committed}")
+        });
+        let first = reply(&run(&w, &["-Client", "claude", "-Task", "hi"]));
+        assert_eq!(first["sidebar"], "%13");
+        assert_eq!(
+            keys(&first)[8..],
+            ["placement", "placementSource", "sidebar"]
+        );
+        assert_eq!(
+            w.fakes.locks(),
+            [
+                format!("+spawn|{key}|$3"),
+                format!("-spawn|{key}|$3"),
+                format!("+sidebar|{key}|$3 committed 1"),
+                format!("-sidebar|{key}|$3"),
+            ]
+        );
+        assert_eq!(bar_splits(&w), 1);
+        // The bar opens beside the caller, in its window.
+        let bar = calls(&w, "split-window").pop().unwrap();
+        assert_eq!(bar[2..4], ["-d", "-h"]);
+        assert_eq!(bar[8], "%1");
+        // A second spawn, a split by the session's placement too, finds the same bar and splits no second one.
+        w.fakes.clear_log();
+        w.fakes.mux_rule("@mux-agents-placement", 0, "h\n", "");
+        let second = reply(&run(&w, &["-Client", "claude", "-Task", "hi"]));
+        assert_eq!(
+            (&second["sidebar"], &second["placement"]),
+            (&json!("%13"), &json!("h"))
+        );
+        assert_eq!(bar_splits(&w), 0);
+    }
+
+    #[test]
+    fn spawn_with_bar_off_opens_nothing() {
+        let (w, _) = bar_on();
+        w.fakes.mux_first("@mux-agents-sidebar", 0, "off\n", "");
+        let ok = reply(&run(&w, &["-Client", "claude", "-Task", "hi"]));
+        assert_eq!(ok["sidebar"], Value::Null);
+        assert_eq!(keys(&ok).last().unwrap(), "sidebar");
+        assert_eq!(bar_splits(&w), 0);
+        assert!(
+            calls(&w, "list-panes")
+                .iter()
+                .all(|c| !c.iter().any(|a| a.contains("#{@agent-role}")))
+        );
+    }
+
+    #[test]
+    fn sidebar_failure_after_commit_still_spawns() {
+        let unknown = "pane %13 could not be checked as the side bar; try again";
+        for (case, message) in [
+            ("lock", "timed out waiting for the agent lock"),
+            ("option exit", "rmux call failed"),
+            ("option throw", "the rmux endpoint did not answer"),
+            ("probe", unknown),
+            ("open", "rmux call failed"),
+        ] {
+            let (w, open) = bar_on();
+            match case {
+                "lock" => w.fakes.lock_timeout("sidebar|"),
+                "option exit" => w.fakes.mux_first("@mux-agents-sidebar", 1, "", "no server"),
+                "option throw" => w.fakes.mux_script("@mux-agents-sidebar", |_| {
+                    refuse(1, "endpoint", "the rmux endpoint did not answer")
+                }),
+                "probe" => {
+                    open.set(true);
+                    w.fakes.mux_first("|end", 1, "", "no server");
+                }
+                _ => w.fakes.mux_script("split-window", |argv| {
+                    let bar = argv.last().is_some_and(|a| a == "watch");
+                    Ok(Output {
+                        code: i32::from(bar),
+                        stdout: if bar { "" } else { "%9|@5\n" }.into(),
+                        stderr: "no space for new pane\n".into(),
+                    })
+                }),
+            }
+            let ok = reply(&run(&w, &["-Client", "claude", "-Task", "hi"]));
+            assert_eq!(
+                (&ok["sidebar"], &ok["sidebarError"]),
+                (&Value::Null, &json!(message)),
+                "{case}"
+            );
+            assert_eq!(
+                keys(&ok)[8..],
+                ["placement", "placementSource", "sidebar", "sidebarError"],
+                "{case}"
+            );
+            // The agent is live: committed, with its record.
+            let folder = agents_dir(&w).join(ok["id"].as_str().unwrap());
+            assert!(folder.join("commit.json").is_file(), "{case}");
+            assert!(calls(&w, "kill-pane").is_empty(), "{case}");
+            // A failed probe or read opens no bar.
+            if case != "open" {
+                assert_eq!(bar_splits(&w), 0, "{case}");
+            }
+        }
+        let (w, _) = bar_on();
+        w.fakes.lock_timeout("sidebar|");
+        assert!(run(&w, &["-Client", "claude", "-Task", "hi"]).starts_with("ok "));
+        let key = w.caller().server_key;
+        assert_eq!(
+            w.fakes.locks(),
+            [
+                format!("+spawn|{key}|$3"),
+                format!("-spawn|{key}|$3"),
+                format!("!sidebar|{key}|$3"),
+            ]
+        );
+    }
+
     #[test]
     fn placement_never_masks_a_refusal() {
         // -Tab with -Split is usage, before any call.
@@ -1854,7 +2059,8 @@ mod tests {
                 "context",
                 "reason",
                 "placement",
-                "placementSource"
+                "placementSource",
+                "sidebar"
             ]
         );
         // A record that cannot be written is never committed: the launch aborts and the pane closes, and no commit

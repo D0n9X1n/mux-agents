@@ -58,7 +58,7 @@ pub static VERBS: &[VerbDef] = &[
         max: 0,
         usage: "usage: mux-agent spawn -Client <claude|copilot> [-Task <text>] [-TaskFile <path>] [-BriefFile <path>] [-Name <name>] [-Split <value>] [-Tab] [-NoFork] [-Text]",
         handler: crate::agents::spawn::spawn,
-        text: json::to_text,
+        text: crate::agents::spawn::spawn_text,
     },
     VerbDef {
         name: "placement",
@@ -573,9 +573,11 @@ mod tests {
         w
     }
 
+    // The agent's pane is %12; the side bar's split, the only call running `watch`, answers %13 in the caller's window.
     fn spawn_world() -> World {
         let w = World::human("");
         w.fakes.mux_rule("new-window", 0, "%12|@7\n", "");
+        w.fakes.mux_rule("watch", 0, "%13|@1\n", "");
         w.fakes.mux_rule("split-window", 0, "%12|@7\n", "");
         w
     }
@@ -644,6 +646,15 @@ mod tests {
             &[
                 "spawn", "-Client", "copilot", "-Task", "hi", "-Split", "v", "-Name", "helper",
             ],
+            0,
+        );
+        let w = spawn_world();
+        w.fakes.mux_first("@mux-agents-placement", 0, "h\n", "");
+        w.fakes.mux_first("@mux-agents-sidebar", 0, "off\n", "");
+        record(
+            &w,
+            "spawn -Client claude -Task hi, placement h, side bar off",
+            &["spawn", "-Client", "claude", "-Task", "hi"],
             0,
         );
         let w = spawn_world();
@@ -762,31 +773,64 @@ mod tests {
             .replace(session, "00000000-0000-4000-8000-000000000000")
     }
 
+    // A spawn through the entry, JSON or -Text, with its random id and session id fixed.
+    fn spawn_reply(w: &World, text: bool) -> (u8, String) {
+        let mut args = vec!["spawn", "-Client", "claude", "-Task", "hi"];
+        if text {
+            args.push("-Text");
+        }
+        let (code, out) = call(w, &args);
+        let (id, session) = if text {
+            let field = |name: &str| {
+                out.lines()
+                    .find_map(|l| l.strip_prefix(&format!("{name}: ")))
+                    .unwrap()
+                    .to_string()
+            };
+            (field("id"), field("sessionId"))
+        } else {
+            let reply: Value = serde_json::from_str(&out).unwrap();
+            let field = |name: &str| reply[name].as_str().unwrap().to_string();
+            (field("id"), field("sessionId"))
+        };
+        (code, fixed_ids(&out, &id, &session))
+    }
+
     #[test]
     fn spawn_replies_fixture_matches() {
-        let w = spawn_world();
-        w.fakes.mux_first("new-window", 0, "%9|@5\n", "");
-        let (code, out) = call(&w, &["spawn", "-Client", "claude", "-Task", "hi"]);
-        assert_eq!(code, 0, "{out}");
-        let reply: Value = serde_json::from_str(&out).unwrap();
-        let (id, session) = (
-            reply["id"].as_str().unwrap(),
-            reply["sessionId"].as_str().unwrap(),
-        );
-        assert_eq!(fixed_ids(&out, id, session), reply_fixture("SPAWN_JSON"));
-
-        let w = spawn_world();
-        w.fakes.mux_first("new-window", 0, "%9|@5\n", "");
-        let (code, out) = call(&w, &["spawn", "-Client", "claude", "-Task", "hi", "-Text"]);
-        assert_eq!(code, 0, "{out}");
-        let field = |name: &str| {
-            out.lines()
-                .find_map(|l| l.strip_prefix(&format!("{name}: ")))
-                .unwrap()
-                .to_string()
+        // The bar opened (%13), turned off by `sidebar -Close`, and unknown after the commit (its probe failed).
+        let open = || {
+            let w = spawn_world();
+            w.fakes.mux_first("new-window", 0, "%9|@5\n", "");
+            w
         };
-        let (id, session) = (field("id"), field("sessionId"));
-        assert_eq!(fixed_ids(&out, &id, &session), reply_fixture("SPAWN_TEXT"));
+        let off = || {
+            let w = open();
+            w.fakes.mux_first("@mux-agents-sidebar", 0, "off\n", "");
+            w
+        };
+        let failed = || {
+            let w = open();
+            w.fakes
+                .mux_first("#{@agent-role}|#{@agent-id}", 0, "%13|@1|sidebar|\n", "");
+            w.fakes.mux_first("|end", 1, "", "no server");
+            w
+        };
+        let cases: [(&str, &dyn Fn() -> World); 3] = [
+            ("SPAWN", &open),
+            ("SPAWN_OFF", &off),
+            ("SPAWN_ERROR", &failed),
+        ];
+        for (name, world) in cases {
+            for (text, kind) in [(false, "JSON"), (true, "TEXT")] {
+                let fixture = format!("{name}_{kind}");
+                assert_eq!(
+                    spawn_reply(&world(), text),
+                    (0, reply_fixture(&fixture)),
+                    "{fixture}"
+                );
+            }
+        }
 
         let w = World::human(ID);
         let (code, out) = call(&w, &["spawn", "-Client", "claude", "-Task", "hi"]);
