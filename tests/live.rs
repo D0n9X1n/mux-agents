@@ -608,7 +608,9 @@ exec claude --dangerously-skip-permissions
     }
 
     // A tab is titled with the agent's name and keeps it (automatic-rename off) once its client runs; a split's pane
-    // title is the name, and the active pane stays the caller's.
+    // title is the name, and the active pane stays the caller's. A client that sets its own title (OSC 0) after it
+    // starts leaves the pane title alone (allow-set-title off), except on tmux 3.2a, which has no such option: there
+    // the title may change, and the spawn still succeeded.
     fn spawn_titles_tab_and_pane(mux: Mux) {
         let Some(mut live) = Live::human(mux) else {
             return;
@@ -622,19 +624,45 @@ exec claude --dangerously-skip-permissions
                 .collect::<Vec<_>>()
                 .join(",")
         };
+        // The client's own title escape, written to its tty, then a marker the pane must show: once it does, the
+        // multiplexer has read the escape before it.
+        let retitle = |live: &Live, client: &Value, pane: &str, marker: &str| {
+            let tty = tty_of(client["pid"].as_u64().unwrap());
+            let mut out = std::fs::OpenOptions::new().write(true).open(&tty).unwrap();
+            write!(out, "\x1b]0;client-title\x07{marker}\r\n").unwrap();
+            live.server.wait(&format!("{marker} on {pane}"), || {
+                live.call(&["capture-pane", "-p", "-t", pane])
+                    .contains(marker)
+                    .then_some(())
+            });
+        };
         let tab = live.spawn("tab-agent", &[]);
-        live.server.client_by_session(s(&tab["sessionId"]));
+        let client = live.server.client_by_session(s(&tab["sessionId"]));
         let window = s(&tab["window"]);
         assert_eq!(live.field(window, "#{window_name}"), "tab-agent", "{mux:?}");
         let rename = live.call(&["show-options", "-wv", "-t", window, "automatic-rename"]);
         assert_eq!(rename.trim(), "off", "{mux:?}");
+        retitle(&live, &client, s(&tab["pane"]), "tab-marker");
+        assert_eq!(live.field(window, "#{window_name}"), "tab-agent", "{mux:?}");
         let split = live.spawn("split-agent", &["-Split", "h"]);
-        live.server.client_by_session(s(&split["sessionId"]));
+        let client = live.server.client_by_session(s(&split["sessionId"]));
         assert_eq!(
             live.field(s(&split["pane"]), "#{pane_title}"),
             "split-agent",
             "{mux:?}"
         );
+        assert_eq!(active(&live), root, "{mux:?}");
+        retitle(&live, &client, s(&split["pane"]), "split-marker");
+        let titles = [
+            live.field(s(&tab["pane"]), "#{pane_title}"),
+            live.field(s(&split["pane"]), "#{pane_title}"),
+        ];
+        if mux == Mux::Tmux32 {
+            // The documented limit: no allow-set-title, so the client's title may win; both agents still run.
+            assert_eq!(live.tagged().len(), 2, "{mux:?} {titles:?}");
+        } else {
+            assert_eq!(titles, ["tab-agent", "split-agent"], "{mux:?}");
+        }
         assert_eq!(active(&live), root, "{mux:?}");
     }
 

@@ -420,12 +420,24 @@ impl Launch<'_> {
             }
             tag_argv.extend(["set-option", "-p", "-t", &new_pane, key, value]);
         }
-        // A split's pane is titled with the name (select-pane -T leaves focus alone); a tab has it from -n, which
-        // turns automatic-rename off for that window.
-        if self.split.is_some() {
-            tag_argv.extend([";", "select-pane", "-T", &agent.name, "-t", &new_pane]);
-        }
+        // The agent's pane is titled with its name (select-pane -T leaves focus alone); a tab also has it as the
+        // window's name from -n, which turns automatic-rename off for that window.
+        tag_argv.extend([";", "select-pane", "-T", &agent.name, "-t", &new_pane]);
         native(ctx, &tag_argv, false)?;
+        // Before the commit, so before the client starts: its title escapes no longer replace the name. Best
+        // effort: tmux 3.2a has no allow-set-title and refuses it, and the spawn goes on.
+        let _ = native(
+            ctx,
+            &[
+                "set-option",
+                "-p",
+                "-t",
+                &new_pane,
+                "allow-set-title",
+                "off",
+            ],
+            true,
+        );
         let parent_agent = match (&caller.agent, caller.client) {
             (Some(parent), Some(client)) => {
                 let session = ctx
@@ -1594,6 +1606,40 @@ mod tests {
     }
 
     #[test]
+    fn a_refused_allow_set_title_still_spawns() {
+        // tmux 3.2a has no allow-set-title: its refusal is best effort, so the agent still commits, tab or split.
+        for extra in [&[][..], &["-Split", "h"]] {
+            let w = human();
+            w.fakes
+                .mux_first("allow-set-title", 1, "", "invalid option: allow-set-title");
+            let mut args = vec!["-Client", "claude", "-Task", "hi"];
+            args.extend(extra);
+            let ok = reply(&run(&w, &args));
+            assert_eq!(ok["name"], "hi", "{extra:?}");
+            let folder = agents_dir(&w).join(ok["id"].as_str().unwrap());
+            assert!(folder.join("commit.json").is_file(), "{extra:?}");
+            let titles: Vec<Vec<String>> = calls(&w, "set-option")
+                .into_iter()
+                .filter(|c| c.iter().any(|t| t == "allow-set-title"))
+                .collect();
+            assert_eq!(
+                titles,
+                [[
+                    "-N",
+                    "set-option",
+                    "-p",
+                    "-t",
+                    "%9",
+                    "allow-set-title",
+                    "off"
+                ]
+                .map(String::from)],
+                "{extra:?}"
+            );
+        }
+    }
+
+    #[test]
     fn pane_cmd_is_exe_launcher_spec() {
         let host_env =
             |w: &World| pane_env(w.ctx.state_root.to_str().unwrap(), crate::state::root::HOST);
@@ -2174,9 +2220,10 @@ mod tests {
         let prompt = spec["prompt"].clone();
         assert_eq!(spec["args"], json!(["--session-id", new, "-i", prompt]));
         let tags = &calls(&w, "set-option")[0];
-        assert_eq!(
-            tags[tags.len() - 2..],
-            ["@agent-context", "brief:copy-verification-failed"]
+        assert!(
+            tags.windows(2)
+                .any(|pair| pair == ["@agent-context", "brief:copy-verification-failed"]),
+            "{tags:?}"
         );
         let slashes = |p: &Path| p.to_str().unwrap().replace('\\', "/");
         assert_eq!(
@@ -2339,6 +2386,10 @@ mod tests {
         });
         let (seen, dir) = (log.clone(), agents.clone());
         w.fakes.mux_script("set-option", move |argv| {
+            if argv[5] == "allow-set-title" {
+                seen.borrow_mut().push("allow-set-title".into());
+                return Ok(Output::default());
+            }
             let folder = dir.join(&argv[6]);
             seen.borrow_mut().push(format!(
                 "tag record {} commit {}",
@@ -2364,6 +2415,8 @@ mod tests {
             [
                 "launch spec true",
                 "tag record false commit false",
+                // Before the commit, so before the launcher starts the client.
+                "allow-set-title",
                 "commit: record true commit false"
             ]
         );
@@ -2401,10 +2454,27 @@ mod tests {
             "%9",
             "@agent-context",
             "brief:human",
+            ";",
+            "select-pane",
+            "-T",
+            "hi",
+            "-t",
+            "%9",
         ]
         .map(String::from)
         .to_vec();
-        assert_eq!(calls(&w, "set-option"), [tags]);
+        let title = [
+            "-N",
+            "set-option",
+            "-p",
+            "-t",
+            "%9",
+            "allow-set-title",
+            "off",
+        ]
+        .map(String::from)
+        .to_vec();
+        assert_eq!(calls(&w, "set-option"), [tags, title]);
         let folder = agents.join(id);
         let record = json!({"schema": 1, "id": id, "name": "hi", "client": "claude",
             "sessionId": ok["sessionId"], "context": "brief", "reason": "human", "session": "$3",
@@ -2463,7 +2533,9 @@ mod tests {
         let w = human();
         let dir = agents_dir(&w);
         w.fakes.mux_script("set-option", move |argv| {
-            std::fs::create_dir(dir.join(&argv[6]).join("record.json")).unwrap();
+            if argv[5] == "@agent-id" {
+                std::fs::create_dir(dir.join(&argv[6]).join("record.json")).unwrap();
+            }
             Ok(Output::default())
         });
         assert_eq!(
