@@ -1,0 +1,42 @@
+# Changelog
+
+All notable changes to mux-agents. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions follow [Semantic Versioning](https://semver.org/). Full notes are on the wiki.
+
+## [Unreleased]
+
+### Changed
+
+- A shorter README with previews of the side bar, `list`, a mailbox report and a refused spawn; the details moved to the wiki's [Usage](https://github.com/D0n9X1n/mux-agents/wiki/Usage) page.
+- Added `SECURITY.md`, `CODE_OF_CONDUCT.md` and this changelog.
+
+## [0.2.0] - 2026-11-01
+
+One native Rust binary replaces the PowerShell implementation: no PowerShell or .NET is needed on any OS. [Release notes](https://github.com/D0n9X1n/mux-agents/wiki/Release-v0.2.0).
+
+### Added
+
+- Prebuilt binaries for macOS, Linux and Windows on x86_64 and aarch64, shipped on the `dist` branch with `SHA256SUMS`; the marketplace installs them, so nothing is built or downloaded at run time.
+- rmux 0.10+ on every OS; tmux 3.2+ on macOS and Linux.
+- A one-line upgrade for Claude Code and Copilot CLI.
+
+### Changed
+
+- `list` with six agents takes about 23 ms.
+- Unix locks are files under `~/.local/state/mux-agents/locks`.
+- The lock wait counts wall-clock time, and a state folder another call creates at the same moment is checked instead of refused.
+
+### Fixed
+
+- The .NET named-mutex advisory [GHSA-2j93-m82w-73j2](https://github.com/advisories/GHSA-2j93-m82w-73j2) no longer applies: no .NET runs.
+
+### Removed
+
+- All PowerShell code and Pester suites.
+
+## [0.1.0] - 2026-10-31
+
+The first release: `spawn`, `list`, `status`, `send`, `read`, `focus`, `stop` and the side bar on Windows (rmux) and on Linux and macOS (tmux), written in PowerShell 7.4. [Release notes](https://github.com/D0n9X1n/mux-agents/wiki/Release-v0.1.0).
+
+[Unreleased]: https://github.com/D0n9X1n/mux-agents/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/D0n9X1n/mux-agents/compare/v0.1.0...v0.2.0
+[0.1.0]: https://github.com/D0n9X1n/mux-agents/releases/tag/v0.1.0

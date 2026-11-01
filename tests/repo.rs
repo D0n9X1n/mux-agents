@@ -1790,7 +1790,7 @@ const COPILOT_UPGRADE: &str =
 #[test]
 fn readme_is_short_features_and_quick_start() {
     let readme = file_lines("README.md");
-    assert!(readme.len() <= 60, "README has {} lines", readme.len());
+    assert!(readme.len() <= 75, "README has {} lines", readme.len());
     let headings: Vec<&str> = readme
         .iter()
         .filter(|l| l.starts_with("## "))
@@ -1811,6 +1811,69 @@ fn readme_is_short_features_and_quick_start() {
     assert!(
         link_targets(&repo_file("README.md")).contains(&usage),
         "README does not link {usage}"
+    );
+}
+
+// What a visitor sees first: badges that each point at a real page, a gallery of real output, and the community
+// files GitHub's health check looks for.
+#[test]
+fn repo_front_page_and_community_files() {
+    let readme = repo_file("README.md");
+    for badge in [
+        "actions/workflows/ci.yml/badge.svg",
+        "img.shields.io/github/v/release/D0n9X1n/mux-agents",
+        "img.shields.io/github/license/D0n9X1n/mux-agents",
+        "img.shields.io/badge/platform-macOS%20%7C%20Linux%20%7C%20Windows",
+        "img.shields.io/badge/rust-1.89%2B",
+        "img.shields.io/badge/tmux-3.2%2B",
+        "img.shields.io/badge/rmux-0.10%2B",
+        "img.shields.io/badge/Claude%20Code-plugin",
+        "img.shields.io/badge/Copilot%20CLI-plugin",
+    ] {
+        assert!(readme.contains(badge), "README lacks the badge {badge}");
+    }
+    for image in ["sidebar", "list", "mail", "safety"] {
+        let path = format!("assets/preview/mux-agents-{image}.png");
+        assert!(
+            readme.contains(&format!(
+                "https://raw.githubusercontent.com/D0n9X1n/mux-agents/main/{path}"
+            )),
+            "README does not show {path}"
+        );
+        let png = std::fs::read(Path::new(env!("CARGO_MANIFEST_DIR")).join(&path)).unwrap();
+        assert_eq!(
+            png[..8],
+            [0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a],
+            "{path}"
+        );
+    }
+    let files = tracked();
+    for path in [
+        "LICENSE",
+        "CONTRIBUTING.md",
+        "CODE_OF_CONDUCT.md",
+        "SECURITY.md",
+        "CHANGELOG.md",
+        ".github/ISSUE_TEMPLATE/config.yml",
+    ] {
+        assert!(files.iter().any(|f| f == path), "{path} is not tracked");
+    }
+    // The changelog names every release the wiki has notes for.
+    let changelog = repo_file("CHANGELOG.md");
+    for page in wiki_pages()
+        .iter()
+        .filter(|p| p.starts_with("Release-v") && !p.ends_with("-zh-CN"))
+    {
+        let version = page.trim_start_matches("Release-v");
+        assert!(
+            changelog.contains(&format!("## [{version}]")),
+            "CHANGELOG lacks {version}"
+        );
+    }
+    // Vulnerabilities go to a private advisory, never a public issue.
+    assert!(
+        repo_file("SECURITY.md")
+            .contains("https://github.com/D0n9X1n/mux-agents/security/advisories/new")
     );
 }
 
