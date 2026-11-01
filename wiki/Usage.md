@@ -46,7 +46,7 @@ You rarely type these: the skill runs them for you. Every command is `<plugin>/s
 | `send` | `send claude-1 -BodyFile note.md`, `send parent -BodyFile result.md` | post a message to an agent or to your parent |
 | `read` | `read -Wait 600`, `read claude-1 -Lines 40` | wait for your messages, or read an agent's pane |
 | `focus` | `focus claude-1` | switch the multiplexer to an agent's pane |
-| `stop` | `stop claude-1` | close an agent's pane and its processes |
+| `stop` | `stop claude-1` | close an agent's pane and its processes; an agent that already ended answers `ok` with `already` (`exited`, `stopped` or `lost`) |
 | `sidebar` | `sidebar`, `sidebar -Close` | reopen the side-bar split, or close it for the rest of the session |
 
 Exit code 0 means ok, 1 an error and 2 a refusal or usage error; on failure, `check` names the cause.
@@ -130,5 +130,6 @@ Every refusal is one JSON line with `check` naming the cause:
 - `spawn` opens a detached window (or, by `-Split h|v` or the session's `placement`, splits the caller's pane) running `<binary> launcher <spec.json>` by the binary's absolute path, tags the pane with `@agent-*` options, and records the agent in the state folder: `MUX_AGENTS_STATE` if set, else `%LOCALAPPDATA%\mux-agents\state` on Windows and `$XDG_STATE_HOME/mux-agents/state` or `~/.local/state/mux-agents/state` on Linux and macOS.
 - Once the agent is committed, `spawn` finds or opens the session's side bar under the side bar's own lock; a failure there is reported as `sidebarError` and never fails the spawn.
 - Messages go to per-pane mailboxes, never as keystrokes. `read -Wait` returns each message once. Every child posts exactly one exit notice to its parent: `exited`, `stopped` or `lost`.
+- An agent whose tab or pane is gone is closed on the next `list`, `read`, `spawn`, `stop` or side-bar tick: one `lost` notice (or `exited` with its code), gone from `list` and the side bar, kept in `list -All` with `closedBy: "pane"`. A pane that `remain-on-exit` keeps after its agent ended is closed too, only while it is still tagged as that agent.
 - Locks are per user: on Unix, files under `~/.local/state/mux-agents/locks`; on Windows, a named mutex `Local\MuxAgents-<hex>`. This fixes the .NET named-mutex advisory [GHSA-2j93-m82w-73j2](https://github.com/advisories/GHSA-2j93-m82w-73j2) that affected 0.1 on Linux and macOS.
 - `list` with six live agents averages about 23 ms (`scripts/dev/bench-list.sh`, tmux 3.8 on an Apple silicon Mac).
