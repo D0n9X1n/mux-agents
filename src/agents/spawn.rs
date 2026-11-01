@@ -1222,23 +1222,59 @@ mod tests {
             run(&w, &["-Client", "claude", "-Task", "hi", "-Name", "worker"]),
             "2 name agent name is taken, try worker-2"
         );
-        // Another session's record, a record whose id is not its folder's, and an unreadable one name nothing.
+        // Another session's record and a folder with no record.json name nothing.
         let w = human();
         ended(
             &w,
             "000000000b04",
             json!({"name": "add-subtract", "session": "$4"}),
         );
-        ended(
-            &w,
-            "000000000b05",
-            json!({"name": "add-subtract", "id": "000000000b06"}),
-        );
-        let broken = w.folder("000000000b07");
-        std::fs::create_dir_all(&broken).unwrap();
-        std::fs::write(broken.join("record.json"), "{").unwrap();
+        std::fs::create_dir_all(w.folder("000000000b05")).unwrap();
         let ok = reply(&run(&w, &["-Client", "claude", "-Task", "add subtract"]));
         assert_eq!(ok["name"], "add-subtract");
+    }
+
+    #[test]
+    fn an_unreadable_record_refuses_rather_than_reuse_a_name() {
+        // Fail closed: a record that cannot be read, is not an object, is not its folder's or has no name could
+        // hide a taken name, so the spawn refuses 2 `name` before any pane.
+        let id = "000000000b07";
+        let refused =
+            format!("2 name agent record {id} cannot be read, so names cannot be checked");
+        // A case's name and how it breaks the record.
+        type Case<'a> = (&'a str, &'a dyn Fn(&World));
+        let cases: [Case; 5] = [
+            ("not JSON", &|w| {
+                let folder = w.folder(id);
+                std::fs::create_dir_all(&folder).unwrap();
+                std::fs::write(folder.join("record.json"), "{").unwrap();
+            }),
+            ("not an object", &|w| {
+                let folder = w.folder(id);
+                std::fs::create_dir_all(&folder).unwrap();
+                std::fs::write(folder.join("record.json"), "[\"w\"]").unwrap();
+            }),
+            ("unreadable", &|w| {
+                std::fs::create_dir_all(w.folder(id).join("record.json")).unwrap();
+            }),
+            ("another folder's id", &|w| {
+                ended(w, id, json!({"name": "w", "id": "000000000b06"}));
+            }),
+            ("no name", &|w| ended(w, id, json!({"name": null}))),
+        ];
+        for (case, make) in cases {
+            let w = human();
+            make(&w);
+            for args in [
+                &["-Task", "add subtract"][..],
+                &["-Task", "hi", "-Name", "w"],
+            ] {
+                let mut full = vec!["-Client", "claude"];
+                full.extend(args);
+                assert_eq!(run(&w, &full), refused, "{case} {args:?}");
+            }
+            assert!(calls(&w, "new-window").is_empty(), "{case}");
+        }
     }
 
     #[test]
