@@ -733,8 +733,11 @@ mod tests {
         w.fakes.mux_rule("|end", 0, "%13|@1|sidebar||end\n", "");
         w.fakes.mux_rule("list-panes", 0, "%13|@1|sidebar|\n", "");
         record(&w, "sidebar -Close", &["sidebar", "-Close"], 0);
-        // watch draws only to a terminal, so its one frame is drawn through watch_on; a closed output ends it.
+        // watch draws only to a terminal, so its one frame is drawn through watch_on; a closed output ends it. The
+        // pane answers its probe, so the frame reads its window's layout first.
         let w = World::human("");
+        w.fakes
+            .mux_rule("#{pane_id}|#{@agent-role}", 0, "%1|sidebar\n", "");
         w.fakes.clear_log();
         let request = w.request(&["watch"]);
         let reply = crate::sidebar::watch_on(&w.ctx, &request, true, &mut |_| {

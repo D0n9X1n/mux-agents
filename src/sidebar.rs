@@ -1,9 +1,10 @@
 //! The side bar (MuxAgents.ps1:1423-1591): `sidebar [-Close]` opens or closes one bar per session running
 //! `<abs binary> watch`, and `watch` draws the session's board in it until its pane closes.
 
+use std::cmp::Reverse;
 use std::collections::HashSet;
 use std::io;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use serde_json::{Map, Value};
 
@@ -27,6 +28,13 @@ const PANE_FORMAT: &str = "#{pane_id}|#{window_id}";
 const CLEAR: &str = "\u{1b}[H\u{1b}[2J";
 // The bar is a fifth of its window, never narrower than this.
 const MIN_WIDTH: u32 = 40;
+// The bar's window, one row per pane (S1.3), with the zoom flag: a zoomed window is left alone.
+const LAYOUT: &str = "#{pane_id}|#{pane_active}|#{pane_at_right}|#{pane_at_top}|#{pane_at_bottom}|#{pane_width}|#{window_width}|#{pane_left}|#{pane_top}|#{window_zoomed_flag}";
+// Repairs that may fail in a row before repair pauses, and how long a pause lasts when the layout does not change.
+const REPAIR_TRIES: u32 = 3;
+const REARM: Duration = Duration::from_secs(60);
+// The bar's last line while repair is paused, dim.
+const PAUSED: &str = "\u{1b}[2mlayout: repair paused\u{1b}[0m";
 // `off` once `sidebar -Close` ran in the session; unset again by `sidebar`.
 const OPTION: &str = "@mux-agents-sidebar";
 
@@ -141,10 +149,224 @@ fn gone(probe: &Output) -> bool {
     probe.code == 0 && probe.stdout.trim_end_matches(['\r', '\n']) == "|"
 }
 
-/// The side-bar loop for the caller's pane. Each tick asks the pane itself, reads the board (ended rows with their
-/// exit codes), writes home, clear and the board, then sleeps 2 s. Ends `pane-closed` when the probe answers gone,
-/// `output-closed` when a write fails and `probe-failed` after 30 unknown probes in a row. A failed board read still
-/// draws the last board marked `refresh failed`, so a dead terminal is found even when nothing else answers.
+/// One pane of the bar's window, as LAYOUT reads it.
+#[derive(Debug, PartialEq, Eq)]
+struct Pane {
+    id: String,
+    active: bool,
+    at_right: bool,
+    at_top: bool,
+    at_bottom: bool,
+    width: u32,
+    left: u32,
+    top: u32,
+}
+
+/// The bar's window: its width, whether a pane is zoomed, and its panes.
+#[derive(Debug)]
+struct Layout {
+    width: u32,
+    zoomed: bool,
+    panes: Vec<Pane>,
+}
+
+/// The LAYOUT rows, or none unless every row is exactly ten well-formed fields (a pane id, 0/1 flags, decimal
+/// numbers) agreeing on the window's width and zoom, with at least one row. One final LF ends the answer.
+fn parse_layout(text: &str) -> Option<Layout> {
+    let flag = |f: &str| match f {
+        "0" => Some(false),
+        "1" => Some(true),
+        _ => None,
+    };
+    let number = |f: &str| {
+        (!f.is_empty() && f.bytes().all(|b| b.is_ascii_digit()))
+            .then(|| f.parse::<u32>().ok())
+            .flatten()
+    };
+    let body = text.strip_suffix('\n').unwrap_or(text);
+    let mut layout: Option<Layout> = None;
+    for line in body.split('\n') {
+        let line = line.strip_suffix('\r').unwrap_or(line);
+        let f: Vec<&str> = line.split('|').collect();
+        if f.len() != 10 || !pane_id(f[0]) {
+            return None;
+        }
+        let (width, zoomed) = (number(f[6])?, flag(f[9])?);
+        let pane = Pane {
+            id: f[0].to_string(),
+            active: flag(f[1])?,
+            at_right: flag(f[2])?,
+            at_top: flag(f[3])?,
+            at_bottom: flag(f[4])?,
+            width: number(f[5])?,
+            left: number(f[7])?,
+            top: number(f[8])?,
+        };
+        let layout = layout.get_or_insert_with(|| Layout {
+            width,
+            zoomed,
+            panes: Vec::new(),
+        });
+        if (layout.width, layout.zoomed) != (width, zoomed) {
+            return None;
+        }
+        layout.panes.push(pane);
+    }
+    layout
+}
+
+/// The pane the bar is moved against (S1.4): of the other panes at the right edge, the topmost; else the other pane
+/// reaching furthest right (the topmost of those). Never the bar; none when the bar is the window's only pane.
+fn move_target<'a>(panes: &'a [Pane], bar: &str) -> Option<&'a str> {
+    let others = || panes.iter().filter(|p| p.id != bar);
+    others()
+        .filter(|p| p.at_right)
+        .min_by_key(|p| p.top)
+        .or_else(|| others().max_by_key(|p| (p.left + p.width, Reverse(p.top))))
+        .map(|p| p.id.as_str())
+}
+
+/// The window's layout as the set of `pane,left,top,width`: a paused repair re-arms when it changes.
+fn signature(panes: &[Pane]) -> String {
+    let mut rows: Vec<String> = panes
+        .iter()
+        .map(|p| format!("{},{},{},{}", p.id, p.left, p.top, p.width))
+        .collect();
+    rows.sort();
+    rows.join(";")
+}
+
+/// The right-edge lock of one `watch` (S1), kept in memory only: the bar stays at the right edge of its window, full
+/// height, `bar_width` columns, and the active pane never changes.
+#[derive(Default)]
+struct Keeper {
+    // The window width the bar's width was last set for; a drag is kept until the window's width changes.
+    applied: Option<u32>,
+    // Repairs that failed in a row: a refused move, or a move the read right after it found did not hold.
+    failures: u32,
+    // While repair is paused: the layout it paused on and when.
+    paused: Option<(String, SystemTime)>,
+}
+
+impl Keeper {
+    fn paused(&self) -> bool {
+        self.paused.is_some()
+    }
+
+    /// One read of the bar's window. A failed or malformed read, or one without the bar, does nothing; so does a
+    /// zoomed window, since resizing a pane unzooms it. A pause re-arms when the layout changed or 60 s passed. A bar
+    /// in place gets its width when the window's width differs from the one last applied for; a bar out of place is
+    /// repaired unless paused.
+    fn tick(&mut self, ctx: &Ctx, bar: &str) {
+        let Some(layout) = read_layout(ctx, bar) else {
+            return;
+        };
+        let Some(me) = layout.panes.iter().find(|p| p.id == bar) else {
+            return;
+        };
+        if layout.zoomed {
+            return;
+        }
+        let shape = signature(&layout.panes);
+        let now = ctx.clock.now();
+        if let Some((paused_on, at)) = &self.paused {
+            let waited = now.duration_since(*at).unwrap_or_default();
+            if *paused_on != shape || waited >= REARM {
+                self.paused = None;
+                self.failures = 0;
+            }
+        }
+        if in_place(me) {
+            (self.failures, self.paused) = (0, None);
+            if self.applied != Some(layout.width) {
+                self.resize(ctx, bar, layout.width);
+            }
+            return;
+        }
+        if !self.paused() {
+            self.repair(ctx, bar, &layout, &shape, now);
+        }
+    }
+
+    /// Counts one failure; the third in a row pauses repair on the layout `shape`.
+    fn fail(&mut self, shape: &str, now: SystemTime) {
+        self.failures += 1;
+        if self.failures >= REPAIR_TRIES {
+            self.paused = Some((shape.to_string(), now));
+        }
+    }
+
+    /// Sets the bar's width for a window `window` wide; remembered only when the multiplexer took it.
+    fn resize(&mut self, ctx: &Ctx, bar: &str, window: u32) {
+        let width = bar_width(window).to_string();
+        if native(ctx, &["resize-pane", "-t", bar, "-x", &width], true).is_ok_and(|r| r.code == 0) {
+            self.applied = Some(window);
+        }
+    }
+
+    /// Moves the bar back to the right edge, full height, against `move_target`, sets its width at once, then gives
+    /// the focus back: move-pane moves the active pane even with -d, so the pane active before (the bar included) is
+    /// selected again unless it still is. The window is read again at once: a bar still out of place counts a failure
+    /// (as a refused move does), one in place ends the run of failures, an unreadable read counts nothing. Checking
+    /// now, not on the next tick, keeps a layout the user changes in between from counting against the repair.
+    fn repair(&mut self, ctx: &Ctx, bar: &str, layout: &Layout, shape: &str, now: SystemTime) {
+        let Some(target) = move_target(&layout.panes, bar) else {
+            return;
+        };
+        let active = layout.panes.iter().find(|p| p.active).map(|p| p.id.clone());
+        let moved = native(
+            ctx,
+            &["move-pane", "-d", "-f", "-h", "-s", bar, "-t", target],
+            true,
+        )
+        .is_ok_and(|moved| moved.code == 0);
+        if !moved {
+            self.fail(shape, now);
+            return;
+        }
+        self.applied = None;
+        self.resize(ctx, bar, layout.width);
+        if let Some(active) = active {
+            let still = native(
+                ctx,
+                &["display-message", "-p", "-t", &active, "#{pane_active}"],
+                true,
+            )
+            .is_ok_and(|r| r.code == 0 && r.stdout.trim_end_matches(['\r', '\n']) == "1");
+            if !still {
+                let _ = native(ctx, &["select-pane", "-t", &active], true);
+            }
+        }
+        let Some(after) = read_layout(ctx, bar) else {
+            return;
+        };
+        match after.panes.iter().find(|p| p.id == bar).map(in_place) {
+            Some(true) => self.failures = 0,
+            Some(false) => self.fail(&signature(&after.panes), now),
+            None => {}
+        }
+    }
+}
+
+/// The bar's window as LAYOUT reads it; none when the read fails or does not parse.
+fn read_layout(ctx: &Ctx, bar: &str) -> Option<Layout> {
+    let read = native(ctx, &["list-panes", "-t", bar, "-F", LAYOUT], true)
+        .ok()
+        .filter(|read| read.code == 0)?;
+    parse_layout(&read.stdout)
+}
+
+/// The S1.3 invariant: the bar is at the right edge, top and bottom of its window.
+fn in_place(bar: &Pane) -> bool {
+    bar.at_right && bar.at_top && bar.at_bottom
+}
+
+/// The side-bar loop for the caller's pane. Each tick asks the pane itself and, when it answers, keeps it at the right
+/// edge of its window (`Keeper`; by its own pane, not its tag, since rmux 0.10.0's rotate-window leaves pane options
+/// behind), reads the board (ended rows with their exit codes), writes home, clear and the board (and `layout: repair
+/// paused` while repair is paused), then sleeps 2 s. Ends `pane-closed` when the probe answers gone, `output-closed`
+/// when a write fails and `probe-failed` after 30 unknown probes in a row. A failed board read still draws the last
+/// board marked `refresh failed`, so a dead terminal is found even when nothing else answers.
 pub fn run_watch(
     ctx: &Ctx,
     caller: &Caller,
@@ -153,6 +375,7 @@ pub fn run_watch(
     // The caller's pane is already a well-formed id, so this never fails.
     let reader = mailbox_key(&caller.pane, &caller.agent_tag).unwrap_or_default();
     let own = format!("{}|", caller.pane);
+    let mut keeper = Keeper::default();
     let mut last = "mux-agents \u{b7} ? running".to_string();
     let mut unknown = 0;
     loop {
@@ -172,6 +395,9 @@ pub fn run_watch(
         if unknown >= UNKNOWN_MAX {
             return "probe-failed";
         }
+        if live {
+            keeper.tick(ctx, &caller.pane);
+        }
         let mut failed = !live;
         match board(ctx, caller, &reader, true, true) {
             Ok(board) => last = format_board(&board),
@@ -180,6 +406,10 @@ pub fn run_watch(
         let mut text = last.clone();
         if failed {
             text.push_str("\nrefresh failed");
+        }
+        if keeper.paused() {
+            text.push('\n');
+            text.push_str(PAUSED);
         }
         if write(&format!("{CLEAR}{}\r\n", text.replace('\n', "\r\n"))).is_err() {
             return "output-closed";
@@ -617,6 +847,8 @@ mod tests {
                 };
                 match answer {
                     "live" => Ok(out(0, "%7|sidebar\n", "")),
+                    // The pane itself, without the bar's tag: watch run by hand in some pane.
+                    "untagged" => Ok(out(0, "%7|\n", "")),
                     "gone" => Ok(out(0, "|\n", "")),
                     "fail" => Ok(out(1, "", "no server")),
                     _ => refuse(1, "endpoint", "the rmux endpoint did not answer"),
@@ -705,6 +937,10 @@ mod tests {
         let listed = Rc::new(Cell::new(0));
         let seen = listed.clone();
         w.fakes.mux_script("list-panes", move |argv| {
+            // Only the board's session list counts; the bar's own layout read is not answered.
+            if !argv.iter().any(|a| a == "-s") {
+                return Ok(out(1, "", "lock"));
+            }
             seen.set(seen.get() + 1);
             if seen.get() == 2 {
                 let rows = ["%9|@5|300|aaaaaaaaaaaa|worker"];
@@ -752,6 +988,444 @@ mod tests {
             Value::Object(reply),
             json!({"pane": "%7", "ended": "pane-closed"})
         );
+    }
+
+    // ---- the right-edge lock (S1)
+
+    #[derive(Debug, Clone)]
+    struct Rect {
+        id: &'static str,
+        left: u32,
+        top: u32,
+        width: u32,
+        height: u32,
+    }
+
+    fn r(id: &'static str, left: u32, top: u32, width: u32, height: u32) -> Rect {
+        Rect {
+            id,
+            left,
+            top,
+            width,
+            height,
+        }
+    }
+
+    /// The bar's window as the multiplexer lays it out: its size, zoom, active pane and panes. move-pane leaves
+    /// `moved` (none: the panes as they were) and makes `move_focus` active, or fails when `move_fail`.
+    #[derive(Default)]
+    struct Win {
+        width: u32,
+        height: u32,
+        zoomed: bool,
+        active: &'static str,
+        panes: Vec<Rect>,
+        moved: Option<Vec<Rect>>,
+        move_focus: Option<&'static str>,
+        move_fail: bool,
+    }
+
+    type Shared = Rc<RefCell<Win>>;
+
+    fn win(active: &'static str, panes: Vec<Rect>) -> Win {
+        Win {
+            width: 200,
+            height: 50,
+            active,
+            panes,
+            ..Win::default()
+        }
+    }
+
+    fn flag(on: bool) -> &'static str {
+        if on { "1" } else { "0" }
+    }
+
+    /// What `list-panes -F <LAYOUT>` answers for `w`.
+    fn layout_text(w: &Win) -> String {
+        w.panes
+            .iter()
+            .map(|p| {
+                format!(
+                    "{}|{}|{}|{}|{}|{}|{}|{}|{}|{}\n",
+                    p.id,
+                    flag(p.id == w.active),
+                    flag(p.left + p.width == w.width),
+                    flag(p.top == 0),
+                    flag(p.top + p.height == w.height),
+                    p.width,
+                    w.width,
+                    p.left,
+                    p.top,
+                    flag(w.zoomed)
+                )
+            })
+            .collect()
+    }
+
+    // A pane split right of the bar: %1 | %7 (the bar) | %4.
+    fn split_right() -> Vec<Rect> {
+        vec![
+            r("%1", 0, 0, 100, 50),
+            r("%7", 101, 0, 40, 50),
+            r("%4", 142, 0, 58, 50),
+        ]
+    }
+
+    // The same window with the bar back at the right edge.
+    fn repaired() -> Vec<Rect> {
+        vec![
+            r("%1", 0, 0, 100, 50),
+            r("%4", 101, 0, 58, 50),
+            r("%7", 160, 0, 40, 50),
+        ]
+    }
+
+    // The bar in place: %1 | %7.
+    fn in_place() -> Vec<Rect> {
+        vec![r("%1", 0, 0, 159, 50), r("%7", 160, 0, 40, 50)]
+    }
+
+    const MOVE: &str = "-N move-pane -d -f -h -s %7 -t %4";
+
+    /// watch_world with the bar's window answered from `win`: the layout read, move-pane, resize-pane (the pane at
+    /// the right edge keeps its right edge), the active check and select-pane.
+    fn keep_world(probes: &[&'static str], win: Win) -> (World, Shared) {
+        let w = watch_world(probes);
+        let shared = Rc::new(RefCell::new(win));
+        let s = shared.clone();
+        w.fakes.mux_script("#{pane_active}", move |argv| {
+            let win = s.borrow();
+            if argv[1] == "list-panes" {
+                assert_eq!(argv[2..], ["-t", "%7", "-F", LAYOUT]);
+                return Ok(out(0, &layout_text(&win), ""));
+            }
+            Ok(out(0, &format!("{}\n", flag(argv[4] == win.active)), ""))
+        });
+        let s = shared.clone();
+        w.fakes.mux_script("move-pane", move |_| {
+            let mut win = s.borrow_mut();
+            if win.move_fail {
+                return Ok(out(1, "", "can't move pane\n"));
+            }
+            if let Some(moved) = win.moved.take() {
+                win.panes = moved;
+            }
+            if let Some(focus) = win.move_focus.take() {
+                win.active = focus;
+            }
+            Ok(Output::default())
+        });
+        let s = shared.clone();
+        w.fakes.mux_script("resize-pane", move |argv| {
+            let mut win = s.borrow_mut();
+            let width: u32 = argv[5].parse().unwrap();
+            let total = win.width;
+            for p in win.panes.iter_mut().filter(|p| p.id == argv[3]) {
+                if p.left + p.width == total {
+                    p.left = total - width;
+                }
+                p.width = width;
+            }
+            Ok(Output::default())
+        });
+        let s = shared.clone();
+        w.fakes.mux_script("select-pane", move |argv| {
+            let mut win = s.borrow_mut();
+            let id = win.panes.iter().find(|p| p.id == argv[3]).unwrap().id;
+            win.active = id;
+            Ok(Output::default())
+        });
+        (w, shared)
+    }
+
+    // The lock's own calls: move-pane, resize-pane, the active check and select-pane.
+    fn kept(w: &World) -> Vec<String> {
+        w.fakes
+            .mux_calls()
+            .iter()
+            .filter(|c| {
+                matches!(c[1].as_str(), "move-pane" | "resize-pane" | "select-pane")
+                    || c.last().is_some_and(|a| a == "#{pane_active}")
+            })
+            .map(|c| c.join(" "))
+            .collect()
+    }
+
+    fn layout_reads(w: &World) -> usize {
+        w.fakes
+            .mux_calls()
+            .iter()
+            .filter(|c| c.last().is_some_and(|a| a == LAYOUT))
+            .count()
+    }
+
+    fn moves(w: &World) -> usize {
+        count(w, "move-pane")
+    }
+
+    fn paused_frame() -> String {
+        format!("{}{PAUSED}\r\n", board_frame())
+    }
+
+    #[test]
+    fn layout_read_is_strict() {
+        let good = layout_text(&win("%1", in_place()));
+        let layout = parse_layout(&good).unwrap();
+        assert_eq!(
+            (layout.width, layout.zoomed, layout.panes.len()),
+            (200, false, 2)
+        );
+        assert_eq!(
+            layout.panes[1],
+            Pane {
+                id: "%7".into(),
+                active: false,
+                at_right: true,
+                at_top: true,
+                at_bottom: true,
+                width: 40,
+                left: 160,
+                top: 0,
+            }
+        );
+        assert!(parse_layout(&good.replace('\n', "\r\n")).is_some());
+        for bad in [
+            "",
+            "\n",
+            "%1|1|0|1|1|159|200|0|0",
+            "%1|1|0|1|1|159|200|0|0|0|x",
+            "%1|2|0|1|1|159|200|0|0|0",
+            "%1|1|0|1|1|+159|200|0|0|0",
+            "%1|1|0|1|1|159|200|0|-1|0",
+            "%1|1|0|1|1|159||0|0|0",
+            "1|1|0|1|1|159|200|0|0|0",
+            "%1|1|0|1|1|159|200|0|0|0\n%7|0|1|1|1|40|201|160|0|0",
+            "%1|1|0|1|1|159|200|0|0|0\n%7|0|1|1|1|40|200|160|0|1",
+            "%1|1|0|1|1|159|200|0|0|0\nnot a row",
+        ] {
+            assert!(parse_layout(bad).is_none(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn move_target_is_never_the_bar() {
+        let target = |panes: Vec<Rect>| {
+            let layout = parse_layout(&layout_text(&win("%1", panes))).unwrap();
+            move_target(&layout.panes, "%7").map(str::to_string)
+        };
+        // A pane split right of the bar.
+        assert_eq!(target(split_right()).as_deref(), Some("%4"));
+        // The bar split -v: the other pane at the right edge, below or above it.
+        let below = vec![
+            r("%1", 0, 0, 159, 50),
+            r("%7", 160, 0, 40, 25),
+            r("%4", 160, 26, 40, 24),
+        ];
+        assert_eq!(target(below).as_deref(), Some("%4"));
+        let above = vec![
+            r("%1", 0, 0, 159, 50),
+            r("%4", 160, 0, 40, 25),
+            r("%7", 160, 26, 40, 24),
+        ];
+        assert_eq!(target(above).as_deref(), Some("%4"));
+        // even-vertical: every pane is at the right edge; the topmost that is not the bar.
+        let even = vec![
+            r("%7", 0, 0, 200, 16),
+            r("%1", 0, 17, 200, 16),
+            r("%4", 0, 34, 200, 16),
+        ];
+        assert_eq!(target(even).as_deref(), Some("%1"));
+        // The bar alone at the right edge and short: the pane reaching furthest right.
+        let alone = vec![
+            r("%1", 0, 0, 100, 50),
+            r("%4", 101, 0, 50, 50),
+            r("%7", 160, 0, 40, 25),
+        ];
+        assert_eq!(target(alone).as_deref(), Some("%4"));
+        // The bar is the window's only pane: nothing to move it against.
+        assert_eq!(target(vec![r("%7", 0, 0, 200, 50)]), None);
+    }
+
+    #[test]
+    fn repair_moves_the_bar_back_and_keeps_focus() {
+        // (the active pane before, the one move-pane leaves active): the bar or another pane.
+        for (active, focus) in [
+            ("%1", Some("%7")),
+            ("%1", Some("%4")),
+            ("%7", Some("%4")),
+            ("%7", Some("%1")),
+            ("%1", None),
+            ("%7", None),
+        ] {
+            let mut broken = win(active, split_right());
+            broken.moved = Some(repaired());
+            broken.move_focus = focus;
+            let (w, state) = keep_world(&["live", "live", "live", "gone"], broken);
+            let (ended, frames) = watch_run(&w);
+            assert_eq!((ended, frames.len()), ("pane-closed", 3));
+            let mut want = vec![
+                MOVE.to_string(),
+                RESIZE.into(),
+                format!("-N display-message -p -t {active} #{{pane_active}}"),
+            ];
+            if focus.is_some_and(|f| f != active) {
+                want.push(format!("-N select-pane -t {active}"));
+            }
+            // One repair, checked by a read right after it; the next ticks find the bar in place and do nothing.
+            assert_eq!(kept(&w), want, "{active} {focus:?}");
+            assert_eq!(state.borrow().active, active, "{focus:?}");
+            assert_eq!(layout_reads(&w), 4);
+        }
+    }
+
+    #[test]
+    fn width_follows_the_window_not_a_drag() {
+        let (w, state) = keep_world(
+            &["live", "live", "live", "live", "live", "gone"],
+            win("%1", in_place()),
+        );
+        let s = state.clone();
+        w.fakes.sleep_probe(move |n| {
+            let mut win = s.borrow_mut();
+            match n {
+                // Dragged to 55: still at the right edge, full height.
+                1 => win.panes = vec![r("%1", 0, 0, 144, 50), r("%7", 145, 0, 55, 50)],
+                3 => {
+                    win.width = 300;
+                    win.panes = vec![r("%1", 0, 0, 244, 50), r("%7", 245, 0, 55, 50)];
+                }
+                _ => {}
+            }
+        });
+        watch_run(&w);
+        // The first tick sets the width for its window; the drag is kept until the window is 300, then 60.
+        assert_eq!(kept(&w), [RESIZE, "-N resize-pane -t %7 -x 60"]);
+        assert_eq!(state.borrow().panes[1].width, 60);
+        assert_eq!(moves(&w), 0);
+    }
+
+    #[test]
+    fn three_failures_pause_until_the_layout_changes_or_a_minute_passes() {
+        let failing = || {
+            let mut w = win("%1", split_right());
+            w.move_fail = true;
+            w
+        };
+        let six = ["live", "live", "live", "live", "live", "live", "gone"];
+        // Three refused moves, then none for three more ticks; the bar says so from the third.
+        let (w, _) = keep_world(&six, failing());
+        let (_, frames) = watch_run(&w);
+        assert_eq!(moves(&w), 3);
+        assert_eq!((count(&w, "resize-pane"), count(&w, "select-pane")), (0, 0));
+        assert_eq!(frames[..2], [board_frame(), board_frame()]);
+        assert_eq!(frames[2..], vec![paused_frame(); 4]);
+        // A changed layout re-arms it, and the repair goes through.
+        let (w, state) = keep_world(&six, failing());
+        let s = state.clone();
+        w.fakes.sleep_probe(move |n| {
+            if n == 4 {
+                let mut win = s.borrow_mut();
+                win.panes[0].width = 99;
+                win.move_fail = false;
+                win.moved = Some(repaired());
+            }
+        });
+        let (_, frames) = watch_run(&w);
+        assert_eq!(moves(&w), 4);
+        assert_eq!(frames[2..4], [paused_frame(), paused_frame()]);
+        assert_eq!(frames[4..], [board_frame(), board_frame()]);
+        // 60 s on the clock after the pause re-arm it; 59 s do not.
+        for (skip, moved, paused) in [(58, 5, 3), (57, 4, 4)] {
+            let (w, _) = keep_world(&six[1..], failing());
+            let fakes = w.fakes.clone();
+            w.fakes.sleep_probe(move |n| {
+                if n == 3 {
+                    fakes.advance(Duration::from_secs(skip));
+                }
+            });
+            let (_, frames) = watch_run(&w);
+            assert_eq!(moves(&w), moved, "{skip}");
+            // The skipped minute ages the agents too, so only each frame's last line is compared.
+            let marked: Vec<bool> = frames
+                .iter()
+                .map(|f| f.ends_with(&format!("{PAUSED}\r\n")))
+                .collect();
+            let mut want = vec![false, false];
+            want.extend((2..5).map(|i| i < paused));
+            assert_eq!(marked, want, "{skip}");
+        }
+        // A move that answers 0 but leaves the bar out of place counts too, by the read right after it: no 4th.
+        let (w, _) = keep_world(&six[1..], win("%1", split_right()));
+        let (_, frames) = watch_run(&w);
+        assert_eq!((moves(&w), layout_reads(&w)), (3, 8));
+        assert_eq!(frames[..2], vec![board_frame(); 2]);
+        assert_eq!(frames[2..], vec![paused_frame(); 3]);
+        // A layout the user changes between two ticks is not a failure: each repair held when it was made.
+        let (w, state) = keep_world(&six, win("%1", split_right()));
+        state.borrow_mut().moved = Some(repaired());
+        let s = state.clone();
+        w.fakes.sleep_probe(move |_| {
+            let mut win = s.borrow_mut();
+            win.panes = split_right();
+            win.moved = Some(repaired());
+        });
+        let (_, frames) = watch_run(&w);
+        assert_eq!(moves(&w), 6);
+        assert_eq!(frames, vec![board_frame(); 6]);
+    }
+
+    #[test]
+    fn a_zoomed_window_is_left_alone() {
+        let (w, state) = keep_world(
+            &["live", "live", "live", "live", "live", "gone"],
+            win("%1", in_place()),
+        );
+        let s = state.clone();
+        w.fakes.sleep_probe(move |n| {
+            let mut win = s.borrow_mut();
+            match n {
+                // %1 zoomed, then the window resized: the bar reads out of place and the width changed.
+                1 => {
+                    win.zoomed = true;
+                    win.width = 300;
+                    win.panes = vec![r("%1", 0, 0, 300, 50), r("%7", 160, 0, 40, 50)];
+                }
+                // Unzoomed: the width that changed meanwhile is applied then.
+                3 => {
+                    win.zoomed = false;
+                    win.panes = vec![r("%1", 0, 0, 259, 50), r("%7", 260, 0, 40, 50)];
+                }
+                _ => {}
+            }
+        });
+        watch_run(&w);
+        assert_eq!(kept(&w), [RESIZE, "-N resize-pane -t %7 -x 60"]);
+        assert_eq!(layout_reads(&w), 5);
+    }
+
+    #[test]
+    fn the_bar_is_kept_by_its_own_pane_with_a_readable_layout() {
+        // rmux 0.10.0's rotate-window leaves pane options where they were, so the bar can lose its tag: a probe
+        // that names the bar's own pane is enough.
+        let mut broken = win("%1", split_right());
+        broken.moved = Some(repaired());
+        let (w, _) = keep_world(&["untagged", "untagged", "gone"], broken);
+        let (ended, frames) = watch_run(&w);
+        assert_eq!((ended, frames), ("pane-closed", vec![board_frame(); 2]));
+        assert_eq!(moves(&w), 1);
+        // A probe that does not answer is no proof the pane is there: nothing is read.
+        let (w, _) = keep_world(&["fail", "fail", "gone"], win("%1", split_right()));
+        watch_run(&w);
+        assert_eq!((layout_reads(&w), kept(&w).len()), (0, 0));
+        // A layout that does not list the bar, a failed read, or one that does not parse: that tick does nothing.
+        for (code, stdout) in [(0, "%1|1|1|1|1|200|200|0|0|0\n"), (1, ""), (0, "garbage\n")] {
+            let w = watch_world(&["live", "live", "gone"]);
+            w.fakes.mux_first("#{pane_at_right}", code, stdout, "");
+            let (_, frames) = watch_run(&w);
+            assert_eq!(frames, vec![board_frame(); 2], "{stdout:?}");
+            assert_eq!((layout_reads(&w), kept(&w).len()), (2, 0), "{stdout:?}");
+        }
     }
 
     // ---- sidebar

@@ -381,20 +381,54 @@ exec claude --dangerously-skip-permissions
                 .run_in(pane, args, &[("MUX_AGENTS_STATE", state.as_str())])
         }
 
-        /// The pid of the bar's `watch`: its pane's process, which runs the binary itself.
-        fn watch_pid(&self, bar: &str) -> u32 {
-            let pid = self.field(bar, "#{pane_pid}");
-            let out = Command::new("ps")
-                .args(["-o", "args=", "-p", &pid])
-                .output()
-                .unwrap();
-            let args = String::from_utf8_lossy(&out.stdout);
-            assert!(
-                args.trim_end().ends_with("mux-agent watch"),
-                "{:?}: the bar's pane runs {args:?}",
+        /// `sidebar` from the root pane, which must open the bar; answers it once it is in place, its output piped
+        /// to `<dir>/frames.<n>` so `wait_tick` can count its redraws.
+        fn open_bar(&mut self) -> String {
+            let (code, open) = self.run(&["sidebar"]);
+            assert_eq!(
+                (code, &open["opened"]),
+                (0, &json!(true)),
+                "{:?} {open}",
                 self.mux()
             );
-            pid.parse().unwrap()
+            let bar = s(&open["pane"]).to_string();
+            self.wait_place(&bar, "the bar to open in place");
+            let log = self.frames_path(&bar);
+            let pipe = format!("cat >> {}", support::quote(log.to_str().unwrap()));
+            self.call(&["pipe-pane", "-o", "-t", &bar, &pipe]);
+            bar
+        }
+
+        fn frames_path(&self, bar: &str) -> PathBuf {
+            self.dir.join(format!("frames.{}", &bar[1..]))
+        }
+
+        /// The bar's redraws since `open_bar`: each frame starts with home and clear.
+        fn frames(&self, bar: &str) -> usize {
+            std::fs::read(self.frames_path(bar)).map_or(0, |bytes| {
+                bytes.windows(7).filter(|w| *w == b"\x1b[H\x1b[2J").count()
+            })
+        }
+
+        /// Returns once the bar's watch has run a whole tick that started after the call: two more redraws than
+        /// counted now, since the first may end a tick already under way and the next tick starts 2 s after it.
+        /// (The multiplexer resumes a stopped pane process at once, so a watch cannot be paused from outside.)
+        fn wait_tick(&self, bar: &str) {
+            let want = self.frames(bar) + 2;
+            self.server
+                .wait("two redraws", || (self.frames(bar) >= want).then_some(()))
+        }
+
+        /// Waits until the bar is at the right edge, full height, at its width.
+        fn wait_place(&self, bar: &str, what: &str) {
+            self.server.wait(what, || {
+                (self.bar_place(bar) == self.in_place(bar)).then_some(())
+            })
+        }
+
+        /// Ends the bar's watch, keeping its pane and its tag: from here no tick can repair anything.
+        fn freeze(&self, bar: &str) {
+            self.call(&["respawn-pane", "-k", "-t", bar, "sleep", "1000"]);
         }
 
         /// Background mux-agent runs from the root pane's shell, each with this test's state root.
@@ -1516,7 +1550,7 @@ exec claude --dangerously-skip-permissions
 
     // S1: from the lower-left pane of a 3-pane window (neither rightmost nor full height), sidebar opens the bar at
     // the window's right edge, full height, `bar_width` columns, and the active pane is unchanged. With its watch
-    // stopped (so no tick can repair anything), a spawn by `placement h` and by `placement v` from that pane puts the
+    // ended (so no tick can repair anything), a spawn by `placement h` and by `placement v` from that pane puts the
     // agent left of the bar, and the bar stays rightmost and full height.
     fn bar_opens_at_right_edge_from_any_pane(mux: Mux) {
         let Some(mut live) = Live::human(mux) else {
@@ -1529,18 +1563,11 @@ exec claude --dangerously-skip-permissions
         let (code, open) = live.run_in(&lower, &["sidebar"]);
         assert_eq!((code, &open["opened"]), (0, &json!(true)), "{mux:?} {open}");
         let bar = s(&open["pane"]).to_string();
+        // The watch's first tick runs before the bar is tagged, so it repairs nothing; ended now, it never will.
+        live.freeze(&bar);
         assert_eq!(live.bar_place(&bar), live.in_place(&bar), "{mux:?}");
         assert_eq!(live.active(&root), active, "{mux:?}: opening moved focus");
         assert_eq!(live.field(&right, "#{pane_at_right}"), "0", "{mux:?}");
-        let watch = live.watch_pid(&bar);
-        let signal = |name: &str| {
-            let sent = Command::new("kill")
-                .args([name, &watch.to_string()])
-                .status()
-                .unwrap();
-            assert!(sent.success(), "{mux:?}: kill {name} {watch}");
-        };
-        signal("-STOP");
         for (n, placement) in ["h", "v"].into_iter().enumerate() {
             let (code, set) = live.run_in(&lower, &["placement", placement]);
             assert_eq!(code, 0, "{mux:?} {set}");
@@ -1564,7 +1591,173 @@ exec claude --dangerously-skip-permissions
                 "{mux:?} placement {placement}: {place}"
             );
         }
-        signal("-CONT");
+    }
+
+    /// `args`, then `select-pane -t <focus>` and the bar's `<at right>|<at top>|<at bottom>`, as one command list,
+    /// so no tick of the watch runs in between. Answers the list's output lines; the last is the bar's place.
+    fn damage(live: &Live, bar: &str, args: &[&str], focus: &str) -> Vec<String> {
+        let mut list: Vec<&str> = args.to_vec();
+        list.extend([
+            ";",
+            "select-pane",
+            "-t",
+            focus,
+            ";",
+            "display-message",
+            "-p",
+            "-t",
+            bar,
+        ]);
+        list.push("#{pane_at_right}|#{pane_at_top}|#{pane_at_bottom}");
+        live.call(&list).lines().map(str::to_string).collect()
+    }
+
+    // S1 test 3: a pane split right of the bar; after one tick the bar is rightmost, full height, at its width again,
+    // the new pane is left of it and the active pane is unchanged.
+    fn bar_repaired_after_a_split_right_of_it(mux: Mux) {
+        let Some(mut live) = Live::human(mux) else {
+            return;
+        };
+        let root = live.server.pane().to_string();
+        let bar = live.open_bar();
+        let active = live.active(&root);
+        let split = [
+            "split-window",
+            "-d",
+            "-h",
+            "-P",
+            "-F",
+            "#{pane_id}",
+            "-t",
+            &bar,
+            "sh",
+        ];
+        let lines = damage(&live, &bar, &split, &active);
+        assert_eq!(
+            lines[1], "0|1|1",
+            "{mux:?}: the split left the bar at the right edge"
+        );
+        live.wait_tick(&bar);
+        assert_eq!(live.bar_place(&bar), live.in_place(&bar), "{mux:?}");
+        assert_eq!(
+            live.active(&root),
+            active,
+            "{mux:?}: the repair moved focus"
+        );
+        let edge = |pane: &str, format: &str| -> u32 { live.field(pane, format).parse().unwrap() };
+        assert!(
+            edge(&lines[0], "#{pane_right}") < edge(&bar, "#{pane_left}"),
+            "{mux:?}: the new pane is not left of the bar"
+        );
+    }
+
+    // S1 test 4: height-only damage (split -v of the bar), even-vertical, swap-pane and rotate-window each put the
+    // bar out of place; each is repaired within a tick, once with the root pane active and once with the bar active,
+    // and the active pane after the repair is exactly the one before.
+    fn bar_repair_keeps_focus(mux: Mux) {
+        let Some(mut live) = Live::human(mux) else {
+            return;
+        };
+        let root = live.server.pane().to_string();
+        let bar = live.open_bar();
+        for name in ["split -v", "even-vertical", "swap-pane", "rotate-window"] {
+            for focus in [root.clone(), bar.clone()] {
+                let split = [
+                    "split-window",
+                    "-d",
+                    "-v",
+                    "-P",
+                    "-F",
+                    "#{pane_id}",
+                    "-t",
+                    &bar,
+                    "sh",
+                ];
+                let layout = ["select-layout", "-t", &bar, "even-vertical"];
+                let swap = ["swap-pane", "-d", "-s", &bar, "-t", &root];
+                let rotate = ["rotate-window", "-t", &bar];
+                let args: &[&str] = match name {
+                    "split -v" => &split,
+                    "even-vertical" => &layout,
+                    "swap-pane" => &swap,
+                    _ => &rotate,
+                };
+                let lines = damage(&live, &bar, args, &focus);
+                let place = lines.last().unwrap();
+                assert_ne!(
+                    place, "1|1|1",
+                    "{mux:?} {name}: the bar was not put out of place"
+                );
+                live.wait_tick(&bar);
+                assert_eq!(
+                    live.bar_place(&bar),
+                    live.in_place(&bar),
+                    "{mux:?} {name} with {focus} active"
+                );
+                assert_eq!(
+                    live.active(&root),
+                    focus,
+                    "{mux:?} {name}: the repair moved focus"
+                );
+                if name == "split -v" {
+                    live.call(&["kill-pane", "-t", &lines[0]]);
+                }
+            }
+        }
+    }
+
+    // S1 test 5: a bar dragged to 55 columns at the right edge is left so (no move, no resize) until the window's
+    // width changes; resize-window -x 300 makes it 60 within one tick.
+    fn bar_drag_kept_until_the_window_resizes(mux: Mux) {
+        let Some(mut live) = Live::human(mux) else {
+            return;
+        };
+        let bar = live.open_bar();
+        // The bar's first tagged tick sets its width; a drag comes after it.
+        live.wait_tick(&bar);
+        live.call(&["resize-pane", "-t", &bar, "-x", "55"]);
+        assert_eq!(live.bar_place(&bar), "1|1|1|55", "{mux:?}");
+        live.wait_tick(&bar);
+        assert_eq!(
+            live.bar_place(&bar),
+            "1|1|1|55",
+            "{mux:?}: the drag was undone"
+        );
+        live.call(&["resize-window", "-t", &bar, "-x", "300"]);
+        live.wait_tick(&bar);
+        assert_eq!(live.bar_place(&bar), "1|1|1|60", "{mux:?}");
+    }
+
+    // S1 amendment: while a pane is zoomed the bar is left alone, so a window resize does not unzoom it (resize-pane
+    // would); once unzoomed, the width for the new window is applied.
+    fn zoomed_window_left_alone(mux: Mux) {
+        let Some(mut live) = Live::human(mux) else {
+            return;
+        };
+        let root = live.server.pane().to_string();
+        let bar = live.open_bar();
+        live.wait_tick(&bar);
+        live.call(&[
+            "resize-pane",
+            "-Z",
+            "-t",
+            &root,
+            ";",
+            "resize-window",
+            "-t",
+            &bar,
+            "-x",
+            "300",
+        ]);
+        live.wait_tick(&bar);
+        assert_eq!(
+            live.field(&bar, "#{window_zoomed_flag}"),
+            "1",
+            "{mux:?}: the watch unzoomed the window"
+        );
+        live.call(&["resize-pane", "-Z", "-t", &root]);
+        live.wait_tick(&bar);
+        assert_eq!(live.bar_place(&bar), "1|1|1|60", "{mux:?}");
     }
 
     // list -All: the reply's and each row's fields, in order; running rows first, then ended ones.
@@ -2480,6 +2673,9 @@ exec claude --dangerously-skip-permissions
                     tagged_pane_cannot_spawn_and_gone_pane_vs_dead_socket,
                     sidebar_opens_at_bar_width_and_closes,
                     bar_opens_at_right_edge_from_any_pane,
+                    bar_repaired_after_a_split_right_of_it,
+                    bar_repair_keeps_focus,
+                    bar_drag_kept_until_the_window_resizes,
                     list_all_json_shape,
                     agent_caller_forks_with_bypass_evidence,
                     spawn_model_recorded_and_listed,
@@ -2507,6 +2703,7 @@ exec claude --dangerously-skip-permissions
             lock_held_15s_refuses_lock,
             sidebar_lock_timeout_still_spawns,
             two_sidebars_one_session_one_split,
+            zoomed_window_left_alone,
             children_are_only_mux_and_client,
             panic_in_lock_frees_lock,
         ]

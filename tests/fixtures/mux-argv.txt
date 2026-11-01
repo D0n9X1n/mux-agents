@@ -167,4 +167,6 @@
 -N display-message -p -t %1 #{pid}|#{pane_pid}|#{session_id}|#{window_id}|#{@agent-id}
 # :1482
 -N display-message -p -t %1 #{pane_id}|#{@agent-role}
+# 0.2.3 (S1): a pane that answers its probe reads its window, then repairs only a bar out of place (none here)
+-N list-panes -t %1 -F #{pane_id}|#{pane_active}|#{pane_at_right}|#{pane_at_top}|#{pane_at_bottom}|#{pane_width}|#{window_width}|#{pane_left}|#{pane_top}|#{window_zoomed_flag}
 -N list-panes -s -t $3 -F <marker>|#{pane_id}|#{window_id}|#{pane_pid}|#{pane_dead}|#{@agent-id}|#{@agent-name}|<marker>
