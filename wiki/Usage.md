@@ -74,6 +74,8 @@ In tab mode the bar stays in the window you spawned from, not in each agent's wi
 
 The bar stays at the right edge, full height: when a split, a layout change, `swap-pane` or `rotate-window` moves it, the next redraw puts it back without moving your focus. Its width follows the window's width; a width you drag it to is kept until the window is resized. While a pane is zoomed the bar is left alone, so it never unzooms your pane. If putting it back fails 3 times in a row, it stops trying and shows `layout: repair paused` until the layout changes or a minute passes.
 
+The bar is the process `sidebar` started in it, not its `@agent-role sidebar` label, so a label that moved (rmux's `rotate-window` leaves labels behind) never makes your pane the bar. A pane that carries the label without being that process is never closed: `sidebar`, `sidebar -Close` and a spawn refuse and name it. If it is an old bar, for example one opened by 0.2.1, which `sidebar -Close` cannot prove, close it with `kill-pane -t <pane>`; if it is your own pane, clear the label with `set-option -p -u -t <pane> @agent-role`. A `mux-agent watch` you run by hand only draws the board; only the bar keeps the layout.
+
 ## Safety checks
 
 Agents start with permission prompts off, so mux-agents never gives an agent more than its caller already has. A `spawn` is refused, naming the check, unless:
