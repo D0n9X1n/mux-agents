@@ -12,6 +12,7 @@ pub mod error;
 pub mod json;
 pub mod launcher;
 pub mod mux;
+pub mod paint;
 pub mod parse;
 pub mod proc;
 pub mod sandbox;
