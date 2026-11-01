@@ -526,12 +526,11 @@ mod tests {
         let cwd = w.ctx.cwd.to_str().unwrap().to_string();
         let exe = w.ctx.exe.to_str().unwrap().to_string();
         let calls = w.fakes.mux_calls();
-        // The new agent's id, as its tags name it.
-        let id = calls
-            .iter()
-            .flat_map(|c| c.windows(2))
-            .find(|pair| pair[0] == "@agent-id")
-            .map(|pair| pair[1].clone());
+        // The new agent's id, as its tags name it (inside the bound tag command: `@agent-id <id>`).
+        let id = calls.iter().flatten().find_map(|t| {
+            let rest = &t[t.find("@agent-id ")? + "@agent-id ".len()..];
+            rest.get(..12).map(str::to_string)
+        });
         let spec = id.as_ref().map(|id| {
             w.ctx
                 .state_root
@@ -552,8 +551,12 @@ mod tests {
                 .map(|t| {
                     // A private capture buffer's random name is written `<buffer>`.
                     let t = &buffer_placeholder(t);
-                    // A token with spaces (if-shell's command, the bar's record) is written quoted.
+                    // A token with spaces (if-shell's command, the bar's record) is written quoted, its id as <id>.
                     if t.contains(' ') {
+                        let t = match &id {
+                            Some(id) => t.replace(id.as_str(), "<id>"),
+                            None => t.clone(),
+                        };
                         return format!("'{t}'");
                     }
                     if Some(t) == spec.as_ref() {
@@ -647,6 +650,7 @@ mod tests {
     // The agent's pane is %12; the side bar's split, the only call running `watch`, answers %13 in the caller's window.
     fn spawn_world() -> World {
         let w = World::human("");
+        w.launches_hold();
         bar_process(&w);
         w.fakes.mux_rule(
             "new-window",

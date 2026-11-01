@@ -276,6 +276,24 @@ pub(crate) mod fixture {
             write(&path, record);
         }
 
+        /// spawn's probe after the tags answers every pane as still the launch its reply named.
+        pub fn launches_hold(&self) {
+            self.fakes
+                .mux_script("}|#{==:#{pane_start_command},", |argv| {
+                    let pane = argv
+                        .iter()
+                        .skip_while(|a| *a != "-t")
+                        .nth(1)
+                        .cloned()
+                        .unwrap_or_default();
+                    Ok(crate::mux::Output {
+                        code: 0,
+                        stdout: format!("{pane}|1\n"),
+                        stderr: String::new(),
+                    })
+                });
+        }
+
         /// The recipient probe answers every pane as a live pane of session $3.
         pub fn recipients_live(&self) {
             self.fakes.mux_script("#{pane_id}|#{session_id}", |argv| {

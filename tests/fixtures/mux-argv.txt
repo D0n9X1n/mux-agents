@@ -21,9 +21,12 @@
 # :800-804; 0.2.3 (#48): the reply also names the pane's start command, kept in record.json as startCommand
 -N new-window -d -P -F #{pane_id}|#{window_id}|#{pane_start_command} -t $3: -n hi -e MUX_AGENTS_STATE=<state> -c <cwd> <exe> launcher <spec>
 # :808-809; 0.2.2: the agent's pane is titled with its name in the tag call (focus unchanged), then a best-effort
-# call keeps the client from retitling it (tmux 3.2a has no allow-set-title and refuses it; the spawn goes on)
--N set-option -p -t %12 @agent-id <id> ; set-option -p -t %12 @agent-name hi ; set-option -p -t %12 @agent-parent %1 ; set-option -p -t %12 @agent-context brief:human ; select-pane -T hi -t %12
--N set-option -p -t %12 allow-set-title off
+# call keeps the client from retitling it (tmux 3.2a has no allow-set-title and refuses it; the spawn goes on).
+# 0.2.3 (#48): both run only while %12 still runs the command the reply named, and a read then shows it still that
+# launch; a pane respawned since is never tagged or retitled, and the spawn rolls back
+-N if-shell -F -t %12 '#{==:#{pane_start_command},/bin/mux-agent launcher /s/spec.json}' 'set-option -p -t %12 @agent-id <id> ; set-option -p -t %12 @agent-name hi ; set-option -p -t %12 @agent-parent %1 ; set-option -p -t %12 @agent-context brief:human ; select-pane -T hi -t %12'
+-N if-shell -F -t %12 '#{==:#{pane_start_command},/bin/mux-agent launcher /s/spec.json}' 'set-option -p -t %12 allow-set-title off'
+-N display-message -p -t %12 '#{pane_id}|#{==:#{pane_start_command},/bin/mux-agent launcher /s/spec.json}'
 # 0.2.1: committed and the spawn lock released, the side bar is found or opened under the sidebar lock
 -N show-options -qv -t $3 @mux-agents-sidebar
 # 0.2.3 (#47): no recorded bar, and no labelled pane anywhere in the session
@@ -47,8 +50,9 @@
 -N list-panes -s -t $3 -F <marker>#{pane_id}<marker>#{window_id}<marker>#{pane_pid}<marker>#{pane_dead}<marker>#{pane_start_command}<marker>#{@agent-id}<marker>#{@agent-name}<marker>
 # :800, 804
 -N split-window -d -v -P -F #{pane_id}|#{window_id}|#{pane_start_command} -t %1 -e MUX_AGENTS_STATE=<state> -c <cwd> <exe> launcher <spec>
--N set-option -p -t %12 @agent-id <id> ; set-option -p -t %12 @agent-name helper ; set-option -p -t %12 @agent-parent %1 ; set-option -p -t %12 @agent-context brief:human ; select-pane -T helper -t %12
--N set-option -p -t %12 allow-set-title off
+-N if-shell -F -t %12 '#{==:#{pane_start_command},/bin/mux-agent launcher /s/spec.json}' 'set-option -p -t %12 @agent-id <id> ; set-option -p -t %12 @agent-name helper ; set-option -p -t %12 @agent-parent %1 ; set-option -p -t %12 @agent-context brief:human ; select-pane -T helper -t %12'
+-N if-shell -F -t %12 '#{==:#{pane_start_command},/bin/mux-agent launcher /s/spec.json}' 'set-option -p -t %12 allow-set-title off'
+-N display-message -p -t %12 '#{pane_id}|#{==:#{pane_start_command},/bin/mux-agent launcher /s/spec.json}'
 -N show-options -qv -t $3 @mux-agents-sidebar
 # 0.2.3 (#47): no recorded bar, and no labelled pane anywhere in the session
 -N show-options -qv -t $3 @mux-agents-sidebar-id
@@ -72,8 +76,9 @@
 -N list-panes -s -t $3 -F <marker>#{pane_id}<marker>#{window_id}<marker>#{pane_pid}<marker>#{pane_dead}<marker>#{pane_start_command}<marker>#{@agent-id}<marker>#{@agent-name}<marker>
 # the stored placement: a split beside the caller, as -Split h
 -N split-window -d -h -P -F #{pane_id}|#{window_id}|#{pane_start_command} -t %1 -e MUX_AGENTS_STATE=<state> -c <cwd> <exe> launcher <spec>
--N set-option -p -t %12 @agent-id <id> ; set-option -p -t %12 @agent-name hi ; set-option -p -t %12 @agent-parent %1 ; set-option -p -t %12 @agent-context brief:human ; select-pane -T hi -t %12
--N set-option -p -t %12 allow-set-title off
+-N if-shell -F -t %12 '#{==:#{pane_start_command},/bin/mux-agent launcher /s/spec.json}' 'set-option -p -t %12 @agent-id <id> ; set-option -p -t %12 @agent-name hi ; set-option -p -t %12 @agent-parent %1 ; set-option -p -t %12 @agent-context brief:human ; select-pane -T hi -t %12'
+-N if-shell -F -t %12 '#{==:#{pane_start_command},/bin/mux-agent launcher /s/spec.json}' 'set-option -p -t %12 allow-set-title off'
+-N display-message -p -t %12 '#{pane_id}|#{==:#{pane_start_command},/bin/mux-agent launcher /s/spec.json}'
 # off after sidebar -Close: read, nothing opened
 -N show-options -qv -t $3 @mux-agents-sidebar
 
@@ -83,7 +88,7 @@
 -N show-options -qv -t $3 @mux-agents-placement
 -N list-panes -s -t $3 -F <marker>#{pane_id}<marker>#{window_id}<marker>#{pane_pid}<marker>#{pane_dead}<marker>#{pane_start_command}<marker>#{@agent-id}<marker>#{@agent-name}<marker>
 -N new-window -d -P -F #{pane_id}|#{window_id}|#{pane_start_command} -t $3: -n hi -e MUX_AGENTS_STATE=<state> -c <cwd> <exe> launcher <spec>
--N set-option -p -t %12 @agent-id <id> ; set-option -p -t %12 @agent-name hi ; set-option -p -t %12 @agent-parent %1 ; set-option -p -t %12 @agent-context brief:human ; select-pane -T hi -t %12
+-N if-shell -F -t %12 '#{==:#{pane_start_command},/bin/mux-agent launcher /s/spec.json}' 'set-option -p -t %12 @agent-id <id> ; set-option -p -t %12 @agent-name hi ; set-option -p -t %12 @agent-parent %1 ; set-option -p -t %12 @agent-context brief:human ; select-pane -T hi -t %12'
 # :823; 0.2.3 (#48): killed only while it still runs the command the reply named (live or dead), then probed: only
 # a gone pane is reported closed
 -N if-shell -F -t %12 '#{==:#{pane_start_command},/bin/mux-agent launcher /s/spec.json}' 'kill-pane -t %12'
