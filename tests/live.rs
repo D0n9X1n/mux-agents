@@ -159,7 +159,7 @@ mod e2e {
     const LONG: Duration = Duration::from_secs(60);
     // Run by the root pane's shell: a session file as Claude writes it, the mode line on the screen, then the client.
     const ROOT_SH: &str = r#"printf '{"pid":%s,"sessionId":"%s","cwd":"%s"}\n' "$$" "$CLAUDE_CODE_SESSION_ID" "$(pwd -P)" > "$HOME/.claude/sessions/$$.json"
-echo 'bypass permissions on (shift+tab to cycle)'
+echo '  ⏵⏵ bypass permissions on (shift+tab to cycle)'
 exec claude --dangerously-skip-permissions
 "#;
 
@@ -1444,13 +1444,13 @@ exec claude --dangerously-skip-permissions
         );
         let w2 = live.spawn("w2", &[]);
         assert_eq!(s(&w2["context"]), "fork", "{mux:?}");
-        // The mode line scrolled out of the screen's last rows (a Shift+Tab the transcript has not recorded yet).
+        // The mode line scrolled out of the screen's last 8 rows (a Shift+Tab the transcript has not recorded yet).
         let pid = live.root_pid;
-        for n in 1..=5 {
+        for n in 1..=8 {
             live.server.send_keys(&format!("noise {n}"));
         }
         live.server
-            .wait_line(&format!("input.{pid}.log"), "noise 5");
+            .wait_line(&format!("input.{pid}.log"), "noise 8");
         let (code, refused) = live.try_spawn("w3", &[]);
         assert_eq!(
             (code, &refused["check"]),

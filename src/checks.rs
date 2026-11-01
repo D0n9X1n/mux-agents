@@ -267,20 +267,58 @@ fn claude_policy(ctx: &Ctx, caller: &Caller) -> Res<bool> {
     if height < 3 {
         return Ok(true);
     }
-    let screen = crate::mux::native(ctx, &["capture-pane", "-p", "-t", pane], true)?;
+    // -J gives back a footer the pane's width wrapped as one row.
+    let screen = crate::mux::native(ctx, &["capture-pane", "-p", "-J", "-t", pane], true)?;
     if screen.code != 0 {
         return Ok(false);
     }
+    Ok(screen_mode(&screen.stdout) == Some(Mode::Bypass))
+}
+
+// How many non-blank rows at the bottom of the pane are searched for its mode line: the footer, with a spinner, a
+// background task, a queued hint and a status line below it.
+const MODE_ROWS: usize = 8;
+
+// Claude Code's footer badges, each the start of a mode line.
+const BYPASS_BADGE: &str = "⏵⏵ bypass permissions on";
+const OTHER_BADGES: [&str; 5] = [
+    "⏵⏵ accept edits on",
+    "⏵⏵ auto mode on",
+    "⏵⏵ don't ask on",
+    "⏸ plan mode on",
+    "⏸ manual mode on",
+];
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Mode {
+    Bypass,
+    Other,
+}
+
+/// The mode a row shows when, after leading whitespace, it starts with a footer badge (words in any case, anything
+/// after it); prompt, quoted or mid-sentence text never does.
+fn mode_line(row: &str) -> Option<Mode> {
+    let row = row.trim_start().to_lowercase();
+    if row.starts_with(BYPASS_BADGE) {
+        Some(Mode::Bypass)
+    } else if OTHER_BADGES.iter().any(|badge| row.starts_with(badge)) {
+        Some(Mode::Other)
+    } else {
+        None
+    }
+}
+
+/// The lowest mode line among the screen's last `MODE_ROWS` non-blank rows.
+fn screen_mode(screen: &str) -> Option<Mode> {
     let rows: Vec<&str> = screen
-        .stdout
         .split('\n')
         .map(|row| row.strip_suffix('\r').unwrap_or(row))
         .filter(|row| !row.trim().is_empty())
         .collect();
-    let tail = &rows[rows.len().saturating_sub(4)..];
-    Ok(tail
+    rows[rows.len().saturating_sub(MODE_ROWS)..]
         .iter()
-        .any(|row| contains_ignoring_case(row, "bypass permissions on")))
+        .rev()
+        .find_map(|row| mode_line(row))
 }
 
 /// ~/.claude/projects/<folder>/<session>.jsonl when exactly one project folder has it.
@@ -959,7 +997,7 @@ mod tests {
         // The file's bytes instead of the transcript lines as UTF-8.
         bytes: Option<Vec<u8>>,
         height: Option<&'static str>,
-        screen: Option<&'static str>,
+        screen: Option<String>,
         sid: &'static str,
         folders: usize,
     }
@@ -970,7 +1008,7 @@ mod tests {
                 transcript: vec![mode("bypassPermissions")],
                 bytes: None,
                 height: Some("40\n"),
-                screen: Some("work\n\n  ⏵⏵ bypass permissions on (shift+tab to cycle)\n\n"),
+                screen: Some(format!("work\n\n{BYPASS}\n\n")),
                 sid: SID,
                 folders: 1,
             }
@@ -981,7 +1019,10 @@ mod tests {
         format!(r#"{{"type":"permission-mode","permissionMode":"{name}","sessionId":"{SID}"}}"#)
     }
 
-    fn claude_policy(case: Claude) -> String {
+    const BYPASS: &str = "  ⏵⏵ bypass permissions on (shift+tab to cycle)";
+
+    // The case's home, fakes and ctx; its answer is `claude_answer`.
+    fn claude_setup(case: &Claude) -> (TempDir, Fakes, Ctx) {
         let home = TempDir::new();
         for folder in 0..case.folders {
             let project = home
@@ -998,22 +1039,31 @@ mod tests {
             Some(out) => fakes.mux_rule("#{pane_height}", 0, out, ""),
             None => fakes.mux_rule("#{pane_height}", 1, "", ""),
         }
-        match case.screen {
+        match &case.screen {
             Some(out) => fakes.mux_rule("capture-pane", 0, out, ""),
             None => fakes.mux_rule("capture-pane", 1, "", ""),
         }
         let mut ctx = fakes.ctx();
         ctx.home = home.path().to_path_buf();
         ctx.env = Env::from_pairs([("CLAUDE_CODE_SESSION_ID", case.sid)]);
+        (home, fakes, ctx)
+    }
+
+    fn claude_answer(ctx: &Ctx) -> String {
         let caller = agent_caller(Client::Claude, Some(&["claude"]));
-        let result = answer(policy(&ctx, &caller, &[]));
+        answer(policy(ctx, &caller, &[]))
+    }
+
+    fn claude_policy(case: Claude) -> String {
+        let (_home, fakes, ctx) = claude_setup(&case);
+        let result = claude_answer(&ctx);
         let calls = fakes.mux_calls();
         if result == "true" && case.screen.is_some() {
             assert_eq!(
                 calls,
                 [
                     vec!["-N", "display-message", "-p", "-t", "%1", "#{pane_height}"],
-                    vec!["-N", "capture-pane", "-p", "-t", "%1"]
+                    vec!["-N", "capture-pane", "-p", "-J", "-t", "%1"]
                 ]
             );
         }
@@ -1077,16 +1127,17 @@ mod tests {
             };
             assert_eq!(claude_policy(case), "false", "{height:?}");
         }
-        // The last 4 non-blank rows must show the mode, any case.
+        // The lowest mode line in the last 8 non-blank rows must be the bypass badge, any case.
         for (screen, want) in [
-            (Some("BYPASS PERMISSIONS ON\na\n\n \nb\nc\n"), "true"),
-            (Some("bypass permissions on\na\nb\nc\nd\n"), "false"),
+            (Some("⏵⏵ BYPASS PERMISSIONS ON\na\n\n \nb\nc\n"), "true"),
+            (Some("  ⏵⏵ bypass permissions on\r\nwork\r\n"), "true"),
+            (Some("bypass permissions on\na\n"), "false"),
             (Some("> \n  ? for shortcuts\n"), "false"),
-            (Some("bypass permissions off\r\n"), "false"),
+            (Some("⏵⏵ bypass permissions off\r\n"), "false"),
             (None, "false"),
         ] {
             let case = Claude {
-                screen,
+                screen: screen.map(String::from),
                 ..Claude::default()
             };
             assert_eq!(claude_policy(case), want, "{screen:?}");
@@ -1725,7 +1776,7 @@ mod tests {
         // Three rows is a sized pane: the mode line is read and decides, not the transcript alone.
         let off = Claude {
             height: Some("3\n"),
-            screen: Some("> \n"),
+            screen: Some("> \n".into()),
             ..Claude::default()
         };
         assert_eq!(claude_policy(off), "false");
@@ -1734,6 +1785,108 @@ mod tests {
             ..Claude::default()
         };
         assert_eq!(claude_policy(on), "true");
+    }
+
+    // `badge` under a work row, then `below` non-blank rows, each after a blank one.
+    fn below_badge(badge: &str, below: usize) -> String {
+        let mut screen = format!("work\n{badge}\n");
+        for n in 1..=below {
+            screen.push_str(&format!("\nrow {n}\n"));
+        }
+        screen
+    }
+
+    const OTHER_BADGES: [&str; 5] = [
+        "⏵⏵ accept edits on",
+        "⏵⏵ auto mode on",
+        "⏵⏵ don't ask on",
+        "⏸ plan mode on",
+        "⏸ manual mode on",
+    ];
+
+    // Rows that name bypass but are not a mode line: a prompt, a quote, text before the badge, no glyph.
+    const NOT_MODE_LINES: [&str; 4] = [
+        "❯ bypass permissions on",
+        "\"bypass permissions on\" is quoted",
+        "x ⏵⏵ bypass permissions on",
+        "bypass permissions on",
+    ];
+
+    #[test]
+    fn policy_claude_mode_line_in_last_8_rows() {
+        // A spinner, a background task, a queued hint and a status line below the footer leave it in view; blank
+        // rows between are not counted.
+        for below in 4..=7 {
+            let case = Claude {
+                screen: Some(below_badge(BYPASS, below)),
+                ..Claude::default()
+            };
+            assert_eq!(claude_policy(case), "true", "{below}");
+        }
+        let case = Claude {
+            screen: Some(below_badge(BYPASS, 8)),
+            ..Claude::default()
+        };
+        assert_eq!(claude_policy(case), "false");
+    }
+
+    #[test]
+    fn policy_claude_wrapped_badge_joined_by_j() {
+        // A 60-column pane wraps the footer and four status rows; only -J gives each row back whole.
+        let rows: Vec<String> = [format!("{BYPASS} · {}", "x".repeat(80))]
+            .into_iter()
+            .chain(std::iter::repeat_n("s".repeat(100), 4))
+            .collect();
+        let (_home, fakes, ctx) = claude_setup(&Claude::default());
+        fakes.mux_script("capture-pane", move |argv| {
+            let joined = argv.iter().any(|a| a == "-J");
+            let mut screen = String::new();
+            for row in &rows {
+                let chars: Vec<char> = row.chars().collect();
+                let width = if joined { chars.len() } else { 60 };
+                for part in chars.chunks(width) {
+                    screen.extend(part);
+                    screen.push('\n');
+                }
+            }
+            Ok(crate::mux::Output {
+                code: 0,
+                stdout: screen,
+                stderr: String::new(),
+            })
+        });
+        assert_eq!(claude_answer(&ctx), "true");
+        assert_eq!(
+            fakes.mux_calls().last().unwrap(),
+            &["-N", "capture-pane", "-p", "-J", "-t", "%1"]
+        );
+    }
+
+    #[test]
+    fn policy_claude_lowest_mode_line_decides() {
+        // Any other mode below an older bypass badge refuses, its words in any case.
+        for badge in OTHER_BADGES {
+            for badge in [badge.to_string(), badge.to_uppercase()] {
+                let case = Claude {
+                    screen: Some(format!("{BYPASS}\nwork\n  {badge} (shift+tab to cycle)\n")),
+                    ..Claude::default()
+                };
+                assert_eq!(claude_policy(case), "false", "{badge}");
+            }
+        }
+        // Text naming bypass is no mode line: alone it shows no mode, and below another mode it hides nothing.
+        for row in NOT_MODE_LINES {
+            let alone = Claude {
+                screen: Some(format!("work\n{row}\n")),
+                ..Claude::default()
+            };
+            assert_eq!(claude_policy(alone), "false", "{row}");
+            let below = Claude {
+                screen: Some(format!("⏵⏵ accept edits on\n{row}\n")),
+                ..Claude::default()
+            };
+            assert_eq!(claude_policy(below), "false", "{row}");
+        }
     }
 
     #[test]
