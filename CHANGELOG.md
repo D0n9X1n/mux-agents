@@ -11,6 +11,7 @@ All notable changes to mux-agents. The format follows [Keep a Changelog](https:/
 ### Fixed
 
 - A Claude Code caller in bypass mode is no longer refused `policy` when its footer sits a few rows up or wraps: the pane is captured with `-J`, the last 8 non-blank rows are searched, only a documented footer badge counts as a mode line and the lowest one decides. A transcript or screen that shows no mode yet is read again, up to 3 times 250 ms apart. Every Claude Code `policy` refusal now names its reason, in its message and as `reason`. ([#40](https://github.com/D0n9X1n/mux-agents/issues/40))
+- An agent whose tab or pane is gone no longer stays in the side bar as `lost`: the next `list`, `read`, `spawn`, `stop` or side-bar tick closes it with exactly one notice to its parent, removes it from `list` and the bar, and keeps it in `list -All` with `closedBy: "pane"`. A pane `remain-on-exit` kept after its agent ended is closed by one server-side check that it is still dead and still tagged as that agent; a pid is never signalled. An agent that never committed is closed only after 60 s, under the session's spawn lock. `stop` on an agent that already ended answers `ok` with `already: "<state>"` instead of a `target` refusal, and closes, signals or notices nothing. The exit message now carries `kind` and `exitCode`, so the first notice wins even when its marker write failed. ([#38](https://github.com/D0n9X1n/mux-agents/issues/38))
 
 ## [0.2.1] - 2026-11-01
 

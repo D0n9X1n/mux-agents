@@ -46,6 +46,18 @@ pub(crate) fn lock<T>(_: &Ctx, key: &str, f: impl FnOnce() -> Res<T>) -> Res<T> 
     crate::testing::locked(key, f)
 }
 
+/// Runs `f` under the per-user lock for `key` when one attempt takes it, never waiting; `None` when it is busy.
+#[cfg(not(test))]
+pub(crate) fn try_lock<T>(ctx: &Ctx, key: &str, f: impl FnOnce() -> Res<T>) -> Res<Option<T>> {
+    crate::state::lock::try_with_lock(ctx, key, f)
+}
+
+/// Tests record the hold as `lock` does; a key held elsewhere (a shared gate or `lock_timeout`) is busy at once.
+#[cfg(test)]
+pub(crate) fn try_lock<T>(_: &Ctx, key: &str, f: impl FnOnce() -> Res<T>) -> Res<Option<T>> {
+    crate::testing::try_locked(key, f)
+}
+
 /// 2 `usage` with the verb's usage line.
 pub(crate) fn usage(verb: &str) -> Refusal {
     let line = crate::cli::VERBS
@@ -201,12 +213,19 @@ pub(crate) mod fixture {
         /// What `list-panes` answers, one `<pane>|<window>|<pid>|<id>|<name>` per row, expanded into the call's
         /// own `-F` format as the multiplexer would.
         pub fn panes(&self, rows: &[&str]) {
+            self.panes_dead(rows, &[]);
+        }
+
+        /// As `panes`, with the panes in `dead` answering `#{pane_dead}` 1 (remain-on-exit kept them).
+        pub fn panes_dead(&self, rows: &[&str], dead: &[&str]) {
             let rows: Vec<String> = rows.iter().map(|r| r.to_string()).collect();
+            let dead: Vec<String> = dead.iter().map(|d| d.to_string()).collect();
             self.fakes.mux_script("list-panes", move |argv| {
                 let rows: Vec<&str> = rows.iter().map(String::as_str).collect();
+                let dead: Vec<&str> = dead.iter().map(String::as_str).collect();
                 Ok(crate::mux::Output {
                     code: 0,
-                    stdout: listed(argv, &rows, "\n"),
+                    stdout: listed_dead(argv, &rows, "\n", &dead),
                     stderr: String::new(),
                 })
             });
@@ -263,6 +282,11 @@ pub(crate) mod fixture {
     /// `rows` (`<pane>|<window>|<pid>|<id>|<name>`, the name to the end and free to hold `|` or LF) expanded
     /// into the `-F` format of `argv`, each row ended by `sep`. A name's LF lands in the output as it would.
     pub fn listed(argv: &[String], rows: &[&str], sep: &str) -> String {
+        listed_dead(argv, rows, sep, &[])
+    }
+
+    /// As `listed`, with `#{pane_dead}` 1 for the panes in `dead` and 0 for the others.
+    pub fn listed_dead(argv: &[String], rows: &[&str], sep: &str, dead: &[&str]) -> String {
         let format = argv
             .iter()
             .skip_while(|a| *a != "-F")
@@ -274,7 +298,13 @@ pub(crate) mod fixture {
                 let mut fields = row.splitn(5, '|');
                 let mut next = || fields.next().unwrap_or("").to_string();
                 let (pane, window, pid, id, name) = (next(), next(), next(), next(), next());
+                let is_dead = if dead.contains(&pane.as_str()) {
+                    "1"
+                } else {
+                    "0"
+                };
                 let line = format
+                    .replace("#{pane_dead}", is_dead)
                     .replace("#{pane_id}", &pane)
                     .replace("#{window_id}", &window)
                     .replace("#{pane_pid}", &pid)

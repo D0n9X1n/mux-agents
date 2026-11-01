@@ -237,8 +237,12 @@ impl Launch<'_> {
             &state.join("server.json"),
             &json!({"socket": caller.socket, "serverPid": caller.server_pid, "serverStart": caller.server_start}),
         )?;
-        // Every tagged pane counts, committed or not, so a launch in progress holds its place.
-        let live = registry::tagged(ctx, caller)?;
+        // Every tagged pane counts, committed or not, so a launch in progress holds its place. Gone agents and dead
+        // panes are closed first, inside this spawn lock (never taken again), and the panes listed again after.
+        let mut live = registry::tagged(ctx, caller)?;
+        if registry::reap(ctx, caller, Some(&live), true)? {
+            live = registry::tagged(ctx, caller)?;
+        }
         if live.len() >= CAP {
             return refuse(2, "cap", "the session already has 6 live agents");
         }
@@ -1160,6 +1164,76 @@ mod tests {
         w.panes(&five.iter().map(String::as_str).collect::<Vec<_>>());
         let ok = reply(&run(&w, &["-Client", "claude", "-Task", "hi"]));
         assert_eq!(ok["name"], "claude-6");
+    }
+
+    #[test]
+    fn spawn_reaps_before_the_cap_inside_its_lock() {
+        // Six tagged panes, the sixth (%26) a dead pane of our committed agent: killed and noticed before the cap.
+        let w = human();
+        let six = rows(6);
+        let folder = w.agent_record("000000000a06", json!({"name": "claude-6", "pane": "%26"}));
+        let killed = Rc::new(Cell::new(false));
+        let gone = killed.clone();
+        w.fakes.mux_script("list-panes -s", move |argv| {
+            let n = if gone.get() { 5 } else { 6 };
+            let rows: Vec<&str> = six[..n].iter().map(String::as_str).collect();
+            Ok(Output {
+                code: 0,
+                stdout: crate::agents::fixture::listed_dead(argv, &rows, "\n", &["%26"]),
+                stderr: String::new(),
+            })
+        });
+        let kill = killed.clone();
+        w.fakes.mux_script("if-shell", move |_| {
+            kill.set(true);
+            Ok(Output {
+                code: 0,
+                stdout: String::new(),
+                stderr: String::new(),
+            })
+        });
+        w.fakes
+            .mux_rule("-t %26 #{pane_id}|#{@agent-id}", 0, "|\n", "");
+        let ok = reply(&run(&w, &["-Client", "claude", "-Task", "hi"]));
+        assert!(killed.get());
+        assert_eq!(ok["name"], "claude-6");
+        assert!(folder.join("notice.json").is_file());
+
+        // An uncommitted agent over 60 s old whose pane is gone: noticed inside the spawn lock, never taken twice.
+        let w = human();
+        w.clock("2026-10-29T12:00:00.0000000Z");
+        let five = rows(5);
+        w.panes(&five.iter().map(String::as_str).collect::<Vec<_>>());
+        let stale = w.uncommitted(
+            "bbbbbbbbbbbb",
+            json!({"pane": "%7", "createdAt": "2026-10-29T11:58:00.0000000Z"}),
+        );
+        w.fakes
+            .mux_rule("-t %7 #{pane_id}|#{@agent-id}", 0, "|\n", "");
+        w.fakes.clear_log();
+        let ok = reply(&run(&w, &["-Client", "claude", "-Task", "hi"]));
+        assert_eq!(ok["name"], "claude-6");
+        assert!(stale.join("notice.json").is_file());
+        let spawn = format!("spawn|{}|$3", w.caller().server_key);
+        let held: Vec<String> = w
+            .fakes
+            .locks()
+            .into_iter()
+            .filter(|l| {
+                l.contains("|bbbbbbbbbbbb")
+                    || *l == format!("+{spawn}")
+                    || *l == format!("-{spawn}")
+            })
+            .collect();
+        assert_eq!(
+            held[..3],
+            [
+                format!("+{spawn}"),
+                format!("+notice|{}|bbbbbbbbbbbb", w.caller().server_key),
+                format!("-notice|{}|bbbbbbbbbbbb", w.caller().server_key)
+            ]
+        );
+        assert_eq!(held.iter().filter(|l| l.contains("spawn|")).count(), 2);
     }
 
     #[test]

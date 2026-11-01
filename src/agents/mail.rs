@@ -74,42 +74,74 @@ pub fn add_mail(
     body: &str,
     message_id: Option<&str>,
 ) -> Res<String> {
-    let mailbox = super::state_dir(ctx, caller)?
-        .join("mail")
-        .join(format!("{key}.jsonl"));
     let given = message_id.filter(|id| !id.is_empty());
     let id = match given {
         Some(id) => id.to_string(),
         None => crate::util::guid()?.replace('-', "")[..8].to_string(),
     };
     let message = json!({"id": id, "from": from, "pane": from_pane, "at": crate::util::utc_o(ctx.clock.now()), "body": body});
+    append_message(ctx, caller, key, &message, given)?;
+    Ok(id)
+}
+
+/// Appends message `id` with `fields` after its body, unless the mailbox already holds a parsable line with that
+/// id: then nothing is added (only the LF it may lack) and that stored message is the answer.
+#[allow(clippy::too_many_arguments)]
+pub fn add_once(
+    ctx: &Ctx,
+    caller: &Caller,
+    key: &str,
+    from: &str,
+    from_pane: &str,
+    body: &str,
+    id: &str,
+    fields: &Map<String, Value>,
+) -> Res<Option<Value>> {
+    let mut message = json!({"id": id, "from": from, "pane": from_pane, "at": crate::util::utc_o(ctx.clock.now()), "body": body});
+    if let Some(object) = message.as_object_mut() {
+        object.extend(fields.iter().map(|(k, v)| (k.clone(), v.clone())));
+    }
+    append_message(ctx, caller, key, &message, Some(id))
+}
+
+/// The append of `add_mail` and `add_once`, under the mailbox lock: seals a torn last line, then adds `message`
+/// unless `dedup` names an id already delivered, whose stored message is answered.
+fn append_message(
+    ctx: &Ctx,
+    caller: &Caller,
+    key: &str,
+    message: &Value,
+    dedup: Option<&str>,
+) -> Res<Option<Value>> {
+    let mailbox = super::state_dir(ctx, caller)?
+        .join("mail")
+        .join(format!("{key}.jsonl"));
     super::lock(ctx, &super::lock_key("mail", caller, key), || {
         // Only a dedup needs the whole mailbox; otherwise its last byte tells whether it is torn.
-        let existing = match given {
+        let existing = match dedup {
             Some(_) => read_or_empty(&mailbox)?,
             None => last_byte(&mailbox)?.into_iter().collect(),
         };
         let torn = existing.last().is_some_and(|&b| b != b'\n');
-        let delivered = given.is_some_and(|id| {
+        let delivered = dedup.and_then(|id| {
             String::from_utf8_lossy(&existing)
                 .split('\n')
                 .filter_map(|line| serde_json::from_str::<Value>(line).ok())
-                .any(|stored| super::text(stored.get("id")) == id)
+                .find(|stored| super::text(stored.get("id")) == id)
         });
         let mut out = String::new();
         if torn {
             out.push('\n');
         }
-        if !delivered {
+        if delivered.is_none() {
             out.push_str(&message.to_string());
             out.push('\n');
         }
         if !out.is_empty() {
             append(&mailbox, out.as_bytes())?;
         }
-        Ok(())
-    })?;
-    Ok(id)
+        Ok(delivered)
+    })
 }
 
 fn read_or_empty(path: &Path) -> Res<Vec<u8>> {
@@ -406,6 +438,53 @@ mod tests {
         let b = add("same", Some(""));
         assert_ne!(a, b);
         assert_eq!(read(&mailbox).lines().count(), 2);
+    }
+
+    #[test]
+    fn add_once_keeps_fields_and_answers_the_delivered_one() {
+        let w = World::human("");
+        let caller = w.caller();
+        let mailbox = w.state().join("mail").join("pane-1.jsonl");
+        let id = "exit-aaaaaaaaaaaa";
+        let mut stopped = Map::new();
+        stopped.insert("kind".into(), "stopped".into());
+        stopped.insert("exitCode".into(), Value::Null);
+        let first = add_once(
+            &w.ctx,
+            &caller,
+            "pane-1",
+            "worker",
+            "%9",
+            "worker was stopped.",
+            id,
+            &stopped,
+        );
+        assert_eq!(first.unwrap(), None);
+        // The fields follow the body, so the stored line says what the notice was.
+        let stored = r#"{"id":"exit-aaaaaaaaaaaa","from":"worker","pane":"%9","at":"1970-01-01T00:00:00.0000000Z","body":"worker was stopped.","kind":"stopped","exitCode":null}"#;
+        assert_eq!(read(&mailbox), format!("{stored}\n"));
+        // A second post of that id adds nothing and answers the message already there.
+        let mut exited = Map::new();
+        exited.insert("kind".into(), "exited".into());
+        exited.insert("exitCode".into(), 0.into());
+        let again = add_once(
+            &w.ctx,
+            &caller,
+            "pane-1",
+            "worker",
+            "%9",
+            "worker exited with code 0.",
+            id,
+            &exited,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(again, serde_json::from_str::<Value>(stored).unwrap());
+        assert_eq!(read(&mailbox), format!("{stored}\n"));
+        // read hands out the same five fields as before.
+        let messages = read_mail(&w.ctx, &caller, "pane-1").unwrap();
+        let keys: Vec<&str> = messages[0].keys().map(String::as_str).collect();
+        assert_eq!(keys, ["id", "from", "pane", "at", "text"]);
     }
 
     #[test]

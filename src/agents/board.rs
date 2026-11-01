@@ -44,9 +44,12 @@ pub fn board(
     all: bool,
     with_exit: bool,
 ) -> Res<Map<String, Value>> {
-    // One list-panes for the notices, the live rows and the ended filter; list runs every 3 s.
-    let tagged = registry::tagged(ctx, caller)?;
-    registry::update_notices(ctx, caller, Some(&tagged))?;
+    // One list-panes for the notices, the live rows and the ended filter; list runs every 3 s. A reap that killed a
+    // pane or posted a notice makes that snapshot stale, so the panes are listed again.
+    let mut tagged = registry::tagged(ctx, caller)?;
+    if registry::reap(ctx, caller, Some(&tagged), false)? {
+        tagged = registry::tagged(ctx, caller)?;
+    }
     let rows = Rows {
         ctx,
         caller,
@@ -79,6 +82,10 @@ pub fn board(
             let pane = super::text(end.record.get("pane"));
             let window = super::text(end.record.get("window"));
             let mut row = rows.row(&end.id, &end.record, pane, &window, &end.kind)?;
+            // After the row's fields, so they keep their places: who closed a lost agent.
+            if let Some(closed) = end.closed_by {
+                row.insert("closedBy".into(), closed.into());
+            }
             if with_exit {
                 row.insert("exitCode".into(), end.code);
             }
@@ -97,6 +104,25 @@ pub fn board(
 const ENDED_MAX: usize = 10;
 const ENDED: [&str; 3] = ["exited", "stopped", "lost"];
 
+/// The newest ended agent named `name` of the caller's session that is not live, as (id, record, state): any of
+/// them, not only the 10 a board shows. Newest notice first, then by id, as the board orders them.
+pub(crate) fn newest_ended(
+    ctx: &Ctx,
+    caller: &Caller,
+    live: &[Pane],
+    name: &str,
+) -> Res<Option<(String, Value, String)>> {
+    let mut ended: Vec<Ended> = ended(ctx, caller, live)?
+        .into_iter()
+        .filter(|end| end.record.get("name").and_then(Value::as_str) == Some(name))
+        .collect();
+    ended.sort_by(|a, b| b.at.cmp(&a.at).then_with(|| a.id.cmp(&b.id)));
+    Ok(ended
+        .into_iter()
+        .next()
+        .map(|end| (end.id, end.record, end.kind)))
+}
+
 fn same_session(record: &Value, caller: &Caller) -> bool {
     record.get("session").and_then(Value::as_str) == Some(caller.session.as_str())
 }
@@ -107,6 +133,7 @@ struct Ended {
     kind: String,
     record: Value,
     code: Value,
+    closed_by: Option<String>,
 }
 
 /// The session's agents with a notice that are not live. notice.json is written once, so it is read unlocked.
@@ -146,6 +173,10 @@ fn ended(ctx: &Ctx, caller: &Caller, live: &[Pane]) -> Res<Vec<Ended>> {
             at: notice.get("at").and_then(Value::as_str).and_then(parse_utc),
             kind: kind.to_string(),
             code: notice.get("exitCode").cloned().unwrap_or(Value::Null),
+            closed_by: notice
+                .get("closedBy")
+                .and_then(Value::as_str)
+                .map(str::to_string),
             id,
             record,
         });
@@ -464,6 +495,48 @@ mod tests {
     }
 
     #[test]
+    fn lost_row_says_closed_by_pane() {
+        let w = World::human("");
+        w.clock(NOW);
+        let caller = w.caller();
+        for (id, name, notice) in [
+            (
+                "bbbbbbbbbbbb",
+                "vanished",
+                json!({"kind": "lost", "exitCode": null, "at": "2026-10-29T11:59:00.0000000Z", "closedBy": "pane"}),
+            ),
+            (
+                "cccccccccccc",
+                "halted",
+                json!({"kind": "stopped", "exitCode": null, "at": "2026-10-29T11:58:00.0000000Z"}),
+            ),
+        ] {
+            let folder = w.agent_record(id, json!({"name": name, "pane": "%7"}));
+            write(&folder.join("notice.json"), notice);
+        }
+        w.panes(&[]);
+        let all = board(&w.ctx, &caller, "pane-1", true, false).unwrap();
+        let rows = all["agents"].as_array().unwrap();
+        let lost = rows[0].as_object().unwrap();
+        assert_eq!(lost["name"], "vanished");
+        // After the 15 row fields, so they keep their places.
+        assert_eq!(
+            lost.iter().map(|(k, v)| (k.as_str(), v)).next_back(),
+            Some(("closedBy", &json!("pane")))
+        );
+        assert!(rows[1].get("closedBy").is_none(), "{}", rows[1]);
+        // The watch feed puts exitCode last, after it.
+        let watch = board(&w.ctx, &caller, "pane-1", true, true).unwrap();
+        let keys: Vec<&str> = watch["agents"][0]
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(keys[keys.len() - 2..], ["closedBy", "exitCode"]);
+    }
+
+    #[test]
     fn with_exit_code_only_for_watch() {
         let (w, caller) = ended_world();
         let watch = board(&w.ctx, &caller, "pane-1", true, true).unwrap();
@@ -539,6 +612,58 @@ mod tests {
             (&row["doing"], &row["doingFrom"], &row["unread"]),
             (&json!("fresh"), &json!("message"), &json!(1))
         );
+    }
+
+    #[test]
+    fn board_lists_again_after_reap_acted() {
+        use std::cell::Cell;
+        use std::rc::Rc;
+        let w = World::human("");
+        let caller = w.caller();
+        let folder = w.agent_record(ID, json!({}));
+        write(
+            &folder.join("launcher.json"),
+            json!({"pid": 300, "exitCode": 0}),
+        );
+        // %9 is listed dead until the conditional kill ran; then it is gone.
+        let killed = Rc::new(Cell::new(false));
+        let gone = killed.clone();
+        w.fakes.mux_script("list-panes", move |argv| {
+            let rows: &[&str] = if gone.get() {
+                &[]
+            } else {
+                &["%9|@5|300|aaaaaaaaaaaa|worker"]
+            };
+            Ok(crate::mux::Output {
+                code: 0,
+                stdout: crate::agents::fixture::listed_dead(argv, rows, "\n", &["%9"]),
+                stderr: String::new(),
+            })
+        });
+        let kill = killed.clone();
+        w.fakes.mux_script("if-shell", move |_| {
+            kill.set(true);
+            Ok(crate::mux::Output {
+                code: 0,
+                stdout: String::new(),
+                stderr: String::new(),
+            })
+        });
+        w.fakes.mux_rule("#{pane_id}|#{@agent-id}", 0, "|\n", "");
+        w.fakes.clear_log();
+        let reply = board(&w.ctx, &caller, "pane-1", true, false).unwrap();
+        assert!(killed.get());
+        assert_eq!(
+            (names(&reply), &reply["running"]),
+            (vec!["worker=exited".to_string()], &json!(0))
+        );
+        let lists = w
+            .fakes
+            .mux_calls()
+            .iter()
+            .filter(|c| crate::agents::fixture::list_call(c))
+            .count();
+        assert_eq!(lists, 2);
     }
 
     #[test]
