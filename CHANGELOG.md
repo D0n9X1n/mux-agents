@@ -8,6 +8,10 @@ All notable changes to mux-agents. The format follows [Keep a Changelog](https:/
 
 - `spawn -Model <model>` chooses the new agent's model (a name or alias such as `sonnet` or `sonnet[1m]`); it reaches the client as `--model <model>`. The spawn reply names `model` after `reason` (`inherited` without `-Model`), `record.json` keeps it, `list` rows carry it (null when inherited), and the side bar and the Claude Code `Agents` pane show `[<model>]` after a live agent's client. ([#41](https://github.com/D0n9X1n/mux-agents/issues/41))
 
+### Changed
+
+- Agents get names that say what they do, never reused in their session, shown as the tab's name or the pane's title (`select-pane -T`, focus unchanged). Without `-Name` the name comes from the task's first words (stopwords dropped, up to 3 words within 24), so "Please add a subtract function to calc.py" becomes `add-subtract-function`; a reserved or empty result falls back to `<client>-N`. Names taken by live agents or by any recorded agent of the session in this state root, ended ones included, are skipped with `-2`, `-3`, … cut at a word boundary; a taken `-Name` is refused `name` with a free one to try. The skill now always passes `-Name <short-kebab-name>`. ([#39](https://github.com/D0n9X1n/mux-agents/issues/39))
+
 ### Fixed
 
 - A Claude Code caller in bypass mode is no longer refused `policy` when its footer sits a few rows up or wraps: the pane is captured with `-J`, the last 8 non-blank rows are searched, only a documented footer badge counts as a mode line and the lowest one decides. A transcript or screen that shows no mode yet is read again, up to 3 times 250 ms apart. Every Claude Code `policy` refusal now names its reason, in its message and as `reason`. ([#40](https://github.com/D0n9X1n/mux-agents/issues/40))
