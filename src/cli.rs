@@ -52,11 +52,19 @@ pub struct VerbDef {
 pub static VERBS: &[VerbDef] = &[
     VerbDef {
         name: "spawn",
-        values: &["Client", "Task", "TaskFile", "BriefFile", "Name", "Split"],
+        values: &[
+            "Client",
+            "Task",
+            "TaskFile",
+            "BriefFile",
+            "Name",
+            "Model",
+            "Split",
+        ],
         switches: &["NoFork", "Tab"],
         min: 0,
         max: 0,
-        usage: "usage: mux-agent spawn -Client <claude|copilot> [-Task <text>] [-TaskFile <path>] [-BriefFile <path>] [-Name <name>] [-Split <value>] [-Tab] [-NoFork] [-Text]",
+        usage: "usage: mux-agent spawn -Client <claude|copilot> [-Task <text>] [-TaskFile <path>] [-BriefFile <path>] [-Name <name>] [-Model <model>] [-Split <value>] [-Tab] [-NoFork] [-Text]",
         handler: crate::agents::spawn::spawn,
         text: crate::agents::spawn::spawn_text,
     },
