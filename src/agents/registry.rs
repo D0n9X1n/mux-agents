@@ -139,6 +139,31 @@ pub fn find_pane(ctx: &Ctx, caller: &Caller, name: &str) -> Res<Pane> {
     }
 }
 
+/// The session's live committed panes after a reap: one list, and a second only when the reap killed a pane or
+/// posted a notice.
+pub fn live_after_reap(ctx: &Ctx, caller: &Caller) -> Res<Vec<Pane>> {
+    let mut panes = tagged(ctx, caller)?;
+    if reap(ctx, caller, Some(&panes), false)? {
+        panes = tagged(ctx, caller)?;
+    }
+    Ok(committed(ctx, caller, panes))
+}
+
+/// As `find_pane`, after a reap: a malformed name refuses before any multiplexer call.
+pub fn find_reaped(ctx: &Ctx, caller: &Caller, name: &str) -> Res<Pane> {
+    let none = || refuse(2, "target", "no live agent has that name");
+    if !super::agent_name(name) {
+        return none();
+    }
+    match live_after_reap(ctx, caller)?
+        .into_iter()
+        .find(|p| p.name == name)
+    {
+        Some(pane) => Ok(pane),
+        None => none(),
+    }
+}
+
 /// The caller's name and mailbox key: an agent pane is its record's name and id; any other pane is root.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Me {

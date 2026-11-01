@@ -132,7 +132,7 @@ pub fn read(ctx: &Ctx, request: &Request) -> Res<Map<String, Value>> {
     let caller = resolve(ctx)?;
     let mut reply = Map::new();
     if named {
-        let pane = find_pane(ctx, &caller, first(request))?;
+        let pane = registry::find_reaped(ctx, &caller, first(request))?;
         let start = format!("-{lines}");
         let captured = native(
             ctx,
@@ -657,6 +657,44 @@ mod tests {
             assert!(reply.contains("\\nm\""), "{wait:?} {reply}");
         }
         assert!(w.fakes.slept().is_empty());
+    }
+
+    // A live worker (%9) and a committed agent `gone` (%8) whose pane is gone, its notice not yet posted.
+    fn gone_world() -> World {
+        let w = World::human("");
+        w.agent_record(ID, json!({}));
+        w.agent_record("bbbbbbbbbbbb", json!({"name": "gone", "pane": "%8"}));
+        w.panes(&["%9|@5|300|aaaaaaaaaaaa|worker"]);
+        w.fakes
+            .mux_rule("-t %8 #{pane_id}|#{@agent-id}", 0, "|\n", "");
+        w
+    }
+
+    #[test]
+    fn named_read_reaps_before_the_name() {
+        let w = gone_world();
+        w.fakes.clear_log();
+        let reply = run(&w, read, &["read", "worker", "-Lines", "5"]);
+        assert!(reply.starts_with("ok "), "{reply}");
+        // The reap posted a notice, so the panes are listed again before the name is looked up.
+        assert_eq!(
+            mux_verbs(&w),
+            [
+                "display-message",
+                "list-panes",
+                "display-message",
+                "list-panes",
+                "capture-pane"
+            ]
+        );
+        let notice = w.folder("bbbbbbbbbbbb").join("notice.json");
+        assert!(notice.is_file());
+        assert_eq!(
+            read_mail_of(&w, "pane-1"),
+            ["gone is gone: its pane closed without an exit record."]
+        );
+        // A lost agent's name answers `target`.
+        assert_eq!(run(&w, read, &["read", "gone"]), NONE);
     }
 
     #[test]

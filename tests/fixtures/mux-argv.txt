@@ -99,6 +99,8 @@
 [read worker -Lines 5]
 -N display-message -p -t %1 #{pid}|#{pane_pid}|#{session_id}|#{window_id}|#{@agent-id}
 -N list-panes -s -t $3 -F <marker>|#{pane_id}|#{window_id}|#{pane_pid}|#{pane_dead}|#{@agent-id}|#{@agent-name}|<marker>
+# 0.2.2: a named read reaps first, on the same list: the gone probe of %8
+-N display-message -p -t %8 #{pane_id}|#{@agent-id}
 # :1366
 -N capture-pane -p -J -t %9 -S -5
 
