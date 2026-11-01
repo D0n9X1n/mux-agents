@@ -1651,15 +1651,14 @@ mod tests {
         );
     }
 
-    // Columns of the samples below, written out by hand: never the code under test.
+    // Columns of the samples below, written out by hand: never the code under test. A ZWJ sequence counts each part,
+    // as a multiplexer that does not cluster it draws them.
     fn sample_columns(text: &str) -> usize {
         let chars: Vec<char> = text.chars().collect();
         let mut total = 0;
         for (at, &c) in chars.iter().enumerate() {
-            let after_zwj = at > 0 && chars[at - 1] == '\u{200d}';
             total += match c {
                 '\u{301}' | '\u{200b}' | '\u{200d}' | '\u{fe0f}' => 0,
-                _ if after_zwj => 0,
                 '\u{2764}' if chars.get(at + 1) == Some(&'\u{fe0f}') => 2,
                 '\u{754c}' | '\u{fe10}' | '\u{1f680}' | '\u{1f469}' | '\u{1f4bb}' => 2,
                 _ => 1,
@@ -1669,15 +1668,31 @@ mod tests {
     }
 
     #[test]
+    fn layout_never_under_counts_a_zwj_sequence() {
+        // 16 of `👩‍💻` (4 columns each, part by part) as a name and a doing line at W = 40: every row fits.
+        let coder = "\u{1f469}\u{200d}\u{1f4bb}";
+        let board = json!({"running": 1, "endedTotal": 1, "agents": [
+            {"name": coder.repeat(16), "state": "running", "doing": coder.repeat(16), "age": 5, "unread": 0},
+            {"name": coder.repeat(16), "state": "stopped", "age": 60}
+        ]});
+        let rows = plain(&board, W40);
+        for row in &rows {
+            assert!(sample_columns(row) <= 40, "{row:?}");
+        }
+        assert_eq!(rows[3], format!("   {}...", coder.repeat(8)));
+        assert_eq!(sample_columns(&rows[3]), 38);
+    }
+
+    #[test]
     fn layout_counts_emoji_and_vertical_forms_by_their_columns() {
         let coder = "\u{1f469}\u{200d}\u{1f4bb}";
         // Each sample's doing line at W = 40: 3 columns of indent, then at most 33 columns of whole clusters and `...`
-        // (16 two-column clusters make 32: a 17th would not fit, so the row is 38 columns).
+        // (16 two-column clusters make 32: a 17th would not fit, so the row is 38 columns; 8 four-column `👩‍💻` too).
         let samples: [(&str, usize, usize); 6] = [
             ("\u{fe10}", 16, 38),
             ("\u{1f680}", 16, 38),
             ("\u{2764}\u{fe0f}", 16, 38),
-            (coder, 16, 38),
+            (coder, 8, 38),
             ("e\u{301}", 33, 39),
             ("a\u{200b}", 33, 39),
         ];

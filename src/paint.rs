@@ -1,7 +1,7 @@
 //! Terminal text for the side bar and `list -Text` (#37): the color switches, the 16 named ANSI colors, display
 //! columns (from the `unicode-width` crate) and cutting to a width on whole clusters.
 
-use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+use unicode_width::UnicodeWidthChar;
 
 use crate::ctx::Env;
 
@@ -109,10 +109,22 @@ pub fn identity(recorded: Option<&str>, name: &str) -> &'static str {
     PALETTE[(hash % PALETTE.len() as u32) as usize]
 }
 
-/// Columns of `text` as the `unicode-width` crate counts them (UAX #11, not CJK: Ambiguous is 1; emoji presentation
-/// and ZWJ sequences 2; combining marks and zero-width characters 0). Agent text is cleaned of controls first.
+/// Columns of `text`, counted conservatively: the sum of `unicode-width`'s width of each character (UAX #11, not CJK:
+/// Ambiguous is 1; combining marks, ZWJ and other zero-width characters 0), with a character followed by VS16
+/// (U+FE0F) counted as at least 2. A ZWJ sequence is never collapsed: multiplexers differ on clustering (tmux 3.2a
+/// draws each part), so the bar may cut early on one that clusters, never late. Agent text is cleaned first.
 pub fn width(text: &str) -> usize {
-    UnicodeWidthStr::width(text)
+    let mut chars = text.chars().peekable();
+    let mut total = 0;
+    while let Some(c) = chars.next() {
+        let w = c.width().unwrap_or(0);
+        total += if chars.peek() == Some(&'\u{fe0f}') {
+            w.max(2)
+        } else {
+            w
+        };
+    }
+    total
 }
 
 /// The byte ends of `text`'s clusters: a character with the zero-width ones after it, and a joiner with the character
@@ -318,10 +330,12 @@ mod tests {
             ("\u{fe10}", 2),
             ("\u{1f680}", 2),
             ("\u{1f600}", 2),
-            // A text-default heart is 1; with VS16 it is an emoji, 2. A ZWJ sequence is one emoji.
+            // A text-default heart is 1; with VS16 it is an emoji, 2. A ZWJ sequence is counted part by part (2 + 0 + 2):
+            // a multiplexer that does not cluster it (tmux 3.2a) draws each part, so the bar never under-counts.
             ("\u{2764}", 1),
             ("\u{2764}\u{fe0f}", 2),
-            ("\u{1f469}\u{200d}\u{1f4bb}", 2),
+            ("\u{1f469}\u{200d}\u{1f4bb}", 4),
+            ("\u{2764}\u{fe0f}\u{200d}\u{1f525}", 4),
             // A combining mark and a zero-width space take no column.
             ("e\u{301}", 1),
             ("\u{301}", 0),
@@ -369,7 +383,9 @@ mod tests {
             "\u{2764}\u{fe0f}\u{2764}\u{fe0f}..."
         );
         let coder = "\u{1f469}\u{200d}\u{1f4bb}";
-        assert_eq!(cut(&coder.repeat(10), 9), format!("{}...", coder.repeat(3)));
+        // 4 columns each: one fits in 6, with `...`; a sequence is never split.
+        assert_eq!(cut(&coder.repeat(10), 9), format!("{coder}..."));
+        assert_eq!(width(&coder.repeat(16)), 64);
         assert_eq!(cut(&"a\u{200b}".repeat(10), 5), "a\u{200b}a\u{200b}...");
     }
 }
