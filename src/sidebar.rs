@@ -91,8 +91,8 @@ pub fn format_age(seconds: Option<&Value>) -> String {
 }
 
 /// The count line, then per live agent its line (with ` [<model>]` after the client when one was chosen) and an
-/// indented doing line, per ended agent one line. Every printed field, state included, is cleaned first; lines are
-/// joined with LF.
+/// indented doing line, per ended agent one line, except a lost one (its pane is gone). Every printed field, state
+/// included, is cleaned first; lines are joined with LF.
 pub fn format_board(board: &Map<String, Value>) -> String {
     let running = board.get("running").and_then(Value::as_i64).unwrap_or(0);
     let mut lines = vec![format!("mux-agents \u{b7} {running} running")];
@@ -120,6 +120,10 @@ pub fn format_board(board: &Map<String, Value>) -> String {
             if !doing.is_empty() {
                 lines.push(format!("  {doing}"));
             }
+            continue;
+        }
+        // A lost agent's pane is gone, so there is nothing to act on: list -All keeps it, the bar does not.
+        if state == "lost" {
             continue;
         }
         let ended = match row.get("exitCode").filter(|code| !code.is_null()) {
@@ -455,11 +459,12 @@ mod tests {
             {"name": "vanished", "client": "claude", "state": "lost", "age": 60},
             null
         ]})));
+        // A lost agent's pane is gone: nothing to act on, so the bar draws no row for it.
         assert_eq!(
             text,
             format!(
                 "mux-agents {DOT} 2 running\n{FULL} claude-1  claude  4m\n  parse the config\n{FULL} idle  copilot  5s\n\
-                 {OPEN} copilot-1  exited 0\n{OPEN} crashed  exited\n{OPEN} halted  stopped\n{OPEN} vanished  lost"
+                 {OPEN} copilot-1  exited 0\n{OPEN} crashed  exited\n{OPEN} halted  stopped"
             )
         );
         assert_eq!(
@@ -471,9 +476,9 @@ mod tests {
         for code in (0u32..32).chain([127]).chain(128..160) {
             let name = format!("a{}b", char::from_u32(code).unwrap());
             let text = format_board(&board(
-                json!({"running": 0, "agents": [{"name": name, "state": "lost"}]}),
+                json!({"running": 0, "agents": [{"name": name, "state": "stopped"}]}),
             ));
-            if text != format!("mux-agents {DOT} 0 running\n{OPEN} ab  lost") {
+            if text != format!("mux-agents {DOT} 0 running\n{OPEN} ab  stopped") {
                 kept.push(format!("{code:04X}"));
             }
         }
@@ -487,12 +492,14 @@ mod tests {
         let text = format_board(&board(json!({"running": 1, "agents": [
             {"name": format!("w{controls}1"), "client": format!("cl{controls}aude"), "state": format!("run{controls}ning"), "doing": format!("do{controls}ing"), "age": 240},
             {"name": format!("x{controls}2"), "state": format!("exi{controls}ted"), "exitCode": format!("3{controls}")},
-            {"name": format!("y{controls}3"), "state": format!("lo{controls}st")}
+            {"name": format!("y{controls}3"), "state": format!("sto{controls}pped")},
+            {"name": format!("z{controls}4"), "state": format!("lo{controls}st")}
         ]})));
+        // A state that reads `lost` once cleaned draws no row either.
         assert_eq!(
             text,
             format!(
-                "mux-agents {DOT} 1 running\n{FULL} w1  claude  4m\n  doing\n{OPEN} x2  exited 3\n{OPEN} y3  lost"
+                "mux-agents {DOT} 1 running\n{FULL} w1  claude  4m\n  doing\n{OPEN} x2  exited 3\n{OPEN} y3  stopped"
             )
         );
         // An escape sequence keeps only its printable rest.
