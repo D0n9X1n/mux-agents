@@ -71,3 +71,13 @@ Side bar (C); `CLAUDE_CONFIG_DIR`/`COPILOT_HOME`; BSDs; tmux below 3.2; rmux in 
 | `-N` never starts a server; gone pane `display-message` exits 0 with empty fields | tmux 3.2 CHANGES; tmux 3.6 probe | Same rules as rmux | survey |
 | Kill, then verify survivors | uzi | `stop` kills survivors only by `pidfd` | survey |
 | `/proc` start ticks, last-`)` parsing; bwrap `NoNewPrivs`, sandbox-runtime `SANDBOX_RUNTIME=1` | proc_pid_stat(5); WSL test; sandbox-runtime | Identity and C1 signals | survey |
+
+## Rust (0.2.0)
+
+0.2.0 keeps these rules in Rust, and adds rmux on macOS and Linux.
+
+- **Entry.** `scripts/mux-agent` (POSIX sh) or `scripts\mux-agent.cmd` runs the first usable of `MUX_AGENTS_BIN`, `scripts/bin/<os>-<arch>/mux-agent[.exe]` and `target/release/mux-agent[.exe]`; with none it prints a JSON `entry` refusal and exits 1.
+- **Locks.** On Unix a lock is a file under the passwd home's `.local/state/mux-agents/locks`, taken with `File::try_lock`; Windows uses a named mutex `Local\MuxAgents-<hex>`. Locks are per user, so every state root of one user shares them, and `GHSA-2j93-m82w-73j2` no longer applies.
+- **Process layer.** No helper processes: Linux reads `/proc` and kills through `pidfd`; macOS uses `proc_pidinfo`, `KERN_PROCARGS2` and `sandbox_check`; Windows uses Toolhelp, `GetProcessTimes`, `ProcessCommandLineInformation`, the process token and DACLs.
+- **Delivery.** `main` is source only. A tag `v<version>` builds six binaries into `scripts/bin/` with one `SHA256SUMS` and commits them on the `dist` branch, which `.claude-plugin/marketplace.json` pins; `dist` only moves to a newer version.
+- **Multiplexer.** The endpoint is `RMUX` when set, else `TMUX`. The binary is the server's image when it is named rmux or tmux, else `rmux` on `PATH` when `RMUX` is set, else `tmux`; `tmux -V` below 3.2 or `rmux -V` below 0.10 refuses `endpoint`. Every call is `<mux> -S <socket> -N …`.

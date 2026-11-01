@@ -77,3 +77,13 @@ Transcript inference; `pane-border-format`; a Copilot CLI panel; notifications.
 |---|---|---|---|
 | Pane user options carrying an agent's state | ntm `@ntm_agent_mail_state` | Same role as `@agent-role` and `status` | survey |
 | Status from files the agents write | Claude Code agent teams inboxes | Same: `status.json`, mailboxes | survey |
+
+## Rust (0.2.0)
+
+0.2.0 keeps the feed, the pane and the split; the side bar and the agent panes run the binary itself.
+
+- **Entry.** `scripts/mux-agent` (POSIX sh) or `scripts\mux-agent.cmd` runs the first usable of `MUX_AGENTS_BIN`, `scripts/bin/<os>-<arch>/mux-agent[.exe]` and `target/release/mux-agent[.exe]`; with none it prints a JSON `entry` refusal and exits 1.
+- **Locks.** On Unix a lock is a file under the passwd home's `.local/state/mux-agents/locks`, taken with `File::try_lock`; Windows uses a named mutex `Local\MuxAgents-<hex>`. Locks are per user, so every state root of one user shares them, and `GHSA-2j93-m82w-73j2` no longer applies.
+- **Process layer.** No helper processes: Linux reads `/proc` and kills through `pidfd`; macOS uses `proc_pidinfo`, `KERN_PROCARGS2` and `sandbox_check`; Windows uses Toolhelp, `GetProcessTimes`, `ProcessCommandLineInformation`, the process token and DACLs.
+- **Delivery.** `main` is source only. A tag `v<version>` builds six binaries into `scripts/bin/` with one `SHA256SUMS` and commits them on the `dist` branch, which `.claude-plugin/marketplace.json` pins; `dist` only moves to a newer version.
+- **Panes.** An agent pane runs `<exe> launcher <spec.json>` and the side bar runs `<exe> watch`, each by the binary's absolute path, so a pane keeps the binary it started with. The Claude Code pane runs `sh <root>/scripts/mux-agent list -All`, or `cmd.exe /d /c <root>\scripts\mux-agent.cmd list -All` when `OS` is `Windows_NT`, and still opens after a 0.1 command line that ran `mux-agent.ps1 … spawn`.

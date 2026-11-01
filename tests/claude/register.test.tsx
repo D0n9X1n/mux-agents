@@ -6,7 +6,7 @@ const PANE = {
   plugin: 'mux-agents', component: 'Pane', requestId: 'mux-agents',
   props: { title: 'Agents', isFocused: false, bodyColumns: 42, placement: 'dock', scroll: { offset: 0, bodyRows: 20 }, view: {} },
 } as const
-const SPAWN = 'pwsh -NoProfile -File "C:/p/scripts/mux-agent.ps1" spawn -Client claude -TaskFile t'
+const SPAWN = '"/p/scripts/mux-agent" spawn -Client claude -TaskFile t'
 const row = (name: string, state: string, doing: string | null, age: number) => ({ name, client: 'claude', state, doing, age })
 const list = (running: number, agents: object[]) => JSON.stringify({ ok: true, verb: 'list', running, agents })
 const LIST = list(1, [row('claude-1', 'running', 'build it', 240), { ...row('copilot-1', 'exited', null, 900), client: 'copilot' }])
@@ -88,7 +88,7 @@ test('list argv on Windows_NT is cmd.exe /d /c <root>\\scripts\\mux-agent.cmd li
   const { seen, clock } = world(on, { RMUX: 'x', OS: 'Windows_NT' }, [ran(0, LIST)])
   const root = await pluginRoot($, on)
   await $.session.start(START)
-  await $.tool.call({ tool: 'PowerShell', command: SPAWN })
+  await $.tool.call({ tool: 'PowerShell', command: `& "C:/p/scripts/mux-agent.cmd" spawn -Client claude -TaskFile t` })
   await clock.settle()
   expect(seen.argv).toEqual([['cmd.exe', '/d', '/c', `${root}\\scripts\\mux-agent.cmd`, 'list', '-All']])
 })
@@ -159,7 +159,7 @@ test('the spawn reply is read from the tool result, not the text the model reads
   expect(seen.opened).toEqual([])
 })
 
-test('a PowerShell spawn opens the pane; a second spawn starts no second refresh', async ($, on) => {
+test('a 0.1 mux-agent.ps1 spawn in the PowerShell tool opens the pane; a second spawn starts no second refresh', async ($, on) => {
   const { seen, clock } = world(on, { TMUX: 'x' }, [ran(0, LIST)])
   await $.session.start(START)
   await $.tool.call({ tool: 'PowerShell', command: `& "C:/p/scripts/mux-agent.ps1" spawn -Client copilot` })

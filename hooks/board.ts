@@ -5,7 +5,8 @@ export const EMPTY: MuxAgentsBoard = { running: 0, agents: [], failed: false }
 
 // The entry as a whole file name (after the start, a slash, a backslash, whitespace or a quote): the shim mux-agent,
 // mux-agent.cmd, the binary mux-agent.exe or the old mux-agent.ps1; then the verb spawn. Either may be quoted. Covers
-// `<path> spawn`, `sh <path> spawn`, `pwsh -File <path> spawn`, `& <path> spawn` and Windows paths.
+// `<path> spawn`, `sh <path> spawn`, `cmd.exe /d /c <path> spawn`, `& <path> spawn`, Windows paths and a 0.1 command
+// line that ran mux-agent.ps1 with `-File`.
 const ENTRY = /(^|[\\/\s"'])mux-agent(\.ps1|\.cmd|\.exe)?["']?\s+["']?spawn["']?(\s|$)/i
 // Format-MuxAgentResult -Text for a successful spawn: ok and verb are left out, the record's fields are printed in order.
 // A refusal prints code, check and message instead, so it never matches.
