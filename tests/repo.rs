@@ -1112,6 +1112,145 @@ fn readme_skill_name_every_platform_and_mux() {
     }
 }
 
+/// One frontmatter scalar as YAML reads it: a double-quoted string (JSON escapes, which YAML's double-quoted style
+/// shares) or a plain scalar. A plain scalar holding `: ` or ` #`, or starting with a YAML indicator, is refused:
+/// YAML would read it differently or not at all, and a client then loads the file with no frontmatter.
+fn yaml_scalar(raw: &str) -> Result<String, String> {
+    let raw = raw.trim();
+    if raw.starts_with('"') {
+        return serde_json::from_str::<String>(raw)
+            .map_err(|e| format!("bad double-quoted scalar {raw}: {e}"));
+    }
+    if raw.is_empty()
+        || raw.contains(": ")
+        || raw.ends_with(':')
+        || raw.contains(" #")
+        || raw.starts_with(|c: char| "'&*!|>%@`#,[]{}-?:".contains(c))
+    {
+        return Err(format!("unquoted plain scalar YAML misreads: {raw}"));
+    }
+    Ok(raw.to_string())
+}
+
+/// The `key: value` pairs between a file's opening and closing `---` lines, each value read by `yaml_scalar`.
+fn frontmatter(text: &str) -> Result<Vec<(String, String)>, String> {
+    let mut lines = text.lines();
+    if lines.next() != Some("---") {
+        return Err("no opening ---".into());
+    }
+    let mut pairs = Vec::new();
+    for line in lines {
+        if line == "---" {
+            return Ok(pairs);
+        }
+        let (key, value) = line
+            .split_once(':')
+            .ok_or_else(|| format!("not key: value: {line}"))?;
+        if key.is_empty()
+            || !key
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+        {
+            return Err(format!("bad key: {line}"));
+        }
+        pairs.push((key.to_string(), yaml_scalar(value)?));
+    }
+    Err("no closing ---".into())
+}
+
+#[test]
+fn frontmatter_refuses_an_unquoted_colon_space_and_reads_quoted_values() {
+    assert!(frontmatter("---\ndescription: Terminal CLI only: needs tmux\n---\n").is_err());
+    assert!(frontmatter("---\ndescription: a # comment\n---\n").is_err());
+    assert!(frontmatter("---\nname: x\n").is_err());
+    assert_eq!(
+        frontmatter(
+            "---\nname: mux-agents\ndescription: \"Terminal CLI only: needs \\\"tmux\\\"\"\n---\nbody\n"
+        ),
+        Ok(vec![
+            ("name".to_string(), "mux-agents".to_string()),
+            (
+                "description".to_string(),
+                "Terminal CLI only: needs \"tmux\"".to_string()
+            ),
+        ])
+    );
+}
+
+// Every tracked Markdown file with frontmatter parses: a value YAML cannot read drops all the file's fields.
+#[test]
+fn tracked_frontmatter_parses() {
+    let mut seen = 0;
+    for path in tracked().iter().filter(|p| p.ends_with(".md")) {
+        let text = repo_file(path);
+        if text.starts_with("---\n") {
+            seen += 1;
+            if let Err(e) = frontmatter(&text) {
+                panic!("{path}: {e}");
+            }
+        }
+    }
+    assert!(seen >= 1, "no frontmatter found; SKILL.md has one");
+}
+
+// Terminal CLI only (#43): the skill says where to skip it and forbids forcing it to apply; the README and both wiki
+// Usage pages state the rule and name the desktop app.
+#[test]
+fn skill_readme_and_wiki_say_terminal_cli_only() {
+    let fields =
+        frontmatter(&repo_file("skills/mux-agents/SKILL.md")).expect("SKILL.md's frontmatter");
+    let field = |key: &str| {
+        fields
+            .iter()
+            .find(|(k, _)| k == key)
+            .map(|(_, v)| v.as_str())
+    };
+    assert_eq!(field("name"), Some("mux-agents"));
+    let description = field("description").expect("SKILL.md's description");
+    assert!(
+        description.starts_with("Terminal CLI only:")
+            && description.contains("tmux")
+            && description.contains("rmux"),
+        "SKILL.md's description: {description}"
+    );
+    let skill = file_lines("skills/mux-agents/SKILL.md");
+    let start = skill
+        .iter()
+        .position(|l| l == "## When to use")
+        .expect("SKILL.md's When to use");
+    let when: String = skill[start + 1..]
+        .iter()
+        .take_while(|l| !l.starts_with("## "))
+        .map(|l| format!("{l}\n"))
+        .collect();
+    for needle in [
+        "Claude Code desktop app",
+        "web or cloud sessions",
+        "IDE chat panels",
+        "GitHub Copilot app",
+        "headless or SDK runs",
+        "Never start a multiplexer or set variables to make it apply",
+        "integrated terminal",
+    ] {
+        assert!(
+            when.contains(needle),
+            "SKILL.md's When to use lacks {needle:?}: {when}"
+        );
+    }
+    for (path, rule, desktop) in [
+        ("README.md", "Terminal CLI only", "desktop app"),
+        ("wiki/Usage.md", "Terminal CLI only", "desktop app"),
+        ("wiki/Usage-zh-CN.md", "仅限终端 CLI", "桌面应用"),
+    ] {
+        assert!(
+            file_lines(path)
+                .iter()
+                .any(|l| l.contains(rule) && l.contains(desktop)),
+            "{path} does not state {rule:?} naming {desktop:?}"
+        );
+    }
+}
+
 #[test]
 fn skill_always_names_its_agents() {
     // Callers always pass -Name with a short kebab name, and the spawn example in the Commands block shows it.

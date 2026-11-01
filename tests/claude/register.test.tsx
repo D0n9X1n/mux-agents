@@ -18,18 +18,44 @@ const header = async (ui: any) => (await ui.find({ type: 'Text', text: /running/
 // process.run answers from `runs` in order, the last repeating; `{ holdMs, answer }` answers after holdMs on the mock clock.
 // tool.call answers with `stdout` as the tool's result, `text` as what the model reads and `isError` as the result's mark.
 // `answers` replaces the engine's answer to command.register or ui.open, for instance with `{ deny }`; `openHoldMs`
-// answers ui.open after that long on the mock clock; `denyWrites` refuses that many state writes first.
-type Answers = { register?: object; open?: object; openHoldMs?: number; denyWrites?: number }
+// answers ui.open after that long on the mock clock; `denyWrites` refuses that many state writes first; `close` is what
+// answers a close beneath the plugin: the engine closing the pane (default), a hook refusing it, or a hook answering
+// without closing.
+// `live` is what the session reads now, changed by a test at any point: its surfaces (`'reject'` refuses the read), the
+// environment, the names whose env.get is refused, and `holds`: each holds one read of its name made while the pane is
+// listed, for `ms` on the mock clock, after letting `skip` such reads through. `seen.panes` is the roster: panes opened
+// and not yet closed.
+type Answers = { register?: object; open?: object; openHoldMs?: number; denyWrites?: number; close?: 'close' | 'deny' | 'keep' }
+type Hold = { name: string; ms: number; skip?: number }
+type Live = { surfaces: string[] | 'reject'; env: Record<string, string>; deny: string[]; holds: Hold[] }
 function world(on: any, env: Record<string, string>, runs: object[], tool: { stdout: string; text: string; isError?: boolean } = { stdout: SPAWN_JSON, text: SPAWN_JSON }, answers: Answers = {}) {
-  const seen = { registered: [] as object[], opened: [] as object[], argv: [] as string[][], init: [] as unknown[], status: [] as (string | undefined)[], settled: 0 }
-  mock.env(on, env)
+  const seen = { registered: [] as object[], opened: [] as object[], closed: [] as string[], panes: new Set<string>(), argv: [] as string[][], init: [] as unknown[], status: [] as (string | undefined)[], settled: 0 }
+  const live: Live = { surfaces: ['terminal'], env: { ...env }, deny: [], holds: [] }
   const clock = mock.clock(on)
+  on('env.get', async (_: unknown, e: { name: string }) => {
+    const hold = seen.panes.size ? live.holds.find(h => h.name === e.name) : undefined
+    if (hold && hold.skip) hold.skip--
+    else if (hold) { live.holds.splice(live.holds.indexOf(hold), 1); await clock.sleep(hold.ms) }
+    return live.deny.includes(e.name) ? { deny: 'unreadable' } : { value: live.env[e.name] }
+  })
+  on('session.surfaces', () => (live.surfaces === 'reject' ? { deny: 'unreadable' } : { value: [...live.surfaces] }))
+  on('session.attach', (_: unknown, e: { clientId: string }) => ({ clientId: e.clientId }))
   on('command.register', (_: unknown, e: object) => { seen.registered.push({ ...e }); return answers.register ?? { value: { command: 'mux-agents-pane' } } })
-  on('ui.open', async (_: unknown, e: object) => {
+  on('ui.open', async (_: unknown, e: { id: string }) => {
     seen.opened.push({ ...e })
     if (answers.openHoldMs) await clock.sleep(answers.openHoldMs)
-    return answers.open ?? { value: { isPlaced: true } }
+    const opened = answers.open ?? { value: { isPlaced: true } }
+    if (!('deny' in opened)) seen.panes.add(e.id)
+    return opened
   })
+  on('ui.close', (_: unknown, e: { id: string }) => {
+    if (answers.close === 'deny') return { deny: 'keep this pane open' }
+    if (answers.close !== 'keep') { seen.panes.delete(e.id); seen.closed.push(e.id) }
+    return { value: undefined }
+  })
+  on('ui.panes', () => ({ value: [...seen.panes].map(id => ({ id, title: id })) }))
+  // Beneath the plugin: a mount its render declines (any surface but the terminal) draws an empty box.
+  on('ui.render', ($$: any, e: unknown) => { const { Box } = $$.ui.resolve(e); return <Box /> })
   let denyWrites = answers.denyWrites ?? 0
   if (denyWrites) on('state.set', (_: unknown, e: unknown, next: (e: unknown) => unknown) => (denyWrites-- > 0 ? { deny: 'disk full' } : next(e)))
   on('ui.status', (_: unknown, e: { text?: string }) => { seen.status.push(e.text); return { value: undefined } })
@@ -42,11 +68,11 @@ function world(on: any, env: Record<string, string>, runs: object[], tool: { std
   })
   on('session.start', (_: unknown, e: { cwd: string }) => ({ cwd: e.cwd }))
   on('tool.call', () => ({ result: { stdout: tool.stdout, stderr: '', interrupted: false }, text: tool.text, ...(tool.isError === undefined ? {} : { isError: tool.isError }) }))
-  return { seen, clock }
+  return { seen, clock, live }
 }
 
 test('session.start registers exactly the mux-agents-pane command', async ($, on) => {
-  const { seen } = world(on, {}, [ran(0, LIST)])
+  const { seen } = world(on, { TMUX: 'x' }, [ran(0, LIST)])
   await $.session.start(START)
   expect(seen.registered).toEqual([{ name: 'mux-agents-pane', description: 'Show the mux-agents board in a pane' }])
 })
@@ -174,6 +200,8 @@ test('list runs once on open, then once at each 3000 ms boundary', async ($, on)
   const { seen, clock } = world(on, { TMUX: 'x' }, [ran(0, LIST)])
   await $.session.start(START)
   await $.command.run({ command: 'mux-agents-pane' })
+  // The first refresh checks eligibility before list runs, so it is counted once that check settles.
+  await clock.settle()
   const counts = [seen.argv.length]
   for (const step of [2999, 1, 2999, 1]) { await clock.advance(step); counts.push(seen.argv.length) }
   expect(counts).toEqual([1, 1, 2, 2, 3])
@@ -261,18 +289,240 @@ test('/mux-agents-pane opens the pane and a stubbed list draws the count and row
   await $.command.run({ command: 'mux-agents-pane' })
   await clock.settle()
   expect(seen.opened).toEqual([{ id: 'mux-agents', title: 'Agents' }])
-  for (const surface of ['terminal', 'desktop'] as const) {
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  expect(await header(ui)).toBe('mux-agents · 1 running')
+  const live = await ui.find({ type: 'Text', text: /claude-1/ })
+  expect([live?.text, live?.props.dimColor]).toEqual(['● claude-1  claude  4m', undefined])
+  const doing = await ui.find({ type: 'Text', text: /build it/ })
+  expect([doing?.text, doing?.props.dimColor]).toEqual(['  build it', true])
+  const copilot = await ui.find({ type: 'Text', text: /copilot-1/ })
+  expect([copilot?.text, copilot?.props.dimColor]).toEqual(['○ copilot-1  copilot  exited  15m', true])
+  await ui.unmount()
+})
+
+// Terminal CLI only (#43): eligible only when the surfaces are exactly ['terminal'], TMUX or RMUX is set and
+// CLAUDE_CODE_REMOTE is not true. Any refused read counts as not eligible.
+const NOT_HERE = 'mux-agents works only in a terminal CLI inside tmux or rmux.'
+const texts = async (ui: any) => (await ui.findAll({ type: 'Text' })).map((t: { text: string }) => t.text)
+
+// Runs every gated path in a session and reports what reached the engine.
+async function gated($: any, w: ReturnType<typeof world>) {
+  await $.session.start(START)
+  const answered = await $.command.run({ command: 'mux-agents-pane' })
+  await $.tool.call({ tool: 'Bash', command: SPAWN })
+  await w.clock.advance(9000)
+  return { answered: (answered as { text?: string })?.text, registered: w.seen.registered.length, opened: w.seen.opened.length, runs: w.seen.argv.length }
+}
+const SKIPPED = { answered: NOT_HERE, registered: 0, opened: 0, runs: 0 }
+
+test('on the desktop app, even inside tmux: no command, no pane, no list, and a mount draws nothing', async ($, on) => {
+  const w = world(on, { TMUX: 'x' }, [ran(0, LIST)])
+  w.live.surfaces = ['desktop']
+  expect(await gated($, w)).toEqual(SKIPPED)
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  expect(await texts(ui)).toEqual([])
+  await ui.unmount()
+})
+
+test('in a terminal inside tmux: the command registers, the pane opens, list refreshes and the board draws', async ($, on) => {
+  const w = world(on, { TMUX: 'x' }, [ran(0, LIST)])
+  expect(await gated($, w)).toEqual({ answered: 'Agents pane opened.', registered: 1, opened: 2, runs: 4 })
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  expect(await header(ui)).toBe('mux-agents · 1 running')
+  await ui.unmount()
+})
+
+test('a terminal with the desktop app attached too (Remote Control) is skipped', async ($, on) => {
+  const w = world(on, { TMUX: 'x' }, [ran(0, LIST)])
+  w.live.surfaces = ['terminal', 'desktop']
+  expect(await gated($, w)).toEqual(SKIPPED)
+})
+
+test('the board never draws outside the terminal, even with the pane open in an eligible session', async ($, on) => {
+  const w = world(on, { TMUX: 'x' }, [ran(0, LIST)])
+  await $.session.start(START)
+  await $.command.run({ command: 'mux-agents-pane' })
+  await w.clock.settle()
+  for (const surface of ['desktop', 'mobile', 'vscode'] as const) {
     const ui = await $.ui.mount({ ...PANE, surface })
-    expect(await header(ui)).toBe('mux-agents · 1 running')
-    const live = await ui.find({ type: 'Text', text: /claude-1/ })
-    expect([live?.text, live?.props.dimColor]).toEqual(['● claude-1  claude  4m', undefined])
-    const doing = await ui.find({ type: 'Text', text: /build it/ })
-    expect([doing?.text, doing?.props.dimColor]).toEqual(['  build it', true])
-    const copilot = await ui.find({ type: 'Text', text: /copilot-1/ })
-    expect([copilot?.text, copilot?.props.dimColor]).toEqual(['○ copilot-1  copilot  exited  15m', true])
+    expect([surface, await texts(ui)]).toEqual([surface, []])
     await ui.unmount()
   }
 })
+
+const FAIL_CLOSED: [string, (l: Live) => void][] = [
+  ['CLAUDE_CODE_REMOTE=true', l => { l.env.CLAUDE_CODE_REMOTE = 'true' }],
+  ['no TMUX and no RMUX', l => { delete l.env.TMUX }],
+  ['TMUX unreadable', l => { l.deny.push('TMUX') }],
+  ['RMUX unreadable with TMUX absent', l => { delete l.env.TMUX; l.env.RMUX = 'x'; l.deny.push('RMUX') }],
+  ['CLAUDE_CODE_REMOTE unreadable', l => { l.deny.push('CLAUDE_CODE_REMOTE') }],
+  ['surfaces unreadable', l => { l.surfaces = 'reject' }],
+  ['no surfaces (headless or SDK)', l => { l.surfaces = [] }],
+]
+for (const [name, set] of FAIL_CLOSED) {
+  test(`fails closed: ${name}`, async ($, on) => {
+    const w = world(on, { TMUX: 'x' }, [ran(0, LIST)])
+    set(w.live)
+    expect(await gated($, w)).toEqual(SKIPPED)
+  })
+}
+
+test('RMUX alone, TMUX absent, is eligible', async ($, on) => {
+  const w = world(on, { RMUX: 'x' }, [ran(0, LIST)])
+  expect(await gated($, w)).toEqual({ answered: 'Agents pane opened.', registered: 1, opened: 2, runs: 4 })
+})
+
+test('CLAUDE_CODE_REMOTE other than true leaves a terminal session eligible', async ($, on) => {
+  const w = world(on, { TMUX: 'x', CLAUDE_CODE_REMOTE: 'false' }, [ran(0, LIST)])
+  expect((await gated($, w)).registered).toBe(1)
+})
+
+test('registered while eligible, then not: /mux-agents-pane answers not available and opens nothing', async ($, on) => {
+  const w = world(on, { TMUX: 'x' }, [ran(0, LIST)])
+  await $.session.start(START)
+  expect(w.seen.registered.length).toBe(1)
+  w.live.surfaces = ['desktop']
+  const answered: any = await $.command.run({ command: 'mux-agents-pane' })
+  await w.clock.settle()
+  expect([answered?.text, w.seen.opened.length, w.seen.argv.length]).toEqual([NOT_HERE, 0, 0])
+})
+
+// Opens the pane in an eligible session and lets the first refresh run.
+async function opened($: any, w: ReturnType<typeof world>) {
+  await $.session.start(START)
+  await $.command.run({ command: 'mux-agents-pane' })
+  await w.clock.settle()
+  expect([w.seen.argv.length, [...w.seen.panes]]).toEqual([1, ['mux-agents']])
+}
+
+// A tick no longer running list once the session is eligible again shows its timer was cancelled.
+async function stillStopped($: any, w: ReturnType<typeof world>, runs: number) {
+  w.live.surfaces = ['terminal']; w.live.env.TMUX = 'x'; w.live.deny = []
+  await w.clock.advance(9000)
+  expect(w.seen.argv.length).toBe(runs)
+}
+
+test('the desktop app attaching to an open pane cancels the refresh and closes the pane at once', async ($, on) => {
+  const w = world(on, { TMUX: 'x' }, [ran(0, LIST)])
+  await opened($, w)
+  w.live.surfaces = ['terminal', 'desktop']
+  await $.session.attach({ surface: 'desktop', clientId: 'd1' })
+  await w.clock.settle()
+  expect([w.seen.closed, [...w.seen.panes], w.seen.argv.length]).toEqual([['mux-agents'], [], 1])
+  await stillStopped($, w, 1)
+})
+
+test('a terminal attaching leaves the pane and its refresh alone', async ($, on) => {
+  const w = world(on, { TMUX: 'x' }, [ran(0, LIST)])
+  await opened($, w)
+  await $.session.attach({ surface: 'terminal', clientId: 't2' })
+  await w.clock.advance(3000)
+  expect([w.seen.closed, w.seen.argv.length]).toEqual([[], 2])
+})
+
+const LOST: [string, (l: Live) => void][] = [
+  ['the surfaces change', l => { l.surfaces = ['terminal', 'desktop'] }],
+  ['the surfaces become unreadable', l => { l.surfaces = 'reject' }],
+  ['TMUX goes away', l => { delete l.env.TMUX }],
+  ['CLAUDE_CODE_REMOTE turns true', l => { l.env.CLAUDE_CODE_REMOTE = 'true' }],
+]
+for (const [name, set] of LOST) {
+  test(`with no attach event, the next tick after ${name} runs no list, cancels the timer and closes the pane`, async ($, on) => {
+    const w = world(on, { TMUX: 'x' }, [ran(0, LIST)])
+    await opened($, w)
+    set(w.live)
+    await w.clock.advance(3000)
+    expect([w.seen.argv.length, w.seen.closed, [...w.seen.panes]]).toEqual([1, ['mux-agents'], []])
+    await stillStopped($, w, 1)
+  })
+}
+
+for (const attach of [false, true]) {
+  test(`eligibility lost while the pane is opening (${attach ? 'with' : 'without'} an attach): no timer, and the pane ends closed`, async ($, on) => {
+    const w = world(on, { TMUX: 'x' }, [ran(0, LIST)], undefined, { openHoldMs: 2000 })
+    await $.session.start(START)
+    const run = $.command.run({ command: 'mux-agents-pane' })
+    await w.clock.advance(1000)
+    w.live.surfaces = ['terminal', 'desktop']
+    if (attach) await $.session.attach({ surface: 'desktop', clientId: 'd1' })
+    await w.clock.advance(1000)
+    const answered: any = await run
+    await w.clock.settle()
+    expect([answered?.text, w.seen.opened.length, w.seen.argv.length, [...w.seen.panes]]).toEqual([NOT_HERE, 1, 0, []])
+    await stillStopped($, w, 0)
+  })
+}
+
+// A read the open or the first refresh waits on outlives the eligibility seen before it (QA #43): the surfaces turn to
+// terminal and desktop while it is held, with and without the desktop's attach event.
+async function lostDuringRead($: any, w: ReturnType<typeof world>, hold: Hold, attach: boolean) {
+  await $.session.start(START)
+  w.live.holds.push(hold)
+  const run = $.command.run({ command: 'mux-agents-pane' })
+  await w.clock.advance(1000)
+  w.live.surfaces = ['terminal', 'desktop']
+  if (attach) await $.session.attach({ surface: 'desktop', clientId: 'd1' })
+  await w.clock.advance(1000)
+  const answered: any = await run
+  await w.clock.settle()
+  return answered?.text
+}
+
+for (const name of ['OS', 'CLAUDE_CODE_REMOTE']) {
+  for (const attach of [false, true]) {
+    test(`eligibility lost while the open waits on ${name} (${attach ? 'with' : 'without'} an attach): no list, no timer, the pane ends closed`, async ($, on) => {
+      const w = world(on, { TMUX: 'x' }, [ran(0, LIST)])
+      const answered = await lostDuringRead($, w, { name, ms: 2000 }, attach)
+      expect([answered, w.seen.argv.length, [...w.seen.panes]]).toEqual([NOT_HERE, 0, []])
+      await stillStopped($, w, 0)
+    })
+  }
+}
+
+for (const attach of [false, true]) {
+  test(`eligibility lost while the first refresh checks it (${attach ? 'with' : 'without'} an attach): no list, no timer, the pane ends closed`, async ($, on) => {
+    const w = world(on, { TMUX: 'x' }, [ran(0, LIST)])
+    // The open's own check reads CLAUDE_CODE_REMOTE first; the refresh's read is the one held.
+    const answered = await lostDuringRead($, w, { name: 'CLAUDE_CODE_REMOTE', ms: 2000, skip: 1 }, attach)
+    expect([answered, w.seen.argv.length, [...w.seen.panes]]).toEqual(['Agents pane opened.', 0, []])
+    await stillStopped($, w, 0)
+  })
+}
+
+// A tick that fires while the last list still runs checks eligibility all the same (QA #43); only a second list waits.
+test('a tick during a held list, eligibility lost with no attach: retired at that tick, and no new list', async ($, on) => {
+  const w = world(on, { TMUX: 'x' }, [{ holdMs: 4000, answer: ran(0, LIST) }, ran(0, LIST)])
+  await $.session.start(START)
+  await $.command.run({ command: 'mux-agents-pane' })
+  await w.clock.settle()
+  w.live.surfaces = ['terminal', 'desktop']
+  await w.clock.advance(3000)
+  expect([w.seen.argv.length, w.seen.settled, w.seen.closed, [...w.seen.panes]]).toEqual([1, 0, ['mux-agents'], []])
+  await w.clock.advance(1000)
+  await stillStopped($, w, 1)
+})
+
+test('a tick during a held list, still eligible: no overlapping list, and the timer keeps going', async ($, on) => {
+  const w = world(on, { TMUX: 'x' }, [{ holdMs: 4000, answer: ran(0, LIST) }, ran(0, LIST)])
+  await $.session.start(START)
+  await $.command.run({ command: 'mux-agents-pane' })
+  await w.clock.settle()
+  await w.clock.advance(3000)
+  expect([w.seen.argv.length, w.seen.settled, w.seen.closed, [...w.seen.panes]]).toEqual([1, 0, [], ['mux-agents']])
+  await w.clock.advance(3000)
+  expect([w.seen.argv.length, w.seen.settled, w.seen.closed]).toEqual([2, 2, []])
+})
+
+for (const below of ['deny', 'keep'] as const) {
+  test(`a close ${below === 'deny' ? 'refused' : 'answered without closing'} below still leaves the refresh cancelled`, async ($, on) => {
+    const w = world(on, { TMUX: 'x' }, [ran(0, LIST)], undefined, { close: below })
+    await opened($, w)
+    w.live.surfaces = ['desktop']
+    await w.clock.advance(3000)
+    expect([w.seen.argv.length, [...w.seen.panes]]).toEqual([1, ['mux-agents']])
+    await stillStopped($, w, 1)
+  })
+}
 
 test('a live agent\'s chosen model follows its client; an inherited one shows nothing', async ($, on) => {
   const rows = [{ ...row('w1', 'running', null, 240), model: 'sonnet' }, { ...row('w2', 'running', null, 5), model: null }]

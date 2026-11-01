@@ -49,6 +49,8 @@ claude plugin marketplace add D0n9X1n/mux-agents && claude plugin install mux-ag
 copilot plugin marketplace add D0n9X1n/mux-agents && copilot plugin install mux-agents@mux-agents
 ```
 
+Terminal CLI only (Claude Code or Copilot CLI inside tmux or rmux); the desktop app and other non-terminal surfaces are skipped.
+
 Start the client inside tmux or rmux, then just ask: *"spawn a Copilot agent to review the diff, a Claude agent to write the parser tests, and open the side bar"*.
 
 ```sh
