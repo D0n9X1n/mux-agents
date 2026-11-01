@@ -182,7 +182,17 @@ mod win {
         {
             private_dir(sid, parent)?;
         }
-        create(sid, path)?;
+        // Another mux-agent may create it between our look and our create: then it is checked as an existing
+        // folder is, reparse points and files included, never trusted.
+        match create(sid, path) {
+            Err(_) if attributes(path)?.is_some() => {
+                no_reparse(path, &mut attributes)?;
+                if attributes(path)?.is_some_and(|a| a & FILE_ATTRIBUTE_DIRECTORY == 0) {
+                    return refuse(1, "state", "the state folder path is a file");
+                }
+            }
+            other => other?,
+        }
         check(sid, path)
     }
 
