@@ -176,7 +176,17 @@ fn new_dir(steps: &dyn Steps, path: &Path) -> Res<bool> {
     }
     match steps.mkdir(path) {
         Ok(()) => {}
-        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => return Ok(false),
+        // Where we meant to make a folder, only a real folder may have appeared: a link here is refused before
+        // the walk could descend through it (links above the root are allowed only where they already were).
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+            return match steps.lstat(path) {
+                Ok(raced) if raced.kind == Kind::Dir => Ok(false),
+                Ok(raced) if raced.kind == Kind::Link => {
+                    refuse(1, "state", "the state folder path has a link")
+                }
+                _ => cannot(),
+            };
+        }
         Err(_) => return cannot(),
     }
     if steps.chmod(path).is_err() {
@@ -863,6 +873,21 @@ pub(crate) mod tests {
             let made = (want == "ok").then_some(0o700);
             assert_eq!(mode(&root), made, "{bits:o}");
         }
+    }
+
+    // A link raced in where we were creating a folder above the root is refused at once: the walk never
+    // descends through it, so nothing is made at its target.
+    #[test]
+    fn ancestor_link_made_concurrently_refuses_no_write() {
+        let dir = TempDir::new();
+        let target = dir.path().join("target");
+        mkdir_mode(&target, 0o755);
+        let above = dir.path().join("above");
+        let root = above.join("state");
+        let plant = |path: &Path| std::os::unix::fs::symlink(&target, path).unwrap();
+        let steps = Concurrent(&above, &plant);
+        assert_eq!(message(private_dirs_with(&steps, &root, &[&root])), LINK);
+        assert!(!target.join("state").exists());
     }
 
     // Any other mkdir failure, and a chmod failing after our own mkdir, still refuse.
