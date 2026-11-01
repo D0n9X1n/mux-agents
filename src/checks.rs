@@ -486,7 +486,7 @@ fn utf16(bytes: &[u8], unit: fn([u8; 2]) -> u16) -> Option<String> {
     if !bytes.len().is_multiple_of(2) {
         return None;
     }
-    let units: Vec<u16> = bytes.chunks_exact(2).map(|c| unit([c[0], c[1]])).collect();
+    let units: Vec<u16> = bytes.as_chunks::<2>().0.iter().map(|&c| unit(c)).collect();
     String::from_utf16(&units).ok()
 }
 
@@ -495,8 +495,10 @@ fn utf32(bytes: &[u8], scalar: fn([u8; 4]) -> u32) -> Option<String> {
         return None;
     }
     bytes
-        .chunks_exact(4)
-        .map(|c| char::from_u32(scalar([c[0], c[1], c[2], c[3]])))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|&c| char::from_u32(scalar(c)))
         .collect()
 }
 
