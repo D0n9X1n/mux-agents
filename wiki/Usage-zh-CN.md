@@ -39,7 +39,7 @@ flowchart LR
 
 | 动词 | 示例 | 作用 |
 |---|---|---|
-| `spawn` | `spawn -Client copilot -TaskFile task.md -BriefFile brief.md -Split h` | 按会话的 `placement` 启动代理（默认是新窗口）；`-Split h\|v` 或 `-Tab` 只决定这一次；`-Model <model>` 指定它的模型（否则用客户端的默认模型） |
+| `spawn` | `spawn -Client copilot -Name add-tests -TaskFile task.md -BriefFile brief.md -Split h` | 按会话的 `placement` 启动代理（默认是新窗口）；`-Split h\|v` 或 `-Tab` 只决定这一次；`-Model <model>` 指定它的模型（否则用客户端的默认模型） |
 | `placement` | `placement h`，`placement tab` | 本会话之后 `spawn` 在哪里打开代理：`tab`（新窗口，默认）、`h` 或 `v`（在你旁边分屏） |
 | `list` | `list -All` | 存活的代理、各自在做什么、未读消息；`-All` 加上已结束的 |
 | `status` | `status -BodyFile step.txt` | 代理报告自己当前在做什么 |
@@ -52,6 +52,8 @@ flowchart LR
 退出码 0 表示成功，1 表示错误，2 表示拒绝或用法错误；失败时由 `check` 指明原因。
 
 每个会话选一次代理在哪里打开：`placement h`（或 `v`）让之后每次 `spawn` 都拆分你的窗格，`placement tab` 改回新窗口，单独的 `placement` 显示当前选择。它保存在多路复用器会话上，随会话结束，不写入磁盘；单次 `spawn` 上的 `-Split h|v` 或 `-Tab` 会覆盖它。
+
+每个代理的名字说明它做什么，也是它的标签页名或窗格标题。技能总是传 `-Name <short-kebab-name>`（1-24 个小写字母、数字或连字符，以字母开头；`parent`、`root` 和 `all` 是保留名）。不传 `-Name` 时，名字取自任务的前几个词："Please add a subtract function to calc.py" 变成 `add-subtract-function`，没有可用词的任务得到 `claude-1` 或 `copilot-1`。名字在其会话中永不复用，即使代理已结束：被占用的派生名加上 `-2`、`-3`……（在词边界截断以保持在 24 以内），被占用的 `-Name` 会被拒绝，并给出一个可用的名字。即使代理的客户端自己设置标题，窗格标题仍保持为该名字；tmux 3.2a 除外，它无法阻止客户端改写窗格标题（标签页名仍然保持）。
 
 ## 侧边栏
 

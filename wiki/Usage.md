@@ -39,7 +39,7 @@ You rarely type these: the skill runs them for you. Every command is `<plugin>/s
 
 | verb | example | what it does |
 |---|---|---|
-| `spawn` | `spawn -Client copilot -TaskFile task.md -BriefFile brief.md -Split h` | start an agent where the session's `placement` says (a new window by default); `-Split h\|v` or `-Tab` decides for this one; `-Model <model>` picks its model (else the client's default) |
+| `spawn` | `spawn -Client copilot -Name add-tests -TaskFile task.md -BriefFile brief.md -Split h` | start an agent where the session's `placement` says (a new window by default); `-Split h\|v` or `-Tab` decides for this one; `-Model <model>` picks its model (else the client's default) |
 | `placement` | `placement h`, `placement tab` | where `spawn` opens agents for the rest of the session: `tab` (a new window, the default), `h` or `v` (a split beside you) |
 | `list` | `list -All` | live agents, what each is doing, unread messages; `-All` adds ended ones |
 | `status` | `status -BodyFile step.txt` | an agent says what it is doing now |
@@ -52,6 +52,8 @@ You rarely type these: the skill runs them for you. Every command is `<plugin>/s
 Exit code 0 means ok, 1 an error and 2 a refusal or usage error; on failure, `check` names the cause.
 
 Choose where agents open once per session: `placement h` (or `v`) splits your pane for every later `spawn`, `placement tab` goes back to new windows, and `placement` alone shows the choice. It lives on the multiplexer session, so it ends with the session and nothing is written to disk; `-Split h|v` or `-Tab` on one `spawn` overrides it.
+
+Every agent's name says what it does and is its tab's name or its pane's title. The skill always passes `-Name <short-kebab-name>` (1-24 lowercase letters, digits or hyphens, starting with a letter; `parent`, `root` and `all` are reserved). Without `-Name`, the name comes from the task's first words: "Please add a subtract function to calc.py" becomes `add-subtract-function`, and a task with no usable words gets `claude-1` or `copilot-1`. A name is never reused in its session, even after its agent ended: a taken derived name gets `-2`, `-3`, … (cut at a word boundary to stay within 24), and a taken `-Name` is refused with a free one to try. The pane's title stays the name even when the agent's client sets a title of its own, except on tmux 3.2a, which cannot stop a client from retitling its pane (the tab's name still holds).
 
 ## Side bar
 

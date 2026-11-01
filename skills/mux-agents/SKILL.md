@@ -16,6 +16,7 @@ The commands below, and the Reply and Listen lines, run as-is in the Bash tool. 
 ## Rules
 
 - Put free text only in files: `-TaskFile`, `-BriefFile` and `-BodyFile`.
+- Always pass `-Name <short-kebab-name>` that says what the agent does (for example `add-tests`): 1-24 lowercase letters, digits or hyphens, starting with a letter. A name is never reused in the session; a taken one is refused with a free one to try.
 - Agent callers always pass `-BriefFile`, because a fork can fall back to brief-only.
 - Report results to your parent with `send parent`.
 - As a spawned agent, run `status -BodyFile <file>` each time you start a step of your task.
@@ -28,7 +29,7 @@ The commands below, and the Reply and Listen lines, run as-is in the Bash tool. 
 ## Commands
 
 ```
-"<entry>" spawn -Client <client> -TaskFile <task-file> -BriefFile <brief-file>
+"<entry>" spawn -Client <client> -Name <name> -TaskFile <task-file> -BriefFile <brief-file>
 "<entry>" placement tab
 "<entry>" placement h
 "<entry>" placement
@@ -45,7 +46,7 @@ The commands below, and the Reply and Listen lines, run as-is in the Bash tool. 
 "<entry>" sidebar -Close
 ```
 
-`spawn` opens where `placement` says (a new window by default). It also takes `-Name <name>`, `-Split h|v` or `-Tab` (this spawn only, over the placement) and `-NoFork`. Pass `-Model <model>` (for example `sonnet`, `opus` or `sonnet[1m]`) only when the user names a model; without it the agent uses its client's default.
+`spawn` opens where `placement` says (a new window by default), titled with the agent's name. It also takes `-Split h|v` or `-Tab` (this spawn only, over the placement) and `-NoFork`. Pass `-Model <model>` (for example `sonnet`, `opus` or `sonnet[1m]`) only when the user names a model; without it the agent uses its client's default.
 
 `list` shows each live agent's state, what it is doing and its unread count; `list -All` adds the ended agents (at most 10, newest first).
 

@@ -130,6 +130,55 @@ pub fn record(ctx: &Ctx, caller: &Caller, id: &str) -> Res<Option<Value>> {
     Ok(crate::state::fs::read_json(&path)?.filter(Value::is_object))
 }
 
+/// The name of every agent record of the caller's session under this state root, live or ended, any age: a name
+/// is never reused in its session. A folder with no record.json, or a record naming another session, names none.
+/// It fails closed: a record that cannot be read, is not an object, is not its folder's, names no session or has
+/// no name could hide a taken name, so it refuses 2 `name`.
+pub(crate) fn recorded_names(ctx: &Ctx, caller: &Caller) -> Res<Vec<String>> {
+    let agents = super::server_dir(ctx, caller).join("agents");
+    let entries = match std::fs::read_dir(&agents) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(e.into()),
+    };
+    let mut names = Vec::new();
+    for entry in entries {
+        let entry = entry?;
+        let Some(id) = entry.file_name().to_str().map(str::to_string) else {
+            continue;
+        };
+        if !super::agent_id(&id) || !entry.path().is_dir() {
+            continue;
+        }
+        let unreadable = || {
+            refuse(
+                2,
+                "name",
+                format!("agent record {id} cannot be read, so names cannot be checked"),
+            )
+        };
+        let record = match crate::state::fs::read_json(&entry.path().join("record.json")) {
+            Ok(None) => continue,
+            Ok(Some(record)) if record.is_object() => record,
+            _ => return unreadable(),
+        };
+        if record.get("id").and_then(Value::as_str) != Some(id.as_str()) {
+            return unreadable();
+        }
+        // Skipped only when it positively names another session: one naming none could be this session's.
+        match record.get("session").and_then(Value::as_str) {
+            Some(session) if session == caller.session => {}
+            Some(_) => continue,
+            None => return unreadable(),
+        }
+        match record.get("name").and_then(Value::as_str) {
+            Some(name) => names.push(name.to_string()),
+            None => return unreadable(),
+        }
+    }
+    Ok(names)
+}
+
 /// The live committed agent named `name` in the caller's session; refuses 2 `target` otherwise.
 pub fn find_pane(ctx: &Ctx, caller: &Caller, name: &str) -> Res<Pane> {
     let none = || refuse(2, "target", "no live agent has that name");

@@ -246,8 +246,14 @@ impl Launch<'_> {
         if live.len() >= CAP {
             return refuse(2, "cap", "the session already has 6 live agents");
         }
-        let taken: Vec<&str> = live.iter().map(|p| p.name.as_str()).collect();
-        let name = resolve_name(self.requested, self.client, &taken)?;
+        // Taken: the live panes' names and every recorded name of the session in this state root.
+        let recorded = registry::recorded_names(ctx, caller)?;
+        let taken: Vec<&str> = live
+            .iter()
+            .map(|p| p.name.as_str())
+            .chain(recorded.iter().map(String::as_str))
+            .collect();
+        let name = resolve_name(self.requested, self.client, &self.task, &taken)?;
         let mut plan = context_plan(caller, self.client, &ctx.env, self.no_fork);
         let session = guid()?;
         let id = hex_id()?;
@@ -414,7 +420,24 @@ impl Launch<'_> {
             }
             tag_argv.extend(["set-option", "-p", "-t", &new_pane, key, value]);
         }
+        // The agent's pane is titled with its name (select-pane -T leaves focus alone); a tab also has it as the
+        // window's name from -n, which turns automatic-rename off for that window.
+        tag_argv.extend([";", "select-pane", "-T", &agent.name, "-t", &new_pane]);
         native(ctx, &tag_argv, false)?;
+        // Before the commit, so before the client starts: its title escapes no longer replace the name. Best
+        // effort: tmux 3.2a has no allow-set-title and refuses it, and the spawn goes on.
+        let _ = native(
+            ctx,
+            &[
+                "set-option",
+                "-p",
+                "-t",
+                &new_pane,
+                "allow-set-title",
+                "off",
+            ],
+            true,
+        );
         let parent_agent = match (&caller.agent, caller.client) {
             (Some(parent), Some(client)) => {
                 let session = ctx
@@ -1158,12 +1181,123 @@ mod tests {
             );
             assert!(calls(&w, "new-window").is_empty(), "{name:?}");
         }
-        // Five leave room for a sixth, named after the taken ones.
+        // Five leave room for a sixth; a task of stopwords names it after the taken ones.
         let w = human();
         let five = rows(5);
         w.panes(&five.iter().map(String::as_str).collect::<Vec<_>>());
-        let ok = reply(&run(&w, &["-Client", "claude", "-Task", "hi"]));
+        let ok = reply(&run(&w, &["-Client", "claude", "-Task", "do it"]));
+        assert_eq!(ok["name"], "do");
+        let w = human();
+        w.panes(&five.iter().map(String::as_str).collect::<Vec<_>>());
+        let ok = reply(&run(&w, &["-Client", "claude", "-Task", "just it"]));
         assert_eq!(ok["name"], "claude-6");
+    }
+
+    // An ended agent, noticed so reap leaves it be; its name is taken until the state root is cleared.
+    fn ended(w: &World, id: &str, fields: Value) {
+        let folder = w.agent_record(id, fields);
+        crate::agents::fixture::write(
+            &folder.join("notice.json"),
+            json!({"kind": "exited", "at": "1970-01-01T00:00:00.0000000Z"}),
+        );
+    }
+
+    #[test]
+    fn ended_agents_names_stay_taken() {
+        // An ended `add-subtract`: a task deriving it gets -2; with -2 live too, -3.
+        let w = human();
+        ended(&w, "000000000b01", json!({"name": "add-subtract"}));
+        let ok = reply(&run(&w, &["-Client", "claude", "-Task", "Add subtract"]));
+        assert_eq!(ok["name"], "add-subtract-2");
+        let w = human();
+        ended(&w, "000000000b01", json!({"name": "add-subtract"}));
+        w.panes(&["%21|@21|321|000000000b02|add-subtract-2"]);
+        let ok = reply(&run(&w, &["-Client", "claude", "-Task", "add subtract"]));
+        assert_eq!(ok["name"], "add-subtract-3");
+        // Eleven ended, more than a board shows: the oldest name is still taken, by -Name too, without case.
+        let w = human();
+        for n in 1..=11u32 {
+            let at = format!("1970-01-01T00:00:{n:02}.0000000Z");
+            ended(
+                &w,
+                &format!("{:012x}", 0xc00 + n),
+                json!({"name": format!("w{n}"), "createdAt": at}),
+            );
+        }
+        assert_eq!(
+            run(&w, &["-Client", "claude", "-Task", "hi", "-Name", "w1"]),
+            "2 name agent name is taken, try w1-2"
+        );
+        assert!(calls(&w, "new-window").is_empty());
+        ended(&w, "000000000b03", json!({"name": "Worker"}));
+        assert_eq!(
+            run(&w, &["-Client", "claude", "-Task", "hi", "-Name", "worker"]),
+            "2 name agent name is taken, try worker-2"
+        );
+        // Another session's record and a folder with no record.json name nothing.
+        let w = human();
+        ended(
+            &w,
+            "000000000b04",
+            json!({"name": "add-subtract", "session": "$4"}),
+        );
+        std::fs::create_dir_all(w.folder("000000000b05")).unwrap();
+        let ok = reply(&run(&w, &["-Client", "claude", "-Task", "add subtract"]));
+        assert_eq!(ok["name"], "add-subtract");
+    }
+
+    #[test]
+    fn an_unreadable_record_refuses_rather_than_reuse_a_name() {
+        // Fail closed: a record that cannot be read, is not an object, is not its folder's or has no name could
+        // hide a taken name, so the spawn refuses 2 `name` before any pane.
+        let id = "000000000b07";
+        let refused =
+            format!("2 name agent record {id} cannot be read, so names cannot be checked");
+        // A case's name and how it breaks the record.
+        type Case<'a> = (&'a str, &'a dyn Fn(&World));
+        let cases: [Case; 7] = [
+            ("not JSON", &|w| {
+                let folder = w.folder(id);
+                std::fs::create_dir_all(&folder).unwrap();
+                std::fs::write(folder.join("record.json"), "{").unwrap();
+            }),
+            ("not an object", &|w| {
+                let folder = w.folder(id);
+                std::fs::create_dir_all(&folder).unwrap();
+                std::fs::write(folder.join("record.json"), "[\"w\"]").unwrap();
+            }),
+            ("unreadable", &|w| {
+                std::fs::create_dir_all(w.folder(id).join("record.json")).unwrap();
+            }),
+            ("another folder's id", &|w| {
+                ended(w, id, json!({"name": "w", "id": "000000000b06"}));
+            }),
+            ("no name", &|w| ended(w, id, json!({"name": null}))),
+            // Only a record that names another session is skipped; one naming none could be this session's.
+            ("no session", &|w| {
+                ended(w, id, json!({"name": "w"}));
+                let path = w.folder(id).join("record.json");
+                let mut record = read_json(&path);
+                record.as_object_mut().unwrap().remove("session");
+                crate::agents::fixture::write(&path, record);
+            }),
+            ("a session that is not a string", &|w| {
+                ended(w, id, json!({"name": "w", "session": 3}))
+            }),
+        ];
+        for (case, make) in cases {
+            let w = human();
+            make(&w);
+            for args in [
+                &["-Task", "add subtract"][..],
+                &["-Task", "hi", "-Name", "w"],
+            ] {
+                let mut full = vec!["-Client", "claude"];
+                full.extend(args);
+                assert_eq!(run(&w, &full), refused, "{case} {args:?}");
+            }
+            assert!(calls(&w, "new-window").is_empty(), "{case}");
+        }
     }
 
     #[test]
@@ -1196,7 +1330,7 @@ mod tests {
             .mux_rule("-t %26 #{pane_id}|#{@agent-id}", 0, "|\n", "");
         let ok = reply(&run(&w, &["-Client", "claude", "-Task", "hi"]));
         assert!(killed.get());
-        assert_eq!(ok["name"], "claude-6");
+        assert_eq!(ok["name"], "hi");
         assert!(folder.join("notice.json").is_file());
 
         // An uncommitted agent over 60 s old whose pane is gone: noticed inside the spawn lock, never taken twice.
@@ -1212,7 +1346,7 @@ mod tests {
             .mux_rule("-t %7 #{pane_id}|#{@agent-id}", 0, "|\n", "");
         w.fakes.clear_log();
         let ok = reply(&run(&w, &["-Client", "claude", "-Task", "hi"]));
-        assert_eq!(ok["name"], "claude-6");
+        assert_eq!(ok["name"], "hi");
         assert!(stale.join("notice.json").is_file());
         let spawn = format!("spawn|{}|$3", w.caller().server_key);
         let held: Vec<String> = w
@@ -1441,7 +1575,7 @@ mod tests {
             // The model's two arguments count toward the limit like every other.
             for model in [&[][..], &["-Model", "sonnet"]] {
                 let w = human();
-                let mut args = vec!["-Client", client, "-Task", "x"];
+                let mut args = vec!["-Client", client, "-Task", "x", "-Name", "w"];
                 args.extend(model);
                 let ok = reply(&run(&w, &args));
                 let spec = read_json(
@@ -1464,7 +1598,7 @@ mod tests {
                 let fit = format!("{}{}", "\"".repeat(room / 2), "x".repeat(room % 2));
                 for (task, fits) in [(fit.clone(), true), (format!("{fit}x"), false)] {
                     let w = human();
-                    let mut args = vec!["-Client", client, "-Task", &task];
+                    let mut args = vec!["-Client", client, "-Task", &task, "-Name", "w"];
                     args.extend(model);
                     let text = run(&w, &args);
                     if fits {
@@ -1479,6 +1613,40 @@ mod tests {
                     }
                 }
             }
+        }
+    }
+
+    #[test]
+    fn a_refused_allow_set_title_still_spawns() {
+        // tmux 3.2a has no allow-set-title: its refusal is best effort, so the agent still commits, tab or split.
+        for extra in [&[][..], &["-Split", "h"]] {
+            let w = human();
+            w.fakes
+                .mux_first("allow-set-title", 1, "", "invalid option: allow-set-title");
+            let mut args = vec!["-Client", "claude", "-Task", "hi"];
+            args.extend(extra);
+            let ok = reply(&run(&w, &args));
+            assert_eq!(ok["name"], "hi", "{extra:?}");
+            let folder = agents_dir(&w).join(ok["id"].as_str().unwrap());
+            assert!(folder.join("commit.json").is_file(), "{extra:?}");
+            let titles: Vec<Vec<String>> = calls(&w, "set-option")
+                .into_iter()
+                .filter(|c| c.iter().any(|t| t == "allow-set-title"))
+                .collect();
+            assert_eq!(
+                titles,
+                [[
+                    "-N",
+                    "set-option",
+                    "-p",
+                    "-t",
+                    "%9",
+                    "allow-set-title",
+                    "off"
+                ]
+                .map(String::from)],
+                "{extra:?}"
+            );
         }
     }
 
@@ -1500,7 +1668,7 @@ mod tests {
             "-t",
             "$3:",
             "-n",
-            "claude-1",
+            "hi",
         ]
         .map(String::from)
         .to_vec();
@@ -2063,9 +2231,10 @@ mod tests {
         let prompt = spec["prompt"].clone();
         assert_eq!(spec["args"], json!(["--session-id", new, "-i", prompt]));
         let tags = &calls(&w, "set-option")[0];
-        assert_eq!(
-            tags[tags.len() - 2..],
-            ["@agent-context", "brief:copy-verification-failed"]
+        assert!(
+            tags.windows(2)
+                .any(|pair| pair == ["@agent-context", "brief:copy-verification-failed"]),
+            "{tags:?}"
         );
         let slashes = |p: &Path| p.to_str().unwrap().replace('\\', "/");
         assert_eq!(
@@ -2228,6 +2397,10 @@ mod tests {
         });
         let (seen, dir) = (log.clone(), agents.clone());
         w.fakes.mux_script("set-option", move |argv| {
+            if argv[5] == "allow-set-title" {
+                seen.borrow_mut().push("allow-set-title".into());
+                return Ok(Output::default());
+            }
             let folder = dir.join(&argv[6]);
             seen.borrow_mut().push(format!(
                 "tag record {} commit {}",
@@ -2253,6 +2426,8 @@ mod tests {
             [
                 "launch spec true",
                 "tag record false commit false",
+                // Before the commit, so before the launcher starts the client.
+                "allow-set-title",
                 "commit: record true commit false"
             ]
         );
@@ -2275,7 +2450,7 @@ mod tests {
             "-t",
             "%9",
             "@agent-name",
-            "claude-1",
+            "hi",
             ";",
             "set-option",
             "-p",
@@ -2290,12 +2465,29 @@ mod tests {
             "%9",
             "@agent-context",
             "brief:human",
+            ";",
+            "select-pane",
+            "-T",
+            "hi",
+            "-t",
+            "%9",
         ]
         .map(String::from)
         .to_vec();
-        assert_eq!(calls(&w, "set-option"), [tags]);
+        let title = [
+            "-N",
+            "set-option",
+            "-p",
+            "-t",
+            "%9",
+            "allow-set-title",
+            "off",
+        ]
+        .map(String::from)
+        .to_vec();
+        assert_eq!(calls(&w, "set-option"), [tags, title]);
         let folder = agents.join(id);
-        let record = json!({"schema": 1, "id": id, "name": "claude-1", "client": "claude",
+        let record = json!({"schema": 1, "id": id, "name": "hi", "client": "claude",
             "sessionId": ok["sessionId"], "context": "brief", "reason": "human", "session": "$3",
             "pane": "%9", "window": "@5", "parentPane": "%1", "parentAgent": null,
             "directory": w.ctx.cwd.to_str().unwrap(), "taskLine": "hi",
@@ -2352,7 +2544,9 @@ mod tests {
         let w = human();
         let dir = agents_dir(&w);
         w.fakes.mux_script("set-option", move |argv| {
-            std::fs::create_dir(dir.join(&argv[6]).join("record.json")).unwrap();
+            if argv[5] == "@agent-id" {
+                std::fs::create_dir(dir.join(&argv[6]).join("record.json")).unwrap();
+            }
             Ok(Output::default())
         });
         assert_eq!(
