@@ -67,4 +67,4 @@ copilot plugin marketplace update mux-agents && copilot plugin update mux-agents
 
 ## Learn more
 
-[Usage](https://github.com/D0n9X1n/mux-agents/wiki/Usage) (commands, side bar, safety checks, upgrades, troubleshooting) · [Wiki](https://github.com/D0n9X1n/mux-agents/wiki) (English · 简体中文) · [Changelog](https://github.com/D0n9X1n/mux-agents/blob/main/CHANGELOG.md) · [Contributing](https://github.com/D0n9X1n/mux-agents/blob/main/CONTRIBUTING.md) · [Security](https://github.com/D0n9X1n/mux-agents/blob/main/SECURITY.md) · MIT
+[Usage](https://github.com/D0n9X1n/mux-agents/wiki/Usage) (commands, side bar, safety checks, upgrades, troubleshooting) · [Wiki](https://github.com/D0n9X1n/mux-agents/wiki) (English · 简体中文) · [Releases](https://github.com/D0n9X1n/mux-agents/releases) · [Contributing](https://github.com/D0n9X1n/mux-agents/blob/main/CONTRIBUTING.md) · [Security](https://github.com/D0n9X1n/mux-agents/blob/main/SECURITY.md) · MIT

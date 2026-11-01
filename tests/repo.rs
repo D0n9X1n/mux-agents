@@ -1035,13 +1035,13 @@ fn hook_line_ok(line: &str) -> bool {
 }
 
 #[test]
-fn plugin_version_is_0_2_2_and_matches_cargo() {
-    assert_eq!(json_file(".claude-plugin/plugin.json")["version"], "0.2.2");
-    assert_eq!(cargo_version(), "0.2.2");
+fn plugin_version_is_0_2_3_and_matches_cargo() {
+    assert_eq!(json_file(".claude-plugin/plugin.json")["version"], "0.2.3");
+    assert_eq!(cargo_version(), "0.2.3");
     let lock = repo_file("Cargo.lock").replace("\r\n", "\n");
     assert!(
-        lock.contains("name = \"mux-agent\"\nversion = \"0.2.2\"\n"),
-        "Cargo.lock does not hold mux-agent 0.2.2"
+        lock.contains("name = \"mux-agent\"\nversion = \"0.2.3\"\n"),
+        "Cargo.lock does not hold mux-agent 0.2.3"
     );
 }
 
@@ -2012,23 +2012,38 @@ fn repo_front_page_and_community_files() {
         "CONTRIBUTING.md",
         "CODE_OF_CONDUCT.md",
         "SECURITY.md",
-        "CHANGELOG.md",
         ".github/ISSUE_TEMPLATE/config.yml",
     ] {
         assert!(files.iter().any(|f| f == path), "{path} is not tracked");
     }
-    // The changelog names every release the wiki has notes for.
-    let changelog = repo_file("CHANGELOG.md");
-    for page in wiki_pages()
-        .iter()
-        .filter(|p| p.starts_with("Release-v") && !p.ends_with("-zh-CN"))
-    {
-        let version = page.trim_start_matches("Release-v");
+    // Release notes live only in GitHub releases (#57): no changelog, and the wiki states only what the repo is and
+    // why, never one page per version.
+    assert!(
+        !files.iter().any(|f| f.eq_ignore_ascii_case("CHANGELOG.md")),
+        "CHANGELOG.md is tracked"
+    );
+    let release_pages: Vec<String> = wiki_pages()
+        .into_iter()
+        .filter(|p| p.starts_with("Release"))
+        .collect();
+    assert!(
+        release_pages.is_empty(),
+        "wiki release pages: {release_pages:?}"
+    );
+    for page in ["Home", "Home-zh-CN"] {
         assert!(
-            changelog.contains(&format!("## [{version}]")),
-            "CHANGELOG lacks {version}"
+            !wiki_text(page).contains("Release-v"),
+            "{page} links a release page"
         );
     }
+    assert!(
+        !repo_file("README.md").contains("CHANGELOG"),
+        "README links the changelog"
+    );
+    assert!(
+        !repo_file(".github/workflows/release.yml").contains("wiki/Release"),
+        "release.yml reads a wiki release page"
+    );
     // Vulnerabilities go to a private advisory, never a public issue.
     assert!(
         repo_file("SECURITY.md")
@@ -2275,8 +2290,8 @@ fn readme_upgrade_lifecycle() {
     );
     at("absolute path");
     at("do not serialize");
-    // The release notes say the same, in both languages.
-    for page in ["Usage-zh-CN", "Release-v0.2.0", "Release-v0.2.0-zh-CN"] {
+    // The Chinese twin says the same.
+    for page in ["Usage-zh-CN"] {
         let text = wiki_text(page);
         for needle in ["sidebar -Close", "`stop`"] {
             assert!(text.contains(needle), "{page} lacks {needle}");

@@ -126,7 +126,4 @@ jobs:
             echo "dist already holds $version from $GITHUB_SHA"
           fi
           if gh release view "$TAG" >/dev/null 2>&1; then echo "release $TAG exists"; exit 0; fi
-          options=(--verify-tag --title "$TAG" --generate-notes)
-          notes="wiki/Release-$TAG.md"
-          if [ -f "$notes" ]; then options+=(--notes-file "$notes"); fi
-          gh release create "$TAG" "${options[@]}"
+          gh release create "$TAG" --verify-tag --title "$TAG" --generate-notes
