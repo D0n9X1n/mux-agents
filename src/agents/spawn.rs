@@ -181,7 +181,7 @@ pub fn spawn(ctx: &Ctx, request: &Request) -> Res<Map<String, Value>> {
 }
 
 /// The reply's `key: value` lines, then `sidebar <pane>`, `sidebar off` or `sidebar error: <message>`.
-pub fn spawn_text(reply: &Map<String, Value>) -> String {
+pub fn spawn_text(reply: &Map<String, Value>, _color: bool) -> String {
     let fields: Map<String, Value> = reply
         .iter()
         .filter(|(key, _)| *key != "sidebar" && *key != "sidebarError")

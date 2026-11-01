@@ -35,8 +35,9 @@ impl Request {
 /// A verb's reply fields after `ok` and `verb`, computed against the call's providers.
 pub type Handler = fn(&Ctx, &Request) -> Res<Map<String, Value>>;
 
-/// A successful reply as `-Text` lines; a refusal is always `json::to_text`.
-pub type Text = fn(&Map<String, Value>) -> String;
+/// A successful reply as `-Text` lines, with SGR color when the second argument says so (S2.7); a refusal is always
+/// `json::lines`, plain.
+pub type Text = fn(&Map<String, Value>, bool) -> String;
 
 pub struct VerbDef {
     pub name: &'static str,
@@ -96,7 +97,7 @@ pub static VERBS: &[VerbDef] = &[
         max: 1,
         usage: "usage: mux-agent focus <name> [-Text]",
         handler: crate::agents::view::focus,
-        text: json::to_text,
+        text: json::lines,
     },
     VerbDef {
         name: "send",
@@ -106,7 +107,7 @@ pub static VERBS: &[VerbDef] = &[
         max: 1,
         usage: "usage: mux-agent send <name|parent|%pane> (-Body <text> | -BodyFile <path>) [-Text]",
         handler: crate::agents::message::send,
-        text: json::to_text,
+        text: json::lines,
     },
     VerbDef {
         name: "read",
@@ -116,7 +117,7 @@ pub static VERBS: &[VerbDef] = &[
         max: 1,
         usage: "usage: mux-agent read [-Wait <seconds>] | read <name> [-Lines <n>] [-Text]",
         handler: crate::agents::message::read,
-        text: json::to_text,
+        text: json::lines,
     },
     VerbDef {
         name: "stop",
@@ -126,7 +127,7 @@ pub static VERBS: &[VerbDef] = &[
         max: 1,
         usage: "usage: mux-agent stop <name> [-Text]",
         handler: crate::agents::message::stop,
-        text: json::to_text,
+        text: json::lines,
     },
     VerbDef {
         name: "status",
@@ -136,7 +137,7 @@ pub static VERBS: &[VerbDef] = &[
         max: 0,
         usage: "usage: mux-agent status (-Body <text> | -BodyFile <path>) [-Text]",
         handler: crate::agents::view::status,
-        text: json::to_text,
+        text: json::lines,
     },
     VerbDef {
         name: "sidebar",
@@ -146,7 +147,7 @@ pub static VERBS: &[VerbDef] = &[
         max: 0,
         usage: "usage: mux-agent sidebar [-Close] [-Text]",
         handler: crate::sidebar::sidebar,
-        text: json::to_text,
+        text: json::lines,
     },
     VerbDef {
         name: "watch",
@@ -156,7 +157,7 @@ pub static VERBS: &[VerbDef] = &[
         max: 0,
         usage: "usage: mux-agent watch [-Text]",
         handler: crate::sidebar::watch,
-        text: json::to_text,
+        text: json::lines,
     },
 ];
 
@@ -247,28 +248,31 @@ fn dispatch(def: &VerbDef, request: &Request, ctx: &Ctx) -> Res<Map<String, Valu
 /// cannot be built replies as JSON with no verb, whatever the arguments. A panic in the verb is 1 `internal`;
 /// unwinding has already released its locks.
 pub fn run<C: Borrow<Ctx>>(args: &[String], ctx: impl FnOnce() -> Res<C>) -> (u8, String) {
-    let (def, text, outcome) = match ctx() {
-        Err(refusal) => (None, false, Err(refusal)),
+    let (def, text, color, outcome) = match ctx() {
+        Err(refusal) => (None, false, false, Err(refusal)),
         Ok(ctx) => match parse(args) {
-            Err(refusal) => (None, false, Err(refusal)),
+            Err(refusal) => (None, false, false, Err(refusal)),
             Ok((def, request)) => {
                 let outcome =
                     panic::catch_unwind(AssertUnwindSafe(|| dispatch(def, &request, ctx.borrow())))
                         .unwrap_or_else(|_| refuse(1, "internal", "unexpected error (panic)"));
-                (Some(def), request.text, outcome)
+                let ctx = ctx.borrow();
+                let color = crate::paint::color_on(&ctx.env, ctx.tty);
+                (Some(def), request.text, color, outcome)
             }
         },
     };
-    let (code, reply, lines): (u8, _, Text) = match outcome {
-        Ok(reply) => (0, reply, def.map_or(json::to_text, |d| d.text)),
+    let (code, reply, lines, color): (u8, _, Text, bool) = match outcome {
+        Ok(reply) => (0, reply, def.map_or(json::lines, |d| d.text), color),
         Err(refusal) => (
             refusal.code,
             failure(def.map(|d| d.name), &refusal),
-            json::to_text,
+            json::lines,
+            false,
         ),
     };
     let out = if text {
-        lines(&reply)
+        lines(&reply, color)
     } else {
         json::to_stdout(&Value::Object(reply))
     };
@@ -342,7 +346,7 @@ mod tests {
             max: 1,
             usage: "usage: probe",
             handler: probe,
-            text: json::to_text,
+            text: json::lines,
         };
         let request = Request {
             verb: "probe",
@@ -966,6 +970,75 @@ mod tests {
                 crate::agents::fixture::SESSION_ID
             )
         );
+    }
+
+    #[test]
+    fn list_text_paints_names_in_their_hue_on_a_terminal() {
+        let mut w = World::human("");
+        w.agent_record(ID, json!({"name": "worker", "color": "magenta"}));
+        let ended = w.agent_record("bbbbbbbbbbbb", json!({"name": "done", "pane": "%8"}));
+        crate::agents::fixture::write(
+            &ended.join("notice.json"),
+            json!({"kind": "stopped", "exitCode": null, "at": "x"}),
+        );
+        w.panes(&["%9|@5|300|aaaaaaaaaaaa|worker"]);
+        let base: Vec<(String, String)> = w
+            .ctx
+            .env
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        let mut with = |tty: bool, extra: &[(&str, &str)]| {
+            let mut env = base.clone();
+            env.extend(extra.iter().map(|(k, v)| (k.to_string(), v.to_string())));
+            w.ctx.env = crate::ctx::Env::from_pairs(env);
+            w.ctx.tty = tty;
+            call(&w, &["list", "-All", "-Text"]).1
+        };
+        // Off a terminal, or with NO_COLOR: plain, as before.
+        let plain = with(false, &[]);
+        assert!(!plain.contains('\u{1b}'), "{plain}");
+        assert_eq!(with(true, &[("NO_COLOR", "1")]), plain);
+        // On a terminal (or forced): the live name in its hue, the ended name dim; nothing else changes.
+        let colored = with(true, &[]);
+        assert_eq!(with(false, &[("FORCE_COLOR", "1")]), colored);
+        let lines: Vec<&str> = colored.lines().collect();
+        assert!(
+            lines[2].starts_with("\u{1b}[35mworker\u{1b}[0m  claude  %9"),
+            "{colored}"
+        );
+        assert!(
+            lines[3].starts_with("\u{1b}[2mdone\u{1b}[0m  claude"),
+            "{colored}"
+        );
+        assert_eq!(
+            colored
+                .replace("\u{1b}[35m", "")
+                .replace("\u{1b}[2m", "")
+                .replace("\u{1b}[0m", ""),
+            plain
+        );
+        // The bar paints the same agent the same way.
+        let bar = crate::sidebar::format_board(
+            json!({"running": 1, "endedTotal": 0, "agents": [
+                {"name": "worker", "state": "running", "age": 5, "unread": 0, "color": "magenta"}
+            ]})
+            .as_object(),
+            &[],
+            crate::sidebar::Size {
+                width: 40,
+                height: 9,
+            },
+            crate::sidebar::Look {
+                color: true,
+                ascii: false,
+                dumb: false,
+            },
+        );
+        assert!(bar[2].contains("\u{1b}[35mworker\u{1b}[0m"), "{bar:?}");
+        // JSON is never colored.
+        w.ctx.tty = true;
+        assert!(!call(&w, &["list", "-All"]).1.contains('\u{1b}'));
     }
 
     #[test]

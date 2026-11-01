@@ -95,10 +95,7 @@ fn find_or_open(ctx: &Ctx, caller: &Caller) -> Res<(String, String, bool)> {
 
 /// A board field made safe to draw: C0 (LF included), DEL and C1 removed, so no field moves the cursor or adds a line.
 fn clean(value: Option<&Value>) -> String {
-    text(value)
-        .chars()
-        .filter(|&c| !(c < ' ' || ('\u{7f}'..='\u{9f}').contains(&c)))
-        .collect()
+    paint::clean(&text(value))
 }
 
 /// Whole seconds as 59s, 59m, 23h or 1d; `?` when unknown.

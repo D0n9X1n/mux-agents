@@ -80,6 +80,8 @@ pub struct Ctx {
     pub clock: Box<dyn Clock>,
     // The launcher's pane already passed the sandbox check when it was spawned.
     pub admitted: bool,
+    // Whether stdout is a terminal: `-Text` colors only there (S2.7).
+    pub tty: bool,
 }
 
 #[cfg(test)]

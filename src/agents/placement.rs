@@ -61,7 +61,7 @@ pub fn placement(ctx: &Ctx, request: &Request) -> Res<Map<String, Value>> {
 }
 
 /// `placement <value> (<source>)`.
-pub fn placement_text(reply: &Map<String, Value>) -> String {
+pub fn placement_text(reply: &Map<String, Value>, _color: bool) -> String {
     format!(
         "placement {} ({})",
         text(reply.get("placement")),

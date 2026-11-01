@@ -26,6 +26,13 @@ pub fn ascii(env: &Env) -> bool {
     env.get("MUX_AGENTS_ASCII") == Some("1")
 }
 
+/// Agent text made safe to draw (S2.9): C0 (LF included), DEL and C1 removed, before any escape is added.
+pub fn clean(text: &str) -> String {
+    text.chars()
+        .filter(|&c| !(c < ' ' || ('\u{7f}'..='\u{9f}').contains(&c)))
+        .collect()
+}
+
 /// An SGR style: bold, dim and one of the 16 named colors.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Style {
