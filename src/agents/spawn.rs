@@ -420,6 +420,11 @@ impl Launch<'_> {
             }
             tag_argv.extend(["set-option", "-p", "-t", &new_pane, key, value]);
         }
+        // A split's pane is titled with the name (select-pane -T leaves focus alone); a tab has it from -n, which
+        // turns automatic-rename off for that window.
+        if self.split.is_some() {
+            tag_argv.extend([";", "select-pane", "-T", &agent.name, "-t", &new_pane]);
+        }
         native(ctx, &tag_argv, false)?;
         let parent_agent = match (&caller.agent, caller.client) {
             (Some(parent), Some(client)) => {

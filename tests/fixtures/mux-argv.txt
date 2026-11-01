@@ -28,7 +28,8 @@
 -N list-panes -s -t $3 -F <marker>|#{pane_id}|#{window_id}|#{pane_pid}|#{pane_dead}|#{@agent-id}|#{@agent-name}|<marker>
 # :800, 804
 -N split-window -d -v -P -F #{pane_id}|#{window_id} -t %1 -e MUX_AGENTS_STATE=<state> -c <cwd> <exe> launcher <spec>
--N set-option -p -t %12 @agent-id <id> ; set-option -p -t %12 @agent-name helper ; set-option -p -t %12 @agent-parent %1 ; set-option -p -t %12 @agent-context brief:human
+# 0.2.2: a split's pane is titled with the agent's name in the tag call (focus unchanged); a tab is named by -n
+-N set-option -p -t %12 @agent-id <id> ; set-option -p -t %12 @agent-name helper ; set-option -p -t %12 @agent-parent %1 ; set-option -p -t %12 @agent-context brief:human ; select-pane -T helper -t %12
 -N show-options -qv -t $3 @mux-agents-sidebar
 -N list-panes -s -t $3 -F #{pane_id}|#{window_id}|#{@agent-role}|#{@agent-id}
 -N split-window -d -h -P -F #{pane_id}|#{window_id} -t %1 -e MUX_AGENTS_STATE=<state> -l 42 <exe> watch
@@ -40,7 +41,7 @@
 -N list-panes -s -t $3 -F <marker>|#{pane_id}|#{window_id}|#{pane_pid}|#{pane_dead}|#{@agent-id}|#{@agent-name}|<marker>
 # the stored placement: a split beside the caller, as -Split h
 -N split-window -d -h -P -F #{pane_id}|#{window_id} -t %1 -e MUX_AGENTS_STATE=<state> -c <cwd> <exe> launcher <spec>
--N set-option -p -t %12 @agent-id <id> ; set-option -p -t %12 @agent-name hi ; set-option -p -t %12 @agent-parent %1 ; set-option -p -t %12 @agent-context brief:human
+-N set-option -p -t %12 @agent-id <id> ; set-option -p -t %12 @agent-name hi ; set-option -p -t %12 @agent-parent %1 ; set-option -p -t %12 @agent-context brief:human ; select-pane -T hi -t %12
 # off after sidebar -Close: read, nothing opened
 -N show-options -qv -t $3 @mux-agents-sidebar
 
