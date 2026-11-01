@@ -1103,7 +1103,7 @@ fn readme_skill_name_every_platform_and_mux() {
         .iter()
         .find(|l| l.starts_with("Use this skill inside "))
         .expect("skill's when-to-use line");
-    for word in ["RMUX", "tmux 3.2", "Windows", "Linux", "macOS"] {
+    for word in ["rmux 0.10+ pane (Windows, Linux or macOS)", "tmux 3.2"] {
         assert!(when.contains(word), "skill line lacks {word}: {when}");
     }
 }

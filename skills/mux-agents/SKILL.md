@@ -5,7 +5,7 @@ description: Start Claude Code or Copilot CLI agents in the current RMUX or tmux
 
 ## When to use
 
-Use this skill inside an RMUX pane on Windows or a tmux 3.2+ pane on Linux or macOS; the tool refuses elsewhere.
+Use this skill inside an rmux 0.10+ pane (Windows, Linux or macOS) or a tmux 3.2+ pane (Linux or macOS); the tool refuses elsewhere.
 
 ## Entry
 
