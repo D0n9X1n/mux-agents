@@ -93,6 +93,8 @@
 
 [sidebar]
 -N display-message -p -t %1 #{pid}|#{pane_pid}|#{session_id}|#{window_id}|#{@agent-id}
+# 0.2.1: sidebar turns the bar back on for the session, inside the sidebar lock
+-N set-option -u -t $3 @mux-agents-sidebar
 # :1526
 -N list-panes -s -t $3 -F #{pane_id}|#{window_id}|#{@agent-role}|#{@agent-id}
 # :1578-1579
@@ -102,6 +104,7 @@
 
 [sidebar, -l refused]
 -N display-message -p -t %1 #{pid}|#{pane_pid}|#{session_id}|#{window_id}|#{@agent-id}
+-N set-option -u -t $3 @mux-agents-sidebar
 -N list-panes -s -t $3 -F #{pane_id}|#{window_id}|#{@agent-role}|#{@agent-id}
 -N split-window -d -h -P -F #{pane_id}|#{window_id} -t %1 -e MUX_AGENTS_STATE=<state> -l 42 <exe> watch
 # :1580
@@ -110,6 +113,8 @@
 
 [sidebar -Close]
 -N display-message -p -t %1 #{pid}|#{pane_pid}|#{session_id}|#{window_id}|#{@agent-id}
+# 0.2.1: off first, inside the sidebar lock, so no spawn reopens the bar
+-N set-option -t $3 @mux-agents-sidebar off
 -N list-panes -s -t $3 -F #{pane_id}|#{window_id}|#{@agent-role}|#{@agent-id}
 # :1532
 -N display-message -p -t %13 #{pane_id}|#{window_id}|#{@agent-role}|#{@agent-id}|end
