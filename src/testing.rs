@@ -29,6 +29,9 @@ struct Rule {
 // Sees each lock event (`+key` or `-key`) and answers text to record with it.
 type Probe = Rc<dyn Fn(&str) -> String>;
 
+// Runs after each sleep with how many there have been.
+type Wake = Rc<dyn Fn(usize)>;
+
 // What `stop_report` answers for the rows stop left.
 type Report = fn(&[Left]) -> serde_json::Map<String, serde_json::Value>;
 
@@ -57,6 +60,7 @@ struct Log {
     kills: Vec<u32>,
     report: Option<Report>,
     probe: Option<Probe>,
+    wake: Option<Wake>,
     // Lock keys starting with one of these time out, as a lock held elsewhere for 15 s would.
     timeouts: Vec<String>,
     // What `Mux::kind` answers; none is tmux.
@@ -208,6 +212,11 @@ impl Fakes {
     /// test sees, or changes, state while a lock is held.
     pub fn lock_probe(&self, probe: impl Fn(&str) -> String + 'static) {
         self.0.borrow_mut().probe = Some(Rc::new(probe));
+    }
+
+    /// Runs after every sleep with the count of sleeps so far, so a test changes what the next read sees.
+    pub fn sleep_probe(&self, probe: impl Fn(usize) + 'static) {
+        self.0.borrow_mut().wake = Some(Rc::new(probe));
     }
 
     /// Every later lock whose key starts with `prefix` times out (recorded as `!key`) without running its body.
@@ -402,10 +411,17 @@ impl Clock for Fakes {
     }
 
     fn sleep(&self, duration: Duration) {
-        let mut log = self.0.borrow_mut();
-        let ms = duration.as_millis() as u64;
-        log.slept.push(ms);
-        log.now_ms += ms;
+        let wake = {
+            let mut log = self.0.borrow_mut();
+            let ms = duration.as_millis() as u64;
+            log.slept.push(ms);
+            log.now_ms += ms;
+            log.wake.clone().map(|wake| (wake, log.slept.len()))
+        };
+        // The log is released first, so the probe may read the fakes.
+        if let Some((wake, count)) = wake {
+            wake(count);
+        }
     }
 }
 

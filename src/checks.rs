@@ -240,23 +240,38 @@ fn permission_mode_line(line: &str) -> bool {
     })
 }
 
+// A read that finds no mode yet (a transcript or a footer being written) is tried this often, this far apart.
+const MODE_READS: usize = 3;
+const MODE_RETRY: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// `read` until it answers anything but `Err(retry)`, at most `MODE_READS` times; its last answer.
+fn retried(
+    ctx: &Ctx,
+    retry: &'static str,
+    read: impl Fn() -> Res<Result<(), &'static str>>,
+) -> Res<Result<(), &'static str>> {
+    let mut answer = read()?;
+    for _ in 1..MODE_READS {
+        if answer != Err(retry) {
+            break;
+        }
+        ctx.clock.sleep(MODE_RETRY);
+        answer = read()?;
+    }
+    Ok(answer)
+}
+
 /// Claude: the latest transcript permission-mode, then the pane's mode line, which catches a Shift+Tab the
-/// transcript has not recorded yet. `Err` names the half that is not bypass and why.
+/// transcript has not recorded yet. `Err` names the half that is not bypass and why. Only a missing mode is read
+/// again; anything else is final.
 fn claude_policy(ctx: &Ctx, caller: &Caller) -> Res<Result<(), &'static str>> {
     let session = ctx.env.get("CLAUDE_CODE_SESSION_ID").unwrap_or("");
     if !session_id(session) {
         return Ok(Err("transcript: no session id"));
     }
-    let Some(transcript) = claude_transcript(&ctx.home, session)? else {
-        return Ok(Err("transcript: not found"));
-    };
-    // A transcript no decoder accepts shows no mode, like one without a permission-mode line.
-    let Scan::Found(line) = last_line(&transcript, r#""permission-mode""#, permission_mode_line)?
-    else {
-        return Ok(Err("transcript: no mode"));
-    };
-    if !line.starts_with(r#"{"type":"permission-mode","permissionMode":"bypassPermissions""#) {
-        return Ok(Err("transcript: other mode"));
+    let transcript = retried(ctx, "transcript: no mode", || transcript_mode(ctx, session))?;
+    if transcript.is_err() {
+        return Ok(transcript);
     }
     let pane = caller.pane.as_str();
     let size = crate::mux::native(
@@ -274,6 +289,27 @@ fn claude_policy(ctx: &Ctx, caller: &Caller) -> Res<Result<(), &'static str>> {
     if height < 3 {
         return Ok(Ok(()));
     }
+    retried(ctx, "screen: no mode line", || pane_mode(ctx, pane))
+}
+
+/// Whether the session's transcript last recorded bypass.
+fn transcript_mode(ctx: &Ctx, session: &str) -> Res<Result<(), &'static str>> {
+    let Some(transcript) = claude_transcript(&ctx.home, session)? else {
+        return Ok(Err("transcript: not found"));
+    };
+    // A transcript no decoder accepts shows no mode, like one without a permission-mode line.
+    let Scan::Found(line) = last_line(&transcript, r#""permission-mode""#, permission_mode_line)?
+    else {
+        return Ok(Err("transcript: no mode"));
+    };
+    if !line.starts_with(r#"{"type":"permission-mode","permissionMode":"bypassPermissions""#) {
+        return Ok(Err("transcript: other mode"));
+    }
+    Ok(Ok(()))
+}
+
+/// Whether the pane's lowest mode line is bypass.
+fn pane_mode(ctx: &Ctx, pane: &str) -> Res<Result<(), &'static str>> {
     // -J gives back a footer the pane's width wrapped as one row.
     let screen = crate::mux::native(ctx, &["capture-pane", "-p", "-J", "-t", pane], true)?;
     if screen.code != 0 {
@@ -1944,6 +1980,111 @@ mod tests {
             ..Claude::default()
         };
         assert_eq!(claude_policy(case), "true");
+    }
+
+    // capture-pane answers `screens` in turn, the last repeating.
+    fn screens_in_turn(fakes: &Fakes, screens: &[String]) {
+        let screens = screens.to_vec();
+        let next = std::cell::Cell::new(0);
+        fakes.mux_script("capture-pane", move |_| {
+            let n = next.get();
+            next.set(n + 1);
+            Ok(crate::mux::Output {
+                code: 0,
+                stdout: screens[n.min(screens.len() - 1)].clone(),
+                stderr: String::new(),
+            })
+        });
+    }
+
+    fn captures(fakes: &Fakes) -> usize {
+        fakes
+            .mux_calls()
+            .iter()
+            .filter(|c| c[1] == "capture-pane")
+            .count()
+    }
+
+    #[test]
+    fn policy_claude_retries_only_a_missing_mode() {
+        let (work, badge) = ("work\n".to_string(), format!("{BYPASS}\n"));
+        // No mode row on any read: 3 captures, 250 ms apart.
+        let (_home, fakes, ctx) = claude_setup(&Claude::default());
+        screens_in_turn(&fakes, std::slice::from_ref(&work));
+        assert_eq!(claude_answer(&ctx), "screen: no mode line");
+        assert_eq!((captures(&fakes), fakes.slept()), (3, vec![250, 250]));
+        // A footer drawn by the second read passes.
+        let (_home, fakes, ctx) = claude_setup(&Claude::default());
+        screens_in_turn(&fakes, &[work.clone(), badge.clone()]);
+        assert_eq!(claude_answer(&ctx), "true");
+        assert_eq!((captures(&fakes), fakes.slept()), (2, vec![250]));
+        // A transcript with no mode line on any read: 3 reads, 2 sleeps, and the pane is never asked.
+        let empty = Claude {
+            transcript: vec![],
+            ..Claude::default()
+        };
+        let (_home, fakes, ctx) = claude_setup(&empty);
+        assert_eq!(claude_answer(&ctx), "transcript: no mode");
+        assert_eq!(fakes.slept(), [250, 250]);
+        assert!(fakes.mux_calls().is_empty());
+        // A mode line written after the first or the second sleep is read, and the screen decides next.
+        for after in [1, 2] {
+            let (home, fakes, ctx) = claude_setup(&empty);
+            let transcript = home.path().join(format!(".claude/projects/p0/{SID}.jsonl"));
+            fakes.sleep_probe(move |count| {
+                if count == after {
+                    std::fs::write(&transcript, mode("bypassPermissions") + "\n").unwrap();
+                }
+            });
+            assert_eq!(claude_answer(&ctx), "true", "{after}");
+            assert_eq!(fakes.slept(), vec![250; after], "{after}");
+            assert_eq!(captures(&fakes), 1, "{after}");
+        }
+        // Every other outcome is final: one read, no sleep.
+        for (case, reason) in [
+            (
+                Claude {
+                    sid: "",
+                    ..Claude::default()
+                },
+                "transcript: no session id",
+            ),
+            (
+                Claude {
+                    folders: 0,
+                    ..Claude::default()
+                },
+                "transcript: not found",
+            ),
+            (
+                Claude {
+                    transcript: vec![mode("default")],
+                    ..Claude::default()
+                },
+                "transcript: other mode",
+            ),
+            (
+                Claude {
+                    screen: None,
+                    ..Claude::default()
+                },
+                "screen: unreadable",
+            ),
+            (
+                Claude {
+                    screen: Some("⏸ plan mode on\n".into()),
+                    ..Claude::default()
+                },
+                "screen: other mode",
+            ),
+        ] {
+            // A screen reason read the pane once; a transcript reason never reached it.
+            let screen = reason.starts_with("screen");
+            let (_home, fakes, ctx) = claude_setup(&case);
+            assert_eq!(claude_answer(&ctx), reason);
+            assert_eq!(fakes.slept(), Vec::<u64>::new(), "{reason}");
+            assert_eq!(captures(&fakes), usize::from(screen), "{reason}");
+        }
     }
 
     #[test]
