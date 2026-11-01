@@ -163,17 +163,24 @@ pub fn private_dirs_with(steps: &dyn Steps, root: &Path, paths: &[&Path]) -> Res
 }
 
 // Creates `path` when nothing is there; whether it did. An existing entry, link or not, is left for the
-// caller's check. Once mkdir succeeded chmod reaches that folder: its parent was checked first (ours at
-// 0700, or sticky), so no other user can rename or replace it.
+// caller's check, which lstats it again. So is one another mux-agent made between our lstat and our mkdir
+// (EEXIST): it gets the same check as any existing entry, never less. Once mkdir succeeded chmod reaches that
+// folder: its parent was checked first (ours at 0700, or sticky), so no other user can rename or replace it.
 fn new_dir(steps: &dyn Steps, path: &Path) -> Res<bool> {
+    let cannot = || refuse(1, "state", "the state folder cannot be created");
     let Ok(stat) = steps.lstat(path) else {
         return refuse(1, "state", CHECKED);
     };
     if stat.kind != Kind::Missing {
         return Ok(false);
     }
-    if steps.mkdir(path).and_then(|()| steps.chmod(path)).is_err() {
-        return refuse(1, "state", "the state folder cannot be created");
+    match steps.mkdir(path) {
+        Ok(()) => {}
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => return Ok(false),
+        Err(_) => return cannot(),
+    }
+    if steps.chmod(path).is_err() {
+        return cannot();
     }
     Ok(true)
 }
@@ -788,28 +795,100 @@ pub(crate) mod tests {
         assert_eq!(message(private_dirs_with(&steps, &root, &[&root])), CHECKED);
     }
 
+    // Another mux-agent makes `self.0` between our lstat and our mkdir: `plant` runs, then the real mkdir(2)
+    // fails with EEXIST.
+    struct Concurrent<'a>(&'a Path, &'a dyn Fn(&Path));
+    impl Steps for Concurrent<'_> {
+        fn mkdir(&self, path: &Path) -> io::Result<()> {
+            if path == self.0 {
+                (self.1)(path);
+            }
+            Real.mkdir(path)
+        }
+    }
+
     // UnixState.Tests.ps1:374: mkdir(2) fails on a link put there after the entry check; nothing follows it.
+    // The link then gets the check any existing entry gets, which refuses it as a link.
     #[test]
     fn link_appears_before_mkdir_refuses_no_create() {
-        struct PlantLink<'a>(&'a Path);
-        impl Steps for PlantLink<'_> {
-            fn mkdir(&self, path: &Path) -> io::Result<()> {
-                symlink(self.0, path)?;
-                Real.mkdir(path)
-            }
-        }
         let dir = TempDir::new();
         let target = dir.path().join("target");
         mkdir_mode(&target, 0o755);
         let k = dir.path().join("k");
-        let steps = PlantLink(&target);
+        let plant = |path: &Path| symlink(&target, path).unwrap();
+        let steps = Concurrent(&k, &plant);
         assert_eq!(
-            message(private_dirs_with(&steps, &k, &[&k])),
-            "the state folder cannot be created"
+            message(private_dirs_with(&steps, &k, &[&k, &k.join("agents")])),
+            LINK
         );
         assert_eq!(mode(&target), Some(0o755));
         assert_eq!(std::fs::read_dir(&target).unwrap().count(), 0);
         assert_eq!(std::fs::read_link(&k).unwrap(), target);
+    }
+
+    // Parallel spawns and lists race to make the same folder: the loser's mkdir fails with EEXIST. That is
+    // not a refusal; what the winner made gets the check an existing folder gets, so a private one passes and
+    // the walk goes on inside it, while a wide one still refuses.
+    #[test]
+    fn made_concurrently_is_checked_as_existing() {
+        for (bits, want) in [
+            (0o700, "ok"),
+            (0o755, "the state folder mode is 755, not 700"),
+        ] {
+            let dir = TempDir::new();
+            let root = dir.path().join("state");
+            let plant = |path: &Path| mkdir_mode(path, bits);
+            let steps = Concurrent(&root, &plant);
+            let agents = root.join("agents");
+            let got = message(private_dirs_with(&steps, &root, &[&root, &agents]));
+            assert_eq!(got, want, "{bits:o}");
+            assert_eq!(mode(&root), Some(bits), "{bits:o}");
+            let made = (want == "ok").then_some(0o700);
+            assert_eq!(mode(&agents), made, "{bits:o}");
+        }
+    }
+
+    // A folder above the root made concurrently gets the parent check an existing one gets.
+    #[test]
+    fn ancestor_made_concurrently_is_checked_as_existing() {
+        let open = "a folder above the state folder is writable by others";
+        for (bits, want) in [(0o700, "ok"), (0o755, "ok"), (0o777, open)] {
+            let dir = TempDir::new();
+            let above = dir.path().join("above");
+            let root = above.join("state");
+            let plant = |path: &Path| mkdir_mode(path, bits);
+            let steps = Concurrent(&above, &plant);
+            let got = message(private_dirs_with(&steps, &root, &[&root]));
+            assert_eq!(got, want, "{bits:o}");
+            let made = (want == "ok").then_some(0o700);
+            assert_eq!(mode(&root), made, "{bits:o}");
+        }
+    }
+
+    // Any other mkdir failure, and a chmod failing after our own mkdir, still refuse.
+    #[test]
+    fn mkdir_or_chmod_failure_refuses() {
+        struct Fail(bool);
+        impl Steps for Fail {
+            fn mkdir(&self, path: &Path) -> io::Result<()> {
+                if self.0 {
+                    return Err(io::Error::from(io::ErrorKind::PermissionDenied));
+                }
+                Real.mkdir(path)
+            }
+            fn chmod(&self, _: &Path) -> io::Result<()> {
+                Err(io::Error::from(io::ErrorKind::PermissionDenied))
+            }
+        }
+        for mkdir_fails in [true, false] {
+            let dir = TempDir::new();
+            let root = dir.path().join("state");
+            assert_eq!(
+                message(private_dirs_with(&Fail(mkdir_fails), &root, &[&root])),
+                "the state folder cannot be created",
+                "{mkdir_fails}"
+            );
+        }
     }
 
     #[cfg(target_os = "macos")]

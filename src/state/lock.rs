@@ -169,13 +169,19 @@ pub(crate) fn with_lock_in<T>(
     }
     crate::state::private_unix::private_dirs(root, &[root])?;
     let file = open_lock(&lock_path(root, key))?;
+    // The wait is clock time, as .NET's WaitOne(15000) is: on a loaded machine a 10 ms sleep can take far
+    // longer. Each back-off counts what the clock moved, never less than BACK_OFF, so a clock that stands
+    // still or is set back still refuses after wait / BACK_OFF back-offs.
     let mut waited = Duration::ZERO;
+    let mut last = ctx.clock.now();
     loop {
         match file.try_lock() {
             Ok(()) => break,
             Err(TryLockError::WouldBlock) if waited < wait => {
                 ctx.clock.sleep(BACK_OFF);
-                waited += BACK_OFF;
+                let now = ctx.clock.now();
+                waited += now.duration_since(last).unwrap_or_default().max(BACK_OFF);
+                last = now;
             }
             Err(TryLockError::WouldBlock) => return timed_out(),
             Err(TryLockError::Error(e)) => return Err(e.into()),
@@ -573,6 +579,62 @@ mod tests {
             );
             assert!(!ran.get());
             assert_eq!(fakes.slept(), vec![10; 1500]);
+            holder.unlock().unwrap();
+        }
+
+        // A clock whose every back-off moves `now` by `step_ms` (negative: backwards), whatever was asked: a
+        // loaded machine where each 10 ms sleep overruns, or a clock that is set back. It counts its sleeps.
+        #[derive(Clone)]
+        struct Skewed(std::rc::Rc<(Cell<i64>, Cell<u32>)>, i64);
+
+        impl crate::ctx::Clock for Skewed {
+            fn now(&self) -> std::time::SystemTime {
+                let base = std::time::UNIX_EPOCH + Duration::from_secs(1_000_000);
+                let ms = self.0.0.get();
+                if ms >= 0 {
+                    base + Duration::from_millis(ms as u64)
+                } else {
+                    base - Duration::from_millis(ms.unsigned_abs())
+                }
+            }
+
+            fn sleep(&self, _: Duration) {
+                self.0.1.set(self.0.1.get() + 1);
+                self.0.0.set(self.0.0.get() + self.1);
+            }
+        }
+
+        // The wait is 15 s of clock time, as .NET's WaitOne(15000) is, not 1500 sleeps: when each 10 ms
+        // sleep takes 40 ms it refuses after 375. A clock that stands still or goes back never makes it
+        // endless: each back-off counts at least 10 ms, so it refuses after 1500 at most.
+        #[test]
+        fn wait_counts_clock_time_not_back_offs() {
+            let dir = TempDir::new();
+            let root = dir.path().join("locks");
+            let fakes = Fakes::default();
+            assert_eq!(
+                with_lock_in(&fakes.ctx(), &root, "k", LOCK_WAIT, || Ok(())),
+                Ok(())
+            );
+            let holder = File::open(lock_path(&root, "k")).unwrap();
+            holder.lock().unwrap();
+            for (step_ms, sleeps) in [(40, 375), (10, 1500), (0, 1500), (-1000, 1500)] {
+                let clock = Skewed(Default::default(), step_ms);
+                let mut ctx = fakes.ctx();
+                ctx.clock = Box::new(clock.clone());
+                let ran = Cell::new(false);
+                let refused = with_lock_in(&ctx, &root, "k", LOCK_WAIT, || {
+                    ran.set(true);
+                    Ok(())
+                });
+                assert_eq!(
+                    refusal(refused),
+                    (2, "lock", "timed out waiting for the agent lock".into()),
+                    "{step_ms}"
+                );
+                assert!(!ran.get());
+                assert_eq!(clock.0.1.get(), sleeps, "{step_ms}");
+            }
             holder.unlock().unwrap();
         }
 
