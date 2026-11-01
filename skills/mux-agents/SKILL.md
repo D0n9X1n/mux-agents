@@ -19,7 +19,8 @@ The commands below, and the Reply and Listen lines, run as-is in the Bash tool. 
 - Agent callers always pass `-BriefFile`, because a fork can fall back to brief-only.
 - Report results to your parent with `send parent`.
 - As a spawned agent, run `status -BodyFile <file>` each time you start a step of your task.
-- In Copilot CLI, run `sidebar` once after your first `spawn`: a narrow pane beside you shows how many agents run and what each is doing. `sidebar -Close` closes it.
+- When the user wants agents as tabs first, run `placement tab`; as panes first, run `placement h` (or `v`). It lasts for the session.
+- The first `spawn` opens a narrow side bar beside you showing how many agents run and what each is doing. `sidebar -Close` closes it for the session; `sidebar` opens it again.
 - Never type into panes.
 - Run `focus` only when the user asks.
 - Children cannot spawn.
@@ -28,6 +29,8 @@ The commands below, and the Reply and Listen lines, run as-is in the Bash tool. 
 
 ```
 "<entry>" spawn -Client <client> -TaskFile <task-file> -BriefFile <brief-file>
+"<entry>" placement tab|h|v
+"<entry>" placement
 "<entry>" list
 "<entry>" list -All
 "<entry>" focus <name>
@@ -41,7 +44,7 @@ The commands below, and the Reply and Listen lines, run as-is in the Bash tool. 
 "<entry>" sidebar -Close
 ```
 
-`spawn` also takes `-Name <name>`, `-Split h|v` (split your pane instead of a new window) and `-NoFork`.
+`spawn` opens where `placement` says (a new window by default). It also takes `-Name <name>`, `-Split h|v` or `-Tab` (this spawn only, over the placement) and `-NoFork`.
 
 `list` shows each live agent's state, what it is doing and its unread count; `list -All` adds the ended agents (at most 10, newest first).
 
