@@ -1112,6 +1112,58 @@ fn readme_skill_name_every_platform_and_mux() {
     }
 }
 
+// Terminal CLI only (#43): the skill says where to skip it and forbids forcing it to apply; the README and both wiki
+// Usage pages state the rule and name the desktop app.
+#[test]
+fn skill_readme_and_wiki_say_terminal_cli_only() {
+    let skill = file_lines("skills/mux-agents/SKILL.md");
+    let description = skill
+        .iter()
+        .find(|l| l.starts_with("description: "))
+        .expect("SKILL.md's description");
+    assert!(
+        description.starts_with("description: Terminal CLI only:")
+            && description.contains("tmux")
+            && description.contains("rmux"),
+        "SKILL.md's description: {description}"
+    );
+    let start = skill
+        .iter()
+        .position(|l| l == "## When to use")
+        .expect("SKILL.md's When to use");
+    let when: String = skill[start + 1..]
+        .iter()
+        .take_while(|l| !l.starts_with("## "))
+        .map(|l| format!("{l}\n"))
+        .collect();
+    for needle in [
+        "Claude Code desktop app",
+        "web or cloud sessions",
+        "IDE chat panels",
+        "GitHub Copilot app",
+        "headless or SDK runs",
+        "Never start a multiplexer or set variables to make it apply",
+        "integrated terminal",
+    ] {
+        assert!(
+            when.contains(needle),
+            "SKILL.md's When to use lacks {needle:?}: {when}"
+        );
+    }
+    for (path, rule, desktop) in [
+        ("README.md", "Terminal CLI only", "desktop app"),
+        ("wiki/Usage.md", "Terminal CLI only", "desktop app"),
+        ("wiki/Usage-zh-CN.md", "仅限终端 CLI", "桌面应用"),
+    ] {
+        assert!(
+            file_lines(path)
+                .iter()
+                .any(|l| l.contains(rule) && l.contains(desktop)),
+            "{path} does not state {rule:?} naming {desktop:?}"
+        );
+    }
+}
+
 #[test]
 fn skill_always_names_its_agents() {
     // Callers always pass -Name with a short kebab name, and the spawn example in the Commands block shows it.
