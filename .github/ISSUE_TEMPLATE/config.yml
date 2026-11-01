@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Security vulnerability
+    url: https://github.com/D0n9X1n/mux-agents/security/advisories/new
+    about: Report it privately, never in a public issue.
+  - name: Usage and troubleshooting
+    url: https://github.com/D0n9X1n/mux-agents/wiki/Usage
+    about: Commands, the side bar, safety checks, upgrades and what each refusal means.
