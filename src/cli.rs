@@ -650,6 +650,9 @@ mod tests {
             path: Some(exe.clone()),
             argv: Some(vec![exe, "watch".into()]),
         });
+        // The proof read of the bar: alive, running 113.
+        w.fakes
+            .mux_rule("#{pane_dead}|#{pane_pid}", 0, "%13|@1|0|113\n", "");
     }
 
     #[test]
@@ -759,13 +762,24 @@ mod tests {
         w.fakes.mux_rule("#{pane_id}|#{pane_pid}", 0, "|\n", "");
         record(&w, "sidebar -Close", &["sidebar", "-Close"], 0);
         // watch draws only to a terminal, so its one frame is drawn through watch_on; a closed output ends it. The
-        // pane answers its probe and the record names it and this process (4242), so the frame reads its window's
-        // layout first.
+        // pane answers its probe, the record names it, this process (4242, `<exe> watch`) and its start, and the
+        // proof read shows the pane running 4242, so the frame reads its window's layout first.
         let w = World::human("");
+        let exe = w.ctx.exe.display().to_string();
+        w.fakes.forget(4242);
+        w.fakes.process(crate::proc::Row {
+            pid: 4242,
+            ppid: crate::agents::fixture::SHELL,
+            start: Some(2000),
+            path: Some(exe.clone()),
+            argv: Some(vec![exe, "watch".into()]),
+        });
         w.fakes
             .mux_rule("#{pane_id}|#{@agent-role}", 0, "%1|sidebar\n", "");
         w.fakes
-            .mux_rule("@mux-agents-sidebar-id", 0, "%1 4242 1\n", "");
+            .mux_rule("@mux-agents-sidebar-id", 0, "%1 4242 2000\n", "");
+        w.fakes
+            .mux_rule("#{pane_dead}|#{pane_pid}", 0, "%1|@1|0|4242\n", "");
         w.fakes.clear_log();
         let request = w.request(&["watch"]);
         let reply = crate::sidebar::watch_on(&w.ctx, &request, true, &mut |_| {

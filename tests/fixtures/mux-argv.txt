@@ -32,6 +32,8 @@
 -N set-option -t $3 @mux-agents-sidebar-id '%13 113 1130'
 # rmux ignores -l, so the bar is sized again
 -N resize-pane -t %13 -x 40
+# 0.2.3 (#47): proven last, so a pane replaced during open is never reported as the bar
+-N display-message -p -t %13 #{pane_id}|#{window_id}|#{pane_dead}|#{pane_pid}
 
 [spawn -Client copilot -Task hi -Split v -Name helper]
 -N display-message -p -t %1 #{pid}|#{pane_pid}|#{session_id}|#{window_id}|#{@agent-id}
@@ -52,6 +54,8 @@
 -N set-option -t $3 @mux-agents-sidebar-id '%13 113 1130'
 # rmux ignores -l, so the bar is sized again
 -N resize-pane -t %13 -x 40
+# 0.2.3 (#47): proven last, so a pane replaced during open is never reported as the bar
+-N display-message -p -t %13 #{pane_id}|#{window_id}|#{pane_dead}|#{pane_pid}
 
 [spawn -Client claude -Task hi, placement h, side bar off]
 -N display-message -p -t %1 #{pid}|#{pane_pid}|#{session_id}|#{window_id}|#{@agent-id}
@@ -152,6 +156,8 @@
 # 0.2.3 (#47): pid 113 is this binary `watch`, so the bar is recorded as <pane> <pid> <start>
 -N set-option -t $3 @mux-agents-sidebar-id '%13 113 1130'
 -N resize-pane -t %13 -x 40
+# 0.2.3 (#47): proven last, so a pane replaced during open is never reported as the bar
+-N display-message -p -t %13 #{pane_id}|#{window_id}|#{pane_dead}|#{pane_pid}
 
 [sidebar, -l refused]
 -N display-message -p -t %1 #{pid}|#{pane_pid}|#{session_id}|#{window_id}|#{@agent-id}
@@ -168,6 +174,8 @@
 -N set-option -t $3 @mux-agents-sidebar-id '%13 113 1130'
 # the multiplexer chose the width, so the resize sets it
 -N resize-pane -t %13 -x 40
+# 0.2.3 (#47): proven last, so a pane replaced during open is never reported as the bar
+-N display-message -p -t %13 #{pane_id}|#{window_id}|#{pane_dead}|#{pane_pid}
 
 [sidebar -Close]
 -N display-message -p -t %1 #{pid}|#{pane_pid}|#{session_id}|#{window_id}|#{@agent-id}
@@ -187,7 +195,9 @@
 -N display-message -p -t %1 #{pid}|#{pane_pid}|#{session_id}|#{window_id}|#{@agent-id}
 # :1482
 -N display-message -p -t %1 #{pane_id}|#{@agent-role}
-# 0.2.3 (S1, #47): only the watch the record names, by its own pane and process, reads its window and repairs it
+# 0.2.3 (S1, #47): only the watch the record names, by its own pane and process, reads its window and repairs it;
+# the record is proven like any other: its pane runs this watch's pid, and the pid is this watch with that start
 -N show-options -qv -t $3 @mux-agents-sidebar-id
+-N display-message -p -t %1 #{pane_id}|#{window_id}|#{pane_dead}|#{pane_pid}
 -N list-panes -t %1 -F #{pane_id}|#{pane_active}|#{pane_at_right}|#{pane_at_top}|#{pane_at_bottom}|#{pane_width}|#{window_width}|#{pane_left}|#{pane_top}|#{window_zoomed_flag}
 -N list-panes -s -t $3 -F <marker>|#{pane_id}|#{window_id}|#{pane_pid}|#{pane_dead}|#{@agent-id}|#{@agent-name}|<marker>

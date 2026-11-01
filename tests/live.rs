@@ -1919,6 +1919,78 @@ exec claude --dangerously-skip-permissions
         live.call(&["send-keys", "-t", &root, "C-c"]);
     }
 
+    // T9 test 5, live: a bar replaced between a passing proof and the kill survives the exact pid-bound conditional
+    // kill the code sends (`kill_command`), its pane read again shows the replacement, and -Close then refuses it.
+    fn replaced_between_proof_and_kill_survives(mux: Mux) {
+        let Some(mut live) = Live::human(mux) else {
+            return;
+        };
+        let bar = live.open_bar();
+        let (code, open) = live.run(&["sidebar"]);
+        assert_eq!(
+            (code, &open["opened"], &open["pane"]),
+            (0, &json!(false), &json!(bar)),
+            "{mux:?}: the bar is not proven: {open}"
+        );
+        let pid: u32 = live.field(&bar, "#{pane_pid}").parse().unwrap();
+        live.call(&["respawn-pane", "-k", "-t", &bar, "sleep", "1000"]);
+        let new = live.field(&bar, "#{pane_pid}");
+        assert_ne!(new, pid.to_string(), "{mux:?}");
+        let kill = mux_agent::sidebar::kill_command(&bar, pid);
+        let kill: Vec<&str> = kill.iter().map(String::as_str).collect();
+        live.call(&kill);
+        assert_eq!(
+            live.field(&bar, mux_agent::sidebar::GONE_FORMAT),
+            format!("{bar}|{new}"),
+            "{mux:?}: the replacement was killed"
+        );
+        let (code, close) = live.run(&["sidebar", "-Close"]);
+        assert_eq!(code, 1, "{mux:?} {close}");
+        assert!(
+            s(&close["message"]).starts_with(&format!("pane {bar} carries the side-bar label")),
+            "{mux:?} {close}"
+        );
+        assert!(live.panes("#{pane_id}").contains(&bar), "{mux:?}");
+    }
+
+    // T9-QA 2, live: a record forged for a watch run by hand, naming its own pane and its own pid with a stale start
+    // or its real one, proves nothing: that pane runs the shell, not the watch. The manual watch moves nothing.
+    fn forged_record_does_not_make_a_manual_watch_keep(mux: Mux) {
+        let Some(mut live) = Live::human(mux) else {
+            return;
+        };
+        let root = live.server.pane().to_string();
+        live.split(&root, &["-h"]);
+        let before = geometry(&live);
+        manual_watch(&mut live, &root);
+        let shell = live.field(&root, "#{pane_pid}");
+        let found = Command::new("pgrep")
+            .args(["-P", &shell, "-f", "watch"])
+            .output()
+            .unwrap();
+        let watch: u32 = String::from_utf8_lossy(&found.stdout)
+            .trim()
+            .parse()
+            .unwrap_or_else(|_| panic!("{mux:?}: no manual watch under {shell}: {found:?}"));
+        let start = mux_agent::proc::host()
+            .row(watch)
+            .and_then(|row| row.start)
+            .unwrap();
+        let session = live.field(&root, "#{session_id}");
+        for stamp in [1, start] {
+            let record = format!("{root} {watch} {stamp}");
+            live.call(&[
+                "set-option",
+                "-t",
+                &session,
+                "@mux-agents-sidebar-id",
+                &record,
+            ]);
+            stays(&live, &before);
+        }
+        live.call(&["send-keys", "-t", &root, "C-c"]);
+    }
+
     /// Runs `mux-agent watch` by hand in `pane`'s shell and waits until it has drawn.
     fn manual_watch(live: &mut Live, pane: &str) {
         let line = format!(
@@ -2869,6 +2941,8 @@ exec claude --dangerously-skip-permissions
                     unproven_label_in_another_window_refuses,
                     manual_watch_moves_nothing,
                     manual_watch_without_a_bar_moves_nothing,
+                    replaced_between_proof_and_kill_survives,
+                    forged_record_does_not_make_a_manual_watch_keep,
                     list_all_json_shape,
                     agent_caller_forks_with_bypass_evidence,
                     spawn_model_recorded_and_listed,

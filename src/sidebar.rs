@@ -26,7 +26,7 @@ const SPLIT_FORMAT: &str = "#{pane_id}|#{window_id}|#{pane_pid}";
 // The proof read of the recorded pane: alive, and still the recorded process.
 const PROOF_FORMAT: &str = "#{pane_id}|#{window_id}|#{pane_dead}|#{pane_pid}";
 // The re-read after a conditional kill: a gone pane answers empty fields.
-const GONE_FORMAT: &str = "#{pane_id}|#{pane_pid}";
+pub const GONE_FORMAT: &str = "#{pane_id}|#{pane_pid}";
 // Each pane of the session and whether it carries the side-bar label, compared by the server: a label value with a
 // newline or `|` cannot forge a line.
 const LABEL_FORMAT: &str = "#{pane_id}|#{==:#{@agent-role},sidebar}";
@@ -613,31 +613,32 @@ fn prove(ctx: &Ctx, caller: &Caller) -> Res<Option<Proven>> {
         return Ok(None);
     };
     for _ in 0..2 {
-        let Some(read) = native(
-            ctx,
-            &["display-message", "-p", "-t", &pane, PROOF_FORMAT],
-            true,
-        )
-        .ok()
-        .filter(|read| read.code == 0) else {
-            continue;
-        };
-        let answer = read.stdout.trim_end_matches(['\r', '\n']);
-        let fields: Vec<&str> = answer.split('|').collect();
-        let alive = fields.len() == 4
-            && fields[0] == pane
-            && window_id(fields[1])
-            && fields[2] == "0"
-            && fields[3] == pid.to_string();
-        if alive && watch_start(ctx, pid).is_some_and(|now| ctx.os.same_start(now, start)) {
-            return Ok(Some(Proven {
-                pane,
-                window: fields[1].to_string(),
-                pid,
-            }));
+        if let Some(window) = proven(ctx, &pane, pid, start) {
+            return Ok(Some(Proven { pane, window, pid }));
         }
     }
     Ok(None)
+}
+
+/// One proof of `<pane> <pid> <start>`: a read of the pane shows it alive running `pid`, and `pid` is alive with
+/// `start`, still this binary `watch`. Answers the pane's window.
+fn proven(ctx: &Ctx, pane: &str, pid: u32, start: i64) -> Option<String> {
+    let read = native(
+        ctx,
+        &["display-message", "-p", "-t", pane, PROOF_FORMAT],
+        true,
+    )
+    .ok()
+    .filter(|read| read.code == 0)?;
+    let answer = read.stdout.trim_end_matches(['\r', '\n']);
+    let fields: Vec<&str> = answer.split('|').collect();
+    let alive = fields.len() == 4
+        && fields[0] == pane
+        && window_id(fields[1])
+        && fields[2] == "0"
+        && fields[3] == pid.to_string();
+    (alive && watch_start(ctx, pid).is_some_and(|now| ctx.os.same_start(now, start)))
+        .then(|| fields[1].to_string())
 }
 
 /// The session's panes, in every window, that carry the side-bar label.
@@ -681,7 +682,8 @@ pub(crate) fn unproven(panes: &[String]) -> String {
     )
 }
 
-/// Whether this watch is the session's recorded bar: the record names its own pane and its own process. Only then
+/// Whether this watch is the session's recorded bar: the record names its own pane and its own pid, and the full
+/// proof holds (its pane runs that pid, alive; the pid is this binary `watch` with the recorded start). Only then
 /// does it keep the layout; a watch run any other way only draws.
 fn own_record(ctx: &Ctx, caller: &Caller) -> bool {
     native(
@@ -692,7 +694,9 @@ fn own_record(ctx: &Ctx, caller: &Caller) -> bool {
     .ok()
     .filter(|read| read.code == 0)
     .and_then(|read| parse_record(read.stdout.trim_end_matches(['\r', '\n'])))
-    .is_some_and(|(pane, pid, _)| pane == caller.pane && pid == ctx.pid)
+    .is_some_and(|(pane, pid, start)| {
+        pane == caller.pane && pid == ctx.pid && proven(ctx, &pane, pid, start).is_some()
+    })
 }
 
 /// Whether a failed split refused only its -l size, by the multiplexer's own words: rmux 0.10.0 "invalid split size
@@ -713,15 +717,27 @@ pub(crate) fn size_refusal(result: &Output) -> bool {
 /// Kills `pane` only while it is alive and still runs `pid`, checked by the server in the same command, then reads
 /// the pane again: true only when it is gone. `if-shell -F` answers 0 whether or not the kill ran.
 fn kill_bar(ctx: &Ctx, pane: &str, pid: u32) -> bool {
-    let check = format!("#{{&&:#{{==:#{{pane_dead}},0}},#{{==:#{{pane_pid}},{pid}}}}}");
-    let kill = format!("kill-pane -t {pane}");
-    let _ = native(ctx, &["if-shell", "-F", "-t", pane, &check, &kill], true);
+    let kill = kill_command(pane, pid);
+    let kill: Vec<&str> = kill.iter().map(String::as_str).collect();
+    let _ = native(ctx, &kill, true);
     native(
         ctx,
         &["display-message", "-p", "-t", pane, GONE_FORMAT],
         true,
     )
     .is_ok_and(|probe| gone(&probe))
+}
+
+/// The conditional kill of `pane`: the server kills it only while it is alive and still runs `pid`.
+pub fn kill_command(pane: &str, pid: u32) -> Vec<String> {
+    vec![
+        "if-shell".into(),
+        "-F".into(),
+        "-t".into(),
+        pane.into(),
+        format!("#{{&&:#{{==:#{{pane_dead}},0}},#{{==:#{{pane_pid}},{pid}}}}}"),
+        format!("kill-pane -t {pane}"),
+    ]
 }
 
 /// The split's answer: pane, window and pid.
@@ -753,7 +769,8 @@ fn new_watch(ctx: &Ctx, pid: u32) -> Option<i64> {
 /// be read), asked for with -l and set again with resize-pane, since rmux ignores -l; a refused resize is left to
 /// the next watch tick. `-d` keeps the active pane. The split's process must be this binary `watch` (else nothing is
 /// killed and the open refuses); then the pane is labelled and recorded as `<pane> <pid> <start>`. A bar that cannot
-/// be labelled or recorded is closed by the guarded kill, which spares a pane that runs anything else by then.
+/// be labelled or recorded is closed by the guarded kill, which spares a pane that runs anything else by then. The
+/// bar is proven as the last step; a pane that fails it is not killed, its record is cleared and the open refuses.
 fn open(ctx: &Ctx, caller: &Caller) -> Res<(String, String)> {
     let env = pane_env(utf8(&ctx.state_root)?, crate::state::root::HOST);
     let width = bar_width(window_width(ctx, &caller.pane).unwrap_or(0)).to_string();
@@ -820,6 +837,21 @@ fn open(ctx: &Ctx, caller: &Caller) -> Res<(String, String)> {
         );
     }
     let _ = native(ctx, &["resize-pane", "-t", &pane, "-x", &width], true);
+    // Proven last: a pane replaced after the check (a hook on the label, say) is never reported as the bar.
+    if proven(ctx, &pane, pid, start).is_none() {
+        let _ = native(
+            ctx,
+            &["set-option", "-u", "-t", &caller.session, RECORD],
+            true,
+        );
+        return refuse(
+            1,
+            "sidebar",
+            format!(
+                "the new side-bar pane {pane} no longer runs this plugin's watch; close it with kill-pane -t {pane}"
+            ),
+        );
+    }
     Ok((pane, window))
 }
 
@@ -844,8 +876,8 @@ mod tests {
     const TAG7: &str = "-N set-option -p -t %7 @agent-role sidebar";
     const RECORD7: &str = "-N set-option -t $3 @mux-agents-sidebar-id %7 107 1070";
     const PROOF: &str = "#{pane_id}|#{window_id}|#{pane_dead}|#{pane_pid}";
-    // The watch's own record: pane %7, the fake process 4242.
-    const OWN: &str = "%7 4242 1\n";
+    // The watch's own record: pane %7, the fake process 4242 started at 2000.
+    const OWN: &str = "%7 4242 2000\n";
     const READ_OPTION: &str = "-N show-options -qv -t $3 @mux-agents-sidebar";
     const OFF: &str = "-N set-option -t $3 @mux-agents-sidebar off";
     const ON: &str = "-N set-option -u -t $3 @mux-agents-sidebar";
@@ -1248,11 +1280,27 @@ mod tests {
 
     const MOVE: &str = "-N move-pane -d -f -h -s %7 -t %4";
 
+    /// The watch is the recorded bar: its process 4242 is `<exe> watch` started at 2000, the record names %7, 4242
+    /// and that start, and the proof read of %7 shows it alive running 4242.
+    fn own_watch(w: &World) {
+        let exe = w.ctx.exe.display().to_string();
+        w.fakes.forget(4242);
+        w.fakes.process(crate::proc::Row {
+            pid: 4242,
+            ppid: crate::agents::fixture::SHELL,
+            start: Some(2000),
+            path: Some(exe.clone()),
+            argv: Some(vec![exe, "watch".into()]),
+        });
+        w.fakes.mux_rule(RECORD, 0, OWN, "");
+        w.fakes.mux_rule(PROOF, 0, "%7|@5|0|4242\n", "");
+    }
+
     /// watch_world with the bar's window answered from `win`: the layout read, move-pane, resize-pane (the pane at
     /// the right edge keeps its right edge), the active check and select-pane.
     fn keep_world(probes: &[&'static str], win: Win) -> (World, Shared) {
         let w = watch_world(probes);
-        w.fakes.mux_rule(RECORD, 0, OWN, "");
+        own_watch(&w);
         let shared = Rc::new(RefCell::new(win));
         let s = shared.clone();
         w.fakes.mux_script("#{pane_active}", move |argv| {
@@ -1582,7 +1630,7 @@ mod tests {
         // A layout that does not list the bar, a failed read, or one that does not parse: that tick does nothing.
         for (code, stdout) in [(0, "%1|1|1|1|1|200|200|0|0|0\n"), (1, ""), (0, "garbage\n")] {
             let w = watch_world(&["live", "live", "gone"]);
-            w.fakes.mux_rule(RECORD, 0, OWN, "");
+            own_watch(&w);
             w.fakes.mux_first("#{pane_at_right}", code, stdout, "");
             let (_, frames) = watch_run(&w);
             assert_eq!(frames, vec![board_frame(); 2], "{stdout:?}");
@@ -1613,7 +1661,8 @@ mod tests {
         record_fail: bool,
         kill_fail: Option<&'static str>,
         probe_fail: Option<(&'static str, usize)>,
-        // One respawn of the bar's pane: `proof` right after its first proof read, `kill` just before the kill.
+        // One respawn of the bar's pane: `proof` right after its first proof read, `kill` just before the kill,
+        // `label` right after open writes its label.
         race: Option<&'static str>,
     }
 
@@ -1760,7 +1809,8 @@ mod tests {
             Ok(out(0, &text, ""))
         });
         // The conditional kill: only a live pane that still runs the pid bound in.
-        let (p, fakes, r, kill_fail) = (panes.clone(), w.fakes.clone(), race, mux.kill_fail);
+        let (p, fakes, r, kill_fail) =
+            (panes.clone(), w.fakes.clone(), race.clone(), mux.kill_fail);
         w.fakes.mux_script("if-shell", move |argv| {
             if let Some(how) = kill_fail {
                 return failed(how);
@@ -1814,7 +1864,7 @@ mod tests {
             }
             Ok(out(0, &format!("{pane}|@5|{pid}\n"), ""))
         });
-        let (p, tag_fail) = (panes.clone(), mux.tag_fail);
+        let (p, fakes, tag_fail) = (panes.clone(), w.fakes.clone(), mux.tag_fail);
         w.fakes.mux_script("set-option -p", move |argv| {
             if let Some(how) = tag_fail {
                 return failed(how);
@@ -1826,6 +1876,10 @@ mod tests {
                 .map(|(_, id)| id.to_string())
                 .unwrap_or_default();
             set(&p, pane, format!("{}|{id}", argv[6]));
+            if race.get() == Some("label") {
+                race.set(None);
+                respawn(&p, &fakes, pane);
+            }
             Ok(Output::default())
         });
         // Checked before the pane rules: read, set (`-t $3 <option> off`) and unset (`-u -t $3 <option>`).
@@ -2216,6 +2270,35 @@ mod tests {
         assert_eq!(get(&panes, "pid %7").as_deref(), Some("1107"));
     }
 
+    // T9-QA 1: open proves the bar last, after labelling, recording and resizing: a bar replaced after its label is
+    // written is not opened; the record is cleared and nothing is killed.
+    #[test]
+    fn open_proves_the_bar_last() {
+        let (w, panes) = sidebar_world(
+            "",
+            Mux {
+                race: Some("label"),
+                ..Mux::default()
+            },
+        );
+        assert_eq!(
+            run(&w, &[]),
+            "1 sidebar the new side-bar pane %7 no longer runs this plugin's watch; close it with kill-pane -t %7"
+        );
+        assert_eq!(record(&panes), None);
+        assert_eq!(closes(&w), 0);
+        assert_eq!(get(&panes, "pid %7").as_deref(), Some("1107"));
+        let all: Vec<String> = w.fakes.mux_calls().iter().map(|c| c.join(" ")).collect();
+        let at = |line: &str| all.iter().position(|c| c == line).unwrap();
+        let proof = format!("-N display-message -p -t %7 {PROOF}");
+        assert!(
+            at(RECORD7) < at(RESIZE) && at(RESIZE) < at(&proof) && at(&proof) < at(CLEAR_RECORD)
+        );
+        // ensure as a spawn runs it opens nothing either: the pane carries the label but is not the bar.
+        assert_eq!(ensure_run(&w), refused(&["%7"]));
+        assert_eq!(count(&w, "split-window"), 1);
+    }
+
     // T9 test 7: a bar that cannot be labelled or recorded is closed only while it is still the watch it split.
     #[test]
     fn a_failed_label_or_record_closes_only_the_watch_it_split() {
@@ -2416,7 +2499,7 @@ mod tests {
                 format!("+sidebar|{key}|$3 display-message"),
                 format!(
                     "-sidebar|{key}|$3 display-message,set-option,show-options,list-panes,display-message,\
-                     split-window,set-option,set-option,resize-pane"
+                     split-window,set-option,set-option,resize-pane,display-message"
                 ),
             ]
         );
@@ -2584,9 +2667,24 @@ mod tests {
     // by hand, with or without a bar, only draws.
     #[test]
     fn only_the_recorded_watch_keeps_the_layout() {
-        for record in ["", "%8 4242 1\n", "%7 4243 1\n", "%7 4242\n"] {
+        // (record, the proof read of the watch's own pane): only its own pane, its own pid in that pane, alive, and
+        // its own start keep the layout.
+        for (record, proof) in [
+            ("", "%7|@5|0|4242\n"),
+            ("%8 4242 2000\n", "%7|@5|0|4242\n"),
+            ("%7 4243 2000\n", "%7|@5|0|4242\n"),
+            ("%7 4242\n", "%7|@5|0|4242\n"),
+            // A stale start: the record names another process that once had this pid.
+            ("%7 4242 1\n", "%7|@5|0|4242\n"),
+            // The pane runs another process (a shell, with this watch run by hand in it), or is dead, or unread.
+            ("%7 4242 2000\n", "%7|@5|0|170\n"),
+            ("%7 4242 2000\n", "%7|@5|1|4242\n"),
+            ("%7 4242 2000\n", ""),
+        ] {
             let (w, _) = keep_world(&["live", "live", "live", "gone"], win("%1", split_right()));
             w.fakes.mux_first(RECORD, 0, record, "");
+            w.fakes.mux_first(PROOF, 0, proof, "");
+            let record = format!("{record:?} {proof:?}");
             let (ended, frames) = watch_run(&w);
             assert_eq!(
                 (ended, frames),
@@ -2640,7 +2738,8 @@ mod tests {
             let inside = if disabled {
                 "show-options"
             } else {
-                "show-options,show-options,list-panes,display-message,split-window,set-option,set-option,resize-pane"
+                "show-options,show-options,list-panes,display-message,split-window,set-option,set-option,resize-pane,\
+                 display-message"
             };
             assert_eq!(
                 w.fakes.locks(),
