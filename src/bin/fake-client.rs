@@ -19,6 +19,9 @@
 //!   the files of its own n, the last line's output winning.
 //! - A command line is mux-agent's arguments split on tabs; `{pid}`, `{sid}` and `{dir}` in them are replaced by
 //!   this client's pid, session id and `$MUX_IT_DIR`. It runs with stdin closed, in the client's cwd and env.
+//! - The command line `@detach` (Unix) runs no mux-agent: it starts `/bin/sleep 600` as this client's child in a session
+//!   of its own with SIGHUP ignored, so a pane's hangup never reaches it, and answers `{"pid": <its pid>}`. It is a
+//!   descendant that outlives its pane; whoever starts one kills it.
 //! - Each line read on stdin (what `send` types into the pane) is appended to `input.<pid>.log`.
 //! - Quit: `quit` (all clients) or `quit.<pid>` appearing makes the client write `exited.<pid>` (its exit code) and
 //!   exit with `MUX_IT_EXIT`.
@@ -141,19 +144,55 @@ impl Runner {
                     .replace("{dir}", &dir)
             })
             .collect();
-        let out = Command::new(&self.entry)
-            .args(&args)
-            .stdin(Stdio::null())
-            .output();
-        let (stdout, stderr, code) = match out {
-            Ok(o) => (o.stdout, o.stderr, o.status.code().unwrap_or(-1)),
-            Err(e) => (Vec::new(), format!("fake-client: {e}\n").into_bytes(), -1),
+        let (stdout, stderr, code) = if args == ["@detach"] {
+            match detach() {
+                Ok(pid) => (json!({"pid": pid}).to_string().into_bytes(), Vec::new(), 0),
+                Err(e) => (Vec::new(), format!("fake-client: {e}\n").into_bytes(), -1),
+            }
+        } else {
+            let out = Command::new(&self.entry)
+                .args(&args)
+                .stdin(Stdio::null())
+                .output();
+            match out {
+                Ok(o) => (o.stdout, o.stderr, o.status.code().unwrap_or(-1)),
+                Err(e) => (Vec::new(), format!("fake-client: {e}\n").into_bytes(), -1),
+            }
         };
         let file = |ext: &str| self.dir.join(format!("{base}.{ext}"));
         write_whole(&file("err"), stderr);
         write_whole(&file("code"), format!("{code}\n"));
         write_whole(&file("json"), stdout);
     }
+}
+
+/// `/bin/sleep 600` as this client's child, in its own session (no controlling terminal, so no hangup from the pane)
+/// with SIGHUP ignored besides; its pid. Never waited for: it outlives this client.
+#[cfg(unix)]
+fn detach() -> std::io::Result<u32> {
+    use std::os::unix::process::CommandExt;
+    let mut command = Command::new("/bin/sleep");
+    command
+        .arg("600")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    // SAFETY: setsid and signal are async-signal-safe, and nothing else runs between fork and exec.
+    unsafe {
+        command.pre_exec(|| {
+            if libc::setsid() == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            libc::signal(libc::SIGHUP, libc::SIG_IGN);
+            Ok(())
+        });
+    }
+    Ok(command.spawn()?.id())
+}
+
+#[cfg(not(unix))]
+fn detach() -> std::io::Result<u32> {
+    Err(std::io::Error::other("@detach is Unix only"))
 }
 
 /// This program's file name without extension, as started (`claude`, `copilot`).
