@@ -8,6 +8,10 @@ All notable changes to mux-agents. The format follows [Keep a Changelog](https:/
 
 - The code is clean on newer clippy (1.98+ `chunks_exact_to_as_chunks`): fixed-size chunking uses `as_chunks`, with the same behaviour. ([#49](https://github.com/D0n9X1n/mux-agents/issues/49))
 
+### Fixed
+
+- After rmux 0.10.0's `rotate-window`, which moves panes but leaves their `@agent-*` tags where they were, no verb reaches the wrong pane. An agent is now its own pane running the exact command it started: `spawn` keeps the pane's `#{pane_start_command}` in `record.json` as `startCommand`, and every `list`, `send`, `read`, `focus`, `stop` and reap finds agents by `record.pane` and that command from one pane list, never by a tag (records from 0.2.0–0.2.2 are proven by their launcher's pid, start and `launcher <spec>` argv instead). Every action on an agent's pane is one `if-shell -F` that holds only while the pane is still that launch: `stop` kills it, then signals and notices only once a fresh read shows the pane gone, else refuses `1 target`; `read <name>` captures into a private buffer that is always deleted; `focus` selects, then reads back that the pane is active, live and that launch, else `2 target`; reap closes a dead pane only while it is still that launch; and spawn's rollback says `its pane was closed` only when the pane is gone. A pane whose tag names an agent but is no running agent's own pane cannot send as one (`2 parent`) or spawn (`tagged`), and `list` reads its own `pane-<n>` mailbox. A pane that is an agent's but no longer its launch is counted towards the cap of 6 but never addressed, and a tag with no record here keeps its place and its name taken. Tested live on rmux 0.10, tmux 3.8 and tmux 3.2a. ([#48](https://github.com/D0n9X1n/mux-agents/issues/48))
+
 ## [0.2.2] - 2026-11-01
 
 A side bar you can read at a glance and that stays on the right, agents named after their task, lost agents closed on their own, `spawn -Model`, and nothing in the desktop app. [Release notes](https://github.com/D0n9X1n/mux-agents/wiki/Release-v0.2.2).

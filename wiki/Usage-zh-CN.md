@@ -151,6 +151,7 @@ copilot plugin marketplace update mux-agents && copilot plugin update mux-agents
 - `spawn` 打开一个分离的窗口（或按 `-Split h|v` 或会话的 `placement` 拆分调用者的窗格），按二进制文件的绝对路径运行 `<binary> launcher <spec.json>`，用 `@agent-*` 选项标记窗格，并在状态文件夹中记录代理：若设置了 `MUX_AGENTS_STATE` 则用它，否则 Windows 上为 `%LOCALAPPDATA%\mux-agents\state`，Linux 和 macOS 上为 `$XDG_STATE_HOME/mux-agents/state` 或 `~/.local/state/mux-agents/state`。
 - 代理提交后，`spawn` 在侧边栏自己的锁下找到或打开会话的侧边栏；那里的失败以 `sidebarError` 报告，从不让启动失败。
 - 消息进入每个窗格的邮箱，从不作为按键输入。`read -Wait` 每条消息只返回一次。每个子代理恰好向父代理发送一条退出通知：`exited`、`stopped` 或 `lost`。
-- 标签页或窗格已不存在的代理，会在下一次 `list`、`read`、`spawn`、`stop` 或侧边栏刷新时被关闭：一条 `lost` 通知（或带退出码的 `exited`），从 `list` 和侧边栏中消失，在 `list -All` 中保留并带 `closedBy: "pane"`。代理结束后被 `remain-on-exit` 留下的窗格也会被关闭，但仅当它仍标记为该代理时。
+- 标签页或窗格已不存在的代理，会在下一次 `list`、`read`、`spawn`、`stop` 或侧边栏刷新时被关闭：一条 `lost` 通知（或带退出码的 `exited`），从 `list` 和侧边栏中消失，在 `list -All` 中保留并带 `closedBy: "pane"`。代理结束后被 `remain-on-exit` 留下的窗格也会被关闭，但仅当它仍在运行该代理启动的那条命令时。
+- 代理按其窗格及该窗格启动的那条命令查找，从不按其 `@agent-*` 标签查找，因此 rmux 的 `rotate-window`（它把标签留在原处）无法让 `send`、`read`、`focus` 或 `stop` 作用到错误的窗格：已不再是其代理自身启动的窗格会以 `target` 拒绝。
 - 锁按用户划分：Unix 上是 `~/.local/state/mux-agents/locks` 下的文件；Windows 上是命名互斥体 `Local\MuxAgents-<hex>`。这修复了 .NET 命名互斥体公告 [GHSA-2j93-m82w-73j2](https://github.com/advisories/GHSA-2j93-m82w-73j2)，它曾影响 0.1 在 Linux 和 macOS 上的版本。
 - 有六个存活代理时，`list` 平均约 23 ms（`scripts/dev/bench-list.sh`，Apple 芯片 Mac 上的 tmux 3.8）。
