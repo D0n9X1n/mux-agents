@@ -4,6 +4,10 @@ All notable changes to mux-agents. The format follows [Keep a Changelog](https:/
 
 ## [Unreleased]
 
+### Changed
+
+- The code is clean on newer clippy (1.98+ `chunks_exact_to_as_chunks`): fixed-size chunking uses `as_chunks`, with the same behaviour. ([#49](https://github.com/D0n9X1n/mux-agents/issues/49))
+
 ## [0.2.2] - 2026-11-01
 
 A side bar you can read at a glance and that stays on the right, agents named after their task, lost agents closed on their own, `spawn -Model`, and nothing in the desktop app. [Release notes](https://github.com/D0n9X1n/mux-agents/wiki/Release-v0.2.2).

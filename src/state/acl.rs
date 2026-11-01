@@ -30,7 +30,9 @@ pub fn posix_acl_extended(access: &[u8], default: Option<&[u8]>) -> bool {
     const GROUP: u16 = 0x08;
     const MASK: u16 = 0x10;
     entries
-        .chunks_exact(8)
+        .as_chunks::<8>()
+        .0
+        .iter()
         .any(|e| matches!(u16::from_le_bytes([e[0], e[1]]), USER | GROUP | MASK))
 }
 

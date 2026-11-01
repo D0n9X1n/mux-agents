@@ -681,7 +681,9 @@ fn letter(c: char) -> bool {
     let code = c as u32;
     c.is_alphabetic()
         && !NOT_LETTERS
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .any(|range| (range[0]..=range[1]).contains(&code))
 }
 

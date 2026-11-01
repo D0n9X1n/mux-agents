@@ -50,8 +50,10 @@ pub fn command_line(bytes: &[u8], base: usize) -> Option<Vec<u16>> {
     let at = buffer.checked_sub(base).filter(|&at| at >= header)?;
     let text = bytes.get(at..at.checked_add(length)?)?;
     Some(
-        text.chunks_exact(2)
-            .map(|pair| u16::from_ne_bytes([pair[0], pair[1]]))
+        text.as_chunks::<2>()
+            .0
+            .iter()
+            .map(|&pair| u16::from_ne_bytes(pair))
             .collect(),
     )
 }
