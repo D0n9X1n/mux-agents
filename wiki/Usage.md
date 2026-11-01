@@ -60,15 +60,29 @@ Every agent's name says what it does and is its tab's name or its pane's title. 
 In Claude Code, an `Agents` pane beside the chat opens after the first successful `spawn` (or with `/mux-agents-pane`) and refreshes every 3 seconds. In any client, the first successful `spawn` also opens a split at the right edge of your window, full height and a fifth of its width (at least 40 columns), that redraws every 2 seconds; later spawns reuse it, `sidebar -Close` closes it for the rest of the session and `sidebar` opens it again:
 
 ```text
-mux-agents · 2 running
-● claude-1  claude  4m
-  running the parser tests (14/20 pass)
-● copilot-1  copilot  1m
-  reviewing src/spawn.rs
-○ claude-2  exited 0
+ mux-agents         3 running / 7 ended
+
+ ◉ add-subtract [sonnet]   working  42s
+   Adding subtract(a, b) under add i...
+
+ ◌ test-calc  ✉ 1          waiting   3m
+   Done: test_calc.py passed, exit 0
+
+ ◉ fix-ci-flake            working  11m
+   Re-running tests/test_watch.rs wi...
+
+ ended -------------------------------
+ ✓ docs-usage                 done  18m
+ ✗ bump-deps              exit 101  25m
+ - spike-rmux              stopped   1h
+   +4 more  (list -All)
 ```
 
 "Doing" is what the agent last reported with `status`, else the first line of its last message, else its task.
+
+Each live agent shows its state, its name in its own color, its `[model]` when one was chosen, and `✉ N` when its parent has N unread messages from it. `◉ working` (green) is running a task; `◌ waiting` (cyan) is an agent in `read -Wait`, listening for its parent, until it sends or reports a `status`. Ended agents follow, the 3 newest: `✓ done` (exited 0), `✗ exit N` (red), `- stopped` (yellow); `+K more` counts the rest, which `list -All` shows. A spawn picks the name color least used by the session's live agents (blue, magenta, bright blue, bright magenta; never a state color), and `list -Text` paints names the same way.
+
+The bar is laid out at its pane's size on every redraw and never wraps: long text is cut with `...`, and a short pane drops blank lines first, then ended rows, then the "doing" lines and whole rows of the oldest agents; the header stays. Color follows `NO_COLOR` (off), `FORCE_COLOR` or `CLICOLOR_FORCE` (on), then `TERM=dumb` (off); `MUX_AGENTS_ASCII=1` draws `* o + x m -` instead of the symbols. Each redraw rewrites the rows in place (no full clear), so the bar does not flicker; with `TERM=dumb` it prints plain frames instead.
 
 In tab mode the bar stays in the window you spawned from, not in each agent's window. `sidebar -Close` closes only this multiplexer bar; the Claude Code `Agents` pane is separate.
 
