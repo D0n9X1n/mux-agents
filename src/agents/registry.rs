@@ -42,8 +42,8 @@ pub fn get_panes(ctx: &Ctx, caller: &Caller, all: bool) -> Res<Vec<Pane>> {
 
 /// Every tagged pane of the caller's session, one `list-panes` call. Each row is framed by a fresh random marker on
 /// both ends and read by that frame over the whole output: an @agent-name may hold LF or CR, and a live pane is never
-/// dropped for its name, nor does its name's text read as a row of its own. A row whose pane, window, pid (a decimal of at least 2: never the kernel's or init's tree) or id is malformed is
-/// not an agent.
+/// dropped for its name, nor does its name's text read as a row of its own. A row whose pane, window, pid (a decimal of at least 2: never the kernel's or init's tree;
+/// empty only on a dead pane, as tmux 3.8 answers it) or id is malformed is not an agent.
 pub(crate) fn tagged(ctx: &Ctx, caller: &Caller) -> Res<Vec<Pane>> {
     let marker = crate::util::guid()?.replace('-', "");
     let format = list_format(&marker);
@@ -68,20 +68,26 @@ pub(crate) fn tagged(ctx: &Ctx, caller: &Caller) -> Res<Vec<Pane>> {
             let window_ok = window
                 .strip_prefix('@')
                 .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()));
-            let pid = pid
-                .bytes()
-                .all(|b| b.is_ascii_digit())
-                .then(|| pid.parse::<u32>().ok())
-                .flatten()
-                .filter(|&pid| pid >= 2)?;
+            // Only an exact 1 is dead: anything else is a live pane, never killed.
+            let dead = dead == "1";
+            // tmux 3.8 answers no pid for a dead pane; a live pane always has one.
+            let pid = if dead && pid.is_empty() {
+                String::new()
+            } else {
+                pid.bytes()
+                    .all(|b| b.is_ascii_digit())
+                    .then(|| pid.parse::<u32>().ok())
+                    .flatten()
+                    .filter(|&pid| pid >= 2)?
+                    .to_string()
+            };
             (super::pane_id(pane) && window_ok && super::agent_id(id)).then(|| Pane {
                 pane: pane.into(),
                 window: window.into(),
-                pid: pid.to_string(),
+                pid,
                 id: id.into(),
                 name: name.into(),
-                // Only an exact 1 is dead: anything else is a live pane, never killed.
-                dead: dead == "1",
+                dead,
             })
         })
         .collect())
@@ -1041,6 +1047,18 @@ mod tests {
             .map(|p| (p.pane, p.dead))
             .collect();
         assert_eq!(got, [("%9".into(), true), ("%8".into(), false)]);
+        // tmux 3.8 answers no pid for a dead pane: it stays listed, as dead, so reap can close it. A live pane with no
+        // pid is still not an agent.
+        w.panes_dead(
+            &["%9|@5||aaaaaaaaaaaa|worker", "%8|@5||bbbbbbbbbbbb|idle"],
+            &["%9"],
+        );
+        let got: Vec<(String, String, bool)> = tagged(&w.ctx, &caller)
+            .unwrap()
+            .into_iter()
+            .map(|p| (p.pane, p.pid, p.dead))
+            .collect();
+        assert_eq!(got, [("%9".into(), String::new(), true)]);
         assert_eq!(
             kill_if_dead("%9", ID),
             KILL_IF_DEAD[1..]
