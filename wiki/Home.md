@@ -10,6 +10,10 @@ mux-agents is a plugin for Claude Code and GitHub Copilot CLI. When the client r
 
 The .NET named-mutex advisory [GHSA-2j93-m82w-73j2](https://github.com/advisories/GHSA-2j93-m82w-73j2), which affected the `lock` check of 0.1 on Linux and macOS, is fixed in 0.2.0: Unix locks are files under `~/.local/state/mux-agents/locks`, and Windows uses a named mutex `Local\MuxAgents-<hex>`.
 
+## Use
+
+- [Usage](Usage) — install, commands, side bar, safety checks, requirements, upgrades and troubleshooting
+
 ## Design
 
 - [Foundation](Design-Foundation) — v0.1.0 sub-project A: the rename to mux-agents, CI on Linux, macOS and Windows, and the tag-driven release; its Rust (0.2.0) section covers the binary, the locks and the `dist` branch

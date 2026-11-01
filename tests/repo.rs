@@ -1087,12 +1087,14 @@ fn no_pwsh_in_readme_skill_contributing_hooks() {
 
 #[test]
 fn readme_skill_name_every_platform_and_mux() {
-    let readme = file_lines("README.md");
+    // The requirements line lives in the wiki's Usage page; the README keeps the no-PowerShell feature line.
+    let readme = file_lines("wiki/Usage.md");
     let platforms = "- rmux 0.10 or later on macOS, Linux or Windows, or tmux 3.2 or later on macOS or Linux, with the caller inside a pane.";
     assert!(
         readme.contains(&platforms.to_string()),
-        "README requirements line"
+        "wiki Usage requirements line"
     );
+    let readme = file_lines("README.md");
     assert!(
         readme.iter().any(|l| l.contains("macOS")
             && l.contains("Linux")
@@ -1152,9 +1154,9 @@ fn readme_links_absolute() {
         .filter(|t| !t.starts_with("https://"))
         .collect();
     assert!(relative.is_empty(), "{relative:?}");
-    // The spawn example passes the brief an agent caller needs.
+    // The spawn example in the wiki's command table passes the brief an agent caller needs.
     assert_eq!(
-        file_lines("README.md")
+        file_lines("wiki/Usage.md")
             .iter()
             .filter(|l| l.starts_with("| `spawn` |") && l.contains("-BriefFile"))
             .count(),
@@ -1636,13 +1638,18 @@ fn tracks_no_docs_path() {
 
 #[test]
 fn readme_notes_dist_pin() {
-    // The marketplace installs ref dist, which the first 0.2.0 release creates.
-    let readme = file_lines("README.md");
+    // The marketplace installs ref dist, which holds the binaries for every platform: nothing to build or download.
     assert!(
-        readme.iter().any(|l| l.contains("`dist`")
-            && l.contains("marketplace")
-            && l.contains("first 0.2.0 release")),
-        "README does not note the dist pin"
+        file_lines("README.md")
+            .iter()
+            .any(|l| l.contains("prebuilt") && l.contains("nothing to build or download")),
+        "README does not say the install carries the binaries"
+    );
+    assert!(
+        file_lines("wiki/Usage.md")
+            .iter()
+            .any(|l| l.contains("`dist`") && l.contains("marketplace")),
+        "wiki Usage does not explain the dist pin"
     );
 }
 
@@ -1779,6 +1786,34 @@ const CLAUDE_UPGRADE: &str =
 const COPILOT_UPGRADE: &str =
     "copilot plugin marketplace update mux-agents && copilot plugin update mux-agents@mux-agents";
 
+// The README sells and starts: a preview, the features and a quick start. Everything else is in the wiki.
+#[test]
+fn readme_is_short_features_and_quick_start() {
+    let readme = file_lines("README.md");
+    assert!(readme.len() <= 60, "README has {} lines", readme.len());
+    let headings: Vec<&str> = readme
+        .iter()
+        .filter(|l| l.starts_with("## "))
+        .map(String::as_str)
+        .collect();
+    assert_eq!(headings, ["## Features", "## Quick start", "## Learn more"]);
+    let preview = "https://raw.githubusercontent.com/D0n9X1n/mux-agents/main/assets/preview/mux-agents-preview.png";
+    assert!(
+        readme.iter().any(|l| l.contains(preview)),
+        "README shows no preview image"
+    );
+    let png = std::fs::read(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/preview/mux-agents-preview.png"),
+    )
+    .unwrap();
+    assert_eq!(png[..8], [0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a]);
+    let usage = format!("{OWNER_WIKI}Usage");
+    assert!(
+        link_targets(&repo_file("README.md")).contains(&usage),
+        "README does not link {usage}"
+    );
+}
+
 #[test]
 fn readme_has_one_line_upgrade_for_both_clis() {
     let readme = file_lines("README.md");
@@ -1894,7 +1929,7 @@ fn readme_launch_flags_in_allowlist() {
 #[test]
 fn readme_shows_auto_update_opt_in() {
     // Claude Code leaves auto-update off for a third-party marketplace; the user turns it on in /plugin.
-    let readme = file_lines("README.md");
+    let readme = file_lines("wiki/Usage.md");
     assert!(
         readme.iter().any(|l| l.contains("`/plugin`")
             && l.contains("**Marketplaces**")
@@ -1977,10 +2012,10 @@ fn state_and_lock_format_pinned() {
     assert!(registry.contains(r#".join("launcher.json")"#));
     // The README promises it.
     assert!(
-        file_lines("README.md")
+        file_lines("wiki/Usage.md")
             .iter()
             .any(|l| l.contains("0.2.x") && l.contains("state folder") && l.contains("lock")),
-        "README does not say 0.2.x keeps the state and lock formats"
+        "wiki Usage does not say 0.2.x keeps the state and lock formats"
     );
 }
 
@@ -1999,9 +2034,9 @@ fn section(text: &str, heading: &str) -> Vec<String> {
 fn readme_upgrade_lifecycle() {
     // From 0.1: close the side bar and stop every agent first (the 0.1 mutex and the 0.2 lock files do not
     // serialize), then update, then restart the sessions; panes keep the binary path they started with.
-    let readme = repo_file("README.md").replace("\r\n", "\n");
-    let upgrade = section(&readme, "Upgrade");
-    assert!(!upgrade.is_empty(), "README has no ## Upgrade section");
+    let usage = wiki_text("Usage");
+    let upgrade = section(&usage, "Upgrade");
+    assert!(!upgrade.is_empty(), "wiki Usage has no ## Upgrade section");
     let at = |needle: &str| {
         upgrade
             .iter()
@@ -2019,7 +2054,7 @@ fn readme_upgrade_lifecycle() {
     at("absolute path");
     at("do not serialize");
     // The release notes say the same, in both languages.
-    for page in ["Release-v0.2.0", "Release-v0.2.0-zh-CN"] {
+    for page in ["Usage-zh-CN", "Release-v0.2.0", "Release-v0.2.0-zh-CN"] {
         let text = wiki_text(page);
         for needle in ["sidebar -Close", "`stop`"] {
             assert!(text.contains(needle), "{page} lacks {needle}");

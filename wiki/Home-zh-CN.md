@@ -10,6 +10,10 @@ mux-agents 是 Claude Code 和 GitHub Copilot CLI 的插件。客户端在 rmux 
 
 .NET 命名互斥体公告 [GHSA-2j93-m82w-73j2](https://github.com/advisories/GHSA-2j93-m82w-73j2) 曾影响 0.1 在 Linux 和 macOS 上的 `lock` 检查，已在 0.2.0 中修复：Unix 上的锁是 `~/.local/state/mux-agents/locks` 下的文件，Windows 使用命名互斥体 `Local\MuxAgents-<hex>`。
 
+## 使用
+
+- [使用](Usage-zh-CN) — 安装、命令、侧边栏、安全检查、要求、升级和故障排查
+
 ## 设计
 
 - [基础](Design-Foundation-zh-CN) — v0.1.0 子项目 A：改名为 mux-agents、在 Linux、macOS 和 Windows 上运行 CI、由标签驱动的发布；其 Rust 实现（0.2.0）一节介绍二进制文件、锁和 `dist` 分支
