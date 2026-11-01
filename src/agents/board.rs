@@ -82,6 +82,10 @@ pub fn board(
             let pane = super::text(end.record.get("pane"));
             let window = super::text(end.record.get("window"));
             let mut row = rows.row(&end.id, &end.record, pane, &window, &end.kind)?;
+            // After the row's fields, so they keep their places: who closed a lost agent.
+            if let Some(closed) = end.closed_by {
+                row.insert("closedBy".into(), closed.into());
+            }
             if with_exit {
                 row.insert("exitCode".into(), end.code);
             }
@@ -110,6 +114,7 @@ struct Ended {
     kind: String,
     record: Value,
     code: Value,
+    closed_by: Option<String>,
 }
 
 /// The session's agents with a notice that are not live. notice.json is written once, so it is read unlocked.
@@ -149,6 +154,10 @@ fn ended(ctx: &Ctx, caller: &Caller, live: &[Pane]) -> Res<Vec<Ended>> {
             at: notice.get("at").and_then(Value::as_str).and_then(parse_utc),
             kind: kind.to_string(),
             code: notice.get("exitCode").cloned().unwrap_or(Value::Null),
+            closed_by: notice
+                .get("closedBy")
+                .and_then(Value::as_str)
+                .map(str::to_string),
             id,
             record,
         });
@@ -464,6 +473,48 @@ mod tests {
                 .to_vec()
             )
         );
+    }
+
+    #[test]
+    fn lost_row_says_closed_by_pane() {
+        let w = World::human("");
+        w.clock(NOW);
+        let caller = w.caller();
+        for (id, name, notice) in [
+            (
+                "bbbbbbbbbbbb",
+                "vanished",
+                json!({"kind": "lost", "exitCode": null, "at": "2026-10-29T11:59:00.0000000Z", "closedBy": "pane"}),
+            ),
+            (
+                "cccccccccccc",
+                "halted",
+                json!({"kind": "stopped", "exitCode": null, "at": "2026-10-29T11:58:00.0000000Z"}),
+            ),
+        ] {
+            let folder = w.agent_record(id, json!({"name": name, "pane": "%7"}));
+            write(&folder.join("notice.json"), notice);
+        }
+        w.panes(&[]);
+        let all = board(&w.ctx, &caller, "pane-1", true, false).unwrap();
+        let rows = all["agents"].as_array().unwrap();
+        let lost = rows[0].as_object().unwrap();
+        assert_eq!(lost["name"], "vanished");
+        // After the 15 row fields, so they keep their places.
+        assert_eq!(
+            lost.iter().map(|(k, v)| (k.as_str(), v)).last(),
+            Some(("closedBy", &json!("pane")))
+        );
+        assert!(rows[1].get("closedBy").is_none(), "{}", rows[1]);
+        // The watch feed puts exitCode last, after it.
+        let watch = board(&w.ctx, &caller, "pane-1", true, true).unwrap();
+        let keys: Vec<&str> = watch["agents"][0]
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(keys[keys.len() - 2..], ["closedBy", "exitCode"]);
     }
 
     #[test]
