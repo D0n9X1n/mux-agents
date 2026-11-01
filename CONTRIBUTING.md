@@ -68,5 +68,6 @@ claude plugin test .
 
 `main` is source only. A release builds six binaries (macOS, Linux and Windows, each `x86_64` and `aarch64`) into `scripts/bin/` with one `SHA256SUMS`, and commits them on the `dist` branch, which the marketplace installs.
 
-1. On `main`, set the same version in `.claude-plugin/plugin.json` and `Cargo.toml` (then `cargo build` to update `Cargo.lock`), and add the release page `wiki/Release-v<version>.md` and its twin.
+1. On `main`, set the same version in `.claude-plugin/plugin.json` and `Cargo.toml` (then `cargo build` to update `Cargo.lock`).
 2. Push tag `v<version>` on that commit once its CI push run is green. The release workflow refuses a tag that is not on `main`, has no green CI push run, or differs from the `plugin.json` or `Cargo.toml` version, and moves `dist` only forward.
+3. Write the release notes in the GitHub release (`gh release edit v<version> --notes-file <file>`). Release notes live only there: the repository keeps no changelog, and the wiki describes what the code is and why, never one page per version.

@@ -48,7 +48,7 @@ On Linux and macOS, .NET 8.0.0–8.0.31, 9.0.0–9.0.20, 10.0.0–10.0.12 and 11
 - Initialize: `-Platform linux`/`macos` with `10.0.12` returns `Failure` 2 `runtime`; mocks of `New-MuxAgentProviders` and `Get-MuxAgentPlatformMembers` record no call. With the override and a mocked `New-MuxAgentProviders` that refuses 2 `state`, `Failure` keeps `advisory`, and the entry and launcher print it. Unix-tagged: an affected version with the override returns `P.Advisory`. AST: the parameter defaults are exactly the two calls; the entry and the launcher call `Initialize-MuxAgentProviders` with only `-Entry`; nothing else calls `New-MuxAgentProviders`.
 - Replies, `-Text`, the watch frame, the launcher's stderr line and the pane environment (override present and absent): each with and without `Advisory`.
 - Lock: for each of the three exception types, a factory that throws once makes two creations, one sleep of `100` and one action run; one that throws twice refuses 2 `lock` naming `XDG_RUNTIME_DIR`. A refusal from the name: no creation, sleep or action. Not retried, one creation and no sleep: another exception type, a `WaitOne` timeout, an abandoned mutex, an `IOException` thrown by `WaitOne` (no action; the mutex is disposed), a refusal inside the action. After a retried take, another runspace takes the same name with timeout 0, proving the release.
-- Docs: README and Home carry the new lock paragraph in both languages; the Release-v0.1.0 notes keep theirs.
+- Docs: README and Home carry the new lock paragraph in both languages; the v0.1.0 GitHub release notes keep theirs.
 - Runtime proof: CI's integration jobs run the real entry and launcher on the runner's pwsh; a test there requires `fixed` and prints the version.
 
 ## Must-pass

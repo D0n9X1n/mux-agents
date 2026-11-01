@@ -48,7 +48,7 @@
 - 初始化：`-Platform linux`/`macos` 配合 `10.0.12` 返回 `Failure` 2 `runtime`；`New-MuxAgentProviders` 和 `Get-MuxAgentPlatformMembers` 的模拟不记录任何调用。设置覆盖开关并让模拟的 `New-MuxAgentProviders` 以 2 `state` 拒绝时，`Failure` 保留 `advisory`，入口和启动器会打印它。仅 Unix：受影响版本加覆盖开关时返回 `P.Advisory`。AST：参数默认值恰好是这两个调用；入口和启动器调用 `Initialize-MuxAgentProviders` 时只传 `-Entry`；没有其他地方调用 `New-MuxAgentProviders`。
 - 回复、`-Text`、watch 画面、启动器的 stderr 行和窗格环境（有和没有覆盖开关）：每项都分别测试有和没有 `Advisory`。
 - 锁：对三种异常类型中的每一种，抛出一次的工厂产生两次创建、一次 `100` 的休眠和一次操作运行；抛出两次的工厂以 2 `lock` 拒绝并指出 `XDG_RUNTIME_DIR`。来自名称的拒绝：不创建、不休眠、不运行操作。不重试，只创建一次且不休眠：其他异常类型、`WaitOne` 超时、被放弃的互斥体、`WaitOne` 抛出的 `IOException`（不运行操作；互斥体被释放）、操作内部的拒绝。重试获取之后，另一个 runspace 以超时 0 获取同一名称，证明已释放。
-- 文档：README 和 Home 以两种语言写入新的锁段落；Release-v0.1.0 发布说明保留原段落。
+- 文档：README 和 Home 以两种语言写入新的锁段落；v0.1.0 的 GitHub 发布说明保留原段落。
 - 运行时证明：CI 的集成作业在运行器的 pwsh 上运行真实的入口和启动器；那里的一个测试要求 `fixed`，并打印版本。
 
 ## 必须通过

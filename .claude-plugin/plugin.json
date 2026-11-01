@@ -1,6 +1,6 @@
 {
   "name": "mux-agents",
-  "version": "0.2.2",
+  "version": "0.2.3",
   "description": "Start Claude Code and Copilot CLI agents in tmux or rmux panes, see what each is doing, message them and stop them.",
   "author": { "name": "Dongxin Tang" },
   "keywords": ["rmux", "tmux", "agents", "skills", "claude-code", "copilot-cli"],
