@@ -1,7 +1,7 @@
 //! The session's agent panes, their records and exit notices (MuxAgents.ps1:535-546, 1014-1018, 1150-1204,
 //! 1287-1296).
 
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 
 use super::mail;
 use crate::caller::Caller;
@@ -201,18 +201,57 @@ pub fn add_notice(
     };
     let key = mail::mailbox_key(&super::text(record.get("parentPane")), "")?;
     let pane = super::text(record.get("pane"));
-    mail::add_mail(
+    let mut fields = Map::new();
+    fields.insert("kind".into(), kind.into());
+    fields.insert("exitCode".into(), code.clone());
+    let delivered = mail::add_once(
         ctx,
         caller,
         &key,
         &name,
         &pane,
         &body,
-        Some(&format!("exit-{id}")),
+        &format!("exit-{id}"),
+        &fields,
     )?;
+    // The first notice wins: a message already delivered (a marker write that failed after it) decides the marker.
+    let (kind, code) = match delivered {
+        Some(message) => delivered_notice(&message, &name),
+        None => (kind.to_string(), code),
+    };
     let at = crate::util::utc_o(ctx.clock.now());
-    crate::state::fs::write_json(&marker, &json!({"kind": kind, "exitCode": code, "at": at}))?;
+    let mut written = json!({"kind": kind, "exitCode": code, "at": at});
+    if kind == "lost" {
+        written["closedBy"] = "pane".into();
+    }
+    crate::state::fs::write_json(&marker, &written)?;
     Ok(true)
+}
+
+/// The (kind, exitCode) of a delivered exit message: its `kind` and `exitCode`, else (a 0.2.1 message) its fixed
+/// body `<name> exited with code <N>.`, `<name> was stopped.` or `<name> is gone: ...`; anything else is lost.
+fn delivered_notice(message: &Value, name: &str) -> (String, Value) {
+    let code = message.get("exitCode").filter(|c| c.is_i64());
+    match message.get("kind").and_then(Value::as_str) {
+        Some("exited") if code.is_some() => {
+            return ("exited".into(), code.cloned().unwrap_or(Value::Null));
+        }
+        Some(kind @ ("stopped" | "lost")) => return (kind.into(), Value::Null),
+        _ => {}
+    }
+    let body = super::text(message.get("body"));
+    let rest = body.strip_prefix(name).unwrap_or_default();
+    if rest == " was stopped." {
+        return ("stopped".into(), Value::Null);
+    }
+    let exited = rest
+        .strip_prefix(" exited with code ")
+        .and_then(|n| n.strip_suffix('.'))
+        .and_then(|n| n.parse::<i64>().ok());
+    match exited {
+        Some(n) => ("exited".into(), n.into()),
+        None => ("lost".into(), Value::Null),
+    }
 }
 
 /// Posts `lost` (or `exited` with launcher.json's code) for each committed agent of the caller's session whose
@@ -531,6 +570,148 @@ mod tests {
         assert!(add_notice(&w.ctx, &caller, ID, &record, Notice::Stopped).unwrap());
         assert!(folder.join("notice.json").is_file());
         assert_eq!(read_mail(&w.ctx, &caller, "pane-1").unwrap().len(), 1);
+    }
+
+    // notice.json as (kind, exitCode, closedBy).
+    fn marker_of(folder: &std::path::Path) -> (Value, Value, Value) {
+        let marker = crate::state::fs::read_json(&folder.join("notice.json"))
+            .unwrap()
+            .unwrap();
+        let field = |name: &str| marker.get(name).cloned().unwrap_or(Value::Null);
+        (field("kind"), field("exitCode"), field("closedBy"))
+    }
+
+    #[test]
+    fn notice_message_carries_kind_and_lost_is_closed_by_pane() {
+        for (notice, kind, code, closed) in [
+            (Notice::Exited(json!(3)), "exited", json!(3), Value::Null),
+            (Notice::Stopped, "stopped", Value::Null, Value::Null),
+            (Notice::Lost, "lost", Value::Null, json!("pane")),
+        ] {
+            let w = World::human("");
+            let caller = w.caller();
+            let folder = w.agent_record(ID, json!({}));
+            let record = record(&w.ctx, &caller, ID).unwrap().unwrap();
+            assert!(add_notice(&w.ctx, &caller, ID, &record, notice).unwrap());
+            let mailbox = w.state().join("mail").join("pane-1.jsonl");
+            let stored: Value =
+                serde_json::from_str(std::fs::read_to_string(mailbox).unwrap().trim_end()).unwrap();
+            assert_eq!(
+                (&stored["kind"], &stored["exitCode"]),
+                (&json!(kind), &code)
+            );
+            assert_eq!(marker_of(&folder), (json!(kind), code, closed));
+        }
+    }
+
+    #[test]
+    fn notice_follows_the_message_already_delivered() {
+        let gone = "worker is gone: its pane closed without an exit record.";
+        // (the stored message's body and fields, the notice this post tries, the notice.json it must write)
+        let cases: Vec<(&str, Option<Value>, Notice, (Value, Value, Value))> = vec![
+            // A message with kind and exitCode decides, whatever this post says.
+            (
+                "worker was stopped.",
+                Some(json!({"kind": "stopped", "exitCode": null})),
+                Notice::Exited(json!(0)),
+                (json!("stopped"), Value::Null, Value::Null),
+            ),
+            (
+                "worker exited with code 3.",
+                Some(json!({"kind": "exited", "exitCode": 3})),
+                Notice::Lost,
+                (json!("exited"), json!(3), Value::Null),
+            ),
+            (
+                gone,
+                Some(json!({"kind": "lost", "exitCode": null})),
+                Notice::Exited(json!(0)),
+                (json!("lost"), Value::Null, json!("pane")),
+            ),
+            // A 0.2.1 message (body only) is read from its fixed body.
+            (
+                "worker was stopped.",
+                None,
+                Notice::Exited(json!(0)),
+                (json!("stopped"), Value::Null, Value::Null),
+            ),
+            (
+                "worker exited with code 3.",
+                None,
+                Notice::Stopped,
+                (json!("exited"), json!(3), Value::Null),
+            ),
+            (
+                "worker exited with code -1073741510.",
+                None,
+                Notice::Stopped,
+                (json!("exited"), json!(-1073741510), Value::Null),
+            ),
+            (
+                gone,
+                None,
+                Notice::Exited(json!(0)),
+                (json!("lost"), Value::Null, json!("pane")),
+            ),
+            // Unparseable: lost, and the message stays the only one.
+            (
+                "something else",
+                None,
+                Notice::Exited(json!(0)),
+                (json!("lost"), Value::Null, json!("pane")),
+            ),
+            (
+                "worker exited with code x.",
+                None,
+                Notice::Stopped,
+                (json!("lost"), Value::Null, json!("pane")),
+            ),
+            (
+                "worker was stopped.",
+                Some(json!({"kind": "paused"})),
+                Notice::Exited(json!(0)),
+                (json!("stopped"), Value::Null, Value::Null),
+            ),
+        ];
+        for (body, fields, notice, want) in cases {
+            let w = World::human("");
+            let caller = w.caller();
+            let folder = w.agent_record(ID, json!({}));
+            let record = record(&w.ctx, &caller, ID).unwrap().unwrap();
+            let id = format!("exit-{ID}");
+            match &fields {
+                Some(fields) => {
+                    crate::agents::mail::add_once(
+                        &w.ctx,
+                        &caller,
+                        "pane-1",
+                        "worker",
+                        "%9",
+                        body,
+                        &id,
+                        fields.as_object().unwrap(),
+                    )
+                    .unwrap();
+                }
+                None => {
+                    crate::agents::mail::add_mail(
+                        &w.ctx,
+                        &caller,
+                        "pane-1",
+                        "worker",
+                        "%9",
+                        body,
+                        Some(&id),
+                    )
+                    .unwrap();
+                }
+            }
+            assert!(add_notice(&w.ctx, &caller, ID, &record, notice).unwrap());
+            assert_eq!(marker_of(&folder), want, "{body} {fields:?}");
+            let messages = read_mail(&w.ctx, &caller, "pane-1").unwrap();
+            assert_eq!(messages.len(), 1, "{body}");
+            assert_eq!(text(messages[0].get("text")).split('\n').nth(1), Some(body));
+        }
     }
 
     #[test]

@@ -742,4 +742,54 @@ mod tests {
         assert_eq!(notice_kind(&l), "stopped");
         assert!(mail(&l).is_empty());
     }
+
+    fn exits_0() -> io::Result<i32> {
+        Ok(0)
+    }
+
+    // A stop delivered `stopped`, then its marker write failed; the launcher's `exited 0` after it adds no message,
+    // and the marker it writes says what the one message says.
+    #[cfg(unix)]
+    #[test]
+    fn exited_after_a_stop_whose_marker_failed_keeps_stopped() {
+        use std::os::unix::fs::PermissionsExt;
+        let l = setup("claude", json!([]));
+        let caller = l.w.caller();
+        let record = crate::agents::registry::record(&l.w.ctx, &caller, ID)
+            .unwrap()
+            .unwrap();
+        let mode = |m: u32| {
+            std::fs::set_permissions(&l.folder, std::fs::Permissions::from_mode(m)).unwrap()
+        };
+        mode(0o500);
+        let stopped = add_notice(&l.w.ctx, &caller, ID, &record, Notice::Stopped);
+        mode(0o700);
+        assert!(stopped.is_err());
+        assert!(!l.folder.join("notice.json").exists());
+        assert_eq!(launch(&l, &spec_str(&l), exits_0).code, 0);
+        let notice: Value =
+            serde_json::from_slice(&std::fs::read(l.folder.join("notice.json")).unwrap()).unwrap();
+        assert_eq!(
+            (&notice["kind"], &notice["exitCode"]),
+            (&json!("stopped"), &Value::Null)
+        );
+        let messages = mail(&l);
+        assert_eq!(messages.len(), 1);
+        assert_eq!(
+            (&messages[0]["kind"], &messages[0]["body"]),
+            (&json!("stopped"), &json!("worker was stopped."))
+        );
+    }
+
+    // A reap that posted `lost` first wins over the launcher's later `exited`: one message, one marker.
+    #[test]
+    fn exited_after_reap_posts_nothing_new() {
+        let l = setup("claude", json!([]));
+        l.w.fakes.mux_first("#{pane_id}|#{@agent-id}", 0, "|\n", "");
+        crate::agents::registry::update_notices(&l.w.ctx, &l.w.caller(), Some(&[])).unwrap();
+        assert_eq!(notice_kind(&l), "lost");
+        assert_eq!(launch(&l, &spec_str(&l), exits_7).code, 7);
+        assert_eq!(notice_kind(&l), "lost");
+        assert_eq!(mail(&l).len(), 1);
+    }
 }
