@@ -46,6 +46,18 @@ pub(crate) fn lock<T>(_: &Ctx, key: &str, f: impl FnOnce() -> Res<T>) -> Res<T> 
     crate::testing::locked(key, f)
 }
 
+/// Runs `f` under the per-user lock for `key` when one attempt takes it, never waiting; `None` when it is busy.
+#[cfg(not(test))]
+pub(crate) fn try_lock<T>(ctx: &Ctx, key: &str, f: impl FnOnce() -> Res<T>) -> Res<Option<T>> {
+    crate::state::lock::try_with_lock(ctx, key, f)
+}
+
+/// Tests record the hold as `lock` does; a key held elsewhere (a shared gate or `lock_timeout`) is busy at once.
+#[cfg(test)]
+pub(crate) fn try_lock<T>(_: &Ctx, key: &str, f: impl FnOnce() -> Res<T>) -> Res<Option<T>> {
+    crate::testing::try_locked(key, f)
+}
+
 /// 2 `usage` with the verb's usage line.
 pub(crate) fn usage(verb: &str) -> Refusal {
     let line = crate::cli::VERBS

@@ -196,6 +196,49 @@ pub(crate) fn with_lock_in<T>(
 #[cfg(unix)]
 const BACK_OFF: Duration = Duration::from_millis(10);
 
+/// Runs `f` holding the lock for `key` when one attempt takes it, never waiting: `None` when another holder has
+/// it, so the caller can defer its work. A refusal of `f`'s own is passed on.
+#[cfg(unix)]
+pub fn try_with_lock<T>(ctx: &Ctx, key: &str, f: impl FnOnce() -> Res<T>) -> Res<Option<T>> {
+    try_with_lock_in(ctx, &lock_root(&Real, &passwd_home()?)?, key, f)
+}
+
+/// `try_with_lock` under an explicit lock root, so tests never touch the real one.
+#[cfg(unix)]
+pub(crate) fn try_with_lock_in<T>(
+    ctx: &Ctx,
+    root: &Path,
+    key: &str,
+    f: impl FnOnce() -> Res<T>,
+) -> Res<Option<T>> {
+    once(|f| with_lock_in(ctx, root, key, Duration::ZERO, f), f)
+}
+
+/// Runs `f` holding the named mutex for `key` when one zero wait takes it (an abandoned mutex counts as held, as
+/// in `with_lock`): `None` when another holder has it. A refusal of `f`'s own is passed on.
+#[cfg(windows)]
+pub fn try_with_lock<T>(ctx: &Ctx, key: &str, f: impl FnOnce() -> Res<T>) -> Res<Option<T>> {
+    once(|f| with_lock_timeout(ctx, key, Duration::ZERO, f), f)
+}
+
+// A zero-wait lock call: its `lock` refusal before `f` ran is "busy", anything else is `f`'s own.
+fn once<T>(
+    take: impl FnOnce(&mut dyn FnMut() -> Res<T>) -> Res<T>,
+    f: impl FnOnce() -> Res<T>,
+) -> Res<Option<T>> {
+    let mut f = Some(f);
+    let ran = std::cell::Cell::new(false);
+    let got = take(&mut || {
+        ran.set(true);
+        (f.take().expect("run once"))()
+    });
+    match got {
+        Ok(value) => Ok(Some(value)),
+        Err(refusal) if refusal.check == "lock" && !ran.get() => Ok(None),
+        Err(refusal) => Err(refusal),
+    }
+}
+
 // O_NOFOLLOW: a link at the name is refused, never followed. The file is never removed, so its name stays
 // bound to one inode that every holder locks.
 #[cfg(unix)]
@@ -538,6 +581,38 @@ mod tests {
             assert_eq!(with_lock_in(&ctx, &root, "k", wait, || Ok(2)), Ok(2));
             // The file stays.
             assert!(path.is_file());
+        }
+
+        // One attempt, no wait: a held lock answers None at once (no back-off on the clock) and the action never
+        // runs; a free one runs it. A refusal of the action's own is passed on, never read as busy.
+        #[test]
+        fn try_takes_once_without_waiting() {
+            let dir = TempDir::new();
+            let root = dir.path().join("locks");
+            let fakes = Fakes::default();
+            let ctx = fakes.ctx();
+            assert_eq!(try_with_lock_in(&ctx, &root, "k", || Ok(7)), Ok(Some(7)));
+            let holder = File::open(lock_path(&root, "k")).unwrap();
+            holder.lock().unwrap();
+            let ran = Cell::new(false);
+            let busy = try_with_lock_in(&ctx, &root, "k", || {
+                ran.set(true);
+                Ok(())
+            });
+            assert_eq!(busy, Ok(None));
+            assert!(!ran.get());
+            assert!(fakes.slept().is_empty());
+            holder.unlock().unwrap();
+            drop(holder);
+            let inner = try_with_lock_in(&ctx, &root, "k", || -> Res<()> {
+                refuse(2, "lock", "timed out waiting for the agent lock")
+            });
+            assert_eq!(
+                refusal(inner),
+                (2, "lock", "timed out waiting for the agent lock".into())
+            );
+            assert!(free_now(&lock_path(&root, "k")));
+            assert_eq!(try_with_lock_in(&ctx, &root, "k", || Ok(2)), Ok(Some(2)));
         }
 
         // The lock is held while the action runs: another descriptor cannot take it then.
@@ -897,6 +972,35 @@ mod tests {
             );
             assert!(!ran);
             assert_eq!(try_elsewhere(&key, wait), (true, Ok(1)));
+        }
+
+        // One attempt, no wait: another thread's try while the mutex is held answers None at once; once it is
+        // released, the try runs its action.
+        #[test]
+        fn windows_try_takes_once_without_waiting() {
+            let key = key();
+            let attempt = |key: &str| {
+                let key = key.to_owned();
+                std::thread::spawn(move || {
+                    let ran = Arc::new(AtomicBool::new(false));
+                    let seen = ran.clone();
+                    let at = std::time::Instant::now();
+                    let got = try_with_lock(&Fakes::default().ctx(), &key, || {
+                        seen.store(true, Ordering::SeqCst);
+                        Ok(1u8)
+                    });
+                    (ran.load(Ordering::SeqCst), got, at.elapsed())
+                })
+                .join()
+                .unwrap()
+            };
+            let ctx = Fakes::default().ctx();
+            let (ran, busy, took) =
+                with_lock_timeout(&ctx, &key, LOCK_WAIT, || Ok(attempt(&key))).unwrap();
+            assert_eq!((ran, busy), (false, Ok(None)));
+            assert!(took < Duration::from_secs(1), "{took:?}");
+            let (ran, free, _) = attempt(&key);
+            assert_eq!((ran, free), (true, Ok(Some(1))));
         }
 
         #[test]

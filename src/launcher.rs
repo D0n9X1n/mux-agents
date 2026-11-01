@@ -743,6 +743,8 @@ mod tests {
         assert!(mail(&l).is_empty());
     }
 
+    // Only the Unix-only marker test uses it.
+    #[cfg(unix)]
     fn exits_0() -> io::Result<i32> {
         Ok(0)
     }
@@ -791,5 +793,93 @@ mod tests {
         assert_eq!(launch(&l, &spec_str(&l), exits_7).code, 7);
         assert_eq!(notice_kind(&l), "lost");
         assert_eq!(mail(&l).len(), 1);
+    }
+
+    // Waits up to 10 s for `ready`, then fails naming `what`.
+    fn until(what: &str, ready: impl Fn() -> bool) {
+        let end = std::time::Instant::now() + Duration::from_secs(10);
+        while !ready() {
+            assert!(std::time::Instant::now() < end, "timed out: {what}");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    // The launcher's post and a reap contend for the agent's notice lock, as two processes do: each runs on its own
+    // thread, and the one that holds the lock first keeps it until the other is waiting for it. Whichever holds it
+    // first posts; the other waits and posts nothing. One message, one marker, and they agree.
+    #[test]
+    fn exited_and_reap_contend_for_the_notice_lock() {
+        for reap_first in [true, false] {
+            let label = if reap_first {
+                "reap first"
+            } else {
+                "launcher first"
+            };
+            let l = setup("claude", json!([]));
+            let gate = std::sync::Arc::new(crate::testing::Gate::default());
+            l.w.fakes.share_locks(gate.clone());
+            let key = format!("notice|{}|{ID}", l.w.caller().server_key);
+            let root = l.w.ctx.state_root.clone();
+            std::thread::scope(|scope| {
+                let reaper = scope.spawn(|| {
+                    // Another process: its own fakes over the same state root.
+                    let mut w = World::human("");
+                    w.ctx.state_root = root.clone();
+                    w.fakes.share_locks(gate.clone());
+                    w.panes(&[]);
+                    w.fakes.mux_rule("#{pane_id}|#{@agent-id}", 0, "|\n", "");
+                    if reap_first {
+                        let (gate, key) = (gate.clone(), key.clone());
+                        w.fakes.lock_probe(move |event| {
+                            if event == format!("+{key}") {
+                                until("the launcher to wait", || gate.waiting(&key) > 0);
+                            }
+                            String::new()
+                        });
+                    } else {
+                        until("the launcher to hold the lock", || gate.held(&key));
+                    }
+                    crate::agents::registry::reap(&w.ctx, &w.caller(), None, false).unwrap()
+                });
+                if reap_first {
+                    until("reap to hold the lock", || gate.held(&key));
+                } else {
+                    let (gate, key) = (gate.clone(), key.clone());
+                    l.w.fakes.lock_probe(move |event| {
+                        if event == format!("+{key}") {
+                            until("reap to wait", || gate.waiting(&key) > 0);
+                        }
+                        String::new()
+                    });
+                }
+                post_exited(&l.w.ctx, &l.folder, 7).unwrap();
+                reaper.join().unwrap();
+            });
+            assert_eq!(
+                gate.waited(&key),
+                1,
+                "{label}: the lock was never contended"
+            );
+            let messages = mail(&l);
+            assert_eq!(messages.len(), 1, "{label} {messages:?}");
+            let notice: Value =
+                serde_json::from_slice(&std::fs::read(l.folder.join("notice.json")).unwrap())
+                    .unwrap();
+            let (kind, code) = if reap_first {
+                (json!("lost"), Value::Null)
+            } else {
+                (json!("exited"), json!(7))
+            };
+            assert_eq!(
+                (&notice["kind"], &notice["exitCode"]),
+                (&kind, &code),
+                "{label}"
+            );
+            assert_eq!(
+                (&messages[0]["kind"], &messages[0]["exitCode"]),
+                (&notice["kind"], &notice["exitCode"]),
+                "{label}: the message and the marker disagree"
+            );
+        }
     }
 }

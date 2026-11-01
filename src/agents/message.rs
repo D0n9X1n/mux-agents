@@ -199,20 +199,21 @@ pub fn stop(ctx: &Ctx, request: &Request) -> Res<Map<String, Value>> {
         return none();
     };
     parent_or_human(&caller, &record)?;
-    // A pane pid that is not a number would walk from pid 0, whose "children" are unrelated processes.
-    let root: u32 = pane
-        .pid
-        .parse()
-        .map_err(|_| Refusal::internal("the pane pid is not a number"))?;
     let folder = server_dir(ctx, &caller).join("agents").join(&pane.id);
     let launcher = folder.join("launcher.json");
     let marker = folder.join("notice.json");
     let left = lock(ctx, &lock_key("notice", &caller, &pane.id), || {
-        // Ended since it was resolved: a notice is there, or the pane is gone and gets its one notice now.
+        // Ended since it was resolved: a notice is there, or the pane is gone and gets its one notice now. Checked
+        // before the pid is read: tmux 3.8 lists a dead pane with none.
         registry::post_if_gone(ctx, &caller, &pane.id, &record)?;
         if let Some(notice) = read_json(&marker)? {
             return Ok(Err(text(notice.get("kind"))));
         }
+        // A pane pid that is not a number would walk from pid 0, whose "children" are unrelated processes.
+        let root: u32 = pane
+            .pid
+            .parse()
+            .map_err(|_| Refusal::internal("the pane pid is not a number"))?;
         let table = ctx.os.table()?;
         // The pane's process must be the agent's own launcher: launcher.json's pid and start, the table's start, and
         // the start of the process the pid opens now, all one. A launcher that never recorded itself, or a pane pid
@@ -1330,5 +1331,38 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(written["closedBy"], "pane");
+    }
+
+    #[test]
+    fn stop_a_dead_pane_without_pid_answers_already() {
+        // tmux 3.8 lists a remain-on-exit dead pane with no pid. The agent ended while reap listed again: its
+        // notice is there (or reap's probe posts one), so stop answers already before it ever reads the pid.
+        for (noticed, state) in [(true, "exited"), (false, "lost")] {
+            let w = stop_world(false, json!({}));
+            let folder = w.folder("bbbbbbbbbbbb");
+            if noticed {
+                write(
+                    &folder.join("notice.json"),
+                    json!({"kind": "exited", "exitCode": 0, "at": "x"}),
+                );
+            }
+            w.panes_dead(&["%9|@5||bbbbbbbbbbbb|worker"], &["%9"]);
+            // The conditional kill ran but the pane is still listed (as a respawn or a slow server would leave it);
+            // its probe answers gone.
+            w.fakes
+                .mux_rule("-t %9 #{pane_id}|#{@agent-id}", 0, "|\n", "");
+            w.fakes.clear_log();
+            let reply = run(&w, stop, &["stop", "worker"]);
+            assert!(
+                reply.contains(&format!(r#""already":"{state}""#)),
+                "{noticed} {reply}"
+            );
+            assert!(
+                !w.fakes.mux_calls().iter().any(|c| c[1] == "kill-pane"),
+                "{noticed}"
+            );
+            assert!(proc_calls(&w).is_empty(), "{noticed}");
+            assert_eq!(stored(&w), usize::from(!noticed), "{noticed}");
+        }
     }
 }
