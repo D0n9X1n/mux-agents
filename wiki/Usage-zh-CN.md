@@ -57,7 +57,7 @@ flowchart LR
 
 ## 侧边栏
 
-在 Claude Code 中，第一次成功 `spawn` 后（或用 `/mux-agents-pane`）会在聊天旁打开 `Agents` 窗格，每 3 秒刷新一次。在任何客户端中，第一次成功 `spawn` 还会在你旁边打开一个 42 列宽的分屏，每 2 秒重绘一次；之后的启动复用它，`sidebar -Close` 在本会话剩余时间内关闭它，`sidebar` 重新打开它：
+在 Claude Code 中，第一次成功 `spawn` 后（或用 `/mux-agents-pane`）会在聊天旁打开 `Agents` 窗格，每 3 秒刷新一次。在任何客户端中，第一次成功 `spawn` 还会在你的窗口右边缘打开一个占满整个高度、宽为窗口五分之一（至少 40 列）的分屏，每 2 秒重绘一次；之后的启动复用它，`sidebar -Close` 在本会话剩余时间内关闭它，`sidebar` 重新打开它：
 
 ```text
 mux-agents · 2 running
@@ -71,6 +71,10 @@ mux-agents · 2 running
 “正在做的事”是代理最近用 `status` 报告的内容，否则是它最后一条消息的第一行，否则是它的任务。
 
 在标签页模式下，侧边栏留在你启动代理的窗口里，而不在每个代理的窗口里。`sidebar -Close` 只关闭这个多路复用器侧边栏；Claude Code 的 `Agents` 窗格与它无关。
+
+侧边栏始终停在右边缘、占满整个高度：拆分、布局变化、`swap-pane` 或 `rotate-window` 移动了它时，下一次重绘会把它移回去，且不改变你的焦点。它的宽度随窗口宽度变化；你拖出来的宽度会保留到窗口大小改变为止。有窗格处于放大（zoom）状态时，侧边栏不做任何调整，所以绝不会取消你的放大。如果连续 3 次移回失败，它会停止尝试并显示 `layout: repair paused`，直到布局改变或过了一分钟。
+
+侧边栏是 `sidebar` 在其中启动的那个进程，而不是它的 `@agent-role sidebar` 标签，所以标签被移动后（rmux 的 `rotate-window` 会把标签留在原处）也绝不会把你的窗格当作侧边栏。带有该标签但不是那个进程的窗格绝不会被关闭：`sidebar`、`sidebar -Close` 和 spawn 都会拒绝并指出它。如果它是旧的侧边栏（例如由 0.2.1 打开、`sidebar -Close` 无法证明的那种），用 `kill-pane -t <pane>` 关闭它；如果它是你自己的窗格，用 `set-option -p -u -t <pane> @agent-role` 清除标签。你手动运行的 `mux-agent watch` 只绘制面板；只有侧边栏会维持布局。
 
 ## 安全检查
 

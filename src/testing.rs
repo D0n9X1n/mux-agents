@@ -206,6 +206,11 @@ impl Fakes {
         self.0.borrow_mut().rows.push(row);
     }
 
+    /// The process `pid` is gone: no row, no open.
+    pub fn forget(&self, pid: u32) {
+        self.0.borrow_mut().rows.retain(|r| r.pid != pid);
+    }
+
     /// The first rule whose text appears in the space-joined argv answers; anything else exits 0 with no output.
     pub fn mux_rule(&self, contains: &str, code: i32, stdout: &str, stderr: &str) {
         let output = Output {

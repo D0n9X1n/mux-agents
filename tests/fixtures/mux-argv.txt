@@ -21,9 +21,20 @@
 -N set-option -p -t %12 allow-set-title off
 # 0.2.1: committed and the spawn lock released, the side bar is found or opened under the sidebar lock
 -N show-options -qv -t $3 @mux-agents-sidebar
--N list-panes -s -t $3 -F #{pane_id}|#{window_id}|#{@agent-role}|#{@agent-id}
--N split-window -d -h -P -F #{pane_id}|#{window_id} -t %1 -e MUX_AGENTS_STATE=<state> -l 42 <exe> watch
--N set-option -p -t %13 @agent-role sidebar
+# 0.2.3 (#47): no recorded bar, and no labelled pane anywhere in the session
+-N show-options -qv -t $3 @mux-agents-sidebar-id
+-N list-panes -s -t $3 -F #{pane_id}|#{==:#{@agent-role},sidebar}
+# 0.2.3 (S1): the window's width sizes the bar, max(40, width / 5); a full-height split at the right edge
+-N display-message -p -t %1 #{window_width}
+-N split-window -d -f -h -P -F #{pane_id}|#{window_id}|#{pane_pid} -t %1 -e MUX_AGENTS_STATE=<state> -l 40 <exe> watch
+-N if-shell -F -t %13 #{&&:#{==:#{pane_dead},0},#{==:#{pane_pid},113}} 'set-option -p -t %13 @agent-role sidebar'
+-N display-message -p -t %13 #{@agent-role}
+# 0.2.3 (#47): pid 113 is this binary `watch`, so the bar is recorded as <pane> <pid> <start>
+-N set-option -t $3 @mux-agents-sidebar-id '%13 113 1130'
+# rmux ignores -l, so the bar is sized again
+-N if-shell -F -t %13 #{&&:#{==:#{pane_dead},0},#{==:#{pane_pid},113}} 'resize-pane -t %13 -x 40'
+# 0.2.3 (#47): proven last, so a pane replaced during open is never reported as the bar
+-N display-message -p -t %13 #{pane_id}|#{window_id}|#{pane_dead}|#{pane_pid}
 
 [spawn -Client copilot -Task hi -Split v -Name helper]
 -N display-message -p -t %1 #{pid}|#{pane_pid}|#{session_id}|#{window_id}|#{@agent-id}
@@ -33,9 +44,20 @@
 -N set-option -p -t %12 @agent-id <id> ; set-option -p -t %12 @agent-name helper ; set-option -p -t %12 @agent-parent %1 ; set-option -p -t %12 @agent-context brief:human ; select-pane -T helper -t %12
 -N set-option -p -t %12 allow-set-title off
 -N show-options -qv -t $3 @mux-agents-sidebar
--N list-panes -s -t $3 -F #{pane_id}|#{window_id}|#{@agent-role}|#{@agent-id}
--N split-window -d -h -P -F #{pane_id}|#{window_id} -t %1 -e MUX_AGENTS_STATE=<state> -l 42 <exe> watch
--N set-option -p -t %13 @agent-role sidebar
+# 0.2.3 (#47): no recorded bar, and no labelled pane anywhere in the session
+-N show-options -qv -t $3 @mux-agents-sidebar-id
+-N list-panes -s -t $3 -F #{pane_id}|#{==:#{@agent-role},sidebar}
+# 0.2.3 (S1): the window's width sizes the bar, max(40, width / 5); a full-height split at the right edge
+-N display-message -p -t %1 #{window_width}
+-N split-window -d -f -h -P -F #{pane_id}|#{window_id}|#{pane_pid} -t %1 -e MUX_AGENTS_STATE=<state> -l 40 <exe> watch
+-N if-shell -F -t %13 #{&&:#{==:#{pane_dead},0},#{==:#{pane_pid},113}} 'set-option -p -t %13 @agent-role sidebar'
+-N display-message -p -t %13 #{@agent-role}
+# 0.2.3 (#47): pid 113 is this binary `watch`, so the bar is recorded as <pane> <pid> <start>
+-N set-option -t $3 @mux-agents-sidebar-id '%13 113 1130'
+# rmux ignores -l, so the bar is sized again
+-N if-shell -F -t %13 #{&&:#{==:#{pane_dead},0},#{==:#{pane_pid},113}} 'resize-pane -t %13 -x 40'
+# 0.2.3 (#47): proven last, so a pane replaced during open is never reported as the bar
+-N display-message -p -t %13 #{pane_id}|#{window_id}|#{pane_dead}|#{pane_pid}
 
 [spawn -Client claude -Task hi, placement h, side bar off]
 -N display-message -p -t %1 #{pid}|#{pane_pid}|#{session_id}|#{window_id}|#{@agent-id}
@@ -125,33 +147,61 @@
 # 0.2.1: sidebar turns the bar back on for the session, inside the sidebar lock
 -N set-option -u -t $3 @mux-agents-sidebar
 # :1526
--N list-panes -s -t $3 -F #{pane_id}|#{window_id}|#{@agent-role}|#{@agent-id}
-# :1578-1579
--N split-window -d -h -P -F #{pane_id}|#{window_id} -t %1 -e MUX_AGENTS_STATE=<state> -l 42 <exe> watch
+# 0.2.3 (#47): no recorded bar, and no labelled pane anywhere in the session
+-N show-options -qv -t $3 @mux-agents-sidebar-id
+-N list-panes -s -t $3 -F #{pane_id}|#{==:#{@agent-role},sidebar}
+# 0.2.3 (S1): the window's width, then a full-height split at the right edge (:1578-1579)
+-N display-message -p -t %1 #{window_width}
+-N split-window -d -f -h -P -F #{pane_id}|#{window_id}|#{pane_pid} -t %1 -e MUX_AGENTS_STATE=<state> -l 40 <exe> watch
 # :1584
--N set-option -p -t %13 @agent-role sidebar
+-N if-shell -F -t %13 #{&&:#{==:#{pane_dead},0},#{==:#{pane_pid},113}} 'set-option -p -t %13 @agent-role sidebar'
+-N display-message -p -t %13 #{@agent-role}
+# 0.2.3 (#47): pid 113 is this binary `watch`, so the bar is recorded as <pane> <pid> <start>
+-N set-option -t $3 @mux-agents-sidebar-id '%13 113 1130'
+-N if-shell -F -t %13 #{&&:#{==:#{pane_dead},0},#{==:#{pane_pid},113}} 'resize-pane -t %13 -x 40'
+# 0.2.3 (#47): proven last, so a pane replaced during open is never reported as the bar
+-N display-message -p -t %13 #{pane_id}|#{window_id}|#{pane_dead}|#{pane_pid}
 
 [sidebar, -l refused]
 -N display-message -p -t %1 #{pid}|#{pane_pid}|#{session_id}|#{window_id}|#{@agent-id}
 -N set-option -u -t $3 @mux-agents-sidebar
--N list-panes -s -t $3 -F #{pane_id}|#{window_id}|#{@agent-role}|#{@agent-id}
--N split-window -d -h -P -F #{pane_id}|#{window_id} -t %1 -e MUX_AGENTS_STATE=<state> -l 42 <exe> watch
+# 0.2.3 (#47): no recorded bar, and no labelled pane anywhere in the session
+-N show-options -qv -t $3 @mux-agents-sidebar-id
+-N list-panes -s -t $3 -F #{pane_id}|#{==:#{@agent-role},sidebar}
+-N display-message -p -t %1 #{window_width}
+-N split-window -d -f -h -P -F #{pane_id}|#{window_id}|#{pane_pid} -t %1 -e MUX_AGENTS_STATE=<state> -l 40 <exe> watch
 # :1580
--N split-window -d -h -P -F #{pane_id}|#{window_id} -t %1 -e MUX_AGENTS_STATE=<state> <exe> watch
--N set-option -p -t %13 @agent-role sidebar
+-N split-window -d -f -h -P -F #{pane_id}|#{window_id}|#{pane_pid} -t %1 -e MUX_AGENTS_STATE=<state> <exe> watch
+-N if-shell -F -t %13 #{&&:#{==:#{pane_dead},0},#{==:#{pane_pid},113}} 'set-option -p -t %13 @agent-role sidebar'
+-N display-message -p -t %13 #{@agent-role}
+# 0.2.3 (#47): pid 113 is this binary `watch`, so the bar is recorded as <pane> <pid> <start>
+-N set-option -t $3 @mux-agents-sidebar-id '%13 113 1130'
+# the multiplexer chose the width, so the resize sets it
+-N if-shell -F -t %13 #{&&:#{==:#{pane_dead},0},#{==:#{pane_pid},113}} 'resize-pane -t %13 -x 40'
+# 0.2.3 (#47): proven last, so a pane replaced during open is never reported as the bar
+-N display-message -p -t %13 #{pane_id}|#{window_id}|#{pane_dead}|#{pane_pid}
 
 [sidebar -Close]
 -N display-message -p -t %1 #{pid}|#{pane_pid}|#{session_id}|#{window_id}|#{@agent-id}
 # 0.2.1: off first, inside the sidebar lock, so no spawn reopens the bar
 -N set-option -t $3 @mux-agents-sidebar off
--N list-panes -s -t $3 -F #{pane_id}|#{window_id}|#{@agent-role}|#{@agent-id}
-# :1532
--N display-message -p -t %13 #{pane_id}|#{window_id}|#{@agent-role}|#{@agent-id}|end
-# :1555
--N kill-pane -t %13
+# 0.2.3 (#47): the recorded bar, proven by one read (alive, the recorded pid) and its process (alive, the same start,
+# still this binary `watch`); a label is never trusted
+-N show-options -qv -t $3 @mux-agents-sidebar-id
+-N display-message -p -t %13 #{pane_id}|#{window_id}|#{pane_dead}|#{pane_pid}
+# :1555; 0.2.3 (#47): killed only while still alive with that pid, checked by the server in the same command; the
+# pane is read again and must be gone, then the record is cleared
+-N if-shell -F -t %13 #{&&:#{==:#{pane_dead},0},#{==:#{pane_pid},113}} 'kill-pane -t %13'
+-N display-message -p -t %13 #{pane_id}|#{pane_pid}
+-N set-option -u -t $3 @mux-agents-sidebar-id
 
 [watch, one frame]
 -N display-message -p -t %1 #{pid}|#{pane_pid}|#{session_id}|#{window_id}|#{@agent-id}
 # :1482
 -N display-message -p -t %1 #{pane_id}|#{@agent-role}
+# 0.2.3 (S1, #47): only the watch the record names, by its own pane and process, reads its window and repairs it;
+# the record is proven like any other: its pane runs this watch's pid, and the pid is this watch with that start
+-N show-options -qv -t $3 @mux-agents-sidebar-id
+-N display-message -p -t %1 #{pane_id}|#{window_id}|#{pane_dead}|#{pane_pid}
+-N list-panes -t %1 -F #{pane_id}|#{pane_active}|#{pane_at_right}|#{pane_at_top}|#{pane_at_bottom}|#{pane_width}|#{window_width}|#{pane_left}|#{pane_top}|#{window_zoomed_flag}
 -N list-panes -s -t $3 -F <marker>|#{pane_id}|#{window_id}|#{pane_pid}|#{pane_dead}|#{@agent-id}|#{@agent-name}|<marker>
