@@ -2155,7 +2155,8 @@ exec claude --dangerously-skip-permissions
         live.server.send_keys_to(pane, &line);
         live.server.wait("the manual watch to draw", || {
             live.call(&["capture-pane", "-p", "-t", pane])
-                .contains("mux-agents \u{b7}")
+                .lines()
+                .any(|l| l.trim_start().starts_with("mux-agents") && l.contains(" running"))
                 .then_some(())
         });
     }
@@ -2187,15 +2188,24 @@ exec claude --dangerously-skip-permissions
         let (code, all) = live.run(&["list", "-All"]);
         assert_eq!(code, 0, "{mux:?} {all}");
         let keys = |v: &Value| v.as_object().unwrap().keys().cloned().collect::<Vec<_>>();
-        assert_eq!(keys(&all), ["ok", "verb", "running", "agents"], "{mux:?}");
         assert_eq!(
-            (&all["ok"], &all["verb"], &all["running"]),
-            (&json!(true), &json!("list"), &json!(1)),
+            keys(&all),
+            ["ok", "verb", "running", "endedTotal", "agents"],
+            "{mux:?}"
+        );
+        assert_eq!(
+            (
+                &all["ok"],
+                &all["verb"],
+                &all["running"],
+                &all["endedTotal"]
+            ),
+            (&json!(true), &json!("list"), &json!(1), &json!(1)),
             "{mux:?}"
         );
         let rows = all["agents"].as_array().unwrap();
         assert_eq!(rows.len(), 2, "{mux:?} {all}");
-        const ROW: [&str; 15] = [
+        const ROW: [&str; 16] = [
             "name",
             "client",
             "pane",
@@ -2211,6 +2221,7 @@ exec claude --dangerously-skip-permissions
             "age",
             "unread",
             "model",
+            "color",
         ];
         // w2's stop notice is unread in the root's mailbox, from w2's pane.
         for (row, (w, state, unread)) in rows.iter().zip([(&w1, "running", 0), (&w2, "stopped", 1)])
