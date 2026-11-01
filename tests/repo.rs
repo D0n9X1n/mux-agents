@@ -885,6 +885,8 @@ fn ci_jobs_run_cargo_and_sh() {
             "cargo test --features live,test-panic --locked --test live",
             "sh tests/release.sh",
             "sh tests/wiki.sh",
+            "@anthropic-ai/claude-code@2.1.310",
+            "sh tests/upgrade.sh",
         ],
     );
     ordered(

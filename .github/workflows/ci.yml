@@ -163,3 +163,8 @@ jobs:
         run: sh tests/release.sh
       - name: Wiki publisher tests
         run: sh tests/wiki.sh
+      # The real one-line upgrade: claude plugin update moves an installed mux-agents to a new version, offline.
+      - name: Install Claude Code 2.1.310
+        run: npm install --global @anthropic-ai/claude-code@2.1.310
+      - name: Upgrade tests
+        run: sh tests/upgrade.sh
