@@ -29,7 +29,8 @@ The commands below, and the Reply and Listen lines, run as-is in the Bash tool. 
 
 ```
 "<entry>" spawn -Client <client> -TaskFile <task-file> -BriefFile <brief-file>
-"<entry>" placement tab|h|v
+"<entry>" placement tab
+"<entry>" placement h
 "<entry>" placement
 "<entry>" list
 "<entry>" list -All
