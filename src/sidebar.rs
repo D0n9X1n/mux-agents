@@ -745,6 +745,15 @@ pub fn kill_command(pane: &str, pid: u32) -> Vec<String> {
     bound(pane, pid, format!("kill-pane -t {pane}"))
 }
 
+/// The conditional label of `pane` as the side bar, only while it is alive and still runs `pid`.
+pub fn label_command(pane: &str, pid: u32) -> Vec<String> {
+    bound(
+        pane,
+        pid,
+        format!("set-option -p -t {pane} @agent-role sidebar"),
+    )
+}
+
 /// The conditional resize of `pane` to `width` columns, only while it is alive and still runs `pid`.
 pub fn resize_command(pane: &str, pid: u32, width: &str) -> Vec<String> {
     bound(pane, pid, format!("resize-pane -t {pane} -x {width}"))
@@ -778,7 +787,8 @@ fn new_watch(ctx: &Ctx, pid: u32) -> Option<i64> {
 /// the state root) so watch reads the caller's state. The bar is `bar_width` of the window (40 when the width cannot
 /// be read), asked for with -l and set again by a pid-bound resize-pane, since rmux ignores -l; a refused resize is left to
 /// the next watch tick. `-d` keeps the active pane. The split's process must be this binary `watch` (else nothing is
-/// killed and the open refuses); then the pane is labelled and recorded as `<pane> <pid> <start>`. A bar that cannot
+/// killed and the open refuses); then the pane is labelled (bound to that pid, read back) and recorded as
+/// `<pane> <pid> <start>`. A bar that cannot
 /// be labelled or recorded is closed by the guarded kill, which spares a pane that runs anything else by then. The
 /// bar is proven as the last step; a pane that fails it is not killed, its record is cleared and the open refuses.
 fn open(ctx: &Ctx, caller: &Caller) -> Res<(String, String)> {
@@ -817,18 +827,29 @@ fn open(ctx: &Ctx, caller: &Caller) -> Res<(String, String)> {
         );
     };
     let record = format!("{pane} {pid} {start}");
-    let steps: [(&str, Vec<&str>); 2] = [
-        (
-            "tagged",
-            vec!["set-option", "-p", "-t", &pane, "@agent-role", "sidebar"],
-        ),
-        (
-            "recorded",
-            vec!["set-option", "-t", &caller.session, RECORD, &record],
-        ),
-    ];
-    for (what, args) in steps {
-        if native(ctx, &args, true).is_ok_and(|done| done.code == 0) {
+    // The label is bound to the checked pid like the kill: a pane replaced since is never labelled. `if-shell -F`
+    // answers 0 either way, so the label is read back.
+    let label = label_command(&pane, pid);
+    let label: Vec<&str> = label.iter().map(String::as_str).collect();
+    let labelled = native(ctx, &label, true).is_ok_and(|done| done.code == 0)
+        && native(
+            ctx,
+            &["display-message", "-p", "-t", &pane, "#{@agent-role}"],
+            true,
+        )
+        .is_ok_and(|read| {
+            read.code == 0 && read.stdout.trim_end_matches(['\r', '\n']) == "sidebar"
+        });
+    let recorded = || {
+        native(
+            ctx,
+            &["set-option", "-t", &caller.session, RECORD, &record],
+            true,
+        )
+        .is_ok_and(|done| done.code == 0)
+    };
+    for (what, done) in [("tagged", labelled), ("recorded", labelled && recorded())] {
+        if done {
             continue;
         }
         if kill_bar(ctx, &pane, pid) {
@@ -861,7 +882,8 @@ fn open(ctx: &Ctx, caller: &Caller) -> Res<(String, String)> {
             1,
             "sidebar",
             format!(
-                "the new side-bar pane {pane} no longer runs this plugin's watch; close it with kill-pane -t {pane}"
+                "the new side-bar pane {pane} no longer runs this plugin's watch; close it with kill-pane -t {pane}, \
+                 or, if it is your own pane, clear its label with set-option -p -u -t {pane} @agent-role"
             ),
         );
     }
@@ -886,7 +908,6 @@ mod tests {
     const READ_RECORD: &str = "-N show-options -qv -t $3 @mux-agents-sidebar-id";
     const CLEAR_RECORD: &str = "-N set-option -u -t $3 @mux-agents-sidebar-id";
     const LABELS: &str = "-N list-panes -s -t $3 -F #{pane_id}|#{==:#{@agent-role},sidebar}";
-    const TAG7: &str = "-N set-option -p -t %7 @agent-role sidebar";
     const RECORD7: &str = "-N set-option -t $3 @mux-agents-sidebar-id %7 107 1070";
     const PROOF: &str = "#{pane_id}|#{window_id}|#{pane_dead}|#{pane_pid}";
     // The watch's own record: pane %7, the fake process 4242 started at 2000.
@@ -1675,7 +1696,7 @@ mod tests {
         kill_fail: Option<&'static str>,
         probe_fail: Option<(&'static str, usize)>,
         // One respawn of the bar's pane: `proof` right after its first proof read, `kill` just before the kill,
-        // `label` right after open writes its label.
+        // `pre-label` just before open's label, `label` right after it.
         race: Option<&'static str>,
     }
 
@@ -1771,22 +1792,27 @@ mod tests {
         if mux.disabled {
             set(&panes, OPTION, "off".into());
         }
-        // The labels, compared by the server: a value only equal to `sidebar` is the label.
+        // The labels, compared by the server: a value only equal to `sidebar` is the label. A read of one pane's
+        // `#{@agent-role}` answers its role.
         let p = panes.clone();
-        w.fakes
-            .mux_script("#{==:#{@agent-role},sidebar}", move |argv| {
-                assert_eq!(argv[1..6], ["list-panes", "-s", "-t", "$3", "-F"]);
-                let text: String = p
-                    .borrow()
-                    .iter()
-                    .filter(|(k, _)| k.starts_with('%'))
-                    .map(|(pane, v)| {
-                        let role = v.split_once('|').map_or(v.as_str(), |(r, _)| r);
-                        format!("{pane}|{}\n", flag(role == "sidebar"))
-                    })
-                    .collect();
-                Ok(out(0, &text, ""))
-            });
+        w.fakes.mux_script("#{@agent-role}", move |argv| {
+            if argv[1] == "display-message" {
+                let role = get(&p, &argv[4]).unwrap_or_default();
+                let role = role.split_once('|').map_or(role.as_str(), |(r, _)| r);
+                return Ok(out(0, &format!("{role}\n"), ""));
+            }
+            assert_eq!(argv[1..6], ["list-panes", "-s", "-t", "$3", "-F"]);
+            let text: String = p
+                .borrow()
+                .iter()
+                .filter(|(k, _)| k.starts_with('%'))
+                .map(|(pane, v)| {
+                    let role = v.split_once('|').map_or(v.as_str(), |(r, _)| r);
+                    format!("{pane}|{}\n", flag(role == "sidebar"))
+                })
+                .collect();
+            Ok(out(0, &text, ""))
+        });
         let race = Rc::new(Cell::new(mux.race));
         let (p, fakes, r) = (panes.clone(), w.fakes.clone(), race.clone());
         let (left, how) = (
@@ -1822,15 +1848,35 @@ mod tests {
             Ok(out(0, &text, ""))
         });
         // The conditional kill: only a live pane that still runs the pid bound in.
-        let (p, fakes, r, kill_fail) =
-            (panes.clone(), w.fakes.clone(), race.clone(), mux.kill_fail);
+        let (p, fakes, r, kill_fail, tag_fail) = (
+            panes.clone(),
+            w.fakes.clone(),
+            race.clone(),
+            mux.kill_fail,
+            mux.tag_fail,
+        );
         w.fakes.mux_script("if-shell", move |argv| {
-            if let Some(how) = kill_fail {
-                return failed(how);
-            }
             let pane = argv[4].clone();
             let want = argv[5].split("#{pane_pid},").nth(1).unwrap();
             let want = want.trim_end_matches('}').to_string();
+            if argv[6] == format!("set-option -p -t {pane} @agent-role sidebar") {
+                if let Some(how) = tag_fail {
+                    return failed(how);
+                }
+                if r.get() == Some("pre-label") {
+                    r.set(None);
+                    respawn(&p, &fakes, &pane);
+                }
+                let alive = get(&p, &format!("dead {pane}")).is_none();
+                if alive && get(&p, &format!("pid {pane}")).as_deref() == Some(want.as_str()) {
+                    set(&p, &pane, "sidebar|".into());
+                }
+                if r.get() == Some("label") {
+                    r.set(None);
+                    respawn(&p, &fakes, &pane);
+                }
+                return Ok(Output::default());
+            }
             if let Some(width) = argv[6].strip_prefix(&format!("resize-pane -t {pane} -x ")) {
                 let alive = get(&p, &format!("dead {pane}")).is_none();
                 if alive && get(&p, &format!("pid {pane}")).as_deref() == Some(want.as_str()) {
@@ -1839,6 +1885,9 @@ mod tests {
                 return Ok(Output::default());
             }
             assert_eq!(argv[6], format!("kill-pane -t {pane}"));
+            if let Some(how) = kill_fail {
+                return failed(how);
+            }
             if r.get() == Some("kill") {
                 r.set(None);
                 respawn(&p, &fakes, &pane);
@@ -1884,23 +1933,9 @@ mod tests {
             }
             Ok(out(0, &format!("{pane}|@5|{pid}\n"), ""))
         });
-        let (p, fakes, tag_fail) = (panes.clone(), w.fakes.clone(), mux.tag_fail);
-        w.fakes.mux_script("set-option -p", move |argv| {
-            if let Some(how) = tag_fail {
-                return failed(how);
-            }
-            let pane = &argv[4];
-            let id = get(&p, pane)
-                .unwrap_or_default()
-                .split_once('|')
-                .map(|(_, id)| id.to_string())
-                .unwrap_or_default();
-            set(&p, pane, format!("{}|{id}", argv[6]));
-            if race.get() == Some("label") {
-                race.set(None);
-                respawn(&p, &fakes, pane);
-            }
-            Ok(Output::default())
+        // A plain pane write (not inside a pid-bound if-shell) is a bug.
+        w.fakes.mux_script("-N set-option -p", |argv| {
+            panic!("an unguarded pane write: {argv:?}")
         });
         // Checked before the pane rules: read, set (`-t $3 <option> off`) and unset (`-u -t $3 <option>`).
         let (p, option_fail) = (panes.clone(), mux.option_fail);
@@ -2019,6 +2054,13 @@ mod tests {
 
     const RESIZE: &str = "-N resize-pane -t %7 -x 40";
 
+    /// open's label of the new bar, as the multiplexer receives it: only while the pane runs `pid`.
+    fn label_line(pane: &str, pid: u32) -> String {
+        format!(
+            "-N if-shell -F -t {pane} #{{&&:#{{==:#{{pane_dead}},0}},#{{==:#{{pane_pid}},{pid}}}}} set-option -p -t {pane} @agent-role sidebar"
+        )
+    }
+
     /// open's resize of the new bar, as the multiplexer receives it: only while the pane runs `pid`.
     fn resize_line(pane: &str, pid: u32, width: u32) -> String {
         format!(
@@ -2032,7 +2074,7 @@ mod tests {
             READ_RECORD.into(),
             LABELS.into(),
             split_line(w, true),
-            TAG7.into(),
+            label_line("%7", 107),
             RECORD7.into(),
             resize_line("%7", 107, 40),
         ]
@@ -2048,6 +2090,10 @@ mod tests {
         let panes: Vec<String> = panes.iter().map(|p| p.to_string()).collect();
         format!("1 sidebar {}", unproven(&panes))
     }
+
+    const GONE_AFTER: &str = "1 sidebar the new side-bar pane %7 no longer runs this plugin's watch; close it with \
+                              kill-pane -t %7, or, if it is your own pane, clear its label with set-option -p -u -t %7 \
+                              @agent-role";
 
     const NOT_CLOSED: &str =
         "1 sidebar the side bar %7 did not close: the pane no longer runs this session's side bar";
@@ -2315,10 +2361,7 @@ mod tests {
                 ..Mux::default()
             },
         );
-        assert_eq!(
-            run(&w, &[]),
-            "1 sidebar the new side-bar pane %7 no longer runs this plugin's watch; close it with kill-pane -t %7"
-        );
+        assert_eq!(run(&w, &[]), GONE_AFTER);
         assert_eq!(record(&panes), None);
         assert_eq!(closes(&w), 0);
         assert_eq!(get(&panes, "pid %7").as_deref(), Some("1107"));
@@ -2335,6 +2378,34 @@ mod tests {
         // ensure as a spawn runs it opens nothing either: the pane carries the label but is not the bar.
         assert_eq!(ensure_run(&w), refused(&["%7"]));
         assert_eq!(count(&w, "split-window"), 1);
+    }
+
+    // T9-QA round 3: the label is bound to the checked pid too. A pane replaced just before it gets no label; open
+    // refuses (the guarded cleanup spares the replacement) and nothing is recorded.
+    #[test]
+    fn a_bar_replaced_before_its_label_is_never_labelled() {
+        let (w, panes) = sidebar_world(
+            "",
+            Mux {
+                race: Some("pre-label"),
+                ..Mux::default()
+            },
+        );
+        assert_eq!(
+            run(&w, &[]),
+            "1 sidebar the side-bar pane %7 could not be tagged or closed; close it with kill-pane -t %7"
+        );
+        assert_eq!(get(&panes, "pid %7").as_deref(), Some("1107"));
+        assert_eq!(roles(&panes), "%1=|,%2=other|,%7=|");
+        assert_eq!(record(&panes), None);
+        let all: Vec<String> = calls(&w);
+        assert!(all.contains(&label_line("%7", 107)), "{all:?}");
+        assert!(!all.iter().any(|c| c.contains("resize-pane")), "{all:?}");
+        // Unlabelled, it blocks nothing: the next open splits a new bar.
+        assert_eq!(
+            run(&w, &[]),
+            r#"ok {"pane":"%8","window":"@5","opened":true}"#
+        );
     }
 
     // T9 test 7: a bar that cannot be labelled or recorded is closed only while it is still the watch it split.
@@ -2355,7 +2426,7 @@ mod tests {
             );
             let closed: Vec<String> = calls(&w)
                 .into_iter()
-                .filter(|c| c.contains("if-shell"))
+                .filter(|c| c.contains("kill-pane"))
                 .collect();
             assert_eq!(closed, [close_line("%7", 107)], "{how}");
             assert_eq!(
@@ -2404,7 +2475,7 @@ mod tests {
             run(&w, &[]),
             "1 sidebar the side-bar pane %7 could not be tagged or closed; close it with kill-pane -t %7"
         );
-        assert_eq!(count(&w, "if-shell"), 1);
+        assert_eq!(closes(&w), 1);
         assert_eq!(roles(&panes), "%1=|,%2=other|,%7=|");
         for (tag, kill) in [("exit", "exit"), ("throw", "throw"), ("exit", "throw")] {
             let (w, _) = sidebar_world(
@@ -2543,7 +2614,7 @@ mod tests {
                 format!("+sidebar|{key}|$3 display-message"),
                 format!(
                     "-sidebar|{key}|$3 display-message,set-option,show-options,list-panes,display-message,\
-                     split-window,set-option,set-option,if-shell,display-message"
+                     split-window,if-shell,display-message,set-option,if-shell,display-message"
                 ),
             ]
         );
@@ -2782,7 +2853,7 @@ mod tests {
             let inside = if disabled {
                 "show-options"
             } else {
-                "show-options,show-options,list-panes,display-message,split-window,set-option,set-option,if-shell,\
+                "show-options,show-options,list-panes,display-message,split-window,if-shell,display-message,set-option,if-shell,\
                  display-message"
             };
             assert_eq!(
@@ -2903,8 +2974,8 @@ mod tests {
         assert_eq!(
             w.fakes.locks()[1],
             format!(
-                "-sidebar|{key}|$3 {ON},-N set-option -p -t %8 @agent-role sidebar,\
-                 -N set-option -t $3 @mux-agents-sidebar-id %8 108 1080,{}",
+                "-sidebar|{key}|$3 {ON},{},-N set-option -t $3 @mux-agents-sidebar-id %8 108 1080,{}",
+                label_line("%8", 108),
                 resize_line("%8", 108, 40)
             )
         );

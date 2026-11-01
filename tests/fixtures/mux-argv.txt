@@ -27,7 +27,8 @@
 # 0.2.3 (S1): the window's width sizes the bar, max(40, width / 5); a full-height split at the right edge
 -N display-message -p -t %1 #{window_width}
 -N split-window -d -f -h -P -F #{pane_id}|#{window_id}|#{pane_pid} -t %1 -e MUX_AGENTS_STATE=<state> -l 40 <exe> watch
--N set-option -p -t %13 @agent-role sidebar
+-N if-shell -F -t %13 #{&&:#{==:#{pane_dead},0},#{==:#{pane_pid},113}} 'set-option -p -t %13 @agent-role sidebar'
+-N display-message -p -t %13 #{@agent-role}
 # 0.2.3 (#47): pid 113 is this binary `watch`, so the bar is recorded as <pane> <pid> <start>
 -N set-option -t $3 @mux-agents-sidebar-id '%13 113 1130'
 # rmux ignores -l, so the bar is sized again
@@ -49,7 +50,8 @@
 # 0.2.3 (S1): the window's width sizes the bar, max(40, width / 5); a full-height split at the right edge
 -N display-message -p -t %1 #{window_width}
 -N split-window -d -f -h -P -F #{pane_id}|#{window_id}|#{pane_pid} -t %1 -e MUX_AGENTS_STATE=<state> -l 40 <exe> watch
--N set-option -p -t %13 @agent-role sidebar
+-N if-shell -F -t %13 #{&&:#{==:#{pane_dead},0},#{==:#{pane_pid},113}} 'set-option -p -t %13 @agent-role sidebar'
+-N display-message -p -t %13 #{@agent-role}
 # 0.2.3 (#47): pid 113 is this binary `watch`, so the bar is recorded as <pane> <pid> <start>
 -N set-option -t $3 @mux-agents-sidebar-id '%13 113 1130'
 # rmux ignores -l, so the bar is sized again
@@ -152,7 +154,8 @@
 -N display-message -p -t %1 #{window_width}
 -N split-window -d -f -h -P -F #{pane_id}|#{window_id}|#{pane_pid} -t %1 -e MUX_AGENTS_STATE=<state> -l 40 <exe> watch
 # :1584
--N set-option -p -t %13 @agent-role sidebar
+-N if-shell -F -t %13 #{&&:#{==:#{pane_dead},0},#{==:#{pane_pid},113}} 'set-option -p -t %13 @agent-role sidebar'
+-N display-message -p -t %13 #{@agent-role}
 # 0.2.3 (#47): pid 113 is this binary `watch`, so the bar is recorded as <pane> <pid> <start>
 -N set-option -t $3 @mux-agents-sidebar-id '%13 113 1130'
 -N if-shell -F -t %13 #{&&:#{==:#{pane_dead},0},#{==:#{pane_pid},113}} 'resize-pane -t %13 -x 40'
@@ -169,7 +172,8 @@
 -N split-window -d -f -h -P -F #{pane_id}|#{window_id}|#{pane_pid} -t %1 -e MUX_AGENTS_STATE=<state> -l 40 <exe> watch
 # :1580
 -N split-window -d -f -h -P -F #{pane_id}|#{window_id}|#{pane_pid} -t %1 -e MUX_AGENTS_STATE=<state> <exe> watch
--N set-option -p -t %13 @agent-role sidebar
+-N if-shell -F -t %13 #{&&:#{==:#{pane_dead},0},#{==:#{pane_pid},113}} 'set-option -p -t %13 @agent-role sidebar'
+-N display-message -p -t %13 #{@agent-role}
 # 0.2.3 (#47): pid 113 is this binary `watch`, so the bar is recorded as <pane> <pid> <start>
 -N set-option -t $3 @mux-agents-sidebar-id '%13 113 1130'
 # the multiplexer chose the width, so the resize sets it

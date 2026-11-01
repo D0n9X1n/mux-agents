@@ -650,6 +650,13 @@ mod tests {
             path: Some(exe.clone()),
             argv: Some(vec![exe, "watch".into()]),
         });
+        // The label read back after open's guarded label write.
+        w.fakes.mux_rule(
+            "display-message -p -t %13 #{@agent-role}",
+            0,
+            "sidebar\n",
+            "",
+        );
         // The proof read of the bar: alive, running 113.
         w.fakes
             .mux_rule("#{pane_dead}|#{pane_pid}", 0, "%13|@1|0|113\n", "");

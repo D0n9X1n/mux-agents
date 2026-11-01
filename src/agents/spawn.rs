@@ -1954,6 +1954,13 @@ mod tests {
                 stderr: String::new(),
             })
         });
+        // The label read back after open's guarded label write.
+        w.fakes.mux_rule(
+            "display-message -p -t %13 #{@agent-role}",
+            0,
+            "sidebar\n",
+            "",
+        );
         let seen = open.clone();
         w.fakes.mux_script("#{pane_dead}|#{pane_pid}", move |_| {
             Ok(Output {
