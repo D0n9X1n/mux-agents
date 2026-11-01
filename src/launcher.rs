@@ -743,6 +743,8 @@ mod tests {
         assert!(mail(&l).is_empty());
     }
 
+    // Only the Unix-only marker test uses it.
+    #[cfg(unix)]
     fn exits_0() -> io::Result<i32> {
         Ok(0)
     }
