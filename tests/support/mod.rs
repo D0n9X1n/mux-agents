@@ -27,7 +27,8 @@ use std::time::{Duration, Instant};
 
 use serde_json::Value;
 
-const WAIT: Duration = Duration::from_secs(30);
+// Generous for loaded CI runners: a wait only runs this long when something is wrong, or behind a 15 s lock wait.
+const WAIT: Duration = Duration::from_secs(60);
 const POLL: Duration = Duration::from_millis(50);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -788,6 +789,8 @@ fn teardown_never_signals_a_reused_server_pid() {
     let gone_start = start_of(gone.id()).expect("the start of a live sleep");
     gone.kill().unwrap();
     gone.wait().unwrap();
+    // Linux start times count clock ticks (10 ms): let the clock pass the gone start, so the sentinel's differs.
+    std::thread::sleep(Duration::from_millis(50));
 
     let mut sentinel = Command::new("/bin/sh")
         .args(["-c", "/bin/sleep 60 & wait"])
