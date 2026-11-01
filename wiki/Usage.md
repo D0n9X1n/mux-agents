@@ -90,6 +90,7 @@ Children run `claude --dangerously-skip-permissions --effort high` or `copilot -
 - macOS, Linux or Windows, x86_64 or aarch64; no PowerShell or .NET needed.
 - rmux 0.10 or later on macOS, Linux or Windows, or tmux 3.2 or later on macOS or Linux, with the caller inside a pane.
 - Claude Code or GitHub Copilot CLI on `PATH` (`claude` or `copilot`; `.exe` on Windows).
+- Terminal CLI only (Claude Code or Copilot CLI inside tmux or rmux); the desktop app and other non-terminal surfaces are skipped: no Agents pane, and the skill says not to use it.
 
 Inside rmux both `RMUX` and `TMUX` may be set; `RMUX` wins.
 

@@ -90,6 +90,7 @@ mux-agents · 2 running
 - macOS、Linux 或 Windows，x86_64 或 aarch64；不需要 PowerShell 或 .NET。
 - macOS、Linux 或 Windows 上的 rmux 0.10 或更高版本，或 macOS 或 Linux 上的 tmux 3.2 或更高版本，且调用者位于窗格中。
 - `PATH` 上有 Claude Code 或 GitHub Copilot CLI（`claude` 或 `copilot`；Windows 上为 `.exe`）。
+- 仅限终端 CLI（在 tmux 或 rmux 中运行的 Claude Code 或 Copilot CLI）；桌面应用和其他非终端界面会被跳过：没有 Agents 窗格，技能也会说明不要使用它。
 
 在 rmux 中 `RMUX` 和 `TMUX` 可能都已设置；以 `RMUX` 为准。
 

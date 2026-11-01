@@ -1,11 +1,13 @@
 ---
 name: mux-agents
-description: Start Claude Code or Copilot CLI agents in the current RMUX or tmux session with forked context, then list, focus, message and stop them.
+description: "Terminal CLI only: needs a tmux or rmux pane. Start Claude Code or Copilot CLI agents in the current RMUX or tmux session with forked context, then list, focus, message and stop them."
 ---
 
 ## When to use
 
 Use this skill inside an rmux 0.10+ pane (Windows, Linux or macOS) or a tmux 3.2+ pane (Linux or macOS); the tool refuses elsewhere.
+
+Skip it in the Claude Code desktop app, web or cloud sessions, IDE chat panels, the GitHub Copilot app and headless or SDK runs, and use the host's normal workflow instead. Never start a multiplexer or set variables to make it apply. An IDE's integrated terminal running the CLI inside tmux or rmux is fine.
 
 ## Entry
 

@@ -3,8 +3,8 @@ import { expect, test } from 'claude-code/testing'
 import { register } from '../../hooks/register'
 
 // The 2.1.310 kit's `$` has no `ui.close`, and a test hook's `$.ui.close` is refused (host rule: the scan lists no call),
-// so these tests load the real hooks and drive them with a small engine: `$.clock.every` timers fired by `tick`, a
-// list that always answers, `$.state` with versions as `$.state.get` and `$.state.set` answer them, and `$.ui.panes`
+// so these tests load the real hooks and drive them with a small engine: an eligible session (the terminal surface
+// only, `TMUX` set), `$.clock.every` timers fired by `tick`, a list that always answers, `$.state` with versions as `$.state.get` and `$.state.set` answer them, and `$.ui.panes`
 // listing the panes opened and not yet closed.
 const LIST = JSON.stringify({ ok: true, verb: 'list', running: 0, agents: [] })
 
@@ -32,6 +32,9 @@ function engine() {
   const answer = { exitCode: 0, stdout: LIST, stderr: '', isStdoutTruncated: false, isStderrTruncated: false }
   const $: any = {
     plugin: { root: '/p' },
+    // An eligible session: a terminal CLI inside tmux.
+    session: { surfaces: async () => ['terminal'] },
+    env: { get: async (name: string) => (name === 'TMUX' ? '/tmp/tmux-1/default,1,0' : undefined) },
     ui: {
       open: async (e: { id: string }) => { panes.add(e.id); return { isPlaced: true } },
       panes: async () => { if (panesFail) throw new Error('ui.panes refused'); return [...panes].map(id => ({ id, title: id })) },
