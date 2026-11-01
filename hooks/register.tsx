@@ -11,6 +11,35 @@ const board = atom({ plugin: 'mux-agents', key: 'board' } as const, EMPTY, { sha
 let ticking: Timer | undefined
 let busy = false
 
+const NOT_HERE = 'mux-agents works only in a terminal CLI inside tmux or rmux.'
+
+// Terminal CLI only (#43), read fresh each time and never cached: the session draws on the terminal and nothing else
+// ($.ui.open has no surface selector, so with a desktop, mobile or IDE client attached too the pane would show there as
+// an empty tab), it runs inside tmux or rmux, and it is not a cloud session. A refused read, or no surface at all
+// (a headless or SDK run), is not eligible.
+async function eligible($: EngineInterface): Promise<boolean> {
+  try {
+    const surfaces = await $.session.surfaces()
+    if (surfaces.length !== 1 || surfaces[0] !== 'terminal') return false
+    if ((await $.env.get('CLAUDE_CODE_REMOTE')) === 'true') return false
+    return Boolean((await $.env.get('TMUX')) || (await $.env.get('RMUX')))
+  } catch {
+    return false
+  }
+}
+
+// Stops the refresh at once, then asks the pane to close. The close is best effort: a hook may refuse it or answer
+// without closing, and that pane keeps its last board while nothing polls.
+async function retire($: EngineInterface) {
+  ticking?.cancel()
+  ticking = undefined
+  try {
+    await $.ui.close({ id: PANE })
+  } catch {
+    // Kept open below; the refresh is already stopped.
+  }
+}
+
 // The entry shim's `list -All`. Hooks have no `process`, so the OS comes from the environment; an unreadable OS is
 // taken as not Windows.
 async function listArgv($: EngineInterface): Promise<string[]> {
@@ -50,20 +79,34 @@ function startRefresh($: EngineInterface, argv: string[]) {
 }
 
 // Opens the pane; the first refresh runs on its own, so neither /mux-agents-pane nor a tool result waits for list.
-async function openPane($: EngineInterface) {
+// Eligibility is checked again once the open resolves, as it may be lost while the open waits: then no timer starts
+// and the pane just opened is closed. Answers whether the pane is open and refreshing.
+async function openPane($: EngineInterface): Promise<boolean> {
   await $.ui.open({ id: PANE, title: 'Agents' })
+  if (!(await eligible($))) {
+    await retire($)
+    return false
+  }
   // Read once per open, before the check, so the check and the timer's start stay together.
   const argv = await listArgv($)
   if (!ticking) {
-    ticking = $.clock.every(3000, () => startRefresh($, argv))
+    // Each tick checks again before list runs; a tick of a timer already cancelled does nothing.
+    const timer: Timer = $.clock.every(3000, () => {
+      eligible($).then(ok => {
+        if (ticking !== timer) return
+        if (ok) startRefresh($, argv)
+        else return retire($)
+      }).catch(() => {})
+    })
+    ticking = timer
     startRefresh($, argv)
   }
+  return true
 }
 
-// After a Bash or PowerShell call: opens the pane when the call was a successful spawn inside tmux or rmux.
+// After a Bash or PowerShell call: opens the pane when the call was a successful spawn in an eligible session.
 async function openAfterSpawn($: EngineInterface, command: string, stdout: string | undefined) {
-  const mux = (await $.env.get('TMUX')) || (await $.env.get('RMUX'))
-  if (mux && isSpawn(command, stdout)) await openPane($)
+  if (isSpawn(command, stdout) && (await eligible($))) await openPane($)
 }
 
 // After a close of the pane: stop its refresh only when the pane is really gone, so a later open starts one new timer.
@@ -82,19 +125,27 @@ async function stopRefreshIfGone($: EngineInterface) {
 }
 
 export const register: Register = on => {
-  // The skill skills/mux-agents owns /mux-agents, so the pane command has a name of its own. A refused registration
-  // (another owner of the name) leaves the session and the open-on-spawn path working.
+  // The skill skills/mux-agents owns /mux-agents, so the pane command has a name of its own, registered only in an
+  // eligible session. A refused registration (another owner of the name) leaves the session and the open-on-spawn
+  // path working.
   on('session.start', async ($, e, next) => {
     try {
-      await $.command.register({ name: 'mux-agents-pane', description: 'Show the mux-agents board in a pane' })
+      if (await eligible($)) await $.command.register({ name: 'mux-agents-pane', description: 'Show the mux-agents board in a pane' })
     } catch {
       // The pane still opens after a spawn; only the command is missing.
     }
     return next(e)
   })
+  // Registered while eligible does not mean eligible now: the command checks again.
   on('command.run', { command: 'mux-agents-pane' }, async $ => {
-    await openPane($)
+    if (!(await eligible($)) || !(await openPane($))) return { text: NOT_HERE }
     return { text: 'Agents pane opened.' }
+  })
+  // A desktop, mobile or IDE client attaching to a session with the pane open: the refresh stops at once and the pane
+  // is asked to close, without holding up the attach.
+  on('session.attach', async ($, e, next) => {
+    if (e.surface !== 'terminal' && ticking) retire($).catch(() => {})
+    return next(e)
   })
   // The pane never delays or changes the tool result: the spawn check and the open run on their own, and any rejection
   // ($.env.get, $.ui.open) is dropped.
@@ -113,8 +164,9 @@ export const register: Register = on => {
     if (e.id === PANE) await stopRefreshIfGone($)
     return closed
   })
-  // Every string drawn here comes from parseList, so it is already cleaned.
-  on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
+  // Every string drawn here comes from parseList, so it is already cleaned. The terminal only: a pane kept open
+  // elsewhere draws nothing.
+  on('ui.render', { component: 'Pane', requestId: PANE, surface: 'terminal' }, async ($, e) => {
     const { Box, Text } = $.ui.resolve(e)
     const b = await read($, board)
     return (
