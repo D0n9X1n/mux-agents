@@ -721,7 +721,7 @@ mod tests {
         );
         record(&sidebar_world(), "sidebar", &["sidebar"], 0);
         let w = sidebar_world();
-        w.fakes.mux_script("-l 42", |_| {
+        w.fakes.mux_script("-l 40", |_| {
             Ok(Output {
                 code: 1,
                 stdout: String::new(),

@@ -22,8 +22,12 @@
 # 0.2.1: committed and the spawn lock released, the side bar is found or opened under the sidebar lock
 -N show-options -qv -t $3 @mux-agents-sidebar
 -N list-panes -s -t $3 -F #{pane_id}|#{window_id}|#{@agent-role}|#{@agent-id}
--N split-window -d -h -P -F #{pane_id}|#{window_id} -t %1 -e MUX_AGENTS_STATE=<state> -l 42 <exe> watch
+# 0.2.3 (S1): the window's width sizes the bar, max(40, width / 5); a full-height split at the right edge
+-N display-message -p -t %1 #{window_width}
+-N split-window -d -f -h -P -F #{pane_id}|#{window_id} -t %1 -e MUX_AGENTS_STATE=<state> -l 40 <exe> watch
 -N set-option -p -t %13 @agent-role sidebar
+# rmux ignores -l, so the bar is sized again
+-N resize-pane -t %13 -x 40
 
 [spawn -Client copilot -Task hi -Split v -Name helper]
 -N display-message -p -t %1 #{pid}|#{pane_pid}|#{session_id}|#{window_id}|#{@agent-id}
@@ -34,8 +38,12 @@
 -N set-option -p -t %12 allow-set-title off
 -N show-options -qv -t $3 @mux-agents-sidebar
 -N list-panes -s -t $3 -F #{pane_id}|#{window_id}|#{@agent-role}|#{@agent-id}
--N split-window -d -h -P -F #{pane_id}|#{window_id} -t %1 -e MUX_AGENTS_STATE=<state> -l 42 <exe> watch
+# 0.2.3 (S1): the window's width sizes the bar, max(40, width / 5); a full-height split at the right edge
+-N display-message -p -t %1 #{window_width}
+-N split-window -d -f -h -P -F #{pane_id}|#{window_id} -t %1 -e MUX_AGENTS_STATE=<state> -l 40 <exe> watch
 -N set-option -p -t %13 @agent-role sidebar
+# rmux ignores -l, so the bar is sized again
+-N resize-pane -t %13 -x 40
 
 [spawn -Client claude -Task hi, placement h, side bar off]
 -N display-message -p -t %1 #{pid}|#{pane_pid}|#{session_id}|#{window_id}|#{@agent-id}
@@ -126,19 +134,24 @@
 -N set-option -u -t $3 @mux-agents-sidebar
 # :1526
 -N list-panes -s -t $3 -F #{pane_id}|#{window_id}|#{@agent-role}|#{@agent-id}
-# :1578-1579
--N split-window -d -h -P -F #{pane_id}|#{window_id} -t %1 -e MUX_AGENTS_STATE=<state> -l 42 <exe> watch
+# 0.2.3 (S1): the window's width, then a full-height split at the right edge (:1578-1579)
+-N display-message -p -t %1 #{window_width}
+-N split-window -d -f -h -P -F #{pane_id}|#{window_id} -t %1 -e MUX_AGENTS_STATE=<state> -l 40 <exe> watch
 # :1584
 -N set-option -p -t %13 @agent-role sidebar
+-N resize-pane -t %13 -x 40
 
 [sidebar, -l refused]
 -N display-message -p -t %1 #{pid}|#{pane_pid}|#{session_id}|#{window_id}|#{@agent-id}
 -N set-option -u -t $3 @mux-agents-sidebar
 -N list-panes -s -t $3 -F #{pane_id}|#{window_id}|#{@agent-role}|#{@agent-id}
--N split-window -d -h -P -F #{pane_id}|#{window_id} -t %1 -e MUX_AGENTS_STATE=<state> -l 42 <exe> watch
+-N display-message -p -t %1 #{window_width}
+-N split-window -d -f -h -P -F #{pane_id}|#{window_id} -t %1 -e MUX_AGENTS_STATE=<state> -l 40 <exe> watch
 # :1580
--N split-window -d -h -P -F #{pane_id}|#{window_id} -t %1 -e MUX_AGENTS_STATE=<state> <exe> watch
+-N split-window -d -f -h -P -F #{pane_id}|#{window_id} -t %1 -e MUX_AGENTS_STATE=<state> <exe> watch
 -N set-option -p -t %13 @agent-role sidebar
+# the multiplexer chose the width, so the resize sets it
+-N resize-pane -t %13 -x 40
 
 [sidebar -Close]
 -N display-message -p -t %1 #{pid}|#{pane_pid}|#{session_id}|#{window_id}|#{@agent-id}

@@ -25,7 +25,8 @@ const LIST_FORMAT: &str = "#{pane_id}|#{window_id}|#{@agent-role}|#{@agent-id}";
 const CONFIRM_FORMAT: &str = "#{pane_id}|#{window_id}|#{@agent-role}|#{@agent-id}|end";
 const PANE_FORMAT: &str = "#{pane_id}|#{window_id}";
 const CLEAR: &str = "\u{1b}[H\u{1b}[2J";
-const WIDTH: &str = "42";
+// The bar is a fifth of its window, never narrower than this.
+const MIN_WIDTH: u32 = 40;
 // `off` once `sidebar -Close` ran in the session; unset again by `sidebar`.
 const OPTION: &str = "@mux-agents-sidebar";
 
@@ -233,9 +234,10 @@ fn console_utf8() {
 #[cfg(not(windows))]
 fn console_utf8() {}
 
-/// `sidebar [-Close]`: one bar per session, under the session's sidebar lock. Opens a 42-column split beside the
-/// caller running watch (again without -l only when the multiplexer refused the size), tagged @agent-role sidebar;
-/// an existing bar is returned with opened false; -Close kills it, and reports closed only when the kill answered 0.
+/// `sidebar [-Close]`: one bar per session, under the session's sidebar lock. Opens a split at the right edge of the
+/// caller's window (`bar_width` columns) running watch (again without -l only when the multiplexer refused the size),
+/// tagged @agent-role sidebar; an existing bar is returned with opened false; -Close kills it, and reports closed only
+/// when the kill answered 0.
 /// -Close first sets the session's @mux-agents-sidebar `off` and `sidebar` unsets it, both inside the lock, so a
 /// spawn's `ensure` never reopens a bar a returned -Close closed. Refused only from a tagged pane.
 pub fn sidebar(ctx: &Ctx, request: &Request) -> Res<Map<String, Value>> {
@@ -284,6 +286,23 @@ pub fn sidebar(ctx: &Ctx, request: &Request) -> Res<Map<String, Value>> {
         }
         Ok(reply)
     })
+}
+
+/// The bar's width for a window `window` columns wide: `max(40, floor(window / 5))`.
+pub fn bar_width(window: u32) -> u32 {
+    (window / 5).max(MIN_WIDTH)
+}
+
+/// The width of `pane`'s window; none when the multiplexer does not answer a number.
+fn window_width(ctx: &Ctx, pane: &str) -> Option<u32> {
+    let read = native(
+        ctx,
+        &["display-message", "-p", "-t", pane, "#{window_width}"],
+        true,
+    )
+    .ok()
+    .filter(|read| read.code == 0)?;
+    read.stdout.trim_end_matches(['\r', '\n']).parse().ok()
 }
 
 fn window_id(text: &str) -> bool {
@@ -364,13 +383,17 @@ fn close_pane(ctx: &Ctx, pane: &str) -> bool {
     native(ctx, &["kill-pane", "-t", pane], true).is_ok_and(|killed| killed.code == 0)
 }
 
-/// Splits the bar beside the caller, with the pane environment (Unix: the state root) so watch reads the caller's
-/// state, and tags it; an untagged bar is closed again.
+/// Splits the bar at the right edge of the caller's window, full height (`-f -h`), with the pane environment (Unix:
+/// the state root) so watch reads the caller's state, and tags it; an untagged bar is closed again. The bar is
+/// `bar_width` of the window (40 when the width cannot be read), asked for with -l and set again with resize-pane,
+/// since rmux ignores -l; a refused resize is left to the next watch tick. `-d` keeps the active pane.
 fn open(ctx: &Ctx, caller: &Caller) -> Res<(String, String)> {
     let env = pane_env(utf8(&ctx.state_root)?, crate::state::root::HOST);
+    let width = bar_width(window_width(ctx, &caller.pane).unwrap_or(0)).to_string();
     let mut split: Vec<&str> = vec![
         "split-window",
         "-d",
+        "-f",
         "-h",
         "-P",
         "-F",
@@ -380,7 +403,7 @@ fn open(ctx: &Ctx, caller: &Caller) -> Res<(String, String)> {
     ];
     split.extend(env.iter().map(String::as_str));
     let command = [utf8(&ctx.exe)?, "watch"];
-    let mut created = native(ctx, &[&split[..], &["-l", WIDTH], &command].concat(), true)?;
+    let mut created = native(ctx, &[&split[..], &["-l", &width], &command].concat(), true)?;
     if size_refusal(&created) {
         created = native(ctx, &[&split[..], &command].concat(), true)?;
     }
@@ -412,6 +435,7 @@ fn open(ctx: &Ctx, caller: &Caller) -> Res<(String, String)> {
             ),
         );
     }
+    let _ = native(ctx, &["resize-pane", "-t", &pane, "-x", &width], true);
     Ok((pane, window))
 }
 
@@ -841,7 +865,7 @@ mod tests {
                 return Ok(out(
                     1,
                     "",
-                    "invalid split size '42': invalid digit found in string\n",
+                    "invalid split size '40': invalid digit found in string\n",
                 ));
             }
             set(&p, "%7", "|".into());
@@ -941,10 +965,65 @@ mod tests {
 
     fn split_line(w: &World, sized: bool) -> String {
         format!(
-            "-N split-window -d -h -P -F #{{pane_id}}|#{{window_id}} -t %1{}{} /bin/mux-agent watch",
+            "-N split-window -d -f -h -P -F #{{pane_id}}|#{{window_id}} -t %1{}{} /bin/mux-agent watch",
             env_text(w),
-            if sized { " -l 42" } else { "" }
+            if sized { " -l 40" } else { "" }
         )
+    }
+
+    const RESIZE: &str = "-N resize-pane -t %7 -x 40";
+
+    #[test]
+    fn bar_width_is_a_fifth_of_the_window_at_least_40() {
+        let widths: Vec<u32> = [0, 80, 136, 199, 200, 204, 205, 250, 300]
+            .into_iter()
+            .map(bar_width)
+            .collect();
+        assert_eq!(widths, [40, 40, 40, 40, 40, 40, 41, 50, 60]);
+    }
+
+    #[test]
+    fn open_sizes_the_bar_to_the_window_then_resizes_it() {
+        // A 250-column window: split -l 50 at the right edge, full height, then resize-pane -x 50 (rmux ignores -l).
+        let (w, _) = sidebar_world("", Mux::default());
+        w.fakes.mux_rule("#{window_width}", 0, "250\n", "");
+        assert!(run(&w, &[]).starts_with("ok "));
+        let probe: Vec<String> = w
+            .fakes
+            .mux_calls()
+            .iter()
+            .filter(|c| c.last().is_some_and(|a| a == "#{window_width}"))
+            .map(|c| c.join(" "))
+            .collect();
+        assert_eq!(probe, ["-N display-message -p -t %1 #{window_width}"]);
+        assert_eq!(
+            calls(&w),
+            [
+                ON.to_string(),
+                LIST.into(),
+                split_line(&w, true).replace("-l 40", "-l 50"),
+                "-N set-option -p -t %7 @agent-role sidebar".into(),
+                "-N resize-pane -t %7 -x 50".into(),
+            ]
+        );
+        // An unreadable width (a failed probe, a non-number) opens the narrowest bar, 40.
+        for answer in [(1, ""), (0, "wide\n"), (0, "")] {
+            let (w, _) = sidebar_world("", Mux::default());
+            w.fakes.mux_rule("#{window_width}", answer.0, answer.1, "");
+            assert!(run(&w, &[]).starts_with("ok "), "{answer:?}");
+            let resized: Vec<String> = calls(&w)
+                .into_iter()
+                .filter(|c| c.contains("resize-pane"))
+                .collect();
+            assert_eq!(resized, [RESIZE], "{answer:?}");
+        }
+        // A refused resize still opens the bar: the next watch tick sizes it.
+        let (w, _) = sidebar_world("", Mux::default());
+        w.fakes.mux_rule("resize-pane", 1, "", "no such pane\n");
+        assert_eq!(
+            run(&w, &[]),
+            r#"ok {"pane":"%7","window":"@5","opened":true}"#
+        );
     }
 
     #[test]
@@ -1056,7 +1135,7 @@ mod tests {
             [
                 format!("+sidebar|{key}|$3 display-message"),
                 format!(
-                    "-sidebar|{key}|$3 display-message,set-option,list-panes,split-window,set-option"
+                    "-sidebar|{key}|$3 display-message,set-option,list-panes,display-message,split-window,set-option,resize-pane"
                 ),
             ]
         );
@@ -1111,7 +1190,7 @@ mod tests {
     #[test]
     fn split_retry_only_on_size_refusal() {
         for stderr in [
-            "invalid split size '42': invalid digit found in string\r\n",
+            "invalid split size '40': invalid digit found in string\r\n",
             "size invalid\n",
             "size too small\n",
             "command split-window: unknown flag -l\n",
@@ -1147,6 +1226,8 @@ mod tests {
             .collect();
         assert_eq!(splits, [split_line(&w, true), split_line(&w, false)]);
         assert_eq!(roles(&panes), "%1=|,%2=other|,%7=sidebar|");
+        // Without -l the multiplexer picks the width, so the resize sizes it.
+        assert_eq!(calls(&w).last().map(String::as_str), Some(RESIZE));
         // Any other failure refuses after exactly one split; a refused retry after exactly two.
         for stderr in [
             "permission denied",
@@ -1166,7 +1247,7 @@ mod tests {
         let (w, _) = sidebar_world(
             "",
             Mux {
-                split_error: Some("invalid split size '42': invalid digit found in string"),
+                split_error: Some("invalid split size '40': invalid digit found in string"),
                 ..Mux::default()
             },
         );
@@ -1194,6 +1275,7 @@ mod tests {
                 .filter(|c| c.contains("kill-pane"))
                 .collect();
             assert_eq!(kills, ["-N kill-pane -t %7"]);
+            assert_eq!(count(&w, "resize-pane"), 0, "{how}");
             assert_eq!(roles(&panes), "%1=|,%2=other|");
         }
         for (tag, kill) in [("exit", "exit"), ("throw", "throw"), ("exit", "throw")] {
@@ -1259,7 +1341,8 @@ mod tests {
                 ON.to_string(),
                 LIST.to_string(),
                 split_line(&w, true),
-                "-N set-option -p -t %7 @agent-role sidebar".into()
+                "-N set-option -p -t %7 @agent-role sidebar".into(),
+                RESIZE.into()
             ]
         );
         assert_eq!(roles(&panes), "%1=|,%2=other|,%7=sidebar|");
@@ -1277,6 +1360,7 @@ mod tests {
             "-N",
             "split-window",
             "-d",
+            "-f",
             "-h",
             "-P",
             "-F",
@@ -1290,7 +1374,7 @@ mod tests {
             w.ctx.state_root.to_str().unwrap(),
             crate::state::root::HOST,
         ));
-        expected.extend(["-l", "42", "/opt/mux agents/bin/mux-agent", "watch"].map(String::from));
+        expected.extend(["-l", "40", "/opt/mux agents/bin/mux-agent", "watch"].map(String::from));
         assert_eq!(split, [expected]);
     }
 
@@ -1306,7 +1390,8 @@ mod tests {
                 READ_OPTION.to_string(),
                 LIST.into(),
                 split_line(&w, true),
-                "-N set-option -p -t %7 @agent-role sidebar".into()
+                "-N set-option -p -t %7 @agent-role sidebar".into(),
+                RESIZE.into()
             ]
         );
         w.fakes.clear_log();
@@ -1343,7 +1428,7 @@ mod tests {
             let inside = if disabled {
                 "show-options"
             } else {
-                "show-options,list-panes,split-window,set-option"
+                "show-options,list-panes,display-message,split-window,set-option,resize-pane"
             };
             assert_eq!(
                 w.fakes.locks(),

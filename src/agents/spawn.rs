@@ -1986,10 +1986,10 @@ mod tests {
             ]
         );
         assert_eq!(bar_splits(&w), 1);
-        // The bar opens beside the caller, in its window.
+        // The bar opens at the right edge of the caller's window, full height.
         let bar = calls(&w, "split-window").pop().unwrap();
-        assert_eq!(bar[2..4], ["-d", "-h"]);
-        assert_eq!(bar[8], "%1");
+        assert_eq!(bar[2..5], ["-d", "-f", "-h"]);
+        assert_eq!(bar[9], "%1");
         // A second spawn, a split by the session's placement too, finds the same bar and splits no second one.
         w.fakes.clear_log();
         w.fakes.mux_rule("@mux-agents-placement", 0, "h\n", "");

@@ -331,6 +331,72 @@ exec claude --dangerously-skip-permissions
                 .collect()
         }
 
+        /// The bar's width by S1: `max(40, window / 5)` of the width its window reads now.
+        fn bar_width(&self, bar: &str) -> String {
+            let window: u32 = self.field(bar, "#{window_width}").parse().unwrap();
+            mux_agent::sidebar::bar_width(window).to_string()
+        }
+
+        /// The bar's place as `<at right>|<at top>|<at bottom>|<width>`: `1|1|1|<bar_width>` when it is locked to
+        /// the right edge, full height, at its width.
+        fn bar_place(&self, bar: &str) -> String {
+            self.field(
+                bar,
+                "#{pane_at_right}|#{pane_at_top}|#{pane_at_bottom}|#{pane_width}",
+            )
+        }
+
+        /// What `bar_place` answers for a bar in place.
+        fn in_place(&self, bar: &str) -> String {
+            format!("1|1|1|{}", self.bar_width(bar))
+        }
+
+        /// The active pane of `target`'s window.
+        fn active(&self, target: &str) -> String {
+            self.call(&[
+                "list-panes",
+                "-t",
+                target,
+                "-F",
+                "#{pane_id}|#{pane_active}",
+            ])
+            .lines()
+            .find_map(|row| row.strip_suffix("|1"))
+            .unwrap_or_else(|| panic!("{:?}: no active pane in {target}'s window", self.mux()))
+            .to_string()
+        }
+
+        /// A new `sh` pane split from `target` with `flags` (`-h` or `-v`), focus kept.
+        fn split(&self, target: &str, flags: &[&str]) -> String {
+            let mut args = vec!["split-window", "-d"];
+            args.extend(flags);
+            args.extend(["-P", "-F", "#{pane_id}", "-t", target, "sh"]);
+            self.call(&args).trim().to_string()
+        }
+
+        /// mux-agent from `pane`'s shell, with this test's state root.
+        fn run_in(&mut self, pane: &str, args: &[&str]) -> (i32, Value) {
+            let state = self.state_text();
+            self.server
+                .run_in(pane, args, &[("MUX_AGENTS_STATE", state.as_str())])
+        }
+
+        /// The pid of the bar's `watch`: its pane's process, which runs the binary itself.
+        fn watch_pid(&self, bar: &str) -> u32 {
+            let pid = self.field(bar, "#{pane_pid}");
+            let out = Command::new("ps")
+                .args(["-o", "args=", "-p", &pid])
+                .output()
+                .unwrap();
+            let args = String::from_utf8_lossy(&out.stdout);
+            assert!(
+                args.trim_end().ends_with("mux-agent watch"),
+                "{:?}: the bar's pane runs {args:?}",
+                self.mux()
+            );
+            pid.parse().unwrap()
+        }
+
         /// Background mux-agent runs from the root pane's shell, each with this test's state root.
         fn bg(&mut self, runs: &[&[&str]]) -> Vec<Job> {
             let state = self.state_text();
@@ -1351,7 +1417,7 @@ exec claude --dangerously-skip-permissions
         assert_eq!(live.mailbox(&live.root_box()).len(), 1, "{mux:?}");
     }
 
-    // A 42-column bar's row: `^. w[12]  claude  \d+[sm]$`.
+    // A bar's row: `^. w[12]  claude  \d+[sm]$`.
     fn bar_row(line: &str) -> bool {
         let Some(rest) = line.strip_prefix("\u{25cf} ") else {
             return false;
@@ -1375,9 +1441,9 @@ exec claude --dangerously-skip-permissions
             && count(&bar_row) == 2
     }
 
-    // The first spawn opens one 42-column bar beside the caller showing the count and each status, outside list;
-    // the next spawn and sidebar answer the same bar; -Close ends it and its watch.
-    fn sidebar_opens_42_columns_and_closes(mux: Mux) {
+    // The first spawn opens one bar at the right edge, `bar_width` columns, showing the count and each status,
+    // outside list; the next spawn and sidebar answer the same bar; -Close ends it and its watch.
+    fn sidebar_opens_at_bar_width_and_closes(mux: Mux) {
         let Some(mut live) = Live::human(mux) else {
             return;
         };
@@ -1416,7 +1482,12 @@ exec claude --dangerously-skip-permissions
             .collect();
         assert_eq!(rows.len(), 1, "{mux:?} {rows:?}");
         let fields: Vec<&str> = rows[0].split('|').collect();
-        assert_eq!(fields[..4], [bar.as_str(), "sidebar", "", "42"], "{mux:?}");
+        let width = live.bar_width(&bar);
+        assert_eq!(
+            fields[..4],
+            [bar.as_str(), "sidebar", "", &width],
+            "{mux:?}"
+        );
         let bar_pid: u32 = fields[4].parse().unwrap();
         let mut screen = String::new();
         let drawn = eventually(Duration::from_secs(30), || {
@@ -1441,6 +1512,59 @@ exec claude --dangerously-skip-permissions
             eventually(Duration::from_secs(10), || !support::alive(bar_pid)),
             "{mux:?}: watch outlived its pane"
         );
+    }
+
+    // S1: from the lower-left pane of a 3-pane window (neither rightmost nor full height), sidebar opens the bar at
+    // the window's right edge, full height, `bar_width` columns, and the active pane is unchanged. With its watch
+    // stopped (so no tick can repair anything), a spawn by `placement h` and by `placement v` from that pane puts the
+    // agent left of the bar, and the bar stays rightmost and full height.
+    fn bar_opens_at_right_edge_from_any_pane(mux: Mux) {
+        let Some(mut live) = Live::human(mux) else {
+            return;
+        };
+        let root = live.server.pane().to_string();
+        let right = live.split(&root, &["-h"]);
+        let lower = live.split(&root, &["-v"]);
+        let active = live.active(&root);
+        let (code, open) = live.run_in(&lower, &["sidebar"]);
+        assert_eq!((code, &open["opened"]), (0, &json!(true)), "{mux:?} {open}");
+        let bar = s(&open["pane"]).to_string();
+        assert_eq!(live.bar_place(&bar), live.in_place(&bar), "{mux:?}");
+        assert_eq!(live.active(&root), active, "{mux:?}: opening moved focus");
+        assert_eq!(live.field(&right, "#{pane_at_right}"), "0", "{mux:?}");
+        let watch = live.watch_pid(&bar);
+        let signal = |name: &str| {
+            let sent = Command::new("kill")
+                .args([name, &watch.to_string()])
+                .status()
+                .unwrap();
+            assert!(sent.success(), "{mux:?}: kill {name} {watch}");
+        };
+        signal("-STOP");
+        for (n, placement) in ["h", "v"].into_iter().enumerate() {
+            let (code, set) = live.run_in(&lower, &["placement", placement]);
+            assert_eq!(code, 0, "{mux:?} {set}");
+            let name = format!("w{n}");
+            let args = live.spawn_args("claude", &name, &[]);
+            let args: Vec<&str> = args.iter().map(String::as_str).collect();
+            let (code, spawned) = live.run_in(&lower, &args);
+            assert_eq!(code, 0, "{mux:?} {spawned}");
+            assert_eq!(spawned["sidebar"], bar.as_str(), "{mux:?} {spawned}");
+            let agent = s(&spawned["pane"]);
+            let edge =
+                |pane: &str, format: &str| -> u32 { live.field(pane, format).parse().unwrap() };
+            assert!(
+                edge(agent, "#{pane_right}") < edge(&bar, "#{pane_left}"),
+                "{mux:?} placement {placement}: the agent is not left of the bar"
+            );
+            let place = live.bar_place(&bar);
+            assert_eq!(
+                place[..6],
+                *"1|1|1|",
+                "{mux:?} placement {placement}: {place}"
+            );
+        }
+        signal("-CONT");
     }
 
     // list -All: the reply's and each row's fields, in order; running rows first, then ended ones.
@@ -1946,7 +2070,12 @@ exec claude --dangerously-skip-permissions
         );
         let bar = s(&w1["sidebar"]).to_string();
         assert!(w1.get("sidebarError").is_none(), "{mux:?} {w1}");
-        assert_eq!(live.bars(), [format!("{bar}|{root_window}|42")], "{mux:?}");
+        let width = live.bar_width(&bar);
+        assert_eq!(
+            live.bars(),
+            [format!("{bar}|{root_window}|{width}")],
+            "{mux:?}"
+        );
         let (code, set) = live.run(&["placement", "h"]);
         assert_eq!(code, 0, "{mux:?} {set}");
         let w2 = live.spawn("w2", &[]);
@@ -2349,7 +2478,8 @@ exec claude --dangerously-skip-permissions
                     client_exit_posts_one_exited_notice,
                     client_start_error_posts_one_exited_notice,
                     tagged_pane_cannot_spawn_and_gone_pane_vs_dead_socket,
-                    sidebar_opens_42_columns_and_closes,
+                    sidebar_opens_at_bar_width_and_closes,
+                    bar_opens_at_right_edge_from_any_pane,
                     list_all_json_shape,
                     agent_caller_forks_with_bypass_evidence,
                     spawn_model_recorded_and_listed,
