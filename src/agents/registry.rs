@@ -16,9 +16,12 @@ pub struct Pane {
     pub pid: String,
     pub id: String,
     pub name: String,
+    // `#{pane_dead}` 1: its program ended and remain-on-exit kept the pane.
+    pub dead: bool,
 }
 
-const LIST_FORMAT: &str = "#{pane_id}|#{window_id}|#{pane_pid}|#{@agent-id}|#{@agent-name}";
+const LIST_FORMAT: &str =
+    "#{pane_id}|#{window_id}|#{pane_pid}|#{pane_dead}|#{@agent-id}|#{@agent-name}";
 
 /// The tagged-pane list format: each row framed by `marker` on both ends.
 pub(crate) fn list_format(marker: &str) -> String {
@@ -53,8 +56,9 @@ pub(crate) fn tagged(ctx: &Ctx, caller: &Caller) -> Res<Vec<Pane>> {
     Ok(records(&listed.stdout, &head, &tail)
         .into_iter()
         .filter_map(|fields| {
-            let mut parts = fields.splitn(5, '|');
-            let (pane, window, pid, id, name) = (
+            let mut parts = fields.splitn(6, '|');
+            let (pane, window, pid, dead, id, name) = (
+                parts.next()?,
                 parts.next()?,
                 parts.next()?,
                 parts.next()?,
@@ -76,6 +80,8 @@ pub(crate) fn tagged(ctx: &Ctx, caller: &Caller) -> Res<Vec<Pane>> {
                 pid: pid.to_string(),
                 id: id.into(),
                 name: name.into(),
+                // Only an exact 1 is dead: anything else is a live pane, never killed.
+                dead: dead == "1",
             })
         })
         .collect())
@@ -254,35 +260,78 @@ fn delivered_notice(message: &Value, name: &str) -> (String, Value) {
     }
 }
 
-/// Posts `lost` (or `exited` with launcher.json's code) for each committed agent of the caller's session whose
-/// pane is gone and that has no notice yet. `tagged` is a list-panes snapshot the caller already has; without
-/// one, panes are listed only when some agent could need a notice.
-pub fn update_notices(ctx: &Ctx, caller: &Caller, tagged: Option<&[Pane]>) -> Res<()> {
+/// An uncommitted agent is closed only after the launcher's 30 s commit wait and 30 s more.
+const UNCOMMITTED_MAX: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// The one server-side command that kills `pane` only while it is dead and still tagged `id`: the check and the
+/// kill run in one command, so a respawn or a retag between them keeps the pane.
+pub fn kill_if_dead(pane: &str, id: &str) -> Vec<String> {
+    vec![
+        "if-shell".into(),
+        "-F".into(),
+        "-t".into(),
+        pane.into(),
+        format!("#{{&&:#{{pane_dead}},#{{==:#{{@agent-id}},{id}}}}}"),
+        format!("kill-pane -t {pane}"),
+    ]
+}
+
+/// Closes the caller session's agents whose pane is gone, with one notice each, and the panes still tagged whose
+/// program ended. True when it killed a pane or posted a notice: the caller then lists the panes again.
+///
+/// - A tagged pane `#{pane_dead}` (kept by remain-on-exit) of one of our agents is killed by `kill_if_dead` under
+///   the agent's notice lock, noticed or not, and a committed agent without a notice is then noticed as below.
+/// - A committed agent without a notice whose pane a fresh probe shows gone: `exited` with launcher.json's code,
+///   else `lost`.
+/// - An uncommitted agent without a notice, created over 60 s ago, likewise, but only under the session's spawn
+///   lock (taken here unless `spawn_lock_held`, as inside spawn) and then its notice lock, and only while it is
+///   still uncommitted. Lock order: spawn, then notice.
+///
+/// `tagged` is a list-panes snapshot the caller already has; without one, panes are listed only when some agent
+/// could need a notice or its launcher recorded an exit (its pane may be dead). A pid is never signalled.
+pub fn reap(
+    ctx: &Ctx,
+    caller: &Caller,
+    tagged: Option<&[Pane]>,
+    spawn_lock_held: bool,
+) -> Res<bool> {
     let agents = super::server_dir(ctx, caller).join("agents");
     let entries = match std::fs::read_dir(&agents) {
         Ok(entries) => entries,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
         Err(e) => return Err(e.into()),
     };
-    let mut candidates = Vec::new();
+    let (mut known, mut committed, mut uncommitted) = (Vec::new(), Vec::new(), Vec::new());
+    let mut exited = false;
     for entry in entries {
         let entry = entry?;
         let Some(id) = entry.file_name().to_str().map(str::to_string) else {
             continue;
         };
         let folder = entry.path();
-        if super::agent_id(&id)
-            && folder.is_dir()
-            && folder.join("commit.json").is_file()
-            && !folder.join("notice.json").exists()
-        {
-            candidates.push(id);
+        if !super::agent_id(&id) || !folder.is_dir() {
+            continue;
         }
+        let noticed = folder.join("notice.json").exists();
+        if folder.join("commit.json").is_file() {
+            if !noticed {
+                committed.push(id.clone());
+            }
+        } else if !noticed && stale(ctx, caller, &id) {
+            uncommitted.push(id.clone());
+        }
+        exited |= crate::state::fs::read_json(&folder.join("launcher.json"))
+            .ok()
+            .flatten()
+            .and_then(|l| l.get("exitCode").filter(|c| !c.is_null()).cloned())
+            .is_some();
+        known.push(id);
     }
-    if candidates.is_empty() {
-        return Ok(());
+    if tagged.is_none() && committed.is_empty() && uncommitted.is_empty() && !exited {
+        return Ok(false);
     }
-    candidates.sort();
+    committed.sort();
+    uncommitted.sort();
     let listed;
     let live = match tagged {
         Some(panes) => panes,
@@ -291,37 +340,112 @@ pub fn update_notices(ctx: &Ctx, caller: &Caller, tagged: Option<&[Pane]>) -> Re
             &listed[..]
         }
     };
-    for id in candidates {
+    let mut acted = false;
+    for pane in live.iter().filter(|p| p.dead && known.contains(&p.id)) {
+        let Some(record) = own_record(ctx, caller, &pane.id)? else {
+            continue;
+        };
+        super::lock(ctx, &super::lock_key("notice", caller, &pane.id), || {
+            let kill = kill_if_dead(&pane.pane, &pane.id);
+            let argv: Vec<&str> = kill.iter().map(String::as_str).collect();
+            crate::mux::native(ctx, &argv, true)?;
+            if agents.join(&pane.id).join("commit.json").is_file() {
+                post_if_gone(ctx, caller, &pane.id, &record)?;
+            }
+            Ok(())
+        })?;
+        acted = true;
+    }
+    for id in committed {
         if live.iter().any(|p| p.id == id) {
             continue;
         }
-        let Some(record) = record(ctx, caller, &id)? else {
+        let Some(record) = own_record(ctx, caller, &id)? else {
             continue;
         };
-        if record.get("session").and_then(Value::as_str) != Some(caller.session.as_str()) {
-            continue;
-        }
-        super::lock(ctx, &super::lock_key("notice", caller, &id), || {
-            // The snapshot may predate a spawn that committed since: only the agent's own pane answering with
-            // exit 0 and empty fields is gone; a live pane or a failed probe waits for the next try.
-            let pane = super::text(record.get("pane"));
-            let probe = crate::mux::native(
-                ctx,
-                &["display-message", "-p", "-t", &pane, GONE_PROBE],
-                true,
-            )?;
-            if probe.code != 0 || probe.stdout.trim_end_matches(['\r', '\n']) != "|" {
-                return Ok(());
-            }
-            let launcher = crate::state::fs::read_json(&agents.join(&id).join("launcher.json"))?;
-            let notice = match launcher.as_ref().and_then(|l| l.get("exitCode")) {
-                Some(code) if !code.is_null() => Notice::Exited(code.clone()),
-                _ => Notice::Lost,
-            };
-            add_notice(ctx, caller, &id, &record, notice).map(|_| ())
+        // The snapshot may predate a spawn that committed since: the fresh probe decides.
+        acted |= super::lock(ctx, &super::lock_key("notice", caller, &id), || {
+            post_if_gone(ctx, caller, &id, &record)
         })?;
     }
-    Ok(())
+    // A dead pane killed above is probed afresh; a live one is a launcher still waiting or running.
+    uncommitted.retain(|id| !live.iter().any(|p| &p.id == id && !p.dead));
+    if !uncommitted.is_empty() {
+        let close = || -> Res<bool> {
+            let mut posted = false;
+            for id in &uncommitted {
+                let Some(record) = own_record(ctx, caller, id)? else {
+                    continue;
+                };
+                posted |= super::lock(ctx, &super::lock_key("notice", caller, id), || {
+                    // A commit that landed while reap waited for the locks makes it a live agent's.
+                    if agents.join(id).join("commit.json").exists() {
+                        return Ok(false);
+                    }
+                    post_if_gone(ctx, caller, id, &record)
+                })?;
+            }
+            Ok(posted)
+        };
+        // Locks are not reentrant: inside spawn, which holds the spawn lock, it is never taken again.
+        acted |= if spawn_lock_held {
+            close()?
+        } else {
+            super::lock(
+                ctx,
+                &super::lock_key("spawn", caller, &caller.session),
+                close,
+            )?
+        };
+    }
+    Ok(acted)
+}
+
+/// record.json of agent `id` when it names that id and the caller's session.
+fn own_record(ctx: &Ctx, caller: &Caller, id: &str) -> Res<Option<Value>> {
+    Ok(record(ctx, caller, id)?.filter(|record| {
+        record.get("id").and_then(Value::as_str) == Some(id)
+            && record.get("session").and_then(Value::as_str) == Some(caller.session.as_str())
+    }))
+}
+
+/// Whether agent `id`'s record was created over 60 s ago; an unreadable record or time is not.
+fn stale(ctx: &Ctx, caller: &Caller, id: &str) -> bool {
+    record(ctx, caller, id)
+        .ok()
+        .flatten()
+        .and_then(|r| {
+            r.get("createdAt")
+                .and_then(Value::as_str)
+                .and_then(crate::util::parse_utc)
+        })
+        .and_then(|created| ctx.clock.now().duration_since(created).ok())
+        .is_some_and(|age| age > UNCOMMITTED_MAX)
+}
+
+/// Whether `pane` is gone: only exit 0 and empty fields prove it; a live pane or a failed probe is no proof.
+pub(crate) fn pane_gone(ctx: &Ctx, pane: &str) -> Res<bool> {
+    let probe = crate::mux::native(
+        ctx,
+        &["display-message", "-p", "-t", pane, GONE_PROBE],
+        true,
+    )?;
+    Ok(probe.code == 0 && probe.stdout.trim_end_matches(['\r', '\n']) == "|")
+}
+
+/// Under agent `id`'s notice lock: when it has no notice and a fresh probe shows its pane gone, posts `exited` with
+/// launcher.json's code, else `lost`. True when it posted.
+pub(crate) fn post_if_gone(ctx: &Ctx, caller: &Caller, id: &str, record: &Value) -> Res<bool> {
+    let folder = super::server_dir(ctx, caller).join("agents").join(id);
+    if folder.join("notice.json").exists() || !pane_gone(ctx, &super::text(record.get("pane")))? {
+        return Ok(false);
+    }
+    let launcher = crate::state::fs::read_json(&folder.join("launcher.json"))?;
+    let notice = match launcher.as_ref().and_then(|l| l.get("exitCode")) {
+        Some(code) if !code.is_null() => Notice::Exited(code.clone()),
+        _ => Notice::Lost,
+    };
+    add_notice(ctx, caller, id, record, notice)
 }
 
 #[cfg(test)]
@@ -339,6 +463,7 @@ mod tests {
             pid: pid.into(),
             id: id.into(),
             name: name.into(),
+            dead: false,
         }
     }
 
@@ -715,12 +840,12 @@ mod tests {
     }
 
     #[test]
-    fn update_notices_needs_gone_probe() {
+    fn reap_needs_gone_probe() {
         // No agents folder: nothing listed, nothing made.
         let w = World::human("");
         let caller = w.caller();
         w.fakes.clear_log();
-        update_notices(&w.ctx, &caller, None).unwrap();
+        reap(&w.ctx, &caller, None, false).unwrap();
         assert!(w.fakes.mux_calls().is_empty());
         assert!(!w.ctx.state_root.exists());
 
@@ -731,7 +856,7 @@ mod tests {
         let gone = "#{pane_id}|#{@agent-id}";
         w.fakes.mux_first(gone, 0, "%9|aaaaaaaaaaaa\n", "");
         w.fakes.clear_log();
-        update_notices(&w.ctx, &caller, None).unwrap();
+        reap(&w.ctx, &caller, None, false).unwrap();
         assert!(!marker.exists());
         let calls = w.fakes.mux_calls();
         assert_eq!(calls.len(), 2);
@@ -746,13 +871,13 @@ mod tests {
         // A failed or odd probe is no proof.
         for (code, out) in [(1, "|\n"), (0, "|x\n"), (0, ""), (0, " |\n")] {
             w.fakes.mux_first(gone, code, out, "");
-            update_notices(&w.ctx, &caller, None).unwrap();
+            reap(&w.ctx, &caller, None, false).unwrap();
             assert!(!marker.exists(), "{code} {out:?}");
         }
         // Gone: exit 0 and empty fields.
         w.fakes.mux_first(gone, 0, "|\r\n", "");
         w.fakes.clear_log();
-        update_notices(&w.ctx, &caller, None).unwrap();
+        reap(&w.ctx, &caller, None, false).unwrap();
         assert!(marker.exists());
         assert_eq!(
             w.fakes.locks(),
@@ -765,7 +890,7 @@ mod tests {
         );
         // Posted: no candidate left, so no list, probe or lock.
         w.fakes.clear_log();
-        update_notices(&w.ctx, &caller, None).unwrap();
+        reap(&w.ctx, &caller, None, false).unwrap();
         assert!(w.fakes.mux_calls().is_empty() && w.fakes.locks().is_empty());
 
         // Live in the snapshot, of another session, uncommitted, or without a record: never probed.
@@ -777,7 +902,7 @@ mod tests {
         write(&bare.join("commit.json"), json!({}));
         let snapshot = [pane("%7", "@2", "310", "bbbbbbbbbbbb", "live")];
         w.fakes.clear_log();
-        update_notices(&w.ctx, &caller, Some(&snapshot)).unwrap();
+        reap(&w.ctx, &caller, Some(&snapshot), false).unwrap();
         assert!(w.fakes.mux_calls().is_empty());
         assert!(w.fakes.locks().is_empty());
     }
@@ -822,7 +947,7 @@ mod tests {
             }
             w.panes(&[]);
             w.fakes.mux_first("#{pane_id}|#{@agent-id}", 0, "|\n", "");
-            update_notices(&w.ctx, &caller, None).unwrap();
+            reap(&w.ctx, &caller, None, false).unwrap();
             let marker = crate::state::fs::read_json(&folder.join("notice.json"))
                 .unwrap()
                 .unwrap();
@@ -835,5 +960,324 @@ mod tests {
             let text = text(messages[0].get("text"));
             assert_eq!(text.split('\n').nth(1), Some(body), "{launcher:?}");
         }
+    }
+
+    fn dead(pane: &str, id: &str) -> Pane {
+        Pane {
+            dead: true,
+            ..self::pane(pane, "@5", "300", id, "worker")
+        }
+    }
+
+    // The mailbox lines as stored, without moving the read offset.
+    fn stored(w: &World) -> Vec<Value> {
+        let path = w.state().join("mail").join("pane-1.jsonl");
+        std::fs::read_to_string(path)
+            .unwrap_or_default()
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect()
+    }
+
+    const KILL_IF_DEAD: [&str; 7] = [
+        "-N",
+        "if-shell",
+        "-F",
+        "-t",
+        "%9",
+        "#{&&:#{pane_dead},#{==:#{@agent-id},aaaaaaaaaaaa}}",
+        "kill-pane -t %9",
+    ];
+
+    #[test]
+    fn tagged_reads_pane_dead() {
+        let w = World::human("");
+        let caller = w.caller();
+        w.panes_dead(
+            &[
+                "%9|@5|300|aaaaaaaaaaaa|worker",
+                "%8|@5|301|bbbbbbbbbbbb|idle",
+            ],
+            &["%9"],
+        );
+        let got: Vec<(String, bool)> = tagged(&w.ctx, &caller)
+            .unwrap()
+            .into_iter()
+            .map(|p| (p.pane, p.dead))
+            .collect();
+        assert_eq!(got, [("%9".into(), true), ("%8".into(), false)]);
+        assert_eq!(
+            kill_if_dead("%9", ID),
+            KILL_IF_DEAD[1..]
+                .iter()
+                .map(|s| s.to_string())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn reap_kills_a_dead_pane_by_one_conditional_then_notices() {
+        let w = World::human("");
+        let caller = w.caller();
+        let folder = w.agent_record(ID, json!({}));
+        write(
+            &folder.join("launcher.json"),
+            json!({"pid": 300, "exitCode": 4}),
+        );
+        w.panes_dead(&["%9|@5|300|aaaaaaaaaaaa|worker"], &["%9"]);
+        // Once the conditional ran, the pane answers gone.
+        w.fakes.mux_rule("#{pane_id}|#{@agent-id}", 0, "|\n", "");
+        w.fakes.clear_log();
+        assert!(reap(&w.ctx, &caller, None, false).unwrap());
+        let calls = w.fakes.mux_calls();
+        assert!(list_call(&calls[0]), "{calls:?}");
+        assert_eq!(calls[1], KILL_IF_DEAD);
+        assert_eq!(
+            calls[2],
+            ["-N", "display-message", "-p", "-t", "%9", GONE_PROBE]
+        );
+        assert_eq!(calls.len(), 3, "{calls:?}");
+        assert_eq!(marker_of(&folder).0, "exited");
+        assert_eq!(marker_of(&folder).1, 4);
+        assert_eq!(stored(&w).len(), 1);
+        let (notice, mail) = (
+            lock_key("notice", &caller, ID),
+            lock_key("mail", &caller, "pane-1"),
+        );
+        assert_eq!(
+            w.fakes.locks(),
+            [
+                format!("+{notice}"),
+                format!("+{mail}"),
+                format!("-{mail}"),
+                format!("-{notice}")
+            ]
+        );
+        // Never a pid signal: the pane goes by the multiplexer only.
+        assert!(!w.fakes.os_calls().iter().any(|c| c.starts_with("kill ")));
+
+        // Already noticed (the launcher posted before it exited): killed again, no probe, no second message.
+        w.fakes.clear_log();
+        assert!(reap(&w.ctx, &caller, Some(&[dead("%9", ID)]), false).unwrap());
+        assert_eq!(w.fakes.mux_calls(), [KILL_IF_DEAD]);
+        assert_eq!(stored(&w).len(), 1);
+        assert_eq!(
+            w.fakes.locks(),
+            [format!("+{notice}"), format!("-{notice}")]
+        );
+
+        // A noticed agent whose launcher recorded an exit is reaped without a snapshot too.
+        w.fakes.clear_log();
+        assert!(reap(&w.ctx, &caller, None, false).unwrap());
+        let calls = w.fakes.mux_calls();
+        assert!(
+            list_call(&calls[0]) && calls[1] == KILL_IF_DEAD,
+            "{calls:?}"
+        );
+    }
+
+    #[test]
+    fn reap_never_kills_a_pane_not_its_own() {
+        let w = World::human("");
+        let caller = w.caller();
+        // Another session's record, and a tag without a folder: never killed, never locked.
+        w.agent_record("bbbbbbbbbbbb", json!({"session": "$4"}));
+        let snapshot = [dead("%7", "bbbbbbbbbbbb"), dead("%6", "cccccccccccc")];
+        w.fakes.clear_log();
+        assert!(!reap(&w.ctx, &caller, Some(&snapshot), false).unwrap());
+        assert!(w.fakes.mux_calls().is_empty());
+        assert!(w.fakes.locks().is_empty());
+    }
+
+    // A multiplexer that keeps pane %9 as (dead, @agent-id) and evaluates the conditional as it would.
+    fn emulated(
+        w: &World,
+        dead: bool,
+        tag: &str,
+    ) -> std::rc::Rc<std::cell::RefCell<Option<(bool, String)>>> {
+        let pane = std::rc::Rc::new(std::cell::RefCell::new(Some((dead, tag.to_string()))));
+        let state = pane.clone();
+        w.fakes.mux_script("if-shell", move |argv| {
+            let condition = &argv[5];
+            let mut held = state.borrow_mut();
+            let holds = held.as_ref().is_some_and(|(dead, tag)| {
+                *dead
+                    && *condition == format!("#{{&&:#{{pane_dead}},#{{==:#{{@agent-id}},{tag}}}}}")
+            });
+            if holds && argv[6] == "kill-pane -t %9" {
+                *held = None;
+            }
+            Ok(crate::mux::Output {
+                code: 0,
+                stdout: String::new(),
+                stderr: String::new(),
+            })
+        });
+        let state = pane.clone();
+        w.fakes.mux_script("#{pane_id}|#{@agent-id}", move |_| {
+            let stdout = match state.borrow().as_ref() {
+                Some((_, tag)) => format!("%9|{tag}\n"),
+                None => "|\n".into(),
+            };
+            Ok(crate::mux::Output {
+                code: 0,
+                stdout,
+                stderr: String::new(),
+            })
+        });
+        pane
+    }
+
+    #[test]
+    fn reap_conditional_keeps_a_retagged_or_live_pane() {
+        // The snapshot saw %9 dead and ours; by the conditional it was retagged, or respawned live: kept.
+        for (dead_now, tag, kept) in [
+            (true, "bbbbbbbbbbbb", true),
+            (false, ID, true),
+            (true, ID, false),
+        ] {
+            let w = World::human("");
+            let caller = w.caller();
+            let folder = w.agent_record(ID, json!({}));
+            let pane = emulated(&w, dead_now, tag);
+            reap(&w.ctx, &caller, Some(&[dead("%9", ID)]), false).unwrap();
+            assert_eq!(pane.borrow().is_some(), kept, "{dead_now} {tag}");
+            assert_eq!(
+                folder.join("notice.json").exists(),
+                !kept,
+                "{dead_now} {tag}"
+            );
+            assert_eq!(stored(&w).len(), usize::from(!kept), "{dead_now} {tag}");
+        }
+    }
+
+    const NOW: &str = "2026-10-29T12:00:00.0000000Z";
+
+    #[test]
+    fn reap_uncommitted_after_60s_under_spawn_then_notice() {
+        let (old, edge, young) = (
+            "2026-10-29T11:58:59.0000000Z",
+            "2026-10-29T11:59:00.0000000Z",
+            "2026-10-29T11:59:30.0000000Z",
+        );
+        // (createdAt, launcher.json, notice.json already, the marker kind and code after, a message posted)
+        let cases: Vec<(&str, Option<Value>, bool, Option<(&str, Value)>)> = vec![
+            (old, None, false, Some(("lost", Value::Null))),
+            (
+                old,
+                Some(json!({"pid": 300, "aborted": true, "exitCode": 1})),
+                false,
+                Some(("exited", json!(1))),
+            ),
+            (old, Some(json!({"pid": 300, "exitCode": 1})), true, None),
+            (edge, None, false, None),
+            (young, None, false, None),
+        ];
+        for (created, launcher, noticed, want) in cases {
+            let w = World::human("");
+            w.clock(NOW);
+            let caller = w.caller();
+            let folder = w.uncommitted(ID, json!({"createdAt": created}));
+            if let Some(launcher) = &launcher {
+                write(&folder.join("launcher.json"), launcher.clone());
+            }
+            if noticed {
+                write(
+                    &folder.join("notice.json"),
+                    json!({"kind": "exited", "exitCode": 1, "at": "x"}),
+                );
+            }
+            w.panes(&[]);
+            w.fakes.mux_rule("#{pane_id}|#{@agent-id}", 0, "|\n", "");
+            w.fakes.clear_log();
+            let acted = reap(&w.ctx, &caller, None, false).unwrap();
+            let label = format!("{created} {launcher:?} {noticed}");
+            assert_eq!(acted, want.is_some(), "{label}");
+            match &want {
+                Some((kind, code)) => {
+                    let (k, c, closed) = marker_of(&folder);
+                    assert_eq!((k, c), (json!(kind), code.clone()), "{label}");
+                    assert_eq!(closed == json!("pane"), *kind == "lost", "{label}");
+                    assert_eq!(stored(&w).len(), 1, "{label}");
+                    let spawn = lock_key("spawn", &caller, "$3");
+                    let notice = lock_key("notice", &caller, ID);
+                    let mail = lock_key("mail", &caller, "pane-1");
+                    assert_eq!(
+                        w.fakes.locks(),
+                        [
+                            format!("+{spawn}"),
+                            format!("+{notice}"),
+                            format!("+{mail}"),
+                            format!("-{mail}"),
+                            format!("-{notice}"),
+                            format!("-{spawn}")
+                        ],
+                        "{label}"
+                    );
+                }
+                None => {
+                    assert!(stored(&w).is_empty(), "{label}");
+                    assert!(w.fakes.locks().is_empty(), "{label}");
+                    assert_eq!(folder.join("notice.json").exists(), noticed, "{label}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn reap_uncommitted_untouched_once_committed_or_live() {
+        let old = json!({"createdAt": "2026-10-29T11:58:00.0000000Z"});
+        // commit.json lands while reap waits for the spawn lock: untouched.
+        let w = World::human("");
+        w.clock(NOW);
+        let caller = w.caller();
+        let folder = w.uncommitted(ID, old.clone());
+        w.panes(&[]);
+        w.fakes.mux_rule("#{pane_id}|#{@agent-id}", 0, "|\n", "");
+        let spawn = lock_key("spawn", &caller, "$3");
+        let commit = folder.join("commit.json");
+        w.fakes.lock_probe(move |event| {
+            if event == format!("+{spawn}") {
+                write(&commit, json!({"committedAt": "x"}));
+            }
+            String::new()
+        });
+        reap(&w.ctx, &caller, None, false).unwrap();
+        assert!(!folder.join("notice.json").exists());
+        assert!(stored(&w).is_empty());
+        // Its pane answers live: untouched.
+        let w = World::human("");
+        w.clock(NOW);
+        let caller = w.caller();
+        let folder = w.uncommitted(ID, old.clone());
+        w.panes(&[]);
+        w.fakes
+            .mux_rule("#{pane_id}|#{@agent-id}", 0, "%9|aaaaaaaaaaaa\n", "");
+        assert!(!reap(&w.ctx, &caller, None, false).unwrap());
+        assert!(!folder.join("notice.json").exists());
+        // Inside spawn's own lock, reap never takes it again.
+        let w = World::human("");
+        w.clock(NOW);
+        let caller = w.caller();
+        let folder = w.uncommitted(ID, old);
+        w.panes(&[]);
+        w.fakes.mux_rule("#{pane_id}|#{@agent-id}", 0, "|\n", "");
+        let spawn = lock_key("spawn", &caller, "$3");
+        w.fakes.clear_log();
+        crate::agents::lock(&w.ctx, &spawn, || reap(&w.ctx, &caller, None, true)).unwrap();
+        assert!(folder.join("notice.json").exists());
+        let notice = lock_key("notice", &caller, ID);
+        assert_eq!(
+            w.fakes.locks()[..2],
+            [format!("+{spawn}"), format!("+{notice}")]
+        );
+        assert_eq!(
+            w.fakes
+                .locks()
+                .iter()
+                .filter(|l| l.contains("spawn|"))
+                .count(),
+            2
+        );
     }
 }

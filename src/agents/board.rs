@@ -46,7 +46,7 @@ pub fn board(
 ) -> Res<Map<String, Value>> {
     // One list-panes for the notices, the live rows and the ended filter; list runs every 3 s.
     let tagged = registry::tagged(ctx, caller)?;
-    registry::update_notices(ctx, caller, Some(&tagged))?;
+    registry::reap(ctx, caller, Some(&tagged), false)?;
     let rows = Rows {
         ctx,
         caller,

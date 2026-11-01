@@ -7,7 +7,7 @@ use std::time::Duration;
 use serde_json::{Map, Value, json};
 
 use super::mail::{add_mail, doing_line, mailbox_key, message_text, read_mail};
-use super::registry::{self, Notice, add_notice, find_pane, self_of, update_notices};
+use super::registry::{self, Notice, add_notice, find_pane, reap, self_of};
 use super::view::first;
 use super::{FILES_ONLY, lock, lock_key, pane_id, server_dir, text, usage};
 use crate::caller::{Kind, resolve};
@@ -154,7 +154,7 @@ pub fn read(ctx: &Ctx, request: &Request) -> Res<Map<String, Value>> {
     let me = self_of(ctx, &caller)?;
     let deadline = ctx.clock.now() + Duration::from_secs(wait as u64);
     let messages = loop {
-        update_notices(ctx, &caller, None)?;
+        reap(ctx, &caller, None, false)?;
         let messages = read_mail(ctx, &caller, &me.key)?;
         if !messages.is_empty() || ctx.clock.now() >= deadline {
             break messages;

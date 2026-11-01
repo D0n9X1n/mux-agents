@@ -678,7 +678,7 @@ mod tests {
         assert_eq!(messages[0]["body"], "worker exited with code 1.");
         // Never lost afterwards: the pane is gone, and the sweep finds the notice already posted.
         l.w.fakes.mux_first("#{pane_id}|#{@agent-id}", 0, "|\n", "");
-        crate::agents::registry::update_notices(&l.w.ctx, &l.w.caller(), Some(&[])).unwrap();
+        crate::agents::registry::reap(&l.w.ctx, &l.w.caller(), Some(&[]), false).unwrap();
         assert_eq!(mail(&l).len(), 1);
         assert_eq!(notice_kind(&l), "exited");
     }
@@ -786,7 +786,7 @@ mod tests {
     fn exited_after_reap_posts_nothing_new() {
         let l = setup("claude", json!([]));
         l.w.fakes.mux_first("#{pane_id}|#{@agent-id}", 0, "|\n", "");
-        crate::agents::registry::update_notices(&l.w.ctx, &l.w.caller(), Some(&[])).unwrap();
+        crate::agents::registry::reap(&l.w.ctx, &l.w.caller(), Some(&[]), false).unwrap();
         assert_eq!(notice_kind(&l), "lost");
         assert_eq!(launch(&l, &spec_str(&l), exits_7).code, 7);
         assert_eq!(notice_kind(&l), "lost");
