@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 use serde_json::{Map, Value, json};
 
 use super::mail::doing_line;
+use super::placement::{DEFAULT as DEFAULT_PLACEMENT, read_placement};
 use super::{copilot, lock, lock_key, registry, state_dir, usage};
 use crate::caller::{Caller, Kind, resolve};
 use crate::checks::{Context, Plan, assert_spawn_allowed, context_plan, resolve_name, session_id};
@@ -80,11 +81,12 @@ pub struct Identity<'a> {
 
 pub fn spawn(ctx: &Ctx, request: &Request) -> Res<Map<String, Value>> {
     let split = request.value("Split");
+    let tab = request.switch("Tab");
     let one_task = request.value("Task").is_some() != request.value("TaskFile").is_some();
     let Some(client) = request.value("Client").and_then(client_named) else {
         return Err(usage("spawn"));
     };
-    if !one_task || !split.is_none_or(|s| s == "h" || s == "v") {
+    if !one_task || !split.is_none_or(|s| s == "h" || s == "v") || (tab && split.is_some()) {
         return Err(usage("spawn"));
     }
     let caller = resolve(ctx)?;
@@ -116,6 +118,15 @@ pub fn spawn(ctx: &Ctx, request: &Request) -> Res<Map<String, Value>> {
     } else {
         ctx.cwd.clone()
     };
+    // After every check of the caller, before the lock: a read that fails is the default, never a refusal.
+    let (placement, source) = match (split, tab) {
+        (Some(split), _) => (split, "flag"),
+        (None, true) => (DEFAULT_PLACEMENT, "flag"),
+        (None, false) => match read_placement(ctx, &caller) {
+            Ok(Some(stored)) => (stored, "session"),
+            _ => (DEFAULT_PLACEMENT, "default"),
+        },
+    };
     let launch = Launch {
         ctx,
         caller: &caller,
@@ -125,11 +136,14 @@ pub fn spawn(ctx: &Ctx, request: &Request) -> Res<Map<String, Value>> {
         task,
         brief,
         directory,
-        split,
+        split: (placement != DEFAULT_PLACEMENT).then_some(placement),
     };
-    lock(ctx, &lock_key("spawn", &caller, &caller.session), || {
+    let mut reply = lock(ctx, &lock_key("spawn", &caller, &caller.session), || {
         launch.run()
-    })
+    })?;
+    reply.insert("placement".into(), placement.into());
+    reply.insert("placementSource".into(), source.into());
+    Ok(reply)
 }
 
 /// A checked request, run under the spawn lock.
@@ -810,6 +824,7 @@ mod tests {
                 "h;kill-server",
             ],
             &["-Client", "claude", "-Task", "hi", "-Split", ""],
+            &["-Client", "claude", "-Task", "hi", "-Tab", "-Split", "v"],
         ] {
             let w = human();
             assert_eq!(run(&w, args), usage, "{args:?}");
@@ -1358,6 +1373,146 @@ mod tests {
         }
     }
 
+    const PLACEMENT_READ: &str = "-N show-options -qv -t $3 @mux-agents-placement";
+
+    fn placement_reads(w: &World) -> usize {
+        placement_reads_in(&w.fakes)
+    }
+
+    fn placement_reads_in(fakes: &crate::testing::Fakes) -> usize {
+        fakes
+            .mux_calls()
+            .iter()
+            .filter(|c| c.join(" ") == PLACEMENT_READ)
+            .count()
+    }
+
+    // Where the agent opened, by its launch call: `tab` for a new window, else the split's `h` or `v`.
+    fn opened(w: &World) -> String {
+        let launch = w
+            .fakes
+            .mux_calls()
+            .into_iter()
+            .find(|c| c.iter().any(|a| a == "launcher"))
+            .expect("a launch call");
+        match launch[1].as_str() {
+            "new-window" => "tab".into(),
+            _ => {
+                // A split beside the caller: `split-window -d -<h|v> -P -F <format> -t %1`.
+                assert_eq!((launch[2].as_str(), launch[8].as_str()), ("-d", "%1"));
+                launch[3].trim_start_matches('-').into()
+            }
+        }
+    }
+
+    #[test]
+    fn placement_flag_then_session_then_tab() {
+        // (extra args, the stored option's answer, where the agent opens, the source). `throw` is a transport
+        // failure, `exit` a nonzero answer.
+        for (extra, stored, place, source) in [
+            (&[][..], "h\n", "h", "session"),
+            (&[], "v\r\n", "v", "session"),
+            (&[], "tab\n", "tab", "session"),
+            (&[], "", "tab", "default"),
+            (&[], "\n", "tab", "default"),
+            (&[], "garbage\n", "tab", "default"),
+            (&[], "H\n", "tab", "default"),
+            (&[], "exit", "tab", "default"),
+            (&[], "throw", "tab", "default"),
+            (&["-Split", "v"], "h\n", "v", "flag"),
+            (&["-Split", "h"], "", "h", "flag"),
+            (&["-Tab"], "h\n", "tab", "flag"),
+            (&["-tab"], "v\n", "tab", "flag"),
+        ] {
+            let w = human();
+            match stored {
+                "exit" => w.fakes.mux_rule("show-options", 1, "", "no server"),
+                "throw" => w.fakes.mux_script("show-options", |_| {
+                    refuse(1, "endpoint", "the rmux endpoint did not answer")
+                }),
+                text => w.fakes.mux_rule("show-options", 0, text, ""),
+            }
+            let fakes = w.fakes.clone();
+            w.fakes.lock_probe(move |event| {
+                if event.starts_with("+spawn") {
+                    format!("reads {}", placement_reads_in(&fakes))
+                } else {
+                    String::new()
+                }
+            });
+            let mut args = vec!["-Client", "claude", "-Task", "hi"];
+            args.extend(extra);
+            let case = format!("{extra:?} {stored:?}");
+            let ok = reply(&run(&w, &args));
+            assert_eq!(
+                (&ok["placement"], &ok["placementSource"]),
+                (&json!(place), &json!(source)),
+                "{case}"
+            );
+            assert_eq!(opened(&w), place, "{case}");
+            // Read only without a flag, once, and before the spawn lock is taken.
+            let reads = usize::from(extra.is_empty());
+            assert_eq!(placement_reads(&w), reads, "{case}");
+            let key = w.caller().server_key;
+            assert_eq!(
+                w.fakes.locks()[0],
+                format!("+spawn|{key}|$3 reads {reads}"),
+                "{case}"
+            );
+        }
+    }
+
+    #[test]
+    fn placement_never_masks_a_refusal() {
+        // -Tab with -Split is usage, before any call.
+        let w = human();
+        assert_eq!(
+            run(
+                &w,
+                &["-Client", "claude", "-Task", "hi", "-Tab", "-Split", "h"]
+            ),
+            format!("2 usage {}", crate::agents::usage("spawn").message)
+        );
+        assert!(w.fakes.mux_calls().is_empty());
+        // A tagged caller and an agent caller refused by its checks are refused before the option is read.
+        let w = ready(World::human("0123456789ab"));
+        w.fakes.mux_rule("show-options", 1, "", "no server");
+        assert_eq!(
+            run(&w, &["-Client", "claude", "-Task", "hi"]),
+            "2 tagged an agent pane cannot spawn agents"
+        );
+        assert_eq!(placement_reads(&w), 0);
+        let w = ready(World::agent(""));
+        w.file("t.md", b"task");
+        w.file("b.md", b"brief");
+        let args = [
+            "-Client",
+            "claude",
+            "-TaskFile",
+            "t.md",
+            "-BriefFile",
+            "b.md",
+        ];
+        assert_eq!(
+            run(&w, &args),
+            "2 flags a client command line cannot be read"
+        );
+        assert_eq!(placement_reads(&w), 0);
+        // The cap is still the cap when the option cannot be read, or holds a split.
+        for (code, stored) in [(1, ""), (0, "h\n")] {
+            let w = human();
+            w.fakes.mux_rule("show-options", code, stored, "");
+            let six = rows(6);
+            w.panes(&six.iter().map(String::as_str).collect::<Vec<_>>());
+            assert_eq!(
+                run(&w, &["-Client", "claude", "-Task", "hi"]),
+                "2 cap the session already has 6 live agents",
+                "{stored:?}"
+            );
+            assert!(calls(&w, "new-window").is_empty() && calls(&w, "split-window").is_empty());
+        }
+    }
+
     #[test]
     fn header_names_parent_transcript() {
         // A cross-client agent starts brief-only; its header names the parent's own transcript: Claude's project
@@ -1697,7 +1852,9 @@ mod tests {
                 "client",
                 "sessionId",
                 "context",
-                "reason"
+                "reason",
+                "placement",
+                "placementSource"
             ]
         );
         // A record that cannot be written is never committed: the launch aborts and the pane closes, and no commit

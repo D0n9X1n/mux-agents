@@ -9,6 +9,8 @@
 
 [spawn -Client claude -Task hi]
 -N display-message -p -t %1 #{pid}|#{pane_pid}|#{session_id}|#{window_id}|#{@agent-id}
+# 0.2.1: no -Split or -Tab, so the session's placement is read, before the spawn lock
+-N show-options -qv -t $3 @mux-agents-placement
 -N list-panes -s -t $3 -F <marker>|#{pane_id}|#{window_id}|#{pane_pid}|#{@agent-id}|#{@agent-name}|<marker>
 # :800-804
 -N new-window -d -P -F #{pane_id}|#{window_id} -t $3: -n claude-1 -e MUX_AGENTS_STATE=<state> -c <cwd> <exe> launcher <spec>
@@ -24,6 +26,7 @@
 
 [spawn -Client claude -Task hi, tagging fails]
 -N display-message -p -t %1 #{pid}|#{pane_pid}|#{session_id}|#{window_id}|#{@agent-id}
+-N show-options -qv -t $3 @mux-agents-placement
 -N list-panes -s -t $3 -F <marker>|#{pane_id}|#{window_id}|#{pane_pid}|#{@agent-id}|#{@agent-name}|<marker>
 -N new-window -d -P -F #{pane_id}|#{window_id} -t $3: -n claude-1 -e MUX_AGENTS_STATE=<state> -c <cwd> <exe> launcher <spec>
 -N set-option -p -t %12 @agent-id <id> ; set-option -p -t %12 @agent-name claude-1 ; set-option -p -t %12 @agent-parent %1 ; set-option -p -t %12 @agent-context brief:human
