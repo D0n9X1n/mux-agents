@@ -1772,18 +1772,123 @@ fn release_gate_requires_tag_eq_plugin_eq_cargo_version() {
     }
 }
 
+/// The one-line upgrades. `claude plugin update` alone reads the cached catalog, so the marketplace is refreshed
+/// first; tests/upgrade.sh pins both behaviours with the real clients.
+const CLAUDE_UPGRADE: &str =
+    "claude plugin marketplace update mux-agents && claude plugin update mux-agents@mux-agents";
+const COPILOT_UPGRADE: &str =
+    "copilot plugin marketplace update mux-agents && copilot plugin update mux-agents@mux-agents";
+
 #[test]
 fn readme_has_one_line_upgrade_for_both_clis() {
     let readme = file_lines("README.md");
-    for want in [
-        "claude plugin update mux-agents@mux-agents",
-        "copilot plugin update mux-agents",
-    ] {
+    for want in [CLAUDE_UPGRADE, COPILOT_UPGRADE] {
         assert!(
             readme.contains(&want.to_string()),
             "README lacks the line {want}"
         );
     }
+    // No line offers the plugin update alone, which keeps a 0.1 install on its cached catalog.
+    for line in &readme {
+        let l = line.trim().trim_matches('`');
+        assert!(
+            !(l.starts_with("claude plugin update") || l.starts_with("copilot plugin update")),
+            "README offers a plugin update without the marketplace refresh: {line}"
+        );
+    }
+    // The upgrade test runs exactly these lines.
+    let upgrade = repo_file("tests/upgrade.sh");
+    for want in [CLAUDE_UPGRADE, COPILOT_UPGRADE] {
+        let command = want.replace("claude plugin", "command claude plugin");
+        let command = command.replace("copilot plugin", "command copilot plugin");
+        assert!(
+            upgrade.contains(&command),
+            "tests/upgrade.sh lacks {command}"
+        );
+    }
+}
+
+/// The quoted strings of `const <name>: [&str; N] = [ ... ];` in a Rust source.
+fn const_strings(src: &str, name: &str) -> Vec<String> {
+    let head = format!("const {name}: [&str; ");
+    let at = src.find(&head).unwrap_or_else(|| panic!("no {head}"));
+    let body = &src[at..];
+    let body = &body[body.find("= [").unwrap() + 3..body.find("];").unwrap()];
+    body.split('"')
+        .skip(1)
+        .step_by(2)
+        .map(String::from)
+        .collect()
+}
+
+/// The flags a text passes to `claude` or `copilot` when it starts one: after the lowercase word, the tokens up to the
+/// end of the command (a `#`, a closing backtick or the line end). A subcommand (`claude plugin …`) is not a launch.
+fn launch_flags(text: &str, client: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for line in text.lines() {
+        for (at, _) in line.match_indices(client) {
+            let before = line[..at].chars().next_back();
+            if before.is_some_and(|c| c.is_ascii_alphanumeric() || "-_./".contains(c)) {
+                continue;
+            }
+            // The client's name is a whole word: `claude-1` is an agent's name, not a launch.
+            let rest = &line[at + client.len()..];
+            if !rest.starts_with([' ', '\t']) {
+                continue;
+            }
+            // After a flag it is that flag's value (`spawn -Client copilot -TaskFile t`), not a launch.
+            let previous = line[..at].split_whitespace().next_back();
+            if previous.is_some_and(|w| w.trim_start_matches('`').starts_with('-')) {
+                continue;
+            }
+            let mut tokens = rest.split_whitespace().peekable();
+            if !tokens.peek().is_some_and(|t| t.starts_with('-')) {
+                continue;
+            }
+            for token in tokens {
+                if token.starts_with('#') {
+                    break;
+                }
+                let bare = token.trim_end_matches(['`', ',', ';', ')', '.']);
+                if bare.starts_with('-') {
+                    out.push(bare.split('=').next().unwrap().to_string());
+                }
+                if token.ends_with('`') {
+                    break;
+                }
+            }
+        }
+    }
+    out
+}
+
+#[test]
+fn readme_launch_flags_in_allowlist() {
+    // The README must never tell a user to start the caller with a flag the spawn checks refuse (check flags), such
+    // as --plugin-dir: every spawn from that session would fail.
+    let readme = repo_file("README.md");
+    assert!(
+        !readme.contains("--plugin-dir"),
+        "README suggests --plugin-dir"
+    );
+    let checks = repo_file("src/checks.rs");
+    for (client, list) in [("claude", "CLAUDE_FLAGS"), ("copilot", "COPILOT_FLAGS")] {
+        let allowed = const_strings(&checks, list);
+        assert!(!allowed.is_empty(), "{list}");
+        let flags = launch_flags(&readme, client);
+        assert!(!flags.is_empty(), "README shows no {client} launch");
+        for flag in flags {
+            assert!(
+                allowed.contains(&flag),
+                "README starts {client} with {flag}, outside {list}"
+            );
+        }
+    }
+    // The scanner sees a flag in prose, in a code span and in a code block, and skips subcommands, comments and agent
+    // names.
+    let sample = "start `claude --plugin-dir x` now\nclaude --model y  # or: copilot --bad\nclaude plugin update z\n`focus claude-1 -Lines 4`\n`spawn -Client copilot -TaskFile t`";
+    assert_eq!(launch_flags(sample, "claude"), ["--plugin-dir", "--model"]);
+    assert_eq!(launch_flags(sample, "copilot"), ["--bad"]);
 }
 
 #[test]
@@ -1826,13 +1931,19 @@ fn release_moves_dist_with_new_plugin_version() {
         dist_version < decide && version < decide && decide < commit,
         "{publish:#?}"
     );
-    // And a real Claude Code moves an install to the new version on one update, from a relative source and on the
-    // same ref.
+    // And a real Claude Code, installed the way a user installs it (the GitHub marketplace, served from a local
+    // repository), moves to the new version with the one-liner, from a relative source and on the same ref; the plugin
+    // update alone stays on the cached catalog.
     let upgrade = repo_file("tests/upgrade.sh");
-    for case in ["migrate_relative_to_dist", "bump_on_same_ref"] {
+    for case in [
+        "update_alone_keeps_cached_catalog",
+        "migrate_relative_to_dist",
+        "bump_on_same_ref",
+    ] {
         assert!(upgrade.contains(case), "tests/upgrade.sh lacks {case}");
     }
-    assert!(upgrade.contains("command claude plugin update \"mux-agents@$mkt\""));
+    assert!(upgrade.contains("command claude plugin marketplace add D0n9X1n/mux-agents"));
+    assert!(upgrade.contains("insteadOf = https://github.com/D0n9X1n/mux-agents.git"));
     assert!(!upgrade.contains("MUX_AGENTS_BIN="));
 }
 
@@ -1899,7 +2010,7 @@ fn readme_upgrade_lifecycle() {
     };
     let close = at("sidebar -Close");
     let stop = at("`stop`");
-    let update = at("claude plugin update mux-agents@mux-agents");
+    let update = at(CLAUDE_UPGRADE);
     let restart = at("Restart");
     assert!(
         close < stop && stop < update && update < restart,
@@ -1910,13 +2021,12 @@ fn readme_upgrade_lifecycle() {
     // The release notes say the same, in both languages.
     for page in ["Release-v0.2.0", "Release-v0.2.0-zh-CN"] {
         let text = wiki_text(page);
-        for needle in [
-            "sidebar -Close",
-            "`stop`",
-            "claude plugin update mux-agents@mux-agents",
-            "copilot plugin update mux-agents",
-        ] {
+        for needle in ["sidebar -Close", "`stop`"] {
             assert!(text.contains(needle), "{page} lacks {needle}");
+        }
+        let lines: Vec<&str> = text.lines().collect();
+        for want in [CLAUDE_UPGRADE, COPILOT_UPGRADE] {
+            assert!(lines.contains(&want), "{page} lacks the line {want}");
         }
     }
 }

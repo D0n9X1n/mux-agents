@@ -28,7 +28,7 @@ claude --dangerously-skip-permissions  # or: copilot --allow-all
 
 Then just ask: "spawn a Copilot agent to write the tests for parser.rs, and open the side bar".
 
-The marketplace installs the `dist` branch, which holds the prebuilt binaries; it takes effect once the first 0.2.0 release creates `dist`. Until then, build from source: clone this repository, run `cargo build --release` in it, and start the client with `--plugin-dir <clone>`; the entry finds `target/release/mux-agent`.
+The marketplace installs the `dist` branch, which holds the prebuilt binaries; it takes effect once the first 0.2.0 release creates `dist`. Until then, Claude Code can run a build from source with no launch flag: `git clone https://github.com/D0n9X1n/mux-agents ~/.claude/skills/mux-agents`, then `cargo build --release` in that folder. The next session loads it as `mux-agents@skills-dir`, and the entry finds `target/release/mux-agent`. Don't install the marketplace plugin beside it: an installed marketplace plugin of the same name takes precedence. For Copilot CLI, wait for the release.
 
 ## What you get
 
@@ -97,15 +97,17 @@ Close what runs, update, then restart:
 3. Update the plugin in each client you use, with one line:
 
 ```text
-claude plugin update mux-agents@mux-agents
-copilot plugin update mux-agents
+claude plugin marketplace update mux-agents && claude plugin update mux-agents@mux-agents
+copilot plugin marketplace update mux-agents && copilot plugin update mux-agents@mux-agents
 ```
+
+Refresh the marketplace first: Claude Code's plugin update reads the catalog it cached when you added the marketplace, so on its own it can report the old version as the latest.
 
 4. Restart your Claude Code and Copilot CLI sessions, then spawn agents and open the side bar again.
 
 Why: each agent pane and the side bar run the binary by the absolute path they started with, so they keep the old version until restarted. From 0.1 the order matters most: the 0.1 named mutex and the 0.2 lock files do not serialize, so a 0.1 pane and a 0.2 command must never run at the same time. Within 0.2.x the state folder, the record, mail and lock file formats stay the same.
 
-Claude Code turns background auto-update off by default for a third-party marketplace such as this one. To turn it on, open `/plugin`, go to **Marketplaces**, select `mux-agents` and select **Enable auto-update**. An update then lands on disk after a session starts; panes already running keep their binary until you restart them.
+Claude Code turns background auto-update off by default for a third-party marketplace such as this one. To turn it on, open `/plugin`, go to **Marketplaces**, select `mux-agents` and select **Enable auto-update**. Claude Code then, within ten minutes of your first message in a session, refreshes the marketplace and updates the plugin on disk; panes already running keep their binary until you restart them.
 
 ## Safety checks
 
@@ -134,7 +136,7 @@ Every refusal is one JSON line with `check` naming the cause:
 
 | check | what it means | what to do |
 |---|---|---|
-| `entry` | no `mux-agent` binary for this OS and architecture | install a release (the marketplace's `dist`), or `cargo build --release` in a clone |
+| `entry` | no `mux-agent` binary for this OS and architecture | install a release (the marketplace's `dist`), or build from source as in the 30-second start |
 | `endpoint` | not inside a multiplexer pane, or tmux older than 3.2 or rmux older than 0.10 | start the client inside tmux 3.2+ or rmux 0.10+ |
 | `sandbox` | the caller runs in a sandbox (`SANDBOX_RUNTIME=1`, a macOS sandbox, Linux `NoNewPrivs`, a restricted Windows token) | run the client outside the sandbox |
 | `policy` | the caller is not in bypass or allow-all | Claude Code: bypass permissions (`--dangerously-skip-permissions` or Shift+Tab); Copilot CLI: `--allow-all` |

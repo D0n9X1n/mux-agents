@@ -42,7 +42,7 @@ sh scripts/dev/tmux32.sh
 cargo test --features live,test-panic --locked --test live
 sh tests/release.sh
 sh tests/wiki.sh
-sh tests/upgrade.sh   # real Claude Code, isolated in a temp dir, offline
+sh tests/upgrade.sh   # real Claude Code (and Copilot CLI when on PATH), isolated in a temp dir, git fetches local
 ```
 
 Lint (`lint`), with actionlint 1.7.12, shellcheck and Claude Code 2.1.310 or later:

@@ -34,8 +34,8 @@ The marketplace installs the `dist` branch, which this release creates: the tagg
 From 0.1, close the side bar with `sidebar -Close` and `stop` every agent first: the 0.1 named mutex and the 0.2.0 lock files do not serialize. Then update with one line per client and restart your sessions:
 
 ```text
-claude plugin update mux-agents@mux-agents
-copilot plugin update mux-agents
+claude plugin marketplace update mux-agents && claude plugin update mux-agents@mux-agents
+copilot plugin marketplace update mux-agents && copilot plugin update mux-agents@mux-agents
 ```
 
 Agent panes and the side bar run the binary by the absolute path they started with; restart them after an upgrade. Claude Code leaves auto-update off for this marketplace until you select **Enable auto-update** under **Marketplaces** in `/plugin`.

@@ -34,8 +34,8 @@ copilot plugin install mux-agents@mux-agents
 从 0.1 升级时，先用 `sidebar -Close` 关闭侧边栏，并 `stop` 每个代理：0.1 的命名互斥体和 0.2.0 的锁文件不会互相串行化。然后每个客户端用一行命令更新，并重启会话：
 
 ```text
-claude plugin update mux-agents@mux-agents
-copilot plugin update mux-agents
+claude plugin marketplace update mux-agents && claude plugin update mux-agents@mux-agents
+copilot plugin marketplace update mux-agents && copilot plugin update mux-agents@mux-agents
 ```
 
 代理窗格和侧边栏按启动时的绝对路径运行二进制文件；升级后请重启它们。在 `/plugin` 的 **Marketplaces** 下选择 **Enable auto-update** 之前，Claude Code 不会为此市场自动更新。
