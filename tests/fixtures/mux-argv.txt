@@ -36,6 +36,15 @@
 -N display-message -p -t %1 #{pane_height}
 -N capture-pane -p -t %1
 
+# placement is new in 0.2.1 (no reference line): a session user option on the caller's session.
+[placement]
+-N display-message -p -t %1 #{pid}|#{pane_pid}|#{session_id}|#{window_id}|#{@agent-id}
+-N show-options -qv -t $3 @mux-agents-placement
+
+[placement h]
+-N display-message -p -t %1 #{pid}|#{pane_pid}|#{session_id}|#{window_id}|#{@agent-id}
+-N set-option -t $3 @mux-agents-placement h
+
 [list]
 -N display-message -p -t %1 #{pid}|#{pane_pid}|#{session_id}|#{window_id}|#{@agent-id}
 -N list-panes -s -t $3 -F <marker>|#{pane_id}|#{window_id}|#{pane_pid}|#{@agent-id}|#{@agent-name}|<marker>

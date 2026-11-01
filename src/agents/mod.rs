@@ -12,6 +12,7 @@ pub mod board;
 pub mod copilot;
 pub mod mail;
 pub mod message;
+pub mod placement;
 pub mod registry;
 pub mod spawn;
 pub mod view;
