@@ -33,10 +33,31 @@ pub const GONE_FORMAT: &str = "#{pane_id}|#{pane_pid}";
 // Each pane of the session and whether it carries the side-bar label, compared by the server: a label value with a
 // newline or `|` cannot forge a line.
 const LABEL_FORMAT: &str = "#{pane_id}|#{==:#{@agent-role},sidebar}";
-// The bar is a fifth of its window, never narrower than this.
-const MIN_WIDTH: u32 = 40;
-// The bar's window, one row per pane (S1.3), with the zoom flag: a zoomed window is left alone.
-const LAYOUT: &str = "#{pane_id}|#{pane_active}|#{pane_at_right}|#{pane_at_top}|#{pane_at_bottom}|#{pane_width}|#{window_width}|#{pane_left}|#{pane_top}|#{window_zoomed_flag}";
+// The bar is `@mux-agents-sidebar-percent` of its window, never narrower than `@mux-agents-sidebar-min` columns,
+// both read where the bar's pane stands (pane, window, session, then `set -g`). Unset or not a whole number in
+// range: 5% of the window, at least 30 columns.
+const MIN_WIDTH: u32 = 30;
+const PERCENT: u32 = 5;
+#[cfg(test)]
+const MIN_OPTION: &str = "@mux-agents-sidebar-min";
+#[cfg(test)]
+const PERCENT_OPTION: &str = "@mux-agents-sidebar-percent";
+// The two options as format fields: the multiplexer replaces `|`, LF and CR in each value, so a value never adds
+// a field or a row (it is then no number, and its default is used).
+macro_rules! options {
+    () => {
+        "#{s/[|\n\r]/x/:@mux-agents-sidebar-min}|#{s/[|\n\r]/x/:@mux-agents-sidebar-percent}"
+    };
+}
+// The caller's window width and the width options, read once by open.
+const WINDOW_PROBE: &str = concat!("#{window_width}|", options!());
+// The bar's window, one row per pane (S1.3), with the zoom flag (a zoomed window is left alone) and the width
+// options as each pane reads them.
+const LAYOUT: &str = concat!(
+    "#{pane_id}|#{pane_active}|#{pane_at_right}|#{pane_at_top}|#{pane_at_bottom}|#{pane_width}|#{window_width}|",
+    "#{pane_left}|#{pane_top}|#{window_zoomed_flag}|",
+    options!()
+);
 // Repairs that may fail in a row before repair pauses, and how long a pause lasts when the layout does not change.
 const REPAIR_TRIES: u32 = 3;
 const REARM: Duration = Duration::from_secs(60);
@@ -138,7 +159,7 @@ pub struct Size {
     pub height: usize,
 }
 
-// Until the pane answers its size: the bar's narrowest width and a common height.
+// Until the pane answers its size: the bar's default narrowest width and a common height.
 const FALLBACK: Size = Size {
     width: MIN_WIDTH as usize,
     height: 24,
@@ -380,13 +401,16 @@ fn live_row(row: &Map<String, Value>, cols: usize, look: Look) -> Live {
     }
 }
 
-/// `mux-agents` bold, then the counts right-aligned when they fit.
+/// `mux-agents` bold, then the counts right-aligned when they fit; short of room only their first part (`N
+/// running`), then the title alone.
 fn header(counts: &str, cols: usize) -> Row {
     let title = span("mux-agents", BOLD);
-    let width = paint::width(counts);
-    if 10 + 2 + width > cols {
+    let fits = |text: &str| 10 + 2 + paint::width(text) <= cols;
+    let running = counts.split(" / ").next().unwrap_or(counts);
+    let Some(counts) = [counts, running].into_iter().find(|text| fits(text)) else {
         return margin(vec![title]);
-    }
+    };
+    let width = paint::width(counts);
     margin(vec![
         title,
         span(" ".repeat(cols - 10 - width), PLAIN),
@@ -655,6 +679,8 @@ struct Pane {
     width: u32,
     left: u32,
     top: u32,
+    // The width options as this pane reads them.
+    sizing: Sizing,
 }
 
 /// The bar's window: its width, whether a pane is zoomed, and its panes.
@@ -665,8 +691,9 @@ struct Layout {
     panes: Vec<Pane>,
 }
 
-/// The LAYOUT rows, or none unless every row is exactly ten well-formed fields (a pane id, 0/1 flags, decimal
-/// numbers) agreeing on the window's width and zoom, with at least one row. One final LF ends the answer.
+/// The LAYOUT rows, or none unless every row is exactly twelve fields, the first ten well-formed (a pane id, 0/1
+/// flags, decimal numbers) and agreeing on the window's width and zoom, with at least one row. The last two are the
+/// width options, each its default when it is no number in range. One final LF ends the answer.
 fn parse_layout(text: &str) -> Option<Layout> {
     let flag = |f: &str| match f {
         "0" => Some(false),
@@ -683,7 +710,7 @@ fn parse_layout(text: &str) -> Option<Layout> {
     for line in body.split('\n') {
         let line = line.strip_suffix('\r').unwrap_or(line);
         let f: Vec<&str> = line.split('|').collect();
-        if f.len() != 10 || !pane_id(f[0]) {
+        if f.len() != 12 || !pane_id(f[0]) {
             return None;
         }
         let (width, zoomed) = (number(f[6])?, flag(f[9])?);
@@ -696,6 +723,7 @@ fn parse_layout(text: &str) -> Option<Layout> {
             width: number(f[5])?,
             left: number(f[7])?,
             top: number(f[8])?,
+            sizing: Sizing::read(f[10], f[11]),
         };
         let layout = layout.get_or_insert_with(|| Layout {
             width,
@@ -735,8 +763,8 @@ fn signature(panes: &[Pane]) -> String {
 /// height, `bar_width` columns, and the active pane never changes.
 #[derive(Default)]
 struct Keeper {
-    // The window width the bar's width was last set for; a drag is kept until the window's width changes.
-    applied: Option<u32>,
+    // The window width the bar's width was last set for, and that width; a drag is kept until either changes.
+    applied: Option<(u32, u32)>,
     // Repairs that failed in a row: a refused move, or a move the read right after it found did not hold.
     failures: u32,
     // While repair is paused: the layout it paused on and when.
@@ -752,13 +780,13 @@ impl Keeper {
 
     /// The bar's width as last set, when one was.
     fn width(&self) -> Option<usize> {
-        self.applied.map(|window| bar_width(window) as usize)
+        self.applied.map(|(_, width)| width as usize)
     }
 
     /// One read of the bar's window. A failed or malformed read, or one without the bar, does nothing; so does a
     /// zoomed window, since resizing a pane unzooms it. A pause re-arms when the layout changed or 60 s passed. A bar
-    /// in place gets its width when the window's width differs from the one last applied for; a bar out of place is
-    /// repaired unless paused. True when it resized or moved the bar.
+    /// in place gets its width when the window's width, or the width its options give, differs from the last one
+    /// applied; a bar out of place is repaired unless paused. True when it resized or moved the bar.
     fn tick(&mut self, ctx: &Ctx, bar: &str) -> bool {
         self.acted = false;
         self.check(ctx, bar);
@@ -786,8 +814,9 @@ impl Keeper {
         }
         if in_place(me) {
             (self.failures, self.paused) = (0, None);
-            if self.applied != Some(layout.width) {
-                self.resize(ctx, bar, layout.width);
+            let want = (layout.width, bar_width(layout.width, me.sizing));
+            if self.applied != Some(want) {
+                self.resize(ctx, bar, want);
             }
             return;
         }
@@ -804,12 +833,13 @@ impl Keeper {
         }
     }
 
-    /// Sets the bar's width for a window `window` wide; remembered only when the multiplexer took it.
-    fn resize(&mut self, ctx: &Ctx, bar: &str, window: u32) {
-        let width = bar_width(window).to_string();
+    /// Sets the bar to `width` for a window `window` wide; remembered only when the multiplexer took it.
+    fn resize(&mut self, ctx: &Ctx, bar: &str, (window, width): (u32, u32)) {
         self.acted = true;
-        if native(ctx, &["resize-pane", "-t", bar, "-x", &width], true).is_ok_and(|r| r.code == 0) {
-            self.applied = Some(window);
+        let columns = width.to_string();
+        if native(ctx, &["resize-pane", "-t", bar, "-x", &columns], true).is_ok_and(|r| r.code == 0)
+        {
+            self.applied = Some((window, width));
         }
     }
 
@@ -835,7 +865,12 @@ impl Keeper {
         }
         self.acted = true;
         self.applied = None;
-        self.resize(ctx, bar, layout.width);
+        let sizing = layout
+            .panes
+            .iter()
+            .find(|p| p.id == bar)
+            .map_or_else(Sizing::default, |p| p.sizing);
+        self.resize(ctx, bar, (layout.width, bar_width(layout.width, sizing)));
         if let Some(active) = active {
             let still = native(
                 ctx,
@@ -1077,21 +1112,74 @@ pub fn sidebar(ctx: &Ctx, request: &Request) -> Res<Map<String, Value>> {
     })
 }
 
-/// The bar's width for a window `window` columns wide: `max(40, floor(window / 5))`.
-pub fn bar_width(window: u32) -> u32 {
-    (window / 5).max(MIN_WIDTH)
+/// The bar's width options: at least `min` columns, `percent` of the window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Sizing {
+    pub min: u32,
+    pub percent: u32,
 }
 
-/// The width of `pane`'s window; none when the multiplexer does not answer a number.
-fn window_width(ctx: &Ctx, pane: &str) -> Option<u32> {
-    let read = native(
+impl Default for Sizing {
+    fn default() -> Self {
+        Sizing {
+            min: MIN_WIDTH,
+            percent: PERCENT,
+        }
+    }
+}
+
+impl Sizing {
+    /// The options as the multiplexer answers them: `min` 1-9999 and `percent` 1-100, in plain digits; each one
+    /// that is not (unset, a sign, a space, too big) is its default alone.
+    pub fn read(min: &str, percent: &str) -> Sizing {
+        let number = |text: &str, most: u32| {
+            (!text.is_empty() && text.bytes().all(|b| b.is_ascii_digit()))
+                .then(|| text.parse::<u32>().ok())
+                .flatten()
+                .filter(|n| (1..=most).contains(n))
+        };
+        let default = Sizing::default();
+        Sizing {
+            min: number(min, 9999).unwrap_or(default.min),
+            percent: number(percent, 100).unwrap_or(default.percent),
+        }
+    }
+}
+
+/// The bar's width for a window `window` columns wide: `max(min, floor(window * percent / 100))`.
+pub fn bar_width(window: u32, sizing: Sizing) -> u32 {
+    let share = u64::from(window) * u64::from(sizing.percent) / 100;
+    u32::try_from(share).unwrap_or(u32::MAX).max(sizing.min)
+}
+
+/// WINDOW_PROBE's answer: the window's width (none unless a number) and the width options; nothing in an answer
+/// that is not exactly 3 fields on one line is used.
+fn window_answer(text: &str) -> (Option<u32>, Sizing) {
+    let line = text.strip_suffix('\n').unwrap_or(text);
+    let line = line.strip_suffix('\r').unwrap_or(line);
+    let f: Vec<&str> = line.split('|').collect();
+    if f.len() != 3 || line.contains(['\n', '\r']) {
+        return (None, Sizing::default());
+    }
+    let width = (!f[0].is_empty() && f[0].bytes().all(|b| b.is_ascii_digit()))
+        .then(|| f[0].parse().ok())
+        .flatten();
+    (width, Sizing::read(f[1], f[2]))
+}
+
+/// The width of `pane`'s window and its width options; no width when the multiplexer does not answer a number.
+fn window_width(ctx: &Ctx, pane: &str) -> (Option<u32>, Sizing) {
+    native(
         ctx,
-        &["display-message", "-p", "-t", pane, "#{window_width}"],
+        &["display-message", "-p", "-t", pane, WINDOW_PROBE],
         true,
     )
     .ok()
-    .filter(|read| read.code == 0)?;
-    read.stdout.trim_end_matches(['\r', '\n']).parse().ok()
+    .filter(|read| read.code == 0)
+    .map_or_else(
+        || (None, Sizing::default()),
+        |read| window_answer(&read.stdout),
+    )
 }
 
 fn window_id(text: &str) -> bool {
@@ -1318,7 +1406,7 @@ fn new_watch(ctx: &Ctx, pid: u32) -> Option<i64> {
 }
 
 /// Splits the bar at the right edge of the caller's window, full height (`-f -h`), with the pane environment (Unix:
-/// the state root) so watch reads the caller's state. The bar is `bar_width` of the window (40 when the width cannot
+/// the state root) so watch reads the caller's state. The bar is `bar_width` of the window (its minimum when the width cannot
 /// be read), asked for with -l and set again by a pid-bound resize-pane, since rmux ignores -l; a refused resize is left to
 /// the next watch tick. `-d` keeps the active pane. The split's process must be this binary `watch` (else nothing is
 /// killed and the open refuses); then the pane is labelled (bound to that pid, read back) and recorded as
@@ -1327,7 +1415,8 @@ fn new_watch(ctx: &Ctx, pid: u32) -> Option<i64> {
 /// bar is proven as the last step; a pane that fails it is not killed, its record is cleared and the open refuses.
 fn open(ctx: &Ctx, caller: &Caller) -> Res<(String, String)> {
     let env = pane_env(utf8(&ctx.state_root)?, crate::state::root::HOST);
-    let width = bar_width(window_width(ctx, &caller.pane).unwrap_or(0)).to_string();
+    let (window, sizing) = window_width(ctx, &caller.pane);
+    let width = bar_width(window.unwrap_or(0), sizing).to_string();
     let mut split: Vec<&str> = vec![
         "split-window",
         "-d",
@@ -1615,6 +1704,20 @@ mod tests {
             [tiny(11), tiny(10), tiny(4), tiny(1)],
             [["mux-agents"], ["mux-ag..."], ["mux"], ["m"]]
         );
+        // Too narrow for both counts (the default 30 columns), the header keeps the running count; narrower still,
+        // the title alone. The header ends one column short of the pane (its right margin).
+        let header = |width| plain(&mock(), Size { width, height: 9 })[0].clone();
+        let cut = |width: usize, counts: &str| {
+            format!(
+                " mux-agents{}{counts}",
+                " ".repeat(width - 12 - counts.len())
+            )
+        };
+        assert_eq!(header(33), cut(33, "3 running / 7 ended"));
+        assert_eq!(header(32), cut(32, "3 running"));
+        assert_eq!(header(30), cut(30, "3 running"));
+        assert_eq!(header(23), cut(23, "3 running"));
+        assert_eq!(header(22), " mux-agents");
         // Short of room the model goes first, then the name is cut; wider, the model is kept.
         let rows = plain(&long, W40);
         assert_eq!(
@@ -2181,10 +2284,27 @@ mod tests {
         assert_eq!(frames, [board_frame(), board_frame()]);
         assert_eq!(w.fakes.slept(), [2000, 2000]);
         assert_eq!(probes(&w), 3);
-        // A thrown or failed probe is unknown, not gone: its frame says refresh failed.
+        // A thrown or failed probe is unknown, not gone: its frame says refresh failed, at the default narrowest
+        // width (30) until the pane answers its size.
         let w = watch_world(&["throw", "fail", "live", "gone"]);
         let (ended, frames) = watch_run(&w);
-        let marked = noted_frame(&["refresh failed"]);
+        assert_eq!(FALLBACK.width, 30);
+        let narrow = [
+            " mux-agents         1 running",
+            "",
+            " \u{25c9} worker        working   4m",
+            "   testing the parser",
+            "",
+            &format!(" ended {}", "-".repeat(21)),
+            " \u{2713} done             done   4m",
+            "",
+            " refresh failed",
+        ];
+        let marked: String = narrow
+            .iter()
+            .map(|row| format!("{row}\u{1b}[K\r\n"))
+            .collect();
+        let marked = format!("\u{1b}[?2026h\u{1b}[H{marked}\u{1b}[J\u{1b}[?2026l");
         assert_eq!(ended, "pane-closed");
         assert_eq!(frames, [marked.clone(), marked, board_frame()]);
         assert_eq!(probes(&w), 4);
@@ -2320,6 +2440,9 @@ mod tests {
         moved: Option<Vec<Rect>>,
         move_focus: Option<&'static str>,
         move_fail: bool,
+        // The two width options as the format answers them (unset: empty).
+        min: &'static str,
+        percent: &'static str,
     }
 
     type Shared = Rc<RefCell<Win>>;
@@ -2330,6 +2453,8 @@ mod tests {
             height: 50,
             active,
             panes,
+            min: "40",
+            percent: "20",
             ..Win::default()
         }
     }
@@ -2344,7 +2469,7 @@ mod tests {
             .iter()
             .map(|p| {
                 format!(
-                    "{}|{}|{}|{}|{}|{}|{}|{}|{}|{}\n",
+                    "{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}\n",
                     p.id,
                     flag(p.id == w.active),
                     flag(p.left + p.width == w.width),
@@ -2354,7 +2479,9 @@ mod tests {
                     w.width,
                     p.left,
                     p.top,
-                    flag(w.zoomed)
+                    flag(w.zoomed),
+                    w.min,
+                    w.percent
                 )
             })
             .collect()
@@ -2532,22 +2659,43 @@ mod tests {
                 width: 40,
                 left: 160,
                 top: 0,
+                sizing: Sizing {
+                    min: 40,
+                    percent: 20
+                },
             }
         );
+        assert_eq!(
+            (layout.panes[1].sizing.min, layout.panes[1].sizing.percent),
+            (40, 20)
+        );
         assert!(parse_layout(&good.replace('\n', "\r\n")).is_some());
+        // The two option fields are read per pane and never fail the row: a bad one is its default alone.
+        for (tail, want) in [
+            ("|", (30, 5)),
+            ("44|7", (44, 7)),
+            ("40x10|7", (30, 7)),
+            ("44|7xx", (44, 5)),
+            ("1x2x3|x", (30, 5)),
+        ] {
+            let layout = parse_layout(&format!("%7|0|1|1|1|40|200|160|0|0|{tail}\n")).unwrap();
+            let sizing = layout.panes[0].sizing;
+            assert_eq!((sizing.min, sizing.percent), want, "{tail:?}");
+        }
         for bad in [
             "",
             "\n",
-            "%1|1|0|1|1|159|200|0|0",
-            "%1|1|0|1|1|159|200|0|0|0|x",
-            "%1|2|0|1|1|159|200|0|0|0",
-            "%1|1|0|1|1|+159|200|0|0|0",
-            "%1|1|0|1|1|159|200|0|-1|0",
-            "%1|1|0|1|1|159||0|0|0",
-            "1|1|0|1|1|159|200|0|0|0",
-            "%1|1|0|1|1|159|200|0|0|0\n%7|0|1|1|1|40|201|160|0|0",
-            "%1|1|0|1|1|159|200|0|0|0\n%7|0|1|1|1|40|200|160|0|1",
-            "%1|1|0|1|1|159|200|0|0|0\nnot a row",
+            "%1|1|0|1|1|159|200|0|0|0",
+            "%1|1|0|1|1|159|200|0|0|0|40",
+            "%1|1|0|1|1|159|200|0|0|0|40|20|x",
+            "%1|2|0|1|1|159|200|0|0|0|40|20",
+            "%1|1|0|1|1|+159|200|0|0|0|40|20",
+            "%1|1|0|1|1|159|200|0|-1|0|40|20",
+            "%1|1|0|1|1|159||0|0|0|40|20",
+            "1|1|0|1|1|159|200|0|0|0|40|20",
+            "%1|1|0|1|1|159|200|0|0|0|40|20\n%7|0|1|1|1|40|201|160|0|0|40|20",
+            "%1|1|0|1|1|159|200|0|0|0|40|20\n%7|0|1|1|1|40|200|160|0|1|40|20",
+            "%1|1|0|1|1|159|200|0|0|0|40|20\nnot a row",
         ] {
             assert!(parse_layout(bad).is_none(), "{bad:?}");
         }
@@ -2648,6 +2796,39 @@ mod tests {
         assert_eq!(kept(&w), [RESIZE, "-N resize-pane -t %7 -x 60"]);
         assert_eq!(state.borrow().panes[1].width, 60);
         assert_eq!(moves(&w), 0);
+    }
+
+    #[test]
+    fn a_changed_option_sets_the_width_on_the_next_tick() {
+        let (w, state) = keep_world(
+            &["live", "live", "live", "live", "live", "gone"],
+            win("%1", in_place()),
+        );
+        let s = state.clone();
+        w.fakes.sleep_probe(move |n| {
+            let mut win = s.borrow_mut();
+            match n {
+                // Dragged to 55, then the options change: the new width wins over the drag.
+                1 => win.panes = vec![r("%1", 0, 0, 144, 50), r("%7", 145, 0, 55, 50)],
+                2 => win.percent = "30",
+                // Unset: 5% of 200 is 10, so the minimum, 30.
+                3 => (win.min, win.percent) = ("", ""),
+                // A value the multiplexer replaced `|` in falls back alone: min 30, percent 25 → 50.
+                4 => (win.min, win.percent) = ("40x10", "25"),
+                _ => {}
+            }
+        });
+        watch_run(&w);
+        assert_eq!(
+            kept(&w),
+            [
+                RESIZE,
+                "-N resize-pane -t %7 -x 60",
+                "-N resize-pane -t %7 -x 30",
+                "-N resize-pane -t %7 -x 50",
+            ]
+        );
+        assert_eq!(state.borrow().panes[1].width, 50);
     }
 
     #[test]
@@ -3053,6 +3234,9 @@ mod tests {
             }
             Ok(Output::default())
         });
+        // open's window probe, checked before the option (it names the width options): a window too narrow for
+        // more than the minimum, with the options unset. A test answers otherwise with `mux_first`.
+        w.fakes.mux_first(WINDOW_PROBE, 0, "200||\n", "");
         // The record, checked before the option (its name starts with the option's).
         let (p, record_fail) = (panes.clone(), mux.record_fail);
         w.fakes.mux_script(RECORD, move |argv| {
@@ -3157,7 +3341,7 @@ mod tests {
         format!(
             "-N split-window -d -f -h -P -F #{{pane_id}}|#{{window_id}}|#{{pane_pid}} -t %1{}{} /bin/mux-agent watch",
             env_text(w),
-            if sized { " -l 40" } else { "" }
+            if sized { " -l 30" } else { "" }
         )
     }
 
@@ -3185,7 +3369,7 @@ mod tests {
             split_line(w, true),
             label_line("%7", 107),
             RECORD7.into(),
-            resize_line("%7", 107, 40),
+            resize_line("%7", 107, 30),
         ]
     }
 
@@ -3208,43 +3392,131 @@ mod tests {
         "1 sidebar the side bar %7 did not close: the pane no longer runs this session's side bar";
 
     #[test]
-    fn bar_width_is_a_fifth_of_the_window_at_least_40() {
-        let widths: Vec<u32> = [0, 80, 136, 199, 200, 204, 205, 250, 300]
+    fn bar_width_is_5_percent_of_the_window_at_least_30() {
+        let widths: Vec<u32> = [0, 80, 200, 619, 620, 639, 640, 1000, u32::MAX]
             .into_iter()
-            .map(bar_width)
+            .map(|window| bar_width(window, Sizing::default()))
             .collect();
-        assert_eq!(widths, [40, 40, 40, 40, 40, 40, 41, 50, 60]);
+        assert_eq!(widths, [30, 30, 30, 30, 31, 31, 32, 50, 214_748_364]);
+        // The options set both numbers; the old fifth, at least 40, is 40 and 20.
+        let old = Sizing::read("40", "20");
+        let widths: Vec<u32> = [0, 200, 205, 300]
+            .into_iter()
+            .map(|w| bar_width(w, old))
+            .collect();
+        assert_eq!(widths, [40, 40, 41, 60]);
+        assert_eq!(bar_width(300, Sizing::read("", "100")), 300);
+        assert_eq!(bar_width(10, Sizing::read("1", "1")), 1);
+    }
+
+    #[test]
+    fn each_option_falls_back_to_its_default_alone() {
+        let default = Sizing::default();
+        assert_eq!((default.min, default.percent), (30, 5));
+        for (min, percent, want) in [
+            ("", "", (30, 5)),
+            ("44", "7", (44, 7)),
+            ("9999", "100", (9999, 100)),
+            // Not a whole number in range: that field alone takes its default.
+            ("0", "7", (30, 7)),
+            ("44", "0", (44, 5)),
+            ("44", "101", (44, 5)),
+            ("10000", "7", (30, 7)),
+            ("+44", "7", (30, 7)),
+            ("44", " 7", (44, 5)),
+            ("4.5", "7", (30, 7)),
+            ("40x10", "7", (30, 7)),
+            ("44", "7xx", (44, 5)),
+            ("40x10", "7xx", (30, 5)),
+            ("99999999999999999999", "7", (30, 7)),
+        ] {
+            let read = Sizing::read(min, percent);
+            assert_eq!((read.min, read.percent), want, "{min:?} {percent:?}");
+        }
+    }
+
+    #[test]
+    fn the_options_are_read_with_the_window_width_and_cannot_break_its_fields() {
+        // `|`, LF and CR in a value are replaced by the multiplexer, so the answer is always 3 fields.
+        assert!(WINDOW_PROBE.starts_with("#{window_width}|"));
+        assert_eq!(WINDOW_PROBE.matches('|').count(), 2 + 2);
+        assert_eq!(LAYOUT.matches('|').count(), 11 + 2);
+        for option in [MIN_OPTION, PERCENT_OPTION] {
+            assert!(WINDOW_PROBE.contains(&format!("#{{s/[|\n\r]/x/:{option}}}")));
+            assert!(LAYOUT.ends_with(&format!("#{{s/[|\n\r]/x/:{PERCENT_OPTION}}}")));
+            assert!(LAYOUT.contains(&format!("|#{{s/[|\n\r]/x/:{option}}}")));
+        }
+        let read = |text: &str| {
+            let (width, sizing) = window_answer(text);
+            (width, sizing.min, sizing.percent)
+        };
+        assert_eq!(read("250||\n"), (Some(250), 30, 5));
+        assert_eq!(read("250|44|7\n"), (Some(250), 44, 7));
+        assert_eq!(read("250|40x10|7\r\n"), (Some(250), 30, 7));
+        assert_eq!(read("250|44|7xx\n"), (Some(250), 44, 5));
+        assert_eq!(read("wide|44|7\n"), (None, 44, 7));
+        // Not 3 fields: nothing in it is trusted.
+        for bad in [
+            "",
+            "250",
+            "250\n",
+            "250|44",
+            "250|44|7|9",
+            "250|44|7\nextra",
+        ] {
+            assert_eq!(read(bad), (None, 30, 5), "{bad:?}");
+        }
     }
 
     #[test]
     fn open_sizes_the_bar_to_the_window_then_resizes_it() {
         // A 250-column window: split -l 50 at the right edge, full height, then resize-pane -x 50 (rmux ignores -l).
         let (w, _) = sidebar_world("", Mux::default());
-        w.fakes.mux_rule("#{window_width}", 0, "250\n", "");
+        w.fakes.mux_first(WINDOW_PROBE, 0, "250||\n", "");
         assert!(run(&w, &[]).starts_with("ok "));
         let probe: Vec<String> = w
             .fakes
             .mux_calls()
             .iter()
-            .filter(|c| c.last().is_some_and(|a| a == "#{window_width}"))
+            .filter(|c| c.last().is_some_and(|a| a == WINDOW_PROBE))
             .map(|c| c.join(" "))
             .collect();
-        assert_eq!(probe, ["-N display-message -p -t %1 #{window_width}"]);
+        assert_eq!(
+            probe,
+            [format!("-N display-message -p -t %1 {WINDOW_PROBE}")]
+        );
         let mut want = vec![ON.to_string()];
         want.extend(opened(&w));
-        want[3] = split_line(&w, true).replace("-l 40", "-l 50");
+        assert_eq!(calls(&w), want);
+        // The options size it: 20% of 250, at least 40, is 50.
+        let (w, _) = sidebar_world("", Mux::default());
+        w.fakes.mux_first(WINDOW_PROBE, 0, "250|40|20\n", "");
+        assert!(run(&w, &[]).starts_with("ok "));
+        let mut want = vec![ON.to_string()];
+        want.extend(opened(&w));
+        want[3] = split_line(&w, true).replace("-l 30", "-l 50");
         want[6] = resize_line("%7", 107, 50);
         assert_eq!(calls(&w), want);
-        // An unreadable width (a failed probe, a non-number) opens the narrowest bar, 40.
-        for answer in [(1, ""), (0, "wide\n"), (0, "")] {
+        // A minimum the multiplexer replaced `|` in is its default alone: 40% of 250.
+        let (w, _) = sidebar_world("", Mux::default());
+        w.fakes.mux_first(WINDOW_PROBE, 0, "250|40x10|40\n", "");
+        assert!(run(&w, &[]).starts_with("ok "));
+        assert_eq!(calls(&w).last(), Some(&resize_line("%7", 107, 100)));
+        // An unreadable width (a failed probe, a non-number) opens the narrowest bar: the minimum, 30 or as set.
+        for (answer, min) in [
+            ((1, ""), 30),
+            ((0, "wide||\n"), 30),
+            ((0, ""), 30),
+            ((0, "wide|44|\n"), 44),
+        ] {
             let (w, _) = sidebar_world("", Mux::default());
-            w.fakes.mux_rule("#{window_width}", answer.0, answer.1, "");
+            w.fakes.mux_first(WINDOW_PROBE, answer.0, answer.1, "");
             assert!(run(&w, &[]).starts_with("ok "), "{answer:?}");
             let resized: Vec<String> = calls(&w)
                 .into_iter()
                 .filter(|c| c.contains("resize-pane"))
                 .collect();
-            assert_eq!(resized, [resize_line("%7", 107, 40)], "{answer:?}");
+            assert_eq!(resized, [resize_line("%7", 107, min)], "{answer:?}");
         }
         // A refused resize still opens the bar: the next watch tick sizes it.
         let (w, _) = sidebar_world("", Mux::default());
@@ -3268,7 +3540,7 @@ mod tests {
         assert_eq!(calls(&w), want);
         assert_eq!(record(&panes).as_deref(), Some("%7 107 1070"));
         assert_eq!(option(&panes), None);
-        assert_eq!(get(&panes, "width %7").as_deref(), Some("40"));
+        assert_eq!(get(&panes, "width %7").as_deref(), Some("30"));
         let events = w.fakes.events();
         let read = events.iter().position(|e| e == "row 107").unwrap();
         let written = events
@@ -3477,7 +3749,7 @@ mod tests {
         let all: Vec<String> = w.fakes.mux_calls().iter().map(|c| c.join(" ")).collect();
         let at = |line: &str| all.iter().position(|c| c == line).unwrap();
         let proof = format!("-N display-message -p -t %7 {PROOF}");
-        let resize = resize_line("%7", 107, 40);
+        let resize = resize_line("%7", 107, 30);
         assert!(
             at(RECORD7) < at(&resize) && at(&resize) < at(&proof) && at(&proof) < at(CLEAR_RECORD)
         );
@@ -3815,7 +4087,7 @@ mod tests {
         assert_eq!(splits, [split_line(&w, true), split_line(&w, false)]);
         assert_eq!(roles(&panes), "%1=|,%2=other|,%7=sidebar|");
         // Without -l the multiplexer picks the width, so the resize sizes it.
-        assert_eq!(calls(&w).last(), Some(&resize_line("%7", 107, 40)));
+        assert_eq!(calls(&w).last(), Some(&resize_line("%7", 107, 30)));
         // Any other failure refuses after exactly one split; a refused retry after exactly two.
         for stderr in [
             "permission denied",
@@ -3883,7 +4155,7 @@ mod tests {
             w.ctx.state_root.to_str().unwrap(),
             crate::state::root::HOST,
         ));
-        expected.extend(["-l", "40", "/opt/mux agents/bin/mux-agent", "watch"].map(String::from));
+        expected.extend(["-l", "30", "/opt/mux agents/bin/mux-agent", "watch"].map(String::from));
         assert_eq!(split, [expected]);
     }
 
@@ -4085,7 +4357,7 @@ mod tests {
             format!(
                 "-sidebar|{key}|$3 {ON},{},-N set-option -t $3 @mux-agents-sidebar-id %8 108 1080,{}",
                 label_line("%8", 108),
-                resize_line("%8", 108, 40)
+                resize_line("%8", 108, 30)
             )
         );
         assert_eq!(ensure_run(&w), "existing %8");

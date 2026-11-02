@@ -57,7 +57,7 @@ Every agent's name says what it does and is its tab's name or its pane's title. 
 
 ## Side bar
 
-In Claude Code, an `Agents` pane beside the chat opens after the first successful `spawn` (or with `/mux-agents-pane`) and refreshes every 3 seconds. In any client, the first successful `spawn` also opens a split at the right edge of your window, full height and a fifth of its width (at least 40 columns), that redraws every 2 seconds; later spawns reuse it, `sidebar -Close` closes it for the rest of the session and `sidebar` opens it again:
+In Claude Code, an `Agents` pane beside the chat opens after the first successful `spawn` (or with `/mux-agents-pane`) and refreshes every 3 seconds. In any client, the first successful `spawn` also opens a split at the right edge of your window, full height and 5% of its width (at least 30 columns), that redraws every 2 seconds; later spawns reuse it, `sidebar -Close` closes it for the rest of the session and `sidebar` opens it again:
 
 ```text
  mux-agents         3 running / 7 ended
@@ -86,7 +86,7 @@ The bar is laid out at its pane's size on every redraw and never wraps: long tex
 
 In tab mode the bar stays in the window you spawned from, not in each agent's window. `sidebar -Close` closes only this multiplexer bar; the Claude Code `Agents` pane is separate.
 
-The bar stays at the right edge, full height: when a split, a layout change, `swap-pane` or `rotate-window` moves it, the next redraw puts it back without moving your focus. Its width follows the window's width; a width you drag it to is kept until the window is resized. While a pane is zoomed the bar is left alone, so it never unzooms your pane. If putting it back fails 3 times in a row, it stops trying and shows `layout: repair paused` until the layout changes or a minute passes.
+The bar stays at the right edge, full height: when a split, a layout change, `swap-pane` or `rotate-window` moves it, the next redraw puts it back without moving your focus. Its width follows the window's width; a width you drag it to is kept until the window is resized or a width option changes. Two multiplexer options set the width: `@mux-agents-sidebar-percent` (1-100, default 5) and `@mux-agents-sidebar-min` (columns, 1-9999, default 30); the bar is the larger of the two. Set them with `set -g` in `~/.tmux.conf` or per session, window or pane (for example `tmux set -g @mux-agents-sidebar-percent 20`); a change applies at the next redraw, and a value that is not a whole number in range uses its default. While a pane is zoomed the bar is left alone, so it never unzooms your pane. If putting it back fails 3 times in a row, it stops trying and shows `layout: repair paused` until the layout changes or a minute passes.
 
 The bar is the process `sidebar` started in it, not its `@agent-role sidebar` label, so a label that moved (rmux's `rotate-window` leaves labels behind) never makes your pane the bar. A pane that carries the label without being that process is never closed: `sidebar`, `sidebar -Close` and a spawn refuse and name it. If it is an old bar, for example one opened by 0.2.1, which `sidebar -Close` cannot prove, close it with `kill-pane -t <pane>`; if it is your own pane, clear the label with `set-option -p -u -t <pane> @agent-role`. A `mux-agent watch` you run by hand only draws the board; only the bar keeps the layout.
 

@@ -549,8 +549,11 @@ mod tests {
             let tokens: Vec<String> = c
                 .iter()
                 .map(|t| {
-                    // A private capture buffer's random name is written `<buffer>`.
-                    let t = &buffer_placeholder(t);
+                    // A private capture buffer's random name is written `<buffer>`; a LF or CR byte (the side
+                    // bar's width options) `\n` or `\r`.
+                    let t = &buffer_placeholder(t)
+                        .replace('\n', "\\n")
+                        .replace('\r', "\\r");
                     // A token with spaces (if-shell's command, the bar's record) is written quoted, its id as <id>.
                     if t.contains(' ') {
                         let t = match &id {
@@ -820,7 +823,7 @@ mod tests {
         );
         record(&sidebar_world(), "sidebar", &["sidebar"], 0);
         let w = sidebar_world();
-        w.fakes.mux_script("-l 40", |_| {
+        w.fakes.mux_script("-l 30", |_| {
             Ok(Output {
                 code: 1,
                 stdout: String::new(),
