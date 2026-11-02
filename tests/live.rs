@@ -1907,9 +1907,9 @@ exec claude --dangerously-skip-permissions
         assert_eq!(live.bar_place(&bar), "1|1|1|60", "{mux:?}");
     }
 
-    // #59: by default the bar is 5% of its window, at least 30 columns; a width option changed while it runs (here
-    // on the session, overriding a `set -g`) sets its width within one tick, and a value that is no number is its
-    // default alone.
+    // #59: by default the bar is 5% of its window, at least 30 columns; a width option changed while it runs (on the
+    // server, then the session, the window and the bar's own pane, each overriding the one before; another pane's
+    // value never counts) sets its width within one tick, and a value that is no number is its default alone.
     fn bar_width_follows_its_options(mux: Mux) {
         let Some(mut live) = Live::human(mux) else {
             return;
@@ -1936,6 +1936,60 @@ exec claude --dangerously-skip-permissions
             "1|1|1|120",
             "{mux:?}: the session's 15%"
         );
+        let window = live.field(&bar, "#{window_id}");
+        live.call(&[
+            "set-option",
+            "-w",
+            "-t",
+            &window,
+            "@mux-agents-sidebar-percent",
+            "20",
+        ]);
+        live.wait_tick(&bar);
+        assert_eq!(
+            live.bar_place(&bar),
+            "1|1|1|160",
+            "{mux:?}: the window's 20%"
+        );
+        let root = live.server.pane().to_string();
+        live.call(&[
+            "set-option",
+            "-p",
+            "-t",
+            &root,
+            "@mux-agents-sidebar-percent",
+            "50",
+        ]);
+        live.call(&[
+            "set-option",
+            "-p",
+            "-t",
+            &bar,
+            "@mux-agents-sidebar-percent",
+            "12",
+        ]);
+        live.wait_tick(&bar);
+        assert_eq!(
+            live.bar_place(&bar),
+            "1|1|1|96",
+            "{mux:?}: the bar's own 12%"
+        );
+        live.call(&[
+            "set-option",
+            "-p",
+            "-u",
+            "-t",
+            &bar,
+            "@mux-agents-sidebar-percent",
+        ]);
+        live.call(&[
+            "set-option",
+            "-w",
+            "-u",
+            "-t",
+            &window,
+            "@mux-agents-sidebar-percent",
+        ]);
         live.call(&[
             "set-option",
             "-t",

@@ -2480,8 +2480,8 @@ mod tests {
                     p.left,
                     p.top,
                     flag(w.zoomed),
-                    w.min,
-                    w.percent
+                    if p.id == "%7" { w.min } else { "99" },
+                    if p.id == "%7" { w.percent } else { "90" }
                 )
             })
             .collect()
@@ -3454,6 +3454,7 @@ mod tests {
         assert_eq!(read("250|44|7\n"), (Some(250), 44, 7));
         assert_eq!(read("250|40x10|7\r\n"), (Some(250), 30, 7));
         assert_eq!(read("250|44|7xx\n"), (Some(250), 44, 5));
+        assert_eq!(read("250|1x2x3|7xx\n"), (Some(250), 30, 5));
         assert_eq!(read("wide|44|7\n"), (None, 44, 7));
         // Not 3 fields: nothing in it is trusted.
         for bad in [
@@ -3488,6 +3489,11 @@ mod tests {
         let mut want = vec![ON.to_string()];
         want.extend(opened(&w));
         assert_eq!(calls(&w), want);
+        // Both options replaced (`|`, LF or CR in them): the width still counts, both options are their defaults.
+        let (w, _) = sidebar_world("", Mux::default());
+        w.fakes.mux_first(WINDOW_PROBE, 0, "1000|1x2|7xx\n", "");
+        assert!(run(&w, &[]).starts_with("ok "));
+        assert_eq!(calls(&w).last(), Some(&resize_line("%7", 107, 50)));
         // The options size it: 20% of 250, at least 40, is 50.
         let (w, _) = sidebar_world("", Mux::default());
         w.fakes.mux_first(WINDOW_PROBE, 0, "250|40|20\n", "");
