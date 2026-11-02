@@ -331,10 +331,17 @@ exec claude --dangerously-skip-permissions
                 .collect()
         }
 
-        /// The bar's width by S1: `max(40, window / 5)` of the width its window reads now.
+        /// The bar's width by S1 (#59): `max(min, window * percent / 100)` of the width its window reads now, with
+        /// the width options as the bar's pane reads them.
         fn bar_width(&self, bar: &str) -> String {
             let window: u32 = self.num(bar, "#{window_width}");
-            mux_agent::sidebar::bar_width(window).to_string()
+            let options = self.field(
+                bar,
+                "#{@mux-agents-sidebar-min}|#{@mux-agents-sidebar-percent}",
+            );
+            let (min, percent) = options.split_once('|').unwrap_or(("", ""));
+            let sizing = mux_agent::sidebar::Sizing::read(min, percent);
+            mux_agent::sidebar::bar_width(window, sizing).to_string()
         }
 
         /// The bar's place as `<at right>|<at top>|<at bottom>|<width>`: `1|1|1|<bar_width>` when it is locked to
@@ -433,6 +440,13 @@ exec claude --dangerously-skip-permissions
             self.server.wait(what, || {
                 (self.bar_place(bar) == self.in_place(bar)).then_some(())
             })
+        }
+
+        /// The side bar's width options as 0.2.3 had them built in, set for the whole server: 20% of the window,
+        /// at least 40 columns.
+        fn old_sizing(&self) {
+            self.call(&["set-option", "-g", "@mux-agents-sidebar-min", "40"]);
+            self.call(&["set-option", "-g", "@mux-agents-sidebar-percent", "20"]);
         }
 
         /// Ends the bar's watch, keeping its pane and its tag: from here no tick can repair anything.
@@ -1504,10 +1518,13 @@ exec claude --dangerously-skip-permissions
     fn bar_ready(screen: &str) -> bool {
         let lines: Vec<&str> = screen.lines().map(str::trim).collect();
         let count = |f: &dyn Fn(&str) -> bool| lines.iter().filter(|l| f(l)).count();
-        let header = ["mux-agents", "2", "running", "/", "0", "ended"];
-        count(&|l| l.split_whitespace().eq(header)) == 1
-            && count(&|l| l == "checking the side bar") == 2
-            && count(&bar_row) == 2
+        // Both counts, or the running count alone in a bar too narrow for both (the default 30 columns).
+        let header = |l: &str| {
+            let words: Vec<&str> = l.split_whitespace().collect();
+            words == ["mux-agents", "2", "running", "/", "0", "ended"]
+                || words == ["mux-agents", "2", "running"]
+        };
+        count(&header) == 1 && count(&|l| l == "checking the side bar") == 2 && count(&bar_row) == 2
     }
 
     // Every captured row fits the bar's width in display columns, and no control text leaked onto the screen.
@@ -1867,11 +1884,13 @@ exec claude --dangerously-skip-permissions
     }
 
     // S1 test 5: a bar dragged to 55 columns at the right edge is left so (no move, no resize) until the window's
-    // width changes; resize-window -x 300 makes it 60 within one tick.
+    // width changes; resize-window -x 300 makes it 60 within one tick (20% of the window, at least 40, set with
+    // `set -g` as a tmux.conf would).
     fn bar_drag_kept_until_the_window_resizes(mux: Mux) {
         let Some(mut live) = Live::human(mux) else {
             return;
         };
+        live.old_sizing();
         let bar = live.open_bar();
         // The bar's first tagged tick sets its width; a drag comes after it.
         live.wait_tick(&bar);
@@ -1888,12 +1907,113 @@ exec claude --dangerously-skip-permissions
         assert_eq!(live.bar_place(&bar), "1|1|1|60", "{mux:?}");
     }
 
+    // #59: by default the bar is 5% of its window, at least 30 columns; a width option changed while it runs (on the
+    // server, then the session, the window and the bar's own pane, each overriding the one before; another pane's
+    // value never counts) sets its width within one tick, and a value that is no number is its default alone.
+    fn bar_width_follows_its_options(mux: Mux) {
+        let Some(mut live) = Live::human(mux) else {
+            return;
+        };
+        let bar = live.open_bar();
+        live.wait_tick(&bar);
+        live.call(&["resize-window", "-t", &bar, "-x", "800"]);
+        live.wait_tick(&bar);
+        assert_eq!(live.bar_place(&bar), "1|1|1|40", "{mux:?}: 5% of 800");
+        live.call(&["set-option", "-g", "@mux-agents-sidebar-percent", "10"]);
+        live.wait_tick(&bar);
+        assert_eq!(live.bar_place(&bar), "1|1|1|80", "{mux:?}: 10% of 800");
+        let session = live.field(&bar, "#{session_id}");
+        live.call(&[
+            "set-option",
+            "-t",
+            &session,
+            "@mux-agents-sidebar-percent",
+            "15",
+        ]);
+        live.wait_tick(&bar);
+        assert_eq!(
+            live.bar_place(&bar),
+            "1|1|1|120",
+            "{mux:?}: the session's 15%"
+        );
+        let window = live.field(&bar, "#{window_id}");
+        live.call(&[
+            "set-option",
+            "-w",
+            "-t",
+            &window,
+            "@mux-agents-sidebar-percent",
+            "20",
+        ]);
+        live.wait_tick(&bar);
+        assert_eq!(
+            live.bar_place(&bar),
+            "1|1|1|160",
+            "{mux:?}: the window's 20%"
+        );
+        let root = live.server.pane().to_string();
+        live.call(&[
+            "set-option",
+            "-p",
+            "-t",
+            &root,
+            "@mux-agents-sidebar-percent",
+            "50",
+        ]);
+        live.call(&[
+            "set-option",
+            "-p",
+            "-t",
+            &bar,
+            "@mux-agents-sidebar-percent",
+            "12",
+        ]);
+        live.wait_tick(&bar);
+        assert_eq!(
+            live.bar_place(&bar),
+            "1|1|1|96",
+            "{mux:?}: the bar's own 12%"
+        );
+        live.call(&[
+            "set-option",
+            "-p",
+            "-u",
+            "-t",
+            &bar,
+            "@mux-agents-sidebar-percent",
+        ]);
+        live.call(&[
+            "set-option",
+            "-w",
+            "-u",
+            "-t",
+            &window,
+            "@mux-agents-sidebar-percent",
+        ]);
+        live.call(&[
+            "set-option",
+            "-t",
+            &session,
+            "@mux-agents-sidebar-percent",
+            "1|5",
+        ]);
+        live.call(&["set-option", "-g", "@mux-agents-sidebar-min", "50"]);
+        live.wait_tick(&bar);
+        assert_eq!(
+            live.bar_place(&bar),
+            "1|1|1|50",
+            "{mux:?}: 5% of 800, at least 50"
+        );
+        assert_eq!(live.bar_place(&bar), live.in_place(&bar), "{mux:?}");
+    }
+
     // S1 amendment: while a pane is zoomed the bar is left alone, so a window resize does not unzoom it (resize-pane
     // would); once unzoomed, the width for the new window is applied.
     fn zoomed_window_left_alone(mux: Mux) {
         let Some(mut live) = Live::human(mux) else {
             return;
         };
+        live.old_sizing();
         let root = live.server.pane().to_string();
         let bar = live.open_bar();
         live.wait_tick(&bar);
@@ -3300,6 +3420,7 @@ exec claude --dangerously-skip-permissions
                     bar_repaired_after_a_split_right_of_it,
                     bar_repair_keeps_focus,
                     bar_drag_kept_until_the_window_resizes,
+                    bar_width_follows_its_options,
                     replaced_bar_is_never_closed,
                     close_after_rotate_spares_the_users_pane,
                     unproven_label_in_another_window_refuses,
