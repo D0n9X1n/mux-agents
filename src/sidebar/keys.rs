@@ -117,9 +117,13 @@ fn escape(bytes: &[u8]) -> Option<(usize, Option<Event>)> {
 }
 
 /// `\e[` then parameter and intermediate bytes (0x20-0x3F) up to a final byte (0x40-0x7E).
-/// Any other byte ends the sequence unfinished and dropped, and is decoded on its own.
+/// Any other byte ends the sequence unfinished and dropped, and is decoded on its own. A sequence that reaches
+/// `BUFFER_MAX` bytes without its final byte is dropped there, so it is never an event however it was read.
 fn csi(bytes: &[u8]) -> Option<(usize, Option<Event>)> {
     for (i, &byte) in bytes.iter().enumerate().skip(2) {
+        if i == BUFFER_MAX {
+            return Some((i, None));
+        }
         match byte {
             0x20..=0x3f => {}
             0x40..=0x7e => return Some((i + 1, csi_event(&bytes[2..i], byte))),
@@ -373,6 +377,35 @@ mod tests {
         assert_eq!(
             events(&decoder.push(b"\x1b[<0;65536;1Mj", at(3))),
             [Event::Down]
+        );
+    }
+
+    #[test]
+    fn a_report_longer_than_the_buffer_is_dropped_however_it_is_read() {
+        // 78 bytes: whole in one read, or split at any byte, it is never an event.
+        let mut long = b"\x1b[<".to_vec();
+        long.extend([b'0'; 70]);
+        long.extend(b";3;5M");
+        for split in 0..=long.len() {
+            let mut decoder = Decoder::default();
+            let (a, b) = long.split_at(split);
+            let mut got = events(&decoder.push(a, at(1)));
+            got.extend(events(&decoder.push(b, at(2))));
+            got.extend(events(&decoder.push(b"j", at(3))));
+            assert_eq!(got, [Event::Down], "split at {split}");
+        }
+        // One at the limit still decodes.
+        let mut fits = b"\x1b[<".to_vec();
+        fits.extend([b'0'; BUFFER_MAX - 8]);
+        fits.extend(b";3;5M");
+        assert_eq!(fits.len(), BUFFER_MAX);
+        assert_eq!(
+            events(&Decoder::default().push(&fits, at(1))),
+            [Event::Press {
+                button: 0,
+                x: 3,
+                y: 5
+            }]
         );
     }
 
