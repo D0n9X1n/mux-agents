@@ -364,10 +364,13 @@ mod unix {
 }
 
 /// Turns on mouse press and release reports in SGR form; `DISABLE` turns them off in reverse.
+#[cfg(any(unix, test))] // Windows only draws (#70); its tests still drive `TermInput` on a `FakeTerm`.
 pub const ENABLE: &[u8] = b"\x1b[?1000h\x1b[?1006h";
+#[cfg(any(unix, test))]
 pub const DISABLE: &[u8] = b"\x1b[?1006l\x1b[?1000l";
 
 /// The terminal calls `TermInput` makes, one per setup step and one per undo, so a test can fail any of them.
+#[cfg(any(unix, test))]
 pub trait Term {
     fn save(&mut self) -> io::Result<()>;
     fn arm(&mut self) -> io::Result<()>;
@@ -379,6 +382,7 @@ pub trait Term {
 }
 
 // The setup steps begun so far; each is set before its call, so one that fails partway is still undone.
+#[cfg(any(unix, test))]
 #[derive(Default)]
 struct Steps {
     armed: bool,
@@ -387,11 +391,13 @@ struct Steps {
 }
 
 /// The side bar's terminal while `watch` reads it: set up step by step, and undone in reverse when dropped.
+#[cfg(any(unix, test))]
 pub struct TermInput<T: Term> {
     term: T,
     steps: Steps,
 }
 
+#[cfg(any(unix, test))]
 impl<T: Term> TermInput<T> {
     /// Saves the terminal, then arms it, makes it raw and turns on mouse reports, in that order. A failed save
     /// answers `None` with nothing to undo; any later failure answers `None` once the steps begun are undone.
@@ -412,6 +418,7 @@ impl<T: Term> TermInput<T> {
     }
 }
 
+#[cfg(any(unix, test))]
 impl<T: Term> Input for TermInput<T> {
     /// A terminal that cannot be read is `Closed`: `watch` stops reading it, never retries it.
     fn wait(&mut self, clock: &dyn Clock, timeout: Duration) -> Waited {
@@ -421,6 +428,7 @@ impl<T: Term> Input for TermInput<T> {
     }
 }
 
+#[cfg(any(unix, test))]
 impl<T: Term> Drop for TermInput<T> {
     /// Undoes the steps begun in reverse: mouse reports off (a failed write is ignored), then the saved mode back,
     /// then disarmed.
