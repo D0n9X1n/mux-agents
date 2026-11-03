@@ -1,6 +1,10 @@
 //! The side bar (MuxAgents.ps1:1423-1591): `sidebar [-Close]` opens or closes one bar per session running
 //! `<abs binary> watch`, and `watch` draws the session's board in it until its pane closes.
 
+mod input;
+mod keys;
+mod pick;
+
 use std::cmp::Reverse;
 use std::io;
 use std::time::{Duration, SystemTime};
