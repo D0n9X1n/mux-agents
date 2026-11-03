@@ -108,11 +108,12 @@ fn caller_refusal(code: u8, message: &str) -> Refusal {
 /// Refuses 1 `endpoint` for an unusable endpoint, pane or probe, 1 `caller` when the caller is not below its pane
 /// or its agent's start is unreadable or changed, and 2 `caller` for a non-shell in between.
 pub fn resolve(ctx: &Ctx) -> Res<Caller> {
-    let endpoint = crate::mux::endpoint(&ctx.env, crate::state::root::HOST)
-        .ok_or_else(|| endpoint_refusal("not inside an rmux pane"))?;
+    let not_inside = || endpoint_refusal(&crate::mux::not_inside(crate::mux::env_kind(&ctx.env)));
+    let endpoint =
+        crate::mux::endpoint(&ctx.env, crate::state::root::HOST).ok_or_else(not_inside)?;
     let pane = ctx.env.get("TMUX_PANE").unwrap_or("");
     if !pane_id(pane) {
-        return Err(endpoint_refusal("not inside an rmux pane"));
+        return Err(not_inside());
     }
     // rmux 0.10.0 answers a probe of a gone pane with exit 0 and empty fields, so the row itself is validated.
     // A typed refusal from connecting or a timeout keeps its own message.
@@ -120,7 +121,10 @@ pub fn resolve(ctx: &Ctx) -> Res<Caller> {
     let probe = (out.code == 0)
         .then(|| probe_row(&out.stdout))
         .flatten()
-        .ok_or_else(|| endpoint_refusal("rmux endpoint did not answer"))?;
+        .ok_or_else(|| {
+            let name = crate::mux::in_use(ctx);
+            endpoint_refusal(&format!("{name} endpoint did not answer"))
+        })?;
     // Compared as numbers: the endpoint's pid is already a number, and leading zeros name the same process.
     if probe.server_pid.parse::<u32>().ok() != Some(endpoint.server_pid) {
         return Err(endpoint_refusal("rmux server changed"));
@@ -212,7 +216,11 @@ fn walk(ctx: &Ctx, pane_pid: u32) -> Res<Vec<Row>> {
             .row(ppid)
             .filter(|parent| parent.start.is_some() && parent.start <= start);
     }
-    Err(caller_refusal(1, "caller is not below its rmux pane"))
+    let name = crate::mux::in_use(ctx);
+    Err(caller_refusal(
+        1,
+        &format!("caller is not below its {name} pane"),
+    ))
 }
 
 #[cfg(test)]
@@ -288,16 +296,51 @@ mod tests {
             ctx.env = env(pane);
             assert_eq!(
                 outcome(resolve(&ctx)),
-                "1 endpoint not inside an rmux pane",
+                "1 endpoint not inside a tmux pane",
                 "{pane:?}"
             );
             assert!(fakes.mux_calls().is_empty(), "{pane:?}");
         }
-        // No endpoint at all.
+        // The variable the endpoint came from names the multiplexer; no endpoint at all names both.
+        for (var, value, name) in [
+            ("RMUX", format!("{},{SERVER},0", socket()), "an rmux"),
+            ("RMUX", "relative,1,0".into(), "an rmux"),
+            ("TMUX", "relative,1,0".into(), "a tmux"),
+            ("TMUX", String::new(), "a tmux or rmux"),
+        ] {
+            let fakes = human();
+            let mut ctx = fakes.ctx();
+            ctx.env = Env::from_pairs([(var, value.clone()), ("TMUX_PANE", "x".into())]);
+            assert_eq!(
+                outcome(resolve(&ctx)),
+                format!("1 endpoint not inside {name} pane"),
+                "{var}={value:?}"
+            );
+        }
         let fakes = human();
         let mut ctx = fakes.ctx();
         ctx.env = Env::from_pairs([("TMUX_PANE", "%1")]);
-        assert_eq!(outcome(resolve(&ctx)), "1 endpoint not inside an rmux pane");
+        assert_eq!(
+            outcome(resolve(&ctx)),
+            "1 endpoint not inside a tmux or rmux pane"
+        );
+    }
+
+    #[test]
+    fn refusals_name_the_connected_mux() {
+        // The multiplexer that answered, not the variable: rmux under TMUX is rmux.
+        let failed = human_with_probe(1, "900|100|$3|@1|\n");
+        failed.mux_kind(crate::mux::Kind::Rmux);
+        assert_eq!(
+            outcome(run(&failed)),
+            "1 endpoint rmux endpoint did not answer"
+        );
+        let other_pane = human_with_probe(0, "900|50|$3|@1|\n");
+        other_pane.mux_kind(crate::mux::Kind::Rmux);
+        assert_eq!(
+            outcome(run(&other_pane)),
+            "1 caller caller is not below its rmux pane"
+        );
     }
 
     #[test]
@@ -324,14 +367,14 @@ mod tests {
             let fakes = human_with_probe(0, row);
             assert_eq!(
                 outcome(run(&fakes)),
-                "1 endpoint rmux endpoint did not answer",
+                "1 endpoint tmux endpoint did not answer",
                 "{row:?}"
             );
         }
         let failed = human_with_probe(1, "900|100|$3|@1|\n");
         assert_eq!(
             outcome(run(&failed)),
-            "1 endpoint rmux endpoint did not answer"
+            "1 endpoint tmux endpoint did not answer"
         );
         // The probe is the one pinned call, and a tag keeps everything after the fourth bar.
         let fakes = human_with_probe(0, "900|100|$3|@1|a|b\n");
@@ -417,7 +460,7 @@ mod tests {
         for fakes in [no_pane, no_caller, other_pane] {
             assert_eq!(
                 outcome(run(&fakes)),
-                "1 caller caller is not below its rmux pane"
+                "1 caller caller is not below its tmux pane"
             );
         }
     }
@@ -481,7 +524,7 @@ mod tests {
         later.mux_rule("display-message", 0, "900|100|$3|@1|\n", "");
         assert_eq!(
             outcome(run(&later)),
-            "1 caller caller is not below its rmux pane"
+            "1 caller caller is not below its tmux pane"
         );
         let same = Fakes::default();
         same.process(testing::row(SERVER, 1, SERVER_START));
@@ -508,7 +551,7 @@ mod tests {
             fakes.prefer_last();
             assert_eq!(
                 outcome(run(&fakes)),
-                "1 caller caller is not below its rmux pane"
+                "1 caller caller is not below its tmux pane"
             );
         }
     }
@@ -532,7 +575,7 @@ mod tests {
         };
         assert_eq!(
             outcome(run(&build(1801))),
-            "1 caller caller is not below its rmux pane"
+            "1 caller caller is not below its tmux pane"
         );
         assert_eq!(outcome(run(&build(1800))), "Human");
     }
@@ -583,7 +626,7 @@ mod tests {
         let fakes = tall(64);
         assert_eq!(
             outcome(run(&fakes)),
-            "1 caller caller is not below its rmux pane"
+            "1 caller caller is not below its tmux pane"
         );
         // One row per ancestor and never the whole table.
         let calls = fakes.os_calls();
@@ -606,7 +649,7 @@ mod tests {
         fakes.mux_rule("display-message", 0, "900|100|$3|@1|\n", "");
         assert_eq!(
             outcome(run(&fakes)),
-            "1 caller caller is not below its rmux pane"
+            "1 caller caller is not below its tmux pane"
         );
     }
 

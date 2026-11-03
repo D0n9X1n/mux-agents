@@ -35,16 +35,30 @@ fn output(mut command: Command) -> (i32, String, String) {
     )
 }
 
+// An unknown or missing verb: no verb named.
 fn usage(message: &str) -> (i32, String, String) {
     let line =
         format!(r#"{{"ok":false,"verb":null,"code":2,"check":"usage","message":"{message}"}}{NL}"#);
     (2, line, String::new())
 }
 
-// Outside a multiplexer pane, a request that parses and passes its own checks reaches this refusal.
-fn endpoint(verb: &str) -> (i32, String, String) {
+// A known verb's own usage refusal names it.
+fn verb_usage(verb: &str, message: &str) -> (i32, String, String) {
     let line = format!(
-        r#"{{"ok":false,"verb":"{verb}","code":1,"check":"endpoint","message":"not inside an rmux pane"}}{NL}"#
+        r#"{{"ok":false,"verb":"{verb}","code":2,"check":"usage","message":"{message}"}}{NL}"#
+    );
+    (2, line, String::new())
+}
+
+// Outside a multiplexer pane, a request that parses and passes its own checks reaches this refusal; with neither
+// RMUX nor TMUX set it names both.
+fn endpoint(verb: &str) -> (i32, String, String) {
+    endpoint_in(verb, "a tmux or rmux")
+}
+
+fn endpoint_in(verb: &str, mux: &str) -> (i32, String, String) {
+    let line = format!(
+        r#"{{"ok":false,"verb":"{verb}","code":1,"check":"endpoint","message":"not inside {mux} pane"}}{NL}"#
     );
     (1, line, String::new())
 }
@@ -57,7 +71,7 @@ const READ: &str = "usage: mux-agent read [-Wait <seconds>] | read <name> [-Line
 #[test]
 fn no_args_usage_exit_2() {
     let all = usage(
-        "usage: mux-agent <focus|list|placement|read|send|sidebar|spawn|status|stop|watch> ...",
+        "usage: mux-agent <focus|list|placement|read|send|sidebar|spawn|status|stop|version|watch> ...",
     );
     assert_eq!(mux_agent(&[]), all);
     assert_eq!(mux_agent(&["bogus", "-Text"]), all);
@@ -72,7 +86,7 @@ fn verb_and_flags_match_without_case() {
         mux_agent(&["LIST", "-all", "-TEXT"]),
         (
             1,
-            format!("code: 1\ncheck: endpoint\nmessage: not inside an rmux pane{NL}"),
+            format!("code: 1\ncheck: endpoint\nmessage: not inside a tmux or rmux pane{NL}"),
             String::new()
         )
     );
@@ -96,37 +110,83 @@ fn verb_and_flags_match_without_case() {
 fn value_flag_twice_is_usage() {
     assert_eq!(
         mux_agent(&["spawn", "-Client", "claude", "-Client", "copilot"]),
-        usage(SPAWN)
+        verb_usage("spawn", SPAWN)
     );
     assert_eq!(
         mux_agent(&["spawn", "-Client", "claude", "-client", "copilot"]),
-        usage(SPAWN)
+        verb_usage("spawn", SPAWN)
     );
-    assert_eq!(mux_agent(&["spawn", "-Client"]), usage(SPAWN));
+    assert_eq!(mux_agent(&["spawn", "-Client"]), verb_usage("spawn", SPAWN));
     // Switches and -Text may repeat.
     assert_eq!(mux_agent(&["list", "-All", "-All", "-Text", "-Text"]).0, 1);
 }
 
 #[test]
 fn unknown_dash_token_is_usage() {
-    assert_eq!(mux_agent(&["list", "-Bogus"]), usage(LIST));
-    assert_eq!(mux_agent(&["list", "-"]), usage(LIST));
-    assert_eq!(mux_agent(&["focus", "-All", "x"]), usage(FOCUS));
-    assert_eq!(mux_agent(&["list", "--All"]), usage(LIST));
+    assert_eq!(mux_agent(&["list", "-Bogus"]), verb_usage("list", LIST));
+    assert_eq!(mux_agent(&["list", "-"]), verb_usage("list", LIST));
+    assert_eq!(
+        mux_agent(&["focus", "-All", "x"]),
+        verb_usage("focus", FOCUS)
+    );
+    assert_eq!(mux_agent(&["list", "--All"]), verb_usage("list", LIST));
+}
+
+// A known verb's usage refusal honours -Text wherever it stands; an unknown verb's stays JSON with no verb.
+#[test]
+fn usage_refusal_keeps_verb_and_text() {
+    let text = (
+        2,
+        format!("code: 2\ncheck: usage\nmessage: {LIST}{NL}"),
+        String::new(),
+    );
+    assert_eq!(mux_agent(&["list", "-Bogus", "-Text"]), text);
+    assert_eq!(mux_agent(&["LIST", "-text", "x"]), text);
+    let all = usage(
+        "usage: mux-agent <focus|list|placement|read|send|sidebar|spawn|status|stop|version|watch> ...",
+    );
+    assert_eq!(mux_agent(&["bogus", "-Bogus", "-Text"]), all);
+}
+
+// version needs no pane, no state root and no caller: it answers outside a multiplexer, with a state root that
+// would refuse every other verb.
+#[test]
+fn version_outside_mux() {
+    let version = env!("CARGO_PKG_VERSION");
+    let json = (
+        0,
+        format!(r#"{{"ok":true,"verb":"version","version":"{version}"}}{NL}"#),
+        String::new(),
+    );
+    let text = (0, format!("version {version}{NL}"), String::new());
+    assert_eq!(mux_agent(&["version"]), json);
+    assert_eq!(mux_agent(&["--version"]), json);
+    assert_eq!(mux_agent(&["version", "-Text"]), text);
+    assert_eq!(mux_agent(&["--version", "-Text"]), text);
+    for args in [&["version"][..], &["--version"]] {
+        let mut call = command(args);
+        call.env("MUX_AGENTS_STATE", "relative/state")
+            .env("SANDBOX_RUNTIME", "1");
+        assert_eq!(output(call), json, "{args:?}");
+    }
+    assert_eq!(
+        mux_agent(&["version", "x"]),
+        verb_usage("version", "usage: mux-agent version [-Text]")
+    );
 }
 
 #[test]
 fn positional_bounds() {
-    assert_eq!(mux_agent(&["focus"]), usage(FOCUS));
-    assert_eq!(mux_agent(&["focus", "a", "b"]), usage(FOCUS));
+    assert_eq!(mux_agent(&["focus"]), verb_usage("focus", FOCUS));
+    assert_eq!(mux_agent(&["focus", "a", "b"]), verb_usage("focus", FOCUS));
     assert_eq!(mux_agent(&["focus", "a"]), endpoint("focus"));
-    assert_eq!(mux_agent(&["list", "x"]), usage(LIST));
+    assert_eq!(mux_agent(&["list", "x"]), verb_usage("list", LIST));
     assert_eq!(mux_agent(&["read"]), endpoint("read"));
     assert_eq!(mux_agent(&["read", "a", "-Lines", "5"]), endpoint("read"));
-    assert_eq!(mux_agent(&["read", "a", "b"]), usage(READ));
+    assert_eq!(mux_agent(&["read", "a", "b"]), verb_usage("read", READ));
     assert_eq!(
         mux_agent(&["watch", ""]),
-        usage("usage: mux-agent watch [-Text]")
+        verb_usage("watch", "usage: mux-agent watch [-Text]")
     );
 }
 
@@ -134,6 +194,24 @@ fn positional_bounds() {
 fn list_outside_mux_refuses_endpoint_1() {
     assert_eq!(mux_agent(&["list"]), endpoint("list"));
     assert_eq!(mux_agent(&["list", "-All"]), endpoint("list"));
+}
+
+// The refusal names the multiplexer the caller's variable names, even when its value is unusable: RMUX before TMUX.
+#[test]
+fn endpoint_refusal_names_the_mux() {
+    for (vars, mux) in [
+        (&[("TMUX", "relative,1,0")][..], "a tmux"),
+        (&[("RMUX", "relative,1,0")], "an rmux"),
+        (
+            &[("RMUX", "relative,1,0"), ("TMUX", "relative,1,0")],
+            "an rmux",
+        ),
+        (&[("RMUX", ""), ("TMUX", "relative,1,0")], "a tmux"),
+    ] {
+        let mut call = command(&["list"]);
+        call.envs(vars.iter().copied());
+        assert_eq!(output(call), endpoint_in("list", mux), "{vars:?}");
+    }
 }
 
 // The hidden pane entry reads only a spec.json inside the state root; it is not a verb, so its refusal goes to

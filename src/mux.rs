@@ -70,6 +70,46 @@ pub fn endpoint(env: &Env, os: OsKind) -> Option<Endpoint> {
     })
 }
 
+impl Kind {
+    pub fn name(self) -> &'static str {
+        match self {
+            Kind::Rmux => "rmux",
+            Kind::Tmux => "tmux",
+        }
+    }
+}
+
+/// The multiplexer the caller's variables name, by the one `endpoint` reads: a non-empty `RMUX`, else a non-empty
+/// `TMUX`; neither names none.
+pub fn env_kind(env: &Env) -> Option<Kind> {
+    let set = |name: &str| env.get(name).is_some_and(|v| !v.is_empty());
+    if set("RMUX") {
+        Some(Kind::Rmux)
+    } else if set("TMUX") {
+        Some(Kind::Tmux)
+    } else {
+        None
+    }
+}
+
+/// The multiplexer a refusal names: the connected one, else the one the variables name, else `tmux or rmux`.
+pub fn in_use(ctx: &Ctx) -> &'static str {
+    let connected = ctx.mux.borrow().as_ref().map(|mux| mux.kind());
+    connected
+        .or_else(|| env_kind(&ctx.env))
+        .map_or("tmux or rmux", Kind::name)
+}
+
+/// `not inside a tmux pane`, `not inside an rmux pane` or, with no multiplexer named, `not inside a tmux or rmux
+/// pane`.
+pub fn not_inside(kind: Option<Kind>) -> String {
+    match kind {
+        Some(Kind::Rmux) => "not inside an rmux pane".into(),
+        Some(Kind::Tmux) => "not inside a tmux pane".into(),
+        None => "not inside a tmux or rmux pane".into(),
+    }
+}
+
 fn file_name(kind: Kind) -> &'static str {
     match (kind, cfg!(windows)) {
         (Kind::Rmux, false) => "rmux",
@@ -179,7 +219,7 @@ impl RealMux {
     /// `connect` with `-V` bounded by `version_timeout`; a `-V` that fails to start or times out is no version.
     fn connect_within(ctx: &Ctx, version_timeout: Duration) -> Res<RealMux> {
         let Some(endpoint) = endpoint(&ctx.env, crate::state::root::HOST) else {
-            return refuse(1, "endpoint", "not inside an rmux pane");
+            return refuse(1, "endpoint", not_inside(env_kind(&ctx.env)));
         };
         let image = ctx.os.row(endpoint.server_pid).and_then(|row| row.path);
         let rmux_set = ctx.env.get("RMUX").is_some_and(|v| !v.is_empty());
@@ -205,8 +245,10 @@ impl Mux for RealMux {
         }
         let mut argv = vec!["-S", self.socket.as_str()];
         argv.extend_from_slice(args);
-        crate::spawn::captured(&self.bin, &argv, self.timeout)
-            .or_else(|_| refuse(1, "endpoint", "the rmux endpoint did not answer"))
+        crate::spawn::captured(&self.bin, &argv, self.timeout).or_else(|_| {
+            let name = self.kind.name();
+            refuse(1, "endpoint", format!("the {name} endpoint did not answer"))
+        })
     }
 
     fn kind(&self) -> Kind {
@@ -753,34 +795,74 @@ fn main() {
     }
 
     #[test]
-    fn native_outside_a_pane_refuses_endpoint() {
-        let fakes = Fakes::default();
-        let ctx = fakes.ctx();
-        *ctx.mux.borrow_mut() = None;
+    fn refusals_name_the_mux_in_use() {
+        // Unconnected: the variable `endpoint` reads names it, even when its value is unusable; neither names both.
+        for (pairs, name) in [
+            (&[("RMUX", "/r,1,0"), ("TMUX", "/t,2,0")][..], "rmux"),
+            (&[("TMUX", "/t,2,0")], "tmux"),
+            (&[("RMUX", ""), ("TMUX", "/t,2,0")], "tmux"),
+            (&[("RMUX", "relative,1,0")], "rmux"),
+            (&[("TMUX", "")], "tmux or rmux"),
+            (&[], "tmux or rmux"),
+        ] {
+            let fakes = Fakes::default();
+            let mut ctx = fakes.ctx();
+            ctx.env = Env::from_pairs(pairs.iter().copied());
+            *ctx.mux.borrow_mut() = None;
+            assert_eq!(in_use(&ctx), name, "{pairs:?}");
+        }
         assert_eq!(
-            refusal(native(&ctx, &["list-panes"], false)),
-            (1, "endpoint", "not inside an rmux pane".into())
+            [Kind::Tmux, Kind::Rmux].map(|kind| not_inside(Some(kind))),
+            ["not inside a tmux pane", "not inside an rmux pane"]
         );
-        assert!(fakes.os_calls().is_empty());
+        assert_eq!(not_inside(None), "not inside a tmux or rmux pane");
+        // Connected: the multiplexer that answers, whatever the variables say.
+        let fakes = Fakes::default();
+        fakes.mux_kind(Kind::Rmux);
+        let mut ctx = fakes.ctx();
+        ctx.env = Env::from_pairs([("TMUX", "/t,2,0")]);
+        assert_eq!(in_use(&ctx), "rmux");
+    }
+
+    #[test]
+    fn native_outside_a_pane_refuses_endpoint() {
+        for (pairs, message) in [
+            (&[][..], "not inside a tmux or rmux pane"),
+            (&[("TMUX", "relative,1,0")], "not inside a tmux pane"),
+            (&[("RMUX", "relative,1,0")], "not inside an rmux pane"),
+        ] {
+            let fakes = Fakes::default();
+            let mut ctx = fakes.ctx();
+            ctx.env = Env::from_pairs(pairs.iter().copied());
+            *ctx.mux.borrow_mut() = None;
+            assert_eq!(
+                refusal(native(&ctx, &["list-panes"], false)),
+                (1, "endpoint", message.into()),
+                "{pairs:?}"
+            );
+            assert!(fakes.os_calls().is_empty());
+        }
     }
 
     #[test]
     fn timeout_refuses_endpoint_did_not_answer() {
-        let dir = TempDir::new();
-        let bin = fake_mux(dir.path(), "tmux", "tmux 3.4");
-        let fakes = Fakes::default();
-        let ctx = ctx_for(&fakes, Some(&bin), "TMUX", "");
-        let mut mux = RealMux::connect(&ctx).unwrap();
-        mux.timeout = Duration::from_millis(200);
-        let did_not_answer = (
-            1,
-            "endpoint",
-            "the rmux endpoint did not answer".to_string(),
-        );
-        assert_eq!(refusal(mux.run(&["-N", "slow"])), did_not_answer);
-        // A binary that is gone by the call answers nothing either.
-        std::fs::remove_file(&bin).unwrap();
-        assert_eq!(refusal(mux.run(&["-N", "list-panes"])), did_not_answer);
+        // Named for the binary that ran, not the variable: a tmux server under RMUX is tmux.
+        for (name, version, var) in [
+            ("tmux", "tmux 3.4", "RMUX"),
+            ("rmux", "rmux 0.10.0", "TMUX"),
+        ] {
+            let dir = TempDir::new();
+            let bin = fake_mux(dir.path(), name, version);
+            let fakes = Fakes::default();
+            let ctx = ctx_for(&fakes, Some(&bin), var, "");
+            let mut mux = RealMux::connect(&ctx).unwrap();
+            mux.timeout = Duration::from_millis(200);
+            let did_not_answer = (1, "endpoint", format!("the {name} endpoint did not answer"));
+            assert_eq!(refusal(mux.run(&["-N", "slow"])), did_not_answer);
+            // A binary that is gone by the call answers nothing either.
+            std::fs::remove_file(&bin).unwrap();
+            assert_eq!(refusal(mux.run(&["-N", "list-panes"])), did_not_answer);
+        }
     }
 
     #[test]

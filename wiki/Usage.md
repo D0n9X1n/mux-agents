@@ -48,6 +48,7 @@ You rarely type these: the skill runs them for you. Every command is `<plugin>/s
 | `focus` | `focus claude-1` | switch the multiplexer to an agent's pane |
 | `stop` | `stop claude-1` | close an agent's pane and its processes; an agent that already ended answers `ok` with `already` (`exited`, `stopped` or `lost`) |
 | `sidebar` | `sidebar`, `sidebar -Close` | reopen the side-bar split, or close it for the rest of the session |
+| `version` | `version`, `--version` | the binary's version, to tell which one a pane runs; works outside a multiplexer |
 
 Exit code 0 means ok, 1 an error and 2 a refusal or usage error; on failure, `check` names the cause.
 
