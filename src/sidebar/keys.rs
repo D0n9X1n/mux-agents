@@ -276,6 +276,36 @@ mod tests {
     }
 
     #[test]
+    fn a_new_unfinished_sequence_takes_its_own_read_time() {
+        // A report finishes, then a new one starts in the same read: the new one's first byte was read at t2, not at
+        // t1 when the earlier sequence started.
+        let mut decoder = Decoder::default();
+        assert_eq!(decoder.push(b"\x1b[<0;3;", at(1)), []);
+        assert_eq!(events(&decoder.push(b"5M\x1b[<0;4;", at(2))).len(), 1);
+        assert_eq!(
+            decoder.push(b"6M", at(3)),
+            [Read {
+                event: Event::Press {
+                    button: 0,
+                    x: 4,
+                    y: 6
+                },
+                first: at(2)
+            }]
+        );
+    }
+
+    #[test]
+    fn an_unknown_csi_takes_its_final_byte_with_it() {
+        // `\e[5~` (Page Up) is dropped whole: its final `~` is not left to be read on its own, and an unknown CSI
+        // ending in `j` or `k` takes that letter too, so it is no Down or Up.
+        let mut decoder = Decoder::default();
+        assert_eq!(events(&decoder.push(b"\x1b[5~", at(1))), []);
+        assert_eq!(events(&decoder.push(b"\x1b[2j\x1b[3k", at(1))), []);
+        assert!(decoder.buf.is_empty());
+    }
+
+    #[test]
     fn idle_turns_a_lone_escape_into_esc() {
         let mut decoder = Decoder::default();
         assert_eq!(decoder.push(b"\x1b", at(1)), []);
@@ -393,6 +423,18 @@ mod tests {
             got.extend(events(&decoder.push(b, at(2))));
             got.extend(events(&decoder.push(b"j", at(3))));
             assert_eq!(got, [Event::Down], "split at {split}");
+        }
+        // One byte past the limit is dropped too, however it is read.
+        let mut over = b"\x1b[<".to_vec();
+        over.extend([b'0'; BUFFER_MAX - 7]);
+        over.extend(b";3;5M");
+        assert_eq!(over.len(), BUFFER_MAX + 1);
+        for split in 0..=over.len() {
+            let mut decoder = Decoder::default();
+            let (a, b) = over.split_at(split);
+            let mut got = events(&decoder.push(a, at(1)));
+            got.extend(events(&decoder.push(b, at(2))));
+            assert_eq!(got, [], "split at {split}");
         }
         // One at the limit still decodes.
         let mut fits = b"\x1b[<".to_vec();

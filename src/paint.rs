@@ -254,6 +254,16 @@ mod tests {
         };
         assert_eq!(paint("x", reverse, true), "\u{1b}[7mx\u{1b}[0m");
         assert_eq!(paint("x", selected, true), "\u{1b}[1;7;34mx\u{1b}[0m");
+        // Dim comes before reverse.
+        let dim = Style {
+            dim: true,
+            reverse: true,
+            ..Style::default()
+        };
+        assert_eq!(paint("x", dim, true), "\u{1b}[2;7mx\u{1b}[0m");
+        // No color, no SGR: the selection is not drawn reversed.
+        assert_eq!(paint("x", reverse, false), "x");
+        assert_eq!(paint("x", selected, false), "x");
     }
 
     #[test]

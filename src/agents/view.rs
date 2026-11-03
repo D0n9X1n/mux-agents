@@ -265,15 +265,26 @@ mod tests {
         // The bar drew worker on %9; it is on %10 now: refused before any select.
         w.fakes.clear_log();
         let moved = focus_pane(&w.ctx, &caller, "worker", Some("%9")).unwrap_err();
-        assert_eq!((moved.code, moved.check), (2, "target"));
-        assert!(
-            w.fakes.mux_calls().iter().all(|c| c[1] != "if-shell"),
-            "{:?}",
-            w.fakes.mux_calls()
+        assert_eq!(
+            (moved.code, moved.check, moved.message.as_str()),
+            (
+                2,
+                "target",
+                "the agent is no longer on the pane the bar drew"
+            )
         );
-        // Still on the pane the bar drew, and the read-back proves it focused.
+        let selects = |calls: Vec<Vec<String>>| {
+            calls
+                .iter()
+                .filter(|c| c.iter().any(|arg| arg.contains("select-window -t %10")))
+                .count()
+        };
+        assert_eq!(selects(w.fakes.mux_calls()), 0, "{:?}", w.fakes.mux_calls());
+        // Still on the pane the bar drew: it selects that pane, and the read-back proves it focused.
+        w.fakes.clear_log();
         w.fakes.mux_first("#{window_active}", 0, "%10|1|1|1\n", "");
         let focused = focus_pane(&w.ctx, &caller, "worker", Some("%10")).unwrap();
+        assert_eq!(selects(w.fakes.mux_calls()), 1, "{:?}", w.fakes.mux_calls());
         assert_eq!(
             (focused.name, focused.pane, focused.window),
             ("worker".into(), "%10".into(), "@5".into())

@@ -79,18 +79,22 @@ impl Pick {
     /// with no wrap; Enter selects the top agent first, then focuses the selected one; Esc clears. Every key dismisses
     /// the note and draws again; any other event does nothing.
     pub fn key(&mut self, event: Event, drawn: &[Target]) -> Act {
+        if !matches!(event, Event::Up | Event::Down | Event::Enter | Event::Esc) {
+            return Act::Nothing;
+        }
         self.follow(drawn);
         let at = self.chosen.as_ref().map(|(_, at)| *at);
         let next = match (event, at, drawn.len().checked_sub(1)) {
-            (Event::Press { .. } | Event::Release { .. } | Event::Interrupt, _, _) => {
-                return Act::Nothing;
-            }
             (Event::Esc, _, _) | (_, _, None) => None,
             (Event::Enter, Some(at), _) => Some(at),
             (Event::Down | Event::Enter, None, _) => Some(0),
             (Event::Down, Some(at), Some(last)) => Some((at + 1).min(last)),
             (Event::Up, None, Some(last)) => Some(last),
             (Event::Up, Some(at), _) => Some(at.saturating_sub(1)),
+            // Not a key: returned above.
+            (Event::Press { .. } | Event::Release { .. } | Event::Interrupt, _, _) => {
+                return Act::Nothing;
+            }
         };
         self.failed = None;
         self.chosen = next.map(|at| (drawn[at].name.clone(), at));
@@ -273,6 +277,9 @@ mod tests {
             })
         );
         assert_eq!(resolve(&board(json!([ended])), "worker"), None);
+        // Two running agents with the same name: ambiguous, so neither.
+        let twin = json!({"name": "worker", "state": "running", "pane": "%5"});
+        assert_eq!(resolve(&board(json!([worker, twin])), "worker"), None);
         assert_eq!(resolve(&one, "nobody"), None);
         // A board field is cleaned before it is compared, as the bar drew it.
         let dirty = board(json!([{"name": "work\u{1b}er", "state": "running\n", "pane": "%9"}]));
@@ -285,18 +292,45 @@ mod tests {
         let mut pick = Pick::default();
         assert_eq!(pick.key(Event::Down, &three), Act::Redraw);
         assert_eq!(pick.selected(), Some("a"));
-        pick.key(Event::Down, &three);
-        pick.key(Event::Down, &three);
+        assert_eq!(pick.key(Event::Down, &three), Act::Redraw);
+        assert_eq!(pick.selected(), Some("bb"), "one step at a time");
+        assert_eq!(pick.key(Event::Down, &three), Act::Redraw);
+        assert_eq!(pick.selected(), Some("ccc"));
         assert_eq!(pick.key(Event::Down, &three), Act::Redraw);
         assert_eq!(pick.selected(), Some("ccc"), "no wrap at the bottom");
 
         let mut pick = Pick::default();
         assert_eq!(pick.key(Event::Up, &three), Act::Redraw);
         assert_eq!(pick.selected(), Some("ccc"));
-        pick.key(Event::Up, &three);
-        pick.key(Event::Up, &three);
+        assert_eq!(pick.key(Event::Up, &three), Act::Redraw);
+        assert_eq!(pick.selected(), Some("bb"), "one step at a time");
+        assert_eq!(pick.key(Event::Up, &three), Act::Redraw);
+        assert_eq!(pick.selected(), Some("a"));
         assert_eq!(pick.key(Event::Up, &three), Act::Redraw);
         assert_eq!(pick.selected(), Some("a"), "no wrap at the top");
+
+        // A mouse event or Ctrl-C is not a key: nothing changes, not even when the drawn agents did.
+        let mut pick = Pick::default();
+        pick.key(Event::Down, &three);
+        pick.failed("x");
+        let moved = drawn(&["zz"]);
+        for event in [
+            Event::Press {
+                button: 0,
+                x: 1,
+                y: 1,
+            },
+            Event::Release {
+                button: 0,
+                x: 1,
+                y: 1,
+            },
+            Event::Interrupt,
+        ] {
+            assert_eq!(pick.key(event, &moved), Act::Nothing, "{event:?}");
+            assert_eq!(pick.selected(), Some("a"), "{event:?}");
+            assert!(pick.note().is_some(), "{event:?}");
+        }
 
         let mut pick = Pick::default();
         assert_eq!(pick.key(Event::Enter, &three), Act::Redraw);
@@ -360,9 +394,12 @@ mod tests {
         pick.ticked();
         assert_eq!(pick.note(), None);
 
-        pick.failed("worker");
-        assert_eq!(pick.key(Event::Down, &drawn(&["a"])), Act::Redraw);
-        assert_eq!(pick.note(), None);
+        // Every key dismisses it.
+        for event in [Event::Down, Event::Up, Event::Enter, Event::Esc] {
+            pick.failed("worker");
+            assert_ne!(pick.key(event, &drawn(&["a"])), Act::Nothing, "{event:?}");
+            assert_eq!(pick.note(), None, "{event:?}");
+        }
 
         pick.failed("worker");
         pick.pressed();

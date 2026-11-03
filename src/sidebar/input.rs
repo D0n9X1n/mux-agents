@@ -410,6 +410,8 @@ pub(crate) struct FakeTerm {
     pub(crate) log: std::rc::Rc<std::cell::RefCell<Vec<String>>>,
     pub(crate) fail: Option<&'static str>,
     pub(crate) partial: bool,
+    /// The `DISABLE` write fails (on the way out, after the mode was in use).
+    pub(crate) fail_disable: bool,
     pub(crate) reads: std::collections::VecDeque<io::Result<Waited>>,
 }
 
@@ -421,6 +423,7 @@ impl FakeTerm {
             log: Default::default(),
             fail: None,
             partial: false,
+            fail_disable: false,
             reads: Default::default(),
         }
     }
@@ -449,6 +452,10 @@ impl Term for FakeTerm {
     }
 
     fn write(&mut self, bytes: &[u8]) -> io::Result<()> {
+        if self.fail_disable && bytes == DISABLE {
+            self.log.borrow_mut().push("write failed".into());
+            return Err(io::Error::other("write failed"));
+        }
         if self.partial && bytes == ENABLE {
             let entry = format!("write {}", bytes[..4].escape_ascii());
             self.log.borrow_mut().push(entry);
@@ -484,9 +491,10 @@ mod tests {
 
     #[test]
     fn setup_rolls_back_each_failed_step_in_reverse() {
-        let enable = write(ENABLE);
-        let partway = write(&ENABLE[..4]);
-        let disable = write(DISABLE);
+        // The mode bytes as the terminal must see them, written out rather than taken from the constants.
+        let enable = write(b"\x1b[?1000h\x1b[?1006h");
+        let partway = write(b"\x1b[?1");
+        let disable = write(b"\x1b[?1006l\x1b[?1000l");
         let cases: [(Option<&'static str>, bool, Vec<&str>); 4] = [
             (Some("save"), false, vec!["save"]),
             (Some("arm"), false, vec!["save", "arm", "disarm"]),
@@ -523,6 +531,24 @@ mod tests {
         assert_eq!(
             *log.borrow(),
             ["save", "arm", "raw", &enable, &disable, "restore", "disarm"]
+        );
+
+        // A disable write that fails on the way out still restores the mode and disarms, without panicking.
+        let mut term = FakeTerm::new();
+        term.fail_disable = true;
+        let log = term.log.clone();
+        drop(TermInput::setup(term).expect("every step succeeds"));
+        assert_eq!(
+            *log.borrow(),
+            [
+                "save",
+                "arm",
+                "raw",
+                &enable,
+                "write failed",
+                "restore",
+                "disarm"
+            ]
         );
     }
 
@@ -623,16 +649,23 @@ mod tests {
     fn term_input_errors_are_closed() {
         let fakes = Fakes::default();
         let mut term = FakeTerm::new();
+        term.reads.push_back(Ok(Waited::Bytes(b"j".to_vec())));
+        term.reads.push_back(Ok(Waited::Timeout));
         term.reads.push_back(Err(io::Error::from_raw_os_error(5))); // EIO
         let mut input = TermInput::setup(term).expect("every step succeeds");
-        assert_eq!(
-            input.wait(&fakes, Duration::from_millis(2000)),
-            Waited::Closed
-        );
+        let wait = Duration::from_millis(2000);
+        // What the terminal answers passes through; only an error is Closed.
+        assert_eq!(input.wait(&fakes, wait), Waited::Bytes(b"j".to_vec()));
+        assert_eq!(input.wait(&fakes, wait), Waited::Timeout);
+        assert_eq!(input.wait(&fakes, wait), Waited::Closed);
+        assert!(fakes.slept().is_empty(), "answered reads take no time");
+        // With nothing left to answer, the fake terminal waits out the timeout on the fake clock.
+        assert_eq!(input.wait(&fakes, wait), Waited::Timeout);
+        assert_eq!(fakes.slept(), [2000]);
     }
 
     #[cfg(unix)]
-    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
     #[cfg(unix)]
     use std::sync::Mutex;
     #[cfg(unix)]
@@ -850,6 +883,226 @@ mod tests {
         assert!(ignored(libc::SIGHUP), "still ignored after");
         // SAFETY: back to the default action, as before this test.
         unsafe { libc::signal(libc::SIGHUP, libc::SIG_DFL) };
+    }
+
+    // The current action for `signal`.
+    #[cfg(unix)]
+    fn action(signal: libc::c_int) -> libc::sighandler_t {
+        // SAFETY: a zeroed sigaction is a valid value for sigaction to fill in.
+        let mut now: libc::sigaction = unsafe { std::mem::zeroed() };
+        // SAFETY: a null new action only reads the current one into `now`.
+        assert_eq!(
+            unsafe { libc::sigaction(signal, std::ptr::null(), &mut now) },
+            0
+        );
+        now.sa_sigaction
+    }
+
+    // Installs `handler` for `signal`, with no SA_RESTART.
+    #[cfg(unix)]
+    fn install(signal: libc::c_int, handler: libc::sighandler_t) {
+        // SAFETY: a zeroed sigaction is a valid value (empty mask, no flags).
+        let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
+        action.sa_sigaction = handler;
+        // SAFETY: the pointer is valid for the call; each test puts the default back under `PTY`.
+        assert_eq!(
+            unsafe { libc::sigaction(signal, &action, std::ptr::null_mut()) },
+            0
+        );
+    }
+
+    // VMIN and VTIME on `fd`.
+    #[cfg(unix)]
+    fn vmin_vtime(fd: &OwnedFd) -> (libc::cc_t, libc::cc_t) {
+        // SAFETY: a zeroed termios is a valid value for tcgetattr to fill in.
+        let mut mode: libc::termios = unsafe { std::mem::zeroed() };
+        // SAFETY: `mode` is valid for the call.
+        assert_eq!(unsafe { libc::tcgetattr(fd.as_raw_fd(), &mut mode) }, 0);
+        (mode.c_cc[libc::VMIN], mode.c_cc[libc::VTIME])
+    }
+
+    // A read end with nothing to read yet, and its write end.
+    #[cfg(unix)]
+    fn pipe() -> (OwnedFd, OwnedFd) {
+        let mut fds = [0; 2];
+        // SAFETY: `fds` has room for the two descriptors pipe returns, each taken once below.
+        unsafe {
+            assert_eq!(libc::pipe(fds.as_mut_ptr()), 0);
+            (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1]))
+        }
+    }
+
+    // A save that fails (no terminal) gives the globals back, so the next setup works; a handler someone else had
+    // comes back after, an ignored signal is never touched, and raw mode sets VMIN 1, VTIME 0 whatever came before.
+    #[cfg(unix)]
+    #[test]
+    fn setup_gives_back_what_it_took() {
+        let _pty = PTY.lock().unwrap_or_else(|e| e.into_inner());
+        let (read, write) = pipe();
+        assert!(
+            TermInput::setup(Tty::on(read.as_raw_fd(), write.as_raw_fd())).is_none(),
+            "a pipe is no terminal"
+        );
+
+        let (_master, slave) = pty();
+        let fd = slave.as_raw_fd();
+        // SAFETY: a zeroed termios is a valid value for tcgetattr to fill in.
+        let mut mode: libc::termios = unsafe { std::mem::zeroed() };
+        // SAFETY: `mode` is valid for both calls on the open slave.
+        unsafe {
+            assert_eq!(libc::tcgetattr(fd, &mut mode), 0);
+            mode.c_cc[libc::VMIN] = 0;
+            mode.c_cc[libc::VTIME] = 5;
+            assert_eq!(libc::tcsetattr(fd, libc::TCSANOW, &mode), 0);
+        }
+        let winch = on_winch as extern "C" fn(libc::c_int) as libc::sighandler_t;
+        install(libc::SIGTERM, winch);
+        install(libc::SIGHUP, libc::SIG_IGN);
+
+        let input = TermInput::setup(Tty::on(fd, fd)).expect("the globals were given back");
+        assert_eq!(
+            vmin_vtime(&slave),
+            (1, 0),
+            "a read waits for one byte, no timer"
+        );
+        assert_ne!(
+            action(libc::SIGTERM),
+            winch,
+            "the bar's handler while it runs"
+        );
+        // Changed while the bar runs: the bar never armed it, so it leaves it as it finds it.
+        install(libc::SIGHUP, winch);
+        drop(input);
+        assert_eq!(vmin_vtime(&slave), (0, 5), "restored");
+        assert_eq!(action(libc::SIGTERM), winch, "the replaced handler is back");
+        assert_eq!(
+            action(libc::SIGHUP),
+            winch,
+            "an ignored signal is never disarmed"
+        );
+
+        install(libc::SIGTERM, libc::SIG_DFL);
+        install(libc::SIGHUP, libc::SIG_DFL);
+    }
+
+    // A write the terminal takes in pieces, or a signal interrupts, still writes every byte.
+    #[cfg(unix)]
+    #[test]
+    fn write_finishes_through_short_and_interrupted_writes() {
+        let _pty = PTY.lock().unwrap_or_else(|e| e.into_inner());
+        let (master, slave) = pty();
+        let fd = slave.as_raw_fd();
+        // SAFETY: a zeroed termios is a valid value for tcgetattr to fill in.
+        let mut mode: libc::termios = unsafe { std::mem::zeroed() };
+        // SAFETY: `mode` is valid for both calls; the output is passed through as is, so the bytes count exactly.
+        unsafe {
+            assert_eq!(libc::tcgetattr(fd, &mut mode), 0);
+            libc::cfmakeraw(&mut mode);
+            assert_eq!(libc::tcsetattr(fd, libc::TCSANOW, &mode), 0);
+        }
+        install(
+            libc::SIGWINCH,
+            on_winch as extern "C" fn(libc::c_int) as libc::sighandler_t,
+        );
+        WINCHED.store(0, Ordering::Relaxed);
+        // Fill the pty while nothing reads it, so the next write blocks before its first byte.
+        // SAFETY: fcntl on the open slave; it is made blocking again before `write`.
+        unsafe { libc::fcntl(fd, libc::F_SETFL, libc::O_NONBLOCK) };
+        let mut full = 0;
+        loop {
+            let chunk = [b'f'; 1024];
+            // SAFETY: `chunk` is valid for its length.
+            let n = unsafe { libc::write(fd, chunk.as_ptr().cast(), chunk.len()) };
+            if n <= 0 {
+                break;
+            }
+            full += n as usize;
+        }
+        // SAFETY: as above.
+        unsafe { libc::fcntl(fd, libc::F_SETFL, 0) };
+        assert!(full > 0, "the pty took nothing");
+
+        const LEN: usize = 256 * 1024;
+        let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        // SAFETY: pthread_self has no preconditions.
+        let target = Target(unsafe { libc::pthread_self() });
+        // Signals the writer the whole time: first while it is blocked with nothing written (EINTR), then while
+        // the reader drains, between pieces (a short count).
+        let kicker = {
+            let done = done.clone();
+            std::thread::spawn(move || {
+                while !done.load(Ordering::Relaxed) {
+                    target.kill(libc::SIGWINCH);
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+            })
+        };
+        // Reads nothing for 200 ms, then slowly, until every byte came or none came for 2 s.
+        let reader = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(200));
+            let mut seen = 0;
+            while seen < full + LEN {
+                let mut poll = libc::pollfd {
+                    fd: master.as_raw_fd(),
+                    events: libc::POLLIN,
+                    revents: 0,
+                };
+                // SAFETY: one pollfd, valid for the call.
+                if unsafe { libc::poll(&mut poll, 1, 2000) } <= 0 {
+                    break;
+                }
+                let mut buf = [0u8; 4096];
+                // SAFETY: `buf` has room for the bytes read asks for.
+                let n =
+                    unsafe { libc::read(master.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len()) };
+                if n <= 0 {
+                    break;
+                }
+                seen += n as usize;
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            seen
+        });
+        WINCHED.store(0, Ordering::Relaxed);
+        let wrote = Tty::on(fd, fd).write(&vec![b'x'; LEN]);
+        let during = WINCHED.load(Ordering::Relaxed);
+        done.store(true, Ordering::Relaxed);
+        kicker.join().unwrap();
+        let seen = reader.join().unwrap();
+        install(libc::SIGWINCH, libc::SIG_DFL);
+        assert!(wrote.is_ok(), "{wrote:?}");
+        assert_eq!(seen - full, LEN, "every byte, none twice");
+        assert!(during > 10, "signals came mid-write: {during}");
+    }
+
+    // EOF, a hang-up, a descriptor that is not open, and a read error each end the wait at once.
+    #[cfg(unix)]
+    #[test]
+    fn wait_ends_on_eof_hang_up_and_errors() {
+        let fakes = Fakes::default();
+        let long = Duration::from_secs(5);
+        let poll = |input: RawFd| {
+            let start = Instant::now();
+            let waited = Tty::on(input, -1).poll_read(&fakes, long);
+            assert!(start.elapsed() < Duration::from_secs(1), "{waited:?}");
+            waited
+        };
+        // A read of no bytes is EOF.
+        let null = std::fs::File::open("/dev/null").unwrap();
+        assert_eq!(poll(null.as_raw_fd()).unwrap(), Waited::Closed);
+        // Nothing left to read and no writer: a hang-up (or EOF).
+        let (read, write) = pipe();
+        drop(write);
+        assert_eq!(poll(read.as_raw_fd()).unwrap(), Waited::Closed);
+        // Past the descriptor limit, never open.
+        assert_eq!(poll(libc::c_int::MAX - 1).unwrap(), Waited::Closed);
+        // A regular file always polls readable, but one opened only to write fails its read (EBADF): an error, which
+        // `TermInput::wait` makes Closed.
+        let path = std::env::temp_dir().join(format!("mux-agents-wait-{}", std::process::id()));
+        let file = std::fs::File::create(&path).unwrap();
+        let waited = poll(file.as_raw_fd());
+        let _ = std::fs::remove_file(&path);
+        assert!(waited.is_err(), "{waited:?}");
     }
 
     // Each signal, mid-setup or after it, restores the terminal and still ends the process by that signal. The child
