@@ -424,11 +424,12 @@ mod tests {
             got.extend(events(&decoder.push(b"j", at(3))));
             assert_eq!(got, [Event::Down], "split at {split}");
         }
-        // One byte past the limit is dropped too, however it is read.
+        // The limit is 64 bytes. One past it is dropped too, however it is read.
+        assert_eq!(BUFFER_MAX, 64);
         let mut over = b"\x1b[<".to_vec();
-        over.extend([b'0'; BUFFER_MAX - 7]);
+        over.extend([b'0'; 57]);
         over.extend(b";3;5M");
-        assert_eq!(over.len(), BUFFER_MAX + 1);
+        assert_eq!(over.len(), 65);
         for split in 0..=over.len() {
             let mut decoder = Decoder::default();
             let (a, b) = over.split_at(split);
@@ -438,9 +439,9 @@ mod tests {
         }
         // One at the limit still decodes.
         let mut fits = b"\x1b[<".to_vec();
-        fits.extend([b'0'; BUFFER_MAX - 8]);
+        fits.extend([b'0'; 56]);
         fits.extend(b";3;5M");
-        assert_eq!(fits.len(), BUFFER_MAX);
+        assert_eq!(fits.len(), 64);
         assert_eq!(
             events(&Decoder::default().push(&fits, at(1))),
             [Event::Press {

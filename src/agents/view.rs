@@ -279,7 +279,15 @@ mod tests {
                 .filter(|c| c.iter().any(|arg| arg.contains("select-window -t %10")))
                 .count()
         };
-        assert_eq!(selects(w.fakes.mux_calls()), 0, "{:?}", w.fakes.mux_calls());
+        // Nothing that could select a pane ran: no `if-shell`, no select of any pane.
+        assert!(
+            w.fakes
+                .mux_calls()
+                .iter()
+                .all(|c| c[1] != "if-shell" && !c.iter().any(|arg| arg.contains("select-"))),
+            "{:?}",
+            w.fakes.mux_calls()
+        );
         // Still on the pane the bar drew: it selects that pane, and the read-back proves it focused.
         w.fakes.clear_log();
         w.fakes.mux_first("#{window_active}", 0, "%10|1|1|1\n", "");

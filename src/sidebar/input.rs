@@ -290,40 +290,72 @@ mod unix {
                 };
                 // SAFETY: one pollfd, valid for the call.
                 let ready = unsafe { libc::poll(&mut fd, 1, ms as libc::c_int) };
-                if ready < 0 {
-                    let error = io::Error::last_os_error();
-                    if error.kind() == io::ErrorKind::Interrupted {
-                        continue;
-                    }
-                    return Err(error);
-                }
-                if ready == 0 {
-                    continue;
-                }
-                if fd.revents & libc::POLLIN == 0 {
-                    if fd.revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0 {
-                        return Ok(Waited::Closed);
-                    }
-                    continue;
+                let ready = if ready < 0 {
+                    Err(io::Error::last_os_error())
+                } else {
+                    Ok(ready)
+                };
+                match after_poll(ready, fd.revents) {
+                    Polled::Again => continue,
+                    Polled::Done(done) => return done,
+                    Polled::Read => {}
                 }
                 let mut buf = [0u8; 256];
                 // SAFETY: `buf` has room for the `buf.len()` bytes read asks for.
                 let n = unsafe { libc::read(self.input, buf.as_mut_ptr().cast(), buf.len()) };
-                if n < 0 {
-                    let error = io::Error::last_os_error();
-                    if matches!(
-                        error.kind(),
-                        io::ErrorKind::Interrupted | io::ErrorKind::WouldBlock
-                    ) {
-                        continue;
-                    }
-                    return Err(error);
+                let read = if n < 0 {
+                    Err(io::Error::last_os_error())
+                } else {
+                    Ok(&buf[..n as usize])
+                };
+                if let Some(done) = after_read(read) {
+                    return done;
                 }
-                if n == 0 {
-                    return Ok(Waited::Closed);
-                }
-                return Ok(Waited::Bytes(buf[..n as usize].to_vec()));
             }
+        }
+    }
+
+    /// What one `poll` answer means for the wait.
+    #[derive(Debug)]
+    pub(super) enum Polled {
+        /// Nothing yet, or a signal: poll again to the same deadline.
+        Again,
+        /// Bytes are ready: read them.
+        Read,
+        Done(io::Result<Waited>),
+    }
+
+    /// `ready` is what poll returned (or its error), `revents` what it set. Bytes ready come first, even beside a
+    /// hang-up; a hang-up, error or bad descriptor without them is `Closed`; a failed poll other than EINTR is an
+    /// error.
+    pub(super) fn after_poll(ready: io::Result<libc::c_int>, revents: libc::c_short) -> Polled {
+        match ready {
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => Polled::Again,
+            Err(error) => Polled::Done(Err(error)),
+            Ok(0) => Polled::Again,
+            Ok(_) if revents & libc::POLLIN != 0 => Polled::Read,
+            Ok(_) if revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0 => {
+                Polled::Done(Ok(Waited::Closed))
+            }
+            Ok(_) => Polled::Again,
+        }
+    }
+
+    /// What one `read` answer means: bytes, `Closed` at EOF, an error, or `None` to wait again on EINTR or EAGAIN
+    /// (another reader took the bytes poll saw).
+    pub(super) fn after_read(read: io::Result<&[u8]>) -> Option<io::Result<Waited>> {
+        match read {
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::Interrupted | io::ErrorKind::WouldBlock
+                ) =>
+            {
+                None
+            }
+            Err(error) => Some(Err(error)),
+            Ok([]) => Some(Ok(Waited::Closed)),
+            Ok(bytes) => Some(Ok(Waited::Bytes(bytes.to_vec()))),
         }
     }
 }
@@ -885,9 +917,9 @@ mod tests {
         unsafe { libc::signal(libc::SIGHUP, libc::SIG_DFL) };
     }
 
-    // The current action for `signal`.
+    // The current action for `signal`, whole.
     #[cfg(unix)]
-    fn action(signal: libc::c_int) -> libc::sighandler_t {
+    fn current(signal: libc::c_int) -> libc::sigaction {
         // SAFETY: a zeroed sigaction is a valid value for sigaction to fill in.
         let mut now: libc::sigaction = unsafe { std::mem::zeroed() };
         // SAFETY: a null new action only reads the current one into `now`.
@@ -895,7 +927,13 @@ mod tests {
             unsafe { libc::sigaction(signal, std::ptr::null(), &mut now) },
             0
         );
-        now.sa_sigaction
+        now
+    }
+
+    // The current handler for `signal`.
+    #[cfg(unix)]
+    fn action(signal: libc::c_int) -> libc::sighandler_t {
+        current(signal).sa_sigaction
     }
 
     // Installs `handler` for `signal`, with no SA_RESTART.
@@ -932,6 +970,44 @@ mod tests {
         }
     }
 
+    // Each poll answer and each read answer, including those a real terminal will not give on demand: EINTR or
+    // EAGAIN on a read poll called ready, an error event, a failed poll, bytes beside a hang-up.
+    #[cfg(unix)]
+    #[test]
+    fn poll_and_read_answers() {
+        use super::unix::{Polled, after_poll, after_read};
+        let os = io::Error::from_raw_os_error;
+        let polled = |ready, revents| format!("{:?}", after_poll(ready, revents));
+        let closed = format!("{:?}", Polled::Done(Ok(Waited::Closed)));
+        assert_eq!(polled(Err(os(libc::EINTR)), 0), "Again");
+        assert!(
+            matches!(after_poll(Err(os(libc::EINVAL)), 0), Polled::Done(Err(e)) if e.raw_os_error() == Some(libc::EINVAL))
+        );
+        assert_eq!(polled(Ok(0), 0), "Again");
+        assert_eq!(polled(Ok(1), libc::POLLIN), "Read");
+        assert_eq!(
+            polled(Ok(1), libc::POLLIN | libc::POLLHUP),
+            "Read",
+            "bytes before the hang-up"
+        );
+        assert_eq!(polled(Ok(1), libc::POLLIN | libc::POLLERR), "Read");
+        for event in [libc::POLLHUP, libc::POLLERR, libc::POLLNVAL] {
+            assert_eq!(polled(Ok(1), event), closed, "{event}");
+        }
+        assert_eq!(polled(Ok(1), libc::POLLOUT), "Again");
+
+        assert!(after_read(Err(os(libc::EINTR))).is_none());
+        assert!(after_read(Err(os(libc::EAGAIN))).is_none());
+        assert!(
+            matches!(after_read(Err(os(libc::EIO))), Some(Err(e)) if e.raw_os_error() == Some(libc::EIO))
+        );
+        assert_eq!(after_read(Ok(b"")).unwrap().unwrap(), Waited::Closed);
+        assert_eq!(
+            after_read(Ok(b"jk")).unwrap().unwrap(),
+            Waited::Bytes(b"jk".to_vec())
+        );
+    }
+
     // A save that fails (no terminal) gives the globals back, so the next setup works; a handler someone else had
     // comes back after, an ignored signal is never touched, and raw mode sets VMIN 1, VTIME 0 whatever came before.
     #[cfg(unix)]
@@ -956,7 +1032,20 @@ mod tests {
             assert_eq!(libc::tcsetattr(fd, libc::TCSANOW, &mode), 0);
         }
         let winch = on_winch as extern "C" fn(libc::c_int) as libc::sighandler_t;
-        install(libc::SIGTERM, winch);
+        // Someone else's SIGTERM handler, with its own flags and mask, all of which come back.
+        // SAFETY: a zeroed sigaction is a valid value; the mask and flags are set before it is installed, and the
+        // default goes back at the end of this test, under `PTY`.
+        unsafe {
+            let mut theirs: libc::sigaction = std::mem::zeroed();
+            theirs.sa_sigaction = winch;
+            theirs.sa_flags = libc::SA_RESTART;
+            libc::sigemptyset(&mut theirs.sa_mask);
+            libc::sigaddset(&mut theirs.sa_mask, libc::SIGUSR1);
+            assert_eq!(
+                libc::sigaction(libc::SIGTERM, &theirs, std::ptr::null_mut()),
+                0
+            );
+        }
         install(libc::SIGHUP, libc::SIG_IGN);
 
         let input = TermInput::setup(Tty::on(fd, fd)).expect("the globals were given back");
@@ -974,7 +1063,15 @@ mod tests {
         install(libc::SIGHUP, winch);
         drop(input);
         assert_eq!(vmin_vtime(&slave), (0, 5), "restored");
-        assert_eq!(action(libc::SIGTERM), winch, "the replaced handler is back");
+        let back = current(libc::SIGTERM);
+        assert_eq!(back.sa_sigaction, winch, "the replaced handler is back");
+        assert_ne!(back.sa_flags & libc::SA_RESTART, 0, "with its flags");
+        // SAFETY: `back.sa_mask` is a valid signal set sigaction filled in.
+        assert_eq!(
+            unsafe { libc::sigismember(&back.sa_mask, libc::SIGUSR1) },
+            1,
+            "and its mask"
+        );
         assert_eq!(
             action(libc::SIGHUP),
             winch,
@@ -1040,8 +1137,8 @@ mod tests {
         // Reads nothing for 200 ms, then slowly, until every byte came or none came for 2 s.
         let reader = std::thread::spawn(move || {
             std::thread::sleep(Duration::from_millis(200));
-            let mut seen = 0;
-            while seen < full + LEN {
+            let mut seen = Vec::new();
+            while seen.len() < full + LEN {
                 let mut poll = libc::pollfd {
                     fd: master.as_raw_fd(),
                     events: libc::POLLIN,
@@ -1058,20 +1155,24 @@ mod tests {
                 if n <= 0 {
                     break;
                 }
-                seen += n as usize;
+                seen.extend_from_slice(&buf[..n as usize]);
                 std::thread::sleep(Duration::from_millis(1));
             }
             seen
         });
         WINCHED.store(0, Ordering::Relaxed);
-        let wrote = Tty::on(fd, fd).write(&vec![b'x'; LEN]);
+        // No two neighbouring KiB alike, so a piece written twice or skipped shows.
+        let bytes: Vec<u8> = (0..LEN).map(|i| (i % 251) as u8).collect();
+        let wrote = Tty::on(fd, fd).write(&bytes);
         let during = WINCHED.load(Ordering::Relaxed);
         done.store(true, Ordering::Relaxed);
         kicker.join().unwrap();
         let seen = reader.join().unwrap();
         install(libc::SIGWINCH, libc::SIG_DFL);
         assert!(wrote.is_ok(), "{wrote:?}");
-        assert_eq!(seen - full, LEN, "every byte, none twice");
+        assert_eq!(seen.len(), full + LEN, "every byte, none twice");
+        assert!(seen[..full].iter().all(|&b| b == b'f'));
+        assert!(seen[full..] == bytes[..], "the bytes in order");
         assert!(during > 10, "signals came mid-write: {during}");
     }
 
