@@ -146,6 +146,20 @@ Every refusal is one JSON line with `check` naming the cause:
 | `policy` | the caller is not in bypass or allow-all; for Claude Code, `reason` says which half failed: `transcript: no session id`, `transcript: not found`, `transcript: no mode`, `transcript: other mode`, `screen: unreadable`, `screen: no mode line` or `screen: other mode` | Claude Code: bypass permissions (`--dangerously-skip-permissions` or Shift+Tab), with the footer badge `⏵⏵ bypass permissions on` in the pane's last 8 rows; Copilot CLI: `--allow-all` |
 | `cap` | 6 agents already live in this session | `stop` one |
 | `tagged` | an agent tried to spawn, open the side bar or set `placement` | only the top-level chat spawns |
+| `flags` | a `claude` or `copilot` process from the agent up to the pane has a flag outside the allowlist, or its command line cannot be read | restart the client with only allowlisted flags |
+| `directory` | the caller's launch directory cannot be confirmed from its session or process, or is not an existing absolute folder | start the client in an existing folder and stay in it |
+| `name` | `-Name` is not 1-24 lowercase letters, digits or hyphens starting with a letter, is `parent`, `root` or `all`, or is taken in this session; or an agent record cannot be read, so names cannot be checked | use the free name the message suggests, or another; for an unreadable record, check that agent's folder in the state folder |
+| `brief` | an agent caller spawns a child that starts from a brief, not a fork of its conversation (`-NoFork`, the other client, no session id, a Claude Code that is not interactive, or a failed Copilot CLI session copy), without `-BriefFile` | pass `-BriefFile` with the context the child needs |
+| `target` | no live agent has that name, the recipient is not a live pane of this session, the agent's pane no longer runs its own launch, or `status` comes from a pane that is not an agent | check the name with `list`; only an agent reports `status` |
+| `parent` | `send parent` from a pane that is not an agent, an agent stopping an agent it did not spawn, or an agent pane whose record is missing or cannot be proven to run there | send to an agent by name; only its parent or a human stops an agent |
+| `caller` | a process other than a shell runs between the pane and the client, or the client's process start cannot be read or changed while it was checked | run the client directly from the pane's shell |
+| `lock` | another command held the agent lock for 15 s | retry; if it keeps happening, look for a stuck `mux-agent` process |
+| `state` | the state or lock folder is unsafe or unreadable: a link, a file, another owner, a mode other than 700, an extended ACL, shared with other users, or a folder above it writable by others; or `HOME` or `MUX_AGENTS_STATE` is not an absolute path | fix the folder or variable the message names |
+| `launch` | the agent's pane was created but the agent did not start; the message says whether its pane was closed | check that the client starts by hand in that folder, close a pane left open, then spawn again |
+| `rmux` | a tmux or rmux call failed or answered out of its format | retry; check that the tmux or rmux server still runs |
+| `sidebar` | a pane carries the side-bar label but cannot be proven the bar, a new bar did not start this plugin's watch, or a bar could not be closed | follow the message: close the pane it names with `kill-pane -t <pane>`, or clear its label |
+| `usage` | a bad verb, flag or value; an empty or too long task or status; a message larger than 64 KB; free text on an agent's command line; a task, brief or body file that cannot be read, is too large or is not UTF-8; `watch` outside a terminal | follow the usage line in the message; agents pass free text in files |
+| `internal` | an unexpected error: an I/O error (only its kind is shown), a state file that is not JSON or larger than 1 MB, or a panic | retry; if it repeats, open an issue with the reply |
 
 ## How it works
 

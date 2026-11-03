@@ -146,6 +146,20 @@ copilot plugin marketplace update mux-agents && copilot plugin update mux-agents
 | `policy` | 调用者没有以绕过权限或全部允许的方式运行；对 Claude Code，`reason` 指明哪一半未通过：`transcript: no session id`、`transcript: not found`、`transcript: no mode`、`transcript: other mode`、`screen: unreadable`、`screen: no mode line` 或 `screen: other mode` | Claude Code：绕过权限（`--dangerously-skip-permissions` 或 Shift+Tab），并让页脚标记 `⏵⏵ bypass permissions on` 出现在窗格的最后 8 行内；Copilot CLI：`--allow-all` |
 | `cap` | 此会话中已有 6 个存活代理 | `stop` 其中一个 |
 | `tagged` | 代理尝试启动代理、打开侧边栏或设置 `placement` | 只有顶层聊天可以启动代理 |
+| `flags` | 从代理到窗格之间的某个 `claude` 或 `copilot` 进程带有允许列表之外的标志，或其命令行无法读取 | 只用允许列表中的标志重新启动客户端 |
+| `directory` | 无法从调用者的会话或进程确认其启动目录，或该目录不是一个存在的绝对路径文件夹 | 在一个存在的文件夹中启动客户端，并留在该文件夹 |
+| `name` | `-Name` 不是以字母开头的 1-24 个小写字母、数字或连字符，是 `parent`、`root` 或 `all`，或在此会话中已被占用；或某个代理记录无法读取，因而无法检查名字 | 使用消息建议的空闲名字或另选一个；记录无法读取时，检查状态文件夹中该代理的文件夹 |
+| `brief` | 代理调用者启动的子代理从简报而不是对话分叉开始（`-NoFork`、另一种客户端、没有会话 id、非交互式的 Claude Code，或 Copilot CLI 会话复制失败），却没有传 `-BriefFile` | 传入 `-BriefFile`，写明子代理需要的上下文 |
+| `target` | 没有存活代理叫这个名字、接收者不是此会话的存活窗格、代理的窗格已不再运行它自己的启动命令，或 `status` 来自一个不是代理的窗格 | 用 `list` 核对名字；只有代理报告 `status` |
+| `parent` | 从不是代理的窗格执行 `send parent`、代理停止不是它启动的代理，或代理窗格的记录缺失或无法证明在此运行 | 按名字发送给代理；只有父代理或人类可以停止代理 |
+| `caller` | 窗格与客户端之间运行着 shell 以外的进程，或客户端进程的启动时间无法读取或在检查期间发生了变化 | 直接从窗格的 shell 运行客户端 |
+| `lock` | 另一个命令持有代理锁达 15 秒 | 重试；若反复出现，查找卡住的 `mux-agent` 进程 |
+| `state` | 状态文件夹或锁文件夹不安全或无法读取：是链接、是文件、属于其他用户、权限不是 700、有扩展 ACL、与其他用户共享，或其上层文件夹可被他人写入；或 `HOME`、`MUX_AGENTS_STATE` 不是绝对路径 | 修正消息指出的文件夹或变量 |
+| `launch` | 代理的窗格已创建，但代理没有启动；消息会说明其窗格是否已关闭 | 先确认客户端能在该文件夹中手动启动，关闭留下的窗格，再重新启动代理 |
+| `rmux` | 一次 tmux 或 rmux 调用失败，或回答不符合格式 | 重试；确认 tmux 或 rmux 服务器仍在运行 |
+| `sidebar` | 某个窗格带有侧边栏标签却无法证明是侧边栏、新侧边栏没有启动本插件的 watch，或侧边栏无法关闭 | 按消息处理：用 `kill-pane -t <pane>` 关闭它指出的窗格，或清除其标签 |
+| `usage` | 动词、标志或值有误；任务或状态为空或过长；消息大于 64 KB；代理在命令行上传自由文本；任务、简报或正文文件无法读取、过大或不是 UTF-8；在终端之外运行 `watch` | 按消息中的用法行改正；代理用文件传自由文本 |
+| `internal` | 意外错误：I/O 错误（只显示其类型）、状态文件不是 JSON 或大于 1 MB，或程序 panic | 重试；若反复出现，附上回复提交 issue |
 
 ## 工作原理
 
