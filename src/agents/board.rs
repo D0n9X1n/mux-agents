@@ -116,7 +116,8 @@ pub fn board(ctx: &Ctx, caller: &Caller, all: bool, watch: bool) -> Res<Map<Stri
     Ok(reply)
 }
 
-const ENDED_MAX: usize = 10;
+/// Ended agents a board (`list -All`) shows, newest first.
+pub(crate) const ENDED_MAX: usize = 10;
 const ENDED: [&str; 3] = ["exited", "stopped", "lost"];
 
 /// The newest ended agent named `name` of the caller's session that is not live, as (id, record, state): any of

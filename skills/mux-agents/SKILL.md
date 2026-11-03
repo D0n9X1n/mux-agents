@@ -72,7 +72,7 @@ The commands below, and the Reply and Listen lines, run as-is in the Bash tool. 
 - `policy`: the caller's live policy is unreadable or is neither bypass nor allow-all. For Claude Code, `reason` says whether the transcript or the screen failed and why (for example `screen: no mode line`).
 - `flags`: a flag outside the allowlist, or an unreadable command line, on any `claude` or `copilot` process from the agent up to the pane.
 - `directory`: the caller's launch directory cannot be confirmed.
-- `tagged`: a spawn or a side bar from an agent pane; children cannot spawn or open the side bar.
+- `tagged`: a spawn, a side bar or `placement` from an agent pane; children cannot spawn, open the side bar or choose where agents open.
 - `cap`: 6 live agents in the session.
 - `name`: a bad or taken name.
-- Other check names: `brief`, `target`, `parent`, `endpoint`, `state`, `lock`, `caller`, `usage` and `internal`.
+- Other check names: `brief`, `target`, `parent`, `endpoint`, `state`, `lock`, `caller`, `launch`, `rmux`, `sidebar`, `usage` and `internal`.
