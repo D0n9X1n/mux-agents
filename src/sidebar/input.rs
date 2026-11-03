@@ -192,11 +192,21 @@ mod unix {
             Ok(())
         }
 
-        /// Arms the handler, then installs it for each of `SIGNALS`, keeping the actions it replaces.
+        /// Arms the handler, then installs it for each of `SIGNALS`, keeping the actions it replaces. A signal ignored
+        /// when `watch` started (SIGHUP under nohup) is left ignored: it would not have ended the process either.
         fn arm(&mut self) -> io::Result<()> {
             ARMED.store(true, Ordering::Release);
             for (signal, old) in SIGNALS.into_iter().zip(&mut self.old) {
                 // SAFETY: a zeroed sigaction is a valid value (empty mask, no flags) to fill in.
+                let mut current: libc::sigaction = unsafe { std::mem::zeroed() };
+                // SAFETY: a null new action only reads the current one into `current`.
+                if unsafe { libc::sigaction(signal, std::ptr::null(), &mut current) } != 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                if current.sa_sigaction == libc::SIG_IGN {
+                    continue;
+                }
+                // SAFETY: as above, for the action to install.
                 let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
                 action.sa_sigaction = on_signal as extern "C" fn(libc::c_int) as libc::sighandler_t;
                 // SAFETY: as above, for the old action sigaction fills in.
@@ -257,14 +267,17 @@ mod unix {
         }
 
         /// Waits up to `timeout`, by the real time and not `clock`, for bytes: a signal mid-wait keeps waiting to the
-        /// same deadline. EOF, or a hang-up or error without bytes, is `Closed`.
+        /// same deadline. A zero timeout still polls once, so bytes already waiting are read. EOF, or a hang-up or
+        /// error without bytes, is `Closed`.
         fn poll_read(&mut self, _clock: &dyn Clock, timeout: Duration) -> io::Result<Waited> {
             let deadline = Instant::now() + timeout;
+            let mut polled = false;
             loop {
                 let left = deadline.saturating_duration_since(Instant::now());
-                if left.is_zero() {
+                if left.is_zero() && polled {
                     return Ok(Waited::Timeout);
                 }
+                polled = true;
                 // Rounded up, so poll never wakes early and spins on a deadline less than a millisecond away.
                 let ms = left
                     .as_nanos()
@@ -799,6 +812,44 @@ mod tests {
         let seen = drain(&master, Duration::from_millis(100));
         assert!(find(&seen, DISABLE).is_some(), "{}", seen.escape_ascii());
         assert_eq!(modes(&slave), COOKED, "restored");
+    }
+
+    // A zero wait still reads bytes already waiting (the loop drains input before each frame), and a signal that was
+    // ignored when `watch` started (SIGHUP under nohup) stays ignored while it runs and after.
+    #[cfg(unix)]
+    #[test]
+    fn zero_wait_reads_waiting_bytes_and_ignored_signals_stay_ignored() {
+        let _pty = PTY.lock().unwrap_or_else(|e| e.into_inner());
+        let (master, slave) = pty();
+        let fd = slave.as_raw_fd();
+        let ignored = |signal| {
+            // SAFETY: a zeroed sigaction is a valid value for sigaction to fill in.
+            let mut now: libc::sigaction = unsafe { std::mem::zeroed() };
+            // SAFETY: a null new action only reads the current one into `now`.
+            unsafe { libc::sigaction(signal, std::ptr::null(), &mut now) };
+            now.sa_sigaction == libc::SIG_IGN
+        };
+        // SAFETY: SIG_IGN for SIGHUP is put back to the default below, under `PTY`.
+        unsafe { libc::signal(libc::SIGHUP, libc::SIG_IGN) };
+        let mut input = TermInput::setup(Tty::on(fd, fd)).expect("a pty sets up");
+        assert!(ignored(libc::SIGHUP), "an ignored SIGHUP is left ignored");
+        assert!(!ignored(libc::SIGTERM), "SIGTERM gets the handler");
+        let fakes = Fakes::default();
+        assert_eq!(input.wait(&fakes, Duration::ZERO), Waited::Timeout);
+        // SAFETY: one byte from a valid buffer to the open master.
+        assert_eq!(
+            unsafe { libc::write(master.as_raw_fd(), b"k".as_ptr().cast(), 1) },
+            1
+        );
+        std::thread::sleep(Duration::from_millis(50));
+        assert_eq!(
+            input.wait(&fakes, Duration::ZERO),
+            Waited::Bytes(b"k".to_vec())
+        );
+        drop(input);
+        assert!(ignored(libc::SIGHUP), "still ignored after");
+        // SAFETY: back to the default action, as before this test.
+        unsafe { libc::signal(libc::SIGHUP, libc::SIG_DFL) };
     }
 
     // Each signal, mid-setup or after it, restores the terminal and still ends the process by that signal. The child
