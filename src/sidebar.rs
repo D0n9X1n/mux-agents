@@ -1435,7 +1435,7 @@ fn open(ctx: &Ctx, caller: &Caller) -> Res<(String, String)> {
         created = native(ctx, &[&split[..], &command].concat(), true)?;
     }
     if created.code != 0 {
-        return refuse(1, "rmux", "rmux call failed");
+        return crate::mux::call_failed(ctx);
     }
     let Some((pane, window, pid)) = split_answer(&created.stdout) else {
         return refuse(1, "rmux", "rmux did not name the side-bar pane");
@@ -3977,7 +3977,7 @@ mod tests {
         );
         w.fakes
             .mux_first(READ_RECORD.trim_start_matches("-N "), 1, "", "no server");
-        assert_eq!(run(&w, &[]), "1 rmux rmux call failed");
+        assert_eq!(run(&w, &[]), "1 rmux tmux call failed");
         assert_eq!(count(&w, "list-panes"), 0);
     }
 
@@ -4107,7 +4107,7 @@ mod tests {
                     ..Mux::default()
                 },
             );
-            assert_eq!(run(&w, &[]), "1 rmux rmux call failed", "{stderr}");
+            assert_eq!(run(&w, &[]), "1 rmux tmux call failed", "{stderr}");
             assert_eq!((count(&w, "split-window"), count(&w, "set-option")), (1, 0));
         }
         let (w, _) = sidebar_world(
@@ -4117,8 +4117,18 @@ mod tests {
                 ..Mux::default()
             },
         );
-        assert_eq!(run(&w, &[]), "1 rmux rmux call failed");
+        assert_eq!(run(&w, &[]), "1 rmux tmux call failed");
         assert_eq!((count(&w, "split-window"), count(&w, "set-option")), (2, 0));
+        // The message names the multiplexer that ran the split; the check stays `rmux`.
+        let (w, _) = sidebar_world(
+            "",
+            Mux {
+                split_error: Some("no space for new pane"),
+                ..Mux::default()
+            },
+        );
+        w.fakes.mux_kind(crate::mux::Kind::Rmux);
+        assert_eq!(run(&w, &[]), "1 rmux rmux call failed");
     }
 
     #[test]
@@ -4308,7 +4318,7 @@ mod tests {
                 ..Mux::default()
             },
         );
-        assert_eq!(ensure_run(&w), "1 rmux rmux call failed");
+        assert_eq!(ensure_run(&w), "1 rmux tmux call failed");
         assert_eq!(roles(&panes), "%1=|,%2=other|");
     }
 

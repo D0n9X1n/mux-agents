@@ -126,15 +126,16 @@ pub fn resolve(ctx: &Ctx) -> Res<Caller> {
             endpoint_refusal(&format!("{name} endpoint did not answer"))
         })?;
     // Compared as numbers: the endpoint's pid is already a number, and leading zeros name the same process.
+    let name = crate::mux::in_use(ctx);
     if probe.server_pid.parse::<u32>().ok() != Some(endpoint.server_pid) {
-        return Err(endpoint_refusal("rmux server changed"));
+        return Err(endpoint_refusal(&format!("{name} server changed")));
     }
     // A restarted server can reuse the socket and pid, so the key includes its exact start.
     let server_start = ctx
         .os
         .open(endpoint.server_pid)
         .map(|opened| opened.start)
-        .ok_or_else(|| endpoint_refusal("rmux server start is unreadable"))?;
+        .ok_or_else(|| endpoint_refusal(&format!("{name} server start is unreadable")))?;
     let server_key = crate::util::sha256_hex(format!(
         "{}|{}|{server_start}",
         endpoint.socket, endpoint.server_pid
@@ -341,6 +342,16 @@ mod tests {
             outcome(run(&other_pane)),
             "1 caller caller is not below its rmux pane"
         );
+        let changed = human_with_probe(0, "901|100|$3|@1|\n");
+        changed.mux_kind(crate::mux::Kind::Rmux);
+        assert_eq!(outcome(run(&changed)), "1 endpoint rmux server changed");
+        let unreadable = human();
+        unreadable.opens(SERVER, &[None]);
+        unreadable.mux_kind(crate::mux::Kind::Rmux);
+        assert_eq!(
+            outcome(run(&unreadable)),
+            "1 endpoint rmux server start is unreadable"
+        );
     }
 
     #[test]
@@ -409,7 +420,7 @@ mod tests {
     #[test]
     fn server_pid_changed_refuses() {
         let fakes = human_with_probe(0, "901|100|$3|@1|\n");
-        assert_eq!(outcome(run(&fakes)), "1 endpoint rmux server changed");
+        assert_eq!(outcome(run(&fakes)), "1 endpoint tmux server changed");
     }
 
     #[test]
@@ -418,7 +429,7 @@ mod tests {
         fakes.opens(SERVER, &[None]);
         assert_eq!(
             outcome(run(&fakes)),
-            "1 endpoint rmux server start is unreadable"
+            "1 endpoint tmux server start is unreadable"
         );
     }
 

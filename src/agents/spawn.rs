@@ -2275,10 +2275,10 @@ mod tests {
         let unknown = crate::sidebar::unproven(&["%13".to_string()]);
         for (case, message) in [
             ("lock", "timed out waiting for the agent lock"),
-            ("option exit", "rmux call failed"),
+            ("option exit", "tmux call failed"),
             ("option throw", "the rmux endpoint did not answer"),
             ("probe", unknown.as_str()),
-            ("open", "rmux call failed"),
+            ("open", "tmux call failed"),
         ] {
             let (w, open) = bar_on();
             match case {

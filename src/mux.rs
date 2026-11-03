@@ -247,7 +247,7 @@ impl Mux for RealMux {
         argv.extend_from_slice(args);
         crate::spawn::captured(&self.bin, &argv, self.timeout).or_else(|_| {
             let name = self.kind.name();
-            refuse(1, "endpoint", format!("the {name} endpoint did not answer"))
+            refuse(1, "endpoint", format!("{name} endpoint did not answer"))
         })
     }
 
@@ -268,9 +268,15 @@ pub fn native(ctx: &Ctx, args: &[&str], allow_failure: bool) -> Res<Output> {
     let mux = ctx.mux.borrow();
     let out = mux.as_ref().expect("connected above").run(&argv)?;
     if out.code != 0 && !allow_failure {
-        return refuse(1, "rmux", "rmux call failed");
+        return call_failed(ctx);
     }
     Ok(out)
+}
+
+/// 1 `rmux` for a call that ran and failed. The check keeps its name, part of the reply contract; the message names
+/// the multiplexer in use.
+pub fn call_failed<T>(ctx: &Ctx) -> Res<T> {
+    refuse(1, "rmux", format!("{} call failed", in_use(ctx)))
 }
 
 #[cfg(test)]
@@ -745,9 +751,10 @@ fn main() {
             split(&listed.stdout),
             [argv(&["-S", SOCKET, "-N", "display-message", "-p", "x"])]
         );
+        // The check keeps its name `rmux`; the message names the binary that ran.
         assert_eq!(
             refusal(native(&ctx, &["fail"], false)),
-            (1, "rmux", "rmux call failed".into())
+            (1, "rmux", "tmux call failed".into())
         );
         assert_eq!(native(&ctx, &["fail"], true).unwrap().code, 3);
         assert!(ctx.mux.borrow().is_some());
@@ -783,6 +790,9 @@ fn main() {
         let fakes = Fakes::default();
         fakes.mux_rule("kill-pane", 1, "", "SECRET");
         let ctx = fakes.ctx();
+        let refused = refusal(native(&ctx, &["kill-pane", "-t", "%9"], false));
+        assert_eq!(refused, (1, "rmux", "tmux call failed".into()));
+        fakes.mux_kind(Kind::Rmux);
         let refused = refusal(native(&ctx, &["kill-pane", "-t", "%9"], false));
         assert_eq!(refused, (1, "rmux", "rmux call failed".into()));
         assert_eq!(
@@ -857,7 +867,7 @@ fn main() {
             let ctx = ctx_for(&fakes, Some(&bin), var, "");
             let mut mux = RealMux::connect(&ctx).unwrap();
             mux.timeout = Duration::from_millis(200);
-            let did_not_answer = (1, "endpoint", format!("the {name} endpoint did not answer"));
+            let did_not_answer = (1, "endpoint", format!("{name} endpoint did not answer"));
             assert_eq!(refusal(mux.run(&["-N", "slow"])), did_not_answer);
             // A binary that is gone by the call answers nothing either.
             std::fs::remove_file(&bin).unwrap();

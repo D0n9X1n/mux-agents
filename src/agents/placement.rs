@@ -140,7 +140,7 @@ mod tests {
             call(&w, &["placement"]),
             (
                 1,
-                r#"{"ok":false,"verb":"placement","code":1,"check":"rmux","message":"rmux call failed"}"#
+                r#"{"ok":false,"verb":"placement","code":1,"check":"rmux","message":"tmux call failed"}"#
                     .into()
             )
         );
