@@ -249,6 +249,20 @@ pub fn parse(args: &[String]) -> Res<(&'static VerbDef, Request)> {
     Ok((def, request))
 }
 
+/// Whether `tokens` ask for `-Text` as `parse` reads them: a value flag's next token is its value (a body of
+/// `-Text` is a body), and a token `parse` would refuse is passed over so a later `-Text` still counts.
+fn wants_text(def: &VerbDef, tokens: &[String]) -> bool {
+    let mut tokens = tokens.iter();
+    while let Some(token) = tokens.next() {
+        if flag(def.values, token).is_some() {
+            tokens.next();
+        } else if flag(&["Text"], token).is_some() {
+            return true;
+        }
+    }
+    false
+}
+
 fn failure(verb: Option<&str>, refusal: &Refusal) -> Map<String, Value> {
     let mut reply = Map::new();
     reply.insert("ok".into(), false.into());
@@ -284,12 +298,13 @@ fn success(def: &VerbDef, data: Map<String, Value>) -> Map<String, Value> {
 /// Build the providers, parse, run the verb and map the outcome to exit code 0, 1 or 2 and the reply text, never
 /// echoing an error's own text. The providers come first, as in the reference's entry (mux-agent.ps1): one that
 /// cannot be built replies as JSON with no verb, whatever the arguments. `version` alone reads nothing they build, so
-/// it is answered without them. A usage refusal of a known verb names it and honours a `-Text` anywhere among the
-/// tokens; an unknown verb has neither. A panic in the verb is 1 `internal`; unwinding has already released its locks.
+/// it is answered without them. A usage refusal of a known verb names it and honours a `-Text` switch anywhere among
+/// the tokens (`wants_text`); an unknown verb has neither. A panic in the verb is 1 `internal`; unwinding has already
+/// released its locks.
 pub fn run<C: Borrow<Ctx>>(args: &[String], ctx: impl FnOnce() -> Res<C>) -> (u8, String) {
     let verb = named(args);
     let refused = |refusal| {
-        let text = verb.is_some() && args[1..].iter().any(|a| flag(&["Text"], a).is_some());
+        let text = verb.is_some_and(|def| wants_text(def, &args[1..]));
         (verb, text, false, Err(refusal))
     };
     let (def, text, color, outcome) = match (verb, parse(args)) {
@@ -1214,6 +1229,22 @@ mod tests {
                 "{out}"
             );
         }
+        // `-Text` given as a value (a message body) is that value, never the switch: the refusal stays JSON.
+        for tokens in [
+            &["send", "-Body", "-Text"][..],
+            &["send", "alice", "-Body", "-Text", "-Bogus"],
+            &["send", "-Bogus", "alice", "-Body", "-text"],
+        ] {
+            let (code, out) = call(&w, tokens);
+            assert_eq!(code, 2, "{tokens:?}");
+            assert!(
+                out.starts_with(r#"{"ok":false,"verb":"send","code":2,"check":"usage""#),
+                "{tokens:?}: {out}"
+            );
+        }
+        // A switch after a value still counts.
+        let (_, out) = call(&w, &["send", "alice", "-Body", "hi", "-Bogus", "-Text"]);
+        assert!(out.starts_with("code: 2\ncheck: usage\n"), "{out}");
     }
 
     #[test]
