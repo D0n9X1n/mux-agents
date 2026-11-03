@@ -7,7 +7,7 @@ use std::time::{Duration, SystemTime};
 
 use serde_json::{Map, Value};
 
-use crate::agents::board::board;
+use crate::agents::board::{ENDED_MAX, board};
 use crate::agents::spawn::{pane_env, utf8};
 use crate::agents::{lock, lock_key, pane_id, text};
 use crate::caller::{Caller, resolve};
@@ -519,7 +519,13 @@ fn assemble(parts: &Parts, shape: &Shape, cols: usize) -> Vec<Row> {
     ended.extend(parts.ended[..shape.ended].iter().cloned());
     let more = parts.ended_more + parts.ended.len() - shape.ended;
     if more > 0 && shape.folded {
-        ended.push(indented(&format!("+{more} more  (list -All)"), cols));
+        // Only promise `list -All` when it shows every ended agent: it shows the newest ENDED_MAX.
+        let text = if more + shape.ended <= ENDED_MAX {
+            format!("+{more} more  (list -All)")
+        } else {
+            format!("+{more} more ended")
+        };
+        ended.push(indented(&text, cols));
     }
     if !ended.is_empty() {
         blocks.push(ended);
@@ -1660,7 +1666,7 @@ mod tests {
                 " No agents running.".to_string(),
             ]
         );
-        // 12 ended, of which the feed carries 10: `12 ended`, 3 rows, `+9 more`.
+        // 12 ended, of which the feed carries 10: `12 ended`, 3 rows, `+9 more ended` (list -All shows only 10).
         let rows: Vec<Value> = (0..10)
             .map(|n| json!({"name": format!("a{n}"), "state": "stopped", "age": 60}))
             .collect();
@@ -1673,7 +1679,7 @@ mod tests {
                 pad("- a0", "stopped   1m"),
                 pad("- a1", "stopped   1m"),
                 pad("- a2", "stopped   1m"),
-                "   +9 more  (list -All)".to_string()
+                "   +9 more ended".to_string()
             ]
         );
         // A board never read.
@@ -1685,6 +1691,38 @@ mod tests {
                 " refresh failed".to_string()
             ]
         );
+    }
+
+    #[test]
+    fn layout_promises_list_all_only_for_rows_it_shows() {
+        // `list -All` shows the 10 newest ended agents: `+K more  (list -All)` only when all of them are there.
+        let ended = |total: usize| {
+            let rows: Vec<Value> = (0..total.min(10))
+                .map(|n| json!({"name": format!("a{n}"), "state": "stopped", "age": 60}))
+                .collect();
+            json!({"running": 0, "endedTotal": total, "agents": rows})
+        };
+        let last = |board: &Value| plain(board, W40).last().cloned().unwrap();
+        assert_eq!(last(&ended(4)), "   +1 more  (list -All)");
+        assert_eq!(last(&ended(10)), "   +7 more  (list -All)");
+        assert_eq!(last(&ended(11)), "   +8 more ended");
+        // Fewer rows fit: the rows the bar drops are still among the 10.
+        let short = plain(
+            &ended(10),
+            Size {
+                width: 40,
+                height: 3,
+            },
+        );
+        assert_eq!(short.last().unwrap(), "   +10 more  (list -All)");
+        let short = plain(
+            &ended(11),
+            Size {
+                width: 40,
+                height: 3,
+            },
+        );
+        assert_eq!(short.last().unwrap(), "   +11 more ended");
     }
 
     #[test]
