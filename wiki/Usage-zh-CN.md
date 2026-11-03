@@ -141,7 +141,7 @@ copilot plugin marketplace update mux-agents && copilot plugin update mux-agents
 | 检查 | 含义 | 处理办法 |
 |---|---|---|
 | `entry` | 没有适用于此操作系统和架构的 `mux-agent` 二进制文件 | 从插件市场重新安装插件，或按上文从源码构建 |
-| `endpoint` | 不在多路复用器窗格中，或 tmux 低于 3.2、rmux 低于 0.10 | 在 tmux 3.2+ 或 rmux 0.10+ 中启动客户端 |
+| `endpoint` | 不在多路复用器窗格中、tmux 低于 3.2 或 rmux 低于 0.10、服务器没有应答，或服务器在此窗格启动后重启过 | 在 tmux 3.2+ 或 rmux 0.10+ 中启动客户端；服务器重启后，在新窗格中重新启动客户端 |
 | `sandbox` | 调用者在沙箱中运行（`SANDBOX_RUNTIME=1`、macOS 沙箱、Linux `NoNewPrivs`、受限的 Windows 令牌） | 在沙箱外运行客户端 |
 | `policy` | 调用者没有以绕过权限或全部允许的方式运行；对 Claude Code，`reason` 指明哪一半未通过：`transcript: no session id`、`transcript: not found`、`transcript: no mode`、`transcript: other mode`、`screen: unreadable`、`screen: no mode line` 或 `screen: other mode` | Claude Code：绕过权限（`--dangerously-skip-permissions` 或 Shift+Tab），并让页脚标记 `⏵⏵ bypass permissions on` 出现在窗格的最后 8 行内；Copilot CLI：`--allow-all` |
 | `cap` | 此会话中已有 6 个存活代理 | `stop` 其中一个 |

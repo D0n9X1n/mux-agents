@@ -141,7 +141,7 @@ Every refusal is one JSON line with `check` naming the cause:
 | check | what it means | what to do |
 |---|---|---|
 | `entry` | no `mux-agent` binary for this OS and architecture | reinstall the plugin from the marketplace, or build from source as above |
-| `endpoint` | not inside a multiplexer pane, or tmux older than 3.2 or rmux older than 0.10 | start the client inside tmux 3.2+ or rmux 0.10+ |
+| `endpoint` | not inside a multiplexer pane, tmux older than 3.2 or rmux older than 0.10, a server that did not answer, or a server restarted since this pane started | start the client inside tmux 3.2+ or rmux 0.10+; after a server restart, start the client again in a new pane |
 | `sandbox` | the caller runs in a sandbox (`SANDBOX_RUNTIME=1`, a macOS sandbox, Linux `NoNewPrivs`, a restricted Windows token) | run the client outside the sandbox |
 | `policy` | the caller is not in bypass or allow-all; for Claude Code, `reason` says which half failed: `transcript: no session id`, `transcript: not found`, `transcript: no mode`, `transcript: other mode`, `screen: unreadable`, `screen: no mode line` or `screen: other mode` | Claude Code: bypass permissions (`--dangerously-skip-permissions` or Shift+Tab), with the footer badge `⏵⏵ bypass permissions on` in the pane's last 8 rows; Copilot CLI: `--allow-all` |
 | `cap` | 6 agents already live in this session | `stop` one |

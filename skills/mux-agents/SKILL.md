@@ -75,4 +75,4 @@ The commands below, and the Reply and Listen lines, run as-is in the Bash tool. 
 - `tagged`: a spawn, a side bar or `placement` from an agent pane; children cannot spawn, open the side bar or choose where agents open.
 - `cap`: 6 live agents in the session.
 - `name`: a bad or taken name.
-- Other check names: `brief`, `target`, `parent`, `endpoint`, `state`, `lock`, `caller`, `usage` and `internal`.
+- Other check names: `brief`, `target`, `parent`, `endpoint`, `state`, `lock`, `caller`, `launch`, `rmux`, `sidebar`, `usage` and `internal`.
