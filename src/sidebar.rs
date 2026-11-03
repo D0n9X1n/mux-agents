@@ -173,6 +173,7 @@ const ENDED_SHOWN: usize = 3;
 const PLAIN: Style = Style {
     bold: false,
     dim: false,
+    reverse: false,
     color: None,
 };
 const BOLD: Style = Style {
