@@ -159,7 +159,44 @@ pub static VERBS: &[VerbDef] = &[
         handler: crate::sidebar::watch,
         text: json::lines,
     },
+    VerbDef {
+        name: "version",
+        values: &[],
+        switches: &[],
+        min: 0,
+        max: 0,
+        usage: "usage: mux-agent version [-Text]",
+        handler: version,
+        text: version_text,
+    },
 ];
+
+/// This binary's version. `run` answers it before any provider is built, so it reads no multiplexer, state root or
+/// caller and passes no sandbox check; the handler serves the table's shape only.
+fn version(_: &Ctx, _: &Request) -> Res<Map<String, Value>> {
+    Ok(version_data())
+}
+
+fn version_data() -> Map<String, Value> {
+    let mut data = Map::new();
+    data.insert("version".into(), env!("CARGO_PKG_VERSION").into());
+    data
+}
+
+fn version_text(reply: &Map<String, Value>, _color: bool) -> String {
+    format!("version {}", reply["version"].as_str().unwrap_or_default())
+}
+
+/// The verb the first token names, in any case; `--version` is `version`.
+fn named(args: &[String]) -> Option<&'static VerbDef> {
+    let first = args.first()?;
+    let name = if first.eq_ignore_ascii_case("--version") {
+        "version"
+    } else {
+        first
+    };
+    VERBS.iter().find(|d| d.name.eq_ignore_ascii_case(name))
+}
 
 fn flag<'a>(names: &[&'a str], token: &str) -> Option<&'a str> {
     let name = token.strip_prefix('-')?;
@@ -169,10 +206,7 @@ fn flag<'a>(names: &[&'a str], token: &str) -> Option<&'a str> {
 /// `<verb>`, then `-Value <next token, whatever it looks like>`, `-Switch` and positionals; `-Text` is a
 /// switch of every verb.
 pub fn parse(args: &[String]) -> Res<(&'static VerbDef, Request)> {
-    let Some(def) = args
-        .first()
-        .and_then(|v| VERBS.iter().find(|d| d.name.eq_ignore_ascii_case(v)))
-    else {
+    let Some(def) = named(args) else {
         let mut names: Vec<_> = VERBS.iter().map(|d| d.name).collect();
         names.sort_unstable();
         return refuse(
@@ -215,6 +249,20 @@ pub fn parse(args: &[String]) -> Res<(&'static VerbDef, Request)> {
     Ok((def, request))
 }
 
+/// Whether `tokens` ask for `-Text` as `parse` reads them: a value flag's next token is its value (a body of
+/// `-Text` is a body), and a token `parse` would refuse is passed over so a later `-Text` still counts.
+fn wants_text(def: &VerbDef, tokens: &[String]) -> bool {
+    let mut tokens = tokens.iter();
+    while let Some(token) = tokens.next() {
+        if flag(def.values, token).is_some() {
+            tokens.next();
+        } else if flag(&["Text"], token).is_some() {
+            return true;
+        }
+    }
+    false
+}
+
 fn failure(verb: Option<&str>, refusal: &Refusal) -> Map<String, Value> {
     let mut reply = Map::new();
     reply.insert("ok".into(), false.into());
@@ -236,30 +284,51 @@ fn dispatch(def: &VerbDef, request: &Request, ctx: &Ctx) -> Res<Map<String, Valu
     // Every public verb refuses a sandboxed caller before any multiplexer call (MuxAgents.ps1:94).
     crate::sandbox::assert_unsandboxed(ctx)?;
     let data = (def.handler)(ctx, request)?;
+    Ok(success(def, data))
+}
+
+fn success(def: &VerbDef, data: Map<String, Value>) -> Map<String, Value> {
     let mut reply = Map::new();
     reply.insert("ok".into(), true.into());
     reply.insert("verb".into(), def.name.into());
     reply.extend(data);
-    Ok(reply)
+    reply
 }
 
 /// Build the providers, parse, run the verb and map the outcome to exit code 0, 1 or 2 and the reply text, never
 /// echoing an error's own text. The providers come first, as in the reference's entry (mux-agent.ps1): one that
-/// cannot be built replies as JSON with no verb, whatever the arguments. A panic in the verb is 1 `internal`;
-/// unwinding has already released its locks.
+/// cannot be built replies as JSON with no verb, whatever the arguments. `version` alone reads nothing they build, so
+/// it is answered without them. A usage refusal of a known verb names it and honours a `-Text` switch anywhere among
+/// the tokens (`wants_text`); an unknown verb has neither. A panic in the verb is 1 `internal`; unwinding has already
+/// released its locks.
 pub fn run<C: Borrow<Ctx>>(args: &[String], ctx: impl FnOnce() -> Res<C>) -> (u8, String) {
-    let (def, text, color, outcome) = match ctx() {
-        Err(refusal) => (None, false, false, Err(refusal)),
-        Ok(ctx) => match parse(args) {
+    let verb = named(args);
+    let refused = |refusal| {
+        let text = verb.is_some_and(|def| wants_text(def, &args[1..]));
+        (verb, text, false, Err(refusal))
+    };
+    let (def, text, color, outcome) = match (verb, parse(args)) {
+        (Some(def), Ok((_, request))) if def.name == "version" => (
+            Some(def),
+            request.text,
+            false,
+            Ok(success(def, version_data())),
+        ),
+        (Some(def), Err(refusal)) if def.name == "version" => refused(refusal),
+        (_, parsed) => match ctx() {
             Err(refusal) => (None, false, false, Err(refusal)),
-            Ok((def, request)) => {
-                let outcome =
-                    panic::catch_unwind(AssertUnwindSafe(|| dispatch(def, &request, ctx.borrow())))
-                        .unwrap_or_else(|_| refuse(1, "internal", "unexpected error (panic)"));
-                let ctx = ctx.borrow();
-                let color = crate::paint::color_on(&ctx.env, ctx.tty);
-                (Some(def), request.text, color, outcome)
-            }
+            Ok(ctx) => match parsed {
+                Err(refusal) => refused(refusal),
+                Ok((def, request)) => {
+                    let outcome = panic::catch_unwind(AssertUnwindSafe(|| {
+                        dispatch(def, &request, ctx.borrow())
+                    }))
+                    .unwrap_or_else(|_| refuse(1, "internal", "unexpected error (panic)"));
+                    let ctx = ctx.borrow();
+                    let color = crate::paint::color_on(&ctx.env, ctx.tty);
+                    (Some(def), request.text, color, outcome)
+                }
+            },
         },
     };
     let (code, reply, lines, color): (u8, _, Text, bool) = match outcome {
@@ -421,7 +490,8 @@ mod tests {
                 "stop",
                 "status",
                 "sidebar",
-                "watch"
+                "watch",
+                "version"
             ]
         );
         for name in names {
@@ -448,6 +518,7 @@ mod tests {
             ("status", 0, 0),
             ("sidebar", 0, 0),
             ("watch", 0, 0),
+            ("version", 0, 0),
         ];
         assert_eq!(bounds.len(), VERBS.len());
         let pos = ["p1", "p2", "p3"];
@@ -493,6 +564,7 @@ mod tests {
             "status" => vec!["status", "-BodyFile", "s.md"],
             "sidebar" => vec!["sidebar"],
             "watch" => vec!["watch"],
+            "version" => vec!["version"],
             other => panic!("no valid call for {other}"),
         }
     }
@@ -509,6 +581,12 @@ mod tests {
                 w.fakes.clear_log();
                 w.fakes.signals(signals.clone());
                 let (code, out) = call(&w, &valid_call(def.name));
+                // version reads nothing a sandbox could hide, so it answers before any check.
+                if def.name == "version" {
+                    assert_eq!(code, 0, "{out}");
+                    assert!(w.fakes.events().is_empty(), "{:?}", w.fakes.events());
+                    continue;
+                }
                 let want = format!(
                     r#"{{"ok":false,"verb":"{}","code":2,"check":"sandbox","message":"{message}"}}"#,
                     def.name
@@ -1115,6 +1193,101 @@ mod tests {
         // JSON is never colored.
         w.ctx.tty = true;
         assert!(!call(&w, &["list", "-All"]).1.contains('\u{1b}'));
+    }
+
+    #[test]
+    fn usage_refusal_keeps_a_known_verb_and_its_text() {
+        let w = World::human("");
+        let list = "usage: mux-agent list [-All] [-Text]";
+        assert_eq!(
+            call(&w, &["LIST", "-Bogus"]),
+            (
+                2,
+                format!(
+                    r#"{{"ok":false,"verb":"list","code":2,"check":"usage","message":"{list}"}}"#
+                )
+            )
+        );
+        // -Text anywhere among the tokens, even after the one refused.
+        for tokens in [
+            &["list", "-Bogus", "-Text"][..],
+            &["list", "-text", "-Bogus"],
+            &["list", "x", "-TEXT"],
+        ] {
+            assert_eq!(
+                call(&w, tokens),
+                (2, format!("code: 2\ncheck: usage\nmessage: {list}")),
+                "{tokens:?}"
+            );
+        }
+        // An unknown or missing verb has no usage line of its own: no verb, and JSON whatever -Text says.
+        for tokens in [&["bogus", "-Text"][..], &["-Text"], &[]] {
+            let (code, out) = call(&w, tokens);
+            assert_eq!(code, 2, "{tokens:?}");
+            assert!(
+                out.starts_with(r#"{"ok":false,"verb":null,"code":2,"check":"usage""#),
+                "{out}"
+            );
+        }
+        // `-Text` given as a value (a message body) is that value, never the switch: the refusal stays JSON.
+        for tokens in [
+            &["send", "-Body", "-Text"][..],
+            &["send", "alice", "-Body", "-Text", "-Bogus"],
+            &["send", "-Bogus", "alice", "-Body", "-text"],
+        ] {
+            let (code, out) = call(&w, tokens);
+            assert_eq!(code, 2, "{tokens:?}");
+            assert!(
+                out.starts_with(r#"{"ok":false,"verb":"send","code":2,"check":"usage""#),
+                "{tokens:?}: {out}"
+            );
+        }
+        // A switch after a value still counts.
+        let (_, out) = call(&w, &["send", "alice", "-Body", "hi", "-Bogus", "-Text"]);
+        assert!(out.starts_with("code: 2\ncheck: usage\n"), "{out}");
+    }
+
+    #[test]
+    fn version_needs_no_providers() {
+        // The providers are never built: a state root that cannot be built does not stop it.
+        let no_ctx = || refuse::<Ctx>(1, "state", "MUX_AGENTS_STATE is not an absolute path");
+        let version = env!("CARGO_PKG_VERSION");
+        let json = format!(r#"{{"ok":true,"verb":"version","version":"{version}"}}"#);
+        for tokens in [
+            &["version"][..],
+            &["VERSION"],
+            &["--version"],
+            &["--Version"],
+        ] {
+            assert_eq!(run(&args(tokens), no_ctx), (0, json.clone()), "{tokens:?}");
+        }
+        for tokens in [&["version", "-Text"][..], &["--version", "-text"]] {
+            assert_eq!(
+                run(&args(tokens), no_ctx),
+                (0, format!("version {version}")),
+                "{tokens:?}"
+            );
+        }
+        assert_eq!(
+            run(&args(&["version", "x"]), no_ctx),
+            (
+                2,
+                r#"{"ok":false,"verb":"version","code":2,"check":"usage","message":"usage: mux-agent version [-Text]"}"#
+                    .to_string()
+            )
+        );
+        // Any other verb still builds the providers first.
+        assert_eq!(
+            run(&args(&["list"]), no_ctx),
+            (
+                1,
+                r#"{"ok":false,"verb":null,"code":1,"check":"state","message":"MUX_AGENTS_STATE is not an absolute path"}"#
+                    .to_string()
+            )
+        );
+        // The generic usage line lists it.
+        let w = World::human("");
+        assert!(call(&w, &["bogus"]).1.contains("|stop|version|watch>"));
     }
 
     #[test]

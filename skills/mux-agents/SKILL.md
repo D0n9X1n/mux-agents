@@ -46,6 +46,7 @@ The commands below, and the Reply and Listen lines, run as-is in the Bash tool. 
 "<entry>" stop <name>
 "<entry>" sidebar
 "<entry>" sidebar -Close
+"<entry>" version
 ```
 
 `spawn` opens where `placement` says (a new window by default), titled with the agent's name. It also takes `-Split h|v` or `-Tab` (this spawn only, over the placement) and `-NoFork`. Pass `-Model <model>` (for example `sonnet`, `opus` or `sonnet[1m]`) only when the user names a model; without it the agent uses its client's default.
