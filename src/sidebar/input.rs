@@ -112,6 +112,8 @@ mod unix {
 
     /// The handler for `SIGNALS`: puts the saved mode back and turns mouse reports off, then ends the process by
     /// the same signal under its default action. Only async-signal-safe calls (tcsetattr, write, signal, raise).
+    /// A hang-up writes nothing: the terminal is going away, and rmux, closing the pane, no longer reaps a process
+    /// that writes to it then (it is left a zombie).
     extern "C" fn on_signal(signal: libc::c_int) {
         if ARMED.load(Ordering::Acquire) {
             let input = IN_FD.load(Ordering::Relaxed);
@@ -120,7 +122,9 @@ mod unix {
             // A failed call is ignored: the process ends either way.
             unsafe {
                 libc::tcsetattr(input, libc::TCSANOW, (*SAVED.0.get()).as_ptr());
-                libc::write(output, DISABLE.as_ptr().cast(), DISABLE.len());
+                if signal != libc::SIGHUP {
+                    libc::write(output, DISABLE.as_ptr().cast(), DISABLE.len());
+                }
             }
         }
         // SAFETY: back to the default action, then raised again: the signal stays blocked until this handler
@@ -1257,15 +1261,22 @@ mod tests {
                     Some(signal),
                     "{case}: {status:?} {seen_text}"
                 );
-                let disable = find(&seen, DISABLE)
-                    .unwrap_or_else(|| panic!("{case}: no DISABLE in {seen_text}"));
                 let enable = find(&seen, ENABLE);
                 match when {
-                    "after-setup" => assert!(
-                        enable.is_some_and(|enable| enable < disable),
-                        "{case}: {seen_text}"
-                    ),
+                    "after-setup" => assert!(enable.is_some(), "{case}: {seen_text}"),
                     _ => assert_eq!(enable, None, "{case}: {seen_text}"),
+                }
+                // A hang-up means the terminal is gone: nothing is written to it.
+                let disable = find(&seen, DISABLE);
+                if signal == libc::SIGHUP {
+                    assert_eq!(disable, None, "{case}: {seen_text}");
+                } else {
+                    let disable =
+                        disable.unwrap_or_else(|| panic!("{case}: no DISABLE in {seen_text}"));
+                    assert!(
+                        enable.is_none_or(|enable| enable < disable),
+                        "{case}: {seen_text}"
+                    );
                 }
                 assert_eq!(modes(&slave), COOKED, "{case}: restored");
             }
