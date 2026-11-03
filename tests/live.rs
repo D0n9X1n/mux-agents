@@ -406,17 +406,68 @@ exec claude --dangerously-skip-permissions
             );
             let bar = s(&open["pane"]).to_string();
             self.wait_place(&bar, "the bar to open in place");
-            let log = self.frames_path(&bar);
-            let pipe = format!("cat >> {}", support::quote(log.to_str().unwrap()));
-            self.call(&["pipe-pane", "-o", "-t", &bar, &pipe]);
+            self.log_frames(&bar);
             bar
+        }
+
+        /// Pipes the bar's output to `<dir>/frames.<n>`, so `frames` counts its redraws from here.
+        fn log_frames(&self, bar: &str) {
+            let log = self.frames_path(bar);
+            let pipe = format!("cat >> {}", support::quote(log.to_str().unwrap()));
+            self.call(&["pipe-pane", "-o", "-t", bar, &pipe]);
+        }
+
+        /// A left click on column 3 of the bar's row `y` (1-based), as the bar's pane gets it with SGR mouse
+        /// reporting: the press, then the release.
+        fn press(&self, bar: &str, y: usize) {
+            for end in ['M', 'm'] {
+                self.call(&["send-keys", "-t", bar, "-l", &format!("\x1b[<0;3;{y}{end}")]);
+            }
+        }
+
+        /// The 1-based line of the bar's screen whose second token is `name`: that agent's name line.
+        fn row_of(&self, bar: &str, name: &str) -> usize {
+            let screen = self.call(&["capture-pane", "-p", "-t", bar]);
+            row_at(&screen, name)
+                .unwrap_or_else(|| panic!("{:?}: no row for {name}:\n{screen}", self.mux()))
+        }
+
+        /// Returns just after a redraw of the bar: its next tick is about 1.9 s away.
+        fn after_redraw(&self, bar: &str) {
+            let n = self.frames(bar);
+            self.server
+                .wait("a redraw", || (self.frames(bar) > n).then_some(()));
+            std::thread::sleep(Duration::from_millis(100));
+        }
+
+        /// The active pane of the session's active window.
+        fn focused(&self) -> String {
+            self.panes("#{pane_id}|#{window_active}|#{pane_active}")
+                .iter()
+                .filter(|r| r.ends_with("|1|1"))
+                .map(|r| r.split('|').next().unwrap().to_string())
+                .collect::<Vec<_>>()
+                .join(",")
+        }
+
+        /// Clicks are off with MUX_AGENTS_ASCII=1: a scenario that clicks asserts the server does not set it.
+        fn assert_not_ascii(&self) {
+            let out = self
+                .server
+                .try_call(&["show-environment", "-g", "MUX_AGENTS_ASCII"]);
+            let shown = String::from_utf8_lossy(&out.stdout);
+            assert!(
+                !out.status.success() || shown.starts_with('-'),
+                "{:?}: MUX_AGENTS_ASCII is set: {shown}",
+                self.mux()
+            );
         }
 
         fn frames_path(&self, bar: &str) -> PathBuf {
             self.dir.join(format!("frames.{}", &bar[1..]))
         }
 
-        /// The bar's redraws since `open_bar`: each frame starts with synchronized output on and home (S2.8).
+        /// The bar's redraws since `log_frames`: each frame starts with synchronized output on and home (S2.8).
         fn frames(&self, bar: &str) -> usize {
             std::fs::read(self.frames_path(bar)).map_or(0, |bytes| {
                 bytes
@@ -3189,6 +3240,228 @@ exec claude --dangerously-skip-permissions
         assert_eq!(exit_messages(&live, &w1).len(), 1, "{mux:?}");
     }
 
+    /// The 1-based line of `screen` whose second token is `name`: that agent's name line (`◉`/`◌`, then the name).
+    fn row_at(screen: &str, name: &str) -> Option<usize> {
+        screen
+            .lines()
+            .position(|l| l.split_whitespace().nth(1) == Some(name))
+            .map(|i| i + 1)
+    }
+
+    /// #61: with clicks on (no MUX_AGENTS_ASCII), `w1` and `w2` spawned and both drawn on the bar, its frames logged
+    /// and the root pane active; answers the bar and w1's pane.
+    fn two_rows(live: &mut Live) -> (String, String) {
+        live.assert_not_ascii();
+        let w1 = live.spawn("w1", &[]);
+        let w2 = live.spawn("w2", &[]);
+        let bar = s(&w1["sidebar"]).to_string();
+        live.worker_pid(&w1);
+        live.worker_pid(&w2);
+        live.log_frames(&bar);
+        let mut screen = String::new();
+        let drawn = eventually(Duration::from_secs(30), || {
+            screen = live.call(&["capture-pane", "-p", "-t", &bar]);
+            row_at(&screen, "w1").is_some() && row_at(&screen, "w2").is_some()
+        });
+        assert!(drawn, "{:?}: the bar shows:\n{screen}", live.mux());
+        assert_eq!(live.focused(), live.server.pane(), "{:?}", live.mux());
+        (bar, s(&w1["pane"]).to_string())
+    }
+
+    /// Waits up to 10 s for `pane` to be the session's active pane.
+    fn wait_focused(live: &Live, pane: &str, what: &str) {
+        let mut now = String::new();
+        let moved = eventually(Duration::from_secs(10), || {
+            now = live.focused();
+            now == pane
+        });
+        assert!(
+            moved,
+            "{:?}: {what}: the active pane is {now}, not {pane}",
+            live.mux()
+        );
+    }
+
+    // #61: a left click on an agent's name line focuses that agent's pane, and the bar keeps redrawing after it.
+    fn bar_click_focuses_an_agent(mux: Mux) {
+        let Some(mut live) = Live::human(mux) else {
+            return;
+        };
+        let (bar, p1) = two_rows(&mut live);
+        live.after_redraw(&bar);
+        let y = live.row_of(&bar, "w1");
+        live.press(&bar, y);
+        wait_focused(&live, &p1, "a click on w1's row");
+        live.wait_tick(&bar);
+    }
+
+    // #61: `j` selects the first agent and Enter focuses it.
+    fn bar_keys_focus_an_agent(mux: Mux) {
+        let Some(mut live) = Live::human(mux) else {
+            return;
+        };
+        let (bar, p1) = two_rows(&mut live);
+        live.after_redraw(&bar);
+        live.call(&["send-keys", "-t", &bar, "-l", "j"]);
+        live.call(&["send-keys", "-t", &bar, "Enter"]);
+        wait_focused(&live, &p1, "j then Enter");
+    }
+
+    // #61: a press read after the bar shrank, before it drew at its new size, may land on a row that moved: it is
+    // dropped and the bar redraws at once (well before its next tick, ~1.9 s away). Nothing is focused.
+    fn bar_click_after_shrinking_does_nothing(mux: Mux) {
+        let Some(mut live) = Live::human(mux) else {
+            return;
+        };
+        let (bar, _) = two_rows(&mut live);
+        let root = live.server.pane().to_string();
+        let width = live.field(&bar, "#{pane_width}");
+        let mut attempt = 1;
+        let n = loop {
+            let y = live.row_of(&bar, "w1");
+            live.after_redraw(&bar);
+            let n = live.frames(&bar);
+            live.call(&["resize-pane", "-t", &bar, "-x", "15"]);
+            live.press(&bar, y);
+            // A tick redraw fell between the resize and the press: try again from the bar's own width.
+            if live.frames(&bar) < n + 2 {
+                break n;
+            }
+            assert!(attempt < 3, "{mux:?}: a tick fell before the press 3 times");
+            attempt += 1;
+            live.call(&["resize-pane", "-t", &bar, "-x", &width]);
+            live.wait_place(&bar, "the bar back at its width");
+        };
+        let mut seen = n;
+        let redrew = eventually(Duration::from_millis(500), || {
+            seen = live.frames(&bar);
+            seen > n
+        });
+        assert!(
+            redrew,
+            "{mux:?}: no redraw within 500 ms of the press ({n} -> {seen} frames)"
+        );
+        assert_eq!(live.focused(), root, "{mux:?}: the dropped press focused");
+    }
+
+    /// A real tmux client attached to a session on a 120x40 pty, the master drained by a thread; killed on drop.
+    struct Client {
+        child: std::process::Child,
+        master: std::fs::File,
+    }
+
+    impl Client {
+        fn attach(live: &Live, session: &str) -> Client {
+            use std::io::Read;
+            use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+            use std::os::unix::process::CommandExt;
+            use std::process::Stdio;
+
+            // SAFETY: each call takes the descriptor `posix_openpt` just returned, or the name `ptsname` returned
+            // for it, read before any other call (no other thread of this binary calls `ptsname`).
+            let (master, slave) = unsafe {
+                let master = libc::posix_openpt(libc::O_RDWR | libc::O_NOCTTY);
+                assert!(
+                    master >= 0,
+                    "posix_openpt: {}",
+                    std::io::Error::last_os_error()
+                );
+                let master = OwnedFd::from_raw_fd(master);
+                let fd = master.as_raw_fd();
+                assert_eq!(libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC), 0);
+                assert_eq!(libc::grantpt(fd), 0, "grantpt");
+                assert_eq!(libc::unlockpt(fd), 0, "unlockpt");
+                let name = libc::ptsname(fd);
+                assert!(!name.is_null(), "ptsname");
+                let slave = libc::open(name, libc::O_RDWR | libc::O_NOCTTY | libc::O_CLOEXEC);
+                assert!(
+                    slave >= 0,
+                    "open slave: {}",
+                    std::io::Error::last_os_error()
+                );
+                (master, OwnedFd::from_raw_fd(slave))
+            };
+            let size = libc::winsize {
+                ws_row: 40,
+                ws_col: 120,
+                ws_xpixel: 0,
+                ws_ypixel: 0,
+            };
+            // SAFETY: `size` is valid for the call.
+            let set = unsafe { libc::ioctl(slave.as_raw_fd(), libc::TIOCSWINSZ as _, &size) };
+            assert_eq!(set, 0, "TIOCSWINSZ: {}", std::io::Error::last_os_error());
+            let mut attach = Command::new(live.server.binary());
+            attach
+                .arg("-S")
+                .arg(live.server.socket())
+                .args(["attach", "-t", session])
+                .env_clear()
+                .env("TERM", "xterm-256color")
+                .env("HOME", live.dir.join("home"))
+                .stdin(Stdio::from(slave.try_clone().unwrap()))
+                .stdout(Stdio::from(slave.try_clone().unwrap()))
+                .stderr(Stdio::from(slave));
+            if let Some(lang) = std::env::var_os("LANG") {
+                attach.env("LANG", lang);
+            }
+            // SAFETY: the hook only calls setsid and ioctl, both async-signal-safe: the pty becomes the client's
+            // controlling terminal.
+            unsafe {
+                attach.pre_exec(|| {
+                    if libc::setsid() < 0 || libc::ioctl(0, libc::TIOCSCTTY as _, 0) < 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    Ok(())
+                });
+            }
+            let child = attach.spawn().unwrap();
+            let master = std::fs::File::from(master);
+            let mut drain = master.try_clone().unwrap();
+            std::thread::spawn(move || {
+                let mut buf = [0u8; 4096];
+                while matches!(drain.read(&mut buf), Ok(n) if n > 0) {}
+            });
+            Client { child, master }
+        }
+
+        /// Bytes typed on the client's terminal.
+        fn write(&mut self, bytes: &[u8]) {
+            self.master.write_all(bytes).unwrap();
+        }
+    }
+
+    impl Drop for Client {
+        fn drop(&mut self) {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+    }
+
+    // #61 through a real client: tmux 3.8 attached on a 120x40 terminal with `mouse on` hands a click on w1's name
+    // line to the bar, which focuses w1.
+    fn bar_real_client_click_focuses(mux: Mux) {
+        let Some(mut live) = Live::human(mux) else {
+            return;
+        };
+        let (bar, p1) = two_rows(&mut live);
+        let session = live.field(live.server.pane(), "#{session_id}");
+        let mut client = Client::attach(&live, &session);
+        live.server.wait("the client to attach", || {
+            (!live.call(&["list-clients"]).trim().is_empty()).then_some(())
+        });
+        live.call(&["set-option", "-g", "mouse", "on"]);
+        live.wait_place(&bar, "the bar in place at the client's size");
+        live.after_redraw(&bar);
+        let y = live.row_of(&bar, "w1");
+        let left: usize = live.num(&bar, "#{pane_left}");
+        let top: usize = live.num(&bar, "#{pane_top}");
+        for end in ['M', 'm'] {
+            client.write(format!("\x1b[<0;{};{}{end}", left + 3, top + y).as_bytes());
+        }
+        wait_focused(&live, &p1, "a real client's click on w1's row");
+        drop(client);
+    }
+
     // remain-on-exit keeps an ended agent's pane dead: list kills it by the one conditional and posts no second
     // notice. The conditional keeps a dead pane retagged since and a live pane with the agent's tag.
     fn dead_pane_closed_by_one_conditional(mux: Mux) {
@@ -3448,6 +3721,9 @@ exec claude --dangerously-skip-permissions
                     bar_keeps_its_header_with_emoji_sequences,
                     dead_pane_closed_by_one_conditional,
                     rotated_window_reaches_each_agent_by_its_pane,
+                    bar_click_focuses_an_agent,
+                    bar_keys_focus_an_agent,
+                    bar_click_after_shrinking_does_nothing,
                 ]
             );
         };
@@ -3469,6 +3745,7 @@ exec claude --dangerously-skip-permissions
             zoomed_window_left_alone,
             children_are_only_mux_and_client,
             panic_in_lock_frees_lock,
+            bar_real_client_click_focuses,
         ]
     );
 }

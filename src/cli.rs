@@ -942,9 +942,13 @@ mod tests {
             .mux_rule("#{pane_dead}|#{pane_pid}", 0, "%1|@1|0|4242\n", "");
         w.fakes.clear_log();
         let request = w.request(&["watch"]);
-        let reply = crate::sidebar::watch_on(&w.ctx, &request, true, &mut |_| {
-            Err(std::io::Error::other("closed"))
-        })
+        let reply = crate::sidebar::watch_on(
+            &w.ctx,
+            &request,
+            true,
+            &|| Box::new(crate::sidebar::input::NoInput),
+            &mut |_| Err(std::io::Error::other("closed")),
+        )
         .unwrap();
         assert_eq!(reply["ended"], "output-closed");
         got.push_str(&render(&w, "watch, one frame"));

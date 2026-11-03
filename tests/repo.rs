@@ -1035,13 +1035,13 @@ fn hook_line_ok(line: &str) -> bool {
 }
 
 #[test]
-fn plugin_version_is_0_2_4_and_matches_cargo() {
-    assert_eq!(json_file(".claude-plugin/plugin.json")["version"], "0.2.4");
-    assert_eq!(cargo_version(), "0.2.4");
+fn plugin_version_is_0_2_5_and_matches_cargo() {
+    assert_eq!(json_file(".claude-plugin/plugin.json")["version"], "0.2.5");
+    assert_eq!(cargo_version(), "0.2.5");
     let lock = repo_file("Cargo.lock").replace("\r\n", "\n");
     assert!(
-        lock.contains("name = \"mux-agent\"\nversion = \"0.2.4\"\n"),
-        "Cargo.lock does not hold mux-agent 0.2.4"
+        lock.contains("name = \"mux-agent\"\nversion = \"0.2.5\"\n"),
+        "Cargo.lock does not hold mux-agent 0.2.5"
     );
 }
 
@@ -2301,4 +2301,27 @@ fn readme_upgrade_lifecycle() {
             assert!(lines.contains(&want), "{page} lacks the line {want}");
         }
     }
+}
+
+#[test]
+fn usage_documents_side_bar_clicks() {
+    // One line of the Side bar section says how a click or a key focuses an agent (#61), and the Chinese twin's
+    // section has a line with the same code spans.
+    let en = section(&wiki_text("Usage"), "Side bar");
+    let zh = section(&wiki_text("Usage-zh-CN"), "侧边栏");
+    let line = en
+        .iter()
+        .find(|l| l.contains("`mouse on`"))
+        .unwrap_or_else(|| panic!("## Side bar does not name `mouse on`: {en:#?}"));
+    for needle in ["`focus failed: ", "`MUX_AGENTS_ASCII=1`"] {
+        assert!(
+            line.contains(needle),
+            "the click line lacks {needle}: {line}"
+        );
+    }
+    let spans = spans_and_numbers(line);
+    assert!(
+        zh.iter().any(|l| spans_and_numbers(l) == spans),
+        "## 侧边栏 has no line with the spans {spans:?}"
+    );
 }

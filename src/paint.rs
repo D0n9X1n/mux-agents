@@ -35,11 +35,12 @@ pub fn clean(text: &str) -> String {
         .collect()
 }
 
-/// An SGR style: bold, dim and one of the 16 named colors.
+/// An SGR style: bold, dim, reverse video (the side bar's selected name) and one of the 16 named colors.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Style {
     pub bold: bool,
     pub dim: bool,
+    pub reverse: bool,
     pub color: Option<Color>,
 }
 
@@ -63,6 +64,9 @@ pub fn paint(text: &str, style: Style, color: bool) -> String {
     }
     if style.dim {
         codes.push("2");
+    }
+    if style.reverse {
+        codes.push("7");
     }
     if let Some(c) = style.color {
         codes.push(match c {
@@ -234,6 +238,32 @@ mod tests {
         assert!(!ascii(&env(&[("MUX_AGENTS_ASCII", "0")])));
         assert!(!ascii(&env(&[("MUX_AGENTS_ASCII", "")])));
         assert!(!ascii(&env(&[])));
+    }
+
+    #[test]
+    fn paint_reverse() {
+        let reverse = Style {
+            reverse: true,
+            ..Style::default()
+        };
+        let selected = Style {
+            bold: true,
+            reverse: true,
+            color: Some(Color::Blue),
+            ..Style::default()
+        };
+        assert_eq!(paint("x", reverse, true), "\u{1b}[7mx\u{1b}[0m");
+        assert_eq!(paint("x", selected, true), "\u{1b}[1;7;34mx\u{1b}[0m");
+        // Dim comes before reverse.
+        let dim = Style {
+            dim: true,
+            reverse: true,
+            ..Style::default()
+        };
+        assert_eq!(paint("x", dim, true), "\u{1b}[2;7mx\u{1b}[0m");
+        // No color, no SGR: the selection is not drawn reversed.
+        assert_eq!(paint("x", reverse, false), "x");
+        assert_eq!(paint("x", selected, false), "x");
     }
 
     #[test]

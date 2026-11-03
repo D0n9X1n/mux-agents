@@ -1,6 +1,10 @@
 //! The side bar (MuxAgents.ps1:1423-1591): `sidebar [-Close]` opens or closes one bar per session running
 //! `<abs binary> watch`, and `watch` draws the session's board in it until its pane closes.
 
+pub(crate) mod input;
+mod keys;
+mod pick;
+
 use std::cmp::Reverse;
 use std::io;
 use std::time::{Duration, SystemTime};
@@ -9,6 +13,7 @@ use serde_json::{Map, Value};
 
 use crate::agents::board::{ENDED_MAX, board};
 use crate::agents::spawn::{pane_env, utf8};
+use crate::agents::view::focus_pane;
 use crate::agents::{lock, lock_key, pane_id, text};
 use crate::caller::{Caller, resolve};
 use crate::cli::Request;
@@ -16,8 +21,13 @@ use crate::ctx::{Ctx, Env};
 use crate::error::{Res, refuse};
 use crate::mux::{Output, native};
 use crate::paint::{self, Color, Style};
+use input::{Input, NoInput, Waited};
+use keys::{Decoder, Event};
+use pick::{Act, Pick, Target};
 
 const TICK: Duration = Duration::from_millis(2000);
+// How long a lone ESC may wait for the rest of a sequence before it counts as the Esc key.
+const ESC_WAIT: Duration = Duration::from_millis(50);
 // A minute of ticks with no answer from the multiplexer: a write to a pipe whose reader closed can still succeed.
 const UNKNOWN_MAX: u32 = 30;
 // The bar's own pane, its label and its size, read each tick (S2.1: the layout follows the actual pane).
@@ -169,6 +179,7 @@ const ENDED_SHOWN: usize = 3;
 const PLAIN: Style = Style {
     bold: false,
     dim: false,
+    reverse: false,
     color: None,
 };
 const BOLD: Style = Style {
@@ -182,6 +193,13 @@ const BADGE: Style = Style {
     ..PLAIN
 };
 const MAIL: &str = "\u{2709}";
+const HINT: &str = "Enter: focus  Esc: clear";
+
+/// Agent-supplied text as drawn: '◉' and '◌' become '•' (all one column under unicode-width 0.2.3), so only the
+/// bar's own glyph starts a name line.
+fn own_glyphs(text: &str) -> String {
+    text.replace(['\u{25c9}', '\u{25cc}'], "\u{2022}")
+}
 
 const fn hued(color: Color) -> Style {
     Style {
@@ -316,11 +334,27 @@ fn indented(text: &str, cols: usize) -> Row {
     vec![span("   ", PLAIN), span(paint::cut(text, cols - 2), DIM)]
 }
 
-/// One live agent: its line, its doing line and its age (the oldest drop first).
+/// One live agent: its line, its doing line, its age (the oldest drop first) and what focusing it needs.
 struct Live {
     line: Row,
     doing: Option<Row>,
     age: Option<i64>,
+    target: Target,
+}
+
+/// The rows as drawn, and each drawn running agent with its name line's row, top to bottom.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct Laid {
+    pub rows: Vec<Row>,
+    pub agents: Vec<(Target, usize)>,
+}
+
+/// The drawn running agents, top to bottom (for keys).
+fn targets(laid: &Laid) -> Vec<Target> {
+    laid.agents
+        .iter()
+        .map(|(target, _)| target.clone())
+        .collect()
 }
 
 /// The rows a board can draw, before the height decides which are kept.
@@ -360,7 +394,7 @@ fn live_row(row: &Map<String, Value>, cols: usize, look: Look) -> Live {
         row.get("color").and_then(Value::as_str),
         &name,
     ));
-    let model = clean(row.get("model"));
+    let model = own_glyphs(&clean(row.get("model")));
     let model = if model.is_empty() {
         Vec::new()
     } else {
@@ -381,7 +415,7 @@ fn live_row(row: &Map<String, Value>, cols: usize, look: Look) -> Live {
     let line = agent_line(
         span(kind.glyph(look.ascii), kind.style()),
         span(
-            name,
+            own_glyphs(&name),
             Style {
                 color: hue,
                 ..PLAIN
@@ -392,12 +426,16 @@ fn live_row(row: &Map<String, Value>, cols: usize, look: Look) -> Live {
         right(kind, word, &format_age(row.get("age"))),
         cols,
     );
-    let doing = clean(row.get("doing"));
+    let doing = own_glyphs(&clean(row.get("doing")));
     let doing = doing.trim();
     Live {
         line: margin(line),
         doing: (!doing.is_empty()).then(|| indented(doing, cols)),
         age: row.get("age").and_then(Value::as_i64),
+        target: Target {
+            name,
+            pane: clean(row.get("pane")),
+        },
     }
 }
 
@@ -418,10 +456,15 @@ fn header(counts: &str, cols: usize) -> Row {
     ])
 }
 
-fn parts(board: Option<&Map<String, Value>>, notes: &[&str], cols: usize, look: Look) -> Parts {
+fn parts(
+    board: Option<&Map<String, Value>>,
+    notes: &[(&str, Style)],
+    cols: usize,
+    look: Look,
+) -> Parts {
     let notes = notes
         .iter()
-        .map(|note| margin(vec![span(paint::cut(note, cols), DIM)]))
+        .map(|(note, style)| margin(vec![span(paint::cut(&own_glyphs(note), cols), *style)]))
         .collect();
     let Some(board) = board else {
         return Parts {
@@ -460,7 +503,7 @@ fn parts(board: Option<&Map<String, Value>>, notes: &[&str], cols: usize, look: 
         };
         let line = agent_line(
             span(kind.glyph(look.ascii), kind.style()),
-            span(clean(row.get("name")), DIM),
+            span(own_glyphs(&clean(row.get("name"))), DIM),
             Vec::new(),
             Vec::new(),
             right(kind, &word, &format_age(row.get("age"))),
@@ -486,9 +529,11 @@ fn parts(board: Option<&Map<String, Value>>, notes: &[&str], cols: usize, look: 
 }
 
 /// The kept parts as rows: blocks (header, each live agent, `+J more running`, `No agents running.`, the ended
-/// section, the notes) with a blank line between the first `gaps` pairs of them.
-fn assemble(parts: &Parts, shape: &Shape, cols: usize) -> Vec<Row> {
+/// section, the notes) with a blank line between the first `gaps` pairs of them; each shown live agent with its row.
+fn assemble(parts: &Parts, shape: &Shape, cols: usize) -> Laid {
     let mut blocks: Vec<Vec<Row>> = vec![vec![parts.header.clone()]];
+    // The block each shown live agent heads.
+    let mut heads = Vec::new();
     for (at, live) in parts.live.iter().enumerate() {
         if !shape.shown[at] {
             continue;
@@ -497,6 +542,7 @@ fn assemble(parts: &Parts, shape: &Shape, cols: usize) -> Vec<Row> {
         if let Some(doing) = live.doing.as_ref().filter(|_| shape.doing[at]) {
             block.push(doing.clone());
         }
+        heads.push((blocks.len(), &live.target));
         blocks.push(block);
     }
     let hidden = shape.shown.iter().filter(|shown| !**shown).count();
@@ -534,13 +580,17 @@ fn assemble(parts: &Parts, shape: &Shape, cols: usize) -> Vec<Row> {
         blocks.push(parts.notes[..shape.notes].to_vec());
     }
     let mut rows = Vec::new();
+    let mut agents = Vec::new();
     for (at, block) in blocks.into_iter().enumerate() {
         if at > 0 && at <= shape.gaps {
             rows.push(Vec::new());
         }
+        if let Some((_, target)) = heads.iter().find(|(head, _)| *head == at) {
+            agents.push(((*target).clone(), rows.len()));
+        }
         rows.extend(block);
     }
-    rows
+    Laid { rows, agents }
 }
 
 /// Drops the next part in S2.1's overflow order: blank lines (the lowest first), ended rows (folded into `+K more`),
@@ -596,9 +646,34 @@ fn drop_one(parts: &Parts, shape: &mut Shape) -> bool {
 /// (one column is left free at the right, so no row ends in a pending wrap). Under 12 columns, the header only.
 /// `None` is a board never read: the header says `? running`.
 fn layout(board: Option<&Map<String, Value>>, notes: &[&str], size: Size, look: Look) -> Vec<Row> {
+    let notes: Vec<(&str, Style)> = notes.iter().map(|note| (*note, DIM)).collect();
+    lay(board, &notes, size, look).rows
+}
+
+/// `layout` with each note in its own style, and the drawn running agents with their rows.
+fn lay(
+    board: Option<&Map<String, Value>>,
+    notes: &[(&str, Style)],
+    size: Size,
+    look: Look,
+) -> Laid {
+    lay_notes(board, notes, size, look).0
+}
+
+/// `lay`, and how many of the notes it kept.
+fn lay_notes(
+    board: Option<&Map<String, Value>>,
+    notes: &[(&str, Style)],
+    size: Size,
+    look: Look,
+) -> (Laid, usize) {
     if size.width < 12 {
         let max = size.width.saturating_sub(1).max(1);
-        return vec![cut_row(vec![span("mux-agents", BOLD)], max)];
+        let laid = Laid {
+            rows: vec![cut_row(vec![span("mux-agents", BOLD)], max)],
+            agents: Vec::new(),
+        };
+        return (laid, 0);
     }
     let cols = size.width - 2;
     let parts = parts(board, notes, cols, look);
@@ -615,14 +690,61 @@ fn layout(board: Option<&Map<String, Value>>, notes: &[&str], size: Size, look: 
     };
     shape.gaps = usize::MAX;
     shape.gaps = assemble(&parts, &shape, cols)
+        .rows
         .iter()
         .filter(|row| row.is_empty())
         .count();
     loop {
-        let mut rows = assemble(&parts, &shape, cols);
-        if rows.len() <= size.height || !drop_one(&parts, &mut shape) {
-            rows.truncate(size.height.max(1));
-            return rows;
+        let mut laid = assemble(&parts, &shape, cols);
+        if laid.rows.len() <= size.height || !drop_one(&parts, &mut shape) {
+            laid.rows.truncate(size.height.max(1));
+            let kept = laid.rows.len();
+            laid.agents.retain(|(_, row)| *row < kept);
+            return (laid, shape.notes);
+        }
+    }
+}
+
+/// `lay` with `HINT` as the last note, only when it costs nothing else: the hinted rows are exactly the bare rows,
+/// then the hint's own rows (the hint alone when the bare rows end in notes, else a blank row and the hint).
+/// Otherwise the bare layout, so the hint goes before any other row or gap.
+fn with_hint(
+    board: Option<&Map<String, Value>>,
+    notes: &[(&str, Style)],
+    size: Size,
+    look: Look,
+) -> Laid {
+    let (bare, kept) = lay_notes(board, notes, size, look);
+    let mut hinted_notes = notes.to_vec();
+    hinted_notes.push((HINT, DIM));
+    let hinted = lay(board, &hinted_notes, size, look);
+    let hint = margin(vec![span(
+        paint::cut(HINT, size.width.saturating_sub(2)),
+        DIM,
+    )]);
+    let own = if kept > 0 {
+        vec![hint]
+    } else {
+        vec![Row::new(), hint]
+    };
+    let n = bare.rows.len();
+    let fits = hinted.rows.len() == n + own.len()
+        && hinted.rows[..n] == bare.rows[..]
+        && hinted.rows[n..] == own[..];
+    if fits { hinted } else { bare }
+}
+
+/// Marks `name`'s drawn row as selected: its margin becomes `▸` (`>` in ASCII) and, with color, the rest of the row
+/// is reversed. Nothing when `name` is not drawn.
+fn mark(laid: &mut Laid, name: &str, look: Look) {
+    let Some(&(_, at)) = laid.agents.iter().find(|(target, _)| target.name == name) else {
+        return;
+    };
+    let row = &mut laid.rows[at];
+    row[0] = span(if look.ascii { ">" } else { "\u{25b8}" }, PLAIN);
+    if look.color {
+        for (_, style) in &mut row[1..] {
+            style.reverse = true;
         }
     }
 }
@@ -942,22 +1064,30 @@ fn read_size(ctx: &Ctx, bar: &str) -> Option<Size> {
 /// The side-bar loop for the caller's pane. Each tick asks the pane itself (and its size) and, when it answers,
 /// keeps it at the right edge of its window (`Keeper`; by its own pane, not its tag, since rmux 0.10.0's
 /// rotate-window leaves pane options behind), reads the board (ended rows with their exit codes, waiting and the
-/// parent's unread), lays it out at the pane's size (and `layout: repair paused` while repair is paused), writes the
-/// frame, then sleeps 2 s. Ends `pane-closed` when the probe answers gone, `output-closed` when a write fails and
-/// `probe-failed` after 30 unknown probes in a row. A failed board read still draws the last board marked `refresh
-/// failed`, so a dead terminal is found even when nothing else answers.
+/// parent's unread), lays it out at the pane's size (and `layout: repair paused` while repair is paused, then any
+/// `focus failed` note; the selected agent marked, with the hint when it fits), writes the frame, then reads `input`
+/// until 2 s after that write, acting on each event as it is read (`act`): every event of one read in order, then a
+/// key or left press draws again at once, without counting a tick. A lone ESC is waited on at most 50 ms before it
+/// counts as the key. Ends `pane-closed` when the probe answers gone, `output-closed` when
+/// a write fails, `probe-failed` after 30 unknown probes in a row and `interrupted` on Ctrl-C. A failed board read
+/// still draws the last board marked `refresh failed`, so a dead terminal is found even when nothing else answers.
+/// An input that can no longer be read is dropped, which restores its terminal, and the loop goes on without it;
+/// `input` is owned here, so it is dropped, and its terminal restored, on every return and every unwind.
 pub fn run_watch(
     ctx: &Ctx,
     caller: &Caller,
+    mut input: Box<dyn Input>,
     write: &mut dyn FnMut(&str) -> io::Result<()>,
 ) -> &'static str {
     let own = format!("{}|", caller.pane);
     // watch draws only to a terminal (watch_on refuses otherwise).
     let look = Look::from_env(&ctx.env, true);
+    let mut keys = Decoder::default();
     let mut keeper = Keeper::default();
     let mut last: Option<Map<String, Value>> = None;
     let mut size = FALLBACK;
     let mut unknown = 0;
+    let mut pick = Pick::default();
     loop {
         let probe = native(
             ctx,
@@ -994,39 +1124,188 @@ pub fn run_watch(
             Ok(board) => last = Some(board),
             Err(_) => failed = true,
         }
+        let note = pick.note();
         let mut notes = Vec::new();
         if failed {
-            notes.push("refresh failed");
+            notes.push(("refresh failed", DIM));
         }
         if keeper.paused() {
-            notes.push(PAUSED);
+            notes.push((PAUSED, DIM));
         }
-        let rows = layout(last.as_ref(), &notes, size, look);
-        if write(&frame(&rows, size, look)).is_err() {
+        if let Some(note) = note.as_deref() {
+            notes.push((note, PLAIN));
+        }
+        let bare = lay(last.as_ref(), &notes, size, look);
+        pick.follow(&targets(&bare));
+        let laid = match pick.selected() {
+            Some(name) => {
+                let mut laid = with_hint(last.as_ref(), &notes, size, look);
+                mark(&mut laid, name, look);
+                laid
+            }
+            None => bare,
+        };
+        if write(&frame(&laid.rows, size, look)).is_err() {
             return "output-closed";
         }
-        ctx.clock.sleep(TICK);
+        let shown = Shown {
+            written: ctx.clock.now(),
+            targets: targets(&laid),
+            width: size.width,
+        };
+        loop {
+            let since = ctx
+                .clock
+                .now()
+                .duration_since(shown.written)
+                .unwrap_or(TICK);
+            let left = TICK.saturating_sub(since);
+            if left.is_zero() {
+                pick.ticked();
+                break;
+            }
+            let wait = if keys.lone_esc() {
+                left.min(ESC_WAIT)
+            } else {
+                left
+            };
+            let reads = match input.wait(&*ctx.clock, wait) {
+                Waited::Bytes(bytes) => keys.push(&bytes, ctx.clock.now()),
+                Waited::Timeout => keys.idle(),
+                // The old input is dropped here, which restores its terminal.
+                Waited::Closed => {
+                    input = Box::new(NoInput);
+                    Vec::new()
+                }
+            };
+            let mut redraw = false;
+            for read in reads {
+                if read.event == Event::Interrupt {
+                    return "interrupted";
+                }
+                redraw |= act(ctx, caller, look, read, &mut pick, &shown, last.as_ref());
+            }
+            if redraw {
+                break;
+            }
+        }
     }
 }
 
-/// The side-bar pane's process: draws the board to stdout until its pane closes.
+/// A press read less than this long after a frame was written is dropped: the user may have aimed at the frame
+/// before it.
+const PRESS_GAP: Duration = Duration::from_millis(50);
+
+/// One multiplexer call for the bar's width and its rows, so the rows are read at the width they were drawn at.
+fn click_read(bar: &str) -> [&str; 10] {
+    [
+        "display-message",
+        "-p",
+        "-t",
+        bar,
+        "#{pane_width}",
+        ";",
+        "capture-pane",
+        "-p",
+        "-t",
+        bar,
+    ]
+}
+
+/// The frame on screen: when it was written, the running agents it drew (top to bottom) and its width.
+struct Shown {
+    written: SystemTime,
+    targets: Vec<Target>,
+    width: usize,
+}
+
+/// Acts on one event read while `shown` is on screen; true when the bar must draw again at once. A left press reads
+/// the bar and focuses the running agent on its name line, unless it is ASCII or stale (read less than `PRESS_GAP`
+/// after the frame's write, or begun before it); any left press dismisses the note and draws again. Keys go to
+/// `pick`. A failed focus shows its note. Other buttons and releases do nothing.
+fn act(
+    ctx: &Ctx,
+    caller: &Caller,
+    look: Look,
+    read: keys::Read,
+    pick: &mut Pick,
+    shown: &Shown,
+    board: Option<&Map<String, Value>>,
+) -> bool {
+    match read.event {
+        Event::Press { button: 0, y, .. } => {
+            pick.pressed();
+            let stale = read.first < shown.written + PRESS_GAP;
+            if look.ascii || stale {
+                return true;
+            }
+            if let Some(target) = click(ctx, caller, y, shown.width, board)
+                && focus_pane(ctx, caller, &target.name, Some(&target.pane)).is_err()
+            {
+                pick.failed(&target.name);
+            }
+            true
+        }
+        Event::Press { .. } | Event::Release { .. } | Event::Interrupt => false,
+        Event::Up | Event::Down | Event::Enter | Event::Esc => {
+            match pick.key(read.event, &shown.targets) {
+                Act::Nothing => false,
+                Act::Redraw => true,
+                Act::Focus(target) => {
+                    match focus_pane(ctx, caller, &target.name, Some(&target.pane)) {
+                        Ok(_) => pick.focused(),
+                        Err(_) => pick.failed(&target.name),
+                    }
+                    true
+                }
+            }
+        }
+    }
+}
+
+/// The running agent on row `y` of the bar, read in one call: none unless the call answers, the bar is `width`
+/// columns wide (the frame's width), row `y` is a name line and its name is exactly one running agent on `board`.
+fn click(
+    ctx: &Ctx,
+    caller: &Caller,
+    y: u16,
+    width: usize,
+    board: Option<&Map<String, Value>>,
+) -> Option<Target> {
+    let read = native(ctx, &click_read(&caller.pane), true)
+        .ok()
+        .filter(|read| read.code == 0)?;
+    let name = pick::screen_hit(&read.stdout, width, y)?;
+    pick::resolve(board?, name)
+}
+
+/// The side-bar pane's process: draws the board to stdout until its pane closes, reading its own terminal when
+/// stdin is one too and `TERM` is not `dumb` (`input::open`).
 pub fn watch(ctx: &Ctx, request: &Request) -> Res<Map<String, Value>> {
     use std::io::{IsTerminal, Write};
     let stdout = io::stdout();
     let terminal = stdout.is_terminal();
     let mut out = stdout.lock();
-    watch_on(ctx, request, terminal, &mut |frame| {
-        out.write_all(frame.as_bytes())?;
-        out.flush()
-    })
+    watch_on(
+        ctx,
+        request,
+        terminal,
+        &|| input::open(&ctx.env),
+        &mut |frame| {
+            out.write_all(frame.as_bytes())?;
+            out.flush()
+        },
+    )
 }
 
 /// Refuses unless stdout is a terminal: a terminal whose pane closed fails the next write, but a pipe whose reader
-/// closed may not, and with the pane alive nothing else would end the loop.
+/// closed may not, and with the pane alive nothing else would end the loop. Opens the input only once it draws, so
+/// a refusal leaves the terminal as it was.
 pub(crate) fn watch_on(
     ctx: &Ctx,
     _request: &Request,
     terminal: bool,
+    open: &dyn Fn() -> Box<dyn Input>,
     write: &mut dyn FnMut(&str) -> io::Result<()>,
 ) -> Res<Map<String, Value>> {
     if !terminal {
@@ -1038,7 +1317,7 @@ pub(crate) fn watch_on(
     }
     let caller = resolve(ctx)?;
     console_utf8();
-    let ended = run_watch(ctx, &caller, write);
+    let ended = run_watch(ctx, &caller, open(), write);
     let mut reply = Map::new();
     reply.insert("pane".into(), caller.pane.into());
     reply.insert("ended".into(), ended.into());
@@ -1525,6 +1804,7 @@ fn open(ctx: &Ctx, caller: &Caller) -> Res<(String, String)> {
 
 #[cfg(test)]
 mod tests {
+    use super::input::{DISABLE, ENABLE, FakeTerm, Input, NoInput, TermInput, Waited};
     use super::*;
     use crate::agents::fixture::{ID, World, write};
     use crate::error::refuse;
@@ -2040,6 +2320,451 @@ mod tests {
         assert!(rows.iter().all(|r| r.is_ascii()), "{rows:?}");
     }
 
+    // The mock-up with a pane on each running agent.
+    fn mock_panes() -> Value {
+        let mut board = mock();
+        for (at, pane) in ["%1", "%2", "%3"].into_iter().enumerate() {
+            board["agents"][at]["pane"] = json!(pane);
+        }
+        board
+    }
+
+    fn target(name: &str, pane: &str) -> Target {
+        Target {
+            name: name.into(),
+            pane: pane.into(),
+        }
+    }
+
+    // A line as a pane `w` columns wide shows it: pieces of at most `w` columns, the first its head.
+    fn reflow(line: &str, w: usize) -> Vec<String> {
+        let mut pieces = Vec::new();
+        let mut piece = String::new();
+        for c in line.chars() {
+            if paint::width(&piece) + paint::width(&c.to_string()) > w {
+                pieces.push(std::mem::take(&mut piece));
+            }
+            piece.push(c);
+        }
+        pieces.push(piece);
+        pieces
+    }
+
+    #[test]
+    fn own_glyphs_in_agent_text() {
+        let board = json!({"running": 2, "endedTotal": 1, "agents": [
+            {"name": "worker", "state": "running", "model": "\u{25c9}x", "doing": "\u{25cc} step \u{25c9} two", "age": 5, "unread": 0, "color": "blue", "waiting": false, "pane": "%1"},
+            {"name": "b\u{25c9}t", "state": "running", "model": "\u{25cc}m", "age": 7, "unread": 0, "color": "blue", "waiting": false, "pane": "%2"},
+            {"name": "a\u{25c9}b", "state": "stopped", "exitCode": null, "age": 60}
+        ]});
+        let rows = format_board(board.as_object(), &["note \u{25c9}"], W40, PLAIN_LOOK);
+        assert_eq!(
+            rows,
+            [
+                pad("mux-agents", "2 running / 1 ended"),
+                String::new(),
+                pad("\u{25c9} worker [\u{2022}x]", "working   5s"),
+                "   \u{2022} step \u{2022} two".to_string(),
+                String::new(),
+                pad("\u{25c9} b\u{2022}t [\u{2022}m]", "working   7s"),
+                String::new(),
+                format!(" ended {}", "-".repeat(31)),
+                pad("- a\u{2022}b", "stopped   1m"),
+                String::new(),
+                " note \u{2022}".to_string(),
+            ]
+        );
+        // One column each, as the glyphs they replace: every row keeps its width.
+        for glyph in ["\u{25c9}", "\u{25cc}", "\u{2022}"] {
+            assert_eq!(paint::width(glyph), 1, "{glyph:?}");
+        }
+        assert_eq!(own_glyphs("\u{25c9} a \u{25cc}"), "\u{2022} a \u{2022}");
+        // Only the bar's own glyph starts a name line.
+        let hits: Vec<_> = rows.iter().filter_map(|row| pick::row_hit(row)).collect();
+        assert_eq!(hits, ["worker", "b\u{2022}t"]);
+        // The target keeps the board's name: only the drawn text changes.
+        let notes = [("note \u{25c9}", DIM)];
+        let laid = lay(board.as_object(), &notes, W40, PLAIN_LOOK);
+        assert_eq!(
+            targets(&laid),
+            [target("worker", "%1"), target("b\u{25c9}t", "%2")]
+        );
+    }
+
+    #[test]
+    fn lay_lists_drawn_running_agents() {
+        let board = mock_panes();
+        let laid = lay(board.as_object(), &[], W40, PLAIN_LOOK);
+        assert_eq!(
+            laid.agents,
+            [
+                (target("add-subtract", "%1"), 2),
+                (target("test-calc", "%2"), 5),
+                (target("fix-ci-flake", "%3"), 8),
+            ]
+        );
+        assert_eq!(
+            targets(&laid),
+            [
+                target("add-subtract", "%1"),
+                target("test-calc", "%2"),
+                target("fix-ci-flake", "%3"),
+            ]
+        );
+        assert_eq!(laid.rows, layout(board.as_object(), &[], W40, PLAIN_LOOK));
+        // Four rows: the newest agent, then `+2 more running`, which is no agent.
+        let short = Size {
+            width: 40,
+            height: 4,
+        };
+        let laid = lay(board.as_object(), &[], short, PLAIN_LOOK);
+        assert_eq!(laid.agents, [(target("add-subtract", "%1"), 1)]);
+        assert_eq!(render(&laid.rows[2], false), "   +2 more running");
+        // The header only: under 12 columns, or one row.
+        for size in [
+            Size {
+                width: 11,
+                height: 40,
+            },
+            Size {
+                width: 40,
+                height: 1,
+            },
+            Size {
+                width: 40,
+                height: 0,
+            },
+        ] {
+            let laid = lay(board.as_object(), &[], size, PLAIN_LOOK);
+            assert_eq!(laid.agents, [], "{size:?}");
+        }
+        // Ended agents are never listed.
+        let ended = json!({"running": 0, "endedTotal": 1, "agents": [
+            {"name": "halted", "state": "stopped", "exitCode": null, "age": 60, "pane": "%4"}
+        ]});
+        assert_eq!(lay(ended.as_object(), &[], W40, PLAIN_LOOK).agents, []);
+        assert_eq!(lay(None, &[], W40, PLAIN_LOOK).agents, []);
+    }
+
+    #[test]
+    fn lay_lists_the_agents_overflow_keeps() {
+        // Ages out of board order: overflow drops `old` (900s), then `mid` (60s), and keeps `new` and `last`.
+        let board = json!({"running": 4, "endedTotal": 0, "agents": [
+            {"name": "old", "state": "running", "age": 900, "unread": 0, "color": "blue", "waiting": false, "pane": "%1"},
+            {"name": "new", "state": "running", "age": 5, "unread": 0, "color": "blue", "waiting": false, "pane": "%2"},
+            {"name": "mid", "state": "running", "age": 60, "unread": 0, "color": "blue", "waiting": false, "pane": "%3"},
+            {"name": "last", "state": "running", "age": 30, "unread": 0, "color": "blue", "waiting": false, "pane": "%4"}
+        ]});
+        let size = Size {
+            width: 40,
+            height: 4,
+        };
+        let laid = lay(board.as_object(), &[], size, PLAIN_LOOK);
+        let names: Vec<&str> = laid.agents.iter().map(|(t, _)| t.name.as_str()).collect();
+        let panes: Vec<&str> = laid.agents.iter().map(|(t, _)| t.pane.as_str()).collect();
+        let rows: Vec<usize> = laid.agents.iter().map(|(_, row)| *row).collect();
+        assert_eq!(names, ["new", "last"]);
+        assert_eq!(panes, ["%2", "%4"]);
+        assert_eq!(rows, [1, 2]);
+        assert_eq!(
+            render(&laid.rows[1], false),
+            pad("\u{25c9} new", "working   5s")
+        );
+        assert_eq!(
+            render(&laid.rows[2], false),
+            pad("\u{25c9} last", "working  30s")
+        );
+        assert_eq!(render(&laid.rows[3], false), "   +2 more running");
+    }
+
+    #[test]
+    fn lay_targets_are_cleaned() {
+        // The name and pane are cleaned as every drawn field is: no control reaches the target.
+        let board = json!({"running": 1, "endedTotal": 0, "agents": [
+            {"name": "wo\u{1b}rk\u{7}er\u{85}", "state": "running", "age": 5, "unread": 0, "color": "blue", "waiting": false, "pane": "\u{9b}%7\n\u{7f}"}
+        ]});
+        let laid = lay(board.as_object(), &[], W40, PLAIN_LOOK);
+        assert_eq!(laid.agents, [(target("worker", "%7"), 2)]);
+    }
+
+    #[test]
+    fn lay_keeps_each_notes_style() {
+        let color = Look {
+            color: true,
+            ..PLAIN_LOOK
+        };
+        let notes = [
+            ("plain note", PLAIN),
+            ("dim note", DIM),
+            ("red note", hued(Color::Red)),
+        ];
+        let rows: Vec<String> = lay(None, &notes, W40, color)
+            .rows
+            .iter()
+            .map(|row| render(row, true))
+            .collect();
+        assert_eq!(
+            rows[2..],
+            [
+                " plain note".to_string(),
+                " \u{1b}[2mdim note\u{1b}[0m".to_string(),
+                " \u{1b}[31mred note\u{1b}[0m".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn row_hit_on_real_layout_output() {
+        // Agent text holding the bar's glyphs and its ASCII ones, at offsets that bring them to a piece's head.
+        let text = |lead: &str| format!("{lead}\u{25c9} x  \u{25cc} y  * z  x w  ").repeat(6);
+        let board = json!({"running": 3, "endedTotal": 1, "agents": [
+            {"name": "add-subtract", "state": "running", "model": "\u{25c9} x", "doing": text(""), "age": 42, "unread": 0, "color": "blue", "waiting": false, "pane": "%1"},
+            {"name": "test-calc", "state": "running", "model": "x w", "doing": text("x "), "age": 180, "unread": 1, "color": "magenta", "waiting": true, "pane": "%2"},
+            {"name": "fix-ci-flake", "state": "running", "model": "\u{25cc} y", "doing": text("* z  "), "age": 660, "unread": 0, "color": "bright-blue", "waiting": false, "pane": "%3"},
+            {"name": "\u{25c9} x", "state": "exited", "exitCode": 0, "age": 1080}
+        ]});
+        let notes = ["\u{25c9} x", " \u{25cc} y"];
+        let ascii = Look {
+            ascii: true,
+            ..PLAIN_LOOK
+        };
+        // A hit names a prefix of the agent drawn there (a cut name ends in `...`).
+        let names = |hit: &str, name: &str| name.starts_with(hit.trim_end_matches("..."));
+        let mut hits = 0;
+        for (width, height) in [(40, 40), (40, 8), (30, 24), (18, 24)] {
+            let size = Size { width, height };
+            let styled: Vec<(&str, Style)> = notes.iter().map(|note| (*note, DIM)).collect();
+            let laid = lay(board.as_object(), &styled, size, PLAIN_LOOK);
+            let lines = format_board(board.as_object(), &notes, size, PLAIN_LOOK);
+            assert!(!laid.agents.is_empty(), "{size:?}");
+            // The agent whose name line is row `at`, if any.
+            let owner = |at: usize| {
+                laid.agents
+                    .iter()
+                    .find(|(_, row)| *row == at)
+                    .map(|(target, _)| target.name.as_str())
+            };
+            for (at, line) in lines.iter().enumerate() {
+                match (pick::row_hit(line), owner(at)) {
+                    (Some(hit), Some(name)) => {
+                        assert!(names(hit, name), "{size:?} {at}: {line:?}");
+                        hits += 1;
+                    }
+                    (got, _) => assert_eq!(got, None, "{size:?} {at}: {line:?}"),
+                }
+                for w in [12, 15, 20] {
+                    for (part, piece) in reflow(line, w).iter().enumerate() {
+                        match (pick::row_hit(piece), owner(at).filter(|_| part == 0)) {
+                            (Some(hit), Some(name)) => {
+                                assert!(names(hit, name), "{size:?} w={w} {at}: {piece:?}");
+                            }
+                            (got, _) => assert_eq!(got, None, "{size:?} w={w} {at}: {piece:?}"),
+                        }
+                    }
+                }
+            }
+            for line in format_board(board.as_object(), &notes, size, ascii) {
+                for w in [usize::MAX, 12, 15, 20] {
+                    for piece in reflow(&line, w) {
+                        assert_eq!(
+                            pick::row_hit(&piece),
+                            None,
+                            "{size:?} ascii w={w}: {piece:?}"
+                        );
+                    }
+                }
+            }
+        }
+        // Every size draws its agents' name lines, and each is hit.
+        assert!(hits >= 4, "{hits}");
+    }
+
+    #[test]
+    fn hint_is_dropped_first() {
+        let board = mock_panes();
+        let hint = |height: usize| {
+            let size = Size { width: 40, height };
+            let bare = lay(board.as_object(), &[], size, PLAIN_LOOK);
+            (with_hint(board.as_object(), &[], size, PLAIN_LOOK), bare)
+        };
+        // The mock-up draws 16 rows: with 18, the hint is last, after a blank line.
+        let (hinted, bare) = hint(18);
+        assert_eq!(bare.rows.len(), 16);
+        assert_eq!(hinted.rows[..16], bare.rows[..]);
+        assert_eq!(hinted.rows[16], Row::new());
+        assert_eq!(render(&hinted.rows[17], false), format!(" {HINT}"));
+        assert_eq!(hinted.agents, bare.agents);
+        // One row short: the bar as it is without the hint.
+        let (hinted, bare) = hint(17);
+        assert_eq!(hinted, bare);
+        // One agent at 40x4: a hinted layout could keep the hint by dropping the gap; it is the bare one.
+        let one = json!({"running": 1, "endedTotal": 0, "agents": [
+            {"name": "worker", "state": "running", "doing": "testing", "age": 5, "unread": 0, "color": "blue", "waiting": false, "pane": "%1"}
+        ]});
+        let size = Size {
+            width: 40,
+            height: 4,
+        };
+        let bare = lay(one.as_object(), &[], size, PLAIN_LOOK);
+        assert_eq!(with_hint(one.as_object(), &[], size, PLAIN_LOOK), bare);
+        // At 40x5 a hinted layout keeps every bare row but drops the hint's own blank line: it is the bare one.
+        let size = Size {
+            width: 40,
+            height: 5,
+        };
+        let bare = lay(one.as_object(), &[], size, PLAIN_LOOK);
+        assert_eq!(bare.rows.len(), 4);
+        assert_eq!(with_hint(one.as_object(), &[], size, PLAIN_LOOK), bare);
+        let size = Size {
+            width: 40,
+            height: 6,
+        };
+        let hinted = with_hint(one.as_object(), &[], size, PLAIN_LOOK);
+        assert_eq!(
+            render(hinted.rows.last().unwrap(), false),
+            format!(" {HINT}")
+        );
+    }
+
+    #[test]
+    fn hint_shows_beside_notes() {
+        let one = json!({"running": 1, "endedTotal": 0, "agents": [
+            {"name": "worker", "state": "running", "doing": "testing", "age": 5, "unread": 0, "color": "blue", "waiting": false, "pane": "%1"}
+        ]});
+        let notes = [("refresh failed", DIM)];
+        // The notes block takes the hint as its last row: no blank line inside the block.
+        let bare = lay(one.as_object(), &notes, W40, PLAIN_LOOK);
+        let hinted = with_hint(one.as_object(), &notes, W40, PLAIN_LOOK);
+        assert_eq!(bare.rows.len(), 6);
+        assert_eq!(hinted.rows.len(), 7);
+        assert_eq!(hinted.rows[..6], bare.rows[..]);
+        assert_eq!(render(&hinted.rows[6], false), format!(" {HINT}"));
+        assert_eq!(hinted.agents, bare.agents);
+        // One row short: a hinted layout would drop the gap before the notes; it is the bare one.
+        let size = Size {
+            width: 40,
+            height: 6,
+        };
+        let bare = lay(one.as_object(), &notes, size, PLAIN_LOOK);
+        assert_eq!(with_hint(one.as_object(), &notes, size, PLAIN_LOOK), bare);
+    }
+
+    #[test]
+    fn hint_is_dim_and_cut_to_the_width() {
+        let one = json!({"running": 1, "endedTotal": 0, "agents": [
+            {"name": "worker", "state": "running", "doing": "testing", "age": 5, "unread": 0, "color": "blue", "waiting": false, "pane": "%1"}
+        ]});
+        let color = Look {
+            color: true,
+            ..PLAIN_LOOK
+        };
+        let drawn = |width: usize| {
+            let size = Size { width, height: 40 };
+            let bare = lay(one.as_object(), &[], size, color);
+            let hinted = with_hint(one.as_object(), &[], size, color);
+            let n = bare.rows.len();
+            assert_eq!(hinted.rows.len(), n + 2, "{width}");
+            assert_eq!(hinted.rows[..n], bare.rows[..], "{width}");
+            assert_eq!(hinted.rows[n], Row::new(), "{width}");
+            render(&hinted.rows[n + 1], true)
+        };
+        assert_eq!(drawn(40), format!(" \u{1b}[2m{HINT}\u{1b}[0m"));
+        // 20 columns: 18 for the hint, cut with `...`.
+        assert_eq!(drawn(20), " \u{1b}[2mEnter: focus  E...\u{1b}[0m");
+    }
+
+    #[test]
+    fn selected_row_marks_and_reverses() {
+        let board = json!({"running": 2, "endedTotal": 0, "agents": [
+            {"name": "worker", "state": "running", "doing": "testing", "age": 240, "unread": 0, "color": "blue", "waiting": false, "pane": "%1"},
+            {"name": "writer", "state": "running", "model": "sonnet", "age": 180, "unread": 2, "color": "magenta", "waiting": true, "pane": "%2"}
+        ]});
+        let color = Look {
+            color: true,
+            ..PLAIN_LOOK
+        };
+        let ascii = Look {
+            ascii: true,
+            ..PLAIN_LOOK
+        };
+        let drawn = |look: Look, selected: Option<&str>| {
+            let mut laid = lay(board.as_object(), &[], W40, look);
+            if let Some(name) = selected {
+                mark(&mut laid, name, look);
+            }
+            laid.rows
+                .iter()
+                .map(|row| render(row, look.color))
+                .collect::<Vec<_>>()
+        };
+        let rows = drawn(PLAIN_LOOK, Some("worker"));
+        assert_eq!(
+            rows[2],
+            pad("\u{25c9} worker", "working   4m").replacen(' ', "\u{25b8}", 1)
+        );
+        assert!(
+            rows[2].starts_with("\u{25b8}\u{25c9} worker"),
+            "{:?}",
+            rows[2]
+        );
+        let rows = drawn(ascii, Some("worker"));
+        assert!(rows[2].starts_with(">* worker"), "{:?}", rows[2]);
+        let rows = drawn(color, Some("worker"));
+        let bare = drawn(color, None);
+        assert!(
+            rows[2].starts_with(
+                "\u{25b8}\u{1b}[7;32m\u{25c9}\u{1b}[0m\u{1b}[7m \u{1b}[0m\u{1b}[7;34mworker\u{1b}[0m"
+            ),
+            "{:?}",
+            rows[2]
+        );
+        assert!(
+            rows[2].contains("\u{1b}[7;32mworking\u{1b}[0m"),
+            "{:?}",
+            rows[2]
+        );
+        for (at, (got, want)) in rows.iter().zip(&bare).enumerate() {
+            if at != 2 {
+                assert_eq!(got, want, "{at}");
+            }
+        }
+        // A later agent: every span after the marker is reversed, its model, badge and age included.
+        let sgr = |codes: &str, text: &str| format!("\u{1b}[{codes}m{text}\u{1b}[0m");
+        let rows = drawn(color, Some("writer"));
+        assert_eq!(
+            rows[5],
+            [
+                "\u{25b8}".to_string(),
+                sgr("7;36", "\u{25cc}"),
+                sgr("7", " "),
+                sgr("7;35", "writer"),
+                sgr("2;7", " [sonnet]"),
+                sgr("7", "  "),
+                sgr("1;7;34", "\u{2709} 2"),
+                sgr("7", "    "),
+                sgr("7;36", "waiting"),
+                sgr("7", "   3m"),
+            ]
+            .concat()
+        );
+        for (at, (got, want)) in rows.iter().zip(&bare).enumerate() {
+            if at != 5 {
+                assert_eq!(got, want, "{at}");
+            }
+        }
+        let rows = drawn(PLAIN_LOOK, Some("writer"));
+        assert_eq!(
+            rows[5],
+            pad("\u{25cc} writer [sonnet]  \u{2709} 2", "waiting   3m")
+                .replacen(' ', "\u{25b8}", 1)
+        );
+        // An unknown name marks nothing.
+        let mut laid = lay(board.as_object(), &[], W40, color);
+        let before = laid.rows.clone();
+        mark(&mut laid, "nobody", color);
+        assert_eq!(laid.rows, before);
+    }
+
     #[test]
     fn agent_text_never_reaches_the_frame_as_controls() {
         let evil = "a\u{1b}[31mred\u{1b}]8;;http://x\u{7}link\u{1b}]8;;\u{7}\u{9b}2J\u{85}\u{7f}z";
@@ -2248,7 +2973,7 @@ mod tests {
     fn watch_run(w: &World) -> (&'static str, Vec<String>) {
         let caller = w.caller();
         let mut frames = Vec::new();
-        let ended = run_watch(&w.ctx, &caller, &mut |frame: &str| {
+        let ended = run_watch(&w.ctx, &caller, Box::new(NoInput), &mut |frame: &str| {
             frames.push(frame.to_string());
             assert!(frames.len() <= 100, "runaway");
             Ok(())
@@ -2371,7 +3096,9 @@ mod tests {
     fn watch_output_closed() {
         let w = watch_world(&["live", "live", "gone"]);
         let caller = w.caller();
-        let ended = run_watch(&w.ctx, &caller, &mut |_| Err(io::Error::other("EIO")));
+        let ended = run_watch(&w.ctx, &caller, Box::new(NoInput), &mut |_| {
+            Err(io::Error::other("EIO"))
+        });
         assert_eq!(ended, "output-closed");
         assert_eq!(probes(&w), 1);
         assert!(w.fakes.slept().is_empty());
@@ -2379,7 +3106,9 @@ mod tests {
         let w = watch_world(&["fail"]);
         w.fakes.mux_first("list-panes", 1, "", "lock");
         let caller = w.caller();
-        let ended = run_watch(&w.ctx, &caller, &mut |_| Err(io::Error::other("EIO")));
+        let ended = run_watch(&w.ctx, &caller, Box::new(NoInput), &mut |_| {
+            Err(io::Error::other("EIO"))
+        });
         assert_eq!((ended, probes(&w)), ("output-closed", 1));
     }
 
@@ -2431,8 +3160,10 @@ mod tests {
         let w = watch_world(&["gone"]);
         w.fakes.clear_log();
         let request = w.request(&["watch"]);
-        let refused =
-            watch_on(&w.ctx, &request, false, &mut |_| panic!("drew to a pipe")).unwrap_err();
+        let refused = watch_on(&w.ctx, &request, false, &no_input, &mut |_| {
+            panic!("drew to a pipe")
+        })
+        .unwrap_err();
         assert_eq!(
             (refused.code, refused.check, refused.message.as_str()),
             (
@@ -2442,11 +3173,772 @@ mod tests {
             )
         );
         assert!(w.fakes.mux_calls().is_empty());
-        let reply = watch_on(&w.ctx, &request, true, &mut |_| Ok(())).unwrap();
+        let reply = watch_on(&w.ctx, &request, true, &no_input, &mut |_| Ok(())).unwrap();
         assert_eq!(
             Value::Object(reply),
             json!({"pane": "%7", "ended": "pane-closed"})
         );
+    }
+
+    fn no_input() -> Box<dyn Input> {
+        Box::new(NoInput)
+    }
+
+    // ---- watch's input
+
+    /// An input that answers `steps` in turn, each `(ms, answer)` due that long after the one before, and records
+    /// each timeout. A step due within the timeout moves the fake clock to it and answers it; else the whole timeout
+    /// passes, without a sleep, and times out.
+    struct Script {
+        fakes: Fakes,
+        steps: VecDeque<(u64, Waited)>,
+        waits: Rc<RefCell<Vec<u64>>>,
+    }
+
+    impl Script {
+        fn new(fakes: &Fakes, steps: Vec<(u64, Waited)>) -> Self {
+            Script {
+                fakes: fakes.clone(),
+                steps: steps.into(),
+                waits: Default::default(),
+            }
+        }
+    }
+
+    impl Input for Script {
+        fn wait(&mut self, _clock: &dyn crate::ctx::Clock, timeout: Duration) -> Waited {
+            let ms = timeout.as_millis() as u64;
+            self.waits.borrow_mut().push(ms);
+            match self.steps.front_mut() {
+                Some((due, _)) if *due <= ms => {
+                    self.fakes.advance(Duration::from_millis(*due));
+                    self.steps.pop_front().unwrap().1
+                }
+                Some((due, _)) => {
+                    *due -= ms;
+                    self.fakes.advance(timeout);
+                    Waited::Timeout
+                }
+                None => {
+                    self.fakes.advance(timeout);
+                    Waited::Timeout
+                }
+            }
+        }
+    }
+
+    // One watch run reading `input`: how it ended, its frames and the fake time (ms) each was written at.
+    fn watch_with(w: &World, input: Box<dyn Input>) -> (&'static str, Vec<String>, Vec<u64>) {
+        let caller = w.caller();
+        let mut frames = Vec::new();
+        let mut times = Vec::new();
+        let ended = run_watch(&w.ctx, &caller, input, &mut |frame: &str| {
+            frames.push(frame.to_string());
+            let at = w.ctx.clock.now().duration_since(SystemTime::UNIX_EPOCH);
+            times.push(at.unwrap().as_millis() as u64);
+            assert!(frames.len() <= 100, "runaway");
+            Ok(())
+        });
+        (ended, frames, times)
+    }
+
+    fn diffs(times: &[u64]) -> Vec<u64> {
+        times.windows(2).map(|t| t[1] - t[0]).collect()
+    }
+
+    #[test]
+    fn watch_under_constant_input_still_draws_every_2s() {
+        let w = watch_world(&["live", "live", "live", "gone"]);
+        let steps = (0..40)
+            .map(|_| (300, Waited::Bytes(b"x".to_vec())))
+            .collect();
+        let script = Script::new(&w.fakes, steps);
+        let waits = script.waits.clone();
+        let (ended, frames, times) = watch_with(&w, Box::new(script));
+        assert_eq!((ended, frames.len()), ("pane-closed", 3));
+        assert_eq!(diffs(&times), [2000, 2000]);
+        let waits = waits.borrow();
+        assert!(waits.iter().all(|&ms| ms > 0 && ms <= 2000), "{waits:?}");
+        // Each tick waits for six reads 300 ms apart, then the 200 ms left.
+        assert_eq!(waits[..7], [2000, 1700, 1400, 1100, 800, 500, 200]);
+        assert!(w.fakes.slept().is_empty());
+    }
+
+    #[test]
+    fn watch_ctrl_c_ends_interrupted() {
+        let w = watch_world(&["live"]);
+        let script = Script::new(&w.fakes, vec![(500, Waited::Bytes(vec![3]))]);
+        let (ended, frames, _) = watch_with(&w, Box::new(script));
+        assert_eq!((ended, frames.len(), probes(&w)), ("interrupted", 1, 1));
+    }
+
+    #[test]
+    fn watch_lone_escape_waits_50ms() {
+        let w = watch_world(&["live", "live", "live", "gone"]);
+        let script = Script::new(&w.fakes, vec![(100, Waited::Bytes(b"\x1b".to_vec()))]);
+        let waits = script.waits.clone();
+        let (ended, frames, times) = watch_with(&w, Box::new(script));
+        assert_eq!((ended, frames.len()), ("pane-closed", 3));
+        // 50 ms after the ESC it counts as the key, which draws again at once (#61).
+        assert_eq!(*waits.borrow(), [2000, 50, 2000, 2000]);
+        assert_eq!(diffs(&times), [150, 2000]);
+    }
+
+    #[test]
+    fn watch_keeps_drawing_after_input_closes() {
+        let w = watch_world(&["live", "live", "live", "gone"]);
+        let script = Script::new(&w.fakes, vec![(100, Waited::Closed)]);
+        let waits = script.waits.clone();
+        let (ended, frames, times) = watch_with(&w, Box::new(script));
+        assert_eq!((ended, frames.len()), ("pane-closed", 3));
+        assert_eq!(*waits.borrow(), [2000]);
+        // The rest of the tick, then every tick, is slept as without input.
+        assert_eq!(w.fakes.slept()[..2], [1900, 2000]);
+        assert_eq!(diffs(&times), [2000, 2000]);
+    }
+
+    #[test]
+    fn watch_waits_2s_from_the_end_of_a_slow_write() {
+        let w = watch_world(&["live", "live", "gone"]);
+        let script = Script::new(&w.fakes, vec![]);
+        let waits = script.waits.clone();
+        let caller = w.caller();
+        let mut frames = 0;
+        let ended = run_watch(&w.ctx, &caller, Box::new(script), &mut |_| {
+            frames += 1;
+            assert!(frames <= 100, "runaway");
+            // The terminal takes 250 ms to take the frame.
+            w.fakes.advance(Duration::from_millis(250));
+            Ok(())
+        });
+        assert_eq!((ended, frames), ("pane-closed", 2));
+        assert_eq!(*waits.borrow(), [2000, 2000]);
+    }
+
+    #[test]
+    fn watch_late_lone_escape_waits_only_the_time_left() {
+        let w = watch_world(&["live", "live", "live", "gone"]);
+        let script = Script::new(&w.fakes, vec![(1990, Waited::Bytes(b"\x1b".to_vec()))]);
+        let waits = script.waits.clone();
+        let (ended, frames, times) = watch_with(&w, Box::new(script));
+        assert_eq!((ended, frames.len()), ("pane-closed", 3));
+        // 10 ms are left of the tick, so the ESC waits 10 ms, not 50, and the next frame is not late.
+        assert_eq!(*waits.borrow(), [2000, 10, 2000, 2000]);
+        assert_eq!(diffs(&times), [2000, 2000]);
+    }
+
+    // A terminal set up on a FakeTerm answering `reads`, and its log.
+    fn term_input(reads: Vec<io::Result<Waited>>) -> (Box<dyn Input>, Rc<RefCell<Vec<String>>>) {
+        let term = FakeTerm {
+            reads: reads.into(),
+            ..FakeTerm::new()
+        };
+        let log = term.log.clone();
+        let input = TermInput::setup(term).expect("every step succeeds");
+        (Box::new(input), log)
+    }
+
+    fn logged(bytes: &[u8]) -> String {
+        format!("write {}", bytes.escape_ascii())
+    }
+
+    // One way watch ends: how it ends, the probe answers, the terminal's reads and the frame write.
+    type End = (
+        &'static str,
+        &'static [&'static str],
+        Vec<io::Result<Waited>>,
+        fn(&str) -> io::Result<()>,
+    );
+
+    #[test]
+    fn watch_restores_after_every_exit() {
+        let restored = [logged(DISABLE), "restore".into(), "disarm".into()];
+        let ends: [End; 4] = [
+            ("pane-closed", &["live", "gone"], vec![], |_| Ok(())),
+            ("output-closed", &["live"], vec![], |_| {
+                Err(io::Error::other("EIO"))
+            }),
+            ("probe-failed", &["fail"], vec![], |_| Ok(())),
+            (
+                "interrupted",
+                &["live"],
+                vec![Ok(Waited::Bytes(vec![3]))],
+                |_| Ok(()),
+            ),
+        ];
+        for (want, answers, reads, write) in ends {
+            let w = watch_world(answers);
+            let (input, log) = term_input(reads);
+            let caller = w.caller();
+            let mut frames = 0;
+            let ended = run_watch(&w.ctx, &caller, input, &mut |frame| {
+                frames += 1;
+                assert!(frames <= 100, "runaway");
+                write(frame)
+            });
+            assert_eq!(ended, want);
+            let log = log.borrow();
+            assert_eq!(log[log.len() - 3..], restored, "{want}");
+            let restores = log.iter().filter(|e| *e == "restore").count();
+            assert_eq!(restores, 1, "{want}");
+        }
+        // A panic in the loop unwinds through it, and the input is still dropped.
+        let w = watch_world(&["live"]);
+        let (input, log) = term_input(vec![]);
+        let caller = w.caller();
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            run_watch(&w.ctx, &caller, input, &mut |_| panic!("write"))
+        }));
+        assert!(panicked.is_err());
+        assert_eq!(
+            *log.borrow(),
+            [
+                "save",
+                "arm",
+                "raw",
+                &logged(ENABLE),
+                &restored[0],
+                "restore",
+                "disarm"
+            ]
+        );
+    }
+
+    #[test]
+    fn watch_on_keeps_drawing_when_setup_fails() {
+        let w = watch_world(&["live", "live", "live", "gone"]);
+        let request = w.request(&["watch"]);
+        let log: Rc<RefCell<Vec<String>>> = Default::default();
+        let opened = Rc::new(Cell::new(0));
+        let open = {
+            let (log, opened) = (log.clone(), opened.clone());
+            move || {
+                opened.set(opened.get() + 1);
+                let term = FakeTerm {
+                    log: log.clone(),
+                    fail: Some("raw"),
+                    ..FakeTerm::new()
+                };
+                input::open_with(&Env::default(), true, true, || {
+                    TermInput::setup(term).map(|input| Box::new(input) as Box<dyn Input>)
+                })
+            }
+        };
+        let mut frames = 0;
+        let reply = watch_on(&w.ctx, &request, true, &open, &mut |_| {
+            frames += 1;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!((reply["ended"].as_str(), frames), (Some("pane-closed"), 3));
+        assert_eq!(opened.get(), 1);
+        assert_eq!(*log.borrow(), ["save", "arm", "raw", "restore", "disarm"]);
+        assert_eq!(w.fakes.slept(), [2000, 2000, 2000]);
+    }
+
+    #[test]
+    fn watch_on_reads_the_input_it_opened() {
+        let w = watch_world(&["live"]);
+        let request = w.request(&["watch"]);
+        let opened = Rc::new(Cell::new(0));
+        let open = {
+            let (fakes, opened) = (w.fakes.clone(), opened.clone());
+            move || -> Box<dyn Input> {
+                opened.set(opened.get() + 1);
+                Box::new(Script::new(&fakes, vec![(500, Waited::Bytes(vec![3]))]))
+            }
+        };
+        let mut frames = 0;
+        let reply = watch_on(&w.ctx, &request, true, &open, &mut |_| {
+            frames += 1;
+            assert!(frames <= 100, "runaway");
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!((reply["ended"].as_str(), frames), (Some("interrupted"), 1));
+        assert_eq!(opened.get(), 1);
+    }
+
+    #[test]
+    fn watch_on_opens_the_input_only_once_it_draws() {
+        let w = watch_world(&["gone"]);
+        let request = w.request(&["watch"]);
+        let open = || -> Box<dyn Input> { panic!("opened the terminal") };
+        // Refused for a pipe, and refused outside a pane: the terminal is never touched.
+        assert!(watch_on(&w.ctx, &request, false, &open, &mut |_| Ok(())).is_err());
+        let mut w = w;
+        let env: Vec<(String, String)> = w
+            .ctx
+            .env
+            .iter()
+            .filter(|(k, _)| *k != "TMUX_PANE")
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        w.ctx.env = Env::from_pairs(env);
+        assert!(watch_on(&w.ctx, &request, true, &open, &mut |_| Ok(())).is_err());
+    }
+
+    #[test]
+    fn watch_poll_failure_restores_then_keeps_drawing() {
+        let w = watch_world(&["live", "live", "gone"]);
+        let (input, log) = term_input(vec![Err(io::Error::other("EIO"))]);
+        let caller = w.caller();
+        let ended = run_watch(&w.ctx, &caller, input, &mut |_| {
+            log.borrow_mut().push("frame".into());
+            Ok(())
+        });
+        assert_eq!(ended, "pane-closed");
+        assert_eq!(
+            *log.borrow(),
+            [
+                "save",
+                "arm",
+                "raw",
+                &logged(ENABLE),
+                "frame",
+                &logged(DISABLE),
+                "restore",
+                "disarm",
+                "frame"
+            ]
+        );
+        // The failed read took no time: the tick is slept whole, then the next.
+        assert_eq!(w.fakes.slept(), [2000, 2000]);
+    }
+
+    // ---- clicks and keys (#61)
+
+    // The bar's click read: its width, then its rows.
+    const CLICK: &str = "-N display-message -p -t %7 #{pane_width} ; capture-pane -p -t %7";
+    const READ_BACK: &str = "#{window_active}";
+
+    // An SGR left press at row `y`.
+    fn press(y: u16) -> Waited {
+        Waited::Bytes(format!("\x1b[<0;3;{y}M").into_bytes())
+    }
+
+    fn key(bytes: &[u8]) -> Waited {
+        Waited::Bytes(bytes.to_vec())
+    }
+
+    // The watch world whose bar answers the click read with `answer`, and whose worker %9 reads back focused.
+    fn click_world(probes: &[&'static str], answer: String) -> World {
+        let w = watch_world(probes);
+        w.fakes
+            .mux_script("capture-pane", move |_| Ok(out(0, &answer, "")));
+        w.fakes.mux_first(READ_BACK, 0, "%9|1|1|1\n", "");
+        w
+    }
+
+    // The click read's answer: `width`, then `rows`.
+    fn answer(width: usize, rows: &[String]) -> String {
+        format!("{width}\n{}\n", rows.join("\n"))
+    }
+
+    fn board_answer() -> String {
+        answer(40, &board_rows())
+    }
+
+    fn mux_text(w: &World) -> Vec<String> {
+        w.fakes.mux_calls().iter().map(|c| c.join(" ")).collect()
+    }
+
+    fn click_reads(w: &World) -> usize {
+        mux_text(w).iter().filter(|c| *c == CLICK).count()
+    }
+
+    // Guarded selects: the if-shell around select-window and select-pane.
+    fn selects(w: &World) -> usize {
+        w.fakes
+            .mux_calls()
+            .iter()
+            .filter(|c| c[1] == "if-shell")
+            .count()
+    }
+
+    // The board with worker selected: the marker in its margin and the hint under the board.
+    fn marked_frame() -> String {
+        let mut rows = board_rows();
+        rows[2] = rows[2].replacen(' ', "\u{25b8}", 1);
+        rows.push(String::new());
+        rows.push(format!(" {HINT}"));
+        screen(&rows, 24)
+    }
+
+    fn failed_frame() -> String {
+        noted_frame(&["focus failed: worker"])
+    }
+
+    fn watch_env(w: &mut World, key: &str, value: &str) {
+        let mut env: Vec<(String, String)> = w
+            .ctx
+            .env
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        env.push((key.into(), value.into()));
+        w.ctx.env = Env::from_pairs(env);
+    }
+
+    #[test]
+    fn click_focuses_through_one_read_and_guarded_select() {
+        let w = click_world(&["live", "live", "live", "gone"], board_answer());
+        let script = Script::new(&w.fakes, vec![(300, press(3))]);
+        let (ended, frames, times) = watch_with(&w, Box::new(script));
+        assert_eq!((ended, frames.len()), ("pane-closed", 3));
+        // The redraw follows the click at once; the next tick is 2 s after it.
+        assert_eq!(diffs(&times), [300, 2000]);
+        assert_eq!(frames, [board_frame(), board_frame(), board_frame()]);
+        let live = crate::agents::registry::Launch {
+            command: crate::agents::fixture::launch_command("%9"),
+            pid: None,
+        }
+        .live();
+        // The calls in order, the snapshot's pane lists aside.
+        let calls: Vec<String> = w
+            .fakes
+            .mux_calls()
+            .iter()
+            .filter(|c| c[1] != "list-panes")
+            .map(|c| c.join(" "))
+            .collect();
+        let at = calls.iter().position(|c| c == CLICK).expect("a click read");
+        assert_eq!(
+            calls[at..at + 3],
+            [
+                CLICK.to_string(),
+                format!("-N if-shell -F -t %9 {live} select-window -t %9 ; select-pane -t %9"),
+                format!(
+                    "-N display-message -p -t %9 #{{pane_id}}|#{{window_active}}|#{{pane_active}}|{live}"
+                ),
+            ]
+        );
+        assert_eq!((click_reads(&w), selects(&w)), (1, 1));
+    }
+
+    // The watch world with running agents writer-two and writer as well as worker.
+    fn two_writers(w: &World) {
+        w.agent_record("cccccccccccc", json!({"name": "writer-two", "pane": "%11"}));
+        w.agent_record("dddddddddddd", json!({"name": "writer", "pane": "%12"}));
+        w.panes(&[
+            "%9|@5|300|aaaaaaaaaaaa|worker",
+            "%11|@6|311|cccccccccccc|writer-two",
+            "%12|@7|312|dddddddddddd|writer",
+        ]);
+    }
+
+    #[test]
+    fn click_at_another_width_does_nothing_and_redraws() {
+        // At 9 columns the head of `writer-two`'s line reflows to ` ◉ writer`, a whole name line of another agent.
+        let split: Vec<String> = [
+            " mux-agen",
+            "ts  3 run",
+            " \u{25c9} writer",
+            "-two   wa",
+            "iting   3m",
+        ]
+        .iter()
+        .map(|r| r.to_string())
+        .collect();
+        for width in [30, 55, 9] {
+            let w = click_world(&["live", "live", "live", "gone"], answer(width, &split));
+            two_writers(&w);
+            let script = Script::new(&w.fakes, vec![(300, press(3))]);
+            let (ended, frames, times) = watch_with(&w, Box::new(script));
+            assert_eq!((ended, frames.len()), ("pane-closed", 3), "{width}");
+            assert_eq!(diffs(&times), [300, 2000], "{width}");
+            assert_eq!((click_reads(&w), selects(&w)), (1, 0), "{width}");
+            assert_eq!(frames[0], frames[1], "{width}");
+        }
+    }
+
+    #[test]
+    fn click_elsewhere_does_nothing() {
+        // The header, the doing line and an ended row: each read, none focuses, each redraws at once.
+        let w = click_world(
+            &["live", "live", "live", "live", "live", "gone"],
+            board_answer(),
+        );
+        let steps = vec![(300, press(1)), (300, press(4)), (300, press(7))];
+        let (ended, frames, times) = watch_with(&w, Box::new(Script::new(&w.fakes, steps)));
+        assert_eq!((ended, frames.len()), ("pane-closed", 5));
+        assert_eq!(diffs(&times), [300, 300, 300, 2000]);
+        assert_eq!((click_reads(&w), selects(&w)), (3, 0));
+        // A release, the wheel and button 2: no read, no redraw.
+        let w = click_world(&["live", "live", "gone"], board_answer());
+        let steps = vec![
+            (300, key(b"\x1b[<0;3;3m")),
+            (300, key(b"\x1b[<64;3;3M")),
+            (300, key(b"\x1b[<2;3;3M")),
+        ];
+        let (ended, frames, times) = watch_with(&w, Box::new(Script::new(&w.fakes, steps)));
+        assert_eq!((ended, frames.len()), ("pane-closed", 2));
+        assert_eq!(diffs(&times), [2000]);
+        assert_eq!((click_reads(&w), selects(&w)), (0, 0));
+    }
+
+    #[test]
+    fn press_near_or_across_a_write_is_dropped() {
+        // Read 20 ms after its frame: dropped, but it still redraws at once.
+        let w = click_world(&["live", "live", "live", "gone"], board_answer());
+        let script = Script::new(&w.fakes, vec![(20, press(3))]);
+        let (_, _, times) = watch_with(&w, Box::new(script));
+        assert_eq!(diffs(&times), [20, 2000]);
+        assert_eq!((click_reads(&w), selects(&w)), (0, 0));
+        // Its first byte read before the second write, its last after: dropped.
+        let w = click_world(&["live", "live", "live", "live", "gone"], board_answer());
+        let steps = vec![(1990, key(b"\x1b[<0;3;")), (110, key(b"3M"))];
+        let (_, _, times) = watch_with(&w, Box::new(Script::new(&w.fakes, steps)));
+        assert_eq!(diffs(&times), [2000, 100, 2000]);
+        assert_eq!((click_reads(&w), selects(&w)), (0, 0));
+        // 30 ms after the second write: dropped.
+        let w = click_world(&["live", "live", "live", "live", "gone"], board_answer());
+        let script = Script::new(&w.fakes, vec![(2030, press(3))]);
+        let (_, _, times) = watch_with(&w, Box::new(script));
+        assert_eq!(diffs(&times), [2000, 30, 2000]);
+        assert_eq!((click_reads(&w), selects(&w)), (0, 0));
+        // 100 ms after it: acts.
+        let w = click_world(&["live", "live", "live", "live", "gone"], board_answer());
+        let script = Script::new(&w.fakes, vec![(2100, press(3))]);
+        let (_, _, times) = watch_with(&w, Box::new(script));
+        assert_eq!(diffs(&times), [2000, 100, 2000]);
+        assert_eq!((click_reads(&w), selects(&w)), (1, 1));
+    }
+
+    #[test]
+    fn one_read_handles_every_event_in_order() {
+        let w = click_world(&["live", "live", "live", "gone"], board_answer());
+        let script = Script::new(&w.fakes, vec![(300, key(b"j\r"))]);
+        let (ended, frames, times) = watch_with(&w, Box::new(script));
+        assert_eq!(ended, "pane-closed");
+        // j selected worker, then Enter focused it: the next frame is unmarked.
+        assert_eq!(frames, [board_frame(), board_frame(), board_frame()]);
+        assert_eq!(diffs(&times), [300, 2000]);
+        assert_eq!((click_reads(&w), selects(&w)), (0, 1));
+        // The focus came before the next frame's probe.
+        let calls = mux_text(&w);
+        let select = calls.iter().position(|c| c.contains("if-shell")).unwrap();
+        let probes_before = calls[..select]
+            .iter()
+            .filter(|c| c.ends_with(WATCH_PROBE))
+            .count();
+        assert_eq!(probes_before, 1);
+    }
+
+    #[test]
+    fn stale_press_dismisses_the_note_and_redraws() {
+        let w = click_world(&["live", "live", "live", "live", "gone"], board_answer());
+        w.fakes.mux_first(READ_BACK, 0, "%9|0|1|1\n", "");
+        let steps = vec![(300, press(3)), (20, press(3))];
+        let (ended, frames, times) = watch_with(&w, Box::new(Script::new(&w.fakes, steps)));
+        assert_eq!(ended, "pane-closed");
+        assert_eq!(
+            frames,
+            [board_frame(), failed_frame(), board_frame(), board_frame()]
+        );
+        assert_eq!(diffs(&times), [300, 20, 2000]);
+        assert_eq!((click_reads(&w), selects(&w)), (1, 1));
+    }
+
+    #[test]
+    fn ascii_turns_clicks_off() {
+        let mut w = click_world(
+            &["live", "live", "live", "live", "live", "gone"],
+            board_answer(),
+        );
+        watch_env(&mut w, "MUX_AGENTS_ASCII", "1");
+        let steps = vec![(300, press(3)), (300, key(b"j")), (300, key(b"\r"))];
+        let (ended, frames, times) = watch_with(&w, Box::new(Script::new(&w.fakes, steps)));
+        assert_eq!((ended, frames.len()), ("pane-closed", 5));
+        // The press redraws but reads nothing; j selects (ASCII marker) and Enter focuses.
+        assert_eq!(diffs(&times), [300, 300, 300, 2000]);
+        assert_eq!((click_reads(&w), selects(&w)), (0, 1));
+        assert!(frames[2].contains(">* worker"), "{:?}", frames[2]);
+        assert!(!frames[3].contains(">* worker"), "{:?}", frames[3]);
+    }
+
+    #[test]
+    fn drawn_pane_moved_shows_note_never_selects() {
+        let w = watch_world(&["live", "live", "live", "gone"]);
+        w.fakes.mux_first(READ_BACK, 0, "%10|1|1|1\n", "");
+        // The bar drew worker on %9; by the click it is on %10.
+        let moved = Rc::new(Cell::new(false));
+        let record = w.folder(ID).join("record.json");
+        let flag = moved.clone();
+        w.fakes.mux_script("capture-pane", move |_| {
+            flag.set(true);
+            let mut fields = crate::state::fs::read_json(&record).unwrap().unwrap();
+            fields["pane"] = json!("%10");
+            fields["startCommand"] = json!(crate::agents::fixture::launch_command("%10"));
+            write(&record, fields);
+            Ok(out(0, &board_answer(), ""))
+        });
+        let flag = moved.clone();
+        w.fakes.mux_script("list-panes", move |argv| {
+            let row = if flag.get() {
+                "%10|@5|300|aaaaaaaaaaaa|worker"
+            } else {
+                "%9|@5|300|aaaaaaaaaaaa|worker"
+            };
+            Ok(out(
+                0,
+                &crate::agents::fixture::listed(argv, &[row], "\n"),
+                "",
+            ))
+        });
+        let script = Script::new(&w.fakes, vec![(300, press(3))]);
+        let (ended, frames, _) = watch_with(&w, Box::new(script));
+        assert_eq!((ended, frames.len()), ("pane-closed", 3));
+        assert!(moved.get());
+        assert_eq!(click_reads(&w), 1);
+        assert_eq!(selects(&w), 0, "{:?}", mux_text(&w));
+        assert!(
+            frames[1].contains("focus failed: worker"),
+            "{:?}",
+            frames[1]
+        );
+    }
+
+    #[test]
+    fn read_back_failure_shows_note() {
+        let w = click_world(&["live", "live", "live", "gone"], board_answer());
+        w.fakes.mux_first(READ_BACK, 1, "", "no server");
+        let script = Script::new(&w.fakes, vec![(300, press(3))]);
+        let (ended, frames, times) = watch_with(&w, Box::new(script));
+        assert_eq!(ended, "pane-closed");
+        assert_eq!(frames, [board_frame(), failed_frame(), failed_frame()]);
+        assert_eq!(diffs(&times), [300, 2000]);
+        assert_eq!(selects(&w), 1);
+    }
+
+    #[test]
+    fn keys_select_and_focus() {
+        let w = click_world(&["live", "live", "live", "live", "gone"], board_answer());
+        let steps = vec![(300, key(b"j")), (100, key(b"\r"))];
+        let (ended, frames, times) = watch_with(&w, Box::new(Script::new(&w.fakes, steps)));
+        assert_eq!(ended, "pane-closed");
+        assert_eq!(
+            frames,
+            [board_frame(), marked_frame(), board_frame(), board_frame()]
+        );
+        assert_eq!(diffs(&times), [300, 100, 2000]);
+        assert_eq!((click_reads(&w), selects(&w)), (0, 1));
+        let select = w
+            .fakes
+            .mux_calls()
+            .into_iter()
+            .find(|c| c[1] == "if-shell")
+            .unwrap();
+        assert_eq!(select[4], "%9");
+        // A Down split across two reads.
+        let w = click_world(&["live", "live", "live", "gone"], board_answer());
+        let steps = vec![(300, key(b"\x1b[")), (100, key(b"B"))];
+        let (_, frames, times) = watch_with(&w, Box::new(Script::new(&w.fakes, steps)));
+        assert_eq!(frames, [board_frame(), marked_frame(), marked_frame()]);
+        assert_eq!(diffs(&times), [400, 2000]);
+    }
+
+    // A `Script` that runs `then` as it hands back its last step.
+    struct Before {
+        script: Script,
+        then: Option<Box<dyn FnOnce()>>,
+    }
+
+    impl Input for Before {
+        fn wait(&mut self, clock: &dyn crate::ctx::Clock, timeout: Duration) -> Waited {
+            let last = self.script.steps.len() == 1;
+            let waited = self.script.wait(clock, timeout);
+            if last
+                && self.script.steps.is_empty()
+                && let Some(then) = self.then.take()
+            {
+                then();
+            }
+            waited
+        }
+    }
+
+    #[test]
+    fn key_focus_of_a_moved_agent_shows_note_never_selects() {
+        let w = watch_world(&["live", "live", "live", "live", "gone"]);
+        // The bar drew worker on %9 when `j` selected it; by Enter it is on %10.
+        let moved = Rc::new(Cell::new(false));
+        let flag = moved.clone();
+        w.fakes.mux_script("list-panes", move |argv| {
+            let row = if flag.get() {
+                "%10|@5|300|aaaaaaaaaaaa|worker"
+            } else {
+                "%9|@5|300|aaaaaaaaaaaa|worker"
+            };
+            Ok(out(
+                0,
+                &crate::agents::fixture::listed(argv, &[row], "\n"),
+                "",
+            ))
+        });
+        let record = w.folder(ID).join("record.json");
+        let flag = moved.clone();
+        let input = Before {
+            script: Script::new(&w.fakes, vec![(300, key(b"j")), (100, key(b"\r"))]),
+            then: Some(Box::new(move || {
+                flag.set(true);
+                let mut fields = crate::state::fs::read_json(&record).unwrap().unwrap();
+                fields["pane"] = json!("%10");
+                fields["startCommand"] = json!(crate::agents::fixture::launch_command("%10"));
+                write(&record, fields);
+            })),
+        };
+        let (ended, frames, _) = watch_with(&w, Box::new(input));
+        assert_eq!((ended, frames.len()), ("pane-closed", 4));
+        assert!(moved.get());
+        assert_eq!(selects(&w), 0, "{:?}", mux_text(&w));
+        assert!(
+            frames[2].contains("focus failed: worker"),
+            "{:?}",
+            frames[2]
+        );
+    }
+
+    #[test]
+    fn key_focus_unproved_shows_note_and_keeps_the_selection() {
+        let w = click_world(&["live", "live", "live", "gone"], board_answer());
+        w.fakes.mux_first(READ_BACK, 0, "%9|0|1|1\n", "");
+        let steps = vec![(300, key(b"j")), (100, key(b"\r"))];
+        let (ended, frames, _) = watch_with(&w, Box::new(Script::new(&w.fakes, steps)));
+        assert_eq!((ended, frames.len()), ("pane-closed", 3));
+        assert_eq!(selects(&w), 1);
+        // Not focused: the note shows, and worker stays selected.
+        assert!(
+            frames[2].contains("focus failed: worker"),
+            "{:?}",
+            frames[2]
+        );
+        assert!(frames[2].contains("\u{25b8}"), "{:?}", frames[2]);
+    }
+
+    #[test]
+    fn note_lasts_to_second_tick_or_next_key() {
+        let w = click_world(&["live", "live", "live", "live", "gone"], board_answer());
+        w.fakes.mux_first(READ_BACK, 0, "%9|0|1|1\n", "");
+        let script = Script::new(&w.fakes, vec![(300, press(3))]);
+        let (ended, frames, times) = watch_with(&w, Box::new(script));
+        assert_eq!(ended, "pane-closed");
+        assert_eq!(
+            frames,
+            [board_frame(), failed_frame(), failed_frame(), board_frame()]
+        );
+        assert_eq!(diffs(&times), [300, 2000, 2000]);
+        // A release leaves it; j dismisses it.
+        let w = click_world(&["live", "live", "live", "gone"], board_answer());
+        w.fakes.mux_first(READ_BACK, 0, "%9|0|1|1\n", "");
+        let steps = vec![
+            (300, press(3)),
+            (100, key(b"\x1b[<0;3;3m")),
+            (100, key(b"j")),
+        ];
+        let (_, frames, times) = watch_with(&w, Box::new(Script::new(&w.fakes, steps)));
+        assert_eq!(frames, [board_frame(), failed_frame(), marked_frame()]);
+        assert_eq!(diffs(&times), [300, 200]);
     }
 
     // ---- the right-edge lock (S1)
