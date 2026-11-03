@@ -427,8 +427,12 @@ impl Launch<'_> {
             utf8(spec)?,
         ]);
         let created = native(ctx, &argv, false)?;
-        let reply = created_pane(&created.stdout)
-            .ok_or_else(|| Refusal::internal("rmux did not name the new pane"))?;
+        let reply = created_pane(&created.stdout).ok_or_else(|| {
+            Refusal::internal(&format!(
+                "{} did not name the new pane",
+                crate::mux::in_use(ctx)
+            ))
+        })?;
         let (new_pane, window, start_command) = (
             reply.pane.clone(),
             reply.window.clone(),
@@ -437,9 +441,10 @@ impl Launch<'_> {
         *pane = Some(reply);
         // The pane is the agent's only while it runs this exact command: none named, it is never the agent's.
         if start_command.is_empty() {
-            return Err(Refusal::internal(
-                "rmux did not name the new pane's command",
-            ));
+            return Err(Refusal::internal(&format!(
+                "{} did not name the new pane's command",
+                crate::mux::in_use(ctx)
+            )));
         }
         let launch = registry::Launch {
             command: start_command.clone(),

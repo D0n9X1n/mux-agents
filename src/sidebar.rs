@@ -1438,7 +1438,11 @@ fn open(ctx: &Ctx, caller: &Caller) -> Res<(String, String)> {
         return crate::mux::call_failed(ctx);
     }
     let Some((pane, window, pid)) = split_answer(&created.stdout) else {
-        return refuse(1, "rmux", "rmux did not name the side-bar pane");
+        return refuse(
+            1,
+            "rmux",
+            format!("{} did not name the side-bar pane", crate::mux::in_use(ctx)),
+        );
     };
     let Some(start) = new_watch(ctx, pid) else {
         return refuse(
@@ -3979,6 +3983,13 @@ mod tests {
             .mux_first(READ_RECORD.trim_start_matches("-N "), 1, "", "no server");
         assert_eq!(run(&w, &[]), "1 rmux tmux call failed");
         assert_eq!(count(&w, "list-panes"), 0);
+    }
+
+    #[test]
+    fn a_split_that_names_no_pane_names_the_mux_in_use() {
+        let (w, _) = sidebar_world("", Mux::default());
+        w.fakes.mux_first("split-window", 0, "garbage\n", "");
+        assert_eq!(run(&w, &[]), "1 rmux tmux did not name the side-bar pane");
     }
 
     #[test]
