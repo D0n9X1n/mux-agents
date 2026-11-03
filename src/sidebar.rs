@@ -3838,6 +3838,84 @@ mod tests {
         assert_eq!(diffs(&times), [400, 2000]);
     }
 
+    // A `Script` that runs `then` as it hands back its last step.
+    struct Before {
+        script: Script,
+        then: Option<Box<dyn FnOnce()>>,
+    }
+
+    impl Input for Before {
+        fn wait(&mut self, clock: &dyn crate::ctx::Clock, timeout: Duration) -> Waited {
+            let last = self.script.steps.len() == 1;
+            let waited = self.script.wait(clock, timeout);
+            if last
+                && self.script.steps.is_empty()
+                && let Some(then) = self.then.take()
+            {
+                then();
+            }
+            waited
+        }
+    }
+
+    #[test]
+    fn key_focus_of_a_moved_agent_shows_note_never_selects() {
+        let w = watch_world(&["live", "live", "live", "live", "gone"]);
+        // The bar drew worker on %9 when `j` selected it; by Enter it is on %10.
+        let moved = Rc::new(Cell::new(false));
+        let flag = moved.clone();
+        w.fakes.mux_script("list-panes", move |argv| {
+            let row = if flag.get() {
+                "%10|@5|300|aaaaaaaaaaaa|worker"
+            } else {
+                "%9|@5|300|aaaaaaaaaaaa|worker"
+            };
+            Ok(out(
+                0,
+                &crate::agents::fixture::listed(argv, &[row], "\n"),
+                "",
+            ))
+        });
+        let record = w.folder(ID).join("record.json");
+        let flag = moved.clone();
+        let input = Before {
+            script: Script::new(&w.fakes, vec![(300, key(b"j")), (100, key(b"\r"))]),
+            then: Some(Box::new(move || {
+                flag.set(true);
+                let mut fields = crate::state::fs::read_json(&record).unwrap().unwrap();
+                fields["pane"] = json!("%10");
+                fields["startCommand"] = json!(crate::agents::fixture::launch_command("%10"));
+                write(&record, fields);
+            })),
+        };
+        let (ended, frames, _) = watch_with(&w, Box::new(input));
+        assert_eq!((ended, frames.len()), ("pane-closed", 4));
+        assert!(moved.get());
+        assert_eq!(selects(&w), 0, "{:?}", mux_text(&w));
+        assert!(
+            frames[2].contains("focus failed: worker"),
+            "{:?}",
+            frames[2]
+        );
+    }
+
+    #[test]
+    fn key_focus_unproved_shows_note_and_keeps_the_selection() {
+        let w = click_world(&["live", "live", "live", "gone"], board_answer());
+        w.fakes.mux_first(READ_BACK, 0, "%9|0|1|1\n", "");
+        let steps = vec![(300, key(b"j")), (100, key(b"\r"))];
+        let (ended, frames, _) = watch_with(&w, Box::new(Script::new(&w.fakes, steps)));
+        assert_eq!((ended, frames.len()), ("pane-closed", 3));
+        assert_eq!(selects(&w), 1);
+        // Not focused: the note shows, and worker stays selected.
+        assert!(
+            frames[2].contains("focus failed: worker"),
+            "{:?}",
+            frames[2]
+        );
+        assert!(frames[2].contains("\u{25b8}"), "{:?}", frames[2]);
+    }
+
     #[test]
     fn note_lasts_to_second_tick_or_next_key() {
         let w = click_world(&["live", "live", "live", "live", "gone"], board_answer());
