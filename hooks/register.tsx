@@ -1,11 +1,11 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register, Timer } from 'claude-code'
 
-import { EMPTY, formatAge, isSpawn, parseList } from './board'
+import { EMPTY, formatAge, isSpawn, look, mail, parseList } from './board'
 
 const PANE = 'mux-agents'
 // Change the shape tag when the board's fields change: it declines what an earlier version stored.
-const board = atom({ plugin: 'mux-agents', key: 'board' } as const, EMPTY, { shape: 'board-2' })
+const board = atom({ plugin: 'mux-agents', key: 'board' } as const, EMPTY, { shape: 'board-3' })
 // Per module load (a hot reload drops the timer and resets both): the one refresh timer while the pane is open, and at
 // most one list run at a time.
 let ticking: Timer | undefined
@@ -26,6 +26,15 @@ async function eligible($: EngineInterface): Promise<boolean> {
     if (!((await $.env.get('TMUX')) || (await $.env.get('RMUX')))) return false
     const surfaces = await $.session.surfaces()
     return surfaces.length === 1 && surfaces[0] === 'terminal'
+  } catch {
+    return false
+  }
+}
+
+// MUX_AGENTS_ASCII=1 draws ASCII glyphs, as the side bar does (src/paint.rs ascii); an unreadable value draws symbols.
+async function asciiGlyphs($: EngineInterface): Promise<boolean> {
+  try {
+    return (await $.env.get('MUX_AGENTS_ASCII')) === '1'
   } catch {
     return false
   }
@@ -175,20 +184,26 @@ export const register: Register = on => {
     return closed
   })
   // Every string drawn here comes from parseList, so it is already cleaned. The terminal only: a pane kept open
-  // elsewhere draws nothing.
+  // elsewhere draws nothing. Rows look as on the side bar: glyph and state word in the state's color, `✉ N` for a
+  // live agent's unread messages; a lost agent is not drawn.
   on('ui.render', { component: 'Pane', requestId: PANE, surface: 'terminal' }, async ($, e) => {
     const { Box, Text } = $.ui.resolve(e)
     const b = await read($, board)
+    const ascii = await asciiGlyphs($)
     return (
       <Box flexDirection="column">
         <Text>mux-agents · {b.running} running{b.failed ? ' · refresh failed' : ''}</Text>
         {b.agents.map(a => {
-          const ended = a.state !== 'running'
-          // A live agent's chosen model follows its client.
-          const tag = !ended && a.model ? ` [${a.model}]` : ''
+          const row = look(a, ascii)
+          if (!row) return null
+          // A live agent's chosen model follows its client, then its unread badge.
+          const tag = !row.ended && a.model ? ` [${a.model}]` : ''
+          const badge = row.ended ? undefined : mail(a.unread, ascii)
           return (
             <Box flexDirection="column">
-              <Text dimColor={ended || undefined}>{ended ? '○' : '●'} {a.name}  {a.client}{tag}  {ended ? `${a.state}  ` : ''}{formatAge(a.age)}</Text>
+              <Text dimColor={row.ended || undefined}>
+                <Text color={row.color}>{row.glyph}</Text> {a.name}  {a.client}{tag}  {badge ? <Text bold color="blue">{badge}</Text> : null}{badge ? '  ' : ''}<Text color={row.color}>{row.word}</Text>  {formatAge(a.age)}
+              </Text>
               {a.doing ? <Text dimColor>  {a.doing}</Text> : null}
             </Box>
           )

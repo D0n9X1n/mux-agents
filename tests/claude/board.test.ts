@@ -1,6 +1,6 @@
 import { expect, test } from 'claude-code/testing'
 
-import { clean, formatAge, isSpawn, parseList } from '../../hooks/board'
+import { clean, formatAge, isSpawn, look, mail, parseList } from '../../hooks/board'
 import {
   SPAWN_ERROR_JSON, SPAWN_ERROR_TEXT, SPAWN_JSON, SPAWN_MODEL_JSON, SPAWN_MODEL_TEXT, SPAWN_OFF_JSON, SPAWN_OFF_TEXT, SPAWN_TEXT,
   TAGGED_JSON, TAGGED_TEXT,
@@ -101,7 +101,7 @@ test('parseList maps every failure to undefined and cleans every string', () => 
   expect(parseList(0, '{"ok":true,"verb":"list","agents":[]}')).toBe(undefined)
   expect(parseList(0, '{"ok":true,"verb":"list","running":0}')).toBe(undefined)
   const dirty = JSON.stringify({ ok: true, running: 1, agents: [{ name: 'a\u001b', client: 'c\u0007', state: 's\u009b', doing: 'd\te', age: 1 }] })
-  expect(parseList(0, dirty)).toEqual({ running: 1, agents: [{ name: 'a', client: 'c', state: 's', doing: 'd e', age: 1, model: null }] })
+  expect(parseList(0, dirty)).toEqual({ running: 1, agents: [{ name: 'a', client: 'c', state: 's', doing: 'd e', age: 1, model: null, unread: 0, exitCode: null }] })
 })
 
 test('parseList keeps a chosen model, cleaned, and null for an inherited one', () => {
@@ -112,6 +112,39 @@ test('parseList keeps a chosen model, cleaned, and null for an inherited one', (
   ]
   const parsed = parseList(0, JSON.stringify({ ok: true, verb: 'list', running: 3, agents: rows }))
   expect(parsed?.agents.map(a => a.model)).toEqual(['sonnet', null, null])
+})
+
+test('parseList keeps unread and an ended row\'s exit code: 0 and null when missing or not a number', () => {
+  const rows = [
+    { name: 'a', client: 'claude', state: 'running', doing: null, age: 1, unread: 2 },
+    { name: 'b', client: 'claude', state: 'exited', doing: null, age: 1, unread: 0, exitCode: 0 },
+    { name: 'c', client: 'claude', state: 'exited', doing: null, age: 1, exitCode: 101 },
+    { name: 'd', client: 'claude', state: 'stopped', doing: null, age: 1, unread: '3', exitCode: null },
+    { name: 'e', client: 'claude', state: 'exited', doing: null, age: 1, exitCode: '1' },
+  ]
+  const parsed = parseList(0, JSON.stringify({ ok: true, verb: 'list', running: 1, agents: rows }))
+  expect(parsed?.agents.map(a => [a.name, a.unread, a.exitCode])).toEqual([['a', 2, null], ['b', 0, 0], ['c', 0, 101], ['d', 0, null], ['e', 0, null]])
+})
+
+const agent = (state: string, exitCode?: unknown) => ({ name: 'n', client: 'claude', state, doing: null, age: 1, model: null, unread: 0, exitCode }) as never
+
+test('look draws each state with the side bar\'s glyph, word and color, Unicode or ASCII', () => {
+  const both = (state: string, exitCode?: unknown) => [look(agent(state, exitCode), false), look(agent(state, exitCode), true)].map(l => l && `${l.glyph} ${l.word} ${l.color ?? 'dim'} ${l.ended}`)
+  expect(both('running')).toEqual(['\u25c9 working green false', '* working green false'])
+  expect(both('exited', 0)).toEqual(['\u2713 done dim true', '+ done dim true'])
+  expect(both('exited', 101)).toEqual(['\u2717 exit 101 red true', 'x exit 101 red true'])
+  expect(both('exited', -1)).toEqual(['\u2717 exit -1 red true', 'x exit -1 red true'])
+  expect(both('stopped', null)).toEqual(['- stopped yellow true', '- stopped yellow true'])
+})
+
+test('look draws an exit with no code (an older list) as a dim exited, another state dim, and no lost agent', () => {
+  for (const code of [null, undefined, '0']) expect(look(agent('exited', code), false)).toEqual({ glyph: '-', word: 'exited', color: undefined, ended: true })
+  expect(look(agent('paused'), true)).toEqual({ glyph: '-', word: 'paused', color: undefined, ended: true })
+  expect([look(agent('lost'), false), look(agent('lost'), true)]).toEqual([undefined, undefined])
+})
+
+test('mail is the side bar\'s unread badge, only for a count above 0', () => {
+  expect([mail(3, false), mail(3, true), mail(0, false), mail(undefined, false), mail('2', false)]).toEqual(['\u2709 3', 'm 3', undefined, undefined, undefined])
 })
 
 test('formatAge uses s, m and h, floored', () => {

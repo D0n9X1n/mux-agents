@@ -41,7 +41,7 @@ flowchart LR
 |---|---|---|
 | `spawn` | `spawn -Client copilot -Name add-tests -TaskFile task.md -BriefFile brief.md -Split h` | 按会话的 `placement` 启动代理（默认是新窗口）；`-Split h\|v` 或 `-Tab` 只决定这一次；`-Model <model>` 指定它的模型（否则用客户端的默认模型） |
 | `placement` | `placement h`，`placement tab` | 本会话之后 `spawn` 在哪里打开代理：`tab`（新窗口，默认）、`h` 或 `v`（在你旁边分屏） |
-| `list` | `list -All` | 存活的代理、各自在做什么、未读消息；`-All` 加上已结束的 |
+| `list` | `list -All` | 存活的代理、各自在做什么、未读消息；`-All` 加上已结束的，各带其 `exitCode` |
 | `status` | `status -BodyFile step.txt` | 代理报告自己当前在做什么 |
 | `send` | `send claude-1 -BodyFile note.md`，`send parent -BodyFile result.md` | 给某个代理或你的父代理发消息 |
 | `read` | `read -Wait 600`，`read claude-1 -Lines 40` | 等待你的消息，或读取某个代理的窗格 |
@@ -84,7 +84,7 @@ flowchart LR
 
 侧边栏每次重绘都按窗格的实际大小排版，绝不换行：过长的文字用 `...` 截断；窗格太矮时先去掉空行，再去掉已结束的行，然后去掉最早代理的“正在做的事”行和整行；标题始终保留。颜色依次遵循 `NO_COLOR`（关）、`FORCE_COLOR` 或 `CLICOLOR_FORCE`（开）、然后 `TERM=dumb`（关）；`MUX_AGENTS_ASCII=1` 用 `* o + x m -` 代替符号。每次重绘都在原处改写各行（不整屏清除），所以侧边栏不会闪烁；在 `TERM=dumb` 下则输出普通的帧。
 
-在标签页模式下，侧边栏留在你启动代理的窗口里，而不在每个代理的窗口里。`sidebar -Close` 只关闭这个多路复用器侧边栏；Claude Code 的 `Agents` 窗格与它无关。
+在标签页模式下，侧边栏留在你启动代理的窗口里，而不在每个代理的窗口里。`sidebar -Close` 只关闭这个多路复用器侧边栏；Claude Code 的 `Agents` 窗格与它无关。该窗格绘制各行的方式与侧边栏相同，包括 `MUX_AGENTS_ASCII=1`：`◉ working`、`✓ done`、`✗ exit N`、`- stopped` 和 `✉ N`，但没有 `◌ waiting`，那只有侧边栏读取。
 
 侧边栏始终停在右边缘、占满整个高度：拆分、布局变化、`swap-pane` 或 `rotate-window` 移动了它时，下一次重绘会把它移回去，且不改变你的焦点。它的宽度随窗口宽度变化；你拖出来的宽度会保留到窗口大小或宽度选项改变为止。两个多路复用器选项决定宽度：`@mux-agents-sidebar-percent`（1-100，默认 5）和 `@mux-agents-sidebar-min`（列数，1-9999，默认 30）；侧边栏取两者中较大的值。可在 `~/.tmux.conf` 中用 `set -g` 设置，也可按会话、窗口或窗格设置（例如 `tmux set -g @mux-agents-sidebar-percent 20`）；改动在下一次重绘时生效，不是范围内整数的值使用其默认值。有窗格处于放大（zoom）状态时，侧边栏不做任何调整，所以绝不会取消你的放大。如果连续 3 次移回失败，它会停止尝试并显示 `layout: repair paused`，直到布局改变或过了一分钟。
 
