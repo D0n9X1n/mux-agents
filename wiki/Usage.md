@@ -41,7 +41,7 @@ You rarely type these: the skill runs them for you. Every command is `<plugin>/s
 |---|---|---|
 | `spawn` | `spawn -Client copilot -Name add-tests -TaskFile task.md -BriefFile brief.md -Split h` | start an agent where the session's `placement` says (a new window by default); `-Split h\|v` or `-Tab` decides for this one; `-Model <model>` picks its model (else the client's default) |
 | `placement` | `placement h`, `placement tab` | where `spawn` opens agents for the rest of the session: `tab` (a new window, the default), `h` or `v` (a split beside you) |
-| `list` | `list -All` | live agents, what each is doing, unread messages; `-All` adds ended ones |
+| `list` | `list -All` | live agents, what each is doing, unread messages; `-All` adds ended ones, each with its `exitCode` |
 | `status` | `status -BodyFile step.txt` | an agent says what it is doing now |
 | `send` | `send claude-1 -BodyFile note.md`, `send parent -BodyFile result.md` | post a message to an agent or to your parent |
 | `read` | `read -Wait 600`, `read claude-1 -Lines 40` | wait for your messages, or read an agent's pane |
@@ -84,7 +84,7 @@ Each live agent shows its state, its name in its own color, its `[model]` when o
 
 The bar is laid out at its pane's size on every redraw and never wraps: long text is cut with `...`, and a short pane drops blank lines first, then ended rows, then the "doing" lines and whole rows of the oldest agents; the header stays. Color follows `NO_COLOR` (off), `FORCE_COLOR` or `CLICOLOR_FORCE` (on), then `TERM=dumb` (off); `MUX_AGENTS_ASCII=1` draws `* o + x m -` instead of the symbols. Each redraw rewrites the rows in place (no full clear), so the bar does not flicker; with `TERM=dumb` it prints plain frames instead.
 
-In tab mode the bar stays in the window you spawned from, not in each agent's window. `sidebar -Close` closes only this multiplexer bar; the Claude Code `Agents` pane is separate.
+In tab mode the bar stays in the window you spawned from, not in each agent's window. `sidebar -Close` closes only this multiplexer bar; the Claude Code `Agents` pane is separate. That pane draws its rows as the bar does, `MUX_AGENTS_ASCII=1` included: `◉ working`, `✓ done`, `✗ exit N`, `- stopped` and `✉ N`, but not `◌ waiting`, which only the bar reads.
 
 The bar stays at the right edge, full height: when a split, a layout change, `swap-pane` or `rotate-window` moves it, the next redraw puts it back without moving your focus. Its width follows the window's width; a width you drag it to is kept until the window is resized or a width option changes. Two multiplexer options set the width: `@mux-agents-sidebar-percent` (1-100, default 5) and `@mux-agents-sidebar-min` (columns, 1-9999, default 30); the bar is the larger of the two. Set them with `set -g` in `~/.tmux.conf` or per session, window or pane (for example `tmux set -g @mux-agents-sidebar-percent 20`); a change applies at the next redraw, and a value that is not a whole number in range uses its default. While a pane is zoomed the bar is left alone, so it never unzooms your pane. If putting it back fails 3 times in a row, it stops trying and shows `layout: repair paused` until the layout changes or a minute passes.
 

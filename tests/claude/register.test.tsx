@@ -292,11 +292,11 @@ test('/mux-agents-pane opens the pane and a stubbed list draws the count and row
   const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
   expect(await header(ui)).toBe('mux-agents · 1 running')
   const live = await ui.find({ type: 'Text', text: /claude-1/ })
-  expect([live?.text, live?.props.dimColor]).toEqual(['● claude-1  claude  4m', undefined])
+  expect([live?.text, live?.props.dimColor]).toEqual(['◉ claude-1  claude  working  4m', undefined])
   const doing = await ui.find({ type: 'Text', text: /build it/ })
   expect([doing?.text, doing?.props.dimColor]).toEqual(['  build it', true])
   const copilot = await ui.find({ type: 'Text', text: /copilot-1/ })
-  expect([copilot?.text, copilot?.props.dimColor]).toEqual(['○ copilot-1  copilot  exited  15m', true])
+  expect([copilot?.text, copilot?.props.dimColor]).toEqual(['- copilot-1  copilot  exited  15m', true])
   await ui.unmount()
 })
 
@@ -532,21 +532,97 @@ test('a live agent\'s chosen model follows its client; an inherited one shows no
   await clock.settle()
   const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
   const texts = (await ui.findAll({ type: 'Text' })).map((t: { text: string }) => t.text)
-  expect(texts).toContain('● w1  claude [sonnet]  4m')
-  expect(texts).toContain('● w2  claude  5s')
+  expect(texts).toContain('◉ w1  claude [sonnet]  working  4m')
+  expect(texts).toContain('◉ w2  claude  working  5s')
   await ui.unmount()
 })
 
-test('ended rows are dimmed and named by state: exited, stopped and lost', async ($, on) => {
-  const { clock } = world(on, { TMUX: 'x' }, [ran(0, list(0, [row('a', 'exited', null, 60), row('b', 'stopped', null, 60), row('c', 'lost', null, 60)]))])
+// Each row's line, its dimColor, and its own colored spans (glyph, badge, state word) as text:color[:bold], found by
+// the row's name. A row's spans are the Texts right after its line whose text is part of it.
+async function drawn(ui: any, name: string) {
+  const all = await ui.findAll({ type: 'Text' })
+  const at = all.findIndex((t: any) => new RegExp(`^\\S ${name}  `).test(t.text))
+  if (at < 0) return undefined
+  const line = all[at]
+  const spans = []
+  for (const t of all.slice(at + 1)) {
+    if (!line.text.includes(t.text)) break
+    if (t.props.color) spans.push(`${t.text}:${t.props.color}${t.props.bold ? ':bold' : ''}`)
+  }
+  return [line.text, line.props.dimColor ?? false, ...spans]
+}
+
+test('every state list -All returns is drawn as the side bar draws it: working, done, exit N, stopped, exited; lost is not', async ($, on) => {
+  const rows = [
+    row('w', 'running', null, 60), { ...row('d', 'exited', null, 60), exitCode: 0 }, { ...row('x', 'exited', null, 60), exitCode: 101 },
+    { ...row('s', 'stopped', null, 60), exitCode: null }, row('o', 'exited', null, 60), { ...row('l', 'lost', null, 60), exitCode: null },
+  ]
+  const { clock } = world(on, { TMUX: 'x' }, [ran(0, list(1, rows))])
   await $.session.start(START)
   await $.command.run({ command: 'mux-agents-pane' })
   await clock.settle()
   const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
-  const rows = []
-  for (const name of ['a', 'b', 'c']) { const t = await ui.find({ type: 'Text', text: new RegExp(`^○ ${name} `) }); rows.push(`${t?.text}|${t?.props.dimColor}`) }
-  expect(rows).toEqual(['○ a  claude  exited  1m|true', '○ b  claude  stopped  1m|true', '○ c  claude  lost  1m|true'])
+  expect(await drawn(ui, 'w')).toEqual(['\u25c9 w  claude  working  1m', false, '\u25c9:green', 'working:green'])
+  expect(await drawn(ui, 'd')).toEqual(['\u2713 d  claude  done  1m', true])
+  expect(await drawn(ui, 'x')).toEqual(['\u2717 x  claude  exit 101  1m', true, '\u2717:red', 'exit 101:red'])
+  expect(await drawn(ui, 's')).toEqual(['- s  claude  stopped  1m', true, '-:yellow', 'stopped:yellow'])
+  // An exit with no code, as an older binary's list answers it.
+  expect(await drawn(ui, 'o')).toEqual(['- o  claude  exited  1m', true])
+  const texts = (await ui.findAll({ type: 'Text' })).map((t: { text: string }) => t.text)
+  expect(texts.filter((t: string) => / l /.test(t) || t.includes('lost'))).toEqual([])
   await ui.unmount()
+})
+
+test('a live agent with unread messages shows the side bar\'s \u2709 N; none at 0', async ($, on) => {
+  const rows = [{ ...row('w1', 'running', null, 240), model: 'sonnet', unread: 2 }, { ...row('w2', 'running', null, 5), unread: 0 }]
+  const { clock } = world(on, { TMUX: 'x' }, [ran(0, list(2, rows))])
+  await $.session.start(START)
+  await $.command.run({ command: 'mux-agents-pane' })
+  await clock.settle()
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  expect(await drawn(ui, 'w1')).toEqual(['\u25c9 w1  claude [sonnet]  \u2709 2  working  4m', false, '\u25c9:green', '\u2709 2:blue:bold', 'working:green'])
+  expect(await drawn(ui, 'w2')).toEqual(['\u25c9 w2  claude  working  5s', false, '\u25c9:green', 'working:green'])
+  await ui.unmount()
+})
+
+test('MUX_AGENTS_ASCII=1 draws the side bar\'s ASCII glyphs and m N; any other value the symbols', async ($, on) => {
+  const rows = [
+    { ...row('w', 'running', null, 60), unread: 1 }, { ...row('d', 'exited', null, 60), exitCode: 0 },
+    { ...row('x', 'exited', null, 60), exitCode: 3 }, { ...row('s', 'stopped', null, 60), exitCode: null },
+  ]
+  const { clock, live } = world(on, { TMUX: 'x', MUX_AGENTS_ASCII: '1' }, [ran(0, list(1, rows))])
+  await $.session.start(START)
+  await $.command.run({ command: 'mux-agents-pane' })
+  await clock.settle()
+  // Each mount reads MUX_AGENTS_ASCII afresh.
+  const rowsDrawn = async () => {
+    const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+    const texts = (await ui.findAll({ type: 'Text' })).map((t: { text: string }) => t.text).filter((t: string) => /^\S \S+  claude  /.test(t))
+    await ui.unmount()
+    return texts
+  }
+  expect(await rowsDrawn()).toEqual(['* w  claude  m 1  working  1m', '+ d  claude  done  1m', 'x x  claude  exit 3  1m', '- s  claude  stopped  1m'])
+  const symbols = ['\u25c9 w  claude  \u2709 1  working  1m', '\u2713 d  claude  done  1m', '\u2717 x  claude  exit 3  1m', '- s  claude  stopped  1m']
+  live.env.MUX_AGENTS_ASCII = 'true'
+  expect(await rowsDrawn()).toEqual(symbols)
+  live.env.MUX_AGENTS_ASCII = '1'
+  live.deny.push('MUX_AGENTS_ASCII')
+  expect(await rowsDrawn()).toEqual(symbols)
+})
+
+// A board stored by an earlier version: `board-2` is declined (an empty board until the first refresh), and a board
+// stored under the current tag whose rows lack unread and exitCode still draws.
+test('a board stored in the old shape draws without crashing', async ($, on) => {
+  let stored: unknown = { shape: 'board-2', value: { running: 7, agents: [row('old', 'running', null, 1)], failed: false } }
+  on('state.get', async () => ({ value: { version: 3, value: stored } }))
+  const old = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  expect((await old.findAll({ type: 'Text' })).map((t: { text: string }) => t.text)).toEqual(['mux-agents \u00b7 0 running'])
+  await old.unmount()
+  stored = { shape: 'board-3', value: { running: 1, agents: [row('w', 'running', null, 1), row('e', 'exited', null, 1), row('s', 'stopped', null, 1)], failed: false } }
+  const lacking = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  expect((await lacking.findAll({ type: 'Text' })).map((t: { text: string }) => t.text).filter((t: string) => / claude  /.test(t)))
+    .toEqual(['\u25c9 w  claude  working  1s', '- e  claude  exited  1s', '- s  claude  stopped  1s'])
+  await lacking.unmount()
 })
 
 test('the pane draws a board whose name and doing hold ESC, BEL and C1, with none of them drawn', async ($, on) => {
@@ -558,7 +634,7 @@ test('the pane draws a board whose name and doing hold ESC, BEL and C1, with non
   const texts = (await ui.findAll({ type: 'Text' })).map((t: { text: string }) => t.text)
   const controls = texts.flatMap((t: string) => [...t].map(c => c.codePointAt(0)!).filter(c => c < 0x20 || (c >= 0x7f && c <= 0x9f)))
   expect(controls).toEqual([])
-  expect(texts).toContain('● ev[31mil  claude  5s')
+  expect(texts).toContain('◉ ev[31mil  claude  working  5s')
   expect(texts).toContain('  done now')
   await ui.unmount()
 })
@@ -570,7 +646,7 @@ test('successful refreshes update rows, count and status; success after a failur
   await $.command.run({ command: 'mux-agents-pane' })
   const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
   await clock.advance(3000)
-  expect([await header(ui), (await ui.find({ type: 'Text', text: /claude-2/ }))?.text]).toEqual(['mux-agents · 2 running', '● claude-2  claude  3s'])
+  expect([await header(ui), (await ui.find({ type: 'Text', text: /claude-2/ }))?.text]).toEqual(['mux-agents · 2 running', '◉ claude-2  claude  working  3s'])
   await clock.advance(3000)
   expect(await header(ui)).toBe('mux-agents · 2 running · refresh failed')
   await clock.advance(3000)
@@ -586,7 +662,7 @@ test('a non-zero exit keeps the last board, marked refresh failed, and leaves th
   await clock.advance(3000)
   const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
   expect(await header(ui)).toBe('mux-agents · 1 running · refresh failed')
-  expect((await ui.find({ type: 'Text', text: /claude-1/ }))?.text).toBe('● claude-1  claude  4m')
+  expect((await ui.find({ type: 'Text', text: /claude-1/ }))?.text).toBe('◉ claude-1  claude  working  4m')
   expect(seen.status).toEqual(['agents: 1'])
   await ui.unmount()
 })
@@ -598,8 +674,8 @@ test('output that is not JSON with exit 0 after a good board keeps that board, m
   await clock.advance(3000)
   const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
   expect(await header(ui)).toBe('mux-agents · 1 running · refresh failed')
-  expect((await ui.find({ type: 'Text', text: /claude-1/ }))?.text).toBe('● claude-1  claude  4m')
-  expect((await ui.find({ type: 'Text', text: /copilot-1/ }))?.text).toBe('○ copilot-1  copilot  exited  15m')
+  expect((await ui.find({ type: 'Text', text: /claude-1/ }))?.text).toBe('◉ claude-1  claude  working  4m')
+  expect((await ui.find({ type: 'Text', text: /copilot-1/ }))?.text).toBe('- copilot-1  copilot  exited  15m')
   expect(seen.status).toEqual(['agents: 1'])
   await ui.unmount()
 })
@@ -612,7 +688,7 @@ test('an otherwise valid board with ok false after a good board keeps that board
   await clock.advance(3000)
   const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
   expect(await header(ui)).toBe('mux-agents · 1 running · refresh failed')
-  expect((await ui.find({ type: 'Text', text: /claude-1/ }))?.text).toBe('● claude-1  claude  4m')
+  expect((await ui.find({ type: 'Text', text: /claude-1/ }))?.text).toBe('◉ claude-1  claude  working  4m')
   expect(await ui.find({ type: 'Text', text: /claude-9/ })).toBe(undefined)
   expect(seen.status).toEqual(['agents: 1'])
   await ui.unmount()
@@ -625,7 +701,7 @@ test('a process rejection right after a good board keeps that board, marked refr
   await clock.advance(3000)
   const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
   expect(await header(ui)).toBe('mux-agents · 1 running · refresh failed')
-  expect((await ui.find({ type: 'Text', text: /claude-1/ }))?.text).toBe('● claude-1  claude  4m')
+  expect((await ui.find({ type: 'Text', text: /claude-1/ }))?.text).toBe('◉ claude-1  claude  working  4m')
   await ui.unmount()
 })
 

@@ -2416,7 +2416,13 @@ exec claude --dangerously-skip-permissions
         // w2's stop notice is unread in the root's mailbox, from w2's pane.
         for (row, (w, state, unread)) in rows.iter().zip([(&w1, "running", 0), (&w2, "stopped", 1)])
         {
-            assert_eq!(keys(row), ROW, "{mux:?}");
+            // An ended row ends with its exitCode: null for a stop.
+            let mut want_keys = ROW.to_vec();
+            if state != "running" {
+                want_keys.push("exitCode");
+                assert_eq!(row["exitCode"], Value::Null, "{mux:?} {row}");
+            }
+            assert_eq!(keys(row), want_keys, "{mux:?}");
             let want = json!({
                 "name": w["name"], "client": "claude", "pane": w["pane"], "window": w["window"], "context": "brief",
                 "parent": root, "sessionId": w["sessionId"], "directory": live.path("work"), "state": state,

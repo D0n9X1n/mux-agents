@@ -1,5 +1,5 @@
 // Pure helpers for the Agents pane: spawn detection, feed parsing, cleaning, age text.
-import type { MuxAgentsBoard } from '../types/index'
+import type { MuxAgentsAgent, MuxAgentsBoard } from '../types/index'
 
 export const EMPTY: MuxAgentsBoard = { running: 0, agents: [], failed: false }
 
@@ -48,9 +48,37 @@ export function parseList(exitCode: number, stdout: string): Omit<MuxAgentsBoard
   const agents = r.agents.map((a: Record<string, unknown>) => ({
     name: clean(String(a.name ?? '')), client: clean(String(a.client ?? '')), state: clean(String(a.state ?? '')),
     doing: typeof a.doing === 'string' ? clean(a.doing) : null, age: typeof a.age === 'number' ? a.age : 0,
-    model: typeof a.model === 'string' ? clean(a.model) : null,
+    model: typeof a.model === 'string' ? clean(a.model) : null, unread: typeof a.unread === 'number' ? a.unread : 0,
+    exitCode: typeof a.exitCode === 'number' ? a.exitCode : null,
   }))
   return { running: r.running, agents }
+}
+
+// How a row is drawn, as the side bar draws it (src/sidebar.rs Kind): its glyph, Unicode or ASCII (MUX_AGENTS_ASCII=1),
+// its state word and their color, undefined for dim. `ended` dims the row.
+export type Look = { glyph: string; word: string; color: 'green' | 'red' | 'yellow' | undefined; ended: boolean }
+
+// A lost agent's pane is gone, so it is not drawn, as on the side bar. An exit with no code (a list from an older
+// binary) is a dim `- exited`: it is neither proof of done nor of a failure. Fields are read tolerantly, since a
+// stored board may lack them.
+export function look(a: MuxAgentsAgent, ascii: boolean): Look | undefined {
+  const code = typeof a.exitCode === 'number' ? a.exitCode : undefined
+  switch (a.state) {
+    case 'running': return { glyph: ascii ? '*' : '\u25c9', word: 'working', color: 'green', ended: false }
+    case 'lost': return undefined
+    case 'exited':
+      if (code === 0) return { glyph: ascii ? '+' : '\u2713', word: 'done', color: undefined, ended: true }
+      if (code !== undefined) return { glyph: ascii ? 'x' : '\u2717', word: `exit ${code}`, color: 'red', ended: true }
+      return { glyph: '-', word: 'exited', color: undefined, ended: true }
+    case 'stopped': return { glyph: '-', word: 'stopped', color: 'yellow', ended: true }
+    default: return { glyph: '-', word: a.state, color: undefined, ended: true }
+  }
+}
+
+// The side bar's unread badge, `✉ N` (ASCII `m N`), only for a count above 0.
+export function mail(unread: unknown, ascii: boolean): string | undefined {
+  if (typeof unread !== 'number' || unread <= 0) return undefined
+  return `${ascii ? 'm' : '\u2709'} ${unread}`
 }
 
 export function formatAge(seconds: number): string {

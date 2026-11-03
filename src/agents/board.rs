@@ -34,10 +34,10 @@ pub fn select_doing(
 }
 
 /// `{running, agents}` for the caller's session: running agents in pane order and, with `all`, `endedTotal` (every
-/// ended agent of the session) and the session's ended agents, newest notice first, at most 10. Unread is the
-/// caller's own mailbox's: a running agent's pane reads its id's, any other pane `pane-<n>`, as the same snapshot
-/// shows it (a tag never names a reader). `watch` (the bar's feed) adds each ended row's exitCode from its
-/// notice.json and each live row's `waiting` (S2.4), and a live row's unread is instead its own messages still unread
+/// ended agent of the session) and the session's ended agents, newest notice first, at most 10, each with its exitCode
+/// from its notice.json. Unread is the caller's own mailbox's: a running agent's pane reads its id's, any other pane
+/// `pane-<n>`, as the same snapshot shows it (a tag never names a reader). `watch` (the bar's feed) adds each live
+/// row's `waiting` (S2.4), and a live row's unread is instead its own messages still unread
 /// in its parent's mailbox (S2.5). Locks one at a time: notice locks, the reader's (or each parent's) mail lock, then
 /// each row's agent lock.
 pub fn board(ctx: &Ctx, caller: &Caller, all: bool, watch: bool) -> Res<Map<String, Value>> {
@@ -99,9 +99,8 @@ pub fn board(ctx: &Ctx, caller: &Caller, all: bool, watch: bool) -> Res<Map<Stri
             if let Some(closed) = end.closed_by {
                 row.insert("closedBy".into(), closed.into());
             }
-            if watch {
-                row.insert("exitCode".into(), end.code);
-            }
+            // Last: its exit code from notice.json, null when it has none.
+            row.insert("exitCode".into(), end.code);
             agents.push(row);
         }
     }
@@ -579,66 +578,54 @@ mod tests {
             write(&folder.join("notice.json"), notice);
         }
         w.panes(&[]);
-        let all = board(&w.ctx, &caller, true, false).unwrap();
-        let rows = all["agents"].as_array().unwrap();
-        let lost = rows[0].as_object().unwrap();
-        assert_eq!(lost["name"], "vanished");
-        // After the 16 row fields, so they keep their places.
-        assert_eq!(
-            lost.iter().map(|(k, v)| (k.as_str(), v)).next_back(),
-            Some(("closedBy", &json!("pane")))
-        );
-        assert!(rows[1].get("closedBy").is_none(), "{}", rows[1]);
-        // The watch feed puts exitCode last, after it.
-        let watch = board(&w.ctx, &caller, true, true).unwrap();
-        let keys: Vec<&str> = watch["agents"][0]
-            .as_object()
-            .unwrap()
-            .keys()
-            .map(String::as_str)
-            .collect();
-        assert_eq!(keys[keys.len() - 2..], ["closedBy", "exitCode"]);
+        // After the 16 row fields, so they keep their places; exitCode last, after it, in list -All and the bar's feed.
+        for watch in [false, true] {
+            let all = board(&w.ctx, &caller, true, watch).unwrap();
+            let rows = all["agents"].as_array().unwrap();
+            let lost = rows[0].as_object().unwrap();
+            assert_eq!(lost["name"], "vanished");
+            assert_eq!(lost["closedBy"], "pane");
+            let keys: Vec<&str> = lost.keys().map(String::as_str).collect();
+            assert_eq!(keys[keys.len() - 2..], ["closedBy", "exitCode"]);
+            assert!(rows[1].get("closedBy").is_none(), "{}", rows[1]);
+        }
     }
 
     #[test]
-    fn with_exit_code_only_for_watch() {
+    fn ended_rows_carry_exit_code_in_list_and_watch() {
         let (w, caller) = ended_world();
-        let watch = board(&w.ctx, &caller, true, true).unwrap();
-        let codes: Vec<String> = watch["agents"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|row| {
-                let row = row.as_object().unwrap();
-                match row.get("exitCode") {
-                    // Added last, after unread.
-                    Some(code) => {
-                        assert_eq!(row.keys().next_back().unwrap(), "exitCode");
-                        format!("{}={code}", row["name"].as_str().unwrap())
-                    }
-                    None => format!("{}=none", row["name"].as_str().unwrap()),
-                }
-            })
-            .collect();
-        assert_eq!(
-            codes,
-            [
-                "worker=none",
-                "done=3",
-                "vanished=null",
-                "tie=null",
-                "halted=null",
-                "late=null"
-            ]
-        );
-        let list = board(&w.ctx, &caller, true, false).unwrap();
-        assert!(
-            !list["agents"]
+        // list -All and the bar's feed alike: every ended row, never a live one.
+        for watch in [false, true] {
+            let reply = board(&w.ctx, &caller, true, watch).unwrap();
+            let codes: Vec<String> = reply["agents"]
                 .as_array()
                 .unwrap()
                 .iter()
-                .any(|row| row.get("exitCode").is_some())
-        );
+                .map(|row| {
+                    let row = row.as_object().unwrap();
+                    match row.get("exitCode") {
+                        // Added last, after the row's fields.
+                        Some(code) => {
+                            assert_eq!(row.keys().next_back().unwrap(), "exitCode");
+                            format!("{}={code}", row["name"].as_str().unwrap())
+                        }
+                        None => format!("{}=none", row["name"].as_str().unwrap()),
+                    }
+                })
+                .collect();
+            assert_eq!(
+                codes,
+                [
+                    "worker=none",
+                    "done=3",
+                    "vanished=null",
+                    "tie=null",
+                    "halted=null",
+                    "late=null"
+                ],
+                "watch={watch}"
+            );
+        }
     }
 
     #[test]
