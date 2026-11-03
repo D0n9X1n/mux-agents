@@ -6,7 +6,7 @@ use super::board::board;
 use super::mail::doing_line;
 use super::registry::{self, find_pane};
 use super::{FILES_ONLY, lock, lock_key, state_dir, usage};
-use crate::caller::{Kind, resolve};
+use crate::caller::{Caller, Kind, resolve};
 use crate::cli::Request;
 use crate::ctx::Ctx;
 use crate::error::{Res, refuse};
@@ -48,11 +48,37 @@ pub fn list_text(reply: &Map<String, Value>, color: bool) -> String {
     crate::json::to_text(&shown)
 }
 
-/// Selects a running agent's window and pane, only while its pane is still its live launch (checked by the server in
-/// the same command), then reads it back: the pane must be active in the active window, live and still that launch.
+/// The agent `focus_pane` selected: its name, pane and window.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Focused {
+    pub name: String,
+    pub pane: String,
+    pub window: String,
+}
+
+/// The `focus` verb: `focus_pane` on the agent its positional names, with no drawn pane to check.
 pub fn focus(ctx: &Ctx, request: &Request) -> Res<Map<String, Value>> {
     let caller = resolve(ctx)?;
-    let pane = find_pane(ctx, &caller, first(request))?;
+    let focused = focus_pane(ctx, &caller, first(request), None)?;
+    let mut reply = Map::new();
+    reply.insert("name".into(), focused.name.into());
+    reply.insert("pane".into(), focused.pane.into());
+    reply.insert("window".into(), focused.window.into());
+    Ok(reply)
+}
+
+/// Selects a running agent's window and pane, only while its pane is still its live launch (checked by the server in
+/// the same command), then reads it back: the pane must be active in the active window, live and still that launch.
+/// With `expected` (the pane the side bar drew), an agent now on another pane is refused before anything is selected.
+pub fn focus_pane(ctx: &Ctx, caller: &Caller, name: &str, expected: Option<&str>) -> Res<Focused> {
+    let pane = find_pane(ctx, caller, name)?;
+    if expected.is_some_and(|e| e != pane.pane) {
+        return refuse(
+            2,
+            "target",
+            "the agent is no longer on the pane the bar drew",
+        );
+    }
     let p = pane.pane.as_str();
     let select = registry::bound(
         p,
@@ -73,11 +99,11 @@ pub fn focus(ctx: &Ctx, request: &Request) -> Res<Map<String, Value>> {
     if !focused {
         return refuse(2, "target", "the agent's pane is no longer its launch");
     }
-    let mut reply = Map::new();
-    reply.insert("name".into(), pane.name.into());
-    reply.insert("pane".into(), pane.pane.into());
-    reply.insert("window".into(), pane.window.into());
-    Ok(reply)
+    Ok(Focused {
+        name: pane.name,
+        pane: pane.pane,
+        window: pane.window,
+    })
 }
 
 /// The positional the verb table requires.
@@ -228,6 +254,34 @@ mod tests {
             run(&w, focus, &["focus", "other"]),
             "2 target no live agent has that name"
         );
+    }
+
+    #[test]
+    fn focus_pane_refuses_a_moved_agent_before_selecting() {
+        let w = World::human("");
+        w.agent_record(ID, json!({"pane": "%10"}));
+        w.panes(&["%10|@5|300|aaaaaaaaaaaa|worker"]);
+        let caller = w.caller();
+        // The bar drew worker on %9; it is on %10 now: refused before any select.
+        w.fakes.clear_log();
+        let moved = focus_pane(&w.ctx, &caller, "worker", Some("%9")).unwrap_err();
+        assert_eq!((moved.code, moved.check), (2, "target"));
+        assert!(
+            w.fakes.mux_calls().iter().all(|c| c[1] != "if-shell"),
+            "{:?}",
+            w.fakes.mux_calls()
+        );
+        // Still on the pane the bar drew, and the read-back proves it focused.
+        w.fakes.mux_first("#{window_active}", 0, "%10|1|1|1\n", "");
+        let focused = focus_pane(&w.ctx, &caller, "worker", Some("%10")).unwrap();
+        assert_eq!(
+            (focused.name, focused.pane, focused.window),
+            ("worker".into(), "%10".into(), "@5".into())
+        );
+        // A read-back that does not prove it focused.
+        w.fakes.mux_first("#{window_active}", 0, "%10|1|0|1\n", "");
+        let unproved = focus_pane(&w.ctx, &caller, "worker", Some("%10")).unwrap_err();
+        assert_eq!((unproved.code, unproved.check), (2, "target"));
     }
 
     #[test]
