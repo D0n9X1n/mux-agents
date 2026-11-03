@@ -1,5 +1,4 @@
 //! The side bar's terminal input as events: keys and SGR mouse reports, decoded from the bytes `watch` reads.
-#![allow(dead_code)] // Until T9 gives every item a caller (#61).
 
 use std::time::SystemTime;
 
