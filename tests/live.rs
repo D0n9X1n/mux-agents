@@ -3659,29 +3659,13 @@ exec claude --dangerously-skip-permissions
     }
 
     // One test fn per scenario, each on its own fresh server.
-    // `ignored <reason>: [...]` adds scenarios that run only with `--ignored`.
     macro_rules! tests_on {
         ($module:ident, $mux:ident, [$($name:ident),* $(,)?]) => {
-            tests_on!($module, $mux, [$($name),*], ignored "": []);
-        };
-        (
-            $module:ident,
-            $mux:ident,
-            [$($name:ident),* $(,)?],
-            ignored $reason:literal: [$($later:ident),* $(,)?]
-        ) => {
             mod $module {
                 $(
                     #[test]
                     fn $name() {
                         super::$name(super::Mux::$mux)
-                    }
-                )*
-                $(
-                    #[test]
-                    #[ignore = $reason]
-                    fn $later() {
-                        super::$later(super::Mux::$mux)
                     }
                 )*
             }
@@ -3737,8 +3721,6 @@ exec claude --dangerously-skip-permissions
                     bar_keeps_its_header_with_emoji_sequences,
                     dead_pane_closed_by_one_conditional,
                     rotated_window_reaches_each_agent_by_its_pane,
-                ],
-                ignored "until T9 (#61)": [
                     bar_click_focuses_an_agent,
                     bar_keys_focus_an_agent,
                     bar_click_after_shrinking_does_nothing,
@@ -3763,7 +3745,7 @@ exec claude --dangerously-skip-permissions
             zoomed_window_left_alone,
             children_are_only_mux_and_client,
             panic_in_lock_frees_lock,
-        ],
-        ignored "until T9 (#61)": [bar_real_client_click_focuses]
+            bar_real_client_click_focuses,
+        ]
     );
 }
