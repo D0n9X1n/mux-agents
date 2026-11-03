@@ -91,6 +91,8 @@ The bar stays at the right edge, full height: when a split, a layout change, `sw
 
 The bar is the process `sidebar` started in it, not its `@agent-role sidebar` label, so a label that moved (rmux's `rotate-window` leaves labels behind) never makes your pane the bar. A pane that carries the label without being that process is never closed: `sidebar`, `sidebar -Close` and a spawn refuse and name it. If it is an old bar, for example one opened by 0.2.1, which `sidebar -Close` cannot prove, close it with `kill-pane -t <pane>`; if it is your own pane, clear the label with `set-option -p -u -t <pane> @agent-role`. A `mux-agent watch` you run by hand only draws the board; only the bar keeps the layout.
 
+Click an agent's name line in the bar to switch to its window and pane. Clicks reach the bar only with `mouse on` (`set -g mouse on`); with it on, Shift-drag selects text. Clicks are off with `MUX_AGENTS_ASCII=1`. A click made while the bar is being resized does nothing and the bar redraws. With the bar pane active, `j`/`k` or the arrow keys select a running agent, Enter switches to it and Esc clears; a switch that fails shows `focus failed: <name>`. `◉` and `◌` in an agent's status or model show as `•`.
+
 ## Safety checks
 
 Agents start with permission prompts off, so mux-agents never gives an agent more than its caller already has. A `spawn` is refused, naming the check, unless:

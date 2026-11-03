@@ -2302,3 +2302,26 @@ fn readme_upgrade_lifecycle() {
         }
     }
 }
+
+#[test]
+fn usage_documents_side_bar_clicks() {
+    // One line of the Side bar section says how a click or a key focuses an agent (#61), and the Chinese twin's
+    // section has a line with the same code spans.
+    let en = section(&wiki_text("Usage"), "Side bar");
+    let zh = section(&wiki_text("Usage-zh-CN"), "侧边栏");
+    let line = en
+        .iter()
+        .find(|l| l.contains("`mouse on`"))
+        .unwrap_or_else(|| panic!("## Side bar does not name `mouse on`: {en:#?}"));
+    for needle in ["`focus failed: ", "`MUX_AGENTS_ASCII=1`"] {
+        assert!(
+            line.contains(needle),
+            "the click line lacks {needle}: {line}"
+        );
+    }
+    let spans = spans_and_numbers(line);
+    assert!(
+        zh.iter().any(|l| spans_and_numbers(l) == spans),
+        "## 侧边栏 has no line with the spans {spans:?}"
+    );
+}

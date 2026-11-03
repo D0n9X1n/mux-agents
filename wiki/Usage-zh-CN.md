@@ -91,6 +91,8 @@ flowchart LR
 
 侧边栏是 `sidebar` 在其中启动的那个进程，而不是它的 `@agent-role sidebar` 标签，所以标签被移动后（rmux 的 `rotate-window` 会把标签留在原处）也绝不会把你的窗格当作侧边栏。带有该标签但不是那个进程的窗格绝不会被关闭：`sidebar`、`sidebar -Close` 和 spawn 都会拒绝并指出它。如果它是旧的侧边栏（例如由 0.2.1 打开、`sidebar -Close` 无法证明的那种），用 `kill-pane -t <pane>` 关闭它；如果它是你自己的窗格，用 `set-option -p -u -t <pane> @agent-role` 清除标签。你手动运行的 `mux-agent watch` 只绘制面板；只有侧边栏会维持布局。
 
+在侧边栏中点击代理的名字行，即可切换到它的窗口和窗格。只有开启 `mouse on`（`set -g mouse on`）时点击才会到达侧边栏；开启后用 Shift 拖动来选择文字。`MUX_AGENTS_ASCII=1` 时点击无效。调整侧边栏大小期间的点击不起作用，侧边栏会重绘。侧边栏窗格处于活动状态时，`j`/`k` 或方向键选择一个运行中的代理，Enter 切换到它，Esc 取消选择；切换失败时显示 `focus failed: <name>`。代理状态或模型中的 `◉` 和 `◌` 显示为 `•`。
+
 ## 安全检查
 
 代理启动时关闭了权限提示，所以 mux-agents 从不给代理超出其调用者已有的权限。除非满足以下条件，`spawn` 会被拒绝并指明检查项：
