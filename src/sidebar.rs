@@ -2619,6 +2619,36 @@ mod tests {
         assert_eq!(diffs(&times), [2000, 2000]);
     }
 
+    #[test]
+    fn watch_waits_2s_from_the_end_of_a_slow_write() {
+        let w = watch_world(&["live", "live", "gone"]);
+        let script = Script::new(&w.fakes, vec![]);
+        let waits = script.waits.clone();
+        let caller = w.caller();
+        let mut frames = 0;
+        let ended = run_watch(&w.ctx, &caller, Box::new(script), &mut |_| {
+            frames += 1;
+            assert!(frames <= 100, "runaway");
+            // The terminal takes 250 ms to take the frame.
+            w.fakes.advance(Duration::from_millis(250));
+            Ok(())
+        });
+        assert_eq!((ended, frames), ("pane-closed", 2));
+        assert_eq!(*waits.borrow(), [2000, 2000]);
+    }
+
+    #[test]
+    fn watch_late_lone_escape_waits_only_the_time_left() {
+        let w = watch_world(&["live", "live", "live", "gone"]);
+        let script = Script::new(&w.fakes, vec![(1990, Waited::Bytes(b"\x1b".to_vec()))]);
+        let waits = script.waits.clone();
+        let (ended, frames, times) = watch_with(&w, Box::new(script));
+        assert_eq!((ended, frames.len()), ("pane-closed", 3));
+        // 10 ms are left of the tick, so the ESC waits 10 ms, not 50, and the next frame is not late.
+        assert_eq!(*waits.borrow(), [2000, 10, 2000, 2000]);
+        assert_eq!(diffs(&times), [2000, 2000]);
+    }
+
     // A terminal set up on a FakeTerm answering `reads`, and its log.
     fn term_input(reads: Vec<io::Result<Waited>>) -> (Box<dyn Input>, Rc<RefCell<Vec<String>>>) {
         let term = FakeTerm {
@@ -2726,6 +2756,29 @@ mod tests {
         assert_eq!(opened.get(), 1);
         assert_eq!(*log.borrow(), ["save", "arm", "raw", "restore", "disarm"]);
         assert_eq!(w.fakes.slept(), [2000, 2000, 2000]);
+    }
+
+    #[test]
+    fn watch_on_reads_the_input_it_opened() {
+        let w = watch_world(&["live"]);
+        let request = w.request(&["watch"]);
+        let opened = Rc::new(Cell::new(0));
+        let open = {
+            let (fakes, opened) = (w.fakes.clone(), opened.clone());
+            move || -> Box<dyn Input> {
+                opened.set(opened.get() + 1);
+                Box::new(Script::new(&fakes, vec![(500, Waited::Bytes(vec![3]))]))
+            }
+        };
+        let mut frames = 0;
+        let reply = watch_on(&w.ctx, &request, true, &open, &mut |_| {
+            frames += 1;
+            assert!(frames <= 100, "runaway");
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!((reply["ended"].as_str(), frames), (Some("interrupted"), 1));
+        assert_eq!(opened.get(), 1);
     }
 
     #[test]
