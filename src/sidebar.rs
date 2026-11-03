@@ -1,7 +1,7 @@
 //! The side bar (MuxAgents.ps1:1423-1591): `sidebar [-Close]` opens or closes one bar per session running
 //! `<abs binary> watch`, and `watch` draws the session's board in it until its pane closes.
 
-mod input;
+pub(crate) mod input;
 mod keys;
 mod pick;
 
@@ -20,8 +20,12 @@ use crate::ctx::{Ctx, Env};
 use crate::error::{Res, refuse};
 use crate::mux::{Output, native};
 use crate::paint::{self, Color, Style};
+use input::{Input, NoInput, Waited};
+use keys::{Decoder, Event};
 
 const TICK: Duration = Duration::from_millis(2000);
+// How long a lone ESC may wait for the rest of a sequence before it counts as the Esc key.
+const ESC_WAIT: Duration = Duration::from_millis(50);
 // A minute of ticks with no answer from the multiplexer: a write to a pipe whose reader closed can still succeed.
 const UNKNOWN_MAX: u32 = 30;
 // The bar's own pane, its label and its size, read each tick (S2.1: the layout follows the actual pane).
@@ -948,17 +952,22 @@ fn read_size(ctx: &Ctx, bar: &str) -> Option<Size> {
 /// keeps it at the right edge of its window (`Keeper`; by its own pane, not its tag, since rmux 0.10.0's
 /// rotate-window leaves pane options behind), reads the board (ended rows with their exit codes, waiting and the
 /// parent's unread), lays it out at the pane's size (and `layout: repair paused` while repair is paused), writes the
-/// frame, then sleeps 2 s. Ends `pane-closed` when the probe answers gone, `output-closed` when a write fails and
-/// `probe-failed` after 30 unknown probes in a row. A failed board read still draws the last board marked `refresh
-/// failed`, so a dead terminal is found even when nothing else answers.
+/// frame, then reads `input` until 2 s after that write: input never moves the next frame, and a lone ESC is waited
+/// on at most 50 ms before it counts as the key. Ends `pane-closed` when the probe answers gone, `output-closed` when
+/// a write fails, `probe-failed` after 30 unknown probes in a row and `interrupted` on Ctrl-C. A failed board read
+/// still draws the last board marked `refresh failed`, so a dead terminal is found even when nothing else answers.
+/// An input that can no longer be read is dropped, which restores its terminal, and the loop goes on without it;
+/// `input` is owned here, so it is dropped, and its terminal restored, on every return and every unwind.
 pub fn run_watch(
     ctx: &Ctx,
     caller: &Caller,
+    mut input: Box<dyn Input>,
     write: &mut dyn FnMut(&str) -> io::Result<()>,
 ) -> &'static str {
     let own = format!("{}|", caller.pane);
     // watch draws only to a terminal (watch_on refuses otherwise).
     let look = Look::from_env(&ctx.env, true);
+    let mut keys = Decoder::default();
     let mut keeper = Keeper::default();
     let mut last: Option<Map<String, Value>> = None;
     let mut size = FALLBACK;
@@ -1010,28 +1019,61 @@ pub fn run_watch(
         if write(&frame(&rows, size, look)).is_err() {
             return "output-closed";
         }
-        ctx.clock.sleep(TICK);
+        let written = ctx.clock.now();
+        loop {
+            let since = ctx.clock.now().duration_since(written).unwrap_or(TICK);
+            let left = TICK.saturating_sub(since);
+            if left.is_zero() {
+                break;
+            }
+            let wait = if keys.lone_esc() {
+                left.min(ESC_WAIT)
+            } else {
+                left
+            };
+            let reads = match input.wait(&*ctx.clock, wait) {
+                Waited::Bytes(bytes) => keys.push(&bytes, ctx.clock.now()),
+                Waited::Timeout => keys.idle(),
+                // The old input is dropped here, which restores its terminal.
+                Waited::Closed => {
+                    input = Box::new(NoInput);
+                    Vec::new()
+                }
+            };
+            if reads.iter().any(|read| read.event == Event::Interrupt) {
+                return "interrupted";
+            }
+        }
     }
 }
 
-/// The side-bar pane's process: draws the board to stdout until its pane closes.
+/// The side-bar pane's process: draws the board to stdout until its pane closes, reading its own terminal when
+/// stdin is one too and `TERM` is not `dumb` (`input::open`).
 pub fn watch(ctx: &Ctx, request: &Request) -> Res<Map<String, Value>> {
     use std::io::{IsTerminal, Write};
     let stdout = io::stdout();
     let terminal = stdout.is_terminal();
     let mut out = stdout.lock();
-    watch_on(ctx, request, terminal, &mut |frame| {
-        out.write_all(frame.as_bytes())?;
-        out.flush()
-    })
+    watch_on(
+        ctx,
+        request,
+        terminal,
+        &|| input::open(&ctx.env),
+        &mut |frame| {
+            out.write_all(frame.as_bytes())?;
+            out.flush()
+        },
+    )
 }
 
 /// Refuses unless stdout is a terminal: a terminal whose pane closed fails the next write, but a pipe whose reader
-/// closed may not, and with the pane alive nothing else would end the loop.
+/// closed may not, and with the pane alive nothing else would end the loop. Opens the input only once it draws, so
+/// a refusal leaves the terminal as it was.
 pub(crate) fn watch_on(
     ctx: &Ctx,
     _request: &Request,
     terminal: bool,
+    open: &dyn Fn() -> Box<dyn Input>,
     write: &mut dyn FnMut(&str) -> io::Result<()>,
 ) -> Res<Map<String, Value>> {
     if !terminal {
@@ -1043,7 +1085,7 @@ pub(crate) fn watch_on(
     }
     let caller = resolve(ctx)?;
     console_utf8();
-    let ended = run_watch(ctx, &caller, write);
+    let ended = run_watch(ctx, &caller, open(), write);
     let mut reply = Map::new();
     reply.insert("pane".into(), caller.pane.into());
     reply.insert("ended".into(), ended.into());
@@ -1530,6 +1572,7 @@ fn open(ctx: &Ctx, caller: &Caller) -> Res<(String, String)> {
 
 #[cfg(test)]
 mod tests {
+    use super::input::{DISABLE, ENABLE, FakeTerm, Input, NoInput, TermInput, Waited};
     use super::*;
     use crate::agents::fixture::{ID, World, write};
     use crate::error::refuse;
@@ -2253,7 +2296,7 @@ mod tests {
     fn watch_run(w: &World) -> (&'static str, Vec<String>) {
         let caller = w.caller();
         let mut frames = Vec::new();
-        let ended = run_watch(&w.ctx, &caller, &mut |frame: &str| {
+        let ended = run_watch(&w.ctx, &caller, Box::new(NoInput), &mut |frame: &str| {
             frames.push(frame.to_string());
             assert!(frames.len() <= 100, "runaway");
             Ok(())
@@ -2376,7 +2419,9 @@ mod tests {
     fn watch_output_closed() {
         let w = watch_world(&["live", "live", "gone"]);
         let caller = w.caller();
-        let ended = run_watch(&w.ctx, &caller, &mut |_| Err(io::Error::other("EIO")));
+        let ended = run_watch(&w.ctx, &caller, Box::new(NoInput), &mut |_| {
+            Err(io::Error::other("EIO"))
+        });
         assert_eq!(ended, "output-closed");
         assert_eq!(probes(&w), 1);
         assert!(w.fakes.slept().is_empty());
@@ -2384,7 +2429,9 @@ mod tests {
         let w = watch_world(&["fail"]);
         w.fakes.mux_first("list-panes", 1, "", "lock");
         let caller = w.caller();
-        let ended = run_watch(&w.ctx, &caller, &mut |_| Err(io::Error::other("EIO")));
+        let ended = run_watch(&w.ctx, &caller, Box::new(NoInput), &mut |_| {
+            Err(io::Error::other("EIO"))
+        });
         assert_eq!((ended, probes(&w)), ("output-closed", 1));
     }
 
@@ -2436,8 +2483,10 @@ mod tests {
         let w = watch_world(&["gone"]);
         w.fakes.clear_log();
         let request = w.request(&["watch"]);
-        let refused =
-            watch_on(&w.ctx, &request, false, &mut |_| panic!("drew to a pipe")).unwrap_err();
+        let refused = watch_on(&w.ctx, &request, false, &no_input, &mut |_| {
+            panic!("drew to a pipe")
+        })
+        .unwrap_err();
         assert_eq!(
             (refused.code, refused.check, refused.message.as_str()),
             (
@@ -2447,11 +2496,283 @@ mod tests {
             )
         );
         assert!(w.fakes.mux_calls().is_empty());
-        let reply = watch_on(&w.ctx, &request, true, &mut |_| Ok(())).unwrap();
+        let reply = watch_on(&w.ctx, &request, true, &no_input, &mut |_| Ok(())).unwrap();
         assert_eq!(
             Value::Object(reply),
             json!({"pane": "%7", "ended": "pane-closed"})
         );
+    }
+
+    fn no_input() -> Box<dyn Input> {
+        Box::new(NoInput)
+    }
+
+    // ---- watch's input
+
+    /// An input that answers `steps` in turn, each `(ms, answer)` due that long after the one before, and records
+    /// each timeout. A step due within the timeout moves the fake clock to it and answers it; else the whole timeout
+    /// passes, without a sleep, and times out.
+    struct Script {
+        fakes: Fakes,
+        steps: VecDeque<(u64, Waited)>,
+        waits: Rc<RefCell<Vec<u64>>>,
+    }
+
+    impl Script {
+        fn new(fakes: &Fakes, steps: Vec<(u64, Waited)>) -> Self {
+            Script {
+                fakes: fakes.clone(),
+                steps: steps.into(),
+                waits: Default::default(),
+            }
+        }
+    }
+
+    impl Input for Script {
+        fn wait(&mut self, _clock: &dyn crate::ctx::Clock, timeout: Duration) -> Waited {
+            let ms = timeout.as_millis() as u64;
+            self.waits.borrow_mut().push(ms);
+            match self.steps.front_mut() {
+                Some((due, _)) if *due <= ms => {
+                    self.fakes.advance(Duration::from_millis(*due));
+                    self.steps.pop_front().unwrap().1
+                }
+                Some((due, _)) => {
+                    *due -= ms;
+                    self.fakes.advance(timeout);
+                    Waited::Timeout
+                }
+                None => {
+                    self.fakes.advance(timeout);
+                    Waited::Timeout
+                }
+            }
+        }
+    }
+
+    // One watch run reading `input`: how it ended, its frames and the fake time (ms) each was written at.
+    fn watch_with(w: &World, input: Box<dyn Input>) -> (&'static str, Vec<String>, Vec<u64>) {
+        let caller = w.caller();
+        let mut frames = Vec::new();
+        let mut times = Vec::new();
+        let ended = run_watch(&w.ctx, &caller, input, &mut |frame: &str| {
+            frames.push(frame.to_string());
+            let at = w.ctx.clock.now().duration_since(SystemTime::UNIX_EPOCH);
+            times.push(at.unwrap().as_millis() as u64);
+            assert!(frames.len() <= 100, "runaway");
+            Ok(())
+        });
+        (ended, frames, times)
+    }
+
+    fn diffs(times: &[u64]) -> Vec<u64> {
+        times.windows(2).map(|t| t[1] - t[0]).collect()
+    }
+
+    #[test]
+    fn watch_under_constant_input_still_draws_every_2s() {
+        let w = watch_world(&["live", "live", "live", "gone"]);
+        let steps = (0..40)
+            .map(|_| (300, Waited::Bytes(b"x".to_vec())))
+            .collect();
+        let script = Script::new(&w.fakes, steps);
+        let waits = script.waits.clone();
+        let (ended, frames, times) = watch_with(&w, Box::new(script));
+        assert_eq!((ended, frames.len()), ("pane-closed", 3));
+        assert_eq!(diffs(&times), [2000, 2000]);
+        let waits = waits.borrow();
+        assert!(waits.iter().all(|&ms| ms > 0 && ms <= 2000), "{waits:?}");
+        // Each tick waits for six reads 300 ms apart, then the 200 ms left.
+        assert_eq!(waits[..7], [2000, 1700, 1400, 1100, 800, 500, 200]);
+        assert!(w.fakes.slept().is_empty());
+    }
+
+    #[test]
+    fn watch_ctrl_c_ends_interrupted() {
+        let w = watch_world(&["live"]);
+        let script = Script::new(&w.fakes, vec![(500, Waited::Bytes(vec![3]))]);
+        let (ended, frames, _) = watch_with(&w, Box::new(script));
+        assert_eq!((ended, frames.len(), probes(&w)), ("interrupted", 1, 1));
+    }
+
+    #[test]
+    fn watch_lone_escape_waits_50ms() {
+        let w = watch_world(&["live", "live", "live", "gone"]);
+        let script = Script::new(&w.fakes, vec![(100, Waited::Bytes(b"\x1b".to_vec()))]);
+        let waits = script.waits.clone();
+        let (ended, frames, times) = watch_with(&w, Box::new(script));
+        assert_eq!((ended, frames.len()), ("pane-closed", 3));
+        assert_eq!(*waits.borrow(), [2000, 50, 1850, 2000, 2000]);
+        assert_eq!(diffs(&times), [2000, 2000]);
+    }
+
+    #[test]
+    fn watch_keeps_drawing_after_input_closes() {
+        let w = watch_world(&["live", "live", "live", "gone"]);
+        let script = Script::new(&w.fakes, vec![(100, Waited::Closed)]);
+        let waits = script.waits.clone();
+        let (ended, frames, times) = watch_with(&w, Box::new(script));
+        assert_eq!((ended, frames.len()), ("pane-closed", 3));
+        assert_eq!(*waits.borrow(), [2000]);
+        // The rest of the tick, then every tick, is slept as without input.
+        assert_eq!(w.fakes.slept()[..2], [1900, 2000]);
+        assert_eq!(diffs(&times), [2000, 2000]);
+    }
+
+    // A terminal set up on a FakeTerm answering `reads`, and its log.
+    fn term_input(reads: Vec<io::Result<Waited>>) -> (Box<dyn Input>, Rc<RefCell<Vec<String>>>) {
+        let term = FakeTerm {
+            reads: reads.into(),
+            ..FakeTerm::new()
+        };
+        let log = term.log.clone();
+        let input = TermInput::setup(term).expect("every step succeeds");
+        (Box::new(input), log)
+    }
+
+    fn logged(bytes: &[u8]) -> String {
+        format!("write {}", bytes.escape_ascii())
+    }
+
+    // One way watch ends: how it ends, the probe answers, the terminal's reads and the frame write.
+    type End = (
+        &'static str,
+        &'static [&'static str],
+        Vec<io::Result<Waited>>,
+        fn(&str) -> io::Result<()>,
+    );
+
+    #[test]
+    fn watch_restores_after_every_exit() {
+        let restored = [logged(DISABLE), "restore".into(), "disarm".into()];
+        let ends: [End; 4] = [
+            ("pane-closed", &["live", "gone"], vec![], |_| Ok(())),
+            ("output-closed", &["live"], vec![], |_| {
+                Err(io::Error::other("EIO"))
+            }),
+            ("probe-failed", &["fail"], vec![], |_| Ok(())),
+            (
+                "interrupted",
+                &["live"],
+                vec![Ok(Waited::Bytes(vec![3]))],
+                |_| Ok(()),
+            ),
+        ];
+        for (want, answers, reads, write) in ends {
+            let w = watch_world(answers);
+            let (input, log) = term_input(reads);
+            let caller = w.caller();
+            let mut frames = 0;
+            let ended = run_watch(&w.ctx, &caller, input, &mut |frame| {
+                frames += 1;
+                assert!(frames <= 100, "runaway");
+                write(frame)
+            });
+            assert_eq!(ended, want);
+            let log = log.borrow();
+            assert_eq!(log[log.len() - 3..], restored, "{want}");
+            let restores = log.iter().filter(|e| *e == "restore").count();
+            assert_eq!(restores, 1, "{want}");
+        }
+        // A panic in the loop unwinds through it, and the input is still dropped.
+        let w = watch_world(&["live"]);
+        let (input, log) = term_input(vec![]);
+        let caller = w.caller();
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            run_watch(&w.ctx, &caller, input, &mut |_| panic!("write"))
+        }));
+        assert!(panicked.is_err());
+        assert_eq!(
+            *log.borrow(),
+            [
+                "save",
+                "arm",
+                "raw",
+                &logged(ENABLE),
+                &restored[0],
+                "restore",
+                "disarm"
+            ]
+        );
+    }
+
+    #[test]
+    fn watch_on_keeps_drawing_when_setup_fails() {
+        let w = watch_world(&["live", "live", "live", "gone"]);
+        let request = w.request(&["watch"]);
+        let log: Rc<RefCell<Vec<String>>> = Default::default();
+        let opened = Rc::new(Cell::new(0));
+        let open = {
+            let (log, opened) = (log.clone(), opened.clone());
+            move || {
+                opened.set(opened.get() + 1);
+                let term = FakeTerm {
+                    log: log.clone(),
+                    fail: Some("raw"),
+                    ..FakeTerm::new()
+                };
+                input::open_with(&Env::default(), true, true, || {
+                    TermInput::setup(term).map(|input| Box::new(input) as Box<dyn Input>)
+                })
+            }
+        };
+        let mut frames = 0;
+        let reply = watch_on(&w.ctx, &request, true, &open, &mut |_| {
+            frames += 1;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!((reply["ended"].as_str(), frames), (Some("pane-closed"), 3));
+        assert_eq!(opened.get(), 1);
+        assert_eq!(*log.borrow(), ["save", "arm", "raw", "restore", "disarm"]);
+        assert_eq!(w.fakes.slept(), [2000, 2000, 2000]);
+    }
+
+    #[test]
+    fn watch_on_opens_the_input_only_once_it_draws() {
+        let w = watch_world(&["gone"]);
+        let request = w.request(&["watch"]);
+        let open = || -> Box<dyn Input> { panic!("opened the terminal") };
+        // Refused for a pipe, and refused outside a pane: the terminal is never touched.
+        assert!(watch_on(&w.ctx, &request, false, &open, &mut |_| Ok(())).is_err());
+        let mut w = w;
+        let env: Vec<(String, String)> = w
+            .ctx
+            .env
+            .iter()
+            .filter(|(k, _)| *k != "TMUX_PANE")
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        w.ctx.env = Env::from_pairs(env);
+        assert!(watch_on(&w.ctx, &request, true, &open, &mut |_| Ok(())).is_err());
+    }
+
+    #[test]
+    fn watch_poll_failure_restores_then_keeps_drawing() {
+        let w = watch_world(&["live", "live", "gone"]);
+        let (input, log) = term_input(vec![Err(io::Error::other("EIO"))]);
+        let caller = w.caller();
+        let ended = run_watch(&w.ctx, &caller, input, &mut |_| {
+            log.borrow_mut().push("frame".into());
+            Ok(())
+        });
+        assert_eq!(ended, "pane-closed");
+        assert_eq!(
+            *log.borrow(),
+            [
+                "save",
+                "arm",
+                "raw",
+                &logged(ENABLE),
+                "frame",
+                &logged(DISABLE),
+                "restore",
+                "disarm",
+                "frame"
+            ]
+        );
+        // The failed read took no time: the tick is slept whole, then the next.
+        assert_eq!(w.fakes.slept(), [2000, 2000]);
     }
 
     // ---- the right-edge lock (S1)
