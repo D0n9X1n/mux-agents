@@ -22,6 +22,7 @@ use crate::mux::{Output, native};
 use crate::paint::{self, Color, Style};
 use input::{Input, NoInput, Waited};
 use keys::{Decoder, Event};
+use pick::Target;
 
 const TICK: Duration = Duration::from_millis(2000);
 // How long a lone ESC may wait for the rest of a sequence before it counts as the Esc key.
@@ -191,6 +192,14 @@ const BADGE: Style = Style {
     ..PLAIN
 };
 const MAIL: &str = "\u{2709}";
+#[allow(dead_code)] // Until T9 draws it (#61).
+const HINT: &str = "Enter: focus  Esc: clear";
+
+/// Agent-supplied text as drawn: '◉' and '◌' become '•' (all one column under unicode-width 0.2.3), so only the
+/// bar's own glyph starts a name line.
+fn own_glyphs(text: &str) -> String {
+    text.replace(['\u{25c9}', '\u{25cc}'], "\u{2022}")
+}
 
 const fn hued(color: Color) -> Style {
     Style {
@@ -325,11 +334,28 @@ fn indented(text: &str, cols: usize) -> Row {
     vec![span("   ", PLAIN), span(paint::cut(text, cols - 2), DIM)]
 }
 
-/// One live agent: its line, its doing line and its age (the oldest drop first).
+/// One live agent: its line, its doing line, its age (the oldest drop first) and what focusing it needs.
 struct Live {
     line: Row,
     doing: Option<Row>,
     age: Option<i64>,
+    target: Target,
+}
+
+/// The rows as drawn, and each drawn running agent with its name line's row, top to bottom.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct Laid {
+    pub rows: Vec<Row>,
+    pub agents: Vec<(Target, usize)>,
+}
+
+/// The drawn running agents, top to bottom (for keys).
+#[allow(dead_code)] // Until T9 gives it a caller (#61).
+fn targets(laid: &Laid) -> Vec<Target> {
+    laid.agents
+        .iter()
+        .map(|(target, _)| target.clone())
+        .collect()
 }
 
 /// The rows a board can draw, before the height decides which are kept.
@@ -369,7 +395,7 @@ fn live_row(row: &Map<String, Value>, cols: usize, look: Look) -> Live {
         row.get("color").and_then(Value::as_str),
         &name,
     ));
-    let model = clean(row.get("model"));
+    let model = own_glyphs(&clean(row.get("model")));
     let model = if model.is_empty() {
         Vec::new()
     } else {
@@ -390,7 +416,7 @@ fn live_row(row: &Map<String, Value>, cols: usize, look: Look) -> Live {
     let line = agent_line(
         span(kind.glyph(look.ascii), kind.style()),
         span(
-            name,
+            own_glyphs(&name),
             Style {
                 color: hue,
                 ..PLAIN
@@ -401,12 +427,16 @@ fn live_row(row: &Map<String, Value>, cols: usize, look: Look) -> Live {
         right(kind, word, &format_age(row.get("age"))),
         cols,
     );
-    let doing = clean(row.get("doing"));
+    let doing = own_glyphs(&clean(row.get("doing")));
     let doing = doing.trim();
     Live {
         line: margin(line),
         doing: (!doing.is_empty()).then(|| indented(doing, cols)),
         age: row.get("age").and_then(Value::as_i64),
+        target: Target {
+            name,
+            pane: clean(row.get("pane")),
+        },
     }
 }
 
@@ -427,10 +457,15 @@ fn header(counts: &str, cols: usize) -> Row {
     ])
 }
 
-fn parts(board: Option<&Map<String, Value>>, notes: &[&str], cols: usize, look: Look) -> Parts {
+fn parts(
+    board: Option<&Map<String, Value>>,
+    notes: &[(&str, Style)],
+    cols: usize,
+    look: Look,
+) -> Parts {
     let notes = notes
         .iter()
-        .map(|note| margin(vec![span(paint::cut(note, cols), DIM)]))
+        .map(|(note, style)| margin(vec![span(paint::cut(&own_glyphs(note), cols), *style)]))
         .collect();
     let Some(board) = board else {
         return Parts {
@@ -469,7 +504,7 @@ fn parts(board: Option<&Map<String, Value>>, notes: &[&str], cols: usize, look: 
         };
         let line = agent_line(
             span(kind.glyph(look.ascii), kind.style()),
-            span(clean(row.get("name")), DIM),
+            span(own_glyphs(&clean(row.get("name"))), DIM),
             Vec::new(),
             Vec::new(),
             right(kind, &word, &format_age(row.get("age"))),
@@ -495,9 +530,11 @@ fn parts(board: Option<&Map<String, Value>>, notes: &[&str], cols: usize, look: 
 }
 
 /// The kept parts as rows: blocks (header, each live agent, `+J more running`, `No agents running.`, the ended
-/// section, the notes) with a blank line between the first `gaps` pairs of them.
-fn assemble(parts: &Parts, shape: &Shape, cols: usize) -> Vec<Row> {
+/// section, the notes) with a blank line between the first `gaps` pairs of them; each shown live agent with its row.
+fn assemble(parts: &Parts, shape: &Shape, cols: usize) -> Laid {
     let mut blocks: Vec<Vec<Row>> = vec![vec![parts.header.clone()]];
+    // The block each shown live agent heads.
+    let mut heads = Vec::new();
     for (at, live) in parts.live.iter().enumerate() {
         if !shape.shown[at] {
             continue;
@@ -506,6 +543,7 @@ fn assemble(parts: &Parts, shape: &Shape, cols: usize) -> Vec<Row> {
         if let Some(doing) = live.doing.as_ref().filter(|_| shape.doing[at]) {
             block.push(doing.clone());
         }
+        heads.push((blocks.len(), &live.target));
         blocks.push(block);
     }
     let hidden = shape.shown.iter().filter(|shown| !**shown).count();
@@ -543,13 +581,17 @@ fn assemble(parts: &Parts, shape: &Shape, cols: usize) -> Vec<Row> {
         blocks.push(parts.notes[..shape.notes].to_vec());
     }
     let mut rows = Vec::new();
+    let mut agents = Vec::new();
     for (at, block) in blocks.into_iter().enumerate() {
         if at > 0 && at <= shape.gaps {
             rows.push(Vec::new());
         }
+        if let Some((_, target)) = heads.iter().find(|(head, _)| *head == at) {
+            agents.push(((*target).clone(), rows.len()));
+        }
         rows.extend(block);
     }
-    rows
+    Laid { rows, agents }
 }
 
 /// Drops the next part in S2.1's overflow order: blank lines (the lowest first), ended rows (folded into `+K more`),
@@ -605,9 +647,23 @@ fn drop_one(parts: &Parts, shape: &mut Shape) -> bool {
 /// (one column is left free at the right, so no row ends in a pending wrap). Under 12 columns, the header only.
 /// `None` is a board never read: the header says `? running`.
 fn layout(board: Option<&Map<String, Value>>, notes: &[&str], size: Size, look: Look) -> Vec<Row> {
+    let notes: Vec<(&str, Style)> = notes.iter().map(|note| (*note, DIM)).collect();
+    lay(board, &notes, size, look).rows
+}
+
+/// `layout` with each note in its own style, and the drawn running agents with their rows.
+fn lay(
+    board: Option<&Map<String, Value>>,
+    notes: &[(&str, Style)],
+    size: Size,
+    look: Look,
+) -> Laid {
     if size.width < 12 {
         let max = size.width.saturating_sub(1).max(1);
-        return vec![cut_row(vec![span("mux-agents", BOLD)], max)];
+        return Laid {
+            rows: vec![cut_row(vec![span("mux-agents", BOLD)], max)],
+            agents: Vec::new(),
+        };
     }
     let cols = size.width - 2;
     let parts = parts(board, notes, cols, look);
@@ -624,14 +680,58 @@ fn layout(board: Option<&Map<String, Value>>, notes: &[&str], size: Size, look: 
     };
     shape.gaps = usize::MAX;
     shape.gaps = assemble(&parts, &shape, cols)
+        .rows
         .iter()
         .filter(|row| row.is_empty())
         .count();
     loop {
-        let mut rows = assemble(&parts, &shape, cols);
-        if rows.len() <= size.height || !drop_one(&parts, &mut shape) {
-            rows.truncate(size.height.max(1));
-            return rows;
+        let mut laid = assemble(&parts, &shape, cols);
+        if laid.rows.len() <= size.height || !drop_one(&parts, &mut shape) {
+            laid.rows.truncate(size.height.max(1));
+            let kept = laid.rows.len();
+            laid.agents.retain(|(_, row)| *row < kept);
+            return laid;
+        }
+    }
+}
+
+/// `lay` with `HINT` last, after a blank line, only when it costs nothing else: the hinted rows are exactly the bare
+/// rows, a blank row and the hint. Otherwise the bare layout, so the hint goes before any other row or gap.
+#[allow(dead_code)] // Until T9 draws it (#61).
+fn with_hint(
+    board: Option<&Map<String, Value>>,
+    notes: &[(&str, Style)],
+    size: Size,
+    look: Look,
+) -> Laid {
+    let bare = lay(board, notes, size, look);
+    let mut hinted_notes = notes.to_vec();
+    hinted_notes.push((HINT, DIM));
+    let hinted = lay(board, &hinted_notes, size, look);
+    let hint = margin(vec![span(
+        paint::cut(HINT, size.width.saturating_sub(2)),
+        DIM,
+    )]);
+    let n = bare.rows.len();
+    let fits = hinted.rows.len() == n + 2
+        && hinted.rows[..n] == bare.rows[..]
+        && hinted.rows[n].is_empty()
+        && hinted.rows[n + 1] == hint;
+    if fits { hinted } else { bare }
+}
+
+/// Marks `name`'s drawn row as selected: its margin becomes `▸` (`>` in ASCII) and, with color, the rest of the row
+/// is reversed. Nothing when `name` is not drawn.
+#[allow(dead_code)] // Until T9 gives it a caller (#61).
+fn mark(laid: &mut Laid, name: &str, look: Look) {
+    let Some(&(_, at)) = laid.agents.iter().find(|(target, _)| target.name == name) else {
+        return;
+    };
+    let row = &mut laid.rows[at];
+    row[0] = span(if look.ascii { ">" } else { "\u{25b8}" }, PLAIN);
+    if look.color {
+        for (_, style) in &mut row[1..] {
+            style.reverse = true;
         }
     }
 }
@@ -2086,6 +2186,289 @@ mod tests {
         assert!(rows[5].contains("test-calc  m 2"), "{}", rows[5]);
         assert!(rows[3].ends_with("..."));
         assert!(rows.iter().all(|r| r.is_ascii()), "{rows:?}");
+    }
+
+    // The mock-up with a pane on each running agent.
+    fn mock_panes() -> Value {
+        let mut board = mock();
+        for (at, pane) in ["%1", "%2", "%3"].into_iter().enumerate() {
+            board["agents"][at]["pane"] = json!(pane);
+        }
+        board
+    }
+
+    fn target(name: &str, pane: &str) -> Target {
+        Target {
+            name: name.into(),
+            pane: pane.into(),
+        }
+    }
+
+    // A line as a pane `w` columns wide shows it: pieces of at most `w` columns, the first its head.
+    fn reflow(line: &str, w: usize) -> Vec<String> {
+        let mut pieces = Vec::new();
+        let mut piece = String::new();
+        for c in line.chars() {
+            if paint::width(&piece) + paint::width(&c.to_string()) > w {
+                pieces.push(std::mem::take(&mut piece));
+            }
+            piece.push(c);
+        }
+        pieces.push(piece);
+        pieces
+    }
+
+    #[test]
+    fn own_glyphs_in_agent_text() {
+        let board = json!({"running": 1, "endedTotal": 1, "agents": [
+            {"name": "worker", "state": "running", "model": "\u{25c9}x", "doing": "\u{25cc} step \u{25c9} two", "age": 5, "unread": 0, "color": "blue", "waiting": false},
+            {"name": "a\u{25c9}b", "state": "stopped", "exitCode": null, "age": 60}
+        ]});
+        let rows = format_board(board.as_object(), &["note \u{25c9}"], W40, PLAIN_LOOK);
+        assert_eq!(
+            rows,
+            [
+                pad("mux-agents", "1 running / 1 ended"),
+                String::new(),
+                pad("\u{25c9} worker [\u{2022}x]", "working   5s"),
+                "   \u{2022} step \u{2022} two".to_string(),
+                String::new(),
+                format!(" ended {}", "-".repeat(31)),
+                pad("- a\u{2022}b", "stopped   1m"),
+                String::new(),
+                " note \u{2022}".to_string(),
+            ]
+        );
+        // One column each, as the glyphs they replace: every row keeps its width.
+        for glyph in ["\u{25c9}", "\u{25cc}", "\u{2022}"] {
+            assert_eq!(paint::width(glyph), 1, "{glyph:?}");
+        }
+        assert_eq!(own_glyphs("\u{25c9} a \u{25cc}"), "\u{2022} a \u{2022}");
+        // Only the bar's own glyph starts a name line.
+        let hits: Vec<_> = rows.iter().filter_map(|row| pick::row_hit(row)).collect();
+        assert_eq!(hits, ["worker"]);
+    }
+
+    #[test]
+    fn lay_lists_drawn_running_agents() {
+        let board = mock_panes();
+        let laid = lay(board.as_object(), &[], W40, PLAIN_LOOK);
+        assert_eq!(
+            laid.agents,
+            [
+                (target("add-subtract", "%1"), 2),
+                (target("test-calc", "%2"), 5),
+                (target("fix-ci-flake", "%3"), 8),
+            ]
+        );
+        assert_eq!(
+            targets(&laid),
+            [
+                target("add-subtract", "%1"),
+                target("test-calc", "%2"),
+                target("fix-ci-flake", "%3"),
+            ]
+        );
+        assert_eq!(laid.rows, layout(board.as_object(), &[], W40, PLAIN_LOOK));
+        // Four rows: the newest agent, then `+2 more running`, which is no agent.
+        let short = Size {
+            width: 40,
+            height: 4,
+        };
+        let laid = lay(board.as_object(), &[], short, PLAIN_LOOK);
+        assert_eq!(laid.agents, [(target("add-subtract", "%1"), 1)]);
+        assert_eq!(render(&laid.rows[2], false), "   +2 more running");
+        // The header only: under 12 columns, or one row.
+        for size in [
+            Size {
+                width: 11,
+                height: 40,
+            },
+            Size {
+                width: 40,
+                height: 1,
+            },
+            Size {
+                width: 40,
+                height: 0,
+            },
+        ] {
+            let laid = lay(board.as_object(), &[], size, PLAIN_LOOK);
+            assert_eq!(laid.agents, [], "{size:?}");
+        }
+        // Ended agents are never listed.
+        let ended = json!({"running": 0, "endedTotal": 1, "agents": [
+            {"name": "halted", "state": "stopped", "exitCode": null, "age": 60, "pane": "%4"}
+        ]});
+        assert_eq!(lay(ended.as_object(), &[], W40, PLAIN_LOOK).agents, []);
+        assert_eq!(lay(None, &[], W40, PLAIN_LOOK).agents, []);
+    }
+
+    #[test]
+    fn row_hit_on_real_layout_output() {
+        // Agent text holding the bar's glyphs and its ASCII ones, at offsets that bring them to a piece's head.
+        let text = |lead: &str| format!("{lead}\u{25c9} x  \u{25cc} y  * z  x w  ").repeat(6);
+        let board = json!({"running": 3, "endedTotal": 1, "agents": [
+            {"name": "add-subtract", "state": "running", "model": "\u{25c9} x", "doing": text(""), "age": 42, "unread": 0, "color": "blue", "waiting": false, "pane": "%1"},
+            {"name": "test-calc", "state": "running", "model": "x w", "doing": text("x "), "age": 180, "unread": 1, "color": "magenta", "waiting": true, "pane": "%2"},
+            {"name": "fix-ci-flake", "state": "running", "model": "\u{25cc} y", "doing": text("* z  "), "age": 660, "unread": 0, "color": "bright-blue", "waiting": false, "pane": "%3"},
+            {"name": "\u{25c9} x", "state": "exited", "exitCode": 0, "age": 1080}
+        ]});
+        let notes = ["\u{25c9} x", " \u{25cc} y"];
+        let ascii = Look {
+            ascii: true,
+            ..PLAIN_LOOK
+        };
+        // A hit names a prefix of the agent drawn there (a cut name ends in `...`).
+        let names = |hit: &str, name: &str| name.starts_with(hit.trim_end_matches("..."));
+        let mut hits = 0;
+        for (width, height) in [(40, 40), (40, 8), (30, 24), (18, 24)] {
+            let size = Size { width, height };
+            let styled: Vec<(&str, Style)> = notes.iter().map(|note| (*note, DIM)).collect();
+            let laid = lay(board.as_object(), &styled, size, PLAIN_LOOK);
+            let lines = format_board(board.as_object(), &notes, size, PLAIN_LOOK);
+            assert!(!laid.agents.is_empty(), "{size:?}");
+            // The agent whose name line is row `at`, if any.
+            let owner = |at: usize| {
+                laid.agents
+                    .iter()
+                    .find(|(_, row)| *row == at)
+                    .map(|(target, _)| target.name.as_str())
+            };
+            for (at, line) in lines.iter().enumerate() {
+                match (pick::row_hit(line), owner(at)) {
+                    (Some(hit), Some(name)) => {
+                        assert!(names(hit, name), "{size:?} {at}: {line:?}");
+                        hits += 1;
+                    }
+                    (got, _) => assert_eq!(got, None, "{size:?} {at}: {line:?}"),
+                }
+                for w in [12, 15, 20] {
+                    for (part, piece) in reflow(line, w).iter().enumerate() {
+                        match (pick::row_hit(piece), owner(at).filter(|_| part == 0)) {
+                            (Some(hit), Some(name)) => {
+                                assert!(names(hit, name), "{size:?} w={w} {at}: {piece:?}");
+                            }
+                            (got, _) => assert_eq!(got, None, "{size:?} w={w} {at}: {piece:?}"),
+                        }
+                    }
+                }
+            }
+            for line in format_board(board.as_object(), &notes, size, ascii) {
+                for w in [usize::MAX, 12, 15, 20] {
+                    for piece in reflow(&line, w) {
+                        assert_eq!(
+                            pick::row_hit(&piece),
+                            None,
+                            "{size:?} ascii w={w}: {piece:?}"
+                        );
+                    }
+                }
+            }
+        }
+        // Every size draws its agents' name lines, and each is hit.
+        assert!(hits >= 4, "{hits}");
+    }
+
+    #[test]
+    fn hint_is_dropped_first() {
+        let board = mock_panes();
+        let hint = |height: usize| {
+            let size = Size { width: 40, height };
+            let bare = lay(board.as_object(), &[], size, PLAIN_LOOK);
+            (with_hint(board.as_object(), &[], size, PLAIN_LOOK), bare)
+        };
+        // The mock-up draws 16 rows: with 18, the hint is last, after a blank line.
+        let (hinted, bare) = hint(18);
+        assert_eq!(bare.rows.len(), 16);
+        assert_eq!(hinted.rows[..16], bare.rows[..]);
+        assert_eq!(hinted.rows[16], Row::new());
+        assert_eq!(render(&hinted.rows[17], false), format!(" {HINT}"));
+        assert_eq!(hinted.agents, bare.agents);
+        // One row short: the bar as it is without the hint.
+        let (hinted, bare) = hint(17);
+        assert_eq!(hinted, bare);
+        // One agent at 40x4: a hinted layout could keep the hint by dropping the gap; it is the bare one.
+        let one = json!({"running": 1, "endedTotal": 0, "agents": [
+            {"name": "worker", "state": "running", "doing": "testing", "age": 5, "unread": 0, "color": "blue", "waiting": false, "pane": "%1"}
+        ]});
+        let size = Size {
+            width: 40,
+            height: 4,
+        };
+        let bare = lay(one.as_object(), &[], size, PLAIN_LOOK);
+        assert_eq!(with_hint(one.as_object(), &[], size, PLAIN_LOOK), bare);
+        let size = Size {
+            width: 40,
+            height: 6,
+        };
+        let hinted = with_hint(one.as_object(), &[], size, PLAIN_LOOK);
+        assert_eq!(
+            render(hinted.rows.last().unwrap(), false),
+            format!(" {HINT}")
+        );
+    }
+
+    #[test]
+    fn selected_row_marks_and_reverses() {
+        let board = json!({"running": 2, "endedTotal": 0, "agents": [
+            {"name": "worker", "state": "running", "doing": "testing", "age": 240, "unread": 0, "color": "blue", "waiting": false, "pane": "%1"},
+            {"name": "writer", "state": "running", "age": 180, "unread": 0, "color": "magenta", "waiting": true, "pane": "%2"}
+        ]});
+        let color = Look {
+            color: true,
+            ..PLAIN_LOOK
+        };
+        let ascii = Look {
+            ascii: true,
+            ..PLAIN_LOOK
+        };
+        let drawn = |look: Look, selected: Option<&str>| {
+            let mut laid = lay(board.as_object(), &[], W40, look);
+            if let Some(name) = selected {
+                mark(&mut laid, name, look);
+            }
+            laid.rows
+                .iter()
+                .map(|row| render(row, look.color))
+                .collect::<Vec<_>>()
+        };
+        let rows = drawn(PLAIN_LOOK, Some("worker"));
+        assert_eq!(
+            rows[2],
+            pad("\u{25c9} worker", "working   4m").replacen(' ', "\u{25b8}", 1)
+        );
+        assert!(
+            rows[2].starts_with("\u{25b8}\u{25c9} worker"),
+            "{:?}",
+            rows[2]
+        );
+        let rows = drawn(ascii, Some("worker"));
+        assert!(rows[2].starts_with(">* worker"), "{:?}", rows[2]);
+        let rows = drawn(color, Some("worker"));
+        let bare = drawn(color, None);
+        assert!(
+            rows[2].starts_with(
+                "\u{25b8}\u{1b}[7;32m\u{25c9}\u{1b}[0m\u{1b}[7m \u{1b}[0m\u{1b}[7;34mworker\u{1b}[0m"
+            ),
+            "{:?}",
+            rows[2]
+        );
+        assert!(
+            rows[2].contains("\u{1b}[7;32mworking\u{1b}[0m"),
+            "{:?}",
+            rows[2]
+        );
+        for (at, (got, want)) in rows.iter().zip(&bare).enumerate() {
+            if at != 2 {
+                assert_eq!(got, want, "{at}");
+            }
+        }
+        // An unknown name marks nothing.
+        let mut laid = lay(board.as_object(), &[], W40, color);
+        let before = laid.rows.clone();
+        mark(&mut laid, "nobody", color);
+        assert_eq!(laid.rows, before);
     }
 
     #[test]
