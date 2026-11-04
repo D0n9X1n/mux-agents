@@ -895,7 +895,7 @@ pub fn required(list: &str) -> Result<Vec<Mux>, String> {
 }
 
 /// The binary and its `-V` answer, or None with a skip message. A multiplexer MUX_AGENTS_LIVE_REQUIRE names is never
-/// skipped: it fails the test instead. The gate is opt-in, so CI without rmux or tmux 3.2a still skips them.
+/// skipped: it fails the test instead. The gate is opt-in; CI's integration job names all three (#71).
 pub fn available(mux: Mux) -> Option<(PathBuf, String)> {
     let list = std::env::var("MUX_AGENTS_LIVE_REQUIRE").unwrap_or_default();
     let gate = required(&list).unwrap_or_else(|why| panic!("{why}"));

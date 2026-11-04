@@ -150,6 +150,12 @@ jobs:
           rustup default 1.95.0
           # tests/release.sh cross-builds the other Apple arch on macOS.
           if [ "$RUNNER_OS" = macOS ]; then rustup target add x86_64-apple-darwin aarch64-apple-darwin; fi
+      # rmux from crates.io at a pinned version, with its own lockfile: `rmux` and `rmux-daemon` land in ~/.cargo/bin.
+      - name: Install rmux 0.10.0
+        run: |
+          set -euo pipefail
+          cargo install rmux --version 0.10.0 --locked
+          rmux -V
       - name: Build tmux 3.2a
         run: |
           set -euo pipefail
@@ -157,7 +163,15 @@ jobs:
           line=$(printf '%s\n' "$out" | tail -n 1)
           case $line in MUX_AGENTS_TMUX32=/*) ;; *) echo "unexpected: $line"; exit 1 ;; esac
           echo "$line" >> "$GITHUB_ENV"
+      # A multiplexer the run cannot find fails the suite instead of skipping its tests (#71); the preflight prints
+      # each one's version and binary.
+      - name: Live preflight
+        env:
+          MUX_AGENTS_LIVE_REQUIRE: tmux,tmux32,rmux
+        run: cargo test --features live,test-panic --locked --test live preflight -- --nocapture
       - name: Live tests
+        env:
+          MUX_AGENTS_LIVE_REQUIRE: tmux,tmux32,rmux
         run: cargo test --features live,test-panic --locked --test live
       - name: Release script tests
         run: sh tests/release.sh
