@@ -100,8 +100,7 @@ Transcript inference; `pane-border-format`; a Copilot CLI panel; notifications.
 - **0.2.2.** The bar is found by its process, not its label (#47, #50), kept at the right edge, full height, `max(40, window / 5)` columns wide; colors by state and agent, `NO_COLOR`, ASCII glyphs and an in-place redraw with synchronized output (#51).
 - **0.2.4.** The width is `max(@mux-agents-sidebar-min, window × @mux-agents-sidebar-percent / 100)`, by default 30 columns and 5% (#59).
 - **0.2.5.** A left click on an agent's name line, or `j`/`k` and Enter in the bar, switches to that agent's window and pane; `◉`/`◌` in agent text draw as `•` (#61).
-- **#74.** The default width is back to 20% of the window, at least 40 columns.
-- **#70.** Clicks and keys work on Windows too: `watch` reads the console in VT input mode and restores it on every exit.
+- **0.2.6.** The default width is back to 20% of the window, at least 40 columns (#74). Clicks and keys work on Windows too: `watch` reads the console in VT input mode and restores it on every exit (#70).
 
 ## Rust (0.2.0)
 
