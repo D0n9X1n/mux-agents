@@ -890,6 +890,28 @@ fn ci_jobs_run_cargo_and_sh() {
         ],
     );
     ordered(
+        "integration-windows",
+        &[
+            r#"echo "TEMP=$RUNNER_TEMP" >> "$GITHUB_ENV""#,
+            "git fetch -q --depth 1 https://github.com/Helvesec/rmux dfd68c774ca0f4212139a21d37d09c90f75f8bd7",
+            "cargo build --locked --bin rmux",
+            "cargo clippy --all-targets --features live,test-panic --locked -- -D warnings",
+            "cargo test --features live,test-panic --locked --test live_windows -- --nocapture",
+        ],
+    );
+    let windows = code_lines(&ci);
+    let windows = job(&windows, "integration-windows");
+    for want in [
+        "    runs-on: windows-latest",
+        "      RMUX_ALLOW_INTERNAL_DAEMON_IN_CALLER_JOB: '1'",
+        "      MUX_AGENTS_LIVE_REQUIRE: rmux",
+    ] {
+        assert!(
+            windows.iter().any(|l| l == want),
+            "integration-windows: {want}"
+        );
+    }
+    ordered(
         "lint",
         &[
             "./actionlint",

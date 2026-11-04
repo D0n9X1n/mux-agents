@@ -70,10 +70,362 @@ fn platform_setup() -> Option<Box<dyn Input>> {
     TermInput::setup(Tty::stdio()).map(|input| Box::new(input) as Box<dyn Input>)
 }
 
-/// Windows: draw-only, never reading the console (#70).
+/// Windows: the console on stdin and stdout, set up (#70).
 #[cfg(windows)]
 fn platform_setup() -> Option<Box<dyn Input>> {
-    None
+    TermInput::setup(Console::stdio()).map(|input| Box::new(input) as Box<dyn Input>)
+}
+
+/// Turns the characters of console key records into UTF-8, one read at a time (#70). Under VT input the console
+/// reports each character of a sequence as a key-down record of its own; key-up records and records with no character
+/// are dropped. The first half of a surrogate pair is held until its second half, even across reads; a lone half is
+/// U+FFFD.
+#[cfg(any(windows, test))]
+#[derive(Default)]
+pub(crate) struct KeyUnits {
+    high: Option<u16>,
+}
+
+#[cfg(any(windows, test))]
+impl KeyUnits {
+    /// One record: `down` its key state, `repeat` its repeat count (0 counts once), `unit` its UTF-16 character.
+    pub(crate) fn push(&mut self, down: bool, repeat: u16, unit: u16, out: &mut Vec<u8>) {
+        if !down || unit == 0 {
+            return;
+        }
+        for _ in 0..repeat.max(1) {
+            self.unit(unit, out);
+        }
+    }
+
+    fn unit(&mut self, unit: u16, out: &mut Vec<u8>) {
+        let held = self.high.take();
+        if let Some(high) = held
+            && (0xdc00..=0xdfff).contains(&unit)
+        {
+            let pair = char::decode_utf16([high, unit]).next().and_then(Result::ok);
+            return put(pair.unwrap_or(char::REPLACEMENT_CHARACTER), out);
+        }
+        if held.is_some() {
+            put(char::REPLACEMENT_CHARACTER, out);
+        }
+        if (0xd800..=0xdbff).contains(&unit) {
+            self.high = Some(unit);
+        } else {
+            put(
+                char::from_u32(u32::from(unit)).unwrap_or(char::REPLACEMENT_CHARACTER),
+                out,
+            );
+        }
+    }
+}
+
+#[cfg(any(windows, test))]
+fn put(c: char, out: &mut Vec<u8>) {
+    out.extend_from_slice(c.encode_utf8(&mut [0; 4]).as_bytes());
+}
+
+#[cfg(windows)]
+pub use windows::Console;
+
+#[cfg(windows)]
+mod windows {
+    use std::ffi::c_void;
+    use std::io;
+    use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, Ordering};
+    use std::sync::{Mutex, MutexGuard};
+    use std::time::{Duration, Instant};
+
+    use windows_sys::Win32::Foundation::{
+        FALSE, HANDLE, INVALID_HANDLE_VALUE, TRUE, WAIT_OBJECT_0, WAIT_TIMEOUT,
+    };
+    use windows_sys::Win32::Storage::FileSystem::WriteFile;
+    use windows_sys::Win32::System::Console::{
+        CTRL_BREAK_EVENT, CTRL_C_EVENT, ENABLE_ECHO_INPUT, ENABLE_EXTENDED_FLAGS,
+        ENABLE_LINE_INPUT, ENABLE_PROCESSED_INPUT, ENABLE_QUICK_EDIT_MODE,
+        ENABLE_VIRTUAL_TERMINAL_INPUT, GetConsoleMode, GetNumberOfConsoleInputEvents, GetStdHandle,
+        INPUT_RECORD, KEY_EVENT, ReadConsoleInputW, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
+        SetConsoleCtrlHandler, SetConsoleMode,
+    };
+    use windows_sys::Win32::System::Threading::WaitForSingleObject;
+    use windows_sys::core::BOOL;
+
+    use super::{DISABLE, KeyUnits, Term, Waited};
+    use crate::ctx::Clock;
+
+    // The input mode `save` read, which `raw` changes and `restore` and the handler put back.
+    static SAVED: AtomicU32 = AtomicU32::new(0);
+    // Whether the handler restores the console: set by `arm`, cleared by `disarm`.
+    static ARMED: AtomicBool = AtomicBool::new(false);
+    // Whether a `Console` holds the globals: one per process, from `save` to `disarm`.
+    static OWNED: AtomicBool = AtomicBool::new(false);
+    static IN: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
+    static OUT: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
+    // Held by the handler and by every change to the console (`save`, `raw`, `write`, `restore`, and `arm` and
+    // `disarm` setting `ARMED`). The handler runs on a thread of its own, so without it a setup step could run just
+    // after the handler restored the mode and leave the console raw when the process ends. True once the handler
+    // ran while armed: the console is ending, and `raw`, `write` and `restore` then change nothing.
+    static GATE: Mutex<bool> = Mutex::new(false);
+
+    fn gate() -> MutexGuard<'static, bool> {
+        GATE.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    // The error a setup step answers once the handler ran.
+    fn ended() -> io::Error {
+        io::Error::other("the console is ending")
+    }
+
+    /// The saved input mode without line editing, echo, Ctrl-C processing or quick edit, and with VT input: each
+    /// key, arrow and mouse report arrives as its characters, and Ctrl-C as byte 0x03.
+    pub(crate) fn raw_mode(saved: u32) -> u32 {
+        (saved
+            & !(ENABLE_LINE_INPUT
+                | ENABLE_ECHO_INPUT
+                | ENABLE_PROCESSED_INPUT
+                | ENABLE_QUICK_EDIT_MODE))
+            | ENABLE_VIRTUAL_TERMINAL_INPUT
+            | ENABLE_EXTENDED_FLAGS
+    }
+
+    fn valid(handle: HANDLE) -> bool {
+        !handle.is_null() && handle != INVALID_HANDLE_VALUE
+    }
+
+    /// Writes every byte to `output`.
+    fn write_all(output: HANDLE, mut bytes: &[u8]) -> io::Result<()> {
+        while !bytes.is_empty() {
+            let len = bytes.len().min(u32::MAX as usize) as u32;
+            let mut n = 0u32;
+            // SAFETY: `bytes` is valid for `len` bytes and `n` for the count written; no overlapped I/O.
+            if unsafe { WriteFile(output, bytes.as_ptr(), len, &mut n, std::ptr::null_mut()) } == 0
+            {
+                return Err(io::Error::last_os_error());
+            }
+            if n == 0 {
+                return Err(io::ErrorKind::WriteZero.into());
+            }
+            bytes = &bytes[n as usize..];
+        }
+        Ok(())
+    }
+
+    /// The console control handler, run by the system on a thread of its own: while armed it marks the console
+    /// ending, puts the saved input mode back and, on Ctrl-C or Ctrl-Break, turns mouse reports off, all under
+    /// `GATE`, so no setup step undoes it. It returns FALSE, so the next handler, and at last the default one, still
+    /// ends the process. On close, logoff and shutdown the console is going away and console calls are unreliable:
+    /// it writes nothing then.
+    unsafe extern "system" fn on_ctrl(event: u32) -> BOOL {
+        let mut ending = gate();
+        if ARMED.load(Ordering::Acquire) {
+            *ending = true;
+            // SAFETY: `ARMED` means `save` stored `SAVED` and the handles first, under `GATE`, which is held here.
+            // Console never closes the handles. A failed call is ignored: the process ends either way.
+            unsafe { SetConsoleMode(IN.load(Ordering::Relaxed), SAVED.load(Ordering::Relaxed)) };
+            if matches!(event, CTRL_C_EVENT | CTRL_BREAK_EVENT) {
+                let _ = write_all(OUT.load(Ordering::Relaxed), DISABLE);
+            }
+        }
+        FALSE
+    }
+
+    /// The console read from `input` and written to `output`: the real `Term` on Windows. Only one may hold the
+    /// console per process, since the control handler restores it from globals. It borrows the handles: it never
+    /// closes them, so the handler never sees a closed one.
+    pub struct Console {
+        input: HANDLE,
+        output: HANDLE,
+        installed: bool,
+        keys: KeyUnits,
+    }
+
+    impl Console {
+        /// The process's own console: its standard input and output handles.
+        pub fn stdio() -> Console {
+            // SAFETY: GetStdHandle takes a constant; a handle that is missing or not a console fails `save`.
+            unsafe {
+                Console::on(
+                    GetStdHandle(STD_INPUT_HANDLE),
+                    GetStdHandle(STD_OUTPUT_HANDLE),
+                )
+            }
+        }
+
+        pub(crate) fn on(input: HANDLE, output: HANDLE) -> Console {
+            Console {
+                input,
+                output,
+                installed: false,
+                keys: KeyUnits::default(),
+            }
+        }
+
+        fn set(&self, mode: u32) -> io::Result<()> {
+            // SAFETY: takes the handle and a mode value only.
+            if unsafe { SetConsoleMode(self.input, mode) } == 0 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(())
+        }
+
+        /// Reads the records waiting, never more, so the read does not block; answers the bytes of their keys.
+        fn read_keys(&mut self) -> io::Result<Vec<u8>> {
+            let mut bytes = Vec::new();
+            let mut waiting = 0u32;
+            // SAFETY: `waiting` is valid for the call.
+            if unsafe { GetNumberOfConsoleInputEvents(self.input, &mut waiting) } == 0 {
+                return Err(io::Error::last_os_error());
+            }
+            if waiting == 0 {
+                return Ok(bytes);
+            }
+            // SAFETY: INPUT_RECORD is plain data: all zeroes is a valid value for ReadConsoleInputW to fill in.
+            let mut records: [INPUT_RECORD; 64] = unsafe { std::mem::zeroed() };
+            let want = waiting.min(records.len() as u32);
+            let mut read = 0u32;
+            // SAFETY: `records` has room for `want` records and `read` is valid for the count read.
+            if unsafe { ReadConsoleInputW(self.input, records.as_mut_ptr(), want, &mut read) } == 0
+            {
+                return Err(io::Error::last_os_error());
+            }
+            for record in &records[..read as usize] {
+                if u32::from(record.EventType) != KEY_EVENT {
+                    continue;
+                }
+                // SAFETY: a KEY_EVENT record's event is its KeyEvent member, and a key record's character is its
+                // UnicodeChar member when read with ReadConsoleInputW.
+                let (key, unit) = unsafe {
+                    (
+                        record.Event.KeyEvent,
+                        record.Event.KeyEvent.uChar.UnicodeChar,
+                    )
+                };
+                self.keys
+                    .push(key.bKeyDown != 0, key.wRepeatCount, unit, &mut bytes);
+            }
+            Ok(bytes)
+        }
+    }
+
+    impl Term for Console {
+        /// Claims the globals, then reads the mode to restore; a second `Console`, or a handle that is not a
+        /// console, is an error.
+        fn save(&mut self) -> io::Result<()> {
+            let mut ending = gate();
+            if OWNED
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_err()
+            {
+                return Err(io::Error::other("a console is already set up"));
+            }
+            *ending = false;
+            let mut mode = 0u32;
+            let read = if !valid(self.input) {
+                Err(io::Error::other("no console input"))
+            // SAFETY: `mode` is valid for the call; a handle that is not a console fails it.
+            } else if unsafe { GetConsoleMode(self.input, &mut mode) } == 0 {
+                Err(io::Error::last_os_error())
+            } else {
+                Ok(())
+            };
+            if let Err(error) = read {
+                OWNED.store(false, Ordering::Release);
+                return Err(error);
+            }
+            SAVED.store(mode, Ordering::Relaxed);
+            IN.store(self.input, Ordering::Relaxed);
+            OUT.store(self.output, Ordering::Relaxed);
+            Ok(())
+        }
+
+        /// Arms the handler, then installs it. The handler list is changed outside `GATE`, so the system never waits
+        /// on it while a handler waits on `GATE`.
+        fn arm(&mut self) -> io::Result<()> {
+            {
+                let _gate = gate();
+                ARMED.store(true, Ordering::Release);
+            }
+            // SAFETY: `on_ctrl` only reads the globals `save` stored and makes console calls on their handles.
+            if unsafe { SetConsoleCtrlHandler(Some(on_ctrl), TRUE) } == 0 {
+                return Err(io::Error::last_os_error());
+            }
+            self.installed = true;
+            Ok(())
+        }
+
+        /// The raw mode, unless the handler already restored the console.
+        fn raw(&mut self) -> io::Result<()> {
+            let ending = gate();
+            if *ending {
+                return Err(ended());
+            }
+            self.set(raw_mode(SAVED.load(Ordering::Relaxed)))
+        }
+
+        /// Writes every byte, unless the handler already restored the console: no ENABLE after its DISABLE.
+        fn write(&mut self, bytes: &[u8]) -> io::Result<()> {
+            let ending = gate();
+            if *ending {
+                return Err(ended());
+            }
+            write_all(self.output, bytes)
+        }
+
+        /// Puts the saved mode back, unless the handler already did; a failure is ignored, as there is nothing left
+        /// to try.
+        fn restore(&mut self) {
+            let ending = gate();
+            if !*ending {
+                let _ = self.set(SAVED.load(Ordering::Relaxed));
+            }
+        }
+
+        /// Disarms the handler under `GATE`, so a handler already running finishes first and any later one does
+        /// nothing; then removes it and gives up the globals.
+        fn disarm(&mut self) {
+            {
+                let _gate = gate();
+                ARMED.store(false, Ordering::Release);
+            }
+            if std::mem::take(&mut self.installed) {
+                // SAFETY: removes the handler `arm` added; a failure leaves a disarmed handler that does nothing.
+                unsafe { SetConsoleCtrlHandler(Some(on_ctrl), FALSE) };
+            }
+            OWNED.store(false, Ordering::Release);
+        }
+
+        /// Waits up to `timeout`, by the real time and not `clock`, for key records: records with no key (a resize,
+        /// focus) are read and dropped, and the wait goes on to the same deadline. A zero timeout still looks once,
+        /// so keys already waiting are read. Never ReadFile, which would block on a buffer holding only such
+        /// records. A failed wait or read is an error.
+        fn poll_read(&mut self, _clock: &dyn Clock, timeout: Duration) -> io::Result<Waited> {
+            let deadline = Instant::now() + timeout;
+            let mut looked = false;
+            loop {
+                let left = deadline.saturating_duration_since(Instant::now());
+                if left.is_zero() && looked {
+                    return Ok(Waited::Timeout);
+                }
+                looked = true;
+                // Rounded up, so the wait never wakes early and spins on a deadline less than a millisecond away;
+                // below INFINITE.
+                let ms = left
+                    .as_nanos()
+                    .div_ceil(1_000_000)
+                    .min(u128::from(u32::MAX - 1)) as u32;
+                // SAFETY: waits on the input handle `save` checked; waiting consumes nothing.
+                match unsafe { WaitForSingleObject(self.input, ms) } {
+                    WAIT_OBJECT_0 => {}
+                    WAIT_TIMEOUT => continue,
+                    _ => return Err(io::Error::last_os_error()),
+                }
+                let bytes = self.read_keys()?;
+                if !bytes.is_empty() {
+                    return Ok(Waited::Bytes(bytes));
+                }
+            }
+        }
+    }
 }
 
 #[cfg(unix)]
@@ -364,13 +716,13 @@ mod unix {
 }
 
 /// Turns on mouse press and release reports in SGR form; `DISABLE` turns them off in reverse.
-#[cfg(any(unix, test))] // Windows only draws (#70); its tests still drive `TermInput` on a `FakeTerm`.
+#[cfg(any(unix, windows, test))]
 pub const ENABLE: &[u8] = b"\x1b[?1000h\x1b[?1006h";
-#[cfg(any(unix, test))]
+#[cfg(any(unix, windows, test))]
 pub const DISABLE: &[u8] = b"\x1b[?1006l\x1b[?1000l";
 
 /// The terminal calls `TermInput` makes, one per setup step and one per undo, so a test can fail any of them.
-#[cfg(any(unix, test))]
+#[cfg(any(unix, windows, test))]
 pub trait Term {
     fn save(&mut self) -> io::Result<()>;
     fn arm(&mut self) -> io::Result<()>;
@@ -382,7 +734,7 @@ pub trait Term {
 }
 
 // The setup steps begun so far; each is set before its call, so one that fails partway is still undone.
-#[cfg(any(unix, test))]
+#[cfg(any(unix, windows, test))]
 #[derive(Default)]
 struct Steps {
     armed: bool,
@@ -391,13 +743,13 @@ struct Steps {
 }
 
 /// The side bar's terminal while `watch` reads it: set up step by step, and undone in reverse when dropped.
-#[cfg(any(unix, test))]
+#[cfg(any(unix, windows, test))]
 pub struct TermInput<T: Term> {
     term: T,
     steps: Steps,
 }
 
-#[cfg(any(unix, test))]
+#[cfg(any(unix, windows, test))]
 impl<T: Term> TermInput<T> {
     /// Saves the terminal, then arms it, makes it raw and turns on mouse reports, in that order. A failed save
     /// answers `None` with nothing to undo; any later failure answers `None` once the steps begun are undone.
@@ -418,7 +770,7 @@ impl<T: Term> TermInput<T> {
     }
 }
 
-#[cfg(any(unix, test))]
+#[cfg(any(unix, windows, test))]
 impl<T: Term> Input for TermInput<T> {
     /// A terminal that cannot be read is `Closed`: `watch` stops reading it, never retries it.
     fn wait(&mut self, clock: &dyn Clock, timeout: Duration) -> Waited {
@@ -428,7 +780,7 @@ impl<T: Term> Input for TermInput<T> {
     }
 }
 
-#[cfg(any(unix, test))]
+#[cfg(any(unix, windows, test))]
 impl<T: Term> Drop for TermInput<T> {
     /// Undoes the steps begun in reverse: mouse reports off (a failed write is ignored), then the saved mode back,
     /// then disarmed.
@@ -595,6 +947,52 @@ mod tests {
         );
     }
 
+    // What `KeyUnits` turns `(down, repeat, unit)` records into, one read at a time.
+    fn units(keys: &mut KeyUnits, records: &[(bool, u16, u16)]) -> Vec<u8> {
+        let mut out = Vec::new();
+        for &(down, repeat, unit) in records {
+            keys.push(down, repeat, unit, &mut out);
+        }
+        out
+    }
+
+    #[test]
+    fn key_records_become_utf8_bytes() {
+        let mut keys = KeyUnits::default();
+        // Key-up records and records with no character are dropped; a repeat count repeats the character, and a
+        // count of 0 still counts once.
+        let read = units(
+            &mut keys,
+            &[
+                (true, 1, 0x6a),
+                (false, 1, 0x6a),
+                (true, 1, 0),
+                (true, 3, 0x6b),
+                (true, 0, 0x1b),
+            ],
+        );
+        assert_eq!(read, b"jkkk\x1b");
+        // An SGR press and Ctrl-C come through byte for byte; é is two UTF-8 bytes.
+        let sgr: Vec<(bool, u16, u16)> = "\x1b[<0;3;5M\x03é"
+            .encode_utf16()
+            .map(|u| (true, 1, u))
+            .collect();
+        assert_eq!(units(&mut keys, &sgr), "\x1b[<0;3;5M\x03é".as_bytes());
+        // A surrogate pair split across two reads is held until its second half arrives.
+        assert_eq!(units(&mut keys, &[(true, 1, 0xd83d)]), b"");
+        assert_eq!(units(&mut keys, &[(false, 1, 0xde00)]), b"");
+        assert_eq!(units(&mut keys, &[(true, 1, 0xde00)]), "😀".as_bytes());
+        // A lone half is U+FFFD, and the character after a lone high half still counts.
+        assert_eq!(
+            units(&mut keys, &[(true, 1, 0xd83d), (true, 1, 0x6a)]),
+            "\u{fffd}j".as_bytes()
+        );
+        assert_eq!(
+            units(&mut keys, &[(true, 1, 0xde00)]),
+            "\u{fffd}".as_bytes()
+        );
+    }
+
     #[test]
     fn no_input_sleeps_the_timeout_but_never_zero() {
         let fakes = Fakes::default();
@@ -676,16 +1074,400 @@ mod tests {
         assert_eq!(fakes.slept(), Vec::<u64>::new());
     }
 
-    // Draw-only on Windows (#70): two terminals still get `NoInput`, and the console is never touched.
+    // The Windows console tests (#70): each runs this test binary again as a child with CREATE_NO_WINDOW, which
+    // gives the child a hidden console of its own, as the unix tests use a pty. The child opens CONIN$, writes
+    // records into it as a terminal's keys would arrive, and checks what `Console` reads and leaves behind.
     #[cfg(windows)]
-    #[test]
-    fn windows_setup_is_none() {
-        assert!(platform_setup().is_none());
-        let fakes = Fakes::default();
-        let env = Env::from_pairs([("TERM", "xterm-256color")]);
-        let mut input = open_with(&env, true, true, platform_setup);
-        assert_eq!(input.wait(&fakes, Duration::ZERO), Waited::Timeout);
-        assert_eq!(fakes.slept(), Vec::<u64>::new());
+    mod console {
+        use std::ffi::c_void;
+        use std::io::Read;
+        use std::os::windows::process::CommandExt;
+        use std::process::{Command, Stdio};
+        use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, Ordering};
+        use std::time::Instant;
+
+        use windows_sys::Win32::Foundation::{
+            FALSE, GENERIC_READ, GENERIC_WRITE, HANDLE, INVALID_HANDLE_VALUE, TRUE,
+        };
+        use windows_sys::Win32::Storage::FileSystem::{
+            CreateFileW, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
+        };
+        use windows_sys::Win32::System::Console::{
+            CTRL_BREAK_EVENT, ENABLE_ECHO_INPUT, ENABLE_LINE_INPUT, ENABLE_PROCESSED_INPUT,
+            ENABLE_QUICK_EDIT_MODE, ENABLE_VIRTUAL_TERMINAL_INPUT, FOCUS_EVENT,
+            GenerateConsoleCtrlEvent, GetConsoleMode, GetStdHandle, INPUT_RECORD, KEY_EVENT,
+            STD_OUTPUT_HANDLE, SetConsoleCtrlHandler, WINDOW_BUFFER_SIZE_EVENT, WriteConsoleInputW,
+        };
+        use windows_sys::Win32::System::Threading::CREATE_NO_WINDOW;
+        use windows_sys::core::BOOL;
+
+        use super::super::windows::raw_mode;
+        use super::*;
+
+        // The variable that makes `child` run: `setup`, `break` or `during`.
+        const CHILD: &str = "MUX_AGENTS_CONSOLE_CHILD";
+        // Where `observe` writes the mode it saw.
+        const SEEN: &str = "MUX_AGENTS_CONSOLE_SEEN";
+        // How a process ends by Ctrl-Break under the default handler: STATUS_CONTROL_C_EXIT.
+        const CTRL_EXIT: u32 = 0xC000_013A;
+
+        // Runs `child` for `case` with a hidden console of its own; answers its exit code and its stdout, where
+        // `Console` writes ENABLE and DISABLE.
+        fn run(case: &str, seen: Option<&std::path::Path>) -> (u32, Vec<u8>) {
+            let mut command = Command::new(std::env::current_exe().unwrap());
+            command
+                .args([
+                    "--exact",
+                    "sidebar::input::tests::console::child",
+                    "--include-ignored",
+                    "--test-threads=1",
+                    "--nocapture",
+                ])
+                .env(CHILD, case)
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .creation_flags(CREATE_NO_WINDOW);
+            if let Some(seen) = seen {
+                command.env(SEEN, seen);
+            }
+            let mut child = command.spawn().unwrap();
+            let drain = |mut pipe: Box<dyn Read + Send>| {
+                std::thread::spawn(move || {
+                    let mut bytes = Vec::new();
+                    let _ = pipe.read_to_end(&mut bytes);
+                    bytes
+                })
+            };
+            let out = drain(Box::new(child.stdout.take().unwrap()));
+            let err = drain(Box::new(child.stderr.take().unwrap()));
+            // The child sleeps 20 s if Ctrl-Break does not end it: give up after that.
+            let deadline = Instant::now() + Duration::from_secs(30);
+            let status = loop {
+                if let Some(status) = child.try_wait().unwrap() {
+                    break status;
+                }
+                if Instant::now() > deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    panic!("{case}: the child did not end");
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            };
+            let (out, err) = (out.join().unwrap(), err.join().unwrap());
+            let code = status.code().unwrap() as u32;
+            assert!(
+                code == 0 || code == CTRL_EXIT,
+                "{case}: exit {code:#x}\n{}\n{}",
+                out.escape_ascii(),
+                err.escape_ascii()
+            );
+            (code, out)
+        }
+
+        // Setup takes the raw mode and turns mouse reports on; keys come back as their bytes, records with no key
+        // never end a wait early, and Drop puts the console back and gives it up.
+        #[test]
+        fn console_sets_up_reads_keys_and_restores() {
+            let (code, out) = run("setup", None);
+            let text = out.escape_ascii().to_string();
+            assert_eq!(code, 0, "{text}");
+            let enable = find(&out, ENABLE).unwrap_or_else(|| panic!("no ENABLE: {text}"));
+            let disable = find(&out, DISABLE).unwrap_or_else(|| panic!("no DISABLE: {text}"));
+            assert!(enable < disable, "{text}");
+        }
+
+        // Ctrl-Break after setup: the handler puts the mode back and turns mouse reports off, then the process still
+        // ends by Ctrl-Break. The next handler, run after ours, sees the mode as it was before setup.
+        #[test]
+        fn ctrl_break_restores_the_console_before_the_process_ends() {
+            let seen = std::env::temp_dir().join(format!(
+                "mux-agents-console-break-{}.txt",
+                std::process::id()
+            ));
+            let _ = std::fs::remove_file(&seen);
+            let (code, out) = run("break", Some(&seen));
+            let observed = std::fs::read_to_string(&seen).unwrap_or_default();
+            let _ = std::fs::remove_file(&seen);
+            let text = out.escape_ascii().to_string();
+            assert_eq!(code, CTRL_EXIT, "{text}");
+            let (before, after) = observed
+                .split_once(' ')
+                .unwrap_or_else(|| panic!("no mode seen: {observed:?} {text}"));
+            assert_eq!(before, after, "the mode after the handler");
+            let enable = find(&out, ENABLE).unwrap_or_else(|| panic!("no ENABLE: {text}"));
+            let disable = find(&out, DISABLE).unwrap_or_else(|| panic!("no DISABLE: {text}"));
+            assert!(enable < disable, "{text}");
+        }
+
+        // Ctrl-Break in the middle of setup, its handler running on its own thread before the ENABLE write: the
+        // write is refused, so setup fails and the handler's restore stands. A later setup takes the console again.
+        #[test]
+        fn ctrl_break_during_setup_never_leaves_the_console_raw() {
+            let (code, out) = run("during", None);
+            let text = out.escape_ascii().to_string();
+            assert_eq!(code, 0, "{text}");
+            // The handler's DISABLE comes first; the only ENABLE is the later setup's.
+            let disable = find(&out, DISABLE).unwrap_or_else(|| panic!("no DISABLE: {text}"));
+            let enable = find(&out, ENABLE).unwrap_or_else(|| panic!("no ENABLE: {text}"));
+            assert!(disable < enable, "{text}");
+        }
+
+        // CONIN$ for `observe`, and the mode before setup.
+        static CONIN: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
+        static BEFORE: AtomicU32 = AtomicU32::new(0);
+        // Set by `swallow` once it ran, which is after our handler finished.
+        static SWALLOWED: AtomicBool = AtomicBool::new(false);
+
+        // Registered before setup, so it runs after `Console`'s handler: writes the mode before setup and the mode
+        // now to `SEEN`, and lets the process end.
+        unsafe extern "system" fn observe(_event: u32) -> BOOL {
+            let mut now = 0;
+            // SAFETY: `now` is valid for the call; CONIN$ stays open for the whole process.
+            unsafe { GetConsoleMode(CONIN.load(Ordering::Relaxed), &mut now) };
+            if let Ok(path) = std::env::var(SEEN) {
+                let before = BEFORE.load(Ordering::Relaxed);
+                let _ = std::fs::write(path, format!("{before:#x} {now:#x}"));
+            }
+            FALSE
+        }
+
+        // Registered before setup, so it runs after `Console`'s handler: keeps the process alive.
+        unsafe extern "system" fn swallow(_event: u32) -> BOOL {
+            SWALLOWED.store(true, Ordering::Release);
+            TRUE
+        }
+
+        // The child's own console input, open for the whole process.
+        fn conin() -> HANDLE {
+            let name: Vec<u16> = "CONIN$".encode_utf16().chain([0]).collect();
+            // SAFETY: `name` is a NUL-terminated wide string; the handle is never closed.
+            let handle = unsafe {
+                CreateFileW(
+                    name.as_ptr(),
+                    GENERIC_READ | GENERIC_WRITE,
+                    FILE_SHARE_READ | FILE_SHARE_WRITE,
+                    std::ptr::null(),
+                    OPEN_EXISTING,
+                    0,
+                    std::ptr::null_mut(),
+                )
+            };
+            assert_ne!(
+                handle,
+                INVALID_HANDLE_VALUE,
+                "CONIN$: {}",
+                io::Error::last_os_error()
+            );
+            handle
+        }
+
+        fn stdout() -> HANDLE {
+            // SAFETY: takes a constant.
+            unsafe { GetStdHandle(STD_OUTPUT_HANDLE) }
+        }
+
+        fn mode(handle: HANDLE) -> u32 {
+            let mut mode = 0;
+            // SAFETY: `mode` is valid for the call.
+            assert_ne!(unsafe { GetConsoleMode(handle, &mut mode) }, 0);
+            mode
+        }
+
+        // Writes `records` into the console's input, as a terminal's keys would arrive.
+        fn type_in(handle: HANDLE, records: &[INPUT_RECORD]) {
+            let mut n = 0;
+            // SAFETY: `records` is valid for its length and `n` for the count written.
+            let written = unsafe {
+                WriteConsoleInputW(handle, records.as_ptr(), records.len() as u32, &mut n)
+            };
+            assert_ne!(written, 0, "{}", io::Error::last_os_error());
+            assert_eq!(n as usize, records.len());
+        }
+
+        fn record(kind: u32) -> INPUT_RECORD {
+            // SAFETY: INPUT_RECORD is plain data: all zeroes is a valid value.
+            let mut record: INPUT_RECORD = unsafe { std::mem::zeroed() };
+            record.EventType = kind as u16;
+            record
+        }
+
+        fn key(down: bool, unit: u16) -> INPUT_RECORD {
+            let mut key = record(KEY_EVENT);
+            key.Event.KeyEvent.bKeyDown = i32::from(down);
+            key.Event.KeyEvent.wRepeatCount = 1;
+            key.Event.KeyEvent.uChar.UnicodeChar = unit;
+            key
+        }
+
+        // Each character of `text` as a key-down record, as the console reports VT input.
+        fn keys(text: &str) -> Vec<INPUT_RECORD> {
+            text.encode_utf16().map(|unit| key(true, unit)).collect()
+        }
+
+        // A `Console` that sends Ctrl-Break inside its first write, before writing, and waits for the handlers to
+        // finish: the handler then runs between `raw` and the ENABLE write.
+        struct Breaking {
+            console: Console,
+            sent: bool,
+        }
+
+        impl Term for Breaking {
+            fn save(&mut self) -> io::Result<()> {
+                self.console.save()
+            }
+
+            fn arm(&mut self) -> io::Result<()> {
+                self.console.arm()
+            }
+
+            fn raw(&mut self) -> io::Result<()> {
+                self.console.raw()
+            }
+
+            fn write(&mut self, bytes: &[u8]) -> io::Result<()> {
+                if !std::mem::replace(&mut self.sent, true) {
+                    // SAFETY: Ctrl-Break to the processes on this console: this child alone.
+                    assert_ne!(unsafe { GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, 0) }, 0);
+                    let end = Instant::now() + Duration::from_secs(10);
+                    while !SWALLOWED.load(Ordering::Acquire) {
+                        assert!(Instant::now() < end, "Ctrl-Break never arrived");
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                }
+                self.console.write(bytes)
+            }
+
+            fn restore(&mut self) {
+                self.console.restore();
+            }
+
+            fn disarm(&mut self) {
+                self.console.disarm();
+            }
+
+            fn poll_read(&mut self, clock: &dyn Clock, timeout: Duration) -> io::Result<Waited> {
+                self.console.poll_read(clock, timeout)
+            }
+        }
+
+        fn setup(input: HANDLE, before: u32) {
+            let fakes = Fakes::default();
+            // A handle that is not console input fails `save` and takes nothing: setup still works after.
+            assert!(TermInput::setup(Console::on(INVALID_HANDLE_VALUE, stdout())).is_none());
+            assert!(TermInput::setup(Console::on(stdout(), stdout())).is_none());
+            let mut term =
+                TermInput::setup(Console::on(input, stdout())).expect("the console sets up");
+            let now = mode(input);
+            assert_eq!(now, raw_mode(before), "{before:#x} -> {now:#x}");
+            let cleared = ENABLE_LINE_INPUT
+                | ENABLE_ECHO_INPUT
+                | ENABLE_PROCESSED_INPUT
+                | ENABLE_QUICK_EDIT_MODE;
+            assert_eq!(now & cleared, 0, "{now:#x}");
+            assert_ne!(now & ENABLE_VIRTUAL_TERMINAL_INPUT, 0, "{now:#x}");
+            assert!(
+                TermInput::setup(Console::on(input, stdout())).is_none(),
+                "a second Console while the first is held"
+            );
+
+            // A focus record and a key-up are dropped; each key-down character comes back, in one read.
+            let sent = "\x1b[<0;3;5M\x1b[<0;3;5m\x1b[Aé\r\x03";
+            let mut records = vec![
+                record(FOCUS_EVENT),
+                key(true, 'j' as u16),
+                key(false, 'j' as u16),
+            ];
+            records.extend(keys(sent));
+            type_in(input, &records);
+            let want = format!("j{sent}").into_bytes();
+            assert_eq!(
+                term.wait(&fakes, Duration::from_secs(5)),
+                Waited::Bytes(want)
+            );
+
+            // A resize alone wakes the wait but holds no key: the wait goes on to its deadline.
+            type_in(input, &[record(WINDOW_BUFFER_SIZE_EVENT)]);
+            let start = Instant::now();
+            assert_eq!(
+                term.wait(&fakes, Duration::from_millis(300)),
+                Waited::Timeout
+            );
+            assert!(
+                start.elapsed() >= Duration::from_millis(290),
+                "{:?}",
+                start.elapsed()
+            );
+
+            // A zero wait reads keys already waiting, and times out when there are none.
+            type_in(input, &keys("k"));
+            assert_eq!(
+                term.wait(&fakes, Duration::ZERO),
+                Waited::Bytes(b"k".to_vec())
+            );
+            assert_eq!(term.wait(&fakes, Duration::ZERO), Waited::Timeout);
+            assert!(fakes.slept().is_empty(), "waits run on the real time");
+
+            drop(term);
+            assert_eq!(mode(input), before, "Drop restores the mode");
+            // Given back: the next Console takes the console again.
+            drop(TermInput::setup(Console::on(input, stdout())).expect("set up again"));
+            assert_eq!(mode(input), before);
+        }
+
+        fn ctrl_break(input: HANDLE, before: u32) {
+            // SAFETY: `observe` only reads the console mode and writes a file.
+            assert_ne!(unsafe { SetConsoleCtrlHandler(Some(observe), TRUE) }, 0);
+            let term = TermInput::setup(Console::on(input, stdout())).expect("the console sets up");
+            assert_eq!(mode(input), raw_mode(before));
+            // SAFETY: Ctrl-Break to the processes on this console: this child alone.
+            assert_ne!(unsafe { GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, 0) }, 0);
+            std::thread::sleep(Duration::from_secs(20));
+            drop(term);
+            panic!("Ctrl-Break did not end the process");
+        }
+
+        fn during(input: HANDLE, before: u32) {
+            // SAFETY: `swallow` only stores a flag.
+            assert_ne!(unsafe { SetConsoleCtrlHandler(Some(swallow), TRUE) }, 0);
+            let breaking = Breaking {
+                console: Console::on(input, stdout()),
+                sent: false,
+            };
+            assert!(
+                TermInput::setup(breaking).is_none(),
+                "the ENABLE write after the handler is refused"
+            );
+            assert_eq!(mode(input), before, "the handler's restore stands");
+            drop(TermInput::setup(Console::on(input, stdout())).expect("set up again"));
+            assert_eq!(mode(input), before);
+        }
+
+        // Run only by the tests above, in its own process with a hidden console; without `CHILD` it never touches
+        // the console.
+        #[test]
+        #[ignore = "a child of the console tests"]
+        fn child() {
+            let Ok(case) = std::env::var(CHILD) else {
+                return;
+            };
+            let input = conin();
+            CONIN.store(input, Ordering::Relaxed);
+            let before = mode(input);
+            BEFORE.store(before, Ordering::Relaxed);
+            let cooked = ENABLE_LINE_INPUT | ENABLE_ECHO_INPUT | ENABLE_PROCESSED_INPUT;
+            assert_eq!(
+                before & cooked,
+                cooked,
+                "a new console is cooked: {before:#x}"
+            );
+            match case.as_str() {
+                "setup" => setup(input, before),
+                "break" => ctrl_break(input, before),
+                "during" => during(input, before),
+                other => panic!("unknown case {other}"),
+            }
+        }
     }
 
     #[test]
@@ -775,7 +1557,7 @@ mod tests {
         }
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     fn find(seen: &[u8], bytes: &[u8]) -> Option<usize> {
         seen.windows(bytes.len()).position(|w| w == bytes)
     }

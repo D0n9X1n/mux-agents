@@ -27,7 +27,7 @@ In the main chat session, show a side bar with the agent count and one line per 
   - `-All` adds the session's ended agents, newest first, at most 10, and `endedTotal`, the count of all of them.
   - The result gains `running`, the count of live agents.
 - **`sidebar [-Close]`.** Refused (`tagged`) only from an agent pane; the main Claude Code or Copilot chat and a plain shell may run it. One bar per session, under the session's sidebar lock: the proven bar is returned with `opened: false`, else a new one opens. `-Close` first sets the session option `@mux-agents-sidebar` to `off`, so no later spawn reopens it, then kills the bar only while it is still the recorded process; `sidebar` unsets the option. A pane that carries `@agent-role sidebar` but cannot be proven the bar refuses `1 sidebar` and is named, never closed. The bar has no `@agent-id`, so it is outside the cap and `list`.
-- **`watch`.** The bar's loop: every 2 s, and at once after a key or a left press in the bar, it reads its own pane's size, reads the feed in-process and draws the board at that size. A frame drawn after a failed board read or an unanswered probe of its pane ends with `refresh failed`. It ends `pane-closed` when its pane is gone, `output-closed` when a write fails, `probe-failed` after 30 unanswered probes in a row (a minute), and `interrupted` on Ctrl-C typed in the bar; it restores the terminal on every exit. It draws only to a terminal: with stdout redirected it refuses `usage`, so it runs only as the bar pane's own command. Only the bar's own `watch` keeps the layout; one run by hand draws and takes clicks and keys. It reads its terminal only when stdin and stdout are both terminals and `TERM` is not `dumb`, and never on Windows; otherwise it only draws.
+- **`watch`.** The bar's loop: every 2 s, and at once after a key or a left press in the bar, it reads its own pane's size, reads the feed in-process and draws the board at that size. A frame drawn after a failed board read or an unanswered probe of its pane ends with `refresh failed`. It ends `pane-closed` when its pane is gone, `output-closed` when a write fails, `probe-failed` after 30 unanswered probes in a row (a minute), and `interrupted` on Ctrl-C typed in the bar; it restores the terminal on every exit. It draws only to a terminal: with stdout redirected it refuses `usage`, so it runs only as the bar pane's own command. Only the bar's own `watch` keeps the layout; one run by hand draws and takes clicks and keys. It reads its terminal only when stdin and stdout are both terminals and `TERM` is not `dumb`; otherwise it only draws. On Windows it reads the console: VT input with line editing, echo, Ctrl-C processing and quick edit off, waits on the input handle and reads key records (never `ReadFile`, which a resize record would block), and a console control handler puts the mode back on Ctrl-C, Ctrl-Break or close.
 
 `spawn` writes `taskLine` (the task's first non-empty line, 80 characters) into `record.json`. `send` from an agent writes `last-sent.json` (`line`, `at`) in the sender's folder. Every `doing` source (status, last line, task line) loses control characters and tabs before storage, and the bar strips C0, DEL and C1 controls again before drawing, so no field moves the cursor or adds a line.
 
@@ -74,11 +74,13 @@ In the main chat session, show a side bar with the agent count and one line per 
   - Layout on fixed boards at many sizes, emoji and ZWJ sequences included, and a board whose fields hold ESC sequences, BEL and C1 bytes: the output holds none of them.
   - Keeper: a moved bar goes back and the focus stays, a zoomed window is left alone, 3 failures pause repair, a changed window or option resizes.
 - **Live (Linux, macOS).** Real tmux 3.8, tmux 3.2a and rmux 0.10.0 servers: the bar opens at the right edge at its width, draws the board, goes back after the layout is damaged, and `-Close` closes it.
+- **Windows console (#70).** The test binary runs itself again with a hidden console of its own: setup takes the raw mode, typed records come back as their bytes, a resize alone never ends a wait early, Drop restores the mode, and Ctrl-Break after or during setup leaves the mode restored.
+- **Live (Windows).** `tests/live_windows.rs` in a private rmux 0.10.0 server (a debug build in CI, since the release daemon cannot start in a runner's job object, rmux#238): `j` then Enter and a click on the bar focus an agent, and Ctrl-C ends a hand-run `watch` with mouse reports off.
 - **Claude Code pane.** `tests/claude/register.test.tsx` and `tests/claude/board.test.ts` under `claude plugin test`: a spawn tool call opens the pane, a stubbed `list` renders count and rows, a failed refresh keeps the last board. The lint job installs Claude Code 2.1.310 and runs `claude plugin validate .` and `claude plugin test .`.
 
 ## Must-pass
 
-`cargo test --features test-panic --locked` on every OS, `cargo test --features live,test-panic --locked --test live` on Linux and macOS, and `claude plugin test .`.
+`cargo test --features test-panic --locked` on every OS, `cargo test --features live,test-panic --locked --test live` on Linux and macOS, `cargo test --features live,test-panic --locked --test live_windows` on Windows, and `claude plugin test .`.
 
 ## Non-goals
 
@@ -99,6 +101,7 @@ Transcript inference; `pane-border-format`; a Copilot CLI panel; notifications.
 - **0.2.4.** The width is `max(@mux-agents-sidebar-min, window × @mux-agents-sidebar-percent / 100)`, by default 30 columns and 5% (#59).
 - **0.2.5.** A left click on an agent's name line, or `j`/`k` and Enter in the bar, switches to that agent's window and pane; `◉`/`◌` in agent text draw as `•` (#61).
 - **#74.** The default width is back to 20% of the window, at least 40 columns.
+- **#70.** Clicks and keys work on Windows too: `watch` reads the console in VT input mode and restores it on every exit.
 
 ## Rust (0.2.0)
 
