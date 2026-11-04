@@ -23,7 +23,7 @@ Start Claude Code and Copilot CLI agents in tmux or rmux panes, see what each is
 
 - **Helpers in panes you can see.** Ask in your chat; choose once per session whether agents open as tabs or as panes beside you, and the side bar opens on its own.
 - **They start with your context.** A same-client agent forks your conversation; any other agent starts from a brief you write.
-- **A live side bar.** How many agents run and what each is doing right now; on macOS and Linux, click one to jump to it.
+- **A live side bar.** How many agents run and what each is doing right now; click one to jump to it.
 - **Mailboxes, not keystrokes.** Agents report back through files; nothing ever types into another pane.
 - **Safe by default.** An agent never gets more than its caller already has; a refused spawn names the reason.
 - **Fast and native.** One small Rust binary on macOS, Linux and Windows; `list` with six agents takes about 23 ms, and no PowerShell or .NET is needed.

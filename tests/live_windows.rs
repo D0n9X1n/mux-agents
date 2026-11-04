@@ -1,0 +1,377 @@
+#![cfg(all(windows, feature = "live"))]
+//! Windows live tests for the side bar's clicks and keys (#70): a private rmux server per test (`rmux -L <name>`,
+//! never the user's own) whose root pane is `cmd.exe`, with `claude.exe` on PATH as the fake client. Each test
+//! drives the bar as a terminal would and checks which pane the multiplexer then has active.
+//!
+//! Run with `cargo test --features live --test live_windows -- --nocapture`. Without rmux on PATH each test is
+//! skipped, unless MUX_AGENTS_LIVE_REQUIRE names `rmux`: then it fails. In CI, rmux 0.10.0 runs from a debug build
+//! with RMUX_ALLOW_INTERNAL_DAEMON_IN_CALLER_JOB=1, since a release rmux 0.10.0 cannot start its daemon inside a
+//! runner's job object (rmux#238).
+
+use std::ffi::{OsStr, OsString};
+use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::time::{Duration, Instant};
+
+use serde_json::Value;
+
+// Generous for loaded runners: a wait only runs this long when something is wrong.
+const WAIT: Duration = Duration::from_secs(60);
+const MUX_AGENT: &str = env!("CARGO_BIN_EXE_mux-agent");
+// The pane's mouse reporting, as the multiplexer tracks it: `11` once the bar wrote ENABLE, `00` after DISABLE.
+const MOUSE: &str = "#{mouse_any_flag}#{mouse_sgr_flag}";
+// Variables of the caller's own session that must not reach the private server.
+const SCRUB: [&str; 9] = [
+    "RMUX",
+    "TMUX",
+    "TMUX_PANE",
+    "MUX_AGENTS_STATE",
+    "MUX_AGENTS_ASCII",
+    "CLAUDECODE",
+    "CLAUDE_CODE_SESSION_ID",
+    "CLAUDE_CODE_ENTRYPOINT",
+    "COPILOT_AGENT_SESSION_ID",
+];
+
+/// One test's server and temp dir; dropping it ends the fake clients, kills the server and removes the dir.
+struct Live {
+    socket: String,
+    dir: PathBuf,
+    root: String,
+}
+
+impl Live {
+    /// A server whose one pane runs `cmd.exe`, or None (with a message) when rmux is not installed and not
+    /// required.
+    fn start() -> Option<Live> {
+        let required = std::env::var("MUX_AGENTS_LIVE_REQUIRE")
+            .unwrap_or_default()
+            .split(',')
+            .any(|m| m.trim() == "rmux");
+        match Command::new("rmux").arg("-V").output() {
+            Ok(out) if out.status.success() => {
+                eprintln!("rmux: {}", String::from_utf8_lossy(&out.stdout).trim());
+            }
+            other => {
+                assert!(!required, "MUX_AGENTS_LIVE_REQUIRE names rmux: {other:?}");
+                eprintln!("skipped: no rmux on PATH");
+                return None;
+            }
+        }
+        static N: AtomicU32 = AtomicU32::new(0);
+        let socket = format!(
+            "mxit-{}-{}",
+            std::process::id(),
+            N.fetch_add(1, Ordering::Relaxed)
+        );
+        let dir = std::env::temp_dir().join(&socket);
+        let _ = std::fs::remove_dir_all(&dir);
+        for sub in ["bin", "state"] {
+            std::fs::create_dir_all(dir.join(sub)).unwrap();
+        }
+        std::fs::copy(
+            env!("CARGO_BIN_EXE_fake-client"),
+            dir.join("bin").join("claude.exe"),
+        )
+        .unwrap();
+        std::fs::write(dir.join("task.txt"), "say hi").unwrap();
+        let mut path = dir.join("bin").into_os_string();
+        path.push(";");
+        path.push(Path::new(MUX_AGENT).parent().unwrap());
+        if let Some(rest) = std::env::var_os("PATH") {
+            path.push(";");
+            path.push(rest);
+        }
+        let mut start = Command::new("rmux");
+        start.args([
+            "-L",
+            &socket,
+            "new-session",
+            "-d",
+            "-s",
+            "it",
+            "-x",
+            "200",
+            "-y",
+            "50",
+        ]);
+        for (name, value) in [
+            ("MUX_AGENTS_STATE", dir.join("state").into_os_string()),
+            ("MUX_IT_DIR", dir.clone().into_os_string()),
+            ("MUX_IT_ENTRY", OsString::from(MUX_AGENT)),
+            ("PATH", path),
+        ] {
+            start.arg("-e").arg(assign(name, &value));
+        }
+        for name in SCRUB {
+            start.env_remove(name);
+        }
+        let out = start.arg("cmd.exe").output().unwrap();
+        // Built before the check, so a failed start still kills whatever began.
+        let mut live = Live {
+            socket,
+            dir,
+            root: String::new(),
+        };
+        assert!(out.status.success(), "new-session: {out:?}");
+        live.root = live
+            .call(&["list-panes", "-a", "-F", "#{pane_id}"])
+            .trim()
+            .to_string();
+        live.prompt(&live.root.clone());
+        Some(live)
+    }
+
+    /// `rmux -L <socket> <args>`; panics unless it succeeds, and answers its stdout.
+    fn call(&self, args: &[&str]) -> String {
+        let out = Command::new("rmux")
+            .arg("-L")
+            .arg(&self.socket)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "rmux {args:?}: {out:?}");
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    }
+
+    /// Types `text` literally into `pane`.
+    fn keys(&self, pane: &str, text: &str) {
+        self.call(&["send-keys", "-t", pane, "-l", text]);
+    }
+
+    /// Types `text` into `pane`, then Enter.
+    fn line(&self, pane: &str, text: &str) {
+        self.keys(pane, text);
+        self.call(&["send-keys", "-t", pane, "Enter"]);
+    }
+
+    fn field(&self, pane: &str, format: &str) -> String {
+        self.call(&["display-message", "-p", "-t", pane, format])
+            .trim()
+            .to_string()
+    }
+
+    /// The pane's screen, wrapped lines joined.
+    fn screen(&self, pane: &str) -> String {
+        self.call(&["capture-pane", "-p", "-J", "-t", pane])
+    }
+
+    /// Waits for `cmd.exe` in `pane` to show its prompt.
+    fn prompt(&self, pane: &str) {
+        self.wait("the cmd.exe prompt", || {
+            self.screen(pane)
+                .lines()
+                .any(|l| l.trim_end().ends_with('>'))
+                .then_some(())
+        });
+    }
+
+    /// The active pane of the active window.
+    fn focused(&self) -> String {
+        self.call(&[
+            "list-panes",
+            "-a",
+            "-F",
+            "#{pane_id}|#{window_active}|#{pane_active}",
+        ])
+        .lines()
+        .filter(|r| r.ends_with("|1|1"))
+        .map(|r| r.split('|').next().unwrap().to_string())
+        .collect::<Vec<_>>()
+        .join(",")
+    }
+
+    /// Makes the root pane the active one again.
+    fn focus_root(&self) {
+        let window = self.field(&self.root, "#{window_id}");
+        self.call(&["select-window", "-t", &window]);
+        self.call(&["select-pane", "-t", &self.root]);
+    }
+
+    /// Polls `ready` until it answers, for up to `WAIT`; panics naming `what` when it never does.
+    fn wait<T>(&self, what: &str, mut ready: impl FnMut() -> Option<T>) -> T {
+        let end = Instant::now() + WAIT;
+        loop {
+            if let Some(value) = ready() {
+                return value;
+            }
+            assert!(Instant::now() < end, "timed out waiting for {what}");
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+
+    /// `spawn -Client claude -TaskFile <dir>\task.txt -Name <name>` typed into the root pane; its JSON reply, which
+    /// must be `ok`.
+    fn spawn(&self, name: &str) -> Value {
+        let file = |ext: &str| self.dir.join(format!("{name}.{ext}"));
+        let line = format!(
+            "\"{MUX_AGENT}\" spawn -Client claude -TaskFile \"{}\" -Name {name} > \"{}\" 2> \"{}\" & echo done> \"{}\"",
+            self.dir.join("task.txt").display(),
+            file("json").display(),
+            file("err").display(),
+            file("done").display(),
+        );
+        self.line(&self.root, &line);
+        self.wait(&format!("spawn {name}"), || {
+            file("done").exists().then_some(())
+        });
+        let text = std::fs::read_to_string(file("json")).unwrap();
+        let err = std::fs::read_to_string(file("err")).unwrap_or_default();
+        let reply: Value = serde_json::from_str(&text)
+            .unwrap_or_else(|_| panic!("spawn {name}: stdout {text:?}, stderr {err:?}"));
+        assert_eq!(reply["ok"], true, "spawn {name}: {reply} {err}");
+        reply
+    }
+}
+
+impl Drop for Live {
+    fn drop(&mut self) {
+        // The fake clients quit when this file appears; then the server and its panes go.
+        let _ = std::fs::write(self.dir.join("quit"), "");
+        std::thread::sleep(Duration::from_millis(500));
+        let _ = Command::new("rmux")
+            .args(["-L", &self.socket, "kill-server"])
+            .output();
+        for _ in 0..20 {
+            if std::fs::remove_dir_all(&self.dir).is_ok() || !self.dir.exists() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(250));
+        }
+    }
+}
+
+/// `NAME=value` for `new-session -e`.
+fn assign(name: &str, value: &OsStr) -> OsString {
+    let mut text = OsString::from(format!("{name}="));
+    text.push(value);
+    text
+}
+
+fn s(value: &Value) -> String {
+    value
+        .as_str()
+        .unwrap_or_else(|| panic!("not a string: {value}"))
+        .to_string()
+}
+
+/// The 1-based line of `screen` whose second token is `name`: that agent's name line (`◉`/`◌`, then the name).
+fn row_at(screen: &str, name: &str) -> Option<usize> {
+    screen
+        .lines()
+        .position(|l| l.split_whitespace().nth(1) == Some(name))
+        .map(|i| i + 1)
+}
+
+/// Polls `ready` up to `limit`; false when it never held.
+fn eventually(limit: Duration, mut ready: impl FnMut() -> bool) -> bool {
+    let end = Instant::now() + limit;
+    loop {
+        if ready() {
+            return true;
+        }
+        if Instant::now() > end {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+// #70: on Windows the bar reads its console: it turns mouse reports on, `j` then Enter focuses the first agent, and
+// a left click on an agent's name line focuses that agent.
+#[test]
+fn bar_keys_and_a_click_focus_an_agent() {
+    let Some(live) = Live::start() else {
+        return;
+    };
+    let w1 = live.spawn("w1");
+    let w2 = live.spawn("w2");
+    let bar = s(&w1["sidebar"]);
+    let (p1, p2) = (s(&w1["pane"]), s(&w2["pane"]));
+    live.wait("both agents on the bar", || {
+        let screen = live.screen(&bar);
+        (row_at(&screen, "w1").is_some() && row_at(&screen, "w2").is_some()).then_some(())
+    });
+    assert_eq!(
+        live.field(&bar, MOUSE),
+        "11",
+        "the bar turned mouse reports on"
+    );
+
+    live.focus_root();
+    live.keys(&bar, "j");
+    live.call(&["send-keys", "-t", &bar, "Enter"]);
+    live.wait("j then Enter to focus w1", || {
+        (live.focused() == p1).then_some(())
+    });
+
+    // A press read within 50 ms of a frame is dropped, as the user may have aimed at the frame before it: try again.
+    let mut clicked = false;
+    for _ in 0..3 {
+        live.focus_root();
+        let screen = live.screen(&bar);
+        let y = row_at(&screen, "w2").unwrap_or_else(|| panic!("no w2 row:\n{screen}"));
+        for end in ['M', 'm'] {
+            live.keys(&bar, &format!("\x1b[<0;3;{y}{end}"));
+        }
+        if eventually(Duration::from_secs(5), || live.focused() == p2) {
+            clicked = true;
+            break;
+        }
+    }
+    assert!(
+        clicked,
+        "a click on w2's row never focused {p2}: {}",
+        live.focused()
+    );
+    assert_eq!(live.field(&bar, MOUSE), "11", "the bar still reads clicks");
+}
+
+// #70: Ctrl-C typed into a `watch` run by hand ends it `interrupted`, turns mouse reports off, and leaves the shell
+// taking typed lines again.
+#[test]
+fn ctrl_c_ends_a_hand_run_watch_and_gives_the_console_back() {
+    let Some(live) = Live::start() else {
+        return;
+    };
+    let pane = live
+        .call(&[
+            "split-window",
+            "-v",
+            "-t",
+            &live.root,
+            "-P",
+            "-F",
+            "#{pane_id}",
+            "cmd.exe",
+        ])
+        .trim()
+        .to_string();
+    live.prompt(&pane);
+    // A split does not get the session's `-e` variables in rmux 0.10: the state root is set in the pane itself.
+    live.line(
+        &pane,
+        &format!("set MUX_AGENTS_STATE={}", live.dir.join("state").display()),
+    );
+    live.line(&pane, &format!("\"{MUX_AGENT}\" watch"));
+    live.wait("watch to turn mouse reports on", || {
+        (live.field(&pane, MOUSE) == "11").then_some(())
+    });
+
+    live.call(&["send-keys", "-t", &pane, "C-c"]);
+    live.wait("watch to end interrupted", || {
+        live.screen(&pane)
+            .contains(r#""ended":"interrupted""#)
+            .then_some(())
+    });
+    assert_eq!(live.field(&pane, MOUSE), "00", "mouse reports off again");
+
+    live.line(&pane, "echo typed-after-watch");
+    live.wait("the shell to take a typed line", || {
+        live.screen(&pane)
+            .lines()
+            .any(|l| l.trim() == "typed-after-watch")
+            .then_some(())
+    });
+}

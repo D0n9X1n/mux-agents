@@ -183,3 +183,50 @@ jobs:
         run: npm install --global @anthropic-ai/claude-code@2.1.310
       - name: Upgrade tests
         run: sh tests/upgrade.sh
+  # The side bar's clicks and keys on Windows (#70), in a private rmux server. The release rmux 0.10.0 cannot start
+  # its daemon inside the runner's job object (rmux#238: "Access is denied"); its own CI runs a debug build with the
+  # debug-only RMUX_ALLOW_INTERNAL_DAEMON_IN_CALLER_JOB=1, and so does this job, from the v0.10.0 commit. Swap in the
+  # release zip, pinned by SHA-256, once a release fixes #238.
+  integration-windows:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    env:
+      RMUX_ALLOW_INTERNAL_DAEMON_IN_CALLER_JOB: '1'
+      MUX_AGENTS_LIVE_REQUIRE: rmux
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Point TEMP and TMP at RUNNER_TEMP (the default is an 8.3 path)
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "TEMP=$RUNNER_TEMP" >> "$GITHUB_ENV"
+          echo "TMP=$RUNNER_TEMP" >> "$GITHUB_ENV"
+      # rmux pins its own toolchain (1.96.1) in rust-toolchain.toml; rustup installs it in that directory.
+      - name: Build rmux 0.10.0 (debug, commit dfd68c77 of tag v0.10.0)
+        shell: bash
+        run: |
+          set -euo pipefail
+          git init -q "$RUNNER_TEMP/rmux-src"
+          cd "$RUNNER_TEMP/rmux-src"
+          git fetch -q --depth 1 https://github.com/Helvesec/rmux dfd68c774ca0f4212139a21d37d09c90f75f8bd7
+          git checkout -q FETCH_HEAD
+          test "$(git rev-parse HEAD)" = dfd68c774ca0f4212139a21d37d09c90f75f8bd7
+          cargo build --locked --bin rmux
+          echo "$RUNNER_TEMP/rmux-src/target/debug" >> "$GITHUB_PATH"
+      - name: Rust 1.95.0
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup toolchain install 1.95.0 --profile minimal --component clippy
+          rustup default 1.95.0
+      - name: Clippy with the live tests
+        shell: bash
+        run: cargo clippy --all-targets --features live,test-panic --locked -- -D warnings
+      - name: Windows live tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          rmux -V
+          cargo test --features live,test-panic --locked --test live_windows -- --nocapture
