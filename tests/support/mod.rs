@@ -181,7 +181,10 @@ impl Server {
         let (bin, _) = available(mux)?;
         let fake = env!("CARGO_BIN_EXE_fake-client");
         for name in ["claude", "copilot"] {
-            std::fs::copy(fake, dir.join("bin").join(name)).unwrap();
+            let copy = dir.join("bin").join(name);
+            std::fs::copy(fake, &copy).unwrap();
+            // Without MUX_IT_DIR the fake exits 2 at once: a run that only proves the copy can run (#76).
+            runnable(Command::new(&copy).env_remove("MUX_IT_DIR"));
         }
         let socket = dir.join("s");
         let mut path = OsString::from(dir.join("bin"));
@@ -892,6 +895,22 @@ pub fn required(list: &str) -> Result<Vec<Mux>, String> {
                 .ok_or_else(|| format!("MUX_AGENTS_LIVE_REQUIRE: unknown multiplexer {name:?}"))
         })
         .collect()
+}
+
+/// Runs `command` once, retrying while Linux refuses it as "text file busy" (ETXTBSY, 26): a just-copied program
+/// stays busy while a child another test forked during the copy still holds its write open (#76). Once it has run,
+/// no later run meets ETXTBSY.
+fn runnable(command: &mut Command) {
+    for _ in 0..100 {
+        match command.output() {
+            Err(e) if e.raw_os_error() == Some(26) => std::thread::sleep(Duration::from_millis(20)),
+            run => {
+                run.unwrap();
+                return;
+            }
+        }
+    }
+    panic!("{command:?} stayed busy for 2 s");
 }
 
 /// The binary and its `-V` answer, or None with a skip message. A multiplexer MUX_AGENTS_LIVE_REQUIRE names is never

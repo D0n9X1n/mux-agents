@@ -707,6 +707,9 @@ fn main() {
         let path = dir.join(format!("{name}{EXE}"));
         std::fs::copy(fake_mux_program(), &path).unwrap();
         std::fs::write(dir.join(format!("{name}.version")), version).unwrap();
+        // Run once before any test does, so no later run meets ETXTBSY (#76).
+        crate::testing::wait_runnable(100, || std::process::Command::new(&path).arg("-V").output())
+            .unwrap();
         path
     }
 
