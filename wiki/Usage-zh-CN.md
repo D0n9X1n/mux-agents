@@ -58,7 +58,7 @@ flowchart LR
 
 ## 侧边栏
 
-在 Claude Code 中，第一次成功 `spawn` 后（或用 `/mux-agents-pane`）会在聊天旁打开 `Agents` 窗格，每 3 秒刷新一次。在任何客户端中，第一次成功 `spawn` 还会在你的窗口右边缘打开一个占满整个高度、宽为窗口 5%（至少 30 列）的分屏，每 2 秒重绘一次；之后的启动复用它，`sidebar -Close` 在本会话剩余时间内关闭它，`sidebar` 重新打开它：
+在 Claude Code 中，第一次成功 `spawn` 后（或用 `/mux-agents-pane`）会在聊天旁打开 `Agents` 窗格，每 3 秒刷新一次。在任何客户端中，第一次成功 `spawn` 还会在你的窗口右边缘打开一个占满整个高度、宽为窗口 20%（至少 40 列）的分屏，每 2 秒重绘一次；之后的启动复用它，`sidebar -Close` 在本会话剩余时间内关闭它，`sidebar` 重新打开它：
 
 ```text
  mux-agents         3 running / 7 ended
@@ -87,7 +87,7 @@ flowchart LR
 
 在标签页模式下，侧边栏留在你启动代理的窗口里，而不在每个代理的窗口里。`sidebar -Close` 只关闭这个多路复用器侧边栏；Claude Code 的 `Agents` 窗格与它无关。该窗格绘制各行的方式与侧边栏相同，包括 `MUX_AGENTS_ASCII=1`：`◉ working`、`✓ done`、`✗ exit N`、`- stopped` 和 `✉ N`，但没有 `◌ waiting`，那只有侧边栏读取。
 
-侧边栏始终停在右边缘、占满整个高度：拆分、布局变化、`swap-pane` 或 `rotate-window` 移动了它时，下一次重绘会把它移回去，且不改变你的焦点。它的宽度随窗口宽度变化；你拖出来的宽度会保留到窗口大小或宽度选项改变为止。两个多路复用器选项决定宽度：`@mux-agents-sidebar-percent`（1-100，默认 5）和 `@mux-agents-sidebar-min`（列数，1-9999，默认 30）；侧边栏取两者中较大的值。可在 `~/.tmux.conf` 中用 `set -g` 设置，也可按会话、窗口或窗格设置（例如 `tmux set -g @mux-agents-sidebar-percent 20`）；改动在下一次重绘时生效，不是范围内整数的值使用其默认值。有窗格处于放大（zoom）状态时，侧边栏不做任何调整，所以绝不会取消你的放大。如果连续 3 次移回失败，它会停止尝试并显示 `layout: repair paused`，直到布局改变或过了一分钟。
+侧边栏始终停在右边缘、占满整个高度：拆分、布局变化、`swap-pane` 或 `rotate-window` 移动了它时，下一次重绘会把它移回去，且不改变你的焦点。它的宽度随窗口宽度变化；你拖出来的宽度会保留到窗口大小或宽度选项改变为止。两个多路复用器选项决定宽度：`@mux-agents-sidebar-percent`（1-100，默认 20）和 `@mux-agents-sidebar-min`（列数，1-9999，默认 40）；侧边栏取两者中较大的值。可在 `~/.tmux.conf` 中用 `set -g` 设置，也可按会话、窗口或窗格设置（例如 `tmux set -g @mux-agents-sidebar-percent 10`）；改动在下一次重绘时生效，不是范围内整数的值使用其默认值。有窗格处于放大（zoom）状态时，侧边栏不做任何调整，所以绝不会取消你的放大。如果连续 3 次移回失败，它会停止尝试并显示 `layout: repair paused`，直到布局改变或过了一分钟。
 
 侧边栏是 `sidebar` 在其中启动的那个进程，而不是它的 `@agent-role sidebar` 标签，所以标签被移动后（rmux 的 `rotate-window` 会把标签留在原处）也绝不会把你的窗格当作侧边栏。带有该标签但不是那个进程的窗格绝不会被关闭：`sidebar`、`sidebar -Close` 和 spawn 都会拒绝并指出它。如果它是旧的侧边栏（例如由 0.2.1 打开、`sidebar -Close` 无法证明的那种），用 `kill-pane -t <pane>` 关闭它；如果它是你自己的窗格，用 `set-option -p -u -t <pane> @agent-role` 清除标签。你手动运行的 `mux-agent watch` 会绘制面板，也像侧边栏一样接收点击和按键，但只有侧边栏会维持布局。
 
