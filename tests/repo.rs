@@ -2325,3 +2325,34 @@ fn usage_documents_side_bar_clicks() {
         "## 侧边栏 has no line with the spans {spans:?}"
     );
 }
+
+// #71: the integration job installs rmux at a pinned version and requires all three multiplexers, so a missing
+// one fails the live suite instead of skipping it.
+#[test]
+fn integration_runs_live_on_every_multiplexer() {
+    let lines = job_lines(&repo_file(".github/workflows/ci.yml"), "integration");
+    let install = line_of(&lines, "cargo install rmux");
+    assert!(
+        lines[install].contains("--version 0.10.0") && lines[install].contains("--locked"),
+        "{}",
+        lines[install]
+    );
+    assert!(lines.iter().any(|l| l.contains("rmux -V")), "{lines:#?}");
+    // Every step that runs the live suite requires all three.
+    let live: Vec<usize> = (0..lines.len())
+        .filter(|&i| lines[i].contains("--test live"))
+        .collect();
+    assert!(!live.is_empty(), "{lines:#?}");
+    for at in live {
+        let step = lines[..at]
+            .iter()
+            .rposition(|l| l.starts_with("- "))
+            .unwrap();
+        assert!(
+            lines[step..at].contains(&"MUX_AGENTS_LIVE_REQUIRE: tmux,tmux32,rmux".to_string()),
+            "{:#?}",
+            &lines[step..=at]
+        );
+        assert!(install < step, "{lines:#?}");
+    }
+}
