@@ -564,3 +564,63 @@ impl Drop for TempDir {
         let _ = std::fs::remove_dir_all(&self.0);
     }
 }
+
+/// Runs `spawn` until it is not refused with "text file busy" (ETXTBSY), at most `tries` times, 20 ms apart. A
+/// program a test has just copied can be refused on Linux: a child another test forks while the copy is open for
+/// writing holds that open until it runs its own program (#76). Once it has run, no write is open anywhere, so later
+/// runs of it never meet ETXTBSY.
+pub fn wait_runnable<T>(
+    tries: u32,
+    mut spawn: impl FnMut() -> std::io::Result<T>,
+) -> std::io::Result<T> {
+    const ETXTBSY: i32 = 26;
+    let mut left = tries.max(1);
+    loop {
+        match spawn() {
+            Err(e) if e.raw_os_error() == Some(ETXTBSY) && left > 1 => {
+                left -= 1;
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            done => return done,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io;
+
+    // ETXTBSY: Linux refuses to run a file another process still holds open for writing.
+    const BUSY: i32 = 26;
+
+    #[test]
+    fn wait_runnable_retries_only_a_busy_file() {
+        let mut calls = 0;
+        let ran = wait_runnable(5, || {
+            calls += 1;
+            if calls < 3 {
+                Err(io::Error::from_raw_os_error(BUSY))
+            } else {
+                Ok(calls)
+            }
+        });
+        assert_eq!((ran.unwrap(), calls), (3, 3));
+
+        // Busy every time: gives up after `tries`, with that error.
+        let mut calls = 0;
+        let ran: io::Result<()> = wait_runnable(4, || {
+            calls += 1;
+            Err(io::Error::from_raw_os_error(BUSY))
+        });
+        assert_eq!((ran.unwrap_err().raw_os_error(), calls), (Some(BUSY), 4));
+
+        // Any other error is not retried.
+        let mut calls = 0;
+        let ran: io::Result<()> = wait_runnable(4, || {
+            calls += 1;
+            Err(io::Error::from_raw_os_error(2))
+        });
+        assert_eq!((ran.unwrap_err().raw_os_error(), calls), (Some(2), 1));
+    }
+}
