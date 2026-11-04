@@ -493,13 +493,6 @@ exec claude --dangerously-skip-permissions
             })
         }
 
-        /// The side bar's width options as 0.2.3 had them built in, set for the whole server: 20% of the window,
-        /// at least 40 columns.
-        fn old_sizing(&self) {
-            self.call(&["set-option", "-g", "@mux-agents-sidebar-min", "40"]);
-            self.call(&["set-option", "-g", "@mux-agents-sidebar-percent", "20"]);
-        }
-
         /// Ends the bar's watch, keeping its pane and its tag: from here no tick can repair anything.
         fn freeze(&self, bar: &str) {
             self.call(&["respawn-pane", "-k", "-t", bar, "sleep", "1000"]);
@@ -1569,7 +1562,7 @@ exec claude --dangerously-skip-permissions
     fn bar_ready(screen: &str) -> bool {
         let lines: Vec<&str> = screen.lines().map(str::trim).collect();
         let count = |f: &dyn Fn(&str) -> bool| lines.iter().filter(|l| f(l)).count();
-        // Both counts, or the running count alone in a bar too narrow for both (the default 30 columns).
+        // Both counts, or the running count alone in a bar too narrow for both (a bar set to 30 columns).
         let header = |l: &str| {
             let words: Vec<&str> = l.split_whitespace().collect();
             words == ["mux-agents", "2", "running", "/", "0", "ended"]
@@ -1935,13 +1928,12 @@ exec claude --dangerously-skip-permissions
     }
 
     // S1 test 5: a bar dragged to 55 columns at the right edge is left so (no move, no resize) until the window's
-    // width changes; resize-window -x 300 makes it 60 within one tick (20% of the window, at least 40, set with
-    // `set -g` as a tmux.conf would).
+    // width changes; resize-window -x 300 makes it 60 within one tick (#74: by default 20% of the window, at least
+    // 40).
     fn bar_drag_kept_until_the_window_resizes(mux: Mux) {
         let Some(mut live) = Live::human(mux) else {
             return;
         };
-        live.old_sizing();
         let bar = live.open_bar();
         // The bar's first tagged tick sets its width; a drag comes after it.
         live.wait_tick(&bar);
@@ -1958,9 +1950,9 @@ exec claude --dangerously-skip-permissions
         assert_eq!(live.bar_place(&bar), "1|1|1|60", "{mux:?}");
     }
 
-    // #59: by default the bar is 5% of its window, at least 30 columns; a width option changed while it runs (on the
-    // server, then the session, the window and the bar's own pane, each overriding the one before; another pane's
-    // value never counts) sets its width within one tick, and a value that is no number is its default alone.
+    // #59, #74: by default the bar is 20% of its window, at least 40 columns; a width option changed while it runs
+    // (on the server, then the session, the window and the bar's own pane, each overriding the one before; another
+    // pane's value never counts) sets its width within one tick, and a value that is no number is its default alone.
     fn bar_width_follows_its_options(mux: Mux) {
         let Some(mut live) = Live::human(mux) else {
             return;
@@ -1969,7 +1961,7 @@ exec claude --dangerously-skip-permissions
         live.wait_tick(&bar);
         live.call(&["resize-window", "-t", &bar, "-x", "800"]);
         live.wait_tick(&bar);
-        assert_eq!(live.bar_place(&bar), "1|1|1|40", "{mux:?}: 5% of 800");
+        assert_eq!(live.bar_place(&bar), "1|1|1|160", "{mux:?}: 20% of 800");
         live.call(&["set-option", "-g", "@mux-agents-sidebar-percent", "10"]);
         live.wait_tick(&bar);
         assert_eq!(live.bar_place(&bar), "1|1|1|80", "{mux:?}: 10% of 800");
@@ -1994,13 +1986,13 @@ exec claude --dangerously-skip-permissions
             "-t",
             &window,
             "@mux-agents-sidebar-percent",
-            "20",
+            "25",
         ]);
         live.wait_tick(&bar);
         assert_eq!(
             live.bar_place(&bar),
-            "1|1|1|160",
-            "{mux:?}: the window's 20%"
+            "1|1|1|200",
+            "{mux:?}: the window's 25%"
         );
         let root = live.server.pane().to_string();
         live.call(&[
@@ -2048,12 +2040,12 @@ exec claude --dangerously-skip-permissions
             "@mux-agents-sidebar-percent",
             "1|5",
         ]);
-        live.call(&["set-option", "-g", "@mux-agents-sidebar-min", "50"]);
+        live.call(&["set-option", "-g", "@mux-agents-sidebar-min", "250"]);
         live.wait_tick(&bar);
         assert_eq!(
             live.bar_place(&bar),
-            "1|1|1|50",
-            "{mux:?}: 5% of 800, at least 50"
+            "1|1|1|250",
+            "{mux:?}: 20% of 800, at least 250"
         );
         assert_eq!(live.bar_place(&bar), live.in_place(&bar), "{mux:?}");
     }
@@ -2064,7 +2056,6 @@ exec claude --dangerously-skip-permissions
         let Some(mut live) = Live::human(mux) else {
             return;
         };
-        live.old_sizing();
         let root = live.server.pane().to_string();
         let bar = live.open_bar();
         live.wait_tick(&bar);

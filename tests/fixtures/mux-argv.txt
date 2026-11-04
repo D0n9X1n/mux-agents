@@ -12,6 +12,7 @@
 # one `if-shell -F` that holds only while the pane is still that launch.
 # 0.2.4 (#59): the side bar is `@mux-agents-sidebar-percent` (5) of its window, at least `@mux-agents-sidebar-min` (30)
 # columns, both read in the window probe and the layout; `\n` and `\r` stand for those LF and CR bytes.
+# 0.2.5+ (#74): the default side bar is 20% of its window, at least 40 columns
 
 [spawn -Client claude -Task hi]
 -N display-message -p -t %1 #{pid}|#{pane_pid}|#{session_id}|#{window_id}|#{@agent-id}
@@ -36,13 +37,13 @@
 -N list-panes -s -t $3 -F #{pane_id}|#{==:#{@agent-role},sidebar}
 # 0.2.3 (S1): the window's width sizes the bar (0.2.4: max(30, width * 5 / 100)); a full-height split at the right edge
 -N display-message -p -t %1 #{window_width}|#{s/[|\n\r]/x/:@mux-agents-sidebar-min}|#{s/[|\n\r]/x/:@mux-agents-sidebar-percent}
--N split-window -d -f -h -P -F #{pane_id}|#{window_id}|#{pane_pid} -t %1 -e MUX_AGENTS_STATE=<state> -l 30 <exe> watch
+-N split-window -d -f -h -P -F #{pane_id}|#{window_id}|#{pane_pid} -t %1 -e MUX_AGENTS_STATE=<state> -l 40 <exe> watch
 -N if-shell -F -t %13 #{&&:#{==:#{pane_dead},0},#{==:#{pane_pid},113}} 'set-option -p -t %13 @agent-role sidebar'
 -N display-message -p -t %13 #{@agent-role}
 # 0.2.3 (#47): pid 113 is this binary `watch`, so the bar is recorded as <pane> <pid> <start>
 -N set-option -t $3 @mux-agents-sidebar-id '%13 113 1130'
 # rmux ignores -l, so the bar is sized again
--N if-shell -F -t %13 #{&&:#{==:#{pane_dead},0},#{==:#{pane_pid},113}} 'resize-pane -t %13 -x 30'
+-N if-shell -F -t %13 #{&&:#{==:#{pane_dead},0},#{==:#{pane_pid},113}} 'resize-pane -t %13 -x 40'
 # 0.2.3 (#47): proven last, so a pane replaced during open is never reported as the bar
 -N display-message -p -t %13 #{pane_id}|#{window_id}|#{pane_dead}|#{pane_pid}
 
@@ -61,13 +62,13 @@
 -N list-panes -s -t $3 -F #{pane_id}|#{==:#{@agent-role},sidebar}
 # 0.2.3 (S1): the window's width sizes the bar (0.2.4: max(30, width * 5 / 100)); a full-height split at the right edge
 -N display-message -p -t %1 #{window_width}|#{s/[|\n\r]/x/:@mux-agents-sidebar-min}|#{s/[|\n\r]/x/:@mux-agents-sidebar-percent}
--N split-window -d -f -h -P -F #{pane_id}|#{window_id}|#{pane_pid} -t %1 -e MUX_AGENTS_STATE=<state> -l 30 <exe> watch
+-N split-window -d -f -h -P -F #{pane_id}|#{window_id}|#{pane_pid} -t %1 -e MUX_AGENTS_STATE=<state> -l 40 <exe> watch
 -N if-shell -F -t %13 #{&&:#{==:#{pane_dead},0},#{==:#{pane_pid},113}} 'set-option -p -t %13 @agent-role sidebar'
 -N display-message -p -t %13 #{@agent-role}
 # 0.2.3 (#47): pid 113 is this binary `watch`, so the bar is recorded as <pane> <pid> <start>
 -N set-option -t $3 @mux-agents-sidebar-id '%13 113 1130'
 # rmux ignores -l, so the bar is sized again
--N if-shell -F -t %13 #{&&:#{==:#{pane_dead},0},#{==:#{pane_pid},113}} 'resize-pane -t %13 -x 30'
+-N if-shell -F -t %13 #{&&:#{==:#{pane_dead},0},#{==:#{pane_pid},113}} 'resize-pane -t %13 -x 40'
 # 0.2.3 (#47): proven last, so a pane replaced during open is never reported as the bar
 -N display-message -p -t %13 #{pane_id}|#{window_id}|#{pane_dead}|#{pane_pid}
 
@@ -181,13 +182,13 @@
 -N list-panes -s -t $3 -F #{pane_id}|#{==:#{@agent-role},sidebar}
 # 0.2.3 (S1): the window's width, then a full-height split at the right edge (:1578-1579)
 -N display-message -p -t %1 #{window_width}|#{s/[|\n\r]/x/:@mux-agents-sidebar-min}|#{s/[|\n\r]/x/:@mux-agents-sidebar-percent}
--N split-window -d -f -h -P -F #{pane_id}|#{window_id}|#{pane_pid} -t %1 -e MUX_AGENTS_STATE=<state> -l 30 <exe> watch
+-N split-window -d -f -h -P -F #{pane_id}|#{window_id}|#{pane_pid} -t %1 -e MUX_AGENTS_STATE=<state> -l 40 <exe> watch
 # :1584
 -N if-shell -F -t %13 #{&&:#{==:#{pane_dead},0},#{==:#{pane_pid},113}} 'set-option -p -t %13 @agent-role sidebar'
 -N display-message -p -t %13 #{@agent-role}
 # 0.2.3 (#47): pid 113 is this binary `watch`, so the bar is recorded as <pane> <pid> <start>
 -N set-option -t $3 @mux-agents-sidebar-id '%13 113 1130'
--N if-shell -F -t %13 #{&&:#{==:#{pane_dead},0},#{==:#{pane_pid},113}} 'resize-pane -t %13 -x 30'
+-N if-shell -F -t %13 #{&&:#{==:#{pane_dead},0},#{==:#{pane_pid},113}} 'resize-pane -t %13 -x 40'
 # 0.2.3 (#47): proven last, so a pane replaced during open is never reported as the bar
 -N display-message -p -t %13 #{pane_id}|#{window_id}|#{pane_dead}|#{pane_pid}
 
@@ -199,7 +200,7 @@
 -N show-options -qv -t $3 @mux-agents-sidebar-id
 -N list-panes -s -t $3 -F #{pane_id}|#{==:#{@agent-role},sidebar}
 -N display-message -p -t %1 #{window_width}|#{s/[|\n\r]/x/:@mux-agents-sidebar-min}|#{s/[|\n\r]/x/:@mux-agents-sidebar-percent}
--N split-window -d -f -h -P -F #{pane_id}|#{window_id}|#{pane_pid} -t %1 -e MUX_AGENTS_STATE=<state> -l 30 <exe> watch
+-N split-window -d -f -h -P -F #{pane_id}|#{window_id}|#{pane_pid} -t %1 -e MUX_AGENTS_STATE=<state> -l 40 <exe> watch
 # :1580
 -N split-window -d -f -h -P -F #{pane_id}|#{window_id}|#{pane_pid} -t %1 -e MUX_AGENTS_STATE=<state> <exe> watch
 -N if-shell -F -t %13 #{&&:#{==:#{pane_dead},0},#{==:#{pane_pid},113}} 'set-option -p -t %13 @agent-role sidebar'
@@ -207,7 +208,7 @@
 # 0.2.3 (#47): pid 113 is this binary `watch`, so the bar is recorded as <pane> <pid> <start>
 -N set-option -t $3 @mux-agents-sidebar-id '%13 113 1130'
 # the multiplexer chose the width, so the resize sets it
--N if-shell -F -t %13 #{&&:#{==:#{pane_dead},0},#{==:#{pane_pid},113}} 'resize-pane -t %13 -x 30'
+-N if-shell -F -t %13 #{&&:#{==:#{pane_dead},0},#{==:#{pane_pid},113}} 'resize-pane -t %13 -x 40'
 # 0.2.3 (#47): proven last, so a pane replaced during open is never reported as the bar
 -N display-message -p -t %13 #{pane_id}|#{window_id}|#{pane_dead}|#{pane_pid}
 
