@@ -12,7 +12,7 @@
 # one `if-shell -F` that holds only while the pane is still that launch.
 # 0.2.4 (#59): the side bar is `@mux-agents-sidebar-percent` (5) of its window, at least `@mux-agents-sidebar-min` (30)
 # columns, both read in the window probe and the layout; `\n` and `\r` stand for those LF and CR bytes.
-# 0.2.5+ (#74): the default side bar is 20% of its window, at least 40 columns
+# 0.2.6 (#74): the default side bar is 20% of its window, at least 40 columns
 
 [spawn -Client claude -Task hi]
 -N display-message -p -t %1 #{pid}|#{pane_pid}|#{session_id}|#{window_id}|#{@agent-id}

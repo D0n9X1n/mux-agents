@@ -1057,13 +1057,13 @@ fn hook_line_ok(line: &str) -> bool {
 }
 
 #[test]
-fn plugin_version_is_0_2_5_and_matches_cargo() {
-    assert_eq!(json_file(".claude-plugin/plugin.json")["version"], "0.2.5");
-    assert_eq!(cargo_version(), "0.2.5");
+fn plugin_version_is_0_2_6_and_matches_cargo() {
+    assert_eq!(json_file(".claude-plugin/plugin.json")["version"], "0.2.6");
+    assert_eq!(cargo_version(), "0.2.6");
     let lock = repo_file("Cargo.lock").replace("\r\n", "\n");
     assert!(
-        lock.contains("name = \"mux-agent\"\nversion = \"0.2.5\"\n"),
-        "Cargo.lock does not hold mux-agent 0.2.5"
+        lock.contains("name = \"mux-agent\"\nversion = \"0.2.6\"\n"),
+        "Cargo.lock does not hold mux-agent 0.2.6"
     );
 }
 
