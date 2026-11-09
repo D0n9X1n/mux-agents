@@ -585,6 +585,31 @@ mod tests {
         assert_eq!(launcher_json(&l)["aborted"], true);
         assert!(!crate::agents::committed(&l.folder));
         assert!(!crate::state::fs::claim_json(&l.folder.join("commit.json"), &json!({})).unwrap());
+        // The spawn commits after the launcher's last look but before its give-up claim: the launcher loses the
+        // claim, the spawn's commit stands, and the client starts once.
+        let l = setup("claude", json!([]));
+        std::fs::remove_file(l.folder.join("commit.json")).unwrap();
+        let folder = l.folder.clone();
+        let start_ms =
+            l.w.ctx
+                .clock
+                .now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis() as u64;
+        l.w.fakes.clock_probe(move |ms| {
+            let commit = folder.join("commit.json");
+            if ms >= start_ms + 30_000 && !commit.exists() {
+                crate::agents::fixture::write(&commit, json!({"committedAt": "x"}));
+            }
+        });
+        let ran = launch(&l, &spec_str(&l), exits_7);
+        assert_eq!((ran.code, ran.started.len()), (7, 1));
+        assert!(crate::agents::committed(&l.folder));
+        assert_eq!(
+            crate::state::fs::read_json(&l.folder.join("commit.json")).unwrap(),
+            Some(json!({"committedAt": "x"}))
+        );
         // A give-up already there (another launcher's): no client.
         let l = setup("claude", json!([]));
         write(&l.folder.join("commit.json"), json!({"aborted": true}));

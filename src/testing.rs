@@ -31,6 +31,7 @@ type Probe = Rc<dyn Fn(&str) -> String>;
 
 // Runs after each sleep with how many there have been.
 type Wake = Rc<dyn Fn(usize)>;
+type Read = Rc<dyn Fn(u64)>;
 
 // What `stop_report` answers for the rows stop left.
 type Report = fn(&[Left]) -> serde_json::Map<String, serde_json::Value>;
@@ -61,6 +62,7 @@ struct Log {
     report: Option<Report>,
     probe: Option<Probe>,
     wake: Option<Wake>,
+    read: Option<Read>,
     // Lock keys starting with one of these time out, as a lock held elsewhere for 15 s would.
     timeouts: Vec<String>,
     // What `Mux::kind` answers; none is tmux.
@@ -331,6 +333,11 @@ impl Fakes {
         self.0.borrow_mut().wake = Some(Rc::new(probe));
     }
 
+    /// Runs at every read of the clock with the time read (ms), so a test acts between a check and what follows it.
+    pub fn clock_probe(&self, probe: impl Fn(u64) + 'static) {
+        self.0.borrow_mut().read = Some(Rc::new(probe));
+    }
+
     /// Every later lock whose key starts with `prefix` times out (recorded as `!key`) without running its body.
     pub fn lock_timeout(&self, prefix: &str) {
         self.0.borrow_mut().timeouts.push(prefix.into());
@@ -525,7 +532,14 @@ impl Mux for Fakes {
 
 impl Clock for Fakes {
     fn now(&self) -> SystemTime {
-        SystemTime::UNIX_EPOCH + Duration::from_millis(self.0.borrow().now_ms)
+        let (ms, read) = {
+            let log = self.0.borrow();
+            (log.now_ms, log.read.clone())
+        };
+        if let Some(read) = read {
+            read(ms);
+        }
+        SystemTime::UNIX_EPOCH + Duration::from_millis(ms)
     }
 
     fn sleep(&self, duration: Duration) {
