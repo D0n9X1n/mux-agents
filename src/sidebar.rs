@@ -1306,10 +1306,11 @@ pub fn run_watch(
         if write(&frame(&laid.rows, size, look)).is_err() {
             return "output-closed";
         }
-        let shown = Shown {
+        let mut shown = Shown {
             written: ctx.clock.now(),
             targets: targets(&laid),
             width: size.width,
+            looking: viewing.pane.clone(),
         };
         loop {
             let since = ctx
@@ -1341,7 +1342,15 @@ pub fn run_watch(
                 if read.event == Event::Interrupt {
                     return "interrupted";
                 }
-                redraw |= act(ctx, caller, look, read, &mut pick, &shown, last.as_ref());
+                redraw |= act(
+                    ctx,
+                    caller,
+                    look,
+                    read,
+                    &mut pick,
+                    &mut shown,
+                    last.as_ref(),
+                );
             }
             if redraw {
                 break;
@@ -1536,6 +1545,8 @@ struct Shown {
     written: SystemTime,
     targets: Vec<Target>,
     width: usize,
+    // The pane the session showed at this frame (herdr's next / previous start from it).
+    looking: Option<String>,
 }
 
 /// Acts on one event read while `shown` is on screen; true when the bar must draw again at once. A left press reads
@@ -1548,7 +1559,7 @@ fn act(
     look: Look,
     read: keys::Read,
     pick: &mut Pick,
-    shown: &Shown,
+    shown: &mut Shown,
     board: Option<&Map<String, Value>>,
 ) -> bool {
     match read.event {
@@ -1566,6 +1577,28 @@ fn act(
             true
         }
         Event::Press { .. } | Event::Release { .. } | Event::Interrupt => false,
+        // herdr's next and previous agent (#90), from the pane the session shows, in the bar's order.
+        Event::Next | Event::Prev => {
+            let forward = read.event == Event::Next;
+            if let Some(target) = pick::step(&shown.targets, shown.looking.as_deref(), forward) {
+                if focus_pane(ctx, caller, &target.name, Some(&target.pane)).is_err() {
+                    pick.failed(&target.name);
+                } else {
+                    // The next key of the same read steps on from here, not from the frame's pane.
+                    shown.looking = Some(target.pane.clone());
+                }
+            }
+            true
+        }
+        // herdr's peek (#91): the selected agent, else the first, over the window without switching to it.
+        Event::Peek => {
+            if let Some(target) = pick.chosen(&shown.targets).or(shown.targets.first())
+                && peek(ctx, caller, target).is_err()
+            {
+                pick.failed(&target.name);
+            }
+            true
+        }
         Event::Up | Event::Down | Event::Enter | Event::Esc => {
             match pick.key(read.event, &shown.targets) {
                 Act::Nothing => false,
@@ -1580,6 +1613,105 @@ fn act(
             }
         }
     }
+}
+
+/// Lines a peek shows: the screen and some history.
+const PEEK_LINES: i32 = 200;
+
+/// herdr's peek: the agent's last lines, captured as `read <name> -Lines` captures them (only while its pane is its
+/// own live launch), into a private file of the state folder, shown in a popup over the session's client that pages
+/// it and deletes it when closed. Earlier peek files a closed popup left behind go first. The popup is started in
+/// the background (`run-shell -b -C`), since display-popup answers only once it closes and the bar must not wait.
+fn peek(ctx: &Ctx, caller: &Caller, target: &Target) -> Res<()> {
+    let pane = crate::agents::registry::find_reaped(ctx, caller, &target.name)?;
+    if pane.pane != target.pane {
+        return refuse(
+            2,
+            "target",
+            "the agent is no longer on the pane the bar drew",
+        );
+    }
+    let folder = crate::agents::server_dir(ctx, caller);
+    // The path goes through the multiplexer's parser, its formats and a shell: plain characters only.
+    if !folder
+        .to_str()
+        .is_some_and(|f| plain_path(f, crate::state::root::HOST))
+    {
+        return refuse(
+            1,
+            "state",
+            "peek needs a state folder path of plain characters",
+        );
+    }
+    let text = crate::agents::message::capture(ctx, &pane, PEEK_LINES)?;
+    for old in std::fs::read_dir(&folder).into_iter().flatten().flatten() {
+        if old.file_name().to_string_lossy().starts_with("peek-") {
+            let _ = std::fs::remove_file(old.path());
+        }
+    }
+    let file = folder.join(format!(
+        "peek-{}.txt",
+        crate::util::guid()?.replace('-', "")
+    ));
+    std::fs::write(&file, format!("{text}\n"))?;
+    let Some(path) = file.to_str() else {
+        let _ = std::fs::remove_file(&file);
+        return refuse(1, "internal", "the peek file's path is not text");
+    };
+    let popup = popup_argv(&caller.pane, &target.name, path, crate::state::root::HOST);
+    let popup = popup
+        .iter()
+        .map(|a| format!("'{a}'"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let shown = native(ctx, &["run-shell", "-b", "-C", &popup], true)
+        .ok()
+        .filter(|o| o.code == 0);
+    if shown.is_none() {
+        let _ = std::fs::remove_file(&file);
+        return refuse(1, "target", "the popup did not open");
+    }
+    Ok(())
+}
+
+/// True when `path` holds only characters no layer reads: no format `#`, no `%`, quote, `$`, backquote, `&`, `!` or
+/// other shell character, and a backslash only on Windows, where it separates folders.
+fn plain_path(path: &str, os: crate::state::root::OsKind) -> bool {
+    path.chars().all(|c| {
+        c.is_ascii_alphanumeric()
+            || " _.-/:+,@=~".contains(c)
+            || (c == '\\' && os == crate::state::root::OsKind::Windows)
+    })
+}
+
+/// The popup that pages `path` (a `plain_path`) over the client showing `bar`'s session, titled with the agent's
+/// name, then deletes it: `less` from the end on Unix, `type` and a key on Windows. No argument holds a `'`, so each
+/// goes to `run-shell -C` in single quotes.
+fn popup_argv(bar: &str, name: &str, path: &str, os: crate::state::root::OsKind) -> Vec<String> {
+    let command = match os {
+        crate::state::root::OsKind::Unix => {
+            format!("less -R +G \"{path}\"; rm -f \"{path}\"")
+        }
+        crate::state::root::OsKind::Windows => {
+            format!("cmd /d /c \"type \"{path}\" & pause & del \"{path}\"\"")
+        }
+    };
+    [
+        "display-popup",
+        "-t",
+        bar,
+        "-w",
+        "80%",
+        "-h",
+        "80%",
+        "-T",
+        &format!(" {name} "),
+        "-E",
+        &command,
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect()
 }
 
 /// The running agent on row `y` of the bar, read in one call: none unless the call answers, the bar is `width`
@@ -3353,6 +3485,139 @@ mod tests {
     }
 
     #[test]
+    fn popup_pages_the_file_and_deletes_it_quoted_per_os() {
+        use crate::state::root::OsKind;
+        let unix = popup_argv("%7", "w1", "/s/my state/peek-1.txt", OsKind::Unix);
+        assert_eq!(
+            unix,
+            [
+                "display-popup",
+                "-t",
+                "%7",
+                "-w",
+                "80%",
+                "-h",
+                "80%",
+                "-T",
+                " w1 ",
+                "-E",
+                r#"less -R +G "/s/my state/peek-1.txt"; rm -f "/s/my state/peek-1.txt""#
+            ]
+        );
+        // Only plain paths reach it: no format, expansion, quote or separator character, and \ only on Windows.
+        assert!(plain_path(
+            "/Users/a b/.local/state/mux-agents/s-1",
+            OsKind::Unix
+        ));
+        assert!(plain_path(
+            r"C:\Users\a b\AppData\mux-agents",
+            OsKind::Windows
+        ));
+        for bad in [
+            "/s/#{@x}", "/s/a'b", "/s/a\"b", "/s/$HOME", "/s/a`b`", "/s/a&b", "/s/a;b", "/s/a|b",
+            "/s/%x%", "/s/a!b", "/s/a(b)", "/s/a<b", "/s/a\nb", r"/s/a\b",
+        ] {
+            assert!(!plain_path(bad, OsKind::Unix), "{bad}");
+        }
+        assert!(!plain_path(r"C:\qa&echo x&rem", OsKind::Windows));
+        assert!(!plain_path(r"C:\a%PATH%", OsKind::Windows));
+        let windows = popup_argv("%7", "w1", r"C:\s\peek-1.txt", OsKind::Windows);
+        assert_eq!(
+            windows[10],
+            r#"cmd /d /c "type "C:\s\peek-1.txt" & pause & del "C:\s\peek-1.txt"""#
+        );
+    }
+
+    #[test]
+    fn peek_captures_the_agents_own_pane_into_a_private_file_and_opens_a_popup() {
+        let w = World::human("");
+        let caller = w.caller();
+        w.agent_record(ID, json!({"name": "worker", "pane": "%9"}));
+        w.panes(&["%9|@5|300|aaaaaaaaaaaa|worker"]);
+        w.fakes
+            .mux_first("show-buffer", 0, "line one\nline two\n", "");
+        w.fakes.clear_log();
+        let target = Target {
+            name: "worker".into(),
+            pane: "%9".into(),
+        };
+        peek(&w.ctx, &caller, &target).unwrap();
+        let calls = w.fakes.mux_calls();
+        // The capture is the guarded one (only while %9 is its own launch), then the popup over the bar's client.
+        assert!(
+            calls
+                .iter()
+                .any(|c| c.iter().any(|a| a.contains("capture-pane -J -t %9"))),
+            "{calls:?}"
+        );
+        // The popup runs in the background (display-popup answers only when it closes), each argument quoted.
+        let run = calls.iter().find(|c| c[1] == "run-shell").unwrap();
+        assert_eq!(run[2..4], ["-b", "-C"]);
+        let popup = &run[4];
+        assert!(
+            popup.starts_with(
+                "'display-popup' '-t' '%1' '-w' '80%' '-h' '80%' '-T' ' worker ' '-E' '"
+            ),
+            "{popup}"
+        );
+        // The text is in a private peek file of the state folder, which the popup deletes when closed.
+        let folder = crate::agents::server_dir(&w.ctx, &caller);
+        let files: Vec<_> = std::fs::read_dir(&folder)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|e| e.file_name().to_string_lossy().starts_with("peek-"))
+            .collect();
+        assert_eq!(files.len(), 1);
+        assert_eq!(
+            std::fs::read_to_string(files[0].path()).unwrap(),
+            "line one\nline two\n"
+        );
+        assert!(
+            popup.contains(files[0].path().to_str().unwrap()),
+            "{popup:?}"
+        );
+        // A second peek first deletes the file a popup closed by force left behind.
+        let first = files[0].path();
+        peek(&w.ctx, &caller, &target).unwrap();
+        assert!(!first.exists());
+        let peeks = |folder: &std::path::Path| {
+            std::fs::read_dir(folder)
+                .unwrap()
+                .filter_map(Result::ok)
+                .filter(|e| e.file_name().to_string_lossy().starts_with("peek-"))
+                .count()
+        };
+        assert_eq!(peeks(&folder), 1);
+        // No popup: every peek file goes and peek fails; a moved agent is never read.
+        w.fakes.mux_first("run-shell", 1, "", "no current client");
+        assert!(peek(&w.ctx, &caller, &target).is_err());
+        assert_eq!(peeks(&folder), 0);
+        // A state folder whose path the multiplexer or a shell would read: no capture, no popup.
+        let mut odd = World::human("");
+        odd.ctx.state_root = odd.ctx.state_root.join("#{@x}");
+        odd.agent_record(ID, json!({"name": "worker", "pane": "%9"}));
+        odd.panes(&["%9|@5|300|aaaaaaaaaaaa|worker"]);
+        odd.fakes.clear_log();
+        assert!(peek(&odd.ctx, &odd.caller(), &target).is_err());
+        assert!(!odd.fakes.mux_calls().iter().any(|c| {
+            c.iter()
+                .any(|a| a.contains("capture-pane") || a == "run-shell")
+        }));
+        let moved = Target {
+            name: "worker".into(),
+            pane: "%4".into(),
+        };
+        w.fakes.clear_log();
+        assert!(peek(&w.ctx, &caller, &moved).is_err());
+        assert!(
+            !w.fakes
+                .mux_calls()
+                .iter()
+                .any(|c| c.iter().any(|a| a.contains("capture-pane")))
+        );
+    }
+
+    #[test]
     fn viewing_marks_the_done_spell_left_behind() {
         let board = |activity: &str, changed: Value| {
             json!({"running": 1, "agents": [
@@ -4282,6 +4547,25 @@ mod tests {
             "%11|@6|311|cccccccccccc|writer-two",
             "%12|@7|312|dddddddddddd|writer",
         ]);
+    }
+
+    #[test]
+    fn next_keys_in_one_read_each_step_on_from_the_last() {
+        // `nn` in one read with three running agents: two different agents, in the bar's order, not the same twice.
+        let w = click_world(&["live", "live", "live", "gone"], board_answer());
+        two_writers(&w);
+        let script = Script::new(&w.fakes, vec![(300, key(b"nn"))]);
+        let (ended, _, _) = watch_with(&w, Box::new(script));
+        assert_eq!(ended, "pane-closed");
+        let targets: Vec<String> = w
+            .fakes
+            .mux_calls()
+            .iter()
+            .filter(|c| c[1] == "if-shell")
+            .map(|c| c[4].clone())
+            .collect();
+        assert_eq!(targets.len(), 2, "{targets:?}");
+        assert_ne!(targets[0], targets[1], "{targets:?}");
     }
 
     #[test]

@@ -58,6 +58,23 @@ pub fn resolve(board: &Map<String, Value>, shown: &str) -> Option<Target> {
     found.next().is_none().then_some(one)
 }
 
+/// herdr's next (`forward`) or previous agent: the drawn agent after (before) the one on `looking` (the pane the
+/// session shows), wrapping; from a pane that is no drawn agent's, the first (last). None with none drawn.
+pub fn step<'a>(drawn: &'a [Target], looking: Option<&str>, forward: bool) -> Option<&'a Target> {
+    let n = drawn.len();
+    if n == 0 {
+        return None;
+    }
+    let at = looking.and_then(|pane| drawn.iter().position(|t| t.pane == pane));
+    let to = match (at, forward) {
+        (Some(at), true) => (at + 1) % n,
+        (Some(at), false) => (at + n - 1) % n,
+        (None, true) => 0,
+        (None, false) => n - 1,
+    };
+    drawn.get(to)
+}
+
 /// What the bar does after a key: nothing, draw again, or focus an agent.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Act {
@@ -91,8 +108,17 @@ impl Pick {
             (Event::Down, Some(at), Some(last)) => Some((at + 1).min(last)),
             (Event::Up, None, Some(last)) => Some(last),
             (Event::Up, Some(at), _) => Some(at.saturating_sub(1)),
-            // Not a key: returned above.
-            (Event::Press { .. } | Event::Release { .. } | Event::Interrupt, _, _) => {
+            // Not a selection key: returned above.
+            (
+                Event::Press { .. }
+                | Event::Release { .. }
+                | Event::Interrupt
+                | Event::Next
+                | Event::Prev
+                | Event::Peek,
+                _,
+                _,
+            ) => {
                 return Act::Nothing;
             }
         };
@@ -102,6 +128,12 @@ impl Pick {
             (Event::Enter, Some(target)) => Act::Focus(target.clone()),
             _ => Act::Redraw,
         }
+    }
+
+    /// The selected agent, if any, among `drawn`.
+    pub fn chosen<'a>(&self, drawn: &'a [Target]) -> Option<&'a Target> {
+        let (name, _) = self.chosen.as_ref()?;
+        drawn.iter().find(|t| t.name == *name)
     }
 
     /// A mouse press: it dismisses the note.
@@ -260,6 +292,39 @@ mod tests {
         ] {
             assert_eq!(row_hit(line), None, "{line:?}");
         }
+    }
+
+    #[test]
+    fn step_goes_next_and_prev_in_drawn_order_and_wraps() {
+        let drawn = [
+            Target {
+                name: "b".into(),
+                pane: "%11".into(),
+            },
+            Target {
+                name: "c".into(),
+                pane: "%12".into(),
+            },
+            Target {
+                name: "a".into(),
+                pane: "%10".into(),
+            },
+        ];
+        let name = |t: Option<&Target>| t.map(|t| t.name.clone());
+        assert_eq!(name(step(&drawn, None, true)), Some("b".into()));
+        assert_eq!(name(step(&drawn, Some("%1"), false)), Some("a".into()));
+        assert_eq!(name(step(&drawn, Some("%11"), true)), Some("c".into()));
+        assert_eq!(name(step(&drawn, Some("%10"), true)), Some("b".into()));
+        assert_eq!(name(step(&drawn, Some("%11"), false)), Some("a".into()));
+        assert_eq!(name(step(&[], None, true)), None);
+        // The selection keys never act on n, N or p.
+        let mut pick = Pick::default();
+        for e in [Event::Next, Event::Prev, Event::Peek] {
+            assert_eq!(pick.key(e, &drawn), Act::Nothing);
+        }
+        assert_eq!(pick.chosen(&drawn), None);
+        pick.key(Event::Down, &drawn);
+        assert_eq!(pick.chosen(&drawn).map(|t| t.name.as_str()), Some("b"));
     }
 
     #[test]

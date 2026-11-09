@@ -3372,6 +3372,45 @@ exec claude --dangerously-skip-permissions
         wait_focused(&live, &p1, "j then Enter");
     }
 
+    // #90: `n` (herdr's next agent) from a pane that is no agent's goes to the bar's first agent, `N` to its last.
+    fn bar_n_and_shift_n_step_through_agents(mux: Mux) {
+        let Some(mut live) = Live::human(mux) else {
+            return;
+        };
+        let (bar, p1) = two_rows(&mut live);
+        live.after_redraw(&bar);
+        live.call(&["send-keys", "-t", &bar, "-l", "n"]);
+        wait_focused(&live, &p1, "n from the root pane");
+        let root = live.server.pane().to_string();
+        live.call(&["select-pane", "-t", &root]);
+        live.after_redraw(&bar);
+        let p2 = {
+            let screen = live.call(&["capture-pane", "-p", "-t", &bar]);
+            let y = row_at(&screen, "w2").unwrap();
+            assert!(y > row_at(&screen, "w1").unwrap(), "{mux:?}:\n{screen}");
+            live.panes("#{pane_id}|#{@agent-name}")
+                .iter()
+                .find(|r| r.ends_with("|w2"))
+                .map(|r| r.split('|').next().unwrap().to_string())
+                .unwrap()
+        };
+        live.call(&["send-keys", "-t", &bar, "-l", "N"]);
+        wait_focused(&live, &p2, "N from the root pane");
+        // The documented binding: a run-shell (not below any pane) sends `n` to the bar the session records. tmux's
+        // run-shell knows its own server; the multiplexer's binary is named by the server under test.
+        if mux != Mux::Rmux {
+            live.call(&["select-pane", "-t", &root]);
+            live.after_redraw(&bar);
+            let tmux = live.server.binary().to_string_lossy().into_owned();
+            let socket = live.server.socket().to_string_lossy().into_owned();
+            let line = format!(
+                "{tmux} -S '{socket}' send-keys -t \"$({tmux} -S '{socket}' show -qv @mux-agents-sidebar-id | cut -d' ' -f1)\" n"
+            );
+            live.call(&["run-shell", &line]);
+            wait_focused(&live, &p1, "the documented binding");
+        }
+    }
+
     // #61: a press read after the bar shrank, before it drew at its new size, may land on a row that moved: it is
     // dropped and the bar redraws at once (well before its next tick, ~1.9 s away). Nothing is focused.
     fn bar_click_after_shrinking_does_nothing(mux: Mux) {
@@ -3524,6 +3563,55 @@ exec claude --dangerously-skip-permissions
             client.write(format!("\x1b[<0;{};{}{end}", left + 3, top + y).as_bytes());
         }
         wait_focused(&live, &p1, "a real client's click on w1's row");
+        drop(client);
+    }
+
+    // #91 through a real client: `p` in the bar opens herdr's peek, a popup over the client paging the first agent's
+    // last lines (tmux's display-popup needs a client); `q` closes it and the peek file is gone.
+    fn bar_real_client_peek(mux: Mux) {
+        let Some(mut live) = Live::human(mux) else {
+            return;
+        };
+        let (bar, _) = two_rows(&mut live);
+        let session = live.field(live.server.pane(), "#{session_id}");
+        let mut client = Client::attach(&live, &session);
+        live.server.wait("the client to attach", || {
+            (!live.call(&["list-clients"]).trim().is_empty()).then_some(())
+        });
+        live.wait_place(&bar, "the bar in place at the client's size");
+        live.after_redraw(&bar);
+        live.call(&["send-keys", "-t", &bar, "-l", "p"]);
+        // While the popup is open its peek file exists; the state folder holds it.
+        let peeks = |live: &Live| {
+            let mut found = 0;
+            for dir in std::fs::read_dir(live.dir.join("state"))
+                .into_iter()
+                .flatten()
+                .flatten()
+            {
+                for f in std::fs::read_dir(dir.path())
+                    .into_iter()
+                    .flatten()
+                    .flatten()
+                {
+                    if f.file_name().to_string_lossy().starts_with("peek-") {
+                        found += 1;
+                    }
+                }
+            }
+            found
+        };
+        live.server
+            .wait("the peek file while the popup is open", || {
+                (peeks(&live) == 1).then_some(())
+            });
+        // The bar never waits on the open popup: it keeps redrawing on its ticks meanwhile.
+        live.after_redraw(&bar);
+        assert_eq!(peeks(&live), 1, "the popup is still open");
+        client.write(b"q");
+        live.server.wait("the popup to delete its peek file", || {
+            (peeks(&live) == 0).then_some(())
+        });
         drop(client);
     }
 
@@ -3787,6 +3875,7 @@ exec claude --dangerously-skip-permissions
                     dead_pane_closed_by_one_conditional,
                     rotated_window_reaches_each_agent_by_its_pane,
                     bar_click_focuses_an_agent,
+                    bar_n_and_shift_n_step_through_agents,
                     bar_keys_focus_an_agent,
                     bar_click_after_shrinking_does_nothing,
                 ]
@@ -3811,6 +3900,7 @@ exec claude --dangerously-skip-permissions
             children_are_only_mux_and_client,
             panic_in_lock_frees_lock,
             bar_real_client_click_focuses,
+            bar_real_client_peek,
         ]
     );
 }

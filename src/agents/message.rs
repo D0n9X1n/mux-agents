@@ -209,7 +209,7 @@ pub fn read(ctx: &Ctx, request: &Request) -> Res<Map<String, Value>> {
 /// The last `lines` lines of a running agent's pane, captured by the server into a private buffer only while the
 /// pane is still its live launch (one `if-shell`), then read and deleted. No buffer (the check failed) refuses 2
 /// `target`: a pane replaced in between is never read.
-fn capture(ctx: &Ctx, pane: &registry::Pane, lines: i32) -> Res<String> {
+pub(crate) fn capture(ctx: &Ctx, pane: &registry::Pane, lines: i32) -> Res<String> {
     let buffer = format!("mux-agents-{}", crate::util::guid()?.replace('-', ""));
     let p = pane.pane.as_str();
     let command = format!("capture-pane -J -t {p} -b {buffer} -S -{lines}");

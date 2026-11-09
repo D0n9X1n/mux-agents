@@ -12,6 +12,11 @@ pub enum Event {
     Enter,
     Esc,
     Interrupt,
+    // herdr's next and previous agent (#90): `n`, `N`.
+    Next,
+    Prev,
+    // herdr's peek (#91): `p`.
+    Peek,
 }
 
 /// An event and the time its first byte was read.
@@ -93,6 +98,9 @@ fn decode(bytes: &[u8]) -> Option<(usize, Option<Event>)> {
         b'\r' | b'\n' => Event::Enter,
         b'k' => Event::Up,
         b'j' => Event::Down,
+        b'n' => Event::Next,
+        b'N' => Event::Prev,
+        b'p' => Event::Peek,
         ESC => return escape(bytes),
         _ => return Some((1, None)),
     };
@@ -187,6 +195,9 @@ mod tests {
             (b"\x1b[A", Event::Up),
             (b"\x1bOA", Event::Up),
             (b"j", Event::Down),
+            (b"n", Event::Next),
+            (b"N", Event::Prev),
+            (b"p", Event::Peek),
             (b"\x1b[B", Event::Down),
             (b"\x1bOB", Event::Down),
             (b"\x1bx", Event::Esc),
@@ -344,7 +355,7 @@ mod tests {
 
     #[test]
     fn garbage_is_ignored_and_never_panics() {
-        let keys = [0x03, b'\r', b'\n', b'j', b'k', 0x1b];
+        let keys = [0x03, b'\r', b'\n', b'j', b'k', b'n', b'N', b'p', 0x1b];
         for byte in 0..=255u8 {
             let mut decoder = Decoder::default();
             let reads = decoder.push(&[byte], at(1));
