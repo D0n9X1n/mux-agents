@@ -155,9 +155,9 @@ for event, entries in sorted(h["hooks"].items()):
     for e in entries:
         assert e["type"] == "command" and e["timeoutSec"] <= 10, e
         assert e["bash"].startswith("sh scripts/mux-agent report ") and e["bash"].endswith(">/dev/null 2>&1 || true"), e
-        assert e["powershell"].startswith("& scripts/mux-agent.cmd report ") and e["powershell"].endswith("; exit 0"), e
+        # No PowerShell anywhere (tests/repo.rs): Copilot on Windows keeps the fallback activity.
+        assert set(e) == {"type", "bash", "timeoutSec"} | ({"matcher"} if "matcher" in e else set()), e
         words = e["bash"][len("sh scripts/mux-agent "):].split(" >")[0]
-        assert words == e["powershell"][len("& scripts/mux-agent.cmd "):].split(" *>")[0], e
         print(f"{event}:{e.get('matcher', '')}:{words}")
 PY
   ) || { bad "$name" "hooks.json shape"; return; }
@@ -183,7 +183,7 @@ report idle
 report working
 report working
 report working"
-  [ "$ran" = "$want" ] && ok "$name" || bad "$name" "ran: $ran"
+  if [ "$ran" = "$want" ]; then ok "$name"; else bad "$name" "ran: $ran"; fi
 }
 copilot_hooks_report_through_the_shim
 

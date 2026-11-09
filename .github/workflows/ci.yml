@@ -94,12 +94,6 @@ jobs:
         if: runner.os != 'Windows'
         shell: bash
         run: sh tests/shim.sh
-      # #84: every Copilot hook's powershell command, run from the plugin root as Copilot runs it, reports through the
-      # cmd shim, prints nothing and never fails the turn.
-      - name: Copilot hooks (powershell)
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: pwsh -NoProfile -File tests\copilot-hooks.ps1
       # shim.cmd builds its stub with the .NET Framework csc.exe; its last line counts the failures.
       - name: Shim tests (cmd)
         if: runner.os == 'Windows'
