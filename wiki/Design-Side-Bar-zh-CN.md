@@ -101,7 +101,7 @@
 - **0.2.4。** 宽度为 `max(@mux-agents-sidebar-min, window × @mux-agents-sidebar-percent / 100)`，默认 30 列和 5%（#59）。
 - **0.2.5。** 左键点击代理的名字行，或在侧边栏中用 `j`/`k` 和 Enter，即切换到该代理的窗口和窗格；代理文本中的 `◉`/`◌` 绘制为 `•`（#61）。
 - **0.2.6。** 默认宽度恢复为窗口的 20%，至少 40 列（#74）。Windows 上也支持点击和按键：`watch` 以 VT 输入模式读取控制台，并在每次退出时恢复它（#70）。
-- **下一版。** herdr 的活动：需要你、看过前保持 done、working 和 idle，按此排序，时间从变化算起，标题按状态计数（`N need you` 在前），不再显示 `N running`；`◌ waiting` 改为 `◌ idle`（#82）。
+- **下一版。** herdr 的活动：需要你、看过前保持 done、working 和 idle，按此排序，时间从变化算起，标题按状态计数（`N need you` 在前），不再显示 `N running`；`◌ waiting` 改为 `◌ idle`（#82）。运行中的代理处于多种状态时显示 herdr 的分组标题；代理在你看别处时开始需要你或结束时显示一条 tmux 消息，可用 `@mux-agents-alerts` 关闭（#83）。
 
 ## Rust 实现（0.2.0）
 

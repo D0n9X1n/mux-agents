@@ -90,6 +90,23 @@ export function look(a: MuxAgentsAgent, ascii: boolean): Look | undefined {
   }
 }
 
+// herdr's section headings over a ranked board: the live agents' activity at each row where a new one starts, with its
+// count (`Needs you · 1`, `-` in ASCII); none when every live agent is in one state. Indexed by row; ended rows get
+// none.
+export function sections(agents: MuxAgentsAgent[], ascii = false): (string | undefined)[] {
+  const names: Record<string, string> = { blocked: 'Needs you', done: 'Done', working: 'Working', idle: 'Idle' }
+  const word = (a: MuxAgentsAgent) => (a.activity && a.activity in names ? a.activity : 'working')
+  const live = agents.filter(a => a.state === 'running')
+  const kinds = new Set(live.map(word))
+  if (kinds.size < 2) return agents.map(() => undefined)
+  let last: string | undefined
+  return agents.map(a => {
+    if (a.state !== 'running' || word(a) === last) return undefined
+    last = word(a)
+    return `${names[last]} ${ascii ? '-' : '\u00b7'} ${live.filter(l => word(l) === last).length}`
+  })
+}
+
 // How many live agents need the person (activity blocked), as the side bar's header counts them.
 export function needYou(agents: MuxAgentsAgent[]): number {
   return agents.filter(a => a.state === 'running' && a.activity === 'blocked').length

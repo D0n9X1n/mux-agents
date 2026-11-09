@@ -63,13 +63,16 @@ In Claude Code, an `Agents` pane beside the chat opens after the first successfu
 ```text
  mux-agents        1 need you / 1 done
 
- ! add-subtract [sonnet] needs you  12s
+ Needs you · 1
+ ! add-subtract [sonnet]            12s
    Adding subtract(a, b) under add i...
 
- ✦ test-calc  ✉ 1             done  30s
+ Done · 1
+ ✦ test-calc  ✉ 1                   30s
    Done: test_calc.py passed, exit 0
 
- ◉ fix-ci-flake            working  11m
+ Working · 1
+ ◉ fix-ci-flake                     11m
    Re-running tests/test_watch.rs wi...
 
  ended -------------------------------
@@ -82,6 +85,10 @@ In Claude Code, an `Agents` pane beside the chat opens after the first successfu
 "Doing" is what the agent last reported with `status`, else the first line of its last message, else its task.
 
 Each live agent shows its state, its name in its own color, its `[model]` when one was chosen, and `✉ N` when its parent has N unread messages from it. The states are herdr's, reported by the agent's own client (never read from its screen) and ranked so who needs you comes first: `! needs you` (bold yellow) is asking you a question; `✦ done` (bold cyan) finished its turn while you were not looking at it, and stays done until you have looked at its pane and moved on; `◉ working` (green) is running a turn; `◌ idle` (dim, the whole row) has nothing to do. Within a state, the most recent change comes first, and the time shown is since that change. An agent whose client reports nothing (Copilot CLI for now) is `◉ working`, or `◌ idle` while it listens in `read -Wait`. The header counts the live agents as herdr counts its sections, `N need you` (yellow), `N done`, `N working`, `N idle`, leaving out any 0 (`0 running` when none lives), then `M ended`; a narrow bar drops them from the end. Ended agents follow, the 3 newest that did not end `lost` (a lost agent is counted but not drawn): `✓ done` (exited 0), `✗ exit N` (red), `- stopped` (yellow); `+K more` counts the rest. `list -All` shows the 10 newest ended agents, so the bar writes `+K more  (list -All)` only when every ended agent is among them, and `+K more ended` otherwise. A spawn picks the name color least used by the session's live agents (blue, magenta, bright blue, bright magenta; never a state color), and `list -Text` paints names the same way.
+
+When the live agents are in more than one state, each state's first agent has herdr's section heading above it with its count (`Needs you · 1`), and, as in herdr's priority view, the rows under the headings show only their glyph and time, so names keep the room; a short bar drops the headings right after the blank lines and the words come back. With every live agent in one state there are no headings and each row says its state.
+
+When an agent starts needing you, or finishes, while you are not looking at its pane, the bar shows one tmux message on the session's clients for 5 seconds, `mux-agents: w2 needs you`, as herdr's toast. The multiplexer option `@mux-agents-alerts` sets it: `off` sends none, `blocked` only who needs you, unset or anything else both (for example `tmux set -g @mux-agents-alerts blocked`). The first sight of an agent is never news, so opening the bar is quiet.
 
 The bar is laid out at its pane's size on every redraw and never wraps: long text is cut with `...`, and a short pane drops blank lines first, then ended rows, then the "doing" lines and whole rows of the oldest agents; the header stays. Color follows `NO_COLOR` (off), `FORCE_COLOR` or `CLICOLOR_FORCE` (on), then `TERM=dumb` (off); `MUX_AGENTS_ASCII=1` draws `! @ * o + x m -` instead of the symbols. Each redraw rewrites the rows in place (no full clear), so the bar does not flicker; with `TERM=dumb` it prints plain frames instead.
 

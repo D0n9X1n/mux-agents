@@ -2,7 +2,7 @@ import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register, Timer } from 'claude-code'
 
 import { activity } from './activity'
-import { EMPTY, formatAge, isSpawn, look, mail, needYou, parseList } from './board'
+import { EMPTY, formatAge, isSpawn, look, mail, needYou, parseList, sections } from './board'
 
 const PANE = 'mux-agents'
 // Change the shape tag when the board's fields change: it declines what an earlier version stored.
@@ -195,22 +195,29 @@ export const register: Register = on => {
     const ascii = await asciiGlyphs($)
     // Who needs the person leads the header, as on the side bar; tolerant of a stored board without activity.
     const need = needYou(Array.isArray(b.agents) ? b.agents : [])
+    const headings = sections(Array.isArray(b.agents) ? b.agents : [], ascii)
     return (
       <Box flexDirection="column">
         <Text>mux-agents · {need > 0 ? <Text color="yellow">{need} need you · </Text> : null}{b.running} running{b.failed ? ' · refresh failed' : ''}</Text>
-        {b.agents.map(a => {
+        {b.agents.map((a, at) => {
           const row = look(a, ascii)
           if (!row) return null
+          const heading = headings[at]
           // A live agent's chosen model follows its client, then its unread badge.
           const tag = !row.ended && a.model ? ` [${a.model}]` : ''
           const badge = row.ended ? undefined : mail(a.unread, ascii)
           // A live row's time is since its activity last changed, as on the side bar.
           const age = !row.ended && typeof a.since === 'number' ? a.since : a.age
           const loud = row.pill || row.word === 'done' || undefined
+          // Under herdr's section headings a live row shows the compact status, glyph and time: the heading names it.
+          const compact = !row.ended && headings.some(Boolean)
+          const dot = ascii ? '-' : '\u00b7'
+          const [title, count] = heading ? heading.split(` ${dot} `) : []
           return (
             <Box flexDirection="column">
+              {heading ? <Text bold color={row.color} dimColor={row.muted || undefined}>{title}<Text dimColor> {dot} {count}</Text></Text> : null}
               <Text dimColor={row.ended || row.muted || undefined}>
-                <Text color={row.color} bold={loud}>{row.glyph}</Text> {a.name}  {a.client}{tag}  {badge ? <Text bold color="blue">{badge}</Text> : null}{badge ? '  ' : ''}<Text color={row.color} bold={loud} inverse={row.pill || undefined}>{row.word}</Text>  {formatAge(age)}
+                <Text color={row.color} bold={loud}>{row.glyph}</Text> {a.name}  {a.client}{tag}  {badge ? <Text bold color="blue">{badge}</Text> : null}{badge ? '  ' : ''}{compact ? null : <Text color={row.color} bold={loud} inverse={row.pill || undefined}>{row.word}</Text>}{compact ? '' : '  '}{formatAge(age)}
               </Text>
               {a.doing ? <Text dimColor>  {a.doing}</Text> : null}
             </Box>

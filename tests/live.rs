@@ -1638,9 +1638,10 @@ exec claude --dangerously-skip-permissions
         bar_clean(&live, &bar, &screen);
     }
 
-    // S2, #82: the bar draws in color at its pane's size with nothing stray; an agent in `read -Wait` with no report
-    // shows `idle` until mail wakes it, then `working` again, and its waiting file is gone. An agent whose client
-    // reports `blocked` shows `! needs you` first, the header counting it; its next report moves it back.
+    // S2, #82, #83: the bar draws in color at its pane's size with nothing stray; an agent in `read -Wait` with no
+    // report shows `idle` until mail wakes it, then `working` again, and its waiting file is gone. An agent whose
+    // client reports `blocked` comes first under herdr's `Needs you` heading, the header counting it; its next report
+    // moves it back.
     fn bar_shows_waiting_then_working(mux: Mux) {
         let Some(mut live) = Live::human(mux) else {
             return;
@@ -1655,8 +1656,11 @@ exec claude --dangerously-skip-permissions
         let mut screen = String::new();
         let waiting = eventually(Duration::from_secs(30), || {
             screen = live.call(&["capture-pane", "-p", "-t", &bar]);
-            bar_word(&screen, "w1").as_deref() == Some("idle")
-                && bar_word(&screen, "w2").as_deref() == Some("working")
+            // Two states, so herdr's headings over compact rows: idle `◌ w1`, working `◉ w2`.
+            screen.contains("\u{25cc} w1")
+                && screen.contains("\u{25c9} w2")
+                && screen.contains("Idle \u{b7} 1")
+                && screen.contains("Working \u{b7} 1")
         });
         assert!(waiting, "{mux:?}: the bar shows:\n{screen}");
         // w2's client asks the person: needs you, ranked first, counted in the header.
@@ -1668,16 +1672,30 @@ exec claude --dangerously-skip-permissions
         let blocked = eventually(Duration::from_secs(30), || {
             screen = live.call(&["capture-pane", "-p", "-t", &bar]);
             let rows = [row_at(&screen, "w2"), row_at(&screen, "w1")];
-            bar_word(&screen, "w2").as_deref() == Some("needs")
+            // Two states: herdr's headings, and under them the compact row (glyph, name, time).
+            screen.contains("! w2")
+                && screen.contains("Needs you \u{b7} 1")
+                && screen.contains("Idle \u{b7} 1")
                 && screen.contains("1 need you")
                 && matches!(rows, [Some(a), Some(b)] if a < b)
         });
         assert!(blocked, "{mux:?}: the bar shows:\n{screen}");
         assert!(screen.contains("! w2"), "{mux:?}:\n{screen}");
+        // #83: nobody looks at w2's pane, so the bar tells the session's clients once. tmux keeps the command in its
+        // message log; rmux keeps none, so its message is the unit tests' to prove.
+        if !matches!(mux, Mux::Rmux) {
+            let mut log = String::new();
+            let told = eventually(Duration::from_secs(10), || {
+                log = live.call(&["show-messages"]);
+                log.contains("mux-agents: w2 needs you")
+            });
+            assert!(told, "{mux:?}: no alert in\n{log}");
+            assert_eq!(log.matches("w2 needs you").count(), 1, "{mux:?}:\n{log}");
+        }
         support::write_atomic(&live.dir.join(format!("cmd.{pid2}")), "report\tworking\n");
         let unblocked = eventually(Duration::from_secs(30), || {
             screen = live.call(&["capture-pane", "-p", "-t", &bar]);
-            bar_word(&screen, "w2").as_deref() == Some("working") && !screen.contains("need you")
+            screen.contains("\u{25c9} w2") && !screen.contains("need you")
         });
         assert!(unblocked, "{mux:?}: the bar shows:\n{screen}");
         bar_clean(&live, &bar, &screen);

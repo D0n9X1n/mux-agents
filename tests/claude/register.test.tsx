@@ -727,7 +727,7 @@ test('list runs with a 10000 ms timeout, and a timeout fails like any rejection'
   await ui.unmount()
 })
 
-test('a live row draws its activity as the side bar does: needs you reversed, idle muted, time since the change', async ($, on) => {
+test('a live row draws its activity as the side bar does: under herdr\'s headings the compact status, idle muted', async ($, on) => {
   const rows = [
     { ...row('asker', 'running', 'which db?', 400), activity: 'blocked', since: 12 },
     { ...row('finisher', 'running', null, 500), activity: 'done', since: 30 },
@@ -740,20 +740,56 @@ test('a live row draws its activity as the side bar does: needs you reversed, id
   await clock.settle()
   const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
   const texts = (await ui.findAll({ type: 'Text' })).map((t: { text: string }) => t.text)
+  // Four states: each heading names its state with a dim count, and the rows show glyph and time, no word.
   expect(texts.filter((t: string) => / claude  /.test(t))).toEqual([
-    '! asker  claude  needs you  12s',
-    '✦ finisher  claude  done  30s',
-    '◉ builder  claude  working  10m',
-    '◌ rester  claude  idle  1m',
+    '! asker  claude  12s',
+    '\u2726 finisher  claude  30s',
+    '\u25c9 builder  claude  10m',
+    '\u25cc rester  claude  1m',
   ])
+  expect(texts.filter((t: string) => /^\S.* \u00b7 \d+$/.test(t))).toEqual(['Needs you \u00b7 1', 'Done \u00b7 1', 'Working \u00b7 1', 'Idle \u00b7 1'])
   expect(await header(ui)).toBe('mux-agents · 1 need you · 4 running')
-  // The styled span inside a row: the child Text whose own text is `text`.
   const line = async (text: RegExp) => (await ui.find({ type: 'Text', text })) as any
   const span = (node: any, text: string) => node?.children?.find((c: any) => typeof c === 'object' && c.children?.join('') === text)?.props
-  expect(span(await line(/asker/), 'needs you')).toEqual({ color: 'yellow', bold: true, inverse: true })
-  expect(span(await line(/finisher/), 'done')).toEqual({ color: 'cyan', bold: true })
-  expect(span(await line(/builder/), 'working')).toEqual({ color: 'green' })
+  expect(span(await line(/^Needs you/), 'Needs you')).toBeUndefined()
+  expect((await line(/^Needs you/))?.props).toEqual({ bold: true, color: 'yellow' })
+  expect((await line(/^Idle/))?.props).toEqual({ bold: true, dimColor: true })
   expect([(await line(/rester/))?.props?.dimColor, (await line(/builder/))?.props?.dimColor]).toEqual([true, undefined])
   expect(span(await line(/need you/), '1 need you · ')).toEqual({ color: 'yellow' })
+  await ui.unmount()
+})
+
+test('with every live agent in one state there are no headings and each row says its state: needs you is the pill', async ($, on) => {
+  const rows = [
+    { ...row('asker', 'running', null, 400), activity: 'blocked', since: 12 },
+    { ...row('other', 'running', null, 500), activity: 'blocked', since: 30 },
+  ]
+  const { clock } = world(on, { TMUX: 'x' }, [ran(0, list(2, rows))])
+  await $.session.start(START)
+  await $.command.run({ command: 'mux-agents-pane' })
+  await clock.settle()
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  const texts = (await ui.findAll({ type: 'Text' })).map((t: { text: string }) => t.text)
+  expect(texts.filter((t: string) => / claude  /.test(t))).toEqual(['! asker  claude  needs you  12s', '! other  claude  needs you  30s'])
+  expect(texts.some((t: string) => / \u00b7 \d+$/.test(t))).toBe(false)
+  const node = (await ui.find({ type: 'Text', text: /asker/ })) as any
+  const pill = node?.children?.find((c: any) => typeof c === 'object' && c.children?.join('') === 'needs you')?.props
+  expect(pill).toEqual({ color: 'yellow', bold: true, inverse: true })
+  await ui.unmount()
+})
+
+test('MUX_AGENTS_ASCII=1 draws herdr\'s headings with `-` too', async ($, on) => {
+  const rows = [
+    { ...row('asker', 'running', null, 400), activity: 'blocked', since: 12 },
+    { ...row('builder', 'running', null, 600), activity: 'working', since: null },
+  ]
+  const { clock } = world(on, { TMUX: 'x', MUX_AGENTS_ASCII: '1' }, [ran(0, list(2, rows))])
+  await $.session.start(START)
+  await $.command.run({ command: 'mux-agents-pane' })
+  await clock.settle()
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  const texts = (await ui.findAll({ type: 'Text' })).map((t: { text: string }) => t.text)
+  expect(texts.filter((t: string) => /^\S.* - \d+$/.test(t))).toEqual(['Needs you - 1', 'Working - 1'])
+  expect(texts.filter((t: string) => / claude  /.test(t))).toEqual(['! asker  claude  12s', '* builder  claude  10m'])
   await ui.unmount()
 })

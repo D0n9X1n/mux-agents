@@ -1,6 +1,6 @@
 import { expect, test } from 'claude-code/testing'
 
-import { clean, formatAge, isSpawn, look, mail, parseList } from '../../hooks/board'
+import { clean, formatAge, isSpawn, look, mail, parseList, sections } from '../../hooks/board'
 import {
   SPAWN_ERROR_JSON, SPAWN_ERROR_TEXT, SPAWN_JSON, SPAWN_MODEL_JSON, SPAWN_MODEL_TEXT, SPAWN_OFF_JSON, SPAWN_OFF_TEXT, SPAWN_TEXT,
   TAGGED_JSON, TAGGED_TEXT,
@@ -169,4 +169,14 @@ test('mail is the side bar\'s unread badge, only for a count above 0', () => {
 
 test('formatAge uses s, m and h, floored', () => {
   expect([0, 59, 60, 3599, 3600, 7199].map(formatAge)).toEqual(['0s', '59s', '1m', '59m', '1h', '1h'])
+})
+
+test('sections heads each state\'s first live row with its count, only when the live agents are in more than one state', () => {
+  const a = (state: string, activity: string | null) => ({ ...agent(state), activity })
+  expect(sections([a('running', 'blocked'), a('running', 'done'), a('running', 'done'), a('running', null), a('exited', null)]))
+    .toEqual(['Needs you \u00b7 1', 'Done \u00b7 2', undefined, 'Working \u00b7 1', undefined])
+  expect(sections([a('running', 'working'), a('running', 'working'), a('stopped', null)])).toEqual([undefined, undefined, undefined])
+  expect(sections([])).toEqual([])
+  // ASCII: `-` between the name and the count, as the side bar draws it.
+  expect(sections([a('running', 'blocked'), a('running', 'working')], true)).toEqual(['Needs you - 1', 'Working - 1'])
 })

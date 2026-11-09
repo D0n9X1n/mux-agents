@@ -101,7 +101,7 @@ Transcript inference; `pane-border-format`; a Copilot CLI panel; notifications.
 - **0.2.4.** The width is `max(@mux-agents-sidebar-min, window × @mux-agents-sidebar-percent / 100)`, by default 30 columns and 5% (#59).
 - **0.2.5.** A left click on an agent's name line, or `j`/`k` and Enter in the bar, switches to that agent's window and pane; `◉`/`◌` in agent text draw as `•` (#61).
 - **0.2.6.** The default width is back to 20% of the window, at least 40 columns (#74). Clicks and keys work on Windows too: `watch` reads the console in VT input mode and restores it on every exit (#70).
-- **Next.** herdr's activity: needs you, done until seen, working and idle, ranked, with the time since the change and the header counting each state (`N need you` first) instead of `N running`; `◌ waiting` becomes `◌ idle` (#82).
+- **Next.** herdr's activity: needs you, done until seen, working and idle, ranked, with the time since the change and the header counting each state (`N need you` first) instead of `N running`; `◌ waiting` becomes `◌ idle` (#82). herdr's section headings when the live agents are in more than one state, and one tmux message when an agent starts needing you or finishes while you look elsewhere, `@mux-agents-alerts` to quiet it (#83).
 
 ## Rust (0.2.0)
 

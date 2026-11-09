@@ -63,13 +63,16 @@ flowchart LR
 ```text
  mux-agents        1 need you / 1 done
 
- ! add-subtract [sonnet] needs you  12s
+ Needs you · 1
+ ! add-subtract [sonnet]            12s
    Adding subtract(a, b) under add i...
 
- ✦ test-calc  ✉ 1             done  30s
+ Done · 1
+ ✦ test-calc  ✉ 1                   30s
    Done: test_calc.py passed, exit 0
 
- ◉ fix-ci-flake            working  11m
+ Working · 1
+ ◉ fix-ci-flake                     11m
    Re-running tests/test_watch.rs wi...
 
  ended -------------------------------
@@ -82,6 +85,10 @@ flowchart LR
 “正在做的事”是代理最近用 `status` 报告的内容，否则是它最后一条消息的第一行，否则是它的任务。
 
 每个运行中的代理显示它的状态、用自己颜色显示的名字、选定模型时的 `[model]`，以及其父窗格还有 N 条来自它的未读消息时的 `✉ N`。状态沿用 herdr 的说法，由代理自己的客户端报告（绝不从它的屏幕猜测），并按谁需要你排序：`! needs you`（粗体黄色）表示它在向你提问；`✦ done`（粗体青色）表示它在你没看着时结束了这一轮，直到你看过它的窗格并离开前都保持 done；`◉ working`（绿色）表示正在执行一轮；`◌ idle`（整行变暗）表示无事可做。同一状态中，最近变化的排在前面，显示的时间是从那次变化算起。客户端不报告状态的代理（目前是 Copilot CLI）显示为 `◉ working`，在 `read -Wait` 中等待时显示为 `◌ idle`。标题像 herdr 统计各分组那样统计运行中的代理：`N need you`（黄色）、`N done`、`N working`、`N idle`，为 0 的不显示（没有运行中的代理时显示 `0 running`），然后是 `M ended`；侧边栏较窄时从末尾去掉。之后是已结束的代理，最新的 3 个非 `lost` 结束的代理（`lost` 的代理计入数量但不绘制）：`✓ done`（以 0 退出）、`✗ exit N`（红色）、`- stopped`（黄色）；`+K more` 统计其余的。`list -All` 列出最新的 10 个已结束代理，所以只有当所有已结束代理都在其中时，侧边栏才写 `+K more  (list -All)`，否则写 `+K more ended`。启动代理时会选取本会话运行中代理用得最少的名字颜色（蓝、品红、亮蓝、亮品红；绝不与状态颜色相同），`list -Text` 也用同样的颜色显示名字。
+
+当运行中的代理处于多种状态时，每种状态的第一个代理上方都有 herdr 的分组标题及其数量（`Needs you · 1`），并且像 herdr 的优先级视图那样，标题下的各行只显示字形和时间，让名字有更多空间；侧边栏较矮时，紧接空行之后去掉这些标题，状态文字随之恢复。所有运行中的代理处于同一状态时没有标题，每行显示自己的状态。
+
+当某个代理开始需要你，或者结束了，而你没有在看它的窗格时，侧边栏会在本会话的客户端上显示一条 tmux 消息，持续 5 秒，例如 `mux-agents: w2 needs you`，相当于 herdr 的提示。多路复用器选项 `@mux-agents-alerts` 控制它：`off` 不发送，`blocked` 只提示需要你的代理，未设置或其他值两者都提示（例如 `tmux set -g @mux-agents-alerts blocked`）。第一次看到某个代理时从不提示，所以打开侧边栏是安静的。
 
 侧边栏每次重绘都按窗格的实际大小排版，绝不换行：过长的文字用 `...` 截断；窗格太矮时先去掉空行，再去掉已结束的行，然后去掉最早代理的“正在做的事”行和整行；标题始终保留。颜色依次遵循 `NO_COLOR`（关）、`FORCE_COLOR` 或 `CLICOLOR_FORCE`（开）、然后 `TERM=dumb`（关）；`MUX_AGENTS_ASCII=1` 用 `! @ * o + x m -` 代替符号。每次重绘都在原处改写各行（不整屏清除），所以侧边栏不会闪烁；在 `TERM=dumb` 下则输出普通的帧。
 
