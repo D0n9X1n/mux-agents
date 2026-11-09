@@ -195,10 +195,10 @@ const BADGE: Style = Style {
 const MAIL: &str = "\u{2709}";
 const HINT: &str = "Enter: focus  Esc: clear";
 
-/// Agent-supplied text as drawn: '◉' and '◌' become '•' (all one column under unicode-width 0.2.3), so only the
+/// Agent-supplied text as drawn: '◉', '◌' and '✦' become '•' (all one column under unicode-width 0.2.3), so only the
 /// bar's own glyph starts a name line.
 fn own_glyphs(text: &str) -> String {
-    text.replace(['\u{25c9}', '\u{25cc}'], "\u{2022}")
+    text.replace(['\u{25c9}', '\u{25cc}', '\u{2726}'], "\u{2022}")
 }
 
 const fn hued(color: Color) -> Style {
@@ -250,47 +250,93 @@ fn render(row: &[Span], color: bool) -> String {
         .collect()
 }
 
-/// An agent's state as the bar draws it (S2.3).
+/// An agent's state as the bar draws it (S2.3): a live agent's activity as herdr names it, then the ended kinds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Kind {
-    Working,
-    Waiting,
+    Blocked,
     Done,
+    Working,
+    Idle,
+    Finished,
     Exit,
     Stopped,
     Other,
 }
 
 impl Kind {
-    /// Single-width glyphs (UAX #11 Neutral), or ASCII.
+    /// A live row's kind: its `activity`, else (a feed without it) `waiting`.
+    fn live(row: &Map<String, Value>) -> Kind {
+        match row.get("activity").and_then(Value::as_str) {
+            Some("blocked") => Kind::Blocked,
+            Some("done") => Kind::Done,
+            Some("idle") => Kind::Idle,
+            Some(_) => Kind::Working,
+            None if row.get("waiting") == Some(&Value::Bool(true)) => Kind::Idle,
+            None => Kind::Working,
+        }
+    }
+
+    /// Single-width glyphs (UAX #11 Neutral), or ASCII; glyph and word tell every kind apart without color.
     fn glyph(self, ascii: bool) -> &'static str {
         match (self, ascii) {
+            (Kind::Blocked, _) => "!",
+            (Kind::Done, false) => "\u{2726}",
+            (Kind::Done, true) => "@",
             (Kind::Working, false) => "\u{25c9}",
             (Kind::Working, true) => "*",
-            (Kind::Waiting, false) => "\u{25cc}",
-            (Kind::Waiting, true) => "o",
-            (Kind::Done, false) => "\u{2713}",
-            (Kind::Done, true) => "+",
+            (Kind::Idle, false) => "\u{25cc}",
+            (Kind::Idle, true) => "o",
+            (Kind::Finished, false) => "\u{2713}",
+            (Kind::Finished, true) => "+",
             (Kind::Exit, false) => "\u{2717}",
             (Kind::Exit, true) => "x",
             (Kind::Stopped | Kind::Other, _) => "-",
         }
     }
 
+    /// A live kind's word.
+    fn word(self) -> &'static str {
+        match self {
+            Kind::Blocked => "needs you",
+            Kind::Done => "done",
+            Kind::Idle => "idle",
+            _ => "working",
+        }
+    }
+
     fn style(self) -> Style {
         match self {
+            Kind::Blocked => Style {
+                bold: true,
+                ..hued(Color::Yellow)
+            },
+            Kind::Done => Style {
+                bold: true,
+                ..hued(Color::Cyan)
+            },
             Kind::Working => hued(Color::Green),
-            Kind::Waiting => hued(Color::Cyan),
-            Kind::Done | Kind::Other => DIM,
+            Kind::Idle | Kind::Finished | Kind::Other => DIM,
             Kind::Exit => hued(Color::Red),
             Kind::Stopped => hued(Color::Yellow),
+        }
+    }
+
+    /// The word's style: needs you is reversed, herdr's pill.
+    fn word_style(self) -> Style {
+        Style {
+            reverse: self == Kind::Blocked,
+            ..self.style()
         }
     }
 }
 
 /// The right side of an agent's line: its state word, then its age right-aligned.
-fn right(kind: Kind, word: &str, age: &str) -> Row {
-    vec![span(word, kind.style()), span(format!(" {age:>4}"), PLAIN)]
+fn right(kind: Kind, word: &str, age: &str, muted: bool) -> Row {
+    let age_style = if muted { DIM } else { PLAIN };
+    vec![
+        span(word, kind.word_style()),
+        span(format!(" {age:>4}"), age_style),
+    ]
 }
 
 /// One agent's line in `cols` columns: `<glyph> <name><model><badge>` left, `right` right-aligned. Short of room the
@@ -384,11 +430,9 @@ struct Shape {
 }
 
 fn live_row(row: &Map<String, Value>, cols: usize, look: Look) -> Live {
-    let kind = if row.get("waiting") == Some(&Value::Bool(true)) {
-        Kind::Waiting
-    } else {
-        Kind::Working
-    };
+    let kind = Kind::live(row);
+    // An idle agent's whole row is muted, as herdr mutes it; its name keeps its hue.
+    let muted = kind == Kind::Idle;
     let name = clean(row.get("name"));
     let hue = paint::hue(paint::identity(
         row.get("color").and_then(Value::as_str),
@@ -407,23 +451,24 @@ fn live_row(row: &Map<String, Value>, cols: usize, look: Look) -> Live {
     } else {
         Vec::new()
     };
-    let word = if kind == Kind::Waiting {
-        "waiting"
-    } else {
-        "working"
-    };
+    // The time since the activity last changed, else since the agent started.
+    let since = row
+        .get("since")
+        .filter(|since| !since.is_null())
+        .or_else(|| row.get("age"));
     let line = agent_line(
         span(kind.glyph(look.ascii), kind.style()),
         span(
             own_glyphs(&name),
             Style {
                 color: hue,
+                dim: muted,
                 ..PLAIN
             },
         ),
         model,
         badge,
-        right(kind, word, &format_age(row.get("age"))),
+        right(kind, kind.word(), &format_age(since), muted),
         cols,
     );
     let doing = own_glyphs(&clean(row.get("doing")));
@@ -439,21 +484,32 @@ fn live_row(row: &Map<String, Value>, cols: usize, look: Look) -> Live {
     }
 }
 
-/// `mux-agents` bold, then the counts right-aligned when they fit; short of room only their first part (`N
-/// running`), then the title alone.
-fn header(counts: &str, cols: usize) -> Row {
+/// `mux-agents` bold, then the counts right-aligned when they fit, as herdr counts its sections: `N need you`
+/// (yellow), `N done`, `N working`, `N idle`, each only when not 0 (`0 running` when no agent lives), then `M ended`.
+/// Short of room the counts lose their last part, then the next, then the title stands alone.
+fn header(parts: &[(String, Style)], cols: usize) -> Row {
     let title = span("mux-agents", BOLD);
-    let fits = |text: &str| 10 + 2 + paint::width(text) <= cols;
-    let running = counts.split(" / ").next().unwrap_or(counts);
-    let Some(counts) = [counts, running].into_iter().find(|text| fits(text)) else {
+    let shown = |n: usize| -> Row {
+        let mut row = Vec::new();
+        for (at, (text, style)) in parts[..n].iter().enumerate() {
+            if at > 0 {
+                row.push(span(" / ", PLAIN));
+            }
+            row.push(span(text.clone(), *style));
+        }
+        row
+    };
+    let Some(counts) = (1..=parts.len())
+        .rev()
+        .map(shown)
+        .find(|row| 10 + 2 + row_width(row) <= cols)
+    else {
         return margin(vec![title]);
     };
-    let width = paint::width(counts);
-    margin(vec![
-        title,
-        span(" ".repeat(cols - 10 - width), PLAIN),
-        span(counts, PLAIN),
-    ])
+    let width = row_width(&counts);
+    let mut row = vec![title, span(" ".repeat(cols - 10 - width), PLAIN)];
+    row.extend(counts);
+    margin(row)
 }
 
 fn parts(
@@ -468,7 +524,7 @@ fn parts(
         .collect();
     let Some(board) = board else {
         return Parts {
-            header: header("? running", cols),
+            header: header(&[("? running".into(), PLAIN)], cols),
             live: Vec::new(),
             ended: Vec::new(),
             ended_more: 0,
@@ -479,6 +535,8 @@ fn parts(
     };
     let rows = board.get("agents").and_then(Value::as_array);
     let (mut live, mut ended, mut counted) = (Vec::new(), Vec::new(), 0);
+    // Live agents by kind, in herdr's order: needs you, done, working, idle.
+    let mut kinds = [0usize; 4];
     for row in rows.map_or(&[][..], Vec::as_slice) {
         let Some(row) = row.as_object() else {
             continue;
@@ -486,6 +544,13 @@ fn parts(
         // Every printed field, state included, is cleaned first.
         let state = clean(row.get("state"));
         if state == "running" {
+            let at = match Kind::live(row) {
+                Kind::Blocked => 0,
+                Kind::Done => 1,
+                Kind::Working => 2,
+                _ => 3,
+            };
+            kinds[at] += 1;
             live.push(live_row(row, cols, look));
             continue;
         }
@@ -494,7 +559,7 @@ fn parts(
             // A lost agent's pane is gone: counted, never drawn.
             "lost" => continue,
             "exited" => match row.get("exitCode").filter(|code| !code.is_null()) {
-                Some(code) if clean(Some(code)) == "0" => (Kind::Done, "done".to_string()),
+                Some(code) if clean(Some(code)) == "0" => (Kind::Finished, "done".to_string()),
                 Some(code) => (Kind::Exit, format!("exit {}", clean(Some(code)))),
                 None => (Kind::Exit, "exit ?".to_string()),
             },
@@ -506,7 +571,7 @@ fn parts(
             span(own_glyphs(&clean(row.get("name"))), DIM),
             Vec::new(),
             Vec::new(),
-            right(kind, &word, &format_age(row.get("age"))),
+            right(kind, &word, &format_age(row.get("age")), false),
             cols,
         );
         ended.push(margin(line));
@@ -516,9 +581,18 @@ fn parts(
         .and_then(Value::as_u64)
         .map_or(counted, |total| total as usize);
     ended.truncate(ENDED_SHOWN);
-    let running = board.get("running").and_then(Value::as_i64).unwrap_or(0);
+    let words = ["need you", "done", "working", "idle"];
+    let styles = [hued(Color::Yellow), PLAIN, PLAIN, PLAIN];
+    let mut counts: Vec<(String, Style)> = (0..4)
+        .filter(|&at| kinds[at] > 0)
+        .map(|at| (format!("{} {}", kinds[at], words[at]), styles[at]))
+        .collect();
+    if counts.is_empty() {
+        counts.push(("0 running".into(), PLAIN));
+    }
+    counts.push((format!("{total} ended"), PLAIN));
     Parts {
-        header: header(&format!("{running} running / {total} ended"), cols),
+        header: header(&counts, cols),
         nothing: live.is_empty(),
         live,
         ended_more: total.saturating_sub(ended.len()),
@@ -1088,6 +1162,7 @@ pub fn run_watch(
     let mut size = FALLBACK;
     let mut unknown = 0;
     let mut pick = Pick::default();
+    let mut viewing = Viewing::default();
     loop {
         let probe = native(
             ctx,
@@ -1124,6 +1199,14 @@ pub fn run_watch(
             Ok(board) => last = Some(board),
             Err(_) => failed = true,
         }
+        // The pane the person looks at (an unanswered probe changes nothing), then the done spell they leave behind:
+        // seen. A spell not marked is kept and marked again on the next tick.
+        if let Some(looked) = shown_pane(ctx, caller) {
+            viewing.tick(looked, last.as_ref());
+        }
+        viewing.mark(|pane, changed| {
+            crate::agents::board::mark_seen(ctx, caller, pane, changed).is_ok()
+        });
         let note = pick.note();
         let mut notes = Vec::new();
         if failed {
@@ -1189,6 +1272,77 @@ pub fn run_watch(
                 break;
             }
         }
+    }
+}
+
+/// The pane the session shows to an attached client, its current window's active pane: `Some(None)` when no client
+/// is attached, `None` when the multiplexer did not answer in that shape (nothing is known).
+fn shown_pane(ctx: &Ctx, caller: &Caller) -> Option<Option<String>> {
+    let read = native(
+        ctx,
+        &["display-message", "-p", "-t", &caller.session, SHOWN_FORMAT],
+        true,
+    )
+    .ok()?;
+    if read.code != 0 {
+        return None;
+    }
+    let line = read.stdout.trim_end_matches(['\r', '\n']);
+    let (pane, attached) = line.split_once('|')?;
+    let attached = attached.parse::<u32>().ok()?;
+    if attached == 0 {
+        return Some(None);
+    }
+    crate::agents::pane_id(pane).then(|| Some(pane.to_string()))
+}
+
+const SHOWN_FORMAT: &str = "#{pane_id}|#{session_attached}";
+
+/// Who the person is looking at, as herdr holds a done agent while it is viewed: the shown pane, the newest done
+/// spell (a row's `changedAt`) it showed while looked at, and the spells left behind still to be marked seen.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct Viewing {
+    pane: Option<String>,
+    done: Option<String>,
+    left: Vec<(String, String)>,
+}
+
+impl Viewing {
+    /// One tick with the pane shown now (`None`: none, no client attached) and the board. Leaving a pane queues the
+    /// done spell it showed to be marked seen; while the same pane stays shown, a done row on it is remembered.
+    fn tick(&mut self, shown: Option<String>, board: Option<&Map<String, Value>>) {
+        if shown != self.pane {
+            if let (Some(pane), Some(done)) = (self.pane.take(), self.done.take()) {
+                self.left.retain(|(p, _)| *p != pane);
+                self.left.push((pane, done));
+            }
+            self.pane = shown;
+        }
+        let rows = board
+            .and_then(|b| b.get("agents"))
+            .and_then(Value::as_array);
+        let done = rows
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_object)
+            .find(|row| {
+                let field = |name: &str| row.get(name).and_then(Value::as_str);
+                field("state") == Some("running")
+                    && self.pane.is_some()
+                    && field("pane") == self.pane.as_deref()
+                    && field("activity") == Some("done")
+            });
+        if let Some(changed) = done
+            .and_then(|row| row.get("changedAt"))
+            .and_then(Value::as_str)
+        {
+            self.done = Some(changed.to_string());
+        }
+    }
+
+    /// Marks each spell left behind with `seen`; one it could not mark stays for the next tick.
+    fn mark(&mut self, mut seen: impl FnMut(&str, &str) -> bool) {
+        self.left.retain(|(pane, changed)| !seen(pane, changed));
     }
 }
 
@@ -1878,12 +2032,13 @@ mod tests {
         out
     }
 
-    // The issue's mock-up: three live agents (one waiting, with an unread message), 7 ended of which the feed has 4.
+    // The issue's mock-up: three live agents in the feed's rank (one needs you, one done with an unread message, one
+    // working), 7 ended of which the feed has 4.
     fn mock() -> Value {
         json!({"running": 3, "endedTotal": 7, "agents": [
-            {"name": "add-subtract", "state": "running", "doing": "Adding subtract(a, b) under add in calc.py", "age": 42, "unread": 0, "color": "blue", "waiting": false},
-            {"name": "test-calc", "state": "running", "doing": "Done: test_calc.py passed, exit 0", "age": 180, "unread": 1, "color": "magenta", "waiting": true},
-            {"name": "fix-ci-flake", "state": "running", "doing": "Re-running tests/test_watch.rs with --nocapture", "age": 660, "unread": 0, "color": "bright-blue", "waiting": false},
+            {"name": "add-subtract", "state": "running", "doing": "Adding subtract(a, b) under add in calc.py", "age": 42, "unread": 0, "color": "blue", "activity": "blocked", "since": 12, "waiting": false},
+            {"name": "test-calc", "state": "running", "doing": "Done: test_calc.py passed, exit 0", "age": 180, "unread": 1, "color": "magenta", "activity": "done", "since": 30, "waiting": true},
+            {"name": "fix-ci-flake", "state": "running", "doing": "Re-running tests/test_watch.rs with --nocapture", "age": 660, "unread": 0, "color": "bright-blue", "activity": "working", "since": null, "waiting": false},
             {"name": "docs-usage", "state": "exited", "exitCode": 0, "age": 1080},
             {"name": "bump-deps", "state": "exited", "exitCode": 101, "age": 1500},
             {"name": "spike-rmux", "state": "stopped", "exitCode": null, "age": 3600},
@@ -1896,12 +2051,12 @@ mod tests {
         assert_eq!(
             plain(&mock(), W40),
             [
-                pad("mux-agents", "3 running / 7 ended"),
+                pad("mux-agents", "1 need you / 1 done"),
                 String::new(),
-                pad("\u{25c9} add-subtract", "working  42s"),
+                pad("! add-subtract", "needs you  12s"),
                 "   Adding subtract(a, b) under add i...".to_string(),
                 String::new(),
-                pad("\u{25cc} test-calc  \u{2709} 1", "waiting   3m"),
+                pad("\u{2726} test-calc  \u{2709} 1", "done  30s"),
                 "   Done: test_calc.py passed, exit 0".to_string(),
                 String::new(),
                 pad("\u{25c9} fix-ci-flake", "working  11m"),
@@ -2026,8 +2181,8 @@ mod tests {
             [tiny(11), tiny(10), tiny(4), tiny(1)],
             [["mux-agents"], ["mux-ag..."], ["mux"], ["m"]]
         );
-        // Too narrow for both counts (a bar set to 30 columns), the header keeps the running count; narrower still,
-        // the title alone. The header ends one column short of the pane (its right margin).
+        // Too narrow for every count, the header drops the last one, then the next: `N need you` stays longest;
+        // narrower still, the title alone. The header ends one column short of the pane (its right margin).
         let header = |width| plain(&mock(), Size { width, height: 9 })[0].clone();
         let cut = |width: usize, counts: &str| {
             format!(
@@ -2035,17 +2190,33 @@ mod tests {
                 " ".repeat(width - 12 - counts.len())
             )
         };
-        assert_eq!(header(33), cut(33, "3 running / 7 ended"));
-        assert_eq!(header(32), cut(32, "3 running"));
-        assert_eq!(header(30), cut(30, "3 running"));
-        assert_eq!(header(23), cut(23, "3 running"));
+        // Each count fits from 14 columns beyond its width (margin, title, two spaces, right margin).
+        let full = "1 need you / 1 done / 1 working / 7 ended";
+        assert_eq!(header(full.len() + 14), cut(full.len() + 14, full));
+        let three = "1 need you / 1 done / 1 working";
+        assert_eq!(header(full.len() + 13), cut(full.len() + 13, three));
+        assert_eq!(header(three.len() + 14), cut(three.len() + 14, three));
+        assert_eq!(
+            header(three.len() + 13),
+            cut(three.len() + 13, "1 need you / 1 done")
+        );
+        assert_eq!(header(33), cut(33, "1 need you / 1 done"));
+        assert_eq!(header(32), cut(32, "1 need you"));
+        assert_eq!(header(24), cut(24, "1 need you"));
+        assert_eq!(header(24), cut(24, "1 need you"));
+        assert_eq!(header(23), " mux-agents");
+        // With nobody blocked or done: the working count, then the title alone; nothing live: `0 running`.
+        let mut calm = mock();
+        calm["agents"][0]["activity"] = json!("working");
+        calm["agents"][1]["activity"] = json!("working");
+        let header = |width| plain(&calm, Size { width, height: 9 })[0].clone();
+        assert_eq!(header(33), cut(33, "3 working / 7 ended"));
+        assert_eq!(header(32), cut(32, "3 working"));
+        assert_eq!(header(23), cut(23, "3 working"));
         assert_eq!(header(22), " mux-agents");
         // Short of room the model goes first, then the name is cut; wider, the model is kept.
         let rows = plain(&long, W40);
-        assert_eq!(
-            rows[2],
-            pad("\u{25c9} a-very-long-agent-n...", "working  42s")
-        );
+        assert_eq!(rows[2], pad("! a-very-long-agent...", " needs you  12s"));
         let rows = plain(
             &long,
             Size {
@@ -2174,7 +2345,7 @@ mod tests {
                 }
             ),
             [
-                pad("mux-agents", "6 running / 3 ended"),
+                pad("mux-agents", "6 working / 3 ended"),
                 live(1),
                 "   doing 1".to_string(),
                 live(2),
@@ -2192,7 +2363,7 @@ mod tests {
             {"name": "w", "state": "running", "doing": "x", "age": 5, "unread": 0},
             {"name": "e", "state": "stopped", "age": 60}
         ]});
-        let header = pad("mux-agents", "1 running / 1 ended");
+        let header = pad("mux-agents", "1 working / 1 ended");
         let at = |height| plain(&board, Size { width: 40, height });
         assert_eq!(at(7).len(), 7);
         assert_eq!(
@@ -2209,7 +2380,7 @@ mod tests {
         for height in 1..=20 {
             let rows = plain(&mock(), Size { width: 40, height });
             assert!(rows.len() <= height, "{height}");
-            assert_eq!(rows[0], pad("mux-agents", "3 running / 7 ended"));
+            assert_eq!(rows[0], pad("mux-agents", "1 need you / 1 done"));
         }
     }
 
@@ -2232,16 +2403,26 @@ mod tests {
             assert!(rows[at].starts_with(&want), "{at}: {:?}", rows[at]);
         };
         starts(0, format!(" {}", sgr("1", "mux-agents")));
+        // The header leads with who needs the person, in yellow.
+        assert!(
+            rows[0].ends_with(&format!(
+                "{} / 1 done / 1 working / 7 ended",
+                sgr("33", "1 need you")
+            )),
+            "{:?}",
+            rows[0]
+        );
+        // Needs you: a bold yellow `!` and the word reversed, herdr's pill.
         starts(
             2,
             format!(
                 " {} {}{}",
-                sgr("32", "\u{25c9}"),
+                sgr("1;33", "!"),
                 sgr("34", "add-subtract"),
                 sgr("2", " [sonnet]")
             ),
         );
-        assert!(rows[2].ends_with(&format!("{}  42s", sgr("32", "working"))));
+        assert!(rows[2].ends_with(&format!("{}  12s", sgr("1;7;33", "needs you"))));
         assert_eq!(
             rows[3],
             format!(
@@ -2249,16 +2430,18 @@ mod tests {
                 sgr("2", "Adding subtract(a, b) under add in calc.py")
             )
         );
+        // Done: a bold cyan `✦`.
         starts(
             5,
             format!(
                 " {} {}  {}",
-                sgr("36", "\u{25cc}"),
+                sgr("1;36", "\u{2726}"),
                 sgr("35", "test-calc"),
                 sgr("1;34", "\u{2709} 2")
             ),
         );
-        assert!(rows[5].contains(&sgr("36", "waiting")));
+        assert!(rows[5].ends_with(&format!("{}  30s", sgr("1;36", "done"))));
+        assert!(rows[8].ends_with(&format!("{}  11m", sgr("32", "working"))));
         starts(
             8,
             format!(" {} {}", sgr("32", "\u{25c9}"), sgr("94", "fix-ci-flake")),
@@ -2314,7 +2497,7 @@ mod tests {
             .iter()
             .map(|&at| &rows[at][1..2])
             .collect();
-        assert_eq!(glyphs, ["*", "o", "*", "+", "x", "-"]);
+        assert_eq!(glyphs, ["!", "@", "*", "+", "x", "-"]);
         assert!(rows[5].contains("test-calc  m 2"), "{}", rows[5]);
         assert!(rows[3].ends_with("..."));
         assert!(rows.iter().all(|r| r.is_ascii()), "{rows:?}");
@@ -2361,7 +2544,7 @@ mod tests {
         assert_eq!(
             rows,
             [
-                pad("mux-agents", "2 running / 1 ended"),
+                pad("mux-agents", "2 working / 1 ended"),
                 String::new(),
                 pad("\u{25c9} worker [\u{2022}x]", "working   5s"),
                 "   \u{2022} step \u{2022} two".to_string(),
@@ -2735,15 +2918,15 @@ mod tests {
             rows[5],
             [
                 "\u{25b8}".to_string(),
-                sgr("7;36", "\u{25cc}"),
+                sgr("2;7", "\u{25cc}"),
                 sgr("7", " "),
-                sgr("7;35", "writer"),
+                sgr("2;7;35", "writer"),
                 sgr("2;7", " [sonnet]"),
                 sgr("7", "  "),
                 sgr("1;7;34", "\u{2709} 2"),
-                sgr("7", "    "),
-                sgr("7;36", "waiting"),
-                sgr("7", "   3m"),
+                sgr("7", "       "),
+                sgr("2;7", "idle"),
+                sgr("2;7", "   3m"),
             ]
             .concat()
         );
@@ -2755,8 +2938,7 @@ mod tests {
         let rows = drawn(PLAIN_LOOK, Some("writer"));
         assert_eq!(
             rows[5],
-            pad("\u{25cc} writer [sonnet]  \u{2709} 2", "waiting   3m")
-                .replacen(' ', "\u{25b8}", 1)
+            pad("\u{25cc} writer [sonnet]  \u{2709} 2", "idle   3m").replacen(' ', "\u{25b8}", 1)
         );
         // An unknown name marks nothing.
         let mut laid = lay(board.as_object(), &[], W40, color);
@@ -2883,6 +3065,77 @@ mod tests {
     }
 
     #[test]
+    fn viewing_marks_the_done_spell_left_behind() {
+        let board = |activity: &str, changed: Value| {
+            json!({"running": 1, "agents": [
+                {"name": "w", "state": "running", "pane": "%9", "activity": activity, "changedAt": changed},
+                {"name": "x", "state": "exited", "pane": "%8", "activity": "done", "changedAt": "old"}
+            ]})
+        };
+        let at = |t: &str| json!(format!("2026-11-08T{t}.0000000Z"));
+        let mut v = Viewing::default();
+        let shown = |p: &str| Some(p.to_string());
+        // Marks what is queued, answering `ok`; returns what was asked.
+        let mark = |v: &mut Viewing, ok: bool| {
+            let mut asked = Vec::new();
+            v.mark(|pane, changed| {
+                asked.push(format!("{pane} {changed}"));
+                ok
+            });
+            asked
+        };
+        // Working while looked at, then done while still looked at: held, nothing marked yet.
+        v.tick(shown("%9"), board("working", Value::Null).as_object());
+        v.tick(shown("%9"), board("done", at("12:00:00")).as_object());
+        v.tick(shown("%9"), board("done", at("12:00:00")).as_object());
+        assert!(mark(&mut v, true).is_empty());
+        // Leaving marks that spell seen, once; a failed mark is asked again on the next tick.
+        v.tick(shown("%1"), board("done", at("12:00:00")).as_object());
+        assert_eq!(mark(&mut v, false), ["%9 2026-11-08T12:00:00.0000000Z"]);
+        assert_eq!(mark(&mut v, true), ["%9 2026-11-08T12:00:00.0000000Z"]);
+        assert!(mark(&mut v, true).is_empty());
+        // A spell that ended while the person was elsewhere is not marked by leaving another pane.
+        v.tick(None, board("done", at("12:01:00")).as_object());
+        assert!(mark(&mut v, true).is_empty());
+        // Looked at only while it worked: leaving marks nothing.
+        v.tick(shown("%9"), board("working", Value::Null).as_object());
+        v.tick(shown("%1"), board("done", at("12:02:00")).as_object());
+        assert!(mark(&mut v, true).is_empty());
+        // A detached client (no pane shown) is leaving, even with no board; an ended row is never remembered.
+        v.tick(shown("%9"), board("done", at("12:02:00")).as_object());
+        v.tick(None, None);
+        assert_eq!(mark(&mut v, true), ["%9 2026-11-08T12:02:00.0000000Z"]);
+        v.tick(shown("%8"), board("done", at("12:03:00")).as_object());
+        v.tick(shown("%1"), None);
+        assert!(mark(&mut v, true).is_empty());
+    }
+
+    #[test]
+    fn shown_pane_needs_an_attached_client() {
+        let w = World::human("");
+        let caller = w.caller();
+        for (out, want) in [
+            ("%9|1\n", Some(Some("%9"))),
+            ("%9|2\n", Some(Some("%9"))),
+            ("%9|0\n", Some(None)),
+            ("|0\n", Some(None)),
+            ("|1\n", None),
+            ("%9\n", None),
+            ("%9|x\n", None),
+            ("", None),
+        ] {
+            w.fakes.mux_first(SHOWN_FORMAT, 0, out, "");
+            let got = shown_pane(&w.ctx, &caller);
+            assert_eq!(got.as_ref().map(|p| p.as_deref()), want, "{out:?}");
+        }
+        // A failed call is not known either: the bar keeps what it had.
+        w.fakes.mux_first(SHOWN_FORMAT, 1, "%9|1\n", "");
+        assert_eq!(shown_pane(&w.ctx, &caller), None);
+        let call = w.fakes.mux_calls().pop().unwrap();
+        assert_eq!(call[call.len() - 3..], ["-t", "$3", SHOWN_FORMAT]);
+    }
+
+    #[test]
     fn format_age_units() {
         let ages: Vec<String> = [
             json!(0),
@@ -2984,7 +3237,7 @@ mod tests {
     // The watch world's board at 40x24, plain.
     fn board_rows() -> Vec<String> {
         vec![
-            pad("mux-agents", "1 running / 1 ended"),
+            pad("mux-agents", "1 working / 1 ended"),
             String::new(),
             pad("\u{25c9} worker", "working   4m"),
             "   testing the parser".into(),
@@ -3035,7 +3288,7 @@ mod tests {
         let (ended, frames) = watch_run(&w);
         assert_eq!(ended, "pane-closed");
         let short = [
-            pad("mux-agents", "1 running / 1 ended"),
+            pad("mux-agents", "1 working / 1 ended"),
             pad("\u{25c9} worker", "working   4m"),
             "   testing the parser".to_string(),
             "   +1 more  (list -All)".to_string(),

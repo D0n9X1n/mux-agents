@@ -22,11 +22,12 @@ pub fn screen_hit(answer: &str, width: usize, y: u16) -> Option<&str> {
     row_hit(rows.lines().nth(usize::from(y) - 1)?)
 }
 
-/// The name on a bar name line: margin (' ', '▸', '>'), '◉' or '◌', ' ', then the name to the next space.
+/// The name on a bar name line: margin (' ', '▸', '>'), a live glyph ('!', '✦', '◉', '◌'), ' ', then the name to
+/// the next space.
 pub fn row_hit(line: &str) -> Option<&str> {
     let mut chars = line.chars();
     let margin = matches!(chars.next()?, ' ' | '\u{25b8}' | '>');
-    let glyph = matches!(chars.next()?, '\u{25c9}' | '\u{25cc}');
+    let glyph = matches!(chars.next()?, '!' | '\u{2726}' | '\u{25c9}' | '\u{25cc}');
     if !margin || !glyph || chars.next()? != ' ' {
         return None;
     }
@@ -226,6 +227,12 @@ mod tests {
             ),
             (">\u{25c9} worker", "worker"),
             (" \u{25c9} work...", "work..."),
+            (" ! fix-ci       needs you  12s", "fix-ci"),
+            (
+                "\u{25b8}\u{2726} test-calc  \u{2709} 1  done  30s",
+                "test-calc",
+            ),
+            (" \u{25cc} idler        idle   3m", "idler"),
         ] {
             assert_eq!(row_hit(line), Some(name), "{line:?}");
         }
@@ -244,6 +251,9 @@ mod tests {
             " working",
             " * worker      working   4m",
             " o worker      waiting   3m",
+            // ASCII-only glyphs never hit (clicks are off in ASCII), nor a header that leads with a count.
+            " @ worker      done  30s",
+            " mux-agents  1 need you / 3 running",
             "\u{25c9} worker",
             " \u{25c9} ",
             " \u{25c9}  worker",

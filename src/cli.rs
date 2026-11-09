@@ -140,6 +140,16 @@ pub static VERBS: &[VerbDef] = &[
         text: json::lines,
     },
     VerbDef {
+        name: "report",
+        values: &["Kind"],
+        switches: &[],
+        min: 1,
+        max: 1,
+        usage: "usage: mux-agent report <working|blocked|idle> [-Kind <permission|question>] [-Text]",
+        handler: crate::agents::view::report,
+        text: json::lines,
+    },
+    VerbDef {
         name: "sidebar",
         values: &[],
         switches: &["Close"],
@@ -470,7 +480,7 @@ mod tests {
     // A valid argv for each verb, positionals at the verb's minimum.
     fn valid(verb: &str) -> Vec<&'static str> {
         match verb {
-            "focus" | "send" | "stop" => vec!["a"],
+            "focus" | "send" | "stop" | "report" => vec!["a"],
             _ => vec![],
         }
     }
@@ -489,6 +499,7 @@ mod tests {
                 "read",
                 "stop",
                 "status",
+                "report",
                 "sidebar",
                 "watch",
                 "version"
@@ -516,6 +527,7 @@ mod tests {
             ("read", 0, 1),
             ("stop", 1, 1),
             ("status", 0, 0),
+            ("report", 1, 1),
             ("sidebar", 0, 0),
             ("watch", 0, 0),
             ("version", 0, 0),
@@ -562,6 +574,7 @@ mod tests {
             "read" => vec!["read"],
             "stop" => vec!["stop", "worker"],
             "status" => vec!["status", "-BodyFile", "s.md"],
+            "report" => vec!["report", "idle"],
             "sidebar" => vec!["sidebar"],
             "watch" => vec!["watch"],
             "version" => vec!["version"],
@@ -899,6 +912,12 @@ mod tests {
             &["status", "-BodyFile", "s.md"],
             0,
         );
+        record(
+            &w,
+            "report working, from a Claude agent",
+            &["report", "working"],
+            0,
+        );
         record(&sidebar_world(), "sidebar", &["sidebar"], 0);
         let w = sidebar_world();
         w.fakes.mux_script("-l 40", |_| {
@@ -1124,7 +1143,7 @@ mod tests {
         assert_eq!(
             out,
             format!(
-                "running: 1\nworker  claude  %9  @5  brief  %1  {}  /work  1970-01-01T00:00:00.0000000Z  running  build it  task  0  0  sonnet",
+                "running: 1\nworker  claude  %9  @5  brief  %1  {}  /work  1970-01-01T00:00:00.0000000Z  running  build it  task  0  0  sonnet    working  ",
                 crate::agents::fixture::SESSION_ID
             )
         );

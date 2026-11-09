@@ -170,6 +170,11 @@
 # 0.2.3 (#48): the caller's pane is a running agent's own pane
 -N list-panes -s -t $3 -F <marker>#{pane_id}<marker>#{window_id}<marker>#{pane_pid}<marker>#{pane_dead}<marker>#{pane_start_command}<marker>#{@agent-id}<marker>#{@agent-name}<marker>
 
+[report working, from a Claude agent]
+-N display-message -p -t %1 #{pid}|#{pane_pid}|#{session_id}|#{window_id}|#{@agent-id}
+# 0.3.0 (#82): as status, the caller's pane is a running agent's own pane
+-N list-panes -s -t $3 -F <marker>#{pane_id}<marker>#{window_id}<marker>#{pane_pid}<marker>#{pane_dead}<marker>#{pane_start_command}<marker>#{@agent-id}<marker>#{@agent-name}<marker>
+
 [sidebar]
 -N display-message -p -t %1 #{pid}|#{pane_pid}|#{session_id}|#{window_id}|#{@agent-id}
 # 0.2.3 (#48): the caller's pane carries no agent tag and is no agent record's pane
@@ -237,3 +242,5 @@
 -N display-message -p -t %1 #{pane_id}|#{window_id}|#{pane_dead}|#{pane_pid}
 -N list-panes -t %1 -F #{pane_id}|#{pane_active}|#{pane_at_right}|#{pane_at_top}|#{pane_at_bottom}|#{pane_width}|#{window_width}|#{pane_left}|#{pane_top}|#{window_zoomed_flag}|#{s/[|\n\r]/x/:@mux-agents-sidebar-min}|#{s/[|\n\r]/x/:@mux-agents-sidebar-percent}
 -N list-panes -s -t $3 -F <marker>#{pane_id}<marker>#{window_id}<marker>#{pane_pid}<marker>#{pane_dead}<marker>#{pane_start_command}<marker>#{@agent-id}<marker>#{@agent-name}<marker>
+# 0.3.0 (#82): which pane the session shows to an attached client, so a done agent the person looked at is marked seen
+-N display-message -p -t $3 #{pane_id}|#{session_attached}

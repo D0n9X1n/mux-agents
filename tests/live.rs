@@ -1562,11 +1562,12 @@ exec claude --dangerously-skip-permissions
     fn bar_ready(screen: &str) -> bool {
         let lines: Vec<&str> = screen.lines().map(str::trim).collect();
         let count = |f: &dyn Fn(&str) -> bool| lines.iter().filter(|l| f(l)).count();
-        // Both counts, or the running count alone in a bar too narrow for both (a bar set to 30 columns).
+        // Both counts (no report yet: working), or the working count alone in a bar too narrow for both (a bar set
+        // to 30 columns).
         let header = |l: &str| {
             let words: Vec<&str> = l.split_whitespace().collect();
-            words == ["mux-agents", "2", "running", "/", "0", "ended"]
-                || words == ["mux-agents", "2", "running"]
+            words == ["mux-agents", "2", "working", "/", "0", "ended"]
+                || words == ["mux-agents", "2", "working"]
         };
         count(&header) == 1 && count(&|l| l == "checking the side bar") == 2 && count(&bar_row) == 2
     }
@@ -1618,7 +1619,7 @@ exec claude --dangerously-skip-permissions
         screen = live.call(&["capture-pane", "-p", "-t", &bar]);
         let first = screen.lines().next().unwrap_or_default();
         assert!(
-            first.trim_start().starts_with("mux-agents") && first.contains("running"),
+            first.trim_start().starts_with("mux-agents") && first.contains("working"),
             "{mux:?}: the first row is {first:?}:\n{screen}"
         );
         // Not wrapped: the doing line is one row, and every drawn row starts with the bar's margin (a wrapped rest
@@ -1637,8 +1638,9 @@ exec claude --dangerously-skip-permissions
         bar_clean(&live, &bar, &screen);
     }
 
-    // S2: the bar draws in color at its pane's size with nothing stray; an agent in `read -Wait` shows `waiting`
-    // until mail wakes it, then `working` again, and its waiting file is gone.
+    // S2, #82: the bar draws in color at its pane's size with nothing stray; an agent in `read -Wait` with no report
+    // shows `idle` until mail wakes it, then `working` again, and its waiting file is gone. An agent whose client
+    // reports `blocked` shows `! needs you` first, the header counting it; its next report moves it back.
     fn bar_shows_waiting_then_working(mux: Mux) {
         let Some(mut live) = Live::human(mux) else {
             return;
@@ -1653,10 +1655,31 @@ exec claude --dangerously-skip-permissions
         let mut screen = String::new();
         let waiting = eventually(Duration::from_secs(30), || {
             screen = live.call(&["capture-pane", "-p", "-t", &bar]);
-            bar_word(&screen, "w1").as_deref() == Some("waiting")
+            bar_word(&screen, "w1").as_deref() == Some("idle")
                 && bar_word(&screen, "w2").as_deref() == Some("working")
         });
         assert!(waiting, "{mux:?}: the bar shows:\n{screen}");
+        // w2's client asks the person: needs you, ranked first, counted in the header.
+        let pid2 = live.worker_pid(&w2);
+        support::write_atomic(
+            &live.dir.join(format!("cmd.{pid2}")),
+            "report\tblocked\t-Kind\tquestion\n",
+        );
+        let blocked = eventually(Duration::from_secs(30), || {
+            screen = live.call(&["capture-pane", "-p", "-t", &bar]);
+            let rows = [row_at(&screen, "w2"), row_at(&screen, "w1")];
+            bar_word(&screen, "w2").as_deref() == Some("needs")
+                && screen.contains("1 need you")
+                && matches!(rows, [Some(a), Some(b)] if a < b)
+        });
+        assert!(blocked, "{mux:?}: the bar shows:\n{screen}");
+        assert!(screen.contains("! w2"), "{mux:?}:\n{screen}");
+        support::write_atomic(&live.dir.join(format!("cmd.{pid2}")), "report\tworking\n");
+        let unblocked = eventually(Duration::from_secs(30), || {
+            screen = live.call(&["capture-pane", "-p", "-t", &bar]);
+            bar_word(&screen, "w2").as_deref() == Some("working") && !screen.contains("need you")
+        });
+        assert!(unblocked, "{mux:?}: the bar shows:\n{screen}");
         bar_clean(&live, &bar, &screen);
         let folder = live.agent_dir(s(&w1["id"]));
         let files = || -> Vec<String> {
@@ -2460,6 +2483,15 @@ exec claude --dangerously-skip-permissions
         {
             // An ended row ends with its exitCode: null for a stop.
             let mut want_keys = ROW.to_vec();
+            // A live row then carries its activity (#82): no report yet, so working since nothing.
+            if state == "running" {
+                want_keys.extend(["activity", "since", "changedAt"]);
+                assert_eq!(
+                    (&row["activity"], &row["since"], &row["changedAt"]),
+                    (&json!("working"), &Value::Null, &Value::Null),
+                    "{mux:?} {row}"
+                );
+            }
             if state != "running" {
                 want_keys.push("exitCode");
                 assert_eq!(row["exitCode"], Value::Null, "{mux:?} {row}");

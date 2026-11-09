@@ -618,7 +618,8 @@ test('a board stored in the old shape draws without crashing', async ($, on) => 
   const old = await $.ui.mount({ ...PANE, surface: 'terminal' })
   expect((await old.findAll({ type: 'Text' })).map((t: { text: string }) => t.text)).toEqual(['mux-agents \u00b7 0 running'])
   await old.unmount()
-  stored = { shape: 'board-3', value: { running: 1, agents: [row('w', 'running', null, 1), row('e', 'exited', null, 1), row('s', 'stopped', null, 1)], failed: false } }
+  // The last shape, its rows lacking newer fields (activity, since, exit codes): drawn as working and dim ends.
+  stored = { shape: 'board-4', value: { running: 1, agents: [row('w', 'running', null, 1), row('e', 'exited', null, 1), row('s', 'stopped', null, 1)], failed: false } }
   const lacking = await $.ui.mount({ ...PANE, surface: 'terminal' })
   expect((await lacking.findAll({ type: 'Text' })).map((t: { text: string }) => t.text).filter((t: string) => / claude  /.test(t)))
     .toEqual(['\u25c9 w  claude  working  1s', '- e  claude  exited  1s', '- s  claude  stopped  1s'])
@@ -713,5 +714,36 @@ test('list runs with a 10000 ms timeout, and a timeout fails like any rejection'
   expect(seen.init).toEqual([{ timeoutMs: 10000 }, { timeoutMs: 10000 }])
   const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
   expect(await header(ui)).toBe('mux-agents · 1 running · refresh failed')
+  await ui.unmount()
+})
+
+test('a live row draws its activity as the side bar does: needs you reversed, idle muted, time since the change', async ($, on) => {
+  const rows = [
+    { ...row('asker', 'running', 'which db?', 400), activity: 'blocked', since: 12 },
+    { ...row('finisher', 'running', null, 500), activity: 'done', since: 30 },
+    { ...row('builder', 'running', null, 600), activity: 'working', since: null },
+    { ...row('rester', 'running', null, 700), activity: 'idle', since: 90 },
+  ]
+  const { clock } = world(on, { TMUX: 'x' }, [ran(0, list(4, rows))])
+  await $.session.start(START)
+  await $.command.run({ command: 'mux-agents-pane' })
+  await clock.settle()
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  const texts = (await ui.findAll({ type: 'Text' })).map((t: { text: string }) => t.text)
+  expect(texts.filter((t: string) => / claude  /.test(t))).toEqual([
+    '! asker  claude  needs you  12s',
+    '✦ finisher  claude  done  30s',
+    '◉ builder  claude  working  10m',
+    '◌ rester  claude  idle  1m',
+  ])
+  expect(await header(ui)).toBe('mux-agents · 1 need you · 4 running')
+  // The styled span inside a row: the child Text whose own text is `text`.
+  const line = async (text: RegExp) => (await ui.find({ type: 'Text', text })) as any
+  const span = (node: any, text: string) => node?.children?.find((c: any) => typeof c === 'object' && c.children?.join('') === text)?.props
+  expect(span(await line(/asker/), 'needs you')).toEqual({ color: 'yellow', bold: true, inverse: true })
+  expect(span(await line(/finisher/), 'done')).toEqual({ color: 'cyan', bold: true })
+  expect(span(await line(/builder/), 'working')).toEqual({ color: 'green' })
+  expect([(await line(/rester/))?.props?.dimColor, (await line(/builder/))?.props?.dimColor]).toEqual([true, undefined])
+  expect(span(await line(/need you/), '1 need you · ')).toEqual({ color: 'yellow' })
   await ui.unmount()
 })

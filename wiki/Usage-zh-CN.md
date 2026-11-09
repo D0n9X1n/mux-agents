@@ -61,12 +61,12 @@ flowchart LR
 在 Claude Code 中，第一次成功 `spawn` 后（或用 `/mux-agents-pane`）会在聊天旁打开 `Agents` 窗格，每 3 秒刷新一次。在任何客户端中，第一次成功 `spawn` 还会在你的窗口右边缘打开一个占满整个高度、宽为窗口 20%（至少 40 列）的分屏，每 2 秒重绘一次；之后的启动复用它，`sidebar -Close` 在本会话剩余时间内关闭它，`sidebar` 重新打开它：
 
 ```text
- mux-agents         3 running / 7 ended
+ mux-agents        1 need you / 1 done
 
- ◉ add-subtract [sonnet]   working  42s
+ ! add-subtract [sonnet] needs you  12s
    Adding subtract(a, b) under add i...
 
- ◌ test-calc  ✉ 1          waiting   3m
+ ✦ test-calc  ✉ 1             done  30s
    Done: test_calc.py passed, exit 0
 
  ◉ fix-ci-flake            working  11m
@@ -81,17 +81,17 @@ flowchart LR
 
 “正在做的事”是代理最近用 `status` 报告的内容，否则是它最后一条消息的第一行，否则是它的任务。
 
-每个运行中的代理显示它的状态、用自己颜色显示的名字、选定模型时的 `[model]`，以及其父窗格还有 N 条来自它的未读消息时的 `✉ N`。`◉ working`（绿色）表示正在执行任务；`◌ waiting`（青色）表示代理正在 `read -Wait` 中等待父窗格，直到它发送消息或报告 `status`。之后是已结束的代理，最新的 3 个非 `lost` 结束的代理（`lost` 的代理计入数量但不绘制）：`✓ done`（以 0 退出）、`✗ exit N`（红色）、`- stopped`（黄色）；`+K more` 统计其余的。`list -All` 列出最新的 10 个已结束代理，所以只有当所有已结束代理都在其中时，侧边栏才写 `+K more  (list -All)`，否则写 `+K more ended`。启动代理时会选取本会话运行中代理用得最少的名字颜色（蓝、品红、亮蓝、亮品红；绝不与状态颜色相同），`list -Text` 也用同样的颜色显示名字。
+每个运行中的代理显示它的状态、用自己颜色显示的名字、选定模型时的 `[model]`，以及其父窗格还有 N 条来自它的未读消息时的 `✉ N`。状态沿用 herdr 的说法，由代理自己的客户端报告（绝不从它的屏幕猜测），并按谁需要你排序：`! needs you`（粗体黄色）表示它在向你提问；`✦ done`（粗体青色）表示它在你没看着时结束了这一轮，直到你看过它的窗格并离开前都保持 done；`◉ working`（绿色）表示正在执行一轮；`◌ idle`（整行变暗）表示无事可做。同一状态中，最近变化的排在前面，显示的时间是从那次变化算起。客户端不报告状态的代理（目前是 Copilot CLI）显示为 `◉ working`，在 `read -Wait` 中等待时显示为 `◌ idle`。标题像 herdr 统计各分组那样统计运行中的代理：`N need you`（黄色）、`N done`、`N working`、`N idle`，为 0 的不显示（没有运行中的代理时显示 `0 running`），然后是 `M ended`；侧边栏较窄时从末尾去掉。之后是已结束的代理，最新的 3 个非 `lost` 结束的代理（`lost` 的代理计入数量但不绘制）：`✓ done`（以 0 退出）、`✗ exit N`（红色）、`- stopped`（黄色）；`+K more` 统计其余的。`list -All` 列出最新的 10 个已结束代理，所以只有当所有已结束代理都在其中时，侧边栏才写 `+K more  (list -All)`，否则写 `+K more ended`。启动代理时会选取本会话运行中代理用得最少的名字颜色（蓝、品红、亮蓝、亮品红；绝不与状态颜色相同），`list -Text` 也用同样的颜色显示名字。
 
-侧边栏每次重绘都按窗格的实际大小排版，绝不换行：过长的文字用 `...` 截断；窗格太矮时先去掉空行，再去掉已结束的行，然后去掉最早代理的“正在做的事”行和整行；标题始终保留。颜色依次遵循 `NO_COLOR`（关）、`FORCE_COLOR` 或 `CLICOLOR_FORCE`（开）、然后 `TERM=dumb`（关）；`MUX_AGENTS_ASCII=1` 用 `* o + x m -` 代替符号。每次重绘都在原处改写各行（不整屏清除），所以侧边栏不会闪烁；在 `TERM=dumb` 下则输出普通的帧。
+侧边栏每次重绘都按窗格的实际大小排版，绝不换行：过长的文字用 `...` 截断；窗格太矮时先去掉空行，再去掉已结束的行，然后去掉最早代理的“正在做的事”行和整行；标题始终保留。颜色依次遵循 `NO_COLOR`（关）、`FORCE_COLOR` 或 `CLICOLOR_FORCE`（开）、然后 `TERM=dumb`（关）；`MUX_AGENTS_ASCII=1` 用 `! @ * o + x m -` 代替符号。每次重绘都在原处改写各行（不整屏清除），所以侧边栏不会闪烁；在 `TERM=dumb` 下则输出普通的帧。
 
-在标签页模式下，侧边栏留在你启动代理的窗口里，而不在每个代理的窗口里。`sidebar -Close` 只关闭这个多路复用器侧边栏；Claude Code 的 `Agents` 窗格与它无关。该窗格绘制各行的方式与侧边栏相同，包括 `MUX_AGENTS_ASCII=1`：`◉ working`、`✓ done`、`✗ exit N`、`- stopped` 和 `✉ N`，但没有 `◌ waiting`，那只有侧边栏读取。
+在标签页模式下，侧边栏留在你启动代理的窗口里，而不在每个代理的窗口里。`sidebar -Close` 只关闭这个多路复用器侧边栏；Claude Code 的 `Agents` 窗格与它无关。该窗格绘制各行的方式与侧边栏相同，包括 `MUX_AGENTS_ASCII=1`：`! needs you`、`✦ done`、`◉ working`、`◌ idle`、`✓ done`、`✗ exit N`、`- stopped` 和 `✉ N`；不报告状态、在 `read -Wait` 中等待的代理在那里显示为 `◉ working`，因为只有侧边栏读取这一点。
 
 侧边栏始终停在右边缘、占满整个高度：拆分、布局变化、`swap-pane` 或 `rotate-window` 移动了它时，下一次重绘会把它移回去，且不改变你的焦点。它的宽度随窗口宽度变化；你拖出来的宽度会保留到窗口大小或宽度选项改变为止。两个多路复用器选项决定宽度：`@mux-agents-sidebar-percent`（1-100，默认 20）和 `@mux-agents-sidebar-min`（列数，1-9999，默认 40）；侧边栏取两者中较大的值。可在 `~/.tmux.conf` 中用 `set -g` 设置，也可按会话、窗口或窗格设置（例如 `tmux set -g @mux-agents-sidebar-percent 10`）；改动在下一次重绘时生效，不是范围内整数的值使用其默认值。有窗格处于放大（zoom）状态时，侧边栏不做任何调整，所以绝不会取消你的放大。如果连续 3 次移回失败，它会停止尝试并显示 `layout: repair paused`，直到布局改变或过了一分钟。
 
 侧边栏是 `sidebar` 在其中启动的那个进程，而不是它的 `@agent-role sidebar` 标签，所以标签被移动后（rmux 的 `rotate-window` 会把标签留在原处）也绝不会把你的窗格当作侧边栏。带有该标签但不是那个进程的窗格绝不会被关闭：`sidebar`、`sidebar -Close` 和 spawn 都会拒绝并指出它。如果它是旧的侧边栏（例如由 0.2.1 打开、`sidebar -Close` 无法证明的那种），用 `kill-pane -t <pane>` 关闭它；如果它是你自己的窗格，用 `set-option -p -u -t <pane> @agent-role` 清除标签。你手动运行的 `mux-agent watch` 会绘制面板，也像侧边栏一样接收点击和按键，但只有侧边栏会维持布局。
 
-在侧边栏中点击代理的名字行，即可切换到它的窗口和窗格。只有开启 `mouse on`（`set -g mouse on`）时点击才会到达侧边栏；开启后用 Shift 拖动来选择文字。`MUX_AGENTS_ASCII=1` 时点击无效。调整侧边栏大小期间的点击不起作用，侧边栏会重绘。侧边栏窗格处于活动状态时，`j`/`k` 或方向键选择一个运行中的代理，Enter 切换到它，Esc 取消选择；切换失败时显示 `focus failed: <name>`。按键或按下左键会让侧边栏立即重绘，在侧边栏中键入 Ctrl-C 会结束它（`interrupted`）；每次退出时它都会恢复终端。`TERM=dumb` 时，侧边栏只绘制：它不接收点击或按键。在 Windows 上，侧边栏在 rmux 0.10 或更高版本中通过控制台接收点击和按键，与 macOS 和 Linux 相同。代理状态或模型中的 `◉` 和 `◌` 显示为 `•`。
+在侧边栏中点击代理的名字行，即可切换到它的窗口和窗格。只有开启 `mouse on`（`set -g mouse on`）时点击才会到达侧边栏；开启后用 Shift 拖动来选择文字。`MUX_AGENTS_ASCII=1` 时点击无效。调整侧边栏大小期间的点击不起作用，侧边栏会重绘。侧边栏窗格处于活动状态时，`j`/`k` 或方向键选择一个运行中的代理，Enter 切换到它，Esc 取消选择；切换失败时显示 `focus failed: <name>`。按键或按下左键会让侧边栏立即重绘，在侧边栏中键入 Ctrl-C 会结束它（`interrupted`）；每次退出时它都会恢复终端。`TERM=dumb` 时，侧边栏只绘制：它不接收点击或按键。在 Windows 上，侧边栏在 rmux 0.10 或更高版本中通过控制台接收点击和按键，与 macOS 和 Linux 相同。代理状态或模型中的 `◉`、`◌` 和 `✦` 显示为 `•`。
 
 ## 安全检查
 

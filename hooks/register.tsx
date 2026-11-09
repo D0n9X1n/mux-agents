@@ -1,11 +1,12 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register, Timer } from 'claude-code'
 
-import { EMPTY, formatAge, isSpawn, look, mail, parseList } from './board'
+import { activity } from './activity'
+import { EMPTY, formatAge, isSpawn, look, mail, needYou, parseList } from './board'
 
 const PANE = 'mux-agents'
 // Change the shape tag when the board's fields change: it declines what an earlier version stored.
-const board = atom({ plugin: 'mux-agents', key: 'board' } as const, EMPTY, { shape: 'board-3' })
+const board = atom({ plugin: 'mux-agents', key: 'board' } as const, EMPTY, { shape: 'board-4' })
 // Per module load (a hot reload drops the timer and resets both): the one refresh timer while the pane is open, and at
 // most one list run at a time.
 let ticking: Timer | undefined
@@ -141,6 +142,8 @@ async function stopRefreshIfGone($: EngineInterface) {
 }
 
 export const register: Register = on => {
+  // Every session in tmux or rmux reports its own activity; only an agent's pane is answered.
+  activity(on)
   // The skill skills/mux-agents owns /mux-agents, so the pane command has a name of its own, registered only in an
   // eligible session. A refused registration (another owner of the name) leaves the session and the open-on-spawn
   // path working.
@@ -190,19 +193,24 @@ export const register: Register = on => {
     const { Box, Text } = $.ui.resolve(e)
     const b = await read($, board)
     const ascii = await asciiGlyphs($)
+    // Who needs the person leads the header, as on the side bar; tolerant of a stored board without activity.
+    const need = needYou(Array.isArray(b.agents) ? b.agents : [])
     return (
       <Box flexDirection="column">
-        <Text>mux-agents · {b.running} running{b.failed ? ' · refresh failed' : ''}</Text>
+        <Text>mux-agents · {need > 0 ? <Text color="yellow">{need} need you · </Text> : null}{b.running} running{b.failed ? ' · refresh failed' : ''}</Text>
         {b.agents.map(a => {
           const row = look(a, ascii)
           if (!row) return null
           // A live agent's chosen model follows its client, then its unread badge.
           const tag = !row.ended && a.model ? ` [${a.model}]` : ''
           const badge = row.ended ? undefined : mail(a.unread, ascii)
+          // A live row's time is since its activity last changed, as on the side bar.
+          const age = !row.ended && typeof a.since === 'number' ? a.since : a.age
+          const loud = row.pill || row.word === 'done' || undefined
           return (
             <Box flexDirection="column">
-              <Text dimColor={row.ended || undefined}>
-                <Text color={row.color}>{row.glyph}</Text> {a.name}  {a.client}{tag}  {badge ? <Text bold color="blue">{badge}</Text> : null}{badge ? '  ' : ''}<Text color={row.color}>{row.word}</Text>  {formatAge(a.age)}
+              <Text dimColor={row.ended || row.muted || undefined}>
+                <Text color={row.color} bold={loud}>{row.glyph}</Text> {a.name}  {a.client}{tag}  {badge ? <Text bold color="blue">{badge}</Text> : null}{badge ? '  ' : ''}<Text color={row.color} bold={loud} inverse={row.pill || undefined}>{row.word}</Text>  {formatAge(age)}
               </Text>
               {a.doing ? <Text dimColor>  {a.doing}</Text> : null}
             </Box>

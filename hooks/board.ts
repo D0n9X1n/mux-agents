@@ -50,13 +50,28 @@ export function parseList(exitCode: number, stdout: string): Omit<MuxAgentsBoard
     doing: typeof a.doing === 'string' ? clean(a.doing) : null, age: typeof a.age === 'number' ? a.age : 0,
     model: typeof a.model === 'string' ? clean(a.model) : null, unread: typeof a.unread === 'number' ? a.unread : 0,
     exitCode: typeof a.exitCode === 'number' ? a.exitCode : null,
+    activity: typeof a.activity === 'string' ? clean(a.activity) : null,
+    since: typeof a.since === 'number' ? a.since : null,
   }))
   return { running: r.running, agents }
 }
 
 // How a row is drawn, as the side bar draws it (src/sidebar.rs Kind): its glyph, Unicode or ASCII (MUX_AGENTS_ASCII=1),
-// its state word and their color, undefined for dim. `ended` dims the row.
-export type Look = { glyph: string; word: string; color: 'green' | 'red' | 'yellow' | undefined; ended: boolean }
+// its state word and their color, undefined for dim. `ended` dims the row; `muted` dims an idle agent's row, as herdr
+// mutes it; `pill` reverses the word (needs you), herdr's pill.
+export type Look = {
+  glyph: string; word: string; color: 'green' | 'red' | 'yellow' | 'cyan' | undefined; ended: boolean; muted?: boolean; pill?: boolean
+}
+
+// A live agent by its activity (blocked, done, working, idle); a list without one (an older binary) is working.
+function live(activity: unknown, ascii: boolean): Look {
+  switch (activity) {
+    case 'blocked': return { glyph: '!', word: 'needs you', color: 'yellow', ended: false, pill: true }
+    case 'done': return { glyph: ascii ? '@' : '\u2726', word: 'done', color: 'cyan', ended: false }
+    case 'idle': return { glyph: ascii ? 'o' : '\u25cc', word: 'idle', color: undefined, ended: false, muted: true }
+    default: return { glyph: ascii ? '*' : '\u25c9', word: 'working', color: 'green', ended: false }
+  }
+}
 
 // A lost agent's pane is gone, so it is not drawn, as on the side bar. An exit with no code (a list from an older
 // binary) is a dim `- exited`: it is neither proof of done nor of a failure. Fields are read tolerantly, since a
@@ -64,7 +79,7 @@ export type Look = { glyph: string; word: string; color: 'green' | 'red' | 'yell
 export function look(a: MuxAgentsAgent, ascii: boolean): Look | undefined {
   const code = typeof a.exitCode === 'number' ? a.exitCode : undefined
   switch (a.state) {
-    case 'running': return { glyph: ascii ? '*' : '\u25c9', word: 'working', color: 'green', ended: false }
+    case 'running': return live(a.activity, ascii)
     case 'lost': return undefined
     case 'exited':
       if (code === 0) return { glyph: ascii ? '+' : '\u2713', word: 'done', color: undefined, ended: true }
@@ -73,6 +88,11 @@ export function look(a: MuxAgentsAgent, ascii: boolean): Look | undefined {
     case 'stopped': return { glyph: '-', word: 'stopped', color: 'yellow', ended: true }
     default: return { glyph: '-', word: a.state, color: undefined, ended: true }
   }
+}
+
+// How many live agents need the person (activity blocked), as the side bar's header counts them.
+export function needYou(agents: MuxAgentsAgent[]): number {
+  return agents.filter(a => a.state === 'running' && a.activity === 'blocked').length
 }
 
 // The side bar's unread badge, `✉ N` (ASCII `m N`), only for a count above 0.

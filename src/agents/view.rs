@@ -1,4 +1,4 @@
-//! list, focus and status (MuxAgents.ps1:1271-1285, 1335-1352).
+//! list, focus, status (MuxAgents.ps1:1271-1285, 1335-1352) and report.
 
 use serde_json::{Map, Value, json};
 
@@ -11,7 +11,7 @@ use crate::cli::Request;
 use crate::ctx::Ctx;
 use crate::error::{Res, refuse};
 use crate::mux::native;
-use crate::state::fs::{BODY_MAX, read_text, write_json};
+use crate::state::fs::{BODY_MAX, read_json, read_text, write_json};
 
 /// The board as the caller's pane sees it: unread from its own mailbox (a running agent's id, else `pane-<n>`).
 pub fn list(ctx: &Ctx, request: &Request) -> Res<Map<String, Value>> {
@@ -157,6 +157,67 @@ pub fn status(ctx: &Ctx, request: &Request) -> Res<Map<String, Value>> {
         record.get("name").cloned().unwrap_or(Value::Null),
     );
     reply.insert("text".into(), text.into());
+    Ok(reply)
+}
+
+/// What an agent's own client may report (herdr's OSC 7501 words; `done` is the reader's, never reported).
+const REPORTED: [&str; 3] = ["working", "blocked", "idle"];
+const KINDS: [&str; 2] = ["permission", "question"];
+
+/// `report <working|blocked|idle> [-Kind <permission|question>]`: the agent's own state, as its client's hooks see it,
+/// in activity.json under its agent lock. Enum words only, never free text. `since` moves only when the state or its
+/// kind changes; an unreadable file counts as none.
+pub fn report(ctx: &Ctx, request: &Request) -> Res<Map<String, Value>> {
+    let state = first(request);
+    let kind = request.value("Kind");
+    let words = REPORTED.contains(&state) && kind.is_none_or(|k| KINDS.contains(&k));
+    if !words || (kind.is_some() && state != "blocked") {
+        return Err(usage("report"));
+    }
+    let caller = resolve(ctx)?;
+    let me = match caller.kind {
+        Kind::Agent => match registry::Snapshot::take(ctx, &caller)?.own(&caller) {
+            registry::Own::Agent(me) => Some(me),
+            _ => None,
+        },
+        Kind::Human => None,
+    };
+    let Some(me) = me else {
+        return refuse(2, "target", "only an agent reports its activity");
+    };
+    let file = state_dir(ctx, &caller)?
+        .join("agents")
+        .join(&me.id)
+        .join("activity.json");
+    let now = crate::util::utc_o(ctx.clock.now());
+    let kind = kind.map_or(Value::Null, Value::from);
+    let since = lock(ctx, &lock_key("agent", &caller, &me.id), || {
+        let old = read_json(&file).ok().flatten();
+        let same = old.as_ref().is_some_and(|old| {
+            old.get("state").and_then(Value::as_str) == Some(state)
+                && old.get("kind") == Some(&kind)
+        });
+        // Kept only when it is still a time; anything else is repaired to now.
+        let since = old
+            .as_ref()
+            .and_then(|old| old.get("since"))
+            .filter(|since| same && since.as_str().and_then(crate::util::parse_utc).is_some())
+            .cloned()
+            .unwrap_or_else(|| now.clone().into());
+        write_json(
+            &file,
+            &json!({"state": state, "kind": kind, "since": since}),
+        )?;
+        Ok(since)
+    })?;
+    let mut reply = Map::new();
+    reply.insert(
+        "name".into(),
+        me.record.get("name").cloned().unwrap_or(Value::Null),
+    );
+    reply.insert("state".into(), state.into());
+    reply.insert("kind".into(), kind);
+    reply.insert("since".into(), since);
     Ok(reply)
 }
 
@@ -402,6 +463,93 @@ mod tests {
                 format!("+{agent} exists=false"),
                 format!("-{agent} exists=true")
             ]
+        );
+    }
+
+    #[test]
+    fn report_only_agent_enum_only() {
+        let target = "2 target only an agent reports its activity";
+        let usage = "2 usage usage: mux-agent report <working|blocked|idle> [-Kind <permission|question>] [-Text]";
+        // A human pane with a tag and a record.
+        let w = World::human(ID);
+        w.agent_record(ID, json!({"pane": "%1"}));
+        w.panes(&["%1|@1|100|aaaaaaaaaaaa|worker"]);
+        assert_eq!(run(&w, report, &["report", "idle"]), target);
+        // An agent pane with no record.
+        assert_eq!(run(&World::agent(""), report, &["report", "idle"]), target);
+
+        let w = World::agent(ID);
+        let folder = w.agent_record(ID, json!({"pane": "%1"}));
+        w.panes(&["%1|@1|100|aaaaaaaaaaaa|worker"]);
+        w.fakes.clear_log();
+        // Any other word, a kind on a state that is not blocked, or another kind refuses before the caller is resolved.
+        for args in [
+            &["report", "done"][..],
+            &["report", "Working"],
+            &["report", "idle", "-Kind", "question"],
+            &["report", "blocked", "-Kind", "auth"],
+        ] {
+            assert_eq!(run(&w, report, args), usage, "{args:?}");
+        }
+        assert!(w.fakes.mux_calls().is_empty());
+        assert!(!folder.join("activity.json").exists());
+
+        // Written while the agent lock is held.
+        w.clock("2026-11-08T12:00:00.0000000Z");
+        let file = folder.join("activity.json");
+        let seen = file.clone();
+        w.fakes
+            .lock_probe(move |_| format!("exists={}", seen.exists()));
+        w.fakes.clear_log();
+        assert_eq!(
+            run(&w, report, &["report", "working"]),
+            r#"ok {"name":"worker","state":"working","kind":null,"since":"2026-11-08T12:00:00.0000000Z"}"#
+        );
+        let agent = lock_key("agent", &w.caller(), ID);
+        assert_eq!(
+            w.fakes.locks(),
+            [
+                format!("+{agent} exists=false"),
+                format!("-{agent} exists=true")
+            ]
+        );
+        // The same state again keeps its since; a change moves it; a new kind is a change.
+        w.clock("2026-11-08T12:00:05.0000000Z");
+        run(&w, report, &["report", "working"]);
+        assert_eq!(
+            std::fs::read_to_string(&file).unwrap(),
+            r#"{"state":"working","kind":null,"since":"2026-11-08T12:00:00.0000000Z"}"#
+        );
+        run(&w, report, &["report", "blocked", "-Kind", "question"]);
+        assert_eq!(
+            std::fs::read_to_string(&file).unwrap(),
+            r#"{"state":"blocked","kind":"question","since":"2026-11-08T12:00:05.0000000Z"}"#
+        );
+        w.clock("2026-11-08T12:00:09.0000000Z");
+        run(&w, report, &["report", "blocked", "-Kind", "permission"]);
+        assert_eq!(
+            std::fs::read_to_string(&file).unwrap(),
+            r#"{"state":"blocked","kind":"permission","since":"2026-11-08T12:00:09.0000000Z"}"#
+        );
+        // A blocked report without a kind is a plain blocked.
+        run(&w, report, &["report", "blocked"]);
+        assert_eq!(
+            std::fs::read_to_string(&file).unwrap(),
+            r#"{"state":"blocked","kind":null,"since":"2026-11-08T12:00:09.0000000Z"}"#
+        );
+        // A kept since that is not a time is repaired.
+        std::fs::write(&file, br#"{"state":"blocked","kind":null,"since":null}"#).unwrap();
+        run(&w, report, &["report", "blocked"]);
+        assert_eq!(
+            std::fs::read_to_string(&file).unwrap(),
+            r#"{"state":"blocked","kind":null,"since":"2026-11-08T12:00:09.0000000Z"}"#
+        );
+        // An unreadable file is replaced as if there were none.
+        std::fs::write(&file, b"{").unwrap();
+        run(&w, report, &["report", "idle"]);
+        assert_eq!(
+            std::fs::read_to_string(&file).unwrap(),
+            r#"{"state":"idle","kind":null,"since":"2026-11-08T12:00:09.0000000Z"}"#
         );
     }
 

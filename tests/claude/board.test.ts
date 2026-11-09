@@ -101,7 +101,7 @@ test('parseList maps every failure to undefined and cleans every string', () => 
   expect(parseList(0, '{"ok":true,"verb":"list","agents":[]}')).toBe(undefined)
   expect(parseList(0, '{"ok":true,"verb":"list","running":0}')).toBe(undefined)
   const dirty = JSON.stringify({ ok: true, running: 1, agents: [{ name: 'a\u001b', client: 'c\u0007', state: 's\u009b', doing: 'd\te', age: 1 }] })
-  expect(parseList(0, dirty)).toEqual({ running: 1, agents: [{ name: 'a', client: 'c', state: 's', doing: 'd e', age: 1, model: null, unread: 0, exitCode: null }] })
+  expect(parseList(0, dirty)).toEqual({ running: 1, agents: [{ name: 'a', client: 'c', state: 's', doing: 'd e', age: 1, model: null, unread: 0, exitCode: null, activity: null, since: null }] })
 })
 
 test('parseList keeps a chosen model, cleaned, and null for an inherited one', () => {
@@ -135,6 +135,26 @@ test('look draws each state with the side bar\'s glyph, word and color, Unicode 
   expect(both('exited', 101)).toEqual(['\u2717 exit 101 red true', 'x exit 101 red true'])
   expect(both('exited', -1)).toEqual(['\u2717 exit -1 red true', 'x exit -1 red true'])
   expect(both('stopped', null)).toEqual(['- stopped yellow true', '- stopped yellow true'])
+})
+
+test('look draws a live agent by its activity as the side bar does: needs you, done, working, idle', () => {
+  const live = (activity: unknown) => ({ ...agent('running'), activity })
+  const both = (activity: unknown) => [look(live(activity), false), look(live(activity), true)].map(l => l && `${l.glyph} ${l.word} ${l.color ?? 'dim'} ${l.ended}${l.muted ? ' muted' : ''}${l.pill ? ' pill' : ''}`)
+  expect(both('blocked')).toEqual(['! needs you yellow false pill', '! needs you yellow false pill'])
+  expect(both('done')).toEqual(['\u2726 done cyan false', '@ done cyan false'])
+  expect(both('working')).toEqual(['\u25c9 working green false', '* working green false'])
+  expect(both('idle')).toEqual(['\u25cc idle dim false muted', 'o idle dim false muted'])
+  // A list without activity (an older binary), or an unknown word: working.
+  expect(both(undefined)).toEqual(['\u25c9 working green false', '* working green false'])
+  expect(both('dreaming')).toEqual(['\u25c9 working green false', '* working green false'])
+})
+
+test('parseList keeps a live row\'s activity and since, null when missing or not a word or a number', () => {
+  const one = (fields: object) => parseList(0, JSON.stringify({ ok: true, running: 1, agents: [{ name: 'w', state: 'running', ...fields }] }))!.agents[0]
+  expect([one({ activity: 'done', since: 30 }).activity, one({ activity: 'done', since: 30 }).since]).toEqual(['done', 30])
+  expect([one({}).activity, one({}).since]).toEqual([null, null])
+  expect([one({ activity: 5, since: '30' }).activity, one({ activity: 5, since: '30' }).since]).toEqual([null, null])
+  expect(one({ activity: 'do\u001bne' }).activity).toBe('done')
 })
 
 test('look draws an exit with no code (an older list) as a dim exited, another state dim, and no lost agent', () => {

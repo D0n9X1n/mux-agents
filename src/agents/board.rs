@@ -84,6 +84,15 @@ pub fn board(ctx: &Ctx, caller: &Caller, all: bool, watch: bool) -> Res<Map<Stri
             "running",
         )?);
     }
+    // Ranked as herdr does, then the most recent change first by its own time (no report last), then pane order
+    // (a stable sort).
+    agents.sort_by_key(|row| {
+        let changed = row
+            .get("changedAt")
+            .and_then(Value::as_str)
+            .and_then(parse_utc);
+        (rank(row), changed.is_none(), std::cmp::Reverse(changed))
+    });
     let running = agents.len();
     let mut ended_total = None;
     if all {
@@ -237,12 +246,16 @@ impl Rows<'_> {
         let folder = super::server_dir(self.ctx, self.caller)
             .join("agents")
             .join(id);
-        let (status, sent, waiting) =
+        let live = state == "running";
+        let (status, sent, waiting, reported, seen) =
             super::lock(self.ctx, &super::lock_key("agent", self.caller, id), || {
                 let read = |name: &str| read_json(&folder.join(name)).ok().flatten();
                 let status = read("status.json");
-                // Only a live row of the bar's feed reads its waiting files.
-                let waiting = (self.watch && state == "running").then(|| {
+                // Only a live row reads what its client reported and when the person last left its pane.
+                let reported = live.then(|| read("activity.json")).flatten();
+                let seen = live.then(|| read("seen.json")).flatten();
+                // Only a live row reads its waiting files: its activity falls back to them in every feed.
+                let waiting = live.then(|| {
                     let at = status
                         .as_ref()
                         .and_then(|s| s.get("at"))
@@ -250,7 +263,7 @@ impl Rows<'_> {
                         .and_then(parse_utc);
                     super::message::waiting_now(self.ctx, &folder, at)
                 });
-                Ok((status, read("last-sent.json"), waiting))
+                Ok((status, read("last-sent.json"), waiting, reported, seen))
             })?;
         let (doing, from) = select_doing(
             status.as_ref().and_then(|s| s.get("text")),
@@ -295,10 +308,99 @@ impl Rows<'_> {
             "color".into(),
             crate::paint::identity(recorded, &name).into(),
         );
-        if let Some(waiting) = waiting {
+        if live {
+            let (activity, since) = activity(reported.as_ref(), seen.as_ref(), waiting, self.now);
+            row.insert("activity".into(), activity.into());
+            row.insert("since".into(), since.map_or(Value::Null, Value::from));
+            // The change's own time: names the done episode the bar marks seen.
+            let changed = reported
+                .as_ref()
+                .and_then(|r| r.get("since"))
+                .filter(|_| since.is_some())
+                .cloned();
+            row.insert("changedAt".into(), changed.unwrap_or(Value::Null));
+        }
+        // Only the bar's feed shows the waiting flag itself.
+        if let Some(waiting) = waiting.filter(|_| self.watch) {
             row.insert("waiting".into(), waiting.into());
         }
         Ok(row)
+    }
+}
+
+/// A live agent's activity and the seconds since it last changed, as herdr names them: what its client reported in
+/// activity.json (`blocked`, `working`; `idle` is `done` until the person has looked at this very idle spell, which
+/// seen.json names by its `since`); with no readable report, `idle` while it listens in `read -Wait` and `working`
+/// otherwise, with no since.
+fn activity(
+    reported: Option<&Value>,
+    seen: Option<&Value>,
+    waiting: Option<bool>,
+    now: SystemTime,
+) -> (&'static str, Option<u64>) {
+    let at = |value: Option<&Value>, key: &str| {
+        value
+            .and_then(|v| v.get(key))
+            .and_then(Value::as_str)
+            .and_then(parse_utc)
+    };
+    let state = reported
+        .and_then(|r| r.get("state"))
+        .and_then(Value::as_str);
+    let since = at(reported, "since");
+    let word = match (state, since) {
+        (Some("blocked"), Some(_)) => "blocked",
+        (Some("working"), Some(_)) => "working",
+        (Some("idle"), Some(since)) => match at(seen, "since") {
+            Some(seen) if seen >= since => "idle",
+            _ => "done",
+        },
+        _ => {
+            let word = if waiting == Some(true) {
+                "idle"
+            } else {
+                "working"
+            };
+            return (word, None);
+        }
+    };
+    let secs = since.map(|since| now.duration_since(since).map_or(0, |d| d.as_secs()));
+    (word, secs)
+}
+
+/// Records that the person looked at the done spell `changed` (a row's `changedAt`) of the running agent on `pane`:
+/// seen.json under its agent lock, never moved back to an older spell. False when no running agent is on the pane.
+pub fn mark_seen(ctx: &Ctx, caller: &Caller, pane: &str, changed: &str) -> Res<bool> {
+    let Some(at) = parse_utc(changed) else {
+        return Ok(false);
+    };
+    let snapshot = registry::Snapshot::take(ctx, caller)?;
+    let Some(agent) = snapshot.running().into_iter().find(|p| p.pane == pane) else {
+        return Ok(false);
+    };
+    let file = super::state_dir(ctx, caller)?
+        .join("agents")
+        .join(&agent.id)
+        .join("seen.json");
+    super::lock(ctx, &super::lock_key("agent", caller, &agent.id), || {
+        let old = read_json(&file)
+            .ok()
+            .flatten()
+            .and_then(|v| v.get("since").and_then(Value::as_str).and_then(parse_utc));
+        if old.is_none_or(|old| old < at) {
+            crate::state::fs::write_json(&file, &serde_json::json!({"since": changed}))?;
+        }
+        Ok(true)
+    })
+}
+
+/// herdr's rank: who needs the person first.
+fn rank(row: &Map<String, Value>) -> u8 {
+    match row.get("activity").and_then(Value::as_str) {
+        Some("blocked") => 0,
+        Some("done") => 1,
+        Some("working") => 2,
+        _ => 3,
     }
 }
 
@@ -423,7 +525,7 @@ mod tests {
             json!({"name": name, "client": client, "pane": pane, "window": window, "context": "brief",
                 "parent": "%1", "sessionId": SESSION_ID, "directory": "/work", "createdAt": created,
                 "state": "running", "doing": doing, "doingFrom": from, "age": age, "unread": unread,
-                "model": model, "color": color})
+                "model": model, "color": color, "activity": "working", "since": null, "changedAt": null})
         };
         // A record without a model (the client's own) lists null; one without a color gets its name's hue.
         let want = json!({"running": 2, "agents": [
@@ -774,6 +876,164 @@ mod tests {
             (&row["doing"], &row["doingFrom"]),
             (&json!("sent"), &json!("message"))
         );
+    }
+
+    #[test]
+    fn activity_is_reported_seen_or_listening_and_ranks_the_rows() {
+        let w = World::human("");
+        w.clock(NOW);
+        let caller = w.caller();
+        // Five live agents in pane order a..e.
+        let ids = [
+            "aaaaaaaaaaaa",
+            "bbbbbbbbbbbb",
+            "cccccccccccc",
+            "dddddddddddd",
+            "eeeeeeeeeeee",
+        ];
+        let names = ["a", "b", "c", "d", "e"];
+        let mut folders = Vec::new();
+        let mut panes = Vec::new();
+        for (i, (id, name)) in ids.iter().zip(names).enumerate() {
+            folders.push(w.agent_record(id, json!({"name": name, "pane": format!("%{}", 10 + i)})));
+            panes.push(format!("%{}|@5|{}|{id}|{name}", 10 + i, 300 + i));
+        }
+        let panes: Vec<&str> = panes.iter().map(String::as_str).collect();
+        w.panes(&panes);
+        let report = |i: usize, state: &str, since: &str| {
+            write(
+                &folders[i].join("activity.json"),
+                json!({"state": state, "kind": null, "since": format!("2026-10-29T{since}.0000000Z")}),
+            )
+        };
+        let seen = |i: usize, since: &str| {
+            write(
+                &folders[i].join("seen.json"),
+                json!({"since": format!("2026-10-29T{since}.0000000Z")}),
+            )
+        };
+        // a: idle since 11:50, that spell seen: idle. b: idle since 11:58, only an older spell seen: done.
+        // c: working since 11:59. d: no report: working (list) or listening (watch). e: blocked since 11:40.
+        report(0, "idle", "11:50:00");
+        seen(0, "11:50:00");
+        report(1, "idle", "11:58:00");
+        seen(1, "11:57:00");
+        report(2, "working", "11:59:00");
+        report(4, "blocked", "11:40:00");
+        w.fakes.process(crate::testing::row(700, 303, 7000));
+        write(
+            &folders[3].join("waiting-700.json"),
+            json!({"pid": 700, "start": 7000, "since": "2026-10-29T11:59:30.0000000Z"}),
+        );
+        let rows = |watch: bool| -> Vec<String> {
+            let reply = board(&w.ctx, &caller, false, watch).unwrap();
+            reply["agents"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|row| {
+                    format!(
+                        "{}={}/{}",
+                        row["name"].as_str().unwrap(),
+                        row["activity"],
+                        row["since"]
+                    )
+                })
+                .collect()
+        };
+        // Needs you first, then done, working (newest change first, then pane order), idle.
+        // list and the bar's feed agree: d listens in read -Wait, so it is idle in both.
+        assert_eq!(rows(false), rows(true));
+        assert_eq!(
+            rows(true),
+            [
+                r#"e="blocked"/1200"#,
+                r#"b="done"/120"#,
+                r#"c="working"/60"#,
+                r#"a="idle"/600"#,
+                r#"d="idle"/null"#
+            ]
+        );
+        // Its own spell seen: idle; no seen file at all: done; an unreadable report counts as none.
+        seen(1, "11:58:00");
+        report(0, "idle", "11:50:00");
+        std::fs::remove_file(folders[0].join("seen.json")).unwrap();
+        std::fs::write(folders[2].join("activity.json"), "{").unwrap();
+        assert_eq!(
+            rows(false),
+            [
+                r#"e="blocked"/1200"#,
+                r#"a="done"/600"#,
+                r#"c="working"/null"#,
+                r#"b="idle"/120"#,
+                r#"d="idle"/null"#
+            ]
+        );
+        // An unknown word counts as no report.
+        report(4, "dreaming", "11:40:00");
+        assert_eq!(rows(false)[0], r#"a="done"/600"#);
+        // changedAt names the spell; null without a report.
+        let reply = board(&w.ctx, &caller, false, false).unwrap();
+        let changed: Vec<String> = reply["agents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| format!("{}={}", row["name"].as_str().unwrap(), row["changedAt"]))
+            .collect();
+        assert_eq!(
+            changed,
+            [
+                r#"a="2026-10-29T11:50:00.0000000Z""#,
+                "c=null",
+                "e=null",
+                r#"b="2026-10-29T11:58:00.0000000Z""#,
+                "d=null"
+            ]
+        );
+        // Two changes within one second rank by their own times, not by whole seconds: the newer first, though
+        // the older comes first in pane order.
+        for (i, at) in [(2, "11:59:59.8000000Z"), (0, "11:59:59.1000000Z")] {
+            write(
+                &folders[i].join("activity.json"),
+                json!({"state": "blocked", "kind": null, "since": format!("2026-10-29T{at}")}),
+            );
+        }
+        w.clock("2026-10-29T12:00:00.9000000Z");
+        assert_eq!(&rows(false)[..2], [r#"c="blocked"/1"#, r#"a="blocked"/1"#]);
+    }
+
+    #[test]
+    fn mark_seen_names_the_spell_under_the_agent_lock() {
+        let w = World::human("");
+        w.clock(NOW);
+        let caller = w.caller();
+        let folder = w.agent_record(ID, json!({}));
+        w.panes(&["%9|@5|300|aaaaaaaaaaaa|worker"]);
+        let file = folder.join("seen.json");
+        let seen = file.clone();
+        w.fakes
+            .lock_probe(move |_| format!("exists={}", seen.exists()));
+        w.fakes.clear_log();
+        assert!(mark_seen(&w.ctx, &caller, "%9", "2026-10-29T11:58:00.0000000Z").unwrap());
+        let agent = lock_key("agent", &caller, ID);
+        assert_eq!(
+            w.fakes.locks(),
+            [
+                format!("+{agent} exists=false"),
+                format!("-{agent} exists=true")
+            ]
+        );
+        let body = || std::fs::read_to_string(&file).unwrap();
+        assert_eq!(body(), r#"{"since":"2026-10-29T11:58:00.0000000Z"}"#);
+        // Never back to an older spell; a newer one replaces it.
+        mark_seen(&w.ctx, &caller, "%9", "2026-10-29T11:50:00.0000000Z").unwrap();
+        assert_eq!(body(), r#"{"since":"2026-10-29T11:58:00.0000000Z"}"#);
+        mark_seen(&w.ctx, &caller, "%9", "2026-10-29T11:59:00.0000000Z").unwrap();
+        assert_eq!(body(), r#"{"since":"2026-10-29T11:59:00.0000000Z"}"#);
+        // No running agent on the pane, or no time: nothing written.
+        assert!(!mark_seen(&w.ctx, &caller, "%4", "2026-10-29T12:00:00.0000000Z").unwrap());
+        assert!(!mark_seen(&w.ctx, &caller, "%9", "soon").unwrap());
+        assert_eq!(body(), r#"{"since":"2026-10-29T11:59:00.0000000Z"}"#);
     }
 
     #[test]

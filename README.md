@@ -23,7 +23,7 @@ Start Claude Code and Copilot CLI agents in tmux or rmux panes, see what each is
 
 - **Helpers in panes you can see.** Ask in your chat; choose once per session whether agents open as tabs or as panes beside you, and the side bar opens on its own.
 - **They start with your context.** A same-client agent forks your conversation; any other agent starts from a brief you write.
-- **A live side bar.** How many agents run and what each is doing right now; click one to jump to it.
+- **A live side bar.** Who needs you, who just finished, who is working and who is idle, as herdr shows it, with what each is doing right now; click one to jump to it.
 - **Mailboxes, not keystrokes.** Agents report back through files; nothing ever types into another pane.
 - **Safe by default.** An agent never gets more than its caller already has; a refused spawn names the reason.
 - **Fast and native.** One small Rust binary on macOS, Linux and Windows; `list` with six agents takes about 23 ms, and no PowerShell or .NET is needed.
@@ -31,7 +31,7 @@ Start Claude Code and Copilot CLI agents in tmux or rmux panes, see what each is
 
 <table>
   <tr>
-    <td width="50%"><img src="https://raw.githubusercontent.com/D0n9X1n/mux-agents/main/assets/preview/mux-agents-sidebar.png" alt="The side bar: three live agents in their own colors, two working and one waiting with an unread message, each with what it is doing; then three ended agents (done, exit 101, stopped) and +4 more"></td>
+    <td width="50%"><img src="https://raw.githubusercontent.com/D0n9X1n/mux-agents/main/assets/preview/mux-agents-sidebar.png" alt="The side bar: three live agents in their own colors, ranked as herdr ranks them (one needs you, one done with an unread message, one working), each with what it is doing; then three ended agents (done, exit 101, stopped) and +4 more"></td>
     <td width="50%"><img src="https://raw.githubusercontent.com/D0n9X1n/mux-agents/main/assets/preview/mux-agents-list.png" alt="mux-agent list answering one JSON object with each agent's state and current step"></td>
   </tr>
   <tr>
