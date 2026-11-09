@@ -37,22 +37,20 @@ pub fn write_json_with(
     Ok(written?)
 }
 
-/// One decision two processes race for: the first to create `path` writes `choice` and wins. Answers the choice
-/// that stands, this one or the one already there (#97: spawn's commit against the launcher's give-up).
+/// One decision two processes race for: the first to make `path` wins, and its choice stands. Answers the choice
+/// that stands, this one or the one already there (#97: spawn's commit against the launcher's give-up). The choice
+/// is written whole beside `path`, then hard-linked to it: the link appears with its content or fails because
+/// `path` exists, so `path` is never seen empty and exactly one link wins.
 pub fn decide(path: &Path, choice: &str) -> Res<String> {
-    match write_new(path, choice.as_bytes()) {
+    let mut name = path.as_os_str().to_owned();
+    name.push(format!(".{}.tmp", crate::util::guid()?.replace('-', "")));
+    let tmp = PathBuf::from(name);
+    write_new(&tmp, choice.as_bytes())?;
+    let linked = std::fs::hard_link(&tmp, path);
+    let _ = std::fs::remove_file(&tmp);
+    match linked {
         Ok(()) => Ok(choice.to_string()),
-        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
-            // The winner wrote its few bytes at once; read until they are there.
-            for _ in 0..100 {
-                let held = std::fs::read_to_string(path)?;
-                if !held.is_empty() {
-                    return Ok(held);
-                }
-                std::thread::sleep(std::time::Duration::from_millis(10));
-            }
-            Err(Refusal::internal("the launch decision is empty"))
-        }
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => Ok(std::fs::read_to_string(path)?),
         Err(e) => Err(e.into()),
     }
 }
@@ -157,6 +155,33 @@ mod tests {
         let path = dir.path().join(name);
         std::fs::write(&path, bytes).unwrap();
         path
+    }
+
+    #[test]
+    fn decide_lets_the_first_choice_stand_and_leaves_no_tmp() {
+        let dir = TempDir::new();
+        let path = dir.path().join("decided");
+        assert_eq!(decide(&path, "commit").unwrap(), "commit");
+        assert_eq!(decide(&path, "abort").unwrap(), "commit");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "commit");
+        let names: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, ["decided"]);
+        // Many racers: exactly one choice stands, and every racer answers it.
+        let path = dir.path().join("race");
+        let answers: Vec<String> = std::thread::scope(|scope| {
+            let racers: Vec<_> = (0..16)
+                .map(|n| {
+                    let path = &path;
+                    scope.spawn(move || decide(path, &format!("c{n}")).unwrap())
+                })
+                .collect();
+            racers.into_iter().map(|r| r.join().unwrap()).collect()
+        });
+        let stands = std::fs::read_to_string(&path).unwrap();
+        assert!(answers.iter().all(|a| *a == stands), "{answers:?} {stands}");
     }
 
     #[test]

@@ -223,13 +223,11 @@ fn launch(
     Ok(code)
 }
 
-/// True once commit.json exists; false at once for abort.json, or after 30 s with neither. At 30 s the launch is
-/// decided `abort`, unless spawn decided `commit` first: then its commit.json is moments away and the wait goes on
-/// (#97), so a spawn that answered ok always has a running client. That wait is bounded too (30 s more), for a spawn
-/// that died between its decision and its commit.
+/// True once commit.json exists; false at once for abort.json. At 30 s the launch is decided `abort`, unless spawn
+/// decided `commit` first (#97): its record is written by then and commit.json is its next write, so the client
+/// starts now, and a spawn that answered ok always has one. Nothing waits on a spawn after the decision.
 fn wait_commit(ctx: &Ctx, folder: &Path) -> bool {
-    let mut deadline = ctx.clock.now() + COMMIT_WAIT;
-    let mut committing = false;
+    let deadline = ctx.clock.now() + COMMIT_WAIT;
     loop {
         if folder.join("abort.json").is_file() {
             return false;
@@ -238,16 +236,9 @@ fn wait_commit(ctx: &Ctx, folder: &Path) -> bool {
             return true;
         }
         if ctx.clock.now() >= deadline {
-            if committing {
-                return false;
-            }
             let decided =
                 crate::state::fs::decide(&folder.join(crate::agents::spawn::DECIDED), "abort");
-            if decided.as_deref() != Ok("commit") {
-                return false;
-            }
-            committing = true;
-            deadline = ctx.clock.now() + COMMIT_WAIT;
+            return decided.as_deref() == Ok("commit");
         }
         ctx.clock.sleep(COMMIT_POLL);
     }
@@ -593,27 +584,17 @@ mod tests {
             std::fs::read_to_string(l.folder.join("decided")).unwrap(),
             "abort"
         );
-        // Timed out after the spawn decided commit but before commit.json is seen: it waits on and runs the client.
+        // Timed out after the spawn decided commit, before its commit.json: the client starts at once, with no
+        // further wait (a stalled or dead spawn cannot make it give up on an agent the spawn reported).
         let l = setup("claude", json!([]));
         std::fs::remove_file(l.folder.join("commit.json")).unwrap();
         std::fs::write(l.folder.join("decided"), "commit").unwrap();
-        let folder = l.folder.clone();
-        let polls = std::rc::Rc::new(std::cell::Cell::new(0));
-        let seen = polls.clone();
-        l.w.fakes.sleep_probe(move |_| {
-            seen.set(seen.get() + 1);
-            if seen.get() == 121 {
-                std::fs::write(folder.join("commit.json"), "{}").unwrap();
-            }
-        });
         assert_eq!(launch(&l, &spec_str(&l), exits_7).code, 7);
-        assert!(polls.get() > 120, "{}", polls.get());
-        // A spawn that decided commit and then died: the wait still ends, 30 s later.
-        let l = setup("claude", json!([]));
-        std::fs::remove_file(l.folder.join("commit.json")).unwrap();
-        std::fs::write(l.folder.join("decided"), "commit").unwrap();
-        assert_eq!(launch(&l, &spec_str(&l), exits_7).code, 1);
-        assert_eq!(l.w.fakes.slept(), vec![250; 240]);
+        assert_eq!(l.w.fakes.slept(), vec![250; 120]);
+        assert_eq!(
+            std::fs::read_to_string(l.folder.join("decided")).unwrap(),
+            "commit"
+        );
     }
 
     #[test]
