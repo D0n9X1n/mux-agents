@@ -141,5 +141,51 @@ set +f
 unset MUX_AGENTS_BIN
 if [ "$n" = 16 ] && [ -z "$why" ]; then ok skill_commands_run_through_shim; else bad skill_commands_run_through_shim "$n commands$why"; fi
 
+# #84: Copilot reads the plugin root's hooks.json (Claude Code reads hooks/hooks.json only) and runs each command from
+# the plugin root. Every hook reports through the shim, never fails the turn, and maps Copilot's events as herdr's
+# agents report: a prompt works, a question blocks until answered, a stop idles.
+copilot_hooks_report_through_the_shim() {
+  name=copilot_hooks_report_through_the_shim
+  hooks="$repo/hooks.json"
+  got=$(python3 - "$hooks" <<'PY'
+import json, sys
+h = json.load(open(sys.argv[1]))
+assert h["version"] == 1, h
+for event, entries in sorted(h["hooks"].items()):
+    for e in entries:
+        assert e["type"] == "command" and e["timeoutSec"] <= 10, e
+        assert e["bash"].startswith("sh scripts/mux-agent report ") and e["bash"].endswith(">/dev/null 2>&1 || true"), e
+        assert e["powershell"].startswith("& scripts/mux-agent.cmd report ") and e["powershell"].endswith("; exit 0"), e
+        words = e["bash"][len("sh scripts/mux-agent "):].split(" >")[0]
+        assert words == e["powershell"][len("& scripts/mux-agent.cmd "):].split(" *>")[0], e
+        print(f"{event}:{e.get('matcher', '')}:{words}")
+PY
+  ) || { bad "$name" "hooks.json shape"; return; }
+  want="agentStop::report idle
+postToolUse:ask_user:report working
+postToolUseFailure:ask_user:report working
+preToolUse:ask_user:report blocked -Kind question
+userPromptSubmitted::report working"
+  [ "$got" = "$want" ] || { bad "$name" "events: $got"; return; }
+  # Run as Copilot runs it, from the plugin root, with a binary that records its arguments: the shim passes them on,
+  # and a refusal (here: exit 2) never fails the hook.
+  fake="$tmp/fake-mux-agent"
+  printf '#!/bin/sh\necho "$*" >> "%s/argv"\nexit 2\n' "$tmp" > "$fake"
+  chmod +x "$fake"
+  : > "$tmp/argv"
+  python3 -c 'import json,sys; [print(e["bash"]) for es in json.load(open(sys.argv[1]))["hooks"].values() for e in es]' "$hooks" |
+    while IFS= read -r cmd; do
+      (cd "$repo" && MUX_AGENTS_BIN="$fake" sh -c "$cmd") || echo "FAILED $cmd" >> "$tmp/argv"
+    done
+  ran=$(sort "$tmp/argv")
+  want="report blocked -Kind question
+report idle
+report working
+report working
+report working"
+  [ "$ran" = "$want" ] && ok "$name" || bad "$name" "ran: $ran"
+}
+copilot_hooks_report_through_the_shim
+
 echo "$pass passed, $fail failed"
 [ "$fail" = 0 ]

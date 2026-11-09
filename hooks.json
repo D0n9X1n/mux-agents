@@ -1,0 +1,20 @@
+{
+  "version": 1,
+  "hooks": {
+    "userPromptSubmitted": [
+      { "type": "command", "bash": "sh scripts/mux-agent report working >/dev/null 2>&1 || true", "powershell": "& scripts/mux-agent.cmd report working *> $null; exit 0", "timeoutSec": 10 }
+    ],
+    "preToolUse": [
+      { "type": "command", "matcher": "ask_user", "bash": "sh scripts/mux-agent report blocked -Kind question >/dev/null 2>&1 || true", "powershell": "& scripts/mux-agent.cmd report blocked -Kind question *> $null; exit 0", "timeoutSec": 10 }
+    ],
+    "postToolUse": [
+      { "type": "command", "matcher": "ask_user", "bash": "sh scripts/mux-agent report working >/dev/null 2>&1 || true", "powershell": "& scripts/mux-agent.cmd report working *> $null; exit 0", "timeoutSec": 10 }
+    ],
+    "postToolUseFailure": [
+      { "type": "command", "matcher": "ask_user", "bash": "sh scripts/mux-agent report working >/dev/null 2>&1 || true", "powershell": "& scripts/mux-agent.cmd report working *> $null; exit 0", "timeoutSec": 10 }
+    ],
+    "agentStop": [
+      { "type": "command", "bash": "sh scripts/mux-agent report idle >/dev/null 2>&1 || true", "powershell": "& scripts/mux-agent.cmd report idle *> $null; exit 0", "timeoutSec": 10 }
+    ]
+  }
+}
