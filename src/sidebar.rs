@@ -1622,15 +1622,11 @@ fn act(
 /// Lines a peek shows: the screen and some history.
 const PEEK_LINES: i32 = 200;
 
-/// How long a peek file may stay: the popup deletes its file as it starts, so one still here this old belongs to a
-/// popup that never opened, and a later peek deletes it. A popup queued behind another keeps its file until then.
-const PEEK_KEEP: Duration = Duration::from_secs(24 * 60 * 60);
-
 /// herdr's peek: the agent's last lines, captured as `read <name> -Lines` captures them (only while its pane is its
 /// own live launch), into a private file of the state folder, shown in a popup over the session's client that pages
-/// it, deleting it as it starts. Peek files older than PEEK_KEEP, whose popup never opened, go first. The popup is
-/// started in the background (`run-shell -b -C`), since display-popup answers only once it closes and the bar must
-/// not wait; so a popup that fails to open is not seen here, and its file goes with a later sweep.
+/// it, deleting it as it starts. The popup is started in the background (`run-shell -b -C`), since display-popup
+/// answers only once it closes and the bar must not wait; so a popup that never opens is not seen here, and its
+/// file stays in the state folder (no sweep: age cannot tell it from a popup still queued behind another).
 fn peek(ctx: &Ctx, caller: &Caller, target: &Target) -> Res<()> {
     let pane = crate::agents::registry::find_reaped(ctx, caller, &target.name)?;
     if pane.pane != target.pane {
@@ -1653,16 +1649,6 @@ fn peek(ctx: &Ctx, caller: &Caller, target: &Target) -> Res<()> {
         );
     }
     let text = crate::agents::message::capture(ctx, &pane, PEEK_LINES)?;
-    let now = SystemTime::now();
-    for old in std::fs::read_dir(&folder).into_iter().flatten().flatten() {
-        let stale = old
-            .metadata()
-            .and_then(|m| m.modified())
-            .is_ok_and(|at| now.duration_since(at).is_ok_and(|age| age > PEEK_KEEP));
-        if stale && old.file_name().to_string_lossy().starts_with("peek-") {
-            let _ = std::fs::remove_file(old.path());
-        }
-    }
     let file = folder.join(format!(
         "peek-{}.txt",
         crate::util::guid()?.replace('-', "")
@@ -3616,26 +3602,10 @@ mod tests {
             popup.contains(files[0].path().to_str().unwrap()),
             "{popup:?}"
         );
-        // A second peek keeps a file a queued popup has not opened yet, and deletes one older than PEEK_KEEP, whose
-        // popup never opened.
+        // A second peek never deletes another's file: it may belong to a popup still queued.
         let first = files[0].path();
         peek(&w.ctx, &caller, &target).unwrap();
         assert!(first.exists());
-        let old = std::time::SystemTime::now() - PEEK_KEEP - std::time::Duration::from_secs(1);
-        for f in std::fs::read_dir(&folder)
-            .unwrap()
-            .filter_map(Result::ok)
-            .filter(|e| e.file_name().to_string_lossy().starts_with("peek-"))
-        {
-            std::fs::File::options()
-                .write(true)
-                .open(f.path())
-                .unwrap()
-                .set_modified(old)
-                .unwrap();
-        }
-        peek(&w.ctx, &caller, &target).unwrap();
-        assert!(!first.exists());
         let peeks = |folder: &std::path::Path| {
             std::fs::read_dir(folder)
                 .unwrap()
@@ -3643,11 +3613,11 @@ mod tests {
                 .filter(|e| e.file_name().to_string_lossy().starts_with("peek-"))
                 .count()
         };
-        assert_eq!(peeks(&folder), 1);
+        assert_eq!(peeks(&folder), 2);
         // No popup: its file goes and peek fails; a moved agent is never read.
         w.fakes.mux_first("run-shell", 1, "", "no current client");
         assert!(peek(&w.ctx, &caller, &target).is_err());
-        assert_eq!(peeks(&folder), 1);
+        assert_eq!(peeks(&folder), 2);
         // A state folder whose path the multiplexer or a shell would read: no capture, no popup.
         let mut odd = World::human("");
         odd.ctx.state_root = odd.ctx.state_root.join("#{@x}");

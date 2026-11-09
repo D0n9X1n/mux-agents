@@ -680,6 +680,32 @@ exec claude --dangerously-skip-permissions
         names
     }
 
+    /// True when a `less` runs below process `root`, by ps's parent links.
+    fn pagers_under(root: u64) -> bool {
+        let out = Command::new("ps")
+            .args(["-axo", "pid=,ppid=,comm="])
+            .output()
+            .unwrap();
+        let rows: Vec<(u64, u64, String)> = String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .filter_map(|l| {
+                let mut f = l.split_whitespace();
+                let pid = f.next()?.parse().ok()?;
+                let ppid = f.next()?.parse().ok()?;
+                Some((pid, ppid, f.collect::<Vec<_>>().join(" ")))
+            })
+            .collect();
+        let mut below = vec![root];
+        let mut i = 0;
+        while i < below.len() {
+            let parent = below[i];
+            below.extend(rows.iter().filter(|r| r.1 == parent).map(|r| r.0));
+            i += 1;
+        }
+        rows.iter()
+            .any(|r| below.contains(&r.0) && r.2.rsplit('/').next() == Some("less"))
+    }
+
     /// `/dev/<tty>` of a process, by ps.
     fn tty_of(pid: u64) -> String {
         let out = Command::new("ps")
@@ -3601,14 +3627,24 @@ exec claude --dangerously-skip-permissions
             }
             found
         };
-        // The popup's shell deletes the file as it starts paging it: gone while the popup is still open.
-        live.server
-            .wait("the popup to start and delete its peek file", || {
-                (peeks(&live) == 0).then_some(())
-            });
-        // The bar never waits on the open popup: it keeps redrawing on its ticks meanwhile.
-        live.after_redraw(&bar);
+        // The popup is open: its pager runs under this server, on a deleted file (the shell deleted it as it
+        // started), and the bar keeps redrawing on its ticks meanwhile, never waiting on the popup.
+        let server: u64 = live.field(live.server.pane(), "#{pid}").parse().unwrap();
+        live.server.wait("the popup's pager under this server", || {
+            pagers_under(server).then_some(())
+        });
+        assert_eq!(peeks(&live), 0, "the popup deleted its file as it opened");
+        // A tick is 2 s; a bar blocked on the popup would not draw again within 5 s.
+        let n = live.frames(&bar);
+        assert!(
+            eventually(Duration::from_secs(5), || live.frames(&bar) > n),
+            "{mux:?}: the bar stopped drawing while the popup was open"
+        );
+        assert!(pagers_under(server), "the popup is still open");
         client.write(b"q");
+        live.server.wait("q to close the popup", || {
+            (!pagers_under(server)).then_some(())
+        });
         drop(client);
     }
 
