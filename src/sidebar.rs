@@ -3554,7 +3554,16 @@ mod tests {
 
     #[test]
     fn peek_captures_the_agents_own_pane_into_a_private_file_and_opens_a_popup() {
-        let w = World::human("");
+        let mut w = World::human("");
+        // The test root is canonicalized, which on Windows adds `\\?\`; the real root (%LOCALAPPDATA%) has none.
+        if let Some(plain) = w
+            .ctx
+            .state_root
+            .to_str()
+            .and_then(|r| r.strip_prefix(r"\\?\"))
+        {
+            w.ctx.state_root = plain.into();
+        }
         let caller = w.caller();
         w.agent_record(ID, json!({"name": "worker", "pane": "%9"}));
         w.panes(&["%9|@5|300|aaaaaaaaaaaa|worker"]);
