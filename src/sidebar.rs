@@ -1622,14 +1622,15 @@ fn act(
 /// Lines a peek shows: the screen and some history.
 const PEEK_LINES: i32 = 200;
 
-/// How long a peek file may stay: a popup closed by force leaves its file, which a later peek deletes once older.
-const PEEK_KEEP: Duration = Duration::from_secs(60);
+/// How long a peek file may stay: the popup deletes its file as it starts, so one still here this old belongs to a
+/// popup that never opened, and a later peek deletes it. A popup queued behind another keeps its file until then.
+const PEEK_KEEP: Duration = Duration::from_secs(24 * 60 * 60);
 
 /// herdr's peek: the agent's last lines, captured as `read <name> -Lines` captures them (only while its pane is its
 /// own live launch), into a private file of the state folder, shown in a popup over the session's client that pages
-/// it and deletes it when closed. Peek files a popup closed by force left behind, older than PEEK_KEEP, go first. The
-/// popup is started in the background (`run-shell -b -C`), since display-popup answers only once it closes and the
-/// bar must not wait; so a popup that fails to open is not seen here, and its file goes with the next sweep.
+/// it, deleting it as it starts. Peek files older than PEEK_KEEP, whose popup never opened, go first. The popup is
+/// started in the background (`run-shell -b -C`), since display-popup answers only once it closes and the bar must
+/// not wait; so a popup that fails to open is not seen here, and its file goes with a later sweep.
 fn peek(ctx: &Ctx, caller: &Caller, target: &Target) -> Res<()> {
     let pane = crate::agents::registry::find_reaped(ctx, caller, &target.name)?;
     if pane.pane != target.pane {
@@ -1701,16 +1702,17 @@ fn plain_path(path: &str, os: crate::state::root::OsKind) -> bool {
     })
 }
 
-/// The popup that pages `path` (a `plain_path`) over the client showing `bar`'s session, then deletes it: `less` from
-/// the end on Unix, `type` and a key on Windows. No argument holds a `'`, so each goes to `run-shell -C` in single
-/// quotes. No -T: tmux 3.2 has none.
+/// The popup that pages `path` (a `plain_path`) over the client showing `bar`'s session, deleting it once read, so a
+/// popup closed by force leaves nothing: on Unix the file is opened, deleted, then paged from the end by `less`; on
+/// Windows `type` shows it, `del` deletes it, then `pause` waits for a key. No argument holds a `'`, so each goes to
+/// `run-shell -C` in single quotes. No -T: tmux 3.2 has none.
 fn popup_argv(bar: &str, path: &str, os: crate::state::root::OsKind) -> Vec<String> {
     let command = match os {
         crate::state::root::OsKind::Unix => {
-            format!("less -R +G \"{path}\"; rm -f \"{path}\"")
+            format!("{{ rm -f \"{path}\"; less -R +G; }} < \"{path}\"")
         }
         crate::state::root::OsKind::Windows => {
-            format!("cmd /d /c \"type \"{path}\" & pause & del \"{path}\"\"")
+            format!("cmd /d /c \"type \"{path}\" & del \"{path}\" & pause\"")
         }
     };
     [
@@ -3514,7 +3516,7 @@ mod tests {
                 "-h",
                 "80%",
                 "-E",
-                r#"less -R +G "/s/my state/peek-1.txt"; rm -f "/s/my state/peek-1.txt""#
+                r#"{ rm -f "/s/my state/peek-1.txt"; less -R +G; } < "/s/my state/peek-1.txt""#
             ]
         );
         // Only plain paths reach it: no format, expansion, quote or separator character, and \ only on Windows.
@@ -3537,12 +3539,12 @@ mod tests {
         let windows = popup_argv("%7", r"C:\s\peek-1.txt", OsKind::Windows);
         assert_eq!(
             windows[8],
-            r#"cmd /d /c "type "C:\s\peek-1.txt" & pause & del "C:\s\peek-1.txt"""#
+            r#"cmd /d /c "type "C:\s\peek-1.txt" & del "C:\s\peek-1.txt" & pause""#
         );
     }
 
     // The Windows popup command run as the popup runs it, through cmd, on a real Windows host: it shows the text,
-    // its `pause` takes a key (here the end of stdin) and the file is deleted, from a folder with a space.
+    // the file is deleted before its `pause` takes a key (here the end of stdin), from a folder with a space.
     #[cfg(windows)]
     #[test]
     fn windows_popup_command_shows_then_deletes_the_file() {
@@ -3614,8 +3616,8 @@ mod tests {
             popup.contains(files[0].path().to_str().unwrap()),
             "{popup:?}"
         );
-        // A second peek keeps a file another popup may still be opening, and deletes one older than PEEK_KEEP that
-        // a popup closed by force left behind.
+        // A second peek keeps a file a queued popup has not opened yet, and deletes one older than PEEK_KEEP, whose
+        // popup never opened.
         let first = files[0].path();
         peek(&w.ctx, &caller, &target).unwrap();
         assert!(first.exists());

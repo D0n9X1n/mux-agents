@@ -3581,7 +3581,7 @@ exec claude --dangerously-skip-permissions
         live.wait_place(&bar, "the bar in place at the client's size");
         live.after_redraw(&bar);
         live.call(&["send-keys", "-t", &bar, "-l", "p"]);
-        // While the popup is open its peek file exists; the state folder holds it.
+        // The peek files in the state folder.
         let peeks = |live: &Live| {
             let mut found = 0;
             for dir in std::fs::read_dir(live.dir.join("state"))
@@ -3601,17 +3601,14 @@ exec claude --dangerously-skip-permissions
             }
             found
         };
+        // The popup's shell deletes the file as it starts paging it: gone while the popup is still open.
         live.server
-            .wait("the peek file while the popup is open", || {
-                (peeks(&live) == 1).then_some(())
+            .wait("the popup to start and delete its peek file", || {
+                (peeks(&live) == 0).then_some(())
             });
         // The bar never waits on the open popup: it keeps redrawing on its ticks meanwhile.
         live.after_redraw(&bar);
-        assert_eq!(peeks(&live), 1, "the popup is still open");
         client.write(b"q");
-        live.server.wait("the popup to delete its peek file", || {
-            (peeks(&live) == 0).then_some(())
-        });
         drop(client);
     }
 
