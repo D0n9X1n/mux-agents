@@ -65,7 +65,7 @@ fn endpoint_in(verb: &str, mux: &str) -> (i32, String, String) {
 
 const SPAWN: &str = "usage: mux-agent spawn -Client <claude|copilot> [-Task <text>] [-TaskFile <path>] [-BriefFile <path>] [-Name <name>] [-Model <model>] [-Split <value>] [-Tab] [-NoFork] [-Text]";
 const LIST: &str = "usage: mux-agent list [-All] [-Text]";
-const FOCUS: &str = "usage: mux-agent focus <name> [-Text]";
+const FOCUS: &str = "usage: mux-agent focus (<name> | -Next | -Prev) [-Text]";
 const READ: &str = "usage: mux-agent read [-Wait <seconds>] | read <name> [-Lines <n>] [-Text]";
 
 #[test]

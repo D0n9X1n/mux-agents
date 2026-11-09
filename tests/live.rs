@@ -1256,6 +1256,29 @@ exec claude --dangerously-skip-permissions
         let (code, focused) = live.run(&["focus", "w2"]);
         assert_eq!(code, 0, "{mux:?} {focused}");
         assert_eq!(active(&live), s(&w2["pane"]), "{mux:?}");
+        // #90: with no client attached nobody is looking at an agent, so -Next goes to the most urgent: w1, which
+        // needs the person, ranks before w2; -Prev to the last.
+        let pid = live.worker_pid(&w1);
+        support::write_atomic(&live.dir.join(format!("cmd.{pid}")), "report\tblocked\n");
+        let reply = live.dir.join(format!("reply.{pid}.1.json"));
+        assert!(
+            eventually(Duration::from_secs(30), || reply.is_file()),
+            "{mux:?}: the report did not run"
+        );
+        let (code, focused) = live.run(&["focus", "-Next"]);
+        assert_eq!(
+            (code, &focused["name"]),
+            (0, &w1["name"]),
+            "{mux:?} {focused}"
+        );
+        assert_eq!(active(&live), s(&w1["pane"]), "{mux:?}");
+        let (code, focused) = live.run(&["focus", "-Prev"]);
+        assert_eq!(
+            (code, &focused["name"]),
+            (0, &w2["name"]),
+            "{mux:?} {focused}"
+        );
+        assert_eq!(active(&live), s(&w2["pane"]), "{mux:?}");
     }
 
     // stop posts `stopped` to a reader already waiting, which returns it soon after.

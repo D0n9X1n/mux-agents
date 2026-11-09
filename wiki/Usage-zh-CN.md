@@ -45,7 +45,7 @@ flowchart LR
 | `status` | `status -BodyFile step.txt` | 代理报告自己当前在做什么 |
 | `send` | `send claude-1 -BodyFile note.md`，`send parent -BodyFile result.md` | 给某个代理或你的父代理发消息 |
 | `read` | `read -Wait 600`，`read claude-1 -Lines 40` | 等待你的消息，或读取某个代理的窗格 |
-| `focus` | `focus claude-1` | 让多路复用器切换到某个代理的窗格 |
+| `focus` | `focus claude-1`、`focus -Next` | 让多路复用器切换到某个代理的窗格；`-Next` / `-Prev` 按侧边栏的顺序逐个切换 |
 | `stop` | `stop claude-1` | 关闭代理的窗格及其进程；已结束的代理回答 `ok` 并带 `already`（`exited`、`stopped` 或 `lost`） |
 | `sidebar` | `sidebar`，`sidebar -Close` | 重新打开侧边栏分屏，或在本会话剩余时间内关闭它 |
 | `version` | `version`，`--version` | 二进制文件的版本，用来分辨窗格运行的是哪一个；在多路复用器之外也能用 |
@@ -98,7 +98,7 @@ flowchart LR
 
 侧边栏是 `sidebar` 在其中启动的那个进程，而不是它的 `@agent-role sidebar` 标签，所以标签被移动后（rmux 的 `rotate-window` 会把标签留在原处）也绝不会把你的窗格当作侧边栏。带有该标签但不是那个进程的窗格绝不会被关闭：`sidebar`、`sidebar -Close` 和 spawn 都会拒绝并指出它。如果它是旧的侧边栏（例如由 0.2.1 打开、`sidebar -Close` 无法证明的那种），用 `kill-pane -t <pane>` 关闭它；如果它是你自己的窗格，用 `set-option -p -u -t <pane> @agent-role` 清除标签。你手动运行的 `mux-agent watch` 会绘制面板，也像侧边栏一样接收点击和按键，但只有侧边栏会维持布局。
 
-在侧边栏中点击代理的名字行，即可切换到它的窗口和窗格。只有开启 `mouse on`（`set -g mouse on`）时点击才会到达侧边栏；开启后用 Shift 拖动来选择文字。`MUX_AGENTS_ASCII=1` 时点击无效。调整侧边栏大小期间的点击不起作用，侧边栏会重绘。侧边栏窗格处于活动状态时，`j`/`k` 或方向键选择一个运行中的代理，Enter 切换到它，Esc 取消选择；切换失败时显示 `focus failed: <name>`。按键或按下左键会让侧边栏立即重绘，在侧边栏中键入 Ctrl-C 会结束它（`interrupted`）；每次退出时它都会恢复终端。`TERM=dumb` 时，侧边栏只绘制：它不接收点击或按键。在 Windows 上，侧边栏在 rmux 0.10 或更高版本中通过控制台接收点击和按键，与 macOS 和 Linux 相同。代理状态或模型中的 `◉`、`◌` 和 `✦` 显示为 `•`。
+在侧边栏中点击代理的名字行，即可切换到它的窗口和窗格。只有开启 `mouse on`（`set -g mouse on`）时点击才会到达侧边栏；开启后用 Shift 拖动来选择文字。`MUX_AGENTS_ASCII=1` 时点击无效。调整侧边栏大小期间的点击不起作用，侧边栏会重绘。侧边栏窗格处于活动状态时，`j`/`k` 或方向键选择一个运行中的代理，Enter 切换到它，Esc 取消选择；切换失败时显示 `focus failed: <name>`。按键或按下左键会让侧边栏立即重绘，在侧边栏中键入 Ctrl-C 会结束它（`interrupted`）；每次退出时它都会恢复终端。`TERM=dumb` 时，侧边栏只绘制：它不接收点击或按键。在任何窗格中（你的或代理的），`focus -Next` 和 `focus -Prev` 都按侧边栏的顺序（需要你的排在最前）在运行中的代理之间逐个切换，就像 herdr 的下一个和上一个代理快捷键，并会循环；在不属于代理的窗格中，`-Next` 切换到最紧急的代理。目前还不能用 tmux 快捷键运行它们：`run-shell` 不在任何窗格之下，调用者检查会拒绝它（#90）。在 Windows 上，侧边栏在 rmux 0.10 或更高版本中通过控制台接收点击和按键，与 macOS 和 Linux 相同。代理状态或模型中的 `◉`、`◌` 和 `✦` 显示为 `•`。
 
 ## 安全检查
 

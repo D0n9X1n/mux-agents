@@ -1352,7 +1352,7 @@ pub fn run_watch(
 
 /// The pane the session shows to an attached client, its current window's active pane: `Some(None)` when no client
 /// is attached, `None` when the multiplexer did not answer in that shape (nothing is known).
-fn shown_pane(ctx: &Ctx, caller: &Caller) -> Option<Option<String>> {
+pub(crate) fn shown_pane(ctx: &Ctx, caller: &Caller) -> Option<Option<String>> {
     let read = native(
         ctx,
         &["display-message", "-p", "-t", &caller.session, SHOWN_FORMAT],

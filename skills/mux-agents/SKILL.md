@@ -38,6 +38,7 @@ The commands below, and the Reply and Listen lines, run as-is in the Bash tool. 
 "<entry>" list
 "<entry>" list -All
 "<entry>" focus <name>
+"<entry>" focus -Next
 "<entry>" send <name> -BodyFile <body-file>
 "<entry>" send parent -BodyFile <body-file>
 "<entry>" status -BodyFile <status-file>

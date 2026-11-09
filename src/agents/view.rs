@@ -56,15 +56,54 @@ pub struct Focused {
     pub window: String,
 }
 
-/// The `focus` verb: `focus_pane` on the agent its positional names, with no drawn pane to check.
+/// The `focus` verb: `focus_pane` on the agent its positional names, with no drawn pane to check; or, with `-Next` /
+/// `-Prev`, on the live agent after (before) the one the session shows, in the board's ranked order (herdr's
+/// agent.next / agent.prev), wrapping; from a pane that is no agent's, the first (last).
 pub fn focus(ctx: &Ctx, request: &Request) -> Res<Map<String, Value>> {
+    let (next, prev) = (request.switch("Next"), request.switch("Prev"));
+    let named = !request.positional.is_empty();
+    if usize::from(next) + usize::from(prev) + usize::from(named) != 1 {
+        return Err(usage("focus"));
+    }
     let caller = resolve(ctx)?;
-    let focused = focus_pane(ctx, &caller, first(request), None)?;
+    let name = if named {
+        first(request).to_string()
+    } else {
+        step(ctx, &caller, next)?
+    };
+    let focused = focus_pane(ctx, &caller, &name, None)?;
     let mut reply = Map::new();
     reply.insert("name".into(), focused.name.into());
     reply.insert("pane".into(), focused.pane.into());
     reply.insert("window".into(), focused.window.into());
     Ok(reply)
+}
+
+/// The live agent next to (`forward`) or before the one on the pane the session shows, in the board's order.
+fn step(ctx: &Ctx, caller: &Caller, forward: bool) -> Res<String> {
+    let board = board(ctx, caller, false, false)?;
+    let live: Vec<(String, String)> = board
+        .get("agents")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_object)
+        .filter(|row| row.get("state").and_then(Value::as_str) == Some("running"))
+        .map(|row| (super::text(row.get("name")), super::text(row.get("pane"))))
+        .collect();
+    if live.is_empty() {
+        return refuse(2, "target", "no live agent to switch to");
+    }
+    let shown = crate::sidebar::shown_pane(ctx, caller).flatten();
+    let at = shown.and_then(|pane| live.iter().position(|(_, p)| *p == pane));
+    let n = live.len();
+    let to = match (at, forward) {
+        (Some(at), true) => (at + 1) % n,
+        (Some(at), false) => (at + n - 1) % n,
+        (None, true) => 0,
+        (None, false) => n - 1,
+    };
+    Ok(live[to].0.clone())
 }
 
 /// Selects a running agent's window and pane, only while its pane is still its live launch (checked by the server in
@@ -314,6 +353,85 @@ mod tests {
         assert_eq!(
             run(&w, focus, &["focus", "other"]),
             "2 target no live agent has that name"
+        );
+    }
+
+    #[test]
+    fn focus_next_and_prev_step_through_the_ranked_board_and_wrap() {
+        let w = World::human("");
+        w.clock("2026-11-08T12:00:00.0000000Z");
+        // In pane order: a works, b needs you, c is done (never seen). Ranked: b, c, a.
+        for (id, name, pane, state) in [
+            ("aaaaaaaaaaaa", "a", "%10", "working"),
+            ("bbbbbbbbbbbb", "b", "%11", "blocked"),
+            ("cccccccccccc", "c", "%12", "idle"),
+        ] {
+            let folder = w.agent_record(id, json!({"name": name, "pane": pane}));
+            write(
+                &folder.join("activity.json"),
+                json!({"state": state, "kind": null, "since": "2026-11-08T11:59:00.0000000Z"}),
+            );
+        }
+        w.panes(&[
+            "%10|@5|300|aaaaaaaaaaaa|a",
+            "%11|@6|301|bbbbbbbbbbbb|b",
+            "%12|@7|302|cccccccccccc|c",
+        ]);
+        // Every select is proved by its read-back, whichever pane it was.
+        w.fakes.mux_script("#{window_active}", |argv| {
+            let pane = argv[argv.len() - 2].clone();
+            Ok(crate::mux::Output {
+                code: 0,
+                stdout: format!("{pane}|1|1|1\n"),
+                stderr: String::new(),
+            })
+        });
+        let step = |shown: &str, flag: &str| {
+            w.fakes.mux_first(
+                "#{pane_id}|#{session_attached}",
+                0,
+                &format!("{shown}|1\n"),
+                "",
+            );
+            run(&w, focus, &["focus", flag])
+        };
+        let name = |out: String| {
+            out.split(r#""name":""#)
+                .nth(1)
+                .map(|r| r[..1].to_string())
+                .unwrap_or(out)
+        };
+        // From a pane that is no agent's: -Next is the most urgent, -Prev the last.
+        assert_eq!(name(step("%1", "-Next")), "b");
+        assert_eq!(name(step("%1", "-Prev")), "a");
+        // From an agent's pane, its neighbour in rank order, wrapping.
+        assert_eq!(name(step("%11", "-Next")), "c");
+        assert_eq!(name(step("%12", "-Next")), "a");
+        assert_eq!(name(step("%10", "-Next")), "b");
+        assert_eq!(name(step("%11", "-Prev")), "a");
+        // No client attached or no answer: as from no agent's pane.
+        w.fakes
+            .mux_first("#{pane_id}|#{session_attached}", 0, "%11|0\n", "");
+        assert_eq!(name(run(&w, focus, &["focus", "-Next"])), "b");
+        // A name with a flag, both flags, or neither: usage, before the caller is resolved (as every verb's own usage).
+        let usage = "2 usage usage: mux-agent focus (<name> | -Next | -Prev) [-Text]";
+        w.fakes.clear_log();
+        for args in [
+            &["focus", "a", "-Next"][..],
+            &["focus", "-Next", "-Prev"],
+            &["focus"],
+        ] {
+            assert_eq!(run(&w, focus, args), usage, "{args:?}");
+        }
+        assert!(w.fakes.mux_calls().is_empty());
+        // No live agent: refused.
+        let w = World::human("");
+        w.panes(&[]);
+        w.fakes
+            .mux_first("#{pane_id}|#{session_attached}", 0, "%1|1\n", "");
+        assert_eq!(
+            run(&w, focus, &["focus", "-Next"]),
+            "2 target no live agent to switch to"
         );
     }
 
