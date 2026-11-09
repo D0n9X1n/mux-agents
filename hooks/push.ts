@@ -33,12 +33,20 @@ export function sendReply(command: string, stdout: string | undefined, root: str
   return undefined
 }
 
-// True when the command is one send by the entry at root, as ONE_SEND says. Paths compare with / for \ and in any case.
+// True when the command is one send by the entry at root, as ONE_SEND says. A Windows root (`C:\…`, `\\server\…`)
+// compares with / for \ and in any case, as Windows reads paths; a POSIX root (`/…`) compares exactly, as a \ there
+// is a character of a file name, never a folder.
 export function isEntrySend(command: string, root: string): boolean {
   const m = ONE_SEND.exec(command)
   if (!m || !root || SHELL.test(command.replace(/^\s*&\s*/, ''))) return false
-  const path = (m[1] ?? m[2] ?? m[3]).replace(/\\/g, '/').toLowerCase()
-  const base = root.replace(/\\/g, '/').replace(/\/+$/, '').toLowerCase()
+  const windows = !root.startsWith('/')
+  let path = m[1] ?? m[2] ?? m[3]
+  let base = root
+  if (windows) {
+    path = path.replace(/\\/g, '/').toLowerCase()
+    base = base.replace(/\\/g, '/').toLowerCase()
+  }
+  base = base.replace(/\/+$/, '')
   return !path.split('/').includes('..') && path.startsWith(base) && ENTRY_FILE.test(path.slice(base.length))
 }
 

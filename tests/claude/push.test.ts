@@ -61,7 +61,18 @@ test('only a command that is one run of this plugin\'s entry\'s send is trusted 
     '/p/scripts/mux-agen? send w1 -Body hi',
     '"/p/scripts/mux-agent" send w1 -Body "$HOME"',
     '"$P/scripts/mux-agent" send w1 -Body hi',
+    // On POSIX a \ is part of a file name and case matters: another file than the entry.
+    '"/p\\scripts\\mux-agent" send w1 -Body hi',
+    '"/p/scripts\\mux-agent" send w1 -Body hi',
+    '"/P/scripts/mux-agent" send w1 -Body hi',
+    '"/p/Scripts/mux-agent" send w1 -Body hi',
   ]) expect(sendReply(cmd, reply({}), '/p')).toBeUndefined()
+  // A Windows root still refuses another root, a path out of it, or another file.
+  for (const cmd of [
+    '& "C:/Other/scripts/mux-agent.cmd" send w1 -Body hi',
+    '& "C:/My Plugins/mux/scripts/../x/scripts/mux-agent.cmd" send w1 -Body hi',
+    '& "C:/My Plugins/mux/scripts/mux-agent.bat" send w1 -Body hi',
+  ]) expect(sendReply(cmd, reply({}), 'C:\\My Plugins\\mux')).toBeUndefined()
   // No root, no trust.
   expect(sendReply(CMD, reply({}), '')).toBeUndefined()
 })
