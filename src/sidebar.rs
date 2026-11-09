@@ -1693,28 +1693,22 @@ fn plain_path(path: &str, os: crate::state::root::OsKind) -> bool {
 /// Windows `type` shows it, `del` deletes it, then `pause` waits for a key. No argument holds a `'`, so each goes to
 /// `run-shell -C` in single quotes. No -T: tmux 3.2 has none.
 fn popup_argv(bar: &str, path: &str, os: crate::state::root::OsKind) -> Vec<String> {
+    // On Unix the command is /bin/sh's own argv, never the session's default-shell (which may be tcsh or fish).
     let command = match os {
-        crate::state::root::OsKind::Unix => {
-            format!("{{ rm -f \"{path}\"; less -R +G; }} < \"{path}\"")
-        }
-        crate::state::root::OsKind::Windows => {
-            format!("cmd /d /c \"type \"{path}\" & del \"{path}\" & pause\"")
-        }
+        crate::state::root::OsKind::Unix => vec![
+            "/bin/sh".to_string(),
+            "-c".to_string(),
+            format!("{{ rm -f \"{path}\"; less -R +G; }} < \"{path}\""),
+        ],
+        crate::state::root::OsKind::Windows => vec![format!(
+            "cmd /d /c \"type \"{path}\" & del \"{path}\" & pause\""
+        )],
     };
-    [
-        "display-popup",
-        "-t",
-        bar,
-        "-w",
-        "80%",
-        "-h",
-        "80%",
-        "-E",
-        &command,
-    ]
-    .iter()
-    .map(|s| s.to_string())
-    .collect()
+    ["display-popup", "-t", bar, "-w", "80%", "-h", "80%", "-E"]
+        .iter()
+        .map(|s| s.to_string())
+        .chain(command)
+        .collect()
 }
 
 /// The running agent on row `y` of the bar, read in one call: none unless the call answers, the bar is `width`
@@ -3502,6 +3496,8 @@ mod tests {
                 "-h",
                 "80%",
                 "-E",
+                "/bin/sh",
+                "-c",
                 r#"{ rm -f "/s/my state/peek-1.txt"; less -R +G; } < "/s/my state/peek-1.txt""#
             ]
         );

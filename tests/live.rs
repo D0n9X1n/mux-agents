@@ -3606,6 +3606,10 @@ exec claude --dangerously-skip-permissions
         });
         live.wait_place(&bar, "the bar in place at the client's size");
         live.after_redraw(&bar);
+        // A default-shell that is no POSIX shell (QA #91): the popup runs /bin/sh itself.
+        if std::path::Path::new("/bin/tcsh").exists() {
+            live.call(&["set-option", "-g", "default-shell", "/bin/tcsh"]);
+        }
         live.call(&["send-keys", "-t", &bar, "-l", "p"]);
         // The peek files in the state folder.
         let peeks = |live: &Live| {
