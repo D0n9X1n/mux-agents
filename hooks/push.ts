@@ -4,12 +4,15 @@
 // says to read.
 import type { EngineInterface } from 'claude-code'
 
-// The whole command is one run of this plugin's own entry's send: optionally after `& `, `sh ` or `cmd /d /c `, the
-// entry as a literal path (quoted, or unquoted without expansion or glob characters), the verb, then arguments with no
-// separator, pipe, redirection, `$` or backquote. So the stdout read below is the entry's own reply, never a file or
-// another program's (a grep that names the entry, `printf${IFS}…/mux-agent`).
-const ONE_SEND = /^\s*(?:&\s*|sh\s+|cmd(?:\.exe)?\s+\/d\s+\/c\s+)?(?:"([^"]+)"|'([^']+)'|([A-Za-z0-9_.\/:\\-]+))\s+["']?send["']?\s/i
-const SHELL = /[;&|<>`$\r\n]/
+// The whole command is one run of this plugin's own entry's send, every word a literal no shell reads: in sh, cmd
+// and the Windows shell tool alike, nothing in it runs, expands or prints, so the stdout read below is the entry's own
+// reply, never a file's or another program's (a grep naming the entry, `printf${IFS}…`, a `(…)` expression). A word
+// is plain characters, or plain characters and spaces in '…' or "…" (no \ before the closing ", which bash reads as an
+// escape). Optionally after `& `, `sh ` or `cmd /d /c `; the first word is the entry's path.
+const PLAIN = String.raw`[A-Za-z0-9_./:\\=+,-]`
+const WORD = String.raw`(?:${PLAIN}+|'(?:${PLAIN}| )*'|"(?:[A-Za-z0-9_./:=+, -]|\\(?!"))*")`
+// Words part at spaces and tabs only: a line break would start a second command.
+const ONE_SEND = new RegExp(String.raw`^[ \t]*(?:&[ \t]*|sh[ \t]+|cmd[ \t]+/d[ \t]+/c[ \t]+)?(${WORD})[ \t]+send((?:[ \t]+${WORD})*)[ \t]*$`)
 // The files the entry is under the plugin root: the shims, or a binary the shim runs.
 const ENTRY_FILE = /^\/(scripts\/mux-agent(\.cmd)?|scripts\/bin\/[a-z0-9_-]+\/mux-agent(\.exe)?|target\/release\/mux-agent(\.exe)?)$/
 // As checks::session_id: either case.
@@ -38,9 +41,9 @@ export function sendReply(command: string, stdout: string | undefined, root: str
 // is a character of a file name, never a folder.
 export function isEntrySend(command: string, root: string): boolean {
   const m = ONE_SEND.exec(command)
-  if (!m || !root || SHELL.test(command.replace(/^\s*&\s*/, ''))) return false
+  if (!m || !root) return false
   const windows = !root.startsWith('/')
-  let path = m[1] ?? m[2] ?? m[3]
+  let path = m[1].replace(/^['"]|['"]$/g, '')
   let base = root
   if (windows) {
     path = path.replace(/\\/g, '/').toLowerCase()

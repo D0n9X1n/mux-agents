@@ -31,6 +31,8 @@ test('only a command that is one run of this plugin\'s entry\'s send is trusted 
     'sh "/p/scripts/mux-agent" send parent -BodyFile b.md',
     "'/p/target/release/mux-agent' send w1 -Body hi",
     '"/p/scripts/bin/darwin-arm64/mux-agent" send w1 -Body hi',
+    `"/p/scripts/mux-agent" send parent -Body 'all done, see /tmp/out.md' -Kind x`,
+    '"/p/scripts/mux-agent" send w1 -Body "tests pass: 12 of 12"',
   ]) expect(sendReply(cmd, reply({}), '/p')).toEqual({ from: 'root', session: SID })
   for (const cmd of [
     '& "C:/My Plugins/mux/scripts/mux-agent.cmd" send w1 -BodyFile b.md',
@@ -61,6 +63,19 @@ test('only a command that is one run of this plugin\'s entry\'s send is trusted 
     '/p/scripts/mux-agen? send w1 -Body hi',
     '"/p/scripts/mux-agent" send w1 -Body "$HOME"',
     '"$P/scripts/mux-agent" send w1 -Body hi',
+    // A word some shell reads: an expression, variable, subexpression, splat or script block, cmd's
+    // %VAR% and ^, smart quotes, history, an escaped closing quote, a glob.
+    `${CMD} ([Console]::WriteLine('${reply({})}'))`,
+    `${CMD} -Body:([Console]::WriteLine('x'))`,
+    `${CMD} -Body @args`,
+    `${CMD} -Body {x}`,
+    `${CMD} -Body %PATH%`,
+    `${CMD} -Body a^b`,
+    `${CMD} -Body ‘x’`,
+    `${CMD} -Body "!!"`,
+    `${CMD} -Body "x\\" y`,
+    `${CMD} -Body *`,
+    `${CMD} -Body 'it''s'`,
     // On POSIX a \ is part of a file name and case matters: another file than the entry.
     '"/p\\scripts\\mux-agent" send w1 -Body hi',
     '"/p/scripts\\mux-agent" send w1 -Body hi',
