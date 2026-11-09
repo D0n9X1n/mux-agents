@@ -2,6 +2,7 @@ import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register, Timer } from 'claude-code'
 
 import { activity } from './activity'
+import { pushAfterSend } from './push'
 import { EMPTY, formatAge, isSpawn, look, mail, needYou, parseList, sections } from './board'
 
 const PANE = 'mux-agents'
@@ -176,7 +177,11 @@ export const register: Register = on => {
     const tool = String(e.tool)
     if ((tool === 'Bash' || tool === 'PowerShell') && ran.deny === undefined && ran.isError !== true) {
       const stdout = (ran.result as { stdout?: unknown } | undefined)?.stdout
-      openAfterSpawn($, String((e as { command?: unknown }).command ?? ''), typeof stdout === 'string' ? stdout : undefined).catch(() => {})
+      const command = String((e as { command?: unknown }).command ?? '')
+      const out = typeof stdout === 'string' ? stdout : undefined
+      openAfterSpawn($, command, out).catch(() => {})
+      // A send to a Claude Code session wakes it at once, as herdr delivers a message (#92).
+      pushAfterSend($, command, out)
     }
     return ran
   })

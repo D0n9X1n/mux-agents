@@ -79,6 +79,25 @@ pub fn send(ctx: &Ctx, request: &Request) -> Res<Map<String, Value>> {
         );
     }
     let key = registry::mailbox_of(&snapshot, &pane)?;
+    // The recipient's Claude Code session, when it is one: a running Claude agent's own, or (to `parent`) the session
+    // its spawner recorded. The sender's hooks wake it with it (#92).
+    let claude = |record: &Value, field: &str| {
+        let id = record.get(field).and_then(Value::as_str)?;
+        crate::checks::session_id(id).then(|| id.to_string())
+    };
+    let to_session = match snapshot.at(&pane) {
+        Some(agent) if agent.record.get("client").and_then(Value::as_str) == Some("claude") => {
+            claude(&agent.record, "sessionId")
+        }
+        Some(_) => None,
+        None if target == "parent" => me
+            .record
+            .as_ref()
+            .and_then(|r| r.get("parentAgent"))
+            .filter(|p| p.get("client").and_then(Value::as_str) == Some("claude"))
+            .and_then(|p| claude(p, "sessionId")),
+        None => None,
+    };
     let deliver = || {
         let id = add_mail(ctx, &caller, &key, &me.name, &caller.pane, &body, None)?;
         if me.record.is_some() {
@@ -105,6 +124,11 @@ pub fn send(ctx: &Ctx, request: &Request) -> Res<Map<String, Value>> {
     reply.insert("to".into(), target.into());
     reply.insert("pane".into(), pane.into());
     reply.insert("id".into(), id.into());
+    reply.insert("from".into(), me.name.clone().into());
+    reply.insert(
+        "toSessionId".into(),
+        to_session.map_or(Value::Null, Value::from),
+    );
     Ok(reply)
 }
 
@@ -1728,6 +1752,64 @@ mod tests {
         run(&w, read, &["read", "-Wait", "1"]);
         let agents = w.state().join("agents");
         assert_eq!(std::fs::read_dir(agents).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn send_names_the_sender_and_a_claude_recipients_session() {
+        // #92: the reply names who sent it and, for a Claude Code recipient, its session, so the sender's hooks can
+        // wake it (herdr delivers a message as the recipient's next input); the mailbox stays the message itself.
+        const CHILD: &str = "11111111-2222-4333-8444-555555555555";
+        const ROOT: &str = "66666666-7777-4888-8999-aaaaaaaaaaaa";
+        let mut w = rotated("", "%1");
+        let tmux = w.ctx.env.get("TMUX").unwrap().to_string();
+        w.ctx.env =
+            crate::ctx::Env::from_pairs([("TMUX", tmux.clone()), ("TMUX_PANE", "%1".into())]);
+        w.panes(&[
+            "%1|@1|100||",
+            "%9|@5|300|aaaaaaaaaaaa|a",
+            "%8|@5|301|bbbbbbbbbbbb|b",
+        ]);
+        w.agent_record(ID, json!({"name": "a", "pane": "%9", "parentPane": "%1", "client": "claude",
+            "sessionId": CHILD, "parentAgent": {"client": "claude", "pid": 1, "start": 1, "sessionId": ROOT}}));
+        w.agent_record(
+            "bbbbbbbbbbbb",
+            json!({"name": "b", "pane": "%8", "parentPane": "%1", "client": "copilot",
+            "sessionId": CHILD}),
+        );
+        let field = |reply: &str, key: &str| -> Value {
+            let json: Value = serde_json::from_str(reply.strip_prefix("ok ").unwrap()).unwrap();
+            json[key].clone()
+        };
+        // The root to a Claude agent: its session; the sender is the root, as its mail names it.
+        let sent = run(&w, send, &["send", "a", "-Body", "hi"]);
+        assert_eq!(
+            (field(&sent, "from"), field(&sent, "toSessionId")),
+            (json!("root"), json!(CHILD)),
+            "{sent}"
+        );
+        // To a Copilot agent: no Claude session to wake.
+        let sent = run(&w, send, &["send", "b", "-Body", "hi"]);
+        assert_eq!(field(&sent, "toSessionId"), Value::Null, "{sent}");
+        // From agent a to its parent, the root Claude session it was spawned from.
+        w.ctx.env =
+            crate::ctx::Env::from_pairs([("TMUX", tmux.clone()), ("TMUX_PANE", "%9".into())]);
+        let sent = run(&w, send, &["send", "parent", "-Body", "done"]);
+        assert_eq!(
+            (field(&sent, "from"), field(&sent, "toSessionId")),
+            (json!("a"), json!(ROOT)),
+            "{sent}"
+        );
+        // A session id that is not one is never answered.
+        w.agent_record(
+            ID,
+            json!({"name": "a", "pane": "%9", "parentPane": "%1", "client": "claude",
+            "sessionId": "x; rm -rf /", "parentAgent": {"client": "claude", "sessionId": "nope"}}),
+        );
+        let sent = run(&w, send, &["send", "parent", "-Body", "done"]);
+        assert_eq!(field(&sent, "toSessionId"), Value::Null, "{sent}");
+        w.ctx.env = crate::ctx::Env::from_pairs([("TMUX", tmux), ("TMUX_PANE", "%1".into())]);
+        let sent = run(&w, send, &["send", "a", "-Body", "hi"]);
+        assert_eq!(field(&sent, "toSessionId"), Value::Null, "{sent}");
     }
 
     #[test]
