@@ -1605,7 +1605,11 @@ fn act(
                 Act::Redraw => true,
                 Act::Focus(target) => {
                     match focus_pane(ctx, caller, &target.name, Some(&target.pane)) {
-                        Ok(_) => pick.focused(),
+                        Ok(_) => {
+                            pick.focused();
+                            // A next key of the same read steps on from here.
+                            shown.looking = Some(target.pane.clone());
+                        }
                         Err(_) => pick.failed(&target.name),
                     }
                     true
@@ -1618,10 +1622,14 @@ fn act(
 /// Lines a peek shows: the screen and some history.
 const PEEK_LINES: i32 = 200;
 
+/// How long a peek file may stay: a popup closed by force leaves its file, which a later peek deletes once older.
+const PEEK_KEEP: Duration = Duration::from_secs(60);
+
 /// herdr's peek: the agent's last lines, captured as `read <name> -Lines` captures them (only while its pane is its
 /// own live launch), into a private file of the state folder, shown in a popup over the session's client that pages
-/// it and deletes it when closed. Earlier peek files a closed popup left behind go first. The popup is started in
-/// the background (`run-shell -b -C`), since display-popup answers only once it closes and the bar must not wait.
+/// it and deletes it when closed. Peek files a popup closed by force left behind, older than PEEK_KEEP, go first. The
+/// popup is started in the background (`run-shell -b -C`), since display-popup answers only once it closes and the
+/// bar must not wait; so a popup that fails to open is not seen here, and its file goes with the next sweep.
 fn peek(ctx: &Ctx, caller: &Caller, target: &Target) -> Res<()> {
     let pane = crate::agents::registry::find_reaped(ctx, caller, &target.name)?;
     if pane.pane != target.pane {
@@ -1644,8 +1652,13 @@ fn peek(ctx: &Ctx, caller: &Caller, target: &Target) -> Res<()> {
         );
     }
     let text = crate::agents::message::capture(ctx, &pane, PEEK_LINES)?;
+    let now = SystemTime::now();
     for old in std::fs::read_dir(&folder).into_iter().flatten().flatten() {
-        if old.file_name().to_string_lossy().starts_with("peek-") {
+        let stale = old
+            .metadata()
+            .and_then(|m| m.modified())
+            .is_ok_and(|at| now.duration_since(at).is_ok_and(|age| age > PEEK_KEEP));
+        if stale && old.file_name().to_string_lossy().starts_with("peek-") {
             let _ = std::fs::remove_file(old.path());
         }
     }
@@ -1653,12 +1666,16 @@ fn peek(ctx: &Ctx, caller: &Caller, target: &Target) -> Res<()> {
         "peek-{}.txt",
         crate::util::guid()?.replace('-', "")
     ));
-    std::fs::write(&file, format!("{text}\n"))?;
+    // The name closes the text, where the pager opens: tmux 3.2 popups have no title.
+    std::fs::write(
+        &file,
+        format!("{text}\n-- peek: {} (q closes) --\n", target.name),
+    )?;
     let Some(path) = file.to_str() else {
         let _ = std::fs::remove_file(&file);
         return refuse(1, "internal", "the peek file's path is not text");
     };
-    let popup = popup_argv(&caller.pane, &target.name, path, crate::state::root::HOST);
+    let popup = popup_argv(&caller.pane, path, crate::state::root::HOST);
     let popup = popup
         .iter()
         .map(|a| format!("'{a}'"))
@@ -1684,10 +1701,10 @@ fn plain_path(path: &str, os: crate::state::root::OsKind) -> bool {
     })
 }
 
-/// The popup that pages `path` (a `plain_path`) over the client showing `bar`'s session, titled with the agent's
-/// name, then deletes it: `less` from the end on Unix, `type` and a key on Windows. No argument holds a `'`, so each
-/// goes to `run-shell -C` in single quotes.
-fn popup_argv(bar: &str, name: &str, path: &str, os: crate::state::root::OsKind) -> Vec<String> {
+/// The popup that pages `path` (a `plain_path`) over the client showing `bar`'s session, then deletes it: `less` from
+/// the end on Unix, `type` and a key on Windows. No argument holds a `'`, so each goes to `run-shell -C` in single
+/// quotes. No -T: tmux 3.2 has none.
+fn popup_argv(bar: &str, path: &str, os: crate::state::root::OsKind) -> Vec<String> {
     let command = match os {
         crate::state::root::OsKind::Unix => {
             format!("less -R +G \"{path}\"; rm -f \"{path}\"")
@@ -1704,8 +1721,6 @@ fn popup_argv(bar: &str, name: &str, path: &str, os: crate::state::root::OsKind)
         "80%",
         "-h",
         "80%",
-        "-T",
-        &format!(" {name} "),
         "-E",
         &command,
     ]
@@ -3487,7 +3502,7 @@ mod tests {
     #[test]
     fn popup_pages_the_file_and_deletes_it_quoted_per_os() {
         use crate::state::root::OsKind;
-        let unix = popup_argv("%7", "w1", "/s/my state/peek-1.txt", OsKind::Unix);
+        let unix = popup_argv("%7", "/s/my state/peek-1.txt", OsKind::Unix);
         assert_eq!(
             unix,
             [
@@ -3498,8 +3513,6 @@ mod tests {
                 "80%",
                 "-h",
                 "80%",
-                "-T",
-                " w1 ",
                 "-E",
                 r#"less -R +G "/s/my state/peek-1.txt"; rm -f "/s/my state/peek-1.txt""#
             ]
@@ -3521,11 +3534,38 @@ mod tests {
         }
         assert!(!plain_path(r"C:\qa&echo x&rem", OsKind::Windows));
         assert!(!plain_path(r"C:\a%PATH%", OsKind::Windows));
-        let windows = popup_argv("%7", "w1", r"C:\s\peek-1.txt", OsKind::Windows);
+        let windows = popup_argv("%7", r"C:\s\peek-1.txt", OsKind::Windows);
         assert_eq!(
-            windows[10],
+            windows[8],
             r#"cmd /d /c "type "C:\s\peek-1.txt" & pause & del "C:\s\peek-1.txt"""#
         );
+    }
+
+    // The Windows popup command run as the popup runs it, through cmd, on a real Windows host: it shows the text,
+    // its `pause` takes a key (here the end of stdin) and the file is deleted, from a folder with a space.
+    #[cfg(windows)]
+    #[test]
+    fn windows_popup_command_shows_then_deletes_the_file() {
+        use crate::state::root::OsKind;
+        let dir = std::env::temp_dir().join(format!("mux peek {}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("peek-1.txt");
+        std::fs::write(&file, "line one\n-- peek: w1 (q closes) --\n").unwrap();
+        let path = file.to_str().unwrap();
+        assert!(plain_path(path, OsKind::Windows), "{path}");
+        let argv = popup_argv("%7", path, OsKind::Windows);
+        let command = argv.last().unwrap();
+        // As the popup's shell gets it: one command line, cmd's own quoting, no Rust argument quoting.
+        use std::os::windows::process::CommandExt;
+        let out = std::process::Command::new(std::env::var("ComSpec").unwrap())
+            .raw_arg(format!("/d /c {command}"))
+            .stdin(std::process::Stdio::null())
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(stdout.contains("-- peek: w1 (q closes) --"), "{out:?}");
+        assert!(!file.exists(), "{out:?}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -3555,9 +3595,7 @@ mod tests {
         assert_eq!(run[2..4], ["-b", "-C"]);
         let popup = &run[4];
         assert!(
-            popup.starts_with(
-                "'display-popup' '-t' '%1' '-w' '80%' '-h' '80%' '-T' ' worker ' '-E' '"
-            ),
+            popup.starts_with("'display-popup' '-t' '%1' '-w' '80%' '-h' '80%' '-E' '"),
             "{popup}"
         );
         // The text is in a private peek file of the state folder, which the popup deletes when closed.
@@ -3570,14 +3608,30 @@ mod tests {
         assert_eq!(files.len(), 1);
         assert_eq!(
             std::fs::read_to_string(files[0].path()).unwrap(),
-            "line one\nline two\n"
+            "line one\nline two\n-- peek: worker (q closes) --\n"
         );
         assert!(
             popup.contains(files[0].path().to_str().unwrap()),
             "{popup:?}"
         );
-        // A second peek first deletes the file a popup closed by force left behind.
+        // A second peek keeps a file another popup may still be opening, and deletes one older than PEEK_KEEP that
+        // a popup closed by force left behind.
         let first = files[0].path();
+        peek(&w.ctx, &caller, &target).unwrap();
+        assert!(first.exists());
+        let old = std::time::SystemTime::now() - PEEK_KEEP - std::time::Duration::from_secs(1);
+        for f in std::fs::read_dir(&folder)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|e| e.file_name().to_string_lossy().starts_with("peek-"))
+        {
+            std::fs::File::options()
+                .write(true)
+                .open(f.path())
+                .unwrap()
+                .set_modified(old)
+                .unwrap();
+        }
         peek(&w.ctx, &caller, &target).unwrap();
         assert!(!first.exists());
         let peeks = |folder: &std::path::Path| {
@@ -3588,10 +3642,10 @@ mod tests {
                 .count()
         };
         assert_eq!(peeks(&folder), 1);
-        // No popup: every peek file goes and peek fails; a moved agent is never read.
+        // No popup: its file goes and peek fails; a moved agent is never read.
         w.fakes.mux_first("run-shell", 1, "", "no current client");
         assert!(peek(&w.ctx, &caller, &target).is_err());
-        assert_eq!(peeks(&folder), 0);
+        assert_eq!(peeks(&folder), 1);
         // A state folder whose path the multiplexer or a shell would read: no capture, no popup.
         let mut odd = World::human("");
         odd.ctx.state_root = odd.ctx.state_root.join("#{@x}");
@@ -4555,6 +4609,25 @@ mod tests {
         let w = click_world(&["live", "live", "live", "gone"], board_answer());
         two_writers(&w);
         let script = Script::new(&w.fakes, vec![(300, key(b"nn"))]);
+        let (ended, _, _) = watch_with(&w, Box::new(script));
+        assert_eq!(ended, "pane-closed");
+        let targets: Vec<String> = w
+            .fakes
+            .mux_calls()
+            .iter()
+            .filter(|c| c[1] == "if-shell")
+            .map(|c| c[4].clone())
+            .collect();
+        assert_eq!(targets.len(), 2, "{targets:?}");
+        assert_ne!(targets[0], targets[1], "{targets:?}");
+    }
+
+    #[test]
+    fn next_after_enter_in_one_read_steps_on_from_the_agent_entered() {
+        // `j`, Enter, `n` in one read: Enter switches to the first agent, then n to the one after it.
+        let w = click_world(&["live", "live", "live", "gone"], board_answer());
+        two_writers(&w);
+        let script = Script::new(&w.fakes, vec![(300, key(b"j\rn"))]);
         let (ended, _, _) = watch_with(&w, Box::new(script));
         assert_eq!(ended, "pane-closed");
         let targets: Vec<String> = w

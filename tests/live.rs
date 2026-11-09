@@ -3903,4 +3903,7 @@ exec claude --dangerously-skip-permissions
             bar_real_client_peek,
         ]
     );
+
+    // tmux 3.2a's display-popup has no -T (QA #91): peek works there too.
+    tests_on!(tmux32_peek, Tmux32, [bar_real_client_peek]);
 }
