@@ -1,6 +1,6 @@
 //! The agent verbs over the per-server state folder: registry, mailboxes, exit notices, board and messages.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use serde_json::Value;
 
@@ -18,6 +18,15 @@ pub mod spawn;
 pub mod view;
 
 /// `<root>/<serverKey>`; reads use it as is and never create it.
+/// True when the agent in `folder` is committed: commit.json is there and is no launcher's give-up (#97). Spawn and
+/// the launcher each try to make commit.json once, whole; the launcher's says `"aborted": true`.
+pub(crate) fn committed(folder: &Path) -> bool {
+    match crate::state::fs::read_json(&folder.join("commit.json")) {
+        Ok(Some(commit)) => commit.get("aborted") != Some(&Value::Bool(true)),
+        _ => false,
+    }
+}
+
 pub(crate) fn server_dir(ctx: &Ctx, caller: &Caller) -> PathBuf {
     ctx.state_root.join(&caller.server_key)
 }

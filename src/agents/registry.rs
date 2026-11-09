@@ -256,7 +256,7 @@ impl Snapshot {
             let Some(record) = own_record(ctx, caller, &id).ok().flatten() else {
                 continue;
             };
-            let committed = folder.join("commit.json").is_file();
+            let committed = super::committed(&folder);
             let noticed = folder.join("notice.json").exists();
             let pane = super::text(record.get("pane"));
             let row = rows.iter().find(|r| r.pane == pane).cloned();
@@ -759,7 +759,7 @@ pub fn reap(
                 did |= super::lock(ctx, &super::lock_key("notice", caller, &agent.id), || {
                     // A commit that landed while reap waited for the locks makes it a live agent's; the age is
                     // checked again under them.
-                    if agents_dir.join(&agent.id).join("commit.json").exists()
+                    if super::committed(&agents_dir.join(&agent.id))
                         || !stale(ctx, caller, &agent.id)
                     {
                         return Ok(false);
@@ -812,7 +812,7 @@ fn worth_listing(ctx: &Ctx, caller: &Caller) -> Res<bool> {
             continue;
         }
         let noticed = folder.join("notice.json").exists();
-        let committed = folder.join("commit.json").is_file();
+        let committed = super::committed(&folder);
         if !noticed && (committed || stale(ctx, caller, &id)) {
             return Ok(true);
         }

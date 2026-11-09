@@ -223,9 +223,9 @@ fn launch(
     Ok(code)
 }
 
-/// True once commit.json exists; false at once for abort.json. At 30 s the launch is decided `abort`, unless spawn
-/// decided `commit` first (#97): its record is written by then and commit.json is its next write, so the client
-/// starts now, and a spawn that answered ok always has one. Nothing waits on a spawn after the decision.
+/// True once the agent is committed; false at once for abort.json. At 30 s the launcher makes commit.json itself as
+/// its give-up (`"aborted": true`), so a spawn can no longer commit; if the spawn's commit was there first, that is
+/// the answer (#97). commit.json is made once, whole, by whichever comes first.
 fn wait_commit(ctx: &Ctx, folder: &Path) -> bool {
     let deadline = ctx.clock.now() + COMMIT_WAIT;
     loop {
@@ -233,12 +233,14 @@ fn wait_commit(ctx: &Ctx, folder: &Path) -> bool {
             return false;
         }
         if folder.join("commit.json").is_file() {
-            return true;
+            return crate::agents::committed(folder);
         }
         if ctx.clock.now() >= deadline {
-            let decided =
-                crate::state::fs::decide(&folder.join(crate::agents::spawn::DECIDED), "abort");
-            return decided.as_deref() == Ok("commit");
+            let gave_up = crate::state::fs::claim_json(
+                &folder.join("commit.json"),
+                &json!({"aborted": true, "at": utc_o(ctx.clock.now())}),
+            );
+            return gave_up.is_ok_and(|made| !made) && crate::agents::committed(folder);
         }
         ctx.clock.sleep(COMMIT_POLL);
     }
@@ -575,26 +577,19 @@ mod tests {
     }
 
     #[test]
-    fn a_timed_out_launcher_decides_abort_once_and_a_spawn_that_decided_first_wins() {
-        // Timed out with no commit and no decision: it decides abort, so a late spawn can no longer commit (#97).
+    fn a_timed_out_launcher_makes_commit_json_as_its_give_up_unless_the_spawn_did() {
+        // Timed out with no commit: it makes commit.json as its give-up, so a late spawn can no longer commit (#97).
         let l = setup("claude", json!([]));
         std::fs::remove_file(l.folder.join("commit.json")).unwrap();
         assert_eq!(launch(&l, &spec_str(&l), exits_7).code, 1);
-        assert_eq!(
-            std::fs::read_to_string(l.folder.join("decided")).unwrap(),
-            "abort"
-        );
-        // Timed out after the spawn decided commit, before its commit.json: the client starts at once, with no
-        // further wait (a stalled or dead spawn cannot make it give up on an agent the spawn reported).
+        assert_eq!(launcher_json(&l)["aborted"], true);
+        assert!(!crate::agents::committed(&l.folder));
+        assert!(!crate::state::fs::claim_json(&l.folder.join("commit.json"), &json!({})).unwrap());
+        // A give-up already there (another launcher's): no client.
         let l = setup("claude", json!([]));
-        std::fs::remove_file(l.folder.join("commit.json")).unwrap();
-        std::fs::write(l.folder.join("decided"), "commit").unwrap();
-        assert_eq!(launch(&l, &spec_str(&l), exits_7).code, 7);
-        assert_eq!(l.w.fakes.slept(), vec![250; 120]);
-        assert_eq!(
-            std::fs::read_to_string(l.folder.join("decided")).unwrap(),
-            "commit"
-        );
+        write(&l.folder.join("commit.json"), json!({"aborted": true}));
+        assert_eq!(launch(&l, &spec_str(&l), exits_7).code, 1);
+        assert!(l.w.fakes.slept().is_empty());
     }
 
     #[test]

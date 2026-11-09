@@ -37,20 +37,19 @@ pub fn write_json_with(
     Ok(written?)
 }
 
-/// One decision two processes race for: the first to make `path` wins, and its choice stands. Answers the choice
-/// that stands, this one or the one already there (#97: spawn's commit against the launcher's give-up). The choice
-/// is written whole beside `path`, then hard-linked to it: the link appears with its content or fails because
-/// `path` exists, so `path` is never seen empty and exactly one link wins.
-pub fn decide(path: &Path, choice: &str) -> Res<String> {
+/// Makes `path` hold `value` only if nothing is there yet: true when this call made it, false when it already
+/// existed. The JSON is written whole beside `path`, then hard-linked to it, so `path` appears with its content or
+/// not at all, and of two racers exactly one makes it (#97: spawn's commit against the launcher's give-up).
+pub fn claim_json(path: &Path, value: &Value) -> Res<bool> {
     let mut name = path.as_os_str().to_owned();
     name.push(format!(".{}.tmp", crate::util::guid()?.replace('-', "")));
     let tmp = PathBuf::from(name);
-    write_new(&tmp, choice.as_bytes())?;
+    write_new(&tmp, value.to_string().as_bytes())?;
     let linked = std::fs::hard_link(&tmp, path);
     let _ = std::fs::remove_file(&tmp);
     match linked {
-        Ok(()) => Ok(choice.to_string()),
-        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => Ok(std::fs::read_to_string(path)?),
+        Ok(()) => Ok(true),
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => Ok(false),
         Err(e) => Err(e.into()),
     }
 }
@@ -158,30 +157,38 @@ mod tests {
     }
 
     #[test]
-    fn decide_lets_the_first_choice_stand_and_leaves_no_tmp() {
+    fn claim_json_makes_a_file_once_whole_and_leaves_no_tmp() {
         let dir = TempDir::new();
-        let path = dir.path().join("decided");
-        assert_eq!(decide(&path, "commit").unwrap(), "commit");
-        assert_eq!(decide(&path, "abort").unwrap(), "commit");
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), "commit");
+        let path = dir.path().join("commit.json");
+        assert!(claim_json(&path, &serde_json::json!({"a": 1})).unwrap());
+        assert!(!claim_json(&path, &serde_json::json!({"b": 2})).unwrap());
+        assert_eq!(
+            read_json(&path).unwrap().unwrap(),
+            serde_json::json!({"a": 1})
+        );
         let names: Vec<_> = std::fs::read_dir(dir.path())
             .unwrap()
             .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
             .collect();
-        assert_eq!(names, ["decided"]);
-        // Many racers: exactly one choice stands, and every racer answers it.
-        let path = dir.path().join("race");
-        let answers: Vec<String> = std::thread::scope(|scope| {
+        assert_eq!(names, ["commit.json"]);
+        // Many racers: exactly one makes it, and the file is that one's whole JSON.
+        let path = dir.path().join("race.json");
+        let made: Vec<(usize, bool)> = std::thread::scope(|scope| {
             let racers: Vec<_> = (0..16)
                 .map(|n| {
                     let path = &path;
-                    scope.spawn(move || decide(path, &format!("c{n}")).unwrap())
+                    scope
+                        .spawn(move || (n, claim_json(path, &serde_json::json!({"n": n})).unwrap()))
                 })
                 .collect();
             racers.into_iter().map(|r| r.join().unwrap()).collect()
         });
-        let stands = std::fs::read_to_string(&path).unwrap();
-        assert!(answers.iter().all(|a| *a == stands), "{answers:?} {stands}");
+        let winners: Vec<usize> = made.iter().filter(|m| m.1).map(|m| m.0).collect();
+        assert_eq!(winners.len(), 1, "{made:?}");
+        assert_eq!(
+            read_json(&path).unwrap().unwrap(),
+            serde_json::json!({"n": winners[0]})
+        );
     }
 
     #[test]
