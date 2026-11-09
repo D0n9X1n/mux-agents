@@ -7,32 +7,36 @@ const reply = (fields: object) => JSON.stringify({ ok: true, verb: 'send', to: '
 const CMD = '"/p/scripts/mux-agent" send w1 -BodyFile b.md'
 
 test('sendReply takes a successful send\'s sender and Claude recipient session, nothing else', () => {
-  expect(sendReply(CMD, reply({}))).toEqual({ from: 'root', session: SID })
-  expect(sendReply('sh /p/scripts/mux-agent send parent -BodyFile b.md', `noise\n${reply({ from: 'w2' })}\r\n`)).toEqual({ from: 'w2', session: SID })
+  expect(sendReply(CMD, reply({}), '/p')).toEqual({ from: 'root', session: SID })
+  expect(sendReply('sh /p/scripts/mux-agent send parent -BodyFile b.md', `noise\n${reply({ from: 'w2' })}\r\n`, '/p')).toEqual({ from: 'w2', session: SID })
   // Not send, not the entry, refused, no session (a Copilot recipient), a bad session or a bad name: nothing.
-  expect(sendReply('"/p/scripts/mux-agent" list', reply({}))).toBeUndefined()
-  expect(sendReply('echo mux-agents send', reply({}))).toBeUndefined()
-  expect(sendReply(CMD, reply({ ok: false }))).toBeUndefined()
-  expect(sendReply(CMD, reply({ verb: 'read' }))).toBeUndefined()
-  expect(sendReply(CMD, reply({ toSessionId: null }))).toBeUndefined()
-  expect(sendReply(CMD, reply({ toSessionId: 'x; rm -rf /' }))).toBeUndefined()
-  expect(sendReply(CMD, reply({ from: 'Evil"/>' }))).toBeUndefined()
-  expect(sendReply(CMD, undefined)).toBeUndefined()
-  expect(sendReply(CMD, 'not json')).toBeUndefined()
+  expect(sendReply('"/p/scripts/mux-agent" list', reply({}), '/p')).toBeUndefined()
+  expect(sendReply('echo mux-agents send', reply({}), '/p')).toBeUndefined()
+  expect(sendReply(CMD, reply({ ok: false }), '/p')).toBeUndefined()
+  expect(sendReply(CMD, reply({ verb: 'read' }), '/p')).toBeUndefined()
+  expect(sendReply(CMD, reply({ toSessionId: null }), '/p')).toBeUndefined()
+  expect(sendReply(CMD, reply({ toSessionId: 'x; rm -rf /' }), '/p')).toBeUndefined()
+  expect(sendReply(CMD, reply({ from: 'Evil"/>' }), '/p')).toBeUndefined()
+  expect(sendReply(CMD, undefined, '/p')).toBeUndefined()
+  expect(sendReply(CMD, 'not json', '/p')).toBeUndefined()
   // Checked ids in either case, as the entry checks them.
-  expect(sendReply(CMD, reply({ toSessionId: SID.toUpperCase() }))).toEqual({ from: 'root', session: SID.toUpperCase() })
+  expect(sendReply(CMD, reply({ toSessionId: SID.toUpperCase() }), '/p')).toEqual({ from: 'root', session: SID.toUpperCase() })
 })
 
-test('only a command that is one run of the entry\'s send is trusted with its stdout', () => {
-  // The forms the skill and the Reply line give: sh, & and cmd.
+test('only a command that is one run of this plugin\'s entry\'s send is trusted with its stdout', () => {
+  // The forms the skill and the Reply line give: sh, & and cmd; the shims or a binary the shim runs.
   for (const cmd of [
     CMD,
-    "'/p/my dir/scripts/mux-agent' send w1 -Body hi",
     '/p/scripts/mux-agent send parent -BodyFile b.md',
     'sh "/p/scripts/mux-agent" send parent -BodyFile b.md',
-    '& "C:/p/scripts/mux-agent.cmd" send w1 -BodyFile b.md',
-    'cmd /d /c "C:\\p\\scripts\\mux-agent.cmd" send w1 -BodyFile b.md',
-  ]) expect(sendReply(cmd, reply({}))).toEqual({ from: 'root', session: SID })
+    "'/p/target/release/mux-agent' send w1 -Body hi",
+    '"/p/scripts/bin/darwin-arm64/mux-agent" send w1 -Body hi',
+  ]) expect(sendReply(cmd, reply({}), '/p')).toEqual({ from: 'root', session: SID })
+  for (const cmd of [
+    '& "C:/My Plugins/mux/scripts/mux-agent.cmd" send w1 -BodyFile b.md',
+    'cmd /d /c "C:\\My Plugins\\mux\\scripts\\mux-agent.cmd" send w1 -BodyFile b.md',
+    '& "c:\\my plugins\\MUX\\scripts\\bin\\windows-x64\\mux-agent.exe" send w1 -BodyFile b.md',
+  ]) expect(sendReply(cmd, reply({}), 'C:\\My Plugins\\mux')).toEqual({ from: 'root', session: SID })
   // A command that only names the entry prints what it likes (a file holding a reply): never trusted.
   for (const cmd of [
     "grep -h 'mux-agent send' payload.json",
@@ -46,7 +50,20 @@ test('only a command that is one run of the entry\'s send is trusted with its st
     `${CMD}\ncat payload.json`,
     '"/p/scripts/not-mux-agent" send w1 -Body hi',
     '"/p/scripts/mux-agent" sender w1',
-  ]) expect(sendReply(cmd, reply({}))).toBeUndefined()
+    // Another program by expansion or as the first word, another entry, out of the root, a glob, an expansion.
+    'printf${IFS}\\n%s\\n/p/scripts/mux-agent send x',
+    'printf "\\n%s\\n" /p/scripts/mux-agent send x',
+    '"/other/scripts/mux-agent" send w1 -Body hi',
+    'mux-agent send w1 -Body hi',
+    '"/p/scripts/../evil/scripts/mux-agent" send w1 -Body hi',
+    '"/p/x/scripts/mux-agent" send w1 -Body hi',
+    '"/px/scripts/mux-agent" send w1 -Body hi',
+    '/p/scripts/mux-agen? send w1 -Body hi',
+    '"/p/scripts/mux-agent" send w1 -Body "$HOME"',
+    '"$P/scripts/mux-agent" send w1 -Body hi',
+  ]) expect(sendReply(cmd, reply({}), '/p')).toBeUndefined()
+  // No root, no trust.
+  expect(sendReply(CMD, reply({}), '')).toBeUndefined()
 })
 
 test('the wake-up is a fixed sentence tagged with the sender, never the message', () => {
@@ -59,15 +76,16 @@ test('a send through the Bash tool wakes the recipient session, after the tool a
   on('env.get', () => ({ value: undefined }))
   on('session.send', (_: unknown, e: object) => { sent.push({ ...e }); return { isDelivered: true } })
   on('tool.call', () => ({ result: { stdout, stderr: '', interrupted: false }, text: stdout }))
-  const ran = await $.tool.call({ tool: 'Bash', command: CMD } as any)
+  const cmd = entrySend(await pluginRoot($, on))
+  const ran = await $.tool.call({ tool: 'Bash', command: cmd } as any)
   expect((ran as any).result.stdout).toBe(stdout)
   await new Promise(r => setTimeout(r, 20))
   // The engine spells a { sessionId } address as the id itself; the origin is this plugin.
   expect(sent).toEqual([{ to: SID, text: wakeUp('root'), origin: { kind: 'plugin', name: 'mux-agents' } }])
   // A send to a Copilot agent (no session) or another verb: no push.
   stdout = reply({ toSessionId: null })
-  await $.tool.call({ tool: 'Bash', command: CMD } as any)
-  await $.tool.call({ tool: 'Bash', command: '"/p/scripts/mux-agent" list' } as any)
+  await $.tool.call({ tool: 'Bash', command: cmd } as any)
+  await $.tool.call({ tool: 'Bash', command: cmd.replace(' send w1 -BodyFile b.md', ' list') } as any)
   await new Promise(r => setTimeout(r, 20))
   expect(sent.length).toBe(1)
 })
@@ -78,13 +96,14 @@ test('a send in the other shell tool wakes the recipient too; a denied or failed
   on('env.get', () => ({ value: undefined }))
   on('session.send', (_: unknown, e: object) => { sent.push({ ...e }); return { isDelivered: true } })
   on('tool.call', () => ran)
-  await $.tool.call({ tool: 'PowerShell', command: '& "C:/p/scripts/mux-agent.cmd" send w1 -BodyFile b.md' } as any)
+  const cmd = entrySend(await pluginRoot($, on))
+  await $.tool.call({ tool: 'PowerShell', command: `& ${cmd}` } as any)
   await new Promise(r => setTimeout(r, 20))
   expect(sent.length).toBe(1)
   ran = { deny: reply({}) }
-  await $.tool.call({ tool: 'Bash', command: CMD } as any)
+  await $.tool.call({ tool: 'Bash', command: cmd } as any)
   ran = { isError: true, result: { stdout: reply({}), stderr: '', interrupted: false }, text: 'failed' }
-  await $.tool.call({ tool: 'Bash', command: CMD } as any)
+  await $.tool.call({ tool: 'Bash', command: cmd } as any)
   await new Promise(r => setTimeout(r, 20))
   expect(sent.length).toBe(1)
 })
@@ -94,13 +113,23 @@ test('a push that is refused, throws or never answers never delays or changes th
   on('env.get', () => ({ value: undefined }))
   on('session.send', () => send())
   on('tool.call', () => ({ result: { stdout: reply({}), stderr: '', interrupted: false }, text: 'ok' }))
+  const cmd = entrySend(await pluginRoot($, on))
   for (const answer of [
     () => ({ isDelivered: false, reason: 'no such session' }),
     () => { throw new Error('gone') },
     () => new Promise(() => {}),
   ]) {
     send = answer
-    const ran = await $.tool.call({ tool: 'Bash', command: CMD } as any)
+    const ran = await $.tool.call({ tool: 'Bash', command: cmd } as any)
     expect((ran as any).text).toBe('ok')
   }
 })
+
+// The plugin root as the engine reports it, read through a classic SessionStart's cwd; the entry's send under it.
+async function pluginRoot($: any, on: any) {
+  let root = ''
+  on('classic.SessionStart', (_: unknown, e: { cwd: string }) => { root = e.cwd; return {} })
+  await $.classic.SessionStart({ source: 'startup' })
+  return root
+}
+const entrySend = (root: string) => `"${root}/scripts/mux-agent" send w1 -BodyFile b.md`

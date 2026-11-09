@@ -4,19 +4,22 @@
 // says to read.
 import type { EngineInterface } from 'claude-code'
 
-// The whole command is one run of the entry's send: optionally after `& `, `sh ` or `cmd /d /c `, the entry (quoted or
-// not, any folder), the verb, then arguments with no separator, pipe, redirection or substitution. So the stdout read
-// below is the entry's own reply, never a file or another program a command printed (a grep that names the entry).
-const ONE_SEND = /^\s*(?:&\s*|sh\s+|cmd(?:\.exe)?\s+\/d\s+\/c\s+)?(?:"(?:[^"]*[\\/])?mux-agent(?:\.cmd|\.exe)?"|'(?:[^']*[\\/])?mux-agent(?:\.cmd|\.exe)?'|(?:[^\s"']*[\\/])?mux-agent(?:\.cmd|\.exe)?)\s+["']?send["']?\s/i
-const SHELL = /[;&|<>`\r\n]|\$\(/
+// The whole command is one run of this plugin's own entry's send: optionally after `& `, `sh ` or `cmd /d /c `, the
+// entry as a literal path (quoted, or unquoted without expansion or glob characters), the verb, then arguments with no
+// separator, pipe, redirection, `$` or backquote. So the stdout read below is the entry's own reply, never a file or
+// another program's (a grep that names the entry, `printf${IFS}…/mux-agent`).
+const ONE_SEND = /^\s*(?:&\s*|sh\s+|cmd(?:\.exe)?\s+\/d\s+\/c\s+)?(?:"([^"]+)"|'([^']+)'|([A-Za-z0-9_.\/:\\-]+))\s+["']?send["']?\s/i
+const SHELL = /[;&|<>`$\r\n]/
+// The files the entry is under the plugin root: the shims, or a binary the shim runs.
+const ENTRY_FILE = /^\/(scripts\/mux-agent(\.cmd)?|scripts\/bin\/[a-z0-9_-]+\/mux-agent(\.exe)?|target\/release\/mux-agent(\.exe)?)$/
 // As checks::session_id: either case.
 const SESSION = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
 const NAME = /^([a-z][a-z0-9-]{0,23}|root)$/
 
 // The send reply on one line of stdout: ok, verb send, a sender's name and the recipient's session, or none. Several
 // sends in one command wake no one: each recipient's read -Wait still finds its mail.
-export function sendReply(command: string, stdout: string | undefined): { from: string; session: string } | undefined {
-  if (!ONE_SEND.test(command) || SHELL.test(command.replace(/^\s*&\s*/, ''))) return undefined
+export function sendReply(command: string, stdout: string | undefined, root: string): { from: string; session: string } | undefined {
+  if (!isEntrySend(command, root)) return undefined
   for (const line of (stdout ?? '').replace(/\r\n/g, '\n').split('\n')) {
     if (!line.trim().startsWith('{')) continue
     let reply: unknown
@@ -30,13 +33,22 @@ export function sendReply(command: string, stdout: string | undefined): { from: 
   return undefined
 }
 
+// True when the command is one send by the entry at root, as ONE_SEND says. Paths compare with / for \ and in any case.
+export function isEntrySend(command: string, root: string): boolean {
+  const m = ONE_SEND.exec(command)
+  if (!m || !root || SHELL.test(command.replace(/^\s*&\s*/, ''))) return false
+  const path = (m[1] ?? m[2] ?? m[3]).replace(/\\/g, '/').toLowerCase()
+  const base = root.replace(/\\/g, '/').replace(/\/+$/, '').toLowerCase()
+  return !path.split('/').includes('..') && path.startsWith(base) && ENTRY_FILE.test(path.slice(base.length))
+}
+
 // The wake-up, tagged as herdr tags a child's report: only a fixed sentence and a checked name, never the body.
 export function wakeUp(from: string): string {
   return `<mux-agents from="${from}">You have a new mux-agents message from ${from}. Run your read command to get it.</mux-agents>`
 }
 
 async function push($: EngineInterface, command: string, stdout: string | undefined) {
-  const reply = sendReply(command, stdout)
+  const reply = sendReply(command, stdout, $.plugin.root)
   if (!reply) return
   await $.session.send({ to: { sessionId: reply.session }, text: wakeUp(reply.from) })
 }
