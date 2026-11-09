@@ -88,9 +88,12 @@ test('only a command that is one run of this plugin\'s entry\'s send is trusted 
     '& "C:/My Plugins/mux/scripts/../x/scripts/mux-agent.cmd" send w1 -Body hi',
     '& "C:/My Plugins/mux/scripts/mux-agent.bat" send w1 -Body hi',
   ]) expect(sendReply(cmd, reply({}), 'C:\\My Plugins\\mux')).toBeUndefined()
-  // A POSIX root holding a \: only a quoted path is the file read, since sh removes an unquoted \.
-  expect(sendReply('/p\\x/scripts/mux-agent send w1 -Body hi', reply({}), '/p\\x')).toBeUndefined()
-  expect(sendReply(`'/p\\x/scripts/mux-agent' send w1 -Body hi`, reply({}), '/p\\x')).toEqual({ from: 'root', session: SID })
+  // A POSIX root holding a \: never trusted, since sh may remove it (unquoted, or one of \\ in "…").
+  for (const cmd of [
+    '/p\\x/scripts/mux-agent send w1 -Body hi',
+    '"/p\\\\x/scripts/mux-agent" send w1 -Body hi',
+    `'/p\\x/scripts/mux-agent' send w1 -Body hi`,
+  ]) expect(sendReply(cmd, reply({}), cmd.includes('\\\\') ? '/p\\\\x' : '/p\\x')).toBeUndefined()
   // No root, no trust.
   expect(sendReply(CMD, reply({}), '')).toBeUndefined()
 })

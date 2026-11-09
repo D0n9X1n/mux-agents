@@ -43,8 +43,9 @@ export function isEntrySend(command: string, root: string): boolean {
   const m = ONE_SEND.exec(command)
   if (!m || !root) return false
   const windows = !root.startsWith('/')
-  // In sh an unquoted \ is an escape the shell removes: the file run would not be the path read here.
-  if (!windows && /\\/.test(m[1]) && !/^['"]/.test(m[1])) return false
+  // In sh a \ may be an escape the shell removes (unquoted, or before \ in "…"): the file run would not be the path
+  // read here. A POSIX entry path holding one is never trusted.
+  if (!windows && m[1].includes('\\')) return false
   let path = m[1].replace(/^['"]|['"]$/g, '')
   let base = root
   if (windows) {
