@@ -77,7 +77,9 @@ fn main() -> ExitCode {
         std::process::exit(code);
     }
     let (code, text) = cli::run(&args, ctx);
-    // A closed stdout leaves only the exit code to report with.
-    let _ = write!(std::io::stdout().lock(), "{text}{NL}");
+    // A closed stdout leaves only the exit code to report with. Nothing at all for no text (`report -Quiet`).
+    if !text.is_empty() {
+        let _ = write!(std::io::stdout().lock(), "{text}{NL}");
+    }
     ExitCode::from(code)
 }

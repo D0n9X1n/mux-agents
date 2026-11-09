@@ -284,3 +284,21 @@ fn watch_dispatches_to_watch_handler() {
         )
     );
 }
+
+// #93: a Copilot hook runs `report -Quiet`; the binary prints nothing at all (not even a line end) and exits 0, here
+// outside a multiplexer where report refuses.
+#[test]
+fn report_quiet_prints_no_byte() {
+    let out = Command::new(env!("CARGO_BIN_EXE_mux-agent"))
+        .args(["report", "working", "-Quiet"])
+        .env_remove("TMUX")
+        .env_remove("RMUX")
+        .env_remove("TMUX_PANE")
+        .env_remove("HC_TERMINAL_ID")
+        .output()
+        .unwrap();
+    assert_eq!(
+        (out.status.code(), out.stdout, out.stderr),
+        (Some(0), Vec::new(), Vec::new())
+    );
+}
