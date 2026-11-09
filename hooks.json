@@ -4,7 +4,8 @@
     "userPromptSubmitted": [
       {
         "type": "command",
-        "bash": "sh scripts/mux-agent report working >/dev/null 2>&1 || true",
+        "bash": "sh scripts/mux-agent report working -Quiet",
+        "command": "scripts\\mux-agent.cmd report working -Quiet",
         "timeoutSec": 10
       }
     ],
@@ -12,7 +13,8 @@
       {
         "type": "command",
         "matcher": "ask_user",
-        "bash": "sh scripts/mux-agent report blocked -Kind question >/dev/null 2>&1 || true",
+        "bash": "sh scripts/mux-agent report blocked -Kind question -Quiet",
+        "command": "scripts\\mux-agent.cmd report blocked -Kind question -Quiet",
         "timeoutSec": 10
       }
     ],
@@ -20,7 +22,8 @@
       {
         "type": "command",
         "matcher": "ask_user",
-        "bash": "sh scripts/mux-agent report working >/dev/null 2>&1 || true",
+        "bash": "sh scripts/mux-agent report working -Quiet",
+        "command": "scripts\\mux-agent.cmd report working -Quiet",
         "timeoutSec": 10
       }
     ],
@@ -28,14 +31,16 @@
       {
         "type": "command",
         "matcher": "ask_user",
-        "bash": "sh scripts/mux-agent report working >/dev/null 2>&1 || true",
+        "bash": "sh scripts/mux-agent report working -Quiet",
+        "command": "scripts\\mux-agent.cmd report working -Quiet",
         "timeoutSec": 10
       }
     ],
     "agentStop": [
       {
         "type": "command",
-        "bash": "sh scripts/mux-agent report idle >/dev/null 2>&1 || true",
+        "bash": "sh scripts/mux-agent report idle -Quiet",
+        "command": "scripts\\mux-agent.cmd report idle -Quiet",
         "timeoutSec": 10
       }
     ]

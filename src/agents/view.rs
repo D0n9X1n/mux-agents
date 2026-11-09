@@ -587,7 +587,7 @@ mod tests {
     #[test]
     fn report_only_agent_enum_only() {
         let target = "2 target only an agent reports its activity";
-        let usage = "2 usage usage: mux-agent report <working|blocked|idle> [-Kind <permission|question>] [-Text]";
+        let usage = "2 usage usage: mux-agent report <working|blocked|idle> [-Kind <permission|question>] [-Quiet] [-Text]";
         // A human pane with a tag and a record.
         let w = World::human(ID);
         w.agent_record(ID, json!({"pane": "%1"}));

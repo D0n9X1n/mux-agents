@@ -154,23 +154,24 @@ assert h["version"] == 1, h
 for event, entries in sorted(h["hooks"].items()):
     for e in entries:
         assert e["type"] == "command" and e["timeoutSec"] <= 10, e
-        assert e["bash"].startswith("sh scripts/mux-agent report ") and e["bash"].endswith(">/dev/null 2>&1 || true"), e
-        # No PowerShell anywhere (tests/repo.rs): Copilot on Windows keeps the fallback activity.
-        assert set(e) == {"type", "bash", "timeoutSec"} | ({"matcher"} if "matcher" in e else set()), e
-        words = e["bash"][len("sh scripts/mux-agent "):].split(" >")[0]
+        # Unix runs bash, Windows the portable command (no PowerShell in the repository, tests/repo.rs); both quiet.
+        assert set(e) == {"type", "bash", "command", "timeoutSec"} | ({"matcher"} if "matcher" in e else set()), e
+        assert e["bash"].startswith("sh scripts/mux-agent report ") and e["bash"].endswith(" -Quiet"), e
+        words = e["bash"][len("sh scripts/mux-agent "):]
+        assert e["command"] == "scripts\\mux-agent.cmd " + words, e
         print(f"{event}:{e.get('matcher', '')}:{words}")
 PY
   ) || { bad "$name" "hooks.json shape"; return; }
-  want="agentStop::report idle
-postToolUse:ask_user:report working
-postToolUseFailure:ask_user:report working
-preToolUse:ask_user:report blocked -Kind question
-userPromptSubmitted::report working"
+  want="agentStop::report idle -Quiet
+postToolUse:ask_user:report working -Quiet
+postToolUseFailure:ask_user:report working -Quiet
+preToolUse:ask_user:report blocked -Kind question -Quiet
+userPromptSubmitted::report working -Quiet"
   [ "$got" = "$want" ] || { bad "$name" "events: $got"; return; }
-  # Run as Copilot runs it, from the plugin root, with a binary that records its arguments: the shim passes them on,
-  # and a refusal (here: exit 2) never fails the hook.
+  # Run as Copilot runs it, from the plugin root, with a binary that records its arguments and fails loudly: the shim
+  # passes them on, and the hook needs no shell to quiet it (-Quiet is mux-agent's own).
   fake="$tmp/fake-mux-agent"
-  printf '#!/bin/sh\necho "$*" >> "%s/argv"\nexit 2\n' "$tmp" > "$fake"
+  printf '#!/bin/sh\necho "$*" >> "%s/argv"\nexit 0\n' "$tmp" > "$fake"
   chmod +x "$fake"
   : > "$tmp/argv"
   python3 -c 'import json,sys; [print(e["bash"]) for es in json.load(open(sys.argv[1]))["hooks"].values() for e in es]' "$hooks" |
@@ -178,11 +179,11 @@ userPromptSubmitted::report working"
       (cd "$repo" && MUX_AGENTS_BIN="$fake" sh -c "$cmd") || echo "FAILED $cmd" >> "$tmp/argv"
     done
   ran=$(sort "$tmp/argv")
-  want="report blocked -Kind question
-report idle
-report working
-report working
-report working"
+  want="report blocked -Kind question -Quiet
+report idle -Quiet
+report working -Quiet
+report working -Quiet
+report working -Quiet"
   if [ "$ran" = "$want" ]; then ok "$name"; else bad "$name" "ran: $ran"; fi
 }
 copilot_hooks_report_through_the_shim

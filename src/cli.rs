@@ -142,10 +142,10 @@ pub static VERBS: &[VerbDef] = &[
     VerbDef {
         name: "report",
         values: &["Kind"],
-        switches: &[],
+        switches: &["Quiet"],
         min: 1,
         max: 1,
-        usage: "usage: mux-agent report <working|blocked|idle> [-Kind <permission|question>] [-Text]",
+        usage: "usage: mux-agent report <working|blocked|idle> [-Kind <permission|question>] [-Quiet] [-Text]",
         handler: crate::agents::view::report,
         text: json::lines,
     },
@@ -322,6 +322,17 @@ fn success(def: &VerbDef, data: Map<String, Value>) -> Map<String, Value> {
 /// the tokens (`wants_text`); an unknown verb has neither. A panic in the verb is 1 `internal`; unwinding has already
 /// released its locks.
 pub fn run<C: Borrow<Ctx>>(args: &[String], ctx: impl FnOnce() -> Res<C>) -> (u8, String) {
+    // `report -Quiet` (a client's hook, #93): nothing printed and success whatever happens, so no hook needs a shell
+    // to discard its output or its exit code.
+    let outcome = answer(args, ctx);
+    if quiet(args) {
+        return (0, String::new());
+    }
+    outcome
+}
+
+/// `run` before `-Quiet`: the exit code and the reply text.
+fn answer<C: Borrow<Ctx>>(args: &[String], ctx: impl FnOnce() -> Res<C>) -> (u8, String) {
     let verb = named(args);
     let refused = |refusal| {
         let text = verb.is_some_and(|def| wants_text(def, &args[1..]));
@@ -366,6 +377,22 @@ pub fn run<C: Borrow<Ctx>>(args: &[String], ctx: impl FnOnce() -> Res<C>) -> (u8
         json::to_stdout(&Value::Object(reply))
     };
     (code, out)
+}
+
+/// `report` with `-Quiet` among its tokens, in any case (the token a `-Kind` takes as its value excepted).
+fn quiet(args: &[String]) -> bool {
+    let Some(def) = named(args).filter(|d| d.name == "report") else {
+        return false;
+    };
+    let mut tokens = args[1..].iter();
+    while let Some(token) = tokens.next() {
+        if flag(def.values, token).is_some() {
+            tokens.next();
+        } else if flag(&["Quiet"], token).is_some() {
+            return true;
+        }
+    }
+    false
 }
 
 /// The spec of the hidden `launcher <spec>` call a pane runs (spec D4); not a verb, so absent from the usage text.
@@ -590,6 +617,35 @@ mod tests {
             "version" => vec!["version"],
             other => panic!("no valid call for {other}"),
         }
+    }
+
+    #[test]
+    fn report_quiet_prints_nothing_and_succeeds_whatever_happens() {
+        // A hook's command (#93): Copilot reads a hook's output and exit code, so -Quiet answers neither.
+        let w = World::human("");
+        assert_eq!(
+            call(&w, &["report", "working", "-Quiet"]),
+            (0, String::new())
+        );
+        assert_eq!(
+            call(&w, &["report", "dreaming", "-Quiet"]),
+            (0, String::new())
+        );
+        assert_eq!(
+            call(&w, &["report", "idle", "-Quiet", "-Text"]),
+            (0, String::new())
+        );
+        // Outside a multiplexer too (the providers refuse first).
+        assert_eq!(
+            run(&args(&["report", "idle", "-Quiet"]), || -> Res<&Ctx> {
+                refuse(1, "endpoint", "not inside a tmux pane")
+            }),
+            (0, String::new())
+        );
+        // Without -Quiet the refusal is as before.
+        assert_eq!(call(&w, &["report", "working"]).0, 2);
+        // Only report takes it.
+        assert_eq!(call(&w, &["list", "-Quiet"]).0, 2);
     }
 
     #[test]

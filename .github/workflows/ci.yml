@@ -87,6 +87,22 @@ jobs:
           echo "$out"
           if [ "$rc" != 1 ]; then echo "expected exit 1, got $rc"; exit 1; fi
           case $out in *'"check":"endpoint"'*) ;; *) echo 'expected check endpoint'; exit 1 ;; esac
+      # #93: on Windows Copilot runs each hook's portable command; run every one through the cmd shim to the release
+      # binary, which refuses outside a multiplexer: -Quiet must print nothing and exit 0.
+      - name: Windows Copilot hook commands
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          unset TMUX RMUX TMUX_PANE MUX_AGENTS_BIN
+          n=0
+          while IFS= read -r hook; do
+            n=$((n + 1))
+            rc=0
+            out=$(cmd //d //c "$hook" 2>&1) || rc=$?
+            if [ "$rc" != 0 ] || [ -n "$out" ]; then echo "$hook: exit $rc, printed: $out"; exit 1; fi
+          done < <(python3 -c 'import json; [print(e["command"]) for es in json.load(open("hooks.json"))["hooks"].values() for e in es]')
+          [ "$n" = 5 ] || { echo "expected 5 hook commands, ran $n"; exit 1; }
       - name: Release panic test
         shell: bash
         run: cargo test --release --features test-panic --locked --test panic
