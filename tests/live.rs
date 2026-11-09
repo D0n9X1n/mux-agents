@@ -1681,9 +1681,10 @@ exec claude --dangerously-skip-permissions
         });
         assert!(blocked, "{mux:?}: the bar shows:\n{screen}");
         assert!(screen.contains("! w2"), "{mux:?}:\n{screen}");
-        // #83: nobody looks at w2's pane, so the bar tells the session's clients once. tmux keeps the command in its
-        // message log; rmux keeps none, so its message is the unit tests' to prove.
-        if !matches!(mux, Mux::Rmux) {
+        // #83: nobody looks at w2's pane, so the bar tells the session's clients once. tmux 3.8 keeps the command in
+        // its message log; tmux 3.2a shows that log only to a client and rmux keeps none, so theirs is the unit tests'
+        // to prove.
+        if mux == Mux::Tmux38 {
             let mut log = String::new();
             let told = eventually(Duration::from_secs(10), || {
                 log = live.call(&["show-messages"]);
