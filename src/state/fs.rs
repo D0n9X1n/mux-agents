@@ -37,6 +37,26 @@ pub fn write_json_with(
     Ok(written?)
 }
 
+/// One decision two processes race for: the first to create `path` writes `choice` and wins. Answers the choice
+/// that stands, this one or the one already there (#97: spawn's commit against the launcher's give-up).
+pub fn decide(path: &Path, choice: &str) -> Res<String> {
+    match write_new(path, choice.as_bytes()) {
+        Ok(()) => Ok(choice.to_string()),
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+            // The winner wrote its few bytes at once; read until they are there.
+            for _ in 0..100 {
+                let held = std::fs::read_to_string(path)?;
+                if !held.is_empty() {
+                    return Ok(held);
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            Err(Refusal::internal("the launch decision is empty"))
+        }
+        Err(e) => Err(e.into()),
+    }
+}
+
 fn write_new(path: &Path, bytes: &[u8]) -> io::Result<()> {
     let mut file = OpenOptions::new().write(true).create_new(true).open(path)?;
     file.write_all(bytes)

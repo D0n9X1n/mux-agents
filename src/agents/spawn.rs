@@ -563,7 +563,9 @@ fn hue_for(snapshot: &registry::Snapshot) -> &'static str {
     crate::paint::PALETTE[least]
 }
 
-/// commit.json, the last write: from here the agent is live.
+/// commit.json, the last write: from here the agent is live. First the launch is decided `commit`; a launcher that
+/// gave up waiting decided `abort` first, and then the spawn refuses (and rolls back) rather than answer for an agent
+/// that will never start (#97).
 fn commit(ctx: &Ctx, folder: &Path) -> Res<()> {
     #[cfg(test)]
     COMMIT_PROBE.with(|probe| {
@@ -571,11 +573,17 @@ fn commit(ctx: &Ctx, folder: &Path) -> Res<()> {
             probe(folder);
         }
     });
+    if crate::state::fs::decide(&folder.join(DECIDED), "commit")? != "commit" {
+        return refuse(1, "launch", "the launcher gave up before the commit");
+    }
     write_json(
         &folder.join("commit.json"),
         &json!({"committedAt": utc_o(ctx.clock.now())}),
     )
 }
+
+/// The launch's one decision, `commit` or `abort`, shared with the launcher.
+pub(crate) const DECIDED: &str = "decided";
 
 #[cfg(test)]
 type CommitProbe = Box<dyn Fn(&Path)>;
@@ -2870,6 +2878,36 @@ mod tests {
         );
         assert_eq!(*commits.borrow(), 0);
         commit_probe(None);
+    }
+
+    #[test]
+    fn a_launcher_that_gave_up_first_makes_the_spawn_refuse_and_roll_back() {
+        // #97: on a slow server the launcher's 30 s commit wait can end before the spawn commits. The launcher
+        // decides abort first, so the spawn must not answer ok for an agent that will never start.
+        commit_probe(Some(Box::new(|folder: &Path| {
+            std::fs::write(folder.join("decided"), "abort").unwrap();
+        })));
+        let w = human();
+        w.fakes
+            .mux_first("-t %9 #{pane_id}|#{@agent-id}", 0, "|\n", "");
+        let out = run(&w, &["-Client", "claude", "-Task", "hi"]);
+        commit_probe(None);
+        assert!(out.starts_with("1 launch the agent did not start"), "{out}");
+        let folder = agents_dir(&w).join(&agent_folders(&w)[0]);
+        assert!(!folder.join("commit.json").exists());
+        assert_eq!(
+            std::fs::read_to_string(folder.join("decided")).unwrap(),
+            "abort"
+        );
+        // A spawn that decides first commits, as before.
+        let w = human();
+        assert!(reply(&run(&w, &["-Client", "claude", "-Task", "hi"]))["id"].is_string());
+        let folder = agents_dir(&w).join(&agent_folders(&w)[0]);
+        assert_eq!(
+            std::fs::read_to_string(folder.join("decided")).unwrap(),
+            "commit"
+        );
+        assert!(folder.join("commit.json").is_file());
     }
 
     #[test]
