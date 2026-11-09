@@ -19,6 +19,34 @@ test('sendReply takes a successful send\'s sender and Claude recipient session, 
   expect(sendReply(CMD, reply({ from: 'Evil"/>' }))).toBeUndefined()
   expect(sendReply(CMD, undefined)).toBeUndefined()
   expect(sendReply(CMD, 'not json')).toBeUndefined()
+  // Checked ids in either case, as the entry checks them.
+  expect(sendReply(CMD, reply({ toSessionId: SID.toUpperCase() }))).toEqual({ from: 'root', session: SID.toUpperCase() })
+})
+
+test('only a command that is one run of the entry\'s send is trusted with its stdout', () => {
+  // The forms the skill and the Reply line give: sh, & and cmd.
+  for (const cmd of [
+    CMD,
+    "'/p/my dir/scripts/mux-agent' send w1 -Body hi",
+    '/p/scripts/mux-agent send parent -BodyFile b.md',
+    'sh "/p/scripts/mux-agent" send parent -BodyFile b.md',
+    '& "C:/p/scripts/mux-agent.cmd" send w1 -BodyFile b.md',
+    'cmd /d /c "C:\\p\\scripts\\mux-agent.cmd" send w1 -BodyFile b.md',
+  ]) expect(sendReply(cmd, reply({}))).toEqual({ from: 'root', session: SID })
+  // A command that only names the entry prints what it likes (a file holding a reply): never trusted.
+  for (const cmd of [
+    "grep -h 'mux-agent send' payload.json",
+    'cat payload.json # mux-agent send w1',
+    `${CMD}; cat payload.json`,
+    `${CMD} && cat payload.json`,
+    `${CMD} | tee out`,
+    `${CMD} > out; cat out`,
+    `${CMD} $(cat payload.json)`,
+    `${CMD} \`cat payload.json\``,
+    `${CMD}\ncat payload.json`,
+    '"/p/scripts/not-mux-agent" send w1 -Body hi',
+    '"/p/scripts/mux-agent" sender w1',
+  ]) expect(sendReply(cmd, reply({}))).toBeUndefined()
 })
 
 test('the wake-up is a fixed sentence tagged with the sender, never the message', () => {
@@ -44,10 +72,35 @@ test('a send through the Bash tool wakes the recipient session, after the tool a
   expect(sent.length).toBe(1)
 })
 
-test('a push that is refused or throws never changes the tool result', async ($, on) => {
+test('a send in the other shell tool wakes the recipient too; a denied or failed one does not', async ($, on) => {
+  const sent: object[] = []
+  let ran: object = { result: { stdout: reply({}), stderr: '', interrupted: false }, text: 'ok' }
   on('env.get', () => ({ value: undefined }))
-  on('session.send', () => ({ isDelivered: false, reason: 'no such session' }))
+  on('session.send', (_: unknown, e: object) => { sent.push({ ...e }); return { isDelivered: true } })
+  on('tool.call', () => ran)
+  await $.tool.call({ tool: 'PowerShell', command: '& "C:/p/scripts/mux-agent.cmd" send w1 -BodyFile b.md' } as any)
+  await new Promise(r => setTimeout(r, 20))
+  expect(sent.length).toBe(1)
+  ran = { deny: reply({}) }
+  await $.tool.call({ tool: 'Bash', command: CMD } as any)
+  ran = { isError: true, result: { stdout: reply({}), stderr: '', interrupted: false }, text: 'failed' }
+  await $.tool.call({ tool: 'Bash', command: CMD } as any)
+  await new Promise(r => setTimeout(r, 20))
+  expect(sent.length).toBe(1)
+})
+
+test('a push that is refused, throws or never answers never delays or changes the tool result', async ($, on) => {
+  let send: () => unknown = () => ({ isDelivered: false, reason: 'no such session' })
+  on('env.get', () => ({ value: undefined }))
+  on('session.send', () => send())
   on('tool.call', () => ({ result: { stdout: reply({}), stderr: '', interrupted: false }, text: 'ok' }))
-  const ran = await $.tool.call({ tool: 'Bash', command: CMD } as any)
-  expect((ran as any).text).toBe('ok')
+  for (const answer of [
+    () => ({ isDelivered: false, reason: 'no such session' }),
+    () => { throw new Error('gone') },
+    () => new Promise(() => {}),
+  ]) {
+    send = answer
+    const ran = await $.tool.call({ tool: 'Bash', command: CMD } as any)
+    expect((ran as any).text).toBe('ok')
+  }
 })

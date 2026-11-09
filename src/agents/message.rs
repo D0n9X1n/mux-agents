@@ -1799,6 +1799,36 @@ mod tests {
             (json!("a"), json!(ROOT)),
             "{sent}"
         );
+        // From agent c, spawned by agent a: its parent is a, so a's own session, not the root's a recorded.
+        w.panes(&[
+            "%1|@1|100||",
+            "%9|@5|300|aaaaaaaaaaaa|a",
+            "%8|@5|301|bbbbbbbbbbbb|b",
+            "%7|@5|302|cccccccccccc|c",
+        ]);
+        w.agent_record(
+            "cccccccccccc",
+            json!({"name": "c", "pane": "%7", "parentPane": "%9", "client": "copilot",
+            "parentAgent": {"client": "claude", "pid": 2, "start": 2, "sessionId": ROOT}}),
+        );
+        w.ctx.env =
+            crate::ctx::Env::from_pairs([("TMUX", tmux.clone()), ("TMUX_PANE", "%7".into())]);
+        let sent = run(&w, send, &["send", "parent", "-Body", "done"]);
+        assert_eq!(
+            (field(&sent, "from"), field(&sent, "toSessionId")),
+            (json!("c"), json!(CHILD)),
+            "{sent}"
+        );
+        // A root that is a Copilot session: nothing to wake, whatever id its record holds.
+        w.agent_record(
+            ID,
+            json!({"name": "a", "pane": "%9", "parentPane": "%1", "client": "claude",
+            "sessionId": CHILD, "parentAgent": {"client": "copilot", "pid": 1, "start": 1, "sessionId": ROOT}}),
+        );
+        w.ctx.env =
+            crate::ctx::Env::from_pairs([("TMUX", tmux.clone()), ("TMUX_PANE", "%9".into())]);
+        let sent = run(&w, send, &["send", "parent", "-Body", "done"]);
+        assert_eq!(field(&sent, "toSessionId"), Value::Null, "{sent}");
         // A session id that is not one is never answered.
         w.agent_record(
             ID,

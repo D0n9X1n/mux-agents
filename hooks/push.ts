@@ -4,14 +4,19 @@
 // says to read.
 import type { EngineInterface } from 'claude-code'
 
-// The entry as a whole file name, then the verb send (as board.ts finds spawn).
-const ENTRY = /(^|[\\/\s"'])mux-agent(\.cmd|\.exe)?["']?\s+["']?send["']?(\s|$)/i
-const SESSION = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/
+// The whole command is one run of the entry's send: optionally after `& `, `sh ` or `cmd /d /c `, the entry (quoted or
+// not, any folder), the verb, then arguments with no separator, pipe, redirection or substitution. So the stdout read
+// below is the entry's own reply, never a file or another program a command printed (a grep that names the entry).
+const ONE_SEND = /^\s*(?:&\s*|sh\s+|cmd(?:\.exe)?\s+\/d\s+\/c\s+)?(?:"(?:[^"]*[\\/])?mux-agent(?:\.cmd|\.exe)?"|'(?:[^']*[\\/])?mux-agent(?:\.cmd|\.exe)?'|(?:[^\s"']*[\\/])?mux-agent(?:\.cmd|\.exe)?)\s+["']?send["']?\s/i
+const SHELL = /[;&|<>`\r\n]|\$\(/
+// As checks::session_id: either case.
+const SESSION = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
 const NAME = /^([a-z][a-z0-9-]{0,23}|root)$/
 
-// The send reply on one line of stdout: ok, verb send, a sender's name and the recipient's session, or none.
+// The send reply on one line of stdout: ok, verb send, a sender's name and the recipient's session, or none. Several
+// sends in one command wake no one: each recipient's read -Wait still finds its mail.
 export function sendReply(command: string, stdout: string | undefined): { from: string; session: string } | undefined {
-  if (!ENTRY.test(command)) return undefined
+  if (!ONE_SEND.test(command) || SHELL.test(command.replace(/^\s*&\s*/, ''))) return undefined
   for (const line of (stdout ?? '').replace(/\r\n/g, '\n').split('\n')) {
     if (!line.trim().startsWith('{')) continue
     let reply: unknown
