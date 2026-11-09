@@ -7,7 +7,7 @@ description: "Terminal CLI only: needs a tmux or rmux pane. Start Claude Code or
 
 Use this skill inside an rmux 0.10+ pane (Windows, Linux or macOS) or a tmux 3.2+ pane (Linux or macOS); the tool refuses elsewhere.
 
-Skip it in the Claude Code desktop app, web or cloud sessions, IDE chat panels, the GitHub Copilot app and headless or SDK runs, and use the host's normal workflow instead. Never start a multiplexer or set variables to make it apply. An IDE's integrated terminal running the CLI inside tmux or rmux is fine.
+Skip it in the Claude Code desktop app, web or cloud sessions, IDE chat panels, the GitHub Copilot app and headless or SDK runs, and use the host's normal workflow instead. Skip it in a herdr terminal (`HC_TERMINAL_ID` is set and you are not inside tmux or rmux): use herdr's own skills (`hc --skill`) there. Never start a multiplexer or set variables to make it apply. An IDE's integrated terminal running the CLI inside tmux or rmux is fine.
 
 ## Entry
 
@@ -68,6 +68,7 @@ The commands below, and the Reply and Listen lines, run as-is in the Bash tool. 
 ## Refusals
 
 - `entry`: no usable `mux-agent` binary for this OS and architecture.
+- `herdr`: the caller runs in a herdr terminal outside tmux and rmux (`HC_TERMINAL_ID` is set); use herdr's own skills.
 - `sandbox`: the caller runs in a sandbox: `SANDBOX_RUNTIME=1`, a macOS sandbox, Linux `NoNewPrivs`, or a Windows token that is unreadable, AppContainer, restricted or below Medium integrity.
 - `policy`: the caller's live policy is unreadable or is neither bypass nor allow-all. For Claude Code, `reason` says whether the transcript or the screen failed and why (for example `screen: no mode line`).
 - `flags`: a flag outside the allowlist, or an unreadable command line, on any `claude` or `copilot` process from the agent up to the pane.

@@ -115,3 +115,10 @@ test('a pane that stops being an agent\'s stops reporting after its first refusa
   await $.turn.complete(end('t2'))
   expect(w.argv.length).toBe(2)
 })
+
+test('in a herdr terminal outside tmux and rmux nothing runs: herdr reads its agents itself', async ($, on) => {
+  const w = world(on, { HC_TERMINAL_ID: 't7' }, [OK])
+  await $.turn.start({ text: 'go', turnId: 't1' })
+  await $.turn.complete(end('t1'))
+  expect(w.argv).toEqual([])
+})

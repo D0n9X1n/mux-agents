@@ -286,10 +286,20 @@ fn failure(verb: Option<&str>, refusal: &Refusal) -> Map<String, Value> {
     reply
 }
 
+/// In a herdr terminal every verb refuses: herdr runs and coordinates agents itself (#85).
+pub(crate) const HERDR: &str =
+    "this terminal is herdr's: use herdr's own skills (hc --skill), not mux-agents";
+
 fn dispatch(def: &VerbDef, request: &Request, ctx: &Ctx) -> Res<Map<String, Value>> {
     #[cfg(feature = "test-panic")]
     if ctx.env.get("MUX_AGENTS_TEST_PANIC") == Some("dispatch") {
         panic!("PANIC-PAYLOAD-7f3a");
+    }
+    // A herdr terminal (herdr-core gives every terminal it runs its address) outside tmux and rmux: herdr's skills
+    // apply there, before anything is read. Inside tmux or rmux the pane is the multiplexer's, whatever it inherited.
+    let var = |name: &str| ctx.env.get(name).is_some_and(|v| !v.is_empty());
+    if var("HC_TERMINAL_ID") && !var("TMUX") && !var("RMUX") {
+        return refuse(2, "herdr", HERDR);
     }
     // Every public verb refuses a sandboxed caller before any multiplexer call (MuxAgents.ps1:94).
     crate::sandbox::assert_unsandboxed(ctx)?;
@@ -579,6 +589,51 @@ mod tests {
             "watch" => vec!["watch"],
             "version" => vec!["version"],
             other => panic!("no valid call for {other}"),
+        }
+    }
+
+    #[test]
+    fn every_verb_stands_down_in_a_herdr_terminal() {
+        // herdr-core gives every terminal it runs its address; there herdr's own skills drive agents (#85).
+        for def in VERBS {
+            let mut w = World::human("");
+            w.ctx.env = crate::ctx::Env::from_pairs([("HC_TERMINAL_ID", "t7")]);
+            w.fakes.clear_log();
+            let (code, out) = call(&w, &valid_call(def.name));
+            if def.name == "version" {
+                assert_eq!(code, 0, "{out}");
+                continue;
+            }
+            let want = format!(
+                r#"{{"ok":false,"verb":"{}","code":2,"check":"herdr","message":"{HERDR}"}}"#,
+                def.name
+            );
+            assert_eq!((code, out.as_str()), (2, want.as_str()), "{}", def.name);
+            assert!(w.fakes.mux_calls().is_empty(), "{}", def.name);
+        }
+        // Inside tmux or rmux the pane is the multiplexer's, even with an address a tmux server inherited from the
+        // herdr terminal it started in; an empty address is no herdr terminal.
+        let w = World::human("");
+        let (tmux, pane) = (w.ctx.env.get("TMUX").unwrap_or_default(), "%1");
+        for pairs in [
+            [
+                ("TMUX", tmux),
+                ("TMUX_PANE", pane),
+                ("HC_TERMINAL_ID", "t7"),
+            ],
+            [
+                ("RMUX", "/tmp/rmux-501/main,900,0"),
+                ("TMUX_PANE", pane),
+                ("HC_TERMINAL_ID", "t7"),
+            ],
+            [("TMUX", tmux), ("TMUX_PANE", pane), ("HC_TERMINAL_ID", "")],
+        ] {
+            let mut w = World::human("");
+            w.ctx.env = crate::ctx::Env::from_pairs(pairs);
+            assert!(
+                !call(&w, &["list"]).1.contains(r#""check":"herdr""#),
+                "{pairs:?}"
+            );
         }
     }
 

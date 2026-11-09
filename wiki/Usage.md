@@ -112,6 +112,7 @@ Children run `claude --dangerously-skip-permissions --effort high` or `copilot -
 - rmux 0.10 or later on macOS, Linux or Windows, or tmux 3.2 or later on macOS or Linux, with the caller inside a pane.
 - Claude Code or GitHub Copilot CLI on `PATH` (`claude` or `copilot`; `.exe` on Windows).
 - Terminal CLI only (Claude Code or Copilot CLI inside tmux or rmux); the desktop app and other non-terminal surfaces are skipped: no Agents pane, and the skill says not to use it.
+- Not in herdr: in a herdr terminal outside tmux and rmux (`HC_TERMINAL_ID` is set) every command refuses with `herdr`, the hooks report nothing and the Agents pane never opens; use herdr's own skills (`hc --skill`) there. Inside tmux or rmux, even one started from a herdr terminal, the pane is the multiplexer's and mux-agents works as usual: herdr cannot see agents inside tmux.
 
 Inside rmux both `RMUX` and `TMUX` may be set; `RMUX` wins.
 

@@ -367,6 +367,16 @@ for (const [name, set] of FAIL_CLOSED) {
   })
 }
 
+test('a herdr terminal outside tmux and rmux is not eligible; inside tmux an inherited address changes nothing', async ($, on) => {
+  const w = world(on, { HC_TERMINAL_ID: 't7' }, [ran(0, LIST)])
+  expect(await gated($, w)).toEqual(SKIPPED)
+})
+
+test('a tmux pane that inherited a herdr address is still eligible', async ($, on) => {
+  const w = world(on, { TMUX: 'x', HC_TERMINAL_ID: 't7' }, [ran(0, LIST)])
+  expect(await gated($, w)).toEqual({ answered: 'Agents pane opened.', registered: 1, opened: 2, runs: 4 })
+})
+
 test('RMUX alone, TMUX absent, is eligible', async ($, on) => {
   const w = world(on, { RMUX: 'x' }, [ran(0, LIST)])
   expect(await gated($, w)).toEqual({ answered: 'Agents pane opened.', registered: 1, opened: 2, runs: 4 })

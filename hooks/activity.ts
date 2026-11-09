@@ -21,7 +21,8 @@ async function reportArgv($: EngineInterface, state: State, kind?: string): Prom
   return ['sh', `${root}/scripts/mux-agent`, ...tail]
 }
 
-// Inside tmux or rmux at all: a pane that could be an agent's.
+// Inside tmux or rmux at all: a pane that could be an agent's. A herdr terminal outside them reports nothing; herdr reads
+// its agents itself (#85).
 async function inMux($: EngineInterface): Promise<boolean> {
   try {
     return Boolean((await $.env.get('TMUX')) || (await $.env.get('RMUX')))
