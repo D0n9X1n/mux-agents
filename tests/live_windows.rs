@@ -278,6 +278,42 @@ fn eventually(limit: Duration, mut ready: impl FnMut() -> bool) -> bool {
     }
 }
 
+// A client whose running image an update renamed (claude.exe.old.<ms>.<pid>) is still the caller's client: `list` run
+// by it answers ok instead of refusing `caller`.
+#[test]
+fn a_client_renamed_by_an_update_still_calls() {
+    let Some(live) = Live::start() else {
+        return;
+    };
+    live.line(&live.root, "claude");
+    let log = live.dir.join("clients.log");
+    let pid: u32 = live.wait("the client to start", || {
+        std::fs::read_to_string(&log)
+            .ok()?
+            .lines()
+            .next()?
+            .trim()
+            .parse()
+            .ok()
+    });
+    let bin = live.dir.join("bin");
+    std::fs::rename(
+        bin.join("claude.exe"),
+        bin.join(format!("claude.exe.old.1794521471990.{pid}")),
+    )
+    .unwrap();
+    let held = live.dir.join(format!("cmd.{pid}.part"));
+    std::fs::write(&held, "list\n").unwrap();
+    std::fs::rename(&held, live.dir.join(format!("cmd.{pid}"))).unwrap();
+    let reply = live.dir.join(format!("reply.{pid}.1.json"));
+    let text = live.wait("the list reply", || std::fs::read_to_string(&reply).ok());
+    let err =
+        std::fs::read_to_string(live.dir.join(format!("reply.{pid}.1.err"))).unwrap_or_default();
+    let answer: Value = serde_json::from_str(&text)
+        .unwrap_or_else(|_| panic!("list: stdout {text:?}, stderr {err:?}"));
+    assert_eq!(answer["ok"], true, "list: {answer} {err}");
+}
+
 // #70: on Windows the bar reads its console: it turns mouse reports on, `j` then Enter focuses the first agent, and
 // a left click on an agent's name line focuses that agent.
 #[test]
