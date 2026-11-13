@@ -36,6 +36,11 @@ type Read = Rc<dyn Fn(u64)>;
 // What `stop_report` answers for the rows stop left.
 type Report = fn(&[Left]) -> serde_json::Map<String, serde_json::Value>;
 
+struct HcAnswer {
+    argv: Option<Vec<String>>,
+    result: Res<crate::spawn::Out>,
+}
+
 #[derive(Default)]
 struct Log {
     rows: Vec<Row>,
@@ -46,7 +51,8 @@ struct Log {
     mux_calls: Vec<Vec<String>>,
     hc_bins: HashMap<String, PathBuf>,
     hc_calls: Vec<(PathBuf, Vec<String>, Duration)>,
-    hc_answers: VecDeque<Res<crate::spawn::Out>>,
+    hc_answers: VecDeque<HcAnswer>,
+    hc_faults: Vec<String>,
     slept: Vec<u64>,
     // What sandbox() answers; none is an unsandboxed macOS.
     signals: Option<Signals>,
@@ -326,7 +332,28 @@ impl Fakes {
     }
 
     pub fn hc_answer(&self, answer: Res<crate::spawn::Out>) {
-        self.0.borrow_mut().hc_answers.push_back(answer);
+        self.0.borrow_mut().hc_answers.push_back(HcAnswer {
+            argv: None,
+            result: answer,
+        });
+    }
+
+    pub fn hc_expect(&self, argv: &[&str], result: Res<crate::spawn::Out>) {
+        self.0.borrow_mut().hc_answers.push_back(HcAnswer {
+            argv: Some(argv.iter().map(|s| s.to_string()).collect()),
+            result,
+        });
+    }
+
+    pub fn hc_done(&self) -> Res<()> {
+        let log = self.0.borrow();
+        if log.hc_faults.is_empty() && log.hc_answers.is_empty() {
+            Ok(())
+        } else {
+            Err(crate::error::Refusal::internal(
+                "hc fixture was not fully satisfied",
+            ))
+        }
     }
 
     pub fn hc_calls(&self) -> Vec<(PathBuf, Vec<String>, Duration)> {
@@ -564,9 +591,27 @@ impl crate::hc::Hc for Fakes {
             args.iter().map(|s| s.to_string()).collect(),
             timeout,
         ));
-        log.hc_answers
-            .pop_front()
-            .unwrap_or_else(|| Err(crate::error::Refusal::internal("unconfigured hc fake")))
+        let actual: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+        match log.hc_answers.pop_front() {
+            Some(answer)
+                if answer
+                    .argv
+                    .as_ref()
+                    .is_none_or(|expected| *expected == actual) =>
+            {
+                answer.result
+            }
+            Some(_) => {
+                log.hc_faults
+                    .push(format!("unexpected hc argv: {actual:?}"));
+                Err(crate::error::Refusal::internal("unexpected hc argv"))
+            }
+            None => {
+                log.hc_faults
+                    .push(format!("unconfigured hc call: {actual:?}"));
+                Err(crate::error::Refusal::internal("unconfigured hc fake"))
+            }
+        }
     }
 }
 
@@ -644,6 +689,39 @@ pub fn wait_runnable<T>(
 mod tests {
     use super::*;
     use std::io;
+
+    #[test]
+    fn hc_strict_fixture_detects_swallowed_errors() {
+        let f = Fakes::default();
+        let bin = f.hc_install("hc");
+        let _ =
+            crate::hc::Hc::captured(&f, &bin, &["get", "t1", "--json"], Duration::from_secs(15));
+        f.clear_log();
+        assert_eq!(
+            f.hc_done().unwrap_err().message,
+            "unexpected error (hc fixture was not fully satisfied)"
+        );
+        let f = Fakes::default();
+        f.hc_expect(&["--version"], Ok(crate::spawn::Out::default()));
+        assert!(f.hc_done().is_err());
+        let _ = crate::hc::Hc::captured(
+            &f,
+            &bin,
+            &["ls", "--all", "--json"],
+            Duration::from_secs(15),
+        );
+        assert!(f.hc_done().is_err());
+        let f = Fakes::default();
+        f.hc_expect(
+            &["get", "t1", "--json"],
+            Err(crate::error::Refusal::internal("timeout")),
+        );
+        assert!(
+            crate::hc::Hc::captured(&f, &bin, &["get", "t1", "--json"], Duration::from_secs(15))
+                .is_err()
+        );
+        f.hc_done().unwrap();
+    }
 
     // ETXTBSY: Linux refuses to run a file another process still holds open for writing.
     const BUSY: i32 = 26;
