@@ -334,6 +334,20 @@ fn scoped_launcher_runs_once_with_explicit_context() {
     .unwrap();
     fs::write(&spec, json!({"schema":1,"generation":"0","client":"claude","args":["--session-id","0f11fc2f-2032-48ef-a920-4af2a8e5af50"]}).to_string()).unwrap();
     fs::write(folder.join("commit.json"), "{}").unwrap();
+    fs::write(state.join("key/server.json"), "{}").unwrap();
+    fs::write(
+        folder.join("record.json"),
+        json!({"id":"aaaaaaaaaaaa","name":"worker","session":"$3","parentPane":"%1","pane":"%9"})
+            .to_string(),
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        for path in [&state, &state.join("key"), &state.join("key/agents")] {
+            fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+    }
     fs::write(t.0.join("quit"), "").unwrap();
     let run = || {
         Command::new(env!("CARGO_BIN_EXE_mux-agent"))

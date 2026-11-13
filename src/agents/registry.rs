@@ -602,7 +602,11 @@ pub fn add_notice(
     let name = super::text(record.get("name"));
     let (kind, code, body) = match notice {
         Notice::Exited(code) => {
-            let body = format!("{name} exited with code {}.", super::text(Some(&code)));
+            let body = if code.is_null() {
+                format!("{name} exited.")
+            } else {
+                format!("{name} exited with code {}.", super::text(Some(&code)))
+            };
             ("exited", code, body)
         }
         Notice::Stopped => ("stopped", Value::Null, format!("{name} was stopped.")),
@@ -646,7 +650,7 @@ pub fn add_notice(
 fn delivered_notice(message: &Value, name: &str) -> (String, Value) {
     let code = message.get("exitCode").filter(|c| c.is_i64());
     match message.get("kind").and_then(Value::as_str) {
-        Some("exited") if code.is_some() => {
+        Some("exited") if code.is_some() || message.get("exitCode") == Some(&Value::Null) => {
             return ("exited".into(), code.cloned().unwrap_or(Value::Null));
         }
         Some(kind @ ("stopped" | "lost")) => return (kind.into(), Value::Null),
@@ -2234,4 +2238,52 @@ mod tests {
             2
         );
     }
+}
+#[cfg(test)]
+#[path = "registry_hc_tests.rs"]
+mod hc_tests;
+/// Reconcile supplied hc facts; never query or clean a view.
+pub fn reap_hc(ctx: &Ctx, caller: &Caller, snapshot: &super::membership::Snapshot) -> Res<bool> {
+    use super::lifecycle::{Life, classify};
+    let mut acted = false;
+    for o in &snapshot.facts.local {
+        let Some(t) = o.terminal.as_ref().filter(|t| o.identity.matches(t)) else {
+            continue;
+        };
+        if classify(Some(t), &o.identity.launcher) != Life::Ended {
+            continue;
+        }
+        let notice = match t.reason {
+            Some(crate::hc::Reason::Exited) => {
+                Notice::Exited(t.exit_code.map_or(Value::Null, Value::from))
+            }
+            Some(crate::hc::Reason::Killed) => Notice::Stopped,
+            _ => continue,
+        };
+        let id = &o.identity.id;
+        acted |= with_member_notice(ctx, caller, id, || {
+            let Some(record) = record(ctx, caller, id)? else {
+                return Ok(false);
+            };
+            if super::core_identity::Identity::read(&record, id, &super::membership::team(caller))
+                .as_ref()
+                != Some(&o.identity)
+            {
+                return Ok(false);
+            }
+            add_notice(ctx, caller, id, &record, notice)
+        })?;
+    }
+    Ok(acted)
+}
+/// Shared hc reap/B2 stop order. Caller must hold neither lock.
+pub fn with_member_notice<T>(
+    ctx: &Ctx,
+    caller: &Caller,
+    id: &str,
+    f: impl FnOnce() -> Res<T>,
+) -> Res<T> {
+    super::lock(ctx, &super::lock_key("member", caller, id), || {
+        super::lock(ctx, &super::lock_key("notice", caller, id), f)
+    })
 }
