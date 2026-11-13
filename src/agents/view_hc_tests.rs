@@ -29,7 +29,13 @@ fn member_target_rechecks_complete_identity() {
     }
     write(&w.folder(ID).join("record.json"), r);
     assert!(member_target::current(&w.ctx, &c, &id).is_ok());
-    cf::member(&w, "bbbbbbbbbbbb", json!({}));
+    let second = cf::member(&w, "bbbbbbbbbbbb", json!({}));
+    cf::online(&w);
+    let first = read_json(&w.folder(ID).join("record.json"))
+        .unwrap()
+        .unwrap();
+    cf::get(&w, "taaaaaaaaaaaa", cf::wire(&first));
+    cf::get(&w, "tbbbbbbbbbbbb", cf::wire(&second));
     assert!(member_target::named(&w.ctx, &c, "worker").is_err());
     assert!(member_target::named(&w.ctx, &c, "bad/name").is_err());
     w.fakes.hc_done().unwrap();
