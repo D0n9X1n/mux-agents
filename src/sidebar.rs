@@ -589,8 +589,8 @@ fn parts(
         }
         counted += 1;
         let (kind, word) = match state.as_str() {
-            // A lost agent's pane is gone: counted, never drawn.
-            "lost" => continue,
+            "lost" | "unknown" => (Kind::Other, state.clone()),
+            value if value.starts_with("exited ") => (Kind::Exit, state.clone()),
             "exited" => match row.get("exitCode").filter(|code| !code.is_null()) {
                 Some(code) if clean(Some(code)) == "0" => (Kind::Finished, "done".to_string()),
                 Some(code) => (Kind::Exit, format!("exit {}", clean(Some(code)))),
@@ -2358,14 +2358,14 @@ mod tests {
     // working), 7 ended of which the feed has 4.
     fn sectioned() -> Value {
         json!({"running": 3, "endedTotal": 7, "agents": [
-            {"name": "add-subtract", "state": "running", "doing": "Adding subtract(a, b) under add in calc.py", "age": 42, "unread": 0, "color": "blue", "activity": "blocked", "since": 12, "waiting": false},
-            {"name": "test-calc", "state": "running", "doing": "Done: test_calc.py passed, exit 0", "age": 180, "unread": 1, "color": "magenta", "activity": "done", "since": 30, "waiting": true},
-            {"name": "fix-ci-flake", "state": "running", "doing": "Re-running tests/test_watch.rs with --nocapture", "age": 660, "unread": 0, "color": "bright-blue", "activity": "working", "since": null, "waiting": false},
-            {"name": "docs-usage", "state": "exited", "exitCode": 0, "age": 1080},
-            {"name": "bump-deps", "state": "exited", "exitCode": 101, "age": 1500},
-            {"name": "spike-rmux", "state": "stopped", "exitCode": null, "age": 3600},
-            {"name": "older", "state": "stopped", "exitCode": null, "age": 7200}
-        ]})
+                    {"name": "add-subtract", "state": "running", "doing": "Adding subtract(a, b) under add in calc.py", "age": 42, "unread": 0, "color": "blue", "activity": "blocked", "since": 12, "waiting": false},
+                    {"name": "test-calc", "state": "running", "doing": "Done: test_calc.py passed, exit 0", "age": 180, "unread": 1, "color": "magenta", "activity": "done", "since": 30, "waiting": true},
+                    {"name": "fix-ci-flake", "state": "running", "doing": "Re-running tests/test_watch.rs with --nocapture", "age": 660, "unread": 0, "color": "bright-blue", "activity": "working", "since": null, "waiting": false},
+                    {"name": "docs-usage", "state": "exited", "exitCode": 0, "age": 1080},
+        {"name":"bump-deps","state":"exited 101","life":"ended","view":"detached","hcAddress":"t-bump","exitCode":101,"age":1500},
+                    {"name": "spike-rmux", "state": "stopped", "exitCode": null, "age": 3600},
+                    {"name": "older", "state": "stopped", "exitCode": null, "age": 7200}
+                ]})
     }
 
     #[test]
@@ -2391,7 +2391,7 @@ mod tests {
                 String::new(),
                 format!(" ended {}", "-".repeat(31)),
                 pad("\u{2713} docs-usage", "done  18m"),
-                pad("\u{2717} bump-deps", "exit 101  25m"),
+                pad("\u{2717} bump-deps", "exited 101  25m"),
                 pad("- spike-rmux", "stopped   1h"),
                 "   +4 more  (list -All)".to_string(),
             ]
@@ -2474,7 +2474,7 @@ mod tests {
 
     #[test]
     fn layout_nothing_running_and_more_ended() {
-        // Nothing live: `No agents running.`, even with ended agents. A lost one is counted, never drawn.
+        // Nothing live: lifecycle rows remain visible, including lost members.
         let ended = json!({"running": 0, "endedTotal": 3, "agents": [
             {"name": "gone", "state": "lost", "age": 60},
             {"name": "halted", "state": "stopped", "exitCode": null, "age": 60},
@@ -2488,9 +2488,9 @@ mod tests {
                 " No agents running.".to_string(),
                 String::new(),
                 format!(" ended {}", "-".repeat(31)),
+                pad("- gone", "lost   1m"),
                 pad("- halted", "stopped   1m"),
                 pad("\u{2717} crashed", "exit ?    ?"),
-                "   +1 more  (list -All)".to_string(),
             ]
         );
         let empty = json!({"running": 0, "endedTotal": 0, "agents": []});
@@ -2893,7 +2893,7 @@ mod tests {
             16,
             format!(" {} {}", sgr("31", "\u{2717}"), sgr("2", "bump-deps")),
         );
-        assert!(rows[16].contains(&sgr("31", "exit 101")));
+        assert!(rows[16].contains(&sgr("31", "exited 101")));
         starts(
             17,
             format!(" {} {}", sgr("33", "-"), sgr("2", "spike-rmux")),

@@ -167,3 +167,37 @@ fn peek_detached_refuses_without_reopening_or_capturing() {
     );
     w.fakes.hc_done().unwrap();
 }
+
+#[test]
+fn lifecycle_words_are_visible_in_ascii_and_unicode() {
+    for ascii in [false, true] {
+        for (state, life) in [
+            ("lost", "lost"),
+            ("unknown", "unknown"),
+            ("exited 7", "ended"),
+        ] {
+            let board = json!({"running":0,"endedTotal":1,"agents":[{"name":"worker","state":state,"life":life,
+                "view":"detached","hcAddress":"t1","pane":null,"window":null,"age":60,"exitCode":7}]});
+            let rows = format_board(
+                board.as_object(),
+                &[],
+                Size {
+                    width: 40,
+                    height: 24,
+                },
+                Look {
+                    color: false,
+                    ascii,
+                    dumb: false,
+                },
+            );
+            let row = rows
+                .iter()
+                .find(|r| r.contains("worker"))
+                .expect("lifecycle row hidden");
+            assert!(row.contains(state), "{row}");
+            assert!(!rows.iter().any(|r| r.contains("+1 more")));
+            assert!(pick::resolve(board.as_object().unwrap(), "worker").is_none());
+        }
+    }
+}
