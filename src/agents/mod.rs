@@ -17,6 +17,7 @@ pub mod core_identity;
 pub mod core_launch;
 pub mod lifecycle;
 pub mod mail;
+pub mod membership;
 pub mod message;
 pub mod placement;
 pub mod registry;
