@@ -158,9 +158,30 @@ fn unc(path: &str) -> bool {
 
 fn claim_spec(spec: &Path, folder: &Path) -> Res<Option<Value>> {
     let v = read_json(spec)?.ok_or_else(|| Refusal::internal("the launch spec is missing"))?;
+    let gen_id = match v.get("generation") {
+        None => "0",
+        Some(Value::String(g))
+            if !g.is_empty()
+                && g.len() <= 64
+                && g.bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_') =>
+        {
+            g
+        }
+        _ => return Err(Refusal::internal("invalid launch generation")),
+    };
     let gens = folder.join("gens");
     std::fs::create_dir_all(&gens)?;
-    Ok(crate::state::fs::claim_json(&gens.join("0.claim"), &json!("run"))?.then_some(v))
+    let plain = gens
+        .to_str()
+        .ok_or_else(|| Refusal::internal("invalid generation folder"))?;
+    if !same_path(&std::fs::canonicalize(&gens)?, plain, HOST) {
+        return Err(Refusal::internal("invalid generation folder"));
+    }
+    Ok(
+        crate::state::fs::claim_json(&gens.join(format!("{gen_id}.claim")), &json!("run"))?
+            .then_some(v),
+    )
 }
 
 fn launch(
@@ -604,6 +625,94 @@ mod tests {
         assert!(seen);
         assert_eq!(code, 7);
         assert_eq!(mail(&l).len(), 1);
+    }
+
+    #[test]
+    fn generation_adversarial_refusal() {
+        for gen_id in [
+            json!("../x"),
+            json!(""),
+            json!(2),
+            json!(null),
+            json!("a/b"),
+            json!("x".repeat(65)),
+            json!("中"),
+        ] {
+            let l = setup("claude", json!([]));
+            let mut v = read_json(&l.spec).unwrap().unwrap();
+            v["generation"] = gen_id;
+            write(&l.spec, v);
+            let r = launch(&l, &spec_str(&l), exits_7);
+            assert_eq!(r.code, 1);
+            assert!(r.started.is_empty());
+            assert!(!l.folder.join("launcher.json").exists());
+            assert!(mail(&l).is_empty());
+            assert!(!l.folder.join("gens").exists());
+        }
+        let l = setup("claude", json!([]));
+        std::fs::write(l.folder.join("gens"), b"not a directory").unwrap();
+        assert_eq!(launch(&l, &spec_str(&l), exits_7).code, 1);
+        assert!(!l.folder.join("launcher.json").exists());
+        assert!(mail(&l).is_empty());
+        #[cfg(unix)]
+        {
+            let l = setup("claude", json!([]));
+            let outside = crate::testing::TempDir::new();
+            std::os::unix::fs::symlink(outside.path(), l.folder.join("gens")).unwrap();
+            let r = launch(&l, &spec_str(&l), exits_7);
+            assert_eq!(r.code, 1);
+            assert!(r.started.is_empty());
+            assert!(!l.folder.join("launcher.json").exists());
+            assert!(mail(&l).is_empty());
+            assert!(std::fs::read_dir(outside.path()).unwrap().next().is_none());
+        }
+    }
+
+    #[test]
+    fn generation_adversarial_failed_start() {
+        let l = setup("claude", json!([]));
+        let mut v = read_json(&l.spec).unwrap().unwrap();
+        v["generation"] = json!("g-1");
+        write(&l.spec, v);
+        assert_eq!(
+            launch(&l, &spec_str(&l), || Err(io::Error::other("uncertain"))).code,
+            1
+        );
+        assert_eq!(
+            read_json(&l.folder.join("gens/g-1.claim")).unwrap(),
+            Some(json!("run"))
+        );
+        let record = std::fs::read(l.folder.join("launcher.json")).unwrap();
+        let messages = mail(&l);
+        let duplicate = launch(&l, &spec_str(&l), exits_7);
+        assert!(duplicate.started.is_empty());
+        assert_eq!(duplicate.code, 0);
+        assert_eq!(
+            std::fs::read(l.folder.join("launcher.json")).unwrap(),
+            record
+        );
+        assert_eq!(mail(&l), messages);
+    }
+
+    #[test]
+    fn generation_adversarial_valid() {
+        for gen_id in ["A_z-09".to_string(), "x".repeat(64), "0".to_string()] {
+            let l = setup("claude", json!([]));
+            let mut v = read_json(&l.spec).unwrap().unwrap();
+            v["generation"] = json!(gen_id);
+            write(&l.spec, v);
+            let ran = launch(&l, &spec_str(&l), exits_7);
+            assert_eq!(ran.code, 7);
+            assert_eq!(ran.started.len(), 1);
+            assert!(ran.err.is_empty());
+            assert_eq!(
+                read_json(&l.folder.join("gens").join(format!("{gen_id}.claim"))).unwrap(),
+                Some(json!("run"))
+            );
+            let duplicate = launch(&l, &spec_str(&l), exits_7);
+            assert_eq!(duplicate.code, 0);
+            assert!(duplicate.started.is_empty());
+        }
     }
 
     #[test]
