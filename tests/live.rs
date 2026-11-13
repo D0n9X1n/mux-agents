@@ -1309,6 +1309,7 @@ exec claude --dangerously-skip-permissions
             eventually(Duration::from_secs(30), || reply.is_file()),
             "{mux:?}: the report did not run"
         );
+        assert_eq!(json_file(&reply)["ok"], true);
         let (code, focused) = live.run(&["focus", "-Next"]);
         assert_eq!(
             (code, &focused["name"]),
@@ -1559,28 +1560,18 @@ exec claude --dangerously-skip-permissions
             .output()
             .unwrap();
         assert_ne!(dead.status.code(), Some(0), "{mux:?}");
-        // mux-agent ends the gone pane's agent with one notice (lost, or exited if its launcher outlived the pane)
-        // and keeps the live one.
-        let (code, all) = live.run(&["list", "-All"]);
-        assert_eq!(code, 0, "{mux:?} {all}");
-        let state = |name: &str| {
-            all["agents"]
+        assert_detached_running(&mut live, &w1);
+        assert!(exit_messages(&live, &w2).is_empty());
+        let (_, list) = live.run(&["list"]);
+        assert_eq!(
+            list["agents"]
                 .as_array()
                 .unwrap()
                 .iter()
-                .find(|a| a["name"] == name)
-                .map(|a| s(&a["state"]).to_string())
-        };
-        assert_eq!(state("w2").as_deref(), Some("running"), "{mux:?} {all}");
-        assert!(
-            matches!(state("w1").as_deref(), Some("lost" | "exited")),
-            "{mux:?} {all}"
+                .find(|r| r["name"] == "w2")
+                .unwrap()["view"],
+            "attached"
         );
-        assert!(
-            live.agent_dir(s(&w1["id"])).join("notice.json").is_file(),
-            "{mux:?}"
-        );
-        assert_eq!(live.mailbox(&live.root_box()).len(), 1, "{mux:?}");
     }
 
     // A bar's live row (S2.1): `◉ w[12] … working <n>[sm]`.
@@ -2511,6 +2502,7 @@ exec claude --dangerously-skip-permissions
         let w2 = live.spawn("w2", &[]);
         let (code, stop) = live.run(&["stop", "w2"]);
         assert_eq!(code, 0, "{mux:?} {stop}");
+        live.wait_gone(s(&w2["pane"]));
         let (code, all) = live.run(&["list", "-All"]);
         assert_eq!(code, 0, "{mux:?} {all}");
         let keys = |v: &Value| v.as_object().unwrap().keys().cloned().collect::<Vec<_>>();
@@ -2567,10 +2559,13 @@ exec claude --dangerously-skip-permissions
                 want_keys.push("exitCode");
                 assert_eq!(row["exitCode"], Value::Null, "{mux:?} {row}");
             }
+            want_keys.extend(["life", "view", "hcAddress"]);
             assert_eq!(keys(row), want_keys, "{mux:?}");
             let want = json!({
-                "name": w["name"], "client": "claude", "pane": w["pane"], "window": w["window"], "context": "brief",
+                "name": w["name"], "client": "claude", "pane": if state=="running" {w["pane"].clone()} else {Value::Null}, "window": if state=="running" {w["window"].clone()} else {Value::Null}, "context": "brief",
                 "parent": root, "sessionId": w["sessionId"], "directory": live.path("work"), "state": state,
+                "life": if state=="running" {"running"} else {"ended"},
+                "view": if state=="running" {"attached"} else {"detached"}, "hcAddress": w["hcAddress"],
                 "doing": "say hi", "doingFrom": "task", "unread": unread, "model": null,
             });
             for (field, value) in want.as_object().unwrap() {
@@ -3102,15 +3097,24 @@ exec claude --dangerously-skip-permissions
             &[],
         );
         assert_eq!(code, 0, "{mux:?} {out} {err}");
-        let tail: Vec<&str> = out.lines().rev().take(3).collect();
+        let (_, list) = live.run(&["list"]);
+        let w5 = list["agents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["name"] == "w5")
+            .unwrap();
+        let tail: Vec<&str> = out.lines().rev().take(6).collect();
         assert_eq!(
             tail,
             [
-                format!("sidebar {}", s(&reopened["pane"])).as_str(),
-                "placementSource: flag",
-                "placement: tab"
-            ],
-            "{mux:?} {out}"
+                format!("sidebar {}", s(&reopened["pane"])),
+                format!("hcAddress: {}", s(&w5["hcAddress"])),
+                "view: attached".into(),
+                "life: running".into(),
+                "placementSource: flag".into(),
+                "placement: tab".into()
+            ]
         );
         assert_eq!(live.bars().len(), 1, "{mux:?}");
     }
