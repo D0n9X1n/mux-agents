@@ -1009,8 +1009,13 @@ mod tests {
             0,
         );
         record(&agents_world(), "read", &["read"], 0);
+        let w = agents_world();
+        crate::agents::core_fixture::member(&w, ID, json!({}));
+        let mut row = crate::agents::fixture::row_of("%9|@5|300||", &[]);
+        row.command = "hc attach taaaaaaaaaaaa".into();
+        w.pane_rows(&[row]);
         record(
-            &agents_world(),
+            &w,
             "read worker -Lines 5",
             &["read", "worker", "-Lines", "5"],
             0,
@@ -1488,5 +1493,58 @@ fn stop_hc_wire_order() {
         let args = tokens.into_iter().map(str::to_string).collect::<Vec<_>>();
         assert_eq!(run(&args, || Ok(&w.ctx)), (0, want.into()));
         w.fakes.hc_done().unwrap();
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn named_read_dispatch_is_guarded_and_never_reattaches() {
+    use crate::agents::{
+        core_fixture as cf,
+        fixture::{ID, World, row_of},
+    };
+    for attached in [false, true] {
+        let w = World::human("");
+        cf::member(&w, ID, serde_json::json!({}));
+        if attached {
+            let mut row = row_of("%9|@5|300||", &[]);
+            row.command = "hc attach taaaaaaaaaaaa".into();
+            w.pane_rows(&[row]);
+        } else {
+            w.panes(&[]);
+        }
+        w.fakes.mux_rule("show-buffer", 0, "one\ntwo\n", "");
+        for text in [false, true] {
+            let mut args = vec!["read", "worker", "-Lines", "1"];
+            if text {
+                args.push("-Text");
+            }
+            let args = args.into_iter().map(str::to_string).collect::<Vec<_>>();
+            let got = run(&args, || Ok(&w.ctx));
+            let want = match (attached, text) {
+                (true, false) => (
+                    0,
+                    r#"{"ok":true,"verb":"read","name":"worker","pane":"%9","text":"two"}"#,
+                ),
+                (true, true) => (0, "name: worker\npane: %9\ntext: two"),
+                (false, false) => (
+                    2,
+                    r#"{"ok":false,"verb":"read","code":2,"check":"target","message":"the agent has no live view; run focus worker"}"#,
+                ),
+                (false, true) => (
+                    2,
+                    "code: 2\ncheck: target\nmessage: the agent has no live view; run focus worker",
+                ),
+            };
+            assert_eq!(got, (want.0, want.1.into()));
+            w.fakes.hc_done().unwrap();
+        }
+        assert!(
+            !w.fakes
+                .mux_calls()
+                .iter()
+                .any(|a| a[1] == "new-window" || a[1] == "split-window")
+        );
+        assert!(!w.folder(ID).join("notice.json").exists());
     }
 }

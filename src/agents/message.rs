@@ -170,8 +170,7 @@ pub fn read(ctx: &Ctx, request: &Request) -> Res<Map<String, Value>> {
     let caller = resolve(ctx)?;
     let mut reply = Map::new();
     if named {
-        let pane = registry::find_reaped(ctx, &caller, first(request))?;
-        let tail = capture(ctx, &pane, lines)?;
+        let (pane, tail) = capture_hc(ctx, &caller, first(request), None, lines)?;
         reply.insert("name".into(), pane.name.into());
         reply.insert("pane".into(), pane.pane.into());
         reply.insert("text".into(), tail.into());
@@ -423,7 +422,7 @@ mod tests {
     const NONE: &str = "2 target no live agent has that name";
 
     fn target_refusal(verb: &str) -> &'static str {
-        if verb == "stop" {
+        if verb == "stop" || verb == "read" {
             "2 target no unique committed member has that identity"
         } else {
             NONE
@@ -492,7 +491,7 @@ mod tests {
                 );
                 assert_eq!(
                     mux_verbs(&w),
-                    if args[0] == "stop" {
+                    if args[0] == "stop" || args[0] == "read" {
                         vec!["display-message"]
                     } else {
                         vec!["display-message", "list-panes"]
@@ -804,17 +803,19 @@ mod tests {
     }
 
     #[test]
-    fn named_read_reaps_before_the_name() {
+    fn named_read_does_not_reap_other_members() {
         let w = gone_world();
+        cf::member(&w, ID, json!({"startCommand":launch_command("%9")}));
+        cf::member(&w, "bbbbbbbbbbbb", json!({"name":"gone","pane":"%8"}));
+        w.fakes.mux_rule("show-buffer", 0, "one\ntwo\n", "");
         w.fakes.clear_log();
-        let reply = run(&w, read, &["read", "worker", "-Lines", "5"]);
-        assert!(reply.starts_with("ok "), "{reply}");
-        // The reap posted a notice, so the panes are listed again before the name is looked up.
+        assert_eq!(
+            run(&w, read, &["read", "worker", "-Lines", "1"]),
+            r#"ok {"name":"worker","pane":"%9","text":"two"}"#
+        );
         assert_eq!(
             mux_verbs(&w),
             [
-                "display-message",
-                "list-panes",
                 "display-message",
                 "list-panes",
                 "if-shell",
@@ -822,14 +823,13 @@ mod tests {
                 "delete-buffer"
             ]
         );
-        let notice = w.folder("bbbbbbbbbbbb").join("notice.json");
-        assert!(notice.is_file());
+        assert!(!w.folder("bbbbbbbbbbbb").join("notice.json").exists());
+        assert!(read_mail_of(&w, "pane-1").is_empty());
         assert_eq!(
-            read_mail_of(&w, "pane-1"),
-            ["gone is gone: its pane closed without an exit record."]
+            run(&w, read, &["read", "gone"]),
+            "2 target the agent has no live view; run focus gone"
         );
-        // A lost agent's name answers `target`.
-        assert_eq!(run(&w, read, &["read", "gone"]), NONE);
+        w.fakes.hc_done().unwrap();
     }
 
     #[test]
@@ -837,7 +837,7 @@ mod tests {
         let usage =
             "2 usage usage: mux-agent read [-Wait <seconds>] | read <name> [-Lines <n>] [-Text]";
         let w = World::human("");
-        w.agent_record(ID, json!({}));
+        cf::member(&w, ID, json!({"startCommand":launch_command("%9")}));
         w.panes(&["%9|@5|300|aaaaaaaaaaaa|worker"]);
         w.fakes.clear_log();
         for lines in ["0", "2001", "x", "-1"] {
@@ -1189,6 +1189,11 @@ mod tests {
             })
             .collect();
         assert_eq!(rows, ["a@%9", "b@%8"]);
+        cf::member(
+            &w,
+            ID,
+            json!({"name":"a","startCommand":launch_command("%9")}),
+        );
         assert_eq!(
             run(&w, read, &["read", "a"]),
             r#"ok {"name":"a","pane":"%9","text":"a's screen"}"#
@@ -1268,7 +1273,7 @@ mod tests {
     #[test]
     fn read_and_focus_never_act_on_a_replaced_pane() {
         let w = World::human("");
-        w.agent_record(ID, json!({}));
+        cf::member(&w, ID, json!({"startCommand":launch_command("%9")}));
         w.panes(&["%9|@5|300|aaaaaaaaaaaa|worker"]);
         let live = registry::Launch {
             command: launch_command("%9"),
@@ -1332,7 +1337,7 @@ mod tests {
         // D9: the conditional capture or show-buffer fails as a call: `2 target`, and delete-buffer still runs.
         for failing in ["if-shell", "show-buffer"] {
             let w = World::human("");
-            w.agent_record(ID, json!({}));
+            cf::member(&w, ID, json!({"startCommand":launch_command("%9")}));
             w.panes(&["%9|@5|300|aaaaaaaaaaaa|worker"]);
             w.fakes.mux_rule("show-buffer", 0, "text\n", "");
             w.fakes.mux_script(failing, |_| Err(lost_server()));

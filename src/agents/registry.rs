@@ -515,16 +515,6 @@ pub fn live_after_reap(ctx: &Ctx, caller: &Caller) -> Res<Snapshot> {
     Ok(snapshot)
 }
 
-/// As `find_pane`, after a reap.
-pub fn find_reaped(ctx: &Ctx, caller: &Caller, name: &str) -> Res<Pane> {
-    if !super::agent_name(name) {
-        return no_agent();
-    }
-    live_after_reap(ctx, caller)?
-        .find(name)
-        .map_or_else(no_agent, Ok)
-}
-
 /// Refuses 2 `tagged` unless the caller's pane carries no agent tag and is no own record's pane.
 pub fn untagged(ctx: &Ctx, caller: &Caller, message: &str) -> Res<()> {
     if caller.agent_tag.is_empty() && Snapshot::take(ctx, caller)?.own(caller) == Own::None {

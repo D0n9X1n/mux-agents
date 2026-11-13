@@ -147,10 +147,7 @@
 [read worker -Lines 5]
 -N display-message -p -t %1 #{pid}|#{pane_pid}|#{session_id}|#{window_id}|#{@agent-id}
 -N list-panes -s -t $3 -F <marker>#{pane_id}<marker>#{window_id}<marker>#{pane_pid}<marker>#{pane_dead}<marker>#{pane_start_command}<marker>#{@agent-id}<marker>#{@agent-name}<marker>
-# 0.2.2: a named read reaps first, on the same list: the gone probe of %8
--N display-message -p -t %8 #{pane_id}|#{@agent-id}
-# :1366; 0.2.3 (#48): captured into a private buffer only while %9 is still its live launch, read, then deleted
--N if-shell -F -t %9 '#{&&:#{==:#{pane_dead},0},#{==:#{pane_start_command},/bin/mux-agent launcher /state/agents/9/spec.json}}' 'capture-pane -J -t %9 -b <buffer> -S -5'
+-N if-shell -F -t %9 '#{&&:#{==:#{pane_dead},0},#{==:#{pane_start_command},hc attach taaaaaaaaaaaa}}' 'capture-pane -J -t %9 -b <buffer> -S -5'
 -N show-buffer -b <buffer>
 -N delete-buffer -b <buffer>
 
