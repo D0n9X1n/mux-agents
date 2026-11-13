@@ -7,7 +7,7 @@ use crate::{
 };
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
-pub struct Prepared {
+pub(crate) struct Prepared {
     pub folder: PathBuf,
     pub record: Value,
     pub argv: Vec<String>,
@@ -17,7 +17,7 @@ fn field<'a>(v: &'a Value, k: &str) -> Res<&'a str> {
         .and_then(Value::as_str)
         .ok_or_else(|| Refusal::internal("invalid prepared identity"))
 }
-pub fn execute(
+pub(crate) fn execute(
     ctx: &Ctx,
     prepare: impl FnOnce() -> Res<Prepared>,
     attach: impl FnOnce(&Core<'_>, &Prepared, &mut Option<Created>) -> Res<()>,
@@ -84,6 +84,10 @@ pub fn execute(
     }
     result
 }
+fn attempt<T>(f: impl FnOnce() -> Res<T>) -> Res<T> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(f))
+        .unwrap_or_else(|_| Err(Refusal::internal("launch boundary panicked")))
+}
 fn rollback(
     core: &Core<'_>,
     p: &Prepared,
@@ -94,13 +98,13 @@ fn rollback(
     let mut evidence = json!({"hcAddress":address,"identity":p.record,"pane":pane.map(|v|v.pane.as_str()),"kill":"pending","viewCleanup":"pending"});
     let path = p.folder.join("abort.json");
     let _ = write_json(&path, &evidence);
-    evidence["kill"] = match core.kill(address) {
+    evidence["kill"] = match attempt(|| core.kill(address)) {
         Ok(()) => json!("acknowledged"),
         Err(e) => json!({"uncertain":true,"message":e.message}),
     };
     evidence["viewCleanup"] = match pane.filter(|v| !v.command.is_empty()) {
         None => json!("unproven"),
-        Some(v) => match clean(v) {
+        Some(v) => match attempt(|| clean(v)) {
             Ok(gone) => json!({"gone":gone}),
             Err(e) => json!({"failed":true,"message":e.message}),
         },
@@ -229,5 +233,130 @@ mod tests {
             assert!(a.iter().any(|s| s == label));
         }
         assert_eq!(a.iter().filter(|s| s.as_str() == "run").count(), 1);
+    }
+
+    #[test]
+    fn post_run_fault_matrix_preserves_evidence_and_never_skips_cleanup() {
+        for stage in [
+            "identity",
+            "attach",
+            "reply",
+            "tags",
+            "proof",
+            "record",
+            "commit",
+            "timeout",
+            "panic",
+            "abort-write",
+            "kill",
+            "cleanup",
+            "cleanup-panic",
+            "title",
+        ] {
+            let w = World::human("");
+            ready(&w);
+            answer(&w.fakes, r#"{"address":"t1"}"#);
+            if stage == "kill" {
+                w.fakes.hc_answer(Err(Refusal::internal("kill uncertain")));
+            } else {
+                answer(&w.fakes, "{}");
+            }
+            let folder = w.ctx.state_root.join("key/agents/aaaaaaaaaaaa");
+            let cleaned = Rc::new(Cell::new(0));
+            let seen = cleaned.clone();
+            let result = execute(
+                &w.ctx,
+                || {
+                    let p = prepared(&w);
+                    if stage == "identity" {
+                        std::fs::create_dir(p.folder.join("record.json"))?;
+                    }
+                    Ok(p)
+                },
+                |_, p, pane| {
+                    if ["attach", "reply"].contains(&stage) {
+                        return Err(Refusal::internal(stage));
+                    }
+                    *pane = Some(created());
+                    if stage == "record" {
+                        std::fs::remove_file(p.folder.join("record.json"))?;
+                        std::fs::create_dir(p.folder.join("record.json"))?;
+                    }
+                    if stage == "abort-write" {
+                        std::fs::create_dir(p.folder.join("abort.json"))?;
+                    }
+                    if stage == "panic" {
+                        panic!("after attach");
+                    }
+                    if [
+                        "tags",
+                        "proof",
+                        "abort-write",
+                        "kill",
+                        "cleanup",
+                        "cleanup-panic",
+                    ]
+                    .contains(&stage)
+                    {
+                        return Err(Refusal::internal(stage));
+                    }
+                    Ok(())
+                },
+                |p| {
+                    if stage == "timeout" {
+                        write_json(&p.join("commit.json"), &json!({"aborted":true}))?;
+                    }
+                    if ["commit", "timeout"].contains(&stage) {
+                        return Err(Refusal::internal(stage));
+                    }
+                    write_json(&p.join("commit.json"), &json!({}))
+                },
+                move |_| {
+                    seen.set(seen.get() + 1);
+                    if stage == "cleanup-panic" {
+                        panic!("cleanup");
+                    }
+                    if stage == "cleanup" {
+                        return Err(Refusal::internal("probe failed"));
+                    }
+                    Ok(true)
+                },
+            );
+            if stage == "title" {
+                assert!(result.is_ok());
+                assert_eq!(cleaned.get(), 0);
+                continue;
+            }
+            assert!(result.is_err(), "{stage}");
+            assert!(folder.join("spec.json").exists());
+            let calls = w.fakes.hc_calls();
+            assert_eq!(calls.iter().filter(|(_, a, _)| a[0] == "run").count(), 1);
+            assert_eq!(
+                calls
+                    .iter()
+                    .filter(|(_, a, _)| a[0] == "kill")
+                    .map(|(_, a, _)| a[1].as_str())
+                    .collect::<Vec<_>>(),
+                ["t1"]
+            );
+            assert_eq!(
+                cleaned.get(),
+                usize::from(!["identity", "attach", "reply"].contains(&stage)),
+                "{stage}"
+            );
+            if stage != "abort-write" {
+                let e = crate::state::fs::read_json(&folder.join("abort.json"))
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(e["hcAddress"], "t1");
+                if stage == "kill" {
+                    assert_eq!(e["kill"]["uncertain"], true);
+                }
+                if stage == "cleanup-panic" {
+                    assert_eq!(e["viewCleanup"]["failed"], true);
+                }
+            }
+            assert!(!crate::agents::committed(&folder), "{stage}");
+        }
     }
 }
