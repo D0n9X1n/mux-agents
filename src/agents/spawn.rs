@@ -217,7 +217,7 @@ struct Agent {
     session: String,
     plan: Plan,
     folder: PathBuf,
-    // A Copilot fork's session copy, deleted on any failure.
+    // A Copilot fork's copy; legacy pane failures remove it, hc failures retain it.
     copied: Option<PathBuf>,
 }
 
@@ -230,6 +230,78 @@ impl Agent {
 }
 
 impl Launch<'_> {
+    fn allocate(&self, state: &Path, name: String, color: &'static str) -> Res<Agent> {
+        let (ctx, caller) = (self.ctx, self.caller);
+        let mut plan = context_plan(caller, self.client, &ctx.env, self.no_fork);
+        let session = guid()?;
+        let id = hex_id()?;
+        let mut copied = None;
+        if plan.context == Context::Fork && self.client == Client::Copilot {
+            let parent = plan.parent_session.clone().unwrap_or_default();
+            if copilot::copy_session(&ctx.home, &parent, &session) {
+                copied = Some(copilot::session_folder(&ctx.home, &session));
+            } else {
+                plan = Plan {
+                    context: Context::Brief,
+                    reason: "copy-verification-failed",
+                    parent_session: None,
+                };
+            }
+        }
+        // A brief plan never has a copy, so nothing is left behind here.
+        if plan.context == Context::Brief && caller.kind == Kind::Agent && self.brief.is_none() {
+            return refuse(
+                2,
+                "brief",
+                "this agent starts brief-only, so an agent caller passes -BriefFile",
+            );
+        }
+        Ok(Agent {
+            folder: state.join("agents").join(&id),
+            id,
+            name,
+            color,
+            session,
+            plan,
+            copied,
+        })
+    }
+
+    fn record(
+        &self,
+        agent: &Agent,
+        new_pane: &str,
+        window: &str,
+        start_command: &str,
+    ) -> Res<Value> {
+        let (ctx, caller) = (self.ctx, self.caller);
+        let parent_agent = match (&caller.agent, caller.client) {
+            (Some(parent), Some(client)) => {
+                let session = ctx
+                    .env
+                    .get(session_variable(client))
+                    .filter(|s| session_id(s));
+                json!({"client": client_name(client), "pid": parent.pid, "start": parent.start, "sessionId": session})
+            }
+            _ => Value::Null,
+        };
+        let client = client_name(self.client);
+        let context = context_name(agent.plan.context);
+        let mut record = json!({"schema": 1, "id": agent.id, "name": agent.name, "client": client,
+            "sessionId": agent.session, "context": context, "reason": agent.plan.reason,
+            "session": caller.session, "pane": new_pane, "window": window, "parentPane": caller.pane,
+            "parentAgent": parent_agent, "directory": utf8(&self.directory)?,
+            "taskLine": doing_line(&self.task), "createdAt": utc_o(ctx.clock.now())});
+        record["color"] = agent.color.into();
+        // The exact command the pane started, as the multiplexer renders it: the agent is the pane running it (#48).
+        record["startCommand"] = start_command.into();
+        // No model is the client's own; a chosen one is the record's last field.
+        if let Some(model) = self.model {
+            record["model"] = model.into();
+        }
+        Ok(record)
+    }
+
     fn run(&self) -> Res<Map<String, Value>> {
         let (ctx, caller) = (self.ctx, self.caller);
         let state = state_dir(ctx, caller)?;
@@ -257,39 +329,7 @@ impl Launch<'_> {
             .collect();
         let name = resolve_name(self.requested, self.client, &self.task, &taken)?;
         let color = hue_for(&snapshot);
-        let mut plan = context_plan(caller, self.client, &ctx.env, self.no_fork);
-        let session = guid()?;
-        let id = hex_id()?;
-        let mut copied = None;
-        if plan.context == Context::Fork && self.client == Client::Copilot {
-            let parent = plan.parent_session.clone().unwrap_or_default();
-            if copilot::copy_session(&ctx.home, &parent, &session) {
-                copied = Some(copilot::session_folder(&ctx.home, &session));
-            } else {
-                plan = Plan {
-                    context: Context::Brief,
-                    reason: "copy-verification-failed",
-                    parent_session: None,
-                };
-            }
-        }
-        // A brief plan never has a copy, so nothing is left behind here.
-        if plan.context == Context::Brief && caller.kind == Kind::Agent && self.brief.is_none() {
-            return refuse(
-                2,
-                "brief",
-                "this agent starts brief-only, so an agent caller passes -BriefFile",
-            );
-        }
-        let agent = Agent {
-            folder: state.join("agents").join(&id),
-            id,
-            name,
-            color,
-            session,
-            plan,
-            copied,
-        };
+        let agent = self.allocate(&state, name, color)?;
         let spec = match self.prepare(&agent) {
             Ok(spec) => spec,
             Err(refusal) => {
@@ -499,30 +539,9 @@ impl Launch<'_> {
                 "the new pane no longer runs the agent's launch",
             ));
         }
-        let parent_agent = match (&caller.agent, caller.client) {
-            (Some(parent), Some(client)) => {
-                let session = ctx
-                    .env
-                    .get(session_variable(client))
-                    .filter(|s| session_id(s));
-                json!({"client": client_name(client), "pid": parent.pid, "start": parent.start, "sessionId": session})
-            }
-            _ => Value::Null,
-        };
+        let record = self.record(agent, &new_pane, &window, &start_command)?;
         let client = client_name(self.client);
         let context = context_name(agent.plan.context);
-        let mut record = json!({"schema": 1, "id": agent.id, "name": agent.name, "client": client,
-            "sessionId": agent.session, "context": context, "reason": agent.plan.reason,
-            "session": caller.session, "pane": new_pane, "window": window, "parentPane": caller.pane,
-            "parentAgent": parent_agent, "directory": utf8(&self.directory)?,
-            "taskLine": doing_line(&self.task), "createdAt": utc_o(ctx.clock.now())});
-        record["color"] = agent.color.into();
-        // The exact command the pane started, as the multiplexer renders it: the agent is the pane running it (#48).
-        record["startCommand"] = start_command.into();
-        // No model is the client's own; a chosen one is the record's last field.
-        if let Some(model) = self.model {
-            record["model"] = model.into();
-        }
         write_json(&agent.folder.join("record.json"), &record)?;
         // Last: only a committed agent is live.
         commit(ctx, &agent.folder)?;
@@ -915,6 +934,37 @@ mod tests {
 
     fn human() -> World {
         ready(World::human(""))
+    }
+
+    #[test]
+    fn shared_preparation_preserves_pane_metadata() {
+        let w = human();
+        let caller = w.caller();
+        let launch = Launch {
+            ctx: &w.ctx,
+            caller: &caller,
+            client: Client::Claude,
+            requested: None,
+            model: Some("sonnet"),
+            no_fork: true,
+            task: "task".into(),
+            brief: None,
+            directory: w.ctx.cwd.clone(),
+            split: None,
+        };
+        let a = launch
+            .allocate(&w.state(), "worker".into(), "blue")
+            .unwrap();
+        let r = launch.record(&a, "%9", "@5", "literal").unwrap();
+        assert_eq!(
+            (&r["pane"], &r["window"], &r["startCommand"]),
+            (&json!("%9"), &json!("@5"), &json!("literal"))
+        );
+        assert_eq!(r["color"], "blue");
+        assert_eq!(r["model"], "sonnet");
+        assert_eq!(r["id"], a.id);
+        assert_eq!(r["directory"], json!(w.ctx.cwd));
+        assert_eq!(r["sessionId"], a.session);
     }
 
     // An agent caller whose C3, C2 and C5 checks the tests skip, as an admitted pane's are.
