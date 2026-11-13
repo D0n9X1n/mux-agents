@@ -52,6 +52,7 @@ fn ctx() -> Res<Ctx> {
         exe: exe()?,
         os: mux_agent::proc::host(),
         mux: RefCell::new(None),
+        hc: Box::new(mux_agent::hc::NativeHc),
         clock: Box::new(SystemClock),
         admitted: false,
         tty: std::io::IsTerminal::is_terminal(&std::io::stdout()),
