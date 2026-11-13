@@ -26,6 +26,21 @@ pub(crate) fn execute(
 ) -> Res<Value> {
     let core = hc::connect(ctx)?;
     let mut p = prepare()?;
+    let mut candidate = p.record.clone();
+    candidate["hcAddress"] = json!("pending");
+    candidate["launcherArgv"] = json!(p.argv);
+    let id = field(&p.record, "id")?;
+    let team = field(&p.record, "team")?;
+    let spec = crate::state::fs::read_json(&p.folder.join("spec.json"))?;
+    if super::core_identity::Identity::read(&candidate, id, team).is_none()
+        || spec
+            .as_ref()
+            .and_then(|s| s.get("generation"))
+            .and_then(Value::as_str)
+            != Some("0")
+    {
+        return Err(Refusal::internal("invalid prepared identity or spec"));
+    }
     let id = field(&p.record, "id")?;
     if !super::agent_id(id) || p.argv.is_empty() || field(&p.record, "generation")? != "0" {
         return Err(Refusal::internal("invalid prepared generation"));
@@ -477,5 +492,75 @@ mod tests {
             Ok(true)
         }));
         assert!(cleaned.get());
+    }
+
+    #[test]
+    fn invalid_preparation_never_runs() {
+        for key in ["generation", "team", "sessionId", "spec"] {
+            let w = World::human("");
+            ready(&w);
+            let got = execute(
+                &w.ctx,
+                || {
+                    let mut p = prepared(&w);
+                    if key == "spec" {
+                        write_json(&p.folder.join("spec.json"), &json!({"generation":"1"}))?;
+                    } else {
+                        p.record[key] = json!("bad");
+                    }
+                    Ok(p)
+                },
+                |_, _, _| panic!("attach"),
+                |_| panic!("commit"),
+                |_| panic!("clean"),
+            );
+            assert!(got.is_err());
+            assert_eq!(w.fakes.hc_calls().len(), 1, "{key}");
+        }
+    }
+    #[test]
+    fn kill_provider_panic_still_cleans_the_proven_view() {
+        struct PanicKill(Fakes);
+        impl crate::hc::Hc for PanicKill {
+            fn find(&self, n: &str, p: &str) -> Option<PathBuf> {
+                crate::hc::Hc::find(&self.0, n, p)
+            }
+            fn captured(&self, p: &Path, a: &[&str], t: std::time::Duration) -> Res<Out> {
+                let out = crate::hc::Hc::captured(&self.0, p, a, t);
+                if a[0] == "kill" {
+                    panic!("kill uncertain");
+                }
+                out
+            }
+        }
+        let mut w = World::human("");
+        ready(&w);
+        answer(&w.fakes, r#"{"address":"t1"}"#);
+        answer(&w.fakes, "{}");
+        w.ctx.hc = Box::new(PanicKill(w.fakes.clone()));
+        let cleaned = Cell::new(false);
+        let e = execute(
+            &w.ctx,
+            || Ok(prepared(&w)),
+            |_, _, pane| {
+                *pane = Some(created());
+                Err(Refusal::internal("proof"))
+            },
+            |_| panic!("commit"),
+            |_| {
+                cleaned.set(true);
+                Ok(true)
+            },
+        )
+        .unwrap_err();
+        assert_eq!(e.message, "unexpected error (proof)");
+        assert!(cleaned.get());
+        let v = crate::state::fs::read_json(
+            &w.ctx.state_root.join("key/agents/aaaaaaaaaaaa/abort.json"),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(v["kill"]["uncertain"], true);
+        assert_eq!(v["viewCleanup"]["gone"], true);
     }
 }
