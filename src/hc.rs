@@ -170,6 +170,111 @@ impl Core<'_> {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum State {
+    Live,
+    Finished,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Reason {
+    Exited,
+    Killed,
+    ServerStop,
+    Other(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Foreground {
+    pub argv: Vec<String>,
+    pub pid: i32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Terminal {
+    pub address: String,
+    pub state: State,
+    pub reason: Option<Reason>,
+    pub exit_code: Option<i32>,
+    pub argv: Vec<String>,
+    pub foreground: Option<Foreground>,
+    pub labels: std::collections::BTreeMap<String, String>,
+    pub pid: Option<u32>,
+}
+
+fn string(v: &Value) -> Res<String> {
+    v.as_str().map(str::to_owned).ok_or_else(invalid)
+}
+
+fn strings(v: &Value) -> Res<Vec<String>> {
+    v.as_array()
+        .ok_or_else(invalid)?
+        .iter()
+        .map(string)
+        .collect()
+}
+
+fn optional<T>(v: &Value, k: &str, f: impl FnOnce(&Value) -> Res<T>) -> Res<Option<T>> {
+    match v.get(k) {
+        None | Some(Value::Null) => Ok(None),
+        Some(x) => f(x).map(Some),
+    }
+}
+
+fn pid(v: &Value) -> Res<u32> {
+    v.as_u64()
+        .and_then(|n| u32::try_from(n).ok())
+        .ok_or_else(invalid)
+}
+
+impl Terminal {
+    fn decode(v: &Value) -> Res<Self> {
+        Ok(Self {
+            address: address(v)?,
+            state: match v["state"].as_str() {
+                Some("live") => State::Live,
+                Some("finished") => State::Finished,
+                _ => return Err(invalid()),
+            },
+            reason: optional(v, "reason", |x| match x.as_str() {
+                Some("exited") => Ok(Reason::Exited),
+                Some("killed") => Ok(Reason::Killed),
+                Some("server_stop") => Ok(Reason::ServerStop),
+                Some(s) => Ok(Reason::Other(s.into())),
+                None => Err(invalid()),
+            })?,
+            exit_code: optional(v, "exit_code", |x| {
+                x.as_i64()
+                    .and_then(|n| i32::try_from(n).ok())
+                    .ok_or_else(invalid)
+            })?,
+            argv: strings(&v["argv"])?,
+            foreground: optional(v, "foreground", |x| {
+                Ok(Foreground {
+                    argv: strings(&x["argv"])?,
+                    pid: x["pid"]
+                        .as_i64()
+                        .and_then(|n| i32::try_from(n).ok())
+                        .ok_or_else(invalid)?,
+                })
+            })?,
+            labels: v["labels"]
+                .as_object()
+                .ok_or_else(invalid)?
+                .iter()
+                .map(|(k, v)| Ok((k.clone(), string(v)?)))
+                .collect::<Res<_>>()?,
+            pid: optional(v, "pid", pid)?,
+        })
+    }
+}
+
+impl Core<'_> {
+    pub fn get(&self, t: &str) -> Res<Terminal> {
+        Terminal::decode(&self.json(&["get".into(), t.into(), "--json".into()])?)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -326,6 +431,150 @@ mod tests {
             assert!(h.run(&r).is_err());
         }
         assert_eq!(f.hc_calls().len(), 2);
+    }
+
+    #[test]
+    fn hc_terminal_fields() {
+        for (state, reason, code, argv) in [
+            (
+                "live",
+                Value::Null,
+                Value::Null,
+                serde_json::json!(["/bin/zsh", "-l"]),
+            ),
+            (
+                "finished",
+                serde_json::json!("exited"),
+                serde_json::json!(7),
+                serde_json::json!(["claude"]),
+            ),
+            (
+                "finished",
+                serde_json::json!("killed"),
+                Value::Null,
+                serde_json::json!([]),
+            ),
+            (
+                "finished",
+                serde_json::json!("server_stop"),
+                Value::Null,
+                serde_json::json!([]),
+            ),
+            (
+                "live",
+                serde_json::json!("spawn_pending"),
+                Value::Null,
+                serde_json::json!([]),
+            ),
+        ] {
+            let f = Fakes::default();
+            f.hc_install("hc");
+            answer(&f, "hc 0.1.21");
+            let wire = serde_json::json!({
+                "address": "t1",
+                "state": state,
+                "reason": reason,
+                "exit_code": code,
+                "argv": argv,
+                "foreground": {"argv": ["child"], "pid": 8, "name": "ignored"},
+                "labels": {"team": "x"},
+                "pid": 7,
+                "future_field": "ignored",
+            });
+            answer(&f, &wire.to_string());
+            let c = f.ctx();
+            let t = connect(&c).unwrap().get("t1").unwrap();
+            assert_eq!(t.address, "t1");
+            assert_eq!(
+                t.state,
+                if state == "live" {
+                    State::Live
+                } else {
+                    State::Finished
+                }
+            );
+            assert_eq!(
+                t.reason,
+                match wire["reason"].as_str() {
+                    Some("exited") => Some(Reason::Exited),
+                    Some("killed") => Some(Reason::Killed),
+                    Some("server_stop") => Some(Reason::ServerStop),
+                    Some(s) => Some(Reason::Other(s.into())),
+                    None => None,
+                }
+            );
+            assert_eq!(t.exit_code, wire["exit_code"].as_i64().map(|n| n as i32));
+            assert_eq!(serde_json::json!(t.argv), wire["argv"]);
+            assert_eq!(t.pid, Some(7));
+            assert_eq!(t.labels["team"], "x");
+            assert_eq!(
+                t.foreground,
+                Some(Foreground {
+                    argv: vec!["child".into()],
+                    pid: 8,
+                })
+            );
+            assert_eq!(f.hc_calls()[1].1, ["get", "t1", "--json"]);
+            assert_eq!(f.hc_calls()[1].2, Duration::from_secs(15));
+        }
+
+        let minimal = serde_json::json!({
+            "address": "t1",
+            "state": "live",
+            "argv": [],
+            "labels": {},
+        });
+        for nulls in [false, true] {
+            let mut wire = minimal.clone();
+            if nulls {
+                for key in ["reason", "exit_code", "foreground", "pid"] {
+                    wire[key] = Value::Null;
+                }
+            }
+            let t = Terminal::decode(&wire).unwrap();
+            assert_eq!(
+                (t.reason, t.exit_code, t.foreground, t.pid),
+                (None, None, None, None)
+            );
+        }
+        for key in ["address", "state", "argv", "labels"] {
+            let mut wire = minimal.clone();
+            wire.as_object_mut().unwrap().remove(key);
+            assert!(Terminal::decode(&wire).is_err(), "missing {key}");
+            wire[key] = Value::Null;
+            assert!(Terminal::decode(&wire).is_err(), "null {key}");
+        }
+        for (key, bad) in [
+            ("address", serde_json::json!("")),
+            ("address", serde_json::json!(1)),
+            ("state", serde_json::json!("unknown")),
+            ("state", serde_json::json!(1)),
+            ("argv", serde_json::json!([1])),
+            ("argv", serde_json::json!("claude")),
+            ("labels", serde_json::json!({"team": 1})),
+            ("labels", serde_json::json!([])),
+            ("reason", serde_json::json!(1)),
+            ("exit_code", serde_json::json!("7")),
+            ("exit_code", serde_json::json!(i64::from(i32::MAX) + 1)),
+            ("exit_code", serde_json::json!(i64::from(i32::MIN) - 1)),
+            ("pid", serde_json::json!(-1)),
+            ("pid", serde_json::json!("7")),
+            ("pid", serde_json::json!(u64::from(u32::MAX) + 1)),
+            ("foreground", serde_json::json!({"argv": []})),
+            ("foreground", serde_json::json!({"pid": 8})),
+            ("foreground", serde_json::json!({"argv": [1], "pid": 8})),
+            ("foreground", serde_json::json!({"argv": [], "pid": "8"})),
+            (
+                "foreground",
+                serde_json::json!({"argv": [], "pid": i64::from(i32::MAX) + 1}),
+            ),
+        ] {
+            let mut wire = minimal.clone();
+            wire[key] = bad;
+            let e = Terminal::decode(&wire).unwrap_err();
+            assert_eq!((e.code, e.check), (1, "hc"), "{wire}");
+            assert_eq!(e.message, "hc returned invalid JSON", "{wire}");
+        }
     }
 
     #[test]
