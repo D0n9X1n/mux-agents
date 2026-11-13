@@ -757,6 +757,45 @@ mod tests {
     }
 
     #[test]
+    fn attached_env_does_not_change_process_environment() {
+        for state in [None, Some("inherited-root")] {
+            let mut command = Std::new(me());
+            command.args(probe_args("attached_env_parent", &[]));
+            if let Some(state) = state {
+                command.env("MUX_AGENTS_STATE", state);
+            } else {
+                command.env_remove("MUX_AGENTS_STATE");
+            }
+            let out = command.output().unwrap();
+            assert!(
+                out.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr),
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "a child of attached_env_does_not_change_process_environment"]
+    fn attached_env_parent() {
+        if !probing() {
+            return;
+        }
+        let before = std::env::var_os("MUX_AGENTS_STATE");
+        let value = format!("leak-probe-{}", crate::util::hex_id().unwrap());
+        let code = attached_env(
+            &me(),
+            &probe_args("probe_report", &[]),
+            &[],
+            &[("MUX_AGENTS_STATE", &value)],
+        )
+        .unwrap();
+        assert_eq!(code, 7);
+        assert_eq!(std::env::var_os("MUX_AGENTS_STATE"), before);
+    }
+
+    #[test]
     fn attached_overlay_is_command_local() {
         let before = std::env::var_os("PATH");
         let c = attached_command(
