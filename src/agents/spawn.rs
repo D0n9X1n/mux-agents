@@ -689,7 +689,7 @@ pub fn client_args(
             args.splice(0..0, flags);
         }
     }
-    if let Some(task) = prompt {
+    if let Some(task) = prompt.filter(|task| !task.is_empty()) {
         if client == Client::Copilot {
             args.push("-i".into());
         }
@@ -1146,12 +1146,29 @@ mod tests {
     }
 
     #[test]
+    fn recipes_omit_empty_tasks() {
+        for client in [Client::Claude, Client::Copilot] {
+            assert_eq!(
+                client_args(client, Recipe::First(Some("")), "own", None),
+                client_args(client, Recipe::First(None), "own", None),
+                "empty task is absent"
+            );
+            assert_eq!(
+                client_args(client, Recipe::First(Some(" ")), "own", None)
+                    .last()
+                    .map(String::as_str),
+                Some(" ")
+            );
+        }
+    }
+
+    #[test]
     fn recipe_matrix() {
         let id = "0f11fc2f-2032-48ef-a920-4af2a8e5af50";
         for c in [Client::Claude, Client::Copilot] {
             for task in [None, Some(""), Some("task --fork-session parent")] {
                 let mut expected = vec!["--session-id".to_string(), id.into()];
-                if let Some(t) = task {
+                if let Some(t) = task.filter(|t| !t.is_empty()) {
                     if c == Client::Copilot {
                         expected.push("-i".into());
                     }
