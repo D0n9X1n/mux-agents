@@ -114,6 +114,7 @@ pub(crate) mod tests {
             ("generation", json!("A")),
             ("sessionId", json!("bad")),
             ("launcherArgv", json!([])),
+            ("launcherArgv", json!(["", "launcher", "/spec"])),
             ("session", json!("$4")),
         ] {
             let mut bad = r.clone();
@@ -189,6 +190,14 @@ pub(crate) mod tests {
         let mut changed = row.clone();
         changed.command = "human shell".into();
         assert!(id.view(&r, &[changed]).is_none());
+        for pid in ["1", "0", ""] {
+            let mut invalid = row.clone();
+            invalid.pid = pid.into();
+            assert!(id.view(&r, &[invalid]).is_none(), "pid {pid:?}");
+        }
+        let mut invalid_window = row.clone();
+        invalid_window.window = "1".into();
+        assert!(id.view(&r, &[invalid_window]).is_none(), "window without @");
         let mut dead = row;
         dead.dead = true;
         assert!(id.view(&r, &[dead]).is_none());

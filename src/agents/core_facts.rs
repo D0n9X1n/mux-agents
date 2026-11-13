@@ -188,6 +188,7 @@ mod tests {
             "foreign",
             "bad-id",
             "bad-gen",
+            "bad-name",
             "missing-name",
             "failed-get",
             "failed-ls",
@@ -220,6 +221,7 @@ mod tests {
                 "foreign" => v["labels"]["mux.team"] = json!("other:$3"),
                 "bad-id" => v["labels"]["mux.id"] = json!("not-an-id"),
                 "bad-gen" => v["labels"]["mux.gen"] = json!("../0"),
+                "bad-name" => v["labels"]["mux.name"] = json!("Bad Name"),
                 "missing-name" => {
                     v["labels"].as_object_mut().unwrap().remove("mux.name");
                 }
