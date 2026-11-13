@@ -32,6 +32,10 @@ impl Snapshot {
     }
 }
 pub fn take(core: &Core<'_>, team: &str, members: &[Identity]) -> Res<Snapshot> {
+    let unique: BTreeSet<_> = members.iter().map(|i| i.address.as_str()).collect();
+    if unique.len() != members.len() || members.iter().any(|i| i.team != team) {
+        return Err(Refusal::internal("ambiguous local core identity"));
+    }
     let listed = core.ls(&[("mux.managed", "1"), ("mux.team", team)])?;
     let addresses: BTreeSet<String> = listed
         .iter()
@@ -75,6 +79,14 @@ pub fn take(core: &Core<'_>, team: &str, members: &[Identity]) -> Res<Snapshot> 
             || t.labels.get("mux.team").map(String::as_str) != Some(team)
         {
             return Err(Refusal::internal("invalid cross-root reservation"));
+        }
+        if !t.labels.get("mux.id").is_some_and(|s| super::agent_id(s))
+            || !t
+                .labels
+                .get("mux.gen")
+                .is_some_and(|s| super::core_identity::generation(s))
+        {
+            return Err(Refusal::internal("invalid cross-root identity"));
         }
         if classify(Some(t), &[]) == Life::Ended {
             continue;
@@ -166,6 +178,70 @@ mod tests {
                 s.names().contains(&"worker".to_string()),
                 want != Life::Ended
             );
+        }
+    }
+    #[test]
+    fn reservations_fail_closed_and_only_ended_frees_names() {
+        for case in [
+            "duplicate",
+            "wrong-team",
+            "foreign",
+            "bad-id",
+            "bad-gen",
+            "missing-name",
+            "failed-get",
+            "failed-ls",
+            "ended",
+            "live",
+        ] {
+            let f = Fakes::default();
+            connect(&f);
+            let ctx = f.ctx();
+            let core = hc::connect(&ctx).unwrap();
+            let id = identity();
+            if case == "duplicate" {
+                assert!(take(&core, "k:$3", &[id.clone(), id]).is_err());
+                assert_eq!(f.hc_calls().len(), 1);
+                continue;
+            }
+            if case == "wrong-team" {
+                assert!(take(&core, "k:$4", &[identity()]).is_err());
+                assert_eq!(f.hc_calls().len(), 1);
+                continue;
+            }
+            if case == "failed-ls" {
+                f.hc_answer(Err(crate::error::Refusal::internal("ls failed")));
+                assert!(take(&core, "k:$3", &[]).is_err());
+                continue;
+            }
+            answer(&f, json!({"terminals":[{"address":"t1"}]}));
+            let mut v = wire(&id);
+            match case {
+                "foreign" => v["labels"]["mux.team"] = json!("other:$3"),
+                "bad-id" => v["labels"]["mux.id"] = json!("not-an-id"),
+                "bad-gen" => v["labels"]["mux.gen"] = json!("../0"),
+                "missing-name" => {
+                    v["labels"].as_object_mut().unwrap().remove("mux.name");
+                }
+                "ended" => {
+                    v["state"] = json!("finished");
+                    v["reason"] = json!("killed");
+                }
+                _ => {}
+            }
+            if case == "failed-get" {
+                f.hc_answer(Err(crate::error::Refusal::internal("get failed")));
+            } else {
+                answer(&f, v);
+            }
+            let got = take(&core, "k:$3", &[]);
+            if ["ended", "live"].contains(&case) {
+                let s = got.unwrap();
+                assert_eq!(s.count(), usize::from(case == "live"));
+                assert_eq!(s.names().contains(&"worker".into()), case == "live");
+            } else {
+                assert!(got.is_err(), "{case}");
+            }
         }
     }
 }
