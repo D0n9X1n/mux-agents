@@ -34,9 +34,6 @@ type Wake = Rc<dyn Fn(usize)>;
 type Read = Rc<dyn Fn(u64)>;
 type HcProbe = Rc<dyn Fn(&[String])>;
 
-// What `stop_report` answers for the rows stop left.
-type Report = fn(&[Left]) -> serde_json::Map<String, serde_json::Value>;
-
 struct HcAnswer {
     argv: Option<Vec<String>>,
     result: Res<crate::spawn::Out>,
@@ -68,9 +65,6 @@ struct Log {
     // `+key` on taking a lock and `-key` on releasing it, each followed by the probe's answer when one is set.
     locks: Vec<String>,
     held: Vec<String>,
-    // Pids whose kill shows an exit; any other kill fails.
-    kills: Vec<u32>,
-    report: Option<Report>,
     probe: Option<Probe>,
     wake: Option<Wake>,
     read: Option<Read>,
@@ -286,19 +280,6 @@ impl Fakes {
             .extend(starts.iter().copied());
     }
 
-    /// A kill of this pid shows the exit.
-    pub fn kill_ok(&self, pid: u32) {
-        self.0.borrow_mut().kills.push(pid);
-    }
-
-    /// What `stop_report` answers; none answers an empty map.
-    pub fn stop_report_with(
-        &self,
-        report: fn(&[Left]) -> serde_json::Map<String, serde_json::Value>,
-    ) {
-        self.0.borrow_mut().report = Some(report);
-    }
-
     /// Moves the last listed row to the front, so `row` answers it for its pid.
     pub fn prefer_last(&self) {
         let mut log = self.0.borrow_mut();
@@ -502,7 +483,7 @@ impl Os for Fakes {
 
     fn kill(&self, opened: Opened) -> bool {
         self.os_call(format!("kill {}", opened.pid));
-        self.0.borrow().kills.contains(&opened.pid)
+        false
     }
 
     fn cwd(&self, pid: u32) -> Option<String> {
@@ -524,9 +505,8 @@ impl Os for Fakes {
         opened == listed
     }
 
-    fn stop_report(&self, left: &[Left]) -> serde_json::Map<String, serde_json::Value> {
-        let report = self.0.borrow().report;
-        report.map_or_else(serde_json::Map::new, |report| report(left))
+    fn stop_report(&self, _: &[Left]) -> serde_json::Map<String, serde_json::Value> {
+        serde_json::Map::new()
     }
 
     fn token(&self) -> Option<Token> {

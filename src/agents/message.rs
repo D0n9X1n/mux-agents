@@ -1,6 +1,5 @@
 //! send, read and stop (MuxAgents.ps1:1298-1333, 1354-1421).
 
-use std::collections::{HashSet, VecDeque};
 use std::ops::RangeInclusive;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
@@ -14,10 +13,8 @@ use super::{FILES_ONLY, lock, lock_key, pane_id, server_dir, text, usage};
 use crate::caller::{Kind, resolve};
 use crate::cli::Request;
 use crate::ctx::Ctx;
-use crate::error::{Refusal, Res, refuse};
+use crate::error::{Res, refuse};
 use crate::mux::native;
-use crate::proc::seam::hold;
-use crate::proc::{Left, Reason, Row};
 use crate::state::fs::{BODY_MAX, read_json, read_text, write_json};
 
 /// Appends a message to a live agent's, the parent's or a session pane's mailbox. Never types into a pane.
@@ -336,150 +333,6 @@ impl Drop for Waiting<'_> {
 }
 
 const POLL: Duration = Duration::from_millis(500);
-const TREE_MAX: usize = 256;
-const NOT_ITS_LAUNCH: &str =
-    "the agent's pane is no longer its own launch, so nothing was closed or signalled";
-
-/// Closes a live agent's pane, then stops any survivor of the pane's process tree (same pid and start only). Its
-/// parent or a human may stop it. Posts the `stopped` notice and returns the resume command. Runs a reap first. A
-/// name with no live agent but an ended one (the newest, any of them) answers `already:<state>` and closes nothing;
-/// so does a live one found ended under its notice lock, before any kill or signal: a notice already posted, or its
-/// pane gone (then noticed here, as a reap would).
-pub fn stop(ctx: &Ctx, request: &Request) -> Res<Map<String, Value>> {
-    let caller = resolve(ctx)?;
-    let name = first(request);
-    let none = || refuse(2, "target", "no live agent has that name");
-    if !super::agent_name(name) {
-        return none();
-    }
-    let snapshot = registry::live_after_reap(ctx, &caller)?;
-    let live = snapshot.running();
-    let Some(pane) = live.iter().find(|p| p.name == name).cloned() else {
-        return match super::board::newest_ended(ctx, &caller, &live, name)? {
-            Some((_, record, state)) => {
-                parent_or_human(&caller, &record)?;
-                let pane = text(record.get("pane"));
-                Ok(already(&record, pane, &state))
-            }
-            None => none(),
-        };
-    };
-    let record = pane.record.clone();
-    parent_or_human(&caller, &record)?;
-    let folder = server_dir(ctx, &caller).join("agents").join(&pane.id);
-    let launcher = folder.join("launcher.json");
-    let marker = folder.join("notice.json");
-    let left = lock(ctx, &lock_key("notice", &caller, &pane.id), || {
-        // Ended since it was resolved: a notice is there, or the pane is gone and gets its one notice now. Checked
-        // before the pid is read: tmux 3.8 lists a dead pane with none.
-        registry::post_if_gone(ctx, &caller, &pane.id, &record)?;
-        if let Some(notice) = read_json(&marker)? {
-            return Ok(Err(text(notice.get("kind"))));
-        }
-        // A pane pid that is not a number would walk from pid 0, whose "children" are unrelated processes.
-        let root: u32 = pane
-            .pid
-            .parse()
-            .map_err(|_| Refusal::internal("the pane pid is not a number"))?;
-        // A 0.2.x record (no startCommand) is its launch only while its launcher is proven: checked again here,
-        // before any kill.
-        if let Some(pid) = pane.launch.pid
-            && (pid != root || !registry::proven_launcher(ctx, &caller, &pane.id, pid))
-        {
-            return refuse(1, "target", NOT_ITS_LAUNCH);
-        }
-        let table = ctx.os.table()?;
-        // The pane's process must be the agent's own launcher: launcher.json's pid and start, the table's start, and
-        // the start of the process the pid opens now, all one. A launcher that never recorded itself, or a pane pid
-        // reused since (in the table or at the open), is never walked: only the pane is closed, and every tree row is
-        // left unverified.
-        let recorded = read_json(&launcher)
-            .ok()
-            .flatten()
-            .and_then(|l| Some((l.get("pid")?.as_u64()?, l.get("start")?.as_i64()?)));
-        let listed = table
-            .iter()
-            .find(|row| row.pid == root)
-            .and_then(|row| row.start);
-        let launcher_root = match (recorded, listed) {
-            (Some((pid, start)), Some(listed))
-                if pid == u64::from(root) && ctx.os.same_start(start, listed) =>
-            {
-                ctx.os.open(root).filter(|opened| {
-                    ctx.os.same_start(opened.start, start)
-                        && ctx.os.same_start(opened.start, listed)
-                })
-            }
-            _ => None,
-        };
-        let tree = tree(&table, root);
-        // Every tree row that is not killed is left with its reason: unverified, not opened, another start, or a
-        // failed kill.
-        let mut left = Vec::new();
-        let mut held = Vec::new();
-        match launcher_root {
-            None => left.extend(tree.iter().map(|row| Left {
-                pid: row.pid,
-                reason: Reason::Unverified,
-            })),
-            Some(opened) => {
-                held.push(opened);
-                for row in tree.iter().filter(|row| row.pid != root) {
-                    match hold(ctx.os.open(row.pid), row.start, |a, b| {
-                        ctx.os.same_start(a, b)
-                    }) {
-                        Ok(opened) => held.push(opened),
-                        Err(reason) => left.push(Left {
-                            pid: row.pid,
-                            reason,
-                        }),
-                    }
-                }
-            }
-        }
-        // The server kills the pane only while it is still this live launch, in the same command; a fresh probe then
-        // decides. Not proven gone (replaced in between, or the probe failed): nothing is signalled, nothing noticed.
-        let kill = registry::bound(
-            &pane.pane,
-            pane.launch.live(),
-            format!("kill-pane -t {}", pane.pane),
-        );
-        let kill: Vec<&str> = kill.iter().map(String::as_str).collect();
-        let _ = native(ctx, &kill, true);
-        if !registry::pane_gone(ctx, &pane.pane).unwrap_or(false) {
-            drop(held);
-            return refuse(1, "target", NOT_ITS_LAUNCH);
-        }
-        for opened in held {
-            let pid = opened.pid;
-            if !ctx.os.kill(opened) {
-                left.push(Left {
-                    pid,
-                    reason: Reason::Kill,
-                });
-            }
-        }
-        add_notice(ctx, &caller, &pane.id, &record, Notice::Stopped)?;
-        Ok(Ok(left))
-    })?;
-    let left = match left {
-        Ok(left) => left,
-        Err(state) => return Ok(already(&record, pane.pane, &state)),
-    };
-    let mut reply = Map::new();
-    reply.insert(
-        "name".into(),
-        record.get("name").cloned().unwrap_or(Value::Null),
-    );
-    reply.insert("pane".into(), pane.pane.into());
-    reply.extend(ctx.os.stop_report(&left));
-    reply.insert(
-        "directory".into(),
-        record.get("directory").cloned().unwrap_or(Value::Null),
-    );
-    reply.insert("resume".into(), resume(&record).into());
-    Ok(reply)
-}
 
 /// Refuses an agent caller that is not the record's parent.
 fn parent_or_human(caller: &crate::caller::Caller, record: &Value) -> Res<()> {
@@ -493,61 +346,6 @@ fn parent_or_human(caller: &crate::caller::Caller, record: &Value) -> Res<()> {
         );
     }
     Ok(())
-}
-
-/// `<client> --resume <sessionId>`.
-fn resume(record: &Value) -> String {
-    let client = if text(record.get("client")).eq_ignore_ascii_case("claude") {
-        "claude"
-    } else {
-        "copilot"
-    };
-    format!("{client} --resume {}", text(record.get("sessionId")))
-}
-
-/// The reply for an agent that had already ended: nothing closed, signalled or noticed.
-fn already(record: &Value, pane: String, state: &str) -> Map<String, Value> {
-    let mut reply = Map::new();
-    reply.insert(
-        "name".into(),
-        record.get("name").cloned().unwrap_or(Value::Null),
-    );
-    reply.insert("pane".into(), pane.into());
-    reply.insert("already".into(), state.into());
-    reply.insert(
-        "directory".into(),
-        record.get("directory").cloned().unwrap_or(Value::Null),
-    );
-    reply.insert("resume".into(), resume(record).into());
-    reply
-}
-
-/// The pane's process and its descendants, breadth first, at most 256. A child that started before its parent is
-/// a reused pid, not a child; a row without a start cannot show that, so the walk passes through it. Each pid is
-/// walked once, so rows naming each other as parent end.
-fn tree(table: &[Row], root: u32) -> Vec<&Row> {
-    let mut tree = Vec::new();
-    let mut seen = HashSet::new();
-    let mut queue = VecDeque::from([root]);
-    while let Some(current) = queue.pop_front() {
-        if tree.len() >= TREE_MAX {
-            break;
-        }
-        if !seen.insert(current) {
-            continue;
-        }
-        let parent = table.iter().find(|row| row.pid == current);
-        let parent_start = parent.and_then(|row| row.start);
-        tree.extend(parent);
-        for row in table {
-            let reused =
-                matches!((row.start, parent_start), (Some(child), Some(parent)) if child < parent);
-            if row.ppid == current && row.pid != current && !reused {
-                queue.push_back(row.pid);
-            }
-        }
-    }
-    tree
 }
 
 pub fn capture_hc(
@@ -609,13 +407,14 @@ pub fn stop_hc(ctx: &Ctx, request: &Request) -> Res<Map<String, Value>> {
 
 #[cfg(test)]
 mod tests {
+    use super::stop_hc as stop;
     use super::*;
-    use crate::agents::fixture::{CLAUDE, ID, SESSION_ID, World, launch_command, write};
+    use crate::agents::core_fixture as cf;
+    use crate::agents::fixture::{ID, World, launch_command, write};
     use crate::agents::lock_key;
     use crate::agents::view::focus;
+    use crate::error::Refusal;
     use crate::mux::Output;
-    use crate::proc::Os;
-    use crate::testing;
     use serde_json::json;
 
     type Handler = fn(&Ctx, &Request) -> Res<Map<String, Value>>;
@@ -623,8 +422,17 @@ mod tests {
     const PROBE: &str = "#{pane_id}|#{session_id}";
     const NONE: &str = "2 target no live agent has that name";
 
+    fn target_refusal(verb: &str) -> &'static str {
+        if verb == "stop" {
+            "2 target no unique committed member has that identity"
+        } else {
+            NONE
+        }
+    }
     fn run(w: &World, handler: Handler, args: &[&str]) -> String {
-        match handler(&w.ctx, &w.request(args)) {
+        let result = handler(&w.ctx, &w.request(args));
+        w.fakes.hc_done().unwrap();
+        match result {
             Ok(reply) => format!("ok {}", Value::Object(reply)),
             Err(r) => format!("{} {} {}", r.code, r.check, r.message),
         }
@@ -658,7 +466,11 @@ mod tests {
             w.panes(&["%9|@5|300|aaaaaaaaaaaa|worker"]);
             for (handler, args) in verbs(name) {
                 w.fakes.clear_log();
-                assert_eq!(run_owned(&w, handler, &args), NONE, "{args:?}");
+                assert_eq!(
+                    run_owned(&w, handler, &args),
+                    target_refusal(&args[0]),
+                    "{args:?}"
+                );
                 // Refused before any pane is listed.
                 assert!(!mux_verbs(&w).iter().any(|v| v == "list-panes"), "{args:?}");
             }
@@ -673,8 +485,20 @@ mod tests {
         for name in ["nobody", "worke", "workers"] {
             for (handler, args) in verbs(name) {
                 w.fakes.clear_log();
-                assert_eq!(run_owned(&w, handler, &args), NONE, "{args:?}");
-                assert_eq!(mux_verbs(&w), ["display-message", "list-panes"], "{args:?}");
+                assert_eq!(
+                    run_owned(&w, handler, &args),
+                    target_refusal(&args[0]),
+                    "{args:?}"
+                );
+                assert_eq!(
+                    mux_verbs(&w),
+                    if args[0] == "stop" {
+                        vec!["display-message"]
+                    } else {
+                        vec!["display-message", "list-panes"]
+                    },
+                    "{args:?}"
+                );
             }
         }
     }
@@ -686,16 +510,20 @@ mod tests {
         w.uncommitted(ID, json!({}));
         w.panes(&["%9|@5|300|aaaaaaaaaaaa|worker"]);
         for (handler, args) in verbs("worker") {
-            assert_eq!(run_owned(&w, handler, &args), NONE, "{args:?}");
+            assert_eq!(
+                run_owned(&w, handler, &args),
+                target_refusal(&args[0]),
+                "{args:?}"
+            );
         }
-        // Committed without a record: stop has nothing to stop or resume, and closes nothing.
+        // Committed without a record: stop has no hc identity and closes nothing.
         let w = World::human("");
         let folder = w.folder(ID);
         std::fs::create_dir_all(&folder).unwrap();
         write(&folder.join("commit.json"), json!({}));
         w.panes(&["%9|@5|300|aaaaaaaaaaaa|worker"]);
         w.fakes.clear_log();
-        assert_eq!(run(&w, stop, &["stop", "worker"]), NONE);
+        assert_eq!(run(&w, stop, &["stop", "worker"]), target_refusal("stop"));
         assert!(pane_kills(&w).is_empty());
     }
 
@@ -1098,75 +926,6 @@ mod tests {
         assert_eq!(w.fakes.slept(), [500, 500]);
     }
 
-    // The worker in pane %9 (pid 300) of a caller that is an agent (or a human); its tree is up to each test.
-    fn stop_world(agent: bool, fields: Value) -> World {
-        let w = if agent {
-            World::agent(ID)
-        } else {
-            World::human("")
-        };
-        let folder = w.agent_record("bbbbbbbbbbbb", fields);
-        // The launcher in pane %9 recorded its own pid and start.
-        write(
-            &folder.join("launcher.json"),
-            json!({"pid": 300, "start": 3000, "startedAt": "x"}),
-        );
-        w.panes(&["%9|@5|300|bbbbbbbbbbbb|worker"]);
-        emulate_pane9(&w, &launch_command("%9"));
-        w
-    }
-
-    // The multiplexer's pane %9: live, running `command` (shared, so a test can replace it); a conditional kill takes
-    // it only when its condition is %9's live launch as it is now, and the gone probe then answers empty fields.
-    fn emulate_pane9(w: &World, command: &str) -> std::rc::Rc<std::cell::RefCell<Option<String>>> {
-        let pane = std::rc::Rc::new(std::cell::RefCell::new(Some(command.to_string())));
-        let state = pane.clone();
-        w.fakes.mux_script("if-shell", move |argv| {
-            let mut held = state.borrow_mut();
-            let holds = held.as_ref().is_some_and(|command| {
-                let launch = registry::Launch {
-                    command: command.clone(),
-                    pid: None,
-                };
-                argv[5] == launch.live()
-            });
-            if holds && argv[6] == "kill-pane -t %9" {
-                *held = None;
-            }
-            Ok(crate::mux::Output::default())
-        });
-        let state = pane.clone();
-        w.fakes
-            .mux_script("-t %9 #{pane_id}|#{@agent-id}", move |_| {
-                let stdout = if state.borrow().is_some() {
-                    "%9|bbbbbbbbbbbb\n"
-                } else {
-                    "|\n"
-                };
-                Ok(crate::mux::Output {
-                    code: 0,
-                    stdout: stdout.into(),
-                    stderr: String::new(),
-                })
-            });
-        pane
-    }
-
-    // The conditional kill of %9 as the multiplexer receives it: only while it is still its live launch.
-    fn kill9() -> Vec<String> {
-        let launch = registry::Launch {
-            command: launch_command("%9"),
-            pid: None,
-        };
-        let mut argv = vec!["-N".to_string()];
-        argv.extend(registry::bound(
-            "%9",
-            launch.live(),
-            "kill-pane -t %9".into(),
-        ));
-        argv
-    }
-
     // Every kill of a pane sent to the multiplexer.
     fn pane_kills(w: &World) -> Vec<Vec<String>> {
         w.fakes
@@ -1174,536 +933,6 @@ mod tests {
             .into_iter()
             .filter(|c| c[1] == "kill-pane" || c.last().is_some_and(|a| a.starts_with("kill-pane")))
             .collect()
-    }
-
-    // The table, open and kill calls of the stop walk; resolve's opens of the server and the caller's agent are
-    // left out.
-    fn proc_calls(w: &World) -> Vec<String> {
-        w.fakes
-            .os_calls()
-            .into_iter()
-            .filter(|c| {
-                c == "table"
-                    || ((c.starts_with("open ") || c.starts_with("kill "))
-                        && c != "open 900"
-                        && c != &format!("open {CLAUDE}"))
-            })
-            .collect()
-    }
-
-    fn left_report(left: &[Left]) -> Map<String, Value> {
-        let mut report = Map::new();
-        let rows: Vec<Value> = left
-            .iter()
-            .map(|l| format!("{} {:?}", l.pid, l.reason).to_lowercase().into())
-            .collect();
-        report.insert("left".into(), Value::Array(rows));
-        report
-    }
-
-    #[test]
-    fn stop_tree_bfs_256() {
-        let w = stop_world(false, json!({}));
-        for (pid, ppid, start) in [
-            (300, 900, 3000),
-            (310, 300, 3100),
-            (320, 300, 3200),
-            (311, 310, 3110),
-            (321, 320, 3210),
-            // Started before its parent: a reused pid, not a child.
-            (330, 300, 2999),
-            (340, 999, 3400),
-        ] {
-            w.fakes.process(testing::row(pid, ppid, start));
-        }
-        for pid in [300, 310, 320, 311, 321] {
-            w.fakes.kill_ok(pid);
-        }
-        w.fakes.stop_report_with(left_report);
-        let caller = w.caller();
-        w.fakes.clear_log();
-        assert_eq!(
-            run(&w, stop, &["stop", "worker"]),
-            format!(
-                r#"ok {{"name":"worker","pane":"%9","left":[],"directory":"/work","resume":"claude --resume {SESSION_ID}"}}"#
-            )
-        );
-        // Breadth first; every open before the pane closes, then the kills.
-        assert_eq!(
-            proc_calls(&w),
-            [
-                "table", "open 300", "open 310", "open 320", "open 311", "open 321", "kill 300",
-                "kill 310", "kill 320", "kill 311", "kill 321"
-            ]
-        );
-        // OS and multiplexer calls in one order: the last open, then kill-pane, then the first kill.
-        let events = w.fakes.events();
-        let at = |event: &str| events.iter().position(|e| e == event).expect(event);
-        let kill_event = format!("mux {}", kill9().join(" "));
-        assert!(at("open 321") < at(&kill_event), "{events:?}");
-        assert!(at(&kill_event) < at("kill 300"), "{events:?}");
-        let kill_pane: Vec<_> = w
-            .fakes
-            .mux_calls()
-            .into_iter()
-            .filter(|c| c.last().is_some_and(|a| a.starts_with("kill-pane")))
-            .collect();
-        assert_eq!(kill_pane, [kill9()]);
-        let notice = lock_key("notice", &caller, "bbbbbbbbbbbb");
-        let mail = lock_key("mail", &caller, "pane-1");
-        assert_eq!(
-            w.fakes.locks(),
-            [
-                format!("+{notice}"),
-                format!("+{mail}"),
-                format!("-{mail}"),
-                format!("-{notice}")
-            ]
-        );
-        assert_eq!(read_mail_of(&w, "pane-1"), ["worker was stopped."]);
-
-        // At most 256 rows: a chain of 300 below the pane stops after 256 opens.
-        let w = stop_world(false, json!({}));
-        w.fakes.process(testing::row(300, 900, 3000));
-        let mut parent = 300;
-        for n in 0..299u32 {
-            w.fakes
-                .process(testing::row(1000 + n, parent, 3001 + i64::from(n)));
-            parent = 1000 + n;
-        }
-        w.fakes.clear_log();
-        run(&w, stop, &["stop", "worker"]);
-        assert_eq!(
-            proc_calls(&w)
-                .iter()
-                .filter(|c| c.starts_with("open "))
-                .count(),
-            256
-        );
-
-        // Two rows that name each other as parent: each is walked once.
-        let w = stop_world(false, json!({}));
-        write(
-            &w.folder("bbbbbbbbbbbb").join("launcher.json"),
-            json!({"pid": 300, "start": 5}),
-        );
-        w.fakes.process(testing::row(300, 301, 5));
-        w.fakes.process(testing::row(301, 300, 5));
-        w.fakes.clear_log();
-        run(&w, stop, &["stop", "worker"]);
-        assert_eq!(proc_calls(&w)[..3], ["table", "open 300", "open 301"]);
-        assert_eq!(
-            proc_calls(&w)
-                .iter()
-                .filter(|c| c.starts_with("open "))
-                .count(),
-            2
-        );
-    }
-
-    #[test]
-    fn stop_verifies_pane_process_before_walking() {
-        // A pane pid of 0 or 1 is no agent: nothing is read, walked or killed.
-        for pid in [0, 1] {
-            let w = stop_world(false, json!({}));
-            w.panes(&[&format!("%9|@5|{pid}|bbbbbbbbbbbb|worker")]);
-            w.fakes.process(testing::row(1, 0, 1));
-            w.fakes.process(testing::row(300, 1, 3000));
-            w.fakes.kill_ok(1);
-            w.fakes.clear_log();
-            assert_eq!(run(&w, stop, &["stop", "worker"]), NONE, "{pid}");
-            assert!(proc_calls(&w).is_empty(), "{pid}");
-            assert!(pane_kills(&w).is_empty(), "{pid}");
-        }
-        // The pane pid was reused (another start than launcher.json's), or launcher.json names another pid or
-        // none: only the pane is closed, and its tree is left as survivors.
-        for launcher in [
-            Some(json!({"pid": 300, "start": 2500})),
-            Some(json!({"pid": 301, "start": 3000})),
-            Some(json!({"pid": 300})),
-            None,
-        ] {
-            let w = stop_world(false, json!({}));
-            let file = w.folder("bbbbbbbbbbbb").join("launcher.json");
-            match &launcher {
-                Some(record) => write(&file, record.clone()),
-                None => std::fs::remove_file(&file).unwrap(),
-            }
-            w.fakes.process(testing::row(300, 900, 3000));
-            w.fakes.process(testing::row(310, 300, 3100));
-            w.fakes.kill_ok(300);
-            w.fakes.kill_ok(310);
-            w.fakes.stop_report_with(left_report);
-            w.fakes.clear_log();
-            let reply = run(&w, stop, &["stop", "worker"]);
-            let left = r#""left":["300 unverified","310 unverified"]"#;
-            assert!(reply.contains(left), "{launcher:?} {reply}");
-            assert_eq!(proc_calls(&w), ["table"], "{launcher:?}");
-            let kill_pane: Vec<_> = w
-                .fakes
-                .mux_calls()
-                .into_iter()
-                .filter(|c| c.last().is_some_and(|a| a.starts_with("kill-pane")))
-                .collect();
-            assert_eq!(kill_pane, [kill9()], "{launcher:?}");
-            assert_eq!(read_mail_of(&w, "pane-1"), ["worker was stopped."]);
-        }
-    }
-
-    #[test]
-    fn stop_root_reused_at_open_kills_pane_only() {
-        // launcher.json and the table agree on pid 300 at 3000, but the pid opened is another process (4000), or
-        // none: the tree is never walked, only the pane closes, and every tree row is left unverified.
-        for opened in [Some(4000), None] {
-            let w = stop_world(false, json!({}));
-            w.fakes.process(testing::row(300, 900, 3000));
-            w.fakes.process(testing::row(310, 300, 5000));
-            w.fakes.opens(300, &[opened]);
-            w.fakes.kill_ok(300);
-            w.fakes.kill_ok(310);
-            w.fakes.stop_report_with(left_report);
-            w.fakes.clear_log();
-            let reply = run(&w, stop, &["stop", "worker"]);
-            assert!(
-                reply.contains(r#""left":["300 unverified","310 unverified"]"#),
-                "{opened:?} {reply}"
-            );
-            assert_eq!(proc_calls(&w), ["table", "open 300"], "{opened:?}");
-            let kill_pane: Vec<_> = w
-                .fakes
-                .mux_calls()
-                .into_iter()
-                .filter(|c| c.last().is_some_and(|a| a.starts_with("kill-pane")))
-                .collect();
-            assert_eq!(kill_pane, [kill9()], "{opened:?}");
-            assert_eq!(read_mail_of(&w, "pane-1"), ["worker was stopped."]);
-        }
-    }
-
-    #[test]
-    fn stop_skips_reused_start() {
-        let w = stop_world(false, json!({}));
-        w.fakes.process(testing::row(300, 900, 3000));
-        w.fakes.process(testing::row(310, 300, 3100));
-        w.fakes.process(testing::row(320, 300, 3200));
-        // 310 was reused between the listing and the open; 320 exited.
-        w.fakes.opens(310, &[Some(3999)]);
-        w.fakes.opens(320, &[None]);
-        w.fakes.kill_ok(300);
-        w.fakes.stop_report_with(left_report);
-        w.fakes.clear_log();
-        let reply = run(&w, stop, &["stop", "worker"]);
-        assert!(
-            reply.contains(r#""left":["310 start","320 open"]"#),
-            "{reply}"
-        );
-        assert_eq!(
-            proc_calls(&w),
-            ["table", "open 300", "open 310", "open 320", "kill 300"]
-        );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn stop_report_unix_has_survivor_pids() {
-        let w = stop_world(false, json!({}));
-        w.fakes.process(testing::row(300, 900, 3000));
-        w.fakes.process(testing::row(310, 300, 3100));
-        w.fakes.process(testing::row(320, 300, 3200));
-        w.fakes.opens(320, &[None]);
-        w.fakes.kill_ok(300);
-        w.fakes.stop_report_with(crate::proc::unix::stop_report);
-        assert_eq!(
-            run(&w, stop, &["stop", "worker"]),
-            format!(
-                r#"ok {{"name":"worker","pane":"%9","survivors":2,"survivorPids":[320,310],"directory":"/work","resume":"claude --resume {SESSION_ID}"}}"#
-            )
-        );
-    }
-
-    #[test]
-    fn stop_report_windows_survivors_only() {
-        let w = stop_world(false, json!({}));
-        w.fakes.process(testing::row(300, 900, 3000));
-        w.fakes.process(testing::row(310, 300, 3100));
-        w.fakes.process(testing::row(320, 300, 3200));
-        w.fakes.opens(320, &[None]);
-        w.fakes.kill_ok(300);
-        w.fakes.stop_report_with(crate::proc::windows::stop_report);
-        // Only the failed kill (310) counts; the row never opened (320) does not.
-        assert_eq!(
-            run(&w, stop, &["stop", "worker"]),
-            format!(
-                r#"ok {{"name":"worker","pane":"%9","survivors":1,"directory":"/work","resume":"claude --resume {SESSION_ID}"}}"#
-            )
-        );
-        // An unverified tree (the pane pid's start is not launcher.json's): nothing was killed, so every tree row
-        // is a survivor.
-        let w = stop_world(false, json!({}));
-        write(
-            &w.folder("bbbbbbbbbbbb").join("launcher.json"),
-            json!({"pid": 300, "start": 2500}),
-        );
-        w.fakes.process(testing::row(300, 900, 3000));
-        w.fakes.process(testing::row(310, 300, 3100));
-        w.fakes.kill_ok(300);
-        w.fakes.kill_ok(310);
-        w.fakes.stop_report_with(crate::proc::windows::stop_report);
-        assert_eq!(
-            run(&w, stop, &["stop", "worker"]),
-            format!(
-                r#"ok {{"name":"worker","pane":"%9","survivors":2,"directory":"/work","resume":"claude --resume {SESSION_ID}"}}"#
-            )
-        );
-    }
-
-    #[test]
-    fn stop_resume_command() {
-        for (client, resume) in [
-            (json!("claude"), "claude"),
-            (json!("Claude"), "claude"),
-            (json!("copilot"), "copilot"),
-            (json!("other"), "copilot"),
-            (Value::Null, "copilot"),
-        ] {
-            let w = stop_world(false, json!({"client": client}));
-            let reply = run(&w, stop, &["stop", "worker"]);
-            assert!(
-                reply.ends_with(&format!(r#""resume":"{resume} --resume {SESSION_ID}"}}"#)),
-                "{client} {reply}"
-            );
-        }
-    }
-
-    #[test]
-    fn stop_agent_not_parent_refuses() {
-        let w = stop_world(true, json!({"parentPane": "%7"}));
-        w.fakes.clear_log();
-        assert_eq!(
-            run(&w, stop, &["stop", "worker"]),
-            "2 parent only the parent or a human can stop this agent"
-        );
-        assert!(proc_calls(&w).is_empty());
-        assert!(pane_kills(&w).is_empty());
-        assert!(!w.folder("bbbbbbbbbbbb").join("notice.json").exists());
-        // Its parent (pane %1) may stop it, and so may a human, whoever the parent is.
-        let w = stop_world(true, json!({"parentPane": "%1"}));
-        assert!(run(&w, stop, &["stop", "worker"]).starts_with("ok "));
-        let w = stop_world(false, json!({"parentPane": "%7"}));
-        assert!(run(&w, stop, &["stop", "worker"]).starts_with("ok "));
-    }
-
-    #[test]
-    fn stop_reaches_descendant_behind_unopenable_row() {
-        // pane 300 > 310 (listed without a start) > 320.
-        let w = stop_world(false, json!({}));
-        w.fakes.process(testing::row(300, 900, 3000));
-        w.fakes.process(testing::unknown_start(310, 300));
-        w.fakes.process(testing::row(320, 310, 3200));
-        // Even an open that succeeds does not make a row with no listed start trusted.
-        w.fakes.opens(310, &[Some(3100)]);
-        for pid in [300, 310, 320] {
-            w.fakes.kill_ok(pid);
-        }
-        w.fakes.stop_report_with(left_report);
-        w.fakes.clear_log();
-        let reply = run(&w, stop, &["stop", "worker"]);
-        assert!(reply.contains(r#""left":["310 open"]"#), "{reply}");
-        assert_eq!(
-            proc_calls(&w),
-            [
-                "table", "open 300", "open 310", "open 320", "kill 300", "kill 320"
-            ]
-        );
-    }
-
-    fn kill_panes(w: &World) -> usize {
-        w.fakes
-            .mux_calls()
-            .iter()
-            .filter(|c| c[1] == "kill-pane" || c[1] == "if-shell")
-            .count()
-    }
-
-    // The parent's mailbox lines as stored, without moving the read offset.
-    fn stored(w: &World) -> usize {
-        let path = w.state().join("mail").join("pane-1.jsonl");
-        std::fs::read_to_string(path)
-            .unwrap_or_default()
-            .lines()
-            .count()
-    }
-
-    #[test]
-    fn stop_an_ended_agent_answers_already() {
-        for (kind, code) in [
-            ("exited", json!(3)),
-            ("stopped", Value::Null),
-            ("lost", Value::Null),
-        ] {
-            let w = World::human("");
-            let folder = w.agent_record("bbbbbbbbbbbb", json!({}));
-            write(
-                &folder.join("notice.json"),
-                json!({"kind": kind, "exitCode": code, "at": "2026-10-29T11:00:00.0000000Z"}),
-            );
-            w.panes(&[]);
-            w.fakes.clear_log();
-            let before = std::fs::read(folder.join("notice.json")).unwrap();
-            assert_eq!(
-                run(&w, stop, &["stop", "worker"]),
-                format!(
-                    r#"ok {{"name":"worker","pane":"%9","already":"{kind}","directory":"/work","resume":"claude --resume {SESSION_ID}"}}"#
-                ),
-                "{kind}"
-            );
-            // No kill, no signal, no notice.
-            assert_eq!(kill_panes(&w), 0, "{kind}");
-            assert!(proc_calls(&w).is_empty(), "{kind}");
-            assert_eq!(std::fs::read(folder.join("notice.json")).unwrap(), before);
-            assert_eq!(stored(&w), 0, "{kind}");
-        }
-        // Only its parent or a human, as for a live one.
-        let w = World::agent(ID);
-        w.uncommitted(ID, json!({"name": "me", "pane": "%1"}));
-        let folder = w.agent_record("bbbbbbbbbbbb", json!({"parentPane": "%7"}));
-        write(
-            &folder.join("notice.json"),
-            json!({"kind": "lost", "exitCode": null, "at": "x"}),
-        );
-        w.panes(&[]);
-        assert_eq!(
-            run(&w, stop, &["stop", "worker"]),
-            "2 parent only the parent or a human can stop this agent"
-        );
-    }
-
-    #[test]
-    fn stop_picks_live_then_newest_ended() {
-        // A live agent and an ended one with one name: the live one is stopped.
-        let w = stop_world(false, json!({}));
-        let ended = w.agent_record("cccccccccccc", json!({"pane": "%4"}));
-        write(
-            &ended.join("notice.json"),
-            json!({"kind": "lost", "exitCode": null, "at": "2026-10-29T11:59:00.0000000Z"}),
-        );
-        w.fakes.process(testing::row(300, 900, 3000));
-        w.fakes.kill_ok(300);
-        let reply = run(&w, stop, &["stop", "worker"]);
-        assert!(!reply.contains("already"), "{reply}");
-        assert_eq!(read_mail_of(&w, "pane-1"), ["worker was stopped."]);
-
-        // Two ended `worker`s beyond the 10 shown, 11 newer agents ahead of them: the newer of the two answers.
-        let w = World::human("");
-        for n in 0..11u32 {
-            let folder = w.agent_record(
-                &format!("{n:012x}"),
-                json!({"name": format!("a{n}"), "pane": format!("%{}", 20 + n)}),
-            );
-            write(
-                &folder.join("notice.json"),
-                json!({"kind": "stopped", "exitCode": null, "at": format!("2026-10-29T11:{:02}:00.0000000Z", 10 + n)}),
-            );
-        }
-        for (id, pane, kind, at) in [
-            ("bbbbbbbbbbbb", "%8", "stopped", "10:00"),
-            ("cccccccccccc", "%7", "exited", "10:30"),
-        ] {
-            let folder = w.agent_record(id, json!({"pane": pane}));
-            write(
-                &folder.join("notice.json"),
-                json!({"kind": kind, "exitCode": 0, "at": format!("2026-10-29T{at}:00.0000000Z")}),
-            );
-        }
-        w.panes(&[]);
-        let reply = run(&w, stop, &["stop", "worker"]);
-        assert!(
-            reply.contains(r#""pane":"%7","already":"exited""#),
-            "{reply}"
-        );
-        // No match at all: target, as before.
-        assert_eq!(run(&w, stop, &["stop", "nobody"]), NONE);
-    }
-
-    #[test]
-    fn stop_rechecks_under_the_notice_lock() {
-        // A reap posts its notice while stop waits for the lock: already, no kill, no signal, no second notice.
-        let w = stop_world(false, json!({}));
-        w.fakes.process(testing::row(300, 900, 3000));
-        w.fakes.kill_ok(300);
-        let caller = w.caller();
-        let notice = lock_key("notice", &caller, "bbbbbbbbbbbb");
-        let marker = w.folder("bbbbbbbbbbbb").join("notice.json");
-        let (raced, ctx_marker) = (std::cell::Cell::new(false), marker.clone());
-        w.fakes.lock_probe(move |event| {
-            if event == format!("+{notice}") && !raced.get() {
-                raced.set(true);
-                write(
-                    &ctx_marker,
-                    json!({"kind": "exited", "exitCode": 0, "at": "x"}),
-                );
-            }
-            String::new()
-        });
-        w.fakes.clear_log();
-        let reply = run(&w, stop, &["stop", "worker"]);
-        assert!(reply.contains(r#""already":"exited""#), "{reply}");
-        assert_eq!(kill_panes(&w), 0);
-        assert!(proc_calls(&w).is_empty());
-        assert_eq!(stored(&w), 0);
-
-        // The pane closed (no launcher notice) after stop resolved it: stop posts the one notice itself, lost.
-        let w = stop_world(false, json!({}));
-        w.fakes.process(testing::row(300, 900, 3000));
-        w.fakes.kill_ok(300);
-        w.fakes
-            .mux_first("-t %9 #{pane_id}|#{@agent-id}", 0, "|\n", "");
-        w.fakes.clear_log();
-        let reply = run(&w, stop, &["stop", "worker"]);
-        assert!(reply.contains(r#""already":"lost""#), "{reply}");
-        assert_eq!(kill_panes(&w), 0);
-        assert!(proc_calls(&w).is_empty());
-        assert_eq!(
-            read_mail_of(&w, "pane-1"),
-            ["worker is gone: its pane closed without an exit record."]
-        );
-        let written = crate::state::fs::read_json(&w.folder("bbbbbbbbbbbb").join("notice.json"))
-            .unwrap()
-            .unwrap();
-        assert_eq!(written["closedBy"], "pane");
-    }
-
-    #[test]
-    fn stop_a_dead_pane_without_pid_answers_already() {
-        // tmux 3.8 lists a remain-on-exit dead pane with no pid. The agent ended while reap listed again: its
-        // notice is there (or reap's probe posts one), so stop answers already before it ever reads the pid.
-        for (noticed, state) in [(true, "exited"), (false, "lost")] {
-            let w = stop_world(false, json!({}));
-            let folder = w.folder("bbbbbbbbbbbb");
-            if noticed {
-                write(
-                    &folder.join("notice.json"),
-                    json!({"kind": "exited", "exitCode": 0, "at": "x"}),
-                );
-            }
-            w.panes_dead(&["%9|@5||bbbbbbbbbbbb|worker"], &["%9"]);
-            // The conditional kill ran but the pane is still listed (as a respawn or a slow server would leave it);
-            // its probe answers gone.
-            w.fakes
-                .mux_first("-t %9 #{pane_id}|#{@agent-id}", 0, "|\n", "");
-            w.fakes.clear_log();
-            let reply = run(&w, stop, &["stop", "worker"]);
-            assert!(
-                reply.contains(&format!(r#""already":"{state}""#)),
-                "{noticed} {reply}"
-            );
-            assert!(
-                !w.fakes.mux_calls().iter().any(|c| c[1] == "kill-pane"),
-                "{noticed}"
-            );
-            assert!(proc_calls(&w).is_empty(), "{noticed}");
-            assert_eq!(stored(&w), usize::from(!noticed), "{noticed}");
-        }
     }
 
     // ---- waiting (S2.4)
@@ -1944,7 +1173,6 @@ mod tests {
     fn rotated_tags_never_redirect_a_verb() {
         // From a clean pane, every verb reaches A at %9 and A's mailbox.
         let mut w = rotated("", "%2");
-        emulate_pane9(&w, &launch_command("%9"));
         w.fakes.mux_rule("#{window_active}", 0, "%9|1|1|1\n", "");
         w.fakes.mux_rule("show-buffer", 0, "a's screen\n", "");
         let list = crate::agents::view::list(&w.ctx, &w.request(&["list"])).unwrap();
@@ -1973,13 +1201,23 @@ mod tests {
         assert!(sent.starts_with(r#"ok {"to":"a","pane":"%9""#), "{sent}");
         assert_eq!(read_mail_of(&w, ID), ["hi"]);
         assert!(read_mail_of(&w, "bbbbbbbbbbbb").is_empty());
-        let stopped = run(&w, stop, &["stop", "a"]);
-        assert!(
-            stopped.starts_with(r#"ok {"name":"a","pane":"%9""#),
-            "{stopped}"
+        let r = cf::member(
+            &w,
+            ID,
+            json!({"name":"a","startCommand":launch_command("%9")}),
         );
-        // Only A's own launch at %9 was killed; the root carrying A's tag never was.
-        assert_eq!(pane_kills(&w), [kill9()]);
+        cf::online(&w);
+        cf::answer(&w, &["kill", "taaaaaaaaaaaa", "--json"], "{}");
+        let mut t = cf::wire(&r);
+        t["state"] = json!("finished");
+        t["reason"] = json!("killed");
+        cf::get(&w, "taaaaaaaaaaaa", t);
+        assert_eq!(
+            run(&w, stop, &["stop", "a"]),
+            r#"ok {"name":"a","hcAddress":"taaaaaaaaaaaa","life":"ended"}"#
+        );
+        assert!(pane_kills(&w).is_empty());
+        w.fakes.hc_done().unwrap();
 
         // #48 test 2: then B, tagless, is still addressable, and its own pane is B.
         w.panes(&["%1|@1|100|aaaaaaaaaaaa|a", "%8|@5|301||", "%2|@1|102||"]);
@@ -2025,34 +1263,6 @@ mod tests {
         assert_eq!(list["agents"][0]["name"], "a");
         assert_eq!(list["agents"][0]["unread"], 1);
         assert!(read_mail_of(&w, ID).len() == 2);
-    }
-
-    #[test]
-    fn stop_never_kills_a_pane_replaced_after_it_was_resolved() {
-        let w = stop_world(false, json!({}));
-        w.fakes.process(testing::row(300, 900, 3000));
-        w.fakes.kill_ok(300);
-        let pane = emulate_pane9(&w, &launch_command("%9"));
-        // Respawned (another command) while stop waits for the notice lock.
-        let replace = pane.clone();
-        let notice = lock_key("notice", &w.caller(), "bbbbbbbbbbbb");
-        w.fakes.lock_probe(move |event| {
-            if event == format!("+{notice}") {
-                *replace.borrow_mut() = Some("sh".into());
-            }
-            String::new()
-        });
-        w.fakes.clear_log();
-        assert_eq!(
-            run(&w, stop, &["stop", "worker"]),
-            format!("1 target {NOT_ITS_LAUNCH}")
-        );
-        // The conditional ran and held nothing: the replacement lives, nothing was signalled or noticed.
-        assert_eq!(pane_kills(&w), [kill9()]);
-        assert_eq!(pane.borrow().as_deref(), Some("sh"));
-        assert!(!proc_calls(&w).iter().any(|c| c.starts_with("kill ")));
-        assert!(!w.folder("bbbbbbbbbbbb").join("notice.json").exists());
-        assert_eq!(stored(&w), 0);
     }
 
     #[test]
@@ -2107,94 +1317,6 @@ mod tests {
         assert!(!acted.get());
     }
 
-    // A 0.2.0-0.2.2 worker (no startCommand) at %9, its launcher pid 300 started 3000, run as `<other exe> launcher
-    // <its spec>`; the multiplexer kills %9 only for a conditional naming pid 300.
-    fn legacy_stop_world() -> (World, std::rc::Rc<std::cell::Cell<bool>>) {
-        let w = stop_world(false, json!({}));
-        w.legacy("bbbbbbbbbbbb");
-        let spec = w.folder("bbbbbbbbbbbb").join("spec.json");
-        w.fakes.process(Row {
-            pid: 300,
-            ppid: 900,
-            start: Some(3000),
-            path: Some("/old/mux-agent".into()),
-            argv: Some(vec![
-                "/old/mux-agent".into(),
-                "launcher".into(),
-                spec.to_str().unwrap().into(),
-            ]),
-        });
-        w.fakes.kill_ok(300);
-        let killed = std::rc::Rc::new(std::cell::Cell::new(false));
-        let kill = killed.clone();
-        w.fakes.mux_script("if-shell", move |argv| {
-            if argv[5].contains("#{==:#{pane_pid},300}") && argv[6] == "kill-pane -t %9" {
-                kill.set(true);
-            }
-            Ok(Output::default())
-        });
-        let gone = killed.clone();
-        w.fakes
-            .mux_script("-t %9 #{pane_id}|#{@agent-id}", move |_| {
-                Ok(Output {
-                    code: 0,
-                    stdout: if gone.get() { "|\n" } else { "%9|\n" }.into(),
-                    stderr: String::new(),
-                })
-            });
-        (w, killed)
-    }
-
-    #[test]
-    fn a_legacy_record_is_stopped_only_while_its_launcher_is_proven() {
-        // Proven: the kill is bound to its command and its pid, and the launcher is signalled.
-        let (w, killed) = legacy_stop_world();
-        let reply = run(&w, stop, &["stop", "worker"]);
-        assert!(reply.starts_with(r#"ok {"name":"worker""#), "{reply}");
-        assert!(killed.get());
-        assert!(proc_calls(&w).contains(&"kill 300".to_string()));
-        // The pid kept but its start or its command changed between resolve and stop: refused before any kill.
-        for change in ["start", "command"] {
-            let (w, killed) = legacy_stop_world();
-            let fakes = w.fakes.clone();
-            let notice = lock_key("notice", &w.caller(), "bbbbbbbbbbbb");
-            let change = change.to_string();
-            w.fakes.lock_probe(move |event| {
-                if event == format!("+{notice}") {
-                    let mut row = fakes
-                        .table()
-                        .unwrap()
-                        .into_iter()
-                        .find(|r| r.pid == 300)
-                        .unwrap();
-                    if change == "start" {
-                        row.start = Some(3001);
-                    } else {
-                        row.argv = Some(vec!["/old/mux-agent".into(), "watch".into()]);
-                    }
-                    fakes.forget(300);
-                    fakes.process(row);
-                }
-                String::new()
-            });
-            w.fakes.clear_log();
-            assert_eq!(
-                run(&w, stop, &["stop", "worker"]),
-                format!("1 target {NOT_ITS_LAUNCH}")
-            );
-            assert!(pane_kills(&w).is_empty());
-            assert!(!killed.get());
-            assert!(!proc_calls(&w).iter().any(|c| c.starts_with("kill ")));
-            assert!(!w.folder("bbbbbbbbbbbb").join("notice.json").exists());
-        }
-        // A dead 0.2.x pane is never killed.
-        let (w, killed) = legacy_stop_world();
-        w.panes_dead(&["%9|@5||bbbbbbbbbbbb|worker"], &["%9"]);
-        w.fakes.clear_log();
-        assert!(!reap(&w.ctx, &w.caller(), None, false).unwrap());
-        assert!(pane_kills(&w).is_empty() && !killed.get());
-    }
-
     // A call that fails as a call: no server, a timeout.
     fn lost_server() -> Refusal {
         Refusal {
@@ -2203,39 +1325,6 @@ mod tests {
             message: "rmux endpoint did not answer".into(),
             reason: None,
         }
-    }
-
-    #[test]
-    fn stop_whose_gone_proof_fails_to_run_signals_and_notices_nothing() {
-        // D7: the probe under the notice lock answers live, the one after the conditional kill fails as a call.
-        let w = stop_world(false, json!({}));
-        w.fakes.process(testing::row(300, 900, 3000));
-        w.fakes.kill_ok(300);
-        let probes = std::rc::Rc::new(std::cell::Cell::new(0));
-        let n = probes.clone();
-        w.fakes
-            .mux_script("-t %9 #{pane_id}|#{@agent-id}", move |_| {
-                n.set(n.get() + 1);
-                if n.get() == 1 {
-                    Ok(Output {
-                        code: 0,
-                        stdout: "%9|bbbbbbbbbbbb\n".into(),
-                        stderr: String::new(),
-                    })
-                } else {
-                    Err(lost_server())
-                }
-            });
-        w.fakes.clear_log();
-        assert_eq!(
-            run(&w, stop, &["stop", "worker"]),
-            format!("1 target {NOT_ITS_LAUNCH}")
-        );
-        assert_eq!(probes.get(), 2);
-        assert_eq!(pane_kills(&w), [kill9()]);
-        assert!(!proc_calls(&w).iter().any(|c| c.starts_with("kill ")));
-        assert!(!w.folder("bbbbbbbbbbbb").join("notice.json").exists());
-        assert_eq!(stored(&w), 0);
     }
 
     #[test]

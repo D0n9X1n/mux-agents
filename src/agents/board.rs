@@ -129,25 +129,6 @@ pub fn board(ctx: &Ctx, caller: &Caller, all: bool, watch: bool) -> Res<Map<Stri
 pub(crate) const ENDED_MAX: usize = 10;
 const ENDED: [&str; 3] = ["exited", "stopped", "lost"];
 
-/// The newest ended agent named `name` of the caller's session that is not live, as (id, record, state): any of
-/// them, not only the 10 a board shows. Newest notice first, then by id, as the board orders them.
-pub(crate) fn newest_ended(
-    ctx: &Ctx,
-    caller: &Caller,
-    live: &[Pane],
-    name: &str,
-) -> Res<Option<(String, Value, String)>> {
-    let mut ended: Vec<Ended> = ended(ctx, caller, live)?
-        .into_iter()
-        .filter(|end| end.record.get("name").and_then(Value::as_str) == Some(name))
-        .collect();
-    ended.sort_by(|a, b| b.at.cmp(&a.at).then_with(|| a.id.cmp(&b.id)));
-    Ok(ended
-        .into_iter()
-        .next()
-        .map(|end| (end.id, end.record, end.kind)))
-}
-
 /// The mailbox of an agent's parent pane: the running agent's id there, else `pane-<n>` (as `send parent`
 /// delivers); none for a malformed pane. Never a tag.
 fn parent_key(record: &Value, running: &[Pane]) -> Option<String> {

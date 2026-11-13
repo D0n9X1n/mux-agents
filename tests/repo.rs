@@ -2477,3 +2477,21 @@ fn live_core_installer_precedes_tests() {
         assert!(script.contains(needle), "{needle}");
     }
 }
+
+#[test]
+fn legacy_stop_authority_is_absent() {
+    let message = repo_file("src/agents/message.rs");
+    let production = message.split("#[cfg(test)]").next().unwrap();
+    for token in [
+        "fn stop(",
+        "fn tree(",
+        "ctx.os.table(",
+        "ctx.os.kill(",
+        "kill-pane",
+    ] {
+        assert!(
+            !production.contains(token),
+            "legacy target authority: {token}"
+        );
+    }
+}
