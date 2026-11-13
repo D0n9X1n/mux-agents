@@ -82,6 +82,7 @@ pub struct Snapshot {
     pub facts: core_facts::Snapshot,
     pub records: BTreeMap<String, Stored>,
     pub views: BTreeMap<String, registry::Pane>,
+    pub view_order: Vec<String>,
     pub core_error: Option<Refusal>,
     pub view_error: Option<Refusal>,
 }
@@ -203,7 +204,17 @@ impl Snapshot {
             }
             records.insert(l.identity.id, l.stored);
         }
+        let view_order = rows
+            .iter()
+            .flat_map(|row| {
+                views
+                    .iter()
+                    .filter(move |(_, p)| p.pane == row.pane)
+                    .map(|(id, _)| id.clone())
+            })
+            .collect();
         Self {
+            view_order,
             facts,
             records,
             views,

@@ -440,3 +440,53 @@ fn reader_uses_hc_life_commit_and_view_not_tags_or_notices() {
         w.fakes.hc_done().unwrap();
     }
 }
+
+#[test]
+fn board_view_order_preserves_enumeration_without_promoting_tags() {
+    for mode in ["ordered", "duplicate", "view-error"] {
+        let w = World::human("");
+        let a = f::member(&w, ID, json!({"pane":"%9"}));
+        let b = f::member(&w, "bbbbbbbbbbbb", json!({"name":"second","pane":"%10"}));
+        let c = f::member(&w, "cccccccccccc", json!({"name":"detached","pane":"%2"}));
+        let mut rows = vec![
+            crate::agents::fixture::row_of("%10|@7|301|aaaaaaaaaaaa|wrong", &[]),
+            crate::agents::fixture::row_of("%9|@6|300|bbbbbbbbbbbb|wrong", &[]),
+        ];
+        rows[0].command = "hc attach tbbbbbbbbbbbb".into();
+        rows[1].command = "hc attach taaaaaaaaaaaa".into();
+        if mode == "duplicate" {
+            rows.push(rows[1].clone());
+        }
+        w.pane_rows(&rows);
+        if mode == "view-error" {
+            w.fakes.mux_first("list-panes", 1, "", "down");
+        }
+        let caller = w.caller();
+        f::online(&w);
+        f::listing(&w, &team(&caller), &[]);
+        for r in [&a, &b, &c] {
+            f::get(&w, r["hcAddress"].as_str().unwrap(), f::wire(r));
+        }
+        w.fakes.clear_log();
+        let snapshot = Snapshot::take(&w.ctx, &caller).unwrap();
+        let want: &[&str] = match mode {
+            "ordered" => &["bbbbbbbbbbbb", "aaaaaaaaaaaa"],
+            "duplicate" => &["bbbbbbbbbbbb"],
+            _ => &[],
+        };
+        assert_eq!(snapshot.view_order, want, "{mode}");
+        assert!(!snapshot.views.contains_key("cccccccccccc"));
+        assert_eq!(snapshot.facts.count(), 3);
+        assert_eq!(w.fakes.mux_calls().len(), 1);
+        assert!(crate::agents::fixture::list_call(&w.fakes.mux_calls()[0]));
+        assert_eq!(
+            w.fakes
+                .hc_calls()
+                .iter()
+                .map(|(_, a, _)| a[0].as_str())
+                .collect::<Vec<_>>(),
+            ["--version", "ls", "get", "get", "get"]
+        );
+        w.fakes.hc_done().unwrap();
+    }
+}

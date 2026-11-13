@@ -108,6 +108,7 @@ fn stop_uses_hc_only() {
             .unwrap();
         w.fakes.hc_done().unwrap();
         let snapshot = super::membership::Snapshot {
+            view_order: Vec::new(),
             facts: super::core_facts::Snapshot {
                 local: vec![super::core_facts::Observation {
                     identity: id,
