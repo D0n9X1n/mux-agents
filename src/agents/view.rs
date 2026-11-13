@@ -271,7 +271,7 @@ fn select_view(
 }
 pub fn focus_hc(
     ctx: &Ctx,
-    _core: &crate::hc::Core<'_>,
+    core: &crate::hc::Core<'_>,
     caller: &Caller,
     name: &str,
     expected: Option<&str>,
@@ -288,8 +288,62 @@ pub fn focus_hc(
     }
     match pane {
         Some(p) => select_view(ctx, &p.name, &p.pane, &p.window, &p.launch),
-        None => refuse(2, "target", "view missing"),
+        None => restore_view(ctx, core, caller, &id, record),
     }
+}
+
+fn restore_view(
+    ctx: &Ctx,
+    core: &crate::hc::Core<'_>,
+    caller: &Caller,
+    id: &super::core_identity::Identity,
+    mut record: Value,
+) -> Res<Focused> {
+    let placement = super::placement::read_placement(ctx, caller)
+        .ok()
+        .flatten()
+        .unwrap_or(super::placement::DEFAULT);
+    let mut created = None;
+    let result: Res<super::spawn::Created> = (|| {
+        attach_core(
+            ctx,
+            core,
+            caller,
+            &record,
+            (placement != "tab").then_some(placement),
+            &mut created,
+        )?;
+        let v = created
+            .as_ref()
+            .ok_or_else(|| crate::error::Refusal::internal("unproven new view"))?;
+        record["pane"] = v.pane.clone().into();
+        record["window"] = v.window.clone().into();
+        record["startCommand"] = v.command.clone().into();
+        write_json(
+            &super::server_dir(ctx, caller)
+                .join("agents")
+                .join(&id.id)
+                .join("record.json"),
+            &record,
+        )?;
+        Ok(v.clone())
+    })();
+    if result.is_err()
+        && let Some(v) = &created
+    {
+        let _ = clean_core(ctx, v);
+    }
+    let v = result?;
+    select_view(
+        ctx,
+        &id.name,
+        &v.pane,
+        &v.window,
+        &registry::Launch {
+            command: v.command,
+            pid: None,
+        },
+    )
 }
 
 #[cfg(test)]
