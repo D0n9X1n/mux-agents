@@ -1649,14 +1649,6 @@ const PEEK_LINES: i32 = 200;
 /// answers only once it closes and the bar must not wait; so a popup that never opens is not seen here, and its
 /// file stays in the state folder (no sweep: age cannot tell it from a popup still queued behind another).
 fn peek(ctx: &Ctx, caller: &Caller, target: &Target) -> Res<()> {
-    let pane = crate::agents::registry::find_reaped(ctx, caller, &target.name)?;
-    if pane.pane != target.pane {
-        return refuse(
-            2,
-            "target",
-            "the agent is no longer on the pane the bar drew",
-        );
-    }
     let folder = crate::agents::server_dir(ctx, caller);
     // The path goes through the multiplexer's parser, its formats and a shell: plain characters only.
     if !folder
@@ -1669,7 +1661,13 @@ fn peek(ctx: &Ctx, caller: &Caller, target: &Target) -> Res<()> {
             "peek needs a state folder path of plain characters",
         );
     }
-    let text = crate::agents::message::capture(ctx, &pane, PEEK_LINES)?;
+    let (_, text) = crate::agents::message::capture_hc(
+        ctx,
+        caller,
+        &target.name,
+        (!target.pane.is_empty()).then_some(target.pane.as_str()),
+        PEEK_LINES,
+    )?;
     let file = folder.join(format!(
         "peek-{}.txt",
         crate::util::guid()?.replace('-', "")
@@ -3586,7 +3584,11 @@ mod tests {
             w.ctx.state_root = plain.into();
         }
         let caller = w.caller();
-        w.agent_record(ID, json!({"name": "worker", "pane": "%9"}));
+        crate::agents::core_fixture::member(
+            &w,
+            ID,
+            json!({"name":"worker","pane":"%9","startCommand":crate::agents::fixture::launch_command("%9")}),
+        );
         w.panes(&["%9|@5|300|aaaaaaaaaaaa|worker"]);
         w.fakes
             .mux_first("show-buffer", 0, "line one\nline two\n", "");
@@ -3647,7 +3649,11 @@ mod tests {
         // A state folder whose path the multiplexer or a shell would read: no capture, no popup.
         let mut odd = World::human("");
         odd.ctx.state_root = odd.ctx.state_root.join("#{@x}");
-        odd.agent_record(ID, json!({"name": "worker", "pane": "%9"}));
+        crate::agents::core_fixture::member(
+            &odd,
+            ID,
+            json!({"name":"worker","pane":"%9","startCommand":crate::agents::fixture::launch_command("%9")}),
+        );
         odd.panes(&["%9|@5|300|aaaaaaaaaaaa|worker"]);
         odd.fakes.clear_log();
         assert!(peek(&odd.ctx, &odd.caller(), &target).is_err());
@@ -3667,6 +3673,8 @@ mod tests {
                 .iter()
                 .any(|c| c.iter().any(|a| a.contains("capture-pane")))
         );
+        w.fakes.hc_done().unwrap();
+        odd.fakes.hc_done().unwrap();
     }
 
     #[test]

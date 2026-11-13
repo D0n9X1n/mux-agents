@@ -131,3 +131,39 @@ fn click_next_prev_enter_reopen_detached_and_select_attached() {
         }
     }
 }
+
+#[test]
+fn peek_detached_refuses_without_reopening_or_capturing() {
+    let mut w = World::human("");
+    if let Some(plain) = w
+        .ctx
+        .state_root
+        .to_str()
+        .and_then(|r| r.strip_prefix(r"\\?\"))
+    {
+        w.ctx.state_root = plain.into();
+    }
+    let c = w.caller();
+    cf::member(&w, ID, json!({}));
+    w.panes(&[]);
+    let e = peek(
+        &w.ctx,
+        &c,
+        &Target {
+            name: "worker".into(),
+            pane: String::new(),
+        },
+    )
+    .unwrap_err();
+    assert_eq!(e.message, "the agent has no live view; run focus worker");
+    assert!(
+        !w.fakes
+            .mux_calls()
+            .iter()
+            .any(|a| a.iter().any(|s| s == "new-window"
+                || s == "split-window"
+                || s == "run-shell"
+                || s.contains("capture-pane")))
+    );
+    w.fakes.hc_done().unwrap();
+}
