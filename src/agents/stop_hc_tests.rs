@@ -122,3 +122,86 @@ fn stop_uses_hc_only() {
         assert!(!registry::reap_hc(&w.ctx, &c, &snapshot).unwrap());
     }
 }
+
+use super::fixture::write;
+#[test]
+fn stop_errors_and_authorization() {
+    for mode in [
+        "failure",
+        "uncertain",
+        "denied",
+        "identity",
+        "parent",
+        "uncommitted",
+        "aborted",
+    ] {
+        let w = World::agent("");
+        let r = cf::member(
+            &w,
+            ID,
+            json!({"parentPane":if mode=="denied" {"%88"} else {"%1"}}),
+        );
+        let folder = w.folder(ID);
+        w.fakes.hc_install("hc");
+        if mode == "uncommitted" {
+            std::fs::remove_file(folder.join("commit.json")).unwrap();
+        }
+        if mode == "aborted" {
+            let path = folder.join("commit.json");
+            w.fakes.lock_probe(move |event| {
+                if event.starts_with("+notice|") {
+                    write(&path, json!({"aborted":true}));
+                }
+                String::new()
+            });
+        }
+        if mode == "identity" || mode == "parent" {
+            let path = folder.join("record.json");
+            let mut changed = r.clone();
+            changed[if mode == "identity" {
+                "hcAddress"
+            } else {
+                "parentPane"
+            }] = json!("changed");
+            w.fakes.lock_probe(move |event| {
+                if event.starts_with("+notice|") {
+                    write(&path, changed.clone());
+                }
+                String::new()
+            });
+        }
+        if mode == "failure" || mode == "uncertain" {
+            cf::online(&w);
+            let result = if mode == "failure" {
+                Ok(crate::spawn::Out {
+                    code: 1,
+                    ..Default::default()
+                })
+            } else {
+                Err(crate::error::Refusal::internal("timeout"))
+            };
+            w.fakes
+                .hc_expect(&["kill", "taaaaaaaaaaaa", "--json"], result);
+        }
+        assert!(call(&w).is_err(), "{mode}");
+        assert!(!folder.join("notice.json").exists());
+        assert!(!w.state().join("mail/pane-1.jsonl").exists());
+        w.fakes.hc_done().unwrap();
+    }
+}
+
+#[test]
+fn stop_rejects_uncommitted_member_during_named_selection() {
+    let w = World::agent("");
+    cf::member(&w, ID, json!({"parentPane":"%1"}));
+    let folder = w.folder(ID);
+    std::fs::remove_file(folder.join("commit.json")).unwrap();
+    w.fakes.hc_install("hc");
+    let error = call(&w).unwrap_err();
+    assert_eq!(error.check, "target");
+    assert!(w.fakes.locks().is_empty());
+    assert!(w.fakes.hc_calls().is_empty());
+    assert!(!folder.join("notice.json").exists());
+    assert!(!w.state().join("mail/pane-1.jsonl").exists());
+    w.fakes.hc_done().unwrap();
+}

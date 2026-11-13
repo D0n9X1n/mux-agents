@@ -585,9 +585,9 @@ pub fn capture_hc(
 pub fn stop_hc(ctx: &Ctx, request: &Request) -> Res<Map<String, Value>> {
     let caller = resolve(ctx)?;
     let id = super::member_target::named(ctx, &caller, first(request))?;
-    let record = super::member_target::current(ctx, &caller, &id)?;
-    parent_or_human(&caller, &record)?;
     registry::with_member_notice(ctx, &caller, &id.id, || {
+        let record = super::member_target::current(ctx, &caller, &id)?;
+        parent_or_human(&caller, &record)?;
         let core = crate::hc::connect(ctx)?;
         core.kill(&id.address)?;
         let fact = core.get(&id.address).ok().filter(|t| id.matches(t));
