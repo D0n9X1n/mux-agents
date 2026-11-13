@@ -119,31 +119,7 @@ pub fn focus_pane(ctx: &Ctx, caller: &Caller, name: &str, expected: Option<&str>
             "the agent is no longer on the pane the bar drew",
         );
     }
-    let p = pane.pane.as_str();
-    let select = registry::bound(
-        p,
-        pane.launch.live(),
-        format!("select-window -t {p} ; select-pane -t {p}"),
-    );
-    let select: Vec<&str> = select.iter().map(String::as_str).collect();
-    // Only the read-back decides: a select that failed, or a read that failed as a call, is no proof of focus.
-    let _ = native(ctx, &select, true);
-    let probe = format!(
-        "#{{pane_id}}|#{{window_active}}|#{{pane_active}}|{}",
-        pane.launch.live()
-    );
-    let focused =
-        native(ctx, &["display-message", "-p", "-t", p, &probe], true).is_ok_and(|read| {
-            read.code == 0 && read.stdout.trim_end_matches(['\r', '\n']) == format!("{p}|1|1|1")
-        });
-    if !focused {
-        return refuse(2, "target", "the agent's pane is no longer its launch");
-    }
-    Ok(Focused {
-        name: pane.name,
-        pane: pane.pane,
-        window: pane.window,
-    })
+    select_view(ctx, &pane.name, &pane.pane, &pane.window, &pane.launch)
 }
 
 /// The positional the verb table requires.
@@ -259,6 +235,61 @@ pub fn report(ctx: &Ctx, request: &Request) -> Res<Map<String, Value>> {
     reply.insert("kind".into(), kind);
     reply.insert("since".into(), since);
     Ok(reply)
+}
+
+fn select_view(
+    ctx: &Ctx,
+    name: &str,
+    pane: &str,
+    window: &str,
+    launch: &registry::Launch,
+) -> Res<Focused> {
+    let select = registry::bound(
+        pane,
+        launch.live(),
+        format!("select-window -t {pane} ; select-pane -t {pane}"),
+    );
+    let select: Vec<&str> = select.iter().map(String::as_str).collect();
+    // Only the read-back decides: a select that failed, or a read that failed as a call, is no proof of focus.
+    let _ = native(ctx, &select, true);
+    let probe = format!(
+        "#{{pane_id}}|#{{window_active}}|#{{pane_active}}|{}",
+        launch.live()
+    );
+    let focused =
+        native(ctx, &["display-message", "-p", "-t", pane, &probe], true).is_ok_and(|r| {
+            r.code == 0 && r.stdout.trim_end_matches(['\r', '\n']) == format!("{pane}|1|1|1")
+        });
+    if !focused {
+        return refuse(2, "target", "the agent's pane is no longer its launch");
+    }
+    Ok(Focused {
+        name: name.into(),
+        pane: pane.into(),
+        window: window.into(),
+    })
+}
+pub fn focus_hc(
+    ctx: &Ctx,
+    _core: &crate::hc::Core<'_>,
+    caller: &Caller,
+    name: &str,
+    expected: Option<&str>,
+) -> Res<Focused> {
+    let id = super::member_target::named(ctx, caller, name)?;
+    let record = super::member_target::current(ctx, caller, &id)?;
+    let pane = id.view(&record, &registry::rows(ctx, caller)?);
+    if expected.is_some_and(|e| pane.as_ref().is_none_or(|p| p.pane != e)) {
+        return refuse(
+            2,
+            "target",
+            "the agent is no longer on the pane the bar drew",
+        );
+    }
+    match pane {
+        Some(p) => select_view(ctx, &p.name, &p.pane, &p.window, &p.launch),
+        None => refuse(2, "target", "view missing"),
+    }
 }
 
 #[cfg(test)]

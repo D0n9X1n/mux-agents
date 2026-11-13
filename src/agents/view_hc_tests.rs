@@ -34,3 +34,40 @@ fn member_target_rechecks_complete_identity() {
     assert!(member_target::named(&w.ctx, &c, "bad/name").is_err());
     w.fakes.hc_done().unwrap();
 }
+
+use super::view;
+use crate::hc;
+fn rows(w: &World, r: &serde_json::Value) {
+    let mut row = super::fixture::row_of("%9|@5|300||", &[]);
+    row.command = r["startCommand"].as_str().unwrap().into();
+    w.pane_rows(&[row]);
+}
+#[test]
+fn focus_selects_proven_view_and_refuses_expected_mismatch() {
+    let w = World::human("");
+    let r = cf::member(&w, ID, json!({}));
+    rows(&w, &r);
+    let c = w.caller();
+    cf::online(&w);
+    let core = hc::connect(&w.ctx).unwrap();
+    w.fakes.mux_rule("#{window_active}", 0, "%9|1|1|1\n", "");
+    assert!(view::focus_hc(&w.ctx, &core, &c, "worker", Some("%8")).is_err());
+    assert!(!w.fakes.mux_calls().iter().any(|a| a[1] == "if-shell"));
+    assert_eq!(
+        view::focus_hc(&w.ctx, &core, &c, "worker", Some("%9"))
+            .unwrap()
+            .pane,
+        "%9"
+    );
+    w.fakes.mux_first("#{window_active}", 0, "%9|1|1|0\n", "");
+    assert!(view::focus_hc(&w.ctx, &core, &c, "worker", None).is_err());
+    w.panes(&[]);
+    assert!(view::focus_hc(&w.ctx, &core, &c, "worker", Some("%9")).is_err());
+    assert!(
+        !w.fakes
+            .mux_calls()
+            .iter()
+            .any(|a| a[1] == "new-window" || a[1] == "split-window")
+    );
+    w.fakes.hc_done().unwrap();
+}

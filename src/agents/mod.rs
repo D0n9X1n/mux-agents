@@ -18,7 +18,6 @@ pub mod core_identity;
 pub mod core_launch;
 pub mod lifecycle;
 pub mod mail;
-#[allow(dead_code)]
 pub(crate) mod member_target;
 pub mod membership;
 pub mod message;
