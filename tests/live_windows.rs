@@ -190,6 +190,29 @@ impl Live {
         }
     }
 
+    fn run(&self, args: &[&str]) -> Value {
+        let done = self.dir.join("call.done");
+        let out = self.dir.join("call.json");
+        let _ = std::fs::remove_file(&done);
+        let args = args
+            .iter()
+            .map(|s| format!("\"{s}\""))
+            .collect::<Vec<_>>()
+            .join(" ");
+        self.line(
+            &self.root,
+            &format!(
+                "\"{MUX_AGENT}\" {args} > \"{}\" & echo done> \"{}\"",
+                out.display(),
+                done.display()
+            ),
+        );
+        self.wait("command reply", || done.exists().then_some(()));
+        let v: Value = serde_json::from_str(&std::fs::read_to_string(out).unwrap()).unwrap();
+        assert_eq!(v["ok"], true, "{v}");
+        v
+    }
+
     /// `spawn -Client claude -TaskFile <dir>\task.txt -Name <name>` typed into the root pane; its JSON reply, which
     /// must be `ok`.
     fn spawn(&self, name: &str) -> Value {
@@ -278,6 +301,93 @@ fn eventually(limit: Duration, mut ready: impl FnMut() -> bool) -> bool {
         }
         std::thread::sleep(Duration::from_millis(100));
     }
+}
+
+#[test]
+fn hc_worker_and_view_close_survives_focus_stop() {
+    let Some(live) = Live::start() else {
+        return;
+    };
+    live.run(&["sidebar", "-Close"]);
+    let w = live.spawn("w1");
+    let pid: u32 = live.wait("worker session", || {
+        std::fs::read_to_string(live.dir.join("clients.log"))
+            .ok()?
+            .lines()
+            .find_map(|p| {
+                let r: Value = serde_json::from_str(
+                    &std::fs::read_to_string(live.dir.join(format!("client.{p}.json"))).ok()?,
+                )
+                .ok()?;
+                (r["sessionId"] == w["sessionId"])
+                    .then(|| p.parse().ok())
+                    .flatten()
+            })
+    });
+    let worker: Value = serde_json::from_str(
+        &std::fs::read_to_string(live.dir.join(format!("client.{pid}.json"))).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(worker["env"]["HC_TERMINAL_ID"], w["hcAddress"]);
+    assert!(worker["env"]["TMUX"].is_null() && worker["env"]["RMUX"].is_null());
+    std::fs::write(live.dir.join("status.txt"), "checking core").unwrap();
+    for (n, (command, key, want)) in [
+        (
+            "status\t-BodyFile\t{dir}/status.txt",
+            "text",
+            serde_json::json!("checking core"),
+        ),
+        (
+            "report\tblocked\t-Kind\tquestion",
+            "state",
+            serde_json::json!("blocked"),
+        ),
+        (
+            "send\tparent\t-BodyFile\t{dir}/status.txt",
+            "from",
+            serde_json::json!("w1"),
+        ),
+        ("read", "messages", serde_json::json!([])),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let held = live.dir.join(format!("cmd.{pid}.part"));
+        std::fs::write(&held, format!("{command}\n")).unwrap();
+        std::fs::rename(held, live.dir.join(format!("cmd.{pid}"))).unwrap();
+        let text = live.wait("worker reply", || {
+            std::fs::read_to_string(live.dir.join(format!("reply.{pid}.{}.json", n + 1))).ok()
+        });
+        let r: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(r["ok"], true, "{r}");
+        assert_eq!(r[key], want);
+    }
+    assert_eq!(live.run(&["read"])["messages"].as_array().unwrap().len(), 1);
+    let address = s(&w["hcAddress"]);
+    let get =
+        || private_core::run(live.core.command(&["get", &address, "--json"]), &live.dir).unwrap();
+    let before = get();
+    live.call(&["kill-pane", "-t", &s(&w["pane"])]);
+    let list = live.run(&["list", "-All"]);
+    let row = &list["agents"][0];
+    assert_eq!(row["life"], "running");
+    assert_eq!(row["view"], "detached");
+    assert!(row["pane"].is_null());
+    assert_eq!(live.run(&["read"])["messages"], serde_json::json!([]));
+    assert_eq!(get()["state"], "live");
+    let focus = live.run(&["focus", "w1"]);
+    assert_ne!(focus["pane"], w["pane"]);
+    assert_eq!(live.focused(), s(&focus["pane"]));
+    let list = live.run(&["list"]);
+    assert_eq!(list["agents"][0]["sessionId"], w["sessionId"]);
+    assert_eq!(get()["argv"], before["argv"]);
+    assert_eq!(
+        live.run(&["stop", "w1"]),
+        serde_json::json!({"ok":true,"verb":"stop","name":"w1","hcAddress":address,"life":"ended"})
+    );
+    live.wait("finished core terminal", || {
+        (get()["state"] == "finished").then_some(())
+    });
 }
 
 // A client whose running image an update renamed (claude.exe.old.<ms>.<pid>) is still the caller's client: `list` run
