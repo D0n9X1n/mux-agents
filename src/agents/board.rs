@@ -1181,3 +1181,54 @@ mod tests {
         assert!(!w.folder(ID).join("notice.json").exists());
     }
 }
+#[cfg(test)]
+#[path = "board_hc_tests.rs"]
+mod hc_tests;
+/// Finish an ordered legacy-schema row; view is membership's validated optional Pane. No I/O.
+pub fn hc_row(
+    mut row: Map<String, Value>,
+    o: &super::core_facts::Observation,
+    view: Option<&Pane>,
+) -> Map<String, Value> {
+    use super::lifecycle::Life;
+    let (life, state) = match o.life {
+        Life::Running => ("running", "running".to_string()),
+        Life::Lost => ("lost", "lost".to_string()),
+        Life::Unknown => ("unknown", "unknown".to_string()),
+        Life::Ended => {
+            let t = o.terminal.as_ref();
+            let killed = t.is_some_and(|t| t.reason == Some(crate::hc::Reason::Killed));
+            let code = t.and_then(|t| t.exit_code).filter(|_| !killed);
+            row.insert("exitCode".into(), code.map_or(Value::Null, Value::from));
+            (
+                "ended",
+                if killed {
+                    "stopped".into()
+                } else {
+                    code.map_or_else(|| "exited".into(), |n| format!("exited {n}"))
+                },
+            )
+        }
+    };
+    row.insert("state".into(), state.into());
+    row.insert(
+        "pane".into(),
+        view.map_or(Value::Null, |v| v.pane.clone().into()),
+    );
+    row.insert(
+        "window".into(),
+        view.map_or(Value::Null, |v| v.window.clone().into()),
+    );
+    row.insert("life".into(), life.into());
+    row.insert(
+        "view".into(),
+        if view.is_some() {
+            "attached"
+        } else {
+            "detached"
+        }
+        .into(),
+    );
+    row.insert("hcAddress".into(), o.identity.address.clone().into());
+    row
+}
