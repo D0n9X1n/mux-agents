@@ -1162,7 +1162,7 @@ mod tests {
     #[test]
     fn fork_recipe_keeps_parent_only_on_first_launch() {
         for client in [Client::Claude, Client::Copilot] {
-            for task in [None, Some(""), Some("task --resume parent")] {
+            for task in [None, Some(""), Some(" "), Some("task --resume parent")] {
                 let mut expected: Vec<&str> = match client {
                     Client::Claude => vec![
                         "--resume",
