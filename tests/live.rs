@@ -5,6 +5,10 @@
 //! `sh scripts/dev/tmux32.sh`.
 
 #[cfg(unix)]
+#[path = "support/launch_evidence.rs"]
+mod launch_evidence;
+
+#[cfg(unix)]
 mod support;
 
 #[cfg(unix)]
@@ -15,6 +19,7 @@ use support::{Dir, Mux, Server};
 #[cfg(unix)]
 #[test]
 fn preflight_reports_each_multiplexer() {
+    let _ = support::private_core::PrivateCore::installed();
     for mux in Mux::ALL {
         if let Some((bin, version)) = support::available(mux) {
             eprintln!("preflight {}: {version} at {}", mux.name(), bin.display());
@@ -53,19 +58,24 @@ fn harness_starts_private_server_and_runs_shell() {
                 .map(str::to_string)
         };
         assert_eq!(get("HOME"), Some(dir.join("home").display().to_string()));
+        assert_eq!(
+            get("XDG_STATE_HOME"),
+            Some(dir.join("core-state").display().to_string())
+        );
         assert_eq!(get("MUX_IT_DIR"), Some(dir.path().display().to_string()));
-        // rmux puts its tmux shim first, inside the harness's TMPDIR; <dir>/bin comes before anything outside it.
+        // rmux puts its tmux shim first, inside the private runtime or temp dir; <dir>/bin precedes outside paths.
         let path = get("PATH").unwrap();
-        let first_outside = path
-            .split(':')
-            .find(|p| !p.starts_with(&dir.join("tmp").display().to_string()));
+        let first_outside = path.split(':').find(|p| {
+            !["run", "tmp"]
+                .iter()
+                .any(|sub| std::path::Path::new(p).starts_with(dir.join(sub)))
+        });
         assert_eq!(
             first_outside,
             Some(dir.join("bin").to_str().unwrap()),
             "{mux:?} PATH={path}"
         );
         for unset in [
-            "XDG_STATE_HOME",
             "MUX_AGENTS_STATE",
             "CLAUDE_CODE_SESSION_ID",
             "COPILOT_AGENT_SESSION_ID",
@@ -1891,7 +1901,14 @@ exec claude --dangerously-skip-permissions
             );
             assert_eq!(live.bars().len(), 1, "{mux:?}");
             let agent = s(&spawned["pane"]);
-            let edge = |pane: &str, format: &str| -> u32 { live.num(pane, format) };
+            let edge = |pane: &str, format: &str| -> u32 {
+                crate::launch_evidence::checked(
+                    &live.agent_dir(s(&spawned["id"])),
+                    live.dir.path(),
+                    || live.num(pane, format),
+                )
+                .unwrap_or_else(|e| panic!("{mux:?} placement {placement}: {e}"))
+            };
             assert!(
                 edge(agent, "#{pane_right}") < edge(&bar, "#{pane_left}"),
                 "{mux:?} placement {placement}: the agent is not left of the bar"
@@ -3943,4 +3960,117 @@ exec claude --dangerously-skip-permissions
 
     // tmux 3.2a's display-popup has no -T (QA #91): peek works there too.
     tests_on!(tmux32_peek, Tmux32, [bar_real_client_peek]);
+}
+
+#[cfg(unix)]
+#[test]
+fn private_core_unix() {
+    for mux in Mux::ALL {
+        let d = Dir::new();
+        let Some(mut s) = Server::start(mux, &d) else {
+            continue;
+        };
+        let core = s.core.as_ref().expect("server must own a core");
+        let expected = core
+            .env
+            .iter()
+            .filter(|(k, _)| ["HC_SESSION", "HC_SOCKET", "HOME", "XDG_CONFIG_HOME"].contains(k))
+            .map(|(k, v)| format!("{k}={}", v.to_string_lossy()))
+            .collect::<Vec<_>>();
+        let probe = core.command(&["server", "stop", "--json"]);
+        let env = s.pane_env();
+        for entry in expected {
+            assert!(env.lines().any(|line| line == entry), "missing {entry}");
+        }
+        s.kill();
+        assert_eq!(
+            support::private_core::run(probe, d.path()).unwrap()["stopped"],
+            false
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn private_core_stop_failure_kills_mux_and_keeps_evidence() {
+    check_private_core_stop_failure(false);
+}
+
+#[cfg(unix)]
+#[test]
+fn private_core_stop_failure_during_unwind_kills_mux_and_keeps_evidence() {
+    check_private_core_stop_failure(true);
+}
+
+#[cfg(unix)]
+fn check_private_core_stop_failure(unwinding: bool) {
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+
+    struct KillOnUnwind<'a>(&'a mut Server);
+    impl Drop for KillOnUnwind<'_> {
+        fn drop(&mut self) {
+            self.0.kill();
+        }
+    }
+
+    for mux in Mux::ALL {
+        let dir = Dir::new();
+        let Some(mut server) = Server::start(mux, &dir) else {
+            continue;
+        };
+        server.send_keys("claude");
+        let client = server.wait_client()["pid"].as_u64().unwrap() as u32;
+        let pid = server.pid();
+        let path = dir.path().to_path_buf();
+        // Stop the real private core before injecting a genuine command-spawn failure.
+        assert!(server.core.as_mut().unwrap().stop());
+        let mut failed = support::private_core::PrivateCore::new(
+            dir.join("missing-core"),
+            dir.path(),
+            &std::env::var_os("PATH").unwrap(),
+        );
+        assert!(catch_unwind(AssertUnwindSafe(|| failed.start())).is_err());
+        server.core = Some(failed);
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            if unwinding {
+                let _guard = KillOnUnwind(&mut server);
+                panic!("fixture failure");
+            }
+            server.kill();
+        }));
+        let mux_gone = !support::alive(pid);
+        let client_gone = !support::alive(client);
+        // Recover even against the old early-return teardown before making assertions.
+        server.core = None;
+        server.kill();
+        drop(server);
+        drop(dir);
+        let kept = path.is_dir() && path.join("core-stop-failed").is_file();
+        std::fs::remove_dir_all(&path).unwrap();
+
+        assert!(
+            mux_gone,
+            "{mux:?} unwinding={unwinding}: mux survived failed core stop"
+        );
+        assert!(
+            client_gone,
+            "{mux:?} unwinding={unwinding}: client survived failed core stop"
+        );
+        assert!(kept, "{mux:?}: evidence folder was removed");
+        let panic = result.expect_err("failed core stop must report its failure");
+        let message = panic
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| panic.downcast_ref::<&str>().copied())
+            .unwrap();
+        let expected = if unwinding {
+            "fixture failure".to_string()
+        } else {
+            format!(
+                "private core stop failed; fixture kept at {}",
+                path.display()
+            )
+        };
+        assert_eq!(message, expected);
+    }
 }

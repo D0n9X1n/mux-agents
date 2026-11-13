@@ -350,6 +350,51 @@ fn process_spawn_only_in_spawn_rs() {
     assert_eq!(found, [ALLOWED]);
 }
 
+#[test]
+fn windows_live_rmux_commands_share_the_private_environment() {
+    let source = repo_file("tests/live_windows.rs");
+    let constructor = r#"Command::new("rmux")"#;
+    assert_eq!(
+        source.matches(constructor).count(),
+        1,
+        "every Windows rmux invocation must use the private-environment helper"
+    );
+    let helper = source
+        .split_once("fn rmux(&self) -> Command {")
+        .expect("the Windows fixture needs an rmux command helper")
+        .1
+        .split_once("\n    }")
+        .unwrap()
+        .0;
+    let lines: Vec<_> = helper
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .collect();
+    assert_eq!(
+        lines,
+        [
+            r#"let mut command = Command::new("rmux");"#,
+            "self.core.apply(&mut command);",
+            r#"command.arg("-L").arg(&self.socket);"#,
+            "command",
+        ]
+    );
+}
+
+#[test]
+fn windows_live_skips_missing_rmux_before_requiring_core() {
+    let source = repo_file("tests/live_windows.rs");
+    let before_core = source
+        .split_once("private_core::PrivateCore::installed()")
+        .unwrap()
+        .0;
+    assert!(
+        before_core.contains(r#"if mux_agent::mux::find_on_path("rmux.exe", &path).is_none() {"#)
+    );
+    assert!(before_core.contains("return None;"));
+}
+
 // Release rules (spec D7): `main` is source-only; the marketplace installs the `dist` ref, which the release
 // workflow writes as the tagged tree plus `scripts/bin/` and its `SHA256SUMS`.
 
@@ -850,6 +895,35 @@ fn ci_test_job_named_test() {
             j.iter().any(|l| l == "    runs-on: ${{ matrix.os }}"),
             "job {name}"
         );
+    }
+}
+
+#[test]
+fn integration_runs_cli_tests_with_fake_client() {
+    let ci = repo_file(CI);
+    for (name, before, after) in [
+        (
+            "integration",
+            "- name: Live preflight",
+            "- name: Live tests",
+        ),
+        (
+            "integration-windows",
+            "- name: Clippy with the live tests",
+            "- name: Windows live tests",
+        ),
+    ] {
+        let lines = job_lines(&ci, name);
+        let at = line_of(&lines, "- name: CLI tests that need the fake client");
+        assert_eq!(lines[at + 1], "shell: bash", "{name}");
+        assert_eq!(
+            lines[at + 2],
+            "run: cargo test --features live,test-panic --locked --test cli",
+            "{name}"
+        );
+        let previous = lines[..at].iter().rfind(|line| line.starts_with("- name:"));
+        assert_eq!(previous.map(String::as_str), Some(before), "{name}");
+        assert_eq!(lines[at + 3], after, "{name}");
     }
 }
 
@@ -2362,7 +2436,7 @@ fn integration_runs_live_on_every_multiplexer() {
     assert!(lines.iter().any(|l| l.contains("rmux -V")), "{lines:#?}");
     // Every step that runs the live suite requires all three.
     let live: Vec<usize> = (0..lines.len())
-        .filter(|&i| lines[i].contains("--test live"))
+        .filter(|&i| lines[i].ends_with("--test live") || lines[i].contains("--test live "))
         .collect();
     assert!(!live.is_empty(), "{lines:#?}");
     for at in live {
@@ -2376,5 +2450,30 @@ fn integration_runs_live_on_every_multiplexer() {
             &lines[step..=at]
         );
         assert!(install < step, "{lines:#?}");
+    }
+}
+
+#[test]
+fn live_core_installer_precedes_tests() {
+    for job in ["integration", "integration-windows"] {
+        let lines = job_lines(&repo_file(".github/workflows/ci.yml"), job);
+        assert!(
+            line_of(&lines, "sh scripts/dev/hc.sh")
+                < line_of(&lines, "cargo test --features live,test-panic")
+        );
+        assert!(lines.iter().any(|l| l.contains("--test live_core")));
+    }
+    let script = repo_file("scripts/dev/hc.sh");
+    for needle in [
+        "0.1.21",
+        "linux-x86_64",
+        "macos-aarch64",
+        "macos-x86_64",
+        "windows-x86_64",
+        "curl --fail",
+        "shasum -a 256",
+        "System32/tar.exe",
+    ] {
+        assert!(script.contains(needle), "{needle}");
     }
 }

@@ -264,13 +264,35 @@ unsafe extern "system" {
 /// The client on the caller's own console (MuxAgents.ps1:1650-1659): stdio inherited, `remove` taken out of its
 /// environment; its exit code.
 pub fn attached(path: &Path, args: &[String], remove: &[&str]) -> io::Result<i32> {
-    audit(path)?;
+    attached_env(path, args, remove, &[])
+}
+
+fn attached_command(
+    path: &Path,
+    args: &[String],
+    remove: &[&str],
+    set: &[(&str, &str)],
+) -> Command {
     let mut command = Command::new(path);
-    command.args(args);
+    command.args(args).envs(set.iter().copied());
     for name in remove {
         command.env_remove(name);
     }
-    Ok(exit_code(command.status()?))
+    command
+}
+
+/// Like `attached`, with per-child overrides that never change the process environment.
+/// Removals apply after the overrides, so a name in both is absent from the child.
+pub fn attached_env(
+    path: &Path,
+    args: &[String],
+    remove: &[&str],
+    set: &[(&str, &str)],
+) -> io::Result<i32> {
+    audit(path)?;
+    Ok(exit_code(
+        attached_command(path, args, remove, set).status()?,
+    ))
 }
 
 /// What a timeout kills: on Unix the child's own process group, which needs nothing held.
@@ -732,6 +754,75 @@ mod tests {
             !alive
         });
         assert!(gone, "descendant {pid} survived");
+    }
+
+    #[test]
+    fn attached_env_does_not_change_process_environment() {
+        for state in [None, Some("inherited-root")] {
+            let mut command = Std::new(me());
+            command.args(probe_args("attached_env_parent", &[]));
+            if let Some(state) = state {
+                command.env("MUX_AGENTS_STATE", state);
+            } else {
+                command.env_remove("MUX_AGENTS_STATE");
+            }
+            let out = command.output().unwrap();
+            assert!(
+                out.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr),
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "a child of attached_env_does_not_change_process_environment"]
+    fn attached_env_parent() {
+        if !probing() {
+            return;
+        }
+        let before = std::env::var_os("MUX_AGENTS_STATE");
+        let value = format!("leak-probe-{}", crate::util::hex_id().unwrap());
+        let code = attached_env(
+            &me(),
+            &probe_args("probe_report", &[]),
+            &[],
+            &[("MUX_AGENTS_STATE", &value)],
+        )
+        .unwrap();
+        assert_eq!(code, 7);
+        assert_eq!(std::env::var_os("MUX_AGENTS_STATE"), before);
+    }
+
+    #[test]
+    fn attached_overlay_is_command_local() {
+        let before = std::env::var_os("PATH");
+        let c = attached_command(
+            Path::new("client"),
+            &["literal arg".into()],
+            &["CLAUDECODE"],
+            &[
+                ("PATH", "new-path"),
+                ("MUX_AGENTS_STATE", "new-root"),
+                ("CLAUDECODE", "remove-me"),
+            ],
+        );
+        let vars: std::collections::BTreeMap<_, _> = c
+            .get_envs()
+            .map(|(k, v)| (k.to_owned(), v.map(std::ffi::OsStr::to_owned)))
+            .collect();
+        assert_eq!(
+            vars.get(std::ffi::OsStr::new("PATH")),
+            Some(&Some("new-path".into()))
+        );
+        assert_eq!(
+            vars.get(std::ffi::OsStr::new("MUX_AGENTS_STATE")),
+            Some(&Some("new-root".into()))
+        );
+        assert_eq!(vars.get(std::ffi::OsStr::new("CLAUDECODE")), Some(&None));
+        assert!(!vars.contains_key(std::ffi::OsStr::new("HC_SOCKET")));
+        assert_eq!(std::env::var_os("PATH"), before);
     }
 
     #[test]

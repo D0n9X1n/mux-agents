@@ -41,8 +41,13 @@ fn exe() -> Res<PathBuf> {
 
 // The providers, built before the arguments are parsed, as the reference entry did. The multiplexer connects on
 // first use.
-fn ctx() -> Res<Ctx> {
-    let env = Env::from_os(std::env::vars_os());
+fn ctx(args: &[String]) -> Res<Ctx> {
+    let inherited = Env::from_os(std::env::vars_os());
+    let env = if cli::launcher_spec(args).is_some() {
+        mux_agent::launcher_scope::environment(args, &inherited)?
+    } else {
+        inherited
+    };
     let state_root = root(&env, HOST)?;
     Ok(Ctx {
         pid: std::process::id(),
@@ -68,7 +73,10 @@ fn main() -> ExitCode {
         .map(|a| a.to_string_lossy().into_owned())
         .collect();
     if let Some(spec) = cli::launcher_spec(&args) {
-        let (code, reply) = cli::run_launcher(spec, ctx);
+        let (code, reply) =
+            cli::run_launcher(spec, mux_agent::launcher_scope::is_scoped(&args), || {
+                ctx(&args)
+            });
         let mut out = std::io::stdout().lock();
         if let Some(reply) = reply {
             let _ = write!(out, "{reply}{NL}");
@@ -77,7 +85,7 @@ fn main() -> ExitCode {
         // The client's own exit code, which may not fit a u8 on Windows.
         std::process::exit(code);
     }
-    let (code, text) = cli::run(&args, ctx);
+    let (code, text) = cli::run(&args, || ctx(&args));
     // A closed stdout leaves only the exit code to report with. Nothing at all for no text (`report -Quiet`).
     if !text.is_empty() {
         let _ = write!(std::io::stdout().lock(), "{text}{NL}");
