@@ -256,3 +256,68 @@ fn only_committed_same_name_matches_are_queried() {
     assert_eq!(named(&w.ctx, &c, "worker").unwrap().id, NEW);
     w.fakes.hc_done().unwrap();
 }
+
+#[test]
+fn adapters_resolve_duplicates_without_running_a_core_terminal() {
+    use crate::agents::{fixture::row_of, message, view};
+    for verb in ["focus", "capture", "stop"] {
+        let w = World::human("");
+        let [a, b] = pair(&w);
+        let c = w.caller();
+        let mut row = row_of("%19|@8|300||", &[]);
+        row.command = "hc attach tbbbbbbbbbbbb".into();
+        w.pane_rows(&[row]);
+        w.fakes.mux_rule("#{window_active}", 0, "%19|1|1|1\n", "");
+        w.fakes.mux_rule("show-buffer", 0, "one\ntwo\n", "");
+        cf::online(&w);
+        let core = if verb == "focus" {
+            Some(crate::hc::connect(&w.ctx).unwrap())
+        } else {
+            None
+        };
+        fact(&w, &a, "ended");
+        fact(&w, &b, "running");
+        if verb == "stop" {
+            cf::online(&w);
+            cf::answer(&w, &["kill", "tbbbbbbbbbbbb", "--json"], "{}");
+            fact(&w, &b, "ended");
+        }
+        match verb {
+            "focus" => assert_eq!(
+                view::focus_hc(&w.ctx, core.as_ref().unwrap(), &c, "worker", Some("%19"))
+                    .unwrap()
+                    .pane,
+                "%19"
+            ),
+            "capture" => assert_eq!(
+                message::capture_hc(&w.ctx, &c, "worker", Some("%19"), 2)
+                    .unwrap()
+                    .1,
+                "one\ntwo"
+            ),
+            _ => assert_eq!(
+                message::stop_hc(&w.ctx, &w.request(&["stop", "worker"])).unwrap()["hcAddress"],
+                "tbbbbbbbbbbbb"
+            ),
+        }
+        assert_eq!(
+            w.fakes
+                .hc_calls()
+                .iter()
+                .map(|(_, a, _)| a[0].clone())
+                .collect::<Vec<_>>(),
+            if verb == "stop" {
+                vec!["--version", "get", "get", "--version", "kill", "get"]
+            } else {
+                vec!["--version", "get", "get"]
+            }
+        );
+        assert!(
+            !w.fakes
+                .mux_calls()
+                .iter()
+                .any(|a| a[1] == "new-window" || a[1] == "split-window")
+        );
+        w.fakes.hc_done().unwrap();
+    }
+}

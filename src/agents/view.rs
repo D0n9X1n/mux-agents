@@ -276,7 +276,7 @@ pub fn focus_hc(
     name: &str,
     expected: Option<&str>,
 ) -> Res<Focused> {
-    let id = super::member_target::named(ctx, caller, name)?;
+    let id = super::member_target::named_with_core(ctx, caller, name, Some(core))?;
     lock(ctx, &lock_key("member", caller, &id.id), || {
         let record = super::member_target::current(ctx, caller, &id)?;
         let pane = id.view(&record, &registry::rows(ctx, caller)?);
