@@ -3,6 +3,8 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use serde_json::Value;
+
 use crate::ctx::Ctx;
 use crate::error::{Refusal, Res};
 use crate::spawn::Out;
@@ -79,6 +81,93 @@ fn version_ok(text: &str) -> bool {
         .map(str::parse::<u64>)
         .collect::<Result<Vec<_>, _>>();
     matches!(nums, Ok(ref n) if n.len() == 3 && (n[0], n[1], n[2]) >= (0, 1, 21))
+}
+
+pub struct Run<'a> {
+    pub bg: bool,
+    pub keep: bool,
+    pub outlive_parent: bool,
+    pub no_notify: bool,
+    pub name: Option<&'a str>,
+    pub labels: &'a [(&'a str, &'a str)],
+    pub cwd: Option<&'a str>,
+    pub argv: &'a [&'a str],
+}
+
+fn invalid() -> Refusal {
+    failure("hc returned invalid JSON")
+}
+
+fn text(v: &Value, key: &str) -> Res<String> {
+    v.get(key)
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+        .ok_or_else(invalid)
+}
+
+fn address(v: &Value) -> Res<String> {
+    text(v, "address").and_then(|a| if a.is_empty() { Err(invalid()) } else { Ok(a) })
+}
+
+impl Core<'_> {
+    fn call(&self, args: &[String]) -> Res<Out> {
+        let argv: Vec<_> = args.iter().map(String::as_str).collect();
+        let out = self
+            .provider
+            .captured(&self.bin, &argv, Duration::from_secs(15))
+            .map_err(|_| failure("hc call failed; execution is uncertain; do not retry blindly"))?;
+        if out.code != 0 {
+            return Err(failure(
+                "hc command failed; execution is uncertain; do not retry blindly",
+            ));
+        }
+        Ok(out)
+    }
+
+    fn json(&self, args: &[String]) -> Res<Value> {
+        serde_json::from_str(&self.call(args)?.stdout).map_err(|_| invalid())
+    }
+
+    pub fn run(&self, r: &Run<'_>) -> Res<String> {
+        if r.argv.is_empty() {
+            return Err(failure("hc run needs argv"));
+        }
+        if r.argv.len() == 1
+            && r.argv[0].contains(|c: char| c.is_whitespace() || ";|&<>$`*?(){}~'\"".contains(c))
+        {
+            return Err(failure(
+                "hc run needs a literal executable, not a shell line",
+            ));
+        }
+        let mut a = vec!["run".into()];
+        for (yes, flag) in [
+            (r.bg, "--bg"),
+            (r.keep, "--keep"),
+            (r.outlive_parent, "--outlive-parent"),
+            (r.no_notify, "--no-notify"),
+        ] {
+            if yes {
+                a.push(flag.into());
+            }
+        }
+        if let Some(n) = r.name {
+            a.extend(["--name".into(), n.into()]);
+        }
+        for (k, v) in r.labels {
+            a.extend(["--label".into(), format!("{k}={v}")]);
+        }
+        if let Some(c) = r.cwd {
+            a.extend(["--cwd".into(), c.into()]);
+        }
+        a.extend(["--json".into(), "--".into()]);
+        a.extend(r.argv.iter().map(|s| s.to_string()));
+        address(&self.json(&a)?)
+    }
+
+    pub fn kill(&self, t: &str) -> Res<()> {
+        self.call(&["kill".into(), t.into(), "--json".into()])
+            .map(|_| ())
+    }
 }
 
 #[cfg(test)]
@@ -160,6 +249,82 @@ mod tests {
             stderr: "SECRET".into(),
         }));
         assert_eq!(connect(&f.ctx()).err().unwrap().message, INSTALL);
+        assert_eq!(f.hc_calls().len(), 2);
+    }
+
+    #[test]
+    fn hc_run_kill() {
+        let f = Fakes::default();
+        f.hc_install("hc");
+        answer(&f, "hc 0.1.21");
+        answer(
+            &f,
+            r#"{"address":"t1","agent":null,"cwd":"/a b","name":"worker","state":"live","turn":0}"#,
+        );
+        answer(&f, "{}");
+        let c = f.ctx();
+        let h = connect(&c).unwrap();
+        let r = Run {
+            bg: true,
+            keep: true,
+            outlive_parent: true,
+            no_notify: true,
+            name: Some("worker"),
+            labels: &[("team", "x")],
+            cwd: Some("/a b"),
+            argv: &["claude", "literal ; $()"],
+        };
+        assert_eq!(h.run(&r).unwrap(), "t1");
+        h.kill("t1").unwrap();
+        assert_eq!(
+            f.hc_calls()[1].1,
+            [
+                "run",
+                "--bg",
+                "--keep",
+                "--outlive-parent",
+                "--no-notify",
+                "--name",
+                "worker",
+                "--label",
+                "team=x",
+                "--cwd",
+                "/a b",
+                "--json",
+                "--",
+                "claude",
+                "literal ; $()",
+            ]
+        );
+        assert_eq!(f.hc_calls()[2].1, ["kill", "t1", "--json"]);
+        assert_eq!(f.hc_calls()[1].2, Duration::from_secs(15));
+        assert_eq!(f.hc_calls()[2].2, Duration::from_secs(15));
+    }
+
+    #[test]
+    fn hc_run_options() {
+        let f = Fakes::default();
+        f.hc_install("hc");
+        answer(&f, "hc 0.1.21");
+        answer(&f, r#"{"address":"t1"}"#);
+        let c = f.ctx();
+        let h = connect(&c).unwrap();
+        let mut r = Run {
+            bg: false,
+            keep: false,
+            outlive_parent: false,
+            no_notify: false,
+            name: None,
+            labels: &[],
+            cwd: None,
+            argv: &["claude"],
+        };
+        assert_eq!(h.run(&r).unwrap(), "t1");
+        assert_eq!(f.hc_calls()[1].1, ["run", "--json", "--", "claude"]);
+        for argv in [&[][..], &["echo secret; exit"]] {
+            r.argv = argv;
+            assert!(h.run(&r).is_err());
+        }
         assert_eq!(f.hc_calls().len(), 2);
     }
 
