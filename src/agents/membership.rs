@@ -118,6 +118,27 @@ impl Snapshot {
         Ok(Self::assemble(ctx, caller, local, facts, None))
     }
 
+    pub fn admit_name(
+        &self,
+        requested: Option<&str>,
+        client: crate::parse::Client,
+        task: &str,
+    ) -> Res<String> {
+        if let Some(e) = &self.core_error {
+            return Err(e.clone());
+        }
+        if self.facts.count() >= 6 {
+            return crate::error::refuse(2, "cap", "the session already has 6 live agents");
+        }
+        let names = self.facts.names();
+        crate::checks::resolve_name(
+            requested,
+            client,
+            task,
+            &names.iter().map(String::as_str).collect::<Vec<_>>(),
+        )
+    }
+
     fn assemble(
         ctx: &Ctx,
         caller: &Caller,

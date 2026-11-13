@@ -246,3 +246,100 @@ fn spawn_snapshot_refuses_unverified_reservations() {
         w.fakes.hc_done().unwrap();
     }
 }
+
+#[test]
+fn only_ended_releases_name_and_capacity() {
+    for (mode, count) in [
+        ("running", 6),
+        ("lost", 6),
+        ("unknown", 6),
+        ("ended", 5),
+        ("uncommitted", 6),
+    ] {
+        let w = World::human("");
+        let caller = w.caller();
+        let r = f::member(&w, ID, json!({}));
+        if mode == "uncommitted" {
+            std::fs::remove_file(w.folder(ID).join("commit.json")).unwrap();
+        }
+        for foreign in [false, true] {
+            f::online(&w);
+            f::listing(
+                &w,
+                &team(&caller),
+                if foreign {
+                    &["x5", "x1", "x2", "x3", "x4", "x1", "taaaaaaaaaaaa"]
+                } else {
+                    &[]
+                },
+            );
+            let mut t = f::wire(&r);
+            match mode {
+                "lost" => t["argv"] = json!(["/bin/zsh", "-l"]),
+                "unknown" => t["labels"]["mux.gen"] = json!("old"),
+                "ended" => {
+                    t["state"] = json!("finished");
+                    t["reason"] = json!("killed");
+                }
+                _ => {}
+            }
+            f::get(&w, "taaaaaaaaaaaa", t);
+            if foreign {
+                for n in 1..=5 {
+                    let mut t = f::wire(&r);
+                    let a = format!("x{n}");
+                    t["address"] = json!(a);
+                    t["labels"]["mux.id"] = json!(format!("{n:012x}"));
+                    t["labels"]["mux.name"] = json!(format!("other-{n}"));
+                    f::get(&w, &a, t);
+                }
+            }
+            w.fakes.clear_log();
+            let s = Snapshot::take(&w.ctx, &caller).unwrap();
+            assert_eq!(
+                s.facts.count(),
+                if foreign { count } else { count - 5 },
+                "{mode}"
+            );
+            let got = s.admit_name(Some("worker"), crate::parse::Client::Claude, "task");
+            if mode == "ended" {
+                assert_eq!(got.unwrap(), "worker");
+                if foreign {
+                    assert_eq!(
+                        s.admit_name(Some("other-1"), crate::parse::Client::Claude, "task")
+                            .unwrap_err()
+                            .message,
+                        "agent name is taken, try other-1-2"
+                    );
+                }
+            } else {
+                assert_eq!(
+                    got.unwrap_err().message,
+                    if foreign {
+                        "the session already has 6 live agents"
+                    } else {
+                        "agent name is taken, try worker-2"
+                    }
+                );
+            }
+            assert_eq!(
+                w.fakes
+                    .hc_calls()
+                    .iter()
+                    .filter(|(_, a, _)| a[0] == "get")
+                    .count(),
+                if foreign { 6 } else { 1 }
+            );
+            w.fakes.hc_done().unwrap();
+        }
+    }
+    let w = World::human("");
+    let caller = w.caller();
+    f::member(&w, ID, json!({}));
+    let s = Snapshot::take(&w.ctx, &caller).unwrap();
+    assert!(
+        s.admit_name(None, crate::parse::Client::Claude, "task")
+            .is_err()
+    );
+    w.fakes.hc_done().unwrap();
+}
