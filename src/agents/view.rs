@@ -277,19 +277,21 @@ pub fn focus_hc(
     expected: Option<&str>,
 ) -> Res<Focused> {
     let id = super::member_target::named(ctx, caller, name)?;
-    let record = super::member_target::current(ctx, caller, &id)?;
-    let pane = id.view(&record, &registry::rows(ctx, caller)?);
-    if expected.is_some_and(|e| pane.as_ref().is_none_or(|p| p.pane != e)) {
-        return refuse(
-            2,
-            "target",
-            "the agent is no longer on the pane the bar drew",
-        );
-    }
-    match pane {
-        Some(p) => select_view(ctx, &p.name, &p.pane, &p.window, &p.launch),
-        None => restore_view(ctx, core, caller, &id, record),
-    }
+    lock(ctx, &lock_key("member", caller, &id.id), || {
+        let record = super::member_target::current(ctx, caller, &id)?;
+        let pane = id.view(&record, &registry::rows(ctx, caller)?);
+        if expected.is_some_and(|e| pane.as_ref().is_none_or(|p| p.pane != e)) {
+            return refuse(
+                2,
+                "target",
+                "the agent is no longer on the pane the bar drew",
+            );
+        }
+        match pane {
+            Some(p) => select_view(ctx, &p.name, &p.pane, &p.window, &p.launch),
+            None => restore_view(ctx, core, caller, &id, record),
+        }
+    })
 }
 
 fn restore_view(

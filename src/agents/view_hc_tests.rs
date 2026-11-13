@@ -164,3 +164,140 @@ fn failed_attachment_cleans_only_new_view() {
         w.fakes.hc_done().unwrap();
     }
 }
+
+#[test]
+fn focus_reopens_once() {
+    use std::{
+        sync::{Arc, mpsc},
+        time::{Duration, Instant},
+    };
+    let w = World::human("");
+    cf::member(&w, ID, json!({}));
+    let c = w.caller();
+    let gate = Arc::new(crate::testing::Gate::default());
+    w.fakes.share_locks(gate.clone());
+    let key = super::lock_key("member", &c, ID);
+    let key2 = key.clone();
+    let g = gate.clone();
+    let (tx, rx) = mpsc::channel();
+    w.fakes.mux_script("new-window", move |_| {
+        tx.send(()).unwrap();
+        let end = Instant::now() + Duration::from_secs(3);
+        while g.waiting(&key2) == 0 {
+            assert!(Instant::now() < end, "second focus never waited");
+            std::thread::yield_now();
+        }
+        Ok(crate::mux::Output {
+            code: 0,
+            stdout: "%19|@8|hc attach taaaaaaaaaaaa\n".into(),
+            stderr: String::new(),
+        })
+    });
+    w.panes(&[]);
+    w.launches_hold();
+    w.fakes.mux_rule("#{window_active}", 0, "%19|1|1|1\n", "");
+    let root = w.ctx.state_root.clone();
+    let folder = w.folder(ID);
+    let g = gate.clone();
+    let child = std::thread::spawn(move || {
+        let mut other = World::human("");
+        other.ctx.state_root = root;
+        other.fakes.share_locks(g);
+        other.fakes.mux_script("list-panes", move |argv| {
+            let r = read_json(&folder.join("record.json")).unwrap().unwrap();
+            let mut row = super::fixture::row_of("%19|@8|300||", &[]);
+            row.command = r["startCommand"].as_str().unwrap().into();
+            Ok(crate::mux::Output {
+                code: 0,
+                stdout: super::fixture::listed_rows(argv, &[row], "\n"),
+                stderr: String::new(),
+            })
+        });
+        other
+            .fakes
+            .mux_rule("#{window_active}", 0, "%19|1|1|1\n", "");
+        cf::online(&other);
+        let core = hc::connect(&other.ctx).unwrap();
+        let c = other.caller();
+        rx.recv_timeout(Duration::from_secs(3)).unwrap();
+        assert_eq!(
+            view::focus_hc(&other.ctx, &core, &c, "worker", None)
+                .unwrap()
+                .pane,
+            "%19"
+        );
+        other.fakes.hc_done().unwrap();
+        assert!(
+            !other
+                .fakes
+                .mux_calls()
+                .iter()
+                .any(|a| a[1] == "new-window" || a[1] == "split-window")
+        );
+    });
+    cf::online(&w);
+    let core = hc::connect(&w.ctx).unwrap();
+    view::focus_hc(&w.ctx, &core, &c, "worker", None).unwrap();
+    child.join().unwrap();
+    assert_eq!(gate.waited(&key), 1);
+    assert_eq!(
+        w.fakes
+            .mux_calls()
+            .iter()
+            .filter(|a| a[1] == "new-window")
+            .count(),
+        1
+    );
+    w.fakes.hc_done().unwrap();
+}
+#[test]
+fn focus_rechecks_under_member_lock() {
+    let w = World::human("");
+    let r = cf::member(&w, ID, json!({}));
+    let c = w.caller();
+    rows(&w, &r);
+    let path = w.folder(ID).join("record.json");
+    let mut changed = r;
+    changed["generation"] = json!("1");
+    w.fakes.lock_probe(move |e| {
+        if e.starts_with("+member|") {
+            write(&path, changed.clone());
+        }
+        String::new()
+    });
+    cf::online(&w);
+    let core = hc::connect(&w.ctx).unwrap();
+    assert!(view::focus_hc(&w.ctx, &core, &c, "worker", None).is_err());
+    assert!(
+        !w.fakes
+            .mux_calls()
+            .iter()
+            .any(|a| a[1] == "list-panes" || a[1] == "new-window" || a[1] == "if-shell")
+    );
+    w.fakes.hc_done().unwrap();
+}
+
+#[test]
+fn focus_rechecks_aborted_commit_under_member_lock() {
+    let w = World::human("");
+    let r = cf::member(&w, ID, json!({}));
+    let c = w.caller();
+    rows(&w, &r);
+    let path = w.folder(ID).join("commit.json");
+    w.fakes.lock_probe(move |event| {
+        if event.starts_with("+member|") {
+            write(&path, json!({"aborted":true}));
+        }
+        String::new()
+    });
+    cf::online(&w);
+    let core = hc::connect(&w.ctx).unwrap();
+    assert!(view::focus_hc(&w.ctx, &core, &c, "worker", None).is_err());
+    assert!(
+        !w.fakes
+            .mux_calls()
+            .iter()
+            .any(|a| a[1] == "list-panes" || a[1] == "new-window" || a[1] == "if-shell")
+    );
+    w.fakes.hc_done().unwrap();
+}
