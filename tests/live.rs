@@ -3879,12 +3879,79 @@ exec claude --dangerously-skip-permissions
         };
     }
 
+    fn core(live: &Live, args: &[&str]) -> Value {
+        support::private_core::run(
+            live.server.core.as_ref().unwrap().command(args),
+            live.dir.path(),
+        )
+        .unwrap()
+    }
+    fn hc_view_close_survives_focus_stop(mux: Mux) {
+        let Some(mut live) = Live::human(mux) else {
+            return;
+        };
+        live.close_bar();
+        let w = live.spawn("w1", &[]);
+        let pid = live.worker_pid(&w);
+        let (code, child) = live.server.command(pid, &["@detach"]);
+        assert_eq!(code, 0);
+        let child = child["pid"].as_u64().unwrap() as u32;
+        let _owned = support::Sentinels(vec![(child, support::start_of(child))]);
+        let address = s(&w["hcAddress"]);
+        let folder = live.agent_dir(s(&w["id"]));
+        let before = json_file(&folder.join("record.json"));
+        live.call(&["kill-pane", "-t", s(&w["pane"])]);
+        live.wait_gone(s(&w["pane"]));
+        for _ in 0..2 {
+            let (code, list) = live.run(&["list", "-All"]);
+            assert_eq!(code, 0, "{list}");
+            let row = &list["agents"][0];
+            assert_eq!(
+                (&row["life"], &row["view"], &row["hcAddress"]),
+                (&json!("running"), &json!("detached"), &w["hcAddress"])
+            );
+            assert!(row["pane"].is_null() && row["window"].is_null());
+            assert!(!folder.join("notice.json").exists());
+            assert!(exit_messages(&live, &w).is_empty());
+        }
+        assert_eq!(core(&live, &["get", address, "--json"])["state"], "live");
+        let (code, focus) = live.run(&["focus", "w1"]);
+        assert_eq!(code, 0, "{focus}");
+        assert_ne!(focus["pane"], w["pane"]);
+        let after = json_file(&folder.join("record.json"));
+        for k in [
+            "id",
+            "team",
+            "generation",
+            "sessionId",
+            "hcAddress",
+            "launcherArgv",
+        ] {
+            assert_eq!(after[k], before[k], "{k}");
+        }
+        assert_eq!(after["pane"], focus["pane"]);
+        assert_eq!(live.worker_pid(&w), pid);
+        let (code, stop) = live.run(&["stop", "w1"]);
+        assert_eq!(code, 0, "{stop}");
+        assert_eq!(
+            stop,
+            json!({"ok":true,"verb":"stop","name":"w1","hcAddress":address,"life":"ended"})
+        );
+        assert!(eventually(Duration::from_secs(10), || core(
+            &live,
+            &["get", address, "--json"]
+        )["state"]
+            == "finished"));
+        assert_eq!(exit_messages(&live, &w).len(), 1);
+    }
+
     macro_rules! every_mux_scenario {
         ($module:ident, $mux:ident) => {
             tests_on!(
                 $module,
                 $mux,
                 [
+                    hc_view_close_survives_focus_stop,
                     root_unsandboxed_terminal_driver_finished,
                     spawn_window_and_split_tagged,
                     spawn_titles_tab_and_pane,
