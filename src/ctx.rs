@@ -77,6 +77,7 @@ pub struct Ctx {
     pub os: Box<dyn Os>,
     // Resolved on first use, so verbs that never reach the multiplexer never probe for it.
     pub mux: RefCell<Option<Box<dyn Mux>>>,
+    pub hc: Box<dyn crate::hc::Hc>,
     pub clock: Box<dyn Clock>,
     // The launcher's pane already passed the sandbox check when it was spawned.
     pub admitted: bool,

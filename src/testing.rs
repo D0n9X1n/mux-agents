@@ -44,6 +44,9 @@ struct Log {
     events: Vec<String>,
     rules: Vec<Rule>,
     mux_calls: Vec<Vec<String>>,
+    hc_bins: HashMap<String, PathBuf>,
+    hc_calls: Vec<(PathBuf, Vec<String>, Duration)>,
+    hc_answers: VecDeque<Res<crate::spawn::Out>>,
     slept: Vec<u64>,
     // What sandbox() answers; none is an unsandboxed macOS.
     signals: Option<Signals>,
@@ -313,6 +316,23 @@ impl Fakes {
         self.0.borrow().mux_calls.clone()
     }
 
+    pub fn hc_install(&self, name: &str) -> PathBuf {
+        let path = std::env::temp_dir().join(format!("{name}{}", std::env::consts::EXE_SUFFIX));
+        self.0
+            .borrow_mut()
+            .hc_bins
+            .insert(name.into(), path.clone());
+        path
+    }
+
+    pub fn hc_answer(&self, answer: Res<crate::spawn::Out>) {
+        self.0.borrow_mut().hc_answers.push_back(answer);
+    }
+
+    pub fn hc_calls(&self) -> Vec<(PathBuf, Vec<String>, Duration)> {
+        self.0.borrow().hc_calls.clone()
+    }
+
     pub fn slept(&self) -> Vec<u64> {
         self.0.borrow().slept.clone()
     }
@@ -348,11 +368,12 @@ impl Fakes {
         self.0.borrow_mut().gate = Some(gate);
     }
 
-    /// Forgets the recorded OS, multiplexer, sleep and lock calls.
+    /// Forgets the recorded OS, multiplexer, hc, sleep and lock calls.
     pub fn clear_log(&self) {
         let mut log = self.0.borrow_mut();
         log.os_calls.clear();
         log.mux_calls.clear();
+        log.hc_calls.clear();
         log.events.clear();
         log.slept.clear();
         log.locks.clear();
@@ -374,6 +395,7 @@ impl Fakes {
             exe: PathBuf::from("/bin/mux-agent"),
             os: Box::new(self.clone()),
             mux: RefCell::new(Some(Box::new(self.clone()))),
+            hc: Box::new(self.clone()),
             clock: Box::new(self.clone()),
             admitted: false,
             tty: false,
@@ -527,6 +549,24 @@ impl Mux for Fakes {
 
     fn kind(&self) -> Kind {
         self.0.borrow().kind.unwrap_or(Kind::Tmux)
+    }
+}
+
+impl crate::hc::Hc for Fakes {
+    fn find(&self, name: &str, _path: &str) -> Option<PathBuf> {
+        self.0.borrow().hc_bins.get(name).cloned()
+    }
+
+    fn captured(&self, path: &Path, args: &[&str], timeout: Duration) -> Res<crate::spawn::Out> {
+        let mut log = self.0.borrow_mut();
+        log.hc_calls.push((
+            path.into(),
+            args.iter().map(|s| s.to_string()).collect(),
+            timeout,
+        ));
+        log.hc_answers
+            .pop_front()
+            .unwrap_or_else(|| Err(crate::error::Refusal::internal("unconfigured hc fake")))
     }
 }
 
