@@ -25,6 +25,14 @@ fn core_environment_is_private() {
         vars[std::ffi::OsStr::new("HOME")],
         Some(d.join("a").join("home").as_os_str())
     );
+    for home in ["HOME", "USERPROFILE"] {
+        let home = std::path::Path::new(vars[std::ffi::OsStr::new(home)].unwrap());
+        for (key, sub) in [("APPDATA", "Roaming"), ("LOCALAPPDATA", "Local")] {
+            let folder = std::path::Path::new(vars[std::ffi::OsStr::new(key)].unwrap());
+            assert_eq!(folder, home.join("AppData").join(sub), "{key}");
+            assert!(folder.is_dir(), "{key} must exist");
+        }
+    }
     assert!(!vars.contains_key(std::ffi::OsStr::new("HC_TERMINAL_ID")));
     assert!(!vars.contains_key(std::ffi::OsStr::new("TMUX")));
     assert_eq!(
@@ -59,6 +67,20 @@ fn core_environment_keys_are_allowlisted() {
         "LANG",
         "SystemRoot",
         "ComSpec",
+        "SystemDrive",
+        "windir",
+        "ProgramData",
+        "ALLUSERSPROFILE",
+        "PUBLIC",
+        "ProgramFiles",
+        "ProgramFiles(x86)",
+        "CommonProgramFiles",
+        "PATHEXT",
+        "OS",
+        "PROCESSOR_ARCHITECTURE",
+        "NUMBER_OF_PROCESSORS",
+        "COMPUTERNAME",
+        "USERDOMAIN",
         "RMUX_ALLOW_INTERNAL_DAEMON_IN_CALLER_JOB",
     ]
     .into_iter()

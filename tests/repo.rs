@@ -350,6 +350,51 @@ fn process_spawn_only_in_spawn_rs() {
     assert_eq!(found, [ALLOWED]);
 }
 
+#[test]
+fn windows_live_rmux_commands_share_the_private_environment() {
+    let source = repo_file("tests/live_windows.rs");
+    let constructor = r#"Command::new("rmux")"#;
+    assert_eq!(
+        source.matches(constructor).count(),
+        1,
+        "every Windows rmux invocation must use the private-environment helper"
+    );
+    let helper = source
+        .split_once("fn rmux(&self) -> Command {")
+        .expect("the Windows fixture needs an rmux command helper")
+        .1
+        .split_once("\n    }")
+        .unwrap()
+        .0;
+    let lines: Vec<_> = helper
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .collect();
+    assert_eq!(
+        lines,
+        [
+            r#"let mut command = Command::new("rmux");"#,
+            "self.core.apply(&mut command);",
+            r#"command.arg("-L").arg(&self.socket);"#,
+            "command",
+        ]
+    );
+}
+
+#[test]
+fn windows_live_skips_missing_rmux_before_requiring_core() {
+    let source = repo_file("tests/live_windows.rs");
+    let before_core = source
+        .split_once("private_core::PrivateCore::installed()")
+        .unwrap()
+        .0;
+    assert!(
+        before_core.contains(r#"if mux_agent::mux::find_on_path("rmux.exe", &path).is_none() {"#)
+    );
+    assert!(before_core.contains("return None;"));
+}
+
 // Release rules (spec D7): `main` is source-only; the marketplace installs the `dist` ref, which the release
 // workflow writes as the tagged tree plus `scripts/bin/` and its `SHA256SUMS`.
 
