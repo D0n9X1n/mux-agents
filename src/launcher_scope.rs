@@ -28,6 +28,10 @@ pub fn spec(args: &[String]) -> Option<&str> {
     }
 }
 
+pub fn is_scoped(args: &[String]) -> bool {
+    args.len() == 6 && spec(args).is_some()
+}
+
 pub fn environment(args: &[String], inherited: &Env) -> Res<Env> {
     if spec(args).is_none() {
         return refuse(2, "usage", "invalid launcher arguments");
@@ -90,6 +94,27 @@ mod tests {
         assert_eq!(scoped.get("MUX_AGENTS_STATE"), w.ctx.state_root.to_str());
         for k in ["HC_SESSION", "HC_SOCKET", "HC_TERMINAL_ID"] {
             assert_eq!(scoped.get(k), inherited.get(k));
+        }
+    }
+
+    #[test]
+    fn only_exact_six_argument_form_is_scoped() {
+        let args = [
+            "launcher",
+            "spec.json",
+            "--state-root",
+            "root",
+            "--path",
+            "path",
+        ]
+        .map(str::to_owned);
+        assert!(is_scoped(&args));
+        assert!(!is_scoped(&args[..2]));
+        assert!(!is_scoped(&[]));
+        for (index, wrong) in [(0, "Launcher"), (2, "--root"), (4, "--PATH")] {
+            let mut malformed = args.clone();
+            malformed[index] = wrong.into();
+            assert!(!is_scoped(&malformed));
         }
     }
 

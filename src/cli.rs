@@ -397,15 +397,16 @@ fn quiet(args: &[String]) -> bool {
 
 /// The spec of the hidden `launcher <spec>` call a pane runs (spec D4); not a verb, so absent from the usage text.
 pub fn launcher_spec(args: &[String]) -> Option<&str> {
-    match args {
-        [verb, spec] if verb == "launcher" => Some(spec),
-        _ => None,
-    }
+    crate::launcher_scope::spec(args)
 }
 
 /// The pane's process: the launcher's exit code, or the providers' refusal as JSON with its code. No sandbox check:
 /// the pane was spawned by a call that passed it, and the launcher runs no verb.
-pub fn run_launcher(spec: &str, ctx: impl FnOnce() -> Res<Ctx>) -> (i32, Option<String>) {
+pub fn run_launcher(
+    spec: &str,
+    scoped: bool,
+    ctx: impl FnOnce() -> Res<Ctx>,
+) -> (i32, Option<String>) {
     match ctx() {
         Err(refusal) => (
             refusal.code.into(),
@@ -413,9 +414,10 @@ pub fn run_launcher(spec: &str, ctx: impl FnOnce() -> Res<Ctx>) -> (i32, Option<
         ),
         Ok(ctx) => {
             // A panic still ends the pane with the launcher's own failure code.
-            let code =
-                panic::catch_unwind(AssertUnwindSafe(|| crate::launcher::launcher(&ctx, spec)))
-                    .unwrap_or(1);
+            let code = panic::catch_unwind(AssertUnwindSafe(|| {
+                crate::launcher::launcher(&ctx, spec, scoped)
+            }))
+            .unwrap_or(1);
             (code, None)
         }
     }
