@@ -27,6 +27,15 @@ pub fn execute(
     clean: impl FnOnce(&Created) -> Res<bool>,
 ) -> Res<Value> {
     let core = hc::connect(ctx)?;
+    execute_connected(&core, prepare, attach, commit, clean)
+}
+pub fn execute_connected(
+    core: &Core<'_>,
+    prepare: impl FnOnce() -> Res<Prepared>,
+    attach: impl FnOnce(&Core<'_>, &Prepared, &mut Option<Created>) -> Res<()>,
+    commit: impl FnOnce(&Path) -> Res<()>,
+    clean: impl FnOnce(&Created) -> Res<bool>,
+) -> Res<Value> {
     let mut p = prepare()?;
     let mut candidate = p.record.clone();
     candidate["hcAddress"] = json!("pending");
@@ -87,7 +96,7 @@ pub fn execute(
     let mut pane = None;
     let operation = || -> Res<Value> {
         write_json(&p.folder.join("record.json"), &p.record)?;
-        attach(&core, &p, &mut pane)?;
+        attach(core, &p, &mut pane)?;
         let v = pane
             .as_ref()
             .filter(|v| !v.command.is_empty())
@@ -104,7 +113,7 @@ pub fn execute(
     match result {
         Ok(record) => Ok(record),
         Err(mut e) => {
-            if !rollback(&core, &p, &address, pane.as_ref(), clean) {
+            if !rollback(core, &p, &address, pane.as_ref(), clean) {
                 e.message.push_str("; abort evidence could not be written");
             }
             Err(e)
@@ -176,6 +185,33 @@ mod tests {
             window: "@5".into(),
             command: "hc attach t1".into(),
         }
+    }
+    #[test]
+    fn connected_transaction_does_not_reconnect() {
+        let w = World::human("");
+        ready(&w);
+        let core = hc::connect(&w.ctx).unwrap();
+        answer(&w.fakes, r#"{"address":"t1"}"#);
+        execute_connected(
+            &core,
+            || Ok(prepared(&w)),
+            |_, _, view| {
+                *view = Some(created());
+                Ok(())
+            },
+            |p| write_json(&p.join("commit.json"), &json!({})),
+            |_| panic!("clean"),
+        )
+        .unwrap();
+        assert_eq!(
+            w.fakes
+                .hc_calls()
+                .iter()
+                .map(|(_, a, _)| a[0].clone())
+                .collect::<Vec<_>>(),
+            ["--version", "run"]
+        );
+        w.fakes.hc_done().unwrap();
     }
     #[test]
     fn core_connect_precedes_all_preparation() {
