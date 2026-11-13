@@ -13,7 +13,7 @@ use serde_json::{Map, Value};
 
 use crate::agents::board::{ENDED_MAX, board};
 use crate::agents::spawn::{pane_env, utf8};
-use crate::agents::view::focus_pane;
+use crate::agents::view::{Focused, focus_hc};
 use crate::agents::{lock, lock_key, pane_id, text};
 use crate::caller::{Caller, resolve};
 use crate::cli::Request;
@@ -1549,6 +1549,27 @@ struct Shown {
     looking: Option<String>,
 }
 
+fn focus_target_hc(ctx: &Ctx, caller: &Caller, target: &Target) -> Res<Focused> {
+    let core = crate::hc::connect(ctx)?;
+    focus_hc(
+        ctx,
+        &core,
+        caller,
+        &target.name,
+        (!target.pane.is_empty()).then_some(target.pane.as_str()),
+    )
+}
+impl Shown {
+    fn focused(&mut self, focused: Focused) {
+        for target in &mut self.targets {
+            if target.name == focused.name {
+                target.pane = focused.pane.clone();
+            }
+        }
+        self.looking = Some(focused.pane);
+    }
+}
+
 /// Acts on one event read while `shown` is on screen; true when the bar must draw again at once. A left press reads
 /// the bar and focuses the running agent on its name line, unless it is ASCII or stale (read less than `PRESS_GAP`
 /// after the frame's write, or begun before it); any left press dismisses the note and draws again. Keys go to
@@ -1569,10 +1590,11 @@ fn act(
             if look.ascii || stale {
                 return true;
             }
-            if let Some(target) = click(ctx, caller, y, shown.width, board)
-                && focus_pane(ctx, caller, &target.name, Some(&target.pane)).is_err()
-            {
-                pick.failed(&target.name);
+            if let Some(target) = click(ctx, caller, y, shown.width, board) {
+                match focus_target_hc(ctx, caller, &target) {
+                    Ok(focused) => shown.focused(focused),
+                    Err(_) => pick.failed(&target.name),
+                }
             }
             true
         }
@@ -1580,12 +1602,12 @@ fn act(
         // herdr's next and previous agent (#90), from the pane the session shows, in the bar's order.
         Event::Next | Event::Prev => {
             let forward = read.event == Event::Next;
-            if let Some(target) = pick::step(&shown.targets, shown.looking.as_deref(), forward) {
-                if focus_pane(ctx, caller, &target.name, Some(&target.pane)).is_err() {
-                    pick.failed(&target.name);
-                } else {
-                    // The next key of the same read steps on from here, not from the frame's pane.
-                    shown.looking = Some(target.pane.clone());
+            if let Some(target) =
+                pick::step(&shown.targets, shown.looking.as_deref(), forward).cloned()
+            {
+                match focus_target_hc(ctx, caller, &target) {
+                    Ok(focused) => shown.focused(focused),
+                    Err(_) => pick.failed(&target.name),
                 }
             }
             true
@@ -1604,11 +1626,10 @@ fn act(
                 Act::Nothing => false,
                 Act::Redraw => true,
                 Act::Focus(target) => {
-                    match focus_pane(ctx, caller, &target.name, Some(&target.pane)) {
-                        Ok(_) => {
+                    match focus_target_hc(ctx, caller, &target) {
+                        Ok(focused) => {
                             pick.focused();
-                            // A next key of the same read steps on from here.
-                            shown.looking = Some(target.pane.clone());
+                            shown.focused(focused);
                         }
                         Err(_) => pick.failed(&target.name),
                     }
@@ -3829,7 +3850,12 @@ mod tests {
         let mut w = w;
         w.ctx.env = crate::ctx::Env::from_pairs(env);
         w.clock("1970-01-01T00:04:00Z");
-        let worker = w.agent_record(ID, json!({"name": "worker", "pane": "%9"}));
+        crate::agents::core_fixture::member(
+            &w,
+            ID,
+            json!({"name":"worker","pane":"%9","startCommand":crate::agents::fixture::launch_command("%9")}),
+        );
+        let worker = w.folder(ID);
         write(
             &worker.join("status.json"),
             json!({"text": "testing the parser", "at": "x"}),
@@ -4192,6 +4218,7 @@ mod tests {
             assert!(frames.len() <= 100, "runaway");
             Ok(())
         });
+        w.fakes.hc_done().unwrap();
         (ended, frames, times)
     }
 
@@ -4537,6 +4564,7 @@ mod tests {
     fn click_focuses_through_one_read_and_guarded_select() {
         let w = click_world(&["live", "live", "live", "gone"], board_answer());
         let script = Script::new(&w.fakes, vec![(300, press(3))]);
+        crate::agents::core_fixture::online(&w);
         let (ended, frames, times) = watch_with(&w, Box::new(script));
         assert_eq!((ended, frames.len()), ("pane-closed", 3));
         // The redraw follows the click at once; the next tick is 2 s after it.
@@ -4571,8 +4599,16 @@ mod tests {
 
     // The watch world with running agents writer-two and writer as well as worker.
     fn two_writers(w: &World) {
-        w.agent_record("cccccccccccc", json!({"name": "writer-two", "pane": "%11"}));
-        w.agent_record("dddddddddddd", json!({"name": "writer", "pane": "%12"}));
+        crate::agents::core_fixture::member(
+            w,
+            "cccccccccccc",
+            json!({"name":"writer-two","pane":"%11","startCommand":crate::agents::fixture::launch_command("%11")}),
+        );
+        crate::agents::core_fixture::member(
+            w,
+            "dddddddddddd",
+            json!({"name":"writer","pane":"%12","startCommand":crate::agents::fixture::launch_command("%12")}),
+        );
         w.panes(&[
             "%9|@5|300|aaaaaaaaaaaa|worker",
             "%11|@6|311|cccccccccccc|writer-two",
@@ -4586,6 +4622,8 @@ mod tests {
         let w = click_world(&["live", "live", "live", "gone"], board_answer());
         two_writers(&w);
         let script = Script::new(&w.fakes, vec![(300, key(b"nn"))]);
+        crate::agents::core_fixture::online(&w);
+        crate::agents::core_fixture::online(&w);
         let (ended, _, _) = watch_with(&w, Box::new(script));
         assert_eq!(ended, "pane-closed");
         let targets: Vec<String> = w
@@ -4595,8 +4633,7 @@ mod tests {
             .filter(|c| c[1] == "if-shell")
             .map(|c| c[4].clone())
             .collect();
-        assert_eq!(targets.len(), 2, "{targets:?}");
-        assert_ne!(targets[0], targets[1], "{targets:?}");
+        assert_eq!(targets, ["%9", "%11"]);
     }
 
     #[test]
@@ -4605,6 +4642,8 @@ mod tests {
         let w = click_world(&["live", "live", "live", "gone"], board_answer());
         two_writers(&w);
         let script = Script::new(&w.fakes, vec![(300, key(b"j\rn"))]);
+        crate::agents::core_fixture::online(&w);
+        crate::agents::core_fixture::online(&w);
         let (ended, _, _) = watch_with(&w, Box::new(script));
         assert_eq!(ended, "pane-closed");
         let targets: Vec<String> = w
@@ -4614,8 +4653,7 @@ mod tests {
             .filter(|c| c[1] == "if-shell")
             .map(|c| c[4].clone())
             .collect();
-        assert_eq!(targets.len(), 2, "{targets:?}");
-        assert_ne!(targets[0], targets[1], "{targets:?}");
+        assert_eq!(targets, ["%9", "%11"]);
     }
 
     #[test]
@@ -4691,6 +4729,7 @@ mod tests {
         // 100 ms after it: acts.
         let w = click_world(&["live", "live", "live", "live", "gone"], board_answer());
         let script = Script::new(&w.fakes, vec![(2100, press(3))]);
+        crate::agents::core_fixture::online(&w);
         let (_, _, times) = watch_with(&w, Box::new(script));
         assert_eq!(diffs(&times), [2000, 100, 2000]);
         assert_eq!((click_reads(&w), selects(&w)), (1, 1));
@@ -4700,6 +4739,7 @@ mod tests {
     fn one_read_handles_every_event_in_order() {
         let w = click_world(&["live", "live", "live", "gone"], board_answer());
         let script = Script::new(&w.fakes, vec![(300, key(b"j\r"))]);
+        crate::agents::core_fixture::online(&w);
         let (ended, frames, times) = watch_with(&w, Box::new(script));
         assert_eq!(ended, "pane-closed");
         // j selected worker, then Enter focused it: the next frame is unmarked.
@@ -4721,6 +4761,7 @@ mod tests {
         let w = click_world(&["live", "live", "live", "live", "gone"], board_answer());
         w.fakes.mux_first(READ_BACK, 0, "%9|0|1|1\n", "");
         let steps = vec![(300, press(3)), (20, press(3))];
+        crate::agents::core_fixture::online(&w);
         let (ended, frames, times) = watch_with(&w, Box::new(Script::new(&w.fakes, steps)));
         assert_eq!(ended, "pane-closed");
         assert_eq!(
@@ -4739,6 +4780,7 @@ mod tests {
         );
         watch_env(&mut w, "MUX_AGENTS_ASCII", "1");
         let steps = vec![(300, press(3)), (300, key(b"j")), (300, key(b"\r"))];
+        crate::agents::core_fixture::online(&w);
         let (ended, frames, times) = watch_with(&w, Box::new(Script::new(&w.fakes, steps)));
         assert_eq!((ended, frames.len()), ("pane-closed", 5));
         // The press redraws but reads nothing; j selects (ASCII marker) and Enter focuses.
@@ -4778,6 +4820,7 @@ mod tests {
             ))
         });
         let script = Script::new(&w.fakes, vec![(300, press(3))]);
+        crate::agents::core_fixture::online(&w);
         let (ended, frames, _) = watch_with(&w, Box::new(script));
         assert_eq!((ended, frames.len()), ("pane-closed", 3));
         assert!(moved.get());
@@ -4795,6 +4838,7 @@ mod tests {
         let w = click_world(&["live", "live", "live", "gone"], board_answer());
         w.fakes.mux_first(READ_BACK, 1, "", "no server");
         let script = Script::new(&w.fakes, vec![(300, press(3))]);
+        crate::agents::core_fixture::online(&w);
         let (ended, frames, times) = watch_with(&w, Box::new(script));
         assert_eq!(ended, "pane-closed");
         assert_eq!(frames, [board_frame(), failed_frame(), failed_frame()]);
@@ -4806,6 +4850,7 @@ mod tests {
     fn keys_select_and_focus() {
         let w = click_world(&["live", "live", "live", "live", "gone"], board_answer());
         let steps = vec![(300, key(b"j")), (100, key(b"\r"))];
+        crate::agents::core_fixture::online(&w);
         let (ended, frames, times) = watch_with(&w, Box::new(Script::new(&w.fakes, steps)));
         assert_eq!(ended, "pane-closed");
         assert_eq!(
@@ -4879,6 +4924,7 @@ mod tests {
                 write(&record, fields);
             })),
         };
+        crate::agents::core_fixture::online(&w);
         let (ended, frames, _) = watch_with(&w, Box::new(input));
         assert_eq!((ended, frames.len()), ("pane-closed", 4));
         assert!(moved.get());
@@ -4895,6 +4941,7 @@ mod tests {
         let w = click_world(&["live", "live", "live", "gone"], board_answer());
         w.fakes.mux_first(READ_BACK, 0, "%9|0|1|1\n", "");
         let steps = vec![(300, key(b"j")), (100, key(b"\r"))];
+        crate::agents::core_fixture::online(&w);
         let (ended, frames, _) = watch_with(&w, Box::new(Script::new(&w.fakes, steps)));
         assert_eq!((ended, frames.len()), ("pane-closed", 3));
         assert_eq!(selects(&w), 1);
@@ -4912,6 +4959,7 @@ mod tests {
         let w = click_world(&["live", "live", "live", "live", "gone"], board_answer());
         w.fakes.mux_first(READ_BACK, 0, "%9|0|1|1\n", "");
         let script = Script::new(&w.fakes, vec![(300, press(3))]);
+        crate::agents::core_fixture::online(&w);
         let (ended, frames, times) = watch_with(&w, Box::new(script));
         assert_eq!(ended, "pane-closed");
         assert_eq!(
@@ -4927,6 +4975,7 @@ mod tests {
             (100, key(b"\x1b[<0;3;3m")),
             (100, key(b"j")),
         ];
+        crate::agents::core_fixture::online(&w);
         let (_, frames, times) = watch_with(&w, Box::new(Script::new(&w.fakes, steps)));
         assert_eq!(frames, [board_frame(), failed_frame(), marked_frame()]);
         assert_eq!(diffs(&times), [300, 200]);
@@ -6941,3 +6990,7 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "sidebar_hc_tests.rs"]
+mod hc_tests;
