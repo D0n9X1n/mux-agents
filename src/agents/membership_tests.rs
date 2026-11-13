@@ -165,3 +165,84 @@ fn hc_snapshot_survives_view_loss() {
         w.fakes.hc_done().unwrap();
     }
 }
+
+#[test]
+fn spawn_snapshot_refuses_unverified_reservations() {
+    for mode in [
+        "local-get",
+        "ls",
+        "foreign-get",
+        "foreign-team",
+        "legacy-tags",
+        "duplicate-address",
+    ] {
+        let w = World::human("");
+        let r = f::member(&w, ID, json!({}));
+        let caller = w.caller();
+        if mode == "duplicate-address" {
+            f::member(&w, "bbbbbbbbbbbb", json!({"hcAddress":"taaaaaaaaaaaa"}));
+        }
+        f::online(&w);
+        let core = hc::connect(&w.ctx).unwrap();
+        if mode == "ls" {
+            w.fakes.hc_expect(
+                &[
+                    "ls",
+                    "--all",
+                    "--label",
+                    "mux.managed=1",
+                    "--label",
+                    &format!("mux.team={}", team(&caller)),
+                    "--json",
+                ],
+                Err(Refusal::internal("ls failed")),
+            );
+        } else if mode != "duplicate-address" {
+            f::listing(
+                &w,
+                &team(&caller),
+                if mode.starts_with("foreign") {
+                    &["z1"]
+                } else {
+                    &[]
+                },
+            );
+            if mode == "local-get" {
+                w.fakes.hc_expect(
+                    &["get", "taaaaaaaaaaaa", "--json"],
+                    Err(Refusal::internal("gone")),
+                );
+            } else {
+                f::get(&w, "taaaaaaaaaaaa", f::wire(&r));
+            }
+            if mode == "foreign-get" {
+                w.fakes
+                    .hc_expect(&["get", "z1", "--json"], Err(Refusal::internal("gone")));
+            }
+            if mode == "foreign-team" {
+                let mut t = f::wire(&r);
+                t["address"] = json!("z1");
+                t["labels"]["mux.team"] = json!("other:$3");
+                f::get(&w, "z1", t);
+            }
+        }
+        w.panes(&["%8|@4|300|bbbbbbbbbbbb|tag-only"]);
+        let result = Snapshot::for_spawn(&w.ctx, &caller, &core);
+        if ["local-get", "legacy-tags"].contains(&mode) {
+            let s = result.unwrap();
+            assert_eq!(s.facts.count(), 1);
+            assert!(s.facts.reserved.is_empty());
+        } else {
+            assert!(result.is_err(), "{mode}");
+        }
+        assert_eq!(
+            w.fakes
+                .hc_calls()
+                .iter()
+                .filter(|(_, a, _)| a[0] == "--version")
+                .count(),
+            1
+        );
+        w.fakes.hc_done().unwrap();
+    }
+}

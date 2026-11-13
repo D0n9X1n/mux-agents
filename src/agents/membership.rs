@@ -1,6 +1,7 @@
 use super::core_identity::Identity;
 use super::{core_facts, registry};
 use crate::hc;
+use crate::hc::Core;
 use crate::{
     caller::Caller,
     ctx::Ctx,
@@ -108,6 +109,13 @@ impl Snapshot {
             ),
         };
         Ok(Self::assemble(ctx, caller, local, facts, error))
+    }
+
+    pub fn for_spawn(ctx: &Ctx, caller: &Caller, core: &Core<'_>) -> Res<Self> {
+        let local = locals(ctx, caller)?;
+        let ids: Vec<_> = local.iter().map(|l| l.identity.clone()).collect();
+        let facts = core_facts::take(core, &team(caller), &ids)?;
+        Ok(Self::assemble(ctx, caller, local, facts, None))
     }
 
     fn assemble(
