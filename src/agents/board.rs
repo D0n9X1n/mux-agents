@@ -1,5 +1,4 @@
-//! The side-bar feed: live agents in pane order and, with -All, the session's ended agents (MuxAgents.ps1:1034-1075,
-//! 1216-1269).
+//! The side-bar feed: hc membership with optional attached views and terminal history.
 
 use std::collections::HashMap;
 use std::time::SystemTime;
@@ -33,27 +32,41 @@ pub fn select_doing(
     (Value::Null, Value::Null)
 }
 
-/// `{running, agents}` for the caller's session: running agents in pane order and, with `all`, `endedTotal` (every
-/// ended agent of the session) and the session's ended agents, newest notice first, at most 10, each with its exitCode
-/// from its notice.json. Unread is the caller's own mailbox's: a running agent's pane reads its id's, any other pane
-/// `pane-<n>`, as the same snapshot shows it (a tag never names a reader). `watch` (the bar's feed) adds each live
-/// row's `waiting` (S2.4), and a live row's unread is instead its own messages still unread
-/// in its parent's mailbox (S2.5). Locks one at a time: notice locks, the reader's (or each parent's) mail lock, then
-/// each row's agent lock.
+/// One reconciled hc snapshot: committed Running members ranked by activity, then Lost/Unknown by id.
+/// With `all`, append up to ten terminal-Ended rows and the uncapped `endedTotal`. Terminal facts own
+/// lifecycle and exit codes; notices supply only historical time and closure metadata. Unread belongs
+/// to the caller's mailbox, or each member's parent mailbox in watch mode. Reap's member/notice/mail
+/// locks finish before sorted mailbox reads, followed by each row's agent lock. Never refresh or reap views.
 pub fn board(ctx: &Ctx, caller: &Caller, all: bool, watch: bool) -> Res<Map<String, Value>> {
-    // One list-panes for the notices, the live rows and the ended filter; list runs every 3 s. A reap that killed a
-    // pane or posted a notice makes that snapshot stale, so the panes are listed again.
-    let snapshot = registry::live_after_reap(ctx, caller)?;
-    let panes = snapshot.running();
-    let reader = match snapshot.own(caller) {
-        registry::Own::Agent(me) => me.id,
+    use super::{lifecycle::Life, membership::Snapshot};
+    let snapshot = Snapshot::take(ctx, caller)?;
+    registry::reap_hc(ctx, caller, &snapshot)?;
+    let members: Vec<_> = snapshot
+        .facts
+        .local
+        .iter()
+        .filter(|o| snapshot.records[&o.identity.id].committed)
+        .collect();
+    let panes: Vec<_> = snapshot
+        .view_order
+        .iter()
+        .filter(|id| {
+            members
+                .iter()
+                .any(|o| &o.identity.id == *id && o.life == Life::Running)
+        })
+        .map(|id| snapshot.views[id].clone())
+        .collect();
+    let mine: Vec<_> = panes.iter().filter(|p| p.pane == caller.pane).collect();
+    let reader = match mine.as_slice() {
+        [p] => p.id.clone(),
         _ => mailbox_key(&caller.pane, "")?,
     };
-    // The mailboxes whose unread counts: the reader's, or (watch) each live agent's parent's, in key order.
-    let mut keys: Vec<String> = if watch {
-        panes
+    let mut keys: Vec<_> = if watch {
+        members
             .iter()
-            .filter_map(|pane| parent_key(&pane.record, &panes))
+            .filter(|o| o.life == Life::Running)
+            .filter_map(|o| parent_key(&snapshot.records[&o.identity.id].record, &panes))
             .collect()
     } else {
         vec![reader.clone()]
@@ -62,8 +75,7 @@ pub fn board(ctx: &Ctx, caller: &Caller, all: bool, watch: bool) -> Res<Map<Stri
     keys.dedup();
     let mut unread = HashMap::new();
     for key in keys {
-        let counts = unread_counts(ctx, caller, &key)?;
-        unread.insert(key, counts);
+        unread.insert(key.clone(), unread_counts(ctx, caller, &key)?);
     }
     let rows = Rows {
         ctx,
@@ -74,18 +86,81 @@ pub fn board(ctx: &Ctx, caller: &Caller, all: bool, watch: bool) -> Res<Map<Stri
         now: ctx.clock.now(),
         watch,
     };
-    let mut agents = Vec::new();
-    for pane in &panes {
-        agents.push(rows.row(
-            &pane.id,
-            &pane.record,
-            pane.pane.clone(),
-            &pane.window,
-            "running",
-        )?);
+    let mut running = Vec::new();
+    let mut other = Vec::new();
+    let mut ended = Vec::new();
+    for o in members {
+        if o.life == Life::Ended && !all {
+            continue;
+        }
+        let id = &o.identity.id;
+        let notice = if o.life == Life::Running {
+            None
+        } else {
+            read_json(
+                &super::server_dir(ctx, caller)
+                    .join("agents")
+                    .join(id)
+                    .join("notice.json"),
+            )?
+        };
+        if o.life == Life::Ended {
+            let at = notice
+                .as_ref()
+                .and_then(|n| n.get("at"))
+                .and_then(Value::as_str)
+                .and_then(parse_utc);
+            ended.push((at, o, notice));
+        } else if o.life == Life::Running {
+            running.push(o);
+        } else {
+            other.push((o, notice));
+        }
     }
-    // Ranked as herdr does, then the most recent change first by its own time (no report last), then pane order
-    // (a stable sort).
+    let ended_total = ended.len();
+    ended.sort_by(|a, b| {
+        b.0.cmp(&a.0)
+            .then_with(|| a.1.identity.id.cmp(&b.1.identity.id))
+    });
+    running.sort_by_key(|o| {
+        (
+            snapshot
+                .view_order
+                .iter()
+                .position(|id| id == &o.identity.id)
+                .unwrap_or(usize::MAX),
+            o.identity.id.clone(),
+        )
+    });
+    other.sort_by(|a, b| a.0.identity.id.cmp(&b.0.identity.id));
+    let make =
+        |o: &super::core_facts::Observation, notice: Option<&Value>| -> Res<Map<String, Value>> {
+            let id = &o.identity.id;
+            let record = &snapshot.records[id].record;
+            let live = o.life == Life::Running;
+            let mut row = rows.row(
+                id,
+                record,
+                super::text(record.get("pane")),
+                &super::text(record.get("window")),
+                if live { "running" } else { "unknown" },
+            )?;
+            if !live {
+                if let Some(closed) = notice
+                    .and_then(|n| n.get("closedBy"))
+                    .and_then(Value::as_str)
+                {
+                    row.insert("closedBy".into(), closed.into());
+                }
+                row.insert("exitCode".into(), Value::Null);
+            }
+            Ok(hc_row(row, o, snapshot.views.get(id)))
+        };
+    let count = running.len();
+    let mut agents = running
+        .into_iter()
+        .map(|o| make(o, None))
+        .collect::<Res<Vec<_>>>()?;
     agents.sort_by_key(|row| {
         let changed = row
             .get("changedAt")
@@ -93,30 +168,16 @@ pub fn board(ctx: &Ctx, caller: &Caller, all: bool, watch: bool) -> Res<Map<Stri
             .and_then(parse_utc);
         (rank(row), changed.is_none(), std::cmp::Reverse(changed))
     });
-    let running = agents.len();
-    let mut ended_total = None;
-    if all {
-        let mut ended = ended(ctx, caller, &panes)?;
-        ended_total = Some(ended.len());
-        // Newest first (an unreadable time is oldest), then by id.
-        ended.sort_by(|a, b| b.at.cmp(&a.at).then_with(|| a.id.cmp(&b.id)));
-        for end in ended.into_iter().take(ENDED_MAX) {
-            let pane = super::text(end.record.get("pane"));
-            let window = super::text(end.record.get("window"));
-            let mut row = rows.row(&end.id, &end.record, pane, &window, &end.kind)?;
-            // After the row's fields, so they keep their places: who closed a lost agent.
-            if let Some(closed) = end.closed_by {
-                row.insert("closedBy".into(), closed.into());
-            }
-            // Last: its exit code from notice.json, null when it has none.
-            row.insert("exitCode".into(), end.code);
-            agents.push(row);
-        }
+    for (o, notice) in other {
+        agents.push(make(o, notice.as_ref())?);
+    }
+    for (_, o, notice) in ended.into_iter().take(ENDED_MAX) {
+        agents.push(make(o, notice.as_ref())?);
     }
     let mut reply = Map::new();
-    reply.insert("running".into(), running.into());
-    if let Some(total) = ended_total {
-        reply.insert("endedTotal".into(), total.into());
+    reply.insert("running".into(), count.into());
+    if all {
+        reply.insert("endedTotal".into(), ended_total.into());
     }
     reply.insert(
         "agents".into(),
@@ -127,7 +188,6 @@ pub fn board(ctx: &Ctx, caller: &Caller, all: bool, watch: bool) -> Res<Map<Stri
 
 /// Ended agents a board (`list -All`) shows, newest first.
 pub(crate) const ENDED_MAX: usize = 10;
-const ENDED: [&str; 3] = ["exited", "stopped", "lost"];
 
 /// The mailbox of an agent's parent pane: the running agent's id there, else `pane-<n>` (as `send parent`
 /// delivers); none for a malformed pane. Never a tag.
@@ -138,67 +198,6 @@ fn parent_key(record: &Value, running: &[Pane]) -> Option<String> {
         .find(|p| p.pane == parent)
         .map_or("", |p| p.id.as_str());
     mailbox_key(&parent, id).ok()
-}
-
-fn same_session(record: &Value, caller: &Caller) -> bool {
-    record.get("session").and_then(Value::as_str) == Some(caller.session.as_str())
-}
-
-struct Ended {
-    at: Option<SystemTime>,
-    id: String,
-    kind: String,
-    record: Value,
-    code: Value,
-    closed_by: Option<String>,
-}
-
-/// The session's agents with a notice that are not live. notice.json is written once, so it is read unlocked.
-fn ended(ctx: &Ctx, caller: &Caller, live: &[Pane]) -> Res<Vec<Ended>> {
-    let agents = super::server_dir(ctx, caller).join("agents");
-    let entries = match std::fs::read_dir(&agents) {
-        Ok(entries) => entries,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(e) => return Err(e.into()),
-    };
-    let mut found = Vec::new();
-    for entry in entries {
-        let entry = entry?;
-        let Some(id) = entry.file_name().to_str().map(str::to_string) else {
-            continue;
-        };
-        if !super::agent_id(&id) || !entry.path().is_dir() || live.iter().any(|p| p.id == id) {
-            continue;
-        }
-        let Some(notice) = read_json(&entry.path().join("notice.json"))? else {
-            continue;
-        };
-        let kind = notice
-            .get("kind")
-            .and_then(Value::as_str)
-            .unwrap_or_default();
-        if !ENDED.contains(&kind) {
-            continue;
-        }
-        let Some(record) = registry::record(ctx, caller, &id)? else {
-            continue;
-        };
-        if !same_session(&record, caller) || record.get("id").and_then(Value::as_str) != Some(&id) {
-            continue;
-        }
-        found.push(Ended {
-            at: notice.get("at").and_then(Value::as_str).and_then(parse_utc),
-            kind: kind.to_string(),
-            code: notice.get("exitCode").cloned().unwrap_or(Value::Null),
-            closed_by: notice
-                .get("closedBy")
-                .and_then(Value::as_str)
-                .map(str::to_string),
-            id,
-            record,
-        });
-    }
-    Ok(found)
 }
 
 struct Rows<'a> {
@@ -349,14 +348,14 @@ fn activity(
     (word, secs)
 }
 
-/// Records that the person looked at the done spell `changed` (a row's `changedAt`) of the running agent on `pane`:
-/// seen.json under its agent lock, never moved back to an older spell. False when no running agent is on the pane.
+/// Records the viewed done spell `changed` under the agent lock, never moving seen.json backward.
+/// Requires a unique committed attachment on `pane`; historical notices do not invalidate view proof.
 pub fn mark_seen(ctx: &Ctx, caller: &Caller, pane: &str, changed: &str) -> Res<bool> {
     let Some(at) = parse_utc(changed) else {
         return Ok(false);
     };
     let snapshot = registry::Snapshot::take(ctx, caller)?;
-    let Some(agent) = snapshot.running().into_iter().find(|p| p.pane == pane) else {
+    let Some(agent) = snapshot.view_at(pane) else {
         return Ok(false);
     };
     let file = super::state_dir(ctx, caller)?
@@ -393,6 +392,60 @@ mod tests {
     use crate::agents::mail::{add_mail, read_mail};
     use serde_json::json;
     use std::path::{Path, PathBuf};
+
+    use crate::agents::core_fixture as cf;
+
+    // Preserve the pane-authenticated launch while adding hc membership facts.
+    fn member(w: &World, id: &str, mut fields: Value) -> PathBuf {
+        let pane = fields.get("pane").and_then(Value::as_str).unwrap_or("%9");
+        fields["startCommand"] = crate::agents::fixture::launch_command(pane).into();
+        cf::member(w, id, fields);
+        w.folder(id)
+    }
+
+    // One finite board snapshot. Lifecycle is explicit, never inferred from notices.
+    fn snapshot(w: &World, caller: &Caller, facts: &[(&str, &str)]) {
+        cf::online(w);
+        cf::listing(w, &super::super::membership::team(caller), &[]);
+        let mut facts = facts.to_vec();
+        facts.sort_by_key(|(id, _)| *id);
+        for (id, life) in facts {
+            let record = read_json(
+                &super::super::server_dir(&w.ctx, caller)
+                    .join("agents")
+                    .join(id)
+                    .join("record.json"),
+            )
+            .unwrap()
+            .unwrap();
+            let mut terminal = cf::wire(&record);
+            match life {
+                "running" => {}
+                "lost" => terminal["argv"] = json!(["/bin/sh", "-l"]),
+                "unknown" => terminal["labels"]["mux.gen"] = json!("1"),
+                "stopped" => {
+                    terminal["state"] = json!("finished");
+                    terminal["reason"] = json!("killed");
+                }
+                code => {
+                    terminal["state"] = json!("finished");
+                    terminal["reason"] = json!("exited");
+                    terminal["exit_code"] = json!(code.parse::<i32>().unwrap());
+                }
+            }
+            cf::get(w, record["hcAddress"].as_str().unwrap(), terminal);
+        }
+    }
+
+    const ENDED_FACTS: &[(&str, &str)] = &[
+        (ID, "running"),
+        ("bbbbbbbbbbbb", "3"),
+        ("cccccccccccc", "stopped"),
+        ("dddddddddddd", "lost"),
+        ("111111111111", "unknown"),
+        ("222222222222", "lost"),
+        ("333333333333", "stopped"),
+    ];
 
     const NOW: &str = "2026-10-29T12:00:00.0000000Z";
 
@@ -468,11 +521,13 @@ mod tests {
         let w = World::human("");
         w.clock(NOW);
         let caller = w.caller();
-        w.agent_record(
+        member(
+            &w,
             ID,
             json!({"createdAt": "2026-10-29T11:56:00.0000000Z", "model": "sonnet", "color": "magenta"}),
         );
-        w.agent_record(
+        member(
+            &w,
             "bbbbbbbbbbbb",
             json!({"name": "idle", "pane": "%8", "client": "copilot", "taskLine": "",
                 "createdAt": "2026-10-29T11:59:55.0000000Z"}),
@@ -491,7 +546,9 @@ mod tests {
         }
         let before = tree(&w.state());
         w.fakes.clear_log();
+        snapshot(&w, &caller, &[(ID, "running"), ("bbbbbbbbbbbb", "running")]);
         let reply = board(&w.ctx, &caller, false, false).unwrap();
+        w.fakes.hc_done().unwrap();
         let row = |name,
                    client,
                    pane,
@@ -502,16 +559,17 @@ mod tests {
                    age,
                    unread,
                    model: Value,
-                   color: &str| {
+                   color: &str,
+                   address: &str| {
             json!({"name": name, "client": client, "pane": pane, "window": window, "context": "brief",
                 "parent": "%1", "sessionId": SESSION_ID, "directory": "/work", "createdAt": created,
                 "state": "running", "doing": doing, "doingFrom": from, "age": age, "unread": unread,
-                "model": model, "color": color, "activity": "working", "since": null, "changedAt": null})
+                "model": model, "color": color, "activity": "working", "since": null, "changedAt": null, "life":"running", "view":"attached", "hcAddress":address})
         };
         // A record without a model (the client's own) lists null; one without a color gets its name's hue.
         let want = json!({"running": 2, "agents": [
-            row("worker", "claude", "%9", "@6", "2026-10-29T11:56:00.0000000Z", json!("build it"), json!("task"), 240, 2, json!("sonnet"), "magenta"),
-            row("idle", "copilot", "%8", "@7", "2026-10-29T11:59:55.0000000Z", Value::Null, Value::Null, 5, 1, Value::Null, crate::paint::identity(None, "idle"))
+            row("worker", "claude", "%9", "@6", "2026-10-29T11:56:00.0000000Z", json!("build it"), json!("task"), 240, 2, json!("sonnet"), "magenta", "taaaaaaaaaaaa"),
+            row("idle", "copilot", "%8", "@7", "2026-10-29T11:59:55.0000000Z", Value::Null, Value::Null, 5, 1, Value::Null, crate::paint::identity(None, "idle"), "tbbbbbbbbbbbb")
         ]});
         // Compared as text: the order of keys is part of the reply.
         assert_eq!(Value::Object(reply).to_string(), want.to_string());
@@ -523,12 +581,12 @@ mod tests {
         assert_eq!(read_mail(&w.ctx, &caller, "pane-1").unwrap().len(), 4);
     }
 
-    // A live worker and ended agents of every kind, another session, a foreign record and an unreadable time.
+    // A live worker, terminal Ended, Lost/Unknown, another session and an unreadable notice time.
     fn ended_world() -> (World, Caller) {
         let w = World::human("");
         w.clock(NOW);
         let caller = w.caller();
-        w.agent_record(ID, json!({}));
+        member(&w, ID, json!({}));
         w.panes(&["%9|@5|300|aaaaaaaaaaaa|worker"]);
         for (id, name, kind, code, at, session) in [
             ("bbbbbbbbbbbb", "done", "exited", json!(3), "11:59", "$3"),
@@ -553,8 +611,11 @@ mod tests {
             ("222222222222", "late", "lost", Value::Null, "garbage", "$3"),
             ("333333333333", "tie", "stopped", Value::Null, "11:50", "$3"),
         ] {
-            let folder =
-                w.agent_record(id, json!({"name": name, "pane": "%7", "session": session}));
+            let folder = member(
+                &w,
+                id,
+                json!({"name": name, "pane": "%7", "session": session}),
+            );
             let at = if at == "garbage" {
                 at.to_string()
             } else {
@@ -562,27 +623,21 @@ mod tests {
             };
             write(
                 &folder.join("notice.json"),
-                json!({"kind": kind, "exitCode": code, "at": at}),
+                json!({"kind": kind, "exitCode": if code.is_null() || code == json!(3) {json!(99)} else {code}, "at": at}),
             );
         }
-        let foreign = w.agent_record(
-            "444444444444",
-            json!({"id": "bbbbbbbbbbbb", "name": "foreign"}),
-        );
-        write(
-            &foreign.join("notice.json"),
-            json!({"kind": "lost", "exitCode": null, "at": NOW}),
-        );
         (w, caller)
     }
 
     #[test]
     fn ended_newest_first_max_10() {
         let (w, caller) = ended_world();
+        snapshot(&w, &caller, ENDED_FACTS);
         let all = board(&w.ctx, &caller, true, false).unwrap();
+        w.fakes.hc_done().unwrap();
         assert_eq!(all["running"], 1);
-        // Every ended agent of the session, lost ones included; other sessions, odd kinds and foreign records not.
-        assert_eq!(all["endedTotal"], 5);
+        // Only terminal Ended counts; Lost and Unknown remain separate, other sessions excluded.
+        assert_eq!(all["endedTotal"], 3);
         let keys: Vec<&str> = all.keys().map(String::as_str).collect();
         assert_eq!(keys, ["running", "endedTotal", "agents"]);
         // Newest notice first, ties by id, an unreadable time last.
@@ -590,27 +645,53 @@ mod tests {
             names(&all),
             [
                 "worker=running",
-                "done=exited",
+                "odd=unknown",
+                "late=lost",
                 "vanished=lost",
+                "done=exited 3",
                 "tie=stopped",
-                "halted=stopped",
-                "late=lost"
+                "halted=stopped"
             ]
         );
+        snapshot(&w, &caller, ENDED_FACTS);
         let plain = board(&w.ctx, &caller, false, false).unwrap();
-        assert_eq!(names(&plain), ["worker=running"]);
+        w.fakes.hc_done().unwrap();
+        assert_eq!(
+            names(&plain),
+            [
+                "worker=running",
+                "odd=unknown",
+                "late=lost",
+                "vanished=lost"
+            ]
+        );
         // Without -All the reply is unchanged: no endedTotal.
         assert!(plain.get("endedTotal").is_none());
 
+        // Invalid hc identities are refusals, not silently discarded rows.
+        let bad = World::human("");
+        member(
+            &bad,
+            "444444444444",
+            json!({"id":"bbbbbbbbbbbb", "name":"foreign"}),
+        );
+        assert_eq!(
+            board(&bad.ctx, &bad.caller(), true, false)
+                .unwrap_err()
+                .check,
+            "internal"
+        );
+        bad.fakes.hc_done().unwrap();
         // The live row and exactly the 10 newest of 12 ended agents.
         let w = World::human("");
         w.clock(NOW);
         let caller = w.caller();
-        w.agent_record("ffffffffffff", json!({}));
+        member(&w, "ffffffffffff", json!({}));
         w.panes(&["%9|@5|300|ffffffffffff|worker"]);
         for n in 0..12u32 {
             let id = format!("{n:012x}");
-            let folder = w.agent_record(
+            let folder = member(
+                &w,
                 &id,
                 json!({"name": format!("a{n}"), "pane": format!("%{}", 20 + n)}),
             );
@@ -621,7 +702,12 @@ mod tests {
                 json!({"kind": "stopped", "exitCode": null, "at": at}),
             );
         }
+        let ids: Vec<_> = (0..12u32).map(|n| format!("{n:012x}")).collect();
+        let mut facts: Vec<_> = ids.iter().map(|id| (id.as_str(), "stopped")).collect();
+        facts.push(("ffffffffffff", "running"));
+        snapshot(&w, &caller, &facts);
         let all = board(&w.ctx, &caller, true, false).unwrap();
+        w.fakes.hc_done().unwrap();
         // Uncapped: 12 ended, 10 rows.
         assert_eq!(all["endedTotal"], 12);
         let got: Vec<String> = names(&all)
@@ -650,7 +736,7 @@ mod tests {
             (
                 "bbbbbbbbbbbb",
                 "vanished",
-                json!({"kind": "lost", "exitCode": null, "at": "2026-10-29T11:59:00.0000000Z", "closedBy": "pane"}),
+                json!({"kind": "exited", "exitCode": 99, "at": "2026-10-29T11:59:00.0000000Z", "closedBy": "pane"}),
             ),
             (
                 "cccccccccccc",
@@ -658,19 +744,30 @@ mod tests {
                 json!({"kind": "stopped", "exitCode": null, "at": "2026-10-29T11:58:00.0000000Z"}),
             ),
         ] {
-            let folder = w.agent_record(id, json!({"name": name, "pane": "%7"}));
+            let folder = member(&w, id, json!({"name": name, "pane": "%7"}));
             write(&folder.join("notice.json"), notice);
         }
         w.panes(&[]);
-        // After the 16 row fields, so they keep their places; exitCode last, after it, in list -All and the bar's feed.
+        // Metadata and exitCode follow the 16 prefix fields, then the hc suffix in both feeds.
         for watch in [false, true] {
+            snapshot(
+                &w,
+                &caller,
+                &[("bbbbbbbbbbbb", "lost"), ("cccccccccccc", "stopped")],
+            );
             let all = board(&w.ctx, &caller, true, watch).unwrap();
+            w.fakes.hc_done().unwrap();
             let rows = all["agents"].as_array().unwrap();
             let lost = rows[0].as_object().unwrap();
             assert_eq!(lost["name"], "vanished");
             assert_eq!(lost["closedBy"], "pane");
+            assert_eq!(lost["life"], "lost");
+            assert_eq!(lost["exitCode"], Value::Null);
             let keys: Vec<&str> = lost.keys().map(String::as_str).collect();
-            assert_eq!(keys[keys.len() - 2..], ["closedBy", "exitCode"]);
+            assert_eq!(
+                keys[keys.len() - 5..],
+                ["closedBy", "exitCode", "life", "view", "hcAddress"]
+            );
             assert!(rows[1].get("closedBy").is_none(), "{}", rows[1]);
         }
     }
@@ -680,7 +777,9 @@ mod tests {
         let (w, caller) = ended_world();
         // list -All and the bar's feed alike: every ended row, never a live one.
         for watch in [false, true] {
+            snapshot(&w, &caller, ENDED_FACTS);
             let reply = board(&w.ctx, &caller, true, watch).unwrap();
+            w.fakes.hc_done().unwrap();
             let codes: Vec<String> = reply["agents"]
                 .as_array()
                 .unwrap()
@@ -688,9 +787,9 @@ mod tests {
                 .map(|row| {
                     let row = row.as_object().unwrap();
                     match row.get("exitCode") {
-                        // Added last, after the row's fields.
+                        // hc suffix follows the terminal fields.
                         Some(code) => {
-                            assert_eq!(row.keys().next_back().unwrap(), "exitCode");
+                            assert_eq!(row.keys().next_back().unwrap(), "hcAddress");
                             format!("{}={code}", row["name"].as_str().unwrap())
                         }
                         None => format!("{}=none", row["name"].as_str().unwrap()),
@@ -701,11 +800,12 @@ mod tests {
                 codes,
                 [
                     "worker=none",
-                    "done=3",
+                    "odd=null",
+                    "late=null",
                     "vanished=null",
+                    "done=3",
                     "tie=null",
-                    "halted=null",
-                    "late=null"
+                    "halted=null"
                 ],
                 "watch={watch}"
             );
@@ -716,7 +816,7 @@ mod tests {
     fn board_reads_inside_their_locks() {
         let w = World::human("");
         let caller = w.caller();
-        let live = w.agent_record(ID, json!({}));
+        let live = member(&w, ID, json!({}));
         w.panes(&["%9|@5|300|aaaaaaaaaaaa|worker"]);
         let mailbox = w.state().join("mail").join("pane-1.jsonl");
         let (agent, mail) = (
@@ -741,7 +841,9 @@ mod tests {
             }
             String::new()
         });
+        snapshot(&w, &caller, &[(ID, "running")]);
         let reply = board(&w.ctx, &caller, false, false).unwrap();
+        w.fakes.hc_done().unwrap();
         let row = &reply["agents"][0];
         assert_eq!(
             (&row["doing"], &row["doingFrom"], &row["unread"]),
@@ -750,12 +852,12 @@ mod tests {
     }
 
     #[test]
-    fn board_lists_again_after_reap_acted() {
+    fn board_does_not_refresh_after_reap() {
         use std::cell::Cell;
         use std::rc::Rc;
         let w = World::human("");
         let caller = w.caller();
-        let folder = w.agent_record(ID, json!({}));
+        let folder = member(&w, ID, json!({}));
         write(
             &folder.join("launcher.json"),
             json!({"pid": 300, "exitCode": 0}),
@@ -786,11 +888,15 @@ mod tests {
         });
         w.fakes.mux_rule("#{pane_id}|#{@agent-id}", 0, "|\n", "");
         w.fakes.clear_log();
+        snapshot(&w, &caller, &[(ID, "0")]);
         let reply = board(&w.ctx, &caller, true, false).unwrap();
-        assert!(killed.get());
+        w.fakes.hc_done().unwrap();
+        assert!(!killed.get());
+        assert!(folder.join("notice.json").exists());
+        assert_eq!(w.fakes.hc_calls().len(), 3);
         assert_eq!(
             (names(&reply), &reply["running"]),
-            (vec!["worker=exited".to_string()], &json!(0))
+            (vec!["worker=exited 0".to_string()], &json!(0))
         );
         let lists = w
             .fakes
@@ -798,15 +904,15 @@ mod tests {
             .iter()
             .filter(|c| crate::agents::fixture::list_call(c))
             .count();
-        assert_eq!(lists, 2);
+        assert_eq!(lists, 1);
     }
 
     #[test]
     fn lock_order_notice_mail_agent() {
         let w = World::human("");
         let caller = w.caller();
-        let live = w.agent_record(ID, json!({}));
-        w.agent_record("bbbbbbbbbbbb", json!({"name": "gone", "pane": "%8"}));
+        let live = member(&w, ID, json!({}));
+        member(&w, "bbbbbbbbbbbb", json!({"name": "gone", "pane": "%8"}));
         w.panes(&["%9|@5|300|aaaaaaaaaaaa|worker"]);
         w.fakes.mux_first("#{pane_id}|#{@agent-id}", 0, "|\n", "");
         // status.json exists only while the row's agent lock is held, so a row that shows it read it there.
@@ -822,16 +928,21 @@ mod tests {
             String::new()
         });
         w.fakes.clear_log();
+        snapshot(&w, &caller, &[(ID, "running"), ("bbbbbbbbbbbb", "0")]);
         let reply = board(&w.ctx, &caller, false, false).unwrap();
+        w.fakes.hc_done().unwrap();
+        let member_lock = lock_key("member", &caller, "bbbbbbbbbbbb");
         let notice = lock_key("notice", &caller, "bbbbbbbbbbbb");
         let mail = lock_key("mail", &caller, "pane-1");
         assert_eq!(
             w.fakes.locks(),
             [
+                format!("+{member_lock}"),
                 format!("+{notice}"),
                 format!("+{mail}"),
                 format!("-{mail}"),
                 format!("-{notice}"),
+                format!("-{member_lock}"),
                 format!("+{mail}"),
                 format!("-{mail}"),
                 format!("+{agent}"),
@@ -851,7 +962,9 @@ mod tests {
             json!({"line": "sent", "at": "x"}),
         );
         w.fakes.lock_probe(|_| String::new());
+        snapshot(&w, &caller, &[(ID, "running"), ("bbbbbbbbbbbb", "0")]);
         let reply = board(&w.ctx, &caller, false, false).unwrap();
+        w.fakes.hc_done().unwrap();
         let row = &reply["agents"][0];
         assert_eq!(
             (&row["doing"], &row["doingFrom"]),
@@ -876,7 +989,11 @@ mod tests {
         let mut folders = Vec::new();
         let mut panes = Vec::new();
         for (i, (id, name)) in ids.iter().zip(names).enumerate() {
-            folders.push(w.agent_record(id, json!({"name": name, "pane": format!("%{}", 10 + i)})));
+            folders.push(member(
+                &w,
+                id,
+                json!({"name": name, "pane": format!("%{}", 10 + i)}),
+            ));
             panes.push(format!("%{}|@5|{}|{id}|{name}", 10 + i, 300 + i));
         }
         let panes: Vec<&str> = panes.iter().map(String::as_str).collect();
@@ -907,7 +1024,13 @@ mod tests {
             json!({"pid": 700, "start": 7000, "since": "2026-10-29T11:59:30.0000000Z"}),
         );
         let rows = |watch: bool| -> Vec<String> {
+            snapshot(
+                &w,
+                &caller,
+                &ids.iter().map(|id| (*id, "running")).collect::<Vec<_>>(),
+            );
             let reply = board(&w.ctx, &caller, false, watch).unwrap();
+            w.fakes.hc_done().unwrap();
             reply["agents"]
                 .as_array()
                 .unwrap()
@@ -954,7 +1077,13 @@ mod tests {
         report(4, "dreaming", "11:40:00");
         assert_eq!(rows(false)[0], r#"a="done"/600"#);
         // changedAt names the spell; null without a report.
+        snapshot(
+            &w,
+            &caller,
+            &ids.iter().map(|id| (*id, "running")).collect::<Vec<_>>(),
+        );
         let reply = board(&w.ctx, &caller, false, false).unwrap();
+        w.fakes.hc_done().unwrap();
         let changed: Vec<String> = reply["agents"]
             .as_array()
             .unwrap()
@@ -1011,10 +1140,33 @@ mod tests {
         assert_eq!(body(), r#"{"since":"2026-10-29T11:58:00.0000000Z"}"#);
         mark_seen(&w.ctx, &caller, "%9", "2026-10-29T11:59:00.0000000Z").unwrap();
         assert_eq!(body(), r#"{"since":"2026-10-29T11:59:00.0000000Z"}"#);
-        // No running agent on the pane, or no time: nothing written.
+        // A wrong pane is no view; malformed time does not even take a pane snapshot or agent lock.
         assert!(!mark_seen(&w.ctx, &caller, "%4", "2026-10-29T12:00:00.0000000Z").unwrap());
+        w.fakes.clear_log();
         assert!(!mark_seen(&w.ctx, &caller, "%9", "soon").unwrap());
+        assert!(w.fakes.mux_calls().is_empty());
+        assert!(w.fakes.locks().is_empty());
         assert_eq!(body(), r#"{"since":"2026-10-29T11:59:00.0000000Z"}"#);
+        // A notice is history, not evidence that the committed attachment disappeared.
+        write(&folder.join("notice.json"), json!({"kind":"stopped"}));
+        w.fakes.clear_log();
+        assert!(mark_seen(&w.ctx, &caller, "%9", "2026-10-29T12:00:00.0000000Z").unwrap());
+        assert_eq!(w.fakes.mux_calls().len(), 1);
+        assert!(crate::agents::fixture::list_call(&w.fakes.mux_calls()[0]));
+        assert_eq!(body(), r#"{"since":"2026-10-29T12:00:00.0000000Z"}"#);
+        // Replaced launches, duplicate pane rows and duplicate own records never prove a unique view.
+        let mut replaced = crate::agents::fixture::row_of("%9|@5|300|aaaaaaaaaaaa|worker", &[]);
+        replaced.command = "/bin/sh -l".into();
+        w.pane_rows(&[replaced]);
+        assert!(!mark_seen(&w.ctx, &caller, "%9", "2026-10-29T12:01:00.0000000Z").unwrap());
+        w.panes(&["%9|@5|300|aaaaaaaaaaaa|worker", "%9|@5|300||"]);
+        assert!(!mark_seen(&w.ctx, &caller, "%9", "2026-10-29T12:01:00.0000000Z").unwrap());
+        w.panes(&["%9|@5|300|aaaaaaaaaaaa|worker"]);
+        w.agent_record("bbbbbbbbbbbb", json!({"name":"duplicate", "pane":"%9"}));
+        assert!(!mark_seen(&w.ctx, &caller, "%9", "2026-10-29T12:01:00.0000000Z").unwrap());
+        assert_eq!(body(), r#"{"since":"2026-10-29T12:00:00.0000000Z"}"#);
+        assert!(w.fakes.hc_calls().is_empty());
+        w.fakes.hc_done().unwrap();
     }
 
     #[test]
@@ -1022,7 +1174,7 @@ mod tests {
         let w = World::human("");
         w.clock(NOW);
         let caller = w.caller();
-        let folder = w.agent_record(ID, json!({}));
+        let folder = member(&w, ID, json!({}));
         w.panes(&["%9|@5|300|aaaaaaaaaaaa|worker"]);
         // The agent's `read -Wait`: pid 700, started at 7000.
         w.fakes.process(crate::testing::row(700, 300, 7000));
@@ -1039,7 +1191,9 @@ mod tests {
             )
         };
         let waiting = || {
+            snapshot(&w, &caller, &[(ID, "running")]);
             let reply = board(&w.ctx, &caller, true, true).unwrap();
+            w.fakes.hc_done().unwrap();
             reply["agents"][0]["waiting"].clone()
         };
         let files = || {
@@ -1075,9 +1229,15 @@ mod tests {
         wait(703, 700, 7000, "11:59:00");
         assert_eq!(waiting(), json!(false));
         assert_eq!(files(), Vec::<String>::new());
+        // Detached Running members still read their activity/wait markers.
+        w.panes(&[]);
+        wait(700, 700, 7000, "11:59:00");
+        assert_eq!(waiting(), json!(true));
         // Only the bar's feed says waiting; list's rows are unchanged.
         wait(700, 700, 7000, "11:59:00");
+        snapshot(&w, &caller, &[(ID, "running")]);
         let list = board(&w.ctx, &caller, true, false).unwrap();
+        w.fakes.hc_done().unwrap();
         assert!(list["agents"][0].get("waiting").is_none());
         assert_eq!(files(), ["waiting-700.json"]);
     }
@@ -1088,8 +1248,9 @@ mod tests {
         w.clock(NOW);
         let caller = w.caller();
         // worker (%9) reports to the human pane %1; child (%8) reports to worker, an agent, whose mailbox is its id.
-        w.agent_record(ID, json!({}));
-        w.agent_record(
+        member(&w, ID, json!({}));
+        member(
+            &w,
             "bbbbbbbbbbbb",
             json!({"name": "child", "pane": "%8", "parentPane": "%9"}),
         );
@@ -1105,7 +1266,9 @@ mod tests {
         add_mail(&w.ctx, &caller, "pane-2", "worker", "%9", "z", None).unwrap();
         // The bar's own pane (pane-7) has no mail; its reader is not used.
         let unread = || {
+            snapshot(&w, &caller, &[(ID, "running"), ("bbbbbbbbbbbb", "running")]);
             let reply = board(&w.ctx, &caller, true, true).unwrap();
+            w.fakes.hc_done().unwrap();
             reply["agents"]
                 .as_array()
                 .unwrap()
@@ -1132,34 +1295,302 @@ mod tests {
         assert_eq!(unread(), ["worker=0", "child=0"]);
         // list keeps the calling reader's unread: the caller's own pane-1, never the bar's parents.
         add_mail(&w.ctx, &caller, "pane-1", "worker", "%9", "w", None).unwrap();
+        snapshot(&w, &caller, &[(ID, "running"), ("bbbbbbbbbbbb", "running")]);
         let list = board(&w.ctx, &caller, false, false).unwrap();
+        w.fakes.hc_done().unwrap();
         assert_eq!(list["agents"][0]["unread"], 1);
     }
 
     #[test]
     fn a_dead_launch_a_failed_kill_left_is_not_running() {
-        // #48 test 5: reap's conditional kill of the dead launch %9 failed (or the server kept the pane): the pane
-        // is still listed dead, so it is no board row and no target.
+        // A failed view cleanup does not end hc membership: the member runs detached until terminal facts.
         let w = World::human("");
         let caller = w.caller();
-        w.agent_record(ID, json!({}));
+        member(&w, ID, json!({}));
         w.panes_dead(&["%9|@5|300|aaaaaaaaaaaa|worker"], &["%9"]);
         w.fakes.mux_rule("if-shell", 1, "", "no server");
         w.fakes
             .mux_rule("-t %9 #{pane_id}|#{@agent-id}", 0, "%9|aaaaaaaaaaaa\n", "");
+        snapshot(&w, &caller, &[(ID, "running")]);
         let reply = board(&w.ctx, &caller, true, false).unwrap();
-        assert_eq!(reply["running"], 0);
-        assert!(names(&reply).is_empty(), "{reply:?}");
+        w.fakes.hc_done().unwrap();
+        assert_eq!(reply["running"], 1);
+        assert_eq!(names(&reply), ["worker=running"]);
+        assert_eq!(reply["agents"][0]["view"], "detached");
+        assert_eq!(reply["agents"][0]["pane"], Value::Null);
         let killed = w
             .fakes
             .mux_calls()
             .iter()
             .filter(|c| c[1] == "if-shell")
             .count();
-        assert!(killed >= 1);
+        assert_eq!(killed, 0);
         let found = registry::find_pane(&w.ctx, &caller, "worker").unwrap_err();
         assert_eq!((found.code, found.check), (2, "target"));
         assert!(!w.folder(ID).join("notice.json").exists());
+        snapshot(&w, &caller, &[(ID, "0")]);
+        let reply = board(&w.ctx, &caller, true, false).unwrap();
+        w.fakes.hc_done().unwrap();
+        assert_eq!(reply["running"], 0);
+        assert_eq!(names(&reply), ["worker=exited 0"]);
+        assert!(w.folder(ID).join("notice.json").exists());
+        assert!(!w.fakes.mux_calls().iter().any(|c| c[1] == "if-shell"));
+    }
+    #[test]
+    fn board_hc_route_orders_counts_and_never_refreshes() {
+        use crate::agents::core_fixture as cf;
+        for watch in [false, true] {
+            let w = World::human("");
+            let c = w.caller();
+            w.clock(NOW);
+            let mut records = Vec::new();
+            for (id, name) in [
+                ("aaaaaaaaaaaa", "detached"),
+                ("bbbbbbbbbbbb", "attached"),
+                ("cccccccccccc", "lost"),
+                ("dddddddddddd", "unknown"),
+                ("eeeeeeeeeeee", "ended"),
+            ] {
+                records.push(cf::member(
+                    &w,
+                    id,
+                    json!({"name":name,"pane":if name=="attached" {"%8"} else {"%9"}}),
+                ));
+            }
+            let mut row = crate::agents::fixture::row_of("%8|@7|300|aaaaaaaaaaaa|wrong", &[]);
+            row.command = "hc attach tbbbbbbbbbbbb".into();
+            w.pane_rows(&[row]);
+            write(
+                &w.folder("aaaaaaaaaaaa").join("notice.json"),
+                json!({"kind":"stopped","exitCode":99}),
+            );
+            write(
+                &w.folder("cccccccccccc").join("notice.json"),
+                json!({"kind":"exited","exitCode":99,"closedBy":"pane"}),
+            );
+            add_mail(&w.ctx, &c, "pane-1", "detached", "%9", "keep", None).unwrap();
+            for all in [false, true] {
+                cf::online(&w);
+                cf::listing(&w, &super::super::membership::team(&c), &[]);
+                for (i, r) in records.iter().enumerate() {
+                    let mut t = cf::wire(r);
+                    if i == 2 {
+                        t["argv"] = json!(["/bin/sh", "-l"]);
+                    }
+                    if i == 3 {
+                        t["labels"]["mux.gen"] = json!("1");
+                    }
+                    if i == 4 {
+                        t["state"] = json!("finished");
+                        t["reason"] = json!("exited");
+                        t["exit_code"] = json!(7);
+                    }
+                    cf::get(&w, r["hcAddress"].as_str().unwrap(), t);
+                }
+                w.fakes.clear_log();
+                let out = board(&w.ctx, &c, all, watch).unwrap();
+                w.fakes.hc_done().unwrap();
+                assert_eq!(
+                    read_json(
+                        &super::super::server_dir(&w.ctx, &c)
+                            .join("agents/eeeeeeeeeeee/notice.json")
+                    )
+                    .unwrap()
+                    .unwrap()["exitCode"],
+                    7
+                );
+                assert_eq!(out["running"], 2);
+                assert_eq!(out.get("endedTotal"), all.then_some(&json!(1)));
+                let rows = out["agents"].as_array().unwrap();
+                assert_eq!(
+                    rows.iter()
+                        .map(|r| r["name"].as_str().unwrap())
+                        .collect::<Vec<_>>(),
+                    if all {
+                        vec!["attached", "detached", "lost", "unknown", "ended"]
+                    } else {
+                        vec!["attached", "detached", "lost", "unknown"]
+                    }
+                );
+                assert_eq!(
+                    (
+                        &rows[1]["pane"],
+                        &rows[1]["window"],
+                        &rows[1]["life"],
+                        &rows[1]["view"],
+                        &rows[1]["unread"]
+                    ),
+                    (
+                        &Value::Null,
+                        &Value::Null,
+                        &json!("running"),
+                        &json!("detached"),
+                        &json!(1)
+                    )
+                );
+                assert_eq!(rows[2]["state"], "lost");
+                assert_eq!(rows[2]["exitCode"], Value::Null);
+                assert_eq!(rows[2]["closedBy"], "pane");
+                for row in rows {
+                    let keys = row
+                        .as_object()
+                        .unwrap()
+                        .keys()
+                        .map(String::as_str)
+                        .collect::<Vec<_>>();
+                    assert_eq!(&keys[keys.len() - 3..], ["life", "view", "hcAddress"]);
+                }
+                if all {
+                    assert_eq!(rows[4]["state"], "exited 7");
+                    assert_eq!(rows[4]["exitCode"], 7);
+                }
+                assert_eq!(w.fakes.hc_calls().len(), 7);
+                assert_eq!(w.fakes.mux_calls().len(), 1);
+                assert!(crate::agents::fixture::list_call(&w.fakes.mux_calls()[0]));
+            }
+        }
+    }
+    #[test]
+    fn board_hc_failures_do_not_invent_completion() {
+        use crate::agents::core_fixture as cf;
+        for mode in ["view-error", "core-error", "record-error", "notice-lock"] {
+            let w = World::human("");
+            let c = w.caller();
+            let r = cf::member(&w, ID, json!({}));
+            w.panes(&[]);
+            if mode == "record-error" {
+                std::fs::write(w.folder(ID).join("record.json"), "{").unwrap();
+            } else if mode != "core-error" {
+                cf::online(&w);
+                cf::listing(&w, &super::super::membership::team(&c), &[]);
+                let mut t = cf::wire(&r);
+                if mode == "notice-lock" {
+                    t["state"] = json!("finished");
+                    t["reason"] = json!("exited");
+                    w.fakes.lock_timeout("notice|");
+                }
+                cf::get(&w, "taaaaaaaaaaaa", t);
+            }
+            if mode == "view-error" {
+                w.fakes.mux_first("list-panes", 1, "", "down");
+            }
+            let got = board(&w.ctx, &c, true, false);
+            w.fakes.hc_done().unwrap();
+            match mode {
+                "view-error" => {
+                    let b = got.unwrap();
+                    assert_eq!(b["running"], 1);
+                    assert_eq!(b["agents"][0]["view"], "detached");
+                }
+                "core-error" => {
+                    let b = got.unwrap();
+                    assert_eq!(b["running"], 0);
+                    assert_eq!(b["agents"][0]["life"], "unknown");
+                }
+                "record-error" => assert_eq!(got.unwrap_err().check, "internal"),
+                _ => {
+                    let e = got.unwrap_err();
+                    assert_eq!(
+                        (e.code, e.check, e.message.as_str()),
+                        (2, "lock", "timed out waiting for the agent lock")
+                    );
+                }
+            }
+            assert!(!w.folder(ID).join("notice.json").exists());
+        }
+    }
+    #[test]
+    fn mark_seen_is_view_proof_not_notice_lifecycle() {
+        let w = World::human("");
+        let c = w.caller();
+        w.agent_record(ID, json!({}));
+        w.panes(&["%9|@5|300||"]);
+        write(&w.folder(ID).join("notice.json"), json!({"kind":"stopped"}));
+        assert!(mark_seen(&w.ctx, &c, "%9", "2026-10-29T11:58:00.0000000Z").unwrap());
+        assert_eq!(
+            read_json(&w.folder(ID).join("seen.json")).unwrap().unwrap(),
+            json!({"since":"2026-10-29T11:58:00.0000000Z"})
+        );
+        w.panes(&["%8|@5|300|aaaaaaaaaaaa|worker"]);
+        assert!(!mark_seen(&w.ctx, &c, "%8", "2026-10-29T11:59:00.0000000Z").unwrap());
+        assert!(w.fakes.hc_calls().is_empty());
+        w.fakes.hc_done().unwrap();
+    }
+    #[test]
+    fn board_hc_rank_and_terminal_limit() {
+        use crate::agents::core_fixture as cf;
+        let w = World::human("");
+        let c = w.caller();
+        w.clock(NOW);
+        let mut records = Vec::new();
+        for (id, name, pane, state, at) in [
+            ("aaaaaaaaaaaa", "detached-a", "%10", "working", "11:59:00"),
+            ("bbbbbbbbbbbb", "attached-b", "%11", "working", "11:59:00"),
+            ("cccccccccccc", "attached-c", "%12", "working", "11:59:00"),
+            ("dddddddddddd", "detached-d", "%13", "blocked", "11:58:00"),
+        ] {
+            records.push(cf::member(&w, id, json!({"name":name,"pane":pane})));
+            write(
+                &w.folder(id).join("activity.json"),
+                json!({"state":state,"since":format!("2026-10-29T{at}.0000000Z")}),
+            );
+        }
+        let mut panes = vec![
+            crate::agents::fixture::row_of("%12|@5|300||", &[]),
+            crate::agents::fixture::row_of("%11|@5|301||", &[]),
+        ];
+        panes[0].command = "hc attach tcccccccccccc".into();
+        panes[1].command = "hc attach tbbbbbbbbbbbb".into();
+        w.pane_rows(&panes);
+        for n in 0..12 {
+            let id = format!("{n:012x}");
+            records.push(cf::member(&w, &id, json!({"name":format!("e{n}")})));
+            write(
+                &w.folder(&id).join("notice.json"),
+                json!({"kind":"stopped","at":format!("2026-10-29T11:59:{n:02}.0000000Z")}),
+            );
+        }
+        records.sort_by_key(|r| r["hcAddress"].as_str().unwrap().to_string());
+        cf::online(&w);
+        cf::listing(&w, &super::super::membership::team(&c), &[]);
+        for r in &records {
+            let mut t = cf::wire(r);
+            if r["name"].as_str().unwrap().starts_with('e') {
+                t["state"] = json!("finished");
+                t["reason"] = json!("killed");
+            }
+            cf::get(&w, r["hcAddress"].as_str().unwrap(), t);
+        }
+        let out = board(&w.ctx, &c, true, false).unwrap();
+        w.fakes.hc_done().unwrap();
+        assert_eq!(
+            (&out["running"], &out["endedTotal"]),
+            (&json!(4), &json!(12))
+        );
+        assert_eq!(
+            out["agents"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|r| r["name"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            [
+                "detached-d",
+                "attached-c",
+                "attached-b",
+                "detached-a",
+                "e11",
+                "e10",
+                "e9",
+                "e8",
+                "e7",
+                "e6",
+                "e5",
+                "e4",
+                "e3",
+                "e2"
+            ]
+        );
     }
 }
 #[cfg(test)]

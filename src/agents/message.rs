@@ -1226,7 +1226,22 @@ mod tests {
         let mut w = rotated("", "%2");
         w.fakes.mux_rule("#{window_active}", 0, "%9|1|1|1\n", "");
         w.fakes.mux_rule("show-buffer", 0, "a's screen\n", "");
+        let a = cf::member(
+            &w,
+            ID,
+            json!({"name":"a","startCommand":launch_command("%9")}),
+        );
+        let b = cf::member(
+            &w,
+            "bbbbbbbbbbbb",
+            json!({"name":"b","pane":"%8","startCommand":launch_command("%8")}),
+        );
+        cf::online(&w);
+        cf::listing(&w, a["team"].as_str().unwrap(), &[]);
+        cf::get(&w, "taaaaaaaaaaaa", cf::wire(&a));
+        cf::get(&w, "tbbbbbbbbbbbb", cf::wire(&b));
         let list = crate::agents::view::list(&w.ctx, &w.request(&["list"])).unwrap();
+        w.fakes.hc_done().unwrap();
         let rows: Vec<String> = list["agents"]
             .as_array()
             .unwrap()
@@ -1315,7 +1330,22 @@ mod tests {
         for _ in 0..2 {
             add_mail(&w.ctx, &caller, ID, "a", "%9", "for a", None).unwrap();
         }
+        let a = cf::member(
+            &w,
+            ID,
+            json!({"name":"a","startCommand":launch_command("%9")}),
+        );
+        let b = cf::member(
+            &w,
+            "bbbbbbbbbbbb",
+            json!({"name":"b","pane":"%8","startCommand":launch_command("%8")}),
+        );
+        cf::online(&w);
+        cf::listing(&w, a["team"].as_str().unwrap(), &[]);
+        cf::get(&w, "taaaaaaaaaaaa", cf::wire(&a));
+        cf::get(&w, "tbbbbbbbbbbbb", cf::wire(&b));
         let list = crate::agents::view::list(&w.ctx, &w.request(&["list"])).unwrap();
+        w.fakes.hc_done().unwrap();
         assert_eq!(list["agents"][0]["name"], "a");
         assert_eq!(list["agents"][0]["unread"], 1);
         assert!(read_mail_of(&w, ID).len() == 2);

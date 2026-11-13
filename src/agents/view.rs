@@ -27,7 +27,7 @@ pub fn list_text(reply: &Map<String, Value>, color: bool) -> String {
     let mut shown = reply.clone();
     if let Some(Value::Array(rows)) = shown.get_mut("agents") {
         for row in rows.iter_mut().filter_map(Value::as_object_mut) {
-            let recorded = row.remove("color");
+            let recorded = row.shift_remove("color");
             if !color {
                 continue;
             }
@@ -444,17 +444,37 @@ mod tests {
         );
     }
 
+    // A finite board snapshot; pane-authenticated focus keeps its existing route until P3.
+    fn list_snapshot(w: &World, records: &[Value], ended: Option<&str>) {
+        use crate::agents::core_fixture as cf;
+        cf::online(w);
+        let team = records.first().expect("nonempty member fixture")["team"]
+            .as_str()
+            .unwrap();
+        cf::listing(w, team, &[]);
+        for record in records {
+            let mut terminal = cf::wire(record);
+            if record["id"].as_str() == ended {
+                terminal["state"] = json!("finished");
+                terminal["reason"] = json!("killed");
+            }
+            cf::get(w, record["hcAddress"].as_str().unwrap(), terminal);
+        }
+    }
+
     #[test]
     fn focus_next_and_prev_step_through_the_ranked_board_and_wrap() {
         let w = World::human("");
         w.clock("2026-11-08T12:00:00.0000000Z");
         // In pane order: a works, b needs you, c is done (never seen). Ranked: b, c, a.
+        let mut records = Vec::new();
         for (id, name, pane, state) in [
             ("aaaaaaaaaaaa", "a", "%10", "working"),
             ("bbbbbbbbbbbb", "b", "%11", "blocked"),
             ("cccccccccccc", "c", "%12", "idle"),
         ] {
-            let folder = w.agent_record(id, json!({"name": name, "pane": pane}));
+            records.push(crate::agents::core_fixture::member(&w, id, json!({"name": name, "pane": pane, "startCommand":crate::agents::fixture::launch_command(pane)})));
+            let folder = w.folder(id);
             write(
                 &folder.join("activity.json"),
                 json!({"state": state, "kind": null, "since": "2026-11-08T11:59:00.0000000Z"}),
@@ -481,7 +501,10 @@ mod tests {
                 &format!("{shown}|1\n"),
                 "",
             );
-            run(&w, focus, &["focus", flag])
+            list_snapshot(&w, &records, None);
+            let result = run(&w, focus, &["focus", flag]);
+            w.fakes.hc_done().unwrap();
+            result
         };
         let name = |out: String| {
             out.split(r#""name":""#)
@@ -500,7 +523,9 @@ mod tests {
         // No client attached or no answer: as from no agent's pane.
         w.fakes
             .mux_first("#{pane_id}|#{session_attached}", 0, "%11|0\n", "");
+        list_snapshot(&w, &records, None);
         assert_eq!(name(run(&w, focus, &["focus", "-Next"])), "b");
+        w.fakes.hc_done().unwrap();
         // A name with a flag, both flags, or neither: usage, before the caller is resolved (as every verb's own usage).
         let usage = "2 usage usage: mux-agent focus (<name> | -Next | -Prev) [-Text]";
         w.fakes.clear_log();
@@ -517,10 +542,13 @@ mod tests {
         w.panes(&[]);
         w.fakes
             .mux_first("#{pane_id}|#{session_attached}", 0, "%1|1\n", "");
+        crate::agents::core_fixture::online(&w);
+        crate::agents::core_fixture::listing(&w, &super::super::membership::team(&w.caller()), &[]);
         assert_eq!(
             run(&w, focus, &["focus", "-Next"]),
             "2 target no live agent to switch to"
         );
+        w.fakes.hc_done().unwrap();
     }
 
     #[test]
@@ -763,8 +791,18 @@ mod tests {
     fn list_reader_counts_own_mailbox() {
         let mut w = World::human("");
         let caller = w.caller();
-        w.agent_record(ID, json!({}));
-        let ended = w.agent_record("bbbbbbbbbbbb", json!({"name": "done", "pane": "%7"}));
+        let a = crate::agents::core_fixture::member(
+            &w,
+            ID,
+            json!({"startCommand":crate::agents::fixture::launch_command("%9")}),
+        );
+        let b = crate::agents::core_fixture::member(
+            &w,
+            "bbbbbbbbbbbb",
+            json!({"name": "done", "pane": "%7"}),
+        );
+        let ended = w.folder("bbbbbbbbbbbb");
+        let records = [a, b];
         write(
             &ended.join("notice.json"),
             json!({"kind": "stopped", "exitCode": null, "at": "x"}),
@@ -776,7 +814,9 @@ mod tests {
         }
         w.panes(&["%9|@5|300|aaaaaaaaaaaa|worker"]);
         let rows = |w: &World, args: &[&str]| -> Vec<Value> {
+            list_snapshot(w, &records, Some("bbbbbbbbbbbb"));
             let reply = list(&w.ctx, &w.request(args)).unwrap();
+            w.fakes.hc_done().unwrap();
             reply["agents"].as_array().unwrap().clone()
         };
         assert_eq!(rows(&w, &["list"])[0]["unread"], 1);
@@ -821,16 +861,20 @@ mod tests {
         // #48 test 10: six running agents, their tags rotated one place: one list-panes, every row by its own pane.
         let w = World::human("");
         let mut rows = Vec::new();
+        let mut records = Vec::new();
         for n in 0..6u32 {
             let id = format!("{:012x}", 0xe00 + n);
             let pane = format!("%{}", 30 + n);
-            w.agent_record(&id, json!({"name": format!("w{n}"), "pane": pane}));
+            records.push(crate::agents::core_fixture::member(&w, &id, json!({"name": format!("w{n}"), "pane": pane,"startCommand":crate::agents::fixture::launch_command(&pane)})));
             let tag = format!("{:012x}", 0xe00 + (n + 1) % 6);
             rows.push(format!("{pane}|@5|{}|{tag}|w{}", 330 + n, (n + 1) % 6));
         }
         w.panes(&rows.iter().map(String::as_str).collect::<Vec<_>>());
+        list_snapshot(&w, &records, None);
         w.fakes.clear_log();
         let reply = list(&w.ctx, &w.request(&["list"])).unwrap();
+        w.fakes.hc_done().unwrap();
+        assert_eq!(w.fakes.hc_calls().len(), 8);
         let got: Vec<String> = reply["agents"]
             .as_array()
             .unwrap()

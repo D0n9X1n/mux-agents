@@ -1061,6 +1061,35 @@ mod tests {
         }
     }
 
+    // One finite membership snapshot for each public list/watch invocation.
+    fn board_snapshot(w: &World, records: &[Value], ended: Option<&str>) {
+        use crate::agents::core_fixture as cf;
+        let caller = w.caller();
+        cf::online(w);
+        cf::listing(w, &crate::agents::membership::team(&caller), &[]);
+        for record in records {
+            let mut wire = cf::wire(record);
+            if record["id"].as_str() == ended {
+                wire["state"] = json!("finished");
+                wire["reason"] = json!("killed");
+            }
+            cf::get(w, record["hcAddress"].as_str().unwrap(), wire);
+        }
+    }
+
+    fn board_world() -> World {
+        use crate::agents::core_fixture as cf;
+        let w = agents_world();
+        let a = cf::member(
+            &w,
+            ID,
+            json!({"startCommand":crate::agents::fixture::launch_command("%9")}),
+        );
+        let b = cf::member(&w, "bbbbbbbbbbbb", json!({"name":"gone", "pane":"%8"}));
+        board_snapshot(&w, &[a, b], Some("bbbbbbbbbbbb"));
+        w
+    }
+
     #[test]
     fn recorded_argv_matches_fixture() {
         let mut got = String::new();
@@ -1077,6 +1106,26 @@ mod tests {
                         r#"{"ok":false,"verb":"spawn","code":1,"check":"rmux","message":"tmux call failed"}"#
                     );
                 }
+            }
+            if tokens[0] == "list" {
+                let reply: Value = serde_json::from_str(&out).unwrap();
+                let expected = if tokens.contains(&"-All") {
+                    vec!["ok", "verb", "running", "endedTotal", "agents"]
+                } else {
+                    vec!["ok", "verb", "running", "agents"]
+                };
+                assert_eq!(
+                    reply
+                        .as_object()
+                        .unwrap()
+                        .keys()
+                        .map(String::as_str)
+                        .collect::<Vec<_>>(),
+                    expected
+                );
+                assert_eq!(w.fakes.hc_calls().len(), 4);
+                assert_eq!(w.fakes.mux_calls().len(), 2); // Caller probe, then one membership pane list.
+                assert!(crate::agents::fixture::list_call(&w.fakes.mux_calls()[1]));
             }
             got.push_str(&render(w, scenario));
             got.push('\n');
@@ -1132,8 +1181,8 @@ mod tests {
         );
         record(&World::human(""), "placement", &["placement"], 0);
         record(&World::human(""), "placement h", &["placement", "h"], 0);
-        record(&agents_world(), "list", &["list"], 0);
-        record(&agents_world(), "list -All", &["list", "-All"], 0);
+        record(&board_world(), "list", &["list"], 0);
+        record(&board_world(), "list -All", &["list", "-All"], 0);
         record(&agents_world(), "focus worker", &["focus", "worker"], 0);
         record(
             &agents_world(),
@@ -1243,6 +1292,7 @@ mod tests {
             .mux_rule("@mux-agents-sidebar-id", 0, "%1 4242 2000\n", "");
         w.fakes
             .mux_rule("#{pane_dead}|#{pane_pid}", 0, "%1|@1|0|4242\n", "");
+        board_snapshot(&w, &[], None);
         w.fakes.clear_log();
         let request = w.request(&["watch"]);
         let reply = crate::sidebar::watch_on(
@@ -1253,7 +1303,17 @@ mod tests {
             &mut |_| Err(std::io::Error::other("closed")),
         )
         .unwrap();
+        w.fakes.hc_done().unwrap();
         assert_eq!(reply["ended"], "output-closed");
+        assert_eq!(w.fakes.hc_calls().len(), 2); // Empty membership: version and ls, no gets.
+        assert_eq!(
+            w.fakes
+                .mux_calls()
+                .iter()
+                .filter(|c| crate::agents::fixture::list_call(c))
+                .count(),
+            1
+        );
         got.push_str(&render(&w, "watch, one frame"));
         got.push('\n');
 
@@ -1459,14 +1519,20 @@ mod tests {
     #[test]
     fn list_text_shows_the_model() {
         let w = World::human("");
-        w.agent_record(ID, json!({"model": "sonnet"}));
+        let record = crate::agents::core_fixture::member(
+            &w,
+            ID,
+            json!({"model":"sonnet", "startCommand":crate::agents::fixture::launch_command("%9")}),
+        );
         w.panes(&["%9|@5|300|aaaaaaaaaaaa|worker"]);
+        board_snapshot(&w, &[record], None);
         let (code, out) = call(&w, &["list", "-Text"]);
+        w.fakes.hc_done().unwrap();
         assert_eq!(code, 0, "{out}");
         assert_eq!(
             out,
             format!(
-                "running: 1\nworker  claude  %9  @5  brief  %1  {}  /work  1970-01-01T00:00:00.0000000Z  running  build it  task  0  0  sonnet    working  ",
+                "running: 1\nworker  claude  %9  @5  brief  %1  {}  /work  1970-01-01T00:00:00.0000000Z  running  build it  task  0  0  sonnet  working      running  attached  taaaaaaaaaaaa",
                 crate::agents::fixture::SESSION_ID
             )
         );
@@ -1475,8 +1541,18 @@ mod tests {
     #[test]
     fn list_text_paints_names_in_their_hue_on_a_terminal() {
         let mut w = World::human("");
-        w.agent_record(ID, json!({"name": "worker", "color": "magenta"}));
-        let ended = w.agent_record("bbbbbbbbbbbb", json!({"name": "done", "pane": "%8"}));
+        let a = crate::agents::core_fixture::member(
+            &w,
+            ID,
+            json!({"name":"worker", "color":"magenta", "startCommand":crate::agents::fixture::launch_command("%9")}),
+        );
+        let b = crate::agents::core_fixture::member(
+            &w,
+            "bbbbbbbbbbbb",
+            json!({"name":"done", "pane":"%8"}),
+        );
+        let ended = w.folder("bbbbbbbbbbbb");
+        let records = [a, b];
         crate::agents::fixture::write(
             &ended.join("notice.json"),
             json!({"kind": "stopped", "exitCode": null, "at": "x"}),
@@ -1493,10 +1569,30 @@ mod tests {
             env.extend(extra.iter().map(|(k, v)| (k.to_string(), v.to_string())));
             w.ctx.env = crate::ctx::Env::from_pairs(env);
             w.ctx.tty = tty;
-            call(&w, &["list", "-All", "-Text"]).1
+            board_snapshot(&w, &records, Some("bbbbbbbbbbbb"));
+            let (code, out) = call(&w, &["list", "-All", "-Text"]);
+            w.fakes.hc_done().unwrap();
+            assert_eq!(code, 0, "{out}");
+            out
         };
         // Off a terminal, or with NO_COLOR: plain, as before.
         let plain = with(false, &[]);
+        assert!(
+            plain
+                .lines()
+                .nth(2)
+                .unwrap()
+                .ends_with("running  attached  taaaaaaaaaaaa")
+        );
+        assert!(
+            plain
+                .lines()
+                .nth(3)
+                .unwrap()
+                .starts_with("done  claude      brief"),
+            "{plain}"
+        );
+        assert!(!plain.contains("magenta"));
         assert!(!plain.contains('\u{1b}'), "{plain}");
         assert_eq!(with(true, &[("NO_COLOR", "1")]), plain);
         // On a terminal (or forced): the live name in its hue, the ended name dim; nothing else changes.
@@ -1538,7 +1634,24 @@ mod tests {
         assert!(bar[2].contains("\u{1b}[35mworker\u{1b}[0m"), "{bar:?}");
         // JSON is never colored.
         w.ctx.tty = true;
-        assert!(!call(&w, &["list", "-All"]).1.contains('\u{1b}'));
+        board_snapshot(&w, &records, Some("bbbbbbbbbbbb"));
+        let (code, output) = call(&w, &["list", "-All"]);
+        w.fakes.hc_done().unwrap();
+        assert_eq!(code, 0, "{output}");
+        assert!(!output.contains('\u{1b}'));
+        let reply: Value = serde_json::from_str(&output).unwrap();
+        assert_eq!(
+            reply
+                .as_object()
+                .unwrap()
+                .keys()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            ["ok", "verb", "running", "endedTotal", "agents"]
+        );
+        assert_eq!(reply["agents"][0]["color"], "magenta");
+        assert_eq!(reply["agents"][1]["pane"], Value::Null);
+        assert_eq!(reply["agents"][1]["window"], Value::Null);
     }
 
     #[test]

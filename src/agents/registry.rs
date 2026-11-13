@@ -233,6 +233,36 @@ fn window_ok(window: &str) -> bool {
 }
 
 impl Snapshot {
+    /// A unique committed attachment, independent of lifecycle notices.
+    pub fn view_at(&self, pane: &str) -> Option<Pane> {
+        let candidates: Vec<_> = self
+            .agents
+            .iter()
+            .filter(|a| super::text(a.record.get("pane")) == pane)
+            .collect();
+        let [a] = candidates.as_slice() else {
+            return None;
+        };
+        let row = a.row.as_ref()?;
+        if !a.committed
+            || row.dead
+            || live_pid(&row.pid).is_none()
+            || !window_ok(&row.window)
+            || self.rows.iter().filter(|r| r.pane == pane).count() != 1
+        {
+            return None;
+        }
+        Some(Pane {
+            pane: row.pane.clone(),
+            window: row.window.clone(),
+            pid: row.pid.clone(),
+            id: a.id.clone(),
+            name: super::text(a.record.get("name")),
+            record: a.record.clone(),
+            launch: a.launch.clone()?,
+        })
+    }
+
     /// One `list-panes` and the state folder's own records, classified.
     pub fn take(ctx: &Ctx, caller: &Caller) -> Res<Snapshot> {
         let rows = rows(ctx, caller)?;
@@ -2025,18 +2055,35 @@ mod tests {
     }
 
     // Another spawn holds the session's spawn lock while an uncommitted agent over 60 s old has its pane gone, or
-    // dead: list never waits for that lock. It returns at once with no cleanup; a later list, the lock free, closes
-    // the agent with exactly one notice.
+    // dead: list never waits for that lock. Only terminal hc facts post a notice, regardless of spawn contention.
     #[test]
     fn list_never_waits_for_a_busy_spawn_lock() {
         use std::sync::Arc;
         use std::sync::atomic::{AtomicBool, Ordering};
         use std::time::{Duration, Instant};
-        for dead in [false, true] {
+        for (dead, terminal) in [(false, false), (true, false), (false, true), (true, true)] {
             let w = World::human("");
             w.clock(NOW);
             let caller = w.caller();
-            let folder = w.uncommitted(ID, json!({"createdAt": "2026-10-29T11:58:00.0000000Z"}));
+            let record = crate::agents::core_fixture::member(
+                &w,
+                ID,
+                json!({"createdAt": "2026-10-29T11:58:00.0000000Z"}),
+            );
+            let folder = w.folder(ID);
+            std::fs::remove_file(folder.join("commit.json")).unwrap();
+            let snapshot = || {
+                use crate::agents::core_fixture as cf;
+                cf::online(&w);
+                cf::listing(&w, record["team"].as_str().unwrap(), &[]);
+                let mut wire = cf::wire(&record);
+                if terminal {
+                    wire["state"] = json!("finished");
+                    wire["reason"] = json!("exited");
+                    wire["exit_code"] = json!(0);
+                }
+                cf::get(&w, "taaaaaaaaaaaa", wire);
+            };
             let killed = std::rc::Rc::new(std::cell::Cell::new(false));
             let listed_now = killed.clone();
             w.fakes.mux_script("list-panes", move |argv| {
@@ -2097,9 +2144,11 @@ mod tests {
                     std::thread::sleep(Duration::from_millis(1));
                 }
                 w.fakes.clear_log();
+                snapshot();
                 let at = Instant::now();
                 let reply = crate::agents::view::list(&w.ctx, &w.request(&["list"]));
                 let took = at.elapsed();
+                w.fakes.hc_done().unwrap();
                 release.store(true, Ordering::SeqCst);
                 holder.join().unwrap();
                 assert!(reply.is_ok(), "dead={dead} {reply:?}");
@@ -2110,16 +2159,22 @@ mod tests {
                 "dead={dead}: list waited {took:?} for the spawn lock"
             );
             assert!(w.fakes.slept().is_empty(), "dead={dead}");
-            assert!(!folder.join("notice.json").exists(), "dead={dead}");
+            assert_eq!(folder.join("notice.json").exists(), terminal, "dead={dead}");
             assert!(!killed.get(), "dead={dead}");
-            assert!(stored(&w).is_empty(), "dead={dead}");
-            // The lock free: the next list closes it, once; the one after posts nothing more.
+            assert_eq!(stored(&w).len(), usize::from(terminal), "dead={dead}");
+            // Releasing spawn changes no hc life: Running remains unnotified; Ended stays notified once.
             for _ in 0..2 {
+                snapshot();
                 crate::agents::view::list(&w.ctx, &w.request(&["list"])).unwrap();
+                w.fakes.hc_done().unwrap();
             }
-            assert_eq!(killed.get(), dead, "dead={dead}");
-            assert_eq!(marker_of(&folder).0, json!("lost"), "dead={dead}");
-            assert_eq!(stored(&w).len(), 1, "dead={dead}");
+            assert!(!killed.get(), "dead={dead}");
+            assert_eq!(folder.join("notice.json").exists(), terminal);
+            if terminal {
+                assert_eq!(marker_of(&folder).0, json!("exited"));
+            }
+            assert_eq!(stored(&w).len(), usize::from(terminal), "dead={dead}");
+            assert!(!w.fakes.locks().iter().any(|event| event.contains("spawn|")));
         }
     }
 

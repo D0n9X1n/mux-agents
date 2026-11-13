@@ -466,7 +466,7 @@ pub(crate) fn created_pane(stdout: &str) -> Option<Created> {
 pub enum Recipe<'a> {
     First(Option<&'a str>),
     /// Claude forks from `parent` itself. For Copilot, the caller must first copy the parent session into the
-    /// `session` passed to `client_args`, as `Launch::run` does, and fall back to `First` if the copy fails.
+    /// `session` passed to `client_args`, in `Launch::allocate`, and fall back to `First` if the copy fails.
     Fork {
         parent: &'a str,
         task: Option<&'a str>,
