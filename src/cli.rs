@@ -286,7 +286,7 @@ fn failure(verb: Option<&str>, refusal: &Refusal) -> Map<String, Value> {
     reply
 }
 
-/// In a herdr terminal every verb refuses: herdr runs and coordinates agents itself (#85).
+/// An unproven herdr terminal refuses: herdr runs and coordinates its own agents (#85).
 pub(crate) const HERDR: &str =
     "this terminal is herdr's: use herdr's own skills (hc --skill), not mux-agents";
 
@@ -295,11 +295,9 @@ fn dispatch(def: &VerbDef, request: &Request, ctx: &Ctx) -> Res<Map<String, Valu
     if ctx.env.get("MUX_AGENTS_TEST_PANIC") == Some("dispatch") {
         panic!("PANIC-PAYLOAD-7f3a");
     }
-    // A herdr terminal (herdr-core gives every terminal it runs its address) outside tmux and rmux: herdr's skills
-    // apply there, before anything is read. Inside tmux or rmux the pane is the multiplexer's, whatever it inherited.
-    let var = |name: &str| ctx.env.get(name).is_some_and(|v| !v.is_empty());
-    if var("HC_TERMINAL_ID") && !var("TMUX") && !var("RMUX") {
-        return refuse(2, "herdr", HERDR);
+    // Non-mux herdr terminals stand down; committed mux workers use their member identity.
+    if crate::caller::hc::applies(ctx) {
+        crate::caller::hc::resolve(ctx)?;
     }
     // Every public verb refuses a sandboxed caller before any multiplexer call (MuxAgents.ps1:94).
     crate::sandbox::assert_unsandboxed(ctx)?;

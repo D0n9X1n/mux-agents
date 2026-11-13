@@ -207,3 +207,125 @@ fn hc_worker_rejects_unproven_identity_before_mux() {
         }
     }
 }
+#[test]
+fn hc_worker_commands_keep_mail_status_activity_and_spawn_fence() {
+    for (args, field, want) in [
+        (
+            vec!["status", "-BodyFile", "body.txt"],
+            "text",
+            json!("hello"),
+        ),
+        (
+            vec!["report", "blocked", "-Kind", "question"],
+            "state",
+            json!("blocked"),
+        ),
+        (
+            vec!["send", "parent", "-BodyFile", "body.txt"],
+            "from",
+            json!("worker"),
+        ),
+        (vec!["read"], "messages", json!([])),
+        (
+            vec!["spawn", "-Client", "claude", "-TaskFile", "body.txt"],
+            "check",
+            json!("tagged"),
+        ),
+    ] {
+        let (w, c, r, folder) = worker();
+        w.file("body.txt", b"hello");
+        proof(&w, &r);
+        proof(&w, &r);
+        if args[0] == "read" {
+            cf::online(&w);
+            cf::listing(
+                &w,
+                &crate::agents::membership::team(&c),
+                &[r["hcAddress"].as_str().unwrap()],
+            );
+            cf::get(&w, r["hcAddress"].as_str().unwrap(), wire(&r));
+        }
+        let (code, out) = crate::cli::run(
+            &args.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+            || Ok(&w.ctx),
+        );
+        let v: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(code, if args[0] == "spawn" { 2 } else { 0 }, "{out}");
+        assert_eq!(v[field], want, "{out}");
+        if args[0] == "status" {
+            assert_eq!(
+                crate::state::fs::read_json(&folder.join("status.json"))
+                    .unwrap()
+                    .unwrap()["text"],
+                "hello"
+            );
+        }
+        if args[0] == "report" {
+            assert_eq!(
+                crate::state::fs::read_json(&folder.join("activity.json"))
+                    .unwrap()
+                    .unwrap()["kind"],
+                "question"
+            );
+        }
+        w.fakes.hc_done().unwrap();
+    }
+}
+#[test]
+fn hc_worker_bypass_and_sandbox_boundaries() {
+    for (key, value) in [
+        ("TMUX", "present"),
+        ("RMUX", "present"),
+        ("HC_TERMINAL_ID", ""),
+    ] {
+        let f = crate::testing::Fakes::default();
+        let mut c = f.ctx();
+        c.env = Env::from_pairs([("HC_TERMINAL_ID", "t1"), (key, value)]);
+        if key == "HC_TERMINAL_ID" {
+            c.env = Env::from_pairs([(key, value)]);
+        }
+        assert!(!caller::hc::applies(&c));
+        assert!(f.hc_calls().is_empty());
+        f.hc_done().unwrap();
+    }
+    let (mut w, _, r, _) = worker();
+    proof(&w, &r);
+    w.ctx.env = Env::from_pairs([
+        ("HC_TERMINAL_ID", r["hcAddress"].as_str().unwrap()),
+        ("SANDBOX_RUNTIME", "1"),
+    ]);
+    let (code, out) = crate::cli::run(&["report".into(), "idle".into()], || Ok(&w.ctx));
+    assert_eq!(code, 2);
+    assert_eq!(
+        serde_json::from_str::<Value>(&out).unwrap()["check"],
+        "sandbox"
+    );
+    assert!(w.fakes.mux_calls().is_empty());
+    w.fakes.hc_done().unwrap();
+    let (w, _, _, _) = worker();
+    let e = caller::resolve(&w.ctx).unwrap_err();
+    assert_eq!((e.code, e.check), (2, "herdr"));
+    w.fakes.hc_done().unwrap();
+}
+#[test]
+fn hc_worker_revalidates_before_writing() {
+    let (w, _, r, folder) = worker();
+    w.file("body.txt", b"hello");
+    proof(&w, &r);
+    cf::online(&w);
+    let mut changed = wire(&r);
+    changed["labels"]["mux.gen"] = "changed".into();
+    cf::get(&w, r["hcAddress"].as_str().unwrap(), changed);
+    let (code, out) = crate::cli::run(
+        &["status".into(), "-BodyFile".into(), "body.txt".into()],
+        || Ok(&w.ctx),
+    );
+    assert_eq!(code, 2, "{out}");
+    assert_eq!(
+        serde_json::from_str::<Value>(&out).unwrap()["check"],
+        "herdr"
+    );
+    assert!(!folder.join("status.json").exists());
+    assert!(w.fakes.mux_calls().is_empty());
+    w.fakes.hc_done().unwrap();
+}
