@@ -163,8 +163,9 @@ fn claim_spec(spec: &Path, folder: &Path) -> Res<Option<Value>> {
         Some(Value::String(g))
             if !g.is_empty()
                 && g.len() <= 64
-                && g.bytes()
-                    .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_') =>
+                && g.bytes().all(|b| {
+                    b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' || b == b'_'
+                }) =>
         {
             g
         }
@@ -630,6 +631,8 @@ mod tests {
     #[test]
     fn generation_adversarial_refusal() {
         for gen_id in [
+            json!("A_z-09"),
+            json!("A"),
             json!("../x"),
             json!(""),
             json!(2),
@@ -696,7 +699,7 @@ mod tests {
 
     #[test]
     fn generation_adversarial_valid() {
-        for gen_id in ["A_z-09".to_string(), "x".repeat(64), "0".to_string()] {
+        for gen_id in ["a_z-09".to_string(), "x".repeat(64), "0".to_string()] {
             let l = setup("claude", json!([]));
             let mut v = read_json(&l.spec).unwrap().unwrap();
             v["generation"] = json!(gen_id);
