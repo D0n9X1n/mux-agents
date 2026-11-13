@@ -1107,6 +1107,13 @@ mod tests {
                     );
                 }
             }
+            if tokens[0] == "focus" {
+                assert_eq!(
+                    out,
+                    r#"{"ok":true,"verb":"focus","name":"worker","pane":"%9","window":"@5"}"#
+                );
+                assert_eq!(w.fakes.hc_calls().len(), 1);
+            }
             if tokens[0] == "list" {
                 let reply: Value = serde_json::from_str(&out).unwrap();
                 let expected = if tokens.contains(&"-All") {
@@ -1183,7 +1190,13 @@ mod tests {
         record(&World::human(""), "placement h", &["placement", "h"], 0);
         record(&board_world(), "list", &["list"], 0);
         record(&board_world(), "list -All", &["list", "-All"], 0);
-        record(&agents_world(), "focus worker", &["focus", "worker"], 0);
+        let w = agents_world();
+        crate::agents::core_fixture::member(&w, ID, json!({}));
+        let mut row = crate::agents::fixture::row_of("%9|@5|300|aaaaaaaaaaaa|worker", &[]);
+        row.command = "hc attach taaaaaaaaaaaa".into();
+        w.pane_rows(&[row]);
+        crate::agents::core_fixture::online(&w);
+        record(&w, "focus worker", &["focus", "worker"], 0);
         record(
             &agents_world(),
             "send worker -Body hi",

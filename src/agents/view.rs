@@ -57,7 +57,7 @@ pub struct Focused {
     pub window: String,
 }
 
-/// The `focus` verb: `focus_pane` on the agent its positional names, with no drawn pane to check; or, with `-Next` /
+/// The `focus` verb: `focus_hc` on the agent its positional names, with no drawn pane to check; or, with `-Next` /
 /// `-Prev`, on the live agent after (before) the one the session shows, in the board's ranked order (herdr's
 /// agent.next / agent.prev), wrapping; from a pane that is no agent's, the first (last).
 pub fn focus(ctx: &Ctx, request: &Request) -> Res<Map<String, Value>> {
@@ -72,7 +72,8 @@ pub fn focus(ctx: &Ctx, request: &Request) -> Res<Map<String, Value>> {
     } else {
         step(ctx, &caller, next)?
     };
-    let focused = focus_pane(ctx, &caller, &name, None)?;
+    let core = crate::hc::connect(ctx)?;
+    let focused = focus_hc(ctx, &core, &caller, &name, None)?;
     let mut reply = Map::new();
     reply.insert("name".into(), focused.name.into());
     reply.insert("pane".into(), focused.pane.into());
@@ -89,7 +90,7 @@ fn step(ctx: &Ctx, caller: &Caller, forward: bool) -> Res<String> {
         .into_iter()
         .flatten()
         .filter_map(Value::as_object)
-        .filter(|row| row.get("state").and_then(Value::as_str) == Some("running"))
+        .filter(|row| row.get("life").and_then(Value::as_str) == Some("running"))
         .map(|row| (super::text(row.get("name")), super::text(row.get("pane"))))
         .collect();
     if live.is_empty() {
@@ -351,6 +352,7 @@ fn restore_view(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agents::core_fixture as cf;
     use crate::agents::fixture::{ID, World, write};
     use crate::agents::lock_key;
     use crate::agents::mail::add_mail;
@@ -360,7 +362,9 @@ mod tests {
     type Handler = fn(&Ctx, &Request) -> Res<Map<String, Value>>;
 
     fn run(w: &World, handler: Handler, args: &[&str]) -> String {
-        match handler(&w.ctx, &w.request(args)) {
+        let result = handler(&w.ctx, &w.request(args));
+        w.fakes.hc_done().unwrap();
+        match result {
             Ok(reply) => format!("ok {}", Value::Object(reply)),
             Err(r) => format!("{} {} {}", r.code, r.check, r.message),
         }
@@ -369,10 +373,15 @@ mod tests {
     #[test]
     fn focus_selects_window_then_pane() {
         let w = World::human("");
-        w.agent_record(ID, json!({}));
+        cf::member(
+            &w,
+            ID,
+            json!({"startCommand":crate::agents::fixture::launch_command("%9")}),
+        );
         w.panes(&["%9|@5|300|aaaaaaaaaaaa|worker"]);
         w.fakes.mux_rule("#{window_active}", 0, "%9|1|1|1\n", "");
         w.fakes.clear_log();
+        cf::online(&w);
         assert_eq!(
             run(&w, focus, &["focus", "worker"]),
             r#"ok {"name":"worker","pane":"%9","window":"@5"}"#
@@ -418,15 +427,17 @@ mod tests {
             (1, "%9|1|1|1\n"),
         ] {
             w.fakes.mux_first("#{window_active}", code, out, "");
+            cf::online(&w);
             assert_eq!(
                 run(&w, focus, &["focus", "worker"]),
                 "2 target the agent's pane is no longer its launch",
                 "{code} {out:?}"
             );
         }
+        cf::online(&w);
         assert_eq!(
             run(&w, focus, &["focus", "nobody"]),
-            "2 target no live agent has that name"
+            "2 target no unique committed member has that identity"
         );
         // A rotated tag names nobody: worker's pane is still %9.
         w.panes(&[
@@ -434,17 +445,19 @@ mod tests {
             "%8|@5|301|aaaaaaaaaaaa|worker",
         ]);
         w.fakes.mux_first("#{window_active}", 0, "%9|1|1|1\n", "");
+        cf::online(&w);
         assert_eq!(
             run(&w, focus, &["focus", "worker"]),
             r#"ok {"name":"worker","pane":"%9","window":"@5"}"#
         );
+        cf::online(&w);
         assert_eq!(
             run(&w, focus, &["focus", "other"]),
-            "2 target no live agent has that name"
+            "2 target no unique committed member has that identity"
         );
     }
 
-    // A finite board snapshot; pane-authenticated focus keeps its existing route until P3.
+    // A finite board snapshot; stepped focus queues its target connection separately.
     fn list_snapshot(w: &World, records: &[Value], ended: Option<&str>) {
         use crate::agents::core_fixture as cf;
         cf::online(w);
@@ -502,6 +515,7 @@ mod tests {
                 "",
             );
             list_snapshot(&w, &records, None);
+            cf::online(&w);
             let result = run(&w, focus, &["focus", flag]);
             w.fakes.hc_done().unwrap();
             result
@@ -524,6 +538,7 @@ mod tests {
         w.fakes
             .mux_first("#{pane_id}|#{session_attached}", 0, "%11|0\n", "");
         list_snapshot(&w, &records, None);
+        cf::online(&w);
         assert_eq!(name(run(&w, focus, &["focus", "-Next"])), "b");
         w.fakes.hc_done().unwrap();
         // A name with a flag, both flags, or neither: usage, before the caller is resolved (as every verb's own usage).
@@ -537,6 +552,7 @@ mod tests {
             assert_eq!(run(&w, focus, args), usage, "{args:?}");
         }
         assert!(w.fakes.mux_calls().is_empty());
+        assert!(w.fakes.hc_calls().is_empty());
         // No live agent: refused.
         let w = World::human("");
         w.panes(&[]);
@@ -554,12 +570,18 @@ mod tests {
     #[test]
     fn focus_pane_refuses_a_moved_agent_before_selecting() {
         let w = World::human("");
-        w.agent_record(ID, json!({"pane": "%10"}));
+        cf::member(
+            &w,
+            ID,
+            json!({"pane":"%10","startCommand":crate::agents::fixture::launch_command("%10")}),
+        );
         w.panes(&["%10|@5|300|aaaaaaaaaaaa|worker"]);
         let caller = w.caller();
+        cf::online(&w);
+        let core = crate::hc::connect(&w.ctx).unwrap();
         // The bar drew worker on %9; it is on %10 now: refused before any select.
         w.fakes.clear_log();
-        let moved = focus_pane(&w.ctx, &caller, "worker", Some("%9")).unwrap_err();
+        let moved = focus_hc(&w.ctx, &core, &caller, "worker", Some("%9")).unwrap_err();
         assert_eq!(
             (moved.code, moved.check, moved.message.as_str()),
             (
@@ -586,7 +608,7 @@ mod tests {
         // Still on the pane the bar drew: it selects that pane, and the read-back proves it focused.
         w.fakes.clear_log();
         w.fakes.mux_first("#{window_active}", 0, "%10|1|1|1\n", "");
-        let focused = focus_pane(&w.ctx, &caller, "worker", Some("%10")).unwrap();
+        let focused = focus_hc(&w.ctx, &core, &caller, "worker", Some("%10")).unwrap();
         assert_eq!(selects(w.fakes.mux_calls()), 1, "{:?}", w.fakes.mux_calls());
         assert_eq!(
             (focused.name, focused.pane, focused.window),
@@ -594,8 +616,9 @@ mod tests {
         );
         // A read-back that does not prove it focused.
         w.fakes.mux_first("#{window_active}", 0, "%10|1|0|1\n", "");
-        let unproved = focus_pane(&w.ctx, &caller, "worker", Some("%10")).unwrap_err();
+        let unproved = focus_hc(&w.ctx, &core, &caller, "worker", Some("%10")).unwrap_err();
         assert_eq!((unproved.code, unproved.check), (2, "target"));
+        w.fakes.hc_done().unwrap();
     }
 
     #[test]
@@ -899,7 +922,12 @@ mod tests {
     fn focus_read_back_that_fails_to_run_is_a_target_refusal() {
         // D9: the read-back after the select fails as a call (no server, a timeout): `2 target`, never another check.
         let w = World::human("");
-        w.agent_record(ID, json!({}));
+        cf::member(
+            &w,
+            ID,
+            json!({"startCommand":crate::agents::fixture::launch_command("%9")}),
+        );
+        cf::online(&w);
         w.panes(&["%9|@5|300|aaaaaaaaaaaa|worker"]);
         w.fakes.mux_script("#{window_active}", |_| {
             Err(crate::error::Refusal {
@@ -913,5 +941,79 @@ mod tests {
             run(&w, focus, &["focus", "worker"]),
             "2 target the agent's pane is no longer its launch"
         );
+    }
+
+    #[test]
+    fn cli_focus_hc_named_and_steps_restore_detached() {
+        use crate::agents::core_fixture as cf;
+        for args in [
+            vec!["focus", "next"],
+            vec!["focus", "prev"],
+            vec!["focus", "-Next"],
+            vec!["focus", "-Prev"],
+        ] {
+            let w = World::human("");
+            let c = w.caller();
+            let a = cf::member(&w, ID, json!({"name":"next"}));
+            let b = cf::member(&w, "bbbbbbbbbbbb", json!({"name":"prev","pane":"%8"}));
+            let n = if args[1] == "prev" || args[1] == "-Prev" {
+                "prev"
+            } else {
+                "next"
+            };
+            w.panes(&[]);
+            if args[1].starts_with('-') {
+                cf::online(&w);
+                cf::listing(&w, &super::super::membership::team(&c), &[]);
+                for r in [&a, &b] {
+                    cf::get(&w, r["hcAddress"].as_str().unwrap(), cf::wire(r));
+                }
+            }
+            cf::online(&w);
+            let address = if n == "next" {
+                "taaaaaaaaaaaa"
+            } else {
+                "tbbbbbbbbbbbb"
+            };
+            w.fakes.mux_first(
+                "new-window",
+                0,
+                &format!("%20|@7|hc attach {address}\n"),
+                "",
+            );
+            w.launches_hold();
+            w.fakes.mux_first("#{window_active}", 0, "%20|1|1|1\n", "");
+            let out = focus(&w.ctx, &w.request(&args)).unwrap();
+            w.fakes.hc_done().unwrap();
+            assert_eq!(
+                Value::Object(out).to_string(),
+                format!(r#"{{"name":"{n}","pane":"%20","window":"@7"}}"#)
+            );
+            let calls = w.fakes.hc_calls();
+            assert_eq!(
+                calls
+                    .iter()
+                    .map(|(_, a, _)| a[0].as_str())
+                    .collect::<Vec<_>>(),
+                if args[1].starts_with('-') {
+                    vec!["--version", "ls", "get", "get", "--version"]
+                } else {
+                    vec!["--version"]
+                }
+            );
+            assert_eq!(
+                w.fakes
+                    .mux_calls()
+                    .iter()
+                    .filter(|a| a[1] == "new-window")
+                    .count(),
+                1
+            );
+            assert!(
+                !calls
+                    .iter()
+                    .any(|(_, a, _)| ["run", "kill"].contains(&a[0].as_str()))
+            );
+        }
     }
 }

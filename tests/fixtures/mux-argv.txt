@@ -123,10 +123,10 @@
 [focus worker]
 -N display-message -p -t %1 #{pid}|#{pane_pid}|#{session_id}|#{window_id}|#{@agent-id}
 -N list-panes -s -t $3 -F <marker>#{pane_id}<marker>#{window_id}<marker>#{pane_pid}<marker>#{pane_dead}<marker>#{pane_start_command}<marker>#{@agent-id}<marker>#{@agent-name}<marker>
-# :1282-1283; 0.2.3 (#48): the window and pane are selected only while %9 is still its live launch, then read back:
-# active in the active window, live and that launch
--N if-shell -F -t %9 '#{&&:#{==:#{pane_dead},0},#{==:#{pane_start_command},/bin/mux-agent launcher /state/agents/9/spec.json}}' 'select-window -t %9 ; select-pane -t %9'
--N display-message -p -t %9 '#{pane_id}|#{window_active}|#{pane_active}|#{&&:#{==:#{pane_dead},0},#{==:#{pane_start_command},/bin/mux-agent launcher /state/agents/9/spec.json}}'
+# The window and pane are selected only while %9 is still its live hc attachment, then read back:
+# active in the active window, live and that attachment
+-N if-shell -F -t %9 '#{&&:#{==:#{pane_dead},0},#{==:#{pane_start_command},hc attach taaaaaaaaaaaa}}' 'select-window -t %9 ; select-pane -t %9'
+-N display-message -p -t %9 '#{pane_id}|#{window_active}|#{pane_active}|#{&&:#{==:#{pane_dead},0},#{==:#{pane_start_command},hc attach taaaaaaaaaaaa}}'
 
 [send worker -Body hi]
 -N display-message -p -t %1 #{pid}|#{pane_pid}|#{session_id}|#{window_id}|#{@agent-id}

@@ -426,7 +426,7 @@ mod tests {
     const NONE: &str = "2 target no live agent has that name";
 
     fn target_refusal(verb: &str) -> &'static str {
-        if verb == "stop" || verb == "read" {
+        if verb == "focus" || verb == "stop" || verb == "read" {
             "2 target no unique committed member has that identity"
         } else {
             NONE
@@ -469,6 +469,9 @@ mod tests {
             w.panes(&["%9|@5|300|aaaaaaaaaaaa|worker"]);
             for (handler, args) in verbs(name) {
                 w.fakes.clear_log();
+                if args[0] == "focus" {
+                    cf::online(&w);
+                }
                 assert_eq!(
                     run_owned(&w, handler, &args),
                     target_refusal(&args[0]),
@@ -488,6 +491,9 @@ mod tests {
         for name in ["nobody", "worke", "workers"] {
             for (handler, args) in verbs(name) {
                 w.fakes.clear_log();
+                if args[0] == "focus" {
+                    cf::online(&w);
+                }
                 assert_eq!(
                     run_owned(&w, handler, &args),
                     target_refusal(&args[0]),
@@ -495,7 +501,7 @@ mod tests {
                 );
                 assert_eq!(
                     mux_verbs(&w),
-                    if args[0] == "stop" || args[0] == "read" {
+                    if args[0] == "focus" || args[0] == "stop" || args[0] == "read" {
                         vec!["display-message"]
                     } else {
                         vec!["display-message", "list-panes"]
@@ -513,11 +519,18 @@ mod tests {
         w.uncommitted(ID, json!({}));
         w.panes(&["%9|@5|300|aaaaaaaaaaaa|worker"]);
         for (handler, args) in verbs("worker") {
+            w.fakes.clear_log();
+            if args[0] == "focus" {
+                cf::online(&w);
+            }
             assert_eq!(
                 run_owned(&w, handler, &args),
                 target_refusal(&args[0]),
                 "{args:?}"
             );
+            if args[0] != "send" {
+                assert_eq!(mux_verbs(&w), ["display-message"], "{args:?}");
+            }
         }
         // Committed without a record: stop has no hc identity and closes nothing.
         let w = World::human("");
@@ -1264,6 +1277,7 @@ mod tests {
             run(&w, read, &["read", "a"]),
             r#"ok {"name":"a","pane":"%9","text":"a's screen"}"#
         );
+        cf::online(&w);
         assert_eq!(
             run(&w, focus, &["focus", "a"]),
             r#"ok {"name":"a","pane":"%9","window":"@5"}"#
@@ -1396,6 +1410,7 @@ mod tests {
             "2 target the agent's pane is no longer its launch"
         );
         assert_eq!(mux_verbs(&w).last().unwrap(), "delete-buffer");
+        cf::online(&w);
         assert_eq!(
             run(&w, focus, &["focus", "worker"]),
             "2 target the agent's pane is no longer its launch"
