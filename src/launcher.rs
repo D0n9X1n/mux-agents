@@ -652,7 +652,7 @@ mod tests {
 
     #[test]
     fn generation_adversarial_path_syntax_refusal() {
-        for gen_id in [r"..\..\x", "C:x", "a.b"] {
+        for gen_id in [r"..\..\x", "C:x", "a.b", r"a\b"] {
             let l = setup("claude", json!([]));
             // A drive-relative name can replace the folder prefix on Windows.
             let claim = l.folder.join("gens").join(format!("{gen_id}.claim"));
