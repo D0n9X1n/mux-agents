@@ -607,6 +607,28 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn generation_fence_dangling_claim_blocks_without_following_link() {
+        let l = setup("claude", json!([]));
+        let outside = crate::testing::TempDir::new();
+        let target = outside.path().join("claim.json");
+        let claim = l.folder.join("gens/0.claim");
+        std::fs::create_dir(l.folder.join("gens")).unwrap();
+        std::os::unix::fs::symlink(&target, &claim).unwrap();
+        assert!(!claim.exists());
+        assert!(std::fs::symlink_metadata(&claim).unwrap().is_symlink());
+        let r = launch(&l, &spec_str(&l), exits_7);
+        assert!(!target.exists());
+        assert!(std::fs::read_dir(outside.path()).unwrap().next().is_none());
+        assert_eq!(r.code, 0);
+        assert!(r.started.is_empty());
+        assert!(r.err.is_empty());
+        assert!(!l.folder.join("launcher.json").exists());
+        assert!(mail(&l).is_empty());
+        assert_eq!(std::fs::read_link(&claim).unwrap(), target);
+    }
+
     #[test]
     fn generation_adversarial_active() {
         let l = setup("claude", json!([]));
@@ -626,6 +648,38 @@ mod tests {
         assert!(seen);
         assert_eq!(code, 7);
         assert_eq!(mail(&l).len(), 1);
+    }
+
+    #[test]
+    fn generation_adversarial_path_syntax_refusal() {
+        for gen_id in [r"..\..\x", "C:x", "a.b"] {
+            let l = setup("claude", json!([]));
+            // A drive-relative name can replace the folder prefix on Windows.
+            let claim = l.folder.join("gens").join(format!("{gen_id}.claim"));
+            assert!(!claim.exists(), "{gen_id}");
+            // Backslash traversal would escape gens and the agent folder on Windows.
+            #[cfg(windows)]
+            let escaped = l.folder.parent().unwrap().join("x.claim");
+            #[cfg(windows)]
+            assert!(!escaped.exists());
+            let mut v = read_json(&l.spec).unwrap().unwrap();
+            v["generation"] = json!(gen_id);
+            write(&l.spec, v);
+            let r = launch(&l, &spec_str(&l), exits_7);
+            assert_eq!(r.code, 1, "{gen_id}");
+            assert!(r.started.is_empty(), "{gen_id}");
+            assert_eq!(
+                r.err,
+                ["mux-agent: the launcher failed: unexpected error (invalid launch generation)"],
+                "{gen_id}"
+            );
+            assert!(!l.folder.join("launcher.json").exists(), "{gen_id}");
+            assert!(mail(&l).is_empty(), "{gen_id}");
+            assert!(!claim.exists(), "{gen_id}");
+            assert!(!l.folder.join("gens").exists(), "{gen_id}");
+            #[cfg(windows)]
+            assert!(!escaped.exists(), "{gen_id}");
+        }
     }
 
     #[test]
@@ -657,6 +711,7 @@ mod tests {
         assert_eq!(launch(&l, &spec_str(&l), exits_7).code, 1);
         assert!(!l.folder.join("launcher.json").exists());
         assert!(mail(&l).is_empty());
+        // Unix-only: creating Windows symlinks requires privileges.
         #[cfg(unix)]
         {
             let l = setup("claude", json!([]));
@@ -716,6 +771,66 @@ mod tests {
             assert_eq!(duplicate.code, 0);
             assert!(duplicate.started.is_empty());
         }
+    }
+
+    #[test]
+    fn generation_claim_survives_commit_timeout_exit() {
+        let l = setup("claude", json!([]));
+        std::fs::remove_file(l.folder.join("commit.json")).unwrap();
+        let ran = launch(&l, &spec_str(&l), exits_7);
+        assert_eq!(ran.code, 1);
+        assert!(ran.started.is_empty());
+        assert_eq!(l.w.fakes.slept(), vec![250; 120]);
+        assert_eq!(launcher_json(&l)["aborted"], true);
+        assert!(!crate::agents::committed(&l.folder));
+        assert_eq!(
+            read_json(&l.folder.join("gens/0.claim")).unwrap(),
+            Some(json!("run"))
+        );
+        let record = std::fs::read(l.folder.join("launcher.json")).unwrap();
+        let messages = mail(&l);
+        let second = launch(&l, &spec_str(&l), exits_7);
+        assert_eq!(second.code, 0);
+        assert!(second.started.is_empty());
+        assert_eq!(
+            std::fs::read(l.folder.join("launcher.json")).unwrap(),
+            record
+        );
+        assert_eq!(mail(&l), messages);
+        assert_eq!(
+            read_json(&l.folder.join("gens/0.claim")).unwrap(),
+            Some(json!("run"))
+        );
+    }
+
+    #[test]
+    fn generation_claim_survives_abort_exit() {
+        let l = setup("claude", json!([]));
+        std::fs::remove_file(l.folder.join("commit.json")).unwrap();
+        write(&l.folder.join("abort.json"), json!({}));
+        let ran = launch(&l, &spec_str(&l), exits_7);
+        assert_eq!(ran.code, 1);
+        assert!(ran.started.is_empty());
+        assert!(l.w.fakes.slept().is_empty());
+        assert_eq!(launcher_json(&l)["aborted"], true);
+        assert_eq!(
+            read_json(&l.folder.join("gens/0.claim")).unwrap(),
+            Some(json!("run"))
+        );
+        let record = std::fs::read(l.folder.join("launcher.json")).unwrap();
+        let messages = mail(&l);
+        let second = launch(&l, &spec_str(&l), exits_7);
+        assert_eq!(second.code, 0);
+        assert!(second.started.is_empty());
+        assert_eq!(
+            std::fs::read(l.folder.join("launcher.json")).unwrap(),
+            record
+        );
+        assert_eq!(mail(&l), messages);
+        assert_eq!(
+            read_json(&l.folder.join("gens/0.claim")).unwrap(),
+            Some(json!("run"))
+        );
     }
 
     #[test]
