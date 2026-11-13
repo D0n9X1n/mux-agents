@@ -15,6 +15,7 @@ use support::{Dir, Mux, Server};
 #[cfg(unix)]
 #[test]
 fn preflight_reports_each_multiplexer() {
+    let _ = support::private_core::PrivateCore::installed();
     for mux in Mux::ALL {
         if let Some((bin, version)) = support::available(mux) {
             eprintln!("preflight {}: {version} at {}", mux.name(), bin.display());
@@ -53,19 +54,24 @@ fn harness_starts_private_server_and_runs_shell() {
                 .map(str::to_string)
         };
         assert_eq!(get("HOME"), Some(dir.join("home").display().to_string()));
+        assert_eq!(
+            get("XDG_STATE_HOME"),
+            Some(dir.join("core-state").display().to_string())
+        );
         assert_eq!(get("MUX_IT_DIR"), Some(dir.path().display().to_string()));
-        // rmux puts its tmux shim first, inside the harness's TMPDIR; <dir>/bin comes before anything outside it.
+        // rmux puts its tmux shim first, inside the private runtime or temp dir; <dir>/bin precedes outside paths.
         let path = get("PATH").unwrap();
-        let first_outside = path
-            .split(':')
-            .find(|p| !p.starts_with(&dir.join("tmp").display().to_string()));
+        let first_outside = path.split(':').find(|p| {
+            !["run", "tmp"]
+                .iter()
+                .any(|sub| std::path::Path::new(p).starts_with(dir.join(sub)))
+        });
         assert_eq!(
             first_outside,
             Some(dir.join("bin").to_str().unwrap()),
             "{mux:?} PATH={path}"
         );
         for unset in [
-            "XDG_STATE_HOME",
             "MUX_AGENTS_STATE",
             "CLAUDE_CODE_SESSION_ID",
             "COPILOT_AGENT_SESSION_ID",
@@ -3943,4 +3949,32 @@ exec claude --dangerously-skip-permissions
 
     // tmux 3.2a's display-popup has no -T (QA #91): peek works there too.
     tests_on!(tmux32_peek, Tmux32, [bar_real_client_peek]);
+}
+
+#[cfg(unix)]
+#[test]
+fn private_core_unix() {
+    for mux in Mux::ALL {
+        let d = Dir::new();
+        let Some(mut s) = Server::start(mux, &d) else {
+            continue;
+        };
+        let core = s.core.as_ref().expect("server must own a core");
+        let expected = core
+            .env
+            .iter()
+            .filter(|(k, _)| ["HC_SESSION", "HC_SOCKET", "HOME", "XDG_CONFIG_HOME"].contains(k))
+            .map(|(k, v)| format!("{k}={}", v.to_string_lossy()))
+            .collect::<Vec<_>>();
+        let probe = core.command(&["server", "stop", "--json"]);
+        let env = s.pane_env();
+        for entry in expected {
+            assert!(env.lines().any(|line| line == entry), "missing {entry}");
+        }
+        s.kill();
+        assert_eq!(
+            support::private_core::run(probe, d.path()).unwrap()["stopped"],
+            false
+        );
+    }
 }
