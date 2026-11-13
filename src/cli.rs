@@ -730,6 +730,7 @@ mod tests {
         let cwd = w.ctx.cwd.to_str().unwrap().to_string();
         let exe = w.ctx.exe.to_str().unwrap().to_string();
         let calls = w.fakes.mux_calls();
+        let hc = w.fakes.hc_calls().first().map(|(path, _, _)| path.clone());
         // The new agent's id, as its tags name it (inside the bound tag command: `@agent-id <id>`).
         let id = calls.iter().flatten().find_map(|t| {
             let rest = &t[t.find("@agent-id ")? + "@agent-id ".len()..];
@@ -753,6 +754,9 @@ mod tests {
             let tokens: Vec<String> = c
                 .iter()
                 .map(|t| {
+                    if hc.as_ref().and_then(|path| path.to_str()) == Some(t.as_str()) {
+                        return "<hc>".into();
+                    }
                     // A private capture buffer's random name is written `<buffer>`; a LF or CR byte (the side
                     // bar's width options) `\n` or `\r`.
                     let t = &buffer_placeholder(t)
@@ -859,19 +863,18 @@ mod tests {
         let w = World::human("");
         w.launches_hold();
         bar_process(&w);
-        w.fakes.mux_rule(
-            "new-window",
-            0,
-            "%12|@7|/bin/mux-agent launcher /s/spec.json\n",
-            "",
-        );
+        w.fakes
+            .mux_rule("new-window", 0, "%12|@7|hc attach t1\n", "");
         w.fakes.mux_rule("watch", 0, "%13|@1|113\n", "");
-        w.fakes.mux_rule(
-            "split-window",
-            0,
-            "%12|@7|/bin/mux-agent launcher /s/spec.json\n",
-            "",
-        );
+        w.fakes
+            .mux_rule("split-window", 0, "%12|@7|hc attach t1\n", "");
+        use crate::agents::core_fixture as cf;
+        cf::online(&w);
+        cf::listing(&w, &crate::agents::membership::team(&w.caller()), &[]);
+        w.fakes.hc_answer(Ok(crate::spawn::Out {
+            stdout: r#"{"address":"t1"}"#.into(),
+            ..Default::default()
+        }));
         w
     }
 
@@ -940,6 +943,124 @@ mod tests {
             .mux_rule("#{pane_dead}|#{pane_pid}", 0, "%13|@1|0|113\n", "");
     }
 
+    // The four spawn recordings and eight reply goldens all pin the complete hc run and attachment boundary.
+    fn assert_spawn_calls(w: &World, failed: bool) {
+        let hc = w.fakes.hc_calls();
+        let run = &hc[2].1;
+        let id = run.iter().find_map(|s| s.strip_prefix("mux.id=")).unwrap();
+        let spec = run.iter().position(|a| a == "launcher").unwrap() + 1;
+        let folder = std::path::Path::new(&run[spec]).parent().unwrap();
+        let record = crate::state::fs::read_json(&folder.join("record.json"))
+            .unwrap()
+            .unwrap();
+        let mut argv: Vec<String> = [
+            "run",
+            "--bg",
+            "--keep",
+            "--outlive-parent",
+            "--no-notify",
+            "--name",
+        ]
+        .map(String::from)
+        .to_vec();
+        argv.push(format!("m{}", &id[..8]));
+        for label in [
+            "mux.managed=1".into(),
+            format!("mux.team={}", record["team"].as_str().unwrap()),
+            format!("mux.id={id}"),
+            "mux.gen=0".into(),
+            format!("mux.name={}", record["name"].as_str().unwrap()),
+        ] {
+            argv.extend(["--label".into(), label]);
+        }
+        argv.extend([
+            "--cwd".into(),
+            w.ctx.cwd.to_str().unwrap().into(),
+            "--json".into(),
+            "--".into(),
+            w.ctx.exe.to_str().unwrap().into(),
+            "launcher".into(),
+            folder.join("spec.json").to_str().unwrap().into(),
+            "--state-root".into(),
+            w.ctx.state_root.to_str().unwrap().into(),
+            "--path".into(),
+            w.ctx.env.get("PATH").unwrap_or("").into(),
+        ]);
+        let mut expected = vec![
+            vec!["--version".into()],
+            vec![
+                "ls".into(),
+                "--all".into(),
+                "--label".into(),
+                "mux.managed=1".into(),
+                "--label".into(),
+                format!("mux.team={}", record["team"].as_str().unwrap()),
+                "--json".into(),
+            ],
+            argv,
+        ];
+        if failed {
+            expected.push(["kill", "t1", "--json"].map(String::from).to_vec());
+        }
+        assert_eq!(
+            hc.iter().map(|(_, a, _)| a.clone()).collect::<Vec<_>>(),
+            expected
+        );
+        let calls = w.fakes.mux_calls();
+        let create = calls
+            .iter()
+            .find(|a| a.iter().any(|t| t == "attach"))
+            .unwrap();
+        assert_eq!(
+            &create[create.len() - 3..],
+            [hc[0].0.to_str().unwrap(), "attach", "t1"]
+        );
+        assert!(!calls.iter().flatten().any(|t| t == "launcher"));
+        assert!(!create.iter().any(|t| t == "-e"));
+        let pane = if failed {
+            "%12"
+        } else {
+            record["pane"].as_str().unwrap()
+        };
+        let bound: Vec<_> = calls
+            .iter()
+            .filter(|a| a[1] == "if-shell" && a[4] == pane)
+            .collect();
+        assert_eq!(bound.len(), if failed { 2 } else { 3 });
+        for call in &bound {
+            assert_eq!(call[5], "#{==:#{pane_start_command},hc attach t1}");
+        }
+        assert!(bound[0][6].contains("@agent-id"));
+        assert!(!bound[0][6].contains("select-pane"));
+        assert!(!bound[0][6].contains("allow-set-title"));
+        if failed {
+            assert_eq!(bound[1][6], "kill-pane -t %12");
+            assert!(calls.iter().any(|a| a[1..]
+                == [
+                    "display-message",
+                    "-p",
+                    "-t",
+                    "%12",
+                    "#{pane_id}|#{@agent-id}"
+                ]));
+            assert!(!folder.join("commit.json").exists());
+            assert!(folder.join("abort.json").exists());
+        } else {
+            assert_eq!(
+                bound[1][6],
+                format!(
+                    "select-pane -T {} -t {pane}",
+                    record["name"].as_str().unwrap()
+                )
+            );
+            assert_eq!(
+                bound[2][6],
+                format!("set-option -p -t {pane} allow-set-title off")
+            );
+            assert!(folder.join("commit.json").exists());
+        }
+    }
+
     #[test]
     fn recorded_argv_matches_fixture() {
         let mut got = String::new();
@@ -948,6 +1069,15 @@ mod tests {
             let (code, out) = call(w, tokens);
             assert_eq!(code, want, "{scenario}: {out}");
             w.fakes.hc_done().unwrap();
+            if tokens[0] == "spawn" && want != 2 {
+                assert_spawn_calls(w, want == 1);
+                if want == 1 {
+                    assert_eq!(
+                        out,
+                        r#"{"ok":false,"verb":"spawn","code":1,"check":"rmux","message":"tmux call failed"}"#
+                    );
+                }
+            }
             got.push_str(&render(w, scenario));
             got.push('\n');
         };
@@ -976,6 +1106,9 @@ mod tests {
         );
         let w = spawn_world();
         w.fakes.mux_first("set-option", 1, "", "no such pane");
+        crate::agents::core_fixture::answer(&w, &["kill", "t1", "--json"], "{}");
+        w.fakes
+            .mux_rule("-t %12 #{pane_id}|#{@agent-id}", 0, "|\n", "");
         record(
             &w,
             "spawn -Client claude -Task hi, tagging fails",
@@ -1173,6 +1306,49 @@ mod tests {
             args.push("-Text");
         }
         let (code, out) = call(w, &args);
+        assert_eq!(code, 0, "{out}");
+        w.fakes.hc_done().unwrap();
+        assert_spawn_calls(w, false);
+        if text {
+            assert!(out.contains("\nlife: running\nview: attached\nhcAddress: t1\nsidebar "));
+            assert!(out.contains(&format!("\nmodel: {}\n", model.unwrap_or("inherited"))));
+        } else {
+            let reply: Value = serde_json::from_str(&out).unwrap();
+            let mut keys = vec![
+                "ok",
+                "verb",
+                "name",
+                "id",
+                "pane",
+                "window",
+                "client",
+                "sessionId",
+                "context",
+                "reason",
+                "model",
+                "placement",
+                "placementSource",
+                "sidebar",
+            ];
+            if reply.get("sidebarError").is_some() {
+                keys.push("sidebarError");
+            }
+            keys.extend(["life", "view", "hcAddress"]);
+            assert_eq!(
+                reply
+                    .as_object()
+                    .unwrap()
+                    .keys()
+                    .map(String::as_str)
+                    .collect::<Vec<_>>(),
+                keys
+            );
+            assert_eq!(
+                (&reply["life"], &reply["view"], &reply["hcAddress"]),
+                (&json!("running"), &json!("attached"), &json!("t1"))
+            );
+            assert_eq!(reply["model"], model.unwrap_or("inherited"));
+        }
         let (id, session) = if text {
             let field = |name: &str| {
                 out.lines()
@@ -1194,12 +1370,8 @@ mod tests {
         // The bar opened (%13), turned off by `sidebar -Close`, and unproven after the commit (its proof failed).
         let open = || {
             let w = spawn_world();
-            w.fakes.mux_first(
-                "new-window",
-                0,
-                "%9|@5|/bin/mux-agent launcher /s/spec.json\n",
-                "",
-            );
+            w.fakes
+                .mux_first("new-window", 0, "%9|@5|hc attach t1\n", "");
             w
         };
         let off = || {
