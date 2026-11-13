@@ -21,7 +21,7 @@ fn failure_contains_launch_artifacts() {
     fs::write(folder.join("launcher.json"), "launcher-exit-1").unwrap();
     fs::write(folder.join("abort.json"), "abort-reason").unwrap();
     fs::write(t.0.join("client.12.json"), "client-session").unwrap();
-    fs::write(t.0.join("exited.12"), "7").unwrap();
+    fs::write(t.0.join("exited.12"), "exit-code-73").unwrap();
     let err = launch_evidence::checked(&folder, &t.0, || panic!("missing-view")).unwrap_err();
     for token in [
         "missing-view",
@@ -32,7 +32,7 @@ fn failure_contains_launch_artifacts() {
         "client.12.json",
         "client-session",
         "exited.12",
-        "7",
+        "exit-code-73",
     ] {
         assert!(err.contains(token), "missing {token}: {err}");
     }
@@ -48,6 +48,9 @@ fn failure_contains_launch_artifacts() {
             file.display()
         );
     }
+    let pane = 4;
+    let err = launch_evidence::checked(&folder, &t.0, || panic!("pane {pane} gone")).unwrap_err();
+    assert!(err.contains("pane 4 gone"), "formatted panic lost: {err}");
     fs::remove_file(folder.join("abort.json")).unwrap();
     let err = launch_evidence::checked(&folder, &t.0, || panic!("gone")).unwrap_err();
     assert!(err.contains("unavailable"));
