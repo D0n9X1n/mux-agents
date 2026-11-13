@@ -23,7 +23,7 @@ fn core_environment_is_private() {
     let vars: std::collections::BTreeMap<_, _> = c.get_envs().collect();
     assert_eq!(
         vars[std::ffi::OsStr::new("HOME")],
-        Some(d.join("a/home").as_os_str())
+        Some(d.join("a").join("home").as_os_str())
     );
     assert!(!vars.contains_key(std::ffi::OsStr::new("HC_TERMINAL_ID")));
     assert!(!vars.contains_key(std::ffi::OsStr::new("TMUX")));
@@ -45,6 +45,47 @@ fn core_environment_is_private() {
     drop((a, b));
     std::fs::remove_dir_all(d).unwrap();
 }
+#[test]
+fn core_environment_keys_are_allowlisted() {
+    use std::collections::BTreeSet;
+
+    let d = root();
+    let core = PrivateCore::new("fake".into(), &d, "private-path".as_ref());
+    let keys: BTreeSet<_> = core.env.iter().map(|(key, _)| *key).collect();
+    let expected: BTreeSet<_> = [
+        "USER",
+        "USERNAME",
+        "LOGNAME",
+        "LANG",
+        "SystemRoot",
+        "ComSpec",
+        "RMUX_ALLOW_INTERNAL_DAEMON_IN_CALLER_JOB",
+    ]
+    .into_iter()
+    .filter(|key| std::env::var_os(key).is_some())
+    .chain([
+        "HOME",
+        "USERPROFILE",
+        "APPDATA",
+        "LOCALAPPDATA",
+        "XDG_STATE_HOME",
+        "XDG_CONFIG_HOME",
+        "XDG_RUNTIME_DIR",
+        "TMPDIR",
+        "TEMP",
+        "TMP",
+        "PATH",
+        "HC_SESSION",
+        "HC_SOCKET",
+        "MUX_IT_DIR",
+        "MUX_IT_ENTRY",
+    ])
+    .collect();
+    drop(core);
+    std::fs::remove_dir_all(d).unwrap();
+    assert_eq!(keys, expected);
+}
+
 #[test]
 fn core_drop_spares_another_fixture() {
     let d = root();
