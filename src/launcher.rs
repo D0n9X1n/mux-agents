@@ -184,15 +184,7 @@ fn claim_spec(spec: &Path, folder: &Path) -> Res<Option<Value>> {
     let v = read_json(spec)?.ok_or_else(|| Refusal::internal("the launch spec is missing"))?;
     let gen_id = match v.get("generation") {
         None => "0",
-        Some(Value::String(g))
-            if !g.is_empty()
-                && g.len() <= 64
-                && g.bytes().all(|b| {
-                    b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' || b == b'_'
-                }) =>
-        {
-            g
-        }
+        Some(Value::String(g)) if crate::agents::core_identity::generation(g) => g,
         _ => return Err(Refusal::internal("invalid launch generation")),
     };
     let gens = folder.join("gens");
