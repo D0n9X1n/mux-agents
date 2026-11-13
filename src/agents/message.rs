@@ -550,6 +550,38 @@ fn tree(table: &[Row], root: u32) -> Vec<&Row> {
     tree
 }
 
+pub fn capture_hc(
+    ctx: &Ctx,
+    caller: &crate::caller::Caller,
+    name: &str,
+    expected: Option<&str>,
+    lines: i32,
+) -> Res<(registry::Pane, String)> {
+    if !(1..=2000).contains(&lines) {
+        return Err(usage("read"));
+    }
+    let id = super::member_target::named(ctx, caller, name)?;
+    lock(ctx, &lock_key("member", caller, &id.id), || {
+        let record = super::member_target::current(ctx, caller, &id)?;
+        let Some(pane) = id.view(&record, &registry::rows(ctx, caller)?) else {
+            return refuse(
+                2,
+                "target",
+                format!("the agent has no live view; run focus {name}"),
+            );
+        };
+        if expected.is_some_and(|e| e != pane.pane) {
+            return refuse(
+                2,
+                "target",
+                "the agent is no longer on the pane the bar drew",
+            );
+        }
+        let tail = capture(ctx, &pane, lines)?;
+        Ok((pane, tail))
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

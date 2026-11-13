@@ -301,3 +301,31 @@ fn focus_rechecks_aborted_commit_under_member_lock() {
     );
     w.fakes.hc_done().unwrap();
 }
+
+#[test]
+fn capture_requires_view_and_never_reopens() {
+    for present in [false, true] {
+        let w = World::human("");
+        let r = cf::member(&w, ID, json!({}));
+        let c = w.caller();
+        if present {
+            rows(&w, &r);
+        } else {
+            w.panes(&[]);
+        }
+        w.fakes.mux_rule("show-buffer", 0, "one\ntwo\n", "");
+        for expected in [None, Some("%9")] {
+            let got = super::message::capture_hc(&w.ctx, &c, "worker", expected, 2);
+            if present {
+                assert_eq!(got.unwrap().1, "one\ntwo");
+            } else {
+                assert!(got.unwrap_err().message.contains("focus worker"));
+            }
+        }
+        assert!(super::message::capture_hc(&w.ctx, &c, "worker", Some("%8"), 2).is_err());
+        assert!(!w.fakes.mux_calls().iter().any(|a| a[1] == "new-window"
+            || a[1] == "split-window"
+            || (!present && a.iter().any(|s| s.contains("capture-pane")))));
+        w.fakes.hc_done().unwrap();
+    }
+}
