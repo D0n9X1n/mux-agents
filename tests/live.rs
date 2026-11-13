@@ -1442,53 +1442,50 @@ exec claude --dangerously-skip-permissions
         let Some(mut live) = Live::human(mux) else {
             return;
         };
-        live.call(&["set-environment", "-g", "MUX_IT_EXIT", "7"]);
+        live.close_bar();
         let w1 = live.spawn("w1", &[]);
         let client = live.server.client_by_session(s(&w1["sessionId"]));
-        assert_eq!(client["env"]["MUX_IT_EXIT"], "7", "{mux:?}");
         let pid = client["pid"].as_u64().unwrap();
-        support::write_atomic(&live.dir.join(format!("quit.{pid}")), "");
+        support::write_atomic(&live.dir.join(format!("quit.{pid}")), "7\n");
         assert_eq!(
             live.server.wait_file(&format!("exited.{pid}")).trim(),
             "7",
             "{mux:?}"
         );
-        live.wait_gone(s(&w1["pane"]));
         one_exited_notice(&mut live, &w1, 7);
     }
 
     // The single `exited` notice of `w` with `code`: notice.json, launcher.json, one mailbox line, one read.
     fn one_exited_notice(live: &mut Live, w: &Value, code: i64) {
-        let mux = live.mux();
         let folder = live.agent_dir(s(&w["id"]));
-        let rel = folder
-            .strip_prefix(live.dir.path())
-            .unwrap()
-            .join("notice.json");
-        let notice: Value =
-            serde_json::from_str(&live.server.wait_file(rel.to_str().unwrap())).unwrap();
+        let a = s(&w["hcAddress"]);
+        assert!(eventually(
+            LONG,
+            || core(live, &["get", a, "--json"])["state"] == "finished"
+        ));
+        assert!(!folder.join("notice.json").exists());
+        assert!(exit_messages(live, w).is_empty());
+        let (status, list) = live.run(&["list"]);
+        assert_eq!(status, 0, "{list}");
+        let notice = json_file(&folder.join("notice.json"));
         assert_eq!(
             (&notice["kind"], &notice["exitCode"]),
-            (&json!("exited"), &json!(code)),
-            "{mux:?}"
+            (&json!("exited"), &json!(code))
         );
-        assert_eq!(
-            json_file(&folder.join("launcher.json"))["exitCode"],
-            code,
-            "{mux:?}"
-        );
+        assert_eq!(json_file(&folder.join("launcher.json"))["exitCode"], code);
         let (status, read) = live.run(&["read"]);
-        let want = format!("{} exited with code {code}.", s(&w["name"]));
-        assert_eq!((status, bodies(&read)), (0, vec![want]), "{mux:?}");
-        let (_, again) = live.run(&["read"]);
-        assert_eq!(again["messages"], json!([]), "{mux:?}");
-        assert_eq!(live.mailbox(&live.root_box()).len(), 1, "{mux:?}");
-        let (_, all) = live.run(&["list", "-All"]);
         assert_eq!(
-            (&all["agents"][0]["name"], &all["agents"][0]["state"]),
-            (&w["name"], &json!("exited")),
-            "{mux:?}"
+            (status, bodies(&read)),
+            (
+                0,
+                vec![format!("{} exited with code {code}.", s(&w["name"]))]
+            )
         );
+        assert_eq!(live.run(&["read"]).1["messages"], json!([]));
+        assert_eq!(exit_messages(live, w).len(), 1);
+        let (_, all) = live.run(&["list", "-All"]);
+        assert_eq!(all["agents"][0]["state"], format!("exited {code}"));
+        assert_eq!(all["agents"][0]["life"], "ended");
     }
 
     // A PATH `claude` that cannot start (its shebang names a missing interpreter, so the start fails NotFound) still
@@ -1498,12 +1495,12 @@ exec claude --dangerously-skip-permissions
         let Some(mut live) = Live::human(mux) else {
             return;
         };
+        live.close_bar();
         let claude = live.dir.join("bin/claude");
         std::fs::remove_file(&claude).unwrap();
         std::fs::write(&claude, "#!/nonexistent/mux-it/interpreter\n").unwrap();
         std::fs::set_permissions(&claude, std::fs::Permissions::from_mode(0o755)).unwrap();
         let w1 = live.spawn("w1", &[]);
-        live.wait_gone(s(&w1["pane"]));
         one_exited_notice(&mut live, &w1, 1);
         assert!(
             !live.dir.join("clients.log").exists(),
@@ -3203,39 +3200,6 @@ exec claude --dangerously-skip-permissions
             .collect()
     }
 
-    // Agent `w` ended with one `lost` notice closed by its pane: notice.json, one message, gone from list and in
-    // list -All as lost.
-    fn one_lost_notice(live: &mut Live, w: &Value) {
-        let mux = live.mux();
-        let name = s(&w["name"]).to_string();
-        let notice = json_file(&live.agent_dir(s(&w["id"])).join("notice.json"));
-        assert_eq!(
-            (&notice["kind"], &notice["closedBy"]),
-            (&json!("lost"), &json!("pane")),
-            "{mux:?} {name} {notice}"
-        );
-        let messages = exit_messages(live, w);
-        assert_eq!(messages.len(), 1, "{mux:?} {name} {messages:?}");
-        assert_eq!(messages[0]["kind"], "lost", "{mux:?} {name}");
-        let (code, list) = live.run(&["list"]);
-        assert_eq!(code, 0, "{mux:?} {list}");
-        assert!(!names(&list).contains(&name), "{mux:?} {name} {list}");
-        let (_, all) = live.run(&["list", "-All"]);
-        let row = all["agents"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|a| a["name"] == name.as_str())
-            .cloned()
-            .unwrap_or_else(|| panic!("{mux:?}: {name} is not in list -All: {all}"));
-        assert_eq!(
-            (&row["state"], &row["closedBy"]),
-            (&json!("lost"), &json!("pane")),
-            "{mux:?} {row}"
-        );
-        assert_eq!(exit_messages(live, w).len(), 1, "{mux:?} {name}");
-    }
-
     // Spawns a tab agent and a split agent and kills both panes from outside, as a user closing them would.
     fn two_killed(live: &mut Live, n: u32) -> [Value; 2] {
         let tab = live.spawn(&format!("v{n}"), &["-Tab"]);
@@ -3250,64 +3214,55 @@ exec claude --dangerously-skip-permissions
         [tab, split]
     }
 
-    // With the bar off, each of list, read, read <other>, spawn and stop <other> alone closes a tab agent and a split
-    // agent whose panes were killed: one `lost` notice each, closed by the pane. stop on a killed agent answers
-    // already lost.
+    // Closing a view leaves its core member running; each foreground trigger preserves it.
+    fn assert_detached_running(live: &mut Live, w: &Value) {
+        assert!(!live.agent_dir(s(&w["id"])).join("notice.json").exists());
+        let (code, list) = live.run(&["list", "-All"]);
+        assert_eq!(code, 0);
+        let row = list["agents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["name"] == w["name"])
+            .unwrap();
+        assert_eq!(
+            (&row["life"], &row["view"], &row["hcAddress"]),
+            (&json!("running"), &json!("detached"), &w["hcAddress"])
+        );
+        assert!(row["pane"].is_null());
+        assert!(exit_messages(live, w).is_empty());
+        assert!(!live.agent_dir(s(&w["id"])).join("notice.json").exists());
+        assert_eq!(
+            core(live, &["get", s(&w["hcAddress"]), "--json"])["state"],
+            "live"
+        );
+    }
     fn gone_pane_closed_by_each_trigger(mux: Mux) {
-        let Some(mut live) = Live::human(mux) else {
-            return;
-        };
-        live.close_bar();
-        let other = live.spawn("other", &[]);
-        live.worker_pid(&other);
-        let mut n = 1;
         for trigger in ["list", "read", "read other", "spawn", "stop other"] {
-            let killed = two_killed(&mut live, n);
-            n += 2;
-            for w in &killed {
-                assert!(
-                    !live.agent_dir(s(&w["id"])).join("notice.json").exists(),
-                    "{mux:?} {trigger}: noticed before the trigger"
-                );
-            }
-            let (code, reply) = match trigger {
-                "spawn" => (0, live.spawn("fresh", &[])),
-                _ => {
-                    let args: Vec<&str> = trigger.split(' ').collect();
-                    live.run(&args)
-                }
+            let Some(mut live) = Live::human(mux) else {
+                return;
             };
-            assert_eq!(code, 0, "{mux:?} {trigger}: {reply}");
-            for w in &killed {
-                assert!(
-                    live.agent_dir(s(&w["id"])).join("notice.json").is_file(),
-                    "{mux:?} {trigger}: {} not closed",
-                    s(&w["name"])
-                );
-            }
-            for w in &killed {
-                one_lost_notice(&mut live, w);
+            live.close_bar();
+            let other = live.spawn("other", &[]);
+            live.worker_pid(&other);
+            let closed = two_killed(&mut live, 1);
+            let (code, reply) = if trigger == "spawn" {
+                (0, live.spawn("fresh", &[]))
+            } else {
+                live.run(&trigger.split(' ').collect::<Vec<_>>())
+            };
+            assert_eq!(code, 0, "{reply}");
+            for w in &closed {
+                assert_detached_running(&mut live, w);
+                for _ in 0..2 {
+                    let (code, stop) = live.run(&["stop", s(&w["name"])]);
+                    assert_eq!(code, 0, "{stop}");
+                    assert_eq!(stop["hcAddress"], w["hcAddress"]);
+                    assert_eq!(stop["life"], "ended");
+                }
+                assert_eq!(exit_messages(&live, w).len(), 1);
             }
         }
-        // stop on an agent whose pane was just killed: its one notice, and already lost.
-        let w = live.spawn("last", &[]);
-        live.worker_pid(&w);
-        live.call(&["kill-pane", "-t", s(&w["pane"])]);
-        live.wait_gone(s(&w["pane"]));
-        let (code, stop) = live.run(&["stop", "last"]);
-        assert_eq!(
-            (code, &stop["already"]),
-            (0, &json!("lost")),
-            "{mux:?} {stop}"
-        );
-        one_lost_notice(&mut live, &w);
-        let (code, again) = live.run(&["stop", "last"]);
-        assert_eq!(
-            (code, &again["already"]),
-            (0, &json!("lost")),
-            "{mux:?} {again}"
-        );
-        assert_eq!(exit_messages(&live, &w).len(), 1, "{mux:?}");
     }
 
     // With the bar on and no command run, the bar's own tick closes an agent whose pane was killed: its row goes and
