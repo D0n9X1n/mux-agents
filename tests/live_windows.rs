@@ -40,15 +40,11 @@ impl Live {
             .unwrap_or_default()
             .split(',')
             .any(|m| m.trim() == "rmux");
-        match Command::new("rmux").arg("-V").output() {
-            Ok(out) if out.status.success() => {
-                eprintln!("rmux: {}", String::from_utf8_lossy(&out.stdout).trim());
-            }
-            other => {
-                assert!(!required, "MUX_AGENTS_LIVE_REQUIRE names rmux: {other:?}");
-                eprintln!("skipped: no rmux on PATH");
-                return None;
-            }
+        let path = std::env::var("PATH").unwrap_or_default();
+        if mux_agent::mux::find_on_path("rmux.exe", &path).is_none() {
+            assert!(!required, "MUX_AGENTS_LIVE_REQUIRE names rmux: not on PATH");
+            eprintln!("skipped: no rmux on PATH");
+            return None;
         }
         static N: AtomicU32 = AtomicU32::new(0);
         let socket = format!(
@@ -74,37 +70,36 @@ impl Live {
             path.push(";");
             path.push(rest);
         }
-        let mut core =
+        let core =
             private_core::PrivateCore::new(private_core::PrivateCore::installed(), &dir, &path);
-        core.start();
-        let mut start = Command::new("rmux");
-        start.args([
-            "-L",
-            &socket,
-            "new-session",
-            "-d",
-            "-s",
-            "it",
-            "-x",
-            "200",
-            "-y",
-            "50",
-        ]);
-        core.apply(&mut start);
-        for (name, value) in &core.env {
-            start.arg("-e").arg(assign(name, value));
-        }
-        start
-            .arg("-e")
-            .arg(assign("MUX_AGENTS_STATE", dir.join("state").as_os_str()));
-        let out = start.arg("cmd.exe").output().unwrap();
-        // Built before the check, so a failed start still kills whatever began.
+        // Built before any server starts, so a failed start still kills whatever began.
         let mut live = Live {
             core,
             socket,
             dir,
             root: String::new(),
         };
+        match live.rmux().arg("-V").output() {
+            Ok(out) if out.status.success() => {
+                eprintln!("rmux: {}", String::from_utf8_lossy(&out.stdout).trim());
+            }
+            other => {
+                assert!(!required, "MUX_AGENTS_LIVE_REQUIRE names rmux: {other:?}");
+                eprintln!("skipped: no rmux on PATH");
+                return None;
+            }
+        }
+        live.core.start();
+        let mut start = live.rmux();
+        start.args(["new-session", "-d", "-s", "it", "-x", "200", "-y", "50"]);
+        for (name, value) in &live.core.env {
+            start.arg("-e").arg(assign(name, value));
+        }
+        start.arg("-e").arg(assign(
+            "MUX_AGENTS_STATE",
+            live.dir.join("state").as_os_str(),
+        ));
+        let out = start.arg("cmd.exe").output().unwrap();
         assert!(out.status.success(), "new-session: {out:?}");
         live.root = live
             .call(&["list-panes", "-a", "-F", "#{pane_id}"])
@@ -114,14 +109,17 @@ impl Live {
         Some(live)
     }
 
+    /// The server and every client need the same environment to resolve the named pipe.
+    fn rmux(&self) -> Command {
+        let mut command = Command::new("rmux");
+        self.core.apply(&mut command);
+        command.arg("-L").arg(&self.socket);
+        command
+    }
+
     /// `rmux -L <socket> <args>`; panics unless it succeeds, and answers its stdout.
     fn call(&self, args: &[&str]) -> String {
-        let out = Command::new("rmux")
-            .arg("-L")
-            .arg(&self.socket)
-            .args(args)
-            .output()
-            .unwrap();
+        let out = self.rmux().args(args).output().unwrap();
         assert!(out.status.success(), "rmux {args:?}: {out:?}");
         String::from_utf8_lossy(&out.stdout).into_owned()
     }
@@ -222,9 +220,7 @@ impl Drop for Live {
         // The fake clients quit when this file appears; then the server and its panes go.
         let _ = std::fs::write(self.dir.join("quit"), "");
         std::thread::sleep(Duration::from_millis(500));
-        let _ = Command::new("rmux")
-            .args(["-L", &self.socket, "kill-server"])
-            .output();
+        let _ = self.rmux().arg("kill-server").output();
         if !core_stopped {
             let message = format!(
                 "private core stop failed; fixture kept at {}",
