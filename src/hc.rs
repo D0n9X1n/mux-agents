@@ -273,6 +273,20 @@ impl Core<'_> {
     pub fn get(&self, t: &str) -> Res<Terminal> {
         Terminal::decode(&self.json(&["get".into(), t.into(), "--json".into()])?)
     }
+
+    pub fn ls(&self, labels: &[(&str, &str)]) -> Res<Vec<String>> {
+        let mut a = vec!["ls".into(), "--all".into()];
+        for (k, v) in labels {
+            a.extend(["--label".into(), format!("{k}={v}")]);
+        }
+        a.push("--json".into());
+        self.json(&a)?["terminals"]
+            .as_array()
+            .ok_or_else(invalid)?
+            .iter()
+            .map(address)
+            .collect()
+    }
 }
 
 #[cfg(test)]
@@ -575,6 +589,92 @@ mod tests {
             assert_eq!((e.code, e.check), (1, "hc"), "{wire}");
             assert_eq!(e.message, "hc returned invalid JSON", "{wire}");
         }
+    }
+
+    #[test]
+    fn hc_protocol_list() {
+        let f = Fakes::default();
+        f.hc_install("hc");
+        answer(&f, "hc 0.1.21");
+        answer(
+            &f,
+            r#"{"terminals":[{"address":"t1","state":"live"},{"address":"t2","state":"finished"}],"hidden_finished":0}"#,
+        );
+        let c = f.ctx();
+        let h = connect(&c).unwrap();
+        assert_eq!(
+            h.ls(&[("team", "x"), ("member", "y")]).unwrap(),
+            ["t1", "t2"]
+        );
+        assert_eq!(
+            f.hc_calls()[1].1,
+            [
+                "ls", "--all", "--label", "team=x", "--label", "member=y", "--json"
+            ]
+        );
+        assert_eq!(f.hc_calls()[1].2, Duration::from_secs(15));
+        answer(&f, r#"{"terminals":[]}"#);
+        assert!(h.ls(&[]).unwrap().is_empty());
+        assert_eq!(f.hc_calls()[2].1, ["ls", "--all", "--json"]);
+    }
+
+    #[test]
+    fn hc_protocol_failures() {
+        for (code, body) in [
+            (1, "SECRET"),
+            (0, "SECRET"),
+            (0, "{}"),
+            (0, r#"{"terminals":[{"address":""}]}"#),
+            (0, "null"),
+            (0, "[]"),
+            (0, r#"{"terminals":null}"#),
+            (0, r#"{"terminals":{}}"#),
+            (0, r#"{"terminals":[{}]}"#),
+            (0, r#"{"terminals":[{"address":1}]}"#),
+            (0, r#"{"terminals":[{"address":"t1"},null]}"#),
+        ] {
+            let f = Fakes::default();
+            f.hc_install("hc");
+            answer(&f, "hc 0.1.21");
+            f.hc_answer(Ok(Out {
+                code,
+                stdout: body.into(),
+                stderr: "SECRET".into(),
+            }));
+            let c = f.ctx();
+            let e = connect(&c).unwrap().ls(&[]).unwrap_err();
+            assert_eq!((e.code, e.check), (1, "hc"));
+            assert!(!e.message.contains("SECRET"));
+            if code != 0 {
+                assert!(e.message.contains("do not retry blindly"));
+            } else {
+                assert_eq!(e.message, "hc returned invalid JSON");
+            }
+            assert_eq!(f.hc_calls().len(), 2);
+        }
+        let f = Fakes::default();
+        f.hc_install("hc");
+        answer(&f, "hc 0.1.21");
+        f.hc_answer(Err(Refusal::internal("timeout SECRET")));
+        let c = f.ctx();
+        let e = connect(&c).unwrap().kill("t1").unwrap_err();
+        assert!(e.message.contains("do not retry blindly"));
+        assert!(!e.message.contains("SECRET"));
+        assert_eq!(f.hc_calls().len(), 2);
+        for bad in [
+            serde_json::json!({}),
+            serde_json::json!({"address": "t1", "state": "unknown", "argv": [], "labels": {}}),
+            serde_json::json!({"address": "t1", "state": "live", "argv": [1], "labels": {}}),
+        ] {
+            assert!(Terminal::decode(&bad).is_err());
+        }
+        let minimal =
+            serde_json::json!({"address": "t1", "state": "live", "argv": [], "labels": {}});
+        let t = Terminal::decode(&minimal).unwrap();
+        assert_eq!(
+            (t.pid, t.foreground, t.exit_code, t.reason),
+            (None, None, None, None)
+        );
     }
 
     #[test]
