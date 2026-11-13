@@ -11,6 +11,8 @@ use crate::error::{Refusal, Res};
 pub mod board;
 pub mod copilot;
 pub mod core_facts;
+#[cfg(test)]
+pub(crate) mod core_fixture;
 pub mod core_identity;
 pub mod core_launch;
 pub mod lifecycle;
