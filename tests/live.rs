@@ -5,6 +5,10 @@
 //! `sh scripts/dev/tmux32.sh`.
 
 #[cfg(unix)]
+#[path = "support/launch_evidence.rs"]
+mod launch_evidence;
+
+#[cfg(unix)]
 mod support;
 
 #[cfg(unix)]
@@ -1897,7 +1901,14 @@ exec claude --dangerously-skip-permissions
             );
             assert_eq!(live.bars().len(), 1, "{mux:?}");
             let agent = s(&spawned["pane"]);
-            let edge = |pane: &str, format: &str| -> u32 { live.num(pane, format) };
+            let edge = |pane: &str, format: &str| -> u32 {
+                crate::launch_evidence::checked(
+                    &live.agent_dir(s(&spawned["id"])),
+                    live.dir.path(),
+                    || live.num(pane, format),
+                )
+                .unwrap_or_else(|e| panic!("{mux:?} placement {placement}: {e}"))
+            };
             assert!(
                 edge(agent, "#{pane_right}") < edge(&bar, "#{pane_left}"),
                 "{mux:?} placement {placement}: the agent is not left of the bar"
