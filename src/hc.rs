@@ -330,6 +330,18 @@ mod tests {
     }
 
     #[test]
+    fn hc_binary_does_not_repeat_lookup() {
+        let f = Fakes::default();
+        let expected = f.hc_install("herdr-core");
+        answer(&f, "hc 0.1.21");
+        let ctx = f.ctx();
+        let core = connect(&ctx).unwrap();
+        f.hc_install("hc");
+        assert_eq!(core.binary(), expected.as_path());
+        assert_eq!(f.hc_calls().len(), 1);
+    }
+
+    #[test]
     fn hc_version_order() {
         for (names, want) in [
             (&["hc", "herdr-core"][..], "hc"),
