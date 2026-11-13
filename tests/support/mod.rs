@@ -1,15 +1,18 @@
-//! The live tests' harness: a private multiplexer server per test, never the user's own.
+//! The live tests' harness: a private multiplexer server and core per test, never the user's own.
 //!
 //! - `Dir::new()` makes a short temp dir (`/tmp/mxit-<pid>-<n>`, mode 0700, canonical) with `bin/`, `home/`,
-//!   `home/.claude/sessions/`, `work/` and `tmp/`; dropping it removes everything.
+//!   `home/.claude/sessions/`, `work/` and `tmp/`; dropping it removes everything unless core stop failed.
 //! - `Server::start(mux, &dir)` runs `<mux> -S <dir>/s -f /dev/null new-session -d -x 200 -y 50 -c <dir>/work sh`
-//!   from a cleared environment: HOME=<dir>/home, PATH=<dir>/bin:<PATH>, TMPDIR=<dir>/tmp, MUX_IT_DIR=<dir>,
-//!   MUX_IT_ENTRY=<the mux-agent binary>, plus USER, LOGNAME and LANG when set. So no TMUX, RMUX, MUX_AGENTS_STATE,
-//!   XDG_STATE_HOME or CLAUDE_*/COPILOT_* of the caller's own session reaches a pane. `<dir>/bin` holds `claude` and
-//!   `copilot`, copies of the fake-client binary. A mux that is not installed is skipped with a message (None),
-//!   unless MUX_AGENTS_LIVE_REQUIRE (`tmux,tmux32,rmux`, any subset) names it: then the test fails instead.
-//! - Every later call is `<mux> -S <socket> -N …`. Dropping the server (or `kill`) snapshots every descendant of the
-//!   server, writes `<dir>/quit`, kills the server, waits for its pid to go (SIGKILL after 5 s), waits for each
+//!   from a cleared environment supplied by `PrivateCore`: private HOME/XDG/HC endpoint variables,
+//!   PATH=<dir>/bin:<PATH>, TMPDIR=<dir>/tmp, MUX_IT_DIR=<dir>, MUX_IT_ENTRY=<the mux-agent binary>, plus selected
+//!   account/runtime variables. No TMUX, RMUX, MUX_AGENTS_STATE or CLAUDE_*/COPILOT_* of the caller's own session
+//!   reaches a pane. `<dir>/bin` holds `claude` and `copilot`, copies of the fake-client binary. A mux that is not
+//!   installed is skipped with a message (None), unless MUX_AGENTS_LIVE_REQUIRE (`tmux,tmux32,rmux`, any subset)
+//!   names it: then the test fails instead.
+//! - Core stop is attempted before mux/lock cleanup; failure keeps only the fixture folder for evidence and is
+//!   reported after mux cleanup.
+//!   Every later mux call is `<mux> -S <socket> -N …`. Dropping the server (or `kill`) snapshots every descendant of
+//!   the server, writes `<dir>/quit`, kills the server, waits for its pid to go (SIGKILL after 5 s), waits for each
 //!   descendant to go (SIGKILL, same start only, after 5 s), removes the socket, then removes the lock files whose
 //!   keys name this server (`<passwd home>/.local/state/mux-agents/locks/<hex>.lock`; mux-agent never removes one).
 //!   Only keys built from this server's own key are touched, so no other lock is. The server's pid is trusted only
@@ -17,6 +20,8 @@
 //! - Files the harness waits on are written whole: shell lines write `<name>.tmp` and `mv` it into place, and the fake
 //!   client renames its files into place.
 #![allow(dead_code)]
+
+pub mod private_core;
 
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
@@ -142,12 +147,15 @@ impl Dir {
 
 impl Drop for Dir {
     fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
+        if !self.join("core-stop-failed").exists() {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
     }
 }
 
-/// A running private server; killed on drop, so a failing test leaves none behind.
+/// A running private server; killed on drop even when core stop fails and retains the fixture folder.
 pub struct Server {
+    pub core: Option<private_core::PrivateCore>,
     mux: Mux,
     bin: PathBuf,
     dir: PathBuf,
@@ -192,6 +200,12 @@ impl Server {
             path.push(":");
             path.push(rest);
         }
+        let mut core = private_core::PrivateCore::new(
+            private_core::PrivateCore::installed(),
+            dir.path(),
+            &path,
+        );
+        core.start();
         let mut start = Command::new(&bin);
         start
             .arg("-S")
@@ -208,20 +222,11 @@ impl Server {
                 "-c",
             ])
             .arg(dir.join("work"))
-            .arg("sh")
-            .env_clear()
-            .env("HOME", dir.join("home"))
-            .env("PATH", path)
-            .env("TMPDIR", dir.join("tmp"))
-            .env("MUX_IT_DIR", dir.path())
-            .env("MUX_IT_ENTRY", env!("CARGO_BIN_EXE_mux-agent"));
-        for keep in ["USER", "LOGNAME", "LANG"] {
-            if let Some(value) = std::env::var_os(keep) {
-                start.env(keep, value);
-            }
-        }
+            .arg("sh");
+        core.apply(&mut start);
         let out = start.output().unwrap();
         let mut server = Server {
+            core: Some(core),
             mux,
             bin,
             dir: dir.path().to_path_buf(),
@@ -603,6 +608,7 @@ impl Server {
         if self.killed {
             return;
         }
+        let core_stopped = self.core.as_mut().is_none_or(|core| core.stop());
         self.killed = true;
         let sessions = self.sessions();
         // A pid whose start is not the one recorded at `start` (or was never readable) is another process: its tree
@@ -627,6 +633,17 @@ impl Server {
         let _ = std::fs::remove_file(&self.socket);
         // Only once nothing of this server can hold or take a lock.
         let left = self.remove_locks(&sessions);
+        if !core_stopped {
+            let message = format!(
+                "private core stop failed; fixture kept at {}",
+                self.dir.display()
+            );
+            if std::thread::panicking() {
+                eprintln!("{message}");
+            } else {
+                panic!("{message}");
+            }
+        }
         if !left.is_empty() && !std::thread::panicking() {
             panic!("{:?}: lock files left: {left:?}", self.mux);
         }
@@ -845,6 +862,7 @@ fn teardown_never_signals_a_reused_server_pid() {
     for recorded in [Some(gone_start), None] {
         let dir = Dir::new();
         let mut server = Server {
+            core: None,
             mux: Mux::Tmux38,
             // Answers every call with exit 1, as a server that is gone does.
             bin: PathBuf::from("/usr/bin/false"),
