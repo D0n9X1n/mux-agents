@@ -582,6 +582,31 @@ pub fn capture_hc(
     })
 }
 
+pub fn stop_hc(ctx: &Ctx, request: &Request) -> Res<Map<String, Value>> {
+    let caller = resolve(ctx)?;
+    let id = super::member_target::named(ctx, &caller, first(request))?;
+    let record = super::member_target::current(ctx, &caller, &id)?;
+    parent_or_human(&caller, &record)?;
+    registry::with_member_notice(ctx, &caller, &id.id, || {
+        let core = crate::hc::connect(ctx)?;
+        core.kill(&id.address)?;
+        let fact = core.get(&id.address).ok().filter(|t| id.matches(t));
+        use super::lifecycle::{Life, classify};
+        let life = match classify(fact.as_ref(), &id.launcher) {
+            Life::Running => "running",
+            Life::Lost => "lost",
+            Life::Ended => "ended",
+            Life::Unknown => "unknown",
+        };
+        add_notice(ctx, &caller, &id.id, &record, Notice::Stopped)?;
+        let mut reply = Map::new();
+        reply.insert("name".into(), id.name.clone().into());
+        reply.insert("hcAddress".into(), id.address.clone().into());
+        reply.insert("life".into(), life.into());
+        Ok(reply)
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
