@@ -53,3 +53,18 @@ fn failure_contains_launch_artifacts() {
     assert!(err.contains("unavailable"));
     assert_eq!(launch_evidence::checked(&folder, &t.0, || 23).unwrap(), 23);
 }
+
+#[test]
+fn bar_geometry_reads_include_agent_evidence() {
+    let source = include_str!("live.rs");
+    let start = source
+        .find("    fn bar_opens_at_right_edge_from_any_pane(")
+        .unwrap();
+    let body = &source[start..source[start..].find("    fn damage(").unwrap() + start];
+    assert!(
+        body.contains("launch_evidence::checked("),
+        "bar geometry bypasses launch evidence"
+    );
+    assert!(body.contains("live.agent_dir(s(&spawned[\"id\"]))"));
+    assert!(body.contains("live.dir.path()"));
+}
