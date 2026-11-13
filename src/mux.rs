@@ -221,6 +221,18 @@ impl RealMux {
         let Some(endpoint) = endpoint(&ctx.env, crate::state::root::HOST) else {
             return refuse(1, "endpoint", not_inside(env_kind(&ctx.env)));
         };
+        Self::connect_endpoint(ctx, endpoint, version_timeout)
+    }
+
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "Core worker routing follows in Task 2")
+    )]
+    pub(crate) fn for_member(ctx: &Ctx, endpoint: Endpoint) -> Res<RealMux> {
+        Self::connect_endpoint(ctx, endpoint, VERSION_TIMEOUT)
+    }
+
+    fn connect_endpoint(ctx: &Ctx, endpoint: Endpoint, version_timeout: Duration) -> Res<RealMux> {
         let image = ctx.os.row(endpoint.server_pid).and_then(|row| row.path);
         let rmux_set = ctx.env.get("RMUX").is_some_and(|v| !v.is_empty());
         let (bin, kind) = binary(image.as_deref(), rmux_set, ctx.env.get("PATH"))?;
@@ -726,6 +738,31 @@ fn main() {
 
     fn argv(items: &[&str]) -> Vec<String> {
         items.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn member_mux_uses_record_socket_and_server_image_without_tmux() {
+        for (name, version) in [("tmux", "tmux 3.4"), ("rmux", "rmux 0.10")] {
+            let d = TempDir::new();
+            let bin = fake_mux(d.path(), name, version);
+            let f = Fakes::default();
+            let mut c = ctx_for(&f, Some(&bin), "TMUX", "");
+            c.env = Env::default();
+            let m = RealMux::for_member(
+                &c,
+                Endpoint {
+                    socket: SOCKET.into(),
+                    server_pid: 900,
+                },
+            )
+            .unwrap();
+            assert_eq!(m.kind().name(), name);
+            assert_eq!(
+                split(&m.run(&["-N", "list-panes"]).unwrap().stdout),
+                [argv(&["-S", SOCKET, "-N", "list-panes"])]
+            );
+            assert!(m.run(&["list-panes"]).is_err());
+        }
     }
 
     #[test]
