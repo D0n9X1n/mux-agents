@@ -24,3 +24,6 @@ pub mod state;
 #[cfg(test)]
 pub(crate) mod testing;
 pub mod util;
+
+#[cfg(test)]
+mod caller_hc_tests;

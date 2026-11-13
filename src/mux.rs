@@ -224,10 +224,6 @@ impl RealMux {
         Self::connect_endpoint(ctx, endpoint, version_timeout)
     }
 
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "Core worker routing follows in Task 2")
-    )]
     pub(crate) fn for_member(ctx: &Ctx, endpoint: Endpoint) -> Res<RealMux> {
         Self::connect_endpoint(ctx, endpoint, VERSION_TIMEOUT)
     }

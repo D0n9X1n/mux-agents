@@ -5,6 +5,9 @@ use crate::error::{Refusal, Res};
 use crate::parse::Client;
 use crate::proc::Row;
 
+#[path = "caller_hc.rs"]
+pub(crate) mod hc;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Kind {
     Agent,
@@ -24,7 +27,7 @@ pub struct Caller {
     pub kind: Kind,
     pub client: Option<Client>,
     pub agent: Option<Agent>,
-    /// The walked rows, the caller's own first and the pane's last; argv included, so it never leaves memory.
+    /// The walked rows, caller first and pane or core terminal process last; argv stays in memory.
     pub chain: Vec<Row>,
     pub pane: String,
     pub window: String,
@@ -108,6 +111,20 @@ fn caller_refusal(code: u8, message: &str) -> Refusal {
 /// Refuses 1 `endpoint` for an unusable endpoint, pane or probe, 1 `caller` when the caller is not below its pane
 /// or its agent's start is unreadable or changed, and 2 `caller` for a non-shell in between.
 pub fn resolve(ctx: &Ctx) -> Res<Caller> {
+    if hc::applies(ctx) {
+        let c = hc::resolve(ctx)?;
+        if ctx.mux.borrow().is_none() {
+            let mux = crate::mux::RealMux::for_member(
+                ctx,
+                crate::mux::Endpoint {
+                    socket: c.socket.clone(),
+                    server_pid: c.server_pid,
+                },
+            )?;
+            *ctx.mux.borrow_mut() = Some(Box::new(mux));
+        }
+        return Ok(c);
+    }
     let not_inside = || endpoint_refusal(&crate::mux::not_inside(crate::mux::env_kind(&ctx.env)));
     let endpoint =
         crate::mux::endpoint(&ctx.env, crate::state::root::HOST).ok_or_else(not_inside)?;
