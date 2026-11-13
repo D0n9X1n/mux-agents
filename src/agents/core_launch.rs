@@ -7,7 +7,8 @@ use crate::{
 };
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
-pub(crate) struct Prepared {
+/// Prepared input for the launch transaction the spawn adapter calls in b23-B.
+pub struct Prepared {
     pub folder: PathBuf,
     pub record: Value,
     pub argv: Vec<String>,
@@ -17,7 +18,8 @@ fn field<'a>(v: &'a Value, k: &str) -> Res<&'a str> {
         .and_then(Value::as_str)
         .ok_or_else(|| Refusal::internal("invalid prepared identity"))
 }
-pub(crate) fn execute(
+/// The launch transaction the spawn adapter calls in b23-B.
+pub fn execute(
     ctx: &Ctx,
     prepare: impl FnOnce() -> Res<Prepared>,
     attach: impl FnOnce(&Core<'_>, &Prepared, &mut Option<Created>) -> Res<()>,

@@ -622,7 +622,7 @@ fn plain_token(value: &str) -> bool {
 
 /// The new pane as its creation reply names it.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct Created {
+pub struct Created {
     pub pane: String,
     pub window: String,
     // `#{pane_start_command}`, as the multiplexer renders it; may be empty.
