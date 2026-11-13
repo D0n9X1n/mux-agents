@@ -53,11 +53,43 @@ mod tests {
         let mut cases = vec![
             (wire("live", Value::Null, json!(launcher)), Life::Running),
             (
+                wire("live", json!("exited"), json!(launcher)),
+                Life::Running,
+            ),
+            (
+                wire(
+                    "live",
+                    Value::Null,
+                    json!(["/bin/mux-agent", "launcher", "/s/other.json"]),
+                ),
+                Life::Unknown,
+            ),
+            (
+                wire("live", Value::Null, json!(["/bin/mux-agent", "launcher"])),
+                Life::Unknown,
+            ),
+            (
+                wire(
+                    "live",
+                    Value::Null,
+                    json!(["/bin/mux-agent", "launcher", "/s/spec.json", "extra"]),
+                ),
+                Life::Unknown,
+            ),
+            (
                 wire(
                     "live",
                     Value::Null,
                     json!(["/other/mux-agent", "launcher", "/s/spec.json"]),
                 ),
+                Life::Unknown,
+            ),
+            (
+                wire("live", Value::Null, json!(["/bin/zsh", "-c"])),
+                Life::Unknown,
+            ),
+            (
+                wire("live", Value::Null, json!(["/bin/sh", "/x/run.sh"])),
                 Life::Unknown,
             ),
             (
@@ -71,6 +103,10 @@ mod tests {
             (wire("live", Value::Null, json!([])), Life::Unknown),
             (
                 wire("finished", json!("exited"), json!(launcher)),
+                Life::Ended,
+            ),
+            (
+                wire("finished", json!("exited"), json!(["/bin/zsh", "-l"])),
                 Life::Ended,
             ),
             (wire("finished", json!("killed"), json!([])), Life::Ended),
@@ -139,5 +175,20 @@ mod tests {
             assert_eq!(f.hc_calls().len(), 2);
             assert_eq!(f.hc_calls()[1].1, ["get", "t1", "--json"]);
         }
+        let live_with_empty_argv = Terminal {
+            address: "t1".into(),
+            state: State::Live,
+            reason: None,
+            exit_code: None,
+            argv: Vec::new(),
+            foreground: None,
+            labels: Default::default(),
+            pid: None,
+        };
+        assert_eq!(
+            classify(Some(&live_with_empty_argv), &[]),
+            Life::Unknown,
+            "{live_with_empty_argv:?}"
+        );
     }
 }
