@@ -214,3 +214,72 @@ fn hc_reap_delivery_failure_is_retryable() {
         w.fakes.hc_done().unwrap();
     }
 }
+#[test]
+fn hc_reap_stop_contention() {
+    fn until(ready: impl Fn() -> bool) {
+        let end = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !ready() {
+            assert!(std::time::Instant::now() < end, "contention timeout");
+            std::thread::yield_now();
+        }
+    }
+    for stop_first in [false, true] {
+        let w = World::human("");
+        let c = w.caller();
+        let s = observed(&w, "exited");
+        let gate = std::sync::Arc::new(crate::testing::Gate::default());
+        let key = crate::agents::lock_key("member", &c, ID);
+        let root = w.ctx.state_root.clone();
+        w.fakes.share_locks(gate.clone());
+        std::thread::scope(|scope| {
+            let stop = scope.spawn(|| {
+                let mut other = World::human("");
+                other.ctx.state_root = root;
+                other.fakes.share_locks(gate.clone());
+                let c = other.caller();
+                if stop_first {
+                    let (g, k) = (gate.clone(), key.clone());
+                    other.fakes.lock_probe(move |e| {
+                        if e == format!("+{k}") {
+                            until(|| g.waiting(&k) > 0);
+                        }
+                        String::new()
+                    });
+                } else {
+                    until(|| gate.held(&key));
+                }
+                with_member_notice(&other.ctx, &c, ID, || {
+                    let r = record(&other.ctx, &c, ID)?.unwrap();
+                    add_notice(&other.ctx, &c, ID, &r, Notice::Stopped)
+                })
+                .unwrap();
+                other.fakes.hc_done().unwrap();
+            });
+            if stop_first {
+                until(|| gate.held(&key));
+            } else {
+                let (g, k) = (gate.clone(), key.clone());
+                w.fakes.lock_probe(move |e| {
+                    if e == format!("+{k}") {
+                        until(|| g.waiting(&k) > 0);
+                    }
+                    String::new()
+                });
+            }
+            reap_hc(&w.ctx, &c, &s).unwrap();
+            stop.join().unwrap();
+        });
+        assert_eq!(gate.waited(&key), 1);
+        let n = read_json(&w.folder(ID).join("notice.json"))
+            .unwrap()
+            .unwrap();
+        let m = messages(&w);
+        assert_eq!(m.len(), 1);
+        assert_eq!(n["kind"], if stop_first { "stopped" } else { "exited" });
+        assert_eq!(
+            (&m[0]["kind"], &m[0]["exitCode"]),
+            (&n["kind"], &n["exitCode"])
+        );
+        w.fakes.hc_done().unwrap();
+    }
+}

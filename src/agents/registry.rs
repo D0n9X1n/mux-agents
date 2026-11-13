@@ -2261,24 +2261,29 @@ pub fn reap_hc(ctx: &Ctx, caller: &Caller, snapshot: &super::membership::Snapsho
             _ => continue,
         };
         let id = &o.identity.id;
-        acted |= super::lock(ctx, &super::lock_key("member", caller, id), || {
-            super::lock(ctx, &super::lock_key("notice", caller, id), || {
-                let Some(record) = record(ctx, caller, id)? else {
-                    return Ok(false);
-                };
-                if super::core_identity::Identity::read(
-                    &record,
-                    id,
-                    &super::membership::team(caller),
-                )
+        acted |= with_member_notice(ctx, caller, id, || {
+            let Some(record) = record(ctx, caller, id)? else {
+                return Ok(false);
+            };
+            if super::core_identity::Identity::read(&record, id, &super::membership::team(caller))
                 .as_ref()
-                    != Some(&o.identity)
-                {
-                    return Ok(false);
-                }
-                add_notice(ctx, caller, id, &record, notice)
-            })
+                != Some(&o.identity)
+            {
+                return Ok(false);
+            }
+            add_notice(ctx, caller, id, &record, notice)
         })?;
     }
     Ok(acted)
+}
+/// Shared hc reap/B2 stop order. Caller must hold neither lock.
+pub fn with_member_notice<T>(
+    ctx: &Ctx,
+    caller: &Caller,
+    id: &str,
+    f: impl FnOnce() -> Res<T>,
+) -> Res<T> {
+    super::lock(ctx, &super::lock_key("member", caller, id), || {
+        super::lock(ctx, &super::lock_key("notice", caller, id), f)
+    })
 }
