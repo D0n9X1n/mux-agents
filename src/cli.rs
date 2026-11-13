@@ -1008,7 +1008,30 @@ mod tests {
             &["send", "worker", "-Body", "hi"],
             0,
         );
-        record(&agents_world(), "read", &["read"], 0);
+        let w = agents_world();
+        let a = crate::agents::core_fixture::member(&w, ID, json!({}));
+        let b = crate::agents::core_fixture::member(
+            &w,
+            "bbbbbbbbbbbb",
+            json!({"name":"gone","pane":"%8"}),
+        );
+        crate::agents::core_fixture::online(&w);
+        crate::agents::core_fixture::listing(
+            &w,
+            &crate::agents::membership::team(&w.caller()),
+            &[],
+        );
+        crate::agents::core_fixture::get(
+            &w,
+            "taaaaaaaaaaaa",
+            crate::agents::core_fixture::wire(&a),
+        );
+        crate::agents::core_fixture::get(
+            &w,
+            "tbbbbbbbbbbbb",
+            crate::agents::core_fixture::wire(&b),
+        );
+        record(&w, "read", &["read"], 0);
         let w = agents_world();
         crate::agents::core_fixture::member(&w, ID, json!({}));
         let mut row = crate::agents::fixture::row_of("%9|@5|300||", &[]);
@@ -1546,5 +1569,43 @@ fn named_read_dispatch_is_guarded_and_never_reattaches() {
                 .any(|a| a[1] == "new-window" || a[1] == "split-window")
         );
         assert!(!w.folder(ID).join("notice.json").exists());
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn mailbox_hc_dispatch_keeps_json_and_text_order() {
+    use crate::agents::{
+        core_fixture as cf,
+        fixture::{ID, World},
+        membership,
+    };
+    for (text, want) in [
+        (
+            false,
+            r#"{"ok":true,"verb":"read","messages":[{"id":"exit-aaaaaaaaaaaa","from":"worker","pane":"%9","at":"2026-10-29T12:00:00.0000000Z","text":"[mux-agent from worker (%9) #exit-aaaaaaaaaaaa]\nworker exited with code 7."}]}"#,
+        ),
+        (
+            true,
+            "exit-aaaaaaaaaaaa  worker  %9  2026-10-29T12:00:00.0000000Z  [mux-agent from worker (%9) #exit-aaaaaaaaaaaa]\nworker exited with code 7.",
+        ),
+    ] {
+        let w = World::human("");
+        w.clock("2026-10-29T12:00:00.0000000Z");
+        let r = cf::member(&w, ID, serde_json::json!({}));
+        w.panes(&[]);
+        let mut t = cf::wire(&r);
+        t["state"] = "finished".into();
+        t["reason"] = "exited".into();
+        t["exit_code"] = 7.into();
+        cf::online(&w);
+        cf::listing(&w, &membership::team(&w.caller()), &[]);
+        cf::get(&w, "taaaaaaaaaaaa", t);
+        let mut args = vec!["read".to_string()];
+        if text {
+            args.push("-Text".into());
+        }
+        assert_eq!(run(&args, || Ok(&w.ctx)), (0, want.into()));
+        w.fakes.hc_done().unwrap();
     }
 }

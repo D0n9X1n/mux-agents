@@ -7,7 +7,7 @@ use std::time::{Duration, SystemTime};
 use serde_json::{Map, Value, json};
 
 use super::mail::{add_mail, doing_line, message_text, read_mail};
-use super::registry::{self, Notice, add_notice, reap, self_of};
+use super::registry::{self, Notice, add_notice, self_of};
 use super::view::first;
 use super::{FILES_ONLY, lock, lock_key, pane_id, server_dir, text, usage};
 use crate::caller::{Kind, resolve};
@@ -176,9 +176,9 @@ pub fn read(ctx: &Ctx, request: &Request) -> Res<Map<String, Value>> {
         reply.insert("text".into(), tail.into());
         return Ok(reply);
     }
-    // One snapshot names the reader and serves the first reap.
-    let snapshot = registry::Snapshot::take(ctx, &caller)?;
-    let me = self_of(&caller, &snapshot)?;
+    // One membership snapshot names the reader and serves the first reconciliation.
+    let snapshot = super::membership::Snapshot::take(ctx, &caller)?;
+    let me = snapshot.reader(&caller)?;
     // Removed on every return, mail, timeout or error, when this guard drops.
     let _waiting = match &me.record {
         Some(_) if wait > 0 => Waiting::start(ctx, &caller, &me.key),
@@ -187,7 +187,11 @@ pub fn read(ctx: &Ctx, request: &Request) -> Res<Map<String, Value>> {
     let deadline = ctx.clock.now() + Duration::from_secs(wait as u64);
     let mut first_pass = Some(snapshot);
     let messages = loop {
-        reap(ctx, &caller, first_pass.take().as_ref(), false)?;
+        let snapshot = match first_pass.take() {
+            Some(snapshot) => snapshot,
+            None => super::membership::Snapshot::take(ctx, &caller)?,
+        };
+        registry::reap_hc(ctx, &caller, &snapshot)?;
         let messages = read_mail(ctx, &caller, &me.key)?;
         if !messages.is_empty() || ctx.clock.now() >= deadline {
             break messages;
@@ -553,6 +557,9 @@ mod tests {
                 &["send", "worker", "-Body", "x"],
                 &["read"],
             ] {
+                if args[0] == "read" {
+                    poll(&w, &[]);
+                }
                 assert_eq!(
                     run(&w, args_handler(args[0]), args),
                     refused,
@@ -785,6 +792,7 @@ mod tests {
         for wait in ["0", "600", "+5", " 7 ", "-0"] {
             w.recipients_live();
             run(&w, send, &["send", "%1", "-Body", "m"]);
+            poll(&w, &[]);
             let reply = run(&w, read, &["read", "-Wait", wait]);
             assert!(reply.contains("\\nm\""), "{wait:?} {reply}");
         }
@@ -903,6 +911,9 @@ mod tests {
     fn read_wait_polls_500ms_until_deadline() {
         let w = World::human("");
         w.state();
+        for _ in 0..7 {
+            poll(&w, &[]);
+        }
         assert_eq!(
             run(&w, read, &["read", "-Wait", "3"]),
             r#"ok {"messages":[]}"#
@@ -921,6 +932,9 @@ mod tests {
             }
             String::new()
         });
+        for _ in 0..3 {
+            poll(&w, &[]);
+        }
         let reply = run(&w, read, &["read", "-Wait", "600"]);
         assert!(reply.contains(r#"\nlate""#), "{reply}");
         assert_eq!(w.fakes.slept(), [500, 500]);
@@ -972,6 +986,11 @@ mod tests {
         let mine = format!(r#"{{"pid":4242,"start":2000,"since":"{SINCE}"}}"#);
         // A timeout: written under the agent lock before the first poll, there at every poll, gone after.
         let w = waiting_world();
+        let r = cf::member(
+            &w,
+            ID,
+            json!({"pane":"%1","window":"@1","parentPane":"%4","startCommand":launch_command("%1")}),
+        );
         other_wait(&w);
         let file = w.folder(ID).join("waiting-4242.json");
         let seen = Rc::new(RefCell::new(Vec::new()));
@@ -982,6 +1001,9 @@ mod tests {
                 .push(std::fs::read_to_string(&probe).ok())
         });
         let agent = lock_key("agent", &w.caller(), ID);
+        for _ in 0..3 {
+            poll(&w, &[cf::wire(&r)]);
+        }
         w.fakes.clear_log();
         assert_eq!(
             run(&w, read, &["read", "-Wait", "1"]),
@@ -999,6 +1021,11 @@ mod tests {
 
         // Mail ends the wait and the file goes.
         let w = waiting_world();
+        let r = cf::member(
+            &w,
+            ID,
+            json!({"pane":"%1","window":"@1","parentPane":"%4","startCommand":launch_command("%1")}),
+        );
         let mailbox = w.state().join("mail").join(format!("{ID}.jsonl"));
         let file = w.folder(ID).join("waiting-4242.json");
         let probe = file.clone();
@@ -1010,24 +1037,45 @@ mod tests {
             )
             .unwrap();
         });
+        for _ in 0..2 {
+            poll(&w, &[cf::wire(&r)]);
+        }
         let reply = run(&w, read, &["read", "-Wait", "600"]);
         assert!(reply.contains(r#"\ngo""#), "{reply}");
         assert_eq!(waiting_names(&w), Vec::<String>::new());
 
         // A failed mail read or a failed notice pass (the reap's pane list) removes it too.
         let w = waiting_world();
+        let r = cf::member(
+            &w,
+            ID,
+            json!({"pane":"%1","window":"@1","parentPane":"%4","startCommand":launch_command("%1")}),
+        );
+        poll(&w, &[cf::wire(&r)]);
         w.fakes.lock_timeout("mail|");
         assert!(run(&w, read, &["read", "-Wait", "5"]).starts_with("2 lock"));
         assert_eq!(waiting_names(&w), Vec::<String>::new());
         let w = waiting_world();
+        let r = cf::member(
+            &w,
+            ID,
+            json!({"pane":"%1","window":"@1","parentPane":"%4","startCommand":launch_command("%1")}),
+        );
+        poll(&w, &[cf::wire(&r)]);
         w.fakes.mux_first("list-panes", 1, "", "down");
         assert!(run(&w, read, &["read", "-Wait", "5"]).starts_with("1 "));
         assert_eq!(waiting_names(&w), Vec::<String>::new());
 
         // -Wait 0 never waits, so it marks nothing.
         let w = waiting_world();
+        let r = cf::member(
+            &w,
+            ID,
+            json!({"pane":"%1","window":"@1","parentPane":"%4","startCommand":launch_command("%1")}),
+        );
         let agent = lock_key("agent", &w.caller(), ID);
         w.fakes.clear_log();
+        poll(&w, &[cf::wire(&r)]);
         run(&w, read, &["read"]);
         assert!(!w.fakes.locks().iter().any(|l| l.contains(&agent)));
 
@@ -1035,6 +1083,9 @@ mod tests {
         let w = World::human("");
         w.state();
         w.fakes.sleep_probe(|_| {});
+        for _ in 0..3 {
+            poll(&w, &[]);
+        }
         run(&w, read, &["read", "-Wait", "1"]);
         let agents = w.state().join("agents");
         assert_eq!(std::fs::read_dir(agents).unwrap().count(), 0);
@@ -1351,6 +1402,197 @@ mod tests {
             let last = calls.last().unwrap();
             assert_eq!(last[1], "delete-buffer", "{failing} {calls:?}");
             assert!(last[3].starts_with("mux-agents-"), "{failing}");
+        }
+    }
+
+    fn poll(w: &World, terminals: &[Value]) {
+        cf::online(w);
+        cf::listing(w, &super::super::membership::team(&w.caller()), &[]);
+        for t in terminals {
+            cf::get(w, t["address"].as_str().unwrap(), t.clone());
+        }
+    }
+    #[test]
+    fn mailbox_read_reconciles_one_hc_snapshot_without_pane_authority() {
+        for mode in ["running", "exited", "killed", "lost", "unknown"] {
+            let w = World::human("");
+            let r = cf::member(&w, ID, json!({}));
+            write(&w.folder(ID).join("launcher.json"), json!({"exitCode":99}));
+            let mut t = cf::wire(&r);
+            match mode {
+                "exited" | "killed" => {
+                    t["state"] = json!("finished");
+                    t["reason"] = json!(mode);
+                    t["exit_code"] = json!(7);
+                }
+                "lost" => t["argv"] = json!(["/bin/sh"]),
+                "unknown" => t["labels"]["mux.gen"] = json!("1"),
+                _ => {}
+            }
+            w.panes(&[]);
+            let notice = w.folder(ID).join("notice.json");
+            for round in 0..2 {
+                poll(&w, std::slice::from_ref(&t));
+                w.fakes.clear_log();
+                let result = read(&w.ctx, &w.request(&["read"])).unwrap();
+                let messages = result["messages"].as_array().unwrap();
+                let ended = ["exited", "killed"].contains(&mode);
+                assert_eq!(
+                    messages.len(),
+                    usize::from(ended && round == 0),
+                    "{mode}/{round}"
+                );
+                if let Some(message) = messages.first() {
+                    assert_eq!(
+                        message["text"],
+                        if mode == "exited" {
+                            "[mux-agent from worker (%9) #exit-aaaaaaaaaaaa]\nworker exited with code 7."
+                        } else {
+                            "[mux-agent from worker (%9) #exit-aaaaaaaaaaaa]\nworker was stopped."
+                        }
+                    );
+                    let n = read_json(&notice).unwrap().unwrap();
+                    assert_eq!(
+                        n["kind"],
+                        if mode == "exited" {
+                            "exited"
+                        } else {
+                            "stopped"
+                        }
+                    );
+                    assert_eq!(
+                        n["exitCode"],
+                        if mode == "exited" {
+                            json!(7)
+                        } else {
+                            Value::Null
+                        }
+                    );
+                }
+                assert_eq!(notice.exists(), ended, "{mode}");
+                assert_eq!(mux_verbs(&w), ["display-message", "list-panes"], "{mode}");
+                assert_eq!(
+                    w.fakes
+                        .hc_calls()
+                        .iter()
+                        .map(|(_, a, _)| a[0].clone())
+                        .collect::<Vec<_>>(),
+                    ["--version", "ls", "get"]
+                );
+                w.fakes.hc_done().unwrap();
+            }
+        }
+    }
+    #[test]
+    fn mailbox_wait_refreshes_once_per_poll_and_reads_terminal_notice() {
+        let w = World::human("");
+        let r = cf::member(&w, ID, json!({}));
+        w.panes(&[]);
+        let live = cf::wire(&r);
+        let mut ended = live.clone();
+        ended["state"] = json!("finished");
+        ended["reason"] = json!("exited");
+        ended["exit_code"] = json!(7);
+        poll(&w, &[live]);
+        poll(&w, &[ended]);
+        w.fakes.clear_log();
+        let result = read(&w.ctx, &w.request(&["read", "-Wait", "3"])).unwrap();
+        assert_eq!(result["messages"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            result["messages"][0]["text"],
+            "[mux-agent from worker (%9) #exit-aaaaaaaaaaaa]\nworker exited with code 7."
+        );
+        assert_eq!(w.fakes.slept(), [500]);
+        assert_eq!(
+            w.fakes
+                .mux_calls()
+                .iter()
+                .filter(|a| a[1] == "list-panes")
+                .count(),
+            2
+        );
+        assert_eq!(w.fakes.hc_calls().len(), 6);
+        w.fakes.hc_done().unwrap();
+    }
+    #[test]
+    fn mailbox_wait_drops_marker_on_reconciliation_errors() {
+        for mode in ["corrupt-record", "notice-lock"] {
+            let w = waiting_world();
+            let r = cf::member(
+                &w,
+                ID,
+                json!({"pane":"%1","window":"@1","parentPane":"%4","startCommand":launch_command("%1")}),
+            );
+            let folder = w.folder(ID);
+            let waiting = folder.join("waiting-4242.json");
+            if mode == "corrupt-record" {
+                poll(&w, &[cf::wire(&r)]);
+                w.fakes.sleep_probe(move |_| {
+                    assert!(waiting.is_file());
+                    std::fs::write(folder.join("record.json"), "{").unwrap();
+                });
+            } else {
+                let child = cf::member(&w, "bbbbbbbbbbbb", json!({"name":"child","pane":"%9"}));
+                let mut ended = cf::wire(&child);
+                ended["state"] = json!("finished");
+                ended["reason"] = json!("exited");
+                poll(&w, &[cf::wire(&r), ended]);
+                w.fakes.lock_timeout("notice|");
+            }
+            let e = read(&w.ctx, &w.request(&["read", "-Wait", "1"])).unwrap_err();
+            assert_eq!(
+                (e.code, e.check),
+                if mode == "corrupt-record" {
+                    (1, "internal")
+                } else {
+                    (2, "lock")
+                }
+            );
+            assert!(waiting_names(&w).is_empty());
+            w.fakes.hc_done().unwrap();
+        }
+    }
+    #[test]
+    fn mailbox_root_reads_existing_mail_during_core_failure() {
+        for mode in ["missing", "ls-error", "get-error"] {
+            let w = World::human("");
+            let r = cf::member(&w, ID, json!({}));
+            w.panes(&[]);
+            let c = w.caller();
+            add_mail(&w.ctx, &c, "pane-1", "parent", "%2", "keep", None).unwrap();
+            if mode != "missing" {
+                cf::online(&w);
+                if mode == "ls-error" {
+                    w.fakes.hc_expect(
+                        &[
+                            "ls",
+                            "--all",
+                            "--label",
+                            "mux.managed=1",
+                            "--label",
+                            &format!("mux.team={}", super::super::membership::team(&c)),
+                            "--json",
+                        ],
+                        Err(Refusal::internal("ls failed")),
+                    );
+                } else {
+                    cf::listing(&w, &super::super::membership::team(&c), &[]);
+                    w.fakes.hc_expect(
+                        &["get", r["hcAddress"].as_str().unwrap(), "--json"],
+                        Err(Refusal::internal("get failed")),
+                    );
+                }
+            }
+            let reply = read(&w.ctx, &w.request(&["read"])).unwrap();
+            assert_eq!(reply["messages"].as_array().unwrap().len(), 1);
+            assert!(
+                reply["messages"][0]["text"]
+                    .as_str()
+                    .unwrap()
+                    .ends_with("\nkeep")
+            );
+            assert!(!w.folder(ID).join("notice.json").exists());
+            w.fakes.hc_done().unwrap();
         }
     }
 }
