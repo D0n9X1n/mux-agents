@@ -1,5 +1,5 @@
 //! The pane launcher, `mux-agent launcher <spec.json>` (mux-agent-launcher.ps1, MuxAgents.ps1:1593-1671): waits
-//! for the launch commit, runs the client once in this pane, records its exit code and posts one `exited` notice.
+//! for the launch commit, runs the client once in this pane, records its exit code; only the legacy form posts an `exited` notice.
 
 use std::io;
 use std::path::{Component, Path};
@@ -48,7 +48,7 @@ pub fn launcher(ctx: &Ctx, spec: &str, scoped: bool) -> i32 {
         use std::io::Write;
         let _ = writeln!(io::stderr(), "{line}");
     };
-    run(ctx, spec, &mut err, &mut |path, args, remove| {
+    run(ctx, spec, scoped, &mut err, &mut |path, args, remove| {
         let overrides = launch_overrides(scoped, ctx)?;
         crate::spawn::attached_env(
             path,
@@ -77,7 +77,13 @@ fn launch_overrides(scoped: bool, ctx: &Ctx) -> io::Result<Vec<(&'static str, St
     ])
 }
 
-pub(crate) fn run(ctx: &Ctx, spec: &str, err: &mut dyn FnMut(&str), start: Start) -> i32 {
+pub(crate) fn run(
+    ctx: &Ctx,
+    spec: &str,
+    scoped: bool,
+    err: &mut dyn FnMut(&str),
+    start: Start,
+) -> i32 {
     let given = Path::new(spec);
     // Only a spec.json inside the state root, its path already canonical (no link on the way), is read.
     if !given.is_absolute()
@@ -120,7 +126,9 @@ pub(crate) fn run(ctx: &Ctx, spec: &str, err: &mut dyn FnMut(&str), start: Start
         }
     };
     // The exit notice for the parent; a stop that already posted one wins.
-    let _ = post_exited(ctx, folder, code);
+    if !scoped {
+        let _ = post_exited(ctx, folder, code);
+    }
     code
 }
 
@@ -440,6 +448,7 @@ mod tests {
         let code = run(
             &l.w.ctx,
             spec,
+            false,
             &mut |line: &str| err.push(line.to_string()),
             &mut |path: &Path, args: &[String], remove: &[&str]| {
                 started.push((
@@ -666,18 +675,24 @@ mod tests {
     fn generation_adversarial_active() {
         let l = setup("claude", json!([]));
         let mut seen = false;
-        let code = run(&l.w.ctx, &spec_str(&l), &mut |_| {}, &mut |_, _, _| {
-            seen = true;
-            let before = std::fs::read(l.folder.join("launcher.json")).unwrap();
-            let duplicate = launch(&l, &spec_str(&l), exits_7);
-            assert!(duplicate.started.is_empty());
-            assert_eq!(
-                std::fs::read(l.folder.join("launcher.json")).unwrap(),
-                before
-            );
-            assert!(mail(&l).is_empty());
-            Ok(7)
-        });
+        let code = run(
+            &l.w.ctx,
+            &spec_str(&l),
+            false,
+            &mut |_| {},
+            &mut |_, _, _| {
+                seen = true;
+                let before = std::fs::read(l.folder.join("launcher.json")).unwrap();
+                let duplicate = launch(&l, &spec_str(&l), exits_7);
+                assert!(duplicate.started.is_empty());
+                assert_eq!(
+                    std::fs::read(l.folder.join("launcher.json")).unwrap(),
+                    before
+                );
+                assert!(mail(&l).is_empty());
+                Ok(7)
+            },
+        );
         assert!(seen);
         assert_eq!(code, 7);
         assert_eq!(mail(&l).len(), 1);
@@ -1087,7 +1102,7 @@ mod tests {
     }
 
     #[test]
-    fn exited_notice_unless_stopped() {
+    fn legacy_exited_notice_unless_stopped() {
         let l = setup("claude", json!([]));
         assert_eq!(launch(&l, &spec_str(&l), exits_7).code, 7);
         assert_eq!(notice_kind(&l), "exited");
@@ -1130,7 +1145,7 @@ mod tests {
     // and the marker it writes says what the one message says.
     #[cfg(unix)]
     #[test]
-    fn exited_after_a_stop_whose_marker_failed_keeps_stopped() {
+    fn legacy_exited_after_a_stop_whose_marker_failed_keeps_stopped() {
         use std::os::unix::fs::PermissionsExt;
         let l = setup("claude", json!([]));
         let caller = l.w.caller();
@@ -1162,7 +1177,7 @@ mod tests {
 
     // A reap that posted `lost` first wins over the launcher's later `exited`: one message, one marker.
     #[test]
-    fn exited_after_reap_posts_nothing_new() {
+    fn legacy_exited_after_reap_posts_nothing_new() {
         let l = setup("claude", json!([]));
         l.w.fakes.mux_first("#{pane_id}|#{@agent-id}", 0, "|\n", "");
         crate::agents::registry::reap(&l.w.ctx, &l.w.caller(), None, false).unwrap();
@@ -1185,7 +1200,7 @@ mod tests {
     // thread, and the one that holds the lock first keeps it until the other is waiting for it. Whichever holds it
     // first posts; the other waits and posts nothing. One message, one marker, and they agree.
     #[test]
-    fn exited_and_reap_contend_for_the_notice_lock() {
+    fn legacy_exited_and_reap_contend_for_the_notice_lock() {
         for reap_first in [true, false] {
             let label = if reap_first {
                 "reap first"
@@ -1257,6 +1272,86 @@ mod tests {
                 (&notice["kind"], &notice["exitCode"]),
                 "{label}: the message and the marker disagree"
             );
+        }
+    }
+
+    #[test]
+    fn scoped_launcher_leaves_notices_to_reap() {
+        for scoped in [false, true] {
+            for case in [
+                "exit",
+                "start-error",
+                "no-args",
+                "timeout",
+                "abort",
+                "missing-client",
+            ] {
+                let l = setup(
+                    "claude",
+                    if case == "no-args" {
+                        Value::Null
+                    } else {
+                        json!([])
+                    },
+                );
+                if case == "timeout" {
+                    std::fs::remove_file(l.folder.join("commit.json")).unwrap();
+                }
+                if case == "abort" {
+                    write(&l.folder.join("abort.json"), json!({}));
+                }
+                if case == "missing-client" {
+                    std::fs::remove_file(l.bin.join(exe_name("claude"))).unwrap();
+                }
+                let mut starts = 0;
+                let code = run(
+                    &l.w.ctx,
+                    &spec_str(&l),
+                    scoped,
+                    &mut |_| {},
+                    &mut |_, _, _| {
+                        starts += 1;
+                        if case == "start-error" {
+                            Err(io::Error::other("no exec"))
+                        } else {
+                            Ok(7)
+                        }
+                    },
+                );
+                assert_eq!(code, if case == "exit" { 7 } else { 1 });
+                assert_eq!(
+                    l.w.fakes.slept(),
+                    if case == "timeout" {
+                        vec![250; 120]
+                    } else {
+                        vec![]
+                    }
+                );
+                assert_eq!(launcher_json(&l)["exitCode"], code);
+                assert_eq!(starts, usize::from(["exit", "start-error"].contains(&case)));
+                assert_eq!(l.folder.join("notice.json").exists(), !scoped);
+                assert_eq!(mail(&l).len(), usize::from(!scoped));
+                assert_eq!(
+                    read_json(&l.folder.join("gens/0.claim")).unwrap(),
+                    Some(json!("run"))
+                );
+                let before = std::fs::read(l.folder.join("launcher.json")).unwrap();
+                assert_eq!(
+                    run(
+                        &l.w.ctx,
+                        &spec_str(&l),
+                        scoped,
+                        &mut |_| {},
+                        &mut |_, _, _| panic!("duplicate")
+                    ),
+                    0
+                );
+                assert_eq!(
+                    std::fs::read(l.folder.join("launcher.json")).unwrap(),
+                    before
+                );
+                l.w.fakes.hc_done().unwrap();
+            }
         }
     }
 }
