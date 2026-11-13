@@ -917,7 +917,7 @@ exec claude --dangerously-skip-permissions
     }
 
     // spawn writes server.json, record.json, spec.json and last commit.json, tags the pane, and its launcher (the
-    // pane's process) runs the PATH client with the record's session.
+    // core-owned process) runs the PATH client with the record's session.
     fn spawn_tags_pane_writes_record_and_commit_runs_client(mux: Mux) {
         let Some(mut live) = Live::human(mux) else {
             return;
@@ -1005,10 +1005,7 @@ exec claude --dangerously-skip-permissions
             argv[5]
         );
         assert_eq!(client["cwd"], live.path("work"), "{mux:?}");
-        let pane_pid: u64 = live.num(pane, "#{pane_pid}");
-        assert_eq!(client["ppid"], pane_pid, "{mux:?}");
-        let launcher = json_file(&folder.join("launcher.json"));
-        assert_eq!(launcher["pid"], pane_pid, "{mux:?}");
+        let launcher = core_launcher(&live, &w1, &client);
         assert!(launcher["start"].is_i64(), "{mux:?} {launcher}");
         let (code, list) = live.run(&["list"]);
         assert_eq!(
@@ -1018,8 +1015,21 @@ exec claude --dangerously-skip-permissions
         );
     }
 
-    // Each worker is the PATH claude, forked from the caller's session, the pane's own process's child, in its own
-    // terminal.
+    fn core_launcher(live: &Live, w: &Value, client: &Value) -> Value {
+        let launcher = json_file(&live.agent_dir(s(&w["id"])).join("launcher.json"));
+        assert_eq!(client["ppid"], launcher["pid"]);
+        assert_ne!(
+            launcher["pid"],
+            live.num::<u64>(s(&w["pane"]), "#{pane_pid}")
+        );
+        assert_eq!(
+            core(live, &["get", s(&w["hcAddress"]), "--json"])["pid"],
+            launcher["pid"]
+        );
+        launcher
+    }
+
+    // Each worker is the PATH claude, forked from the caller's session, with a core-owned launcher and PTY.
     fn worker_is_path_claude_forked_own_tty(mux: Mux) {
         let Some(mut live) = Live::agent(mux) else {
             return;
@@ -1062,12 +1072,10 @@ exec claude --dangerously-skip-permissions
                 "{mux:?}"
             );
             let pane = s(&w["pane"]);
-            let pane_pid: u64 = live.num(pane, "#{pane_pid}");
-            assert_eq!(client["ppid"], pane_pid, "{mux:?}");
-            let launcher = json_file(&live.agent_dir(s(&w["id"])).join("launcher.json"));
-            assert_eq!(launcher["pid"], pane_pid, "{mux:?}");
+            let launcher = core_launcher(&live, &w, &client);
             let tty = tty_of(client["pid"].as_u64().unwrap());
-            assert_eq!(tty, live.field(pane, "#{pane_tty}"), "{mux:?}");
+            assert_eq!(tty, tty_of(launcher["pid"].as_u64().unwrap()));
+            assert_ne!(tty, live.field(pane, "#{pane_tty}"));
             ttys.push(tty);
         }
         let distinct: BTreeSet<&String> = ttys.iter().collect();
@@ -1334,14 +1342,8 @@ exec claude --dangerously-skip-permissions
         let at = Instant::now();
         assert_eq!(code, 0, "{mux:?} {stop}");
         assert_eq!(
-            (&stop["name"], &stop["survivors"], &stop["survivorPids"]),
-            (&json!("w1"), &json!(0), &json!([])),
-            "{mux:?}"
-        );
-        assert_eq!(
-            stop["resume"],
-            format!("claude --resume {}", s(&w1["sessionId"])),
-            "{mux:?}"
+            stop,
+            json!({"ok":true,"verb":"stop","name":w1["name"],"hcAddress":w1["hcAddress"],"life":"ended"})
         );
         let (code, reply) = live.server.job_wait(job, LONG);
         let took = at.elapsed();
@@ -1355,7 +1357,11 @@ exec claude --dangerously-skip-permissions
             "{mux:?}: the reader took {took:?} after stop"
         );
         let (code, stop) = live.run(&["stop", "w2"]);
-        assert_eq!((code, &stop["survivors"]), (0, &json!(0)), "{mux:?} {stop}");
+        assert_eq!(
+            stop,
+            json!({"ok":true,"verb":"stop","name":w2["name"],"hcAddress":w2["hcAddress"],"life":"ended"})
+        );
+        assert_eq!(code, 0);
         let (code, read) = live.run(&["read", "-Wait", "30"]);
         assert_eq!(
             (code, bodies(&read)),
@@ -1364,22 +1370,19 @@ exec claude --dangerously-skip-permissions
         );
     }
 
-    // stop closes each pane and leaves no process of it unaccounted for: no quit file, no kill bypass. w1's worker
-    // has a child that outlives the pane (its own session, SIGHUP ignored), so kill-pane's hangup never ends it and
-    // only stop's tree walk can. With a pidfd (Linux) stop kills it and reports no survivor. Without one (macOS) the
-    // proc layer never signals a pid (MacOs::kill, pinned in src/proc/macos.rs), so stop must report it as the one
-    // survivor, and it is still there.
+    // Stop ends core-owned launchers and clients; attachment views disappear without a pane kill or quit file.
+    // The detached Unix child remains fixture-owned and is cleaned up by its Sentinels guard.
     fn stop_leaves_no_surviving_process(mux: Mux) {
         let Some(mut live) = Live::human(mux) else {
             return;
         };
-        let (mut pids, mut panes) = (Vec::new(), Vec::new());
+        let (mut pids, mut workers) = (Vec::new(), Vec::new());
         for (name, extra) in [("w1", &[][..]), ("w2", &["-Split", "h"][..])] {
             let w = live.spawn(name, extra);
             pids.push(live.worker_pid(&w) as u32);
             let launcher = json_file(&live.agent_dir(s(&w["id"])).join("launcher.json"));
             pids.push(launcher["pid"].as_u64().unwrap() as u32);
-            panes.push(s(&w["pane"]).to_string());
+            workers.push(w);
         }
         let worker = u64::from(pids[0]);
         let (code, detached) = live.server.command(worker, &["@detach"]);
@@ -1396,45 +1399,31 @@ exec claude --dangerously-skip-permissions
             worker,
             "{mux:?}: not the worker's child"
         );
-        for name in ["w1", "w2"] {
-            let (code, stop) = live.run(&["stop", name]);
-            assert_eq!(code, 0, "{mux:?} {stop}");
-            let survivors = if name == "w1" && cfg!(target_os = "macos") {
-                json!([child])
-            } else {
-                json!([])
-            };
+        for w in &workers {
+            let (code, stop) = live.run(&["stop", s(&w["name"])]);
+            assert_eq!(code, 0, "{stop}");
             assert_eq!(
-                (&stop["survivors"], &stop["survivorPids"]),
-                (&json!(survivors.as_array().unwrap().len()), &survivors),
-                "{mux:?} {name}"
+                stop,
+                json!({"ok":true,"verb":"stop","name":w["name"],"hcAddress":w["hcAddress"],"life":"ended"})
             );
+            assert!(eventually(LONG, || core(
+                &live,
+                &["get", s(&w["hcAddress"]), "--json"]
+            )["state"]
+                == "finished"));
+            live.wait_gone(s(&w["pane"]));
         }
-        let child_left = || support::alive(child) && support::start_of(child) == child_start;
-        if cfg!(target_os = "macos") {
-            assert!(
-                child_left(),
-                "{mux:?}: stop signalled a pid without a pidfd"
-            );
-        } else {
-            eventually(Duration::from_secs(10), || !child_left());
-            assert!(!child_left(), "{mux:?}: the child outlived stop");
-        }
-        for pane in &panes {
-            live.wait_gone(pane);
-        }
-        eventually(Duration::from_secs(10), || {
-            !pids.iter().any(|p| support::alive(*p))
-        });
-        let left: Vec<u32> = pids
+        assert!(eventually(LONG, || !pids
             .iter()
-            .copied()
-            .filter(|p| support::alive(*p))
-            .collect();
-        assert_eq!(pids.len(), 4, "{mux:?}");
-        assert_eq!(left, Vec::<u32>::new(), "{mux:?}: survivors of {pids:?}");
-        assert!(!live.dir.join("quit").exists(), "{mux:?}");
-        assert!(live.tagged().is_empty(), "{mux:?}");
+            .any(|p| support::alive(*p))));
+        assert!(
+            live.tagged().is_empty(),
+            "live agent view tags survived stop"
+        );
+        assert!(!live.dir.join("quit").exists());
+        for pid in pids.iter().copied().chain([child]) {
+            assert!(!live.dir.join(format!("quit.{pid}")).exists());
+        }
     }
 
     // A client that exits posts one `exited` notice with its code.
@@ -2845,7 +2834,8 @@ exec claude --dangerously-skip-permissions
         );
     }
 
-    // Through every verb, mux-agent starts only the multiplexer and the clients.
+    // Through every verb, mux-agent starts only the multiplexer, core CLI, and clients.
+    // Core launcher argv and the mux-owned attachment command are checked separately from the spawn audit.
     fn children_are_only_mux_and_client(mux: Mux) {
         let Some(mut live) = Live::human(mux) else {
             return;
@@ -2855,6 +2845,17 @@ exec claude --dangerously-skip-permissions
         assert_eq!(code, 0, "{mux:?} {w2}");
         live.worker_pid(&w1);
         live.worker_pid(&w2);
+        for w in [&w1, &w2] {
+            let r = json_file(&live.agent_dir(s(&w["id"])).join("record.json"));
+            assert_eq!(
+                core(&live, &["get", s(&w["hcAddress"]), "--json"])["argv"],
+                r["launcherArgv"]
+            );
+            assert_eq!(
+                live.field(s(&w["pane"]), "#{pane_start_command}"),
+                s(&r["startCommand"])
+            );
+        }
         std::fs::write(live.dir.join("to-w1.txt"), "hello w1").unwrap();
         let body = live.path("to-w1.txt");
         for args in [
@@ -2884,7 +2885,20 @@ exec claude --dangerously-skip-permissions
                     .into_owned()
             })
             .collect();
-        let allowed = ["tmux", "rmux", "claude", "copilot", "fake-client"];
+        let command = live.server.core.as_ref().unwrap().command(&[]);
+        let hc_name = Path::new(command.get_program())
+            .file_name()
+            .unwrap()
+            .to_string_lossy();
+        let allowed = [
+            "tmux",
+            "rmux",
+            "claude",
+            "copilot",
+            "fake-client",
+            hc_name.as_ref(),
+        ];
+        assert!(names.contains(&hc_name.to_string()));
         assert!(
             names.iter().all(|n| allowed.contains(&n.as_str())),
             "{mux:?}: {names:?}"
@@ -3787,7 +3801,16 @@ exec claude --dangerously-skip-permissions
 
         // stop w1 closes only w1's pane.
         let (code, stop) = live.run_in(&clean, &["stop", "w1"]);
-        assert_eq!((code, &stop["pane"]), (0, &json!(p1)), "{mux:?} {stop}");
+        assert_eq!(code, 0);
+        assert_eq!(
+            stop,
+            json!({"ok":true,"verb":"stop","name":"w1","hcAddress":w1["hcAddress"],"life":"ended"})
+        );
+        assert!(eventually(LONG, || core(
+            &live,
+            &["get", s(&w1["hcAddress"]), "--json"]
+        )["state"]
+            == "finished"));
         live.wait_gone(&p1);
         let panes = live.panes("#{pane_id}");
         for pane in [&root, &p2, &clean] {
