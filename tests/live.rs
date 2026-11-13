@@ -3978,3 +3978,88 @@ fn private_core_unix() {
         );
     }
 }
+
+#[cfg(unix)]
+#[test]
+fn private_core_stop_failure_kills_mux_and_keeps_evidence() {
+    check_private_core_stop_failure(false);
+}
+
+#[cfg(unix)]
+#[test]
+fn private_core_stop_failure_during_unwind_kills_mux_and_keeps_evidence() {
+    check_private_core_stop_failure(true);
+}
+
+#[cfg(unix)]
+fn check_private_core_stop_failure(unwinding: bool) {
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+
+    struct KillOnUnwind<'a>(&'a mut Server);
+    impl Drop for KillOnUnwind<'_> {
+        fn drop(&mut self) {
+            self.0.kill();
+        }
+    }
+
+    for mux in Mux::ALL {
+        let dir = Dir::new();
+        let Some(mut server) = Server::start(mux, &dir) else {
+            continue;
+        };
+        server.send_keys("claude");
+        let client = server.wait_client()["pid"].as_u64().unwrap() as u32;
+        let pid = server.pid();
+        let path = dir.path().to_path_buf();
+        // Stop the real private core before injecting a genuine command-spawn failure.
+        assert!(server.core.as_mut().unwrap().stop());
+        let mut failed = support::private_core::PrivateCore::new(
+            dir.join("missing-core"),
+            dir.path(),
+            &std::env::var_os("PATH").unwrap(),
+        );
+        assert!(catch_unwind(AssertUnwindSafe(|| failed.start())).is_err());
+        server.core = Some(failed);
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            if unwinding {
+                let _guard = KillOnUnwind(&mut server);
+                panic!("fixture failure");
+            }
+            server.kill();
+        }));
+        let mux_gone = !support::alive(pid);
+        let client_gone = !support::alive(client);
+        // Recover even against the old early-return teardown before making assertions.
+        server.core = None;
+        server.kill();
+        drop(server);
+        drop(dir);
+        let kept = path.is_dir() && path.join("core-stop-failed").is_file();
+        std::fs::remove_dir_all(&path).unwrap();
+
+        assert!(
+            mux_gone,
+            "{mux:?} unwinding={unwinding}: mux survived failed core stop"
+        );
+        assert!(
+            client_gone,
+            "{mux:?} unwinding={unwinding}: client survived failed core stop"
+        );
+        assert!(kept, "{mux:?}: evidence folder was removed");
+        let panic = result.expect_err("failed core stop must report its failure");
+        let message = panic
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| panic.downcast_ref::<&str>().copied())
+            .unwrap();
+        let expected = if unwinding {
+            "fixture failure".to_string()
+        } else {
+            format!(
+                "private core stop failed; fixture kept at {}",
+                path.display()
+            )
+        };
+        assert_eq!(message, expected);
+    }
+}

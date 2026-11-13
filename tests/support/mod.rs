@@ -9,7 +9,8 @@
 //!   reaches a pane. `<dir>/bin` holds `claude` and `copilot`, copies of the fake-client binary. A mux that is not
 //!   installed is skipped with a message (None), unless MUX_AGENTS_LIVE_REQUIRE (`tmux,tmux32,rmux`, any subset)
 //!   names it: then the test fails instead.
-//! - Core stop precedes mux/lock cleanup; a failed core stop keeps the fixture for evidence.
+//! - Core stop is attempted before mux/lock cleanup; failure keeps only the fixture folder for evidence and is
+//!   reported after mux cleanup.
 //!   Every later mux call is `<mux> -S <socket> -N …`. Dropping the server (or `kill`) snapshots every descendant of
 //!   the server, writes `<dir>/quit`, kills the server, waits for its pid to go (SIGKILL after 5 s), waits for each
 //!   descendant to go (SIGKILL, same start only, after 5 s), removes the socket, then removes the lock files whose
@@ -152,7 +153,7 @@ impl Drop for Dir {
     }
 }
 
-/// A running private server; killed on drop unless core stop fails and retains the fixture.
+/// A running private server; killed on drop even when core stop fails and retains the fixture folder.
 pub struct Server {
     pub core: Option<private_core::PrivateCore>,
     mux: Mux,
@@ -607,14 +608,7 @@ impl Server {
         if self.killed {
             return;
         }
-        if let Some(core) = &mut self.core
-            && !core.stop()
-        {
-            if std::thread::panicking() {
-                return;
-            }
-            panic!("private core stop failed; retain fixture");
-        }
+        let core_stopped = self.core.as_mut().is_none_or(|core| core.stop());
         self.killed = true;
         let sessions = self.sessions();
         // A pid whose start is not the one recorded at `start` (or was never readable) is another process: its tree
@@ -639,6 +633,17 @@ impl Server {
         let _ = std::fs::remove_file(&self.socket);
         // Only once nothing of this server can hold or take a lock.
         let left = self.remove_locks(&sessions);
+        if !core_stopped {
+            let message = format!(
+                "private core stop failed; fixture kept at {}",
+                self.dir.display()
+            );
+            if std::thread::panicking() {
+                eprintln!("{message}");
+            } else {
+                panic!("{message}");
+            }
+        }
         if !left.is_empty() && !std::thread::panicking() {
             panic!("{:?}: lock files left: {left:?}", self.mux);
         }

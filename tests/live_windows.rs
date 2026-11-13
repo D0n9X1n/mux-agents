@@ -218,18 +218,27 @@ impl Live {
 
 impl Drop for Live {
     fn drop(&mut self) {
-        if !self.core.stop() {
-            if std::thread::panicking() {
-                return;
-            }
-            panic!("private core stop failed; retain fixture");
-        }
+        let core_stopped = self.core.stop();
         // The fake clients quit when this file appears; then the server and its panes go.
         let _ = std::fs::write(self.dir.join("quit"), "");
         std::thread::sleep(Duration::from_millis(500));
         let _ = Command::new("rmux")
             .args(["-L", &self.socket, "kill-server"])
             .output();
+        if !core_stopped {
+            let message = format!(
+                "private core stop failed; fixture kept at {}",
+                self.dir.display()
+            );
+            if std::thread::panicking() {
+                eprintln!("{message}");
+                return;
+            }
+            panic!("{message}");
+        }
+        if self.dir.join("core-stop-failed").exists() {
+            return;
+        }
         for _ in 0..20 {
             if std::fs::remove_dir_all(&self.dir).is_ok() || !self.dir.exists() {
                 return;
