@@ -8,6 +8,9 @@
 //! with RMUX_ALLOW_INTERNAL_DAEMON_IN_CALLER_JOB=1, since a release rmux 0.10.0 cannot start its daemon inside a
 //! runner's job object (rmux#238).
 
+#[path = "support/private_core.rs"]
+mod private_core;
+
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -21,21 +24,9 @@ const WAIT: Duration = Duration::from_secs(60);
 const MUX_AGENT: &str = env!("CARGO_BIN_EXE_mux-agent");
 // The pane's mouse reporting, as the multiplexer tracks it: `11` once the bar wrote ENABLE, `00` after DISABLE.
 const MOUSE: &str = "#{mouse_any_flag}#{mouse_sgr_flag}";
-// Variables of the caller's own session that must not reach the private server.
-const SCRUB: [&str; 9] = [
-    "RMUX",
-    "TMUX",
-    "TMUX_PANE",
-    "MUX_AGENTS_STATE",
-    "MUX_AGENTS_ASCII",
-    "CLAUDECODE",
-    "CLAUDE_CODE_SESSION_ID",
-    "CLAUDE_CODE_ENTRYPOINT",
-    "COPILOT_AGENT_SESSION_ID",
-];
-
 /// One test's server and temp dir; dropping it ends the fake clients, kills the server and removes the dir.
 struct Live {
+    core: private_core::PrivateCore,
     socket: String,
     dir: PathBuf,
     root: String,
@@ -83,6 +74,9 @@ impl Live {
             path.push(";");
             path.push(rest);
         }
+        let mut core =
+            private_core::PrivateCore::new(private_core::PrivateCore::installed(), &dir, &path);
+        core.start();
         let mut start = Command::new("rmux");
         start.args([
             "-L",
@@ -96,20 +90,17 @@ impl Live {
             "-y",
             "50",
         ]);
-        for (name, value) in [
-            ("MUX_AGENTS_STATE", dir.join("state").into_os_string()),
-            ("MUX_IT_DIR", dir.clone().into_os_string()),
-            ("MUX_IT_ENTRY", OsString::from(MUX_AGENT)),
-            ("PATH", path),
-        ] {
-            start.arg("-e").arg(assign(name, &value));
+        core.apply(&mut start);
+        for (name, value) in &core.env {
+            start.arg("-e").arg(assign(name, value));
         }
-        for name in SCRUB {
-            start.env_remove(name);
-        }
+        start
+            .arg("-e")
+            .arg(assign("MUX_AGENTS_STATE", dir.join("state").as_os_str()));
         let out = start.arg("cmd.exe").output().unwrap();
         // Built before the check, so a failed start still kills whatever began.
         let mut live = Live {
+            core,
             socket,
             dir,
             root: String::new(),
@@ -227,6 +218,12 @@ impl Live {
 
 impl Drop for Live {
     fn drop(&mut self) {
+        if !self.core.stop() {
+            if std::thread::panicking() {
+                return;
+            }
+            panic!("private core stop failed; retain fixture");
+        }
         // The fake clients quit when this file appears; then the server and its panes go.
         let _ = std::fs::write(self.dir.join("quit"), "");
         std::thread::sleep(Duration::from_millis(500));
@@ -410,4 +407,40 @@ fn ctrl_c_ends_a_hand_run_watch_and_gives_the_console_back() {
             .any(|l| l.trim() == "typed-after-watch")
             .then_some(())
     });
+}
+
+#[test]
+fn private_core_windows() {
+    let Some(live) = Live::start() else {
+        return;
+    };
+    let out = live.dir.join("scope.txt");
+    let done = live.dir.join("scope.done");
+    live.line(
+        &live.root,
+        &format!(
+            "set > \"{}\" & echo done> \"{}\"",
+            out.display(),
+            done.display()
+        ),
+    );
+    live.wait("private core env", || done.exists().then_some(()));
+    let env = std::fs::read_to_string(out).unwrap();
+    for (key, value) in live
+        .core
+        .env
+        .iter()
+        .filter(|(k, _)| ["HC_SOCKET", "HC_SESSION", "HOME", "XDG_CONFIG_HOME"].contains(k))
+    {
+        assert!(
+            env.lines()
+                .any(|l| l.eq_ignore_ascii_case(&format!("{key}={}", value.to_string_lossy())))
+        );
+    }
+    let d = live.dir.clone();
+    let probe = live.core.command(&["server", "stop", "--json"]);
+    drop(live);
+    std::fs::create_dir_all(&d).unwrap();
+    assert_eq!(private_core::run(probe, &d).unwrap()["stopped"], false);
+    std::fs::remove_dir_all(d).unwrap();
 }
