@@ -602,7 +602,11 @@ pub fn add_notice(
     let name = super::text(record.get("name"));
     let (kind, code, body) = match notice {
         Notice::Exited(code) => {
-            let body = format!("{name} exited with code {}.", super::text(Some(&code)));
+            let body = if code.is_null() {
+                format!("{name} exited.")
+            } else {
+                format!("{name} exited with code {}.", super::text(Some(&code)))
+            };
             ("exited", code, body)
         }
         Notice::Stopped => ("stopped", Value::Null, format!("{name} was stopped.")),
@@ -646,7 +650,7 @@ pub fn add_notice(
 fn delivered_notice(message: &Value, name: &str) -> (String, Value) {
     let code = message.get("exitCode").filter(|c| c.is_i64());
     match message.get("kind").and_then(Value::as_str) {
-        Some("exited") if code.is_some() => {
+        Some("exited") if code.is_some() || message.get("exitCode") == Some(&Value::Null) => {
             return ("exited".into(), code.cloned().unwrap_or(Value::Null));
         }
         Some(kind @ ("stopped" | "lost")) => return (kind.into(), Value::Null),
@@ -2235,3 +2239,6 @@ mod tests {
         );
     }
 }
+#[cfg(test)]
+#[path = "registry_hc_tests.rs"]
+mod hc_tests;
