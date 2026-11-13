@@ -281,6 +281,8 @@ fn attached_command(
     command
 }
 
+/// Like `attached`, with per-child overrides that never change the process environment.
+/// Removals apply after the overrides, so a name in both is absent from the child.
 pub fn attached_env(
     path: &Path,
     args: &[String],

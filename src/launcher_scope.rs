@@ -5,6 +5,8 @@ use std::path::Path;
 use crate::ctx::{Ctx, Env};
 use crate::error::{Res, refuse};
 
+/// The executable and six-argument launcher form for hc, carrying state root and PATH but no caller HC endpoints.
+/// Tests only until the hc launch path calls it in phase 1b-ii-b2.
 pub fn argv(ctx: &Ctx, file: &Path) -> Res<Vec<String>> {
     use crate::agents::spawn::utf8;
     Ok([
@@ -20,6 +22,8 @@ pub fn argv(ctx: &Ctx, file: &Path) -> Res<Vec<String>> {
     .into())
 }
 
+/// The spec from only `launcher <spec>` or `launcher <spec> --state-root <abs> --path <value>`.
+/// Matches the exact grammar; `environment` checks that the state folder is absolute.
 pub fn spec(args: &[String]) -> Option<&str> {
     match args {
         [v, s] if v == "launcher" => Some(s),
@@ -28,10 +32,13 @@ pub fn spec(args: &[String]) -> Option<&str> {
     }
 }
 
+/// Whether the arguments match exactly the six-argument launcher form with explicit state root and PATH.
 pub fn is_scoped(args: &[String]) -> bool {
     args.len() == 6 && spec(args).is_some()
 }
 
+/// The two-argument form keeps the inherited environment unchanged; the six-argument form replaces only PATH and MUX_AGENTS_STATE.
+/// A relative state folder refuses with code 1 and check `state`, as in `state::root`; malformed arguments refuse usage.
 pub fn environment(args: &[String], inherited: &Env) -> Res<Env> {
     if spec(args).is_none() {
         return refuse(2, "usage", "invalid launcher arguments");
