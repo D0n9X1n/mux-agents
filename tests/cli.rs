@@ -302,3 +302,77 @@ fn report_quiet_prints_no_byte() {
         (Some(0), Vec::new(), Vec::new())
     );
 }
+
+#[cfg(feature = "live")]
+#[test]
+fn scoped_launcher_runs_once_with_explicit_context() {
+    use serde_json::{Value, json};
+    use std::{fs, path::PathBuf};
+    struct Temp(PathBuf);
+    impl Drop for Temp {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+    let t = Temp(
+        fs::canonicalize(std::env::temp_dir())
+            .unwrap()
+            .join(format!("mux-scope-{}", mux_agent::util::hex_id().unwrap())),
+    );
+    for sub in ["bin", "work", "state/key/agents/aaaaaaaaaaaa"] {
+        fs::create_dir_all(t.0.join(sub)).unwrap();
+    }
+    let bin = t.0.join("bin");
+    let work = t.0.join("work");
+    let state = t.0.join("state");
+    let folder = state.join("key/agents/aaaaaaaaaaaa");
+    let spec = folder.join("spec.json");
+    fs::copy(
+        env!("CARGO_BIN_EXE_fake-client"),
+        bin.join(format!("claude{}", std::env::consts::EXE_SUFFIX)),
+    )
+    .unwrap();
+    fs::write(&spec, json!({"schema":1,"generation":"0","client":"claude","args":["--session-id","0f11fc2f-2032-48ef-a920-4af2a8e5af50"]}).to_string()).unwrap();
+    fs::write(folder.join("commit.json"), "{}").unwrap();
+    fs::write(t.0.join("quit"), "").unwrap();
+    let run = || {
+        Command::new(env!("CARGO_BIN_EXE_mux-agent"))
+            .args([
+                "launcher",
+                spec.to_str().unwrap(),
+                "--state-root",
+                state.to_str().unwrap(),
+                "--path",
+                bin.to_str().unwrap(),
+            ])
+            .current_dir(&work)
+            .env("MUX_AGENTS_STATE", "relative-hostile-root")
+            .env("PATH", "")
+            .env("MUX_IT_DIR", &t.0)
+            .env("MUX_IT_EXIT", "0")
+            .env_remove("MUX_AGENTS_TEST_PANIC")
+            .env_remove("TMUX")
+            .env_remove("RMUX")
+            .env_remove("TMUX_PANE")
+            .output()
+            .unwrap()
+    };
+    let first = run();
+    assert!(first.status.success(), "scoped launch failed: {first:?}");
+    assert!(folder.join("gens/0.claim").is_file());
+    let log = fs::read_to_string(t.0.join("clients.log")).unwrap();
+    let pid = log.trim();
+    let client: Value =
+        serde_json::from_slice(&fs::read(t.0.join(format!("client.{pid}.json"))).unwrap()).unwrap();
+    let state_text = state.display().to_string();
+    let work_text = work.display().to_string();
+    assert_eq!(client["env"]["MUX_AGENTS_STATE"], state_text);
+    assert_eq!(
+        client["cwd"].as_str().unwrap().trim_start_matches(r"\\?\"),
+        work_text.trim_start_matches(r"\\?\")
+    );
+    assert_eq!(client["env"]["CLAUDE_CODE_SESSION_ID"], Value::Null);
+    assert!(run().status.success());
+    assert_eq!(fs::read_to_string(t.0.join("clients.log")).unwrap(), log);
+    assert!(!folder.join("notice.json").exists());
+}

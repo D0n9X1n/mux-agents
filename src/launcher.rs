@@ -43,14 +43,38 @@ const LINK: &str = "mux-agent: the launch spec path has a junction or link";
 pub(crate) type Start<'a> = &'a mut dyn FnMut(&Path, &[String], &[&str]) -> io::Result<i32>;
 
 /// The pane's process: exit 2 for a spec it will not read, else the client's exit code (1 when it never ran).
-pub fn launcher(ctx: &Ctx, spec: &str) -> i32 {
+pub fn launcher(ctx: &Ctx, spec: &str, scoped: bool) -> i32 {
     let mut err = |line: &str| {
         use std::io::Write;
         let _ = writeln!(io::stderr(), "{line}");
     };
     run(ctx, spec, &mut err, &mut |path, args, remove| {
-        crate::spawn::attached(path, args, remove)
+        let overrides = launch_overrides(scoped, ctx)?;
+        crate::spawn::attached_env(
+            path,
+            args,
+            remove,
+            &overrides
+                .iter()
+                .map(|(k, v)| (*k, v.as_str()))
+                .collect::<Vec<_>>(),
+        )
     })
+}
+
+/// The client's environment overrides: only a scoped launch names its state root and PATH; a legacy launch adds none.
+fn launch_overrides(scoped: bool, ctx: &Ctx) -> io::Result<Vec<(&'static str, String)>> {
+    if !scoped {
+        return Ok(Vec::new());
+    }
+    let root = ctx
+        .state_root
+        .to_str()
+        .ok_or_else(|| io::Error::other("state root is not UTF-8"))?;
+    Ok(vec![
+        ("MUX_AGENTS_STATE", root.to_string()),
+        ("PATH", ctx.env.get("PATH").unwrap_or("").to_string()),
+    ])
 }
 
 pub(crate) fn run(ctx: &Ctx, spec: &str, err: &mut dyn FnMut(&str), start: Start) -> i32 {
@@ -463,6 +487,23 @@ mod tests {
         let notice: Value =
             serde_json::from_slice(&std::fs::read(l.folder.join("notice.json")).unwrap()).unwrap();
         notice["kind"].clone()
+    }
+
+    #[test]
+    fn legacy_launch_adds_no_overrides() {
+        let mut w = World::human("");
+        w.ctx.env = Env::from_pairs([("PATH", "client-path")]);
+        assert!(launch_overrides(false, &w.ctx).unwrap().is_empty());
+        assert_eq!(
+            launch_overrides(true, &w.ctx).unwrap(),
+            vec![
+                (
+                    "MUX_AGENTS_STATE",
+                    w.ctx.state_root.to_str().unwrap().to_string()
+                ),
+                ("PATH", "client-path".to_string()),
+            ]
+        );
     }
 
     // The link check's decision, as text, so the Windows rules run on every host.

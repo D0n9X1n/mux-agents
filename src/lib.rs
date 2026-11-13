@@ -12,6 +12,7 @@ pub mod error;
 pub mod hc;
 pub mod json;
 pub mod launcher;
+pub mod launcher_scope;
 pub mod mux;
 pub mod paint;
 pub mod parse;

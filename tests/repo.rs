@@ -853,6 +853,35 @@ fn ci_test_job_named_test() {
     }
 }
 
+#[test]
+fn integration_runs_cli_tests_with_fake_client() {
+    let ci = repo_file(CI);
+    for (name, before, after) in [
+        (
+            "integration",
+            "- name: Live preflight",
+            "- name: Live tests",
+        ),
+        (
+            "integration-windows",
+            "- name: Clippy with the live tests",
+            "- name: Windows live tests",
+        ),
+    ] {
+        let lines = job_lines(&ci, name);
+        let at = line_of(&lines, "- name: CLI tests that need the fake client");
+        assert_eq!(lines[at + 1], "shell: bash", "{name}");
+        assert_eq!(
+            lines[at + 2],
+            "run: cargo test --features live,test-panic --locked --test cli",
+            "{name}"
+        );
+        let previous = lines[..at].iter().rfind(|line| line.starts_with("- name:"));
+        assert_eq!(previous.map(String::as_str), Some(before), "{name}");
+        assert_eq!(lines[at + 3], after, "{name}");
+    }
+}
+
 // What each CI job runs, in order: the Rust gates and the shims on every OS, the live, release and wiki suites on
 // Linux and macOS, the scripts' lint, and a check of every release target.
 #[test]
