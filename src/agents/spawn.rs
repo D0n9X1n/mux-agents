@@ -3246,3 +3246,82 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "spawn_hc_tests.rs"]
+mod hc_tests;
+pub struct CoreRequest<'a> {
+    pub client: Client,
+    pub task: &'a str,
+    pub brief: Option<&'a str>,
+    pub directory: &'a Path,
+    pub model: Option<&'a str>,
+    pub no_fork: bool,
+    pub split: Option<&'a str>,
+}
+pub struct CoreSlot {
+    pub name: String,
+    pub color: &'static str,
+}
+pub fn launch_hc(
+    ctx: &Ctx,
+    caller: &Caller,
+    request: CoreRequest<'_>,
+    reserve: impl FnOnce(&crate::hc::Core<'_>) -> Res<CoreSlot>,
+) -> Res<Value> {
+    let core = crate::hc::connect(ctx)?;
+    lock(ctx, &lock_key("spawn", caller, &caller.session), || {
+        let slot = reserve(&core)?;
+        let launch = Launch {
+            ctx,
+            caller,
+            client: request.client,
+            requested: None,
+            model: request.model,
+            no_fork: request.no_fork,
+            task: request.task.into(),
+            brief: request.brief.map(str::to_owned),
+            directory: request.directory.into(),
+            split: request.split,
+        };
+        super::core_launch::execute_connected(
+            &core,
+            || launch.prepare_hc(slot),
+            |core, p, view| {
+                super::attachment::attach(ctx, core, caller, &p.record, request.split, view)
+            },
+            |folder| commit(ctx, folder),
+            |view| super::attachment::clean(ctx, view),
+        )
+    })
+}
+impl Launch<'_> {
+    fn prepare_hc(&self, slot: CoreSlot) -> Res<super::core_launch::Prepared> {
+        let (ctx, caller) = (self.ctx, self.caller);
+        let state = state_dir(ctx, caller)?;
+        write_json(
+            &state.join("server.json"),
+            &json!({"socket":caller.socket,"serverPid":caller.server_pid,"serverStart":caller.server_start}),
+        )?;
+        let agent = self.allocate(&state, slot.name, slot.color)?;
+        let prepare = || {
+            let spec = self.prepare(&agent)?;
+            let mut record = self.record(&agent, "", "", "")?;
+            let mut body = crate::state::fs::read_json(&spec)?
+                .ok_or_else(|| Refusal::internal("missing launch spec"))?;
+            body["generation"] = "0".into();
+            write_json(&spec, &body)?;
+            record["generation"] = "0".into();
+            record["team"] = super::membership::team(caller).into();
+            for k in ["pane", "window", "startCommand"] {
+                record.as_object_mut().unwrap().remove(k);
+            }
+            Ok(super::core_launch::Prepared {
+                folder: agent.folder.clone(),
+                record,
+                argv: crate::launcher_scope::argv(ctx, &spec)?,
+            })
+        };
+        prepare()
+    }
+}
