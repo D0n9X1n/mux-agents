@@ -8,6 +8,7 @@ use crate::caller::Caller;
 use crate::ctx::Ctx;
 use crate::error::{Refusal, Res};
 
+pub mod attachment;
 pub mod board;
 pub mod copilot;
 pub mod core_facts;

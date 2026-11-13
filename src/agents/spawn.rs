@@ -632,7 +632,7 @@ fn private_folder(ctx: &Ctx, folder: &Path) -> Res<()> {
 
 /// A value safe unquoted in a multiplexer command string: ASCII letters, digits and `- _ : % @ .` only. Agent ids,
 /// names, panes and contexts are always such tokens.
-fn plain_token(value: &str) -> bool {
+pub(crate) fn plain_token(value: &str) -> bool {
     !value.is_empty()
         && value
             .bytes()
