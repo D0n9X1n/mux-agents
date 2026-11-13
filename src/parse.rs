@@ -326,15 +326,18 @@ fn windows_file_name(path: &str) -> &str {
     path.rsplit(['/', '\\']).next().unwrap_or(path)
 }
 
-/// A Windows row's client by image name, any case (MuxAgents.ps1:200-204).
+/// A Windows row's client by image name, any case: claude.exe or copilot.exe, also when followed by `.old` and
+/// anything. An update renames the running image (claude.exe.old.<ms>.<pid>, copilot.exe.old-<pid>-<ms>), and Windows
+/// then reports that name for the client still running from it.
 pub fn windows_client(path: &str) -> Option<Client> {
-    let file = windows_file_name(path);
-    if file.eq_ignore_ascii_case("claude.exe") {
-        Some(Client::Claude)
-    } else if file.eq_ignore_ascii_case("copilot.exe") {
-        Some(Client::Copilot)
-    } else {
-        None
+    let name = windows_file_name(path).to_ascii_lowercase();
+    match name
+        .find(".exe.old")
+        .map_or(&name[..], |at| &name[..at + 4])
+    {
+        "claude.exe" => Some(Client::Claude),
+        "copilot.exe" => Some(Client::Copilot),
+        _ => None,
     }
 }
 
@@ -980,5 +983,38 @@ mod tests {
         .collect();
         assert_eq!(shells, [true, true, true, true, true, false, false, false]);
         assert!(windows_is_shell("C:\\Windows\\System32\\cmd.exe"));
+    }
+
+    #[test]
+    fn windows_client_renamed_by_update() {
+        // An update renames the running image; Windows then reports the new name for the still-running client.
+        for (path, want) in [
+            (
+                "C:\\Users\\u\\.local\\bin\\claude.exe.old.1794521471990.33184",
+                Client::Claude,
+            ),
+            ("C:\\x\\CLAUDE.EXE.OLD.1794278312805.29380", Client::Claude),
+            (
+                "C:\\x\\copilot.exe.old.1794521471990.33184",
+                Client::Copilot,
+            ),
+            ("C:\\x\\claude.exe.old.1780606666068", Client::Claude),
+            ("C:\\x\\claude.exe.old-26048", Client::Claude),
+            ("C:\\x\\copilot.exe.old", Client::Copilot),
+            ("C:\\x\\Copilot.exe.old-4860-1787948345922", Client::Copilot),
+        ] {
+            assert_eq!(windows_client(path), Some(want), "{path}");
+        }
+        // Only an update's `.old` rename of the client's own name counts.
+        for path in [
+            "C:\\x\\claude.exe.bak",
+            "C:\\x\\claude.exe.new.26048.1793146170705.ab5cc69a",
+            "C:\\x\\xclaude.exe.old",
+            "C:\\x\\claude.old.exe",
+            "C:\\x\\node.exe.old.1",
+            "C:\\x\\claude.exe.old\\pwsh.exe",
+        ] {
+            assert_eq!(windows_client(path), None, "{path}");
+        }
     }
 }
