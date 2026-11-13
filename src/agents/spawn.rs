@@ -1046,6 +1046,95 @@ mod tests {
         (w, launch)
     }
 
+    fn hc_world(w: World) -> World {
+        for verb in ["new-window", "split-window"] {
+            w.fakes.mux_first(verb, 0, "%9|@5|hc attach t1\n", "");
+        }
+        w.fakes
+            .mux_first("-t %9 #{pane_id}|#{@agent-id}", 0, "|\n", "");
+        w
+    }
+    fn hc_attempt(w: &World, client: Client, model: Option<&str>, rollback: bool) -> Res<Value> {
+        use crate::agents::core_fixture as cf;
+        let caller = w.caller();
+        cf::online(w);
+        w.fakes.hc_answer(Ok(crate::spawn::Out {
+            stdout: r#"{"address":"t1"}"#.into(),
+            ..Default::default()
+        }));
+        if rollback {
+            cf::answer(w, &["kill", "t1", "--json"], "{}");
+        }
+        let result = launch_hc(
+            &w.ctx,
+            &caller,
+            CoreRequest {
+                client,
+                task: "hi",
+                brief: Some("brief"),
+                directory: &w.ctx.cwd,
+                model,
+                no_fork: false,
+                split: None,
+            },
+            |_| {
+                Ok(CoreSlot {
+                    name: "hi".into(),
+                    color: "blue",
+                })
+            },
+        );
+        let folder = agents_dir(w).join(&agent_folders(w)[0]);
+        let spec = read_json(&folder.join("spec.json"));
+        let id = spec["id"].as_str().unwrap();
+        let team = format!("{}:{}", caller.server_key, caller.session);
+        let mut run = vec![
+            "run".into(),
+            "--bg".into(),
+            "--keep".into(),
+            "--outlive-parent".into(),
+            "--no-notify".into(),
+            "--name".into(),
+            format!("m{}", &id[..8]),
+        ];
+        for label in [
+            "mux.managed=1".into(),
+            format!("mux.team={team}"),
+            format!("mux.id={id}"),
+            "mux.gen=0".into(),
+            "mux.name=hi".into(),
+        ] {
+            run.extend(["--label".into(), label]);
+        }
+        run.extend([
+            "--cwd".into(),
+            utf8(&w.ctx.cwd).unwrap().into(),
+            "--json".into(),
+            "--".into(),
+            utf8(&w.ctx.exe).unwrap().into(),
+            "launcher".into(),
+            utf8(&folder.join("spec.json")).unwrap().into(),
+            "--state-root".into(),
+            utf8(&w.ctx.state_root).unwrap().into(),
+            "--path".into(),
+            w.ctx.env.get("PATH").unwrap_or("").into(),
+        ]);
+        let mut expected = vec![vec!["--version".to_string()], run];
+        if rollback {
+            expected.push(["kill", "t1", "--json"].map(String::from).to_vec());
+        }
+        assert_eq!(
+            w.fakes
+                .hc_calls()
+                .iter()
+                .map(|(_, a, _)| a.clone())
+                .collect::<Vec<_>>(),
+            expected
+        );
+        w.fakes.hc_done().unwrap();
+        result
+    }
+
     fn run(w: &World, args: &[&str]) -> String {
         let mut full = vec!["spawn"];
         full.extend(args);
@@ -2726,153 +2815,129 @@ mod tests {
 
     #[test]
     fn failure_after_launch_writes_abort_kills_pane() {
-        // The kill is bound to the creation reply's start command alone (the pane live or dead), and only a gone
-        // probe after it says the pane was closed.
         let kill = [
             "-N",
             "if-shell",
             "-F",
             "-t",
             "%9",
-            "#{==:#{pane_start_command},/bin/mux-agent launcher /s/spec.json}",
+            "#{==:#{pane_start_command},hc attach t1}",
             "kill-pane -t %9",
         ]
-        .map(String::from)
-        .to_vec();
-        for (gone, want) in [
-            (
-                "|\n",
-                "1 launch the agent did not start; its pane was closed",
-            ),
-            ("%9|\n", "1 launch the agent did not start"),
-            ("", "1 launch the agent did not start"),
-        ] {
-            let w = human();
-            w.fakes.mux_first("set-option", 1, "", "no pane");
+        .map(String::from);
+        for (gone, closed) in [("|\n", true), ("%9|\n", false), ("", false)] {
+            let w = hc_world(human());
+            w.fakes.mux_first("@agent-context", 1, "", "no pane");
             w.fakes
                 .mux_first("-t %9 #{pane_id}|#{@agent-id}", 0, gone, "");
+            let e = hc_attempt(&w, Client::Claude, None, true).unwrap_err();
             assert_eq!(
-                run(&w, &["-Client", "claude", "-Task", "hi"]),
-                want,
-                "{gone:?}"
+                (e.code, e.check, e.message.as_str()),
+                (1, "rmux", "tmux call failed")
             );
             let folder = agents_dir(&w).join(&agent_folders(&w)[0]);
+            let abort = read_json(&folder.join("abort.json"));
+            let mut identity = read_json(&folder.join("record.json"));
+            for k in ["pane", "window", "startCommand"] {
+                identity.as_object_mut().unwrap().remove(k);
+            }
             assert_eq!(
-                std::fs::read_to_string(folder.join("abort.json")).unwrap(),
-                r#"{"abortedAt":"1970-01-01T00:00:00.0000000Z","pane":"%9"}"#
+                abort,
+                json!({"hcAddress":"t1","identity":identity,"pane":"%9","kill":"acknowledged","viewCleanup":{"gone":closed}})
             );
-            assert!(!folder.join("record.json").exists() && !folder.join("commit.json").exists());
-            let kills: Vec<Vec<String>> = calls(&w, "if-shell")
+            assert!(folder.join("record.json").is_file());
+            assert!(!folder.join("commit.json").exists());
+            let kills: Vec<_> = calls(&w, "if-shell")
                 .into_iter()
                 .filter(|c| c[6].starts_with("kill-pane"))
                 .collect();
-            assert_eq!(kills, std::slice::from_ref(&kill), "{gone:?}");
-            assert!(calls(&w, "kill-pane").is_empty(), "{gone:?}");
+            assert_eq!(kills, [kill.to_vec()]);
+            assert!(calls(&w, "kill-pane").is_empty());
         }
-        // A reply naming the pane but no start command: never the agent's, so it is not killed and not claimed.
-        let w = human();
-        w.fakes.mux_first("new-window", 0, "%9|@5|\n", "");
-        assert_eq!(
-            run(&w, &["-Client", "claude", "-Task", "hi"]),
-            "1 launch the agent did not start"
-        );
-        let folder = agents_dir(&w).join(&agent_folders(&w)[0]);
-        assert_eq!(
-            std::fs::read_to_string(folder.join("abort.json")).unwrap(),
-            r#"{"abortedAt":"1970-01-01T00:00:00.0000000Z","pane":"%9"}"#
-        );
-        assert!(calls(&w, "if-shell").is_empty() && calls(&w, "set-option").is_empty());
-        // A failed or garbled launch names no pane: abort.json says null and nothing is killed or tagged.
-        for (code, out) in [
-            (1, "%9|@5|/bin/mux-agent launcher /s/spec.json\n"),
-            (0, ""),
-            (0, "%9|@5|/bin/mux-agent launcher /s/spec.json\n%10|@6\n"),
-            (0, "%9|@5\n"),
-            (0, "%9|@5;kill-server\n"),
-            (0, "#{pane_id}|@5|x\n"),
-            (0, "%9 |@5|x\n"),
+        for (code, out, message) in [
+            (0, "%9|@5|\n", "unexpected error (unproven new view)"),
+            (1, "%9|@5|hc attach t1\n", "tmux call failed"),
+            (0, "", "unexpected error (unproven new view)"),
+            (
+                0,
+                "%9|@5|hc attach t1\n%10|@6\n",
+                "unexpected error (unproven new view)",
+            ),
+            (0, "%9|@5\n", "unexpected error (unproven new view)"),
+            (
+                0,
+                "%9|@5;kill-server\n",
+                "unexpected error (unproven new view)",
+            ),
+            (
+                0,
+                "#{pane_id}|@5|x\n",
+                "unexpected error (unproven new view)",
+            ),
+            (0, "%9 |@5|x\n", "unexpected error (unproven new view)"),
         ] {
-            let w = human();
+            let w = hc_world(human());
             w.fakes.mux_first("new-window", code, out, "");
+            let e = hc_attempt(&w, Client::Claude, None, true).unwrap_err();
             assert_eq!(
-                run(&w, &["-Client", "claude", "-Task", "hi"]),
-                "1 launch the agent did not start",
-                "{out:?}"
+                (e.code, e.check, e.message.as_str()),
+                (1, if code == 1 { "rmux" } else { "internal" }, message)
             );
             let folder = agents_dir(&w).join(&agent_folders(&w)[0]);
+            let a = read_json(&folder.join("abort.json"));
             assert_eq!(
-                std::fs::read_to_string(folder.join("abort.json")).unwrap(),
-                r#"{"abortedAt":"1970-01-01T00:00:00.0000000Z","pane":null}"#
+                (&a["hcAddress"], &a["pane"], &a["kill"], &a["viewCleanup"]),
+                (
+                    &json!("t1"),
+                    &Value::Null,
+                    &json!("acknowledged"),
+                    &json!("unproven")
+                )
             );
-            assert!(calls(&w, "if-shell").is_empty() && calls(&w, "set-option").is_empty());
+            assert!(folder.join("record.json").is_file());
+            assert!(!folder.join("commit.json").exists());
+            assert!(calls(&w, "if-shell").is_empty());
+            assert!(calls(&w, "set-option").is_empty());
         }
-        // A CRLF line end is not garbled, and the start command may hold `|`; record.json keeps it exactly.
-        let w = human();
-        w.fakes.mux_first(
-            "new-window",
-            0,
-            "%9|@5|/b/mux|agent launcher /s/spec.json\r\n",
-            "",
-        );
-        let ok = reply(&run(&w, &["-Client", "claude", "-Task", "hi"]));
-        assert_eq!((&ok["pane"], &ok["window"]), (&json!("%9"), &json!("@5")));
-        let folder = agents_dir(&w).join(&agent_folders(&w)[0]);
+        let w = hc_world(human());
+        w.fakes
+            .mux_first("new-window", 0, "%9|@5|/b/hc|binary attach t1\r\n", "");
+        let r = hc_attempt(&w, Client::Claude, None, false).unwrap();
         assert_eq!(
-            read_json(&folder.join("record.json"))["startCommand"],
-            "/b/mux|agent launcher /s/spec.json"
+            (&r["pane"], &r["window"], &r["startCommand"]),
+            (&json!("%9"), &json!("@5"), &json!("/b/hc|binary attach t1"))
         );
-        // A Copilot fork's copy is deleted when the launch fails, and kept when it commits.
         for fail in [true, false] {
-            let mut w = agent();
-            w.fakes.client(CLAUDE, Client::Copilot);
-            let mut pairs: Vec<(String, String)> = w
-                .ctx
-                .env
-                .iter()
-                .map(|(k, v)| (k.to_string(), v.to_string()))
-                .collect();
-            pairs.push(("COPILOT_AGENT_SESSION_ID".into(), OLD.into()));
-            w.ctx.env = Env::from_pairs(pairs);
-            w.ctx.home = w.ctx.cwd.parent().unwrap().join("home");
+            let (w, _) = admitted(Client::Copilot, true);
+            let w = hc_world(w);
             let source = session_folder(&w.ctx.home, OLD);
-            std::fs::create_dir_all(&source).unwrap();
-            std::fs::write(source.join("workspace.yaml"), format!("id: {OLD}\n")).unwrap();
-            std::fs::write(
-                source.join("events.jsonl"),
-                format!("{{\"sessionId\":\"{OLD}\"}}\n"),
-            )
-            .unwrap();
             if fail {
-                w.fakes.mux_first("set-option", 1, "", "");
+                w.fakes.mux_first("@agent-context", 1, "", "bad");
             }
-            w.file("t.md", b"task");
-            let text = run(&w, &["-Client", "copilot", "-TaskFile", "t.md"]);
-            let mut sessions: Vec<String> = std::fs::read_dir(source.parent().unwrap())
-                .unwrap()
-                .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
-                .collect();
-            sessions.sort();
-            if fail {
-                assert_eq!(text, "1 launch the agent did not start");
-                assert_eq!(sessions, [OLD]);
-            } else {
-                let ok = reply(&text);
-                assert_eq!(
-                    (&ok["context"], &ok["reason"]),
-                    (&json!("fork"), &json!("same-client"))
-                );
-                let new = ok["sessionId"].as_str().unwrap();
-                assert!(sessions.contains(&new.to_string()) && sessions.len() == 2);
-                let spec = read_json(
-                    &agents_dir(&w)
-                        .join(ok["id"].as_str().unwrap())
-                        .join("spec.json"),
-                );
-                assert_eq!(
-                    spec["args"].as_array().unwrap()[..3],
-                    [json!("--resume"), json!(new), json!("-i")]
-                );
-            }
+            let got = hc_attempt(&w, Client::Copilot, None, fail);
+            assert_eq!(got.is_err(), fail);
+            let folder = agents_dir(&w).join(&agent_folders(&w)[0]);
+            let record = read_json(&folder.join("record.json"));
+            assert_eq!(
+                (&record["context"], &record["reason"]),
+                (&json!("fork"), &json!("same-client"))
+            );
+            let new = record["sessionId"].as_str().unwrap();
+            let copy = session_folder(&w.ctx.home, new);
+            assert!(copy.join("workspace.yaml").is_file());
+            assert!(copy.join("events.jsonl").is_file());
+            assert_eq!(
+                std::fs::read_dir(source.parent().unwrap()).unwrap().count(),
+                2
+            );
+            assert_eq!(
+                read_json(&folder.join("spec.json"))["args"]
+                    .as_array()
+                    .unwrap()[..3],
+                [json!("--resume"), json!(new), json!("-i")]
+            );
+            assert_eq!(crate::agents::committed(&folder), !fail);
+            assert_eq!(folder.join("abort.json").exists(), fail);
         }
     }
 
