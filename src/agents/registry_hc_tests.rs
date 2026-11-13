@@ -136,3 +136,81 @@ fn hc_reap_notices_once() {
         w.fakes.hc_done().unwrap();
     }
 }
+#[test]
+fn hc_reap_rereads_identity_under_both_locks() {
+    for key in [
+        "generation",
+        "hcAddress",
+        "team",
+        "sessionId",
+        "launcherArgv",
+        "id",
+        "name",
+        "session",
+        "removed",
+        "broken",
+        "parentPane",
+    ] {
+        let w = World::human("");
+        let c = w.caller();
+        let s = observed(&w, "exited");
+        let file = w.folder(ID).join("record.json");
+        let mut r = s.records[ID].record.clone();
+        let notice = crate::agents::lock_key("notice", &c, ID);
+        r[key] = match key {
+            "launcherArgv" => json!(["other"]),
+            "parentPane" => json!("%2"),
+            _ => json!("changed"),
+        };
+        w.fakes.lock_probe(move |event| {
+            if event == format!("+{notice}") {
+                match key {
+                    "removed" => std::fs::remove_file(&file).unwrap(),
+                    "broken" => std::fs::write(&file, "{").unwrap(),
+                    _ => write(&file, r.clone()),
+                }
+            }
+            String::new()
+        });
+        let got = reap_hc(&w.ctx, &c, &s);
+        if key == "broken" {
+            assert!(got.is_err());
+        } else {
+            assert_eq!(got.unwrap(), key == "parentPane", "stale identity {key}");
+        }
+        assert!(messages(&w).is_empty());
+        if key == "parentPane" {
+            assert!(w.state().join("mail/pane-2.jsonl").is_file());
+        }
+        w.fakes.hc_done().unwrap();
+    }
+}
+#[test]
+fn hc_reap_delivery_failure_is_retryable() {
+    for parent in ["%1", "%2"] {
+        let w = World::human("");
+        let c = w.caller();
+        let s = observed(&w, "null");
+        let mailbox = w.state().join("mail/pane-1.jsonl");
+        std::fs::create_dir(&mailbox).unwrap();
+        assert!(reap_hc(&w.ctx, &c, &s).is_err());
+        assert!(!w.folder(ID).join("notice.json").exists());
+        std::fs::remove_dir(&mailbox).unwrap();
+        let mut r = s.records[ID].record.clone();
+        r["parentPane"] = json!(parent);
+        write(&w.folder(ID).join("record.json"), r);
+        assert!(reap_hc(&w.ctx, &c, &s).unwrap());
+        assert!(!reap_hc(&w.ctx, &c, &s).unwrap());
+        assert_eq!(messages(&w).len(), usize::from(parent == "%1"));
+        if parent == "%2" {
+            assert_eq!(
+                std::fs::read_to_string(w.state().join("mail/pane-2.jsonl"))
+                    .unwrap()
+                    .lines()
+                    .count(),
+                1
+            );
+        }
+        w.fakes.hc_done().unwrap();
+    }
+}

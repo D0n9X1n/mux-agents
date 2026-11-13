@@ -2263,7 +2263,20 @@ pub fn reap_hc(ctx: &Ctx, caller: &Caller, snapshot: &super::membership::Snapsho
         let id = &o.identity.id;
         acted |= super::lock(ctx, &super::lock_key("member", caller, id), || {
             super::lock(ctx, &super::lock_key("notice", caller, id), || {
-                add_notice(ctx, caller, id, &snapshot.records[id].record, notice)
+                let Some(record) = record(ctx, caller, id)? else {
+                    return Ok(false);
+                };
+                if super::core_identity::Identity::read(
+                    &record,
+                    id,
+                    &super::membership::team(caller),
+                )
+                .as_ref()
+                    != Some(&o.identity)
+                {
+                    return Ok(false);
+                }
+                add_notice(ctx, caller, id, &record, notice)
             })
         })?;
     }
