@@ -161,7 +161,13 @@ impl Core<'_> {
         }
         a.extend(["--json".into(), "--".into()]);
         a.extend(r.argv.iter().map(|s| s.to_string()));
-        address(&self.json(&a)?)
+        let out = self.call(&a)?;
+        serde_json::from_str(&out.stdout)
+            .map_err(|_| invalid())
+            .and_then(|v| address(&v))
+            .map_err(|_| {
+                failure("hc returned invalid JSON; execution is uncertain; do not retry blindly")
+            })
     }
 
     pub fn kill(&self, t: &str) -> Res<()> {
@@ -330,11 +336,16 @@ mod tests {
     #[test]
     fn hc_version_gate() {
         for (v, ok) in [
+            ("hc 0.1.3", false),
             ("hc 0.1.20", false),
             ("hc 0.1.21", true),
+            ("hc 0.1.100", true),
             ("hc 0.10.0", true),
             ("hc 1.0.0", true),
             ("hc 0.1.21-rc.1", false),
+            ("0.1.21", false),
+            ("hc 0.1", false),
+            ("hc 0.1.21 x", false),
             ("SECRET", false),
         ] {
             let f = Fakes::default();
@@ -389,7 +400,7 @@ mod tests {
             outlive_parent: true,
             no_notify: true,
             name: Some("worker"),
-            labels: &[("team", "x")],
+            labels: &[("team", "x"), ("member", "worker")],
             cwd: Some("/a b"),
             argv: &["claude", "literal ; $()"],
         };
@@ -407,6 +418,8 @@ mod tests {
                 "worker",
                 "--label",
                 "team=x",
+                "--label",
+                "member=worker",
                 "--cwd",
                 "/a b",
                 "--json",
@@ -418,6 +431,144 @@ mod tests {
         assert_eq!(f.hc_calls()[2].1, ["kill", "t1", "--json"]);
         assert_eq!(f.hc_calls()[1].2, Duration::from_secs(15));
         assert_eq!(f.hc_calls()[2].2, Duration::from_secs(15));
+    }
+
+    #[test]
+    fn hc_run_failures() {
+        for (case, reply, message) in [
+            (
+                "transport",
+                Err(Refusal::internal("timeout SECRET")),
+                "hc call failed; execution is uncertain; do not retry blindly",
+            ),
+            (
+                "nonzero exit",
+                Ok(Out {
+                    code: 1,
+                    stdout: r#"{"address":"t1","detail":"SECRET"}"#.into(),
+                    stderr: "SECRET stderr".into(),
+                }),
+                "hc command failed; execution is uncertain; do not retry blindly",
+            ),
+            (
+                "invalid JSON",
+                Ok(Out {
+                    code: 0,
+                    stdout: "SECRET not JSON".into(),
+                    stderr: "SECRET stderr".into(),
+                }),
+                "hc returned invalid JSON; execution is uncertain; do not retry blindly",
+            ),
+            (
+                "missing address",
+                Ok(Out {
+                    code: 0,
+                    stdout: r#"{"state":"live","detail":"SECRET"}"#.into(),
+                    stderr: "SECRET stderr".into(),
+                }),
+                "hc returned invalid JSON; execution is uncertain; do not retry blindly",
+            ),
+        ] {
+            let f = Fakes::default();
+            let bin = f.hc_install("hc");
+            answer(&f, "hc 0.1.21");
+            // A retry gets the same failure, so the call log must catch it.
+            f.hc_answer(reply.clone());
+            f.hc_answer(reply);
+            let c = f.ctx();
+            let h = connect(&c).unwrap();
+            let r = Run {
+                bg: false,
+                keep: false,
+                outlive_parent: false,
+                no_notify: false,
+                name: None,
+                labels: &[],
+                cwd: None,
+                argv: &["claude"],
+            };
+            let e = h.run(&r).unwrap_err();
+            assert_eq!((e.code, e.check), (1, "hc"), "{case}");
+            assert_eq!(e.message, message, "{case}");
+            assert!(e.message.contains("uncertain"), "{case}");
+            assert!(e.message.contains("do not retry blindly"), "{case}");
+            assert!(!e.message.contains("SECRET"), "{case}");
+            assert_eq!(
+                f.hc_calls(),
+                vec![
+                    (
+                        bin.clone(),
+                        vec!["--version".into()],
+                        Duration::from_secs(5),
+                    ),
+                    (
+                        bin,
+                        vec!["run".into(), "--json".into(), "--".into(), "claude".into()],
+                        Duration::from_secs(15),
+                    ),
+                ],
+                "{case}"
+            );
+        }
+    }
+
+    #[test]
+    fn hc_run_mixed_flags() {
+        let f = Fakes::default();
+        f.hc_install("hc");
+        answer(&f, "hc 0.1.21");
+        let c = f.ctx();
+        let h = connect(&c).unwrap();
+        let mut r = Run {
+            bg: true,
+            keep: false,
+            outlive_parent: false,
+            no_notify: true,
+            name: None,
+            labels: &[],
+            cwd: None,
+            argv: &["claude"],
+        };
+        answer(&f, r#"{"address":"t1"}"#);
+        assert_eq!(h.run(&r).unwrap(), "t1");
+        assert_eq!(
+            f.hc_calls()[1].1,
+            ["run", "--bg", "--no-notify", "--json", "--", "claude"]
+        );
+        r.bg = false;
+        r.keep = true;
+        r.outlive_parent = true;
+        r.no_notify = false;
+        answer(&f, r#"{"address":"t2"}"#);
+        assert_eq!(h.run(&r).unwrap(), "t2");
+        assert_eq!(
+            f.hc_calls()[2].1,
+            [
+                "run",
+                "--keep",
+                "--outlive-parent",
+                "--json",
+                "--",
+                "claude"
+            ]
+        );
+        // Each field alone pins the two pairs' internal wiring as well.
+        for (index, flag) in ["--bg", "--keep", "--outlive-parent", "--no-notify"]
+            .into_iter()
+            .enumerate()
+        {
+            r.bg = index == 0;
+            r.keep = index == 1;
+            r.outlive_parent = index == 2;
+            r.no_notify = index == 3;
+            answer(&f, r#"{"address":"t1"}"#);
+            assert_eq!(h.run(&r).unwrap(), "t1");
+            assert_eq!(
+                f.hc_calls()[index + 3].1,
+                ["run", flag, "--json", "--", "claude"]
+            );
+        }
+        assert_eq!(f.hc_calls().len(), 7);
     }
 
     #[test]
@@ -440,11 +591,52 @@ mod tests {
         };
         assert_eq!(h.run(&r).unwrap(), "t1");
         assert_eq!(f.hc_calls()[1].1, ["run", "--json", "--", "claude"]);
-        for argv in [&[][..], &["echo secret; exit"]] {
+        for argv in [&[][..], &["echo secret; exit"], &["a|b"], &["$(x)"]] {
             r.argv = argv;
-            assert!(h.run(&r).is_err());
+            let e = h.run(&r).unwrap_err();
+            assert_eq!((e.code, e.check), (1, "hc"));
+            assert_eq!(
+                e.message,
+                if argv.is_empty() {
+                    "hc run needs argv"
+                } else {
+                    "hc run needs a literal executable, not a shell line"
+                }
+            );
         }
         assert_eq!(f.hc_calls().len(), 2);
+        r.argv = &["/usr/local/bin/claude"];
+        answer(&f, r#"{"address":"t2"}"#);
+        assert_eq!(h.run(&r).unwrap(), "t2");
+        assert_eq!(
+            f.hc_calls()[2].1,
+            ["run", "--json", "--", "/usr/local/bin/claude"]
+        );
+        assert_eq!(f.hc_calls().len(), 3);
+    }
+
+    #[test]
+    fn hc_get_rejects_malformed_terminal() {
+        for body in [
+            r#"{"address":"t1","state":"live","labels":{},"detail":"SECRET"}"#,
+            r#"{"address":"t1","state":"live","argv":"SECRET","labels":{}}"#,
+        ] {
+            let f = Fakes::default();
+            f.hc_install("hc");
+            answer(&f, "hc 0.1.21");
+            f.hc_answer(Ok(Out {
+                code: 0,
+                stdout: body.into(),
+                stderr: "SECRET stderr".into(),
+            }));
+            let c = f.ctx();
+            let e = connect(&c).unwrap().get("t1").unwrap_err();
+            assert_eq!((e.code, e.check), (1, "hc"));
+            assert_eq!(e.message, "hc returned invalid JSON");
+            assert!(!e.message.contains("SECRET"));
+            assert_eq!(f.hc_calls().len(), 2);
+            assert_eq!(f.hc_calls()[1].1, ["get", "t1", "--json"]);
+        }
     }
 
     #[test]
