@@ -3917,7 +3917,7 @@ exec claude --dangerously-skip-permissions
             stop,
             json!({"ok":true,"verb":"stop","name":"w1","hcAddress":address,"life":"ended"})
         );
-        assert!(eventually(Duration::from_secs(10), || core(
+        assert!(eventually(LONG, || core(
             &live,
             &["get", address, "--json"]
         )["state"]
