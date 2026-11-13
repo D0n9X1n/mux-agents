@@ -9,6 +9,7 @@ pub mod checks;
 pub mod cli;
 pub mod ctx;
 pub mod error;
+pub mod hc;
 pub mod json;
 pub mod launcher;
 pub mod mux;

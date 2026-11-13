@@ -571,6 +571,50 @@ mod tests {
     }
 
     #[test]
+    fn hc_session_unchanged() {
+        for session in [None, Some(""), Some("private 1a")] {
+            let mut cmd = Std::new(me());
+            cmd.args([
+                "spawn::tests::hc_session_parent",
+                "--exact",
+                "--ignored",
+                "--nocapture",
+            ]);
+            if let Some(s) = session {
+                cmd.env("HC_SESSION", s);
+            } else {
+                cmd.env_remove("HC_SESSION");
+            }
+            let out = cmd.output().unwrap();
+            assert!(out.status.success());
+            assert!(
+                String::from_utf8_lossy(&out.stdout).contains(&format!("HC_SESSION={session:?}")),
+                "capture lost HC_SESSION"
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "a child of hc_session_unchanged"]
+    fn hc_session_parent() {
+        let args = probe_args("hc_session_probe", &[]);
+        let argv: Vec<_> = args.iter().map(String::as_str).collect();
+        let out =
+            crate::hc::Hc::captured(&crate::hc::NativeHc, &me(), &argv, Duration::from_secs(5))
+                .unwrap();
+        assert_eq!(out.code, 0);
+        print!("{}", out.stdout);
+    }
+
+    #[test]
+    #[ignore = "a probe the spawn tests start"]
+    fn hc_session_probe() {
+        if probing() {
+            println!("HC_SESSION={:?}", std::env::var_os("HC_SESSION"));
+        }
+    }
+
+    #[test]
     fn captured_reports_utf8_code_cwd_and_closed_stdin() {
         let out = probe("probe_report", &[], Duration::from_secs(10)).unwrap();
         assert_eq!(out.code, 7, "{out:?}");

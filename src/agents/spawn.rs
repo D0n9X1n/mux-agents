@@ -355,10 +355,9 @@ impl Launch<'_> {
         let prompt = format!("{}\n\n{}", lines.join("\n"), self.task);
         let args = client_args(
             self.client,
-            &agent.plan,
+            Recipe::LegacyPane(&agent.plan, &prompt),
             &agent.session,
             self.model,
-            &prompt,
         );
         let mut argv: Vec<&str> = client_flags(self.client).to_vec();
         argv.extend(args.iter().map(String::as_str));
@@ -649,34 +648,53 @@ pub(crate) fn created_pane(stdout: &str) -> Option<Created> {
     })
 }
 
-/// The client arguments after its flags. A Claude fork resumes and forks the parent into `session`; a Copilot fork
-/// resumes `session`, the copy made for it. A brief starts `session` fresh. A chosen model comes before the prompt
-/// (for Copilot before `-i`, which takes it).
-fn client_args(
+pub enum Recipe<'a> {
+    First(Option<&'a str>),
+    Resume,
+    // shortcut: pane compatibility only, retire in phase 1b when panes use first/resume recipes.
+    LegacyPane(&'a Plan, &'a str),
+}
+
+/// The client arguments after its flags. First/resume put the model before the session selector; legacy panes
+/// keep it after. A supplied task is last (for Copilot after `-i`, which takes it).
+pub fn client_args(
     client: Client,
-    plan: &Plan,
+    recipe: Recipe<'_>,
     session: &str,
     model: Option<&str>,
-    prompt: &str,
 ) -> Vec<String> {
-    let mut args: Vec<String> = match (plan.context, client) {
-        (Context::Fork, Client::Claude) => vec![
-            "--resume".into(),
-            plan.parent_session.clone().unwrap_or_default(),
-            "--fork-session".into(),
-            "--session-id".into(),
-            session.into(),
-        ],
-        (Context::Fork, Client::Copilot) => vec!["--resume".into(), session.into()],
-        (Context::Brief, _) => vec!["--session-id".into(), session.into()],
+    let (mut args, prompt, legacy) = match recipe {
+        Recipe::First(task) => (vec!["--session-id".into(), session.into()], task, false),
+        Recipe::Resume => (vec!["--resume".into(), session.into()], None, false),
+        Recipe::LegacyPane(plan, task) => {
+            let args = match (plan.context, client) {
+                (Context::Fork, Client::Claude) => vec![
+                    "--resume".into(),
+                    plan.parent_session.clone().unwrap_or_default(),
+                    "--fork-session".into(),
+                    "--session-id".into(),
+                    session.into(),
+                ],
+                (Context::Fork, Client::Copilot) => vec!["--resume".into(), session.into()],
+                (Context::Brief, _) => vec!["--session-id".into(), session.into()],
+            };
+            (args, Some(task), true)
+        }
     };
     if let Some(model) = model {
-        args.extend(["--model".into(), model.into()]);
+        let flags = ["--model".into(), model.into()];
+        if legacy {
+            args.extend(flags);
+        } else {
+            args.splice(0..0, flags);
+        }
     }
-    if client == Client::Copilot {
-        args.push("-i".into());
+    if let Some(task) = prompt {
+        if client == Client::Copilot {
+            args.push("-i".into());
+        }
+        args.push(task.into());
     }
-    args.push(prompt.into());
     args
 }
 
@@ -1125,6 +1143,55 @@ mod tests {
             &["-Client", "claude", "-Task", "hi", "-BriefFile", "empty.md"],
         );
         assert!(empty.starts_with("ok "), "{empty}");
+    }
+
+    #[test]
+    fn recipe_matrix() {
+        let id = "0f11fc2f-2032-48ef-a920-4af2a8e5af50";
+        for c in [Client::Claude, Client::Copilot] {
+            for task in [None, Some(""), Some("task --fork-session parent")] {
+                let mut expected = vec!["--session-id".to_string(), id.into()];
+                if let Some(t) = task {
+                    if c == Client::Copilot {
+                        expected.push("-i".into());
+                    }
+                    expected.push(t.into());
+                }
+                assert_eq!(client_args(c, Recipe::First(task), id, None), expected);
+                assert_eq!(client_args(c, Recipe::Resume, id, None), ["--resume", id]);
+                let mut modeled = vec!["--model".to_string(), "sonnet".into()];
+                modeled.extend(expected);
+                assert_eq!(
+                    client_args(c, Recipe::First(task), id, Some("sonnet")),
+                    modeled
+                );
+            }
+            let mut whole = vec![client_name(c).to_string()];
+            whole.extend(client_flags(c).iter().map(|s| s.to_string()));
+            whole.extend(client_args(c, Recipe::Resume, id, Some("sonnet")));
+            let prefix = match c {
+                Client::Claude => vec![
+                    "claude",
+                    "--dangerously-skip-permissions",
+                    "--effort",
+                    "high",
+                    "--model",
+                    "sonnet",
+                    "--resume",
+                    id,
+                ],
+                Client::Copilot => vec![
+                    "copilot",
+                    "--no-sandbox",
+                    "--allow-all",
+                    "--model",
+                    "sonnet",
+                    "--resume",
+                    id,
+                ],
+            };
+            assert_eq!(whole, prefix);
+        }
     }
 
     #[test]
