@@ -39,23 +39,29 @@ pub(crate) fn execute(
         ("mux.name", field(&p.record, "name")?),
     ];
     let argv: Vec<&str> = p.argv.iter().map(String::as_str).collect();
-    let run = core.run(&Run {
-        bg: true,
-        keep: true,
-        outlive_parent: true,
-        no_notify: true,
-        name: Some(&name),
-        labels: &labels,
-        cwd: Some(field(&p.record, "directory")?),
-        argv: &argv,
+    let run = attempt(|| {
+        core.run(&Run {
+            bg: true,
+            keep: true,
+            outlive_parent: true,
+            no_notify: true,
+            name: Some(&name),
+            labels: &labels,
+            cwd: Some(field(&p.record, "directory")?),
+            argv: &argv,
+        })
     });
     let address = match run {
         Ok(a) => a,
-        Err(e) => {
-            let _ = write_json(
+        Err(mut e) => {
+            if write_json(
                 &p.folder.join("abort.json"),
                 &json!({"runUncertain":true,"hcAddress":null,"message":e.message}),
-            );
+            )
+            .is_err()
+            {
+                e.message.push_str("; abort evidence could not be written");
+            }
             return Err(e);
         }
     };
@@ -78,11 +84,15 @@ pub(crate) fn execute(
     };
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(operation))
         .unwrap_or_else(|_| Err(Refusal::internal("launch panicked")));
-    if let Err(error) = result {
-        rollback(&core, &p, &address, pane.as_ref(), clean);
-        return Err(error);
+    match result {
+        Ok(record) => Ok(record),
+        Err(mut e) => {
+            if !rollback(&core, &p, &address, pane.as_ref(), clean) {
+                e.message.push_str("; abort evidence could not be written");
+            }
+            Err(e)
+        }
     }
-    result
 }
 fn attempt<T>(f: impl FnOnce() -> Res<T>) -> Res<T> {
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(f))
@@ -94,10 +104,10 @@ fn rollback(
     address: &str,
     pane: Option<&Created>,
     clean: impl FnOnce(&Created) -> Res<bool>,
-) {
+) -> bool {
     let mut evidence = json!({"hcAddress":address,"identity":p.record,"pane":pane.map(|v|v.pane.as_str()),"kill":"pending","viewCleanup":"pending"});
     let path = p.folder.join("abort.json");
-    let _ = write_json(&path, &evidence);
+    let first = write_json(&path, &evidence).is_ok();
     evidence["kill"] = match attempt(|| core.kill(address)) {
         Ok(()) => json!("acknowledged"),
         Err(e) => json!({"uncertain":true,"message":e.message}),
@@ -109,7 +119,7 @@ fn rollback(
             Err(e) => json!({"failed":true,"message":e.message}),
         },
     };
-    let _ = write_json(&path, &evidence);
+    write_json(&path, &evidence).is_ok() && first
 }
 
 #[cfg(test)]
@@ -358,5 +368,114 @@ mod tests {
             }
             assert!(!crate::agents::committed(&folder), "{stage}");
         }
+    }
+
+    #[test]
+    fn uncertain_run_is_never_retried_or_guessed_killed() {
+        struct PanicRun(Fakes);
+        impl crate::hc::Hc for PanicRun {
+            fn find(&self, n: &str, p: &str) -> Option<PathBuf> {
+                crate::hc::Hc::find(&self.0, n, p)
+            }
+            fn captured(&self, p: &Path, a: &[&str], t: std::time::Duration) -> Res<Out> {
+                let out = crate::hc::Hc::captured(&self.0, p, a, t);
+                if a[0] == "run" {
+                    panic!("run uncertain");
+                }
+                out
+            }
+        }
+        for mode in ["nonzero", "malformed", "timeout", "panic"] {
+            let mut w = World::human("");
+            ready(&w);
+            match mode {
+                "nonzero" => w.fakes.hc_answer(Ok(Out {
+                    code: 1,
+                    stdout: r#"{"address":"do-not-kill"}"#.into(),
+                    stderr: String::new(),
+                })),
+                "timeout" => w.fakes.hc_answer(Err(Refusal::internal("timeout"))),
+                _ => answer(&w.fakes, "not-json"),
+            }
+            if mode == "panic" {
+                w.ctx.hc = Box::new(PanicRun(w.fakes.clone()));
+            }
+            let got = execute(
+                &w.ctx,
+                || Ok(prepared(&w)),
+                |_, _, _| panic!("attach"),
+                |_| panic!("commit"),
+                |_| panic!("clean"),
+            );
+            assert!(got.is_err());
+            let calls = w.fakes.hc_calls();
+            assert_eq!(calls.iter().filter(|(_, a, _)| a[0] == "run").count(), 1);
+            assert!(!calls.iter().any(|(_, a, _)| a[0] == "kill"));
+            let e = crate::state::fs::read_json(
+                &w.ctx.state_root.join("key/agents/aaaaaaaaaaaa/abort.json"),
+            )
+            .unwrap()
+            .unwrap();
+            assert_eq!(e["runUncertain"], true);
+            assert!(e["hcAddress"].is_null());
+        }
+    }
+    #[test]
+    fn failed_abort_write_is_reported_without_skipping_kill_or_cleanup() {
+        let w = World::human("");
+        ready(&w);
+        answer(&w.fakes, r#"{"address":"t1"}"#);
+        answer(&w.fakes, "{}");
+        let cleaned = Cell::new(false);
+        let got = execute(
+            &w.ctx,
+            || Ok(prepared(&w)),
+            |_, p, pane| {
+                *pane = Some(created());
+                std::fs::create_dir(p.folder.join("abort.json"))?;
+                Err(Refusal::internal("proof failed"))
+            },
+            |_| panic!("commit"),
+            |_| {
+                cleaned.set(true);
+                Ok(true)
+            },
+        )
+        .unwrap_err();
+        assert!(got.message.contains("abort evidence could not be written"));
+        assert!(got.message.contains("proof failed"));
+        assert!(cleaned.get());
+        assert_eq!(
+            w.fakes.hc_calls().last().unwrap().1,
+            ["kill", "t1", "--json"]
+        );
+    }
+    #[test]
+    fn prepare_failure_has_no_run_and_kill_error_still_cleans() {
+        let w = World::human("");
+        ready(&w);
+        let got = execute(
+            &w.ctx,
+            || Err(Refusal::internal("prepare failed")),
+            |_, _, _| panic!("attach"),
+            |_| panic!("commit"),
+            |_| panic!("clean"),
+        );
+        assert!(got.is_err());
+        assert_eq!(w.fakes.hc_calls().len(), 1);
+        let w = World::human("");
+        ready(&w);
+        let ctx = &w.ctx;
+        let core = hc::connect(ctx).unwrap();
+        let p = prepared(&w);
+        let cleaned = Cell::new(false);
+        let value: Res<()> = attempt(|| panic!("boundary panicked"));
+        assert!(value.is_err());
+        w.fakes.hc_answer(Err(Refusal::internal("kill failed")));
+        assert!(rollback(&core, &p, "t1", Some(&created()), |_| {
+            cleaned.set(true);
+            Ok(true)
+        }));
+        assert!(cleaned.get());
     }
 }
