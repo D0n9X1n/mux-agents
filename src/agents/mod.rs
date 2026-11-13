@@ -8,10 +8,17 @@ use crate::caller::Caller;
 use crate::ctx::Ctx;
 use crate::error::{Refusal, Res};
 
+pub mod attachment;
 pub mod board;
 pub mod copilot;
+pub mod core_facts;
+#[cfg(test)]
+pub(crate) mod core_fixture;
+pub mod core_identity;
+pub mod core_launch;
 pub mod lifecycle;
 pub mod mail;
+pub mod membership;
 pub mod message;
 pub mod placement;
 pub mod registry;

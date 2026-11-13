@@ -1,4 +1,5 @@
 //! list, focus, status (MuxAgents.ps1:1271-1285, 1335-1352) and report.
+pub use super::attachment::{attach as attach_core, clean as clean_core};
 
 use serde_json::{Map, Value, json};
 
