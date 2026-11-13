@@ -132,8 +132,11 @@ impl Core<'_> {
         if r.argv.is_empty() {
             return Err(failure("hc run needs argv"));
         }
+        // hc runs a lone string with spaces or shell signs through the shell; allow only plain paths.
         if r.argv.len() == 1
-            && r.argv[0].contains(|c: char| c.is_whitespace() || ";|&<>$`*?(){}~'\"".contains(c))
+            && !r.argv[0]
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || "/._-+".contains(c))
         {
             return Err(failure(
                 "hc run needs a literal executable, not a shell line",
@@ -615,6 +618,69 @@ mod tests {
             ["run", "--json", "--", "/usr/local/bin/claude"]
         );
         assert_eq!(f.hc_calls().len(), 3);
+    }
+
+    #[test]
+    fn hc_run_lone_argument_requires_plain_path() {
+        let cases: &[(&[&str], bool)] = &[
+            (&[r"./a\b"], false),
+            (&["./x[1]"], false),
+            (&["a#b"], false),
+            (&["a!b"], false),
+            (&["a=b"], false),
+            (&["a%b"], false),
+            (&["C:x"], false),
+            (&["café"], false),
+            (&["claude"], true),
+            (&["/usr/bin/env"], true),
+            (&["./tool-1.2_x+y"], true),
+            (
+                &[
+                    r"./a\b", "./x[1]", "a#b", "a!b", "a=b", "a%b", "C:x", "café",
+                ],
+                true,
+            ),
+        ];
+        let mut unexpectedly_accepted = Vec::new();
+        for &(argv, allowed) in cases {
+            let f = Fakes::default();
+            f.hc_install("hc");
+            answer(&f, "hc 0.1.21");
+            answer(&f, r#"{"address":"t1"}"#);
+            let c = f.ctx();
+            let h = connect(&c).unwrap();
+            let r = Run {
+                bg: false,
+                keep: false,
+                outlive_parent: false,
+                no_notify: false,
+                name: None,
+                labels: &[],
+                cwd: None,
+                argv,
+            };
+            let result = h.run(&r);
+            if allowed {
+                assert_eq!(result.unwrap(), "t1", "{argv:?}");
+                let mut expected = vec!["run", "--json", "--"];
+                expected.extend_from_slice(argv);
+                assert_eq!(f.hc_calls().len(), 2, "{argv:?}");
+                assert_eq!(f.hc_calls()[1].1, expected, "{argv:?}");
+            } else if let Err(e) = result {
+                assert_eq!((e.code, e.check), (1, "hc"), "{argv:?}");
+                assert_eq!(
+                    e.message, "hc run needs a literal executable, not a shell line",
+                    "{argv:?}"
+                );
+                assert_eq!(f.hc_calls().len(), 1, "{argv:?}");
+            } else {
+                unexpectedly_accepted.push(argv[0]);
+            }
+        }
+        assert!(
+            unexpectedly_accepted.is_empty(),
+            "non-plain single arguments were accepted: {unexpectedly_accepted:?}"
+        );
     }
 
     #[test]
