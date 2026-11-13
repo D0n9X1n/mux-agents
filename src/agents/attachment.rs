@@ -114,16 +114,18 @@ fn decorate(ctx: &Ctx, caller: &Caller, record: &Value, view: &Created) -> Res<(
             .collect::<Vec<_>>()
             .join(" ; "),
     )?;
-    bound(
-        ctx,
-        view,
-        format!("select-pane -T {} -t {}", field("name")?, view.pane),
-    )?;
-    bound(
-        ctx,
-        view,
-        format!("set-option -p -t {} allow-set-title off", view.pane),
-    )?;
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _ = bound(
+            ctx,
+            view,
+            format!("select-pane -T {} -t {}", field("name")?, view.pane),
+        );
+        bound(
+            ctx,
+            view,
+            format!("set-option -p -t {} allow-set-title off", view.pane),
+        )
+    }));
     Ok(())
 }
 

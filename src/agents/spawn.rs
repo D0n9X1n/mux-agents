@@ -3322,6 +3322,16 @@ impl Launch<'_> {
                 argv: crate::launcher_scope::argv(ctx, &spec)?,
             })
         };
-        prepare()
+        prepare().map_err(|mut e: Refusal| {
+            if write_json(
+                &agent.folder.join("abort.json"),
+                &json!({"runUncertain":false,"hcAddress":null,"message":e.message}),
+            )
+            .is_err()
+            {
+                e.message.push_str("; abort evidence could not be written");
+            }
+            e
+        })
     }
 }

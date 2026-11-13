@@ -257,3 +257,192 @@ fn record_then_commit_order() {
     assert_eq!(*log.borrow(), ["attach", "commit"]);
     w.fakes.hc_done().unwrap();
 }
+#[test]
+fn hc_launch_fault_matrix() {
+    for stage in [
+        "record",
+        "mux",
+        "malformed",
+        "empty",
+        "tag",
+        "proof",
+        "view-record",
+        "commit-fs",
+        "launcher-timeout",
+        "timeout",
+        "panic",
+        "title",
+        "title-panic",
+        "title-option",
+        "run-timeout",
+        "run-malformed",
+        "spec",
+    ] {
+        let (w, caller, source) = forked();
+        let mut req = request(&w);
+        req.client = Client::Copilot;
+        req.no_fork = false;
+        req.brief = Some("brief");
+        let success = ["title", "title-panic", "title-option"].contains(&stage);
+        let known = !["spec", "run-timeout", "run-malformed"].contains(&stage);
+        core_fixture::online(&w);
+        if stage == "run-timeout" {
+            w.fakes.hc_answer(Err(Refusal::internal("timeout")));
+        } else if stage != "spec" {
+            answer(
+                &w.fakes,
+                if stage == "run-malformed" {
+                    "bad"
+                } else {
+                    r#"{"address":"t1"}"#
+                },
+            );
+        }
+        if known && !success {
+            core_fixture::answer(&w, &["kill", "t1", "--json"], "{}");
+        }
+        w.fakes
+            .mux_rule("new-window", 0, "%9|@5|exact,#} attach t1\n", "");
+        w.launches_hold();
+        w.fakes
+            .mux_rule("-t %9 #{pane_id}|#{@agent-id}", 0, "|\n", "");
+        let state = super::super::server_dir(&w.ctx, &caller);
+        let state2 = state.clone();
+        if stage == "spec" {
+            w.fakes.clock_probe(move |_| {
+                let folder = std::fs::read_dir(state2.join("agents"))
+                    .unwrap()
+                    .next()
+                    .unwrap()
+                    .unwrap()
+                    .path();
+                let p = folder.join("spec.json");
+                if p.is_file() {
+                    std::fs::remove_file(&p).unwrap();
+                    std::fs::create_dir(p).unwrap();
+                }
+            });
+        }
+        w.fakes.hc_probe(move |a| {
+            if stage == "record" && a[0] == "run" {
+                let i = a.iter().position(|x| x == "launcher").unwrap();
+                std::fs::create_dir(Path::new(&a[i + 1]).parent().unwrap().join("record.json"))
+                    .unwrap();
+            }
+        });
+        match stage {
+            "mux" => w.fakes.mux_first("new-window", 1, "", "bad"),
+            "malformed" => w.fakes.mux_first("new-window", 0, "%9|@5\n", ""),
+            "empty" => w.fakes.mux_first("new-window", 0, "%9|@5|\n", ""),
+            "tag" => w.fakes.mux_first("@agent-context", 1, "", "bad"),
+            "proof" => w
+                .fakes
+                .mux_first("}|#{==:#{pane_start_command},", 0, "%9|0\n", ""),
+            "title" => w.fakes.mux_first("select-pane -T", 1, "", "bad"),
+            "title-option" => w.fakes.mux_first("allow-set-title", 1, "", "bad"),
+            "title-panic" => w.fakes.mux_script("select-pane -T", |_| panic!("title")),
+            "panic" => w.fakes.mux_script("@agent-context", |_| panic!("tag")),
+            "timeout" => w
+                .fakes
+                .mux_script("new-window", |_| Err(Refusal::internal("timeout"))),
+            "view-record" => w.fakes.mux_script("@agent-context", move |_| {
+                let folder = std::fs::read_dir(state.join("agents"))
+                    .unwrap()
+                    .next()
+                    .unwrap()
+                    .unwrap()
+                    .path();
+                std::fs::remove_file(folder.join("record.json"))?;
+                std::fs::create_dir(folder.join("record.json"))?;
+                Ok(crate::mux::Output::default())
+            }),
+            _ => {}
+        }
+        let _reset = ProbeReset;
+        if stage == "commit-fs" {
+            commit_probe(Some(Box::new(|p| {
+                std::fs::create_dir(p.join("commit.json")).unwrap()
+            })));
+        }
+        if stage == "launcher-timeout" {
+            commit_probe(Some(Box::new(|p| {
+                write_json(&p.join("commit.json"), &json!({"aborted":true})).unwrap()
+            })));
+        }
+        let got = launch_hc(&w.ctx, &caller, req, slot);
+        let folder = folder(&w);
+        let calls = w.fakes.hc_calls();
+        assert_eq!(
+            calls.iter().filter(|(_, a, _)| a[0] == "run").count(),
+            usize::from(stage != "spec"),
+            "{stage}"
+        );
+        assert_eq!(got.is_ok(), success, "{stage}: {got:?}");
+        let kills = calls
+            .iter()
+            .filter(|(_, a, _)| a[0] == "kill")
+            .map(|(_, a, _)| a.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            kills,
+            if known && !success {
+                vec![vec!["kill", "t1", "--json"]]
+            } else {
+                vec![]
+            },
+            "{stage}"
+        );
+        let proven = [
+            "tag",
+            "proof",
+            "view-record",
+            "commit-fs",
+            "launcher-timeout",
+            "panic",
+        ]
+        .contains(&stage);
+        let mux = w.fakes.mux_calls();
+        let clean = mux
+            .iter()
+            .filter(|a| a.last().is_some_and(|s| s == "kill-pane -t %9"))
+            .collect::<Vec<_>>();
+        assert_eq!(clean.len(), usize::from(proven), "{stage}");
+        if proven {
+            assert_eq!(
+                clean[0][5],
+                registry::Launch {
+                    command: "exact,#} attach t1".into(),
+                    pid: None
+                }
+                .launched()
+            );
+        }
+        if !success {
+            assert!(
+                folder.join("abort.json").exists(),
+                "abort evidence missing at {stage}"
+            );
+            let e = read_json(&folder.join("abort.json")).unwrap().unwrap();
+            if known {
+                assert_eq!(e["hcAddress"], "t1");
+                assert_eq!(e["kill"], "acknowledged");
+                if proven {
+                    assert_eq!(e["viewCleanup"]["gone"], true);
+                } else {
+                    assert_eq!(e["viewCleanup"], "unproven");
+                }
+            } else {
+                assert!(e["hcAddress"].is_null());
+                assert_eq!(e["runUncertain"], stage != "spec");
+            }
+            assert!(!super::super::committed(&folder));
+        }
+        assert!(folder.join("spec.json").exists());
+        assert_eq!(
+            std::fs::read_dir(source.parent().unwrap()).unwrap().count(),
+            2,
+            "copy retained: {stage}"
+        );
+        w.fakes.hc_done().unwrap();
+    }
+}
