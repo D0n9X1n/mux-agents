@@ -1135,6 +1135,13 @@ mod tests {
         result
     }
 
+    struct HcCommitReset;
+    impl Drop for HcCommitReset {
+        fn drop(&mut self) {
+            commit_probe(None);
+        }
+    }
+
     fn run(w: &World, args: &[&str]) -> String {
         let mut full = vec!["spawn"];
         full.extend(args);
@@ -3119,28 +3126,44 @@ mod tests {
 
     #[test]
     fn a_launcher_that_gave_up_first_makes_the_spawn_refuse_and_roll_back() {
-        // #97: on a slow server the launcher's 30 s commit wait can end before the spawn commits. The launcher made
-        // commit.json first, as its give-up, so the spawn must not answer ok for an agent that will never start.
-        commit_probe(Some(Box::new(|folder: &Path| {
-            crate::agents::fixture::write(&folder.join("commit.json"), json!({"aborted": true}));
-        })));
-        let w = human();
-        w.fakes
-            .mux_first("-t %9 #{pane_id}|#{@agent-id}", 0, "|\n", "");
-        let out = run(&w, &["-Client", "claude", "-Task", "hi"]);
-        commit_probe(None);
-        assert!(out.starts_with("1 launch the agent did not start"), "{out}");
-        let folder = agents_dir(&w).join(&agent_folders(&w)[0]);
-        assert!(!crate::agents::committed(&folder));
-        assert_eq!(
-            crate::state::fs::read_json(&folder.join("commit.json")).unwrap(),
-            Some(json!({"aborted": true}))
-        );
-        // A spawn that commits first is committed, as before.
-        let w = human();
-        assert!(reply(&run(&w, &["-Client", "claude", "-Task", "hi"]))["id"].is_string());
-        let folder = agents_dir(&w).join(&agent_folders(&w)[0]);
-        assert!(crate::agents::committed(&folder));
+        for gave_up in [true, false] {
+            let _reset = HcCommitReset;
+            if gave_up {
+                commit_probe(Some(Box::new(|folder| {
+                    crate::agents::fixture::write(
+                        &folder.join("commit.json"),
+                        json!({"aborted":true}),
+                    );
+                })));
+            }
+            let w = hc_world(human());
+            let result = hc_attempt(&w, Client::Claude, None, gave_up);
+            let folder = agents_dir(&w).join(&agent_folders(&w)[0]);
+            if gave_up {
+                let e = result.unwrap_err();
+                assert_eq!(
+                    (e.code, e.check, e.message.as_str()),
+                    (1, "launch", "the launcher gave up before the commit")
+                );
+                assert_eq!(
+                    read_json(&folder.join("commit.json")),
+                    json!({"aborted":true})
+                );
+                let abort = read_json(&folder.join("abort.json"));
+                assert_eq!(
+                    (&abort["kill"], &abort["viewCleanup"]),
+                    (&json!("acknowledged"), &json!({"gone":true}))
+                );
+            } else {
+                assert_eq!(result.unwrap()["hcAddress"], "t1");
+                assert_eq!(
+                    read_json(&folder.join("commit.json")),
+                    json!({"committedAt":"1970-01-01T00:00:00.0000000Z"})
+                );
+                assert!(!folder.join("abort.json").exists());
+            }
+            assert_eq!(crate::agents::committed(&folder), !gave_up);
+        }
     }
 
     #[test]
@@ -3190,124 +3213,121 @@ mod tests {
 
     #[test]
     fn rollback_keeps_a_replacement_and_closes_its_own_launch_live_or_dead() {
-        let ours = "/bin/mux-agent launcher /s/spec.json";
-        // (what %9 runs when the rollback's conditional is checked, killed, the reply)
-        for (now, killed, want) in [
-            (
-                ours,
-                true,
-                "1 launch the agent did not start; its pane was closed",
-            ),
-            ("sh", false, "1 launch the agent did not start"),
-        ] {
-            let w = human();
+        for now in ["hc attach t1", "sh"] {
+            let w = hc_world(human());
             let pane = Rc::new(RefCell::new(Some(now.to_string())));
             let state = pane.clone();
             w.fakes.mux_script("if-shell", move |argv| {
-                let mut held = state.borrow_mut();
-                let holds = held.as_ref().is_some_and(|command| {
-                    let launch = registry::Launch {
-                        command: command.clone(),
-                        pid: None,
-                    };
-                    argv[5] == launch.launched()
+                let mut current = state.borrow_mut();
+                let holds = current.as_ref().is_some_and(|command| {
+                    argv[5]
+                        == registry::Launch {
+                            command: command.clone(),
+                            pid: None,
+                        }
+                        .launched()
                 });
-                if holds && argv[6].starts_with("kill-pane") {
-                    *held = None;
+                if argv[6] == "kill-pane -t %9" && (argv[5] == "1" || holds) {
+                    *current = None;
                 }
                 Ok(Output::default())
             });
-            // Registered last, so it answers first: the bound tag call fails, and the spawn rolls back.
-            w.fakes.mux_first("set-option", 1, "", "no pane");
-            let probed = pane.clone();
+            w.fakes.mux_first("@agent-context", 1, "", "bad");
+            let probe = pane.clone();
             w.fakes
                 .mux_script("-t %9 #{pane_id}|#{@agent-id}", move |_| {
                     Ok(Output {
-                        code: 0,
-                        stdout: if probed.borrow().is_some() {
-                            "%9|\n"
-                        } else {
+                        stdout: if probe.borrow().is_none() {
                             "|\n"
+                        } else {
+                            "%9|\n"
                         }
                         .into(),
-                        stderr: String::new(),
+                        ..Output::default()
                     })
                 });
+            let e = hc_attempt(&w, Client::Claude, None, true).unwrap_err();
             assert_eq!(
-                run(&w, &["-Client", "claude", "-Task", "hi"]),
-                want,
-                "{now}"
+                (e.code, e.check, e.message.as_str()),
+                (1, "rmux", "tmux call failed")
             );
-            assert_eq!(pane.borrow().is_none(), killed, "{now}");
+            assert_eq!(pane.borrow().is_none(), now == "hc attach t1");
+            let a = read_json(
+                &agents_dir(&w)
+                    .join(&agent_folders(&w)[0])
+                    .join("abort.json"),
+            );
+            assert_eq!(a["kill"], "acknowledged");
+            assert_eq!(a["viewCleanup"], json!({"gone":now=="hc attach t1"}));
         }
     }
 
     #[test]
     fn a_pane_replaced_before_it_is_tagged_is_never_written() {
-        // D1: the pane the reply named is respawned (`sh`) before the tags: no tag, title or option reaches it, it is
-        // not killed, and the spawn refuses `1 launch` with no closure claim and no record.
-        let w = human();
-        let ours = "/bin/mux-agent launcher /s/spec.json";
-        let pane = Rc::new(RefCell::new(Some("sh".to_string())));
-        let acted = Rc::new(RefCell::new(Vec::<String>::new()));
-        let (state, log) = (pane.clone(), acted.clone());
-        w.fakes.mux_script("if-shell", move |argv| {
-            let command = state.borrow().clone();
-            let holds = command.is_some_and(|command| {
-                let launch = registry::Launch { command, pid: None };
-                argv[5] == launch.launched() || argv[5] == launch.live()
-            });
-            if holds {
-                log.borrow_mut().push(argv[6].clone());
+        let w = hc_world(human());
+        let acted = Rc::new(RefCell::new(Vec::new()));
+        let log = acted.clone();
+        // The exact predicate assertion and set-option/select-pane checks enforce the guard;
+        // acted cannot fill after the assertion, so its emptiness alone proves nothing.
+        w.fakes.mux_script("if-shell", move |a| {
+            assert_eq!(a[5], "#{==:#{pane_start_command},hc attach t1}");
+            if a[5] == "#{==:#{pane_start_command},sh}" {
+                log.borrow_mut().push(a[6].clone());
             }
             Ok(Output::default())
         });
-        let probed = pane.clone();
         w.fakes
-            .mux_script("}|#{==:#{pane_start_command},", move |_| {
-                let now = probed.borrow().clone().unwrap_or_default();
-                Ok(Output {
-                    code: 0,
-                    stdout: format!("%9|{}\n", u8::from(now == ours)),
-                    stderr: String::new(),
-                })
-            });
+            .mux_first("}|#{==:#{pane_start_command},", 0, "%9|0\n", "");
         w.fakes
             .mux_first("-t %9 #{pane_id}|#{@agent-id}", 0, "%9|\n", "");
+        let e = hc_attempt(&w, Client::Claude, None, true).unwrap_err();
         assert_eq!(
-            run(&w, &["-Client", "claude", "-Task", "hi"]),
-            "1 launch the agent did not start"
+            (e.code, e.check, e.message.as_str()),
+            (1, "internal", "unexpected error (unproven new view)")
         );
-        assert!(acted.borrow().is_empty(), "{:?}", acted.borrow());
-        assert_eq!(pane.borrow().as_deref(), Some("sh"));
+        assert!(acted.borrow().is_empty());
         assert!(calls(&w, "set-option").is_empty());
         assert!(calls(&w, "select-pane").is_empty());
         let folder = agents_dir(&w).join(&agent_folders(&w)[0]);
-        assert!(!folder.join("record.json").exists() && !folder.join("commit.json").exists());
-        assert!(folder.join("abort.json").is_file());
+        let r = read_json(&folder.join("record.json"));
+        assert_eq!(r["hcAddress"], "t1");
+        assert!(r.get("pane").is_none());
+        assert!(!folder.join("commit.json").exists());
+        let a = read_json(&folder.join("abort.json"));
+        assert_eq!(
+            (&a["kill"], &a["viewCleanup"]),
+            (&json!("acknowledged"), &json!({"gone":false}))
+        );
     }
 
     #[test]
     fn rollback_whose_gone_proof_fails_to_run_claims_nothing() {
-        // Test 8b: the tagging fails, the bound kill runs, and the probe after it fails as a call: no closure claim.
-        let w = human();
-        w.fakes.mux_first("set-option", 1, "", "no pane");
+        let w = hc_world(human());
+        w.fakes.mux_first("@agent-context", 1, "", "bad");
         w.fakes.mux_script("-t %9 #{pane_id}|#{@agent-id}", |_| {
-            Err(Refusal {
-                code: 1,
-                check: "endpoint",
-                message: "rmux endpoint did not answer".into(),
-                reason: None,
-            })
+            refuse(1, "endpoint", "rmux endpoint did not answer")
         });
+        let e = hc_attempt(&w, Client::Claude, None, true).unwrap_err();
         assert_eq!(
-            run(&w, &["-Client", "claude", "-Task", "hi"]),
-            "1 launch the agent did not start"
+            (e.code, e.check, e.message.as_str()),
+            (1, "rmux", "tmux call failed")
         );
-        assert!(
+        assert_eq!(
             calls(&w, "if-shell")
                 .iter()
-                .any(|c| c[6] == "kill-pane -t %9")
+                .filter(|c| c[6] == "kill-pane -t %9")
+                .count(),
+            1
+        );
+        let a = read_json(
+            &agents_dir(&w)
+                .join(&agent_folders(&w)[0])
+                .join("abort.json"),
+        );
+        assert_eq!(a["kill"], "acknowledged");
+        assert_eq!(
+            a["viewCleanup"],
+            json!({"failed":true,"message":"rmux endpoint did not answer"})
         );
     }
 }
