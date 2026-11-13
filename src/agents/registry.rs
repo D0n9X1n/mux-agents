@@ -2242,3 +2242,30 @@ mod tests {
 #[cfg(test)]
 #[path = "registry_hc_tests.rs"]
 mod hc_tests;
+/// Reconcile supplied hc facts; never query or clean a view.
+pub fn reap_hc(ctx: &Ctx, caller: &Caller, snapshot: &super::membership::Snapshot) -> Res<bool> {
+    use super::lifecycle::{Life, classify};
+    let mut acted = false;
+    for o in &snapshot.facts.local {
+        let Some(t) = o.terminal.as_ref().filter(|t| o.identity.matches(t)) else {
+            continue;
+        };
+        if classify(Some(t), &o.identity.launcher) != Life::Ended {
+            continue;
+        }
+        let notice = match t.reason {
+            Some(crate::hc::Reason::Exited) => {
+                Notice::Exited(t.exit_code.map_or(Value::Null, Value::from))
+            }
+            Some(crate::hc::Reason::Killed) => Notice::Stopped,
+            _ => continue,
+        };
+        let id = &o.identity.id;
+        acted |= super::lock(ctx, &super::lock_key("member", caller, id), || {
+            super::lock(ctx, &super::lock_key("notice", caller, id), || {
+                add_notice(ctx, caller, id, &snapshot.records[id].record, notice)
+            })
+        })?;
+    }
+    Ok(acted)
+}
