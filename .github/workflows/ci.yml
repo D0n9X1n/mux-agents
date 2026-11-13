@@ -185,6 +185,9 @@ jobs:
         env:
           MUX_AGENTS_LIVE_REQUIRE: tmux,tmux32,rmux
         run: cargo test --features live,test-panic --locked --test live preflight -- --nocapture
+      - name: CLI tests that need the fake client
+        shell: bash
+        run: cargo test --features live,test-panic --locked --test cli
       - name: Live tests
         env:
           MUX_AGENTS_LIVE_REQUIRE: tmux,tmux32,rmux
@@ -240,6 +243,9 @@ jobs:
       - name: Clippy with the live tests
         shell: bash
         run: cargo clippy --all-targets --features live,test-panic --locked -- -D warnings
+      - name: CLI tests that need the fake client
+        shell: bash
+        run: cargo test --features live,test-panic --locked --test cli
       - name: Windows live tests
         shell: bash
         run: |
