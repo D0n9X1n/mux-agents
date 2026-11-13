@@ -110,6 +110,10 @@ fn address(v: &Value) -> Res<String> {
 }
 
 impl Core<'_> {
+    pub fn binary(&self) -> &Path {
+        &self.bin
+    }
+
     fn call(&self, args: &[String]) -> Res<Out> {
         let argv: Vec<_> = args.iter().map(String::as_str).collect();
         let out = self
@@ -309,6 +313,32 @@ mod tests {
             stdout: text.into(),
             stderr: String::new(),
         }));
+    }
+
+    #[test]
+    fn hc_binary_is_the_connected_executable() {
+        for name in ["hc", "herdr-core"] {
+            let f = Fakes::default();
+            let expected = f.hc_install(name);
+            answer(&f, "hc 0.1.21");
+            let ctx = f.ctx();
+            let core = connect(&ctx).unwrap();
+            assert_eq!(core.binary(), expected.as_path());
+            assert_eq!(core.binary(), expected.as_path());
+            assert_eq!(f.hc_calls().len(), 1);
+        }
+    }
+
+    #[test]
+    fn hc_binary_does_not_repeat_lookup() {
+        let f = Fakes::default();
+        let expected = f.hc_install("herdr-core");
+        answer(&f, "hc 0.1.21");
+        let ctx = f.ctx();
+        let core = connect(&ctx).unwrap();
+        f.hc_install("hc");
+        assert_eq!(core.binary(), expected.as_path());
+        assert_eq!(f.hc_calls().len(), 1);
     }
 
     #[test]
