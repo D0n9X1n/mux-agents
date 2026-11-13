@@ -32,6 +32,7 @@ type Probe = Rc<dyn Fn(&str) -> String>;
 // Runs after each sleep with how many there have been.
 type Wake = Rc<dyn Fn(usize)>;
 type Read = Rc<dyn Fn(u64)>;
+type HcProbe = Rc<dyn Fn(&[String])>;
 
 // What `stop_report` answers for the rows stop left.
 type Report = fn(&[Left]) -> serde_json::Map<String, serde_json::Value>;
@@ -52,6 +53,7 @@ struct Log {
     hc_bins: HashMap<String, PathBuf>,
     hc_calls: Vec<(PathBuf, Vec<String>, Duration)>,
     hc_answers: VecDeque<HcAnswer>,
+    hc_probe: Option<HcProbe>,
     hc_faults: Vec<String>,
     slept: Vec<u64>,
     // What sandbox() answers; none is an unsandboxed macOS.
@@ -356,6 +358,10 @@ impl Fakes {
         }
     }
 
+    pub fn hc_probe(&self, probe: impl Fn(&[String]) + 'static) {
+        self.0.borrow_mut().hc_probe = Some(Rc::new(probe));
+    }
+
     pub fn hc_calls(&self) -> Vec<(PathBuf, Vec<String>, Duration)> {
         self.0.borrow().hc_calls.clone()
     }
@@ -592,7 +598,7 @@ impl crate::hc::Hc for Fakes {
             timeout,
         ));
         let actual: Vec<String> = args.iter().map(|s| s.to_string()).collect();
-        match log.hc_answers.pop_front() {
+        let answer = match log.hc_answers.pop_front() {
             Some(answer)
                 if answer
                     .argv
@@ -611,7 +617,13 @@ impl crate::hc::Hc for Fakes {
                     .push(format!("unconfigured hc call: {actual:?}"));
                 Err(crate::error::Refusal::internal("unconfigured hc fake"))
             }
+        };
+        let probe = log.hc_probe.clone();
+        drop(log);
+        if let Some(probe) = probe {
+            probe(&actual);
         }
+        answer
     }
 }
 
@@ -689,6 +701,49 @@ pub fn wait_runnable<T>(
 mod tests {
     use super::*;
     use std::io;
+
+    #[test]
+    fn hc_probe_runs_after_logging_without_borrowing_log() {
+        let f = Fakes::default();
+        let seen = f.clone();
+        let bin = f.hc_install("hc");
+        f.hc_probe(move |args| {
+            assert_eq!(seen.hc_calls().last().unwrap().1, args);
+            if args == ["run"] {
+                seen.hc_expect(
+                    &["get"],
+                    Ok(crate::spawn::Out {
+                        stdout: "next".into(),
+                        ..Default::default()
+                    }),
+                );
+            }
+        });
+        f.hc_expect(
+            &["run"],
+            Ok(crate::spawn::Out {
+                stdout: "first".into(),
+                ..Default::default()
+            }),
+        );
+        assert_eq!(
+            crate::hc::Hc::captured(&f, &bin, &["run"], Duration::ZERO)
+                .unwrap()
+                .stdout,
+            "first"
+        );
+        assert_eq!(
+            crate::hc::Hc::captured(&f, &bin, &["get"], Duration::ZERO)
+                .unwrap()
+                .stdout,
+            "next"
+        );
+        f.hc_done().unwrap();
+        f.hc_expect(&["get"], Ok(crate::spawn::Out::default()));
+        assert!(crate::hc::Hc::captured(&f, &bin, &["wrong"], Duration::ZERO).is_err());
+        f.clear_log();
+        assert!(f.hc_done().is_err());
+    }
 
     #[test]
     fn hc_strict_fixture_detects_swallowed_errors() {
