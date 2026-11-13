@@ -388,6 +388,139 @@ mod tests {
     }
 
     #[test]
+    fn rollback_writes_pending_before_cleanup_and_remembers_first_write_failure() {
+        for block_first_write in [false, true] {
+            let w = World::human("");
+            ready(&w);
+            answer(&w.fakes, r#"{"address":"t1"}"#);
+            answer(&w.fakes, "{}");
+            let path = w.ctx.state_root.join("key/agents/aaaaaaaaaaaa/abort.json");
+            let saw_pending = Cell::new(false);
+            let cleaned = Cell::new(false);
+            let got = execute(
+                &w.ctx,
+                || Ok(prepared(&w)),
+                |_, _, pane| {
+                    *pane = Some(created());
+                    if block_first_write {
+                        std::fs::create_dir(&path)?;
+                    }
+                    panic!("after attach");
+                },
+                |_| panic!("commit"),
+                |_| {
+                    if block_first_write {
+                        // Let the final write succeed without hiding the first write's failure.
+                        std::fs::remove_dir(&path)?;
+                    } else {
+                        // Observe pending evidence before the final write can replace it.
+                        if let Some(e) = crate::state::fs::read_json(&path)? {
+                            saw_pending.set(
+                                e["hcAddress"] == "t1"
+                                    && e["kill"] == "pending"
+                                    && e["viewCleanup"] == "pending",
+                            );
+                        }
+                    }
+                    cleaned.set(true);
+                    Ok(true)
+                },
+            )
+            .unwrap_err();
+            assert!(cleaned.get());
+            if !block_first_write {
+                assert!(saw_pending.get(), "pending evidence must precede cleanup");
+            }
+            assert_eq!(
+                got.message
+                    .contains("; abort evidence could not be written"),
+                block_first_write,
+                "first evidence write failure must remain reported"
+            );
+            let evidence = crate::state::fs::read_json(&path).unwrap().unwrap();
+            assert_eq!(evidence["kill"], "acknowledged");
+            assert_eq!(evidence["viewCleanup"]["gone"], true);
+        }
+    }
+
+    #[test]
+    fn empty_view_command_never_commits_or_authorizes_cleanup() {
+        for attach_fails in [false, true] {
+            let w = World::human("");
+            ready(&w);
+            answer(&w.fakes, r#"{"address":"t1"}"#);
+            answer(&w.fakes, "{}");
+            let committed = Cell::new(false);
+            let cleaned = Cell::new(false);
+            let got = execute(
+                &w.ctx,
+                || Ok(prepared(&w)),
+                |_, _, pane| {
+                    *pane = Some(Created {
+                        command: String::new(),
+                        ..created()
+                    });
+                    if attach_fails {
+                        return Err(Refusal::internal("proof failed"));
+                    }
+                    Ok(())
+                },
+                |_| {
+                    committed.set(true);
+                    Ok(())
+                },
+                |_| {
+                    cleaned.set(true);
+                    Ok(true)
+                },
+            );
+            assert!(got.is_err(), "empty view command must refuse");
+            assert!(!committed.get(), "unproven view must not commit");
+            assert!(
+                !cleaned.get(),
+                "empty view command must not authorize cleanup"
+            );
+            let evidence = crate::state::fs::read_json(
+                &w.ctx.state_root.join("key/agents/aaaaaaaaaaaa/abort.json"),
+            )
+            .unwrap()
+            .unwrap();
+            assert_eq!(evidence["viewCleanup"], "unproven");
+            assert_eq!(
+                w.fakes.hc_calls().last().unwrap().1,
+                ["kill", "t1", "--json"]
+            );
+        }
+    }
+
+    #[test]
+    fn uncertain_run_reports_failed_abort_write_without_retry() {
+        let w = World::human("");
+        ready(&w);
+        w.fakes.hc_answer(Err(Refusal::internal("timeout")));
+        let got = execute(
+            &w.ctx,
+            || {
+                let p = prepared(&w);
+                std::fs::create_dir(p.folder.join("abort.json"))?;
+                Ok(p)
+            },
+            |_, _, _| panic!("attach"),
+            |_| panic!("commit"),
+            |_| panic!("clean"),
+        )
+        .unwrap_err();
+        assert!(
+            got.message
+                .contains("; abort evidence could not be written")
+        );
+        let calls = w.fakes.hc_calls();
+        assert_eq!(calls.iter().filter(|(_, a, _)| a[0] == "run").count(), 1);
+        assert!(!calls.iter().any(|(_, a, _)| a[0] == "kill"));
+        assert_eq!(calls.len(), 2);
+    }
+
+    #[test]
     fn uncertain_run_is_never_retried_or_guessed_killed() {
         struct PanicRun(Fakes);
         impl crate::hc::Hc for PanicRun {
