@@ -10,7 +10,7 @@ use crate::ctx::{Clock, Ctx, Env};
 use crate::error::Res;
 use crate::mux::{Kind, Mux, Output};
 use crate::parse::Client;
-use crate::proc::{Left, Opened, Os, Row, Signals, Token};
+use crate::proc::{Opened, Os, Row, Signals, Token};
 
 // Answers a matching call from its argv: stateful fakes (a pane table, a queue of probe answers, a failure).
 type Script = Rc<dyn Fn(&[String]) -> Res<Output>>;
@@ -503,10 +503,6 @@ impl Os for Fakes {
 
     fn same_start(&self, opened: i64, listed: i64) -> bool {
         opened == listed
-    }
-
-    fn stop_report(&self, _: &[Left]) -> serde_json::Map<String, serde_json::Value> {
-        serde_json::Map::new()
     }
 
     fn token(&self) -> Option<Token> {

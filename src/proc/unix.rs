@@ -1,10 +1,8 @@
-//! What Linux and macOS share: the shells, the stop report, the pid probe and the Linux pidfd source.
+//! What Linux and macOS share: the shells, the pid probe and the Linux pidfd source.
 
 use std::io;
 
-use serde_json::{Map, Value};
-
-use super::{Left, Row};
+use super::Row;
 
 /// The shells allowed between the caller and its agent or pane, by real-path basename, case-sensitive (Unix.ps1:8).
 pub const SHELLS: [&str; 8] = ["sh", "bash", "zsh", "fish", "dash", "ksh", "tcsh", "pwsh"];
@@ -14,15 +12,6 @@ pub fn is_shell(row: &Row) -> bool {
         .as_deref()
         .and_then(|path| path.rsplit('/').next())
         .is_some_and(|file| SHELLS.contains(&file))
-}
-
-/// Every tree row stop did not kill, whatever the reason, is a survivor (Unix.ps1:17-19).
-pub fn stop_report(left: &[Left]) -> Map<String, Value> {
-    let pids: Vec<Value> = left.iter().map(|l| l.pid.into()).collect();
-    let mut report = Map::new();
-    report.insert("survivors".into(), pids.len().into());
-    report.insert("survivorPids".into(), Value::Array(pids));
-    report
 }
 
 /// kill(pid, 0), which sends nothing: 0 when the process exists, else errno (ESRCH gone, EPERM another user's).
@@ -112,7 +101,6 @@ impl super::seam::ProcSource for PidfdSource {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::proc::Reason;
 
     fn row(path: Option<&str>) -> Row {
         Row {
@@ -147,24 +135,6 @@ mod tests {
         let mut want = vec![true; 8];
         want.extend([false; 5]);
         assert_eq!(answers, want);
-    }
-
-    #[test]
-    fn stop_report_lists_every_survivor_pid() {
-        let left = [
-            (310, Reason::Kill),
-            (320, Reason::Start),
-            (330, Reason::Open),
-        ]
-        .map(|(pid, reason)| Left { pid, reason });
-        assert_eq!(
-            Value::Object(stop_report(&left)).to_string(),
-            r#"{"survivors":3,"survivorPids":[310,320,330]}"#
-        );
-        assert_eq!(
-            Value::Object(stop_report(&[])).to_string(),
-            r#"{"survivors":0,"survivorPids":[]}"#
-        );
     }
 
     #[test]

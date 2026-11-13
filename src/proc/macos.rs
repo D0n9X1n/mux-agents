@@ -6,10 +6,9 @@ use std::mem::{MaybeUninit, size_of};
 use std::ptr::null_mut;
 
 use libc::c_int;
-use serde_json::{Map, Value};
 
 use super::seam::{self, ProcSource};
-use super::{Handle, Left, Opened, Os, Row, Signals, Token, unix};
+use super::{Handle, Opened, Os, Row, Signals, Token, unix};
 use crate::parse::{self, Client};
 
 pub struct MacOs;
@@ -217,10 +216,6 @@ impl Os for MacOs {
 
     fn same_start(&self, opened: i64, listed: i64) -> bool {
         opened == listed
-    }
-
-    fn stop_report(&self, left: &[Left]) -> Map<String, Value> {
-        unix::stop_report(left)
     }
 
     // Unix has no token (Unix.ps1 binds Token to $null).

@@ -1,9 +1,7 @@
 //! The Windows process table: Toolhelp, process handles and the caller's token, no helper processes
 //! (MuxAgents.ps1:171-229, 350-355, 836-910). The decisions are pure and compile everywhere; the calls are Windows-only.
 
-use serde_json::{Map, Value};
-
-use super::{Left, Reason, Token};
+use super::Token;
 
 /// A FILETIME's two halves as the one 100 ns count the server key hashes.
 pub fn filetime(high: u32, low: u32) -> i64 {
@@ -19,18 +17,6 @@ pub fn same_start(opened: i64, listed: i64) -> bool {
 /// or above, is unsandboxed (MuxAgents.ps1:903-910).
 pub fn token_admits(token: Option<Token>) -> bool {
     token.is_some_and(|t| !t.app_container && !t.restricted && t.integrity_rid >= 8192)
-}
-
-/// Windows counts the processes stop did not kill but may still run: failed kills (MuxAgents.ps1:218) and every row
-/// of a tree that was never walked. A row that would not open or showed another start is gone or not the agent's.
-pub fn stop_report(left: &[Left]) -> Map<String, Value> {
-    let failed = left
-        .iter()
-        .filter(|l| matches!(l.reason, Reason::Kill | Reason::Unverified))
-        .count();
-    let mut report = Map::new();
-    report.insert("survivors".into(), failed.into());
-    report
 }
 
 /// The command line from a ProcessCommandLineInformation answer: a UNICODE_STRING at the start of `bytes`, whose
@@ -67,7 +53,6 @@ mod win {
     use std::mem::{MaybeUninit, size_of};
     use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 
-    use serde_json::{Map, Value};
     use windows_sys::Wdk::System::Threading::{
         NtQueryInformationProcess, ProcessBasicInformation, ProcessCommandLineInformation,
     };
@@ -86,7 +71,7 @@ mod win {
         PROCESS_TERMINATE, QueryFullProcessImageNameW, TerminateProcess, WaitForSingleObject,
     };
 
-    use super::super::{Left, Opened, Os, Row, Signals, Token};
+    use super::super::{Opened, Os, Row, Signals, Token};
     use crate::parse::{self, Client};
 
     pub struct Windows;
@@ -354,10 +339,6 @@ mod win {
             super::same_start(opened, listed)
         }
 
-        fn stop_report(&self, left: &[Left]) -> Map<String, Value> {
-            super::stop_report(left)
-        }
-
         /// The caller's own token; none when any part is unreadable.
         fn token(&self) -> Option<Token> {
             let token = token_handle()?;
@@ -531,26 +512,6 @@ mod tests {
         assert!(token_admits(token(false, false, 8448)));
         assert!(token_admits(token(false, false, 12288)));
         assert!(token_admits(token(false, false, 16384)));
-    }
-
-    #[test]
-    fn stop_report_counts_failed_kills() {
-        let left = [
-            (310, Reason::Kill),
-            (320, Reason::Start),
-            (330, Reason::Open),
-            (340, Reason::Kill),
-            (350, Reason::Unverified),
-        ]
-        .map(|(pid, reason)| Left { pid, reason });
-        assert_eq!(
-            Value::Object(stop_report(&left)).to_string(),
-            r#"{"survivors":3}"#
-        );
-        assert_eq!(
-            Value::Object(stop_report(&[])).to_string(),
-            r#"{"survivors":0}"#
-        );
     }
 
     // A UNICODE_STRING {Length, MaximumLength, Buffer} then the text, as the kernel lays it out.

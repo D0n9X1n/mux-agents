@@ -2,8 +2,6 @@
 
 use std::io;
 
-use serde_json::{Map, Value};
-
 use crate::parse::Client;
 
 #[cfg(target_os = "linux")]
@@ -16,7 +14,7 @@ pub mod unix;
 pub mod windows;
 
 /// One process. `start` is the kernel's own unit (spec D1), none when the process cannot be opened (a Windows
-/// Toolhelp row kept so stop's walk reaches its children); `path` the real executable; `argv` none when unreadable.
+/// Toolhelp row whose parent information remains available); path is the real executable; argv is optional.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Row {
     pub pid: u32,
@@ -33,22 +31,6 @@ pub type Handle = std::os::windows::io::OwnedHandle;
 
 /// A process held for a kill: its start read after the handle opened, so both name the same process.
 pub type Opened = seam::Opened<Handle>;
-
-/// Why stop left a tree row alive.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Reason {
-    Open,
-    Start,
-    Kill,
-    /// The pane's process is not the launcher launcher.json recorded, so its tree was never opened or killed.
-    Unverified,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Left {
-    pub pid: u32,
-    pub reason: Reason,
-}
 
 /// The caller's Windows token (T14).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -79,7 +61,6 @@ pub trait Os {
     fn client_of(&self, row: &Row) -> Option<Client>;
     fn is_shell(&self, row: &Row) -> bool;
     fn same_start(&self, opened: i64, listed: i64) -> bool;
-    fn stop_report(&self, left: &[Left]) -> Map<String, Value>;
     fn token(&self) -> Option<Token>;
     fn sandbox(&self) -> Signals;
 }
