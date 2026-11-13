@@ -10,6 +10,7 @@ use crate::error::{Refusal, Res};
 
 pub mod board;
 pub mod copilot;
+pub mod lifecycle;
 pub mod mail;
 pub mod message;
 pub mod placement;
