@@ -156,14 +156,6 @@
 
 [stop worker]
 -N display-message -p -t %1 #{pid}|#{pane_pid}|#{session_id}|#{window_id}|#{@agent-id}
--N list-panes -s -t $3 -F <marker>#{pane_id}<marker>#{window_id}<marker>#{pane_pid}<marker>#{pane_dead}<marker>#{pane_start_command}<marker>#{@agent-id}<marker>#{@agent-name}<marker>
-# 0.2.2: stop reaps first (the gone probe of %8), then re-checks its own pane under the notice lock
--N display-message -p -t %8 #{pane_id}|#{@agent-id}
--N display-message -p -t %9 #{pane_id}|#{@agent-id}
-# :1409; 0.2.3 (#48): killed only while %9 is still its live launch, then probed: only a gone pane is signalled
-# and noticed
--N if-shell -F -t %9 '#{&&:#{==:#{pane_dead},0},#{==:#{pane_start_command},/bin/mux-agent launcher /state/agents/9/spec.json}}' 'kill-pane -t %9'
--N display-message -p -t %9 #{pane_id}|#{@agent-id}
 
 [status -BodyFile s.md, from a Claude agent]
 -N display-message -p -t %1 #{pid}|#{pane_pid}|#{session_id}|#{window_id}|#{@agent-id}

@@ -126,7 +126,7 @@ pub static VERBS: &[VerbDef] = &[
         min: 1,
         max: 1,
         usage: "usage: mux-agent stop <name> [-Text]",
-        handler: crate::agents::message::stop,
+        handler: crate::agents::message::stop_hc,
         text: json::lines,
     },
     VerbDef {
@@ -947,6 +947,7 @@ mod tests {
             w.fakes.clear_log();
             let (code, out) = call(w, tokens);
             assert_eq!(code, want, "{scenario}: {out}");
+            w.fakes.hc_done().unwrap();
             got.push_str(&render(w, scenario));
             got.push('\n');
         };
@@ -1014,7 +1015,16 @@ mod tests {
             &["read", "worker", "-Lines", "5"],
             0,
         );
-        record(&agents_world(), "stop worker", &["stop", "worker"], 0);
+        let w = agents_world();
+        let r = crate::agents::core_fixture::member(&w, ID, json!({}));
+        crate::agents::core_fixture::online(&w);
+        crate::agents::core_fixture::answer(&w, &["kill", "taaaaaaaaaaaa", "--json"], "{}");
+        crate::agents::core_fixture::get(
+            &w,
+            "taaaaaaaaaaaa",
+            crate::agents::core_fixture::wire(&r),
+        );
+        record(&w, "stop worker", &["stop", "worker"], 0);
         let w = World::agent(ID);
         w.agent_record(ID, json!({"pane": "%1"}));
         w.panes(&["%1|@1|100|aaaaaaaaaaaa|worker"]);
@@ -1462,17 +1472,21 @@ fn stop_hc_wire_order() {
     };
     let w = World::agent("");
     let r = cf::member(&w, ID, serde_json::json!({}));
-    cf::online(&w);
-    cf::answer(&w, &["kill", "taaaaaaaaaaaa", "--json"], "{}");
-    cf::get(&w, "taaaaaaaaaaaa", cf::wire(&r));
-    let def = VerbDef {
-        handler: crate::agents::message::stop_hc,
-        ..*VERBS.iter().find(|v| v.name == "stop").unwrap()
-    };
-    let reply = dispatch(&def, &w.request(&["stop", "worker"]), &w.ctx).unwrap();
-    assert_eq!(
-        crate::json::to_stdout(&Value::Object(reply)),
-        r#"{"ok":true,"verb":"stop","name":"worker","hcAddress":"taaaaaaaaaaaa","life":"running"}"#
-    );
-    w.fakes.hc_done().unwrap();
+    for (tokens, want) in [
+        (
+            vec!["stop", "worker"],
+            r#"{"ok":true,"verb":"stop","name":"worker","hcAddress":"taaaaaaaaaaaa","life":"running"}"#,
+        ),
+        (
+            vec!["stop", "worker", "-Text"],
+            "name: worker\nhcAddress: taaaaaaaaaaaa\nlife: running",
+        ),
+    ] {
+        cf::online(&w);
+        cf::answer(&w, &["kill", "taaaaaaaaaaaa", "--json"], "{}");
+        cf::get(&w, "taaaaaaaaaaaa", cf::wire(&r));
+        let args = tokens.into_iter().map(str::to_string).collect::<Vec<_>>();
+        assert_eq!(run(&args, || Ok(&w.ctx)), (0, want.into()));
+        w.fakes.hc_done().unwrap();
+    }
 }

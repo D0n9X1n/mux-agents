@@ -1,11 +1,13 @@
 use super::{
     core_fixture as cf,
     fixture::{ID, World},
-    message, registry,
+    registry,
 };
 use serde_json::{Value, json};
 fn call(w: &World) -> crate::error::Res<serde_json::Map<String, Value>> {
-    message::stop_hc(&w.ctx, &w.request(&["stop", "worker"]))
+    let args = ["stop", "worker"].map(str::to_string);
+    let (def, request) = crate::cli::parse(&args).unwrap();
+    (def.handler)(&w.ctx, &request)
 }
 #[test]
 fn stop_uses_hc_only() {
