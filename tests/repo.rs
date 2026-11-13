@@ -2362,7 +2362,7 @@ fn integration_runs_live_on_every_multiplexer() {
     assert!(lines.iter().any(|l| l.contains("rmux -V")), "{lines:#?}");
     // Every step that runs the live suite requires all three.
     let live: Vec<usize> = (0..lines.len())
-        .filter(|&i| lines[i].contains("--test live"))
+        .filter(|&i| lines[i].ends_with("--test live") || lines[i].contains("--test live "))
         .collect();
     assert!(!live.is_empty(), "{lines:#?}");
     for at in live {
@@ -2376,5 +2376,30 @@ fn integration_runs_live_on_every_multiplexer() {
             &lines[step..=at]
         );
         assert!(install < step, "{lines:#?}");
+    }
+}
+
+#[test]
+fn live_core_installer_precedes_tests() {
+    for job in ["integration", "integration-windows"] {
+        let lines = job_lines(&repo_file(".github/workflows/ci.yml"), job);
+        assert!(
+            line_of(&lines, "sh scripts/dev/hc.sh")
+                < line_of(&lines, "cargo test --features live,test-panic")
+        );
+        assert!(lines.iter().any(|l| l.contains("--test live_core")));
+    }
+    let script = repo_file("scripts/dev/hc.sh");
+    for needle in [
+        "0.1.21",
+        "linux-x86_64",
+        "macos-aarch64",
+        "macos-x86_64",
+        "windows-x86_64",
+        "curl --fail",
+        "shasum -a 256",
+        "System32/tar.exe",
+    ] {
+        assert!(script.contains(needle), "{needle}");
     }
 }

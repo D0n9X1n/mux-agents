@@ -179,6 +179,12 @@ jobs:
           line=$(printf '%s\n' "$out" | tail -n 1)
           case $line in MUX_AGENTS_TMUX32=/*) ;; *) echo "unexpected: $line"; exit 1 ;; esac
           echo "$line" >> "$GITHUB_ENV"
+      - name: Install private-test core binary 0.1.21
+        shell: bash
+        run: sh scripts/dev/hc.sh
+      - name: Private core fixture tests
+        shell: bash
+        run: cargo test --features live,test-panic --locked --test live_core -- --nocapture
       # A multiplexer the run cannot find fails the suite instead of skipping its tests (#71); the preflight prints
       # each one's version and binary.
       - name: Live preflight
@@ -237,6 +243,12 @@ jobs:
           set -euo pipefail
           rustup toolchain install 1.95.0 --profile minimal --component clippy
           rustup default 1.95.0
+      - name: Install private-test core binary 0.1.21
+        shell: bash
+        run: sh scripts/dev/hc.sh
+      - name: Private core fixture tests
+        shell: bash
+        run: cargo test --features live,test-panic --locked --test live_core -- --nocapture
       - name: Clippy with the live tests
         shell: bash
         run: cargo clippy --all-targets --features live,test-panic --locked -- -D warnings
