@@ -68,10 +68,21 @@ pub(crate) fn run(ctx: &Ctx, spec: &str, err: &mut dyn FnMut(&str), start: Start
         return 2;
     }
     let folder = given.parent().unwrap_or(given);
-    let code = match launch(ctx, given, folder, err, start) {
+    let spec_value = match claim_spec(given, folder) {
+        Ok(Some(v)) => v,
+        Ok(None) => return 0,
+        Err(refusal) => {
+            err(&format!(
+                "mux-agent: the launcher failed: {}",
+                refusal.message
+            ));
+            return 1;
+        }
+    };
+    let code = match launch(ctx, &spec_value, folder, err, start) {
         Ok(code) => code,
         Err(refusal) => {
-            // Any launcher failure still leaves an exit record, so the parent gets `exited`, never `lost`.
+            // A failure after the claim still leaves an exit record, so the parent gets `exited`, never `lost`.
             err(&format!(
                 "mux-agent: the launcher failed: {}",
                 refusal.message
@@ -145,14 +156,20 @@ fn unc(path: &str) -> bool {
     !drive
 }
 
+fn claim_spec(spec: &Path, folder: &Path) -> Res<Option<Value>> {
+    let v = read_json(spec)?.ok_or_else(|| Refusal::internal("the launch spec is missing"))?;
+    let gens = folder.join("gens");
+    std::fs::create_dir_all(&gens)?;
+    Ok(crate::state::fs::claim_json(&gens.join("0.claim"), &json!("run"))?.then_some(v))
+}
+
 fn launch(
     ctx: &Ctx,
-    spec: &Path,
+    launch: &Value,
     folder: &Path,
     err: &mut dyn FnMut(&str),
     start: Start,
 ) -> Res<i32> {
-    let launch = read_json(spec)?.ok_or_else(|| Refusal::internal("the launch spec is missing"))?;
     let exit_path = folder.join("launcher.json");
     // pid and start name this pane's own process, so stop can tell it from a reused pid.
     let mut record = Map::new();
@@ -538,6 +555,58 @@ mod tests {
     }
 
     #[test]
+    fn generation_fence() {
+        let l = setup("claude", json!([]));
+        assert_eq!(launch(&l, &spec_str(&l), exits_7).started.len(), 1);
+        let record = std::fs::read(l.folder.join("launcher.json")).unwrap();
+        let messages = mail(&l);
+        let second = launch(&l, &spec_str(&l), exits_7);
+        assert!(second.started.is_empty());
+        assert_eq!(second.code, 0);
+        assert_eq!(
+            std::fs::read(l.folder.join("launcher.json")).unwrap(),
+            record
+        );
+        assert_eq!(mail(&l), messages);
+        assert_eq!(
+            read_json(&l.folder.join("gens/0.claim")).unwrap(),
+            Some(json!("run"))
+        );
+        for value in [b"\"abandoned\"".as_slice(), b"\"run\"", b"corrupt", b""] {
+            let l = setup("claude", json!([]));
+            std::fs::create_dir(l.folder.join("gens")).unwrap();
+            std::fs::write(l.folder.join("gens/0.claim"), value).unwrap();
+            let r = launch(&l, &spec_str(&l), exits_7);
+            assert_eq!(r.code, 0);
+            assert!(r.started.is_empty());
+            assert!(!l.folder.join("launcher.json").exists());
+            assert!(mail(&l).is_empty());
+            assert_eq!(std::fs::read(l.folder.join("gens/0.claim")).unwrap(), value);
+        }
+    }
+
+    #[test]
+    fn generation_adversarial_active() {
+        let l = setup("claude", json!([]));
+        let mut seen = false;
+        let code = run(&l.w.ctx, &spec_str(&l), &mut |_| {}, &mut |_, _, _| {
+            seen = true;
+            let before = std::fs::read(l.folder.join("launcher.json")).unwrap();
+            let duplicate = launch(&l, &spec_str(&l), exits_7);
+            assert!(duplicate.started.is_empty());
+            assert_eq!(
+                std::fs::read(l.folder.join("launcher.json")).unwrap(),
+                before
+            );
+            assert!(mail(&l).is_empty());
+            Ok(7)
+        });
+        assert!(seen);
+        assert_eq!(code, 7);
+        assert_eq!(mail(&l).len(), 1);
+    }
+
+    #[test]
     fn abort_json_ends_1_without_client() {
         let l = setup("claude", json!(["--session-id", "s", "p"]));
         std::fs::remove_file(l.folder.join("commit.json")).unwrap();
@@ -705,7 +774,19 @@ mod tests {
         assert_eq!(launcher_json(&l)["exitCode"], 1);
         assert_eq!(notice_kind(&l), "exited");
         assert_eq!(mail(&l).len(), 1);
-        // A launcher error before the normal completion write: an exit record is still left.
+        // A failure after the claim (no args) still leaves the fallback exit record and the exited notice.
+        let l = setup("claude", json!(null));
+        let ran = launch(&l, &spec_str(&l), exits_7);
+        assert_eq!(ran.code, 1);
+        assert!(ran.started.is_empty());
+        assert_eq!(launcher_json(&l)["exitCode"], 1);
+        assert_eq!(notice_kind(&l), "exited");
+        assert_eq!(mail(&l).len(), 1);
+        assert_eq!(
+            read_json(&l.folder.join("gens/0.claim")).unwrap(),
+            Some(json!("run"))
+        );
+        // A failure before the claim (malformed spec) writes no record and no notice.
         let l = setup("claude", json!([]));
         std::fs::write(&l.spec, b"{not json").unwrap();
         let ran = launch(&l, &spec_str(&l), exits_7);
@@ -715,19 +796,8 @@ mod tests {
             ran.err,
             ["mux-agent: the launcher failed: unexpected error (state file is not JSON)"]
         );
-        assert_eq!(
-            launcher_json(&l),
-            json!({"pid": CALLER, "exitCode": 1, "exitedAt": "1970-01-01T00:00:00.0000000Z"})
-        );
-        assert_eq!(notice_kind(&l), "exited");
-        let messages = mail(&l);
-        assert_eq!(messages.len(), 1);
-        assert_eq!(messages[0]["body"], "worker exited with code 1.");
-        // Never lost afterwards: the pane is gone, and the sweep finds the notice already posted.
-        l.w.fakes.mux_first("#{pane_id}|#{@agent-id}", 0, "|\n", "");
-        crate::agents::registry::reap(&l.w.ctx, &l.w.caller(), None, false).unwrap();
-        assert_eq!(mail(&l).len(), 1);
-        assert_eq!(notice_kind(&l), "exited");
+        assert!(!l.folder.join("launcher.json").exists());
+        assert!(mail(&l).is_empty());
     }
 
     #[test]
