@@ -2950,178 +2950,216 @@ mod tests {
 
     #[test]
     fn record_then_commit_order() {
-        let w = human();
+        let w = hc_world(human());
+        let _reset = HcCommitReset;
         let agents = agents_dir(&w);
         let log = Rc::new(RefCell::new(Vec::new()));
         let (seen, dir) = (log.clone(), agents.clone());
-        w.fakes.mux_script("new-window", move |argv| {
-            let spec = PathBuf::from(argv.last().unwrap());
-            seen.borrow_mut()
-                .push(format!("launch spec {}", spec.is_file()));
-            let _ = &dir;
+        w.fakes.mux_script("new-window", move |_| {
+            let folder = std::fs::read_dir(&dir)
+                .unwrap()
+                .next()
+                .unwrap()
+                .unwrap()
+                .path();
+            assert!(
+                folder.join("record.json").is_file(),
+                "hc identity must precede attachment"
+            );
+            let r = read_json(&folder.join("record.json"));
+            assert_eq!(r["hcAddress"], "t1");
+            assert!(r.get("pane").is_none());
+            assert!(folder.join("spec.json").is_file());
+            assert!(!folder.join("commit.json").exists());
+            seen.borrow_mut().push("attach");
             Ok(Output {
-                code: 0,
-                stdout: "%9|@5|/bin/mux-agent launcher /s/spec.json\n".into(),
-                stderr: String::new(),
+                stdout: "%9|@5|hc attach t1\n".into(),
+                ..Output::default()
             })
         });
         let (seen, dir) = (log.clone(), agents.clone());
-        w.fakes.mux_script("set-option", move |argv| {
-            let command = argv.last().cloned().unwrap_or_default();
-            if command.contains("allow-set-title") {
-                seen.borrow_mut().push("allow-set-title".into());
-                return Ok(Output::default());
-            }
-            let id = command
-                .split(' ')
-                .skip_while(|t| *t != "@agent-id")
-                .nth(1)
-                .unwrap_or_default()
-                .to_string();
-            let folder = dir.join(id);
-            seen.borrow_mut().push(format!(
-                "tag record {} commit {}",
-                folder.join("record.json").exists(),
-                folder.join("commit.json").exists()
-            ));
+        w.fakes.mux_script("@agent-context", move |_| {
+            let folder = std::fs::read_dir(&dir)
+                .unwrap()
+                .next()
+                .unwrap()
+                .unwrap()
+                .path();
+            let r = read_json(&folder.join("record.json"));
+            assert_eq!(r["hcAddress"], "t1");
+            assert!(r.get("pane").is_none());
+            assert!(!folder.join("commit.json").exists());
+            seen.borrow_mut().push("tag");
             Ok(Output::default())
         });
-        // At the moment commit.json is written, record.json is already there and commit.json is not yet.
         let seen = log.clone();
-        commit_probe(Some(Box::new(move |folder: &Path| {
-            seen.borrow_mut().push(format!(
-                "commit: record {} commit {}",
-                folder.join("record.json").is_file(),
-                folder.join("commit.json").exists()
-            ));
+        w.fakes.mux_script("select-pane -T", move |_| {
+            seen.borrow_mut().push("title");
+            Ok(Output::default())
+        });
+        let seen = log.clone();
+        w.fakes.mux_script("allow-set-title", move |_| {
+            seen.borrow_mut().push("option");
+            Ok(Output::default())
+        });
+        let seen = log.clone();
+        commit_probe(Some(Box::new(move |folder| {
+            let r = read_json(&folder.join("record.json"));
+            assert_eq!(
+                (&r["pane"], &r["window"], &r["startCommand"]),
+                (&json!("%9"), &json!("@5"), &json!("hc attach t1"))
+            );
+            assert!(!folder.join("commit.json").exists());
+            seen.borrow_mut().push("commit");
         })));
-        w.fakes.clear_log();
-        let ok = reply(&run(&w, &["-Client", "claude", "-Task", "hi"]));
-        let id = ok["id"].as_str().unwrap();
+        let r = hc_attempt(&w, Client::Claude, None, false).unwrap();
         assert_eq!(
             *log.borrow(),
-            [
-                "launch spec true",
-                "tag record false commit false",
-                // Before the commit, so before the launcher starts the client.
-                "allow-set-title",
-                "commit: record true commit false"
-            ]
+            ["attach", "tag", "title", "option", "commit"]
         );
-        let caller = w.caller();
-        assert_eq!(
-            w.fakes.locks()[0],
-            format!("+spawn|{}|$3", caller.server_key)
-        );
-        // The tags, the title and the option, each bound to the command the reply named: the server writes them only
-        // while %9 still runs it.
-        let launched = "#{==:#{pane_start_command},/bin/mux-agent launcher /s/spec.json}";
-        let bound = |command: String| -> Vec<String> {
-            ["-N", "if-shell", "-F", "-t", "%9", launched]
-                .map(String::from)
-                .into_iter()
-                .chain([command])
-                .collect()
-        };
-        let tags = bound(format!(
-            "set-option -p -t %9 @agent-id {id} ; set-option -p -t %9 @agent-name hi ; \
-             set-option -p -t %9 @agent-parent %1 ; set-option -p -t %9 @agent-context brief:human ; \
-             select-pane -T hi -t %9"
-        ));
-        let title = bound("set-option -p -t %9 allow-set-title off".into());
-        assert_eq!(calls(&w, "if-shell"), [tags, title]);
-        assert!(calls(&w, "set-option").is_empty() && calls(&w, "select-pane").is_empty());
-        // Then one read shows %9 still that launch.
-        assert!(w.fakes.mux_calls().iter().any(|c| c[1] == "display-message"
-            && c[4] == "%9"
-            && c[5] == format!("#{{pane_id}}|{launched}")));
+        commit_probe(None);
+        let id = r["id"].as_str().unwrap();
         let folder = agents.join(id);
-        let record = json!({"schema": 1, "id": id, "name": "hi", "client": "claude",
-            "sessionId": ok["sessionId"], "context": "brief", "reason": "human", "session": "$3",
-            "pane": "%9", "window": "@5", "parentPane": "%1", "parentAgent": null,
-            "directory": w.ctx.cwd.to_str().unwrap(), "taskLine": "hi",
-            "createdAt": "1970-01-01T00:00:00.0000000Z", "color": "blue",
-            "startCommand": "/bin/mux-agent launcher /s/spec.json"});
+        let caller = w.caller();
+        let spec = folder.join("spec.json");
+        let argv = json!([
+            utf8(&w.ctx.exe).unwrap(),
+            "launcher",
+            utf8(&spec).unwrap(),
+            "--state-root",
+            utf8(&w.ctx.state_root).unwrap(),
+            "--path",
+            w.ctx.env.get("PATH").unwrap_or("")
+        ]);
+        let expected = json!({"schema":1,"id":id,"name":"hi","client":"claude","sessionId":r["sessionId"],
+            "context":"brief","reason":"human","session":"$3","team":format!("{}:$3",caller.server_key),"generation":"0","parentPane":"%1","parentAgent":null,
+            "directory":w.ctx.cwd,"taskLine":"hi","createdAt":"1970-01-01T00:00:00.0000000Z","color":"blue",
+            "hcAddress":"t1","launcherArgv":argv,"pane":"%9","window":"@5","startCommand":"hc attach t1"});
         assert_eq!(
             std::fs::read_to_string(folder.join("record.json")).unwrap(),
-            record.to_string()
+            expected.to_string()
         );
+        assert_eq!(r.to_string(), expected.to_string());
+        assert_eq!(read_json(&spec)["generation"], "0");
         assert_eq!(
-            std::fs::read_to_string(folder.join("commit.json")).unwrap(),
-            r#"{"committedAt":"1970-01-01T00:00:00.0000000Z"}"#
+            read_json(&folder.join("commit.json")),
+            json!({"committedAt":"1970-01-01T00:00:00.0000000Z"})
         );
-        let keys: Vec<String> = ok.as_object().unwrap().keys().cloned().collect();
-        assert_eq!(
-            keys,
+        let bound = |command: String| {
             [
-                "name",
-                "id",
-                "pane",
-                "window",
-                "client",
-                "sessionId",
-                "context",
-                "reason",
-                "model",
-                "placement",
-                "placementSource",
-                "sidebar"
+                "-N",
+                "if-shell",
+                "-F",
+                "-t",
+                "%9",
+                "#{==:#{pane_start_command},hc attach t1}",
+            ]
+            .map(String::from)
+            .into_iter()
+            .chain([command])
+            .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            calls(&w, "if-shell"),
+            [
+                bound(format!(
+                    "set-option -p -t %9 @agent-id {id} ; set-option -p -t %9 @agent-name hi ; set-option -p -t %9 @agent-parent %1 ; set-option -p -t %9 @agent-context brief:human"
+                )),
+                bound("select-pane -T hi -t %9".into()),
+                bound("set-option -p -t %9 allow-set-title off".into())
             ]
         );
-        assert_eq!(ok["model"], "inherited");
-        // A chosen model is recorded last and replied after reason; with none the record has no model.
-        let w = human();
-        let ok = reply(&run(
-            &w,
-            &["-Client", "claude", "-Task", "hi", "-Model", "sonnet"],
-        ));
-        assert_eq!(ok["model"], "sonnet");
-        let record = read_json(
+        assert!(calls(&w, "set-option").is_empty());
+        assert!(calls(&w, "select-pane").is_empty());
+        assert!(w.fakes.mux_calls().iter().any(|a| {
+            a == &[
+                "-N",
+                "display-message",
+                "-p",
+                "-t",
+                "%9",
+                "#{pane_id}|#{==:#{pane_start_command},hc attach t1}",
+            ]
+            .map(String::from)
+        }));
+        assert!(!r.as_object().unwrap().contains_key("model"));
+        let w = hc_world(human());
+        let r = hc_attempt(&w, Client::Claude, Some("sonnet"), false).unwrap();
+        assert_eq!(r["model"], "sonnet");
+        let names: Vec<_> = r.as_object().unwrap().keys().map(String::as_str).collect();
+        assert_eq!(
+            &names[16..],
+            [
+                "model",
+                "hcAddress",
+                "launcherArgv",
+                "pane",
+                "window",
+                "startCommand"
+            ]
+        );
+        let spec = read_json(
             &agents_dir(&w)
-                .join(ok["id"].as_str().unwrap())
-                .join("record.json"),
+                .join(r["id"].as_str().unwrap())
+                .join("spec.json"),
         );
         assert_eq!(
-            record.as_object().unwrap().keys().next_back().unwrap(),
-            "model"
+            spec["args"].as_array().unwrap()[2..4],
+            [json!("--model"), json!("sonnet")]
         );
-        assert_eq!(record["model"], "sonnet");
-        // A record that cannot be written is never committed: the launch aborts and the pane closes, and no commit
-        // was ever written.
-        let commits = Rc::new(RefCell::new(0));
-        let seen = commits.clone();
-        commit_probe(Some(Box::new(move |_: &Path| *seen.borrow_mut() += 1)));
-        let w = human();
-        let dir = agents_dir(&w);
-        w.fakes.mux_script("set-option", move |argv| {
-            let command = argv.last().cloned().unwrap_or_default();
-            let id = command
-                .split(' ')
-                .skip_while(|t| *t != "@agent-id")
-                .nth(1)
-                .map(str::to_string);
-            if let Some(id) = id {
-                std::fs::create_dir(dir.join(id).join("record.json")).unwrap();
+        for stage in ["before-attach", "after-tags"] {
+            let w = hc_world(human());
+            let _reset = HcCommitReset;
+            let commits = Rc::new(Cell::new(0));
+            let seen = commits.clone();
+            commit_probe(Some(Box::new(move |_| seen.set(seen.get() + 1))));
+            if stage == "before-attach" {
+                w.fakes.hc_probe(|a| {
+                    if a[0] == "run" {
+                        let i = a.iter().position(|v| v == "launcher").unwrap();
+                        std::fs::create_dir(
+                            Path::new(&a[i + 1]).parent().unwrap().join("record.json"),
+                        )
+                        .unwrap();
+                    }
+                });
+            } else {
+                let agents = agents_dir(&w);
+                w.fakes.mux_script("@agent-context", move |_| {
+                    let path = std::fs::read_dir(&agents)
+                        .unwrap()
+                        .next()
+                        .unwrap()
+                        .unwrap()
+                        .path()
+                        .join("record.json");
+                    std::fs::remove_file(&path).unwrap();
+                    std::fs::create_dir(path).unwrap();
+                    Ok(Output::default())
+                });
             }
-            Ok(Output::default())
-        });
-        w.fakes
-            .mux_first("-t %9 #{pane_id}|#{@agent-id}", 0, "|\n", "");
-        assert_eq!(
-            run(&w, &["-Client", "claude", "-Task", "hi"]),
-            "1 launch the agent did not start; its pane was closed"
-        );
-        let folder = agents_dir(&w).join(&agent_folders(&w)[0]);
-        assert!(folder.join("abort.json").is_file() && !folder.join("commit.json").exists());
-        assert_eq!(
-            calls(&w, "if-shell")
-                .iter()
-                .filter(|c| c[6].starts_with("kill-pane"))
-                .count(),
-            1
-        );
-        assert_eq!(*commits.borrow(), 0);
-        commit_probe(None);
+            assert!(hc_attempt(&w, Client::Claude, None, true).is_err());
+            assert_eq!(commits.get(), 0);
+            let folder = agents_dir(&w).join(&agent_folders(&w)[0]);
+            assert!(!folder.join("commit.json").exists());
+            let a = read_json(&folder.join("abort.json"));
+            assert_eq!(a["kill"], "acknowledged");
+            assert_eq!(
+                a["viewCleanup"],
+                if stage == "before-attach" {
+                    json!("unproven")
+                } else {
+                    json!({"gone":true})
+                }
+            );
+            assert_eq!(
+                calls(&w, "if-shell")
+                    .iter()
+                    .filter(|a| a[6] == "kill-pane -t %9")
+                    .count(),
+                usize::from(stage == "after-tags")
+            );
+        }
     }
 
     #[test]
