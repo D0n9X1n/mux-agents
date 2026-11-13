@@ -343,6 +343,8 @@ mod tests {
             ("hc 0.10.0", true),
             ("hc 1.0.0", true),
             ("hc 0.1.21-rc.1", false),
+            ("xx 0.1.21", false),
+            ("hc 0.1.21.1", false),
             ("0.1.21", false),
             ("hc 0.1", false),
             ("hc 0.1.21 x", false),
