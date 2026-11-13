@@ -119,31 +119,7 @@ pub fn focus_pane(ctx: &Ctx, caller: &Caller, name: &str, expected: Option<&str>
             "the agent is no longer on the pane the bar drew",
         );
     }
-    let p = pane.pane.as_str();
-    let select = registry::bound(
-        p,
-        pane.launch.live(),
-        format!("select-window -t {p} ; select-pane -t {p}"),
-    );
-    let select: Vec<&str> = select.iter().map(String::as_str).collect();
-    // Only the read-back decides: a select that failed, or a read that failed as a call, is no proof of focus.
-    let _ = native(ctx, &select, true);
-    let probe = format!(
-        "#{{pane_id}}|#{{window_active}}|#{{pane_active}}|{}",
-        pane.launch.live()
-    );
-    let focused =
-        native(ctx, &["display-message", "-p", "-t", p, &probe], true).is_ok_and(|read| {
-            read.code == 0 && read.stdout.trim_end_matches(['\r', '\n']) == format!("{p}|1|1|1")
-        });
-    if !focused {
-        return refuse(2, "target", "the agent's pane is no longer its launch");
-    }
-    Ok(Focused {
-        name: pane.name,
-        pane: pane.pane,
-        window: pane.window,
-    })
+    select_view(ctx, &pane.name, &pane.pane, &pane.window, &pane.launch)
 }
 
 /// The positional the verb table requires.
@@ -259,6 +235,117 @@ pub fn report(ctx: &Ctx, request: &Request) -> Res<Map<String, Value>> {
     reply.insert("kind".into(), kind);
     reply.insert("since".into(), since);
     Ok(reply)
+}
+
+fn select_view(
+    ctx: &Ctx,
+    name: &str,
+    pane: &str,
+    window: &str,
+    launch: &registry::Launch,
+) -> Res<Focused> {
+    let select = registry::bound(
+        pane,
+        launch.live(),
+        format!("select-window -t {pane} ; select-pane -t {pane}"),
+    );
+    let select: Vec<&str> = select.iter().map(String::as_str).collect();
+    // Only the read-back decides: a select that failed, or a read that failed as a call, is no proof of focus.
+    let _ = native(ctx, &select, true);
+    let probe = format!(
+        "#{{pane_id}}|#{{window_active}}|#{{pane_active}}|{}",
+        launch.live()
+    );
+    let focused =
+        native(ctx, &["display-message", "-p", "-t", pane, &probe], true).is_ok_and(|r| {
+            r.code == 0 && r.stdout.trim_end_matches(['\r', '\n']) == format!("{pane}|1|1|1")
+        });
+    if !focused {
+        return refuse(2, "target", "the agent's pane is no longer its launch");
+    }
+    Ok(Focused {
+        name: name.into(),
+        pane: pane.into(),
+        window: window.into(),
+    })
+}
+pub fn focus_hc(
+    ctx: &Ctx,
+    core: &crate::hc::Core<'_>,
+    caller: &Caller,
+    name: &str,
+    expected: Option<&str>,
+) -> Res<Focused> {
+    let id = super::member_target::named(ctx, caller, name)?;
+    lock(ctx, &lock_key("member", caller, &id.id), || {
+        let record = super::member_target::current(ctx, caller, &id)?;
+        let pane = id.view(&record, &registry::rows(ctx, caller)?);
+        if expected.is_some_and(|e| pane.as_ref().is_none_or(|p| p.pane != e)) {
+            return refuse(
+                2,
+                "target",
+                "the agent is no longer on the pane the bar drew",
+            );
+        }
+        match pane {
+            Some(p) => select_view(ctx, &p.name, &p.pane, &p.window, &p.launch),
+            None => restore_view(ctx, core, caller, &id, record),
+        }
+    })
+}
+
+fn restore_view(
+    ctx: &Ctx,
+    core: &crate::hc::Core<'_>,
+    caller: &Caller,
+    id: &super::core_identity::Identity,
+    mut record: Value,
+) -> Res<Focused> {
+    let placement = super::placement::read_placement(ctx, caller)
+        .ok()
+        .flatten()
+        .unwrap_or(super::placement::DEFAULT);
+    let mut created = None;
+    let result: Res<super::spawn::Created> = (|| {
+        attach_core(
+            ctx,
+            core,
+            caller,
+            &record,
+            (placement != "tab").then_some(placement),
+            &mut created,
+        )?;
+        let v = created
+            .as_ref()
+            .ok_or_else(|| crate::error::Refusal::internal("unproven new view"))?;
+        record["pane"] = v.pane.clone().into();
+        record["window"] = v.window.clone().into();
+        record["startCommand"] = v.command.clone().into();
+        write_json(
+            &super::server_dir(ctx, caller)
+                .join("agents")
+                .join(&id.id)
+                .join("record.json"),
+            &record,
+        )?;
+        Ok(v.clone())
+    })();
+    if result.is_err()
+        && let Some(v) = &created
+    {
+        let _ = clean_core(ctx, v);
+    }
+    let v = result?;
+    select_view(
+        ctx,
+        &id.name,
+        &v.pane,
+        &v.window,
+        &registry::Launch {
+            command: v.command,
+            pid: None,
+        },
+    )
 }
 
 #[cfg(test)]

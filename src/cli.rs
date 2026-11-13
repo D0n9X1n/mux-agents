@@ -1452,3 +1452,27 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+#[test]
+fn stop_hc_wire_order() {
+    use crate::agents::{
+        core_fixture as cf,
+        fixture::{ID, World},
+    };
+    let w = World::agent("");
+    let r = cf::member(&w, ID, serde_json::json!({}));
+    cf::online(&w);
+    cf::answer(&w, &["kill", "taaaaaaaaaaaa", "--json"], "{}");
+    cf::get(&w, "taaaaaaaaaaaa", cf::wire(&r));
+    let def = VerbDef {
+        handler: crate::agents::message::stop_hc,
+        ..*VERBS.iter().find(|v| v.name == "stop").unwrap()
+    };
+    let reply = dispatch(&def, &w.request(&["stop", "worker"]), &w.ctx).unwrap();
+    assert_eq!(
+        crate::json::to_stdout(&Value::Object(reply)),
+        r#"{"ok":true,"verb":"stop","name":"worker","hcAddress":"taaaaaaaaaaaa","life":"running"}"#
+    );
+    w.fakes.hc_done().unwrap();
+}

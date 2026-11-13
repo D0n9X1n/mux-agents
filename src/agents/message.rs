@@ -550,6 +550,63 @@ fn tree(table: &[Row], root: u32) -> Vec<&Row> {
     tree
 }
 
+pub fn capture_hc(
+    ctx: &Ctx,
+    caller: &crate::caller::Caller,
+    name: &str,
+    expected: Option<&str>,
+    lines: i32,
+) -> Res<(registry::Pane, String)> {
+    if !(1..=2000).contains(&lines) {
+        return Err(usage("read"));
+    }
+    let id = super::member_target::named(ctx, caller, name)?;
+    lock(ctx, &lock_key("member", caller, &id.id), || {
+        let record = super::member_target::current(ctx, caller, &id)?;
+        let Some(pane) = id.view(&record, &registry::rows(ctx, caller)?) else {
+            return refuse(
+                2,
+                "target",
+                format!("the agent has no live view; run focus {name}"),
+            );
+        };
+        if expected.is_some_and(|e| e != pane.pane) {
+            return refuse(
+                2,
+                "target",
+                "the agent is no longer on the pane the bar drew",
+            );
+        }
+        let tail = capture(ctx, &pane, lines)?;
+        Ok((pane, tail))
+    })
+}
+
+pub fn stop_hc(ctx: &Ctx, request: &Request) -> Res<Map<String, Value>> {
+    let caller = resolve(ctx)?;
+    let id = super::member_target::named(ctx, &caller, first(request))?;
+    registry::with_member_notice(ctx, &caller, &id.id, || {
+        let record = super::member_target::current(ctx, &caller, &id)?;
+        parent_or_human(&caller, &record)?;
+        let core = crate::hc::connect(ctx)?;
+        core.kill(&id.address)?;
+        let fact = core.get(&id.address).ok().filter(|t| id.matches(t));
+        use super::lifecycle::{Life, classify};
+        let life = match classify(fact.as_ref(), &id.launcher) {
+            Life::Running => "running",
+            Life::Lost => "lost",
+            Life::Ended => "ended",
+            Life::Unknown => "unknown",
+        };
+        add_notice(ctx, &caller, &id.id, &record, Notice::Stopped)?;
+        let mut reply = Map::new();
+        reply.insert("name".into(), id.name.clone().into());
+        reply.insert("hcAddress".into(), id.address.clone().into());
+        reply.insert("life".into(), life.into());
+        Ok(reply)
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

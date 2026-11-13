@@ -18,12 +18,17 @@ pub mod core_identity;
 pub mod core_launch;
 pub mod lifecycle;
 pub mod mail;
+pub(crate) mod member_target;
 pub mod membership;
 pub mod message;
 pub mod placement;
 pub mod registry;
 pub mod spawn;
+#[cfg(test)]
+mod stop_hc_tests;
 pub mod view;
+#[cfg(test)]
+mod view_hc_tests;
 
 /// `<root>/<serverKey>`; reads use it as is and never create it.
 /// True when the agent in `folder` is committed: commit.json is there and is no launcher's give-up (#97). Spawn and
