@@ -562,3 +562,57 @@ fn a_candidate_never_acts_as_a_member() {
         w.fakes.hc_done().unwrap();
     }
 }
+/// Production has no multiplexer until the caller is resolved: a candidate refuses 2 `tagged` before any is made, so it
+/// never sees an endpoint error and no multiplexer runs.
+#[test]
+fn a_candidate_is_refused_before_any_multiplexer() {
+    for verb in ["report", "read"] {
+        let (w, c, r, folder) = worker();
+        crate::agents::mail::add_mail(&w.ctx, &c, ID, "root", "%1", "hello", None).unwrap();
+        let (a, mut t) = (r["hcAddress"].as_str().unwrap().to_string(), wire(&r));
+        // Proven at dispatch, a candidate in the handler's own resolution.
+        cf::online(&w);
+        cf::get(&w, &a, t.clone());
+        t["pid"] = 31338.into();
+        w.fakes.process(crate::testing::row(31338, 1, 900));
+        cf::online(&w);
+        cf::get(&w, &a, t);
+        *w.ctx.mux.borrow_mut() = None;
+        assert!(
+            w.ctx.env.get("PATH").is_none(),
+            "no multiplexer can be found"
+        );
+        let args: Vec<String> = if verb == "report" {
+            vec!["report".into(), "blocked".into()]
+        } else {
+            vec!["read".into()]
+        };
+        let (code, out) = crate::cli::run(&args, || Ok(&w.ctx));
+        assert_eq!(
+            (code, out.contains(r#""check":"tagged""#)),
+            (2, true),
+            "{verb}: {out}"
+        );
+        assert!(!out.contains("endpoint"), "{verb}: {out}");
+        assert!(
+            w.ctx.mux.borrow().is_none(),
+            "{verb}: no multiplexer was made"
+        );
+        assert!(
+            w.fakes.mux_calls().is_empty(),
+            "{verb}: no multiplexer call"
+        );
+        assert!(
+            !folder.join("activity.json").exists(),
+            "{verb}: no member write"
+        );
+        assert_eq!(
+            crate::agents::mail::read_mail(&w.ctx, &c, ID)
+                .unwrap()
+                .len(),
+            1,
+            "{verb}: mailbox unread"
+        );
+        w.fakes.hc_done().unwrap();
+    }
+}
