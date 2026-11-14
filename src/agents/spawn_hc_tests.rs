@@ -23,6 +23,7 @@ fn request(w: &World) -> CoreRequest<'_> {
         directory: &w.ctx.cwd,
         model: None,
         no_fork: true,
+        effort: None,
         split: None,
         resume: None,
         leader: None,

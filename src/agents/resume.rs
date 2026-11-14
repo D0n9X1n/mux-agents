@@ -60,6 +60,7 @@ pub fn resume(ctx: &Ctx, request: &Request) -> Res<Map<String, Value>> {
                 directory: Path::new(&directory),
                 model: None,
                 no_fork: true,
+                effort: None,
                 split,
                 resume: Some(&resumed),
                 leader: None,

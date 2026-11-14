@@ -156,6 +156,7 @@ fn create(ctx: &Ctx, caller: &Caller, core: &Core<'_>, plan: &Plan<'_>) -> Res<M
             directory: plan.folder,
             model: None,
             no_fork: true,
+            effort: None,
             split: None,
             resume: None,
             leader: Some(&leader),
