@@ -36,8 +36,8 @@ fn drawn_target_restores_detached_but_refuses_stale_attached() {
             &w.ctx,
             &c,
             &Target {
-                name: "worker".into(),
-                pane: drawn.into(),
+                id: ID.into(),
+                ..Target::new("worker", drawn)
             },
         );
         assert_eq!(got.as_ref().ok().map(|f| f.pane.as_str()), want);
@@ -96,7 +96,7 @@ fn click_next_prev_enter_reopen_detached_and_select_attached() {
             w.fakes
                 .mux_rule("capture-pane", 0, "40\n \u{25c9} worker\n", "");
             cf::online(&w);
-            let board = json!({"agents":[{"name":"worker","state":"running","pane":if present {json!("%9")} else {Value::Null}}]});
+            let board = json!({"agents":[{"id":ID,"name":"worker","state":"running","pane":if present {json!("%9")} else {Value::Null}}]});
             let target = pick::resolve(board.as_object().unwrap(), "worker").unwrap();
             let mut shown = Shown {
                 written: SystemTime::UNIX_EPOCH,
@@ -150,8 +150,8 @@ fn peek_detached_refuses_without_reopening_or_capturing() {
         &w.ctx,
         &c,
         &Target {
-            name: "worker".into(),
-            pane: String::new(),
+            id: ID.into(),
+            ..Target::new("worker", "")
         },
     )
     .unwrap_err();

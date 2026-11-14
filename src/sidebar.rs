@@ -13,7 +13,7 @@ use serde_json::{Map, Value};
 
 use crate::agents::board::{ENDED_MAX, board};
 use crate::agents::spawn::{pane_env, utf8};
-use crate::agents::view::{Focused, focus_hc};
+use crate::agents::view::Focused;
 use crate::agents::{lock, lock_key, pane_id, text};
 use crate::caller::{Caller, resolve};
 use crate::cli::Request;
@@ -611,10 +611,7 @@ fn live_row(row: &Map<String, Value>, cols: usize, look: Look) -> Live {
         compact: margin(compact),
         doing: (!doing.is_empty()).then(|| indented(doing, cols)),
         age: row.get("age").and_then(Value::as_i64),
-        target: Target {
-            name,
-            pane: clean(row.get("pane")),
-        },
+        target: Target::of(row),
     }
 }
 
@@ -974,10 +971,10 @@ fn with_hint(
     if fits { hinted } else { bare }
 }
 
-/// Marks `name`'s drawn row as selected: its margin becomes `▸` (`>` in ASCII) and, with color, the rest of the row
-/// is reversed. Nothing when `name` is not drawn.
-fn mark(laid: &mut Laid, name: &str, look: Look) {
-    let Some(&(_, at)) = laid.agents.iter().find(|(target, _)| target.name == name) else {
+/// Marks member `id`'s drawn row as selected: its margin becomes `▸` (`>` in ASCII) and, with color, the rest of the
+/// row is reversed. Nothing when `id` is not drawn.
+fn mark(laid: &mut Laid, id: &str, look: Look) {
+    let Some(&(_, at)) = laid.agents.iter().find(|(target, _)| target.id == id) else {
         return;
     };
     let row = &mut laid.rows[at];
@@ -1474,9 +1471,9 @@ pub fn run_watch(
         let bare = lay(last.as_ref(), &notes, size, look);
         pick.follow(&targets(&bare));
         let laid = match pick.selected() {
-            Some(name) => {
+            Some(id) => {
                 let mut laid = with_hint(last.as_ref(), &notes, size, look);
-                mark(&mut laid, name, look);
+                mark(&mut laid, id, look);
                 laid
             }
             None => bare,
@@ -1807,18 +1804,16 @@ struct Shown {
 
 fn focus_target_hc(ctx: &Ctx, caller: &Caller, target: &Target) -> Res<Focused> {
     let core = crate::hc::connect(ctx)?;
-    focus_hc(
-        ctx,
-        &core,
-        caller,
-        &target.name,
-        (!target.pane.is_empty()).then_some(target.pane.as_str()),
-    )
+    let drawn = (!target.pane.is_empty()).then_some(target.pane.as_str());
+    match crate::agents::view::focus_member(ctx, Some(&core), caller, &target.id, drawn)? {
+        crate::agents::view::Member::Focused(focused) => Ok(focused),
+        _ => refuse(2, "target", "no unique committed member has that identity"),
+    }
 }
 impl Shown {
     fn focused(&mut self, focused: Focused) {
         for target in &mut self.targets {
-            if target.name == focused.name {
+            if target.id == focused.id {
                 target.pane = focused.pane.clone();
             }
         }
@@ -1917,13 +1912,12 @@ fn peek(ctx: &Ctx, caller: &Caller, target: &Target) -> Res<()> {
             "peek needs a state folder path of plain characters",
         );
     }
-    let (_, text) = crate::agents::message::capture_hc(
+    let (_, text) = crate::agents::message::capture_member(
         ctx,
         caller,
-        &target.name,
+        &target.id,
         (!target.pane.is_empty()).then_some(target.pane.as_str()),
         PEEK_LINES,
-        None,
     )?;
     let file = folder.join(format!(
         "peek-{}.txt",
@@ -3374,10 +3368,7 @@ mod tests {
     }
 
     fn target(name: &str, pane: &str) -> Target {
-        Target {
-            name: name.into(),
-            pane: pane.into(),
-        }
+        Target::new(name, pane)
     }
 
     // A line as a pane `w` columns wide shows it: pieces of at most `w` columns, the first its head.
@@ -4020,8 +4011,8 @@ mod tests {
             .mux_first("show-buffer", 0, "line one\nline two\n", "");
         w.fakes.clear_log();
         let target = Target {
-            name: "worker".into(),
-            pane: "%9".into(),
+            id: ID.into(),
+            ..Target::new("worker", "%9")
         };
         peek(&w.ctx, &caller, &target).unwrap();
         let calls = w.fakes.mux_calls();
@@ -4088,8 +4079,8 @@ mod tests {
                 .any(|a| a.contains("capture-pane") || a == "run-shell")
         }));
         let moved = Target {
-            name: "worker".into(),
-            pane: "%4".into(),
+            id: ID.into(),
+            ..Target::new("worker", "%4")
         };
         w.fakes.clear_log();
         assert!(peek(&w.ctx, &caller, &moved).is_err());

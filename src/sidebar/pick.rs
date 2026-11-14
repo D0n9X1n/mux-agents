@@ -4,11 +4,62 @@ use serde_json::{Map, Value};
 
 use super::keys::Event;
 
-/// A live agent the bar can focus: its name and its pane.
+/// An agent row the bar can open: its member id (its name on a feed without ids), name, pane and life.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Target {
+    pub id: String,
     pub name: String,
     pub pane: String,
+    pub life: String,
+}
+
+impl Target {
+    /// A board row as the bar draws it, each field cleaned.
+    pub fn of(row: &Map<String, Value>) -> Target {
+        let (name, id) = (super::clean(row.get("name")), super::clean(row.get("id")));
+        let life = match super::clean(row.get("life")) {
+            life if !life.is_empty() => life,
+            _ if super::clean(row.get("state")) == "running" => "running".into(),
+            _ => "ended".into(),
+        };
+        Target {
+            id: if id.is_empty() { name.clone() } else { id },
+            pane: super::clean(row.get("pane")),
+            life,
+            name,
+        }
+    }
+
+    #[cfg(test)]
+    pub fn new(name: &str, pane: &str) -> Target {
+        Target {
+            id: name.into(),
+            name: name.into(),
+            pane: pane.into(),
+            life: "running".into(),
+        }
+    }
+}
+
+/// B10 `n`/`N`: the next (`forward`) or previous agent of `walk` after `from` with a live view, wrapping; from none,
+/// the first (last) with one; none when no agent has one.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "shortcut: no caller until the team bar's keys and open (Tasks 11-12, #103); remove this then"
+    )
+)]
+pub fn step_live(walk: &[Target], from: Option<usize>, forward: bool) -> Option<usize> {
+    let n = walk.len();
+    (1..=n)
+        .map(|k| match (from, forward) {
+            (Some(f), true) => (f + k) % n,
+            (Some(f), false) => (f + n - k) % n,
+            (None, true) => k - 1,
+            (None, false) => n - k,
+        })
+        .find(|&at| !walk[at].pane.is_empty())
 }
 
 /// The answer of `display-message -p '#{pane_width}' ; capture-pane -p`: its first line is the width, then the rows.
@@ -46,10 +97,7 @@ pub fn resolve(board: &Map<String, Value>, shown: &str) -> Option<Target> {
         .iter()
         .filter_map(Value::as_object)
         .filter(|row| super::clean(row.get("state")) == "running")
-        .map(|row| Target {
-            name: super::clean(row.get("name")),
-            pane: super::clean(row.get("pane")),
-        })
+        .map(Target::of)
         .filter(|target| match cut {
             Some(head) => target.name.starts_with(head),
             None => target.name == shown,
@@ -83,18 +131,19 @@ pub enum Act {
     Focus(Target),
 }
 
-/// The keyboard selection (a name and its ordinal among the drawn agents) and the `focus failed` note (a name and
-/// the ticks it has been shown).
+/// The keyboard selection (a member id and its ordinal among the drawn agents), the note (its text and the ticks it has
+/// been shown) and whether keys wrap.
 #[derive(Debug, Default)]
 pub struct Pick {
     chosen: Option<(String, usize)>,
-    failed: Option<(String, u8)>,
+    note: Option<(String, u8)>,
+    wrap: bool,
 }
 
 impl Pick {
-    /// A key against the agents drawn now. Down and Up select the top or bottom agent first, then move one at a time
-    /// with no wrap; Enter selects the top agent first, then focuses the selected one; Esc clears. Every key dismisses
-    /// the note and draws again; any other event does nothing.
+    /// A key against the agents drawn now. Down and Up select the top or bottom agent first, then move one at a time,
+    /// wrapping only in a team (`set_wrap`); Enter selects the top agent first, then focuses the selected one; Esc
+    /// clears. Every key dismisses the note and draws again; any other event does nothing.
     pub fn key(&mut self, event: Event, drawn: &[Target]) -> Act {
         if !matches!(event, Event::Up | Event::Down | Event::Enter | Event::Esc) {
             return Act::Nothing;
@@ -105,9 +154,17 @@ impl Pick {
             (Event::Esc, _, _) | (_, _, None) => None,
             (Event::Enter, Some(at), _) => Some(at),
             (Event::Down | Event::Enter, None, _) => Some(0),
-            (Event::Down, Some(at), Some(last)) => Some((at + 1).min(last)),
+            (Event::Down, Some(at), Some(last)) => Some(if self.wrap && at == last {
+                0
+            } else {
+                (at + 1).min(last)
+            }),
             (Event::Up, None, Some(last)) => Some(last),
-            (Event::Up, Some(at), _) => Some(at.saturating_sub(1)),
+            (Event::Up, Some(at), Some(last)) => Some(if self.wrap && at == 0 {
+                last
+            } else {
+                at.saturating_sub(1)
+            }),
             // Not a selection key: returned above.
             (
                 Event::Press { .. }
@@ -122,8 +179,8 @@ impl Pick {
                 return Act::Nothing;
             }
         };
-        self.failed = None;
-        self.chosen = next.map(|at| (drawn[at].name.clone(), at));
+        self.note = None;
+        self.chosen = next.map(|at| (drawn[at].id.clone(), at));
         match (event, at.and_then(|at| drawn.get(at))) {
             (Event::Enter, Some(target)) => Act::Focus(target.clone()),
             _ => Act::Redraw,
@@ -132,31 +189,31 @@ impl Pick {
 
     /// The selected agent, if any, among `drawn`.
     pub fn chosen<'a>(&self, drawn: &'a [Target]) -> Option<&'a Target> {
-        let (name, _) = self.chosen.as_ref()?;
-        drawn.iter().find(|t| t.name == *name)
+        let (id, _) = self.chosen.as_ref()?;
+        drawn.iter().find(|t| t.id == *id)
     }
 
     /// A mouse press: it dismisses the note.
     pub fn pressed(&mut self) {
-        self.failed = None;
+        self.note = None;
     }
 
-    /// The selection against the agents drawn now: the same name where it is now, else the agent at its former
+    /// The selection against the agents drawn now: the same member id where it is now, else the agent at its former
     /// ordinal, else the last; with none drawn it clears.
     pub fn follow(&mut self, drawn: &[Target]) {
-        let Some((name, at)) = self.chosen.take() else {
+        let Some((id, at)) = self.chosen.take() else {
             return;
         };
         let at = drawn
             .iter()
-            .position(|target| target.name == name)
+            .position(|target| target.id == id)
             .or_else(|| drawn.len().checked_sub(1).map(|last| at.min(last)));
-        self.chosen = at.map(|at| (drawn[at].name.clone(), at));
+        self.chosen = at.map(|at| (drawn[at].id.clone(), at));
     }
 
-    /// The selected agent's name.
+    /// The selected agent's member id.
     pub fn selected(&self) -> Option<&str> {
-        self.chosen.as_ref().map(|(name, _)| name.as_str())
+        self.chosen.as_ref().map(|(id, _)| id.as_str())
     }
 
     /// The selected agent was focused: the selection clears.
@@ -164,26 +221,61 @@ impl Pick {
         self.chosen = None;
     }
 
+    /// Keys wrap at both ends: a team's bar, #103 B10.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "shortcut: no caller until the team bar's keys and open (Tasks 11-12, #103); remove this then"
+        )
+    )]
+    pub fn set_wrap(&mut self, wrap: bool) {
+        self.wrap = wrap;
+    }
+
+    /// Selects `drawn[at]` (`n`/`N` in a team), dismissing the note.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "shortcut: no caller until the team bar's keys and open (Tasks 11-12, #103); remove this then"
+        )
+    )]
+    pub fn select(&mut self, drawn: &[Target], at: usize) {
+        self.note = None;
+        self.chosen = drawn.get(at).map(|t| (t.id.clone(), at));
+    }
+
+    /// Opening `name` showed nothing (#103 B6).
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "shortcut: no caller until the team bar's keys and open (Tasks 11-12, #103); remove this then"
+        )
+    )]
+    pub fn nothing(&mut self, name: &str) {
+        self.note = Some((format!("nothing to open for {name}"), 0));
+    }
+
     /// Focusing `name` failed: the note shows it until a key, a press or its second tick.
     pub fn failed(&mut self, name: &str) {
-        self.failed = Some((name.to_string(), 0));
+        self.note = Some((format!("focus failed: {name}"), 0));
     }
 
     /// One tick of the bar: the note clears at its second.
     pub fn ticked(&mut self) {
-        if let Some((_, ticks)) = self.failed.as_mut() {
+        if let Some((_, ticks)) = self.note.as_mut() {
             *ticks += 1;
             if *ticks >= 2 {
-                self.failed = None;
+                self.note = None;
             }
         }
     }
 
-    /// The note the bar draws while a focus failure is shown.
+    /// The note the bar draws while one is shown: a focus failure, or nothing to open.
     pub fn note(&self) -> Option<String> {
-        self.failed
-            .as_ref()
-            .map(|(name, _)| format!("focus failed: {name}"))
+        self.note.as_ref().map(|(text, _)| text.clone())
     }
 }
 
@@ -215,10 +307,7 @@ mod tests {
     }
 
     fn target(name: &str) -> Target {
-        Target {
-            name: name.into(),
-            pane: format!("%{}", name.len()),
-        }
+        Target::new(name, &format!("%{}", name.len()))
     }
 
     fn drawn(names: &[&str]) -> Vec<Target> {
@@ -297,18 +386,9 @@ mod tests {
     #[test]
     fn step_goes_next_and_prev_in_drawn_order_and_wraps() {
         let drawn = [
-            Target {
-                name: "b".into(),
-                pane: "%11".into(),
-            },
-            Target {
-                name: "c".into(),
-                pane: "%12".into(),
-            },
-            Target {
-                name: "a".into(),
-                pane: "%10".into(),
-            },
+            Target::new("b", "%11"),
+            Target::new("c", "%12"),
+            Target::new("a", "%10"),
         ];
         let name = |t: Option<&Target>| t.map(|t| t.name.clone());
         assert_eq!(name(step(&drawn, None, true)), Some("b".into()));
@@ -333,10 +413,7 @@ mod tests {
         let worker = json!({"name": "worker", "state": "running", "pane": "%9"});
         let word = json!({"name": "word", "state": "running", "pane": "%4"});
         let ended = json!({"name": "worker", "state": "exited", "pane": "%3"});
-        let found = Some(Target {
-            name: "worker".into(),
-            pane: "%9".into(),
-        });
+        let found = Some(Target::new("worker", "%9"));
         let one = board(json!([worker, ended]));
         assert_eq!(resolve(&one, "worker"), found);
         assert_eq!(resolve(&one, "wor..."), found);
@@ -345,10 +422,7 @@ mod tests {
         assert_eq!(resolve(&board(json!([worker, word])), "wor..."), None);
         assert_eq!(
             resolve(&board(json!([worker, word])), "word"),
-            Some(Target {
-                name: "word".into(),
-                pane: "%4".into(),
-            })
+            Some(Target::new("word", "%4"))
         );
         assert_eq!(resolve(&board(json!([ended])), "worker"), None);
         // Two running agents with the same name: ambiguous, so neither.
@@ -478,5 +552,63 @@ mod tests {
         pick.failed("worker");
         pick.pressed();
         assert_eq!(pick.note(), None);
+    }
+
+    #[test]
+    fn selection_follows_the_member_id_not_the_name() {
+        let a = Target {
+            id: "aaaaaaaaaaaa".into(),
+            ..Target::new("twin", "%1")
+        };
+        let b = Target {
+            id: "bbbbbbbbbbbb".into(),
+            ..Target::new("twin", "")
+        };
+        let mut pick = Pick::default();
+        pick.key(Event::Down, &[a.clone(), b.clone()]);
+        pick.key(Event::Down, &[a.clone(), b.clone()]);
+        assert_eq!(pick.selected(), Some("bbbbbbbbbbbb"));
+        let swapped = [b.clone(), a.clone()];
+        pick.follow(&swapped);
+        assert_eq!(pick.chosen(&swapped), Some(&b));
+        assert_eq!(pick.key(Event::Enter, &swapped), Act::Focus(b.clone()));
+        pick.key(Event::Up, &swapped);
+        assert_eq!(
+            pick.selected(),
+            Some("bbbbbbbbbbbb"),
+            "no wrap outside a team"
+        );
+        pick.set_wrap(true);
+        pick.key(Event::Up, &swapped);
+        assert_eq!(pick.selected(), Some("aaaaaaaaaaaa"), "a team wraps (B10)");
+        pick.key(Event::Down, &swapped);
+        assert_eq!(pick.selected(), Some("bbbbbbbbbbbb"));
+        pick.select(&swapped, 1);
+        assert_eq!(pick.selected(), Some("aaaaaaaaaaaa"));
+        assert_eq!(
+            (
+                step_live(&swapped, Some(1), true),
+                step_live(&swapped, None, false)
+            ),
+            (Some(1), Some(1))
+        );
+        assert_eq!(
+            step_live(std::slice::from_ref(&b), None, true),
+            None,
+            "n/N skip agents without a live view"
+        );
+        pick.nothing("twin");
+        assert_eq!(pick.note().as_deref(), Some("nothing to open for twin"));
+        let row = json!({"id": "x", "name": "e\u{1b}", "state": "stopped", "life": "ended", "pane": null});
+        let t = Target::of(row.as_object().unwrap());
+        assert_eq!(
+            (
+                t.id.as_str(),
+                t.name.as_str(),
+                t.pane.as_str(),
+                t.life.as_str()
+            ),
+            ("x", "e", "", "ended")
+        );
     }
 }
