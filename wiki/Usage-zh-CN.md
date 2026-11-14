@@ -119,7 +119,7 @@ flowchart LR
 - macOS、Linux 或 Windows 上的 rmux 0.10 或更高版本，或 macOS 或 Linux 上的 tmux 3.2 或更高版本，且调用者位于窗格中。
 - `PATH` 上有 Claude Code 或 GitHub Copilot CLI（`claude` 或 `copilot`；Windows 上为 `.exe`）。
 - 仅限终端 CLI（在 tmux 或 rmux 中运行的 Claude Code 或 Copilot CLI）；桌面应用和其他非终端界面会被跳过：没有 Agents 窗格，技能也会说明不要使用它。
-- 不在 herdr 中：在 tmux 和 rmux 之外的 herdr 终端里（设置了 `HC_TERMINAL_ID`）每个命令都以 `herdr` 拒绝，钩子不报告任何状态，Agents 窗格也不会打开；在那里请使用 herdr 自己的技能（`hc --skill`）。在 tmux 或 rmux 中，即使它是从 herdr 终端启动的，窗格也属于多路复用器，mux-agents 照常工作：herdr 看不到 tmux 里的代理。
+- 不在 herdr 中：在 tmux 和 rmux 之外的 herdr 终端里（设置了 `HC_TERMINAL_ID`）每个命令都以 `herdr` 拒绝，钩子不报告任何状态，Agents 窗格也不会打开；在那里请使用 herdr 自己的技能（`hc --skill`）。在 tmux 或 rmux 中，即使它是从 herdr 终端启动的，窗格也属于多路复用器，mux-agents 照常工作。此时 herdr 也能看到整个团队：每次 `spawn` 还会启动一个中继，即 herdr 终端下一个运行 `mux-agent relay` 的隐藏 hc 终端，herdr 因此把该代理列为那个终端的子代理，显示它的状态（working、needs you、done、idle）和当前步骤，spawn 的回复也会给出它（`herdr: t7`，或带原因的 `herdrError`）。在中继里输入的一行（herdr 的输入框，或 `hc send t7 "…"`）会以 `herdr` 的名义进入该代理的邮箱；结束中继只会结束中继，不会结束代理（用 `stop <name>`）。中继随代理一同结束。它需要 `PATH` 上有 `hc`；在你的环境里设置 `MUX_AGENTS_HERDR=off` 可关闭它。代理不会继承 `HC_TERMINAL_ID`。
 
 在 rmux 中 `RMUX` 和 `TMUX` 可能都已设置；以 `RMUX` 为准。
 

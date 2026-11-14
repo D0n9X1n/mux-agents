@@ -4,7 +4,8 @@ use std::process::Command;
 
 const NL: &str = if cfg!(windows) { "\r\n" } else { "\n" };
 
-// Never inside the caller's own multiplexer: no endpoint, so no call can reach a real server.
+// Never inside the caller's own multiplexer: no endpoint, so no call can reach a real server. Never in a herdr terminal
+// either: run from one, every verb would refuse `herdr` before the check a test names.
 fn command(args: &[&str]) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_mux-agent"));
     command.args(args);
@@ -15,6 +16,7 @@ fn command(args: &[&str]) -> Command {
         "TMUX_PANE",
         "SANDBOX_RUNTIME",
         "MUX_AGENTS_STATE",
+        "HC_TERMINAL_ID",
     ] {
         command.env_remove(name);
     }

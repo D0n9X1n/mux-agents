@@ -66,8 +66,10 @@ fn main() -> ExitCode {
         .skip(1)
         .map(|a| a.to_string_lossy().into_owned())
         .collect();
-    if let Some(spec) = cli::launcher_spec(&args) {
-        let (code, reply) = cli::run_launcher(spec, ctx);
+    let hidden = cli::launcher_spec(&args)
+        .map(|spec| cli::run_launcher(spec, ctx))
+        .or_else(|| cli::relay_spec(&args).map(|spec| cli::run_relay(spec, ctx)));
+    if let Some((code, reply)) = hidden {
         let mut out = std::io::stdout().lock();
         if let Some(reply) = reply {
             let _ = write!(out, "{reply}{NL}");

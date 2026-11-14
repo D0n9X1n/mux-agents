@@ -18,8 +18,9 @@ use crate::state::fs::{read_json, write_json};
 use crate::state::root::{HOST, OsKind};
 use crate::util::utc_o;
 
-/// The parent's client identity, taken out of the client's environment (MuxAgents.ps1:1595-1596).
-pub const SCRUB: [&str; 12] = [
+/// The parent's client identity, taken out of the client's environment (MuxAgents.ps1:1595-1596), and the herdr
+/// terminal the multiplexer runs in: a child is no herdr coordinator for it (#103).
+pub const SCRUB: [&str; 13] = [
     "CLAUDECODE",
     "CLAUDE_CODE_SESSION_ID",
     "CLAUDE_CODE_MESSAGING_SOCKET",
@@ -32,6 +33,7 @@ pub const SCRUB: [&str; 12] = [
     "CLAUDE_EFFORT",
     "COPILOT_AGENT_SESSION_ID",
     "COPILOT_CLI",
+    "HC_TERMINAL_ID",
 ];
 
 const COMMIT_WAIT: Duration = Duration::from_secs(30);
@@ -90,7 +92,7 @@ pub(crate) fn run(ctx: &Ctx, spec: &str, err: &mut dyn FnMut(&str), start: Start
 }
 
 /// `path` below `root` by whole components, with no `.` or `..` (Windows: ignoring case).
-fn lexically_under(root: &Path, path: &Path) -> bool {
+pub(crate) fn lexically_under(root: &Path, path: &Path) -> bool {
     let plain = |c: &Component| !matches!(c, Component::CurDir | Component::ParentDir);
     let text = |c: Component| {
         let text = c.as_os_str().to_string_lossy().into_owned();
@@ -115,7 +117,7 @@ fn lexically_under(root: &Path, path: &Path) -> bool {
 /// Whether `given` is already the canonical path `resolved`, so no link or junction lies on the way. Windows:
 /// canonicalize answers `\\?\C:\...` whatever the caller typed, and NTFS names ignore case, so both sides drop a
 /// drive's `\\?\` and compare ignoring case; an 8.3 short name still differs and refuses. Unix: exact bytes.
-fn same_path(resolved: &Path, given: &str, os: OsKind) -> bool {
+pub(crate) fn same_path(resolved: &Path, given: &str, os: OsKind) -> bool {
     let Some(resolved) = resolved.to_str() else {
         return false;
     };
@@ -634,6 +636,8 @@ mod tests {
                 "CLAUDE_EFFORT",
                 "COPILOT_AGENT_SESSION_ID",
                 "COPILOT_CLI",
+                // #103: the herdr terminal the multiplexer runs in is not the child's.
+                "HC_TERMINAL_ID",
             ]
         );
         let l = setup("copilot", json!(["-i", "p"]));

@@ -7,7 +7,7 @@ description: "Terminal CLI only: needs a tmux or rmux pane. Start Claude Code or
 
 Use this skill inside an rmux 0.10+ pane (Windows, Linux or macOS) or a tmux 3.2+ pane (Linux or macOS); the tool refuses elsewhere.
 
-Skip it in the Claude Code desktop app, web or cloud sessions, IDE chat panels, the GitHub Copilot app and headless or SDK runs, and use the host's normal workflow instead. Skip it in a herdr terminal (`HC_TERMINAL_ID` is set and you are not inside tmux or rmux): use herdr's own skills (`hc --skill`) there. Never start a multiplexer or set variables to make it apply. An IDE's integrated terminal running the CLI inside tmux or rmux is fine.
+Skip it in the Claude Code desktop app, web or cloud sessions, IDE chat panels, the GitHub Copilot app and headless or SDK runs, and use the host's normal workflow instead. Skip it in a herdr terminal (`HC_TERMINAL_ID` is set and you are not inside tmux or rmux): use herdr's own skills (`hc --skill`) there. Never start a multiplexer or set variables to make it apply. An IDE's integrated terminal running the CLI inside tmux or rmux is fine. Inside tmux or rmux started from a herdr terminal, use this skill, not `hc run`, for helpers: each agent it starts also shows in herdr, and a line typed to it there reaches its mailbox as from `herdr`.
 
 ## Entry
 

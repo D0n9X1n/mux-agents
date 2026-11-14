@@ -113,10 +113,37 @@ fn append_message(
     message: &Value,
     dedup: Option<&str>,
 ) -> Res<Option<Value>> {
-    let mailbox = super::state_dir(ctx, caller)?
-        .join("mail")
-        .join(format!("{key}.jsonl"));
-    super::lock(ctx, &super::lock_key("mail", caller, key), || {
+    let state = super::state_dir(ctx, caller)?;
+    append_in(ctx, &state, &caller.server_key, key, message, dedup)
+}
+
+/// Appends a message from `from` to agent mailbox `key` in the server folder `state` whose key is `server_key`,
+/// under the same mailbox lock `send` takes. For the herdr relay, which runs outside the multiplexer and so has no
+/// caller: the folder is the one spawn already made private.
+pub fn add_mail_in(
+    ctx: &Ctx,
+    state: &Path,
+    server_key: &str,
+    key: &str,
+    from: &str,
+    body: &str,
+) -> Res<String> {
+    let id = crate::util::guid()?.replace('-', "")[..8].to_string();
+    let message = json!({"id": id, "from": from, "pane": from, "at": crate::util::utc_o(ctx.clock.now()), "body": body});
+    append_in(ctx, state, server_key, key, &message, None)?;
+    Ok(id)
+}
+
+fn append_in(
+    ctx: &Ctx,
+    state: &Path,
+    server_key: &str,
+    key: &str,
+    message: &Value,
+    dedup: Option<&str>,
+) -> Res<Option<Value>> {
+    let mailbox = state.join("mail").join(format!("{key}.jsonl"));
+    super::lock(ctx, &format!("mail|{server_key}|{key}"), || {
         // Only a dedup needs the whole mailbox; otherwise its last byte tells whether it is torn.
         let existing = match dedup {
             Some(_) => read_or_empty(&mailbox)?,

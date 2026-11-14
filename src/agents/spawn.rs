@@ -8,7 +8,7 @@ use serde_json::{Map, Value, json};
 
 use super::mail::doing_line;
 use super::placement::{DEFAULT as DEFAULT_PLACEMENT, read_placement};
-use super::{copilot, lock, lock_key, registry, state_dir, text, usage};
+use super::{copilot, lock, lock_key, registry, server_dir, state_dir, text, usage};
 use crate::caller::{Caller, Kind, resolve};
 use crate::checks::{Context, Plan, assert_spawn_allowed, context_plan, resolve_name, session_id};
 use crate::cli::Request;
@@ -173,6 +173,25 @@ pub fn spawn(ctx: &Ctx, request: &Request) -> Res<Map<String, Value>> {
         Err(refusal) => {
             reply.insert("sidebar".into(), Value::Null);
             reply.insert("sidebarError".into(), refusal.message.into());
+        }
+    }
+    // herdr sees the agent (#103): its relay, best effort like the bar, and only in a herdr terminal.
+    let id = text(reply.get("id"));
+    let folder = server_dir(ctx, &caller).join("agents").join(&id);
+    let started = panic::catch_unwind(AssertUnwindSafe(|| {
+        crate::herdr::start_relay(ctx, &folder, &id, &mut |hc, args| {
+            crate::spawn::captured(hc, args, crate::herdr::RUN_TIMEOUT)
+        })
+    }))
+    .unwrap_or_else(|_| Some(Err("unexpected error (panic)".into())));
+    match started {
+        None => {}
+        Some(Ok(address)) => {
+            reply.insert("herdr".into(), address.into());
+        }
+        Some(Err(why)) => {
+            reply.insert("herdr".into(), Value::Null);
+            reply.insert("herdrError".into(), why.into());
         }
     }
     Ok(reply)

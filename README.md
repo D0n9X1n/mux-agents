@@ -24,6 +24,7 @@ Start Claude Code and Copilot CLI agents in tmux or rmux panes, see what each is
 - **Helpers in panes you can see.** Ask in your chat; choose once per session whether agents open as tabs or as panes beside you, and the side bar opens on its own.
 - **They start with your context.** A same-client agent forks your conversation; any other agent starts from a brief you write.
 - **A live side bar.** Who needs you, who just finished, who is working and who is idle, as herdr shows it, with what each is doing right now; click one to jump to it.
+- **Seen in herdr too.** Run tmux or rmux in a herdr terminal and every agent also shows in herdr as a sub-agent, with its state and step; a line typed to it there lands in its mailbox.
 - **Mailboxes, not keystrokes.** Agents report back through files; nothing ever types into another pane.
 - **Safe by default.** An agent never gets more than its caller already has; a refused spawn names the reason.
 - **Fast and native.** One small Rust binary on macOS, Linux and Windows; `list` with six agents takes about 23 ms, and no PowerShell or .NET is needed.

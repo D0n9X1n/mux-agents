@@ -403,6 +403,29 @@ pub fn launcher_spec(args: &[String]) -> Option<&str> {
     }
 }
 
+/// The spec of the hidden `relay <spec>` call a herdr terminal runs (#103); not a verb either.
+pub fn relay_spec(args: &[String]) -> Option<&str> {
+    match args {
+        [verb, spec] if verb == "relay" => Some(spec),
+        _ => None,
+    }
+}
+
+/// The relay's process: its exit code, or the providers' refusal as JSON with its code. No herdr or sandbox check:
+/// the relay runs in the herdr terminal a passed spawn started it in, and runs no verb.
+pub fn run_relay(spec: &str, ctx: impl FnOnce() -> Res<Ctx>) -> (i32, Option<String>) {
+    match ctx() {
+        Err(refusal) => (
+            refusal.code.into(),
+            Some(json::to_stdout(&Value::Object(failure(None, &refusal)))),
+        ),
+        Ok(ctx) => (
+            panic::catch_unwind(AssertUnwindSafe(|| crate::herdr::relay(&ctx, spec))).unwrap_or(1),
+            None,
+        ),
+    }
+}
+
 /// The pane's process: the launcher's exit code, or the providers' refusal as JSON with its code. No sandbox check:
 /// the pane was spawned by a call that passed it, and the launcher runs no verb.
 pub fn run_launcher(spec: &str, ctx: impl FnOnce() -> Res<Ctx>) -> (i32, Option<String>) {
