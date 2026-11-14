@@ -60,11 +60,7 @@ pub fn write_json_durable(path: &Path, value: &Value) -> Res<()> {
         if fail && is_dir {
             return Err(io::Error::other("injected flush failure"));
         }
-        if is_dir {
-            sync_dir(at)
-        } else {
-            OpenOptions::new().write(true).open(at)?.sync_data()
-        }
+        if is_dir { sync_dir(at) } else { sync_file(at) }
     })
 }
 
@@ -114,6 +110,37 @@ thread_local! {
 #[cfg(test)]
 pub fn fail_sync_dir(dir: Option<&Path>) {
     SYNC_FAULT.with(|fault| *fault.borrow_mut() = dir.map(Path::to_path_buf));
+}
+
+#[cfg(test)]
+thread_local! {
+    // A file whose flush fails on this thread; its `.<hex>.tmp` siblings (the durable write temp file) fail too.
+    static FILE_FAULT: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Makes `sync_file(path)`, and the durable write temp file for `path`, fail on this thread (none: no failure).
+#[cfg(test)]
+pub fn fail_sync_file(path: Option<&Path>) {
+    FILE_FAULT.with(|fault| *fault.borrow_mut() = path.map(Path::to_path_buf));
+}
+
+/// Flushes the contents of a file to disk.
+pub fn sync_file(path: &Path) -> io::Result<()> {
+    #[cfg(test)]
+    {
+        let hit = FILE_FAULT.with(|fault| {
+            fault.borrow().as_deref().is_some_and(|f| {
+                let (p, f) = (path.to_string_lossy(), f.to_string_lossy());
+                p == f
+                    || p.strip_prefix(&*f)
+                        .is_some_and(|rest| rest.starts_with('.') && rest.ends_with(".tmp"))
+            })
+        });
+        if hit {
+            return Err(io::Error::other("injected file flush failure"));
+        }
+    }
+    OpenOptions::new().write(true).open(path)?.sync_data()
 }
 
 #[cfg(test)]
@@ -325,6 +352,20 @@ mod tests {
     use super::*;
     use crate::testing::TempDir;
     use serde_json::json;
+
+    #[test]
+    fn a_file_flush_fault_fails_only_that_file() {
+        let dir = crate::testing::TempDir::new();
+        let (a, b) = (dir.path().join("a.json"), dir.path().join("b.json"));
+        fail_sync_file(Some(&a));
+        // The temp file of the durable write to `a` fails its flush; nothing is renamed.
+        assert!(write_json_durable(&a, &serde_json::json!(1)).is_err() && !a.exists());
+        write_json_durable(&b, &serde_json::json!(2)).unwrap();
+        std::fs::write(&a, "x").unwrap();
+        assert!(sync_file(&a).is_err() && sync_file(&b).is_ok());
+        fail_sync_file(None);
+        assert!(sync_file(&a).is_ok());
+    }
 
     // A durable write flushes the temp file's contents before the rename makes it `path`, then flushes the folder
     // so the new name survives too. A failed flush is an error: a failed file flush leaves `path` as it was.
