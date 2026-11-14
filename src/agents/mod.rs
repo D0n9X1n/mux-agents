@@ -30,6 +30,7 @@ pub mod spawn;
 #[cfg(test)]
 mod stop_hc_tests;
 pub mod team;
+pub mod tree;
 pub mod up;
 pub mod view;
 #[cfg(test)]

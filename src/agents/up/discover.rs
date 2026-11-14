@@ -40,7 +40,7 @@ pub fn refuse_existing(ctx: &Ctx, core: &Core<'_>, team: &str) -> Res<()> {
 }
 
 /// Decision 1: an uncommitted launch whose abort evidence proves nothing runs (no uncertain run, no uncertain kill).
-fn ran_nothing(folder: &Path) -> bool {
+pub(crate) fn ran_nothing(folder: &Path) -> bool {
     !folder.join("commit.json").exists()
         && matches!(read_json(&folder.join("abort.json")), Ok(Some(a))
             if a.get("runUncertain") != Some(&Value::Bool(true))
