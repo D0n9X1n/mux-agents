@@ -219,8 +219,8 @@ pub fn spawn(ctx: &Ctx, request: &Request) -> Res<Map<String, Value>> {
             let snapshot = super::membership::Snapshot::for_spawn(ctx, &caller, core)?;
             registry::reap_hc(ctx, &caller, &snapshot)?;
             // The brief rule as far as the request decides it: after the caller's standing (the gate), before the
-            // name and a member's debit (#103 D5: a refused request spends no token). allocate checks it again; only a
-            // Copilot fork whose copy fails verification turns brief there, after the debit, as a failed launch does.
+            // name. allocate checks it again; only a Copilot fork whose copy fails verification turns brief there.
+            // Neither refusal spends a token: the launch takes it as its last step before `hc run` (#103 D5).
             if caller.kind == Kind::Agent
                 && brief.is_none()
                 && context_plan(&caller, client, &ctx.env, no_fork).context == Context::Brief

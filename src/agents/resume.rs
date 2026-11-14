@@ -108,8 +108,9 @@ pub fn resume(ctx: &Ctx, request: &Request) -> Res<Map<String, Value>> {
 
 /// X as `target` names it, checked under the spawn lock: `<id>` is that member, `<name>` the newest (by
 /// `createdAt`) of that name that no resume superseded. X must be proven ended, not taken, no leader, its session
-/// live nowhere (`session_held`), no member of its name running, its flags within the team's ceiling, and the
-/// session under its cap.
+/// live nowhere (`session_held`) and no member of its name running. Outside a team the session stays under its cap; in
+/// a team the caller's authority, the tree's limit, the parent's and the team's ceiling, the name and a member's budget
+/// are checked in that order, and the budget is only checked here: the launch spends it (#103 D5).
 fn admit(
     ctx: &Ctx,
     caller: &crate::caller::Caller,
@@ -201,7 +202,7 @@ fn admit(
     if let Some(why) = session_held(ctx, core, id, &x.identity.session_id) {
         return refuse(2, "session", why);
     }
-    // shortcut: no record on this base sets `depth` (no `up` yet); a member whose record says depth 0 is a leader.
+    // A leader is the depth-0 record `up` makes (leader.rs); it is never resumed.
     if record.get("depth").and_then(Value::as_u64) == Some(0) {
         return refuse(2, "leader", "a leader is never resumed");
     }
