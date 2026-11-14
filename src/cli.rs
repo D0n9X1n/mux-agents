@@ -315,7 +315,7 @@ fn failure(verb: Option<&str>, refusal: &Refusal) -> Map<String, Value> {
     if let Some(session) = &refusal.leftover {
         reply.insert("leftoverSession".into(), session.clone().into());
     }
-    for (key, value) in &refusal.details {
+    for (key, value) in refusal.details.iter() {
         reply.insert(key.clone(), value.clone());
     }
     reply

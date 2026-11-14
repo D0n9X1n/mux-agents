@@ -14,7 +14,7 @@ pub struct Refusal {
     /// A session `up` created and could not remove (#103): the reply names it as `leftoverSession`.
     pub leftover: Option<String>,
     /// Reply fields beside `message` (#103 M6): `retryAt`, `id`, `delivered`. Merged by `cli::failure`.
-    pub details: Map<String, Value>,
+    pub details: Box<Map<String, Value>>,
 }
 
 pub type Res<T> = Result<T, Refusal>;
@@ -26,7 +26,7 @@ pub fn refuse<T>(code: u8, check: &'static str, message: impl Into<String>) -> R
         message: message.into(),
         reason: None,
         leftover: None,
-        details: Map::new(),
+        details: Default::default(),
     })
 }
 
@@ -45,7 +45,7 @@ impl Refusal {
             message: format!("unexpected error ({reason})"),
             reason: None,
             leftover: None,
-            details: Map::new(),
+            details: Default::default(),
         }
     }
 }
@@ -59,7 +59,7 @@ impl From<io::Error> for Refusal {
             message: format!("unexpected error ({:?})", error.kind()),
             reason: None,
             leftover: None,
-            details: Map::new(),
+            details: Default::default(),
         }
     }
 }
