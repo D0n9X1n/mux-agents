@@ -227,6 +227,8 @@ pub fn within(ceiling: Policy, child: Policy) -> bool {
 pub struct Team {
     pub team: String,
     pub session: String,
+    /// The session's name, as `up` made it (#103).
+    pub name: String,
     pub directory: String,
     pub client: Client,
     pub flags: Vec<String>,
@@ -246,7 +248,7 @@ pub fn path(server_dir: &Path, session: &str) -> PathBuf {
 
 impl Team {
     fn to_json(&self) -> Value {
-        json!({"schema": SCHEMA, "team": self.team, "session": self.session, "directory": self.directory,
+        json!({"schema": SCHEMA, "team": self.team, "session": self.session, "name": self.name, "directory": self.directory,
             "client": crate::agents::spawn::client_name(self.client), "flags": self.flags,
             "policy": self.policy.word(), "leader": self.leader, "createdAt": self.created_at})
     }
@@ -276,6 +278,7 @@ impl Team {
         Some(Team {
             team: text("team")?,
             session: text("session")?,
+            name: text("name")?,
             directory: text("directory")?,
             client,
             flags,
@@ -459,6 +462,7 @@ mod tests {
         Team {
             team: "0123456789abcdef:$3".into(),
             session: "$3".into(),
+            name: "s".into(),
             directory: "/work".into(),
             client: Client::Claude,
             flags: v(flags),
@@ -500,5 +504,26 @@ mod tests {
             crate::state::fs::write_json(&other, &bad).unwrap();
             assert!(read(&other).is_err(), "{bad}");
         }
+    }
+
+    #[test]
+    fn a_team_record_keeps_its_session_name() {
+        let d = TempDir::new();
+        let file = path(d.path(), "$7");
+        let team = Team {
+            team: "0123456789abcdef".into(),
+            session: "$7".into(),
+            name: "p-01234567-ab".into(),
+            directory: "/p".into(),
+            client: Client::Claude,
+            flags: vec![],
+            policy: Policy::Default,
+            leader: "aaaaaaaaaaaa".into(),
+            created_at: "x".into(),
+        };
+        assert!(create(&file, &team).unwrap() && !create(&file, &team).unwrap());
+        assert_eq!(read(&file).unwrap(), Some(team));
+        std::fs::write(&file, r#"{"schema":1,"team":"t","session":"$7","directory":"/p","client":"claude","flags":[],"policy":"default","leader":"aaaaaaaaaaaa","createdAt":"x"}"#).unwrap();
+        assert!(read(&file).is_err());
     }
 }

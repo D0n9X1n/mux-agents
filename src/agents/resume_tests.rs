@@ -255,6 +255,7 @@ fn resume_refuses_and_launches_nothing() {
                 let team = super::super::team::Team {
                     team: membership::team(&w.caller()),
                     session: "$3".into(),
+                    name: "s".into(),
                     directory: "/work".into(),
                     client: crate::parse::Client::Claude,
                     flags: Vec::new(),
