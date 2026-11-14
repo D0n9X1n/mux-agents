@@ -41,55 +41,154 @@ impl Policy {
     }
 }
 
-/// A flag's name (before `=`) and its value: the `=` part, else the next argument.
-fn named<'a>(flags: &'a [String], name: &str) -> Vec<&'a str> {
-    let mut found = Vec::new();
+// The flags each client takes a value for, as `--x v` or `--x=v`; any other dash token takes none.
+const CLAUDE_VALUED: [&str; 13] = [
+    "--model",
+    "--add-dir",
+    "--session-id",
+    "-r",
+    "--resume",
+    "-n",
+    "--name",
+    "--permission-mode",
+    "--effort",
+    "--allowedTools",
+    "--allowed-tools",
+    "--disallowedTools",
+    "--disallowed-tools",
+];
+const CLAUDE_BARE: [&str; 5] = [
+    "--continue",
+    "-c",
+    "--fork-session",
+    "--dangerously-skip-permissions",
+    "--verbose",
+];
+const COPILOT_VALUED: [&str; 16] = [
+    "--model",
+    "--add-dir",
+    "--session-id",
+    "-r",
+    "--resume",
+    "-n",
+    "--name",
+    "--reasoning-effort",
+    "-i",
+    "--interactive",
+    "-p",
+    "--prompt",
+    "--mode",
+    "--deny-tool",
+    "--deny-url",
+    "--excluded-tools",
+];
+const COPILOT_BARE: [&str; 10] = [
+    "--continue",
+    "--allow-all",
+    "--yolo",
+    "--no-sandbox",
+    "--allow-all-tools",
+    "--allow-all-paths",
+    "--allow-all-urls",
+    "--autopilot",
+    "--plan",
+    "--assisted-approval",
+];
+
+/// The client's flags as (name, value) pairs, honouring argument boundaries: a valued flag consumes its value (so a
+/// value that looks like a flag is never read as one), and nothing after `--` is a flag. None when a dash token is
+/// not one the client is known to take: an unknown flag could change permissions in ways this does not model.
+fn parsed(flags: &[String], valued: &[&str], bare: &[&str]) -> Option<Vec<(String, String)>> {
+    let mut out = Vec::new();
     let mut i = 0;
     while i < flags.len() {
-        let (head, inline) = match flags[i].split_once('=') {
-            Some((h, v)) => (h, Some(v)),
-            None => (flags[i].as_str(), None),
+        let token = flags[i].as_str();
+        if token == "--" {
+            break;
+        }
+        if !token.starts_with('-') || token == "-" {
+            // A positional (the task text): no permission meaning.
+            i += 1;
+            continue;
+        }
+        let (name, inline) = match token.split_once('=') {
+            Some((n, v)) => (n, Some(v)),
+            None => (token, None),
         };
-        if head == name {
-            match inline {
-                Some(v) => found.push(v),
+        if valued.contains(&name) {
+            let value = match inline {
+                Some(v) => v.to_string(),
                 None => {
-                    found.push(flags.get(i + 1).map_or("", String::as_str));
                     i += 1;
+                    flags.get(i)?.clone()
                 }
-            }
+            };
+            out.push((name.to_string(), value));
+        } else if bare.contains(&name) && inline.is_none() {
+            out.push((name.to_string(), String::new()));
+        } else {
+            return None;
         }
         i += 1;
     }
-    found
+    Some(out)
 }
 
-fn has(flags: &[String], names: &[&str]) -> bool {
-    flags
-        .iter()
-        .any(|f| names.contains(&f.split('=').next().unwrap_or(f)))
-}
-
-/// The policy `flags` give `client`, deny-first and strictest-wins: anything that narrows the client (a deny rule, a
-/// non-bypass mode) makes it `Default`, even beside a flag that would widen it.
+/// The policy `flags` give `client`, strictest-wins and fail-closed: anything that narrows the client, and any flag
+/// this does not know, makes it `Default`, even beside a flag that would widen it.
 pub fn policy(client: Client, flags: &[String]) -> Policy {
+    let (valued, bare): (&[&str], &[&str]) = match client {
+        Client::Claude => (&CLAUDE_VALUED, &CLAUDE_BARE),
+        Client::Copilot => (&COPILOT_VALUED, &COPILOT_BARE),
+    };
+    let Some(pairs) = parsed(flags, valued, bare) else {
+        return Policy::Default;
+    };
+    let named = |n: &str| pairs.iter().any(|(k, _)| k == n);
     match client {
         Client::Claude => {
-            let modes = named(flags, "--permission-mode");
-            if modes.iter().any(|m| *m != "bypassPermissions") {
+            // Tool restrictions narrow it; any mode but bypassPermissions narrows it (dontAsk included: Claude Code
+            // starts teammates of a dontAsk lead in Manual).
+            let narrowed = pairs.iter().any(|(k, v)| {
+                matches!(
+                    k.as_str(),
+                    "--allowedTools"
+                        | "--allowed-tools"
+                        | "--disallowedTools"
+                        | "--disallowed-tools"
+                ) || (k == "--permission-mode" && v != "bypassPermissions")
+            });
+            if narrowed {
                 return Policy::Default;
             }
-            if has(flags, &["--dangerously-skip-permissions"]) || !modes.is_empty() {
+            if named("--dangerously-skip-permissions") || named("--permission-mode") {
                 Policy::Bypass
             } else {
                 Policy::Default
             }
         }
         Client::Copilot => {
-            if has(flags, &["--deny-tool", "--deny-url", "--deny-path"]) {
+            // Deny rules beat allow-all; plan mode and assisted approval narrow it.
+            let narrowed = pairs.iter().any(|(k, v)| {
+                matches!(
+                    k.as_str(),
+                    "--deny-tool"
+                        | "--deny-url"
+                        | "--excluded-tools"
+                        | "--plan"
+                        | "--assisted-approval"
+                ) || (k == "--mode" && v != "interactive" && v != "autopilot")
+            });
+            if narrowed {
                 return Policy::Default;
             }
-            if has(flags, &["--allow-all", "--yolo"]) {
+            // `--allow-all` is documented as the three `--allow-all-*` flags together.
+            let all = named("--allow-all")
+                || named("--yolo")
+                || (named("--allow-all-tools")
+                    && named("--allow-all-paths")
+                    && named("--allow-all-urls"));
+            if all {
                 Policy::AllowAll
             } else {
                 Policy::Default
@@ -214,6 +313,41 @@ mod tests {
         }
         assert_eq!(p(&["--permission-mode"]), Policy::Default);
         assert_eq!(p(&["--model", "opus", "--effort", "high"]), Policy::Default);
+        // Review of 214261e: a flag's value, or anything after `--`, is never read as a flag.
+        assert_eq!(
+            p(&["--name", "--dangerously-skip-permissions"]),
+            Policy::Default
+        );
+        assert_eq!(
+            p(&["--", "--dangerously-skip-permissions"]),
+            Policy::Default
+        );
+        assert_eq!(
+            p(&["--model", "--permission-mode", "bypassPermissions"]),
+            Policy::Default
+        );
+        // Tool restrictions and unknown flags narrow it.
+        assert_eq!(
+            p(&[
+                "--dangerously-skip-permissions",
+                "--disallowed-tools",
+                "Bash"
+            ]),
+            Policy::Default
+        );
+        assert_eq!(
+            p(&["--dangerously-skip-permissions", "--something-new"]),
+            Policy::Default
+        );
+        assert_eq!(
+            p(&[
+                "--dangerously-skip-permissions",
+                "--effort",
+                "high",
+                "task text"
+            ]),
+            Policy::Bypass
+        );
     }
 
     #[test]
@@ -224,13 +358,30 @@ mod tests {
         assert_eq!(p(&["--yolo"]), Policy::AllowAll);
         assert_eq!(p(&["--allow-all-tools"]), Policy::Default);
         for deny in [
-            "--deny-tool",
-            "--deny-tool=shell(rm)",
-            "--deny-url",
-            "--deny-path",
+            &["--deny-tool", "shell(rm)"][..],
+            &["--deny-tool=shell(rm)"],
+            &["--deny-url", "x"],
         ] {
-            assert_eq!(p(&["--allow-all", deny]), Policy::Default, "{deny}");
+            let mut f = vec!["--allow-all"];
+            f.extend(deny);
+            assert_eq!(p(&f), Policy::Default, "{deny:?}");
         }
+        // Review of 214261e: the three --allow-all-* together are --allow-all; plan mode and assisted approval narrow.
+        assert_eq!(
+            p(&["--allow-all-tools", "--allow-all-paths", "--allow-all-urls"]),
+            Policy::AllowAll
+        );
+        assert_eq!(
+            p(&["--allow-all-tools", "--allow-all-paths"]),
+            Policy::Default
+        );
+        assert_eq!(p(&["--yolo", "--plan"]), Policy::Default);
+        assert_eq!(p(&["--yolo", "--assisted-approval"]), Policy::Default);
+        assert_eq!(p(&["--yolo", "--mode", "plan"]), Policy::Default);
+        assert_eq!(p(&["--yolo", "--mode=autopilot"]), Policy::AllowAll);
+        assert_eq!(p(&["--name", "--allow-all"]), Policy::Default);
+        assert_eq!(p(&["--", "--yolo"]), Policy::Default);
+        assert_eq!(p(&["--yolo", "--unknown"]), Policy::Default);
     }
 
     #[test]
