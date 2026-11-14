@@ -89,6 +89,27 @@ pub struct Snapshot {
 
 impl Snapshot {
     /// Resolve only the mailbox reader; notices never determine current membership.
+    /// The committed member named `name` that hc shows running and that has no end notice: its id and record. None
+    /// when there is no such member, or more than one (#104 phase 1c).
+    pub fn running_named(&self, name: &str) -> Option<(String, Value)> {
+        let found: Vec<(String, Value)> = self
+            .facts
+            .local
+            .iter()
+            .filter(|o| o.identity.name == name && o.life == super::lifecycle::Life::Running)
+            .filter_map(|o| {
+                self.records
+                    .get(&o.identity.id)
+                    .filter(|s| s.committed && !s.noticed)
+                    .map(|s| (o.identity.id.clone(), s.record.clone()))
+            })
+            .collect();
+        match found.as_slice() {
+            [one] => Some(one.clone()),
+            _ => None,
+        }
+    }
+
     /// Member `id` as hc sees it now: running, its record committed and, unless `noticed_ok`, with no end notice.
     /// Anything else refuses 2 `parent`; another member's id is never this caller (#104 phase 1c).
     pub fn member(&self, id: &str, noticed_ok: bool) -> Res<registry::Me> {

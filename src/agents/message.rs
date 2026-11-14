@@ -44,59 +44,84 @@ pub fn send(ctx: &Ctx, request: &Request) -> Res<Map<String, Value>> {
         Some(me) => me?,
         None => self_of(&caller, &snapshot)?,
     };
-    let pane = if target == "parent" {
-        match &me.record {
-            Some(record) => text(record.get("parentPane")),
-            None => return refuse(2, "parent", "only an agent has a parent"),
-        }
-    } else if pane_id(target) {
-        target.to_string()
+    // Closing a view never stops an agent (#104): a member hc shows running is reachable by name with no live view;
+    // its mailbox is its id and no pane is probed for it.
+    let viewless = if target != "parent" && !pane_id(target) && snapshot.find(target).is_none() {
+        super::membership::Snapshot::take(ctx, &caller)
+            .ok()
+            .and_then(|m| m.running_named(target))
     } else {
-        if !super::agent_name(target) {
-            return refuse(2, "target", "no live agent has that name");
-        }
-        match snapshot.find(target) {
-            Some(agent) => agent.pane,
-            None => return refuse(2, "target", "no live agent has that name"),
-        }
+        None
     };
-    // The pane must be a live pane of this session; its mailbox is the running agent's there, else `pane-<n>`.
-    let probe = native(
-        ctx,
-        &["display-message", "-p", "-t", &pane, RECIPIENT],
-        true,
-    )?;
-    let line = probe.stdout.trim_end_matches(['\r', '\n']);
-    let live = probe.code == 0
-        && line.split_once('|').is_some_and(|(at, session)| {
-            at == pane && session == caller.session && pane_session(session)
-        });
-    if !live {
-        return refuse(
-            2,
-            "target",
-            "the recipient is not a live pane of this session",
-        );
-    }
-    let key = registry::mailbox_of(&snapshot, &pane)?;
-    // The recipient's Claude Code session, when it is one: a running Claude agent's own, or (to `parent`) the session
-    // its spawner recorded. The sender's hooks wake it with it (#92).
-    let claude = |record: &Value, field: &str| {
-        let id = record.get(field).and_then(Value::as_str)?;
-        crate::checks::session_id(id).then(|| id.to_string())
-    };
-    let to_session = match snapshot.at(&pane) {
-        Some(agent) if agent.record.get("client").and_then(Value::as_str) == Some("claude") => {
-            claude(&agent.record, "sessionId")
+    let (pane, key, to_session) = match viewless {
+        Some((id, record)) => {
+            let session = record
+                .get("sessionId")
+                .and_then(Value::as_str)
+                .filter(|s| crate::checks::session_id(s))
+                .filter(|_| record.get("client").and_then(Value::as_str) == Some("claude"))
+                .map(String::from);
+            (text(record.get("pane")), id, session)
         }
-        Some(_) => None,
-        None if target == "parent" => me
-            .record
-            .as_ref()
-            .and_then(|r| r.get("parentAgent"))
-            .filter(|p| p.get("client").and_then(Value::as_str) == Some("claude"))
-            .and_then(|p| claude(p, "sessionId")),
-        None => None,
+        None => {
+            let pane = if target == "parent" {
+                match &me.record {
+                    Some(record) => text(record.get("parentPane")),
+                    None => return refuse(2, "parent", "only an agent has a parent"),
+                }
+            } else if pane_id(target) {
+                target.to_string()
+            } else {
+                if !super::agent_name(target) {
+                    return refuse(2, "target", "no live agent has that name");
+                }
+                match snapshot.find(target) {
+                    Some(agent) => agent.pane,
+                    None => return refuse(2, "target", "no live agent has that name"),
+                }
+            };
+            // The pane must be a live pane of this session; its mailbox is the running agent's there, else `pane-<n>`.
+            let probe = native(
+                ctx,
+                &["display-message", "-p", "-t", &pane, RECIPIENT],
+                true,
+            )?;
+            let line = probe.stdout.trim_end_matches(['\r', '\n']);
+            let live = probe.code == 0
+                && line.split_once('|').is_some_and(|(at, session)| {
+                    at == pane && session == caller.session && pane_session(session)
+                });
+            if !live {
+                return refuse(
+                    2,
+                    "target",
+                    "the recipient is not a live pane of this session",
+                );
+            }
+            let key = registry::mailbox_of(&snapshot, &pane)?;
+            // The recipient's Claude Code session, when it is one: a running Claude agent's own, or (to `parent`) the session
+            // its spawner recorded. The sender's hooks wake it with it (#92).
+            let claude = |record: &Value, field: &str| {
+                let id = record.get(field).and_then(Value::as_str)?;
+                crate::checks::session_id(id).then(|| id.to_string())
+            };
+            let to_session = match snapshot.at(&pane) {
+                Some(agent)
+                    if agent.record.get("client").and_then(Value::as_str) == Some("claude") =>
+                {
+                    claude(&agent.record, "sessionId")
+                }
+                Some(_) => None,
+                None if target == "parent" => me
+                    .record
+                    .as_ref()
+                    .and_then(|r| r.get("parentAgent"))
+                    .filter(|p| p.get("client").and_then(Value::as_str) == Some("claude"))
+                    .and_then(|p| claude(p, "sessionId")),
+                None => None,
+            };
+            (pane, key, to_session)
+        }
     };
     let deliver = || {
         let id = add_mail(ctx, &caller, &key, &me.name, &caller.pane, &body, None)?;
@@ -497,6 +522,11 @@ mod tests {
                 if args[0] == "focus" {
                     cf::online(&w);
                 }
+                // send also asks hc for a running member with no view by that name (#104 phase 1c).
+                if args[0] == "send" {
+                    cf::online(&w);
+                    cf::listing(&w, &crate::agents::membership::team(&w.caller()), &[]);
+                }
                 assert_eq!(
                     run_owned(&w, handler, &args),
                     target_refusal(&args[0]),
@@ -506,6 +536,14 @@ mod tests {
                     mux_verbs(&w),
                     if args[0] == "focus" || args[0] == "stop" || args[0] == "read" {
                         vec!["display-message"]
+                    } else if args[0] == "send" {
+                        // The pane snapshot misses, then the hc member lookup takes its own (#104 phase 1c).
+                        vec![
+                            "display-message",
+                            "display-message",
+                            "list-panes",
+                            "list-panes",
+                        ]
                     } else {
                         vec!["display-message", "list-panes"]
                     },
@@ -525,6 +563,10 @@ mod tests {
             w.fakes.clear_log();
             if args[0] == "focus" {
                 cf::online(&w);
+            }
+            if args[0] == "send" {
+                cf::online(&w);
+                cf::listing(&w, &crate::agents::membership::team(&w.caller()), &[]);
             }
             assert_eq!(
                 run_owned(&w, handler, &args),
@@ -824,6 +866,23 @@ mod tests {
         w.fakes
             .mux_rule("-t %8 #{pane_id}|#{@agent-id}", 0, "|\n", "");
         w
+    }
+
+    // #104 phase 1c: closing a view never stops an agent, so a running member with no view is still reachable by
+    // name; its mailbox is its id and no pane is probed for it.
+    #[test]
+    fn send_reaches_a_running_member_with_no_view() {
+        let w = World::human("");
+        let caller = w.caller();
+        let r = cf::member(&w, ID, json!({"pane":"%5","window":"@1"}));
+        w.pane_rows(&[]);
+        cf::online(&w);
+        cf::listing(&w, &crate::agents::membership::team(&caller), &[]);
+        cf::get(&w, "taaaaaaaaaaaa", cf::wire(&r));
+        let out = run(&w, send, &["send", "worker", "-Body", "hi"]);
+        assert!(out.starts_with("ok "), "{out}");
+        assert_eq!(read_mail_of(&w, ID), ["hi"]);
+        w.fakes.hc_done().unwrap();
     }
 
     #[test]
