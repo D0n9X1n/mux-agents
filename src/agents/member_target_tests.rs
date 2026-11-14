@@ -466,3 +466,70 @@ fn kept_member_tells_a_dropped_terminal_from_a_failure() {
     );
     w.fakes.hc_done().unwrap();
 }
+
+#[test]
+fn capture_member_reads_the_requested_twin_and_refuses_a_moved_pane() {
+    use crate::agents::{core_fixture as cf, fixture::World, message};
+    use std::{cell::RefCell, rc::Rc};
+    let w = World::human("");
+    let c = w.caller();
+    cf::member(&w, "aaaaaaaaaaaa", json!({"name": "twin", "pane": "%8"}));
+    cf::member(&w, "bbbbbbbbbbbb", json!({"name": "twin", "pane": "%9"}));
+    let rows: Vec<_> = [
+        ("%8|@5|300||", "aaaaaaaaaaaa"),
+        ("%9|@6|301||", "bbbbbbbbbbbb"),
+    ]
+    .into_iter()
+    .map(|(row, id)| {
+        let mut row = crate::agents::fixture::row_of(row, &[]);
+        row.command = format!("hc attach t{id}");
+        row
+    })
+    .collect();
+    w.pane_rows(&rows);
+    // Each pane holds its own text: `show-buffer` answers with the pane the last `capture-pane` named.
+    let captured = Rc::new(RefCell::new(String::new()));
+    let seen = captured.clone();
+    w.fakes.mux_script("capture-pane", move |argv| {
+        let at = argv.iter().position(|a| a == "-t").expect("a target pane");
+        *seen.borrow_mut() = argv[at + 1].clone();
+        Ok(crate::mux::Output::default())
+    });
+    let shown = captured.clone();
+    w.fakes.mux_script("show-buffer", move |_| {
+        let text = match shown.borrow().as_str() {
+            "%8" => "a one\na two\n",
+            "%9" => "b one\nb two\n",
+            _ => "",
+        };
+        Ok(crate::mux::Output {
+            stdout: text.into(),
+            ..Default::default()
+        })
+    });
+    for (id, pane, text) in [
+        ("bbbbbbbbbbbb", "%9", "b one\nb two"),
+        ("aaaaaaaaaaaa", "%8", "a one\na two"),
+    ] {
+        for expected in [None, Some(pane)] {
+            let (got, tail) = message::capture_member(&w.ctx, &c, id, expected, 2).unwrap();
+            assert_eq!(
+                (got.id.as_str(), got.pane.as_str(), tail.as_str()),
+                (id, pane, text),
+                "{id} {expected:?}"
+            );
+        }
+    }
+    let moved = message::capture_member(&w.ctx, &c, "bbbbbbbbbbbb", Some("%8"), 2).unwrap_err();
+    assert_eq!(
+        moved.message,
+        "the agent is no longer on the pane the bar drew"
+    );
+    assert!(
+        !w.fakes
+            .mux_calls()
+            .iter()
+            .any(|a| a[1] == "new-window" || a[1] == "split-window")
+    );
+    w.fakes.hc_done().unwrap();
+}
