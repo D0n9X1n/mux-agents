@@ -89,23 +89,26 @@ pub struct Snapshot {
 
 impl Snapshot {
     /// Resolve only the mailbox reader; notices never determine current membership.
-    /// The committed member named `name` that hc shows running and that has no end notice: its id and record. None
-    /// when there is no such member, or more than one (#104 phase 1c).
+    /// The member named `name`: of every committed member with that name and no end notice, whatever hc says of
+    /// it, exactly one, and hc shows it running. Its id and record; none otherwise. Uniqueness is decided before
+    /// life, so a member hc could not read never makes a same-name one look unique (#104 phase 1c).
     pub fn running_named(&self, name: &str) -> Option<(String, Value)> {
-        let found: Vec<(String, Value)> = self
+        let candidates: Vec<_> = self
             .facts
             .local
             .iter()
-            .filter(|o| o.identity.name == name && o.life == super::lifecycle::Life::Running)
-            .filter_map(|o| {
+            .filter(|o| o.identity.name == name)
+            .filter(|o| {
                 self.records
                     .get(&o.identity.id)
-                    .filter(|s| s.committed && !s.noticed)
-                    .map(|s| (o.identity.id.clone(), s.record.clone()))
+                    .is_some_and(|s| s.committed && !s.noticed)
             })
             .collect();
-        match found.as_slice() {
-            [one] => Some(one.clone()),
+        match candidates.as_slice() {
+            [o] if o.life == super::lifecycle::Life::Running => self
+                .records
+                .get(&o.identity.id)
+                .map(|s| (o.identity.id.clone(), s.record.clone())),
             _ => None,
         }
     }

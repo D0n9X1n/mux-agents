@@ -46,10 +46,13 @@ pub fn send(ctx: &Ctx, request: &Request) -> Res<Map<String, Value>> {
     };
     // Closing a view never stops an agent (#104): a member hc shows running is reachable by name with no live view;
     // its mailbox is its id and no pane is probed for it.
+    // When hc cannot be read, that is the answer, never a false "no live agent".
     let viewless = if target != "parent" && !pane_id(target) && snapshot.find(target).is_none() {
-        super::membership::Snapshot::take(ctx, &caller)
-            .ok()
-            .and_then(|m| m.running_named(target))
+        let members = super::membership::Snapshot::take(ctx, &caller)?;
+        if let Some(error) = members.core_error {
+            return Err(error);
+        }
+        members.running_named(target)
     } else {
         None
     };
@@ -883,6 +886,56 @@ mod tests {
         assert!(out.starts_with("ok "), "{out}");
         assert_eq!(read_mail_of(&w, ID), ["hi"]);
         w.fakes.hc_done().unwrap();
+    }
+
+    // #104 phase 1c review: the fallback delivers only to the one committed, unnoticed member of that name that hc
+    // shows running; an ended, uncommitted or noticed one, or a name two members share (even when hc cannot read
+    // one of them), refuses and leaves every mailbox empty.
+    #[test]
+    fn send_to_a_viewless_member_refuses_unless_it_is_the_one_running() {
+        for case in ["ended", "uncommitted", "noticed", "twin", "twin-unknown"] {
+            let w = World::human("");
+            let caller = w.caller();
+            let r = cf::member(&w, ID, json!({"pane":"%5","window":"@1"}));
+            let mut t = cf::wire(&r);
+            match case {
+                "ended" => {
+                    t["state"] = json!("finished");
+                    t["reason"] = json!("exited");
+                }
+                "uncommitted" => std::fs::remove_file(w.folder(ID).join("commit.json")).unwrap(),
+                "noticed" => write(&w.folder(ID).join("notice.json"), json!({"kind":"stopped"})),
+                _ => {}
+            }
+            w.pane_rows(&[]);
+            cf::online(&w);
+            cf::listing(&w, &crate::agents::membership::team(&caller), &[]);
+            cf::get(&w, "taaaaaaaaaaaa", t);
+            if case.starts_with("twin") {
+                let b = cf::member(&w, "bbbbbbbbbbbb", json!({"pane":"%6","window":"@1"}));
+                let mut tb = cf::wire(&b);
+                if case == "twin-unknown" {
+                    tb["labels"]["mux.gen"] = json!("1");
+                }
+                cf::get(&w, "tbbbbbbbbbbbb", tb);
+            }
+            let out = run(&w, send, &["send", "worker", "-Body", "hi"]);
+            assert_eq!(out, NONE, "{case}");
+            assert!(read_mail_of(&w, ID).is_empty(), "{case}");
+            assert!(read_mail_of(&w, "bbbbbbbbbbbb").is_empty(), "{case}");
+        }
+    }
+
+    // When hc cannot be read, send says so; it never claims the name has no live agent.
+    #[test]
+    fn send_reports_an_unreadable_hc_not_a_missing_agent() {
+        let w = World::human("");
+        cf::member(&w, ID, json!({"pane":"%5","window":"@1"}));
+        w.pane_rows(&[]);
+        let out = run(&w, send, &["send", "worker", "-Body", "hi"]);
+        assert_ne!(out, NONE);
+        assert!(!out.starts_with("ok "), "{out}");
+        assert!(read_mail_of(&w, ID).is_empty());
     }
 
     #[test]
