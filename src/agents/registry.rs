@@ -587,21 +587,26 @@ pub fn add_notice(
             format!("{name} is gone: its pane closed without an exit record."),
         ),
     };
-    let key = mail::mailbox_key(&super::text(record.get("parentPane")), "")?;
-    let pane = super::text(record.get("pane"));
-    let mut fields = Map::new();
-    fields.insert("kind".into(), kind.into());
-    fields.insert("exitCode".into(), code.clone());
-    let delivered = mail::add_once(
-        ctx,
-        caller,
-        &key,
-        &name,
-        &pane,
-        &body,
-        &format!("exit-{id}"),
-        &fields,
-    )?;
+    let parent = super::text(record.get("parentPane"));
+    let delivered = if parent.is_empty() {
+        None // spec v10 amendment (#103): a leader has no parent pane; its notice is recorded for the bar and `list`, mailed to no one
+    } else {
+        let key = mail::mailbox_key(&parent, "")?;
+        let pane = super::text(record.get("pane"));
+        let mut fields = Map::new();
+        fields.insert("kind".into(), kind.into());
+        fields.insert("exitCode".into(), code.clone());
+        mail::add_once(
+            ctx,
+            caller,
+            &key,
+            &name,
+            &pane,
+            &body,
+            &format!("exit-{id}"),
+            &fields,
+        )?
+    };
     // The first notice wins: a message already delivered (a marker write that failed after it) decides the marker.
     let (kind, code) = match delivered {
         Some(message) => delivered_notice(&message, &name),
@@ -2233,6 +2238,23 @@ mod tests {
                 .count(),
             2
         );
+    }
+
+    #[test]
+    fn a_parentless_exit_notice_is_recorded_and_not_mailed() {
+        let w = World::human("");
+        let caller = w.caller();
+        let folder = w.agent_record(ID, json!({"parentPane": null}));
+        let record = record(&w.ctx, &caller, ID).unwrap().unwrap();
+        assert!(add_notice(&w.ctx, &caller, ID, &record, Notice::Stopped).unwrap());
+        assert_eq!(
+            crate::state::fs::read_json(&folder.join("notice.json"))
+                .unwrap()
+                .unwrap()["kind"],
+            "stopped"
+        );
+        assert!(w.state().join("mail").read_dir().unwrap().next().is_none());
+        assert!(!add_notice(&w.ctx, &caller, ID, &record, Notice::Stopped).unwrap());
     }
 }
 #[cfg(test)]

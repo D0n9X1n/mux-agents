@@ -1718,6 +1718,32 @@ mod tests {
             ]
         );
     }
+
+    #[test]
+    fn a_parentless_ended_leader_shows_in_list_and_the_bar() {
+        let w = World::human("");
+        let caller = w.caller();
+        let folder = member(
+            &w,
+            ID,
+            json!({"name": "leader", "parentPane": null, "depth": 0}),
+        );
+        w.panes(&[]);
+        for watch in [false, true] {
+            snapshot(&w, &caller, &[(ID, "0")]);
+            let reply = board(&w.ctx, &caller, true, watch).unwrap();
+            w.fakes.hc_done().unwrap();
+            assert_eq!(
+                names(&reply),
+                vec!["leader=exited 0".to_string()],
+                "watch {watch}"
+            );
+        }
+        assert!(
+            folder.join("notice.json").exists()
+                && w.state().join("mail").read_dir().unwrap().next().is_none()
+        );
+    }
 }
 #[cfg(test)]
 #[path = "board_hc_tests.rs"]
