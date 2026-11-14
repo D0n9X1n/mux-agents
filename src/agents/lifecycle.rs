@@ -16,18 +16,29 @@ pub fn classify(fact: Option<&Terminal>, launcher: &[String]) -> Life {
     };
     match t.state {
         State::Live if !launcher.is_empty() && t.argv == launcher => Life::Running,
-        State::Live
-            if t.argv.len() == 2
-                && t.argv[1] == "-l"
-                && ["sh", "bash", "zsh", "fish", "dash", "ksh"]
-                    .contains(&t.argv[0].rsplit('/').next().unwrap_or("")) =>
-        {
-            Life::Lost
-        }
+        State::Live if recovery_shell(&t.argv) => Life::Lost,
         State::Finished if matches!(t.reason.as_ref(), Some(Reason::Exited | Reason::Killed)) => {
             Life::Ended
         }
         _ => Life::Unknown,
+    }
+}
+
+/// The shell hc's keep puts in place of a lost program: a POSIX login shell (`<shell> -l`), or on Windows PowerShell
+/// with hc's prompt hook (`<path>\pwsh.exe -NoExit -Command <hook>`, hc 0.1.21). Anything else is not proven lost.
+fn recovery_shell(argv: &[String]) -> bool {
+    match argv {
+        [shell, flag] if flag == "-l" => ["sh", "bash", "zsh", "fish", "dash", "ksh"]
+            .contains(&shell.rsplit('/').next().unwrap_or("")),
+        [shell, no_exit, command, _hook] if no_exit == "-NoExit" && command == "-Command" => {
+            let name = shell
+                .rsplit(['/', '\\'])
+                .next()
+                .unwrap_or("")
+                .to_ascii_lowercase();
+            ["pwsh", "pwsh.exe", "powershell", "powershell.exe"].contains(&name.as_str())
+        }
+        _ => false,
     }
 }
 
@@ -129,6 +140,34 @@ mod tests {
             "/bin/ksh",
         ] {
             cases.push((wire("live", Value::Null, json!([shell, "-l"])), Life::Lost));
+        }
+        // On Windows hc 0.1.21 keeps a lost program's terminal with PowerShell and its prompt hook (observed on a
+        // private core restart): `<path>\pwsh.exe -NoExit -Command <hook>`.
+        let hook = "$global:__hc_prompt = $function:prompt; function global:prompt { $p }";
+        for shell in [
+            r"C:\Users\u\AppData\Local\Microsoft\WindowsApps\pwsh.exe",
+            r"C:\Program Files\PowerShell\7\PWSH.EXE",
+            r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe",
+            "pwsh",
+        ] {
+            cases.push((
+                wire(
+                    "live",
+                    Value::Null,
+                    json!([shell, "-NoExit", "-Command", hook]),
+                ),
+                Life::Lost,
+            ));
+        }
+        for argv in [
+            json!([r"C:\x\pwsh.exe", "-NoExit"]),
+            json!([r"C:\x\pwsh.exe", "-NoExit", "-Command"]),
+            json!([r"C:\x\pwsh.exe", "-Command", hook]),
+            json!([r"C:\x\pwsh.exe", "-NoExit", "-Command", hook, "extra"]),
+            json!([r"C:\x\cmd.exe", "-NoExit", "-Command", hook]),
+            json!([r"C:\x\zsh", "-l"]),
+        ] {
+            cases.push((wire("live", Value::Null, argv), Life::Unknown));
         }
         let mut no_foreground: Value =
             serde_json::from_str(&wire("live", Value::Null, json!(launcher))).unwrap();
