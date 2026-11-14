@@ -1025,12 +1025,6 @@ mod tests {
         assert_eq!(launcher_json(&l)["exitCode"], 1);
     }
 
-    // Only the Unix-only marker test uses it.
-    #[cfg(unix)]
-    fn exits_0() -> io::Result<i32> {
-        Ok(0)
-    }
-
     #[test]
     fn launcher_leaves_notices_to_reap() {
         {
