@@ -49,9 +49,10 @@ pub fn list_text(reply: &Map<String, Value>, color: bool) -> String {
     crate::json::to_text(&shown)
 }
 
-/// The agent `focus_hc` selected: its name, pane and window.
+/// The agent focus selected: its member id, name, pane and window.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Focused {
+    pub id: String,
     pub name: String,
     pub pane: String,
     pub window: String,
@@ -229,6 +230,7 @@ pub fn report(ctx: &Ctx, request: &Request) -> Res<Map<String, Value>> {
 
 fn select_view(
     ctx: &Ctx,
+    id: &str,
     name: &str,
     pane: &str,
     window: &str,
@@ -254,11 +256,20 @@ fn select_view(
         return refuse(2, "target", "the agent's pane is no longer its launch");
     }
     Ok(Focused {
+        id: id.into(),
         name: name.into(),
         pane: pane.into(),
         window: window.into(),
     })
 }
+/// What the bar's open found for member `id` (#103 B6).
+#[derive(Debug)]
+pub enum Member {
+    Focused(Focused),
+    NoView,
+    Gone,
+}
+
 pub fn focus_hc(
     ctx: &Ctx,
     core: &crate::hc::Core<'_>,
@@ -267,8 +278,44 @@ pub fn focus_hc(
     expected: Option<&str>,
 ) -> Res<Focused> {
     let id = super::member_target::named_with_core(ctx, caller, name, Some(core))?;
+    match focus_identity(ctx, Some(core), caller, &id, expected)? {
+        Some(focused) => Ok(focused),
+        None => refuse(2, "target", "the agent has no validated view"),
+    }
+}
+
+/// The bar's open (#103 B6): member `id` by id, never by name. A validated view is selected through the multiplexer alone
+/// (view.rs `select_view`), so no hc is needed; a member with none is reopened (an attach: nothing restarts or types) only
+/// with `core`, else `NoView`; an id no committed member has any more is `Gone`.
+pub fn focus_member(
+    ctx: &Ctx,
+    core: Option<&crate::hc::Core<'_>>,
+    caller: &Caller,
+    id: &str,
+    expected: Option<&str>,
+) -> Res<Member> {
+    let identity = match super::member_target::by_id(ctx, caller, id) {
+        Ok(identity) => identity,
+        Err(e) if e.check == "target" => return Ok(Member::Gone),
+        Err(e) => return Err(e),
+    };
+    Ok(
+        match focus_identity(ctx, core, caller, &identity, expected)? {
+            Some(f) => Member::Focused(f),
+            None => Member::NoView,
+        },
+    )
+}
+
+fn focus_identity(
+    ctx: &Ctx,
+    core: Option<&crate::hc::Core<'_>>,
+    caller: &Caller,
+    id: &super::core_identity::Identity,
+    expected: Option<&str>,
+) -> Res<Option<Focused>> {
     lock(ctx, &lock_key("member", caller, &id.id), || {
-        let record = super::member_target::current(ctx, caller, &id)?;
+        let record = super::member_target::current(ctx, caller, id)?;
         let pane = id.view(&record, &registry::rows(ctx, caller)?);
         if expected.is_some_and(|e| pane.as_ref().is_none_or(|p| p.pane != e)) {
             return refuse(
@@ -277,9 +324,12 @@ pub fn focus_hc(
                 "the agent is no longer on the pane the bar drew",
             );
         }
-        match pane {
-            Some(p) => select_view(ctx, &p.name, &p.pane, &p.window, &p.launch),
-            None => restore_view(ctx, core, caller, &id, record),
+        match (pane, core) {
+            (Some(p), _) => {
+                select_view(ctx, &id.id, &p.name, &p.pane, &p.window, &p.launch).map(Some)
+            }
+            (None, Some(core)) => restore_view(ctx, core, caller, id, record).map(Some),
+            (None, None) => Ok(None),
         }
     })
 }
@@ -329,6 +379,7 @@ fn restore_view(
     let v = result?;
     select_view(
         ctx,
+        &id.id,
         &id.name,
         &v.pane,
         &v.window,
@@ -1069,6 +1120,64 @@ mod tests {
                     .iter()
                     .any(|(_, a, _)| ["run", "kill"].contains(&a[0].as_str()))
             );
+        }
+    }
+
+    #[test]
+    fn focus_member_opens_by_id_and_reaches_hc_only_to_reopen() {
+        // (case, a validated view, a reopen core, the member exists, what it gives)
+        for (case, present, reopen, exists, want) in [
+            ("view", true, false, true, "focused %9 true"),
+            ("reopened", false, true, true, "focused %19 true"),
+            ("no view", false, false, true, "no view"),
+            ("gone", false, false, false, "gone"),
+        ] {
+            let w = World::human("");
+            let c = w.caller();
+            cf::member(&w, "bbbbbbbbbbbb", json!({"pane": "%7"})); // the same name "worker", another id
+            if exists {
+                cf::member(&w, ID, json!({}));
+            }
+            if present {
+                let mut row = crate::agents::fixture::row_of("%9|@5|300||", &[]);
+                row.command = "hc attach taaaaaaaaaaaa".into();
+                w.pane_rows(&[row]);
+            } else {
+                w.panes(&[]);
+            }
+            w.launches_hold();
+            w.fakes
+                .mux_rule("new-window", 0, "%19|@8|hc attach taaaaaaaaaaaa\n", "");
+            w.fakes.mux_rule(
+                "#{window_active}",
+                0,
+                if present { "%9|1|1|1\n" } else { "%19|1|1|1\n" },
+                "",
+            );
+            if reopen {
+                cf::online(&w);
+            }
+            let core = reopen.then(|| crate::hc::connect(&w.ctx).unwrap());
+            let got = match focus_member(&w.ctx, core.as_ref(), &c, ID, None).unwrap() {
+                Member::Focused(f) => format!("focused {} {}", f.pane, f.id == ID),
+                Member::NoView => "no view".into(),
+                Member::Gone => "gone".into(),
+            };
+            assert_eq!(got, want, "{case}");
+            assert_eq!(
+                w.fakes
+                    .mux_calls()
+                    .iter()
+                    .filter(|a| a[1] == "new-window")
+                    .count(),
+                usize::from(case == "reopened"),
+                "{case}"
+            );
+            assert!(
+                reopen || w.fakes.hc_calls().is_empty(),
+                "{case}: a validated view needs no hc"
+            );
+            w.fakes.hc_done().unwrap();
         }
     }
 }
