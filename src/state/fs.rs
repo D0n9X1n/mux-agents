@@ -56,15 +56,17 @@ pub fn claim_json(path: &Path, value: &Value) -> Res<bool> {
     }
 }
 
-/// Flushes `dir`'s entries to disk, so a file made in it survives a crash or power loss. Windows needs the folder
-/// opened for writing with backup semantics; a read-only open fails there.
+/// Flushes `dir`'s entries to disk, so an entry made in it survives a crash or power loss. Windows opens the folder
+/// with the right to add a subfolder (FILE_APPEND_DATA) and backup semantics: the least access FlushFileBuffers
+/// takes, and the right a folder made in it needed; a read-only open cannot flush there.
 pub fn sync_dir(dir: &Path) -> io::Result<()> {
     #[cfg(windows)]
     {
         use std::os::windows::fs::OpenOptionsExt;
         const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+        const FILE_APPEND_DATA: u32 = 0x0004;
         OpenOptions::new()
-            .write(true)
+            .access_mode(FILE_APPEND_DATA)
             .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
             .open(dir)?
             .sync_all()
@@ -72,6 +74,37 @@ pub fn sync_dir(dir: &Path) -> io::Result<()> {
     #[cfg(not(windows))]
     {
         File::open(dir)?.sync_all()
+    }
+}
+
+/// Flushes a folder that may not be this user's. A folder the user cannot add an entry to is skipped: no folder on
+/// the user's paths can have been made in it by this user. Any other failure is an error, so an entry this user
+/// may have made is never left unflushed (#103).
+pub fn sync_ancestor(dir: &Path) -> io::Result<()> {
+    match sync_dir(dir) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == io::ErrorKind::PermissionDenied && !may_add_entry(dir) => Ok(()),
+        Err(e) => Err(e),
+    }
+}
+
+/// Whether this user may add an entry to `dir`. Windows: the open for FILE_APPEND_DATA that sync_dir made was
+/// refused, and that is the right adding a folder takes, so no. Unix: write and search permission, as the kernel
+/// checks them for this user.
+fn may_add_entry(dir: &Path) -> bool {
+    #[cfg(windows)]
+    {
+        let _ = dir;
+        false
+    }
+    #[cfg(not(windows))]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        let Ok(c) = std::ffi::CString::new(dir.as_os_str().as_bytes()) else {
+            return true;
+        };
+        // SAFETY: `c` is a NUL-terminated path that outlives the call.
+        unsafe { libc::access(c.as_ptr(), libc::W_OK | libc::X_OK) == 0 }
     }
 }
 
@@ -218,6 +251,37 @@ mod tests {
         assert!(claim_json(&dir.path().join("c.json"), &json!(1)).unwrap());
         sync_dir(dir.path()).unwrap();
         assert!(sync_dir(&dir.path().join("missing")).is_err());
+        assert!(sync_ancestor(&dir.path().join("missing")).is_err());
+        sync_ancestor(dir.path()).unwrap();
+        // Every folder above a user's own one either flushes or is one the user could not add to.
+        for above in dir.path().ancestors() {
+            sync_ancestor(above).unwrap_or_else(|e| panic!("{}: {e}", above.display()));
+        }
+    }
+
+    // #103: a folder the user can add to but not open for a flush (Unix mode 0300) is an error, never skipped; one
+    // the user cannot add to (0100) is skipped.
+    #[cfg(unix)]
+    #[test]
+    fn sync_ancestor_skips_only_folders_the_user_cannot_add_to() {
+        use std::os::unix::fs::PermissionsExt;
+        // SAFETY: geteuid has no preconditions and cannot fail.
+        if unsafe { libc::geteuid() } == 0 {
+            eprintln!("skip: root may add to any folder");
+            return;
+        }
+        let dir = TempDir::new();
+        let probe = dir.path().join("p");
+        std::fs::create_dir(&probe).unwrap();
+        let set =
+            |mode| std::fs::set_permissions(&probe, std::fs::Permissions::from_mode(mode)).unwrap();
+        set(0o300);
+        assert!(sync_ancestor(&probe).is_err());
+        set(0o100);
+        sync_ancestor(&probe).unwrap();
+        set(0o500);
+        sync_ancestor(&probe).unwrap();
+        set(0o700);
     }
 
     #[test]

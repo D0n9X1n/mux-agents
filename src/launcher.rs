@@ -72,20 +72,23 @@ fn launch_overrides(ctx: &Ctx) -> io::Result<Vec<(&'static str, String)>> {
 }
 
 pub(crate) fn run(ctx: &Ctx, spec: &str, err: &mut dyn FnMut(&str), start: Start) -> i32 {
-    run_with(ctx, spec, err, start, &mut |d: &Path| {
-        crate::state::fs::sync_dir(d)
+    run_with(ctx, spec, err, start, &mut |d: &Path, above_root: bool| {
+        if above_root {
+            crate::state::fs::sync_ancestor(d)
+        } else {
+            crate::state::fs::sync_dir(d)
+        }
     })
 }
 
-/// Flushes the claim's folder and every folder above it before the client may run, so no folder entry on the
-/// claim's path can vanish in a crash or power loss, whoever made it and whether or not its maker finished (#103).
-/// From `gens` up to the state root a failed flush is an error. Above the root it is best effort: mux-agent makes
-/// those folders only when the root is first made, and one that existed before is already on disk, while a
-/// folder such as `C:\Users` or `/home` may not open for writing.
+/// Flushes the claim's folder and every folder above it, up to the filesystem root, before the client may run, so no
+/// folder entry on the claim's path can vanish in a crash or power loss, whoever made it and whether or not its maker
+/// finished (#103). Any failed flush stops the launch. Above the state root a folder this user cannot add an entry to
+/// (`C:\Users`, `/home`) is skipped by `sync`: nothing on the path can have been made in it by this user.
 fn flush_claim(
     root: &Path,
     folder: &Path,
-    sync: &mut dyn FnMut(&Path) -> io::Result<()>,
+    sync: &mut dyn FnMut(&Path, bool) -> io::Result<()>,
 ) -> io::Result<()> {
     let gens = folder.join("gens");
     let depth = root.components().count();
@@ -96,13 +99,13 @@ fn flush_claim(
         if !at_root && !lexically_under(root, dir) {
             return Err(io::Error::other("the claim is not under the state root"));
         }
-        sync(dir)?;
+        sync(dir, false)?;
         if at_root {
             break;
         }
     }
     for dir in dirs.filter(|d| !d.as_os_str().is_empty()) {
-        let _ = sync(dir);
+        sync(dir, true)?;
     }
     Ok(())
 }
@@ -122,7 +125,7 @@ fn run_with(
     spec: &str,
     err: &mut dyn FnMut(&str),
     start: Start,
-    sync: &mut dyn FnMut(&Path) -> io::Result<()>,
+    sync: &mut dyn FnMut(&Path, bool) -> io::Result<()>,
 ) -> i32 {
     let given = Path::new(spec);
     // Only a spec.json inside the state root, its path already canonical (no link on the way), is read.
@@ -649,9 +652,8 @@ mod tests {
         }
     }
 
-    // #103: a won claim and every folder above it are flushed to disk before the client runs. A failed flush from
-    // `gens` up to the state root leaves the claim `run` and an exit record, and the client never runs; above the
-    // root a failed flush is ignored.
+    // #103: a won claim and every folder above it are flushed to disk before the client runs. Any failed flush, at
+    // `gens` or above the state root, leaves the claim `run` and an exit record, and the client never runs.
     #[test]
     fn generation_claim_is_flushed_before_the_client_runs() {
         let run_flushing = |l: &Launch, fail: bool| {
@@ -666,7 +668,7 @@ mod tests {
                     started += 1;
                     Ok(0)
                 },
-                &mut |d: &Path| {
+                &mut |d: &Path, _: bool| {
                     synced.push(d.to_path_buf());
                     if fail {
                         Err(io::Error::other("flush failed"))
@@ -702,7 +704,8 @@ mod tests {
             Some(json!("run"))
         );
         assert_eq!(launcher_json(&l)["exitCode"], 1);
-        // Above the root a failed flush is ignored: the client runs.
+        // A failed flush above the root stops the launch too; the sync it gets for those folders is the one that
+        // skips folders the user cannot add to.
         let l = setup("claude", json!([]));
         let depth = l.w.ctx.state_root.components().count();
         let mut err = Vec::new();
@@ -715,15 +718,22 @@ mod tests {
                 started += 1;
                 Ok(0)
             },
-            &mut |d: &Path| {
-                if d.components().count() < depth {
+            &mut |d: &Path, above_root: bool| {
+                assert_eq!(
+                    above_root,
+                    d.components().count() < depth,
+                    "{}",
+                    d.display()
+                );
+                if above_root {
                     Err(io::Error::other("no write access"))
                 } else {
                     Ok(())
                 }
             },
         );
-        assert_eq!((code, started), (0, 1), "{err:?}");
+        assert_eq!((code, started), (1, 0), "{err:?}");
+        assert_eq!(launcher_json(&l)["exitCode"], 1);
     }
 
     #[cfg(unix)]
