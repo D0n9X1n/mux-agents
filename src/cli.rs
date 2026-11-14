@@ -289,7 +289,9 @@ pub fn parse(args: &[String]) -> Res<(&'static VerbDef, Request)> {
 fn wants_text(def: &VerbDef, tokens: &[String]) -> bool {
     let mut tokens = tokens.iter();
     while let Some(token) = tokens.next() {
-        if flag(def.values, token).is_some() {
+        if def.name == "up" && token == "--" {
+            return false; // as `parse`: every later token is the client's
+        } else if flag(def.values, token).is_some() {
             tokens.next();
         } else if flag(&["Text"], token).is_some() {
             return true;
@@ -634,6 +636,15 @@ mod tests {
             panic!("spawn must refuse --") // VerbDef is not Debug
         };
         assert_eq!(e.check, "usage");
+        let def = VERBS.iter().find(|d| d.name == "up").unwrap();
+        assert!(!wants_text(
+            def,
+            &args(&["-Client", "claude", "--", "-Text"])
+        ));
+        assert!(wants_text(
+            def,
+            &args(&["-Text", "-Client", "claude", "--", "x"])
+        ));
     }
 
     use crate::agents::fixture::{CLAUDE, ID, World, list_call};
