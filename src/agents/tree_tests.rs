@@ -1334,3 +1334,68 @@ fn a_run_input_that_cannot_be_built_spends_no_token() {
         assert_ne!(a["runUncertain"], true, "nothing ran: {a}");
     }
 }
+/// Under the team lock the proof is whole again (#103 D1): a terminal that no longer runs the recorded launch, or a
+/// launch aborted since dispatch, refuses 2 `tagged`, never acting on what dispatch saw.
+#[test]
+fn standing_revalidates_the_launch_under_the_lock() {
+    for case in ["argv", "aborted"] {
+        let mut m = member_world();
+        m.hc();
+        let t = term(&m.r, Some(150));
+        m.rounds(1, &t);
+        let c = crate::caller::resolve_tree(&m.w.ctx).unwrap();
+        assert_eq!(c.member.as_deref(), Some(ID), "{case}: proven at dispatch");
+        let mut later = t.clone();
+        match case {
+            "argv" => later["argv"] = json!(["/bin/sh", "-l"]),
+            _ => write(&m.folder(ID).join("commit.json"), json!({"aborted": true})),
+        }
+        m.rounds(1, &later);
+        assert_eq!(standing(&m.w.ctx, &c, None), Err(tagged()), "{case}");
+        m.w.fakes.hc_done().unwrap();
+    }
+}
+/// The same through a spawn: the terminal changes between dispatch and the team lock; the spawn refuses 2 `tagged`
+/// before any reconcile, debit or launch.
+#[test]
+fn a_spawn_whose_terminal_changes_before_the_lock_refuses() {
+    let mut m = member_world();
+    m.w.file("t.md", b"task");
+    m.w.file("b.md", b"brief");
+    m.hc();
+    let t = term(&m.r, Some(150));
+    m.rounds(2, &t);
+    let mut later = t.clone();
+    later["argv"] = json!(["/bin/sh", "-l"]);
+    m.rounds(1, &later);
+    let args = [
+        "spawn",
+        "-Client",
+        "claude",
+        "-TaskFile",
+        "t.md",
+        "-BriefFile",
+        "b.md",
+        "-Context",
+        "brief",
+    ]
+    .map(String::from);
+    let (code, out) = crate::cli::run(&args, || Ok(&m.w.ctx));
+    assert_eq!(
+        (code, out.contains(r#""check":"tagged""#)),
+        (2, true),
+        "{out}"
+    );
+    assert!(
+        !crate::agents::budget::path(&m.state, "$3").exists(),
+        "no token spent"
+    );
+    assert!(
+        !m.w.fakes
+            .hc_calls()
+            .iter()
+            .any(|c| c.1.first().is_some_and(|a| a == "ls" || a == "run")),
+        "no reconcile, no launch"
+    );
+    m.w.fakes.hc_done().unwrap();
+}

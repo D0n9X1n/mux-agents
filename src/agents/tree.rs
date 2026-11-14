@@ -274,13 +274,23 @@ pub fn standing(ctx: &Ctx, caller: &Caller, core: Option<&Core<'_>>) -> Res<Stan
         let rel = [caller.server_key.as_str(), "agents", id, "record.json"];
         let record = crate::caller::hc::within_root(&ctx.state_root, &rel)
             .and_then(|p| crate::state::fs::read_json(&p).ok().flatten());
-        let address = record
+        let identity = record
             .as_ref()
-            .and_then(|r| super::core_identity::Identity::read(r, id, &team))
-            .map(|i| i.address);
-        let t = address
-            .and_then(|a| core.get(&a).ok())
-            .map(|t| sampled(ctx, core, t));
+            .and_then(|r| super::core_identity::Identity::read(r, id, &team));
+        // What dispatch proved, proved again under the lock: the launch still committed (not aborted) and its terminal
+        // still running the recorded launcher, read inside the state root.
+        let rel = [caller.server_key.as_str(), "agents", id, "commit.json"];
+        let committed = crate::caller::hc::within_root(&ctx.state_root, &rel)
+            .and_then(|p| crate::state::fs::read_json(&p).ok().flatten())
+            .is_some_and(|c| c.get("aborted") != Some(&Value::Bool(true)));
+        let t = identity.as_ref().and_then(|i| {
+            core.get(&i.address)
+                .ok()
+                .map(|t| sampled(ctx, core, t))
+                .filter(|t| {
+                    committed && super::lifecycle::classify(Some(t), &i.launcher) == Life::Running
+                })
+        });
         return t
             .zip(record)
             .and_then(|(t, r)| prove_member(ctx, &team, id, &r, &t))
