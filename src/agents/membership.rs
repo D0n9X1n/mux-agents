@@ -90,6 +90,31 @@ pub struct Snapshot {
 impl Snapshot {
     /// Resolve only the mailbox reader; notices never determine current membership.
     pub fn reader(&self, caller: &Caller) -> Res<registry::Me> {
+        // A member proven through its own hc terminal is itself by id, whichever pane shows it, or none (#104).
+        if let Some(id) = &caller.member {
+            let running = self
+                .facts
+                .local
+                .iter()
+                .any(|o| &o.identity.id == id && o.life == super::lifecycle::Life::Running);
+            return match self.records.get(id) {
+                Some(stored) if running && stored.committed => {
+                    let name = self
+                        .facts
+                        .local
+                        .iter()
+                        .find(|o| &o.identity.id == id)
+                        .map(|o| o.identity.name.clone())
+                        .unwrap_or_default();
+                    Ok(registry::Me {
+                        name,
+                        key: id.clone(),
+                        record: Some(stored.record.clone()),
+                    })
+                }
+                _ => crate::error::refuse(2, "parent", "this agent cannot be proven to run"),
+            };
+        }
         if let Some(error) = &self.view_error {
             return Err(error.clone());
         }

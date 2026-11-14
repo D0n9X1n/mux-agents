@@ -515,6 +515,18 @@ pub struct Me {
 /// The caller as `snapshot` sees its pane: a running agent is itself; an own record's pane in any other class, or a
 /// pane carrying an agent tag that is no running agent's, refuses 2 `parent`; any other pane is root.
 pub fn self_of(caller: &Caller, snapshot: &Snapshot) -> Res<Me> {
+    // A member proven through its own hc terminal (live, running, its labels and generation matched) is itself by
+    // id, whichever pane shows it or none (#104 phase 1c); its committed, unnoticed record must still be here.
+    if let Some(id) = &caller.member {
+        return match snapshot.agents.iter().find(|a| &a.id == id) {
+            Some(agent) if agent.committed && !agent.noticed => Ok(Me {
+                name: super::text(agent.record.get("name")),
+                key: id.clone(),
+                record: Some(agent.record.clone()),
+            }),
+            _ => refuse(2, "parent", "this agent cannot be proven to run"),
+        };
+    }
     match snapshot.own(caller) {
         Own::Agent(pane) => Ok(Me {
             name: pane.name,
@@ -1154,6 +1166,25 @@ mod tests {
                 "{argv:?} {start} {pid} {dead}"
             );
         }
+    }
+
+    #[test]
+    fn a_hc_proven_member_is_itself_with_its_view_closed() {
+        // #104 phase 1c: send and status take self from own(); a member proven through its own hc terminal is that
+        // member by id even when no pane shows it, and never another record that names its old pane.
+        let w = World::agent("");
+        w.agent_record(ID, json!({"name": "me", "pane": "%1"}));
+        w.panes(&[]);
+        let mut caller = w.caller();
+        caller.member = Some(ID.into());
+        let s = Snapshot::take(&w.ctx, &caller).unwrap();
+        let me = self_of(&caller, &s).unwrap();
+        assert_eq!((me.name.as_str(), me.key.as_str()), ("me", ID));
+        caller.member = Some("bbbbbbbbbbbb".into());
+        assert_eq!(
+            refusal(self_of(&caller, &s)),
+            "2 parent this agent cannot be proven to run"
+        );
     }
 
     #[test]

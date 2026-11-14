@@ -350,6 +350,7 @@ fn post_exited(ctx: &Ctx, folder: &Path, code: i32) -> Res<()> {
         socket: String::new(),
         server_key: server_key.to_string(),
         agent_tag: String::new(),
+        member: None,
     };
     lock(ctx, &lock_key("notice", &caller, id), || {
         add_notice(ctx, &caller, id, &record, Notice::Exited(code.into())).map(|_| ())

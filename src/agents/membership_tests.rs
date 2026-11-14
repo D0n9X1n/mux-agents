@@ -490,3 +490,67 @@ fn board_view_order_preserves_enumeration_without_promoting_tags() {
         w.fakes.hc_done().unwrap();
     }
 }
+
+// #104 phase 1c: a worker proven through its own hc terminal is that member, whichever pane shows it now: a closed
+// or moved view, or a multiplexer that does not answer, never changes whose mailbox it reads.
+#[test]
+fn reader_takes_a_hc_proven_member_by_id_not_by_its_view() {
+    for case in [
+        "detached",
+        "moved",
+        "view-error",
+        "ended",
+        "uncommitted",
+        "other",
+    ] {
+        let w = World::human("");
+        let mut caller = w.caller();
+        let r = f::member(&w, ID, json!({"pane":"%1","window":"@1"}));
+        let mut t = f::wire(&r);
+        if case == "ended" {
+            t["state"] = json!("finished");
+            t["reason"] = json!("exited");
+        }
+        if case == "uncommitted" {
+            std::fs::remove_file(w.folder(ID).join("commit.json")).unwrap();
+        }
+        caller.member = Some(if case == "other" { "bbbbbbbbbbbb" } else { ID }.into());
+        caller.agent_tag = ID.into();
+        let mut row = crate::agents::fixture::row_of("%5|@1|100|bbbbbbbbbbbb|wrong", &[]);
+        row.command = "hc attach taaaaaaaaaaaa".into();
+        w.pane_rows(if case == "moved" {
+            std::slice::from_ref(&row)
+        } else {
+            &[]
+        });
+        if case == "view-error" {
+            w.fakes.mux_first("list-panes", 1, "", "down");
+        }
+        f::online(&w);
+        f::listing(&w, &team(&caller), &[]);
+        f::get(&w, "taaaaaaaaaaaa", t);
+        let snapshot = Snapshot::take(&w.ctx, &caller).unwrap();
+        let result = snapshot.reader(&caller);
+        match case {
+            "detached" | "moved" | "view-error" => assert_eq!(
+                result.unwrap(),
+                registry::Me {
+                    name: "worker".into(),
+                    key: ID.into(),
+                    record: Some(r.clone())
+                },
+                "{case}"
+            ),
+            _ => {
+                let e = result.unwrap_err();
+                assert_eq!(
+                    (e.code, e.check, e.message.as_str()),
+                    (2, "parent", "this agent cannot be proven to run"),
+                    "{case}"
+                );
+            }
+        }
+        assert!(w.fakes.locks().is_empty());
+        w.fakes.hc_done().unwrap();
+    }
+}

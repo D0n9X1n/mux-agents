@@ -83,6 +83,7 @@ fn prove(ctx: &Ctx) -> Res<Option<Caller>> {
             socket: socket.into(),
             server_key: key.into(),
             agent_tag: id.into(),
+            member: Some(id.into()),
         })
     };
     Ok(read())

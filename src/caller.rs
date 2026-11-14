@@ -37,6 +37,9 @@ pub struct Caller {
     pub socket: String,
     pub server_key: String,
     pub agent_tag: String,
+    /// The member id proven through the caller's own hc terminal (its `mux.id`, labels, generation and life), none
+    /// for a caller proven by its pane. Such a member is itself whichever pane shows it (#104 phase 1c).
+    pub member: Option<String>,
 }
 
 const PROBE: &str = "#{pid}|#{pane_pid}|#{session_id}|#{window_id}|#{@agent-id}";
@@ -210,6 +213,7 @@ pub fn resolve(ctx: &Ctx) -> Res<Caller> {
         socket: endpoint.socket,
         server_key,
         agent_tag: probe.tag.to_string(),
+        member: None,
     })
 }
 

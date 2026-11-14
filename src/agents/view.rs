@@ -5,7 +5,7 @@ use serde_json::{Map, Value, json};
 
 use super::board::board;
 use super::mail::doing_line;
-use super::registry::{self, find_pane};
+use super::registry;
 use super::{FILES_ONLY, lock, lock_key, state_dir, usage};
 use crate::caller::{Caller, Kind, resolve};
 use crate::cli::Request;
@@ -49,7 +49,7 @@ pub fn list_text(reply: &Map<String, Value>, color: bool) -> String {
     crate::json::to_text(&shown)
 }
 
-/// The agent `focus_pane` selected: its name, pane and window.
+/// The agent `focus_hc` selected: its name, pane and window.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Focused {
     pub name: String,
@@ -106,21 +106,6 @@ fn step(ctx: &Ctx, caller: &Caller, forward: bool) -> Res<String> {
         (None, false) => n - 1,
     };
     Ok(live[to].0.clone())
-}
-
-/// Selects a running agent's window and pane, only while its pane is still its live launch (checked by the server in
-/// the same command), then reads it back: the pane must be active in the active window, live and still that launch.
-/// With `expected` (the pane the side bar drew), an agent now on another pane is refused before anything is selected.
-pub fn focus_pane(ctx: &Ctx, caller: &Caller, name: &str, expected: Option<&str>) -> Res<Focused> {
-    let pane = find_pane(ctx, caller, name)?;
-    if expected.is_some_and(|e| e != pane.pane) {
-        return refuse(
-            2,
-            "target",
-            "the agent is no longer on the pane the bar drew",
-        );
-    }
-    select_view(ctx, &pane.name, &pane.pane, &pane.window, &pane.launch)
 }
 
 /// The positional the verb table requires.
@@ -568,7 +553,7 @@ mod tests {
     }
 
     #[test]
-    fn focus_pane_refuses_a_moved_agent_before_selecting() {
+    fn focus_hc_refuses_a_moved_agent_before_selecting() {
         let w = World::human("");
         cf::member(
             &w,
