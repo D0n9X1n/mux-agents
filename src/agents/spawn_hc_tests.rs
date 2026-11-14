@@ -34,6 +34,7 @@ fn slot(_: &crate::hc::Core<'_>) -> Res<CoreSlot> {
         name: "worker".into(),
         color: "blue",
         placed: None,
+        debit: false,
     })
 }
 fn folder(w: &World) -> PathBuf {
@@ -470,6 +471,7 @@ fn a_placed_child_records_its_place_and_a_failed_launch_keeps_its_debit() {
             name: "worker".into(),
             color: "blue",
             placed: p,
+            debit: false,
         })
     };
     let r = launch_hc(&w.ctx, &caller, request(&w), |_| slot(Some(placed.clone()))).unwrap();

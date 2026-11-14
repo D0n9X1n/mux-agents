@@ -260,6 +260,7 @@ pub fn spawn(ctx: &Ctx, request: &Request) -> Res<Map<String, Value>> {
                 name,
                 color: crate::paint::PALETTE[i],
                 placed,
+                debit: gate.as_ref().is_some_and(|a| a.member),
             })
         },
     )?;
@@ -956,6 +957,7 @@ mod tests {
                     name: "hi".into(),
                     color: "blue",
                     placed: None,
+                    debit: false,
                 })
             },
         );
@@ -3928,6 +3930,8 @@ pub struct CoreSlot {
     pub name: String,
     pub color: &'static str,
     pub placed: Option<super::tree::Placed>,
+    /// A member's child or resume: the launch takes one budget token as its last step before `hc run` (D5).
+    pub debit: bool,
 }
 /// What a resume carries from the ended member X into its successor: X's id, its record (name, client, session,
 /// directory, parent, depth, mailbox) and the client flags its launch spec recorded.
@@ -3958,6 +3962,7 @@ pub fn launch_hc_locked(
 ) -> Res<Value> {
     let mut slot = reserve(core)?;
     let placed = slot.placed.take();
+    let debit = slot.debit;
     let launch = Launch {
         ctx,
         caller,
@@ -3984,6 +3989,17 @@ pub fn launch_hc_locked(
                 super::leader::prepare(ctx, caller, request.client, request.directory, slot, leader)
             }
             (None, None) => launch.prepare_hc(slot),
+        },
+        || {
+            if !debit {
+                return Ok(());
+            }
+            let file = super::budget::path(&super::server_dir(ctx, caller), &caller.session);
+            super::budget::spend(
+                &file,
+                &super::budget::rate(ctx, caller),
+                super::budget::now_secs(ctx),
+            )
         },
         |core, p, view| {
             // MUX_AGENTS_TEST_PANIC=launch panics after `hc run`, inside the rollback scope (live `up` test).

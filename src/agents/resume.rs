@@ -56,6 +56,8 @@ pub fn resume(ctx: &Ctx, request: &Request) -> Res<Map<String, Value>> {
         };
         let snapshot = Snapshot::for_spawn(ctx, &caller, &core)?;
         let resumed = admit(ctx, &caller, &core, &snapshot, target, gate.as_ref())?;
+        // A member's resume takes its token as the launch's last step before `hc run` (D5).
+        let debit = matches!(&gate, Some((_, super::tree::Standing::Member(_))));
         // The mailbox barrier: a reader of X's mailbox that holds its lock finishes before Y exists; one after it
         // finds X superseded (or not yet running Y) and reads nothing. No mailbox lock is held across the launch.
         let mailbox = super::mail::member_mailbox(&resumed.from, &resumed.record);
@@ -87,6 +89,7 @@ pub fn resume(ctx: &Ctx, request: &Request) -> Res<Map<String, Value>> {
                     name,
                     color,
                     placed: None,
+                    debit,
                 })
             },
         )?;
@@ -217,7 +220,7 @@ fn admit(
             name_check()?;
             if matches!(s, super::tree::Standing::Member(_)) {
                 let file = super::budget::path(&server_dir(ctx, caller), &caller.session);
-                super::budget::spend(
+                super::budget::check(
                     &file,
                     &super::budget::rate(ctx, caller),
                     super::budget::now_secs(ctx),

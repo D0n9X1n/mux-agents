@@ -425,7 +425,8 @@ pub struct Placed {
     pub directory: Option<String>,
     pub name: String,
 }
-/// After the snapshot: limit, ceiling, name, then a member's token last, so a refusal spends nothing.
+/// After the snapshot: limit, ceiling, name, then a member's budget last. It is only checked here: the launch takes
+/// the token as its last step before `hc run` (`CoreSlot::debit`), so no later refusal spends it (D5).
 pub fn place(
     ctx: &Ctx,
     caller: &Caller,
@@ -440,7 +441,7 @@ pub fn place(
     let name = name()?;
     if a.member {
         let file = super::budget::path(&server_dir(ctx, caller), &caller.session);
-        super::budget::spend(
+        super::budget::check(
             &file,
             &super::budget::rate(ctx, caller),
             super::budget::now_secs(ctx),

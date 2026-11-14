@@ -167,6 +167,7 @@ fn create(ctx: &Ctx, caller: &Caller, core: &Core<'_>, plan: &Plan<'_>) -> Res<M
                 name: "leader".into(),
                 color: crate::paint::identity(None, "leader"),
                 placed: None,
+                debit: false,
             })
         })
     })

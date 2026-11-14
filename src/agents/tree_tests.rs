@@ -493,9 +493,9 @@ fn admission_runs_in_v5_order() {
         (m.depth, &m.parent["id"], m.directory.as_deref()),
         (3, &json!(i[1]), Some("/work"))
     );
-    assert_eq!(
-        crate::state::fs::read_json(&budget).unwrap().unwrap()["tokens"],
-        19
+    assert!(
+        !budget.exists(),
+        "place checks the budget; the launch spends it (D5)"
     );
 }
 #[test]
@@ -1112,5 +1112,192 @@ fn a_refused_request_spends_no_token() {
             .iter()
             .any(|c| c.1.first().is_some_and(|a| a == "run")),
         "refused before any launch"
+    );
+}
+/// What a proven member's spawn reads from hc under the team lock: its two resolutions, then the launch's connect,
+/// its own terminal and the snapshot of LEADER, ID and OTHER.
+fn spawn_rounds(m: &Mw, t: &Value) {
+    m.rounds(2, t);
+    cf::online(&m.w);
+    cf::get(&m.w, m.r["hcAddress"].as_str().unwrap(), t.clone());
+    cf::listing(&m.w, &crate::agents::membership::team(&m.c), &[]);
+    let mut all: Vec<(String, Value)> = [LEADER, ID, OTHER]
+        .iter()
+        .map(|id| {
+            let r = m.record(id);
+            (
+                r["hcAddress"].as_str().unwrap().to_string(),
+                if *id == ID { t.clone() } else { cf::wire(&r) },
+            )
+        })
+        .collect();
+    all.sort_by(|a, b| a.0.cmp(&b.0));
+    for (address, wire) in all {
+        cf::get(&m.w, &address, wire);
+    }
+}
+/// A request check that only the launch's own preparation can make (the escaped command line) spends no token: the
+/// debit is the last step before `hc run` (#103 D5).
+#[test]
+fn a_command_line_too_long_spends_no_token() {
+    let mut m = member_world();
+    m.w.file("t.md", &vec![b'"'; crate::state::fs::TASK_MAX as usize]);
+    m.w.file("b.md", b"brief");
+    m.hc();
+    spawn_rounds(&m, &term(&m.r, Some(150)));
+    let args = [
+        "spawn",
+        "-Client",
+        "claude",
+        "-TaskFile",
+        "t.md",
+        "-BriefFile",
+        "b.md",
+        "-Context",
+        "brief",
+        "-Name",
+        "child",
+    ]
+    .map(String::from);
+    let (code, out) = crate::cli::run(&args, || Ok(&m.w.ctx));
+    assert_eq!(
+        (
+            code,
+            out.contains(r#""check":"usage""#),
+            out.contains("too long")
+        ),
+        (2, true, true),
+        "{out}"
+    );
+    assert!(
+        !crate::agents::budget::path(&m.state, "$3").exists(),
+        "no token spent"
+    );
+    assert!(
+        !m.w.fakes
+            .hc_calls()
+            .iter()
+            .any(|c| c.1.first().is_some_and(|a| a == "run")),
+        "no launch"
+    );
+}
+/// A refusal from inside `allocate` spends no token: a Copilot member's fork whose session copy cannot be verified
+/// turns brief, and with no -BriefFile it refuses 2 `brief` before the debit.
+#[test]
+fn a_refusal_inside_allocate_spends_no_token() {
+    let mut m = member_world();
+    m.w.file("t.md", b"task");
+    let mut r = m.record(ID);
+    r["client"] = "copilot".into();
+    write(&m.folder(ID).join("record.json"), r);
+    m.w.fakes.client(150, Client::Copilot);
+    m.hc();
+    m.w.ctx.env = crate::ctx::Env::from_pairs([
+        ("HC_TERMINAL_ID", m.r["hcAddress"].as_str().unwrap()),
+        (
+            "COPILOT_AGENT_SESSION_ID",
+            "33333333-3333-4333-8333-333333333333",
+        ),
+    ]);
+    // No session folder to copy: `copy_session` fails before it writes anything.
+    m.w.ctx.home = m.w.ctx.cwd.join("no-home");
+    spawn_rounds(&m, &term(&m.r, Some(150)));
+    let args = [
+        "spawn",
+        "-Client",
+        "copilot",
+        "-TaskFile",
+        "t.md",
+        "-Context",
+        "fork",
+        "-Name",
+        "child",
+    ]
+    .map(String::from);
+    let (code, out) = crate::cli::run(&args, || Ok(&m.w.ctx));
+    assert_eq!(
+        (code, out.contains(r#""check":"brief""#)),
+        (2, true),
+        "{out}"
+    );
+    assert!(
+        !crate::agents::budget::path(&m.state, "$3").exists(),
+        "no token spent"
+    );
+    assert!(
+        !m.w.fakes
+            .hc_calls()
+            .iter()
+            .any(|c| c.1.first().is_some_and(|a| a == "run")),
+        "no launch"
+    );
+}
+/// A guard: a member's spawn that launches spends exactly one token.
+#[test]
+fn a_member_spawn_that_launches_spends_one_token() {
+    let mut m = member_world();
+    m.w.file("t.md", b"task");
+    m.w.file("b.md", b"brief");
+    m.hc();
+    spawn_rounds(&m, &term(&m.r, Some(150)));
+    launch_ok(&m.w);
+    let args = [
+        "spawn",
+        "-Client",
+        "claude",
+        "-TaskFile",
+        "t.md",
+        "-BriefFile",
+        "b.md",
+        "-Context",
+        "brief",
+        "-Name",
+        "child",
+    ]
+    .map(String::from);
+    let (code, out) = crate::cli::run(&args, || Ok(&m.w.ctx));
+    assert_eq!(code, 0, "{out}");
+    let budget = crate::state::fs::read_json(&crate::agents::budget::path(&m.state, "$3"))
+        .unwrap()
+        .unwrap();
+    assert_eq!(budget["tokens"], 19, "one token, at the launch");
+    m.w.fakes.hc_done().unwrap();
+}
+/// A guard: a failure that cannot be known before the launch keeps its token. `hc run` fails after the debit (D5).
+#[test]
+fn a_failed_launch_keeps_its_token() {
+    let mut m = member_world();
+    m.w.file("t.md", b"task");
+    m.w.file("b.md", b"brief");
+    m.hc();
+    spawn_rounds(&m, &term(&m.r, Some(150)));
+    m.w.fakes
+        .hc_answer(Err(crate::error::Refusal::internal("timeout")));
+    let args = [
+        "spawn",
+        "-Client",
+        "claude",
+        "-TaskFile",
+        "t.md",
+        "-BriefFile",
+        "b.md",
+        "-Context",
+        "brief",
+        "-Name",
+        "child",
+    ]
+    .map(String::from);
+    let (code, out) = crate::cli::run(&args, || Ok(&m.w.ctx));
+    assert_ne!(code, 0, "{out}");
+    let budget = crate::state::fs::read_json(&crate::agents::budget::path(&m.state, "$3"))
+        .unwrap()
+        .unwrap();
+    assert_eq!(budget["tokens"], 19, "the run failed after the debit");
+    assert!(
+        m.w.fakes
+            .hc_calls()
+            .iter()
+            .any(|c| c.1.first().is_some_and(|a| a == "run")),
+        "the run was tried"
     );
 }

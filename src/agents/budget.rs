@@ -38,9 +38,9 @@ pub fn rate(ctx: &Ctx, caller: &Caller) -> Rate {
         refill: read("@mux-agents-spawn-refill", DEFAULT.refill),
     }
 }
-/// Takes one token at `now` (s), on disk before it returns; the caller holds the team lock. Empty refuses 2 `budget`;
-/// a malformed file, or a clock before the file's, refuses (fail closed).
-pub fn spend(file: &Path, rate: &Rate, now: u64) -> Res<()> {
+/// The bucket at `now` (s), read only: its tokens and the time they count from. Empty refuses 2 `budget`; a malformed
+/// file, or a clock before the file's, refuses (fail closed).
+fn level(file: &Path, rate: &Rate, now: u64) -> Res<(u64, u64)> {
     let (tokens, at) = match crate::state::fs::read_json(file)? {
         None => (rate.capacity, now),
         Some(v) => match (
@@ -66,6 +66,16 @@ pub fn spend(file: &Path, rate: &Rate, now: u64) -> Res<()> {
             format!("the team's spawn budget is spent; the next token arrives in {n}s"),
         );
     }
+    Ok((tokens, at))
+}
+/// Whether a token is there at `now`, taking none: the team gate checks it in its order (D5). The launch takes it
+/// with `spend` as its last step before `hc run`, under the same team lock, so a refused request spends nothing.
+pub fn check(file: &Path, rate: &Rate, now: u64) -> Res<()> {
+    level(file, rate, now).map(|_| ())
+}
+/// Takes one token at `now` (s), on disk before it returns; the caller holds the team lock. Refuses as `check` does.
+pub fn spend(file: &Path, rate: &Rate, now: u64) -> Res<()> {
+    let (tokens, at) = level(file, rate, now)?;
     let dir = file.parent().unwrap_or(Path::new(""));
     // The folders this call makes, nearest first; each is a new entry in its parent.
     let made = dir

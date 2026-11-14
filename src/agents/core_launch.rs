@@ -27,11 +27,12 @@ pub fn execute(
     clean: impl FnOnce(&Created) -> Res<bool>,
 ) -> Res<Value> {
     let core = hc::connect(ctx)?;
-    execute_connected(&core, prepare, attach, commit, clean)
+    execute_connected(&core, prepare, || Ok(()), attach, commit, clean)
 }
 pub fn execute_connected(
     core: &Core<'_>,
     prepare: impl FnOnce() -> Res<Prepared>,
+    debit: impl FnOnce() -> Res<()>,
     attach: impl FnOnce(&Core<'_>, &Prepared, &mut Option<Created>) -> Res<()>,
     commit: impl FnOnce(&Path) -> Res<()>,
     clean: impl FnOnce(&Created) -> Res<bool>,
@@ -69,6 +70,9 @@ pub fn execute_connected(
         labels.push(("mux.up", up));
     }
     let argv: Vec<&str> = p.argv.iter().map(String::as_str).collect();
+    // A member's budget token: the last step before `hc run`, after every check of the request, so a refusal before
+    // here spends nothing and only a failure from here on (the run, the launch) keeps it (#103 D5).
+    debit().map_err(|e| super::spawn::abort_evidence(&p.folder, e))?;
     let run = attempt(|| {
         core.run(&Run {
             bg: true,
@@ -199,6 +203,7 @@ mod tests {
         execute_connected(
             &core,
             || Ok(prepared(&w)),
+            || Ok(()),
             |_, _, view| {
                 *view = Some(created());
                 Ok(())
