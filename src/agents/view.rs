@@ -77,7 +77,9 @@ pub fn focus(ctx: &Ctx, request: &Request) -> Res<Map<String, Value>> {
     let mut reply = Map::new();
     reply.insert("name".into(), focused.name.into());
     reply.insert("pane".into(), focused.pane.into());
-    reply.insert("window".into(), focused.window.into());
+    // The view is focused and the member lock released: the bar of its window is best effort and never fails focus.
+    reply.insert("window".into(), focused.window.clone().into());
+    crate::sidebar::keep(ctx, &caller, &focused.window, &mut reply);
     Ok(reply)
 }
 
@@ -357,6 +359,65 @@ mod tests {
         }
     }
 
+    // #103: focus keeps the bar of the focused view's window (@5), never the caller's (@1): its proven bar is
+    // named in the reply; with the session's bar off, the reply names none and no record is read.
+    #[test]
+    fn focus_keeps_the_bar_of_the_focused_views_window() {
+        for off in [false, true] {
+            let w = World::human("");
+            cf::member(
+                &w,
+                ID,
+                json!({"startCommand":crate::agents::fixture::launch_command("%9")}),
+            );
+            w.panes(&["%9|@5|300|aaaaaaaaaaaa|worker"]);
+            w.fakes.mux_rule("#{window_active}", 0, "%9|1|1|1\n", "");
+            let exe = w.ctx.exe.display().to_string();
+            w.fakes.process(crate::proc::Row {
+                pid: 113,
+                ppid: 900,
+                start: Some(1130),
+                path: Some(exe.clone()),
+                argv: Some(vec![exe, "watch".into()]),
+            });
+            w.fakes.mux_rule(
+                "show-options -wqv -t @5 @mux-agents-sidebar-id",
+                0,
+                "%13 113 1130\n",
+                "",
+            );
+            w.fakes
+                .mux_rule("#{pane_dead}|#{pane_pid}", 0, "%13|@5|0|113\n", "");
+            if off {
+                w.fakes
+                    .mux_rule("show-options -qv -t $3 @mux-agents-sidebar", 0, "off\n", "");
+            }
+            cf::online(&w);
+            let want = if off { "null" } else { r#""%13""# };
+            assert_eq!(
+                run(&w, focus, &["focus", "worker"]),
+                format!(r#"ok {{"name":"worker","pane":"%9","window":"@5","sidebar":{want}}}"#),
+                "{off}"
+            );
+            let reads: Vec<String> = w
+                .fakes
+                .mux_calls()
+                .iter()
+                .filter(|c| c.iter().any(|a| a == "@mux-agents-sidebar-id"))
+                .map(|c| c.join(" "))
+                .collect();
+            let want: &[&str] = if off {
+                &[]
+            } else {
+                &[
+                    "-N show-options -qv -t $3 @mux-agents-sidebar-id",
+                    "-N show-options -wqv -t @5 @mux-agents-sidebar-id",
+                ]
+            };
+            assert_eq!(reads, want, "{off}");
+        }
+    }
+
     #[test]
     fn focus_selects_window_then_pane() {
         let w = World::human("");
@@ -367,11 +428,14 @@ mod tests {
         );
         w.panes(&["%9|@5|300|aaaaaaaaaaaa|worker"]);
         w.fakes.mux_rule("#{window_active}", 0, "%9|1|1|1\n", "");
+        // The session's bar is off: focus only reads that, after the select.
+        w.fakes
+            .mux_first("show-options -qv -t $3 @mux-agents-sidebar", 0, "off\n", "");
         w.fakes.clear_log();
         cf::online(&w);
         assert_eq!(
             run(&w, focus, &["focus", "worker"]),
-            r#"ok {"name":"worker","pane":"%9","window":"@5"}"#
+            r#"ok {"name":"worker","pane":"%9","window":"@5","sidebar":null}"#
         );
         let live = registry::Launch {
             command: crate::agents::fixture::launch_command("%9"),
@@ -383,7 +447,7 @@ mod tests {
         // One server-side command selects the window and the pane only while %9 is still its live launch; a read
         // then proves it active, live and that launch.
         assert_eq!(
-            calls[2..],
+            calls[2..4],
             [
                 vec![
                     "-N".to_string(),
@@ -435,7 +499,7 @@ mod tests {
         cf::online(&w);
         assert_eq!(
             run(&w, focus, &["focus", "worker"]),
-            r#"ok {"name":"worker","pane":"%9","window":"@5"}"#
+            r#"ok {"name":"worker","pane":"%9","window":"@5","sidebar":null}"#
         );
         cf::online(&w);
         assert_eq!(
@@ -970,11 +1034,13 @@ mod tests {
             );
             w.launches_hold();
             w.fakes.mux_first("#{window_active}", 0, "%20|1|1|1\n", "");
+            w.fakes
+                .mux_first("show-options -qv -t $3 @mux-agents-sidebar", 0, "off\n", "");
             let out = focus(&w.ctx, &w.request(&args)).unwrap();
             w.fakes.hc_done().unwrap();
             assert_eq!(
                 Value::Object(out).to_string(),
-                format!(r#"{{"name":"{n}","pane":"%20","window":"@7"}}"#)
+                format!(r#"{{"name":"{n}","pane":"%20","window":"@7","sidebar":null}}"#)
             );
             let calls = w.fakes.hc_calls();
             assert_eq!(

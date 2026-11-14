@@ -852,14 +852,32 @@ mod tests {
         w
     }
 
-    // The agent's pane is %12; the side bar's split, the only call running `watch`, answers %13 in the caller's window.
+    // The agent's pane is %12; the side bar's split, the only call running `watch`, answers %13 in the window it
+    // targets (the new view's), and the bar's proof answers that window.
     fn spawn_world() -> World {
         let w = World::human("");
         w.launches_hold();
         bar_process(&w);
         w.fakes
             .mux_rule("new-window", 0, "%12|@7|hc attach t1\n", "");
-        w.fakes.mux_rule("watch", 0, "%13|@1|113\n", "");
+        let bar_window = std::rc::Rc::new(std::cell::RefCell::new("@1".to_string()));
+        let at = bar_window.clone();
+        w.fakes.mux_script("watch", move |argv| {
+            let target = argv.iter().position(|a| a == "-t").unwrap() + 1;
+            *at.borrow_mut() = argv[target].clone();
+            Ok(Output {
+                code: 0,
+                stdout: format!("%13|{}|113\n", argv[target]),
+                stderr: String::new(),
+            })
+        });
+        w.fakes.mux_script("#{pane_dead}|#{pane_pid}", move |_| {
+            Ok(Output {
+                code: 0,
+                stdout: format!("%13|{}|0|113\n", std::cell::RefCell::borrow(&bar_window)),
+                stderr: String::new(),
+            })
+        });
         w.fakes
             .mux_rule("split-window", 0, "%12|@7|hc attach t1\n", "");
         use crate::agents::core_fixture as cf;
@@ -1104,7 +1122,7 @@ mod tests {
             if tokens[0] == "focus" {
                 assert_eq!(
                     out,
-                    r#"{"ok":true,"verb":"focus","name":"worker","pane":"%9","window":"@5"}"#
+                    r#"{"ok":true,"verb":"focus","name":"worker","pane":"%9","window":"@5","sidebar":null}"#
                 );
                 assert_eq!(w.fakes.hc_calls().len(), 1);
             }
@@ -1190,6 +1208,9 @@ mod tests {
         row.command = "hc attach taaaaaaaaaaaa".into();
         w.pane_rows(&[row]);
         crate::agents::core_fixture::online(&w);
+        // The session's bar is off: focus keeps no bar, after one read.
+        w.fakes
+            .mux_first("show-options -qv -t $3 @mux-agents-sidebar", 0, "off\n", "");
         record(&w, "focus worker", &["focus", "worker"], 0);
         record(
             &agents_world(),
@@ -1271,7 +1292,7 @@ mod tests {
         let w = World::human("");
         bar_process(&w);
         w.fakes.mux_rule(
-            "show-options -qv -t $3 @mux-agents-sidebar-id",
+            "show-options -wqv -t @1 @mux-agents-sidebar-id",
             0,
             "%13 113 1130\n",
             "",
@@ -1279,6 +1300,8 @@ mod tests {
         w.fakes
             .mux_rule("#{pane_dead}|#{pane_pid}", 0, "%13|@1|0|113\n", "");
         w.fakes.mux_rule("#{pane_id}|#{pane_pid}", 0, "|\n", "");
+        // The session's one window, the caller's @1.
+        w.fakes.mux_rule("list-windows", 0, "@1\n", "");
         record(&w, "sidebar -Close", &["sidebar", "-Close"], 0);
         // watch draws only to a terminal, so its one frame is drawn through watch_on; a closed output ends it. The
         // pane answers its probe, the record names it, this process (4242, `<exe> watch`) and its start, and the
@@ -1450,7 +1473,7 @@ mod tests {
             let w = open();
             // A recorded bar whose proof cannot be read, and its label: no second bar.
             w.fakes.mux_first(
-                "show-options -qv -t $3 @mux-agents-sidebar-id",
+                "show-options -wqv -t @5 @mux-agents-sidebar-id",
                 0,
                 "%13 113 1130\n",
                 "",

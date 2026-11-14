@@ -300,13 +300,13 @@ exec claude --dangerously-skip-permissions
             reply
         }
 
-        /// `sidebar -Close`, which must succeed: the session's bar is gone and stays off. A test counting mux calls
-        /// closes it first, since its watch also calls the multiplexer every 2 s.
+        /// `sidebar -Close`, which must succeed: every bar of the session is gone and they stay off. A test counting
+        /// mux calls closes them first, since each watch also calls the multiplexer every 2 s.
         fn close_bar(&mut self) -> Value {
             let (code, close) = self.run(&["sidebar", "-Close"]);
             assert_eq!(code, 0, "{:?} {close}", self.mux());
-            if let Some(pane) = close["pane"].as_str() {
-                self.wait_gone(pane);
+            for pane in close["panes"].as_array().into_iter().flatten() {
+                self.wait_gone(pane.as_str().unwrap());
             }
             close
         }
@@ -1766,13 +1766,17 @@ exec claude --dangerously-skip-permissions
         bar_clean(&live, &bar, &screen);
     }
 
-    // The first spawn opens one bar at the right edge, `bar_width` columns, showing the count and each status,
-    // outside list; the next spawn and sidebar answer the same bar; -Close ends it and its watch.
+    // The first spawn beside the caller opens its window's one bar at the right edge, `bar_width` columns, showing
+    // the count and each status, outside list; the next spawn in that window and sidebar answer the same bar; -Close
+    // ends it and its watch.
     fn sidebar_opens_at_bar_width_and_closes(mux: Mux) {
         let Some(mut live) = Live::human(mux) else {
             return;
         };
-        let workers = [live.spawn("w1", &[]), live.spawn("w2", &[])];
+        let workers = [
+            live.spawn("w1", &["-Split", "h"]),
+            live.spawn("w2", &["-Split", "h"]),
+        ];
         let opened = s(&workers[0]["sidebar"]).to_string();
         assert_eq!(workers[1]["sidebar"], opened.as_str(), "{mux:?}");
         std::fs::write(live.dir.join("status.txt"), "checking the side bar").unwrap();
@@ -2259,7 +2263,8 @@ hc {}:
     }
 
     // #47 test 8: a pane in another window of the session carrying the label without proof (a 0.2.1 bar) refuses
-    // sidebar, spawn's bar and -Close: no second bar, no kill.
+    // -Close, which closes no bar: nothing is killed. #103: a label refuses only a bar of its own window, so sidebar
+    // and a spawn's bar open in their own windows.
     fn unproven_label_in_another_window_refuses(mux: Mux) {
         let Some(mut live) = Live::human(mux) else {
             return;
@@ -2281,25 +2286,18 @@ hc {}:
             .to_string();
         live.call(&["set-option", "-p", "-t", &other, "@agent-role", "sidebar"]);
         let refused = format!("pane {other} carries the side-bar label");
-        // -Close first: it turns the bar off before it refuses, and sidebar turns it on again for the spawn.
-        for args in [&["sidebar", "-Close"][..], &["sidebar"]] {
-            let (code, reply) = live.run(args);
-            assert_eq!(code, 1, "{mux:?} {args:?} {reply}");
-            assert!(
-                s(&reply["message"]).starts_with(&refused),
-                "{mux:?} {reply}"
-            );
-        }
-        let (code, spawned) = live.try_spawn("w1", &[]);
-        assert_eq!(
-            (code, &spawned["sidebar"]),
-            (0, &Value::Null),
-            "{mux:?} {spawned}"
-        );
+        let (code, reply) = live.run(&["sidebar", "-Close"]);
+        assert_eq!(code, 1, "{mux:?} {reply}");
         assert!(
-            s(&spawned["sidebarError"]).starts_with(&refused),
-            "{mux:?} {spawned}"
+            s(&reply["message"]).starts_with(&refused),
+            "{mux:?} {reply}"
         );
+        let (code, open) = live.run(&["sidebar"]);
+        assert_eq!((code, &open["opened"]), (0, &json!(true)), "{mux:?} {open}");
+        let (code, spawned) = live.try_spawn("w1", &[]);
+        assert_eq!(code, 0, "{mux:?} {spawned}");
+        assert!(spawned.get("sidebarError").is_none(), "{mux:?} {spawned}");
+        assert_ne!(spawned["sidebar"], Value::Null, "{mux:?} {spawned}");
         assert!(
             live.panes("#{pane_id}").contains(&other),
             "{mux:?}: the pane was killed"
@@ -2309,7 +2307,10 @@ hc {}:
             .into_iter()
             .filter(|r| r == "sidebar")
             .count();
-        assert_eq!(labelled, 1, "{mux:?}: a second bar opened");
+        assert_eq!(
+            labelled, 3,
+            "{mux:?}: the label and one bar in each of the two windows"
+        );
     }
 
     // QA on S1: `mux-agent watch` run by hand in the shell pane beside the real bar only draws: over several ticks no
@@ -2473,13 +2474,15 @@ hc {}:
             .row(watch)
             .and_then(|row| row.start)
             .unwrap();
-        let session = live.field(&root, "#{session_id}");
+        // #103: the record a watch reads is its window's.
+        let window = live.field(&root, "#{window_id}");
         for stamp in [1, start] {
             let record = format!("{root} {watch} {stamp}");
             live.call(&[
                 "set-option",
+                "-w",
                 "-t",
-                &session,
+                &window,
                 "@mux-agents-sidebar-id",
                 &record,
             ]);
@@ -3059,8 +3062,10 @@ hc {}:
         assert!(!live.state().exists(), "{mux:?}");
     }
 
-    // The first spawn opens the session's one bar in the caller's window; later spawns, split or tab, by the
-    // placement or by a flag, answer the same bar. After sidebar -Close a spawn opens none; sidebar opens it again.
+    // #103: each view's window keeps its own bar. The first spawn (a tab) opens one in its new window; a split
+    // beside the caller opens one in the caller's window, and a later split there answers that same bar; a tab gets
+    // its own. After sidebar -Close every bar is gone and a spawn opens none; sidebar opens one in the caller's window
+    // again, and each view window gets its own back.
     fn spawn_bar_once_reused_and_close_stays_closed(mux: Mux) {
         let Some(mut live) = Live::human(mux) else {
             return;
@@ -3073,46 +3078,69 @@ hc {}:
             (&json!("tab"), &json!("default")),
             "{mux:?} {w1}"
         );
-        let bar = s(&w1["sidebar"]).to_string();
+        assert_ne!(w1["window"], root_window.as_str(), "{mux:?}");
+        let bar1 = s(&w1["sidebar"]).to_string();
         assert!(w1.get("sidebarError").is_none(), "{mux:?} {w1}");
-        let width = live.bar_width(&bar);
+        let width = live.bar_width(&bar1);
         assert_eq!(
             live.bars(),
-            [format!("{bar}|{root_window}|{width}")],
+            [format!("{bar1}|{}|{width}", s(&w1["window"]))],
             "{mux:?}"
         );
         let (code, set) = live.run(&["placement", "h"]);
         assert_eq!(code, 0, "{mux:?} {set}");
         let w2 = live.spawn("w2", &[]);
         assert_eq!(
-            (&w2["placement"], &w2["placementSource"], &w2["sidebar"]),
-            (&json!("h"), &json!("session"), &json!(bar)),
+            (&w2["placement"], &w2["placementSource"]),
+            (&json!("h"), &json!("session")),
             "{mux:?} {w2}"
         );
         assert_eq!(w2["window"], root_window.as_str(), "{mux:?}");
+        let bar2 = s(&w2["sidebar"]).to_string();
+        assert_ne!(bar2, bar1, "{mux:?}");
+        assert_eq!(live.field(&bar2, "#{window_id}"), root_window, "{mux:?}");
         // Split beside the caller: to its right, not at the window's left edge.
         assert_ne!(live.field(s(&w2["pane"]), "#{pane_left}"), "0", "{mux:?}");
+        let w2b = live.spawn("w2b", &[]);
+        assert_eq!(w2b["sidebar"], bar2.as_str(), "{mux:?} {w2b}");
         let w3 = live.spawn("w3", &["-Tab"]);
         assert_eq!(
-            (&w3["placement"], &w3["placementSource"], &w3["sidebar"]),
-            (&json!("tab"), &json!("flag"), &json!(bar)),
+            (&w3["placement"], &w3["placementSource"]),
+            (&json!("tab"), &json!("flag")),
             "{mux:?} {w3}"
         );
         assert_ne!(w3["window"], root_window.as_str(), "{mux:?}");
-        assert_eq!(live.bars().len(), 1, "{mux:?} {:?}", live.bars());
+        let bar3 = s(&w3["sidebar"]).to_string();
+        assert!(bar3 != bar1 && bar3 != bar2, "{mux:?} {w3}");
+        assert_eq!(
+            live.field(&bar3, "#{window_id}"),
+            s(&w3["window"]),
+            "{mux:?}"
+        );
+        assert_eq!(live.bars().len(), 3, "{mux:?} {:?}", live.bars());
         let close = live.close_bar();
-        assert_eq!(close["pane"], bar.as_str(), "{mux:?}");
+        let mut closed: Vec<&str> = close["panes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|p| p.as_str().unwrap())
+            .collect();
+        closed.sort();
+        let mut want = [bar1.as_str(), bar2.as_str(), bar3.as_str()];
+        want.sort();
+        assert_eq!(closed, want, "{mux:?} {close}");
+        assert!(live.bars().is_empty(), "{mux:?} {:?}", live.bars());
         let w4 = live.spawn("w4", &["-Tab"]);
         assert_eq!(w4["sidebar"], Value::Null, "{mux:?} {w4}");
         assert!(w4.get("sidebarError").is_none(), "{mux:?} {w4}");
         assert!(live.bars().is_empty(), "{mux:?} {:?}", live.bars());
         let (code, reopened) = live.run(&["sidebar"]);
         assert_eq!(
-            (code, &reopened["opened"]),
-            (0, &json!(true)),
+            (code, &reopened["opened"], &reopened["window"]),
+            (0, &json!(true), &json!(root_window)),
             "{mux:?} {reopened}"
         );
-        // -Text names the bar on its own last line.
+        // -Text names the bar of the new view's window on its own last line.
         let state = live.state_text();
         let args = live.spawn_args("claude", "w5", &["-Tab", "-Text"]);
         let args: Vec<&str> = args.iter().map(String::as_str).collect();
@@ -3130,11 +3158,17 @@ hc {}:
             .iter()
             .find(|r| r["name"] == "w5")
             .unwrap();
+        let bar5 = live
+            .bars()
+            .into_iter()
+            .find(|b| b.split('|').nth(1) == w5["window"].as_str())
+            .map(|b| b.split('|').next().unwrap().to_string())
+            .unwrap_or_else(|| panic!("{mux:?}: no bar in w5's window {w5}"));
         let tail: Vec<&str> = out.lines().rev().take(6).collect();
         assert_eq!(
             tail,
             [
-                format!("sidebar {}", s(&reopened["pane"])),
+                format!("sidebar {bar5}"),
                 format!("hcAddress: {}", s(&w5["hcAddress"])),
                 "view: attached".into(),
                 "life: running".into(),
@@ -3142,12 +3176,37 @@ hc {}:
                 "placement: tab".into()
             ]
         );
-        assert_eq!(live.bars().len(), 1, "{mux:?}");
+        // The caller's bar gives each other view window its own on its next ticks.
+        assert!(
+            eventually(LONG, || one_bar_per_view_window(&mut live)),
+            "{mux:?} {:?}",
+            live.bars()
+        );
     }
 
-    // Spawns at once open exactly one bar; a spawn racing sidebar -Close never leaves a bar once the close has
-    // returned, and a later spawn opens none.
-    fn spawn_races_keep_one_bar(mux: Mux) {
+    /// Whether each window that shows a live agent's view holds a bar, and no window holds two.
+    fn one_bar_per_view_window(live: &mut Live) -> bool {
+        let (_, list) = live.run(&["list"]);
+        let windows: Vec<String> = live
+            .bars()
+            .iter()
+            .map(|b| b.split('|').nth(1).unwrap().to_string())
+            .collect();
+        let mut distinct = windows.clone();
+        distinct.sort();
+        distinct.dedup();
+        distinct.len() == windows.len()
+            && list["agents"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|r| r["window"].as_str())
+                .all(|w| windows.iter().any(|b| b == w))
+    }
+
+    // #103: spawns at once, each a tab, open one bar in each one's window; a spawn racing sidebar -Close never leaves
+    // a bar once the close has returned, and a later spawn opens none.
+    fn spawn_races_keep_one_bar_per_window(mux: Mux) {
         let Some(mut live) = Live::human(mux) else {
             return;
         };
@@ -3166,9 +3225,15 @@ hc {}:
             results.iter().all(|(code, _)| *code == 0),
             "{mux:?} {results:?}"
         );
-        assert_eq!(results[0].1["sidebar"], results[1].1["sidebar"], "{mux:?}");
-        assert_eq!(live.bars().len(), 1, "{mux:?} {:?}", live.bars());
-        let bar = s(&results[0].1["sidebar"]).to_string();
+        assert_ne!(results[0].1["sidebar"], results[1].1["sidebar"], "{mux:?}");
+        for (_, r) in &results {
+            assert_eq!(
+                live.field(s(&r["sidebar"]), "#{window_id}"),
+                s(&r["window"]),
+                "{mux:?} {r}"
+            );
+        }
+        assert_eq!(live.bars().len(), 2, "{mux:?} {:?}", live.bars());
 
         let c = live.spawn_args("claude", "w3", &["-Tab"]);
         let c: Vec<&str> = c.iter().map(String::as_str).collect();
@@ -3178,17 +3243,92 @@ hc {}:
         assert_eq!(code, 0, "{mux:?} {spawned}");
         let (code, closed) = live.server.job_wait(jobs[1], LONG);
         assert_eq!(code, 0, "{mux:?} {closed}");
-        // Whichever ran first, the spawn answered the old bar or none; it never opened a new one.
+        let panes: Vec<Value> = closed["panes"].as_array().unwrap().clone();
+        // Whichever ran first, the spawn answered a bar the close then closed, or none.
         assert!(
-            spawned["sidebar"] == json!(bar) || spawned["sidebar"] == Value::Null,
-            "{mux:?} {spawned}"
+            spawned["sidebar"] == Value::Null || panes.contains(&spawned["sidebar"]),
+            "{mux:?} {spawned} {closed}"
         );
         assert!(spawned.get("sidebarError").is_none(), "{mux:?} {spawned}");
-        live.wait_gone(&bar);
+        for pane in &panes {
+            live.wait_gone(pane.as_str().unwrap());
+        }
         assert!(live.bars().is_empty(), "{mux:?} {:?}", live.bars());
         let w4 = live.spawn("w4", &["-Tab"]);
         assert_eq!(w4["sidebar"], Value::Null, "{mux:?} {w4}");
         assert!(live.bars().is_empty(), "{mux:?} {:?}", live.bars());
+    }
+
+    // #103: three agents in three windows each show one bar, in its own window and proven by its window's record
+    // (its pane, its pane's process, that process `<exe> watch`); closing a view closes its bar and never stops the
+    // agent.
+    fn three_agents_in_three_windows_each_get_one_proven_bar(mux: Mux) {
+        let Some(mut live) = Live::human(mux) else {
+            return;
+        };
+        let workers = [
+            live.spawn("w1", &["-Tab"]),
+            live.spawn("w2", &["-Tab"]),
+            live.spawn("w3", &["-Tab"]),
+        ];
+        let mut windows: Vec<String> = Vec::new();
+        for w in &workers {
+            assert!(w.get("sidebarError").is_none(), "{mux:?} {w}");
+            let (bar, window) = (s(&w["sidebar"]), s(&w["window"]));
+            assert_eq!(live.field(bar, "#{window_id}"), window, "{mux:?} {w}");
+            let pid = live.field(bar, "#{pane_pid}");
+            let record = live.call(&[
+                "show-options",
+                "-wqv",
+                "-t",
+                window,
+                "@mux-agents-sidebar-id",
+            ]);
+            assert!(
+                record.trim_end().starts_with(&format!("{bar} {pid} ")),
+                "{mux:?} {window}: {record:?}"
+            );
+            let row = mux_agent::proc::host()
+                .row(pid.parse().unwrap())
+                .unwrap_or_else(|| panic!("{mux:?}: no process {pid}"));
+            assert_eq!(
+                row.argv
+                    .as_deref()
+                    .and_then(|a| a.get(1))
+                    .map(String::as_str),
+                Some("watch"),
+                "{mux:?} {row:?}"
+            );
+            windows.push(window.to_string());
+        }
+        windows.sort();
+        windows.dedup();
+        assert_eq!(windows.len(), 3, "{mux:?}");
+        assert_eq!(live.bars().len(), 3, "{mux:?} {:?}", live.bars());
+        // Closing w1's view closes its bar; w1 keeps running, detached.
+        let bar1 = s(&workers[0]["sidebar"]).to_string();
+        let pid = live.worker_pid(&workers[0]);
+        let (code, child) = live.server.command(pid, &["@detach"]);
+        assert_eq!(code, 0, "{mux:?}");
+        let child = child["pid"].as_u64().unwrap() as u32;
+        let _owned = support::Sentinels(vec![(child, support::start_of(child))]);
+        live.call(&["kill-pane", "-t", s(&workers[0]["pane"])]);
+        live.wait_gone(s(&workers[0]["pane"]));
+        live.wait_gone(&bar1);
+        let (code, list) = live.run(&["list", "-All"]);
+        assert_eq!(code, 0, "{mux:?} {list}");
+        let row = list["agents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["name"] == "w1")
+            .unwrap();
+        assert_eq!(
+            (&row["life"], &row["view"]),
+            (&json!("running"), &json!("detached")),
+            "{mux:?} {row}"
+        );
+        assert_eq!(live.bars().len(), 2, "{mux:?} {:?}", live.bars());
     }
 
     // A sidebar lock held elsewhere for 15 s: the spawn still succeeds, its agent recorded and committed, with no bar
@@ -3230,9 +3370,22 @@ hc {}:
         held.unlock().unwrap();
         drop(held);
         assert_eq!(live.tagged().len(), 2, "{mux:?}");
+        // #103: w3's own window gets its own bar; w1's stays.
         let w3 = live.spawn("w3", &["-Tab"]);
-        assert_eq!(w3["sidebar"], bar.as_str(), "{mux:?} {w3}");
-        assert_eq!(live.bars().len(), 1, "{mux:?} {:?}", live.bars());
+        let bar3 = s(&w3["sidebar"]);
+        assert_ne!(bar3, bar.as_str(), "{mux:?} {w3}");
+        assert_eq!(
+            live.field(bar3, "#{window_id}"),
+            s(&w3["window"]),
+            "{mux:?}"
+        );
+        assert!(
+            live.bars()
+                .iter()
+                .any(|b| b.starts_with(&format!("{bar}|"))),
+            "{mux:?} {:?}",
+            live.bars()
+        );
     }
 
     // The messages in the root's mailbox for agent `w`'s exit, as stored.
@@ -3314,8 +3467,9 @@ hc {}:
         let Some(mut live) = Live::human(mux) else {
             return;
         };
-        let w1 = live.spawn("w1", &[]);
-        let w2 = live.spawn("w2", &[]);
+        // Both beside the caller (#103): the window keeps w2's view, and so its bar, when w1's pane goes.
+        let w1 = live.spawn("w1", &["-Split", "h"]);
+        let w2 = live.spawn("w2", &["-Split", "h"]);
         let bar = s(&w1["sidebar"]).to_string();
         let pid = live.worker_pid(&w1);
         live.worker_pid(&w2);
@@ -3363,8 +3517,9 @@ hc {}:
     /// and the root pane active; answers the bar and w1's pane.
     fn two_rows(live: &mut Live) -> (String, String) {
         live.assert_not_ascii();
-        let w1 = live.spawn("w1", &[]);
-        let w2 = live.spawn("w2", &[]);
+        // Both beside the caller (#103): their window, the caller's, keeps the bar a client sees.
+        let w1 = live.spawn("w1", &["-Split", "h"]);
+        let w2 = live.spawn("w2", &["-Split", "h"]);
         let bar = s(&w1["sidebar"]).to_string();
         live.worker_pid(&w1);
         live.worker_pid(&w2);
@@ -3442,7 +3597,8 @@ hc {}:
         };
         live.call(&["send-keys", "-t", &bar, "-l", "N"]);
         wait_focused(&live, &p2, "N from the root pane");
-        // The documented binding: a run-shell (not below any pane) sends `n` to the bar the session records. tmux's
+        // The documented binding: a run-shell (not below any pane) sends `n` to the bar the current window records
+        // (#103: a window option, read with -w). tmux's
         // run-shell knows its own server; the multiplexer's binary is named by the server under test.
         if mux != Mux::Rmux {
             live.call(&["select-pane", "-t", &root]);
@@ -3450,7 +3606,7 @@ hc {}:
             let tmux = live.server.binary().to_string_lossy().into_owned();
             let socket = live.server.socket().to_string_lossy().into_owned();
             let line = format!(
-                "{tmux} -S '{socket}' send-keys -t \"$({tmux} -S '{socket}' show -qv @mux-agents-sidebar-id | cut -d' ' -f1)\" n"
+                "{tmux} -S '{socket}' send-keys -t \"$({tmux} -S '{socket}' show -wqv @mux-agents-sidebar-id | cut -d' ' -f1)\" n"
             );
             live.call(&["run-shell", &line]);
             wait_focused(&live, &p1, "the documented binding");
@@ -3994,7 +4150,8 @@ hc {}:
                     spawn_model_recorded_and_listed,
                     placement_is_per_session,
                     spawn_bar_once_reused_and_close_stays_closed,
-                    spawn_races_keep_one_bar,
+                    spawn_races_keep_one_bar_per_window,
+                    three_agents_in_three_windows_each_get_one_proven_bar,
                     gone_pane_closed_by_each_trigger,
                     bar_drops_a_gone_agent,
                     bar_shows_waiting_then_working,

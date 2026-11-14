@@ -1393,9 +1393,11 @@ mod tests {
             r#"ok {"name":"a","pane":"%9","text":"a's screen"}"#
         );
         cf::online(&w);
+        w.fakes
+            .mux_first("show-options -qv -t $3 @mux-agents-sidebar", 0, "off\n", "");
         assert_eq!(
             run(&w, focus, &["focus", "a"]),
-            r#"ok {"name":"a","pane":"%9","window":"@5"}"#
+            r#"ok {"name":"a","pane":"%9","window":"@5","sidebar":null}"#
         );
         let sent = run(&w, send, &["send", "a", "-Body", "hi"]);
         assert!(sent.starts_with(r#"ok {"to":"a","pane":"%9""#), "{sent}");

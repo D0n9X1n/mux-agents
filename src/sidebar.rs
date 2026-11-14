@@ -89,9 +89,9 @@ pub enum Bar {
     Disabled,
 }
 
-/// The bar a spawn keeps open: under the session's sidebar lock, nothing when the session's option says `off`,
-/// else the session's bar, found or opened beside the caller. A failed read or probe refuses and opens nothing.
-pub fn ensure(ctx: &Ctx, caller: &Caller) -> Res<Bar> {
+/// The bar of `window` a verb keeps open: under the session's sidebar lock, nothing when the session's option says
+/// `off`, else that window's bar, found or opened in it. A failed read or probe refuses and opens nothing.
+pub fn ensure(ctx: &Ctx, caller: &Caller, window: &str) -> Res<Bar> {
     lock(ctx, &lock_key("sidebar", caller, &caller.session), || {
         let read = native(
             ctx,
@@ -101,7 +101,8 @@ pub fn ensure(ctx: &Ctx, caller: &Caller) -> Res<Bar> {
         if read.stdout.trim_end_matches(['\r', '\n']) == "off" {
             return Ok(Bar::Disabled);
         }
-        let (pane, _, opened) = find_or_open(ctx, caller)?;
+        migrate(ctx, &caller.session)?;
+        let (pane, _, opened) = find_or_open(ctx, window)?;
         Ok(if opened {
             Bar::Opened(pane)
         } else {
@@ -110,19 +111,71 @@ pub fn ensure(ctx: &Ctx, caller: &Caller) -> Res<Bar> {
     })
 }
 
-/// The session's bar as (pane, window, opened): the proven one, else a new one; refused while a pane of the session
+/// The best-effort bar of `window` for a verb whose own work is done (spawn, focus): `ensure` under catch_unwind, so
+/// neither a refusal nor a panic (which unwinding has already freed the sidebar lock from) fails the verb. The reply
+/// gets `sidebar` (the bar's pane, or null when off or failed) and, on failure, `sidebarError`.
+pub fn keep(ctx: &Ctx, caller: &Caller, window: &str, reply: &mut Map<String, Value>) {
+    let bar =
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| ensure(ctx, caller, window)))
+            .unwrap_or_else(|_| refuse(1, "internal", "unexpected error (panic)"));
+    match bar {
+        Ok(Bar::Opened(pane) | Bar::Existing(pane)) => {
+            reply.insert("sidebar".into(), pane.into());
+        }
+        Ok(Bar::Disabled) => {
+            reply.insert("sidebar".into(), Value::Null);
+        }
+        Err(refusal) => {
+            reply.insert("sidebar".into(), Value::Null);
+            reply.insert("sidebarError".into(), refusal.message.into());
+        }
+    }
+}
+
+/// `window`'s bar as (pane, window, opened): the proven one, else a new one; refused while a pane of that window
 /// carries the side-bar label without being the proven bar (a 0.2.1 bar, or a label rmux moved), so no second bar
 /// opens beside one that cannot be proven.
-fn find_or_open(ctx: &Ctx, caller: &Caller) -> Res<(String, String, bool)> {
-    if let Some(bar) = prove(ctx, caller)? {
+fn find_or_open(ctx: &Ctx, window: &str) -> Res<(String, String, bool)> {
+    if let Some(bar) = prove(ctx, window)? {
         return Ok((bar.pane, bar.window, false));
     }
-    let labelled = labelled(ctx, caller)?;
+    let labelled = labelled(ctx, &["-t", window])?;
     if !labelled.is_empty() {
         return refuse(1, "sidebar", unproven(&labelled));
     }
-    let (pane, window) = open(ctx, caller)?;
+    let (pane, window) = open(ctx, window)?;
     Ok((pane, window, true))
+}
+
+/// 0.2.x kept one bar per session, recorded as a session option. Under the session's sidebar lock, before any
+/// window's bar is looked at: a proven session record moves to its bar's window (where `prove` finds it) and is
+/// unset, so it is moved once; an unproven one refuses while any pane of the session carries the side-bar label (it
+/// may be that bar), else it names nothing and is unset. An unreadable record refuses: it may name the bar.
+fn migrate(ctx: &Ctx, session: &str) -> Res<()> {
+    let read = native(ctx, &["show-options", "-qv", "-t", session, RECORD], false)?;
+    let text = read.stdout.trim_end_matches(['\r', '\n']);
+    if text.is_empty() {
+        return Ok(());
+    }
+    let window = parse_record(text)
+        .and_then(|(pane, pid, start)| (0..2).find_map(|_| proven(ctx, &pane, pid, start)));
+    match window {
+        Some(window) => {
+            native(
+                ctx,
+                &["set-option", "-w", "-t", &window, RECORD, text],
+                false,
+            )?;
+        }
+        None => {
+            let labelled = labelled(ctx, &["-s", "-t", session])?;
+            if !labelled.is_empty() {
+                return refuse(1, "sidebar", unproven(&labelled));
+            }
+        }
+    }
+    native(ctx, &["set-option", "-u", "-t", session, RECORD], false)?;
+    Ok(())
 }
 
 /// A board field made safe to draw: C0 (LF included), DEL and C1 removed, so no field moves the cursor or adds a line.
@@ -1228,6 +1281,12 @@ pub fn run_watch(
     let mut pick = Pick::default();
     let mut viewing = Viewing::default();
     let mut alerts = Alerts::default();
+    // Whether this bar's window has held a member view (kept in memory only): a bar leaves only once it held one.
+    // shortcut: the window is the one resolved when the watch started; a bar moved to another window by hand stops
+    // proving itself there (own_record) and only draws.
+    let mut held = false;
+    // The other view windows whose ensure failed, and when: each is tried again once REARM has passed.
+    let mut failed_windows: Vec<(String, SystemTime)> = Vec::new();
     loop {
         let probe = native(
             ctx,
@@ -1248,7 +1307,32 @@ pub fn run_watch(
         if let Some(read) = live.and_then(probe_size) {
             size = read;
         }
-        if live.is_some() && own_record(ctx, caller) && keeper.tick(ctx, &caller.pane) {
+        let recorded = live.is_some() && own_record(ctx, caller);
+        // #103: the recorded bar's window held a member view and has none now: the bar leaves. An unread view
+        // list changes nothing.
+        if recorded && let Some(windows) = view_windows(ctx, caller) {
+            if windows.contains(&caller.window) {
+                held = true;
+            } else if held {
+                leave(ctx, caller);
+                return "view-closed";
+            }
+            // Every other view window without a proven bar gets its own (a view moved by break-pane). One whose
+            // ensure failed waits a minute before it is tried again, so a failing open never splits every tick.
+            let now = ctx.clock.now();
+            failed_windows.retain(|(_, at)| now.duration_since(*at).unwrap_or_default() < REARM);
+            for window in windows.iter().filter(|w| **w != caller.window) {
+                if failed_windows.iter().any(|(w, _)| w == window)
+                    || matches!(prove(ctx, window), Ok(Some(_)))
+                {
+                    continue;
+                }
+                if ensure(ctx, caller, window).is_err() {
+                    failed_windows.push((window.clone(), now));
+                }
+            }
+        }
+        if recorded && keeper.tick(ctx, &caller.pane) {
             // The keeper resized or moved the bar: lay out at its size now, else at the width it set.
             match read_size(ctx, &caller.pane) {
                 Some(read) => size = read,
@@ -1820,7 +1904,8 @@ pub fn sidebar(ctx: &Ctx, request: &Request) -> Res<Map<String, Value>> {
                 &["set-option", "-u", "-t", &caller.session, OPTION],
                 false,
             )?;
-            let (pane, window, opened) = find_or_open(ctx, &caller)?;
+            migrate(ctx, &caller.session)?;
+            let (pane, window, opened) = find_or_open(ctx, &caller.window)?;
             reply.insert("pane".into(), pane.into());
             reply.insert("window".into(), window.into());
             reply.insert("opened".into(), opened.into());
@@ -1831,35 +1916,48 @@ pub fn sidebar(ctx: &Ctx, request: &Request) -> Res<Map<String, Value>> {
             &["set-option", "-t", &caller.session, OPTION, "off"],
             false,
         )?;
-        match prove(ctx, &caller)? {
-            None => {
-                let labelled = labelled(ctx, &caller)?;
-                if !labelled.is_empty() {
-                    return refuse(1, "sidebar", unproven(&labelled));
-                }
-                reply.insert("pane".into(), Value::Null);
-                reply.insert("closed".into(), false.into());
+        migrate(ctx, &caller.session)?;
+        // Each window's record is read as that window's own: a window list's option fields fall back to the
+        // session's value, so only the window ids are listed.
+        let windows = native(
+            ctx,
+            &["list-windows", "-t", &caller.session, "-F", "#{window_id}"],
+            false,
+        )?;
+        let mut closed: Vec<String> = Vec::new();
+        for window in windows.stdout.split('\n') {
+            let window = window.strip_suffix('\r').unwrap_or(window);
+            if !window_id(window) {
+                continue;
             }
-            Some(bar) => {
-                if !kill_bar(ctx, &bar.pane, bar.pid) {
-                    return refuse(
-                        1,
-                        "sidebar",
-                        format!(
-                            "the side bar {} did not close: the pane no longer runs this session's side bar",
-                            bar.pane
-                        ),
-                    );
-                }
-                let _ = native(
-                    ctx,
-                    &["set-option", "-u", "-t", &caller.session, RECORD],
-                    true,
+            let Some(bar) = prove(ctx, window)? else {
+                continue;
+            };
+            if !kill_bar(ctx, &bar.pane, bar.pid) {
+                return refuse(
+                    1,
+                    "sidebar",
+                    format!(
+                        "the side bar {} did not close: the pane no longer runs this session's side bar",
+                        bar.pane
+                    ),
                 );
-                reply.insert("pane".into(), bar.pane.into());
-                reply.insert("closed".into(), true.into());
+            }
+            let _ = native(ctx, &["set-option", "-wu", "-t", &bar.window, RECORD], true);
+            closed.push(bar.pane);
+        }
+        if closed.is_empty() {
+            let labelled = labelled(ctx, &["-s", "-t", &caller.session])?;
+            if !labelled.is_empty() {
+                return refuse(1, "sidebar", unproven(&labelled));
             }
         }
+        reply.insert(
+            "pane".into(),
+            closed.first().map_or(Value::Null, |p| p.clone().into()),
+        );
+        reply.insert("closed".into(), (!closed.is_empty()).into());
+        reply.insert("panes".into(), closed.into());
         Ok(reply)
     })
 }
@@ -1974,21 +2072,21 @@ fn watch_start(ctx: &Ctx, pid: u32) -> Option<i64> {
         .flatten()
 }
 
-/// The session's bar, proven now (T9): the record names a pane whose one read shows it alive (`#{pane_dead}` 0) with
-/// the recorded pid, and that pid is alive with the recorded start, still this binary `watch`. A failed proof is
-/// read once more, then there is no proven bar. An unreadable record refuses: it may name the bar.
-fn prove(ctx: &Ctx, caller: &Caller) -> Res<Option<Proven>> {
-    let read = native(
-        ctx,
-        &["show-options", "-qv", "-t", &caller.session, RECORD],
-        false,
-    )?;
+/// `window`'s bar, proven now (T9): its window record names a pane whose one read shows it alive (`#{pane_dead}` 0)
+/// in `window` with the recorded pid, and that pid is alive with the recorded start, still this binary `watch`. A
+/// failed proof is read once more, then there is no proven bar. An unreadable record refuses: it may name the bar.
+fn prove(ctx: &Ctx, window: &str) -> Res<Option<Proven>> {
+    let read = native(ctx, &["show-options", "-wqv", "-t", window, RECORD], false)?;
     let Some((pane, pid, start)) = parse_record(read.stdout.trim_end_matches(['\r', '\n'])) else {
         return Ok(None);
     };
     for _ in 0..2 {
-        if let Some(window) = proven(ctx, &pane, pid, start) {
-            return Ok(Some(Proven { pane, window, pid }));
+        if let Some(at) = proven(ctx, &pane, pid, start) {
+            return Ok((at == window).then_some(Proven {
+                pane,
+                window: at,
+                pid,
+            }));
         }
     }
     Ok(None)
@@ -2015,18 +2113,11 @@ fn proven(ctx: &Ctx, pane: &str, pid: u32, start: i64) -> Option<String> {
         .then(|| fields[1].to_string())
 }
 
-/// The session's panes, in every window, that carry the side-bar label.
-fn labelled(ctx: &Ctx, caller: &Caller) -> Res<Vec<String>> {
+/// The panes that carry the side-bar label, of `scope`: `-t <window>` one window, `-s -t <session>` every window.
+fn labelled(ctx: &Ctx, scope: &[&str]) -> Res<Vec<String>> {
     let listed = native(
         ctx,
-        &[
-            "list-panes",
-            "-s",
-            "-t",
-            &caller.session,
-            "-F",
-            LABEL_FORMAT,
-        ],
+        &[&["list-panes"], scope, &["-F", LABEL_FORMAT]].concat(),
         false,
     )?;
     let mut panes: Vec<String> = Vec::new();
@@ -2056,21 +2147,65 @@ pub(crate) fn unproven(panes: &[String]) -> String {
     )
 }
 
-/// Whether this watch is the session's recorded bar: the record names its own pane and its own pid, and the full
-/// proof holds (its pane runs that pid, alive; the pid is this binary `watch` with the recorded start). Only then
-/// does it keep the layout; a watch run any other way only draws.
+/// Whether this watch is its window's recorded bar: the record of its window names its own pane and its own pid,
+/// and the full proof holds (its pane runs that pid, alive, in that window; the pid is this binary `watch` with the
+/// recorded start). Only then does it keep the layout; a watch run any other way only draws.
 fn own_record(ctx: &Ctx, caller: &Caller) -> bool {
     native(
         ctx,
-        &["show-options", "-qv", "-t", &caller.session, RECORD],
+        &["show-options", "-wqv", "-t", &caller.window, RECORD],
         true,
     )
     .ok()
     .filter(|read| read.code == 0)
     .and_then(|read| parse_record(read.stdout.trim_end_matches(['\r', '\n'])))
     .is_some_and(|(pane, pid, start)| {
-        pane == caller.pane && pid == ctx.pid && proven(ctx, &pane, pid, start).is_some()
+        pane == caller.pane
+            && pid == ctx.pid
+            && proven(ctx, &pane, pid, start).is_some_and(|at| at == caller.window)
     })
+}
+
+/// The windows of the session that show a member's live view: each local member's record through `Identity::view`
+/// on the session's panes (a dead pane is no view). None when either read fails; no pane read without members.
+fn view_windows(ctx: &Ctx, caller: &Caller) -> Option<Vec<String>> {
+    let locals = crate::agents::membership::locals(ctx, caller).ok()?;
+    if locals.is_empty() {
+        return Some(Vec::new());
+    }
+    let rows = crate::agents::registry::rows(ctx, caller).ok()?;
+    let mut windows: Vec<String> = Vec::new();
+    for local in &locals {
+        if let Some(view) = local.identity.view(&local.stored.record, &rows)
+            && !windows.contains(&view.window)
+        {
+            windows.push(view.window);
+        }
+    }
+    Some(windows)
+}
+
+/// The bar leaves its window (#103): under the session's sidebar lock, its pane's label is removed only while the
+/// pane still runs this process, and its window's record is cleared only while it still names this bar.
+fn leave(ctx: &Ctx, caller: &Caller) {
+    let _ = lock(ctx, &lock_key("sidebar", caller, &caller.session), || {
+        let unlabel = unlabel_command(&caller.pane, ctx.pid);
+        let unlabel: Vec<&str> = unlabel.iter().map(String::as_str).collect();
+        let _ = native(ctx, &unlabel, true);
+        if own_record(ctx, caller) {
+            let _ = native(
+                ctx,
+                &["set-option", "-wu", "-t", &caller.window, RECORD],
+                true,
+            );
+        }
+        Ok(())
+    });
+}
+
+/// The conditional removal of `pane`'s side-bar label, only while it is alive and still runs `pid`.
+pub fn unlabel_command(pane: &str, pid: u32) -> Vec<String> {
+    bound(pane, pid, format!("set-option -p -u -t {pane} @agent-role"))
 }
 
 /// Whether a failed split refused only its -l size, by the multiplexer's own words: rmux 0.10.0 "invalid split size
@@ -2157,18 +2292,19 @@ fn new_watch(ctx: &Ctx, pid: u32) -> Option<i64> {
     None
 }
 
-/// Splits the bar at the right edge of the caller's window, full height (`-f -h`), with the pane environment (Unix:
+/// Splits the bar at the right edge of `window`, full height (`-f -h`), with the pane environment (Unix:
 /// the state root) so watch reads the caller's state. The bar is `bar_width` of the window (its minimum when the width cannot
 /// be read), asked for with -l and set again by a pid-bound resize-pane, since rmux ignores -l; a refused resize is left to
 /// the next watch tick. `-d` keeps the active pane. The split's process must be this binary `watch` (else nothing is
 /// killed and the open refuses); then the pane is labelled (bound to that pid, read back) and recorded as
-/// `<pane> <pid> <start>`. A bar that cannot
+/// `<pane> <pid> <start>` as `window`'s record. A bar that cannot
 /// be labelled or recorded is closed by the guarded kill, which spares a pane that runs anything else by then. The
-/// bar is proven as the last step; a pane that fails it is not killed, its record is cleared and the open refuses.
-fn open(ctx: &Ctx, caller: &Caller) -> Res<(String, String)> {
+/// bar is proven, in `window`, as the last step; a pane that fails it is not killed, its record is cleared and the
+/// open refuses.
+fn open(ctx: &Ctx, target: &str) -> Res<(String, String)> {
     let env = pane_env(utf8(&ctx.state_root)?, crate::state::root::HOST);
-    let (window, sizing) = window_width(ctx, &caller.pane);
-    let width = bar_width(window.unwrap_or(0), sizing).to_string();
+    let (columns, sizing) = window_width(ctx, target);
+    let width = bar_width(columns.unwrap_or(0), sizing).to_string();
     let mut split: Vec<&str> = vec![
         "split-window",
         "-d",
@@ -2178,7 +2314,7 @@ fn open(ctx: &Ctx, caller: &Caller) -> Res<(String, String)> {
         "-F",
         SPLIT_FORMAT,
         "-t",
-        &caller.pane,
+        target,
     ];
     split.extend(env.iter().map(String::as_str));
     let command = [utf8(&ctx.exe)?, "watch"];
@@ -2222,7 +2358,7 @@ fn open(ctx: &Ctx, caller: &Caller) -> Res<(String, String)> {
     let recorded = || {
         native(
             ctx,
-            &["set-option", "-t", &caller.session, RECORD, &record],
+            &["set-option", "-w", "-t", target, RECORD, &record],
             true,
         )
         .is_ok_and(|done| done.code == 0)
@@ -2251,12 +2387,8 @@ fn open(ctx: &Ctx, caller: &Caller) -> Res<(String, String)> {
     let resize: Vec<&str> = resize.iter().map(String::as_str).collect();
     let _ = native(ctx, &resize, true);
     // Proven last: a pane replaced after the check (a hook on the label, say) is never reported as the bar.
-    if proven(ctx, &pane, pid, start).is_none() {
-        let _ = native(
-            ctx,
-            &["set-option", "-u", "-t", &caller.session, RECORD],
-            true,
-        );
+    if proven(ctx, &pane, pid, start).is_none_or(|at| at != target) {
+        let _ = native(ctx, &["set-option", "-wu", "-t", target, RECORD], true);
         return refuse(
             1,
             "sidebar",
@@ -2282,10 +2414,18 @@ mod tests {
     use std::collections::VecDeque;
     use std::rc::Rc;
 
-    const READ_RECORD: &str = "-N show-options -qv -t $3 @mux-agents-sidebar-id";
-    const CLEAR_RECORD: &str = "-N set-option -u -t $3 @mux-agents-sidebar-id";
-    const LABELS: &str = "-N list-panes -s -t $3 -F #{pane_id}|#{==:#{@agent-role},sidebar}";
-    const RECORD7: &str = "-N set-option -t $3 @mux-agents-sidebar-id %7 107 1070";
+    // The caller's window @1 record: read, cleared and written as a window option.
+    const READ_RECORD: &str = "-N show-options -wqv -t @1 @mux-agents-sidebar-id";
+    const CLEAR_RECORD: &str = "-N set-option -wu -t @1 @mux-agents-sidebar-id";
+    const LABELS: &str = "-N list-panes -t @1 -F #{pane_id}|#{==:#{@agent-role},sidebar}";
+    const RECORD7: &str = "-N set-option -w -t @1 @mux-agents-sidebar-id %7 107 1070";
+    // 0.2.x's session record, read and unset by the one migration.
+    const SESSION_RECORD: &str = "-N show-options -qv -t $3 @mux-agents-sidebar-id";
+    const CLEAR_SESSION: &str = "-N set-option -u -t $3 @mux-agents-sidebar-id";
+    const SESSION_LABELS: &str =
+        "-N list-panes -s -t $3 -F #{pane_id}|#{==:#{@agent-role},sidebar}";
+    // -Close's list of the session's windows.
+    const WINDOWS: &str = "-N list-windows -t $3 -F #{window_id}";
     const PROOF: &str = "#{pane_id}|#{window_id}|#{pane_dead}|#{pane_pid}";
     // The watch's own record: pane %7, the fake process 4242 started at 2000.
     const OWN: &str = "%7 4242 2000\n";
@@ -5248,7 +5388,7 @@ mod tests {
             argv: Some(vec![exe, "watch".into()]),
         });
         w.fakes.mux_rule(RECORD, 0, OWN, "");
-        w.fakes.mux_rule(PROOF, 0, "%7|@5|0|4242\n", "");
+        w.fakes.mux_rule(PROOF, 0, "%7|@1|0|4242\n", "");
     }
 
     /// watch_world with the bar's window answered from `win`: the layout read, move-pane, resize-pane (the pane at
@@ -5758,8 +5898,19 @@ mod tests {
             .join(",")
     }
 
+    /// The key of `window`'s record in `Panes`; the session's record stays under RECORD.
+    fn wrec(window: &str) -> String {
+        format!("{RECORD} {window}")
+    }
+
+    /// The caller's window @1 record.
     fn record(panes: &Panes) -> Option<String> {
-        get(panes, RECORD)
+        get(panes, &wrec("@1"))
+    }
+
+    /// The window `pane` stands in: `win <pane>`, else the caller's @1.
+    fn window_of(panes: &Panes, pane: &str) -> String {
+        get(panes, &format!("win {pane}")).unwrap_or_else(|| "@1".into())
     }
 
     /// `<exe> watch` as process `pid`, started at pid * 10.
@@ -5800,7 +5951,7 @@ mod tests {
             set(&panes, "next", "8".into());
             w.fakes.process(watch_row(107, &exe));
             if mux.open {
-                set(&panes, RECORD, "%7 107 1070".into());
+                set(&panes, &wrec("@1"), "%7 107 1070".into());
             }
         }
         for (pane, value) in &mux.extra {
@@ -5818,11 +5969,19 @@ mod tests {
                 let role = role.split_once('|').map_or(role.as_str(), |(r, _)| r);
                 return Ok(out(0, &format!("{role}\n"), ""));
             }
-            assert_eq!(argv[1..6], ["list-panes", "-s", "-t", "$3", "-F"]);
+            // `-s -t $3` lists the session; `-t @<n>` one window.
+            let window = if argv[2] == "-s" {
+                assert_eq!(argv[2..6], ["-s", "-t", "$3", "-F"]);
+                None
+            } else {
+                assert_eq!((argv[2].as_str(), argv[4].as_str()), ("-t", "-F"));
+                Some(argv[3].clone())
+            };
             let text: String = p
                 .borrow()
                 .iter()
                 .filter(|(k, _)| k.starts_with('%'))
+                .filter(|(k, _)| window.as_ref().is_none_or(|w| *w == window_of(&p, k)))
                 .map(|(pane, v)| {
                     let role = v.split_once('|').map_or(v.as_str(), |(r, _)| r);
                     format!("{pane}|{}\n", flag(role == "sidebar"))
@@ -5845,7 +6004,7 @@ mod tests {
             let text = match (get(&p, &pane), get(&p, &format!("pid {pane}"))) {
                 (Some(_), Some(pid)) => {
                     let dead = flag(get(&p, &format!("dead {pane}")).is_some());
-                    format!("{pane}|@5|{dead}|{pid}\n")
+                    format!("{pane}|{}|{dead}|{pid}\n", window_of(&p, &pane))
                 }
                 _ => "|||\n".into(),
             };
@@ -5932,6 +6091,10 @@ mod tests {
             let n: u32 = get(&p, "next").unwrap().parse().unwrap();
             set(&p, "next", (n + 1).to_string());
             let (pane, pid) = (format!("%{n}"), 100 + n);
+            let at = argv.iter().position(|a| a == "-t").unwrap();
+            let window = argv[at + 1].clone();
+            assert!(window.starts_with('@'), "a split beside a pane: {argv:?}");
+            set(&p, &format!("win {pane}"), window.clone());
             set(&p, &pane, "|".into());
             set(&p, &format!("pid {pane}"), pid.to_string());
             let exe = get(&p, "exe").unwrap();
@@ -5948,11 +6111,25 @@ mod tests {
                 }),
                 _ => fakes.process(watch_row(pid, &exe)),
             }
-            Ok(out(0, &format!("{pane}|@5|{pid}\n"), ""))
+            Ok(out(0, &format!("{pane}|{window}|{pid}\n"), ""))
         });
         // A plain pane write (not inside a pid-bound if-shell) is a bug.
         w.fakes.mux_script("-N set-option -p", |argv| {
             panic!("an unguarded pane write: {argv:?}")
+        });
+        // The session's windows: the caller's @1, then each other window a pane stands in, in order.
+        let p = panes.clone();
+        w.fakes.mux_script("list-windows", move |argv| {
+            assert_eq!(argv[2..], ["-t", "$3", "-F", "#{window_id}"]);
+            let mut windows = vec!["@1".to_string()];
+            for (k, _) in p.borrow().iter().filter(|(k, _)| k.starts_with('%')) {
+                let window = window_of(&p, k);
+                if !windows.contains(&window) {
+                    windows.push(window);
+                }
+            }
+            let text: String = windows.iter().map(|w| format!("{w}\n")).collect();
+            Ok(out(0, &text, ""))
         });
         // Checked before the pane rules: read, set (`-t $3 <option> off`) and unset (`-u -t $3 <option>`).
         let (p, option_fail) = (panes.clone(), mux.option_fail);
@@ -5976,19 +6153,28 @@ mod tests {
         w.fakes.mux_first(WINDOW_PROBE, 0, "200||\n", "");
         // The record, checked before the option (its name starts with the option's).
         let (p, record_fail) = (panes.clone(), mux.record_fail);
+        // A window target (`-w`) keeps that window's record, `-t $3` the session's.
         w.fakes.mux_script(RECORD, move |argv| {
+            let at = argv.iter().position(|a| a == "-t").unwrap();
+            let target = &argv[at + 1];
+            assert_eq!(target.starts_with('@'), argv[2].contains('w'), "{argv:?}");
+            let key = if target.starts_with('@') {
+                wrec(target)
+            } else {
+                RECORD.to_string()
+            };
             if argv[1] == "show-options" {
-                let value = get(&p, RECORD).map_or(String::new(), |v| format!("{v}\n"));
+                let value = get(&p, &key).map_or(String::new(), |v| format!("{v}\n"));
                 return Ok(out(0, &value, ""));
             }
-            if argv[2] == "-u" {
-                unset(&p, RECORD);
+            if argv[2].contains('u') {
+                unset(&p, &key);
                 return Ok(Output::default());
             }
             if record_fail {
                 return failed("exit");
             }
-            set(&p, RECORD, argv[5].clone());
+            set(&p, &key, argv[at + 3].clone());
             Ok(Output::default())
         });
         (w, panes)
@@ -6001,7 +6187,7 @@ mod tests {
     // ensure as the caller, after its probe: `opened <pane>`, `existing <pane>`, `disabled` or the refusal.
     fn ensure_run(w: &World) -> String {
         let caller = w.caller();
-        match ensure(&w.ctx, &caller) {
+        match ensure(&w.ctx, &caller, &caller.window) {
             Ok(Bar::Opened(pane)) => format!("opened {pane}"),
             Ok(Bar::Existing(pane)) => format!("existing {pane}"),
             Ok(Bar::Disabled) => "disabled".into(),
@@ -6076,7 +6262,7 @@ mod tests {
 
     fn split_line(w: &World, sized: bool) -> String {
         format!(
-            "-N split-window -d -f -h -P -F #{{pane_id}}|#{{window_id}}|#{{pane_pid}} -t %1{}{} /bin/mux-agent watch",
+            "-N split-window -d -f -h -P -F #{{pane_id}}|#{{window_id}}|#{{pane_pid}} -t @1{}{} /bin/mux-agent watch",
             env_text(w),
             if sized { " -l 40" } else { "" }
         )
@@ -6098,9 +6284,11 @@ mod tests {
         )
     }
 
-    // The calls of an open that finds no bar: record, labels, split, label, record, resize.
+    // The calls of an open that finds no bar: the session record (migration), the window record, labels, split,
+    // label, record, resize.
     fn opened(w: &World) -> Vec<String> {
         vec![
+            SESSION_RECORD.into(),
             READ_RECORD.into(),
             LABELS.into(),
             split_line(w, true),
@@ -6222,12 +6410,12 @@ mod tests {
             .collect();
         assert_eq!(
             probe,
-            [format!("-N display-message -p -t %1 {WINDOW_PROBE}")]
+            [format!("-N display-message -p -t @1 {WINDOW_PROBE}")]
         );
         let mut want = vec![ON.to_string()];
         want.extend(opened(&w));
-        want[3] = split_line(&w, true).replace("-l 40", "-l 50");
-        want[6] = resize_line("%7", 107, 50);
+        want[4] = split_line(&w, true).replace("-l 40", "-l 50");
+        want[7] = resize_line("%7", 107, 50);
         assert_eq!(calls(&w), want);
         // Both options replaced (`|`, LF or CR in them): the width still counts, both options are their defaults.
         let (w, _) = sidebar_world("", Mux::default());
@@ -6240,8 +6428,8 @@ mod tests {
         assert!(run(&w, &[]).starts_with("ok "));
         let mut want = vec![ON.to_string()];
         want.extend(opened(&w));
-        want[3] = split_line(&w, true).replace("-l 40", "-l 75");
-        want[6] = resize_line("%7", 107, 75);
+        want[4] = split_line(&w, true).replace("-l 40", "-l 75");
+        want[7] = resize_line("%7", 107, 75);
         assert_eq!(calls(&w), want);
         // A minimum the multiplexer replaced `|` in is its default alone: 40% of 250.
         let (w, _) = sidebar_world("", Mux::default());
@@ -6269,7 +6457,7 @@ mod tests {
         w.fakes.mux_first("resize-pane", 1, "", "no such pane\n");
         assert_eq!(
             run(&w, &[]),
-            r#"ok {"pane":"%7","window":"@5","opened":true}"#
+            r#"ok {"pane":"%7","window":"@1","opened":true}"#
         );
     }
 
@@ -6279,7 +6467,7 @@ mod tests {
         let (w, panes) = sidebar_world("", Mux::default());
         assert_eq!(
             run(&w, &[]),
-            r#"ok {"pane":"%7","window":"@5","opened":true}"#
+            r#"ok {"pane":"%7","window":"@1","opened":true}"#
         );
         let mut want = vec![ON.to_string()];
         want.extend(opened(&w));
@@ -6359,12 +6547,14 @@ mod tests {
                 });
             }),
             ("record names another pid", |p, _| {
-                set(p, RECORD, "%7 108 1070".into())
+                set(p, &wrec("@1"), "%7 108 1070".into())
             }),
             ("record names another pane", |p, _| {
-                set(p, RECORD, "%2 107 1070".into())
+                set(p, &wrec("@1"), "%2 107 1070".into())
             }),
-            ("record malformed", |p, _| set(p, RECORD, "%7 107".into())),
+            ("record malformed", |p, _| {
+                set(p, &wrec("@1"), "%7 107".into())
+            }),
         ];
         for (name, damage) in damage {
             let (w, panes) = sidebar_world(
@@ -6394,17 +6584,22 @@ mod tests {
             },
         );
         assert_eq!(ensure_run(&w), "existing %7");
-        assert_eq!(calls(&w), [READ_OPTION, READ_RECORD]);
+        assert_eq!(calls(&w), [READ_OPTION, SESSION_RECORD, READ_RECORD]);
         assert_eq!(
             run(&w, &[]),
-            r#"ok {"pane":"%7","window":"@5","opened":false}"#
+            r#"ok {"pane":"%7","window":"@1","opened":false}"#
         );
         w.fakes.clear_log();
-        assert_eq!(run(&w, &["-Close"]), r#"ok {"pane":"%7","closed":true}"#);
+        assert_eq!(
+            run(&w, &["-Close"]),
+            r#"ok {"pane":"%7","closed":true,"panes":["%7"]}"#
+        );
         assert_eq!(
             calls(&w),
             [
                 OFF.to_string(),
+                SESSION_RECORD.into(),
+                WINDOWS.into(),
                 READ_RECORD.into(),
                 close_line("%7", 107),
                 CLEAR_RECORD.into()
@@ -6416,11 +6611,17 @@ mod tests {
         );
         assert_eq!(roles(&panes), "%1=|,%2=other|");
         w.fakes.clear_log();
-        assert_eq!(run(&w, &["-Close"]), r#"ok {"pane":null,"closed":false}"#);
-        assert_eq!(calls(&w), [OFF, READ_RECORD, LABELS]);
+        assert_eq!(
+            run(&w, &["-Close"]),
+            r#"ok {"pane":null,"closed":false,"panes":[]}"#
+        );
+        assert_eq!(
+            calls(&w),
+            [OFF, SESSION_RECORD, WINDOWS, READ_RECORD, SESSION_LABELS]
+        );
         assert_eq!(
             run(&w, &[]),
-            r#"ok {"pane":"%8","window":"@5","opened":true}"#
+            r#"ok {"pane":"%8","window":"@1","opened":true}"#
         );
         assert_eq!(
             (option(&panes), record(&panes).as_deref()),
@@ -6531,7 +6732,7 @@ mod tests {
         // Unlabelled, it blocks nothing: the next open splits a new bar.
         assert_eq!(
             run(&w, &[]),
-            r#"ok {"pane":"%8","window":"@5","opened":true}"#
+            r#"ok {"pane":"%8","window":"@1","opened":true}"#
         );
     }
 
@@ -6671,7 +6872,7 @@ mod tests {
             );
             assert_eq!(
                 run(&w, &["-Close"]),
-                r#"ok {"pane":null,"closed":false}"#,
+                r#"ok {"pane":null,"closed":false,"panes":[]}"#,
                 "{name}"
             );
             assert_eq!(closes(&w), 0, "{name}");
@@ -6693,7 +6894,7 @@ mod tests {
             assert_eq!(run(&w, &["-Close"]), refused(&["%7"]), "{how}");
             assert_eq!(
                 run(&w, &[]),
-                r#"ok {"pane":"%7","window":"@5","opened":false}"#,
+                r#"ok {"pane":"%7","window":"@1","opened":false}"#,
                 "{how}"
             );
             assert_eq!(
@@ -6747,7 +6948,7 @@ mod tests {
             [
                 format!("+sidebar|{key}|$3 display-message,list-panes"),
                 format!(
-                    "-sidebar|{key}|$3 display-message,list-panes,set-option,show-options,list-panes,display-message,\
+                    "-sidebar|{key}|$3 display-message,list-panes,set-option,show-options,show-options,list-panes,display-message,\
                      split-window,if-shell,display-message,set-option,if-shell,display-message"
                 ),
             ]
@@ -6831,7 +7032,7 @@ mod tests {
         );
         assert_eq!(
             run(&w, &[]),
-            r#"ok {"pane":"%7","window":"@5","opened":true}"#
+            r#"ok {"pane":"%7","window":"@1","opened":true}"#
         );
         let splits: Vec<String> = calls(&w)
             .into_iter()
@@ -6883,7 +7084,7 @@ mod tests {
         let (w, panes) = sidebar_world("", Mux::default());
         assert_eq!(
             run(&w, &[]),
-            r#"ok {"pane":"%7","window":"@5","opened":true}"#
+            r#"ok {"pane":"%7","window":"@1","opened":true}"#
         );
         let mut want = vec![ON.to_string()];
         want.extend(opened(&w));
@@ -6910,7 +7111,7 @@ mod tests {
             "-F",
             "#{pane_id}|#{window_id}|#{pane_pid}",
             "-t",
-            "%1",
+            "@1",
         ]
         .map(String::from)
         .to_vec();
@@ -6922,6 +7123,194 @@ mod tests {
         assert_eq!(split, [expected]);
     }
 
+    // The session's panes for the watch's view read and board: worker %9 in `window` until the `after`-th probe,
+    // then `then` (`closed`: no pane, `dead`: a dead pane, `fail`: an unread list).
+    fn views_by_tick(w: &World, window: &'static str, after: usize, then: &'static str) {
+        let fakes = w.fakes.clone();
+        w.fakes.mux_script("#{pane_start_command}", move |argv| {
+            let probed = fakes
+                .mux_calls()
+                .iter()
+                .filter(|c| c.last().is_some_and(|a| a == WATCH_PROBE))
+                .count();
+            let row = format!("%9|{window}|300|aaaaaaaaaaaa|worker");
+            let rows = [row.as_str()];
+            let text = match (probed < after, then) {
+                (true, _) => crate::agents::fixture::listed_dead(argv, &rows, "\n", &[]),
+                (false, "closed") => crate::agents::fixture::listed_dead(argv, &[], "\n", &[]),
+                (false, "dead") => crate::agents::fixture::listed_dead(argv, &rows, "\n", &["%9"]),
+                _ => return Ok(out(1, "", "no server\n")),
+            };
+            Ok(out(0, &text, ""))
+        });
+    }
+
+    const UNLABEL: &str = "-N if-shell -F -t %7 #{&&:#{==:#{pane_dead},0},#{==:#{pane_pid},4242}} set-option -p -u -t %7 \
+                           @agent-role";
+    const CLEAR_OWN: &str = "-N set-option -wu -t @1 @mux-agents-sidebar-id";
+
+    // #103: the recorded bar leaves once its window, having held a member view, lost its last one (closed, or dead):
+    // under the session lock it unlabels its own pane and clears its window's record, then ends `view-closed`.
+    #[test]
+    fn a_bar_leaves_once_its_window_lost_its_last_view() {
+        for gone in ["closed", "dead"] {
+            let (w, _) = keep_world(&["live", "live", "live", "gone"], win("%1", in_place()));
+            views_by_tick(&w, "@1", 2, gone);
+            let fakes = w.fakes.clone();
+            w.fakes
+                .lock_probe(move |_| fakes.mux_calls().len().to_string());
+            let (ended, frames) = watch_run(&w);
+            assert_eq!((ended, frames.len()), ("view-closed", 1), "{gone}");
+            let all: Vec<String> = w.fakes.mux_calls().iter().map(|c| c.join(" ")).collect();
+            let at = |line: &str| all.iter().position(|c| c == line).unwrap();
+            let key = w.caller().server_key;
+            // The board takes each member's lock on its own; the bar's leave holds the session's sidebar lock.
+            let locks: Vec<String> = w
+                .fakes
+                .locks()
+                .into_iter()
+                .filter(|l| l[1..].starts_with("sidebar|"))
+                .collect();
+            assert_eq!(locks.len(), 2, "{gone}");
+            let held =
+                |event: &str| -> usize { event.rsplit(' ').next().unwrap().parse().unwrap() };
+            assert!(
+                locks[0].starts_with(&format!("+sidebar|{key}|$3 ")),
+                "{gone}"
+            );
+            assert!(held(&locks[0]) <= at(UNLABEL), "{gone}");
+            assert!(
+                at(UNLABEL) < at(CLEAR_OWN) && at(CLEAR_OWN) < held(&locks[1]),
+                "{gone}"
+            );
+        }
+    }
+
+    // #103: a bar stays while its window never held a view, while a view read fails, and when it is not the
+    // recorded bar (a watch run by hand).
+    #[test]
+    fn a_bar_stays_unless_its_window_held_a_view_and_lost_it() {
+        for (case, window, then, own) in [
+            ("never held", "@5", "closed", true),
+            ("unread list", "@1", "fail", true),
+            ("hand-run", "@1", "closed", false),
+        ] {
+            let w = if own {
+                keep_world(&["live", "live", "live", "gone"], win("%1", in_place())).0
+            } else {
+                watch_world(&["live", "live", "live", "gone"])
+            };
+            views_by_tick(&w, window, 2, then);
+            let (ended, _) = watch_run(&w);
+            assert_eq!(ended, "pane-closed", "{case}");
+            let all: Vec<String> = w.fakes.mux_calls().iter().map(|c| c.join(" ")).collect();
+            assert!(
+                !all.iter().any(|c| c == UNLABEL || c == CLEAR_OWN),
+                "{case}"
+            );
+        }
+    }
+
+    // #103 step 6: each tick, the recorded bar gives every other view window of the session without a proven bar its
+    // own (`ensure`, a view moved by break-pane); a window whose bar is proven is left alone. A window whose ensure
+    // failed is not tried again by this watch, so a failing open never splits every tick.
+    #[test]
+    fn each_tick_another_view_window_without_a_bar_gets_one() {
+        for proven_there in [false, true] {
+            let (w, _) = keep_world(&["live", "live", "live", "gone"], win("%1", in_place()));
+            crate::agents::core_fixture::member(
+                &w,
+                "cccccccccccc",
+                json!({"name":"third","pane":"%10","startCommand":crate::agents::fixture::launch_command("%10")}),
+            );
+            w.fakes.mux_script("#{pane_start_command}", |argv| {
+                let rows = [
+                    "%9|@1|300|aaaaaaaaaaaa|worker",
+                    "%10|@6|301|cccccccccccc|third",
+                ];
+                Ok(out(
+                    0,
+                    &crate::agents::fixture::listed_dead(argv, &rows, "\n", &[]),
+                    "",
+                ))
+            });
+            // @6's record names %11, this same watch process: proven there only when %11 stands in @6.
+            w.fakes.mux_first(
+                "show-options -wqv -t @6 @mux-agents-sidebar-id",
+                0,
+                "%11 4242 2000\n",
+                "",
+            );
+            let at = if proven_there { "@6" } else { "@9" };
+            w.fakes.mux_first(
+                &format!("-t %11 {PROOF}"),
+                0,
+                &format!("%11|{at}|0|4242\n"),
+                "",
+            );
+            // No pane of @6 carries the label; the split names no pane, so the open refuses.
+            w.fakes.mux_first("#{==:#{@agent-role},sidebar}", 0, "", "");
+            let (ended, frames) = watch_run(&w);
+            assert_eq!((ended, frames.len()), ("pane-closed", 3), "{proven_there}");
+            let splits: Vec<String> = w
+                .fakes
+                .mux_calls()
+                .iter()
+                .filter(|c| c[1] == "split-window")
+                .map(|c| c.join(" "))
+                .collect();
+            if proven_there {
+                assert!(splits.is_empty(), "{splits:?}");
+            } else {
+                assert_eq!(splits.len(), 1, "{splits:?}");
+                assert!(splits[0].contains(" -t @6 "), "{splits:?}");
+            }
+            // The watch's own window @1 is never ensured by its tick.
+            assert!(
+                !w.fakes
+                    .mux_calls()
+                    .iter()
+                    .any(|c| c[1] == "split-window" && c.iter().any(|a| a == "@1"))
+            );
+        }
+    }
+
+    // #103 step 6: a window whose ensure failed (a lock held elsewhere, say) is tried again once a minute has passed.
+    #[test]
+    fn a_failed_window_is_tried_again_after_a_minute() {
+        let mut probes = vec!["live"; 33];
+        probes.push("gone");
+        let probes: &'static [&'static str] = Box::leak(probes.into_boxed_slice());
+        let (w, _) = keep_world(probes, win("%1", in_place()));
+        crate::agents::core_fixture::member(
+            &w,
+            "cccccccccccc",
+            json!({"name":"third","pane":"%10","startCommand":crate::agents::fixture::launch_command("%10")}),
+        );
+        w.fakes.mux_script("#{pane_start_command}", |argv| {
+            let rows = [
+                "%9|@1|300|aaaaaaaaaaaa|worker",
+                "%10|@6|301|cccccccccccc|third",
+            ];
+            Ok(out(
+                0,
+                &crate::agents::fixture::listed_dead(argv, &rows, "\n", &[]),
+                "",
+            ))
+        });
+        w.fakes.mux_first("#{==:#{@agent-role},sidebar}", 0, "", "");
+        let (ended, frames) = watch_run(&w);
+        assert_eq!((ended, frames.len()), ("pane-closed", 33));
+        // Ticks are 2 s apart: the first at once, the next 60 s later, no third within the run.
+        let splits = w
+            .fakes
+            .mux_calls()
+            .iter()
+            .filter(|c| c[1] == "split-window" && c.iter().any(|a| a == "@6"))
+            .count();
+        assert_eq!(splits, 2);
+    }
+
     // QA on S1: only the watch the record names, by its own pane and its own process, keeps the layout; a watch run
     // by hand, with or without a bar, only draws.
     #[test]
@@ -6929,15 +7318,17 @@ mod tests {
         // (record, the proof read of the watch's own pane): only its own pane, its own pid in that pane, alive, and
         // its own start keep the layout.
         for (record, proof) in [
-            ("", "%7|@5|0|4242\n"),
-            ("%8 4242 2000\n", "%7|@5|0|4242\n"),
-            ("%7 4243 2000\n", "%7|@5|0|4242\n"),
-            ("%7 4242\n", "%7|@5|0|4242\n"),
+            ("", "%7|@1|0|4242\n"),
+            ("%8 4242 2000\n", "%7|@1|0|4242\n"),
+            ("%7 4243 2000\n", "%7|@1|0|4242\n"),
+            ("%7 4242\n", "%7|@1|0|4242\n"),
             // A stale start: the record names another process that once had this pid.
-            ("%7 4242 1\n", "%7|@5|0|4242\n"),
+            ("%7 4242 1\n", "%7|@1|0|4242\n"),
             // The pane runs another process (a shell, with this watch run by hand in it), or is dead, or unread.
-            ("%7 4242 2000\n", "%7|@5|0|170\n"),
-            ("%7 4242 2000\n", "%7|@5|1|4242\n"),
+            ("%7 4242 2000\n", "%7|@1|0|170\n"),
+            ("%7 4242 2000\n", "%7|@1|1|4242\n"),
+            // Proven, but in another window than the watch's own: that window's record is not this one.
+            ("%7 4242 2000\n", "%7|@5|0|4242\n"),
             ("%7 4242 2000\n", ""),
         ] {
             let (w, _) = keep_world(&["live", "live", "live", "gone"], win("%1", split_right()));
@@ -6957,6 +7348,244 @@ mod tests {
 
     // ---- ensure
 
+    // ensure as the caller for `window`: as ensure_run.
+    fn ensure_in(w: &World, window: &str) -> String {
+        let caller = w.caller();
+        match ensure(&w.ctx, &caller, window) {
+            Ok(Bar::Opened(pane)) => format!("opened {pane}"),
+            Ok(Bar::Existing(pane)) => format!("existing {pane}"),
+            Ok(Bar::Disabled) => "disabled".into(),
+            Err(r) => format!("{} {} {}", r.code, r.check, r.message),
+        }
+    }
+
+    // #103: each window keeps its own bar, found by its own window record, split in that window, under the one
+    // session lock.
+    #[test]
+    fn each_window_keeps_its_own_bar() {
+        let (w, panes) = sidebar_world("", Mux::default());
+        assert_eq!(ensure_in(&w, "@1"), "opened %7");
+        w.fakes.clear_log();
+        let key = w.caller().server_key;
+        assert_eq!(ensure_in(&w, "@2"), "opened %8");
+        let split = split_line(&w, true).replace("-t @1", "-t @2");
+        assert_eq!(
+            calls(&w),
+            [
+                READ_OPTION.to_string(),
+                SESSION_RECORD.into(),
+                READ_RECORD.replace("@1", "@2"),
+                LABELS.replace("@1", "@2"),
+                split,
+                label_line("%8", 108),
+                "-N set-option -w -t @2 @mux-agents-sidebar-id %8 108 1080".into(),
+                resize_line("%8", 108, 40),
+            ]
+        );
+        assert!(
+            w.fakes
+                .mux_calls()
+                .iter()
+                .any(|c| c.join(" ") == format!("-N display-message -p -t @2 {WINDOW_PROBE}"))
+        );
+        assert_eq!(
+            (
+                record(&panes).as_deref(),
+                get(&panes, &wrec("@2")).as_deref()
+            ),
+            (Some("%7 107 1070"), Some("%8 108 1080"))
+        );
+        assert_eq!(get(&panes, RECORD), None);
+        assert!(
+            w.fakes
+                .locks()
+                .iter()
+                .all(|l| l.starts_with(&format!("+sidebar|{key}|$3"))
+                    || l.starts_with(&format!("-sidebar|{key}|$3")))
+        );
+        assert_eq!(ensure_in(&w, "@1"), "existing %7");
+        assert_eq!(ensure_in(&w, "@2"), "existing %8");
+    }
+
+    // #103: a window's record is that window's bar only while the proven bar stands in that window.
+    #[test]
+    fn a_record_naming_a_bar_in_another_window_is_not_that_windows_bar() {
+        let (w, panes) = sidebar_world(
+            "",
+            Mux {
+                open: true,
+                ..Mux::default()
+            },
+        );
+        // %7 is the proven bar of @1; @2's record names it too.
+        set(&panes, &wrec("@2"), "%7 107 1070".into());
+        assert_eq!(ensure_in(&w, "@2"), "opened %8");
+        assert_eq!(get(&panes, &wrec("@2")).as_deref(), Some("%8 108 1080"));
+        assert_eq!(closes(&w), 0);
+        // %7 was moved to @5: @1's record no longer proves a bar in @1, and @1 holds no label, so @1 gets its own.
+        set(&panes, "win %7", "@5".into());
+        assert_eq!(ensure_in(&w, "@1"), "opened %9");
+        assert_eq!(record(&panes).as_deref(), Some("%9 109 1090"));
+        assert_eq!(closes(&w), 0);
+    }
+
+    // #103: an unproven label refuses a bar in its own window only.
+    #[test]
+    fn an_unproven_label_refuses_only_its_own_window() {
+        let (w, _) = sidebar_world(
+            "",
+            Mux {
+                legacy: true,
+                ..Mux::default()
+            },
+        );
+        assert_eq!(ensure_in(&w, "@1"), refused(&["%7"]));
+        assert_eq!(ensure_in(&w, "@2"), "opened %8");
+    }
+
+    // #103: a 0.2.x session record moves once, under the session lock, to its proven bar's window; the session's is
+    // unset, so the next look reads it no more.
+    #[test]
+    fn a_proven_session_record_moves_to_its_bars_window() {
+        for window in ["@1", "@5"] {
+            let (w, panes) = sidebar_world(
+                "",
+                Mux {
+                    legacy: true,
+                    extra: vec![(RECORD, "%7 107 1070".into()), ("win %7", window.into())],
+                    ..Mux::default()
+                },
+            );
+            let moved = format!("-N set-option -w -t {window} @mux-agents-sidebar-id %7 107 1070");
+            let got = ensure_in(&w, "@1");
+            assert_eq!(
+                calls(&w)[..5],
+                [
+                    READ_OPTION.to_string(),
+                    SESSION_RECORD.into(),
+                    moved,
+                    CLEAR_SESSION.into(),
+                    READ_RECORD.into()
+                ],
+                "{window}"
+            );
+            assert_eq!(get(&panes, RECORD), None, "{window}");
+            assert_eq!(
+                get(&panes, &wrec(window)).as_deref(),
+                Some("%7 107 1070"),
+                "{window}"
+            );
+            // The bar stays in its window: @1 keeps it, or gets its own beside a bar moved to @5.
+            let want = if window == "@1" {
+                "existing %7"
+            } else {
+                "opened %8"
+            };
+            assert_eq!(got, want, "{window}");
+            assert_eq!(closes(&w), 0, "{window}");
+            w.fakes.clear_log();
+            assert_eq!(ensure_in(&w, "@1"), want.replace("opened", "existing"));
+            assert_eq!(
+                calls(&w),
+                [READ_OPTION, SESSION_RECORD, READ_RECORD],
+                "{window}"
+            );
+        }
+        // -Close migrates too, then closes the bar by its window record.
+        let (w, panes) = sidebar_world(
+            "",
+            Mux {
+                legacy: true,
+                extra: vec![(RECORD, "%7 107 1070".into())],
+                ..Mux::default()
+            },
+        );
+        assert_eq!(
+            run(&w, &["-Close"]),
+            r#"ok {"pane":"%7","closed":true,"panes":["%7"]}"#
+        );
+        assert_eq!((get(&panes, RECORD), record(&panes)), (None, None));
+    }
+
+    // #103: an unproven session record refuses while any pane of the session carries the label (it may be that
+    // bar), in every window; with no label anywhere it names nothing and is cleared. An unreadable one refuses.
+    #[test]
+    fn an_unproven_session_record_refuses_while_the_session_holds_a_label_else_is_cleared() {
+        let (w, panes) = sidebar_world(
+            "",
+            Mux {
+                legacy: true,
+                extra: vec![(RECORD, "%7 108 1070".into()), ("win %7", "@5".into())],
+                ..Mux::default()
+            },
+        );
+        for window in ["@1", "@2"] {
+            assert_eq!(ensure_in(&w, window), refused(&["%7"]), "{window}");
+        }
+        assert_eq!(run(&w, &[]), refused(&["%7"]));
+        assert_eq!(run(&w, &["-Close"]), refused(&["%7"]));
+        assert_eq!(get(&panes, RECORD).as_deref(), Some("%7 108 1070"));
+        assert_eq!((closes(&w), count(&w, "split-window")), (0, 0));
+        assert!(
+            w.fakes
+                .mux_calls()
+                .iter()
+                .any(|c| c.join(" ") == SESSION_LABELS)
+        );
+        let (w, panes) = sidebar_world(
+            "",
+            Mux {
+                extra: vec![(RECORD, "%9 109 1090".into())],
+                ..Mux::default()
+            },
+        );
+        assert_eq!(ensure_in(&w, "@1"), "opened %7");
+        assert_eq!(get(&panes, RECORD), None);
+        assert_eq!(record(&panes).as_deref(), Some("%7 107 1070"));
+        let (w, _) = sidebar_world("", Mux::default());
+        w.fakes
+            .mux_first(SESSION_RECORD.trim_start_matches("-N "), 1, "", "no server");
+        assert!(ensure_in(&w, "@1").starts_with("1 rmux "));
+        assert_eq!(count(&w, "split-window"), 0);
+    }
+
+    // #103: -Close lists the session's windows and closes the proven bar of each, clearing each window's record.
+    #[test]
+    fn close_closes_the_bar_of_every_window() {
+        let (w, panes) = sidebar_world("", Mux::default());
+        assert_eq!(ensure_in(&w, "@1"), "opened %7");
+        assert_eq!(ensure_in(&w, "@2"), "opened %8");
+        w.fakes.clear_log();
+        assert_eq!(
+            run(&w, &["-Close"]),
+            r#"ok {"pane":"%7","closed":true,"panes":["%7","%8"]}"#
+        );
+        assert_eq!(
+            calls(&w),
+            [
+                OFF.to_string(),
+                SESSION_RECORD.into(),
+                WINDOWS.into(),
+                READ_RECORD.into(),
+                close_line("%7", 107),
+                CLEAR_RECORD.into(),
+                READ_RECORD.replace("@1", "@2"),
+                close_line("%8", 108),
+                CLEAR_RECORD.replace("@1", "@2"),
+            ]
+        );
+        assert_eq!((record(&panes), get(&panes, &wrec("@2"))), (None, None));
+        assert_eq!(roles(&panes), "%1=|,%2=other|");
+        assert_eq!(option(&panes).as_deref(), Some("off"));
+        // Only @2 holds a bar: it is the one closed.
+        let (w, _) = sidebar_world("", Mux::default());
+        assert_eq!(ensure_in(&w, "@2"), "opened %7");
+        assert_eq!(
+            run(&w, &["-Close"]),
+            r#"ok {"pane":"%7","closed":true,"panes":["%7"]}"#
+        );
+    }
+
     #[test]
     fn ensure_opens_one_bar_then_finds_it() {
         let (w, panes) = sidebar_world("", Mux::default());
@@ -6966,7 +7595,7 @@ mod tests {
         assert_eq!(calls(&w), want);
         w.fakes.clear_log();
         assert_eq!(ensure_run(&w), "existing %7");
-        assert_eq!(calls(&w), [READ_OPTION, READ_RECORD]);
+        assert_eq!(calls(&w), [READ_OPTION, SESSION_RECORD, READ_RECORD]);
         assert_eq!(roles(&panes), "%1=|,%2=other|,%7=sidebar|");
         // ensure only reads the option.
         assert_eq!(option(&panes), None);
@@ -6993,13 +7622,13 @@ mod tests {
                     .collect::<Vec<_>>()
                     .join(",")
             });
-            assert!(ensure(&w.ctx, &caller).is_ok());
+            assert!(ensure(&w.ctx, &caller, &caller.window).is_ok());
             let key = caller.server_key;
             let inside = if disabled {
                 "show-options"
             } else {
-                "show-options,show-options,list-panes,display-message,split-window,if-shell,display-message,set-option,if-shell,\
-                 display-message"
+                "show-options,show-options,show-options,list-panes,display-message,split-window,if-shell,display-message,\
+                 set-option,if-shell,display-message"
             };
             assert_eq!(
                 w.fakes.locks(),
@@ -7093,7 +7722,10 @@ mod tests {
                 String::new()
             }
         });
-        assert_eq!(run(&w, &["-Close"]), r#"ok {"pane":"%7","closed":true}"#);
+        assert_eq!(
+            run(&w, &["-Close"]),
+            r#"ok {"pane":"%7","closed":true,"panes":["%7"]}"#
+        );
         // Off is written inside the lock, before the kill; the record is cleared after it.
         let key = w.caller().server_key;
         assert_eq!(
@@ -7113,13 +7745,13 @@ mod tests {
         w.fakes.clear_log();
         assert_eq!(
             run(&w, &[]),
-            r#"ok {"pane":"%8","window":"@5","opened":true}"#
+            r#"ok {"pane":"%8","window":"@1","opened":true}"#
         );
         assert_eq!(option(&panes), None);
         assert_eq!(
             w.fakes.locks()[1],
             format!(
-                "-sidebar|{key}|$3 {ON},{},-N set-option -t $3 @mux-agents-sidebar-id %8 108 1080,{}",
+                "-sidebar|{key}|$3 {ON},{},-N set-option -w -t @1 @mux-agents-sidebar-id %8 108 1080,{}",
                 label_line("%8", 108),
                 resize_line("%8", 108, 40)
             )

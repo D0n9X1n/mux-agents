@@ -1,7 +1,6 @@
 //! spawn: authenticates the caller, connects hc, then admits and launches under the session's spawn lock.
 //! Hc lifecycle facts reserve capacity and names; commit.json releases the launcher, then the sidebar is best effort.
 
-use std::panic::{self, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
 
 use serde_json::{Map, Value, json};
@@ -16,7 +15,7 @@ use crate::ctx::Ctx;
 use crate::error::{Refusal, Res, refuse};
 use crate::mux::Kind as MuxKind;
 use crate::parse::{Client, cmdline_length};
-use crate::sidebar::{self, Bar};
+use crate::sidebar;
 use crate::state::fs::{BRIEF_MAX, TASK_MAX, read_text, write_json};
 use crate::state::root::OsKind;
 use crate::util::{guid, hex_id, utc_o};
@@ -195,22 +194,13 @@ pub fn spawn(ctx: &Ctx, request: &Request) -> Res<Map<String, Value>> {
     reply.insert("model".into(), model.unwrap_or("inherited").into());
     reply.insert("placement".into(), placement.into());
     reply.insert("placementSource".into(), source.into());
-    // The agent is committed and the spawn lock released: the bar is best effort and never fails the spawn, not
-    // even by a panic, which unwinding has already freed the sidebar lock from.
-    let bar = panic::catch_unwind(AssertUnwindSafe(|| sidebar::ensure(ctx, &caller)))
-        .unwrap_or_else(|_| refuse(1, "internal", "unexpected error (panic)"));
-    match bar {
-        Ok(Bar::Opened(pane) | Bar::Existing(pane)) => {
-            reply.insert("sidebar".into(), pane.into());
-        }
-        Ok(Bar::Disabled) => {
-            reply.insert("sidebar".into(), Value::Null);
-        }
-        Err(refusal) => {
-            reply.insert("sidebar".into(), Value::Null);
-            reply.insert("sidebarError".into(), refusal.message.into());
-        }
-    }
+    // The agent is committed and the spawn lock released: the bar of the new view's window is best effort and never
+    // fails the spawn.
+    let window = record["window"]
+        .as_str()
+        .unwrap_or(&caller.window)
+        .to_string();
+    sidebar::keep(ctx, &caller, &window, &mut reply);
     reply.insert("life".into(), "running".into());
     reply.insert("view".into(), "attached".into());
     reply.insert("hcAddress".into(), record["hcAddress"].clone());
@@ -2371,8 +2361,8 @@ mod tests {
         }
     }
 
-    // A human caller whose session keeps its bar: the bar's split answers %13 in the caller's window @1, run by pid
-    // 113 (`<exe> watch`, start 1130), and from then on the session's record, the bar's proof and the label list name
+    // A human caller whose session keeps its bar: the bar's split answers %13 in the window it targets, run by pid
+    // 113 (`<exe> watch`, start 1130), and from then on that window's record, the bar's proof and the label list name
     // it. `open` says whether the bar is there.
     fn bar_on() -> (World, Rc<Cell<bool>>) {
         let w = World::human("");
@@ -2388,34 +2378,39 @@ mod tests {
             argv: Some(vec![exe, "watch".into()]),
         });
         let open = Rc::new(Cell::new(false));
-        let seen = open.clone();
+        // The window the bar was split in; the caller's @1 until a split says else.
+        let bar_window = Rc::new(RefCell::new("@1".to_string()));
+        let (seen, at) = (open.clone(), bar_window.clone());
         w.fakes.mux_script("split-window", move |argv| {
             let bar = argv.last().is_some_and(|a| a == "watch");
-            if bar {
+            let stdout = if bar {
                 seen.set(true);
-            }
+                let target = argv.iter().position(|a| a == "-t").unwrap() + 1;
+                *at.borrow_mut() = argv[target].clone();
+                format!("%13|{}|113\n", argv[target])
+            } else {
+                "%9|@5|hc attach t1\n".to_string()
+            };
             Ok(Output {
                 code: 0,
-                stdout: if bar {
-                    "%13|@1|113\n"
-                } else {
-                    "%9|@5|hc attach t1\n"
-                }
-                .into(),
+                stdout,
                 stderr: String::new(),
             })
         });
         let record = Rc::new(RefCell::new(String::new()));
         w.fakes.mux_script("@mux-agents-sidebar-id", move |argv| {
             let mut record = record.borrow_mut();
+            // The caller's window record: `-wqv` read, `-wu` unset, `-w` set (its value last). The session holds no
+            // 0.2.x record: its read answers empty.
             let stdout = match (argv[1].as_str(), argv[2].as_str()) {
+                (_, flags) if !flags.contains('w') => String::new(),
                 ("show-options", _) if !record.is_empty() => format!("{record}\n"),
-                ("set-option", "-u") => {
+                ("set-option", "-wu") => {
                     record.clear();
                     String::new()
                 }
                 ("set-option", _) => {
-                    *record = argv[5].clone();
+                    *record = argv.last().unwrap().clone();
                     String::new()
                 }
                 _ => String::new(),
@@ -2433,16 +2428,15 @@ mod tests {
             "sidebar\n",
             "",
         );
-        let seen = open.clone();
+        let (seen, at) = (open.clone(), bar_window.clone());
         w.fakes.mux_script("#{pane_dead}|#{pane_pid}", move |_| {
             Ok(Output {
                 code: 0,
                 stdout: if seen.get() {
-                    "%13|@1|0|113\n"
+                    format!("%13|{}|0|113\n", at.borrow())
                 } else {
-                    "|||\n"
-                }
-                .into(),
+                    "|||\n".to_string()
+                },
                 stderr: String::new(),
             })
         });
@@ -2512,17 +2506,23 @@ mod tests {
             ]
         );
         assert_eq!(bar_splits(&w), 1);
-        // The bar opens at the right edge of the caller's window, full height.
+        // #103: the bar opens at the right edge of the new view's window (@5, where new-window put the agent), full
+        // height, never the caller's.
+        assert_eq!(first["window"], "@5");
         let bar = calls(&w, "split-window").pop().unwrap();
         assert_eq!(bar[2..5], ["-d", "-f", "-h"]);
-        assert_eq!(bar[9], "%1");
+        assert_eq!(bar[9], "@5");
         // A second spawn, a split by the session's placement too, finds the same bar and splits no second one.
         w.fakes.clear_log();
         w.fakes.mux_rule("@mux-agents-placement", 0, "h\n", "");
         let record = read_json(&w.folder(first["id"].as_str().unwrap()).join("record.json"));
         public_snapshot(&w, &[], &[crate::agents::core_fixture::wire(&record)]);
         public_launch(&w, "t2");
+        // The second view splits beside the first, in its window @5.
+        w.fakes
+            .mux_first("split-window", 0, "%10|@5|hc attach t2\n", "");
         let second = reply(&run(&w, &["-Client", "claude", "-Task", "hi"]));
+        assert_eq!(second["window"], "@5");
         assert_eq!(
             (&second["sidebar"], &second["placement"]),
             (&json!("%13"), &json!("h"))
@@ -2571,7 +2571,7 @@ mod tests {
                     // A recorded bar whose proof cannot be read: its label refuses a second bar.
                     open.set(true);
                     w.fakes.mux_first(
-                        "show-options -qv -t $3 @mux-agents-sidebar-id",
+                        "show-options -wqv -t @1 @mux-agents-sidebar-id",
                         0,
                         "%13 113 1130\n",
                         "",
