@@ -4274,9 +4274,34 @@ hc {}:
                 continue;
             };
             let marker = hostile(&live);
+            // A real client on the person's session (tmux: the pty harness runs there), so switch-client has one to
+            // move; rmux runs without one and is held to the other warnings.
+            let client = (!matches!(mux, Mux::Rmux)).then(|| {
+                let root = live.field(live.server.pane(), "#{session_id}");
+                let client = Client::attach(&live, &root);
+                live.server.wait("the client to attach", || {
+                    (!live.call(&["list-clients"]).trim().is_empty()).then_some(())
+                });
+                client
+            });
             let (code, up) = live.run(&["up", "-Client", "claude"]);
             assert_eq!(code, 0, "{mux:?} {up}");
+            assert!(
+                up.get("sidebarError").is_none() && up.get("teamRecordError").is_none(),
+                "{mux:?} {up}"
+            );
             let session = up["session"].as_str().unwrap().to_string();
+            if client.is_some() {
+                assert!(up.get("layoutError").is_none(), "{mux:?} {up}");
+                let name = up["name"].as_str().unwrap();
+                assert!(
+                    eventually(Duration::from_secs(10), || live
+                        .call(&["list-clients", "-F", "#{client_session}"])
+                        .trim()
+                        == name),
+                    "{mux:?}: the client did not switch to {name}"
+                );
+            }
             let core = live.server.core.as_ref().unwrap();
             let get = support::private_core::run(
                 core.command(&["get", up["leader"]["hcAddress"].as_str().unwrap(), "--json"]),

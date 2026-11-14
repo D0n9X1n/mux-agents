@@ -677,6 +677,12 @@ fn up_creates_a_team_in_a_new_session() {
     )
     .unwrap();
     assert!(get["state"] == "live" && up["sidebar"].is_string(), "{up}");
+    // No client is attached here (the Windows harness has none), so only switch-client may warn: the bar and the
+    // team record must not. The switch itself is covered by the unit tests and the Unix live test on tmux.
+    assert!(
+        up.get("sidebarError").is_none() && up.get("teamRecordError").is_none(),
+        "{up}"
+    );
     assert!(eventually(Duration::from_secs(10), || live
         .call(&[
             "list-windows",
