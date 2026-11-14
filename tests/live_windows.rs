@@ -396,6 +396,74 @@ fn hc_worker_and_view_close_survives_focus_stop() {
     });
 }
 
+// A worker whose view is closed still reads its own mail (#104 phase 1c): the person sends to it after the view pane
+// is gone, and `read` run by the worker in its hc terminal, which has no TMUX or RMUX, returns that message.
+#[test]
+fn hc_worker_reads_after_its_view_closes() {
+    let Some(live) = Live::start() else {
+        return;
+    };
+    live.run(&["sidebar", "-Close"]);
+    let w = live.spawn("w1");
+    let pid: u32 = live.wait("worker session", || {
+        std::fs::read_to_string(live.dir.join("clients.log"))
+            .ok()?
+            .lines()
+            .find_map(|p| {
+                let r: Value = serde_json::from_str(
+                    &std::fs::read_to_string(live.dir.join(format!("client.{p}.json"))).ok()?,
+                )
+                .ok()?;
+                (r["sessionId"] == w["sessionId"])
+                    .then(|| p.parse().ok())
+                    .flatten()
+            })
+    });
+    let worker: Value = serde_json::from_str(
+        &std::fs::read_to_string(live.dir.join(format!("client.{pid}.json"))).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(worker["env"]["HC_TERMINAL_ID"], w["hcAddress"]);
+    assert!(worker["env"]["TMUX"].is_null() && worker["env"]["RMUX"].is_null());
+    live.call(&["kill-pane", "-t", &s(&w["pane"])]);
+    live.wait("the view pane to close", || {
+        (!live
+            .call(&["list-panes", "-a", "-F", "#{pane_id}"])
+            .lines()
+            .any(|p| p == s(&w["pane"])))
+        .then_some(())
+    });
+    live.run(&["send", "w1", "-Body", "after the view closed"]);
+    // The worker runs `read` in its hc terminal, twice: the message, then nothing left.
+    let read = |n: u32| -> Value {
+        let held = live.dir.join(format!("cmd.{pid}.part"));
+        std::fs::write(&held, "read\n").unwrap();
+        std::fs::rename(held, live.dir.join(format!("cmd.{pid}"))).unwrap();
+        let text = live.wait("worker read", || {
+            std::fs::read_to_string(live.dir.join(format!("reply.{pid}.{n}.json"))).ok()
+        });
+        serde_json::from_str(&text).unwrap()
+    };
+    let first = read(1);
+    assert_eq!(first["ok"], true, "{first}");
+    let bodies: Vec<&str> = first["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| {
+            m["text"]
+                .as_str()
+                .unwrap()
+                .split_once('\n')
+                .map_or("", |b| b.1)
+        })
+        .collect();
+    assert_eq!(bodies, ["after the view closed"], "{first}");
+    let again = read(2);
+    assert_eq!(again["ok"], true, "{again}");
+    assert_eq!(again["messages"], serde_json::json!([]), "{again}");
+}
+
 // Stop an agent, then resume it (#103): the reply names X as `from` and the successor Y (same name, a new hc
 // terminal); the client in Y's hc terminal runs `--resume <X's session>` as the last arguments, with no task after
 // them; Y's record names X in `resumedFrom`; and the reply's `sidebar` is a live bar in the window of Y's view

@@ -4161,6 +4161,39 @@ hc {}:
         assert_eq!(exit_messages(&live, &w).len(), 1);
     }
 
+    // A worker whose view is closed still reads its own mail (#104 phase 1c): the person sends to it after the view
+    // pane is gone, and `read` run by the worker in its hc terminal, which has no TMUX or RMUX, returns that message.
+    fn hc_worker_reads_after_its_view_closes(mux: Mux) {
+        let Some(mut live) = Live::human(mux) else {
+            return;
+        };
+        live.close_bar();
+        let w = live.spawn("w1", &[]);
+        let pid = live.worker_pid(&w);
+        let client = live.client(pid);
+        assert_eq!(client["env"]["HC_TERMINAL_ID"], w["hcAddress"], "{mux:?}");
+        assert!(
+            client["env"]["TMUX"].is_null() && client["env"]["RMUX"].is_null(),
+            "{mux:?} {client}"
+        );
+        live.call(&["kill-pane", "-t", s(&w["pane"])]);
+        live.wait_gone(s(&w["pane"]));
+        let (code, sent) = live.run(&["send", "w1", "-Body", "after the view closed"]);
+        assert_eq!(code, 0, "{mux:?} {sent}");
+        let (code, read) = live.server.command(pid, &["read"]);
+        assert_eq!(
+            (code, bodies(&read)),
+            (0, vec!["after the view closed".to_string()]),
+            "{mux:?} {read}"
+        );
+        let (code, again) = live.server.command(pid, &["read"]);
+        assert_eq!(
+            (code, &again["messages"]),
+            (0, &json!([])),
+            "{mux:?} {again}"
+        );
+    }
+
     /// The fake client a resume started for `sid`: the one whose argv carries `--resume <sid>`. Its `sessionId` is
     /// null (the fake reads only `--session-id`), so it is found by its argv.
     fn resumed_client(live: &Live, sid: &str) -> Value {
@@ -4452,6 +4485,7 @@ hc {}:
                 $mux,
                 [
                     hc_view_close_survives_focus_stop,
+                    hc_worker_reads_after_its_view_closes,
                     stop_then_resume_returns_with_its_conversation,
                     root_unsandboxed_terminal_driver_finished,
                     spawn_window_and_split_tagged,
