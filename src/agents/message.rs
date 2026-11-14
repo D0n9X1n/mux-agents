@@ -455,8 +455,35 @@ pub fn capture_hc(
         return Err(usage("read"));
     }
     let id = super::member_target::named(ctx, caller, name)?;
+    capture_identity(ctx, caller, &id, expected, lines, standing)
+}
+
+/// `capture_hc` for the bar (#103 B10): member `id` by id, never by name. The bar acts for the person: no standing.
+pub fn capture_member(
+    ctx: &Ctx,
+    caller: &crate::caller::Caller,
+    id: &str,
+    expected: Option<&str>,
+    lines: i32,
+) -> Res<(registry::Pane, String)> {
+    if !(1..=2000).contains(&lines) {
+        return Err(usage("read"));
+    }
+    let id = super::member_target::by_id(ctx, caller, id)?;
+    capture_identity(ctx, caller, &id, expected, lines, None)
+}
+
+fn capture_identity(
+    ctx: &Ctx,
+    caller: &crate::caller::Caller,
+    id: &super::core_identity::Identity,
+    expected: Option<&str>,
+    lines: i32,
+    standing: Option<&super::tree::Standing>,
+) -> Res<(registry::Pane, String)> {
     lock(ctx, &lock_key("member", caller, &id.id), || {
-        let record = super::member_target::current(ctx, caller, &id)?;
+        let record = super::member_target::current(ctx, caller, id)?;
+        // Phase 3: a member reads only down the tree, checked under the member lock (`read <name>`; the bar passes None).
         if let Some(s) = standing {
             super::tree::authority(ctx, caller, s, &id.id, "read")?;
         }
@@ -464,7 +491,7 @@ pub fn capture_hc(
             return refuse(
                 2,
                 "target",
-                format!("the agent has no live view; run focus {name}"),
+                format!("the agent has no live view; run focus {}", id.name),
             );
         };
         if expected.is_some_and(|e| e != pane.pane) {
@@ -477,6 +504,46 @@ pub fn capture_hc(
         let tail = capture(ctx, &pane, lines)?;
         Ok((pane, tail))
     })
+}
+
+/// The output hc keeps for member `id` (#103 B6), also after it ended: `hc read`. None when it is blank, when no committed
+/// member has that id, or when hc answers `not_found` (it no longer keeps the terminal); any other failure is an error.
+pub fn retained(
+    ctx: &Ctx,
+    caller: &crate::caller::Caller,
+    id: &str,
+    lines: u32,
+) -> Res<Option<String>> {
+    let id = match super::member_target::by_id(ctx, caller, id) {
+        Ok(id) => id,
+        Err(e) if e.check == "target" => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    match crate::hc::connect(ctx)?.read(&id.address, lines) {
+        Ok(text) => Ok((!text.trim().is_empty()).then_some(text)),
+        Err(e) if e.check == "not_found" => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+/// Whether hc still keeps member `id`'s terminal (`hc get`; `not_found`: it dropped it), as the bar reopens only one it keeps;
+/// None when no committed member has that id. Any other hc failure, unreachable included, is an error.
+pub fn kept_member(
+    ctx: &Ctx,
+    caller: &crate::caller::Caller,
+    core: &crate::hc::Core<'_>,
+    id: &str,
+) -> Res<Option<bool>> {
+    let id = match super::member_target::by_id(ctx, caller, id) {
+        Ok(id) => id,
+        Err(e) if e.check == "target" => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    match core.get(&id.address) {
+        Ok(_) => Ok(Some(true)),
+        Err(e) if e.check == "not_found" => Ok(Some(false)),
+        Err(e) => Err(e),
+    }
 }
 
 pub fn stop_hc(ctx: &Ctx, request: &Request) -> Res<Map<String, Value>> {

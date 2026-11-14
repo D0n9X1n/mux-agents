@@ -363,3 +363,106 @@ fn by_id_finds_each_of_two_same_name_members() {
     }
     assert!(w.fakes.hc_calls().is_empty(), "by id never asks hc");
 }
+
+#[test]
+fn the_bar_reads_and_captures_by_id_never_by_name() {
+    use crate::agents::{core_fixture as cf, fixture::World, message};
+    let w = World::human("");
+    let c = w.caller();
+    cf::member(&w, "aaaaaaaaaaaa", serde_json::json!({"name": "twin"}));
+    cf::member(&w, "bbbbbbbbbbbb", serde_json::json!({"name": "twin"}));
+    w.panes(&[]);
+    let e = message::capture_member(&w.ctx, &c, "bbbbbbbbbbbb", None, 2).unwrap_err();
+    assert_eq!(e.message, "the agent has no live view; run focus twin");
+    for (id, text, want) in [
+        ("aaaaaaaaaaaa", "old a\n", Some("old a\n")),
+        ("bbbbbbbbbbbb", " \n", None),
+    ] {
+        cf::online(&w);
+        cf::answer(&w, &["read", &format!("t{id}"), "--lines", "200"], text);
+        assert_eq!(
+            message::retained(&w.ctx, &c, id, 200).unwrap().as_deref(),
+            want,
+            "{id}"
+        );
+    }
+    // A read that fails: hc's `not_found` (exit 3, as hc 0.1.21 answers) is nothing to show; hc unreachable is an error.
+    let gone = r#"{"error":{"hint":"see `hc ls --all`","kind":"not_found","message":"no terminal \"taaaaaaaaaaaa\""}}"#;
+    let out = |code: i32, stdout: &str| -> crate::error::Res<crate::spawn::Out> {
+        Ok(crate::spawn::Out {
+            code,
+            stdout: stdout.into(),
+            stderr: String::new(),
+        })
+    };
+    for (code, reply, want) in [
+        (3, gone, Some(None)),
+        (5, r#"{"error":{"kind":"unavailable"}}"#, None),
+    ] {
+        cf::online(&w);
+        w.fakes.hc_expect(
+            &["read", "taaaaaaaaaaaa", "--lines", "200"],
+            out(code, reply),
+        );
+        assert_eq!(
+            message::retained(&w.ctx, &c, "aaaaaaaaaaaa", 200).ok(),
+            want,
+            "exit {code}"
+        );
+    }
+    assert!(
+        !w.fakes
+            .mux_calls()
+            .iter()
+            .any(|a| a.iter().any(|s| s.contains("capture-pane")))
+    );
+    w.fakes.hc_done().unwrap();
+}
+
+#[test]
+fn kept_member_tells_a_dropped_terminal_from_a_failure() {
+    use crate::agents::{core_fixture as cf, fixture::World, message};
+    let w = World::human("");
+    let c = w.caller();
+    let record = cf::member(&w, "aaaaaaaaaaaa", serde_json::json!({"name": "twin"}));
+    let gone = r#"{"error":{"hint":"see `hc ls --all`","kind":"not_found","message":"no terminal \"taaaaaaaaaaaa\""}}"#;
+    let out = |code: i32, stdout: &str| -> crate::error::Res<crate::spawn::Out> {
+        Ok(crate::spawn::Out {
+            code,
+            stdout: stdout.into(),
+            stderr: String::new(),
+        })
+    };
+    cf::online(&w);
+    let core = crate::hc::connect(&w.ctx).unwrap();
+    cf::get(&w, "taaaaaaaaaaaa", cf::wire(&record));
+    w.fakes
+        .hc_expect(&["get", "taaaaaaaaaaaa", "--json"], out(3, gone));
+    w.fakes.hc_expect(
+        &["get", "taaaaaaaaaaaa", "--json"],
+        out(5, r#"{"error":{"kind":"unavailable"}}"#),
+    );
+    assert_eq!(
+        message::kept_member(&w.ctx, &c, &core, "aaaaaaaaaaaa").unwrap(),
+        Some(true),
+        "hc keeps it"
+    );
+    assert_eq!(
+        message::kept_member(&w.ctx, &c, &core, "aaaaaaaaaaaa").unwrap(),
+        Some(false),
+        "hc dropped it"
+    );
+    assert_eq!(
+        message::kept_member(&w.ctx, &c, &core, "aaaaaaaaaaaa")
+            .unwrap_err()
+            .check,
+        "hc",
+        "hc unreachable"
+    );
+    assert_eq!(
+        message::kept_member(&w.ctx, &c, &core, "eeeeeeeeeeee").unwrap(),
+        None,
+        "no such member"
+    );
+    w.fakes.hc_done().unwrap();
+}
