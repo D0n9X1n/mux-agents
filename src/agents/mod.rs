@@ -26,6 +26,7 @@ pub mod registry;
 pub mod spawn;
 #[cfg(test)]
 mod stop_hc_tests;
+pub mod team;
 pub mod view;
 #[cfg(test)]
 mod view_hc_tests;
