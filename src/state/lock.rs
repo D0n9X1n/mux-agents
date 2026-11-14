@@ -171,6 +171,18 @@ pub(crate) fn with_lock_in<T>(
     wait: Duration,
     f: impl FnOnce() -> Res<T>,
 ) -> Res<T> {
+    crate::state::private_unix::private_dirs(root, &[root])?;
+    let file = open_lock(&lock_path(root, key))?;
+    hold_lock(ctx, &file, wait, f)
+}
+
+/// Runs `f` holding a file lock on `file`, waited for up to `wait` then refused 2 `lock`.
+fn hold_lock<T>(
+    ctx: &Ctx,
+    file: &std::fs::File,
+    wait: Duration,
+    f: impl FnOnce() -> Res<T>,
+) -> Res<T> {
     use std::fs::TryLockError;
     // A flock belongs to the open file description, which a child forked while it is held shares until it
     // execs (O_CLOEXEC acts only at exec), so closing our descriptor alone can leave the lock held. Unlocking
@@ -182,8 +194,6 @@ pub(crate) fn with_lock_in<T>(
             let _ = self.0.unlock();
         }
     }
-    crate::state::private_unix::private_dirs(root, &[root])?;
-    let file = open_lock(&lock_path(root, key))?;
     // The wait is clock time, as .NET's WaitOne(15000) is: on a loaded machine a 10 ms sleep can take far
     // longer. Each back-off counts what the clock moved, never less than BACK_OFF, so a clock that stands
     // still or is set back still refuses after wait / BACK_OFF back-offs.
@@ -203,12 +213,86 @@ pub(crate) fn with_lock_in<T>(
         }
     }
     // Unlocked before `file` closes, as the Windows guard releases the mutex before its handle closes.
-    let _held = Held(&file);
+    let _held = Held(file);
     test_panic(ctx);
     f()
 }
 
+/// The admission lock of `up` (#103): `<lock root>/<32 hex of sha256(key)>.lock`, a file lock on every OS, waited for
+/// up to LOCK_WAIT then refused 2 `lock`, released on every exit, unwinding included. The root never comes from the env.
+pub fn admission<T>(ctx: &Ctx, key: &str, f: impl FnOnce() -> Res<T>) -> Res<T> {
+    admission_in(ctx, &admission_root()?, key, LOCK_WAIT, f)
+}
+
+pub(crate) fn admission_in<T>(
+    ctx: &Ctx,
+    root: &Path,
+    key: &str,
+    wait: Duration,
+    f: impl FnOnce() -> Res<T>,
+) -> Res<T> {
+    #[cfg(unix)]
+    return with_lock_in(ctx, root, key, wait, f);
+    #[cfg(windows)]
+    {
+        std::fs::create_dir_all(root)?;
+        crate::state::private_windows::private_dirs(&[root])?;
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(lock_path(root, key))?;
+        hold_lock(ctx, &file, wait, f)
+    }
+}
+
+/// Unix: the per-user lock root of `lock_root` (passwd home). Windows: `<FOLDERID_LocalAppData>\mux-agents\locks`.
 #[cfg(unix)]
+pub(crate) fn admission_root() -> Res<PathBuf> {
+    lock_root(&Real, &passwd_home()?)
+}
+
+#[cfg(windows)]
+pub(crate) fn admission_root() -> Res<PathBuf> {
+    use std::os::windows::ffi::OsStringExt;
+    use windows_sys::Win32::{
+        System::Com::CoTaskMemFree,
+        UI::Shell::{FOLDERID_LocalAppData, KF_FLAG_DEFAULT, SHGetKnownFolderPath},
+    };
+    // GetCurrentProcessToken() (a header inline, not exported): with no token the folder is expanded from this
+    // process's USERPROFILE, which the caller can set; the token resolves it from the user's own profile.
+    const CURRENT_PROCESS_TOKEN: windows_sys::Win32::Foundation::HANDLE = -4isize as _;
+    let mut raw: windows_sys::core::PWSTR = std::ptr::null_mut();
+    // SAFETY: a known folder id and the current process token pseudo-handle; `raw` is freed below on every path
+    // (CoTaskMemFree accepts null).
+    let hr = unsafe {
+        SHGetKnownFolderPath(
+            &FOLDERID_LocalAppData,
+            KF_FLAG_DEFAULT as _,
+            CURRENT_PROCESS_TOKEN,
+            &mut raw,
+        )
+    };
+    let path = (hr >= 0 && !raw.is_null()).then(|| {
+        // SAFETY: on success `raw` is a NUL-terminated wide string we own until the free.
+        let len = (0..).take_while(|&i| unsafe { *raw.add(i) } != 0).count();
+        PathBuf::from(std::ffi::OsString::from_wide(unsafe {
+            std::slice::from_raw_parts(raw, len)
+        }))
+    });
+    // SAFETY: `raw` came from SHGetKnownFolderPath (or is null) and is freed once.
+    unsafe { CoTaskMemFree(raw as *const _) };
+    match path.filter(|p| p.is_absolute()) {
+        Some(p) => Ok(p.join("mux-agents").join("locks")),
+        None => refuse(
+            1,
+            "state",
+            "the local application data folder cannot be read",
+        ),
+    }
+}
+
 const BACK_OFF: Duration = Duration::from_millis(10);
 
 /// Runs `f` holding the lock for `key` when one attempt takes it, never waiting: `None` when another holder has
@@ -1061,5 +1145,95 @@ mod tests {
             // SAFETY: the handle from above, closed once.
             unsafe { CloseHandle(keep as _) };
         }
+    }
+}
+
+#[cfg(test)]
+mod admission_tests {
+    use super::*;
+    use crate::{
+        ctx::Env,
+        testing::{Fakes, TempDir},
+    };
+    use std::path::PathBuf;
+
+    #[test]
+    fn admission_refuses_lock_past_lock_wait() {
+        let (tmp, ctx) = (TempDir::new(), Fakes::default().ctx());
+        let root = tmp.path().join("locks"); // missing: the helper makes it 0700
+        let e = admission_in(&ctx, &root, "up|t", LOCK_WAIT, || {
+            admission_in(&ctx, &root, "up|t", LOCK_WAIT, || Ok(()))
+        })
+        .unwrap_err();
+        assert_eq!((e.code, e.check), (2, "lock"));
+    }
+
+    #[test]
+    fn admission_is_per_user_whatever_the_profile_variables() {
+        let key = |d: &Path| format!("up|{}", d.display());
+        if let Some(dir) = std::env::var_os("MUX_AGENTS_ADMISSION_CHILD").map(PathBuf::from) {
+            return admission(&Fakes::default().ctx(), &key(&dir), || {
+                std::fs::write(dir.join("ready"), "")?;
+                while !dir.join("done").exists() {
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                Ok(())
+            })
+            .unwrap();
+        }
+        let d = TempDir::new();
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "state::lock::admission_tests::admission_is_per_user_whatever_the_profile_variables",
+            ])
+            .env("MUX_AGENTS_ADMISSION_CHILD", d.path())
+            .env("LOCALAPPDATA", d.path())
+            .env("USERPROFILE", d.path())
+            .env("HOME", d.path())
+            .spawn()
+            .unwrap();
+        let at = std::time::Instant::now();
+        while !d.path().join("ready").exists() {
+            assert!(at.elapsed() < Duration::from_secs(30));
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let e = admission_in(
+            &Fakes::default().ctx(),
+            &admission_root().unwrap(),
+            &key(d.path()),
+            Duration::ZERO,
+            || Ok(()),
+        )
+        .unwrap_err();
+        std::fs::write(d.path().join("done"), "").unwrap();
+        assert!(child.wait().unwrap().success());
+        assert_eq!(e.check, "lock");
+    }
+
+    #[cfg(feature = "test-panic")]
+    #[test]
+    fn a_panic_releases_the_admission_lock() {
+        let (tmp, mut ctx) = (TempDir::new(), Fakes::default().ctx());
+        let root = tmp.path().join("locks"); // missing: made 0700
+        ctx.env = Env::from_pairs([("MUX_AGENTS_TEST_PANIC", "lock")]);
+        assert!(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| admission_in(
+                &ctx,
+                &root,
+                "up|p",
+                LOCK_WAIT,
+                || Ok(())
+            )))
+            .is_err()
+        );
+        admission_in(
+            &Fakes::default().ctx(),
+            &root,
+            "up|p",
+            Duration::ZERO,
+            || Ok(()),
+        )
+        .unwrap();
     }
 }
