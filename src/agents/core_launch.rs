@@ -27,11 +27,12 @@ pub fn execute(
     clean: impl FnOnce(&Created) -> Res<bool>,
 ) -> Res<Value> {
     let core = hc::connect(ctx)?;
-    execute_connected(&core, prepare, attach, commit, clean)
+    execute_connected(&core, prepare, || Ok(()), attach, commit, clean)
 }
 pub fn execute_connected(
     core: &Core<'_>,
     prepare: impl FnOnce() -> Res<Prepared>,
+    debit: impl FnOnce() -> Res<()>,
     attach: impl FnOnce(&Core<'_>, &Prepared, &mut Option<Created>) -> Res<()>,
     commit: impl FnOnce(&Path) -> Res<()>,
     clean: impl FnOnce(&Created) -> Res<bool>,
@@ -69,18 +70,25 @@ pub fn execute_connected(
         labels.push(("mux.up", up));
     }
     let argv: Vec<&str> = p.argv.iter().map(String::as_str).collect();
-    let run = attempt(|| {
-        core.run(&Run {
+    // The run's whole input, built and checked before the token: a refusal here ran nothing and spends nothing.
+    let input = field(&p.record, "directory").and_then(|cwd| {
+        let input = Run {
             bg: true,
             keep: true,
             outlive_parent: true,
             no_notify: true,
             name: Some(&name),
             labels: &labels,
-            cwd: Some(field(&p.record, "directory")?),
+            cwd: Some(cwd),
             argv: &argv,
-        })
+        };
+        input.check().map(|()| input)
     });
+    let input = input.map_err(|e| super::spawn::abort_evidence(&p.folder, e))?;
+    // A member's budget token: the last step before `hc run`, after every check of the request and of the run's input,
+    // so a refusal before here spends nothing and only the run and the launch after it keep it (#103 D5).
+    debit().map_err(|e| super::spawn::abort_evidence(&p.folder, e))?;
+    let run = attempt(|| core.run(&input));
     let address = match run {
         Ok(a) => a,
         Err(mut e) => {
@@ -199,6 +207,7 @@ mod tests {
         execute_connected(
             &core,
             || Ok(prepared(&w)),
+            || Ok(()),
             |_, _, view| {
                 *view = Some(created());
                 Ok(())

@@ -8,7 +8,7 @@ use serde_json::{Map, Value, json};
 use super::mail::doing_line;
 use super::placement::{DEFAULT as DEFAULT_PLACEMENT, read_placement};
 use super::{copilot, lock, lock_key, registry, state_dir, text, usage};
-use crate::caller::{Caller, Kind, resolve};
+use crate::caller::{Caller, Kind};
 use crate::checks::{Context, Plan, assert_spawn_allowed, context_plan, session_id};
 use crate::cli::Request;
 use crate::ctx::Ctx;
@@ -26,15 +26,50 @@ const COPILOT_FLAGS: [&str; 2] = ["--no-sandbox", "--allow-all"];
 pub(crate) const CMDLINE_MAX: usize = 32767;
 const EXE_RESERVE: usize = 1024;
 const MODEL_MAX: usize = 64;
+const BRIEF: &str = "this agent starts brief-only, so an agent caller passes -BriefFile";
 const ENTRY: &str =
     "mux-agent entry path may hold only letters, digits, spaces and _ \\ / : . ( ) -";
 
 /// The launcher's flags before the client arguments.
+#[cfg(test)]
 pub(crate) fn client_flags(client: Client) -> &'static [&'static str] {
     match client {
         Client::Claude => &CLAUDE_FLAGS,
         Client::Copilot => &COPILOT_FLAGS,
     }
+}
+
+/// The launch flags: outside a team (`level` None) the 0.2 permission flags, else the level's (D6); then the effort
+/// (D9): Claude always `--effort` (high by default), Copilot `--reasoning-effort` only when asked.
+pub(crate) fn launch_flags(
+    client: Client,
+    level: Option<super::team::Policy>,
+    effort: Option<&str>,
+) -> Vec<String> {
+    let mut flags: Vec<String> = match (level, client) {
+        (None, Client::Claude) => vec![CLAUDE_FLAGS[0].into()],
+        (None, Client::Copilot) => COPILOT_FLAGS.iter().map(|f| f.to_string()).collect(),
+        (Some(level), _) => super::team::permission_flags(client, level),
+    };
+    match (client, effort) {
+        (Client::Claude, e) => flags.extend(["--effort".into(), e.unwrap_or("high").into()]),
+        (Client::Copilot, Some(e)) => flags.extend(["--reasoning-effort".into(), e.into()]),
+        (Client::Copilot, None) => {}
+    }
+    flags
+}
+/// `-Effort`, and whether the child starts brief (`-NoFork` or `-Context brief`); None for a bad value or for `fork`
+/// with `-NoFork`.
+pub(crate) fn options(request: &Request) -> Option<(Option<&str>, bool)> {
+    let (effort, context, no_fork) = (
+        request.value("Effort"),
+        request.value("Context"),
+        request.switch("NoFork"),
+    );
+    let ok = effort.is_none_or(|e| matches!(e, "low" | "medium" | "high"))
+        && context.is_none_or(|c| c == "fork" || c == "brief")
+        && !(context == Some("fork") && no_fork);
+    ok.then_some((effort, no_fork || context == Some("brief")))
 }
 
 pub(crate) fn client_name(client: Client) -> &'static str {
@@ -103,8 +138,24 @@ pub fn spawn(ctx: &Ctx, request: &Request) -> Res<Map<String, Value>> {
     {
         return Err(usage("spawn"));
     }
-    let caller = resolve(ctx)?;
-    registry::untagged(ctx, &caller, "an agent pane cannot spawn agents")?;
+    let Some((effort, no_fork)) = options(request) else {
+        return Err(usage("spawn"));
+    };
+    let caller = crate::caller::resolve_tree(ctx)?;
+    let outside = matches!(
+        super::tree::scope(ctx, &caller)?,
+        super::tree::Scope::Outside
+    );
+    if outside {
+        if caller.candidate.is_some() {
+            return Err(super::tree::tagged());
+        }
+        registry::untagged(ctx, &caller, "an agent pane cannot spawn agents")?;
+    } else {
+        lock(ctx, &lock_key("spawn", &caller, &caller.session), || {
+            super::tree::team_of(ctx, &caller)
+        })?;
+    }
     // Relative files are the caller's; the task travels on the client command line, so it stays at 16 KB.
     let task = match (request.value("Task"), request.value("TaskFile")) {
         (Some(_), _) if caller.kind == Kind::Agent => {
@@ -125,7 +176,7 @@ pub fn spawn(ctx: &Ctx, request: &Request) -> Res<Map<String, Value>> {
         .map(|file| read_text(&ctx.cwd.join(file), BRIEF_MAX))
         .transpose()?;
     // An agent caller passes C3, C2 and C5; its children start where it started.
-    let directory = if caller.kind == Kind::Agent && !ctx.admitted {
+    let directory = if caller.kind == Kind::Agent && !ctx.admitted && outside {
         assert_spawn_allowed(ctx, &caller)?
     } else {
         ctx.cwd.clone()
@@ -148,15 +199,46 @@ pub fn spawn(ctx: &Ctx, request: &Request) -> Res<Map<String, Value>> {
             brief: brief.as_deref(),
             directory: &directory,
             model,
-            no_fork: request.switch("NoFork"),
+            no_fork,
+            effort,
             split: (placement != DEFAULT_PLACEMENT).then_some(placement),
             resume: None,
             leader: None,
         },
         |core| {
+            let gate = match super::tree::team_of(ctx, &caller)? {
+                Some(t) => Some(super::tree::admit(
+                    ctx,
+                    &caller,
+                    &t,
+                    super::tree::standing(ctx, &caller, Some(core))?,
+                )?),
+                None if caller.candidate.is_some() => return Err(super::tree::tagged()),
+                None => None,
+            };
             let snapshot = super::membership::Snapshot::for_spawn(ctx, &caller, core)?;
             registry::reap_hc(ctx, &caller, &snapshot)?;
-            let name = snapshot.admit_name(request.value("Name"), client, &task)?;
+            // The brief rule as far as the request decides it: after the caller's standing (the gate), before the
+            // name and a member's debit (#103 D5: a refused request spends no token). allocate checks it again; only a
+            // Copilot fork whose copy fails verification turns brief there, after the debit, as a failed launch does.
+            if caller.kind == Kind::Agent
+                && brief.is_none()
+                && context_plan(&caller, client, &ctx.env, no_fork).context == Context::Brief
+            {
+                return refuse(2, "brief", BRIEF);
+            }
+            let placed = gate
+                .as_ref()
+                .map(|a| {
+                    super::tree::place(ctx, &caller, a, &snapshot, client, effort, || {
+                        snapshot.name_only(request.value("Name"), client, &task)
+                    })
+                })
+                .transpose()?;
+            let name = match &placed {
+                Some(p) => p.name.clone(),
+                None => snapshot.admit_name(request.value("Name"), client, &task)?,
+            };
             let mut used = [0usize; crate::paint::PALETTE.len()];
             for o in snapshot
                 .facts
@@ -177,6 +259,8 @@ pub fn spawn(ctx: &Ctx, request: &Request) -> Res<Map<String, Value>> {
             Ok(CoreSlot {
                 name,
                 color: crate::paint::PALETTE[i],
+                placed,
+                debit: gate.as_ref().is_some_and(|a| a.member),
             })
         },
     )?;
@@ -237,9 +321,11 @@ struct Launch<'a> {
     // None: the client's own default.
     model: Option<&'a str>,
     no_fork: bool,
+    flags: Vec<String>,
     task: String,
     brief: Option<String>,
     directory: PathBuf,
+    placed: Option<super::tree::Placed>,
 }
 
 /// The agent being started.
@@ -271,11 +357,7 @@ impl Launch<'_> {
         }
         // A verified fork copy is retained as transaction evidence if a later step fails.
         if plan.context == Context::Brief && caller.kind == Kind::Agent && self.brief.is_none() {
-            return refuse(
-                2,
-                "brief",
-                "this agent starts brief-only, so an agent caller passes -BriefFile",
-            );
+            return refuse(2, "brief", BRIEF);
         }
         Ok(Agent {
             folder: state.join("agents").join(&id),
@@ -312,6 +394,11 @@ impl Launch<'_> {
             "session": caller.session, "pane": new_pane, "window": window, "parentPane": caller.pane,
             "parentAgent": parent_agent, "directory": utf8(&self.directory)?,
             "taskLine": doing_line(&self.task), "createdAt": utc_o(ctx.clock.now())});
+        if let Some(p) = &self.placed {
+            record["parentAgent"] = p.parent.clone();
+            record["parentPane"] = p.parent_pane.clone().into();
+            record["depth"] = p.depth.into();
+        }
         record["color"] = agent.color.into();
         // The exact command the pane started, as the multiplexer renders it: the agent is the pane running it (#48).
         record["startCommand"] = start_command.into();
@@ -349,7 +436,7 @@ impl Launch<'_> {
             Context::Brief => Recipe::First(Some(&prompt)),
         };
         let args = client_args(self.client, recipe, &agent.session, self.model);
-        let mut argv: Vec<&str> = client_flags(self.client).to_vec();
+        let mut argv: Vec<&str> = self.flags.iter().map(String::as_str).collect();
         argv.extend(args.iter().map(String::as_str));
         if EXE_RESERVE + cmdline_length(&argv) > CMDLINE_MAX {
             return refuse(2, "usage", "task is too long for the client command line");
@@ -367,8 +454,8 @@ impl Launch<'_> {
         write_json(
             &spec,
             &json!({"schema": 1, "stateDirectory": utf8(state)?, "id": agent.id,
-                "client": client_name(self.client), "flags": client_flags(self.client),
-                "parentPane": self.caller.pane, "args": args,
+                "client": client_name(self.client), "flags": self.flags,
+                "parentPane": self.placed.as_ref().map_or(self.caller.pane.as_str(), |p| p.parent_pane.as_str()), "args": args,
                 "prompt": prompt}),
         )?;
         Ok(spec)
@@ -731,9 +818,11 @@ mod tests {
             client: Client::Claude,
             model: Some("sonnet"),
             no_fork: true,
+            flags: launch_flags(Client::Claude, None, None),
             task: "task".into(),
             brief: None,
             directory: w.ctx.cwd.clone(),
+            placed: None,
         };
         let a = launch
             .allocate(&w.state(), "worker".into(), "blue")
@@ -858,6 +947,7 @@ mod tests {
                 directory: &w.ctx.cwd,
                 model,
                 no_fork: false,
+                effort: None,
                 split: None,
                 resume: None,
                 leader: None,
@@ -866,6 +956,8 @@ mod tests {
                 Ok(CoreSlot {
                     name: "hi".into(),
                     color: "blue",
+                    placed: None,
+                    debit: false,
                 })
             },
         );
@@ -1699,7 +1791,11 @@ mod tests {
                 &["-Task", "add subtract"][..],
                 &["-Task", "hi", "-Name", "w"],
             ] {
-                cf::online(&w); // Local validation precedes ls.
+                // Local validation precedes ls. A record that cannot be read as JSON already refuses in the team
+                // scope check, before hc is connected (#103 D2, fail closed).
+                if case != "not JSON" && case != "unreadable" {
+                    cf::online(&w);
+                }
                 let mut full = vec!["-Client", "claude"];
                 full.extend(args);
                 let got = run(&w, &full);
@@ -3602,6 +3698,215 @@ mod tests {
             w.fakes.hc_done().unwrap();
         }
     }
+    #[test]
+    fn effort_and_context_options() {
+        use crate::agents::team::Policy;
+        let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        assert_eq!(launch_flags(Client::Claude, None, None), s(&CLAUDE_FLAGS));
+        assert_eq!(launch_flags(Client::Copilot, None, None), s(&COPILOT_FLAGS));
+        assert_eq!(
+            launch_flags(Client::Claude, None, Some("low")),
+            s(&["--dangerously-skip-permissions", "--effort", "low"])
+        );
+        assert_eq!(
+            launch_flags(Client::Copilot, None, Some("medium")),
+            s(&[
+                "--no-sandbox",
+                "--allow-all",
+                "--reasoning-effort",
+                "medium"
+            ])
+        );
+        assert_eq!(
+            launch_flags(Client::Claude, Some(Policy::Default), None),
+            s(&["--effort", "high"])
+        );
+        assert_eq!(
+            launch_flags(Client::Copilot, Some(Policy::Default), Some("low")),
+            s(&["--reasoning-effort", "low"])
+        );
+        let w = human();
+        let opts = |args: &[&str]| {
+            let mut all = vec!["spawn", "-Client", "claude", "-Task", "t"];
+            all.extend(args);
+            options(&w.request(&all)).map(|(e, f)| (e.map(String::from), f))
+        };
+        assert_eq!(opts(&[]), Some((None, false)));
+        assert_eq!(
+            opts(&["-Context", "brief", "-Effort", "low"]),
+            Some((Some("low".into()), true))
+        );
+        assert_eq!(opts(&["-Context", "fork"]), Some((None, false)));
+        assert_eq!(opts(&["-NoFork"]), Some((None, true)));
+        for bad in [
+            &["-Effort", "max"][..],
+            &["-Context", "both"],
+            &["-Context", "fork", "-NoFork"],
+        ] {
+            assert_eq!(opts(bad), None, "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn public_spawn_argv_per_client_and_context() {
+        for (client, extra, flags, reason) in [
+            (
+                "claude",
+                &["-Context", "fork"][..],
+                json!(["--dangerously-skip-permissions", "--effort", "high"]),
+                "human",
+            ),
+            (
+                "claude",
+                &["-Context", "brief", "-Effort", "low"],
+                json!(["--dangerously-skip-permissions", "--effort", "low"]),
+                "no-fork",
+            ),
+            (
+                "copilot",
+                &["-Context", "fork"],
+                json!(["--no-sandbox", "--allow-all"]),
+                "human",
+            ),
+            (
+                "copilot",
+                &["-Context", "brief", "-Effort", "medium"],
+                json!([
+                    "--no-sandbox",
+                    "--allow-all",
+                    "--reasoning-effort",
+                    "medium"
+                ]),
+                "no-fork",
+            ),
+        ] {
+            let w = hc_world(human());
+            crate::agents::core_fixture::online(&w);
+            crate::agents::core_fixture::listing(
+                &w,
+                &crate::agents::membership::team(&w.caller()),
+                &[],
+            );
+            w.fakes.hc_answer(Ok(crate::spawn::Out {
+                stdout: r#"{"address":"t1"}"#.into(),
+                ..Default::default()
+            }));
+            let mut args = vec!["spawn", "-Client", client, "-Task", "hi"];
+            args.extend(extra);
+            let r = spawn(&w.ctx, &w.request(&args)).unwrap();
+            let spec = read_json(&agents_dir(&w).join(&agent_folders(&w)[0]).join("spec.json"));
+            assert_eq!(
+                (&spec["flags"], &r["reason"]),
+                (&flags, &json!(reason)),
+                "{client} {extra:?}"
+            );
+        }
+        for bad in [
+            &["-Effort", "max"][..],
+            &["-Context", "both"],
+            &["-Context", "fork", "-NoFork"],
+        ] {
+            let w = human();
+            let mut args = vec!["spawn", "-Client", "claude", "-Task", "t"];
+            args.extend(bad);
+            let (code, out) = crate::cli::run(
+                &args.iter().map(|a| a.to_string()).collect::<Vec<_>>(),
+                || Ok(&w.ctx),
+            );
+            assert_eq!(
+                (code, out.contains(r#""check":"usage""#)),
+                (2, true),
+                "{bad:?}: {out}"
+            );
+            assert!(
+                !w.fakes.mux_calls().iter().any(|c| c[1] == "new-window"),
+                "{bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn public_spawn_forks_for_an_eligible_same_client_agent() {
+        for client in [Client::Claude, Client::Copilot] {
+            let name = client_name(client);
+            let (w, _) = admitted(client, true);
+            empty_launch(&w);
+            let r = reply(&run(
+                &w,
+                &[
+                    "-Client",
+                    name,
+                    "-TaskFile",
+                    "t.md",
+                    "-BriefFile",
+                    "b.md",
+                    "-Context",
+                    "fork",
+                ],
+            ));
+            assert_eq!(
+                (&r["context"], &r["reason"]),
+                (&json!("fork"), &json!("same-client")),
+                "{name}"
+            );
+            let new = r["sessionId"].as_str().unwrap().to_string();
+            assert!(
+                session_id(&new) && new != OLD,
+                "{name}: a fresh generated session"
+            );
+            let spec = read_json(&agents_dir(&w).join(&agent_folders(&w)[0]).join("spec.json"));
+            let args: Vec<String> = serde_json::from_value(spec["args"].clone()).unwrap();
+            match client {
+                Client::Claude => assert_eq!(
+                    args[..5],
+                    [
+                        "--resume",
+                        OLD,
+                        "--fork-session",
+                        "--session-id",
+                        new.as_str()
+                    ]
+                ),
+                Client::Copilot => {
+                    assert_eq!(
+                        args[..2],
+                        ["--resume", new.as_str()],
+                        "copilot resumes its own verified copy"
+                    );
+                    assert!(
+                        session_folder(&w.ctx.home, &new).is_dir(),
+                        "the copy exists"
+                    );
+                }
+            }
+            // Brief mode: no parent session in the args, and the reply says why.
+            let (w, _) = admitted(client, true);
+            empty_launch(&w);
+            let r = reply(&run(
+                &w,
+                &[
+                    "-Client",
+                    name,
+                    "-TaskFile",
+                    "t.md",
+                    "-BriefFile",
+                    "b.md",
+                    "-Context",
+                    "brief",
+                ],
+            ));
+            assert_eq!(
+                (&r["context"], &r["reason"]),
+                (&json!("brief"), &json!("no-fork")),
+                "{name}"
+            );
+            let spec = read_json(&agents_dir(&w).join(&agent_folders(&w)[0]).join("spec.json"));
+            assert!(
+                !spec["args"].as_array().unwrap().iter().any(|a| a == OLD),
+                "{name}: brief never names the parent"
+            );
+        }
+    }
 }
 
 #[cfg(test)]
@@ -3614,6 +3919,7 @@ pub struct CoreRequest<'a> {
     pub directory: &'a Path,
     pub model: Option<&'a str>,
     pub no_fork: bool,
+    pub effort: Option<&'a str>,
     pub split: Option<&'a str>,
     /// Some for a resume: the new member continues an ended one's conversation instead of starting a task.
     pub resume: Option<&'a Resumed>,
@@ -3623,6 +3929,9 @@ pub struct CoreRequest<'a> {
 pub struct CoreSlot {
     pub name: String,
     pub color: &'static str,
+    pub placed: Option<super::tree::Placed>,
+    /// A member's child or resume: the launch takes one budget token as its last step before `hc run` (D5).
+    pub debit: bool,
 }
 /// What a resume carries from the ended member X into its successor: X's id, its record (name, client, session,
 /// directory, parent, depth, mailbox) and the client flags its launch spec recorded.
@@ -3651,7 +3960,9 @@ pub fn launch_hc_locked(
     request: CoreRequest<'_>,
     reserve: impl FnOnce(&crate::hc::Core<'_>) -> Res<CoreSlot>,
 ) -> Res<Value> {
-    let slot = reserve(core)?;
+    let mut slot = reserve(core)?;
+    let placed = slot.placed.take();
+    let debit = slot.debit;
     let launch = Launch {
         ctx,
         caller,
@@ -3660,7 +3971,15 @@ pub fn launch_hc_locked(
         no_fork: request.no_fork,
         task: request.task.into(),
         brief: request.brief.map(str::to_owned),
-        directory: request.directory.into(),
+        flags: placed.as_ref().map_or_else(
+            || launch_flags(request.client, None, request.effort),
+            |p| p.flags.clone(),
+        ),
+        directory: placed
+            .as_ref()
+            .and_then(|p| p.directory.as_deref())
+            .map_or_else(|| request.directory.into(), PathBuf::from),
+        placed,
     };
     super::core_launch::execute_connected(
         core,
@@ -3670,6 +3989,17 @@ pub fn launch_hc_locked(
                 super::leader::prepare(ctx, caller, request.client, request.directory, slot, leader)
             }
             (None, None) => launch.prepare_hc(slot),
+        },
+        || {
+            if !debit {
+                return Ok(());
+            }
+            let file = super::budget::path(&super::server_dir(ctx, caller), &caller.session);
+            super::budget::spend(
+                &file,
+                &super::budget::rate(ctx, caller),
+                super::budget::now_secs(ctx),
+            )
         },
         |core, p, view| {
             // MUX_AGENTS_TEST_PANIC=launch panics after `hc run`, inside the rollback scope (live `up` test).

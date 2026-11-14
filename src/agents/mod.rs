@@ -10,6 +10,7 @@ use crate::error::{Refusal, Res};
 
 pub mod attachment;
 pub mod board;
+pub mod budget;
 pub mod copilot;
 pub mod core_facts;
 #[cfg(test)]
@@ -29,6 +30,7 @@ pub mod spawn;
 #[cfg(test)]
 mod stop_hc_tests;
 pub mod team;
+pub mod tree;
 pub mod up;
 pub mod view;
 #[cfg(test)]

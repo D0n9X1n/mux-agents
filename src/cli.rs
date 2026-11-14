@@ -63,11 +63,13 @@ pub static VERBS: &[VerbDef] = &[
             "Name",
             "Model",
             "Split",
+            "Context",
+            "Effort",
         ],
         switches: &["NoFork", "Tab"],
         min: 0,
         max: 0,
-        usage: "usage: mux-agent spawn -Client <claude|copilot> [-Task <text>] [-TaskFile <path>] [-BriefFile <path>] [-Name <name>] [-Model <model>] [-Split <value>] [-Tab] [-NoFork] [-Text]",
+        usage: "usage: mux-agent spawn -Client <claude|copilot> [-Task <text>] [-TaskFile <path>] [-BriefFile <path>] [-Name <name>] [-Model <model>] [-Split <value>] [-Tab] [-NoFork] [-Context <fork|brief>] [-Effort <low|medium|high>] [-Text]",
         handler: crate::agents::spawn::spawn,
         text: crate::agents::spawn::spawn_text,
     },
@@ -327,7 +329,10 @@ fn dispatch(def: &VerbDef, request: &Request, ctx: &Ctx) -> Res<Map<String, Valu
     }
     // Non-mux herdr terminals stand down; committed mux workers use their member identity.
     if crate::caller::hc::applies(ctx) {
-        crate::caller::hc::resolve(ctx)?;
+        let caller = crate::caller::hc::resolve(ctx)?;
+        if caller.candidate.is_some() && !crate::agents::tree::candidate_verb(def.name, request) {
+            return Err(crate::agents::tree::tagged());
+        }
     }
     // Every public verb refuses a sandboxed caller before any multiplexer call (MuxAgents.ps1:94).
     crate::sandbox::assert_unsandboxed(ctx)?;

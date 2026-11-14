@@ -11,6 +11,7 @@
 #[path = "support/private_core.rs"]
 mod private_core;
 
+use std::collections::HashMap;
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -789,4 +790,107 @@ fn up_whose_launch_panics_leaves_no_session_under_hostile_settings() {
         .count()
         == 1));
     assert!(!marker.exists());
+}
+
+/// `file` of member `id`, under whichever server folder of the state root holds it.
+fn member_file(live: &Live, id: &str, file: &str) -> Value {
+    let state = live.dir.join("state");
+    let path = std::fs::read_dir(&state)
+        .unwrap()
+        .map(|e| e.unwrap().path().join("agents").join(id).join(file))
+        .find(|p| p.is_file())
+        .unwrap();
+    serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap()
+}
+/// mux-agent run by member `id`'s fake client (found by its record's session); its reply.
+fn by(live: &Live, sent: &mut HashMap<u32, usize>, id: &str, args: &[&str]) -> Value {
+    let session = member_file(live, id, "record.json")["sessionId"].clone();
+    let pid: u32 = live.wait("member client", || {
+        std::fs::read_to_string(live.dir.join("clients.log"))
+            .ok()?
+            .lines()
+            .find_map(|p| {
+                let r: Value = serde_json::from_str(
+                    &std::fs::read_to_string(live.dir.join(format!("client.{p}.json"))).ok()?,
+                )
+                .ok()?;
+                (r["sessionId"] == session)
+                    .then(|| p.parse().ok())
+                    .flatten()
+            })
+    });
+    let n = sent.entry(pid).or_default();
+    *n += 1;
+    let held = live.dir.join(format!("cmd.{pid}.part"));
+    std::fs::write(&held, format!("{}\n", args.join("\t"))).unwrap();
+    std::fs::rename(held, live.dir.join(format!("cmd.{pid}"))).unwrap();
+    let reply = live.dir.join(format!("reply.{pid}.{n}.json"));
+    serde_json::from_str(&live.wait("member reply", || std::fs::read_to_string(&reply).ok()))
+        .unwrap()
+}
+#[test]
+fn members_spawn_and_act_only_down_the_tree() {
+    let Some(live) = Live::start() else { return };
+    let (task, brief) = (live.dir.join("task.txt"), live.dir.join("brief.md"));
+    std::fs::write(&task, "say hi").unwrap();
+    std::fs::write(&brief, "brief").unwrap();
+    let (task, brief) = (task.display().to_string(), brief.display().to_string());
+    let leader = s(&live.run(&["up", "-Client", "claude"])["leader"]["id"]);
+    let mut sent = HashMap::new();
+    let spawn = |sent: &mut HashMap<u32, usize>, who: &str, name: &str| {
+        by(
+            &live,
+            sent,
+            who,
+            &[
+                "spawn",
+                "-Client",
+                "claude",
+                "-TaskFile",
+                &task,
+                "-BriefFile",
+                &brief,
+                "-Context",
+                "brief",
+                "-Name",
+                name,
+            ],
+        )
+    };
+    let ok = |sent: &mut HashMap<u32, usize>, who: &str, name: &str| {
+        let r = spawn(sent, who, name);
+        assert_eq!(r["ok"], true, "{name}: {r}");
+        s(&r["id"])
+    };
+    let c1 = ok(&mut sent, &leader, "c1");
+    let flags = member_file(&live, &c1, "spec.json")["flags"].clone();
+    assert!(
+        !flags
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|f| f == "--dangerously-skip-permissions"),
+        "no bypass: {flags}"
+    );
+    let c2 = ok(&mut sent, &leader, "c2");
+    let g1 = ok(&mut sent, &c1, "g1");
+    let h1 = ok(&mut sent, &g1, "h1");
+    assert_eq!(member_file(&live, &h1, "record.json")["depth"], 3);
+    assert_eq!(spawn(&mut sent, &h1, "x")["check"], "depth");
+    for verb in ["stop", "read"] {
+        assert_eq!(
+            by(&live, &mut sent, &c2, &[verb, "c1"])["check"],
+            "authority",
+            "a sibling's {verb}"
+        );
+    }
+    assert_eq!(
+        by(&live, &mut sent, &leader, &["stop", "g1"])["ok"],
+        true,
+        "the leader stops a grandchild"
+    );
+    for name in ["c3", "c4", "c5"] {
+        ok(&mut sent, &leader, name);
+    }
+    assert_eq!(spawn(&mut sent, &leader, "c6")["check"], "limit");
 }

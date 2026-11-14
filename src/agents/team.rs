@@ -217,6 +217,17 @@ pub fn policy(client: Client, flags: &[String]) -> Policy {
     }
 }
 
+/// The flags that give `client` the highest level it can express at or below `level` (D6): Claude has no allow-all, so
+/// it falls to Default; Copilot has no bypass, so it takes allow-all.
+pub fn permission_flags(client: Client, level: Policy) -> Vec<String> {
+    let flags: &[&str] = match (client, level) {
+        (Client::Claude, Policy::Bypass) => &["--dangerously-skip-permissions"],
+        (Client::Copilot, Policy::AllowAll | Policy::Bypass) => &["--allow-all", "--no-sandbox"],
+        _ => &[],
+    };
+    flags.iter().map(|f| f.to_string()).collect()
+}
+
 /// Whether a child launched with `child` stays within `ceiling`.
 pub fn within(ceiling: Policy, child: Policy) -> bool {
     child <= ceiling
@@ -525,5 +536,31 @@ mod tests {
         assert_eq!(read(&file).unwrap(), Some(team));
         std::fs::write(&file, r#"{"schema":1,"team":"t","session":"$7","directory":"/p","client":"claude","flags":[],"policy":"default","leader":"aaaaaaaaaaaa","createdAt":"x"}"#).unwrap();
         assert!(read(&file).is_err());
+    }
+
+    #[test]
+    fn a_child_gets_the_highest_level_its_client_expresses() {
+        use Client::{Claude, Copilot};
+        let none: Vec<String> = Vec::new();
+        assert_eq!(permission_flags(Claude, Policy::Default), none);
+        assert_eq!(permission_flags(Claude, Policy::AllowAll), none);
+        assert_eq!(
+            permission_flags(Claude, Policy::Bypass),
+            v(&["--dangerously-skip-permissions"])
+        );
+        assert_eq!(permission_flags(Copilot, Policy::Default), none);
+        assert_eq!(
+            permission_flags(Copilot, Policy::AllowAll),
+            v(&["--allow-all", "--no-sandbox"])
+        );
+        assert_eq!(
+            permission_flags(Copilot, Policy::Bypass),
+            v(&["--allow-all", "--no-sandbox"])
+        );
+        for c in [Claude, Copilot] {
+            for p in [Policy::Default, Policy::AllowAll, Policy::Bypass] {
+                assert!(within(p, policy(c, &permission_flags(c, p))), "{p:?}");
+            }
+        }
     }
 }

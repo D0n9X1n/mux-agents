@@ -40,6 +40,8 @@ pub struct Caller {
     /// The member id proven through the caller's own hc terminal (its `mux.id`, labels, generation and life), none
     /// for a caller proven by its pane. Such a member is itself whichever pane shows it (#104 phase 1c).
     pub member: Option<String>,
+    /// A terminal identity whose D1 proof failed: never `member`; only `resolve_tree` returns it.
+    pub candidate: Option<String>,
 }
 
 const PROBE: &str = "#{pid}|#{pane_pid}|#{session_id}|#{window_id}|#{@agent-id}";
@@ -113,11 +115,26 @@ fn caller_refusal(code: u8, message: &str) -> Refusal {
     }
 }
 
+/// Every verb but the tree verbs, on every resolution: a candidate refuses 2 `tagged`, so no handler ever falls back to
+/// pane identity for it (view.rs `own_agent`, mailbox reads).
+pub fn resolve(ctx: &Ctx) -> Res<Caller> {
+    resolve_as(ctx, false)
+}
+
 /// Refuses 1 `endpoint` for an unusable endpoint, pane or probe, 1 `caller` when the caller is not below its pane
 /// or its agent's start is unreadable or changed, and 2 `caller` for a non-shell in between.
-pub fn resolve(ctx: &Ctx) -> Res<Caller> {
+pub fn resolve_tree(ctx: &Ctx) -> Res<Caller> {
+    resolve_as(ctx, true)
+}
+
+/// `tree`: a candidate is returned for the tree verbs to prove again under the team lock; otherwise it refuses 2
+/// `tagged` before any multiplexer is made or called.
+fn resolve_as(ctx: &Ctx, tree: bool) -> Res<Caller> {
     if hc::applies(ctx) {
         let c = hc::resolve(ctx)?;
+        if c.candidate.is_some() && !tree {
+            return Err(crate::agents::tree::tagged());
+        }
         if ctx.mux.borrow().is_none() {
             let mux = crate::mux::RealMux::for_member(
                 ctx,
@@ -216,6 +233,7 @@ pub fn resolve(ctx: &Ctx) -> Res<Caller> {
         server_key,
         agent_tag: probe.tag.to_string(),
         member: None,
+        candidate: None,
     })
 }
 

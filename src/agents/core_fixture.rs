@@ -59,6 +59,21 @@ pub fn member(w: &World, id: &str, fields: Value) -> Value {
         .unwrap()
 }
 
+/// Member `id`'s D1 evidence: launcher.json (L `l` started 1000, C `c` started 1500) and its recorded flags.
+pub fn proven(w: &World, id: &str, l: u32, c: u32) {
+    let f = w.folder(id);
+    crate::state::fs::write_json(
+        &f.join("launcher.json"),
+        &json!({"pid": l, "start": 1000, "client": {"pid": c, "start": 1500}}),
+    )
+    .unwrap();
+    crate::state::fs::write_json(
+        &f.join("spec.json"),
+        &json!({"flags": ["--effort", "high"]}),
+    )
+    .unwrap();
+}
+
 pub fn wire(r: &Value) -> Value {
     json!({"address":r["hcAddress"],"state":"live","argv":r["launcherArgv"],"labels":{
         "mux.managed":"1","mux.team":r["team"],"mux.id":r["id"],"mux.gen":r["generation"],"mux.name":r["name"]}})

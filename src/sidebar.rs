@@ -1923,6 +1923,7 @@ fn peek(ctx: &Ctx, caller: &Caller, target: &Target) -> Res<()> {
         &target.name,
         (!target.pane.is_empty()).then_some(target.pane.as_str()),
         PEEK_LINES,
+        None,
     )?;
     let file = folder.join(format!(
         "peek-{}.txt",

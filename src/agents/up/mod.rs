@@ -122,6 +122,7 @@ fn create(ctx: &Ctx, caller: &Caller, core: &Core<'_>, plan: &Plan<'_>) -> Res<M
         client: None,
         agent: None,
         member: None,
+        candidate: None,
         chain: Vec::new(),
         pane: String::new(),
         window: window.clone(),
@@ -156,6 +157,7 @@ fn create(ctx: &Ctx, caller: &Caller, core: &Core<'_>, plan: &Plan<'_>) -> Res<M
             directory: plan.folder,
             model: None,
             no_fork: true,
+            effort: None,
             split: None,
             resume: None,
             leader: Some(&leader),
@@ -164,6 +166,8 @@ fn create(ctx: &Ctx, caller: &Caller, core: &Core<'_>, plan: &Plan<'_>) -> Res<M
             Ok(CoreSlot {
                 name: "leader".into(),
                 color: crate::paint::identity(None, "leader"),
+                placed: None,
+                debit: false,
             })
         })
     })

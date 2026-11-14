@@ -16,6 +16,7 @@ fn worker() -> (World, caller::Caller, Value, std::path::PathBuf) {
         json!({"startCommand":crate::agents::fixture::launch_command("%9")}),
     );
     let folder = w.folder(ID);
+    cf::proven(&w, ID, 31337, 150);
     crate::state::fs::write_json(
         &w.state().join("server.json"),
         &json!({"socket":c.socket,"serverPid":c.server_pid,"serverStart":c.server_start}),
@@ -33,6 +34,7 @@ fn worker() -> (World, caller::Caller, Value, std::path::PathBuf) {
 fn wire(r: &Value) -> Value {
     let mut t = cf::wire(r);
     t["pid"] = 31337.into();
+    t["foreground"] = json!({"argv": ["claude"], "pid": 150});
     t
 }
 fn proof(w: &World, r: &Value) {
@@ -80,10 +82,6 @@ fn hc_worker_routes_without_mux_ancestry() {
 #[test]
 fn hc_worker_rejects_unproven_identity_before_mux() {
     for case in [
-        "unrelated",
-        "missing-pid",
-        "reused-pid",
-        "broken-chain",
         "managed",
         "team",
         "id",
@@ -116,18 +114,6 @@ fn hc_worker_rejects_unproven_identity_before_mux() {
         let mut t = wire(&r);
         let mut record = r.clone();
         match case {
-            "unrelated" => {
-                t["pid"] = 31338.into();
-                w.fakes.process(crate::testing::row(31338, 1, 900));
-            }
-            "missing-pid" => {
-                t.as_object_mut().unwrap().remove("pid");
-            }
-            "reused-pid" => {
-                w.fakes.forget(31337);
-                w.fakes.process(crate::testing::row(31337, 1, 1600));
-            }
-            "broken-chain" => w.fakes.forget(170),
             "managed" => t["labels"]["mux.managed"] = "0".into(),
             "team" => t["labels"]["mux.team"] = "0000000000000000:$9".into(),
             "id" => t["labels"]["mux.id"] = "bbbbbbbbbbbb".into(),
@@ -365,7 +351,8 @@ fn link(target: &std::path::Path, at: &std::path::Path) -> std::io::Result<()> {
 // file outside the canonical state root (#104 phase 1c).
 #[test]
 fn hc_worker_proof_reads_nothing_outside_the_state_root() {
-    // The seam sees the proof's reads: a proven worker opens its commit, its record and its server's file.
+    // The seam sees the proof's reads: a proven worker opens its commit, its record and its server's file, then the
+    // member proof (D1, #103) its launcher.json and spec.json; the record is read once.
     let (w, _, r, _) = worker();
     proof(&w, &r);
     let (got, reads) = crate::state::fs::record_reads(|| caller::resolve(&w.ctx));
@@ -375,7 +362,16 @@ fn hc_worker_proof_reads_nothing_outside_the_state_root() {
         .iter()
         .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
         .collect();
-    assert_eq!(names, ["commit.json", "record.json", "server.json"]);
+    assert_eq!(
+        names,
+        [
+            "commit.json",
+            "record.json",
+            "server.json",
+            "launcher.json",
+            "spec.json"
+        ]
+    );
     for p in &reads {
         assert!(real(p).is_some_and(|p| p.starts_with(&root)), "{p:?}");
     }
@@ -390,6 +386,8 @@ fn hc_worker_proof_reads_nothing_outside_the_state_root() {
         "linked-commit",
         "linked-record",
         "linked-server",
+        "linked-launcher",
+        "linked-spec",
     ] {
         let (w, _, r, folder) = worker();
         let outside = w._dir.path().join("outside");
@@ -425,6 +423,8 @@ fn hc_worker_proof_reads_nothing_outside_the_state_root() {
             "linked-commit" => moved(&folder.join("commit.json")),
             "linked-record" => moved(&folder.join("record.json")),
             "linked-server" => moved(&team.join("server.json")),
+            "linked-launcher" => moved(&folder.join("launcher.json")),
+            "linked-spec" => moved(&folder.join("spec.json")),
             _ => unreachable!(),
         };
         if let Err(e) = made {
@@ -443,8 +443,176 @@ fn hc_worker_proof_reads_nothing_outside_the_state_root() {
             );
         }
         let e = got.unwrap_err();
-        assert_eq!((e.code, e.check), (2, "herdr"), "{case}: {e:?}");
+        // The member proof's files: the terminal identity holds, so a link there leaves a candidate, refused 2 `tagged`.
+        let check = if case == "linked-launcher" || case == "linked-spec" {
+            "tagged"
+        } else {
+            "herdr"
+        };
+        assert_eq!((e.code, e.check), (2, check), "{case}: {e:?}");
         assert!(w.fakes.mux_calls().is_empty(), "{case}");
+        w.fakes.hc_done().unwrap();
+    }
+}
+/// A terminal identity whose proof fails is a candidate: never `member`, and `caller::resolve` refuses it.
+#[test]
+fn a_failed_proof_is_a_candidate() {
+    for case in [
+        "unrelated",
+        "missing-pid",
+        "reused-pid",
+        "broken-chain",
+        "no-foreground",
+        "nested",
+    ] {
+        let (w, _, r, _) = worker();
+        let mut t = wire(&r);
+        match case {
+            "unrelated" => {
+                t["pid"] = 31338.into();
+                w.fakes.process(crate::testing::row(31338, 1, 900));
+            }
+            "missing-pid" => {
+                t.as_object_mut().unwrap().remove("pid");
+            }
+            "reused-pid" => {
+                w.fakes.forget(31337);
+                w.fakes.process(crate::testing::row(31337, 1, 1600));
+            }
+            "broken-chain" => w.fakes.forget(170),
+            "no-foreground" => {
+                t.as_object_mut().unwrap().remove("foreground");
+            }
+            _ => nest(&w),
+        }
+        for _ in 0..2 {
+            cf::online(&w);
+            cf::get(&w, r["hcAddress"].as_str().unwrap(), t.clone());
+        }
+        let got = caller::resolve_tree(&w.ctx).expect(case);
+        assert_eq!(
+            (got.member, got.candidate.as_deref()),
+            (None, Some(ID)),
+            "{case}"
+        );
+        assert_eq!(
+            caller::resolve(&w.ctx).unwrap_err().check,
+            "tagged",
+            "{case}"
+        );
+        w.fakes.hc_done().unwrap();
+    }
+}
+/// A second client (160) between the shell and C: the walk to L succeeds, the proof does not.
+fn nest(w: &World) {
+    w.fakes.forget(170);
+    w.fakes.process(crate::testing::row(170, 160, 1700));
+    w.fakes.process(crate::testing::row(160, 150, 1600));
+    w.fakes.client(160, crate::parse::Client::Claude);
+}
+/// Through the CLI: a nested client, and ancestry that becomes unreadable between dispatch and handler, neither writes
+/// as the member nor reads its mailbox; a foreign herdr terminal stays 2 `herdr`.
+#[test]
+fn a_candidate_never_acts_as_a_member() {
+    for (case, verb) in [
+        ("nested", "report"),
+        ("nested", "read"),
+        ("race", "report"),
+        ("race", "read"),
+        ("foreign", "read"),
+    ] {
+        let (w, c, r, folder) = worker();
+        crate::agents::mail::add_mail(&w.ctx, &c, ID, "root", "%1", "hello", None).unwrap();
+        let (a, mut t) = (r["hcAddress"].as_str().unwrap().to_string(), wire(&r));
+        match case {
+            "nested" => nest(&w),
+            "foreign" => t["labels"]["mux.managed"] = "0".into(),
+            _ => {
+                cf::online(&w);
+                cf::get(&w, &a, t.clone());
+                t["pid"] = 31338.into();
+                w.fakes.process(crate::testing::row(31338, 1, 900));
+            }
+        }
+        cf::online(&w);
+        cf::get(&w, &a, t);
+        let args: Vec<String> = if verb == "report" {
+            vec!["report".into(), "blocked".into()]
+        } else {
+            vec!["read".into()]
+        };
+        let (code, out) = crate::cli::run(&args, || Ok(&w.ctx));
+        let check = if case == "foreign" { "herdr" } else { "tagged" };
+        assert_eq!(
+            (code, out.contains(&format!(r#""check":"{check}""#))),
+            (2, true),
+            "{case} {verb}: {out}"
+        );
+        assert!(
+            !folder.join("activity.json").exists(),
+            "{case} {verb}: no member write"
+        );
+        assert_eq!(
+            crate::agents::mail::read_mail(&w.ctx, &c, ID)
+                .unwrap()
+                .len(),
+            1,
+            "{case} {verb}: mailbox unread"
+        );
+        w.fakes.hc_done().unwrap();
+    }
+}
+/// Production has no multiplexer until the caller is resolved: a candidate refuses 2 `tagged` before any is made, so it
+/// never sees an endpoint error and no multiplexer runs.
+#[test]
+fn a_candidate_is_refused_before_any_multiplexer() {
+    for verb in ["report", "read"] {
+        let (w, c, r, folder) = worker();
+        crate::agents::mail::add_mail(&w.ctx, &c, ID, "root", "%1", "hello", None).unwrap();
+        let (a, mut t) = (r["hcAddress"].as_str().unwrap().to_string(), wire(&r));
+        // Proven at dispatch, a candidate in the handler's own resolution.
+        cf::online(&w);
+        cf::get(&w, &a, t.clone());
+        t["pid"] = 31338.into();
+        w.fakes.process(crate::testing::row(31338, 1, 900));
+        cf::online(&w);
+        cf::get(&w, &a, t);
+        *w.ctx.mux.borrow_mut() = None;
+        assert!(
+            w.ctx.env.get("PATH").is_none(),
+            "no multiplexer can be found"
+        );
+        let args: Vec<String> = if verb == "report" {
+            vec!["report".into(), "blocked".into()]
+        } else {
+            vec!["read".into()]
+        };
+        let (code, out) = crate::cli::run(&args, || Ok(&w.ctx));
+        assert_eq!(
+            (code, out.contains(r#""check":"tagged""#)),
+            (2, true),
+            "{verb}: {out}"
+        );
+        assert!(!out.contains("endpoint"), "{verb}: {out}");
+        assert!(
+            w.ctx.mux.borrow().is_none(),
+            "{verb}: no multiplexer was made"
+        );
+        assert!(
+            w.fakes.mux_calls().is_empty(),
+            "{verb}: no multiplexer call"
+        );
+        assert!(
+            !folder.join("activity.json").exists(),
+            "{verb}: no member write"
+        );
+        assert_eq!(
+            crate::agents::mail::read_mail(&w.ctx, &c, ID)
+                .unwrap()
+                .len(),
+            1,
+            "{verb}: mailbox unread"
+        );
         w.fakes.hc_done().unwrap();
     }
 }

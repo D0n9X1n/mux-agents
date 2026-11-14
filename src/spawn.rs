@@ -264,7 +264,7 @@ unsafe extern "system" {
 /// The client on the caller's own console (MuxAgents.ps1:1650-1659): stdio inherited, `remove` taken out of its
 /// environment; its exit code.
 pub fn attached(path: &Path, args: &[String], remove: &[&str]) -> io::Result<i32> {
-    attached_env(path, args, remove, &[])
+    attached_env(path, args, remove, &[], &mut |_| {})
 }
 
 fn attached_command(
@@ -288,11 +288,13 @@ pub fn attached_env(
     args: &[String],
     remove: &[&str],
     set: &[(&str, &str)],
+    started: &mut dyn FnMut(u32),
 ) -> io::Result<i32> {
     audit(path)?;
-    Ok(exit_code(
-        attached_command(path, args, remove, set).status()?,
-    ))
+    let mut child = attached_command(path, args, remove, set).spawn()?;
+    // The unreaped child holds its pid, so the start read from it names this client.
+    started(child.id());
+    Ok(exit_code(child.wait()?))
 }
 
 /// What a timeout kills: on Unix the child's own process group, which needs nothing held.
@@ -789,6 +791,7 @@ mod tests {
             &probe_args("probe_report", &[]),
             &[],
             &[("MUX_AGENTS_STATE", &value)],
+            &mut |_| {},
         )
         .unwrap();
         assert_eq!(code, 7);
