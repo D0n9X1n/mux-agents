@@ -399,3 +399,39 @@ fn scoped_launcher_runs_once_with_explicit_context() {
     assert_eq!(fs::read_to_string(t.0.join("clients.log")).unwrap(), log);
     assert!(!folder.join("notice.json").exists());
 }
+
+#[test]
+fn hold_runs_until_its_release_file() {
+    use std::{
+        thread::sleep,
+        time::{Duration, Instant},
+    };
+    let dir = std::env::temp_dir().join(format!("mux-hold-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let release = dir.join("r.release");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_mux-agent"))
+        .arg("hold")
+        .arg(&release)
+        .spawn()
+        .unwrap();
+    sleep(Duration::from_millis(600));
+    assert!(child.try_wait().unwrap().is_none());
+    std::fs::write(&release, "").unwrap();
+    let at = Instant::now();
+    while child.try_wait().unwrap().is_none() {
+        assert!(at.elapsed() < Duration::from_secs(1));
+        sleep(Duration::from_millis(20));
+    }
+    assert!(child.wait().unwrap().success());
+    #[cfg(feature = "test-panic")]
+    assert!(
+        Command::new(env!("CARGO_BIN_EXE_mux-agent"))
+            .arg("hold")
+            .arg(dir.join("never"))
+            .env("MUX_AGENTS_HOLD_MS", "300")
+            .status()
+            .unwrap()
+            .success()
+    );
+    std::fs::remove_dir_all(&dir).unwrap();
+}

@@ -72,6 +72,9 @@ fn main() -> ExitCode {
         .skip(1)
         .map(|a| a.to_string_lossy().into_owned())
         .collect();
+    if let Some(code) = mux_agent::hold::main(&args, &SystemClock) {
+        return ExitCode::from(code);
+    }
     if let Some(spec) = cli::launcher_spec(&args) {
         let (code, reply) = cli::run_launcher(spec, || ctx(&args));
         let mut out = std::io::stdout().lock();

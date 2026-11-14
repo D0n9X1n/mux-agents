@@ -10,6 +10,7 @@ pub mod cli;
 pub mod ctx;
 pub mod error;
 pub mod hc;
+pub mod hold;
 pub mod json;
 pub mod launcher;
 pub mod launcher_scope;
