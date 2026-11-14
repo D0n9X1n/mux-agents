@@ -89,7 +89,7 @@ pub fn add_mail(
         None => crate::util::guid()?.replace('-', "")[..8].to_string(),
     };
     let message = json!({"id": id, "from": from, "pane": from_pane, "at": crate::util::utc_o(ctx.clock.now()), "body": body});
-    append_message(ctx, caller, key, &message, given)?;
+    append_message(ctx, caller, key, &message, given, false)?;
     Ok(id)
 }
 
@@ -107,7 +107,7 @@ pub fn add_member_mail(
     let id = crate::util::guid()?.replace('-', "")[..8].to_string();
     let message = json!({"id": id, "from": from, "fromId": from_id, "pane": from_pane,
         "at": crate::util::utc_o(ctx.clock.now()), "body": body});
-    append_message(ctx, caller, key, &message, None)?;
+    append_message(ctx, caller, key, &message, None, false)?;
     Ok(id)
 }
 
@@ -128,7 +128,7 @@ pub fn add_once(
     if let Some(object) = message.as_object_mut() {
         object.extend(fields.iter().map(|(k, v)| (k.clone(), v.clone())));
     }
-    append_message(ctx, caller, key, &message, Some(id))
+    append_message(ctx, caller, key, &message, Some(id), false)
 }
 
 /// The append of `add_mail` and `add_once`, under the mailbox lock: seals a torn last line, then adds `message`
@@ -139,6 +139,7 @@ fn append_message(
     key: &str,
     message: &Value,
     dedup: Option<&str>,
+    durable: bool,
 ) -> Res<Option<Value>> {
     let mailbox = super::state_dir(ctx, caller)?
         .join("mail")
@@ -167,8 +168,61 @@ fn append_message(
         if !out.is_empty() {
             append(&mailbox, out.as_bytes())?;
         }
+        // On every call, a duplicate hit included, so a retry finishes the flush of an earlier call (#103 M5).
+        if durable {
+            crate::state::fs::sync_file(&mailbox)?;
+            if let Some(folder) = mailbox.parent() {
+                crate::state::fs::sync_dir(folder)?;
+            }
+        }
         Ok(delivered)
     })
+}
+
+/// `message` (its own `id`) in the mailbox of `key` once, its file and folder flushed before this returns, on every
+/// call: a failed flush is an error and a retry repeats it (#103 M5).
+pub fn deliver_once(ctx: &Ctx, caller: &Caller, key: &str, message: &Value) -> Res<()> {
+    let id = super::text(message.get("id"));
+    append_message(ctx, caller, key, message, Some(&id), true).map(|_| ())
+}
+
+/// The stored message `id` of the mailbox of `key`, read under its lock; none when absent.
+pub fn find_message(ctx: &Ctx, caller: &Caller, key: &str, id: &str) -> Res<Option<Value>> {
+    let mailbox = super::server_dir(ctx, caller)
+        .join("mail")
+        .join(format!("{key}.jsonl"));
+    super::lock(ctx, &super::lock_key("mail", caller, key), || {
+        Ok(
+            parse_mail(&String::from_utf8_lossy(&read_or_empty(&mailbox)?))
+                .into_iter()
+                .find(|m| super::text(m.get("id")) == id),
+        )
+    })
+}
+
+/// The first line of a message: sender, pane, id, then ` re #<id>`, ` hop <n>` (n > 0) and ` to <cast>` when set.
+pub fn header(message: &Value) -> String {
+    let mut line = format!(
+        "[mux-agent from {} ({}) #{}",
+        super::text(message.get("from")),
+        super::text(message.get("pane")),
+        super::text(message.get("id"))
+    );
+    if let Some(re) = message.get("re").and_then(Value::as_str) {
+        line.push_str(&format!(" re #{re}"));
+    }
+    if let Some(hop) = message
+        .get("hop")
+        .and_then(Value::as_u64)
+        .filter(|&h| h > 0)
+    {
+        line.push_str(&format!(" hop {hop}"));
+    }
+    if let Some(cast) = message.get("cast").and_then(Value::as_str) {
+        line.push_str(&format!(" to {cast}"));
+    }
+    line.push(']');
+    line
 }
 
 fn read_or_empty(path: &Path) -> Res<Vec<u8>> {
@@ -322,16 +376,16 @@ pub fn read_mail_if(
         .iter()
         .map(|message| {
             let field = |name: &str| message.get(name).cloned().unwrap_or(Value::Null);
-            let text = format!(
-                "[mux-agent from {} ({}) #{}]\n{}",
-                super::text(message.get("from")),
-                super::text(message.get("pane")),
-                super::text(message.get("id")),
-                super::text(message.get("body"))
-            );
+            let text = format!("{}\n{}", header(message), super::text(message.get("body")));
             let mut out = Map::new();
             for name in ["id", "from", "pane", "at"] {
                 out.insert(name.into(), field(name));
+            }
+            // A team message (#103 4a) stores all three; a 0.2 message stores none and reads as before.
+            for name in ["re", "hop", "cast"] {
+                if message.get(name).is_some() {
+                    out.insert(name.into(), field(name));
+                }
             }
             out.insert("text".into(), text.into());
             out
@@ -393,6 +447,106 @@ mod tests {
 
     fn read(path: &Path) -> String {
         std::fs::read_to_string(path).unwrap()
+    }
+
+    fn msg(id: &str, re: Option<&str>, hop: u64, cast: Option<&str>) -> Value {
+        json!({"id": id, "from": "a", "pane": "%5", "at": "1970-01-01T00:00:00.0000000Z", "body": "hi",
+            "fromBox": "aaaaaaaaaaaa", "re": re, "hop": hop, "cast": cast})
+    }
+
+    #[test]
+    fn deliver_once_flushes_on_every_call_and_keeps_one_copy() {
+        let w = World::human("");
+        let caller = w.caller();
+        let mail = w.state().join("mail");
+        std::fs::create_dir_all(&mail).unwrap();
+        let file = mail.join("bbbbbbbbbbbb.jsonl");
+        let m = msg("0123456789abcdef", None, 0, Some("team"));
+        crate::state::fs::fail_sync_dir(Some(&mail));
+        assert!(
+            deliver_once(&w.ctx, &caller, "bbbbbbbbbbbb", &m).is_err(),
+            "a failed folder flush refuses"
+        );
+        assert!(
+            deliver_once(&w.ctx, &caller, "bbbbbbbbbbbb", &m).is_err(),
+            "a duplicate hit flushes again"
+        );
+        crate::state::fs::fail_sync_dir(None);
+        crate::state::fs::fail_sync_file(Some(&file));
+        assert!(
+            deliver_once(&w.ctx, &caller, "bbbbbbbbbbbb", &m).is_err(),
+            "a failed file flush refuses"
+        );
+        crate::state::fs::fail_sync_file(None);
+        deliver_once(&w.ctx, &caller, "bbbbbbbbbbbb", &m).unwrap();
+        assert_eq!(
+            read(&file).lines().count(),
+            1,
+            "one copy, whatever the retries"
+        );
+        let found = find_message(&w.ctx, &caller, "bbbbbbbbbbbb", "0123456789abcdef")
+            .unwrap()
+            .unwrap();
+        assert_eq!(found["cast"], "team");
+        assert!(
+            find_message(&w.ctx, &caller, "bbbbbbbbbbbb", "ffffffffffffffff")
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            find_message(&w.ctx, &caller, "cccccccccccc", "0123456789abcdef")
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn stored_and_read_fields_and_header() {
+        let w = World::human("");
+        let caller = w.caller();
+        deliver_once(
+            &w.ctx,
+            &caller,
+            "pane-1",
+            &msg("1111111111111111", None, 0, None),
+        )
+        .unwrap();
+        deliver_once(
+            &w.ctx,
+            &caller,
+            "pane-1",
+            &msg("2222222222222222", Some("1111111111111111"), 2, None),
+        )
+        .unwrap();
+        deliver_once(
+            &w.ctx,
+            &caller,
+            "pane-1",
+            &msg("3333333333333333", None, 0, Some("children")),
+        )
+        .unwrap();
+        let read = read_mail(&w.ctx, &caller, "pane-1").unwrap();
+        let heads: Vec<String> = read
+            .iter()
+            .map(|m| text(m.get("text")).split("\n").next().unwrap().into())
+            .collect();
+        assert_eq!(
+            heads,
+            [
+                "[mux-agent from a (%5) #1111111111111111]",
+                "[mux-agent from a (%5) #2222222222222222 re #1111111111111111 hop 2]",
+                "[mux-agent from a (%5) #3333333333333333 to children]",
+            ]
+        );
+        let keys: Vec<&str> = read[1].keys().map(String::as_str).collect();
+        assert_eq!(
+            keys,
+            ["id", "from", "pane", "at", "re", "hop", "cast", "text"]
+        );
+        assert_eq!(
+            (&read[1]["re"], &read[1]["hop"], &read[0]["cast"]),
+            (&json!("1111111111111111"), &json!(2), &Value::Null)
+        );
     }
 
     #[test]
