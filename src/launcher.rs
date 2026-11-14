@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use serde_json::{Map, Value, json};
 
-use crate::agents::spawn::{CMDLINE_MAX, client_flags, client_named};
+use crate::agents::spawn::{CMDLINE_MAX, client_named};
 use crate::ctx::Ctx;
 use crate::error::{Refusal, Res};
 use crate::parse::cmdline_length;
@@ -117,6 +117,17 @@ pub(crate) fn run(ctx: &Ctx, spec: &str, err: &mut dyn FnMut(&str), start: Start
     code
 }
 
+/// The client flags the launch spec records, the exact ones its spawn chose (#103: a person's `up` records its own).
+/// None when they are missing or not all text: a spec never falls back to flags it does not name.
+fn spec_flags(launch: &Value) -> Option<Vec<String>> {
+    launch
+        .get("flags")?
+        .as_array()?
+        .iter()
+        .map(|f| f.as_str().map(String::from))
+        .collect()
+}
+
 /// `path` below `root` by whole components, with no `.` or `..` (Windows: ignoring case).
 fn lexically_under(root: &Path, path: &Path) -> bool {
     let plain = |c: &Component| !matches!(c, Component::CurDir | Component::ParentDir);
@@ -216,15 +227,14 @@ fn launch(
         return Ok(1);
     }
     let mut code = 1;
-    match launch
+    let client = launch
         .get("client")
         .and_then(Value::as_str)
-        .and_then(client_named)
-    {
-        None => err("mux-agent: the launch spec names no known client"),
-        Some(client) => {
-            let mut args: Vec<String> =
-                client_flags(client).iter().map(|f| f.to_string()).collect();
+        .and_then(client_named);
+    match (client, spec_flags(launch)) {
+        (None, _) => err("mux-agent: the launch spec names no known client"),
+        (Some(_), None) => err("mux-agent: the launch spec names no client flags"),
+        (Some(client), Some(mut args)) => {
             for arg in launch
                 .get("args")
                 .and_then(Value::as_array)
@@ -351,6 +361,8 @@ mod tests {
         write(
             &spec,
             json!({"schema": 1, "stateDirectory": state.to_str().unwrap(), "id": ID, "client": client,
+                "flags": client_named(client).map(|c| crate::agents::spawn::client_flags(c).to_vec())
+                    .unwrap_or_default(),
                 "parentPane": "%1", "args": args, "prompt": "p"}),
         );
         let bin = w.ctx.cwd.parent().unwrap().join("bin");
@@ -945,6 +957,38 @@ mod tests {
             )
         );
         assert!(ran.started.is_empty());
+    }
+
+    // #103 phase 2a-i: the client runs with the flags its spec records, byte for byte, then its args; a spec with no
+    // recorded flags starts nothing rather than fall back to a fixed list.
+    #[test]
+    fn the_launch_runs_the_flags_its_spec_records() {
+        let l = setup("claude", json!(["a"]));
+        let spec = l.folder.join("spec.json");
+        let mut v: Value = read_json(&spec).unwrap().unwrap();
+        v["flags"] = json!(["--model", "x y", "\u{e9}"]);
+        write(&spec, v);
+        let ran = launch(&l, &spec_str(&l), exits_7);
+        assert_eq!(ran.started[0].1, ["--model", "x y", "\u{e9}", "a"]);
+        for flags in [None, Some(json!("--x")), Some(json!(["--x", 1]))] {
+            let l = setup("claude", json!(["a"]));
+            let spec = l.folder.join("spec.json");
+            let mut v: Value = read_json(&spec).unwrap().unwrap();
+            match flags {
+                None => {
+                    v.as_object_mut().unwrap().remove("flags");
+                }
+                Some(f) => v["flags"] = f,
+            }
+            write(&spec, v);
+            let ran = launch(&l, &spec_str(&l), exits_7);
+            assert_eq!(ran.code, 1);
+            assert!(ran.started.is_empty());
+            assert_eq!(
+                ran.err,
+                ["mux-agent: the launch spec names no client flags"]
+            );
+        }
     }
 
     #[test]

@@ -370,7 +370,8 @@ impl Launch<'_> {
         write_json(
             &spec,
             &json!({"schema": 1, "stateDirectory": utf8(state)?, "id": agent.id,
-                "client": client_name(self.client), "parentPane": self.caller.pane, "args": args,
+                "client": client_name(self.client), "flags": client_flags(self.client),
+                "parentPane": self.caller.pane, "args": args,
                 "prompt": prompt}),
         )?;
         Ok(spec)
@@ -2136,7 +2137,7 @@ mod tests {
         assert_eq!(
             read_json(&spec),
             json!({"schema": 1, "stateDirectory": agents_dir(&w).parent().unwrap().to_str().unwrap(),
-                "id": id, "client": "claude", "parentPane": "%1",
+                "id": id, "client": "claude", "flags": client_flags(Client::Claude), "parentPane": "%1",
                 "args": ["--session-id", ok["sessionId"], read_json(&spec)["prompt"]],
                 "prompt": read_json(&spec)["prompt"], "generation": "0"})
         );
@@ -2153,6 +2154,7 @@ mod tests {
                 "stateDirectory",
                 "id",
                 "client",
+                "flags",
                 "parentPane",
                 "args",
                 "prompt",
