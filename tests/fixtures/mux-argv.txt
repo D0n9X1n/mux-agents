@@ -39,9 +39,13 @@
 # 0.3.0 (#103): spawn keeps the bar of the new view's window (@7, where new-window put the agent)
 -N show-options -wqv -t @7 @mux-agents-sidebar-id
 -N list-panes -t @7 -F #{pane_id}|#{==:#{@agent-role},sidebar}
+# 0.3.0 (#103 QA): before a split, the window's panes with the bar's mark; none here is ours
+-N list-panes -t @7 -F #{pane_pid}|#{pane_id}|#{@mux-agents-bar}
 # 0.2.3 (S1): the window's width sizes the bar (0.2.4: max(30, width * 5 / 100)); a full-height split at the right edge
 -N display-message -p -t @7 #{window_width}|#{s/[|\n\r]/x/:@mux-agents-sidebar-min}|#{s/[|\n\r]/x/:@mux-agents-sidebar-percent}
 -N split-window -d -f -h -P -F #{pane_id}|#{window_id}|#{pane_pid} -t @7 -e MUX_AGENTS_STATE=<state> -l 40 <exe> watch
+# 0.3.0 (#103 QA): the new pane carries the bar's mark, its own pid, from its split on
+-N if-shell -F -t %13 #{==:#{pane_pid},113} 'set-option -p -t %13 @mux-agents-bar 113'
 -N if-shell -F -t %13 #{&&:#{==:#{pane_dead},0},#{==:#{pane_pid},113}} 'set-option -p -t %13 @agent-role sidebar'
 -N display-message -p -t %13 #{@agent-role}
 # 0.2.3 (#47): pid 113 is this binary `watch`, so the bar is recorded as <pane> <pid> <start>
@@ -65,9 +69,13 @@
 -N show-options -qv -t $3 @mux-agents-sidebar-id
 -N show-options -wqv -t @7 @mux-agents-sidebar-id
 -N list-panes -t @7 -F #{pane_id}|#{==:#{@agent-role},sidebar}
+# 0.3.0 (#103 QA): before a split, the window's panes with the bar's mark; none here is ours
+-N list-panes -t @7 -F #{pane_pid}|#{pane_id}|#{@mux-agents-bar}
 # 0.2.3 (S1): the window's width sizes the bar (0.2.4: max(30, width * 5 / 100)); a full-height split at the right edge
 -N display-message -p -t @7 #{window_width}|#{s/[|\n\r]/x/:@mux-agents-sidebar-min}|#{s/[|\n\r]/x/:@mux-agents-sidebar-percent}
 -N split-window -d -f -h -P -F #{pane_id}|#{window_id}|#{pane_pid} -t @7 -e MUX_AGENTS_STATE=<state> -l 40 <exe> watch
+# 0.3.0 (#103 QA): the new pane carries the bar's mark, its own pid, from its split on
+-N if-shell -F -t %13 #{==:#{pane_pid},113} 'set-option -p -t %13 @mux-agents-bar 113'
 -N if-shell -F -t %13 #{&&:#{==:#{pane_dead},0},#{==:#{pane_pid},113}} 'set-option -p -t %13 @agent-role sidebar'
 -N display-message -p -t %13 #{@agent-role}
 # 0.2.3 (#47): pid 113 is this binary `watch`, so the bar is recorded as <pane> <pid> <start>
@@ -178,9 +186,13 @@
 -N show-options -qv -t $3 @mux-agents-sidebar-id
 -N show-options -wqv -t @1 @mux-agents-sidebar-id
 -N list-panes -t @1 -F #{pane_id}|#{==:#{@agent-role},sidebar}
+# 0.3.0 (#103 QA): before a split, the window's panes with the bar's mark; none here is ours
+-N list-panes -t @1 -F #{pane_pid}|#{pane_id}|#{@mux-agents-bar}
 # 0.2.3 (S1): the window's width, then a full-height split at the right edge (:1578-1579)
 -N display-message -p -t @1 #{window_width}|#{s/[|\n\r]/x/:@mux-agents-sidebar-min}|#{s/[|\n\r]/x/:@mux-agents-sidebar-percent}
 -N split-window -d -f -h -P -F #{pane_id}|#{window_id}|#{pane_pid} -t @1 -e MUX_AGENTS_STATE=<state> -l 40 <exe> watch
+# 0.3.0 (#103 QA): the new pane carries the bar's mark, its own pid, from its split on
+-N if-shell -F -t %13 #{==:#{pane_pid},113} 'set-option -p -t %13 @mux-agents-bar 113'
 # :1584
 -N if-shell -F -t %13 #{&&:#{==:#{pane_dead},0},#{==:#{pane_pid},113}} 'set-option -p -t %13 @agent-role sidebar'
 -N display-message -p -t %13 #{@agent-role}
@@ -198,10 +210,14 @@
 -N show-options -qv -t $3 @mux-agents-sidebar-id
 -N show-options -wqv -t @1 @mux-agents-sidebar-id
 -N list-panes -t @1 -F #{pane_id}|#{==:#{@agent-role},sidebar}
+# 0.3.0 (#103 QA): before a split, the window's panes with the bar's mark; none here is ours
+-N list-panes -t @1 -F #{pane_pid}|#{pane_id}|#{@mux-agents-bar}
 -N display-message -p -t @1 #{window_width}|#{s/[|\n\r]/x/:@mux-agents-sidebar-min}|#{s/[|\n\r]/x/:@mux-agents-sidebar-percent}
 -N split-window -d -f -h -P -F #{pane_id}|#{window_id}|#{pane_pid} -t @1 -e MUX_AGENTS_STATE=<state> -l 40 <exe> watch
 # :1580
 -N split-window -d -f -h -P -F #{pane_id}|#{window_id}|#{pane_pid} -t @1 -e MUX_AGENTS_STATE=<state> <exe> watch
+# 0.3.0 (#103 QA): the new pane carries the bar's mark, its own pid, from its split on
+-N if-shell -F -t %13 #{==:#{pane_pid},113} 'set-option -p -t %13 @mux-agents-bar 113'
 -N if-shell -F -t %13 #{&&:#{==:#{pane_dead},0},#{==:#{pane_pid},113}} 'set-option -p -t %13 @agent-role sidebar'
 -N display-message -p -t %13 #{@agent-role}
 # 0.2.3 (#47): pid 113 is this binary `watch`, so the bar is recorded as <pane> <pid> <start>

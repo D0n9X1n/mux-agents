@@ -3331,6 +3331,30 @@ hc {}:
         assert_eq!(live.bars().len(), 2, "{mux:?} {:?}", live.bars());
     }
 
+    // #103 QA: break-pane moves the window's last view to a new window. The old bar, before it leaves, gives that
+    // window its own bar; nothing else would (no other bar runs). Each of `bars` is `<pane>|<window>|<width>`.
+    fn break_pane_of_the_last_view_gives_its_new_window_a_bar(mux: Mux) {
+        let Some(mut live) = Live::human(mux) else {
+            return;
+        };
+        let w1 = live.spawn("w1", &["-Split", "h"]);
+        assert!(w1.get("sidebarError").is_none(), "{mux:?} {w1}");
+        let bar = s(&w1["sidebar"]).to_string();
+        let pane = s(&w1["pane"]).to_string();
+        live.worker_pid(&w1);
+        live.call(&["break-pane", "-d", "-s", &pane]);
+        let window = live.field(&pane, "#{window_id}");
+        assert_ne!(window, s(&w1["window"]), "{mux:?}");
+        live.wait_gone(&bar);
+        live.server.wait("a bar in the view's new window", || {
+            live.bars()
+                .iter()
+                .any(|b| b.split('|').nth(1) == Some(window.as_str()))
+                .then_some(())
+        });
+        assert_eq!(live.bars().len(), 1, "{mux:?} {:?}", live.bars());
+    }
+
     // A sidebar lock held elsewhere for 15 s: the spawn still succeeds, its agent recorded and committed, with no bar
     // and the lock refusal as sidebarError; the spawn lock was already released, so a later spawn opens the bar.
     fn sidebar_lock_timeout_still_spawns(mux: Mux) {
@@ -3534,6 +3558,26 @@ hc {}:
         (bar, s(&w1["pane"]).to_string())
     }
 
+    /// The panes of w1 and w2 in the order the bar draws them now, top first. The bar lists running agents in the
+    /// session's pane order (#103: `-Split h` from the root puts w2 between the root and w1), so a key that takes the
+    /// first drawn agent takes w2 here, not the first spawned.
+    fn drawn_ends(live: &Live, bar: &str) -> (String, String) {
+        let screen = live.call(&["capture-pane", "-p", "-t", bar]);
+        let mut names = ["w1", "w2"];
+        names.sort_by_key(|n| {
+            row_at(&screen, n)
+                .unwrap_or_else(|| panic!("{:?}: no row for {n}:\n{screen}", live.mux()))
+        });
+        let pane = |name: &str| {
+            live.panes("#{pane_id}|#{@agent-name}")
+                .iter()
+                .find(|r| r.ends_with(&format!("|{name}")))
+                .map(|r| r.split('|').next().unwrap().to_string())
+                .unwrap()
+        };
+        (pane(names[0]), pane(names[1]))
+    }
+
     /// Waits up to 10 s for `pane` to be the session's active pane.
     fn wait_focused(live: &Live, pane: &str, what: &str) {
         let mut now = String::new();
@@ -3561,16 +3605,17 @@ hc {}:
         live.wait_tick(&bar);
     }
 
-    // #61: `j` selects the first agent and Enter focuses it.
+    // #61: `j` selects the first agent drawn and Enter focuses it.
     fn bar_keys_focus_an_agent(mux: Mux) {
         let Some(mut live) = Live::human(mux) else {
             return;
         };
-        let (bar, p1) = two_rows(&mut live);
+        let (bar, _) = two_rows(&mut live);
         live.after_redraw(&bar);
+        let (top, _) = drawn_ends(&live, &bar);
         live.call(&["send-keys", "-t", &bar, "-l", "j"]);
         live.call(&["send-keys", "-t", &bar, "Enter"]);
-        wait_focused(&live, &p1, "j then Enter");
+        wait_focused(&live, &top, "j then Enter");
     }
 
     // #90: `n` (herdr's next agent) from a pane that is no agent's goes to the bar's first agent, `N` to its last.
@@ -3578,25 +3623,17 @@ hc {}:
         let Some(mut live) = Live::human(mux) else {
             return;
         };
-        let (bar, p1) = two_rows(&mut live);
+        let (bar, _) = two_rows(&mut live);
         live.after_redraw(&bar);
+        let (top, _) = drawn_ends(&live, &bar);
         live.call(&["send-keys", "-t", &bar, "-l", "n"]);
-        wait_focused(&live, &p1, "n from the root pane");
+        wait_focused(&live, &top, "n from the root pane");
         let root = live.server.pane().to_string();
         live.call(&["select-pane", "-t", &root]);
         live.after_redraw(&bar);
-        let p2 = {
-            let screen = live.call(&["capture-pane", "-p", "-t", &bar]);
-            let y = row_at(&screen, "w2").unwrap();
-            assert!(y > row_at(&screen, "w1").unwrap(), "{mux:?}:\n{screen}");
-            live.panes("#{pane_id}|#{@agent-name}")
-                .iter()
-                .find(|r| r.ends_with("|w2"))
-                .map(|r| r.split('|').next().unwrap().to_string())
-                .unwrap()
-        };
+        let (top, bottom) = drawn_ends(&live, &bar);
         live.call(&["send-keys", "-t", &bar, "-l", "N"]);
-        wait_focused(&live, &p2, "N from the root pane");
+        wait_focused(&live, &bottom, "N from the root pane");
         // The documented binding: a run-shell (not below any pane) sends `n` to the bar the current window records
         // (#103: a window option, read with -w). tmux's
         // run-shell knows its own server; the multiplexer's binary is named by the server under test.
@@ -3609,7 +3646,7 @@ hc {}:
                 "{tmux} -S '{socket}' send-keys -t \"$({tmux} -S '{socket}' show -wqv @mux-agents-sidebar-id | cut -d' ' -f1)\" n"
             );
             live.call(&["run-shell", &line]);
-            wait_focused(&live, &p1, "the documented binding");
+            wait_focused(&live, &top, "the documented binding");
         }
     }
 
@@ -4185,11 +4222,18 @@ hc {}:
             panic_in_lock_frees_lock,
             bar_real_client_click_focuses,
             bar_real_client_peek,
+            break_pane_of_the_last_view_gives_its_new_window_a_bar,
         ]
     );
 
     // tmux 3.2a's display-popup has no -T (QA #91): peek works there too.
     tests_on!(tmux32_peek, Tmux32, [bar_real_client_peek]);
+    // break-pane is tmux's; rmux 0.10 is not known to have it.
+    tests_on!(
+        tmux32_break,
+        Tmux32,
+        [break_pane_of_the_last_view_gives_its_new_window_a_bar]
+    );
 }
 
 #[cfg(unix)]
