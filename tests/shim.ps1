@@ -95,6 +95,24 @@ function Run([string[]] $argv, [string] $cwd = $tmp) {
     $script:out = ($text -replace "`r", '').TrimEnd("`n")
 }
 
+# Runs `$command` in a new PowerShell started in $tmp and sets $script:out and $script:rc, as Run does.
+function RunIn([string] $command) {
+    $info = New-Object System.Diagnostics.ProcessStartInfo
+    $info.FileName = $ps
+    $info.UseShellExecute = $false
+    $info.RedirectStandardOutput = $true
+    $info.WorkingDirectory = $tmp
+    $encoded = [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes($command))
+    $info.Arguments = "-NoProfile -NonInteractive -EncodedCommand $encoded"
+    $p = [System.Diagnostics.Process]::Start($info)
+    $text = $p.StandardOutput.ReadToEnd()
+    $p.WaitForExit()
+    $script:rc = $p.ExitCode
+    $script:out = ($text -replace "`r", '').TrimEnd("`n")
+}
+
+function Lit([string] $s) { "'" + ($s -replace "'", "''") + "'" }
+
 function Check([string] $name, [bool] $ok) {
     if ($ok) { "ok   $name" } else { "FAIL ${name}: rc=$($script:rc) out=$($script:out)"; $script:fail++ }
 }
@@ -134,6 +152,34 @@ Expect 'bare_bin_runs_cwd_file' @('in-cwd', '[go]')
 
 Reset; $env:MUX_AGENTS_BIN = Join-Path $tmp 'missing'; Run @('list')
 Expect 'none_usable_prints_entry_json_exit_1' @('{"ok":false,"verb":null,"code":1,"check":"entry","message":"no usable mux-agent binary for ' + "$os-$arch" + '"}') 1
+
+# Called with `&` in a session whose location is not the process's working folder: the output is captured, the
+# exit code is $LASTEXITCODE, and a relative MUX_AGENTS_BIN is a file under the current location.
+Reset; $loc = Join-Path $case 'loc'; Fake (Join-Path $loc $exe) 'in-loc'
+$shimPath = Join-Path (Join-Path $root 'scripts') 'mux-agent.ps1'
+$rel = '.' + [System.IO.Path]::DirectorySeparatorChar + $exe
+RunIn ("Set-Location -LiteralPath $(Lit $loc); `$env:MUX_AGENTS_BIN = $(Lit $rel); `$env:SHIM_EXIT = '5'; " +
+    "`$r = & $(Lit $shimPath) go 'a b'; 'captured=' + (`$r -join '|'); 'code=' + `$LASTEXITCODE")
+Expect 'in_process_capture_location_and_code' @('captured=in-loc|[go]|[a b]', 'code=5')
+
+# A bare MUX_AGENTS_BIN with no such file in the current location never runs a namesake on PATH.
+Reset; $empty = Join-Path $case 'empty'; New-Item -ItemType Directory -Force -Path $empty | Out-Null
+$onPath = Join-Path $case 'path'; Fake (Join-Path $onPath $exe) 'on-path'; Fake $tier3 'tier3'
+$savedPath = $env:PATH; $env:PATH = $onPath + [System.IO.Path]::PathSeparator + $env:PATH
+RunIn ("Set-Location -LiteralPath $(Lit $empty); `$env:MUX_AGENTS_BIN = $(Lit $exe); " +
+    "& $(Lit (Join-Path (Join-Path $root 'scripts') 'mux-agent.ps1')) p; exit `$LASTEXITCODE")
+$env:PATH = $savedPath
+Expect 'bare_bin_never_runs_path_namesake' @('tier3', '[p]')
+
+if ($onWindows) {
+    # An override that is a file but not a program never starts: the next candidate runs; with none, exit 1.
+    Reset; New-Item -ItemType Directory -Force -Path (Split-Path -Parent $tier1) | Out-Null
+    Set-Content -LiteralPath $tier1 -Value 'not a program' -Encoding ASCII; $env:MUX_AGENTS_BIN = $tier1
+    Fake $tier3 'tier3'; Run @('u')
+    Expect 'unstartable_override_falls_through' @('tier3', '[u]')
+    Remove-Item -LiteralPath $tier3; Run @('u')
+    Expect 'unstartable_override_alone_exits_1' @('{"ok":false,"verb":null,"code":1,"check":"entry","message":"no usable mux-agent binary for ' + "$os-$arch" + '"}') 1
+}
 
 if (-not $onWindows) {
     Reset; Fake $tier2 'tier2'; & chmod -x $tier2; Fake $tier3 'tier3'; Run @('x')

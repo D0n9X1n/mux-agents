@@ -1,7 +1,8 @@
 # mux-agent entry shim for PowerShell 7 and Windows PowerShell 5.1: runs the first usable binary of MUX_AGENTS_BIN,
 # scripts/bin/<os>-<arch>/mux-agent[.exe] and target/release/mux-agent[.exe], passing every argument and the exit
 # code through. With none usable it prints an entry refusal and exits 1. The binary needs no PowerShell; this file is
-# an optional entry point beside scripts/mux-agent (sh) and scripts/mux-agent.cmd.
+# an optional entry point beside scripts/mux-agent (sh) and scripts/mux-agent.cmd. It runs the binary with `&`, so
+# the pipeline, redirection, standard input and the current location work as for any native command.
 
 $plugin = Split-Path -Parent $PSScriptRoot
 $onWindows = $env:OS -eq 'Windows_NT'
@@ -21,7 +22,7 @@ $arch = switch -Exact ($arch.ToUpperInvariant()) {
 
 # A regular file that is executable, or becomes so with chmod +x (not Windows).
 function Test-Usable([string] $path) {
-    if (-not $path -or -not (Test-Path -LiteralPath $path -PathType Leaf)) { return $false }
+    if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { return $false }
     if ($onWindows) { return $true }
     & test -x $path
     if ($LASTEXITCODE -eq 0) { return $true }
@@ -30,7 +31,10 @@ function Test-Usable([string] $path) {
     return $LASTEXITCODE -eq 0
 }
 
-# One argument quoted for a Windows command line, as CommandLineToArgvW and Rust's std parse it.
+# PowerShell before 7.3 builds a native command line without escaping quotes and drops empty arguments, so each
+# argument is quoted here as CommandLineToArgvW and Rust's std parse it; 7.3 and later pass them exactly.
+$legacy = $PSVersionTable.PSVersion -lt [version]'7.3'
+if (-not $legacy) { $PSNativeCommandArgumentPassing = 'Standard' }
 function ConvertTo-Argument([string] $a) {
     if ($a.Length -gt 0 -and $a -notmatch '[\s"]') { return $a }
     $out = New-Object System.Text.StringBuilder
@@ -45,7 +49,10 @@ function ConvertTo-Argument([string] $a) {
     [void] $out.Append('\', 2 * $slashes).Append('"')
     return $out.ToString()
 }
+# Always an array: splatting a single string would pass it one character at a time.
+[string[]] $pass = if ($legacy) { @($args | ForEach-Object { ConvertTo-Argument ([string] $_) }) } else { @($args) }
 
+$here = (Get-Location).ProviderPath
 $candidates = @(
     $env:MUX_AGENTS_BIN,
     (Join-Path (Join-Path (Join-Path $plugin 'scripts/bin') "$os-$arch") $exe),
@@ -53,16 +60,16 @@ $candidates = @(
 )
 foreach ($bin in $candidates) {
     if (-not $bin) { continue }
-    # A name with no separator is a file in the current folder, the one checked, never a namesake on PATH.
-    if ($bin -notmatch '[\\/]') { $bin = Join-Path (Get-Location).ProviderPath $bin }
+    # A relative path, a bare name included, is a file under the current location, never a namesake on PATH.
+    if (-not [System.IO.Path]::IsPathRooted($bin)) { $bin = Join-Path $here $bin }
     if (-not (Test-Usable $bin)) { continue }
-    $info = New-Object System.Diagnostics.ProcessStartInfo
-    $info.FileName = $bin
-    $info.UseShellExecute = $false
-    $info.Arguments = ($args | ForEach-Object { ConvertTo-Argument ([string] $_) }) -join ' '
-    $process = [System.Diagnostics.Process]::Start($info)
-    $process.WaitForExit()
-    exit $process.ExitCode
+    try {
+        & $bin @pass
+    } catch {
+        # It never started (not a program this system runs): the next candidate is tried.
+        continue
+    }
+    exit $LASTEXITCODE
 }
 
 [Console]::Out.Write('{"ok":false,"verb":null,"code":1,"check":"entry","message":"no usable mux-agent binary for ' + "$os-$arch" + '"}' + "`n")
