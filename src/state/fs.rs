@@ -80,7 +80,9 @@ pub fn sync_dir(dir: &Path) -> io::Result<()> {
 /// Flushes a folder above the state root, which may not be this user's. A folder whose flush is refused is skipped
 /// only when this user cannot add an entry to it (`C:\Users`, `/home`, a 0100 folder): then no folder on the user's
 /// path can have been made in it by this user. Any other failure is an error, so an entry this user may have made is
-/// never left unflushed (#103).
+/// never left unflushed (#103). This assumes the permissions of the folders above the state root do not change
+/// while a launch runs: a folder whose rights are taken away after the user made an entry in it can no longer be
+/// opened, by this or any program, and cannot be flushed.
 pub fn sync_ancestor(dir: &Path) -> io::Result<()> {
     match sync_dir(dir) {
         Ok(()) => Ok(()),
@@ -101,6 +103,8 @@ fn may_add_entry(dir: &Path) -> bool {
         };
         let probe = dir.join(format!(".mux-agents-probe-{guid}"));
         match std::fs::create_dir(&probe) {
+            // Made, so the user can add here. Removed again; if it cannot be, the refused flush is still the error
+            // the launch reports, and the probe's name says what it is.
             Ok(()) => {
                 let _ = std::fs::remove_dir(&probe);
                 true
