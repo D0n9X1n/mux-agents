@@ -32,6 +32,7 @@ using System;using System.IO;
 class S{static int Main(string[] a){
 Console.WriteLine(File.ReadAllLines(AppDomain.CurrentDomain.BaseDirectory+"label.txt")[0].Trim());
 foreach(string x in a)Console.WriteLine("["+x+"]");
+if(!string.IsNullOrEmpty(Environment.GetEnvironmentVariable("SHIM_STDIN")))Console.Write(Console.In.ReadToEnd());
 string e=Environment.GetEnvironmentVariable("SHIM_EXIT");
 return string.IsNullOrEmpty(e)?0:int.Parse(e);}}
 '@
@@ -45,7 +46,7 @@ function Fake([string] $path, [string] $label) {
         Copy-Item -LiteralPath $stub -Destination $path
         Set-Content -LiteralPath (Join-Path (Split-Path -Parent $path) 'label.txt') -Value $label -Encoding ASCII
     } else {
-        $body = "#!/bin/sh`necho $label`nfor a in `"`$@`"; do printf '[%s]\n' `"`$a`"; done`nexit `${SHIM_EXIT:-0}`n"
+        $body = "#!/bin/sh`necho $label`nfor a in `"`$@`"; do printf '[%s]\n' `"`$a`"; done`n[ -n `"`${SHIM_STDIN:-}`" ] && cat`nexit `${SHIM_EXIT:-0}`n"
         [System.IO.File]::WriteAllText($path, $body)
         & chmod +x $path
     }
@@ -64,6 +65,7 @@ function Reset {
     $script:tier3 = Join-Path (Join-Path $script:root 'target/release') $exe
     Remove-Item Env:MUX_AGENTS_BIN -ErrorAction SilentlyContinue
     Remove-Item Env:SHIM_EXIT -ErrorAction SilentlyContinue
+    Remove-Item Env:SHIM_STDIN -ErrorAction SilentlyContinue
 }
 
 function Quote([string] $a) {
@@ -140,8 +142,8 @@ Reset; New-Item -ItemType Directory -Force -Path $tier1 | Out-Null; $env:MUX_AGE
 Expect 'directory_skipped' @('tier3', '[d]')
 
 Reset; Fake $tier3 'tier3'
-Run @('send', 'a b', '', "it's", '"q"', '$HOME', '*', 'x  y', 'trail\', 'a\"b', '--', '-Lines')
-Expect 'spaces_in_root_and_args' @('tier3', '[send]', '[a b]', '[]', "[it's]", '["q"]', '[$HOME]', '[*]', '[x  y]', '[trail\]', '[a\"b]', '[--]', '[-Lines]')
+Run @('send', 'a b', '', "it's", '"q"', '$HOME', '*', 'x  y', 'trail\', 'a\"b', '--', '-Lines', 'a" b', ' "x" ', 'c?', '[ab]')
+Expect 'spaces_in_root_and_args' @('tier3', '[send]', '[a b]', '[]', "[it's]", '["q"]', '[$HOME]', '[*]', '[x  y]', '[trail\]', '[a\"b]', '[--]', '[-Lines]', '[a" b]', '[ "x" ]', '[c?]', '[[ab]]')
 
 Reset; Fake $tier3 'tier3'; $env:SHIM_EXIT = '7'; Run @('stop', 'z')
 Expect 'exit_code_forwarded' @('tier3', '[stop]', '[z]') 7
@@ -161,6 +163,24 @@ $rel = '.' + [System.IO.Path]::DirectorySeparatorChar + $exe
 RunIn ("Set-Location -LiteralPath $(Lit $loc); `$env:MUX_AGENTS_BIN = $(Lit $rel); `$env:SHIM_EXIT = '5'; " +
     "`$r = & $(Lit $shimPath) go 'a b'; 'captured=' + (`$r -join '|'); 'code=' + `$LASTEXITCODE")
 Expect 'in_process_capture_location_and_code' @('captured=in-loc|[go]|[a b]', 'code=5')
+
+# Called with `&` and no arguments: the binary gets no arguments, not one empty one.
+Reset; Fake $tier3 'tier3'
+RunIn ("`$r = & $(Lit (Join-Path (Join-Path $root 'scripts') 'mux-agent.ps1')); 'captured=' + (`$r -join '|')")
+Expect 'in_process_no_arguments' @('captured=tier3')
+
+# A binary that ran and failed is never retried or turned into the entry refusal, whatever the caller's error
+# preferences: its exit code is the shim's.
+Reset; Fake $tier2 'tier2'; Fake $tier3 'tier3'
+RunIn ("`$ErrorActionPreference = 'Stop'; `$PSNativeCommandUseErrorActionPreference = `$true; `$env:SHIM_EXIT = '7'; " +
+    "try { & $(Lit (Join-Path (Join-Path $root 'scripts') 'mux-agent.ps1')) e } catch { 'caught' }; 'code=' + `$LASTEXITCODE")
+Check 'native_exit_is_not_a_start_failure' (($out -split "`n")[0] -eq 'tier2' -and $out -notmatch 'tier3' -and $out -notmatch 'no usable' -and $out -match 'code=7')
+
+# Input piped to the shim reaches the binary's standard input.
+Reset; Fake $tier3 'tier3'
+RunIn ("`$env:SHIM_STDIN = '1'; `$r = 'payload' | & $(Lit (Join-Path (Join-Path $root 'scripts') 'mux-agent.ps1')) i; " +
+    "'captured=' + ((`$r | ForEach-Object { `$_.Trim() }) -join '|')")
+Expect 'pipeline_input_reaches_the_binary' @('captured=tier3|[i]|payload')
 
 # A bare MUX_AGENTS_BIN with no such file in the current location never runs a namesake on PATH.
 Reset; $empty = Join-Path $case 'empty'; New-Item -ItemType Directory -Force -Path $empty | Out-Null

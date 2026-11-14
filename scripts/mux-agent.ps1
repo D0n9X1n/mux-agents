@@ -31,12 +31,39 @@ function Test-Usable([string] $path) {
     return $LASTEXITCODE -eq 0
 }
 
-# PowerShell before 7.3 builds a native command line without escaping quotes and drops empty arguments, so each
-# argument is quoted here as CommandLineToArgvW and Rust's std parse it; 7.3 and later pass them exactly.
+# The caller's error preferences never turn the binary's own exit code into a failure of the shim.
+$ErrorActionPreference = 'Continue'
+$PSNativeCommandUseErrorActionPreference = $false
+
+# PowerShell before 7.3 builds a native command line itself: it drops an empty argument and leaves quotes and
+# backslashes unescaped; 7.3 and later pass arguments exactly. So before 7.3 each argument is quoted here, as
+# CommandLineToArgvW and Rust's std parse it.
 $legacy = $PSVersionTable.PSVersion -lt [version]'7.3'
 if (-not $legacy) { $PSNativeCommandArgumentPassing = 'Standard' }
-function ConvertTo-Argument([string] $a) {
-    if ($a.Length -gt 0 -and $a -notmatch '[\s"]') { return $a }
+
+# Windows PowerShell 5.1 and pwsh 7.0-7.2 on Windows add their own quotes around an argument when whitespace falls
+# outside a pair of `"` they count, ignoring backslashes. So the whole argument is quoted here and an embedded `"`
+# is written `""` (a literal quote inside quotes), which keeps every whitespace inside a counted pair and the
+# argument as written; backslashes before a `"` are doubled.
+function ConvertTo-WindowsLegacyArgument([string] $a) {
+    $out = New-Object System.Text.StringBuilder
+    [void] $out.Append('"')
+    $slashes = 0
+    foreach ($c in $a.ToCharArray()) {
+        if ($c -eq '\') { $slashes++; continue }
+        if ($c -eq '"') { [void] $out.Append('\', 2 * $slashes).Append('""') } else {
+            if ($slashes) { [void] $out.Append('\', $slashes) }
+            [void] $out.Append($c)
+        }
+        $slashes = 0
+    }
+    [void] $out.Append('\', 2 * $slashes).Append('"')
+    return $out.ToString()
+}
+
+# pwsh 7.0-7.2 on macOS and Linux: .NET splits the command line again, so the argument is quoted with escaped quotes.
+function ConvertTo-UnixLegacyArgument([string] $a) {
+    if ($a.Length -gt 0 -and $a -notmatch '[\s"\\'']') { return $a }
     $out = New-Object System.Text.StringBuilder
     [void] $out.Append('"')
     $slashes = 0
@@ -49,8 +76,15 @@ function ConvertTo-Argument([string] $a) {
     [void] $out.Append('\', 2 * $slashes).Append('"')
     return $out.ToString()
 }
-# Always an array: splatting a single string would pass it one character at a time.
-[string[]] $pass = if ($legacy) { @($args | ForEach-Object { ConvertTo-Argument ([string] $_) }) } else { @($args) }
+
+# Always an array, empty when there are no arguments.
+$pass = @(
+    if (-not $legacy) { $args }
+    elseif ($onWindows) { $args | ForEach-Object { ConvertTo-WindowsLegacyArgument ([string] $_) } }
+    else { $args | ForEach-Object { ConvertTo-UnixLegacyArgument ([string] $_) } }
+)
+# Input piped to the shim goes to the binary; otherwise the binary reads the shim's own standard input.
+$piped = if ($MyInvocation.ExpectingInput) { @($input) } else { $null }
 
 $here = (Get-Location).ProviderPath
 $candidates = @(
@@ -66,6 +100,7 @@ foreach ($bin in $candidates) {
     # PowerShell on macOS and Linux expands `*`, `?` and `[...]` in every unquoted argument it passes to a native
     # program, splatted ones included; single-quoted literals are passed as written.
     $line = '& ' + ((@($bin) + $pass | ForEach-Object { "'" + ($_ -replace "'", "''") + "'" }) -join ' ')
+        if ($null -ne $piped) { $line = '$piped | ' + $line }
     try {
         Invoke-Expression $line
     } catch {
