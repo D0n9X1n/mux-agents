@@ -340,7 +340,7 @@ fn occupies(argv: &[String], session: &str) -> bool {
 }
 
 /// Every member record of every server folder of the state root, with its folder; one that cannot be read fails.
-fn every_record(ctx: &Ctx) -> Res<Vec<(PathBuf, Value)>> {
+pub(crate) fn every_record(ctx: &Ctx) -> Res<Vec<(PathBuf, Value)>> {
     let mut all = Vec::new();
     let servers = match std::fs::read_dir(&ctx.state_root) {
         Ok(entries) => entries,
