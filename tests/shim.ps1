@@ -220,6 +220,12 @@ if ($onWindows) {
     Check 'a_binary_that_cannot_start_fails_under_file' (($rc -ne 0) -and ($out -notmatch 'tier3'))
 }
 
+# A caller with its own local $LASTEXITCODE still gets the binary's exit code.
+Reset; Fake $tier3 'tier3'
+RunIn ("function f { `$local:LASTEXITCODE = 0; `$env:SHIM_EXIT = '7'; & $(Lit (Join-Path (Join-Path $root 'scripts') 'mux-agent.ps1')) s | Out-Null; " +
+    "'code=' + `$global:LASTEXITCODE }; f")
+Expect 'exit_code_reaches_a_scoped_caller' @('code=7')
+
 # Called with `&` and no arguments: the binary gets no arguments, not one empty one.
 Reset; Fake $tier3 'tier3'
 RunIn ("`$r = & $(Lit (Join-Path (Join-Path $root 'scripts') 'mux-agent.ps1')); 'captured=' + (`$r -join '|')")

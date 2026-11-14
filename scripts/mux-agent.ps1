@@ -130,8 +130,9 @@ foreach ($bin in $candidates) {
     } catch {
         throw
     }
-    if ($null -eq $LASTEXITCODE) { exit 1 }
-    exit $LASTEXITCODE
+    # Read the global one: a caller's local $LASTEXITCODE would otherwise hide the binary's code.
+    if ($null -eq $global:LASTEXITCODE) { exit 1 }
+    exit $global:LASTEXITCODE
 }
 
 [Console]::Out.Write('{"ok":false,"verb":null,"code":1,"check":"entry","message":"no usable mux-agent binary for ' + "$os-$arch" + '"}' + "`n")
