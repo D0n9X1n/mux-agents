@@ -493,3 +493,21 @@ fn a_custom_state_root_holds_the_release_and_the_spec() {
         .starts_with(&w.ctx.state_root)
     );
 }
+
+#[test]
+fn a_relative_state_root_is_refused_before_anything_is_made() {
+    // Windows accepts a relative MUX_AGENTS_STATE; `hold` and the launcher take only an absolute root, and every
+    // later verb or bar would resolve the same text against its own folder. `up` refuses it, making nothing.
+    let mut w = ready();
+    let rel = PathBuf::from(format!("mux-up-relative-{}", crate::util::hex32().unwrap()));
+    w.ctx.state_root = rel.clone();
+    let got = claude(&w);
+    let made = rel.exists();
+    let _ = std::fs::remove_dir_all(&rel);
+    let e = got.unwrap_err();
+    assert_eq!(
+        (e.code, e.check, e.message.as_str()),
+        (1, "state", "the state folder path is not absolute")
+    );
+    assert!(!made && w.fakes.mux_calls().is_empty() && !ran(&w));
+}

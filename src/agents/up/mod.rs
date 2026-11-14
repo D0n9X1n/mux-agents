@@ -36,6 +36,12 @@ pub fn up(ctx: &Ctx, request: &Request) -> Res<Map<String, Value>> {
         .value("Client")
         .and_then(client_named)
         .ok_or_else(|| usage("up"))?;
+    // Windows accepts a relative MUX_AGENTS_STATE. `hold` and the launcher take only an absolute root, and `up` cannot
+    // hand its later steps another root (they read ctx.state_root); a verb or bar run later would also resolve the same
+    // text against its own folder. So a relative root is refused before anything is made (#103).
+    if !ctx.state_root.is_absolute() {
+        return refuse(1, "state", "the state folder path is not absolute");
+    }
     let caller = person(ctx)?;
     let core = crate::hc::connect(ctx)?;
     let folder = identity::folder(ctx)?;
