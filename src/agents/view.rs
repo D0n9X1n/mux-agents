@@ -115,6 +115,26 @@ pub(crate) fn first(request: &Request) -> &str {
 
 /// An agent's one-line status in status.json, written under its agent lock. Only an agent pane with its own
 /// record in this session reports status, and only from a file.
+/// The running agent the caller is, for `status` and `report`: a member proven through its own hc terminal by its id
+/// (refused once it ended or has an end notice), else a running agent's own pane as one snapshot shows it, never its
+/// tag; none for a human.
+fn own_agent(ctx: &Ctx, caller: &Caller) -> Res<Option<registry::Me>> {
+    if let Some(me) = super::membership::proven_self(ctx, caller) {
+        return me.map(Some);
+    }
+    Ok(match caller.kind {
+        Kind::Agent => match registry::Snapshot::take(ctx, caller)?.own(caller) {
+            registry::Own::Agent(p) => Some(registry::Me {
+                name: p.name,
+                key: p.id,
+                record: Some(p.record),
+            }),
+            _ => None,
+        },
+        Kind::Human => None,
+    })
+}
+
 pub fn status(ctx: &Ctx, request: &Request) -> Res<Map<String, Value>> {
     let body_file = request.value("BodyFile");
     if request.value("Body").is_some() == body_file.is_some() {
@@ -122,17 +142,11 @@ pub fn status(ctx: &Ctx, request: &Request) -> Res<Map<String, Value>> {
     }
     let caller = resolve(ctx)?;
     // Only a running agent's own pane, as one snapshot shows it: never its tag.
-    let me = match caller.kind {
-        Kind::Agent => match registry::Snapshot::take(ctx, &caller)?.own(&caller) {
-            registry::Own::Agent(me) => Some(me),
-            _ => None,
-        },
-        Kind::Human => None,
-    };
+    let me = own_agent(ctx, &caller)?;
     let Some(me) = me else {
         return refuse(2, "target", "only an agent reports status");
     };
-    let (tag, record) = (me.id.as_str(), &me.record);
+    let tag = me.key.as_str();
     let Some(body_file) = body_file else {
         return refuse(2, "usage", FILES_ONLY);
     };
@@ -154,10 +168,7 @@ pub fn status(ctx: &Ctx, request: &Request) -> Res<Map<String, Value>> {
         Ok(())
     })?;
     let mut reply = Map::new();
-    reply.insert(
-        "name".into(),
-        record.get("name").cloned().unwrap_or(Value::Null),
-    );
+    reply.insert("name".into(), Value::from(me.name.clone()));
     reply.insert("text".into(), text.into());
     Ok(reply)
 }
@@ -177,23 +188,17 @@ pub fn report(ctx: &Ctx, request: &Request) -> Res<Map<String, Value>> {
         return Err(usage("report"));
     }
     let caller = resolve(ctx)?;
-    let me = match caller.kind {
-        Kind::Agent => match registry::Snapshot::take(ctx, &caller)?.own(&caller) {
-            registry::Own::Agent(me) => Some(me),
-            _ => None,
-        },
-        Kind::Human => None,
-    };
+    let me = own_agent(ctx, &caller)?;
     let Some(me) = me else {
         return refuse(2, "target", "only an agent reports its activity");
     };
     let file = state_dir(ctx, &caller)?
         .join("agents")
-        .join(&me.id)
+        .join(&me.key)
         .join("activity.json");
     let now = crate::util::utc_o(ctx.clock.now());
     let kind = kind.map_or(Value::Null, Value::from);
-    let since = lock(ctx, &lock_key("agent", &caller, &me.id), || {
+    let since = lock(ctx, &lock_key("agent", &caller, &me.key), || {
         let old = read_json(&file).ok().flatten();
         let same = old.as_ref().is_some_and(|old| {
             old.get("state").and_then(Value::as_str) == Some(state)
@@ -213,10 +218,7 @@ pub fn report(ctx: &Ctx, request: &Request) -> Res<Map<String, Value>> {
         Ok(since)
     })?;
     let mut reply = Map::new();
-    reply.insert(
-        "name".into(),
-        me.record.get("name").cloned().unwrap_or(Value::Null),
-    );
+    reply.insert("name".into(), Value::from(me.name.clone()));
     reply.insert("state".into(), state.into());
     reply.insert("kind".into(), kind);
     reply.insert("since".into(), since);

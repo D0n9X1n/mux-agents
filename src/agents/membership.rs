@@ -89,31 +89,30 @@ pub struct Snapshot {
 
 impl Snapshot {
     /// Resolve only the mailbox reader; notices never determine current membership.
+    /// Member `id` as hc sees it now: running, its record committed and, unless `noticed_ok`, with no end notice.
+    /// Anything else refuses 2 `parent`; another member's id is never this caller (#104 phase 1c).
+    pub fn member(&self, id: &str, noticed_ok: bool) -> Res<registry::Me> {
+        let observed = self.facts.local.iter().find(|o| o.identity.id == id);
+        let running = observed.is_some_and(|o| o.life == super::lifecycle::Life::Running);
+        match (observed, self.records.get(id)) {
+            (Some(o), Some(stored))
+                if running && stored.committed && (noticed_ok || !stored.noticed) =>
+            {
+                Ok(registry::Me {
+                    name: o.identity.name.clone(),
+                    key: id.to_string(),
+                    record: Some(stored.record.clone()),
+                })
+            }
+            _ => crate::error::refuse(2, "parent", "this agent cannot be proven to run"),
+        }
+    }
+
     pub fn reader(&self, caller: &Caller) -> Res<registry::Me> {
         // A member proven through its own hc terminal is itself by id, whichever pane shows it, or none (#104).
+        // Notices never decide whether it may read its own mailbox.
         if let Some(id) = &caller.member {
-            let running = self
-                .facts
-                .local
-                .iter()
-                .any(|o| &o.identity.id == id && o.life == super::lifecycle::Life::Running);
-            return match self.records.get(id) {
-                Some(stored) if running && stored.committed => {
-                    let name = self
-                        .facts
-                        .local
-                        .iter()
-                        .find(|o| &o.identity.id == id)
-                        .map(|o| o.identity.name.clone())
-                        .unwrap_or_default();
-                    Ok(registry::Me {
-                        name,
-                        key: id.clone(),
-                        record: Some(stored.record.clone()),
-                    })
-                }
-                _ => crate::error::refuse(2, "parent", "this agent cannot be proven to run"),
-            };
+            return self.member(id, true);
         }
         if let Some(error) = &self.view_error {
             return Err(error.clone());
@@ -252,3 +251,10 @@ impl Snapshot {
 #[cfg(test)]
 #[path = "membership_tests.rs"]
 mod tests;
+
+/// The caller itself when it is a member proven through its own hc terminal: that member as hc sees it now, never
+/// matched by pane, refused once it ended or has an end notice. None for a pane-proven caller (#104 phase 1c).
+pub fn proven_self(ctx: &Ctx, caller: &Caller) -> Option<Res<registry::Me>> {
+    let id = caller.member.as_ref()?;
+    Some(Snapshot::take(ctx, caller).and_then(|s| s.member(id, false)))
+}

@@ -236,7 +236,8 @@ fn hc_worker_commands_keep_mail_status_activity_and_spawn_fence() {
         w.file("body.txt", b"hello");
         proof(&w, &r);
         proof(&w, &r);
-        if args[0] == "read" {
+        // Every command but spawn re-checks the proven member in hc before acting as it (#104 phase 1c).
+        if args[0] != "spawn" {
             cf::online(&w);
             cf::listing(
                 &w,

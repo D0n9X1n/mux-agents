@@ -554,3 +554,61 @@ fn reader_takes_a_hc_proven_member_by_id_not_by_its_view() {
         w.fakes.hc_done().unwrap();
     }
 }
+
+// #104 phase 1c review: send, status and report take a proven member by id only while hc shows it running, its
+// record committed and with no end notice; read alone accepts a noticed member. Never another member's id.
+#[test]
+fn member_is_the_proven_id_only_while_running_and_unnoticed() {
+    for case in ["running", "noticed", "ended", "uncommitted", "other"] {
+        let w = World::human("");
+        let caller = w.caller();
+        let r = f::member(&w, ID, json!({"pane":"%1","window":"@1"}));
+        let mut t = f::wire(&r);
+        match case {
+            "ended" => {
+                t["state"] = json!("finished");
+                t["reason"] = json!("exited");
+            }
+            "noticed" => write(&w.folder(ID).join("notice.json"), json!({"kind":"stopped"})),
+            "uncommitted" => std::fs::remove_file(w.folder(ID).join("commit.json")).unwrap(),
+            _ => {}
+        }
+        w.pane_rows(&[]);
+        f::online(&w);
+        f::listing(&w, &team(&caller), &[]);
+        f::get(&w, "taaaaaaaaaaaa", t);
+        let snapshot = Snapshot::take(&w.ctx, &caller).unwrap();
+        let id = if case == "other" { "bbbbbbbbbbbb" } else { ID };
+        let strict = snapshot.member(id, false);
+        let reading = snapshot.member(id, true);
+        let me = registry::Me {
+            name: "worker".into(),
+            key: ID.into(),
+            record: Some(r.clone()),
+        };
+        let refused = |result: Res<registry::Me>| {
+            let e = result.unwrap_err();
+            (e.code, e.check, e.message)
+        };
+        let no = (
+            2,
+            "parent",
+            "this agent cannot be proven to run".to_string(),
+        );
+        match case {
+            "running" => {
+                assert_eq!(strict.unwrap(), me);
+                assert_eq!(reading.unwrap(), me);
+            }
+            "noticed" => {
+                assert_eq!(refused(strict), no);
+                assert_eq!(reading.unwrap(), me);
+            }
+            _ => {
+                assert_eq!(refused(strict), no, "{case}");
+                assert_eq!(refused(reading), no, "{case}");
+            }
+        }
+        w.fakes.hc_done().unwrap();
+    }
+}

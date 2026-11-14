@@ -58,8 +58,15 @@ pub fn board(ctx: &Ctx, caller: &Caller, all: bool, watch: bool) -> Res<Map<Stri
         .map(|id| snapshot.views[id].clone())
         .collect();
     let mine: Vec<_> = panes.iter().filter(|p| p.pane == caller.pane).collect();
-    let reader = match mine.as_slice() {
-        [p] => p.id.clone(),
+    // A member proven through its own hc terminal reads its own mailbox by id, whichever pane shows it (#104).
+    let proven = caller.member.as_ref().filter(|id| {
+        members
+            .iter()
+            .any(|o| &o.identity.id == *id && o.life == Life::Running)
+    });
+    let reader = match (proven, mine.as_slice()) {
+        (Some(id), _) => id.clone(),
+        (None, [p]) => p.id.clone(),
         _ => mailbox_key(&caller.pane, "")?,
     };
     let mut keys: Vec<_> = if watch {

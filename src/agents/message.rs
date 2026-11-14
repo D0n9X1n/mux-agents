@@ -40,7 +40,10 @@ pub fn send(ctx: &Ctx, request: &Request) -> Res<Map<String, Value>> {
     }
     // One snapshot names the sender and the recipient; a tag never names either.
     let snapshot = registry::Snapshot::take(ctx, &caller)?;
-    let me = self_of(&caller, &snapshot)?;
+    let me = match super::membership::proven_self(ctx, &caller) {
+        Some(me) => me?,
+        None => self_of(&caller, &snapshot)?,
+    };
     let pane = if target == "parent" {
         match &me.record {
             Some(record) => text(record.get("parentPane")),
