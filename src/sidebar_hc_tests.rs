@@ -97,10 +97,11 @@ fn click_next_prev_enter_reopen_detached_and_select_attached() {
                 .mux_rule("capture-pane", 0, "40\n \u{25c9} worker\n", "");
             cf::online(&w);
             let board = json!({"agents":[{"id":ID,"name":"worker","state":"running","pane":if present {json!("%9")} else {Value::Null}}]});
-            let target = pick::resolve(board.as_object().unwrap(), "worker").unwrap();
+            let target = Target::of(board["agents"][0].as_object().unwrap());
             let mut shown = Shown {
                 written: SystemTime::UNIX_EPOCH,
                 targets: vec![target],
+                drawn: vec![(ID.to_string(), 0, "\u{25c9} worker".to_string())],
                 width: 40,
                 looking: None,
             };
@@ -122,7 +123,6 @@ fn click_next_prev_enter_reopen_detached_and_select_attached() {
                 },
                 &mut pick,
                 &mut shown,
-                board.as_object()
             ));
             assert_eq!(shown.looking.as_deref(), Some(pane));
             assert_eq!(shown.targets[0].pane, pane);
@@ -197,7 +197,10 @@ fn lifecycle_words_are_visible_in_ascii_and_unicode() {
                 .expect("lifecycle row hidden");
             assert!(row.contains(state), "{row}");
             assert!(!rows.iter().any(|r| r.contains("+1 more")));
-            assert!(pick::resolve(board.as_object().unwrap(), "worker").is_none());
+            assert_ne!(
+                Target::of(board["agents"][0].as_object().unwrap()).life,
+                "running"
+            );
         }
     }
 }

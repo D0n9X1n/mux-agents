@@ -519,6 +519,21 @@ fn targets(laid: &Laid) -> Vec<Target> {
         .collect()
 }
 
+/// Each drawn agent row: its member id, its row and its text after column 0, as `pick::frame_hit` compares them.
+fn drawn(laid: &Laid) -> Vec<(String, usize, String)> {
+    let text = |at: usize| {
+        laid.rows[at]
+            .iter()
+            .skip(1)
+            .map(|(t, _)| t.as_str())
+            .collect::<String>()
+    };
+    laid.agents
+        .iter()
+        .map(|(t, at)| (t.id.clone(), *at, text(*at)))
+        .collect()
+}
+
 /// The rows a board can draw, before the height decides which are kept.
 struct Parts {
     // Between a section's name and its count: `·`, or `-` in ASCII.
@@ -1484,6 +1499,7 @@ pub fn run_watch(
         let mut shown = Shown {
             written: ctx.clock.now(),
             targets: targets(&laid),
+            drawn: drawn(&laid),
             width: size.width,
             looking: viewing.pane.clone(),
         };
@@ -1517,15 +1533,7 @@ pub fn run_watch(
                 if read.event == Event::Interrupt {
                     return "interrupted";
                 }
-                redraw |= act(
-                    ctx,
-                    caller,
-                    look,
-                    read,
-                    &mut pick,
-                    &mut shown,
-                    last.as_ref(),
-                );
+                redraw |= act(ctx, caller, look, read, &mut pick, &mut shown);
             }
             if redraw {
                 break;
@@ -1797,6 +1805,8 @@ fn click_read(bar: &str) -> [&str; 10] {
 struct Shown {
     written: SystemTime,
     targets: Vec<Target>,
+    // Each agent row's id, row and text, for hits.
+    drawn: Vec<(String, usize, String)>,
     width: usize,
     // The pane the session showed at this frame (herdr's next / previous start from it).
     looking: Option<String>,
@@ -1832,7 +1842,6 @@ fn act(
     read: keys::Read,
     pick: &mut Pick,
     shown: &mut Shown,
-    board: Option<&Map<String, Value>>,
 ) -> bool {
     match read.event {
         Event::Press { button: 0, y, .. } => {
@@ -1841,7 +1850,7 @@ fn act(
             if look.ascii || stale {
                 return true;
             }
-            if let Some(target) = click(ctx, caller, y, shown.width, board) {
+            if let Some(target) = click(ctx, caller, y, shown) {
                 match focus_target_hc(ctx, caller, &target) {
                     Ok(focused) => shown.focused(focused),
                     Err(_) => pick.failed(&target.name),
@@ -1932,12 +1941,7 @@ fn peek(ctx: &Ctx, caller: &Caller, target: &Target) -> Res<()> {
         let _ = std::fs::remove_file(&file);
         return refuse(1, "internal", "the peek file's path is not text");
     };
-    let popup = popup_argv(&caller.pane, path, crate::state::root::HOST);
-    let popup = popup
-        .iter()
-        .map(|a| format!("'{a}'"))
-        .collect::<Vec<_>>()
-        .join(" ");
+    let popup = popup_command(&caller.pane, path);
     let shown = native(ctx, &["run-shell", "-b", "-C", &popup], true)
         .ok()
         .filter(|o| o.code == 0);
@@ -1956,6 +1960,15 @@ fn plain_path(path: &str, os: crate::state::root::OsKind) -> bool {
             || " _.-/:+,@=~".contains(c)
             || (c == '\\' && os == crate::state::root::OsKind::Windows)
     })
+}
+
+/// The `run-shell -C` argument that opens the popup paging `path` over `bar`'s client: `popup_argv`, each word single-quoted.
+pub fn popup_command(bar: &str, path: &str) -> String {
+    popup_argv(bar, path, crate::state::root::HOST)
+        .iter()
+        .map(|a| format!("'{a}'"))
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// The popup that pages `path` (a `plain_path`) over the client showing `bar`'s session, deleting it once read, so a
@@ -1981,20 +1994,13 @@ fn popup_argv(bar: &str, path: &str, os: crate::state::root::OsKind) -> Vec<Stri
         .collect()
 }
 
-/// The running agent on row `y` of the bar, read in one call: none unless the call answers, the bar is `width`
-/// columns wide (the frame's width), row `y` is a name line and its name is exactly one running agent on `board`.
-fn click(
-    ctx: &Ctx,
-    caller: &Caller,
-    y: u16,
-    width: usize,
-    board: Option<&Map<String, Value>>,
-) -> Option<Target> {
+/// The agent row a press on row `y` hit, read in one call and confirmed against the frame on screen.
+fn click(ctx: &Ctx, caller: &Caller, y: u16, shown: &Shown) -> Option<Target> {
     let read = native(ctx, &click_read(&caller.pane), true)
         .ok()
         .filter(|read| read.code == 0)?;
-    let name = pick::screen_hit(&read.stdout, width, y)?;
-    pick::resolve(board?, name)
+    let id = pick::frame_hit(&read.stdout, shown.width, y, &shown.drawn)?;
+    shown.targets.iter().find(|t| t.id == id).cloned()
 }
 
 /// The side-bar pane's process: draws the board to stdout until its pane closes, reading its own terminal when
@@ -3371,20 +3377,6 @@ mod tests {
         Target::new(name, pane)
     }
 
-    // A line as a pane `w` columns wide shows it: pieces of at most `w` columns, the first its head.
-    fn reflow(line: &str, w: usize) -> Vec<String> {
-        let mut pieces = Vec::new();
-        let mut piece = String::new();
-        for c in line.chars() {
-            if paint::width(&piece) + paint::width(&c.to_string()) > w {
-                pieces.push(std::mem::take(&mut piece));
-            }
-            piece.push(c);
-        }
-        pieces.push(piece);
-        pieces
-    }
-
     #[test]
     fn own_glyphs_in_agent_text() {
         let board = json!({"running": 2, "endedTotal": 1, "agents": [
@@ -3549,69 +3541,31 @@ mod tests {
     }
 
     #[test]
-    fn row_hit_on_real_layout_output() {
-        // Agent text holding the bar's glyphs and its ASCII ones, at offsets that bring them to a piece's head.
+    fn drawn_rows_hit_their_own_agent_and_nothing_else() {
         let text = |lead: &str| format!("{lead}\u{25c9} x  \u{25cc} y  * z  x w  ").repeat(6);
-        let board = json!({"running": 3, "endedTotal": 1, "agents": [
-            {"name": "add-subtract", "state": "running", "model": "\u{25c9} x", "doing": text(""), "age": 42, "unread": 0, "color": "blue", "waiting": false, "pane": "%1"},
-            {"name": "test-calc", "state": "running", "model": "x w", "doing": text("x "), "age": 180, "unread": 1, "color": "magenta", "waiting": true, "pane": "%2"},
-            {"name": "fix-ci-flake", "state": "running", "model": "\u{25cc} y", "doing": text("* z  "), "age": 660, "unread": 0, "color": "bright-blue", "waiting": false, "pane": "%3"},
-            {"name": "\u{25c9} x", "state": "exited", "exitCode": 0, "age": 1080}
-        ]});
-        let notes = ["\u{25c9} x", " \u{25cc} y"];
-        let ascii = Look {
-            ascii: true,
-            ..PLAIN_LOOK
-        };
-        // A hit names a prefix of the agent drawn there (a cut name ends in `...`).
-        let names = |hit: &str, name: &str| name.starts_with(hit.trim_end_matches("..."));
-        let mut hits = 0;
+        let board = json!({"running": 2, "endedTotal": 1, "agents": [
+            {"name": "add-subtract", "state": "running", "model": "\u{25c9} x", "doing": text(""), "age": 42, "pane": "%1"},
+            {"name": "test-calc", "state": "running", "doing": text("x "), "age": 180, "unread": 1, "pane": "%2"},
+            {"name": "\u{25c9} x", "state": "exited", "exitCode": 0, "age": 1080}]});
         for (width, height) in [(40, 40), (40, 8), (30, 24), (18, 24)] {
-            let size = Size { width, height };
-            let styled: Vec<(&str, Style)> = notes.iter().map(|note| (*note, DIM)).collect();
-            let laid = lay(board.as_object(), &styled, size, PLAIN_LOOK);
-            let lines = format_board(board.as_object(), &notes, size, PLAIN_LOOK);
-            assert!(!laid.agents.is_empty(), "{size:?}");
-            // The agent whose name line is row `at`, if any.
-            let owner = |at: usize| {
-                laid.agents
+            let laid = lay(board.as_object(), &[], Size { width, height }, PLAIN_LOOK);
+            let lines: Vec<String> = laid.rows.iter().map(|r| render(r, false)).collect();
+            let answer = format!("{width}\n{}\n", lines.join("\n"));
+            let hits = drawn(&laid);
+            for at in 0..lines.len() {
+                let want = laid
+                    .agents
                     .iter()
                     .find(|(_, row)| *row == at)
-                    .map(|(target, _)| target.name.as_str())
-            };
-            for (at, line) in lines.iter().enumerate() {
-                match (pick::row_hit(line), owner(at)) {
-                    (Some(hit), Some(name)) => {
-                        assert!(names(hit, name), "{size:?} {at}: {line:?}");
-                        hits += 1;
-                    }
-                    (got, _) => assert_eq!(got, None, "{size:?} {at}: {line:?}"),
-                }
-                for w in [12, 15, 20] {
-                    for (part, piece) in reflow(line, w).iter().enumerate() {
-                        match (pick::row_hit(piece), owner(at).filter(|_| part == 0)) {
-                            (Some(hit), Some(name)) => {
-                                assert!(names(hit, name), "{size:?} w={w} {at}: {piece:?}");
-                            }
-                            (got, _) => assert_eq!(got, None, "{size:?} w={w} {at}: {piece:?}"),
-                        }
-                    }
-                }
-            }
-            for line in format_board(board.as_object(), &notes, size, ascii) {
-                for w in [usize::MAX, 12, 15, 20] {
-                    for piece in reflow(&line, w) {
-                        assert_eq!(
-                            pick::row_hit(&piece),
-                            None,
-                            "{size:?} ascii w={w}: {piece:?}"
-                        );
-                    }
-                }
+                    .map(|(t, _)| t.id.as_str());
+                let y = u16::try_from(at + 1).unwrap();
+                assert_eq!(
+                    pick::frame_hit(&answer, width, y, &hits),
+                    want,
+                    "{width}x{height} {at}"
+                );
             }
         }
-        // Every size draws its agents' name lines, and each is hit.
-        assert!(hits >= 4, "{hits}");
     }
 
     #[test]

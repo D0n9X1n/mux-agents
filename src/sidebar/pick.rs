@@ -62,19 +62,30 @@ pub fn step_live(walk: &[Target], from: Option<usize>, forward: bool) -> Option<
         .find(|&at| !walk[at].pane.is_empty())
 }
 
-/// The answer of `display-message -p '#{pane_width}' ; capture-pane -p`: its first line is the width, then the rows.
-/// None unless that width is `width` (the frame on screen) and row `y` (1-based) is a name line. A pane of another
-/// width reflowed the frame, so its rows are not the rows the user clicked.
-pub fn screen_hit(answer: &str, width: usize, y: u16) -> Option<&str> {
+/// The agent row a press on row `y` (1-based) hit, from the drawn frame's metadata (#103 B6): the answer of
+/// `display-message -p '#{pane_width}' ; capture-pane -p` must be at `width` (the frame's) and its line `y` must still show
+/// that row's text after column 0 (margin, `●` or selection). Header, doing, fold and note lines are in no `drawn`
+/// entry, so they hit nothing, whatever their text names.
+pub fn frame_hit<'a>(
+    answer: &str,
+    width: usize,
+    y: u16,
+    drawn: &'a [(String, usize, String)],
+) -> Option<&'a str> {
     let (head, rows) = answer.split_once('\n')?;
     if head.trim_end_matches('\r').parse::<usize>().ok()? != width || y == 0 {
         return None;
     }
-    row_hit(rows.lines().nth(usize::from(y) - 1)?)
+    let at = usize::from(y) - 1;
+    let (id, _, text) = drawn.iter().find(|(_, row, _)| *row == at)?;
+    let line = rows.lines().nth(at)?;
+    let rest = line.char_indices().nth(1).map_or("", |(i, _)| &line[i..]);
+    (rest.trim_end() == text.trim_end()).then_some(id.as_str())
 }
 
 /// The name on a bar name line: margin (' ', '▸', '>'), a live glyph ('!', '✦', '◉', '◌'), ' ', then the name to
 /// the next space.
+#[cfg(test)]
 pub fn row_hit(line: &str) -> Option<&str> {
     let mut chars = line.chars();
     let margin = matches!(chars.next()?, ' ' | '\u{25b8}' | '>');
@@ -85,25 +96,6 @@ pub fn row_hit(line: &str) -> Option<&str> {
     let rest = chars.as_str();
     let name = &rest[..rest.find(' ').unwrap_or(rest.len())];
     (!name.is_empty()).then_some(name)
-}
-
-/// The running agent `shown` names, each board field cleaned as the bar drew it: by prefix when `shown` ends in
-/// `...` (a cut name), else exactly. None unless exactly one row matches.
-pub fn resolve(board: &Map<String, Value>, shown: &str) -> Option<Target> {
-    let rows = board.get("agents").and_then(Value::as_array);
-    let cut = shown.strip_suffix("...");
-    let mut found = rows
-        .map_or(&[][..], Vec::as_slice)
-        .iter()
-        .filter_map(Value::as_object)
-        .filter(|row| super::clean(row.get("state")) == "running")
-        .map(Target::of)
-        .filter(|target| match cut {
-            Some(head) => target.name.starts_with(head),
-            None => target.name == shown,
-        });
-    let one = found.next()?;
-    found.next().is_none().then_some(one)
 }
 
 /// herdr's next (`forward`) or previous agent: the drawn agent after (before) the one on `looking` (the pane the
@@ -290,52 +282,12 @@ mod tests {
         format!(" {left}{}{right}", " ".repeat(38 - used))
     }
 
-    // The bar at 40 columns as `capture-pane -p` gives it back (`sidebar::tests::board_rows` is private).
-    fn frame() -> String {
-        [
-            pad("mux-agents", "2 running / 1 ended"),
-            String::new(),
-            pad("\u{25c9} worker", "working   4m"),
-            "   testing the parser".to_string(),
-            String::new(),
-            pad("\u{25cc} writer-two", "waiting   3m"),
-            String::new(),
-            format!(" ended {}", "-".repeat(31)),
-            pad("\u{2713} docs-usage", "done  18m"),
-        ]
-        .join("\n")
-    }
-
     fn target(name: &str) -> Target {
         Target::new(name, &format!("%{}", name.len()))
     }
 
     fn drawn(names: &[&str]) -> Vec<Target> {
         names.iter().map(|name| target(name)).collect()
-    }
-
-    #[test]
-    fn screen_hit_needs_the_frames_width() {
-        let answer = format!("40\n{}\n", frame());
-        assert_eq!(screen_hit(&answer, 40, 3), Some("worker"));
-        assert_eq!(screen_hit(&answer, 40, 6), Some("writer-two"));
-        // The header, the doing line, a blank line and an ended row are no name lines.
-        for y in [1, 2, 4, 9] {
-            assert_eq!(screen_hit(&answer, 40, y), None, "y={y}");
-        }
-        // The pane is narrower or wider than the frame on screen.
-        assert_eq!(screen_hit(&format!("30\n{}\n", frame()), 40, 3), None);
-        assert_eq!(screen_hit(&format!("55\n{}\n", frame()), 40, 3), None);
-        assert_eq!(screen_hit(&format!("forty\n{}\n", frame()), 40, 3), None);
-        assert_eq!(screen_hit(&answer, 40, 0), None);
-        assert_eq!(screen_hit(&answer, 40, 10), None);
-        assert_eq!(screen_hit("", 40, 1), None);
-        // The frame at 40 shows `writer-two`; a capture at width 9 reflows its head to ` ◉ writer`, a whole name line
-        // on its own, and is refused for its width.
-        let split = "9\n mux-agen\nts  2 run\n \u{25c9} writer\n-two   wa\niting   3m\n";
-        assert_eq!(row_hit(" \u{25c9} writer"), Some("writer"));
-        assert_eq!(screen_hit(split, 40, 3), None);
-        assert_eq!(screen_hit(split, 9, 3), Some("writer"));
     }
 
     #[test]
@@ -405,33 +357,6 @@ mod tests {
         assert_eq!(pick.chosen(&drawn), None);
         pick.key(Event::Down, &drawn);
         assert_eq!(pick.chosen(&drawn).map(|t| t.name.as_str()), Some("b"));
-    }
-
-    #[test]
-    fn resolve_unique_cut_and_ambiguous() {
-        let board = |agents: Value| json!({ "agents": agents }).as_object().unwrap().clone();
-        let worker = json!({"name": "worker", "state": "running", "pane": "%9"});
-        let word = json!({"name": "word", "state": "running", "pane": "%4"});
-        let ended = json!({"name": "worker", "state": "exited", "pane": "%3"});
-        let found = Some(Target::new("worker", "%9"));
-        let one = board(json!([worker, ended]));
-        assert_eq!(resolve(&one, "worker"), found);
-        assert_eq!(resolve(&one, "wor..."), found);
-        // Only a cut name (ending in `...`) matches by prefix; any other must be the whole name.
-        assert_eq!(resolve(&one, "work"), None);
-        assert_eq!(resolve(&board(json!([worker, word])), "wor..."), None);
-        assert_eq!(
-            resolve(&board(json!([worker, word])), "word"),
-            Some(Target::new("word", "%4"))
-        );
-        assert_eq!(resolve(&board(json!([ended])), "worker"), None);
-        // Two running agents with the same name: ambiguous, so neither.
-        let twin = json!({"name": "worker", "state": "running", "pane": "%5"});
-        assert_eq!(resolve(&board(json!([worker, twin])), "worker"), None);
-        assert_eq!(resolve(&one, "nobody"), None);
-        // A board field is cleaned before it is compared, as the bar drew it.
-        let dirty = board(json!([{"name": "work\u{1b}er", "state": "running\n", "pane": "%9"}]));
-        assert_eq!(resolve(&dirty, "worker"), found);
     }
 
     #[test]
@@ -609,6 +534,45 @@ mod tests {
                 t.life.as_str()
             ),
             ("x", "e", "", "ended")
+        );
+    }
+
+    #[test]
+    fn frame_hit_needs_the_width_the_row_and_its_text() {
+        let line = "\u{25c9} twin           working   4m".to_string();
+        let drawn = vec![
+            ("aaaaaaaaaaaa".to_string(), 1, line.clone()),
+            ("bbbbbbbbbbbb".to_string(), 2, line.clone()),
+        ];
+        let screen = format!(" mux-agents\n\u{25cf}{line}\n\u{25b8}{line}\n   twin is doing it\n");
+        let answer = format!("40\n{screen}");
+        assert_eq!(frame_hit(&answer, 40, 2, &drawn), Some("aaaaaaaaaaaa"));
+        assert_eq!(
+            frame_hit(&answer, 40, 3, &drawn),
+            Some("bbbbbbbbbbbb"),
+            "the clicked one of two names"
+        );
+        for y in [0, 1, 4, 9] {
+            assert_eq!(
+                frame_hit(&answer, 40, y, &drawn),
+                None,
+                "{y}: header, doing line, past the end"
+            );
+        }
+        assert_eq!(
+            frame_hit(&format!("41\n{screen}"), 40, 2, &drawn),
+            None,
+            "reflowed"
+        );
+        assert_eq!(
+            frame_hit(
+                "40\n mux-agents\n \u{25c9} other  working   4m\n",
+                40,
+                2,
+                &drawn
+            ),
+            None,
+            "redrawn"
         );
     }
 }
