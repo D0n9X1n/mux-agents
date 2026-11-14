@@ -174,6 +174,13 @@ $lines = @($out -split "`n")
 Check 'no_argument_runs_as_code' (($rc -eq 0) -and ($lines.Count -eq 7) -and ($lines[1] -eq '[q]') -and
     -not ($lines -contains 'INJECTED') -and @($lines[2..6] | Where-Object { $_ -notlike '*; Write-Output INJECTED; #]' }).Count -eq 0)
 
+# `--%` cannot be passed on as written by any PowerShell call of a program, so the shim refuses it and runs nothing,
+# never a changed command. Called in-process, since `pwsh -File` itself drops `--%` before a script sees it.
+Reset; Fake $tier3 'tier3'
+RunIn ("`$env:SHIM_PROBE = 'EXPANDED'; & $(Lit (Join-Path (Join-Path $root 'scripts') 'mux-agent.ps1')) " +
+    "x '--%' 'a b' '%SHIM_PROBE%'; exit `$LASTEXITCODE")
+Expect 'stop_parsing_token_is_refused' @('{"ok":false,"verb":null,"code":1,"check":"entry","message":"the PowerShell entry cannot pass the argument --%"}') 1
+
 # Called with `&` and no arguments: the binary gets no arguments, not one empty one.
 Reset; Fake $tier3 'tier3'
 RunIn ("`$r = & $(Lit (Join-Path (Join-Path $root 'scripts') 'mux-agent.ps1')); 'captured=' + (`$r -join '|')")

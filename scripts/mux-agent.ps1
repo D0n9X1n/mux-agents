@@ -86,6 +86,14 @@ $pass = @(
 # Input piped to the shim goes to the binary; otherwise the binary reads the shim's own standard input.
 $piped = if ($MyInvocation.ExpectingInput) { @($input) } else { $null }
 
+# PowerShell gives `--%` ("stop parsing") a meaning in every way it calls a program: quoted, in a variable or in
+# parentheses it is dropped or makes PowerShell pass the rest of the line raw, so no PowerShell entry can pass it
+# on as written. mux-agent never takes it; the shim refuses it rather than run a changed command.
+if (@($args | Where-Object { [string] $_ -eq '--%' }).Count) {
+    [Console]::Out.Write('{"ok":false,"verb":null,"code":1,"check":"entry","message":"the PowerShell entry cannot pass the argument --%"}' + "`n")
+    exit 1
+}
+
 $here = (Get-Location).ProviderPath
 $candidates = @(
     $env:MUX_AGENTS_BIN,
