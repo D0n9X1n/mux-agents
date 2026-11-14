@@ -1125,8 +1125,7 @@ fn readme_line_ok(line: &str) -> bool {
 const SKILL_PWSH_NOTE: &str = "The commands below, and the Reply and Listen lines, run as-is in the Bash tool. In PowerShell, prefix `& ` (`& \"<exe>\" send parent …`).";
 
 /// The skill's other PowerShell line: the Shell shortcuts section's source line for a PowerShell profile.
-const SKILL_SHORTCUT_PWSH_LINE: &str =
-    "- PowerShell, in `$PROFILE`: `. \"<plugin folder>/scripts/shell/mux-agents.ps1\"`";
+const SKILL_SHORTCUT_PWSH_LINE: &str = "- PowerShell, in `$PROFILE` (the primary shell for the shortcuts on Windows): `. \"<plugin folder>/scripts/shell/mux-agents.ps1\"`";
 
 /// Hooks and their tests may name the old `mux-agent.ps1` (spawn detection keeps accepting a 0.1 command line) and
 /// Claude Code's `PowerShell` tool, whose calls the pane watches as it watches Bash.
@@ -1379,6 +1378,7 @@ fn skill_documents_shell_shortcuts() {
         "`--%`",
         "`$LASTEXITCODE`",
         "type `claude` or `copilot` for the bare client",
+        "Under Git Bash, MSYS rewrites POSIX-looking paths",
     ] {
         assert!(
             section.contains(needle),

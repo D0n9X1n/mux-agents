@@ -217,12 +217,11 @@ cases="$tmp/sc cases"
 mkdir -p "$cases"
 unset MUX_AGENTS_HOME
 
-# sc_fake <path> <label>: an entry that prints the label and each argument as [arg]; with FAKE_ENV set, also the two
-# MSYS variables it sees. It exits FAKE_EXIT (0 by default).
+# sc_fake <path> <label>: an entry that prints the label and each argument as [arg], then exits FAKE_EXIT (0 by default).
 sc_fake() {
   mkdir -p "$(dirname "$1")"
   # shellcheck disable=SC2016 # the expansions belong to the fake
-  printf '#!/bin/sh\necho %s\nfor a in "$@"; do printf "[%%s]\\n" "$a"; done\n[ -z "${FAKE_ENV-}" ] || printf "env=%%s|%%s\\n" "${MSYS2_ARG_CONV_EXCL-unset}" "${MSYS_NO_PATHCONV-unset}"\nexit "${FAKE_EXIT:-0}"\n' "$2" >"$1"
+  printf '#!/bin/sh\necho %s\nfor a in "$@"; do printf "[%%s]\\n" "$a"; done\nexit "${FAKE_EXIT:-0}"\n' "$2" >"$1"
   chmod +x "$1"
 }
 
@@ -235,9 +234,9 @@ sc_reset() {
   sc_fake "$sc_root/scripts/mux-agent" entry
   sc_fake "$sc_home/scripts/mux-agent" home
   cp "$sc_file" "$sc_else/copy.sh"
-  ln -s "$sc_file" "$sc_else/link.sh"
+  ln -s "$sc_file" "$sc_else/link.sh" 2>/dev/null
   : >"$sc_glob/match-me"
-  unset FAKE_EXIT FAKE_ENV MUX_AGENTS_HOME
+  unset FAKE_EXIT MUX_AGENTS_HOME
 }
 
 # sc_run <shell> <dir> <case> [args...]: runs the case script under the shell, with no rc file, from dir; sets out,
@@ -295,12 +294,11 @@ cat >"$cases/away" <<'EOF'
 cd "$2" || exit 91
 cc h
 EOF
-cat >"$cases/msys" <<'EOF'
+cat >"$cases/keep" <<'EOF'
+__mux_agents_init() { echo mine; }
 . "$1" || exit 90
-export MSYS2_ARG_CONV_EXCL=keep FAKE_ENV=1
-unset MSYS_NO_PATHCONV
-cc m
-printf 'after=%s|%s\n' "${MSYS2_ARG_CONV_EXCL-unset}" "${MSYS_NO_PATHCONV-unset}"
+__mux_agents_init
+cc k
 EOF
 cat >"$cases/wargs" <<'EOF'
 . "$1" || exit 90
@@ -344,9 +342,30 @@ shortcut_cases() {
   sc_reset; sc_fake "$tmp/sc path/mux-agent" on-path; sc_run "$s" "$tmp" path "$sc_file" "$tmp/sc path"
   sc_expect "${s}_mux_agent_on_path_never_used" "$(sc_up entry claude p)"
 
+  # An empty MUX_AGENTS_HOME counts as unset: the sourced file's plugin runs.
+  sc_reset; MUX_AGENTS_HOME=; export MUX_AGENTS_HOME; sc_run "$s" "$tmp" gg "$sc_file"; unset MUX_AGENTS_HOME
+  sc_expect "${s}_empty_home_uses_the_sourced_plugin" "$(sc_up entry copilot x)"
+
+  # Sourcing touches cc, gg and __mux_agents_entry only: a caller's own function of another name survives.
+  sc_reset; sc_run "$s" "$tmp" keep "$sc_file"
+  sc_expect "${s}_caller_function_survives_sourcing" "mine
+$(sc_up entry claude k)"
+
   # MUX_AGENTS_HOME, absolute and relative to where the file is sourced, names the plugin for a copied or symlinked
-  # file, and still does after a cd.
+  # file, and still does after a cd. Git Bash's ln -s may copy instead of linking; then the link cases are skipped,
+  # except in CI on Linux and macOS, where they must run.
   for f in copy link; do
+    if [ "$f" = link ]; then
+      sc_reset
+      if [ ! -L "$sc_else/link.sh" ]; then
+        if [ -n "${CI-}" ] && { [ "$os" = linux ] || [ "$os" = macos ]; }; then
+          bad "${s}_home_link_cases" "ln -s made no symlink"
+        else
+          echo "skip ${s}_home_*_link_after_cd (ln -s made no symlink)"
+        fi
+        continue
+      fi
+    fi
     for h in abs rel; do
       sc_reset
       if [ "$h" = abs ]; then MUX_AGENTS_HOME=$sc_home; else MUX_AGENTS_HOME=${sc_home#"$tmp"/}; fi
@@ -368,13 +387,6 @@ shortcut_cases() {
     bad "${s}_missing_entry_warns_and_defines_nothing" "rc=$rc out=$out err=$err"
   fi
 
-  # The caller's MSYS variables are as before; the entry sees them set on Git Bash, MSYS and Cygwin only.
-  if [ "$os" = windows ]; then seen='*|1'; else seen='keep|unset'; fi
-  sc_reset; sc_run "$s" "$tmp" msys "$sc_file"
-  sc_expect "${s}_msys_variables_only_in_the_call" "$(sc_up entry claude m)
-env=$seen
-after=keep|unset"
-
   sc_reset; sc_run "$s" "$tmp" snap "$sc_file" "$sc_snap" twice
   if [ "$rc" = 0 ] && [ "$out" = "$(sc_up entry claude t)" ] && [ -z "$err" ] && sc_grew opts && sc_grew funcs cc gg &&
     sc_grew vars __mux_agents_entry; then
@@ -392,14 +404,16 @@ for s in ${SHIM_SHELLS:-bash zsh}; do
   shortcut_cases "$s"
 done
 
-# Git Bash's real boundary: a native Windows program, the recorder tests/shim.ps1 builds, receives the arguments as cc
-# gave them, path-like ones included, which Git Bash rewrites for a native program without the two MSYS variables.
+# Git Bash's real boundary: a native Windows program, the recorder tests/shim.ps1 builds, receives cc's arguments as
+# MSYS rewrites them for any native program (a POSIX-looking path becomes a Windows one), and no path-conversion
+# variable is set in its environment: neither cc nor the shim sets one.
 windows_boundary() {
+  unset MSYS2_ARG_CONV_EXCL MSYS_NO_PATHCONV
   rec="$tmp/rec"
   mkdir -p "$rec"
   awk -v q="'" '$0 ~ ("-Value @" q "$") { c = 1; next } index($0, q "@") == 1 { c = 0 } c' "$repo/tests/shim.ps1" >"$rec/stub.cs"
   csc="$(cygpath -u "${WINDIR:-C:/Windows}")/Microsoft.NET/Framework64/v4.0.30319/csc.exe"
-  MSYS2_ARG_CONV_EXCL='*' "$csc" /nologo "/out:$(cygpath -w "$rec/mux-agent.exe")" "$(cygpath -w "$rec/stub.cs")" >/dev/null
+  "$csc" -nologo "-out:$(cygpath -w "$rec/mux-agent.exe")" "$(cygpath -w "$rec/stub.cs")" >/dev/null
   if [ ! -f "$rec/mux-agent.exe" ]; then bad windows_recorder "csc built nothing"; return; fi
   echo rec >"$rec/label.txt"
   w_root="$tmp/w plug"
@@ -407,38 +421,30 @@ windows_boundary() {
   mkdir -p "$w_root"
   cp -R "$repo/scripts" "$w_root/scripts"
   rm -rf "$w_root/scripts/bin"
+  f=$(cygpath -m /tmp/f)
+  envf="$tmp/rec env"
+  export SHIM_ENV_FILE
+  SHIM_ENV_FILE=$(cygpath -w "$envf")
 
   # Through MUX_AGENTS_BIN and the real shim, called via cc.
   export MUX_AGENTS_BIN="$rec/mux-agent.exe"
-  sc_run bash "$tmp" wargs "$w_file"
+  rm -f "$envf"; sc_run bash "$tmp" wargs "$w_file"
   out=$(printf '%s\n' "$out" | tr -d '\r')
-  sc_expect windows_cc_paths_reach_a_native_program_unchanged "$(sc_up rec claude /tmp/f --dir=/tmp/f)"
-
-  # The shim's own exec carries the two variables, whoever calls it.
-  out=$(env -u MSYS2_ARG_CONV_EXCL -u MSYS_NO_PATHCONV sh "$w_root/scripts/mux-agent" /tmp/f --dir=/tmp/f 2>"$tmp/sc err")
-  rc=$?
-  out=$(printf '%s\n' "$out" | tr -d '\r')
-  err=$(cat "$tmp/sc err")
-  sc_expect windows_shim_exec_carries_the_variables "rec
-[/tmp/f]
-[--dir=/tmp/f]"
+  sc_expect windows_cc_paths_get_the_msys_rewrite "$(sc_up rec claude "$f" "--dir=$f")"
+  got=$(tr -d '\r' <"$envf" 2>/dev/null)
+  if [ "$got" = 'unset|unset' ]; then ok windows_no_conversion_variable_reaches_the_program; else bad windows_no_conversion_variable_reaches_the_program "env=$got"; fi
   unset MUX_AGENTS_BIN
-
-  # Control: without the two variables Git Bash rewrites both arguments.
-  out=$(env -u MSYS2_ARG_CONV_EXCL -u MSYS_NO_PATHCONV "$rec/mux-agent.exe" /tmp/f --dir=/tmp/f | tr -d '\r')
-  case $out in
-    *'[/tmp/f]'* | *'[--dir=/tmp/f]'* | *'[--dir=]'*) bad windows_control_without_the_variables_rewrites "$out" ;;
-    rec*'[--dir='*) ok windows_control_without_the_variables_rewrites ;;
-    *) bad windows_control_without_the_variables_rewrites "$out" ;;
-  esac
 
   # No MUX_AGENTS_BIN: the shim selects scripts/bin/windows-<arch>/mux-agent.exe.
   mkdir -p "$w_root/scripts/bin/windows-$arch"
   cp "$rec/mux-agent.exe" "$w_root/scripts/bin/windows-$arch/mux-agent.exe"
   echo bin >"$w_root/scripts/bin/windows-$arch/label.txt"
-  sc_run bash "$tmp" wargs "$w_file"
+  rm -f "$envf"; sc_run bash "$tmp" wargs "$w_file"
   out=$(printf '%s\n' "$out" | tr -d '\r')
-  sc_expect "windows_shim_selects_bin_windows_${arch}" "$(sc_up bin claude /tmp/f --dir=/tmp/f)"
+  sc_expect "windows_shim_selects_bin_windows_${arch}" "$(sc_up bin claude "$f" "--dir=$f")"
+  got=$(tr -d '\r' <"$envf" 2>/dev/null)
+  if [ "$got" = 'unset|unset' ]; then ok windows_bin_sees_no_conversion_variable; else bad windows_bin_sees_no_conversion_variable "env=$got"; fi
+  unset SHIM_ENV_FILE
 }
 if [ "$os" = windows ]; then windows_boundary; fi
 

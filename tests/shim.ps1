@@ -37,6 +37,8 @@ string f=Environment.GetEnvironmentVariable("SHIM_ARGS_FILE");
 if(!string.IsNullOrEmpty(f))File.WriteAllLines(f,a,new System.Text.UTF8Encoding(false));
 string c=Environment.GetEnvironmentVariable("SHIM_COUNT_FILE");
 if(!string.IsNullOrEmpty(c))File.AppendAllText(c,"run\n");
+string v=Environment.GetEnvironmentVariable("SHIM_ENV_FILE");
+if(!string.IsNullOrEmpty(v))File.WriteAllText(v,(Environment.GetEnvironmentVariable("MSYS2_ARG_CONV_EXCL")??"unset")+"|"+(Environment.GetEnvironmentVariable("MSYS_NO_PATHCONV")??"unset"));
 string e=Environment.GetEnvironmentVariable("SHIM_EXIT");
 return string.IsNullOrEmpty(e)?0:int.Parse(e);}}
 '@
@@ -411,11 +413,27 @@ $warn = @(if (Test-Path -LiteralPath $warnFile) { Get-Content -LiteralPath $warn
 $at = if ($warn.Count -eq 1 -and $warn[0] -match '^mux-agents: no entry at (.+); dot-source scripts/shell/mux-agents\.ps1 from the plugin folder or set MUX_AGENTS_HOME$') { $Matches[1] }
 $want = [System.IO.Path]::GetFullPath((Join-Path (Join-Path $root 'scripts') 'mux-agent.ps1'))
 Check 'shortcut_missing_entry_warns_and_defines_nothing' (($rc -eq 0) -and ($out -eq '') -and $at -and
-    ([System.IO.Path]::GetFullPath($at) -eq $want) -and ($at -like '*..*') -and (Grew @()))
+    ($at -eq $want) -and (Grew @()))
 
+# An empty MUX_AGENTS_HOME counts as unset: the dot-sourced file's plugin runs.
 ShortcutReset
-RunCase "`$env:MSYS2_ARG_CONV_EXCL = 'keep'; . <SC>; cc m | Out-Null; 'after=' + `$env:MSYS2_ARG_CONV_EXCL + '|' + [string] `$env:MSYS_NO_PATHCONV"
-Expect 'shortcut_msys_variables_unchanged' @('after=keep|')
+RunCase "`$env:MUX_AGENTS_HOME = ''; . <SC>; gg x"
+Expect 'shortcut_empty_home_uses_the_sourced_plugin' (Up 'tier3' 'copilot' @('x'))
+
+# A drive-relative MUX_AGENTS_HOME (`C:home`) is resolved against that drive's current location when dot-sourced,
+# so cc still runs the fake after `Set-Location` to the drive's root.
+if ($onWindows) {
+    ShortcutReset
+    $home2 = Join-Path $case 'home'
+    New-Item -ItemType Directory -Force -Path (Join-Path $home2 'scripts') | Out-Null
+    Copy-Item -LiteralPath (Join-Path $repo 'scripts/mux-agent.ps1') -Destination (Join-Path $home2 'scripts')
+    Fake (Join-Path (Join-Path $home2 'target/release') $exe) 'home'
+    $drive = $case.Substring(0, 2)
+    RunCase "Set-Location -LiteralPath <C>; `$env:MUX_AGENTS_HOME = <H>; . <SC>; Set-Location -LiteralPath <R>; cc d" @{
+        C = $case; H = "${drive}home"; R = "$drive\"
+    }
+    Expect 'shortcut_drive_relative_home_survives_a_cd' (Up 'home' 'claude' @('d'))
+}
 
 ShortcutReset
 RunCase ($snap + "Snap <W>; Snap <B>; . <SC>; . <SC>; Snap <A>; cc t") @{

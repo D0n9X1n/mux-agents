@@ -11,13 +11,8 @@ exe=mux-agent
 case ${u% *} in
   Darwin) os=macos ;;
   Linux) os=linux ;;
-  # Git Bash, MSYS and Cygwin run the Windows binary. They rewrite path-like arguments for a native program unless
-  # told not to, so the two variables go to the binary's environment, exported here because exec is a special built-in.
-  MINGW* | MSYS* | CYGWIN*)
-    os=windows exe=mux-agent.exe
-    MSYS2_ARG_CONV_EXCL='*' MSYS_NO_PATHCONV=1
-    export MSYS2_ARG_CONV_EXCL MSYS_NO_PATHCONV
-    ;;
+  # Git Bash, MSYS and Cygwin run the Windows binary.
+  MINGW* | MSYS* | CYGWIN*) os=windows exe=mux-agent.exe ;;
   *) os=${u% *} ;;
 esac
 case ${u##* } in arm64 | aarch64) arch=aarch64 ;; x86_64 | amd64) arch=x86_64 ;; *) arch=${u##* } ;; esac

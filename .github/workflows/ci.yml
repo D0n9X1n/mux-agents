@@ -118,8 +118,8 @@ jobs:
         if: runner.os != 'Windows'
         shell: bash
         run: sh tests/shim.sh
-      # Git Bash: the sh shim maps MINGW to the Windows binary, and cc's arguments reach a native program unchanged.
-      # Git Bash has no zsh.
+      # Git Bash: the sh shim maps MINGW to the Windows binary, and cc's arguments reach it as MSYS rewrites them for
+      # any native program. Git Bash has no zsh.
       - name: Shim tests (Git Bash)
         if: runner.os == 'Windows'
         shell: bash

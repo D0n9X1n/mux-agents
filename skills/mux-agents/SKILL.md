@@ -85,9 +85,10 @@ The commands below, and the Reply and Listen lines, run as-is in the Bash tool. 
 For the person at a terminal, not for agents: `cc` starts Claude Code and `gg` starts Copilot CLI through mux-agents, passing every argument on. `<plugin folder>` is the plugin's real folder, two folders above this file's folder. Add one line to a profile:
 
 - bash or zsh, in `~/.bashrc` or `~/.zshrc`: `. "<plugin folder>/scripts/shell/mux-agents.sh"`
-- PowerShell, in `$PROFILE`: `. "<plugin folder>/scripts/shell/mux-agents.ps1"`
+- PowerShell, in `$PROFILE` (the primary shell for the shortcuts on Windows): `. "<plugin folder>/scripts/shell/mux-agents.ps1"`
 
 - A symlinked or copied shortcut file cannot find the plugin: set `MUX_AGENTS_HOME` to the plugin folder before the line.
 - `cc` shadows the C compiler `cc` in that shell.
 - In `$PROFILE`, `cc` and `gg` refuse the argument `--%`, and the exit code is in `$LASTEXITCODE`; check it rather than `$?`.
+- Under Git Bash, MSYS rewrites POSIX-looking paths in the arguments (`/tmp/f` becomes `C:/…/f`), as it does for any native program.
 - The shortcuts never change `claude` or `copilot`: type `claude` or `copilot` for the bare client.

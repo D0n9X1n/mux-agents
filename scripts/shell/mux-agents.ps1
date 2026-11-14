@@ -15,8 +15,23 @@ $__MuxAgentsEntry = & {
     } else {
         Join-Path (Join-Path (Join-Path (Split-Path -Parent $self) '..') '..') 'scripts/mux-agent.ps1'
     }
-    if (-not [System.IO.Path]::IsPathRooted($entry)) {
-        $entry = Join-Path (Get-Location -PSProvider FileSystem).ProviderPath $entry
+    # IsPathRooted accepts `C:foo` (drive-relative) and `\foo` (root-relative), so neither decides absoluteness. On
+    # Windows a drive-relative path is resolved against that drive's current location, and a root-relative one against
+    # the current location's drive; then the path is made full against the current location.
+    $base = (Get-Location -PSProvider FileSystem).ProviderPath
+    if ([System.IO.Path]::DirectorySeparatorChar -eq '\') {
+        if ($entry -match '^[A-Za-z]:(?![\\/])') {
+            $drive = Get-PSDrive -Name $entry.Substring(0, 1) -PSProvider FileSystem -ErrorAction SilentlyContinue
+            $dir = if ($drive) { [System.IO.Path]::Combine($drive.Root, $drive.CurrentLocation) } else { $entry.Substring(0, 2) + '\' }
+            $entry = [System.IO.Path]::Combine($dir, $entry.Substring(2))
+        } elseif ($entry -match '^[\\/](?![\\/])') {
+            $entry = [System.IO.Path]::GetPathRoot($base).TrimEnd('\', '/') + $entry
+        }
+    }
+    $entry = if ($PSVersionTable.PSVersion.Major -ge 6) {
+        [System.IO.Path]::GetFullPath($entry, $base)
+    } else {
+        [System.IO.Path]::GetFullPath([System.IO.Path]::Combine($base, $entry))
     }
     if (Test-Path -LiteralPath $entry -PathType Leaf) { return $entry }
     Write-Warning "mux-agents: no entry at $entry; dot-source scripts/shell/mux-agents.ps1 from the plugin folder or set MUX_AGENTS_HOME"
