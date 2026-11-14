@@ -219,6 +219,7 @@ fn the_record_is_flushed_before_hc_run_and_the_team_record_follows_the_commit() 
 #[test]
 fn post_commit_failures_are_reported_and_the_leader_stays() {
     let w = ready();
+    crate::agents::state_dir(&w.ctx, &w.caller()).unwrap(); // private, as `up` makes it
     std::fs::create_dir_all(team_file(&w).parent().unwrap()).unwrap();
     std::fs::write(team_file(&w), "{}").unwrap();
     fails(&w, "@mux-agents-sidebar");

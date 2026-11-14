@@ -235,7 +235,7 @@ pub(crate) fn admission_in<T>(
     return with_lock_in(ctx, root, key, wait, f);
     #[cfg(windows)]
     {
-        std::fs::create_dir_all(root)?;
+        // private_dirs makes missing parents private too; create_dir_all would give them the parent's inherited ACL.
         crate::state::private_windows::private_dirs(&[root])?;
         let file = std::fs::OpenOptions::new()
             .read(true)

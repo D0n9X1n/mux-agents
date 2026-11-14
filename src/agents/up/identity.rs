@@ -13,8 +13,10 @@ pub fn folder(ctx: &Ctx) -> Res<PathBuf> {
 pub fn team(ctx: &Ctx, folder: &Path, client: Client, name: &str) -> Res<String> {
     #[cfg(unix)]
     crate::state::private_unix::private_dirs(&ctx.state_root, &[&ctx.state_root])?;
+    // Windows, as state_dir: a missing root is made private on the way to `<root>/up`; an existing root keeps its
+    // ACL unchecked (MUX_AGENTS_STATE may name a folder made with inherited access), its own folders are checked.
     #[cfg(windows)]
-    crate::state::private_windows::private_dirs(&[&ctx.state_root])?;
+    crate::state::private_windows::private_dirs(&[&ctx.state_root.join("up")])?;
     let (root, client) = (
         std::fs::canonicalize(&ctx.state_root)?,
         crate::agents::spawn::client_name(client),
