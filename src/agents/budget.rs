@@ -66,13 +66,28 @@ pub fn spend(file: &Path, rate: &Rate, now: u64) -> Res<()> {
             format!("the team's spawn budget is spent; the next token arrives in {n}s"),
         );
     }
-    if let Some(dir) = file.parent() {
-        std::fs::create_dir_all(dir)?;
-    }
+    let dir = file.parent().unwrap_or(Path::new(""));
+    // The folders this call makes, nearest first; each is a new entry in its parent.
+    let made = dir
+        .ancestors()
+        .take_while(|a| !a.as_os_str().is_empty() && !a.exists())
+        .count();
+    std::fs::create_dir_all(dir)?;
     crate::state::fs::write_json_durable(
         file,
         &json!({"schema": 1, "tokens": tokens - 1, "at": at}),
-    )
+    )?;
+    // write_json_durable flushed `dir`; `dir`'s own entry, and every folder made here, live in the parents (#103 D5:
+    // the debit outlives a failed launch). A failed flush is an error, so nothing launches.
+    for parent in dir
+        .ancestors()
+        .skip(1)
+        .take(made.max(1))
+        .filter(|p| !p.as_os_str().is_empty())
+    {
+        crate::state::fs::sync_dir(parent)?;
+    }
+    Ok(())
 }
 /// The clock in whole seconds since the epoch.
 pub fn now_secs(ctx: &Ctx) -> u64 {
@@ -112,6 +127,27 @@ mod tests {
             "a failed flush is an error, so nothing launches"
         );
         crate::state::fs::fail_durable_flush(None);
+    }
+    #[test]
+    fn a_new_teams_folder_is_flushed_into_its_server_folder() {
+        let d = TempDir::new();
+        let server = d.path().join("server");
+        std::fs::create_dir(&server).unwrap();
+        let file = server.join("teams").join("x.budget.json");
+        crate::state::fs::fail_sync_dir(Some(&server));
+        let failed = spend(&file, &DEFAULT, 0);
+        crate::state::fs::fail_sync_dir(None);
+        assert!(
+            failed.is_err(),
+            "the new teams entry is not on disk, so nothing launches"
+        );
+        spend(&file, &DEFAULT, 0).unwrap();
+        let v = crate::state::fs::read_json(&file).unwrap().unwrap();
+        assert_eq!(
+            (v["tokens"].as_u64(), v["at"].as_u64()),
+            (Some(18), Some(0)),
+            "a debit not proven durable still counts: fail closed"
+        );
     }
     #[test]
     fn options_set_the_rate() {
