@@ -397,35 +397,31 @@ impl Team {
         ]
     }
 
-    /// The PM narrow-width rule: when a row it drew needs more than `width`, the header and `widen the bar: needs <n> columns`
-    /// (`<n>`: the largest need among the drawn rows) and no row; keys still walk the selection (`walk` is the whole tree).
-    fn widen(&self, (laid, kept): (Laid, usize), width: usize) -> (Laid, usize) {
-        let need = laid
-            .agents
-            .iter()
-            .filter_map(|(t, _)| self.members.iter().find(|m| m.target.id == t.id))
-            .map(|m| m.need)
-            .max()
-            .unwrap_or(0);
+    /// The PM narrow-width rule over the whole ordered team, before any height folding (#103 A4): a member on a branch the
+    /// height folds away still counts. Too narrow: the header and the first widen line that fits (the whole line, then
+    /// `widen: <n> columns`, then `<n>`, so <n> is never cut; none fits: the header alone) and no row; keys still walk
+    /// the whole tree.
+    fn too_narrow(&self, width: usize) -> Option<(Laid, usize)> {
+        let need = self.members.iter().map(|m| m.need).max()?;
         if need <= width {
-            return (laid, kept);
+            return None;
         }
-        // The whole line when it fits (33 columns and wider); narrower, a shorter line that still says <n>, never a cut one.
         let note = [
             format!("widen the bar: needs {need} columns"),
             format!("widen: {need} columns"),
             need.to_string(),
         ]
         .into_iter()
-        .find(|t| paint::width(t) <= self.cols)
-        .unwrap_or_else(|| need.to_string());
-        (
+        .find(|t| paint::width(t) <= self.cols);
+        let mut rows = vec![self.header.clone()];
+        rows.extend(note.map(|n| margin(vec![span(n, PLAIN)])));
+        Some((
             Laid {
-                rows: vec![self.header.clone(), margin(vec![span(note, PLAIN)])],
+                rows,
                 agents: Vec::new(),
             },
             0,
-        )
+        ))
     }
 
     fn full(&self) -> Cut {
@@ -439,13 +435,118 @@ impl Team {
         }
     }
 
-    fn fit(&self, height: usize) -> (Laid, usize) {
-        let cut = self.full();
-        let mut laid = self.emit(&cut);
-        laid.rows.truncate(height.max(1));
-        let kept = laid.rows.len();
-        laid.agents.retain(|(_, r)| *r < kept);
-        (laid, cut.notes)
+    /// B5: drop the blank line, doing lines bottom-up, each parent's ended rows, the deepest unprotected sub-trees, notes;
+    /// still too tall, the last resort.
+    fn fit(
+        &self,
+        height: usize,
+        focus: Option<usize>,
+        leader: Option<usize>,
+        ascii: bool,
+    ) -> (Laid, usize) {
+        let mut cut = self.full();
+        loop {
+            let laid = self.emit(&cut);
+            if laid.rows.len() <= height {
+                return (laid, cut.notes);
+            }
+            if !self.shrink(&mut cut) {
+                return (self.last_resort(height, focus, leader, ascii), 0);
+            }
+        }
+    }
+
+    fn shrink(&self, cut: &mut Cut) -> bool {
+        let n = self.members.len();
+        let deepest = |ok: &dyn Fn(usize) -> bool| {
+            (0..n)
+                .filter(|&a| ok(a))
+                .max_by_key(|&a| (self.members[a].depth, a))
+        };
+        if cut.gap {
+            cut.gap = false;
+            return true;
+        }
+        if let Some(a) = (0..n)
+            .rev()
+            .find(|&a| cut.doing[a] && self.members[a].doing.is_some())
+        {
+            cut.doing[a] = false;
+            return true;
+        }
+        let fold =
+            deepest(&|a| !cut.folded[a] && self.members[a].kids.iter().any(|&k| self.foldable(k)));
+        if let Some(a) = fold {
+            cut.folded[a] = true;
+            return true;
+        }
+        let open = |a: usize| {
+            let mut p = Some(a);
+            while let Some(x) = p {
+                if cut.hidden[x] {
+                    return false;
+                }
+                p = self.members[x].parent;
+            }
+            true
+        };
+        let rows = self.emit(cut).rows.len();
+        // Hiding never grows the frame; a folded ended leaf is already in `+N ended`.
+        let hide = deepest(&|a| {
+            !self.protected[a]
+                && open(a)
+                && !self.members[a]
+                    .parent
+                    .is_some_and(|p| cut.folded[p] && self.foldable(a))
+                && {
+                    let mut t = cut.clone();
+                    t.hidden[a] = true;
+                    self.emit(&t).rows.len() <= rows
+                }
+        });
+        if let Some(a) = hide {
+            cut.hidden[a] = true;
+            return true;
+        }
+        if cut.notes > 0 {
+            cut.notes -= 1;
+            return true;
+        }
+        false
+    }
+
+    /// The leader, `… N above` (N: the rows between), then the focus row; below 3 rows, the focus row alone.
+    fn last_resort(
+        &self,
+        height: usize,
+        focus: Option<usize>,
+        leader: Option<usize>,
+        ascii: bool,
+    ) -> Laid {
+        let mut laid = Laid {
+            rows: Vec::new(),
+            agents: Vec::new(),
+        };
+        let Some(f) = focus.or(leader).or(self.roots.first().copied()) else {
+            laid.rows.push(self.header.clone());
+            return laid;
+        };
+        if let Some(l) = leader.filter(|&l| l < f && height >= 3) {
+            laid.agents.push((self.members[l].target.clone(), 0));
+            laid.rows.push(self.members[l].line.clone());
+            laid.rows.push(self.summary(
+                0,
+                &format!(
+                    "{} {} above",
+                    if ascii { "..." } else { "\u{2026}" },
+                    f - l - 1
+                ),
+            ));
+        }
+        laid.agents
+            .push((self.members[f].target.clone(), laid.rows.len()));
+        laid.rows.push(self.members[f].line.clone());
+        laid
     }
 }
 
@@ -505,7 +606,8 @@ pub(super) fn lay_team(
         notes,
         cols,
     };
-    team.widen(team.fit(size.height), size.width)
+    team.too_narrow(size.width)
+        .unwrap_or_else(|| team.fit(size.height, selected.or(shown), leader, look.ascii))
 }
 
 #[cfg(test)]
@@ -1037,5 +1139,205 @@ pub(super) mod tests {
                 "{cols}: {text:?}"
             );
         }
+    }
+
+    pub(crate) fn room() -> Map<String, Value> {
+        let ended = || json!({"state": "stopped", "life": "ended", "pane": null});
+        team(vec![
+            member("L", None, 1, json!({"doing": "plan"})),
+            member("A", Some("L"), 2, ended()),
+            member("B", Some("L"), 3, ended()),
+            member("C", Some("L"), 4, json!({"doing": "build"})),
+            member("C1", Some("C"), 5, json!({})),
+            member("C2", Some("C"), 6, json!({"pane": null})),
+            member("D", Some("L"), 7, json!({})),
+            member("D1", Some("D"), 8, json!({})),
+        ])
+    }
+    #[test]
+    fn short_of_height_the_tree_folds_in_order_and_keeps_the_focus_chain() {
+        let labels = |h: usize, f: Focus| {
+            draw(&room(), 40, h, Look::default(), f)
+                .iter()
+                .map(|r| r.split_whitespace().collect::<Vec<_>>().join(" "))
+                .collect::<Vec<_>>()
+        };
+        let c1 = Focus {
+            shown: Some("%15"),
+            selected: None,
+        };
+        let full = [
+            "mux-agents 6 working / 2 ended",
+            "",
+            "\u{25c9} L working 1m",
+            "plan",
+            "- A stopped 1m",
+            "- B stopped 1m",
+            "\u{25c9} C working 1m",
+            "build",
+            "\u{25cf} \u{25c9} C1 working 1m",
+            "\u{25c9} C2 working 1m",
+            "\u{25c9} D working 1m",
+            "\u{25c9} D1 working 1m",
+        ];
+        let drop = |gone: &[usize]| {
+            full.iter()
+                .enumerate()
+                .filter(|(i, _)| !gone.contains(i))
+                .map(|(_, s)| s.to_string())
+                .collect::<Vec<_>>()
+        };
+        // The blank line, then doing lines bottom-up, then each parent's ended rows, then the deepest sub-trees.
+        assert_eq!(
+            (
+                labels(12, c1),
+                labels(11, c1),
+                labels(10, c1),
+                labels(9, c1)
+            ),
+            (drop(&[]), drop(&[1]), drop(&[1, 7]), drop(&[1, 3, 7]))
+        );
+        assert_eq!(
+            labels(8, c1),
+            [
+                full[0], full[2], full[6], full[8], full[9], full[10], full[11], "+2 ended"
+            ]
+        );
+        assert_eq!(
+            labels(7, c1),
+            [
+                full[0], full[2], full[6], full[8], "+1 more", "+2 ended", "+2 more"
+            ]
+        );
+        // Still too tall: the leader, `… N above`, the focus row (the selection when active); below 3 rows the focus row alone.
+        let tail = |n: usize, f: &str| {
+            vec![
+                full[2].to_string(),
+                format!("\u{2026} {n} above"),
+                f.to_string(),
+            ]
+        };
+        assert_eq!(
+            (labels(6, c1), labels(3, c1), labels(2, c1)),
+            (
+                tail(3, full[8]),
+                tail(3, full[8]),
+                vec![full[8].to_string()]
+            )
+        );
+        assert_eq!(
+            labels(
+                7,
+                Focus {
+                    selected: Some("D1"),
+                    ..c1
+                }
+            ),
+            tail(6, full[11]),
+            "the selection on another branch"
+        );
+        assert_eq!(
+            labels(
+                3,
+                Focus {
+                    shown: None,
+                    selected: Some("D1")
+                }
+            ),
+            tail(6, full[11]),
+            "no agent shown"
+        );
+    }
+    #[test]
+    fn team_rows_hit_their_member_id_and_folds_hit_nothing() {
+        let mut rows = room()["agents"].as_array().unwrap().clone();
+        rows[0]["doing"] = json!("twin plan");
+        rows[4]["name"] = json!("twin");
+        rows[5]["name"] = json!("twin");
+        rows.push(member("O", Some("gone"), 9, json!({})));
+        for height in [24, 7] {
+            let laid = lay_team(
+                &team(rows.clone()),
+                &[],
+                Size { width: 40, height },
+                Look::default(),
+                Focus {
+                    shown: Some("%15"),
+                    selected: None,
+                },
+            )
+            .0;
+            let lines: Vec<String> = laid.rows.iter().map(|r| render(r, false)).collect();
+            let answer = format!("40\n{}\n", lines.join("\n"));
+            let hits = crate::sidebar::drawn(&laid);
+            for (at, line) in lines.iter().enumerate() {
+                let want = laid
+                    .agents
+                    .iter()
+                    .find(|(_, r)| *r == at)
+                    .map(|(t, _)| t.id.as_str());
+                let got = crate::sidebar::pick::frame_hit(
+                    &answer,
+                    40,
+                    u16::try_from(at + 1).unwrap(),
+                    &hits,
+                );
+                assert_eq!(got, want, "{height} {at}: {}", line);
+                assert!(
+                    got.is_none() || !(line.contains('+') || line.contains("twin plan")),
+                    "folds and doing lines open nothing"
+                );
+            }
+            if height == 24 {
+                assert!(
+                    lines.iter().any(|l| l.starts_with(" ^ ")),
+                    "the broken row is drawn, and hit as O"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_width_check_covers_the_whole_team_before_folding() {
+        let mut rows = room()["agents"].as_array().unwrap().clone();
+        rows.push(member(
+            "Z",
+            Some("C2"),
+            9,
+            json!({"name": "zed", "state": "exited 2147483647", "life": "ended",
+            "exitCode": 2147483647, "pane": null, "unread": 9}),
+        ));
+        let board = team(rows);
+        // Z needs 34 columns: 1 + 6 (depth 3) + 2 + 5 (its badge) + 2 + 17 + 1; at height 3 the tree folds Z's branch away.
+        let small = lay_team(
+            &board,
+            &[],
+            Size {
+                width: 30,
+                height: 3,
+            },
+            Look::default(),
+            Focus::default(),
+        )
+        .0;
+        let text: Vec<String> = small.rows.iter().map(|r| render(r, false)).collect();
+        assert_eq!(
+            text.get(1).map(String::as_str),
+            Some(" widen: 34 columns"),
+            "{text:?}"
+        );
+        assert!(small.agents.is_empty(), "nothing drawn to click: {text:?}");
+        let fits = lay_team(
+            &board,
+            &[],
+            Size {
+                width: 34,
+                height: 3,
+            },
+            Look::default(),
+            Focus::default(),
+        )
+        .0;
+        assert!(!fits.agents.is_empty(), "at its need the folded tree draws");
     }
 }
