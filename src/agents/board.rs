@@ -57,18 +57,12 @@ pub fn board(ctx: &Ctx, caller: &Caller, all: bool, watch: bool) -> Res<Map<Stri
         })
         .map(|id| snapshot.views[id].clone())
         .collect();
-    let mine: Vec<_> = panes.iter().filter(|p| p.pane == caller.pane).collect();
-    // A member proven through its own hc terminal reads its own mailbox by id, whichever pane shows it (#104).
-    let proven = caller.member.as_ref().filter(|id| {
-        members
-            .iter()
-            .any(|o| &o.identity.id == *id && o.life == Life::Running)
-    });
-    let reader = match (proven, mine.as_slice()) {
-        (Some(id), _) => id.clone(),
-        (None, [p]) => p.id.clone(),
-        _ => mailbox_key(&caller.pane, "")?,
-    };
+    let mine: Vec<String> = panes
+        .iter()
+        .filter(|p| p.pane == caller.pane)
+        .map(|p| p.id.clone())
+        .collect();
+    let reader = reader_key(caller.member.as_deref(), &mine, &caller.pane)?;
     let mut keys: Vec<_> = if watch {
         members
             .iter()
@@ -391,6 +385,18 @@ fn rank(row: &Map<String, Value>) -> u8 {
     }
 }
 
+/// The mailbox whose unread `list` counts for the caller. A member proven through its own hc terminal counts its own
+/// id, always: whichever pane shows it, and even when a later hc look cannot show it running, it is never matched by
+/// pane, so it can never count another member's mail (#104 phase 1c). Any other caller: the one running agent on its
+/// pane, else the pane's own mailbox.
+pub(crate) fn reader_key(member: Option<&str>, on_pane: &[String], pane: &str) -> Res<String> {
+    match (member, on_pane) {
+        (Some(id), _) => Ok(id.to_string()),
+        (None, [id]) => Ok(id.clone()),
+        _ => mailbox_key(pane, ""),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -398,6 +404,19 @@ mod tests {
     use crate::agents::lock_key;
     use crate::agents::mail::{add_mail, read_mail};
     use serde_json::json;
+
+    #[test]
+    fn reader_key_never_matches_a_member_by_pane() {
+        let other = vec!["bbbbbbbbbbbb".to_string()];
+        // A member counts its own id, even with another member's view on its old pane.
+        assert_eq!(reader_key(Some(ID), &other, "%1").unwrap(), ID);
+        assert_eq!(reader_key(Some(ID), &[], "%1").unwrap(), ID);
+        // A pane-proven caller: the one agent on its pane, else the pane's mailbox.
+        assert_eq!(reader_key(None, &other, "%1").unwrap(), "bbbbbbbbbbbb");
+        assert_eq!(reader_key(None, &[], "%1").unwrap(), "pane-1");
+        let two = vec![ID.to_string(), "bbbbbbbbbbbb".to_string()];
+        assert_eq!(reader_key(None, &two, "%1").unwrap(), "pane-1");
+    }
     use std::path::{Path, PathBuf};
 
     use crate::agents::core_fixture as cf;
