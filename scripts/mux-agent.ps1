@@ -47,15 +47,21 @@ $savedPreferences = foreach ($name in 'ErrorActionPreference', 'PSNativeCommandU
     [pscustomobject]@{ Name = $name; Existed = [bool] $v; Value = $(if ($v) { $v.Value }) }
 }
 try {
-    # The caller's error preferences never turn the binary's own exit code into a failure of the shim.
-    $ErrorActionPreference = 'Continue'
-    $PSNativeCommandUseErrorActionPreference = $false
+    # The caller's error preferences never turn the binary's own exit code into a failure of the shim. A caller may
+    # hold them read-only; then they stay as they are (a known limit, see the PR).
+    try { $ErrorActionPreference = 'Continue' } catch { }
+    try { $PSNativeCommandUseErrorActionPreference = $false } catch { }
 
     # PowerShell before 7.3 builds a native command line itself: it drops an empty argument and leaves quotes and
     # backslashes unescaped; 7.3 and later pass arguments exactly. So before 7.3 each argument is quoted here, as
     # CommandLineToArgvW and Rust's std parse it.
     $legacy = $PSVersionTable.PSVersion -lt [version]'7.3'
-    if (-not $legacy) { $PSNativeCommandArgumentPassing = 'Standard' }
+    # When the caller holds it read-only and not `Standard`, the arguments are quoted as before 7.3, which works in
+    # every other mode too.
+    if (-not $legacy) {
+        try { $PSNativeCommandArgumentPassing = 'Standard' } catch { }
+        if ([string] (Get-Variable -Name PSNativeCommandArgumentPassing -ValueOnly -ErrorAction SilentlyContinue) -ne 'Standard') { $legacy = $true }
+    }
 
     # Windows PowerShell 5.1 and pwsh 7.0-7.2 on Windows add their own quotes around an argument when whitespace falls
     # outside a pair of `"` they count, ignoring backslashes. So the whole argument is quoted here and an embedded `"`
@@ -147,7 +153,14 @@ try {
     [Console]::Out.Write('{"ok":false,"verb":null,"code":1,"check":"entry","message":"no usable mux-agent binary for ' + "$os-$arch" + '"}' + "`n")
     exit 1
 } finally {
+    # Only a variable the shim changed is put back, and a restore that fails (a caller's read-only or constant
+    # variable, which the shim could not have changed either) is ignored, so the restore never changes the result.
     foreach ($p in $savedPreferences) {
-        if ($p.Existed) { Set-Variable -Name $p.Name -Value $p.Value } else { Remove-Variable -Name $p.Name -Scope Local -ErrorAction SilentlyContinue }
+        $now = Get-Variable -Name $p.Name -ErrorAction SilentlyContinue
+        if ($p.Existed -and $now -and [object]::Equals($now.Value, $p.Value)) { continue }
+        try {
+            if ($p.Existed) { Set-Variable -Name $p.Name -Value $p.Value -ErrorAction Stop }
+            elseif ($now) { Remove-Variable -Name $p.Name -Scope Local -ErrorAction Stop }
+        } catch { }
     }
 }

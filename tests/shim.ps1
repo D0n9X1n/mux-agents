@@ -247,6 +247,13 @@ RunIn ("function f { Set-Variable ErrorActionPreference Stop -Option AllScope -S
     "'after=' + `$ErrorActionPreference + '|' + `$PSNativeCommandUseErrorActionPreference + '|' + `$PSNativeCommandArgumentPassing }; f")
 Expect 'caller_preferences_are_restored' @('after=Stop|True|Legacy')
 
+# A caller's read-only preference variables never fail the shim or change its exit code.
+Reset; Fake $tier3 'tier3'
+RunIn ("function f { `$ErrorActionPreference = 'Stop'; " +
+    "Set-Variable PSNativeCommandArgumentPassing Legacy -Option ReadOnly,AllScope -Scope Local -ErrorAction SilentlyContinue; " +
+    "`$env:SHIM_EXIT = '7'; & $(Lit (Join-Path (Join-Path $root 'scripts') 'mux-agent.ps1')) r | Out-Null; 'code=' + `$global:LASTEXITCODE }; f")
+Expect 'read_only_caller_preferences_never_fail_the_shim' @('code=7')
+
 # Called with `&` and no arguments: the binary gets no arguments, not one empty one.
 Reset; Fake $tier3 'tier3'
 RunIn ("`$r = & $(Lit (Join-Path (Join-Path $root 'scripts') 'mux-agent.ps1')); 'captured=' + (`$r -join '|')")
