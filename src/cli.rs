@@ -393,18 +393,15 @@ fn quiet(args: &[String]) -> bool {
     false
 }
 
-/// The spec of the hidden `launcher <spec>` call a pane runs (spec D4); not a verb, so absent from the usage text.
+/// The spec of the hidden `launcher <spec> --state-root <abs> --path <value>` call an agent's hc terminal runs; not a
+/// verb, so absent from the usage text.
 pub fn launcher_spec(args: &[String]) -> Option<&str> {
     crate::launcher_scope::spec(args)
 }
 
 /// The pane's process: the launcher's exit code, or the providers' refusal as JSON with its code. No sandbox check:
 /// the pane was spawned by a call that passed it, and the launcher runs no verb.
-pub fn run_launcher(
-    spec: &str,
-    scoped: bool,
-    ctx: impl FnOnce() -> Res<Ctx>,
-) -> (i32, Option<String>) {
+pub fn run_launcher(spec: &str, ctx: impl FnOnce() -> Res<Ctx>) -> (i32, Option<String>) {
     match ctx() {
         Err(refusal) => (
             refusal.code.into(),
@@ -412,10 +409,9 @@ pub fn run_launcher(
         ),
         Ok(ctx) => {
             // A panic still ends the pane with the launcher's own failure code.
-            let code = panic::catch_unwind(AssertUnwindSafe(|| {
-                crate::launcher::launcher(&ctx, spec, scoped)
-            }))
-            .unwrap_or(1);
+            let code =
+                panic::catch_unwind(AssertUnwindSafe(|| crate::launcher::launcher(&ctx, spec)))
+                    .unwrap_or(1);
             (code, None)
         }
     }
@@ -1770,13 +1766,21 @@ mod tests {
         let (code, out) = call(&w, &["launcher", "/s/spec.json"]);
         assert_eq!(code, 2);
         assert!(!out.contains("launcher"), "{out}");
-        // Only the exact `launcher <spec>` reaches the pane launcher.
+        // Only the exact six-argument form reaches the launcher; the v0.2 `launcher <spec>` no longer does.
         assert_eq!(
-            launcher_spec(&args(&["launcher", "/s/spec.json"])),
+            launcher_spec(&args(&[
+                "launcher",
+                "/s/spec.json",
+                "--state-root",
+                "/s",
+                "--path",
+                "p"
+            ])),
             Some("/s/spec.json")
         );
         for tokens in [
-            &["launcher"][..],
+            &["launcher", "/s/spec.json"][..],
+            &["launcher"],
             &["launcher", "a", "b"],
             &["Launcher", "/s/spec.json"],
             &["list", "/s/spec.json"],

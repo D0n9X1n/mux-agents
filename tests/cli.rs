@@ -220,7 +220,10 @@ fn endpoint_refusal_names_the_mux() {
 // stderr, not a JSON reply.
 #[test]
 fn launcher_relative_spec_exit_2() {
-    let (code, stdout, stderr) = mux_agent(&["launcher", "spec.json"]);
+    let root = std::env::temp_dir();
+    let root = root.to_str().unwrap();
+    let (code, stdout, stderr) =
+        mux_agent(&["launcher", "spec.json", "--state-root", root, "--path", ""]);
     assert_eq!(
         (code, stdout.as_str(), stderr.trim_end()),
         (
@@ -229,6 +232,10 @@ fn launcher_relative_spec_exit_2() {
             "mux-agent: the launch spec is outside the state folder"
         )
     );
+    // The v0.2 two-argument form is no launch any more: it is a usage refusal like any unknown verb (#104).
+    let (code, stdout, _) = mux_agent(&["launcher", "spec.json"]);
+    assert_eq!(code, 2);
+    assert!(stdout.contains(r#""check":"usage""#), "{stdout}");
 }
 
 // The providers are built before the arguments are parsed, as the reference's entry did, so a bad state root

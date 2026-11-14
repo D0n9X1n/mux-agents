@@ -7,10 +7,7 @@ use std::time::Duration;
 
 use serde_json::{Map, Value, json};
 
-use crate::agents::registry::{Notice, add_notice};
 use crate::agents::spawn::{CMDLINE_MAX, client_flags, client_named};
-use crate::agents::{lock, lock_key};
-use crate::caller::{Caller, Kind};
 use crate::ctx::Ctx;
 use crate::error::{Refusal, Res};
 use crate::parse::cmdline_length;
@@ -43,13 +40,13 @@ const LINK: &str = "mux-agent: the launch spec path has a junction or link";
 pub(crate) type Start<'a> = &'a mut dyn FnMut(&Path, &[String], &[&str]) -> io::Result<i32>;
 
 /// The pane's process: exit 2 for a spec it will not read, else the client's exit code (1 when it never ran).
-pub fn launcher(ctx: &Ctx, spec: &str, scoped: bool) -> i32 {
+pub fn launcher(ctx: &Ctx, spec: &str) -> i32 {
     let mut err = |line: &str| {
         use std::io::Write;
         let _ = writeln!(io::stderr(), "{line}");
     };
-    run(ctx, spec, scoped, &mut err, &mut |path, args, remove| {
-        let overrides = launch_overrides(scoped, ctx)?;
+    run(ctx, spec, &mut err, &mut |path, args, remove| {
+        let overrides = launch_overrides(ctx)?;
         crate::spawn::attached_env(
             path,
             args,
@@ -62,11 +59,8 @@ pub fn launcher(ctx: &Ctx, spec: &str, scoped: bool) -> i32 {
     })
 }
 
-/// The client's environment overrides: only a scoped launch names its state root and PATH; a legacy launch adds none.
-fn launch_overrides(scoped: bool, ctx: &Ctx) -> io::Result<Vec<(&'static str, String)>> {
-    if !scoped {
-        return Ok(Vec::new());
-    }
+/// The client's environment overrides: the launch names its state root and PATH.
+fn launch_overrides(ctx: &Ctx) -> io::Result<Vec<(&'static str, String)>> {
     let root = ctx
         .state_root
         .to_str()
@@ -77,13 +71,7 @@ fn launch_overrides(scoped: bool, ctx: &Ctx) -> io::Result<Vec<(&'static str, St
     ])
 }
 
-pub(crate) fn run(
-    ctx: &Ctx,
-    spec: &str,
-    scoped: bool,
-    err: &mut dyn FnMut(&str),
-    start: Start,
-) -> i32 {
+pub(crate) fn run(ctx: &Ctx, spec: &str, err: &mut dyn FnMut(&str), start: Start) -> i32 {
     let given = Path::new(spec);
     // Only a spec.json inside the state root, its path already canonical (no link on the way), is read.
     if !given.is_absolute()
@@ -125,10 +113,7 @@ pub(crate) fn run(
             1
         }
     };
-    // The exit notice for the parent; a stop that already posted one wins.
-    if !scoped {
-        let _ = post_exited(ctx, folder, code);
-    }
+    // The exit notice is reconciliation's, from hc facts, once (#104): never the launcher's.
     code
 }
 
@@ -309,54 +294,6 @@ fn wait_commit(ctx: &Ctx, folder: &Path) -> bool {
     }
 }
 
-/// Posts `exited` with `code` under the agent's notice lock, for a spec at
-/// `<root>/<serverKey>/agents/<id>/spec.json` whose record names that id and whose server.json is there.
-fn post_exited(ctx: &Ctx, folder: &Path, code: i32) -> Res<()> {
-    let (Some(agents), Some(id)) = (folder.parent(), folder.file_name().and_then(|n| n.to_str()))
-    else {
-        return Ok(());
-    };
-    let Some(server) = agents.parent() else {
-        return Ok(());
-    };
-    let Some(server_key) = server.file_name().and_then(|n| n.to_str()) else {
-        return Ok(());
-    };
-    if server.parent() != Some(ctx.state_root.as_path())
-        || agents.file_name() != Some("agents".as_ref())
-    {
-        return Ok(());
-    }
-    let (Some(record), Some(_)) = (
-        read_json(&folder.join("record.json"))?,
-        read_json(&server.join("server.json"))?,
-    ) else {
-        return Ok(());
-    };
-    if record.get("id").and_then(Value::as_str) != Some(id) {
-        return Ok(());
-    }
-    // Only the server key and session reach the notice: its folder, mailbox and lock.
-    let caller = Caller {
-        kind: Kind::Human,
-        client: None,
-        agent: None,
-        chain: Vec::new(),
-        pane: String::new(),
-        window: String::new(),
-        session: crate::agents::text(record.get("session")),
-        server_pid: 0,
-        server_start: 0,
-        socket: String::new(),
-        server_key: server_key.to_string(),
-        agent_tag: String::new(),
-        member: None,
-    };
-    lock(ctx, &lock_key("notice", &caller, id), || {
-        add_notice(ctx, &caller, id, &record, Notice::Exited(code.into())).map(|_| ())
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -449,7 +386,6 @@ mod tests {
         let code = run(
             &l.w.ctx,
             spec,
-            false,
             &mut |line: &str| err.push(line.to_string()),
             &mut |path: &Path, args: &[String], remove: &[&str]| {
                 started.push((
@@ -485,19 +421,12 @@ mod tests {
             .collect()
     }
 
-    fn notice_kind(l: &Launch) -> Value {
-        let notice: Value =
-            serde_json::from_slice(&std::fs::read(l.folder.join("notice.json")).unwrap()).unwrap();
-        notice["kind"].clone()
-    }
-
     #[test]
-    fn legacy_launch_adds_no_overrides() {
+    fn a_launch_names_its_state_root_and_path() {
         let mut w = World::human("");
         w.ctx.env = Env::from_pairs([("PATH", "client-path")]);
-        assert!(launch_overrides(false, &w.ctx).unwrap().is_empty());
         assert_eq!(
-            launch_overrides(true, &w.ctx).unwrap(),
+            launch_overrides(&w.ctx).unwrap(),
             vec![
                 (
                     "MUX_AGENTS_STATE",
@@ -676,27 +605,21 @@ mod tests {
     fn generation_adversarial_active() {
         let l = setup("claude", json!([]));
         let mut seen = false;
-        let code = run(
-            &l.w.ctx,
-            &spec_str(&l),
-            false,
-            &mut |_| {},
-            &mut |_, _, _| {
-                seen = true;
-                let before = std::fs::read(l.folder.join("launcher.json")).unwrap();
-                let duplicate = launch(&l, &spec_str(&l), exits_7);
-                assert!(duplicate.started.is_empty());
-                assert_eq!(
-                    std::fs::read(l.folder.join("launcher.json")).unwrap(),
-                    before
-                );
-                assert!(mail(&l).is_empty());
-                Ok(7)
-            },
-        );
+        let code = run(&l.w.ctx, &spec_str(&l), &mut |_| {}, &mut |_, _, _| {
+            seen = true;
+            let before = std::fs::read(l.folder.join("launcher.json")).unwrap();
+            let duplicate = launch(&l, &spec_str(&l), exits_7);
+            assert!(duplicate.started.is_empty());
+            assert_eq!(
+                std::fs::read(l.folder.join("launcher.json")).unwrap(),
+                before
+            );
+            assert!(mail(&l).is_empty());
+            Ok(7)
+        });
         assert!(seen);
         assert_eq!(code, 7);
-        assert_eq!(mail(&l).len(), 1);
+        assert!(mail(&l).is_empty());
     }
 
     #[test]
@@ -1036,8 +959,8 @@ mod tests {
         );
         assert!(ran.started.is_empty());
         assert_eq!(launcher_json(&l)["exitCode"], 1);
-        assert_eq!(notice_kind(&l), "exited");
-        assert_eq!(mail(&l)[0]["body"], "worker exited with code 1.");
+        assert!(!l.folder.join("notice.json").exists());
+        assert!(mail(&l).is_empty());
     }
 
     #[test]
@@ -1048,16 +971,16 @@ mod tests {
         assert_eq!(ran.code, 1);
         assert_eq!(ran.started.len(), 1);
         assert_eq!(launcher_json(&l)["exitCode"], 1);
-        assert_eq!(notice_kind(&l), "exited");
-        assert_eq!(mail(&l).len(), 1);
-        // A failure after the claim (no args) still leaves the fallback exit record and the exited notice.
+        assert!(!l.folder.join("notice.json").exists());
+        assert!(mail(&l).is_empty());
+        // A failure after the claim (no args) still leaves the fallback exit record, and no notice.
         let l = setup("claude", json!(null));
         let ran = launch(&l, &spec_str(&l), exits_7);
         assert_eq!(ran.code, 1);
         assert!(ran.started.is_empty());
         assert_eq!(launcher_json(&l)["exitCode"], 1);
-        assert_eq!(notice_kind(&l), "exited");
-        assert_eq!(mail(&l).len(), 1);
+        assert!(!l.folder.join("notice.json").exists());
+        assert!(mail(&l).is_empty());
         assert_eq!(
             read_json(&l.folder.join("gens/0.claim")).unwrap(),
             Some(json!("run"))
@@ -1102,183 +1025,15 @@ mod tests {
         assert_eq!(launcher_json(&l)["exitCode"], 1);
     }
 
-    #[test]
-    fn legacy_exited_notice_unless_stopped() {
-        let l = setup("claude", json!([]));
-        assert_eq!(launch(&l, &spec_str(&l), exits_7).code, 7);
-        assert_eq!(notice_kind(&l), "exited");
-        let messages = mail(&l);
-        assert_eq!(messages.len(), 1);
-        assert_eq!(
-            (
-                &messages[0]["id"],
-                &messages[0]["from"],
-                &messages[0]["body"]
-            ),
-            (
-                &json!(format!("exit-{ID}")),
-                &json!("worker"),
-                &json!("worker exited with code 7.")
-            )
-        );
-        assert_eq!(
-            l.w.fakes.locks().first().map(String::as_str),
-            Some(format!("+notice|{}|{ID}", l.w.caller().server_key).as_str())
-        );
-        // A stop that already posted its notice wins.
-        let l = setup("claude", json!([]));
-        write(
-            &l.folder.join("notice.json"),
-            json!({"kind": "stopped", "exitCode": null, "at": "x"}),
-        );
-        assert_eq!(launch(&l, &spec_str(&l), exits_7).code, 7);
-        assert_eq!(notice_kind(&l), "stopped");
-        assert!(mail(&l).is_empty());
-    }
-
     // Only the Unix-only marker test uses it.
     #[cfg(unix)]
     fn exits_0() -> io::Result<i32> {
         Ok(0)
     }
 
-    // A stop delivered `stopped`, then its marker write failed; the launcher's `exited 0` after it adds no message,
-    // and the marker it writes says what the one message says.
-    #[cfg(unix)]
     #[test]
-    fn legacy_exited_after_a_stop_whose_marker_failed_keeps_stopped() {
-        use std::os::unix::fs::PermissionsExt;
-        let l = setup("claude", json!([]));
-        let caller = l.w.caller();
-        let record = crate::agents::registry::record(&l.w.ctx, &caller, ID)
-            .unwrap()
-            .unwrap();
-        let mode = |m: u32| {
-            std::fs::set_permissions(&l.folder, std::fs::Permissions::from_mode(m)).unwrap()
-        };
-        mode(0o500);
-        let stopped = add_notice(&l.w.ctx, &caller, ID, &record, Notice::Stopped);
-        mode(0o700);
-        assert!(stopped.is_err());
-        assert!(!l.folder.join("notice.json").exists());
-        assert_eq!(launch(&l, &spec_str(&l), exits_0).code, 0);
-        let notice: Value =
-            serde_json::from_slice(&std::fs::read(l.folder.join("notice.json")).unwrap()).unwrap();
-        assert_eq!(
-            (&notice["kind"], &notice["exitCode"]),
-            (&json!("stopped"), &Value::Null)
-        );
-        let messages = mail(&l);
-        assert_eq!(messages.len(), 1);
-        assert_eq!(
-            (&messages[0]["kind"], &messages[0]["body"]),
-            (&json!("stopped"), &json!("worker was stopped."))
-        );
-    }
-
-    // A reap that posted `lost` first wins over the launcher's later `exited`: one message, one marker.
-    #[test]
-    fn legacy_exited_after_reap_posts_nothing_new() {
-        let l = setup("claude", json!([]));
-        l.w.fakes.mux_first("#{pane_id}|#{@agent-id}", 0, "|\n", "");
-        crate::agents::registry::reap(&l.w.ctx, &l.w.caller(), None, false).unwrap();
-        assert_eq!(notice_kind(&l), "lost");
-        assert_eq!(launch(&l, &spec_str(&l), exits_7).code, 7);
-        assert_eq!(notice_kind(&l), "lost");
-        assert_eq!(mail(&l).len(), 1);
-    }
-
-    // Waits up to 10 s for `ready`, then fails naming `what`.
-    fn until(what: &str, ready: impl Fn() -> bool) {
-        let end = std::time::Instant::now() + Duration::from_secs(10);
-        while !ready() {
-            assert!(std::time::Instant::now() < end, "timed out: {what}");
-            std::thread::sleep(Duration::from_millis(1));
-        }
-    }
-
-    // The launcher's post and a reap contend for the agent's notice lock, as two processes do: each runs on its own
-    // thread, and the one that holds the lock first keeps it until the other is waiting for it. Whichever holds it
-    // first posts; the other waits and posts nothing. One message, one marker, and they agree.
-    #[test]
-    fn legacy_exited_and_reap_contend_for_the_notice_lock() {
-        for reap_first in [true, false] {
-            let label = if reap_first {
-                "reap first"
-            } else {
-                "launcher first"
-            };
-            let l = setup("claude", json!([]));
-            let gate = std::sync::Arc::new(crate::testing::Gate::default());
-            l.w.fakes.share_locks(gate.clone());
-            let key = format!("notice|{}|{ID}", l.w.caller().server_key);
-            let root = l.w.ctx.state_root.clone();
-            std::thread::scope(|scope| {
-                let reaper = scope.spawn(|| {
-                    // Another process: its own fakes over the same state root.
-                    let mut w = World::human("");
-                    w.ctx.state_root = root.clone();
-                    w.fakes.share_locks(gate.clone());
-                    w.panes(&[]);
-                    w.fakes.mux_rule("#{pane_id}|#{@agent-id}", 0, "|\n", "");
-                    if reap_first {
-                        let (gate, key) = (gate.clone(), key.clone());
-                        w.fakes.lock_probe(move |event| {
-                            if event == format!("+{key}") {
-                                until("the launcher to wait", || gate.waiting(&key) > 0);
-                            }
-                            String::new()
-                        });
-                    } else {
-                        until("the launcher to hold the lock", || gate.held(&key));
-                    }
-                    crate::agents::registry::reap(&w.ctx, &w.caller(), None, false).unwrap()
-                });
-                if reap_first {
-                    until("reap to hold the lock", || gate.held(&key));
-                } else {
-                    let (gate, key) = (gate.clone(), key.clone());
-                    l.w.fakes.lock_probe(move |event| {
-                        if event == format!("+{key}") {
-                            until("reap to wait", || gate.waiting(&key) > 0);
-                        }
-                        String::new()
-                    });
-                }
-                post_exited(&l.w.ctx, &l.folder, 7).unwrap();
-                reaper.join().unwrap();
-            });
-            assert_eq!(
-                gate.waited(&key),
-                1,
-                "{label}: the lock was never contended"
-            );
-            let messages = mail(&l);
-            assert_eq!(messages.len(), 1, "{label} {messages:?}");
-            let notice: Value =
-                serde_json::from_slice(&std::fs::read(l.folder.join("notice.json")).unwrap())
-                    .unwrap();
-            let (kind, code) = if reap_first {
-                (json!("lost"), Value::Null)
-            } else {
-                (json!("exited"), json!(7))
-            };
-            assert_eq!(
-                (&notice["kind"], &notice["exitCode"]),
-                (&kind, &code),
-                "{label}"
-            );
-            assert_eq!(
-                (&messages[0]["kind"], &messages[0]["exitCode"]),
-                (&notice["kind"], &notice["exitCode"]),
-                "{label}: the message and the marker disagree"
-            );
-        }
-    }
-
-    #[test]
-    fn scoped_launcher_leaves_notices_to_reap() {
-        for scoped in [false, true] {
+    fn launcher_leaves_notices_to_reap() {
+        {
             for case in [
                 "exit",
                 "start-error",
@@ -1305,20 +1060,14 @@ mod tests {
                     std::fs::remove_file(l.bin.join(exe_name("claude"))).unwrap();
                 }
                 let mut starts = 0;
-                let code = run(
-                    &l.w.ctx,
-                    &spec_str(&l),
-                    scoped,
-                    &mut |_| {},
-                    &mut |_, _, _| {
-                        starts += 1;
-                        if case == "start-error" {
-                            Err(io::Error::other("no exec"))
-                        } else {
-                            Ok(7)
-                        }
-                    },
-                );
+                let code = run(&l.w.ctx, &spec_str(&l), &mut |_| {}, &mut |_, _, _| {
+                    starts += 1;
+                    if case == "start-error" {
+                        Err(io::Error::other("no exec"))
+                    } else {
+                        Ok(7)
+                    }
+                });
                 assert_eq!(code, if case == "exit" { 7 } else { 1 });
                 assert_eq!(
                     l.w.fakes.slept(),
@@ -1330,21 +1079,17 @@ mod tests {
                 );
                 assert_eq!(launcher_json(&l)["exitCode"], code);
                 assert_eq!(starts, usize::from(["exit", "start-error"].contains(&case)));
-                assert_eq!(l.folder.join("notice.json").exists(), !scoped);
-                assert_eq!(mail(&l).len(), usize::from(!scoped));
+                assert!(!l.folder.join("notice.json").exists());
+                assert!(mail(&l).is_empty());
                 assert_eq!(
                     read_json(&l.folder.join("gens/0.claim")).unwrap(),
                     Some(json!("run"))
                 );
                 let before = std::fs::read(l.folder.join("launcher.json")).unwrap();
                 assert_eq!(
-                    run(
-                        &l.w.ctx,
-                        &spec_str(&l),
-                        scoped,
-                        &mut |_| {},
-                        &mut |_, _, _| panic!("duplicate")
-                    ),
+                    run(&l.w.ctx, &spec_str(&l), &mut |_| {}, &mut |_, _, _| panic!(
+                        "duplicate"
+                    )),
                     0
                 );
                 assert_eq!(

@@ -73,10 +73,7 @@ fn main() -> ExitCode {
         .map(|a| a.to_string_lossy().into_owned())
         .collect();
     if let Some(spec) = cli::launcher_spec(&args) {
-        let (code, reply) =
-            cli::run_launcher(spec, mux_agent::launcher_scope::is_scoped(&args), || {
-                ctx(&args)
-            });
+        let (code, reply) = cli::run_launcher(spec, || ctx(&args));
         let mut out = std::io::stdout().lock();
         if let Some(reply) = reply {
             let _ = write!(out, "{reply}{NL}");

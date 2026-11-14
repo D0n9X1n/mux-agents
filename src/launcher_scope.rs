@@ -22,29 +22,21 @@ pub fn argv(ctx: &Ctx, file: &Path) -> Res<Vec<String>> {
     .into())
 }
 
-/// The spec from only `launcher <spec>` or `launcher <spec> --state-root <abs> --path <value>`.
-/// Matches the exact grammar; `environment` checks that the state folder is absolute.
+/// The spec from only `launcher <spec> --state-root <abs> --path <value>`, the form spawn starts every agent with.
+/// The two-argument `launcher <spec>` of a v0.2 pane agent is no longer accepted (#104 phase 1c). Matches the exact
+/// grammar; `environment` checks that the state folder is absolute.
 pub fn spec(args: &[String]) -> Option<&str> {
     match args {
-        [v, s] if v == "launcher" => Some(s),
         [v, s, r, _, p, _] if v == "launcher" && r == "--state-root" && p == "--path" => Some(s),
         _ => None,
     }
 }
 
-/// Whether the arguments match exactly the six-argument launcher form with explicit state root and PATH.
-pub fn is_scoped(args: &[String]) -> bool {
-    args.len() == 6 && spec(args).is_some()
-}
-
-/// The two-argument form keeps the inherited environment unchanged; the six-argument form replaces only PATH and MUX_AGENTS_STATE.
+/// The launcher's environment: the inherited one with only PATH and MUX_AGENTS_STATE replaced.
 /// A relative state folder refuses with code 1 and check `state`, as in `state::root`; malformed arguments refuse usage.
 pub fn environment(args: &[String], inherited: &Env) -> Res<Env> {
     if spec(args).is_none() {
         return refuse(2, "usage", "invalid launcher arguments");
-    }
-    if args.len() == 2 {
-        return Ok(inherited.clone());
     }
     if !Path::new(&args[3]).is_absolute() {
         return refuse(1, "state", "the state folder path is not absolute");
@@ -105,7 +97,7 @@ mod tests {
     }
 
     #[test]
-    fn only_exact_six_argument_form_is_scoped() {
+    fn only_the_exact_six_argument_form_is_a_launch() {
         let args = [
             "launcher",
             "spec.json",
@@ -115,22 +107,25 @@ mod tests {
             "path",
         ]
         .map(str::to_owned);
-        assert!(is_scoped(&args));
-        assert!(!is_scoped(&args[..2]));
-        assert!(!is_scoped(&[]));
+        assert_eq!(spec(&args), Some("spec.json"));
+        // The v0.2 two-argument form is no launch any more.
+        assert_eq!(spec(&args[..2]), None);
+        assert_eq!(spec(&[]), None);
         for (index, wrong) in [(0, "Launcher"), (2, "--root"), (4, "--PATH")] {
             let mut malformed = args.clone();
             malformed[index] = wrong.into();
-            assert!(!is_scoped(&malformed));
+            assert_eq!(spec(&malformed), None);
         }
     }
 
     #[test]
     fn scope_grammar_and_root_are_strict() {
+        // The v0.2 two-argument form is no launch: no spec, and its environment refuses usage.
         let old = vec!["launcher".into(), "spec.json".into()];
-        assert_eq!(spec(&old), Some("spec.json"));
+        assert_eq!(spec(&old), None);
         let env = Env::from_pairs([("PATH", "old")]);
-        assert_eq!(environment(&old, &env).unwrap().get("PATH"), Some("old"));
+        let e = environment(&old, &env).unwrap_err();
+        assert_eq!((e.code, e.check), (2, "usage"));
         let mut a: Vec<String> = [
             "launcher",
             "spec.json",
