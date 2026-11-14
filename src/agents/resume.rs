@@ -13,7 +13,7 @@ use super::placement::{DEFAULT as DEFAULT_PLACEMENT, read_placement};
 use super::spawn::{CoreRequest, CoreSlot, Resumed, client_named, keep_bar, launch_hc_locked};
 use super::view::first;
 use super::{lock, lock_key, registry, server_dir, text, usage};
-use crate::caller::{Kind, resolve};
+use crate::caller::Kind;
 use crate::cli::Request;
 use crate::ctx::Ctx;
 use crate::error::{Refusal, Res, refuse};
@@ -25,20 +25,37 @@ pub fn resume(ctx: &Ctx, request: &Request) -> Res<Map<String, Value>> {
     if !super::agent_id(target) && !super::agent_name(target) {
         return Err(usage("resume"));
     }
-    let caller = resolve(ctx)?;
-    // A person only: an agent never resumes a member.
-    if caller.kind == Kind::Agent {
-        return refuse(2, "tagged", "an agent cannot resume agents");
+    let caller = crate::caller::resolve_tree(ctx)?;
+    if matches!(
+        super::tree::scope(ctx, &caller)?,
+        super::tree::Scope::Outside
+    ) {
+        // Outside a team, a person only: an agent never resumes a member.
+        if caller.kind == Kind::Agent {
+            return refuse(2, "tagged", "an agent cannot resume agents");
+        }
+        registry::untagged(ctx, &caller, "an agent pane cannot resume agents")?;
+    } else {
+        // A leaderless team refuses before any hc call.
+        lock(ctx, &lock_key("spawn", &caller, &caller.session), || {
+            super::tree::team_of(ctx, &caller)
+        })?;
     }
-    registry::untagged(ctx, &caller, "an agent pane cannot resume agents")?;
     let split = match read_placement(ctx, &caller) {
         Ok(Some(stored)) if stored != DEFAULT_PLACEMENT => Some(stored),
         _ => None,
     };
     let core = crate::hc::connect(ctx)?;
     let (from, record) = lock(ctx, &lock_key("spawn", &caller, &caller.session), || {
+        let gate = match super::tree::team_of(ctx, &caller)? {
+            Some(t) => Some((t, super::tree::standing(ctx, &caller, Some(&core))?)),
+            None if caller.kind == Kind::Agent => {
+                return refuse(2, "tagged", "an agent cannot resume agents");
+            }
+            None => None,
+        };
         let snapshot = Snapshot::for_spawn(ctx, &caller, &core)?;
-        let resumed = admit(ctx, &caller, &core, &snapshot, target)?;
+        let resumed = admit(ctx, &caller, &core, &snapshot, target, gate.as_ref())?;
         // The mailbox barrier: a reader of X's mailbox that holds its lock finishes before Y exists; one after it
         // finds X superseded (or not yet running Y) and reads nothing. No mailbox lock is held across the launch.
         let mailbox = super::mail::member_mailbox(&resumed.from, &resumed.record);
@@ -96,6 +113,7 @@ fn admit(
     core: &Core<'_>,
     snapshot: &Snapshot,
     target: &str,
+    gate: Option<&(super::team::Team, super::tree::Standing)>,
 ) -> Res<Resumed> {
     if let Some(e) = &snapshot.core_error {
         return Err(e.clone());
@@ -124,6 +142,9 @@ fn admit(
             })?,
     };
     let id = &x.identity.id;
+    if let Some((_, s)) = gate {
+        super::tree::authorize(&super::tree::records_of(snapshot), s, id, "resume")?;
+    }
     let record = snapshot.records[id].record.clone();
     let life = match x.life {
         Life::Ended => None,
@@ -150,17 +171,23 @@ fn admit(
             ),
         );
     }
-    let others = local
-        .iter()
-        .filter(|o| o.identity.id != *id && o.life != Life::Ended);
-    if others.clone().any(|o| o.identity.name == x.identity.name)
-        || snapshot
-            .facts
-            .reserved
+    let name_check = || -> Res<()> {
+        let others = local
             .iter()
-            .any(|(_, n)| *n == x.identity.name)
-    {
-        return refuse(2, "name", "a member of that name is running");
+            .filter(|o| o.identity.id != *id && o.life != Life::Ended);
+        if others.clone().any(|o| o.identity.name == x.identity.name)
+            || snapshot
+                .facts
+                .reserved
+                .iter()
+                .any(|(_, n)| *n == x.identity.name)
+        {
+            return refuse(2, "name", "a member of that name is running");
+        }
+        Ok(())
+    };
+    if gate.is_none() {
+        name_check()?;
     }
     if let Some(why) = session_held(ctx, core, id, &x.identity.session_id) {
         return refuse(2, "session", why);
@@ -172,18 +199,31 @@ fn admit(
     let flags = recorded_flags(&server_dir(ctx, caller).join("agents").join(id))?;
     let client = client_named(&text(record.get("client")))
         .ok_or_else(|| Refusal::internal("the ended member names no known client"))?;
-    let team_file = super::team::path(&server_dir(ctx, caller), &caller.session);
-    if let Some(team) = super::team::read(&team_file)?
-        && !super::team::within(team.policy, super::team::policy(client, &flags))
-    {
-        return refuse(
-            2,
-            "ceiling",
-            "its flags exceed the team's permission ceiling",
-        );
-    }
-    if snapshot.facts.count() >= 6 {
-        return refuse(2, "cap", "the session already has 6 live agents");
+    match gate {
+        None if snapshot.facts.count() >= 6 => {
+            return refuse(2, "cap", "the session already has 6 live agents");
+        }
+        None => {}
+        Some((team, s)) => {
+            super::tree::limit(snapshot)?;
+            let level = super::tree::parent_level(
+                ctx,
+                caller,
+                team,
+                &super::tree::records_of(snapshot),
+                id,
+            )?;
+            super::tree::bound(super::team::policy(client, &flags), level, team.policy)?;
+            name_check()?;
+            if matches!(s, super::tree::Standing::Member(_)) {
+                let file = super::budget::path(&server_dir(ctx, caller), &caller.session);
+                super::budget::spend(
+                    &file,
+                    &super::budget::rate(ctx, caller),
+                    super::budget::now_secs(ctx),
+                )?;
+            }
+        }
     }
     Ok(Resumed {
         from: id.clone(),

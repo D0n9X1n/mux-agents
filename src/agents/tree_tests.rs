@@ -9,6 +9,7 @@ use crate::agents::{core_fixture as cf, fixture::ID};
 use crate::caller::Caller;
 use crate::parse::Client;
 use crate::proc::Row;
+use serde_json::Map;
 use serde_json::json;
 use std::path::PathBuf;
 pub(crate) const LEADER: &str = "111111111111";
@@ -790,5 +791,269 @@ fn a_candidate_is_proven_under_the_team_lock_or_refused() {
         "under the lock"
     );
     assert!(!m.folder(OTHER).join("notice.json").exists());
+    m.w.fakes.hc_done().unwrap();
+}
+/// hc as resume reads it under the lock: the listing, then each terminal by address (X exited).
+fn facts_of(w: &World, team: &str, rows: &[Value], x: &Value) {
+    cf::listing(w, team, &[]);
+    let mut ended = cf::wire(x);
+    (ended["state"], ended["reason"]) = (json!("finished"), json!("exited"));
+    let mut all: Vec<(String, Value)> = rows
+        .iter()
+        .map(|r| (r["hcAddress"].as_str().unwrap().into(), cf::wire(r)))
+        .collect();
+    all.push((x["hcAddress"].as_str().unwrap().into(), ended));
+    all.sort_by(|a, b| a.0.cmp(&b.0));
+    for (address, wire) in all {
+        cf::get(w, &address, wire);
+    }
+}
+fn launch_ok(w: &World) {
+    w.fakes.hc_answer(Ok(crate::spawn::Out {
+        stdout: r#"{"address":"t9"}"#.into(),
+        ..Default::default()
+    }));
+    for verb in ["new-window", "split-window"] {
+        w.fakes.mux_rule(verb, 0, "%9|@5|exact,#} attach t9\n", "");
+    }
+    w.launches_hold();
+    w.fakes
+        .mux_rule("-t %9 #{pane_id}|#{@agent-id}", 0, "|\n", "");
+}
+type Held = std::rc::Rc<std::cell::RefCell<Vec<bool>>>;
+/// `held`: whether the team lock was held at each `hc get` (recorded in the "candidate" case, run through the CLI).
+fn resume_case(case: &str) -> (Mw, Res<Map<String, Value>>, String, Held) {
+    let mut m = member_world();
+    let x = "dddddddddddd".to_string();
+    let mut rx = child(&x, if case == "non-descendant" { OTHER } else { ID }, 2);
+    rx["sessionId"] = "22222222-2222-4222-8222-222222222222".into();
+    let rx = cf::member(&m.w, &x, rx);
+    let bypass = case == "parent-bound" || case == "team-bound";
+    write(
+        &m.folder(&x).join("spec.json"),
+        json!({"flags": if bypass { json!(["--dangerously-skip-permissions"]) } else { json!([]) }}),
+    );
+    if case == "parent-bound" {
+        std::fs::remove_file(t::path(&m.state, "$3")).unwrap();
+        team_record(&m.w, &["--dangerously-skip-permissions"]);
+    }
+    if case == "budget" {
+        write(
+            &crate::agents::budget::path(&m.state, "$3"),
+            json!({"tokens": 0, "at": 0}),
+        );
+    }
+    let mut rows: Vec<Value> = [LEADER, ID, OTHER].iter().map(|id| m.record(id)).collect();
+    if case == "limit" {
+        for id in ids(4) {
+            rows.push(cf::member(&m.w, &id, child(&id, LEADER, 1)));
+        }
+    }
+    let (held, cand): (Held, bool) = (Default::default(), case == "candidate");
+    if cand {
+        // C is recorded only at the admission lock: the second `+spawn` (the first is the leaderless pre-check).
+        let (lj, key, seen) = (
+            m.folder(ID).join("launcher.json"),
+            crate::agents::lock_key("spawn", &m.c, "$3"),
+            std::cell::Cell::new(0),
+        );
+        write(&lj, json!({"pid": 31337, "start": 1000}));
+        let (f, h, k2) = (m.w.fakes.clone(), held.clone(), key.clone());
+        m.w.fakes.lock_probe(move |e| {
+            if e == format!("+{key}") {
+                seen.set(seen.get() + 1);
+                if seen.get() == 2 {
+                    write(
+                        &lj,
+                        json!({"pid": 31337, "start": 1000, "client": {"pid": 150, "start": 1500}}),
+                    );
+                }
+            }
+            String::new()
+        });
+        m.w.fakes.hc_probe(move |a| {
+            if a[0] == "get" {
+                let l = f.locks();
+                let n = |s: &str| l.iter().filter(|e| **e == format!("{s}{k2}")).count();
+                h.borrow_mut().push(n("+") > n("-"));
+            }
+        });
+    }
+    m.hc();
+    m.rounds(if cand { 3 } else { 2 }, &term(&m.r, Some(150)));
+    facts_of(&m.w, &crate::agents::membership::team(&m.c), &rows, &rx);
+    if case == "ok" || cand {
+        launch_ok(&m.w);
+    }
+    let got = if cand {
+        let (code, out) = crate::cli::run(&["resume".to_string(), x.clone()], || Ok(&m.w.ctx));
+        let v: Value = serde_json::from_str(&out).unwrap();
+        if code == 0 {
+            Ok(v.as_object().unwrap().clone())
+        } else {
+            Err(crate::error::Refusal::internal(&out))
+        }
+    } else {
+        crate::agents::resume::resume(&m.w.ctx, &m.w.request(&["resume", &x]))
+    };
+    (m, got, x, held)
+}
+#[test]
+fn a_member_resumes_only_a_descendant() {
+    let tokens = |m: &Mw| {
+        crate::state::fs::read_json(&crate::agents::budget::path(&m.state, "$3"))
+            .unwrap()
+            .unwrap()["tokens"]
+            .clone()
+    };
+    for case in ["ok", "candidate"] {
+        let (m, got, x, held) = resume_case(case);
+        let r = m.record(got.unwrap()["agent"]["id"].as_str().unwrap());
+        assert_eq!(
+            (&r["depth"], &r["parentAgent"]["id"], &r["resumedFrom"]),
+            (&json!(2), &json!(ID), &json!(x)),
+            "{case}: keeps depth"
+        );
+        assert_eq!(tokens(&m), 19, "{case}: a member spends");
+        if case == "candidate" {
+            assert_eq!(
+                held.borrow()[..3],
+                [false, false, true],
+                "proven only while the admission lock is held"
+            );
+        }
+        m.w.fakes.hc_done().unwrap();
+    }
+    for (case, check) in [
+        ("non-descendant", "authority"),
+        ("limit", "limit"),
+        ("budget", "budget"),
+        ("parent-bound", "ceiling"),
+        ("team-bound", "ceiling"),
+    ] {
+        let (m, got, _, _) = resume_case(case);
+        assert_eq!(got.unwrap_err().check, check, "{case}");
+        assert!(
+            !m.w.fakes
+                .hc_calls()
+                .iter()
+                .any(|c| c.1.first().is_some_and(|a| a == "run")),
+            "{case}: no launch"
+        );
+        if case == "budget" {
+            assert_eq!(tokens(&m), 0, "an empty budget is unchanged");
+        }
+        m.w.fakes.hc_done().unwrap();
+    }
+}
+/// A person's in-team resume spends nothing: it succeeds on an exhausted budget, which stays exhausted.
+#[test]
+fn a_persons_resume_is_free() {
+    let w = World::human("");
+    team_record(&w, &[]);
+    let x = "dddddddddddd";
+    let mut rx = child(x, LEADER, 1);
+    rx["sessionId"] = json!("22222222-2222-4222-8222-222222222222");
+    let rx = cf::member(&w, x, rx);
+    write(&w.folder(x).join("spec.json"), json!({"flags": []}));
+    let (rows, budget) = (
+        vec![cf::member(&w, LEADER, leader_record())],
+        crate::agents::budget::path(&w.state(), "$3"),
+    );
+    write(&budget, json!({"tokens": 0, "at": 0}));
+    cf::online(&w);
+    facts_of(
+        &w,
+        &crate::agents::membership::team(&w.caller()),
+        &rows,
+        &rx,
+    );
+    launch_ok(&w);
+    crate::agents::resume::resume(&w.ctx, &w.request(&["resume", x])).unwrap();
+    assert_eq!(
+        crate::state::fs::read_json(&budget).unwrap().unwrap()["tokens"],
+        0
+    );
+    w.fakes.hc_done().unwrap();
+}
+/// A person's resume where limit, ceiling and name all fail: v5 order gives limit, then ceiling, then name.
+#[test]
+fn resume_refuses_in_v5_order() {
+    for (more, bypass, check) in [
+        (5, false, "limit"),
+        (4, false, "ceiling"),
+        (4, true, "name"),
+    ] {
+        let w = World::human("");
+        team_record(
+            &w,
+            if bypass {
+                &["--dangerously-skip-permissions"][..]
+            } else {
+                &[]
+            },
+        );
+        let (x, twin) = ("dddddddddddd", "eeeeeeeeeeee");
+        let mut rx = child(x, LEADER, 1);
+        (rx["name"], rx["sessionId"]) = (
+            json!("worker"),
+            json!("22222222-2222-4222-8222-222222222222"),
+        );
+        let rx = cf::member(&w, x, rx);
+        write(
+            &w.folder(x).join("spec.json"),
+            json!({"flags": ["--dangerously-skip-permissions"]}),
+        );
+        let mut rt = child(twin, LEADER, 1);
+        rt["name"] = json!("worker");
+        let mut rows = vec![
+            cf::member(&w, LEADER, leader_record()),
+            cf::member(&w, twin, rt),
+        ];
+        for id in ids(more) {
+            rows.push(cf::member(&w, &id, child(&id, LEADER, 1)));
+        }
+        cf::online(&w);
+        facts_of(
+            &w,
+            &crate::agents::membership::team(&w.caller()),
+            &rows,
+            &rx,
+        );
+        let e = crate::agents::resume::resume(&w.ctx, &w.request(&["resume", x])).unwrap_err();
+        assert_eq!(e.check, check, "{more} {bypass}");
+        w.fakes.hc_done().unwrap();
+    }
+    let w = World::human("");
+    w.uncommitted(LEADER, json!({"depth": 0, "upTeam": "t"}));
+    assert_eq!(
+        crate::agents::resume::resume(&w.ctx, &w.request(&["resume", "worker"]))
+            .unwrap_err()
+            .check,
+        "team"
+    );
+    assert!(
+        w.fakes.hc_calls().is_empty(),
+        "leaderless refuses before hc"
+    );
+}
+/// Through the CLI: a candidate whose proof fails refuses 2 `tagged` and makes no folder.
+#[test]
+fn a_candidate_resume_is_refused_with_no_side_effects() {
+    let mut m = member_world();
+    m.w.fakes.forget(170);
+    let before = std::fs::read_dir(m.state.join("agents")).unwrap().count();
+    m.hc();
+    m.rounds(3, &term(&m.r, Some(150)));
+    let (code, out) = crate::cli::run(&["resume", "mbb"].map(String::from), || Ok(&m.w.ctx));
+    assert_eq!(
+        (code, out.contains(r#""check":"tagged""#)),
+        (2, true),
+        "{out}"
+    );
+    assert_eq!(
+        std::fs::read_dir(m.state.join("agents")).unwrap().count(),
+        before
+    );
     m.w.fakes.hc_done().unwrap();
 }

@@ -512,6 +512,40 @@ pub fn authority(
         .collect();
     authorize(&records, standing, target, verb)
 }
+/// The level X's parent may grant: the team's for the leader, else the parent's recorded flags (unreadable refuses).
+pub fn parent_level(
+    ctx: &Ctx,
+    caller: &Caller,
+    found: &Team,
+    records: &BTreeMap<String, Value>,
+    x: &str,
+) -> Res<team::Policy> {
+    let parent = records
+        .get(x)
+        .and_then(|r| r.get("parentAgent"))
+        .and_then(|p| p.get("id"))
+        .and_then(Value::as_str);
+    let Some(p) = parent.filter(|p| *p != found.leader) else {
+        return Ok(found.policy);
+    };
+    let broken = || Refusal {
+        code: 2,
+        check: "authority",
+        reason: None,
+        leftover: None,
+        message: format!(
+            "the parent chain of {} cannot be read",
+            text(records[x].get("name"))
+        ),
+    };
+    let client = records
+        .get(p)
+        .and_then(|r| super::spawn::client_named(&text(r.get("client"))))
+        .ok_or_else(broken)?;
+    let flags = super::resume::recorded_flags(&server_dir(ctx, caller).join("agents").join(p))
+        .map_err(|_| broken())?;
+    Ok(team::policy(client, &flags))
+}
 #[cfg(test)]
 #[path = "tree_tests.rs"]
 pub(crate) mod tests;
