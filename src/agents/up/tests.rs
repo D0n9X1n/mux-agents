@@ -511,3 +511,30 @@ fn a_relative_state_root_is_refused_before_anything_is_made() {
     );
     assert!(!made && w.fakes.mux_calls().is_empty() && !ran(&w));
 }
+
+#[test]
+fn every_folder_above_the_leader_record_is_flushed_before_hc_run() {
+    // The server folder, the state root and each folder above it, up to the filesystem root: a failed flush of any of
+    // them refuses `up` before `hc run`, so a leader that may have run is always found (#103).
+    let depth = agents(&ready()).parent().unwrap().ancestors().count();
+    assert!(depth >= 3);
+    for n in 0..depth {
+        let w = ready();
+        let dir = agents(&w)
+            .parent()
+            .unwrap()
+            .ancestors()
+            .nth(n)
+            .unwrap()
+            .to_path_buf();
+        crate::state::fs::fail_sync_dir(Some(&dir));
+        let got = claude(&w);
+        crate::state::fs::fail_sync_dir(None);
+        let e = got.err();
+        assert!(
+            e.as_ref().is_some_and(|e| e.check == "internal") && !ran(&w) && releases(&w) == 1,
+            "{} {e:?}",
+            dir.display()
+        );
+    }
+}

@@ -14,7 +14,7 @@ use crate::{
     ctx::Ctx,
     error::Res,
     parse::Client,
-    state::fs::{sync_dir, write_json, write_json_durable},
+    state::fs::{sync_ancestor, sync_dir, write_json, write_json_durable},
     util::{guid, hex_id, utc_o},
 };
 
@@ -53,7 +53,7 @@ pub fn prepare(
             "session": caller.session, "parentPane": null, "parentAgent": null, "depth": 0, "upTeam": leader.team,
             "directory": utf8(directory)?, "taskLine": "", "createdAt": utc_o(ctx.clock.now())});
         write_json_durable(&folder.join("record.json"), &record)?;
-        sync_dir(&state.join("agents"))?;
+        flush_to_root(&ctx.state_root, &state.join("agents"))?;
         record["generation"] = "0".into();
         record["team"] = super::membership::team(caller).into();
         Ok(Prepared {
@@ -63,6 +63,25 @@ pub fn prepare(
         })
     };
     run().map_err(|e| abort_evidence(&folder, e))
+}
+
+/// Flushes the folders the record's path depends on before `hc run` (#103), as the launcher's `flush_claim` does for
+/// its claim: `agents`, the server folder and the state root with `sync_dir`, then every folder above the root up to
+/// the filesystem root with `sync_ancestor` (skipped only where this user cannot add an entry). Any failure is an
+/// error, so nothing launches.
+fn flush_to_root(root: &Path, agents: &Path) -> std::io::Result<()> {
+    let depth = root.components().count();
+    let mut dirs = agents.ancestors();
+    for dir in dirs.by_ref() {
+        sync_dir(dir)?;
+        if dir.components().count() <= depth {
+            break;
+        }
+    }
+    for dir in dirs.filter(|d| !d.as_os_str().is_empty()) {
+        sync_ancestor(dir)?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
