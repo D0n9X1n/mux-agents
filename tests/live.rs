@@ -4237,7 +4237,15 @@ hc {}:
         assert_eq!(live.field(pane, "#{@agent-id}"), s(&y["id"]), "{mux:?}");
         // The bar is beside Y: a live bar in the window of Y's view (#122, a bar per window).
         let bar = s(&resumed["sidebar"]).to_string();
-        assert!(live.bars().contains(&bar), "{mux:?} {resumed}");
+        // `bars()` answers `<pane>|<window>|<width>`: the reply's pane is a labelled bar there, in Y's window.
+        assert!(
+            live.bars().iter().any(|b| {
+                let mut fields = b.split('|');
+                fields.next() == Some(bar.as_str()) && fields.next() == record["window"].as_str()
+            }),
+            "{mux:?} {resumed} {:?}",
+            live.bars()
+        );
         assert_eq!(
             live.field(&bar, "#{window_id}"),
             s(&record["window"]),

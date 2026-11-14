@@ -392,13 +392,13 @@ fn hc_worker_and_view_close_survives_focus_stop() {
 
 // Stop an agent, then resume it (#103): the reply names X as `from` and the successor Y (same name, a new hc
 // terminal); the client in Y's hc terminal runs `--resume <X's session>` as the last arguments, with no task after
-// them; and Y's record names X in `resumedFrom`. The bar is checked once #122 (a bar per window) is in.
+// them; Y's record names X in `resumedFrom`; and the reply's `sidebar` is a live bar in the window of Y's view
+// (#122: a bar per window).
 #[test]
 fn hc_stop_then_resume_returns_with_its_conversation() {
     let Some(live) = Live::start() else {
         return;
     };
-    live.run(&["sidebar", "-Close"]);
     let w = live.spawn("w1");
     let sid = s(&w["sessionId"]);
     let address = s(&w["hcAddress"]);
@@ -457,6 +457,20 @@ fn hc_stop_then_resume_returns_with_its_conversation() {
         .expect("Y's record");
     assert_eq!(record["resumedFrom"], w["id"]);
     assert_eq!(record["sessionId"], w["sessionId"]);
+    // The bar kept by the resume: a live pane carrying the side-bar label, in the window of Y's view.
+    let bar = s(&resumed["sidebar"]);
+    assert!(resumed.get("sidebarError").is_none(), "{resumed}");
+    assert_eq!(live.field(&bar, "#{pane_dead}"), "0", "{resumed}");
+    assert_eq!(live.field(&bar, "#{@agent-role}"), "sidebar", "{resumed}");
+    assert_eq!(
+        live.field(&bar, "#{window_id}"),
+        s(&record["window"]),
+        "{resumed}"
+    );
+    assert_eq!(
+        live.field(&s(&record["pane"]), "#{window_id}"),
+        s(&record["window"])
+    );
 }
 
 // A client whose running image an update renamed (claude.exe.old.<ms>.<pid>) is still the caller's client: `list` run

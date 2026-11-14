@@ -1138,3 +1138,184 @@ fn power_loss_after_each_record_write_leaves_a_complete_record() {
         w.fakes.hc_done().unwrap();
     }
 }
+
+// v11: send, read, spawn and stop stay bounded during a resume. Real threads and the real locks: a resume of X is
+// paused while it holds the spawn lock, or (spawn lock held) X's mailbox barrier. Meanwhile another thread acts on
+// another member B (a running member of another conversation): `send` to B, `read` as B, `stop` B, or `spawn` a new
+// member. Each completes, or refuses `lock` within LOCK_WAIT; none waits without bound. send, read and stop take no
+// lock the resume holds, so they finish while it is still paused; spawn waits for the spawn lock and finishes within
+// LOCK_WAIT (plus a margin) after the resume gives it back. The lock wait is the real lock's, on the real clock (the
+// seam's), and no case comes near it.
+#[test]
+fn send_read_spawn_and_stop_stay_bounded_during_a_resume() {
+    use std::sync::atomic::{AtomicBool, Ordering::SeqCst};
+    use std::sync::{Arc, Mutex, mpsc};
+    use std::time::{Duration, Instant};
+    const B: &str = "cccccccccccc";
+    let margin = Duration::from_secs(2);
+    for pause in ["spawn", "mail"] {
+        for verb in ["send", "read", "spawn", "stop"] {
+            let w = World::human("");
+            let root = real_locks(&w);
+            let caller = w.caller();
+            let x = member(&w, ID, json!({"pane": "%5", "window": "@1", "depth": 1}));
+            let b = member(
+                &w,
+                B,
+                json!({"name": "other", "pane": "%6", "window": "@1", "depth": 1,
+                    "sessionId": OTHER_SESSION}),
+            );
+            w.panes(&[]);
+            facts(&w, &[(&x, "exited"), (&b, "running")]);
+            launches(&w, "t1");
+            let key = match pause {
+                "spawn" => lock_key("spawn", &caller, "$3"),
+                _ => lock_key("mail", &caller, ID),
+            };
+            let (held_tx, held_rx) = mpsc::channel();
+            let (go_tx, go_rx) = mpsc::channel::<()>();
+            let released: Arc<Mutex<Option<Instant>>> = Arc::new(Mutex::new(None));
+            let (paused, at, hold, give) = (
+                AtomicBool::new(false),
+                released.clone(),
+                format!("+{key}"),
+                format!("-{key}"),
+            );
+            w.fakes.lock_probe(move |event| {
+                if event == hold && !paused.swap(true, SeqCst) {
+                    held_tx.send(()).unwrap();
+                    go_rx
+                        .recv_timeout(Duration::from_secs(10))
+                        .expect("the verb never let the resume go: it waited without bound");
+                }
+                if event == give {
+                    *at.lock().unwrap() = Some(Instant::now());
+                }
+                String::new()
+            });
+            let state_root = w.ctx.state_root.clone();
+            let (xr, br) = (x.clone(), b.clone());
+            let worker = std::thread::spawn(move || {
+                let mut v = World::human("");
+                v.ctx.state_root = state_root;
+                v.fakes.real_locks(&root);
+                let team = membership::team(&v.caller());
+                let terminal = |r: &Value, life: &str| {
+                    let mut t = wire(r, life);
+                    t["labels"]["mux.team"] = json!(team);
+                    t
+                };
+                let addr = |r: &Value| r["hcAddress"].as_str().unwrap().to_string();
+                let look = |v: &World| {
+                    cf::online(v);
+                    cf::listing(v, &team, &[]);
+                    cf::get(v, &addr(&xr), terminal(&xr, "exited"));
+                    cf::get(v, &addr(&br), terminal(&br, "running"));
+                };
+                let request: Vec<&str> = match verb {
+                    "send" => {
+                        v.panes(&[]);
+                        look(&v);
+                        vec!["send", "other", "-Body", "hi"]
+                    }
+                    "read" => {
+                        let tmux = v.ctx.env.get("TMUX").unwrap().to_string();
+                        v.ctx.env = crate::ctx::Env::from_pairs([
+                            ("TMUX", tmux),
+                            ("TMUX_PANE", "%6".to_string()),
+                        ]);
+                        let mut row = crate::agents::fixture::row_of("%6|@1|300||", &[]);
+                        row.command = br["startCommand"].as_str().unwrap().into();
+                        v.pane_rows(&[row]);
+                        look(&v);
+                        // The read fence's own look under B's mailbox lock.
+                        cf::online(&v);
+                        cf::get(&v, &addr(&br), terminal(&br, "running"));
+                        vec!["read"]
+                    }
+                    "stop" => {
+                        v.panes(&[]);
+                        cf::online(&v);
+                        cf::answer(&v, &["kill", &addr(&br), "--json"], "{}");
+                        cf::get(&v, &addr(&br), terminal(&br, "stopped"));
+                        vec!["stop", "other"]
+                    }
+                    _ => {
+                        // After the resume: Y is committed at t1; hc cannot read it here, so it is unknown.
+                        v.panes(&[]);
+                        cf::online(&v);
+                        cf::listing(&v, &team, &[]);
+                        v.fakes
+                            .hc_expect(&["get", "t1", "--json"], Err(Refusal::internal("busy")));
+                        cf::get(&v, &addr(&xr), terminal(&xr, "exited"));
+                        cf::get(&v, &addr(&br), terminal(&br, "running"));
+                        launches(&v, "t2");
+                        vec!["spawn", "-Client", "claude", "-Task", "hi", "-Name", "w9"]
+                    }
+                };
+                wait(&held_rx);
+                let started = Instant::now();
+                let request = v.request(&request);
+                let got = match verb {
+                    "send" => crate::agents::message::send(&v.ctx, &request),
+                    "read" => crate::agents::message::read(&v.ctx, &request),
+                    "stop" => crate::agents::message::stop_hc(&v.ctx, &request),
+                    _ => {
+                        // spawn needs the spawn lock the resume holds: let the resume go once it is waiting.
+                        let go = go_tx.clone();
+                        std::thread::spawn(move || {
+                            std::thread::sleep(Duration::from_millis(300));
+                            go.send(()).unwrap();
+                        });
+                        crate::agents::spawn::spawn(&v.ctx, &request)
+                    }
+                };
+                let done = Instant::now();
+                if verb != "spawn" {
+                    go_tx.send(()).unwrap();
+                }
+                let fixture = v.fakes.hc_done();
+                (got, started, done, fixture)
+            });
+            let resumed = resume_of(&w, ID);
+            let (got, started, done, fixture) = worker.join().unwrap();
+            let case = format!("{verb} during the resume's {pause} lock");
+            assert!(resumed.is_ok(), "{case}: the resume {resumed:?}");
+            match &got {
+                Ok(_) => {}
+                Err(e) => assert_eq!((e.code, e.check), (2, "lock"), "{case}: {}", e.message),
+            }
+            fixture.unwrap_or_else(|e| panic!("{case}: {}", e.message));
+            let released = released
+                .lock()
+                .unwrap()
+                .expect("the resume released its lock");
+            assert!(
+                done <= released + crate::state::lock::LOCK_WAIT + margin,
+                "{case}"
+            );
+            if verb == "spawn" {
+                // It waited for the resume's spawn lock, then went on.
+                assert!(done >= released && started < released, "{case}");
+            } else {
+                // It took no lock the resume holds: done while the resume was still paused.
+                assert!(done < released, "{case}");
+            }
+            match verb {
+                "send" => assert_eq!(
+                    read_mail(&w.ctx, &caller, B)
+                        .unwrap()
+                        .iter()
+                        .map(|m| text(m.get("text")).rsplit('\n').next().unwrap().to_string())
+                        .collect::<Vec<_>>(),
+                    ["hi"],
+                    "{case}"
+                ),
+                "read" => assert_eq!(got.unwrap()["messages"], json!([]), "{case}"),
+                "stop" => assert_eq!(got.unwrap()["life"], "ended", "{case}"),
+                _ => assert_eq!(got.unwrap()["name"], "w9", "{case}"),
+            }
+            w.fakes.hc_done().unwrap();
+        }
+    }
+}
