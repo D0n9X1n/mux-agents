@@ -44,13 +44,34 @@ pub fn claim_json(path: &Path, value: &Value) -> Res<bool> {
     let mut name = path.as_os_str().to_owned();
     name.push(format!(".{}.tmp", crate::util::guid()?.replace('-', "")));
     let tmp = PathBuf::from(name);
-    write_new(&tmp, value.to_string().as_bytes())?;
+    // The content is on disk before the name appears, so a claim seen after a crash is never empty.
+    write_new(&tmp, value.to_string().as_bytes())
+        .and_then(|()| OpenOptions::new().write(true).open(&tmp)?.sync_data())?;
     let linked = std::fs::hard_link(&tmp, path);
     let _ = std::fs::remove_file(&tmp);
     match linked {
         Ok(()) => Ok(true),
         Err(e) if e.kind() == io::ErrorKind::AlreadyExists => Ok(false),
         Err(e) => Err(e.into()),
+    }
+}
+
+/// Flushes `dir`'s entries to disk, so a file made in it survives a crash or power loss. Windows needs the folder
+/// opened for writing with backup semantics; a read-only open fails there.
+pub fn sync_dir(dir: &Path) -> io::Result<()> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+        OpenOptions::new()
+            .write(true)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+            .open(dir)?
+            .sync_all()
+    }
+    #[cfg(not(windows))]
+    {
+        File::open(dir)?.sync_all()
     }
 }
 
@@ -189,6 +210,14 @@ mod tests {
             read_json(&path).unwrap().unwrap(),
             serde_json::json!({"n": winners[0]})
         );
+    }
+
+    #[test]
+    fn sync_dir_flushes_a_folder_and_refuses_a_missing_one() {
+        let dir = TempDir::new();
+        assert!(claim_json(&dir.path().join("c.json"), &json!(1)).unwrap());
+        sync_dir(dir.path()).unwrap();
+        assert!(sync_dir(&dir.path().join("missing")).is_err());
     }
 
     #[test]

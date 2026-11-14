@@ -185,6 +185,16 @@ fn unc(path: &str) -> bool {
 }
 
 fn claim_spec(spec: &Path, folder: &Path) -> Res<Option<Value>> {
+    claim_spec_with(spec, folder, &mut |d: &Path| crate::state::fs::sync_dir(d))
+}
+
+/// Claims the spec's generation (`gens/<gen>.claim` = `run`). A won claim is flushed to disk (`sync`) before the
+/// client may run: a failed flush is an error, the claim stays `run`, and the client never runs (#103).
+fn claim_spec_with(
+    spec: &Path,
+    folder: &Path,
+    sync: &mut dyn FnMut(&Path) -> io::Result<()>,
+) -> Res<Option<Value>> {
     let v = read_json(spec)?.ok_or_else(|| Refusal::internal("the launch spec is missing"))?;
     let gen_id = match v.get("generation") {
         None => "0",
@@ -199,10 +209,11 @@ fn claim_spec(spec: &Path, folder: &Path) -> Res<Option<Value>> {
     if !same_path(&std::fs::canonicalize(&gens)?, plain, HOST) {
         return Err(Refusal::internal("invalid generation folder"));
     }
-    Ok(
-        crate::state::fs::claim_json(&gens.join(format!("{gen_id}.claim")), &json!("run"))?
-            .then_some(v),
-    )
+    if !crate::state::fs::claim_json(&gens.join(format!("{gen_id}.claim")), &json!("run"))? {
+        return Ok(None);
+    }
+    sync(&gens)?;
+    Ok(Some(v))
 }
 
 fn launch(
@@ -589,6 +600,31 @@ mod tests {
             assert!(mail(&l).is_empty());
             assert_eq!(std::fs::read(l.folder.join("gens/0.claim")).unwrap(), value);
         }
+    }
+
+    // #103: a won claim is flushed to disk before the client runs; when the flush fails the claim stays `run` and
+    // the client never runs, so a crash can never erase the evidence that it may have.
+    #[test]
+    fn generation_claim_is_flushed_before_the_client_runs() {
+        let l = setup("claude", json!([]));
+        let spec = l.folder.join("spec.json");
+        let synced = std::cell::RefCell::new(Vec::new());
+        let ok = claim_spec_with(&spec, &l.folder, &mut |d: &Path| {
+            synced.borrow_mut().push(d.to_path_buf());
+            Ok(())
+        });
+        assert!(ok.unwrap().is_some());
+        assert_eq!(*synced.borrow(), [l.folder.join("gens")]);
+        let l = setup("claude", json!([]));
+        let spec = l.folder.join("spec.json");
+        let failed = claim_spec_with(&spec, &l.folder, &mut |_: &Path| {
+            Err(io::Error::other("flush failed"))
+        });
+        assert!(failed.is_err());
+        assert_eq!(
+            read_json(&l.folder.join("gens/0.claim")).unwrap(),
+            Some(json!("run"))
+        );
     }
 
     #[cfg(unix)]
