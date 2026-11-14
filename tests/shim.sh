@@ -205,8 +205,7 @@ copilot_hooks_report_through_the_shim
 # the plugin's entry as `up -Client claude|copilot -- <args>`. Each case runs a script in a fresh shell with no rc file
 # against a copy of the plugin layout whose scripts/mux-agent is a fake that prints a label and each argument as [arg].
 # SHIM_SHELLS names the shells (default: bash zsh); one that is missing is skipped locally and fails in CI.
-# TODO(up): once `mux-agent up` exists, add the spec's integration case: cc and gg through the real scripts/mux-agent
-# to a built binary's `up`, which starts the client with the arguments as given.
+# The integration case (cc and gg through the real scripts/mux-agent to a built binary's `up`) is tests/shortcuts.rs.
 sc_root="$tmp/sc plug"
 sc_file="$sc_root/scripts/shell/mux-agents.sh"
 sc_home="$tmp/sc home"

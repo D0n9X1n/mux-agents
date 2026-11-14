@@ -313,8 +313,7 @@ if (-not $onWindows) {
 # Shell shortcuts (scripts/shell/mux-agents.ps1): dot-sourced from a profile, it defines cc and gg, which run the
 # plugin's entry shim as `up -Client claude|copilot -- <args>`. Each case runs in a new PowerShell against a plugin
 # root holding the real shim, the shortcut file and the fake binary tier3, which prints a label and [arg] per argument.
-# TODO(up): once `mux-agent up` exists, add the spec's integration case: cc and gg through the real shim to a built
-# binary's `up`, which starts the client with the arguments as given.
+# The integration case (cc and gg through the real shim to a built binary's `up`) is tests/shortcuts.rs.
 function ShortcutReset {
     Reset
     $shell = Join-Path (Join-Path $script:root 'scripts') 'shell'
