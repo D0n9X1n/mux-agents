@@ -252,6 +252,7 @@ pub fn tagged() -> Refusal {
         message: TAGGED.into(),
         reason: None,
         leftover: None,
+        details: Default::default(),
     }
 }
 /// The verbs that re-prove a candidate under the team lock (`resolve_tree`, then `standing`).
@@ -578,6 +579,7 @@ pub fn parent_level(
         check: "authority",
         reason: None,
         leftover: None,
+        details: Default::default(),
         message: format!(
             "the parent chain of {} cannot be read",
             text(records[x].get("name"))

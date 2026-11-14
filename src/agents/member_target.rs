@@ -12,6 +12,7 @@ fn changed() -> Refusal {
         message: "no unique committed member has that identity".into(),
         reason: None,
         leftover: None,
+        details: Default::default(),
     }
 }
 pub(crate) fn named(ctx: &Ctx, caller: &Caller, name: &str) -> Res<Identity> {

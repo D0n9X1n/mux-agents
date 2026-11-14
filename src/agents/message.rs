@@ -1894,6 +1894,7 @@ mod tests {
             message: "rmux endpoint did not answer".into(),
             reason: None,
             leftover: None,
+            details: Default::default(),
         }
     }
 

@@ -102,6 +102,7 @@ fn endpoint_refusal(message: &str) -> Refusal {
         message: message.into(),
         reason: None,
         leftover: None,
+        details: Default::default(),
     }
 }
 
@@ -112,6 +113,7 @@ fn caller_refusal(code: u8, message: &str) -> Refusal {
         message: message.into(),
         reason: None,
         leftover: None,
+        details: Default::default(),
     }
 }
 

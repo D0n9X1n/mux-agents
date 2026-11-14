@@ -315,6 +315,9 @@ fn failure(verb: Option<&str>, refusal: &Refusal) -> Map<String, Value> {
     if let Some(session) = &refusal.leftover {
         reply.insert("leftoverSession".into(), session.clone().into());
     }
+    for (key, value) in &refusal.details {
+        reply.insert(key.clone(), value.clone());
+    }
     reply
 }
 
@@ -470,6 +473,19 @@ mod tests {
             Ok((_, request)) => panic!("parsed: {request:?}"),
             Err(refusal) => (refusal.code, refusal.check),
         }
+    }
+
+    #[test]
+    fn failure_merges_refusal_details() {
+        let r = crate::error::refuse::<()>(2, "quota", "m")
+            .unwrap_err()
+            .with("retryAt", "2026-01-01T01:00:00.0000000Z")
+            .with("delivered", serde_json::json!(["a"]));
+        assert_eq!(
+            serde_json::Value::Object(failure(Some("send"), &r)),
+            serde_json::json!({"ok": false, "verb": "send", "code": 2, "check": "quota", "message": "m",
+                "retryAt": "2026-01-01T01:00:00.0000000Z", "delivered": ["a"]})
+        );
     }
 
     fn probe(ctx: &Ctx, request: &Request) -> Res<Map<String, Value>> {

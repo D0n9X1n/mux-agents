@@ -633,6 +633,7 @@ pub fn header(
             message: ENTRY.into(),
             reason: None,
             leftover: None,
+            details: Default::default(),
         })?
         .replace('\\', "/");
     let mux = match ctx.mux.borrow().as_ref().map(|mux| mux.kind()) {

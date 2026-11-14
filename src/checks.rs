@@ -81,6 +81,7 @@ fn refusal(code: u8, check: &'static str, message: String) -> Refusal {
         message,
         reason: None,
         leftover: None,
+        details: Default::default(),
     }
 }
 

@@ -110,6 +110,7 @@ pub(crate) fn usage(verb: &str) -> Refusal {
         message: line.into(),
         reason: None,
         leftover: None,
+        details: Default::default(),
     }
 }
 

@@ -37,6 +37,7 @@ fn failure(message: &str) -> Refusal {
         message: message.into(),
         reason: None,
         leftover: None,
+        details: Default::default(),
     }
 }
 
@@ -177,6 +178,7 @@ impl Core<'_> {
                 message: "hc keeps no such terminal".into(),
                 reason: None,
                 leftover: None,
+                details: Default::default(),
             });
         }
         if out.code != 0 {

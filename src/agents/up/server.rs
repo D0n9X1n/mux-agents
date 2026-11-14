@@ -16,6 +16,7 @@ pub fn same(ctx: &Ctx, dest: &Caller) -> Res<()> {
         message: RESTARTED.into(),
         reason: None,
         leftover: None,
+        details: Default::default(),
     };
     let out = native(
         ctx,

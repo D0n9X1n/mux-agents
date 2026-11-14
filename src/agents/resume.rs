@@ -143,6 +143,7 @@ fn admit(
                 message: "no member has that name or id".into(),
                 reason: None,
                 leftover: None,
+                details: Default::default(),
             })?,
     };
     let id = &x.identity.id;

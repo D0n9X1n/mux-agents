@@ -275,6 +275,7 @@ pub fn read_text(path: &Path, max: u64) -> Res<String> {
         message: "a task or brief file cannot be read".into(),
         reason: None,
         leftover: None,
+        details: Default::default(),
     };
     let mut options = OpenOptions::new();
     options.read(true);
