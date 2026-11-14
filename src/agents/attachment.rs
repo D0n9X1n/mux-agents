@@ -26,7 +26,8 @@ pub fn attach(
     };
     if !super::agent_id(field("id")?)
         || !super::agent_name(field("name")?)
-        || !super::pane_id(&caller.pane)
+        // A paneless caller (`up`'s leader, #103) may only open a window: a split needs a pane to split.
+        || !(super::pane_id(&caller.pane) || (caller.pane.is_empty() && split.is_none()))
     {
         return Err(Refusal::internal("invalid attachment identity"));
     }
@@ -97,12 +98,12 @@ fn decorate(ctx: &Ctx, caller: &Caller, record: &Value, view: &Created) -> Res<(
             .ok_or_else(|| Refusal::internal("invalid attachment tags"))
     };
     let context = format!("{}:{}", field("context")?, field("reason")?);
-    let tags = [
-        ("@agent-id", field("id")?),
-        ("@agent-name", field("name")?),
-        ("@agent-parent", caller.pane.as_str()),
-        ("@agent-context", context.as_str()),
-    ];
+    let mut tags = vec![("@agent-id", field("id")?), ("@agent-name", field("name")?)];
+    // A leader's view has no parent pane, so no parent tag (#103).
+    if !caller.pane.is_empty() {
+        tags.push(("@agent-parent", caller.pane.as_str()));
+    }
+    tags.push(("@agent-context", context.as_str()));
     if !tags.iter().all(|(_, v)| super::spawn::plain_token(v)) {
         return Err(Refusal::internal("invalid attachment tags"));
     }
@@ -197,5 +198,44 @@ mod tests {
         );
         assert!(w.fakes.mux_calls().is_empty());
         w.fakes.hc_done().unwrap();
+    }
+
+    #[test]
+    fn a_paneless_caller_attaches_a_window_without_a_parent_tag() {
+        let w = World::human("");
+        let mut caller = w.caller();
+        caller.pane = String::new();
+        core_fixture::online(&w);
+        let core = hc::connect(&w.ctx).unwrap();
+        w.fakes.mux_rule(
+            "new-window",
+            0,
+            "%9|@5|hc attach t1
+",
+            "",
+        );
+        w.launches_hold();
+        w.fakes.mux_rule(
+            "-t %9 #{pane_id}|#{@agent-id}",
+            0,
+            "|
+",
+            "",
+        );
+        let r = serde_json::json!({"id":"aaaaaaaaaaaa","name":"leader","hcAddress":"t1","directory":w.ctx.cwd,"context":"brief","reason":"leader"});
+        attach(&w.ctx, &core, &caller, &r, None, &mut None).unwrap();
+        assert!(
+            !w.fakes
+                .mux_calls()
+                .iter()
+                .flatten()
+                .any(|t| t.contains("@agent-parent"))
+        );
+        assert_eq!(
+            attach(&w.ctx, &core, &caller, &r, Some("h"), &mut None)
+                .unwrap_err()
+                .message,
+            "unexpected error (invalid attachment identity)"
+        );
     }
 }
