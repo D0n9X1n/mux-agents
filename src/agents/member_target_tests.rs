@@ -339,3 +339,27 @@ fn a_name_skips_the_member_a_resume_superseded() {
     std::fs::remove_file(w.folder(NEW).join("commit.json")).unwrap();
     assert_eq!(named(&w.ctx, &c, "worker").unwrap().id, ID);
 }
+
+#[test]
+fn by_id_finds_each_of_two_same_name_members() {
+    use crate::agents::{core_fixture as cf, fixture::World};
+    let w = World::human("");
+    let c = w.caller();
+    cf::member(&w, "aaaaaaaaaaaa", serde_json::json!({"name": "twin"}));
+    cf::member(
+        &w,
+        "bbbbbbbbbbbb",
+        serde_json::json!({"name": "twin", "pane": "%8"}),
+    );
+    for id in ["aaaaaaaaaaaa", "bbbbbbbbbbbb"] {
+        assert_eq!(super::by_id(&w.ctx, &c, id).unwrap().id, id);
+    }
+    for id in ["eeeeeeeeeeee", "../x", ""] {
+        assert_eq!(
+            super::by_id(&w.ctx, &c, id).unwrap_err().check,
+            "target",
+            "{id}"
+        );
+    }
+    assert!(w.fakes.hc_calls().is_empty(), "by id never asks hc");
+}

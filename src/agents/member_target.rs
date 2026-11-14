@@ -79,6 +79,19 @@ pub(crate) fn named_with_core(
         _ => Err(changed()),
     }
 }
+/// The committed, unsuperseded member whose id is `id`: the bar opens rows by id, never by name (#103 B6).
+pub(crate) fn by_id(ctx: &Ctx, caller: &Caller, id: &str) -> Res<Identity> {
+    if !super::agent_id(id) {
+        return Err(changed());
+    }
+    let local = membership::locals(ctx, caller)?;
+    let superseded = membership::superseded_locals(&local);
+    local
+        .into_iter()
+        .find(|l| l.identity.id == id && l.stored.committed && !superseded.contains(&l.identity.id))
+        .map(|l| l.identity)
+        .ok_or_else(changed)
+}
 pub(crate) fn current(ctx: &Ctx, caller: &Caller, id: &Identity) -> Res<Value> {
     let record = registry::record(ctx, caller, &id.id)?.ok_or_else(changed)?;
     let folder = super::server_dir(ctx, caller).join("agents").join(&id.id);
