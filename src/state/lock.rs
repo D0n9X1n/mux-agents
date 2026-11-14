@@ -256,24 +256,52 @@ pub(crate) fn admission_root() -> Res<PathBuf> {
 #[cfg(windows)]
 pub(crate) fn admission_root() -> Res<PathBuf> {
     use std::os::windows::ffi::OsStringExt;
+    use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
     use windows_sys::Win32::{
-        System::Com::CoTaskMemFree,
+        Foundation::HANDLE,
+        Security::{TOKEN_DUPLICATE, TOKEN_IMPERSONATE, TOKEN_QUERY},
+        System::{
+            Com::CoTaskMemFree,
+            Threading::{GetCurrentProcess, OpenProcessToken},
+        },
         UI::Shell::{FOLDERID_LocalAppData, KF_FLAG_DEFAULT, SHGetKnownFolderPath},
     };
-    // GetCurrentProcessToken() (a header inline, not exported): with no token the folder is expanded from this
-    // process's USERPROFILE, which the caller can set; the token resolves it from the user's own profile.
-    const CURRENT_PROCESS_TOKEN: windows_sys::Win32::Foundation::HANDLE = -4isize as _;
+    let unreadable = || {
+        refuse(
+            1,
+            "state",
+            "the local application data folder cannot be read",
+        )
+    };
+    // With no token the folder is expanded from this process's USERPROFILE, which the caller can set; this process's
+    // own token resolves it from the user's profile. SHGetKnownFolderPath needs the token opened with TOKEN_QUERY and
+    // TOKEN_IMPERSONATE (and at times TOKEN_DUPLICATE), which GetCurrentProcessToken's pseudo-handle does not carry.
+    let mut token: HANDLE = std::ptr::null_mut();
+    // SAFETY: the current-process pseudo handle needs no closing; `token` is a valid out pointer.
+    if unsafe {
+        OpenProcessToken(
+            GetCurrentProcess(),
+            TOKEN_QUERY | TOKEN_IMPERSONATE | TOKEN_DUPLICATE,
+            &mut token,
+        )
+    } == 0
+    {
+        return unreadable();
+    }
+    // SAFETY: a fresh token handle nothing else owns; dropping it closes it (CloseHandle) on every path below.
+    let token = unsafe { OwnedHandle::from_raw_handle(token) };
     let mut raw: windows_sys::core::PWSTR = std::ptr::null_mut();
-    // SAFETY: a known folder id and the current process token pseudo-handle; `raw` is freed below on every path
-    // (CoTaskMemFree accepts null).
+    // SAFETY: a known folder id and an open token with the access the call documents, which outlives the call;
+    // `raw` is freed below on every path (CoTaskMemFree accepts null).
     let hr = unsafe {
         SHGetKnownFolderPath(
             &FOLDERID_LocalAppData,
             KF_FLAG_DEFAULT as _,
-            CURRENT_PROCESS_TOKEN,
+            token.as_raw_handle(),
             &mut raw,
         )
     };
+    drop(token);
     let path = (hr >= 0 && !raw.is_null()).then(|| {
         // SAFETY: on success `raw` is a NUL-terminated wide string we own until the free.
         let len = (0..).take_while(|&i| unsafe { *raw.add(i) } != 0).count();
@@ -285,11 +313,7 @@ pub(crate) fn admission_root() -> Res<PathBuf> {
     unsafe { CoTaskMemFree(raw as *const _) };
     match path.filter(|p| p.is_absolute()) {
         Some(p) => Ok(p.join("mux-agents").join("locks")),
-        None => refuse(
-            1,
-            "state",
-            "the local application data folder cannot be read",
-        ),
+        None => unreadable(),
     }
 }
 
@@ -1235,5 +1259,17 @@ mod admission_tests {
             || Ok(()),
         )
         .unwrap();
+    }
+
+    /// The admission root is this user's LocalAppData from the profile, as the test process's own (unmodified)
+    /// LOCALAPPDATA names it, plus `mux-agents\locks`.
+    #[cfg(windows)]
+    #[test]
+    fn admission_root_is_the_users_local_app_data() {
+        let local = PathBuf::from(std::env::var_os("LOCALAPPDATA").unwrap());
+        assert_eq!(
+            admission_root().unwrap(),
+            local.join("mux-agents").join("locks")
+        );
     }
 }
