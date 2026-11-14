@@ -184,13 +184,7 @@ pub fn prove_member(
     if !proven {
         return None;
     }
-    let flags = read("spec.json").and_then(|spec| {
-        spec.get("flags")?
-            .as_array()?
-            .iter()
-            .map(|f| f.as_str().map(String::from))
-            .collect::<Option<Vec<_>>>()
-    })?;
+    let flags = super::resume::recorded_flags(&ctx.state_root, key, id).ok()?;
     Some(Member {
         id: id.into(),
         record,
@@ -578,7 +572,7 @@ pub fn parent_level(
         .get(p)
         .and_then(|r| super::spawn::client_named(&text(r.get("client"))))
         .ok_or_else(broken)?;
-    let flags = super::resume::recorded_flags(&server_dir(ctx, caller).join("agents").join(p))
+    let flags = super::resume::recorded_flags(&ctx.state_root, &caller.server_key, p)
         .map_err(|_| broken())?;
     Ok(team::policy(client, &flags))
 }

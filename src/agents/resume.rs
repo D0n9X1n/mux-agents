@@ -205,7 +205,7 @@ fn admit(
     if record.get("depth").and_then(Value::as_u64) == Some(0) {
         return refuse(2, "leader", "a leader is never resumed");
     }
-    let flags = recorded_flags(&server_dir(ctx, caller).join("agents").join(id))?;
+    let flags = recorded_flags(&ctx.state_root, &caller.server_key, id)?;
     let client = client_named(&text(record.get("client")))
         .ok_or_else(|| Refusal::internal("the ended member names no known client"))?;
     match gate {
@@ -241,9 +241,13 @@ fn admit(
     })
 }
 
-/// The client flags X's launch spec recorded; X never resumes with flags its spec does not name.
-pub(crate) fn recorded_flags(folder: &Path) -> Res<Vec<String>> {
-    read_json(&folder.join("spec.json"))?
+/// The client flags member `id`'s launch spec recorded; X never resumes with flags its spec does not name. The spec is
+/// read only inside the state root (`within_root`, #104): one reached through a link out of it names no flags.
+pub(crate) fn recorded_flags(state_root: &Path, key: &str, id: &str) -> Res<Vec<String>> {
+    let spec = crate::caller::hc::within_root(state_root, &[key, "agents", id, "spec.json"]);
+    spec.map(|p| read_json(&p))
+        .transpose()?
+        .flatten()
         .and_then(|spec| {
             spec.get("flags")?
                 .as_array()?

@@ -1438,3 +1438,65 @@ fn a_second_root_grants_no_authority() {
         );
     }
 }
+/// A resume reads launch specs only inside the state root (#104): the target's spec.json, or its parent's, linked to a
+/// file outside refuses, never resuming with flags read through the link.
+#[test]
+fn a_linked_spec_refuses_a_resume() {
+    for case in ["target", "parent"] {
+        let w = World::human("");
+        team_record(&w, &[]);
+        let (x, p) = ("dddddddddddd", "eeeeeeeeeeee");
+        let mut rows = vec![cf::member(&w, LEADER, leader_record())];
+        let mut rx = child(
+            x,
+            if case == "parent" { p } else { LEADER },
+            if case == "parent" { 2 } else { 1 },
+        );
+        if case == "parent" {
+            rows.push(cf::member(&w, p, child(p, LEADER, 1)));
+            write(&w.folder(p).join("spec.json"), json!({"flags": []}));
+        }
+        rx["sessionId"] = json!("22222222-2222-4222-8222-222222222222");
+        let rx = cf::member(&w, x, rx);
+        write(&w.folder(x).join("spec.json"), json!({"flags": []}));
+        let outside = w._dir.path().join("outside");
+        std::fs::create_dir(&outside).unwrap();
+        let spec = w
+            .folder(if case == "parent" { p } else { x })
+            .join("spec.json");
+        let moved = outside.join("spec.json");
+        std::fs::rename(&spec, &moved).unwrap();
+        #[cfg(unix)]
+        let linked = std::os::unix::fs::symlink(&moved, &spec);
+        #[cfg(windows)]
+        let linked = std::os::windows::fs::symlink_file(&moved, &spec);
+        if let Err(e) = linked {
+            eprintln!("{case}: skipped, no link: {e}");
+            continue;
+        }
+        cf::online(&w);
+        facts_of(
+            &w,
+            &crate::agents::membership::team(&w.caller()),
+            &rows,
+            &rx,
+        );
+        let e = crate::agents::resume::resume(&w.ctx, &w.request(&["resume", x])).unwrap_err();
+        let want = match case {
+            "target" => (
+                "internal",
+                "unexpected error (the ended member's launch spec names no client flags)",
+            ),
+            _ => ("authority", "the parent chain of mdd cannot be read"),
+        };
+        assert_eq!((e.check, e.message.as_str()), want, "{case}");
+        assert!(
+            !w.fakes
+                .hc_calls()
+                .iter()
+                .any(|c| c.1.first().is_some_and(|a| a == "run")),
+            "{case}: no launch"
+        );
+        w.fakes.hc_done().unwrap();
+    }
+}
