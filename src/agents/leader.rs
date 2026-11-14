@@ -94,6 +94,7 @@ mod tests {
         CoreSlot {
             name: "leader".into(),
             color: crate::paint::identity(None, "leader"),
+            placed: None,
         }
     }
 

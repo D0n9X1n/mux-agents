@@ -33,6 +33,7 @@ fn slot(_: &crate::hc::Core<'_>) -> Res<CoreSlot> {
     Ok(CoreSlot {
         name: "worker".into(),
         color: "blue",
+        placed: None,
     })
 }
 fn folder(w: &World) -> PathBuf {
@@ -448,4 +449,72 @@ fn hc_launch_fault_matrix() {
         );
         w.fakes.hc_done().unwrap();
     }
+}
+#[test]
+fn a_placed_child_records_its_place_and_a_failed_launch_keeps_its_debit() {
+    let w = World::human("");
+    let (caller, dir) = (w.caller(), w.ctx.cwd.join("member"));
+    std::fs::create_dir(&dir).unwrap();
+    let d = utf8(&dir).unwrap().to_string();
+    let placed = crate::agents::tree::Placed {
+        depth: 2,
+        parent: json!({"id": "aaaaaaaaaaaa"}),
+        parent_pane: "%4".into(),
+        flags: vec!["--effort".into(), "low".into()],
+        directory: Some(d.clone()),
+        name: "worker".into(),
+    };
+    ready(&w);
+    let slot = |p| {
+        Ok(CoreSlot {
+            name: "worker".into(),
+            color: "blue",
+            placed: p,
+        })
+    };
+    let r = launch_hc(&w.ctx, &caller, request(&w), |_| slot(Some(placed.clone()))).unwrap();
+    assert_eq!(
+        (
+            &r["depth"],
+            &r["parentAgent"]["id"],
+            &r["parentPane"],
+            &r["directory"]
+        ),
+        (&json!(2), &json!("aaaaaaaaaaaa"), &json!("%4"), &json!(d))
+    );
+    let spec = read_json(&folder(&w).join("spec.json")).unwrap().unwrap();
+    assert_eq!(
+        (&spec["flags"], &spec["parentPane"]),
+        (&json!(["--effort", "low"]), &json!("%4"))
+    );
+    assert!(
+        w.fakes.hc_calls()[1]
+            .1
+            .windows(2)
+            .any(|a| a[0] == "--cwd" && a[1] == d),
+        "the member's directory"
+    );
+    let file = w.state().join("teams").join("b.json");
+    let debit = |_: &crate::hc::Core<'_>| {
+        crate::agents::budget::spend(&file, &crate::agents::budget::DEFAULT, 0)?;
+        slot(None)
+    };
+    w.fakes.clear_log();
+    core_fixture::online(&w);
+    crate::state::fs::fail_durable_flush(Some(0));
+    let flushed = launch_hc(&w.ctx, &caller, request(&w), debit);
+    crate::state::fs::fail_durable_flush(None);
+    assert!(
+        flushed.is_err() && w.fakes.hc_calls().len() == 1,
+        "a failed flush launches nothing"
+    );
+    let _ = std::fs::remove_file(&file);
+    core_fixture::online(&w);
+    w.fakes.hc_answer(Err(Refusal::internal("timeout")));
+    assert!(launch_hc(&w.ctx, &caller, request(&w), debit).is_err());
+    assert_eq!(
+        read_json(&file).unwrap().unwrap()["tokens"],
+        19,
+        "a failed launch keeps the debit"
+    );
 }

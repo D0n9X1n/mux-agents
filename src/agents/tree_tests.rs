@@ -633,3 +633,73 @@ fn of_two_racing_spawns_at_six_one_wins() {
     });
     assert_eq!(wins, 1);
 }
+#[test]
+fn a_candidate_spawn_is_proven_under_the_lock_or_refused_with_no_side_effects() {
+    let args = ["spawn", "-Client", "claude", "-TaskFile", "t.md"].map(String::from);
+    // Refused: walk and proof fail. OTHER is ended in hc but never reconciled: no `ls`, notice, mail, budget or run.
+    let mut m = member_world();
+    m.w.file("t.md", b"task");
+    m.w.fakes.forget(170);
+    m.hc();
+    m.rounds(3, &term(&m.r, Some(150)));
+    let (code, out) = crate::cli::run(&args, || Ok(&m.w.ctx));
+    assert_eq!(
+        (code, out.contains(r#""check":"tagged""#)),
+        (2, true),
+        "{out}"
+    );
+    assert!(
+        !m.folder(OTHER).join("notice.json").exists()
+            && !crate::agents::budget::path(&m.state, "$3").exists()
+    );
+    assert!(
+        !m.w.fakes
+            .hc_calls()
+            .iter()
+            .any(|c| c.1.first().is_some_and(|a| a == "ls" || a == "run")),
+        "no reconcile, no launch"
+    );
+    m.w.fakes.hc_done().unwrap();
+    // Proven only under the lock: launcher.json gains C when the team lock is taken; ID at depth 3 then refuses `depth`.
+    let mut m = member_world();
+    m.w.file("t.md", b"task");
+    let (p1, p2) = ("cccccccccc01", "cccccccccc02");
+    cf::member(&m.w, p1, child(p1, LEADER, 1));
+    cf::member(&m.w, p2, child(p2, p1, 2));
+    let mut r = m.record(ID);
+    (r["depth"], r["parentAgent"]) = (json!(3), json!({"id": p2}));
+    write(&m.folder(ID).join("record.json"), r);
+    let lj = m.folder(ID).join("launcher.json");
+    write(&lj, json!({"pid": 31337, "start": 1000}));
+    let plus = format!("+{}", crate::agents::lock_key("spawn", &m.c, "$3"));
+    m.w.fakes.lock_probe(move |e| {
+        if e == plus {
+            write(
+                &lj,
+                json!({"pid": 31337, "start": 1000, "client": {"pid": 150, "start": 1500}}),
+            );
+        }
+        String::new()
+    });
+    m.hc();
+    m.rounds(3, &term(&m.r, Some(150)));
+    let (code, out) = crate::cli::run(&args, || Ok(&m.w.ctx));
+    assert_eq!(
+        (code, out.contains(r#""check":"depth""#)),
+        (2, true),
+        "proven under the lock: {out}"
+    );
+    m.w.fakes.hc_done().unwrap();
+}
+#[test]
+fn a_leaderless_team_refuses_before_hc() {
+    let w = World::human("");
+    w.uncommitted(LEADER, json!({"depth": 0, "upTeam": "t"}));
+    let e = crate::agents::spawn::spawn(
+        &w.ctx,
+        &w.request(&["spawn", "-Client", "claude", "-Task", "hi"]),
+    )
+    .unwrap_err();
+    assert_eq!((e.code, e.check), (1, "team"));
+    assert!(w.fakes.hc_calls().is_empty(), "hc is not even installed");
+}

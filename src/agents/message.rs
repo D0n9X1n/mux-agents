@@ -2011,4 +2011,19 @@ mod tests {
             w.fakes.hc_done().unwrap();
         }
     }
+
+    #[test]
+    fn send_parent_reaches_a_parent_named_by_id() {
+        let w = World::agent(ID);
+        w.agent_record(
+            ID,
+            json!({"pane": "%1", "parentPane": "%4", "depth": 2,
+            "parentAgent": {"client": "claude", "id": "bbbbbbbbbbbb"}}),
+        );
+        w.panes(&["%1|@1|100|aaaaaaaaaaaa|worker", "%4|@1|101||"]);
+        w.recipients_live();
+        w.file("b.md", b"done");
+        assert!(run(&w, send, &["send", "parent", "-BodyFile", "b.md"]).starts_with("ok "));
+        assert_eq!(read_mail_of(&w, "pane-4"), ["done"]);
+    }
 }

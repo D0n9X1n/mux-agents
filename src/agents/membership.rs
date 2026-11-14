@@ -285,6 +285,19 @@ impl Snapshot {
         if self.facts.count() >= 6 {
             return crate::error::refuse(2, "cap", "the session already has 6 live agents");
         }
+        self.name_only(requested, client, task)
+    }
+
+    /// The name alone: in a team the limit is the tree's (D4), so no 0.2 cap.
+    pub fn name_only(
+        &self,
+        requested: Option<&str>,
+        client: crate::parse::Client,
+        task: &str,
+    ) -> Res<String> {
+        if let Some(e) = &self.core_error {
+            return Err(e.clone());
+        }
         let names = self.facts.names();
         crate::checks::resolve_name(
             requested,

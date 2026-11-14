@@ -166,6 +166,7 @@ fn create(ctx: &Ctx, caller: &Caller, core: &Core<'_>, plan: &Plan<'_>) -> Res<M
             Ok(CoreSlot {
                 name: "leader".into(),
                 color: crate::paint::identity(None, "leader"),
+                placed: None,
             })
         })
     })

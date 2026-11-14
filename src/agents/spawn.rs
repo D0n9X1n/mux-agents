@@ -8,7 +8,7 @@ use serde_json::{Map, Value, json};
 use super::mail::doing_line;
 use super::placement::{DEFAULT as DEFAULT_PLACEMENT, read_placement};
 use super::{copilot, lock, lock_key, registry, state_dir, text, usage};
-use crate::caller::{Caller, Kind, resolve};
+use crate::caller::{Caller, Kind};
 use crate::checks::{Context, Plan, assert_spawn_allowed, context_plan, session_id};
 use crate::cli::Request;
 use crate::ctx::Ctx;
@@ -140,8 +140,21 @@ pub fn spawn(ctx: &Ctx, request: &Request) -> Res<Map<String, Value>> {
     let Some((effort, no_fork)) = options(request) else {
         return Err(usage("spawn"));
     };
-    let caller = resolve(ctx)?;
-    registry::untagged(ctx, &caller, "an agent pane cannot spawn agents")?;
+    let caller = crate::caller::resolve_tree(ctx)?;
+    let outside = matches!(
+        super::tree::scope(ctx, &caller)?,
+        super::tree::Scope::Outside
+    );
+    if outside {
+        if caller.candidate.is_some() {
+            return Err(super::tree::tagged());
+        }
+        registry::untagged(ctx, &caller, "an agent pane cannot spawn agents")?;
+    } else {
+        lock(ctx, &lock_key("spawn", &caller, &caller.session), || {
+            super::tree::team_of(ctx, &caller)
+        })?;
+    }
     // Relative files are the caller's; the task travels on the client command line, so it stays at 16 KB.
     let task = match (request.value("Task"), request.value("TaskFile")) {
         (Some(_), _) if caller.kind == Kind::Agent => {
@@ -162,7 +175,7 @@ pub fn spawn(ctx: &Ctx, request: &Request) -> Res<Map<String, Value>> {
         .map(|file| read_text(&ctx.cwd.join(file), BRIEF_MAX))
         .transpose()?;
     // An agent caller passes C3, C2 and C5; its children start where it started.
-    let directory = if caller.kind == Kind::Agent && !ctx.admitted {
+    let directory = if caller.kind == Kind::Agent && !ctx.admitted && outside {
         assert_spawn_allowed(ctx, &caller)?
     } else {
         ctx.cwd.clone()
@@ -192,9 +205,30 @@ pub fn spawn(ctx: &Ctx, request: &Request) -> Res<Map<String, Value>> {
             leader: None,
         },
         |core| {
+            let gate = match super::tree::team_of(ctx, &caller)? {
+                Some(t) => Some(super::tree::admit(
+                    ctx,
+                    &caller,
+                    &t,
+                    super::tree::standing(ctx, &caller, Some(core))?,
+                )?),
+                None if caller.candidate.is_some() => return Err(super::tree::tagged()),
+                None => None,
+            };
             let snapshot = super::membership::Snapshot::for_spawn(ctx, &caller, core)?;
             registry::reap_hc(ctx, &caller, &snapshot)?;
-            let name = snapshot.admit_name(request.value("Name"), client, &task)?;
+            let placed = gate
+                .as_ref()
+                .map(|a| {
+                    super::tree::place(ctx, &caller, a, &snapshot, client, effort, || {
+                        snapshot.name_only(request.value("Name"), client, &task)
+                    })
+                })
+                .transpose()?;
+            let name = match &placed {
+                Some(p) => p.name.clone(),
+                None => snapshot.admit_name(request.value("Name"), client, &task)?,
+            };
             let mut used = [0usize; crate::paint::PALETTE.len()];
             for o in snapshot
                 .facts
@@ -215,6 +249,7 @@ pub fn spawn(ctx: &Ctx, request: &Request) -> Res<Map<String, Value>> {
             Ok(CoreSlot {
                 name,
                 color: crate::paint::PALETTE[i],
+                placed,
             })
         },
     )?;
@@ -279,6 +314,7 @@ struct Launch<'a> {
     task: String,
     brief: Option<String>,
     directory: PathBuf,
+    placed: Option<super::tree::Placed>,
 }
 
 /// The agent being started.
@@ -351,6 +387,11 @@ impl Launch<'_> {
             "session": caller.session, "pane": new_pane, "window": window, "parentPane": caller.pane,
             "parentAgent": parent_agent, "directory": utf8(&self.directory)?,
             "taskLine": doing_line(&self.task), "createdAt": utc_o(ctx.clock.now())});
+        if let Some(p) = &self.placed {
+            record["parentAgent"] = p.parent.clone();
+            record["parentPane"] = p.parent_pane.clone().into();
+            record["depth"] = p.depth.into();
+        }
         record["color"] = agent.color.into();
         // The exact command the pane started, as the multiplexer renders it: the agent is the pane running it (#48).
         record["startCommand"] = start_command.into();
@@ -407,7 +448,7 @@ impl Launch<'_> {
             &spec,
             &json!({"schema": 1, "stateDirectory": utf8(state)?, "id": agent.id,
                 "client": client_name(self.client), "flags": self.flags,
-                "parentPane": self.caller.pane, "args": args,
+                "parentPane": self.placed.as_ref().map_or(self.caller.pane.as_str(), |p| p.parent_pane.as_str()), "args": args,
                 "prompt": prompt}),
         )?;
         Ok(spec)
@@ -774,6 +815,7 @@ mod tests {
             task: "task".into(),
             brief: None,
             directory: w.ctx.cwd.clone(),
+            placed: None,
         };
         let a = launch
             .allocate(&w.state(), "worker".into(), "blue")
@@ -907,6 +949,7 @@ mod tests {
                 Ok(CoreSlot {
                     name: "hi".into(),
                     color: "blue",
+                    placed: None,
                 })
             },
         );
@@ -1740,7 +1783,11 @@ mod tests {
                 &["-Task", "add subtract"][..],
                 &["-Task", "hi", "-Name", "w"],
             ] {
-                cf::online(&w); // Local validation precedes ls.
+                // Local validation precedes ls. A record that cannot be read as JSON already refuses in the team
+                // scope check, before hc is connected (#103 D2, fail closed).
+                if case != "not JSON" && case != "unreadable" {
+                    cf::online(&w);
+                }
                 let mut full = vec!["-Client", "claude"];
                 full.extend(args);
                 let got = run(&w, &full);
@@ -3874,6 +3921,7 @@ pub struct CoreRequest<'a> {
 pub struct CoreSlot {
     pub name: String,
     pub color: &'static str,
+    pub placed: Option<super::tree::Placed>,
 }
 /// What a resume carries from the ended member X into its successor: X's id, its record (name, client, session,
 /// directory, parent, depth, mailbox) and the client flags its launch spec recorded.
@@ -3902,17 +3950,25 @@ pub fn launch_hc_locked(
     request: CoreRequest<'_>,
     reserve: impl FnOnce(&crate::hc::Core<'_>) -> Res<CoreSlot>,
 ) -> Res<Value> {
-    let slot = reserve(core)?;
+    let mut slot = reserve(core)?;
+    let placed = slot.placed.take();
     let launch = Launch {
         ctx,
         caller,
         client: request.client,
         model: request.model,
         no_fork: request.no_fork,
-        flags: launch_flags(request.client, None, request.effort),
         task: request.task.into(),
         brief: request.brief.map(str::to_owned),
-        directory: request.directory.into(),
+        flags: placed.as_ref().map_or_else(
+            || launch_flags(request.client, None, request.effort),
+            |p| p.flags.clone(),
+        ),
+        directory: placed
+            .as_ref()
+            .and_then(|p| p.directory.as_deref())
+            .map_or_else(|| request.directory.into(), PathBuf::from),
+        placed,
     };
     super::core_launch::execute_connected(
         core,

@@ -65,7 +65,13 @@ pub fn resume(ctx: &Ctx, request: &Request) -> Res<Map<String, Value>> {
                 resume: Some(&resumed),
                 leader: None,
             },
-            |_| Ok(CoreSlot { name, color }),
+            |_| {
+                Ok(CoreSlot {
+                    name,
+                    color,
+                    placed: None,
+                })
+            },
         )?;
         Ok((resumed.from.clone(), record))
     })?;
