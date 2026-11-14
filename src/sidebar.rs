@@ -2463,7 +2463,7 @@ enum SelfExit {
 }
 
 /// #103: a watch not proven for STARTUP decides under the session's sidebar lock, from what it reads there. Its pane
-/// not marked for this process (run by hand) is no bar's to clean up; its window's record naming its pane and pid (an
+/// not marked for this process (run by hand) is no bar's to clean up; its window's record proving it in full (an
 /// ensure recorded or adopted it while it waited on the lock) keeps it; else it removes its pane's label and mark
 /// (each bound to its pid, like `leave`) and leaves, so its pane closes with it and, dead, blocks no later bar. An
 /// unread mark or record, or a lock not taken, decides nothing.
@@ -2480,9 +2480,15 @@ fn self_exit(ctx: &Ctx, caller: &Caller) -> SelfExit {
         let Some(record) = read(&["show-options", "-wqv", "-t", &caller.window, RECORD]) else {
             return Ok(SelfExit::Unread);
         };
-        if parse_record(record.stdout.trim_end_matches(['\r', '\n']))
-            .is_some_and(|(pane, pid, _)| pane == caller.pane && pid == ctx.pid)
-        {
+        // Kept only by the full proof the tick uses (`own_record`): this pane, this pid, alive in this window, with the
+        // recorded start. A record naming the pane and pid with a stale start keeps nothing.
+        if parse_record(record.stdout.trim_end_matches(['\r', '\n'])).is_some_and(
+            |(pane, pid, start)| {
+                pane == caller.pane
+                    && pid == ctx.pid
+                    && proven(ctx, &pane, pid, start).is_some_and(|at| at == caller.window)
+            },
+        ) {
             return Ok(SelfExit::Kept);
         }
         for command in [
@@ -7973,6 +7979,58 @@ mod tests {
         assert_eq!((ended, frames.len()), ("unproven", 6));
         let all: Vec<String> = w.fakes.mux_calls().iter().map(|c| c.join(" ")).collect();
         assert!(all.iter().any(|c| c == UNLABEL) && all.iter().any(|c| c == UNMARK));
+    }
+
+    // #103 review: `Kept` needs the full proof the tick uses. A record naming this pane and pid with a stale start fails
+    // every proof; it keeps nothing, and the bar leaves within the limit, unlabelled and unmarked.
+    #[test]
+    fn a_record_with_a_stale_start_keeps_no_bar() {
+        let mut probes = vec!["live"; 12];
+        probes.push("gone");
+        let probes: &'static [&'static str] = Box::leak(probes.into_boxed_slice());
+        let (w, _) = keep_world(probes, win("%1", in_place()));
+        views_by_tick(&w, "@1", 100, "closed");
+        w.fakes.mux_first(RECORD, 0, "%7 4242 1\n", "");
+        w.fakes
+            .mux_script(OWN_MARK, |_| Ok(out(0, "4242|4242\n", "")));
+        let (ended, frames) = watch_run(&w);
+        assert_eq!((ended, frames.len()), ("unproven", 5));
+        let all: Vec<String> = w.fakes.mux_calls().iter().map(|c| c.join(" ")).collect();
+        assert!(all.iter().any(|c| c == UNLABEL) && all.iter().any(|c| c == UNMARK));
+    }
+
+    // #103 review, fail closed: a self-exit whose session lock is not taken, or whose window record cannot be read under
+    // it, decides nothing: the bar keeps running, neither unlabelled nor unmarked, and tries again on the next tick.
+    #[test]
+    fn a_self_exit_without_its_lock_or_record_decides_nothing() {
+        let mut probes = vec!["live"; 12];
+        probes.push("gone");
+        let probes: &'static [&'static str] = Box::leak(probes.into_boxed_slice());
+        for case in ["lock", "record"] {
+            let w = watch_world(probes);
+            w.fakes
+                .mux_script(OWN_MARK, |_| Ok(out(0, "4242|4242\n", "")));
+            if case == "lock" {
+                w.fakes.lock_timeout("sidebar|");
+            } else {
+                w.fakes.mux_first(RECORD, 1, "", "no server\n");
+            }
+            let (ended, frames) = watch_run(&w);
+            assert_eq!((ended, frames.len()), ("pane-closed", 12), "{case}");
+            let all: Vec<String> = w.fakes.mux_calls().iter().map(|c| c.join(" ")).collect();
+            assert!(!all.iter().any(|c| c == UNLABEL || c == UNMARK), "{case}");
+            // Tried again on each later tick.
+            let tries = if case == "lock" {
+                w.fakes
+                    .locks()
+                    .iter()
+                    .filter(|l| l.starts_with("!sidebar|"))
+                    .count()
+            } else {
+                all.iter().filter(|c| *c == OWN_MARK_READ).count()
+            };
+            assert!(tries >= 2, "{case}: {tries}");
+        }
     }
 
     // #103 review: the self-exit is decided under the session's sidebar lock, the record read again there: an ensure
