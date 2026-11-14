@@ -39,102 +39,115 @@ function Test-Usable([string] $path) {
     return $global:LASTEXITCODE -eq 0
 }
 
-# The caller's error preferences never turn the binary's own exit code into a failure of the shim.
-$ErrorActionPreference = 'Continue'
-$PSNativeCommandUseErrorActionPreference = $false
+# The shim changes three of PowerShell's preference variables for itself. A caller may hold them with
+# `-Option AllScope`, which an assignment here would change for the caller too, so each is saved first and restored
+# in `finally`, which also runs on `exit`.
+$savedPreferences = foreach ($name in 'ErrorActionPreference', 'PSNativeCommandUseErrorActionPreference', 'PSNativeCommandArgumentPassing') {
+    $v = Get-Variable -Name $name -ErrorAction SilentlyContinue
+    [pscustomobject]@{ Name = $name; Existed = [bool] $v; Value = $(if ($v) { $v.Value }) }
+}
+try {
+    # The caller's error preferences never turn the binary's own exit code into a failure of the shim.
+    $ErrorActionPreference = 'Continue'
+    $PSNativeCommandUseErrorActionPreference = $false
 
-# PowerShell before 7.3 builds a native command line itself: it drops an empty argument and leaves quotes and
-# backslashes unescaped; 7.3 and later pass arguments exactly. So before 7.3 each argument is quoted here, as
-# CommandLineToArgvW and Rust's std parse it.
-$legacy = $PSVersionTable.PSVersion -lt [version]'7.3'
-if (-not $legacy) { $PSNativeCommandArgumentPassing = 'Standard' }
+    # PowerShell before 7.3 builds a native command line itself: it drops an empty argument and leaves quotes and
+    # backslashes unescaped; 7.3 and later pass arguments exactly. So before 7.3 each argument is quoted here, as
+    # CommandLineToArgvW and Rust's std parse it.
+    $legacy = $PSVersionTable.PSVersion -lt [version]'7.3'
+    if (-not $legacy) { $PSNativeCommandArgumentPassing = 'Standard' }
 
-# Windows PowerShell 5.1 and pwsh 7.0-7.2 on Windows add their own quotes around an argument when whitespace falls
-# outside a pair of `"` they count, ignoring backslashes. So the whole argument is quoted here and an embedded `"`
-# is written `""` (a literal quote inside quotes), which keeps every whitespace inside a counted pair and the
-# argument as written; backslashes before a `"` are doubled.
-function ConvertTo-WindowsLegacyArgument([string] $a) {
-    $out = New-Object System.Text.StringBuilder
-    [void] $out.Append('"')
-    $slashes = 0
-    foreach ($c in $a.ToCharArray()) {
-        if ($c -eq '\') { $slashes++; continue }
-        if ($c -eq '"') { [void] $out.Append('\', 2 * $slashes).Append('""') } else {
-            if ($slashes) { [void] $out.Append('\', $slashes) }
+    # Windows PowerShell 5.1 and pwsh 7.0-7.2 on Windows add their own quotes around an argument when whitespace falls
+    # outside a pair of `"` they count, ignoring backslashes. So the whole argument is quoted here and an embedded `"`
+    # is written `""` (a literal quote inside quotes), which keeps every whitespace inside a counted pair and the
+    # argument as written; backslashes before a `"` are doubled.
+    function ConvertTo-WindowsLegacyArgument([string] $a) {
+        $out = New-Object System.Text.StringBuilder
+        [void] $out.Append('"')
+        $slashes = 0
+        foreach ($c in $a.ToCharArray()) {
+            if ($c -eq '\') { $slashes++; continue }
+            if ($c -eq '"') { [void] $out.Append('\', 2 * $slashes).Append('""') } else {
+                if ($slashes) { [void] $out.Append('\', $slashes) }
+                [void] $out.Append($c)
+            }
+            $slashes = 0
+        }
+        [void] $out.Append('\', 2 * $slashes).Append('"')
+        return $out.ToString()
+    }
+
+    # pwsh 7.0-7.2 on macOS and Linux: .NET splits the command line again, so the argument is quoted with escaped quotes.
+    function ConvertTo-UnixLegacyArgument([string] $a) {
+        if ($a.Length -gt 0 -and $a -notmatch '[\s"\\'']') { return $a }
+        $out = New-Object System.Text.StringBuilder
+        [void] $out.Append('"')
+        $slashes = 0
+        foreach ($c in $a.ToCharArray()) {
+            if ($c -eq '\') { $slashes++; continue }
+            if ($c -eq '"') { [void] $out.Append('\', 2 * $slashes + 1) } elseif ($slashes) { [void] $out.Append('\', $slashes) }
+            $slashes = 0
             [void] $out.Append($c)
         }
-        $slashes = 0
+        [void] $out.Append('\', 2 * $slashes).Append('"')
+        return $out.ToString()
     }
-    [void] $out.Append('\', 2 * $slashes).Append('"')
-    return $out.ToString()
-}
 
-# pwsh 7.0-7.2 on macOS and Linux: .NET splits the command line again, so the argument is quoted with escaped quotes.
-function ConvertTo-UnixLegacyArgument([string] $a) {
-    if ($a.Length -gt 0 -and $a -notmatch '[\s"\\'']') { return $a }
-    $out = New-Object System.Text.StringBuilder
-    [void] $out.Append('"')
-    $slashes = 0
-    foreach ($c in $a.ToCharArray()) {
-        if ($c -eq '\') { $slashes++; continue }
-        if ($c -eq '"') { [void] $out.Append('\', 2 * $slashes + 1) } elseif ($slashes) { [void] $out.Append('\', $slashes) }
-        $slashes = 0
-        [void] $out.Append($c)
+    # Always an array, empty when there are no arguments.
+    $pass = @(
+        if (-not $legacy) { $args }
+        elseif ($onWindows) { $args | ForEach-Object { ConvertTo-WindowsLegacyArgument ([string] $_) } }
+        else { $args | ForEach-Object { ConvertTo-UnixLegacyArgument ([string] $_) } }
+    )
+    # Input piped to the shim goes to the binary; otherwise the binary reads the shim's own standard input.
+    $piped = if ($MyInvocation.ExpectingInput) { @($input) } else { $null }
+
+    # PowerShell gives `--%` ("stop parsing") a meaning in every way it calls a program: quoted, in a variable or in
+    # parentheses it is dropped or makes PowerShell pass the rest of the line raw, so no PowerShell entry can pass it
+    # on as written. The shim refuses it, as an argument or as a flag's value, rather than run a changed command; the
+    # sh and cmd entries pass it.
+    if (@($args | Where-Object { [string] $_ -eq '--%' }).Count) {
+        [Console]::Out.Write('{"ok":false,"verb":null,"code":1,"check":"entry","message":"the PowerShell entry cannot pass the argument --%"}' + "`n")
+        exit 1
     }
-    [void] $out.Append('\', 2 * $slashes).Append('"')
-    return $out.ToString()
-}
 
-# Always an array, empty when there are no arguments.
-$pass = @(
-    if (-not $legacy) { $args }
-    elseif ($onWindows) { $args | ForEach-Object { ConvertTo-WindowsLegacyArgument ([string] $_) } }
-    else { $args | ForEach-Object { ConvertTo-UnixLegacyArgument ([string] $_) } }
-)
-# Input piped to the shim goes to the binary; otherwise the binary reads the shim's own standard input.
-$piped = if ($MyInvocation.ExpectingInput) { @($input) } else { $null }
+    $here = (Get-Location).ProviderPath
+    $candidates = @(
+        $env:MUX_AGENTS_BIN,
+        (Join-Path (Join-Path (Join-Path $plugin 'scripts/bin') "$os-$arch") $exe),
+        (Join-Path (Join-Path $plugin 'target/release') $exe)
+    )
+    foreach ($bin in $candidates) {
+        if (-not $bin) { continue }
+        # A relative path, a bare name included, is a file under the current location, never a namesake on PATH.
+        if (-not [System.IO.Path]::IsPathRooted($bin)) { $bin = Join-Path $here $bin }
+        if (-not (Test-Usable $bin)) { continue }
+        # PowerShell on macOS and Linux expands `*`, `?` and `[...]` in every unquoted argument it passes to a native
+        # program, splatted ones included; single-quoted literals are passed as written. PowerShell's own escaper doubles
+        # every character it reads as a single quote (U+0027, U+2018, U+2019, U+201A, U+201B), so no argument can close
+        # its literal.
+        $line = '& ' + ((@($bin) + $pass | ForEach-Object {
+                    "'" + [System.Management.Automation.Language.CodeGeneration]::EscapeSingleQuotedStringContent([string] $_) + "'"
+                }) -join ' ')
+            if ($null -ne $piped) { $line = '$piped | ' + $line }
+        # A failure to start, or an error raised downstream, is thrown on to the caller (a non-zero exit under -File):
+        # never a fallback to another candidate, which might run a second binary, and never the exit code of an
+        # earlier command.
+        $global:LASTEXITCODE = $null
+        try {
+            Invoke-Expression $line
+        } catch {
+            throw
+        }
+        # Read the global one: a caller's local $LASTEXITCODE would otherwise hide the binary's code.
+        if ($null -eq $global:LASTEXITCODE) { exit 1 }
+        exit $global:LASTEXITCODE
+    }
 
-# PowerShell gives `--%` ("stop parsing") a meaning in every way it calls a program: quoted, in a variable or in
-# parentheses it is dropped or makes PowerShell pass the rest of the line raw, so no PowerShell entry can pass it
-# on as written. The shim refuses it, as an argument or as a flag's value, rather than run a changed command; the
-# sh and cmd entries pass it.
-if (@($args | Where-Object { [string] $_ -eq '--%' }).Count) {
-    [Console]::Out.Write('{"ok":false,"verb":null,"code":1,"check":"entry","message":"the PowerShell entry cannot pass the argument --%"}' + "`n")
+    [Console]::Out.Write('{"ok":false,"verb":null,"code":1,"check":"entry","message":"no usable mux-agent binary for ' + "$os-$arch" + '"}' + "`n")
     exit 1
-}
-
-$here = (Get-Location).ProviderPath
-$candidates = @(
-    $env:MUX_AGENTS_BIN,
-    (Join-Path (Join-Path (Join-Path $plugin 'scripts/bin') "$os-$arch") $exe),
-    (Join-Path (Join-Path $plugin 'target/release') $exe)
-)
-foreach ($bin in $candidates) {
-    if (-not $bin) { continue }
-    # A relative path, a bare name included, is a file under the current location, never a namesake on PATH.
-    if (-not [System.IO.Path]::IsPathRooted($bin)) { $bin = Join-Path $here $bin }
-    if (-not (Test-Usable $bin)) { continue }
-    # PowerShell on macOS and Linux expands `*`, `?` and `[...]` in every unquoted argument it passes to a native
-    # program, splatted ones included; single-quoted literals are passed as written. PowerShell's own escaper doubles
-    # every character it reads as a single quote (U+0027, U+2018, U+2019, U+201A, U+201B), so no argument can close
-    # its literal.
-    $line = '& ' + ((@($bin) + $pass | ForEach-Object {
-                "'" + [System.Management.Automation.Language.CodeGeneration]::EscapeSingleQuotedStringContent([string] $_) + "'"
-            }) -join ' ')
-        if ($null -ne $piped) { $line = '$piped | ' + $line }
-    # A failure to start, or an error raised downstream, is thrown on to the caller (a non-zero exit under -File):
-    # never a fallback to another candidate, which might run a second binary, and never the exit code of an
-    # earlier command.
-    $global:LASTEXITCODE = $null
-    try {
-        Invoke-Expression $line
-    } catch {
-        throw
+} finally {
+    foreach ($p in $savedPreferences) {
+        if ($p.Existed) { Set-Variable -Name $p.Name -Value $p.Value } else { Remove-Variable -Name $p.Name -Scope Local -ErrorAction SilentlyContinue }
     }
-    # Read the global one: a caller's local $LASTEXITCODE would otherwise hide the binary's code.
-    if ($null -eq $global:LASTEXITCODE) { exit 1 }
-    exit $global:LASTEXITCODE
 }
-
-[Console]::Out.Write('{"ok":false,"verb":null,"code":1,"check":"entry","message":"no usable mux-agent binary for ' + "$os-$arch" + '"}' + "`n")
-exit 1

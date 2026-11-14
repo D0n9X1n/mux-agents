@@ -238,6 +238,15 @@ $unscoped = @(Select-String -LiteralPath (Join-Path $repo 'scripts/mux-agent.ps1
     Where-Object { $_.Line -notmatch '^\s*#' })
 Check 'no_unscoped_exit_code_read' ($unscoped.Count -eq 0)
 
+# A caller's AllScope preference variables are the same after the shim as before it.
+Reset; Fake $tier3 'tier3'
+RunIn ("function f { Set-Variable ErrorActionPreference Stop -Option AllScope -Scope Local; " +
+    "Set-Variable PSNativeCommandUseErrorActionPreference `$true -Option AllScope -Scope Local; " +
+    "Set-Variable PSNativeCommandArgumentPassing Legacy -Option AllScope -Scope Local; " +
+    "& $(Lit (Join-Path (Join-Path $root 'scripts') 'mux-agent.ps1')) p | Out-Null; " +
+    "'after=' + `$ErrorActionPreference + '|' + `$PSNativeCommandUseErrorActionPreference + '|' + `$PSNativeCommandArgumentPassing }; f")
+Expect 'caller_preferences_are_restored' @('after=Stop|True|Legacy')
+
 # Called with `&` and no arguments: the binary gets no arguments, not one empty one.
 Reset; Fake $tier3 'tier3'
 RunIn ("`$r = & $(Lit (Join-Path (Join-Path $root 'scripts') 'mux-agent.ps1')); 'captured=' + (`$r -join '|')")
