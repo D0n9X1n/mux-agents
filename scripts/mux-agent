@@ -1,13 +1,25 @@
 #!/bin/sh
-# mux-agent entry shim: runs the first usable binary of MUX_AGENTS_BIN, scripts/bin/<os>-<arch>/mux-agent and
-# target/release/mux-agent, passing every argument and the exit code through. With none usable it prints an entry
+# mux-agent entry shim: runs the first usable binary of MUX_AGENTS_BIN, scripts/bin/<os>-<arch>/mux-agent[.exe] and
+# target/release/mux-agent[.exe], passing every argument and the exit code through. With none usable it prints an entry
 # refusal and exits 1. POSIX sh; the only subprocess is uname.
 
 case $0 in */*) here=${0%/*} ;; *) here=. ;; esac
 plugin=$here/..
 
 u=$(uname -sm)
-case ${u% *} in Darwin) os=macos ;; Linux) os=linux ;; *) os=${u% *} ;; esac
+exe=mux-agent
+case ${u% *} in
+  Darwin) os=macos ;;
+  Linux) os=linux ;;
+  # Git Bash, MSYS and Cygwin run the Windows binary. They rewrite path-like arguments for a native program unless
+  # told not to, so the two variables go to the binary's environment, exported here because exec is a special built-in.
+  MINGW* | MSYS* | CYGWIN*)
+    os=windows exe=mux-agent.exe
+    MSYS2_ARG_CONV_EXCL='*' MSYS_NO_PATHCONV=1
+    export MSYS2_ARG_CONV_EXCL MSYS_NO_PATHCONV
+    ;;
+  *) os=${u% *} ;;
+esac
 case ${u##* } in arm64 | aarch64) arch=aarch64 ;; x86_64 | amd64) arch=x86_64 ;; *) arch=${u##* } ;; esac
 
 # A regular file that is executable, or becomes so with chmod +x.
@@ -17,7 +29,7 @@ usable() {
   [ -x "$1" ]
 }
 
-for bin in "${MUX_AGENTS_BIN-}" "$plugin/scripts/bin/$os-$arch/mux-agent" "$plugin/target/release/mux-agent"; do
+for bin in "${MUX_AGENTS_BIN-}" "$plugin/scripts/bin/$os-$arch/$exe" "$plugin/target/release/$exe"; do
   # A name with no slash is a file in the cwd, so exec runs the file checked rather than searching PATH.
   case $bin in '' | */*) ;; *) bin=./$bin ;; esac
   if usable "$bin"; then exec "$bin" "$@"; fi

@@ -106,10 +106,24 @@ jobs:
       - name: Release panic test
         shell: bash
         run: cargo test --release --features test-panic --locked --test panic
+      # The shell shortcut cases run under bash and zsh; macOS ships zsh.
+      - name: Install zsh
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y zsh
       - name: Shim tests (sh)
         if: runner.os != 'Windows'
         shell: bash
         run: sh tests/shim.sh
+      # Git Bash: the sh shim maps MINGW to the Windows binary, and cc's arguments reach a native program unchanged.
+      # Git Bash has no zsh.
+      - name: Shim tests (Git Bash)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: SHIM_SHELLS=bash bash tests/shim.sh
       # shim.cmd builds its stub with the .NET Framework csc.exe; its last line counts the failures.
       - name: Shim tests (cmd)
         if: runner.os == 'Windows'

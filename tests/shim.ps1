@@ -308,6 +308,136 @@ if (-not $onWindows) {
     Check 'nonexec_gets_chmod' (($rc -eq 0) -and ($out -eq "tier2`n[x]") -and $made)
 }
 
+# Shell shortcuts (scripts/shell/mux-agents.ps1): dot-sourced from a profile, it defines cc and gg, which run the
+# plugin's entry shim as `up -Client claude|copilot -- <args>`. Each case runs in a new PowerShell against a plugin
+# root holding the real shim, the shortcut file and the fake binary tier3, which prints a label and [arg] per argument.
+# TODO(up): once `mux-agent up` exists, add the spec's integration case: cc and gg through the real shim to a built
+# binary's `up`, which starts the client with the arguments as given.
+function ShortcutReset {
+    Reset
+    $shell = Join-Path (Join-Path $script:root 'scripts') 'shell'
+    New-Item -ItemType Directory -Force -Path $shell | Out-Null
+    Copy-Item -LiteralPath (Join-Path $repo 'scripts/shell/mux-agents.ps1') -Destination $shell
+    $script:sc = Join-Path $shell 'mux-agents.ps1'
+    $script:glob = Join-Path $script:case 'glob'
+    New-Item -ItemType Directory -Force -Path $script:glob | Out-Null
+    Set-Content -LiteralPath (Join-Path $script:glob 'match-me') -Value '' -Encoding ASCII
+    Fake $script:tier3 'tier3'
+}
+
+# The fake's output for `up -Client <client> -- <rest>`.
+function Up([string] $label, [string] $client, [string[]] $rest = @()) {
+    $lines = @($label, '[up]', '[-Client]', "[$client]", '[--]')
+    foreach ($r in $rest) { $lines += "[$r]" }
+    $lines
+}
+
+# RunIn with <SC>, <GLOB> and the other <NAME> tokens replaced by literals of the values given.
+function RunCase([string] $template, [hashtable] $values = @{}) {
+    $values['SC'] = $script:sc; $values['GLOB'] = $script:glob
+    foreach ($k in $values.Keys) { $template = $template.Replace("<$k>", (Lit $values[$k])) }
+    RunIn $template
+}
+
+ShortcutReset
+RunCase @'
+Set-Location -LiteralPath <GLOB>; . <SC>; cc a 'b c' '' '*' '$x' 'q"t' "it's" -r /tmp/f --dir=/tmp/f; 'code=' + $LASTEXITCODE
+'@
+Expect 'shortcut_cc_args_arrive_exactly' ((Up 'tier3' 'claude' @('a', 'b c', '', '*', '$x', 'q"t', "it's", '-r', '/tmp/f', '--dir=/tmp/f')) + 'code=0')
+
+ShortcutReset
+RunCase ". <SC>; gg x; 'code=' + `$LASTEXITCODE"
+Expect 'shortcut_gg_runs_copilot' ((Up 'tier3' 'copilot' @('x')) + 'code=0')
+
+ShortcutReset
+RunCase "`$env:SHIM_EXIT = '7'; . <SC>; cc z | Out-Null; 'code=' + `$LASTEXITCODE"
+Expect 'shortcut_last_exit_code_is_the_programs' @('code=7')
+
+# A mux-agent on PATH, shim or binary, is never used.
+ShortcutReset
+$onPath = Join-Path $case 'path'; Fake (Join-Path $onPath $exe) 'on-path'
+Set-Content -LiteralPath (Join-Path $onPath 'mux-agent.ps1') -Value "'on-path'" -Encoding ASCII
+RunCase "`$env:PATH = <P> + [System.IO.Path]::PathSeparator + `$env:PATH; . <SC>; cc p" @{ P = $onPath }
+Expect 'shortcut_mux_agent_on_path_never_used' (Up 'tier3' 'claude' @('p'))
+
+# MUX_AGENTS_HOME, absolute and relative to where the file is dot-sourced, names the plugin for a copied or symlinked
+# file, and still does after a cd.
+foreach ($f in 'copy', 'link') {
+    foreach ($h in 'abs', 'rel') {
+        ShortcutReset
+        $home2 = Join-Path $case 'home'
+        New-Item -ItemType Directory -Force -Path (Join-Path $home2 'scripts') | Out-Null
+        Copy-Item -LiteralPath (Join-Path $repo 'scripts/mux-agent.ps1') -Destination (Join-Path $home2 'scripts')
+        Fake (Join-Path (Join-Path $home2 'target/release') $exe) 'home'
+        $else = Join-Path $case 'else'; New-Item -ItemType Directory -Force -Path $else | Out-Null
+        $file = Join-Path $else "$f.ps1"
+        if ($f -eq 'copy') { Copy-Item -LiteralPath $sc -Destination $file } else {
+            try { New-Item -ItemType SymbolicLink -Path $file -Value $sc -ErrorAction Stop | Out-Null } catch { }
+        }
+        $name = "shortcut_home_${h}_${f}_after_cd"
+        if (-not (Test-Path -LiteralPath $file)) {
+            if ($env:CI) { Check $name $false } else { "skip $name (no symlink: $($Error[0]))" }
+            continue
+        }
+        $value = if ($h -eq 'abs') { $home2 } else { Join-Path "c$($script:n)" 'home' }
+        RunCase "`$env:MUX_AGENTS_HOME = <H>; . <F>; Set-Location -LiteralPath <GLOB>; cc h" @{ H = $value; F = $file }
+        Expect $name (Up 'home' 'claude' @('h'))
+    }
+}
+
+ShortcutReset
+RunCase "Set-Location -LiteralPath <S>; . ./shell/mux-agents.ps1; Set-Location -LiteralPath <GLOB>; cc h" @{ S = (Join-Path $root 'scripts') }
+Expect 'shortcut_relative_source_after_cd' (Up 'tier3' 'claude' @('h'))
+
+# Snap writes the function names, then the global variable names, to a file; the case runs it once first so that the
+# automatic variables a first command creates are in both snapshots.
+$snap = 'function Snap([string] $f) { Set-Content -LiteralPath $f -Value (@(Get-ChildItem function: | ForEach-Object Name | Sort-Object) + ''--'' + @(Get-Variable -Scope Global | ForEach-Object Name | Sort-Object)) }; '
+function Grew([string[]] $names) {
+    $before = @(Get-Content -LiteralPath (Join-Path $case 'before.txt'))
+    $after = @(Get-Content -LiteralPath (Join-Path $case 'after.txt'))
+    $added = @($after | Where-Object { $before -notcontains $_ } | Sort-Object)
+    $removed = @($before | Where-Object { $after -notcontains $_ })
+    ($removed.Count -eq 0) -and (($added -join ',') -eq ((@($names) | Sort-Object) -join ','))
+}
+
+ShortcutReset
+Remove-Item -LiteralPath (Join-Path (Join-Path $root 'scripts') 'mux-agent.ps1')
+$warnFile = Join-Path $case 'warn.txt'
+# The warning record's message is written, not the redirected text, which Windows PowerShell wraps at the console width.
+RunCase ($snap + "Snap <W>; Snap <B>; . <SC> 3>&1 | ForEach-Object { Add-Content -LiteralPath <WF> -Value ([string] `$_.Message) }; Snap <A>") @{
+    W = (Join-Path $case 'warm.txt'); B = (Join-Path $case 'before.txt'); A = (Join-Path $case 'after.txt'); WF = $warnFile
+}
+$warn = @(if (Test-Path -LiteralPath $warnFile) { Get-Content -LiteralPath $warnFile })
+$at = if ($warn.Count -eq 1 -and $warn[0] -match '^mux-agents: no entry at (.+); dot-source scripts/shell/mux-agents\.ps1 from the plugin folder or set MUX_AGENTS_HOME$') { $Matches[1] }
+$want = [System.IO.Path]::GetFullPath((Join-Path (Join-Path $root 'scripts') 'mux-agent.ps1'))
+Check 'shortcut_missing_entry_warns_and_defines_nothing' (($rc -eq 0) -and ($out -eq '') -and $at -and
+    ([System.IO.Path]::GetFullPath($at) -eq $want) -and ($at -like '*..*') -and (Grew @()))
+
+ShortcutReset
+RunCase "`$env:MSYS2_ARG_CONV_EXCL = 'keep'; . <SC>; cc m | Out-Null; 'after=' + `$env:MSYS2_ARG_CONV_EXCL + '|' + [string] `$env:MSYS_NO_PATHCONV"
+Expect 'shortcut_msys_variables_unchanged' @('after=keep|')
+
+ShortcutReset
+RunCase ($snap + "Snap <W>; Snap <B>; . <SC>; . <SC>; Snap <A>; cc t") @{
+    W = (Join-Path $case 'warm.txt'); B = (Join-Path $case 'before.txt'); A = (Join-Path $case 'after.txt')
+}
+Check 'shortcut_sourcing_twice_adds_three_names_only' (($rc -eq 0) -and ($out -eq ((Up 'tier3' 'claude' @('t')) -join "`n")) -and
+    (Grew @('cc', 'gg', '__MuxAgentsEntry')))
+
+# -Verbose and -Debug reach the program, and the caller's preferences are as before.
+ShortcutReset
+RunCase (". <SC>; `$ErrorActionPreference = 'Stop'; `$VerbosePreference = 'SilentlyContinue'; `$DebugPreference = 'SilentlyContinue'; " +
+    "`$WarningPreference = 'Continue'; `$env:SHIM_EXIT = '7'; cc -Verbose -Debug v; 'code=' + `$LASTEXITCODE; " +
+    "'prefs=' + `$ErrorActionPreference + '|' + `$VerbosePreference + '|' + `$DebugPreference + '|' + `$WarningPreference")
+$lines = @($out -split "`n")
+Check 'shortcut_verbose_and_debug_reach_the_program' ((($lines[0..7]) -join "`n") -eq ((Up 'tier3' 'claude' @('-Verbose', '-Debug', 'v')) -join "`n") -and ($lines -contains 'code=7'))
+Check 'shortcut_caller_preferences_unchanged' ($lines -contains 'prefs=Stop|SilentlyContinue|SilentlyContinue|Continue')
+
+# `--%` ends parsing for the rest of its line, so the code check is on a line of its own.
+ShortcutReset
+RunCase ". <SC>`ncc --% x 'a b'`n'code=' + `$LASTEXITCODE"
+Expect 'shortcut_stop_parsing_token_is_refused' @('{"ok":false,"verb":null,"code":1,"check":"entry","message":"the PowerShell entry cannot pass the argument --%"}', 'code=1')
+
 Remove-Item Env:MUX_AGENTS_BIN -ErrorAction SilentlyContinue
 Remove-Item Env:SHIM_EXIT -ErrorAction SilentlyContinue
 Remove-Item -LiteralPath $tmp -Recurse -Force

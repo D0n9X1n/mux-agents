@@ -949,6 +949,9 @@ fn ci_jobs_run_cargo_and_sh() {
     );
     let test = job_lines(&ci, "test");
     line_of(&test, "sh tests/shim.sh");
+    // The shortcut cases run under bash and zsh on Linux and macOS, and under Git Bash on Windows.
+    line_of(&test, "sudo apt-get install -y zsh");
+    line_of(&test, "SHIM_SHELLS=bash bash tests/shim.sh");
     line_of(&test, r"cmd //d //c 'tests\shim.cmd'");
     line_of(&test, r"cmd //d //c 'scripts\mux-agent.cmd' list");
     line_of(&test, r#"echo "TEMP=$RUNNER_TEMP" >> "$GITHUB_ENV""#);
@@ -1121,6 +1124,10 @@ fn readme_line_ok(line: &str) -> bool {
 /// The one PowerShell line the skill keeps: how a PowerShell caller runs the entry.
 const SKILL_PWSH_NOTE: &str = "The commands below, and the Reply and Listen lines, run as-is in the Bash tool. In PowerShell, prefix `& ` (`& \"<exe>\" send parent …`).";
 
+/// The skill's other PowerShell line: the Shell shortcuts section's source line for a PowerShell profile.
+const SKILL_SHORTCUT_PWSH_LINE: &str =
+    "- PowerShell, in `$PROFILE`: `. \"<plugin folder>/scripts/shell/mux-agents.ps1\"`";
+
 /// Hooks and their tests may name the old `mux-agent.ps1` (spawn detection keeps accepting a 0.1 command line) and
 /// Claude Code's `PowerShell` tool, whose calls the pane watches as it watches Bash.
 fn hook_line_ok(line: &str) -> bool {
@@ -1150,7 +1157,7 @@ fn no_pwsh_in_readme_skill_contributing_hooks() {
         }
     }
     for line in file_lines("skills/mux-agents/SKILL.md") {
-        if names_powershell(&line) && line != SKILL_PWSH_NOTE {
+        if names_powershell(&line) && line != SKILL_PWSH_NOTE && line != SKILL_SHORTCUT_PWSH_LINE {
             bad.push(format!("SKILL.md: {line}"));
         }
     }
@@ -1173,6 +1180,9 @@ fn no_pwsh_in_readme_skill_contributing_hooks() {
     assert!(bad.is_empty(), "{bad:#?}");
     // The skill keeps its note; the pane runs the shim, never PowerShell; spawn detection still takes 0.1 lines.
     assert!(file_lines("skills/mux-agents/SKILL.md").contains(&SKILL_PWSH_NOTE.to_string()));
+    assert!(
+        file_lines("skills/mux-agents/SKILL.md").contains(&SKILL_SHORTCUT_PWSH_LINE.to_string())
+    );
     let register = repo_file("hooks/register.tsx");
     assert!(register.contains(
         r"return ['cmd.exe', '/d', '/c', `${root}\\scripts\\mux-agent.cmd`, 'list', '-All']"
@@ -1343,6 +1353,36 @@ fn skill_readme_and_wiki_say_terminal_cli_only() {
                 .iter()
                 .any(|l| l.contains(rule) && l.contains(desktop)),
             "{path} does not state {rule:?} naming {desktop:?}"
+        );
+    }
+}
+
+// The person's shortcuts `cc` and `gg`: SKILL.md says how to source them and what they cannot do.
+#[test]
+fn skill_documents_shell_shortcuts() {
+    let skill = file_lines("skills/mux-agents/SKILL.md");
+    let start = skill
+        .iter()
+        .position(|l| l == "## Shell shortcuts")
+        .expect("SKILL.md's Shell shortcuts");
+    let section: String = skill[start + 1..]
+        .iter()
+        .take_while(|l| !l.starts_with("## "))
+        .map(|l| format!("{l}\n"))
+        .collect();
+    for needle in [
+        "`. \"<plugin folder>/scripts/shell/mux-agents.sh\"`",
+        SKILL_SHORTCUT_PWSH_LINE,
+        "the plugin's real folder",
+        "`MUX_AGENTS_HOME`",
+        "shadows the C compiler `cc`",
+        "`--%`",
+        "`$LASTEXITCODE`",
+        "type `claude` or `copilot` for the bare client",
+    ] {
+        assert!(
+            section.contains(needle),
+            "SKILL.md's Shell shortcuts lacks {needle:?}: {section}"
         );
     }
 }
@@ -1909,8 +1949,10 @@ fn readme_notes_dist_pin() {
     );
 }
 
-/// The optional PowerShell entry shim (#103), the one PowerShell file that ships.
+/// The optional PowerShell entry shim (#103).
 const POWERSHELL_ENTRY: &str = "scripts/mux-agent.ps1";
+/// The optional PowerShell shortcuts `cc` and `gg`, dot-sourced from a profile.
+const POWERSHELL_SHORTCUTS: &str = "scripts/shell/mux-agents.ps1";
 
 #[test]
 fn no_powershell_needed() {
@@ -1923,11 +1965,16 @@ fn no_powershell_needed() {
                 .any(|e| p.ends_with(e))
         })
         .collect();
-    // #103: the user asked for a PowerShell entry beside sh and cmd. The binary and hooks still need none; these two
-    // files are an optional entry point and its tests, and nothing else may be PowerShell.
+    // #103: the user asked for a PowerShell entry beside sh and cmd, and for PowerShell shortcuts beside the bash and
+    // zsh ones. The binary and hooks still need none; these three files are an optional entry point, the optional
+    // shortcuts and their tests, and nothing else may be PowerShell.
     assert_eq!(
         scripts,
-        [&POWERSHELL_ENTRY.to_string(), &"tests/shim.ps1".to_string()],
+        [
+            &POWERSHELL_ENTRY.to_string(),
+            &POWERSHELL_SHORTCUTS.to_string(),
+            &"tests/shim.ps1".to_string()
+        ],
         "{scripts:?}"
     );
     let mut bad = Vec::new();
@@ -1937,7 +1984,7 @@ fn no_powershell_needed() {
             .any(|d| p.starts_with(d))
             || ["Cargo.toml", "CONTRIBUTING.md"].contains(&p.as_str())
     }) {
-        if path.as_str() == POWERSHELL_ENTRY {
+        if [POWERSHELL_ENTRY, POWERSHELL_SHORTCUTS].contains(&path.as_str()) {
             continue;
         }
         let full = Path::new(env!("CARGO_MANIFEST_DIR")).join(path);
