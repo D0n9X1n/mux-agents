@@ -341,7 +341,7 @@ fn scoped_launcher_runs_once_with_explicit_context() {
         bin.join(format!("claude{}", std::env::consts::EXE_SUFFIX)),
     )
     .unwrap();
-    fs::write(&spec, json!({"schema":1,"generation":"0","client":"claude","args":["--session-id","0f11fc2f-2032-48ef-a920-4af2a8e5af50"]}).to_string()).unwrap();
+    fs::write(&spec, json!({"schema":1,"generation":"0","client":"claude","flags":["--dangerously-skip-permissions","--effort","high"],"args":["--session-id","0f11fc2f-2032-48ef-a920-4af2a8e5af50"]}).to_string()).unwrap();
     fs::write(folder.join("commit.json"), "{}").unwrap();
     fs::write(state.join("key/server.json"), "{}").unwrap();
     fs::write(
