@@ -5441,6 +5441,31 @@ mod tests {
         assert_eq!((click_reads(&w), selects(&w)), (1, 1));
     }
 
+    // A guard for the rule the live click tests wait on (#103): a press read with the clock not moved since its frame is
+    // dropped and only redraws; the same press read on a later frame, more than PRESS_GAP after it, focuses.
+    #[test]
+    fn a_press_read_at_its_frame_is_dropped_and_one_read_after_the_gap_focuses() {
+        let w = click_world(&["live", "live", "live", "gone"], board_answer());
+        let script = Script::new(&w.fakes, vec![(0, press(3))]);
+        watch_frames(&w, 3);
+        let (_, frames, times) = watch_with(&w, Box::new(script));
+        assert_eq!(diffs(&times), [0, 2000], "redrawn at once, no tick counted");
+        assert_eq!(frames.len(), 3);
+        assert_eq!((click_reads(&w), selects(&w)), (0, 0), "dropped: no focus");
+        let w = click_world(&["live", "live", "live", "live", "gone"], board_answer());
+        let script = Script::new(&w.fakes, vec![(2060, press(3))]);
+        watch_frames(&w, 2);
+        crate::agents::core_fixture::online(&w);
+        watch_frames(&w, 2);
+        let (_, _, times) = watch_with(&w, Box::new(script));
+        assert_eq!(diffs(&times), [2000, 60, 2000]);
+        assert_eq!(
+            (click_reads(&w), selects(&w)),
+            (1, 1),
+            "60 ms after the second frame: select-pane"
+        );
+    }
+
     #[test]
     fn one_read_handles_every_event_in_order() {
         let w = click_world(&["live", "live", "live", "gone"], board_answer());

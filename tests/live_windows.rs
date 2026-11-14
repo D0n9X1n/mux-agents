@@ -612,19 +612,23 @@ fn bar_keys_and_a_click_focus_an_agent() {
         (live.focused() == p1).then_some(())
     });
 
-    // A press read within 50 ms of a frame is dropped, as the user may have aimed at the frame before it: try again.
+    // A press read within 50 ms of a frame is dropped, as the user may have aimed at the frame before it (sidebar.rs
+    // PRESS_GAP). So each try presses just after a redraw, when the next frame is about 1.9 s away: the bar's text
+    // changes with every frame while its agents' ages count seconds. A bar busy between frames can still read a press
+    // late, so the tries go on until WAIT (#103: the tree tests now run beside this one).
     let mut clicked = false;
-    for _ in 0..3 {
+    let deadline = Instant::now() + WAIT;
+    while !clicked && Instant::now() < deadline {
         live.focus_root();
+        let before = live.screen(&bar);
+        eventually(Duration::from_secs(3), || live.screen(&bar) != before);
+        std::thread::sleep(Duration::from_millis(100));
         let screen = live.screen(&bar);
         let y = row_at(&screen, "w2").unwrap_or_else(|| panic!("no w2 row:\n{screen}"));
         for end in ['M', 'm'] {
             live.keys(&bar, &format!("\x1b[<0;3;{y}{end}"));
         }
-        if eventually(Duration::from_secs(5), || live.focused() == p2) {
-            clicked = true;
-            break;
-        }
+        clicked = eventually(Duration::from_secs(3), || live.focused() == p2);
     }
     assert!(
         clicked,
