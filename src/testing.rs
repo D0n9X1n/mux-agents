@@ -42,6 +42,8 @@ struct HcAnswer {
 #[derive(Default)]
 struct Log {
     rows: Vec<Row>,
+    // `table()` fails as an unreadable process table would.
+    table_fails: bool,
     os_calls: Vec<String>,
     // OS and multiplexer calls in one order: OS calls as recorded, multiplexer calls as `mux <argv>`.
     events: Vec<String>,
@@ -74,6 +76,8 @@ struct Log {
     kind: Option<Kind>,
     // Shared with another thread's fakes by `share_locks`: a held key blocks there, as the real lock does.
     gate: Option<std::sync::Arc<Gate>>,
+    // Set by `real_locks`: `locked` takes the real per-user lock under this root, with the real clock.
+    real_locks: Option<PathBuf>,
 }
 
 /// Locks two fakes on two threads contend for, as two processes contend for the real lock: a key held by one blocks
@@ -170,6 +174,17 @@ pub fn locked<T>(key: &str, f: impl FnOnce() -> Res<T>) -> Res<T> {
         fakes.0.borrow_mut().locks.push(format!("!{key}"));
         return crate::error::refuse(2, "lock", "timed out waiting for the agent lock");
     }
+    let real = fakes.0.borrow().real_locks.clone();
+    if let Some(root) = real {
+        let mut ctx = fakes.ctx();
+        ctx.clock = Box::new(crate::ctx::SystemClock);
+        return crate::state::lock::with_lock_at(&ctx, &root, key, || {
+            fakes.lock_event('+', key);
+            let out = f();
+            fakes.lock_event('-', key);
+            out
+        });
+    }
     let gate = fakes.0.borrow().gate.clone();
     if let Some(gate) = &gate {
         gate.take(key);
@@ -211,6 +226,11 @@ impl Fakes {
     /// A process the fake table lists, opens and answers `row` for.
     pub fn process(&self, row: Row) {
         self.0.borrow_mut().rows.push(row);
+    }
+
+    /// Later `table()` reads fail, as an unreadable process table does.
+    pub fn table_fails(&self) {
+        self.0.borrow_mut().table_fails = true;
     }
 
     /// The process `pid` is gone: no row, no open.
@@ -382,6 +402,12 @@ impl Fakes {
         self.0.borrow_mut().gate = Some(gate);
     }
 
+    /// Later locks are the real per-user locks (`state::lock`) under `root`, waited for on the real clock, so two
+    /// threads whose fakes name one root contend as two processes do. Lock events are still recorded and probed.
+    pub fn real_locks(&self, root: &Path) {
+        self.0.borrow_mut().real_locks = Some(root.to_path_buf());
+    }
+
     /// Forgets the recorded OS, multiplexer, hc, sleep and lock calls.
     pub fn clear_log(&self) {
         let mut log = self.0.borrow_mut();
@@ -462,6 +488,9 @@ impl Os for Fakes {
 
     fn table(&self) -> std::io::Result<Vec<Row>> {
         self.os_call("table".into());
+        if self.0.borrow().table_fails {
+            return Err(std::io::Error::other("unreadable process table"));
+        }
         Ok(self.0.borrow().rows.clone())
     }
 

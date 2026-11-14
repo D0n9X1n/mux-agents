@@ -136,6 +136,21 @@ pub fn with_lock<T>(ctx: &Ctx, key: &str, f: impl FnOnce() -> Res<T>) -> Res<T> 
     with_lock_under(ctx, &passwd_home()?, key, f)
 }
 
+/// The real lock for tests that contend on it from real threads: a lock file under `root` (Unix), or a named mutex
+/// whose name also carries `root` (Windows), so no test touches the user's own locks or another test's.
+#[cfg(test)]
+pub(crate) fn with_lock_at<T>(
+    ctx: &Ctx,
+    root: &Path,
+    key: &str,
+    f: impl FnOnce() -> Res<T>,
+) -> Res<T> {
+    #[cfg(unix)]
+    return with_lock_in(ctx, root, key, LOCK_WAIT, f);
+    #[cfg(windows)]
+    return with_lock_timeout(ctx, &format!("{}|{key}", root.display()), LOCK_WAIT, f);
+}
+
 /// `with_lock` for a given passwd home, so tests never touch the real one.
 #[cfg(unix)]
 pub(crate) fn with_lock_under<T>(

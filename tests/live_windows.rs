@@ -390,6 +390,75 @@ fn hc_worker_and_view_close_survives_focus_stop() {
     });
 }
 
+// Stop an agent, then resume it (#103): the reply names X as `from` and the successor Y (same name, a new hc
+// terminal); the client in Y's hc terminal runs `--resume <X's session>` as the last arguments, with no task after
+// them; and Y's record names X in `resumedFrom`. The bar is checked once #122 (a bar per window) is in.
+#[test]
+fn hc_stop_then_resume_returns_with_its_conversation() {
+    let Some(live) = Live::start() else {
+        return;
+    };
+    live.run(&["sidebar", "-Close"]);
+    let w = live.spawn("w1");
+    let sid = s(&w["sessionId"]);
+    let address = s(&w["hcAddress"]);
+    let get = |address: &str| {
+        private_core::run(live.core.command(&["get", address, "--json"]), &live.dir).unwrap()
+    };
+    assert_eq!(
+        live.run(&["stop", "w1"]),
+        serde_json::json!({"ok":true,"verb":"stop","name":"w1","hcAddress":address,"life":"ended"})
+    );
+    live.wait("finished core terminal", || {
+        (get(&address)["state"] == "finished").then_some(())
+    });
+    let resumed = live.run(&["resume", "w1"]);
+    assert_eq!(resumed["from"], w["id"], "{resumed}");
+    let y = &resumed["agent"];
+    assert_eq!(y["name"], "w1", "{resumed}");
+    assert_ne!(y["id"], w["id"], "{resumed}");
+    let y_address = s(&y["hcAddress"]);
+    assert_ne!(y_address, address, "{resumed}");
+    assert_eq!(get(&y_address)["state"], "live");
+    // The client hc started in Y's terminal: the fake client's record whose HC_TERMINAL_ID is Y's address.
+    let client: Value = live.wait("the resumed client", || {
+        std::fs::read_to_string(live.dir.join("clients.log"))
+            .ok()?
+            .lines()
+            .find_map(|p| {
+                let r: Value = serde_json::from_str(
+                    &std::fs::read_to_string(live.dir.join(format!("client.{}.json", p.trim())))
+                        .ok()?,
+                )
+                .ok()?;
+                (r["env"]["HC_TERMINAL_ID"] == y["hcAddress"]).then_some(r)
+            })
+    });
+    let argv: Vec<String> = client["argv"].as_array().unwrap().iter().map(s).collect();
+    assert!(argv.len() >= 2, "{argv:?}");
+    assert_eq!(
+        argv[argv.len() - 2..],
+        ["--resume".to_string(), sid.clone()],
+        "{argv:?}"
+    );
+    assert!(!argv.iter().any(|a| a == "--fork-session"), "{argv:?}");
+    // Y's record, in its server's folder of the state root.
+    let record: Value = std::fs::read_dir(live.dir.join("state"))
+        .unwrap()
+        .find_map(|server| {
+            let path = server
+                .ok()?
+                .path()
+                .join("agents")
+                .join(s(&y["id"]))
+                .join("record.json");
+            serde_json::from_str(&std::fs::read_to_string(path).ok()?).ok()
+        })
+        .expect("Y's record");
+    assert_eq!(record["resumedFrom"], w["id"]);
+    assert_eq!(record["sessionId"], w["sessionId"]);
+}
+
 // A client whose running image an update renamed (claude.exe.old.<ms>.<pid>) is still the caller's client: `list` run
 // by it answers ok instead of refusing `caller`.
 #[test]

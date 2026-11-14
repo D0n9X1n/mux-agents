@@ -23,6 +23,7 @@ pub mod membership;
 pub mod message;
 pub mod placement;
 pub mod registry;
+pub mod resume;
 pub mod spawn;
 #[cfg(test)]
 mod stop_hc_tests;

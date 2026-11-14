@@ -47,12 +47,26 @@ pub fn send(ctx: &Ctx, request: &Request) -> Res<Map<String, Value>> {
     // Closing a view never stops an agent (#104): a member hc shows running is reachable by name with no live view;
     // its mailbox is its id and no pane is probed for it.
     // When hc cannot be read, that is the answer, never a false "no live agent".
-    let viewless = if target != "parent" && !pane_id(target) && snapshot.find(target).is_none() {
+    // A pane found by name is an hc member's only while it is the current member of that name (committed, not
+    // superseded, hc running): the pane fast path stands when the member rule picks that same member; otherwise the
+    // rule's own answer is used, and none refuses. A pane-only (pre-hc) record keeps its pane path.
+    let by_name = target != "parent" && !pane_id(target);
+    let fast = by_name.then(|| snapshot.find(target)).flatten();
+    let viewless = if by_name
+        && fast
+            .as_ref()
+            .is_none_or(|a| a.record.get("hcAddress").is_some())
+    {
         let members = super::membership::Snapshot::take(ctx, &caller)?;
         if let Some(error) = members.core_error {
             return Err(error);
         }
-        members.running_named(target)
+        match (members.running_named(target), &fast) {
+            (Some((id, _)), Some(agent)) if id == agent.id => None,
+            (Some(found), _) => Some(found),
+            (None, Some(_)) => return refuse(2, "target", "no live agent has that name"),
+            (None, None) => None,
+        }
     } else {
         None
     };
@@ -64,7 +78,8 @@ pub fn send(ctx: &Ctx, request: &Request) -> Res<Map<String, Value>> {
                 .filter(|s| crate::checks::session_id(s))
                 .filter(|_| record.get("client").and_then(Value::as_str) == Some("claude"))
                 .map(String::from);
-            (text(record.get("pane")), id, session)
+            let key = super::mail::member_mailbox(&id, &record);
+            (text(record.get("pane")), key, session)
         }
         None => {
             let pane = if target == "parent" {
@@ -215,6 +230,19 @@ pub fn read(ctx: &Ctx, request: &Request) -> Res<Map<String, Value>> {
         Some(_) if wait > 0 => Waiting::start(ctx, &caller, &me.key),
         _ => None,
     };
+    let mailbox = match &me.record {
+        Some(record) => super::mail::member_mailbox(&me.key, record),
+        None => me.key.clone(),
+    };
+    // A member reads behind the fence; a person's pane mailbox has no member to supersede.
+    let identity = me.record.as_ref().and_then(|_| {
+        snapshot
+            .facts
+            .local
+            .iter()
+            .find(|o| o.identity.id == me.key)
+            .map(|o| o.identity.clone())
+    });
     let deadline = ctx.clock.now() + Duration::from_secs(wait as u64);
     let mut first_pass = Some(snapshot);
     let messages = loop {
@@ -223,7 +251,12 @@ pub fn read(ctx: &Ctx, request: &Request) -> Res<Map<String, Value>> {
             None => super::membership::Snapshot::take(ctx, &caller)?,
         };
         registry::reap_hc(ctx, &caller, &snapshot)?;
-        let messages = read_mail(ctx, &caller, &me.key)?;
+        let messages = match &identity {
+            Some(id) => {
+                super::mail::read_mail_if(ctx, &caller, &mailbox, || current(ctx, &caller, id))?
+            }
+            None => read_mail(ctx, &caller, &mailbox)?,
+        };
         if !messages.is_empty() || ctx.clock.now() >= deadline {
             break messages;
         }
@@ -235,6 +268,31 @@ pub fn read(ctx: &Ctx, request: &Request) -> Res<Map<String, Value>> {
         Value::Array(messages.into_iter().map(Value::Object).collect()),
     );
     Ok(reply)
+}
+
+/// The read fence: whether member `id` is still the current owner of its mailbox: its record committed, superseded
+/// by no committed resume, and its hc terminal running now. The reader holds the mailbox lock, so a resume's barrier
+/// orders it; anything that cannot be proven is not current.
+pub(super) fn current(
+    ctx: &Ctx,
+    caller: &crate::caller::Caller,
+    id: &super::core_identity::Identity,
+) -> bool {
+    use super::lifecycle::{Life, classify};
+    let Ok(local) = super::membership::locals(ctx, caller) else {
+        return false;
+    };
+    let committed = local
+        .iter()
+        .any(|l| l.identity == *id && l.stored.committed);
+    if !committed || super::membership::superseded_locals(&local).contains(&id.id) {
+        return false;
+    }
+    let Ok(core) = crate::hc::connect(ctx) else {
+        return false;
+    };
+    let fact = core.get(&id.address).ok().filter(|t| id.matches(t));
+    classify(fact.as_ref(), &id.launcher) == Life::Running
 }
 
 /// The last `lines` lines of a running agent's pane, captured by the server into a private buffer only while the
@@ -888,6 +946,180 @@ mod tests {
         w.fakes.hc_done().unwrap();
     }
 
+    // A resumed member keeps the mailbox it inherited: its record's `mailbox` names it, and send delivers there.
+    #[test]
+    fn send_delivers_to_the_mailbox_a_member_inherited() {
+        let w = World::human("");
+        let caller = w.caller();
+        let r = cf::member(
+            &w,
+            ID,
+            json!({"pane":"%5","window":"@1","mailbox":"bbbbbbbbbbbb"}),
+        );
+        w.pane_rows(&[]);
+        cf::online(&w);
+        cf::listing(&w, &crate::agents::membership::team(&caller), &[]);
+        cf::get(&w, "taaaaaaaaaaaa", cf::wire(&r));
+        let out = run(&w, send, &["send", "worker", "-Body", "hi"]);
+        assert!(out.starts_with("ok "), "{out}");
+        assert_eq!(read_mail_of(&w, "bbbbbbbbbbbb"), ["hi"]);
+        assert!(read_mail_of(&w, ID).is_empty());
+        w.fakes.hc_done().unwrap();
+    }
+
+    // A member whose record names an inherited mailbox reads that mailbox, not one named by its own id.
+    #[test]
+    fn mailbox_read_uses_the_inherited_mailbox() {
+        let w = World::human("");
+        let r = cf::member(&w, ID, json!({"mailbox":"bbbbbbbbbbbb"}));
+        w.panes(&["%1|@1|300|aaaaaaaaaaaa|worker"]);
+        let mut r = r;
+        r["pane"] = json!("%1");
+        r["startCommand"] = json!(launch_command("%1"));
+        write(&w.folder(ID).join("record.json"), r.clone());
+        let c = w.caller();
+        add_mail(&w.ctx, &c, "bbbbbbbbbbbb", "root", "%2", "inherited", None).unwrap();
+        add_mail(&w.ctx, &c, ID, "root", "%2", "own", None).unwrap();
+        poll(&w, &[cf::wire(&r)]);
+        fence(&w, &r);
+        let reply = read(&w.ctx, &w.request(&["read"])).unwrap();
+        let texts: Vec<String> = reply["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| {
+                m["text"]
+                    .as_str()
+                    .unwrap()
+                    .rsplit('\n')
+                    .next()
+                    .unwrap()
+                    .to_string()
+            })
+            .collect();
+        assert_eq!(texts, ["inherited"]);
+        w.fakes.hc_done().unwrap();
+    }
+
+    // The read fence: holding its mailbox lock, a member reads only while it is still current. A member a committed
+    // resume superseded reads nothing, and its mail stays for the successor.
+    #[test]
+    fn a_superseded_member_reads_nothing() {
+        let w = World::human("");
+        let x = cf::member(
+            &w,
+            ID,
+            json!({"pane":"%1","startCommand":launch_command("%1")}),
+        );
+        let y = cf::member(
+            &w,
+            "bbbbbbbbbbbb",
+            json!({"pane":"%6","resumedFrom":ID,"mailbox":ID}),
+        );
+        w.panes(&["%1|@1|300|aaaaaaaaaaaa|worker"]);
+        add_mail(&w.ctx, &w.caller(), ID, "root", "%2", "hi", None).unwrap();
+        poll(&w, &[cf::wire(&x), cf::wire(&y)]);
+        let reply = read(&w.ctx, &w.request(&["read"])).unwrap();
+        assert!(reply["messages"].as_array().unwrap().is_empty());
+        w.fakes.hc_done().unwrap();
+        assert_eq!(read_mail_of(&w, ID), ["hi"]);
+    }
+
+    // A member whose terminal ended after its snapshot and before it took its mailbox lock reads nothing: hc is asked
+    // again under the lock.
+    #[test]
+    fn a_member_that_ended_before_the_lock_reads_nothing() {
+        let w = World::human("");
+        let x = cf::member(
+            &w,
+            ID,
+            json!({"pane":"%1","startCommand":launch_command("%1")}),
+        );
+        w.panes(&["%1|@1|300|aaaaaaaaaaaa|worker"]);
+        add_mail(&w.ctx, &w.caller(), ID, "root", "%2", "hi", None).unwrap();
+        poll(&w, &[cf::wire(&x)]);
+        let mut ended = cf::wire(&x);
+        ended["state"] = json!("finished");
+        ended["reason"] = json!("exited");
+        cf::online(&w);
+        cf::get(&w, "taaaaaaaaaaaa", ended);
+        let reply = read(&w.ctx, &w.request(&["read"])).unwrap();
+        assert!(reply["messages"].as_array().unwrap().is_empty());
+        w.fakes.hc_done().unwrap();
+        assert_eq!(read_mail_of(&w, ID), ["hi"]);
+    }
+
+    // A member a committed resume superseded never makes its successor's name ambiguous, even before its end
+    // notice is posted.
+    #[test]
+    fn send_by_name_reaches_the_successor_not_the_superseded_member() {
+        let w = World::human("");
+        let caller = w.caller();
+        let x = cf::member(&w, ID, json!({"pane":"%5","window":"@1"}));
+        let y = cf::member(
+            &w,
+            "bbbbbbbbbbbb",
+            json!({"pane":"%6","window":"@1","resumedFrom":ID,"mailbox":ID}),
+        );
+        let mut ended = cf::wire(&x);
+        ended["state"] = json!("finished");
+        ended["reason"] = json!("exited");
+        w.pane_rows(&[]);
+        cf::online(&w);
+        cf::listing(&w, &crate::agents::membership::team(&caller), &[]);
+        cf::get(&w, "taaaaaaaaaaaa", ended);
+        cf::get(&w, "tbbbbbbbbbbbb", cf::wire(&y));
+        let out = run(&w, send, &["send", "worker", "-Body", "hi"]);
+        assert!(out.starts_with("ok "), "{out}");
+        assert_eq!(read_mail_of(&w, ID), ["hi"]);
+        w.fakes.hc_done().unwrap();
+    }
+
+    // A superseded member whose pane survives is never what its name means: the pane fast path applies the current
+    // member rule (committed, not superseded, hc running), so send reaches the running successor, and with the
+    // successor ended it refuses and delivers nothing.
+    #[test]
+    fn send_by_name_skips_a_superseded_member_that_still_has_a_pane() {
+        for successor in ["running", "ended"] {
+            let w = World::human("");
+            let caller = w.caller();
+            let x = cf::member(
+                &w,
+                ID,
+                json!({"pane":"%5","window":"@1","startCommand":launch_command("%5")}),
+            );
+            let y = cf::member(
+                &w,
+                "bbbbbbbbbbbb",
+                json!({"pane":"%6","window":"@1","resumedFrom":ID,"mailbox":ID}),
+            );
+            w.panes(&["%5|@1|300|aaaaaaaaaaaa|worker"]);
+            w.recipients_live();
+            let mut ended = cf::wire(&x);
+            ended["state"] = json!("finished");
+            ended["reason"] = json!("exited");
+            let mut ty = cf::wire(&y);
+            if successor == "ended" {
+                ty["state"] = json!("finished");
+                ty["reason"] = json!("exited");
+            }
+            cf::online(&w);
+            cf::listing(&w, &crate::agents::membership::team(&caller), &[]);
+            cf::get(&w, "taaaaaaaaaaaa", ended);
+            cf::get(&w, "tbbbbbbbbbbbb", ty);
+            let got = send(&w.ctx, &w.request(&["send", "worker", "-Body", "hi"]));
+            match successor {
+                "running" => assert_eq!(got.unwrap()["pane"], "%6"),
+                _ => {
+                    let e = got.unwrap_err();
+                    assert_eq!((e.code, e.check), (2, "target"), "{}", e.message);
+                    assert!(read_mail_of(&w, ID).is_empty());
+                }
+            }
+            w.fakes.hc_done().unwrap();
+        }
+    }
+
     // #104 phase 1c review: the fallback delivers only to the one committed, unnoticed member of that name that hc
     // shows running; an ended, uncommitted or noticed one, or a name two members share (even when hc cannot read
     // one of them), refuses and leaves every mailbox empty.
@@ -1131,6 +1363,7 @@ mod tests {
         let agent = lock_key("agent", &w.caller(), ID);
         for _ in 0..3 {
             poll(&w, &[cf::wire(&r)]);
+            fence(&w, &r);
         }
         w.fakes.clear_log();
         assert_eq!(
@@ -1167,6 +1400,7 @@ mod tests {
         });
         for _ in 0..2 {
             poll(&w, &[cf::wire(&r)]);
+            fence(&w, &r);
         }
         let reply = run(&w, read, &["read", "-Wait", "600"]);
         assert!(reply.contains(r#"\ngo""#), "{reply}");
@@ -1204,6 +1438,7 @@ mod tests {
         let agent = lock_key("agent", &w.caller(), ID);
         w.fakes.clear_log();
         poll(&w, &[cf::wire(&r)]);
+        fence(&w, &r);
         run(&w, read, &["read"]);
         assert!(!w.fakes.locks().iter().any(|l| l.contains(&agent)));
 
@@ -1399,6 +1634,11 @@ mod tests {
             run(&w, focus, &["focus", "a"]),
             r#"ok {"name":"a","pane":"%9","window":"@5","sidebar":null}"#
         );
+        // Send by name applies the current-member rule: one hc look confirms a is the member its name means.
+        cf::online(&w);
+        cf::listing(&w, a["team"].as_str().unwrap(), &[]);
+        cf::get(&w, "taaaaaaaaaaaa", cf::wire(&a));
+        cf::get(&w, "tbbbbbbbbbbbb", cf::wire(&b));
         let sent = run(&w, send, &["send", "a", "-Body", "hi"]);
         assert!(sent.starts_with(r#"ok {"to":"a","pane":"%9""#), "{sent}");
         assert_eq!(read_mail_of(&w, ID), ["hi"]);
@@ -1423,6 +1663,13 @@ mod tests {
 
         // #48 test 2: then B, tagless, is still addressable, and its own pane is B.
         w.panes(&["%1|@1|100|aaaaaaaaaaaa|a", "%8|@5|301||", "%2|@1|102||"]);
+        let mut killed = cf::wire(&r);
+        killed["state"] = json!("finished");
+        killed["reason"] = json!("killed");
+        cf::online(&w);
+        cf::listing(&w, a["team"].as_str().unwrap(), &[]);
+        cf::get(&w, "taaaaaaaaaaaa", killed);
+        cf::get(&w, "tbbbbbbbbbbbb", cf::wire(&b));
         let sent = run(&w, send, &["send", "b", "-Body", "to b"]);
         assert!(sent.starts_with(r#"ok {"to":"b","pane":"%8""#), "{sent}");
         assert_eq!(read_mail_of(&w, "bbbbbbbbbbbb"), ["to b"]);
@@ -1567,6 +1814,11 @@ mod tests {
         }
     }
 
+    // The read fence's own look under the mailbox lock: hc shows the reading member running.
+    fn fence(w: &World, r: &Value) {
+        cf::online(w);
+        cf::get(w, r["hcAddress"].as_str().unwrap(), cf::wire(r));
+    }
     fn poll(w: &World, terminals: &[Value]) {
         cf::online(w);
         cf::listing(w, &super::super::membership::team(&w.caller()), &[]);
@@ -1689,6 +1941,7 @@ mod tests {
             let waiting = folder.join("waiting-4242.json");
             if mode == "corrupt-record" {
                 poll(&w, &[cf::wire(&r)]);
+                fence(&w, &r);
                 w.fakes.sleep_probe(move |_| {
                     assert!(waiting.is_file());
                     std::fs::write(folder.join("record.json"), "{").unwrap();

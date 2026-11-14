@@ -246,6 +246,11 @@ fn hc_worker_commands_keep_mail_status_activity_and_spawn_fence() {
             );
             cf::get(&w, r["hcAddress"].as_str().unwrap(), wire(&r));
         }
+        // read's fence looks at the member again under its mailbox lock.
+        if args[0] == "read" {
+            cf::online(&w);
+            cf::get(&w, r["hcAddress"].as_str().unwrap(), wire(&r));
+        }
         let (code, out) = crate::cli::run(
             &args.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
             || Ok(&w.ctx),

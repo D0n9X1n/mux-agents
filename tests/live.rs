@@ -2587,6 +2587,13 @@ hc {}:
             if state != "running" {
                 want_keys.push("exitCode");
                 assert_eq!(row["exitCode"], Value::Null, "{mux:?} {row}");
+                // `list -All` offers the command that starts an ended member again.
+                want_keys.push("resume");
+                assert_eq!(
+                    row["resume"],
+                    json!(format!("mux-agent resume {}", s(&w["id"]))),
+                    "{mux:?} {row}"
+                );
             }
             want_keys.extend(["life", "view", "hcAddress"]);
             assert_eq!(keys(row), want_keys, "{mux:?}");
@@ -4154,6 +4161,90 @@ hc {}:
         assert_eq!(exit_messages(&live, &w).len(), 1);
     }
 
+    /// The fake client a resume started for `sid`: the one whose argv carries `--resume <sid>`. Its `sessionId` is
+    /// null (the fake reads only `--session-id`), so it is found by its argv.
+    fn resumed_client(live: &Live, sid: &str) -> Value {
+        let log = live.dir.join("clients.log");
+        let end = Instant::now() + LONG;
+        loop {
+            let found = std::fs::read_to_string(&log).ok().and_then(|text| {
+                text.lines().find_map(|pid| {
+                    let path = live.dir.join(format!("client.{}.json", pid.trim()));
+                    let record: Value =
+                        serde_json::from_str(&std::fs::read_to_string(path).ok()?).ok()?;
+                    let resumes = record["argv"]
+                        .as_array()?
+                        .windows(2)
+                        .any(|a| a[0] == "--resume" && a[1] == sid);
+                    resumes.then_some(record)
+                })
+            });
+            if let Some(record) = found {
+                return record;
+            }
+            assert!(Instant::now() < end, "no client resumed {sid}");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    // Stop an agent, then resume it: the successor runs `claude <flags> --resume <its session>`, no task and no fork,
+    // as the client of its own new hc terminal; its record links back with the same session; its view is tagged with
+    // its id; and the session's bar stands.
+    fn stop_then_resume_returns_with_its_conversation(mux: Mux) {
+        let Some(mut live) = Live::human(mux) else {
+            return;
+        };
+        let w = live.spawn("w1", &[]);
+        let sid = s(&w["sessionId"]).to_string();
+        let address = s(&w["hcAddress"]).to_string();
+        let (code, stop) = live.run(&["stop", "w1"]);
+        assert_eq!(code, 0, "{mux:?} {stop}");
+        assert!(
+            eventually(LONG, || core(&live, &["get", &address, "--json"])["state"]
+                == "finished"),
+            "{mux:?}"
+        );
+        let (code, resumed) = live.run(&["resume", "w1"]);
+        assert_eq!(code, 0, "{mux:?} {resumed}");
+        assert_eq!(resumed["from"], w["id"], "{mux:?}");
+        let y = resumed["agent"].clone();
+        assert_eq!(y["name"], "w1", "{mux:?}");
+        assert_ne!(y["hcAddress"], w["hcAddress"], "{mux:?}");
+        let client = resumed_client(&live, &sid);
+        let argv = strings(&client["argv"]);
+        let at = argv.iter().position(|a| *a == "--resume").unwrap();
+        assert_eq!(argv[at + 1], sid, "{mux:?}");
+        assert_eq!(
+            at + 2,
+            argv.len(),
+            "{mux:?}: no task after the conversation: {argv:?}"
+        );
+        assert!(!argv.contains(&"--fork-session"), "{mux:?} {argv:?}");
+        assert_eq!(client["exe"], "claude", "{mux:?}");
+        let folder = live.agent_dir(s(&y["id"]));
+        let record = json_file(&folder.join("record.json"));
+        assert_eq!(record["resumedFrom"], w["id"], "{mux:?}");
+        assert_eq!(record["sessionId"], sid.as_str(), "{mux:?}");
+        // The client runs in Y's hc terminal: its parent is the launcher, the terminal's own process.
+        let launcher = json_file(&folder.join("launcher.json"));
+        assert_eq!(client["ppid"], launcher["pid"], "{mux:?}");
+        assert_eq!(
+            core(&live, &["get", s(&y["hcAddress"]), "--json"])["pid"],
+            launcher["pid"],
+            "{mux:?}"
+        );
+        let pane = s(&record["pane"]);
+        assert_eq!(live.field(pane, "#{@agent-id}"), s(&y["id"]), "{mux:?}");
+        // The bar is beside Y: a live bar in the window of Y's view (#122, a bar per window).
+        let bar = s(&resumed["sidebar"]).to_string();
+        assert!(live.bars().contains(&bar), "{mux:?} {resumed}");
+        assert_eq!(
+            live.field(&bar, "#{window_id}"),
+            s(&record["window"]),
+            "{mux:?} {resumed}"
+        );
+    }
+
     macro_rules! every_mux_scenario {
         ($module:ident, $mux:ident) => {
             tests_on!(
@@ -4161,6 +4252,7 @@ hc {}:
                 $mux,
                 [
                     hc_view_close_survives_focus_stop,
+                    stop_then_resume_returns_with_its_conversation,
                     root_unsandboxed_terminal_driver_finished,
                     spawn_window_and_split_tagged,
                     spawn_titles_tab_and_pane,

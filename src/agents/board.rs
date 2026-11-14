@@ -41,11 +41,14 @@ pub fn board(ctx: &Ctx, caller: &Caller, all: bool, watch: bool) -> Res<Map<Stri
     use super::{lifecycle::Life, membership::Snapshot};
     let snapshot = Snapshot::take(ctx, caller)?;
     registry::reap_hc(ctx, caller, &snapshot)?;
+    // A member a committed resume superseded is its successor now: it has no row of its own.
+    let superseded = snapshot.superseded();
     let members: Vec<_> = snapshot
         .facts
         .local
         .iter()
         .filter(|o| snapshot.records[&o.identity.id].committed)
+        .filter(|o| !superseded.contains(&o.identity.id))
         .collect();
     let panes: Vec<_> = snapshot
         .view_order
@@ -63,6 +66,11 @@ pub fn board(ctx: &Ctx, caller: &Caller, all: bool, watch: bool) -> Res<Map<Stri
         .map(|p| p.id.clone())
         .collect();
     let reader = reader_key(caller.member.as_deref(), &mine, &caller.pane)?;
+    // A member reads the mailbox its record names (inherited by a resume), else its id.
+    let reader = match snapshot.records.get(&reader) {
+        Some(stored) => super::mail::member_mailbox(&reader, &stored.record),
+        None => reader,
+    };
     let mut keys: Vec<_> = if watch {
         members
             .iter()
@@ -155,6 +163,10 @@ pub fn board(ctx: &Ctx, caller: &Caller, all: bool, watch: bool) -> Res<Map<Stri
                 }
                 row.insert("exitCode".into(), Value::Null);
             }
+            // `list -All` offers the command that starts an ended member again; the bar's feed does not.
+            if all && !watch && o.life == Life::Ended {
+                row.insert("resume".into(), format!("mux-agent resume {id}").into());
+            }
             Ok(hc_row(row, o, snapshot.views.get(id)))
         };
     let count = running.len();
@@ -194,11 +206,10 @@ pub(crate) const ENDED_MAX: usize = 10;
 /// delivers); none for a malformed pane. Never a tag.
 fn parent_key(record: &Value, running: &[Pane]) -> Option<String> {
     let parent = super::text(record.get("parentPane"));
-    let id = running
-        .iter()
-        .find(|p| p.pane == parent)
-        .map_or("", |p| p.id.as_str());
-    mailbox_key(&parent, id).ok()
+    match running.iter().find(|p| p.pane == parent) {
+        Some(p) => Some(super::mail::member_mailbox(&p.id, &p.record)),
+        None => mailbox_key(&parent, "").ok(),
+    }
 }
 
 struct Rows<'a> {
@@ -1266,6 +1277,95 @@ mod tests {
         w.fakes.hc_done().unwrap();
         assert!(list["agents"][0].get("waiting").is_none());
         assert_eq!(files(), ["waiting-700.json"]);
+    }
+
+    // A resumed parent keeps its inherited mailbox, so its child's unread is counted there, not under its own id.
+    #[test]
+    fn watch_unread_counts_in_the_mailbox_a_parent_inherited() {
+        let w = World::human("");
+        w.clock(NOW);
+        let caller = w.caller();
+        member(&w, ID, json!({"mailbox": "cccccccccccc"}));
+        member(
+            &w,
+            "bbbbbbbbbbbb",
+            json!({"name": "child", "pane": "%8", "parentPane": "%9"}),
+        );
+        w.panes(&[
+            "%9|@5|300|aaaaaaaaaaaa|worker",
+            "%8|@5|301|bbbbbbbbbbbb|child",
+        ]);
+        add_mail(&w.ctx, &caller, "cccccccccccc", "child", "%8", "y", None).unwrap();
+        for _ in 0..2 {
+            add_mail(&w.ctx, &caller, ID, "child", "%8", "stale", None).unwrap();
+        }
+        snapshot(&w, &caller, &[(ID, "running"), ("bbbbbbbbbbbb", "running")]);
+        let reply = board(&w.ctx, &caller, true, true).unwrap();
+        w.fakes.hc_done().unwrap();
+        let unread: Vec<String> = reply["agents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| format!("{}={}", r["name"].as_str().unwrap(), r["unread"]))
+            .collect();
+        assert_eq!(unread, ["worker=0", "child=1"]);
+    }
+
+    // A member a committed resume superseded has no row; `list -All` offers `resume <id>` on every other ended row
+    // (stopped or exited), never on a running one and never in the bar's feed.
+    #[test]
+    fn list_all_offers_resume_for_ended_members_no_resume_superseded() {
+        let w = World::human("");
+        w.clock(NOW);
+        let caller = w.caller();
+        member(&w, ID, json!({}));
+        member(
+            &w,
+            "bbbbbbbbbbbb",
+            json!({"pane": "%8", "resumedFrom": ID, "mailbox": ID}),
+        );
+        member(&w, "cccccccccccc", json!({"name": "other", "pane": "%7"}));
+        w.panes(&[]);
+        let rows = |facts: &[(&str, &str)], watch: bool| {
+            snapshot(&w, &caller, facts);
+            let reply = board(&w.ctx, &caller, true, watch).unwrap();
+            w.fakes.hc_done().unwrap();
+            reply["agents"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|r| {
+                    let resume = r.get("resume").map_or("-", |v| v.as_str().unwrap());
+                    format!("{}={resume}", r["name"].as_str().unwrap())
+                })
+                .collect::<Vec<_>>()
+        };
+        let y_running = [
+            (ID, "stopped"),
+            ("bbbbbbbbbbbb", "running"),
+            ("cccccccccccc", "3"),
+        ];
+        assert_eq!(
+            rows(&y_running, false),
+            ["worker=-", "other=mux-agent resume cccccccccccc"]
+        );
+        let all_ended = [
+            (ID, "stopped"),
+            ("bbbbbbbbbbbb", "stopped"),
+            ("cccccccccccc", "3"),
+        ];
+        let mut ended = rows(&all_ended, false);
+        ended.sort();
+        assert_eq!(
+            ended,
+            [
+                "other=mux-agent resume cccccccccccc",
+                "worker=mux-agent resume bbbbbbbbbbbb"
+            ]
+        );
+        let mut feed = rows(&all_ended, true);
+        feed.sort();
+        assert_eq!(feed, ["other=-", "worker=-"]);
     }
 
     #[test]

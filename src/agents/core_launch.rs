@@ -95,7 +95,7 @@ pub fn execute_connected(
     p.record["launcherArgv"] = json!(p.argv);
     let mut pane = None;
     let operation = || -> Res<Value> {
-        write_json(&p.folder.join("record.json"), &p.record)?;
+        crate::state::fs::write_json_durable(&p.folder.join("record.json"), &p.record)?;
         attach(core, &p, &mut pane)?;
         let v = pane
             .as_ref()
@@ -104,7 +104,7 @@ pub fn execute_connected(
         p.record["pane"] = v.pane.clone().into();
         p.record["window"] = v.window.clone().into();
         p.record["startCommand"] = v.command.clone().into();
-        write_json(&p.folder.join("record.json"), &p.record)?;
+        crate::state::fs::write_json_durable(&p.folder.join("record.json"), &p.record)?;
         commit(&p.folder)?;
         Ok(p.record.clone())
     };
@@ -420,6 +420,42 @@ mod tests {
                 }
             }
             assert!(!crate::agents::committed(&folder), "{stage}");
+        }
+    }
+
+    // Each record.json write is flushed to disk; a failed flush at either one rolls the launch back: no commit, so
+    // the launcher never starts the client, and the run is killed.
+    #[test]
+    fn a_failed_record_flush_never_commits() {
+        for nth in [0, 1] {
+            let w = World::human("");
+            ready(&w);
+            answer(&w.fakes, r#"{"address":"t1"}"#);
+            answer(&w.fakes, "{}");
+            crate::state::fs::fail_durable_flush(Some(nth));
+            let committed = Cell::new(false);
+            let got = execute(
+                &w.ctx,
+                || Ok(prepared(&w)),
+                |_, _, pane| {
+                    *pane = Some(created());
+                    Ok(())
+                },
+                |_| {
+                    committed.set(true);
+                    Ok(())
+                },
+                |_| Ok(true),
+            );
+            crate::state::fs::fail_durable_flush(None);
+            assert!(got.is_err(), "{nth}");
+            assert!(!committed.get(), "{nth}");
+            assert_eq!(
+                w.fakes.hc_calls().last().unwrap().1,
+                ["kill", "t1", "--json"],
+                "{nth}"
+            );
+            w.fakes.hc_done().unwrap();
         }
     }
 

@@ -150,6 +150,7 @@ pub fn spawn(ctx: &Ctx, request: &Request) -> Res<Map<String, Value>> {
             model,
             no_fork: request.switch("NoFork"),
             split: (placement != DEFAULT_PLACEMENT).then_some(placement),
+            resume: None,
         },
         |core| {
             let snapshot = super::membership::Snapshot::for_spawn(ctx, &caller, core)?;
@@ -194,17 +195,22 @@ pub fn spawn(ctx: &Ctx, request: &Request) -> Res<Map<String, Value>> {
     reply.insert("model".into(), model.unwrap_or("inherited").into());
     reply.insert("placement".into(), placement.into());
     reply.insert("placementSource".into(), source.into());
-    // The agent is committed and the spawn lock released: the bar of the new view's window is best effort and never
-    // fails the spawn.
-    let window = record["window"]
-        .as_str()
-        .unwrap_or(&caller.window)
-        .to_string();
-    sidebar::keep(ctx, &caller, &window, &mut reply);
+    keep_bar(ctx, &caller, &record, &mut reply);
     reply.insert("life".into(), "running".into());
     reply.insert("view".into(), "attached".into());
     reply.insert("hcAddress".into(), record["hcAddress"].clone());
     Ok(reply)
+}
+
+/// The post-commit bar step spawn and resume share: the agent is committed and the spawn lock released, so the bar
+/// of the new view's window (the committed `record`'s window, else the caller's) is best effort and never fails the
+/// verb. Adds `sidebar` (the bar's pane, or null) and, when the step failed, `sidebarError`.
+pub fn keep_bar(ctx: &Ctx, caller: &Caller, record: &Value, reply: &mut Map<String, Value>) {
+    let window = record["window"]
+        .as_str()
+        .unwrap_or(&caller.window)
+        .to_string();
+    sidebar::keep(ctx, caller, &window, reply);
 }
 
 /// The reply's `key: value` lines, then `sidebar <pane>`, `sidebar off` or `sidebar error: <message>`.
@@ -851,6 +857,7 @@ mod tests {
                 model,
                 no_fork: false,
                 split: None,
+                resume: None,
             },
             |_| {
                 Ok(CoreSlot {
@@ -3593,10 +3600,19 @@ pub struct CoreRequest<'a> {
     pub model: Option<&'a str>,
     pub no_fork: bool,
     pub split: Option<&'a str>,
+    /// Some for a resume: the new member continues an ended one's conversation instead of starting a task.
+    pub resume: Option<&'a Resumed>,
 }
 pub struct CoreSlot {
     pub name: String,
     pub color: &'static str,
+}
+/// What a resume carries from the ended member X into its successor: X's id, its record (name, client, session,
+/// directory, parent, depth, mailbox) and the client flags its launch spec recorded.
+pub struct Resumed {
+    pub from: String,
+    pub record: Value,
+    pub flags: Vec<String>,
 }
 pub fn launch_hc(
     ctx: &Ctx,
@@ -3606,27 +3622,41 @@ pub fn launch_hc(
 ) -> Res<Value> {
     let core = crate::hc::connect(ctx)?;
     lock(ctx, &lock_key("spawn", caller, &caller.session), || {
-        let slot = reserve(&core)?;
-        let launch = Launch {
-            ctx,
-            caller,
-            client: request.client,
-            model: request.model,
-            no_fork: request.no_fork,
-            task: request.task.into(),
-            brief: request.brief.map(str::to_owned),
-            directory: request.directory.into(),
-        };
-        super::core_launch::execute_connected(
-            &core,
-            || launch.prepare_hc(slot),
-            |core, p, view| {
-                super::attachment::attach(ctx, core, caller, &p.record, request.split, view)
-            },
-            |folder| commit(ctx, folder),
-            |view| super::attachment::clean(ctx, view),
-        )
+        launch_hc_locked(ctx, caller, &core, request, reserve)
     })
+}
+/// `launch_hc` for a caller that already holds the session's spawn lock: resume holds it across its own checks and
+/// this launch, so the lock is taken once.
+pub fn launch_hc_locked(
+    ctx: &Ctx,
+    caller: &Caller,
+    core: &crate::hc::Core<'_>,
+    request: CoreRequest<'_>,
+    reserve: impl FnOnce(&crate::hc::Core<'_>) -> Res<CoreSlot>,
+) -> Res<Value> {
+    let slot = reserve(core)?;
+    let launch = Launch {
+        ctx,
+        caller,
+        client: request.client,
+        model: request.model,
+        no_fork: request.no_fork,
+        task: request.task.into(),
+        brief: request.brief.map(str::to_owned),
+        directory: request.directory.into(),
+    };
+    super::core_launch::execute_connected(
+        core,
+        || match request.resume {
+            Some(resumed) => launch.prepare_resumed(slot, resumed),
+            None => launch.prepare_hc(slot),
+        },
+        |core, p, view| {
+            super::attachment::attach(ctx, core, caller, &p.record, request.split, view)
+        },
+        |folder| commit(ctx, folder),
+        |view| super::attachment::clean(ctx, view),
+    )
 }
 impl Launch<'_> {
     fn prepare_hc(&self, slot: CoreSlot) -> Res<super::core_launch::Prepared> {
@@ -3655,16 +3685,84 @@ impl Launch<'_> {
                 argv: crate::launcher_scope::argv(ctx, &spec)?,
             })
         };
-        prepare().map_err(|mut e: Refusal| {
-            if write_json(
-                &agent.folder.join("abort.json"),
-                &json!({"runUncertain":false,"hcAddress":null,"message":e.message}),
-            )
-            .is_err()
-            {
-                e.message.push_str("; abort evidence could not be written");
-            }
-            e
-        })
+        prepare().map_err(|e| abort_evidence(&agent.folder, e))
     }
+
+    /// A resume: `<client> <X's recorded flags> --resume <X's session>`, no task, prompt, model or fork, in a new
+    /// folder. Its record keeps X's name, client, session, directory, parent and depth, names X in `resumedFrom`
+    /// and keeps X's mailbox. That record and the folder holding it are flushed to disk before `hc run`, so a
+    /// power loss never loses `resumedFrom`; a failed flush launches nothing.
+    fn prepare_resumed(
+        &self,
+        slot: CoreSlot,
+        resumed: &Resumed,
+    ) -> Res<super::core_launch::Prepared> {
+        let (ctx, caller) = (self.ctx, self.caller);
+        let state = state_dir(ctx, caller)?;
+        write_json(
+            &state.join("server.json"),
+            &json!({"socket":caller.socket,"serverPid":caller.server_pid,"serverStart":caller.server_start}),
+        )?;
+        let id = hex_id()?;
+        let folder = state.join("agents").join(&id);
+        let prepare = || {
+            let from = &resumed.record;
+            let session = text(from.get("sessionId"));
+            private_folder(ctx, &folder)?;
+            let args = client_args(self.client, Recipe::Resume, &session, None);
+            let spec = folder.join("spec.json");
+            write_json(
+                &spec,
+                &json!({"schema": 1, "stateDirectory": utf8(&state)?, "id": id,
+                    "client": client_name(self.client), "flags": resumed.flags,
+                    "parentPane": from.get("parentPane"), "args": args, "generation": "0"}),
+            )?;
+            let mut record = from.clone();
+            let fields = record
+                .as_object_mut()
+                .ok_or_else(|| Refusal::internal("the ended member's record is not an object"))?;
+            for k in [
+                "hcAddress",
+                "launcherArgv",
+                "pane",
+                "window",
+                "startCommand",
+                "model",
+                "generation",
+                "team",
+            ] {
+                fields.remove(k);
+            }
+            record["id"] = id.clone().into();
+            record["name"] = slot.name.into();
+            record["color"] = slot.color.into();
+            record["createdAt"] = utc_o(ctx.clock.now()).into();
+            record["resumedFrom"] = resumed.from.clone().into();
+            record["mailbox"] = super::mail::member_mailbox(&resumed.from, from).into();
+            // Before hc run and without the hc fields, so no reader takes it for a member until the run names one.
+            crate::state::fs::write_json_durable(&folder.join("record.json"), &record)?;
+            crate::state::fs::sync_dir(&state.join("agents"))?;
+            record["generation"] = "0".into();
+            record["team"] = super::membership::team(caller).into();
+            Ok(super::core_launch::Prepared {
+                folder: folder.clone(),
+                record,
+                argv: crate::launcher_scope::argv(ctx, &spec)?,
+            })
+        };
+        prepare().map_err(|e| abort_evidence(&folder, e))
+    }
+}
+
+/// Leaves abort.json for a launch that failed before `hc run`: nothing ran, and the message says why.
+fn abort_evidence(folder: &Path, mut e: Refusal) -> Refusal {
+    if write_json(
+        &folder.join("abort.json"),
+        &json!({"runUncertain":false,"hcAddress":null,"message":e.message}),
+    )
+    .is_err()
+    {
+        e.message.push_str("; abort evidence could not be written");
+    }
+    e
 }

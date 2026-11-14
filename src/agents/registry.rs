@@ -537,10 +537,10 @@ pub fn self_of(caller: &Caller, snapshot: &Snapshot) -> Res<Me> {
     }
 }
 
-/// The mailbox of `pane`: the running agent's id there, else `pane-<n>`.
+/// The mailbox of `pane`: the running agent's there (its id, or the one it inherited), else `pane-<n>`.
 pub fn mailbox_of(snapshot: &Snapshot, pane: &str) -> Res<String> {
     match snapshot.at(pane) {
-        Some(agent) => Ok(agent.id),
+        Some(agent) => Ok(mail::member_mailbox(&agent.id, &agent.record)),
         None => mail::mailbox_key(pane, ""),
     }
 }

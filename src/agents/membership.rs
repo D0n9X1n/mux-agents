@@ -49,12 +49,6 @@ pub fn locals(ctx: &Ctx, caller: &Caller) -> Res<Vec<Local>> {
         if !record.is_object() {
             return Err(Refusal::internal("invalid local hc record"));
         }
-        if !["hcAddress", "generation", "team", "launcherArgv"]
-            .iter()
-            .any(|k| record.get(k).is_some())
-        {
-            continue;
-        }
         if record
             .get("session")
             .and_then(Value::as_str)
@@ -62,8 +56,25 @@ pub fn locals(ctx: &Ctx, caller: &Caller) -> Res<Vec<Local>> {
         {
             continue;
         }
-        let identity = Identity::read(&record, &id, &team(caller))
-            .ok_or_else(|| Refusal::internal("invalid local hc identity"))?;
+        let hc = ["hcAddress", "generation", "team", "launcherArgv"]
+            .iter()
+            .any(|k| record.get(k).is_some());
+        let identity = if hc {
+            Identity::read(&record, &id, &team(caller))
+                .ok_or_else(|| Refusal::internal("invalid local hc identity"))?
+        } else {
+            // A resume's successor whose hc run reply was lost after its launcher claimed the run: a member whose
+            // life comes from hc. Without a claim (or with an abandoned one) it never ran and is no member.
+            let claimed = match crate::state::fs::read_json(&folder.join("gens").join("0.claim")) {
+                Ok(Some(claim)) => claim.as_str() != Some("abandoned"),
+                Ok(None) => false,
+                Err(_) => true,
+            };
+            match Identity::pending(&record, &id, &team(caller)) {
+                Some(identity) if claimed => identity,
+                _ => continue,
+            }
+        };
         local.push(Local {
             identity,
             stored: Stored {
@@ -75,6 +86,42 @@ pub fn locals(ctx: &Ctx, caller: &Caller) -> Res<Vec<Local>> {
     }
     local.sort_by(|a, b| a.identity.id.cmp(&b.identity.id));
     Ok(local)
+}
+
+/// The ids a committed member names in `resumedFrom`: each is superseded by its resume, so its name means the
+/// successor and it is never the one a name, list, board, send or focus picks. Supersession follows the
+/// `resumedFrom` chain (amendment 2 to resume v11, recorded on #103): a superseded member's own `resumedFrom` is
+/// superseded too, so X -> Y -> Z supersedes X even when Y (a successor whose claim was not abandoned but which has
+/// no commit, because it may have run) never committed.
+pub fn superseded(records: &[(&str, &Value, bool)]) -> std::collections::BTreeSet<String> {
+    let mut superseded = std::collections::BTreeSet::new();
+    loop {
+        let before = superseded.len();
+        for (id, record, committed) in records {
+            if !*committed && !superseded.contains(*id) {
+                continue;
+            }
+            if let Some(from) = record
+                .get("resumedFrom")
+                .and_then(Value::as_str)
+                .filter(|from| super::agent_id(from))
+            {
+                superseded.insert(from.to_owned());
+            }
+        }
+        if superseded.len() == before {
+            return superseded;
+        }
+    }
+}
+
+/// `superseded` over every local member.
+pub fn superseded_locals(local: &[Local]) -> std::collections::BTreeSet<String> {
+    let rows: Vec<_> = local
+        .iter()
+        .map(|l| (l.identity.id.as_str(), &l.stored.record, l.stored.committed))
+        .collect();
+    superseded(&rows)
 }
 
 #[derive(Debug)]
@@ -93,11 +140,13 @@ impl Snapshot {
     /// it, exactly one, and hc shows it running. Its id and record; none otherwise. Uniqueness is decided before
     /// life, so a member hc could not read never makes a same-name one look unique (#104 phase 1c).
     pub fn running_named(&self, name: &str) -> Option<(String, Value)> {
+        let superseded = self.superseded();
         let candidates: Vec<_> = self
             .facts
             .local
             .iter()
             .filter(|o| o.identity.name == name)
+            .filter(|o| !superseded.contains(&o.identity.id))
             .filter(|o| {
                 self.records
                     .get(&o.identity.id)
@@ -111,6 +160,16 @@ impl Snapshot {
                 .map(|s| (o.identity.id.clone(), s.record.clone())),
             _ => None,
         }
+    }
+
+    /// The members a committed resume superseded.
+    pub fn superseded(&self) -> std::collections::BTreeSet<String> {
+        let rows: Vec<_> = self
+            .records
+            .iter()
+            .map(|(id, s)| (id.as_str(), &s.record, s.committed))
+            .collect();
+        superseded(&rows)
     }
 
     /// Member `id` as hc sees it now: running, its record committed and, unless `noticed_ok`, with no end notice.

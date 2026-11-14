@@ -32,15 +32,16 @@ impl Snapshot {
     }
 }
 pub fn take(core: &Core<'_>, team: &str, members: &[Identity]) -> Res<Snapshot> {
-    let unique: BTreeSet<_> = members.iter().map(|i| i.address.as_str()).collect();
-    if unique.len() != members.len() || members.iter().any(|i| i.team != team) {
+    let known: Vec<_> = members.iter().filter(|i| !i.address.is_empty()).collect();
+    let unique: BTreeSet<_> = known.iter().map(|i| i.address.as_str()).collect();
+    if unique.len() != known.len() || members.iter().any(|i| i.team != team) {
         return Err(Refusal::internal("ambiguous local core identity"));
     }
     let listed = core.ls(&[("mux.managed", "1"), ("mux.team", team)])?;
     let addresses: BTreeSet<String> = listed
         .iter()
         .cloned()
-        .chain(members.iter().map(|i| i.address.clone()))
+        .chain(known.iter().map(|i| i.address.clone()))
         .collect();
     let facts: BTreeMap<String, Option<Terminal>> = addresses
         .into_iter()
@@ -49,12 +50,38 @@ pub fn take(core: &Core<'_>, team: &str, members: &[Identity]) -> Res<Snapshot> 
             (a, t)
         })
         .collect();
-    let local = members
+    // A pending member (a resume's successor whose run reply was lost) has no address: the one listed terminal its
+    // run labelled with its id and generation names it; none or several leave it unresolved, so Unknown.
+    let resolved: Vec<Identity> = members
         .iter()
         .map(|id| {
-            let terminal = facts
-                .get(&id.address)
-                .cloned()
+            if !id.address.is_empty() {
+                return id.clone();
+            }
+            let labelled: Vec<_> = listed
+                .iter()
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .filter(|a| {
+                    facts.get(*a).cloned().flatten().is_some_and(|t| {
+                        let mut probe = id.clone();
+                        probe.address = t.address.clone();
+                        t.address == **a && probe.matches(&t)
+                    })
+                })
+                .collect();
+            let mut id = id.clone();
+            if let [one] = labelled.as_slice() {
+                id.address = (*one).clone();
+            }
+            id
+        })
+        .collect();
+    let local = resolved
+        .iter()
+        .map(|id| {
+            let terminal = (!id.address.is_empty())
+                .then(|| facts.get(&id.address).cloned().flatten())
                 .flatten()
                 .filter(|t| id.matches(t));
             let life = classify(terminal.as_ref(), &id.launcher);
@@ -67,7 +94,7 @@ pub fn take(core: &Core<'_>, team: &str, members: &[Identity]) -> Res<Snapshot> 
         .collect();
     let mut reserved = Vec::new();
     for address in listed.into_iter().collect::<BTreeSet<_>>() {
-        if members.iter().any(|i| i.address == address) {
+        if resolved.iter().any(|i| i.address == address) {
             continue;
         }
         let t = facts

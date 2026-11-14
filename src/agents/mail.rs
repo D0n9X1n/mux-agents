@@ -23,6 +23,15 @@ pub fn mailbox_key(pane: &str, tag: &str) -> Res<String> {
     Ok(format!("pane-{}", &pane[1..]))
 }
 
+/// A member's mailbox: the one its record's `mailbox` names (a resumed member keeps the mailbox it inherited),
+/// otherwise its id.
+pub fn member_mailbox(id: &str, record: &Value) -> String {
+    match record.get("mailbox").and_then(Value::as_str) {
+        Some(key) if super::agent_id(key) => key.to_string(),
+        _ => id.to_string(),
+    }
+}
+
 /// LF line ends; ESC and the other C0 controls except LF and TAB, and DEL, removed.
 pub fn message_text(text: &str) -> String {
     text.replace("\r\n", "\n")
@@ -266,10 +275,24 @@ pub fn parse_mail(text: &str) -> Vec<Value> {
 /// Every unread message of `key`'s mailbox in arrival order, as `{id, from, pane, at, text}`; the offset moves
 /// past them under the mailbox lock.
 pub fn read_mail(ctx: &Ctx, caller: &Caller, key: &str) -> Res<Vec<Map<String, Value>>> {
+    read_mail_if(ctx, caller, key, || true)
+}
+
+/// `read_mail` behind a fence: holding the mailbox lock, `current` decides whether the reader may still read this
+/// mailbox; when it says no, nothing is read and the offset stays (one owner reads a mailbox).
+pub fn read_mail_if(
+    ctx: &Ctx,
+    caller: &Caller,
+    key: &str,
+    current: impl FnOnce() -> bool,
+) -> Res<Vec<Map<String, Value>>> {
     let mail = super::state_dir(ctx, caller)?.join("mail");
     let mailbox = mail.join(format!("{key}.jsonl"));
     let cursor = mail.join(format!("{key}.offset"));
     let found = super::lock(ctx, &super::lock_key("mail", caller, key), || {
+        if !current() {
+            return Ok(Vec::new());
+        }
         let unread = unread_text(&mailbox, &cursor, false)?;
         if unread.text.is_empty() {
             return Ok(Vec::new());

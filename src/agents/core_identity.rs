@@ -50,6 +50,31 @@ impl Identity {
             launcher,
         })
     }
+    /// A resume's successor that claimed its run (gen 0) and kept only its pre-run record: hc run's reply, and so
+    /// its address and launcher, were lost. Its address is empty until hc's labels name its terminal; with no
+    /// launcher it is never Running, so its life is Ended, Lost or Unknown, never "no member".
+    pub fn pending(r: &Value, id: &str, team: &str) -> Option<Self> {
+        let s = |k: &str| r.get(k)?.as_str();
+        if !super::agent_id(id)
+            || s("id")? != id
+            || s("session")? != team.rsplit_once(':')?.1
+            || !super::agent_name(s("name")?)
+            || !crate::checks::session_id(s("sessionId")?)
+            || !super::agent_id(s("resumedFrom")?)
+            || r.get("hcAddress").is_some()
+        {
+            return None;
+        }
+        Some(Self {
+            id: id.into(),
+            name: s("name")?.into(),
+            address: String::new(),
+            generation: "0".into(),
+            team: team.into(),
+            session_id: s("sessionId")?.into(),
+            launcher: Vec::new(),
+        })
+    }
     pub fn matches(&self, t: &Terminal) -> bool {
         t.address == self.address
             && [

@@ -321,3 +321,21 @@ fn adapters_resolve_duplicates_without_running_a_core_terminal() {
         w.fakes.hc_done().unwrap();
     }
 }
+// A member a committed resume names in `resumedFrom` is superseded: its name means its successor alone, so no hc
+// answer about the old terminal (gone, unreadable or ended) is needed or can make the name ambiguous.
+#[test]
+fn a_name_skips_the_member_a_resume_superseded() {
+    let w = World::human("");
+    let c = w.caller();
+    pair(&w);
+    cf::member(
+        &w,
+        NEW,
+        json!({"createdAt":"2026-11-13T10:01:00Z","pane":"%19","resumedFrom":ID}),
+    );
+    assert_eq!(named(&w.ctx, &c, "worker").unwrap().id, NEW);
+    assert!(w.fakes.hc_calls().is_empty());
+    // An uncommitted successor supersedes nothing.
+    std::fs::remove_file(w.folder(NEW).join("commit.json")).unwrap();
+    assert_eq!(named(&w.ctx, &c, "worker").unwrap().id, ID);
+}

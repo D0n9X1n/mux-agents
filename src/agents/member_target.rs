@@ -25,9 +25,12 @@ pub(crate) fn named_with_core(
     if !super::agent_name(name) {
         return Err(changed());
     }
-    let found: Vec<_> = membership::locals(ctx, caller)?
+    let local = membership::locals(ctx, caller)?;
+    let superseded = membership::superseded_locals(&local);
+    let found: Vec<_> = local
         .into_iter()
         .filter(|l| l.identity.name == name && l.stored.committed)
+        .filter(|l| !superseded.contains(&l.identity.id))
         .collect();
     match found.as_slice() {
         [] => return Err(changed()),

@@ -37,6 +37,85 @@ pub fn write_json_with(
     Ok(written?)
 }
 
+/// As `write_json`, and on disk when it returns: the temp file's contents are flushed before the rename makes it
+/// `path`, then `path`'s folder is flushed so the new name survives a crash or power loss too. A failed flush is an
+/// error, which stops whatever needed the file on disk. For a member's record in the launch transaction, which must
+/// never lose `resumedFrom`; everything else uses `write_json`.
+pub fn write_json_durable(path: &Path, value: &Value) -> Res<()> {
+    #[cfg(test)]
+    let fail = DURABLE_FAULT.with(|fault| match fault.get() {
+        Some(0) => {
+            fault.set(None);
+            true
+        }
+        Some(n) => {
+            fault.set(Some(n - 1));
+            false
+        }
+        None => false,
+    });
+    #[cfg(not(test))]
+    let fail = false;
+    write_json_durable_with(path, value, &mut |at, is_dir| {
+        if fail && is_dir {
+            return Err(io::Error::other("injected flush failure"));
+        }
+        if is_dir {
+            sync_dir(at)
+        } else {
+            OpenOptions::new().write(true).open(at)?.sync_data()
+        }
+    })
+}
+
+/// `write_json_durable` with the flush given: `sync(file, false)` flushes the temp file's contents, `sync(dir,
+/// true)` the folder that holds `path`.
+pub fn write_json_durable_with(
+    path: &Path,
+    value: &Value,
+    sync: &mut dyn FnMut(&Path, bool) -> io::Result<()>,
+) -> Res<()> {
+    let mut name = path.as_os_str().to_owned();
+    name.push(format!(".{}.tmp", crate::util::guid()?.replace('-', "")));
+    let tmp = PathBuf::from(name);
+    let written = write_new(&tmp, value.to_string().as_bytes())
+        .and_then(|()| sync(&tmp, false))
+        .and_then(|()| std::fs::rename(&tmp, path));
+    if written.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    written?;
+    let dir = match path.parent() {
+        Some(dir) if !dir.as_os_str().is_empty() => dir,
+        _ => Path::new("."),
+    };
+    Ok(sync(dir, true)?)
+}
+
+#[cfg(test)]
+thread_local! {
+    // When set to n, the (n+1)th `write_json_durable` on this thread fails its folder flush.
+    static DURABLE_FAULT: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+}
+
+/// Makes the (n+1)th `write_json_durable` on this thread fail its folder flush (none: no failure).
+#[cfg(test)]
+pub fn fail_durable_flush(n: Option<usize>) {
+    DURABLE_FAULT.with(|fault| fault.set(n));
+}
+
+#[cfg(test)]
+thread_local! {
+    // A folder whose `sync_dir` fails on this thread.
+    static SYNC_FAULT: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Makes `sync_dir(dir)` fail on this thread for exactly `dir` (none: no failure); other folders still flush.
+#[cfg(test)]
+pub fn fail_sync_dir(dir: Option<&Path>) {
+    SYNC_FAULT.with(|fault| *fault.borrow_mut() = dir.map(Path::to_path_buf));
+}
+
 /// Makes `path` hold `value` only if nothing is there yet: true when this call made it, false when it already
 /// existed. The JSON is written whole beside `path`, then hard-linked to it, so `path` appears with its content or
 /// not at all, and of two racers exactly one makes it (#97: spawn's commit against the launcher's give-up).
@@ -60,6 +139,10 @@ pub fn claim_json(path: &Path, value: &Value) -> Res<bool> {
 /// with the right to add a subfolder (FILE_APPEND_DATA) and backup semantics: the least access FlushFileBuffers
 /// takes, and the right a folder made in it needed; a read-only open cannot flush there.
 pub fn sync_dir(dir: &Path) -> io::Result<()> {
+    #[cfg(test)]
+    if SYNC_FAULT.with(|fault| fault.borrow().as_deref() == Some(dir)) {
+        return Err(io::Error::other("injected folder flush failure"));
+    }
     #[cfg(windows)]
     {
         use std::os::windows::fs::OpenOptionsExt;
@@ -219,6 +302,48 @@ mod tests {
     use super::*;
     use crate::testing::TempDir;
     use serde_json::json;
+
+    // A durable write flushes the temp file's contents before the rename makes it `path`, then flushes the folder
+    // so the new name survives too. A failed flush is an error: a failed file flush leaves `path` as it was.
+    #[test]
+    fn write_json_durable_flushes_the_temp_file_before_the_rename() {
+        let dir = TempDir::new();
+        let path = dir.path().join("record.json");
+        std::fs::write(&path, "old").unwrap();
+        let mut events = Vec::new();
+        write_json_durable_with(&path, &json!({"a": 1}), &mut |at, is_dir| {
+            let name = at.file_name().unwrap().to_string_lossy().into_owned();
+            let content = std::fs::read_to_string(&path).unwrap();
+            events.push(format!("{is_dir} {} {content}", name.ends_with(".tmp")));
+            if !is_dir {
+                assert_eq!(std::fs::read_to_string(at).unwrap(), r#"{"a":1}"#);
+            } else {
+                assert_eq!(at, dir.path());
+            }
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(events, ["false true old", r#"true false {"a":1}"#]);
+        assert_eq!(names(dir.path()), ["record.json"]);
+        for failing in [false, true] {
+            std::fs::write(&path, "old").unwrap();
+            let e = write_json_durable_with(&path, &json!({"b": 2}), &mut |_, is_dir| {
+                if is_dir == failing {
+                    Err(io::Error::other("flush failed"))
+                } else {
+                    Ok(())
+                }
+            });
+            assert!(e.is_err(), "dir={failing}");
+            let want = if failing { r#"{"b":2}"# } else { "old" };
+            assert_eq!(
+                std::fs::read_to_string(&path).unwrap(),
+                want,
+                "dir={failing}"
+            );
+            assert_eq!(names(dir.path()), ["record.json"], "dir={failing}");
+        }
+    }
 
     fn names(dir: &Path) -> Vec<String> {
         let mut names: Vec<_> = std::fs::read_dir(dir)
