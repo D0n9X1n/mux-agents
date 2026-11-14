@@ -1884,7 +1884,33 @@ exec claude --dangerously-skip-permissions
                     live.dir.path(),
                     || live.num(pane, format),
                 )
-                .unwrap_or_else(|e| panic!("{mux:?} placement {placement}: {e}"))
+                .unwrap_or_else(|e| {
+                    // #97: the agent's own hc terminal, as the core sees it, so a missing view names its cause.
+                    let address = s(&spawned["hcAddress"]);
+                    let mut core = String::new();
+                    for args in [
+                        vec!["get", address, "--json"],
+                        vec!["read", address, "--lines", "40"],
+                    ] {
+                        let out = live.server.core.as_ref().map(|c| c.command(&args).output());
+                        core.push_str(&format!(
+                            "
+hc {}:
+{}",
+                            args.join(" "),
+                            match out {
+                                Some(Ok(o)) => format!(
+                                    "{}{}",
+                                    String::from_utf8_lossy(&o.stdout),
+                                    String::from_utf8_lossy(&o.stderr)
+                                ),
+                                Some(Err(e)) => format!("unavailable: {e}"),
+                                None => "no private core".into(),
+                            }
+                        ));
+                    }
+                    panic!("{mux:?} placement {placement}: {e}{core}")
+                })
             };
             assert!(
                 edge(agent, "#{pane_right}") < edge(&bar, "#{pane_left}"),
