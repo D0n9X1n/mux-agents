@@ -36,8 +36,10 @@ const COMMIT_POLL: Duration = Duration::from_millis(250);
 const OUTSIDE: &str = "mux-agent: the launch spec is outside the state folder";
 const LINK: &str = "mux-agent: the launch spec path has a junction or link";
 
-/// Starts the client attached to this pane: its path, its arguments, the variables to take out; its exit code.
-pub(crate) type Start<'a> = &'a mut dyn FnMut(&Path, &[String], &[&str]) -> io::Result<i32>;
+/// Starts the client attached to this pane: its path, its arguments, the variables to take out, and `started`, told the
+/// client's pid from the child handle before the wait (#103 D1); its exit code.
+pub(crate) type Start<'a> =
+    &'a mut dyn FnMut(&Path, &[String], &[&str], &mut dyn FnMut(u32)) -> io::Result<i32>;
 
 /// The pane's process: exit 2 for a spec it will not read, else the client's exit code (1 when it never ran).
 pub fn launcher(ctx: &Ctx, spec: &str) -> i32 {
@@ -45,7 +47,7 @@ pub fn launcher(ctx: &Ctx, spec: &str) -> i32 {
         use std::io::Write;
         let _ = writeln!(io::stderr(), "{line}");
     };
-    run(ctx, spec, &mut err, &mut |path, args, remove| {
+    run(ctx, spec, &mut err, &mut |path, args, remove, started| {
         let overrides = launch_overrides(ctx)?;
         crate::spawn::attached_env(
             path,
@@ -55,6 +57,7 @@ pub fn launcher(ctx: &Ctx, spec: &str) -> i32 {
                 .iter()
                 .map(|(k, v)| (*k, v.as_str()))
                 .collect::<Vec<_>>(),
+            started,
         )
     })
 }
@@ -330,7 +333,19 @@ fn launch(
                         ));
                     } else {
                         // Attached, so the client owns the pane's console; a start that fails is exit 1.
-                        code = start(&executable, &args, &SCRUB).unwrap_or(1);
+                        let mut client = Value::Null;
+                        code = start(&executable, &args, &SCRUB, &mut |pid| {
+                            client =
+                                json!({"pid": pid, "start": ctx.os.open(pid).map(|o| o.start)});
+                            let mut now = record.clone();
+                            now.insert("client".into(), client.clone());
+                            // A record that cannot be written proves no member: D1 fails closed.
+                            let _ = write_json(&exit_path, &Value::Object(now));
+                        })
+                        .unwrap_or(1);
+                        if !client.is_null() {
+                            record.insert("client".into(), client);
+                        }
                     }
                 }
             }
@@ -460,7 +475,7 @@ mod tests {
             &l.w.ctx,
             spec,
             &mut |line: &str| err.push(line.to_string()),
-            &mut |path: &Path, args: &[String], remove: &[&str]| {
+            &mut |path: &Path, args: &[String], remove: &[&str], _| {
                 started.push((
                     path.to_path_buf(),
                     args.to_vec(),
@@ -664,7 +679,7 @@ mod tests {
                 &l.w.ctx,
                 &spec_str(l),
                 &mut |line: &str| err.push(line.to_string()),
-                &mut |_: &Path, _: &[String], _: &[&str]| {
+                &mut |_: &Path, _: &[String], _: &[&str], _| {
                     started += 1;
                     Ok(0)
                 },
@@ -714,7 +729,7 @@ mod tests {
             &l.w.ctx,
             &spec_str(&l),
             &mut |line: &str| err.push(line.to_string()),
-            &mut |_: &Path, _: &[String], _: &[&str]| {
+            &mut |_: &Path, _: &[String], _: &[&str], _| {
                 started += 1;
                 Ok(0)
             },
@@ -762,7 +777,7 @@ mod tests {
     fn generation_adversarial_active() {
         let l = setup("claude", json!([]));
         let mut seen = false;
-        let code = run(&l.w.ctx, &spec_str(&l), &mut |_| {}, &mut |_, _, _| {
+        let code = run(&l.w.ctx, &spec_str(&l), &mut |_| {}, &mut |_, _, _, _| {
             seen = true;
             let before = std::fs::read(l.folder.join("launcher.json")).unwrap();
             let duplicate = launch(&l, &spec_str(&l), exits_7);
@@ -1243,7 +1258,7 @@ mod tests {
                     std::fs::remove_file(l.bin.join(exe_name("claude"))).unwrap();
                 }
                 let mut starts = 0;
-                let code = run(&l.w.ctx, &spec_str(&l), &mut |_| {}, &mut |_, _, _| {
+                let code = run(&l.w.ctx, &spec_str(&l), &mut |_| {}, &mut |_, _, _, _| {
                     starts += 1;
                     if case == "start-error" {
                         Err(io::Error::other("no exec"))
@@ -1270,9 +1285,12 @@ mod tests {
                 );
                 let before = std::fs::read(l.folder.join("launcher.json")).unwrap();
                 assert_eq!(
-                    run(&l.w.ctx, &spec_str(&l), &mut |_| {}, &mut |_, _, _| panic!(
-                        "duplicate"
-                    )),
+                    run(
+                        &l.w.ctx,
+                        &spec_str(&l),
+                        &mut |_| {},
+                        &mut |_, _, _, _| panic!("duplicate")
+                    ),
                     0
                 );
                 assert_eq!(
@@ -1282,5 +1300,34 @@ mod tests {
                 l.w.fakes.hc_done().unwrap();
             }
         }
+    }
+
+    #[test]
+    fn the_launcher_records_its_client_before_it_waits() {
+        let l = setup("claude", json!([]));
+        l.w.fakes
+            .process(crate::testing::row(4300, l.w.ctx.pid, 1600));
+        let mut seen = Value::Null;
+        let code = run(
+            &l.w.ctx,
+            &spec_str(&l),
+            &mut |_| {},
+            &mut |_, _, _, started| {
+                started(4300);
+                seen = launcher_json(&l)["client"].clone();
+                Ok(7)
+            },
+        );
+        assert_eq!(code, 7);
+        assert_eq!(
+            seen,
+            json!({"pid": 4300, "start": 1600}),
+            "on disk while the client runs"
+        );
+        assert_eq!(
+            launcher_json(&l)["client"],
+            json!({"pid": 4300, "start": 1600}),
+            "kept after the exit"
+        );
     }
 }
