@@ -42,12 +42,10 @@ impl Policy {
 }
 
 // The flags each client takes a value for, as `--x v` or `--x=v`; any other dash token takes none.
-const CLAUDE_VALUED: [&str; 13] = [
+const CLAUDE_VALUED: [&str; 11] = [
     "--model",
     "--add-dir",
     "--session-id",
-    "-r",
-    "--resume",
     "-n",
     "--name",
     "--permission-mode",
@@ -64,12 +62,10 @@ const CLAUDE_BARE: [&str; 5] = [
     "--dangerously-skip-permissions",
     "--verbose",
 ];
-const COPILOT_VALUED: [&str; 16] = [
+const COPILOT_VALUED: [&str; 11] = [
     "--model",
     "--add-dir",
     "--session-id",
-    "-r",
-    "--resume",
     "-n",
     "--name",
     "--reasoning-effort",
@@ -78,6 +74,13 @@ const COPILOT_VALUED: [&str; 16] = [
     "-p",
     "--prompt",
     "--mode",
+];
+// The flags whose value is optional (`--resume [value]`, `--deny-tool [<tools>...]`): they take the next token only
+// when it is not itself a flag or `--`, as the clients' own parsers do, so they never swallow a narrowing flag.
+const CLAUDE_OPTIONAL: [&str; 2] = ["-r", "--resume"];
+const COPILOT_OPTIONAL: [&str; 5] = [
+    "-r",
+    "--resume",
     "--deny-tool",
     "--deny-url",
     "--excluded-tools",
@@ -98,7 +101,12 @@ const COPILOT_BARE: [&str; 10] = [
 /// The client's flags as (name, value) pairs, honouring argument boundaries: a valued flag consumes its value (so a
 /// value that looks like a flag is never read as one), and nothing after `--` is a flag. None when a dash token is
 /// not one the client is known to take: an unknown flag could change permissions in ways this does not model.
-fn parsed(flags: &[String], valued: &[&str], bare: &[&str]) -> Option<Vec<(String, String)>> {
+fn parsed(
+    flags: &[String],
+    valued: &[&str],
+    optional: &[&str],
+    bare: &[&str],
+) -> Option<Vec<(String, String)>> {
     let mut out = Vec::new();
     let mut i = 0;
     while i < flags.len() {
@@ -124,6 +132,18 @@ fn parsed(flags: &[String], valued: &[&str], bare: &[&str]) -> Option<Vec<(Strin
                 }
             };
             out.push((name.to_string(), value));
+        } else if optional.contains(&name) {
+            let value = match inline {
+                Some(v) => v.to_string(),
+                None => match flags.get(i + 1) {
+                    Some(next) if !next.starts_with('-') => {
+                        i += 1;
+                        next.clone()
+                    }
+                    _ => String::new(),
+                },
+            };
+            out.push((name.to_string(), value));
         } else if bare.contains(&name) && inline.is_none() {
             out.push((name.to_string(), String::new()));
         } else {
@@ -137,11 +157,11 @@ fn parsed(flags: &[String], valued: &[&str], bare: &[&str]) -> Option<Vec<(Strin
 /// The policy `flags` give `client`, strictest-wins and fail-closed: anything that narrows the client, and any flag
 /// this does not know, makes it `Default`, even beside a flag that would widen it.
 pub fn policy(client: Client, flags: &[String]) -> Policy {
-    let (valued, bare): (&[&str], &[&str]) = match client {
-        Client::Claude => (&CLAUDE_VALUED, &CLAUDE_BARE),
-        Client::Copilot => (&COPILOT_VALUED, &COPILOT_BARE),
+    let (valued, optional, bare): (&[&str], &[&str], &[&str]) = match client {
+        Client::Claude => (&CLAUDE_VALUED, &CLAUDE_OPTIONAL, &CLAUDE_BARE),
+        Client::Copilot => (&COPILOT_VALUED, &COPILOT_OPTIONAL, &COPILOT_BARE),
     };
-    let Some(pairs) = parsed(flags, valued, bare) else {
+    let Some(pairs) = parsed(flags, valued, optional, bare) else {
         return Policy::Default;
     };
     let named = |n: &str| pairs.iter().any(|(k, _)| k == n);
@@ -348,6 +368,34 @@ mod tests {
             ]),
             Policy::Bypass
         );
+        // Review of 883ff6b: an optional value never swallows a narrowing flag or `--`.
+        for r in ["--resume", "-r"] {
+            assert_eq!(
+                p(&[r, "--", "--dangerously-skip-permissions"]),
+                Policy::Default,
+                "{r}"
+            );
+            assert_eq!(
+                p(&[
+                    "--dangerously-skip-permissions",
+                    r,
+                    "--permission-mode",
+                    "plan"
+                ]),
+                Policy::Default,
+                "{r}"
+            );
+            assert_eq!(
+                p(&["--dangerously-skip-permissions", r]),
+                Policy::Bypass,
+                "{r}"
+            );
+            assert_eq!(
+                p(&["--dangerously-skip-permissions", r, "abc"]),
+                Policy::Bypass,
+                "{r}"
+            );
+        }
     }
 
     #[test]
@@ -382,6 +430,20 @@ mod tests {
         assert_eq!(p(&["--name", "--allow-all"]), Policy::Default);
         assert_eq!(p(&["--", "--yolo"]), Policy::Default);
         assert_eq!(p(&["--yolo", "--unknown"]), Policy::Default);
+        // Review of 883ff6b: an optional value never swallows a narrowing flag or `--`.
+        for r in ["--resume", "-r"] {
+            assert_eq!(p(&["--yolo", r, "--plan"]), Policy::Default, "{r}");
+            assert_eq!(
+                p(&["--yolo", r, "--assisted-approval"]),
+                Policy::Default,
+                "{r}"
+            );
+            assert_eq!(p(&[r, "--", "--yolo"]), Policy::Default, "{r}");
+            assert_eq!(p(&["--yolo", r]), Policy::AllowAll, "{r}");
+            assert_eq!(p(&["--yolo", r, "abc"]), Policy::AllowAll, "{r}");
+        }
+        assert_eq!(p(&["--yolo", "--deny-tool"]), Policy::Default);
+        assert_eq!(p(&["--deny-tool", "--yolo"]), Policy::Default);
     }
 
     #[test]
