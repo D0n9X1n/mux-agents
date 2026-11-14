@@ -226,6 +226,18 @@ RunIn ("function f { `$local:LASTEXITCODE = 0; `$env:SHIM_EXIT = '7'; & $(Lit (J
     "'code=' + `$global:LASTEXITCODE }; f")
 Expect 'exit_code_reaches_a_scoped_caller' @('code=7')
 
+# A caller with a non-zero local $LASTEXITCODE still runs the binary (on macOS and Linux the executable check runs
+# `test -x`, whose exit code must not be read from the caller's scope).
+Reset; Fake $tier3 'tier3'
+RunIn ("function f { `$local:LASTEXITCODE = 7; `$r = & $(Lit (Join-Path (Join-Path $root 'scripts') 'mux-agent.ps1')) u; " +
+    "'captured=' + (`$r -join '|') }; f")
+Expect 'a_scoped_caller_never_decides_usability' @('captured=tier3|[u]')
+
+# The shim reads no unqualified $LASTEXITCODE: every read is $global:LASTEXITCODE.
+$unscoped = @(Select-String -LiteralPath (Join-Path $repo 'scripts/mux-agent.ps1') -Pattern '(?<![:\w])\$LASTEXITCODE' |
+    Where-Object { $_.Line -notmatch '^\s*#' })
+Check 'no_unscoped_exit_code_read' ($unscoped.Count -eq 0)
+
 # Called with `&` and no arguments: the binary gets no arguments, not one empty one.
 Reset; Fake $tier3 'tier3'
 RunIn ("`$r = & $(Lit (Join-Path (Join-Path $root 'scripts') 'mux-agent.ps1')); 'captured=' + (`$r -join '|')")

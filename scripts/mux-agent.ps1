@@ -32,10 +32,11 @@ function Test-Usable([string] $path) {
         } catch { return $false }
     }
     & test -x $path
-    if ($LASTEXITCODE -eq 0) { return $true }
+    # Always the global exit code: a caller's own $LASTEXITCODE must never decide this.
+    if ($global:LASTEXITCODE -eq 0) { return $true }
     & chmod +x $path 2>$null
     & test -x $path
-    return $LASTEXITCODE -eq 0
+    return $global:LASTEXITCODE -eq 0
 }
 
 # The caller's error preferences never turn the binary's own exit code into a failure of the shim.
