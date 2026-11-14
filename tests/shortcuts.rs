@@ -24,6 +24,10 @@ fn run(shell: &str, args: &[&str]) -> Option<Output> {
         "TMUX_PANE",
         "HC_TERMINAL_ID",
         "MUX_AGENTS_HOME",
+        // bash runs $BASH_ENV even with --norc --noprofile: its output would break the JSON, and it could set the
+        // variables removed here again.
+        "BASH_ENV",
+        "ENV",
     ] {
         command.env_remove(name);
     }
