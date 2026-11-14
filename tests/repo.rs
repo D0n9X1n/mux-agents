@@ -1786,6 +1786,7 @@ fn export_ignore_rules() {
     for path in [
         "scripts/mux-agent",
         "scripts/mux-agent.cmd",
+        POWERSHELL_ENTRY,
         "hooks",
         "skills",
         ".claude-plugin",
@@ -1908,6 +1909,9 @@ fn readme_notes_dist_pin() {
     );
 }
 
+/// The optional PowerShell entry shim (#103), the one PowerShell file that ships.
+const POWERSHELL_ENTRY: &str = "scripts/mux-agent.ps1";
+
 #[test]
 fn no_powershell_needed() {
     let files = tracked();
@@ -1919,7 +1923,13 @@ fn no_powershell_needed() {
                 .any(|e| p.ends_with(e))
         })
         .collect();
-    assert!(scripts.is_empty(), "{scripts:?}");
+    // #103: the user asked for a PowerShell entry beside sh and cmd. The binary and hooks still need none; these two
+    // files are an optional entry point and its tests, and nothing else may be PowerShell.
+    assert_eq!(
+        scripts,
+        [&POWERSHELL_ENTRY.to_string(), &"tests/shim.ps1".to_string()],
+        "{scripts:?}"
+    );
     let mut bad = Vec::new();
     for path in files.iter().filter(|p| {
         ["scripts/", ".github/", ".claude-plugin/"]
@@ -1927,6 +1937,9 @@ fn no_powershell_needed() {
             .any(|d| p.starts_with(d))
             || ["Cargo.toml", "CONTRIBUTING.md"].contains(&p.as_str())
     }) {
+        if path.as_str() == POWERSHELL_ENTRY {
+            continue;
+        }
         let full = Path::new(env!("CARGO_MANIFEST_DIR")).join(path);
         let Ok(text) = std::fs::read_to_string(full) else {
             continue; // not text

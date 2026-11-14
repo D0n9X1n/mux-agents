@@ -1,0 +1,149 @@
+# Tests for scripts/mux-agent.ps1, the PowerShell entry shim. Run: pwsh -NoProfile -File tests/shim.ps1 (or
+# powershell -NoProfile -File on Windows). tests/shim_ps.rs runs it under every PowerShell present. Each case copies the
+# shim into a plugin root with a space in its name and plants fake binaries that print a label and each argument as
+# [arg]. The last line counts the failures.
+
+$ErrorActionPreference = 'Stop'
+$repo = Split-Path -Parent $PSScriptRoot
+$onWindows = $env:OS -eq 'Windows_NT'
+$ps = (Get-Process -Id $PID).Path
+$tmp = Join-Path ([System.IO.Path]::GetTempPath()) ("mux shim ps " + [guid]::NewGuid().ToString('N').Substring(0, 8))
+New-Item -ItemType Directory -Path $tmp | Out-Null
+$script:fail = 0
+
+if ($onWindows) {
+    $arch = if ($env:PROCESSOR_ARCHITEW6432) { $env:PROCESSOR_ARCHITEW6432 } else { $env:PROCESSOR_ARCHITECTURE }
+    $os = 'windows'; $exe = 'mux-agent.exe'
+} else {
+    $os = switch -Exact ((uname -s)) { 'Darwin' { 'macos' } 'Linux' { 'linux' } default { $_ } }
+    $arch = (uname -m); $exe = 'mux-agent'
+}
+$arch = switch -Exact ($arch.ToUpperInvariant()) {
+    'AMD64' { 'x86_64' } 'X86_64' { 'x86_64' } 'ARM64' { 'aarch64' } 'AARCH64' { 'aarch64' } default { $arch }
+}
+
+# The fake binary: on Windows a stub .exe (built once with the .NET Framework csc.exe, as tests/shim.cmd does) that
+# prints the first line of label.txt beside it; elsewhere a sh script with the label inside.
+$stub = Join-Path $tmp 'stub.exe'
+if ($onWindows) {
+    $cs = Join-Path $tmp 'stub.cs'
+    Set-Content -LiteralPath $cs -Encoding ASCII -Value @'
+using System;using System.IO;
+class S{static int Main(string[] a){
+Console.WriteLine(File.ReadAllLines(AppDomain.CurrentDomain.BaseDirectory+"label.txt")[0].Trim());
+foreach(string x in a)Console.WriteLine("["+x+"]");
+string e=Environment.GetEnvironmentVariable("SHIM_EXIT");
+return string.IsNullOrEmpty(e)?0:int.Parse(e);}}
+'@
+    & "$env:WINDIR\Microsoft.NET\Framework64\v4.0.30319\csc.exe" /nologo "/out:$stub" $cs | Out-Null
+    if (-not (Test-Path -LiteralPath $stub)) { 'FAIL no stub binary'; '1 failed'; exit 1 }
+}
+
+function Fake([string] $path, [string] $label) {
+    New-Item -ItemType Directory -Force -Path (Split-Path -Parent $path) | Out-Null
+    if ($onWindows) {
+        Copy-Item -LiteralPath $stub -Destination $path
+        Set-Content -LiteralPath (Join-Path (Split-Path -Parent $path) 'label.txt') -Value $label -Encoding ASCII
+    } else {
+        $body = "#!/bin/sh`necho $label`nfor a in `"`$@`"; do printf '[%s]\n' `"`$a`"; done`nexit `${SHIM_EXIT:-0}`n"
+        [System.IO.File]::WriteAllText($path, $body)
+        & chmod +x $path
+    }
+}
+
+# A fresh plugin root per case, with the shim copied in and no MUX_AGENTS_BIN.
+$script:n = 0
+function Reset {
+    $script:n++
+    $script:case = Join-Path $tmp "c$($script:n)"
+    $script:root = Join-Path $script:case 'plug in'
+    New-Item -ItemType Directory -Force -Path (Join-Path $script:root 'scripts') | Out-Null
+    Copy-Item -LiteralPath (Join-Path $repo 'scripts/mux-agent.ps1') -Destination (Join-Path $script:root 'scripts')
+    $script:tier1 = Join-Path (Join-Path $script:case 'env bin') $exe
+    $script:tier2 = Join-Path (Join-Path (Join-Path $script:root 'scripts/bin') "$os-$arch") $exe
+    $script:tier3 = Join-Path (Join-Path $script:root 'target/release') $exe
+    Remove-Item Env:MUX_AGENTS_BIN -ErrorAction SilentlyContinue
+    Remove-Item Env:SHIM_EXIT -ErrorAction SilentlyContinue
+}
+
+function Quote([string] $a) {
+    if ($a.Length -gt 0 -and $a -notmatch '[\s"]') { return $a }
+    $out = New-Object System.Text.StringBuilder
+    [void] $out.Append('"'); $slashes = 0
+    foreach ($c in $a.ToCharArray()) {
+        if ($c -eq '\') { $slashes++; continue }
+        if ($c -eq '"') { [void] $out.Append('\', 2 * $slashes + 1) } elseif ($slashes) { [void] $out.Append('\', $slashes) }
+        $slashes = 0; [void] $out.Append($c)
+    }
+    [void] $out.Append('\', 2 * $slashes).Append('"')
+    $out.ToString()
+}
+
+# Runs the shim in a new PowerShell from `$cwd` and sets $script:out (LF-joined lines) and $script:rc.
+function Run([string[]] $argv, [string] $cwd = $tmp) {
+    $info = New-Object System.Diagnostics.ProcessStartInfo
+    $info.FileName = $ps
+    $info.UseShellExecute = $false
+    $info.RedirectStandardOutput = $true
+    $info.WorkingDirectory = $cwd
+    $shim = Join-Path (Join-Path $script:root 'scripts') 'mux-agent.ps1'
+    $info.Arguments = (@('-NoProfile', '-NonInteractive', '-File', $shim) + $argv | ForEach-Object { Quote $_ }) -join ' '
+    $p = [System.Diagnostics.Process]::Start($info)
+    $text = $p.StandardOutput.ReadToEnd()
+    $p.WaitForExit()
+    $script:rc = $p.ExitCode
+    $script:out = ($text -replace "`r", '').TrimEnd("`n")
+}
+
+function Check([string] $name, [bool] $ok) {
+    if ($ok) { "ok   $name" } else { "FAIL ${name}: rc=$($script:rc) out=$($script:out)"; $script:fail++ }
+}
+function Expect([string] $name, [string[]] $lines, [int] $code = 0) {
+    Check $name (($script:rc -eq $code) -and ($script:out -eq ($lines -join "`n")))
+}
+
+Reset; Fake $tier1 'tier1'; $env:MUX_AGENTS_BIN = $tier1; Run @('list')
+Expect 'tier1_env_wins' @('tier1', '[list]')
+
+Reset; Fake $tier2 'tier2'; Run @('list', '-All')
+Expect 'tier2_bin_os_arch' @('tier2', '[list]', '[-All]')
+
+Reset; Fake $tier3 'tier3'; Run @('list')
+Expect 'tier3_target_release' @('tier3', '[list]')
+
+Reset; Fake $tier1 'tier1'; Fake $tier2 'tier2'; Fake $tier3 'tier3'
+$env:MUX_AGENTS_BIN = $tier1; Run @(); $a = $out
+Remove-Item Env:MUX_AGENTS_BIN; Run @(); $b = $out
+Remove-Item -LiteralPath $tier2; Run @(); $c = $out
+Check 'precedence_1_2_3' ("$a,$b,$c" -eq 'tier1,tier2,tier3')
+
+# A directory is never a binary: the shim moves on.
+Reset; New-Item -ItemType Directory -Force -Path $tier1 | Out-Null; $env:MUX_AGENTS_BIN = $tier1; Fake $tier3 'tier3'; Run @('d')
+Expect 'directory_skipped' @('tier3', '[d]')
+
+Reset; Fake $tier3 'tier3'
+Run @('send', 'a b', '', "it's", '"q"', '$HOME', '*', 'x  y', 'trail\', 'a\"b', '--', '-Lines')
+Expect 'spaces_in_root_and_args' @('tier3', '[send]', '[a b]', '[]', "[it's]", '["q"]', '[$HOME]', '[*]', '[x  y]', '[trail\]', '[a\"b]', '[--]', '[-Lines]')
+
+Reset; Fake $tier3 'tier3'; $env:SHIM_EXIT = '7'; Run @('stop', 'z')
+Expect 'exit_code_forwarded' @('tier3', '[stop]', '[z]') 7
+
+# A MUX_AGENTS_BIN with no separator names a file in the current folder, never a namesake on PATH.
+Reset; $cwd = Join-Path $case 'cwd'; Fake (Join-Path $cwd $exe) 'in-cwd'; $env:MUX_AGENTS_BIN = $exe; Run @('go') $cwd
+Expect 'bare_bin_runs_cwd_file' @('in-cwd', '[go]')
+
+Reset; $env:MUX_AGENTS_BIN = Join-Path $tmp 'missing'; Run @('list')
+Expect 'none_usable_prints_entry_json_exit_1' @('{"ok":false,"verb":null,"code":1,"check":"entry","message":"no usable mux-agent binary for ' + "$os-$arch" + '"}') 1
+
+if (-not $onWindows) {
+    Reset; Fake $tier2 'tier2'; & chmod -x $tier2; Fake $tier3 'tier3'; Run @('x')
+    & test -x $tier2; $made = $LASTEXITCODE -eq 0
+    Check 'nonexec_gets_chmod' (($rc -eq 0) -and ($out -eq "tier2`n[x]") -and $made)
+}
+
+Remove-Item Env:MUX_AGENTS_BIN -ErrorAction SilentlyContinue
+Remove-Item Env:SHIM_EXIT -ErrorAction SilentlyContinue
+Remove-Item -LiteralPath $tmp -Recurse -Force
+"$($script:fail) failed"
+if ($script:fail -gt 0) { exit 1 }
+exit 0
