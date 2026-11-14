@@ -77,9 +77,11 @@ pub fn sync_dir(dir: &Path) -> io::Result<()> {
     }
 }
 
-/// Flushes a folder that may not be this user's. A folder the user cannot add an entry to is skipped: no folder on
-/// the user's paths can have been made in it by this user. Any other failure is an error, so an entry this user
-/// may have made is never left unflushed (#103).
+/// Flushes a folder above the state root, which may not be this user's. A folder this user cannot open to add a
+/// subfolder is skipped, on the assumption that the user could not have made a folder in it either. That holds for
+/// standard permissions (`C:\Users`, `/home`, a 0100 folder) but not for an ACL that denies only SYNCHRONIZE: there
+/// a folder can be made but the open is refused, and the entry is left unflushed (#103 follow-up). Any other failure
+/// is an error.
 pub fn sync_ancestor(dir: &Path) -> io::Result<()> {
     match sync_dir(dir) {
         Ok(()) => Ok(()),
@@ -88,9 +90,9 @@ pub fn sync_ancestor(dir: &Path) -> io::Result<()> {
     }
 }
 
-/// Whether this user may add an entry to `dir`. Windows: the open for FILE_APPEND_DATA that sync_dir made was
-/// refused, and that is the right adding a folder takes, so no. Unix: write and search permission, as the kernel
-/// checks them for this user.
+/// Whether this user may add an entry to `dir`, after sync_dir's open was refused. Windows: taken as no, since that
+/// open asked only for FILE_APPEND_DATA, the right adding a folder takes (see sync_ancestor for the exception). Unix:
+/// write and search permission, as the kernel checks them for this user.
 fn may_add_entry(dir: &Path) -> bool {
     #[cfg(windows)]
     {
