@@ -823,6 +823,7 @@ mod tests {
             server_key: "0123456789abcdef".into(),
             agent_tag: String::new(),
             member: None,
+            candidate: None,
         }
     }
 

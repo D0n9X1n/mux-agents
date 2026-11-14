@@ -200,13 +200,7 @@ fn prove(m: &Mw, id: &str, fg: Option<i32>) -> Option<Member> {
     cf::online(&m.w);
     cf::get(&m.w, address, term(&r, fg));
     let t = crate::hc::connect(&m.w.ctx).unwrap().get(address).unwrap();
-    prove_member(
-        &m.w.ctx,
-        &m.state,
-        &crate::agents::membership::team(&m.c),
-        id,
-        &t,
-    )
+    prove_member(&m.w.ctx, &crate::agents::membership::team(&m.c), id, &r, &t)
 }
 #[test]
 fn a_member_is_proven_by_its_recorded_launcher_and_client() {
@@ -355,4 +349,45 @@ fn the_copilot_pair_is_unix_loader_to_native() {
         );
         m.w.fakes.hc_done().unwrap();
     }
+}
+#[test]
+fn standing_proves_under_the_lock_and_keeps_a_pane_agent_caller() {
+    let mut m = member_world();
+    m.hc();
+    let mut t = term(&m.r, Some(150));
+    t.as_object_mut().unwrap().remove("pid");
+    m.rounds(2, &t);
+    let c = crate::caller::resolve_tree(&m.w.ctx).unwrap();
+    assert_eq!(
+        c.candidate.as_deref(),
+        Some(ID),
+        "the walk cannot run without a terminal pid"
+    );
+    assert!(
+        matches!(standing(&m.w.ctx, &c, None), Ok(Standing::Member(x)) if x.id == ID),
+        "proven under the lock"
+    );
+    m.w.fakes.forget(170);
+    m.rounds(2, &term(&m.r, Some(150)));
+    let c = crate::caller::resolve_tree(&m.w.ctx).unwrap();
+    assert_eq!(
+        standing(&m.w.ctx, &c, None),
+        Err(tagged()),
+        "a failed proof never falls back"
+    );
+    m.w.fakes.hc_done().unwrap();
+    let w = World::human("");
+    assert_eq!(standing(&w.ctx, &w.caller(), None), Ok(Standing::Person));
+    let h = World::human(ID);
+    assert_eq!(
+        standing(&h.ctx, &h.caller(), None),
+        Err(tagged()),
+        "a tagged pane"
+    );
+    let a = World::agent("");
+    assert_eq!(
+        standing(&a.ctx, &a.caller(), None).unwrap_err().check,
+        "caller",
+        "a tmux-pane agent keeps 2 caller"
+    );
 }

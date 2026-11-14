@@ -5,15 +5,17 @@ use super::membership::Snapshot;
 use super::team::{self, Team};
 use super::{server_dir, text};
 use crate::caller::Caller;
+use crate::caller::Kind;
 use crate::ctx::Ctx;
+use crate::error::Refusal;
 use crate::error::{Res, refuse};
+use crate::hc::Core;
 use crate::hc::Terminal;
 use crate::parse::Client;
 use crate::proc::Row;
 use crate::state::root::OsKind;
 use serde_json::Value;
 use std::collections::BTreeMap;
-use std::path::Path;
 pub const MAX_DEPTH: u64 = 3;
 pub const MAX_MEMBERS: usize = 6;
 /// Outside a team 0.2 holds; a launched leader without a team record refuses every spawn (D2).
@@ -104,10 +106,22 @@ pub struct Member {
 /// D1, the one proof: caller > shells only > X, every row readable and no newer than its child. X is the C that member
 /// `id`'s launcher.json recorded, or (Unix only) the native copilot whose parent is that C, the npm loader; C's parent is
 /// the recorded L; both pids and starts match; `t`, M's own terminal by address and labels, shows X, C or L in front.
-pub fn prove_member(ctx: &Ctx, state: &Path, team: &str, id: &str, t: &Terminal) -> Option<Member> {
-    let folder = state.join("agents").join(id);
-    let read = |f: &str| crate::state::fs::read_json(&folder.join(f)).ok().flatten();
-    let (record, launcher) = (read("record.json")?, read("launcher.json")?);
+/// `record` is M's record as the caller already read it, inside the state root; launcher.json and spec.json are read
+/// the same way, so no file of the proof is reached through a link out of the root (#104).
+pub fn prove_member(
+    ctx: &Ctx,
+    team: &str,
+    id: &str,
+    record: &Value,
+    t: &Terminal,
+) -> Option<Member> {
+    let (key, _) = team.split_once(':')?;
+    let read = |f: &str| {
+        crate::caller::hc::within_root(&ctx.state_root, &[key, "agents", id, f])
+            .and_then(|p| crate::state::fs::read_json(&p).ok().flatten())
+    };
+    let launcher = read("launcher.json")?;
+    let record = record.clone();
     let pid_start = |v: &Value| {
         Some((
             u32::try_from(v.get("pid")?.as_u64()?).ok()?,
@@ -169,7 +183,13 @@ pub fn prove_member(ctx: &Ctx, state: &Path, team: &str, id: &str, t: &Terminal)
     if !proven {
         return None;
     }
-    let flags = super::resume::recorded_flags(&folder).ok()?;
+    let flags = read("spec.json").and_then(|spec| {
+        spec.get("flags")?
+            .as_array()?
+            .iter()
+            .map(|f| f.as_str().map(String::from))
+            .collect::<Option<Vec<_>>>()
+    })?;
     Some(Member {
         id: id.into(),
         record,
@@ -198,6 +218,65 @@ pub fn copilot_pair(
         && file(loader).as_deref() == Some("node")
         && file(native).as_deref() == Some("copilot")
         && is_copilot(loader)
+}
+pub const TAGGED: &str = "this caller cannot be proven a member";
+pub fn tagged() -> Refusal {
+    Refusal {
+        code: 2,
+        check: "tagged",
+        message: TAGGED.into(),
+        reason: None,
+        leftover: None,
+    }
+}
+/// The verbs that re-prove a candidate under the team lock (`resolve_tree`, then `standing`).
+pub fn candidate_verb(verb: &str, request: &crate::cli::Request) -> bool {
+    matches!(verb, "spawn" | "stop" | "resume")
+        || (verb == "read" && !request.positional.is_empty())
+}
+#[derive(Debug, Clone, PartialEq)]
+pub enum Standing {
+    Person,
+    Member(Member),
+}
+/// D1 under the team lock: an hc member or candidate is proven again (a failure is 2 `tagged`, never a fallback); a
+/// person is a human in an untagged pane; a tmux-pane agent keeps 2 `caller`.
+pub fn standing(ctx: &Ctx, caller: &Caller, core: Option<&Core<'_>>) -> Res<Standing> {
+    if let Some(id) = caller.member.as_ref().or(caller.candidate.as_ref()) {
+        let connected;
+        let core = match core {
+            Some(core) => core,
+            None => {
+                connected = crate::hc::connect(ctx)?;
+                &connected
+            }
+        };
+        let team = super::membership::team(caller);
+        let rel = [caller.server_key.as_str(), "agents", id, "record.json"];
+        let record = crate::caller::hc::within_root(&ctx.state_root, &rel)
+            .and_then(|p| crate::state::fs::read_json(&p).ok().flatten());
+        let address = record
+            .as_ref()
+            .and_then(|r| super::core_identity::Identity::read(r, id, &team))
+            .map(|i| i.address);
+        let t = address.and_then(|a| core.get(&a).ok());
+        return t
+            .zip(record)
+            .and_then(|(t, r)| prove_member(ctx, &team, id, &r, &t))
+            .map(Standing::Member)
+            .ok_or_else(tagged);
+    }
+    match caller.kind {
+        Kind::Human => {
+            super::registry::untagged(ctx, caller, TAGGED)?;
+            Ok(Standing::Person)
+        }
+        Kind::Agent => refuse(
+            2,
+            "caller",
+            "an agent in a tmux or rmux pane cannot be proven a member",
+        ),
+    }
 }
 #[cfg(test)]
 #[path = "tree_tests.rs"]

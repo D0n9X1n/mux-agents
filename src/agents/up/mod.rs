@@ -122,6 +122,7 @@ fn create(ctx: &Ctx, caller: &Caller, core: &Core<'_>, plan: &Plan<'_>) -> Res<M
         client: None,
         agent: None,
         member: None,
+        candidate: None,
         chain: Vec::new(),
         pane: String::new(),
         window: window.clone(),
