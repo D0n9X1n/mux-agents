@@ -100,6 +100,12 @@ pub trait Steps {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
     }
+
+    /// Flushes the folder that holds a folder just made, so its entry survives a crash or power loss (#103: a
+    /// launch claim below it is only as durable as every folder on its path).
+    fn sync_parent(&self, path: &Path) -> io::Result<()> {
+        crate::state::fs::sync_dir(path.parent().unwrap_or(Path::new("/")))
+    }
 }
 
 pub struct Real;
@@ -189,7 +195,7 @@ fn new_dir(steps: &dyn Steps, path: &Path) -> Res<bool> {
         }
         Err(_) => return cannot(),
     }
-    if steps.chmod(path).is_err() {
+    if steps.chmod(path).is_err() || steps.sync_parent(path).is_err() {
         return cannot();
     }
     Ok(true)
@@ -775,6 +781,52 @@ pub(crate) mod tests {
         } else {
             assert_eq!(above, "ok");
         }
+    }
+
+    // #103: the parent of every folder made here is flushed, so the state root and its folders survive a crash or
+    // power loss; a failed flush refuses, and no later folder is made.
+    #[test]
+    fn made_folders_are_flushed_into_their_parents() {
+        use std::cell::RefCell;
+        struct Flush(RefCell<Vec<PathBuf>>, bool);
+        impl Steps for Flush {
+            fn sync_parent(&self, path: &Path) -> io::Result<()> {
+                self.0.borrow_mut().push(path.to_path_buf());
+                if self.1 {
+                    Err(io::Error::other("flush failed"))
+                } else {
+                    Real.sync_parent(path)
+                }
+            }
+        }
+        let dir = TempDir::new();
+        let root = dir.path().join("state");
+        let (agents, mail) = (root.join("k/agents"), root.join("k/mail"));
+        let steps = Flush(RefCell::new(Vec::new()), false);
+        assert_eq!(
+            message(private_dirs_with(&steps, &root, &[&root, &agents, &mail])),
+            "ok"
+        );
+        assert_eq!(
+            steps.0.into_inner(),
+            [root.clone(), root.join("k"), agents.clone(), mail.clone()]
+        );
+        // Existing folders are not flushed again.
+        let steps = Flush(RefCell::new(Vec::new()), false);
+        assert_eq!(
+            message(private_dirs_with(&steps, &root, &[&root, &agents])),
+            "ok"
+        );
+        assert!(steps.0.into_inner().is_empty());
+        let dir = TempDir::new();
+        let root = dir.path().join("state");
+        let steps = Flush(RefCell::new(Vec::new()), true);
+        assert_eq!(
+            message(private_dirs_with(&steps, &root, &[&root, &root.join("k")])),
+            "the state folder cannot be created"
+        );
+        assert_eq!(steps.0.into_inner(), std::slice::from_ref(&root));
+        assert_eq!(mode(&root.join("k")), None);
     }
 
     // UnixState.Tests.ps1:224, 283: any failed lstat refuses, never passes.

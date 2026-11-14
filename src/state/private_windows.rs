@@ -191,6 +191,12 @@ mod win {
                     return refuse(1, "state", "the state folder path is a file");
                 }
             }
+            // Made here: its entry in the parent is flushed, so it survives a crash or power loss (#103).
+            Ok(()) => {
+                if let Some(parent) = path.parent() {
+                    crate::state::fs::sync_dir(parent)?;
+                }
+            }
             other => other?,
         }
         check(sid, path)
