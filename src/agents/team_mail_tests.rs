@@ -160,3 +160,29 @@ fn concurrent_senders_never_pass_120() {
     let (one, two) = (std::thread::spawn(run.clone()), std::thread::spawn(run));
     assert_eq!(one.join().unwrap() + two.join().unwrap(), 120);
 }
+
+#[test]
+fn a_failed_entry_flush_is_finished_by_the_retry() {
+    let w = World::human("");
+    let root = sends_root(&crate::agents::server_dir(&w.ctx, &w.caller()), "$3");
+    let teams = root.parent().unwrap().parent().unwrap().to_path_buf();
+    let i = json!({"id": "1111111111111111", "sender": "aaaaaaaaaaaa"});
+    // The uncertain state, built explicitly (finding 8): every folder exists, made by an earlier call whose entry
+    // flushes may not have reached the disk. Task 5 flushes only folders it creates, so it flushes nothing here.
+    std::fs::create_dir_all(root.join("aaaaaaaaaaaa")).unwrap();
+    crate::state::fs::fail_sync_dir(Some(&teams));
+    let r = write_intent(&root, "aaaaaaaaaaaa", &i);
+    assert!(
+        r.is_err(),
+        "folders that exist are flushed into their parents: {r:?}"
+    );
+    let r = write_intent(&root, "aaaaaaaaaaaa", &i);
+    assert!(r.is_err(), "the retry flushes teams again: {r:?}");
+    crate::state::fs::fail_sync_dir(None);
+    write_intent(&root, "aaaaaaaaaaaa", &i).unwrap();
+    assert!(
+        root.join("aaaaaaaaaaaa")
+            .join("1111111111111111.json")
+            .is_file()
+    );
+}
