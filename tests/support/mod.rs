@@ -314,8 +314,14 @@ impl Server {
         String::from_utf8(out.stdout).unwrap()
     }
 
+    /// One client call to this server, run with the same cleared environment the server started with (#97): a pane
+    /// a client call creates must not take the test process's PATH, which lacks `<dir>/bin` and its fake clients.
     pub fn try_call(&self, args: &[&str]) -> Output {
-        Command::new(&self.bin)
+        let mut command = Command::new(&self.bin);
+        if let Some(core) = &self.core {
+            core.apply(&mut command);
+        }
+        command
             .arg("-S")
             .arg(&self.socket)
             .arg("-N")
