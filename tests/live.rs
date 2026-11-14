@@ -4565,6 +4565,7 @@ hc {}:
                     bar_n_and_shift_n_step_through_agents,
                     bar_keys_focus_an_agent,
                     bar_click_after_shrinking_does_nothing,
+                    members_spawn_and_act_only_down_the_tree,
                 ]
             );
         };
@@ -4601,75 +4602,71 @@ hc {}:
         [break_pane_of_the_last_view_gives_its_new_window_a_bar]
     );
 
-    #[test]
-    fn members_spawn_and_act_only_down_the_tree() {
-        for mux in Mux::ALL {
-            let Some(mut live) = Live::human(mux) else {
-                continue;
-            };
-            std::fs::write(live.dir.join("brief.md"), "brief").unwrap();
-            let (code, up) = live.run(&["up", "-Client", "claude"]);
-            assert_eq!(code, 0, "{mux:?} {up}");
-            let leader = up["leader"]["id"].as_str().unwrap().to_string();
-            let ok = |live: &mut Live, by: &str, name: &str| {
-                let (code, r) = live.spawn_by(by, name);
-                assert_eq!(code, 0, "{mux:?} {name}: {r}");
-                r["id"].as_str().unwrap().to_string()
-            };
-            let read = |live: &Live, id: &str, file: &str| -> Value {
-                serde_json::from_str(
-                    &std::fs::read_to_string(live.agent_dir(id).join(file)).unwrap(),
-                )
+    /// The tree end to end, one multiplexer per test (`every_mux_scenario`), so one panic hides no other.
+    fn members_spawn_and_act_only_down_the_tree(mux: Mux) {
+        let Some(mut live) = Live::human(mux) else {
+            return;
+        };
+        std::fs::write(live.dir.join("brief.md"), "brief").unwrap();
+        let (code, up) = live.run(&["up", "-Client", "claude"]);
+        assert_eq!(code, 0, "{mux:?} {up}");
+        let leader = up["leader"]["id"].as_str().unwrap().to_string();
+        let ok = |live: &mut Live, by: &str, name: &str| {
+            let (code, r) = live.spawn_by(by, name);
+            assert_eq!(code, 0, "{mux:?} {name}: {r}");
+            r["id"].as_str().unwrap().to_string()
+        };
+        let read = |live: &Live, id: &str, file: &str| -> Value {
+            serde_json::from_str(&std::fs::read_to_string(live.agent_dir(id).join(file)).unwrap())
                 .unwrap()
-            };
-            let c1 = ok(&mut live, &leader, "c1");
-            let flags = read(&live, &c1, "spec.json")["flags"].clone();
-            assert!(
-                !flags
-                    .as_array()
-                    .unwrap()
-                    .iter()
-                    .any(|f| f == "--dangerously-skip-permissions"),
-                "{mux:?}: a default-permission leader's child runs without bypass: {flags}"
-            );
-            let c2 = ok(&mut live, &leader, "c2");
-            let g1 = ok(&mut live, &c1, "g1");
-            let h1 = ok(&mut live, &g1, "h1");
-            let r = read(&live, &h1, "record.json");
-            assert_eq!(
-                (&r["depth"], &r["parentAgent"]["id"]),
-                (&json!(3), &json!(g1)),
-                "{mux:?}"
-            );
-            let (code, r) = live.spawn_by(&h1, "x");
-            assert_eq!(
-                (code, r["check"].as_str()),
-                (2, Some("depth")),
-                "{mux:?} {r}"
-            );
-            for verb in ["stop", "read"] {
-                let pid = live.client_of(&c2);
-                let (code, r) = live.server.command(pid, &[verb, "c1"]);
-                assert_eq!(
-                    (code, r["check"].as_str()),
-                    (2, Some("authority")),
-                    "{mux:?} a sibling's {verb}: {r}"
-                );
-            }
-            let pid = live.client_of(&leader);
-            let (code, r) = live.server.command(pid, &["stop", "g1"]);
-            assert_eq!(code, 0, "{mux:?} the leader stops a grandchild: {r}");
-            // Live besides the leader: c1, c2, h1 (no cascade stop); three more make six, a 7th refuses.
-            for name in ["c3", "c4", "c5"] {
-                ok(&mut live, &leader, name);
-            }
-            let (code, r) = live.spawn_by(&leader, "c6");
+        };
+        let c1 = ok(&mut live, &leader, "c1");
+        let flags = read(&live, &c1, "spec.json")["flags"].clone();
+        assert!(
+            !flags
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|f| f == "--dangerously-skip-permissions"),
+            "{mux:?}: a default-permission leader's child runs without bypass: {flags}"
+        );
+        let c2 = ok(&mut live, &leader, "c2");
+        let g1 = ok(&mut live, &c1, "g1");
+        let h1 = ok(&mut live, &g1, "h1");
+        let r = read(&live, &h1, "record.json");
+        assert_eq!(
+            (&r["depth"], &r["parentAgent"]["id"]),
+            (&json!(3), &json!(g1)),
+            "{mux:?}"
+        );
+        let (code, r) = live.spawn_by(&h1, "x");
+        assert_eq!(
+            (code, r["check"].as_str()),
+            (2, Some("depth")),
+            "{mux:?} {r}"
+        );
+        for verb in ["stop", "read"] {
+            let pid = live.client_of(&c2);
+            let (code, r) = live.server.command(pid, &[verb, "c1"]);
             assert_eq!(
                 (code, r["check"].as_str()),
-                (2, Some("limit")),
-                "{mux:?} {r}"
+                (2, Some("authority")),
+                "{mux:?} a sibling's {verb}: {r}"
             );
         }
+        let pid = live.client_of(&leader);
+        let (code, r) = live.server.command(pid, &["stop", "g1"]);
+        assert_eq!(code, 0, "{mux:?} the leader stops a grandchild: {r}");
+        // Live besides the leader: c1, c2, h1 (no cascade stop); three more make six, a 7th refuses.
+        for name in ["c3", "c4", "c5"] {
+            ok(&mut live, &leader, name);
+        }
+        let (code, r) = live.spawn_by(&leader, "c6");
+        assert_eq!(
+            (code, r["check"].as_str()),
+            (2, Some("limit")),
+            "{mux:?} {r}"
+        );
     }
 }
 
