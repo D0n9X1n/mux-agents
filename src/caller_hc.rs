@@ -32,7 +32,8 @@ pub(crate) fn resolve(ctx: &Ctx) -> Res<Caller> {
         })
 }
 fn prove(ctx: &Ctx) -> Res<Option<Caller>> {
-    let t = crate::hc::connect(ctx)?.get(ctx.env.get("HC_TERMINAL_ID").unwrap_or(""))?;
+    let core = crate::hc::connect(ctx)?;
+    let t = core.get(ctx.env.get("HC_TERMINAL_ID").unwrap_or(""))?;
     let read = || -> Option<Caller> {
         let walked = t.pid.and_then(|pid| super::walk(ctx, pid).ok());
         let address = ctx.env.get("HC_TERMINAL_ID")?;
@@ -85,8 +86,10 @@ fn prove(ctx: &Ctx) -> Res<Option<Caller>> {
         {
             return None;
         }
-        let proven =
-            walked.is_some() && agents::tree::prove_member(ctx, team, id, &r, &t).is_some();
+        let proven = walked.is_some() && {
+            let t = agents::tree::sampled(ctx, &core, t.clone());
+            agents::tree::prove_member(ctx, team, id, &r, &t).is_some()
+        };
         Some(Caller {
             kind: Kind::Agent,
             client: Some(agents::spawn::client_named(r["client"].as_str()?)?),

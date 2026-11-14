@@ -488,6 +488,12 @@ fn a_failed_proof_is_a_candidate() {
         for _ in 0..2 {
             cf::online(&w);
             cf::get(&w, r["hcAddress"].as_str().unwrap(), t.clone());
+            // hc never names the foreground: every bounded re-read finds none, so the proof still refuses.
+            if case == "no-foreground" {
+                for _ in 0..crate::agents::tree::SAMPLE_READS {
+                    cf::get(&w, r["hcAddress"].as_str().unwrap(), t.clone());
+                }
+            }
         }
         let got = caller::resolve_tree(&w.ctx).expect(case);
         assert_eq!(
@@ -615,4 +621,22 @@ fn a_candidate_is_refused_before_any_multiplexer() {
         );
         w.fakes.hc_done().unwrap();
     }
+}
+/// hc names a terminal's foreground only once it has sampled the terminal (#103, CI on Linux): a member that acts in
+/// that first moment is read again, on the clock, rather than refused; it is proven once hc names its foreground.
+#[test]
+fn a_member_is_proven_once_hc_names_its_foreground() {
+    let (w, _, r, _) = worker();
+    let mut unsampled = wire(&r);
+    unsampled.as_object_mut().unwrap().remove("foreground");
+    cf::online(&w);
+    cf::get(&w, r["hcAddress"].as_str().unwrap(), unsampled);
+    cf::get(&w, r["hcAddress"].as_str().unwrap(), wire(&r));
+    let got = caller::resolve_tree(&w.ctx).unwrap();
+    assert_eq!((got.member.as_deref(), got.candidate), (Some(ID), None));
+    assert!(
+        !w.fakes.slept().is_empty(),
+        "the re-read waits on the clock"
+    );
+    w.fakes.hc_done().unwrap();
 }

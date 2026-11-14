@@ -200,6 +200,24 @@ pub fn prove_member(
         flags,
     })
 }
+/// How many times a terminal hc has not yet sampled is read again before the proof decides.
+pub const SAMPLE_READS: usize = 20;
+/// hc names a terminal's foreground only once it has sampled the terminal, about 100 ms after it starts: a member that
+/// acts before that is read again, on the clock, up to `SAMPLE_READS` times. A terminal that never names one, or a
+/// read that fails, is returned as it is, so the proof still refuses it (D1 stays fail-closed).
+pub fn sampled(ctx: &Ctx, core: &Core<'_>, mut t: Terminal) -> Terminal {
+    for _ in 0..SAMPLE_READS {
+        if t.foreground.is_some() {
+            break;
+        }
+        ctx.clock.sleep(std::time::Duration::from_millis(100));
+        match core.get(&t.address) {
+            Ok(next) => t = next,
+            Err(_) => break,
+        }
+    }
+    t
+}
 /// The one pair that counts as C (D1), Unix only: `native` (an executable named `copilot`) is the direct child of
 /// `loader` (an executable named `node`), and `is_copilot(loader)` is the canonical Unix client recognition
 /// (`Os::client_of` -> `parse::unix_client`: links resolved, relative scripts against the cwd), never the raw spelling.
@@ -260,7 +278,9 @@ pub fn standing(ctx: &Ctx, caller: &Caller, core: Option<&Core<'_>>) -> Res<Stan
             .as_ref()
             .and_then(|r| super::core_identity::Identity::read(r, id, &team))
             .map(|i| i.address);
-        let t = address.and_then(|a| core.get(&a).ok());
+        let t = address
+            .and_then(|a| core.get(&a).ok())
+            .map(|t| sampled(ctx, core, t));
         return t
             .zip(record)
             .and_then(|(t, r)| prove_member(ctx, &team, id, &r, &t))
