@@ -126,6 +126,19 @@ fn text(v: &Value, key: &str) -> Res<String> {
         .ok_or_else(invalid)
 }
 
+/// hc's error `kind` from a failed call: `{"error":{"kind":…}}` on stdout or stderr. hc prints it when its output is piped,
+/// `--json` or not (a probe here on 2026-11-14 got `unavailable`, exit 5, from `hc read` without `--json`).
+fn error_kind(out: &Out) -> Option<String> {
+    [&out.stdout, &out.stderr].into_iter().find_map(|s| {
+        serde_json::from_str::<Value>(s.trim())
+            .ok()?
+            .get("error")?
+            .get("kind")?
+            .as_str()
+            .map(str::to_owned)
+    })
+}
+
 fn address(v: &Value) -> Res<String> {
     text(v, "address").and_then(|a| if a.is_empty() { Err(invalid()) } else { Ok(a) })
 }
@@ -135,12 +148,37 @@ impl Core<'_> {
         &self.bin
     }
 
-    fn call(&self, args: &[String]) -> Res<Out> {
+    fn exec(&self, args: &[String]) -> Res<Out> {
         let argv: Vec<_> = args.iter().map(String::as_str).collect();
-        let out = self
-            .provider
+        self.provider
             .captured(&self.bin, &argv, Duration::from_secs(15))
-            .map_err(|_| failure("hc call failed; execution is uncertain; do not retry blindly"))?;
+            .map_err(|_| failure("hc call failed; execution is uncertain; do not retry blindly"))
+    }
+
+    fn call(&self, args: &[String]) -> Res<Out> {
+        let out = self.exec(args)?;
+        if out.code != 0 {
+            return Err(failure(
+                "hc command failed; execution is uncertain; do not retry blindly",
+            ));
+        }
+        Ok(out)
+    }
+
+    /// `call` for `read` and `get`: hc's `not_found` (exit 3; observed with hc 0.1.21 on 2026-11-14) becomes the refusal check
+    /// `not_found`, so the bar tells a terminal hc dropped from a failure (#103 B6); every other failure, unreachable included,
+    /// stays `hc`.
+    fn call_found(&self, args: &[String]) -> Res<Out> {
+        let out = self.exec(args)?;
+        if out.code != 0 && error_kind(&out).as_deref() == Some("not_found") {
+            return Err(Refusal {
+                code: 2,
+                check: "not_found",
+                message: "hc keeps no such terminal".into(),
+                reason: None,
+                leftover: None,
+            });
+        }
         if out.code != 0 {
             return Err(failure(
                 "hc command failed; execution is uncertain; do not retry blindly",
@@ -189,6 +227,13 @@ impl Core<'_> {
     pub fn kill(&self, t: &str) -> Res<()> {
         self.call(&["kill".into(), t.into(), "--json".into()])
             .map(|_| ())
+    }
+
+    /// `hc read <t> --lines <n>`: the terminal's screen and `n` lines of history as plain text, also after it finished
+    /// (members run `--keep`).
+    pub fn read(&self, t: &str, lines: u32) -> Res<String> {
+        self.call_found(&["read".into(), t.into(), "--lines".into(), lines.to_string()])
+            .map(|out| out.stdout)
     }
 }
 
@@ -293,7 +338,14 @@ impl Terminal {
 
 impl Core<'_> {
     pub fn get(&self, t: &str) -> Res<Terminal> {
-        Terminal::decode(&self.json(&["get".into(), t.into(), "--json".into()])?)
+        Terminal::decode(
+            &serde_json::from_str(
+                &self
+                    .call_found(&["get".into(), t.into(), "--json".into()])?
+                    .stdout,
+            )
+            .map_err(|_| invalid())?,
+        )
     }
 
     pub fn ls(&self, labels: &[(&str, &str)]) -> Res<Vec<String>> {
@@ -998,5 +1050,61 @@ mod tests {
             vec![(p, vec!["--version".to_string()], Duration::from_secs(5))]
         );
         assert!(c.hc.captured(Path::new("hc"), &[], Duration::ZERO).is_err());
+    }
+
+    #[test]
+    fn read_returns_the_retained_text() {
+        let f = Fakes::default();
+        f.hc_install("hc");
+        answer(&f, "hc 0.1.21");
+        answer(&f, "line one\nline two\n");
+        f.hc_answer(Ok(Out {
+            code: 1,
+            stdout: String::new(),
+            stderr: "gone".into(),
+        }));
+        let ctx = f.ctx();
+        let core = connect(&ctx).unwrap();
+        assert_eq!(core.read("t7", 200).unwrap(), "line one\nline two\n");
+        assert!(core.read("t7", 200).is_err(), "a failed read is no output");
+        let calls: Vec<_> = f.hc_calls().into_iter().map(|(_, a, _)| a).collect();
+        assert_eq!(calls[1], ["read", "t7", "--lines", "200"]);
+    }
+
+    #[test]
+    fn read_and_get_keep_hcs_not_found_kind() {
+        let f = Fakes::default();
+        f.hc_install("hc");
+        answer(&f, "hc 0.1.21");
+        // Observed with hc 0.1.21 on 2026-11-14: `hc read t9zzz --json` and `hc get t9zzz --json` exit 3 and print this.
+        let gone = r#"{"error":{"hint":"see `hc ls --all`","kind":"not_found","message":"no terminal \"t9zzz\""}}"#;
+        for _ in 0..2 {
+            f.hc_answer(Ok(Out {
+                code: 3,
+                stdout: gone.into(),
+                stderr: String::new(),
+            }));
+        }
+        let down = r#"{"error":{"kind":"unavailable","message":"core did not start within 15 s"}}"#;
+        f.hc_answer(Ok(Out {
+            code: 5,
+            stdout: down.into(),
+            stderr: String::new(),
+        }));
+        f.hc_answer(Err(Refusal::internal("hc call failed")));
+        let ctx = f.ctx();
+        let core = connect(&ctx).unwrap();
+        assert_eq!(core.get("t9zzz").unwrap_err().check, "not_found");
+        assert_eq!(core.read("t9zzz", 200).unwrap_err().check, "not_found");
+        assert_eq!(
+            core.read("t9zzz", 200).unwrap_err().check,
+            "hc",
+            "hc unreachable is a failure, never a drop"
+        );
+        assert_eq!(
+            core.read("t9zzz", 200).unwrap_err().check,
+            "hc",
+            "no answer at all"
+        );
     }
 }
