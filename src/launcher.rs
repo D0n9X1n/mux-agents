@@ -72,6 +72,51 @@ fn launch_overrides(ctx: &Ctx) -> io::Result<Vec<(&'static str, String)>> {
 }
 
 pub(crate) fn run(ctx: &Ctx, spec: &str, err: &mut dyn FnMut(&str), start: Start) -> i32 {
+    run_with(ctx, spec, err, start, &mut |d: &Path| {
+        crate::state::fs::sync_dir(d)
+    })
+}
+
+/// Flushes every folder from the claim's `gens` up to the state root, so the claim and every folder entry on its
+/// path survive a crash or power loss: spawn made them, and none was flushed before.
+fn flush_claim(
+    root: &Path,
+    folder: &Path,
+    sync: &mut dyn FnMut(&Path) -> io::Result<()>,
+) -> io::Result<()> {
+    let gens = folder.join("gens");
+    let depth = root.components().count();
+    for dir in gens.ancestors() {
+        // Every folder below the root is lexically under it; the first one at the root's depth is the root itself.
+        let at_root = dir.components().count() == depth;
+        if !at_root && !lexically_under(root, dir) {
+            break;
+        }
+        sync(dir)?;
+        if at_root {
+            return Ok(());
+        }
+    }
+    Err(io::Error::other("the claim is not under the state root"))
+}
+
+/// The exit record a launcher that claimed its generation leaves when it fails before or instead of the client, so
+/// the parent gets `exited`, never `lost`.
+fn failed_exit(ctx: &Ctx, folder: &Path) {
+    let at = utc_o(ctx.clock.now());
+    let _ = write_json(
+        &folder.join("launcher.json"),
+        &json!({"pid": ctx.pid, "exitCode": 1, "exitedAt": at}),
+    );
+}
+
+fn run_with(
+    ctx: &Ctx,
+    spec: &str,
+    err: &mut dyn FnMut(&str),
+    start: Start,
+    sync: &mut dyn FnMut(&Path) -> io::Result<()>,
+) -> i32 {
     let given = Path::new(spec);
     // Only a spec.json inside the state root, its path already canonical (no link on the way), is read.
     if !given.is_absolute()
@@ -97,19 +142,23 @@ pub(crate) fn run(ctx: &Ctx, spec: &str, err: &mut dyn FnMut(&str), start: Start
             return 1;
         }
     };
+    // A won claim is on disk before the client may run (#103): a failed flush leaves the claim `run` and an exit
+    // record, and the client never runs.
+    if let Err(e) = flush_claim(&ctx.state_root, folder, sync) {
+        err(&format!(
+            "mux-agent: the launcher failed: the generation claim could not be flushed to disk: {e}"
+        ));
+        failed_exit(ctx, folder);
+        return 1;
+    }
     let code = match launch(ctx, &spec_value, folder, err, start) {
         Ok(code) => code,
         Err(refusal) => {
-            // A failure after the claim still leaves an exit record, so the parent gets `exited`, never `lost`.
             err(&format!(
                 "mux-agent: the launcher failed: {}",
                 refusal.message
             ));
-            let at = utc_o(ctx.clock.now());
-            let _ = write_json(
-                &folder.join("launcher.json"),
-                &json!({"pid": ctx.pid, "exitCode": 1, "exitedAt": at}),
-            );
+            failed_exit(ctx, folder);
             1
         }
     };
@@ -184,17 +233,9 @@ fn unc(path: &str) -> bool {
     !drive
 }
 
+/// Claims the spec's generation (`gens/<gen>.claim` = `run`): the spec when this launcher won it, none when another
+/// claim (or an abandonment) was there first.
 fn claim_spec(spec: &Path, folder: &Path) -> Res<Option<Value>> {
-    claim_spec_with(spec, folder, &mut |d: &Path| crate::state::fs::sync_dir(d))
-}
-
-/// Claims the spec's generation (`gens/<gen>.claim` = `run`). A won claim is flushed to disk (`sync`) before the
-/// client may run: a failed flush is an error, the claim stays `run`, and the client never runs (#103).
-fn claim_spec_with(
-    spec: &Path,
-    folder: &Path,
-    sync: &mut dyn FnMut(&Path) -> io::Result<()>,
-) -> Res<Option<Value>> {
     let v = read_json(spec)?.ok_or_else(|| Refusal::internal("the launch spec is missing"))?;
     let gen_id = match v.get("generation") {
         None => "0",
@@ -209,11 +250,10 @@ fn claim_spec_with(
     if !same_path(&std::fs::canonicalize(&gens)?, plain, HOST) {
         return Err(Refusal::internal("invalid generation folder"));
     }
-    if !crate::state::fs::claim_json(&gens.join(format!("{gen_id}.claim")), &json!("run"))? {
-        return Ok(None);
-    }
-    sync(&gens)?;
-    Ok(Some(v))
+    Ok(
+        crate::state::fs::claim_json(&gens.join(format!("{gen_id}.claim")), &json!("run"))?
+            .then_some(v),
+    )
 }
 
 fn launch(
@@ -602,29 +642,56 @@ mod tests {
         }
     }
 
-    // #103: a won claim is flushed to disk before the client runs; when the flush fails the claim stays `run` and
-    // the client never runs, so a crash can never erase the evidence that it may have.
+    // #103: a won claim, and every folder on its path up to the state root, is flushed to disk before the client
+    // runs; when a flush fails the claim stays `run`, an exit record is left, and the client never runs.
     #[test]
     fn generation_claim_is_flushed_before_the_client_runs() {
+        let run_flushing = |l: &Launch, fail: bool| {
+            let mut synced = Vec::new();
+            let mut err = Vec::new();
+            let mut started = 0;
+            let code = run_with(
+                &l.w.ctx,
+                &spec_str(l),
+                &mut |line: &str| err.push(line.to_string()),
+                &mut |_: &Path, _: &[String], _: &[&str]| {
+                    started += 1;
+                    Ok(0)
+                },
+                &mut |d: &Path| {
+                    synced.push(d.to_path_buf());
+                    if fail {
+                        Err(io::Error::other("flush failed"))
+                    } else {
+                        Ok(())
+                    }
+                },
+            );
+            (code, synced, started, err)
+        };
         let l = setup("claude", json!([]));
-        let spec = l.folder.join("spec.json");
-        let synced = std::cell::RefCell::new(Vec::new());
-        let ok = claim_spec_with(&spec, &l.folder, &mut |d: &Path| {
-            synced.borrow_mut().push(d.to_path_buf());
-            Ok(())
-        });
-        assert!(ok.unwrap().is_some());
-        assert_eq!(*synced.borrow(), [l.folder.join("gens")]);
+        let (code, synced, started, _) = run_flushing(&l, false);
+        assert_eq!(code, 0);
+        assert_eq!(started, 1);
+        let root = l.w.ctx.state_root.clone();
+        let want: Vec<PathBuf> = l
+            .folder
+            .join("gens")
+            .ancestors()
+            .take_while(|d| d.components().count() >= root.components().count())
+            .map(Path::to_path_buf)
+            .collect();
+        assert_eq!(synced, want);
+        assert_eq!(synced.last(), Some(&root));
         let l = setup("claude", json!([]));
-        let spec = l.folder.join("spec.json");
-        let failed = claim_spec_with(&spec, &l.folder, &mut |_: &Path| {
-            Err(io::Error::other("flush failed"))
-        });
-        assert!(failed.is_err());
+        let (code, synced, started, err) = run_flushing(&l, true);
+        assert_eq!((code, synced.len(), started), (1, 1, 0));
+        assert!(err[0].contains("could not be flushed"), "{err:?}");
         assert_eq!(
             read_json(&l.folder.join("gens/0.claim")).unwrap(),
             Some(json!("run"))
         );
+        assert_eq!(launcher_json(&l)["exitCode"], 1);
     }
 
     #[cfg(unix)]
