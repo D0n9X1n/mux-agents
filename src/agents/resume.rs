@@ -187,7 +187,7 @@ fn admit(
 }
 
 /// The client flags X's launch spec recorded; X never resumes with flags its spec does not name.
-fn recorded_flags(folder: &Path) -> Res<Vec<String>> {
+pub(crate) fn recorded_flags(folder: &Path) -> Res<Vec<String>> {
     read_json(&folder.join("spec.json"))?
         .and_then(|spec| {
             spec.get("flags")?
