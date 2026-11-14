@@ -121,7 +121,16 @@ foreach ($bin in $candidates) {
                 "'" + [System.Management.Automation.Language.CodeGeneration]::EscapeSingleQuotedStringContent([string] $_) + "'"
             }) -join ' ')
         if ($null -ne $piped) { $line = '$piped | ' + $line }
-    Invoke-Expression $line
+    # A failure to start, or an error raised downstream, is thrown on to the caller (a non-zero exit under -File):
+    # never a fallback to another candidate, which might run a second binary, and never the exit code of an
+    # earlier command.
+    $global:LASTEXITCODE = $null
+    try {
+        Invoke-Expression $line
+    } catch {
+        throw
+    }
+    if ($null -eq $LASTEXITCODE) { exit 1 }
     exit $LASTEXITCODE
 }
 

@@ -208,6 +208,18 @@ $runs = if (Test-Path -LiteralPath $countFile) { @(Get-Content -LiteralPath $cou
 # PowerShell wraps the downstream error (`failed to run: downstream`); what matters is that it reaches the caller.
 Check 'a_started_binary_is_never_run_again' (($out -match 'caught=.*downstream') -and ($out -notmatch 'no usable') -and ($runs -eq 1))
 
+# A candidate that passes the check but cannot run fails the shim: a non-zero exit, no other candidate, never 0.
+if ($onWindows) {
+    Reset; New-Item -ItemType Directory -Force -Path (Split-Path -Parent $tier1) | Out-Null
+    [System.IO.File]::WriteAllBytes($tier1, [byte[]](0x4D, 0x5A, 0x00, 0x01, 0x02)); $env:MUX_AGENTS_BIN = $tier1
+    Fake $tier3 'tier3'
+    RunIn ("cmd.exe /d /c exit 0; & $(Lit (Join-Path (Join-Path $root 'scripts') 'mux-agent.ps1')) x 2>`$null; " +
+        "'code=' + `$LASTEXITCODE")
+    Check 'a_binary_that_cannot_start_fails' (($out -notmatch 'tier3') -and ($out -notmatch 'code=0'))
+    Run @('x')
+    Check 'a_binary_that_cannot_start_fails_under_file' (($rc -ne 0) -and ($out -notmatch 'tier3'))
+}
+
 # Called with `&` and no arguments: the binary gets no arguments, not one empty one.
 Reset; Fake $tier3 'tier3'
 RunIn ("`$r = & $(Lit (Join-Path (Join-Path $root 'scripts') 'mux-agent.ps1')); 'captured=' + (`$r -join '|')")
