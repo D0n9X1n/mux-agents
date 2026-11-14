@@ -254,6 +254,17 @@ RunIn ("function f { `$ErrorActionPreference = 'Stop'; " +
     "`$env:SHIM_EXIT = '7'; & $(Lit (Join-Path (Join-Path $root 'scripts') 'mux-agent.ps1')) r | Out-Null; 'code=' + `$global:LASTEXITCODE }; f")
 Expect 'read_only_caller_preferences_never_fail_the_shim' @('code=7')
 
+# A caller's read-only argument-passing mode never changes the arguments, whichever mode it holds.
+foreach ($mode in 'Legacy', 'Windows', 'Standard') {
+    Reset; Fake $tier3 'tier3'
+    $argsFile = Join-Path $case 'args.txt'
+    RunIn ("function f { Set-Variable PSNativeCommandArgumentPassing $mode -Option ReadOnly,AllScope -Scope Local -ErrorAction SilentlyContinue; " +
+        "`$env:SHIM_ARGS_FILE = $(Lit $argsFile); " +
+        "& $(Lit (Join-Path (Join-Path $root 'scripts') 'mux-agent.ps1')) e $(Lit 'a b') $(Lit '') $(Lit 'a" b') $(Lit 'c\') | Out-Null }; f")
+    $got = if (Test-Path -LiteralPath $argsFile) { [System.IO.File]::ReadAllText($argsFile, [System.Text.Encoding]::UTF8) -replace "`r", '' } else { '<none>' }
+    Check "read_only_${mode}_mode_keeps_arguments_exact" ($got -eq ((@('e', 'a b', '', 'a" b', 'c\') -join "`n") + "`n"))
+}
+
 # Called with `&` and no arguments: the binary gets no arguments, not one empty one.
 Reset; Fake $tier3 'tier3'
 RunIn ("`$r = & $(Lit (Join-Path (Join-Path $root 'scripts') 'mux-agent.ps1')); 'captured=' + (`$r -join '|')")

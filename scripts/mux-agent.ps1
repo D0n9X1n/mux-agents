@@ -56,11 +56,11 @@ try {
     # backslashes unescaped; 7.3 and later pass arguments exactly. So before 7.3 each argument is quoted here, as
     # CommandLineToArgvW and Rust's std parse it.
     $legacy = $PSVersionTable.PSVersion -lt [version]'7.3'
-    # When the caller holds it read-only and not `Standard`, the arguments are quoted as before 7.3, which works in
-    # every other mode too.
+    # When the caller holds it read-only, only `Legacy` builds the command line as before 7.3, so only then are the
+    # arguments quoted here; `Windows` passes them to an .exe as `Standard` does.
     if (-not $legacy) {
         try { $PSNativeCommandArgumentPassing = 'Standard' } catch { }
-        if ([string] (Get-Variable -Name PSNativeCommandArgumentPassing -ValueOnly -ErrorAction SilentlyContinue) -ne 'Standard') { $legacy = $true }
+        if ([string] (Get-Variable -Name PSNativeCommandArgumentPassing -ValueOnly -ErrorAction SilentlyContinue) -eq 'Legacy') { $legacy = $true }
     }
 
     # Windows PowerShell 5.1 and pwsh 7.0-7.2 on Windows add their own quotes around an argument when whitespace falls
