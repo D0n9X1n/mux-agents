@@ -543,6 +543,11 @@ pub fn authority(
     target: &str,
     verb: &str,
 ) -> Res<()> {
+    // A person needs no team record and no ancestry: `up` may have launched its leader and stopped before writing the
+    // record, and a person may still stop or read it. The target's identity and view are checked by the caller.
+    if matches!(standing, Standing::Person) {
+        return Ok(());
+    }
     let Some(team) = team_of(ctx, caller)? else {
         return no_team();
     };

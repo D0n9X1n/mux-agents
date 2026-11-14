@@ -1500,3 +1500,37 @@ fn a_linked_spec_refuses_a_resume() {
         w.fakes.hc_done().unwrap();
     }
 }
+/// A person may still stop or read a committed leader whose team record `up` never wrote (#103): authority asks a
+/// person for no team record; the target's identity and view are still checked.
+#[test]
+fn a_person_stops_and_reads_a_leaderless_teams_leader() {
+    for verb in ["read", "stop"] {
+        let w = World::human("");
+        let r = cf::member(&w, LEADER, leader_record());
+        let mut row = crate::agents::fixture::row_of("%4|@5|300||", &[]);
+        row.command = r["startCommand"].as_str().unwrap().into();
+        w.pane_rows(&[row]);
+        w.fakes.mux_rule("show-buffer", 0, "one\ntwo\n", "");
+        let a = r["hcAddress"].as_str().unwrap().to_string();
+        if verb == "stop" {
+            cf::online(&w);
+            cf::answer(&w, &["kill", &a, "--json"], "{}");
+            cf::get(&w, &a, cf::wire(&r));
+        }
+        let (code, out) = crate::cli::run(&[verb, "leader"].map(String::from), || Ok(&w.ctx));
+        assert_eq!(code, 0, "{verb}: {out}");
+        w.fakes.hc_done().unwrap();
+    }
+    let w = World::human("");
+    cf::member(&w, LEADER, leader_record());
+    let e = crate::agents::spawn::spawn(
+        &w.ctx,
+        &w.request(&["spawn", "-Client", "claude", "-Task", "hi"]),
+    )
+    .unwrap_err();
+    assert_eq!(
+        (e.code, e.check),
+        (1, "team"),
+        "a spawn still refuses without the team record"
+    );
+}
