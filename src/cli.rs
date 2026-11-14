@@ -1092,7 +1092,21 @@ mod tests {
             [hc[0].0.to_str().unwrap(), "attach", "t1"]
         );
         assert!(!calls.iter().flatten().any(|t| t == "launcher"));
-        assert!(!create.iter().any(|t| t == "-e"));
+        // The view gets the state root as the bar does (#103): exactly `-e MUX_AGENTS_STATE=<root>` on Unix, none on
+        // Windows, whose panes inherit it.
+        let env: Vec<&String> = create
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| *i > 0 && create[i - 1] == "-e")
+            .map(|(_, t)| t)
+            .collect();
+        #[cfg(unix)]
+        assert_eq!(
+            env,
+            [&format!("MUX_AGENTS_STATE={}", w.ctx.state_root.display())]
+        );
+        #[cfg(windows)]
+        assert!(env.is_empty() && !create.iter().any(|t| t == "-e"));
         let pane = if failed {
             "%12"
         } else {

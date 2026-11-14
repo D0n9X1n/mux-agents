@@ -2124,6 +2124,12 @@ mod tests {
         ]
         .map(String::from)
         .to_vec();
+        // The state root reaches the view as it does the bar (#103): `-e MUX_AGENTS_STATE=<root>` on Unix, none on
+        // Windows.
+        expected.extend(pane_env(
+            w.ctx.state_root.to_str().unwrap(),
+            crate::state::root::HOST,
+        ));
         expected.extend([
             "-c".into(),
             w.ctx.cwd.to_str().unwrap().into(),
@@ -2132,6 +2138,7 @@ mod tests {
             "t1".into(),
         ]);
         assert_eq!(calls(&w, "new-window"), [expected]);
+        #[cfg(windows)]
         assert!(!calls(&w, "new-window")[0].iter().any(|a| a == "-e"));
         assert!(calls(&w, "split-window").is_empty());
         assert_eq!(
@@ -2187,6 +2194,10 @@ mod tests {
             ]
             .map(String::from)
             .to_vec();
+            expected.extend(pane_env(
+                w.ctx.state_root.to_str().unwrap(),
+                crate::state::root::HOST,
+            ));
             expected.extend([
                 "-c".into(),
                 w.ctx.cwd.to_str().unwrap().into(),
@@ -2195,6 +2206,7 @@ mod tests {
                 "t1".into(),
             ]);
             assert_eq!(calls(&w, "split-window"), [expected], "{split}");
+            #[cfg(windows)]
             assert!(!calls(&w, "split-window")[0].iter().any(|a| a == "-e"));
             assert!(calls(&w, "new-window").is_empty());
             assert_eq!(

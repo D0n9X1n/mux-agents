@@ -50,6 +50,10 @@ pub fn attach(
     if split.is_none() {
         args.extend(["-n", name]);
     }
+    // A Unix pane gets the server's environment, not the caller's: the state root reaches the view as it does the
+    // bar (#103). Windows panes inherit it and get none.
+    let env = super::spawn::pane_env(utf8(&ctx.state_root)?, crate::state::root::HOST);
+    args.extend(env.iter().map(String::as_str));
     args.extend(["-c", directory, utf8(core.binary())?, "attach", address]);
     let reply = native(ctx, &args, false)?;
     let view = created_pane(&reply.stdout)
@@ -236,6 +240,43 @@ mod tests {
                 .unwrap_err()
                 .message,
             "unexpected error (invalid attachment identity)"
+        );
+    }
+
+    /// A Unix pane gets the server's environment, not the caller's, so the view is given the state root as the bar is
+    /// (`-e MUX_AGENTS_STATE=<root>`, #103); a Windows pane inherits it and gets no `-e`.
+    #[test]
+    fn the_view_carries_the_state_root_into_a_unix_pane() {
+        let w = World::human("");
+        let caller = w.caller();
+        core_fixture::online(&w);
+        let core = hc::connect(&w.ctx).unwrap();
+        w.fakes
+            .mux_rule("new-window", 0, "%9|@5|hc attach t1\n", "");
+        w.launches_hold();
+        w.fakes
+            .mux_rule("-t %9 #{pane_id}|#{@agent-id}", 0, "|\n", "");
+        let r = serde_json::json!({"id":"aaaaaaaaaaaa","name":"worker","hcAddress":"t1","directory":w.ctx.cwd,"context":"brief","reason":"human"});
+        attach(&w.ctx, &core, &caller, &r, None, &mut None).unwrap();
+        let calls = w.fakes.mux_calls();
+        let create = calls
+            .iter()
+            .find(|c| c.iter().any(|t| t == "new-window"))
+            .unwrap();
+        let at = create.iter().position(|t| t == "-c").unwrap();
+        #[cfg(unix)]
+        assert_eq!(
+            &create[at - 2..at],
+            [
+                "-e".to_string(),
+                format!("MUX_AGENTS_STATE={}", w.ctx.state_root.display())
+            ],
+            "{create:?}"
+        );
+        #[cfg(windows)]
+        assert!(
+            !create.iter().any(|t| t == "-e") && create[at - 2] == "-n",
+            "{create:?}"
         );
     }
 }
