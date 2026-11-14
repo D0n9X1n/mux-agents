@@ -63,8 +63,11 @@ foreach ($bin in $candidates) {
     # A relative path, a bare name included, is a file under the current location, never a namesake on PATH.
     if (-not [System.IO.Path]::IsPathRooted($bin)) { $bin = Join-Path $here $bin }
     if (-not (Test-Usable $bin)) { continue }
+    # PowerShell on macOS and Linux expands `*`, `?` and `[...]` in every unquoted argument it passes to a native
+    # program, splatted ones included; single-quoted literals are passed as written.
+    $line = '& ' + ((@($bin) + $pass | ForEach-Object { "'" + ($_ -replace "'", "''") + "'" }) -join ' ')
     try {
-        & $bin @pass
+        Invoke-Expression $line
     } catch {
         # It never started (not a program this system runs): the next candidate is tried.
         continue
