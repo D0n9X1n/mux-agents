@@ -640,3 +640,32 @@ fn a_member_is_proven_once_hc_names_its_foreground() {
     );
     w.fakes.hc_done().unwrap();
 }
+/// The terminal hc names after sampling is checked as the first reading was (#103 D1): a later reading that has
+/// finished, or runs other argv, proves no member, whatever its foreground.
+#[test]
+fn a_sampled_terminal_is_checked_like_the_first() {
+    for case in ["finished", "argv"] {
+        let (w, _, r, _) = worker();
+        let a = r["hcAddress"].as_str().unwrap();
+        let mut unsampled = wire(&r);
+        unsampled.as_object_mut().unwrap().remove("foreground");
+        let mut later = wire(&r);
+        match case {
+            "finished" => {
+                later["state"] = "finished".into();
+                later["reason"] = "exited".into();
+            }
+            _ => later["argv"] = json!(["/bin/sh", "-l"]),
+        }
+        cf::online(&w);
+        cf::get(&w, a, unsampled);
+        cf::get(&w, a, later);
+        let got = caller::resolve_tree(&w.ctx).unwrap();
+        assert_eq!(
+            (got.member, got.candidate.as_deref()),
+            (None, Some(ID)),
+            "{case}"
+        );
+        w.fakes.hc_done().unwrap();
+    }
+}

@@ -194,6 +194,18 @@ pub fn prove_member(
         flags,
     })
 }
+/// Whether terminal `t` still shows member `identity`'s launch (D1): `committed` (commit.json there and not aborted), its
+/// identity labels, and the recorded launcher running in it. Dispatch and the team lock ask it of every reading of the
+/// terminal, the first and the one `sampled` returns, so the two can never check different things.
+pub fn launch_holds(
+    identity: &super::core_identity::Identity,
+    t: &Terminal,
+    committed: bool,
+) -> bool {
+    committed
+        && identity.matches(t)
+        && super::lifecycle::classify(Some(t), &identity.launcher) == Life::Running
+}
 /// How many times a terminal hc has not yet sampled is read again before the proof decides.
 pub const SAMPLE_READS: usize = 20;
 /// hc names a terminal's foreground only once it has sampled the terminal, about 100 ms after it starts: a member that
@@ -281,9 +293,7 @@ pub fn standing(ctx: &Ctx, caller: &Caller, core: Option<&Core<'_>>) -> Res<Stan
             core.get(&i.address)
                 .ok()
                 .map(|t| sampled(ctx, core, t))
-                .filter(|t| {
-                    committed && super::lifecycle::classify(Some(t), &i.launcher) == Life::Running
-                })
+                .filter(|t| launch_holds(i, t, committed))
         });
         return t
             .zip(record)

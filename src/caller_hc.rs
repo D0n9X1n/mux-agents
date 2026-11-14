@@ -55,17 +55,14 @@ fn prove(ctx: &Ctx) -> Res<Option<Caller>> {
         let inside = |rel: &[&str]| within_root(&ctx.state_root, rel);
         let folder = inside(&[key, "agents", id])?;
         inside(&[key, "agents", id, "commit.json"])?;
-        if !agents::committed(&folder) {
+        let committed = agents::committed(&folder);
+        if !committed {
             return None;
         }
         let record = inside(&[key, "agents", id, "record.json"])?;
         let r = crate::state::fs::read_json(&record).ok()??;
         let identity = Identity::read(&r, id, team)?;
-        if identity.address != address
-            || !identity.matches(&t)
-            || agents::lifecycle::classify(Some(&t), &identity.launcher)
-                != agents::lifecycle::Life::Running
-        {
+        if identity.address != address || !agents::tree::launch_holds(&identity, &t, committed) {
             return None;
         }
         let pane = r["pane"].as_str()?;
@@ -87,8 +84,10 @@ fn prove(ctx: &Ctx) -> Res<Option<Caller>> {
             return None;
         }
         let proven = walked.is_some() && {
+            // The reading the proof uses is checked as the first was: hc may name the foreground only on a later one.
             let t = agents::tree::sampled(ctx, &core, t.clone());
-            agents::tree::prove_member(ctx, team, id, &r, &t).is_some()
+            agents::tree::launch_holds(&identity, &t, committed)
+                && agents::tree::prove_member(ctx, team, id, &r, &t).is_some()
         };
         Some(Caller {
             kind: Kind::Agent,
