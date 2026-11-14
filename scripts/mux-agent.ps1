@@ -20,10 +20,17 @@ $arch = switch -Exact ($arch.ToUpperInvariant()) {
     'AMD64' { 'x86_64' } 'X86_64' { 'x86_64' } 'ARM64' { 'aarch64' } 'AARCH64' { 'aarch64' } default { $arch }
 }
 
-# A regular file that is executable, or becomes so with chmod +x (not Windows).
+# A regular file that is a program: on Windows one that starts with the PE "MZ" header, elsewhere one that is
+# executable or becomes so with chmod +x. Usability is decided before the binary runs, never by catching an error
+# after it, so a binary that started is never run again and an error after it started reaches the caller.
 function Test-Usable([string] $path) {
     if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { return $false }
-    if ($onWindows) { return $true }
+    if ($onWindows) {
+        try {
+            $stream = [System.IO.File]::OpenRead($path)
+            try { return ($stream.ReadByte() -eq 0x4D) -and ($stream.ReadByte() -eq 0x5A) } finally { $stream.Dispose() }
+        } catch { return $false }
+    }
     & test -x $path
     if ($LASTEXITCODE -eq 0) { return $true }
     & chmod +x $path 2>$null
@@ -88,7 +95,8 @@ $piped = if ($MyInvocation.ExpectingInput) { @($input) } else { $null }
 
 # PowerShell gives `--%` ("stop parsing") a meaning in every way it calls a program: quoted, in a variable or in
 # parentheses it is dropped or makes PowerShell pass the rest of the line raw, so no PowerShell entry can pass it
-# on as written. mux-agent never takes it; the shim refuses it rather than run a changed command.
+# on as written. The shim refuses it, as an argument or as a flag's value, rather than run a changed command; the
+# sh and cmd entries pass it.
 if (@($args | Where-Object { [string] $_ -eq '--%' }).Count) {
     [Console]::Out.Write('{"ok":false,"verb":null,"code":1,"check":"entry","message":"the PowerShell entry cannot pass the argument --%"}' + "`n")
     exit 1
@@ -113,12 +121,7 @@ foreach ($bin in $candidates) {
                 "'" + [System.Management.Automation.Language.CodeGeneration]::EscapeSingleQuotedStringContent([string] $_) + "'"
             }) -join ' ')
         if ($null -ne $piped) { $line = '$piped | ' + $line }
-    try {
-        Invoke-Expression $line
-    } catch {
-        # It never started (not a program this system runs): the next candidate is tried.
-        continue
-    }
+    Invoke-Expression $line
     exit $LASTEXITCODE
 }
 

@@ -33,6 +33,10 @@ class S{static int Main(string[] a){
 Console.WriteLine(File.ReadAllLines(AppDomain.CurrentDomain.BaseDirectory+"label.txt")[0].Trim());
 foreach(string x in a)Console.WriteLine("["+x+"]");
 if(!string.IsNullOrEmpty(Environment.GetEnvironmentVariable("SHIM_STDIN")))Console.Write(Console.In.ReadToEnd());
+string f=Environment.GetEnvironmentVariable("SHIM_ARGS_FILE");
+if(!string.IsNullOrEmpty(f))File.WriteAllLines(f,a,new System.Text.UTF8Encoding(false));
+string c=Environment.GetEnvironmentVariable("SHIM_COUNT_FILE");
+if(!string.IsNullOrEmpty(c))File.AppendAllText(c,"run\n");
 string e=Environment.GetEnvironmentVariable("SHIM_EXIT");
 return string.IsNullOrEmpty(e)?0:int.Parse(e);}}
 '@
@@ -46,7 +50,7 @@ function Fake([string] $path, [string] $label) {
         Copy-Item -LiteralPath $stub -Destination $path
         Set-Content -LiteralPath (Join-Path (Split-Path -Parent $path) 'label.txt') -Value $label -Encoding ASCII
     } else {
-        $body = "#!/bin/sh`necho $label`nfor a in `"`$@`"; do printf '[%s]\n' `"`$a`"; done`n[ -n `"`${SHIM_STDIN:-}`" ] && cat`nexit `${SHIM_EXIT:-0}`n"
+        $body = "#!/bin/sh`necho $label`nfor a in `"`$@`"; do printf '[%s]\n' `"`$a`"; done`n[ -n `"`${SHIM_STDIN:-}`" ] && cat`n[ -n `"`${SHIM_ARGS_FILE:-}`" ] && printf '%s\n' `"`$@`" > `"`$SHIM_ARGS_FILE`"`n[ -n `"`${SHIM_COUNT_FILE:-}`" ] && echo run >> `"`$SHIM_COUNT_FILE`"`nexit `${SHIM_EXIT:-0}`n"
         [System.IO.File]::WriteAllText($path, $body)
         & chmod +x $path
     }
@@ -66,6 +70,8 @@ function Reset {
     Remove-Item Env:MUX_AGENTS_BIN -ErrorAction SilentlyContinue
     Remove-Item Env:SHIM_EXIT -ErrorAction SilentlyContinue
     Remove-Item Env:SHIM_STDIN -ErrorAction SilentlyContinue
+    Remove-Item Env:SHIM_ARGS_FILE -ErrorAction SilentlyContinue
+    Remove-Item Env:SHIM_COUNT_FILE -ErrorAction SilentlyContinue
 }
 
 function Quote([string] $a) {
@@ -180,6 +186,27 @@ Reset; Fake $tier3 'tier3'
 RunIn ("`$env:SHIM_PROBE = 'EXPANDED'; & $(Lit (Join-Path (Join-Path $root 'scripts') 'mux-agent.ps1')) " +
     "x '--%' 'a b' '%SHIM_PROBE%'; exit `$LASTEXITCODE")
 Expect 'stop_parsing_token_is_refused' @('{"ok":false,"verb":null,"code":1,"check":"entry","message":"the PowerShell entry cannot pass the argument --%"}') 1
+
+# Exact values, read from a UTF-8 file the fake writes, so the console's code page cannot hide a change: backticks,
+# every Unicode single quote, `$`, wildcards and quotes arrive byte for byte.
+Reset; Fake $tier3 'tier3'
+$exact = @('a`b', '``', [string][char]0x2018 + 'x' + [char]0x2019, [string][char]0x201A + [char]0x201B, '$env:PATH', '*', 'a" b', '')
+$argsFile = Join-Path $case 'args.txt'; $env:SHIM_ARGS_FILE = $argsFile
+Run (@('e') + $exact)
+$got = if (Test-Path -LiteralPath $argsFile) { [System.IO.File]::ReadAllText($argsFile, [System.Text.Encoding]::UTF8) -replace "`r", '' } else { '<none>' }
+$want = ((@('e') + $exact) -join "`n") + "`n"
+Check 'arguments_arrive_exactly' (($rc -eq 0) -and ($got -eq $want))
+
+# A binary that started is never run again: an error thrown after it, downstream of its output, reaches the caller
+# and no other candidate runs.
+Reset; Fake $tier1 'tier1'; Fake $tier3 'tier3'
+$countFile = Join-Path $case 'runs.txt'
+RunIn ("`$env:MUX_AGENTS_BIN = $(Lit $tier1); `$env:SHIM_COUNT_FILE = $(Lit $countFile); " +
+    "try { & $(Lit (Join-Path (Join-Path $root 'scripts') 'mux-agent.ps1')) d | ForEach-Object { throw 'downstream' } } " +
+    "catch { 'caught=' + `$_.Exception.Message }")
+$runs = if (Test-Path -LiteralPath $countFile) { @(Get-Content -LiteralPath $countFile).Count } else { 0 }
+# PowerShell wraps the downstream error (`failed to run: downstream`); what matters is that it reaches the caller.
+Check 'a_started_binary_is_never_run_again' (($out -match 'caught=.*downstream') -and ($out -notmatch 'no usable') -and ($runs -eq 1))
 
 # Called with `&` and no arguments: the binary gets no arguments, not one empty one.
 Reset; Fake $tier3 'tier3'
