@@ -25,6 +25,7 @@ fn request(w: &World) -> CoreRequest<'_> {
         no_fork: true,
         split: None,
         resume: None,
+        leader: None,
     }
 }
 fn slot(_: &crate::hc::Core<'_>) -> Res<CoreSlot> {

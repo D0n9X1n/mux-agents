@@ -62,6 +62,7 @@ pub fn resume(ctx: &Ctx, request: &Request) -> Res<Map<String, Value>> {
                 no_fork: true,
                 split,
                 resume: Some(&resumed),
+                leader: None,
             },
             |_| Ok(CoreSlot { name, color }),
         )?;

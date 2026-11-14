@@ -151,6 +151,7 @@ pub fn spawn(ctx: &Ctx, request: &Request) -> Res<Map<String, Value>> {
             no_fork: request.switch("NoFork"),
             split: (placement != DEFAULT_PLACEMENT).then_some(placement),
             resume: None,
+            leader: None,
         },
         |core| {
             let snapshot = super::membership::Snapshot::for_spawn(ctx, &caller, core)?;
@@ -410,7 +411,7 @@ fn commit_probe(probe: Option<CommitProbe>) {
 }
 
 /// Made private like the state, agents and mail folders.
-fn private_folder(ctx: &Ctx, folder: &Path) -> Res<()> {
+pub(crate) fn private_folder(ctx: &Ctx, folder: &Path) -> Res<()> {
     #[cfg(unix)]
     crate::state::private_unix::private_dirs(&ctx.state_root, &[folder])?;
     #[cfg(windows)]
@@ -859,6 +860,7 @@ mod tests {
                 no_fork: false,
                 split: None,
                 resume: None,
+                leader: None,
             },
             |_| {
                 Ok(CoreSlot {
@@ -3603,6 +3605,8 @@ pub struct CoreRequest<'a> {
     pub split: Option<&'a str>,
     /// Some for a resume: the new member continues an ended one's conversation instead of starting a task.
     pub resume: Option<&'a Resumed>,
+    /// Some for `up`'s leader (#103): no parent, depth 0, its team's label.
+    pub leader: Option<&'a super::leader::Leader>,
 }
 pub struct CoreSlot {
     pub name: String,
@@ -3648,11 +3652,19 @@ pub fn launch_hc_locked(
     };
     super::core_launch::execute_connected(
         core,
-        || match request.resume {
-            Some(resumed) => launch.prepare_resumed(slot, resumed),
-            None => launch.prepare_hc(slot),
+        || match (request.resume, request.leader) {
+            (Some(resumed), _) => launch.prepare_resumed(slot, resumed),
+            (None, Some(leader)) => {
+                super::leader::prepare(ctx, caller, request.client, request.directory, slot, leader)
+            }
+            (None, None) => launch.prepare_hc(slot),
         },
         |core, p, view| {
+            // MUX_AGENTS_TEST_PANIC=launch panics after `hc run`, inside the rollback scope (live `up` test).
+            #[cfg(feature = "test-panic")]
+            if ctx.env.get("MUX_AGENTS_TEST_PANIC") == Some("launch") {
+                panic!("PANIC-PAYLOAD-launch");
+            }
             super::attachment::attach(ctx, core, caller, &p.record, request.split, view)
         },
         |folder| commit(ctx, folder),
@@ -3756,7 +3768,7 @@ impl Launch<'_> {
 }
 
 /// Leaves abort.json for a launch that failed before `hc run`: nothing ran, and the message says why.
-fn abort_evidence(folder: &Path, mut e: Refusal) -> Refusal {
+pub(crate) fn abort_evidence(folder: &Path, mut e: Refusal) -> Refusal {
     if write_json(
         &folder.join("abort.json"),
         &json!({"runUncertain":false,"hcAddress":null,"message":e.message}),

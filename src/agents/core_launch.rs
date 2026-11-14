@@ -57,13 +57,17 @@ pub fn execute_connected(
         return Err(Refusal::internal("invalid prepared generation"));
     }
     let name = format!("m{}", &id[..8]);
-    let labels = [
+    let mut labels = vec![
         ("mux.managed", "1"),
         ("mux.team", field(&p.record, "team")?),
         ("mux.id", id),
         ("mux.gen", "0"),
         ("mux.name", field(&p.record, "name")?),
     ];
+    // `up`'s leader carries its team (#103).
+    if let Some(up) = p.record.get("upTeam").and_then(Value::as_str) {
+        labels.push(("mux.up", up));
+    }
     let argv: Vec<&str> = p.argv.iter().map(String::as_str).collect();
     let run = attempt(|| {
         core.run(&Run {

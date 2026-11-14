@@ -16,6 +16,7 @@ pub mod core_facts;
 pub(crate) mod core_fixture;
 pub mod core_identity;
 pub mod core_launch;
+pub mod leader;
 pub mod lifecycle;
 pub mod mail;
 pub(crate) mod member_target;
