@@ -136,9 +136,10 @@ pub struct Snapshot {
 
 impl Snapshot {
     /// Resolve only the mailbox reader; notices never determine current membership.
-    /// The member named `name`: of every committed member with that name and no end notice, whatever hc says of
-    /// it, exactly one, and hc shows it running. Its id and record; none otherwise. Uniqueness is decided before
-    /// life, so a member hc could not read never makes a same-name one look unique (#104 phase 1c).
+    /// The member named `name`: of every committed member with that name and no end notice that hc does not prove
+    /// ended, exactly one, and hc shows it running. Its id and record; none otherwise. As in `member_target`, a
+    /// member proven ended is no rival for its name; a lost or unknown one still is, so a member hc could not read
+    /// never makes a same-name one look unique (#104 phase 1c).
     pub fn running_named(&self, name: &str) -> Option<(String, Value)> {
         let superseded = self.superseded();
         let candidates: Vec<_> = self
@@ -152,6 +153,7 @@ impl Snapshot {
                     .get(&o.identity.id)
                     .is_some_and(|s| s.committed && !s.noticed)
             })
+            .filter(|o| o.life != super::lifecycle::Life::Ended)
             .collect();
         match candidates.as_slice() {
             [o] if o.life == super::lifecycle::Life::Running => self

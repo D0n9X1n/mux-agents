@@ -311,7 +311,8 @@ fn restore_view(
         record["pane"] = v.pane.clone().into();
         record["window"] = v.window.clone().into();
         record["startCommand"] = v.command.clone().into();
-        write_json(
+        // Durable, as every rewrite of a member's record (v11): a power loss never loses `resumedFrom`.
+        crate::state::fs::write_json_durable(
             &super::server_dir(ctx, caller)
                 .join("agents")
                 .join(&id.id)

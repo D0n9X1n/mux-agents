@@ -1319,3 +1319,110 @@ fn send_read_spawn_and_stop_stay_bounded_during_a_resume() {
         }
     }
 }
+
+// v11:25: every rewrite of a member's record is durable, focus's included. Resume X to Y, Y's view is gone, then
+// `focus worker` reopens it and rewrites Y's record with the new view. A failed flush of Y's folder after that
+// rewrite is reported (focus fails, the new view is cleaned up); the record on disk, as a power loss right after the
+// write leaves it, is whole JSON that keeps `resumedFrom`, `mailbox` and `sessionId`, and no temp file is left. With
+// the flush working, focus reopens the view.
+#[test]
+fn focus_rewrites_a_resumed_record_durably() {
+    let w = World::human("");
+    let x = member(&w, ID, json!({"pane": "%5", "window": "@1", "depth": 1}));
+    w.panes(&[]);
+    facts(&w, &[(&x, "exited")]);
+    launches(&w, "t1");
+    let y = resume_of(&w, ID).unwrap()["agent"]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    w.fakes.hc_done().unwrap();
+    w.fakes.mux_rule("#{window_active}", 0, "%9|1|1|1\n", "");
+    cf::online(&w);
+    let core = crate::hc::connect(&w.ctx).unwrap();
+    let caller = w.caller();
+    let folder = w.folder(&y);
+    crate::state::fs::fail_sync_dir(Some(&folder));
+    let got = crate::agents::view::focus_hc(&w.ctx, &core, &caller, "worker", None);
+    crate::state::fs::fail_sync_dir(None);
+    assert!(got.is_err(), "the failed flush is reported: {got:?}");
+    let record = record_of(&w, &y);
+    for (k, v) in [
+        ("id", json!(y)),
+        ("resumedFrom", json!(ID)),
+        ("mailbox", json!(ID)),
+        ("sessionId", json!(SESSION_ID)),
+        ("pane", json!("%9")),
+    ] {
+        assert_eq!(record[k], v, "{k}");
+    }
+    let left: Vec<_> = std::fs::read_dir(&folder)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|n| n.ends_with(".tmp"))
+        .collect();
+    assert!(left.is_empty(), "{left:?}");
+    let focused = crate::agents::view::focus_hc(&w.ctx, &core, &caller, "worker", None).unwrap();
+    assert_eq!(focused.pane, "%9");
+    assert_eq!(record_of(&w, &y)["resumedFrom"], ID);
+    w.fakes.hc_done().unwrap();
+}
+
+// Two unrelated ended `worker`s: resume the newer, and `send worker` reaches its successor Y. The older one, proven
+// ended, is no rival for the name (as `member_target` decides). A lost or unknown `worker` beside them still makes
+// the name ambiguous: send refuses and delivers nothing.
+#[test]
+fn send_by_name_reaches_the_successor_of_one_of_two_ended_members() {
+    const C: &str = "cccccccccccc";
+    const D: &str = "dddddddddddd";
+    const THIRD: &str = "22222222-3333-4444-8555-666666666666";
+    for rival in ["none", "lost", "unknown"] {
+        let w = World::human("");
+        let caller = w.caller();
+        let x = member(
+            &w,
+            ID,
+            json!({"pane": "%5", "depth": 1, "createdAt": "2026-11-13T10:00:00Z"}),
+        );
+        let c = member(
+            &w,
+            C,
+            json!({"pane": "%7", "depth": 1, "createdAt": "2026-11-13T10:01:00Z",
+                "sessionId": OTHER_SESSION}),
+        );
+        w.panes(&[]);
+        facts(&w, &[(&x, "exited"), (&c, "stopped")]);
+        launches(&w, "t1");
+        let reply = resume_of(&w, "worker").unwrap();
+        assert_eq!(reply["from"], C, "{rival}");
+        let y = record_of(&w, reply["agent"]["id"].as_str().unwrap());
+        w.fakes.hc_done().unwrap();
+        let mut members = vec![
+            (x.clone(), "exited"),
+            (c.clone(), "stopped"),
+            (y, "running"),
+        ];
+        if rival != "none" {
+            let d = member(&w, D, json!({"pane": "%8", "depth": 1, "sessionId": THIRD}));
+            members.push((d, rival));
+        }
+        let refs: Vec<_> = members.iter().map(|(r, l)| (r, *l)).collect();
+        snapshot(&w, &refs);
+        let got =
+            crate::agents::message::send(&w.ctx, &w.request(&["send", "worker", "-Body", "hi"]));
+        let delivered: Vec<String> = read_mail(&w.ctx, &caller, C)
+            .unwrap()
+            .iter()
+            .map(|m| text(m.get("text")).rsplit('\n').next().unwrap().to_string())
+            .collect();
+        if rival == "none" {
+            assert!(got.is_ok(), "{rival}: {got:?}");
+            assert_eq!(delivered, ["hi"], "{rival}");
+        } else {
+            let e = got.unwrap_err();
+            assert_eq!((e.code, e.check), (2, "target"), "{rival}: {}", e.message);
+            assert!(delivered.is_empty(), "{rival}");
+        }
+        w.fakes.hc_done().unwrap();
+    }
+}
