@@ -26,6 +26,7 @@ const COPILOT_FLAGS: [&str; 2] = ["--no-sandbox", "--allow-all"];
 pub(crate) const CMDLINE_MAX: usize = 32767;
 const EXE_RESERVE: usize = 1024;
 const MODEL_MAX: usize = 64;
+const BRIEF: &str = "this agent starts brief-only, so an agent caller passes -BriefFile";
 const ENTRY: &str =
     "mux-agent entry path may hold only letters, digits, spaces and _ \\ / : . ( ) -";
 
@@ -217,6 +218,15 @@ pub fn spawn(ctx: &Ctx, request: &Request) -> Res<Map<String, Value>> {
             };
             let snapshot = super::membership::Snapshot::for_spawn(ctx, &caller, core)?;
             registry::reap_hc(ctx, &caller, &snapshot)?;
+            // The brief rule as far as the request decides it: after the caller's standing (the gate), before the
+            // name and a member's debit (#103 D5: a refused request spends no token). allocate checks it again; only a
+            // Copilot fork whose copy fails verification turns brief there, after the debit, as a failed launch does.
+            if caller.kind == Kind::Agent
+                && brief.is_none()
+                && context_plan(&caller, client, &ctx.env, no_fork).context == Context::Brief
+            {
+                return refuse(2, "brief", BRIEF);
+            }
             let placed = gate
                 .as_ref()
                 .map(|a| {
@@ -346,11 +356,7 @@ impl Launch<'_> {
         }
         // A verified fork copy is retained as transaction evidence if a later step fails.
         if plan.context == Context::Brief && caller.kind == Kind::Agent && self.brief.is_none() {
-            return refuse(
-                2,
-                "brief",
-                "this agent starts brief-only, so an agent caller passes -BriefFile",
-            );
+            return refuse(2, "brief", BRIEF);
         }
         Ok(Agent {
             folder: state.join("agents").join(&id),

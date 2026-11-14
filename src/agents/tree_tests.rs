@@ -1057,3 +1057,60 @@ fn a_candidate_resume_is_refused_with_no_side_effects() {
     );
     m.w.fakes.hc_done().unwrap();
 }
+/// A request refused by itself spends no token (#103 D5): a proven member's brief child with no -BriefFile refuses 2
+/// `brief` under the team lock, after its standing and the snapshot, before the debit and any launch.
+#[test]
+fn a_refused_request_spends_no_token() {
+    let mut m = member_world();
+    m.w.file("t.md", b"task");
+    m.hc();
+    let t = term(&m.r, Some(150));
+    m.rounds(2, &t);
+    // What the launch would read under the team lock: connect, the caller's own terminal, then the snapshot.
+    cf::online(&m.w);
+    cf::get(&m.w, m.r["hcAddress"].as_str().unwrap(), t.clone());
+    cf::listing(&m.w, &crate::agents::membership::team(&m.c), &[]);
+    let mut all: Vec<(String, Value)> = [LEADER, ID, OTHER]
+        .iter()
+        .map(|id| {
+            let r = m.record(id);
+            (
+                r["hcAddress"].as_str().unwrap().to_string(),
+                if *id == ID { t.clone() } else { cf::wire(&r) },
+            )
+        })
+        .collect();
+    all.sort_by(|a, b| a.0.cmp(&b.0));
+    for (address, wire) in all {
+        cf::get(&m.w, &address, wire);
+    }
+    let args = [
+        "spawn",
+        "-Client",
+        "claude",
+        "-TaskFile",
+        "t.md",
+        "-Context",
+        "brief",
+        "-Name",
+        "child",
+    ]
+    .map(String::from);
+    let (code, out) = crate::cli::run(&args, || Ok(&m.w.ctx));
+    assert_eq!(
+        (code, out.contains(r#""check":"brief""#)),
+        (2, true),
+        "{out}"
+    );
+    assert!(
+        !crate::agents::budget::path(&m.state, "$3").exists(),
+        "no token spent"
+    );
+    assert!(
+        !m.w.fakes
+            .hc_calls()
+            .iter()
+            .any(|c| c.1.first().is_some_and(|a| a == "run")),
+        "refused before any launch"
+    );
+}
