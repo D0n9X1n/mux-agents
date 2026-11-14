@@ -10,6 +10,8 @@ pub struct Refusal {
     pub check: &'static str,
     pub message: String,
     pub reason: Option<&'static str>,
+    /// A session `up` created and could not remove (#103): the reply names it as `leftoverSession`.
+    pub leftover: Option<String>,
 }
 
 pub type Res<T> = Result<T, Refusal>;
@@ -20,6 +22,7 @@ pub fn refuse<T>(code: u8, check: &'static str, message: impl Into<String>) -> R
         check,
         message: message.into(),
         reason: None,
+        leftover: None,
     })
 }
 
@@ -31,6 +34,7 @@ impl Refusal {
             check: "internal",
             message: format!("unexpected error ({reason})"),
             reason: None,
+            leftover: None,
         }
     }
 }
@@ -43,6 +47,7 @@ impl From<io::Error> for Refusal {
             check: "internal",
             message: format!("unexpected error ({:?})", error.kind()),
             reason: None,
+            leftover: None,
         }
     }
 }

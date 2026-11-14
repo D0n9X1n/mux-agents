@@ -17,6 +17,7 @@ pub(crate) fn resolve(ctx: &Ctx) -> Res<Caller> {
             check: "herdr",
             message: crate::cli::HERDR.into(),
             reason: None,
+            leftover: None,
         })
 }
 fn prove(ctx: &Ctx) -> Res<Option<Caller>> {

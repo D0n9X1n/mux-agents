@@ -93,6 +93,7 @@ pub(crate) fn usage(verb: &str) -> Refusal {
         check: "usage",
         message: line.into(),
         reason: None,
+        leftover: None,
     }
 }
 

@@ -80,6 +80,7 @@ fn refusal(code: u8, check: &'static str, message: String) -> Refusal {
         check,
         message,
         reason: None,
+        leftover: None,
     }
 }
 

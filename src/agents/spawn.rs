@@ -544,6 +544,7 @@ pub fn header(
             check: "entry",
             message: ENTRY.into(),
             reason: None,
+            leftover: None,
         })?
         .replace('\\', "/");
     let mux = match ctx.mux.borrow().as_ref().map(|mux| mux.kind()) {

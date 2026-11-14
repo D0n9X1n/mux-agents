@@ -1789,6 +1789,7 @@ mod tests {
             check: "endpoint",
             message: "rmux endpoint did not answer".into(),
             reason: None,
+            leftover: None,
         }
     }
 

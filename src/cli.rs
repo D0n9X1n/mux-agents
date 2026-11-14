@@ -293,6 +293,9 @@ fn failure(verb: Option<&str>, refusal: &Refusal) -> Map<String, Value> {
     if let Some(reason) = refusal.reason {
         reply.insert("reason".into(), reason.into());
     }
+    if let Some(session) = &refusal.leftover {
+        reply.insert("leftoverSession".into(), session.clone().into());
+    }
     reply
 }
 
@@ -1824,6 +1827,14 @@ mod tests {
         ] {
             assert_eq!(launcher_spec(&args(tokens)), None, "{tokens:?}");
         }
+    }
+
+    #[test]
+    fn a_refusal_names_its_leftover_session() {
+        let mut r = Refusal::internal("x");
+        r.leftover = Some("p-1".into());
+        assert_eq!(failure(Some("up"), &r)["leftoverSession"], "p-1");
+        assert!(!failure(Some("up"), &Refusal::internal("x")).contains_key("leftoverSession"));
     }
 }
 

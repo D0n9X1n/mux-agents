@@ -112,6 +112,7 @@ fn admit(
                 check: "target",
                 message: "no member has that name or id".into(),
                 reason: None,
+                leftover: None,
             })?,
     };
     let id = &x.identity.id;

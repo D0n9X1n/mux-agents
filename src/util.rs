@@ -51,6 +51,13 @@ pub fn hex_id() -> io::Result<String> {
     Ok(hex(&bytes))
 }
 
+/// 32 lowercase hex characters: a session suffix or a release file name.
+pub fn hex32() -> io::Result<String> {
+    let mut bytes = [0u8; 16];
+    random_bytes(&mut bytes)?;
+    Ok(hex(&bytes))
+}
+
 /// A random (version 4) GUID in lowercase 8-4-4-4-12 form: a client session id.
 pub fn guid() -> io::Result<String> {
     let mut b = [0u8; 16];
@@ -283,5 +290,13 @@ mod tests {
         assert_eq!(age_seconds(created, at(1_700_000_000, 0)), Some(0));
         assert_eq!(age_seconds(created, at(1_699_999_000, 0)), Some(0));
         assert_eq!(age_seconds("garbage", at(1_700_000_005, 0)), None);
+    }
+
+    #[test]
+    fn hex32_is_32_lower_hex_and_random() {
+        let (a, b) = (hex32().unwrap(), hex32().unwrap());
+        assert!(
+            a.len() == 32 && a.bytes().all(|c| matches!(c, b'0'..=b'9' | b'a'..=b'f')) && a != b
+        );
     }
 }

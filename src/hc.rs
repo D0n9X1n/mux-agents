@@ -36,6 +36,7 @@ fn failure(message: &str) -> Refusal {
         check: "hc",
         message: message.into(),
         reason: None,
+        leftover: None,
     }
 }
 

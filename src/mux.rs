@@ -936,6 +936,7 @@ fn main() {
                 check: "endpoint",
                 message: OLD_TMUX.into(),
                 reason: None,
+                leftover: None,
             })
         );
         assert_eq!(Fakes::default().kind(), Kind::Tmux);
