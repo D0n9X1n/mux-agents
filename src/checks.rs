@@ -24,7 +24,7 @@ pub struct Plan {
 }
 
 const NAME_MAX: usize = 24;
-const RESERVED: [&str; 3] = ["parent", "root", "all"];
+const RESERVED: [&str; 6] = ["parent", "root", "all", "leader", "children", "team"];
 // The session file and workspace.yaml read at most this, like every state file.
 const FILE_MAX: u64 = crate::state::fs::STATE_MAX;
 
@@ -786,6 +786,24 @@ mod tests {
     const OTHER_SID: &str = "99999999-2222-4333-8444-555555555555";
     const CLAUDE: u32 = 150;
     const UNCONFIRMED: &str = "2 directory the caller's launch directory cannot be confirmed";
+
+    #[test]
+    fn team_words_are_reserved_names() {
+        for word in ["parent", "leader", "children", "team"] {
+            let r = resolve_name(Some(word), crate::parse::Client::Claude, "t", &[]);
+            assert!(r.is_err(), "{word} resolves");
+            let r = r.unwrap_err();
+            assert_eq!(
+                (r.code, r.check, r.message.as_str()),
+                (2, "name", "agent name is reserved"),
+                "{word}"
+            );
+        }
+        assert_eq!(
+            resolve_name(None, crate::parse::Client::Claude, "team", &[]).unwrap(),
+            "claude-1"
+        );
+    }
 
     fn strings(items: &[&str]) -> Vec<String> {
         items.iter().map(|s| s.to_string()).collect()
