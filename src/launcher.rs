@@ -77,8 +77,11 @@ pub(crate) fn run(ctx: &Ctx, spec: &str, err: &mut dyn FnMut(&str), start: Start
     })
 }
 
-/// Flushes every folder from the claim's `gens` up to the state root, so the claim and every folder entry on its
-/// path survive a crash or power loss: spawn made them, and none was flushed before.
+/// Flushes the claim's folder and every folder above it before the client may run, so no folder entry on the
+/// claim's path can vanish in a crash or power loss, whoever made it and whether or not its maker finished (#103).
+/// From `gens` up to the state root a failed flush is an error. Above the root it is best effort: mux-agent makes
+/// those folders only when the root is first made, and one that existed before is already on disk, while a
+/// folder such as `C:\Users` or `/home` may not open for writing.
 fn flush_claim(
     root: &Path,
     folder: &Path,
@@ -86,18 +89,22 @@ fn flush_claim(
 ) -> io::Result<()> {
     let gens = folder.join("gens");
     let depth = root.components().count();
-    for dir in gens.ancestors() {
+    let mut dirs = gens.ancestors();
+    for dir in dirs.by_ref() {
         // Every folder below the root is lexically under it; the first one at the root's depth is the root itself.
         let at_root = dir.components().count() == depth;
         if !at_root && !lexically_under(root, dir) {
-            break;
+            return Err(io::Error::other("the claim is not under the state root"));
         }
         sync(dir)?;
         if at_root {
-            return Ok(());
+            break;
         }
     }
-    Err(io::Error::other("the claim is not under the state root"))
+    for dir in dirs.filter(|d| !d.as_os_str().is_empty()) {
+        let _ = sync(dir);
+    }
+    Ok(())
 }
 
 /// The exit record a launcher that claimed its generation leaves when it fails before or instead of the client, so
@@ -642,8 +649,9 @@ mod tests {
         }
     }
 
-    // #103: a won claim, and every folder on its path up to the state root, is flushed to disk before the client
-    // runs; when a flush fails the claim stays `run`, an exit record is left, and the client never runs.
+    // #103: a won claim and every folder above it are flushed to disk before the client runs. A failed flush from
+    // `gens` up to the state root leaves the claim `run` and an exit record, and the client never runs; above the
+    // root a failed flush is ignored.
     #[test]
     fn generation_claim_is_flushed_before_the_client_runs() {
         let run_flushing = |l: &Launch, fail: bool| {
@@ -674,15 +682,17 @@ mod tests {
         assert_eq!(code, 0);
         assert_eq!(started, 1);
         let root = l.w.ctx.state_root.clone();
+        // gens, the agent folder, agents, the server folder, the root, then every folder above it.
         let want: Vec<PathBuf> = l
             .folder
             .join("gens")
             .ancestors()
-            .take_while(|d| d.components().count() >= root.components().count())
+            .filter(|d| !d.as_os_str().is_empty())
             .map(Path::to_path_buf)
             .collect();
         assert_eq!(synced, want);
-        assert_eq!(synced.last(), Some(&root));
+        assert!(synced.contains(&root));
+        assert!(synced.len() > 5);
         let l = setup("claude", json!([]));
         let (code, synced, started, err) = run_flushing(&l, true);
         assert_eq!((code, synced.len(), started), (1, 1, 0));
@@ -692,6 +702,28 @@ mod tests {
             Some(json!("run"))
         );
         assert_eq!(launcher_json(&l)["exitCode"], 1);
+        // Above the root a failed flush is ignored: the client runs.
+        let l = setup("claude", json!([]));
+        let depth = l.w.ctx.state_root.components().count();
+        let mut err = Vec::new();
+        let mut started = 0;
+        let code = run_with(
+            &l.w.ctx,
+            &spec_str(&l),
+            &mut |line: &str| err.push(line.to_string()),
+            &mut |_: &Path, _: &[String], _: &[&str]| {
+                started += 1;
+                Ok(0)
+            },
+            &mut |d: &Path| {
+                if d.components().count() < depth {
+                    Err(io::Error::other("no write access"))
+                } else {
+                    Ok(())
+                }
+            },
+        );
+        assert_eq!((code, started), (0, 1), "{err:?}");
     }
 
     #[cfg(unix)]
