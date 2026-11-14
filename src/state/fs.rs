@@ -77,11 +77,10 @@ pub fn sync_dir(dir: &Path) -> io::Result<()> {
     }
 }
 
-/// Flushes a folder above the state root, which may not be this user's. A folder this user cannot open to add a
-/// subfolder is skipped, on the assumption that the user could not have made a folder in it either. That holds for
-/// standard permissions (`C:\Users`, `/home`, a 0100 folder) but not for an ACL that denies only SYNCHRONIZE: there
-/// a folder can be made but the open is refused, and the entry is left unflushed (#103 follow-up). Any other failure
-/// is an error.
+/// Flushes a folder above the state root, which may not be this user's. A folder whose flush is refused is skipped
+/// only when this user cannot add an entry to it (`C:\Users`, `/home`, a 0100 folder): then no folder on the user's
+/// path can have been made in it by this user. Any other failure is an error, so an entry this user may have made is
+/// never left unflushed (#103).
 pub fn sync_ancestor(dir: &Path) -> io::Result<()> {
     match sync_dir(dir) {
         Ok(()) => Ok(()),
@@ -90,14 +89,24 @@ pub fn sync_ancestor(dir: &Path) -> io::Result<()> {
     }
 }
 
-/// Whether this user may add an entry to `dir`, after sync_dir's open was refused. Windows: taken as no, since that
-/// open asked only for FILE_APPEND_DATA, the right adding a folder takes (see sync_ancestor for the exception). Unix:
-/// write and search permission, as the kernel checks them for this user.
+/// Whether this user may add an entry to `dir`, after sync_dir's open was refused; true when unsure. Windows: a
+/// refused open does not prove a refused create (an ACL can deny only SYNCHRONIZE), so a probe folder is made and
+/// removed: only a create refused for permission answers no. Unix: write and search permission, as the kernel
+/// checks them for this user.
 fn may_add_entry(dir: &Path) -> bool {
     #[cfg(windows)]
     {
-        let _ = dir;
-        false
+        let Ok(guid) = crate::util::guid() else {
+            return true;
+        };
+        let probe = dir.join(format!(".mux-agents-probe-{guid}"));
+        match std::fs::create_dir(&probe) {
+            Ok(()) => {
+                let _ = std::fs::remove_dir(&probe);
+                true
+            }
+            Err(e) => e.kind() != io::ErrorKind::PermissionDenied,
+        }
     }
     #[cfg(not(windows))]
     {
@@ -259,6 +268,78 @@ mod tests {
         for above in dir.path().ancestors() {
             sync_ancestor(above).unwrap_or_else(|e| panic!("{}: {e}", above.display()));
         }
+    }
+
+    // #103 (review of 67de719): on Windows an ACL that denies only SYNCHRONIZE refuses the flush open but still lets
+    // the user make a folder there; that folder is an error, never skipped.
+    #[cfg(windows)]
+    #[test]
+    fn sync_ancestor_refuses_a_folder_the_user_can_add_to_but_not_flush() {
+        use std::os::windows::ffi::OsStrExt;
+        use windows_sys::Win32::Foundation::LocalFree;
+        use windows_sys::Win32::Security::Authorization::{
+            ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1, SE_FILE_OBJECT,
+            SetNamedSecurityInfoW,
+        };
+        use windows_sys::Win32::Security::{
+            DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES,
+        };
+        use windows_sys::Win32::Storage::FileSystem::CreateDirectoryW;
+        let wide = |s: &std::ffi::OsStr| s.encode_wide().chain(Some(0)).collect::<Vec<u16>>();
+        let dir = TempDir::new();
+        let odd = dir.path().join("nosync");
+        let name = wide(odd.as_os_str());
+        // Deny SYNCHRONIZE to everyone, allow everything else; children inherit only the allow.
+        let sddl = wide("D:P(D;;0x00100000;;;WD)(A;OICI;FA;;;WD)".as_ref());
+        let mut sd: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
+        // SAFETY: `sddl` is NUL-terminated; `sd` receives a LocalAlloc descriptor, freed below.
+        let ok = unsafe {
+            ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                sddl.as_ptr(),
+                SDDL_REVISION_1,
+                &mut sd,
+                std::ptr::null_mut(),
+            )
+        };
+        assert_ne!(ok, 0);
+        let attributes = SECURITY_ATTRIBUTES {
+            nLength: size_of::<SECURITY_ATTRIBUTES>() as u32,
+            lpSecurityDescriptor: sd,
+            bInheritHandle: 0,
+        };
+        // SAFETY: `name` is NUL-terminated and `attributes` points at a live descriptor.
+        let made = unsafe { CreateDirectoryW(name.as_ptr(), &attributes) };
+        // SAFETY: `sd` came from ConvertStringSecurityDescriptorToSecurityDescriptorW.
+        unsafe { LocalFree(sd) };
+        assert_ne!(made, 0);
+        let flush = sync_dir(&odd);
+        let ancestor = sync_ancestor(&odd);
+        let child = std::fs::create_dir(odd.join("child"));
+        // A NULL DACL again, so the temp folder can be removed whatever the asserts say.
+        // SAFETY: `name` is NUL-terminated; the null pointers mean no owner, group or SACL change and a NULL DACL.
+        let reset = unsafe {
+            SetNamedSecurityInfoW(
+                name.as_ptr(),
+                SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null(),
+                std::ptr::null(),
+            )
+        };
+        assert_eq!(reset, 0);
+        assert!(child.is_ok(), "{child:?}");
+        assert!(flush.is_err(), "the open was not refused: {flush:?}");
+        assert!(
+            ancestor.is_err(),
+            "a folder the user can add to was skipped"
+        );
+        let left: Vec<_> = std::fs::read_dir(&odd)
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(left, ["child"], "the probe folder was left behind");
     }
 
     // #103: a folder the user can add to but not open for a flush (Unix mode 0300) is an error, never skipped; one
