@@ -321,14 +321,14 @@ fn capture_requires_view_and_never_reopens() {
         }
         w.fakes.mux_rule("show-buffer", 0, "one\ntwo\n", "");
         for expected in [None, Some("%9")] {
-            let got = super::message::capture_hc(&w.ctx, &c, "worker", expected, 2);
+            let got = super::message::capture_hc(&w.ctx, &c, "worker", expected, 2, None);
             if present {
                 assert_eq!(got.unwrap().1, "one\ntwo");
             } else {
                 assert!(got.unwrap_err().message.contains("focus worker"));
             }
         }
-        assert!(super::message::capture_hc(&w.ctx, &c, "worker", Some("%8"), 2).is_err());
+        assert!(super::message::capture_hc(&w.ctx, &c, "worker", Some("%8"), 2, None).is_err());
         assert!(!w.fakes.mux_calls().iter().any(|a| a[1] == "new-window"
             || a[1] == "split-window"
             || (!present && a.iter().any(|s| s.contains("capture-pane")))));

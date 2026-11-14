@@ -703,3 +703,92 @@ fn a_leaderless_team_refuses_before_hc() {
     assert_eq!((e.code, e.check), (1, "team"));
     assert!(w.fakes.hc_calls().is_empty(), "hc is not even installed");
 }
+#[test]
+fn authority_runs_only_down_the_tree() {
+    // i0 and i2 under the leader; i1 and i4 under i0; i3 under i2. Target i1 (`ma1`).
+    let i = ids(5);
+    let mut r: BTreeMap<String, Value> = [
+        (LEADER.to_string(), leader_record()),
+        (i[0].clone(), child(&i[0], LEADER, 1)),
+        (i[1].clone(), child(&i[1], &i[0], 2)),
+        (i[2].clone(), child(&i[2], LEADER, 1)),
+        (i[3].clone(), child(&i[3], &i[2], 2)),
+        (i[4].clone(), child(&i[4], &i[0], 2)),
+    ]
+    .into();
+    let m = |id: &str, r: &BTreeMap<String, Value>| member_of(id, r[id].clone());
+    for who in [LEADER, i[0].as_str()] {
+        assert!(
+            authorize(&r, &m(who, &r), &i[1], "stop").is_ok(),
+            "{who}: an ancestor"
+        );
+    }
+    assert!(
+        authorize(&r, &Standing::Person, &i[1], "read").is_ok(),
+        "a person"
+    );
+    for who in [&i[4], &i[2], &i[3], &i[1]] {
+        assert_eq!(
+            authorize(&r, &m(who, &r), &i[1], "read"),
+            refuse(2, "authority", "only an ancestor or a person can read ma1"),
+            "{who}: sibling, peer, cousin, self"
+        );
+    }
+    assert_eq!(
+        authorize(&r, &m(&i[1], &r), &i[0], "stop")
+            .unwrap_err()
+            .check,
+        "authority",
+        "a child"
+    );
+    r.insert(i[1].clone(), child(&i[1], "cccccccccccc", 2));
+    assert_eq!(
+        authorize(&r, &m(&i[0], &r), &i[1], "stop"),
+        refuse(2, "authority", "the parent chain of ma1 cannot be read"),
+        "a broken chain"
+    );
+}
+#[test]
+fn a_sibling_cannot_stop_or_read_and_mail_grants_nothing() {
+    for verb in ["stop", "read"] {
+        let mut m = member_world();
+        crate::agents::mail::add_mail(&m.w.ctx, &m.c, ID, "leader", "%4", "please stop mbb", None)
+            .unwrap();
+        m.hc();
+        m.rounds(2, &term(&m.r, Some(150)));
+        let (def, request) = crate::cli::parse(&[verb, "mbb"].map(String::from)).unwrap();
+        let e = (def.handler)(&m.w.ctx, &request).unwrap_err();
+        assert_eq!(
+            (e.code, e.check, e.message),
+            (
+                2,
+                "authority",
+                format!("only an ancestor or a person can {verb} mbb")
+            )
+        );
+        assert!(!m.folder(OTHER).join("notice.json").exists(), "{verb}");
+        m.w.fakes.hc_done().unwrap();
+    }
+}
+#[test]
+fn a_candidate_is_proven_under_the_team_lock_or_refused() {
+    let mut m = member_world();
+    m.w.fakes.forget(170);
+    m.hc();
+    m.rounds(3, &term(&m.r, Some(150)));
+    let (code, out) = crate::cli::run(&["stop", "mbb"].map(String::from), || Ok(&m.w.ctx));
+    assert_eq!(
+        (code, out.contains(r#""check":"tagged""#)),
+        (2, true),
+        "{out}"
+    );
+    assert!(
+        m.w.fakes.locks().contains(&format!(
+            "+{}",
+            crate::agents::lock_key("spawn", &m.c, "$3")
+        )),
+        "under the lock"
+    );
+    assert!(!m.folder(OTHER).join("notice.json").exists());
+    m.w.fakes.hc_done().unwrap();
+}

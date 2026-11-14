@@ -455,6 +455,63 @@ pub fn place(
         name,
     })
 }
+/// stop, read <name>, resume: a person passes; a member only when its id is in the target's chain to the leader.
+/// Records only: mail grants nothing.
+pub fn authorize(
+    records: &BTreeMap<String, Value>,
+    standing: &Standing,
+    target: &str,
+    verb: &str,
+) -> Res<()> {
+    let Standing::Member(m) = standing else {
+        return Ok(());
+    };
+    if ancestors(records, target)?.contains(&m.id) {
+        return Ok(());
+    }
+    let name = records
+        .get(target)
+        .map_or(target.to_string(), |r| text(r.get("name")));
+    refuse(
+        2,
+        "authority",
+        format!("only an ancestor or a person can {verb} {name}"),
+    )
+}
+/// Runs `f` with the caller's standing under the team lock, held across the authority check and the action; None
+/// outside a team (0.2 rules; a candidate there refuses 2 `tagged`).
+pub fn with_standing<T>(
+    ctx: &Ctx,
+    caller: &Caller,
+    f: impl FnOnce(Option<&Standing>) -> Res<T>,
+) -> Res<T> {
+    if matches!(scope(ctx, caller)?, Scope::Outside) {
+        return if caller.candidate.is_some() {
+            Err(tagged())
+        } else {
+            f(None)
+        };
+    }
+    super::lock(
+        ctx,
+        &super::lock_key("spawn", caller, &caller.session),
+        || f(Some(&standing(ctx, caller, None)?)),
+    )
+}
+/// `authorize` over the session's local records.
+pub fn authority(
+    ctx: &Ctx,
+    caller: &Caller,
+    standing: &Standing,
+    target: &str,
+    verb: &str,
+) -> Res<()> {
+    let records = super::membership::locals(ctx, caller)?
+        .into_iter()
+        .map(|l| (l.identity.id, l.stored.record))
+        .collect();
+    authorize(&records, standing, target, verb)
+}
 #[cfg(test)]
 #[path = "tree_tests.rs"]
 pub(crate) mod tests;

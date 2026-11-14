@@ -290,7 +290,7 @@ fn adapters_resolve_duplicates_without_running_a_core_terminal() {
                 "%19"
             ),
             "capture" => assert_eq!(
-                message::capture_hc(&w.ctx, &c, "worker", Some("%19"), 2)
+                message::capture_hc(&w.ctx, &c, "worker", Some("%19"), 2, None)
                     .unwrap()
                     .1,
                 "one\ntwo"

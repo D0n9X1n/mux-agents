@@ -213,15 +213,18 @@ pub fn read(ctx: &Ctx, request: &Request) -> Res<Map<String, Value>> {
     if (named && request.value("Wait").is_some()) || (!named && request.value("Lines").is_some()) {
         return Err(usage("read"));
     }
-    let caller = resolve(ctx)?;
     let mut reply = Map::new();
     if named {
-        let (pane, tail) = capture_hc(ctx, &caller, first(request), None, lines)?;
+        let caller = crate::caller::resolve_tree(ctx)?;
+        let (pane, tail) = super::tree::with_standing(ctx, &caller, |s| {
+            capture_hc(ctx, &caller, first(request), None, lines, s)
+        })?;
         reply.insert("name".into(), pane.name.into());
         reply.insert("pane".into(), pane.pane.into());
         reply.insert("text".into(), tail.into());
         return Ok(reply);
     }
+    let caller = resolve(ctx)?;
     // One membership snapshot names the reader and serves the first reconciliation.
     let snapshot = super::membership::Snapshot::take(ctx, &caller)?;
     let me = snapshot.reader(&caller)?;
@@ -446,6 +449,7 @@ pub fn capture_hc(
     name: &str,
     expected: Option<&str>,
     lines: i32,
+    standing: Option<&super::tree::Standing>,
 ) -> Res<(registry::Pane, String)> {
     if !(1..=2000).contains(&lines) {
         return Err(usage("read"));
@@ -453,6 +457,9 @@ pub fn capture_hc(
     let id = super::member_target::named(ctx, caller, name)?;
     lock(ctx, &lock_key("member", caller, &id.id), || {
         let record = super::member_target::current(ctx, caller, &id)?;
+        if let Some(s) = standing {
+            super::tree::authority(ctx, caller, s, &id.id, "read")?;
+        }
         let Some(pane) = id.view(&record, &registry::rows(ctx, caller)?) else {
             return refuse(
                 2,
@@ -473,27 +480,32 @@ pub fn capture_hc(
 }
 
 pub fn stop_hc(ctx: &Ctx, request: &Request) -> Res<Map<String, Value>> {
-    let caller = resolve(ctx)?;
-    let id = super::member_target::named(ctx, &caller, first(request))?;
-    registry::with_member_notice(ctx, &caller, &id.id, || {
-        let record = super::member_target::current(ctx, &caller, &id)?;
-        parent_or_human(&caller, &record)?;
-        let core = crate::hc::connect(ctx)?;
-        core.kill(&id.address)?;
-        let fact = core.get(&id.address).ok().filter(|t| id.matches(t));
-        use super::lifecycle::{Life, classify};
-        let life = match classify(fact.as_ref(), &id.launcher) {
-            Life::Running => "running",
-            Life::Lost => "lost",
-            Life::Ended => "ended",
-            Life::Unknown => "unknown",
-        };
-        add_notice(ctx, &caller, &id.id, &record, Notice::Stopped)?;
-        let mut reply = Map::new();
-        reply.insert("name".into(), id.name.clone().into());
-        reply.insert("hcAddress".into(), id.address.clone().into());
-        reply.insert("life".into(), life.into());
-        Ok(reply)
+    let caller = crate::caller::resolve_tree(ctx)?;
+    super::tree::with_standing(ctx, &caller, |standing| {
+        let id = super::member_target::named(ctx, &caller, first(request))?;
+        registry::with_member_notice(ctx, &caller, &id.id, || {
+            let record = super::member_target::current(ctx, &caller, &id)?;
+            match standing {
+                Some(s) => super::tree::authority(ctx, &caller, s, &id.id, "stop")?,
+                None => parent_or_human(&caller, &record)?,
+            }
+            let core = crate::hc::connect(ctx)?;
+            core.kill(&id.address)?;
+            let fact = core.get(&id.address).ok().filter(|t| id.matches(t));
+            use super::lifecycle::{Life, classify};
+            let life = match classify(fact.as_ref(), &id.launcher) {
+                Life::Running => "running",
+                Life::Lost => "lost",
+                Life::Ended => "ended",
+                Life::Unknown => "unknown",
+            };
+            add_notice(ctx, &caller, &id.id, &record, Notice::Stopped)?;
+            let mut reply = Map::new();
+            reply.insert("name".into(), id.name.clone().into());
+            reply.insert("hcAddress".into(), id.address.clone().into());
+            reply.insert("life".into(), life.into());
+            Ok(reply)
+        })
     })
 }
 
