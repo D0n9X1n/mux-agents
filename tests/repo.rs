@@ -2477,3 +2477,35 @@ fn live_core_installer_precedes_tests() {
         assert!(script.contains(needle), "{needle}");
     }
 }
+
+#[test]
+fn legacy_stop_authority_is_absent() {
+    let message = repo_file("src/agents/message.rs");
+    let production = message.split("#[cfg(test)]").next().unwrap();
+    for token in [
+        "fn stop(",
+        "fn tree(",
+        "ctx.os.table(",
+        "ctx.os.kill(",
+        "kill-pane",
+    ] {
+        assert!(
+            !production.contains(token),
+            "legacy target authority: {token}"
+        );
+    }
+    for file in [
+        "src/proc/mod.rs",
+        "src/proc/unix.rs",
+        "src/proc/windows.rs",
+        "src/proc/linux.rs",
+        "src/proc/macos.rs",
+        "src/testing.rs",
+    ] {
+        assert!(
+            !repo_file(file).contains("stop_report"),
+            "obsolete stop report in {file}"
+        );
+    }
+    assert!(!repo_file("src/proc/seam.rs").contains("pub fn hold<"));
+}

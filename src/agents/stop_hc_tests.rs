@@ -1,11 +1,13 @@
 use super::{
     core_fixture as cf,
     fixture::{ID, World},
-    message, registry,
+    registry,
 };
 use serde_json::{Value, json};
 fn call(w: &World) -> crate::error::Res<serde_json::Map<String, Value>> {
-    message::stop_hc(&w.ctx, &w.request(&["stop", "worker"]))
+    let args = ["stop", "worker"].map(str::to_string);
+    let (def, request) = crate::cli::parse(&args).unwrap();
+    (def.handler)(&w.ctx, &request)
 }
 #[test]
 fn stop_uses_hc_only() {
@@ -106,6 +108,7 @@ fn stop_uses_hc_only() {
             .unwrap();
         w.fakes.hc_done().unwrap();
         let snapshot = super::membership::Snapshot {
+            view_order: Vec::new(),
             facts: super::core_facts::Snapshot {
                 local: vec![super::core_facts::Observation {
                     identity: id,
@@ -204,4 +207,125 @@ fn stop_rejects_uncommitted_member_during_named_selection() {
     assert!(!folder.join("notice.json").exists());
     assert!(!w.state().join("mail/pane-1.jsonl").exists());
     w.fakes.hc_done().unwrap();
+}
+
+#[test]
+fn stop_ignores_view_and_launcher_process_evidence() {
+    for (pid, command) in [
+        ("0", "sh"),
+        ("1", "sh"),
+        ("300", "sh"),
+        ("", "hc attach taaaaaaaaaaaa"),
+    ] {
+        let w = World::human("");
+        let r = cf::member(&w, ID, json!({}));
+        let mut row = super::fixture::row_of(&format!("%9|@5|{pid}|bbbbbbbbbbbb|other"), &[]);
+        row.command = command.into();
+        row.dead = pid.is_empty();
+        w.pane_rows(&[row]);
+        write(
+            &w.folder(ID).join("launcher.json"),
+            json!({"pid":300,"start":999,"exitCode":7}),
+        );
+        cf::online(&w);
+        cf::answer(&w, &["kill", "taaaaaaaaaaaa", "--json"], "{}");
+        let mut t = cf::wire(&r);
+        t["state"] = json!("finished");
+        t["reason"] = json!("killed");
+        cf::get(&w, "taaaaaaaaaaaa", t);
+        w.fakes.clear_log();
+        assert_eq!(
+            Value::Object(call(&w).unwrap()).to_string(),
+            r#"{"name":"worker","hcAddress":"taaaaaaaaaaaa","life":"ended"}"#
+        );
+        assert_eq!(w.fakes.mux_calls().len(), 1);
+        assert!(
+            !w.fakes
+                .os_calls()
+                .iter()
+                .any(|a| a == "table" || a.starts_with("kill ") || a == "open 300")
+        );
+        w.fakes.hc_done().unwrap();
+    }
+}
+#[test]
+fn stop_refuses_legacy_records_without_core_calls() {
+    let w = World::human("");
+    w.agent_record(ID, json!({}));
+    w.fakes.hc_install("hc");
+    let e = call(&w).unwrap_err();
+    assert_eq!(
+        (e.code, e.check, e.message.as_str()),
+        (2, "target", "no unique committed member has that identity")
+    );
+    assert!(!w.folder(ID).join("notice.json").exists());
+    assert!(w.fakes.hc_calls().is_empty());
+    w.fakes.hc_done().unwrap();
+}
+#[test]
+fn stop_notice_race_is_not_lifecycle_authority() {
+    let w = World::human("");
+    let r = cf::member(&w, ID, json!({}));
+    let file = w.folder(ID).join("notice.json");
+    let raced = file.clone();
+    w.fakes.lock_probe(move |event| {
+        if event.starts_with("+notice|") {
+            write(&raced, json!({"kind":"exited","exitCode":7,"at":"x"}));
+        }
+        String::new()
+    });
+    cf::online(&w);
+    cf::answer(&w, &["kill", "taaaaaaaaaaaa", "--json"], "{}");
+    cf::get(&w, "taaaaaaaaaaaa", cf::wire(&r));
+    assert_eq!(
+        Value::Object(call(&w).unwrap()).to_string(),
+        r#"{"name":"worker","hcAddress":"taaaaaaaaaaaa","life":"running"}"#
+    );
+    assert_eq!(
+        std::fs::read_to_string(file).unwrap(),
+        r#"{"kind":"exited","exitCode":7,"at":"x"}"#
+    );
+    assert!(!w.state().join("mail/pane-1.jsonl").exists());
+    w.fakes.hc_done().unwrap();
+}
+#[test]
+fn stop_resolves_reused_name_beyond_board_history_limit() {
+    let w = World::human("");
+    let a = cf::member(&w, ID, json!({"createdAt":"2026-11-13T10:00:00Z"}));
+    let b = cf::member(
+        &w,
+        "bbbbbbbbbbbb",
+        json!({"createdAt":"2026-11-13T10:01:00Z"}),
+    );
+    for n in 0..11 {
+        cf::member(
+            &w,
+            &format!("{n:012x}"),
+            json!({"name":format!("other{n}"),"createdAt":format!("2026-11-13T11:{n:02}:00Z")}),
+        );
+    }
+    for mode in ["live", "ended"] {
+        cf::online(&w);
+        let mut old = cf::wire(&a);
+        old["state"] = json!("finished");
+        old["reason"] = json!("exited");
+        let mut fresh = cf::wire(&b);
+        if mode == "ended" {
+            fresh["state"] = json!("finished");
+            fresh["reason"] = json!("exited");
+        }
+        cf::get(&w, "taaaaaaaaaaaa", old);
+        cf::get(&w, "tbbbbbbbbbbbb", fresh);
+        cf::online(&w);
+        cf::answer(&w, &["kill", "tbbbbbbbbbbbb", "--json"], "{}");
+        let mut killed = cf::wire(&b);
+        killed["state"] = json!("finished");
+        killed["reason"] = json!("killed");
+        cf::get(&w, "tbbbbbbbbbbbb", killed);
+        assert_eq!(
+            Value::Object(call(&w).unwrap()).to_string(),
+            r#"{"name":"worker","hcAddress":"tbbbbbbbbbbbb","life":"ended"}"#
+        );
+        w.fakes.hc_done().unwrap();
+    }
 }

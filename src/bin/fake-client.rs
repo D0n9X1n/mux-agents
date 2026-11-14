@@ -24,7 +24,7 @@
 //!   descendant that outlives its pane; whoever starts one kills it.
 //! - Each line read on stdin (what `send` types into the pane) is appended to `input.<pid>.log`.
 //! - Quit: `quit` (all clients) or `quit.<pid>` appearing makes the client write `exited.<pid>` (its exit code) and
-//!   exit with `MUX_IT_EXIT`.
+//!   exit with numeric `quit.<pid>` contents overriding `MUX_IT_EXIT`; empty, invalid or missing contents keep it.
 
 use std::ffi::OsString;
 use std::io::{BufRead, IsTerminal, Write};
@@ -37,7 +37,7 @@ use serde_json::{Map, Value, json};
 const POLL: Duration = Duration::from_millis(50);
 
 // The variables a client record carries; never the whole environment.
-const ENV: [&str; 9] = [
+const ENV: [&str; 10] = [
     "MUX_AGENTS_STATE",
     "CLAUDE_CODE_SESSION_ID",
     "CLAUDE_CODE_ENTRYPOINT",
@@ -47,6 +47,7 @@ const ENV: [&str; 9] = [
     "RMUX",
     "HOME",
     "MUX_IT_EXIT",
+    "HC_TERMINAL_ID",
 ];
 
 fn main() {
@@ -109,6 +110,7 @@ fn main() {
     let mut taken = 0;
     loop {
         if dir.join("quit").exists() || dir.join(format!("quit.{pid}")).exists() {
+            let code = quit_code(&dir, pid, code);
             write_whole(&dir.join(format!("exited.{pid}")), format!("{code}\n"));
             std::process::exit(code);
         }
@@ -123,6 +125,13 @@ fn main() {
         }
         std::thread::sleep(POLL);
     }
+}
+
+fn quit_code(dir: &Path, pid: u32, fallback: i32) -> i32 {
+    std::fs::read_to_string(dir.join(format!("quit.{pid}")))
+        .ok()
+        .and_then(|s| s.trim().parse().ok())
+        .unwrap_or(fallback)
 }
 
 struct Runner {
@@ -234,5 +243,24 @@ fn append(path: &Path, text: &str) {
         .open(path)
     {
         let _ = file.write_all(text.as_bytes());
+    }
+}
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn client_record_includes_core_terminal_address() {
+        assert!(super::ENV.contains(&"HC_TERMINAL_ID"));
+    }
+
+    #[test]
+    fn quit_file_owns_exit_code() {
+        let d = std::env::temp_dir().join(format!("mux-quit-{}", std::process::id()));
+        std::fs::create_dir(&d).unwrap();
+        assert_eq!(super::quit_code(&d, 7, 3), 3);
+        for (text, want) in [("7\n", 7), ("", 3), ("invalid", 3)] {
+            std::fs::write(d.join("quit.7"), text).unwrap();
+            assert_eq!(super::quit_code(&d, 7, 3), want);
+        }
+        std::fs::remove_dir_all(d).unwrap();
     }
 }

@@ -82,11 +82,57 @@ pub struct Snapshot {
     pub facts: core_facts::Snapshot,
     pub records: BTreeMap<String, Stored>,
     pub views: BTreeMap<String, registry::Pane>,
+    pub view_order: Vec<String>,
     pub core_error: Option<Refusal>,
     pub view_error: Option<Refusal>,
 }
 
 impl Snapshot {
+    /// Resolve only the mailbox reader; notices never determine current membership.
+    pub fn reader(&self, caller: &Caller) -> Res<registry::Me> {
+        if let Some(error) = &self.view_error {
+            return Err(error.clone());
+        }
+        let mine: Vec<_> = self
+            .facts
+            .local
+            .iter()
+            .filter(|o| {
+                self.records[&o.identity.id]
+                    .record
+                    .get("pane")
+                    .and_then(Value::as_str)
+                    == Some(caller.pane.as_str())
+            })
+            .collect();
+        match mine.as_slice() {
+            [o] if o.life == super::lifecycle::Life::Running
+                && self.records[&o.identity.id].committed
+                && self
+                    .views
+                    .get(&o.identity.id)
+                    .is_some_and(|p| p.pane == caller.pane) =>
+            {
+                Ok(registry::Me {
+                    name: o.identity.name.clone(),
+                    key: o.identity.id.clone(),
+                    record: Some(self.records[&o.identity.id].record.clone()),
+                })
+            }
+            [] if caller.agent_tag.is_empty() => Ok(registry::Me {
+                name: "root".into(),
+                key: super::mail::mailbox_key(&caller.pane, "")?,
+                record: None,
+            }),
+            [] => crate::error::refuse(2, "parent", "this agent pane has no record"),
+            _ => crate::error::refuse(
+                2,
+                "parent",
+                "this pane's agent cannot be proven to run here",
+            ),
+        }
+    }
+
     pub fn take(ctx: &Ctx, caller: &Caller) -> Res<Self> {
         let local = locals(ctx, caller)?;
         let ids: Vec<_> = local.iter().map(|l| l.identity.clone()).collect();
@@ -158,7 +204,17 @@ impl Snapshot {
             }
             records.insert(l.identity.id, l.stored);
         }
+        let view_order = rows
+            .iter()
+            .flat_map(|row| {
+                views
+                    .iter()
+                    .filter(move |(_, p)| p.pane == row.pane)
+                    .map(|(id, _)| id.clone())
+            })
+            .collect();
         Self {
+            view_order,
             facts,
             records,
             views,

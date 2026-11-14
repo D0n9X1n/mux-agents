@@ -343,3 +343,150 @@ fn only_ended_releases_name_and_capacity() {
     );
     w.fakes.hc_done().unwrap();
 }
+
+#[test]
+fn reader_uses_hc_life_commit_and_view_not_tags_or_notices() {
+    for case in [
+        "root",
+        "tag-only",
+        "running",
+        "noticed",
+        "uncommitted",
+        "ended",
+        "lost",
+        "unknown",
+        "detached",
+        "duplicate",
+        "view-error",
+    ] {
+        let w = World::human("");
+        let mut caller = w.caller();
+        let r = f::member(&w, ID, json!({"pane":"%1","window":"@1"}));
+        let mut t = f::wire(&r);
+        match case {
+            "ended" => {
+                t["state"] = json!("finished");
+                t["reason"] = json!("exited");
+            }
+            "lost" => t["argv"] = json!(["/bin/sh"]),
+            "unknown" => t["labels"]["mux.gen"] = json!("1"),
+            "noticed" => write(&w.folder(ID).join("notice.json"), json!({"kind":"stopped"})),
+            "uncommitted" => std::fs::remove_file(w.folder(ID).join("commit.json")).unwrap(),
+            _ => {}
+        }
+        if ["root", "tag-only"].contains(&case) {
+            caller.pane = "%2".into();
+        }
+        caller.agent_tag = if case == "tag-only" {
+            ID.into()
+        } else {
+            "bbbbbbbbbbbb".into()
+        };
+        if case == "root" {
+            caller.agent_tag.clear();
+        }
+        let mut row = crate::agents::fixture::row_of("%1|@1|100|bbbbbbbbbbbb|wrong", &[]);
+        row.command = "hc attach taaaaaaaaaaaa".into();
+        w.pane_rows(if case == "detached" {
+            &[]
+        } else {
+            std::slice::from_ref(&row)
+        });
+        if case == "view-error" {
+            w.fakes.mux_first("list-panes", 1, "", "down");
+        }
+        f::online(&w);
+        f::listing(&w, &team(&caller), &[]);
+        f::get(&w, "taaaaaaaaaaaa", t);
+        if case == "duplicate" {
+            let b = f::member(&w, "bbbbbbbbbbbb", json!({"pane":"%1","window":"@1"}));
+            f::get(&w, "tbbbbbbbbbbbb", f::wire(&b));
+        }
+        let snapshot = Snapshot::take(&w.ctx, &caller).unwrap();
+        let result = snapshot.reader(&caller);
+        match case {
+            "root" => assert_eq!(
+                result.unwrap(),
+                registry::Me {
+                    name: "root".into(),
+                    key: "pane-2".into(),
+                    record: None
+                }
+            ),
+            "running" | "noticed" => assert_eq!(
+                result.unwrap(),
+                registry::Me {
+                    name: "worker".into(),
+                    key: ID.into(),
+                    record: Some(r)
+                }
+            ),
+            "tag-only" => assert_eq!(result.unwrap_err().message, "this agent pane has no record"),
+            "view-error" => assert_eq!(result.unwrap_err(), snapshot.view_error.unwrap()),
+            _ => {
+                let e = result.unwrap_err();
+                assert_eq!(
+                    (e.code, e.check, e.message.as_str()),
+                    (
+                        2,
+                        "parent",
+                        "this pane's agent cannot be proven to run here"
+                    ),
+                    "{case}"
+                );
+            }
+        }
+        assert!(w.fakes.locks().is_empty());
+        w.fakes.hc_done().unwrap();
+    }
+}
+
+#[test]
+fn board_view_order_preserves_enumeration_without_promoting_tags() {
+    for mode in ["ordered", "duplicate", "view-error"] {
+        let w = World::human("");
+        let a = f::member(&w, ID, json!({"pane":"%9"}));
+        let b = f::member(&w, "bbbbbbbbbbbb", json!({"name":"second","pane":"%10"}));
+        let c = f::member(&w, "cccccccccccc", json!({"name":"detached","pane":"%2"}));
+        let mut rows = vec![
+            crate::agents::fixture::row_of("%10|@7|301|aaaaaaaaaaaa|wrong", &[]),
+            crate::agents::fixture::row_of("%9|@6|300|bbbbbbbbbbbb|wrong", &[]),
+        ];
+        rows[0].command = "hc attach tbbbbbbbbbbbb".into();
+        rows[1].command = "hc attach taaaaaaaaaaaa".into();
+        if mode == "duplicate" {
+            rows.push(rows[1].clone());
+        }
+        w.pane_rows(&rows);
+        if mode == "view-error" {
+            w.fakes.mux_first("list-panes", 1, "", "down");
+        }
+        let caller = w.caller();
+        f::online(&w);
+        f::listing(&w, &team(&caller), &[]);
+        for r in [&a, &b, &c] {
+            f::get(&w, r["hcAddress"].as_str().unwrap(), f::wire(r));
+        }
+        w.fakes.clear_log();
+        let snapshot = Snapshot::take(&w.ctx, &caller).unwrap();
+        let want: &[&str] = match mode {
+            "ordered" => &["bbbbbbbbbbbb", "aaaaaaaaaaaa"],
+            "duplicate" => &["bbbbbbbbbbbb"],
+            _ => &[],
+        };
+        assert_eq!(snapshot.view_order, want, "{mode}");
+        assert!(!snapshot.views.contains_key("cccccccccccc"));
+        assert_eq!(snapshot.facts.count(), 3);
+        assert_eq!(w.fakes.mux_calls().len(), 1);
+        assert!(crate::agents::fixture::list_call(&w.fakes.mux_calls()[0]));
+        assert_eq!(
+            w.fakes
+                .hc_calls()
+                .iter()
+                .map(|(_, a, _)| a[0].as_str())
+                .collect::<Vec<_>>(),
+            ["--version", "ls", "get", "get", "get"]
+        );
+        w.fakes.hc_done().unwrap();
+    }
+}

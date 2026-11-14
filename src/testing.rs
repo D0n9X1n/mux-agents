@@ -10,7 +10,7 @@ use crate::ctx::{Clock, Ctx, Env};
 use crate::error::Res;
 use crate::mux::{Kind, Mux, Output};
 use crate::parse::Client;
-use crate::proc::{Left, Opened, Os, Row, Signals, Token};
+use crate::proc::{Opened, Os, Row, Signals, Token};
 
 // Answers a matching call from its argv: stateful fakes (a pane table, a queue of probe answers, a failure).
 type Script = Rc<dyn Fn(&[String]) -> Res<Output>>;
@@ -33,9 +33,6 @@ type Probe = Rc<dyn Fn(&str) -> String>;
 type Wake = Rc<dyn Fn(usize)>;
 type Read = Rc<dyn Fn(u64)>;
 type HcProbe = Rc<dyn Fn(&[String])>;
-
-// What `stop_report` answers for the rows stop left.
-type Report = fn(&[Left]) -> serde_json::Map<String, serde_json::Value>;
 
 struct HcAnswer {
     argv: Option<Vec<String>>,
@@ -68,9 +65,6 @@ struct Log {
     // `+key` on taking a lock and `-key` on releasing it, each followed by the probe's answer when one is set.
     locks: Vec<String>,
     held: Vec<String>,
-    // Pids whose kill shows an exit; any other kill fails.
-    kills: Vec<u32>,
-    report: Option<Report>,
     probe: Option<Probe>,
     wake: Option<Wake>,
     read: Option<Read>,
@@ -286,19 +280,6 @@ impl Fakes {
             .extend(starts.iter().copied());
     }
 
-    /// A kill of this pid shows the exit.
-    pub fn kill_ok(&self, pid: u32) {
-        self.0.borrow_mut().kills.push(pid);
-    }
-
-    /// What `stop_report` answers; none answers an empty map.
-    pub fn stop_report_with(
-        &self,
-        report: fn(&[Left]) -> serde_json::Map<String, serde_json::Value>,
-    ) {
-        self.0.borrow_mut().report = Some(report);
-    }
-
     /// Moves the last listed row to the front, so `row` answers it for its pid.
     pub fn prefer_last(&self) {
         let mut log = self.0.borrow_mut();
@@ -502,7 +483,7 @@ impl Os for Fakes {
 
     fn kill(&self, opened: Opened) -> bool {
         self.os_call(format!("kill {}", opened.pid));
-        self.0.borrow().kills.contains(&opened.pid)
+        false
     }
 
     fn cwd(&self, pid: u32) -> Option<String> {
@@ -522,11 +503,6 @@ impl Os for Fakes {
 
     fn same_start(&self, opened: i64, listed: i64) -> bool {
         opened == listed
-    }
-
-    fn stop_report(&self, left: &[Left]) -> serde_json::Map<String, serde_json::Value> {
-        let report = self.0.borrow().report;
-        report.map_or_else(serde_json::Map::new, |report| report(left))
     }
 
     fn token(&self) -> Option<Token> {

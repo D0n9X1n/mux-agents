@@ -917,7 +917,7 @@ exec claude --dangerously-skip-permissions
     }
 
     // spawn writes server.json, record.json, spec.json and last commit.json, tags the pane, and its launcher (the
-    // pane's process) runs the PATH client with the record's session.
+    // core-owned process) runs the PATH client with the record's session.
     fn spawn_tags_pane_writes_record_and_commit_runs_client(mux: Mux) {
         let Some(mut live) = Live::human(mux) else {
             return;
@@ -1005,10 +1005,7 @@ exec claude --dangerously-skip-permissions
             argv[5]
         );
         assert_eq!(client["cwd"], live.path("work"), "{mux:?}");
-        let pane_pid: u64 = live.num(pane, "#{pane_pid}");
-        assert_eq!(client["ppid"], pane_pid, "{mux:?}");
-        let launcher = json_file(&folder.join("launcher.json"));
-        assert_eq!(launcher["pid"], pane_pid, "{mux:?}");
+        let launcher = core_launcher(&live, &w1, &client);
         assert!(launcher["start"].is_i64(), "{mux:?} {launcher}");
         let (code, list) = live.run(&["list"]);
         assert_eq!(
@@ -1018,8 +1015,21 @@ exec claude --dangerously-skip-permissions
         );
     }
 
-    // Each worker is the PATH claude, forked from the caller's session, the pane's own process's child, in its own
-    // terminal.
+    fn core_launcher(live: &Live, w: &Value, client: &Value) -> Value {
+        let launcher = json_file(&live.agent_dir(s(&w["id"])).join("launcher.json"));
+        assert_eq!(client["ppid"], launcher["pid"]);
+        assert_ne!(
+            launcher["pid"],
+            live.num::<u64>(s(&w["pane"]), "#{pane_pid}")
+        );
+        assert_eq!(
+            core(live, &["get", s(&w["hcAddress"]), "--json"])["pid"],
+            launcher["pid"]
+        );
+        launcher
+    }
+
+    // Each worker is the PATH claude, forked from the caller's session, with a core-owned launcher and PTY.
     fn worker_is_path_claude_forked_own_tty(mux: Mux) {
         let Some(mut live) = Live::agent(mux) else {
             return;
@@ -1062,12 +1072,10 @@ exec claude --dangerously-skip-permissions
                 "{mux:?}"
             );
             let pane = s(&w["pane"]);
-            let pane_pid: u64 = live.num(pane, "#{pane_pid}");
-            assert_eq!(client["ppid"], pane_pid, "{mux:?}");
-            let launcher = json_file(&live.agent_dir(s(&w["id"])).join("launcher.json"));
-            assert_eq!(launcher["pid"], pane_pid, "{mux:?}");
+            let launcher = core_launcher(&live, &w, &client);
             let tty = tty_of(client["pid"].as_u64().unwrap());
-            assert_eq!(tty, live.field(pane, "#{pane_tty}"), "{mux:?}");
+            assert_eq!(tty, tty_of(launcher["pid"].as_u64().unwrap()));
+            assert_ne!(tty, live.field(pane, "#{pane_tty}"));
             ttys.push(tty);
         }
         let distinct: BTreeSet<&String> = ttys.iter().collect();
@@ -1301,6 +1309,7 @@ exec claude --dangerously-skip-permissions
             eventually(Duration::from_secs(30), || reply.is_file()),
             "{mux:?}: the report did not run"
         );
+        assert_eq!(json_file(&reply)["ok"], true);
         let (code, focused) = live.run(&["focus", "-Next"]);
         assert_eq!(
             (code, &focused["name"]),
@@ -1334,14 +1343,8 @@ exec claude --dangerously-skip-permissions
         let at = Instant::now();
         assert_eq!(code, 0, "{mux:?} {stop}");
         assert_eq!(
-            (&stop["name"], &stop["survivors"], &stop["survivorPids"]),
-            (&json!("w1"), &json!(0), &json!([])),
-            "{mux:?}"
-        );
-        assert_eq!(
-            stop["resume"],
-            format!("claude --resume {}", s(&w1["sessionId"])),
-            "{mux:?}"
+            stop,
+            json!({"ok":true,"verb":"stop","name":w1["name"],"hcAddress":w1["hcAddress"],"life":"ended"})
         );
         let (code, reply) = live.server.job_wait(job, LONG);
         let took = at.elapsed();
@@ -1355,7 +1358,11 @@ exec claude --dangerously-skip-permissions
             "{mux:?}: the reader took {took:?} after stop"
         );
         let (code, stop) = live.run(&["stop", "w2"]);
-        assert_eq!((code, &stop["survivors"]), (0, &json!(0)), "{mux:?} {stop}");
+        assert_eq!(
+            stop,
+            json!({"ok":true,"verb":"stop","name":w2["name"],"hcAddress":w2["hcAddress"],"life":"ended"})
+        );
+        assert_eq!(code, 0);
         let (code, read) = live.run(&["read", "-Wait", "30"]);
         assert_eq!(
             (code, bodies(&read)),
@@ -1364,22 +1371,19 @@ exec claude --dangerously-skip-permissions
         );
     }
 
-    // stop closes each pane and leaves no process of it unaccounted for: no quit file, no kill bypass. w1's worker
-    // has a child that outlives the pane (its own session, SIGHUP ignored), so kill-pane's hangup never ends it and
-    // only stop's tree walk can. With a pidfd (Linux) stop kills it and reports no survivor. Without one (macOS) the
-    // proc layer never signals a pid (MacOs::kill, pinned in src/proc/macos.rs), so stop must report it as the one
-    // survivor, and it is still there.
+    // Stop ends core-owned launchers and clients; attachment views disappear without a pane kill or quit file.
+    // The detached Unix child remains fixture-owned and is cleaned up by its Sentinels guard.
     fn stop_leaves_no_surviving_process(mux: Mux) {
         let Some(mut live) = Live::human(mux) else {
             return;
         };
-        let (mut pids, mut panes) = (Vec::new(), Vec::new());
+        let (mut pids, mut workers) = (Vec::new(), Vec::new());
         for (name, extra) in [("w1", &[][..]), ("w2", &["-Split", "h"][..])] {
             let w = live.spawn(name, extra);
             pids.push(live.worker_pid(&w) as u32);
             let launcher = json_file(&live.agent_dir(s(&w["id"])).join("launcher.json"));
             pids.push(launcher["pid"].as_u64().unwrap() as u32);
-            panes.push(s(&w["pane"]).to_string());
+            workers.push(w);
         }
         let worker = u64::from(pids[0]);
         let (code, detached) = live.server.command(worker, &["@detach"]);
@@ -1396,45 +1400,31 @@ exec claude --dangerously-skip-permissions
             worker,
             "{mux:?}: not the worker's child"
         );
-        for name in ["w1", "w2"] {
-            let (code, stop) = live.run(&["stop", name]);
-            assert_eq!(code, 0, "{mux:?} {stop}");
-            let survivors = if name == "w1" && cfg!(target_os = "macos") {
-                json!([child])
-            } else {
-                json!([])
-            };
+        for w in &workers {
+            let (code, stop) = live.run(&["stop", s(&w["name"])]);
+            assert_eq!(code, 0, "{stop}");
             assert_eq!(
-                (&stop["survivors"], &stop["survivorPids"]),
-                (&json!(survivors.as_array().unwrap().len()), &survivors),
-                "{mux:?} {name}"
+                stop,
+                json!({"ok":true,"verb":"stop","name":w["name"],"hcAddress":w["hcAddress"],"life":"ended"})
             );
+            assert!(eventually(LONG, || core(
+                &live,
+                &["get", s(&w["hcAddress"]), "--json"]
+            )["state"]
+                == "finished"));
+            live.wait_gone(s(&w["pane"]));
         }
-        let child_left = || support::alive(child) && support::start_of(child) == child_start;
-        if cfg!(target_os = "macos") {
-            assert!(
-                child_left(),
-                "{mux:?}: stop signalled a pid without a pidfd"
-            );
-        } else {
-            eventually(Duration::from_secs(10), || !child_left());
-            assert!(!child_left(), "{mux:?}: the child outlived stop");
-        }
-        for pane in &panes {
-            live.wait_gone(pane);
-        }
-        eventually(Duration::from_secs(10), || {
-            !pids.iter().any(|p| support::alive(*p))
-        });
-        let left: Vec<u32> = pids
+        assert!(eventually(LONG, || !pids
             .iter()
-            .copied()
-            .filter(|p| support::alive(*p))
-            .collect();
-        assert_eq!(pids.len(), 4, "{mux:?}");
-        assert_eq!(left, Vec::<u32>::new(), "{mux:?}: survivors of {pids:?}");
-        assert!(!live.dir.join("quit").exists(), "{mux:?}");
-        assert!(live.tagged().is_empty(), "{mux:?}");
+            .any(|p| support::alive(*p))));
+        assert!(
+            live.tagged().is_empty(),
+            "live agent view tags survived stop"
+        );
+        assert!(!live.dir.join("quit").exists());
+        for pid in pids.iter().copied().chain([child]) {
+            assert!(!live.dir.join(format!("quit.{pid}")).exists());
+        }
     }
 
     // A client that exits posts one `exited` notice with its code.
@@ -1442,53 +1432,50 @@ exec claude --dangerously-skip-permissions
         let Some(mut live) = Live::human(mux) else {
             return;
         };
-        live.call(&["set-environment", "-g", "MUX_IT_EXIT", "7"]);
+        live.close_bar();
         let w1 = live.spawn("w1", &[]);
         let client = live.server.client_by_session(s(&w1["sessionId"]));
-        assert_eq!(client["env"]["MUX_IT_EXIT"], "7", "{mux:?}");
         let pid = client["pid"].as_u64().unwrap();
-        support::write_atomic(&live.dir.join(format!("quit.{pid}")), "");
+        support::write_atomic(&live.dir.join(format!("quit.{pid}")), "7\n");
         assert_eq!(
             live.server.wait_file(&format!("exited.{pid}")).trim(),
             "7",
             "{mux:?}"
         );
-        live.wait_gone(s(&w1["pane"]));
         one_exited_notice(&mut live, &w1, 7);
     }
 
     // The single `exited` notice of `w` with `code`: notice.json, launcher.json, one mailbox line, one read.
     fn one_exited_notice(live: &mut Live, w: &Value, code: i64) {
-        let mux = live.mux();
         let folder = live.agent_dir(s(&w["id"]));
-        let rel = folder
-            .strip_prefix(live.dir.path())
-            .unwrap()
-            .join("notice.json");
-        let notice: Value =
-            serde_json::from_str(&live.server.wait_file(rel.to_str().unwrap())).unwrap();
+        let a = s(&w["hcAddress"]);
+        assert!(eventually(
+            LONG,
+            || core(live, &["get", a, "--json"])["state"] == "finished"
+        ));
+        assert!(!folder.join("notice.json").exists());
+        assert!(exit_messages(live, w).is_empty());
+        let (status, list) = live.run(&["list"]);
+        assert_eq!(status, 0, "{list}");
+        let notice = json_file(&folder.join("notice.json"));
         assert_eq!(
             (&notice["kind"], &notice["exitCode"]),
-            (&json!("exited"), &json!(code)),
-            "{mux:?}"
+            (&json!("exited"), &json!(code))
         );
-        assert_eq!(
-            json_file(&folder.join("launcher.json"))["exitCode"],
-            code,
-            "{mux:?}"
-        );
+        assert_eq!(json_file(&folder.join("launcher.json"))["exitCode"], code);
         let (status, read) = live.run(&["read"]);
-        let want = format!("{} exited with code {code}.", s(&w["name"]));
-        assert_eq!((status, bodies(&read)), (0, vec![want]), "{mux:?}");
-        let (_, again) = live.run(&["read"]);
-        assert_eq!(again["messages"], json!([]), "{mux:?}");
-        assert_eq!(live.mailbox(&live.root_box()).len(), 1, "{mux:?}");
-        let (_, all) = live.run(&["list", "-All"]);
         assert_eq!(
-            (&all["agents"][0]["name"], &all["agents"][0]["state"]),
-            (&w["name"], &json!("exited")),
-            "{mux:?}"
+            (status, bodies(&read)),
+            (
+                0,
+                vec![format!("{} exited with code {code}.", s(&w["name"]))]
+            )
         );
+        assert_eq!(live.run(&["read"]).1["messages"], json!([]));
+        assert_eq!(exit_messages(live, w).len(), 1);
+        let (_, all) = live.run(&["list", "-All"]);
+        assert_eq!(all["agents"][0]["state"], format!("exited {code}"));
+        assert_eq!(all["agents"][0]["life"], "ended");
     }
 
     // A PATH `claude` that cannot start (its shebang names a missing interpreter, so the start fails NotFound) still
@@ -1498,12 +1485,12 @@ exec claude --dangerously-skip-permissions
         let Some(mut live) = Live::human(mux) else {
             return;
         };
+        live.close_bar();
         let claude = live.dir.join("bin/claude");
         std::fs::remove_file(&claude).unwrap();
         std::fs::write(&claude, "#!/nonexistent/mux-it/interpreter\n").unwrap();
         std::fs::set_permissions(&claude, std::fs::Permissions::from_mode(0o755)).unwrap();
         let w1 = live.spawn("w1", &[]);
-        live.wait_gone(s(&w1["pane"]));
         one_exited_notice(&mut live, &w1, 1);
         assert!(
             !live.dir.join("clients.log").exists(),
@@ -1573,28 +1560,18 @@ exec claude --dangerously-skip-permissions
             .output()
             .unwrap();
         assert_ne!(dead.status.code(), Some(0), "{mux:?}");
-        // mux-agent ends the gone pane's agent with one notice (lost, or exited if its launcher outlived the pane)
-        // and keeps the live one.
-        let (code, all) = live.run(&["list", "-All"]);
-        assert_eq!(code, 0, "{mux:?} {all}");
-        let state = |name: &str| {
-            all["agents"]
+        assert_detached_running(&mut live, &w1);
+        assert!(exit_messages(&live, &w2).is_empty());
+        let (_, list) = live.run(&["list"]);
+        assert_eq!(
+            list["agents"]
                 .as_array()
                 .unwrap()
                 .iter()
-                .find(|a| a["name"] == name)
-                .map(|a| s(&a["state"]).to_string())
-        };
-        assert_eq!(state("w2").as_deref(), Some("running"), "{mux:?} {all}");
-        assert!(
-            matches!(state("w1").as_deref(), Some("lost" | "exited")),
-            "{mux:?} {all}"
+                .find(|r| r["name"] == "w2")
+                .unwrap()["view"],
+            "attached"
         );
-        assert!(
-            live.agent_dir(s(&w1["id"])).join("notice.json").is_file(),
-            "{mux:?}"
-        );
-        assert_eq!(live.mailbox(&live.root_box()).len(), 1, "{mux:?}");
     }
 
     // A bar's live row (S2.1): `◉ w[12] … working <n>[sm]`.
@@ -2525,6 +2502,7 @@ exec claude --dangerously-skip-permissions
         let w2 = live.spawn("w2", &[]);
         let (code, stop) = live.run(&["stop", "w2"]);
         assert_eq!(code, 0, "{mux:?} {stop}");
+        live.wait_gone(s(&w2["pane"]));
         let (code, all) = live.run(&["list", "-All"]);
         assert_eq!(code, 0, "{mux:?} {all}");
         let keys = |v: &Value| v.as_object().unwrap().keys().cloned().collect::<Vec<_>>();
@@ -2581,10 +2559,13 @@ exec claude --dangerously-skip-permissions
                 want_keys.push("exitCode");
                 assert_eq!(row["exitCode"], Value::Null, "{mux:?} {row}");
             }
+            want_keys.extend(["life", "view", "hcAddress"]);
             assert_eq!(keys(row), want_keys, "{mux:?}");
             let want = json!({
-                "name": w["name"], "client": "claude", "pane": w["pane"], "window": w["window"], "context": "brief",
+                "name": w["name"], "client": "claude", "pane": if state=="running" {w["pane"].clone()} else {Value::Null}, "window": if state=="running" {w["window"].clone()} else {Value::Null}, "context": "brief",
                 "parent": root, "sessionId": w["sessionId"], "directory": live.path("work"), "state": state,
+                "life": if state=="running" {"running"} else {"ended"},
+                "view": if state=="running" {"attached"} else {"detached"}, "hcAddress": w["hcAddress"],
                 "doing": "say hi", "doingFrom": "task", "unread": unread, "model": null,
             });
             for (field, value) in want.as_object().unwrap() {
@@ -2848,7 +2829,8 @@ exec claude --dangerously-skip-permissions
         );
     }
 
-    // Through every verb, mux-agent starts only the multiplexer and the clients.
+    // Through every verb, mux-agent starts only the multiplexer, core CLI, and clients.
+    // Core launcher argv and the mux-owned attachment command are checked separately from the spawn audit.
     fn children_are_only_mux_and_client(mux: Mux) {
         let Some(mut live) = Live::human(mux) else {
             return;
@@ -2858,6 +2840,17 @@ exec claude --dangerously-skip-permissions
         assert_eq!(code, 0, "{mux:?} {w2}");
         live.worker_pid(&w1);
         live.worker_pid(&w2);
+        for w in [&w1, &w2] {
+            let r = json_file(&live.agent_dir(s(&w["id"])).join("record.json"));
+            assert_eq!(
+                core(&live, &["get", s(&w["hcAddress"]), "--json"])["argv"],
+                r["launcherArgv"]
+            );
+            assert_eq!(
+                live.field(s(&w["pane"]), "#{pane_start_command}"),
+                s(&r["startCommand"])
+            );
+        }
         std::fs::write(live.dir.join("to-w1.txt"), "hello w1").unwrap();
         let body = live.path("to-w1.txt");
         for args in [
@@ -2887,7 +2880,20 @@ exec claude --dangerously-skip-permissions
                     .into_owned()
             })
             .collect();
-        let allowed = ["tmux", "rmux", "claude", "copilot", "fake-client"];
+        let command = live.server.core.as_ref().unwrap().command(&[]);
+        let hc_name = Path::new(command.get_program())
+            .file_name()
+            .unwrap()
+            .to_string_lossy();
+        let allowed = [
+            "tmux",
+            "rmux",
+            "claude",
+            "copilot",
+            "fake-client",
+            hc_name.as_ref(),
+        ];
+        assert!(names.contains(&hc_name.to_string()));
         assert!(
             names.iter().all(|n| allowed.contains(&n.as_str())),
             "{mux:?}: {names:?}"
@@ -3091,15 +3097,24 @@ exec claude --dangerously-skip-permissions
             &[],
         );
         assert_eq!(code, 0, "{mux:?} {out} {err}");
-        let tail: Vec<&str> = out.lines().rev().take(3).collect();
+        let (_, list) = live.run(&["list"]);
+        let w5 = list["agents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["name"] == "w5")
+            .unwrap();
+        let tail: Vec<&str> = out.lines().rev().take(6).collect();
         assert_eq!(
             tail,
             [
-                format!("sidebar {}", s(&reopened["pane"])).as_str(),
-                "placementSource: flag",
-                "placement: tab"
-            ],
-            "{mux:?} {out}"
+                format!("sidebar {}", s(&reopened["pane"])),
+                format!("hcAddress: {}", s(&w5["hcAddress"])),
+                "view: attached".into(),
+                "life: running".into(),
+                "placementSource: flag".into(),
+                "placement: tab".into()
+            ]
         );
         assert_eq!(live.bars().len(), 1, "{mux:?}");
     }
@@ -3203,39 +3218,6 @@ exec claude --dangerously-skip-permissions
             .collect()
     }
 
-    // Agent `w` ended with one `lost` notice closed by its pane: notice.json, one message, gone from list and in
-    // list -All as lost.
-    fn one_lost_notice(live: &mut Live, w: &Value) {
-        let mux = live.mux();
-        let name = s(&w["name"]).to_string();
-        let notice = json_file(&live.agent_dir(s(&w["id"])).join("notice.json"));
-        assert_eq!(
-            (&notice["kind"], &notice["closedBy"]),
-            (&json!("lost"), &json!("pane")),
-            "{mux:?} {name} {notice}"
-        );
-        let messages = exit_messages(live, w);
-        assert_eq!(messages.len(), 1, "{mux:?} {name} {messages:?}");
-        assert_eq!(messages[0]["kind"], "lost", "{mux:?} {name}");
-        let (code, list) = live.run(&["list"]);
-        assert_eq!(code, 0, "{mux:?} {list}");
-        assert!(!names(&list).contains(&name), "{mux:?} {name} {list}");
-        let (_, all) = live.run(&["list", "-All"]);
-        let row = all["agents"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|a| a["name"] == name.as_str())
-            .cloned()
-            .unwrap_or_else(|| panic!("{mux:?}: {name} is not in list -All: {all}"));
-        assert_eq!(
-            (&row["state"], &row["closedBy"]),
-            (&json!("lost"), &json!("pane")),
-            "{mux:?} {row}"
-        );
-        assert_eq!(exit_messages(live, w).len(), 1, "{mux:?} {name}");
-    }
-
     // Spawns a tab agent and a split agent and kills both panes from outside, as a user closing them would.
     fn two_killed(live: &mut Live, n: u32) -> [Value; 2] {
         let tab = live.spawn(&format!("v{n}"), &["-Tab"]);
@@ -3250,68 +3232,58 @@ exec claude --dangerously-skip-permissions
         [tab, split]
     }
 
-    // With the bar off, each of list, read, read <other>, spawn and stop <other> alone closes a tab agent and a split
-    // agent whose panes were killed: one `lost` notice each, closed by the pane. stop on a killed agent answers
-    // already lost.
+    // Closing a view leaves its core member running; each foreground trigger preserves it.
+    fn assert_detached_running(live: &mut Live, w: &Value) {
+        assert!(!live.agent_dir(s(&w["id"])).join("notice.json").exists());
+        let (code, list) = live.run(&["list", "-All"]);
+        assert_eq!(code, 0);
+        let row = list["agents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["name"] == w["name"])
+            .unwrap();
+        assert_eq!(
+            (&row["life"], &row["view"], &row["hcAddress"]),
+            (&json!("running"), &json!("detached"), &w["hcAddress"])
+        );
+        assert!(row["pane"].is_null());
+        assert!(exit_messages(live, w).is_empty());
+        assert!(!live.agent_dir(s(&w["id"])).join("notice.json").exists());
+        assert_eq!(
+            core(live, &["get", s(&w["hcAddress"]), "--json"])["state"],
+            "live"
+        );
+    }
     fn gone_pane_closed_by_each_trigger(mux: Mux) {
-        let Some(mut live) = Live::human(mux) else {
-            return;
-        };
-        live.close_bar();
-        let other = live.spawn("other", &[]);
-        live.worker_pid(&other);
-        let mut n = 1;
         for trigger in ["list", "read", "read other", "spawn", "stop other"] {
-            let killed = two_killed(&mut live, n);
-            n += 2;
-            for w in &killed {
-                assert!(
-                    !live.agent_dir(s(&w["id"])).join("notice.json").exists(),
-                    "{mux:?} {trigger}: noticed before the trigger"
-                );
-            }
-            let (code, reply) = match trigger {
-                "spawn" => (0, live.spawn("fresh", &[])),
-                _ => {
-                    let args: Vec<&str> = trigger.split(' ').collect();
-                    live.run(&args)
-                }
+            let Some(mut live) = Live::human(mux) else {
+                return;
             };
-            assert_eq!(code, 0, "{mux:?} {trigger}: {reply}");
-            for w in &killed {
-                assert!(
-                    live.agent_dir(s(&w["id"])).join("notice.json").is_file(),
-                    "{mux:?} {trigger}: {} not closed",
-                    s(&w["name"])
-                );
-            }
-            for w in &killed {
-                one_lost_notice(&mut live, w);
+            live.close_bar();
+            let other = live.spawn("other", &[]);
+            live.worker_pid(&other);
+            let closed = two_killed(&mut live, 1);
+            let (code, reply) = if trigger == "spawn" {
+                (0, live.spawn("fresh", &[]))
+            } else {
+                live.run(&trigger.split(' ').collect::<Vec<_>>())
+            };
+            assert_eq!(code, 0, "{reply}");
+            for w in &closed {
+                assert_detached_running(&mut live, w);
+                for _ in 0..2 {
+                    let (code, stop) = live.run(&["stop", s(&w["name"])]);
+                    assert_eq!(code, 0, "{stop}");
+                    assert_eq!(stop["hcAddress"], w["hcAddress"]);
+                    assert_eq!(stop["life"], "ended");
+                }
+                assert_eq!(exit_messages(&live, w).len(), 1);
             }
         }
-        // stop on an agent whose pane was just killed: its one notice, and already lost.
-        let w = live.spawn("last", &[]);
-        live.worker_pid(&w);
-        live.call(&["kill-pane", "-t", s(&w["pane"])]);
-        live.wait_gone(s(&w["pane"]));
-        let (code, stop) = live.run(&["stop", "last"]);
-        assert_eq!(
-            (code, &stop["already"]),
-            (0, &json!("lost")),
-            "{mux:?} {stop}"
-        );
-        one_lost_notice(&mut live, &w);
-        let (code, again) = live.run(&["stop", "last"]);
-        assert_eq!(
-            (code, &again["already"]),
-            (0, &json!("lost")),
-            "{mux:?} {again}"
-        );
-        assert_eq!(exit_messages(&live, &w).len(), 1, "{mux:?}");
     }
 
-    // With the bar on and no command run, the bar's own tick closes an agent whose pane was killed: its row goes and
-    // its one notice is posted.
+    // Watch preserves detached members and reaps only terminal completion.
     fn bar_drops_a_gone_agent(mux: Mux) {
         let Some(mut live) = Live::human(mux) else {
             return;
@@ -3319,33 +3291,38 @@ exec claude --dangerously-skip-permissions
         let w1 = live.spawn("w1", &[]);
         let w2 = live.spawn("w2", &[]);
         let bar = s(&w1["sidebar"]).to_string();
-        live.worker_pid(&w1);
+        let pid = live.worker_pid(&w1);
         live.worker_pid(&w2);
-        let row = |screen: &str, name: &str| {
-            screen
-                .lines()
-                .any(|l| l.split_whitespace().nth(1) == Some(name))
-        };
-        let mut screen = String::new();
-        let drawn = eventually(Duration::from_secs(30), || {
-            screen = live.call(&["capture-pane", "-p", "-t", &bar]);
-            row(&screen, "w1") && row(&screen, "w2")
-        });
-        assert!(drawn, "{mux:?}: the bar shows:\n{screen}");
+        live.log_frames(&bar);
         live.call(&["kill-pane", "-t", s(&w1["pane"])]);
+        live.wait_gone(s(&w1["pane"]));
+        live.wait_tick(&bar);
+        let screen = live.call(&["capture-pane", "-p", "-t", &bar]);
+        assert!(row_at(&screen, "w1").is_some() && row_at(&screen, "w2").is_some());
         let marker = live.agent_dir(s(&w1["id"])).join("notice.json");
-        let dropped = eventually(Duration::from_secs(30), || {
-            screen = live.call(&["capture-pane", "-p", "-t", &bar]);
-            marker.is_file() && !row(&screen, "w1") && row(&screen, "w2")
-        });
-        assert!(dropped, "{mux:?}: the bar shows:\n{screen}");
-        let notice = json_file(&marker);
-        assert_eq!(
-            (&notice["kind"], &notice["closedBy"]),
-            (&json!("lost"), &json!("pane")),
-            "{mux:?} {notice}"
-        );
-        assert_eq!(exit_messages(&live, &w1).len(), 1, "{mux:?}");
+        assert!(!marker.exists());
+        assert!(exit_messages(&live, &w1).is_empty());
+        support::write_atomic(&live.dir.join(format!("quit.{pid}")), "7\n");
+        assert!(eventually(LONG, || {
+            let screen = live.call(&["capture-pane", "-p", "-t", &bar]);
+            marker.exists()
+                && screen.contains("1 working")
+                && screen.contains("1 ended")
+                && screen
+                    .lines()
+                    .any(|l| l.contains("w1") && l.contains("exited 7"))
+        }));
+        assert_eq!(json_file(&marker)["kind"], "exited");
+        assert_eq!(exit_messages(&live, &w1).len(), 1);
+    }
+    fn kill_dead_view(live: &Live, w: &Value) {
+        let r = json_file(&live.agent_dir(s(&w["id"])).join("record.json"));
+        let launch = mux_agent::agents::registry::Launch {
+            command: s(&r["startCommand"]).into(),
+            pid: None,
+        };
+        let args = mux_agent::agents::registry::kill_if_dead(s(&w["pane"]), &launch);
+        live.call(&args.iter().map(String::as_str).collect::<Vec<_>>());
     }
 
     /// The 1-based line of `screen` whose second token is `name`: that agent's name line (`◉`/`◌`, then the name).
@@ -3669,18 +3646,17 @@ exec claude --dangerously-skip-permissions
         drop(client);
     }
 
-    // remain-on-exit keeps an ended agent's pane dead: list kills it by the one conditional and posts no second
-    // notice. The conditional keeps a dead pane retagged since and a live pane with the agent's tag.
+    // remain-on-exit keeps an ended member's view dead: list reaps completion without view cleanup.
+    // The explicit conditional kills only the original dead view, regardless of tags.
     fn dead_pane_closed_by_one_conditional(mux: Mux) {
         let Some(mut live) = Live::human(mux) else {
             return;
         };
         live.close_bar();
         live.call(&["set-option", "-g", "remain-on-exit", "on"]);
-        live.call(&["set-environment", "-g", "MUX_IT_EXIT", "5"]);
         let quit_dead = |live: &mut Live, w: &Value| {
             let pid = live.worker_pid(w);
-            support::write_atomic(&live.dir.join(format!("quit.{pid}")), "");
+            support::write_atomic(&live.dir.join(format!("quit.{pid}")), "5\n");
             live.server.wait_file(&format!("exited.{pid}"));
             let pane = s(&w["pane"]).to_string();
             live.server.wait("the pane to be dead", || {
@@ -3689,10 +3665,15 @@ exec claude --dangerously-skip-permissions
         };
         let w1 = live.spawn("w1", &[]);
         quit_dead(&mut live, &w1);
-        // The launcher posted `exited 5` before it ended; list closes the pane and posts nothing more.
+        // List posts `exited 5` but leaves the dead attachment view in place.
         let (code, list) = live.run(&["list"]);
         assert_eq!(code, 0, "{mux:?} {list}");
         assert!(!names(&list).contains(&"w1".to_string()), "{mux:?} {list}");
+        assert!(
+            live.panes("#{pane_id}")
+                .contains(&s(&w1["pane"]).to_string())
+        );
+        kill_dead_view(&live, &w1);
         live.wait_gone(s(&w1["pane"]));
         let notice = json_file(&live.agent_dir(s(&w1["id"])).join("notice.json"));
         assert_eq!(
@@ -3707,24 +3688,11 @@ exec claude --dangerously-skip-permissions
         live.worker_pid(&w3);
         quit_dead(&mut live, &w2);
         let (p2, p3) = (s(&w2["pane"]).to_string(), s(&w3["pane"]).to_string());
-        // The conditional of an agent's own launch: its record's startCommand, the pane dead. Tags play no part.
-        let launch = |live: &Live, w: &Value| {
-            let record = json_file(&live.agent_dir(s(&w["id"])).join("record.json"));
-            mux_agent::agents::registry::Launch {
-                command: s(&record["startCommand"]).to_string(),
-                pid: None,
-            }
-        };
-        let conditional = |live: &Live, pane: &str, w: &Value| {
-            let argv = mux_agent::agents::registry::kill_if_dead(pane, &launch(live, w));
-            let argv: Vec<&str> = argv.iter().map(String::as_str).collect();
-            live.call(&argv);
-        };
         let listed = |live: &Live, pane: &str| live.panes("#{pane_id}").iter().any(|p| p == pane);
         // Live with its own launch: kept.
-        conditional(&live, &p3, &w3);
+        kill_dead_view(&live, &w3);
         assert!(listed(&live, &p3), "{mux:?}: a live pane was killed");
-        // Its tag moved to another pane (as rmux's rotate-window leaves it): list still closes the dead launch.
+        // Its tag moved (as rmux's rotate-window leaves it): explicit cleanup still owns the dead view.
         live.call(&["set-option", "-p", "-t", &p2, "@agent-id", "bbbbbbbbbbbb"]);
         let (code, list) = live.run(&["list"]);
         assert_eq!(
@@ -3732,6 +3700,8 @@ exec claude --dangerously-skip-permissions
             (0, vec!["w3".to_string()]),
             "{mux:?} {list}"
         );
+        assert!(live.panes("#{pane_id}").contains(&p2));
+        kill_dead_view(&live, &w2);
         live.wait_gone(&p2);
         assert_eq!(exit_messages(&live, &w2).len(), 1, "{mux:?}");
         assert!(listed(&live, &p3), "{mux:?}");
@@ -3743,7 +3713,7 @@ exec claude --dangerously-skip-permissions
         live.server.wait("the replacement to be dead", || {
             (live.field(&p4, "#{pane_dead}") == "1").then_some(())
         });
-        conditional(&live, &p4, &w4);
+        kill_dead_view(&live, &w4);
         assert!(
             listed(&live, &p4),
             "{mux:?}: a replaced dead pane was killed"
@@ -3751,9 +3721,10 @@ exec claude --dangerously-skip-permissions
         let (code, list) = live.run(&["list"]);
         assert_eq!(
             (code, names(&list)),
-            (0, vec!["w3".to_string()]),
+            (0, vec!["w3".to_string(), "w4".to_string()]),
             "{mux:?} {list}"
         );
+        assert_detached_running(&mut live, &w4);
         assert!(listed(&live, &p4), "{mux:?}: list killed a replacement");
         assert!(listed(&live, &p3), "{mux:?}");
     }
@@ -3834,7 +3805,16 @@ exec claude --dangerously-skip-permissions
 
         // stop w1 closes only w1's pane.
         let (code, stop) = live.run_in(&clean, &["stop", "w1"]);
-        assert_eq!((code, &stop["pane"]), (0, &json!(p1)), "{mux:?} {stop}");
+        assert_eq!(code, 0);
+        assert_eq!(
+            stop,
+            json!({"ok":true,"verb":"stop","name":"w1","hcAddress":w1["hcAddress"],"life":"ended"})
+        );
+        assert!(eventually(LONG, || core(
+            &live,
+            &["get", s(&w1["hcAddress"]), "--json"]
+        )["state"]
+            == "finished"));
         live.wait_gone(&p1);
         let panes = live.panes("#{pane_id}");
         for pane in [&root, &p2, &clean] {
@@ -3879,12 +3859,79 @@ exec claude --dangerously-skip-permissions
         };
     }
 
+    fn core(live: &Live, args: &[&str]) -> Value {
+        support::private_core::run(
+            live.server.core.as_ref().unwrap().command(args),
+            live.dir.path(),
+        )
+        .unwrap()
+    }
+    fn hc_view_close_survives_focus_stop(mux: Mux) {
+        let Some(mut live) = Live::human(mux) else {
+            return;
+        };
+        live.close_bar();
+        let w = live.spawn("w1", &[]);
+        let pid = live.worker_pid(&w);
+        let (code, child) = live.server.command(pid, &["@detach"]);
+        assert_eq!(code, 0);
+        let child = child["pid"].as_u64().unwrap() as u32;
+        let _owned = support::Sentinels(vec![(child, support::start_of(child))]);
+        let address = s(&w["hcAddress"]);
+        let folder = live.agent_dir(s(&w["id"]));
+        let before = json_file(&folder.join("record.json"));
+        live.call(&["kill-pane", "-t", s(&w["pane"])]);
+        live.wait_gone(s(&w["pane"]));
+        for _ in 0..2 {
+            let (code, list) = live.run(&["list", "-All"]);
+            assert_eq!(code, 0, "{list}");
+            let row = &list["agents"][0];
+            assert_eq!(
+                (&row["life"], &row["view"], &row["hcAddress"]),
+                (&json!("running"), &json!("detached"), &w["hcAddress"])
+            );
+            assert!(row["pane"].is_null() && row["window"].is_null());
+            assert!(!folder.join("notice.json").exists());
+            assert!(exit_messages(&live, &w).is_empty());
+        }
+        assert_eq!(core(&live, &["get", address, "--json"])["state"], "live");
+        let (code, focus) = live.run(&["focus", "w1"]);
+        assert_eq!(code, 0, "{focus}");
+        assert_ne!(focus["pane"], w["pane"]);
+        let after = json_file(&folder.join("record.json"));
+        for k in [
+            "id",
+            "team",
+            "generation",
+            "sessionId",
+            "hcAddress",
+            "launcherArgv",
+        ] {
+            assert_eq!(after[k], before[k], "{k}");
+        }
+        assert_eq!(after["pane"], focus["pane"]);
+        assert_eq!(live.worker_pid(&w), pid);
+        let (code, stop) = live.run(&["stop", "w1"]);
+        assert_eq!(code, 0, "{stop}");
+        assert_eq!(
+            stop,
+            json!({"ok":true,"verb":"stop","name":"w1","hcAddress":address,"life":"ended"})
+        );
+        assert!(eventually(LONG, || core(
+            &live,
+            &["get", address, "--json"]
+        )["state"]
+            == "finished"));
+        assert_eq!(exit_messages(&live, &w).len(), 1);
+    }
+
     macro_rules! every_mux_scenario {
         ($module:ident, $mux:ident) => {
             tests_on!(
                 $module,
                 $mux,
                 [
+                    hc_view_close_survives_focus_stop,
                     root_unsandboxed_terminal_driver_finished,
                     spawn_window_and_split_tagged,
                     spawn_titles_tab_and_pane,

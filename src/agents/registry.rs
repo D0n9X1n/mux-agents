@@ -233,6 +233,36 @@ fn window_ok(window: &str) -> bool {
 }
 
 impl Snapshot {
+    /// A unique committed attachment, independent of lifecycle notices.
+    pub fn view_at(&self, pane: &str) -> Option<Pane> {
+        let candidates: Vec<_> = self
+            .agents
+            .iter()
+            .filter(|a| super::text(a.record.get("pane")) == pane)
+            .collect();
+        let [a] = candidates.as_slice() else {
+            return None;
+        };
+        let row = a.row.as_ref()?;
+        if !a.committed
+            || row.dead
+            || live_pid(&row.pid).is_none()
+            || !window_ok(&row.window)
+            || self.rows.iter().filter(|r| r.pane == pane).count() != 1
+        {
+            return None;
+        }
+        Some(Pane {
+            pane: row.pane.clone(),
+            window: row.window.clone(),
+            pid: row.pid.clone(),
+            id: a.id.clone(),
+            name: super::text(a.record.get("name")),
+            record: a.record.clone(),
+            launch: a.launch.clone()?,
+        })
+    }
+
     /// One `list-panes` and the state folder's own records, classified.
     pub fn take(ctx: &Ctx, caller: &Caller) -> Res<Snapshot> {
         let rows = rows(ctx, caller)?;
@@ -442,55 +472,6 @@ pub fn record(ctx: &Ctx, caller: &Caller, id: &str) -> Res<Option<Value>> {
     Ok(crate::state::fs::read_json(&path)?.filter(Value::is_object))
 }
 
-/// The name of every agent record of the caller's session under this state root, live or ended, any age: a name
-/// is never reused in its session. A folder with no record.json, or a record naming another session, names none.
-/// It fails closed: a record that cannot be read, is not an object, is not its folder's, names no session or has
-/// no name could hide a taken name, so it refuses 2 `name`.
-pub(crate) fn recorded_names(ctx: &Ctx, caller: &Caller) -> Res<Vec<String>> {
-    let agents = super::server_dir(ctx, caller).join("agents");
-    let entries = match std::fs::read_dir(&agents) {
-        Ok(entries) => entries,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(e) => return Err(e.into()),
-    };
-    let mut names = Vec::new();
-    for entry in entries {
-        let entry = entry?;
-        let Some(id) = entry.file_name().to_str().map(str::to_string) else {
-            continue;
-        };
-        if !super::agent_id(&id) || !entry.path().is_dir() {
-            continue;
-        }
-        let unreadable = || {
-            refuse(
-                2,
-                "name",
-                format!("agent record {id} cannot be read, so names cannot be checked"),
-            )
-        };
-        let record = match crate::state::fs::read_json(&entry.path().join("record.json")) {
-            Ok(None) => continue,
-            Ok(Some(record)) if record.is_object() => record,
-            _ => return unreadable(),
-        };
-        if record.get("id").and_then(Value::as_str) != Some(id.as_str()) {
-            return unreadable();
-        }
-        // Skipped only when it positively names another session: one naming none could be this session's.
-        match record.get("session").and_then(Value::as_str) {
-            Some(session) if session == caller.session => {}
-            Some(_) => continue,
-            None => return unreadable(),
-        }
-        match record.get("name").and_then(Value::as_str) {
-            Some(name) => names.push(name.to_string()),
-            None => return unreadable(),
-        }
-    }
-    Ok(names)
-}
-
 fn no_agent<T>() -> Res<T> {
     refuse(2, "target", "no live agent has that name")
 }
@@ -513,16 +494,6 @@ pub fn live_after_reap(ctx: &Ctx, caller: &Caller) -> Res<Snapshot> {
         snapshot = Snapshot::take(ctx, caller)?;
     }
     Ok(snapshot)
-}
-
-/// As `find_pane`, after a reap.
-pub fn find_reaped(ctx: &Ctx, caller: &Caller, name: &str) -> Res<Pane> {
-    if !super::agent_name(name) {
-        return no_agent();
-    }
-    live_after_reap(ctx, caller)?
-        .find(name)
-        .map_or_else(no_agent, Ok)
 }
 
 /// Refuses 2 `tagged` unless the caller's pane carries no agent tag and is no own record's pane.
@@ -2084,18 +2055,35 @@ mod tests {
     }
 
     // Another spawn holds the session's spawn lock while an uncommitted agent over 60 s old has its pane gone, or
-    // dead: list never waits for that lock. It returns at once with no cleanup; a later list, the lock free, closes
-    // the agent with exactly one notice.
+    // dead: list never waits for that lock. Only terminal hc facts post a notice, regardless of spawn contention.
     #[test]
     fn list_never_waits_for_a_busy_spawn_lock() {
         use std::sync::Arc;
         use std::sync::atomic::{AtomicBool, Ordering};
         use std::time::{Duration, Instant};
-        for dead in [false, true] {
+        for (dead, terminal) in [(false, false), (true, false), (false, true), (true, true)] {
             let w = World::human("");
             w.clock(NOW);
             let caller = w.caller();
-            let folder = w.uncommitted(ID, json!({"createdAt": "2026-10-29T11:58:00.0000000Z"}));
+            let record = crate::agents::core_fixture::member(
+                &w,
+                ID,
+                json!({"createdAt": "2026-10-29T11:58:00.0000000Z"}),
+            );
+            let folder = w.folder(ID);
+            std::fs::remove_file(folder.join("commit.json")).unwrap();
+            let snapshot = || {
+                use crate::agents::core_fixture as cf;
+                cf::online(&w);
+                cf::listing(&w, record["team"].as_str().unwrap(), &[]);
+                let mut wire = cf::wire(&record);
+                if terminal {
+                    wire["state"] = json!("finished");
+                    wire["reason"] = json!("exited");
+                    wire["exit_code"] = json!(0);
+                }
+                cf::get(&w, "taaaaaaaaaaaa", wire);
+            };
             let killed = std::rc::Rc::new(std::cell::Cell::new(false));
             let listed_now = killed.clone();
             w.fakes.mux_script("list-panes", move |argv| {
@@ -2156,9 +2144,11 @@ mod tests {
                     std::thread::sleep(Duration::from_millis(1));
                 }
                 w.fakes.clear_log();
+                snapshot();
                 let at = Instant::now();
                 let reply = crate::agents::view::list(&w.ctx, &w.request(&["list"]));
                 let took = at.elapsed();
+                w.fakes.hc_done().unwrap();
                 release.store(true, Ordering::SeqCst);
                 holder.join().unwrap();
                 assert!(reply.is_ok(), "dead={dead} {reply:?}");
@@ -2169,16 +2159,22 @@ mod tests {
                 "dead={dead}: list waited {took:?} for the spawn lock"
             );
             assert!(w.fakes.slept().is_empty(), "dead={dead}");
-            assert!(!folder.join("notice.json").exists(), "dead={dead}");
+            assert_eq!(folder.join("notice.json").exists(), terminal, "dead={dead}");
             assert!(!killed.get(), "dead={dead}");
-            assert!(stored(&w).is_empty(), "dead={dead}");
-            // The lock free: the next list closes it, once; the one after posts nothing more.
+            assert_eq!(stored(&w).len(), usize::from(terminal), "dead={dead}");
+            // Releasing spawn changes no hc life: Running remains unnotified; Ended stays notified once.
             for _ in 0..2 {
+                snapshot();
                 crate::agents::view::list(&w.ctx, &w.request(&["list"])).unwrap();
+                w.fakes.hc_done().unwrap();
             }
-            assert_eq!(killed.get(), dead, "dead={dead}");
-            assert_eq!(marker_of(&folder).0, json!("lost"), "dead={dead}");
-            assert_eq!(stored(&w).len(), 1, "dead={dead}");
+            assert!(!killed.get(), "dead={dead}");
+            assert_eq!(folder.join("notice.json").exists(), terminal);
+            if terminal {
+                assert_eq!(marker_of(&folder).0, json!("exited"));
+            }
+            assert_eq!(stored(&w).len(), usize::from(terminal), "dead={dead}");
+            assert!(!w.fakes.locks().iter().any(|event| event.contains("spawn|")));
         }
     }
 

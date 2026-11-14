@@ -2,11 +2,9 @@
 
 use std::io;
 
-use serde_json::{Map, Value};
-
 use super::seam;
 use super::unix::{self, PidfdSource};
-use super::{Left, Opened, Os, Row, Signals, Token};
+use super::{Opened, Os, Row, Signals, Token};
 use crate::parse::{self, Client};
 
 pub struct Linux;
@@ -85,10 +83,6 @@ impl Os for Linux {
     // Raw starttime ticks on both sides, so exact.
     fn same_start(&self, opened: i64, listed: i64) -> bool {
         opened == listed
-    }
-
-    fn stop_report(&self, left: &[Left]) -> Map<String, Value> {
-        unix::stop_report(left)
     }
 
     // Unix has no token (Unix.ps1 binds Token to $null).

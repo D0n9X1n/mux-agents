@@ -1,5 +1,5 @@
-//! spawn: checks the request and caller, then under the session's spawn lock: cap, name, context, files, pane,
-//! tags, record.json and last commit.json; only a committed agent is live (MuxAgents.ps1:641-833).
+//! spawn: authenticates the caller, connects hc, then admits and launches under the session's spawn lock.
+//! Hc lifecycle facts reserve capacity and names; commit.json releases the launcher, then the sidebar is best effort.
 
 use std::panic::{self, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
@@ -10,11 +10,11 @@ use super::mail::doing_line;
 use super::placement::{DEFAULT as DEFAULT_PLACEMENT, read_placement};
 use super::{copilot, lock, lock_key, registry, state_dir, text, usage};
 use crate::caller::{Caller, Kind, resolve};
-use crate::checks::{Context, Plan, assert_spawn_allowed, context_plan, resolve_name, session_id};
+use crate::checks::{Context, Plan, assert_spawn_allowed, context_plan, session_id};
 use crate::cli::Request;
 use crate::ctx::Ctx;
 use crate::error::{Refusal, Res, refuse};
-use crate::mux::{Kind as MuxKind, native};
+use crate::mux::Kind as MuxKind;
 use crate::parse::{Client, cmdline_length};
 use crate::sidebar::{self, Bar};
 use crate::state::fs::{BRIEF_MAX, TASK_MAX, read_text, write_json};
@@ -26,9 +26,7 @@ const COPILOT_FLAGS: [&str; 2] = ["--no-sandbox", "--allow-all"];
 // The client command line holds 32767 UTF-16 units after quoting; 1024 of them are kept for the executable path.
 pub(crate) const CMDLINE_MAX: usize = 32767;
 const EXE_RESERVE: usize = 1024;
-const CAP: usize = 6;
 const MODEL_MAX: usize = 64;
-const PANE_FORMAT: &str = "#{pane_id}|#{window_id}|#{pane_start_command}";
 const ENTRY: &str =
     "mux-agent entry path may hold only letters, digits, spaces and _ \\ / : . ( ) -";
 
@@ -142,21 +140,59 @@ pub fn spawn(ctx: &Ctx, request: &Request) -> Res<Map<String, Value>> {
             _ => (DEFAULT_PLACEMENT, "default"),
         },
     };
-    let launch = Launch {
+    let record = launch_hc(
         ctx,
-        caller: &caller,
-        client,
-        requested: request.value("Name"),
-        model,
-        no_fork: request.switch("NoFork"),
-        task,
-        brief,
-        directory,
-        split: (placement != DEFAULT_PLACEMENT).then_some(placement),
-    };
-    let mut reply = lock(ctx, &lock_key("spawn", &caller, &caller.session), || {
-        launch.run()
-    })?;
+        &caller,
+        CoreRequest {
+            client,
+            task: &task,
+            brief: brief.as_deref(),
+            directory: &directory,
+            model,
+            no_fork: request.switch("NoFork"),
+            split: (placement != DEFAULT_PLACEMENT).then_some(placement),
+        },
+        |core| {
+            let snapshot = super::membership::Snapshot::for_spawn(ctx, &caller, core)?;
+            registry::reap_hc(ctx, &caller, &snapshot)?;
+            let name = snapshot.admit_name(request.value("Name"), client, &task)?;
+            let mut used = [0usize; crate::paint::PALETTE.len()];
+            for o in snapshot
+                .facts
+                .local
+                .iter()
+                .filter(|o| o.life != super::lifecycle::Life::Ended)
+            {
+                let r = &snapshot.records[&o.identity.id].record;
+                let color = crate::paint::identity(
+                    r.get("color").and_then(Value::as_str),
+                    &o.identity.name,
+                );
+                if let Some(i) = crate::paint::PALETTE.iter().position(|p| *p == color) {
+                    used[i] += 1;
+                }
+            }
+            let i = (0..used.len()).min_by_key(|i| (used[*i], *i)).unwrap_or(0);
+            Ok(CoreSlot {
+                name,
+                color: crate::paint::PALETTE[i],
+            })
+        },
+    )?;
+    let mut reply = Map::new();
+    for key in [
+        "name",
+        "id",
+        "pane",
+        "window",
+        "client",
+        "sessionId",
+        "context",
+        "reason",
+    ] {
+        reply.insert(key.into(), record[key].clone());
+    }
+    reply.insert("model".into(), model.unwrap_or("inherited").into());
     reply.insert("placement".into(), placement.into());
     reply.insert("placementSource".into(), source.into());
     // The agent is committed and the spawn lock released: the bar is best effort and never fails the spawn, not
@@ -175,6 +211,9 @@ pub fn spawn(ctx: &Ctx, request: &Request) -> Res<Map<String, Value>> {
             reply.insert("sidebarError".into(), refusal.message.into());
         }
     }
+    reply.insert("life".into(), "running".into());
+    reply.insert("view".into(), "attached".into());
+    reply.insert("hcAddress".into(), record["hcAddress"].clone());
     Ok(reply)
 }
 
@@ -198,35 +237,23 @@ struct Launch<'a> {
     ctx: &'a Ctx,
     caller: &'a Caller,
     client: Client,
-    requested: Option<&'a str>,
     // None: the client's own default.
     model: Option<&'a str>,
     no_fork: bool,
     task: String,
     brief: Option<String>,
     directory: PathBuf,
-    split: Option<&'a str>,
 }
 
 /// The agent being started.
 struct Agent {
     id: String,
     name: String,
-    // The identity hue from `hue_for`, kept in record.json as `color`.
+    // The reserved identity hue, kept in record.json as `color`.
     color: &'static str,
     session: String,
     plan: Plan,
     folder: PathBuf,
-    // A Copilot fork's copy; legacy pane failures remove it, hc failures retain it.
-    copied: Option<PathBuf>,
-}
-
-impl Agent {
-    fn remove_copy(&self) {
-        if let Some(copy) = &self.copied {
-            let _ = std::fs::remove_dir_all(copy);
-        }
-    }
 }
 
 impl Launch<'_> {
@@ -235,12 +262,9 @@ impl Launch<'_> {
         let mut plan = context_plan(caller, self.client, &ctx.env, self.no_fork);
         let session = guid()?;
         let id = hex_id()?;
-        let mut copied = None;
         if plan.context == Context::Fork && self.client == Client::Copilot {
             let parent = plan.parent_session.clone().unwrap_or_default();
-            if copilot::copy_session(&ctx.home, &parent, &session) {
-                copied = Some(copilot::session_folder(&ctx.home, &session));
-            } else {
+            if !copilot::copy_session(&ctx.home, &parent, &session) {
                 plan = Plan {
                     context: Context::Brief,
                     reason: "copy-verification-failed",
@@ -248,7 +272,7 @@ impl Launch<'_> {
                 };
             }
         }
-        // A brief plan never has a copy, so nothing is left behind here.
+        // A verified fork copy is retained as transaction evidence if a later step fails.
         if plan.context == Context::Brief && caller.kind == Kind::Agent && self.brief.is_none() {
             return refuse(
                 2,
@@ -263,7 +287,6 @@ impl Launch<'_> {
             color,
             session,
             plan,
-            copied,
         })
     }
 
@@ -300,78 +323,6 @@ impl Launch<'_> {
             record["model"] = model.into();
         }
         Ok(record)
-    }
-
-    fn run(&self) -> Res<Map<String, Value>> {
-        let (ctx, caller) = (self.ctx, self.caller);
-        let state = state_dir(ctx, caller)?;
-        write_json(
-            &state.join("server.json"),
-            &json!({"socket": caller.socket, "serverPid": caller.server_pid, "serverStart": caller.server_start}),
-        )?;
-        // Every own record whose pane is there counts, and every reservation (a tagged id with no own record here: a
-        // launch in progress, or another state root's agent), each id once. Gone agents and dead launches are closed
-        // first, inside this spawn lock (never taken again), and the panes listed again after.
-        let mut snapshot = registry::Snapshot::take(ctx, caller)?;
-        if registry::reap(ctx, caller, Some(&snapshot), true)? {
-            snapshot = registry::Snapshot::take(ctx, caller)?;
-        }
-        if snapshot.count() >= CAP {
-            return refuse(2, "cap", "the session already has 6 live agents");
-        }
-        // Taken: every recorded name of the session in this state root, and the names reservations' tags carry.
-        let recorded = registry::recorded_names(ctx, caller)?;
-        let reserved = snapshot.reserved_names();
-        let taken: Vec<&str> = recorded
-            .iter()
-            .chain(reserved.iter())
-            .map(String::as_str)
-            .collect();
-        let name = resolve_name(self.requested, self.client, &self.task, &taken)?;
-        let color = hue_for(&snapshot);
-        let agent = self.allocate(&state, name, color)?;
-        let spec = match self.prepare(&agent) {
-            Ok(spec) => spec,
-            Err(refusal) => {
-                let _ = std::fs::remove_dir_all(&agent.folder);
-                agent.remove_copy();
-                return Err(refusal);
-            }
-        };
-        let mut pane: Option<Created> = None;
-        self.start(&agent, &spec, &mut pane).or_else(|_| {
-            // Each cleanup step runs on its own: a failing one skips none of the others and never hides the refusal.
-            let at = utc_o(ctx.clock.now());
-            let _ = write_json(
-                &agent.folder.join("abort.json"),
-                &json!({"abortedAt": at, "pane": pane.as_ref().map(|p| p.pane.clone())}),
-            );
-            // Only the pane the creation reply named, while it is still that launch (live or dead), is killed; only
-            // a fresh probe showing it gone says it was closed.
-            let closed = pane
-                .as_ref()
-                .filter(|p| !p.command.is_empty())
-                .is_some_and(|p| {
-                    let launch = registry::Launch {
-                        command: p.command.clone(),
-                        pid: None,
-                    };
-                    let kill = registry::bound(
-                        &p.pane,
-                        launch.launched(),
-                        format!("kill-pane -t {}", p.pane),
-                    );
-                    let kill: Vec<&str> = kill.iter().map(String::as_str).collect();
-                    let _ = native(ctx, &kill, true);
-                    registry::pane_gone(ctx, &p.pane).unwrap_or(false)
-                });
-            agent.remove_copy();
-            if closed {
-                refuse(1, "launch", "the agent did not start; its pane was closed")
-            } else {
-                refuse(1, "launch", "the agent did not start")
-            }
-        })
     }
 
     /// Before any pane: header, prompt and args, the length check, then the private folder, brief.md and spec.json.
@@ -424,163 +375,6 @@ impl Launch<'_> {
         )?;
         Ok(spec)
     }
-
-    /// From the launch call on a pane may exist, so any failure here is a launch failure; `pane` names it once known.
-    fn start(
-        &self,
-        agent: &Agent,
-        spec: &Path,
-        pane: &mut Option<Created>,
-    ) -> Res<Map<String, Value>> {
-        let (ctx, caller) = (self.ctx, self.caller);
-        let session_target = format!("{}:", caller.session);
-        let split_flag = self.split.map(|split| format!("-{split}"));
-        let mut argv: Vec<&str> = match &split_flag {
-            Some(flag) => vec![
-                "split-window",
-                "-d",
-                flag,
-                "-P",
-                "-F",
-                PANE_FORMAT,
-                "-t",
-                &caller.pane,
-            ],
-            None => vec![
-                "new-window",
-                "-d",
-                "-P",
-                "-F",
-                PANE_FORMAT,
-                "-t",
-                &session_target,
-                "-n",
-                &agent.name,
-            ],
-        };
-        let env = pane_env(utf8(&ctx.state_root)?, crate::state::root::HOST);
-        argv.extend(env.iter().map(String::as_str));
-        argv.extend([
-            "-c",
-            utf8(&self.directory)?,
-            utf8(&ctx.exe)?,
-            "launcher",
-            utf8(spec)?,
-        ]);
-        let created = native(ctx, &argv, false)?;
-        let reply = created_pane(&created.stdout).ok_or_else(|| {
-            Refusal::internal(&format!(
-                "{} did not name the new pane",
-                crate::mux::in_use(ctx)
-            ))
-        })?;
-        let (new_pane, window, start_command) = (
-            reply.pane.clone(),
-            reply.window.clone(),
-            reply.command.clone(),
-        );
-        *pane = Some(reply);
-        // The pane is the agent's only while it runs this exact command: none named, it is never the agent's.
-        if start_command.is_empty() {
-            return Err(Refusal::internal(&format!(
-                "{} did not name the new pane's command",
-                crate::mux::in_use(ctx)
-            )));
-        }
-        let launch = registry::Launch {
-            command: start_command.clone(),
-            pid: None,
-        };
-        let context = format!("{}:{}", context_name(agent.plan.context), agent.plan.reason);
-        let tags = [
-            ("@agent-id", agent.id.as_str()),
-            ("@agent-name", &agent.name),
-            ("@agent-parent", &caller.pane),
-            ("@agent-context", &context),
-        ];
-        // Every value goes into one server-side command string, so each must be a plain token: an id, a name, a pane
-        // or a context, none holding a space, quote, `;`, `#`, `{` or `}`.
-        if !tags.iter().all(|(_, value)| plain_token(value)) || !plain_token(&new_pane) {
-            return Err(Refusal::internal("a tag value is not a plain token"));
-        }
-        let mut writes: Vec<String> = tags
-            .iter()
-            .map(|(key, value)| format!("set-option -p -t {new_pane} {key} {value}"))
-            .collect();
-        // The agent's pane is titled with its name (select-pane -T leaves focus alone); a tab also has it as the
-        // window's name from -n, which turns automatic-rename off for that window.
-        writes.push(format!("select-pane -T {} -t {new_pane}", agent.name));
-        // The server writes them only while the pane still runs the command the reply named (live or dead): a pane
-        // respawned since is never tagged or retitled.
-        let tag = registry::bound(&new_pane, launch.launched(), writes.join(" ; "));
-        let tag: Vec<&str> = tag.iter().map(String::as_str).collect();
-        native(ctx, &tag, false)?;
-        // Before the commit, so before the client starts: its title escapes no longer replace the name. Best
-        // effort, bound the same way: tmux 3.2a has no allow-set-title and refuses it, and the spawn goes on.
-        let title = registry::bound(
-            &new_pane,
-            launch.launched(),
-            format!("set-option -p -t {new_pane} allow-set-title off"),
-        );
-        let title: Vec<&str> = title.iter().map(String::as_str).collect();
-        let _ = native(ctx, &title, true);
-        // Then the pane must still be that launch, else nothing above is known to have reached it: rollback.
-        let probe = format!("#{{pane_id}}|{}", launch.launched());
-        let still = native(
-            ctx,
-            &["display-message", "-p", "-t", &new_pane, &probe],
-            true,
-        )
-        .is_ok_and(|read| {
-            read.code == 0 && read.stdout.trim_end_matches(['\r', '\n']) == format!("{new_pane}|1")
-        });
-        if !still {
-            return Err(Refusal::internal(
-                "the new pane no longer runs the agent's launch",
-            ));
-        }
-        let record = self.record(agent, &new_pane, &window, &start_command)?;
-        let client = client_name(self.client);
-        let context = context_name(agent.plan.context);
-        write_json(&agent.folder.join("record.json"), &record)?;
-        // Last: only a committed agent is live.
-        commit(ctx, &agent.folder)?;
-        let mut reply = Map::new();
-        reply.insert("name".into(), agent.name.clone().into());
-        reply.insert("id".into(), agent.id.clone().into());
-        reply.insert("pane".into(), new_pane.into());
-        reply.insert("window".into(), window.into());
-        reply.insert("client".into(), client.into());
-        reply.insert("sessionId".into(), agent.session.clone().into());
-        reply.insert("context".into(), context.into());
-        reply.insert("reason".into(), agent.plan.reason.into());
-        reply.insert("model".into(), self.model.unwrap_or("inherited").into());
-        Ok(reply)
-    }
-}
-
-/// The new agent's identity hue (#37): the palette hue least used by the session's counted own agents (their
-/// recorded hue, else their name's), ties by palette order. Read under the spawn lock.
-fn hue_for(snapshot: &registry::Snapshot) -> &'static str {
-    let mut used = [0usize; crate::paint::PALETTE.len()];
-    for agent in snapshot
-        .agents
-        .iter()
-        .filter(|a| a.class != registry::Class::Gone)
-    {
-        let record = &agent.record;
-        let hue = crate::paint::identity(
-            record.get("color").and_then(Value::as_str),
-            &text(record.get("name")),
-        );
-        if let Some(at) = crate::paint::PALETTE.iter().position(|p| *p == hue) {
-            used[at] += 1;
-        }
-    }
-    let least = (0..used.len())
-        .min_by_key(|&at| (used[at], at))
-        .unwrap_or(0);
-    crate::paint::PALETTE[least]
 }
 
 /// commit.json, the last write: from here the agent is live. It is made once, whole: a launcher that gave up waiting
@@ -672,7 +466,7 @@ pub(crate) fn created_pane(stdout: &str) -> Option<Created> {
 pub enum Recipe<'a> {
     First(Option<&'a str>),
     /// Claude forks from `parent` itself. For Copilot, the caller must first copy the parent session into the
-    /// `session` passed to `client_args`, as `Launch::run` does, and fall back to `First` if the copy fails.
+    /// `session` passed to `client_args`, in `Launch::allocate`, and fall back to `First` if the copy fails.
     Fork {
         parent: &'a str,
         task: Option<&'a str>,
@@ -916,18 +710,10 @@ mod tests {
     // The session's bar is off, so a spawn opens none; `bar_on` keeps one.
     fn ready(w: World) -> World {
         w.launches_hold();
-        w.fakes.mux_rule(
-            "new-window",
-            0,
-            "%9|@5|/bin/mux-agent launcher /s/spec.json\n",
-            "",
-        );
-        w.fakes.mux_rule(
-            "split-window",
-            0,
-            "%9|@5|/bin/mux-agent launcher /s/spec.json\n",
-            "",
-        );
+        w.fakes
+            .mux_rule("new-window", 0, "%9|@5|hc attach t1\n", "");
+        w.fakes
+            .mux_rule("split-window", 0, "%9|@5|hc attach t1\n", "");
         w.fakes.mux_rule("@mux-agents-sidebar", 0, "off\n", "");
         w
     }
@@ -944,13 +730,11 @@ mod tests {
             ctx: &w.ctx,
             caller: &caller,
             client: Client::Claude,
-            requested: None,
             model: Some("sonnet"),
             no_fork: true,
             task: "task".into(),
             brief: None,
             directory: w.ctx.cwd.clone(),
-            split: None,
         };
         let a = launch
             .allocate(&w.state(), "worker".into(), "blue")
@@ -1046,10 +830,188 @@ mod tests {
         (w, launch)
     }
 
+    fn hc_world(w: World) -> World {
+        for verb in ["new-window", "split-window"] {
+            w.fakes.mux_first(verb, 0, "%9|@5|hc attach t1\n", "");
+        }
+        w.fakes
+            .mux_first("-t %9 #{pane_id}|#{@agent-id}", 0, "|\n", "");
+        w
+    }
+    fn hc_attempt(w: &World, client: Client, model: Option<&str>, rollback: bool) -> Res<Value> {
+        use crate::agents::core_fixture as cf;
+        let caller = w.caller();
+        cf::online(w);
+        w.fakes.hc_answer(Ok(crate::spawn::Out {
+            stdout: r#"{"address":"t1"}"#.into(),
+            ..Default::default()
+        }));
+        if rollback {
+            cf::answer(w, &["kill", "t1", "--json"], "{}");
+        }
+        let result = launch_hc(
+            &w.ctx,
+            &caller,
+            CoreRequest {
+                client,
+                task: "hi",
+                brief: Some("brief"),
+                directory: &w.ctx.cwd,
+                model,
+                no_fork: false,
+                split: None,
+            },
+            |_| {
+                Ok(CoreSlot {
+                    name: "hi".into(),
+                    color: "blue",
+                })
+            },
+        );
+        let folder = agents_dir(w).join(&agent_folders(w)[0]);
+        let spec = read_json(&folder.join("spec.json"));
+        let id = spec["id"].as_str().unwrap();
+        let team = format!("{}:{}", caller.server_key, caller.session);
+        let mut run = vec![
+            "run".into(),
+            "--bg".into(),
+            "--keep".into(),
+            "--outlive-parent".into(),
+            "--no-notify".into(),
+            "--name".into(),
+            format!("m{}", &id[..8]),
+        ];
+        for label in [
+            "mux.managed=1".into(),
+            format!("mux.team={team}"),
+            format!("mux.id={id}"),
+            "mux.gen=0".into(),
+            "mux.name=hi".into(),
+        ] {
+            run.extend(["--label".into(), label]);
+        }
+        run.extend([
+            "--cwd".into(),
+            utf8(&w.ctx.cwd).unwrap().into(),
+            "--json".into(),
+            "--".into(),
+            utf8(&w.ctx.exe).unwrap().into(),
+            "launcher".into(),
+            utf8(&folder.join("spec.json")).unwrap().into(),
+            "--state-root".into(),
+            utf8(&w.ctx.state_root).unwrap().into(),
+            "--path".into(),
+            w.ctx.env.get("PATH").unwrap_or("").into(),
+        ]);
+        let mut expected = vec![vec!["--version".to_string()], run];
+        if rollback {
+            expected.push(["kill", "t1", "--json"].map(String::from).to_vec());
+        }
+        assert_eq!(
+            w.fakes
+                .hc_calls()
+                .iter()
+                .map(|(_, a, _)| a.clone())
+                .collect::<Vec<_>>(),
+            expected
+        );
+        w.fakes.hc_done().unwrap();
+        result
+    }
+
+    struct HcCommitReset;
+    impl Drop for HcCommitReset {
+        fn drop(&mut self) {
+            commit_probe(None);
+        }
+    }
+
+    // Each invocation explicitly queues its one snapshot and, only if admitted, one run.
+    fn public_snapshot(w: &World, listed: &[&str], wires: &[Value]) {
+        use crate::agents::core_fixture as cf;
+        cf::online(w);
+        cf::listing(w, &super::super::membership::team(&w.caller()), listed);
+        let mut wires = wires.to_vec();
+        wires.sort_by_key(|v| v["address"].as_str().unwrap().to_string());
+        for wire in wires {
+            let address = wire["address"].as_str().unwrap().to_string();
+            cf::get(w, &address, wire);
+        }
+    }
+
+    fn public_launch(w: &World, address: &str) {
+        w.fakes.hc_answer(Ok(crate::spawn::Out {
+            stdout: json!({"address": address}).to_string(),
+            ..Default::default()
+        }));
+        if address != "t1" {
+            for verb in ["new-window", "split-window"] {
+                w.fakes
+                    .mux_first(verb, 0, &format!("%10|@6|hc attach {address}\n"), "");
+            }
+        }
+    }
+
+    fn empty_launch(w: &World) {
+        public_snapshot(w, &[], &[]);
+        public_launch(w, "t1");
+    }
+
+    fn assert_public_runs(w: &World) {
+        for (_, argv, _) in w.fakes.hc_calls().iter().filter(|(_, a, _)| a[0] == "run") {
+            let id = argv.iter().find_map(|s| s.strip_prefix("mux.id=")).unwrap();
+            let caller = w.caller();
+            let folder = w
+                .ctx
+                .state_root
+                .join(&caller.server_key)
+                .join("agents")
+                .join(id);
+            let spec = read_json(&folder.join("spec.json"));
+            let record = read_json(&folder.join("record.json"));
+            assert_eq!(spec["id"], id);
+            let mut expected = vec![
+                "run".into(),
+                "--bg".into(),
+                "--keep".into(),
+                "--outlive-parent".into(),
+                "--no-notify".into(),
+                "--name".into(),
+                format!("m{}", &id[..8]),
+            ];
+            for label in [
+                "mux.managed=1".into(),
+                format!("mux.team={}:{}", caller.server_key, caller.session),
+                format!("mux.id={id}"),
+                "mux.gen=0".into(),
+                format!("mux.name={}", record["name"].as_str().unwrap()),
+            ] {
+                expected.extend(["--label".into(), label]);
+            }
+            expected.extend([
+                "--cwd".into(),
+                record["directory"].as_str().unwrap().into(),
+                "--json".into(),
+                "--".into(),
+                utf8(&w.ctx.exe).unwrap().into(),
+                "launcher".into(),
+                utf8(&folder.join("spec.json")).unwrap().into(),
+                "--state-root".into(),
+                utf8(&w.ctx.state_root).unwrap().into(),
+                "--path".into(),
+                w.ctx.env.get("PATH").unwrap_or("").into(),
+            ]);
+            assert_eq!(argv, &expected);
+        }
+    }
+
     fn run(w: &World, args: &[&str]) -> String {
         let mut full = vec!["spawn"];
         full.extend(args);
-        match spawn(&w.ctx, &w.request(&full)) {
+        let result = spawn(&w.ctx, &w.request(&full));
+        w.fakes.hc_done().unwrap();
+        assert_public_runs(w);
+        match result {
             Ok(reply) => format!("ok {}", Value::Object(reply)),
             Err(r) => format!("{} {} {}", r.code, r.check, r.message),
         }
@@ -1134,6 +1096,7 @@ mod tests {
             assert_eq!(run(&w, args), usage, "{args:?}");
             assert!(w.fakes.mux_calls().is_empty(), "{args:?}");
             assert!(!w.ctx.state_root.exists(), "{args:?}");
+            assert!(w.fakes.hc_calls().is_empty());
         }
         // Task and brief files: UTF-8, 16 KB and 1 MB, relative to the caller's cwd.
         let w = human();
@@ -1171,10 +1134,12 @@ mod tests {
             assert_eq!(run(&w, &full), format!("2 usage {message}"), "{args:?}");
             assert_eq!(verbs(&w), ["display-message", "list-panes"], "{args:?}");
             assert!(!w.ctx.state_root.exists(), "{args:?}");
+            assert!(w.fakes.hc_calls().is_empty());
         }
         // At the limits, and with an empty brief, it spawns.
         w.file("max.md", &[b'x'; 16384]);
         w.file("brief.md", &vec![b'x'; 1 << 20]);
+        empty_launch(&w);
         let max = run(
             &w,
             &[
@@ -1187,6 +1152,10 @@ mod tests {
             ],
         );
         assert!(max.starts_with("ok "), "{max}");
+        let first = reply(&max);
+        let record = read_json(&w.folder(first["id"].as_str().unwrap()).join("record.json"));
+        public_snapshot(&w, &[], &[crate::agents::core_fixture::wire(&record)]);
+        public_launch(&w, "t2");
         let empty = run(
             &w,
             &["-Client", "claude", "-Task", "hi", "-BriefFile", "empty.md"],
@@ -1313,11 +1282,13 @@ mod tests {
                 "{model}"
             );
             assert!(w.fakes.mux_calls().is_empty(), "{model}");
+            assert!(w.fakes.hc_calls().is_empty());
             assert!(!w.ctx.state_root.exists(), "{model}");
         }
         let max = "a".repeat(64);
         for model in ["sonnet", "sonnet[1m]", "claude-opus-4.5_x", max.as_str()] {
             let w = human();
+            empty_launch(&w);
             let ok = reply(&run(
                 &w,
                 &["-Client", "claude", "-Task", "hi", "-Model", model],
@@ -1363,6 +1334,7 @@ mod tests {
             if no_fork {
                 args.push("-NoFork");
             }
+            empty_launch(&w);
             let ok = reply(&run(&w, &args));
             let new = ok["sessionId"].as_str().unwrap();
             let spec = read_json(
@@ -1445,66 +1417,77 @@ mod tests {
         assert!(!w.ctx.state_root.exists());
     }
 
-    fn rows(count: u32) -> Vec<String> {
+    fn reservations(w: &World, count: u32, foreign: bool) -> Vec<Value> {
         (1..=count)
             .map(|n| {
-                let p = 20 + n;
-                format!("%{p}|@{p}|{}|{:012x}|claude-{n}", 300 + n, 0xa00 + n)
+                let id = format!("{:012x}", 0xa00 + n);
+                let record = crate::agents::core_fixture::member(
+                    w,
+                    &id,
+                    json!({"name": format!("claude-{n}")}),
+                );
+                if foreign {
+                    std::fs::remove_dir_all(w.folder(&id)).unwrap();
+                } else {
+                    std::fs::remove_file(w.folder(&id).join("commit.json")).unwrap();
+                }
+                crate::agents::core_fixture::wire(&record)
             })
             .collect()
     }
 
+    fn reservation_snapshot(w: &World, wires: &[Value], foreign: bool) {
+        let addresses: Vec<_> = wires
+            .iter()
+            .map(|v| v["address"].as_str().unwrap())
+            .collect();
+        public_snapshot(w, if foreign { &addresses } else { &[] }, wires);
+    }
+
     #[test]
     fn cap_6_counts_uncommitted() {
-        // Six tagged panes, none committed: a launch in progress holds its place.
-        let w = human();
-        let six = rows(6);
-        w.panes(&six.iter().map(String::as_str).collect::<Vec<_>>());
-        assert_eq!(
-            run(&w, &["-Client", "claude", "-Task", "hi"]),
-            "2 cap the session already has 6 live agents"
-        );
-        assert!(calls(&w, "new-window").is_empty());
-        assert!(agent_folders(&w).is_empty());
-        // server.json is written under the lock before the panes are listed.
-        let caller = w.caller();
-        let server = std::fs::read_to_string(
-            w.ctx
-                .state_root
-                .join(&caller.server_key)
-                .join("server.json"),
-        )
-        .unwrap();
-        let expected = json!({"socket": caller.socket, "serverPid": caller.server_pid, "serverStart": caller.server_start});
-        assert_eq!(server, expected.to_string());
-        // A live pane whose name holds LF (or CR) still counts: six panes, one named `worker6\nhidden`, refuse a 7th.
-        for name in ["worker6\nhidden", "worker6\r\nhidden", "worker6\rhidden"] {
+        for foreign in [false, true] {
             let w = human();
-            let mut six = rows(5);
-            six.push(format!("%26|@26|306|000000000a06|{name}"));
-            w.panes(&six.iter().map(String::as_str).collect::<Vec<_>>());
+            let six = reservations(&w, 6, foreign);
+            reservation_snapshot(&w, &six, foreign);
             assert_eq!(
                 run(&w, &["-Client", "claude", "-Task", "hi"]),
-                "2 cap the session already has 6 live agents",
-                "{name:?}"
+                "2 cap the session already has 6 live agents"
             );
-            assert!(calls(&w, "new-window").is_empty(), "{name:?}");
+            assert!(calls(&w, "new-window").is_empty());
+            assert!(!w.state().join("server.json").exists());
+            assert_eq!(agent_folders(&w).len(), if foreign { 0 } else { 6 });
+            for (task, name) in [("do it", "do"), ("just it", "claude-6")] {
+                let w = human();
+                let five = reservations(&w, 5, foreign);
+                reservation_snapshot(&w, &five, foreign);
+                public_launch(&w, "t1");
+                let ok = reply(&run(&w, &["-Client", "claude", "-Task", task]));
+                assert_eq!(ok["name"], name);
+                let caller = w.caller();
+                assert_eq!(
+                    read_json(&w.state().join("server.json")),
+                    json!({"socket": caller.socket, "serverPid": caller.server_pid, "serverStart": caller.server_start})
+                );
+            }
         }
-        // Five leave room for a sixth; a task of stopwords names it after the taken ones.
-        let w = human();
-        let five = rows(5);
-        w.panes(&five.iter().map(String::as_str).collect::<Vec<_>>());
-        let ok = reply(&run(&w, &["-Client", "claude", "-Task", "do it"]));
-        assert_eq!(ok["name"], "do");
-        let w = human();
-        w.panes(&five.iter().map(String::as_str).collect::<Vec<_>>());
-        let ok = reply(&run(&w, &["-Client", "claude", "-Task", "just it"]));
-        assert_eq!(ok["name"], "claude-6");
+        for name in ["worker6\nhidden", "worker6\r\nhidden", "worker6\rhidden"] {
+            let w = human();
+            let mut six = reservations(&w, 6, true);
+            six[5]["labels"]["mux.name"] = name.into();
+            reservation_snapshot(&w, &six, true);
+            assert_eq!(
+                run(&w, &["-Client", "claude", "-Task", "hi"]),
+                "1 internal unexpected error (reservation has no managed name)"
+            );
+            assert!(calls(&w, "new-window").is_empty());
+            assert!(!w.state().join("server.json").exists());
+        }
     }
 
     // The new agent's record.json: the one folder `before` did not have.
     fn new_record(w: &World, before: &[String]) -> Value {
-        let new: Vec<String> = agent_folders(w)
+        let new: Vec<_> = agent_folders(w)
             .into_iter()
             .filter(|f| !before.contains(f))
             .collect();
@@ -1514,8 +1497,11 @@ mod tests {
 
     #[test]
     fn spawn_colors_the_least_used_hue_of_live_agents() {
-        let spawn_color = |w: &World| {
+        use crate::agents::core_fixture as cf;
+        let spawn_color = |w: &World, listed: &[&str], wires: &[Value]| {
             let before = agent_folders(w);
+            public_snapshot(w, listed, wires);
+            public_launch(w, "t1");
             let ok = run(w, &["-Client", "claude", "-Task", "hi", "-Name", "new"]);
             assert!(ok.starts_with("ok "), "{ok}");
             new_record(w, &before)["color"]
@@ -1523,10 +1509,7 @@ mod tests {
                 .unwrap()
                 .to_string()
         };
-        // None live: the first hue.
-        let w = human();
-        assert_eq!(spawn_color(&w), "blue");
-        // The least used hue of the live agents, ties by palette order.
+        assert_eq!(spawn_color(&human(), &[], &[]), "blue");
         for (colors, want) in [
             (&["blue"][..], "magenta"),
             (&["blue", "magenta"], "bright-blue"),
@@ -1540,143 +1523,200 @@ mod tests {
                 "magenta",
             ),
         ] {
-            let w = human();
-            let mut panes = Vec::new();
-            for (n, color) in colors.iter().enumerate() {
-                let id = format!("{:012x}", 0xd00 + n);
-                w.agent_record(&id, json!({"name": format!("a{n}"), "color": color, "pane": format!("%{}", 30 + n)}));
-                panes.push(format!("%{}|@5|{}|{id}|a{n}", 30 + n, 330 + n));
+            for mode in ["running", "lost", "unknown"] {
+                let w = human();
+                w.panes(&[]);
+                let wires: Vec<_> = colors
+                    .iter()
+                    .enumerate()
+                    .map(|(n, color)| {
+                        let r = cf::member(
+                            &w,
+                            &format!("{:012x}", 0xd00 + n),
+                            json!({"name": format!("a{n}"), "color": color}),
+                        );
+                        let mut wire = cf::wire(&r);
+                        if mode == "lost" {
+                            wire["argv"] = json!(["/bin/sh", "-l"]);
+                        }
+                        if mode == "unknown" {
+                            wire["labels"]["mux.gen"] = "1".into();
+                        }
+                        wire
+                    })
+                    .collect();
+                assert_eq!(spawn_color(&w, &[], &wires), want, "{colors:?} {mode}");
             }
-            w.panes(&panes.iter().map(String::as_str).collect::<Vec<_>>());
-            assert_eq!(spawn_color(&w), want, "{colors:?}");
         }
-        // A ended (blue, not live) and B live (magenta): C gets blue.
         let w = human();
-        ended(&w, "000000000e01", json!({"name": "a", "color": "blue"}));
-        w.agent_record(
-            "000000000e02",
-            json!({"name": "b", "color": "magenta", "pane": "%31"}),
-        );
-        w.panes(&["%31|@5|331|000000000e02|b"]);
-        assert_eq!(spawn_color(&w), "blue");
-        // Another session's record on a listed pane does not count; a live agent with no color counts its name's hue.
+        let a = cf::member(&w, "000000000e01", json!({"name": "a", "color": "blue"}));
+        let b = cf::member(&w, "000000000e02", json!({"name": "b", "color": "magenta"}));
+        let mut done = cf::wire(&a);
+        done["state"] = "finished".into();
+        done["reason"] = "exited".into();
+        done["exit_code"] = 0.into();
+        assert_eq!(spawn_color(&w, &[], &[done, cf::wire(&b)]), "blue");
         let w = human();
-        w.agent_record(
+        cf::member(
+            &w,
             "000000000e03",
             json!({"name": "x", "color": "blue", "session": "$4"}),
         );
+        let r = cf::member(&w, "000000000e04", json!({"name": "worker"}));
         let hashed = crate::paint::identity(None, "worker");
-        w.agent_record("000000000e04", json!({"name": "worker"}));
-        w.panes(&[
-            "%31|@5|331|000000000e03|x",
-            "%32|@5|332|000000000e04|worker",
-        ]);
         let want = if hashed == "blue" { "magenta" } else { "blue" };
-        assert_eq!(spawn_color(&w), want);
-    }
-
-    // An ended agent, noticed so reap leaves it be; its name is taken until the state root is cleared.
-    fn ended(w: &World, id: &str, fields: Value) {
-        let folder = w.agent_record(id, fields);
-        crate::agents::fixture::write(
-            &folder.join("notice.json"),
-            json!({"kind": "exited", "at": "1970-01-01T00:00:00.0000000Z"}),
+        assert_eq!(spawn_color(&w, &[], &[cf::wire(&r)]), want);
+        let w = human();
+        let r = cf::member(
+            &w,
+            "000000000e05",
+            json!({"name": "foreign", "color": "blue"}),
         );
+        std::fs::remove_dir_all(w.folder("000000000e05")).unwrap();
+        assert_eq!(spawn_color(&w, &["t000000000e05"], &[cf::wire(&r)]), "blue");
     }
 
     #[test]
-    fn ended_agents_names_stay_taken() {
-        // An ended `add-subtract`: a task deriving it gets -2; with -2 live too, -3.
-        let w = human();
-        ended(&w, "000000000b01", json!({"name": "add-subtract"}));
-        let ok = reply(&run(&w, &["-Client", "claude", "-Task", "Add subtract"]));
-        assert_eq!(ok["name"], "add-subtract-2");
-        let w = human();
-        ended(&w, "000000000b01", json!({"name": "add-subtract"}));
-        w.panes(&["%21|@21|321|000000000b02|add-subtract-2"]);
-        let ok = reply(&run(&w, &["-Client", "claude", "-Task", "add subtract"]));
-        assert_eq!(ok["name"], "add-subtract-3");
-        // Eleven ended, more than a board shows: the oldest name is still taken, by -Name too, without case.
-        let w = human();
-        for n in 1..=11u32 {
-            let at = format!("1970-01-01T00:00:{n:02}.0000000Z");
-            ended(
-                &w,
-                &format!("{:012x}", 0xc00 + n),
-                json!({"name": format!("w{n}"), "createdAt": at}),
-            );
+    fn ended_agents_names_are_released_only_by_hc() {
+        use crate::agents::core_fixture as cf;
+        for (name, task, requested) in [
+            ("add-subtract", "Add subtract", None),
+            ("w1", "hi", Some("w1")),
+            ("worker", "Worker", Some("worker")),
+        ] {
+            for mode in ["ended", "running", "lost", "unknown"] {
+                let w = human();
+                let mut wires = Vec::new();
+                // More ended history than a board shows must not hide the oldest reusable name.
+                let count = if name == "w1" && mode == "ended" {
+                    11
+                } else {
+                    1
+                };
+                for n in 1..=count {
+                    let r = cf::member(
+                        &w,
+                        &format!("{:012x}", 0xb00 + n),
+                        json!({"name": if n == 1 { name.to_string() } else { format!("w{n}") }}),
+                    );
+                    let mut wire = cf::wire(&r);
+                    if mode == "ended" {
+                        wire["state"] = "finished".into();
+                        wire["reason"] = "exited".into();
+                        wire["exit_code"] = 0.into();
+                    }
+                    if mode == "lost" {
+                        wire["argv"] = json!(["/bin/sh", "-l"]);
+                    }
+                    if mode == "unknown" {
+                        wire["labels"]["mux.gen"] = "1".into();
+                    }
+                    wires.push(wire);
+                }
+                // A live suffix never prevents reuse of the verified Ended base name.
+                if name == "add-subtract" {
+                    let suffix = cf::member(&w, "000000000b20", json!({"name": "add-subtract-2"}));
+                    wires.push(cf::wire(&suffix));
+                }
+                public_snapshot(&w, &[], &wires);
+                let mut args = vec!["-Client", "claude", "-Task", task];
+                if let Some(requested) = requested {
+                    args.extend(["-Name", requested]);
+                }
+                if mode == "ended" || requested.is_none() {
+                    public_launch(&w, "t1");
+                    let ok = reply(&run(&w, &args));
+                    assert_eq!(
+                        ok["name"],
+                        if mode == "ended" {
+                            name.into()
+                        } else {
+                            format!("{name}-3")
+                        }
+                    );
+                } else {
+                    assert_eq!(
+                        run(&w, &args),
+                        format!("2 name agent name is taken, try {name}-2")
+                    );
+                    assert!(calls(&w, "new-window").is_empty());
+                }
+            }
         }
-        assert_eq!(
-            run(&w, &["-Client", "claude", "-Task", "hi", "-Name", "w1"]),
-            "2 name agent name is taken, try w1-2"
-        );
-        assert!(calls(&w, "new-window").is_empty());
-        ended(&w, "000000000b03", json!({"name": "Worker"}));
-        assert_eq!(
-            run(&w, &["-Client", "claude", "-Task", "hi", "-Name", "worker"]),
-            "2 name agent name is taken, try worker-2"
-        );
-        // Another session's record and a folder with no record.json name nothing.
+        // Identity-free legacy history, another session and an empty folder reserve nothing.
         let w = human();
-        ended(
+        w.agent_record("000000000b01", json!({"name": "add-subtract"}));
+        cf::member(
             &w,
             "000000000b04",
             json!({"name": "add-subtract", "session": "$4"}),
         );
         std::fs::create_dir_all(w.folder("000000000b05")).unwrap();
-        let ok = reply(&run(&w, &["-Client", "claude", "-Task", "add subtract"]));
-        assert_eq!(ok["name"], "add-subtract");
+        empty_launch(&w);
+        assert_eq!(
+            reply(&run(&w, &["-Client", "claude", "-Task", "add subtract"]))["name"],
+            "add-subtract"
+        );
     }
 
     #[test]
     fn an_unreadable_record_refuses_rather_than_reuse_a_name() {
-        // Fail closed: a record that cannot be read, is not an object, is not its folder's or has no name could
-        // hide a taken name, so the spawn refuses 2 `name` before any pane.
+        use crate::agents::core_fixture as cf;
         let id = "000000000b07";
-        let refused =
-            format!("2 name agent record {id} cannot be read, so names cannot be checked");
-        // A case's name and how it breaks the record.
-        type Case<'a> = (&'a str, &'a dyn Fn(&World));
-        let cases: [Case; 7] = [
-            ("not JSON", &|w| {
-                let folder = w.folder(id);
-                std::fs::create_dir_all(&folder).unwrap();
-                std::fs::write(folder.join("record.json"), "{").unwrap();
-            }),
-            ("not an object", &|w| {
-                let folder = w.folder(id);
-                std::fs::create_dir_all(&folder).unwrap();
-                std::fs::write(folder.join("record.json"), "[\"w\"]").unwrap();
-            }),
-            ("unreadable", &|w| {
-                std::fs::create_dir_all(w.folder(id).join("record.json")).unwrap();
-            }),
-            ("another folder's id", &|w| {
-                ended(w, id, json!({"name": "w", "id": "000000000b06"}));
-            }),
-            ("no name", &|w| ended(w, id, json!({"name": null}))),
-            // Only a record that names another session is skipped; one naming none could be this session's.
-            ("no session", &|w| {
-                ended(w, id, json!({"name": "w"}));
-                let path = w.folder(id).join("record.json");
-                let mut record = read_json(&path);
-                record.as_object_mut().unwrap().remove("session");
-                crate::agents::fixture::write(&path, record);
-            }),
-            ("a session that is not a string", &|w| {
-                ended(w, id, json!({"name": "w", "session": 3}))
-            }),
-        ];
-        for (case, make) in cases {
+        for case in [
+            "not JSON",
+            "not an object",
+            "unreadable",
+            "another id",
+            "no name",
+            "no session",
+            "non-string session",
+        ] {
             let w = human();
-            make(&w);
+            let mut record = cf::member(&w, id, json!({"name": "w"}));
+            let path = w.folder(id).join("record.json");
+            match case {
+                "not JSON" => std::fs::write(&path, "{").unwrap(),
+                "not an object" => std::fs::write(&path, "[\"w\"]").unwrap(),
+                "unreadable" => {
+                    std::fs::remove_file(&path).unwrap();
+                    std::fs::create_dir(&path).unwrap();
+                }
+                _ => {
+                    match case {
+                        "another id" => record["id"] = "000000000b06".into(),
+                        "no name" => record["name"] = Value::Null,
+                        "no session" => {
+                            record.as_object_mut().unwrap().remove("session");
+                        }
+                        _ => record["session"] = 3.into(),
+                    }
+                    crate::agents::fixture::write(&path, record);
+                }
+            }
             for args in [
                 &["-Task", "add subtract"][..],
                 &["-Task", "hi", "-Name", "w"],
             ] {
+                cf::online(&w); // Local validation precedes ls.
                 let mut full = vec!["-Client", "claude"];
                 full.extend(args);
-                assert_eq!(run(&w, &full), refused, "{case} {args:?}");
+                let got = run(&w, &full);
+                if case == "unreadable" {
+                    assert!(got.starts_with("1 internal unexpected error ("), "{got}");
+                } else {
+                    let message = match case {
+                        "not JSON" => "state file is not JSON",
+                        "not an object" => "invalid local hc record",
+                        _ => "invalid local hc identity",
+                    };
+                    assert_eq!(
+                        got,
+                        format!("1 internal unexpected error ({message})"),
+                        "{case}"
+                    );
+                }
+                assert!(!w.fakes.hc_calls().iter().any(|(_, a, _)| a[0] == "run"));
             }
             assert!(calls(&w, "new-window").is_empty(), "{case}");
         }
@@ -1684,72 +1724,86 @@ mod tests {
 
     #[test]
     fn spawn_reaps_before_the_cap_inside_its_lock() {
-        // Six tagged panes, the sixth (%26) a dead pane of our committed agent: killed and noticed before the cap.
-        let w = human();
-        let six = rows(6);
-        let folder = w.agent_record("000000000a06", json!({"name": "claude-6", "pane": "%26"}));
-        let killed = Rc::new(Cell::new(false));
-        let gone = killed.clone();
-        w.fakes.mux_script("list-panes -s", move |argv| {
-            let n = if gone.get() { 5 } else { 6 };
-            let rows: Vec<&str> = six[..n].iter().map(String::as_str).collect();
-            Ok(Output {
-                code: 0,
-                stdout: crate::agents::fixture::listed_dead(argv, &rows, "\n", &["%26"]),
-                stderr: String::new(),
-            })
-        });
-        let kill = killed.clone();
-        w.fakes.mux_script("if-shell", move |_| {
-            kill.set(true);
-            Ok(Output {
-                code: 0,
-                stdout: String::new(),
-                stderr: String::new(),
-            })
-        });
-        w.fakes
-            .mux_rule("-t %26 #{pane_id}|#{@agent-id}", 0, "|\n", "");
-        let ok = reply(&run(&w, &["-Client", "claude", "-Task", "hi"]));
-        assert!(killed.get());
-        assert_eq!(ok["name"], "hi");
-        assert!(folder.join("notice.json").is_file());
-
-        // An uncommitted agent over 60 s old whose pane is gone: noticed inside the spawn lock, never taken twice.
-        let w = human();
-        w.clock("2026-10-29T12:00:00.0000000Z");
-        let five = rows(5);
-        w.panes(&five.iter().map(String::as_str).collect::<Vec<_>>());
-        let stale = w.uncommitted(
-            "bbbbbbbbbbbb",
-            json!({"pane": "%7", "createdAt": "2026-10-29T11:58:00.0000000Z"}),
-        );
-        w.fakes
-            .mux_rule("-t %7 #{pane_id}|#{@agent-id}", 0, "|\n", "");
-        w.fakes.clear_log();
-        let ok = reply(&run(&w, &["-Client", "claude", "-Task", "hi"]));
-        assert_eq!(ok["name"], "hi");
-        assert!(stale.join("notice.json").is_file());
-        let spawn = format!("spawn|{}|$3", w.caller().server_key);
-        let held: Vec<String> = w
-            .fakes
-            .locks()
-            .into_iter()
-            .filter(|l| {
-                l.contains("|bbbbbbbbbbbb")
-                    || *l == format!("+{spawn}")
-                    || *l == format!("-{spawn}")
-            })
-            .collect();
-        assert_eq!(
-            held[..3],
-            [
-                format!("+{spawn}"),
-                format!("+notice|{}|bbbbbbbbbbbb", w.caller().server_key),
-                format!("-notice|{}|bbbbbbbbbbbb", w.caller().server_key)
-            ]
-        );
-        assert_eq!(held.iter().filter(|l| l.contains("spawn|")).count(), 2);
+        for ended in [true, false] {
+            let w = human();
+            w.clock("2026-10-29T12:00:00.0000000Z");
+            let mut six = reservations(&w, 6, false);
+            let id = "000000000a06";
+            let folder = w.folder(id);
+            let mut record = read_json(&folder.join("record.json"));
+            record["createdAt"] = "2026-10-29T11:58:00.0000000Z".into();
+            crate::agents::fixture::write(&folder.join("record.json"), record);
+            if ended {
+                six[5]["state"] = "finished".into();
+                six[5]["reason"] = "exited".into();
+                six[5]["exit_code"] = 7.into();
+            }
+            reservation_snapshot(&w, &six, false);
+            w.fakes.clear_log();
+            let c = w.caller();
+            w.fakes.clear_log();
+            if ended {
+                public_launch(&w, "t1");
+                let ok = reply(&run(&w, &["-Client", "claude", "-Task", "hi"]));
+                assert_eq!(ok["name"], "hi");
+                assert_eq!(read_json(&folder.join("notice.json"))["exitCode"], 7);
+                let spawn = lock_key("spawn", &c, "$3");
+                let member = lock_key("member", &c, id);
+                let notice = lock_key("notice", &c, id);
+                let mail = lock_key("mail", &c, "pane-1");
+                let bar = lock_key("sidebar", &c, "$3");
+                assert_eq!(
+                    w.fakes.locks(),
+                    [
+                        format!("+{spawn}"),
+                        format!("+{member}"),
+                        format!("+{notice}"),
+                        format!("+{mail}"),
+                        format!("-{mail}"),
+                        format!("-{notice}"),
+                        format!("-{member}"),
+                        format!("-{spawn}"),
+                        format!("+{bar}"),
+                        format!("-{bar}")
+                    ]
+                );
+            } else {
+                assert_eq!(
+                    run(&w, &["-Client", "claude", "-Task", "hi"]),
+                    "2 cap the session already has 6 live agents"
+                );
+                assert!(!folder.join("notice.json").exists());
+                assert_eq!(
+                    w.fakes.locks(),
+                    [
+                        format!("+{}", lock_key("spawn", &c, "$3")),
+                        format!("-{}", lock_key("spawn", &c, "$3"))
+                    ]
+                );
+            }
+            // Authentication and membership each list panes once; assertions above do not relist membership.
+            assert_eq!(
+                w.fakes
+                    .hc_calls()
+                    .iter()
+                    .filter(|(_, a, _)| a[0] == "ls")
+                    .count(),
+                1
+            );
+            assert_eq!(
+                w.fakes
+                    .hc_calls()
+                    .iter()
+                    .filter(|(_, a, _)| a[0] == "get")
+                    .count(),
+                6
+            );
+            assert!(
+                calls(&w, "if-shell")
+                    .iter()
+                    .all(|a| !a.last().unwrap().starts_with("kill-pane"))
+            );
+        }
     }
 
     #[test]
@@ -1759,6 +1813,7 @@ mod tests {
         w.file("t.md", b"task");
         w.file("b.md", b"brief text\n");
         for client in ["claude", "copilot"] {
+            public_snapshot(&w, &[], &[]);
             assert_eq!(
                 run(&w, &["-Client", client, "-TaskFile", "t.md"]),
                 "2 brief this agent starts brief-only, so an agent caller passes -BriefFile",
@@ -1767,6 +1822,7 @@ mod tests {
             assert!(calls(&w, "new-window").is_empty());
             assert!(agent_folders(&w).is_empty());
         }
+        empty_launch(&w);
         let ok = reply(&run(
             &w,
             &[
@@ -1800,6 +1856,7 @@ mod tests {
         );
         // A human needs no brief.
         let w = human();
+        empty_launch(&w);
         assert!(run(&w, &["-Client", "claude", "-Task", "hi"]).starts_with("ok "));
         // Not admitted, an agent caller is checked (C3 first) before the lock.
         let w = ready(World::agent(""));
@@ -1882,6 +1939,7 @@ mod tests {
                     "[mux-agent] You are claude-2 (claude, id 0123456789ab), started in this {name} session."
                 )
             );
+            empty_launch(&w);
             let ok = reply(&run(&w, &["-Client", "claude", "-Task", "hi"]));
             let spec = read_json(
                 &agents_dir(&w)
@@ -1936,7 +1994,11 @@ mod tests {
         // A refused entry launches nothing and leaves no agent folder.
         w.ctx.exe = PathBuf::from("/x\"$(y)/mux-agent");
         w.fakes.clear_log();
-        assert_eq!(run(&w, &["-Client", "claude", "-Task", "hi"]), ENTRY);
+        public_snapshot(&w, &[], &[]);
+        assert_eq!(
+            run(&w, &["-Client", "claude", "-Task", "hi"]),
+            format!("{ENTRY}; abort evidence could not be written")
+        );
         assert!(calls(&w, "new-window").is_empty());
         assert!(agent_folders(&w).is_empty());
     }
@@ -1959,6 +2021,7 @@ mod tests {
                 let w = human();
                 let mut args = vec!["-Client", client, "-Task", "x", "-Name", "w"];
                 args.extend(model);
+                empty_launch(&w);
                 let ok = reply(&run(&w, &args));
                 let spec = read_json(
                     &agents_dir(&w)
@@ -1982,12 +2045,17 @@ mod tests {
                     let w = human();
                     let mut args = vec!["-Client", client, "-Task", &task, "-Name", "w"];
                     args.extend(model);
+                    public_snapshot(&w, &[], &[]);
+                    if fits {
+                        public_launch(&w, "t1");
+                    }
                     let text = run(&w, &args);
                     if fits {
                         assert!(text.starts_with("ok "), "{client} {model:?} {}", task.len());
                     } else {
                         assert_eq!(
-                            text, "2 usage task is too long for the client command line",
+                            text,
+                            "2 usage task is too long for the client command line; abort evidence could not be written",
                             "{client} {model:?}"
                         );
                         assert!(calls(&w, "new-window").is_empty());
@@ -2007,6 +2075,7 @@ mod tests {
                 .mux_first("allow-set-title", 1, "", "invalid option: allow-set-title");
             let mut args = vec!["-Client", "claude", "-Task", "hi"];
             args.extend(extra);
+            empty_launch(&w);
             let ok = reply(&run(&w, &args));
             assert_eq!(ok["name"], "hi", "{extra:?}");
             let folder = agents_dir(&w).join(ok["id"].as_str().unwrap());
@@ -2024,7 +2093,7 @@ mod tests {
                     "-F",
                     "-t",
                     "%9",
-                    "#{==:#{pane_start_command},/bin/mux-agent launcher /s/spec.json}",
+                    "#{==:#{pane_start_command},hc attach t1}",
                     "set-option -p -t %9 allow-set-title off"
                 ]
                 .map(String::from)],
@@ -2035,9 +2104,8 @@ mod tests {
 
     #[test]
     fn pane_cmd_is_exe_launcher_spec() {
-        let host_env =
-            |w: &World| pane_env(w.ctx.state_root.to_str().unwrap(), crate::state::root::HOST);
         let w = human();
+        empty_launch(&w);
         let ok = reply(&run(&w, &["-Client", "claude", "-Task", "hi"]));
         let id = ok["id"].as_str().unwrap();
         let spec = agents_dir(&w).join(id).join("spec.json");
@@ -2055,22 +2123,22 @@ mod tests {
         ]
         .map(String::from)
         .to_vec();
-        expected.extend(host_env(&w));
         expected.extend([
             "-c".into(),
             w.ctx.cwd.to_str().unwrap().into(),
-            "/bin/mux-agent".into(),
-            "launcher".into(),
-            spec.to_str().unwrap().into(),
+            w.fakes.hc_install("hc").to_str().unwrap().into(),
+            "attach".into(),
+            "t1".into(),
         ]);
         assert_eq!(calls(&w, "new-window"), [expected]);
+        assert!(!calls(&w, "new-window")[0].iter().any(|a| a == "-e"));
         assert!(calls(&w, "split-window").is_empty());
         assert_eq!(
             read_json(&spec),
             json!({"schema": 1, "stateDirectory": agents_dir(&w).parent().unwrap().to_str().unwrap(),
                 "id": id, "client": "claude", "parentPane": "%1",
                 "args": ["--session-id", ok["sessionId"], read_json(&spec)["prompt"]],
-                "prompt": read_json(&spec)["prompt"]})
+                "prompt": read_json(&spec)["prompt"], "generation": "0"})
         );
         let keys: Vec<String> = read_json(&spec)
             .as_object()
@@ -2087,7 +2155,8 @@ mod tests {
                 "client",
                 "parentPane",
                 "args",
-                "prompt"
+                "prompt",
+                "generation"
             ]
         );
         let prompt = read_json(&spec)["prompt"].as_str().unwrap().to_string();
@@ -2095,6 +2164,7 @@ mod tests {
         assert_eq!(prompt.split('\n').count(), 7);
         for split in ["h", "v"] {
             let w = human();
+            empty_launch(&w);
             let ok = reply(&run(
                 &w,
                 &["-Client", "copilot", "-Task", "hi", "-Split", split],
@@ -2105,8 +2175,8 @@ mod tests {
             let mut expected: Vec<String> = [
                 "-N",
                 "split-window",
-                "-d",
                 &format!("-{split}"),
+                "-d",
                 "-P",
                 "-F",
                 "#{pane_id}|#{window_id}|#{pane_start_command}",
@@ -2115,15 +2185,15 @@ mod tests {
             ]
             .map(String::from)
             .to_vec();
-            expected.extend(host_env(&w));
             expected.extend([
                 "-c".into(),
                 w.ctx.cwd.to_str().unwrap().into(),
-                "/bin/mux-agent".into(),
-                "launcher".into(),
-                spec.to_str().unwrap().into(),
+                w.fakes.hc_install("hc").to_str().unwrap().into(),
+                "attach".into(),
+                "t1".into(),
             ]);
             assert_eq!(calls(&w, "split-window"), [expected], "{split}");
+            assert!(!calls(&w, "split-window")[0].iter().any(|a| a == "-e"));
             assert!(calls(&w, "new-window").is_empty());
             assert_eq!(
                 read_json(&spec)["args"].as_array().unwrap()[..2],
@@ -2151,6 +2221,7 @@ mod tests {
             if no_fork {
                 args.push("-NoFork");
             }
+            empty_launch(&w);
             let ok = reply(&run(&w, &args));
             let new = ok["sessionId"].as_str().unwrap();
             let folder = agents_dir(&w).join(ok["id"].as_str().unwrap());
@@ -2186,9 +2257,9 @@ mod tests {
                 [
                     "-c",
                     launch.to_str().unwrap(),
-                    "/bin/mux-agent",
-                    "launcher",
-                    spec.to_str().unwrap()
+                    w.fakes.hc_install("hc").to_str().unwrap(),
+                    "attach",
+                    "t1"
                 ],
                 "{case}"
             );
@@ -2220,14 +2291,14 @@ mod tests {
             .fakes
             .mux_calls()
             .into_iter()
-            .find(|c| c.iter().any(|a| a == "launcher"))
+            .find(|c| c.iter().any(|a| a == "attach"))
             .expect("a launch call");
         match launch[1].as_str() {
             "new-window" => "tab".into(),
             _ => {
-                // A split beside the caller: `split-window -d -<h|v> -P -F <format> -t %1`.
-                assert_eq!((launch[2].as_str(), launch[8].as_str()), ("-d", "%1"));
-                launch[3].trim_start_matches('-').into()
+                // A split beside the caller: `split-window -<h|v> -d -P -F <format> -t %1`.
+                assert_eq!((launch[3].as_str(), launch[8].as_str()), ("-d", "%1"));
+                launch[2].trim_start_matches('-').into()
             }
         }
     }
@@ -2260,6 +2331,14 @@ mod tests {
                 text => w.fakes.mux_rule("show-options", 0, text, ""),
             }
             let fakes = w.fakes.clone();
+            let reads = usize::from(extra.is_empty());
+            w.fakes.hc_probe(move |a| {
+                if a[0] == "--version" {
+                    assert_eq!(placement_reads_in(&fakes), reads);
+                    assert!(fakes.locks().is_empty());
+                }
+            });
+            let fakes = w.fakes.clone();
             w.fakes.lock_probe(move |event| {
                 if event.starts_with("+spawn") {
                     format!("reads {}", placement_reads_in(&fakes))
@@ -2270,6 +2349,7 @@ mod tests {
             let mut args = vec!["-Client", "claude", "-Task", "hi"];
             args.extend(extra);
             let case = format!("{extra:?} {stored:?}");
+            empty_launch(&w);
             let ok = reply(&run(&w, &args));
             assert_eq!(
                 (&ok["placement"], &ok["placementSource"]),
@@ -2295,12 +2375,8 @@ mod tests {
     fn bar_on() -> (World, Rc<Cell<bool>>) {
         let w = World::human("");
         w.launches_hold();
-        w.fakes.mux_rule(
-            "new-window",
-            0,
-            "%9|@5|/bin/mux-agent launcher /s/spec.json\n",
-            "",
-        );
+        w.fakes
+            .mux_rule("new-window", 0, "%9|@5|hc attach t1\n", "");
         let exe = w.ctx.exe.display().to_string();
         w.fakes.process(crate::proc::Row {
             pid: 113,
@@ -2321,7 +2397,7 @@ mod tests {
                 stdout: if bar {
                     "%13|@1|113\n"
                 } else {
-                    "%9|@5|/bin/mux-agent launcher /s/spec.json\n"
+                    "%9|@5|hc attach t1\n"
                 }
                 .into(),
                 stderr: String::new(),
@@ -2409,11 +2485,20 @@ mod tests {
             });
             format!("committed {committed}")
         });
+        empty_launch(&w);
         let first = reply(&run(&w, &["-Client", "claude", "-Task", "hi"]));
         assert_eq!(first["sidebar"], "%13");
         assert_eq!(
             keys(&first)[8..],
-            ["model", "placement", "placementSource", "sidebar"]
+            [
+                "model",
+                "placement",
+                "placementSource",
+                "sidebar",
+                "life",
+                "view",
+                "hcAddress"
+            ]
         );
         assert_eq!(
             w.fakes.locks(),
@@ -2432,21 +2517,29 @@ mod tests {
         // A second spawn, a split by the session's placement too, finds the same bar and splits no second one.
         w.fakes.clear_log();
         w.fakes.mux_rule("@mux-agents-placement", 0, "h\n", "");
+        let record = read_json(&w.folder(first["id"].as_str().unwrap()).join("record.json"));
+        public_snapshot(&w, &[], &[crate::agents::core_fixture::wire(&record)]);
+        public_launch(&w, "t2");
         let second = reply(&run(&w, &["-Client", "claude", "-Task", "hi"]));
         assert_eq!(
             (&second["sidebar"], &second["placement"]),
             (&json!("%13"), &json!("h"))
         );
         assert_eq!(bar_splits(&w), 0);
+        assert_eq!(
+            (&first["hcAddress"], &second["hcAddress"]),
+            (&json!("t1"), &json!("t2"))
+        );
     }
 
     #[test]
     fn spawn_with_bar_off_opens_nothing() {
         let (w, _) = bar_on();
         w.fakes.mux_first("@mux-agents-sidebar", 0, "off\n", "");
+        empty_launch(&w);
         let ok = reply(&run(&w, &["-Client", "claude", "-Task", "hi"]));
         assert_eq!(ok["sidebar"], Value::Null);
-        assert_eq!(keys(&ok).last().unwrap(), "sidebar");
+        assert_eq!(&keys(&ok)[11..], ["sidebar", "life", "view", "hcAddress"]);
         assert_eq!(bar_splits(&w), 0);
         assert!(
             calls(&w, "list-panes")
@@ -2488,16 +2581,12 @@ mod tests {
                     let bar = argv.last().is_some_and(|a| a == "watch");
                     Ok(Output {
                         code: i32::from(bar),
-                        stdout: if bar {
-                            ""
-                        } else {
-                            "%9|@5|/bin/mux-agent launcher /s/spec.json\n"
-                        }
-                        .into(),
+                        stdout: if bar { "" } else { "%9|@5|hc attach t1\n" }.into(),
                         stderr: "no space for new pane\n".into(),
                     })
                 }),
             }
+            empty_launch(&w);
             let ok = reply(&run(&w, &["-Client", "claude", "-Task", "hi"]));
             assert_eq!(
                 (&ok["sidebar"], &ok["sidebarError"]),
@@ -2511,7 +2600,10 @@ mod tests {
                     "placement",
                     "placementSource",
                     "sidebar",
-                    "sidebarError"
+                    "sidebarError",
+                    "life",
+                    "view",
+                    "hcAddress"
                 ],
                 "{case}"
             );
@@ -2528,6 +2620,7 @@ mod tests {
         let (w, _) = bar_on();
         w.fakes
             .mux_script("@mux-agents-sidebar", |_| panic!("PANIC-PAYLOAD-bar"));
+        empty_launch(&w);
         let ok = reply(&run(&w, &["-Client", "claude", "-Task", "hi"]));
         assert_eq!(
             (&ok["sidebar"], &ok["sidebarError"]),
@@ -2537,6 +2630,7 @@ mod tests {
         assert!(folder.join("commit.json").is_file());
         let (w, _) = bar_on();
         w.fakes.lock_timeout("sidebar|");
+        empty_launch(&w);
         assert!(run(&w, &["-Client", "claude", "-Task", "hi"]).starts_with("ok "));
         let key = w.caller().server_key;
         assert_eq!(
@@ -2589,8 +2683,8 @@ mod tests {
         for (code, stored) in [(1, ""), (0, "h\n")] {
             let w = human();
             w.fakes.mux_rule("show-options", code, stored, "");
-            let six = rows(6);
-            w.panes(&six.iter().map(String::as_str).collect::<Vec<_>>());
+            let six = reservations(&w, 6, false);
+            reservation_snapshot(&w, &six, false);
             assert_eq!(
                 run(&w, &["-Client", "claude", "-Task", "hi"]),
                 "2 cap the session already has 6 live agents",
@@ -2616,6 +2710,7 @@ mod tests {
                     .join(format!("{OLD}.jsonl")),
                 Client::Copilot => session_folder(&w.ctx.home, OLD).join("events.jsonl"),
             };
+            empty_launch(&w);
             let ok = reply(&run(
                 &w,
                 &["-Client", child, "-TaskFile", "t.md", "-BriefFile", "b.md"],
@@ -2653,6 +2748,7 @@ mod tests {
             names.sort();
             names
         };
+        public_snapshot(&w, &[], &[]);
         assert_eq!(
             run(&w, &["-Client", "copilot", "-TaskFile", "t.md"]),
             "2 brief this agent starts brief-only, so an agent caller passes -BriefFile"
@@ -2661,6 +2757,7 @@ mod tests {
         assert!(agent_folders(&w).is_empty());
         assert_eq!(names(), [OLD]);
         // With a brief it starts a fresh session, and says why everywhere.
+        empty_launch(&w);
         let ok = reply(&run(
             &w,
             &[
@@ -2726,367 +2823,399 @@ mod tests {
 
     #[test]
     fn failure_after_launch_writes_abort_kills_pane() {
-        // The kill is bound to the creation reply's start command alone (the pane live or dead), and only a gone
-        // probe after it says the pane was closed.
         let kill = [
             "-N",
             "if-shell",
             "-F",
             "-t",
             "%9",
-            "#{==:#{pane_start_command},/bin/mux-agent launcher /s/spec.json}",
+            "#{==:#{pane_start_command},hc attach t1}",
             "kill-pane -t %9",
         ]
-        .map(String::from)
-        .to_vec();
-        for (gone, want) in [
-            (
-                "|\n",
-                "1 launch the agent did not start; its pane was closed",
-            ),
-            ("%9|\n", "1 launch the agent did not start"),
-            ("", "1 launch the agent did not start"),
-        ] {
-            let w = human();
-            w.fakes.mux_first("set-option", 1, "", "no pane");
+        .map(String::from);
+        for (gone, closed) in [("|\n", true), ("%9|\n", false), ("", false)] {
+            let w = hc_world(human());
+            w.fakes.mux_first("@agent-context", 1, "", "no pane");
             w.fakes
                 .mux_first("-t %9 #{pane_id}|#{@agent-id}", 0, gone, "");
+            let e = hc_attempt(&w, Client::Claude, None, true).unwrap_err();
             assert_eq!(
-                run(&w, &["-Client", "claude", "-Task", "hi"]),
-                want,
-                "{gone:?}"
+                (e.code, e.check, e.message.as_str()),
+                (1, "rmux", "tmux call failed")
             );
             let folder = agents_dir(&w).join(&agent_folders(&w)[0]);
+            let abort = read_json(&folder.join("abort.json"));
+            let mut identity = read_json(&folder.join("record.json"));
+            for k in ["pane", "window", "startCommand"] {
+                identity.as_object_mut().unwrap().remove(k);
+            }
             assert_eq!(
-                std::fs::read_to_string(folder.join("abort.json")).unwrap(),
-                r#"{"abortedAt":"1970-01-01T00:00:00.0000000Z","pane":"%9"}"#
+                abort,
+                json!({"hcAddress":"t1","identity":identity,"pane":"%9","kill":"acknowledged","viewCleanup":{"gone":closed}})
             );
-            assert!(!folder.join("record.json").exists() && !folder.join("commit.json").exists());
-            let kills: Vec<Vec<String>> = calls(&w, "if-shell")
+            assert!(folder.join("record.json").is_file());
+            assert!(!folder.join("commit.json").exists());
+            let kills: Vec<_> = calls(&w, "if-shell")
                 .into_iter()
                 .filter(|c| c[6].starts_with("kill-pane"))
                 .collect();
-            assert_eq!(kills, std::slice::from_ref(&kill), "{gone:?}");
-            assert!(calls(&w, "kill-pane").is_empty(), "{gone:?}");
+            assert_eq!(kills, [kill.to_vec()]);
+            assert!(calls(&w, "kill-pane").is_empty());
         }
-        // A reply naming the pane but no start command: never the agent's, so it is not killed and not claimed.
-        let w = human();
-        w.fakes.mux_first("new-window", 0, "%9|@5|\n", "");
-        assert_eq!(
-            run(&w, &["-Client", "claude", "-Task", "hi"]),
-            "1 launch the agent did not start"
-        );
-        let folder = agents_dir(&w).join(&agent_folders(&w)[0]);
-        assert_eq!(
-            std::fs::read_to_string(folder.join("abort.json")).unwrap(),
-            r#"{"abortedAt":"1970-01-01T00:00:00.0000000Z","pane":"%9"}"#
-        );
-        assert!(calls(&w, "if-shell").is_empty() && calls(&w, "set-option").is_empty());
-        // A failed or garbled launch names no pane: abort.json says null and nothing is killed or tagged.
-        for (code, out) in [
-            (1, "%9|@5|/bin/mux-agent launcher /s/spec.json\n"),
-            (0, ""),
-            (0, "%9|@5|/bin/mux-agent launcher /s/spec.json\n%10|@6\n"),
-            (0, "%9|@5\n"),
-            (0, "%9|@5;kill-server\n"),
-            (0, "#{pane_id}|@5|x\n"),
-            (0, "%9 |@5|x\n"),
+        for (code, out, message) in [
+            (0, "%9|@5|\n", "unexpected error (unproven new view)"),
+            (1, "%9|@5|hc attach t1\n", "tmux call failed"),
+            (0, "", "unexpected error (unproven new view)"),
+            (
+                0,
+                "%9|@5|hc attach t1\n%10|@6\n",
+                "unexpected error (unproven new view)",
+            ),
+            (0, "%9|@5\n", "unexpected error (unproven new view)"),
+            (
+                0,
+                "%9|@5;kill-server\n",
+                "unexpected error (unproven new view)",
+            ),
+            (
+                0,
+                "#{pane_id}|@5|x\n",
+                "unexpected error (unproven new view)",
+            ),
+            (0, "%9 |@5|x\n", "unexpected error (unproven new view)"),
         ] {
-            let w = human();
+            let w = hc_world(human());
             w.fakes.mux_first("new-window", code, out, "");
+            let e = hc_attempt(&w, Client::Claude, None, true).unwrap_err();
             assert_eq!(
-                run(&w, &["-Client", "claude", "-Task", "hi"]),
-                "1 launch the agent did not start",
-                "{out:?}"
+                (e.code, e.check, e.message.as_str()),
+                (1, if code == 1 { "rmux" } else { "internal" }, message)
             );
             let folder = agents_dir(&w).join(&agent_folders(&w)[0]);
+            let a = read_json(&folder.join("abort.json"));
             assert_eq!(
-                std::fs::read_to_string(folder.join("abort.json")).unwrap(),
-                r#"{"abortedAt":"1970-01-01T00:00:00.0000000Z","pane":null}"#
+                (&a["hcAddress"], &a["pane"], &a["kill"], &a["viewCleanup"]),
+                (
+                    &json!("t1"),
+                    &Value::Null,
+                    &json!("acknowledged"),
+                    &json!("unproven")
+                )
             );
-            assert!(calls(&w, "if-shell").is_empty() && calls(&w, "set-option").is_empty());
+            assert!(folder.join("record.json").is_file());
+            assert!(!folder.join("commit.json").exists());
+            assert!(calls(&w, "if-shell").is_empty());
+            assert!(calls(&w, "set-option").is_empty());
         }
-        // A CRLF line end is not garbled, and the start command may hold `|`; record.json keeps it exactly.
-        let w = human();
-        w.fakes.mux_first(
-            "new-window",
-            0,
-            "%9|@5|/b/mux|agent launcher /s/spec.json\r\n",
-            "",
-        );
-        let ok = reply(&run(&w, &["-Client", "claude", "-Task", "hi"]));
-        assert_eq!((&ok["pane"], &ok["window"]), (&json!("%9"), &json!("@5")));
-        let folder = agents_dir(&w).join(&agent_folders(&w)[0]);
+        let w = hc_world(human());
+        w.fakes
+            .mux_first("new-window", 0, "%9|@5|/b/hc|binary attach t1\r\n", "");
+        let r = hc_attempt(&w, Client::Claude, None, false).unwrap();
         assert_eq!(
-            read_json(&folder.join("record.json"))["startCommand"],
-            "/b/mux|agent launcher /s/spec.json"
+            (&r["pane"], &r["window"], &r["startCommand"]),
+            (&json!("%9"), &json!("@5"), &json!("/b/hc|binary attach t1"))
         );
-        // A Copilot fork's copy is deleted when the launch fails, and kept when it commits.
         for fail in [true, false] {
-            let mut w = agent();
-            w.fakes.client(CLAUDE, Client::Copilot);
-            let mut pairs: Vec<(String, String)> = w
-                .ctx
-                .env
-                .iter()
-                .map(|(k, v)| (k.to_string(), v.to_string()))
-                .collect();
-            pairs.push(("COPILOT_AGENT_SESSION_ID".into(), OLD.into()));
-            w.ctx.env = Env::from_pairs(pairs);
-            w.ctx.home = w.ctx.cwd.parent().unwrap().join("home");
+            let (w, _) = admitted(Client::Copilot, true);
+            let w = hc_world(w);
             let source = session_folder(&w.ctx.home, OLD);
-            std::fs::create_dir_all(&source).unwrap();
-            std::fs::write(source.join("workspace.yaml"), format!("id: {OLD}\n")).unwrap();
-            std::fs::write(
-                source.join("events.jsonl"),
-                format!("{{\"sessionId\":\"{OLD}\"}}\n"),
-            )
-            .unwrap();
             if fail {
-                w.fakes.mux_first("set-option", 1, "", "");
+                w.fakes.mux_first("@agent-context", 1, "", "bad");
             }
-            w.file("t.md", b"task");
-            let text = run(&w, &["-Client", "copilot", "-TaskFile", "t.md"]);
-            let mut sessions: Vec<String> = std::fs::read_dir(source.parent().unwrap())
-                .unwrap()
-                .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
-                .collect();
-            sessions.sort();
-            if fail {
-                assert_eq!(text, "1 launch the agent did not start");
-                assert_eq!(sessions, [OLD]);
-            } else {
-                let ok = reply(&text);
-                assert_eq!(
-                    (&ok["context"], &ok["reason"]),
-                    (&json!("fork"), &json!("same-client"))
-                );
-                let new = ok["sessionId"].as_str().unwrap();
-                assert!(sessions.contains(&new.to_string()) && sessions.len() == 2);
-                let spec = read_json(
-                    &agents_dir(&w)
-                        .join(ok["id"].as_str().unwrap())
-                        .join("spec.json"),
-                );
-                assert_eq!(
-                    spec["args"].as_array().unwrap()[..3],
-                    [json!("--resume"), json!(new), json!("-i")]
-                );
-            }
+            let got = hc_attempt(&w, Client::Copilot, None, fail);
+            assert_eq!(got.is_err(), fail);
+            let folder = agents_dir(&w).join(&agent_folders(&w)[0]);
+            let record = read_json(&folder.join("record.json"));
+            assert_eq!(
+                (&record["context"], &record["reason"]),
+                (&json!("fork"), &json!("same-client"))
+            );
+            let new = record["sessionId"].as_str().unwrap();
+            let copy = session_folder(&w.ctx.home, new);
+            assert!(copy.join("workspace.yaml").is_file());
+            assert!(copy.join("events.jsonl").is_file());
+            assert_eq!(
+                std::fs::read_dir(source.parent().unwrap()).unwrap().count(),
+                2
+            );
+            assert_eq!(
+                read_json(&folder.join("spec.json"))["args"]
+                    .as_array()
+                    .unwrap()[..3],
+                [json!("--resume"), json!(new), json!("-i")]
+            );
+            assert_eq!(crate::agents::committed(&folder), !fail);
+            assert_eq!(folder.join("abort.json").exists(), fail);
         }
     }
 
     #[test]
     fn record_then_commit_order() {
-        let w = human();
+        let w = hc_world(human());
+        let _reset = HcCommitReset;
         let agents = agents_dir(&w);
         let log = Rc::new(RefCell::new(Vec::new()));
         let (seen, dir) = (log.clone(), agents.clone());
-        w.fakes.mux_script("new-window", move |argv| {
-            let spec = PathBuf::from(argv.last().unwrap());
-            seen.borrow_mut()
-                .push(format!("launch spec {}", spec.is_file()));
-            let _ = &dir;
+        w.fakes.mux_script("new-window", move |_| {
+            let folder = std::fs::read_dir(&dir)
+                .unwrap()
+                .next()
+                .unwrap()
+                .unwrap()
+                .path();
+            assert!(
+                folder.join("record.json").is_file(),
+                "hc identity must precede attachment"
+            );
+            let r = read_json(&folder.join("record.json"));
+            assert_eq!(r["hcAddress"], "t1");
+            assert!(r.get("pane").is_none());
+            assert!(folder.join("spec.json").is_file());
+            assert!(!folder.join("commit.json").exists());
+            seen.borrow_mut().push("attach");
             Ok(Output {
-                code: 0,
-                stdout: "%9|@5|/bin/mux-agent launcher /s/spec.json\n".into(),
-                stderr: String::new(),
+                stdout: "%9|@5|hc attach t1\n".into(),
+                ..Output::default()
             })
         });
         let (seen, dir) = (log.clone(), agents.clone());
-        w.fakes.mux_script("set-option", move |argv| {
-            let command = argv.last().cloned().unwrap_or_default();
-            if command.contains("allow-set-title") {
-                seen.borrow_mut().push("allow-set-title".into());
-                return Ok(Output::default());
-            }
-            let id = command
-                .split(' ')
-                .skip_while(|t| *t != "@agent-id")
-                .nth(1)
-                .unwrap_or_default()
-                .to_string();
-            let folder = dir.join(id);
-            seen.borrow_mut().push(format!(
-                "tag record {} commit {}",
-                folder.join("record.json").exists(),
-                folder.join("commit.json").exists()
-            ));
+        w.fakes.mux_script("@agent-context", move |_| {
+            let folder = std::fs::read_dir(&dir)
+                .unwrap()
+                .next()
+                .unwrap()
+                .unwrap()
+                .path();
+            let r = read_json(&folder.join("record.json"));
+            assert_eq!(r["hcAddress"], "t1");
+            assert!(r.get("pane").is_none());
+            assert!(!folder.join("commit.json").exists());
+            seen.borrow_mut().push("tag");
             Ok(Output::default())
         });
-        // At the moment commit.json is written, record.json is already there and commit.json is not yet.
         let seen = log.clone();
-        commit_probe(Some(Box::new(move |folder: &Path| {
-            seen.borrow_mut().push(format!(
-                "commit: record {} commit {}",
-                folder.join("record.json").is_file(),
-                folder.join("commit.json").exists()
-            ));
+        w.fakes.mux_script("select-pane -T", move |_| {
+            seen.borrow_mut().push("title");
+            Ok(Output::default())
+        });
+        let seen = log.clone();
+        w.fakes.mux_script("allow-set-title", move |_| {
+            seen.borrow_mut().push("option");
+            Ok(Output::default())
+        });
+        let seen = log.clone();
+        commit_probe(Some(Box::new(move |folder| {
+            let r = read_json(&folder.join("record.json"));
+            assert_eq!(
+                (&r["pane"], &r["window"], &r["startCommand"]),
+                (&json!("%9"), &json!("@5"), &json!("hc attach t1"))
+            );
+            assert!(!folder.join("commit.json").exists());
+            seen.borrow_mut().push("commit");
         })));
-        w.fakes.clear_log();
-        let ok = reply(&run(&w, &["-Client", "claude", "-Task", "hi"]));
-        let id = ok["id"].as_str().unwrap();
+        let r = hc_attempt(&w, Client::Claude, None, false).unwrap();
         assert_eq!(
             *log.borrow(),
-            [
-                "launch spec true",
-                "tag record false commit false",
-                // Before the commit, so before the launcher starts the client.
-                "allow-set-title",
-                "commit: record true commit false"
-            ]
+            ["attach", "tag", "title", "option", "commit"]
         );
-        let caller = w.caller();
-        assert_eq!(
-            w.fakes.locks()[0],
-            format!("+spawn|{}|$3", caller.server_key)
-        );
-        // The tags, the title and the option, each bound to the command the reply named: the server writes them only
-        // while %9 still runs it.
-        let launched = "#{==:#{pane_start_command},/bin/mux-agent launcher /s/spec.json}";
-        let bound = |command: String| -> Vec<String> {
-            ["-N", "if-shell", "-F", "-t", "%9", launched]
-                .map(String::from)
-                .into_iter()
-                .chain([command])
-                .collect()
-        };
-        let tags = bound(format!(
-            "set-option -p -t %9 @agent-id {id} ; set-option -p -t %9 @agent-name hi ; \
-             set-option -p -t %9 @agent-parent %1 ; set-option -p -t %9 @agent-context brief:human ; \
-             select-pane -T hi -t %9"
-        ));
-        let title = bound("set-option -p -t %9 allow-set-title off".into());
-        assert_eq!(calls(&w, "if-shell"), [tags, title]);
-        assert!(calls(&w, "set-option").is_empty() && calls(&w, "select-pane").is_empty());
-        // Then one read shows %9 still that launch.
-        assert!(w.fakes.mux_calls().iter().any(|c| c[1] == "display-message"
-            && c[4] == "%9"
-            && c[5] == format!("#{{pane_id}}|{launched}")));
+        commit_probe(None);
+        let id = r["id"].as_str().unwrap();
         let folder = agents.join(id);
-        let record = json!({"schema": 1, "id": id, "name": "hi", "client": "claude",
-            "sessionId": ok["sessionId"], "context": "brief", "reason": "human", "session": "$3",
-            "pane": "%9", "window": "@5", "parentPane": "%1", "parentAgent": null,
-            "directory": w.ctx.cwd.to_str().unwrap(), "taskLine": "hi",
-            "createdAt": "1970-01-01T00:00:00.0000000Z", "color": "blue",
-            "startCommand": "/bin/mux-agent launcher /s/spec.json"});
+        let caller = w.caller();
+        let spec = folder.join("spec.json");
+        let argv = json!([
+            utf8(&w.ctx.exe).unwrap(),
+            "launcher",
+            utf8(&spec).unwrap(),
+            "--state-root",
+            utf8(&w.ctx.state_root).unwrap(),
+            "--path",
+            w.ctx.env.get("PATH").unwrap_or("")
+        ]);
+        let expected = json!({"schema":1,"id":id,"name":"hi","client":"claude","sessionId":r["sessionId"],
+            "context":"brief","reason":"human","session":"$3","team":format!("{}:$3",caller.server_key),"generation":"0","parentPane":"%1","parentAgent":null,
+            "directory":w.ctx.cwd,"taskLine":"hi","createdAt":"1970-01-01T00:00:00.0000000Z","color":"blue",
+            "hcAddress":"t1","launcherArgv":argv,"pane":"%9","window":"@5","startCommand":"hc attach t1"});
         assert_eq!(
             std::fs::read_to_string(folder.join("record.json")).unwrap(),
-            record.to_string()
+            expected.to_string()
         );
+        assert_eq!(r.to_string(), expected.to_string());
+        assert_eq!(read_json(&spec)["generation"], "0");
         assert_eq!(
-            std::fs::read_to_string(folder.join("commit.json")).unwrap(),
-            r#"{"committedAt":"1970-01-01T00:00:00.0000000Z"}"#
+            read_json(&folder.join("commit.json")),
+            json!({"committedAt":"1970-01-01T00:00:00.0000000Z"})
         );
-        let keys: Vec<String> = ok.as_object().unwrap().keys().cloned().collect();
-        assert_eq!(
-            keys,
+        let bound = |command: String| {
             [
-                "name",
-                "id",
-                "pane",
-                "window",
-                "client",
-                "sessionId",
-                "context",
-                "reason",
-                "model",
-                "placement",
-                "placementSource",
-                "sidebar"
+                "-N",
+                "if-shell",
+                "-F",
+                "-t",
+                "%9",
+                "#{==:#{pane_start_command},hc attach t1}",
+            ]
+            .map(String::from)
+            .into_iter()
+            .chain([command])
+            .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            calls(&w, "if-shell"),
+            [
+                bound(format!(
+                    "set-option -p -t %9 @agent-id {id} ; set-option -p -t %9 @agent-name hi ; set-option -p -t %9 @agent-parent %1 ; set-option -p -t %9 @agent-context brief:human"
+                )),
+                bound("select-pane -T hi -t %9".into()),
+                bound("set-option -p -t %9 allow-set-title off".into())
             ]
         );
-        assert_eq!(ok["model"], "inherited");
-        // A chosen model is recorded last and replied after reason; with none the record has no model.
-        let w = human();
-        let ok = reply(&run(
-            &w,
-            &["-Client", "claude", "-Task", "hi", "-Model", "sonnet"],
-        ));
-        assert_eq!(ok["model"], "sonnet");
-        let record = read_json(
+        assert!(calls(&w, "set-option").is_empty());
+        assert!(calls(&w, "select-pane").is_empty());
+        assert!(w.fakes.mux_calls().iter().any(|a| {
+            a == &[
+                "-N",
+                "display-message",
+                "-p",
+                "-t",
+                "%9",
+                "#{pane_id}|#{==:#{pane_start_command},hc attach t1}",
+            ]
+            .map(String::from)
+        }));
+        assert!(!r.as_object().unwrap().contains_key("model"));
+        let w = hc_world(human());
+        let r = hc_attempt(&w, Client::Claude, Some("sonnet"), false).unwrap();
+        assert_eq!(r["model"], "sonnet");
+        let names: Vec<_> = r.as_object().unwrap().keys().map(String::as_str).collect();
+        assert_eq!(
+            &names[16..],
+            [
+                "model",
+                "hcAddress",
+                "launcherArgv",
+                "pane",
+                "window",
+                "startCommand"
+            ]
+        );
+        let spec = read_json(
             &agents_dir(&w)
-                .join(ok["id"].as_str().unwrap())
-                .join("record.json"),
+                .join(r["id"].as_str().unwrap())
+                .join("spec.json"),
         );
         assert_eq!(
-            record.as_object().unwrap().keys().next_back().unwrap(),
-            "model"
+            spec["args"].as_array().unwrap()[2..4],
+            [json!("--model"), json!("sonnet")]
         );
-        assert_eq!(record["model"], "sonnet");
-        // A record that cannot be written is never committed: the launch aborts and the pane closes, and no commit
-        // was ever written.
-        let commits = Rc::new(RefCell::new(0));
-        let seen = commits.clone();
-        commit_probe(Some(Box::new(move |_: &Path| *seen.borrow_mut() += 1)));
-        let w = human();
-        let dir = agents_dir(&w);
-        w.fakes.mux_script("set-option", move |argv| {
-            let command = argv.last().cloned().unwrap_or_default();
-            let id = command
-                .split(' ')
-                .skip_while(|t| *t != "@agent-id")
-                .nth(1)
-                .map(str::to_string);
-            if let Some(id) = id {
-                std::fs::create_dir(dir.join(id).join("record.json")).unwrap();
+        for stage in ["before-attach", "after-tags"] {
+            let w = hc_world(human());
+            let _reset = HcCommitReset;
+            let commits = Rc::new(Cell::new(0));
+            let seen = commits.clone();
+            commit_probe(Some(Box::new(move |_| seen.set(seen.get() + 1))));
+            if stage == "before-attach" {
+                w.fakes.hc_probe(|a| {
+                    if a[0] == "run" {
+                        let i = a.iter().position(|v| v == "launcher").unwrap();
+                        std::fs::create_dir(
+                            Path::new(&a[i + 1]).parent().unwrap().join("record.json"),
+                        )
+                        .unwrap();
+                    }
+                });
+            } else {
+                let agents = agents_dir(&w);
+                w.fakes.mux_script("@agent-context", move |_| {
+                    let path = std::fs::read_dir(&agents)
+                        .unwrap()
+                        .next()
+                        .unwrap()
+                        .unwrap()
+                        .path()
+                        .join("record.json");
+                    std::fs::remove_file(&path).unwrap();
+                    std::fs::create_dir(path).unwrap();
+                    Ok(Output::default())
+                });
             }
-            Ok(Output::default())
-        });
-        w.fakes
-            .mux_first("-t %9 #{pane_id}|#{@agent-id}", 0, "|\n", "");
-        assert_eq!(
-            run(&w, &["-Client", "claude", "-Task", "hi"]),
-            "1 launch the agent did not start; its pane was closed"
-        );
-        let folder = agents_dir(&w).join(&agent_folders(&w)[0]);
-        assert!(folder.join("abort.json").is_file() && !folder.join("commit.json").exists());
-        assert_eq!(
-            calls(&w, "if-shell")
-                .iter()
-                .filter(|c| c[6].starts_with("kill-pane"))
-                .count(),
-            1
-        );
-        assert_eq!(*commits.borrow(), 0);
-        commit_probe(None);
+            assert!(hc_attempt(&w, Client::Claude, None, true).is_err());
+            assert_eq!(commits.get(), 0);
+            let folder = agents_dir(&w).join(&agent_folders(&w)[0]);
+            assert!(!folder.join("commit.json").exists());
+            let a = read_json(&folder.join("abort.json"));
+            assert_eq!(a["kill"], "acknowledged");
+            assert_eq!(
+                a["viewCleanup"],
+                if stage == "before-attach" {
+                    json!("unproven")
+                } else {
+                    json!({"gone":true})
+                }
+            );
+            assert_eq!(
+                calls(&w, "if-shell")
+                    .iter()
+                    .filter(|a| a[6] == "kill-pane -t %9")
+                    .count(),
+                usize::from(stage == "after-tags")
+            );
+        }
     }
 
     #[test]
     fn a_launcher_that_gave_up_first_makes_the_spawn_refuse_and_roll_back() {
-        // #97: on a slow server the launcher's 30 s commit wait can end before the spawn commits. The launcher made
-        // commit.json first, as its give-up, so the spawn must not answer ok for an agent that will never start.
-        commit_probe(Some(Box::new(|folder: &Path| {
-            crate::agents::fixture::write(&folder.join("commit.json"), json!({"aborted": true}));
-        })));
-        let w = human();
-        w.fakes
-            .mux_first("-t %9 #{pane_id}|#{@agent-id}", 0, "|\n", "");
-        let out = run(&w, &["-Client", "claude", "-Task", "hi"]);
-        commit_probe(None);
-        assert!(out.starts_with("1 launch the agent did not start"), "{out}");
-        let folder = agents_dir(&w).join(&agent_folders(&w)[0]);
-        assert!(!crate::agents::committed(&folder));
-        assert_eq!(
-            crate::state::fs::read_json(&folder.join("commit.json")).unwrap(),
-            Some(json!({"aborted": true}))
-        );
-        // A spawn that commits first is committed, as before.
-        let w = human();
-        assert!(reply(&run(&w, &["-Client", "claude", "-Task", "hi"]))["id"].is_string());
-        let folder = agents_dir(&w).join(&agent_folders(&w)[0]);
-        assert!(crate::agents::committed(&folder));
+        for gave_up in [true, false] {
+            let _reset = HcCommitReset;
+            if gave_up {
+                commit_probe(Some(Box::new(|folder| {
+                    crate::agents::fixture::write(
+                        &folder.join("commit.json"),
+                        json!({"aborted":true}),
+                    );
+                })));
+            }
+            let w = hc_world(human());
+            let result = hc_attempt(&w, Client::Claude, None, gave_up);
+            let folder = agents_dir(&w).join(&agent_folders(&w)[0]);
+            if gave_up {
+                let e = result.unwrap_err();
+                assert_eq!(
+                    (e.code, e.check, e.message.as_str()),
+                    (1, "launch", "the launcher gave up before the commit")
+                );
+                assert_eq!(
+                    read_json(&folder.join("commit.json")),
+                    json!({"aborted":true})
+                );
+                let abort = read_json(&folder.join("abort.json"));
+                assert_eq!(
+                    (&abort["kill"], &abort["viewCleanup"]),
+                    (&json!("acknowledged"), &json!({"gone":true}))
+                );
+            } else {
+                assert_eq!(result.unwrap()["hcAddress"], "t1");
+                assert_eq!(
+                    read_json(&folder.join("commit.json")),
+                    json!({"committedAt":"1970-01-01T00:00:00.0000000Z"})
+                );
+                assert!(!folder.join("abort.json").exists());
+            }
+            assert_eq!(crate::agents::committed(&folder), !gave_up);
+        }
     }
 
     #[test]
     fn reservations_count_once_and_their_names_stay_taken() {
-        // Five tagged panes with no record here (another state root's agents, or launches in progress), one tag on
-        // two panes: five places, never six.
+        use crate::agents::core_fixture as cf;
         let w = human();
-        let mut panes = rows(5);
-        panes.push(format!("%40|@40|340|{:012x}|claude-1", 0xa01));
-        w.panes(&panes.iter().map(String::as_str).collect::<Vec<_>>());
-        // Their names are taken, as opaque names.
+        let wires = reservations(&w, 5, true);
+        let mut addresses: Vec<_> = wires
+            .iter()
+            .map(|v| v["address"].as_str().unwrap())
+            .collect();
+        addresses.push(addresses[0]);
+        public_snapshot(&w, &addresses, &wires);
         assert_eq!(
             run(
                 &w,
@@ -3094,156 +3223,360 @@ mod tests {
             ),
             "2 name agent name is taken, try claude-3-2"
         );
-        let ok = reply(&run(&w, &["-Client", "claude", "-Task", "hi"]));
-        assert_eq!(ok["name"], "hi");
-        // A running agent whose pane carries a reserved id's tag (rotated there) counts once, as itself: six.
-        let w = human();
-        w.agent_record(
-            "000000000d01",
-            json!({"name": "mine", "pane": "%30", "color": "blue"}),
+        public_snapshot(&w, &addresses, &wires);
+        public_launch(&w, "t1");
+        assert_eq!(
+            reply(&run(&w, &["-Client", "claude", "-Task", "hi"]))["name"],
+            "hi"
         );
-        let mut panes = rows(5);
-        panes.push(format!("%30|@30|330|{:012x}|claude-1", 0xa01));
-        w.panes(&panes.iter().map(String::as_str).collect::<Vec<_>>());
+        assert_eq!(
+            w.fakes
+                .hc_calls()
+                .iter()
+                .filter(|(_, a, _)| a[0] == "get")
+                .count(),
+            10
+        );
+        let w = human();
+        let mut wires = reservations(&w, 5, true);
+        let addresses: Vec<_> = wires
+            .iter()
+            .map(|v| v["address"].as_str().unwrap().to_string())
+            .collect();
+        let r = cf::member(&w, "000000000d01", json!({"name": "mine", "color": "blue"}));
+        wires.push(cf::wire(&r));
+        w.panes(&[]);
+        public_snapshot(
+            &w,
+            &addresses.iter().map(String::as_str).collect::<Vec<_>>(),
+            &wires,
+        );
         assert_eq!(
             run(&w, &["-Client", "claude", "-Task", "hi"]),
             "2 cap the session already has 6 live agents"
         );
-        // Tags never name a running agent's name: `mine` is taken by its record, the tag's `claude-1` by the
-        // reservation.
         let w = human();
-        w.agent_record("000000000d01", json!({"name": "mine", "pane": "%30"}));
-        w.panes(&[&format!("%30|@30|330|{:012x}|claude-1", 0xa01)]);
+        let mut wires = reservations(&w, 1, true);
+        let r = cf::member(&w, "000000000d01", json!({"name": "mine"}));
+        wires.push(cf::wire(&r));
         for name in ["mine", "claude-1"] {
-            assert!(
-                run(&w, &["-Client", "claude", "-Task", "hi", "-Name", name])
-                    .starts_with("2 name agent name is taken"),
-                "{name}"
+            public_snapshot(&w, &["t000000000a01"], &wires);
+            assert_eq!(
+                run(&w, &["-Client", "claude", "-Task", "hi", "-Name", name]),
+                format!("2 name agent name is taken, try {name}-2")
             );
         }
     }
 
     #[test]
     fn rollback_keeps_a_replacement_and_closes_its_own_launch_live_or_dead() {
-        let ours = "/bin/mux-agent launcher /s/spec.json";
-        // (what %9 runs when the rollback's conditional is checked, killed, the reply)
-        for (now, killed, want) in [
-            (
-                ours,
-                true,
-                "1 launch the agent did not start; its pane was closed",
-            ),
-            ("sh", false, "1 launch the agent did not start"),
-        ] {
-            let w = human();
+        for now in ["hc attach t1", "sh"] {
+            let w = hc_world(human());
             let pane = Rc::new(RefCell::new(Some(now.to_string())));
             let state = pane.clone();
             w.fakes.mux_script("if-shell", move |argv| {
-                let mut held = state.borrow_mut();
-                let holds = held.as_ref().is_some_and(|command| {
-                    let launch = registry::Launch {
-                        command: command.clone(),
-                        pid: None,
-                    };
-                    argv[5] == launch.launched()
+                let mut current = state.borrow_mut();
+                let holds = current.as_ref().is_some_and(|command| {
+                    argv[5]
+                        == registry::Launch {
+                            command: command.clone(),
+                            pid: None,
+                        }
+                        .launched()
                 });
-                if holds && argv[6].starts_with("kill-pane") {
-                    *held = None;
+                if argv[6] == "kill-pane -t %9" && (argv[5] == "1" || holds) {
+                    *current = None;
                 }
                 Ok(Output::default())
             });
-            // Registered last, so it answers first: the bound tag call fails, and the spawn rolls back.
-            w.fakes.mux_first("set-option", 1, "", "no pane");
-            let probed = pane.clone();
+            w.fakes.mux_first("@agent-context", 1, "", "bad");
+            let probe = pane.clone();
             w.fakes
                 .mux_script("-t %9 #{pane_id}|#{@agent-id}", move |_| {
                     Ok(Output {
-                        code: 0,
-                        stdout: if probed.borrow().is_some() {
-                            "%9|\n"
-                        } else {
+                        stdout: if probe.borrow().is_none() {
                             "|\n"
+                        } else {
+                            "%9|\n"
                         }
                         .into(),
-                        stderr: String::new(),
+                        ..Output::default()
                     })
                 });
+            let e = hc_attempt(&w, Client::Claude, None, true).unwrap_err();
             assert_eq!(
-                run(&w, &["-Client", "claude", "-Task", "hi"]),
-                want,
-                "{now}"
+                (e.code, e.check, e.message.as_str()),
+                (1, "rmux", "tmux call failed")
             );
-            assert_eq!(pane.borrow().is_none(), killed, "{now}");
+            assert_eq!(pane.borrow().is_none(), now == "hc attach t1");
+            let a = read_json(
+                &agents_dir(&w)
+                    .join(&agent_folders(&w)[0])
+                    .join("abort.json"),
+            );
+            assert_eq!(a["kill"], "acknowledged");
+            assert_eq!(a["viewCleanup"], json!({"gone":now=="hc attach t1"}));
         }
     }
 
     #[test]
     fn a_pane_replaced_before_it_is_tagged_is_never_written() {
-        // D1: the pane the reply named is respawned (`sh`) before the tags: no tag, title or option reaches it, it is
-        // not killed, and the spawn refuses `1 launch` with no closure claim and no record.
-        let w = human();
-        let ours = "/bin/mux-agent launcher /s/spec.json";
-        let pane = Rc::new(RefCell::new(Some("sh".to_string())));
-        let acted = Rc::new(RefCell::new(Vec::<String>::new()));
-        let (state, log) = (pane.clone(), acted.clone());
-        w.fakes.mux_script("if-shell", move |argv| {
-            let command = state.borrow().clone();
-            let holds = command.is_some_and(|command| {
-                let launch = registry::Launch { command, pid: None };
-                argv[5] == launch.launched() || argv[5] == launch.live()
-            });
-            if holds {
-                log.borrow_mut().push(argv[6].clone());
+        let w = hc_world(human());
+        let acted = Rc::new(RefCell::new(Vec::new()));
+        let log = acted.clone();
+        // The exact predicate assertion and set-option/select-pane checks enforce the guard;
+        // acted cannot fill after the assertion, so its emptiness alone proves nothing.
+        w.fakes.mux_script("if-shell", move |a| {
+            assert_eq!(a[5], "#{==:#{pane_start_command},hc attach t1}");
+            if a[5] == "#{==:#{pane_start_command},sh}" {
+                log.borrow_mut().push(a[6].clone());
             }
             Ok(Output::default())
         });
-        let probed = pane.clone();
         w.fakes
-            .mux_script("}|#{==:#{pane_start_command},", move |_| {
-                let now = probed.borrow().clone().unwrap_or_default();
-                Ok(Output {
-                    code: 0,
-                    stdout: format!("%9|{}\n", u8::from(now == ours)),
-                    stderr: String::new(),
-                })
-            });
+            .mux_first("}|#{==:#{pane_start_command},", 0, "%9|0\n", "");
         w.fakes
             .mux_first("-t %9 #{pane_id}|#{@agent-id}", 0, "%9|\n", "");
+        let e = hc_attempt(&w, Client::Claude, None, true).unwrap_err();
         assert_eq!(
-            run(&w, &["-Client", "claude", "-Task", "hi"]),
-            "1 launch the agent did not start"
+            (e.code, e.check, e.message.as_str()),
+            (1, "internal", "unexpected error (unproven new view)")
         );
-        assert!(acted.borrow().is_empty(), "{:?}", acted.borrow());
-        assert_eq!(pane.borrow().as_deref(), Some("sh"));
+        assert!(acted.borrow().is_empty());
         assert!(calls(&w, "set-option").is_empty());
         assert!(calls(&w, "select-pane").is_empty());
         let folder = agents_dir(&w).join(&agent_folders(&w)[0]);
-        assert!(!folder.join("record.json").exists() && !folder.join("commit.json").exists());
-        assert!(folder.join("abort.json").is_file());
+        let r = read_json(&folder.join("record.json"));
+        assert_eq!(r["hcAddress"], "t1");
+        assert!(r.get("pane").is_none());
+        assert!(!folder.join("commit.json").exists());
+        let a = read_json(&folder.join("abort.json"));
+        assert_eq!(
+            (&a["kill"], &a["viewCleanup"]),
+            (&json!("acknowledged"), &json!({"gone":false}))
+        );
     }
 
     #[test]
     fn rollback_whose_gone_proof_fails_to_run_claims_nothing() {
-        // Test 8b: the tagging fails, the bound kill runs, and the probe after it fails as a call: no closure claim.
-        let w = human();
-        w.fakes.mux_first("set-option", 1, "", "no pane");
+        let w = hc_world(human());
+        w.fakes.mux_first("@agent-context", 1, "", "bad");
         w.fakes.mux_script("-t %9 #{pane_id}|#{@agent-id}", |_| {
-            Err(Refusal {
-                code: 1,
-                check: "endpoint",
-                message: "rmux endpoint did not answer".into(),
-                reason: None,
-            })
+            refuse(1, "endpoint", "rmux endpoint did not answer")
         });
+        let e = hc_attempt(&w, Client::Claude, None, true).unwrap_err();
         assert_eq!(
-            run(&w, &["-Client", "claude", "-Task", "hi"]),
-            "1 launch the agent did not start"
+            (e.code, e.check, e.message.as_str()),
+            (1, "rmux", "tmux call failed")
         );
-        assert!(
+        assert_eq!(
             calls(&w, "if-shell")
                 .iter()
-                .any(|c| c[6] == "kill-pane -t %9")
+                .filter(|c| c[6] == "kill-pane -t %9")
+                .count(),
+            1
         );
+        let a = read_json(
+            &agents_dir(&w)
+                .join(&agent_folders(&w)[0])
+                .join("abort.json"),
+        );
+        assert_eq!(a["kill"], "acknowledged");
+        assert_eq!(
+            a["viewCleanup"],
+            json!({"failed":true,"message":"rmux endpoint did not answer"})
+        );
+    }
+    #[test]
+    fn public_hc_spawn_contract() {
+        use crate::agents::core_fixture as cf;
+        for mode in ["ended", "running", "lost", "unknown", "no-core"] {
+            let w = hc_world(human());
+            let c = w.caller();
+            let r = cf::member(&w, "aaaaaaaaaaaa", json!({"name":"hi","color":"blue"}));
+            w.panes(&[]);
+            let n = w.folder("aaaaaaaaaaaa").join("notice.json");
+            let mut t = cf::wire(&r);
+            let stale = br#"{"kind":"stopped","at":"2026-10-29T11:00:00.0000000Z"}"#;
+            if matches!(mode, "running" | "lost" | "unknown") {
+                std::fs::write(&n, stale).unwrap();
+            }
+            if mode == "ended" {
+                t["state"] = json!("finished");
+                t["reason"] = json!("exited");
+                t["exit_code"] = json!(7);
+            }
+            if mode == "lost" {
+                t["argv"] = json!(["/bin/sh", "-l"]);
+            }
+            if mode == "unknown" {
+                t["labels"]["mux.gen"] = json!("1");
+            }
+            if mode != "no-core" {
+                cf::online(&w);
+                cf::listing(&w, &super::super::membership::team(&c), &[]);
+                cf::get(&w, "taaaaaaaaaaaa", t);
+            }
+            if mode == "ended" {
+                w.fakes.hc_answer(Ok(crate::spawn::Out {
+                    stdout: r#"{"address":"t1"}"#.into(),
+                    ..Default::default()
+                }));
+            }
+            let f = w.fakes.clone();
+            w.fakes.hc_probe(move |a| {
+                let locks = f.locks();
+                if a[0] == "--version" {
+                    assert!(locks.is_empty());
+                } else {
+                    assert!(locks.first().unwrap().starts_with("+spawn|"));
+                }
+            });
+            w.fakes.clear_log();
+            let got = spawn(
+                &w.ctx,
+                &w.request(&["spawn", "-Client", "claude", "-Task", "hi", "-Name", "hi"]),
+            );
+            if mode == "ended" {
+                let out = got.unwrap();
+                assert_public_runs(&w);
+                assert_eq!(out["model"], "inherited");
+                assert_eq!(
+                    out.keys().map(String::as_str).collect::<Vec<_>>(),
+                    [
+                        "name",
+                        "id",
+                        "pane",
+                        "window",
+                        "client",
+                        "sessionId",
+                        "context",
+                        "reason",
+                        "model",
+                        "placement",
+                        "placementSource",
+                        "sidebar",
+                        "life",
+                        "view",
+                        "hcAddress"
+                    ]
+                );
+                assert_eq!(
+                    (&out["life"], &out["view"], &out["hcAddress"]),
+                    (&json!("running"), &json!("attached"), &json!("t1"))
+                );
+                assert_eq!(read_json(&n)["exitCode"], 7);
+                let record = read_json(
+                    &agents_dir(&w)
+                        .join(out["id"].as_str().unwrap())
+                        .join("record.json"),
+                );
+                assert_eq!(record["color"], "blue");
+                let spawn = lock_key("spawn", &c, "$3");
+                let member = lock_key("member", &c, "aaaaaaaaaaaa");
+                let notice = lock_key("notice", &c, "aaaaaaaaaaaa");
+                let mail = lock_key("mail", &c, "pane-1");
+                let bar = lock_key("sidebar", &c, "$3");
+                assert_eq!(
+                    w.fakes.locks(),
+                    [
+                        format!("+{spawn}"),
+                        format!("+{member}"),
+                        format!("+{notice}"),
+                        format!("+{mail}"),
+                        format!("-{mail}"),
+                        format!("-{notice}"),
+                        format!("-{member}"),
+                        format!("-{spawn}"),
+                        format!("+{bar}"),
+                        format!("-{bar}")
+                    ]
+                );
+                assert_eq!(calls(&w, "list-panes").len(), 2);
+                assert_eq!(
+                    w.fakes
+                        .hc_calls()
+                        .iter()
+                        .map(|(_, a, _)| a[0].clone())
+                        .collect::<Vec<_>>(),
+                    ["--version", "ls", "get", "run"]
+                );
+            } else {
+                let e = got.unwrap_err();
+                if mode == "no-core" {
+                    assert!(!n.exists());
+                } else {
+                    assert_eq!(std::fs::read(&n).unwrap(), stale);
+                }
+                assert_eq!(
+                    (e.code, e.check),
+                    if mode == "no-core" {
+                        (1, "hc")
+                    } else {
+                        (2, "name")
+                    }
+                );
+                assert_eq!(
+                    e.message,
+                    if mode == "no-core" {
+                        "install or upgrade herdr-core to >= 0.1.21 and put hc (or herdr-core) on PATH"
+                    } else {
+                        "agent name is taken, try hi-2"
+                    }
+                );
+                assert!(calls(&w, "new-window").is_empty());
+            }
+            if mode == "no-core" {
+                assert!(w.fakes.locks().is_empty());
+            }
+            w.fakes.hc_done().unwrap();
+        }
+    }
+    #[test]
+    fn public_hc_spawn_counts_detached_and_foreign_reservations() {
+        use crate::agents::core_fixture as cf;
+        for foreign in [false, true] {
+            let w = hc_world(human());
+            let c = w.caller();
+            w.panes(&[]);
+            let mut records = Vec::new();
+            for n in 0..6 {
+                let id = format!("{n:012x}");
+                let r = cf::member(&w, &id, json!({"name":format!("w{n}")}));
+                if foreign {
+                    std::fs::remove_dir_all(w.folder(&id)).unwrap();
+                } else {
+                    std::fs::remove_file(w.folder(&id).join("commit.json")).unwrap();
+                }
+                records.push(r);
+            }
+            cf::online(&w);
+            let addresses: Vec<_> = records
+                .iter()
+                .map(|r| r["hcAddress"].as_str().unwrap())
+                .collect();
+            cf::listing(
+                &w,
+                &super::super::membership::team(&c),
+                if foreign { &addresses } else { &[] },
+            );
+            for r in &records {
+                cf::get(&w, r["hcAddress"].as_str().unwrap(), cf::wire(r));
+            }
+            let e = spawn(
+                &w.ctx,
+                &w.request(&["spawn", "-Client", "claude", "-Task", "hi"]),
+            )
+            .unwrap_err();
+            assert_eq!(
+                (e.code, e.check, e.message.as_str()),
+                (2, "cap", "the session already has 6 live agents")
+            );
+            assert!(!w.state().join("server.json").exists());
+            assert!(calls(&w, "new-window").is_empty());
+            assert_eq!(w.fakes.hc_calls().len(), 8);
+            w.fakes.hc_done().unwrap();
+        }
     }
 }
 
@@ -3276,13 +3609,11 @@ pub fn launch_hc(
             ctx,
             caller,
             client: request.client,
-            requested: None,
             model: request.model,
             no_fork: request.no_fork,
             task: request.task.into(),
             brief: request.brief.map(str::to_owned),
             directory: request.directory.into(),
-            split: request.split,
         };
         super::core_launch::execute_connected(
             &core,

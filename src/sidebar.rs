@@ -13,7 +13,7 @@ use serde_json::{Map, Value};
 
 use crate::agents::board::{ENDED_MAX, board};
 use crate::agents::spawn::{pane_env, utf8};
-use crate::agents::view::focus_pane;
+use crate::agents::view::{Focused, focus_hc};
 use crate::agents::{lock, lock_key, pane_id, text};
 use crate::caller::{Caller, resolve};
 use crate::cli::Request;
@@ -589,8 +589,8 @@ fn parts(
         }
         counted += 1;
         let (kind, word) = match state.as_str() {
-            // A lost agent's pane is gone: counted, never drawn.
-            "lost" => continue,
+            "lost" | "unknown" => (Kind::Other, state.clone()),
+            value if value.starts_with("exited ") => (Kind::Exit, state.clone()),
             "exited" => match row.get("exitCode").filter(|code| !code.is_null()) {
                 Some(code) if clean(Some(code)) == "0" => (Kind::Finished, "done".to_string()),
                 Some(code) => (Kind::Exit, format!("exit {}", clean(Some(code)))),
@@ -1549,6 +1549,27 @@ struct Shown {
     looking: Option<String>,
 }
 
+fn focus_target_hc(ctx: &Ctx, caller: &Caller, target: &Target) -> Res<Focused> {
+    let core = crate::hc::connect(ctx)?;
+    focus_hc(
+        ctx,
+        &core,
+        caller,
+        &target.name,
+        (!target.pane.is_empty()).then_some(target.pane.as_str()),
+    )
+}
+impl Shown {
+    fn focused(&mut self, focused: Focused) {
+        for target in &mut self.targets {
+            if target.name == focused.name {
+                target.pane = focused.pane.clone();
+            }
+        }
+        self.looking = Some(focused.pane);
+    }
+}
+
 /// Acts on one event read while `shown` is on screen; true when the bar must draw again at once. A left press reads
 /// the bar and focuses the running agent on its name line, unless it is ASCII or stale (read less than `PRESS_GAP`
 /// after the frame's write, or begun before it); any left press dismisses the note and draws again. Keys go to
@@ -1569,10 +1590,11 @@ fn act(
             if look.ascii || stale {
                 return true;
             }
-            if let Some(target) = click(ctx, caller, y, shown.width, board)
-                && focus_pane(ctx, caller, &target.name, Some(&target.pane)).is_err()
-            {
-                pick.failed(&target.name);
+            if let Some(target) = click(ctx, caller, y, shown.width, board) {
+                match focus_target_hc(ctx, caller, &target) {
+                    Ok(focused) => shown.focused(focused),
+                    Err(_) => pick.failed(&target.name),
+                }
             }
             true
         }
@@ -1580,12 +1602,12 @@ fn act(
         // herdr's next and previous agent (#90), from the pane the session shows, in the bar's order.
         Event::Next | Event::Prev => {
             let forward = read.event == Event::Next;
-            if let Some(target) = pick::step(&shown.targets, shown.looking.as_deref(), forward) {
-                if focus_pane(ctx, caller, &target.name, Some(&target.pane)).is_err() {
-                    pick.failed(&target.name);
-                } else {
-                    // The next key of the same read steps on from here, not from the frame's pane.
-                    shown.looking = Some(target.pane.clone());
+            if let Some(target) =
+                pick::step(&shown.targets, shown.looking.as_deref(), forward).cloned()
+            {
+                match focus_target_hc(ctx, caller, &target) {
+                    Ok(focused) => shown.focused(focused),
+                    Err(_) => pick.failed(&target.name),
                 }
             }
             true
@@ -1604,11 +1626,10 @@ fn act(
                 Act::Nothing => false,
                 Act::Redraw => true,
                 Act::Focus(target) => {
-                    match focus_pane(ctx, caller, &target.name, Some(&target.pane)) {
-                        Ok(_) => {
+                    match focus_target_hc(ctx, caller, &target) {
+                        Ok(focused) => {
                             pick.focused();
-                            // A next key of the same read steps on from here.
-                            shown.looking = Some(target.pane.clone());
+                            shown.focused(focused);
                         }
                         Err(_) => pick.failed(&target.name),
                     }
@@ -1628,14 +1649,6 @@ const PEEK_LINES: i32 = 200;
 /// answers only once it closes and the bar must not wait; so a popup that never opens is not seen here, and its
 /// file stays in the state folder (no sweep: age cannot tell it from a popup still queued behind another).
 fn peek(ctx: &Ctx, caller: &Caller, target: &Target) -> Res<()> {
-    let pane = crate::agents::registry::find_reaped(ctx, caller, &target.name)?;
-    if pane.pane != target.pane {
-        return refuse(
-            2,
-            "target",
-            "the agent is no longer on the pane the bar drew",
-        );
-    }
     let folder = crate::agents::server_dir(ctx, caller);
     // The path goes through the multiplexer's parser, its formats and a shell: plain characters only.
     if !folder
@@ -1648,7 +1661,13 @@ fn peek(ctx: &Ctx, caller: &Caller, target: &Target) -> Res<()> {
             "peek needs a state folder path of plain characters",
         );
     }
-    let text = crate::agents::message::capture(ctx, &pane, PEEK_LINES)?;
+    let (_, text) = crate::agents::message::capture_hc(
+        ctx,
+        caller,
+        &target.name,
+        (!target.pane.is_empty()).then_some(target.pane.as_str()),
+        PEEK_LINES,
+    )?;
     let file = folder.join(format!(
         "peek-{}.txt",
         crate::util::guid()?.replace('-', "")
@@ -2339,13 +2358,13 @@ mod tests {
     // working), 7 ended of which the feed has 4.
     fn sectioned() -> Value {
         json!({"running": 3, "endedTotal": 7, "agents": [
-            {"name": "add-subtract", "state": "running", "doing": "Adding subtract(a, b) under add in calc.py", "age": 42, "unread": 0, "color": "blue", "activity": "blocked", "since": 12, "waiting": false},
-            {"name": "test-calc", "state": "running", "doing": "Done: test_calc.py passed, exit 0", "age": 180, "unread": 1, "color": "magenta", "activity": "done", "since": 30, "waiting": true},
-            {"name": "fix-ci-flake", "state": "running", "doing": "Re-running tests/test_watch.rs with --nocapture", "age": 660, "unread": 0, "color": "bright-blue", "activity": "working", "since": null, "waiting": false},
-            {"name": "docs-usage", "state": "exited", "exitCode": 0, "age": 1080},
-            {"name": "bump-deps", "state": "exited", "exitCode": 101, "age": 1500},
-            {"name": "spike-rmux", "state": "stopped", "exitCode": null, "age": 3600},
-            {"name": "older", "state": "stopped", "exitCode": null, "age": 7200}
+            {"name": "add-subtract", "state": "running", "doing": "Adding subtract(a, b) under add in calc.py", "age": 42, "unread": 0, "color": "blue", "activity": "blocked", "since": 12, "waiting": false, "life": "running", "view": "attached", "hcAddress": "t-add"},
+            {"name": "test-calc", "state": "running", "doing": "Done: test_calc.py passed, exit 0", "age": 180, "unread": 1, "color": "magenta", "activity": "done", "since": 30, "waiting": true, "life": "running", "view": "attached", "hcAddress": "t-test"},
+            {"name": "fix-ci-flake", "state": "running", "doing": "Re-running tests/test_watch.rs with --nocapture", "age": 660, "unread": 0, "color": "bright-blue", "activity": "working", "since": null, "waiting": false, "life": "running", "view": "attached", "hcAddress": "t-fix"},
+            {"name": "docs-usage", "state": "exited 0", "age": 1080, "exitCode": 0, "life": "ended", "view": "detached", "hcAddress": "t-docs"},
+            {"name": "bump-deps", "state": "exited 101", "age": 1500, "exitCode": 101, "life": "ended", "view": "detached", "hcAddress": "t-bump"},
+            {"name": "spike-rmux", "state": "stopped", "age": 3600, "exitCode": null, "life": "ended", "view": "detached", "hcAddress": "t-spike"},
+            {"name": "older", "state": "stopped", "age": 7200, "exitCode": null, "life": "ended", "view": "detached", "hcAddress": "t-older"}
         ]})
     }
 
@@ -2371,8 +2390,8 @@ mod tests {
                 "   Re-running tests/test_watch.rs wi...".to_string(),
                 String::new(),
                 format!(" ended {}", "-".repeat(31)),
-                pad("\u{2713} docs-usage", "done  18m"),
-                pad("\u{2717} bump-deps", "exit 101  25m"),
+                pad("\u{2717} docs-usage", "exited 0  18m"),
+                pad("\u{2717} bump-deps", "exited 101  25m"),
                 pad("- spike-rmux", "stopped   1h"),
                 "   +4 more  (list -All)".to_string(),
             ]
@@ -2455,24 +2474,31 @@ mod tests {
 
     #[test]
     fn layout_nothing_running_and_more_ended() {
-        // Nothing live: `No agents running.`, even with ended agents. A lost one is counted, never drawn.
-        let ended = json!({"running": 0, "endedTotal": 3, "agents": [
-            {"name": "gone", "state": "lost", "age": 60},
-            {"name": "halted", "state": "stopped", "exitCode": null, "age": 60},
-            {"name": "crashed", "state": "exited", "exitCode": null, "age": null}
+        // Nothing live: lifecycle rows remain visible, including lost members.
+        let ended = json!({"running": 0, "endedTotal": 2, "agents": [
+            {"name": "gone", "state": "lost", "age": 60, "life":"lost", "view":"detached", "hcAddress":"t-gone"},
+            {"name": "halted", "state": "stopped", "age": 60, "exitCode": null, "life":"ended", "view":"detached", "hcAddress":"t-halted"},
+            {"name": "crashed", "state": "exited", "age": null, "exitCode": null, "life":"ended", "view":"detached", "hcAddress":"t-crashed"}
         ]});
         assert_eq!(
             plain(&ended, W40),
             [
-                pad("mux-agents", "0 running / 3 ended"),
+                pad("mux-agents", "0 running / 2 ended"),
                 String::new(),
                 " No agents running.".to_string(),
                 String::new(),
                 format!(" ended {}", "-".repeat(31)),
+                pad("- gone", "lost   1m"),
                 pad("- halted", "stopped   1m"),
                 pad("\u{2717} crashed", "exit ?    ?"),
-                "   +1 more  (list -All)".to_string(),
             ]
+        );
+        let mut unknown = ended.clone();
+        unknown["agents"][0]["state"] = json!("unknown");
+        unknown["agents"][0]["life"] = json!("unknown");
+        assert_eq!(
+            plain(&unknown, W40)[0],
+            pad("mux-agents", "0 running / 2 ended")
         );
         let empty = json!({"running": 0, "endedTotal": 0, "agents": []});
         assert_eq!(
@@ -2485,7 +2511,7 @@ mod tests {
         );
         // 12 ended, of which the feed carries 10: `12 ended`, 3 rows, `+9 more ended` (list -All shows only 10).
         let rows: Vec<Value> = (0..10)
-            .map(|n| json!({"name": format!("a{n}"), "state": "stopped", "age": 60}))
+            .map(|n| json!({"name": format!("a{n}"), "state": "stopped", "age": 60, "life":"ended", "view":"detached", "hcAddress":format!("t{n}")}))
             .collect();
         let twelve = json!({"running": 0, "endedTotal": 12, "agents": rows});
         let got = plain(&twelve, W40);
@@ -2867,14 +2893,14 @@ mod tests {
         );
         starts(
             15,
-            format!(" {} {}", sgr("2", "\u{2713}"), sgr("2", "docs-usage")),
+            format!(" {} {}", sgr("31", "\u{2717}"), sgr("2", "docs-usage")),
         );
-        assert!(rows[15].contains(&sgr("2", "done")));
+        assert!(rows[15].contains(&sgr("31", "exited 0")));
         starts(
             16,
             format!(" {} {}", sgr("31", "\u{2717}"), sgr("2", "bump-deps")),
         );
-        assert!(rows[16].contains(&sgr("31", "exit 101")));
+        assert!(rows[16].contains(&sgr("31", "exited 101")));
         starts(
             17,
             format!(" {} {}", sgr("33", "-"), sgr("2", "spike-rmux")),
@@ -2912,7 +2938,7 @@ mod tests {
             .iter()
             .map(|&at| &rows[at][1..2])
             .collect();
-        assert_eq!(glyphs, ["!", "@", "*", "+", "x", "-"]);
+        assert_eq!(glyphs, ["!", "@", "*", "x", "x", "-"]);
         assert!(rows[7].contains("test-calc  m 2"), "{}", rows[7]);
         assert!(rows[4].ends_with("..."));
         assert_eq!(rows[2], " Needs you - 1");
@@ -3565,7 +3591,11 @@ mod tests {
             w.ctx.state_root = plain.into();
         }
         let caller = w.caller();
-        w.agent_record(ID, json!({"name": "worker", "pane": "%9"}));
+        crate::agents::core_fixture::member(
+            &w,
+            ID,
+            json!({"name":"worker","pane":"%9","startCommand":crate::agents::fixture::launch_command("%9")}),
+        );
         w.panes(&["%9|@5|300|aaaaaaaaaaaa|worker"]);
         w.fakes
             .mux_first("show-buffer", 0, "line one\nline two\n", "");
@@ -3626,7 +3656,11 @@ mod tests {
         // A state folder whose path the multiplexer or a shell would read: no capture, no popup.
         let mut odd = World::human("");
         odd.ctx.state_root = odd.ctx.state_root.join("#{@x}");
-        odd.agent_record(ID, json!({"name": "worker", "pane": "%9"}));
+        crate::agents::core_fixture::member(
+            &odd,
+            ID,
+            json!({"name":"worker","pane":"%9","startCommand":crate::agents::fixture::launch_command("%9")}),
+        );
         odd.panes(&["%9|@5|300|aaaaaaaaaaaa|worker"]);
         odd.fakes.clear_log();
         assert!(peek(&odd.ctx, &odd.caller(), &target).is_err());
@@ -3646,6 +3680,8 @@ mod tests {
                 .iter()
                 .any(|c| c.iter().any(|a| a.contains("capture-pane")))
         );
+        w.fakes.hc_done().unwrap();
+        odd.fakes.hc_done().unwrap();
     }
 
     #[test]
@@ -3829,12 +3865,22 @@ mod tests {
         let mut w = w;
         w.ctx.env = crate::ctx::Env::from_pairs(env);
         w.clock("1970-01-01T00:04:00Z");
-        let worker = w.agent_record(ID, json!({"name": "worker", "pane": "%9"}));
+        crate::agents::core_fixture::member(
+            &w,
+            ID,
+            json!({"name":"worker","pane":"%9","startCommand":crate::agents::fixture::launch_command("%9")}),
+        );
+        let worker = w.folder(ID);
         write(
             &worker.join("status.json"),
             json!({"text": "testing the parser", "at": "x"}),
         );
-        let done = w.agent_record("bbbbbbbbbbbb", json!({"name": "done", "pane": "%8"}));
+        crate::agents::core_fixture::member(
+            &w,
+            "bbbbbbbbbbbb",
+            json!({"name":"done", "pane":"%8"}),
+        );
+        let done = w.folder("bbbbbbbbbbbb");
         write(
             &done.join("notice.json"),
             json!({"kind": "exited", "exitCode": 0, "at": "1970-01-01T00:03:00Z"}),
@@ -3868,6 +3914,47 @@ mod tests {
         w
     }
 
+    // Queue exactly the caller-declared frame count before execution, never respond to observed calls.
+    // Focus version calls are queued explicitly between these frame batches by each test.
+    fn watch_frames(w: &World, count: usize) {
+        member_frames(w, count, &[ID, "bbbbbbbbbbbb"]);
+    }
+
+    fn writer_frames(w: &World, count: usize) {
+        member_frames(
+            w,
+            count,
+            &[ID, "bbbbbbbbbbbb", "cccccccccccc", "dddddddddddd"],
+        );
+    }
+
+    fn member_frames(w: &World, count: usize, ids: &[&str]) {
+        use crate::agents::core_fixture as cf;
+        let caller = w.caller();
+        let folder = crate::agents::server_dir(&w.ctx, &caller).join("agents");
+        let records: Vec<_> = ids
+            .iter()
+            .map(|id| {
+                crate::state::fs::read_json(&folder.join(id).join("record.json"))
+                    .unwrap()
+                    .unwrap()
+            })
+            .collect();
+        for _ in 0..count {
+            cf::online(w);
+            cf::listing(w, &crate::agents::membership::team(&caller), &[]);
+            for record in &records {
+                let mut terminal = cf::wire(record);
+                if record["id"] == "bbbbbbbbbbbb" {
+                    terminal["state"] = json!("finished");
+                    terminal["reason"] = json!("exited");
+                    terminal["exit_code"] = json!(0);
+                }
+                cf::get(w, record["hcAddress"].as_str().unwrap(), terminal);
+            }
+        }
+    }
+
     fn probes(w: &World) -> usize {
         w.fakes
             .mux_calls()
@@ -3885,6 +3972,7 @@ mod tests {
             assert!(frames.len() <= 100, "runaway");
             Ok(())
         });
+        w.fakes.hc_done().unwrap();
         (ended, frames)
     }
 
@@ -3897,7 +3985,7 @@ mod tests {
             "   testing the parser".into(),
             String::new(),
             format!(" ended {}", "-".repeat(31)),
-            pad("\u{2713} done", "done   4m"),
+            pad("\u{2717} done", "exited 0   4m"),
         ]
     }
 
@@ -3939,6 +4027,7 @@ mod tests {
     #[test]
     fn watch_follows_the_pane_size_each_tick() {
         let w = watch_world(&["live", "short", "live", "gone"]);
+        watch_frames(&w, 3);
         let (ended, frames) = watch_run(&w);
         assert_eq!(ended, "pane-closed");
         let short = [
@@ -3953,6 +4042,7 @@ mod tests {
     #[test]
     fn watch_pane_closed() {
         let w = watch_world(&["live", "live", "gone"]);
+        watch_frames(&w, 2);
         let (ended, frames) = watch_run(&w);
         assert_eq!(ended, "pane-closed");
         assert_eq!(frames, [board_frame(), board_frame()]);
@@ -3961,6 +4051,7 @@ mod tests {
         // A thrown or failed probe is unknown, not gone: its frame says refresh failed, at the default narrowest
         // width (40, the board frames' width) until the pane answers its size.
         let w = watch_world(&["throw", "fail", "live", "gone"]);
+        watch_frames(&w, 3);
         let (ended, frames) = watch_run(&w);
         assert_eq!(FALLBACK.width, 40);
         let marked = noted_frame(&["refresh failed"]);
@@ -3972,6 +4063,7 @@ mod tests {
     #[test]
     fn watch_probe_failed_after_30_unknown() {
         let w = watch_world(&["fail"]);
+        watch_frames(&w, 29);
         let (ended, frames) = watch_run(&w);
         assert_eq!((ended, frames.len(), probes(&w)), ("probe-failed", 29, 30));
         // A probe that names its pane resets the count.
@@ -3980,6 +4072,7 @@ mod tests {
         answers.extend(vec!["fail"; 29]);
         answers.push("gone");
         let w = watch_world(&answers);
+        watch_frames(&w, 59);
         let (ended, frames) = watch_run(&w);
         assert_eq!((ended, frames.len(), probes(&w)), ("pane-closed", 59, 60));
     }
@@ -3988,42 +4081,38 @@ mod tests {
     fn watch_output_closed() {
         let w = watch_world(&["live", "live", "gone"]);
         let caller = w.caller();
+        watch_frames(&w, 1);
         let ended = run_watch(&w.ctx, &caller, Box::new(NoInput), &mut |_| {
             Err(io::Error::other("EIO"))
         });
+        w.fakes.hc_done().unwrap();
         assert_eq!(ended, "output-closed");
         assert_eq!(probes(&w), 1);
         assert!(w.fakes.slept().is_empty());
-        // Probe and board both failing still write a frame, so a dead terminal is found at once.
+        // An unknown probe and failed view read still write a frame, detecting a closed output at once.
         let w = watch_world(&["fail"]);
         w.fakes.mux_first("list-panes", 1, "", "lock");
         let caller = w.caller();
+        watch_frames(&w, 1);
         let ended = run_watch(&w.ctx, &caller, Box::new(NoInput), &mut |_| {
             Err(io::Error::other("EIO"))
         });
+        w.fakes.hc_done().unwrap();
         assert_eq!((ended, probes(&w)), ("output-closed", 1));
     }
 
     #[test]
     fn watch_refresh_failed_keeps_last() {
         let w = watch_world(&["live", "live", "live", "gone"]);
-        let listed = Rc::new(Cell::new(0));
-        let seen = listed.clone();
-        w.fakes.mux_script("list-panes", move |argv| {
-            // Only the board's session list counts; the bar's own layout read is not answered.
-            if !argv.iter().any(|a| a == "-s") {
-                return Ok(out(1, "", "lock"));
-            }
-            seen.set(seen.get() + 1);
-            if seen.get() == 2 {
-                let rows = ["%9|@5|300|aaaaaaaaaaaa|worker"];
-                Ok(out(
-                    0,
-                    &crate::agents::fixture::listed(argv, &rows, "\n"),
-                    "",
-                ))
+        let record = w.folder(ID).join("record.json");
+        let good = std::fs::read(&record).unwrap();
+        watch_frames(&w, 1);
+        std::fs::write(&record, "{").unwrap();
+        w.fakes.sleep_probe(move |tick| {
+            if tick == 1 {
+                std::fs::write(&record, &good).unwrap();
             } else {
-                Ok(out(1, "", "lock"))
+                std::fs::write(&record, "{").unwrap();
             }
         });
         let (ended, frames) = watch_run(&w);
@@ -4044,7 +4133,38 @@ mod tests {
             ]
         );
         // The board is read as the bar's pane, with the ended rows and their exit codes.
-        assert_eq!(listed.get(), 3);
+        assert_eq!(w.fakes.hc_calls().len(), 4);
+        // Corrupt local records fail before pane reads; only the middle successful snapshot lists panes.
+        assert_eq!(
+            w.fakes
+                .mux_calls()
+                .iter()
+                .filter(|c| snapshot_list(c))
+                .count(),
+            1
+        );
+        assert_eq!(count(&w, "list-panes"), 0); // This helper excludes membership snapshot lists.
+    }
+
+    #[test]
+    fn watch_view_error_keeps_running_member_detached() {
+        let w = watch_world(&["live", "gone"]);
+        let caller = w.caller();
+        w.fakes.mux_script("list-panes", |_| Ok(out(1, "", "down")));
+        watch_frames(&w, 1);
+        let board = crate::agents::board::board(&w.ctx, &caller, true, true).unwrap();
+        w.fakes.hc_done().unwrap();
+        assert_eq!(board["running"], 1);
+        assert_eq!(board["agents"][0]["life"], "running");
+        assert_eq!(board["agents"][0]["view"], "detached");
+        assert_eq!(board["agents"][0]["pane"], Value::Null);
+        assert_eq!(board["agents"][0]["window"], Value::Null);
+        watch_frames(&w, 1);
+        let (ended, frames) = watch_run(&w);
+        assert_eq!(ended, "pane-closed");
+        assert_eq!(frames, [board_frame()]);
+        assert!(!frames[0].contains("refresh failed"));
+        w.fakes.hc_done().unwrap();
     }
 
     #[test]
@@ -4092,6 +4212,7 @@ mod tests {
                     _ => out(0, "%1|1\n", ""),
                 })
             });
+        watch_frames(&w, 4);
         let (ended, _) = watch_run(&w);
         assert_eq!(ended, "pane-closed");
         let calls = w.fakes.mux_calls();
@@ -4127,6 +4248,7 @@ mod tests {
         );
         assert!(w.fakes.mux_calls().is_empty());
         let reply = watch_on(&w.ctx, &request, true, &no_input, &mut |_| Ok(())).unwrap();
+        w.fakes.hc_done().unwrap();
         assert_eq!(
             Value::Object(reply),
             json!({"pane": "%7", "ended": "pane-closed"})
@@ -4192,6 +4314,7 @@ mod tests {
             assert!(frames.len() <= 100, "runaway");
             Ok(())
         });
+        w.fakes.hc_done().unwrap();
         (ended, frames, times)
     }
 
@@ -4207,6 +4330,7 @@ mod tests {
             .collect();
         let script = Script::new(&w.fakes, steps);
         let waits = script.waits.clone();
+        watch_frames(&w, 3);
         let (ended, frames, times) = watch_with(&w, Box::new(script));
         assert_eq!((ended, frames.len()), ("pane-closed", 3));
         assert_eq!(diffs(&times), [2000, 2000]);
@@ -4221,6 +4345,7 @@ mod tests {
     fn watch_ctrl_c_ends_interrupted() {
         let w = watch_world(&["live"]);
         let script = Script::new(&w.fakes, vec![(500, Waited::Bytes(vec![3]))]);
+        watch_frames(&w, 1);
         let (ended, frames, _) = watch_with(&w, Box::new(script));
         assert_eq!((ended, frames.len(), probes(&w)), ("interrupted", 1, 1));
     }
@@ -4230,6 +4355,7 @@ mod tests {
         let w = watch_world(&["live", "live", "live", "gone"]);
         let script = Script::new(&w.fakes, vec![(100, Waited::Bytes(b"\x1b".to_vec()))]);
         let waits = script.waits.clone();
+        watch_frames(&w, 3);
         let (ended, frames, times) = watch_with(&w, Box::new(script));
         assert_eq!((ended, frames.len()), ("pane-closed", 3));
         // 50 ms after the ESC it counts as the key, which draws again at once (#61).
@@ -4242,6 +4368,7 @@ mod tests {
         let w = watch_world(&["live", "live", "live", "gone"]);
         let script = Script::new(&w.fakes, vec![(100, Waited::Closed)]);
         let waits = script.waits.clone();
+        watch_frames(&w, 3);
         let (ended, frames, times) = watch_with(&w, Box::new(script));
         assert_eq!((ended, frames.len()), ("pane-closed", 3));
         assert_eq!(*waits.borrow(), [2000]);
@@ -4257,6 +4384,7 @@ mod tests {
         let waits = script.waits.clone();
         let caller = w.caller();
         let mut frames = 0;
+        watch_frames(&w, 2);
         let ended = run_watch(&w.ctx, &caller, Box::new(script), &mut |_| {
             frames += 1;
             assert!(frames <= 100, "runaway");
@@ -4264,6 +4392,7 @@ mod tests {
             w.fakes.advance(Duration::from_millis(250));
             Ok(())
         });
+        w.fakes.hc_done().unwrap();
         assert_eq!((ended, frames), ("pane-closed", 2));
         assert_eq!(*waits.borrow(), [2000, 2000]);
     }
@@ -4273,6 +4402,7 @@ mod tests {
         let w = watch_world(&["live", "live", "live", "gone"]);
         let script = Script::new(&w.fakes, vec![(1990, Waited::Bytes(b"\x1b".to_vec()))]);
         let waits = script.waits.clone();
+        watch_frames(&w, 3);
         let (ended, frames, times) = watch_with(&w, Box::new(script));
         assert_eq!((ended, frames.len()), ("pane-closed", 3));
         // 10 ms are left of the tick, so the ESC waits 10 ms, not 50, and the next frame is not late.
@@ -4324,11 +4454,13 @@ mod tests {
             let (input, log) = term_input(reads);
             let caller = w.caller();
             let mut frames = 0;
+            watch_frames(&w, if want == "probe-failed" { 29 } else { 1 });
             let ended = run_watch(&w.ctx, &caller, input, &mut |frame| {
                 frames += 1;
                 assert!(frames <= 100, "runaway");
                 write(frame)
             });
+            w.fakes.hc_done().unwrap();
             assert_eq!(ended, want);
             let log = log.borrow();
             assert_eq!(log[log.len() - 3..], restored, "{want}");
@@ -4339,10 +4471,12 @@ mod tests {
         let w = watch_world(&["live"]);
         let (input, log) = term_input(vec![]);
         let caller = w.caller();
+        watch_frames(&w, 1);
         let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             run_watch(&w.ctx, &caller, input, &mut |_| panic!("write"))
         }));
         assert!(panicked.is_err());
+        w.fakes.hc_done().unwrap();
         assert_eq!(
             *log.borrow(),
             [
@@ -4378,11 +4512,13 @@ mod tests {
             }
         };
         let mut frames = 0;
+        watch_frames(&w, 3);
         let reply = watch_on(&w.ctx, &request, true, &open, &mut |_| {
             frames += 1;
             Ok(())
         })
         .unwrap();
+        w.fakes.hc_done().unwrap();
         assert_eq!((reply["ended"].as_str(), frames), (Some("pane-closed"), 3));
         assert_eq!(opened.get(), 1);
         assert_eq!(*log.borrow(), ["save", "arm", "raw", "restore", "disarm"]);
@@ -4402,12 +4538,14 @@ mod tests {
             }
         };
         let mut frames = 0;
+        watch_frames(&w, 1);
         let reply = watch_on(&w.ctx, &request, true, &open, &mut |_| {
             frames += 1;
             assert!(frames <= 100, "runaway");
             Ok(())
         })
         .unwrap();
+        w.fakes.hc_done().unwrap();
         assert_eq!((reply["ended"].as_str(), frames), (Some("interrupted"), 1));
         assert_eq!(opened.get(), 1);
     }
@@ -4429,6 +4567,7 @@ mod tests {
             .collect();
         w.ctx.env = Env::from_pairs(env);
         assert!(watch_on(&w.ctx, &request, true, &open, &mut |_| Ok(())).is_err());
+        w.fakes.hc_done().unwrap();
     }
 
     #[test]
@@ -4436,10 +4575,12 @@ mod tests {
         let w = watch_world(&["live", "live", "gone"]);
         let (input, log) = term_input(vec![Err(io::Error::other("EIO"))]);
         let caller = w.caller();
+        watch_frames(&w, 2);
         let ended = run_watch(&w.ctx, &caller, input, &mut |_| {
             log.borrow_mut().push("frame".into());
             Ok(())
         });
+        w.fakes.hc_done().unwrap();
         assert_eq!(ended, "pane-closed");
         assert_eq!(
             *log.borrow(),
@@ -4537,6 +4678,9 @@ mod tests {
     fn click_focuses_through_one_read_and_guarded_select() {
         let w = click_world(&["live", "live", "live", "gone"], board_answer());
         let script = Script::new(&w.fakes, vec![(300, press(3))]);
+        watch_frames(&w, 1);
+        crate::agents::core_fixture::online(&w);
+        watch_frames(&w, 2);
         let (ended, frames, times) = watch_with(&w, Box::new(script));
         assert_eq!((ended, frames.len()), ("pane-closed", 3));
         // The redraw follows the click at once; the next tick is 2 s after it.
@@ -4571,8 +4715,16 @@ mod tests {
 
     // The watch world with running agents writer-two and writer as well as worker.
     fn two_writers(w: &World) {
-        w.agent_record("cccccccccccc", json!({"name": "writer-two", "pane": "%11"}));
-        w.agent_record("dddddddddddd", json!({"name": "writer", "pane": "%12"}));
+        crate::agents::core_fixture::member(
+            w,
+            "cccccccccccc",
+            json!({"name":"writer-two","pane":"%11","startCommand":crate::agents::fixture::launch_command("%11")}),
+        );
+        crate::agents::core_fixture::member(
+            w,
+            "dddddddddddd",
+            json!({"name":"writer","pane":"%12","startCommand":crate::agents::fixture::launch_command("%12")}),
+        );
         w.panes(&[
             "%9|@5|300|aaaaaaaaaaaa|worker",
             "%11|@6|311|cccccccccccc|writer-two",
@@ -4586,6 +4738,10 @@ mod tests {
         let w = click_world(&["live", "live", "live", "gone"], board_answer());
         two_writers(&w);
         let script = Script::new(&w.fakes, vec![(300, key(b"nn"))]);
+        writer_frames(&w, 1);
+        crate::agents::core_fixture::online(&w);
+        crate::agents::core_fixture::online(&w);
+        writer_frames(&w, 2);
         let (ended, _, _) = watch_with(&w, Box::new(script));
         assert_eq!(ended, "pane-closed");
         let targets: Vec<String> = w
@@ -4595,8 +4751,7 @@ mod tests {
             .filter(|c| c[1] == "if-shell")
             .map(|c| c[4].clone())
             .collect();
-        assert_eq!(targets.len(), 2, "{targets:?}");
-        assert_ne!(targets[0], targets[1], "{targets:?}");
+        assert_eq!(targets, ["%9", "%11"]);
     }
 
     #[test]
@@ -4605,6 +4760,10 @@ mod tests {
         let w = click_world(&["live", "live", "live", "gone"], board_answer());
         two_writers(&w);
         let script = Script::new(&w.fakes, vec![(300, key(b"j\rn"))]);
+        writer_frames(&w, 1);
+        crate::agents::core_fixture::online(&w);
+        crate::agents::core_fixture::online(&w);
+        writer_frames(&w, 2);
         let (ended, _, _) = watch_with(&w, Box::new(script));
         assert_eq!(ended, "pane-closed");
         let targets: Vec<String> = w
@@ -4614,8 +4773,7 @@ mod tests {
             .filter(|c| c[1] == "if-shell")
             .map(|c| c[4].clone())
             .collect();
-        assert_eq!(targets.len(), 2, "{targets:?}");
-        assert_ne!(targets[0], targets[1], "{targets:?}");
+        assert_eq!(targets, ["%9", "%11"]);
     }
 
     #[test]
@@ -4635,6 +4793,7 @@ mod tests {
             let w = click_world(&["live", "live", "live", "gone"], answer(width, &split));
             two_writers(&w);
             let script = Script::new(&w.fakes, vec![(300, press(3))]);
+            writer_frames(&w, 3);
             let (ended, frames, times) = watch_with(&w, Box::new(script));
             assert_eq!((ended, frames.len()), ("pane-closed", 3), "{width}");
             assert_eq!(diffs(&times), [300, 2000], "{width}");
@@ -4651,6 +4810,7 @@ mod tests {
             board_answer(),
         );
         let steps = vec![(300, press(1)), (300, press(4)), (300, press(7))];
+        watch_frames(&w, 5);
         let (ended, frames, times) = watch_with(&w, Box::new(Script::new(&w.fakes, steps)));
         assert_eq!((ended, frames.len()), ("pane-closed", 5));
         assert_eq!(diffs(&times), [300, 300, 300, 2000]);
@@ -4662,6 +4822,7 @@ mod tests {
             (300, key(b"\x1b[<64;3;3M")),
             (300, key(b"\x1b[<2;3;3M")),
         ];
+        watch_frames(&w, 2);
         let (ended, frames, times) = watch_with(&w, Box::new(Script::new(&w.fakes, steps)));
         assert_eq!((ended, frames.len()), ("pane-closed", 2));
         assert_eq!(diffs(&times), [2000]);
@@ -4673,24 +4834,30 @@ mod tests {
         // Read 20 ms after its frame: dropped, but it still redraws at once.
         let w = click_world(&["live", "live", "live", "gone"], board_answer());
         let script = Script::new(&w.fakes, vec![(20, press(3))]);
+        watch_frames(&w, 3);
         let (_, _, times) = watch_with(&w, Box::new(script));
         assert_eq!(diffs(&times), [20, 2000]);
         assert_eq!((click_reads(&w), selects(&w)), (0, 0));
         // Its first byte read before the second write, its last after: dropped.
         let w = click_world(&["live", "live", "live", "live", "gone"], board_answer());
         let steps = vec![(1990, key(b"\x1b[<0;3;")), (110, key(b"3M"))];
+        watch_frames(&w, 4);
         let (_, _, times) = watch_with(&w, Box::new(Script::new(&w.fakes, steps)));
         assert_eq!(diffs(&times), [2000, 100, 2000]);
         assert_eq!((click_reads(&w), selects(&w)), (0, 0));
         // 30 ms after the second write: dropped.
         let w = click_world(&["live", "live", "live", "live", "gone"], board_answer());
         let script = Script::new(&w.fakes, vec![(2030, press(3))]);
+        watch_frames(&w, 4);
         let (_, _, times) = watch_with(&w, Box::new(script));
         assert_eq!(diffs(&times), [2000, 30, 2000]);
         assert_eq!((click_reads(&w), selects(&w)), (0, 0));
         // 100 ms after it: acts.
         let w = click_world(&["live", "live", "live", "live", "gone"], board_answer());
         let script = Script::new(&w.fakes, vec![(2100, press(3))]);
+        watch_frames(&w, 2);
+        crate::agents::core_fixture::online(&w);
+        watch_frames(&w, 2);
         let (_, _, times) = watch_with(&w, Box::new(script));
         assert_eq!(diffs(&times), [2000, 100, 2000]);
         assert_eq!((click_reads(&w), selects(&w)), (1, 1));
@@ -4700,6 +4867,9 @@ mod tests {
     fn one_read_handles_every_event_in_order() {
         let w = click_world(&["live", "live", "live", "gone"], board_answer());
         let script = Script::new(&w.fakes, vec![(300, key(b"j\r"))]);
+        watch_frames(&w, 1);
+        crate::agents::core_fixture::online(&w);
+        watch_frames(&w, 2);
         let (ended, frames, times) = watch_with(&w, Box::new(script));
         assert_eq!(ended, "pane-closed");
         // j selected worker, then Enter focused it: the next frame is unmarked.
@@ -4721,6 +4891,9 @@ mod tests {
         let w = click_world(&["live", "live", "live", "live", "gone"], board_answer());
         w.fakes.mux_first(READ_BACK, 0, "%9|0|1|1\n", "");
         let steps = vec![(300, press(3)), (20, press(3))];
+        watch_frames(&w, 1);
+        crate::agents::core_fixture::online(&w);
+        watch_frames(&w, 3);
         let (ended, frames, times) = watch_with(&w, Box::new(Script::new(&w.fakes, steps)));
         assert_eq!(ended, "pane-closed");
         assert_eq!(
@@ -4739,6 +4912,9 @@ mod tests {
         );
         watch_env(&mut w, "MUX_AGENTS_ASCII", "1");
         let steps = vec![(300, press(3)), (300, key(b"j")), (300, key(b"\r"))];
+        watch_frames(&w, 3);
+        crate::agents::core_fixture::online(&w);
+        watch_frames(&w, 2);
         let (ended, frames, times) = watch_with(&w, Box::new(Script::new(&w.fakes, steps)));
         assert_eq!((ended, frames.len()), ("pane-closed", 5));
         // The press redraws but reads nothing; j selects (ASCII marker) and Enter focuses.
@@ -4778,6 +4954,9 @@ mod tests {
             ))
         });
         let script = Script::new(&w.fakes, vec![(300, press(3))]);
+        watch_frames(&w, 1);
+        crate::agents::core_fixture::online(&w);
+        watch_frames(&w, 2);
         let (ended, frames, _) = watch_with(&w, Box::new(script));
         assert_eq!((ended, frames.len()), ("pane-closed", 3));
         assert!(moved.get());
@@ -4795,6 +4974,9 @@ mod tests {
         let w = click_world(&["live", "live", "live", "gone"], board_answer());
         w.fakes.mux_first(READ_BACK, 1, "", "no server");
         let script = Script::new(&w.fakes, vec![(300, press(3))]);
+        watch_frames(&w, 1);
+        crate::agents::core_fixture::online(&w);
+        watch_frames(&w, 2);
         let (ended, frames, times) = watch_with(&w, Box::new(script));
         assert_eq!(ended, "pane-closed");
         assert_eq!(frames, [board_frame(), failed_frame(), failed_frame()]);
@@ -4806,6 +4988,9 @@ mod tests {
     fn keys_select_and_focus() {
         let w = click_world(&["live", "live", "live", "live", "gone"], board_answer());
         let steps = vec![(300, key(b"j")), (100, key(b"\r"))];
+        watch_frames(&w, 2);
+        crate::agents::core_fixture::online(&w);
+        watch_frames(&w, 2);
         let (ended, frames, times) = watch_with(&w, Box::new(Script::new(&w.fakes, steps)));
         assert_eq!(ended, "pane-closed");
         assert_eq!(
@@ -4824,6 +5009,7 @@ mod tests {
         // A Down split across two reads.
         let w = click_world(&["live", "live", "live", "gone"], board_answer());
         let steps = vec![(300, key(b"\x1b[")), (100, key(b"B"))];
+        watch_frames(&w, 3);
         let (_, frames, times) = watch_with(&w, Box::new(Script::new(&w.fakes, steps)));
         assert_eq!(frames, [board_frame(), marked_frame(), marked_frame()]);
         assert_eq!(diffs(&times), [400, 2000]);
@@ -4879,6 +5065,9 @@ mod tests {
                 write(&record, fields);
             })),
         };
+        watch_frames(&w, 2);
+        crate::agents::core_fixture::online(&w);
+        watch_frames(&w, 2);
         let (ended, frames, _) = watch_with(&w, Box::new(input));
         assert_eq!((ended, frames.len()), ("pane-closed", 4));
         assert!(moved.get());
@@ -4895,6 +5084,9 @@ mod tests {
         let w = click_world(&["live", "live", "live", "gone"], board_answer());
         w.fakes.mux_first(READ_BACK, 0, "%9|0|1|1\n", "");
         let steps = vec![(300, key(b"j")), (100, key(b"\r"))];
+        watch_frames(&w, 2);
+        crate::agents::core_fixture::online(&w);
+        watch_frames(&w, 1);
         let (ended, frames, _) = watch_with(&w, Box::new(Script::new(&w.fakes, steps)));
         assert_eq!((ended, frames.len()), ("pane-closed", 3));
         assert_eq!(selects(&w), 1);
@@ -4912,6 +5104,9 @@ mod tests {
         let w = click_world(&["live", "live", "live", "live", "gone"], board_answer());
         w.fakes.mux_first(READ_BACK, 0, "%9|0|1|1\n", "");
         let script = Script::new(&w.fakes, vec![(300, press(3))]);
+        watch_frames(&w, 1);
+        crate::agents::core_fixture::online(&w);
+        watch_frames(&w, 3);
         let (ended, frames, times) = watch_with(&w, Box::new(script));
         assert_eq!(ended, "pane-closed");
         assert_eq!(
@@ -4927,6 +5122,9 @@ mod tests {
             (100, key(b"\x1b[<0;3;3m")),
             (100, key(b"j")),
         ];
+        watch_frames(&w, 1);
+        crate::agents::core_fixture::online(&w);
+        watch_frames(&w, 2);
         let (_, frames, times) = watch_with(&w, Box::new(Script::new(&w.fakes, steps)));
         assert_eq!(frames, [board_frame(), failed_frame(), marked_frame()]);
         assert_eq!(diffs(&times), [300, 200]);
@@ -5124,6 +5322,7 @@ mod tests {
             win
         };
         let (w, state) = keep_world(&["wide", "gone"], wide());
+        watch_frames(&w, 1);
         let (ended, frames) = watch_run(&w);
         assert_eq!(ended, "pane-closed");
         assert_eq!(kept(&w), [RESIZE]);
@@ -5132,6 +5331,7 @@ mod tests {
         // When the size cannot be read again, the width the keeper set is used.
         let (w, _) = keep_world(&["wide", "gone"], wide());
         w.fakes.mux_first(SIZE_FORMAT, 1, "", "no server");
+        watch_frames(&w, 1);
         let (_, frames) = watch_run(&w);
         assert_eq!(frames, [board_frame()]);
     }
@@ -5280,6 +5480,7 @@ mod tests {
             broken.moved = Some(repaired());
             broken.move_focus = focus;
             let (w, state) = keep_world(&["live", "live", "live", "gone"], broken);
+            watch_frames(&w, 3);
             let (ended, frames) = watch_run(&w);
             assert_eq!((ended, frames.len()), ("pane-closed", 3));
             let mut want = vec![
@@ -5316,6 +5517,7 @@ mod tests {
                 _ => {}
             }
         });
+        watch_frames(&w, 5);
         watch_run(&w);
         // The first tick sets the width for its window; the drag is kept until the window is 300, then 60.
         assert_eq!(kept(&w), [RESIZE, "-N resize-pane -t %7 -x 60"]);
@@ -5343,6 +5545,7 @@ mod tests {
                 _ => {}
             }
         });
+        watch_frames(&w, 5);
         watch_run(&w);
         assert_eq!(
             kept(&w),
@@ -5366,6 +5569,7 @@ mod tests {
         let six = ["live", "live", "live", "live", "live", "live", "gone"];
         // Three refused moves, then none for three more ticks; the bar says so from the third.
         let (w, _) = keep_world(&six, failing());
+        watch_frames(&w, 6);
         let (_, frames) = watch_run(&w);
         assert_eq!(moves(&w), 3);
         assert_eq!((count(&w, "resize-pane"), count(&w, "select-pane")), (0, 0));
@@ -5382,6 +5586,7 @@ mod tests {
                 win.moved = Some(repaired());
             }
         });
+        watch_frames(&w, 6);
         let (_, frames) = watch_run(&w);
         assert_eq!(moves(&w), 4);
         assert_eq!(frames[2..4], [paused_frame(), paused_frame()]);
@@ -5395,6 +5600,7 @@ mod tests {
                     fakes.advance(Duration::from_secs(skip));
                 }
             });
+            watch_frames(&w, 5);
             let (_, frames) = watch_run(&w);
             assert_eq!(moves(&w), moved, "{skip}");
             // The skipped minute ages the agents too, so only each frame's last line is compared.
@@ -5405,6 +5611,7 @@ mod tests {
         }
         // A move that answers 0 but leaves the bar out of place counts too, by the read right after it: no 4th.
         let (w, _) = keep_world(&six[1..], win("%1", split_right()));
+        watch_frames(&w, 5);
         let (_, frames) = watch_run(&w);
         assert_eq!((moves(&w), layout_reads(&w)), (3, 8));
         assert_eq!(frames[..2], vec![board_frame(); 2]);
@@ -5418,6 +5625,7 @@ mod tests {
             win.panes = split_right();
             win.moved = Some(repaired());
         });
+        watch_frames(&w, 6);
         let (_, frames) = watch_run(&w);
         assert_eq!(moves(&w), 6);
         assert_eq!(frames, vec![board_frame(); 6]);
@@ -5447,6 +5655,7 @@ mod tests {
                 _ => {}
             }
         });
+        watch_frames(&w, 5);
         watch_run(&w);
         assert_eq!(kept(&w), [RESIZE, "-N resize-pane -t %7 -x 60"]);
         assert_eq!(layout_reads(&w), 5);
@@ -5459,11 +5668,13 @@ mod tests {
         let mut broken = win("%1", split_right());
         broken.moved = Some(repaired());
         let (w, _) = keep_world(&["untagged", "untagged", "gone"], broken);
+        watch_frames(&w, 2);
         let (ended, frames) = watch_run(&w);
         assert_eq!((ended, frames), ("pane-closed", vec![board_frame(); 2]));
         assert_eq!(moves(&w), 1);
         // A probe that does not answer is no proof the pane is there: nothing is read.
         let (w, _) = keep_world(&["fail", "fail", "gone"], win("%1", split_right()));
+        watch_frames(&w, 2);
         watch_run(&w);
         assert_eq!((layout_reads(&w), kept(&w).len()), (0, 0));
         // A layout that does not list the bar, a failed read, or one that does not parse: that tick does nothing.
@@ -5471,6 +5682,7 @@ mod tests {
             let w = watch_world(&["live", "live", "gone"]);
             own_watch(&w);
             w.fakes.mux_first("#{pane_at_right}", code, stdout, "");
+            watch_frames(&w, 2);
             let (_, frames) = watch_run(&w);
             assert_eq!(frames, vec![board_frame(); 2], "{stdout:?}");
             assert_eq!((layout_reads(&w), kept(&w).len()), (2, 0), "{stdout:?}");
@@ -6732,6 +6944,7 @@ mod tests {
             w.fakes.mux_first(RECORD, 0, record, "");
             w.fakes.mux_first(PROOF, 0, proof, "");
             let record = format!("{record:?} {proof:?}");
+            watch_frames(&w, 3);
             let (ended, frames) = watch_run(&w);
             assert_eq!(
                 (ended, frames),
@@ -6940,4 +7153,42 @@ mod tests {
             }
         }
     }
+    #[test]
+    fn watch_hc_route_consumes_one_snapshot_per_frame() {
+        use crate::agents::core_fixture as cf;
+        let w = watch_world(&["live", "live", "gone"]);
+        let c = w.caller();
+        let a = cf::member(
+            &w,
+            ID,
+            json!({"name":"worker","pane":"%9","startCommand":crate::agents::fixture::launch_command("%9")}),
+        );
+        let b = cf::member(&w, "bbbbbbbbbbbb", json!({"name":"done","pane":"%8"}));
+        for _ in 0..2 {
+            cf::online(&w);
+            cf::listing(&w, &crate::agents::membership::team(&c), &[]);
+            cf::get(&w, "taaaaaaaaaaaa", cf::wire(&a));
+            let mut t = cf::wire(&b);
+            t["state"] = json!("finished");
+            t["reason"] = json!("exited");
+            t["exit_code"] = json!(0);
+            cf::get(&w, "tbbbbbbbbbbbb", t);
+        }
+        let (end, frames) = watch_run(&w);
+        assert_eq!(end, "pane-closed");
+        assert_eq!(frames.len(), 2);
+        for frame in frames {
+            assert!(frame.contains("worker"));
+            assert!(frame.contains("done"));
+            assert!(frame.contains("1 working / 1 ended"));
+            assert!(frame.contains("exited 0"));
+            assert_eq!(frame, board_frame());
+        }
+        assert_eq!(w.fakes.hc_calls().len(), 8);
+        w.fakes.hc_done().unwrap();
+    }
 }
+
+#[cfg(test)]
+#[path = "sidebar_hc_tests.rs"]
+mod hc_tests;
