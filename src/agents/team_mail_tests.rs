@@ -1,5 +1,6 @@
 use super::*;
 use crate::agents::fixture::World;
+use crate::agents::tree::tests::{LEADER, child, leader_record};
 use crate::util::{parse_utc, utc_o};
 use serde_json::json;
 
@@ -184,5 +185,150 @@ fn a_failed_entry_flush_is_finished_by_the_retry() {
         root.join("aaaaaaaaaaaa")
             .join("1111111111111111.json")
             .is_file()
+    );
+}
+
+const A: &str = "0000000000a1";
+const B: &str = "0000000000b2";
+const C: &str = "0000000000c3";
+
+fn m(id: &str, record: Value) -> Member {
+    Member {
+        id: id.into(),
+        name: crate::agents::text(record.get("name")),
+        record,
+    }
+}
+
+/// leader > A > B, leader > C.
+fn tree3() -> Vec<Member> {
+    vec![
+        m(LEADER, leader_record()),
+        m(A, json!({"name": "alpha", "parentAgent": {"id": LEADER}})),
+        m(
+            B,
+            json!({"name": "beta", "parentAgent": {"id": A}, "parentPane": "%7"}),
+        ),
+        m(C, json!({"name": "gamma", "parentAgent": {"id": LEADER}})),
+    ]
+}
+
+fn ids(p: Res<Pick>) -> Vec<String> {
+    match p.unwrap() {
+        Pick::Members(v) => v.iter().map(|m| m.id.clone()).collect(),
+        Pick::Pane(p) => vec![p],
+        Pick::Unknown => vec!["unknown".into()],
+    }
+}
+
+fn why(p: Res<Pick>) -> String {
+    let r = p.unwrap_err();
+    format!("{} {} {}", r.code, r.check, r.message)
+}
+
+#[test]
+fn words_resolve_on_the_roster() {
+    let r = tree3();
+    assert_eq!(ids(pick(&r, Some(A), &Target::Parent)), [LEADER]);
+    assert_eq!(
+        ids(pick(&r, Some(B), &Target::Parent)),
+        [A],
+        "parentAgent.id names a running member"
+    );
+    assert_eq!(ids(pick(&r, Some(B), &Target::Leader)), [LEADER]);
+    assert_eq!(ids(pick(&r, Some(A), &Target::Children)), [B]);
+    assert_eq!(
+        ids(pick(&r, None, &Target::Children)),
+        [A, C],
+        "a person reaches the children of the leader"
+    );
+    assert_eq!(
+        ids(pick(&r, Some(A), &Target::Team)),
+        [LEADER, B, C],
+        "everyone but the sender"
+    );
+    assert_eq!(ids(pick(&r, None, &Target::Team)), [LEADER, A, B, C]);
+    assert_eq!(ids(pick(&r, Some(A), &Target::Name("gamma".into()))), [C]);
+    assert_eq!(
+        ids(pick(&r, Some(A), &Target::Name("nobody".into()))),
+        ["unknown"]
+    );
+    assert_eq!(ids(pick(&r, Some(A), &Target::Pane("%9".into()))), ["%9"]);
+    assert_eq!(
+        why(pick(&r, None, &Target::Parent)),
+        "2 parent only an agent has a parent"
+    );
+    assert_eq!(
+        (
+            target("leader").unwrap(),
+            target("%3").unwrap(),
+            target("beta").unwrap()
+        ),
+        (
+            Target::Leader,
+            Target::Pane("%3".into()),
+            Target::Name("beta".into())
+        )
+    );
+    for bad in ["Beta", "a b", "%", "x!", ""] {
+        assert_eq!(target(bad).unwrap_err().check, "usage", "{bad}");
+    }
+}
+
+#[test]
+fn parent_falls_back_to_the_parent_pane() {
+    let mut r = tree3();
+    r.retain(|x| x.id != A);
+    assert_eq!(
+        ids(pick(&r, Some(B), &Target::Parent)),
+        ["%7"],
+        "no running parent member: parentPane"
+    );
+    assert_eq!(ids(pick(&r, Some(C), &Target::Parent)), [LEADER]);
+}
+
+#[test]
+fn empty_targets_refuse() {
+    let lone = vec![m(
+        A,
+        json!({"name": "alpha", "parentAgent": {"id": "ffffffffffff"}, "parentPane": null}),
+    )];
+    assert_eq!(
+        why(pick(&lone, Some(A), &Target::Leader)),
+        "2 target this team has no leader"
+    );
+    assert_eq!(
+        why(pick(&lone, Some(A), &Target::Children)),
+        "2 target no other member to send to"
+    );
+    assert_eq!(
+        why(pick(&lone, Some(A), &Target::Team)),
+        "2 target no other member to send to"
+    );
+    assert_eq!(
+        why(pick(&lone, Some(A), &Target::Parent)),
+        "2 parent only an agent has a parent"
+    );
+    assert_eq!(
+        why(pick(&lone, None, &Target::Children)),
+        "2 target this team has no leader"
+    );
+}
+
+#[test]
+fn roster_is_running_committed_unnoticed() {
+    use crate::agents::lifecycle::Life;
+    let s = crate::agents::tree::tests::snap(
+        &[
+            (LEADER, leader_record(), Life::Running),
+            (A, child(A, LEADER, 1), Life::Running),
+            (B, child(B, A, 2), Life::Ended),
+            (C, child(C, LEADER, 1), Life::Lost),
+        ],
+        0,
+    );
+    assert_eq!(
+        roster(&s).into_iter().map(|m| m.id).collect::<Vec<_>>(),
+        [LEADER, A]
     );
 }

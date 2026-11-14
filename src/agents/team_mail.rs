@@ -164,6 +164,134 @@ pub fn mark_done(root: &Path, sender: &str, id: &str) {
     }
 }
 
+/// A running member of the team.
+#[derive(Debug, Clone)]
+pub struct Member {
+    pub id: String,
+    pub name: String,
+    pub record: Value,
+}
+
+impl Member {
+    pub fn mailbox(&self) -> String {
+        super::mail::member_mailbox(&self.id, &self.record)
+    }
+}
+
+/// The team (`membership::team(caller)`, with or without a team record: the members of the session): every committed
+/// member with no end notice, not superseded, that hc shows running; in snapshot order.
+pub fn roster(s: &super::membership::Snapshot) -> Vec<Member> {
+    let superseded = s.superseded();
+    s.facts
+        .local
+        .iter()
+        .filter(|o| {
+            o.life == super::lifecycle::Life::Running && !superseded.contains(&o.identity.id)
+        })
+        .filter_map(|o| {
+            s.records
+                .get(&o.identity.id)
+                .filter(|st| st.committed && !st.noticed)
+                .map(|st| Member {
+                    id: o.identity.id.clone(),
+                    name: o.identity.name.clone(),
+                    record: st.record.clone(),
+                })
+        })
+        .collect()
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum Target {
+    Name(String),
+    Parent,
+    Leader,
+    Children,
+    Team,
+    Pane(String),
+}
+
+/// The target word of a send; anything else is 2 `usage`.
+pub fn target(word: &str) -> Res<Target> {
+    Ok(match word {
+        "parent" => Target::Parent,
+        "leader" => Target::Leader,
+        "children" => Target::Children,
+        "team" => Target::Team,
+        w if super::pane_id(w) => Target::Pane(w.into()),
+        w if super::agent_name(w) => Target::Name(w.into()),
+        _ => return Err(super::usage("send")),
+    })
+}
+
+#[derive(Debug)]
+pub enum Pick {
+    Members(Vec<Member>),
+    Pane(String),
+    Unknown,
+}
+
+pub const NO_NAME: &str = "no agent of this team has that name";
+const NO_LEADER: &str = "this team has no leader";
+const NO_OTHER: &str = "no other member to send to";
+const NO_PARENT: &str = "only an agent has a parent";
+
+/// Who `t` names for `sender` (a member id; None for a person) on `roster`.
+pub fn pick(roster: &[Member], sender: Option<&str>, t: &Target) -> Res<Pick> {
+    let leader = roster.iter().find(|m| super::tree::is_leader(&m.record));
+    let parent_of = |m: &Member| super::text(m.record.get("parentAgent").and_then(|p| p.get("id")));
+    let others = |keep: &dyn Fn(&Member) -> bool| -> Res<Pick> {
+        let v: Vec<Member> = roster
+            .iter()
+            .filter(|m| Some(m.id.as_str()) != sender && keep(m))
+            .cloned()
+            .collect();
+        if v.is_empty() {
+            refuse(2, "target", NO_OTHER)
+        } else {
+            Ok(Pick::Members(v))
+        }
+    };
+    match t {
+        Target::Name(n) => Ok(roster
+            .iter()
+            .find(|m| m.name == *n)
+            .map_or(Pick::Unknown, |m| Pick::Members(vec![m.clone()]))),
+        Target::Pane(p) => Ok(Pick::Pane(p.clone())),
+        Target::Leader => match leader {
+            Some(l) => Ok(Pick::Members(vec![l.clone()])),
+            None => refuse(2, "target", NO_LEADER),
+        },
+        Target::Parent => {
+            let Some(me) = sender.and_then(|s| roster.iter().find(|m| m.id == s)) else {
+                return refuse(2, "parent", NO_PARENT);
+            };
+            let parent = parent_of(me);
+            if let Some(p) = roster.iter().find(|m| !parent.is_empty() && m.id == parent) {
+                return Ok(Pick::Members(vec![p.clone()]));
+            }
+            match me
+                .record
+                .get("parentPane")
+                .and_then(Value::as_str)
+                .filter(|p| super::pane_id(p))
+            {
+                Some(pane) => Ok(Pick::Pane(pane.into())),
+                None => refuse(2, "parent", NO_PARENT),
+            }
+        }
+        Target::Children => {
+            let parent = match (sender, leader) {
+                (Some(s), _) => s.to_string(),
+                (None, Some(l)) => l.id.clone(),
+                (None, None) => return refuse(2, "target", NO_LEADER),
+            };
+            others(&|m| parent_of(m) == parent)
+        }
+        Target::Team => others(&|_| true),
+    }
+}
+
 #[cfg(test)]
 #[path = "team_mail_tests.rs"]
 mod tests;
