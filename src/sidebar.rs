@@ -4,6 +4,7 @@
 pub(crate) mod input;
 mod keys;
 mod pick;
+mod tree;
 
 use std::cmp::Reverse;
 use std::io;
