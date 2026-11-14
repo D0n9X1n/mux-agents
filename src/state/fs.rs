@@ -116,6 +116,21 @@ pub fn fail_sync_dir(dir: Option<&Path>) {
     SYNC_FAULT.with(|fault| *fault.borrow_mut() = dir.map(Path::to_path_buf));
 }
 
+#[cfg(test)]
+thread_local! {
+    // While `record_reads` runs on this thread: every path `read_json` was asked to open, in order.
+    static READS: std::cell::RefCell<Option<Vec<PathBuf>>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Runs `f` and answers its result with every path `read_json` was asked to open on this thread meanwhile.
+#[cfg(test)]
+pub fn record_reads<T>(f: impl FnOnce() -> T) -> (T, Vec<PathBuf>) {
+    READS.with(|reads| *reads.borrow_mut() = Some(Vec::new()));
+    let got = f();
+    let reads = READS.with(|reads| reads.borrow_mut().take().unwrap_or_default());
+    (got, reads)
+}
+
 /// Makes `path` hold `value` only if nothing is there yet: true when this call made it, false when it already
 /// existed. The JSON is written whole beside `path`, then hard-linked to it, so `path` appears with its content or
 /// not at all, and of two racers exactly one makes it (#97: spawn's commit against the launcher's give-up).
@@ -224,6 +239,12 @@ fn write_new(path: &Path, bytes: &[u8]) -> io::Result<()> {
 /// The parsed file, or `None` when it or its folder is missing; over 1 MB is an error. Callers hold the
 /// session lock. On Windows the read shares delete, so it never blocks a replace.
 pub fn read_json(path: &Path) -> Res<Option<Value>> {
+    #[cfg(test)]
+    READS.with(|reads| {
+        if let Some(reads) = reads.borrow_mut().as_mut() {
+            reads.push(path.to_path_buf());
+        }
+    });
     let mut options = OpenOptions::new();
     options.read(true);
     #[cfg(windows)]

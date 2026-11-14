@@ -39,12 +39,21 @@ fn prove(ctx: &Ctx) -> Res<Option<Caller>> {
         if !agents::agent_id(id) {
             return None;
         }
-        let state = ctx.state_root.join(key);
-        let folder = state.join("agents").join(id);
+        // A file is read only where it is itself, inside the state root: no link on the way out (#104 phase 1c).
+        // shortcut: checked before the open, not by it; the state root is this user's own, private folder.
+        let root = std::fs::canonicalize(&ctx.state_root).ok()?;
+        let inside = |rel: &[&str]| -> Option<std::path::PathBuf> {
+            let at = rel.iter().fold(ctx.state_root.clone(), |p, r| p.join(r));
+            let real = rel.iter().fold(root.clone(), |p, r| p.join(r));
+            (std::fs::canonicalize(&at).ok()? == real).then_some(at)
+        };
+        let folder = inside(&[key, "agents", id])?;
+        inside(&[key, "agents", id, "commit.json"])?;
         if !agents::committed(&folder) {
             return None;
         }
-        let r = crate::state::fs::read_json(&folder.join("record.json")).ok()??;
+        let record = inside(&[key, "agents", id, "record.json"])?;
+        let r = crate::state::fs::read_json(&record).ok()??;
         let identity = Identity::read(&r, id, team)?;
         if identity.address != address
             || !identity.matches(&t)
@@ -58,7 +67,7 @@ fn prove(ctx: &Ctx) -> Res<Option<Caller>> {
         if !agents::pane_id(pane) || !window.strip_prefix('@').is_some_and(super::digits) {
             return None;
         }
-        let server = crate::state::fs::read_json(&state.join("server.json")).ok()??;
+        let server = crate::state::fs::read_json(&inside(&[key, "server.json"])?).ok()??;
         let pid = u32::try_from(server["serverPid"].as_u64()?).ok()?;
         let start = server["serverStart"].as_i64()?;
         let socket = server["socket"].as_str()?;

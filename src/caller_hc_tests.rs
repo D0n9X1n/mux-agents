@@ -335,3 +335,116 @@ fn hc_worker_revalidates_before_writing() {
     assert!(w.fakes.mux_calls().is_empty());
     w.fakes.hc_done().unwrap();
 }
+/// `p` with every link resolved: its nearest existing ancestor's canonical path, then the rest as named. None when
+/// the rest climbs (`..`), so where it lands is not known.
+fn real(p: &std::path::Path) -> Option<std::path::PathBuf> {
+    let parts: Vec<_> = p.components().collect();
+    (0..=parts.len()).rev().find_map(|n| {
+        let at: std::path::PathBuf = parts[..n].iter().collect();
+        let real = std::fs::canonicalize(&at).ok()?;
+        Some(
+            parts[n..]
+                .iter()
+                .all(|c| matches!(c, std::path::Component::Normal(_)))
+                .then(|| parts[n..].iter().fold(real, |acc, c| acc.join(c))),
+        )
+    })?
+}
+/// Makes `at` a link to `target`, a folder or a file.
+fn link(target: &std::path::Path, at: &std::path::Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    return std::os::unix::fs::symlink(target, at);
+    #[cfg(windows)]
+    return if target.is_dir() {
+        std::os::windows::fs::symlink_dir(target, at)
+    } else {
+        std::os::windows::fs::symlink_file(target, at)
+    };
+}
+// Whatever its hc terminal's labels name, and wherever a link in the state root points, the worker proof opens no
+// file outside the canonical state root (#104 phase 1c).
+#[test]
+fn hc_worker_proof_reads_nothing_outside_the_state_root() {
+    // The seam sees the proof's reads: a proven worker opens its commit, its record and its server's file.
+    let (w, _, r, _) = worker();
+    proof(&w, &r);
+    let (got, reads) = crate::state::fs::record_reads(|| caller::resolve(&w.ctx));
+    got.unwrap();
+    let root = std::fs::canonicalize(&w.ctx.state_root).unwrap();
+    let names: Vec<_> = reads
+        .iter()
+        .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(names, ["commit.json", "record.json", "server.json"]);
+    for p in &reads {
+        assert!(real(p).is_some_and(|p| p.starts_with(&root)), "{p:?}");
+    }
+    w.fakes.hc_done().unwrap();
+    for case in [
+        "traversal-team",
+        "traversal-id",
+        "absolute-team",
+        "absolute-id",
+        "linked-team",
+        "linked-member",
+        "linked-commit",
+        "linked-record",
+        "linked-server",
+    ] {
+        let (w, _, r, folder) = worker();
+        let outside = w._dir.path().join("outside");
+        std::fs::create_dir(&outside).unwrap();
+        let team = folder.parent().unwrap().parent().unwrap().to_path_buf();
+        let mut t = wire(&r);
+        // Moves `at` outside the state root and leaves a link to it in its place: the proof would succeed through
+        // the link, reading the moved files.
+        let moved = |at: &std::path::Path| {
+            let to = outside.join(at.file_name().unwrap());
+            std::fs::rename(at, &to).unwrap();
+            link(&to, at)
+        };
+        let made = match case {
+            "traversal-team" => {
+                t["labels"]["mux.team"] = "../../outside:$3".into();
+                Ok(())
+            }
+            "traversal-id" => {
+                t["labels"]["mux.id"] = "../outside".into();
+                Ok(())
+            }
+            "absolute-team" => {
+                t["labels"]["mux.team"] = format!("{}:$3", outside.display()).into();
+                Ok(())
+            }
+            "absolute-id" => {
+                t["labels"]["mux.id"] = outside.display().to_string().into();
+                Ok(())
+            }
+            "linked-team" => moved(&team),
+            "linked-member" => moved(&folder),
+            "linked-commit" => moved(&folder.join("commit.json")),
+            "linked-record" => moved(&folder.join("record.json")),
+            "linked-server" => moved(&team.join("server.json")),
+            _ => unreachable!(),
+        };
+        if let Err(e) = made {
+            // Windows makes a link only with the privilege or developer mode.
+            eprintln!("{case}: skipped, no link: {e}");
+            continue;
+        }
+        cf::online(&w);
+        cf::get(&w, r["hcAddress"].as_str().unwrap(), t);
+        let (got, reads) = crate::state::fs::record_reads(|| caller::resolve(&w.ctx));
+        let root = std::fs::canonicalize(&w.ctx.state_root).unwrap();
+        for p in &reads {
+            assert!(
+                real(p).is_some_and(|p| p.starts_with(&root)),
+                "{case}: read {p:?}, outside {root:?}"
+            );
+        }
+        let e = got.unwrap_err();
+        assert_eq!((e.code, e.check), (2, "herdr"), "{case}: {e:?}");
+        assert!(w.fakes.mux_calls().is_empty(), "{case}");
+        w.fakes.hc_done().unwrap();
+    }
+}
