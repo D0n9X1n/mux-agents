@@ -4,6 +4,13 @@
 pub(crate) mod input;
 mod keys;
 mod pick;
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "shortcut: the team bar draws through `lay_team` from Task 11 (#103); remove this then"
+    )
+)]
 mod tree;
 
 use std::cmp::Reverse;
@@ -565,7 +572,88 @@ struct Shape {
     notes: usize,
 }
 
-fn live_row(row: &Map<String, Value>, cols: usize, look: Look) -> Live {
+/// An ended, lost or unknown row's kind and word (S2.3), as `parts` and the tree draw it.
+fn ended_kind(row: &Map<String, Value>) -> (Kind, String) {
+    let state = clean(row.get("state"));
+    match state.as_str() {
+        "lost" | "unknown" => (Kind::Other, state.clone()),
+        value if value.starts_with("exited ") => (Kind::Exit, state.clone()),
+        "exited" => match row.get("exitCode").filter(|code| !code.is_null()) {
+            Some(code) if clean(Some(code)) == "0" => (Kind::Finished, "done".to_string()),
+            Some(code) => (Kind::Exit, format!("exit {}", clean(Some(code)))),
+            None => (Kind::Exit, "exit ?".to_string()),
+        },
+        "stopped" => (Kind::Stopped, state.clone()),
+        _ => (Kind::Other, state.clone()),
+    }
+}
+
+/// The header's counts (#103 B7: a team board holds only the team): live agents by kind in herdr's order, each when not 0
+/// (`0 running` when none lives), then `M ended` (`endedTotal`, else every row not running).
+fn counts(board: &Map<String, Value>) -> Vec<(String, Style)> {
+    let rows: Vec<&Map<String, Value>> = board
+        .get("agents")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_object)
+        .collect();
+    let mut kinds = [0usize; 4];
+    for row in rows.iter().filter(|r| clean(r.get("state")) == "running") {
+        kinds[match Kind::live(row) {
+            Kind::Blocked => 0,
+            Kind::Done => 1,
+            Kind::Working => 2,
+            _ => 3,
+        }] += 1;
+    }
+    let total = board
+        .get("endedTotal")
+        .and_then(Value::as_u64)
+        .map_or(rows.len() - kinds.iter().sum::<usize>(), |t| t as usize);
+    let (words, styles) = (
+        ["need you", "done", "working", "idle"],
+        [hued(Color::Yellow), PLAIN, PLAIN, PLAIN],
+    );
+    let mut counts: Vec<(String, Style)> = (0..4)
+        .filter(|&at| kinds[at] > 0)
+        .map(|at| (format!("{} {}", kinds[at], words[at]), styles[at]))
+        .collect();
+    if counts.is_empty() {
+        counts.push(("0 running".into(), PLAIN));
+    }
+    counts.push((format!("{total} ended"), PLAIN));
+    counts
+}
+
+/// The unread badge after a name: `✉ N` (ASCII `m N`), none at 0. Live and recovery rows share it (#103 B8).
+fn unread_badge(row: &Map<String, Value>, look: Look) -> Row {
+    let unread = row.get("unread").and_then(Value::as_u64).unwrap_or(0);
+    if unread == 0 {
+        return Vec::new();
+    }
+    vec![
+        span("  ", PLAIN),
+        span(
+            format!("{} {unread}", if look.ascii { "m" } else { MAIL }),
+            BADGE,
+        ),
+    ]
+}
+
+/// A live row's pieces before layout: `live_row` and the team tree lay them out each its own way.
+struct LiveParts {
+    kind: Kind,
+    muted: bool,
+    glyph: Span,
+    name: Span,
+    model: Row,
+    badge: Row,
+    age: String,
+    doing: String,
+}
+
+fn live_parts(row: &Map<String, Value>, look: Look) -> LiveParts {
     let kind = Kind::live(row);
     // An idle agent's whole row is muted, as herdr mutes it; its name keeps its hue.
     let muted = kind == Kind::Idle;
@@ -580,52 +668,54 @@ fn live_row(row: &Map<String, Value>, cols: usize, look: Look) -> Live {
     } else {
         vec![span(format!(" [{model}]"), DIM)]
     };
-    let unread = row.get("unread").and_then(Value::as_u64).unwrap_or(0);
-    let badge = if unread > 0 {
-        let mail = if look.ascii { "m" } else { MAIL };
-        vec![span("  ", PLAIN), span(format!("{mail} {unread}"), BADGE)]
-    } else {
-        Vec::new()
-    };
     // The time since the activity last changed, else since the agent started.
     let since = row
         .get("since")
         .filter(|since| !since.is_null())
         .or_else(|| row.get("age"));
-    let glyph = span(kind.glyph(look.ascii), kind.style());
-    let name_span = span(
-        own_glyphs(&name),
-        Style {
-            color: hue,
-            dim: muted,
-            ..PLAIN
-        },
-    );
-    let age = format_age(since);
-    let line = agent_line(
-        glyph.clone(),
-        name_span.clone(),
-        model.clone(),
-        badge.clone(),
-        right(kind, kind.word(), &age, muted),
-        cols,
-    );
-    let age_style = if muted { DIM } else { PLAIN };
-    let compact = agent_line(
-        glyph,
-        name_span,
-        model,
-        badge,
-        vec![span(format!("{age:>4}"), age_style)],
-        cols,
-    );
-    let doing = own_glyphs(&clean(row.get("doing")));
-    let doing = doing.trim();
-    Live {
+    LiveParts {
         kind,
+        muted,
+        glyph: span(kind.glyph(look.ascii), kind.style()),
+        name: span(
+            own_glyphs(&name),
+            Style {
+                color: hue,
+                dim: muted,
+                ..PLAIN
+            },
+        ),
+        model,
+        badge: unread_badge(row, look),
+        age: format_age(since),
+        doing: own_glyphs(&clean(row.get("doing"))).trim().to_string(),
+    }
+}
+
+fn live_row(row: &Map<String, Value>, cols: usize, look: Look) -> Live {
+    let p = live_parts(row, look);
+    let age_style = if p.muted { DIM } else { PLAIN };
+    let line = agent_line(
+        p.glyph.clone(),
+        p.name.clone(),
+        p.model.clone(),
+        p.badge.clone(),
+        right(p.kind, p.kind.word(), &p.age, p.muted),
+        cols,
+    );
+    let compact = agent_line(
+        p.glyph,
+        p.name,
+        p.model,
+        p.badge,
+        vec![span(format!("{:>4}", p.age), age_style)],
+        cols,
+    );
+    Live {
+        kind: p.kind,
         line: margin(line),
         compact: margin(compact),
-        doing: (!doing.is_empty()).then(|| indented(doing, cols)),
+        doing: (!p.doing.is_empty()).then(|| indented(&p.doing, cols)),
         age: row.get("age").and_then(Value::as_i64),
         target: Target::of(row),
     }
@@ -683,37 +773,17 @@ fn parts(
     };
     let rows = board.get("agents").and_then(Value::as_array);
     let (mut live, mut ended, mut counted) = (Vec::new(), Vec::new(), 0);
-    // Live agents by kind, in herdr's order: needs you, done, working, idle.
-    let mut kinds = [0usize; 4];
     for row in rows.map_or(&[][..], Vec::as_slice) {
         let Some(row) = row.as_object() else {
             continue;
         };
         // Every printed field, state included, is cleaned first.
-        let state = clean(row.get("state"));
-        if state == "running" {
-            let at = match Kind::live(row) {
-                Kind::Blocked => 0,
-                Kind::Done => 1,
-                Kind::Working => 2,
-                _ => 3,
-            };
-            kinds[at] += 1;
+        if clean(row.get("state")) == "running" {
             live.push(live_row(row, cols, look));
             continue;
         }
         counted += 1;
-        let (kind, word) = match state.as_str() {
-            "lost" | "unknown" => (Kind::Other, state.clone()),
-            value if value.starts_with("exited ") => (Kind::Exit, state.clone()),
-            "exited" => match row.get("exitCode").filter(|code| !code.is_null()) {
-                Some(code) if clean(Some(code)) == "0" => (Kind::Finished, "done".to_string()),
-                Some(code) => (Kind::Exit, format!("exit {}", clean(Some(code)))),
-                None => (Kind::Exit, "exit ?".to_string()),
-            },
-            "stopped" => (Kind::Stopped, state.clone()),
-            _ => (Kind::Other, state.clone()),
-        };
+        let (kind, word) = ended_kind(row);
         let line = agent_line(
             span(kind.glyph(look.ascii), kind.style()),
             span(own_glyphs(&clean(row.get("name"))), DIM),
@@ -729,19 +799,9 @@ fn parts(
         .and_then(Value::as_u64)
         .map_or(counted, |total| total as usize);
     ended.truncate(ENDED_SHOWN);
-    let words = ["need you", "done", "working", "idle"];
-    let styles = [hued(Color::Yellow), PLAIN, PLAIN, PLAIN];
-    let mut counts: Vec<(String, Style)> = (0..4)
-        .filter(|&at| kinds[at] > 0)
-        .map(|at| (format!("{} {}", kinds[at], words[at]), styles[at]))
-        .collect();
-    if counts.is_empty() {
-        counts.push(("0 running".into(), PLAIN));
-    }
-    counts.push((format!("{total} ended"), PLAIN));
     Parts {
         dot: if look.ascii { "-" } else { "\u{b7}" },
-        header: header(&counts, cols),
+        header: header(&counts(board), cols),
         nothing: live.is_empty(),
         live,
         ended_more: total.saturating_sub(ended.len()),
