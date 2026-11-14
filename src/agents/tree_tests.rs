@@ -391,3 +391,245 @@ fn standing_proves_under_the_lock_and_keeps_a_pane_agent_caller() {
         "a tmux-pane agent keeps 2 caller"
     );
 }
+pub(crate) fn member_of(id: &str, record: Value) -> Standing {
+    Standing::Member(Member {
+        id: id.into(),
+        record,
+        client: Client::Claude,
+        pid: 150,
+        start: 1500,
+        flags: vec![],
+    })
+}
+#[test]
+fn admission_runs_in_v5_order() {
+    let w = World::human("");
+    let c = w.caller();
+    assert_eq!(team_of(&w.ctx, &c), Ok(None), "outside a team, 0.2");
+    w.uncommitted(LEADER, json!({"depth": 0, "upTeam": "t"}));
+    assert_eq!(
+        team_of(&w.ctx, &c),
+        no_team(),
+        "a leader without its record refuses before any hc call"
+    );
+    std::fs::remove_dir_all(w.folder(LEADER)).unwrap();
+    team_record(&w, &[]);
+    let team = team_of(&w.ctx, &c).unwrap().unwrap();
+    let i = ids(6);
+    let parents = [LEADER, i[0].as_str(), i[1].as_str(), LEADER, LEADER, LEADER];
+    cf::member(&w, LEADER, leader_record());
+    for (n, id) in i.iter().enumerate() {
+        cf::member(
+            &w,
+            id,
+            child(id, parents[n], if n < 3 { n as u64 + 1 } else { 1 }),
+        );
+    }
+    let rec = |id: &str| {
+        crate::state::fs::read_json(&w.folder(id).join("record.json"))
+            .unwrap()
+            .unwrap()
+    };
+    assert_eq!(
+        admit(&w.ctx, &c, &team, member_of(&i[2], rec(&i[2])))
+            .unwrap_err()
+            .check,
+        "depth",
+        "before any snapshot"
+    );
+    let a = admit(&w.ctx, &c, &team, member_of(&i[1], rec(&i[1]))).unwrap();
+    let mut rows: Vec<_> = std::iter::once(LEADER)
+        .chain(i.iter().map(String::as_str))
+        .map(|id| (id, rec(id), Life::Running))
+        .collect();
+    let kid = || -> Res<String> { Ok("kid".into()) };
+    assert_eq!(
+        place(&w.ctx, &c, &a, &snap(&rows, 0), Client::Claude, None, kid)
+            .unwrap_err()
+            .check,
+        "limit"
+    );
+    rows.pop();
+    let (five, budget) = (
+        snap(&rows, 0),
+        crate::agents::budget::path(&w.state(), "$3"),
+    );
+    let taken = place(&w.ctx, &c, &a, &five, Client::Claude, None, || {
+        refuse(2, "name", "taken")
+    });
+    assert_eq!(taken.unwrap_err().check, "name");
+    assert!(!budget.exists(), "a name refusal spends no token");
+    write(&budget, json!({"tokens": 0, "at": 0}));
+    assert_eq!(
+        place(&w.ctx, &c, &a, &five, Client::Claude, None, kid)
+            .unwrap_err()
+            .check,
+        "budget",
+        "budget last"
+    );
+    let pa = admit(&w.ctx, &c, &team, Standing::Person).unwrap();
+    let p = place(&w.ctx, &c, &pa, &five, Client::Claude, None, kid).unwrap();
+    assert_eq!(
+        (
+            p.depth,
+            &p.parent["id"],
+            p.parent_pane.as_str(),
+            p.flags.as_slice(),
+            p.name.as_str()
+        ),
+        (
+            1,
+            &json!(LEADER),
+            "%4",
+            &["--effort".to_string(), "high".into()][..],
+            "kid"
+        ),
+        "a person's child: leader, free"
+    );
+    std::fs::remove_file(&budget).unwrap();
+    let m = place(&w.ctx, &c, &a, &five, Client::Claude, None, kid).unwrap();
+    assert_eq!(
+        (m.depth, &m.parent["id"], m.directory.as_deref()),
+        (3, &json!(i[1]), Some("/work"))
+    );
+    assert_eq!(
+        crate::state::fs::read_json(&budget).unwrap().unwrap()["tokens"],
+        19
+    );
+}
+#[test]
+fn ancestors_end_at_the_leader() {
+    let i = ids(3);
+    let mut r: BTreeMap<String, Value> = [
+        (LEADER.to_string(), leader_record()),
+        (i[0].clone(), child(&i[0], LEADER, 1)),
+        (i[1].clone(), child(&i[1], &i[0], 2)),
+    ]
+    .into();
+    assert_eq!(
+        ancestors(&r, &i[1]).unwrap(),
+        [i[0].clone(), LEADER.to_string()]
+    );
+    assert!(ancestors(&r, LEADER).unwrap().is_empty());
+    r.insert(i[2].clone(), child(&i[2], "cccccccccccc", 2));
+    assert_eq!(
+        ancestors(&r, &i[2]),
+        refuse(2, "authority", "the parent chain of ma2 cannot be read"),
+        "broken"
+    );
+    for (id, bad) in [
+        (&i[0], child(&i[0], &i[1], 1)),
+        (&i[0], json!({"depth": 0, "parentAgent": null})),
+        (&i[0], child(&i[0], LEADER, 2)),
+    ] {
+        let mut r = r.clone();
+        r.insert(id.clone(), bad);
+        assert_eq!(
+            ancestors(&r, &i[1]).unwrap_err().check,
+            "authority",
+            "cycle, non-leader root, depth"
+        );
+    }
+}
+#[test]
+fn a_child_inherits_the_lower_of_its_parent_and_the_ceiling() {
+    use t::Policy::{AllowAll, Bypass, Default as Def};
+    let f = |c, p, ceiling| child_flags(c, p, ceiling, None).unwrap();
+    let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+    assert_eq!(
+        f(Client::Claude, Def, Def),
+        s(&["--effort", "high"]),
+        "a default leader's child: no bypass"
+    );
+    assert_eq!(
+        f(Client::Claude, Def, Bypass),
+        s(&["--effort", "high"]),
+        "parent below the ceiling"
+    );
+    assert_eq!(
+        f(Client::Claude, Bypass, Def),
+        s(&["--effort", "high"]),
+        "parent above the ceiling"
+    );
+    assert_eq!(
+        f(Client::Claude, Bypass, Bypass),
+        s(&["--dangerously-skip-permissions", "--effort", "high"])
+    );
+    assert_eq!(
+        f(Client::Claude, AllowAll, Bypass),
+        s(&["--effort", "high"]),
+        "Copilot AllowAll parent: Claude Default"
+    );
+    assert_eq!(
+        f(Client::Copilot, Bypass, Bypass),
+        s(&["--allow-all", "--no-sandbox"]),
+        "Claude Bypass: Copilot AllowAll"
+    );
+    assert_eq!(
+        bound(Bypass, Def, Bypass),
+        refuse(2, "ceiling", "the child's flags exceed its parent's policy")
+    );
+    assert_eq!(
+        bound(Bypass, Bypass, Def),
+        refuse(
+            2,
+            "ceiling",
+            "the child's flags exceed the team's permission ceiling"
+        )
+    );
+}
+#[test]
+fn of_two_racing_spawns_at_six_one_wins() {
+    let w = World::human("");
+    team_record(&w, &[]);
+    cf::member(&w, LEADER, leader_record());
+    for id in ids(5) {
+        cf::member(&w, &id, child(&id, LEADER, 1));
+    }
+    let (state, locks) = (
+        w.ctx.state_root.clone(),
+        w.ctx.state_root.parent().unwrap().join("locks"),
+    );
+    let key = crate::agents::lock_key("spawn", &w.caller(), "$3");
+    let race = |n: usize| {
+        let mut r = World::human("");
+        r.ctx.state_root = state.clone();
+        r.fakes.real_locks(&locks);
+        let c = r.caller();
+        crate::agents::lock(&r.ctx, &key, || {
+            let a = admit(&r.ctx, &c, &team_of(&r.ctx, &c)?.unwrap(), Standing::Person)?;
+            let all = crate::agents::resume::every_record(&r.ctx)?;
+            let rows: Vec<_> = all
+                .iter()
+                .map(|(f, v)| {
+                    (
+                        f.file_name().unwrap().to_str().unwrap(),
+                        v.clone(),
+                        Life::Running,
+                    )
+                })
+                .collect();
+            place(
+                &r.ctx,
+                &c,
+                &a,
+                &snap(&rows, 0),
+                Client::Claude,
+                None,
+                || Ok(format!("w{n}")),
+            )?;
+            let id = format!("{:012x}", 0xf0 + n);
+            r.uncommitted(&id, child(&id, LEADER, 1));
+            Ok(())
+        })
+        .is_ok()
+    };
+    let wins = std::thread::scope(|s| {
+        let all: Vec<_> = (0..2).map(|n| s.spawn(move || race(n))).collect();
+        all.into_iter()
+            .map(|h| h.join().unwrap())
+            .filter(|won| *won)
+            .count()
+    });
+    assert_eq!(wins, 1);
+}

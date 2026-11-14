@@ -15,6 +15,7 @@ use crate::parse::Client;
 use crate::proc::Row;
 use crate::state::root::OsKind;
 use serde_json::Value;
+use serde_json::json;
 use std::collections::BTreeMap;
 pub const MAX_DEPTH: u64 = 3;
 pub const MAX_MEMBERS: usize = 6;
@@ -277,6 +278,182 @@ pub fn standing(ctx: &Ctx, caller: &Caller, core: Option<&Core<'_>>) -> Res<Stan
             "an agent in a tmux or rmux pane cannot be proven a member",
         ),
     }
+}
+/// The ids above member `id`, nearest first, ending at the depth-0 leader; every link readable, one deeper than its
+/// parent, no cycle. Anything else refuses 2 `authority`.
+pub fn ancestors(records: &BTreeMap<String, Value>, id: &str) -> Res<Vec<String>> {
+    let name = records
+        .get(id)
+        .map_or(id.to_string(), |r| text(r.get("name")));
+    let broken = || {
+        refuse(
+            2,
+            "authority",
+            format!("the parent chain of {name} cannot be read"),
+        )
+    };
+    let depth = |r: &Value| r.get("depth").and_then(Value::as_u64);
+    let (mut chain, mut at) = (Vec::<String>::new(), id.to_string());
+    loop {
+        let Some(r) = records.get(&at) else {
+            return broken();
+        };
+        if is_leader(r) {
+            return Ok(chain);
+        }
+        let parent = r
+            .get("parentAgent")
+            .and_then(|p| p.get("id"))
+            .and_then(Value::as_str);
+        let (Some(d), Some(parent)) = (depth(r), parent) else {
+            return broken();
+        };
+        let up = records.get(parent).and_then(depth);
+        if parent == id
+            || chain.iter().any(|c| c == parent)
+            || up.map(|u| u + 1) != Some(d)
+            || chain.len() > MAX_DEPTH as usize
+        {
+            return broken();
+        }
+        chain.push(parent.to_string());
+        at = parent.to_string();
+    }
+}
+/// D6: the highest level `client` expresses at or below min(parent, ceiling); `bound` still guards.
+pub fn child_flags(
+    client: Client,
+    parent: team::Policy,
+    ceiling: team::Policy,
+    effort: Option<&str>,
+) -> Res<Vec<String>> {
+    let flags = super::spawn::launch_flags(client, Some(parent.min(ceiling)), effort);
+    bound(team::policy(client, &flags), parent, ceiling)?;
+    Ok(flags)
+}
+pub fn bound(child: team::Policy, parent: team::Policy, ceiling: team::Policy) -> Res<()> {
+    if !team::within(ceiling, child) {
+        return refuse(
+            2,
+            "ceiling",
+            "the child's flags exceed the team's permission ceiling",
+        );
+    }
+    if !team::within(parent, child) {
+        return refuse(2, "ceiling", "the child's flags exceed its parent's policy");
+    }
+    Ok(())
+}
+pub fn no_team<T>() -> Res<T> {
+    refuse(
+        1,
+        "team",
+        "the team record is missing; this team cannot spawn until up repairs it (2a-iii-b)",
+    )
+}
+/// The team record, read first under the team lock: None outside a team; a launched leader without it refuses 1 `team`
+/// before any hc call.
+pub fn team_of(ctx: &Ctx, caller: &Caller) -> Res<Option<Team>> {
+    match scope(ctx, caller)? {
+        Scope::Outside => Ok(None),
+        Scope::Leaderless => no_team(),
+        Scope::Team(t) => Ok(Some(t)),
+    }
+}
+/// A proven caller's child, from local records only (no snapshot, no reconcile), its depth checked.
+#[derive(Debug)]
+pub struct Admitted {
+    pub team: Team,
+    pub member: bool,
+    pub depth: u64,
+    pub parent: Value,
+    pub parent_pane: String,
+    pub level: team::Policy,
+    pub directory: Option<String>,
+}
+pub fn admit(ctx: &Ctx, caller: &Caller, found: &Team, standing: Standing) -> Res<Admitted> {
+    let records: BTreeMap<String, Value> = super::membership::locals(ctx, caller)?
+        .into_iter()
+        .map(|l| (l.identity.id, l.stored.record))
+        .collect();
+    let a = match standing {
+        Standing::Person => {
+            let leader = records
+                .get(&found.leader)
+                .ok_or_else(|| Refusal::internal("the team's leader has no record"))?;
+            let pane = text(leader.get("pane"));
+            Admitted {
+                team: found.clone(),
+                member: false,
+                depth: 1,
+                level: found.policy,
+                directory: None,
+                parent: json!({"client": text(leader.get("client")), "pid": null, "start": null,
+                    "sessionId": leader.get("sessionId"), "id": found.leader}),
+                parent_pane: if super::pane_id(&pane) {
+                    pane
+                } else {
+                    caller.pane.clone()
+                },
+            }
+        }
+        Standing::Member(m) => Admitted {
+            team: found.clone(),
+            member: true,
+            depth: ancestors(&records, &m.id)?.len() as u64 + 1,
+            level: team::policy(m.client, &m.flags),
+            directory: m
+                .record
+                .get("directory")
+                .and_then(Value::as_str)
+                .map(String::from),
+            parent: json!({"client": super::spawn::client_name(m.client), "pid": m.pid, "start": m.start,
+                "sessionId": m.record.get("sessionId"), "id": m.id}),
+            parent_pane: caller.pane.clone(),
+        },
+    };
+    check_depth(a.depth)?;
+    Ok(a)
+}
+/// Where an admitted child goes, and its name.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Placed {
+    pub depth: u64,
+    pub parent: Value,
+    pub parent_pane: String,
+    pub flags: Vec<String>,
+    pub directory: Option<String>,
+    pub name: String,
+}
+/// After the snapshot: limit, ceiling, name, then a member's token last, so a refusal spends nothing.
+pub fn place(
+    ctx: &Ctx,
+    caller: &Caller,
+    a: &Admitted,
+    snapshot: &Snapshot,
+    client: Client,
+    effort: Option<&str>,
+    name: impl FnOnce() -> Res<String>,
+) -> Res<Placed> {
+    limit(snapshot)?;
+    let flags = child_flags(client, a.level, a.team.policy, effort)?;
+    let name = name()?;
+    if a.member {
+        let file = super::budget::path(&server_dir(ctx, caller), &caller.session);
+        super::budget::spend(
+            &file,
+            &super::budget::rate(ctx, caller),
+            super::budget::now_secs(ctx),
+        )?;
+    }
+    Ok(Placed {
+        depth: a.depth,
+        parent: a.parent.clone(),
+        parent_pane: a.parent_pane.clone(),
+        flags,
+        directory: a.directory.clone(),
+        name,
+    })
 }
 #[cfg(test)]
 #[path = "tree_tests.rs"]
