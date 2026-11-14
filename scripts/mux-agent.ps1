@@ -98,8 +98,12 @@ foreach ($bin in $candidates) {
     if (-not [System.IO.Path]::IsPathRooted($bin)) { $bin = Join-Path $here $bin }
     if (-not (Test-Usable $bin)) { continue }
     # PowerShell on macOS and Linux expands `*`, `?` and `[...]` in every unquoted argument it passes to a native
-    # program, splatted ones included; single-quoted literals are passed as written.
-    $line = '& ' + ((@($bin) + $pass | ForEach-Object { "'" + ($_ -replace "'", "''") + "'" }) -join ' ')
+    # program, splatted ones included; single-quoted literals are passed as written. PowerShell's own escaper doubles
+    # every character it reads as a single quote (U+0027, U+2018, U+2019, U+201A, U+201B), so no argument can close
+    # its literal.
+    $line = '& ' + ((@($bin) + $pass | ForEach-Object {
+                "'" + [System.Management.Automation.Language.CodeGeneration]::EscapeSingleQuotedStringContent([string] $_) + "'"
+            }) -join ' ')
         if ($null -ne $piped) { $line = '$piped | ' + $line }
     try {
         Invoke-Expression $line

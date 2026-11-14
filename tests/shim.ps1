@@ -164,6 +164,16 @@ RunIn ("Set-Location -LiteralPath $(Lit $loc); `$env:MUX_AGENTS_BIN = $(Lit $rel
     "`$r = & $(Lit $shimPath) go 'a b'; 'captured=' + (`$r -join '|'); 'code=' + `$LASTEXITCODE")
 Expect 'in_process_capture_location_and_code' @('captured=in-loc|[go]|[a b]', 'code=5')
 
+# No argument can run as code: each character PowerShell reads as a single quote stays inside its argument.
+Reset; Fake $tier3 'tier3'
+$quotes = @(0x27, 0x2018, 0x2019, 0x201A, 0x201B) | ForEach-Object { [string][char]$_ + '; Write-Output INJECTED; #' }
+Run (@('q') + $quotes)
+# The fake prints in the console's code page, which may not hold these quotes, so the check is that each argument
+# arrived as one line ending in its own text and that nothing ran.
+$lines = @($out -split "`n")
+Check 'no_argument_runs_as_code' (($rc -eq 0) -and ($lines.Count -eq 7) -and ($lines[1] -eq '[q]') -and
+    -not ($lines -contains 'INJECTED') -and @($lines[2..6] | Where-Object { $_ -notlike '*; Write-Output INJECTED; #]' }).Count -eq 0)
+
 # Called with `&` and no arguments: the binary gets no arguments, not one empty one.
 Reset; Fake $tier3 'tier3'
 RunIn ("`$r = & $(Lit (Join-Path (Join-Path $root 'scripts') 'mux-agent.ps1')); 'captured=' + (`$r -join '|')")
