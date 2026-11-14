@@ -309,9 +309,10 @@ pub fn standing(ctx: &Ctx, caller: &Caller, core: Option<&Core<'_>>) -> Res<Stan
         ),
     }
 }
-/// The ids above member `id`, nearest first, ending at the depth-0 leader; every link readable, one deeper than its
-/// parent, no cycle. Anything else refuses 2 `authority`.
-pub fn ancestors(records: &BTreeMap<String, Value>, id: &str) -> Res<Vec<String>> {
+/// The ids above member `id`, nearest first, ending at `leader`, the team record's own depth-0 leader; every link
+/// readable, one deeper than its parent, no cycle. A chain that ends at any other root, even a depth-0 `upTeam` record,
+/// and anything else, refuses 2 `authority`.
+pub fn ancestors(records: &BTreeMap<String, Value>, id: &str, leader: &str) -> Res<Vec<String>> {
     let name = records
         .get(id)
         .map_or(id.to_string(), |r| text(r.get("name")));
@@ -329,7 +330,7 @@ pub fn ancestors(records: &BTreeMap<String, Value>, id: &str) -> Res<Vec<String>
             return broken();
         };
         if is_leader(r) {
-            return Ok(chain);
+            return if at == leader { Ok(chain) } else { broken() };
         }
         let parent = r
             .get("parentAgent")
@@ -430,7 +431,7 @@ pub fn admit(ctx: &Ctx, caller: &Caller, found: &Team, standing: Standing) -> Re
         Standing::Member(m) => Admitted {
             team: found.clone(),
             member: true,
-            depth: ancestors(&records, &m.id)?.len() as u64 + 1,
+            depth: ancestors(&records, &m.id, &found.leader)?.len() as u64 + 1,
             level: team::policy(m.client, &m.flags),
             directory: m
                 .record
@@ -490,6 +491,7 @@ pub fn place(
 /// Records only: mail grants nothing.
 pub fn authorize(
     records: &BTreeMap<String, Value>,
+    leader: &str,
     standing: &Standing,
     target: &str,
     verb: &str,
@@ -497,7 +499,7 @@ pub fn authorize(
     let Standing::Member(m) = standing else {
         return Ok(());
     };
-    if ancestors(records, target)?.contains(&m.id) {
+    if ancestors(records, target, leader)?.contains(&m.id) {
         return Ok(());
     }
     let name = records
@@ -537,11 +539,14 @@ pub fn authority(
     target: &str,
     verb: &str,
 ) -> Res<()> {
+    let Some(team) = team_of(ctx, caller)? else {
+        return no_team();
+    };
     let records = super::membership::locals(ctx, caller)?
         .into_iter()
         .map(|l| (l.identity.id, l.stored.record))
         .collect();
-    authorize(&records, standing, target, verb)
+    authorize(&records, &team.leader, standing, target, verb)
 }
 /// The level X's parent may grant: the team's for the leader, else the parent's recorded flags (unreadable refuses).
 pub fn parent_level(

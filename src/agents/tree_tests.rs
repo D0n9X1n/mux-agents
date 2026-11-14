@@ -508,13 +508,13 @@ fn ancestors_end_at_the_leader() {
     ]
     .into();
     assert_eq!(
-        ancestors(&r, &i[1]).unwrap(),
+        ancestors(&r, &i[1], LEADER).unwrap(),
         [i[0].clone(), LEADER.to_string()]
     );
-    assert!(ancestors(&r, LEADER).unwrap().is_empty());
+    assert!(ancestors(&r, LEADER, LEADER).unwrap().is_empty());
     r.insert(i[2].clone(), child(&i[2], "cccccccccccc", 2));
     assert_eq!(
-        ancestors(&r, &i[2]),
+        ancestors(&r, &i[2], LEADER),
         refuse(2, "authority", "the parent chain of ma2 cannot be read"),
         "broken"
     );
@@ -526,7 +526,7 @@ fn ancestors_end_at_the_leader() {
         let mut r = r.clone();
         r.insert(id.clone(), bad);
         assert_eq!(
-            ancestors(&r, &i[1]).unwrap_err().check,
+            ancestors(&r, &i[1], LEADER).unwrap_err().check,
             "authority",
             "cycle, non-leader root, depth"
         );
@@ -720,23 +720,23 @@ fn authority_runs_only_down_the_tree() {
     let m = |id: &str, r: &BTreeMap<String, Value>| member_of(id, r[id].clone());
     for who in [LEADER, i[0].as_str()] {
         assert!(
-            authorize(&r, &m(who, &r), &i[1], "stop").is_ok(),
+            authorize(&r, LEADER, &m(who, &r), &i[1], "stop").is_ok(),
             "{who}: an ancestor"
         );
     }
     assert!(
-        authorize(&r, &Standing::Person, &i[1], "read").is_ok(),
+        authorize(&r, LEADER, &Standing::Person, &i[1], "read").is_ok(),
         "a person"
     );
     for who in [&i[4], &i[2], &i[3], &i[1]] {
         assert_eq!(
-            authorize(&r, &m(who, &r), &i[1], "read"),
+            authorize(&r, LEADER, &m(who, &r), &i[1], "read"),
             refuse(2, "authority", "only an ancestor or a person can read ma1"),
             "{who}: sibling, peer, cousin, self"
         );
     }
     assert_eq!(
-        authorize(&r, &m(&i[1], &r), &i[0], "stop")
+        authorize(&r, LEADER, &m(&i[1], &r), &i[0], "stop")
             .unwrap_err()
             .check,
         "authority",
@@ -744,7 +744,7 @@ fn authority_runs_only_down_the_tree() {
     );
     r.insert(i[1].clone(), child(&i[1], "cccccccccccc", 2));
     assert_eq!(
-        authorize(&r, &m(&i[0], &r), &i[1], "stop"),
+        authorize(&r, LEADER, &m(&i[0], &r), &i[1], "stop"),
         refuse(2, "authority", "the parent chain of ma1 cannot be read"),
         "a broken chain"
     );
@@ -1398,4 +1398,43 @@ fn a_spawn_whose_terminal_changes_before_the_lock_refuses() {
         "no reconcile, no launch"
     );
     m.w.fakes.hc_done().unwrap();
+}
+/// Ancestry ends only at the team's own leader (#103): a second depth-0 `upTeam` record R in the session, with
+/// R > A > B, gives A no team standing, so its spawn admission and its stop and read of B refuse 2 `authority`.
+#[test]
+fn a_second_root_grants_no_authority() {
+    let w = World::human("");
+    let c = w.caller();
+    team_record(&w, &[]);
+    cf::member(&w, LEADER, leader_record());
+    let rogue = "cccccccccccc";
+    cf::member(
+        &w,
+        rogue,
+        json!({"id": rogue, "name": "rogue", "client": "claude", "session": "$3", "depth": 0,
+        "upTeam": "t", "parentAgent": null, "pane": "%5"}),
+    );
+    let i = ids(2);
+    cf::member(&w, &i[0], child(&i[0], rogue, 1));
+    cf::member(&w, &i[1], child(&i[1], &i[0], 2));
+    let rec = |id: &str| {
+        crate::state::fs::read_json(&w.folder(id).join("record.json"))
+            .unwrap()
+            .unwrap()
+    };
+    let team = team_of(&w.ctx, &c).unwrap().unwrap();
+    assert_eq!(team.leader, LEADER);
+    let e = admit(&w.ctx, &c, &team, member_of(&i[0], rec(&i[0]))).unwrap_err();
+    assert_eq!(
+        (e.check, e.message.as_str()),
+        ("authority", "the parent chain of ma0 cannot be read"),
+        "spawn admission"
+    );
+    for verb in ["stop", "read"] {
+        assert_eq!(
+            authority(&w.ctx, &c, &member_of(&i[0], rec(&i[0])), &i[1], verb),
+            refuse(2, "authority", "the parent chain of ma1 cannot be read"),
+            "{verb}"
+        );
+    }
 }

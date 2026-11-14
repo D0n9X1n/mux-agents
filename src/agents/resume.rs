@@ -145,8 +145,14 @@ fn admit(
             })?,
     };
     let id = &x.identity.id;
-    if let Some((_, s)) = gate {
-        super::tree::authorize(&super::tree::records_of(snapshot), s, id, "resume")?;
+    if let Some((team, s)) = gate {
+        super::tree::authorize(
+            &super::tree::records_of(snapshot),
+            &team.leader,
+            s,
+            id,
+            "resume",
+        )?;
     }
     let record = snapshot.records[id].record.clone();
     let life = match x.life {
