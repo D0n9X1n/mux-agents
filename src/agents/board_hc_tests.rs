@@ -59,6 +59,8 @@ fn hc_board_fields_append() {
                 running: &[],
                 now: w.ctx.clock.now(),
                 watch,
+                leader: None,
+                parents: &HashMap::new(),
             };
             let mut base = rows
                 .row(
