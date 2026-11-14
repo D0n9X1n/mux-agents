@@ -3342,6 +3342,16 @@ hc {}:
         let bar = s(&w1["sidebar"]).to_string();
         let pane = s(&w1["pane"]).to_string();
         live.worker_pid(&w1);
+        // The spawn marked the window as one that held a view before it returned, so the bar leaves whether or not
+        // a tick of it ever saw the view.
+        let viewed = live.call(&[
+            "show-options",
+            "-wqv",
+            "-t",
+            s(&w1["window"]),
+            "@mux-agents-viewed",
+        ]);
+        assert_eq!(viewed.trim_end(), "1", "{mux:?}");
         live.call(&["break-pane", "-d", "-s", &pane]);
         let window = live.field(&pane, "#{window_id}");
         assert_ne!(window, s(&w1["window"]), "{mux:?}");

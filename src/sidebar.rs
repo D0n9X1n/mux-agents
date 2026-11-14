@@ -75,6 +75,11 @@ const REARM: Duration = Duration::from_secs(60);
 const PAUSED: &str = "layout: repair paused";
 // `off` once `sidebar -Close` ran in the session; unset again by `sidebar`.
 const OPTION: &str = "@mux-agents-sidebar";
+// `1` on a window once a verb placed or focused a member view in it (`ensure`, under the session lock), so the
+// window's bar knows it held a view even when the view is gone before the bar's first look (#103). Unset when the
+// bar leaves. shortcut: a window viewed while the bar was on, whose view then closed with no bar left to unset it
+// (the bar closed by `sidebar -Close` first), keeps it; a bar opened there later by `sidebar` leaves at once.
+const VIEWED: &str = "@mux-agents-viewed";
 // The session's bar as `<pane> <pid> <start>`, written only by `open` once the split's process is this binary
 // `watch`, cleared by `sidebar -Close` once the bar is gone.
 const RECORD: &str = "@mux-agents-sidebar-id";
@@ -107,6 +112,9 @@ pub fn ensure(ctx: &Ctx, caller: &Caller, window: &str) -> Res<Bar> {
         if read.stdout.trim_end_matches(['\r', '\n']) == "off" {
             return Ok(Bar::Disabled);
         }
+        // The window held a member view (#103): a verb placed or focused one there. Best effort: the bar also sees
+        // the view itself.
+        let _ = native(ctx, &["set-option", "-w", "-t", window, VIEWED, "1"], true);
         migrate(ctx, &caller.session)?;
         let (pane, _, opened) = find_or_open(ctx, window)?;
         Ok(if opened {
@@ -156,10 +164,12 @@ fn find_or_open(ctx: &Ctx, window: &str) -> Res<(String, String, bool)> {
 
 /// Closes each pane of `window` that carries the bar's mark for its own pid but is not the proven bar (an open that
 /// failed left it; none is labelled, `find_or_open` refused that first), so a retry never splits beside it. Each close
-/// is bound to that mark and pid, alive or dead, and read back: a pane that is not gone refuses, so no second bar
-/// opens. A list that cannot be read refuses: it may hold such a pane.
+/// is one `if-shell -F` that holds only on a proven bar (`marked_kill_command`), and is read back: a marked pane that
+/// is not gone (one that runs another program now, or a bar that cannot be proven here) refuses, naming it, so no
+/// second bar opens and nothing unproven is killed. A list that cannot be read refuses: it may hold such a pane.
 fn sweep(ctx: &Ctx, window: &str) -> Res<()> {
     let listed = native(ctx, &["list-panes", "-t", window, "-F", MARK_FORMAT], false)?;
+    let command = bar_command(ctx);
     for line in listed.stdout.split('\n') {
         let line = line.strip_suffix('\r').unwrap_or(line);
         let mut fields = line.splitn(3, '|');
@@ -173,9 +183,11 @@ fn sweep(ctx: &Ctx, window: &str) -> Res<()> {
         if !pane_id(pane) || mark != pid.to_string() {
             continue;
         }
-        let kill = marked_kill_command(pane, pid);
-        let kill: Vec<&str> = kill.iter().map(String::as_str).collect();
-        let _ = native(ctx, &kill, true);
+        if let Some((start, name)) = &command {
+            let kill = marked_kill_command(pane, pid, start, name);
+            let kill: Vec<&str> = kill.iter().map(String::as_str).collect();
+            let _ = native(ctx, &kill, true);
+        }
         let closed = native(
             ctx,
             &["display-message", "-p", "-t", pane, GONE_FORMAT],
@@ -187,8 +199,9 @@ fn sweep(ctx: &Ctx, window: &str) -> Res<()> {
                 1,
                 "sidebar",
                 format!(
-                    "the side-bar pane {pane} left by an earlier open could not be closed; close it with kill-pane \
-                     -t {pane}"
+                    "pane {pane} carries the side-bar mark but could not be proven a side bar and was not closed: if \
+                     it is an old side bar, close it with kill-pane -t {pane}; if it is your own pane, clear the mark \
+                     with set-option -p -u -t {pane} {MARK}"
                 ),
             );
         }
@@ -1357,10 +1370,18 @@ pub fn run_watch(
             size = read;
         }
         let recorded = live.is_some() && own_record(ctx, caller);
-        // #103: a live member view seen in the bar's own window counts as held, recorded or not (the first tick may
-        // run before open records the bar). Only the recorded bar acts: once its window held a view and has none
-        // now, it first gives the other view windows their bar (no tick of it follows), then leaves. An unread view
-        // list changes nothing.
+        // #103: the window held a view once a verb marked it viewed (`ensure`), or once this bar sees a live member
+        // view in it, recorded or not (the first tick may run before open records the bar), whichever comes first.
+        if live.is_some() && !held {
+            held = native(
+                ctx,
+                &["show-options", "-wqv", "-t", &caller.window, VIEWED],
+                true,
+            )
+            .is_ok_and(|read| read.code == 0 && read.stdout.trim_end_matches(['\r', '\n']) == "1");
+        }
+        // Only the recorded bar acts: once its window held a view and has none now, it first gives the other view
+        // windows their bar (no tick of it follows), then leaves. An unread view list changes nothing.
         let read = if recorded || (live.is_some() && !held) {
             view_windows(ctx, caller)
         } else {
@@ -1575,6 +1596,9 @@ impl Viewing {
 }
 
 /// Each live agent's last activity, by pane, to tell when one starts needing the person or finishes.
+/// One agent's change worth a message: its name, its activity (`blocked` or `done`) and the change's `changedAt`.
+type News = (String, String, String);
+
 #[derive(Debug, Default)]
 struct Alerts {
     last: std::collections::HashMap<String, String>,
@@ -1582,12 +1606,9 @@ struct Alerts {
 
 impl Alerts {
     /// One tick: the agents that turned blocked or done since the last tick, while their pane is not the one shown,
-    /// as (name, activity). The first sight of an agent is no news; a board not read changes nothing.
-    fn tick(
-        &mut self,
-        board: Option<&Map<String, Value>>,
-        shown: Option<&str>,
-    ) -> Vec<(String, String)> {
+    /// as (name, activity, the change's `changedAt`). The first sight of an agent is no news; a board not read
+    /// changes nothing.
+    fn tick(&mut self, board: Option<&Map<String, Value>>, shown: Option<&str>) -> Vec<News> {
         let Some(rows) = board
             .and_then(|b| b.get("agents"))
             .and_then(Value::as_array)
@@ -1606,7 +1627,11 @@ impl Alerts {
                 && matches!(activity.as_str(), "blocked" | "done")
                 && shown != Some(pane.as_str())
             {
-                news.push((clean(row.get("name")), activity.clone()));
+                news.push((
+                    clean(row.get("name")),
+                    activity.clone(),
+                    clean(row.get("changedAt")),
+                ));
             }
             now.insert(pane, activity);
         }
@@ -1617,10 +1642,76 @@ impl Alerts {
 
 /// `@mux-agents-alerts`: `off` sends none, `blocked` only who needs the person, anything else (unset) both.
 const ALERTS_OPTION: &str = "@mux-agents-alerts";
+/// The session's changes already told (#83 with a bar per window): `<name>|<activity>|<changedAt>`, one per agent,
+/// space-separated, so a second bar that sees the same change sends nothing.
+const ALERTED: &str = "@mux-agents-alerted";
 
 /// The tmux message for `news`, on the session's clients for 5 s, unless `@mux-agents-alerts` says otherwise. Names
 /// are `[a-z0-9-]` and the words fixed, so the text holds no format. Best effort.
-fn alert(ctx: &Ctx, caller: &Caller, news: &[(String, String)]) {
+///
+/// Once per session (#83 with a bar per window, #103): under the session's sidebar lock, the news already told
+/// (`@mux-agents-alerted`, by any bar of the session) is dropped, the rest is recorded as told (whatever
+/// `@mux-agents-alerts` says, so turning it on later replays nothing), and only then sent. A record that cannot be
+/// read or written, or a lock not taken, sends nothing: a change is told at most once.
+fn alert(ctx: &Ctx, caller: &Caller, news: &[News]) {
+    let _ = lock(ctx, &lock_key("sidebar", caller, &caller.session), || {
+        let read = native(
+            ctx,
+            &["show-options", "-qv", "-t", &caller.session, ALERTED],
+            true,
+        )?;
+        if read.code != 0 {
+            return Ok(());
+        }
+        // One entry per agent, its latest change told.
+        let mut told: Vec<String> = read.stdout.split_whitespace().map(String::from).collect();
+        let fresh: Vec<&News> = news
+            .iter()
+            .filter(|(name, _, _)| crate::agents::agent_name(name))
+            .filter(|news| !told.contains(&told_key(news)))
+            .collect();
+        if fresh.is_empty() {
+            return Ok(());
+        }
+        for news in &fresh {
+            let name = format!("{}|", news.0);
+            told.retain(|t| !t.starts_with(&name));
+            told.push(told_key(news));
+        }
+        let record = told.join(" ");
+        let written = native(
+            ctx,
+            &["set-option", "-t", &caller.session, ALERTED, &record],
+            true,
+        )?;
+        if written.code != 0 {
+            return Ok(());
+        }
+        send_alert(ctx, caller, &fresh);
+        Ok(())
+    });
+}
+
+/// `<name>|<activity>|<changedAt>`, with no space or `|` inside a field (an unset `changedAt` is `-`).
+fn told_key((name, activity, changed): &News) -> String {
+    let field = |text: &str| -> String {
+        let text: String = text
+            .chars()
+            .map(|c| {
+                if c.is_whitespace() || c == '|' {
+                    '_'
+                } else {
+                    c
+                }
+            })
+            .collect();
+        if text.is_empty() { "-".into() } else { text }
+    };
+    format!("{}|{}|{}", field(name), field(activity), field(changed))
+}
+
+/// The message itself, as `@mux-agents-alerts` says: `off` none, `blocked` only who needs the person, else both.
+fn send_alert(ctx: &Ctx, caller: &Caller, news: &[&News]) {
     let option = native(
         ctx,
         &["show-options", "-qv", "-t", &caller.session, ALERTS_OPTION],
@@ -1631,13 +1722,12 @@ fn alert(ctx: &Ctx, caller: &Caller, news: &[(String, String)]) {
     .unwrap_or_default();
     let parts: Vec<String> = news
         .iter()
-        .filter(|(_, activity)| match option.as_str() {
+        .filter(|(_, activity, _)| match option.as_str() {
             "off" => false,
             "blocked" => activity == "blocked",
             _ => true,
         })
-        .filter(|(name, _)| crate::agents::agent_name(name))
-        .map(|(name, activity)| {
+        .map(|(name, activity, _)| {
             let word = if activity == "blocked" {
                 "needs you"
             } else {
@@ -2264,6 +2354,12 @@ fn leave(ctx: &Ctx, caller: &Caller) -> bool {
                 true,
             );
         }
+        // The window holds no view now: a bar opened here later starts as one that never held a view.
+        let _ = native(
+            ctx,
+            &["set-option", "-wu", "-t", &caller.window, VIEWED],
+            true,
+        );
         Ok(true)
     })
     .unwrap_or(false)
@@ -2333,17 +2429,62 @@ pub fn mark_command(pane: &str, pid: u32) -> Vec<String> {
     ]
 }
 
-/// The kill of a pane left with the bar's mark: the server kills it only while its mark and its pid are both `pid`,
-/// alive or dead.
-pub fn marked_kill_command(pane: &str, pid: u32) -> Vec<String> {
+/// The kill of a pane left with the bar's mark, in one `if-shell -F` the server evaluates with the kill: only while
+/// its mark and its pid are both `pid`, its `#{pane_start_command}` is `start` (the bar's exact command, as the
+/// multiplexer renders it) and its `#{pane_current_command}` is `name` (this binary's file name), alive or dead. A
+/// process that exec'd another program keeps its pid and mark but fails the last; a multiplexer that has no such
+/// variable expands it empty and fails it too, so nothing is killed.
+pub fn marked_kill_command(pane: &str, pid: u32, start: &str, name: &str) -> Vec<String> {
+    let (start, name) = (
+        crate::agents::registry::escape(start),
+        crate::agents::registry::escape(name),
+    );
     vec![
         "if-shell".into(),
         "-F".into(),
         "-t".into(),
         pane.into(),
-        format!("#{{&&:#{{==:#{{{MARK}}},{pid}}},#{{==:#{{pane_pid}},{pid}}}}}"),
+        format!(
+            "#{{&&:#{{&&:#{{==:#{{{MARK}}},{pid}}},#{{==:#{{pane_pid}},{pid}}}}},\
+             #{{&&:#{{==:#{{pane_start_command}},{start}}},#{{==:#{{pane_current_command}},{name}}}}}}}"
+        ),
         format!("kill-pane -t {pane}"),
     ]
+}
+
+/// The bar's start command as the multiplexer in use renders `#{pane_start_command}` for the split's two items
+/// `<exe> watch`, and this binary's file name; none when it cannot be told exactly. tmux joins the items with a
+/// space and quotes an item that holds anything special, so only an exe made of plain characters is told; rmux
+/// 0.10 percent-encodes each item (all but `A-Za-z0-9-_./: =+`) and joins them with 0x1f (`format_command_field`,
+/// crates/rmux-server/src/pane_terminals/lifecycle_state.rs:385-427).
+fn bar_command(ctx: &Ctx) -> Option<(String, String)> {
+    let exe = ctx.exe.to_str()?;
+    let name = ctx.exe.file_name()?.to_str()?.to_string();
+    let kind = ctx.mux.borrow().as_ref().map(|mux| mux.kind())?;
+    let start = match kind {
+        crate::mux::Kind::Tmux => {
+            let plain = !exe.is_empty()
+                && exe
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b"-_./:+=".contains(&b));
+            plain.then(|| format!("{exe} watch"))?
+        }
+        crate::mux::Kind::Rmux => {
+            let encode = |text: &str| -> String {
+                text.bytes()
+                    .map(|b| {
+                        if b.is_ascii_alphanumeric() || b"-_./: =+".contains(&b) {
+                            char::from(b).to_string()
+                        } else {
+                            format!("%{b:02X}")
+                        }
+                    })
+                    .collect()
+            };
+            format!("{}\x1f{}", encode(exe), encode("watch"))
+        }
+    };
+    Some((start, name))
 }
 
 /// The conditional label of `pane` as the side bar, only while it is alive and still runs `pid`.
@@ -2544,6 +2685,8 @@ mod tests {
     // The watch's own record: pane %7, the fake process 4242 started at 2000.
     const OWN: &str = "%7 4242 2000\n";
     const READ_OPTION: &str = "-N show-options -qv -t $3 @mux-agents-sidebar";
+    // #103 QA: ensure marks its window @1 viewed, right after it reads the session's option.
+    const VIEWED_ON: &str = "-N set-option -w -t @1 @mux-agents-viewed 1";
     const OFF: &str = "-N set-option -t $3 @mux-agents-sidebar off";
     const ON: &str = "-N set-option -u -t $3 @mux-agents-sidebar";
 
@@ -3997,7 +4140,7 @@ mod tests {
         let news = |al: &mut Alerts, a: &str, b: &str, shown: Option<&str>| {
             al.tick(board(a, b).as_object(), shown)
                 .into_iter()
-                .map(|(n, w)| format!("{n}={w}"))
+                .map(|(n, w, _)| format!("{n}={w}"))
                 .collect::<Vec<_>>()
         };
         // The first sight is no news, whatever the state.
@@ -4021,8 +4164,8 @@ mod tests {
     #[test]
     fn alert_sends_one_message_as_the_option_says() {
         let news = vec![
-            ("w1".to_string(), "blocked".to_string()),
-            ("w2".to_string(), "done".to_string()),
+            ("w1".to_string(), "blocked".to_string(), "t1".to_string()),
+            ("w2".to_string(), "done".to_string(), "t2".to_string()),
         ];
         let sent = |option: &str| {
             let w = World::human("");
@@ -4052,6 +4195,105 @@ mod tests {
             call[call.len() - 5..],
             ["-t", "$3", "-d", "5000", "mux-agents: w1 needs you"]
         );
+    }
+
+    // A session with a stateful `@mux-agents-alerted` (read, written) and two bars' callers: %7 in @1 and %8 in @2.
+    fn two_bars() -> (World, Caller, Caller) {
+        let w = World::human("");
+        let alerted = Rc::new(RefCell::new(String::new()));
+        let a = alerted.clone();
+        w.fakes.mux_script(ALERTED, move |argv| {
+            if argv[1] == "show-options" {
+                return Ok(out(0, &format!("{}\n", a.borrow()), ""));
+            }
+            *a.borrow_mut() = argv.last().unwrap().clone();
+            Ok(Output::default())
+        });
+        let one = w.caller();
+        let mut two = one.clone();
+        two.window = "@2".into();
+        two.pane = "%8".into();
+        (w, one, two)
+    }
+
+    fn told(w: &World) -> Vec<String> {
+        sent(&w.fakes)
+    }
+
+    fn sent(fakes: &Fakes) -> Vec<String> {
+        fakes
+            .mux_calls()
+            .into_iter()
+            .filter(|c| {
+                c[1] == "display-message" && c.last().is_some_and(|t| t.starts_with("mux-agents:"))
+            })
+            .map(|c| c.last().unwrap().clone())
+            .collect()
+    }
+
+    fn agent_board(activity: &str, changed: &str) -> Value {
+        json!({"running": 1, "agents": [
+            {"name": "w2", "state": "running", "pane": "%9", "activity": activity, "changedAt": changed}
+        ]})
+    }
+
+    // #83 with a bar per window (#103): two bars of one session see w2 turn blocked; the session is told once. The
+    // decision and the message are made under the session's sidebar lock.
+    #[test]
+    fn two_bars_of_one_session_tell_one_change_once() {
+        let (w, one, two) = two_bars();
+        let fakes = w.fakes.clone();
+        w.fakes.lock_probe(move |_| sent(&fakes).len().to_string());
+        let (mut a, mut b) = (Alerts::default(), Alerts::default());
+        for al in [&mut a, &mut b] {
+            assert!(
+                al.tick(agent_board("working", "t0").as_object(), None)
+                    .is_empty()
+            );
+        }
+        for (al, caller) in [(&mut a, &one), (&mut b, &two)] {
+            let news = al.tick(agent_board("blocked", "t1").as_object(), None);
+            assert_eq!(news.len(), 1);
+            alert(&w.ctx, caller, &news);
+        }
+        assert_eq!(told(&w), ["mux-agents: w2 needs you"]);
+        // The message went out while the first alert held the session lock.
+        let key = one.server_key.clone();
+        let locks = w.fakes.locks();
+        assert_eq!(
+            locks[..2],
+            [
+                format!("+sidebar|{key}|$3 0"),
+                format!("-sidebar|{key}|$3 1")
+            ]
+        );
+        // A later change (blocked again, a new changedAt) is told once more, by whichever bar sees it first.
+        for al in [&mut a, &mut b] {
+            al.tick(agent_board("working", "t2").as_object(), None);
+        }
+        for (al, caller) in [(&mut a, &one), (&mut b, &two)] {
+            let news = al.tick(agent_board("blocked", "t3").as_object(), None);
+            alert(&w.ctx, caller, &news);
+        }
+        assert_eq!(told(&w).len(), 2);
+    }
+
+    // #83 with a bar per window (#103): a bar opened after the alert, whose first read still saw w2 working (a read
+    // racing the change), sees the same blocked change next: it was told, so nothing is sent.
+    #[test]
+    fn a_bar_opened_after_the_alert_tells_none_of_it() {
+        let (w, one, two) = two_bars();
+        let mut a = Alerts::default();
+        a.tick(agent_board("working", "t0").as_object(), None);
+        let news = a.tick(agent_board("blocked", "t1").as_object(), None);
+        alert(&w.ctx, &one, &news);
+        assert_eq!(told(&w).len(), 1);
+        let mut late = Alerts::default();
+        late.tick(agent_board("working", "t0").as_object(), None);
+        let news = late.tick(agent_board("blocked", "t1").as_object(), None);
+        assert_eq!(news.len(), 1);
+        alert(&w.ctx, &two, &news);
+        assert_eq!(told(&w).len(), 1);
     }
 
     #[test]
@@ -6148,6 +6390,45 @@ mod tests {
         );
         w.fakes.mux_script("if-shell", move |argv| {
             let pane = argv[4].clone();
+            // The kill of a marked pane: every `#{==:#{<var>},<value>}` of its guard (a pure `&&`) must hold on the
+            // pane as it is now: its mark, pid, `start <pane>` (default `<exe> watch`) and `cmd <pane>` (default the
+            // exe's file name), as the server would evaluate them in the same command.
+            if argv[5].contains("@mux-agents-bar") && argv[6].starts_with("kill-pane") {
+                assert!(
+                    !argv[5].contains("||") && !argv[5].contains("#{!"),
+                    "{argv:?}"
+                );
+                let exe = get(&p, "exe").unwrap();
+                let fact = |var: &str| -> Option<String> {
+                    match var {
+                        "@mux-agents-bar" => get(&p, &format!("mark {pane}")),
+                        "pane_pid" => get(&p, &format!("pid {pane}")),
+                        "pane_start_command" => get(&p, &format!("pid {pane}")).map(|_| {
+                            get(&p, &format!("start {pane}")).unwrap_or(format!("{exe} watch"))
+                        }),
+                        "pane_current_command" => get(&p, &format!("pid {pane}")).map(|_| {
+                            get(&p, &format!("cmd {pane}")).unwrap_or_else(|| {
+                                std::path::Path::new(&exe)
+                                    .file_name()
+                                    .unwrap()
+                                    .to_string_lossy()
+                                    .into_owned()
+                            })
+                        }),
+                        other => panic!("an unexpected guard variable {other}"),
+                    }
+                };
+                let holds = argv[5].split("#{==:#{").skip(1).all(|term| {
+                    let (var, rest) = term.split_once("},").unwrap();
+                    let value = rest.split('}').next().unwrap();
+                    fact(var).as_deref() == Some(value)
+                });
+                if holds && get(&p, &pane).is_some() {
+                    unset(&p, &pane);
+                    unset(&p, &format!("pid {pane}"));
+                }
+                return Ok(Output::default());
+            }
             let want = argv[5].split("#{pane_pid},").nth(1).unwrap();
             let want = want.trim_end_matches('}').to_string();
             if argv[6] == format!("set-option -p -t {pane} @agent-role sidebar") {
@@ -6464,11 +6745,58 @@ mod tests {
         )
     }
 
-    /// The close of a pane that carries the bar's mark: only while the mark and the pane's pid are both `pid`.
+    /// The close of a pane that carries the bar's mark, in one `if-shell -F`: only while its mark and its pid are both
+    /// `pid`, it was started as the bar's exact command and it runs this binary now.
     fn marked_close_line(pane: &str, pid: u32) -> String {
         format!(
-            "-N if-shell -F -t {pane} #{{&&:#{{==:#{{@mux-agents-bar}},{pid}}},#{{==:#{{pane_pid}},{pid}}}}} kill-pane -t {pane}"
+            "-N if-shell -F -t {pane} #{{&&:#{{&&:#{{==:#{{@mux-agents-bar}},{pid}}},#{{==:#{{pane_pid}},{pid}}}}},\
+             #{{&&:#{{==:#{{pane_start_command}},/bin/mux-agent watch}},#{{==:#{{pane_current_command}},mux-agent}}}}}} \
+             kill-pane -t {pane}"
         )
+    }
+
+    // #103 QA: a pane that carries the bar's mark for its own pid is closed only when it is proven a bar in the same
+    // command: one that exec'd another program (%4: same pid, same mark) or was started as another command (%5)
+    // is never closed, and the open refuses, naming it, rather than split beside it.
+    #[test]
+    fn a_marked_pane_not_proven_a_bar_is_never_closed() {
+        for (pane, fact, value) in [("%4", "cmd %4", "vim"), ("%5", "start %5", "/bin/sh")] {
+            let pid = if pane == "%4" { "104" } else { "105" };
+            let (w, panes) = sidebar_world(
+                "",
+                Mux {
+                    extra: vec![
+                        (pane, "|".into()),
+                        (
+                            Box::leak(format!("pid {pane}").into_boxed_str()),
+                            pid.into(),
+                        ),
+                        (
+                            Box::leak(format!("mark {pane}").into_boxed_str()),
+                            pid.into(),
+                        ),
+                        (fact, value.into()),
+                    ],
+                    ..Mux::default()
+                },
+            );
+            let got = ensure_run(&w);
+            assert!(
+                got.starts_with(&format!("1 sidebar pane {pane} carries the side-bar mark")),
+                "{got}"
+            );
+            assert!(get(&panes, pane).is_some(), "{pane} survives");
+            assert_eq!(count(&w, "split-window"), 0, "{pane}");
+            let kills = w
+                .fakes
+                .mux_calls()
+                .iter()
+                .filter(|c| {
+                    c[1] == "if-shell" && c.last().is_some_and(|a| a.starts_with("kill-pane"))
+                })
+                .count();
+            assert_eq!(kills, 1, "{pane}: the guarded close was tried once");
+        }
     }
 
     fn refused(panes: &[&str]) -> String {
@@ -6751,7 +7079,10 @@ mod tests {
             },
         );
         assert_eq!(ensure_run(&w), "existing %7");
-        assert_eq!(calls(&w), [READ_OPTION, SESSION_RECORD, READ_RECORD]);
+        assert_eq!(
+            calls(&w),
+            [READ_OPTION, VIEWED_ON, SESSION_RECORD, READ_RECORD]
+        );
         assert_eq!(
             run(&w, &[]),
             r#"ok {"pane":"%7","window":"@1","opened":false}"#
@@ -7534,6 +7865,22 @@ mod tests {
 
     // #103 QA: a view seen in the bar's own window counts from the first tick that sees it, recorded or not: a view
     // closed before the record proves the bar (the first tick ran before open recorded it) still lets it leave.
+    // #103 QA: the window's `@mux-agents-viewed` (set by the verb that placed the view) makes it held, even when the
+    // view is gone before the bar's first tick: the bar leaves at once, and unsets it.
+    #[test]
+    fn a_view_closed_before_the_first_tick_still_lets_the_bar_leave() {
+        let (w, _) = keep_world(&["live", "live", "live", "gone"], win("%1", in_place()));
+        views_by_tick(&w, "@1", 0, "closed");
+        w.fakes.mux_first(VIEWED, 0, "1\n", "");
+        let (ended, frames) = watch_run(&w);
+        assert_eq!((ended, frames.len()), ("view-closed", 0));
+        let all: Vec<String> = w.fakes.mux_calls().iter().map(|c| c.join(" ")).collect();
+        assert!(
+            all.iter()
+                .any(|c| c == "-N set-option -wu -t @1 @mux-agents-viewed")
+        );
+    }
+
     #[test]
     fn a_view_seen_before_the_record_proves_the_bar_counts() {
         let (w, _) = keep_world(&["live", "live", "live", "gone"], win("%1", in_place()));
@@ -7641,6 +7988,7 @@ mod tests {
             calls(&w),
             [
                 READ_OPTION.to_string(),
+                VIEWED_ON.replace("@1", "@2"),
                 SESSION_RECORD.into(),
                 READ_RECORD.replace("@1", "@2"),
                 LABELS.replace("@1", "@2"),
@@ -7729,9 +8077,10 @@ mod tests {
             let moved = format!("-N set-option -w -t {window} @mux-agents-sidebar-id %7 107 1070");
             let got = ensure_in(&w, "@1");
             assert_eq!(
-                calls(&w)[..5],
+                calls(&w)[..6],
                 [
                     READ_OPTION.to_string(),
+                    VIEWED_ON.into(),
                     SESSION_RECORD.into(),
                     moved,
                     CLEAR_SESSION.into(),
@@ -7757,7 +8106,7 @@ mod tests {
             assert_eq!(ensure_in(&w, "@1"), want.replace("opened", "existing"));
             assert_eq!(
                 calls(&w),
-                [READ_OPTION, SESSION_RECORD, READ_RECORD],
+                [READ_OPTION, VIEWED_ON, SESSION_RECORD, READ_RECORD],
                 "{window}"
             );
         }
@@ -7909,16 +8258,44 @@ mod tests {
         );
     }
 
+    // #103 QA: `ensure` (spawn, focus and resume keep their view's bar through it) marks the window viewed, under the
+    // session's sidebar lock, before the bar is found or opened.
+    #[test]
+    fn ensure_marks_its_window_viewed_under_the_lock() {
+        let (w, _) = sidebar_world("", Mux::default());
+        let fakes = w.fakes.clone();
+        w.fakes
+            .lock_probe(move |_| fakes.mux_calls().len().to_string());
+        assert_eq!(ensure_run(&w), "opened %7");
+        let all: Vec<String> = w.fakes.mux_calls().iter().map(|c| c.join(" ")).collect();
+        let at = all
+            .iter()
+            .position(|c| c == "-N set-option -w -t @1 @mux-agents-viewed 1")
+            .expect("the window is marked viewed");
+        let locks = w.fakes.locks();
+        let held = |event: &str| -> usize { event.rsplit(' ').next().unwrap().parse().unwrap() };
+        assert!(held(&locks[0]) <= at && at < held(&locks[1]), "{locks:?}");
+        assert!(
+            at < all
+                .iter()
+                .position(|c| c.contains(" split-window "))
+                .unwrap()
+        );
+    }
+
     #[test]
     fn ensure_opens_one_bar_then_finds_it() {
         let (w, panes) = sidebar_world("", Mux::default());
         assert_eq!(ensure_run(&w), "opened %7");
-        let mut want = vec![READ_OPTION.to_string()];
+        let mut want = vec![READ_OPTION.to_string(), VIEWED_ON.to_string()];
         want.extend(opened(&w));
         assert_eq!(calls(&w), want);
         w.fakes.clear_log();
         assert_eq!(ensure_run(&w), "existing %7");
-        assert_eq!(calls(&w), [READ_OPTION, SESSION_RECORD, READ_RECORD]);
+        assert_eq!(
+            calls(&w),
+            [READ_OPTION, VIEWED_ON, SESSION_RECORD, READ_RECORD]
+        );
         assert_eq!(roles(&panes), "%1=|,%2=other|,%7=sidebar|");
         // ensure only reads the option.
         assert_eq!(option(&panes), None);
@@ -7950,7 +8327,7 @@ mod tests {
             let inside = if disabled {
                 "show-options"
             } else {
-                "show-options,show-options,show-options,list-panes,list-panes,display-message,split-window,if-shell,\
+                "show-options,set-option,show-options,show-options,list-panes,list-panes,display-message,split-window,if-shell,\
                  if-shell,display-message,set-option,if-shell,display-message"
             };
             assert_eq!(

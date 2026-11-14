@@ -32,6 +32,8 @@
 # 0.3.0 (#103): the bar is its window's: the record is a window option of that window, the label is looked for in
 # that window, and the split, its width probe and the record target the window; the lock stays the session's
 -N show-options -qv -t $3 @mux-agents-sidebar
+# 0.3.0 (#103 QA): under the lock, the view's window is marked as one that held a view
+-N set-option -w -t @7 @mux-agents-viewed 1
 # 0.2.3 (#47): no recorded bar, and no labelled pane anywhere in the session
 # 0.3.0 (#103): first, under the lock, the 0.2.x session record: proven, it moves to its bar's window; else
 # it refuses while the session holds a label, or is unset. Nothing recorded here: nothing moves
@@ -65,6 +67,8 @@
 -N if-shell -F -t %12 '#{==:#{pane_start_command},hc attach t1}' 'set-option -p -t %12 allow-set-title off'
 -N display-message -p -t %12 '#{pane_id}|#{==:#{pane_start_command},hc attach t1}'
 -N show-options -qv -t $3 @mux-agents-sidebar
+# 0.3.0 (#103 QA): under the lock, the view's window is marked as one that held a view
+-N set-option -w -t @7 @mux-agents-viewed 1
 # 0.2.3 (#47): no recorded bar, and no labelled pane anywhere in the session
 -N show-options -qv -t $3 @mux-agents-sidebar-id
 -N show-options -wqv -t @7 @mux-agents-sidebar-id
@@ -254,6 +258,8 @@
 # the record is proven like any other: its pane runs this watch's pid, and the pid is this watch with that start
 -N show-options -wqv -t @1 @mux-agents-sidebar-id
 -N display-message -p -t %1 #{pane_id}|#{window_id}|#{pane_dead}|#{pane_pid}
+# 0.3.0 (#103 QA): a bar whose window has not held a view yet reads the window's viewed mark
+-N show-options -wqv -t @1 @mux-agents-viewed
 -N list-panes -t %1 -F #{pane_id}|#{pane_active}|#{pane_at_right}|#{pane_at_top}|#{pane_at_bottom}|#{pane_width}|#{window_width}|#{pane_left}|#{pane_top}|#{window_zoomed_flag}|#{s/[|\n\r]/x/:@mux-agents-sidebar-min}|#{s/[|\n\r]/x/:@mux-agents-sidebar-percent}
 -N list-panes -s -t $3 -F <marker>#{pane_id}<marker>#{window_id}<marker>#{pane_pid}<marker>#{pane_dead}<marker>#{pane_start_command}<marker>#{@agent-id}<marker>#{@agent-name}<marker>
 # 0.3.0 (#82): which pane the session shows to an attached client, so a done agent the person looked at is marked seen
