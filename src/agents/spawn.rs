@@ -396,7 +396,7 @@ fn commit(ctx: &Ctx, folder: &Path) -> Res<()> {
 }
 
 #[cfg(test)]
-type CommitProbe = Box<dyn Fn(&Path)>;
+pub(crate) type CommitProbe = Box<dyn Fn(&Path)>;
 
 #[cfg(test)]
 thread_local! {
@@ -406,7 +406,7 @@ thread_local! {
 
 /// Sets (or clears) the probe that sees the agent folder at the moment commit.json is written.
 #[cfg(test)]
-fn commit_probe(probe: Option<CommitProbe>) {
+pub(crate) fn commit_probe(probe: Option<CommitProbe>) {
     COMMIT_PROBE.with(|slot| *slot.borrow_mut() = probe);
 }
 

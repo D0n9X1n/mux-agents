@@ -17,6 +17,8 @@ pub struct Request {
     pub switches: Vec<&'static str>,
     pub positional: Vec<String>,
     pub text: bool,
+    /// `up` only: every token after `--`, the client's flags, byte for byte.
+    pub rest: Vec<String>,
 }
 
 impl Request {
@@ -140,6 +142,16 @@ pub static VERBS: &[VerbDef] = &[
         text: json::lines,
     },
     VerbDef {
+        name: "up",
+        values: &["Client", "Name"],
+        switches: &[],
+        min: 0,
+        max: 0,
+        usage: "usage: mux-agent up -Client <claude|copilot> [-Name <name>] [-Text] [-- <client flags>]",
+        handler: crate::agents::up::up,
+        text: json::lines,
+    },
+    VerbDef {
         name: "status",
         values: &["Body", "BodyFile"],
         switches: &[],
@@ -241,6 +253,7 @@ pub fn parse(args: &[String]) -> Res<(&'static VerbDef, Request)> {
         switches: Vec::new(),
         positional: Vec::new(),
         text: false,
+        rest: Vec::new(),
     };
     let mut tokens = args[1..].iter();
     while let Some(token) = tokens.next() {
@@ -257,6 +270,8 @@ pub fn parse(args: &[String]) -> Res<(&'static VerbDef, Request)> {
             }
         } else if flag(&["Text"], token).is_some() {
             request.text = true;
+        } else if def.name == "up" && token == "--" {
+            request.rest = tokens.by_ref().cloned().collect(); // `up` only: every later token is the client's, byte for byte
         } else if token.starts_with('-') {
             return refuse(2, "usage", def.usage);
         } else {
@@ -479,6 +494,7 @@ mod tests {
             switches: Vec::new(),
             positional: vec!["x".into()],
             text: false,
+            rest: Vec::new(),
         };
         let reply = dispatch(&def, &request, &ctx).unwrap();
         assert_eq!(
@@ -545,6 +561,7 @@ mod tests {
                 "read",
                 "stop",
                 "resume",
+                "up",
                 "status",
                 "report",
                 "sidebar",
@@ -574,6 +591,7 @@ mod tests {
             ("read", 0, 1),
             ("stop", 1, 1),
             ("resume", 1, 1),
+            ("up", 0, 0),
             ("status", 0, 0),
             ("report", 1, 1),
             ("sidebar", 0, 0),
@@ -600,6 +618,24 @@ mod tests {
         }
     }
 
+    #[test]
+    fn only_up_passes_client_flags_after_a_double_dash() {
+        let up = parsed(&[
+            "up", "-Client", "claude", "--", "--model", "a b", "-Text", "--",
+        ]);
+        assert_eq!(
+            (up.rest.as_slice(), up.text),
+            (
+                &["--model", "a b", "-Text", "--"].map(String::from)[..],
+                false
+            )
+        );
+        let Err(e) = parse(&args(&["spawn", "-Client", "claude", "--", "x"])) else {
+            panic!("spawn must refuse --") // VerbDef is not Debug
+        };
+        assert_eq!(e.check, "usage");
+    }
+
     use crate::agents::fixture::{CLAUDE, ID, World, list_call};
     use crate::mux::Output;
     use crate::proc::Signals;
@@ -622,6 +658,7 @@ mod tests {
             "read" => vec!["read"],
             "stop" => vec!["stop", "worker"],
             "resume" => vec!["resume", "worker"],
+            "up" => vec!["up", "-Client", "claude"],
             "status" => vec!["status", "-BodyFile", "s.md"],
             "report" => vec!["report", "idle"],
             "sidebar" => vec!["sidebar"],
@@ -1792,7 +1829,7 @@ mod tests {
         );
         // The generic usage line lists it.
         let w = World::human("");
-        assert!(call(&w, &["bogus"]).1.contains("|stop|version|watch>"));
+        assert!(call(&w, &["bogus"]).1.contains("|stop|up|version|watch>"));
     }
 
     #[test]

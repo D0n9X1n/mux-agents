@@ -190,7 +190,8 @@ impl Live {
         }
     }
 
-    fn run(&self, args: &[&str]) -> Value {
+    /// mux-agent typed into the root pane; its JSON reply, whatever it says.
+    fn run_any(&self, args: &[&str]) -> Value {
         let done = self.dir.join("call.done");
         let out = self.dir.join("call.json");
         let _ = std::fs::remove_file(&done);
@@ -208,7 +209,12 @@ impl Live {
             ),
         );
         self.wait("command reply", || done.exists().then_some(()));
-        let v: Value = serde_json::from_str(&std::fs::read_to_string(out).unwrap()).unwrap();
+        serde_json::from_str(&std::fs::read_to_string(out).unwrap()).unwrap()
+    }
+
+    /// `run_any`, whose reply must be `ok`.
+    fn run(&self, args: &[&str]) -> Value {
+        let v = self.run_any(args);
         assert_eq!(v["ok"], true, "{v}");
         v
     }
@@ -641,4 +647,72 @@ fn private_core_windows() {
     std::fs::create_dir_all(&d).unwrap();
     assert_eq!(private_core::run(probe, &d).unwrap()["stopped"], false);
     std::fs::remove_dir_all(d).unwrap();
+}
+
+/// The hostile settings: renumbered windows, kept dead panes, and a default command that leaves a marker.
+fn hostile(live: &Live) -> PathBuf {
+    let marker = live.dir.join("marker");
+    live.call(&["set-option", "-g", "renumber-windows", "on"]);
+    live.call(&["set-option", "-g", "remain-on-exit", "on"]);
+    live.call(&[
+        "set-option",
+        "-g",
+        "default-command",
+        &format!("cmd /c type nul > \"{}\" & claude", marker.display()),
+    ]);
+    marker
+}
+
+#[test]
+fn up_creates_a_team_in_a_new_session() {
+    let Some(live) = Live::start() else {
+        return;
+    };
+    let marker = hostile(&live);
+    let up = live.run(&["up", "-Client", "claude"]);
+    let get = private_core::run(
+        live.core
+            .command(&["get", &s(&up["leader"]["hcAddress"]), "--json"]),
+        &live.dir,
+    )
+    .unwrap();
+    assert!(get["state"] == "live" && up["sidebar"].is_string(), "{up}");
+    assert!(eventually(Duration::from_secs(10), || live
+        .call(&[
+            "list-windows",
+            "-t",
+            &s(&up["session"]),
+            "-F",
+            "#{window_name}|#{window_active}"
+        ])
+        .trim()
+        == "leader|1"));
+    assert!(!marker.exists());
+    assert_eq!(
+        live.run_any(&["up", "-Client", "claude"])["check"],
+        "leader"
+    );
+}
+
+#[cfg(feature = "test-panic")]
+#[test]
+fn up_whose_launch_panics_leaves_no_session_under_hostile_settings() {
+    let Some(live) = Live::start() else {
+        return;
+    };
+    let marker = hostile(&live);
+    live.line(&live.root, "set MUX_AGENTS_TEST_PANIC=launch");
+    live.prompt(&live.root);
+    let reply = live.run_any(&["up", "-Client", "claude"]);
+    assert_eq!(
+        (&reply["ok"], &reply["check"]),
+        (&serde_json::json!(false), &serde_json::json!("internal")),
+        "{reply}"
+    );
+    assert!(eventually(Duration::from_secs(10), || live
+        .call(&["list-sessions", "-F", "#{session_name}"])
+        .lines()
+        .count()
+        == 1));
+    assert!(!marker.exists());
 }

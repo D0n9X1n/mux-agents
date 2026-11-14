@@ -73,7 +73,7 @@ const READ: &str = "usage: mux-agent read [-Wait <seconds>] | read <name> [-Line
 #[test]
 fn no_args_usage_exit_2() {
     let all = usage(
-        "usage: mux-agent <focus|list|placement|read|report|resume|send|sidebar|spawn|status|stop|version|watch> ...",
+        "usage: mux-agent <focus|list|placement|read|report|resume|send|sidebar|spawn|status|stop|up|version|watch> ...",
     );
     assert_eq!(mux_agent(&[]), all);
     assert_eq!(mux_agent(&["bogus", "-Text"]), all);
@@ -145,7 +145,7 @@ fn usage_refusal_keeps_verb_and_text() {
     assert_eq!(mux_agent(&["list", "-Bogus", "-Text"]), text);
     assert_eq!(mux_agent(&["LIST", "-text", "x"]), text);
     let all = usage(
-        "usage: mux-agent <focus|list|placement|read|report|resume|send|sidebar|spawn|status|stop|version|watch> ...",
+        "usage: mux-agent <focus|list|placement|read|report|resume|send|sidebar|spawn|status|stop|up|version|watch> ...",
     );
     assert_eq!(mux_agent(&["bogus", "-Bogus", "-Text"]), all);
 }

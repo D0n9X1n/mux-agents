@@ -72,6 +72,18 @@ pub(crate) fn lock<T>(_: &Ctx, key: &str, f: impl FnOnce() -> Res<T>) -> Res<T> 
     crate::testing::locked(key, f)
 }
 
+/// The team admission lock of `up` (state::lock::admission).
+#[cfg(not(test))]
+pub(crate) fn admit<T>(ctx: &Ctx, key: &str, f: impl FnOnce() -> Res<T>) -> Res<T> {
+    crate::state::lock::admission(ctx, key, f)
+}
+
+/// Tests record it as `lock` does.
+#[cfg(test)]
+pub(crate) fn admit<T>(_: &Ctx, key: &str, f: impl FnOnce() -> Res<T>) -> Res<T> {
+    crate::testing::locked(key, f)
+}
+
 /// Runs `f` under the per-user lock for `key` when one attempt takes it, never waiting; `None` when it is busy.
 #[cfg(not(test))]
 pub(crate) fn try_lock<T>(ctx: &Ctx, key: &str, f: impl FnOnce() -> Res<T>) -> Res<Option<T>> {

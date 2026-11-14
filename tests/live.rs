@@ -4253,6 +4253,173 @@ hc {}:
         );
     }
 
+    /// The hostile settings: renumbered windows, kept dead panes, and a default command that leaves a marker.
+    fn hostile(live: &Live) -> PathBuf {
+        let marker = live.dir.join("marker");
+        live.call(&["set-option", "-g", "renumber-windows", "on"]);
+        live.call(&["set-option", "-g", "remain-on-exit", "on"]);
+        live.call(&[
+            "set-option",
+            "-g",
+            "default-command",
+            &format!("touch '{}'; exec claude", marker.display()),
+        ]);
+        marker
+    }
+
+    #[test]
+    fn up_creates_a_team_in_a_new_session() {
+        for mux in Mux::ALL {
+            let Some(mut live) = Live::human(mux) else {
+                continue;
+            };
+            let marker = hostile(&live);
+            let (code, up) = live.run(&["up", "-Client", "claude"]);
+            assert_eq!(code, 0, "{mux:?} {up}");
+            let session = up["session"].as_str().unwrap().to_string();
+            let core = live.server.core.as_ref().unwrap();
+            let get = support::private_core::run(
+                core.command(&["get", up["leader"]["hcAddress"].as_str().unwrap(), "--json"]),
+                live.dir.path(),
+            )
+            .unwrap();
+            assert_eq!(get["state"], "live", "{mux:?}");
+            assert!(up["sidebar"].is_string(), "{mux:?} {up}");
+            assert!(
+                eventually(Duration::from_secs(10), || live
+                    .call(&[
+                        "list-windows",
+                        "-t",
+                        &session,
+                        "-F",
+                        "#{window_name}|#{window_active}"
+                    ])
+                    .trim()
+                    == "leader|1"),
+                "{mux:?}"
+            );
+            assert!(!marker.exists(), "{mux:?}");
+            let (code, again) = live.run(&["up", "-Client", "claude"]);
+            assert_eq!(
+                (code, again["check"].as_str()),
+                (2, Some("leader")),
+                "{mux:?} {again}"
+            );
+        }
+    }
+
+    #[test]
+    fn two_servers_racing_up_in_one_folder_launch_one_leader() {
+        for mux in Mux::ALL {
+            let (Some(a), Some(b)) = (Live::human(mux), Live::human(mux)) else {
+                continue;
+            };
+            let (state, work, go, bin) = (
+                a.state_text(),
+                a.dir.join("work"),
+                a.dir.join("go"),
+                env!("CARGO_BIN_EXE_mux-agent"),
+            );
+            std::fs::create_dir_all(&work).unwrap();
+            for (n, live) in [&a, &b].into_iter().enumerate() {
+                let pane = live
+                    .call(&["list-panes", "-a", "-F", "#{pane_id}"])
+                    .lines()
+                    .next()
+                    .unwrap()
+                    .to_string();
+                let line = format!(
+                    "cd '{}' && while [ ! -e '{}' ]; do sleep 0.01; done; MUX_AGENTS_STATE='{state}' '{bin}' up -Client claude > '{}'; echo $? > '{}'",
+                    work.display(),
+                    go.display(),
+                    a.dir.join(format!("out{n}")).display(),
+                    a.dir.join(format!("done{n}")).display()
+                );
+                live.call(&["send-keys", "-t", &pane, "-l", &line]);
+                live.call(&["send-keys", "-t", &pane, "Enter"]);
+            }
+            std::fs::write(&go, "").unwrap();
+            assert!(
+                eventually(Duration::from_secs(60), || (0..2)
+                    .all(|n| a.dir.join(format!("done{n}")).exists())),
+                "{mux:?}"
+            );
+            let replies: Vec<Value> = (0..2)
+                .map(|n| {
+                    serde_json::from_str(
+                        &std::fs::read_to_string(a.dir.join(format!("out{n}"))).unwrap(),
+                    )
+                    .unwrap()
+                })
+                .collect();
+            assert_eq!(
+                replies.iter().filter(|r| r["ok"] == true).count(),
+                1,
+                "{mux:?} {replies:?}"
+            );
+            assert!(
+                replies.iter().any(|r| r["check"] == "leader"),
+                "{mux:?} {replies:?}"
+            );
+            let t = replies.iter().find(|r| r["ok"] == true).unwrap()["team"]
+                .as_str()
+                .unwrap()
+                .to_string();
+            let leaders: usize = [&a, &b]
+                .iter()
+                .map(|l| {
+                    support::private_core::run(
+                        l.server.core.as_ref().unwrap().command(&[
+                            "ls",
+                            "--all",
+                            "--label",
+                            "mux.managed=1",
+                            "--label",
+                            &format!("mux.up={t}"),
+                            "--json",
+                        ]),
+                        l.dir.path(),
+                    )
+                    .unwrap()["terminals"]
+                        .as_array()
+                        .map_or(0, Vec::len)
+                })
+                .sum();
+            assert_eq!(
+                leaders, 1,
+                "{mux:?}: exactly one mux.up={t} leader terminal across both private cores"
+            );
+        }
+    }
+
+    #[cfg(feature = "test-panic")]
+    #[test]
+    fn up_whose_launch_panics_leaves_no_session_under_hostile_settings() {
+        for mux in Mux::ALL {
+            let Some(mut live) = Live::human(mux) else {
+                continue;
+            };
+            let (marker, state) = (hostile(&live), live.state_text());
+            let (code, out) = live.server.run(
+                &["up", "-Client", "claude"],
+                &[
+                    ("MUX_AGENTS_STATE", state.as_str()),
+                    ("MUX_AGENTS_TEST_PANIC", "launch"),
+                ],
+            );
+            assert_eq!(code, 1, "{mux:?} {out}");
+            assert!(
+                eventually(Duration::from_secs(10), || live
+                    .call(&["list-sessions", "-F", "#{session_name}"])
+                    .lines()
+                    .count()
+                    == 1),
+                "{mux:?}"
+            );
+            assert!(!marker.exists(), "{mux:?}");
+        }
+    }
+
     macro_rules! every_mux_scenario {
         ($module:ident, $mux:ident) => {
             tests_on!(
