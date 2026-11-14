@@ -119,8 +119,18 @@ fn may_add_entry(dir: &Path) -> bool {
             return true;
         };
         // SAFETY: `c` is a NUL-terminated path that outlives the call.
-        unsafe { libc::access(c.as_ptr(), libc::W_OK | libc::X_OK) == 0 }
+        if unsafe { libc::access(c.as_ptr(), libc::W_OK | libc::X_OK) } == 0 {
+            return true;
+        }
+        !refused(io::Error::last_os_error().raw_os_error())
     }
+}
+
+/// Whether access(2) failed because this user may not add an entry: permission (EACCES, EPERM) or a read-only file
+/// system (EROFS). Any other failure (EIO, ENOMEM, ...) proves nothing, so the refused flush stays an error.
+#[cfg(not(windows))]
+fn refused(errno: Option<i32>) -> bool {
+    matches!(errno, Some(libc::EACCES | libc::EPERM | libc::EROFS))
 }
 
 fn write_new(path: &Path, bytes: &[u8]) -> io::Result<()> {
@@ -334,16 +344,41 @@ mod tests {
         };
         assert_eq!(reset, 0);
         assert!(child.is_ok(), "{child:?}");
-        assert!(flush.is_err(), "the open was not refused: {flush:?}");
-        assert!(
-            ancestor.is_err(),
-            "a folder the user can add to was skipped"
-        );
+        if flush.is_ok() {
+            // An elevated user (a CI runner) opens it anyway with backup semantics: the folder is flushed, which is
+            // the safe outcome, and nothing is skipped.
+            assert!(ancestor.is_ok(), "{ancestor:?}");
+        } else {
+            assert!(
+                ancestor.is_err(),
+                "a folder the user can add to was skipped"
+            );
+        }
         let left: Vec<_> = std::fs::read_dir(&odd)
             .unwrap()
             .map(|e| e.unwrap().file_name())
             .collect();
         assert_eq!(left, ["child"], "the probe folder was left behind");
+    }
+
+    // #103 (review of 5dc2ff5): only a permission or read-only refusal from access(2) means the user cannot add an
+    // entry; an inconclusive failure keeps the flush error.
+    #[cfg(unix)]
+    #[test]
+    fn only_a_permission_refusal_means_the_user_cannot_add() {
+        for errno in [libc::EACCES, libc::EPERM, libc::EROFS] {
+            assert!(refused(Some(errno)), "{errno}");
+        }
+        for errno in [
+            libc::EIO,
+            libc::ENOMEM,
+            libc::ENOENT,
+            libc::ELOOP,
+            libc::ENAMETOOLONG,
+        ] {
+            assert!(!refused(Some(errno)), "{errno}");
+        }
+        assert!(!refused(None));
     }
 
     // #103: a folder the user can add to but not open for a flush (Unix mode 0300) is an error, never skipped; one
