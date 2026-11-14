@@ -828,6 +828,12 @@ fn resume_case(case: &str) -> (Mw, Res<Map<String, Value>>, String, Held) {
     let mut rx = child(&x, if case == "non-descendant" { OTHER } else { ID }, 2);
     rx["sessionId"] = "22222222-2222-4222-8222-222222222222".into();
     let rx = cf::member(&m.w, &x, rx);
+    if case == "no-directory" {
+        // A record whose run input cannot be built: no `directory` for `hc run --cwd`.
+        let mut r = m.record(&x);
+        r.as_object_mut().unwrap().remove("directory");
+        write(&m.folder(&x).join("record.json"), r);
+    }
     let bypass = case == "parent-bound" || case == "team-bound";
     write(
         &m.folder(&x).join("spec.json"),
@@ -1300,4 +1306,31 @@ fn a_failed_launch_keeps_its_token() {
             .any(|c| c.1.first().is_some_and(|a| a == "run")),
         "the run was tried"
     );
+}
+/// The run's own inputs are checked before the token (#103 D5): a member's resume of a descendant whose record has no
+/// `directory` refuses with no token spent, no `hc run`, and no abort that says a run may have happened.
+#[test]
+fn a_run_input_that_cannot_be_built_spends_no_token() {
+    let (m, got, x, _) = resume_case("no-directory");
+    assert!(got.is_err(), "{got:?}");
+    assert!(
+        !crate::agents::budget::path(&m.state, "$3").exists(),
+        "no token spent: {got:?}"
+    );
+    assert!(
+        !m.w.fakes
+            .hc_calls()
+            .iter()
+            .any(|c| c.1.first().is_some_and(|a| a == "run")),
+        "no launch"
+    );
+    for entry in std::fs::read_dir(m.state.join("agents")).unwrap() {
+        let folder = entry.unwrap().path();
+        let abort = folder.join("abort.json");
+        if folder.ends_with(&x) || !abort.is_file() {
+            continue;
+        }
+        let a = crate::state::fs::read_json(&abort).unwrap().unwrap();
+        assert_ne!(a["runUncertain"], true, "nothing ran: {a}");
+    }
 }

@@ -95,6 +95,26 @@ pub struct Run<'a> {
     pub argv: &'a [&'a str],
 }
 
+impl Run<'_> {
+    /// Whether `hc run` would take these inputs, without calling hc: a launch checks it before it spends anything.
+    pub fn check(&self) -> Res<()> {
+        if self.argv.is_empty() {
+            return Err(failure("hc run needs argv"));
+        }
+        // hc runs a lone string with spaces or shell signs through the shell; allow only plain paths.
+        if self.argv.len() == 1
+            && !self.argv[0]
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || "/._-+".contains(c))
+        {
+            return Err(failure(
+                "hc run needs a literal executable, not a shell line",
+            ));
+        }
+        Ok(())
+    }
+}
+
 fn invalid() -> Refusal {
     failure("hc returned invalid JSON")
 }
@@ -134,19 +154,7 @@ impl Core<'_> {
     }
 
     pub fn run(&self, r: &Run<'_>) -> Res<String> {
-        if r.argv.is_empty() {
-            return Err(failure("hc run needs argv"));
-        }
-        // hc runs a lone string with spaces or shell signs through the shell; allow only plain paths.
-        if r.argv.len() == 1
-            && !r.argv[0]
-                .chars()
-                .all(|c| c.is_ascii_alphanumeric() || "/._-+".contains(c))
-        {
-            return Err(failure(
-                "hc run needs a literal executable, not a shell line",
-            ));
-        }
+        r.check()?;
         let mut a = vec!["run".into()];
         for (yes, flag) in [
             (r.bg, "--bg"),
