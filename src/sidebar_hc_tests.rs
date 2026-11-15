@@ -386,17 +386,55 @@ fn open_acts_by_life_never_restarts_and_always_answers() {
             0,
             None,
         ),
+        // #103 review: a Lost row with no view reattaches its recovery terminal when hc keeps it; a reattach that does not
+        // take shows its retained output; hc dropping it is nothing to open; hc unreachable is a failure.
         (
-            "lost absent",
+            "lost kept",
             "lost",
             false,
             true,
+            true,
+            "listed",
+            true,
+            Some("%19"),
+            0,
+            None,
+        ),
+        (
+            "lost output",
+            "lost",
             false,
-            "",
+            true,
+            true,
+            "kept-output",
+            false,
+            None,
+            1,
+            None,
+        ),
+        (
+            "lost dropped",
+            "lost",
+            false,
+            true,
+            true,
+            "dropped",
             true,
             None,
             0,
             nothing,
+        ),
+        (
+            "lost hc down",
+            "lost",
+            false,
+            true,
+            true,
+            "down",
+            true,
+            None,
+            0,
+            Some("focus failed: worker"),
         ),
         (
             "unknown view no hc",
@@ -570,6 +608,13 @@ fn open_acts_by_life_never_restarts_and_always_answers() {
                 "" => {}
                 // A Running row without a view: `hc get` finds its terminal (reopen), answers `not_found` (nothing to open) or fails.
                 "listed" => cf::get(&w, "taaaaaaaaaaaa", own()),
+                // Kept, but the reattach does not take: the check, then `retained` connects again, checks and reads.
+                "kept-output" => {
+                    cf::get(&w, "taaaaaaaaaaaa", own());
+                    cf::online(&w);
+                    cf::get(&w, "taaaaaaaaaaaa", own());
+                    cf::answer(&w, &read, "old\n")
+                }
                 "mislabeled" => {
                     let mut t = own();
                     t["labels"]["mux.gen"] = json!("1");
@@ -647,7 +692,10 @@ fn open_acts_by_life_never_restarts_and_always_answers() {
             );
             assert_eq!(
                 calls.iter().filter(|a| a.contains("new-window")).count(),
-                usize::from(case == "running closed"),
+                usize::from(matches!(
+                    case,
+                    "running closed" | "lost kept" | "lost output"
+                )),
                 "{how}"
             );
             assert!(

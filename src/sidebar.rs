@@ -2133,10 +2133,12 @@ fn preview(ctx: &Ctx, caller: &Caller, target: &Target, pick: &mut Pick) {
 }
 
 /// Opens a drawn agent row by member id and life (#103 B6); nothing restarts or types. A validated view is focused
-/// through the multiplexer alone, so an Unknown row's view opens without hc. Without one: Running reopens its view (hc);
-/// Lost has nothing to open; Unknown and Ended show their output. A member gone, a terminal hc dropped, or blank output,
-/// is `nothing to open for <name>`; a focus that did not take, or hc unreachable, is `focus failed: <name>`. A
-/// successful open clears the selection; otherwise the row stays selected, so `p` or Enter act on it next.
+/// through the multiplexer alone, so an Unknown row's view opens without hc. Without one: Running reopens its view and
+/// Lost reattaches its recovery terminal, each only when hc keeps the member's own terminal (#103 review: a Lost row
+/// whose reattach does not take shows its retained output); Unknown and Ended show their output. A member gone, a
+/// terminal hc dropped or another identity's, or blank output, is `nothing to open for <name>`; a focus that did not
+/// take, or hc unreachable, is `focus failed: <name>`. A successful open clears the selection; otherwise the row stays
+/// selected, so `p` or Enter act on it next.
 fn open_target(ctx: &Ctx, caller: &Caller, target: &Target, pick: &mut Pick, shown: &mut Shown) {
     use crate::agents::view::{Member, focus_member};
     let focused = |member: Res<Member>, shown: &mut Shown| match member {
@@ -2152,24 +2154,30 @@ fn open_target(ctx: &Ctx, caller: &Caller, target: &Target, pick: &mut Pick, sho
         "running" | "lost" | "unknown" => {
             match focused(focus_member(ctx, None, caller, &target.id, None), shown) {
                 Some(opened) => opened,
-                None if target.life == "running" => {
-                    // Reopen only a terminal hc still keeps: one it dropped is nothing to open; hc unreachable fails.
+                None if target.life == "unknown" => show_output(ctx, caller, target),
+                None => {
+                    // Reattach only a terminal hc still keeps as the member's own: one it dropped is nothing to open; hc
+                    // unreachable fails.
                     let Ok(core) = crate::hc::connect(ctx) else {
                         pick.failed(&target.name);
                         return;
                     };
                     match crate::agents::message::kept_member(ctx, caller, &core, &target.id) {
-                        Ok(Some(true)) => focused(
-                            focus_member(ctx, Some(&core), caller, &target.id, None),
-                            shown,
-                        )
-                        .unwrap_or(Opened::Failed),
+                        Ok(Some(true)) => {
+                            match focused(
+                                focus_member(ctx, Some(&core), caller, &target.id, None),
+                                shown,
+                            ) {
+                                Some(Opened::Shown) => Opened::Shown,
+                                // A Lost row whose recovery terminal did not reattach: its retained output instead.
+                                _ if target.life == "lost" => show_output(ctx, caller, target),
+                                other => other.unwrap_or(Opened::Failed),
+                            }
+                        }
                         Ok(_) => Opened::Nothing,
                         Err(_) => Opened::Failed,
                     }
                 }
-                None if target.life == "unknown" => show_output(ctx, caller, target),
-                None => Opened::Nothing,
             }
         }
         _ => show_output(ctx, caller, target),
