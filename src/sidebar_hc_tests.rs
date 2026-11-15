@@ -662,3 +662,166 @@ fn open_acts_by_life_never_restarts_and_always_answers() {
         }
     }
 }
+
+#[test]
+fn p_previews_the_selected_id_and_changes_nothing() {
+    // (case, B selected, B's life, B has a view, what hc keeps, the pane captured, popups, note)
+    let cases = [
+        ("live", true, "running", true, "", Some("%8"), 1, None),
+        ("ended", true, "ended", false, "old\n", None, 1, None),
+        (
+            "blank",
+            true,
+            "ended",
+            false,
+            " \n",
+            None,
+            0,
+            Some("nothing to open for twin"),
+        ),
+        (
+            "dropped",
+            true,
+            "ended",
+            false,
+            "dropped",
+            None,
+            0,
+            Some("nothing to open for twin"),
+        ),
+        (
+            "down",
+            true,
+            "ended",
+            false,
+            "down",
+            None,
+            0,
+            Some("focus failed: twin"),
+        ),
+        ("none", false, "running", true, "", Some("%9"), 1, None),
+    ];
+    for (case, selected, life, view, kept, captured, popups, note) in cases {
+        let w = plain_world();
+        let c = w.caller();
+        cf::member(&w, ID, json!({"name": "twin"}));
+        cf::member(&w, "bbbbbbbbbbbb", json!({"name": "twin", "pane": "%8"}));
+        let mut rows = Vec::new();
+        for (pane, id) in [("%9", ID), ("%8", "bbbbbbbbbbbb")]
+            .into_iter()
+            .filter(|(p, _)| view || *p == "%9")
+        {
+            let mut row = row_of(&format!("{pane}|@5|300||"), &[]);
+            row.command = format!("hc attach t{id}");
+            rows.push(row);
+        }
+        w.pane_rows(&rows);
+        w.fakes.mux_rule("show-buffer", 0, "screen text\n", "");
+        let gone = r#"{"error":{"hint":"see `hc ls --all`","kind":"not_found","message":"no terminal \"tbbbbbbbbbbbb\""}}"#;
+        let out = |code: i32, stdout: &str| -> crate::error::Res<crate::spawn::Out> {
+            Ok(crate::spawn::Out {
+                code,
+                stdout: stdout.into(),
+                stderr: String::new(),
+            })
+        };
+        let read = ["read", "tbbbbbbbbbbbb", "--lines", "200"];
+        match kept {
+            "" => {}
+            // The read fails: hc's `not_found` (exit 3) is nothing to show; hc unreachable (exit 5) is a failure.
+            "dropped" => {
+                cf::online(&w);
+                w.fakes.hc_expect(&read, out(3, gone))
+            }
+            "down" => {
+                cf::online(&w);
+                w.fakes
+                    .hc_expect(&read, out(5, r#"{"error":{"kind":"unavailable"}}"#))
+            }
+            text => {
+                cf::online(&w);
+                cf::answer(&w, &read, text)
+            }
+        }
+        let a = Target {
+            id: ID.into(),
+            ..Target::new("twin", "%9")
+        };
+        let b = Target {
+            id: "bbbbbbbbbbbb".into(),
+            life: life.into(),
+            ..Target::new("twin", if view { "%8" } else { "" })
+        };
+        let mut shown = Shown {
+            written: SystemTime::UNIX_EPOCH,
+            targets: vec![a, b],
+            drawn: Vec::new(),
+            width: 40,
+            looking: Some("%9".into()),
+            team: true,
+        };
+        let mut pick = Pick::default();
+        if selected {
+            pick.select(&shown.targets, 1);
+        }
+        let before = pick.selected().map(str::to_string);
+        assert!(act(
+            &w.ctx,
+            &c,
+            Look::default(),
+            keys::Read {
+                event: Event::Peek,
+                first: SystemTime::UNIX_EPOCH
+            },
+            &mut pick,
+            &mut shown
+        ));
+        let calls: Vec<String> = w.fakes.mux_calls().iter().map(|a| a.join(" ")).collect();
+        let took = |pane: &str| {
+            calls
+                .iter()
+                .any(|a| a.contains("capture-pane") && a.contains(pane))
+        };
+        assert_eq!(
+            (took("%8"), took("%9")),
+            (captured == Some("%8"), captured == Some("%9")),
+            "{case}: duplicate names preview the id"
+        );
+        assert_eq!(
+            calls.iter().filter(|a| a.contains("display-popup")).count(),
+            popups,
+            "{case}"
+        );
+        assert_eq!(pick.note().as_deref(), note, "{case}");
+        if case == "ended" {
+            assert_eq!(
+                peek_text(&w).as_deref(),
+                Some("old\n\n-- peek: twin (q closes) --\n")
+            );
+        }
+        assert_eq!(
+            (
+                pick.selected().map(str::to_string),
+                shown.looking.as_deref()
+            ),
+            (before, Some("%9")),
+            "{case}: nothing else changes"
+        );
+        assert!(
+            !calls
+                .iter()
+                .any(|a| ["select-window", "new-window", "send-keys", "respawn"]
+                    .iter()
+                    .any(|v| a.contains(v))),
+            "{case}"
+        );
+        assert!(
+            w.fakes
+                .hc_calls()
+                .iter()
+                .all(|(_, a, _)| a[0] != "run" && a[0] != "kill"),
+            "{case}"
+        );
+        w.fakes.hc_done().unwrap();
+    }
+}

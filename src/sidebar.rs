@@ -1993,6 +1993,19 @@ fn act(
             }
             true
         }
+        // A team's `p`: the selection, else the shown agent (B10).
+        Event::Peek if shown.team => {
+            let target = pick.chosen(&shown.targets).cloned().or_else(|| {
+                shown
+                    .looking
+                    .as_deref()
+                    .and_then(|p| shown.targets.iter().find(|t| t.pane == p).cloned())
+            });
+            if let Some(target) = target {
+                preview(ctx, caller, &target, pick);
+            }
+            true
+        }
         // herdr's peek (#91): the selected agent, else the first, over the window without switching to it.
         Event::Peek => {
             if let Some(target) = pick.chosen(&shown.targets).or(shown.targets.first())
@@ -2103,6 +2116,19 @@ fn show_output(ctx: &Ctx, caller: &Caller, target: &Target) -> Opened {
         Ok(None) => Opened::Nothing,
         Err(e) if e.check == "target" => Opened::Nothing,
         _ => Opened::Failed,
+    }
+}
+
+/// `p` in a team (#103 B10): member `target` by id in the popup: its live view captured, else its retained output, else
+/// the note. Nothing switches, restarts or types.
+fn preview(ctx: &Ctx, caller: &Caller, target: &Target, pick: &mut Pick) {
+    if !target.pane.is_empty() && peek(ctx, caller, target).is_ok() {
+        return;
+    }
+    match show_output(ctx, caller, target) {
+        Opened::Shown => {}
+        Opened::Nothing => pick.nothing(&target.name),
+        Opened::Failed => pick.failed(&target.name),
     }
 }
 
