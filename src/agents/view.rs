@@ -166,7 +166,7 @@ pub fn status(ctx: &Ctx, request: &Request) -> Res<Map<String, Value>> {
         write_json(&file, &json!({"text": text, "at": at}))?;
         // A status is work: the agent no longer waits.
         if let Some(folder) = file.parent() {
-            super::message::clear_waiting(folder);
+            super::message::prune_leases(ctx, folder);
         }
         Ok(())
     })?;
@@ -219,6 +219,10 @@ pub fn report(ctx: &Ctx, request: &Request) -> Res<Map<String, Value>> {
             &file,
             &json!({"state": state, "kind": kind, "since": since}),
         )?;
+        // Only stale leases go: a live one of the current owner stays on call (W6).
+        if let Some(folder) = file.parent() {
+            super::message::prune_leases(ctx, folder);
+        }
         Ok(since)
     })?;
     let mut reply = Map::new();

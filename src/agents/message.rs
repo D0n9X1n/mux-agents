@@ -199,7 +199,7 @@ fn send_legacy(
             let _ = write_json(&file, &json!({"line": doing_line(body), "at": at}));
             // A message sent is the agent's step done: it no longer waits.
             if let Some(folder) = file.parent() {
-                clear_waiting(folder);
+                prune_leases(ctx, folder);
             }
         }
         Ok(id)
@@ -354,7 +354,9 @@ pub fn read(ctx: &Ctx, request: &Request) -> Res<Map<String, Value>> {
     }
     // Removed on every return, mail, timeout or error, when this guard drops: after the reply is built.
     let _waiting = match &me.record {
-        Some(_) if wait > 0 && id.is_none() => Waiting::start(ctx, &caller, &me.key),
+        Some(_) if wait > 0 && id.is_none() => {
+            Waiting::start(ctx, &caller, &me.key, &owner, wait as u64)
+        }
         _ => None,
     };
     let served = match id {
@@ -480,10 +482,64 @@ fn waiting_files(folder: &Path) -> Vec<(u32, PathBuf)> {
         .collect()
 }
 
-/// Removes all of an agent's waiting files; its caller holds the agent lock. Best effort.
-pub(crate) fn clear_waiting(folder: &Path) {
-    for (_, file) in waiting_files(folder) {
-        let _ = std::fs::remove_file(file);
+/// The current owner of the agent of `folder`: its id and the generation of its record ("0" when none).
+pub(crate) fn owner_of_folder(folder: &Path) -> Option<super::receipt::Owner> {
+    let id = folder.file_name()?.to_str()?.to_string();
+    let record = read_json(&folder.join("record.json")).ok().flatten()?;
+    let generation = text(record.get("generation"));
+    Some(super::receipt::Owner {
+        id,
+        generation: if generation.is_empty() {
+            "0".into()
+        } else {
+            generation
+        },
+    })
+}
+
+/// A lease naming `owner`, a live pid with its recorded start and a future `until` (W6).
+fn lease_live(ctx: &Ctx, pid: u32, marker: &Value, owner: &super::receipt::Owner) -> bool {
+    let named = marker.get("pid").and_then(Value::as_u64) == Some(u64::from(pid));
+    let start = marker.get("start").and_then(Value::as_i64);
+    let alive = named && start.is_some() && ctx.os.row(pid).is_some_and(|row| row.start == start);
+    let mine = marker
+        .get("owner")
+        .is_some_and(|o| text(o.get("id")) == owner.id && text(o.get("gen")) == owner.generation);
+    let until = marker
+        .get("until")
+        .and_then(Value::as_str)
+        .and_then(crate::util::parse_utc);
+    alive && mine && until.is_some_and(|u| u > ctx.clock.now())
+}
+
+/// Whether the agent of `folder` is on call: a lease of its current owner is live. Reads only.
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "shortcut: the board reads it from task 4 (#103)")
+)]
+pub(crate) fn on_call(ctx: &Ctx, folder: &Path) -> bool {
+    let Some(owner) = owner_of_folder(folder) else {
+        return false;
+    };
+    waiting_files(folder).into_iter().any(|(pid, f)| {
+        read_json(&f)
+            .ok()
+            .flatten()
+            .is_some_and(|m| lease_live(ctx, pid, &m, &owner))
+    })
+}
+
+/// Removes only stale leases: dead or reused pids, other owners, past `until`. The caller holds the agent lock.
+pub(crate) fn prune_leases(ctx: &Ctx, folder: &Path) {
+    let owner = owner_of_folder(folder).unwrap_or_default();
+    for (pid, file) in waiting_files(folder) {
+        if !read_json(&file)
+            .ok()
+            .flatten()
+            .is_some_and(|m| lease_live(ctx, pid, &m, &owner))
+        {
+            let _ = std::fs::remove_file(file);
+        }
     }
 }
 
@@ -517,21 +573,29 @@ pub(crate) fn waiting_now(ctx: &Ctx, folder: &Path, status_at: Option<SystemTime
 struct Waiting<'a> {
     ctx: &'a Ctx,
     key: String,
-    file: PathBuf,
+    pub(crate) file: PathBuf,
 }
 
 impl<'a> Waiting<'a> {
-    /// Writes `{pid, start, since}` under the agent lock before the first poll. Best effort: no file without a
+    /// Writes `{pid, start, since, owner, until}` under the agent lock before the first poll. Best effort: no file without a
     /// known start time (it could not be told from a reused pid) or when the write fails.
-    fn start(ctx: &'a Ctx, caller: &crate::caller::Caller, id: &str) -> Option<Waiting<'a>> {
+    fn start(
+        ctx: &'a Ctx,
+        caller: &crate::caller::Caller,
+        id: &str,
+        owner: &super::receipt::Owner,
+        wait: u64,
+    ) -> Option<Waiting<'a>> {
         let start = ctx.os.row(ctx.pid)?.start?;
         let file = waiting_file(&server_dir(ctx, caller).join("agents").join(id), ctx.pid);
         let since = crate::util::utc_o(ctx.clock.now());
+        let until = crate::util::utc_o(ctx.clock.now() + Duration::from_secs(wait));
         let key = lock_key("agent", caller, id);
         lock(ctx, &key, || {
             write_json(
                 &file,
-                &json!({"pid": ctx.pid, "start": start, "since": since}),
+                &json!({"pid": ctx.pid, "start": start, "since": since,
+                    "owner": {"id": owner.id, "gen": owner.generation}, "until": until}),
             )
         })
         .ok()?;
@@ -1688,6 +1752,48 @@ mod tests {
         names
     }
 
+    const LATER: &str = "2999-01-01T00:00:00.0000000Z";
+
+    // A lease of `owner` by `pid` (recorded start pid * 10) until `until`.
+    fn lease(w: &World, pid: u32, owner: &str, until: &str) {
+        write(
+            &w.folder(ID).join(format!("waiting-{pid}.json")),
+            json!({"pid": pid, "start": pid * 10, "since": SINCE, "owner": {"id": owner, "gen": "0"}, "until": until}),
+        );
+    }
+
+    #[test]
+    fn leases_name_their_owner_and_only_stale_ones_are_pruned() {
+        let w = waiting_world();
+        for pid in [78, 79, 80] {
+            w.fakes
+                .process(crate::testing::row(pid, 1, i64::from(pid) * 10));
+        }
+        let me = crate::agents::receipt::Owner {
+            id: ID.into(),
+            generation: "0".into(),
+        };
+        let mine = Waiting::start(&w.ctx, &w.caller(), ID, &me, 600).unwrap();
+        let file = read_json(&mine.file).unwrap().unwrap();
+        assert_eq!(
+            (&file["owner"], file["until"].is_string()),
+            (&json!({"id": ID, "gen": "0"}), true)
+        );
+        lease(&w, 77, ID, LATER); // dead pid
+        lease(&w, 78, "bbbbbbbbbbbb", LATER); // another owner
+        lease(&w, 79, ID, LATER); // an overlapping wait of this owner
+        lease(&w, 80, ID, "1970-01-01T00:00:00.0000000Z"); // past until
+        prune_leases(&w.ctx, &w.folder(ID));
+        assert_eq!(waiting_names(&w), ["waiting-4242.json", "waiting-79.json"]);
+        assert!(on_call(&w.ctx, &w.folder(ID)));
+        drop(mine);
+        assert_eq!(
+            waiting_names(&w),
+            ["waiting-79.json"],
+            "each wait removes only its own"
+        );
+    }
+
     fn other_wait(w: &World) {
         write(
             &w.folder(ID).join("waiting-77.json"),
@@ -1699,7 +1805,9 @@ mod tests {
     fn read_wait_marks_the_agent_waiting_until_it_returns() {
         use std::cell::RefCell;
         use std::rc::Rc;
-        let mine = format!(r#"{{"pid":4242,"start":2000,"since":"{SINCE}"}}"#);
+        let mine = format!(
+            r#"{{"pid":4242,"start":2000,"since":"{SINCE}","owner":{{"id":"{ID}","gen":"0"}},"until":"2026-10-29T12:00:01.0000000Z"}}"#
+        );
         // A timeout: written under the agent lock before the first poll, there at every poll, gone after.
         let w = waiting_world();
         let r = cf::member(
@@ -1899,7 +2007,7 @@ mod tests {
     }
 
     #[test]
-    fn send_and_status_clear_every_waiting_file() {
+    fn send_and_status_prune_stale_leases() {
         let w = waiting_world();
         for pid in [4242, 77] {
             write(

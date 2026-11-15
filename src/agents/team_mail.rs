@@ -696,7 +696,7 @@ fn deliver(
                 &json!({"line": super::mail::doing_line(body), "at": utc_o(ctx.clock.now())}),
             );
             if let Some(folder) = file.parent() {
-                super::message::clear_waiting(folder);
+                super::message::prune_leases(ctx, folder);
             }
         }
         Ok(())
