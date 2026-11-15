@@ -898,3 +898,199 @@ fn members_spawn_and_act_only_down_the_tree() {
     }
     assert_eq!(spawn(&mut sent, &leader, "c6")["check"], "limit");
 }
+
+/// Each named row on a bar screen: (line, column-0 mark, glyph column).
+fn tree_rows(screen: &str, names: &[&str]) -> Option<Vec<(usize, char, usize)>> {
+    names
+        .iter()
+        .map(|name| {
+            screen.lines().enumerate().find_map(|(at, l)| {
+                let c: Vec<char> = l.chars().collect();
+                let glyph = (1..c.len()).find(|&i| c[i] != ' ' && c[i] != '^')?;
+                let word: String = c
+                    .get(glyph + 2..)?
+                    .iter()
+                    .take_while(|x| **x != ' ')
+                    .collect();
+                (word == *name).then_some((at, c[0], glyph))
+            })
+        })
+        .collect()
+}
+
+#[test]
+fn team_bar_draws_the_tree_and_opens_any_row() {
+    let Some(live) = Live::start() else { return };
+    let up = live.run(&["up", "-Client", "claude"]);
+    std::fs::write(live.dir.join("brief.md"), "brief").unwrap();
+    // Harness prerequisite (rmux 0.10.0): the bar's own popup command, run as the bar runs it (`run-shell -b -C`) with no client,
+    // answers 0 and leaves its peek file; else the bar deletes the file unseen and the output check below fails for another reason.
+    let file = live.dir.join("peek-probe.txt");
+    std::fs::write(&file, "probe").unwrap();
+    let command = mux_agent::sidebar::popup_command(&s(&up["sidebar"]), file.to_str().unwrap());
+    let probe = live
+        .rmux()
+        .args(["run-shell", "-b", "-C", &command])
+        .output()
+        .unwrap();
+    std::thread::sleep(Duration::from_secs(1));
+    assert!(
+        probe.status.success() && file.exists(),
+        "the popup command without a client: {probe:?}"
+    );
+    std::fs::remove_file(&file).unwrap();
+    let record = |id: &str| -> Value {
+        let f = std::fs::read_dir(live.dir.join("state"))
+            .unwrap()
+            .flatten()
+            .map(|d| d.path().join("agents").join(id).join("record.json"))
+            .find(|p| p.exists())
+            .unwrap();
+        serde_json::from_str(&std::fs::read_to_string(f).unwrap()).unwrap()
+    };
+    let pid_of = |sid: &Value| -> u64 {
+        live.wait("the client", || {
+            std::fs::read_to_string(live.dir.join("clients.log"))
+                .ok()?
+                .lines()
+                .find_map(|p| {
+                    let r: Value = serde_json::from_str(
+                        &std::fs::read_to_string(
+                            live.dir.join(format!("client.{}.json", p.trim())),
+                        )
+                        .ok()?,
+                    )
+                    .ok()?;
+                    (&r["sessionId"] == sid)
+                        .then(|| p.trim().parse().ok())
+                        .flatten()
+                })
+        })
+    };
+    let mut replies = std::collections::HashMap::new();
+    let mut agent = |pid: u64, args: &[&str]| -> Value {
+        let n = {
+            let n = replies.entry(pid).or_insert(0);
+            *n += 1;
+            *n
+        };
+        let held = live.dir.join(format!("cmd.{pid}.part"));
+        std::fs::write(&held, format!("{}\n", args.join("\t"))).unwrap();
+        std::fs::rename(&held, live.dir.join(format!("cmd.{pid}"))).unwrap();
+        let v: Value = serde_json::from_str(&live.wait("the reply", || {
+            std::fs::read_to_string(live.dir.join(format!("reply.{pid}.{n}.json"))).ok()
+        }))
+        .unwrap();
+        assert_eq!(v["ok"], true, "{args:?}: {v}");
+        v
+    };
+    let (task, brief, session) = (
+        live.dir.join("task.txt").display().to_string(),
+        live.dir.join("brief.md").display().to_string(),
+        s(&up["session"]),
+    );
+    let child = agent(
+        pid_of(&record(&s(&up["leader"]["id"]))["sessionId"]),
+        &[
+            "spawn",
+            "-Client",
+            "claude",
+            "-TaskFile",
+            &task,
+            "-BriefFile",
+            &brief,
+            "-Context",
+            "brief",
+            "-Name",
+            "child",
+        ],
+    );
+    let child_pid = pid_of(&child["sessionId"]);
+    let grand = agent(
+        child_pid,
+        &[
+            "spawn",
+            "-Client",
+            "claude",
+            "-TaskFile",
+            &task,
+            "-BriefFile",
+            &brief,
+            "-Context",
+            "brief",
+            "-Name",
+            "grand",
+        ],
+    );
+    assert_eq!(record(&s(&grand["id"]))["depth"], 2);
+    let bars = [
+        s(&up["sidebar"]),
+        s(&child["sidebar"]),
+        s(&grand["sidebar"]),
+    ];
+    for bar in &bars {
+        live.wait("the tree indented, no mark", || {
+            let r = tree_rows(&live.screen(bar), &["leader", "child", "grand"])?;
+            (r[0].0 < r[1].0
+                && r[1].0 < r[2].0
+                && r.iter().map(|x| x.2).eq([1, 3, 5])
+                && r.iter().all(|x| x.1 != '\u{25cf}'))
+            .then_some(())
+        });
+    }
+    live.keys(&bars[0], "jjj");
+    live.call(&["send-keys", "-t", &bars[0], "Enter"]);
+    live.wait("j to grand, Enter", || {
+        (live.field(&session, "#{pane_id}") == s(&grand["pane"])).then_some(())
+    });
+    agent(child_pid, &["stop", "grand"]);
+    let line = live.wait("grand stays, stopped", || {
+        live.call(&["capture-pane", "-e", "-p", "-t", &bars[0]])
+            .lines()
+            .find(|l| l.contains("grand") && l.contains("stopped"))
+            .map(str::to_string)
+    });
+    let dim = line.split("\u{1b}[").skip(1).any(|p| {
+        p.split("m")
+            .next()
+            .unwrap_or("")
+            .split(";")
+            .any(|n| n == "2")
+    });
+    assert!(
+        dim || !line.contains("\u{1b}"),
+        "the ended row is dimmed where SGR is drawn: {line:?}"
+    );
+    let kept = String::from_utf8(
+        live.core
+            .command(&["read", &s(&grand["hcAddress"]), "--lines", "200"])
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap();
+    live.keys(&bars[0], "jjj");
+    live.call(&["send-keys", "-t", &bars[0], "Enter"]);
+    let text = live.wait("the peek file", || {
+        std::fs::read_dir(live.dir.join("state"))
+            .ok()?
+            .flatten()
+            .flat_map(|d| std::fs::read_dir(d.path()).into_iter().flatten().flatten())
+            .find(|f| f.file_name().to_string_lossy().starts_with("peek-"))
+            .and_then(|f| std::fs::read_to_string(f.path()).ok())
+    });
+    assert_eq!(text, format!("{kept}\n-- peek: grand (q closes) --\n"));
+    assert!(
+        !live.screen(&bars[0]).contains("focus failed"),
+        "no popup error"
+    );
+    assert_eq!(
+        private_core::run(
+            live.core
+                .command(&["get", &s(&grand["hcAddress"]), "--json"]),
+            &live.dir
+        )
+        .unwrap()["state"],
+        "finished"
+    );
+}

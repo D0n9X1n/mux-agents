@@ -3738,6 +3738,8 @@ hc {}:
     struct Client {
         child: std::process::Child,
         master: std::fs::File,
+        // Every byte the client's terminal was sent, as the drain thread read it.
+        seen: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
     }
 
     impl Client {
@@ -3807,11 +3809,42 @@ hc {}:
             let child = attach.spawn().unwrap();
             let master = std::fs::File::from(master);
             let mut drain = master.try_clone().unwrap();
+            let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let into = seen.clone();
             std::thread::spawn(move || {
                 let mut buf = [0u8; 4096];
-                while matches!(drain.read(&mut buf), Ok(n) if n > 0) {}
+                while let Ok(n) = drain.read(&mut buf) {
+                    if n == 0 {
+                        break;
+                    }
+                    into.lock().unwrap().extend_from_slice(&buf[..n]);
+                }
             });
-            Client { child, master }
+            Client {
+                child,
+                master,
+                seen,
+            }
+        }
+
+        /// What the client terminal was sent, escape sequences and blanks removed: a popup text however it was drawn.
+        fn text(&self) -> String {
+            let bytes = String::from_utf8_lossy(&self.seen.lock().unwrap()).into_owned();
+            let (mut out, mut chars) = (String::new(), bytes.chars());
+            while let Some(c) = chars.next() {
+                if c == '\u{1b}' {
+                    if chars.next() == Some('[') {
+                        for d in chars.by_ref() {
+                            if ('@'..='~').contains(&d) {
+                                break;
+                            }
+                        }
+                    }
+                } else if !c.is_whitespace() {
+                    out.push(c);
+                }
+            }
+            out
         }
 
         /// Bytes typed on the client's terminal.
@@ -4328,6 +4361,227 @@ hc {}:
             &format!("touch '{}'; exec claude", marker.display()),
         ]);
         marker
+    }
+
+    /// Each named row on a bar screen: (line, column-0 mark, glyph column).
+    fn tree_rows(screen: &str, names: &[&str]) -> Option<Vec<(usize, char, usize)>> {
+        names
+            .iter()
+            .map(|name| {
+                screen.lines().enumerate().find_map(|(at, l)| {
+                    let c: Vec<char> = l.chars().collect();
+                    let glyph = (1..c.len()).find(|&i| c[i] != ' ' && c[i] != '^')?;
+                    let word: String = c
+                        .get(glyph + 2..)?
+                        .iter()
+                        .take_while(|x| **x != ' ')
+                        .collect();
+                    (word == *name).then_some((at, c[0], glyph))
+                })
+            })
+            .collect()
+    }
+    /// A peek file left in the state folder (no client ran the popup that deletes it).
+    fn peek_file(live: &Live) -> Option<String> {
+        std::fs::read_dir(live.dir.join("state"))
+            .ok()?
+            .flatten()
+            .flat_map(|d| std::fs::read_dir(d.path()).into_iter().flatten().flatten())
+            .find(|f| f.file_name().to_string_lossy().starts_with("peek-"))
+            .and_then(|f| std::fs::read_to_string(f.path()).ok())
+    }
+    #[test]
+    fn team_bar_draws_the_tree_and_opens_any_row() {
+        for mux in Mux::ALL {
+            let Some(mut live) = Live::human(mux) else {
+                continue;
+            };
+            live.assert_not_ascii();
+            let tmux = !matches!(mux, Mux::Rmux);
+            let client = tmux.then(|| {
+                let client =
+                    Client::attach(&live, &live.field(live.server.pane(), "#{session_id}"));
+                live.server.wait("the client to attach", || {
+                    (!live.call(&["list-clients"]).trim().is_empty()).then_some(())
+                });
+                client
+            });
+            let (code, up) = live.run(&["up", "-Client", "claude"]);
+            assert_eq!(code, 0, "{mux:?} {up}");
+            let session = s(&up["session"]).to_string();
+            let lead = json_file(&live.agent_dir(s(&up["leader"]["id"])).join("record.json"));
+            // Members pass a brief (phase 3: a member without one is refused `brief`); `spawn_by` sends -BriefFile and -Context brief.
+            std::fs::write(live.dir.join("brief.md"), "brief").unwrap();
+            let spawn = |live: &mut Live, by: &str, name: &str| {
+                let (code, reply) = live.spawn_by(by, name);
+                assert_eq!(code, 0, "{mux:?} spawn {name}: {reply}");
+                reply
+            };
+            let child = spawn(&mut live, s(&up["leader"]["id"]), "child");
+            let child_pid = live.client_of(s(&child["id"]));
+            let grand = spawn(&mut live, s(&child["id"]), "grand");
+            let r = json_file(&live.agent_dir(s(&grand["id"])).join("record.json"));
+            assert_eq!(
+                (&r["parentAgent"]["id"], &r["depth"]),
+                (&child["id"], &json!(2)),
+                "{mux:?}"
+            );
+            let views = [
+                (s(&lead["pane"]).to_string(), "leader"),
+                (s(&child["pane"]).to_string(), "child"),
+                (s(&grand["pane"]).to_string(), "grand"),
+            ];
+            let bars = [
+                s(&up["sidebar"]).to_string(),
+                s(&child["sidebar"]).to_string(),
+                s(&grand["sidebar"]).to_string(),
+            ];
+            for ((view, _), bar) in views.iter().zip(&bars) {
+                // B9: every view window has its own bar
+                assert_eq!(
+                    live.field(bar, "#{window_id}"),
+                    live.field(view, "#{window_id}"),
+                    "{mux:?}"
+                );
+            }
+            let check = |live: &Live| {
+                let shown = live.field(&session, "#{pane_id}");
+                let marked = views
+                    .iter()
+                    .find(|(p, _)| tmux && *p == shown)
+                    .map(|(_, n)| *n);
+                for bar in &bars {
+                    let mut screen = String::new();
+                    let ok = eventually(Duration::from_secs(10), || {
+                        screen = live.call(&["capture-pane", "-p", "-t", bar]);
+                        tree_rows(&screen, &["leader", "child", "grand"]).is_some_and(|r| {
+                            r[0].0 < r[1].0
+                                && r[1].0 < r[2].0
+                                && r.iter().map(|x| x.2).eq([1, 3, 5])
+                                && r.iter()
+                                    .zip(["leader", "child", "grand"])
+                                    .all(|(x, n)| (x.1 == '\u{25cf}') == (marked == Some(n)))
+                        })
+                    });
+                    assert!(ok, "{mux:?} {bar}, shown {shown}:\n{screen}");
+                }
+            };
+            check(&live);
+            live.call(&["send-keys", "-t", &bars[0], "-l", "jjj"]);
+            live.call(&["send-keys", "-t", &bars[0], "Enter"]);
+            assert!(
+                eventually(Duration::from_secs(10), || live
+                    .field(&session, "#{pane_id}")
+                    == views[2].0),
+                "{mux:?}: j to grand, Enter"
+            );
+            check(&live); // `●` follows to grand on tmux
+            // Stopped, grand stays in place with its state word, dimmed where the capture carries SGR (tmux: always).
+            let (code, out) = live.server.command(child_pid, &["stop", "grand"]);
+            assert_eq!(code, 0, "{mux:?} {out}");
+            let mut line = String::new();
+            assert!(
+                eventually(Duration::from_secs(15), || {
+                    line = live
+                        .call(&["capture-pane", "-e", "-p", "-t", &bars[0]])
+                        .lines()
+                        .find(|l| l.contains("grand"))
+                        .unwrap_or_default()
+                        .to_string();
+                    line.contains("stopped")
+                }),
+                "{mux:?}: {line:?}"
+            );
+            let dim = line.split("\u{1b}[").skip(1).any(|p| {
+                p.split("m")
+                    .next()
+                    .unwrap_or("")
+                    .split(";")
+                    .any(|n| n == "2")
+            });
+            assert!(
+                dim || (!tmux && !line.contains("\u{1b}")),
+                "{mux:?}: the ended row is dimmed: {line:?}"
+            );
+            let plain = live.call(&["capture-pane", "-p", "-t", &bars[0]]);
+            assert!(
+                tree_rows(&plain, &["leader", "child", "grand"])
+                    .is_some_and(|r| r[1].0 < r[2].0 && r[2].2 == 5),
+                "{mux:?}: in place\n{plain}"
+            );
+            // Harness prerequisite: the bar's own popup command, run as the bar runs it (`run-shell -b -C`) with no client, must
+            // answer 0 and leave its peek file; else the bar deletes the file unseen and the output check below fails for another reason.
+            if client.is_none() {
+                let file = live.dir.join("peek-probe.txt");
+                std::fs::write(&file, "probe").unwrap();
+                let command = mux_agent::sidebar::popup_command(&bars[0], file.to_str().unwrap());
+                let probe = live.server.try_call(&["run-shell", "-b", "-C", &command]);
+                std::thread::sleep(Duration::from_secs(1));
+                assert!(
+                    probe.status.success() && file.exists(),
+                    "{mux:?}: the popup command without a client: {probe:?}"
+                );
+                std::fs::remove_file(&file).unwrap();
+            }
+            // Opening the ended grand shows its retained output (`hc read`, plain text); nothing restarts.
+            let hc = live.server.core.as_ref().unwrap();
+            let kept = String::from_utf8(
+                hc.command(&["read", s(&grand["hcAddress"]), "--lines", "200"])
+                    .output()
+                    .unwrap()
+                    .stdout,
+            )
+            .unwrap();
+            let last = kept
+                .lines()
+                .rev()
+                .find(|l| !l.trim().is_empty())
+                .expect("grand kept output")
+                .replace(" ", "");
+            live.call(&["send-keys", "-t", &bars[0], "-l", "jjj"]);
+            live.call(&["send-keys", "-t", &bars[0], "Enter"]);
+            match &client {
+                Some(client) => {
+                    let server: u64 = live.field(live.server.pane(), "#{pid}").parse().unwrap();
+                    live.server
+                        .wait("the output popup", || pagers_under(server).then_some(()));
+                    let shows = || {
+                        let t = client.text();
+                        t.contains("--peek:grand(qcloses)--") && t.contains(&last)
+                    };
+                    assert!(
+                        eventually(Duration::from_secs(10), shows),
+                        "{mux:?}: the popup pages grand's output"
+                    );
+                }
+                None => {
+                    let mut text = None;
+                    assert!(
+                        eventually(Duration::from_secs(10), || {
+                            text = peek_file(&live);
+                            text.is_some()
+                        }),
+                        "{mux:?}"
+                    );
+                    assert_eq!(
+                        text.unwrap(),
+                        format!("{kept}\n-- peek: grand (q closes) --\n"),
+                        "{mux:?}"
+                    );
+                }
+            }
+            let screen = live.call(&["capture-pane", "-p", "-t", &bars[0]]);
+            assert!(
+                !screen.contains("focus failed") && !screen.contains("nothing to open"),
+                "{mux:?}: no popup error\n{screen}"
+            );
+            assert_eq!(
+                core(&live, &["get", s(&grand["hcAddress"]), "--json"])["state"],
+                "finished",
+                "{mux:?}: opening restarts nothing"
+            );
+            drop(client);
+        }
     }
 
     #[test]
