@@ -81,7 +81,7 @@ The commands below, and the Reply and Listen lines, run as-is in the Bash tool. 
 - Run each `send` as a command of its own, with `-BodyFile` and plain words.
 - A line `message <id> ... run mux-agent read -Id <id>` names a large message. `read -Id` serves it only after you ack the batch that carried it first: run `read -Ack <batch>`, then `read -Id <id>`, or both at once with `read -Id <id> -Ack <batch>`. Handle the body it returns, then ack that body's own batch with `read -Ack <body-batch>`. While one is open, another `read -Id` returns it again with `"note": "ack it first"`.
 - An ack whose batch's references would push the held large messages past 1024 is refused: drain them with `read -Id <id>`, ack each one, then retry the ack.
-- A resumed member is a new generation; the ack history kept for its superseded generation is dropped.
+- A resumed member is a new generation; the ack history kept for its superseded generation is dropped at the next ack, unless that old generation still owns a pending receipt.
 - `read -Cancel` stops listening until new mail arrives. The leader never listens on call: it reads at its next turn or waits with `read -Wait`.
 - A child that finishes its task keeps listening until its parent stops it.
 

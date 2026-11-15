@@ -2620,7 +2620,7 @@ fn skill_teaches_the_wake_and_listening_on_call() {
         // 4b-i: the held cap (receipt::HELD_MAX) and a superseded generation's ack history.
         "would push the held large messages past 1024 is refused",
         "drain them with `read -Id <id>`, ack each one, then retry the ack",
-        "the ack history kept for its superseded generation is dropped",
+        "the ack history kept for its superseded generation is dropped at the next ack, unless that old generation still owns a pending receipt",
     ] {
         assert!(skill.contains(want), "SKILL.md lacks {want}");
     }
