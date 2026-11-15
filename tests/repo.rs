@@ -2569,3 +2569,18 @@ fn legacy_stop_authority_is_absent() {
     }
     assert!(!repo_file("src/proc/seam.rs").contains("pub fn hold<"));
 }
+
+#[test]
+fn skill_teaches_team_messaging() {
+    let skill = std::fs::read_to_string("skills/mux-agents/SKILL.md").unwrap();
+    for want in [
+        r#""<entry>" send <name|parent|leader|children|team> -BodyFile <body-file>"#,
+        r#""<entry>" send <name|parent|leader> -BodyFile <body-file> -Re <id>"#,
+        r#""<entry>" send <target> -BodyFile <body-file> -Id <id>"#,
+        "hop 4",
+        "120 messages",
+        "-Id <id>",
+    ] {
+        assert!(skill.contains(want), "SKILL.md lacks {want}");
+    }
+}

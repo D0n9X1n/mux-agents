@@ -39,8 +39,9 @@ The commands below, and the Reply and Listen lines, run as-is in the Bash tool. 
 "<entry>" list -All
 "<entry>" focus <name>
 "<entry>" focus -Next
-"<entry>" send <name> -BodyFile <body-file>
-"<entry>" send parent -BodyFile <body-file>
+"<entry>" send <name|parent|leader|children|team> -BodyFile <body-file>
+"<entry>" send <name|parent|leader> -BodyFile <body-file> -Re <id>
+"<entry>" send <target> -BodyFile <body-file> -Id <id>
 "<entry>" status -BodyFile <status-file>
 "<entry>" read -Wait <seconds>
 "<entry>" read <name> -Lines <n>
@@ -54,6 +55,13 @@ The commands below, and the Reply and Listen lines, run as-is in the Bash tool. 
 `spawn` opens where `placement` says (a new window by default), titled with the agent's name. It also takes `-Split h|v` or `-Tab` (this spawn only, over the placement) and `-NoFork`. Pass `-Model <model>` (for example `sonnet`, `opus` or `sonnet[1m]`) only when the user names a model; without it the agent uses its client's default.
 
 `list` shows each live agent's state, what it is doing and its unread count; `list -All` adds the ended agents (at most 10, newest first), each with its `exitCode` (null for a stop) and the `resume` command that starts it again with its conversation (a person only; never its task again).
+
+## Team messaging
+
+- Send only within your team: a name, `parent`, `leader`, `children` (your children) or `team` (everyone but you). A name outside your team is refused.
+- `team` and `children` are one message id to each recipient. Answer a message with `-Re <its id>`, to its sender only (a name, `parent` or `leader`); a reply that would be hop 4 is refused, and a broadcast cannot be answered with a broadcast.
+- At most 120 messages per hour; past that, `send` refuses with `retryAt`.
+- When `send` fails with `check` `mail`, run the same send again with `-Id <id>` from the reply: it finishes that send, never a new one.
 
 ## Listening
 
