@@ -5360,10 +5360,16 @@ hc {}:
             // A tagged hook: a process holding the terminal id of b, outside its client chain, outside tmux/rmux.
             let addr =
                 s(&json_file(&live.agent_dir(&b).join("record.json"))["hcAddress"]).to_string();
+            // The state root reaches it as it reaches `live.run`: without it the hook looks in the default root, finds
+            // no member for the terminal, and is refused as herdr's, never reaching the tagged check.
+            let state = live.state_text();
             let (code, out, _) = live.server.run_raw(
                 env!("CARGO_BIN_EXE_mux-agent"),
                 &["read", "-Count"],
-                &[("HC_TERMINAL_ID", addr.as_str())],
+                &[
+                    ("HC_TERMINAL_ID", addr.as_str()),
+                    ("MUX_AGENTS_STATE", state.as_str()),
+                ],
                 &["TMUX", "RMUX"],
             );
             assert_eq!((code, out.contains("tagged")), (2, true), "{mux:?} {out}");
