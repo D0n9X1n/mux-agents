@@ -200,6 +200,93 @@ mod tests {
         assert_eq!(policy_of(Client::Claude, &v(&["--frobnicate"])), None);
     }
 
+    // A variadic option (`<tools...>`) takes every value up to the next flag or `--`, as the client reads it: a value is
+    // never moved into the prompt, so a restriction survives replay. `--x=v` takes only `v` in Claude (commander's
+    // `=` branch ends the list); Copilot's parser is not verified, so its `=` list stays open (fail closed).
+    #[test]
+    fn a_variadic_option_keeps_every_value() {
+        // (client, argv, options, prompt)
+        type Case = (
+            Client,
+            &'static [&'static str],
+            &'static [&'static str],
+            &'static [&'static str],
+        );
+        let cases: [Case; 8] = [
+            (
+                Client::Claude,
+                &["--disallowedTools", "Bash", "Edit", "--model", "x"],
+                &["--disallowedTools", "Bash", "Edit", "--model", "x"],
+                &[],
+            ),
+            (
+                Client::Claude,
+                &["--disallowed-tools", "Bash", "Edit", "--", "fix"],
+                &["--disallowed-tools", "Bash", "Edit"],
+                &["--", "fix"],
+            ),
+            (
+                Client::Claude,
+                &["--allowedTools", "Read", "Grep", "-p", "fix"],
+                &["--allowedTools", "Read", "Grep"],
+                &["-p", "fix"],
+            ),
+            (
+                Client::Claude,
+                &["--add-dir", "a", "b", "--allowed-tools", "Read"],
+                &["--add-dir", "a", "b", "--allowed-tools", "Read"],
+                &[],
+            ),
+            (
+                Client::Claude,
+                &["--disallowedTools=Bash", "fix"],
+                &["--disallowedTools=Bash"],
+                &["fix"],
+            ),
+            (
+                Client::Copilot,
+                &["--deny-tool", "shell", "write", "--model", "x"],
+                &["--deny-tool", "shell", "write", "--model", "x"],
+                &[],
+            ),
+            (
+                Client::Copilot,
+                &["--excluded-tools", "a", "b", "-p", "fix"],
+                &["--excluded-tools", "a", "b"],
+                &["-p", "fix"],
+            ),
+            (
+                Client::Copilot,
+                &["--deny-url=x.com", "y.com", "--", "fix"],
+                &["--deny-url=x.com", "y.com"],
+                &["--", "fix"],
+            ),
+        ];
+        for (client, argv, options, prompt) in cases {
+            let got = classify(client, &v(argv)).unwrap();
+            assert_eq!(
+                (got.options.clone(), got.prompt),
+                (v(options), v(prompt)),
+                "{argv:?}"
+            );
+            assert_eq!(policy_of(client, &got.options), Some(Policy::Default));
+            assert_eq!(
+                replay(client, &got.options, Policy::Default).ok(),
+                Some(got.options),
+                "{argv:?}: the restriction survives replay"
+            );
+        }
+        // A variadic this does not model is refused whole: none of its values can become a prompt.
+        for (client, argv) in [
+            (Client::Claude, &["--tools", "Bash", "fix"][..]),
+            (Client::Claude, &["--mcp-config", "a.json", "b.json"]),
+            (Client::Copilot, &["--allow-tool", "shell", "fix"]),
+        ] {
+            assert_eq!(refused(classify(client, &v(argv))), usage(), "{argv:?}");
+            assert_eq!(policy_of(client, &v(argv)), None, "{argv:?}");
+        }
+    }
+
     // One argv grammar: classify, the ceiling the argv gives, and replay agree for every spelling of a prompt.
     #[test]
     fn a_prompt_in_any_spelling_keeps_the_ceiling_its_options_give() {

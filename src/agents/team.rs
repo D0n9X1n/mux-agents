@@ -80,6 +80,7 @@ const COPILOT_VALUED: [&str; 11] = [
 ];
 // The flags whose value is optional (`--resume [value]`, `--deny-tool [<tools>...]`): they take the next token only
 // when it is not itself a flag or `--`, as the clients' own parsers do, so they never swallow a narrowing flag.
+// A variadic flag (below) then takes every further value the same way.
 const CLAUDE_OPTIONAL: [&str; 2] = ["-r", "--resume"];
 const COPILOT_OPTIONAL: [&str; 5] = [
     "-r",
@@ -88,6 +89,16 @@ const COPILOT_OPTIONAL: [&str; 5] = [
     "--deny-url",
     "--excluded-tools",
 ];
+// The variadic flags (`--allowedTools <tools...>`, `--deny-tool [<tools>...]` in each client's help): after their
+// first value they take every token up to the next flag or `--`, so no value is ever read as the prompt.
+const CLAUDE_VARIADIC: [&str; 5] = [
+    "--add-dir",
+    "--allowedTools",
+    "--allowed-tools",
+    "--disallowedTools",
+    "--disallowed-tools",
+];
+const COPILOT_VARIADIC: [&str; 3] = ["--deny-tool", "--deny-url", "--excluded-tools"];
 const COPILOT_BARE: [&str; 10] = [
     "--continue",
     "--allow-all",
@@ -114,26 +125,50 @@ pub(crate) enum Arg {
     Rest(Vec<String>),
 }
 
-type Tables = (
-    &'static [&'static str],
-    &'static [&'static str],
-    &'static [&'static str],
-);
+/// One client's flag tables. `inline_ends_list`: `--x=v` gives a variadic flag `v` alone. Claude's commander reads
+/// it so (its `=` branch never continues the list); Copilot's parser is not verified, so its list stays open (fail
+/// closed: a value is kept as an option, never moved into the prompt).
+struct Grammar {
+    valued: &'static [&'static str],
+    optional: &'static [&'static str],
+    bare: &'static [&'static str],
+    variadic: &'static [&'static str],
+    inline_ends_list: bool,
+}
 
-fn tables(client: Client) -> Tables {
+fn grammar(client: Client) -> Grammar {
     match client {
-        Client::Claude => (&CLAUDE_VALUED, &CLAUDE_OPTIONAL, &CLAUDE_BARE),
-        Client::Copilot => (&COPILOT_VALUED, &COPILOT_OPTIONAL, &COPILOT_BARE),
+        Client::Claude => Grammar {
+            valued: &CLAUDE_VALUED,
+            optional: &CLAUDE_OPTIONAL,
+            bare: &CLAUDE_BARE,
+            variadic: &CLAUDE_VARIADIC,
+            inline_ends_list: true,
+        },
+        Client::Copilot => Grammar {
+            valued: &COPILOT_VALUED,
+            optional: &COPILOT_OPTIONAL,
+            bare: &COPILOT_BARE,
+            variadic: &COPILOT_VARIADIC,
+            inline_ends_list: false,
+        },
     }
 }
 
 /// The one argv grammar `policy`, `policy_of` and `options::classify` read, honouring argument boundaries: a valued
 /// flag consumes its value (so a value that looks like a flag is never read as one); an optional one takes the next
-/// token only when it is not a flag; an attached short value (`-nworker`, `-nworker=blue`) is read before the `=`
-/// split; nothing after `--` is a flag. Refuses 2 `usage` for a dash token the client is not known to take (an unknown
-/// flag could change permissions in ways this does not model) and for a valued flag with no value.
+/// token only when it is not a flag; a variadic one then takes every value up to the next flag or `--`; an attached
+/// short value (`-nworker`, `-nworker=blue`) is read before the `=` split; nothing after `--` is a flag. Refuses 2
+/// `usage` for a dash token the client is not known to take (an unknown flag could change permissions in ways this
+/// does not model) and for a valued flag with no value.
 pub(crate) fn args(client: Client, argv: &[String]) -> Res<Vec<Arg>> {
-    let (valued, optional, bare) = tables(client);
+    let Grammar {
+        valued,
+        optional,
+        bare,
+        variadic,
+        inline_ends_list,
+    } = grammar(client);
     let mut out = Vec::new();
     let mut i = 0;
     while i < argv.len() {
@@ -180,6 +215,17 @@ pub(crate) fn args(client: Client, argv: &[String]) -> Res<Vec<Arg>> {
             i += 1;
             tokens.push(v.clone());
             values.push(v.clone());
+        }
+        if variadic.contains(&name) && !(inline.is_some() && inline_ends_list) {
+            // Up to the next flag or `--`; a lone `-` is a value, as commander reads it.
+            while let Some(v) = argv
+                .get(i + 1)
+                .filter(|v| !(v.len() > 1 && v.starts_with('-')))
+            {
+                i += 1;
+                tokens.push(v.clone());
+                values.push(v.clone());
+            }
         }
         out.push(Arg::Flag {
             name: name.into(),
