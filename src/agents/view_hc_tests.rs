@@ -335,3 +335,108 @@ fn capture_requires_view_and_never_reopens() {
         w.fakes.hc_done().unwrap();
     }
 }
+
+// Call 18a (PR #138 Tech Lead): a held identity reopens at its own generation's address, never the active record's;
+// a pending generation without `hcAddress` refuses and attaches nothing. `record.json` keeps every generation field.
+#[test]
+fn focus_member_attaches_the_held_generations_address() {
+    use crate::{agents::gens, state::evidence::publish};
+    // (case, the active generation's top-level fields kept, the pending hcAddress, what focus gives)
+    for (case, active, pending_address, want) in [
+        (
+            "active 1 at old, pending 2 at new",
+            true,
+            Some("new-address"),
+            Ok("new-address"),
+        ),
+        (
+            "pending only, at new",
+            false,
+            Some("new-address"),
+            Ok("new-address"),
+        ),
+        (
+            "active 1 at old, pending 2 without address",
+            true,
+            None,
+            Err(()),
+        ),
+        ("pending only, without address", false, None, Err(())),
+    ] {
+        let w = World::human("");
+        let c = w.caller();
+        let mut r = cf::member(
+            &w,
+            ID,
+            json!({"lifecycle": 1, "generation": "1", "hcName": "m0123abcd", "hcAddress": "old-address"}),
+        );
+        if !active {
+            for k in ["generation", "hcName", "hcAddress", "launcherArgv"] {
+                r.as_object_mut().unwrap().remove(k);
+            }
+        }
+        r["pending"] = json!({"gen": 2, "hcName": "m4567cdef",
+            "sessionId": "11111111-2222-4333-8444-555555555555"});
+        if let Some(a) = pending_address {
+            r["pending"]["hcAddress"] = json!(a);
+        }
+        let f = w.folder(ID);
+        write(&f.join("record.json"), r.clone());
+        publish(&gens::path(&f, 2, "commit"), &json!({"committed": true})).unwrap();
+        let before = std::fs::read(f.join("record.json")).unwrap();
+        w.panes(&[]);
+        w.launches_hold();
+        w.fakes
+            .mux_rule("new-window", 0, "%19|@8|hc attach new-address\n", "");
+        w.fakes.mux_rule("#{window_active}", 0, "%19|1|1|1\n", "");
+        cf::online(&w);
+        let core = hc::connect(&w.ctx).unwrap();
+        let got = view::focus_member(&w.ctx, Some(&core), &c, ID, None);
+        let attached: Vec<_> = w
+            .fakes
+            .mux_calls()
+            .into_iter()
+            .filter(|a| a[1] == "new-window")
+            .map(|a| a.last().unwrap().clone())
+            .collect();
+        match want {
+            Ok(address) => {
+                assert!(
+                    matches!(got, Ok(view::Member::Focused(_))),
+                    "{case}: {got:?}"
+                );
+                assert_eq!(attached, [address], "{case}");
+                // restore_view's own view-field write stays until A3c (`view_held`); every other field is unchanged.
+                let mut after = read_json(&f.join("record.json")).unwrap().unwrap();
+                let mut stored = r.clone();
+                for k in crate::agents::team_state::VIEW_FIELDS {
+                    after.as_object_mut().unwrap().remove(k);
+                    stored.as_object_mut().unwrap().remove(k);
+                }
+                assert_eq!(after, stored, "{case}: generation fields kept");
+            }
+            Err(()) => {
+                let e = got.unwrap_err();
+                assert_eq!(
+                    (e.check, e.message.as_str()),
+                    ("internal", "unexpected error (invalid attachment identity)"),
+                    "{case}"
+                );
+                assert!(attached.is_empty(), "{case}: no attach: {attached:?}");
+                assert_eq!(
+                    std::fs::read(f.join("record.json")).unwrap(),
+                    before,
+                    "{case}: record.json byte-identical"
+                );
+            }
+        }
+        match gens::member_of(&f) {
+            gens::Member::Life(g) => assert_eq!(
+                (g.active(), g.pending()),
+                (active.then_some(1), Some(2)),
+                "{case}: still the same generations"
+            ),
+            other => panic!("{case}: {other:?}"),
+        }
+    }
+}

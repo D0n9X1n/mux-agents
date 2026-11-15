@@ -199,6 +199,8 @@ pub fn board(ctx: &Ctx, caller: &Caller, all: bool, watch: bool) -> Res<Map<Stri
                 &super::text(record.get("window")),
                 if live { "running" } else { "unknown" },
             )?;
+            // Call 18a: the selected identity's session (a held one's is its pending generation's), in place.
+            row.insert("sessionId".into(), o.identity.session_id.clone().into());
             if !live {
                 if let Some(closed) = notice
                     .and_then(|n| n.get("closedBy"))
@@ -1854,6 +1856,28 @@ mod tests {
                 assert!(crate::agents::fixture::list_call(&w.fakes.mux_calls()[0]));
             }
         }
+    }
+    // Call 18a: a held member's row names its pending generation's session, never the active record's.
+    #[test]
+    fn a_held_members_row_names_the_pending_session() {
+        use crate::agents::{core_fixture as cf, gens};
+        use crate::state::evidence::publish;
+        const PENDING: &str = "11111111-2222-4333-8444-555555555555";
+        let w = World::human("");
+        let c = w.caller();
+        let mut r = cf::member(
+            &w,
+            ID,
+            json!({"lifecycle": 1, "generation": "1", "hcName": "m0123abcd"}),
+        );
+        r["pending"] = json!({"gen": 2, "hcName": "m4567cdef", "sessionId": PENDING,
+            "hcAddress": "new-address"});
+        let f = w.folder(ID);
+        write(&f.join("record.json"), r);
+        publish(&gens::path(&f, 2, "commit"), &json!({"committed": true})).unwrap();
+        w.panes(&[]);
+        let b = board(&w.ctx, &c, true, false).unwrap();
+        assert_eq!(b["agents"][0]["sessionId"], PENDING, "{b:?}");
     }
     #[test]
     fn board_hc_failures_do_not_invent_completion() {

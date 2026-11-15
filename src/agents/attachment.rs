@@ -15,6 +15,7 @@ pub fn attach(
     core: &Core<'_>,
     caller: &Caller,
     record: &Value,
+    address: &str,
     split: Option<&str>,
     pane: &mut Option<Created>,
 ) -> Res<()> {
@@ -24,14 +25,16 @@ pub fn attach(
             .and_then(Value::as_str)
             .ok_or_else(|| Refusal::internal("invalid attachment identity"))
     };
-    if !super::agent_id(field("id")?)
+    // Call 18a: the address is the selected identity's (a held one's is its pending generation's), never the record's.
+    if address.is_empty()
+        || !super::agent_id(field("id")?)
         || !super::agent_name(field("name")?)
         // A paneless caller (`up`'s leader, #103) may only open a window: a split needs a pane to split.
         || !(super::pane_id(&caller.pane) || (caller.pane.is_empty() && split.is_none()))
     {
         return Err(Refusal::internal("invalid attachment identity"));
     }
-    let (address, directory, name) = (field("hcAddress")?, field("directory")?, field("name")?);
+    let (directory, name) = (field("directory")?, field("name")?);
     let session = format!("{}:", caller.session);
     let (mut args, target) = match split {
         None => (vec!["new-window"], session.as_str()),
@@ -161,7 +164,8 @@ mod tests {
             .mux_rule("-t %9 #{pane_id}|#{@agent-id}", 0, "|\n", "");
         let r = serde_json::json!({"id":"aaaaaaaaaaaa","name":"worker","hcAddress":"t1","directory":w.ctx.cwd,"context":"brief","reason":"human"});
         let mut view = None;
-        crate::agents::view::attach_core(&w.ctx, &core, &caller, &r, None, &mut view).unwrap();
+        crate::agents::view::attach_core(&w.ctx, &core, &caller, &r, "t1", None, &mut view)
+            .unwrap();
         let view = view.unwrap();
         let calls = w.fakes.mux_calls();
         let create = calls.iter().find(|a| a[1] == "new-window").unwrap();
@@ -227,7 +231,7 @@ mod tests {
             "",
         );
         let r = serde_json::json!({"id":"aaaaaaaaaaaa","name":"leader","hcAddress":"t1","directory":w.ctx.cwd,"context":"brief","reason":"leader"});
-        attach(&w.ctx, &core, &caller, &r, None, &mut None).unwrap();
+        attach(&w.ctx, &core, &caller, &r, "t1", None, &mut None).unwrap();
         assert!(
             !w.fakes
                 .mux_calls()
@@ -236,7 +240,7 @@ mod tests {
                 .any(|t| t.contains("@agent-parent"))
         );
         assert_eq!(
-            attach(&w.ctx, &core, &caller, &r, Some("h"), &mut None)
+            attach(&w.ctx, &core, &caller, &r, "t1", Some("h"), &mut None)
                 .unwrap_err()
                 .message,
             "unexpected error (invalid attachment identity)"
@@ -257,7 +261,7 @@ mod tests {
         w.fakes
             .mux_rule("-t %9 #{pane_id}|#{@agent-id}", 0, "|\n", "");
         let r = serde_json::json!({"id":"aaaaaaaaaaaa","name":"worker","hcAddress":"t1","directory":w.ctx.cwd,"context":"brief","reason":"human"});
-        attach(&w.ctx, &core, &caller, &r, None, &mut None).unwrap();
+        attach(&w.ctx, &core, &caller, &r, "t1", None, &mut None).unwrap();
         let calls = w.fakes.mux_calls();
         let create = calls
             .iter()

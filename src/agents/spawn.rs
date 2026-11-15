@@ -4011,7 +4011,9 @@ pub fn launch_hc_locked(
             if ctx.env.get("MUX_AGENTS_TEST_PANIC") == Some("launch") {
                 panic!("PANIC-PAYLOAD-launch");
             }
-            super::attachment::attach(ctx, core, caller, &p.record, request.split, view)
+            // The run's own address, just recorded by `execute_connected` from `hc run`'s reply.
+            let address = p.record["hcAddress"].as_str().unwrap_or_default();
+            super::attachment::attach(ctx, core, caller, &p.record, address, request.split, view)
         },
         |folder| commit(ctx, folder),
         |view| super::attachment::clean(ctx, view),

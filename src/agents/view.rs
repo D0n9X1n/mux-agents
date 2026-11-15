@@ -357,6 +357,7 @@ fn restore_view(
             core,
             caller,
             &record,
+            &id.address,
             (placement != "tab").then_some(placement),
             &mut created,
         )?;
