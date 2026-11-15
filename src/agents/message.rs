@@ -857,9 +857,57 @@ fn kept(core: &crate::hc::Core<'_>, id: &super::core_identity::Identity) -> Res<
     }
 }
 
+/// How long `stop` waits for the member's recorded client to exit (#137), and how often it looks.
+const CLIENT_EXIT_BOUND: Duration = Duration::from_millis(8000);
+const CLIENT_EXIT_POLL: Duration = Duration::from_millis(250);
+
+/// The client member `id` recorded, as (pid, start): its active generation's `client.json` for a lifecycle record, the
+/// `client` its `launcher.json` names for any other. Each file is read only inside the state root. None when it
+/// recorded none.
+fn recorded_client(ctx: &Ctx, key: &str, id: &str, record: &Value) -> Option<(u32, i64)> {
+    let read = |rel: &[&str]| {
+        crate::caller::hc::within_root(&ctx.state_root, rel)
+            .and_then(|p| read_json(&p).ok().flatten())
+    };
+    let client = if super::gens::lifecycle(record) {
+        let n = super::gens::active(record)?.to_string();
+        read(&[key, "agents", id, "gens", &n, "client.json"])?
+    } else {
+        read(&[key, "agents", id, "launcher.json"])?
+            .get("client")?
+            .clone()
+    };
+    Some((
+        u32::try_from(client.get("pid")?.as_u64()?).ok()?,
+        client.get("start")?.as_i64()?,
+    ))
+}
+
+/// Waits, on the injected clock, until the recorded client is gone from the OS process table: no row for its pid, or
+/// one with another start. False once `CLIENT_EXIT_BOUND` has passed with it still there.
+fn client_exited(ctx: &Ctx, (pid, start): (u32, i64)) -> bool {
+    let live = || {
+        ctx.os
+            .row(pid)
+            .and_then(|row| row.start)
+            .is_some_and(|s| ctx.os.same_start(s, start))
+    };
+    let deadline = ctx.clock.now() + CLIENT_EXIT_BOUND;
+    while live() {
+        if ctx.clock.now() >= deadline {
+            return false;
+        }
+        ctx.clock.sleep(CLIENT_EXIT_POLL);
+    }
+    true
+}
+
+/// `stop <name>`: kills the member's hc terminal under its locks, then, with every lock released, replies only once its
+/// recorded client has exited (#137), so a `resume` right after is not refused `session`. Past the bound it still
+/// replies, with `clientExited: false`.
 pub fn stop_hc(ctx: &Ctx, request: &Request) -> Res<Map<String, Value>> {
     let caller = crate::caller::resolve_tree(ctx)?;
-    super::tree::with_standing(ctx, &caller, |standing| {
+    let (mut reply, client) = super::tree::with_standing(ctx, &caller, |standing| {
         let id = super::member_target::named(ctx, &caller, first(request))?;
         registry::with_member_notice(ctx, &caller, &id.id, || {
             let record = super::member_target::current(ctx, &caller, &id)?;
@@ -878,13 +926,18 @@ pub fn stop_hc(ctx: &Ctx, request: &Request) -> Res<Map<String, Value>> {
                 Life::Unknown => "unknown",
             };
             add_notice(ctx, &caller, &id.id, &record, Notice::Stopped)?;
+            let client = recorded_client(ctx, &caller.server_key, &id.id, &record);
             let mut reply = Map::new();
             reply.insert("name".into(), id.name.clone().into());
             reply.insert("hcAddress".into(), id.address.clone().into());
             reply.insert("life".into(), life.into());
-            Ok(reply)
+            Ok((reply, client))
         })
-    })
+    })?;
+    if client.is_some_and(|c| !client_exited(ctx, c)) {
+        reply.insert("clientExited".into(), false.into());
+    }
+    Ok(reply)
 }
 
 #[cfg(test)]

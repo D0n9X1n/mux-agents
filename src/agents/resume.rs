@@ -334,7 +334,8 @@ fn taken(ctx: &Ctx, caller: &crate::caller::Caller, id: &str) -> Res<Option<Stri
 /// Unclear evidence (a process table, hc or a record that cannot be read) is never free.
 fn session_held(ctx: &Ctx, core: &Core<'_>, x: &str, session: &str) -> Option<String> {
     let live = || {
-        "that conversation is live in another member or terminal, or cannot be proven ended"
+        "that conversation is live in another member or terminal, or cannot be proven ended; if you just stopped \
+         it, retry in a few seconds"
             .to_string()
     };
     let held = || -> Res<Option<String>> {

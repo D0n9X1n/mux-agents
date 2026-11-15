@@ -663,6 +663,14 @@ fn resume_refuses_while_the_conversation_is_live_anywhere() {
             assert_eq!((e.code, e.check), (2, "session"), "{case}: {}", e.message);
             if case.ends_with("-no-argv") {
                 assert!(e.message.contains("7001"), "{case}: {}", e.message);
+            } else {
+                // #137: a conversation just stopped may still be ending; the message says to retry.
+                assert_eq!(
+                    e.message,
+                    "that conversation is live in another member or terminal, or cannot be proven ended; if you \
+                     just stopped it, retry in a few seconds",
+                    "{case}"
+                );
             }
             assert_eq!(folders(&w), before, "{case}");
             assert_eq!(runs(&w), 0, "{case}");

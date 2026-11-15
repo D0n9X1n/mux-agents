@@ -329,3 +329,80 @@ fn stop_resolves_reused_name_beyond_board_history_limit() {
         w.fakes.hc_done().unwrap();
     }
 }
+
+// #137: `stop` replies once the member's recorded client has exited, so a `resume` right after it is not refused
+// `session`. The wait is bounded and polls on the injected clock, after every lock is released.
+fn stopping(w: &World, lifecycle: bool) {
+    let r = cf::member(
+        w,
+        ID,
+        if lifecycle {
+            json!({"lifecycle": 1})
+        } else {
+            json!({})
+        },
+    );
+    if lifecycle {
+        let path = super::gens::path(&w.folder(ID), 0, "client");
+        crate::state::evidence::publish(&path, &json!({"pid": 150, "start": 1500})).unwrap();
+    } else {
+        cf::proven(w, ID, 31337, 150);
+    }
+    w.fakes.process(crate::testing::row(150, 31337, 1500));
+    cf::online(w);
+    cf::answer(w, &["kill", "taaaaaaaaaaaa", "--json"], "{}");
+    let mut t = cf::wire(&r);
+    t["state"] = json!("finished");
+    t["reason"] = json!("killed");
+    cf::get(w, "taaaaaaaaaaaa", t);
+}
+
+#[test]
+fn stop_replies_once_the_recorded_client_has_exited() {
+    for lifecycle in [false, true] {
+        let w = World::human("");
+        stopping(&w, lifecycle);
+        let (f, member) = (
+            w.fakes.clone(),
+            format!("member|{}|{ID}", w.caller().server_key),
+        );
+        w.fakes.sleep_probe(move |n| {
+            // No lock is held while it waits.
+            assert_eq!(
+                f.locks()
+                    .iter()
+                    .rev()
+                    .find(|e| e.ends_with(member.as_str())),
+                Some(&format!("-{member}"))
+            );
+            if n == 2 {
+                f.forget(150);
+            }
+        });
+        let got = Value::Object(call(&w).unwrap()).to_string();
+        assert_eq!(
+            got, r#"{"name":"worker","hcAddress":"taaaaaaaaaaaa","life":"ended"}"#,
+            "lifecycle {lifecycle}"
+        );
+        assert_eq!(w.fakes.slept(), [250, 250], "lifecycle {lifecycle}");
+        w.fakes.hc_done().unwrap();
+    }
+}
+
+#[test]
+fn stop_past_the_bound_still_replies_ok_with_client_exited_false() {
+    let w = World::human("");
+    stopping(&w, false);
+    let got = call(&w).unwrap();
+    assert_eq!(got["clientExited"], json!(false));
+    assert_eq!(got["life"], json!("ended"));
+    let slept: u64 = w.fakes.slept().iter().sum();
+    assert_eq!(slept, 8000);
+    // A client that reappears under its pid with another start is not the recorded one: it has exited.
+    let w = World::human("");
+    stopping(&w, false);
+    w.fakes.forget(150);
+    w.fakes.process(crate::testing::row(150, 1, 9999));
+    let got = call(&w).unwrap();
+    assert_eq!((got.get("clientExited"), w.fakes.slept()), (None, vec![]));
+}
