@@ -1890,7 +1890,7 @@ mod tests {
                     assert_eq!(b["running"], 0);
                     assert_eq!(b["agents"][0]["life"], "unknown");
                 }
-                "record-error" => assert_eq!(got.unwrap_err().check, "internal"),
+                "record-error" => assert_eq!(got.unwrap_err().check, "evidence"),
                 _ => {
                     let e = got.unwrap_err();
                     assert_eq!(

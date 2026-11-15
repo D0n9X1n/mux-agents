@@ -31,7 +31,12 @@ impl Snapshot {
             .collect()
     }
 }
-pub fn take(core: &Core<'_>, team: &str, members: &[Identity]) -> Res<Snapshot> {
+pub fn take(
+    core: &Core<'_>,
+    team: &str,
+    members: &[Identity],
+    freed: &[(String, String)],
+) -> Res<Snapshot> {
     let known: Vec<_> = members.iter().filter(|i| !i.address.is_empty()).collect();
     let unique: BTreeSet<_> = known.iter().map(|i| i.address.as_str()).collect();
     if unique.len() != known.len() || members.iter().any(|i| i.team != team) {
@@ -115,6 +120,11 @@ pub fn take(core: &Core<'_>, team: &str, members: &[Identity]) -> Res<Snapshot> 
         {
             return Err(Refusal::internal("invalid cross-root identity"));
         }
+        // R3: a generation done by recorded evidence holds no name and no slot, whatever hc says of its terminal.
+        let (tid, tgen) = (&t.labels["mux.id"], &t.labels["mux.gen"]);
+        if freed.iter().any(|(id, n)| id == tid && n == tgen) {
+            continue;
+        }
         if classify(Some(t), &[]) == Life::Ended {
             continue;
         }
@@ -185,7 +195,7 @@ mod tests {
             } else {
                 answer(&f, v);
             }
-            let s = take(&core, "k:$3", &[id]).unwrap();
+            let s = take(&core, "k:$3", &[id], &[]).unwrap();
             let want = match state {
                 "running" => Life::Running,
                 "lost" => Life::Lost,
@@ -228,18 +238,18 @@ mod tests {
             let core = hc::connect(&ctx).unwrap();
             let id = identity();
             if case == "duplicate" {
-                assert!(take(&core, "k:$3", &[id.clone(), id]).is_err());
+                assert!(take(&core, "k:$3", &[id.clone(), id], &[]).is_err());
                 assert_eq!(f.hc_calls().len(), 1);
                 continue;
             }
             if case == "wrong-team" {
-                assert!(take(&core, "k:$4", &[identity()]).is_err());
+                assert!(take(&core, "k:$4", &[identity()], &[]).is_err());
                 assert_eq!(f.hc_calls().len(), 1);
                 continue;
             }
             if case == "failed-ls" {
                 f.hc_answer(Err(crate::error::Refusal::internal("ls failed")));
-                assert!(take(&core, "k:$3", &[]).is_err());
+                assert!(take(&core, "k:$3", &[], &[]).is_err());
                 continue;
             }
             answer(&f, json!({"terminals":[{"address":"t1"}]}));
@@ -263,7 +273,7 @@ mod tests {
             } else {
                 answer(&f, v);
             }
-            let got = take(&core, "k:$3", &[]);
+            let got = take(&core, "k:$3", &[], &[]);
             if ["ended", "live"].contains(&case) {
                 let s = got.unwrap();
                 assert_eq!(s.count(), usize::from(case == "live"));

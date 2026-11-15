@@ -1447,6 +1447,12 @@ fn a_lifecycle_member_resumes_with_its_stored_options_only() {
         json!({"client": "claude", "pane": "%5", "window": "@1", "depth": 1,
         "lifecycle": 1, "options": ["--model", "x"], "prompt": ["fix"]}),
     );
+    let f = w.folder(ID);
+    let publish = |file: &str, v: Value| {
+        crate::state::evidence::publish(&crate::agents::gens::path(&f, 0, file), &v).unwrap();
+    };
+    publish("commit", json!({"committed": true}));
+    publish("ended", json!({"state": "finished", "reason": "exited"}));
     let before = folders(&w);
     w.panes(&[]);
     facts(&w, &[(&x, "exited")]);
@@ -1481,6 +1487,12 @@ fn a_lifecycle_member_whose_options_are_not_pure_is_refused() {
             json!({"client": "claude", "pane": "%5", "window": "@1", "depth": 1,
             "lifecycle": 1, "options": options.clone()}),
         );
+        let f = w.folder(ID);
+        let publish = |file: &str, v: Value| {
+            crate::state::evidence::publish(&crate::agents::gens::path(&f, 0, file), &v).unwrap();
+        };
+        publish("commit", json!({"committed": true}));
+        publish("ended", json!({"state": "finished", "reason": "exited"}));
         w.panes(&[]);
         facts(&w, &[(&x, "exited")]);
         launches(&w, "t1");

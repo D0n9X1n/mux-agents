@@ -9,18 +9,25 @@ use crate::{
 };
 use serde_json::Value;
 use std::collections::BTreeMap;
+use std::path::Path;
 
 #[derive(Debug)]
 pub struct Stored {
     pub record: Value,
     pub committed: bool,
     pub noticed: bool,
+    /// A lifecycle member's notice, read once here (R1); the board shows it (Task 5).
+    pub notice: Option<Value>,
 }
 
 #[derive(Debug)]
 pub struct Local {
     pub identity: Identity,
     pub stored: Stored,
+    /// R4: the identity is a pending generation's.
+    pub held: bool,
+    /// R3: Some(finished) for a lifecycle member; None for a pre-lifecycle one.
+    pub finished: Option<bool>,
 }
 
 pub fn team(caller: &Caller) -> String {
@@ -28,23 +35,26 @@ pub fn team(caller: &Caller) -> String {
 }
 
 pub fn locals(ctx: &Ctx, caller: &Caller) -> Res<Vec<Local>> {
-    let entries = match std::fs::read_dir(super::server_dir(ctx, caller).join("agents")) {
-        Ok(e) => e,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(e) => return Err(e.into()),
-    };
-    let mut local = Vec::new();
-    for entry in entries {
-        let entry = entry?;
-        let Some(id) = entry.file_name().to_str().map(str::to_owned) else {
-            continue;
-        };
-        if !super::agent_id(&id) || !entry.file_type()?.is_dir() {
-            continue;
-        }
-        let folder = entry.path();
-        let Some(record) = crate::state::fs::read_json(&folder.join("record.json"))? else {
-            continue;
+    Ok(scan(ctx, caller)?.0)
+}
+
+/// The (id, generation) pairs a lifecycle record names that are done by recorded evidence (R3).
+type Freed = Vec<(String, String)>;
+
+/// R1, R5: every member folder classified once; with the (id, generation) pairs a lifecycle record names that are
+/// done by recorded evidence (R3), whose listed hc terminals `core_facts::take` never reserves.
+fn scan(ctx: &Ctx, caller: &Caller) -> Res<(Vec<Local>, Freed)> {
+    use super::gens::Member;
+    let (mut local, mut freed) = (Vec::new(), Vec::new());
+    // R5: link entries are kept, so member_of refuses them; a regular file at an id is no member.
+    for (id, folder, member) in
+        super::gens::members(&super::server_dir(ctx, caller).join("agents"))?
+    {
+        let record = match &member {
+            Member::Absent => continue,
+            Member::Unreadable(e) => return Err(e.clone()),
+            Member::Pre(r) => r,
+            Member::Life(g) => g.record(),
         };
         if !record.is_object() {
             return Err(Refusal::internal("invalid local hc record"));
@@ -56,36 +66,128 @@ pub fn locals(ctx: &Ctx, caller: &Caller) -> Res<Vec<Local>> {
         {
             continue;
         }
-        let hc = ["hcAddress", "generation", "team", "launcherArgv"]
-            .iter()
-            .any(|k| record.get(k).is_some());
-        let identity = if hc {
-            Identity::read(&record, &id, &team(caller))
-                .ok_or_else(|| Refusal::internal("invalid local hc identity"))?
-        } else {
-            // A resume's successor whose hc run reply was lost after its launcher claimed the run: a member whose
-            // life comes from hc. Without a claim (or with an abandoned one) it never ran and is no member.
-            let claimed = match crate::state::fs::read_json(&folder.join("gens").join("0.claim")) {
-                Ok(Some(claim)) => claim.as_str() != Some("abandoned"),
-                Ok(None) => false,
-                Err(_) => true,
-            };
-            match Identity::pending(&record, &id, &team(caller)) {
-                Some(identity) if claimed => identity,
-                _ => continue,
+        let one = match &member {
+            Member::Life(g) => {
+                let s = g.status()?; // R1: the one status read; life_local takes it
+                for (n, done) in [(g.pending(), s.pending_done), (g.active(), s.active_done)] {
+                    if let (Some(n), Some(true)) = (n, done) {
+                        freed.push((id.clone(), n.to_string()));
+                    }
+                }
+                life_local(g, &s, &id, &team(caller))?
             }
+            _ => pre_local(&folder, record, &id, caller)?,
         };
-        local.push(Local {
-            identity,
-            stored: Stored {
-                record,
-                committed: super::committed(&folder),
-                noticed: folder.join("notice.json").exists(),
-            },
-        });
+        local.extend(one);
     }
-    local.sort_by(|a, b| a.identity.id.cmp(&b.identity.id));
-    Ok(local)
+    Ok((local, freed))
+}
+
+/// Main's reading of a pre-lifecycle record, moved: its identity, the folder commit and the folder notice.
+fn pre_local(folder: &Path, record: &Value, id: &str, caller: &Caller) -> Res<Option<Local>> {
+    let hc = ["hcAddress", "generation", "team", "launcherArgv"]
+        .iter()
+        .any(|k| record.get(k).is_some());
+    let identity = if hc {
+        Identity::read(record, id, &team(caller))
+            .ok_or_else(|| Refusal::internal("invalid local hc identity"))?
+    } else {
+        // A resume's successor whose hc run reply was lost after its launcher claimed the run: a member whose
+        // life comes from hc. Without a claim (or with an abandoned one) it never ran and is no member.
+        let claimed = match crate::state::fs::read_json(&folder.join("gens").join("0.claim")) {
+            Ok(Some(claim)) => claim.as_str() != Some("abandoned"),
+            Ok(None) => false,
+            Err(_) => true,
+        };
+        match Identity::pending(record, id, &team(caller)) {
+            Some(identity) if claimed => identity,
+            _ => return Ok(None),
+        }
+    };
+    Ok(Some(Local {
+        identity,
+        stored: Stored {
+            record: record.clone(),
+            committed: super::folder_committed(folder),
+            noticed: folder.join("notice.json").exists(),
+            notice: None,
+        },
+        held: false,
+        finished: None,
+    }))
+}
+
+/// R1-R4: one `status`, the subject generation's identity, commit and notice (each read once), and its
+/// presentation; none for a held identity. A finished member is kept with `finished: Some(true)` so `settle` reads
+/// it Ended; a member that never had a subject is no member.
+fn life_local(
+    g: &super::gens::Gen,
+    s: &super::gens::Status,
+    id: &str,
+    team: &str,
+) -> Res<Option<Local>> {
+    let Some(n) = s.subject else {
+        return Ok(None);
+    };
+    let (identity, record) = subject_of(g, s, id, team)?;
+    let notice = g.read(n, "notice").known()?;
+    Ok(Some(Local {
+        identity,
+        stored: Stored {
+            record,
+            committed: s.committed,
+            noticed: notice.is_some(),
+            notice,
+        },
+        held: s.held,
+        finished: Some(s.finished),
+    }))
+}
+
+/// R4: the identity and record of the generation `s.subject` names, built once for membership and for
+/// `member_target::current`, so selection and revalidation agree. A held pending generation: `Identity::held`, the
+/// record without presentation fields (the active generation's view is not its). Otherwise `Identity::read` and the
+/// presented record. Call only when `s.subject` is Some.
+pub(crate) fn subject_of(
+    g: &super::gens::Gen,
+    s: &super::gens::Status,
+    id: &str,
+    team: &str,
+) -> Res<(Identity, Value)> {
+    if s.held {
+        let identity = Identity::held(g.record(), id, team)
+            .ok_or_else(|| Refusal::internal("invalid held generation"))?;
+        let mut r = g.record().clone();
+        if let Some(o) = r.as_object_mut() {
+            for k in super::team_state::VIEW_FIELDS {
+                o.remove(k);
+            }
+        }
+        return Ok((identity, r));
+    }
+    let identity = Identity::read(g.record(), id, team)
+        .ok_or_else(|| Refusal::internal("invalid local hc identity"))?;
+    Ok((
+        identity,
+        super::team_state::presented(g.folder(), g.record().clone())?,
+    ))
+}
+
+/// R3 (ambiguity 5): a lifecycle observation is Ended exactly when every generation its record names is done;
+/// hc's Ended alone becomes Unknown, and a recorded end with hc forgetting the terminal is Ended.
+fn settle(facts: &mut core_facts::Snapshot, local: &[Local]) {
+    use super::lifecycle::Life;
+    for o in &mut facts.local {
+        match local
+            .iter()
+            .find(|l| l.identity.id == o.identity.id)
+            .and_then(|l| l.finished)
+        {
+            Some(true) => o.life = Life::Ended,
+            Some(false) if o.life == Life::Ended => o.life = Life::Unknown,
+            _ => {}
+        }
+    }
 }
 
 /// The ids a committed member names in `resumedFrom`: each is superseded by its resume, so its name means the
@@ -243,10 +345,11 @@ impl Snapshot {
     }
 
     pub fn take(ctx: &Ctx, caller: &Caller) -> Res<Self> {
-        let local = locals(ctx, caller)?;
+        let (local, freed) = scan(ctx, caller)?;
         let ids: Vec<_> = local.iter().map(|l| l.identity.clone()).collect();
-        let result = hc::connect(ctx).and_then(|core| core_facts::take(&core, &team(caller), &ids));
-        let (facts, error) = match result {
+        let result =
+            hc::connect(ctx).and_then(|core| core_facts::take(&core, &team(caller), &ids, &freed));
+        let (mut facts, error) = match result {
             Ok(facts) => (facts, None),
             Err(e) => (
                 core_facts::Snapshot {
@@ -263,13 +366,15 @@ impl Snapshot {
                 Some(e),
             ),
         };
+        settle(&mut facts, &local); // R3: also when hc cannot be read
         Ok(Self::assemble(ctx, caller, local, facts, error))
     }
 
     pub fn for_spawn(ctx: &Ctx, caller: &Caller, core: &Core<'_>) -> Res<Self> {
-        let local = locals(ctx, caller)?;
+        let (local, freed) = scan(ctx, caller)?;
         let ids: Vec<_> = local.iter().map(|l| l.identity.clone()).collect();
-        let facts = core_facts::take(core, &team(caller), &ids)?;
+        let mut facts = core_facts::take(core, &team(caller), &ids, &freed)?;
+        settle(&mut facts, &local);
         Ok(Self::assemble(ctx, caller, local, facts, None))
     }
 

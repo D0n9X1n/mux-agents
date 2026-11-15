@@ -612,3 +612,531 @@ fn member_is_the_proven_id_only_while_running_and_unnoticed() {
         w.fakes.hc_done().unwrap();
     }
 }
+
+const OTHER_SID: &str = "11111111-2222-4333-8444-555555555555";
+
+/// hc's terminal at `address` labelled generation `n` of ID, `state` live (argv `claude`, not a launcher) or
+/// finished (exited 0).
+fn term(w: &World, address: &str, n: &str, state: &str) -> Value {
+    let team = team(&w.caller());
+    let mut t = json!({"address": address, "state": state, "argv": ["claude"], "labels": {"mux.managed": "1",
+        "mux.team": team, "mux.id": ID, "mux.gen": n, "mux.name": "worker"}});
+    if state == "finished" {
+        (t["reason"], t["exit_code"]) = (json!("exited"), json!(0));
+    }
+    t
+}
+
+/// What admission (`for_spawn`) or the snapshot (`take`) observes: (count, lives, names).
+fn observe(
+    w: &World,
+    spawn: bool,
+    listed: &[&str],
+    gets: &[(&str, Value)],
+) -> Res<(usize, Vec<Life>, Vec<String>)> {
+    let caller = w.caller();
+    f::online(w);
+    f::listing(w, &team(&caller), listed);
+    for (address, t) in gets {
+        f::get(w, address, t.clone());
+    }
+    w.panes(&[]);
+    let s = if spawn {
+        let core = crate::hc::connect(&w.ctx)?;
+        Snapshot::for_spawn(&w.ctx, &caller, &core)?
+    } else {
+        Snapshot::take(&w.ctx, &caller)?
+    };
+    Ok((
+        s.facts.count(),
+        s.facts.local.iter().map(|o| o.life).collect(),
+        s.facts.names(),
+    ))
+}
+
+/// A lifecycle record with no active generation and `pending` (gen 1, hcName m0123abcd, sessionId OTHER_SID).
+fn held_world(address: Option<&str>) -> World {
+    let w = World::human("");
+    let mut pending = json!({"gen": 1, "hcName": "m0123abcd", "sessionId": OTHER_SID});
+    if let Some(a) = address {
+        pending["hcAddress"] = json!(a);
+    }
+    w.uncommitted(ID, json!({"lifecycle": 1, "pending": pending}));
+    w
+}
+
+// R3, R4 (audits A2, A6, af434f CRITICAL 1): a pending generation not done holds its name and slot.
+#[test]
+fn a_held_generation_keeps_its_name_and_slot_until_done() {
+    let held = || (1, vec![Life::Unknown], vec!["worker".to_string()]);
+    for spawn in [true, false] {
+        let w = held_world(Some("t9"));
+        let got = observe(&w, spawn, &[], &[("t9", term(&w, "t9", "1", "finished"))]).unwrap();
+        assert_eq!(
+            got,
+            held(),
+            "spawn {spawn}: hc's Ended never frees an undecided generation"
+        );
+    }
+    let w = held_world(None);
+    let got = observe(&w, true, &["t9"], &[("t9", term(&w, "t9", "1", "live"))]).unwrap();
+    assert_eq!(
+        got,
+        held(),
+        "before hc run's reply: found by its labels, never Running"
+    );
+    for spawn in [true, false] {
+        let w = held_world(None);
+        let got = observe(&w, spawn, &[], &[]).unwrap();
+        assert_eq!(
+            got,
+            held(),
+            "spawn {spawn}: before any terminal exists, it still holds its name and slot"
+        );
+    }
+    let w = held_world(Some("t9"));
+    let ok = json!({"committed": true});
+    crate::state::evidence::publish(&crate::agents::gens::path(&w.folder(ID), 1, "commit"), &ok)
+        .unwrap();
+    let l = locals(&w.ctx, &w.caller()).unwrap();
+    assert_eq!(
+        (l[0].held, l[0].stored.committed),
+        (true, true),
+        "committed, not promoted: its own commit"
+    );
+    let w = held_world(Some("t9"));
+    let ab = json!({"aborted": true});
+    crate::state::evidence::publish(&crate::agents::gens::path(&w.folder(ID), 1, "commit"), &ab)
+        .unwrap();
+    assert_eq!(
+        observe(&w, true, &[], &[]).unwrap(),
+        (0, vec![], vec![]),
+        "void: no member"
+    );
+    let w = held_world(Some("t9"));
+    std::fs::create_dir_all(crate::agents::gens::dir(&w.folder(ID), 1)).unwrap();
+    std::fs::write(
+        crate::agents::gens::path(&w.folder(ID), 1, "commit"),
+        b"{\"abo",
+    )
+    .unwrap();
+    assert_eq!(
+        observe(&w, true, &[], &[]).map_err(|e| e.check).err(),
+        Some("evidence"),
+        "torn: refused"
+    );
+}
+
+// R4 (audit A1): a held identity is its pending generation's alone, never the active one's commit or view.
+#[test]
+fn a_held_identity_is_its_pending_generation_only() {
+    let w = World::human("");
+    let mut r = f::member(&w, ID, json!({"lifecycle": 1, "generation": "0"}));
+    let folder = w.folder(ID);
+    crate::state::evidence::publish(
+        &crate::agents::gens::path(&folder, 0, "commit"),
+        &json!({"committed": true}),
+    )
+    .unwrap();
+    r["pending"] =
+        json!({"gen": 1, "hcName": "m0123abcd", "sessionId": OTHER_SID, "hcAddress": "t9"});
+    write(&folder.join("record.json"), r.clone());
+    // A valid view of active generation 0, so a held identity that presented would show it (row 2.8).
+    let name = format!("m{}", &ID[..8]);
+    crate::state::evidence::publish(
+        &crate::agents::gens::path(&folder, 0, "launch"),
+        &json!({"hcName": name}),
+    )
+    .unwrap();
+    write(
+        &folder.join("view.json"),
+        json!({"pane": "%9", "window": "@5", "startCommand": "hc attach x",
+        "gen": 0, "hcAddress": r["hcAddress"], "hcName": name}),
+    );
+    let one = || locals(&w.ctx, &w.caller()).unwrap().remove(0);
+    let l = one();
+    let i = &l.identity;
+    let seen = (
+        i.generation.as_str(),
+        i.address.as_str(),
+        i.session_id.as_str(),
+        l.held,
+        l.stored.committed,
+    );
+    assert_eq!(
+        seen,
+        ("1", "t9", OTHER_SID, true, false),
+        "never generation 0's commit"
+    );
+    assert!(i.launcher.is_empty(), "never Running");
+    assert_eq!(
+        l.stored.record.get("pane"),
+        None,
+        "the active generation's view is not the held identity's"
+    );
+    let ok = json!({"committed": true});
+    crate::state::evidence::publish(&crate::agents::gens::path(&folder, 1, "commit"), &ok).unwrap();
+    assert!(one().stored.committed, "its own commit");
+}
+
+// R3 (audit A2): an active generation ends only by its recorded end; once recorded, hc forgetting it changes nothing.
+#[test]
+fn an_active_generation_ends_only_by_its_recorded_end() {
+    let w = World::human("");
+    let r = f::member(
+        &w,
+        ID,
+        json!({"lifecycle": 1, "generation": "1", "hcName": "m0123abcd"}),
+    );
+    let address = r["hcAddress"].as_str().unwrap().to_string();
+    let mut t = f::wire(&r);
+    (t["state"], t["reason"], t["exit_code"]) = (json!("finished"), json!("exited"), json!(0));
+    let got = observe(&w, true, &[], &[(&address, t)]).unwrap();
+    assert_eq!(
+        got,
+        (1, vec![Life::Unknown], vec!["worker".to_string()]),
+        "hc's Ended alone frees nothing"
+    );
+    let end = json!({"state": "finished"});
+    crate::state::evidence::publish(&crate::agents::gens::path(&w.folder(ID), 1, "ended"), &end)
+        .unwrap();
+    let caller = w.caller();
+    f::online(&w);
+    f::listing(&w, &team(&caller), &[]);
+    w.fakes.hc_expect(
+        &["get", &address, "--json"],
+        Ok(crate::spawn::Out {
+            code: 1,
+            ..Default::default()
+        }),
+    );
+    w.panes(&[]);
+    let core = crate::hc::connect(&w.ctx).unwrap();
+    let s = Snapshot::for_spawn(&w.ctx, &caller, &core).unwrap();
+    let seen = (
+        s.facts.count(),
+        s.facts.local.iter().map(|o| o.life).collect::<Vec<_>>(),
+    );
+    assert_eq!(
+        seen,
+        (0, vec![Life::Ended]),
+        "recorded end, hc forgot it: Ended, slot free"
+    );
+}
+
+// R4 (audit A7): every guard of a held identity refuses; a slot is never freed on an invalid block.
+#[test]
+fn a_held_identity_refuses_an_invalid_block() {
+    for (case, key, value) in [
+        ("record id", "id", json!("bbbbbbbbbbbb")),
+        ("no session", "session", Value::Null),
+        ("name", "name", json!("")),
+        ("pending sessionId", "sessionId", json!("x")),
+        ("pending hcName", "hcName", json!("worker")),
+    ] {
+        let w = held_world(Some("t9"));
+        let folder = w.folder(ID);
+        let mut r = crate::state::fs::read_json(&folder.join("record.json"))
+            .unwrap()
+            .unwrap();
+        if ["sessionId", "hcName"].contains(&key) {
+            r["pending"][key] = value;
+        } else {
+            r[key] = value;
+        }
+        write(&folder.join("record.json"), r);
+        let got = locals(&w.ctx, &w.caller()).map_err(|e| e.message).err();
+        assert_eq!(
+            got.as_deref(),
+            Some("unexpected error (invalid held generation)"),
+            "{case}"
+        );
+    }
+}
+
+// R2, R5 (audits A3, af434f CRITICAL 5): an unreadable lifecycle member refuses admission; it is never skipped.
+#[test]
+fn an_unreadable_lifecycle_member_refuses_admission() {
+    let check = |w: &World| locals(&w.ctx, &w.caller()).map_err(|e| e.check).err();
+    let w = World::human("");
+    f::member(&w, ID, json!({"lifecycle": 1, "generation": "01"}));
+    assert_eq!(check(&w), Some("internal"), "a non-canonical generation");
+    for file in ["commit", "notice"] {
+        let w = World::human("");
+        f::member(&w, ID, json!({"lifecycle": 1, "generation": "0"}));
+        std::fs::create_dir_all(crate::agents::gens::dir(&w.folder(ID), 0)).unwrap();
+        std::fs::write(crate::agents::gens::path(&w.folder(ID), 0, file), b"{\"x").unwrap();
+        assert_eq!(check(&w), Some("evidence"), "a torn active {file}");
+    }
+    #[cfg(unix)]
+    {
+        let w = held_world(Some("t9"));
+        let folder = w.folder(ID);
+        let moved = w.state().join("moved");
+        std::fs::rename(&folder, &moved).unwrap();
+        std::os::unix::fs::symlink(&moved, &folder).unwrap();
+        assert_eq!(
+            check(&w),
+            Some("evidence"),
+            "a linked member folder is never skipped"
+        );
+        let w = held_world(Some("t9"));
+        let folder = w.folder(ID);
+        let elsewhere = w.state().join("elsewhere.json");
+        std::fs::rename(folder.join("record.json"), &elsewhere).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, folder.join("record.json")).unwrap();
+        assert_eq!(check(&w), Some("evidence"), "a linked record");
+    }
+}
+
+// R1, R4: committed and noticed are the subject generation's, never the folder's or generation 0's.
+#[test]
+fn mixed_generations_use_the_active_one() {
+    use crate::{agents::gens, state::evidence::publish};
+    let w = World::human("");
+    let caller = w.caller();
+    f::member(
+        &w,
+        ID,
+        json!({"lifecycle": 1, "generation": "1", "hcName": "m0123abcd"}),
+    );
+    let folder = w.folder(ID);
+    write(&folder.join("notice.json"), json!({"kind": "stopped"}));
+    publish(
+        &gens::path(&folder, 0, "commit"),
+        &json!({"committed": true}),
+    )
+    .unwrap();
+    publish(
+        &gens::path(&folder, 0, "notice"),
+        &json!({"kind": "stopped"}),
+    )
+    .unwrap();
+    let one = || {
+        locals(&w.ctx, &caller)
+            .unwrap()
+            .into_iter()
+            .find(|l| l.identity.id == ID)
+            .unwrap()
+    };
+    let got = one();
+    assert_eq!(
+        (got.stored.committed, got.stored.noticed, got.held),
+        (false, false, false)
+    );
+    assert_eq!(got.identity.generation, "1");
+    publish(
+        &gens::path(&folder, 1, "commit"),
+        &json!({"committed": true}),
+    )
+    .unwrap();
+    publish(
+        &gens::path(&folder, 1, "notice"),
+        &json!({"kind": "stopped"}),
+    )
+    .unwrap();
+    let got = one();
+    assert_eq!((got.stored.committed, got.stored.noticed), (true, true));
+    assert_eq!(
+        got.stored.notice.unwrap()["kind"],
+        "stopped",
+        "the board shows this read (Task 5)"
+    );
+}
+
+// R3 (re-audit a9703b8f CRITICAL): a generation done by recorded evidence holds no name and no slot, even when hc
+// still lists its live launcher or recovery shell and no local identity resolves that terminal.
+#[test]
+fn a_done_generations_terminal_reserves_nothing() {
+    use crate::{agents::gens, state::evidence::publish};
+    let ab = json!({"aborted": true});
+    for spawn in [true, false] {
+        let w = held_world(Some("t9"));
+        publish(&gens::path(&w.folder(ID), 1, "commit"), &ab).unwrap();
+        let got = observe(&w, spawn, &["t9"], &[("t9", term(&w, "t9", "1", "live"))]).unwrap();
+        assert_eq!(
+            got,
+            (0, vec![], vec![]),
+            "spawn {spawn}: pending generation 1 void, its shell still listed"
+        );
+    }
+    let w = World::human("");
+    let mut r = f::member(
+        &w,
+        ID,
+        json!({"lifecycle": 1, "generation": "1", "hcName": "m0123abcd"}),
+    );
+    let folder = w.folder(ID);
+    r["pending"] =
+        json!({"gen": 2, "hcName": "m4567cdef", "sessionId": OTHER_SID, "hcAddress": "t8"});
+    write(&folder.join("record.json"), r.clone());
+    publish(
+        &gens::path(&folder, 1, "ended"),
+        &json!({"state": "finished"}),
+    )
+    .unwrap();
+    publish(&gens::path(&folder, 2, "commit"), &ab).unwrap();
+    let address = r["hcAddress"].as_str().unwrap().to_string();
+    let mut gone = f::wire(&r);
+    (gone["state"], gone["reason"], gone["exit_code"]) =
+        (json!("finished"), json!("exited"), json!(0));
+    // hc gets in address order: t7 (a stray shell labelled generation 1), t8 (generation 2's shell), then 1's own.
+    let gets = [
+        ("t7", term(&w, "t7", "1", "live")),
+        ("t8", term(&w, "t8", "2", "live")),
+        (address.as_str(), gone),
+    ];
+    let got = observe(&w, true, &["t7", "t8"], &gets).unwrap();
+    assert_eq!(
+        got,
+        (0, vec![Life::Ended], vec![]),
+        "1 ended, 2 void: neither generation's listed shell holds"
+    );
+}
+
+// R3, PM call 11 (final re-audit): `freed` frees only a done generation this member's record names. A live shell of
+// another member at the same generation, or of this member at a generation its record does not name, stays
+// reserved; so does one of a named generation that is not done.
+#[test]
+fn freed_frees_only_this_members_done_named_generations() {
+    use crate::{agents::gens, state::evidence::publish};
+    let shell = |w: &World, id: &str, n: &str| {
+        let mut t = term(w, "t7", n, "live");
+        t["labels"]["mux.id"] = json!(id);
+        t
+    };
+    for (case, id, n) in [
+        ("another member, generation 1", "bbbbbbbbbbbb", "1"),
+        ("generation 0, not named", ID, "0"),
+    ] {
+        let w = World::human("");
+        let r = f::member(
+            &w,
+            ID,
+            json!({"lifecycle": 1, "generation": "1", "hcName": "m0123abcd"}),
+        );
+        publish(
+            &gens::path(&w.folder(ID), 1, "ended"),
+            &json!({"state": "finished"}),
+        )
+        .unwrap();
+        let address = r["hcAddress"].as_str().unwrap().to_string();
+        let mut gone = f::wire(&r);
+        (gone["state"], gone["reason"], gone["exit_code"]) =
+            (json!("finished"), json!("exited"), json!(0));
+        // hc gets in address order: t7, then generation 1's own.
+        let gets = [("t7", shell(&w, id, n)), (address.as_str(), gone)];
+        let got = observe(&w, true, &["t7"], &gets).unwrap();
+        assert_eq!(
+            got,
+            (1, vec![Life::Ended], vec!["worker".to_string()]),
+            "{case}: its shell stays reserved"
+        );
+    }
+    let w = held_world(Some("t9"));
+    let gets = [
+        ("t7", term(&w, "t7", "1", "live")),
+        ("t9", term(&w, "t9", "1", "finished")),
+    ];
+    let got = observe(&w, true, &["t7", "t9"], &gets).unwrap();
+    let want = (
+        2,
+        vec![Life::Unknown],
+        vec!["worker".to_string(), "worker".to_string()],
+    );
+    assert_eq!(
+        got, want,
+        "pending 1 undecided: a stray of it stays reserved"
+    );
+}
+
+// R3 (re-audit): recorded completion applies when hc cannot be read; `Snapshot::take`'s error arm settles too.
+#[test]
+fn a_recorded_end_frees_the_slot_when_hc_is_unavailable() {
+    let w = World::human("");
+    f::member(
+        &w,
+        ID,
+        json!({"lifecycle": 1, "generation": "1", "hcName": "m0123abcd"}),
+    );
+    let end = json!({"state": "finished"});
+    crate::state::evidence::publish(&crate::agents::gens::path(&w.folder(ID), 1, "ended"), &end)
+        .unwrap();
+    w.panes(&[]); // no `f::online`: hc is not installed, so `hc::connect` fails
+    let s = Snapshot::take(&w.ctx, &w.caller()).unwrap();
+    assert!(s.core_error.is_some(), "hc unavailable");
+    let seen = (
+        s.facts.count(),
+        s.facts.local.iter().map(|o| o.life).collect::<Vec<_>>(),
+        s.facts.names(),
+    );
+    assert_eq!(
+        seen,
+        (0, vec![Life::Ended], vec![]),
+        "Ended by its record: name and slot free"
+    );
+}
+
+// R1 (re-audit): `locals` reads each evidence file of a lifecycle member once; record.json once through the walk and
+// once more only for `completing`, when a done marker is present (PM call 4).
+#[test]
+fn membership_reads_each_lifecycle_file_once() {
+    use crate::{agents::gens, state::evidence::publish};
+    for ended in [false, true] {
+        let w = World::human("");
+        let caller = w.caller();
+        let r = f::member(
+            &w,
+            ID,
+            json!({"lifecycle": 1, "generation": "1", "hcName": "m0123abcd"}),
+        );
+        let folder = w.folder(ID);
+        publish(
+            &gens::path(&folder, 1, "commit"),
+            &json!({"committed": true}),
+        )
+        .unwrap();
+        publish(
+            &gens::path(&folder, 1, "notice"),
+            &json!({"kind": "stopped"}),
+        )
+        .unwrap();
+        publish(
+            &gens::path(&folder, 1, "launch"),
+            &json!({"hcName": "m0123abcd"}),
+        )
+        .unwrap();
+        write(
+            &folder.join("view.json"),
+            json!({"pane": "%9", "gen": 1, "hcAddress": r["hcAddress"],
+            "hcName": "m0123abcd"}),
+        );
+        if ended {
+            publish(
+                &gens::path(&folder, 1, "ended"),
+                &json!({"state": "finished"}),
+            )
+            .unwrap();
+        }
+        let (got, reads) = crate::state::fs::record_reads(|| locals(&w.ctx, &caller));
+        got.unwrap();
+        let others: Vec<_> = reads
+            .iter()
+            .filter(|p| !p.ends_with("record.json"))
+            .collect();
+        let mut seen = others.clone();
+        seen.sort();
+        seen.dedup();
+        assert_eq!(
+            seen.len(),
+            others.len(),
+            "ended {ended}: a file read twice: {reads:?}"
+        );
+        let records = reads.iter().filter(|p| p.ends_with("record.json")).count();
+        assert_eq!(
+            records,
+            1 + usize::from(ended),
+            "ended {ended}: record.json reads: {reads:?}"
+        );
+    }
+}

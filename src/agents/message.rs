@@ -2706,7 +2706,7 @@ mod tests {
             assert_eq!(
                 (e.code, e.check),
                 if mode == "corrupt-record" {
-                    (1, "internal")
+                    (1, "evidence")
                 } else {
                     (2, "lock")
                 }

@@ -93,6 +93,32 @@ impl Identity {
             launcher: Vec::new(),
         })
     }
+    /// R4 (ambiguity 4): the identity a held pending generation stands for; every generation field is the pending
+    /// block's. Its address is `pending.hcAddress`, or empty until hc's labels name it; no launcher, never Running.
+    pub fn held(r: &Value, id: &str, team: &str) -> Option<Self> {
+        let s = |k: &str| r.get(k)?.as_str();
+        let p = r.get("pending")?;
+        let ps = |k: &str| p.get(k)?.as_str();
+        if !super::agent_id(id)
+            || s("id")? != id
+            || s("session")? != team.rsplit_once(':')?.1
+            || !super::agent_name(s("name")?)
+            || !crate::checks::session_id(ps("sessionId")?)
+            || !is_hc_name(ps("hcName")?)
+        {
+            return None;
+        }
+        Some(Self {
+            id: id.into(),
+            name: s("name")?.into(),
+            address: ps("hcAddress").unwrap_or("").into(),
+            generation: p.get("gen")?.as_u64()?.to_string(),
+            hc_name: ps("hcName")?.into(),
+            team: team.into(),
+            session_id: ps("sessionId")?.into(),
+            launcher: Vec::new(),
+        })
+    }
     pub fn matches(&self, t: &Terminal) -> bool {
         t.address == self.address
             && [

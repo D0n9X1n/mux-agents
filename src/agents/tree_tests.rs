@@ -52,6 +52,7 @@ pub(crate) fn snap(members: &[(&str, Value, Life)], reserved: usize) -> Snapshot
                 record: record.clone(),
                 committed: true,
                 noticed: false,
+                notice: None,
             },
         );
     }
@@ -1709,6 +1710,14 @@ fn lifecycle_resume(
         json!(options),
     );
     let rx = cf::member(&w, x, rx);
+    // R3: hc's exited alone no longer ends a lifecycle member; its generation 0 is committed and its end recorded.
+    for (file, v) in [
+        ("commit", json!({"committed": true})),
+        ("ended", json!({"state": "finished", "reason": "exited"})),
+    ] {
+        crate::state::evidence::publish(&crate::agents::gens::path(&w.folder(x), 0, file), &v)
+            .unwrap();
+    }
     write(
         &w.folder(x).join("spec.json"),
         json!({"flags": ["--effort", "high"]}),
