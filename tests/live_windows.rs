@@ -362,7 +362,7 @@ fn hc_worker_and_view_close_survives_focus_stop() {
             "from",
             serde_json::json!("w1"),
         ),
-        ("read", "messages", serde_json::json!([])),
+        ("read", "ids", serde_json::json!([])),
     ]
     .into_iter()
     .enumerate()
@@ -377,7 +377,8 @@ fn hc_worker_and_view_close_survives_focus_stop() {
         assert_eq!(r["ok"], true, "{r}");
         assert_eq!(r[key], want);
     }
-    assert_eq!(live.run(&["read"])["messages"].as_array().unwrap().len(), 1);
+    let first = live.run(&["read"]);
+    assert_eq!(first["ids"].as_array().unwrap().len(), 1, "{first}");
     let address = s(&w["hcAddress"]);
     let get =
         || private_core::run(live.core.command(&["get", &address, "--json"]), &live.dir).unwrap();
@@ -388,7 +389,12 @@ fn hc_worker_and_view_close_survives_focus_stop() {
     assert_eq!(row["life"], "running");
     assert_eq!(row["view"], "detached");
     assert!(row["pane"].is_null());
-    assert_eq!(live.run(&["read"])["messages"], serde_json::json!([]));
+    // Nothing is consumed without an ack (#103 4b-i): acking the first batch leaves nothing new.
+    let batch = s(&first["batch"]);
+    assert_eq!(
+        live.run(&["read", "-Deliver", "-Ack", &batch])["ids"],
+        serde_json::json!([])
+    );
     assert_eq!(get()["state"], "live");
     let focus = live.run(&["focus", "w1"]);
     assert_ne!(focus["pane"], w["pane"]);
@@ -443,34 +449,34 @@ fn hc_worker_reads_after_its_view_closes() {
         .then_some(())
     });
     live.run(&["send", "w1", "-Body", "after the view closed"]);
-    // The worker runs `read` in its hc terminal, twice: the message, then nothing left.
-    let read = |n: u32| -> Value {
+    // The worker runs `read` in its hc terminal, twice: the message, then (acking it) nothing left.
+    let read = |n: u32, cmd: &str| -> Value {
         let held = live.dir.join(format!("cmd.{pid}.part"));
-        std::fs::write(&held, "read\n").unwrap();
+        std::fs::write(&held, format!("{cmd}\n")).unwrap();
         std::fs::rename(held, live.dir.join(format!("cmd.{pid}"))).unwrap();
         let text = live.wait("worker read", || {
             std::fs::read_to_string(live.dir.join(format!("reply.{pid}.{n}.json"))).ok()
         });
         serde_json::from_str(&text).unwrap()
     };
-    let first = read(1);
+    let first = read(1, "read");
     assert_eq!(first["ok"], true, "{first}");
-    let bodies: Vec<&str> = first["messages"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|m| {
-            m["text"]
-                .as_str()
-                .unwrap()
+    // A served batch (#103 4b-i) is one `text`: each entry starts at its header and ends in LF.
+    let text = s(&first["text"]);
+    let bodies: Vec<&str> = text
+        .split("[mux-agent from ")
+        .skip(1)
+        .map(|e| {
+            e.trim_end_matches('\n')
                 .split_once('\n')
                 .map_or("", |b| b.1)
         })
         .collect();
     assert_eq!(bodies, ["after the view closed"], "{first}");
-    let again = read(2);
+    // Nothing is consumed without an ack: the second read acks the first batch and finds nothing new.
+    let again = read(2, &format!("read\t-Deliver\t-Ack\t{}", s(&first["batch"])));
     assert_eq!(again["ok"], true, "{again}");
-    assert_eq!(again["messages"], serde_json::json!([]), "{again}");
+    assert_eq!(again["ids"], serde_json::json!([]), "{again}");
 }
 
 // Stop an agent, then resume it (#103): the reply names X as `from` and the successor Y (same name, a new hc
@@ -1201,13 +1207,8 @@ fn team_messaging_stays_in_the_team() {
     let id = s(&r["id"]);
     for who in [&leader, &b] {
         let got = by(&live, &mut sent, who, &["read"]);
-        // 4a: read answers `messages`; 4b-i turns this line into the `ids` form (`msg-plan-4b-i-3.md` F25, finding 15).
-        let ids: Vec<String> = got["messages"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|m| s(&m["id"]))
-            .collect();
+        // The ids a read served (#103 4b-i, `msg-plan-4b-i-3.md` F25, finding 15).
+        let ids: Vec<String> = got["ids"].as_array().unwrap().iter().map(s).collect();
         assert_eq!(ids, std::slice::from_ref(&id), "one id each");
     }
     assert_eq!(

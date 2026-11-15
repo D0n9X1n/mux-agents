@@ -598,10 +598,17 @@ exec claude --dangerously-skip-permissions
             let mail = self.keyed().join("mail");
             let key = self.root_box();
             let len = std::fs::metadata(mail.join(format!("{key}.jsonl"))).map_or(0, |m| m.len());
-            let offset = std::fs::read_to_string(mail.join(format!("{key}.offset")))
+            // The cursor (#103 4b-i) holds the offset; before its first commit, a legacy offset may.
+            let cursor = std::fs::read_to_string(mail.join(format!("{key}.cursor.json")))
                 .ok()
-                .and_then(|t| t.trim().parse().ok())
-                .unwrap_or(0);
+                .and_then(|t| serde_json::from_str::<Value>(&t).ok())
+                .and_then(|c| c["offset"].as_u64());
+            let offset = cursor.unwrap_or_else(|| {
+                std::fs::read_to_string(mail.join(format!("{key}.offset")))
+                    .ok()
+                    .and_then(|t| t.trim().parse().ok())
+                    .unwrap_or(0)
+            });
             len - offset
         }
 
@@ -724,12 +731,12 @@ exec claude --dangerously-skip-permissions
 
     /// Each message's body: the text after its `[mux-agent from ...]` header line.
     fn bodies(reply: &Value) -> Vec<String> {
-        reply["messages"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|m| {
-                s(&m["text"])
+        // A served batch (#103 4b-i) is one `text`: each entry starts at its header and ends in LF.
+        s(&reply["text"])
+            .split("[mux-agent from ")
+            .skip(1)
+            .map(|e| {
+                e.trim_end_matches('\n')
                     .split_once('\n')
                     .map_or("", |(_, b)| b)
                     .to_string()
@@ -1280,12 +1287,10 @@ exec claude --dangerously-skip-permissions
             "{mux:?}"
         );
         let head = format!("[mux-agent from w1 ({}) #", s(&w1["pane"]));
-        assert!(
-            s(&read["messages"][0]["text"]).starts_with(&head),
-            "{mux:?} {read}"
-        );
-        let (_, again) = live.run(&["read"]);
-        assert_eq!(again["messages"], json!([]), "{mux:?}");
+        assert!(s(&read["text"]).starts_with(&head), "{mux:?} {read}");
+        // Nothing is consumed without an ack (#103 4b-i): the next read acks this batch and finds nothing new.
+        let (_, again) = live.run(&["read", "-Deliver", "-Ack", s(&read["batch"])]);
+        assert_eq!(again["ids"], json!([]), "{mux:?} {again}");
     }
 
     // read -Wait waits on an empty mailbox and returns each worker's reply soon after it is sent.
@@ -1297,6 +1302,8 @@ exec claude --dangerously-skip-permissions
         // The bar's watch calls the multiplexer too; without it, only the reader can grow the count armed reads.
         live.close_bar();
         let mut got = Vec::new();
+        // Nothing is consumed without an ack (#103 4b-i): each reader acks the batch the one before it was served.
+        let mut acked: Option<String> = None;
         for w in &workers {
             let sid = s(&w["sessionId"]);
             let pid = live.worker_pid(w);
@@ -1305,8 +1312,11 @@ exec claude --dangerously-skip-permissions
                 format!("reply from {sid}"),
             )
             .unwrap();
-            let reader: &[&str] = &["read", "-Wait", "30"];
-            let job = live.bg(&[reader])[0];
+            let reader: Vec<&str> = match &acked {
+                Some(b) => vec!["read", "-Wait", "30", "-Ack", b],
+                None => vec!["read", "-Wait", "30"],
+            };
+            let job = live.bg(&[&reader])[0];
             live.armed(job);
             let file = format!("{{dir}}/reply-{sid}.md");
             let (code, sent) = live
@@ -1321,9 +1331,19 @@ exec claude --dangerously-skip-permissions
                 took < Duration::from_secs(5),
                 "{mux:?}: the reader took {took:?} after the send"
             );
-            let messages = reply["messages"].as_array().unwrap();
-            assert_eq!(messages.len(), 1, "{mux:?} {reply}");
-            got.push(format!("{}:{}", s(&messages[0]["from"]), bodies(&reply)[0]));
+            assert_eq!(
+                reply["ids"].as_array().map(Vec::len),
+                Some(1),
+                "{mux:?} {reply}"
+            );
+            // The sender is the entry's header: `[mux-agent from <name> (<pane>) #<id>]`.
+            let from = s(&reply["text"])
+                .strip_prefix("[mux-agent from ")
+                .and_then(|h| h.split_once(' '))
+                .map_or("", |(name, _)| name)
+                .to_string();
+            got.push(format!("{from}:{}", bodies(&reply)[0]));
+            acked = reply["batch"].as_str().map(String::from);
         }
         let want: Vec<String> = ["w1", "w2"]
             .iter()
@@ -1423,7 +1443,8 @@ exec claude --dangerously-skip-permissions
             json!({"ok":true,"verb":"stop","name":w2["name"],"hcAddress":w2["hcAddress"],"life":"ended"})
         );
         assert_eq!(code, 0);
-        let (code, read) = live.run(&["read", "-Wait", "30"]);
+        // Nothing is consumed without an ack (#103 4b-i): this read acks w1's batch, then waits for w2's.
+        let (code, read) = live.run(&["read", "-Wait", "30", "-Ack", s(&reply["batch"])]);
         assert_eq!(
             (code, bodies(&read)),
             (0, vec!["w2 was stopped.".to_string()]),
@@ -1531,7 +1552,9 @@ exec claude --dangerously-skip-permissions
                 vec![format!("{} exited with code {code}.", s(&w["name"]))]
             )
         );
-        assert_eq!(live.run(&["read"]).1["messages"], json!([]));
+        // Nothing is consumed without an ack (#103 4b-i): acking the notice's batch leaves nothing new.
+        let (_, again) = live.run(&["read", "-Deliver", "-Ack", s(&read["batch"])]);
+        assert_eq!(again["ids"], json!([]), "{again}");
         assert_eq!(exit_messages(live, w).len(), 1);
         let (_, all) = live.run(&["list", "-All"]);
         assert_eq!(all["agents"][0]["state"], format!("exited {code}"));
@@ -4278,12 +4301,11 @@ hc {}:
             (0, vec!["after the view closed".to_string()]),
             "{mux:?} {read}"
         );
-        let (code, again) = live.server.command(pid, &["read"]);
-        assert_eq!(
-            (code, &again["messages"]),
-            (0, &json!([])),
-            "{mux:?} {again}"
-        );
+        // Nothing is consumed without an ack (#103 4b-i): the worker acks its batch, then finds nothing new.
+        let (code, again) = live
+            .server
+            .command(pid, &["read", "-Deliver", "-Ack", s(&read["batch"])]);
+        assert_eq!((code, &again["ids"]), (0, &json!([])), "{mux:?} {again}");
     }
 
     /// The fake client a resume started for `sid`: the one whose argv carries `--resume <sid>`. Its `sessionId` is
@@ -5054,13 +5076,13 @@ hc {}:
         );
     }
 
-    // 4a: read still answers `messages`. 4b-i migrates this body to `reply["ids"]` (`msg-plan-4b-i-3.md` F25).
+    // The ids a read served (#103 4b-i, `msg-plan-4b-i-3.md` F25).
     fn ids_of(reply: &Value) -> Vec<String> {
-        reply["messages"]
+        reply["ids"]
             .as_array()
             .unwrap()
             .iter()
-            .map(|m| s(&m["id"]).to_string())
+            .map(|v| s(v).to_string())
             .collect()
     }
 

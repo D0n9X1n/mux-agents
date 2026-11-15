@@ -211,7 +211,7 @@ fn hc_worker_commands_keep_mail_status_activity_and_spawn_fence() {
             "from",
             json!("worker"),
         ),
-        (vec!["read"], "messages", json!([])),
+        (vec!["read"], "ids", json!([])),
         (
             vec!["spawn", "-Client", "claude", "-TaskFile", "body.txt"],
             "check",

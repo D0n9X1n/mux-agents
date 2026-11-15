@@ -1320,7 +1320,7 @@ fn send_read_spawn_and_stop_stay_bounded_during_a_resume() {
                     ["hi"],
                     "{case}"
                 ),
-                "read" => assert_eq!(got.unwrap()["messages"], json!([]), "{case}"),
+                "read" => assert_eq!(got.unwrap()["ids"], json!([]), "{case}"),
                 "stop" => assert_eq!(got.unwrap()["life"], "ended", "{case}"),
                 _ => assert_eq!(got.unwrap()["name"], "w9", "{case}"),
             }

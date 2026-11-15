@@ -414,13 +414,15 @@ pub fn parse_mail(text: &str) -> Vec<Value> {
 }
 
 /// Every unread message of `key`'s mailbox in arrival order, as `{id, from, pane, at, text}`; the offset moves
-/// past them under the mailbox lock.
+/// past them under the mailbox lock. Test only: a read consumes nothing without an ack (#103 4b-i).
+#[cfg(test)]
 pub fn read_mail(ctx: &Ctx, caller: &Caller, key: &str) -> Res<Vec<Map<String, Value>>> {
     read_mail_if(ctx, caller, key, || true)
 }
 
 /// `read_mail` behind a fence: holding the mailbox lock, `current` decides whether the reader may still read this
 /// mailbox; when it says no, nothing is read and the offset stays (one owner reads a mailbox).
+#[cfg(test)]
 pub fn read_mail_if(
     ctx: &Ctx,
     caller: &Caller,
@@ -429,17 +431,18 @@ pub fn read_mail_if(
 ) -> Res<Vec<Map<String, Value>>> {
     let mail = super::state_dir(ctx, caller)?.join("mail");
     let mailbox = mail.join(format!("{key}.jsonl"));
-    let cursor = mail.join(format!("{key}.offset"));
     let found = super::lock(ctx, &super::lock_key("mail", caller, key), || {
         if !current() {
             return Ok(Vec::new());
         }
-        let unread = unread_text(&mailbox, &cursor, false)?;
-        if unread.text.is_empty() {
+        let mut c = receipt::load(&mail, key)?;
+        let (found, end) = unread_after(&mailbox, c.offset)?;
+        if found.is_empty() {
             return Ok(Vec::new());
         }
-        std::fs::write(&cursor, unread.end.to_string())?;
-        Ok(parse_mail(&unread.text))
+        c.offset = end;
+        receipt::commit(&mail, key, &c)?;
+        Ok(found.into_iter().map(|(m, _)| m).collect::<Vec<_>>())
     })?;
     Ok(found
         .iter()
@@ -462,19 +465,43 @@ pub fn read_mail_if(
         .collect())
 }
 
-/// Unread messages in `key`'s mailbox per `<from>|<pane>`, read under the mailbox lock; never moves the offset
-/// or creates a folder.
+/// Unread messages in `key`'s mailbox per `<from>|<pane>`, held ones included, read under the mailbox lock; never
+/// moves the offset or creates a folder.
 pub fn unread_counts(ctx: &Ctx, caller: &Caller, key: &str) -> Res<HashMap<String, usize>> {
     let mail = super::server_dir(ctx, caller).join("mail");
-    let unread = super::lock(ctx, &super::lock_key("mail", caller, key), || {
-        unread_text(
-            &mail.join(format!("{key}.jsonl")),
-            &mail.join(format!("{key}.offset")),
-            true,
-        )
+    let found = super::lock(ctx, &super::lock_key("mail", caller, key), || {
+        let c = receipt::load(&mail, key).unwrap_or_default();
+        let mailbox = mail.join(format!("{key}.jsonl"));
+        let len = std::fs::metadata(&mailbox).map_or(0, |m| m.len());
+        // Tolerant, as list was: an offset past the end or inside a line counts from the start.
+        let offset = match File::open(&mailbox) {
+            Ok(mut f) if c.offset > 0 && c.offset <= len => {
+                if byte_at(&mut f, c.offset - 1)? == b'\n' {
+                    c.offset
+                } else {
+                    0
+                }
+            }
+            _ => 0,
+        };
+        let mut found: Vec<Value> = unread_after(&mailbox, offset)?
+            .0
+            .into_iter()
+            .map(|(m, _)| m)
+            .collect();
+        if !c.held.is_empty() {
+            found.extend(
+                unread_after(&mailbox, 0)?
+                    .0
+                    .into_iter()
+                    .map(|(m, _)| m)
+                    .filter(|m| c.held.contains(&super::text(m.get("id")))),
+            );
+        }
+        Ok(found)
     })?;
     let mut counts = HashMap::new();
-    for message in parse_mail(&unread.text) {
+    for message in found {
         let from = format!(
             "{}|{}",
             super::text(message.get("from")),
@@ -493,6 +520,14 @@ pub fn unread_counts(ctx: &Ctx, caller: &Caller, key: &str) -> Res<HashMap<Strin
         *counts.entry(from).or_insert(0) += 1;
     }
     Ok(counts)
+}
+
+/// The held trailer alone (no receipt), for a serving with nothing new.
+pub fn held_text(ctx: &Ctx, caller: &Caller, key: &str) -> Res<String> {
+    let mail = super::server_dir(ctx, caller).join("mail");
+    super::lock(ctx, &super::lock_key("mail", caller, key), || {
+        Ok(batch(&[], &receipt::load(&mail, key).unwrap_or_default().held).text)
+    })
 }
 
 /// The complete lines after `offset`, each message with the offset past its line, and the snapshot end. Reads only
@@ -1518,10 +1553,15 @@ mod tests {
             .iter()
             .map(|body| add_mail(&w.ctx, &caller, "pane-1", "worker", "%9", body, None).unwrap())
             .collect();
-        let cursor = mail.join("pane-1.offset");
-        let seen = cursor.clone();
-        w.fakes
-            .lock_probe(move |_| std::fs::read_to_string(&seen).unwrap_or_else(|_| "none".into()));
+        // The offset lives in the cursor (#103 4b-i); the probe reads it as the old offset file was read.
+        let seen = receipt::path(&mail, "pane-1");
+        w.fakes.lock_probe(move |_| {
+            crate::state::fs::read_json(&seen)
+                .ok()
+                .flatten()
+                .map_or_else(|| "none".into(), |c| c["offset"].to_string())
+        });
+        let offset = |m: &Path| receipt::load(m, "pane-1").unwrap().offset.to_string();
         w.fakes.clear_log();
         let messages = read_mail(&w.ctx, &caller, "pane-1").unwrap();
         let end = std::fs::metadata(mail.join("pane-1.jsonl")).unwrap().len();
@@ -1530,7 +1570,7 @@ mod tests {
             w.fakes.locks(),
             [format!("+{key} none"), format!("-{key} {end}")]
         );
-        assert_eq!(read(&cursor), end.to_string());
+        assert_eq!(offset(&mail), end.to_string());
         assert_eq!(
             messages[0].keys().collect::<Vec<_>>(),
             ["id", "from", "pane", "at", "text"]
@@ -1545,9 +1585,9 @@ mod tests {
         );
         // Read once: the next read is empty and leaves the cursor; an empty mailbox writes no cursor.
         assert!(read_mail(&w.ctx, &caller, "pane-1").unwrap().is_empty());
-        assert_eq!(read(&cursor), end.to_string());
+        assert_eq!(offset(&mail), end.to_string());
         assert!(read_mail(&w.ctx, &caller, "pane-2").unwrap().is_empty());
-        assert!(!mail.join("pane-2.offset").exists());
+        assert!(!receipt::path(&mail, "pane-2").exists());
     }
 
     #[test]
@@ -1576,7 +1616,10 @@ mod tests {
             .collect();
         assert_eq!(bodies, ["one", "two", "three"]);
         let end = std::fs::metadata(&mailbox).unwrap().len();
-        assert_eq!(read(&mail.join("pane-1.offset")), end.to_string());
+        assert_eq!(
+            receipt::load(&mail, "pane-1").unwrap().offset.to_string(),
+            end.to_string()
+        );
     }
 
     #[test]

@@ -6,7 +6,7 @@ use std::time::{Duration, SystemTime};
 
 use serde_json::{Map, Value, json};
 
-use super::mail::{add_mail, doing_line, message_text, read_mail};
+use super::mail::{add_mail, doing_line, message_text};
 use super::registry::{self, Notice, add_notice, self_of};
 use super::view::first;
 use super::{FILES_ONLY, lock, lock_key, pane_id, server_dir, text, usage};
@@ -256,7 +256,33 @@ pub fn read(ctx: &Ctx, request: &Request) -> Res<Map<String, Value>> {
         return Err(usage("read"));
     };
     let named = !request.positional.is_empty();
-    if (named && request.value("Wait").is_some()) || (!named && request.value("Lines").is_some()) {
+    let (ack, id, deliver, count) = (
+        request.value("Ack"),
+        request.value("Id"),
+        request.switch("Deliver"),
+        request.switch("Count"),
+    );
+    let hex = |v: &str| {
+        (8..=32).contains(&v.len())
+            && v.bytes()
+                .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+    };
+    let modes = [
+        request.value("Wait").is_some(),
+        deliver,
+        count,
+        id.is_some(),
+    ]
+    .into_iter()
+    .filter(|m| *m)
+    .count();
+    if (named
+        && (request.value("Wait").is_some() || ack.is_some() || deliver || count || id.is_some()))
+        || (!named && request.value("Lines").is_some())
+        || modes > 1
+        || (count && ack.is_some())
+        || [ack, id].into_iter().flatten().any(|v| !hex(v))
+    {
         return Err(usage("read"));
     }
     let mut reply = Map::new();
@@ -274,11 +300,6 @@ pub fn read(ctx: &Ctx, request: &Request) -> Res<Map<String, Value>> {
     // One membership snapshot names the reader and serves the first reconciliation.
     let snapshot = super::membership::Snapshot::take(ctx, &caller)?;
     let me = snapshot.reader(&caller)?;
-    // Removed on every return, mail, timeout or error, when this guard drops.
-    let _waiting = match &me.record {
-        Some(_) if wait > 0 => Waiting::start(ctx, &caller, &me.key),
-        _ => None,
-    };
     let mailbox = match &me.record {
         Some(record) => super::mail::member_mailbox(&me.key, record),
         None => me.key.clone(),
@@ -292,30 +313,86 @@ pub fn read(ctx: &Ctx, request: &Request) -> Res<Map<String, Value>> {
             .find(|o| o.identity.id == me.key)
             .map(|o| o.identity.clone())
     });
-    let deadline = ctx.clock.now() + Duration::from_secs(wait as u64);
-    let mut first_pass = Some(snapshot);
-    let messages = loop {
-        let snapshot = match first_pass.take() {
-            Some(snapshot) => snapshot,
-            None => super::membership::Snapshot::take(ctx, &caller)?,
-        };
-        registry::reap_hc(ctx, &caller, &snapshot)?;
-        let messages = match &identity {
-            Some(id) => {
-                super::mail::read_mail_if(ctx, &caller, &mailbox, || current(ctx, &caller, id))?
-            }
-            None => read_mail(ctx, &caller, &mailbox)?,
-        };
-        if !messages.is_empty() || ctx.clock.now() >= deadline {
-            break messages;
-        }
-        // File-watch waits are a non-goal; this polls as the reference did.
-        ctx.clock.sleep(POLL);
+    let owner = super::receipt::Owner {
+        id: me.key.clone(),
+        generation: me
+            .record
+            .as_ref()
+            .map(|r| text(r.get("generation")))
+            .filter(|g| !g.is_empty())
+            .unwrap_or_else(|| "0".into()),
     };
-    reply.insert(
-        "messages".into(),
-        Value::Array(messages.into_iter().map(Value::Object).collect()),
-    );
+    let fence = || identity.as_ref().is_none_or(|i| current(ctx, &caller, i));
+    if count {
+        let c = super::mail::counts(ctx, &caller, &mailbox)?;
+        for (k, v) in [
+            ("badge", json!(c.badge)),
+            ("wake", json!(c.wake)),
+            ("end", json!(c.end)),
+            ("id", json!(owner.id)),
+            ("gen", json!(owner.generation)),
+            (
+                "leader",
+                json!(me.record.as_ref().is_some_and(super::tree::is_leader)),
+            ),
+            ("member", json!(me.record.is_some())),
+        ] {
+            reply.insert(k.into(), v);
+        }
+        return Ok(reply);
+    }
+    if let Some(batch) = ack {
+        let done = super::mail::ack(ctx, &caller, &mailbox, &owner, batch, &fence)?
+            == super::mail::Acked::Done;
+        reply.insert("acked".into(), done.into());
+        if !done {
+            reply.insert("duplicate".into(), true.into());
+        }
+        if !(deliver || id.is_some() || request.value("Wait").is_some()) {
+            return Ok(reply);
+        }
+    }
+    // Removed on every return, mail, timeout or error, when this guard drops: after the reply is built.
+    let _waiting = match &me.record {
+        Some(_) if wait > 0 && id.is_none() => Waiting::start(ctx, &caller, &me.key),
+        _ => None,
+    };
+    let served = match id {
+        Some(id) => super::mail::serve_id(ctx, &caller, &mailbox, &owner, id, &fence)?,
+        None => {
+            let deadline = ctx.clock.now() + Duration::from_secs(wait as u64);
+            let mut first_pass = Some(snapshot);
+            loop {
+                let snapshot = match first_pass.take() {
+                    Some(s) => s,
+                    None => super::membership::Snapshot::take(ctx, &caller)?,
+                };
+                registry::reap_hc(ctx, &caller, &snapshot)?;
+                let r = super::mail::serve(ctx, &caller, &mailbox, &owner, &fence)?;
+                if r.is_some() || ctx.clock.now() >= deadline {
+                    break r;
+                }
+                // File-watch waits are a non-goal; this polls as the reference did.
+                ctx.clock.sleep(POLL);
+            }
+        }
+    };
+    // 4b-ii (part 4 F25) inserts its timeout flag here, computed before `served` is moved by the match (E0382).
+    match served {
+        Some(r) => {
+            reply.insert("batch".into(), r.batch.into());
+            reply.insert("ids".into(), json!(r.ids));
+            reply.insert("text".into(), r.text.into());
+        }
+        None => {
+            reply.insert("batch".into(), Value::Null);
+            reply.insert("ids".into(), json!([]));
+            reply.insert(
+                "text".into(),
+                super::mail::held_text(ctx, &caller, &mailbox)?.into(),
+            );
+        }
+    }
     Ok(reply)
 }
 
@@ -642,10 +719,90 @@ mod tests {
     use crate::agents::core_fixture as cf;
     use crate::agents::fixture::{ID, World, launch_command, write};
     use crate::agents::lock_key;
+    use crate::agents::mail::read_mail;
     use crate::agents::view::focus;
     use crate::error::Refusal;
     use crate::mux::Output;
     use serde_json::json;
+
+    #[test]
+    fn the_read_verb_serves_acks_counts_and_refuses_bad_flags() {
+        let w = World::human("");
+        w.panes(&[]);
+        crate::agents::mail::add_mail(&w.ctx, &w.caller(), "pane-1", "root", "%1", "hi", None)
+            .unwrap();
+        let r = |args: &[&str]| read(&w.ctx, &w.request(args)).map(Value::Object);
+        let first = r(&["read", "-Deliver"]).unwrap();
+        assert_eq!(first["ids"].as_array().map(Vec::len), Some(1), "{first}");
+        assert!(first["text"].as_str().unwrap().ends_with("]\nhi\n"));
+        assert_eq!(
+            r(&["read"]).unwrap()["batch"],
+            first["batch"],
+            "served again until acked"
+        );
+        let c = r(&["read", "-Count"]).unwrap();
+        assert_eq!(
+            (
+                &c["badge"],
+                &c["wake"],
+                &c["gen"],
+                &c["leader"],
+                &c["member"]
+            ),
+            (
+                &json!(1),
+                &json!(1),
+                &json!("0"),
+                &json!(false),
+                &json!(false)
+            )
+        );
+        let b = first["batch"].as_str().unwrap().to_string();
+        assert_eq!(
+            r(&["read", "-Ack", b.as_str()]).unwrap(),
+            json!({"acked": true})
+        );
+        assert_eq!(
+            r(&["read", "-Ack", b.as_str()]).unwrap(),
+            json!({"acked": false, "duplicate": true})
+        );
+        assert_eq!(
+            r(&["read", "-Deliver"]).unwrap(),
+            json!({"batch": null, "ids": [], "text": ""})
+        );
+        for bad in [
+            &["read", "-Count", "-Ack", "0123456789abcdef"][..],
+            &["read", "-Deliver", "-Wait", "1"],
+            &["read", "-Ack", "zz"],
+            &["read", "w", "-Id", "0123456789abcdef"],
+        ] {
+            assert_eq!(r(bad).unwrap_err().check, "usage", "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn concurrent_deliver_and_wait_share_one_receipt() {
+        let w = World::human("");
+        let (locks, state) = (
+            w.ctx.state_root.parent().unwrap().join("locks"),
+            w.ctx.state_root.clone(),
+        );
+        crate::agents::mail::add_mail(&w.ctx, &w.caller(), "pane-1", "root", "%1", "hi", None)
+            .unwrap();
+        let run = move |args: &'static [&'static str]| {
+            let (locks, state) = (locks.clone(), state.clone());
+            std::thread::spawn(move || {
+                let mut v = World::human("");
+                v.ctx.state_root = state;
+                v.fakes.real_locks(&locks);
+                v.panes(&[]);
+                read(&v.ctx, &v.request(args)).unwrap()["batch"].clone()
+            })
+        };
+        let (one, two) = (run(&["read", "-Deliver"]), run(&["read", "-Wait", "1"]));
+        let (one, two) = (one.join().unwrap(), two.join().unwrap());
+        assert!(one.is_string() && one == two, "{one} {two}");
+    }
 
     type Handler = fn(&Ctx, &Request) -> Res<Map<String, Value>>;
 
@@ -659,6 +816,15 @@ mod tests {
             NONE
         }
     }
+    /// The entries of a served batch's `text` (#103 4b-i): each from its `[mux-agent from ` header, without its LF.
+    fn entries(reply: &Map<String, Value>) -> Vec<String> {
+        let text = reply["text"].as_str().unwrap_or_default();
+        text.split("[mux-agent from ")
+            .skip(1)
+            .map(|e| format!("[mux-agent from {}", e.trim_end_matches('\n')))
+            .collect()
+    }
+
     fn run(w: &World, handler: Handler, args: &[&str]) -> String {
         let result = handler(&w.ctx, &w.request(args));
         w.fakes.hc_done().unwrap();
@@ -1036,8 +1202,7 @@ mod tests {
 
     #[test]
     fn read_wait_bounds_0_600() {
-        let usage =
-            "2 usage usage: mux-agent read [-Wait <seconds>] | read <name> [-Lines <n>] [-Text]";
+        let usage = "2 usage usage: mux-agent read [-Wait <seconds> | -Deliver | -Id <id> | -Count] [-Ack <batch>] | read <name> [-Lines <n>] [-Text]";
         let w = World::human("");
         w.fakes.clear_log();
         for wait in ["601", "-1", "x", "", "1.5", "99999999999", "0x10"] {
@@ -1051,7 +1216,7 @@ mod tests {
             run(&w, send, &["send", "%1", "-Body", "m"]);
             poll(&w, &[]);
             let reply = run(&w, read, &["read", "-Wait", wait]);
-            assert!(reply.contains("\\nm\""), "{wait:?} {reply}");
+            assert!(reply.contains("\\nm\\n\""), "{wait:?} {reply}");
         }
         assert!(w.fakes.slept().is_empty());
     }
@@ -1121,19 +1286,9 @@ mod tests {
         poll(&w, &[cf::wire(&r)]);
         fence(&w, &r);
         let reply = read(&w.ctx, &w.request(&["read"])).unwrap();
-        let texts: Vec<String> = reply["messages"]
-            .as_array()
-            .unwrap()
+        let texts: Vec<String> = entries(&reply)
             .iter()
-            .map(|m| {
-                m["text"]
-                    .as_str()
-                    .unwrap()
-                    .rsplit('\n')
-                    .next()
-                    .unwrap()
-                    .to_string()
-            })
+            .map(|e| e.rsplit('\n').next().unwrap().to_string())
             .collect();
         assert_eq!(texts, ["inherited"]);
         w.fakes.hc_done().unwrap();
@@ -1158,7 +1313,7 @@ mod tests {
         add_mail(&w.ctx, &w.caller(), ID, "root", "%2", "hi", None).unwrap();
         poll(&w, &[cf::wire(&x), cf::wire(&y)]);
         let reply = read(&w.ctx, &w.request(&["read"])).unwrap();
-        assert!(reply["messages"].as_array().unwrap().is_empty());
+        assert!(reply["ids"].as_array().unwrap().is_empty());
         w.fakes.hc_done().unwrap();
         assert_eq!(read_mail_of(&w, ID), ["hi"]);
     }
@@ -1182,7 +1337,7 @@ mod tests {
         cf::online(&w);
         cf::get(&w, "taaaaaaaaaaaa", ended);
         let reply = read(&w.ctx, &w.request(&["read"])).unwrap();
-        assert!(reply["messages"].as_array().unwrap().is_empty());
+        assert!(reply["ids"].as_array().unwrap().is_empty());
         w.fakes.hc_done().unwrap();
         assert_eq!(read_mail_of(&w, ID), ["hi"]);
     }
@@ -1340,8 +1495,7 @@ mod tests {
 
     #[test]
     fn read_lines_1_2000() {
-        let usage =
-            "2 usage usage: mux-agent read [-Wait <seconds>] | read <name> [-Lines <n>] [-Text]";
+        let usage = "2 usage usage: mux-agent read [-Wait <seconds> | -Deliver | -Id <id> | -Count] [-Ack <batch>] | read <name> [-Lines <n>] [-Text]";
         let w = World::human("");
         cf::member(&w, ID, json!({"startCommand":launch_command("%9")}));
         w.panes(&["%9|@5|300|aaaaaaaaaaaa|worker"]);
@@ -1414,7 +1568,7 @@ mod tests {
         }
         assert_eq!(
             run(&w, read, &["read", "-Wait", "3"]),
-            r#"ok {"messages":[]}"#
+            r#"ok {"batch":null,"ids":[],"text":""}"#
         );
         assert_eq!(w.fakes.slept(), [500; 6]);
         // Mail that lands while waiting ends the wait at the next poll.
@@ -1434,7 +1588,7 @@ mod tests {
             poll(&w, &[]);
         }
         let reply = run(&w, read, &["read", "-Wait", "600"]);
-        assert!(reply.contains(r#"\nlate""#), "{reply}");
+        assert!(reply.contains(r#"\nlate\n""#), "{reply}");
         assert_eq!(w.fakes.slept(), [500, 500]);
     }
 
@@ -1506,7 +1660,7 @@ mod tests {
         w.fakes.clear_log();
         assert_eq!(
             run(&w, read, &["read", "-Wait", "1"]),
-            r#"ok {"messages":[]}"#
+            r#"ok {"batch":null,"ids":[],"text":""}"#
         );
         assert_eq!(*seen.borrow(), vec![Some(mine.clone()); 2]);
         let locks = w.fakes.locks();
@@ -1541,7 +1695,7 @@ mod tests {
             fence(&w, &r);
         }
         let reply = run(&w, read, &["read", "-Wait", "600"]);
-        assert!(reply.contains(r#"\ngo""#), "{reply}");
+        assert!(reply.contains(r#"\ngo\n""#), "{reply}");
         assert_eq!(waiting_names(&w), Vec::<String>::new());
 
         // A failed mail read or a failed notice pass (the reap's pane list) removes it too.
@@ -2003,11 +2157,19 @@ mod tests {
             }
             w.panes(&[]);
             let notice = w.folder(ID).join("notice.json");
+            let mut acked: Option<String> = None;
             for round in 0..2 {
                 poll(&w, std::slice::from_ref(&t));
                 w.fakes.clear_log();
-                let result = read(&w.ctx, &w.request(&["read"])).unwrap();
-                let messages = result["messages"].as_array().unwrap();
+                // Nothing is consumed without an ack (#103 4b-i): round 1 acks the batch of round 0.
+                let ack = acked.take();
+                let args: Vec<&str> = match &ack {
+                    Some(b) => vec!["read", "-Deliver", "-Ack", b],
+                    None => vec!["read"],
+                };
+                let result = read(&w.ctx, &w.request(&args)).unwrap();
+                acked = result["batch"].as_str().map(String::from);
+                let messages = entries(&result);
                 let ended = ["exited", "killed"].contains(&mode);
                 assert_eq!(
                     messages.len(),
@@ -2016,7 +2178,7 @@ mod tests {
                 );
                 if let Some(message) = messages.first() {
                     assert_eq!(
-                        message["text"],
+                        message.as_str(),
                         if mode == "exited" {
                             "[mux-agent from worker (%9) #exit-aaaaaaaaaaaa]\nworker exited with code 7."
                         } else {
@@ -2069,9 +2231,9 @@ mod tests {
         poll(&w, &[ended]);
         w.fakes.clear_log();
         let result = read(&w.ctx, &w.request(&["read", "-Wait", "3"])).unwrap();
-        assert_eq!(result["messages"].as_array().unwrap().len(), 1);
+        assert_eq!(result["ids"].as_array().unwrap().len(), 1);
         assert_eq!(
-            result["messages"][0]["text"],
+            entries(&result)[0],
             "[mux-agent from worker (%9) #exit-aaaaaaaaaaaa]\nworker exited with code 7."
         );
         assert_eq!(w.fakes.slept(), [500]);
@@ -2157,13 +2319,8 @@ mod tests {
                 }
             }
             let reply = read(&w.ctx, &w.request(&["read"])).unwrap();
-            assert_eq!(reply["messages"].as_array().unwrap().len(), 1);
-            assert!(
-                reply["messages"][0]["text"]
-                    .as_str()
-                    .unwrap()
-                    .ends_with("\nkeep")
-            );
+            assert_eq!(reply["ids"].as_array().unwrap().len(), 1);
+            assert!(entries(&reply)[0].ends_with("\nkeep"));
             assert!(!w.folder(ID).join("notice.json").exists());
             w.fakes.hc_done().unwrap();
         }

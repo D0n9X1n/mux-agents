@@ -2398,7 +2398,7 @@ fn state_and_lock_format_pinned() {
     assert!(src("src/agents/mod.rs").contains(r#"format!("{kind}|{}|{key}", caller.server_key)"#));
     let mail = src("src/agents/mail.rs");
     assert!(mail.contains(r#"mail.join(format!("{key}.jsonl"))"#));
-    assert!(mail.contains(r#"mail.join(format!("{key}.offset"))"#));
+    assert!(src("src/agents/receipt.rs").contains(r#"mail.join(format!("{key}.offset"))"#));
     assert!(mail.contains(r#"Ok(format!("pane-{}", &pane[1..]))"#));
     let registry = src("src/agents/registry.rs");
     assert!(registry.contains(r#".join("record.json")"#));

@@ -115,11 +115,11 @@ pub static VERBS: &[VerbDef] = &[
     },
     VerbDef {
         name: "read",
-        values: &["Wait", "Lines"],
-        switches: &[],
+        values: &["Wait", "Lines", "Ack", "Id"],
+        switches: &["Deliver", "Count"],
         min: 0,
         max: 1,
-        usage: "usage: mux-agent read [-Wait <seconds>] | read <name> [-Lines <n>] [-Text]",
+        usage: "usage: mux-agent read [-Wait <seconds> | -Deliver | -Id <id> | -Count] [-Ack <batch>] | read <name> [-Lines <n>] [-Text]",
         handler: crate::agents::message::read,
         text: json::lines,
     },
@@ -2038,11 +2038,12 @@ fn mailbox_hc_dispatch_keeps_json_and_text_order() {
     for (text, want) in [
         (
             false,
-            r#"{"ok":true,"verb":"read","messages":[{"id":"exit-aaaaaaaaaaaa","from":"worker","pane":"%9","at":"2026-10-29T12:00:00.0000000Z","text":"[mux-agent from worker (%9) #exit-aaaaaaaaaaaa]\nworker exited with code 7."}]}"#,
+            r#"{"ok":true,"verb":"read","batch":"{batch}","ids":["exit-aaaaaaaaaaaa"],"text":"[mux-agent from worker (%9) #exit-aaaaaaaaaaaa]\nworker exited with code 7.\n"}"#,
         ),
         (
             true,
-            "exit-aaaaaaaaaaaa  worker  %9  2026-10-29T12:00:00.0000000Z  [mux-agent from worker (%9) #exit-aaaaaaaaaaaa]\nworker exited with code 7.",
+            // No read-specific text form yet (#103 4b-i): the generic renderer prints each field.
+            "batch: {batch}\nexit-aaaaaaaaaaaa\ntext: [mux-agent from worker (%9) #exit-aaaaaaaaaaaa]\nworker exited with code 7.\n",
         ),
     ] {
         let w = World::human("");
@@ -2060,7 +2061,12 @@ fn mailbox_hc_dispatch_keeps_json_and_text_order() {
         if text {
             args.push("-Text".into());
         }
-        assert_eq!(run(&args, || Ok(&w.ctx)), (0, want.into()));
+        // A receipt's batch id is fresh (#103 4b-i): the expected reply names the one it served, nothing else varies.
+        let got = run(&args, || Ok(&w.ctx));
+        // A person reads its pane mailbox, `pane-1`.
+        let receipt = crate::agents::receipt::load(&w.state().join("mail"), "pane-1").unwrap();
+        let batch = receipt.pending.expect("served, not acked").batch;
+        assert_eq!(got, (0, want.replace("{batch}", &batch)));
         w.fakes.hc_done().unwrap();
     }
 }
