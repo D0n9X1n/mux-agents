@@ -5373,10 +5373,7 @@ hc {}:
             );
             let (_, up) = live.run(&["up", "-Client", "claude"]);
             let leader = s(&up["leader"]["id"]).to_string();
-            let a_reply = live.spawn_by(&leader, "a").1;
-            let a = s(&a_reply["id"]).to_string();
-            // Sender A exits during the test; its own view pane is the only one allowed to close before its capture.
-            let a_pane = a_reply["pane"].as_str().map(str::to_string);
+            let a = s(&live.spawn_by(&leader, "a").1["id"]).to_string();
             let lp = live.client_of(&leader);
             let (code, r) = live.server.command(
                 lp,
@@ -5412,7 +5409,8 @@ hc {}:
             );
             // A sends and exits; the wait returns the batch.
             assert_eq!(live.by(&a, &["send", "b", "-BodyFile", &body]).0, 0);
-            std::fs::write(live.dir.join(format!("quit.{}", live.client_of(&a))), "0").unwrap();
+            let ap = live.client_of(&a);
+            std::fs::write(live.dir.join(format!("quit.{ap}")), "0").unwrap();
             let (_, got) = live.server.collect(bp, n);
             assert!(s(&got["text"]).contains("nonce-7f3a"), "{mux:?} {got}");
             // Re-armed with -Ack; a timeout re-arms; -Cancel ends a running wait and holds until new mail.
@@ -5498,35 +5496,15 @@ hc {}:
             assert_ne!(b2, before, "{mux:?} a new process");
             let (_, stale) = live.server.command(b2, &["read", "-Ack", s(&old["batch"])]);
             assert_eq!(stale["check"], "ack", "{mux:?}");
-            // No keystrokes reached any terminal: no pane shows a notice, and no agent or root pane shows the nonce.
-            // The side bars are left out of the nonce check only: a bar draws each member's doing line, which for the
-            // leader is the first line of the mail it last sent (`send` writes last-sent.json; board::select_doing
-            // falls back status, message, task). That is the bar's own drawing, not input typed into a terminal.
-            // Each pane with its role, read in one listing. A pane counts as a bar only when its role is `sidebar` AND
-            // its screen starts with the bar's own header: rmux can leave a stale `sidebar` label on another pane
-            // (sidebar.rs), and a label alone must not exempt an agent's view from the nonce check.
-            for row in live.panes("#{pane_id}|#{@agent-role}") {
-                let (pane, role) = row.split_once('|').unwrap_or((row.as_str(), ""));
-                let pane = pane.to_string();
-                // Only sender A's own view pane may close between the list and its capture; any other pane that is
-                // gone, or any other capture failure, fails the test.
-                let out = live.server.try_call(&["capture-pane", "-p", "-t", &pane]);
-                if !out.status.success()
-                    && a_pane.as_deref() == Some(pane.as_str())
-                    && String::from_utf8_lossy(&out.stderr).contains("can't find pane")
-                {
-                    continue;
-                }
-                assert!(out.status.success(), "{mux:?} capture {pane}: {out:?}");
-                let screen = String::from_utf8(out.stdout).unwrap();
-                let is_bar = role == "sidebar"
-                    && screen
-                        .lines()
-                        .next()
-                        .is_some_and(|l| l.trim_start().starts_with("mux-agents"));
+            // No keystrokes reached any terminal: each client's own input log (the fake client appends every line it
+            // reads on stdin) holds neither the body nonce nor a notice. This checks what each client received, not
+            // what each pane shows: the side bars draw the leader's last-sent line by design, and panes can close.
+            for pid in [lp, ap, bp, b2] {
+                let typed = std::fs::read_to_string(live.dir.join(format!("input.{pid}.log")))
+                    .unwrap_or_default();
                 assert!(
-                    (is_bar || !screen.contains("nonce-7f3a")) && !screen.contains("mail from"),
-                    "{mux:?} {pane}: {screen}"
+                    !typed.contains("nonce-7f3a") && !typed.contains("mail from"),
+                    "{mux:?} client {pid} was typed into: {typed}"
                 );
             }
         }
