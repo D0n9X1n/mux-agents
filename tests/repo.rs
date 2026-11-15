@@ -2587,3 +2587,19 @@ fn skill_teaches_team_messaging() {
         assert!(skill.contains(want), "SKILL.md lacks {want}");
     }
 }
+
+#[test]
+fn skill_teaches_the_wake_and_listening_on_call() {
+    let skill = repo_file("skills/mux-agents/SKILL.md");
+    for want in [
+        "read -Deliver -Ack <batch>", "read -Ack <batch>", "report done", "read -Wait 600 -Ack <batch>", "read -Cancel",
+        "read -Id <id>", "never your user", "mux-agents mail is waiting (wake <nonce>): run mux-agent read",
+        "run `read`, quote the nonce in your reply", "The wake turn carries no mail",
+        r#"When the background `read -Wait 600` ends with `"timeout": true`, start it again in the background"#,
+    ] {
+        assert!(skill.contains(want), "SKILL.md lacks {want}");
+    }
+    for gone in ["arrives as your next input", "wakes no one"] {
+        assert!(!skill.contains(gone), "SKILL.md still says {gone}: the sender wakes no one now");
+    }
+}

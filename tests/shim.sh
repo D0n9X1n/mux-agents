@@ -138,7 +138,7 @@ while IFS= read -r line; do
   case $line in '"<entry>" '*) ;; *) why="$why; not run as \"<entry>\": $line"; continue ;; esac
   line=$(printf '%s\n' "$line" | sed -e "s#<entry>#$shim#" -e 's#<client>#claude#g' -e 's#<name>#claude-1#g' \
     -e 's#<seconds>#600#g' -e 's#<n>#20#g' -e "s#<task-file>#$fx/task.md#g" -e "s#<brief-file>#$fx/brief.md#g" \
-    -e "s#<body-file>#$fx/body.md#g" -e "s#<status-file>#$fx/status.md#g" -e 's#<id>#0123456789abcdef#g')
+    -e "s#<body-file>#$fx/body.md#g" -e "s#<status-file>#$fx/status.md#g" -e 's#<id>#0123456789abcdef#g' -e 's#<batch>#fedcba9876543210#g')
   case $line in *'<'*) why="$why; unexpanded placeholder: $line"; continue ;; esac
   want=tier1
   for w in ${line#"$prefix"}; do want="$want
@@ -150,7 +150,7 @@ $block
 END_BLOCK
 set +f
 unset MUX_AGENTS_BIN
-if [ "$n" = 22 ] && [ -z "$why" ]; then ok skill_commands_run_through_shim; else bad skill_commands_run_through_shim "$n commands$why"; fi
+if [ "$n" = 29 ] && [ -z "$why" ]; then ok skill_commands_run_through_shim; else bad skill_commands_run_through_shim "$n commands$why"; fi
 
 # #84: Copilot reads the plugin root's hooks.json (Claude Code reads hooks/hooks.json only) and runs each command from
 # the plugin root. Every hook reports through the shim, never fails the turn, and maps Copilot's events as herdr's
