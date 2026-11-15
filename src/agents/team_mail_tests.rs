@@ -1242,6 +1242,21 @@ fn a_committed_0_2_agent_pane_sends_as_itself() {
         "the 0.2 reply, as the agent: {r}"
     );
     assert_eq!(inbox(&w, LEADER)[0]["from"], "pw");
+    // QA fix 2 (round 2): a record whose own id is not its folder's proves no one; never the person path.
+    let w = team_with(World::human(""), rows(&["%1|@1|100||"]));
+    w.agent_record(
+        "0000000000d4",
+        json!({"id": "0000000000e5", "name": "pw", "pane": "%1", "window": "@1"}),
+    );
+    w.recipients_live();
+    online(&w);
+    let r = go(&w, None, &["send", "leader", "-Body", "x"]);
+    assert!(r.is_err(), "an invalid record sends as no one: {r:?}");
+    assert_eq!(
+        said(r.unwrap_err()),
+        "2 tagged this caller cannot be proven a member"
+    );
+    assert!(inbox(&w, LEADER).is_empty(), "never as root");
 }
 
 /// QA fix 3: whether a caller is 0.2 is decided from the caller, so a 0.2 send never needs hc.

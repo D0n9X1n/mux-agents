@@ -337,14 +337,21 @@ fn claim(ctx: &Ctx, caller: &Caller) -> Res<Claim> {
                 .and_then(Value::as_str)
                 .is_none_or(|s| s == caller.session);
         if here {
-            found.push((record.get("hcAddress").is_some(), super::committed(&folder)));
+            // As `registry::own_record`: its own id is its folder's, its session the caller's (QA round 2, fix 2).
+            let valid = super::text(record.get("id")) == id
+                && record.get("session").and_then(Value::as_str) == Some(caller.session.as_str());
+            found.push((
+                record.get("hcAddress").is_some(),
+                super::committed(&folder),
+                valid,
+            ));
         }
     }
     // Every record that claims the pane counts, hc or not: two make its owner ambiguous (QA round 2, fix 1).
     Ok(match found.as_slice() {
         [] => Claim::None,
-        [(true, _)] => Claim::Member,
-        [(false, true)] => Claim::Agent,
+        [(true, _, _)] => Claim::Member,
+        [(false, true, true)] => Claim::Agent,
         _ => Claim::Unproven,
     })
 }
