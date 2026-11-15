@@ -1594,4 +1594,16 @@ fn a_copilot_member_reports_done_then_listens_on_call() {
     );
     let screen = live.call(&["capture-pane", "-p", "-t", &live.root]);
     assert!(!screen.contains("mail from"), "no notice typed: {screen}");
+    // No keystrokes reach a recipient either: b (the one recipient here) got the body only through `read`, never
+    // typed into its client's stdin or drawn on its pane.
+    let record = member_file(&live, &b, "record.json");
+    let b_pid = client_pid(&live, &s(&record["sessionId"]), 0);
+    let typed =
+        std::fs::read_to_string(live.dir.join(format!("input.{b_pid}.log"))).unwrap_or_default();
+    assert!(!typed.contains("nonce-7f3a"), "typed into b: {typed}");
+    let b_screen = live.screen(&s(&record["pane"]));
+    assert!(
+        !b_screen.contains("nonce-7f3a") && !b_screen.contains("mail from"),
+        "drawn on b: {b_screen}"
+    );
 }
