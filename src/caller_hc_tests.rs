@@ -351,7 +351,7 @@ pub(crate) fn link(target: &std::path::Path, at: &std::path::Path) -> std::io::R
 // file outside the canonical state root (#104 phase 1c).
 #[test]
 fn hc_worker_proof_reads_nothing_outside_the_state_root() {
-    // The seam sees the proof's reads: a proven worker opens its commit, its record and its server's file, then the
+    // The seam sees the proof's reads: a proven worker opens its record, its commit and its server's file, then the
     // member proof (D1, #103) its launcher.json and spec.json; the record is read once.
     let (w, _, r, _) = worker();
     proof(&w, &r);
@@ -365,8 +365,8 @@ fn hc_worker_proof_reads_nothing_outside_the_state_root() {
     assert_eq!(
         names,
         [
-            "commit.json",
             "record.json",
+            "commit.json",
             "server.json",
             "launcher.json",
             "spec.json"
@@ -667,5 +667,118 @@ fn a_sampled_terminal_is_checked_like_the_first() {
             "{case}"
         );
         w.fakes.hc_done().unwrap();
+    }
+}
+
+/// `worker()` turned lifecycle at generation 1: raw pane `%2`, window `@2`; generation 1's view, launch, launcher
+/// and client published; the folder `commit.json` kept; generation 0's and 1's commits as given. Returns the member
+/// folder `worker()` made: after `worker()` sets `HC_TERMINAL_ID`, `w.folder(ID)` would resolve the caller (re-audit
+/// a0586ee IMPORTANT), so no test calls it.
+fn lifecycle_worker(g0: Option<Value>, g1: Option<Value>) -> (World, Value, std::path::PathBuf) {
+    use crate::{agents::gens, state::evidence::publish};
+    let (w, _c, mut r, folder) = worker();
+    let view = json!({"pane": "%9", "window": "@5", "startCommand": r["startCommand"], "gen": 1,
+        "hcAddress": r["hcAddress"], "hcName": "m0123abcd"});
+    (r["lifecycle"], r["generation"], r["hcName"]) = (json!(1), json!("1"), json!("m0123abcd"));
+    (r["options"], r["pane"], r["window"]) =
+        (json!(["--effort", "high"]), json!("%2"), json!("@2"));
+    crate::state::fs::write_json(&folder.join("record.json"), &r).unwrap();
+    crate::state::fs::write_json(&folder.join("view.json"), &view).unwrap();
+    publish(
+        &gens::path(&folder, 1, "launch"),
+        &json!({"hcName": "m0123abcd"}),
+    )
+    .unwrap();
+    publish(
+        &gens::path(&folder, 1, "launcher"),
+        &json!({"pid": 31337, "start": 1000}),
+    )
+    .unwrap();
+    publish(
+        &gens::path(&folder, 1, "client"),
+        &json!({"pid": 150, "start": 1500}),
+    )
+    .unwrap();
+    for (n, c) in [(0, g0), (1, g1)] {
+        if let Some(c) = c {
+            publish(&gens::path(&folder, n, "commit"), &c).unwrap();
+        }
+    }
+    (w, r, folder)
+}
+fn ok() -> Option<Value> {
+    Some(json!({"committed": true}))
+}
+
+// S7, K2 (af434f IMPORTANT 9; audit C8): only generation 1's commit and view prove a lifecycle worker; an
+// uncommitted or unreadable one is refused before any candidate is made.
+#[test]
+fn a_lifecycle_worker_proves_from_its_active_generation() {
+    let (w, r, _) = lifecycle_worker(ok(), ok());
+    proof(&w, &r);
+    let got = caller::resolve(&w.ctx).expect("a committed lifecycle worker resolves");
+    let seen = (
+        got.kind,
+        got.pane.as_str(),
+        got.window.as_str(),
+        got.member.as_deref(),
+    );
+    assert_eq!(seen, (caller::Kind::Agent, "%9", "@5", Some(ID)));
+    let (w, r, _) = lifecycle_worker(ok(), None);
+    proof(&w, &r);
+    let e = caller::hc::resolve(&w.ctx).unwrap_err();
+    assert_eq!(
+        e.check, "herdr",
+        "neither the folder's nor generation 0's commit: no candidate"
+    );
+    let (w, mut r, folder) = lifecycle_worker(ok(), ok());
+    r["generation"] = json!("01");
+    crate::state::fs::write_json(&folder.join("record.json"), &r).unwrap();
+    proof(&w, &r);
+    let e = caller::hc::resolve(&w.ctx).unwrap_err();
+    assert_eq!(e.check, "herdr", "an unreadable record: no candidate");
+}
+
+// S7 (af434f IMPORTANT 9; audits C5, C6): standing rereads under the lock from generation 1 only; its member is
+// presented; an unreadable record by then is `tagged`.
+#[test]
+fn a_lifecycle_worker_stands_by_its_active_generation() {
+    let (w, r, folder) = lifecycle_worker(Some(json!({"aborted": true})), ok());
+    std::fs::remove_file(folder.join("commit.json")).unwrap();
+    proof(&w, &r);
+    let got = caller::resolve(&w.ctx).unwrap();
+    proof(&w, &r);
+    let s = crate::agents::tree::standing(&w.ctx, &got, None).unwrap();
+    let crate::agents::tree::Standing::Member(m) = s else {
+        panic!("not a member: {s:?}")
+    };
+    assert_eq!(
+        (m.record["pane"].clone(), m.record["window"].clone()),
+        (json!("%9"), json!("@5"))
+    );
+    let mut bad = r.clone();
+    bad["generation"] = json!("01");
+    crate::state::fs::write_json(&folder.join("record.json"), &bad).unwrap();
+    proof(&w, &r);
+    let e = crate::agents::tree::standing(&w.ctx, &got, None).unwrap_err();
+    assert_eq!(e.check, "tagged", "unreadable under the lock");
+}
+
+// R1, R4: a lifecycle proof reads no folder-level commit or notice and nothing of generation 0.
+#[test]
+fn a_lifecycle_proof_reads_only_its_active_generation() {
+    let (w, r, folder) = lifecycle_worker(ok(), ok());
+    proof(&w, &r);
+    let (got, reads) = crate::state::fs::record_reads(|| caller::resolve(&w.ctx));
+    got.unwrap();
+    for p in &reads {
+        assert!(
+            p != &folder.join("commit.json") && p != &folder.join("notice.json"),
+            "{p:?}"
+        );
+        assert!(
+            !p.starts_with(crate::agents::gens::dir(&folder, 0)),
+            "{p:?}"
+        );
     }
 }

@@ -307,18 +307,33 @@ pub fn standing(ctx: &Ctx, caller: &Caller, core: Option<&Core<'_>>) -> Res<Stan
             }
         };
         let team = super::membership::team(caller);
+        use super::gens::Member;
+        let folder = super::server_dir(ctx, caller).join("agents").join(id);
         let rel = [caller.server_key.as_str(), "agents", id, "record.json"];
-        let record = crate::caller::hc::within_root(&ctx.state_root, &rel)
-            .and_then(|p| crate::state::fs::read_json(&p).ok().flatten());
+        let member = crate::caller::hc::within_root(&ctx.state_root, &rel)
+            .map(|_| super::gens::member_of(&folder));
+        // What dispatch proved, proved again under the lock: the launch still committed (not aborted) and its terminal
+        // still running the recorded launcher, read inside the state root. R1, R2, R4: from one snapshot; Unreadable
+        // is `tagged`.
+        let (record, committed) = match member {
+            // The lifecycle commitment is proved by `prove_member` (A2b `lifecycle_client`: `gens::committed` of the
+            // active generation, refusing on Unreadable), which `standing` must pass anyway.
+            Some(Member::Life(g)) => (
+                super::team_state::presented(&folder, g.record().clone()).ok(),
+                true,
+            ),
+            Some(Member::Pre(r)) => {
+                let rel = [caller.server_key.as_str(), "agents", id, "commit.json"];
+                let committed = crate::caller::hc::within_root(&ctx.state_root, &rel)
+                    .and_then(|p| crate::state::fs::read_json(&p).ok().flatten())
+                    .is_some_and(|c| c.get("aborted") != Some(&Value::Bool(true)));
+                (Some(r), committed)
+            }
+            _ => (None, false),
+        };
         let identity = record
             .as_ref()
             .and_then(|r| super::core_identity::Identity::read(r, id, &team));
-        // What dispatch proved, proved again under the lock: the launch still committed (not aborted) and its terminal
-        // still running the recorded launcher, read inside the state root.
-        let rel = [caller.server_key.as_str(), "agents", id, "commit.json"];
-        let committed = crate::caller::hc::within_root(&ctx.state_root, &rel)
-            .and_then(|p| crate::state::fs::read_json(&p).ok().flatten())
-            .is_some_and(|c| c.get("aborted") != Some(&Value::Bool(true)));
         let t = identity.as_ref().and_then(|i| {
             core.get(&i.address)
                 .ok()

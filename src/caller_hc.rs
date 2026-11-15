@@ -55,13 +55,28 @@ fn prove(ctx: &Ctx) -> Res<Option<Caller>> {
         // A file is read only where it is itself, inside the state root: no link on the way out (#104 phase 1c).
         let inside = |rel: &[&str]| within_root(&ctx.state_root, rel);
         let folder = inside(&[key, "agents", id])?;
-        inside(&[key, "agents", id, "commit.json"])?;
-        let committed = agents::committed(&folder);
+        inside(&[key, "agents", id, "record.json"])?; // R5: checked before anything is opened
+        // R1, R2, R4: one member_of, one status; the active generation commits and presents.
+        let (r, committed) = match agents::gens::member_of(&folder) {
+            agents::gens::Member::Life(g) => {
+                let s = g.status().ok()?; // R2: Unreadable is no caller (refused `herdr`)
+                if !s.active_committed {
+                    return None;
+                }
+                (
+                    agents::team_state::presented(&folder, g.record().clone()).ok()?,
+                    true,
+                )
+            }
+            agents::gens::Member::Pre(r) => {
+                inside(&[key, "agents", id, "commit.json"])?;
+                (r, agents::folder_committed(&folder))
+            }
+            agents::gens::Member::Absent | agents::gens::Member::Unreadable(_) => return None,
+        };
         if !committed {
             return None;
         }
-        let record = inside(&[key, "agents", id, "record.json"])?;
-        let r = crate::state::fs::read_json(&record).ok()??;
         let identity = Identity::read(&r, id, team)?;
         if identity.address != address || !agents::tree::launch_holds(&identity, &t, committed) {
             return None;
