@@ -178,6 +178,11 @@ pub fn commit(mail: &Path, key: &str, c: &Cursor) -> Res<()> {
     Ok(())
 }
 
+/// Before an existing receipt is served again, its cursor is settled on disk (task 4c gives it its body).
+pub fn settle(_mail: &Path, _key: &str) -> Res<()> {
+    Ok(())
+}
+
 /// R5: with an uncertain ack, the folder of the cursor is flushed first; a failure refuses 1 `mail` and issues nothing.
 pub fn gate(mail: &Path, c: &Cursor) -> Res<()> {
     if c.uncertain.is_some() && crate::state::fs::sync_dir(mail).is_err() {

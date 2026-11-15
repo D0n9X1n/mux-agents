@@ -642,15 +642,14 @@ pub fn serve_id(
         }
         let mut c = receipt::load(&mail, key)?;
         receipt::gate(&mail, &c)?;
+        // One receipt in flight per channel (F2): the owner gets its in-flight held body again, whatever id it names.
+        if let Some(r) = c.id_pending.as_ref().filter(|r| r.owner == *owner) {
+            let r = r.clone();
+            receipt::settle(&mail, key)?;
+            return Ok(Some(r));
+        }
         if !c.held.iter().any(|h| h == id) {
             return refuse(2, "usage", "that message is not held; run mux-agent read");
-        }
-        if let Some(r) = c
-            .id_pending
-            .as_ref()
-            .filter(|r| r.owner == *owner && r.ids == [id])
-        {
-            return Ok(Some(r.clone()));
         }
         let (found, _) = unread_after(&mail.join(format!("{key}.jsonl")), 0)?;
         let Some((m, _)) = found
@@ -1054,6 +1053,79 @@ mod tests {
                 "{crossed}: the retry is retired"
             );
         }
+    }
+
+    const H3: &str = "3333333333333333";
+
+    /// H1 and H3 (5000 bytes each) served as references and acked: both held.
+    fn held_two(w: &World) {
+        for id in [H1, H3] {
+            deliver_once(&w.ctx, &w.caller(), "pane-1", &sized(id, 5000, "x")).unwrap();
+        }
+        let r = sv(w, "a").unwrap().unwrap();
+        assert_eq!(r.refs, [H1, H3]);
+        ak(w, "a", &r.batch).unwrap();
+    }
+
+    #[test]
+    fn a_second_held_id_re_serves_the_receipt_in_flight() {
+        let w = World::human("");
+        held_two(&w);
+        let first = sid(&w, "a", H1).unwrap().unwrap();
+        let again = sid(&w, "a", H3).unwrap().unwrap();
+        assert_eq!(
+            again, first,
+            "the in-flight receipt, unchanged, never replaced"
+        );
+        assert_eq!(
+            receipt::load(&w.state().join("mail"), "pane-1")
+                .unwrap()
+                .id_pending
+                .unwrap()
+                .ids,
+            [H1]
+        );
+        ak(&w, "a", &first.batch).unwrap();
+        assert_eq!(
+            sid(&w, "a", H3).unwrap().unwrap().ids,
+            [H3],
+            "acked: the next one is served"
+        );
+    }
+
+    #[test]
+    fn concurrent_held_reads_share_one_receipt() {
+        let w = World::human("");
+        held_two(&w);
+        let (locks, state) = (
+            w.ctx.state_root.parent().unwrap().join("locks"),
+            w.ctx.state_root.clone(),
+        );
+        let run = move |id: &'static str| {
+            let (locks, state) = (locks.clone(), state.clone());
+            std::thread::spawn(move || {
+                let mut v = World::human("");
+                v.ctx.state_root = state;
+                v.fakes.real_locks(&locks);
+                let o = Owner {
+                    id: "a".into(),
+                    generation: "0".into(),
+                };
+                serve_id(&v.ctx, &v.caller(), "pane-1", &o, id, &|| true)
+                    .unwrap()
+                    .unwrap()
+            })
+        };
+        let (one, two) = (run(H1), run(H3));
+        let (one, two) = (one.join().unwrap(), two.join().unwrap());
+        assert_eq!(one, two, "whichever ran first, the other got its receipt");
+        assert_eq!(
+            receipt::load(&w.state().join("mail"), "pane-1")
+                .unwrap()
+                .id_pending
+                .unwrap(),
+            one
+        );
     }
 
     fn msg(id: &str, re: Option<&str>, hop: u64, cast: Option<&str>) -> Value {
