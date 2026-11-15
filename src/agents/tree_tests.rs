@@ -1534,3 +1534,37 @@ fn a_person_stops_and_reads_a_leaderless_teams_leader() {
         "a spawn still refuses without the team record"
     );
 }
+
+#[test]
+fn the_hook_chain_proves_and_a_non_shell_link_is_tagged() {
+    // The hook runs mux-agent via sh under the client: caller, shell, client, launcher is the D1 chain.
+    let mut m = member_world();
+    m.hc();
+    m.rounds(1, &term(&m.r, Some(150)));
+    assert_eq!(
+        crate::caller::hc::resolve(&m.w.ctx)
+            .unwrap()
+            .member
+            .as_deref(),
+        Some(ID),
+        "the hook chain proves"
+    );
+    // A non-shell host process between the shell (170) and the client (150).
+    m.w.fakes.process(crate::testing::row(171, 150, 1710));
+    m.w.fakes.forget(170);
+    m.w.fakes.process(crate::testing::row(170, 171, 1700));
+    m.w.fakes.shell(170);
+    m.rounds(1, &term(&m.r, Some(150)));
+    let got = crate::caller::hc::resolve(&m.w.ctx).unwrap();
+    assert_eq!(
+        (got.member, got.candidate.as_deref()),
+        (None, Some(ID)),
+        "a candidate"
+    );
+    m.rounds(1, &term(&m.r, Some(150)));
+    assert_eq!(
+        crate::caller::resolve(&m.w.ctx).unwrap_err().check,
+        "tagged",
+        "every verb refuses it, read -Count included"
+    );
+}
