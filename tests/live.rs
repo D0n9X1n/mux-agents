@@ -5373,7 +5373,10 @@ hc {}:
             );
             let (_, up) = live.run(&["up", "-Client", "claude"]);
             let leader = s(&up["leader"]["id"]).to_string();
-            let a = s(&live.spawn_by(&leader, "a").1["id"]).to_string();
+            let a_reply = live.spawn_by(&leader, "a").1;
+            let a = s(&a_reply["id"]).to_string();
+            // Sender A exits during the test; its own view pane is the only one allowed to close before its capture.
+            let a_pane = a_reply["pane"].as_str().map(str::to_string);
             let lp = live.client_of(&leader);
             let (code, r) = live.server.command(
                 lp,
@@ -5505,10 +5508,11 @@ hc {}:
                 .map(|b| b.split('|').next().unwrap().to_string())
                 .collect();
             for pane in live.panes("#{pane_id}") {
-                // A pane listed above can close before its capture (sender A has exited): a pane that is gone shows
-                // nothing, so it is skipped; any other capture failure still fails the test.
+                // Only sender A's own view pane may close between the list and its capture; any other pane that is
+                // gone, or any other capture failure, fails the test.
                 let out = live.server.try_call(&["capture-pane", "-p", "-t", &pane]);
                 if !out.status.success()
+                    && a_pane.as_deref() == Some(pane.as_str())
                     && String::from_utf8_lossy(&out.stderr).contains("can't find pane")
                 {
                     continue;
