@@ -189,6 +189,28 @@ pub fn commit(mail: &Path, key: &str, c: &Cursor) -> Res<()> {
             "the mail cursor would be larger than 1 MB",
         ));
     }
+    #[cfg(feature = "test-panic")]
+    {
+        // Live tests only: a one-shot fault named by a file in the mail folder, through the real durable write:
+        // fault-file fails the temp-file flush (before the rename), fault-folder the folder sync (after it).
+        let file_fault = std::fs::remove_file(mail.join("fault-file")).is_ok();
+        let dir_fault = std::fs::remove_file(mail.join("fault-folder")).is_ok();
+        if file_fault || dir_fault {
+            let mut sync = |at: &Path, is_dir: bool| -> std::io::Result<()> {
+                if (is_dir && dir_fault) || (!is_dir && file_fault) {
+                    return Err(std::io::Error::other("injected flush failure"));
+                }
+                if is_dir {
+                    crate::state::fs::sync_dir(at)
+                } else {
+                    crate::state::fs::sync_file(at)
+                }
+            };
+            crate::state::fs::write_json_durable_with(&path(mail, key), &v, &mut sync)?;
+            let _ = std::fs::remove_file(legacy_path(mail, key));
+            return Ok(());
+        }
+    }
     crate::state::fs::write_json_durable(&path(mail, key), &v)?;
     let _ = std::fs::remove_file(legacy_path(mail, key));
     Ok(())
@@ -217,6 +239,29 @@ pub fn gate(mail: &Path, c: &Cursor) -> Res<()> {
 mod tests {
     use super::*;
     use crate::testing::TempDir;
+
+    #[cfg(feature = "test-panic")]
+    #[test]
+    fn a_fault_file_fails_one_commit() {
+        let d = TempDir::new();
+        let mail = d.path();
+        std::fs::write(mail.join("fault-folder"), "").unwrap();
+        let r = commit(mail, "k", &Cursor::default());
+        assert!(r.is_err(), "the folder flush failed");
+        assert_eq!(r.unwrap_err().check, "internal");
+        assert!(
+            path(mail, "k").exists() && !mail.join("fault-folder").exists(),
+            "renamed; one shot"
+        );
+        std::fs::write(mail.join("fault-file"), "").unwrap();
+        let c = Cursor {
+            offset: 9,
+            ..Cursor::default()
+        };
+        assert!(commit(mail, "k", &c).is_err());
+        assert_eq!(load(mail, "k").unwrap().offset, 0, "the old cursor stands");
+        commit(mail, "k", &c).unwrap();
+    }
 
     fn o(id: &str) -> Owner {
         Owner {
