@@ -30,18 +30,38 @@ pub(crate) fn read_placement(ctx: &Ctx, caller: &Caller) -> Res<Option<&'static 
 }
 
 /// `placement` reads the session's placement (`tab` by default); `placement <value>` sets it on the caller's
-/// multiplexer session. Refused from a tagged pane: only the top-level chat chooses.
+/// multiplexer session. Refused from a tagged pane: only the top-level chat chooses, or the depth-0 leader of an `up`
+/// team for its own team session (#137).
 pub fn placement(ctx: &Ctx, request: &Request) -> Res<Map<String, Value>> {
     let value = match request.positional.first() {
         None => None,
         Some(value) => Some(known(value).ok_or_else(|| usage("placement"))?),
     };
     let caller = resolve(ctx)?;
-    super::registry::untagged(
-        ctx,
-        &caller,
-        "an agent pane cannot choose where agents open",
-    )?;
+    if caller.member.is_some() {
+        // #137: a proven hc member is allowed only as the depth-0 leader `up` launched that its team record names,
+        // proven again under the team lock (`tree::standing`), which is held while it reads or sets the option.
+        return super::tree::with_standing(ctx, &caller, |standing| {
+            let leads = match (standing, super::tree::scope(ctx, &caller)?) {
+                (Some(super::tree::Standing::Member(m)), super::tree::Scope::Team(team)) => {
+                    super::tree::is_leader(&m.record) && team.leader == m.id
+                }
+                _ => false,
+            };
+            if !leads {
+                return crate::error::refuse(2, "tagged", NOT_HERE);
+            }
+            choose(ctx, &caller, value)
+        });
+    }
+    super::registry::untagged(ctx, &caller, NOT_HERE)?;
+    choose(ctx, &caller, value)
+}
+
+const NOT_HERE: &str = "an agent pane cannot choose where agents open";
+
+/// Sets `value` on the caller's session, or reads the session's placement when there is none.
+fn choose(ctx: &Ctx, caller: &Caller, value: Option<&'static str>) -> Res<Map<String, Value>> {
     let (placement, source) = match value {
         Some(value) => {
             native(
@@ -51,7 +71,7 @@ pub fn placement(ctx: &Ctx, request: &Request) -> Res<Map<String, Value>> {
             )?;
             (value, "session")
         }
-        None => match read_placement(ctx, &caller)? {
+        None => match read_placement(ctx, caller)? {
             Some(stored) => (stored, "session"),
             None => (DEFAULT, "default"),
         },

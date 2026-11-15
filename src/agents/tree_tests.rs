@@ -2129,3 +2129,78 @@ fn a_lifecycle_proof_refuses_ids_and_generations_that_are_not_plain_before_readi
     }
     m.w.fakes.hc_done().unwrap();
 }
+
+/// #137: the hc caller ID made the depth-0 `up` leader that the team record names.
+fn leader_world() -> Mw {
+    let mut m = member_world();
+    let team = t::path(&m.state, "$3");
+    let mut found = t::read(&team).unwrap().unwrap();
+    found.leader = ID.into();
+    std::fs::remove_file(&team).unwrap();
+    assert!(t::create(&team, &found).unwrap());
+    (m.r["depth"], m.r["upTeam"], m.r["parentAgent"]) = (json!(0), json!("t"), Value::Null);
+    write(&m.folder(ID).join("record.json"), m.r.clone());
+    m.hc();
+    m
+}
+fn placement_calls(m: &Mw) -> Vec<String> {
+    m.w.fakes
+        .mux_calls()
+        .iter()
+        .filter(|c| c.iter().any(|a| a == "@mux-agents-placement"))
+        .map(|c| c.join(" "))
+        .collect()
+}
+
+#[test]
+fn the_up_leader_sets_and_reads_placement_for_its_own_session() {
+    let m = leader_world();
+    m.rounds(3, &term(&m.r, Some(150)));
+    let (code, out) = crate::cli::run(&["placement", "h"].map(String::from), || Ok(&m.w.ctx));
+    assert_eq!(
+        (code, out.as_str()),
+        (
+            0,
+            r#"{"ok":true,"verb":"placement","placement":"h","source":"session"}"#
+        ),
+    );
+    assert_eq!(
+        placement_calls(&m),
+        ["-N set-option -t $3 @mux-agents-placement h"]
+    );
+    m.w.fakes.hc_done().unwrap();
+    m.w.fakes.clear_log();
+    m.w.fakes.mux_rule("show-options", 0, "h\n", "");
+    m.rounds(3, &term(&m.r, Some(150)));
+    let (code, out) = crate::cli::run(&["placement".to_string()], || Ok(&m.w.ctx));
+    assert_eq!(
+        (code, out.as_str()),
+        (
+            0,
+            r#"{"ok":true,"verb":"placement","placement":"h","source":"session"}"#
+        ),
+    );
+    m.w.fakes.hc_done().unwrap();
+}
+
+#[test]
+fn every_other_proven_member_is_still_refused_placement_tagged() {
+    let tagged = r#"{"ok":false,"verb":"placement","code":2,"check":"tagged","message":"an agent pane cannot choose where agents open"}"#;
+    // A depth-1 member, and a depth-0 `up` record that the team record does not name as its leader.
+    for case in ["member", "not-the-teams-leader"] {
+        let mut m = member_world();
+        if case == "not-the-teams-leader" {
+            (m.r["depth"], m.r["upTeam"], m.r["parentAgent"]) = (json!(0), json!("t"), Value::Null);
+            write(&m.folder(ID).join("record.json"), m.r.clone());
+        }
+        m.hc();
+        m.rounds(3, &term(&m.r, Some(150)));
+        for args in [&["placement"][..], &["placement", "h"]] {
+            let args: Vec<String> = args.iter().map(|a| a.to_string()).collect();
+            let (code, out) = crate::cli::run(&args, || Ok(&m.w.ctx));
+            assert_eq!((code, out.as_str()), (2, tagged), "{case} {args:?}");
+            m.rounds(3, &term(&m.r, Some(150)));
+        }
+        assert!(placement_calls(&m).is_empty(), "{case}");
+    }
+}
