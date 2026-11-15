@@ -587,8 +587,9 @@ fn ended_kind(row: &Map<String, Value>) -> (Kind, String) {
     }
 }
 
-/// The header's counts (#103 B7: a team board holds only the team): live agents by kind in herdr's order, each when not 0
-/// (`0 running` when none lives), then `M ended` (`endedTotal`, else every row not running).
+/// The header's counts (#103 B7: a team board holds only the team): live agents by kind in herdr's order, on call in its
+/// W6 rank (below needs-you, above done), each when not 0 (`0 running` when none lives), then `M ended` (`endedTotal`,
+/// else every row not running).
 fn counts(board: &Map<String, Value>) -> Vec<(String, Style)> {
     let rows: Vec<&Map<String, Value>> = board
         .get("agents")
@@ -597,13 +598,14 @@ fn counts(board: &Map<String, Value>) -> Vec<(String, Style)> {
         .flatten()
         .filter_map(Value::as_object)
         .collect();
-    let mut kinds = [0usize; 4];
+    let mut kinds = [0usize; 5];
     for row in rows.iter().filter(|r| clean(r.get("state")) == "running") {
         kinds[match Kind::live(row) {
             Kind::Blocked => 0,
-            Kind::Done => 1,
-            Kind::Working => 2,
-            _ => 3,
+            Kind::OnCall => 1,
+            Kind::Done => 2,
+            Kind::Working => 3,
+            _ => 4,
         }] += 1;
     }
     let total = board
@@ -611,10 +613,10 @@ fn counts(board: &Map<String, Value>) -> Vec<(String, Style)> {
         .and_then(Value::as_u64)
         .map_or(rows.len() - kinds.iter().sum::<usize>(), |t| t as usize);
     let (words, styles) = (
-        ["need you", "done", "working", "idle"],
-        [hued(Color::Yellow), PLAIN, PLAIN, PLAIN],
+        ["need you", "on call", "done", "working", "idle"],
+        [hued(Color::Yellow), PLAIN, PLAIN, PLAIN, PLAIN],
     );
-    let mut counts: Vec<(String, Style)> = (0..4)
+    let mut counts: Vec<(String, Style)> = (0..5)
         .filter(|&at| kinds[at] > 0)
         .map(|at| (format!("{} {}", kinds[at], words[at]), styles[at]))
         .collect();
@@ -721,7 +723,8 @@ fn live_row(row: &Map<String, Value>, cols: usize, look: Look) -> Live {
 }
 
 /// `mux-agents` bold, then the counts right-aligned when they fit, as herdr counts its sections: `N need you`
-/// (yellow), `N done`, `N working`, `N idle`, each only when not 0 (`0 running` when no agent lives), then `M ended`.
+/// (yellow), `N on call`, `N done`, `N working`, `N idle`, each only when not 0 (`0 running` when no agent lives), then
+/// `M ended`.
 /// Short of room the counts lose their last part, then the next, then the title stands alone.
 fn header(parts: &[(String, Style)], cols: usize) -> Row {
     let title = span("mux-agents", BOLD);
@@ -3106,6 +3109,25 @@ mod tests {
                 "   +4 more  (list -All)".to_string(),
             ]
         );
+    }
+
+    #[test]
+    fn the_header_counts_on_call_apart_in_its_rank() {
+        // W6: on call ranks below needs-you and above done; the header counts it on its own, never as idle.
+        let one = json!({"running": 1, "endedTotal": 0, "agents": [
+            {"name": "b", "state": "running", "age": 5, "unread": 0, "color": "blue", "activity": "on call", "pane": "%1"}
+        ]});
+        assert_eq!(
+            plain(&one, W40)[0],
+            pad("mux-agents", "1 on call / 0 ended")
+        );
+        let mut all = sectioned();
+        all["agents"][2]["activity"] = json!("on call");
+        let words: Vec<String> = counts(all.as_object().unwrap())
+            .into_iter()
+            .map(|(text, _)| text)
+            .collect();
+        assert_eq!(words, ["1 need you", "1 on call", "1 done", "7 ended"]);
     }
 
     #[test]
