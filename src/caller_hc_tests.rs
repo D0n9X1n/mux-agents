@@ -337,7 +337,7 @@ fn real(p: &std::path::Path) -> Option<std::path::PathBuf> {
     })?
 }
 /// Makes `at` a link to `target`, a folder or a file.
-fn link(target: &std::path::Path, at: &std::path::Path) -> std::io::Result<()> {
+pub(crate) fn link(target: &std::path::Path, at: &std::path::Path) -> std::io::Result<()> {
     #[cfg(unix)]
     return std::os::unix::fs::symlink(target, at);
     #[cfg(windows)]

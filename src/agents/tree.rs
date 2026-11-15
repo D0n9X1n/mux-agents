@@ -104,6 +104,32 @@ pub struct Member {
     pub start: i64,
     pub flags: Vec<String>,
 }
+/// proof-0b K2: the launcher and the client, each as (pid, start), of lifecycle member `id`'s active generation,
+/// from K1a only. The id and the generation are plain values before any join (redesign point 3); every file is
+/// read through `gens`, whose walk opens only regular files below real folders (point 8, state-0 S5). Only a
+/// commit that decides Run proves; Unreadable is unproven here, never a refusal.
+fn lifecycle_client(
+    ctx: &Ctx,
+    key: &str,
+    id: &str,
+    record: &Value,
+) -> Option<((u32, i64), (u32, i64))> {
+    use super::gens;
+    use crate::state::evidence::Evidence;
+    if !gens::plain_id(id) {
+        return None;
+    }
+    let n = gens::plain_gen(record.get("generation")?.as_str()?)?;
+    let member = ctx.state_root.join(key).join("agents").join(id);
+    if !matches!(gens::record(&member), Evidence::Present(_)) {
+        return None;
+    }
+    if !gens::committed(&member, n).ok()? {
+        return None;
+    }
+    let proven = gens::client(ctx, &member, n)?;
+    Some((proven.launcher, proven.client))
+}
 /// D1, the one proof: caller > shells only > X, every row readable and no newer than its child. X is the C that member
 /// `id`'s launcher.json recorded, or (Unix only) the native copilot whose parent is that C, the npm loader; C's parent is
 /// the recorded L; both pids and starts match; `t`, M's own terminal by address and labels, shows X, C or L in front.
@@ -121,7 +147,6 @@ pub fn prove_member(
         crate::caller::hc::within_root(&ctx.state_root, &[key, "agents", id, f])
             .and_then(|p| crate::state::fs::read_json(&p).ok().flatten())
     };
-    let launcher = read("launcher.json")?;
     let record = record.clone();
     let pid_start = |v: &Value| {
         Some((
@@ -129,8 +154,12 @@ pub fn prove_member(
             v.get("start")?.as_i64()?,
         ))
     };
-    let ((l_pid, l_start), (c_pid, c_start)) =
-        (pid_start(&launcher)?, pid_start(launcher.get("client")?)?);
+    let ((l_pid, l_start), (c_pid, c_start)) = if super::gens::lifecycle(&record) {
+        lifecycle_client(ctx, key, id, &record)?
+    } else {
+        let launcher = read("launcher.json")?;
+        (pid_start(&launcher)?, pid_start(launcher.get("client")?)?)
+    };
     let identity = super::core_identity::Identity::read(&record, id, team)?;
     if !identity.matches(t) {
         return None;

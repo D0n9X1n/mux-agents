@@ -203,6 +203,51 @@ fn prove(m: &Mw, id: &str, fg: Option<i32>) -> Option<Member> {
     let t = crate::hc::connect(&m.w.ctx).unwrap().get(address).unwrap();
     prove_member(&m.w.ctx, &crate::agents::membership::team(&m.c), id, &r, &t)
 }
+/// K2 fixtures: ID made a lifecycle record of generation `g` (stored options `--model x`; an `hcName` beyond 0, as
+/// A2a Task 4 requires), `reparent()` done, and the folder-level `launcher.json` removed so that only generation
+/// evidence can prove it. The folder-level `spec.json` (`--effort high`) stays, so flags read from it would show.
+fn lifecycle_world(g: u64) -> Mw {
+    let m = member_world();
+    m.reparent();
+    let mut r = m.record(ID);
+    (r["lifecycle"], r["options"], r["generation"]) =
+        (json!(1), json!(["--model", "x"]), json!(g.to_string()));
+    if g > 0 {
+        r["hcName"] = json!("m0123abcd");
+    }
+    write(&m.folder(ID).join("record.json"), r);
+    std::fs::remove_file(m.folder(ID).join("launcher.json")).unwrap();
+    m
+}
+/// Generation `n`'s `launcher.json` (L 31337, start 1000) and `client.json` (C 150, start 1500), published.
+fn evidence(m: &Mw, n: u64) {
+    use crate::{agents::gens::path, state::evidence::publish};
+    let f = m.folder(ID);
+    publish(
+        &path(&f, n, "launcher"),
+        &json!({"pid": 31337, "start": 1000, "startedAt": "x"}),
+    )
+    .unwrap();
+    publish(&path(&f, n, "client"), &json!({"pid": 150, "start": 1500})).unwrap();
+}
+/// Generation `n`'s `commit.json`, published.
+fn commit(m: &Mw, n: u64, body: Value) {
+    crate::state::evidence::publish(
+        &crate::agents::gens::path(&m.folder(ID), n, "commit"),
+        &body,
+    )
+    .unwrap();
+}
+/// `prove_member` over member `id` (the raw string) with the record value `r` passed in, foreground 150; answers the
+/// proof and every path `read_json` was asked to open during the proof call alone.
+fn prove_reads(m: &Mw, id: &str, r: &Value) -> (Option<Member>, Vec<PathBuf>) {
+    let address = r["hcAddress"].as_str().unwrap();
+    cf::online(&m.w);
+    cf::get(&m.w, address, term(r, Some(150)));
+    let t = crate::hc::connect(&m.w.ctx).unwrap().get(address).unwrap();
+    let team = crate::agents::membership::team(&m.c);
+    crate::state::fs::record_reads(|| prove_member(&m.w.ctx, &team, id, r, &t))
+}
 #[test]
 fn a_member_is_proven_by_its_recorded_launcher_and_client() {
     for fg in [150, 31337] {
@@ -1577,6 +1622,9 @@ fn a_lifecycle_member_reports_done_over_its_hook_chain_and_keeps_its_lease() {
     let mut r = m.record(ID);
     (r["lifecycle"], r["options"]) = (json!(1), json!(["--model", "x"]));
     write(&m.folder(ID).join("record.json"), r);
+    // K2: a lifecycle member is proven from its active committed generation's evidence.
+    evidence(&m, 0);
+    commit(&m, 0, json!({"committed": true}));
     m.w.fakes.process(crate::testing::row(77, 1, 770));
     let lease = m.folder(ID).join("waiting-77.json");
     write(
@@ -1717,18 +1765,181 @@ fn a_lifecycle_member_above_the_team_ceiling_is_refused() {
     w.fakes.hc_done().unwrap();
 }
 
+// proof-0b K2: a lifecycle member is proven from its committed generation's client.json alone; neither folder-level
+// launcher.json nor spec.json is read. Without client.json it is unproven.
+#[test]
+fn a_lifecycle_member_is_proven_from_its_committed_generations_client_json() {
+    let m = lifecycle_world(0);
+    std::fs::remove_file(m.folder(ID).join("spec.json")).unwrap();
+    evidence(&m, 0);
+    commit(&m, 0, json!({"committed": true}));
+    let x = prove(&m, ID, Some(150)).expect("proven from client.json alone");
+    assert_eq!(
+        (x.pid, x.start, x.flags.as_slice()),
+        (150, 1500, &["--model".to_string(), "x".into()][..])
+    );
+    std::fs::remove_file(crate::agents::gens::path(&m.folder(ID), 0, "client")).unwrap();
+    assert_eq!(prove(&m, ID, Some(150)), None, "no client.json: unproven");
+    m.w.fakes.hc_done().unwrap();
+}
+
+// K2: only the active generation proves, and only its client. Generation 0 is whole, committed and names this very
+// client, so a proof that read any of it would succeed. The record names generation 1, whose files are all present
+// (so each reads Present): aborted, it proves nothing; committed, it proves; with a client.json naming another
+// process, nothing again.
+#[test]
+fn only_the_active_generation_proves_a_lifecycle_member() {
+    let m = lifecycle_world(1);
+    evidence(&m, 0);
+    commit(&m, 0, json!({"committed": true}));
+    evidence(&m, 1);
+    commit(&m, 1, json!({"aborted": true}));
+    assert_eq!(
+        prove(&m, ID, Some(150)),
+        None,
+        "generation 0's commit never decides generation 1"
+    );
+    std::fs::write(
+        crate::agents::gens::path(&m.folder(ID), 1, "commit"),
+        br#"{"committed":true}"#,
+    )
+    .unwrap();
+    assert!(
+        matches!(prove(&m, ID, Some(150)), Some(x) if x.pid == 150),
+        "generation 1 committed"
+    );
+    std::fs::write(
+        crate::agents::gens::path(&m.folder(ID), 1, "client"),
+        br#"{"pid":152,"start":1500}"#,
+    )
+    .unwrap();
+    assert_eq!(
+        prove(&m, ID, Some(150)),
+        None,
+        "generation 0's client never stands in"
+    );
+    m.w.fakes.hc_done().unwrap();
+}
+
+// K2 through the lifecycle branch: only a commit that decides Run (gens::decide) proves. Absent, aborted, invalid,
+// contradictory and unreadable each leave the member unproven, never refused. The first case is the control.
+#[test]
+fn a_lifecycle_member_is_proven_only_by_a_committed_decision() {
+    for (case, body) in [
+        ("committed", Some(&br#"{"committed":true}"#[..])),
+        ("absent", None),
+        ("aborted", Some(&br#"{"aborted":true}"#[..])),
+        ("invalid", Some(&br#"{"committed":"true"}"#[..])),
+        (
+            "contradictory",
+            Some(&br#"{"committed":true,"aborted":true}"#[..]),
+        ),
+        ("unreadable", Some(&br#"{"comm"#[..])),
+    ] {
+        let m = lifecycle_world(0);
+        evidence(&m, 0);
+        if let Some(bytes) = body {
+            std::fs::write(crate::agents::gens::path(&m.folder(ID), 0, "commit"), bytes).unwrap();
+        }
+        assert_eq!(
+            prove(&m, ID, Some(150)).is_some(),
+            case == "committed",
+            "{case}"
+        );
+        m.w.fakes.hc_done().unwrap();
+    }
+}
+
+// K1a's veto through K2: a committed generation whose exit.json says client-conflict, or is torn, proves nothing,
+// though its launcher.json and client.json name the live pair. A clean exit.json is the control.
+#[test]
+fn a_lifecycle_member_whose_exit_vetoes_its_client_is_unproven() {
+    for (case, bytes) in [
+        ("clean exit", &br#"{"exitCode":0}"#[..]),
+        (
+            "client-conflict",
+            &br#"{"exitCode":1,"reason":"client-conflict"}"#[..],
+        ),
+        ("torn exit", &br#"{"exitC"#[..]),
+    ] {
+        let m = lifecycle_world(0);
+        evidence(&m, 0);
+        commit(&m, 0, json!({"committed": true}));
+        std::fs::write(crate::agents::gens::path(&m.folder(ID), 0, "exit"), bytes).unwrap();
+        assert_eq!(
+            prove(&m, ID, Some(150)).is_some(),
+            case == "clean exit",
+            "{case}"
+        );
+        m.w.fakes.hc_done().unwrap();
+    }
+}
+
+// K1a/K2 for Copilot on generation evidence: client.json names the loader 150 (the launcher's child); the caller's
+// client is its native 155. A native 156 under another loader 160 of the same launcher (start 1500, like 150) is
+// unrelated: only the recorded loader may pair. Unix only, as `copilot_pair` is.
+#[cfg(unix)]
+#[test]
+fn a_lifecycle_copilot_member_is_proven_by_its_pair_only() {
+    for case in ["the pair", "unrelated native"] {
+        let m = lifecycle_world(0);
+        let mut r = m.record(ID);
+        r["client"] = json!("copilot");
+        write(&m.folder(ID).join("record.json"), r);
+        evidence(&m, 0);
+        commit(&m, 0, json!({"committed": true}));
+        m.w.fakes.forget(150);
+        m.w.fakes.process(row(
+            150,
+            31337,
+            1500,
+            "/usr/bin/node",
+            &["node", "/usr/local/bin/copilot"],
+        ));
+        m.w.fakes
+            .process(row(155, 150, 1550, "/opt/copilot/copilot", &["copilot"]));
+        let native = if case == "the pair" { 155 } else { 156 };
+        if case == "unrelated native" {
+            m.w.fakes.process(row(
+                160,
+                31337,
+                1500,
+                "/usr/bin/node",
+                &["node", "/usr/local/bin/copilot"],
+            ));
+            m.w.fakes
+                .process(row(156, 160, 1560, "/opt/copilot/copilot", &["copilot"]));
+        }
+        for pid in [150, 155, 156, 160] {
+            m.w.fakes.client(pid, Client::Copilot);
+        }
+        m.w.fakes.forget(170);
+        m.w.fakes.process(crate::testing::row(170, native, 1700));
+        let got = prove(&m, ID, Some(native as i32));
+        if case == "the pair" {
+            assert!(
+                matches!(got, Some(x) if x.pid == 150 && x.client == Client::Copilot),
+                "{case}"
+            );
+        } else {
+            assert_eq!(got, None, "{case}");
+        }
+        m.w.fakes.hc_done().unwrap();
+    }
+}
+
 // E2: a proven lifecycle member's flags are its stored options, never its spec (`--effort high`); none: unproven.
+// (A2a Task 1's test, moved onto committed generation-0 evidence; both assertions kept.)
 #[test]
 fn a_proven_lifecycle_members_flags_are_its_stored_options() {
-    let m = member_world();
-    m.reparent();
-    let mut r = m.record(ID);
-    (r["lifecycle"], r["options"]) = (json!(1), json!(["--model", "x"]));
-    write(&m.folder(ID).join("record.json"), r.clone());
+    let m = lifecycle_world(0);
+    evidence(&m, 0);
+    commit(&m, 0, json!({"committed": true}));
     assert_eq!(
         prove(&m, ID, Some(150)).map(|x| x.flags),
         Some(vec!["--model".to_string(), "x".into()])
     );
+    let mut r = m.record(ID);
     r.as_object_mut().unwrap().remove("options");
     write(&m.folder(ID).join("record.json"), r);
     assert_eq!(
@@ -1736,5 +1947,158 @@ fn a_proven_lifecycle_members_flags_are_its_stored_options() {
         None,
         "no stored options: unproven"
     );
+    m.w.fakes.hc_done().unwrap();
+}
+
+// K2, point 8: the shared reader opens only regular files reached through real folders. A file or folder link out
+// of the member folder, or a dangling exit.json, proves nothing, and the linked name is never opened. Every OS; the
+// record is passed in, because `prove` would read record.json through its link.
+#[test]
+fn lifecycle_evidence_reached_through_a_link_proves_nothing() {
+    use crate::agents::gens::{dir, path};
+    const GEN: [&str; 4] = ["client.json", "commit.json", "exit.json", "launcher.json"];
+    for case in [
+        "record",
+        "commit",
+        "launcher",
+        "client",
+        "exit",
+        "dangling exit",
+        "gens/0",
+    ] {
+        let m = lifecycle_world(0);
+        evidence(&m, 0);
+        commit(&m, 0, json!({"committed": true}));
+        let f = m.folder(ID);
+        crate::state::evidence::publish(&path(&f, 0, "exit"), &json!({"exitCode": 0})).unwrap();
+        let r = m.record(ID);
+        let (got, reads) = prove_reads(&m, ID, &r);
+        assert!(got.is_some(), "{case}: proven before the link");
+        let mut seen: Vec<_> = reads
+            .iter()
+            .filter_map(|p| p.file_name()?.to_str().map(String::from))
+            .collect();
+        seen.sort();
+        assert_eq!(
+            seen,
+            [
+                "client.json",
+                "commit.json",
+                "exit.json",
+                "launcher.json",
+                "record.json"
+            ],
+            "{case}: the seam"
+        );
+        let (at, never): (PathBuf, Vec<String>) = match case {
+            "record" => (f.join("record.json"), vec!["record.json".into()]),
+            "gens/0" => (dir(&f, 0), GEN.iter().map(|n| n.to_string()).collect()),
+            "dangling exit" => (path(&f, 0, "exit"), vec!["exit.json".into()]),
+            file => (path(&f, 0, file), vec![format!("{file}.json")]),
+        };
+        let outside = crate::testing::TempDir::new();
+        let moved = outside.path().join(at.file_name().unwrap());
+        std::fs::rename(&at, &moved).unwrap();
+        if let Err(e) = crate::caller_hc_tests::link(&moved, &at) {
+            assert!(
+                std::env::var_os("CI").is_none(),
+                "{case}: CI must make links: {e}"
+            );
+            eprintln!("{case}: skipped, no link: {e}");
+            m.w.fakes.hc_done().unwrap();
+            continue;
+        }
+        if case == "dangling exit" {
+            std::fs::remove_file(&moved).unwrap();
+        }
+        let (got, reads) = prove_reads(&m, ID, &r);
+        assert_eq!(got, None, "{case}: unproven");
+        for n in &never {
+            let opened = reads
+                .iter()
+                .any(|p| p.file_name().is_some_and(|x| x == n.as_str()));
+            assert!(!opened, "{case}: {n} opened through the link: {reads:?}");
+        }
+        m.w.fakes.hc_done().unwrap();
+    }
+}
+
+// K2, point 8: a FIFO at commit, launcher, client or exit leaves the member unproven and is never opened. Bounded:
+// the fakes hold `Rc`, so the proof runs on this thread, and a watchdog thread releases a reader blocked on the FIFO
+// after 2 s (a non-blocking writer open; with no reader it fails at once, so the watchdog never blocks either).
+#[cfg(unix)]
+#[test]
+fn a_fifo_in_place_of_lifecycle_evidence_proves_nothing_and_is_never_opened() {
+    use std::os::unix::{ffi::OsStrExt, fs::OpenOptionsExt};
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
+    use std::time::{Duration, Instant};
+    for file in ["commit", "launcher", "client", "exit"] {
+        let m = lifecycle_world(0);
+        evidence(&m, 0);
+        commit(&m, 0, json!({"committed": true}));
+        let at = crate::agents::gens::path(&m.folder(ID), 0, file);
+        let _ = std::fs::remove_file(&at);
+        let c = std::ffi::CString::new(at.as_os_str().as_bytes()).unwrap();
+        assert_eq!(
+            unsafe { libc::mkfifo(c.as_ptr(), 0o600) },
+            0,
+            "{file}: mkfifo"
+        );
+        let done = Arc::new(AtomicBool::new(false));
+        let (stop, fifo) = (done.clone(), at.clone());
+        let dog = std::thread::spawn(move || {
+            let start = Instant::now();
+            while !stop.load(Ordering::SeqCst) {
+                if start.elapsed() > Duration::from_secs(2) {
+                    let _ = std::fs::OpenOptions::new()
+                        .write(true)
+                        .custom_flags(libc::O_NONBLOCK)
+                        .open(&fifo);
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        });
+        let r = m.record(ID);
+        let begun = Instant::now();
+        let (got, reads) = prove_reads(&m, ID, &r);
+        done.store(true, Ordering::SeqCst);
+        dog.join().unwrap();
+        let name = format!("{file}.json");
+        let opened = reads
+            .iter()
+            .any(|p| p.file_name().is_some_and(|x| x == name.as_str()));
+        assert!(!opened, "{file}: the FIFO was opened: {reads:?}");
+        assert_eq!(got, None, "{file}: unproven");
+        assert!(
+            begun.elapsed() < Duration::from_secs(2),
+            "{file}: the proof blocked"
+        );
+        m.w.fakes.hc_done().unwrap();
+    }
+}
+
+// Point 3: the id and the generation are plain values before any path is joined; a refused value reads nothing,
+// the record included. The raw id strings go in as they are. The point-8 walk starts at the member folder, so
+// `./<ID>` would read ID's own evidence: only the plain-id check refuses it. `"00"` would name gens/0.
+#[test]
+fn a_lifecycle_proof_refuses_ids_and_generations_that_are_not_plain_before_reading() {
+    let m = lifecycle_world(0);
+    evidence(&m, 0);
+    commit(&m, 0, json!({"committed": true}));
+    let r = m.record(ID);
+    let mut zero = r.clone();
+    zero["generation"] = json!("00");
+    for (case, id, rec) in [
+        ("interior dot", format!("./{ID}"), &r),
+        ("climbing", format!("../agents/{ID}"), &r),
+        ("generation 00", ID.to_string(), &zero),
+    ] {
+        let (got, reads) = prove_reads(&m, &id, rec);
+        assert_eq!(got, None, "{case}");
+        assert!(reads.is_empty(), "{case}: nothing read: {reads:?}");
+    }
     m.w.fakes.hc_done().unwrap();
 }
