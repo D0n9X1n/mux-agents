@@ -374,7 +374,7 @@ const REFUSED = (check: string) => JSON.stringify({ ok: false, verb: 'read', cod
 test('a team member in an hc terminal is eligible, proven once by read -Count', async ($, on) => {
   const w = world(on, { HC_TERMINAL_ID: 't7' }, [ran(0, COUNT_OF(true)), ran(0, LIST)])
   expect(await gated($, w)).toEqual({ answered: 'Agents pane opened.', registered: 1, opened: 2, runs: 5 })
-  expect(w.seen.argv[0].slice(-2)).toEqual(['read', '-Count'])
+  expect(w.seen.argv[0]?.slice(-2)).toEqual(['read', '-Count'])
   expect(w.seen.argv.slice(1).every(a => a.at(-1) === '-All')).toBe(true)
 })
 
@@ -382,7 +382,7 @@ for (const [what, reply] of [['a plain herdr terminal', ran(2, REFUSED('herdr'))
   test(`${what} in an hc terminal is not eligible, and asks once`, async ($, on) => {
     const w = world(on, { HC_TERMINAL_ID: 't7' }, [reply, ran(0, LIST)])
     expect(await gated($, w)).toEqual({ ...SKIPPED, runs: 1 })
-    expect(w.seen.argv[0].slice(-2)).toEqual(['read', '-Count'])
+    expect(w.seen.argv[0]?.slice(-2)).toEqual(['read', '-Count'])
   })
 }
 
