@@ -589,17 +589,31 @@ impl Server {
 
     /// Has fake client `pid` run mux-agent with `args`; answers the exit code and the JSON reply.
     pub fn command(&mut self, pid: u64, args: &[&str]) -> (i32, Value) {
-        let n = self.replies.entry(pid).or_default();
-        *n += 1;
-        let n = *n;
-        write_atomic(
-            &self.dir.join(format!("cmd.{pid}")),
-            format!("{}\n", args.join("\t")),
-        );
+        let n = self.post(pid, args);
+        self.collect(pid, n)
+    }
+
+    /// Posts a command to fake client `pid` without waiting (once it took the previous one); its reply number.
+    pub fn post(&mut self, pid: u64, args: &[&str]) -> u32 {
+        let n = {
+            let n = self.replies.entry(pid).or_default();
+            *n += 1;
+            *n
+        };
+        let cmd = self.dir.join(format!("cmd.{pid}"));
+        self.wait(&format!("client {pid} took its last command"), || {
+            (!cmd.exists()).then_some(())
+        });
+        write_atomic(&cmd, format!("{}\n", args.join("\t")));
+        n
+    }
+
+    /// The reply of command `n` posted to `pid`.
+    pub fn collect(&self, pid: u64, n: u32) -> (i32, Value) {
         let stdout = self.wait_file(&format!("reply.{pid}.{n}.json"));
         let code = std::fs::read_to_string(self.dir.join(format!("reply.{pid}.{n}.code"))).unwrap();
         let reply = serde_json::from_str(&stdout)
-            .unwrap_or_else(|e| panic!("{:?} {args:?}: {e}: {stdout:?}", self.mux));
+            .unwrap_or_else(|e| panic!("{:?} reply {n} of {pid}: {e}: {stdout:?}", self.mux));
         (code.trim().parse().unwrap(), reply)
     }
 

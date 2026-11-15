@@ -5229,6 +5229,160 @@ hc {}:
         let (_, stale) = live.by(&a, &["read", "-Ack", s(&pending["batch"])]);
         assert_eq!(stale["check"], "ack", "{mux:?} another owner cannot ack it");
     }
+
+    fn activity_of(live: &mut Live, name: &str) -> String {
+        let (_, l) = live.run(&["list", "-All"]);
+        l["agents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|a| a["name"] == name)
+            .map_or(String::new(), |a| s(&a["activity"]).to_string())
+    }
+
+    #[test]
+    fn a_copilot_member_reports_done_then_listens_on_call() {
+        for mux in Mux::ALL {
+            let Some(mut live) = Live::human(mux) else {
+                continue;
+            };
+            for (f, t) in [
+                ("brief.md", "brief"),
+                ("task.txt", "say hi"),
+                ("body.md", "nonce-7f3a"),
+            ] {
+                std::fs::write(live.dir.join(f), t).unwrap();
+            }
+            let (body, task, brief) = (
+                live.path("body.md"),
+                live.path("task.txt"),
+                live.path("brief.md"),
+            );
+            let (_, up) = live.run(&["up", "-Client", "claude"]);
+            let leader = s(&up["leader"]["id"]).to_string();
+            let a = s(&live.spawn_by(&leader, "a").1["id"]).to_string();
+            let lp = live.client_of(&leader);
+            let (code, r) = live.server.command(
+                lp,
+                &[
+                    "spawn",
+                    "-Client",
+                    "copilot",
+                    "-TaskFile",
+                    &task,
+                    "-BriefFile",
+                    &brief,
+                    "-Context",
+                    "brief",
+                    "-Name",
+                    "b",
+                ],
+            );
+            assert_eq!(code, 0, "{mux:?} {r}");
+            let b = s(&r["id"]).to_string();
+            let bp = live.client_of(&b);
+            // W5: done first, then listening; the bar shows on call.
+            assert_eq!(
+                live.by(&b, &["report", "done"]).1["state"],
+                "done",
+                "{mux:?}"
+            );
+            let n = live.server.post(bp, &["@bg read", "-Wait", "600"]);
+            assert!(
+                eventually(Duration::from_secs(10), || activity_of(&mut live, "b")
+                    == "on call"),
+                "{mux:?}"
+            );
+            // A sends and exits; the wait returns the batch.
+            assert_eq!(live.by(&a, &["send", "b", "-BodyFile", &body]).0, 0);
+            std::fs::write(live.dir.join(format!("quit.{}", live.client_of(&a))), "0").unwrap();
+            let (_, got) = live.server.collect(bp, n);
+            assert!(s(&got["text"]).contains("nonce-7f3a"), "{mux:?} {got}");
+            // Re-armed with -Ack; a timeout re-arms; -Cancel ends a running wait and holds until new mail.
+            let (_, t) = live.by(&b, &["read", "-Wait", "1", "-Ack", s(&got["batch"])]);
+            assert_eq!(
+                (&t["acked"], &t["timeout"]),
+                (&json!(true), &json!(true)),
+                "{mux:?} {t}"
+            );
+            let n = live.server.post(bp, &["@bg read", "-Wait", "600"]);
+            assert!(eventually(Duration::from_secs(10), || activity_of(
+                &mut live, "b"
+            ) == "on call"));
+            assert_eq!(live.by(&b, &["read", "-Cancel"]).1["cancelled"], true);
+            assert_eq!(
+                live.server.collect(bp, n).1["cancelled"],
+                true,
+                "{mux:?} cancel during a wait"
+            );
+            assert_eq!(
+                live.by(&b, &["read", "-Wait", "600"]).1["cancelled"],
+                true,
+                "{mux:?} no re-arm until new mail"
+            );
+            assert!(eventually(Duration::from_secs(10), || activity_of(
+                &mut live, "b"
+            ) != "on call"));
+            // Failure matrix, as the plugin drives the CLI.
+            assert_eq!(live.by(&leader, &["send", "b", "-BodyFile", &body]).0, 0);
+            let (_, d1) = live.by(&b, &["read", "-Deliver"]); // stripped block, unforwarded echo, drop: no -Ack follows
+            let (_, d2) = live.by(&b, &["read", "-Deliver"]);
+            assert_eq!(d1["batch"], d2["batch"], "{mux:?} re-served, never lost");
+            let mail = live.keyed().join("mail");
+            std::fs::write(mail.join("fault-file"), "").unwrap(); // failed ack
+            assert_eq!(
+                live.by(&b, &["read", "-Ack", s(&d1["batch"])]).1["check"],
+                "mail",
+                "{mux:?}"
+            );
+            assert_eq!(
+                live.by(&b, &["read", "-Deliver"]).1["batch"],
+                d1["batch"],
+                "{mux:?} the receipt stands"
+            );
+            std::fs::write(mail.join("fault-folder"), "").unwrap(); // uncertain ack (4b-i R5)
+            assert_eq!(
+                live.by(&b, &["read", "-Ack", s(&d1["batch"])]).1["check"],
+                "mail",
+                "{mux:?}"
+            );
+            assert_eq!(
+                live.by(&b, &["read", "-Ack", s(&d1["batch"])]).1["duplicate"],
+                true,
+                "{mux:?} retired"
+            );
+            // A tagged hook: a process holding the terminal id of b, outside its client chain, outside tmux/rmux.
+            let addr =
+                s(&json_file(&live.agent_dir(&b).join("record.json"))["hcAddress"]).to_string();
+            let (code, out, _) = live.server.run_raw(
+                env!("CARGO_BIN_EXE_mux-agent"),
+                &["read", "-Count"],
+                &[("HC_TERMINAL_ID", addr.as_str())],
+                &["TMUX", "RMUX"],
+            );
+            assert_eq!((code, out.contains("tagged")), (2, true), "{mux:?} {out}");
+            // Owner change mid-delivery: a resumed b is a new owner; the old receipt is stale for it.
+            live.by(&leader, &["send", "b", "-BodyFile", &body]);
+            let (_, old) = live.by(&b, &["read", "-Deliver"]);
+            let sid =
+                s(&json_file(&live.agent_dir(&b).join("record.json"))["sessionId"]).to_string();
+            let before = live.client_of(&b);
+            live.by(&leader, &["stop", "b"]);
+            live.by(&leader, &["resume", "b"]);
+            let b2 = live.successor(&sid, before);
+            assert_ne!(b2, before, "{mux:?} a new process");
+            let (_, stale) = live.server.command(b2, &["read", "-Ack", s(&old["batch"])]);
+            assert_eq!(stale["check"], "ack", "{mux:?}");
+            // No keystrokes reached any terminal: no pane shows the nonce or a notice.
+            for pane in live.panes("#{pane_id}") {
+                let screen = live.call(&["capture-pane", "-p", "-t", &pane]);
+                assert!(
+                    !screen.contains("nonce-7f3a") && !screen.contains("mail from"),
+                    "{mux:?} {pane}: {screen}"
+                );
+            }
+        }
+    }
 }
 
 #[cfg(unix)]
