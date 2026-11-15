@@ -7,12 +7,23 @@ pub fn generation(g: &str) -> bool {
         && g.bytes()
             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b"-_".contains(&b))
 }
+/// launch-1 G2: `m` and 8 lowercase hex digits, the shape of a generation-0 name (`m` and the first 8 of the id)
+/// and of each new generation name (`m` and 8 random hex digits, A3 Task 9).
+pub fn is_hc_name(name: &str) -> bool {
+    name.len() == 9
+        && name.strip_prefix("m").is_some_and(|hex| {
+            hex.bytes()
+                .all(|b| b.is_ascii_digit() || b"abcdef".contains(&b))
+        })
+}
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Identity {
     pub id: String,
     pub name: String,
     pub address: String,
     pub generation: String,
+    /// The hc name of the generation (G2): hcName; for generation 0 without one, m and the first 8 of the id.
+    pub hc_name: String,
     pub team: String,
     pub session_id: String,
     pub launcher: Vec<String>,
@@ -45,6 +56,12 @@ impl Identity {
             name: s("name")?.into(),
             address: s("hcAddress")?.into(),
             generation: s("generation")?.into(),
+            hc_name: match (r.get("hcName"), s("generation")?) {
+                // G2: only an existing generation-0 terminal keeps the derived name.
+                (None, "0") => format!("m{}", &id[..8]),
+                (None, _) => return None,
+                (Some(v), _) => v.as_str().filter(|n| is_hc_name(n))?.to_owned(),
+            },
             team: team.into(),
             session_id: s("sessionId")?.into(),
             launcher,
@@ -70,6 +87,7 @@ impl Identity {
             name: s("name")?.into(),
             address: String::new(),
             generation: "0".into(),
+            hc_name: format!("m{}", &id[..8]),
             team: team.into(),
             session_id: s("sessionId")?.into(),
             launcher: Vec::new(),
@@ -226,5 +244,74 @@ pub(crate) mod tests {
         let mut dead = row;
         dead.dead = true;
         assert!(id.view(&r, &[dead]).is_none());
+    }
+
+    #[test]
+    fn a_generation_carries_its_hc_name() {
+        let mut r = record();
+        let id = "aaaaaaaaaaaa";
+        assert_eq!(
+            Identity::read(&r, id, "k:$3").unwrap().hc_name,
+            "maaaaaaaa",
+            "generation 0: m and id[..8]"
+        );
+        r["hcName"] = json!("m0123abcd");
+        r["generation"] = json!("1");
+        let i = Identity::read(&r, id, "k:$3").unwrap();
+        assert_eq!(
+            (i.hc_name.as_str(), i.generation.as_str()),
+            ("m0123abcd", "1")
+        );
+        for bad in [
+            json!("m0123ABCD"),
+            json!("m0123abcg"),
+            json!("M0123abcd"),
+            json!("m0123abc"),
+            json!("m0123abcde"),
+            json!("x0123abcd"),
+            json!("../x"),
+            json!(""),
+            json!(null),
+            json!(7),
+        ] {
+            r["hcName"] = bad.clone();
+            assert!(Identity::read(&r, id, "k:$3").is_none(), "{bad}");
+        }
+        let mut p = record();
+        for k in ["hcAddress", "generation", "launcherArgv", "team"] {
+            p.as_object_mut().unwrap().remove(k);
+        }
+        p["resumedFrom"] = json!("bbbbbbbbbbbb");
+        assert_eq!(
+            Identity::pending(&p, id, "k:$3").unwrap().hc_name,
+            "maaaaaaaa"
+        );
+    }
+
+    // G2: only an existing generation-0 terminal keeps the derived name; a later generation must carry its own.
+    #[test]
+    fn a_later_generation_without_its_hc_name_is_refused() {
+        let id = "aaaaaaaaaaaa";
+        for g in ["1", "2", "10"] {
+            let mut r = record();
+            r["generation"] = json!(g);
+            assert!(
+                Identity::read(&r, id, "k:$3").is_none(),
+                "generation {g}: no invented name"
+            );
+            r["hcName"] = json!("m0123abcd");
+            assert_eq!(
+                Identity::read(&r, id, "k:$3").unwrap().hc_name,
+                "m0123abcd",
+                "generation {g}"
+            );
+        }
+        let mut r = record();
+        r["hcName"] = json!("m0123abcd");
+        assert_eq!(
+            Identity::read(&r, id, "k:$3").unwrap().hc_name,
+            "m0123abcd",
+            "a recorded name wins at 0 too"
+        );
     }
 }
