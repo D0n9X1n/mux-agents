@@ -1431,3 +1431,114 @@ fn notices_are_opt_in_and_one_per_recipient() {
         "authority"
     );
 }
+
+#[test]
+fn the_warning_comes_before_any_notice_even_with_a_concurrent_sender() {
+    use std::sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering::SeqCst},
+    };
+    let w = team_world();
+    let locks = w.ctx.state_root.parent().unwrap().join("locks");
+    w.fakes.real_locks(&locks);
+    let log = Arc::new(Mutex::new(Vec::<String>::new()));
+    let on = Arc::new(AtomicBool::new(false));
+    let (l, o) = (log.clone(), on.clone());
+    w.fakes.mux_script("set-option", move |_| {
+        l.lock().unwrap().push("set".into());
+        o.store(true, SeqCst);
+        Ok(crate::mux::Output {
+            code: 0,
+            stdout: String::new(),
+            stderr: String::new(),
+        })
+    });
+    let state = w.ctx.state_root.clone();
+    let mut sender = None;
+    let (l, o) = (log.clone(), on.clone());
+    let mut warn = |text: &str| {
+        l.lock().unwrap().push(format!("warn {text}"));
+        let (l, o, state, locks) = (l.clone(), o.clone(), state.clone(), locks.clone());
+        sender = Some(std::thread::spawn(move || {
+            sender_thread(state, locks, l, o)
+        }));
+        // The sender now waits on the team lock that notify holds.
+        std::thread::sleep(std::time::Duration::from_millis(300));
+    };
+    crate::agents::message::notify_as(
+        &w.ctx,
+        &w.caller(),
+        &w.request(&["notify", "-On"]),
+        &mut warn,
+    )
+    .unwrap();
+    sender.take().unwrap().join().unwrap();
+    let mut want = vec![format!("warn {}", crate::agents::message::DRAFT_WARNING)];
+    want.extend(["set", "notice", "notice"].map(String::from));
+    assert_eq!(
+        *log.lock().unwrap(),
+        want,
+        "the warning is printed before notices can be on"
+    );
+}
+
+/// A concurrent sender on the same state and real locks: it sends to `team` once notify releases the team lock.
+fn sender_thread(
+    state: PathBuf,
+    locks: PathBuf,
+    log: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    on: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) {
+    let mut v = World::human("");
+    v.ctx.state_root = state;
+    v.fakes.real_locks(&locks);
+    v.fakes.mux_script("show-options", move |_| {
+        let now = if on.load(std::sync::atomic::Ordering::SeqCst) {
+            "on"
+        } else {
+            "off"
+        };
+        Ok(crate::mux::Output {
+            code: 0,
+            stdout: format!("{now}\n"),
+            stderr: String::new(),
+        })
+    });
+    let l = log.clone();
+    v.fakes.hc_probe(move |argv| {
+        if argv.first().map(String::as_str) == Some("send") {
+            l.lock().unwrap().push("notice".into());
+        }
+    });
+    online(&v);
+    cf::online(&v);
+    for t in [B, LEADER] {
+        cf::answer(
+            &v,
+            &[
+                "send",
+                &format!("t{t}"),
+                "mail from ma1: run mux-agent read",
+                "--json",
+            ],
+            "{}",
+        );
+    }
+    go(&v, Some(A), &["send", "team", "-Body", "x"]).unwrap();
+}
+
+#[test]
+fn a_failed_set_option_refuses_on_and_off() {
+    for flag in ["-On", "-Off"] {
+        let w = team_world();
+        w.fakes.mux_rule("set-option", 1, "", "no server running");
+        let r = crate::agents::message::notify_as(
+            &w.ctx,
+            &w.caller(),
+            &w.request(&["notify", flag]),
+            &mut |_: &str| {},
+        );
+        assert!(r.is_err(), "{flag}: {r:?}");
+        assert_eq!(r.unwrap_err().check, "notify", "{flag}");
+    }
+}
