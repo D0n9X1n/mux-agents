@@ -538,3 +538,15 @@ fn every_folder_above_the_leader_record_is_flushed_before_hc_run() {
         );
     }
 }
+
+// S6: up publishes its release marker whole, as {}, never as an empty file.
+#[test]
+fn up_publishes_a_whole_release_marker() {
+    let w = ready();
+    claude(&w).unwrap();
+    let bodies: Vec<Vec<u8>> = std::fs::read_dir(w.ctx.state_root.join("up"))
+        .unwrap()
+        .map(|e| std::fs::read(e.unwrap().path()).unwrap())
+        .collect();
+    assert_eq!(bodies, [b"{}".to_vec()]);
+}

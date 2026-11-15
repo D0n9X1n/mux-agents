@@ -110,7 +110,9 @@ fn create(ctx: &Ctx, caller: &Caller, core: &Core<'_>, plan: &Plan<'_>) -> Res<M
     // write fails, the session may stay: the refusal names it.
     let step2 = Cell::new(false);
     let fail = |mut e: Refusal| {
-        if std::fs::write(&release, b"").is_err() || !step2.get() {
+        if crate::state::evidence::publish(&release, &serde_json::json!({})).is_err()
+            || !step2.get()
+        {
             e.leftover = Some(name.clone());
         }
         e
@@ -212,7 +214,7 @@ fn layout(
     view: &str,
     reply: &mut Map<String, Value>,
 ) -> Res<()> {
-    let wrote = std::fs::write(release, b"");
+    let wrote = crate::state::evidence::publish(release, &serde_json::json!({})).map(|_| ());
     crate::sidebar::keep(ctx, dest, view, reply);
     wrote?;
     server::same(ctx, dest)?;

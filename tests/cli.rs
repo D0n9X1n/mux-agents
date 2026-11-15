@@ -416,7 +416,14 @@ fn hold_runs_until_its_release_file() {
         .unwrap();
     sleep(Duration::from_millis(600));
     assert!(child.try_wait().unwrap().is_none());
+    // An empty or torn release is not a whole file: hold keeps waiting (#103 state-0 S6).
     std::fs::write(&release, "").unwrap();
+    sleep(Duration::from_millis(600));
+    assert!(
+        child.try_wait().unwrap().is_none(),
+        "an empty release ended the wait"
+    );
+    std::fs::write(&release, "{}").unwrap();
     let at = Instant::now();
     while child.try_wait().unwrap().is_none() {
         assert!(at.elapsed() < Duration::from_secs(1));

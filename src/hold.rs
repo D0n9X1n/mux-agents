@@ -10,7 +10,11 @@ pub const LIMIT: Duration = Duration::from_secs(600);
 
 pub fn wait(release: &Path, clock: &dyn Clock, limit: Duration) {
     let (mut waited, mut last) = (Duration::ZERO, clock.now());
-    while !release.exists() && waited < limit {
+    while !matches!(
+        crate::state::evidence::read(release),
+        crate::state::evidence::Evidence::Present(_)
+    ) && waited < limit
+    {
         clock.sleep(POLL);
         let now = clock.now();
         waited += now.duration_since(last).unwrap_or_default().max(POLL);
@@ -48,9 +52,12 @@ mod tests {
         let release = d.path().join("r.release");
         wait(&release, ctx.clock.as_ref(), Duration::from_secs(1));
         assert_eq!(fakes.slept().len(), 5);
-        std::fs::write(&release, "").unwrap();
+        std::fs::write(&release, b"{").unwrap();
+        wait(&release, ctx.clock.as_ref(), Duration::from_secs(1));
+        assert_eq!(fakes.slept().len(), 10, "a torn release keeps it waiting");
+        std::fs::write(&release, b"{}").unwrap();
         wait(&release, ctx.clock.as_ref(), LIMIT);
-        assert_eq!(fakes.slept().len(), 5);
+        assert_eq!(fakes.slept().len(), 10);
         assert_eq!(
             main(&["hold".into(), "relative".into()], ctx.clock.as_ref()),
             None
