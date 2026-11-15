@@ -307,6 +307,28 @@ mod tests {
         assert_eq!(w.fakes.locks(), want);
     }
 
+    // S3: a refusing replay hook runs no body and patches nothing; its refusal is the answer.
+    #[test]
+    fn a_refusing_hook_runs_no_body_and_patches_nothing() {
+        fn hook(_: &Tx<'_>) -> Res<()> {
+            Err(evidence::unreadable())
+        }
+        let (w, s) = world();
+        open(&w.ctx, &s, |tx| tx.create(ID, json!({"generation": "0"}))).unwrap();
+        let at = w.folder(ID).join("record.json");
+        let before = std::fs::read(&at).unwrap();
+        let ran = Cell::new(false);
+        test_hook(Some(hook));
+        let got = open(&w.ctx, &s, |tx| {
+            ran.set(true);
+            tx.patch(ID, &[("generation", json!("1"))], &[]).map(|_| ())
+        });
+        test_hook(None);
+        assert_eq!(got.map_err(|e| e.check), Err("evidence"));
+        assert!(!ran.get(), "the body ran");
+        assert_eq!(std::fs::read(&at).unwrap(), before);
+    }
+
     fn member_locked(w: &World, s: &Scope, f: impl FnOnce(&Tx<'_>) -> Res<()>) -> Vec<String> {
         w.fakes.clear_log();
         open(&w.ctx, s, f).unwrap();
