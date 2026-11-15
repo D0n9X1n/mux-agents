@@ -852,7 +852,7 @@ mod tests {
             run(&w, send, &["send", "parent", "-Body", "x"]),
             "2 usage agents pass free text only in files: use -BodyFile"
         );
-        let usage = "2 usage usage: mux-agent send <name|parent|%pane> (-Body <text> | -BodyFile <path>) [-Text]";
+        let usage = "2 usage usage: mux-agent send <name|parent|leader|children|team|%pane> (-Body <text> | -BodyFile <path>) [-Id <id>] [-Text]";
         w.file("b.md", b"ok");
         w.fakes.clear_log();
         assert_eq!(run(&w, send, &["send", "parent"]), usage);

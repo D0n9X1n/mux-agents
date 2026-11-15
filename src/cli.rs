@@ -105,11 +105,11 @@ pub static VERBS: &[VerbDef] = &[
     },
     VerbDef {
         name: "send",
-        values: &["Body", "BodyFile"],
+        values: &["Body", "BodyFile", "Id"],
         switches: &[],
         min: 1,
         max: 1,
-        usage: "usage: mux-agent send <name|parent|%pane> (-Body <text> | -BodyFile <path>) [-Text]",
+        usage: "usage: mux-agent send <name|parent|leader|children|team|%pane> (-Body <text> | -BodyFile <path>) [-Id <id>] [-Text]",
         handler: crate::agents::message::send,
         text: json::lines,
     },
@@ -473,6 +473,21 @@ mod tests {
             Ok((_, request)) => panic!("parsed: {request:?}"),
             Err(refusal) => (refusal.code, refusal.check),
         }
+    }
+
+    #[test]
+    fn send_takes_id_and_re() {
+        let args = |v: &[&str]| v.iter().map(|a| a.to_string()).collect::<Vec<_>>();
+        let p = parse(&args(&[
+            "send",
+            "leader",
+            "-Body",
+            "x",
+            "-Id",
+            "0123456789abcdef",
+        ]));
+        assert!(p.is_ok(), "send takes -Id: {:?}", p.as_ref().err());
+        assert_eq!(p.unwrap().1.value("Id"), Some("0123456789abcdef"));
     }
 
     #[test]

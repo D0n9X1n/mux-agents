@@ -575,3 +575,99 @@ fn a_pane_proven_member_routes_through_the_team() {
     );
     assert_eq!(inbox(&w, LEADER)[0]["fromBox"], A);
 }
+
+#[test]
+fn a_failed_send_is_finished_by_its_id_to_its_original_recipients() {
+    let w = team_world();
+    online(&w);
+    let leader = w.state().join("mail").join(format!("{LEADER}.jsonl"));
+    std::fs::create_dir_all(leader.parent().unwrap()).unwrap();
+    crate::state::fs::fail_sync_file(Some(&leader));
+    let e = go(&w, Some(A), &["send", "team", "-Body", "hi"]).unwrap_err();
+    crate::state::fs::fail_sync_file(None);
+    assert_eq!(
+        (e.code, e.check, e.details["delivered"].clone()),
+        (1, "mail", json!(["mb2"])),
+        "B is first by id"
+    );
+    let id = e.details["id"].as_str().unwrap().to_string();
+    assert_eq!(
+        e.message,
+        format!("the message could not be saved; retry with -Id {id}")
+    );
+    cf::member(
+        &w,
+        C,
+        json!({"name": "mc3", "depth": 1, "parentAgent": {"id": LEADER}, "pane": "%8", "window": "@1"}),
+    );
+    online(&w);
+    assert_eq!(
+        go(&w, Some(A), &["send", "team", "-Body", "hi", "-Id", &id]).unwrap()["id"],
+        id.as_str()
+    );
+    assert_eq!(
+        (
+            inbox(&w, LEADER).len(),
+            inbox(&w, B).len(),
+            inbox(&w, C).len()
+        ),
+        (1, 1, 0),
+        "one copy each, originals only"
+    );
+    assert_eq!(a_sends(&w), 1, "no new intent");
+}
+
+#[test]
+fn an_id_must_be_this_send() {
+    let w = team_world();
+    online(&w);
+    let id = go(&w, Some(A), &["send", "leader", "-Body", "hi"]).unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let cases = [
+        (
+            A,
+            "changed",
+            id.clone(),
+            "2 id that id belongs to a different send",
+        ),
+        (
+            B,
+            "hi",
+            id.clone(),
+            "2 id that id belongs to a different send",
+        ),
+        (
+            A,
+            "hi",
+            "ffffffffffffffff".to_string(),
+            "2 id no send with that id",
+        ),
+    ];
+    for (who, body, idv, want) in cases {
+        online(&w);
+        assert_eq!(
+            said(
+                go(
+                    &w,
+                    Some(who),
+                    &["send", "leader", "-Body", body, "-Id", &idv]
+                )
+                .unwrap_err()
+            ),
+            want,
+            "{who} {body}"
+        );
+    }
+    for bad in ["xyz", "ABCDEF12", "1234567", "g0000000"] {
+        assert_eq!(
+            go(&w, Some(A), &["send", "leader", "-Body", "x", "-Id", bad])
+                .unwrap_err()
+                .check,
+            "usage",
+            "{bad}"
+        );
+    }
+    assert_eq!(inbox(&w, LEADER).len(), 1);
+}
