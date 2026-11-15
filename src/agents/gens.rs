@@ -122,6 +122,51 @@ pub fn committed(member: &Path, n: u64) -> Res<bool> {
         .is_some_and(|c| c.get("committed") == Some(&Value::Bool(true))))
 }
 
+/// The client a generation proved (proof-0b K1a): the recorded launcher and the process it started, each as
+/// (pid, start).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Proven {
+    pub launcher: (u32, i64),
+    pub client: (u32, i64),
+}
+
+fn pid_start(v: &Value) -> Option<(u32, i64)> {
+    Some((
+        u32::try_from(v.get("pid")?.as_u64()?).ok()?,
+        v.get("start")?.as_i64()?,
+    ))
+}
+
+/// proof-0b K1a, the one accessor of the client of generation `n`: `client.json` Present; `exit.json` Absent or
+/// Present without `client-conflict`; `launcher.json` Present; the client and the launcher both live, each with its
+/// recorded start both as opened and as listed; the client a child of that launcher. Anything else, `Unreadable`
+/// included, is unproven (None): the generation stays reserved and caller proof refuses. Liveness alone is never
+/// enough.
+pub fn client(ctx: &crate::ctx::Ctx, member: &Path, n: u64) -> Option<Proven> {
+    let Evidence::Present(c) = read(member, n, "client") else {
+        return None;
+    };
+    match read(member, n, "exit") {
+        Evidence::Absent => {}
+        Evidence::Present(e)
+            if e.get("reason").and_then(Value::as_str) != Some("client-conflict") => {}
+        _ => return None,
+    }
+    let Evidence::Present(l) = read(member, n, "launcher") else {
+        return None;
+    };
+    let (launcher, client) = (pid_start(&l)?, pid_start(&c)?);
+    let live = |(pid, start): (u32, i64)| {
+        let row = ctx.os.row(pid)?;
+        let opened = ctx.os.open(pid)?;
+        (ctx.os.same_start(opened.start, start)
+            && row.start.is_some_and(|s| ctx.os.same_start(s, start)))
+        .then_some(row)
+    };
+    let (l_row, c_row) = (live(launcher)?, live(client)?);
+    (c_row.ppid == l_row.pid).then_some(Proven { launcher, client })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -265,5 +310,135 @@ mod tests {
         publish(&path(&m, 1, "ended"), &json!({})).unwrap();
         std::fs::write(m.join("record.json"), b"{").unwrap();
         assert_eq!(done(&m, 1).map_err(|e| e.check), Err("evidence"));
+    }
+}
+
+#[cfg(test)]
+mod client_tests {
+    use super::*;
+    use crate::state::evidence::publish;
+    use crate::testing::{Fakes, TempDir, row, unknown_start};
+    use serde_json::json;
+
+    // Launcher 500 (start 1000) and its child 600 (start 1500); generation 1 has its launcher.json.
+    fn world() -> (Fakes, crate::ctx::Ctx, TempDir, PathBuf) {
+        let fakes = Fakes::default();
+        fakes.process(row(500, 1, 1000));
+        fakes.process(row(600, 500, 1500));
+        let ctx = fakes.ctx();
+        let d = TempDir::new();
+        let m = d.path().join("agents/aaaaaaaaaaaa");
+        publish(
+            &path(&m, 1, "launcher"),
+            &json!({"pid": 500, "start": 1000, "startedAt": "x"}),
+        )
+        .unwrap();
+        (fakes, ctx, d, m)
+    }
+
+    #[test]
+    fn a_child_of_the_recorded_launcher_is_proven_from_client_json_alone() {
+        let (_f, ctx, _d, m) = world();
+        assert_eq!(client(&ctx, &m, 1), None, "absent: unproven");
+        publish(&path(&m, 1, "client"), &json!({"pid": 600, "start": 1500})).unwrap();
+        let want = Proven {
+            launcher: (500, 1000),
+            client: (600, 1500),
+        };
+        assert_eq!(client(&ctx, &m, 1), Some(want));
+        assert_eq!(
+            client(&ctx, &m, 2),
+            None,
+            "another generation has its own files"
+        );
+    }
+
+    #[test]
+    fn a_foreign_conflicting_torn_or_reparented_client_is_unproven() {
+        // Foreign: live, but not a child of the recorded launcher.
+        let (f, ctx, _d, m) = world();
+        f.process(row(700, 1, 1600));
+        publish(&path(&m, 1, "client"), &json!({"pid": 700, "start": 1600})).unwrap();
+        assert_eq!(client(&ctx, &m, 1), None, "foreign");
+        // exit.json says client-conflict.
+        let (_f, ctx, _d, m) = world();
+        publish(&path(&m, 1, "client"), &json!({"pid": 600, "start": 1500})).unwrap();
+        publish(
+            &path(&m, 1, "exit"),
+            &json!({"exitCode": 1, "reason": "client-conflict"}),
+        )
+        .unwrap();
+        assert_eq!(client(&ctx, &m, 1), None, "conflict");
+        // Torn client.json: unproven, and never deleted.
+        let (_f, ctx, _d, m) = world();
+        std::fs::write(path(&m, 1, "client"), b"{").unwrap();
+        assert_eq!(client(&ctx, &m, 1), None, "torn");
+        assert!(path(&m, 1, "client").exists());
+        // Launcher dead, the client reparented to 1.
+        let (f, ctx, _d, m) = world();
+        publish(&path(&m, 1, "client"), &json!({"pid": 600, "start": 1500})).unwrap();
+        f.forget(500);
+        f.forget(600);
+        f.process(row(600, 1, 1500));
+        assert_eq!(client(&ctx, &m, 1), None, "reparented");
+        // A reused client pid: same pid, another start in both row and open.
+        let (_f, ctx, _d, m) = world();
+        publish(&path(&m, 1, "client"), &json!({"pid": 600, "start": 1499})).unwrap();
+        assert_eq!(client(&ctx, &m, 1), None, "reused client pid");
+    }
+
+    // Each guard alone: everything else valid (proven first), then one fact broken. Each case is the one that kills
+    // its guard's mutation (Step 4 table); the opened start and the listed start are compared separately.
+    #[test]
+    fn each_guard_alone_leaves_the_client_unproven() {
+        type Break = fn(&Fakes, &Path);
+        let cases: [(&str, Break); 10] = [
+            ("client opens with another start", |f, _| {
+                f.opens(600, &[Some(1499)])
+            }),
+            ("client start unreadable at open", |f, _| {
+                f.opens(600, &[None])
+            }),
+            ("client row lists another start", |f, _| {
+                f.forget(600);
+                f.process(row(600, 500, 1499));
+                f.opens(600, &[Some(1500)]);
+            }),
+            ("client row start unknown", |f, _| {
+                f.forget(600);
+                f.process(unknown_start(600, 500));
+                f.opens(600, &[Some(1500)]);
+            }),
+            ("launcher opens with another start", |f, _| {
+                f.opens(500, &[Some(999)])
+            }),
+            ("launcher start unreadable at open", |f, _| {
+                f.opens(500, &[None])
+            }),
+            ("launcher row lists another start", |f, _| {
+                f.forget(500);
+                f.process(row(500, 1, 999));
+                f.opens(500, &[Some(1000)]);
+            }),
+            ("exit.json unreadable", |_, m| {
+                std::fs::write(path(m, 1, "exit"), b"{").unwrap()
+            }),
+            ("launcher.json unreadable", |_, m| {
+                std::fs::write(path(m, 1, "launcher"), b"{").unwrap()
+            }),
+            ("launcher.json absent", |_, m| {
+                std::fs::remove_file(path(m, 1, "launcher")).unwrap()
+            }),
+        ];
+        for (case, break_one) in cases {
+            let (f, ctx, _d, m) = world();
+            publish(&path(&m, 1, "client"), &json!({"pid": 600, "start": 1500})).unwrap();
+            assert!(
+                client(&ctx, &m, 1).is_some(),
+                "{case}: proven before the break"
+            );
+            break_one(&f, &m);
+            assert_eq!(client(&ctx, &m, 1), None, "{case}");
+        }
     }
 }
