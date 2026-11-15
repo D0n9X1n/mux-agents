@@ -7,6 +7,10 @@ use serde_json::{Value, json};
 use crate::error::{Refusal, Res, refuse};
 
 pub const HISTORY: usize = 16;
+/// Held ids at most: an ack that would hold more is refused until `-Id` drains some. With the history bounded too,
+/// a cursor stays far below the 1 MB read cap. shortcut: a count, not bytes; ids are 8 or 16 characters, and
+/// `commit` refuses any cursor over the cap, keeping the old one.
+pub const HELD_MAX: usize = 1024;
 pub const NOT_ON_DISK: &str = "the last acknowledgement is not yet on disk; retry";
 
 /// A reader: its member id (a person: its pane mailbox) and generation. A resumed successor is another owner.
@@ -123,9 +127,14 @@ impl Cursor {
         }
     }
 
-    /// Appends `{batch, owner}` to the history, keeping the last 16 of that owner (R4).
+    /// Appends `{batch, owner}` to the history, keeping the last 16 of that owner (R4). The history of any other
+    /// owner goes unless it owns a receipt still pending: a predecessor can no longer ack (#103 4b-i).
     pub fn remember(&mut self, batch: &str, owner: &Owner) {
         self.acked.push((batch.into(), owner.clone()));
+        let (pending, id_pending) = (&self.pending, &self.id_pending);
+        let owns = |r: &Option<Receipt>, o: &Owner| r.as_ref().is_some_and(|r| r.owner == *o);
+        self.acked
+            .retain(|(_, o)| o == owner || owns(pending, o) || owns(id_pending, o));
         let mine = self.acked.iter().filter(|(_, o)| o == owner).count();
         if mine > HISTORY {
             let first = self
@@ -171,9 +180,16 @@ pub fn load(mail: &Path, key: &str) -> Res<Cursor> {
 }
 
 /// Commits `c` whole with `write_json_durable`; then the legacy offset goes. A failed file flush leaves the old cursor;
-/// a failed folder flush errors after the rename (the new cursor is there, its folder maybe not: R5).
+/// a failed folder flush errors after the rename (the new cursor is there, its folder maybe not: R5). A cursor `load`
+/// could not read back (over 1 MB) is refused and the old one stays.
 pub fn commit(mail: &Path, key: &str, c: &Cursor) -> Res<()> {
-    crate::state::fs::write_json_durable(&path(mail, key), &c.to_json())?;
+    let v = c.to_json();
+    if v.to_string().len() as u64 > crate::state::fs::STATE_MAX {
+        return Err(Refusal::internal(
+            "the mail cursor would be larger than 1 MB",
+        ));
+    }
+    crate::state::fs::write_json_durable(&path(mail, key), &v)?;
     let _ = std::fs::remove_file(legacy_path(mail, key));
     Ok(())
 }
@@ -246,17 +262,66 @@ mod tests {
         for n in 0..17 {
             c.remember(&format!("b{n}"), &o("a"));
         }
-        c.remember("z", &o("b"));
         assert!(
             !c.was_acked("b0", &o("a"))
                 && c.was_acked("b1", &o("a"))
                 && c.was_acked("b16", &o("a"))
         );
+        c.remember("z", &o("b"));
         assert!(
             c.was_acked("z", &o("b")) && !c.was_acked("z", &o("a")),
             "per owner"
         );
-        assert_eq!(c.acked.len(), 17);
+        assert_eq!(c.acked.len(), 1, "a's history went when b acked");
+    }
+
+    #[test]
+    fn a_predecessors_history_is_pruned_and_the_current_owner_keeps_16() {
+        let mut c = Cursor::default();
+        for n in 0..16 {
+            c.remember(&format!("a{n}"), &o("a"));
+        }
+        for n in 0..17 {
+            c.remember(&format!("b{n}"), &o("b"));
+        }
+        assert!(
+            !c.acked.iter().any(|(_, w)| *w == o("a")),
+            "the predecessor's history goes"
+        );
+        assert_eq!(c.acked.len(), HISTORY);
+        assert!(
+            !c.was_acked("b0", &o("b"))
+                && c.was_acked("b1", &o("b"))
+                && c.was_acked("b16", &o("b"))
+        );
+        // The owner of a receipt still pending keeps its history: it may still ack, and retry an ack.
+        let mut c = Cursor::default();
+        c.remember("a0", &o("a"));
+        c.pending = Some(Receipt {
+            owner: o("a"),
+            ..Receipt::default()
+        });
+        c.remember("b0", &o("b"));
+        assert!(c.was_acked("a0", &o("a")) && c.was_acked("b0", &o("b")));
+    }
+
+    #[test]
+    fn a_cursor_too_large_to_load_is_never_committed() {
+        let d = TempDir::new();
+        let mail = d.path();
+        let small = Cursor {
+            offset: 5,
+            ..Cursor::default()
+        };
+        commit(mail, "k", &small).unwrap();
+        let mut big = small.clone();
+        big.held = (0..60_000).map(|n| format!("{n:016x}")).collect();
+        assert!(commit(mail, "k", &big).is_err(), "over the read cap");
+        assert_eq!(
+            load(mail, "k").unwrap(),
+            small,
+            "the old cursor stays, loadable"
+        );
     }
 
     #[test]

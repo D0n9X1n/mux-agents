@@ -1,5 +1,5 @@
-//! Mailboxes: `mail/<key>.jsonl` with a byte offset in `<key>.offset`, one JSON message per LF-ended line
-//! (MuxAgents.ps1:1020-1148, 1206-1214).
+//! Mailboxes: `mail/<key>.jsonl`, one JSON message per LF-ended line, read through the receipt cursor
+//! `<key>.cursor.json` (receipt.rs; a legacy `<key>.offset` migrates once) (MuxAgents.ps1:1020-1148, 1206-1214).
 
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
@@ -622,7 +622,8 @@ pub fn serve(
 }
 
 /// R4: `pending` or `idPending` of `owner` named `batch` commits (offset = max, held updated, history, `uncertain`);
-/// one in the history of `owner` is a duplicate; anything else is 2 `ack` `stale receipt`. R5 gate first.
+/// one in the history of `owner` is a duplicate; anything else is 2 `ack` `stale receipt`. R5 gate first. Refs that
+/// would hold more than `HELD_MAX` refuse 1 `mail`, the receipt kept, until `-Id` drains.
 pub fn ack(
     ctx: &Ctx,
     caller: &Caller,
@@ -651,6 +652,17 @@ pub fn ack(
                 .filter(|id| !c.held.contains(id))
                 .cloned()
                 .collect();
+            if c.held.len() + new.len() > receipt::HELD_MAX {
+                return refuse(
+                    1,
+                    "mail",
+                    format!(
+                        "{} held: run mux-agent read -Id {} and ack it, then retry this ack",
+                        c.held.len(),
+                        c.held[0]
+                    ),
+                );
+            }
             c.held.extend(new);
         } else if mine(&c.id_pending) {
             let r = c.id_pending.take().expect("matched");
@@ -1185,6 +1197,59 @@ mod tests {
         let r = sv(w, "a").unwrap().unwrap();
         assert_eq!(r.refs, [H1, H3]);
         ak(w, "a", &r.batch).unwrap();
+    }
+
+    /// A cursor near the old 1 MB read cap (many held ids, sixteen acks of each of 100 dead owners) still loads, and
+    /// so does one exactly at the held cap: acking a new reference is refused cleanly, the cursor unchanged; `-Id`
+    /// and its ack drain, the ack pruning dead owners; at the cap, the refused ack then goes through.
+    #[test]
+    fn a_full_cursor_refuses_new_references_and_still_drains() {
+        for (filler, retried) in [(40_000, false), (1023, true)] {
+            let w = World::human("");
+            let mail = w.state().join("mail");
+            held_h1(&w);
+            let mut c = receipt::load(&mail, "pane-1").unwrap();
+            c.held
+                .extend((0..filler).map(|n| format!("{:016x}", 0xf000_0000_0000_0000u64 + n)));
+            for d in 0..100 {
+                for n in 0..16 {
+                    c.acked
+                        .push((format!("b{d}-{n:014}"), me(&format!("dead{d:04}"))));
+                }
+            }
+            receipt::commit(&mail, "pane-1", &c).unwrap();
+            if !retried {
+                assert!(
+                    c.to_json().to_string().len() > 800_000,
+                    "near the old limit"
+                );
+            }
+            deliver_once(&w.ctx, &w.caller(), "pane-1", &sized(H3, 5000, "x")).unwrap();
+            let r = sv(&w, "a").unwrap().unwrap();
+            assert_eq!(r.refs, [H3]);
+            let before = receipt::load(&mail, "pane-1").unwrap();
+            let e = ak(&w, "a", &r.batch).unwrap_err();
+            assert_eq!((e.code, e.check), (1, "mail"), "{filler}");
+            assert!(
+                e.message
+                    .contains("held: run mux-agent read -Id 1111111111111111"),
+                "{}",
+                e.message
+            );
+            assert_eq!(receipt::load(&mail, "pane-1").unwrap(), before, "unchanged");
+            // Drain: the held body by `-Id`, then its ack.
+            let body = sid(&w, "a", H1).unwrap().unwrap();
+            assert_eq!(body.ids, [H1]);
+            assert!(matches!(ak(&w, "a", &body.batch).unwrap(), Acked::Done));
+            let after = receipt::load(&mail, "pane-1").unwrap();
+            assert!(!after.held.contains(&H1.to_string()));
+            assert!(
+                after.acked.iter().all(|(_, o)| *o == me("a")),
+                "dead owners pruned"
+            );
+            let retry = ak(&w, "a", &r.batch);
+            assert_eq!(retry.is_ok(), retried, "{filler}: {retry:?}");
+        }
     }
 
     #[test]
