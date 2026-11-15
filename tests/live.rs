@@ -671,6 +671,34 @@ exec claude --dangerously-skip-permissions
                 ],
             )
         }
+
+        /// A detached session whose first pane starts in `dir`; its pane id.
+        fn session_in(&self, name: &str, dir: &Path) -> String {
+            std::fs::create_dir_all(dir).unwrap();
+            let d = dir.display().to_string();
+            self.call(&[
+                "new-session",
+                "-d",
+                "-s",
+                name,
+                "-x",
+                "200",
+                "-y",
+                "50",
+                "-c",
+                &d,
+                "sh",
+            ]);
+            self.call(&["list-panes", "-t", name, "-F", "#{pane_id}"])
+                .trim()
+                .to_string()
+        }
+
+        /// mux-agent run by member `id` (its fake client).
+        fn by(&mut self, id: &str, args: &[&str]) -> (i32, Value) {
+            let pid = self.client_of(id);
+            self.server.command(pid, args)
+        }
     }
 
     fn s(value: &Value) -> &str {
@@ -4922,6 +4950,7 @@ hc {}:
                     bar_keys_focus_an_agent,
                     bar_click_after_shrinking_does_nothing,
                     members_spawn_and_act_only_down_the_tree,
+                    team_messaging_stays_in_the_team,
                 ]
             );
         };
@@ -5022,6 +5051,80 @@ hc {}:
             (code, r["check"].as_str()),
             (2, Some("limit")),
             "{mux:?} {r}"
+        );
+    }
+
+    // 4a: read still answers `messages`. 4b-i migrates this body to `reply["ids"]` (`msg-plan-4b-i-3.md` F25).
+    fn ids_of(reply: &Value) -> Vec<String> {
+        reply["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| s(&m["id"]).to_string())
+            .collect()
+    }
+
+    /// Team messaging end to end (#103 4a): leader > a > b, and team T2 in another session. A broadcast is one id
+    /// each; a reply is hop 1; another team is refused; `children` is only the leader's own; the 121st send of the
+    /// hour refuses with `retryAt`.
+    fn team_messaging_stays_in_the_team(mux: Mux) {
+        let Some(mut live) = Live::human(mux) else {
+            return;
+        };
+        std::fs::write(live.dir.join("brief.md"), "brief").unwrap();
+        let body = live.path("body.md");
+        std::fs::write(&body, "hello").unwrap();
+        let (code, up) = live.run(&["up", "-Client", "claude"]);
+        assert_eq!(code, 0, "{mux:?} {up}");
+        let leader = s(&up["leader"]["id"]).to_string();
+        let spawn = |live: &mut Live, by: &str, name: &str| {
+            let (code, r) = live.spawn_by(by, name);
+            assert_eq!(code, 0, "{mux:?} {name}: {r}");
+            s(&r["id"]).to_string()
+        };
+        let a = spawn(&mut live, &leader, "a");
+        let b = spawn(&mut live, &a, "b");
+        // Team T2: `up` from another folder in another session.
+        let pane = live.session_in("t2", &live.dir.join("t2"));
+        let (code, up2) = live.run_in(&pane, &["up", "-Client", "claude"]);
+        assert_eq!(code, 0, "{mux:?} {up2}");
+        spawn(&mut live, s(&up2["leader"]["id"]), "x");
+        let (code, sent) = live.by(&a, &["send", "team", "-BodyFile", &body]);
+        assert_eq!(code, 0, "{mux:?} {sent}");
+        let id = s(&sent["id"]).to_string();
+        for who in [&leader, &b] {
+            let (_, r) = live.by(who, &["read"]);
+            assert_eq!(ids_of(&r), std::slice::from_ref(&id), "{mux:?} one id each");
+        }
+        let (code, r) = live.by(&b, &["send", "a", "-BodyFile", &body, "-Re", &id]);
+        assert_eq!((code, &r["hop"]), (0, &json!(1)), "{mux:?} {r}");
+        let (code, r) = live.by(&b, &["send", "x", "-BodyFile", &body]);
+        assert_eq!(
+            (code, s(&r["check"])),
+            (2, "target"),
+            "{mux:?} another team: {r}"
+        );
+        let (_, r) = live.by(&leader, &["send", "children", "-BodyFile", &body]);
+        assert_eq!(
+            r["recipients"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|x| s(&x["id"]).to_string())
+                .collect::<Vec<_>>(),
+            std::slice::from_ref(&a),
+            "{mux:?}"
+        );
+        // The quota through the live client (F22): a has sent one (team); 119 more fill the hour, the 121st refuses.
+        for n in 0..119 {
+            let (code, r) = live.by(&a, &["send", "leader", "-BodyFile", &body]);
+            assert_eq!(code, 0, "{mux:?} send {}: {r}", n + 2);
+        }
+        let (code, r) = live.by(&a, &["send", "leader", "-BodyFile", &body]);
+        assert_eq!(
+            (code, s(&r["check"]), r["retryAt"].is_string()),
+            (2, "quota", true),
+            "{mux:?} the 121st: {r}"
         );
     }
 }
