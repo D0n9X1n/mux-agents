@@ -519,11 +519,17 @@ pub(super) fn current(
     let Ok(local) = super::membership::locals(ctx, caller) else {
         return false;
     };
-    let committed = local
+    let Some(mine) = local
         .iter()
-        .any(|l| l.identity == *id && l.stored.committed);
-    if !committed || super::membership::superseded_locals(&local).contains(&id.id) {
+        .find(|l| l.identity == *id && l.stored.committed)
+    else {
         return false;
+    };
+    if super::membership::superseded_locals(&local).contains(&id.id) {
+        return false;
+    }
+    if mine.finished == Some(true) {
+        return false; // R3: ended by its record
     }
     let Ok(core) = crate::hc::connect(ctx) else {
         return false;

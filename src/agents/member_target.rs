@@ -1,4 +1,4 @@
-use super::{core_identity::Identity, membership, registry};
+use super::{core_identity::Identity, membership};
 use crate::{
     caller::Caller,
     ctx::Ctx,
@@ -52,16 +52,23 @@ pub(crate) fn named_with_core(
     if addresses.len() != found.len() {
         return Err(changed());
     }
-    let mut live = Vec::new();
+    let mut live_ids = Vec::new();
     for member in &found {
         let id = &member.identity;
-        let fact = core.get(&id.address).ok().filter(|t| id.matches(t));
-        if super::lifecycle::classify(fact.as_ref(), &id.launcher) != super::lifecycle::Life::Ended
-        {
-            live.push(id);
+        // R3: a lifecycle candidate's end is its record's; hc decides only for a pre-lifecycle one.
+        let live = match member.finished {
+            Some(finished) => !finished,
+            None => {
+                let fact = core.get(&id.address).ok().filter(|t| id.matches(t));
+                super::lifecycle::classify(fact.as_ref(), &id.launcher)
+                    != super::lifecycle::Life::Ended
+            }
+        };
+        if live {
+            live_ids.push(id);
         }
     }
-    match live.as_slice() {
+    match live_ids.as_slice() {
         [one] => Ok((*one).clone()),
         [] => found
             .iter()
@@ -93,12 +100,29 @@ pub(crate) fn by_id(ctx: &Ctx, caller: &Caller, id: &str) -> Res<Identity> {
         .map(|l| l.identity)
         .ok_or_else(changed)
 }
+/// R1, R4: one `member_of` and one `status`; the identity and record of the subject generation, built by
+/// `membership::subject_of` as membership built the identity `by_id` or `named` returned, so they agree.
 pub(crate) fn current(ctx: &Ctx, caller: &Caller, id: &Identity) -> Res<Value> {
-    let record = registry::record(ctx, caller, &id.id)?.ok_or_else(changed)?;
+    use super::gens::Member;
     let folder = super::server_dir(ctx, caller).join("agents").join(&id.id);
-    if !super::committed(&folder)
-        || Identity::read(&record, &id.id, &membership::team(caller)).as_ref() != Some(id)
-    {
+    let team = membership::team(caller);
+    let (record, identity, committed) = match super::gens::member_of(&folder) {
+        Member::Absent => return Err(changed()),
+        Member::Unreadable(e) => return Err(e),
+        Member::Pre(r) => {
+            let identity = Identity::read(&r, &id.id, &team);
+            (r, identity, super::folder_committed(&folder))
+        }
+        Member::Life(g) => {
+            let s = g.status()?; // R2: an unreadable marker refuses
+            if s.subject.is_none() {
+                return Err(changed());
+            }
+            let (identity, record) = membership::subject_of(&g, &s, &id.id, &team)?;
+            (record, Some(identity), s.committed)
+        }
+    };
+    if !record.is_object() || !committed || identity.as_ref() != Some(id) {
         return Err(changed());
     }
     Ok(record)

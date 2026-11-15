@@ -1,4 +1,5 @@
 use super::*;
+use crate::agents::registry;
 use crate::agents::{
     core_fixture as cf,
     fixture::{ID, World, write},
@@ -573,4 +574,141 @@ fn retained_and_kept_never_trust_another_identitys_terminal() {
         "another identity's terminal is never read"
     );
     w.fakes.hc_done().unwrap();
+}
+
+// R1, R2, R4: the targeted member is committed by its subject generation, read once; never the folder's commit.
+#[test]
+fn a_lifecycle_target_is_its_active_generation_read_once() {
+    use crate::{agents::gens, state::evidence::publish};
+    let w = World::human("");
+    let caller = w.caller();
+    let r = cf::member(
+        &w,
+        ID,
+        json!({"lifecycle": 1, "generation": "1", "hcName": "m0123abcd"}),
+    );
+    let f = w.folder(ID);
+    publish(&gens::path(&f, 0, "commit"), &json!({"committed": true})).unwrap();
+    let id =
+        crate::agents::core_identity::Identity::read(&r, ID, &membership::team(&caller)).unwrap();
+    assert_eq!(
+        current(&w.ctx, &caller, &id).map_err(|e| e.check).err(),
+        Some("target"),
+        "folder commit says nothing"
+    );
+    publish(&gens::path(&f, 1, "commit"), &json!({"committed": true})).unwrap();
+    let (got, reads) = crate::state::fs::record_reads(|| current(&w.ctx, &caller, &id));
+    got.unwrap();
+    assert_eq!(
+        reads.iter().filter(|p| p.ends_with("record.json")).count(),
+        1,
+        "one read: {reads:?}"
+    );
+    std::fs::write(gens::path(&f, 1, "ended"), b"{\"st").unwrap();
+    assert_eq!(
+        current(&w.ctx, &caller, &id).map_err(|e| e.check).err(),
+        Some("evidence"),
+        "torn: refused"
+    );
+}
+
+// R4 (re-audit a0586ee CRITICAL): by_id and current agree on the subject generation; a committed, unfinished pending
+// generation's identity round-trips without any write in between.
+#[test]
+fn by_id_and_current_agree_on_a_held_generation() {
+    use crate::{agents::gens, state::evidence::publish};
+    let w = World::human("");
+    let caller = w.caller();
+    let mut r = cf::member(
+        &w,
+        ID,
+        json!({"lifecycle": 1, "generation": "1", "hcName": "m0123abcd"}),
+    );
+    let f = w.folder(ID);
+    r["pending"] = json!({"gen": 2, "hcName": "m4567cdef", "sessionId": "11111111-2222-4333-8444-555555555555",
+        "hcAddress": "t9"});
+    write(&f.join("record.json"), r);
+    publish(&gens::path(&f, 2, "commit"), &json!({"committed": true})).unwrap();
+    let id = by_id(&w.ctx, &caller, ID).unwrap();
+    assert_eq!(
+        (id.generation.as_str(), id.address.as_str()),
+        ("2", "t9"),
+        "the held generation's identity"
+    );
+    let got = current(&w.ctx, &caller, &id).expect("the same identity revalidates");
+    assert_eq!(got.get("pane"), None, "a held identity presents nothing");
+}
+
+// R3 (re-audit a0586ee CRITICAL): a lifecycle candidate is a rival for its name until its record says finished;
+// hc forgetting or finishing its terminal decides nothing.
+#[test]
+fn a_lifecycle_name_is_freed_only_by_its_recorded_end() {
+    use crate::{agents::gens, state::evidence::publish};
+    for old_ended in [true, false] {
+        let w = World::human("");
+        let caller = w.caller();
+        let life = json!({"lifecycle": 1, "generation": "1", "hcName": "m0123abcd"});
+        let old = cf::member(&w, ID, life.clone());
+        cf::member(&w, NEW, life);
+        for id in [ID, NEW] {
+            publish(
+                &gens::path(&w.folder(id), 1, "commit"),
+                &json!({"committed": true}),
+            )
+            .unwrap();
+        }
+        if old_ended {
+            publish(
+                &gens::path(&w.folder(ID), 1, "ended"),
+                &json!({"state": "finished"}),
+            )
+            .unwrap();
+        }
+        cf::online(&w);
+        if !old_ended {
+            // hc's finished terminal for the old one (ids sort first): a classification by hc would drop it.
+            let mut t = cf::wire(&old);
+            (t["state"], t["reason"], t["exit_code"]) =
+                (json!("finished"), json!("exited"), json!(0));
+            cf::get(&w, old["hcAddress"].as_str().unwrap(), t);
+        }
+        let got = named(&w.ctx, &caller, "worker")
+            .map(|i| i.id)
+            .map_err(|e| e.check);
+        let want = if old_ended {
+            Ok(NEW.to_string())
+        } else {
+            Err("target")
+        };
+        assert_eq!(got, want, "old ended by its record: {old_ended}");
+    }
+}
+
+// R3 (re-audit): the mailbox read fence never keeps a finished lifecycle member current, whatever hc shows.
+#[test]
+fn the_read_fence_ends_a_lifecycle_member_by_its_record() {
+    use crate::{agents::gens, state::evidence::publish};
+    let w = World::human("");
+    let caller = w.caller();
+    let r = cf::member(
+        &w,
+        ID,
+        json!({"lifecycle": 1, "generation": "1", "hcName": "m0123abcd"}),
+    );
+    let f = w.folder(ID);
+    publish(&gens::path(&f, 1, "commit"), &json!({"committed": true})).unwrap();
+    publish(&gens::path(&f, 1, "ended"), &json!({"state": "finished"})).unwrap();
+    let id =
+        crate::agents::core_identity::Identity::read(&r, ID, &membership::team(&caller)).unwrap();
+    cf::online(&w);
+    cf::get(&w, r["hcAddress"].as_str().unwrap(), cf::wire(&r)); // hc: running
+    assert!(
+        !crate::agents::message::current(&w.ctx, &caller, &id),
+        "recorded end: not current"
+    );
+    std::fs::remove_file(gens::path(&f, 1, "ended")).unwrap();
+    assert!(
+        crate::agents::message::current(&w.ctx, &caller, &id),
+        "not ended, hc running: current"
+    );
 }
