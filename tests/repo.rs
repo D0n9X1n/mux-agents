@@ -883,6 +883,7 @@ fn ci_test_job_named_test() {
     assert!(block(&lint, "    strategy:").is_empty());
     for (name, oses) in [
         ("test", "[ubuntu-latest, macos-latest, windows-latest]"),
+        ("plugin", "[ubuntu-latest, macos-latest, windows-latest]"),
         ("integration", "[ubuntu-latest, macos-latest]"),
     ] {
         let j = job(&ci, name);
@@ -994,7 +995,20 @@ fn ci_jobs_run_cargo_and_sh() {
             "./actionlint",
             "jq . .claude-plugin/plugin.json .claude-plugin/marketplace.json",
             "xargs -0 shellcheck",
-            "@anthropic-ai/claude-code@2.1.310",
+        ],
+    );
+    let lint = job_lines(&ci, "lint");
+    assert!(
+        !lint
+            .iter()
+            .any(|l| l.contains("claude-code@") || l.contains("claude plugin")),
+        "lint runs no plugin step: the plugin job does, on three OSes"
+    );
+    // The plugin tests run on three OSes at the engine the plugin is written against (4b-ii).
+    ordered(
+        "plugin",
+        &[
+            "@anthropic-ai/claude-code@2.1.325",
             "claude plugin validate .",
             "claude plugin test .",
         ],
@@ -2592,14 +2606,24 @@ fn skill_teaches_team_messaging() {
 fn skill_teaches_the_wake_and_listening_on_call() {
     let skill = repo_file("skills/mux-agents/SKILL.md");
     for want in [
-        "read -Deliver -Ack <batch>", "read -Ack <batch>", "report done", "read -Wait 600 -Ack <batch>", "read -Cancel",
-        "read -Id <id>", "never your user", "mux-agents mail is waiting (wake <nonce>): run mux-agent read",
-        "run `read`, quote the nonce in your reply", "The wake turn carries no mail",
+        "read -Deliver -Ack <batch>",
+        "read -Ack <batch>",
+        "report done",
+        "read -Wait 600 -Ack <batch>",
+        "read -Cancel",
+        "read -Id <id>",
+        "never your user",
+        "mux-agents mail is waiting (wake <nonce>): run mux-agent read",
+        "run `read`, quote the nonce in your reply",
+        "The wake turn carries no mail",
         r#"When the background `read -Wait 600` ends with `"timeout": true`, start it again in the background"#,
     ] {
         assert!(skill.contains(want), "SKILL.md lacks {want}");
     }
     for gone in ["arrives as your next input", "wakes no one"] {
-        assert!(!skill.contains(gone), "SKILL.md still says {gone}: the sender wakes no one now");
+        assert!(
+            !skill.contains(gone),
+            "SKILL.md still says {gone}: the sender wakes no one now"
+        );
     }
 }
