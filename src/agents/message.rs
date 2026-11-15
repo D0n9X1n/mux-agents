@@ -506,8 +506,10 @@ fn capture_identity(
     })
 }
 
-/// The output hc keeps for member `id` (#103 B6), also after it ended: `hc read`. None when it is blank, when no committed
-/// member has that id, or when hc answers `not_found` (it no longer keeps the terminal); any other failure is an error.
+/// The output hc keeps for member `id` (#103 B6), also after it ended: `hc read`, only of a terminal that is still the
+/// member's own (`Identity::matches`: its address, team, id and generation labels). None when it is blank, when no
+/// committed member has that id, when hc answers `not_found` (it no longer keeps the terminal), or when the terminal at
+/// that address is another identity's (an Unknown row): its output is never shown. Any other failure is an error.
 pub fn retained(
     ctx: &Ctx,
     caller: &crate::caller::Caller,
@@ -519,15 +521,20 @@ pub fn retained(
         Err(e) if e.check == "target" => return Ok(None),
         Err(e) => return Err(e),
     };
-    match crate::hc::connect(ctx)?.read(&id.address, lines) {
+    let core = crate::hc::connect(ctx)?;
+    if !kept(&core, &id)? {
+        return Ok(None);
+    }
+    match core.read(&id.address, lines) {
         Ok(text) => Ok((!text.trim().is_empty()).then_some(text)),
         Err(e) if e.check == "not_found" => Ok(None),
         Err(e) => Err(e),
     }
 }
 
-/// Whether hc still keeps member `id`'s terminal (`hc get`; `not_found`: it dropped it), as the bar reopens only one it keeps;
-/// None when no committed member has that id. Any other hc failure, unreachable included, is an error.
+/// Whether hc still keeps member `id`'s own terminal (`hc get` and `Identity::matches`), as the bar reopens only one it
+/// keeps: false when hc dropped it (`not_found`) or the terminal at its address is another identity's. None when no
+/// committed member has that id. Any other hc failure, unreachable included, is an error.
 pub fn kept_member(
     ctx: &Ctx,
     caller: &crate::caller::Caller,
@@ -539,9 +546,15 @@ pub fn kept_member(
         Err(e) if e.check == "target" => return Ok(None),
         Err(e) => return Err(e),
     };
+    kept(core, &id).map(Some)
+}
+
+/// Whether the terminal at `id`'s address is still `id`'s own: false when hc dropped it or it carries another
+/// identity's labels (#103 review); any other hc failure is an error.
+fn kept(core: &crate::hc::Core<'_>, id: &super::core_identity::Identity) -> Res<bool> {
     match core.get(&id.address) {
-        Ok(_) => Ok(Some(true)),
-        Err(e) if e.check == "not_found" => Ok(Some(false)),
+        Ok(t) => Ok(id.matches(&t)),
+        Err(e) if e.check == "not_found" => Ok(false),
         Err(e) => Err(e),
     }
 }

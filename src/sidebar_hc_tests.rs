@@ -506,14 +506,25 @@ fn open_acts_by_life_never_restarts_and_always_answers() {
             0,
             Some("focus failed: worker"),
         ),
+        // #103 review: an Unknown row whose terminal is labelled for another identity shows nothing of it.
+        (
+            "unknown mislabeled",
+            "unknown",
+            false,
+            true,
+            true,
+            "mislabeled",
+            true,
+            None,
+            0,
+            nothing,
+        ),
     ];
     for (case, life, present, exists, hc, kept, reads, want, popups, note) in cases {
         for press in [true, false] {
             let w = plain_world();
             let c = w.caller();
-            if exists {
-                cf::member(&w, ID, json!({}));
-            }
+            let record = exists.then(|| cf::member(&w, ID, json!({})));
             if present {
                 let mut row = row_of("%9|@5|300||", &[]);
                 row.command = "hc attach taaaaaaaaaaaa".into();
@@ -553,20 +564,25 @@ fn open_acts_by_life_never_restarts_and_always_answers() {
                 ["get", "taaaaaaaaaaaa", "--json"],
                 ["read", "taaaaaaaaaaaa", "--lines", "200"],
             );
+            // Every hc look first checks that the terminal is still the member's own (`hc get`, #103 review).
+            let own = || cf::wire(record.as_ref().unwrap());
             match kept {
                 "" => {}
                 // A Running row without a view: `hc get` finds its terminal (reopen), answers `not_found` (nothing to open) or fails.
-                "listed" => cf::get(
-                    &w,
-                    "taaaaaaaaaaaa",
-                    json!({"address": "taaaaaaaaaaaa", "state": "live", "argv": [], "labels": {}}),
-                ),
-                "dropped" if life == "running" => w.fakes.hc_expect(&get, out(3, gone)),
-                "down" if life == "running" => w.fakes.hc_expect(&get, out(5, down)),
-                // An Ended row: `hc read` answers `not_found` (nothing to open) or fails (focus failed).
-                "dropped" => w.fakes.hc_expect(&read, out(3, gone)),
-                "down" => w.fakes.hc_expect(&read, out(5, down)),
-                text => cf::answer(&w, &read, text),
+                "listed" => cf::get(&w, "taaaaaaaaaaaa", own()),
+                "mislabeled" => {
+                    let mut t = own();
+                    t["labels"]["mux.gen"] = json!("1");
+                    cf::get(&w, "taaaaaaaaaaaa", t)
+                }
+                // hc dropped the terminal (`not_found`), or hc is unreachable, at that first look.
+                "dropped" => w.fakes.hc_expect(&get, out(3, gone)),
+                "down" => w.fakes.hc_expect(&get, out(5, down)),
+                // An Ended or Unknown row whose own terminal hc keeps: its output, read after the check.
+                text => {
+                    cf::get(&w, "taaaaaaaaaaaa", own());
+                    cf::answer(&w, &read, text)
+                }
             }
             let other = Target {
                 id: "cccccccccccc".into(),
@@ -705,7 +721,7 @@ fn p_previews_the_selected_id_and_changes_nothing() {
         let w = plain_world();
         let c = w.caller();
         cf::member(&w, ID, json!({"name": "twin"}));
-        cf::member(&w, "bbbbbbbbbbbb", json!({"name": "twin", "pane": "%8"}));
+        let b_record = cf::member(&w, "bbbbbbbbbbbb", json!({"name": "twin", "pane": "%8"}));
         let mut rows = Vec::new();
         for (pane, id) in [("%9", ID), ("%8", "bbbbbbbbbbbb")]
             .into_iter()
@@ -726,20 +742,23 @@ fn p_previews_the_selected_id_and_changes_nothing() {
             })
         };
         let read = ["read", "tbbbbbbbbbbbb", "--lines", "200"];
+        let get = ["get", "tbbbbbbbbbbbb", "--json"];
         match kept {
             "" => {}
-            // The read fails: hc's `not_found` (exit 3) is nothing to show; hc unreachable (exit 5) is a failure.
+            // hc checks the terminal is still B's own first (#103 review): `not_found` (exit 3) is nothing to show; hc
+            // unreachable (exit 5) is a failure; B's own terminal is then read.
             "dropped" => {
                 cf::online(&w);
-                w.fakes.hc_expect(&read, out(3, gone))
+                w.fakes.hc_expect(&get, out(3, gone))
             }
             "down" => {
                 cf::online(&w);
                 w.fakes
-                    .hc_expect(&read, out(5, r#"{"error":{"kind":"unavailable"}}"#))
+                    .hc_expect(&get, out(5, r#"{"error":{"kind":"unavailable"}}"#))
             }
             text => {
                 cf::online(&w);
+                cf::get(&w, "tbbbbbbbbbbbb", cf::wire(&b_record));
                 cf::answer(&w, &read, text)
             }
         }

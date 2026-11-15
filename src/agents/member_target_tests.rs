@@ -369,8 +369,16 @@ fn the_bar_reads_and_captures_by_id_never_by_name() {
     use crate::agents::{core_fixture as cf, fixture::World, message};
     let w = World::human("");
     let c = w.caller();
-    cf::member(&w, "aaaaaaaaaaaa", serde_json::json!({"name": "twin"}));
-    cf::member(&w, "bbbbbbbbbbbb", serde_json::json!({"name": "twin"}));
+    let a = cf::member(&w, "aaaaaaaaaaaa", serde_json::json!({"name": "twin"}));
+    let b = cf::member(&w, "bbbbbbbbbbbb", serde_json::json!({"name": "twin"}));
+    // `retained` reads only a terminal that is still the member's own: hc `get` answers it first.
+    let own = |id: &str| {
+        if id == "aaaaaaaaaaaa" {
+            cf::wire(&a)
+        } else {
+            cf::wire(&b)
+        }
+    };
     w.panes(&[]);
     let e = message::capture_member(&w.ctx, &c, "bbbbbbbbbbbb", None, 2).unwrap_err();
     assert_eq!(e.message, "the agent has no live view; run focus twin");
@@ -379,6 +387,7 @@ fn the_bar_reads_and_captures_by_id_never_by_name() {
         ("bbbbbbbbbbbb", " \n", None),
     ] {
         cf::online(&w);
+        cf::get(&w, &format!("t{id}"), own(id));
         cf::answer(&w, &["read", &format!("t{id}"), "--lines", "200"], text);
         assert_eq!(
             message::retained(&w.ctx, &c, id, 200).unwrap().as_deref(),
@@ -400,6 +409,7 @@ fn the_bar_reads_and_captures_by_id_never_by_name() {
         (5, r#"{"error":{"kind":"unavailable"}}"#, None),
     ] {
         cf::online(&w);
+        cf::get(&w, "taaaaaaaaaaaa", own("aaaaaaaaaaaa"));
         w.fakes.hc_expect(
             &["read", "taaaaaaaaaaaa", "--lines", "200"],
             out(code, reply),
@@ -530,6 +540,37 @@ fn capture_member_reads_the_requested_twin_and_refuses_a_moved_pane() {
             .mux_calls()
             .iter()
             .any(|a| a[1] == "new-window" || a[1] == "split-window")
+    );
+    w.fakes.hc_done().unwrap();
+}
+
+#[test]
+fn retained_and_kept_never_trust_another_identitys_terminal() {
+    use crate::agents::{core_fixture as cf, fixture::World, message};
+    let w = World::human("");
+    let c = w.caller();
+    let record = cf::member(&w, "aaaaaaaaaaaa", serde_json::json!({"name": "twin"}));
+    // The terminal at the member's address is labelled for another generation: the snapshot calls the row Unknown.
+    let mut other = cf::wire(&record);
+    other["labels"]["mux.gen"] = serde_json::json!("1");
+    cf::online(&w);
+    cf::get(&w, "taaaaaaaaaaaa", other.clone());
+    assert_eq!(
+        message::retained(&w.ctx, &c, "aaaaaaaaaaaa", 200).ok(),
+        Some(None),
+        "its output is never shown"
+    );
+    cf::online(&w);
+    let core = crate::hc::connect(&w.ctx).unwrap();
+    cf::get(&w, "taaaaaaaaaaaa", other);
+    assert_eq!(
+        message::kept_member(&w.ctx, &c, &core, "aaaaaaaaaaaa").ok(),
+        Some(Some(false)),
+        "it is never reattached"
+    );
+    assert!(
+        w.fakes.hc_calls().iter().all(|(_, a, _)| a[0] != "read"),
+        "another identity's terminal is never read"
     );
     w.fakes.hc_done().unwrap();
 }
