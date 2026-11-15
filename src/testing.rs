@@ -816,3 +816,48 @@ mod tests {
         assert_eq!((ran.unwrap_err().raw_os_error(), calls), (Some(2), 1));
     }
 }
+
+/// `root` itself and everything under it: a folder `None`, a file its bytes. Only a missing `root` maps to nothing,
+/// so making the root (even empty) is seen. A refusal test compares it before and after: nothing made.
+pub type Tree = std::collections::BTreeMap<std::path::PathBuf, Option<Vec<u8>>>;
+
+pub fn tree(root: &std::path::Path) -> Tree {
+    let mut all = Tree::new();
+    match std::fs::symlink_metadata(root) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Ok(m) if m.is_dir() => {
+            all.insert(root.to_path_buf(), None);
+            for entry in std::fs::read_dir(root).unwrap() {
+                all.extend(tree(&entry.unwrap().path()));
+            }
+        }
+        _ => {
+            all.insert(root.to_path_buf(), Some(std::fs::read(root).unwrap()));
+        }
+    }
+    all
+}
+
+#[test]
+fn tree_sees_an_empty_folder_and_every_byte() {
+    let d = TempDir::new();
+    let root = d.path().join("root");
+    assert_eq!(tree(&root), Tree::new(), "a missing root is empty");
+    std::fs::create_dir(&root).unwrap();
+    let empty = tree(&root);
+    assert_ne!(empty, Tree::new(), "an existing empty root is seen");
+    std::fs::create_dir_all(root.join("a/b")).unwrap();
+    assert_ne!(tree(&root), empty, "an empty folder is seen");
+    std::fs::write(root.join("a/f"), b"1").unwrap();
+    let one = tree(&root);
+    std::fs::write(root.join("a/f"), b"2").unwrap();
+    assert_ne!(tree(&root), one, "a changed byte is seen");
+    std::fs::write(d.path().join("file"), b"1").unwrap();
+    assert_eq!(
+        tree(&d.path().join("file"))
+            .into_values()
+            .collect::<Vec<_>>(),
+        [Some(b"1".to_vec())],
+        "a file root"
+    );
+}

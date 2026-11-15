@@ -207,9 +207,15 @@ fn admit(
     if record.get("depth").and_then(Value::as_u64) == Some(0) {
         return refuse(2, "leader", "a leader is never resumed");
     }
-    let flags = recorded_flags(&ctx.state_root, &caller.server_key, id)?;
     let client = client_named(&text(record.get("client")))
         .ok_or_else(|| Refusal::internal("the ended member names no known client"))?;
+    let flags = member_flags(&ctx.state_root, &caller.server_key, id, &record)?;
+    // E2: a lifecycle member replays only its stored options, within the team ceiling, before any other gate.
+    let flags = if super::gens::lifecycle(&record) {
+        super::options::replay(client, &flags, ceiling(gate.map(|(team, _)| team)))?
+    } else {
+        flags
+    };
     match gate {
         None if snapshot.facts.count() >= 6 => {
             return refuse(2, "cap", "the session already has 6 live agents");
@@ -258,6 +264,27 @@ pub(crate) fn recorded_flags(state_root: &Path, key: &str, id: &str) -> Res<Vec<
                 .collect()
         })
         .ok_or_else(|| Refusal::internal("the ended member's launch spec names no client flags"))
+}
+
+/// The flags member `id` runs with: the stored `options` of a lifecycle record (options-6e E1), never its spec;
+/// the folder-level launch spec of any other member. The one choice resume, member proof and parent level share.
+pub(crate) fn member_flags(
+    state_root: &Path,
+    key: &str,
+    id: &str,
+    record: &Value,
+) -> Res<Vec<String>> {
+    if super::gens::lifecycle(record) {
+        super::options::stored(record)
+    } else {
+        recorded_flags(state_root, key, id)
+    }
+}
+
+/// E2: the ceiling replayed options are held to: the policy `up` fixed for the team; outside a team none (0.2
+/// rules), and `replay` still refuses a prompt or a session choice.
+pub(crate) fn ceiling(team: Option<&super::team::Team>) -> super::team::Policy {
+    team.map_or(super::team::Policy::Bypass, |t| t.policy)
 }
 
 /// The member that took `id`: one naming `id` in `resumedFrom` that either claimed its run (`gens/0.claim` = `run`),

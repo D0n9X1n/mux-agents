@@ -184,7 +184,7 @@ pub fn prove_member(
     if !proven {
         return None;
     }
-    let flags = super::resume::recorded_flags(&ctx.state_root, key, id).ok()?;
+    let flags = super::resume::member_flags(&ctx.state_root, key, id, &record).ok()?;
     Some(Member {
         id: id.into(),
         record,
@@ -585,11 +585,10 @@ pub fn parent_level(
             text(records[x].get("name"))
         ),
     };
-    let client = records
-        .get(p)
-        .and_then(|r| super::spawn::client_named(&text(r.get("client"))))
-        .ok_or_else(broken)?;
-    let flags = super::resume::recorded_flags(&ctx.state_root, &caller.server_key, p)
+    let parent_record = records.get(p).ok_or_else(broken)?;
+    let client =
+        super::spawn::client_named(&text(parent_record.get("client"))).ok_or_else(broken)?;
+    let flags = super::resume::member_flags(&ctx.state_root, &caller.server_key, p, parent_record)
         .map_err(|_| broken())?;
     Ok(team::policy(client, &flags))
 }

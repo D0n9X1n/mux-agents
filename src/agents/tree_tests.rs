@@ -1568,3 +1568,124 @@ fn the_hook_chain_proves_and_a_non_shell_link_is_tagged() {
         "every verb refuses it, read -Count included"
     );
 }
+
+// E2: the level a lifecycle parent grants is read from its options, not from a folder-level spec.
+#[test]
+fn a_lifecycle_parents_level_is_read_from_its_options() {
+    let m = member_world();
+    let found = t::read(&t::path(&m.state, "$3")).unwrap().unwrap();
+    let grandchild = "cccccccccccc";
+    let mut parent = m.record(ID);
+    parent["lifecycle"] = json!(1);
+    parent["options"] = json!(t::permission_flags(Client::Claude, t::Policy::Bypass));
+    let mut records = BTreeMap::new();
+    records.insert(ID.to_string(), parent.clone());
+    records.insert(grandchild.to_string(), child(grandchild, ID, 2));
+    let level = |records: &BTreeMap<String, Value>| {
+        parent_level(&m.w.ctx, &m.c, &found, records, grandchild)
+    };
+    assert_eq!(level(&records), Ok(t::Policy::Bypass));
+    parent.as_object_mut().unwrap().remove("lifecycle");
+    records.insert(ID.to_string(), parent);
+    assert_eq!(
+        level(&records),
+        Ok(t::Policy::Default),
+        "pre-lifecycle: the spec, --effort high"
+    );
+}
+
+/// A person's in-team resume of lifecycle member X (the leader's child) whose stored options are `options`, in a team
+/// `up` made with `up_flags`. X's folder-level spec says `--effort high`, so only the options can give it Bypass.
+/// Returns the world, the result, and the server folder's tree just before the resume.
+fn lifecycle_resume(
+    up_flags: &[String],
+    options: &[String],
+    launches: bool,
+) -> (World, Res<Map<String, Value>>, crate::testing::Tree) {
+    let w = World::human("");
+    team_record(&w, &up_flags.iter().map(String::as_str).collect::<Vec<_>>());
+    let x = "dddddddddddd";
+    let mut rx = child(x, LEADER, 1);
+    (rx["sessionId"], rx["lifecycle"], rx["options"]) = (
+        json!("22222222-2222-4222-8222-222222222222"),
+        json!(1),
+        json!(options),
+    );
+    let rx = cf::member(&w, x, rx);
+    write(
+        &w.folder(x).join("spec.json"),
+        json!({"flags": ["--effort", "high"]}),
+    );
+    let rows = vec![cf::member(&w, LEADER, leader_record())];
+    cf::online(&w);
+    facts_of(
+        &w,
+        &crate::agents::membership::team(&w.caller()),
+        &rows,
+        &rx,
+    );
+    if launches {
+        launch_ok(&w);
+    }
+    let before = crate::testing::tree(&w.state());
+    let got = crate::agents::resume::resume(&w.ctx, &w.request(&["resume", x]));
+    (w, got, before)
+}
+
+// E2 in a team: bypass options stored under a Bypass team replay as they are.
+#[test]
+fn a_lifecycle_member_replays_bypass_options_under_a_bypass_team() {
+    let bypass = t::permission_flags(Client::Claude, t::Policy::Bypass);
+    let (w, got, _) = lifecycle_resume(&bypass, &bypass, true);
+    let y = got.unwrap()["agent"]["id"].as_str().unwrap().to_string();
+    let spec = crate::state::fs::read_json(&w.folder(&y).join("spec.json"))
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        spec["flags"],
+        json!(bypass),
+        "replayed within the Bypass ceiling"
+    );
+    w.fakes.hc_done().unwrap();
+}
+
+// E2 in a team: options above the team ceiling are refused by replay itself (its message, not `bound`'s), and
+// nothing is launched or made.
+#[test]
+fn a_lifecycle_member_above_the_team_ceiling_is_refused() {
+    let bypass = t::permission_flags(Client::Claude, t::Policy::Bypass);
+    let (w, got, before) = lifecycle_resume(&[], &bypass, false);
+    let e = got.unwrap_err();
+    assert_eq!(
+        (e.code, e.check, e.message.as_str()),
+        (2, "ceiling", "the replayed options exceed the team ceiling")
+    );
+    assert!(
+        !w.fakes.hc_calls().iter().any(|c| c.1[0] == "run"),
+        "nothing launched"
+    );
+    assert_eq!(crate::testing::tree(&w.state()), before, "nothing made");
+    w.fakes.hc_done().unwrap();
+}
+
+// E2: a proven lifecycle member's flags are its stored options, never its spec (`--effort high`); none: unproven.
+#[test]
+fn a_proven_lifecycle_members_flags_are_its_stored_options() {
+    let m = member_world();
+    m.reparent();
+    let mut r = m.record(ID);
+    (r["lifecycle"], r["options"]) = (json!(1), json!(["--model", "x"]));
+    write(&m.folder(ID).join("record.json"), r.clone());
+    assert_eq!(
+        prove(&m, ID, Some(150)).map(|x| x.flags),
+        Some(vec!["--model".to_string(), "x".into()])
+    );
+    r.as_object_mut().unwrap().remove("options");
+    write(&m.folder(ID).join("record.json"), r);
+    assert_eq!(
+        prove(&m, ID, Some(150)),
+        None,
+        "no stored options: unproven"
+    );
+    m.w.fakes.hc_done().unwrap();
+}

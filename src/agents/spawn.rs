@@ -4086,6 +4086,11 @@ impl Launch<'_> {
                 "model",
                 "generation",
                 "team",
+                // A2a: the successor is launched pre-lifecycle with folder-level files, and its spec holds the
+                // replayed options. A3 Task 10 makes it a lifecycle record through `forward`.
+                "lifecycle",
+                "options",
+                "prompt",
             ] {
                 fields.remove(k);
             }

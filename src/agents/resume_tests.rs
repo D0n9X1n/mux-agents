@@ -1435,3 +1435,115 @@ fn send_by_name_reaches_the_successor_of_one_of_two_ended_members() {
         w.fakes.hc_done().unwrap();
     }
 }
+
+// E2: a lifecycle member resumes with exactly its stored options: never the spec flags, the prompt or a session
+// choice. The successor is still launched pre-lifecycle, so it keeps neither mark, options nor prompt (A3 Task 10).
+#[test]
+fn a_lifecycle_member_resumes_with_its_stored_options_only() {
+    let w = World::human("");
+    let x = member(
+        &w,
+        ID,
+        json!({"client": "claude", "pane": "%5", "window": "@1", "depth": 1,
+        "lifecycle": 1, "options": ["--model", "x"], "prompt": ["fix"]}),
+    );
+    let before = folders(&w);
+    w.panes(&[]);
+    facts(&w, &[(&x, "exited")]);
+    launches(&w, "t1");
+    resume_of(&w, ID).unwrap();
+    let y = new_folder(&w, &before);
+    let spec = read_json(&y.join("spec.json")).unwrap().unwrap();
+    assert_eq!(
+        (&spec["flags"], &spec["args"]),
+        (&json!(["--model", "x"]), &json!(["--resume", SESSION_ID]))
+    );
+    let r = record_of(&w, y.file_name().unwrap().to_str().unwrap());
+    for k in ["lifecycle", "options", "prompt"] {
+        assert!(r.get(k).is_none(), "{k}");
+    }
+    w.fakes.hc_done().unwrap();
+}
+
+// E2: stored options that carry a session choice or a prompt, or are not text, launch nothing and make nothing.
+#[test]
+fn a_lifecycle_member_whose_options_are_not_pure_is_refused() {
+    for (options, check) in [
+        (json!(["--resume", "s"]), "usage"),
+        (json!(["fix"]), "usage"),
+        (json!(["--model", 1]), "internal"),
+        (json!(null), "internal"),
+    ] {
+        let w = World::human("");
+        let x = member(
+            &w,
+            ID,
+            json!({"client": "claude", "pane": "%5", "window": "@1", "depth": 1,
+            "lifecycle": 1, "options": options.clone()}),
+        );
+        w.panes(&[]);
+        facts(&w, &[(&x, "exited")]);
+        launches(&w, "t1");
+        let before = crate::testing::tree(&w.state());
+        let e = resume_of(&w, ID).unwrap_err();
+        assert_eq!(e.check, check, "{options}");
+        assert_eq!(runs(&w), 0, "{options}: nothing launched");
+        assert_eq!(
+            crate::testing::tree(&w.state()),
+            before,
+            "{options}: nothing made"
+        );
+    }
+}
+
+// E2: replayed options are held to the team ceiling; outside a team there is none, and replay still refuses a
+// prompt or a session choice.
+#[test]
+fn the_replay_ceiling_is_the_teams_else_bypass() {
+    use crate::agents::{
+        options::replay,
+        team::{Policy, Team, permission_flags},
+    };
+    use crate::parse::Client;
+    assert_eq!(ceiling(None), Policy::Bypass);
+    let team = Team {
+        team: "t".into(),
+        session: "$3".into(),
+        name: "s".into(),
+        directory: "/work".into(),
+        client: Client::Claude,
+        flags: Vec::new(),
+        policy: Policy::Default,
+        leader: "111111111111".into(),
+        created_at: "x".into(),
+    };
+    assert_eq!(ceiling(Some(&team)), Policy::Default);
+    let above = permission_flags(Client::Claude, Policy::Bypass);
+    assert_eq!(
+        replay(Client::Claude, &above, ceiling(Some(&team)))
+            .unwrap_err()
+            .check,
+        "ceiling"
+    );
+    let bypass = Team {
+        policy: Policy::Bypass,
+        ..team
+    };
+    assert_eq!(ceiling(Some(&bypass)), Policy::Bypass);
+    assert_eq!(
+        replay(Client::Claude, &above, ceiling(Some(&bypass))),
+        Ok(above.clone())
+    );
+}
+
+// The one choice of flags: the options of a lifecycle record, never its spec; the spec of any other member.
+#[test]
+fn a_lifecycle_records_flags_are_its_options_never_its_spec() {
+    let w = World::human("");
+    let mut r = member(&w, ID, json!({"lifecycle": 1, "options": ["--model", "x"]}));
+    let key = w.caller().server_key;
+    let flags = |r: &Value| member_flags(&w.ctx.state_root, &key, ID, r).unwrap();
+    assert_eq!(flags(&r), ["--model", "x"]);
+    r.as_object_mut().unwrap().remove("lifecycle");
+    assert_eq!(flags(&r), client_flags(client_named("claude").unwrap()));
+}

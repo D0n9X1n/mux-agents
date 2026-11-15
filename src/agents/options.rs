@@ -70,6 +70,20 @@ pub fn replay(client: Client, stored: &[String], ceiling: super::team::Policy) -
     Ok(again.options)
 }
 
+/// E2: the options a lifecycle record stores, the one reader of `record.options`. Missing, or not all text,
+/// refuses: a relaunch never runs with options it cannot read.
+pub fn stored(record: &serde_json::Value) -> Res<Vec<String>> {
+    let missing = || crate::error::Refusal::internal("the member records no options");
+    let list = record
+        .get("options")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(missing)?;
+    list.iter()
+        .map(|v| v.as_str().map(String::from))
+        .collect::<Option<Vec<_>>>()
+        .ok_or_else(missing)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -459,5 +473,21 @@ mod tests {
             Policy::Default
         );
         assert_eq!(refused(classify(Client::Claude, &unknown)), usage());
+    }
+
+    #[test]
+    fn stored_reads_text_options_only() {
+        use serde_json::json;
+        let want: Vec<String> = vec!["--model".into(), "x".into()];
+        assert_eq!(stored(&json!({"options": ["--model", "x"]})).unwrap(), want);
+        assert!(stored(&json!({"options": []})).unwrap().is_empty());
+        for bad in [
+            json!({}),
+            json!({"options": "x"}),
+            json!({"options": [1]}),
+            json!({"options": null}),
+        ] {
+            assert_eq!(stored(&bad).map_err(|e| e.check), Err("internal"), "{bad}");
+        }
     }
 }
