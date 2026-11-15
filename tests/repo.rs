@@ -2573,10 +2573,13 @@ fn legacy_stop_authority_is_absent() {
 #[test]
 fn skill_teaches_team_messaging() {
     let skill = std::fs::read_to_string("skills/mux-agents/SKILL.md").unwrap();
+    // Every Commands line is a runnable command (tests/shim.sh runs each); the choices of target are prose.
     for want in [
-        r#""<entry>" send <name|parent|leader|children|team> -BodyFile <body-file>"#,
-        r#""<entry>" send <name|parent|leader> -BodyFile <body-file> -Re <id>"#,
-        r#""<entry>" send <target> -BodyFile <body-file> -Id <id>"#,
+        r#""<entry>" send leader -BodyFile <body-file>"#,
+        r#""<entry>" send team -BodyFile <body-file>"#,
+        r#""<entry>" send parent -BodyFile <body-file> -Re <id>"#,
+        r#""<entry>" send <name> -BodyFile <body-file> -Id <id>"#,
+        "a name, `parent`, `leader`, `children` (your children) or `team`",
         "hop 4",
         "120 messages",
         "-Id <id>",

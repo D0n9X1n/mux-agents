@@ -39,9 +39,12 @@ The commands below, and the Reply and Listen lines, run as-is in the Bash tool. 
 "<entry>" list -All
 "<entry>" focus <name>
 "<entry>" focus -Next
-"<entry>" send <name|parent|leader|children|team> -BodyFile <body-file>
-"<entry>" send <name|parent|leader> -BodyFile <body-file> -Re <id>
-"<entry>" send <target> -BodyFile <body-file> -Id <id>
+"<entry>" send <name> -BodyFile <body-file>
+"<entry>" send parent -BodyFile <body-file>
+"<entry>" send leader -BodyFile <body-file>
+"<entry>" send team -BodyFile <body-file>
+"<entry>" send parent -BodyFile <body-file> -Re <id>
+"<entry>" send <name> -BodyFile <body-file> -Id <id>
 "<entry>" status -BodyFile <status-file>
 "<entry>" read -Wait <seconds>
 "<entry>" read <name> -Lines <n>
