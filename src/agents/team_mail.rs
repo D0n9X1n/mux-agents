@@ -137,6 +137,25 @@ pub fn write_intent(root: &Path, sender: &str, value: &Value) -> Res<()> {
     )
 }
 
+/// 1 `mail` naming the send by its id: a retry with `-Id <id>` finishes it (F4, M5).
+fn unsaved(id: &str, delivered: &[String]) -> crate::error::Refusal {
+    refuse::<()>(
+        1,
+        "mail",
+        format!("the message could not be saved; retry with -Id {id}"),
+    )
+    .unwrap_err()
+    .with("id", id.to_string())
+    .with("delivered", json!(delivered))
+}
+
+/// Flushes intent `id` again: its file, its folder, and every folder entry up to the server folder.
+fn settle(root: &Path, sender: &str, id: &str) -> Res<()> {
+    crate::state::fs::sync_file(&root.join(sender).join(format!("{id}.json")))?;
+    crate::state::fs::sync_dir(&root.join(sender))?;
+    durable_dir(&root.join(sender), base_of(root))
+}
+
 pub enum Found {
     Mine(Value),
     Other,
@@ -385,7 +404,10 @@ pub fn route(ctx: &Ctx, caller: &Caller, request: &Request, body: &str) -> Res<R
             let hash = crate::util::sha256_hex(body);
             let intent = match &id {
                 Some(id) => match find_intent(&root, &owner, id)? {
-                    Found::Mine(i) if super::text(i.get("bodyHash")) == hash => i,
+                    Found::Mine(i) if super::text(i.get("bodyHash")) == hash => {
+                        settle(&root, &owner, id).map_err(|_| unsaved(id, &[]))?;
+                        i
+                    }
                     Found::Mine(_) | Found::Other => {
                         return refuse(2, "id", "that id belongs to a different send");
                     }
@@ -400,7 +422,15 @@ pub fn route(ctx: &Ctx, caller: &Caller, request: &Request, body: &str) -> Res<R
                     charge(ctx, &root.join(&owner), sender.id.is_some())?;
                     let i = json!({"id": fresh_id(&root, new_id)?, "sender": owner, "at": utc_o(ctx.clock.now()),
                     "bodyHash": hash, "cast": cast, "re": re, "hop": hop, "recipients": recipients});
-                    write_intent(&root, &owner, &i)?;
+                    if let Err(e) = write_intent(&root, &owner, &i) {
+                        // Renamed but maybe not flushed: the intent may outlive a crash, and its id is the way back.
+                        let id = super::text(i.get("id"));
+                        return Err(if root.join(&owner).join(format!("{id}.json")).exists() {
+                            unsaved(&id, &[])
+                        } else {
+                            e
+                        });
+                    }
                     i
                 }
             };
@@ -531,14 +561,7 @@ fn deliver(
                 "cast": intent["cast"]});
             if super::mail::deliver_once(ctx, caller, &super::text(r.get("box")), &message).is_err()
             {
-                return Err(refuse::<()>(
-                    1,
-                    "mail",
-                    format!("the message could not be saved; retry with -Id {id}"),
-                )
-                .unwrap_err()
-                .with("id", id.clone())
-                .with("delivered", json!(delivered)));
+                return Err(unsaved(&id, &delivered));
             }
             delivered.push(super::text(r.get("name")));
         }

@@ -671,3 +671,40 @@ fn an_id_must_be_this_send() {
     }
     assert_eq!(inbox(&w, LEADER).len(), 1);
 }
+
+#[test]
+fn an_uncertain_intent_returns_its_id_and_the_retry_settles_it() {
+    let w = team_world();
+    online(&w);
+    let dir = sends_dir(&crate::agents::server_dir(&w.ctx, &w.caller()), "$3", A);
+    std::fs::create_dir_all(&dir).unwrap();
+    crate::state::fs::fail_sync_dir(Some(&dir));
+    let e = go(&w, Some(A), &["send", "leader", "-Body", "hi"]);
+    assert!(e.is_err(), "an unflushed intent is no send yet");
+    let e = e.unwrap_err();
+    assert_eq!((e.code, e.check), (1, "mail"), "{}", e.message);
+    let id = e.details["id"].as_str().unwrap().to_string();
+    assert_eq!(
+        e.message,
+        format!("the message could not be saved; retry with -Id {id}")
+    );
+    assert!(
+        inbox(&w, LEADER).is_empty(),
+        "nothing delivered before the intent is durable"
+    );
+    online(&w);
+    assert_eq!(
+        go(&w, Some(A), &["send", "leader", "-Body", "hi", "-Id", &id])
+            .unwrap_err()
+            .check,
+        "mail",
+        "the retry flushes again"
+    );
+    crate::state::fs::fail_sync_dir(None);
+    online(&w);
+    assert_eq!(
+        go(&w, Some(A), &["send", "leader", "-Body", "hi", "-Id", &id]).unwrap()["id"],
+        id.as_str()
+    );
+    assert_eq!((inbox(&w, LEADER).len(), a_sends(&w)), (1, 1));
+}
