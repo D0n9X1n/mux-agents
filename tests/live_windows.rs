@@ -91,23 +91,31 @@ impl Live {
             }
         }
         live.core.start();
-        let mut start = live.rmux();
-        start.args(["new-session", "-d", "-s", "it", "-x", "200", "-y", "50"]);
-        for (name, value) in &live.core.env {
-            start.arg("-e").arg(assign(name, value));
+        live.root = live.new_session("it");
+        Some(live)
+    }
+
+    /// A detached session `name` whose one pane runs `cmd.exe` with the private core's environment and this test's
+    /// state root (`MUX_AGENTS_STATE`); its pane id, once the prompt shows. Every session of a test is made here, so
+    /// each gets the same environment as the first.
+    fn new_session(&self, name: &str) -> String {
+        let mut start = self.rmux();
+        start.args(["new-session", "-d", "-s", name, "-x", "200", "-y", "50"]);
+        for (key, value) in &self.core.env {
+            start.arg("-e").arg(assign(key, value));
         }
         start.arg("-e").arg(assign(
             "MUX_AGENTS_STATE",
-            live.dir.join("state").as_os_str(),
+            self.dir.join("state").as_os_str(),
         ));
         let out = start.arg("cmd.exe").output().unwrap();
-        assert!(out.status.success(), "new-session: {out:?}");
-        live.root = live
-            .call(&["list-panes", "-a", "-F", "#{pane_id}"])
+        assert!(out.status.success(), "new-session {name}: {out:?}");
+        let pane = self
+            .call(&["list-panes", "-t", name, "-F", "#{pane_id}"])
             .trim()
             .to_string();
-        live.prompt(&live.root.clone());
-        Some(live)
+        self.prompt(&pane);
+        pane
     }
 
     /// The server and every client need the same environment to resolve the named pipe.
@@ -1184,11 +1192,8 @@ fn team_messaging_stays_in_the_team() {
     };
     let a = spawn(&mut sent, &leader, "a");
     let b = spawn(&mut sent, &a, "b");
-    live.call(&["new-session", "-d", "-s", "t2"]);
-    let pane = live
-        .call(&["list-panes", "-t", "t2", "-F", "#{pane_id}"])
-        .trim()
-        .to_string();
+    // T2's session gets the first session's environment and state root (QA round 2, finding 3).
+    let pane = live.new_session("t2");
     let up2 = live.run_at(&pane, &live.dir.join("t2"), &["up", "-Client", "claude"]);
     assert_eq!(up2["ok"], true, "{up2}");
     spawn(&mut sent, &s(&up2["leader"]["id"]), "x");
