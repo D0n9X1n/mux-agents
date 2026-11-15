@@ -625,6 +625,77 @@ pub fn ack(
     })
 }
 
+/// R7: held message `id` whole (64 KB at most, outside the budget) as its own receipt in `idPending`; re-served
+/// unchanged to the same owner until acked. Not held: 2 `usage`.
+pub fn serve_id(
+    ctx: &Ctx,
+    caller: &Caller,
+    key: &str,
+    owner: &Owner,
+    id: &str,
+    current: &dyn Fn() -> bool,
+) -> Res<Option<Receipt>> {
+    let mail = mail_dir(ctx, caller)?;
+    super::lock(ctx, &super::lock_key("mail", caller, key), || {
+        if !current() {
+            return Ok(None);
+        }
+        let mut c = receipt::load(&mail, key)?;
+        receipt::gate(&mail, &c)?;
+        if !c.held.iter().any(|h| h == id) {
+            return refuse(2, "usage", "that message is not held; run mux-agent read");
+        }
+        if let Some(r) = c
+            .id_pending
+            .as_ref()
+            .filter(|r| r.owner == *owner && r.ids == [id])
+        {
+            return Ok(Some(r.clone()));
+        }
+        let (found, _) = unread_after(&mail.join(format!("{key}.jsonl")), 0)?;
+        let Some((m, _)) = found
+            .into_iter()
+            .find(|(m, _)| super::text(m.get("id")) == id)
+        else {
+            return Err(Refusal::internal("a held message is missing"));
+        };
+        let r = Receipt {
+            batch: super::team_mail::new_id()?,
+            owner: owner.clone(),
+            ids: vec![id.into()],
+            refs: Vec::new(),
+            end: c.offset,
+            text: entry(&m),
+        };
+        c.id_pending = Some(r.clone());
+        c.uncertain = None;
+        receipt::commit(&mail, key, &c)
+            .or_else(|_| refuse(1, "mail", "the receipt could not be saved; retry"))?;
+        Ok(Some(r))
+    })
+}
+
+/// R8: read-only, never creating a folder: `badge` = unread + held, `wake` = unread after `offset`, `end` = snapshot end.
+#[derive(Debug, PartialEq)]
+pub struct Counts {
+    pub badge: usize,
+    pub wake: usize,
+    pub end: u64,
+}
+
+pub fn counts(ctx: &Ctx, caller: &Caller, key: &str) -> Res<Counts> {
+    let mail = super::server_dir(ctx, caller).join("mail");
+    super::lock(ctx, &super::lock_key("mail", caller, key), || {
+        let c = receipt::load(&mail, key).unwrap_or_default();
+        let (found, end) = unread_after(&mail.join(format!("{key}.jsonl")), c.offset)?;
+        Ok(Counts {
+            badge: found.len() + c.held.len(),
+            wake: found.len(),
+            end,
+        })
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -882,6 +953,107 @@ mod tests {
             ak(&w, "a", &r.batch).unwrap();
         }
         assert_eq!(ak(&w, "a", &first).unwrap_err().message, "stale receipt");
+    }
+
+    fn sid(w: &World, o: &str, id: &str) -> Res<Option<Receipt>> {
+        serve_id(&w.ctx, &w.caller(), "pane-1", &me(o), id, &|| true)
+    }
+
+    /// H1 (5000 bytes) served as a reference and acked: held.
+    fn held_h1(w: &World) {
+        deliver_once(&w.ctx, &w.caller(), "pane-1", &sized(H1, 5000, "x")).unwrap();
+        let r = sv(w, "a").unwrap().unwrap();
+        assert_eq!(r.refs, [H1]);
+        ak(w, "a", &r.batch).unwrap();
+    }
+
+    #[test]
+    fn a_held_body_is_its_own_receipt() {
+        let w = World::human("");
+        held_h1(&w);
+        let r = sid(&w, "a", H1).unwrap().unwrap();
+        assert!(
+            r.text
+                .starts_with("[mux-agent from a (%5) #1111111111111111]\n")
+                && r.text.len() == 5000,
+            "the whole body, outside the budget"
+        );
+        assert_eq!(
+            sid(&w, "a", H1).unwrap().unwrap(),
+            r,
+            "death before the ack: still held, same receipt"
+        );
+        let mail = w.state().join("mail");
+        assert_eq!(receipt::load(&mail, "pane-1").unwrap().held, [H1]);
+        assert!(matches!(ak(&w, "a", &r.batch).unwrap(), Acked::Done));
+        assert!(
+            receipt::load(&mail, "pane-1").unwrap().held.is_empty(),
+            "the ack unholds"
+        );
+        assert!(matches!(ak(&w, "a", &r.batch).unwrap(), Acked::Duplicate));
+        assert_eq!(
+            sid(&w, "a", H1).unwrap_err().check,
+            "usage",
+            "no longer held"
+        );
+    }
+
+    #[test]
+    fn held_mail_counts_in_badge_never_wake() {
+        let w = World::human("");
+        held_h1(&w);
+        let c = counts(&w.ctx, &w.caller(), "pane-1").unwrap();
+        assert_eq!((c.badge, c.wake), (1, 0), "held: badge only");
+        put(&w, H2, "two");
+        let c = counts(&w.ctx, &w.caller(), "pane-1").unwrap();
+        let len = std::fs::metadata(w.state().join("mail").join("pane-1.jsonl"))
+            .unwrap()
+            .len();
+        assert_eq!(
+            (c.badge, c.wake, c.end),
+            (2, 1, len),
+            "new mail behind a held reference wakes"
+        );
+    }
+
+    #[test]
+    fn another_reader_completes_the_flush_and_the_retry_is_a_duplicate() {
+        for crossed in [false, true] {
+            let w = World::human("");
+            held_h1(&w);
+            put(&w, H2, "two");
+            let mail = w.state().join("mail");
+            let first = if crossed {
+                sid(&w, "a", H1)
+            } else {
+                sv(&w, "a")
+            }
+            .unwrap()
+            .unwrap();
+            crate::state::fs::fail_sync_dir(Some(&mail));
+            assert_eq!(
+                ak(&w, "a", &first.batch).unwrap_err().check,
+                "mail",
+                "{crossed}: renamed, folder unflushed"
+            );
+            crate::state::fs::fail_sync_dir(None);
+            // Another reader: its operation flushes the folder (the gate), then it is served and acks.
+            let other = if crossed {
+                sv(&w, "a")
+            } else {
+                sid(&w, "a", H1)
+            }
+            .unwrap()
+            .unwrap();
+            assert!(
+                matches!(ak(&w, "a", &other.batch).unwrap(), Acked::Done),
+                "{crossed}"
+            );
+            assert!(
+                matches!(ak(&w, "a", &first.batch).unwrap(), Acked::Duplicate),
+                "{crossed}: the retry is retired"
+            );
+        }
     }
 
     fn msg(id: &str, re: Option<&str>, hop: u64, cast: Option<&str>) -> Value {
