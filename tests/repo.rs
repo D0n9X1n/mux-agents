@@ -2544,6 +2544,30 @@ fn usage_says_a_teams_n_selects_and_enter_opens() {
     );
 }
 
+// #137: a reopened view (`resume`, `focus` after its view closed, `sidebar` from a person pane) opens in the caller's
+// window, with a bar beside it; the Chinese twin has a line with the same code spans.
+#[test]
+fn usage_says_reopened_views_open_in_the_callers_window() {
+    let en = section(&wiki_text("Usage"), "Side bar");
+    let zh = section(&wiki_text("Usage-zh-CN"), "侧边栏");
+    let line = en
+        .iter()
+        .find(|l| l.contains("opens in the caller's window, with a bar beside it"))
+        .unwrap_or_else(|| panic!("## Side bar does not say where a reopened view opens: {en:#?}"));
+    for needle in ["`resume`", "`focus`", "`sidebar`"] {
+        assert!(
+            line.contains(needle),
+            "the reopened-view line lacks {needle}: {line}"
+        );
+    }
+    let spans = spans_and_numbers(line);
+    assert!(
+        zh.iter()
+            .any(|l| l.contains("在调用者的窗口中打开") && spans_and_numbers(l) == spans),
+        "## 侧边栏 has no twin line with the spans {spans:?}"
+    );
+}
+
 // #71: the integration job installs rmux at a pinned version and requires all three multiplexers, so a missing
 // one fails the live suite instead of skipping it.
 #[test]

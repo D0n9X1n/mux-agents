@@ -102,6 +102,8 @@ Click an agent's name line in the bar to switch to its window and pane. Clicks r
 
 In a team's bar (a session `up` started), `n`/`N` select the next or previous agent with a live view, wrapping, and do not switch on their own; Enter opens it.
 
+A reopened view (`resume`, `focus` after an agent's view was closed, or `sidebar` from a person pane) opens in the caller's window, with a bar beside it, not in the team's leader window: every agent view has a bar.
+
 ## Safety checks
 
 Agents start with permission prompts off, so mux-agents never gives an agent more than its caller already has. A `spawn` is refused, naming the check, unless:
