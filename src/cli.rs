@@ -169,7 +169,7 @@ pub static VERBS: &[VerbDef] = &[
         switches: &["Quiet"],
         min: 1,
         max: 1,
-        usage: "usage: mux-agent report <working|blocked|idle> [-Kind <permission|question>] [-Quiet] [-Text]",
+        usage: "usage: mux-agent report <working|blocked|idle|done> [-Kind <permission|question>] [-Quiet] [-Text]",
         handler: crate::agents::view::report,
         text: json::lines,
     },

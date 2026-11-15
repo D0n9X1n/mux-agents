@@ -177,10 +177,11 @@ pub fn status(ctx: &Ctx, request: &Request) -> Res<Map<String, Value>> {
 }
 
 /// What an agent's own client may report (herdr's OSC 7501 words; `done` is the reader's, never reported).
-const REPORTED: [&str; 3] = ["working", "blocked", "idle"];
+// `done` is reported by a member whose task is finished, before it listens (#103 4b-ii W5).
+const REPORTED: [&str; 4] = ["working", "blocked", "idle", "done"];
 const KINDS: [&str; 2] = ["permission", "question"];
 
-/// `report <working|blocked|idle> [-Kind <permission|question>]`: the agent's own state, as its client's hooks see it,
+/// `report <working|blocked|idle|done> [-Kind <permission|question>]`: the agent's own state, as its client's hooks see it,
 /// in activity.json under its agent lock. Enum words only, never free text. `since` moves only when the state or its
 /// kind changes; an unreadable file counts as none.
 pub fn report(ctx: &Ctx, request: &Request) -> Res<Map<String, Value>> {
@@ -829,7 +830,7 @@ mod tests {
     #[test]
     fn report_only_agent_enum_only() {
         let target = "2 target only an agent reports its activity";
-        let usage = "2 usage usage: mux-agent report <working|blocked|idle> [-Kind <permission|question>] [-Quiet] [-Text]";
+        let usage = "2 usage usage: mux-agent report <working|blocked|idle|done> [-Kind <permission|question>] [-Quiet] [-Text]";
         // A human pane with a tag and a record.
         let w = World::human(ID);
         w.agent_record(ID, json!({"pane": "%1"}));
@@ -844,7 +845,7 @@ mod tests {
         w.fakes.clear_log();
         // Any other word, a kind on a state that is not blocked, or another kind refuses before the caller is resolved.
         for args in [
-            &["report", "done"][..],
+            &["report", "finished"][..],
             &["report", "Working"],
             &["report", "idle", "-Kind", "question"],
             &["report", "blocked", "-Kind", "auth"],

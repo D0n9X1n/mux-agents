@@ -427,6 +427,7 @@ fn activity(
     let since = at(reported, "since");
     let word = match (state, since) {
         (Some("blocked"), Some(_)) => "blocked",
+        (Some("done"), Some(_)) => "done",
         (Some("working"), Some(_)) => "working",
         (Some("idle"), Some(since)) => match at(seen, "since") {
             Some(seen) if seen >= since => "idle",
@@ -518,6 +519,13 @@ fn team_leader(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_reported_done_is_done() {
+        let now = crate::util::parse_utc("2026-03-01T00:01:00Z").unwrap();
+        let r = json!({"state": "done", "kind": null, "since": "2026-03-01T00:00:00.0000000Z"});
+        assert_eq!(activity(Some(&r), None, None, now), ("done", Some(60)));
+    }
     use crate::agents::fixture::{ID, SESSION_ID, World, write};
     use crate::agents::lock_key;
     use crate::agents::mail::{add_mail, read_mail};

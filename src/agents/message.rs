@@ -1651,6 +1651,32 @@ mod tests {
         w
     }
 
+    #[test]
+    fn report_done_is_recorded_and_keeps_the_lease() {
+        let w = waiting_world();
+        w.fakes.process(crate::testing::row(77, 1, 770));
+        // A valid lease: the current owner, a future expiry.
+        write(
+            &w.folder(ID).join("waiting-77.json"),
+            json!({"pid": 77, "start": 770, "since": SINCE,
+                "owner": {"id": ID, "gen": "0"}, "until": "2999-01-01T00:00:00.0000000Z"}),
+        );
+        let r = crate::agents::view::report(&w.ctx, &w.request(&["report", "done"]));
+        assert!(r.is_ok(), "done is a report word: {r:?}");
+        let r = r.unwrap();
+        assert_eq!(r["state"], "done");
+        assert_eq!(
+            read_json(&w.folder(ID).join("activity.json"))
+                .unwrap()
+                .unwrap()["state"],
+            "done"
+        );
+        assert!(
+            w.folder(ID).join("waiting-77.json").exists(),
+            "done clears no lease"
+        );
+    }
+
     // The waiting files in the caller's folder, by name.
     fn waiting_names(w: &World) -> Vec<String> {
         let mut names: Vec<String> = std::fs::read_dir(w.folder(ID))
