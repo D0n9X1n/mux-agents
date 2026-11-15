@@ -5502,12 +5502,12 @@ hc {}:
             // The side bars are left out of the nonce check only: a bar draws each member's doing line, which for the
             // leader is the first line of the mail it last sent (`send` writes last-sent.json; board::select_doing
             // falls back status, message, task). That is the bar's own drawing, not input typed into a terminal.
-            let bars: Vec<String> = live
-                .bars()
-                .iter()
-                .map(|b| b.split('|').next().unwrap().to_string())
-                .collect();
-            for pane in live.panes("#{pane_id}") {
+            // Each pane with its role, read in one listing: a side bar is any pane whose role is `sidebar`, whatever
+            // agent id it carries.
+            for row in live.panes("#{pane_id}|#{@agent-role}") {
+                let (pane, role) = row.split_once('|').unwrap_or((row.as_str(), ""));
+                let pane = pane.to_string();
+                let is_bar = role == "sidebar";
                 // Only sender A's own view pane may close between the list and its capture; any other pane that is
                 // gone, or any other capture failure, fails the test.
                 let out = live.server.try_call(&["capture-pane", "-p", "-t", &pane]);
@@ -5520,8 +5520,7 @@ hc {}:
                 assert!(out.status.success(), "{mux:?} capture {pane}: {out:?}");
                 let screen = String::from_utf8(out.stdout).unwrap();
                 assert!(
-                    (bars.contains(&pane) || !screen.contains("nonce-7f3a"))
-                        && !screen.contains("mail from"),
+                    (is_bar || !screen.contains("nonce-7f3a")) && !screen.contains("mail from"),
                     "{mux:?} {pane}: {screen}"
                 );
             }
