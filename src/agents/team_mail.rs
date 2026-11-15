@@ -426,6 +426,15 @@ fn route_team(
     if !team {
         return Ok(Routed::Legacy(None));
     }
+    // What the caller is decides 0.2 or team before any hc look (QA fix 3); a pane is a person's only when no agent
+    // record claims it (QA fix 1).
+    if caller.member.is_none() {
+        match claim(ctx, caller)? {
+            Claim::Unproven => return Err(super::tree::tagged()),
+            Claim::Agent => return Ok(Routed::Legacy(None)),
+            Claim::None | Claim::Member => {}
+        }
+    }
     let t = target(word)?;
     // Lock order (M2): team, then (in deliver) the agent of the sender, then each mailbox.
     super::lock(
@@ -435,14 +444,6 @@ fn route_team(
             let s = Snapshot::take(ctx, caller)?;
             if let Some(e) = &s.core_error {
                 return Err(e.clone());
-            }
-            // A pane is a person's only when no agent record claims it (QA fix 1).
-            if caller.member.is_none() {
-                match claim(ctx, caller)? {
-                    Claim::Unproven => return Err(super::tree::tagged()),
-                    Claim::Agent => return Ok(Routed::Legacy(Some(Box::new(s)))),
-                    Claim::None | Claim::Member => {}
-                }
             }
             let me = match s.reader(caller) {
                 Ok(me) => me,

@@ -547,7 +547,7 @@ fn a_non_member_agent_pane_keeps_0_2() {
     );
     w.recipients_live();
     w.file("b.md", b"done");
-    online(&w);
+    // A 0.2 caller is decided from its own record: no hc look (QA fix 3).
     assert_eq!(
         go(&w, None, &["send", "parent", "-BodyFile", "b.md"]).unwrap()["pane"],
         "%4",
@@ -566,7 +566,6 @@ fn a_non_member_agent_pane_keeps_0_2() {
         ][..],
         &["send", "%4", "-BodyFile", "b.md", "-Re", "ffffffffffffffff"][..],
     ] {
-        online(&w);
         let r = go(&w, None, args);
         assert!(r.is_err(), "{args:?} on the 0.2 path: {r:?}");
         assert_eq!(
@@ -1224,4 +1223,24 @@ fn a_committed_0_2_agent_pane_sends_as_itself() {
         "the 0.2 reply, as the agent: {r}"
     );
     assert_eq!(inbox(&w, LEADER)[0]["from"], "pw");
+}
+
+/// QA fix 3: whether a caller is 0.2 is decided from the caller, so a 0.2 send never needs hc.
+#[test]
+fn a_non_member_agent_pane_keeps_0_2_while_hc_is_down() {
+    let w = team_with(
+        World::agent("0000000000d4"),
+        rows(&["%1|@1|100|0000000000d4|pw", "%4|@1|101||"]),
+    );
+    w.agent_record(
+        "0000000000d4",
+        json!({"name": "pw", "pane": "%1", "parentPane": "%4"}),
+    );
+    w.recipients_live();
+    w.file("b.md", b"done");
+    // No `online`: hc is not installed.
+    let r = go(&w, None, &["send", "parent", "-BodyFile", "b.md"]);
+    assert!(r.is_ok(), "the 0.2 send needs no hc: {r:?}");
+    assert_eq!(r.unwrap()["pane"], "%4", "the 0.2 reply");
+    assert_eq!(inbox(&w, "pane-4").len(), 1);
 }
