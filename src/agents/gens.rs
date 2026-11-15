@@ -147,11 +147,31 @@ pub fn done(member: &Path, n: u64) -> Res<bool> {
     Ok(completing != Some(n))
 }
 
-/// Whether generation `n` committed (commit `{committed: true}`); `Unreadable` refuses.
+/// What a whole `commit.json` decides (launch-1 G4): only a lone `committed: true` runs. `aborted: true` stops, also
+/// beside `committed: true`; anything else is invalid and never runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Decision {
+    Run,
+    Aborted,
+    Invalid,
+}
+
+pub fn decide(commit: &Value) -> Decision {
+    let yes = |k: &str| commit.get(k) == Some(&Value::Bool(true));
+    if yes("aborted") {
+        Decision::Aborted
+    } else if yes("committed") {
+        Decision::Run
+    } else {
+        Decision::Invalid
+    }
+}
+
+/// Whether generation `n` committed: its commit decides `Run` (`decide`); `Unreadable` refuses.
 pub fn committed(member: &Path, n: u64) -> Res<bool> {
     Ok(read(member, n, "commit")
         .known()?
-        .is_some_and(|c| c.get("committed") == Some(&Value::Bool(true))))
+        .is_some_and(|c| decide(&c) == Decision::Run))
 }
 
 /// The client a generation proved (proof-0b K1a): the recorded launcher and the process it started, each as
@@ -435,6 +455,36 @@ mod tests {
                 assert!(reads.is_empty(), "{case}: opened {reads:?}");
             }
         }
+    }
+
+    // launch-1 G4: a lone `committed: true` runs; `aborted: true` stops even beside it; anything else never runs.
+    #[test]
+    fn a_commit_decides_only_when_committed_alone() {
+        for (body, want) in [
+            (json!({"committed": true}), Decision::Run),
+            (json!({"committed": true, "at": "x"}), Decision::Run),
+            (json!({"aborted": true}), Decision::Aborted),
+            (
+                json!({"committed": true, "aborted": true}),
+                Decision::Aborted,
+            ),
+            (json!({"committed": "true"}), Decision::Invalid),
+            (json!({"committed": false}), Decision::Invalid),
+            (json!({"committedAt": "x"}), Decision::Invalid),
+            (json!({"x": 1}), Decision::Invalid),
+            (json!(true), Decision::Invalid),
+            (json!(null), Decision::Invalid),
+        ] {
+            assert_eq!(decide(&body), want, "{body}");
+            let (_d, m) = member();
+            publish(&path(&m, 1, "commit"), &body).unwrap();
+            assert_eq!(committed(&m, 1).unwrap(), want == Decision::Run, "{body}");
+        }
+        let (_d, m) = member();
+        assert!(!committed(&m, 1).unwrap(), "absent");
+        std::fs::create_dir_all(dir(&m, 1)).unwrap();
+        std::fs::write(path(&m, 1, "commit"), br#"{"comm"#).unwrap();
+        assert_eq!(committed(&m, 1).map_err(|e| e.check), Err("evidence"));
     }
 
     // S6: an unreadable record.json stops done; it never means done.
