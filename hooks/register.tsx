@@ -2,7 +2,7 @@ import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register, Timer } from 'claude-code'
 
 import { activity } from './activity'
-import { pushAfterSend } from './push'
+import { arm, onSubmit } from './deliver'
 import { EMPTY, formatAge, isSpawn, look, mail, needYou, parseList, sections } from './board'
 
 const PANE = 'mux-agents'
@@ -154,6 +154,8 @@ export const register: Register = on => {
     } catch {
       // The pane still opens after a spawn; only the command is missing.
     }
+    // The wake timer of a member (deliver.ts): armed once per load, never with MUX_AGENTS_WAKE=0.
+    await arm($).catch(() => {})
     return next(e)
   })
   // Registered while eligible does not mean eligible now: the command checks again.
@@ -180,11 +182,11 @@ export const register: Register = on => {
       const command = String((e as { command?: unknown }).command ?? '')
       const out = typeof stdout === 'string' ? stdout : undefined
       openAfterSpawn($, command, out).catch(() => {})
-      // A send to a Claude Code session wakes it at once, as herdr delivers a message (#92).
-      pushAfterSend($, command, out)
     }
     return ran
   })
+  // Mail at the turn of an interactive prompt (deliver.ts W2); a plugin wake passes every hook but this one.
+  on('prompt.submit', async ($, e, next) => onSubmit($, e, next))
   // Any origin (the person, a plugin): the close goes on first; its answer is returned unchanged.
   on('ui.close', async ($, e, next) => {
     const closed = await next(e)

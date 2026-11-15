@@ -3,6 +3,8 @@
 // answered; anywhere else `report` refuses `target` and this session stops asking.
 import type { EngineInterface, Register } from 'claude-code'
 
+import { turnCompleted, turnStarted } from './deliver'
+
 type On = Parameters<Register>[0]
 type State = 'working' | 'blocked' | 'idle'
 
@@ -53,11 +55,11 @@ function report($: EngineInterface, state: State, kind?: string) {
 // The main loop only: a subagent's turns and tools (agentId) are not this agent's own.
 export const activity = (on: On) => {
   on('turn.start', async ($, e, next) => {
-    if (e.agentId === undefined) report($, 'working')
+    if (e.agentId === undefined) { report($, 'working'); turnStarted() }
     return next(e)
   })
   on('turn.complete', async ($, e, next) => {
-    if (e.agentId === undefined) report($, 'idle')
+    if (e.agentId === undefined) { report($, 'idle'); turnCompleted() }
     return next(e)
   })
   // A question to the person blocks until it is answered, then the turn works on.

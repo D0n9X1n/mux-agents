@@ -30,7 +30,7 @@ type Hold = { name: string; ms: number; skip?: number }
 type Live = { surfaces: string[] | 'reject'; env: Record<string, string>; deny: string[]; holds: Hold[] }
 function world(on: any, env: Record<string, string>, runs: object[], tool: { stdout: string; text: string; isError?: boolean } = { stdout: SPAWN_JSON, text: SPAWN_JSON }, answers: Answers = {}) {
   const seen = { registered: [] as object[], opened: [] as object[], closed: [] as string[], panes: new Set<string>(), argv: [] as string[][], init: [] as unknown[], status: [] as (string | undefined)[], settled: 0 }
-  const live: Live = { surfaces: ['terminal'], env: { ...env }, deny: [], holds: [] }
+  const live: Live = { surfaces: ['terminal'], env: { MUX_AGENTS_WAKE: '0', ...env }, deny: [], holds: [] }
   const clock = mock.clock(on)
   on('env.get', async (_: unknown, e: { name: string }) => {
     const hold = seen.panes.size ? live.holds.find(h => h.name === e.name) : undefined
