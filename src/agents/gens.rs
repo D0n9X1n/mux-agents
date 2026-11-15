@@ -122,6 +122,192 @@ pub fn pending(record: &Value) -> Option<u64> {
     record.get("pending")?.get("gen")?.as_u64()
 }
 
+/// What `record.json` says a member folder holds (S6, S7; R5). Every reader matches on it once.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Member {
+    Absent,
+    /// A record without `lifecycle: 1` (prelife-1c G10).
+    Pre(Value),
+    Life(Gen),
+    /// Torn, a FIFO, a folder, any link (at `record.json` or `<id>`), or invalid lifecycle fields.
+    Unreadable(Refusal),
+}
+
+/// A lifecycle member as `member_of` read it once (R1): its folder, its record and the generations the record names.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Gen {
+    folder: PathBuf,
+    record: Value,
+    active: Option<u64>,
+    pending: Option<u64>,
+}
+
+/// R5: one read through the walk; a refusal is never read again another way.
+pub fn member_of(folder: &Path) -> Member {
+    match record(folder) {
+        Evidence::Absent => Member::Absent,
+        Evidence::Present(r) if lifecycle(&r) => life_of(folder, r),
+        Evidence::Present(r) => Member::Pre(r),
+        Evidence::Unreadable => Member::Unreadable(evidence::unreadable()),
+    }
+}
+
+/// R5: every `<agents>/<id>` entry but a regular file, classified once, links kept (so `member_of` refuses them).
+pub fn members(agents: &Path) -> Res<Vec<(String, PathBuf, Member)>> {
+    let entries = match std::fs::read_dir(agents) {
+        Ok(e) => e,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(e.into()),
+    };
+    let mut all = Vec::new();
+    for entry in entries {
+        let entry = entry?;
+        let Some(id) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        if !crate::agents::agent_id(&id) || entry.file_type()?.is_file() {
+            continue;
+        }
+        let folder = entry.path();
+        let member = member_of(&folder);
+        all.push((id, folder, member));
+    }
+    all.sort_by(|a, b| a.0.cmp(&b.0));
+    Ok(all)
+}
+
+/// R5: invalid lifecycle fields refuse `internal`, including a pending generation equal to the active one.
+fn life_of(folder: &Path, record: Value) -> Member {
+    let invalid = || Member::Unreadable(Refusal::internal("invalid lifecycle record"));
+    let active = match record.get("generation") {
+        None => None,
+        Some(g) => match g.as_str().and_then(plain_gen) {
+            Some(n) => Some(n),
+            None => return invalid(),
+        },
+    };
+    let pending = match record.get("pending") {
+        None => None,
+        Some(p) => match p.get("gen").and_then(Value::as_u64) {
+            Some(n) => Some(n),
+            None => return invalid(),
+        },
+    };
+    if pending.is_some() && pending == active {
+        return invalid(); // G1.1: a pending generation is 1 + the highest named
+    }
+    Member::Life(Gen {
+        folder: folder.to_path_buf(),
+        record,
+        active,
+        pending,
+    })
+}
+
+/// R1, R2: generation n's completion markers and commit decision, each read once; Unreadable refuses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Marks {
+    pub abandoned: bool,
+    pub decision: Option<Decision>,
+    pub ended: bool,
+    pub released: bool,
+}
+
+impl Marks {
+    /// A done marker (S6): claim `abandoned`, commit `aborted`, `ended`, `released`.
+    pub fn any(&self) -> bool {
+        self.abandoned || self.decision == Some(Decision::Aborted) || self.ended || self.released
+    }
+}
+
+pub fn marks(member: &Path, n: u64) -> Res<Marks> {
+    Ok(Marks {
+        abandoned: claim(member, n).known()?.is_some_and(|c| c == "abandoned"),
+        decision: read(member, n, "commit").known()?.map(|c| decide(&c)),
+        ended: read(member, n, "ended").known()?.is_some(),
+        released: read(member, n, "released").known()?.is_some(),
+    })
+}
+
+/// R3, R4: every completion question about a lifecycle member, from one read (ambiguities 3, 13, 14).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Status {
+    /// The generation the member's identity stands for: pending if not done, else active.
+    pub subject: Option<u64>,
+    /// The subject is a pending generation (a held identity).
+    pub held: bool,
+    /// The subject's commit decides Run.
+    pub committed: bool,
+    /// The active generation's commit decides Run (presentation, notices, proof).
+    pub active_committed: bool,
+    /// Every generation the record names is done (R3): the member's name and slot are free.
+    pub finished: bool,
+    /// No active generation, and no pending one or one voided before it ran.
+    pub never_ran: bool,
+    /// The pending generation's own `done` (S6), or None when the record names none (R3: membership frees exactly
+    /// the done generations' hc terminals, `core_facts::take`; a lifecycle notice waits for `active_done`).
+    pub pending_done: Option<bool>,
+    /// The active generation's own `done`, or None when the record names none.
+    pub active_done: Option<bool>,
+}
+
+impl Gen {
+    pub fn record(&self) -> &Value {
+        &self.record
+    }
+
+    pub fn folder(&self) -> &Path {
+        &self.folder
+    }
+
+    pub fn active(&self) -> Option<u64> {
+        self.active
+    }
+
+    pub fn pending(&self) -> Option<u64> {
+        self.pending
+    }
+
+    /// `gens/<n>/<file>.json` through the walk; the caller names the generation (R4).
+    pub fn read(&self, n: u64, file: &str) -> Evidence {
+        read(&self.folder, n, file)
+    }
+
+    /// R1: one `marks` per named generation; `record.json` reread at most once, for `completing` (S6).
+    pub fn status(&self) -> Res<Status> {
+        let pm = self.pending.map(|n| marks(&self.folder, n)).transpose()?;
+        let am = self.active.map(|n| marks(&self.folder, n)).transpose()?;
+        let marked = pm.is_some_and(|m| m.any()) || am.is_some_and(|m| m.any());
+        let completing = if marked {
+            let r = record(&self.folder)
+                .known()?
+                .ok_or_else(|| Refusal::internal("a generation has no member record"))?;
+            r.get("completing")
+                .and_then(|c| c.get("gen"))
+                .and_then(Value::as_u64)
+        } else {
+            None
+        };
+        let done = |n: Option<u64>, m: Option<Marks>| {
+            n.zip(m).map(|(n, m)| m.any() && completing != Some(n))
+        };
+        let (p_done, a_done) = (done(self.pending, pm), done(self.active, am));
+        let held = p_done == Some(false);
+        let run = |m: Option<Marks>| m.is_some_and(|m| m.decision == Some(Decision::Run));
+        let p_void = pm.is_some_and(|m| m.abandoned || m.decision == Some(Decision::Aborted));
+        Ok(Status {
+            subject: if held { self.pending } else { self.active },
+            held,
+            committed: if held { run(pm) } else { run(am) },
+            active_committed: run(am),
+            finished: p_done != Some(false) && a_done != Some(false),
+            never_ran: self.active.is_none() && (self.pending.is_none() || p_void),
+            pending_done: p_done,
+            active_done: a_done,
+        })
+    }
+}
+
 /// launch-1 G1.1: 1 + the highest generation any file under `gens/` or `pending` names; 0 for none.
 pub fn next(member: &Path, record: Option<&Value>) -> Res<u64> {
     let mut high: Option<u64> = record.and_then(pending);
@@ -149,13 +335,7 @@ pub fn next(member: &Path, record: Option<&Value>) -> Res<u64> {
 /// then a reread of `record.json`; never done while `record.completing.gen` is `n` (release-1d R4). `Unreadable`
 /// anywhere is the `evidence` refusal, never "not done".
 pub fn done(member: &Path, n: u64) -> Res<bool> {
-    let abandoned = claim(member, n).known()?.is_some_and(|c| c == "abandoned");
-    let aborted = read(member, n, "commit")
-        .known()?
-        .is_some_and(|c| c.get("aborted") == Some(&Value::Bool(true)));
-    let ended = read(member, n, "ended").known()?.is_some();
-    let released = read(member, n, "released").known()?.is_some();
-    if !(abandoned || aborted || ended || released) {
+    if !marks(member, n)?.any() {
         return Ok(false);
     }
     let record = record(member)
@@ -253,6 +433,342 @@ mod tests {
         let r = json!({"lifecycle": 1, "generation": "1"});
         crate::state::fs::write_json(&m.join("record.json"), &r).unwrap();
         (d, m)
+    }
+
+    /// A member `<root>/0123456789abcdef/agents/aaaaaaaaaaaa` (the walk starts three folders up) with `record`.
+    fn life(record: Value) -> (crate::testing::TempDir, PathBuf) {
+        let d = crate::testing::TempDir::new();
+        let m = d.path().join("0123456789abcdef/agents/aaaaaaaaaaaa");
+        std::fs::create_dir_all(&m).unwrap();
+        crate::state::fs::write_json(&m.join("record.json"), &record).unwrap();
+        (d, m)
+    }
+    fn gen_of(m: &Path) -> Gen {
+        match member_of(m) {
+            Member::Life(g) => g,
+            other => panic!("not a lifecycle member: {other:?}"),
+        }
+    }
+    fn unreadable(m: &Path) -> bool {
+        matches!(member_of(m), Member::Unreadable(_))
+    }
+
+    // R5, ambiguity 1: one read through the walk, no fallback; invalid lifecycle fields are unreadable.
+    #[test]
+    fn member_of_classifies_once_without_fallback() {
+        let (_d, m) = life(json!({"name": "w"}));
+        assert!(
+            matches!(member_of(&m), Member::Pre(r) if r["name"] == "w"),
+            "prelife-1c G10"
+        );
+        assert!(matches!(
+            member_of(&m.with_file_name("bbbbbbbbbbbb")),
+            Member::Absent
+        ));
+        for bad in [
+            json!({"lifecycle": 1, "generation": "01"}),
+            json!({"lifecycle": 1, "generation": 1}),
+            json!({"lifecycle": 1, "pending": {"gen": "1"}}),
+            json!({"lifecycle": 1, "generation": "1", "pending": {"gen": 1}}),
+        ] {
+            let (_d, m) = life(bad.clone());
+            assert!(unreadable(&m), "{bad}");
+        }
+        let (_d, m) = life(json!({}));
+        std::fs::write(m.join("record.json"), b"{\"lifecy").unwrap();
+        assert!(unreadable(&m), "torn");
+        #[cfg(unix)]
+        {
+            let (d, m) = life(json!({}));
+            let elsewhere = d.path().join("elsewhere.json");
+            std::fs::remove_file(m.join("record.json")).unwrap();
+            std::os::unix::fs::symlink(&elsewhere, m.join("record.json")).unwrap();
+            assert!(unreadable(&m), "a dangling link");
+            crate::state::fs::write_json(&elsewhere, &json!({"name": "w"})).unwrap();
+            assert!(unreadable(&m), "a link to a pre-lifecycle record");
+            let (d, m) = life(json!({"name": "w"}));
+            let moved = d.path().join("moved");
+            std::fs::rename(&m, &moved).unwrap();
+            std::os::unix::fs::symlink(&moved, &m).unwrap();
+            assert!(unreadable(&m), "a linked member folder");
+        }
+    }
+
+    // R5 (audit A4): a FIFO at record.json is unreadable at once, never opened.
+    #[cfg(unix)]
+    #[test]
+    fn a_fifo_record_is_unreadable_and_never_opened() {
+        let (_d, m) = life(json!({}));
+        std::fs::remove_file(m.join("record.json")).unwrap();
+        let c = std::ffi::CString::new(m.join("record.json").to_str().unwrap()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let at = m.clone();
+        std::thread::spawn(move || tx.send(unreadable(&at)).unwrap());
+        assert_eq!(
+            rx.recv_timeout(std::time::Duration::from_secs(2)),
+            Ok(true),
+            "never blocks"
+        );
+    }
+
+    // R5 (audit A3): members keeps link entries so member_of refuses them; it skips only non-ids and regular files.
+    #[test]
+    fn members_keeps_links_and_skips_only_files_and_non_ids() {
+        let (d, m) = life(json!({"name": "w"}));
+        let agents = m.parent().unwrap().to_path_buf();
+        std::fs::write(agents.join("cccccccccccc"), b"x").unwrap();
+        std::fs::create_dir(agents.join("not-an-id")).unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(d.path().join("gone"), agents.join("dddddddddddd")).unwrap();
+        let got: Vec<(String, bool)> = members(&agents)
+            .unwrap()
+            .into_iter()
+            .map(|(id, _, member)| (id, matches!(member, Member::Unreadable(_))))
+            .collect();
+        let mut want = vec![("aaaaaaaaaaaa".to_string(), false)];
+        if cfg!(unix) {
+            want.push(("dddddddddddd".to_string(), true));
+        }
+        assert_eq!(got, want);
+        assert!(
+            members(&d.path().join("none")).unwrap().is_empty(),
+            "no agents folder"
+        );
+    }
+
+    // R4 (audit A8): Gen::read(n, ..) reads generation n only; a pending generation never stands for an active one.
+    #[test]
+    fn a_generation_reads_only_its_own_evidence() {
+        let (_d, m) = life(json!({"lifecycle": 1, "generation": "1", "hcName": "m0123abcd"}));
+        crate::state::fs::write_json(&m.join("notice.json"), &json!({"kind": "stopped"})).unwrap();
+        publish(&path(&m, 0, "notice"), &json!({"kind": "stopped"})).unwrap();
+        let g = gen_of(&m);
+        assert_eq!((g.active(), g.pending()), (Some(1), None));
+        assert_eq!(
+            g.read(1, "notice"),
+            Evidence::Absent,
+            "neither the folder nor generation 0"
+        );
+        publish(&path(&m, 1, "notice"), &json!({"kind": "exited"})).unwrap();
+        assert!(
+            matches!(gen_of(&m).read(1, "notice"), Evidence::Present(n) if n["kind"] == "exited")
+        );
+        let (_d, m) = life(json!({"lifecycle": 1, "pending": {"gen": 2}}));
+        publish(&path(&m, 2, "commit"), &json!({"committed": true})).unwrap();
+        let s = gen_of(&m).status().unwrap();
+        assert_eq!(
+            (s.subject, s.active_committed),
+            (Some(2), false),
+            "pending commit is the held identity's only"
+        );
+    }
+
+    /// Seeds `files` (generation, file, value; `"claim"` is `gens/<n>.claim`; the value `"TORN"` writes torn bytes)
+    /// beside `record`, then answers `status()`.
+    fn status_of(record: Value, files: &[(u64, &str, Value)]) -> Res<Status> {
+        let (_d, m) = life(record);
+        for (n, f, v) in files {
+            let at = if *f == "claim" {
+                claim_path(&m, *n)
+            } else {
+                path(&m, *n, f)
+            };
+            std::fs::create_dir_all(at.parent().unwrap()).unwrap();
+            if *v == json!("TORN") {
+                std::fs::write(&at, b"{\"x").unwrap();
+            } else {
+                crate::state::fs::write_json(&at, v).unwrap();
+            }
+        }
+        gen_of(&m).status()
+    }
+
+    // R2, R3, R4 (audit A5, C3): one read answers subject, held, finished and never_ran; an unreadable marker refuses.
+    #[test]
+    fn status_answers_every_completion_question_from_one_read() {
+        let l = |extra: Value| {
+            let mut r = json!({"lifecycle": 1});
+            for (k, v) in extra.as_object().unwrap() {
+                r[k] = v.clone();
+            }
+            r
+        };
+        let p1 = || l(json!({"pending": {"gen": 1}}));
+        let g1 = || l(json!({"generation": "1", "hcName": "m0123abcd"}));
+        let g1p2 = || l(json!({"generation": "1", "hcName": "m0123abcd", "pending": {"gen": 2}}));
+        let (ab, ok, end) = (
+            json!({"aborted": true}),
+            json!({"committed": true}),
+            json!({"state": "finished"}),
+        );
+        // (case, record, files, (subject, held, finished, never_ran))
+        type Case<'a> = (
+            &'a str,
+            Value,
+            Vec<(u64, &'a str, Value)>,
+            (Option<u64>, bool, bool, bool),
+        );
+        let cases: Vec<Case> = vec![
+            ("none", l(json!({})), vec![], (None, false, true, true)),
+            (
+                "pending undecided",
+                p1(),
+                vec![],
+                (Some(1), true, false, false),
+            ),
+            (
+                "pending aborted",
+                p1(),
+                vec![(1, "commit", ab.clone())],
+                (None, false, true, true),
+            ),
+            (
+                "pending abandoned",
+                p1(),
+                vec![(1, "claim", json!("abandoned"))],
+                (None, false, true, true),
+            ),
+            (
+                "pending ended: it ran",
+                p1(),
+                vec![(1, "ended", end.clone())],
+                (None, false, true, false),
+            ),
+            (
+                "pending released: it ran",
+                p1(),
+                vec![(1, "released", json!({}))],
+                (None, false, true, false),
+            ),
+            (
+                "active running",
+                g1(),
+                vec![(1, "commit", ok.clone())],
+                (Some(1), false, false, false),
+            ),
+            (
+                "active ended",
+                g1(),
+                vec![(1, "ended", end.clone())],
+                (Some(1), false, true, false),
+            ),
+            (
+                "active completing",
+                l(json!({"generation": "1", "hcName": "m0123abcd", "completing": {"gen": 1}})),
+                vec![(1, "ended", end.clone())],
+                (Some(1), false, false, false),
+            ),
+            (
+                "active and pending",
+                g1p2(),
+                vec![(1, "ended", end.clone())],
+                (Some(2), true, false, false),
+            ),
+            (
+                "pending void, active runs",
+                g1p2(),
+                vec![(2, "commit", ab.clone())],
+                (Some(1), false, false, false),
+            ),
+        ];
+        for (case, record, files, want) in cases {
+            let s = status_of(record, &files).unwrap();
+            assert_eq!((s.subject, s.held, s.finished, s.never_ran), want, "{case}");
+        }
+        let s = status_of(p1(), &[(1, "commit", ok.clone())]).unwrap();
+        assert_eq!(
+            (s.committed, s.active_committed),
+            (true, false),
+            "the subject's commit, not the active one's"
+        );
+        let s = status_of(g1p2(), &[(1, "commit", ok.clone())]).unwrap();
+        assert_eq!(
+            (s.committed, s.active_committed),
+            (false, true),
+            "a held identity never takes 1's commit"
+        );
+        // R3 (re-audit, core_facts reservations): each named generation's own done, so membership frees exactly those.
+        let s = status_of(g1p2(), &[(1, "ended", end.clone())]).unwrap();
+        assert_eq!(
+            (s.pending_done, s.active_done),
+            (Some(false), Some(true)),
+            "active done, pending not"
+        );
+        let s = status_of(p1(), &[(1, "commit", ab.clone())]).unwrap();
+        assert_eq!(
+            (s.pending_done, s.active_done),
+            (Some(true), None),
+            "pending void; no active generation"
+        );
+        for (case, files) in [
+            (
+                "torn claim, aborted commit",
+                vec![(1, "claim", json!("TORN")), (1, "commit", ab.clone())],
+            ),
+            (
+                "abandoned claim, torn commit",
+                vec![
+                    (1, "claim", json!("abandoned")),
+                    (1, "commit", json!("TORN")),
+                ],
+            ),
+            ("torn ended", vec![(1, "ended", json!("TORN"))]),
+            (
+                "aborted commit, torn released",
+                vec![(1, "commit", ab.clone()), (1, "released", json!("TORN"))],
+            ),
+        ] {
+            assert_eq!(
+                status_of(p1(), &files).map_err(|e| e.check).err(),
+                Some("evidence"),
+                "{case}"
+            );
+        }
+    }
+
+    // R1: status opens each evidence file at most once, record.json once.
+    #[test]
+    fn status_opens_each_file_once() {
+        let (_d, m) = life(
+            json!({"lifecycle": 1, "generation": "1", "hcName": "m0123abcd", "pending": {"gen": 2}}),
+        );
+        publish(&path(&m, 1, "ended"), &json!({"state": "finished"})).unwrap();
+        publish(&path(&m, 2, "commit"), &json!({"committed": true})).unwrap();
+        let g = gen_of(&m);
+        let (s, reads) = crate::state::fs::record_reads(|| g.status());
+        s.unwrap();
+        let mut seen = reads.clone();
+        seen.sort();
+        seen.dedup();
+        assert_eq!(seen.len(), reads.len(), "{reads:?}");
+        assert_eq!(
+            reads.iter().filter(|p| p.ends_with("record.json")).count(),
+            1,
+            "{reads:?}"
+        );
+    }
+
+    // R1, S6 (re-audit: PM call 4's sanctioned reread): `completing` is read from record.json as it is now, never from
+    // the record `member_of` held; a record torn since then refuses.
+    #[test]
+    fn status_rereads_the_record_for_completing() {
+        let (_d, m) = life(json!({"lifecycle": 1, "generation": "1", "hcName": "m0123abcd"}));
+        publish(&path(&m, 1, "ended"), &json!({"state": "finished"})).unwrap();
+        let g = gen_of(&m);
+        assert!(g.status().unwrap().finished, "ended, not completing");
+        let completing = json!({"lifecycle": 1, "generation": "1", "hcName": "m0123abcd", "completing": {"gen": 1}});
+        crate::state::fs::write_json(&m.join("record.json"), &completing).unwrap();
+        assert!(
+            !g.status().unwrap().finished,
+            "completing written after member_of holds it"
+        );
+        std::fs::write(m.join("record.json"), b"{\"lifecy").unwrap();
+        assert_eq!(
+            g.status().map_err(|e| e.check).err(),
+            Some("evidence"),
+            "torn since member_of"
+        );
     }
 
     #[test]

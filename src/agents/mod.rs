@@ -45,6 +45,11 @@ mod view_hc_tests;
 /// True when the agent in `folder` is committed: commit.json is there and is no launcher's give-up (#97). Spawn and
 /// the launcher each try to make commit.json once, whole; the launcher's says `"aborted": true`.
 pub(crate) fn committed(folder: &Path) -> bool {
+    folder_committed(folder)
+}
+
+/// Main's read: commit.json there and not aborted (#97).
+pub(crate) fn folder_committed(folder: &Path) -> bool {
     match crate::state::fs::read_json(&folder.join("commit.json")) {
         Ok(Some(commit)) => commit.get("aborted") != Some(&Value::Bool(true)),
         _ => false,
