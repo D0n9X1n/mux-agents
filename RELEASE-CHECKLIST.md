@@ -11,6 +11,11 @@ Wherever a row records that a member quotes a nonce, also record receipt retirem
 prove the ack: the member's `read -Ack <batch>` answers `"acked": true`, and afterwards its mailbox cursor
 (`mail/<mailbox>.cursor.json` under the state root) has no `pending` batch.
 
+In an interactive turn the delivery hook may ack the batch itself before the person runs a manual ack; that manual
+ack then correctly answers `"acked": false, "duplicate": true`. Either of these counts as receipt retirement:
+the delivery hook's own ack answering `"acked": true`, or a `duplicate` reply together with the cursor check (no
+`pending` batch).
+
 1. Idle Claude self-wake: let A finish its turn and sit idle; send A a message from B. Record that A starts a turn on
    its own, with no keystroke, within 10 s, and that the turn text is
    `mux-agents mail is waiting (wake <nonce>): run mux-agent read` (8 hex digits).

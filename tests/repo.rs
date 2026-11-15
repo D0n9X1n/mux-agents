@@ -2686,6 +2686,10 @@ fn the_release_checklist_names_the_4b_real_client_gate() {
         "receipt retirement",
         r#""acked": true"#,
         "no `pending`",
+        // An interactive turn's delivery hook may ack first; a later manual ack then answers duplicate.
+        "the delivery hook's own ack",
+        r#""acked": false, "duplicate": true"#,
+        "together with the cursor check",
     ] {
         assert!(list.contains(want), "RELEASE-CHECKLIST.md lacks {want}");
     }
