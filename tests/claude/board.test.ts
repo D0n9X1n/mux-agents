@@ -180,3 +180,10 @@ test('sections heads each state\'s first live row with its count, only when the 
   // ASCII: `-` between the name and the count, as the side bar draws it.
   expect(sections([a('running', 'blocked'), a('running', 'working')], true)).toEqual(['Needs you - 1', 'Working - 1'])
 })
+
+test("on call has its own glyph, word and section, below needs you and above working", () => {
+  const live = (activity: string) => ({ name: "n", client: "copilot", state: "running", doing: null, age: 1, model: null, unread: 0, activity }) as never
+  const oncall = live("on call")
+  expect([look(oncall, false)?.glyph, look(oncall, false)?.word, look(oncall, true)?.glyph]).toEqual(["◌", "on call", "o"])
+  expect(sections([live("blocked"), oncall, live("working")])).toEqual(["Needs you · 1", "On call · 1", "Working · 1"])
+})

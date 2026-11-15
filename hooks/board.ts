@@ -67,6 +67,7 @@ export type Look = {
 function live(activity: unknown, ascii: boolean): Look {
   switch (activity) {
     case 'blocked': return { glyph: '!', word: 'needs you', color: 'yellow', ended: false, pill: true }
+    case 'on call': return { glyph: ascii ? 'o' : '◌', word: 'on call', color: undefined, ended: false, muted: true }
     case 'done': return { glyph: ascii ? '@' : '\u2726', word: 'done', color: 'cyan', ended: false }
     case 'idle': return { glyph: ascii ? 'o' : '\u25cc', word: 'idle', color: undefined, ended: false, muted: true }
     default: return { glyph: ascii ? '*' : '\u25c9', word: 'working', color: 'green', ended: false }
@@ -94,7 +95,7 @@ export function look(a: MuxAgentsAgent, ascii: boolean): Look | undefined {
 // count (`Needs you · 1`, `-` in ASCII); none when every live agent is in one state. Indexed by row; ended rows get
 // none.
 export function sections(agents: MuxAgentsAgent[], ascii = false): (string | undefined)[] {
-  const names: Record<string, string> = { blocked: 'Needs you', done: 'Done', working: 'Working', idle: 'Idle' }
+  const names: Record<string, string> = { blocked: 'Needs you', 'on call': 'On call', done: 'Done', working: 'Working', idle: 'Idle' }
   const word = (a: MuxAgentsAgent) => (a.activity && a.activity in names ? a.activity : 'working')
   const live = agents.filter(a => a.state === 'running')
   const kinds = new Set(live.map(word))
