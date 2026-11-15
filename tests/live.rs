@@ -3827,24 +3827,15 @@ hc {}:
             }
         }
 
-        /// What the client terminal was sent, escape sequences and blanks removed: a popup text however it was drawn.
-        fn text(&self) -> String {
-            let bytes = String::from_utf8_lossy(&self.seen.lock().unwrap()).into_owned();
-            let (mut out, mut chars) = (String::new(), bytes.chars());
-            while let Some(c) = chars.next() {
-                if c == '\u{1b}' {
-                    if chars.next() == Some('[') {
-                        for d in chars.by_ref() {
-                            if ('@'..='~').contains(&d) {
-                                break;
-                            }
-                        }
-                    }
-                } else if !c.is_whitespace() {
-                    out.push(c);
-                }
-            }
-            out
+        /// A checkpoint in what the client terminal was sent: `text_since` reads only what arrives after it.
+        fn mark(&self) -> usize {
+            self.seen.lock().unwrap().len()
+        }
+
+        /// What the client terminal was sent after checkpoint `from`, as `visible_text` shows it.
+        fn text_since(&self, from: usize) -> String {
+            let seen = self.seen.lock().unwrap();
+            visible_text(&seen[from.min(seen.len())..])
         }
 
         /// Bytes typed on the client's terminal.
@@ -4390,6 +4381,56 @@ hc {}:
             .find(|f| f.file_name().to_string_lossy().starts_with("peek-"))
             .and_then(|f| std::fs::read_to_string(f.path()).ok())
     }
+    /// Terminal bytes as text, escape sequences and blanks removed: a popup's text however it was drawn.
+    fn visible_text(bytes: &[u8]) -> String {
+        let bytes = String::from_utf8_lossy(bytes).into_owned();
+        let (mut out, mut chars) = (String::new(), bytes.chars());
+        while let Some(c) = chars.next() {
+            if c == '\u{1b}' {
+                if chars.next() == Some('[') {
+                    for d in chars.by_ref() {
+                        if ('@'..='~').contains(&d) {
+                            break;
+                        }
+                    }
+                }
+            } else if !c.is_whitespace() {
+                out.push(c);
+            }
+        }
+        out
+    }
+    /// Whether text a client was sent after a checkpoint is grand's output popup: its pager footer and grand's marker,
+    /// both drawn after the checkpoint (#103 review: grand's own view, drawn before it, never counts).
+    fn popup_shows(after: &str, marker: &str) -> bool {
+        after.contains("--peek:grand(qcloses)--") && after.contains(marker)
+    }
+    // The popup check needs no multiplexer: a popup without the retained text, or the marker seen only in grand's
+    // own view before the checkpoint, fails it.
+    #[test]
+    fn popup_check_requires_the_marker_drawn_after_the_checkpoint() {
+        let marker = "grand-said-7";
+        let stream = format!("\u{1b}[2J {marker} \u{1b}[H").into_bytes();
+        let at = stream.len();
+        let mut popup = stream.clone();
+        popup.extend_from_slice("\u{1b}[1;1H-- peek: grand (q closes) --".as_bytes());
+        assert!(
+            !popup_shows(&visible_text(&popup[at..]), marker),
+            "a popup without the retained text fails"
+        );
+        let mut shown = stream;
+        shown.extend_from_slice(
+            format!("\u{1b}[3;1H{marker}\r\n-- peek: grand (q closes) --").as_bytes(),
+        );
+        assert!(
+            popup_shows(&visible_text(&shown[at..]), marker),
+            "the popup that pages the marker passes"
+        );
+        assert!(
+            !popup_shows(&visible_text(&shown[..at]), marker),
+            "grand's own view alone never passes"
+        );
+    }
     #[test]
     fn team_bar_draws_the_tree_and_opens_any_row() {
         for mux in Mux::ALL {
@@ -4556,25 +4597,51 @@ hc {}:
                 .find(|l| !l.trim().is_empty())
                 .expect("grand kept output")
                 .replace(" ", "");
+            // #103 review: grand's own view drew the marker, so the client switches away from grand to the leader's view,
+            // waits until it has redrawn and gone quiet, and takes a checkpoint: only what it is sent after it can show
+            // the popup, and before the popup opens grand's marker must not be among it.
+            let from = client.as_ref().map(|client| {
+                live.call(&["select-window", "-t", &views[0].0]);
+                live.call(&["select-pane", "-t", &views[0].0]);
+                assert!(
+                    eventually(Duration::from_secs(10), || live
+                        .field(&session, "#{pane_id}")
+                        == views[0].0),
+                    "{mux:?}: the leader's view is shown"
+                );
+                let quiet = eventually(Duration::from_secs(10), || {
+                    let before = client.mark();
+                    std::thread::sleep(Duration::from_millis(500));
+                    client.mark() == before
+                });
+                assert!(quiet, "{mux:?}: the client went quiet on the leader's view");
+                let from = client.mark();
+                std::thread::sleep(Duration::from_secs(1));
+                let early = client.text_since(from);
+                assert!(
+                    !early.contains(&marker),
+                    "{mux:?}: grand's marker before the popup: {early:?}"
+                );
+                from
+            });
             live.call(&["send-keys", "-t", &bars[0], "-l", "jjj"]);
             live.call(&["send-keys", "-t", &bars[0], "Enter"]);
-            match &client {
-                Some(client) => {
+            match (&client, from) {
+                (Some(client), Some(from)) => {
                     let server: u64 = live.field(live.server.pane(), "#{pid}").parse().unwrap();
                     live.server
                         .wait("the output popup", || pagers_under(server).then_some(()));
                     let shows = || {
-                        let t = client.text();
-                        t.contains("--peek:grand(qcloses)--")
-                            && t.contains(&last)
-                            && t.contains(&marker)
+                        let t = client.text_since(from);
+                        popup_shows(&t, &marker) && t.contains(&last)
                     };
                     assert!(
                         eventually(Duration::from_secs(10), shows),
-                        "{mux:?}: the popup pages grand's output"
+                        "{mux:?}: the popup pages grand's output, drawn after the checkpoint: {:?}",
+                        client.text_since(from)
                     );
                 }
-                None => {
+                _ => {
                     let mut text = None;
                     assert!(
                         eventually(Duration::from_secs(10), || {
