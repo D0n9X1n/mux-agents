@@ -5385,11 +5385,20 @@ hc {}:
             assert_ne!(b2, before, "{mux:?} a new process");
             let (_, stale) = live.server.command(b2, &["read", "-Ack", s(&old["batch"])]);
             assert_eq!(stale["check"], "ack", "{mux:?}");
-            // No keystrokes reached any terminal: no pane shows the nonce or a notice.
+            // No keystrokes reached any terminal: no pane shows a notice, and no agent or root pane shows the nonce.
+            // The side bars are left out of the nonce check only: a bar draws each member's doing line, which for the
+            // leader is the first line of the mail it last sent (`send` writes last-sent.json; board::select_doing
+            // falls back status, message, task). That is the bar's own drawing, not input typed into a terminal.
+            let bars: Vec<String> = live
+                .bars()
+                .iter()
+                .map(|b| b.split('|').next().unwrap().to_string())
+                .collect();
             for pane in live.panes("#{pane_id}") {
                 let screen = live.call(&["capture-pane", "-p", "-t", &pane]);
                 assert!(
-                    !screen.contains("nonce-7f3a") && !screen.contains("mail from"),
+                    (bars.contains(&pane) || !screen.contains("nonce-7f3a"))
+                        && !screen.contains("mail from"),
                     "{mux:?} {pane}: {screen}"
                 );
             }
