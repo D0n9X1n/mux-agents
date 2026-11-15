@@ -1175,10 +1175,11 @@ exec claude --dangerously-skip-permissions
         let body = live.path("to-w1.txt");
         let (code, sent) = live.run(&["send", "w1", "-BodyFile", &body]);
         assert_eq!(code, 0, "{mux:?} {sent}");
+        // A send in a session with hc members takes the team path (#103 4a): it names its recipients, not a pane.
         assert_eq!(
-            (&sent["to"], &sent["pane"]),
-            (&json!("w1"), &w1["pane"]),
-            "{mux:?}"
+            (&sent["to"], sent["id"].is_string(), &sent["recipients"]),
+            (&json!("w1"), true, &json!([{"name": "w1", "id": w1["id"]}])),
+            "{mux:?} {sent}"
         );
         // read <name> is the pane's screen: here a line typed into the worker.
         let pid = live.worker_pid(&w1);
@@ -1231,10 +1232,11 @@ exec claude --dangerously-skip-permissions
             .server
             .command(pid, &["send", "parent", "-BodyFile", "{dir}/reply.md"]);
         assert_eq!(code, 0, "{mux:?} {sent}");
+        // The team path (#103 4a): w1 has no running parent member, so `parent` is its parentPane, the root.
         assert_eq!(
-            (&sent["to"], &sent["pane"]),
-            (&json!("parent"), &json!(root)),
-            "{mux:?}"
+            (&sent["to"], sent["id"].is_string(), &sent["recipients"]),
+            (&json!("parent"), true, &json!([{"name": root, "id": null}])),
+            "{mux:?} {sent}"
         );
         let mail = live.mailbox(&live.root_box());
         assert_eq!(mail.len(), 1, "{mux:?} {mail:?}");
@@ -4085,7 +4087,11 @@ hc {}:
             // send reaches that agent's own mailbox.
             let body = format!("to {name}");
             let (code, sent) = live.run_in(&clean, &["send", name, "-Body", &body]);
-            assert_eq!((code, &sent["pane"]), (0, &json!(pane)), "{mux:?} {sent}");
+            assert_eq!(
+                (code, &sent["recipients"]),
+                (0, &json!([{"name": name, "id": w["id"]}])),
+                "{mux:?} {sent}"
+            );
             let mail = live.mailbox(s(&w["id"]));
             assert!(
                 mail.iter().any(|m| m["body"] == body.as_str()),
@@ -4121,7 +4127,11 @@ hc {}:
             "{mux:?} {list}"
         );
         let (code, sent) = live.run_in(&clean, &["send", "w2", "-Body", "still here"]);
-        assert_eq!((code, &sent["pane"]), (0, &json!(p2)), "{mux:?} {sent}");
+        assert_eq!(
+            (code, &sent["recipients"]),
+            (0, &json!([{"name": "w2", "id": w2["id"]}])),
+            "{mux:?} {sent}"
+        );
         let (code, read) = live.run_in(&clean, &["read", "w2", "-Lines", "20"]);
         assert_eq!((code, &read["pane"]), (0, &json!(p2)), "{mux:?} {read}");
         // A root left carrying an agent's tag is no agent: it cannot send as one.
