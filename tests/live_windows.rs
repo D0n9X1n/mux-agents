@@ -235,7 +235,11 @@ impl Live {
                 done.display()
             ),
         );
-        self.wait("command reply", || done.exists().then_some(()));
+        self.wait_or(
+            &format!("command reply to {args}"),
+            || done.exists().then_some(()),
+            || format!("root pane:\n{}", self.screen(&self.root)),
+        );
         serde_json::from_str(&std::fs::read_to_string(out).unwrap()).unwrap()
     }
 
@@ -1396,14 +1400,10 @@ fn post_bg(live: &Live, sent: &mut HashMap<u32, usize>, id: &str, args: &[&str])
     live.dir.join(format!("reply.{pid}.{n}.json"))
 }
 
-/// What an "on call" timeout shows: member `name`'s `list -All` entry, its folder's files with their text, and the
-/// background reply `reply` (json, err, code) so far.
-fn on_call_diagnosis(live: &Live, id: &str, name: &str, reply: &Path) -> String {
-    let list = live.run_any(&["list", "-All"]);
-    let entry = list["agents"]
-        .as_array()
-        .and_then(|a| a.iter().find(|x| x["name"] == name).cloned())
-        .unwrap_or(list);
+/// What an "on call" timeout shows, with no further call through the root pane (it may be the one stuck): the last
+/// `list -All` the poll saw (`last`), member `id`'s folder files with their text, the background reply `reply` (json,
+/// err, code) so far, and the root pane's screen.
+fn on_call_diagnosis(live: &Live, id: &str, last: &str, reply: &Path) -> String {
     let folders = std::fs::read_dir(live.dir.join("state"))
         .map(|d| {
             d.filter_map(Result::ok)
@@ -1412,7 +1412,7 @@ fn on_call_diagnosis(live: &Live, id: &str, name: &str, reply: &Path) -> String 
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
-    let mut out = format!("list -All {name}: {entry}\n");
+    let mut out = format!("last list -All: {last}\n");
     for folder in folders {
         for e in std::fs::read_dir(&folder).into_iter().flatten().flatten() {
             let text = std::fs::read_to_string(e.path()).unwrap_or_default();
@@ -1424,6 +1424,7 @@ fn on_call_diagnosis(live: &Live, id: &str, name: &str, reply: &Path) -> String 
         let text = std::fs::read_to_string(&file).unwrap_or_else(|e| format!("<{e}>"));
         out.push_str(&format!("{}: {}\n", file.display(), text.trim()));
     }
+    out.push_str(&format!("root pane:\n{}", live.screen(&live.root)));
     out
 }
 
@@ -1469,12 +1470,16 @@ fn a_copilot_member_reports_done_then_listens_on_call() {
         spawn(&mut sent, "claude", "a"),
         spawn(&mut sent, "copilot", "b"),
     );
+    // The last `list -All` row of b and how long the call took, for a timeout's diagnosis.
+    let last = std::cell::RefCell::new(String::new());
     let on_call = |live: &Live| {
-        live.run(&["list", "-All"])["agents"]
+        let t = Instant::now();
+        let list = live.run(&["list", "-All"]);
+        let row = list["agents"]
             .as_array()
-            .unwrap()
-            .iter()
-            .any(|x| x["name"] == "b" && x["activity"] == "on call")
+            .and_then(|a| a.iter().find(|x| x["name"] == "b").cloned());
+        *last.borrow_mut() = format!("{:?} {}", t.elapsed(), row.as_ref().unwrap_or(&list));
+        row.is_some_and(|x| x["activity"] == "on call")
     };
     assert_eq!(
         by(&live, &mut sent, &b, &["report", "done"])["state"],
@@ -1484,7 +1489,7 @@ fn a_copilot_member_reports_done_then_listens_on_call() {
     live.wait_or(
         "on call (first wait)",
         || on_call(&live).then_some(()),
-        || on_call_diagnosis(&live, &b, "b", &reply),
+        || on_call_diagnosis(&live, &b, &last.borrow(), &reply),
     );
     by(&live, &mut sent, &a, &["send", "b", "-BodyFile", &body]);
     // Sender exit: A leaves before B collects; the mail is durable, the wait still returns it.
@@ -1518,7 +1523,7 @@ fn a_copilot_member_reports_done_then_listens_on_call() {
     live.wait_or(
         "on call (second wait)",
         || on_call(&live).then_some(()),
-        || on_call_diagnosis(&live, &b, "b", &reply),
+        || on_call_diagnosis(&live, &b, &last.borrow(), &reply),
     );
     assert_eq!(
         by(&live, &mut sent, &b, &["read", "-Cancel"])["cancelled"],
