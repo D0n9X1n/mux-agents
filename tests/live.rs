@@ -5505,7 +5505,16 @@ hc {}:
                 .map(|b| b.split('|').next().unwrap().to_string())
                 .collect();
             for pane in live.panes("#{pane_id}") {
-                let screen = live.call(&["capture-pane", "-p", "-t", &pane]);
+                // A pane listed above can close before its capture (sender A has exited): a pane that is gone shows
+                // nothing, so it is skipped; any other capture failure still fails the test.
+                let out = live.server.try_call(&["capture-pane", "-p", "-t", &pane]);
+                if !out.status.success()
+                    && String::from_utf8_lossy(&out.stderr).contains("can't find pane")
+                {
+                    continue;
+                }
+                assert!(out.status.success(), "{mux:?} capture {pane}: {out:?}");
+                let screen = String::from_utf8(out.stdout).unwrap();
                 assert!(
                     (bars.contains(&pane) || !screen.contains("nonce-7f3a"))
                         && !screen.contains("mail from"),
