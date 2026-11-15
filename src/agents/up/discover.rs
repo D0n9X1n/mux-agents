@@ -283,9 +283,6 @@ mod tests {
             ("torn claim", "evidence"),
             ("linked folder", "evidence"),
         ] {
-            if case == "linked folder" && !cfg!(unix) {
-                continue;
-            }
             let w = World::human("");
             let fields = match case {
                 "01" => json!({"generation": "01"}),
@@ -313,11 +310,11 @@ mod tests {
                     )
                     .unwrap();
                 }
-                #[cfg(unix)]
+                // Call 20: on Windows too (a directory symlink, else a junction); never skipped.
                 "linked folder" => {
                     let moved = w.state().join("moved");
                     std::fs::rename(&f, &moved).unwrap();
-                    std::os::unix::fs::symlink(&moved, &f).unwrap();
+                    crate::testing::link_dir(&moved, &f);
                 }
                 _ => {}
             }

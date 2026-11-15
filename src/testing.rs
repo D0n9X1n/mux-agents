@@ -681,6 +681,41 @@ impl Drop for TempDir {
     }
 }
 
+/// Call 20: a directory link at `link` naming `target` (which need not exist). A symlink on Unix; on Windows a
+/// directory symlink, else (no symlink privilege) a junction (`mklink /J`). Panics with the path when neither can be
+/// made or the result is not a link: a link case never skips.
+pub fn link_dir(target: &Path, link: &Path) {
+    #[cfg(unix)]
+    let made = std::os::unix::fs::symlink(target, link).map_err(|e| e.to_string());
+    #[cfg(windows)]
+    let made = std::os::windows::fs::symlink_dir(target, link).or_else(|e| {
+        // Through spawn.rs, the one place a child process starts (tests/repo.rs).
+        let shell = std::env::var_os("ComSpec").unwrap_or_else(|| "cmd".into());
+        let (l, t) = (link.to_str().unwrap(), target.to_str().unwrap());
+        match crate::spawn::captured(
+            Path::new(&shell),
+            &["/C", "mklink", "/J", l, t],
+            Duration::from_secs(10),
+        ) {
+            Ok(o) if o.code == 0 => Ok(()),
+            Ok(o) => Err(format!("{e}; mklink /J: {}{}", o.stdout, o.stderr)),
+            Err(j) => Err(format!("{e}; mklink /J: {j}")),
+        }
+    });
+    if let Err(e) = made {
+        panic!(
+            "cannot link {} to {}: {e}",
+            link.display(),
+            target.display()
+        );
+    }
+    assert!(
+        std::fs::symlink_metadata(link).is_ok_and(|m| m.file_type().is_symlink()),
+        "not a link: {}",
+        link.display()
+    );
+}
+
 /// Runs `spawn` until it is not refused with "text file busy" (ETXTBSY), at most `tries` times, 20 ms apart. A
 /// program a test has just copied can be refused on Linux: a child another test forks while the copy is open for
 /// writing holds that open until it runs its own program (#76). Once it has run, no write is open anywhere, so later

@@ -480,21 +480,19 @@ mod tests {
         let (_d, m) = life(json!({}));
         std::fs::write(m.join("record.json"), b"{\"lifecy").unwrap();
         assert!(unreadable(&m), "torn");
-        #[cfg(unix)]
-        {
-            let (d, m) = life(json!({}));
-            let elsewhere = d.path().join("elsewhere.json");
-            std::fs::remove_file(m.join("record.json")).unwrap();
-            std::os::unix::fs::symlink(&elsewhere, m.join("record.json")).unwrap();
-            assert!(unreadable(&m), "a dangling link");
-            crate::state::fs::write_json(&elsewhere, &json!({"name": "w"})).unwrap();
-            assert!(unreadable(&m), "a link to a pre-lifecycle record");
-            let (d, m) = life(json!({"name": "w"}));
-            let moved = d.path().join("moved");
-            std::fs::rename(&m, &moved).unwrap();
-            std::os::unix::fs::symlink(&moved, &m).unwrap();
-            assert!(unreadable(&m), "a linked member folder");
-        }
+        // Call 20: on Windows too (a directory symlink, else a junction); never skipped.
+        let (d, m) = life(json!({}));
+        let elsewhere = d.path().join("elsewhere.json");
+        std::fs::remove_file(m.join("record.json")).unwrap();
+        crate::testing::link_dir(&elsewhere, &m.join("record.json"));
+        assert!(unreadable(&m), "a dangling link");
+        crate::state::fs::write_json(&elsewhere, &json!({"name": "w"})).unwrap();
+        assert!(unreadable(&m), "a link to a pre-lifecycle record");
+        let (d, m) = life(json!({"name": "w"}));
+        let moved = d.path().join("moved");
+        std::fs::rename(&m, &moved).unwrap();
+        crate::testing::link_dir(&moved, &m);
+        assert!(unreadable(&m), "a linked member folder");
     }
 
     // R5 (audit A4): a FIFO at record.json is unreadable at once, never opened.
@@ -522,17 +520,16 @@ mod tests {
         let agents = m.parent().unwrap().to_path_buf();
         std::fs::write(agents.join("cccccccccccc"), b"x").unwrap();
         std::fs::create_dir(agents.join("not-an-id")).unwrap();
-        #[cfg(unix)]
-        std::os::unix::fs::symlink(d.path().join("gone"), agents.join("dddddddddddd")).unwrap();
+        crate::testing::link_dir(&d.path().join("gone"), &agents.join("dddddddddddd"));
         let got: Vec<(String, bool)> = members(&agents)
             .unwrap()
             .into_iter()
             .map(|(id, _, member)| (id, matches!(member, Member::Unreadable(_))))
             .collect();
-        let mut want = vec![("aaaaaaaaaaaa".to_string(), false)];
-        if cfg!(unix) {
-            want.push(("dddddddddddd".to_string(), true));
-        }
+        let want = vec![
+            ("aaaaaaaaaaaa".to_string(), false),
+            ("dddddddddddd".to_string(), true),
+        ];
         assert_eq!(got, want);
         assert!(
             members(&d.path().join("none")).unwrap().is_empty(),

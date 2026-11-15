@@ -868,25 +868,23 @@ fn an_unreadable_lifecycle_member_refuses_admission() {
         std::fs::write(crate::agents::gens::path(&w.folder(ID), 0, file), b"{\"x").unwrap();
         assert_eq!(check(&w), Some("evidence"), "a torn active {file}");
     }
-    #[cfg(unix)]
-    {
-        let w = held_world(Some("t9"));
-        let folder = w.folder(ID);
-        let moved = w.state().join("moved");
-        std::fs::rename(&folder, &moved).unwrap();
-        std::os::unix::fs::symlink(&moved, &folder).unwrap();
-        assert_eq!(
-            check(&w),
-            Some("evidence"),
-            "a linked member folder is never skipped"
-        );
-        let w = held_world(Some("t9"));
-        let folder = w.folder(ID);
-        let elsewhere = w.state().join("elsewhere.json");
-        std::fs::rename(folder.join("record.json"), &elsewhere).unwrap();
-        std::os::unix::fs::symlink(&elsewhere, folder.join("record.json")).unwrap();
-        assert_eq!(check(&w), Some("evidence"), "a linked record");
-    }
+    // Call 20: on Windows too (a directory symlink, else a junction); never skipped.
+    let w = held_world(Some("t9"));
+    let folder = w.folder(ID);
+    let moved = w.state().join("moved");
+    std::fs::rename(&folder, &moved).unwrap();
+    crate::testing::link_dir(&moved, &folder);
+    assert_eq!(
+        check(&w),
+        Some("evidence"),
+        "a linked member folder is never skipped"
+    );
+    let w = held_world(Some("t9"));
+    let folder = w.folder(ID);
+    let elsewhere = w.state().join("elsewhere.json");
+    std::fs::rename(folder.join("record.json"), &elsewhere).unwrap();
+    crate::testing::link_dir(&elsewhere, &folder.join("record.json"));
+    assert_eq!(check(&w), Some("evidence"), "a linked record");
 }
 
 // R1, R4: committed and noticed are the subject generation's, never the folder's or generation 0's.
