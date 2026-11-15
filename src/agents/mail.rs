@@ -8,6 +8,7 @@ use std::path::Path;
 
 use serde_json::{Map, Value, json};
 
+use super::receipt::{self, Owner, Receipt};
 use crate::caller::Caller;
 use crate::ctx::Ctx;
 use crate::error::{Refusal, Res, refuse};
@@ -494,6 +495,136 @@ pub fn unread_counts(ctx: &Ctx, caller: &Caller, key: &str) -> Res<HashMap<Strin
     Ok(counts)
 }
 
+/// The complete lines after `offset`, each message with the offset past its line, and the snapshot end. Reads only
+/// the bytes past `offset` (the mailbox only grows); the caller holds the mailbox lock.
+fn unread_after(mailbox: &Path, offset: u64) -> Res<(Vec<(Value, u64)>, u64)> {
+    let mut file = match File::open(mailbox) {
+        Ok(f) => f,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok((Vec::new(), offset)),
+        Err(e) => return Err(e.into()),
+    };
+    if file.metadata()?.len() <= offset {
+        return Ok((Vec::new(), offset));
+    }
+    file.seek(SeekFrom::Start(offset))?;
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)?;
+    let (mut found, mut at) = (Vec::new(), offset);
+    for line in bytes
+        .split_inclusive(|&b| b == b'\n')
+        .filter(|l| l.ends_with(b"\n"))
+    {
+        at += line.len() as u64;
+        if let Ok(v) = serde_json::from_slice::<Value>(&line[..line.len() - 1]) {
+            found.push((v, at));
+        }
+    }
+    Ok((found, at))
+}
+
+fn mail_dir(ctx: &Ctx, caller: &Caller) -> Res<std::path::PathBuf> {
+    Ok(super::state_dir(ctx, caller)?.join("mail"))
+}
+
+#[derive(Debug, PartialEq)]
+pub enum Acked {
+    Done,
+    Duplicate,
+}
+
+/// R3: under the mailbox lock and the fence, the pending receipt of `owner` unchanged, else (discarding the one of
+/// another owner) a new batch over one snapshot after `offset`, committed as `pending`. None: fenced out, or nothing
+/// new (a held-only trailer is served as text with no receipt by the verb). Consumes nothing.
+pub fn serve(
+    ctx: &Ctx,
+    caller: &Caller,
+    key: &str,
+    owner: &Owner,
+    current: &dyn Fn() -> bool,
+) -> Res<Option<Receipt>> {
+    let mail = mail_dir(ctx, caller)?;
+    super::lock(ctx, &super::lock_key("mail", caller, key), || {
+        if !current() {
+            return Ok(None);
+        }
+        let mut c = receipt::load(&mail, key)?;
+        receipt::gate(&mail, &c)?;
+        if let Some(r) = c.pending.as_ref().filter(|r| r.owner == *owner) {
+            return Ok(Some(r.clone()));
+        }
+        let (found, _) = unread_after(&mail.join(format!("{key}.jsonl")), c.offset)?;
+        let messages: Vec<Value> = found.iter().map(|(m, _)| m.clone()).collect();
+        let b = batch(&messages, &c.held);
+        if b.ids.is_empty() {
+            if c.pending.take().is_some() {
+                receipt::commit(&mail, key, &c)?;
+            }
+            return Ok(None);
+        }
+        let end = found[b.ids.len() - 1].1;
+        let r = Receipt {
+            batch: super::team_mail::new_id()?,
+            owner: owner.clone(),
+            ids: b.ids,
+            refs: b.refs,
+            end,
+            text: b.text,
+        };
+        c.pending = Some(r.clone());
+        c.uncertain = None;
+        receipt::commit(&mail, key, &c)
+            .or_else(|_| refuse(1, "mail", "the receipt could not be saved; retry"))?;
+        Ok(Some(r))
+    })
+}
+
+/// R4: `pending` or `idPending` of `owner` named `batch` commits (offset = max, held updated, history, `uncertain`);
+/// one in the history of `owner` is a duplicate; anything else is 2 `ack` `stale receipt`. R5 gate first.
+pub fn ack(
+    ctx: &Ctx,
+    caller: &Caller,
+    key: &str,
+    owner: &Owner,
+    batch_id: &str,
+    current: &dyn Fn() -> bool,
+) -> Res<Acked> {
+    let mail = mail_dir(ctx, caller)?;
+    super::lock(ctx, &super::lock_key("mail", caller, key), || {
+        if !current() {
+            return refuse(2, "ack", "stale receipt");
+        }
+        let mut c = receipt::load(&mail, key)?;
+        receipt::gate(&mail, &c)?;
+        let mine = |r: &Option<Receipt>| {
+            r.as_ref()
+                .is_some_and(|r| r.batch == batch_id && r.owner == *owner)
+        };
+        if mine(&c.pending) {
+            let r = c.pending.take().expect("matched");
+            c.offset = c.offset.max(r.end);
+            let new: Vec<String> = r
+                .refs
+                .iter()
+                .filter(|id| !c.held.contains(id))
+                .cloned()
+                .collect();
+            c.held.extend(new);
+        } else if mine(&c.id_pending) {
+            let r = c.id_pending.take().expect("matched");
+            c.held.retain(|id| !r.ids.contains(id));
+        } else if c.was_acked(batch_id, owner) {
+            return Ok(Acked::Duplicate);
+        } else {
+            return refuse(2, "ack", "stale receipt");
+        }
+        c.remember(batch_id, owner);
+        c.uncertain = Some((batch_id.into(), owner.clone()));
+        receipt::commit(&mail, key, &c)
+            .or_else(|_| refuse(1, "mail", "the acknowledgement could not be saved; retry"))?;
+        Ok(Acked::Done)
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -584,6 +715,173 @@ mod tests {
             trailer,
             "held only: the trailer, no ids"
         );
+    }
+
+    use crate::agents::receipt::{self, Owner, Receipt};
+
+    fn me(id: &str) -> Owner {
+        Owner {
+            id: id.into(),
+            generation: "0".into(),
+        }
+    }
+
+    fn put(w: &World, id: &str, body: &str) {
+        deliver_once(
+            &w.ctx,
+            &w.caller(),
+            "pane-1",
+            &json!({"id": id, "from": "a", "pane": "%5", "at": "x", "body": body}),
+        )
+        .unwrap();
+    }
+
+    fn sv(w: &World, o: &str) -> Res<Option<Receipt>> {
+        serve(&w.ctx, &w.caller(), "pane-1", &me(o), &|| true)
+    }
+
+    fn ak(w: &World, o: &str, b: &str) -> Res<Acked> {
+        ack(&w.ctx, &w.caller(), "pane-1", &me(o), b, &|| true)
+    }
+
+    const H1: &str = "1111111111111111";
+    const H2: &str = "2222222222222222";
+
+    #[test]
+    fn a_receipt_is_re_served_until_acked() {
+        let w = World::human("");
+        put(&w, H1, "one");
+        let r = sv(&w, "a").unwrap().unwrap();
+        assert_eq!(r.ids, [H1]);
+        put(&w, H2, "two");
+        assert_eq!(
+            sv(&w, "a").unwrap().unwrap(),
+            r,
+            "death before acceptance: the same receipt, unchanged"
+        );
+        assert!(matches!(ak(&w, "a", &r.batch).unwrap(), Acked::Done));
+        let r2 = sv(&w, "a").unwrap().unwrap();
+        assert_eq!(r2.ids, [H2]);
+        assert_ne!(r2.batch, r.batch);
+        assert!(
+            serve(&w.ctx, &w.caller(), "pane-1", &me("a"), &|| false)
+                .unwrap()
+                .is_none(),
+            "a fenced reader serves nothing"
+        );
+    }
+
+    #[test]
+    fn acks_are_done_duplicate_or_stale() {
+        let w = World::human("");
+        put(&w, H1, "one");
+        let r = sv(&w, "a").unwrap().unwrap();
+        assert!(matches!(ak(&w, "a", &r.batch).unwrap(), Acked::Done));
+        assert!(matches!(ak(&w, "a", &r.batch).unwrap(), Acked::Duplicate));
+        let e = ak(&w, "a", "ffffffffffffffff").unwrap_err();
+        assert_eq!(
+            (e.code, e.check, e.message.as_str()),
+            (2, "ack", "stale receipt")
+        );
+        let mail = w.state().join("mail");
+        let mut c = receipt::load(&mail, "pane-1").unwrap();
+        let offset = c.offset;
+        c.pending = Some(Receipt {
+            batch: "old".into(),
+            owner: me("a"),
+            end: 1,
+            ..Receipt::default()
+        });
+        receipt::commit(&mail, "pane-1", &c).unwrap();
+        assert!(matches!(ak(&w, "a", "old").unwrap(), Acked::Done));
+        assert_eq!(
+            receipt::load(&mail, "pane-1").unwrap().offset,
+            offset,
+            "the offset never moves backward"
+        );
+    }
+
+    #[test]
+    fn a_new_owner_gets_a_rebuilt_batch() {
+        let w = World::human("");
+        put(&w, H1, "one");
+        let r = sv(&w, "a").unwrap().unwrap();
+        let r2 = sv(&w, "b").unwrap().unwrap(); // a resumed successor: new id, gen "0"
+        assert_eq!(
+            (r2.ids.clone(), r2.batch != r.batch),
+            (vec![H1.to_string()], true)
+        );
+        assert_eq!(
+            ak(&w, "a", &r.batch).unwrap_err().check,
+            "ack",
+            "the predecessor ack is refused"
+        );
+        assert!(matches!(ak(&w, "b", &r2.batch).unwrap(), Acked::Done));
+    }
+
+    #[test]
+    fn a_failed_file_flush_keeps_the_old_cursor() {
+        let w = World::human("");
+        put(&w, H1, "one");
+        let r = sv(&w, "a").unwrap().unwrap();
+        let mail = w.state().join("mail");
+        crate::state::fs::fail_sync_file(Some(&receipt::path(&mail, "pane-1")));
+        assert_eq!(ak(&w, "a", &r.batch).unwrap_err().check, "mail");
+        crate::state::fs::fail_sync_file(None);
+        assert_eq!(
+            receipt::load(&mail, "pane-1")
+                .unwrap()
+                .pending
+                .unwrap()
+                .batch,
+            r.batch,
+            "the receipt stands"
+        );
+        assert!(
+            matches!(ak(&w, "a", &r.batch).unwrap(), Acked::Done),
+            "a retry commits"
+        );
+    }
+
+    #[test]
+    fn a_failed_folder_flush_blocks_new_receipts_until_flushed() {
+        let w = World::human("");
+        put(&w, H1, "one");
+        let r = sv(&w, "a").unwrap().unwrap();
+        let mail = w.state().join("mail");
+        put(&w, H2, "two"); // seeded before the fault (F14): the mailbox folder flush of deliver_once must succeed
+        crate::state::fs::fail_sync_dir(Some(&mail));
+        assert_eq!(
+            ak(&w, "a", &r.batch).unwrap_err().check,
+            "mail",
+            "renamed, folder not flushed"
+        );
+        let e = sv(&w, "a").unwrap_err();
+        assert_eq!((e.code, e.message.as_str()), (1, receipt::NOT_ON_DISK));
+        assert!(
+            receipt::load(&mail, "pane-1").unwrap().pending.is_none(),
+            "no receipt issued"
+        );
+        crate::state::fs::fail_sync_dir(None);
+        assert!(
+            matches!(ak(&w, "a", &r.batch).unwrap(), Acked::Duplicate),
+            "the retry is retired"
+        );
+    }
+
+    #[test]
+    fn the_17th_ack_ages_out_the_oldest() {
+        let w = World::human("");
+        let mut first = String::new();
+        for n in 0..17u64 {
+            put(&w, &format!("{n:016x}"), "m");
+            let r = sv(&w, "a").unwrap().unwrap();
+            if n == 0 {
+                first = r.batch.clone();
+            }
+            ak(&w, "a", &r.batch).unwrap();
+        }
+        assert_eq!(ak(&w, "a", &first).unwrap_err().message, "stale receipt");
     }
 
     fn msg(id: &str, re: Option<&str>, hop: u64, cast: Option<&str>) -> Value {
