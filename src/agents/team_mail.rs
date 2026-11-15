@@ -659,9 +659,25 @@ fn deliver(
     let run = || -> Res<()> {
         let mut delivered = Vec::new();
         for r in &recipients {
-            let message = json!({"id": id, "from": sender.name, "pane": sender.pane, "at": intent["at"],
-                "body": body, "fromBox": sender.key, "re": intent["re"], "hop": intent["hop"],
-                "cast": intent["cast"]});
+            let mut message = Map::new();
+            message.insert("id".into(), id.clone().into());
+            message.insert("from".into(), sender.name.clone().into());
+            // A member's line names it, as its 0.2 line does: the side bar counts unread mail by identity (c723913).
+            if let Some(member) = &sender.id {
+                message.insert("fromId".into(), member.clone().into());
+            }
+            for (k, v) in [
+                ("pane", json!(sender.pane)),
+                ("at", intent["at"].clone()),
+                ("body", json!(body)),
+                ("fromBox", json!(sender.key)),
+                ("re", intent["re"].clone()),
+                ("hop", intent["hop"].clone()),
+                ("cast", intent["cast"].clone()),
+            ] {
+                message.insert(k.into(), v);
+            }
+            let message = Value::Object(message);
             if super::mail::deliver_once(ctx, caller, &super::text(r.get("box")), &message).is_err()
             {
                 return Err(unsaved(&id, &delivered));

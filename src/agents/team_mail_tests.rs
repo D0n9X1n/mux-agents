@@ -1184,8 +1184,9 @@ fn the_reply_json_stored_fields_last_sent_and_wait_cleanup() {
             .keys()
             .map(String::as_str)
             .collect::<Vec<_>>(),
+        // A member sender's line also names it (`fromId`, c723913): the side bar counts unread mail by identity.
         [
-            "id", "from", "pane", "at", "body", "fromBox", "re", "hop", "cast"
+            "id", "from", "fromId", "pane", "at", "body", "fromBox", "re", "hop", "cast"
         ]
     );
     assert_eq!(
@@ -1360,4 +1361,20 @@ fn a_claimed_member_whose_proof_fails_never_falls_back_to_0_2() {
             "{case}: the sender's state is unchanged"
         );
     }
+}
+
+/// The side bar counts a member's unread mail by identity (c723913): a member's team message names it (`fromId`), as
+/// its 0.2 message does; a person's names none.
+#[test]
+fn a_team_message_names_its_member_id() {
+    let w = team_world();
+    online(&w);
+    go(&w, Some(A), &["send", "leader", "-Body", "x"]).unwrap();
+    assert_eq!(inbox(&w, LEADER)[0]["fromId"], A, "a member names itself");
+    online(&w);
+    go(&w, None, &["send", "leader", "-Body", "y"]).unwrap();
+    assert!(
+        inbox(&w, LEADER)[1].get("fromId").is_none(),
+        "a person names no member"
+    );
 }
