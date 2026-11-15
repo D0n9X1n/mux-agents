@@ -595,6 +595,25 @@ fn a_pane_proven_member_routes_through_the_team() {
         (&json!("ma1"), &json!(LEADER))
     );
     assert_eq!(inbox(&w, LEADER)[0]["fromBox"], A);
+    // QA fix 1 (round 2): a second record claiming the pane makes its owner ambiguous, whatever claims it first.
+    let mut row = row_of("%1|@1|100|0000000000a1|ma1", &[]);
+    row.command = format!("hc attach t{A}");
+    let w = team_with(World::agent(A), vec![row]);
+    cf::member(
+        &w,
+        A,
+        json!({"name": "ma1", "depth": 1, "parentAgent": {"id": LEADER}, "pane": "%1", "window": "@1"}),
+    );
+    w.uncommitted("0000000000d4", json!({"name": "pw", "pane": "%1"}));
+    w.file("b.md", b"hi");
+    online(&w);
+    let r = go(&w, None, &["send", "leader", "-BodyFile", "b.md"]);
+    assert!(r.is_err(), "two records claim the pane: {r:?}");
+    assert_eq!(
+        said(r.unwrap_err()),
+        "2 tagged this caller cannot be proven a member"
+    );
+    assert!(inbox(&w, LEADER).is_empty());
 }
 
 #[test]

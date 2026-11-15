@@ -340,9 +340,10 @@ fn claim(ctx: &Ctx, caller: &Caller) -> Res<Claim> {
             found.push((record.get("hcAddress").is_some(), super::committed(&folder)));
         }
     }
+    // Every record that claims the pane counts, hc or not: two make its owner ambiguous (QA round 2, fix 1).
     Ok(match found.as_slice() {
         [] => Claim::None,
-        f if f.iter().any(|(hc, _)| *hc) => Claim::Member,
+        [(true, _)] => Claim::Member,
         [(false, true)] => Claim::Agent,
         _ => Claim::Unproven,
     })
