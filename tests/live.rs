@@ -4454,6 +4454,27 @@ hc {}:
         (r["lifecycle"], r["options"], r["prompt"]) =
             (json!(1), json!(["--model", "x"]), json!(["the task"]));
         std::fs::write(&path, serde_json::to_vec(&r).unwrap()).unwrap();
+        // PM call 16 (R3): a lifecycle member is ended only by recorded evidence, so the seeded record gets generation 0's
+        // commit, recorded end and launch name (each only where the launcher wrote none). A3c Task 6 replaces this seed
+        // with a real lifecycle launch.
+        let gen0 = path.parent().unwrap().join("gens").join("0");
+        std::fs::create_dir_all(&gen0).unwrap();
+        let name = r["hcName"]
+            .as_str()
+            .map_or_else(|| format!("m{}", &s(&w["id"])[..8]), str::to_string);
+        for (file, v) in [
+            ("commit", serde_json::json!({"committed": true})),
+            (
+                "ended",
+                serde_json::json!({"state": "finished", "reason": "stopped"}),
+            ),
+            ("launch", serde_json::json!({"hcName": name})),
+        ] {
+            let at = gen0.join(format!("{file}.json"));
+            if !at.exists() {
+                std::fs::write(&at, serde_json::to_vec(&v).unwrap()).unwrap();
+            }
+        }
         let (code, resumed) = live.run(&["resume", "w1"]);
         assert_eq!(code, 0, "{mux:?} {resumed}");
         let client = resumed_client(&live, &sid);
