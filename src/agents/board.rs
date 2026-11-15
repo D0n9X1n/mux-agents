@@ -148,6 +148,8 @@ pub fn board(ctx: &Ctx, caller: &Caller, all: bool, watch: bool) -> Res<Map<Stri
         let id = &o.identity.id;
         let notice = if o.life == Life::Running {
             None
+        } else if super::gens::lifecycle(&snapshot.records[id].record) {
+            snapshot.records[id].notice.clone() // R1: read once in membership (Task 2)
         } else {
             read_json(
                 &super::server_dir(ctx, caller)

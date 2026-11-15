@@ -134,3 +134,58 @@ fn hc_board_fields_append() {
         }
     }
 }
+
+// S7, R1 (af434f IMPORTANT 10; audit C10): a non-running lifecycle member's notice is its generation's, from the
+// membership snapshot; a torn one refuses `evidence`, never shown as none.
+#[test]
+fn the_board_shows_the_active_generations_notice() {
+    use crate::{agents::gens, state::evidence::publish};
+    let world = |torn: bool| {
+        let w = World::human("");
+        let c = w.caller();
+        let r = cf::member(
+            &w,
+            ID,
+            json!({"lifecycle": 1, "generation": "1", "hcName": "m0123abcd"}),
+        );
+        let f = w.folder(ID);
+        publish(&gens::path(&f, 1, "commit"), &json!({"committed": true})).unwrap();
+        write(
+            &f.join("notice.json"),
+            json!({"kind": "lost", "closedBy": "folder"}),
+        );
+        publish(
+            &gens::path(&f, 0, "notice"),
+            &json!({"kind": "lost", "closedBy": "gen0"}),
+        )
+        .unwrap();
+        if torn {
+            std::fs::write(gens::path(&f, 1, "notice"), b"{\"ki").unwrap();
+        } else {
+            publish(
+                &gens::path(&f, 1, "notice"),
+                &json!({"kind": "lost", "closedBy": "pane"}),
+            )
+            .unwrap();
+        }
+        let mut t = cf::wire(&r);
+        t["argv"] = json!(["/bin/sh", "-l"]);
+        cf::online(&w);
+        cf::listing(&w, &membership::team(&c), &[]);
+        cf::get(&w, r["hcAddress"].as_str().unwrap(), t);
+        w.panes(&[]);
+        (w, c)
+    };
+    let (w, c) = world(false);
+    let got = board(&w.ctx, &c, false, false).unwrap();
+    assert_eq!(
+        got["agents"][0]["closedBy"], "pane",
+        "neither the folder's nor generation 0's notice"
+    );
+    let (w, c) = world(true);
+    assert_eq!(
+        board(&w.ctx, &c, false, false).map_err(|e| e.check).err(),
+        Some("evidence"),
+        "torn notice"
+    );
+}
