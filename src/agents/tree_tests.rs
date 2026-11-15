@@ -1627,6 +1627,16 @@ fn a_lifecycle_member_reports_done_over_its_hook_chain_and_keeps_its_lease() {
     evidence(&m, 0);
     commit(&m, 0, json!({"committed": true}));
     m.w.fakes.process(crate::testing::row(77, 1, 770));
+    let (f, x, name) = (m.folder(ID), m.record(ID), format!("m{}", &ID[..8]));
+    crate::state::evidence::publish(
+        &crate::agents::gens::path(&f, 0, "launch"),
+        &json!({"hcName": name}),
+    )
+    .unwrap();
+    write(
+        &f.join("view.json"),
+        json!({"pane": x["pane"], "window": x["window"], "startCommand": x["startCommand"], "gen": 0, "hcAddress": x["hcAddress"], "hcName": name}),
+    );
     let lease = m.folder(ID).join("waiting-77.json");
     write(
         &lease,

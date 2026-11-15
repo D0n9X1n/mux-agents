@@ -1453,6 +1453,16 @@ fn a_lifecycle_member_resumes_with_its_stored_options_only() {
     };
     publish("commit", json!({"committed": true}));
     publish("ended", json!({"state": "finished", "reason": "exited"}));
+    let name = format!("m{}", &ID[..8]);
+    crate::state::evidence::publish(
+        &crate::agents::gens::path(&f, 0, "launch"),
+        &json!({"hcName": name}),
+    )
+    .unwrap();
+    write(
+        &f.join("view.json"),
+        json!({"pane": x["pane"], "window": x["window"], "startCommand": x["startCommand"], "gen": 0, "hcAddress": x["hcAddress"], "hcName": name}),
+    );
     let before = folders(&w);
     w.panes(&[]);
     facts(&w, &[(&x, "exited")]);
@@ -1493,6 +1503,16 @@ fn a_lifecycle_member_whose_options_are_not_pure_is_refused() {
         };
         publish("commit", json!({"committed": true}));
         publish("ended", json!({"state": "finished", "reason": "exited"}));
+        let name = format!("m{}", &ID[..8]);
+        crate::state::evidence::publish(
+            &crate::agents::gens::path(&f, 0, "launch"),
+            &json!({"hcName": name}),
+        )
+        .unwrap();
+        write(
+            &f.join("view.json"),
+            json!({"pane": x["pane"], "window": x["window"], "startCommand": x["startCommand"], "gen": 0, "hcAddress": x["hcAddress"], "hcName": name}),
+        );
         w.panes(&[]);
         facts(&w, &[(&x, "exited")]);
         launches(&w, "t1");

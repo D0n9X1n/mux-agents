@@ -145,19 +145,50 @@ impl Tx<'_> {
 /// The presentation fields view.json carries (views-6f V1).
 pub const VIEW_FIELDS: [&str; 3] = ["pane", "window", "startCommand"];
 
-/// S4: the member lock only; replaces view.json, never touches record.json.
+/// S4: the member lock only; replaces view.json, never touches record.json. A view names its generation (V1,
+/// ambiguity 7).
 pub fn view(ctx: &Ctx, scope: &Scope, id: &str, view: &Value) -> Res<()> {
+    if !view.get("gen").is_some_and(Value::is_u64) {
+        return Err(Refusal::internal("a view names its generation"));
+    }
     let path = scope.agents(&ctx.state_root).join(id).join("view.json");
     super::lock(ctx, &scope.member_lock(id), || write_json(&path, view))
 }
 
-/// A lifecycle record with its view.json fields over it, for readers that still take a pane from the record;
-/// a pre-lifecycle record is returned as it is.
+/// V1 (ambiguity 6; R1, R2, R4): a lifecycle record never presents its own pane, window or startCommand; view.json's
+/// do, only when `gen` is the active generation, `hcAddress` the record's, and `hcName` that generation's
+/// `launch.json` `hcName` (never the record's). view.json and launch.json are each read once; Unreadable refuses.
+/// No active generation presents nothing. A pre-lifecycle record is returned as it is.
 pub fn presented(folder: &Path, mut record: Value) -> Res<Value> {
-    if !super::gens::lifecycle(&record) {
+    use super::gens;
+    if !gens::lifecycle(&record) {
         return Ok(record);
     }
-    if let Some(v) = evidence::read(&folder.join("view.json")).known()? {
+    if let Some(r) = record.as_object_mut() {
+        for k in VIEW_FIELDS {
+            r.remove(k);
+        }
+    }
+    let Some(n) = record
+        .get("generation")
+        .and_then(Value::as_str)
+        .and_then(gens::plain_gen)
+    else {
+        return Ok(record);
+    };
+    let Some(v) = gens::walk(folder, &["view.json"]).known()? else {
+        return Ok(record);
+    };
+    let launch = gens::read(folder, n, "launch").known()?;
+    let name = launch
+        .as_ref()
+        .and_then(|l| l.get("hcName"))
+        .and_then(Value::as_str);
+    let ours = v.get("gen").and_then(Value::as_u64) == Some(n)
+        && v.get("hcAddress")
+            .is_some_and(|a| Some(a) == record.get("hcAddress"))
+        && name.is_some_and(|h| v.get("hcName").and_then(Value::as_str) == Some(h));
+    if ours {
         for k in VIEW_FIELDS {
             if let Some(x) = v.get(k) {
                 record[k] = x.clone();
@@ -183,6 +214,113 @@ mod tests {
         crate::state::fs::read_json(&w.folder(ID).join("record.json"))
             .unwrap()
             .unwrap()
+    }
+
+    /// The view fields `presented` shows for record `r` beside `view` (None for a field it does not show).
+    fn shown(w: &World, v: &Value) -> Res<[Option<Value>; 3]> {
+        let f = w.folder(ID);
+        crate::state::fs::write_json(&f.join("view.json"), v).unwrap();
+        let r = presented(&f, record(w))?;
+        Ok(VIEW_FIELDS.map(|k| r.get(k).cloned()))
+    }
+
+    // V1 (a280e7 CRITICAL 1; audits A8-A11): gen, hcAddress and launch.json's hcName must be the active generation's;
+    // a rejected view shows none of pane, window, startCommand, and never the record's own.
+    #[test]
+    fn only_the_active_generations_view_presents() {
+        use crate::{agents::gens, state::evidence::publish};
+        let (w, s) = world();
+        let base = json!({"generation": "1", "hcAddress": "t1", "hcName": "m0123abcd", "pane": "%2",
+            "window": "@2", "startCommand": "old"});
+        open(&w.ctx, &s, |tx| tx.create(ID, base).map(|_| ())).unwrap();
+        let f = w.folder(ID);
+        publish(
+            &gens::path(&f, 1, "launch"),
+            &json!({"hcName": "m1111aaaa"}),
+        )
+        .unwrap();
+        let good = json!({"pane": "%9", "window": "@5", "startCommand": "hc attach t1", "gen": 1,
+            "hcAddress": "t1", "hcName": "m1111aaaa"});
+        let none: [Option<Value>; 3] = [None, None, None];
+        assert_eq!(
+            shown(&w, &good).unwrap(),
+            [
+                Some(json!("%9")),
+                Some(json!("@5")),
+                Some(json!("hc attach t1"))
+            ]
+        );
+        for (k, bad) in [
+            ("gen", json!(0)),
+            ("hcAddress", json!("t0")),
+            ("hcName", json!("m0123abcd")),
+        ] {
+            let mut v = good.clone();
+            v[k] = bad;
+            assert_eq!(
+                shown(&w, &v).unwrap(),
+                none,
+                "{k}: not the active generation's (hcName is launch.json's)"
+            );
+        }
+        let mut v = good.clone();
+        v.as_object_mut().unwrap().remove("gen");
+        assert_eq!(shown(&w, &v).unwrap(), none, "a view without gen");
+        std::fs::write(gens::path(&f, 1, "launch"), b"{\"hc").unwrap();
+        assert_eq!(
+            shown(&w, &good).map_err(|e| e.check).err(),
+            Some("evidence"),
+            "torn launch.json"
+        );
+        std::fs::remove_file(gens::path(&f, 1, "launch")).unwrap();
+        std::fs::create_dir(gens::path(&f, 1, "launch")).unwrap();
+        assert_eq!(
+            shown(&w, &good).map_err(|e| e.check).err(),
+            Some("evidence"),
+            "launch.json a folder"
+        );
+        std::fs::remove_dir(gens::path(&f, 1, "launch")).unwrap();
+        assert_eq!(
+            shown(&w, &good).unwrap(),
+            none,
+            "no launch.json: no hcName to match"
+        );
+        std::fs::write(f.join("view.json"), b"{\"pa").unwrap();
+        assert_eq!(
+            presented(&f, record(&w)).map_err(|e| e.check).err(),
+            Some("evidence"),
+            "torn view"
+        );
+        let mut pending = record(&w);
+        pending.as_object_mut().unwrap().remove("generation");
+        pending["pending"] = json!({"gen": 1});
+        crate::state::fs::write_json(&f.join("record.json"), &pending).unwrap();
+        publish(
+            &gens::path(&f, 1, "launch"),
+            &json!({"hcName": "m1111aaaa"}),
+        )
+        .unwrap();
+        assert_eq!(
+            shown(&w, &good).unwrap(),
+            none,
+            "no active generation presents nothing"
+        );
+    }
+
+    // Ambiguity 7: no writer makes a descriptor V1 rejects.
+    #[test]
+    fn a_view_without_gen_is_refused() {
+        let (w, s) = world();
+        open(&w.ctx, &s, |tx| tx.create(ID, json!({})).map(|_| ())).unwrap();
+        for v in [json!({"pane": "P1"}), json!({"pane": "P1", "gen": "1"})] {
+            let e = view(&w.ctx, &s, ID, &v).unwrap_err();
+            assert_eq!(
+                e.message, "unexpected error (a view names its generation)",
+                "{v}"
+            );
+            assert!(!w.folder(ID).join("view.json").exists(), "{v}");
+        }
+        view(&w.ctx, &s, ID, &json!({"pane": "P1", "gen": 0})).unwrap();
     }
 
     #[test]
@@ -213,8 +351,20 @@ mod tests {
     #[test]
     fn a_view_write_and_a_patch_both_survive() {
         let (w, s) = world();
-        open(&w.ctx, &s, |tx| tx.create(ID, json!({"parentAgent": null}))).unwrap();
+        open(&w.ctx, &s, |tx| {
+            tx.create(
+                ID,
+                json!({"parentAgent": null, "generation": "0", "hcAddress": "t1"}),
+            )
+        })
+        .unwrap();
         let folder = w.folder(ID);
+        let name = format!("m{}", &ID[..8]);
+        crate::state::evidence::publish(
+            &crate::agents::gens::path(&folder, 0, "launch"),
+            &json!({"hcName": name}),
+        )
+        .unwrap();
         let seen = record(&w);
         let parent = json!("bbbbbbbbbbbb");
         open(&w.ctx, &s, |tx| {
@@ -222,7 +372,8 @@ mod tests {
         })
         .unwrap();
         let before = std::fs::read(folder.join("record.json")).unwrap();
-        let v = json!({"pane": "P9", "window": "W5", "startCommand": "hc attach t1"});
+        let v = json!({"pane": "P9", "window": "W5", "startCommand": "hc attach t1", "gen": 0,
+            "hcAddress": "t1", "hcName": name});
         view(&w.ctx, &s, ID, &v).unwrap();
         assert_eq!(std::fs::read(folder.join("record.json")).unwrap(), before);
         let r = presented(&folder, record(&w)).unwrap();
@@ -361,7 +512,7 @@ mod tests {
         let (w, s) = world();
         open(&w.ctx, &s, |tx| tx.create(ID, json!({})).map(|_| ())).unwrap();
         w.fakes.clear_log();
-        view(&w.ctx, &s, ID, &json!({"pane": "P1"})).unwrap();
+        view(&w.ctx, &s, ID, &json!({"pane": "P1", "gen": 0})).unwrap();
         let m = s.member_lock(ID);
         assert_eq!(w.fakes.locks(), [format!("+{m}"), format!("-{m}")]);
     }
