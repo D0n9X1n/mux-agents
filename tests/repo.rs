@@ -2524,6 +2524,26 @@ fn usage_documents_side_bar_clicks() {
     );
 }
 
+// #137 (#103 B10): in a team's bar `n`/`N` select the next or previous agent with a live view and Enter opens it; the
+// Chinese twin has a line with the same code spans.
+#[test]
+fn usage_says_a_teams_n_selects_and_enter_opens() {
+    let en = section(&wiki_text("Usage"), "Side bar");
+    let zh = section(&wiki_text("Usage-zh-CN"), "侧边栏");
+    let line = en
+        .iter()
+        .find(|l| l.contains("`n`/`N` select the next or previous agent with a live view"))
+        .unwrap_or_else(|| panic!("## Side bar does not say a team's n/N select: {en:#?}"));
+    assert!(line.contains("Enter opens it"), "{line}");
+    let spans = spans_and_numbers(line);
+    assert!(
+        zh.iter()
+            .any(|l| l.contains("选择下一个或上一个有实时视图的代理")
+                && spans_and_numbers(l) == spans),
+        "## 侧边栏 has no twin line with the spans {spans:?}"
+    );
+}
+
 // #71: the integration job installs rmux at a pinned version and requires all three multiplexers, so a missing
 // one fails the live suite instead of skipping it.
 #[test]
