@@ -905,7 +905,7 @@ fn recorded_client(member: &Path, record: &Value) -> Recorded {
 }
 
 /// Waits, on the injected clock, until the recorded client is gone from the OS process table: no row for its pid, or
-/// one with another start. False once `CLIENT_EXIT_BOUND` has passed with it still there.
+/// one with another known start. False once `CLIENT_EXIT_BOUND` has passed with it still unresolved.
 fn client_exited(ctx: &Ctx, (pid, start): (u32, i64)) -> bool {
     let deadline = ctx.clock.now() + CLIENT_EXIT_BOUND;
     while listed(ctx.os.as_ref(), pid, start) {
@@ -919,11 +919,12 @@ fn client_exited(ctx: &Ctx, (pid, start): (u32, i64)) -> bool {
 
 /// Whether the process `pid` that started at `start` is still in the OS process table, read as resume's session check
 /// reads it (`Os::table`, not `Os::row`: on Windows a handle another process holds keeps an exited process openable).
-/// A table that cannot be read cannot show it gone, so it counts as listed.
+/// A table that cannot be read cannot show it gone, so it counts as listed. So does a row with the pid whose start cannot
+/// be read (call 10; Windows keeps such rows): only no row, or a row with another known start, is gone.
 fn listed(os: &dyn crate::proc::Os, pid: u32, start: i64) -> bool {
     os.table().map_or(true, |rows| {
         rows.iter()
-            .any(|row| row.pid == pid && row.start.is_some_and(|s| os.same_start(s, start)))
+            .any(|row| row.pid == pid && row.start.is_none_or(|s| os.same_start(s, start)))
     })
 }
 

@@ -504,3 +504,17 @@ fn stop_with_a_fifo_at_client_json_returns_promptly() {
     assert_eq!(got.get("clientExited"), Some(&json!(false)));
     w.fakes.hc_done().unwrap();
 }
+
+// Call 10: a row with the recorded pid whose start cannot be read is unresolved, never exited: `stop` waits out the
+// bound, then replies `clientExited: false`.
+#[test]
+fn stop_waits_out_the_bound_for_a_row_with_an_unknown_start() {
+    let w = World::human("");
+    stopping(&w, false);
+    w.fakes.forget(150);
+    w.fakes.process(crate::testing::unknown_start(150, 31337));
+    let got = call(&w).unwrap();
+    assert_eq!(got.get("clientExited"), Some(&json!(false)));
+    assert_eq!(w.fakes.slept().iter().sum::<u64>(), 8000);
+    w.fakes.hc_done().unwrap();
+}
