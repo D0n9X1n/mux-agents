@@ -417,3 +417,90 @@ fn stop_with_an_unreadable_process_table_waits_out_the_bound() {
     assert_eq!(got["clientExited"], json!(false));
     assert_eq!(w.fakes.slept().iter().sum::<u64>(), 8000);
 }
+
+// Call 9: the recorded client is read as typed evidence. Unreadable evidence (torn JSON, a folder in its place) cannot
+// prove the client exited: `stop` replies at once, with `clientExited: false`, and never waits.
+#[test]
+fn stop_with_unreadable_client_evidence_replies_client_exited_false_at_once() {
+    for (case, lifecycle) in [
+        ("torn", false),
+        ("torn", true),
+        ("folder", false),
+        ("folder", true),
+    ] {
+        let w = World::human("");
+        stopping(&w, lifecycle);
+        let at = if lifecycle {
+            super::gens::path(&w.folder(ID), 0, "client")
+        } else {
+            w.folder(ID).join("launcher.json")
+        };
+        std::fs::remove_file(&at).unwrap();
+        if case == "torn" {
+            std::fs::write(&at, b"{\"pid\": 15").unwrap();
+        } else {
+            std::fs::create_dir(&at).unwrap();
+        }
+        let got = call(&w).unwrap();
+        assert_eq!(
+            (got.get("clientExited"), w.fakes.slept()),
+            (Some(&json!(false)), vec![]),
+            "{case} lifecycle {lifecycle}"
+        );
+        w.fakes.hc_done().unwrap();
+    }
+}
+
+// Call 9: an absent client.json recorded no client: no wait and no `clientExited`.
+#[test]
+fn stop_with_no_recorded_client_neither_waits_nor_adds_client_exited() {
+    let w = World::human("");
+    stopping(&w, true);
+    std::fs::remove_file(super::gens::path(&w.folder(ID), 0, "client")).unwrap();
+    let got = call(&w).unwrap();
+    assert_eq!((got.get("clientExited"), w.fakes.slept()), (None, vec![]));
+    w.fakes.hc_done().unwrap();
+}
+
+// Call 9, Unix: a FIFO at client.json is never opened, so `stop` returns promptly. A watchdog releases a reader that
+// blocks on the FIFO after 2 s (a non-blocking writer open fails at once with no reader, so it never blocks itself).
+#[cfg(unix)]
+#[test]
+fn stop_with_a_fifo_at_client_json_returns_promptly() {
+    use std::os::unix::{ffi::OsStrExt, fs::OpenOptionsExt};
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
+    use std::time::{Duration, Instant};
+    let w = World::human("");
+    stopping(&w, true);
+    let at = super::gens::path(&w.folder(ID), 0, "client");
+    std::fs::remove_file(&at).unwrap();
+    let c = std::ffi::CString::new(at.as_os_str().as_bytes()).unwrap();
+    assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0, "mkfifo");
+    let done = Arc::new(AtomicBool::new(false));
+    let (stop, fifo) = (done.clone(), at.clone());
+    let dog = std::thread::spawn(move || {
+        let start = Instant::now();
+        while !stop.load(Ordering::SeqCst) {
+            if start.elapsed() > Duration::from_secs(2) {
+                let _ = std::fs::OpenOptions::new()
+                    .write(true)
+                    .custom_flags(libc::O_NONBLOCK)
+                    .open(&fifo);
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    });
+    let begun = Instant::now();
+    let got = call(&w).unwrap();
+    done.store(true, Ordering::SeqCst);
+    dog.join().unwrap();
+    assert!(
+        begun.elapsed() < Duration::from_secs(2),
+        "stop blocked on the FIFO"
+    );
+    assert_eq!(got.get("clientExited"), Some(&json!(false)));
+    w.fakes.hc_done().unwrap();
+}

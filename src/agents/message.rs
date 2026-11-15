@@ -861,26 +861,47 @@ fn kept(core: &crate::hc::Core<'_>, id: &super::core_identity::Identity) -> Res<
 const CLIENT_EXIT_BOUND: Duration = Duration::from_millis(8000);
 const CLIENT_EXIT_POLL: Duration = Duration::from_millis(250);
 
-/// The client member `id` recorded, as (pid, start): its active generation's `client.json` for a lifecycle record, the
-/// `client` its `launcher.json` names for any other. Each file is read only inside the state root. None when it
-/// recorded none.
-fn recorded_client(ctx: &Ctx, key: &str, id: &str, record: &Value) -> Option<(u32, i64)> {
-    let read = |rel: &[&str]| {
-        crate::caller::hc::within_root(&ctx.state_root, rel)
-            .and_then(|p| read_json(&p).ok().flatten())
-    };
+/// What member `id` recorded of its client (call 9): its active generation's `client.json` for a lifecycle record, the
+/// `client` its `launcher.json` names for any other, each read as typed evidence (`gens::walk`: regular files only,
+/// never a FIFO, a folder or a link, so the read never blocks).
+#[derive(Debug, PartialEq)]
+enum Recorded {
+    /// No such file, or a `launcher.json` that names no client: nothing to wait for.
+    Absent,
+    /// Torn, not a regular file, or without a plain pid and start: the exit cannot be proven.
+    Unreadable,
+    Client(u32, i64),
+}
+
+fn recorded_client(member: &Path, record: &Value) -> Recorded {
+    use crate::state::evidence::Evidence;
     let client = if super::gens::lifecycle(record) {
-        let n = super::gens::active(record)?.to_string();
-        read(&[key, "agents", id, "gens", &n, "client.json"])?
+        let Some(n) = super::gens::active(record) else {
+            return Recorded::Unreadable;
+        };
+        match super::gens::read(member, n, "client") {
+            Evidence::Present(c) => c,
+            Evidence::Absent => return Recorded::Absent,
+            Evidence::Unreadable => return Recorded::Unreadable,
+        }
     } else {
-        read(&[key, "agents", id, "launcher.json"])?
-            .get("client")?
-            .clone()
+        match super::gens::walk(member, &["launcher.json"]) {
+            Evidence::Present(l) => match l.get("client") {
+                Some(c) => c.clone(),
+                None => return Recorded::Absent,
+            },
+            Evidence::Absent => return Recorded::Absent,
+            Evidence::Unreadable => return Recorded::Unreadable,
+        }
     };
-    Some((
-        u32::try_from(client.get("pid")?.as_u64()?).ok()?,
-        client.get("start")?.as_i64()?,
-    ))
+    let pid = client
+        .get("pid")
+        .and_then(Value::as_u64)
+        .and_then(|p| u32::try_from(p).ok());
+    match (pid, client.get("start").and_then(Value::as_i64)) {
+        (Some(pid), Some(start)) => Recorded::Client(pid, start),
+        _ => Recorded::Unreadable,
+    }
 }
 
 /// Waits, on the injected clock, until the recorded client is gone from the OS process table: no row for its pid, or
@@ -930,7 +951,8 @@ pub fn stop_hc(ctx: &Ctx, request: &Request) -> Res<Map<String, Value>> {
                 Life::Unknown => "unknown",
             };
             add_notice(ctx, &caller, &id.id, &record, Notice::Stopped)?;
-            let client = recorded_client(ctx, &caller.server_key, &id.id, &record);
+            let member = server_dir(ctx, &caller).join("agents").join(&id.id);
+            let client = recorded_client(&member, &record);
             let mut reply = Map::new();
             reply.insert("name".into(), id.name.clone().into());
             reply.insert("hcAddress".into(), id.address.clone().into());
@@ -938,7 +960,12 @@ pub fn stop_hc(ctx: &Ctx, request: &Request) -> Res<Map<String, Value>> {
             Ok((reply, client))
         })
     })?;
-    if client.is_some_and(|c| !client_exited(ctx, c)) {
+    let exited = match client {
+        Recorded::Absent => true,
+        Recorded::Unreadable => false,
+        Recorded::Client(pid, start) => client_exited(ctx, (pid, start)),
+    };
+    if !exited {
         reply.insert("clientExited".into(), false.into());
     }
     Ok(reply)
