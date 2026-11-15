@@ -822,21 +822,30 @@ fn member_file(live: &Live, id: &str, file: &str) -> Value {
 }
 /// mux-agent run by member `id`'s fake client (found by its record's session); its reply.
 fn by(live: &Live, sent: &mut HashMap<u32, usize>, id: &str, args: &[&str]) -> Value {
-    let session = member_file(live, id, "record.json")["sessionId"].clone();
-    let pid: u32 = live.wait("member client", || {
-        std::fs::read_to_string(live.dir.join("clients.log"))
-            .ok()?
-            .lines()
-            .find_map(|p| {
-                let r: Value = serde_json::from_str(
-                    &std::fs::read_to_string(live.dir.join(format!("client.{p}.json"))).ok()?,
-                )
-                .ok()?;
-                (r["sessionId"] == session)
-                    .then(|| p.parse().ok())
-                    .flatten()
-            })
-    });
+    let session = s(&member_file(live, id, "record.json")["sessionId"]);
+    by_pid(live, sent, client_pid(live, &session, 0), args)
+}
+
+/// The pid of the newest fake client of `session` (by `sessionId` or argv) other than `skip` (`msg-plan-4b-i-3.md`
+/// F20): a resumed member's client answers, never its dead predecessor.
+fn client_pid(live: &Live, session: &str, skip: u32) -> u32 {
+    live.wait("member client", || {
+        let log = std::fs::read_to_string(live.dir.join("clients.log")).ok()?;
+        log.lines().rev().find_map(|p| {
+            let text = std::fs::read_to_string(live.dir.join(format!("client.{p}.json"))).ok()?;
+            let r: Value = serde_json::from_str(&text).ok()?;
+            let mine = r["sessionId"] == session
+                || r["argv"]
+                    .as_array()
+                    .is_some_and(|a| a.iter().any(|x| x == session));
+            let pid: u32 = p.parse().ok()?;
+            (mine && pid != skip).then_some(pid)
+        })
+    })
+}
+
+/// `by` for a known client pid.
+fn by_pid(live: &Live, sent: &mut HashMap<u32, usize>, pid: u32, args: &[&str]) -> Value {
     let n = sent.entry(pid).or_default();
     *n += 1;
     let held = live.dir.join(format!("cmd.{pid}.part"));
@@ -1264,4 +1273,77 @@ fn team_messaging_stays_in_the_team() {
         (Some("quota"), true),
         "the 121st: {r}"
     );
+}
+
+/// Receipts end to end on Windows (#103 4b-i): b's unacked batch is served again, then acked; a resumed b (another
+/// process) gets a rebuilt batch for unacked mail.
+#[test]
+fn an_unacked_batch_is_served_again_and_rebuilt_for_a_successor() {
+    let Some(live) = Live::start() else { return };
+    let (task, brief, body) = (
+        live.dir.join("task.txt"),
+        live.dir.join("brief.md"),
+        live.dir.join("body.md"),
+    );
+    for (p, t) in [(&task, "say hi"), (&brief, "brief"), (&body, "hello")] {
+        std::fs::write(p, t).unwrap();
+    }
+    let (task, brief, body) = (
+        task.display().to_string(),
+        brief.display().to_string(),
+        body.display().to_string(),
+    );
+    let leader = s(&live.run(&["up", "-Client", "claude"])["leader"]["id"]);
+    let mut sent = HashMap::new();
+    let spawn = |sent: &mut HashMap<u32, usize>, name: &str| {
+        let r = by(
+            &live,
+            sent,
+            &leader,
+            &[
+                "spawn",
+                "-Client",
+                "claude",
+                "-TaskFile",
+                &task,
+                "-BriefFile",
+                &brief,
+                "-Context",
+                "brief",
+                "-Name",
+                name,
+            ],
+        );
+        assert_eq!(r["ok"], true, "{name}: {r}");
+        s(&r["id"])
+    };
+    let (a, b) = (spawn(&mut sent, "a"), spawn(&mut sent, "b"));
+    for _ in 0..2 {
+        assert_eq!(
+            by(&live, &mut sent, &a, &["send", "b", "-BodyFile", &body])["ok"],
+            true
+        );
+    }
+    let first = by(&live, &mut sent, &b, &["read", "-Deliver"]);
+    assert_eq!(first["ids"].as_array().map(Vec::len), Some(2), "{first}");
+    assert_eq!(
+        by(&live, &mut sent, &b, &["read", "-Deliver"])["batch"],
+        first["batch"]
+    );
+    assert_eq!(
+        by(&live, &mut sent, &b, &["read", "-Ack", &s(&first["batch"])])["acked"],
+        true
+    );
+    by(&live, &mut sent, &a, &["send", "b", "-BodyFile", &body]);
+    let pending = by(&live, &mut sent, &b, &["read", "-Deliver"]);
+    let sid = s(&member_file(&live, &b, "record.json")["sessionId"]);
+    let old = client_pid(&live, &sid, 0);
+    assert_eq!(by(&live, &mut sent, &leader, &["stop", "b"])["ok"], true);
+    assert_eq!(by(&live, &mut sent, &leader, &["resume", "b"])["ok"], true);
+    // The resumed B: matched by session id or argv as on Unix, another process than its predecessor (F20).
+    let new = client_pid(&live, &sid, old);
+    assert_ne!(new, old, "a new process");
+    let rebuilt = by_pid(&live, &mut sent, new, &["read", "-Deliver"]);
+    assert_eq!(rebuilt["ids"], pending["ids"]);
+    assert_ne!(rebuilt["batch"], pending["batch"]);
 }
