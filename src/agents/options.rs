@@ -287,6 +287,34 @@ mod tests {
         }
     }
 
+    // A lone `-` inside a variadic list is a value, as commander reads it (only a longer dash token is a flag): it and
+    // every value after it stay options, and replay keeps them.
+    #[test]
+    fn a_lone_dash_in_a_variadic_list_stays_a_value() {
+        for (client, argv) in [
+            (
+                Client::Claude,
+                &["--disallowedTools", "Bash", "-", "Edit", "--model", "x"][..],
+            ),
+            (Client::Claude, &["--add-dir", "a", "-", "b"]),
+            (Client::Copilot, &["--deny-tool", "shell", "-", "write"]),
+            (
+                Client::Copilot,
+                &["--excluded-tools", "a", "-", "b", "--", "fix"],
+            ),
+        ] {
+            let got = classify(client, &v(argv)).unwrap();
+            let end = argv.iter().position(|t| *t == "--").unwrap_or(argv.len());
+            assert_eq!(got.options, v(&argv[..end]), "{argv:?}");
+            assert_eq!(got.prompt, v(&argv[end..]), "{argv:?}");
+            assert_eq!(
+                replay(client, &got.options, Policy::Default).ok(),
+                Some(got.options.clone()),
+                "{argv:?}: replay keeps the lone dash"
+            );
+        }
+    }
+
     // One argv grammar: classify, the ceiling the argv gives, and replay agree for every spelling of a prompt.
     #[test]
     fn a_prompt_in_any_spelling_keeps_the_ceiling_its_options_give() {
