@@ -706,6 +706,26 @@ exec claude --dangerously-skip-permissions
             let pid = self.client_of(id);
             self.server.command(pid, args)
         }
+
+        /// Waits for the fake client of session `sid` (started with `--session-id sid`, or resumed with `sid` in its
+        /// argv) that is not `old`; its pid (`msg-plan-4b-i-3.md` F20).
+        fn successor(&self, sid: &str, old: u64) -> u64 {
+            self.server.wait(&format!("successor of {old}"), || {
+                let log = std::fs::read_to_string(self.dir.join("clients.log")).ok()?;
+                log.lines().rev().find_map(|p| {
+                    let text =
+                        std::fs::read_to_string(self.dir.join(format!("client.{}.json", p.trim())))
+                            .ok()?;
+                    let r: Value = serde_json::from_str(&text).ok()?;
+                    let mine = r["sessionId"] == sid
+                        || r["argv"]
+                            .as_array()
+                            .is_some_and(|a| a.iter().any(|x| x == sid));
+                    let pid = r["pid"].as_u64()?;
+                    (mine && pid != old).then_some(pid)
+                })
+            })
+        }
     }
 
     fn s(value: &Value) -> &str {
@@ -4973,6 +4993,7 @@ hc {}:
                     bar_click_after_shrinking_does_nothing,
                     members_spawn_and_act_only_down_the_tree,
                     team_messaging_stays_in_the_team,
+                    an_unacked_batch_is_served_again_and_rebuilt_for_a_successor,
                 ]
             );
         };
@@ -5148,6 +5169,65 @@ hc {}:
             (2, "quota", true),
             "{mux:?} the 121st: {r}"
         );
+    }
+
+    /// Receipts end to end (#103 4b-i): a sends b two messages; b's unacked batch is served again, then acked; a
+    /// resumed b (another process, new id, the same mailbox) gets a rebuilt batch for unacked mail, which no other
+    /// member can ack.
+    fn an_unacked_batch_is_served_again_and_rebuilt_for_a_successor(mux: Mux) {
+        let Some(mut live) = Live::human(mux) else {
+            return;
+        };
+        std::fs::write(live.dir.join("brief.md"), "brief").unwrap();
+        let body = live.path("body.md");
+        std::fs::write(&body, "hello").unwrap();
+        let (code, up) = live.run(&["up", "-Client", "claude"]);
+        assert_eq!(code, 0, "{mux:?} {up}");
+        let leader = s(&up["leader"]["id"]).to_string();
+        let a = s(&live.spawn_by(&leader, "a").1["id"]).to_string();
+        let b = s(&live.spawn_by(&leader, "b").1["id"]).to_string();
+        for _ in 0..2 {
+            assert_eq!(
+                live.by(&a, &["send", "b", "-BodyFile", &body]).0,
+                0,
+                "{mux:?}"
+            );
+        }
+        let (_, first) = live.by(&b, &["read", "-Deliver"]);
+        assert_eq!(
+            first["ids"].as_array().map(Vec::len),
+            Some(2),
+            "{mux:?} {first}"
+        );
+        // B exits before acking; read again: the same receipt.
+        let (_, again) = live.by(&b, &["read", "-Deliver"]);
+        assert_eq!(again["batch"], first["batch"], "{mux:?}");
+        let (_, acked) = live.by(&b, &["read", "-Ack", s(&first["batch"])]);
+        assert_eq!(acked["acked"], true, "{mux:?} {acked}");
+        // Unacked mail, then a resumed successor (new id, gen 0, same mailbox): a rebuilt batch.
+        assert_eq!(
+            live.by(&a, &["send", "b", "-BodyFile", &body]).0,
+            0,
+            "{mux:?}"
+        );
+        let (_, pending) = live.by(&b, &["read", "-Deliver"]);
+        let sid = s(&json_file(&live.agent_dir(&b).join("record.json"))["sessionId"]).to_string();
+        let old = live.client_of(&b);
+        assert_eq!(live.by(&leader, &["stop", "b"]).0, 0, "{mux:?}");
+        assert_eq!(live.by(&leader, &["resume", "b"]).0, 0, "{mux:?}");
+        let pid = live.successor(&sid, old);
+        assert_ne!(pid, old, "{mux:?} a new process");
+        let (_, rebuilt) = live.server.command(pid, &["read", "-Deliver"]);
+        assert_eq!(
+            rebuilt["ids"], pending["ids"],
+            "{mux:?} the same unacked mail"
+        );
+        assert_ne!(
+            rebuilt["batch"], pending["batch"],
+            "{mux:?} rebuilt for the new owner"
+        );
+        let (_, stale) = live.by(&a, &["read", "-Ack", s(&pending["batch"])]);
+        assert_eq!(stale["check"], "ack", "{mux:?} another owner cannot ack it");
     }
 }
 
