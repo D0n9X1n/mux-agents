@@ -4355,6 +4355,115 @@ hc {}:
         }
     }
 
+    /// The fake client whose argv holds `word`: its `client.<pid>.json` record.
+    fn client_with(live: &Live, word: &str) -> Value {
+        let log = live.dir.join("clients.log");
+        let end = Instant::now() + LONG;
+        loop {
+            let found = std::fs::read_to_string(&log).ok().and_then(|text| {
+                text.lines().find_map(|pid| {
+                    let path = live.dir.join(format!("client.{}.json", pid.trim()));
+                    let record: Value =
+                        serde_json::from_str(&std::fs::read_to_string(path).ok()?).ok()?;
+                    record["argv"]
+                        .as_array()?
+                        .iter()
+                        .any(|a| a == word)
+                        .then_some(record)
+                })
+            });
+            if let Some(record) = found {
+                return record;
+            }
+            assert!(Instant::now() < end, "no client ran with {word}");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    // options-6e E1 through the real CLI: an unknown flag makes no session; the leader runs the person's options,
+    // then the session the recipe chose (never a selector the person gave), then the prompt.
+    #[test]
+    fn up_runs_the_leader_with_options_then_session_then_prompt() {
+        for mux in Mux::ALL {
+            let Some(mut live) = Live::human(mux) else {
+                continue;
+            };
+            let sessions = |live: &Live| live.call(&["list-sessions", "-F", "#{session_id}"]);
+            let before = sessions(&live);
+            let (code, refused) =
+                live.run(&["up", "-Client", "claude", "--", "fix", "--frobnicate"]);
+            assert_eq!(
+                (code, refused["check"].as_str()),
+                (2, Some("usage")),
+                "{mux:?} {refused}"
+            );
+            assert_eq!(
+                sessions(&live),
+                before,
+                "{mux:?}: a refused up makes no session"
+            );
+            let argv = [
+                "up",
+                "-Client",
+                "claude",
+                "--",
+                "fix",
+                "--resume",
+                "SEL9",
+                "--model",
+                "x",
+                "--session-id=SEL8",
+            ];
+            let (code, up) = live.run(&argv);
+            assert_eq!(code, 0, "{mux:?} {up}");
+            let leader = client_with(&live, "fix");
+            let sid = leader["sessionId"].as_str().unwrap().to_string();
+            assert_eq!(
+                leader["argv"],
+                json!(["--model", "x", "--session-id", sid, "fix"]),
+                "{mux:?}"
+            );
+        }
+    }
+
+    // options-6e live: a member started with `--model x` and a task, stopped, its record holding the options A3 will
+    // store (seeded, see the task text), then resumed through the real CLI: argv `--model x --resume <sid>`, no task.
+    fn a_stopped_member_resumes_with_its_stored_options_only(mux: Mux) {
+        let Some(mut live) = Live::human(mux) else {
+            return;
+        };
+        let w = live.spawn("w1", &["-Model", "x"]);
+        let (sid, address) = (
+            s(&w["sessionId"]).to_string(),
+            s(&w["hcAddress"]).to_string(),
+        );
+        let first = strings(&client_with(&live, &sid)["argv"]).join(" ");
+        assert!(
+            first.contains("--model x"),
+            "{mux:?}: started with --model x: {first}"
+        );
+        let (code, stop) = live.run(&["stop", "w1"]);
+        assert_eq!(code, 0, "{mux:?} {stop}");
+        assert!(
+            eventually(LONG, || core(&live, &["get", &address, "--json"])["state"]
+                == "finished"),
+            "{mux:?}"
+        );
+        let path = live.agent_dir(s(&w["id"])).join("record.json");
+        let mut r = json_file(&path);
+        (r["lifecycle"], r["options"], r["prompt"]) =
+            (json!(1), json!(["--model", "x"]), json!(["the task"]));
+        std::fs::write(&path, serde_json::to_vec(&r).unwrap()).unwrap();
+        let (code, resumed) = live.run(&["resume", "w1"]);
+        assert_eq!(code, 0, "{mux:?} {resumed}");
+        let client = resumed_client(&live, &sid);
+        assert_eq!(
+            client["argv"],
+            json!(["--model", "x", "--resume", sid]),
+            "{mux:?}: the stored options only"
+        );
+    }
+
     // Stop an agent, then resume it: the successor runs `claude <flags> --resume <its session>`, no task and no fork,
     // as the client of its own new hc terminal; its record links back with the same session; its view is tagged with
     // its id; and the session's bar stands.
@@ -4944,6 +5053,7 @@ hc {}:
                     hc_view_close_survives_focus_stop,
                     hc_worker_reads_after_its_view_closes,
                     stop_then_resume_returns_with_its_conversation,
+                    a_stopped_member_resumes_with_its_stored_options_only,
                     root_unsandboxed_terminal_driver_finished,
                     spawn_window_and_split_tagged,
                     spawn_titles_tab_and_pane,

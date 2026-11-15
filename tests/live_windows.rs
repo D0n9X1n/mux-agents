@@ -250,12 +250,16 @@ impl Live {
         v
     }
 
-    /// `spawn -Client claude -TaskFile <dir>\task.txt -Name <name>` typed into the root pane; its JSON reply, which
-    /// must be `ok`.
     fn spawn(&self, name: &str) -> Value {
+        self.spawn_with(name, "")
+    }
+
+    /// `spawn -Client claude -TaskFile <dir>\task.txt -Name <name> <extra>` typed into the root pane; its JSON reply,
+    /// which must be `ok`.
+    fn spawn_with(&self, name: &str, extra: &str) -> Value {
         let file = |ext: &str| self.dir.join(format!("{name}.{ext}"));
         let line = format!(
-            "\"{MUX_AGENT}\" spawn -Client claude -TaskFile \"{}\" -Name {name} > \"{}\" 2> \"{}\" & echo done> \"{}\"",
+            "\"{MUX_AGENT}\" spawn -Client claude -TaskFile \"{}\" -Name {name} {extra} > \"{}\" 2> \"{}\" & echo done> \"{}\"",
             self.dir.join("task.txt").display(),
             file("json").display(),
             file("err").display(),
@@ -781,6 +785,103 @@ fn hostile(live: &Live) -> PathBuf {
         &format!("cmd /c type nul > \"{}\" & claude", marker.display()),
     ]);
     marker
+}
+
+/// The first fake client whose argv `matches`: its `client.<pid>.json` record.
+fn client_where(live: &Live, what: &str, matches: impl Fn(&[String]) -> bool) -> Value {
+    live.wait(what, || {
+        std::fs::read_to_string(live.dir.join("clients.log"))
+            .ok()?
+            .lines()
+            .find_map(|p| {
+                let path = live.dir.join(format!("client.{}.json", p.trim()));
+                let r: Value = serde_json::from_str(&std::fs::read_to_string(path).ok()?).ok()?;
+                let argv: Vec<String> = r["argv"].as_array()?.iter().map(s).collect();
+                matches(&argv).then_some(r)
+            })
+    })
+}
+
+// options-6e E1 on rmux for Windows: an unknown flag makes no session; options, the recipe's session, then prompt.
+#[test]
+fn up_runs_the_leader_with_options_then_session_then_prompt() {
+    let Some(live) = Live::start() else {
+        return;
+    };
+    let sessions = || live.call(&["list-sessions", "-F", "#{session_id}"]);
+    let before = sessions();
+    let refused = live.run_any(&["up", "-Client", "claude", "--", "fix", "--frobnicate"]);
+    assert_eq!(refused["check"], "usage", "{refused}");
+    assert_eq!(sessions(), before, "a refused up makes no session");
+    let up = live.run(&[
+        "up",
+        "-Client",
+        "claude",
+        "--",
+        "fix",
+        "--resume",
+        "SEL9",
+        "--model",
+        "x",
+        "--session-id=SEL8",
+    ]);
+    assert!(up["leader"]["id"].is_string(), "{up}");
+    let leader = client_where(&live, "the leader", |a| a.iter().any(|t| t == "fix"));
+    let sid = s(&leader["sessionId"]);
+    assert_eq!(
+        leader["argv"],
+        serde_json::json!(["--model", "x", "--session-id", sid, "fix"])
+    );
+}
+
+// options-6e live on rmux for Windows: started with `--model x` and a task, stopped, its record seeded as in the
+// task text, resumed: argv `--model x --resume <sid>`, no task.
+#[test]
+fn hc_stopped_member_resumes_with_its_stored_options_only() {
+    let Some(live) = Live::start() else {
+        return;
+    };
+    let w = live.spawn_with("w1", "-Model x");
+    let (sid, address) = (s(&w["sessionId"]), s(&w["hcAddress"]));
+    let first = client_where(&live, "the first client", |a| a.contains(&sid));
+    let first: Vec<String> = first["argv"].as_array().unwrap().iter().map(s).collect();
+    assert!(
+        first.windows(2).any(|p| p[0] == "--model" && p[1] == "x"),
+        "started with --model x: {first:?}"
+    );
+    let get =
+        |a: &str| private_core::run(live.core.command(&["get", a, "--json"]), &live.dir).unwrap();
+    assert_eq!(live.run(&["stop", "w1"])["life"], "ended");
+    live.wait("finished core terminal", || {
+        (get(&address)["state"] == "finished").then_some(())
+    });
+    let path = std::fs::read_dir(live.dir.join("state"))
+        .unwrap()
+        .flatten()
+        .map(|d| {
+            d.path()
+                .join("agents")
+                .join(s(&w["id"]))
+                .join("record.json")
+        })
+        .find(|p| p.is_file())
+        .unwrap();
+    let mut r: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    (r["lifecycle"], r["options"], r["prompt"]) = (
+        serde_json::json!(1),
+        serde_json::json!(["--model", "x"]),
+        serde_json::json!(["the task"]),
+    );
+    std::fs::write(&path, serde_json::to_vec(&r).unwrap()).unwrap();
+    live.run(&["resume", "w1"]);
+    let resumed = client_where(&live, "the resumed client", |a| {
+        a.windows(2).any(|p| p[0] == "--resume" && p[1] == sid)
+    });
+    assert_eq!(
+        resumed["argv"],
+        serde_json::json!(["--model", "x", "--resume", sid]),
+        "the stored options only"
+    );
 }
 
 #[test]
