@@ -1928,9 +1928,10 @@ impl Shown {
 }
 
 /// Acts on one event read while `shown` is on screen; true when the bar must draw again at once. A left press reads
-/// the bar and focuses the running agent on its name line, unless it is ASCII or stale (read less than `PRESS_GAP`
-/// after the frame's write, or begun before it); any left press dismisses the note and draws again. Keys go to
-/// `pick`. A failed focus shows its note. Other buttons and releases do nothing.
+/// the bar and opens the agent row it hit (ASCII or stale presses do nothing outside a team; a team bar takes ASCII
+/// clicks and selects the row first, #103 B6); stale is read less than `PRESS_GAP` after the frame's write, or begun
+/// before it; any left press dismisses the note and draws again. Keys go to `pick`. A failed focus shows its note.
+/// Other buttons and releases do nothing.
 fn act(
     ctx: &Ctx,
     caller: &Caller,
@@ -1943,19 +1944,26 @@ fn act(
         Event::Press { button: 0, y, .. } => {
             pick.pressed();
             let stale = read.first < shown.written + PRESS_GAP;
-            if look.ascii || stale {
+            if (look.ascii && !shown.team) || stale {
                 return true;
             }
             if let Some(target) = click(ctx, caller, y, shown) {
-                match focus_target_hc(ctx, caller, &target) {
-                    Ok(focused) => shown.focused(focused),
-                    Err(_) => pick.failed(&target.name),
+                if shown.team {
+                    // The clicked row is selected first: after nothing to open or a failure, `p` and Enter act on it.
+                    if let Some(at) = shown.targets.iter().position(|t| t.id == target.id) {
+                        pick.select(&shown.targets, at);
+                    }
+                    open_target(ctx, caller, &target, pick, shown);
+                } else {
+                    match focus_target_hc(ctx, caller, &target) {
+                        Ok(focused) => shown.focused(focused),
+                        Err(_) => pick.failed(&target.name),
+                    }
                 }
             }
             true
         }
         Event::Press { .. } | Event::Release { .. } | Event::Interrupt => false,
-        // herdr's next and previous agent (#90), from the pane the session shows, in the bar's order.
         // A team's n/N select the next/previous agent with a live view, from the selection, else the shown agent (B10).
         Event::Next | Event::Prev if shown.team => {
             let from = pick
@@ -1972,6 +1980,7 @@ fn act(
             }
             true
         }
+        // herdr's next and previous agent (#90), from the pane the session shows, in the bar's order.
         Event::Next | Event::Prev => {
             let forward = read.event == Event::Next;
             if let Some(target) =
@@ -1998,6 +2007,10 @@ fn act(
                 Act::Nothing => false,
                 Act::Redraw => true,
                 Act::Focus(target) => {
+                    if shown.team {
+                        open_target(ctx, caller, &target, pick, shown);
+                        return true;
+                    }
                     match focus_target_hc(ctx, caller, &target) {
                         Ok(focused) => {
                             pick.focused();
@@ -2015,14 +2028,10 @@ fn act(
 /// Lines a peek shows: the screen and some history.
 const PEEK_LINES: i32 = 200;
 
-/// herdr's peek: the agent's last lines, captured as `read <name> -Lines` captures them (only while its pane is its
-/// own live launch), into a private file of the state folder, shown in a popup over the session's client that pages
-/// it, deleting it as it starts. The popup is started in the background (`run-shell -b -C`), since display-popup
-/// answers only once it closes and the bar must not wait; so a popup that never opens is not seen here, and its
-/// file stays in the state folder (no sweep: age cannot tell it from a popup still queued behind another).
-fn peek(ctx: &Ctx, caller: &Caller, target: &Target) -> Res<()> {
+/// The state folder a peek file goes to; its path goes through the multiplexer's parser, its formats and a shell, so
+/// plain characters only.
+fn peek_folder(ctx: &Ctx, caller: &Caller) -> Res<std::path::PathBuf> {
     let folder = crate::agents::server_dir(ctx, caller);
-    // The path goes through the multiplexer's parser, its formats and a shell: plain characters only.
     if !folder
         .to_str()
         .is_some_and(|f| plain_path(f, crate::state::root::HOST))
@@ -2033,35 +2042,117 @@ fn peek(ctx: &Ctx, caller: &Caller, target: &Target) -> Res<()> {
             "peek needs a state folder path of plain characters",
         );
     }
-    let (_, text) = crate::agents::message::capture_member(
-        ctx,
-        caller,
-        &target.id,
-        (!target.pane.is_empty()).then_some(target.pane.as_str()),
-        PEEK_LINES,
-    )?;
+    Ok(folder)
+}
+
+/// `text` for agent `name` in a private file of `folder`, paged in a popup over the session's client (see `peek`).
+fn popup(ctx: &Ctx, caller: &Caller, folder: &std::path::Path, name: &str, text: &str) -> Res<()> {
     let file = folder.join(format!(
         "peek-{}.txt",
         crate::util::guid()?.replace('-', "")
     ));
     // The name closes the text, where the pager opens: tmux 3.2 popups have no title.
-    std::fs::write(
-        &file,
-        format!("{text}\n-- peek: {} (q closes) --\n", target.name),
-    )?;
+    std::fs::write(&file, format!("{text}\n-- peek: {name} (q closes) --\n"))?;
     let Some(path) = file.to_str() else {
         let _ = std::fs::remove_file(&file);
         return refuse(1, "internal", "the peek file's path is not text");
     };
     let popup = popup_command(&caller.pane, path);
-    let shown = native(ctx, &["run-shell", "-b", "-C", &popup], true)
+    if native(ctx, &["run-shell", "-b", "-C", &popup], true)
         .ok()
-        .filter(|o| o.code == 0);
-    if shown.is_none() {
+        .filter(|o| o.code == 0)
+        .is_none()
+    {
         let _ = std::fs::remove_file(&file);
         return refuse(1, "target", "the popup did not open");
     }
     Ok(())
+}
+
+/// herdr's peek: the agent's last lines, captured as `read <name> -Lines` captures them (only while its pane is its
+/// own live launch), into a private file of the state folder, shown in a popup over the session's client that pages
+/// it, deleting it as it starts. The popup is started in the background (`run-shell -b -C`), since display-popup
+/// answers only once it closes and the bar must not wait; so a popup that never opens is not seen here, and its
+/// file stays in the state folder (no sweep: age cannot tell it from a popup still queued behind another).
+fn peek(ctx: &Ctx, caller: &Caller, target: &Target) -> Res<()> {
+    let folder = peek_folder(ctx, caller)?;
+    let drawn = (!target.pane.is_empty()).then_some(target.pane.as_str());
+    let (_, text) =
+        crate::agents::message::capture_member(ctx, caller, &target.id, drawn, PEEK_LINES)?;
+    popup(ctx, caller, &folder, &target.name, &text)
+}
+
+/// Lines of retained output an agent's output popup shows.
+const OUTPUT_LINES: u32 = 200;
+
+/// What opening a row came to (#103 B6): shown (a view or the output), nothing to show, or a real failure.
+enum Opened {
+    Shown,
+    Nothing,
+    Failed,
+}
+
+/// Member `target`'s retained output (`hc read`) in the peek popup. Blank output, a member gone or a terminal hc
+/// dropped is nothing to show; hc unreachable or a popup that did not open is a failure.
+fn show_output(ctx: &Ctx, caller: &Caller, target: &Target) -> Opened {
+    let Ok(folder) = peek_folder(ctx, caller) else {
+        return Opened::Failed;
+    };
+    match crate::agents::message::retained(ctx, caller, &target.id, OUTPUT_LINES) {
+        Ok(Some(text)) if popup(ctx, caller, &folder, &target.name, &text).is_ok() => Opened::Shown,
+        Ok(None) => Opened::Nothing,
+        Err(e) if e.check == "target" => Opened::Nothing,
+        _ => Opened::Failed,
+    }
+}
+
+/// Opens a drawn agent row by member id and life (#103 B6); nothing restarts or types. A validated view is focused
+/// through the multiplexer alone, so an Unknown row's view opens without hc. Without one: Running reopens its view (hc);
+/// Lost has nothing to open; Unknown and Ended show their output. A member gone, a terminal hc dropped, or blank output,
+/// is `nothing to open for <name>`; a focus that did not take, or hc unreachable, is `focus failed: <name>`. A
+/// successful open clears the selection; otherwise the row stays selected, so `p` or Enter act on it next.
+fn open_target(ctx: &Ctx, caller: &Caller, target: &Target, pick: &mut Pick, shown: &mut Shown) {
+    use crate::agents::view::{Member, focus_member};
+    let focused = |member: Res<Member>, shown: &mut Shown| match member {
+        Ok(Member::Focused(f)) => {
+            shown.focused(f);
+            Some(Opened::Shown)
+        }
+        Ok(Member::Gone) => Some(Opened::Nothing),
+        Ok(Member::NoView) => None,
+        Err(_) => Some(Opened::Failed),
+    };
+    let opened = match target.life.as_str() {
+        "running" | "lost" | "unknown" => {
+            match focused(focus_member(ctx, None, caller, &target.id, None), shown) {
+                Some(opened) => opened,
+                None if target.life == "running" => {
+                    // Reopen only a terminal hc still keeps: one it dropped is nothing to open; hc unreachable fails.
+                    let Ok(core) = crate::hc::connect(ctx) else {
+                        pick.failed(&target.name);
+                        return;
+                    };
+                    match crate::agents::message::kept_member(ctx, caller, &core, &target.id) {
+                        Ok(Some(true)) => focused(
+                            focus_member(ctx, Some(&core), caller, &target.id, None),
+                            shown,
+                        )
+                        .unwrap_or(Opened::Failed),
+                        Ok(_) => Opened::Nothing,
+                        Err(_) => Opened::Failed,
+                    }
+                }
+                None if target.life == "unknown" => show_output(ctx, caller, target),
+                None => Opened::Nothing,
+            }
+        }
+        _ => show_output(ctx, caller, target),
+    };
+    match opened {
+        Opened::Shown => pick.focused(),
+        Opened::Nothing => pick.nothing(&target.name),
+        Opened::Failed => pick.failed(&target.name),
+    }
 }
 
 /// True when `path` holds only characters no layer reads: no format `#`, no `%`, quote, `$`, backquote, `&`, `!` or

@@ -218,13 +218,6 @@ impl Pick {
     }
 
     /// Opening `name` showed nothing (#103 B6).
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "shortcut: no caller until the team bar's keys and open (Tasks 11-12, #103); remove this then"
-        )
-    )]
     pub fn nothing(&mut self, name: &str) {
         self.note = Some((format!("nothing to open for {name}"), 0));
     }

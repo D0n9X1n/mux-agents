@@ -222,7 +222,6 @@ fn two_members_with_one_name_open_the_one_selected() {
         .collect();
     w.pane_rows(&rows);
     w.fakes.mux_rule("#{window_active}", 0, "%8|1|1|1\n", "");
-    cf::online(&w);
     let row = |id: &str, pane: &str, parent: Option<&str>, m: u32| {
         json!({"id": id, "name": if parent.is_some() { "twin" } else { "lead" },
         "parentId": parent, "leader": parent.is_none(), "createdAt": format!("2026-10-29T11:{m:02}:00.0000000Z"), "state": "running",
@@ -299,4 +298,367 @@ fn two_members_with_one_name_open_the_one_selected() {
         "the mark follows"
     );
     w.fakes.hc_done().unwrap();
+}
+
+/// The peek file the popup left in the state folder (a fake multiplexer never runs the popup, which deletes it).
+fn peek_text(w: &World) -> Option<String> {
+    std::fs::read_dir(crate::agents::server_dir(&w.ctx, &w.caller()))
+        .ok()?
+        .flatten()
+        .find(|e| e.file_name().to_string_lossy().starts_with("peek-"))
+        .and_then(|e| std::fs::read_to_string(e.path()).ok())
+}
+/// A world whose state root is a plain path (as `peek_detached_refuses_without_reopening_or_capturing` makes it).
+fn plain_world() -> World {
+    let mut w = World::human("");
+    if let Some(plain) = w
+        .ctx
+        .state_root
+        .to_str()
+        .and_then(|r| r.strip_prefix(r"\\?\"))
+    {
+        w.ctx.state_root = plain.into();
+    }
+    w
+}
+#[test]
+fn open_acts_by_life_never_restarts_and_always_answers() {
+    let nothing = Some("nothing to open for worker");
+    // (case, life, validated view, member exists, hc online, kept output or what hc answers, focus reads back, pane shown after, popups, note)
+    let cases = [
+        (
+            "running view",
+            "running",
+            true,
+            true,
+            false,
+            "",
+            true,
+            Some("%9"),
+            0,
+            None,
+        ),
+        (
+            "running closed",
+            "running",
+            false,
+            true,
+            true,
+            "listed",
+            true,
+            Some("%19"),
+            0,
+            None,
+        ),
+        (
+            "running stale",
+            "running",
+            true,
+            false,
+            false,
+            "",
+            true,
+            None,
+            0,
+            nothing,
+        ),
+        (
+            "running failed",
+            "running",
+            true,
+            true,
+            false,
+            "",
+            false,
+            None,
+            0,
+            Some("focus failed: worker"),
+        ),
+        (
+            "lost view",
+            "lost",
+            true,
+            true,
+            false,
+            "",
+            true,
+            Some("%9"),
+            0,
+            None,
+        ),
+        (
+            "lost absent",
+            "lost",
+            false,
+            true,
+            false,
+            "",
+            true,
+            None,
+            0,
+            nothing,
+        ),
+        (
+            "unknown view no hc",
+            "unknown",
+            true,
+            true,
+            false,
+            "",
+            true,
+            Some("%9"),
+            0,
+            None,
+        ),
+        (
+            "unknown output",
+            "unknown",
+            false,
+            true,
+            true,
+            "old\n",
+            true,
+            None,
+            1,
+            None,
+        ),
+        (
+            "unknown absent",
+            "unknown",
+            false,
+            true,
+            true,
+            " \n",
+            true,
+            None,
+            0,
+            nothing,
+        ),
+        (
+            "ended output",
+            "ended",
+            false,
+            true,
+            true,
+            "old\n",
+            true,
+            None,
+            1,
+            None,
+        ),
+        (
+            "ended absent",
+            "ended",
+            false,
+            true,
+            true,
+            " \n",
+            true,
+            None,
+            0,
+            nothing,
+        ),
+        (
+            "running dropped",
+            "running",
+            false,
+            true,
+            true,
+            "dropped",
+            true,
+            None,
+            0,
+            nothing,
+        ),
+        (
+            "running hc down",
+            "running",
+            false,
+            true,
+            true,
+            "down",
+            true,
+            None,
+            0,
+            Some("focus failed: worker"),
+        ),
+        (
+            "ended dropped",
+            "ended",
+            false,
+            true,
+            true,
+            "dropped",
+            true,
+            None,
+            0,
+            nothing,
+        ),
+        (
+            "ended hc down",
+            "ended",
+            false,
+            true,
+            true,
+            "down",
+            true,
+            None,
+            0,
+            Some("focus failed: worker"),
+        ),
+    ];
+    for (case, life, present, exists, hc, kept, reads, want, popups, note) in cases {
+        for press in [true, false] {
+            let w = plain_world();
+            let c = w.caller();
+            if exists {
+                cf::member(&w, ID, json!({}));
+            }
+            if present {
+                let mut row = row_of("%9|@5|300||", &[]);
+                row.command = "hc attach taaaaaaaaaaaa".into();
+                w.pane_rows(&[row]);
+            } else {
+                w.panes(&[]);
+            }
+            w.launches_hold();
+            w.fakes
+                .mux_rule("new-window", 0, "%19|@8|hc attach taaaaaaaaaaaa\n", "");
+            w.fakes.mux_rule(
+                "#{window_active}",
+                0,
+                &format!(
+                    "{}|1|1|1\n",
+                    if reads { want.unwrap_or("%9") } else { "%4" }
+                ),
+                "",
+            );
+            w.fakes
+                .mux_rule("capture-pane", 0, "40\n \u{25c9} worker\n", "");
+            if hc {
+                cf::online(&w);
+            }
+            // hc 0.1.21's answer for a terminal it no longer keeps (exit 3, observed 2026-11-14), and an unreachable hc (exit 5).
+            let gone = r#"{"error":{"hint":"see `hc ls --all`","kind":"not_found","message":"no terminal \"taaaaaaaaaaaa\""}}"#;
+            let down =
+                r#"{"error":{"kind":"unavailable","message":"core did not start within 15 s"}}"#;
+            let out = |code: i32, stdout: &str| -> crate::error::Res<crate::spawn::Out> {
+                Ok(crate::spawn::Out {
+                    code,
+                    stdout: stdout.into(),
+                    stderr: String::new(),
+                })
+            };
+            let (get, read) = (
+                ["get", "taaaaaaaaaaaa", "--json"],
+                ["read", "taaaaaaaaaaaa", "--lines", "200"],
+            );
+            match kept {
+                "" => {}
+                // A Running row without a view: `hc get` finds its terminal (reopen), answers `not_found` (nothing to open) or fails.
+                "listed" => cf::get(
+                    &w,
+                    "taaaaaaaaaaaa",
+                    json!({"address": "taaaaaaaaaaaa", "state": "live", "argv": [], "labels": {}}),
+                ),
+                "dropped" if life == "running" => w.fakes.hc_expect(&get, out(3, gone)),
+                "down" if life == "running" => w.fakes.hc_expect(&get, out(5, down)),
+                // An Ended row: `hc read` answers `not_found` (nothing to open) or fails (focus failed).
+                "dropped" => w.fakes.hc_expect(&read, out(3, gone)),
+                "down" => w.fakes.hc_expect(&read, out(5, down)),
+                text => cf::answer(&w, &read, text),
+            }
+            let other = Target {
+                id: "cccccccccccc".into(),
+                ..Target::new("other", "%5")
+            };
+            let worker = Target {
+                id: ID.into(),
+                life: life.into(),
+                ..Target::new("worker", if present { "%9" } else { "" })
+            };
+            let mut shown = Shown {
+                written: SystemTime::UNIX_EPOCH,
+                targets: vec![other, worker],
+                width: 40,
+                looking: None,
+                team: true,
+                drawn: vec![(ID.to_string(), 0, "\u{25c9} worker".to_string())],
+            };
+            let mut pick = Pick::default();
+            pick.set_wrap(true);
+            // A click on worker (ASCII rendering: a team bar takes it) while `other` is selected; or worker selected, then Enter.
+            let (event, look) = if press {
+                pick.select(&shown.targets, 0);
+                (
+                    Event::Press {
+                        button: 0,
+                        x: 3,
+                        y: 1,
+                    },
+                    Look {
+                        color: false,
+                        ascii: true,
+                        dumb: false,
+                    },
+                )
+            } else {
+                pick.select(&shown.targets, 1);
+                (Event::Enter, Look::default())
+            };
+            assert!(act(
+                &w.ctx,
+                &c,
+                look,
+                keys::Read {
+                    event,
+                    first: SystemTime::UNIX_EPOCH + Duration::from_secs(1)
+                },
+                &mut pick,
+                &mut shown
+            ));
+            let how = format!("{case} {}", if press { "press" } else { "enter" });
+            assert_eq!(shown.looking.as_deref(), want, "{how}");
+            assert_eq!(pick.note().as_deref(), note, "{how}");
+            // A successful open (a view or the output) clears the selection; nothing to open or a failure keeps the
+            // clicked row selected, so `p` or Enter then acts on it.
+            assert_eq!(pick.selected(), note.is_some().then_some(ID), "{how}");
+            let calls: Vec<String> = w.fakes.mux_calls().iter().map(|a| a.join(" ")).collect();
+            assert_eq!(
+                calls.iter().filter(|a| a.contains("display-popup")).count(),
+                popups,
+                "{how}"
+            );
+            assert_eq!(
+                calls.iter().filter(|a| a.contains("new-window")).count(),
+                usize::from(case == "running closed"),
+                "{how}"
+            );
+            assert!(
+                !calls
+                    .iter()
+                    .any(|a| a.contains("send-keys") || a.contains("respawn")),
+                "{how}: nothing is typed or restarted"
+            );
+            assert!(
+                w.fakes
+                    .hc_calls()
+                    .iter()
+                    .all(|(_, a, _)| a[0] != "run" && a[0] != "kill"),
+                "{how}: hc starts and stops nothing"
+            );
+            assert!(
+                hc || w.fakes.hc_calls().is_empty(),
+                "{how}: a validated view needs no hc"
+            );
+            if popups > 0 {
+                assert_eq!(
+                    peek_text(&w).as_deref(),
+                    Some("old\n\n-- peek: worker (q closes) --\n"),
+                    "{how}"
+                );
+            }
+            w.fakes.hc_done().unwrap();
+        }
+    }
 }
