@@ -141,9 +141,8 @@ fn append_message(
     dedup: Option<&str>,
     durable: bool,
 ) -> Res<Option<Value>> {
-    let mailbox = super::state_dir(ctx, caller)?
-        .join("mail")
-        .join(format!("{key}.jsonl"));
+    let server = super::state_dir(ctx, caller)?;
+    let mailbox = server.join("mail").join(format!("{key}.jsonl"));
     super::lock(ctx, &super::lock_key("mail", caller, key), || {
         // Only a dedup needs the whole mailbox; otherwise its last byte tells whether it is torn.
         let existing = match dedup {
@@ -173,6 +172,8 @@ fn append_message(
             crate::state::fs::sync_file(&mailbox)?;
             if let Some(folder) = mailbox.parent() {
                 crate::state::fs::sync_dir(folder)?;
+                // A `mail` folder `state_dir` just made is an entry of the server folder (QA fix 4).
+                crate::state::fs::durable_dir(folder, &server)?;
             }
         }
         Ok(delivered)
@@ -498,6 +499,31 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    /// QA fix 4: a `mail` folder `state_dir` just made is an entry of the server folder, flushed before success,
+    /// on every call (a duplicate hit included).
+    #[test]
+    fn deliver_once_flushes_the_entry_of_a_new_mail_folder() {
+        let w = World::human("");
+        let caller = w.caller();
+        let server = crate::agents::server_dir(&w.ctx, &caller);
+        let mail = server.join("mail");
+        assert!(!mail.exists(), "no mail folder yet: deliver_once makes it");
+        let m = msg("0123456789abcdef", None, 0, None);
+        crate::state::fs::fail_sync_dir(Some(&server));
+        let r = deliver_once(&w.ctx, &caller, "bbbbbbbbbbbb", &m);
+        assert!(
+            r.is_err(),
+            "the server folder holds the new mail entry: {r:?}"
+        );
+        assert!(
+            deliver_once(&w.ctx, &caller, "bbbbbbbbbbbb", &m).is_err(),
+            "a duplicate hit flushes it again"
+        );
+        crate::state::fs::fail_sync_dir(None);
+        deliver_once(&w.ctx, &caller, "bbbbbbbbbbbb", &m).unwrap();
+        assert_eq!(read(&mail.join("bbbbbbbbbbbb.jsonl")).lines().count(), 1);
     }
 
     #[test]

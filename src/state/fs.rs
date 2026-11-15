@@ -177,6 +177,19 @@ pub fn claim_json(path: &Path, value: &Value) -> Res<bool> {
     }
 }
 
+/// Makes `dir` and flushes, on every call, each folder from `dir` up to `base` into its parent, so a retry finishes
+/// an entry flush an earlier call left undone, for folders that already existed too (#103 F3, QA fix 4).
+pub fn durable_dir(dir: &Path, base: &Path) -> Res<()> {
+    std::fs::create_dir_all(dir)?;
+    let mut at = dir;
+    while at != base {
+        let Some(parent) = at.parent() else { break };
+        sync_dir(parent)?;
+        at = parent;
+    }
+    Ok(())
+}
+
 /// Flushes `dir`'s entries to disk, so an entry made in it survives a crash or power loss. Windows opens the folder
 /// with the right to add a subfolder (FILE_APPEND_DATA) and backup semantics: the least access FlushFileBuffers
 /// takes, and the right a folder made in it needed; a read-only open cannot flush there.

@@ -108,19 +108,6 @@ pub fn fresh_id(root: &Path, mut draw: impl FnMut() -> Res<String>) -> Res<Strin
     }
 }
 
-/// Makes `dir` and flushes, on every call, each folder from `dir` up to `base` into its parent, so a retry finishes
-/// an entry flush an earlier call left undone, for folders that already existed too (F3).
-fn durable_dir(dir: &Path, base: &Path) -> Res<()> {
-    std::fs::create_dir_all(dir)?;
-    let mut at = dir;
-    while at != base {
-        let Some(parent) = at.parent() else { break };
-        crate::state::fs::sync_dir(parent)?;
-        at = parent;
-    }
-    Ok(())
-}
-
 /// The server folder above `teams/<sha16>/sends`.
 fn base_of(root: &Path) -> &Path {
     root.ancestors().nth(3).unwrap_or(root)
@@ -130,7 +117,7 @@ fn base_of(root: &Path) -> &Path {
 /// flushed, renamed, and its folder flushed.
 pub fn write_intent(root: &Path, sender: &str, value: &Value) -> Res<()> {
     let dir = root.join(sender);
-    durable_dir(&dir, base_of(root))?;
+    crate::state::fs::durable_dir(&dir, base_of(root))?;
     crate::state::fs::write_json_durable(
         &dir.join(format!("{}.json", super::text(value.get("id")))),
         value,
@@ -153,7 +140,7 @@ fn unsaved(id: &str, delivered: &[String]) -> crate::error::Refusal {
 fn settle(root: &Path, sender: &str, id: &str) -> Res<()> {
     crate::state::fs::sync_file(&root.join(sender).join(format!("{id}.json")))?;
     crate::state::fs::sync_dir(&root.join(sender))?;
-    durable_dir(&root.join(sender), base_of(root))
+    crate::state::fs::durable_dir(&root.join(sender), base_of(root))
 }
 
 pub enum Found {
