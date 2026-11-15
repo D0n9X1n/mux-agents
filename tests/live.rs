@@ -1778,7 +1778,8 @@ exec claude --dangerously-skip-permissions
     }
 
     // S2, #82, #83: the bar draws in color at its pane's size with nothing stray; an agent in `read -Wait` with no
-    // report shows `idle` until mail wakes it, then `working` again, and its waiting file is gone. An agent whose
+    // report holds a live lease, so it shows `on call` (W6) until mail wakes it, then `working` again, and its waiting
+    // file is gone. An agent whose
     // client reports `blocked` comes first under herdr's `Needs you` heading, the header counting it; its next report
     // moves it back.
     fn bar_shows_waiting_then_working(mux: Mux) {
@@ -1795,10 +1796,10 @@ exec claude --dangerously-skip-permissions
         let mut screen = String::new();
         let waiting = eventually(Duration::from_secs(30), || {
             screen = live.call(&["capture-pane", "-p", "-t", &bar]);
-            // Two states, so herdr's headings over compact rows: idle `◌ w1`, working `◉ w2`.
+            // Two states, so herdr's headings over compact rows: on call `◌ w1`, working `◉ w2`.
             screen.contains("\u{25cc} w1")
                 && screen.contains("\u{25c9} w2")
-                && screen.contains("Idle \u{b7} 1")
+                && screen.contains("On call \u{b7} 1")
                 && screen.contains("Working \u{b7} 1")
         });
         assert!(waiting, "{mux:?}: the bar shows:\n{screen}");
@@ -1814,7 +1815,7 @@ exec claude --dangerously-skip-permissions
             // Two states: herdr's headings, and under them the compact row (glyph, name, time).
             screen.contains("! w2")
                 && screen.contains("Needs you \u{b7} 1")
-                && screen.contains("Idle \u{b7} 1")
+                && screen.contains("On call \u{b7} 1")
                 && screen.contains("1 need you")
                 && matches!(rows, [Some(a), Some(b)] if a < b)
         });
@@ -5230,8 +5231,10 @@ hc {}:
         assert_eq!(stale["check"], "ack", "{mux:?} another owner cannot ack it");
     }
 
-    fn activity_of(live: &mut Live, name: &str) -> String {
-        let (_, l) = live.run(&["list", "-All"]);
+    /// `name`'s activity on the board as `leader` lists it: a board holds only its caller's team (`membership::locals`
+    /// skips other sessions), and the root pane is not in the team `up` made.
+    fn activity_of(live: &mut Live, leader: &str, name: &str) -> String {
+        let (_, l) = live.by(leader, &["list", "-All"]);
         l["agents"]
             .as_array()
             .unwrap()
@@ -5289,8 +5292,9 @@ hc {}:
             );
             let n = live.server.post(bp, &["@bg read", "-Wait", "600"]);
             assert!(
-                eventually(Duration::from_secs(10), || activity_of(&mut live, "b")
-                    == "on call"),
+                eventually(Duration::from_secs(10), || activity_of(
+                    &mut live, &leader, "b"
+                ) == "on call"),
                 "{mux:?}"
             );
             // A sends and exits; the wait returns the batch.
@@ -5307,7 +5311,7 @@ hc {}:
             );
             let n = live.server.post(bp, &["@bg read", "-Wait", "600"]);
             assert!(eventually(Duration::from_secs(10), || activity_of(
-                &mut live, "b"
+                &mut live, &leader, "b"
             ) == "on call"));
             assert_eq!(live.by(&b, &["read", "-Cancel"]).1["cancelled"], true);
             assert_eq!(
@@ -5320,9 +5324,11 @@ hc {}:
                 true,
                 "{mux:?} no re-arm until new mail"
             );
-            assert!(eventually(Duration::from_secs(10), || activity_of(
-                &mut live, "b"
-            ) != "on call"));
+            // b's row must be there: an empty board is not "not on call".
+            assert!(eventually(Duration::from_secs(10), || {
+                let now = activity_of(&mut live, &leader, "b");
+                !now.is_empty() && now != "on call"
+            }));
             // Failure matrix, as the plugin drives the CLI.
             assert_eq!(live.by(&leader, &["send", "b", "-BodyFile", &body]).0, 0);
             let (_, d1) = live.by(&b, &["read", "-Deliver"]); // stripped block, unforwarded echo, drop: no -Ack follows

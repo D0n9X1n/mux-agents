@@ -1472,9 +1472,11 @@ fn a_copilot_member_reports_done_then_listens_on_call() {
     );
     // The last `list -All` row of b and how long the call took, for a timeout's diagnosis.
     let last = std::cell::RefCell::new(String::new());
-    let on_call = |live: &Live| {
+    // Listed by the leader: a board holds only its caller's team (`membership::locals` skips other sessions), and the
+    // root pane is not in the team `up` made.
+    let on_call = |sent: &mut HashMap<u32, usize>| {
         let t = Instant::now();
-        let list = live.run(&["list", "-All"]);
+        let list = by(&live, sent, &leader, &["list", "-All"]);
         let row = list["agents"]
             .as_array()
             .and_then(|a| a.iter().find(|x| x["name"] == "b").cloned());
@@ -1488,7 +1490,7 @@ fn a_copilot_member_reports_done_then_listens_on_call() {
     let reply = post_bg(&live, &mut sent, &b, &["read", "-Wait", "600"]);
     live.wait_or(
         "on call (first wait)",
-        || on_call(&live).then_some(()),
+        || on_call(&mut sent).then_some(()),
         || on_call_diagnosis(&live, &b, &last.borrow(), &reply),
     );
     by(&live, &mut sent, &a, &["send", "b", "-BodyFile", &body]);
@@ -1522,7 +1524,7 @@ fn a_copilot_member_reports_done_then_listens_on_call() {
     let reply = post_bg(&live, &mut sent, &b, &["read", "-Wait", "600"]);
     live.wait_or(
         "on call (second wait)",
-        || on_call(&live).then_some(()),
+        || on_call(&mut sent).then_some(()),
         || on_call_diagnosis(&live, &b, &last.borrow(), &reply),
     );
     assert_eq!(
