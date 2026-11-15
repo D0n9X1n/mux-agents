@@ -256,11 +256,12 @@ pub fn read(ctx: &Ctx, request: &Request) -> Res<Map<String, Value>> {
         return Err(usage("read"));
     };
     let named = !request.positional.is_empty();
-    let (ack, id, deliver, count) = (
+    let (ack, id, deliver, count, cancel) = (
         request.value("Ack"),
         request.value("Id"),
         request.switch("Deliver"),
         request.switch("Count"),
+        request.switch("Cancel"),
     );
     let hex = |v: &str| {
         (8..=32).contains(&v.len())
@@ -272,15 +273,22 @@ pub fn read(ctx: &Ctx, request: &Request) -> Res<Map<String, Value>> {
         deliver,
         count,
         id.is_some(),
+        cancel,
     ]
     .into_iter()
     .filter(|m| *m)
     .count();
     if (named
-        && (request.value("Wait").is_some() || ack.is_some() || deliver || count || id.is_some()))
+        && (request.value("Wait").is_some()
+            || ack.is_some()
+            || deliver
+            || count
+            || cancel
+            || id.is_some()))
         || (!named && request.value("Lines").is_some())
         || modes > 1
         || (count && ack.is_some())
+        || (cancel && ack.is_some())
         || [ack, id].into_iter().flatten().any(|v| !hex(v))
     {
         return Err(usage("read"));
@@ -323,6 +331,21 @@ pub fn read(ctx: &Ctx, request: &Request) -> Res<Map<String, Value>> {
             .unwrap_or_else(|| "0".into()),
     };
     let fence = || identity.as_ref().is_none_or(|i| current(ctx, &caller, i));
+    let folder = server_dir(ctx, &caller).join("agents").join(&me.key);
+    if cancel {
+        if me.record.is_none() {
+            return refuse(2, "target", "only an agent listens on call");
+        }
+        let end = super::mail::counts(ctx, &caller, &mailbox)?.end;
+        lock(ctx, &lock_key("agent", &caller, &me.key), || {
+            write_json(
+                &folder.join("oncall-cancel.json"),
+                &json!({"owner": {"id": owner.id, "gen": owner.generation}, "end": end}),
+            )
+        })?;
+        reply.insert("cancelled".into(), true.into());
+        return Ok(reply);
+    }
     if count {
         let c = super::mail::counts(ctx, &caller, &mailbox)?;
         for (k, v) in [
@@ -365,6 +388,17 @@ pub fn read(ctx: &Ctx, request: &Request) -> Res<Map<String, Value>> {
             let deadline = ctx.clock.now() + Duration::from_secs(wait as u64);
             let mut first_pass = Some(snapshot);
             loop {
+                if wait > 0 && cancelled(ctx, &caller, &folder, &owner, &mailbox)? {
+                    for (k, v) in [
+                        ("cancelled", json!(true)),
+                        ("batch", Value::Null),
+                        ("ids", json!([])),
+                        ("text", json!("")),
+                    ] {
+                        reply.insert(k.into(), v);
+                    }
+                    return Ok(reply);
+                }
                 let snapshot = match first_pass.take() {
                     Some(s) => s,
                     None => super::membership::Snapshot::take(ctx, &caller)?,
@@ -379,7 +413,8 @@ pub fn read(ctx: &Ctx, request: &Request) -> Res<Map<String, Value>> {
             }
         }
     };
-    // 4b-ii (part 4 F25) inserts its timeout flag here, computed before `served` is moved by the match (E0382).
+    // Computed before `served` is moved by the match (E0382); SKILL.md re-arms on it (W5).
+    let timed_out = served.is_none() && wait > 0;
     match served {
         Some(r) => {
             // F2: `-Id` of another held message re-serves the receipt in flight, and says so.
@@ -401,7 +436,26 @@ pub fn read(ctx: &Ctx, request: &Request) -> Res<Map<String, Value>> {
             );
         }
     }
+    if timed_out {
+        reply.insert("timeout".into(), true.into());
+    }
     Ok(reply)
+}
+
+/// A cancel of this owner stands while the mailbox ends at or before its `end` (W5).
+fn cancelled(
+    ctx: &Ctx,
+    caller: &crate::caller::Caller,
+    folder: &Path,
+    owner: &super::receipt::Owner,
+    mailbox: &str,
+) -> Res<bool> {
+    let Some(c) = read_json(&folder.join("oncall-cancel.json")).ok().flatten() else {
+        return Ok(false);
+    };
+    let mine =
+        text(c["owner"].get("id")) == owner.id && text(c["owner"].get("gen")) == owner.generation;
+    Ok(mine && super::mail::counts(ctx, caller, mailbox)?.end <= c["end"].as_u64().unwrap_or(0))
 }
 
 /// The read fence: whether member `id` is still the current owner of its mailbox: its record committed, superseded
@@ -1304,7 +1358,7 @@ mod tests {
 
     #[test]
     fn read_wait_bounds_0_600() {
-        let usage = "2 usage usage: mux-agent read [-Wait <seconds> | -Deliver | -Id <id> | -Count] [-Ack <batch>] | read <name> [-Lines <n>] [-Text]";
+        let usage = "2 usage usage: mux-agent read [-Wait <seconds> | -Deliver | -Id <id> | -Count | -Cancel] [-Ack <batch>] | read <name> [-Lines <n>] [-Text]";
         let w = World::human("");
         w.fakes.clear_log();
         for wait in ["601", "-1", "x", "", "1.5", "99999999999", "0x10"] {
@@ -1597,7 +1651,7 @@ mod tests {
 
     #[test]
     fn read_lines_1_2000() {
-        let usage = "2 usage usage: mux-agent read [-Wait <seconds> | -Deliver | -Id <id> | -Count] [-Ack <batch>] | read <name> [-Lines <n>] [-Text]";
+        let usage = "2 usage usage: mux-agent read [-Wait <seconds> | -Deliver | -Id <id> | -Count | -Cancel] [-Ack <batch>] | read <name> [-Lines <n>] [-Text]";
         let w = World::human("");
         cf::member(&w, ID, json!({"startCommand":launch_command("%9")}));
         w.panes(&["%9|@5|300|aaaaaaaaaaaa|worker"]);
@@ -1670,7 +1724,7 @@ mod tests {
         }
         assert_eq!(
             run(&w, read, &["read", "-Wait", "3"]),
-            r#"ok {"batch":null,"ids":[],"text":""}"#
+            r#"ok {"batch":null,"ids":[],"text":"","timeout":true}"#
         );
         assert_eq!(w.fakes.slept(), [500; 6]);
         // Mail that lands while waiting ends the wait at the next poll.
@@ -1820,6 +1874,79 @@ mod tests {
         );
     }
 
+    /// Member ID listening on %1 (hc, generation "0") and `n` passes of snapshot plus fence answers.
+    fn listening(n: usize) -> (World, Value) {
+        let w = waiting_world();
+        let r = cf::member(
+            &w,
+            ID,
+            json!({"pane":"%1","window":"@1","parentPane":"%4","startCommand":launch_command("%1")}),
+        );
+        passes(&w, &r, n);
+        (w, r)
+    }
+    fn passes(w: &World, r: &Value, n: usize) {
+        for _ in 0..n {
+            poll(w, &[cf::wire(r)]);
+            cf::online(w);
+            cf::get(w, r["hcAddress"].as_str().unwrap(), cf::wire(r));
+        }
+    }
+    /// A read and the sleeps it took.
+    fn timed(w: &World, args: &[&str]) -> (Value, usize) {
+        let before = w.fakes.slept().len();
+        let out = run(w, read, args);
+        let v: Value =
+            serde_json::from_str(out.strip_prefix("ok ").unwrap_or_else(|| panic!("{out}")))
+                .unwrap();
+        (v, w.fakes.slept().len() - before)
+    }
+
+    #[test]
+    fn a_wait_times_out_and_cancel_holds_until_new_mail() {
+        let (w, r) = listening(3); // -Wait 1: passes at 0, 0.5 and 1.0 s
+        let (t, slept) = timed(&w, &["read", "-Wait", "1"]);
+        assert_eq!(t["timeout"], true, "SKILL.md re-arms on this");
+        assert_eq!((&t["batch"], slept), (&Value::Null, 2));
+        // A running wait sees the cancel of its owner at its next poll: one pass, then the cancel check.
+        passes(&w, &r, 1);
+        let file = w.folder(ID).join("oncall-cancel.json");
+        let (f, base) = (file.clone(), w.fakes.slept().len());
+        w.fakes.sleep_probe(move |n| {
+            if n == base + 1 {
+                write(&f, json!({"owner": {"id": ID, "gen": "0"}, "end": 0}));
+            }
+        });
+        let (c, slept) = timed(&w, &["read", "-Wait", "600"]);
+        assert_eq!(
+            (&c["cancelled"], &c["batch"], slept),
+            (&json!(true), &Value::Null, 1)
+        );
+        assert!(waiting_names(&w).is_empty(), "its lease removed");
+        std::fs::remove_file(&file).unwrap();
+        poll(&w, &[cf::wire(&r)]); // -Cancel: the reader snapshot only
+        assert_eq!(timed(&w, &["read", "-Cancel"]).0["cancelled"], true);
+        assert_eq!(
+            read_json(&file).unwrap().unwrap()["owner"],
+            json!({"id": ID, "gen": "0"})
+        );
+        poll(&w, &[cf::wire(&r)]);
+        let (again, slept) = timed(&w, &["read", "-Wait", "600"]);
+        assert_eq!(
+            (&again["cancelled"], slept),
+            (&json!(true), 0),
+            "a later wait returns at once"
+        );
+        crate::agents::mail::add_mail(&w.ctx, &w.caller(), ID, "root", "%2", "new", None).unwrap();
+        passes(&w, &r, 1);
+        let (got, slept) = timed(&w, &["read", "-Wait", "600"]);
+        assert_eq!(
+            (got["ids"].as_array().map(Vec::len), slept),
+            (Some(1), 0),
+            "mail past end re-arms"
+        );
+    }
+
     fn other_wait(w: &World) {
         write(
             &w.folder(ID).join("waiting-77.json"),
@@ -1858,7 +1985,7 @@ mod tests {
         w.fakes.clear_log();
         assert_eq!(
             run(&w, read, &["read", "-Wait", "1"]),
-            r#"ok {"batch":null,"ids":[],"text":""}"#
+            r#"ok {"batch":null,"ids":[],"text":"","timeout":true}"#
         );
         assert_eq!(*seen.borrow(), vec![Some(mine.clone()); 2]);
         let locks = w.fakes.locks();

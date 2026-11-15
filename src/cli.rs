@@ -116,10 +116,10 @@ pub static VERBS: &[VerbDef] = &[
     VerbDef {
         name: "read",
         values: &["Wait", "Lines", "Ack", "Id"],
-        switches: &["Deliver", "Count"],
+        switches: &["Deliver", "Count", "Cancel"],
         min: 0,
         max: 1,
-        usage: "usage: mux-agent read [-Wait <seconds> | -Deliver | -Id <id> | -Count] [-Ack <batch>] | read <name> [-Lines <n>] [-Text]",
+        usage: "usage: mux-agent read [-Wait <seconds> | -Deliver | -Id <id> | -Count | -Cancel] [-Ack <batch>] | read <name> [-Lines <n>] [-Text]",
         handler: crate::agents::message::read,
         text: json::lines,
     },
