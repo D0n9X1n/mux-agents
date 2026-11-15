@@ -1062,3 +1062,108 @@ fn an_unfinished_send_past_a_day_stays_and_its_id_finishes_it() {
         "no duplicate; the original recipients"
     );
 }
+
+#[test]
+fn dead_or_foreign_panes_refuse() {
+    for out in ["%9|$4\n", ""] {
+        let w = team_world();
+        w.fakes.mux_first("#{pane_id}|#{session_id}", 0, out, "");
+        online(&w);
+        assert_eq!(
+            said(go(&w, Some(A), &["send", "%9", "-Body", "x"]).unwrap_err()),
+            "2 target the recipient is not a live pane of this session",
+            "{out}"
+        );
+    }
+}
+
+#[test]
+fn locks_are_team_then_agent_then_each_mailbox() {
+    let w = team_world();
+    w.fakes
+        .real_locks(&w.ctx.state_root.parent().unwrap().join("locks"));
+    online(&w);
+    w.fakes.clear_log();
+    go(&w, Some(A), &["send", "team", "-Body", "x"]).unwrap();
+    let c = w.caller();
+    let keys = [
+        crate::agents::lock_key("spawn", &c, "$3"),
+        crate::agents::lock_key("agent", &c, A),
+        crate::agents::lock_key("mail", &c, B),
+        crate::agents::lock_key("mail", &c, LEADER),
+    ];
+    let got: Vec<String> = w
+        .fakes
+        .locks()
+        .into_iter()
+        .filter(|e| keys.iter().any(|k| e[1..] == *k))
+        .collect();
+    let (s, a, b, l) = (&keys[0], &keys[1], &keys[2], &keys[3]);
+    assert_eq!(
+        got,
+        [
+            format!("+{s}"),
+            format!("+{a}"),
+            format!("+{b}"),
+            format!("-{b}"),
+            format!("+{l}"),
+            format!("-{l}"),
+            format!("-{a}"),
+            format!("-{s}")
+        ],
+        "team, agent, each mailbox; never reversed"
+    );
+}
+
+#[test]
+fn the_reply_json_stored_fields_last_sent_and_wait_cleanup() {
+    let w = team_world();
+    online(&w);
+    crate::agents::fixture::write(
+        &w.folder(A).join("waiting-77.json"),
+        json!({"pid": 77, "start": 1, "since": "x"}),
+    );
+    let r = go(&w, Some(A), &["send", "leader", "-Body", "hello"]).unwrap();
+    assert_eq!(
+        r.as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
+        ["to", "id", "from", "recipients", "hop", "re", "toSessionId"]
+    );
+    assert_eq!(
+        (&r["to"], &r["hop"], &r["re"]),
+        (&json!("leader"), &json!(0), &Value::Null)
+    );
+    let stored = &inbox(&w, LEADER)[0];
+    assert_eq!(
+        stored
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
+        [
+            "id", "from", "pane", "at", "body", "fromBox", "re", "hop", "cast"
+        ]
+    );
+    assert_eq!(
+        crate::state::fs::read_json(&w.folder(A).join("last-sent.json"))
+            .unwrap()
+            .unwrap()["line"],
+        "hello"
+    );
+    assert!(
+        !w.folder(A).join("waiting-77.json").exists(),
+        "a send ends the wait"
+    );
+    online(&w);
+    assert!(
+        go(&w, Some(A), &["send", "mb2", "-Body", "x"])
+            .unwrap()
+            .get("toSessionId")
+            .is_none(),
+        "copilot: none"
+    );
+}
