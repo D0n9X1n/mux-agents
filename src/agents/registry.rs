@@ -6,6 +6,9 @@
 
 use serde_json::{Map, Value, json};
 
+use std::path::Path;
+
+use super::gens::{self, Member};
 use super::mail;
 use crate::caller::Caller;
 use crate::ctx::Ctx;
@@ -108,6 +111,8 @@ pub struct Agent {
     pub row: Option<Row>,
     // Its launch, when the row is proven to be it.
     pub launch: Option<Launch>,
+    /// R1: the member this snapshot read; post_if_gone posts for it.
+    pub member: Member,
 }
 
 /// A running agent: its pane, as the snapshot read it, and its record.
@@ -268,26 +273,22 @@ impl Snapshot {
         let rows = rows(ctx, caller)?;
         let agents_dir = super::server_dir(ctx, caller).join("agents");
         let mut agents = Vec::new();
-        let entries = match std::fs::read_dir(&agents_dir) {
-            Ok(entries) => Some(entries),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
-            Err(e) => return Err(e.into()),
-        };
-        for entry in entries.into_iter().flatten() {
-            let entry = entry?;
-            let Some(id) = entry.file_name().to_str().map(str::to_string) else {
+        for (id, folder, member) in gens::members(&agents_dir)? {
+            // R2: an unreadable member is no own record; its tag, if any, is only a reservation.
+            let state = match &member {
+                Member::Pre(r) => own(r, &id, caller).then(|| {
+                    (
+                        r.clone(),
+                        super::folder_committed(&folder),
+                        folder.join("notice.json").exists(),
+                    )
+                }),
+                Member::Life(g) => life_state(g, &id, caller),
+                Member::Absent | Member::Unreadable(_) => None,
+            };
+            let Some((record, committed, noticed)) = state else {
                 continue;
             };
-            let folder = entry.path();
-            if !super::agent_id(&id) || !folder.is_dir() {
-                continue;
-            }
-            // An unreadable record is no own record: its tag, if any, is only a reservation.
-            let Some(record) = own_record(ctx, caller, &id).ok().flatten() else {
-                continue;
-            };
-            let committed = super::committed(&folder);
-            let noticed = folder.join("notice.json").exists();
             let pane = super::text(record.get("pane"));
             let row = rows.iter().find(|r| r.pane == pane).cloned();
             let launch = row
@@ -302,6 +303,7 @@ impl Snapshot {
                 class,
                 row,
                 launch,
+                member,
             });
         }
         agents.sort_by(|a, b| a.id.cmp(&b.id));
@@ -377,6 +379,27 @@ impl Snapshot {
     }
 }
 
+/// A record naming its folder's id and the caller's session.
+fn own(record: &Value, id: &str, caller: &Caller) -> bool {
+    record.get("id").and_then(Value::as_str) == Some(id)
+        && record.get("session").and_then(Value::as_str) == Some(caller.session.as_str())
+}
+
+/// R1, R2, R4: one `presented`, one `status`, one notice read of the active generation. Any Unreadable skips the
+/// member (display only: its tag stays a reservation, never a free name).
+fn life_state(g: &gens::Gen, id: &str, caller: &Caller) -> Option<(Value, bool, bool)> {
+    if !own(g.record(), id, caller) {
+        return None;
+    }
+    let record = super::team_state::presented(g.folder(), g.record().clone()).ok()?;
+    let s = g.status().ok()?;
+    let noticed = match g.active() {
+        Some(n) => g.read(n, "notice").known().ok()?.is_some(),
+        None => false,
+    };
+    Some((record, s.active_committed, noticed))
+}
+
 /// A running agent as a `Pane`; none in any other class.
 fn pane_of(agent: &Agent) -> Option<Pane> {
     let (row, launch) = (agent.row.as_ref()?, agent.launch.clone()?);
@@ -423,6 +446,9 @@ fn launch_of(ctx: &Ctx, caller: &Caller, id: &str, record: &Value, row: &Row) ->
         }
         Some(_) => None,
         None => {
+            if gens::lifecycle(record) {
+                return None; // ambiguity 11: launcher.json never proves a lifecycle record
+            }
             let pid = live_pid(&row.pid).filter(|_| !row.dead && !row.command.is_empty())?;
             proven_launcher(ctx, caller, id, pid).then(|| Launch {
                 command: row.command.clone(),
@@ -465,11 +491,13 @@ pub fn record(ctx: &Ctx, caller: &Caller, id: &str) -> Res<Option<Value>> {
     if !super::agent_id(id) {
         return Ok(None);
     }
-    let path = super::server_dir(ctx, caller)
-        .join("agents")
-        .join(id)
-        .join("record.json");
-    Ok(crate::state::fs::read_json(&path)?.filter(Value::is_object))
+    let folder = super::server_dir(ctx, caller).join("agents").join(id);
+    match gens::member_of(&folder) {
+        Member::Absent => Ok(None),
+        Member::Pre(r) => Ok(Some(r).filter(Value::is_object)),
+        Member::Life(g) => super::team_state::presented(&folder, g.record().clone()).map(Some),
+        Member::Unreadable(e) => Err(e),
+    }
 }
 
 fn no_agent<T>() -> Res<T> {
@@ -563,13 +591,51 @@ pub fn add_notice(
     record: &Value,
     notice: Notice,
 ) -> Res<bool> {
-    let marker = super::server_dir(ctx, caller)
-        .join("agents")
-        .join(id)
-        .join("notice.json");
-    if marker.exists() {
-        return Ok(false);
-    }
+    let folder = super::server_dir(ctx, caller).join("agents").join(id);
+    let member = gens::member_of(&folder);
+    post(ctx, caller, id, &folder, &member, record, notice)
+}
+
+/// S5, ambiguities 8, 9, 16: the generation, marker and delivery id come from `member` alone; `record` gives only
+/// the name, pane and parent pane. Under the notice lock, so its notice read decides. R3, PM call 7: a lifecycle
+/// notice waits until the active generation is done by recorded evidence (`completing.gen` holds it); until then
+/// nothing is posted and the next list or reap retries (settle-1b, A3b, writes `ended.json`).
+fn post(
+    ctx: &Ctx,
+    caller: &Caller,
+    id: &str,
+    folder: &Path,
+    member: &Member,
+    record: &Value,
+    notice: Notice,
+) -> Res<bool> {
+    let (marker, delivery, once) = match member {
+        Member::Unreadable(e) => return Err(e.clone()),
+        Member::Life(g) => {
+            let Some(n) = g.active() else {
+                return Ok(false); // nothing to notice
+            };
+            let s = g.status()?; // R2: an unreadable marker or record refuses
+            if g.read(n, "notice").known()?.is_some() {
+                return Ok(false);
+            }
+            if s.active_done != Some(true) {
+                return Ok(false); // R3: not ended by its record yet
+            }
+            (
+                gens::path(folder, n, "notice"),
+                gens::delivery_id(id, n),
+                true,
+            )
+        }
+        Member::Pre(_) | Member::Absent => {
+            let marker = folder.join("notice.json");
+            if marker.exists() {
+                return Ok(false);
+            }
+            (marker, format!("exit-{id}"), false)
+        }
+    };
     let name = super::text(record.get("name"));
     let (kind, code, body) = match notice {
         Notice::Exited(code) => {
@@ -598,16 +664,7 @@ pub fn add_notice(
         fields.insert("exitCode".into(), code.clone());
         // The member it is about, so a team bar counts it by identity (#103 review).
         fields.insert("fromId".into(), id.into());
-        mail::add_once(
-            ctx,
-            caller,
-            &key,
-            &name,
-            &pane,
-            &body,
-            &format!("exit-{id}"),
-            &fields,
-        )?
+        mail::add_once(ctx, caller, &key, &name, &pane, &body, &delivery, &fields)?
     };
     // The first notice wins: a message already delivered (a marker write that failed after it) decides the marker.
     let (kind, code) = match delivered {
@@ -619,7 +676,11 @@ pub fn add_notice(
     if kind == "lost" {
         written["closedBy"] = "pane".into();
     }
-    crate::state::fs::write_json(&marker, &written)?;
+    if once {
+        crate::state::evidence::publish(&marker, &written)?; // create-once (S5)
+    } else {
+        crate::state::fs::write_json(&marker, &written)?;
+    }
     Ok(true)
 }
 
@@ -710,7 +771,7 @@ pub fn reap(
         };
         super::lock(ctx, &super::lock_key("notice", caller, &agent.id), || {
             run(ctx, &kill_if_dead(&row.pane, launch))?;
-            post_if_gone(ctx, caller, &agent.id, &agent.record)
+            post_if_gone(ctx, caller, agent)
         })?;
         acted = true;
     }
@@ -721,7 +782,7 @@ pub fn reap(
     {
         // The snapshot may predate a spawn that committed since: the fresh probe decides.
         acted |= super::lock(ctx, &super::lock_key("notice", caller, &agent.id), || {
-            post_if_gone(ctx, caller, &agent.id, &agent.record)
+            post_if_gone(ctx, caller, agent)
         })?;
     }
     // A stale uncommitted agent: its dead launch is killed, and one gone without a notice is probed.
@@ -753,7 +814,7 @@ pub fn reap(
                         run(ctx, &kill_if_dead(&row.pane, launch))?;
                         killed = true;
                     }
-                    Ok(post_if_gone(ctx, caller, &agent.id, &agent.record)? || killed)
+                    Ok(post_if_gone(ctx, caller, agent)? || killed)
                 })?;
             }
             Ok(did)
@@ -778,44 +839,38 @@ pub fn reap(
 /// Without a snapshot, panes are worth listing only when a committed agent has no notice, a stale uncommitted one
 /// has none, or a launcher recorded an exit (its pane may be dead).
 fn worth_listing(ctx: &Ctx, caller: &Caller) -> Res<bool> {
-    let agents = super::server_dir(ctx, caller).join("agents");
-    let entries = match std::fs::read_dir(&agents) {
-        Ok(entries) => entries,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
-        Err(e) => return Err(e.into()),
-    };
-    for entry in entries {
-        let entry = entry?;
-        let Some(id) = entry.file_name().to_str().map(str::to_string) else {
-            continue;
+    for (_, folder, member) in gens::members(&super::server_dir(ctx, caller).join("agents"))? {
+        let worth = match &member {
+            Member::Absent => false,
+            Member::Unreadable(_) => true, // R2, ambiguity 10: listing writes nothing
+            Member::Pre(r) => {
+                let noticed = folder.join("notice.json").exists();
+                (!noticed && (super::folder_committed(&folder) || stale_of(ctx, r)))
+                    || exit_code(&folder, &member).ok().flatten().is_some()
+            }
+            Member::Life(g) => life_worth(ctx, &folder, &member, g),
         };
-        let folder = entry.path();
-        if !super::agent_id(&id) || !folder.is_dir() {
-            continue;
-        }
-        let noticed = folder.join("notice.json").exists();
-        let committed = super::committed(&folder);
-        if !noticed && (committed || stale(ctx, caller, &id)) {
-            return Ok(true);
-        }
-        let exited = crate::state::fs::read_json(&folder.join("launcher.json"))
-            .ok()
-            .flatten()
-            .and_then(|l| l.get("exitCode").filter(|c| !c.is_null()).cloned())
-            .is_some();
-        if exited {
+        if worth {
             return Ok(true);
         }
     }
     Ok(false)
 }
 
-/// record.json of agent `id` when it names that id and the caller's session.
-fn own_record(ctx: &Ctx, caller: &Caller, id: &str) -> Res<Option<Value>> {
-    Ok(record(ctx, caller, id)?.filter(|record| {
-        record.get("id").and_then(Value::as_str) == Some(id)
-            && record.get("session").and_then(Value::as_str) == Some(caller.session.as_str())
-    }))
+/// R1, R2: one `status`, one notice and one exit read of the active generation; any Unreadable lists.
+fn life_worth(ctx: &Ctx, folder: &Path, member: &Member, g: &gens::Gen) -> bool {
+    let Ok(s) = g.status() else { return true };
+    let Some(n) = g.active() else {
+        return stale_of(ctx, g.record());
+    };
+    let noticed = match g.read(n, "notice").known() {
+        Ok(v) => v.is_some(),
+        Err(_) => return true,
+    };
+    if !noticed && (s.active_committed || stale_of(ctx, g.record())) {
+        return true;
+    }
+    !matches!(exit_code(folder, member), Ok(None))
 }
 
 /// Whether agent `id`'s record was created over 60 s ago; an unreadable record or time is not.
@@ -823,11 +878,15 @@ fn stale(ctx: &Ctx, caller: &Caller, id: &str) -> bool {
     record(ctx, caller, id)
         .ok()
         .flatten()
-        .and_then(|r| {
-            r.get("createdAt")
-                .and_then(Value::as_str)
-                .and_then(crate::util::parse_utc)
-        })
+        .is_some_and(|r| stale_of(ctx, &r))
+}
+
+/// Whether `record` was created over 60 s ago; an unreadable time is not.
+fn stale_of(ctx: &Ctx, record: &Value) -> bool {
+    record
+        .get("createdAt")
+        .and_then(Value::as_str)
+        .and_then(crate::util::parse_utc)
         .and_then(|created| ctx.clock.now().duration_since(created).ok())
         .is_some_and(|age| age > UNCOMMITTED_MAX)
 }
@@ -843,18 +902,50 @@ pub(crate) fn pane_gone(ctx: &Ctx, pane: &str) -> Res<bool> {
 }
 
 /// Under agent `id`'s notice lock: when it has no notice and a fresh probe shows its pane gone, posts `exited` with
-/// launcher.json's code, else `lost`. True when it posted.
-pub(crate) fn post_if_gone(ctx: &Ctx, caller: &Caller, id: &str, record: &Value) -> Res<bool> {
-    let folder = super::server_dir(ctx, caller).join("agents").join(id);
-    if folder.join("notice.json").exists() || !pane_gone(ctx, &super::text(record.get("pane")))? {
+/// its recorded exit code, else `lost`. True when it posted. R1 (audit B2): it posts for `agent.member`, the
+/// snapshot's; `post` reads that member's status under the notice lock, so a completion recorded since is seen and a
+/// promotion is not.
+pub(crate) fn post_if_gone(ctx: &Ctx, caller: &Caller, agent: &Agent) -> Res<bool> {
+    let folder = super::server_dir(ctx, caller)
+        .join("agents")
+        .join(&agent.id);
+    if matches!(agent.member, Member::Pre(_) | Member::Absent)
+        && folder.join("notice.json").exists()
+    {
+        return Ok(false); // main's order for a pre-lifecycle agent: no probe once noticed
+    }
+    if !pane_gone(ctx, &super::text(agent.record.get("pane")))? {
         return Ok(false);
     }
-    let launcher = crate::state::fs::read_json(&folder.join("launcher.json"))?;
-    let notice = match launcher.as_ref().and_then(|l| l.get("exitCode")) {
-        Some(code) if !code.is_null() => Notice::Exited(code.clone()),
-        _ => Notice::Lost,
+    let notice = match exit_code(&folder, &agent.member)? {
+        Some(code) => Notice::Exited(code),
+        None => Notice::Lost,
     };
-    add_notice(ctx, caller, id, record, notice)
+    post(
+        ctx,
+        caller,
+        &agent.id,
+        &folder,
+        &agent.member,
+        &agent.record,
+        notice,
+    )
+}
+
+/// The recorded exit code: the active generation's `exit.json`; a pre-lifecycle folder's `launcher.json`.
+/// Unreadable refuses (R2).
+pub(crate) fn exit_code(folder: &Path, member: &Member) -> Res<Option<Value>> {
+    let recorded = match member {
+        Member::Life(g) => match g.active() {
+            Some(n) => g.read(n, "exit").known()?,
+            None => None,
+        },
+        Member::Pre(_) | Member::Absent => {
+            crate::state::fs::read_json(&folder.join("launcher.json"))?
+        }
+        Member::Unreadable(e) => return Err(e.clone()),
+    };
+    Ok(recorded.and_then(|l| l.get("exitCode").filter(|c| !c.is_null()).cloned()))
 }
 
 #[cfg(test)]
@@ -2258,6 +2349,143 @@ mod tests {
         assert!(w.state().join("mail").read_dir().unwrap().next().is_none());
         assert!(!add_notice(&w.ctx, &caller, ID, &record, Notice::Stopped).unwrap());
     }
+
+    /// A lifecycle member at generation 1 (raw pane %2) whose generation-1 view is %9, with conflicting folder and
+    /// generation-0 commit and notice; its pane row listed. Returns its folder.
+    fn life_world(w: &World) -> std::path::PathBuf {
+        use crate::{agents::gens, state::evidence::publish};
+        let f = w.agent_record(
+            ID,
+            json!({"lifecycle": 1, "generation": "1", "hcAddress": "t1",
+            "hcName": "m0123abcd", "pane": "%2", "window": "@2"}),
+        );
+        write(&f.join("notice.json"), json!({"kind": "stopped"}));
+        publish(&gens::path(&f, 0, "commit"), &json!({"committed": true})).unwrap();
+        publish(&gens::path(&f, 0, "notice"), &json!({"kind": "stopped"})).unwrap();
+        publish(
+            &gens::path(&f, 1, "launch"),
+            &json!({"hcName": "m0123abcd"}),
+        )
+        .unwrap();
+        write(
+            &f.join("view.json"),
+            json!({"pane": "%9", "window": "@5", "startCommand": "hc attach t1", "gen": 1,
+            "hcAddress": "t1", "hcName": "m0123abcd"}),
+        );
+        w.pane_rows(&[listed_row("%9", "300", "hc attach t1", ID, "worker")]);
+        f
+    }
+
+    // R1, R4 (af434f CRITICAL 2, 3; audit B3): committed, noticed and the record are generation 1's, from one read.
+    #[test]
+    fn the_snapshot_reads_the_active_generation_once() {
+        use crate::{agents::gens, state::evidence::publish};
+        let w = World::human("");
+        let caller = w.caller();
+        let f = life_world(&w);
+        assert_eq!(
+            record(&w.ctx, &caller, ID).unwrap().unwrap()["pane"],
+            "%9",
+            "record overlays"
+        );
+        let (s, reads) = crate::state::fs::record_reads(|| snapshot(&w));
+        let seen = (
+            s.agents[0].committed,
+            s.agents[0].noticed,
+            s.agents[0].class,
+        );
+        assert_eq!(
+            seen,
+            (false, false, Class::LiveLaunch),
+            "neither the folder nor generation 0"
+        );
+        assert_eq!(
+            reads.iter().filter(|p| p.ends_with("record.json")).count(),
+            1,
+            "one read: {reads:?}"
+        );
+        publish(&gens::path(&f, 1, "commit"), &json!({"committed": true})).unwrap();
+        assert_eq!(classes(&snapshot(&w)), [(ID.to_string(), Class::Running)]);
+        publish(&gens::path(&f, 1, "notice"), &json!({"kind": "exited"})).unwrap();
+        assert!(snapshot(&w).agents[0].noticed, "generation 1's notice");
+        write(
+            &f.join("view.json"),
+            json!({"pane": "%9", "window": "@5", "gen": 0, "hcAddress": "t1",
+            "hcName": "m0123abcd"}),
+        );
+        assert_eq!(
+            record(&w.ctx, &caller, ID).unwrap().unwrap().get("pane"),
+            None,
+            "generation 0's view"
+        );
+    }
+
+    // R2 (audits B4, B5): an unreadable lifecycle member is no own record; its tag is only a reservation, and
+    // `record` refuses it.
+    #[test]
+    fn an_unreadable_lifecycle_member_is_only_a_reservation() {
+        use crate::agents::gens;
+        for case in ["generation 01", "torn commit", "torn notice"] {
+            let w = World::human("");
+            let f = life_world(&w);
+            match case {
+                "generation 01" => {
+                    let mut r = crate::state::fs::read_json(&f.join("record.json"))
+                        .unwrap()
+                        .unwrap();
+                    r["generation"] = json!("01");
+                    write(&f.join("record.json"), r);
+                }
+                "torn commit" => std::fs::write(gens::path(&f, 1, "commit"), b"{\"co").unwrap(),
+                _ => std::fs::write(gens::path(&f, 1, "notice"), b"{\"ki").unwrap(),
+            }
+            let s = snapshot(&w);
+            assert!(s.agents.is_empty(), "{case}: no own record");
+            assert_eq!(
+                s.reserved
+                    .iter()
+                    .map(|(id, _)| id.as_str())
+                    .collect::<Vec<_>>(),
+                [ID],
+                "{case}"
+            );
+            if case == "generation 01" {
+                let e = record(&w.ctx, &w.caller(), ID).unwrap_err();
+                assert_eq!(e.check, "internal", "record refuses");
+            }
+        }
+    }
+
+    // Ambiguity 11: a folder-level launcher.json never proves a lifecycle record without startCommand.
+    #[test]
+    fn a_folder_launcher_never_proves_a_lifecycle_record() {
+        use crate::{agents::gens, state::evidence::publish};
+        let w = legacy_world(&["/elsewhere/mux-agent", "launcher", "<spec>"], 3000);
+        let f = w.folder(ID);
+        let mut r = crate::state::fs::read_json(&f.join("record.json"))
+            .unwrap()
+            .unwrap();
+        (r["lifecycle"], r["generation"], r["hcAddress"], r["hcName"]) =
+            (json!(1), json!("1"), json!("t1"), json!("m0123abcd"));
+        write(&f.join("record.json"), r);
+        publish(&gens::path(&f, 1, "commit"), &json!({"committed": true})).unwrap();
+        publish(
+            &gens::path(&f, 1, "launch"),
+            &json!({"hcName": "m0123abcd"}),
+        )
+        .unwrap();
+        write(
+            &f.join("view.json"),
+            json!({"pane": "%9", "window": "@5", "gen": 1, "hcAddress": "t1",
+            "hcName": "m0123abcd"}),
+        );
+        w.pane_rows(&[listed_row("%9", "300", "old command", ID, "worker")]);
+        assert_ne!(
+            classes(&snapshot(&w)),
+            [(ID.to_string(), Class::Running)],
+            "launcher.json proves nothing"
+        );
+    }
 }
 #[cfg(test)]
 #[path = "registry_hc_tests.rs"]
@@ -2282,8 +2510,13 @@ pub fn reap_hc(ctx: &Ctx, caller: &Caller, snapshot: &super::membership::Snapsho
         };
         let id = &o.identity.id;
         acted |= with_member_notice(ctx, caller, id, || {
-            let Some(record) = record(ctx, caller, id)? else {
-                return Ok(false);
+            // R1: one read; R3, ambiguity 17: hc's finished terminal never ends a lifecycle member.
+            let folder = super::server_dir(ctx, caller).join("agents").join(id);
+            let member = gens::member_of(&folder);
+            let record = match &member {
+                Member::Pre(r) if r.is_object() => r.clone(),
+                Member::Unreadable(e) => return Err(e.clone()),
+                _ => return Ok(false),
             };
             if super::core_identity::Identity::read(&record, id, &super::membership::team(caller))
                 .as_ref()
@@ -2291,7 +2524,7 @@ pub fn reap_hc(ctx: &Ctx, caller: &Caller, snapshot: &super::membership::Snapsho
             {
                 return Ok(false);
             }
-            add_notice(ctx, caller, id, &record, notice)
+            post(ctx, caller, id, &folder, &member, &record, notice)
         })?;
     }
     Ok(acted)
