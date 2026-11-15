@@ -530,3 +530,54 @@ fn stop_waits_out_the_bound_for_a_row_with_an_unknown_start() {
     assert_eq!(w.fakes.slept().iter().sum::<u64>(), 8000);
     w.fakes.hc_done().unwrap();
 }
+
+// A held identity (A3a R4): a pending generation not yet done is the one `stop` targets and kills, so its client, not
+// the active generation's, is the one `stop` waits for.
+#[test]
+fn stop_of_a_held_generation_waits_for_that_generations_client() {
+    use crate::state::evidence::publish;
+    let w = World::human("");
+    let mut r = cf::member(&w, ID, json!({"lifecycle": 1}));
+    let f = w.folder(ID);
+    r["pending"] = json!({"gen": 1, "hcName": "m4567cdef", "sessionId": "11111111-2222-4333-8444-555555555555",
+        "hcAddress": "t9"});
+    super::fixture::write(&f.join("record.json"), r.clone());
+    publish(
+        &super::gens::path(&f, 0, "commit"),
+        &json!({"committed": true}),
+    )
+    .unwrap();
+    publish(
+        &super::gens::path(&f, 1, "commit"),
+        &json!({"committed": true}),
+    )
+    .unwrap();
+    publish(
+        &super::gens::path(&f, 1, "client"),
+        &json!({"pid": 160, "start": 1600}),
+    )
+    .unwrap();
+    w.fakes.process(crate::testing::row(160, 31337, 1600));
+    cf::online(&w);
+    cf::answer(&w, &["kill", "t9", "--json"], "{}");
+    let mut t = cf::wire(&r);
+    (t["address"], t["labels"]["mux.gen"]) = (json!("t9"), json!("1"));
+    (t["state"], t["reason"]) = (json!("finished"), json!("killed"));
+    cf::get(&w, "t9", t);
+    let f2 = w.fakes.clone();
+    w.fakes.sleep_probe(move |n| {
+        if n == 2 {
+            f2.forget(160);
+        }
+    });
+    let got = call(&w).unwrap();
+    assert_eq!(
+        (
+            got.get("hcAddress"),
+            got.get("clientExited"),
+            w.fakes.slept()
+        ),
+        (Some(&json!("t9")), None, vec![250, 250])
+    );
+    w.fakes.hc_done().unwrap();
+}

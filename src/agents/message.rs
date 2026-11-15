@@ -861,8 +861,9 @@ fn kept(core: &crate::hc::Core<'_>, id: &super::core_identity::Identity) -> Res<
 const CLIENT_EXIT_BOUND: Duration = Duration::from_millis(8000);
 const CLIENT_EXIT_POLL: Duration = Duration::from_millis(250);
 
-/// What member `id` recorded of its client (call 9): its active generation's `client.json` for a lifecycle record, the
-/// `client` its `launcher.json` names for any other, each read as typed evidence (`gens::walk`: regular files only,
+/// What member `id` recorded of its client (call 9): for a lifecycle record, the `client.json` of the generation `stop`
+/// targets (the identity's: a held pending generation's own, else the active one, A3a R4); for any other, the
+/// `client` its `launcher.json` names. Each is read as typed evidence (`gens::walk`: regular files only,
 /// never a FIFO, a folder or a link, so the read never blocks).
 #[derive(Debug, PartialEq)]
 enum Recorded {
@@ -873,10 +874,10 @@ enum Recorded {
     Client(u32, i64),
 }
 
-fn recorded_client(member: &Path, record: &Value) -> Recorded {
+fn recorded_client(member: &Path, record: &Value, generation: &str) -> Recorded {
     use crate::state::evidence::Evidence;
     let client = if super::gens::lifecycle(record) {
-        let Some(n) = super::gens::active(record) else {
+        let Some(n) = super::gens::plain_gen(generation) else {
             return Recorded::Unreadable;
         };
         match super::gens::read(member, n, "client") {
@@ -953,7 +954,7 @@ pub fn stop_hc(ctx: &Ctx, request: &Request) -> Res<Map<String, Value>> {
             };
             add_notice(ctx, &caller, &id.id, &record, Notice::Stopped)?;
             let member = server_dir(ctx, &caller).join("agents").join(&id.id);
-            let client = recorded_client(&member, &record);
+            let client = recorded_client(&member, &record, &id.generation);
             let mut reply = Map::new();
             reply.insert("name".into(), id.name.clone().into());
             reply.insert("hcAddress".into(), id.address.clone().into());
