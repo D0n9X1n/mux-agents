@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 use serde_json::{Map, Value, json};
 
 use super::core_identity::Identity;
+use super::gens::Member;
 use super::lifecycle::{Life, classify};
 use super::membership::Snapshot;
 use super::placement::{DEFAULT as DEFAULT_PLACEMENT, read_placement};
@@ -293,34 +294,22 @@ pub(crate) fn ceiling(team: Option<&super::team::Team>) -> super::team::Policy {
 /// names that member (its folder), so the person can resume it.
 fn taken(ctx: &Ctx, caller: &crate::caller::Caller, id: &str) -> Res<Option<String>> {
     let agents = server_dir(ctx, caller).join("agents");
-    let entries = match std::fs::read_dir(&agents) {
-        Ok(entries) => entries,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => return Err(e.into()),
-    };
-    for entry in entries {
-        let folder = entry?.path();
-        let Some(successor) = folder
-            .file_name()
-            .and_then(|n| n.to_str())
-            .filter(|n| super::agent_id(n))
-            .map(str::to_owned)
-        else {
-            continue;
+    for (successor, folder, member) in super::gens::members(&agents)? {
+        let record = match &member {
+            Member::Absent => continue,
+            Member::Unreadable(_) => return Ok(Some(successor)), // R2, ambiguity 13
+            Member::Pre(r) => r,
+            Member::Life(g) => g.record(),
         };
-        if !folder.is_dir() {
+        if record.get("resumedFrom").and_then(Value::as_str) != Some(id) {
             continue;
         }
-        let Ok(record) = read_json(&folder.join("record.json")) else {
+        if let Member::Life(g) = &member {
+            // R1, R2: one status; only a proven void first launch frees the member.
+            if matches!(g.status(), Ok(s) if s.never_ran) {
+                continue;
+            }
             return Ok(Some(successor));
-        };
-        if record
-            .as_ref()
-            .and_then(|r| r.get("resumedFrom"))
-            .and_then(Value::as_str)
-            != Some(id)
-        {
-            continue;
         }
         let claim = match read_json(&folder.join("gens").join("0.claim")) {
             Ok(claim) => claim,
@@ -368,23 +357,46 @@ fn session_held(ctx: &Ctx, core: &Core<'_>, x: &str, session: &str) -> Option<St
                 None => {}
             }
         }
-        let records = every_record(ctx)?;
-        let named: BTreeSet<&str> = records
+        let members = every_member(ctx)?; // R1: one classification per folder
+        if members
             .iter()
-            .filter_map(|(_, r)| r.get("resumedFrom").and_then(Value::as_str))
+            .any(|(_, m)| matches!(m, Member::Unreadable(_)))
+        {
+            return Ok(Some(live())); // R2, R5
+        }
+        let named: BTreeSet<&str> = members
+            .iter()
+            .filter_map(|(_, m)| record_of(m)?.get("resumedFrom")?.as_str())
             .collect();
-        for (folder, record) in &records {
+        for (folder, member) in &members {
+            let Some(record) = record_of(member) else {
+                continue;
+            };
             let id = folder.file_name().and_then(|n| n.to_str()).unwrap_or("");
-            if id == x || named.contains(id) || text(record.get("sessionId")) != session {
+            // R3 (re-audit a0586ee): every conversation the record names; a lifecycle record's pending one too.
+            let mut names = vec![text(record.get("sessionId"))];
+            if matches!(member, Member::Life(_)) {
+                names.push(text(record.get("pending").and_then(|p| p.get("sessionId"))));
+            }
+            if id == x || named.contains(id) || !names.iter().any(|s| s == session) {
                 continue;
             }
-            if !ended(core, folder, id, record) {
+            if !ended(core, folder, id, record, member)? {
                 return Ok(Some(live()));
             }
         }
         Ok(None)
     };
     held().unwrap_or_else(|_| Some(live()))
+}
+
+/// The record a classified member holds: a pre-lifecycle record, or a lifecycle member's; none otherwise.
+fn record_of(m: &Member) -> Option<&Value> {
+    match m {
+        Member::Pre(r) => Some(r),
+        Member::Life(g) => Some(g.record()),
+        Member::Absent | Member::Unreadable(_) => None,
+    }
 }
 
 /// Whether `row` (whose argv cannot be read) is a claude or copilot client: the OS says so, or its image's file
@@ -450,41 +462,21 @@ pub(crate) fn every_member(ctx: &Ctx) -> Res<Vec<(PathBuf, super::gens::Member)>
     Ok(all)
 }
 
-/// Every member record of every server folder of the state root, with its folder; one that cannot be read fails.
-pub(crate) fn every_record(ctx: &Ctx) -> Res<Vec<(PathBuf, Value)>> {
-    let mut all = Vec::new();
-    let servers = match std::fs::read_dir(&ctx.state_root) {
-        Ok(entries) => entries,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(all),
-        Err(e) => return Err(e.into()),
-    };
-    for server in servers {
-        let agents = server?.path().join("agents");
-        if !agents.is_dir() {
-            continue;
-        }
-        for agent in std::fs::read_dir(&agents)? {
-            let folder = agent?.path();
-            let named = folder
-                .file_name()
-                .and_then(|n| n.to_str())
-                .is_some_and(super::agent_id);
-            if !named || !folder.is_dir() {
-                continue;
-            }
-            if let Some(record) = read_json(&folder.join("record.json"))? {
-                all.push((folder, record));
-            }
-        }
+/// R3: a lifecycle member is ended only when every generation it names is done by recorded evidence; hc never
+/// ends it. Unreadable refuses (R2); `session_held` treats any `Err` as held. Pre-lifecycle: main (`pre_ended`).
+fn ended(core: &Core<'_>, folder: &Path, id: &str, record: &Value, member: &Member) -> Res<bool> {
+    match member {
+        Member::Life(g) => Ok(g.status()?.finished),
+        Member::Unreadable(e) => Err(e.clone()),
+        Member::Pre(_) | Member::Absent => Ok(pre_ended(core, folder, id, record)),
     }
-    Ok(all)
 }
 
 /// Whether the member recorded in `folder` is proven ended, asking hc about it alone. An hc member: its own
 /// terminal, matched by address and labels, classifies Ended. A launch whose run named no address yet: its claim was
 /// abandoned, or the one generation-0 terminal labelled with its id has finished, or it never claimed and aborted. A
 /// pre-hc record: its end notice.
-fn ended(core: &Core<'_>, folder: &Path, id: &str, record: &Value) -> bool {
+fn pre_ended(core: &Core<'_>, folder: &Path, id: &str, record: &Value) -> bool {
     if record.get("hcAddress").is_some() {
         let identity = record
             .get("team")

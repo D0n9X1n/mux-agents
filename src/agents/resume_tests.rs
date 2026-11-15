@@ -1579,3 +1579,191 @@ fn a_lifecycle_records_flags_are_its_options_never_its_spec() {
     r.as_object_mut().unwrap().remove("lifecycle");
     assert_eq!(flags(&r), client_flags(client_named("claude").unwrap()));
 }
+
+// R1, R2 (af434f CRITICAL 4; audit C3): a lifecycle successor is judged by its own generations, never gens/0.claim
+// or abort.json; an unreadable marker or record takes the member (never reused on a guess).
+#[test]
+fn a_lifecycle_successor_is_judged_by_its_own_generations() {
+    use crate::{agents::gens, state::evidence::publish};
+    let w = World::human("");
+    let caller = w.caller();
+    let y = w.uncommitted(
+        Y,
+        json!({"lifecycle": 1, "generation": "1", "hcName": "m0123abcd", "resumedFrom": ID}),
+    );
+    std::fs::create_dir_all(y.join("gens")).unwrap();
+    std::fs::write(gens::claim_path(&y, 0), "\"abandoned\"").unwrap();
+    write(&y.join("abort.json"), json!({"runUncertain": false}));
+    publish(&gens::path(&y, 1, "commit"), &json!({"committed": true})).unwrap();
+    let got = || taken(&w.ctx, &caller, ID).unwrap();
+    assert_eq!(
+        got(),
+        Some(Y.to_string()),
+        "generation 1 ran; gens/0.claim and abort.json say nothing"
+    );
+    write(
+        &y.join("record.json"),
+        json!({"lifecycle": 1, "resumedFrom": ID, "session": "$3", "pending": {"gen": 2}}),
+    );
+    assert_eq!(got(), Some(Y.to_string()), "pending 2 undecided");
+    publish(&gens::path(&y, 2, "commit"), &json!({"aborted": true})).unwrap();
+    assert_eq!(got(), None, "a void first launch takes nothing");
+    std::fs::write(gens::claim_path(&y, 2), b"\"aban").unwrap();
+    assert_eq!(got(), Some(Y.to_string()), "a torn claim takes it");
+    for (n, file, v) in [
+        (3, "ended", json!({"state": "finished"})),
+        (4, "released", json!({})),
+    ] {
+        let r = json!({"lifecycle": 1, "resumedFrom": ID, "session": "$3", "pending": {"gen": n}});
+        write(&y.join("record.json"), r);
+        publish(&gens::path(&y, n, file), &v).unwrap();
+        assert_eq!(
+            got(),
+            Some(Y.to_string()),
+            "pending {n} only {file}: it ran, never void"
+        );
+    }
+    write(
+        &y.join("record.json"),
+        json!({"lifecycle": 1, "generation": "01", "resumedFrom": ID}),
+    );
+    assert_eq!(
+        got(),
+        Some(Y.to_string()),
+        "an unreadable successor takes it"
+    );
+}
+
+// R3 (audits C1, C2, C9, C11; re-audit a0586ee): a lifecycle member is ended only when every generation it names is
+// done by recorded evidence; generation 0's end and a stale folder notice never end generation 1; a pending
+// generation that only ended or was released ran and is done; hc's finished terminal never ends it; Unreadable
+// refuses. Each case in a fresh world, hc's finished terminal queued after the connection, so a fallback to hc
+// would answer Ended.
+#[test]
+fn a_lifecycle_member_ends_only_by_its_recorded_completion() {
+    use crate::{agents::gens, state::evidence::publish};
+    let end = json!({"state": "finished"});
+    for (case, want) in [
+        ("hc exited, nothing recorded", Ok(false)),
+        ("generation 0 ended, 1 not", Ok(false)),
+        ("ended recorded", Ok(true)),
+        ("completing", Ok(false)),
+        ("torn ended", Err("evidence")),
+        ("never ran", Ok(true)),
+        ("pending undecided", Ok(false)),
+        ("pending aborted", Ok(true)),
+        ("pending ended", Ok(true)),
+        ("pending released", Ok(true)),
+        ("01", Err("internal")),
+    ] {
+        let w = World::human("");
+        cf::online(&w);
+        let core = crate::hc::connect(&w.ctx).unwrap();
+        let mut r = cf::member(
+            &w,
+            ID,
+            json!({"lifecycle": 1, "generation": "1", "hcName": "m0123abcd"}),
+        );
+        let f = w.folder(ID);
+        std::fs::create_dir_all(gens::dir(&f, 1)).unwrap();
+        // Every case: generation 0's end and a folder Stopped notice, which say nothing of generation 1 (S7).
+        publish(&gens::path(&f, 0, "ended"), &end).unwrap();
+        write(&f.join("notice.json"), json!({"kind": "stopped"}));
+        // Every arm is a unit block: `publish` returns `Published`.
+        match case {
+            "ended recorded" => {
+                publish(&gens::path(&f, 1, "ended"), &end).unwrap();
+            }
+            "completing" => {
+                r["completing"] = json!({"gen": 1});
+                publish(&gens::path(&f, 1, "ended"), &end).unwrap();
+            }
+            "torn ended" => std::fs::write(gens::path(&f, 1, "ended"), b"{\"st").unwrap(),
+            "never ran" | "pending undecided" | "pending aborted" | "pending ended"
+            | "pending released" => {
+                r.as_object_mut().unwrap().remove("generation");
+                if case != "never ran" {
+                    r["pending"] = json!({"gen": 1});
+                }
+                let marker = match case {
+                    "pending aborted" => Some(("commit", json!({"aborted": true}))),
+                    "pending ended" => Some(("ended", end.clone())),
+                    "pending released" => Some(("released", json!({}))),
+                    _ => None,
+                };
+                if let Some((file, v)) = marker {
+                    publish(&gens::path(&f, 1, file), &v).unwrap();
+                }
+            }
+            "01" => r["generation"] = json!("01"),
+            _ => {}
+        }
+        write(&f.join("record.json"), r.clone());
+        let mut t = cf::wire(&r);
+        (t["state"], t["reason"], t["exit_code"]) = (json!("finished"), json!("exited"), json!(0));
+        cf::get(&w, r["hcAddress"].as_str().unwrap(), t);
+        let member = gens::member_of(&f);
+        assert_eq!(
+            ended(&core, &f, ID, &r, &member).map_err(|e| e.check),
+            want,
+            "{case}"
+        );
+    }
+}
+
+// R2, R5: a member folder that cannot be read holds the session; it is never read as ended.
+#[test]
+fn an_unreadable_member_holds_the_session() {
+    let w = World::human("");
+    let y = w.uncommitted(
+        Y,
+        json!({"lifecycle": 1, "generation": "01", "sessionId": SESSION_ID}),
+    );
+    write(&y.join("abort.json"), json!({"runUncertain": false}));
+    cf::online(&w);
+    let core = crate::hc::connect(&w.ctx).unwrap();
+    assert!(
+        session_held(&w.ctx, &core, ID, SESSION_ID).is_some(),
+        "unclear evidence is never free"
+    );
+}
+
+// R3 (re-audit a0586ee CRITICAL; final re-audit): every conversation a lifecycle record names, the active `sessionId`
+// and `pending.sessionId`, is held while either named generation is unfinished; both are free once both are done.
+#[test]
+fn a_pending_conversation_is_held_until_its_generation_is_done() {
+    use crate::{agents::gens, state::evidence::publish};
+    let other = "11111111-2222-4333-8444-555555555555";
+    let end = json!({"state": "finished"});
+    for first in [1u64, 2] {
+        let w = World::human("");
+        let y = w.uncommitted(
+            Y,
+            json!({"lifecycle": 1, "generation": "1", "hcName": "m0123abcd", "sessionId": other,
+            "pending": {"gen": 2, "hcName": "m4567cdef", "sessionId": SESSION_ID}}),
+        );
+        publish(&gens::path(&y, 1, "commit"), &json!({"committed": true})).unwrap();
+        publish(&gens::path(&y, 2, "commit"), &json!({"committed": true})).unwrap();
+        cf::online(&w);
+        let core = crate::hc::connect(&w.ctx).unwrap();
+        // [the active generation's conversation, the pending generation's]
+        let held = || [other, SESSION_ID].map(|s| session_held(&w.ctx, &core, ID, s).is_some());
+        assert_eq!(
+            held(),
+            [true, true],
+            "first {first}: neither generation done: both held"
+        );
+        publish(&gens::path(&y, first, "ended"), &end).unwrap();
+        assert_eq!(
+            held(),
+            [true, true],
+            "only generation {first} done: both still held"
+        );
+        publish(&gens::path(&y, 3 - first, "ended"), &end).unwrap();
+        assert_eq!(
+            held(),
+            [false, false],
+            "first {first}: both generations done: both free"
+        );
+    }
+}

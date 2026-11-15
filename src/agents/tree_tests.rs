@@ -645,7 +645,15 @@ fn of_two_racing_spawns_at_six_one_wins() {
         let c = r.caller();
         crate::agents::lock(&r.ctx, &key, || {
             let a = admit(&r.ctx, &c, &team_of(&r.ctx, &c)?.unwrap(), Standing::Person)?;
-            let all = crate::agents::resume::every_record(&r.ctx)?;
+            let mut all = Vec::new();
+            for (f, m) in crate::agents::resume::every_member(&r.ctx)? {
+                match m {
+                    crate::agents::gens::Member::Pre(v) => all.push((f, v)),
+                    crate::agents::gens::Member::Life(g) => all.push((f, g.record().clone())),
+                    crate::agents::gens::Member::Absent => {}
+                    crate::agents::gens::Member::Unreadable(e) => return Err(e),
+                }
+            }
             let rows: Vec<_> = all
                 .iter()
                 .map(|(f, v)| {
