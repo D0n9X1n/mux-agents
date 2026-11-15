@@ -301,7 +301,10 @@ impl Gen {
             committed: if held { run(pm) } else { run(am) },
             active_committed: run(am),
             finished: p_done != Some(false) && a_done != Some(false),
-            never_ran: self.active.is_none() && (self.pending.is_none() || p_void),
+            // PM call 17: a void pending generation ran nothing only once it is done (`completing` holds it), so
+            // `held` and `never_ran` are never both true.
+            never_ran: self.active.is_none()
+                && (self.pending.is_none() || (p_void && p_done == Some(true))),
             pending_done: p_done,
             active_done: a_done,
         })

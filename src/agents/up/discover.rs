@@ -410,4 +410,44 @@ mod tests {
             "a void first launch is no leader"
         );
     }
+
+    // PM call 17 (#138 QA CRITICAL): a void pending generation that `completing` still holds is not done, so the
+    // leader is held and never "ran nothing": `up` refuses it and `scope` is not Outside.
+    #[test]
+    fn a_held_void_pending_leader_is_still_a_leader() {
+        use crate::{agents::gens, state::evidence::publish};
+        let w = World::human("");
+        let (_, f) = leader(
+            &w,
+            json!({"pending": {"gen": 1, "hcName": "m0123abcd", "sessionId": "x"}, "completing": {"gen": 1}}),
+        );
+        let mut r = crate::state::fs::read_json(&f.join("record.json"))
+            .unwrap()
+            .unwrap();
+        r.as_object_mut().unwrap().remove("generation");
+        crate::state::fs::write_json(&f.join("record.json"), &r).unwrap();
+        publish(&gens::path(&f, 1, "commit"), &json!({"aborted": true})).unwrap();
+        let gens::Member::Life(g) = gens::member_of(&f) else {
+            panic!("not a lifecycle member");
+        };
+        let st = g.status().unwrap();
+        let seen = (st.held, st.finished, st.pending_done, st.never_ran);
+        assert_eq!(
+            seen,
+            (true, false, Some(false), false),
+            "held is never ran-nothing"
+        );
+        let e = up(&w, &[]).unwrap_err();
+        assert_eq!(
+            (e.code, e.check),
+            (2, "leader"),
+            "up refuses: {}",
+            e.message
+        );
+        let got = crate::agents::tree::scope(&w.ctx, &w.caller()).unwrap();
+        assert!(
+            !matches!(got, crate::agents::tree::Scope::Outside),
+            "scope is not Outside"
+        );
+    }
 }
