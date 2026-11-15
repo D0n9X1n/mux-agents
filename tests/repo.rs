@@ -1370,6 +1370,34 @@ fn skill_readme_and_wiki_say_terminal_cli_only() {
     }
 }
 
+// #137: in a herdr terminal the skill decides by one deterministic answer, `read -Count`, never by judgment: a team
+// member (`"member":true`) uses the skill; any other answer uses herdr's own skills.
+#[test]
+fn skill_decides_a_herdr_terminal_by_read_count() {
+    let skill = file_lines("skills/mux-agents/SKILL.md");
+    let start = skill
+        .iter()
+        .position(|l| l == "## When to use")
+        .expect("SKILL.md's When to use");
+    let when: String = skill[start + 1..]
+        .iter()
+        .take_while(|l| !l.starts_with("## "))
+        .map(|l| format!("{l}\n"))
+        .collect();
+    for needle in [
+        "`HC_TERMINAL_ID`",
+        "`\"<entry>\" read -Count`",
+        "`\"member\":true`",
+        "`hc --skill`",
+        "never by judgment",
+    ] {
+        assert!(
+            when.contains(needle),
+            "SKILL.md's When to use lacks {needle:?}: {when}"
+        );
+    }
+}
+
 // The person's shortcuts `cc` and `gg`: SKILL.md says how to source them and what they cannot do.
 #[test]
 fn skill_documents_shell_shortcuts() {
