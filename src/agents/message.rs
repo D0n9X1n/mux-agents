@@ -380,9 +380,15 @@ pub fn read(ctx: &Ctx, request: &Request) -> Res<Map<String, Value>> {
     // 4b-ii (part 4 F25) inserts its timeout flag here, computed before `served` is moved by the match (E0382).
     match served {
         Some(r) => {
+            // F2: `-Id` of another held message re-serves the receipt in flight, and says so.
+            let asked_other = id.is_some_and(|i| !r.ids.iter().any(|x| x == i));
             reply.insert("batch".into(), r.batch.into());
             reply.insert("ids".into(), json!(r.ids));
             reply.insert("text".into(), r.text.into());
+            if asked_other {
+                reply.insert("inFlight".into(), json!(r.ids.first()));
+                reply.insert("note".into(), "ack it first".into());
+            }
         }
         None => {
             reply.insert("batch".into(), Value::Null);
@@ -724,6 +730,38 @@ mod tests {
     use crate::error::Refusal;
     use crate::mux::Output;
     use serde_json::json;
+
+    #[test]
+    fn read_id_names_the_receipt_in_flight() {
+        let w = World::human("");
+        w.panes(&[]);
+        let mail = w.state().join("mail");
+        for id in ["1111111111111111", "3333333333333333"] {
+            crate::agents::mail::add_once(
+                &w.ctx,
+                &w.caller(),
+                "pane-1",
+                "a",
+                "%5",
+                "x",
+                id,
+                &Map::new(),
+            )
+            .unwrap();
+        }
+        let mut c = crate::agents::receipt::load(&mail, "pane-1").unwrap();
+        c.held = vec!["1111111111111111".into(), "3333333333333333".into()];
+        crate::agents::receipt::commit(&mail, "pane-1", &c).unwrap();
+        let r = |args: &[&str]| read(&w.ctx, &w.request(args)).map(Value::Object).unwrap();
+        let first = r(&["read", "-Id", "1111111111111111"]);
+        let again = r(&["read", "-Id", "3333333333333333"]);
+        assert_eq!(again["batch"], first["batch"]);
+        assert_eq!(
+            (&again["inFlight"], &again["note"]),
+            (&json!("1111111111111111"), &json!("ack it first"))
+        );
+        assert!(first.get("inFlight").is_none());
+    }
 
     #[test]
     fn the_read_verb_serves_acks_counts_and_refuses_bad_flags() {
