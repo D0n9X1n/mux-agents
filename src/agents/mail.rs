@@ -467,23 +467,29 @@ pub fn read_mail_if(
 
 /// Unread messages in `key`'s mailbox per `<from>|<pane>`, held ones included, read under the mailbox lock; never
 /// moves the offset or creates a folder.
+/// The cursor's `offset` when it ends a line of `mailbox` (`len` bytes), else 0: tolerant, as list was, so an offset
+/// past the end or inside a line counts from the start. A mailbox that cannot be opened counts from the start too.
+fn kept_offset(mailbox: &Path, offset: u64, len: u64) -> Res<u64> {
+    if offset == 0 || offset > len {
+        return Ok(0);
+    }
+    let Ok(mut f) = File::open(mailbox) else {
+        return Ok(0);
+    };
+    Ok(if byte_at(&mut f, offset - 1)? == b'\n' {
+        offset
+    } else {
+        0
+    })
+}
+
 pub fn unread_counts(ctx: &Ctx, caller: &Caller, key: &str) -> Res<HashMap<String, usize>> {
     let mail = super::server_dir(ctx, caller).join("mail");
     let found = super::lock(ctx, &super::lock_key("mail", caller, key), || {
         let c = receipt::load(&mail, key).unwrap_or_default();
         let mailbox = mail.join(format!("{key}.jsonl"));
         let len = std::fs::metadata(&mailbox).map_or(0, |m| m.len());
-        // Tolerant, as list was: an offset past the end or inside a line counts from the start.
-        let offset = match File::open(&mailbox) {
-            Ok(mut f) if c.offset > 0 && c.offset <= len => {
-                if byte_at(&mut f, c.offset - 1)? == b'\n' {
-                    c.offset
-                } else {
-                    0
-                }
-            }
-            _ => 0,
-        };
+        let offset = kept_offset(&mailbox, c.offset, len)?;
         let mut found: Vec<Value> = unread_after(&mailbox, offset)?
             .0
             .into_iter()
