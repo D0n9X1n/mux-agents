@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 
 use serde_json::{Value, json};
 
-use crate::error::{Refusal, Res};
+use crate::error::{Refusal, Res, refuse};
 use crate::parse::Client;
 
 /// How much a client may do without asking, least first, so a child is within a ceiling when it is not greater.
@@ -42,7 +42,7 @@ impl Policy {
 }
 
 // The flags each client takes a value for, as `--x v` or `--x=v`; any other dash token takes none.
-pub(crate) const CLAUDE_VALUED: [&str; 11] = [
+const CLAUDE_VALUED: [&str; 12] = [
     "--model",
     "--add-dir",
     "--session-id",
@@ -54,15 +54,18 @@ pub(crate) const CLAUDE_VALUED: [&str; 11] = [
     "--allowed-tools",
     "--disallowedTools",
     "--disallowed-tools",
+    "--prompt",
 ];
-pub(crate) const CLAUDE_BARE: [&str; 5] = [
+const CLAUDE_BARE: [&str; 7] = [
     "--continue",
     "-c",
     "--fork-session",
     "--dangerously-skip-permissions",
     "--verbose",
+    "-p",
+    "--print",
 ];
-pub(crate) const COPILOT_VALUED: [&str; 11] = [
+const COPILOT_VALUED: [&str; 11] = [
     "--model",
     "--add-dir",
     "--session-id",
@@ -77,15 +80,15 @@ pub(crate) const COPILOT_VALUED: [&str; 11] = [
 ];
 // The flags whose value is optional (`--resume [value]`, `--deny-tool [<tools>...]`): they take the next token only
 // when it is not itself a flag or `--`, as the clients' own parsers do, so they never swallow a narrowing flag.
-pub(crate) const CLAUDE_OPTIONAL: [&str; 2] = ["-r", "--resume"];
-pub(crate) const COPILOT_OPTIONAL: [&str; 5] = [
+const CLAUDE_OPTIONAL: [&str; 2] = ["-r", "--resume"];
+const COPILOT_OPTIONAL: [&str; 5] = [
     "-r",
     "--resume",
     "--deny-tool",
     "--deny-url",
     "--excluded-tools",
 ];
-pub(crate) const COPILOT_BARE: [&str; 10] = [
+const COPILOT_BARE: [&str; 10] = [
     "--continue",
     "--allow-all",
     "--yolo",
@@ -98,90 +101,121 @@ pub(crate) const COPILOT_BARE: [&str; 10] = [
     "--assisted-approval",
 ];
 
-/// The client's flags as (name, value) pairs, honouring argument boundaries: a valued flag consumes its value (so a
-/// value that looks like a flag is never read as one), and nothing after `--` is a flag. None when a dash token is
-/// not one the client is known to take: an unknown flag could change permissions in ways this does not model.
-fn parsed(
-    flags: &[String],
-    valued: &[&str],
-    optional: &[&str],
-    bare: &[&str],
-) -> Option<Vec<(String, String)>> {
+/// One run of argv tokens as the client reads it (#103 options-6e E1): a known flag with the tokens it took and the
+/// values it read, a positional, or `--` and everything after it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Arg {
+    Flag {
+        name: String,
+        tokens: Vec<String>,
+        values: Vec<String>,
+    },
+    Positional(String),
+    Rest(Vec<String>),
+}
+
+type Tables = (
+    &'static [&'static str],
+    &'static [&'static str],
+    &'static [&'static str],
+);
+
+fn tables(client: Client) -> Tables {
+    match client {
+        Client::Claude => (&CLAUDE_VALUED, &CLAUDE_OPTIONAL, &CLAUDE_BARE),
+        Client::Copilot => (&COPILOT_VALUED, &COPILOT_OPTIONAL, &COPILOT_BARE),
+    }
+}
+
+/// The one argv grammar `policy`, `policy_of` and `options::classify` read, honouring argument boundaries: a valued
+/// flag consumes its value (so a value that looks like a flag is never read as one); an optional one takes the next
+/// token only when it is not a flag; an attached short value (`-nworker`, `-nworker=blue`) is read before the `=`
+/// split; nothing after `--` is a flag. Refuses 2 `usage` for a dash token the client is not known to take (an unknown
+/// flag could change permissions in ways this does not model) and for a valued flag with no value.
+pub(crate) fn args(client: Client, argv: &[String]) -> Res<Vec<Arg>> {
+    let (valued, optional, bare) = tables(client);
     let mut out = Vec::new();
     let mut i = 0;
-    while i < flags.len() {
-        let token = flags[i].as_str();
+    while i < argv.len() {
+        let token = argv[i].as_str();
         if token == "--" {
+            out.push(Arg::Rest(argv[i..].to_vec()));
             break;
         }
         if !token.starts_with('-') || token == "-" {
-            // A positional (the task text): no permission meaning.
+            out.push(Arg::Positional(token.into()));
             i += 1;
             continue;
         }
-        let (name, inline) = match token.split_once('=') {
-            Some((n, v)) => (n, Some(v)),
-            None => (token, None),
-        };
-        // An attached short value (`-nworker`), read as the clients and `options::classify` read it.
         let takes = |n: &str| valued.contains(&n) || optional.contains(&n);
-        // Checked before the `=` split: `-nworker=blue` is `-n` with the value `worker=blue`.
         let (name, inline) = match token.get(..2) {
             Some(short) if !token.starts_with("--") && token.len() > 2 && takes(short) => {
                 (short, token.get(2..))
             }
-            _ => (name, inline),
+            _ => match token.split_once('=') {
+                Some((n, v)) => (n, Some(v)),
+                None => (token, None),
+            },
         };
-        if valued.contains(&name) {
-            let value = match inline {
-                Some(v) => v.to_string(),
-                None => {
-                    i += 1;
-                    flags.get(i)?.clone()
-                }
-            };
-            out.push((name.to_string(), value));
-        } else if optional.contains(&name) {
-            let value = match inline {
-                Some(v) => v.to_string(),
-                None => match flags.get(i + 1) {
-                    Some(next) if !next.starts_with('-') => {
-                        i += 1;
-                        next.clone()
-                    }
-                    _ => String::new(),
-                },
-            };
-            out.push((name.to_string(), value));
-        } else if bare.contains(&name) && inline.is_none() {
-            out.push((name.to_string(), String::new()));
-        } else {
-            return None;
+        if !(takes(name) || (bare.contains(&name) && inline.is_none())) {
+            return refuse(
+                2,
+                "usage",
+                format!("{name} is not a flag this client is known to take"),
+            );
         }
+        let mut tokens = vec![token.to_string()];
+        let mut values: Vec<String> = inline.map(String::from).into_iter().collect();
+        if inline.is_none() && valued.contains(&name) {
+            i += 1;
+            let Some(v) = argv.get(i) else {
+                return refuse(2, "usage", format!("{name} needs a value"));
+            };
+            tokens.push(v.clone());
+            values.push(v.clone());
+        } else if inline.is_none()
+            && optional.contains(&name)
+            && let Some(v) = argv.get(i + 1).filter(|v| !v.starts_with('-'))
+        {
+            i += 1;
+            tokens.push(v.clone());
+            values.push(v.clone());
+        }
+        out.push(Arg::Flag {
+            name: name.into(),
+            tokens,
+            values,
+        });
         i += 1;
     }
-    Some(out)
+    Ok(out)
+}
+
+/// The client's flags as (name, first value) pairs, read by `args`; None when `args` refuses.
+fn parsed(client: Client, flags: &[String]) -> Option<Vec<(String, String)>> {
+    let pairs = args(client, flags)
+        .ok()?
+        .into_iter()
+        .filter_map(|a| match a {
+            Arg::Flag { name, values, .. } => {
+                Some((name, values.into_iter().next().unwrap_or_default()))
+            }
+            _ => None,
+        });
+    Some(pairs.collect())
 }
 
 /// The policy `flags` give `client`, or None when a flag is one this cannot classify: a caller that must not guess
 /// (the replay ceiling, options-6e E2) fails closed on None. `policy` reads None as `Default`.
 pub fn policy_of(client: Client, flags: &[String]) -> Option<Policy> {
-    let (valued, optional, bare): (&[&str], &[&str], &[&str]) = match client {
-        Client::Claude => (&CLAUDE_VALUED, &CLAUDE_OPTIONAL, &CLAUDE_BARE),
-        Client::Copilot => (&COPILOT_VALUED, &COPILOT_OPTIONAL, &COPILOT_BARE),
-    };
-    parsed(flags, valued, optional, bare)?;
+    parsed(client, flags)?;
     Some(policy(client, flags))
 }
 
 /// The policy `flags` give `client`, strictest-wins and fail-closed: anything that narrows the client, and any flag
 /// this does not know, makes it `Default`, even beside a flag that would widen it.
 pub fn policy(client: Client, flags: &[String]) -> Policy {
-    let (valued, optional, bare): (&[&str], &[&str], &[&str]) = match client {
-        Client::Claude => (&CLAUDE_VALUED, &CLAUDE_OPTIONAL, &CLAUDE_BARE),
-        Client::Copilot => (&COPILOT_VALUED, &COPILOT_OPTIONAL, &COPILOT_BARE),
-    };
-    let Some(pairs) = parsed(flags, valued, optional, bare) else {
+    let Some(pairs) = parsed(client, flags) else {
         return Policy::Default;
     };
     let named = |n: &str| pairs.iter().any(|(k, _)| k == n);

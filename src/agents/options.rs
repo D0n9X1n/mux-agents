@@ -3,9 +3,7 @@
 use crate::error::{Res, refuse};
 use crate::parse::Client;
 
-use super::team::{
-    CLAUDE_BARE, CLAUDE_OPTIONAL, CLAUDE_VALUED, COPILOT_BARE, COPILOT_OPTIONAL, COPILOT_VALUED,
-};
+use super::team::{Arg, args};
 
 /// A classified launch argv.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -25,98 +23,29 @@ const SESSION: [&str; 6] = [
     "-c",
     "--fork-session",
 ];
-const CLAUDE_PROMPT_BARE: [&str; 2] = ["-p", "--print"];
-const CLAUDE_PROMPT_VALUED: [&str; 1] = ["--prompt"];
-const COPILOT_PROMPT_VALUED: [&str; 4] = ["-p", "--prompt", "-i", "--interactive"];
+/// The flags that carry the task: prompt, never options.
+const CLAUDE_PROMPT: [&str; 3] = ["-p", "--print", "--prompt"];
+const COPILOT_PROMPT: [&str; 4] = ["-p", "--prompt", "-i", "--interactive"];
 
-struct Table {
-    valued: &'static [&'static str],
-    optional: &'static [&'static str],
-    bare: &'static [&'static str],
-    prompt_bare: &'static [&'static str],
-    prompt_valued: &'static [&'static str],
-}
-
-fn table(client: Client) -> Table {
-    match client {
-        Client::Claude => Table {
-            valued: &CLAUDE_VALUED,
-            optional: &CLAUDE_OPTIONAL,
-            bare: &CLAUDE_BARE,
-            prompt_bare: &CLAUDE_PROMPT_BARE,
-            prompt_valued: &CLAUDE_PROMPT_VALUED,
-        },
-        Client::Copilot => Table {
-            valued: &COPILOT_VALUED,
-            optional: &COPILOT_OPTIONAL,
-            bare: &COPILOT_BARE,
-            prompt_bare: &[],
-            prompt_valued: &COPILOT_PROMPT_VALUED,
-        },
-    }
-}
-
-/// The flag a token names: `--x=v` and an attached short `-xv` give their inline value.
-fn split<'a>(token: &'a str, t: &Table) -> (&'a str, Option<&'a str>) {
-    let short = !token.starts_with("--") && token.len() > 2;
-    let takes =
-        |n: &str| t.valued.contains(&n) || t.optional.contains(&n) || t.prompt_valued.contains(&n);
-    if short && token.is_char_boundary(2) && takes(&token[..2]) {
-        return (&token[..2], Some(&token[2..]));
-    }
-    if let Some((n, v)) = token.split_once("=") {
-        return (n, Some(v));
-    }
-    (token, None)
-}
-
-/// E1: each token into options, session selectors (dropped) or prompt; an unknown flag refuses 2 `usage`.
+/// E1: each token into options, session selectors (dropped) or prompt, read by `team::args`, the grammar the ceiling
+/// reads; an unknown flag refuses 2 `usage`.
 pub fn classify(client: Client, argv: &[String]) -> Res<Classified> {
-    let t = table(client);
+    let prompt: &[&str] = match client {
+        Client::Claude => &CLAUDE_PROMPT,
+        Client::Copilot => &COPILOT_PROMPT,
+    };
     let mut out = Classified::default();
-    let mut i = 0;
-    while i < argv.len() {
-        let token = argv[i].as_str();
-        if token == "--" {
-            out.prompt.extend(argv[i..].iter().cloned());
-            break;
-        }
-        if !token.starts_with("-") || token == "-" {
-            out.prompt.push(token.into());
-            i += 1;
-            continue;
-        }
-        let (name, inline) = split(token, &t);
-        let valued = t.valued.contains(&name) || t.prompt_valued.contains(&name);
-        let optional = t.optional.contains(&name);
-        let bare = t.bare.contains(&name) || t.prompt_bare.contains(&name);
-        let mut taken = vec![token.to_string()];
-        if inline.is_none() && valued {
-            i += 1;
-            match argv.get(i) {
-                Some(v) => taken.push(v.clone()),
-                None => return refuse(2, "usage", format!("{name} needs a value")),
-            }
-        } else if inline.is_none() && optional {
-            if let Some(v) = argv.get(i + 1).filter(|v| !v.starts_with("-")) {
-                i += 1;
-                taken.push(v.clone());
-            }
-        } else if !(valued || optional || (bare && inline.is_none())) {
-            return refuse(
-                2,
-                "usage",
-                format!("{name} is not a flag this client is known to take"),
-            );
-        }
-        if SESSION.contains(&name) {
+    for arg in args(client, argv)? {
+        match arg {
+            Arg::Positional(p) => out.prompt.push(p),
+            Arg::Rest(rest) => out.prompt.extend(rest),
             // Dropped: the recipe chooses the session.
-        } else if t.prompt_bare.contains(&name) || t.prompt_valued.contains(&name) {
-            out.prompt.extend(taken);
-        } else {
-            out.options.extend(taken);
+            Arg::Flag { name, .. } if SESSION.contains(&name.as_str()) => {}
+            Arg::Flag { name, tokens, .. } if prompt.contains(&name.as_str()) => {
+                out.prompt.extend(tokens)
+            }
+            Arg::Flag { tokens, .. } => out.options.extend(tokens),
         }
-        i += 1;
     }
     Ok(out)
 }
@@ -269,6 +198,59 @@ mod tests {
             ceiling()
         );
         assert_eq!(policy_of(Client::Claude, &v(&["--frobnicate"])), None);
+    }
+
+    // One argv grammar: classify, the ceiling the argv gives, and replay agree for every spelling of a prompt.
+    #[test]
+    fn a_prompt_in_any_spelling_keeps_the_ceiling_its_options_give() {
+        let cases: [(Client, &str, Policy, &[&[&str]]); 2] = [
+            (
+                Client::Claude,
+                "--dangerously-skip-permissions",
+                Policy::Bypass,
+                &[
+                    &["-p", "fix"],
+                    &["--print", "fix"],
+                    &["--prompt", "fix"],
+                    &["--prompt=fix"],
+                    &["fix"],
+                    &["--", "fix"],
+                    &["-p", "--", "-x"],
+                ],
+            ),
+            (
+                Client::Copilot,
+                "--allow-all",
+                Policy::AllowAll,
+                &[
+                    &["-p", "fix"],
+                    &["-pfix"],
+                    &["-p=fix"],
+                    &["--prompt", "fix"],
+                    &["--prompt=fix"],
+                    &["-i", "fix"],
+                    &["-ifix"],
+                    &["--interactive=fix"],
+                    &["--", "fix"],
+                ],
+            ),
+        ];
+        for (client, widen, want, prompts) in cases {
+            for prompt in prompts {
+                let mut argv = v(&[widen, "--model", "x"]);
+                argv.extend(v(prompt));
+                let got = classify(client, &argv).unwrap();
+                assert_eq!(got.options, v(&[widen, "--model", "x"]), "{argv:?}");
+                assert_eq!(got.prompt, v(prompt), "{argv:?}");
+                assert_eq!(policy_of(client, &argv), Some(want), "{argv:?}");
+                assert_eq!(crate::agents::team::policy(client, &argv), want, "{argv:?}");
+                assert_eq!(
+                    replay(client, &got.options, want).ok(),
+                    Some(got.options.clone()),
+                    "{argv:?}"
+                );
+            }
+        }
     }
 
     // Every spelling the clients accept for a valued short flag (separated, attached, attached with =, =) gives one
