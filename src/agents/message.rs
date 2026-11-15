@@ -567,10 +567,6 @@ fn lease_live(ctx: &Ctx, pid: u32, marker: &Value, owner: &super::receipt::Owner
 }
 
 /// Whether the agent of `folder` is on call: a lease of its current owner is live. Reads only.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "shortcut: the board reads it from task 4 (#103)")
-)]
 pub(crate) fn on_call(ctx: &Ctx, folder: &Path) -> bool {
     let Some(owner) = owner_of_folder(folder) else {
         return false;

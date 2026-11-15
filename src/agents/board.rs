@@ -293,7 +293,7 @@ impl Rows<'_> {
             .join("agents")
             .join(id);
         let live = state == "running";
-        let (status, sent, waiting, reported, seen) =
+        let (status, sent, waiting, reported, seen, on) =
             super::lock(self.ctx, &super::lock_key("agent", self.caller, id), || {
                 let read = |name: &str| read_json(&folder.join(name)).ok().flatten();
                 let status = read("status.json");
@@ -309,7 +309,11 @@ impl Rows<'_> {
                         .and_then(parse_utc);
                     super::message::waiting_now(self.ctx, &folder, at)
                 });
-                Ok((status, read("last-sent.json"), waiting, reported, seen))
+                // W6: a live lease of the current owner; never the leader, whose unread is its badge.
+                let on = live
+                    && !super::tree::is_leader(record)
+                    && super::message::on_call(self.ctx, &folder);
+                Ok((status, read("last-sent.json"), waiting, reported, seen, on))
             })?;
         let (doing, from) = select_doing(
             status.as_ref().and_then(|s| s.get("text")),
@@ -346,6 +350,7 @@ impl Rows<'_> {
                 .copied()
                 .unwrap_or(0),
         };
+        let unread = leader_badge(self.ctx, self.caller, id, record).unwrap_or(unread);
         let mut row = Map::new();
         row.insert("name".into(), field("name"));
         row.insert("client".into(), field("client"));
@@ -371,6 +376,7 @@ impl Rows<'_> {
         );
         if live {
             let (activity, since) = activity(reported.as_ref(), seen.as_ref(), waiting, self.now);
+            let activity = listening(activity, on);
             row.insert("activity".into(), activity.into());
             row.insert("since".into(), since.map_or(Value::Null, Value::from));
             // The change's own time: names the done episode the bar marks seen.
@@ -403,6 +409,23 @@ impl Rows<'_> {
         }
         Ok(row)
     }
+}
+
+/// W6: a live lease of the current owner shows `on call`, below needs-you, above working and done.
+fn listening(word: &'static str, on_call: bool) -> &'static str {
+    if on_call && word != "blocked" {
+        "on call"
+    } else {
+        word
+    }
+}
+
+/// W6: the leader is never on call; its unread is the badge of its own mailbox (unread plus held).
+pub(crate) fn leader_badge(ctx: &Ctx, caller: &Caller, id: &str, record: &Value) -> Option<usize> {
+    super::tree::is_leader(record)
+        .then(|| super::mail::counts(ctx, caller, &super::mail::member_mailbox(id, record)).ok())
+        .flatten()
+        .map(|c| c.badge)
 }
 
 /// A live agent's activity and the seconds since it last changed, as herdr names them: what its client reported in
@@ -525,6 +548,36 @@ mod tests {
         let now = crate::util::parse_utc("2026-03-01T00:01:00Z").unwrap();
         let r = json!({"state": "done", "kind": null, "since": "2026-03-01T00:00:00.0000000Z"});
         assert_eq!(activity(Some(&r), None, None, now), ("done", Some(60)));
+    }
+
+    #[test]
+    fn on_call_ranks_below_needs_you_and_above_working() {
+        for (word, on, want) in [
+            ("working", true, "on call"),
+            ("done", true, "on call"),
+            ("idle", true, "on call"),
+            ("blocked", true, "blocked"),
+            ("working", false, "working"),
+        ] {
+            assert_eq!(listening(word, on), want, "{word} {on}");
+        }
+    }
+
+    #[test]
+    fn the_leader_shows_its_badge() {
+        let w = World::human("");
+        let leader = json!({"depth": 0, "upTeam": "t"});
+        crate::agents::mail::add_mail(&w.ctx, &w.caller(), "111111111111", "a", "%5", "hi", None)
+            .unwrap();
+        assert_eq!(
+            leader_badge(&w.ctx, &w.caller(), "111111111111", &leader),
+            Some(1)
+        );
+        assert_eq!(
+            leader_badge(&w.ctx, &w.caller(), "111111111111", &json!({"depth": 1})),
+            None,
+            "a member: none"
+        );
     }
     use crate::agents::fixture::{ID, SESSION_ID, World, write};
     use crate::agents::lock_key;

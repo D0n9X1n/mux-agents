@@ -354,9 +354,10 @@ fn render(row: &[Span], color: bool) -> String {
 }
 
 /// An agent's state as the bar draws it (S2.3): a live agent's activity as herdr names it, then the ended kinds.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum Kind {
     Blocked,
+    OnCall,
     Done,
     Working,
     Idle,
@@ -371,6 +372,7 @@ impl Kind {
     fn section(self) -> &'static str {
         match self {
             Kind::Blocked => "Needs you",
+            Kind::OnCall => "On call",
             Kind::Done => "Done",
             Kind::Idle => "Idle",
             _ => "Working",
@@ -381,6 +383,7 @@ impl Kind {
     fn live(row: &Map<String, Value>) -> Kind {
         match row.get("activity").and_then(Value::as_str) {
             Some("blocked") => Kind::Blocked,
+            Some("on call") => Kind::OnCall,
             Some("done") => Kind::Done,
             Some("idle") => Kind::Idle,
             Some(_) => Kind::Working,
@@ -403,6 +406,8 @@ impl Kind {
             (Kind::Finished, true) => "+",
             (Kind::Exit, false) => "\u{2717}",
             (Kind::Exit, true) => "x",
+            (Kind::OnCall, false) => "\u{25cc}",
+            (Kind::OnCall, true) => "o",
             (Kind::Stopped | Kind::Other, _) => "-",
         }
     }
@@ -411,6 +416,7 @@ impl Kind {
     fn word(self) -> &'static str {
         match self {
             Kind::Blocked => "needs you",
+            Kind::OnCall => "on call",
             Kind::Done => "done",
             Kind::Idle => "idle",
             _ => "working",
@@ -428,7 +434,7 @@ impl Kind {
                 ..hued(Color::Cyan)
             },
             Kind::Working => hued(Color::Green),
-            Kind::Idle | Kind::Finished | Kind::Other => DIM,
+            Kind::Idle | Kind::Finished | Kind::Other | Kind::OnCall => DIM,
             Kind::Exit => hued(Color::Red),
             Kind::Stopped => hued(Color::Yellow),
         }
@@ -2960,6 +2966,21 @@ mod tests {
     use std::cell::{Cell, RefCell};
     use std::collections::VecDeque;
     use std::rc::Rc;
+
+    #[test]
+    fn on_call_is_its_own_kind() {
+        let row = serde_json::json!({"activity": "on call"});
+        let k = Kind::live(row.as_object().unwrap());
+        assert_eq!(
+            (k, k.word(), k.glyph(false), k.glyph(true)),
+            (Kind::OnCall, "on call", "\u{25cc}", "o")
+        );
+        assert!(
+            Kind::Blocked < Kind::OnCall
+                && Kind::OnCall < Kind::Done
+                && Kind::OnCall < Kind::Working
+        );
+    }
 
     // The caller's window @1 record: read, cleared and written as a window option.
     const READ_RECORD: &str = "-N show-options -wqv -t @1 @mux-agents-sidebar-id";
