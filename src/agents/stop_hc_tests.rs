@@ -343,8 +343,20 @@ fn stopping(w: &World, lifecycle: bool) {
         },
     );
     if lifecycle {
-        let path = super::gens::path(&w.folder(ID), 0, "client");
-        crate::state::evidence::publish(&path, &json!({"pid": 150, "start": 1500})).unwrap();
+        // A3a: a lifecycle member is targeted only through its active generation's committed evidence, seeded as
+        // member_target_tests' `a_lifecycle_target_is_its_active_generation_read_once` does.
+        use crate::state::evidence::publish;
+        let f = w.folder(ID);
+        publish(
+            &super::gens::path(&f, 0, "commit"),
+            &json!({"committed": true}),
+        )
+        .unwrap();
+        publish(
+            &super::gens::path(&f, 0, "client"),
+            &json!({"pid": 150, "start": 1500}),
+        )
+        .unwrap();
     } else {
         cf::proven(w, ID, 31337, 150);
     }
