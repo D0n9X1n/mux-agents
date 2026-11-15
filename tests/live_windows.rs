@@ -1043,6 +1043,24 @@ fn team_bar_draws_the_tree_and_opens_any_row() {
     live.wait("j to grand, Enter", || {
         (live.field(&session, "#{pane_id}") == s(&grand["pane"])).then_some(())
     });
+    // Grand prints a marker on its own terminal (the fake client prints nothing else), and hc keeps it before grand
+    // stops: the output the peek file must hold.
+    let marker = format!("grand-said-{}", std::process::id());
+    let grand_pid = pid_of(&grand["sessionId"]);
+    agent(grand_pid, &["@say", &marker]);
+    let read = || {
+        String::from_utf8(
+            live.core
+                .command(&["read", &s(&grand["hcAddress"]), "--lines", "200"])
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap()
+    };
+    live.wait("hc keeps grand's marker", || {
+        read().contains(&marker).then_some(())
+    });
     agent(child_pid, &["stop", "grand"]);
     let line = live.wait("grand stays, stopped", || {
         live.call(&["capture-pane", "-e", "-p", "-t", &bars[0]])
@@ -1061,14 +1079,11 @@ fn team_bar_draws_the_tree_and_opens_any_row() {
         dim || !line.contains("\u{1b}"),
         "the ended row is dimmed where SGR is drawn: {line:?}"
     );
-    let kept = String::from_utf8(
-        live.core
-            .command(&["read", &s(&grand["hcAddress"]), "--lines", "200"])
-            .output()
-            .unwrap()
-            .stdout,
-    )
-    .unwrap();
+    let kept = read();
+    assert!(
+        kept.contains(&marker),
+        "the stopped grand keeps its marker: {kept:?}"
+    );
     live.keys(&bars[0], "jjj");
     live.call(&["send-keys", "-t", &bars[0], "Enter"]);
     let text = live.wait("the peek file", || {
@@ -1079,6 +1094,10 @@ fn team_bar_draws_the_tree_and_opens_any_row() {
             .find(|f| f.file_name().to_string_lossy().starts_with("peek-"))
             .and_then(|f| std::fs::read_to_string(f.path()).ok())
     });
+    assert!(
+        text.contains(&marker),
+        "the peek file holds grand's marker: {text:?}"
+    );
     assert_eq!(text, format!("{kept}\n-- peek: grand (q closes) --\n"));
     assert!(
         !live.screen(&bars[0]).contains("focus failed"),

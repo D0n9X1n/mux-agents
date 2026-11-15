@@ -22,6 +22,8 @@
 //! - The command line `@detach` (Unix) runs no mux-agent: it starts `/bin/sleep 600` as this client's child in a session
 //!   of its own with SIGHUP ignored, so a pane's hangup never reaches it, and answers `{"pid": <its pid>}`. It is a
 //!   descendant that outlives its pane; whoever starts one kills it.
+//! - The command line `@say\t<text>` runs no mux-agent: it prints `<text>` and a newline on the client's own stdout (its
+//!   terminal, which hc keeps) and answers `{"ok": true}`. The client prints nothing else, at start or after.
 //! - Each line read on stdin (what `send` types into the pane) is appended to `input.<pid>.log`.
 //! - Quit: `quit` (all clients) or `quit.<pid>` appearing makes the client write `exited.<pid>` (its exit code) and
 //!   exit with numeric `quit.<pid>` contents overriding `MUX_IT_EXIT`; empty, invalid or missing contents keep it.
@@ -153,7 +155,14 @@ impl Runner {
                     .replace("{dir}", &dir)
             })
             .collect();
-        let (stdout, stderr, code) = if args == ["@detach"] {
+        let (stdout, stderr, code) = if let [say_cmd, text] = args.as_slice()
+            && say_cmd == "@say"
+        {
+            match say(&mut std::io::stdout().lock(), text) {
+                Ok(()) => (json!({"ok": true}).to_string().into_bytes(), Vec::new(), 0),
+                Err(e) => (Vec::new(), format!("fake-client: {e}\n").into_bytes(), -1),
+            }
+        } else if args == ["@detach"] {
             match detach() {
                 Ok(pid) => (json!({"pid": pid}).to_string().into_bytes(), Vec::new(), 0),
                 Err(e) => (Vec::new(), format!("fake-client: {e}\n").into_bytes(), -1),
@@ -202,6 +211,12 @@ fn detach() -> std::io::Result<u32> {
 #[cfg(not(unix))]
 fn detach() -> std::io::Result<u32> {
     Err(std::io::Error::other("@detach is Unix only"))
+}
+
+/// `@say`: `text` and a newline on `out` (the client's own stdout, its terminal), flushed, so the terminal keeps it.
+fn say(out: &mut impl Write, text: &str) -> std::io::Result<()> {
+    writeln!(out, "{text}")?;
+    out.flush()
 }
 
 /// This program's file name without extension, as started (`claude`, `copilot`).
@@ -262,5 +277,16 @@ mod tests {
             assert_eq!(super::quit_code(&d, 7, 3), want);
         }
         std::fs::remove_dir_all(d).unwrap();
+    }
+
+    #[test]
+    fn say_prints_its_text_and_a_newline() {
+        let mut out = Vec::new();
+        super::say(&mut out, "grand-marker-1").unwrap();
+        super::say(&mut out, "second line").unwrap();
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "grand-marker-1\nsecond line\n"
+        );
     }
 }

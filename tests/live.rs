@@ -4476,6 +4476,27 @@ hc {}:
                 "{mux:?}: j to grand, Enter"
             );
             check(&live); // `●` follows to grand on tmux
+            // Grand prints a marker on its own terminal (the fake client prints nothing else), and hc keeps it before grand
+            // stops: the output the popup must show. One word, as `Client::text` drops blanks.
+            let marker = format!("grand-said-{}", std::process::id());
+            let grand_pid = live.client_of(s(&grand["id"]));
+            let (code, out) = live.server.command(grand_pid, &["@say", &marker]);
+            assert_eq!(code, 0, "{mux:?} @say: {out}");
+            let read = |live: &Live| {
+                let hc = live.server.core.as_ref().unwrap();
+                String::from_utf8(
+                    hc.command(&["read", s(&grand["hcAddress"]), "--lines", "200"])
+                        .output()
+                        .unwrap()
+                        .stdout,
+                )
+                .unwrap()
+            };
+            assert!(
+                eventually(Duration::from_secs(10), || read(&live).contains(&marker)),
+                "{mux:?}: hc keeps grand's marker: {:?}",
+                read(&live)
+            );
             // Stopped, grand stays in place with its state word, dimmed where the capture carries SGR (tmux: always).
             let (code, out) = live.server.command(child_pid, &["stop", "grand"]);
             assert_eq!(code, 0, "{mux:?} {out}");
@@ -4524,14 +4545,11 @@ hc {}:
                 std::fs::remove_file(&file).unwrap();
             }
             // Opening the ended grand shows its retained output (`hc read`, plain text); nothing restarts.
-            let hc = live.server.core.as_ref().unwrap();
-            let kept = String::from_utf8(
-                hc.command(&["read", s(&grand["hcAddress"]), "--lines", "200"])
-                    .output()
-                    .unwrap()
-                    .stdout,
-            )
-            .unwrap();
+            let kept = read(&live);
+            assert!(
+                kept.contains(&marker),
+                "{mux:?}: the stopped grand keeps its marker: {kept:?}"
+            );
             let last = kept
                 .lines()
                 .rev()
@@ -4547,7 +4565,9 @@ hc {}:
                         .wait("the output popup", || pagers_under(server).then_some(()));
                     let shows = || {
                         let t = client.text();
-                        t.contains("--peek:grand(qcloses)--") && t.contains(&last)
+                        t.contains("--peek:grand(qcloses)--")
+                            && t.contains(&last)
+                            && t.contains(&marker)
                     };
                     assert!(
                         eventually(Duration::from_secs(10), shows),
@@ -4563,8 +4583,13 @@ hc {}:
                         }),
                         "{mux:?}"
                     );
+                    let text = text.unwrap();
+                    assert!(
+                        text.contains(&marker),
+                        "{mux:?}: the peek file holds grand's marker: {text:?}"
+                    );
                     assert_eq!(
-                        text.unwrap(),
+                        text,
                         format!("{kept}\n-- peek: grand (q closes) --\n"),
                         "{mux:?}"
                     );
