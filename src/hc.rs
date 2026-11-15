@@ -145,6 +145,12 @@ fn address(v: &Value) -> Res<String> {
 }
 
 impl Core<'_> {
+    /// `hc send <t> <text> --json`: pasted, then Enter; hc holds it while a person drafts (W7 opt-in only).
+    pub fn send(&self, t: &str, text: &str) -> Res<()> {
+        self.call(&["send".into(), t.into(), text.into(), "--json".into()])
+            .map(|_| ())
+    }
+
     pub fn binary(&self) -> &Path {
         &self.bin
     }

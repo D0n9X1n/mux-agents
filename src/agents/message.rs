@@ -246,6 +246,55 @@ fn bounded(request: &Request, name: &str, default: i32, range: RangeInclusive<i3
     }
 }
 
+pub(crate) const NOTIFY_OPTION: &str = "@mux-agents-notify-send";
+pub const DRAFT_WARNING: &str = "warning: hc's draft hold expires; a notice may land in a draft";
+
+/// `notify -On|-Off` (W7): a person only (else 2 `authority`) sets the option on the team session.
+pub fn notify(ctx: &Ctx, request: &Request) -> Res<Map<String, Value>> {
+    notify_as(ctx, &resolve(ctx)?, request, &mut |text: &str| {
+        eprintln!("{text}")
+    })
+}
+
+/// `warn` gets the draft warning before the option is on (F11); a failed set-option refuses 1 `notify` (F12).
+pub fn notify_as(
+    ctx: &Ctx,
+    caller: &crate::caller::Caller,
+    request: &Request,
+    warn: &mut dyn FnMut(&str),
+) -> Res<Map<String, Value>> {
+    let (on, off) = (request.switch("On"), request.switch("Off"));
+    if on == off {
+        return Err(usage("notify"));
+    }
+    if caller.member.is_some() || caller.kind == Kind::Agent {
+        return refuse(2, "authority", "only a person sets notices");
+    }
+    let value = if on { "on" } else { "off" };
+    // Under the team lock (a send reads the option under it too): the warning first, then the setting (W7).
+    lock(ctx, &lock_key("spawn", caller, &caller.session), || {
+        if on {
+            warn(DRAFT_WARNING);
+        }
+        let saved = native(
+            ctx,
+            &["set-option", "-t", &caller.session, NOTIFY_OPTION, value],
+            true,
+        )
+        .is_ok_and(|o| o.code == 0);
+        if !saved {
+            return refuse(1, "notify", "the notice setting could not be saved");
+        }
+        Ok(())
+    })?;
+    let mut reply = Map::new();
+    if on {
+        reply.insert("warning".into(), DRAFT_WARNING.into());
+    }
+    reply.insert("notify".into(), value.into());
+    Ok(reply)
+}
+
 /// `read [-Wait <s>]`: the caller's unread messages, waiting up to 600 s for one. `read <name> [-Lines n]`: the
 /// pane's tail.
 pub fn read(ctx: &Ctx, request: &Request) -> Res<Map<String, Value>> {

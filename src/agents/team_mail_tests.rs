@@ -1378,3 +1378,56 @@ fn a_team_message_names_its_member_id() {
         "a person names no member"
     );
 }
+
+#[test]
+fn notices_are_opt_in_and_one_per_recipient() {
+    let w = team_world();
+    w.fakes.mux_rule("set-option", 0, "", "");
+    let r = crate::agents::message::notify_as(
+        &w.ctx,
+        &w.caller(),
+        &w.request(&["notify", "-On"]),
+        &mut |_: &str| {},
+    )
+    .unwrap();
+    assert_eq!(r["warning"], crate::agents::message::DRAFT_WARNING);
+    assert!(w.fakes.hc_calls().is_empty(), "-On sends nothing");
+    assert!(
+        w.fakes
+            .mux_calls()
+            .iter()
+            .any(|c| c.iter().any(|a| a == "@mux-agents-notify-send"))
+    );
+    w.fakes.mux_first("show-options", 0, "on\n", "");
+    online(&w);
+    cf::online(&w);
+    for t in [B, LEADER] {
+        cf::answer(
+            &w,
+            &[
+                "send",
+                &format!("t{t}"),
+                "mail from ma1: run mux-agent read",
+                "--json",
+            ],
+            "{}",
+        );
+    }
+    go(&w, Some(A), &["send", "team", "-Body", "x"]).unwrap();
+    w.fakes.mux_first("show-options", 0, "off\n", "");
+    online(&w);
+    go(&w, Some(A), &["send", "team", "-Body", "y"]).unwrap();
+    let mut c = w.caller();
+    c.member = Some(A.into());
+    assert_eq!(
+        crate::agents::message::notify_as(
+            &w.ctx,
+            &c,
+            &w.request(&["notify", "-Off"]),
+            &mut |_: &str| {}
+        )
+        .unwrap_err()
+        .check,
+        "authority"
+    );
+}

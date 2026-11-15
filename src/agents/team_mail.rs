@@ -637,6 +637,45 @@ fn crash_point() -> Res<()> {
     Ok(())
 }
 
+/// W7: with the option on, one `hc send` per recipient with an hc address; failures are dropped (the mail is durable).
+fn notices(ctx: &Ctx, caller: &Caller, sender: &Sender, recipients: &[Value]) {
+    let on = crate::mux::native(
+        ctx,
+        &[
+            "show-options",
+            "-v",
+            "-t",
+            &caller.session,
+            super::message::NOTIFY_OPTION,
+        ],
+        true,
+    )
+    .is_ok_and(|o| o.code == 0 && o.stdout.trim() == "on");
+    if !on {
+        return;
+    }
+    let Ok(core) = crate::hc::connect(ctx) else {
+        return;
+    };
+    let agents = super::server_dir(ctx, caller).join("agents");
+    for r in recipients {
+        let rec =
+            crate::state::fs::read_json(&agents.join(super::text(r.get("id"))).join("record.json"))
+                .ok()
+                .flatten();
+        if let Some(address) = rec
+            .as_ref()
+            .and_then(|r| r.get("hcAddress"))
+            .and_then(Value::as_str)
+        {
+            let _ = core.send(
+                address,
+                &format!("mail from {}: run mux-agent read", sender.name),
+            );
+        }
+    }
+}
+
 /// Delivers intent `intent` (one id) to each recipient durably (M5), then marks it done and writes `last-sent.json`;
 /// a failed save refuses 1 `mail` with `id` and `delivered`. The caller holds the agent lock of a member sender.
 #[allow(clippy::too_many_arguments)]
@@ -685,6 +724,7 @@ fn deliver(
             delivered.push(super::text(r.get("name")));
         }
         mark_done(root, owner, &id);
+        notices(ctx, caller, sender, &recipients);
         if let Some(member) = &sender.id {
             // Best effort, inside the agent lock: last-sent.json names the last message sent; a send ends a wait.
             let file = super::server_dir(ctx, caller)
