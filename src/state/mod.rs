@@ -1,6 +1,7 @@
 //! The state folder: its root, privacy checks, locks and the files inside it.
 
 pub mod acl;
+pub mod evidence;
 pub mod fs;
 pub mod lock;
 #[cfg(unix)]
