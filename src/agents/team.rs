@@ -125,6 +125,12 @@ pub(crate) enum Arg {
     Rest(Vec<String>),
 }
 
+/// Whether an argv token is a flag (or `--`): a dash and more. A lone `-` is a value, as commander reads it, after an
+/// optional-value flag as after a variadic one, and a positional anywhere else.
+fn flag_like(token: &str) -> bool {
+    token.len() > 1 && token.starts_with('-')
+}
+
 /// One client's flag tables. `inline_ends_list`: `--x=v` gives a variadic flag `v` alone. Claude's commander reads
 /// it so (its `=` branch never continues the list); Copilot's parser is not verified, so its list stays open (fail
 /// closed: a value is kept as an option, never moved into the prompt).
@@ -177,7 +183,7 @@ pub(crate) fn args(client: Client, argv: &[String]) -> Res<Vec<Arg>> {
             out.push(Arg::Rest(argv[i..].to_vec()));
             break;
         }
-        if !token.starts_with('-') || token == "-" {
+        if !flag_like(token) {
             out.push(Arg::Positional(token.into()));
             i += 1;
             continue;
@@ -210,18 +216,15 @@ pub(crate) fn args(client: Client, argv: &[String]) -> Res<Vec<Arg>> {
             values.push(v.clone());
         } else if inline.is_none()
             && optional.contains(&name)
-            && let Some(v) = argv.get(i + 1).filter(|v| !v.starts_with('-'))
+            && let Some(v) = argv.get(i + 1).filter(|v| !flag_like(v))
         {
             i += 1;
             tokens.push(v.clone());
             values.push(v.clone());
         }
         if variadic.contains(&name) && !(inline.is_some() && inline_ends_list) {
-            // Up to the next flag or `--`; a lone `-` is a value, as commander reads it.
-            while let Some(v) = argv
-                .get(i + 1)
-                .filter(|v| !(v.len() > 1 && v.starts_with('-')))
-            {
+            // Up to the next flag or `--`.
+            while let Some(v) = argv.get(i + 1).filter(|v| !flag_like(v)) {
                 i += 1;
                 tokens.push(v.clone());
                 values.push(v.clone());

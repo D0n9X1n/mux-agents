@@ -315,6 +315,35 @@ mod tests {
         }
     }
 
+    // E1: a session selector and its value are dropped together in every spelling. A lone `-` after an optional-value
+    // flag is its value (only a longer dash token is a flag), as after a variadic one, so `--resume -` reads as
+    // `--resume=-` and `-r-`.
+    #[test]
+    fn a_lone_dash_is_an_optional_value_in_every_spelling() {
+        for client in [Client::Claude, Client::Copilot] {
+            for selector in [
+                &["--resume", "-"][..],
+                &["--resume=-"],
+                &["-r", "-"],
+                &["-r-"],
+            ] {
+                let mut argv = v(selector);
+                argv.extend(v(&["--model", "x", "fix"]));
+                let got = classify(client, &argv).unwrap();
+                assert_eq!(
+                    (got.options, got.prompt),
+                    (v(&["--model", "x"]), v(&["fix"])),
+                    "{client:?} {argv:?}"
+                );
+                assert_eq!(
+                    policy_of(client, &argv),
+                    Some(Policy::Default),
+                    "{client:?} {argv:?}"
+                );
+            }
+        }
+    }
+
     // One argv grammar: classify, the ceiling the argv gives, and replay agree for every spelling of a prompt.
     #[test]
     fn a_prompt_in_any_spelling_keeps_the_ceiling_its_options_give() {
