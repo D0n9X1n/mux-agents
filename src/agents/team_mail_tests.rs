@@ -930,3 +930,43 @@ fn a_member_answers_a_person_when_parent_falls_back_to_its_pane() {
         "2 re a reply goes only to the message's sender"
     );
 }
+
+/// 120 intents of `sender` at T0.
+fn fill(w: &World, sender: &str) {
+    let dir = sends_dir(
+        &crate::agents::server_dir(&w.ctx, &w.caller()),
+        "$3",
+        sender,
+    );
+    std::fs::create_dir_all(&dir).unwrap();
+    for n in 0..120u64 {
+        crate::state::fs::write_json(
+            &dir.join(format!("{n:016x}.json")),
+            &json!({"id": format!("{n:016x}"), "at": "2026-03-01T00:00:00.0000000Z", "done": true}),
+        )
+        .unwrap();
+    }
+}
+
+#[test]
+fn the_121st_send_refuses_and_persons_are_exempt() {
+    let w = team_world();
+    w.clock("2026-03-01T00:30:00Z");
+    fill(&w, A);
+    online(&w);
+    let e = go(&w, Some(A), &["send", "leader", "-Body", "x"]);
+    assert!(e.is_err(), "the 121st refuses");
+    let e = e.unwrap_err();
+    assert_eq!(
+        (e.code, e.check, e.details["retryAt"].clone()),
+        (2, "quota", json!("2026-03-01T01:00:00.0000000Z"))
+    );
+    assert!(
+        inbox(&w, LEADER).is_empty(),
+        "a refused send delivers nothing"
+    );
+    fill(&w, "pane-1");
+    online(&w);
+    go(&w, None, &["send", "leader", "-Body", "x"]).unwrap();
+    assert_eq!(inbox(&w, LEADER).len(), 1, "persons are exempt");
+}
