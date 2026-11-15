@@ -24,6 +24,8 @@
 //!   descendant that outlives its pane; whoever starts one kills it.
 //! - The command line `@say\t<text>` runs no mux-agent: it prints `<text>` and a newline on the client's own stdout (its
 //!   terminal, which hc keeps) and answers `{"ok": true}`. The client prints nothing else, at start or after.
+//! - The command line `@sleep\t<ms>` runs no mux-agent: it sleeps `<ms>` and answers `{"slept": <ms>}`. A line
+//!   `@bg <line>` runs `<line>` on a thread beside the loop, answering in the files of its own n (#103).
 //! - Each line read on stdin (what `send` types into the pane) is appended to `input.<pid>.log`.
 //! - Quit: `quit` (all clients) or `quit.<pid>` appearing makes the client write `exited.<pid>` (its exit code) and
 //!   exit with numeric `quit.<pid>` contents overriding `MUX_IT_EXIT`; empty, invalid or missing contents keep it.
@@ -122,7 +124,14 @@ fn main() {
             taken += 1;
             let text = std::fs::read_to_string(&held).unwrap_or_default();
             for line in text.lines().filter(|l| !l.is_empty()) {
-                runner.run(line, &format!("reply.{pid}.{taken}"));
+                let base = format!("reply.{pid}.{taken}");
+                // `@bg <line>`: run beside the loop, so a long read -Wait does not block the next command (#103).
+                if let Some(rest) = line.strip_prefix("@bg ") {
+                    let (runner, rest) = (runner.clone(), rest.to_string());
+                    std::thread::spawn(move || runner.run(&rest, &base));
+                } else {
+                    runner.run(line, &base);
+                }
             }
         }
         std::thread::sleep(POLL);
@@ -136,6 +145,7 @@ fn quit_code(dir: &Path, pid: u32, fallback: i32) -> i32 {
         .unwrap_or(fallback)
 }
 
+#[derive(Clone)]
 struct Runner {
     dir: PathBuf,
     pid: u32,
@@ -162,6 +172,11 @@ impl Runner {
                 Ok(()) => (json!({"ok": true}).to_string().into_bytes(), Vec::new(), 0),
                 Err(e) => (Vec::new(), format!("fake-client: {e}\n").into_bytes(), -1),
             }
+        } else if args.len() == 2 && args[0] == "@sleep" {
+            // Live harness support (#103): a slow command with no mux-agent, for background-line tests.
+            let ms: u64 = args[1].parse().unwrap_or(0);
+            std::thread::sleep(std::time::Duration::from_millis(ms));
+            (json!({"slept": ms}).to_string().into_bytes(), Vec::new(), 0)
         } else if args == ["@detach"] {
             match detach() {
                 Ok(pid) => (json!({"pid": pid}).to_string().into_bytes(), Vec::new(), 0),
