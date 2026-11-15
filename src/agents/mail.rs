@@ -550,7 +550,9 @@ pub fn serve(
         let mut c = receipt::load(&mail, key)?;
         receipt::gate(&mail, &c)?;
         if let Some(r) = c.pending.as_ref().filter(|r| r.owner == *owner) {
-            return Ok(Some(r.clone()));
+            let r = r.clone();
+            receipt::settle(&mail, key)?;
+            return Ok(Some(r));
         }
         let (found, _) = unread_after(&mail.join(format!("{key}.jsonl")), c.offset)?;
         let messages: Vec<Value> = found.iter().map(|(m, _)| m.clone()).collect();
@@ -1053,6 +1055,41 @@ mod tests {
                 "{crossed}: the retry is retired"
             );
         }
+    }
+
+    #[test]
+    fn an_uncertain_serve_is_settled_before_its_receipt_returns() {
+        let mail = |w: &World| w.state().join("mail");
+        // Stream: the commit renamed, then its folder flush failed.
+        let w = World::human("");
+        put(&w, H1, "one");
+        crate::state::fs::fail_sync_dir(Some(&mail(&w)));
+        assert_eq!(
+            sv(&w, "a").unwrap_err().check,
+            "mail",
+            "renamed, folder not flushed"
+        );
+        let again = sv(&w, "a");
+        assert!(
+            again.is_err(),
+            "the existing receipt is not returned before its folder is on disk"
+        );
+        assert_eq!(again.unwrap_err().message, receipt::NOT_ON_DISK);
+        crate::state::fs::fail_sync_dir(None);
+        assert_eq!(sv(&w, "a").unwrap().unwrap().ids, [H1]);
+        // Held: the same for idPending (the ack of held_h1 left `uncertain`; cleared so only the serve is in doubt).
+        let w = World::human("");
+        held_h1(&w);
+        let mut c = receipt::load(&mail(&w), "pane-1").unwrap();
+        c.uncertain = None;
+        receipt::commit(&mail(&w), "pane-1", &c).unwrap();
+        crate::state::fs::fail_sync_dir(Some(&mail(&w)));
+        assert_eq!(sid(&w, "a", H1).unwrap_err().check, "mail");
+        let again = sid(&w, "a", H1);
+        assert!(again.is_err(), "the held receipt waits for its folder too");
+        assert_eq!(again.unwrap_err().message, receipt::NOT_ON_DISK);
+        crate::state::fs::fail_sync_dir(None);
+        assert_eq!(sid(&w, "a", H1).unwrap().unwrap().ids, [H1]);
     }
 
     const H3: &str = "3333333333333333";
