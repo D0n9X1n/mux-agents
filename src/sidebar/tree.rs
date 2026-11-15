@@ -27,9 +27,34 @@ fn rows(board: &Map<String, Value>) -> Vec<&Map<String, Value>> {
         .collect()
 }
 
-/// B2/B3: the leader, then each member's children directly under it, oldest `createdAt` first (ties by id). A row whose
-/// parent is not in the team, or whose chain repeats or ends elsewhere than the leader, follows at depth 1, broken;
-/// its own children are broken too. Every row is placed once, so this always ends.
+/// A running sibling's W6 rank, as the board ranks: needs you, on call, done, working, idle.
+fn live_rank(row: &Map<String, Value>) -> u8 {
+    match Kind::live(row) {
+        Kind::Blocked => 0,
+        Kind::OnCall => 1,
+        Kind::Done => 2,
+        Kind::Working => 3,
+        _ => 4,
+    }
+}
+
+/// `kids`, oldest first, with the running ones re-ordered by `live_rank` (age within a rank) in the places running rows
+/// hold; a row that is not running keeps its place, so an ended member's subtree never moves.
+fn rank_siblings<'a>(kids: &mut [&'a Map<String, Value>]) {
+    let running = |r: &Map<String, Value>| clean(r.get("state")) == "running";
+    let slots: Vec<usize> = (0..kids.len()).filter(|&i| running(kids[i])).collect();
+    let mut live: Vec<&'a Map<String, Value>> = slots.iter().map(|&i| kids[i]).collect();
+    // Stable: rows of one rank keep their age order.
+    live.sort_by_key(|r| live_rank(r));
+    for (slot, row) in slots.into_iter().zip(live) {
+        kids[slot] = row;
+    }
+}
+
+/// B2/B3: the leader, then each member's children directly under it, oldest `createdAt` first (ties by id), the running
+/// ones in their W6 rank (`rank_siblings`). A row whose parent is not in the team, or whose chain repeats or ends
+/// elsewhere than the leader, follows at depth 1, broken, oldest first; its own children are broken too. Every row is
+/// placed once, so this always ends.
 pub(super) fn order(board: &Map<String, Value>) -> Vec<Node<'_>> {
     let all = rows(board);
     let id = |r: &Map<String, Value>| clean(r.get("id"));
@@ -74,6 +99,7 @@ pub(super) fn order(board: &Map<String, Value>) -> Vec<Node<'_>> {
                 .filter(|k| !std::ptr::eq(*k, l) && parent(k) == id(r) && attached(k))
                 .collect();
             kids.sort_by_key(key);
+            rank_siblings(&mut kids);
             stack.extend(kids.into_iter().rev().map(|k| (k, depth + 1)));
         }
     }
@@ -686,6 +712,31 @@ pub(super) mod tests {
             member("Z", Some("Y"), 2, json!({})),
         ]);
         assert_eq!(shape(&lone), [s("Y", 1, true), s("Z", 1, true)]);
+    }
+
+    #[test]
+    fn siblings_follow_the_w6_rank_then_age() {
+        // W6 among the running: needs you, on call, done, working, idle, oldest first within a rank; E, stopped, keeps
+        // its age place.
+        let board = team(vec![
+            member("L", None, 1, json!({})),
+            member(
+                "E",
+                Some("L"),
+                2,
+                json!({"state": "stopped", "life": "ended"}),
+            ),
+            member("W", Some("L"), 3, json!({"activity": "working"})),
+            member("I", Some("L"), 4, json!({"activity": "idle"})),
+            member("D", Some("L"), 5, json!({"activity": "done"})),
+            member("O", Some("L"), 6, json!({"activity": "on call"})),
+            member("N", Some("L"), 7, json!({"activity": "blocked"})),
+            member("P", Some("L"), 8, json!({"activity": "on call"})),
+            member("c", Some("W"), 9, json!({"activity": "working"})),
+            member("b", Some("W"), 10, json!({"activity": "on call"})),
+        ]);
+        let ids: Vec<_> = walk(&board).into_iter().map(|t| t.id).collect();
+        assert_eq!(ids, ["L", "E", "N", "O", "P", "D", "W", "b", "c", "I"]);
     }
 
     fn golden() -> Map<String, Value> {
