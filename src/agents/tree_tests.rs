@@ -1569,6 +1569,55 @@ fn the_hook_chain_proves_and_a_non_shell_link_is_tagged() {
     );
 }
 
+// A2a with 4b-ii: a lifecycle member with stored options reports done over its D1 hook chain while an owner-matched
+// `read -Wait` lease is live: the caller is proven, done is recorded, and the lease stays.
+#[test]
+fn a_lifecycle_member_reports_done_over_its_hook_chain_and_keeps_its_lease() {
+    let mut m = member_world();
+    let mut r = m.record(ID);
+    (r["lifecycle"], r["options"]) = (json!(1), json!(["--model", "x"]));
+    write(&m.folder(ID).join("record.json"), r);
+    m.w.fakes.process(crate::testing::row(77, 1, 770));
+    let lease = m.folder(ID).join("waiting-77.json");
+    write(
+        &lease,
+        json!({"pid": 77, "start": 770, "since": "2026-10-29T12:00:00.0000000Z",
+            "owner": {"id": ID, "gen": "0"}, "until": "2999-01-01T00:00:00.0000000Z"}),
+    );
+    m.hc();
+    let t = term(&m.r, Some(150));
+    // The explicit resolution, report's own, then report's snapshot of LEADER, ID and OTHER.
+    m.rounds(2, &t);
+    cf::online(&m.w);
+    cf::listing(&m.w, &crate::agents::membership::team(&m.c), &[]);
+    let mut all: Vec<(String, Value)> = [LEADER, ID, OTHER]
+        .iter()
+        .map(|id| {
+            let r = m.record(id);
+            let wire = if *id == ID { t.clone() } else { cf::wire(&r) };
+            (r["hcAddress"].as_str().unwrap().to_string(), wire)
+        })
+        .collect();
+    all.sort_by(|a, b| a.0.cmp(&b.0));
+    for (address, wire) in all {
+        cf::get(&m.w, &address, wire);
+    }
+    assert_eq!(
+        crate::caller::hc::resolve(&m.w.ctx)
+            .unwrap()
+            .member
+            .as_deref(),
+        Some(ID),
+        "the hook chain proves the lifecycle member"
+    );
+    let got = crate::agents::view::report(&m.w.ctx, &m.w.request(&["report", "done"]));
+    assert_eq!(got.map(|r| r["state"].clone()), Ok(json!("done")));
+    let activity = crate::state::fs::read_json(&m.folder(ID).join("activity.json"));
+    assert_eq!(activity.unwrap().unwrap()["state"], "done");
+    assert!(lease.exists(), "the live lease of the current owner stays");
+    m.w.fakes.hc_done().unwrap();
+}
+
 // E2: the level a lifecycle parent grants is read from its options, not from a folder-level spec.
 #[test]
 fn a_lifecycle_parents_level_is_read_from_its_options() {
