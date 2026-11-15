@@ -391,12 +391,29 @@ fn flag(request: &Request, name: &str) -> Res<Option<String>> {
 }
 
 /// A team send: members (hc- or pane-proven) and persons route through the team under the team lock (M1, M2). A
-/// non-member agent pane, and a person whose name the team lacks, get `Legacy`.
+/// non-member agent pane, and a person whose name the team lacks, get `Legacy`. The 0.2 path has no intents and
+/// no replies, so `-Id` and `-Re` refuse there before anything is written (QA fix 2).
 pub fn route(ctx: &Ctx, caller: &Caller, request: &Request, body: &str) -> Res<Routed> {
     let (re, id) = (flag(request, "Re")?, flag(request, "Id")?);
     if re.is_some() && id.is_some() {
         return Err(super::usage("send"));
     }
+    match route_team(ctx, caller, request, body, re, id)? {
+        Routed::Legacy(_) if request.value("Re").is_some() || request.value("Id").is_some() => {
+            refuse(2, "usage", "-Id and -Re work only inside a team")
+        }
+        routed => Ok(routed),
+    }
+}
+
+fn route_team(
+    ctx: &Ctx,
+    caller: &Caller,
+    request: &Request,
+    body: &str,
+    re: Option<String>,
+    id: Option<String>,
+) -> Res<Routed> {
     let word = request
         .positional
         .first()
@@ -407,11 +424,7 @@ pub fn route(ctx: &Ctx, caller: &Caller, request: &Request, body: &str) -> Res<R
             .iter()
             .any(|l| l.stored.record.get("hcAddress").is_some());
     if !team {
-        return if re.is_some() || id.is_some() {
-            Err(super::usage("send"))
-        } else {
-            Ok(Routed::Legacy(None))
-        };
+        return Ok(Routed::Legacy(None));
     }
     let t = target(word)?;
     // Lock order (M2): team, then (in deliver) the agent of the sender, then each mailbox.

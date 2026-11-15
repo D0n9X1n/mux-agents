@@ -554,6 +554,28 @@ fn a_non_member_agent_pane_keeps_0_2() {
         "the 0.2 reply"
     );
     assert_eq!(inbox(&w, "pane-4").len(), 1);
+    // QA fix 2: the 0.2 path has no intents and no replies, so it refuses -Id and -Re before anything is written.
+    for args in [
+        &[
+            "send",
+            "parent",
+            "-BodyFile",
+            "b.md",
+            "-Id",
+            "ffffffffffffffff",
+        ][..],
+        &["send", "%4", "-BodyFile", "b.md", "-Re", "ffffffffffffffff"][..],
+    ] {
+        online(&w);
+        let r = go(&w, None, args);
+        assert!(r.is_err(), "{args:?} on the 0.2 path: {r:?}");
+        assert_eq!(
+            said(r.unwrap_err()),
+            "2 usage -Id and -Re work only inside a team",
+            "{args:?}"
+        );
+    }
+    assert_eq!(inbox(&w, "pane-4").len(), 1, "nothing appended");
 }
 
 #[test]
