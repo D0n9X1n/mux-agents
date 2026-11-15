@@ -428,6 +428,28 @@ fn occupies(argv: &[String], session: &str) -> bool {
     })
 }
 
+/// R1, R5: every member folder of every server folder of the state root, classified once, links kept.
+pub(crate) fn every_member(ctx: &Ctx) -> Res<Vec<(PathBuf, super::gens::Member)>> {
+    let servers = match std::fs::read_dir(&ctx.state_root) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(e.into()),
+    };
+    let mut all = Vec::new();
+    for server in servers {
+        let agents = server?.path().join("agents");
+        if !agents.is_dir() {
+            continue;
+        }
+        all.extend(
+            super::gens::members(&agents)?
+                .into_iter()
+                .map(|(_, folder, m)| (folder, m)),
+        );
+    }
+    Ok(all)
+}
+
 /// Every member record of every server folder of the state root, with its folder; one that cannot be read fails.
 pub(crate) fn every_record(ctx: &Ctx) -> Res<Vec<(PathBuf, Value)>> {
     let mut all = Vec::new();

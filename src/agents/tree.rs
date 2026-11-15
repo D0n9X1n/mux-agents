@@ -30,19 +30,17 @@ pub fn scope(ctx: &Ctx, caller: &Caller) -> Res<Scope> {
     if let Some(found) = team::read(&team::path(&server, &caller.session))? {
         return Ok(Scope::Team(found));
     }
-    let entries = match std::fs::read_dir(server.join("agents")) {
-        Ok(e) => e,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Scope::Outside),
-        Err(e) => return Err(e.into()),
-    };
-    for entry in entries {
-        let folder = entry?.path();
-        let Some(record) = crate::state::fs::read_json(&folder.join("record.json"))? else {
-            continue;
+    // R1, R5: one `members` pass; an unreadable member under the caller's server key refuses (ambiguity 15).
+    for (_, folder, member) in super::gens::members(&server.join("agents"))? {
+        let record = match &member {
+            super::gens::Member::Absent => continue,
+            super::gens::Member::Unreadable(e) => return Err(e.clone()),
+            super::gens::Member::Pre(r) => r,
+            super::gens::Member::Life(g) => g.record(),
         };
-        if is_leader(&record)
+        if is_leader(record)
             && text(record.get("session")) == caller.session
-            && !super::up::discover::ran_nothing(&folder)
+            && !super::up::discover::ran_nothing(&folder, &member)?
         {
             return Ok(Scope::Leaderless);
         }

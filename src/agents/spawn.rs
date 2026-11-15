@@ -1800,11 +1800,14 @@ mod tests {
                 let mut full = vec!["-Client", "claude"];
                 full.extend(args);
                 let got = run(&w, &full);
-                if case == "unreadable" {
-                    assert!(got.starts_with("1 internal unexpected error ("), "{got}");
+                if case == "not JSON" || case == "unreadable" {
+                    // PM call 14 (R5): a torn record, or a folder at record.json, is Unreadable, never re-read.
+                    assert_eq!(
+                        got, "1 evidence state evidence cannot be read; retry",
+                        "{case}"
+                    );
                 } else {
                     let message = match case {
-                        "not JSON" => "state file is not JSON",
                         "not an object" => "invalid local hc record",
                         _ => "invalid local hc identity",
                     };

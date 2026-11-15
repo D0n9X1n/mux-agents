@@ -52,7 +52,7 @@ pub fn up(ctx: &Ctx, request: &Request) -> Res<Map<String, Value>> {
     let folder = identity::folder(ctx)?;
     let team = identity::team(ctx, &folder, client, request.value("Name").unwrap_or(""))?;
     admit(ctx, &format!("up|{team}"), || {
-        discover::refuse_existing(ctx, &core, &team)?;
+        discover::refuse_existing(ctx, &core, &caller.server_key, &team)?;
         create(
             ctx,
             &caller,
