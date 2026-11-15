@@ -894,6 +894,64 @@ mod tests {
     use crate::mux::Output;
     use serde_json::json;
 
+    /// SKILL.md's large-message rule, run as it is written (4b-i protocol): `read -Id` before the batch that carried the
+    /// reference is acked is refused (the id is not held yet); acking that batch, alone or combined with `-Id`, then
+    /// acking the body's own batch serves the whole body once and leaves nothing held or pending.
+    #[test]
+    fn a_large_message_is_read_in_the_skills_order_and_retired() {
+        for combined in [false, true] {
+            let w = World::human("");
+            w.panes(&[]);
+            let body = "x".repeat(5000);
+            let id = crate::agents::mail::add_mail(
+                &w.ctx,
+                &w.caller(),
+                "pane-1",
+                "a",
+                "%5",
+                &body,
+                None,
+            )
+            .unwrap();
+            let r = |args: &[&str]| read(&w.ctx, &w.request(args)).map(Value::Object);
+            let first = r(&["read"]).unwrap();
+            let stream = first["batch"].as_str().unwrap().to_string();
+            assert!(
+                first["text"]
+                    .as_str()
+                    .unwrap()
+                    .contains(&format!("run mux-agent read -Id {id}")),
+                "a reference, not the body: {first}"
+            );
+            // The old order: the reference's batch is not acked, so the id is not held.
+            let early = r(&["read", "-Id", &id]).unwrap_err();
+            assert_eq!(early.check, "usage", "{}", early.message);
+            let got = if combined {
+                r(&["read", "-Id", &id, "-Ack", &stream]).unwrap()
+            } else {
+                assert_eq!(r(&["read", "-Ack", &stream]).unwrap()["acked"], true);
+                r(&["read", "-Id", &id]).unwrap()
+            };
+            assert_eq!(got["ids"], json!([id]), "{combined}: {got}");
+            assert!(got["text"].as_str().unwrap().contains(&body), "{combined}");
+            let body_batch = got["batch"].as_str().unwrap().to_string();
+            assert_eq!(
+                r(&["read", "-Ack", &body_batch]).unwrap(),
+                json!({"acked": true})
+            );
+            let c = crate::agents::receipt::load(&w.state().join("mail"), "pane-1").unwrap();
+            assert!(
+                c.held.is_empty() && c.pending.is_none() && c.id_pending.is_none(),
+                "{combined}: retired"
+            );
+            assert_eq!(
+                r(&["read"]).unwrap(),
+                json!({"batch": null, "ids": [], "text": ""}),
+                "{combined}: nothing served again"
+            );
+        }
+    }
+
     #[test]
     fn read_id_names_the_receipt_in_flight() {
         let w = World::human("");

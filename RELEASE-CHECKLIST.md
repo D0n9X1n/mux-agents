@@ -7,6 +7,10 @@ Items a person runs by hand before a release. Record each result, with the OS an
 CI runs no authenticated client, so these run by hand with real Claude Code 2.1.325 and Copilot CLI on macOS, Linux
 and Windows (rmux there). In a project folder run `up`; from the leader spawn a Claude member A and a Copilot member B.
 
+Wherever a row records that a member quotes a nonce, also record receipt retirement, because quoting alone does not
+prove the ack: the member's `read -Ack <batch>` answers `"acked": true`, and afterwards its mailbox cursor
+(`mail/<mailbox>.cursor.json` under the state root) has no `pending` batch.
+
 1. Idle Claude self-wake: let A finish its turn and sit idle; send A a message from B. Record that A starts a turn on
    its own, with no keystroke, within 10 s, and that the turn text is
    `mux-agents mail is waiting (wake <nonce>): run mux-agent read` (8 hex digits).

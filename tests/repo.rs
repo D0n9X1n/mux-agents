@@ -2628,6 +2628,37 @@ fn skill_teaches_the_wake_and_listening_on_call() {
     }
 }
 
+/// 4b-i protocol: a referenced (large) message is held only once the stream batch that carried its reference is
+/// acked, and `read -Id` refuses an id that is not held. So SKILL.md must teach, in this order: ack the carrying
+/// batch (alone, or combined as `read -Id <id> -Ack <batch>`), then fetch the body, then ack the body's own batch.
+#[test]
+fn skill_teaches_a_large_message_in_the_protocols_order() {
+    let skill = repo_file("skills/mux-agents/SKILL.md");
+    let line = skill
+        .lines()
+        .find(|l| l.contains("names a large message"))
+        .expect("SKILL.md has the large-message rule");
+    let at = |s: &str| {
+        line.find(s)
+            .unwrap_or_else(|| panic!("the large-message rule lacks {s}: {line}"))
+    };
+    let steps = [
+        "ack the batch that carried it first",
+        "`read -Ack <batch>`, then `read -Id <id>`",
+        "`read -Id <id> -Ack <batch>`",
+        "`read -Ack <body-batch>`",
+    ];
+    let places: Vec<usize> = steps.iter().map(|s| at(s)).collect();
+    assert!(
+        places.windows(2).all(|w| w[0] < w[1]),
+        "the steps are out of order: {line}"
+    );
+    assert!(
+        !skill.contains("run `read -Id <id>`, then ack its batch"),
+        "SKILL.md still fetches the body before acking the batch that carried it"
+    );
+}
+
 #[test]
 fn the_release_checklist_names_the_4b_real_client_gate() {
     let list = std::fs::read_to_string("RELEASE-CHECKLIST.md").unwrap_or_default();
@@ -2651,6 +2682,10 @@ fn the_release_checklist_names_the_4b_real_client_gate() {
         "Ctrl-C",
         "on a wake, runs read and quotes the nonce",
         "mux-agents mail is waiting (wake <nonce>): run mux-agent read",
+        // Quoting the nonce does not prove the ack: the receipt must be retired too.
+        "receipt retirement",
+        r#""acked": true"#,
+        "no `pending`",
     ] {
         assert!(list.contains(want), "RELEASE-CHECKLIST.md lacks {want}");
     }
