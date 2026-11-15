@@ -1794,6 +1794,32 @@ mod tests {
         );
     }
 
+    #[test]
+    fn send_and_status_keep_a_live_lease_of_the_current_owner_and_prune_a_reused_pid() {
+        let w = waiting_world();
+        // A pane-only 0.2 record (no hc fields, so no generation): `owner_of_folder` reads it as generation "0".
+        w.agent_record(ID, json!({"pane": "%1", "parentPane": "%4"}));
+        w.fakes.process(crate::testing::row(79, 1, 790));
+        lease(&w, 79, ID, LATER); // live, this owner, future until
+        w.fakes.process(crate::testing::row(81, 1, 999));
+        lease(&w, 81, ID, LATER); // pid 81 reused: recorded start 810, now 999
+        w.file("b.md", b"done");
+        assert!(run(&w, send, &["send", "parent", "-BodyFile", "b.md"]).starts_with("ok "));
+        assert_eq!(
+            waiting_names(&w),
+            ["waiting-79.json"],
+            "send keeps the live lease, prunes the reused pid"
+        );
+        assert!(on_call(&w.ctx, &w.folder(ID)));
+        let status = crate::agents::view::status;
+        assert!(run(&w, status, &["status", "-BodyFile", "b.md"]).starts_with("ok "));
+        assert_eq!(
+            waiting_names(&w),
+            ["waiting-79.json"],
+            "status keeps it too"
+        );
+    }
+
     fn other_wait(w: &World) {
         write(
             &w.folder(ID).join("waiting-77.json"),
