@@ -2627,3 +2627,35 @@ fn skill_teaches_the_wake_and_listening_on_call() {
         );
     }
 }
+
+#[test]
+fn the_release_checklist_names_the_4b_real_client_gate() {
+    let list = std::fs::read_to_string("RELEASE-CHECKLIST.md").unwrap_or_default();
+    for want in [
+        "## 4b real clients",
+        "Claude Code 2.1.325",
+        "Copilot CLI",
+        "macOS",
+        "Linux",
+        "Windows",
+        "self-wake",
+        "nonce",
+        "MUX_AGENTS_WAKE=0",
+        "report done",
+        "on call",
+        "read -Count",
+        "tagged",
+        "release PR",
+        "killed",
+        "refuses the wake",
+        "Ctrl-C",
+        "on a wake, runs read and quotes the nonce",
+        "mux-agents mail is waiting (wake <nonce>): run mux-agent read",
+    ] {
+        assert!(list.contains(want), "RELEASE-CHECKLIST.md lacks {want}");
+    }
+    assert!(
+        !list.contains("without running read"),
+        "the wake turn carries no mail (PM, fix cycle 2)"
+    );
+}
