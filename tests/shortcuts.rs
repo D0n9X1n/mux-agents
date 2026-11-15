@@ -66,7 +66,7 @@ fn assert_up_refused(shell: &str, function: &str, out: &Output) {
 fn bash_cc_and_gg_reach_up_through_the_real_entry() {
     let file = Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts/shell/mux-agents.sh");
     for function in ["cc", "gg"] {
-        let line = format!(". \"$1\" && {function} --model 'a b' -Text");
+        let line = format!(". \"$1\" && {function} --model 'a b' fix");
         let Some(out) = run(
             "bash",
             &[
@@ -89,7 +89,7 @@ fn pwsh_cc_and_gg_reach_up_through_the_real_entry() {
     let file = Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts/shell/mux-agents.ps1");
     for function in ["cc", "gg"] {
         let line = format!(
-            ". '{}'; {function} --model 'a b' -Text; exit $LASTEXITCODE",
+            ". '{}'; {function} --model 'a b' fix; exit $LASTEXITCODE",
             file.display()
         );
         let Some(out) = run(

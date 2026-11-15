@@ -26,7 +26,10 @@ pub const OUTSIDE: &str = "up needs tmux or rmux for now";
 
 struct Plan<'a> {
     client: Client,
-    flags: &'a [String],
+    /// The client options of the person (options-6e E1): the leader replays them, the ceiling is fixed from them.
+    options: &'a [String],
+    /// The prompt tokens of the person: run once, never replayed.
+    prompt: &'a [String],
     folder: &'a Path,
     team: &'a str,
 }
@@ -36,6 +39,8 @@ pub fn up(ctx: &Ctx, request: &Request) -> Res<Map<String, Value>> {
         .value("Client")
         .and_then(client_named)
         .ok_or_else(|| usage("up"))?;
+    // E1: an unknown client flag refuses usage before anything is made or connected; session selectors are dropped.
+    let classified = super::options::classify(client, &request.rest)?;
     // Windows accepts a relative MUX_AGENTS_STATE. `hold` and the launcher take only an absolute root, and `up` cannot
     // hand its later steps another root (they read ctx.state_root); a verb or bar run later would also resolve the same
     // text against its own folder. So a relative root is refused before anything is made (#103).
@@ -54,7 +59,8 @@ pub fn up(ctx: &Ctx, request: &Request) -> Res<Map<String, Value>> {
             &core,
             &Plan {
                 client,
-                flags: &request.rest,
+                options: &classified.options,
+                prompt: &classified.prompt,
                 folder: &folder,
                 team: &team,
             },
@@ -148,7 +154,8 @@ fn create(ctx: &Ctx, caller: &Caller, core: &Core<'_>, plan: &Plan<'_>) -> Res<M
     step2.set(true);
     let leader = Leader {
         team: plan.team.into(),
-        flags: plan.flags.to_vec(),
+        options: plan.options.to_vec(),
+        prompt: plan.prompt.to_vec(),
     };
     let record = lock(ctx, &lock_key("spawn", &dest, &dest.session), || {
         server::same(ctx, &dest)?;
@@ -232,8 +239,8 @@ fn write_team(ctx: &Ctx, dest: &Caller, plan: &Plan<'_>, name: &str, record: &Va
         name: name.into(),
         directory: utf8(plan.folder)?.into(),
         client: plan.client,
-        flags: plan.flags.to_vec(),
-        policy: team::policy(plan.client, plan.flags),
+        flags: plan.options.to_vec(),
+        policy: team::policy(plan.client, plan.options),
         leader: text(record.get("id")),
         created_at: crate::util::utc_o(ctx.clock.now()),
     };

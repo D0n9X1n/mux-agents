@@ -98,10 +98,10 @@ fn team_file(w: &World) -> PathBuf {
 fn up_creates_the_team_in_a_new_session() {
     let w = ready();
     let key = w.caller().server_key;
-    let flags = ["--model", "a b", "-Text", "\"q\""];
+    let (prompt, options) = (["\"q\""], ["--model", "a b"]);
     let reply = run(
         &w,
-        &[&["up", "-Client", "claude", "--"][..], &flags].concat(),
+        &[&["up", "-Client", "claude", "--"][..], &prompt, &options].concat(),
     )
     .unwrap();
     let (t, name, id) = (
@@ -158,13 +158,21 @@ fn up_creates_the_team_in_a_new_session() {
         (&r["depth"], &r["parentPane"], &r["upTeam"], &r["session"]),
         (&json!(0), &Value::Null, &json!(t), &json!("$7"))
     );
+    let spec = crate::state::fs::read_json(&agents(&w).join(&id).join("spec.json"))
+        .unwrap()
+        .unwrap();
     assert_eq!(
-        crate::state::fs::read_json(&agents(&w).join(&id).join("spec.json"))
-            .unwrap()
-            .unwrap()["flags"],
-        json!(flags)
+        spec["flags"],
+        json!(options),
+        "only the options are client flags"
+    );
+    assert_eq!(spec["args"].as_array().unwrap().last().unwrap(), "\"q\"");
+    assert_eq!(
+        (&r["options"], &r["prompt"]),
+        (&json!(options), &json!(prompt))
     );
     let team = crate::agents::team::read(&team_file(&w)).unwrap().unwrap();
+    assert_eq!(team.flags, options, "the ceiling is fixed from the options");
     assert_eq!(
         (team.team.as_str(), team.name.as_str(), team.leader.as_str()),
         (t.as_str(), name.as_str(), id.as_str())
@@ -549,4 +557,112 @@ fn up_publishes_a_whole_release_marker() {
         .map(|e| std::fs::read(e.unwrap().path()).unwrap())
         .collect();
     assert_eq!(bodies, [b"{}".to_vec()]);
+}
+
+// E1: an unknown client flag refuses usage before anything is made, connected or launched.
+#[test]
+fn an_unknown_client_flag_refuses_before_anything_is_made() {
+    let w = ready();
+    let (mux, hc) = (w.fakes.mux_calls().len(), w.fakes.hc_calls().len());
+    assert!(
+        !w.ctx.state_root.exists(),
+        "premise: nothing has made the state root yet"
+    );
+    let before = crate::testing::tree(&w.ctx.state_root);
+    let e = run(
+        &w,
+        &[
+            "up",
+            "-Client",
+            "claude",
+            "--",
+            "--frobnicate",
+            "--model",
+            "x",
+        ],
+    )
+    .unwrap_err();
+    assert_eq!((e.code, e.check), (2, "usage"));
+    assert_eq!(
+        w.fakes.mux_calls().len(),
+        mux,
+        "no session, no server check"
+    );
+    assert_eq!(
+        w.fakes.hc_calls().len(),
+        hc,
+        "nothing connected, nothing launched"
+    );
+    assert_eq!(
+        crate::testing::tree(&w.ctx.state_root),
+        before,
+        "nothing made"
+    );
+}
+
+// E1/E2: the ceiling is fixed at team creation from the options alone; bypass options give a Bypass team.
+#[test]
+fn up_fixes_the_team_ceiling_from_its_options() {
+    use crate::agents::team::{Policy, permission_flags};
+    let w = ready();
+    let mut options = permission_flags(Client::Claude, Policy::Bypass);
+    options.extend(["--model".to_string(), "x".to_string()]);
+    let mut argv: Vec<&str> = vec!["up", "-Client", "claude", "--", "fix"];
+    argv.extend(options.iter().map(String::as_str));
+    run(&w, &argv).unwrap();
+    let team = crate::agents::team::read(&team_file(&w)).unwrap().unwrap();
+    assert_eq!(
+        (team.flags.clone(), team.policy),
+        (options, Policy::Bypass),
+        "the stored ceiling"
+    );
+}
+
+// E1: a session selector given to `up` is never stored and never reaches the client: the recipe alone chooses the
+// session, then the prompt follows.
+#[test]
+fn up_drops_a_session_selector_and_runs_the_recipes_session() {
+    let w = ready();
+    let argv = [
+        "up",
+        "-Client",
+        "claude",
+        "--",
+        "fix",
+        "--resume",
+        "SEL9",
+        "--model",
+        "x",
+        "--session-id=SEL8",
+    ];
+    let id = run(&w, &argv).unwrap()["leader"]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let read = |f: &str| {
+        crate::state::fs::read_json(&agents(&w).join(&id).join(f))
+            .unwrap()
+            .unwrap()
+    };
+    let (r, spec) = (read("record.json"), read("spec.json"));
+    assert_eq!(
+        (&r["options"], &r["prompt"]),
+        (&json!(["--model", "x"]), &json!(["fix"]))
+    );
+    assert_eq!(spec["flags"], json!(["--model", "x"]));
+    assert_eq!(
+        spec["args"],
+        json!(["--session-id", r["sessionId"], "fix"]),
+        "the recipe's session, then the prompt"
+    );
+    let hc_run = w
+        .fakes
+        .hc_calls()
+        .into_iter()
+        .find(|(_, a, _)| a[0] == "run")
+        .unwrap()
+        .1;
+    for seen in [r.to_string(), spec.to_string(), hc_run.join(" ")] {
+        assert!(!seen.contains("SEL9") && !seen.contains("SEL8"), "{seen}");
+    }
 }
