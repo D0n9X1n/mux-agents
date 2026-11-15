@@ -1364,3 +1364,176 @@ fn an_unacked_batch_is_served_again_and_rebuilt_for_a_successor() {
     assert_eq!(rebuilt["ids"], pending["ids"]);
     assert_ne!(rebuilt["batch"], pending["batch"]);
 }
+
+/// Posts a background line (`@bg`) to member `id`, once its client took the previous command; the path of its reply.
+fn post_bg(live: &Live, sent: &mut HashMap<u32, usize>, id: &str, args: &[&str]) -> PathBuf {
+    let pid = client_pid(
+        live,
+        &s(&member_file(live, id, "record.json")["sessionId"]),
+        0,
+    );
+    let n = sent.entry(pid).or_default();
+    *n += 1;
+    let cmd = live.dir.join(format!("cmd.{pid}"));
+    live.wait("client took its last command", || {
+        (!cmd.exists()).then_some(())
+    });
+    let held = live.dir.join(format!("cmd.{pid}.part"));
+    std::fs::write(&held, format!("@bg {}\n", args.join("\t"))).unwrap();
+    std::fs::rename(held, &cmd).unwrap();
+    live.dir.join(format!("reply.{pid}.{n}.json"))
+}
+
+#[test]
+fn a_copilot_member_reports_done_then_listens_on_call() {
+    let Some(live) = Live::start() else { return };
+    let (task, brief, body) = (
+        live.dir.join("task.txt"),
+        live.dir.join("brief.md"),
+        live.dir.join("body.md"),
+    );
+    for (p, t) in [(&task, "say hi"), (&brief, "brief"), (&body, "nonce-7f3a")] {
+        std::fs::write(p, t).unwrap();
+    }
+    let (task, brief, body) = (
+        task.display().to_string(),
+        brief.display().to_string(),
+        body.display().to_string(),
+    );
+    let leader = s(&live.run(&["up", "-Client", "claude"])["leader"]["id"]);
+    let mut sent = HashMap::new();
+    let spawn = |sent: &mut HashMap<u32, usize>, client: &str, name: &str| {
+        s(&by(
+            &live,
+            sent,
+            &leader,
+            &[
+                "spawn",
+                "-Client",
+                client,
+                "-TaskFile",
+                &task,
+                "-BriefFile",
+                &brief,
+                "-Context",
+                "brief",
+                "-Name",
+                name,
+            ],
+        )["id"])
+    };
+    let (a, b) = (
+        spawn(&mut sent, "claude", "a"),
+        spawn(&mut sent, "copilot", "b"),
+    );
+    let on_call = |live: &Live| {
+        live.run(&["list", "-All"])["agents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|x| x["name"] == "b" && x["activity"] == "on call")
+    };
+    assert_eq!(
+        by(&live, &mut sent, &b, &["report", "done"])["state"],
+        "done"
+    );
+    let reply = post_bg(&live, &mut sent, &b, &["read", "-Wait", "600"]);
+    live.wait("on call", || on_call(&live).then_some(()));
+    by(&live, &mut sent, &a, &["send", "b", "-BodyFile", &body]);
+    // Sender exit: A leaves before B collects; the mail is durable, the wait still returns it.
+    let a_pid = client_pid(
+        &live,
+        &s(&member_file(&live, &a, "record.json")["sessionId"]),
+        0,
+    );
+    std::fs::write(live.dir.join(format!("quit.{a_pid}")), "0").unwrap();
+    live.wait("sender exit", || {
+        live.dir
+            .join(format!("exited.{a_pid}"))
+            .exists()
+            .then_some(())
+    });
+    let got: Value =
+        serde_json::from_str(&live.wait("batch", || std::fs::read_to_string(&reply).ok())).unwrap();
+    assert!(s(&got["text"]).contains("nonce-7f3a"), "{got}");
+    let t = by(
+        &live,
+        &mut sent,
+        &b,
+        &["read", "-Wait", "1", "-Ack", &s(&got["batch"])],
+    );
+    assert_eq!(
+        (&t["acked"], &t["timeout"]),
+        (&serde_json::json!(true), &serde_json::json!(true)),
+        "{t}"
+    );
+    let reply = post_bg(&live, &mut sent, &b, &["read", "-Wait", "600"]);
+    live.wait("on call", || on_call(&live).then_some(()));
+    assert_eq!(
+        by(&live, &mut sent, &b, &["read", "-Cancel"])["cancelled"],
+        true
+    );
+    let c: Value =
+        serde_json::from_str(&live.wait("cancelled", || std::fs::read_to_string(&reply).ok()))
+            .unwrap();
+    assert_eq!(c["cancelled"], true);
+    by(
+        &live,
+        &mut sent,
+        &leader,
+        &["send", "b", "-BodyFile", &body],
+    );
+    let d1 = by(&live, &mut sent, &b, &["read", "-Deliver"]);
+    assert_eq!(
+        by(&live, &mut sent, &b, &["read", "-Deliver"])["batch"],
+        d1["batch"],
+        "no -Ack: re-served"
+    );
+    let mail = std::fs::read_dir(live.dir.join("state"))
+        .unwrap()
+        .map(|e| e.unwrap().path().join("mail"))
+        .find(|p| p.is_dir())
+        .unwrap();
+    std::fs::write(mail.join("fault-file"), "").unwrap();
+    assert_eq!(
+        by(&live, &mut sent, &b, &["read", "-Ack", &s(&d1["batch"])])["check"],
+        "mail"
+    );
+    std::fs::write(mail.join("fault-folder"), "").unwrap();
+    assert_eq!(
+        by(&live, &mut sent, &b, &["read", "-Ack", &s(&d1["batch"])])["check"],
+        "mail"
+    );
+    assert_eq!(
+        by(&live, &mut sent, &b, &["read", "-Ack", &s(&d1["batch"])])["duplicate"],
+        true
+    );
+    // A tagged hook: a process with the terminal id of b, outside its client chain and outside rmux.
+    let addr = s(&member_file(&live, &b, "record.json")["hcAddress"]);
+    let (script, out, done) = (
+        live.dir.join("tagged.cmd"),
+        live.dir.join("tagged.json"),
+        live.dir.join("tagged.done"),
+    );
+    std::fs::write(
+        &script,
+        [
+            "@echo off",
+            "set RMUX=",
+            "set TMUX=",
+            &format!("set HC_TERMINAL_ID={addr}"),
+            &format!("\"{MUX_AGENT}\" read -Count > \"{}\"", out.display()),
+            &format!("echo done> \"{}\"", done.display()),
+        ]
+        .join("\r\n"),
+    )
+    .unwrap();
+    live.line(&live.root, &format!("cmd /d /c \"{}\"", script.display()));
+    live.wait("tagged hook", || done.exists().then_some(()));
+    assert_eq!(
+        serde_json::from_str::<Value>(&std::fs::read_to_string(&out).unwrap()).unwrap()["check"],
+        "tagged"
+    );
+    let screen = live.call(&["capture-pane", "-p", "-t", &live.root]);
+    assert!(!screen.contains("mail from"), "no notice typed: {screen}");
+}
