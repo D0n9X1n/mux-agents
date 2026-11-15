@@ -2722,3 +2722,21 @@ fn generation_evidence_is_read_only_through_gens() {
         }
     }
 }
+
+#[test]
+fn readme_and_wiki_name_the_herdr_core_dependency() {
+    // v0.3.0 runs every agent in a herdr-core (`hc`) terminal; the docs must say so, with the version hc.rs checks.
+    let readme = repo_file("README.md");
+    assert!(
+        readme.contains("herdr-core 0.1.21"),
+        "README.md names herdr-core 0.1.21"
+    );
+    assert!(
+        file_lines("wiki/Usage.md").contains(&"- herdr-core 0.1.21 or later, with `hc` (or `herdr-core`) on `PATH`: every agent runs in an hc terminal.".to_string()),
+        "wiki Usage requirements line"
+    );
+    assert!(
+        file_lines("wiki/Usage-zh-CN.md").contains(&"- herdr-core 0.1.21 或更高版本，且 `PATH` 上有 `hc`（或 `herdr-core`）：每个代理都在 hc 终端中运行。".to_string()),
+        "wiki Usage-zh-CN requirements line"
+    );
+}

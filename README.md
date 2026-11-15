@@ -13,6 +13,7 @@ Start Claude Code and Copilot CLI agents in tmux or rmux panes, see what each is
   <br>
   <a href="https://github.com/tmux/tmux"><img src="https://img.shields.io/badge/tmux-3.2%2B-1bb91f" alt="tmux 3.2+"></a>
   <a href="https://github.com/D0n9X1n/mux-agents/wiki/Usage#requirements"><img src="https://img.shields.io/badge/rmux-0.10%2B-a78bfa" alt="rmux 0.10+"></a>
+  <a href="https://github.com/D0n9X1n/mux-agents/wiki/Usage#requirements"><img src="https://img.shields.io/badge/herdr--core-0.1.21%2B-f59e0b" alt="herdr-core 0.1.21+"></a>
   <a href="https://github.com/D0n9X1n/mux-agents#quick-start"><img src="https://img.shields.io/badge/Claude%20Code-plugin-d97757" alt="Claude Code plugin"></a>
   <a href="https://github.com/D0n9X1n/mux-agents#quick-start"><img src="https://img.shields.io/badge/Copilot%20CLI-plugin-24292f?logo=githubcopilot&amp;logoColor=white" alt="Copilot CLI plugin"></a>
 </p>
@@ -50,6 +51,8 @@ copilot plugin marketplace add D0n9X1n/mux-agents && copilot plugin install mux-
 ```
 
 Terminal CLI only (Claude Code or Copilot CLI inside tmux or rmux); the desktop app and other non-terminal surfaces are skipped.
+
+Requires herdr-core 0.1.21 or later, with `hc` (or `herdr-core`) on `PATH`: every agent runs in an hc terminal, so it keeps running when its pane closes.
 
 Start the client inside tmux or rmux, then just ask: *"spawn a Copilot agent to review the diff, a Claude agent to write the parser tests, and open the side bar"*.
 

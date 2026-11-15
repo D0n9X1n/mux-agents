@@ -118,6 +118,7 @@ flowchart LR
 - macOS、Linux 或 Windows，x86_64 或 aarch64；不需要 PowerShell 或 .NET。
 - macOS、Linux 或 Windows 上的 rmux 0.10 或更高版本，或 macOS 或 Linux 上的 tmux 3.2 或更高版本，且调用者位于窗格中。
 - `PATH` 上有 Claude Code 或 GitHub Copilot CLI（`claude` 或 `copilot`；Windows 上为 `.exe`）。
+- herdr-core 0.1.21 或更高版本，且 `PATH` 上有 `hc`（或 `herdr-core`）：每个代理都在 hc 终端中运行。
 - 仅限终端 CLI（在 tmux 或 rmux 中运行的 Claude Code 或 Copilot CLI）；桌面应用和其他非终端界面会被跳过：没有 Agents 窗格，技能也会说明不要使用它。
 - 不在 herdr 中：在 tmux 和 rmux 之外的 herdr 终端里（设置了 `HC_TERMINAL_ID`）每个命令都以 `herdr` 拒绝，钩子不报告任何状态，Agents 窗格也不会打开；在那里请使用 herdr 自己的技能（`hc --skill`）。在 tmux 或 rmux 中，即使它是从 herdr 终端启动的，窗格也属于多路复用器，mux-agents 照常工作：herdr 看不到 tmux 里的代理。
 
