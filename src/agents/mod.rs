@@ -24,6 +24,7 @@ pub mod mail;
 pub(crate) mod member_target;
 pub mod membership;
 pub mod message;
+pub mod options;
 pub mod placement;
 pub mod receipt;
 pub mod registry;

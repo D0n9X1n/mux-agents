@@ -42,7 +42,7 @@ impl Policy {
 }
 
 // The flags each client takes a value for, as `--x v` or `--x=v`; any other dash token takes none.
-const CLAUDE_VALUED: [&str; 11] = [
+pub(crate) const CLAUDE_VALUED: [&str; 11] = [
     "--model",
     "--add-dir",
     "--session-id",
@@ -55,14 +55,14 @@ const CLAUDE_VALUED: [&str; 11] = [
     "--disallowedTools",
     "--disallowed-tools",
 ];
-const CLAUDE_BARE: [&str; 5] = [
+pub(crate) const CLAUDE_BARE: [&str; 5] = [
     "--continue",
     "-c",
     "--fork-session",
     "--dangerously-skip-permissions",
     "--verbose",
 ];
-const COPILOT_VALUED: [&str; 11] = [
+pub(crate) const COPILOT_VALUED: [&str; 11] = [
     "--model",
     "--add-dir",
     "--session-id",
@@ -77,15 +77,15 @@ const COPILOT_VALUED: [&str; 11] = [
 ];
 // The flags whose value is optional (`--resume [value]`, `--deny-tool [<tools>...]`): they take the next token only
 // when it is not itself a flag or `--`, as the clients' own parsers do, so they never swallow a narrowing flag.
-const CLAUDE_OPTIONAL: [&str; 2] = ["-r", "--resume"];
-const COPILOT_OPTIONAL: [&str; 5] = [
+pub(crate) const CLAUDE_OPTIONAL: [&str; 2] = ["-r", "--resume"];
+pub(crate) const COPILOT_OPTIONAL: [&str; 5] = [
     "-r",
     "--resume",
     "--deny-tool",
     "--deny-url",
     "--excluded-tools",
 ];
-const COPILOT_BARE: [&str; 10] = [
+pub(crate) const COPILOT_BARE: [&str; 10] = [
     "--continue",
     "--allow-all",
     "--yolo",
@@ -123,6 +123,15 @@ fn parsed(
             Some((n, v)) => (n, Some(v)),
             None => (token, None),
         };
+        // An attached short value (`-nworker`), read as the clients and `options::classify` read it.
+        let takes = |n: &str| valued.contains(&n) || optional.contains(&n);
+        // Checked before the `=` split: `-nworker=blue` is `-n` with the value `worker=blue`.
+        let (name, inline) = match token.get(..2) {
+            Some(short) if !token.starts_with("--") && token.len() > 2 && takes(short) => {
+                (short, token.get(2..))
+            }
+            _ => (name, inline),
+        };
         if valued.contains(&name) {
             let value = match inline {
                 Some(v) => v.to_string(),
@@ -152,6 +161,17 @@ fn parsed(
         i += 1;
     }
     Some(out)
+}
+
+/// The policy `flags` give `client`, or None when a flag is one this cannot classify: a caller that must not guess
+/// (the replay ceiling, options-6e E2) fails closed on None. `policy` reads None as `Default`.
+pub fn policy_of(client: Client, flags: &[String]) -> Option<Policy> {
+    let (valued, optional, bare): (&[&str], &[&str], &[&str]) = match client {
+        Client::Claude => (&CLAUDE_VALUED, &CLAUDE_OPTIONAL, &CLAUDE_BARE),
+        Client::Copilot => (&COPILOT_VALUED, &COPILOT_OPTIONAL, &COPILOT_BARE),
+    };
+    parsed(flags, valued, optional, bare)?;
+    Some(policy(client, flags))
 }
 
 /// The policy `flags` give `client`, strictest-wins and fail-closed: anything that narrows the client, and any flag
@@ -264,8 +284,8 @@ impl Team {
             "policy": self.policy.word(), "leader": self.leader, "createdAt": self.created_at})
     }
 
-    /// A record read back whole, or none for anything malformed, of another schema, or whose policy word is not the
-    /// one its own flags give: a record is never trusted for more than its flags allow.
+    /// A record read back whole, or none for anything malformed or of another schema. Its `policy` is the stricter of
+    /// the stored word and the one its flags give: a record is never trusted for more than either allows.
     fn from_json(v: &Value) -> Option<Team> {
         let text = |k: &str| v.get(k).and_then(Value::as_str).map(String::from);
         if v.get("schema").and_then(Value::as_u64) != Some(SCHEMA) {
@@ -278,10 +298,9 @@ impl Team {
             .iter()
             .map(|f| f.as_str().map(String::from))
             .collect::<Option<_>>()?;
-        let recorded = Policy::from_word(&text("policy")?)?;
-        if recorded != policy(client, &flags) {
-            return None;
-        }
+        // The stored word is kept, and the ceiling is the stricter of it and what the flags give now: a record never
+        // gains power by being read again, and a parser that reads the flags differently never makes it unreadable.
+        let recorded = Policy::from_word(&text("policy")?)?.min(policy(client, &flags));
         let leader = text("leader")?;
         if !crate::agents::agent_id(&leader) {
             return None;
@@ -500,13 +519,18 @@ mod tests {
     }
 
     #[test]
-    fn a_record_whose_policy_word_its_flags_do_not_give_is_refused() {
+    fn a_record_whose_policy_word_its_flags_do_not_give_reads_at_the_stricter() {
         let dir = TempDir::new();
         let file = path(dir.path(), "$3");
         let mut t = team(&["--permission-mode", "plan"]);
         t.policy = Policy::Bypass;
         assert!(create(&file, &t).unwrap());
-        assert!(read(&file).is_err());
+        let got = read(&file).ok().flatten().map(|t| t.policy);
+        assert_eq!(
+            got,
+            Some(Policy::Default),
+            "a stored word never gains power"
+        );
         for bad in [
             json!({"schema": 2}),
             json!({"schema": 1, "client": "claude", "flags": "x"}),
@@ -515,6 +539,24 @@ mod tests {
             crate::state::fs::write_json(&other, &bad).unwrap();
             assert!(read(&other).is_err(), "{bad}");
         }
+    }
+
+    // A record written before the parser read `-nworker` stored "default"; it still reads, and its ceiling stays
+    // the stricter of the stored word and what the flags give now.
+    #[test]
+    fn an_old_record_keeps_its_stored_policy_as_its_ceiling() {
+        let dir = TempDir::new();
+        let file = path(dir.path(), "$3");
+        let mut t = team(&["--dangerously-skip-permissions", "-nworker"]);
+        assert_eq!(
+            t.policy,
+            Policy::Bypass,
+            "the parser now reads the flags as bypass"
+        );
+        t.policy = Policy::Default;
+        assert!(create(&file, &t).unwrap());
+        let got = read(&file).ok().flatten().map(|t| t.policy);
+        assert_eq!(got, Some(Policy::Default));
     }
 
     #[test]
