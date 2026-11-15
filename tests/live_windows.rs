@@ -1113,3 +1113,149 @@ fn team_bar_draws_the_tree_and_opens_any_row() {
         "finished"
     );
 }
+
+impl Live {
+    /// mux-agent typed into `pane` after `cd /d <dir>`; its JSON reply.
+    fn run_at(&self, pane: &str, dir: &Path, args: &[&str]) -> Value {
+        std::fs::create_dir_all(dir).unwrap();
+        let (done, out) = (self.dir.join("at.done"), self.dir.join("at.json"));
+        let _ = std::fs::remove_file(&done);
+        let args = args
+            .iter()
+            .map(|a| format!("\"{a}\""))
+            .collect::<Vec<_>>()
+            .join(" ");
+        self.line(
+            pane,
+            &format!(
+                "cd /d \"{}\" & \"{MUX_AGENT}\" {args} > \"{}\" & echo done> \"{}\"",
+                dir.display(),
+                out.display(),
+                done.display()
+            ),
+        );
+        self.wait("reply in pane", || done.exists().then_some(()));
+        serde_json::from_str(&std::fs::read_to_string(out).unwrap()).unwrap()
+    }
+}
+
+/// Team messaging end to end on Windows (#103 4a): leader > a > b, and team T2 in another session. A broadcast is
+/// one id each; a reply is hop 1; another team is refused; `children` is only the leader's own; the 121st send of
+/// the hour refuses with `retryAt`.
+#[test]
+fn team_messaging_stays_in_the_team() {
+    let Some(live) = Live::start() else { return };
+    let (task, brief, body) = (
+        live.dir.join("task.txt"),
+        live.dir.join("brief.md"),
+        live.dir.join("body.md"),
+    );
+    for (p, t) in [(&task, "say hi"), (&brief, "brief"), (&body, "hello")] {
+        std::fs::write(p, t).unwrap();
+    }
+    let (task, brief, body) = (
+        task.display().to_string(),
+        brief.display().to_string(),
+        body.display().to_string(),
+    );
+    let leader = s(&live.run(&["up", "-Client", "claude"])["leader"]["id"]);
+    let mut sent = HashMap::new();
+    let spawn = |sent: &mut HashMap<u32, usize>, who: &str, name: &str| {
+        let r = by(
+            &live,
+            sent,
+            who,
+            &[
+                "spawn",
+                "-Client",
+                "claude",
+                "-TaskFile",
+                &task,
+                "-BriefFile",
+                &brief,
+                "-Context",
+                "brief",
+                "-Name",
+                name,
+            ],
+        );
+        assert_eq!(r["ok"], true, "{name}: {r}");
+        s(&r["id"])
+    };
+    let a = spawn(&mut sent, &leader, "a");
+    let b = spawn(&mut sent, &a, "b");
+    live.call(&["new-session", "-d", "-s", "t2"]);
+    let pane = live
+        .call(&["list-panes", "-t", "t2", "-F", "#{pane_id}"])
+        .trim()
+        .to_string();
+    let up2 = live.run_at(&pane, &live.dir.join("t2"), &["up", "-Client", "claude"]);
+    assert_eq!(up2["ok"], true, "{up2}");
+    spawn(&mut sent, &s(&up2["leader"]["id"]), "x");
+    let r = by(&live, &mut sent, &a, &["send", "team", "-BodyFile", &body]);
+    let id = s(&r["id"]);
+    for who in [&leader, &b] {
+        let got = by(&live, &mut sent, who, &["read"]);
+        // 4a: read answers `messages`; 4b-i turns this line into the `ids` form (`msg-plan-4b-i-3.md` F25, finding 15).
+        let ids: Vec<String> = got["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| s(&m["id"]))
+            .collect();
+        assert_eq!(ids, std::slice::from_ref(&id), "one id each");
+    }
+    assert_eq!(
+        by(
+            &live,
+            &mut sent,
+            &b,
+            &["send", "a", "-BodyFile", &body, "-Re", &id]
+        )["hop"],
+        1
+    );
+    assert_eq!(
+        by(&live, &mut sent, &b, &["send", "x", "-BodyFile", &body])["check"],
+        "target"
+    );
+    let kids = by(
+        &live,
+        &mut sent,
+        &leader,
+        &["send", "children", "-BodyFile", &body],
+    );
+    assert_eq!(
+        kids["recipients"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|x| s(&x["id"]))
+            .collect::<Vec<_>>(),
+        std::slice::from_ref(&a)
+    );
+    // The quota through the live client (F22): a has sent one (team); 119 more fill the hour, the 121st refuses.
+    for n in 0..119 {
+        assert_eq!(
+            by(
+                &live,
+                &mut sent,
+                &a,
+                &["send", "leader", "-BodyFile", &body]
+            )["ok"],
+            true,
+            "send {}",
+            n + 2
+        );
+    }
+    let r = by(
+        &live,
+        &mut sent,
+        &a,
+        &["send", "leader", "-BodyFile", &body],
+    );
+    assert_eq!(
+        (r["check"].as_str(), r["retryAt"].is_string()),
+        (Some("quota"), true),
+        "the 121st: {r}"
+    );
+}
