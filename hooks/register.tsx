@@ -2,7 +2,7 @@ import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register, Timer } from 'claude-code'
 
 import { activity } from './activity'
-import { arm, onSubmit } from './deliver'
+import { arm, onSubmit, run } from './deliver'
 import { EMPTY, formatAge, isSpawn, look, mail, needYou, parseList, sections } from './board'
 
 const PANE = 'mux-agents'
@@ -18,14 +18,29 @@ let epoch = 0
 
 const NOT_HERE = 'mux-agents works only in a terminal CLI inside tmux or rmux.'
 
+// Per module load: whether this hc terminal is a mux-agents team member, as `read -Count` answers it (deliver.ts
+// eligible). A member, a non-member, or a `herdr`, `tagged` or `target` refusal is kept; any other failure asks again.
+let hcMember: boolean | undefined
+
+async function teamMember($: EngineInterface): Promise<boolean> {
+  if (hcMember !== undefined) return hcMember
+  const c = await run($, ['read', '-Count'])
+  if (c && c.ok !== false) hcMember = c.member === true
+  else if (c && /^(herdr|tagged|target)$/.test(String(c.check))) hcMember = false
+  return hcMember === true
+}
+
 // Terminal CLI only (#43), read fresh each time and never cached: the session draws on the terminal and nothing else
 // ($.ui.open has no surface selector, so with a desktop, mobile or IDE client attached too the pane would show there as
-// an empty tab), it runs inside tmux or rmux, and it is not a cloud session. A refused read, or no surface at all
-// (a headless or SDK run), is not eligible. The surfaces, the reading most likely to change, are read last.
+// an empty tab), it runs inside tmux or rmux, or in an hc terminal as a team member (#137; a plain herdr terminal stays
+// without the pane), and it is not a cloud session. A refused read, or no surface at all (a headless or SDK run), is
+// not eligible. The surfaces, the reading most likely to change, are read last.
 async function eligible($: EngineInterface): Promise<boolean> {
   try {
     if ((await $.env.get('CLAUDE_CODE_REMOTE')) === 'true') return false
-    if (!((await $.env.get('TMUX')) || (await $.env.get('RMUX')))) return false
+    if (!((await $.env.get('TMUX')) || (await $.env.get('RMUX')))) {
+      if (!(await $.env.get('HC_TERMINAL_ID')) || !(await teamMember($))) return false
+    }
     const surfaces = await $.session.surfaces()
     return surfaces.length === 1 && surfaces[0] === 'terminal'
   } catch {

@@ -367,10 +367,24 @@ for (const [name, set] of FAIL_CLOSED) {
   })
 }
 
-test('a herdr terminal outside tmux and rmux is not eligible; inside tmux an inherited address changes nothing', async ($, on) => {
-  const w = world(on, { HC_TERMINAL_ID: 't7' }, [ran(0, LIST)])
-  expect(await gated($, w)).toEqual(SKIPPED)
+// An hc terminal outside tmux and rmux (#137): eligible only as a team member, proven once by `read -Count`.
+const COUNT_OF = (member: boolean) => JSON.stringify({ ok: true, badge: 0, wake: 0, end: 0, id: 'a1', gen: '0', leader: true, member })
+const REFUSED = (check: string) => JSON.stringify({ ok: false, verb: 'read', code: 2, check, message: 'no' })
+
+test('a team member in an hc terminal is eligible, proven once by read -Count', async ($, on) => {
+  const w = world(on, { HC_TERMINAL_ID: 't7' }, [ran(0, COUNT_OF(true)), ran(0, LIST)])
+  expect(await gated($, w)).toEqual({ answered: 'Agents pane opened.', registered: 1, opened: 2, runs: 5 })
+  expect(w.seen.argv[0].slice(-2)).toEqual(['read', '-Count'])
+  expect(w.seen.argv.slice(1).every(a => a.at(-1) === '-All')).toBe(true)
 })
+
+for (const [what, reply] of [['a plain herdr terminal', ran(2, REFUSED('herdr'))], ['an unproven member', ran(2, REFUSED('tagged'))], ['a terminal that is no member', ran(0, COUNT_OF(false))]] as const) {
+  test(`${what} in an hc terminal is not eligible, and asks once`, async ($, on) => {
+    const w = world(on, { HC_TERMINAL_ID: 't7' }, [reply, ran(0, LIST)])
+    expect(await gated($, w)).toEqual({ ...SKIPPED, runs: 1 })
+    expect(w.seen.argv[0].slice(-2)).toEqual(['read', '-Count'])
+  })
+}
 
 test('a tmux pane that inherited a herdr address is still eligible', async ($, on) => {
   const w = world(on, { TMUX: 'x', HC_TERMINAL_ID: 't7' }, [ran(0, LIST)])
