@@ -58,11 +58,17 @@ impl Live {
         for sub in ["bin", "state"] {
             std::fs::create_dir_all(dir.join(sub)).unwrap();
         }
-        std::fs::copy(
-            env!("CARGO_BIN_EXE_fake-client"),
-            dir.join("bin").join("claude.exe"),
-        )
-        .unwrap();
+        for alias in ["claude.exe", "copilot.exe"] {
+            std::fs::copy(
+                env!("CARGO_BIN_EXE_fake-client"),
+                dir.join("bin").join(alias),
+            )
+            .unwrap();
+            assert!(
+                dir.join("bin").join(alias).is_file(),
+                "{alias} alias installed"
+            );
+        }
         std::fs::write(dir.join("task.txt"), "say hi").unwrap();
         let mut path = dir.join("bin").into_os_string();
         path.push(";");
@@ -315,6 +321,17 @@ fn eventually(limit: Duration, mut ready: impl FnMut() -> bool) -> bool {
             return false;
         }
         std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+#[test]
+fn the_harness_installs_both_client_aliases() {
+    let Some(live) = Live::start() else { return };
+    for alias in ["claude.exe", "copilot.exe"] {
+        assert!(
+            live.dir.join("bin").join(alias).is_file(),
+            "{alias} alias installed"
+        );
     }
 }
 
