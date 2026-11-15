@@ -1542,3 +1542,54 @@ fn a_failed_set_option_refuses_on_and_off() {
         assert_eq!(r.unwrap_err().check, "notify", "{flag}");
     }
 }
+
+// Call 19 (Tech Lead): a notice names each recipient's address from the classified snapshot (R1, R5); a
+// record.json rewritten after the snapshot is never reread.
+#[test]
+fn notices_take_addresses_from_the_snapshot() {
+    let w = team_world();
+    online(&w);
+    let b = w.folder(B).join("record.json");
+    w.fakes
+        .mux_script(crate::agents::message::NOTIFY_OPTION, move |_| {
+            let mut r = crate::state::fs::read_json(&b).unwrap().unwrap();
+            r["hcAddress"] = json!("moved");
+            crate::state::fs::write_json(&b, &r).unwrap();
+            Ok(crate::mux::Output {
+                code: 0,
+                stdout: "on\n".into(),
+                stderr: String::new(),
+            })
+        });
+    cf::online(&w);
+    for address in [format!("t{B}"), format!("t{LEADER}")] {
+        cf::answer(
+            &w,
+            &[
+                "send",
+                &address,
+                "mail from ma1: run mux-agent read",
+                "--json",
+            ],
+            "{}",
+        );
+    }
+    let mut c = w.caller();
+    c.member = Some(A.into());
+    let r =
+        crate::agents::message::send_as(&w.ctx, &c, &w.request(&["send", "team", "-Body", "hi"]));
+    assert!(r.is_ok(), "{r:?}");
+    let sent: Vec<String> = w
+        .fakes
+        .hc_calls()
+        .into_iter()
+        .filter(|(_, a, _)| a[0] == "send")
+        .map(|(_, a, _)| a[1].clone())
+        .collect();
+    assert_eq!(
+        sent,
+        [format!("t{B}"), format!("t{LEADER}")],
+        "the snapshot's addresses"
+    );
+    w.fakes.hc_done().unwrap();
+}

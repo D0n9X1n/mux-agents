@@ -507,7 +507,7 @@ fn route_team(
                         i
                     }
                 };
-                deliver(ctx, caller, &sender, &root, &owner, &intent, body, word).map(Some)
+                deliver(ctx, caller, &s, &sender, &root, &owner, &intent, body, word).map(Some)
             };
             // Team, then the agent lock of a member sender, then each mailbox: the -Re lookup and every copy inside
             // it.
@@ -638,7 +638,8 @@ fn crash_point() -> Res<()> {
 }
 
 /// W7: with the option on, one `hc send` per recipient with an hc address; failures are dropped (the mail is durable).
-fn notices(ctx: &Ctx, caller: &Caller, sender: &Sender, recipients: &[Value]) {
+/// Call 19 (R1, R5): the address is the classified snapshot's identity, never a reread of `record.json`.
+fn notices(ctx: &Ctx, caller: &Caller, s: &Snapshot, sender: &Sender, recipients: &[Value]) {
     let on = crate::mux::native(
         ctx,
         &[
@@ -657,16 +658,15 @@ fn notices(ctx: &Ctx, caller: &Caller, sender: &Sender, recipients: &[Value]) {
     let Ok(core) = crate::hc::connect(ctx) else {
         return;
     };
-    let agents = super::server_dir(ctx, caller).join("agents");
     for r in recipients {
-        let rec =
-            crate::state::fs::read_json(&agents.join(super::text(r.get("id"))).join("record.json"))
-                .ok()
-                .flatten();
-        if let Some(address) = rec
-            .as_ref()
-            .and_then(|r| r.get("hcAddress"))
-            .and_then(Value::as_str)
+        let id = super::text(r.get("id"));
+        if let Some(address) = s
+            .facts
+            .local
+            .iter()
+            .find(|o| o.identity.id == id)
+            .map(|o| o.identity.address.as_str())
+            .filter(|a| !a.is_empty())
         {
             let _ = core.send(
                 address,
@@ -682,6 +682,7 @@ fn notices(ctx: &Ctx, caller: &Caller, sender: &Sender, recipients: &[Value]) {
 fn deliver(
     ctx: &Ctx,
     caller: &Caller,
+    s: &Snapshot,
     sender: &Sender,
     root: &Path,
     owner: &str,
@@ -724,7 +725,7 @@ fn deliver(
             delivered.push(super::text(r.get("name")));
         }
         mark_done(root, owner, &id);
-        notices(ctx, caller, sender, &recipients);
+        notices(ctx, caller, s, sender, &recipients);
         if let Some(member) = &sender.id {
             // Best effort, inside the agent lock: last-sent.json names the last message sent; a send ends a wait.
             let file = super::server_dir(ctx, caller)
