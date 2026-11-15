@@ -5507,6 +5507,12 @@ hc {}:
                     "{mux:?} client {pid} was typed into: {typed}"
                 );
             }
+            // The person's own root pane (a shell, never a bar, open for the whole test) shows neither either.
+            let root = live.call(&["capture-pane", "-p", "-t", live.server.pane()]);
+            assert!(
+                !root.contains("nonce-7f3a") && !root.contains("mail from"),
+                "{mux:?} the root pane was typed into: {root}"
+            );
         }
     }
 }
