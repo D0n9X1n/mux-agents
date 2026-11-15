@@ -406,3 +406,14 @@ fn stop_past_the_bound_still_replies_ok_with_client_exited_false() {
     let got = call(&w).unwrap();
     assert_eq!((got.get("clientExited"), w.fakes.slept()), (None, vec![]));
 }
+
+#[test]
+fn stop_with_an_unreadable_process_table_waits_out_the_bound() {
+    // A table that cannot be read cannot show the client gone: it waits the whole bound, then replies.
+    let w = World::human("");
+    stopping(&w, false);
+    w.fakes.table_fails();
+    let got = call(&w).unwrap();
+    assert_eq!(got["clientExited"], json!(false));
+    assert_eq!(w.fakes.slept().iter().sum::<u64>(), 8000);
+}

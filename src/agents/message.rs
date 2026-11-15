@@ -886,20 +886,24 @@ fn recorded_client(ctx: &Ctx, key: &str, id: &str, record: &Value) -> Option<(u3
 /// Waits, on the injected clock, until the recorded client is gone from the OS process table: no row for its pid, or
 /// one with another start. False once `CLIENT_EXIT_BOUND` has passed with it still there.
 fn client_exited(ctx: &Ctx, (pid, start): (u32, i64)) -> bool {
-    let live = || {
-        ctx.os
-            .row(pid)
-            .and_then(|row| row.start)
-            .is_some_and(|s| ctx.os.same_start(s, start))
-    };
     let deadline = ctx.clock.now() + CLIENT_EXIT_BOUND;
-    while live() {
+    while listed(ctx.os.as_ref(), pid, start) {
         if ctx.clock.now() >= deadline {
             return false;
         }
         ctx.clock.sleep(CLIENT_EXIT_POLL);
     }
     true
+}
+
+/// Whether the process `pid` that started at `start` is still in the OS process table, read as resume's session check
+/// reads it (`Os::table`, not `Os::row`: on Windows a handle another process holds keeps an exited process openable).
+/// A table that cannot be read cannot show it gone, so it counts as listed.
+fn listed(os: &dyn crate::proc::Os, pid: u32, start: i64) -> bool {
+    os.table().map_or(true, |rows| {
+        rows.iter()
+            .any(|row| row.pid == pid && row.start.is_some_and(|s| os.same_start(s, start)))
+    })
 }
 
 /// `stop <name>`: kills the member's hc terminal under its locks, then, with every lock released, replies only once its
@@ -944,6 +948,38 @@ pub fn stop_hc(ctx: &Ctx, request: &Request) -> Res<Map<String, Value>> {
 mod tests {
     use super::stop_hc as stop;
     use super::*;
+
+    // #137, on the real process table of each OS (macOS, Linux, Windows): a client that was killed and reaped is no
+    // longer listed, so `stop`'s wait ends. On Windows a handle another process holds keeps an exited process
+    // openable, so only the table (as resume's session check reads it) shows it gone.
+    #[test]
+    fn a_reaped_client_is_no_longer_listed_on_this_os() {
+        let os = crate::proc::host();
+        #[cfg(windows)]
+        let mut child = std::process::Command::new("ping")
+            .args(["-n", "60", "127.0.0.1"])
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        #[cfg(unix)]
+        let mut child = std::process::Command::new("/bin/sleep")
+            .arg("60")
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        let start = os.row(pid).and_then(|r| r.start).unwrap();
+        assert!(
+            listed(os.as_ref(), pid, start),
+            "a running client is listed"
+        );
+        child.kill().unwrap();
+        child.wait().unwrap();
+        drop(child);
+        assert!(
+            !listed(os.as_ref(), pid, start),
+            "a reaped client is not listed"
+        );
+    }
     use crate::agents::core_fixture as cf;
     use crate::agents::fixture::{ID, World, launch_command, write};
     use crate::agents::lock_key;
