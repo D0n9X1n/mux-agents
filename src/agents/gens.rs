@@ -41,12 +41,44 @@ pub fn path(member: &Path, n: u64, file: &str) -> PathBuf {
     dir(member, n).join(format!("{file}.json"))
 }
 
+/// Point 8: the one walk. `member` is `<state_root>/<key>/agents/<id>`, so the walk starts at the state root, three
+/// folders up, and checks `<key>`, `agents`, `<id>`, then `names`. Every name but the last must be a real folder
+/// (`symlink_metadata`, never following a link): missing is `Absent`; a link, a file or anything else is `Unreadable`.
+/// The last name goes to `evidence::read`. The state root and anything above it are not walked.
+pub fn walk(member: &Path, names: &[&str]) -> Evidence {
+    let Some(root) = member.ancestors().nth(3) else {
+        return Evidence::Unreadable;
+    };
+    let mut all: Vec<&std::ffi::OsStr> =
+        member.strip_prefix(root).unwrap_or(member).iter().collect();
+    all.extend(names.iter().map(std::ffi::OsStr::new));
+    let Some((last, folders)) = all.split_last() else {
+        return Evidence::Unreadable;
+    };
+    let mut at = root.to_path_buf();
+    for name in folders {
+        at.push(name);
+        match std::fs::symlink_metadata(&at) {
+            Ok(m) if m.is_dir() => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Evidence::Absent,
+            _ => return Evidence::Unreadable,
+        }
+    }
+    evidence::read(&at.join(last))
+}
+
+/// The member record, `<member>/record.json`, through the walk.
+pub fn record(member: &Path) -> Evidence {
+    walk(member, &["record.json"])
+}
+
 pub fn read(member: &Path, n: u64, file: &str) -> Evidence {
-    evidence::read(&path(member, n, file))
+    debug_assert!(FILES.contains(&file), "{file}");
+    walk(member, &["gens", &n.to_string(), &format!("{file}.json")])
 }
 
 pub fn claim(member: &Path, n: u64) -> Evidence {
-    evidence::read(&claim_path(member, n))
+    walk(member, &["gens", &format!("{n}.claim")])
 }
 
 /// The notice delivery id of generation `n` of member `id`.
@@ -105,7 +137,7 @@ pub fn done(member: &Path, n: u64) -> Res<bool> {
     if !(abandoned || aborted || ended || released) {
         return Ok(false);
     }
-    let record = evidence::read(&member.join("record.json"))
+    let record = record(member)
         .known()?
         .ok_or_else(|| Refusal::internal("a generation has no member record"))?;
     let completing = record
@@ -303,6 +335,108 @@ mod tests {
         assert_eq!(done(&m, 0).map_err(|e| e.check), Err("evidence"));
     }
 
+    // Point 8: the walk below a member folder: each folder must be a real folder; a missing one reads Absent; a file
+    // where gens/<n>/ belongs reads Unreadable on every OS.
+    #[test]
+    fn the_walk_below_a_member_needs_real_folders() {
+        let (_d, m) = member();
+        assert_eq!(read(&m, 1, "commit"), Evidence::Absent, "no gens folder");
+        std::fs::create_dir_all(m.join("gens")).unwrap();
+        assert_eq!(
+            read(&m, 1, "commit"),
+            Evidence::Absent,
+            "no generation folder"
+        );
+        std::fs::write(m.join("gens").join("1"), b"x").unwrap();
+        assert_eq!(
+            read(&m, 1, "commit"),
+            Evidence::Unreadable,
+            "a file where gens/1/ belongs"
+        );
+        assert!(
+            matches!(record(&m), Evidence::Present(_)),
+            "the member record"
+        );
+    }
+
+    // Point 8: a link at agents/<id>, at gens or at gens/<n>, live or dangling, reads Unreadable and nothing behind it
+    // is opened. Unix only.
+    #[cfg(unix)]
+    #[test]
+    fn a_linked_folder_below_a_member_reads_unreadable() {
+        use std::os::unix::fs::symlink;
+        for case in [
+            "gens/1 to gens/2",
+            "dangling gens/1",
+            "dangling gens",
+            "agents/<id> to a copy",
+        ] {
+            let (_d, m) = member();
+            publish(&path(&m, 2, "commit"), &json!({"committed": true})).unwrap();
+            match case {
+                "gens/1 to gens/2" => symlink(dir(&m, 2), dir(&m, 1)).unwrap(),
+                "dangling gens/1" => symlink(dir(&m, 9), dir(&m, 1)).unwrap(),
+                "agents/<id> to a copy" => {
+                    let copy = m.with_file_name("copy");
+                    std::fs::rename(&m, &copy).unwrap();
+                    symlink(&copy, &m).unwrap();
+                }
+                _ => {
+                    std::fs::remove_dir_all(m.join("gens")).unwrap();
+                    symlink(m.join("nowhere"), m.join("gens")).unwrap();
+                }
+            }
+            let (got, reads) =
+                crate::state::fs::record_reads(|| (read(&m, 1, "commit"), claim(&m, 1)));
+            assert_eq!(got.0, Evidence::Unreadable, "{case}");
+            let refused = matches!(case, "dangling gens" | "agents/<id> to a copy");
+            assert_eq!(got.1 == Evidence::Unreadable, refused, "{case}: the claim");
+            assert!(reads.is_empty(), "{case}: opened {reads:?}");
+            if case == "agents/<id> to a copy" {
+                assert_eq!(
+                    record(&m),
+                    Evidence::Unreadable,
+                    "the record behind a linked member folder"
+                );
+            }
+        }
+    }
+
+    // Final audit: the walk starts at the state root, so an accidental link at <key> or at agents reads Unreadable
+    // and nothing below it is opened. Its own fixture of the real shape <root>/<key>/agents/<id>. Unix only.
+    #[cfg(unix)]
+    #[test]
+    fn a_linked_key_or_agents_folder_reads_unreadable() {
+        for case in ["none", "key", "agents"] {
+            let d = crate::testing::TempDir::new();
+            let key = d.path().join("0123456789abcdef");
+            let m = key.join("agents").join("aaaaaaaaaaaa");
+            publish(&path(&m, 1, "commit"), &json!({"committed": true})).unwrap();
+            crate::state::fs::write_json(&m.join("record.json"), &json!({"lifecycle": 1})).unwrap();
+            let link = if case == "key" {
+                key.clone()
+            } else {
+                key.join("agents")
+            };
+            if case != "none" {
+                let copy = d.path().join("copy");
+                std::fs::rename(&link, &copy).unwrap();
+                std::os::unix::fs::symlink(&copy, &link).unwrap();
+            }
+            let (got, reads) =
+                crate::state::fs::record_reads(|| (read(&m, 1, "commit"), record(&m)));
+            if case == "none" {
+                assert!(
+                    matches!(got, (Evidence::Present(_), Evidence::Present(_))),
+                    "control: {got:?}"
+                );
+            } else {
+                assert_eq!(got, (Evidence::Unreadable, Evidence::Unreadable), "{case}");
+                assert!(reads.is_empty(), "{case}: opened {reads:?}");
+            }
+        }
+    }
+
     // S6: an unreadable record.json stops done; it never means done.
     #[test]
     fn an_unreadable_record_stops_done() {
@@ -385,6 +519,14 @@ mod client_tests {
         let (_f, ctx, _d, m) = world();
         publish(&path(&m, 1, "client"), &json!({"pid": 600, "start": 1499})).unwrap();
         assert_eq!(client(&ctx, &m, 1), None, "reused client pid");
+        // A dangling exit.json is Unreadable, so the client is unproven.
+        #[cfg(unix)]
+        {
+            let (_f, ctx, _d, m) = world();
+            publish(&path(&m, 1, "client"), &json!({"pid": 600, "start": 1500})).unwrap();
+            std::os::unix::fs::symlink(path(&m, 2, "exit"), path(&m, 1, "exit")).unwrap();
+            assert_eq!(client(&ctx, &m, 1), None, "dangling exit.json");
+        }
     }
 
     // Each guard alone: everything else valid (proven first), then one fact broken. Each case is the one that kills

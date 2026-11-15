@@ -23,10 +23,24 @@ pub enum Published {
     Exists,
 }
 
+/// Point 8: opens only what `symlink_metadata` (which never follows a link) reports as a regular file. Anything else
+/// at the final name (a FIFO, a socket, a folder, any link, dangling or not) is `Unreadable`, unopened. A missing
+/// final name keeps the ancestor rule (`absent`).
 pub fn read(path: &Path) -> Evidence {
+    match std::fs::symlink_metadata(path) {
+        Ok(m) if m.is_file() => {}
+        Ok(_) => return Evidence::Unreadable,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            return if absent(path, |d| std::fs::metadata(d).map(|m| m.is_dir())) {
+                Evidence::Absent
+            } else {
+                Evidence::Unreadable
+            };
+        }
+        Err(_) => return Evidence::Unreadable,
+    }
     match crate::state::fs::read_json(path) {
         Ok(Some(v)) => Evidence::Present(v),
-        Ok(None) if absent(path, |d| std::fs::metadata(d).map(|m| m.is_dir())) => Evidence::Absent,
         Ok(None) | Err(_) => Evidence::Unreadable,
     }
 }
@@ -103,6 +117,70 @@ mod tests {
         let dir = d.path().join("gens/1/ended.json");
         std::fs::create_dir_all(&dir).unwrap();
         assert_eq!(read(&dir), Evidence::Unreadable);
+    }
+
+    // Point 8: only a regular file is opened. A folder reads Unreadable unopened; a missing name keeps the ancestor
+    // rule; a file reads Present.
+    #[test]
+    fn only_a_regular_file_is_opened() {
+        let d = crate::testing::TempDir::new();
+        let (dir, file) = (d.path().join("dir.json"), d.path().join("real.json"));
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::write(&file, br#"{"a":1}"#).unwrap();
+        let gone = d.path().join("gone.json");
+        let (got, reads) =
+            crate::state::fs::record_reads(|| (read(&dir), read(&gone), read(&file)));
+        assert_eq!(
+            got,
+            (
+                Evidence::Unreadable,
+                Evidence::Absent,
+                Evidence::Present(json!({"a": 1}))
+            )
+        );
+        assert_eq!(reads, [file], "only the regular file is opened");
+    }
+
+    // Point 8: a link, dangling or not, and a FIFO read Unreadable and are never opened. Bounded: an opened FIFO would
+    // block, so the reads run on a thread with a 5 s limit and the test fails instead of hanging. Unix only.
+    #[cfg(unix)]
+    #[test]
+    fn a_link_or_a_fifo_reads_unreadable_unopened() {
+        let d = crate::testing::TempDir::new();
+        let file = d.path().join("real.json");
+        std::fs::write(&file, br#"{"a":1}"#).unwrap();
+        let (dangling, live, fifo) = (
+            d.path().join("d.json"),
+            d.path().join("l.json"),
+            d.path().join("f.json"),
+        );
+        std::os::unix::fs::symlink(d.path().join("gone.json"), &dangling).unwrap();
+        std::os::unix::fs::symlink(&file, &live).unwrap();
+        assert!(
+            std::process::Command::new("mkfifo")
+                .arg(&fifo)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(crate::state::fs::record_reads(|| {
+                [read(&dangling), read(&live), read(&fifo)]
+            }));
+        });
+        let (got, reads) = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("a read blocked: the FIFO was opened");
+        assert_eq!(
+            got,
+            [
+                Evidence::Unreadable,
+                Evidence::Unreadable,
+                Evidence::Unreadable
+            ]
+        );
+        assert!(reads.is_empty(), "opened {reads:?}");
     }
 
     #[test]
