@@ -844,3 +844,89 @@ fn a_reply_reaches_a_since_resumed_sender() {
     assert_eq!(r["recipients"][0]["id"], "0000000000a9");
     assert_eq!(inbox(&w, A).len(), 1, "the inherited mailbox of A");
 }
+
+#[test]
+fn a_reply_reads_its_message_inside_the_sender_transaction() {
+    let w = team_world();
+    seed(&w, "1111111111111111", 0, None);
+    w.fakes
+        .real_locks(&w.ctx.state_root.parent().unwrap().join("locks"));
+    online(&w);
+    w.fakes.clear_log();
+    go(
+        &w,
+        Some(B),
+        &["send", "ma1", "-Body", "a", "-Re", "1111111111111111"],
+    )
+    .unwrap();
+    let c = w.caller();
+    let keys = [
+        crate::agents::lock_key("spawn", &c, "$3"),
+        crate::agents::lock_key("agent", &c, B),
+        crate::agents::lock_key("mail", &c, B),
+        crate::agents::lock_key("mail", &c, A),
+    ];
+    let got: Vec<String> = w
+        .fakes
+        .locks()
+        .into_iter()
+        .filter(|e| keys.iter().any(|k| e[1..] == *k))
+        .collect();
+    let (s, g, mb, ma) = (&keys[0], &keys[1], &keys[2], &keys[3]);
+    assert_eq!(
+        got,
+        [
+            format!("+{s}"),
+            format!("+{g}"),
+            format!("+{mb}"),
+            format!("-{mb}"),
+            format!("+{ma}"),
+            format!("-{ma}"),
+            format!("-{g}"),
+            format!("-{s}")
+        ],
+        "the -Re lookup holds the agent lock of the sender"
+    );
+}
+
+/// M3 as written: `parent` is `parentAgent.id` when that member runs, else `parentPane`.
+#[test]
+fn a_member_answers_a_person_when_parent_falls_back_to_its_pane() {
+    let w = team_with(World::human(""), rows(&["%1|@1|100||"]));
+    w.recipients_live();
+    cf::member(
+        &w,
+        C,
+        json!({"name": "mc3", "depth": 1, "parentAgent": {"id": "ffffffffffff"}, "parentPane": "%1",
+        "pane": "%8", "window": "@1"}),
+    );
+    crate::agents::mail::deliver_once(&w.ctx, &w.caller(), C, &json!({"id": "1111111111111111", "from": "root",
+        "pane": "%1", "at": "x", "body": "q", "fromBox": "pane-1", "re": null, "hop": 0, "cast": null})).unwrap();
+    online(&w);
+    let r = go(
+        &w,
+        Some(C),
+        &["send", "parent", "-Body", "a", "-Re", "1111111111111111"],
+    );
+    assert!(
+        r.is_ok(),
+        "reachable: the parent member does not run, parentPane is the person: {r:?}"
+    );
+    assert_eq!(r.unwrap()["hop"], 1);
+    assert_eq!(inbox(&w, "pane-1").len(), 1);
+    // Unreachable: B has a running parent member (A); parent names A, never the person.
+    crate::agents::mail::deliver_once(&w.ctx, &w.caller(), B, &json!({"id": "2222222222222222", "from": "root",
+        "pane": "%1", "at": "x", "body": "q", "fromBox": "pane-1", "re": null, "hop": 0, "cast": null})).unwrap();
+    online(&w);
+    assert_eq!(
+        said(
+            go(
+                &w,
+                Some(B),
+                &["send", "parent", "-Body", "a", "-Re", "2222222222222222"]
+            )
+            .unwrap_err()
+        ),
+        "2 re a reply goes only to the message's sender"
+    );
+}

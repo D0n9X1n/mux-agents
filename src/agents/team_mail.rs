@@ -402,39 +402,54 @@ pub fn route(ctx: &Ctx, caller: &Caller, request: &Request, body: &str) -> Res<R
             // A member is keyed by its id (a resumed member has a new id, so its own quota); a person by its pane mailbox.
             let owner = sender.id.clone().unwrap_or_else(|| sender.key.clone());
             let hash = crate::util::sha256_hex(body);
-            let intent = match &id {
-                Some(id) => match find_intent(&root, &owner, id)? {
-                    Found::Mine(i) if super::text(i.get("bodyHash")) == hash => {
-                        settle(&root, &owner, id).map_err(|_| unsaved(id, &[]))?;
+            let tx = || -> Res<Option<Map<String, Value>>> {
+                let intent = match &id {
+                    Some(id) => match find_intent(&root, &owner, id)? {
+                        Found::Mine(i) if super::text(i.get("bodyHash")) == hash => {
+                            settle(&root, &owner, id).map_err(|_| unsaved(id, &[]))?;
+                            i
+                        }
+                        Found::Mine(_) | Found::Other => {
+                            return refuse(2, "id", "that id belongs to a different send");
+                        }
+                        Found::None => return refuse(2, "id", "no send with that id"),
+                    },
+                    None => {
+                        let Some((recipients, hop, cast)) =
+                            plan(ctx, caller, &s, &sender, &t, re.as_deref())?
+                        else {
+                            return Ok(None);
+                        };
+                        charge(ctx, &root.join(&owner), sender.id.is_some())?;
+                        let i = json!({"id": fresh_id(&root, new_id)?, "sender": owner,
+                            "at": utc_o(ctx.clock.now()), "bodyHash": hash, "cast": cast, "re": re, "hop": hop,
+                            "recipients": recipients});
+                        if let Err(e) = write_intent(&root, &owner, &i) {
+                            // Renamed but maybe not flushed: the intent may outlive a crash, and its id is the way
+                            // back.
+                            let id = super::text(i.get("id"));
+                            return Err(if root.join(&owner).join(format!("{id}.json")).exists() {
+                                unsaved(&id, &[])
+                            } else {
+                                e
+                            });
+                        }
+                        crash_point()?;
                         i
                     }
-                    Found::Mine(_) | Found::Other => {
-                        return refuse(2, "id", "that id belongs to a different send");
-                    }
-                    Found::None => return refuse(2, "id", "no send with that id"),
-                },
-                None => {
-                    let Some((recipients, hop, cast)) =
-                        plan(ctx, caller, &s, &sender, &t, re.as_deref())?
-                    else {
-                        return Ok(Routed::Legacy(Some(Box::new(s))));
-                    };
-                    charge(ctx, &root.join(&owner), sender.id.is_some())?;
-                    let i = json!({"id": fresh_id(&root, new_id)?, "sender": owner, "at": utc_o(ctx.clock.now()),
-                    "bodyHash": hash, "cast": cast, "re": re, "hop": hop, "recipients": recipients});
-                    if let Err(e) = write_intent(&root, &owner, &i) {
-                        // Renamed but maybe not flushed: the intent may outlive a crash, and its id is the way back.
-                        let id = super::text(i.get("id"));
-                        return Err(if root.join(&owner).join(format!("{id}.json")).exists() {
-                            unsaved(&id, &[])
-                        } else {
-                            e
-                        });
-                    }
-                    i
-                }
+                };
+                deliver(ctx, caller, &sender, &root, &owner, &intent, body, word).map(Some)
             };
-            deliver(ctx, caller, &sender, &root, &owner, &intent, body, word).map(Routed::Sent)
+            // Team, then the agent lock of a member sender, then each mailbox: the -Re lookup and every copy inside
+            // it.
+            let sent = match &sender.id {
+                Some(m) => super::lock(ctx, &super::lock_key("agent", caller, m), tx)?,
+                None => tx()?,
+            };
+            match sent {
+                Some(reply) => Ok(Routed::Sent(reply)),
+                None => Ok(Routed::Legacy(Some(Box::new(s)))),
+            }
         },
     )
 }
@@ -534,8 +549,13 @@ fn pane_box(ctx: &Ctx, caller: &Caller, pane: &str) -> Res<Value> {
     )
 }
 
-/// Delivers intent `intent` (one id) to each recipient durably (M5) under the agent lock of a member sender, then
-/// marks it done and writes `last-sent.json`; a failed save refuses 1 `mail` with `id` and `delivered`.
+/// A test hook after the intent is durable; task 11 gives it its test body (a crash right there).
+fn crash_point() -> Res<()> {
+    Ok(())
+}
+
+/// Delivers intent `intent` (one id) to each recipient durably (M5), then marks it done and writes `last-sent.json`;
+/// a failed save refuses 1 `mail` with `id` and `delivered`. The caller holds the agent lock of a member sender.
 #[allow(clippy::too_many_arguments)]
 fn deliver(
     ctx: &Ctx,
@@ -582,10 +602,8 @@ fn deliver(
         }
         Ok(())
     };
-    match &sender.id {
-        Some(m) => super::lock(ctx, &super::lock_key("agent", caller, m), run)?,
-        None => run()?,
-    }
+    // The caller holds the agent lock of a member sender (lock order: team, agent, then each mailbox).
+    run()?;
     let mut reply = Map::new();
     reply.insert("to".into(), word.into());
     reply.insert("id".into(), id.clone().into());
