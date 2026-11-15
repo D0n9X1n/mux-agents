@@ -2726,10 +2726,10 @@ fn generation_evidence_is_read_only_through_gens() {
 #[test]
 fn readme_and_wiki_name_the_herdr_core_dependency() {
     // v0.3.0 runs every agent in a herdr-core (`hc`) terminal; the docs must say so, with the version hc.rs checks.
-    let readme = repo_file("README.md");
+    // The requirement sentence itself, not the badge's alt text.
     assert!(
-        readme.contains("herdr-core 0.1.21"),
-        "README.md names herdr-core 0.1.21"
+        file_lines("README.md").contains(&"Requires herdr-core 0.1.21 or later, with `hc` (or `herdr-core`) on `PATH`: every agent runs in an hc terminal, so it keeps running when its pane closes.".to_string()),
+        "README.md requirement line"
     );
     assert!(
         file_lines("wiki/Usage.md").contains(&"- herdr-core 0.1.21 or later, with `hc` (or `herdr-core`) on `PATH`: every agent runs in an hc terminal.".to_string()),
