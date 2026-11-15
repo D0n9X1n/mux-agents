@@ -1,6 +1,6 @@
 // What this session's own client is doing, reported for the side bar as herdr's agents report theirs (OSC 7501):
-// working while a turn runs, blocked while it asks the person, idle once it ends. Only an agent's own pane is
-// answered; anywhere else `report` refuses `target` and this session stops asking.
+// working while a turn runs, blocked while it asks the person, idle once it ends. Only an agent's own pane or hc
+// terminal is answered; anywhere else `report` refuses `target`, `herdr` or `tagged` and this session stops asking.
 import type { EngineInterface, Register } from 'claude-code'
 
 import { turnCompleted, turnStarted } from './deliver'
@@ -23,25 +23,27 @@ async function reportArgv($: EngineInterface, state: State, kind?: string): Prom
   return ['sh', `${root}/scripts/mux-agent`, ...tail]
 }
 
-// Inside tmux or rmux at all: a pane that could be an agent's. A herdr terminal outside them reports nothing; herdr reads
-// its agents itself (#85).
+// Inside tmux, rmux or an hc terminal: a place that could be an agent's, as deliver.ts inTeam (#137). A plain herdr
+// terminal is refused `herdr` on its first report and asks no more.
 async function inMux($: EngineInterface): Promise<boolean> {
   try {
-    return Boolean((await $.env.get('TMUX')) || (await $.env.get('RMUX')))
+    return Boolean((await $.env.get('HC_TERMINAL_ID')) || (await $.env.get('TMUX')) || (await $.env.get('RMUX')))
   } catch {
     return false
   }
 }
 
-// One report, after every earlier one. A refusal naming the target means this pane is no agent's (or no longer is):
-// no more reports.
-// Every failure is dropped.
+// The refusals that mean this place is no agent's (or no longer is): `target` (no agent here), `herdr` (a plain herdr
+// terminal), `tagged` (not proven a member). After one, no more reports.
+const NOT_AGENT = /"check":"(target|herdr|tagged)"/
+
+// One report, after every earlier one. Every other failure is dropped and the next event reports again.
 async function send($: EngineInterface, state: State, kind?: string) {
   if (agent === false || !(await inMux($))) return
   try {
     const ran = await $.process.run(await reportArgv($, state, kind), { timeoutMs: 10000 })
     if (ran.exitCode === 0) agent = true
-    else if (/"check":"target"/.test(ran.stdout)) agent = false
+    else if (NOT_AGENT.test(ran.stdout)) agent = false
   } catch {
     // The next event reports again.
   }
