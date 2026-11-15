@@ -495,13 +495,14 @@ pub fn mark_seen(ctx: &Ctx, caller: &Caller, pane: &str, changed: &str) -> Res<b
     })
 }
 
-/// herdr's rank: who needs the person first.
+/// The rank of herdr: who needs the person first; on call below needs-you, above done and working (W6).
 fn rank(row: &Map<String, Value>) -> u8 {
     match row.get("activity").and_then(Value::as_str) {
         Some("blocked") => 0,
-        Some("done") => 1,
-        Some("working") => 2,
-        _ => 3,
+        Some("on call") => 1,
+        Some("done") => 2,
+        Some("working") => 3,
+        _ => 4,
     }
 }
 
@@ -561,6 +562,68 @@ mod tests {
         ] {
             assert_eq!(listening(word, on), want, "{word} {on}");
         }
+    }
+
+    #[test]
+    fn the_board_ranks_on_call_below_needs_you_above_done_and_working() {
+        let w = World::human("");
+        w.clock(NOW);
+        let caller = w.caller();
+        let ids = [
+            "0000000000a1",
+            "0000000000b2",
+            "0000000000c3",
+            "0000000000d4",
+        ];
+        let names = ["wk", "dn", "oc", "nd"];
+        let mut folders = Vec::new();
+        let mut panes = Vec::new();
+        for (i, (id, name)) in ids.iter().zip(names).enumerate() {
+            folders.push(member(
+                &w,
+                id,
+                json!({"name": name, "pane": format!("%{}", 10 + i)}),
+            ));
+            panes.push(format!("%{}|@5|{}|{id}|{name}", 10 + i, 300 + i));
+        }
+        let panes: Vec<&str> = panes.iter().map(String::as_str).collect();
+        w.panes(&panes);
+        let report = |i: usize, state: &str| {
+            write(
+                &folders[i].join("activity.json"),
+                json!({"state": state, "kind": null, "since": "2026-10-29T11:59:00.0000000Z"}),
+            )
+        };
+        report(0, "working");
+        report(1, "idle");
+        report(2, "idle");
+        report(3, "blocked");
+        w.fakes.process(crate::testing::row(700, 302, 7000));
+        write(
+            &folders[2].join("waiting-700.json"),
+            json!({"pid": 700, "start": 7000, "since": "2026-10-29T11:59:30.0000000Z",
+            "owner": {"id": ids[2], "gen": "0"}, "until": "2026-10-29T12:10:00.0000000Z"}),
+        );
+        snapshot(
+            &w,
+            &caller,
+            &ids.iter().map(|id| (*id, "running")).collect::<Vec<_>>(),
+        );
+        let reply = board(&w.ctx, &caller, false, true).unwrap();
+        w.fakes.hc_done().unwrap();
+        let got: Vec<String> = reply["agents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| {
+                format!(
+                    "{}={}",
+                    r["name"].as_str().unwrap(),
+                    r["activity"].as_str().unwrap()
+                )
+            })
+            .collect();
+        assert_eq!(got, ["nd=blocked", "oc=on call", "dn=done", "wk=working"]);
     }
 
     #[test]
