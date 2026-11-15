@@ -2,15 +2,17 @@
 //! for the launch commit, runs the client once in this pane, records its exit code; only the legacy form posts an `exited` notice.
 
 use std::io;
-use std::path::{Component, Path};
+use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
 
 use serde_json::{Map, Value, json};
 
+use crate::agents::gens::{self, Decision};
 use crate::agents::spawn::{CMDLINE_MAX, client_named};
 use crate::ctx::Ctx;
 use crate::error::{Refusal, Res};
 use crate::parse::cmdline_length;
+use crate::state::evidence::{self, Evidence, Published};
 use crate::state::fs::{read_json, write_json};
 use crate::state::root::{HOST, OsKind};
 use crate::util::utc_o;
@@ -35,6 +37,56 @@ const COMMIT_WAIT: Duration = Duration::from_secs(30);
 const COMMIT_POLL: Duration = Duration::from_millis(250);
 const OUTSIDE: &str = "mux-agent: the launch spec is outside the state folder";
 const LINK: &str = "mux-agent: the launch spec path has a junction or link";
+const GEN_PATH: &str = "mux-agent: the launch spec path names no generation of a member";
+const FOREIGN: &str = "mux-agent: the launch spec is not this member's launch";
+
+/// The create-once publisher (`evidence::publish` in production): the seam for every publication of the generation
+/// path, so each publication failure is testable.
+pub(crate) type Publish<'a> = &'a mut dyn FnMut(&Path, &Value) -> Res<Published>;
+
+/// What a spec path names (launch-1 G7).
+#[derive(Debug, PartialEq, Eq)]
+enum Spec {
+    /// No `gens` below the state root: the folder-level launch (until A3 Task 14).
+    Folder,
+    /// `<root>/<key>/agents/<id>/gens/<n>/spec.json`: generation n of the member folder.
+    Gen(PathBuf, u64),
+    /// Names `gens` in any other way: refused, never run as a folder.
+    Malformed,
+}
+
+/// `spec` is under `root` (checked by `run_seamed` first; otherwise the path is Malformed). A spec path with no
+/// component equal to `gens` (ignoring ASCII case) below the root is a Folder. One that does name `gens` is a Gen only
+/// when it is exactly `<key>/agents/<id>/gens/<n>/spec.json` and `gens::plain_key`, `gens::plain_id` and
+/// `gens::plain_gen` accept its three names (redesign 3); the member is then joined from the root and those checked
+/// names only.
+fn classify_spec(root: &Path, spec: &Path) -> Spec {
+    if !lexically_under(root, spec) {
+        return Spec::Malformed;
+    }
+    let below: Vec<String> = spec
+        .components()
+        .skip(root.components().count())
+        .map(|c| c.as_os_str().to_string_lossy().into_owned())
+        .collect();
+    if !below.iter().any(|c| c.eq_ignore_ascii_case("gens")) {
+        return Spec::Folder;
+    }
+    match below
+        .iter()
+        .map(String::as_str)
+        .collect::<Vec<_>>()
+        .as_slice()
+    {
+        [key, "agents", id, "gens", n, "spec.json"] => match gens::plain_gen(n) {
+            Some(n) if gens::plain_key(key) && gens::plain_id(id) => {
+                Spec::Gen(root.join(key).join("agents").join(id), n)
+            }
+            _ => Spec::Malformed,
+        },
+        _ => Spec::Malformed,
+    }
+}
 
 /// Starts the client attached to this pane: its path, its arguments, the variables to take out, and `started`, told the
 /// client's pid from the child handle before the wait (#103 D1); its exit code.
@@ -48,7 +100,7 @@ pub fn launcher(ctx: &Ctx, spec: &str) -> i32 {
         let _ = writeln!(io::stderr(), "{line}");
     };
     run(ctx, spec, &mut err, &mut |path, args, remove, started| {
-        let overrides = launch_overrides(ctx)?;
+        let overrides = launch_overrides(ctx, Path::new(spec))?;
         crate::spawn::attached_env(
             path,
             args,
@@ -62,16 +114,21 @@ pub fn launcher(ctx: &Ctx, spec: &str) -> i32 {
     })
 }
 
-/// The client's environment overrides: the launch names its state root and PATH.
-fn launch_overrides(ctx: &Ctx) -> io::Result<Vec<(&'static str, String)>> {
+/// The client's environment overrides: the launch names its state root and PATH; a generation spec also names its
+/// generation (launch-1 G7, `MUX_AGENTS_GEN`).
+fn launch_overrides(ctx: &Ctx, spec: &Path) -> io::Result<Vec<(&'static str, String)>> {
     let root = ctx
         .state_root
         .to_str()
         .ok_or_else(|| io::Error::other("state root is not UTF-8"))?;
-    Ok(vec![
+    let mut all = vec![
         ("MUX_AGENTS_STATE", root.to_string()),
         ("PATH", ctx.env.get("PATH").unwrap_or("").to_string()),
-    ])
+    ];
+    if let Spec::Gen(_, n) = classify_spec(&ctx.state_root, spec) {
+        all.push(("MUX_AGENTS_GEN", n.to_string()));
+    }
+    Ok(all)
 }
 
 pub(crate) fn run(ctx: &Ctx, spec: &str, err: &mut dyn FnMut(&str), start: Start) -> i32 {
@@ -130,6 +187,19 @@ fn run_with(
     start: Start,
     sync: &mut dyn FnMut(&Path, bool) -> io::Result<()>,
 ) -> i32 {
+    run_seamed(ctx, spec, err, start, sync, &mut |at: &Path, v: &Value| {
+        evidence::publish(at, v)
+    })
+}
+
+fn run_seamed(
+    ctx: &Ctx,
+    spec: &str,
+    err: &mut dyn FnMut(&str),
+    start: Start,
+    sync: &mut dyn FnMut(&Path, bool) -> io::Result<()>,
+    publish: Publish,
+) -> i32 {
     let given = Path::new(spec);
     // Only a spec.json inside the state root, its path already canonical (no link on the way), is read.
     if !given.is_absolute()
@@ -143,7 +213,15 @@ fn run_with(
         err(LINK);
         return 2;
     }
-    let folder = given.parent().unwrap_or(given);
+    // On a canonical path: a link cannot make a Gen of a folder-level spec, or the reverse.
+    let folder = match classify_spec(&ctx.state_root, given) {
+        Spec::Folder => given.parent().unwrap_or(given),
+        Spec::Gen(member, n) => return run_gen(ctx, &member, n, err, start, sync, publish),
+        Spec::Malformed => {
+            err(GEN_PATH);
+            return 2;
+        }
+    };
     let spec_value = match claim_spec(given, folder) {
         Ok(Some(v)) => v,
         Ok(None) => return 0,
@@ -291,70 +369,289 @@ fn launch(
         return Ok(1);
     }
     let mut code = 1;
-    let client = launch
-        .get("client")
-        .and_then(Value::as_str)
-        .and_then(client_named);
-    match (client, spec_flags(launch)) {
-        (None, _) => err("mux-agent: the launch spec names no known client"),
-        (Some(_), None) => err("mux-agent: the launch spec names no client flags"),
-        (Some(client), Some(mut args)) => {
-            for arg in launch
-                .get("args")
-                .and_then(Value::as_array)
-                .ok_or_else(|| Refusal::internal("the launch spec has no args"))?
-            {
-                args.push(crate::agents::text(Some(arg)));
-            }
-            let name = crate::agents::spawn::client_name(client);
-            let image = if cfg!(windows) {
-                format!("{name}.exe")
-            } else {
-                name.to_string()
-            };
-            let found = ctx
-                .env
-                .get("PATH")
-                .and_then(|path| crate::mux::find_on_path(&image, path));
-            match found {
-                None => err(&format!("mux-agent: {image} is not on PATH")),
-                Some(executable) => {
-                    let argv: Vec<&str> = args.iter().map(String::as_str).collect();
-                    let length = executable
-                        .as_os_str()
-                        .to_string_lossy()
-                        .encode_utf16()
-                        .count()
-                        + 3
-                        + cmdline_length(&argv);
-                    if length > CMDLINE_MAX {
-                        err(&format!(
-                            "mux-agent: the client command line is too long ({length} characters)"
-                        ));
-                    } else {
-                        // Attached, so the client owns the pane's console; a start that fails is exit 1.
-                        let mut client = Value::Null;
-                        code = start(&executable, &args, &SCRUB, &mut |pid| {
-                            client =
-                                json!({"pid": pid, "start": ctx.os.open(pid).map(|o| o.start)});
-                            let mut now = record.clone();
-                            now.insert("client".into(), client.clone());
-                            // A record that cannot be written proves no member: D1 fails closed.
-                            let _ = write_json(&exit_path, &Value::Object(now));
-                        })
-                        .unwrap_or(1);
-                        if !client.is_null() {
-                            record.insert("client".into(), client);
-                        }
-                    }
-                }
-            }
+    if let Some(found) = client_command(ctx, launch, err)? {
+        // Attached, so the client owns the pane's console; a start that fails is exit 1.
+        let mut client = Value::Null;
+        code = start(&found.executable, &found.args, &SCRUB, &mut |pid| {
+            client = json!({"pid": pid, "start": ctx.os.open(pid).map(|o| o.start)});
+            let mut now = record.clone();
+            now.insert("client".into(), client.clone());
+            // A record that cannot be written proves no member: D1 fails closed.
+            let _ = write_json(&exit_path, &Value::Object(now));
+        })
+        .unwrap_or(1);
+        if !client.is_null() {
+            record.insert("client".into(), client);
         }
     }
     record.insert("exitCode".into(), code.into());
     record.insert("exitedAt".into(), utc_o(ctx.clock.now()).into());
     write_json(&exit_path, &Value::Object(record))?;
     Ok(code)
+}
+
+/// The client a spec names, found on PATH, with its full argument list.
+struct ClientLaunch {
+    executable: PathBuf,
+    args: Vec<String>,
+}
+
+/// The one lookup of a spec's client: its recorded flags then its args, the executable on PATH, the command line
+/// within `CMDLINE_MAX`. A reason it cannot start goes to `err` and answers `Ok(None)`; no `args` array refuses.
+fn client_command(
+    ctx: &Ctx,
+    launch: &Value,
+    err: &mut dyn FnMut(&str),
+) -> Res<Option<ClientLaunch>> {
+    let client = launch
+        .get("client")
+        .and_then(Value::as_str)
+        .and_then(client_named);
+    let (client, mut args) = match (client, spec_flags(launch)) {
+        (None, _) => {
+            err("mux-agent: the launch spec names no known client");
+            return Ok(None);
+        }
+        (Some(_), None) => {
+            err("mux-agent: the launch spec names no client flags");
+            return Ok(None);
+        }
+        (Some(client), Some(args)) => (client, args),
+    };
+    for arg in launch
+        .get("args")
+        .and_then(Value::as_array)
+        .ok_or_else(|| Refusal::internal("the launch spec has no args"))?
+    {
+        args.push(crate::agents::text(Some(arg)));
+    }
+    let name = crate::agents::spawn::client_name(client);
+    let image = if cfg!(windows) {
+        format!("{name}.exe")
+    } else {
+        name.to_string()
+    };
+    let Some(executable) = ctx
+        .env
+        .get("PATH")
+        .and_then(|path| crate::mux::find_on_path(&image, path))
+    else {
+        err(&format!("mux-agent: {image} is not on PATH"));
+        return Ok(None);
+    };
+    let argv: Vec<&str> = args.iter().map(String::as_str).collect();
+    let length = executable
+        .as_os_str()
+        .to_string_lossy()
+        .encode_utf16()
+        .count()
+        + 3
+        + cmdline_length(&argv);
+    if length > CMDLINE_MAX {
+        err(&format!(
+            "mux-agent: the client command line is too long ({length} characters)"
+        ));
+        return Ok(None);
+    }
+    Ok(Some(ClientLaunch { executable, args }))
+}
+
+/// launch-1 G1.2, G12: the spec of generation `n`, only when it is this member's launch n. The record must be a
+/// lifecycle record (`lifecycle: 1`) whose `id` is the folder's name, and it must name n either as `pending.gen` or as
+/// the active `generation`. That entry supplies the expected `hcName` and `sessionId`. Only an absent `hcName` at
+/// generation 0 derives m and the first 8 of the id (G2); `null` or any non-text value is refused. The name must have
+/// the hc shape. `launch.json` must name that hcName and session, and `spec.json` this id, `generation` n as text, and
+/// that session. Anything else, a torn, missing or linked file included, is None, and nothing has been created.
+fn own_spec(member: &Path, n: u64) -> Option<Value> {
+    let id = member.file_name()?.to_str()?;
+    let Evidence::Present(record) = gens::record(member) else {
+        return None;
+    };
+    if !gens::lifecycle(&record) || record.get("id")?.as_str()? != id {
+        return None;
+    }
+    let text = |v: &Value, k: &str| v.get(k).and_then(Value::as_str).map(str::to_owned);
+    let (hc_name, session) = if gens::pending(&record) == Some(n) {
+        let pending = record.get("pending")?;
+        (text(pending, "hcName")?, text(pending, "sessionId")?)
+    } else if gens::active(&record) == Some(n) {
+        // A launcher can read the record only after promotion: the active generation is still its own.
+        let name = match record.get("hcName") {
+            Some(Value::String(s)) => s.clone(),
+            None if n == 0 => format!("m{}", id.get(..8)?),
+            _ => return None,
+        };
+        (name, text(&record, "sessionId")?)
+    } else {
+        return None;
+    };
+    if !crate::agents::core_identity::is_hc_name(&hc_name) {
+        return None;
+    }
+    let Evidence::Present(launch) = gens::read(member, n, "launch") else {
+        return None;
+    };
+    let Evidence::Present(spec) = gens::read(member, n, "spec") else {
+        return None;
+    };
+    let owned = text(&launch, "hcName").as_deref() == Some(hc_name.as_str())
+        && text(&launch, "sessionId").as_deref() == Some(session.as_str())
+        && text(&spec, "id").as_deref() == Some(id)
+        && text(&spec, "generation") == Some(n.to_string())
+        && text(&spec, "sessionId").as_deref() == Some(session.as_str());
+    owned.then_some(spec)
+}
+
+/// launch-1 G4, G7: the launcher of generation `n` of `member`. Order: ownership (`own_spec`, nothing created on
+/// refusal, exit 1 FOREIGN); claim `gens/<n>.claim` = `run` (`Exists`, whatever is there: exit 0, nothing else
+/// touched); flush the claim's folders; `launcher.json` once; the commit wait; the client; `exit.json` once. Every
+/// failure after the won claim leaves `exit.json` with its reason, and exit 1.
+fn run_gen(
+    ctx: &Ctx,
+    member: &Path,
+    n: u64,
+    err: &mut dyn FnMut(&str),
+    start: Start,
+    sync: &mut dyn FnMut(&Path, bool) -> io::Result<()>,
+    publish: Publish,
+) -> i32 {
+    let Some(spec) = own_spec(member, n) else {
+        err(FOREIGN);
+        return 1;
+    };
+    match publish(&gens::claim_path(member, n), &json!("run")) {
+        Ok(Published::Published) => {}
+        Ok(Published::Exists) => return 0,
+        Err(refusal) => {
+            err(&format!(
+                "mux-agent: the launcher failed: {}",
+                refusal.message
+            ));
+            return 1;
+        }
+    }
+    // Final audit (PM): a won claim means no launcher ran this generation. Earlier launcher, client or exit evidence
+    // (anything not Absent by the read rule) is corrupt: nothing starts and nothing more is published. Checked right
+    // after the claim is won, before the claim is flushed and before launcher.json is published.
+    for file in ["launcher", "client", "exit"] {
+        if gens::read(member, n, file) != Evidence::Absent {
+            err(&format!(
+                "mux-agent: the launcher failed: gens/{n}/{file}.json was already there"
+            ));
+            return 1;
+        }
+    }
+    if let Err(e) = flush_claim(&ctx.state_root, member, sync) {
+        err(&format!(
+            "mux-agent: the launcher failed: the generation claim could not be flushed to disk: {e}"
+        ));
+        gen_exit(ctx, member, n, &mut *publish, Some(1), "claim not flushed");
+        return 1;
+    }
+    let own = json!({
+        "pid": ctx.pid,
+        "start": ctx.os.open(ctx.pid).map(|o| o.start),
+        "startedAt": utc_o(ctx.clock.now()),
+    });
+    if !matches!(
+        publish(&gens::path(member, n, "launcher"), &own),
+        Ok(Published::Published)
+    ) {
+        err("mux-agent: the launcher failed: launcher.json could not be published");
+        gen_exit(
+            ctx,
+            member,
+            n,
+            &mut *publish,
+            Some(1),
+            "launcher not published",
+        );
+        return 1;
+    }
+    let stop = match wait_gen_commit(ctx, member, n, &mut *publish) {
+        GenCommit::Decided(Decision::Run) => None,
+        GenCommit::Decided(Decision::Aborted) => Some("aborted"),
+        GenCommit::Decided(Decision::Invalid) => Some("commit invalid"),
+        GenCommit::GaveUp => Some("gave up"),
+        GenCommit::Unreadable => Some("commit unreadable"),
+        GenCommit::Unpublished => Some("give-up not published"),
+    };
+    if let Some(reason) = stop {
+        gen_exit(ctx, member, n, &mut *publish, Some(1), reason);
+        return 1;
+    }
+    let client = client_command(ctx, &spec, err).unwrap_or_else(|refusal| {
+        err(&format!(
+            "mux-agent: the launcher failed: {}",
+            refusal.message
+        ));
+        None
+    });
+    let Some(client) = client else {
+        gen_exit(ctx, member, n, &mut *publish, Some(1), "client not started");
+        return 1;
+    };
+    let started = start(&client.executable, &client.args, &SCRUB, &mut |_pid| {});
+    let (code, reason) = match started {
+        Ok(code) => (code, "exited"),
+        Err(_) => (1, "client not started"),
+    };
+    gen_exit(ctx, member, n, &mut *publish, Some(code), reason);
+    code
+}
+
+/// What the commit wait of a generation ends with.
+#[derive(Debug, PartialEq, Eq)]
+enum GenCommit {
+    /// A whole commit, decided by `gens::decide`.
+    Decided(Decision),
+    /// Absent at 30 s; this launcher published its own `{aborted}`.
+    GaveUp,
+    /// Unreadable at 30 s: nothing published, never overwritten (fix cycle 2).
+    Unreadable,
+    /// Absent at 30 s, the give-up publication failed, and the reread found no decision: nothing created.
+    Unpublished,
+}
+
+/// launch-1 G4, state-0 S6: polls `gens::read(commit)` (the walk of Task 1a step 0) every 250 ms. A whole commit
+/// decides at once. `Absent` and `Unreadable` keep waiting. At 30 s only `Absent` publishes the launcher's own
+/// `{aborted}`, create-once; `Unreadable` publishes nothing and ends `Unreadable` (fix cycle 2). A give-up that lost
+/// the race (`Exists`) or failed (`Err`) rereads: a whole commit acts as decided; else `Unreadable` after `Exists`,
+/// `Unpublished` after `Err`.
+fn wait_gen_commit(ctx: &Ctx, member: &Path, n: u64, publish: Publish) -> GenCommit {
+    let deadline = ctx.clock.now() + COMMIT_WAIT;
+    loop {
+        let seen = gens::read(member, n, "commit");
+        if let Evidence::Present(c) = &seen {
+            return GenCommit::Decided(gens::decide(c));
+        }
+        if ctx.clock.now() >= deadline {
+            if seen == Evidence::Unreadable {
+                return GenCommit::Unreadable;
+            }
+            let give_up = json!({"aborted": true, "at": utc_o(ctx.clock.now())});
+            let failed = match publish(&gens::path(member, n, "commit"), &give_up) {
+                Ok(Published::Published) => return GenCommit::GaveUp,
+                Ok(Published::Exists) => false,
+                Err(_) => true,
+            };
+            return match gens::read(member, n, "commit") {
+                Evidence::Present(c) => GenCommit::Decided(gens::decide(&c)),
+                _ if failed => GenCommit::Unpublished,
+                _ => GenCommit::Unreadable,
+            };
+        }
+        ctx.clock.sleep(COMMIT_POLL);
+    }
+}
+
+/// launch-1 G4: generation n's `exit.json` = `{exitCode, reason, exitedAt}`, create-once through `publish`. An exit
+/// already there is kept (`Exists`): the first reason stands, `client-conflict` included (Task 1c). A failed
+/// publication is not retried: the launcher exits either way, and a generation without an exit stays reserved
+/// (settle-1b). `code` is None only for `client-conflict`, published while the client still runs.
+fn gen_exit(ctx: &Ctx, member: &Path, n: u64, publish: Publish, code: Option<i32>, reason: &str) {
+    let exit = json!({"exitCode": code, "reason": reason, "exitedAt": utc_o(ctx.clock.now())});
+    let _ = publish(&gens::path(member, n, "exit"), &exit);
 }
 
 /// True once the agent is committed; false at once for abort.json. At 30 s the launcher makes commit.json itself as
@@ -384,8 +681,10 @@ fn wait_commit(ctx: &Ctx, folder: &Path) -> bool {
 mod tests {
     use super::*;
     use crate::agents::fixture::{CALLER, ID, World, write};
+    use crate::agents::gens;
     use crate::ctx::Env;
     use crate::parse::cmdline_length;
+    use crate::state::evidence::{self, Evidence};
     use serde_json::{Value, json};
     use std::path::PathBuf;
 
@@ -514,7 +813,16 @@ mod tests {
         let mut w = World::human("");
         w.ctx.env = Env::from_pairs([("PATH", "client-path")]);
         assert_eq!(
-            launch_overrides(&w.ctx).unwrap(),
+            launch_overrides(
+                &w.ctx,
+                &w.ctx
+                    .state_root
+                    .join("k")
+                    .join("agents")
+                    .join(ID)
+                    .join("spec.json")
+            )
+            .unwrap(),
             vec![
                 (
                     "MUX_AGENTS_STATE",
@@ -1329,5 +1637,877 @@ mod tests {
             json!({"pid": 4300, "start": 1600}),
             "kept after the exit"
         );
+    }
+
+    const HC: &str = "m0123abcd";
+    // Generation n of the setup member, pending (launch-1 G1.1): record `lifecycle: 1`, `pending {gen, hcName, sessionId}`;
+    // gens/<n>/spec.json (the folder spec plus id, generation, sessionId) and launch.json (G12). No gens/<n>/commit.json:
+    // the folder-level commit.json of `setup` must never count.
+    fn gen_setup(n: u64) -> (Launch, PathBuf) {
+        let l = setup("claude", json!(["--session-id", "s1"]));
+        edit(&l.folder.join("record.json"), |r| {
+            r["lifecycle"] = json!(1);
+            r["pending"] = json!({"gen": n, "kind": "spawn", "hcName": HC, "sessionId": "s1"});
+        });
+        let mut spec = read_json(&l.spec).unwrap().unwrap();
+        for (k, v) in [
+            ("id", json!(ID)),
+            ("generation", json!(n.to_string())),
+            ("sessionId", json!("s1")),
+        ] {
+            spec[k] = v;
+        }
+        let at = gens::path(&l.folder, n, "spec");
+        evidence::publish(&at, &spec).unwrap();
+        let launch = json!({"hcName": HC, "launcherArgv": [], "sessionId": "s1"});
+        evidence::publish(&gens::path(&l.folder, n, "launch"), &launch).unwrap();
+        (l, at)
+    }
+    fn edit(at: &Path, change: impl FnOnce(&mut Value)) {
+        let mut v = read_json(at).unwrap().unwrap();
+        change(&mut v);
+        std::fs::write(at, serde_json::to_vec(&v).unwrap()).unwrap();
+    }
+    fn commit(l: &Launch, n: u64, body: Value) {
+        evidence::publish(&gens::path(&l.folder, n, "commit"), &body).unwrap();
+    }
+    fn gen_file(l: &Launch, file: &str) -> Value {
+        match gens::read(&l.folder, 1, file) {
+            Evidence::Present(v) => v,
+            other => panic!("{file}: {other:?}"),
+        }
+    }
+    // Writes `body` as gens/1/commit.json right after the nth sleep.
+    fn commit_on_sleep(l: &Launch, nth: usize, body: &'static [u8]) {
+        let at = gens::path(&l.folder, 1, "commit");
+        l.w.fakes.sleep_probe(move |k| {
+            if k == nth {
+                std::fs::write(&at, body).unwrap();
+            }
+        });
+    }
+    // The test's stand-in for the client: told the client pid, answers the exit code.
+    type ClientStart<'a> = &'a mut dyn FnMut(&mut dyn FnMut(u32)) -> io::Result<i32>;
+    struct Seamed {
+        code: i32,
+        err: Vec<String>,
+        started: usize,
+        offered: Vec<PathBuf>,
+    }
+    // `run_seamed` with every flush answering `flushed`, and a publisher that fails the first k offers of each listed
+    // path (Err, nothing written) before it publishes for real; every offered path is recorded.
+    fn seamed(
+        l: &Launch,
+        spec: &Path,
+        flushed: bool,
+        fails: &[(PathBuf, usize)],
+        start: ClientStart,
+    ) -> Seamed {
+        let (mut left, mut offered, mut err, mut started) =
+            (fails.to_vec(), Vec::new(), Vec::new(), 0);
+        let code = run_seamed(
+            &l.w.ctx,
+            spec.to_str().unwrap(),
+            &mut |line: &str| err.push(line.to_string()),
+            &mut |_: &Path, _: &[String], _: &[&str], told: &mut dyn FnMut(u32)| {
+                started += 1;
+                start(told)
+            },
+            &mut |_: &Path, _: bool| {
+                if flushed {
+                    Ok(())
+                } else {
+                    Err(io::Error::other("flush failed"))
+                }
+            },
+            &mut |at: &Path, v: &Value| {
+                offered.push(at.to_path_buf());
+                if let Some((_, k)) = left.iter_mut().find(|(p, k)| p.as_path() == at && *k > 0) {
+                    *k -= 1;
+                    return Err(Refusal::internal("injected publication failure"));
+                }
+                evidence::publish(at, v)
+            },
+        );
+        Seamed {
+            code,
+            err,
+            started,
+            offered,
+        }
+    }
+
+    #[test]
+    fn a_spec_path_is_a_folder_a_generation_or_malformed() {
+        let root = PathBuf::from("state");
+        let m = root.join("0123456789abcdef").join("agents").join(ID);
+        let at = |parts: &[&str]| parts.iter().fold(m.clone(), |p, s| p.join(s));
+        assert_eq!(classify_spec(&root, &at(&["spec.json"])), Spec::Folder);
+        assert_eq!(
+            classify_spec(&root, &at(&["gens", "1", "spec.json"])),
+            Spec::Gen(m.clone(), 1)
+        );
+        assert_eq!(
+            classify_spec(&root, &at(&["gens", "0", "spec.json"])),
+            Spec::Gen(m.clone(), 0)
+        );
+        let other = root
+            .join("0123456789abcdef")
+            .join("notagents")
+            .join(ID)
+            .join("gens")
+            .join("1")
+            .join("spec.json");
+        for bad in [
+            at(&["gens", "01", "spec.json"]),
+            at(&["gens", "+1", "spec.json"]),
+            at(&["gens", "-1", "spec.json"]),
+            at(&["gens", "x", "spec.json"]),
+            at(&["gens", "18446744073709551616", "spec.json"]),
+            at(&["gens", "spec.json"]),
+            at(&["gens", "1", "x", "spec.json"]),
+            at(&["x", "gens", "1", "spec.json"]),
+            at(&["GENS", "1", "spec.json"]),
+            // Redesign 3: an id that is not 12 lowercase hex, or a name that is not plain, never becomes a member.
+            root.join("0123456789abcdef")
+                .join("agents")
+                .join("AAAAAAAAAAAA")
+                .join("gens")
+                .join("1")
+                .join("spec.json"),
+            root.join("0123456789abcdef")
+                .join("agents")
+                .join("..")
+                .join("gens")
+                .join("1")
+                .join("spec.json"),
+            root.join("k")
+                .join("agents")
+                .join(ID)
+                .join("gens")
+                .join("1")
+                .join("spec.json"),
+            root.join("gens").join("1").join("spec.json"),
+            other,
+        ] {
+            assert_eq!(
+                classify_spec(&root, &bad),
+                Spec::Malformed,
+                "{}",
+                bad.display()
+            );
+        }
+    }
+
+    // G7: a path that names `gens` is a generation's or refused; it never reaches the folder-level launch, which would
+    // claim gens/<x>/gens/<n>.claim and decide through agents::committed.
+    #[test]
+    fn a_malformed_generation_path_is_refused_never_run_as_a_folder() {
+        for name in ["01", "x"] {
+            let (l, _) = gen_setup(1);
+            let dir = l.folder.join("gens").join(name);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::copy(gens::path(&l.folder, 1, "spec"), dir.join("spec.json")).unwrap();
+            std::fs::write(dir.join("commit.json"), br#"{"x":1}"#).unwrap();
+            let ran = launch(&l, dir.join("spec.json").to_str().unwrap(), exits_7);
+            assert_eq!((ran.code, ran.started.len()), (2, 0), "{name}");
+            assert_eq!(ran.err, [GEN_PATH], "{name}");
+            for left in [
+                dir.join("gens"),
+                dir.join("launcher.json"),
+                gens::claim_path(&l.folder, 1),
+            ] {
+                assert!(!left.exists(), "{name}: {}", left.display());
+            }
+        }
+    }
+
+    #[test]
+    fn a_gens_spec_claims_its_generation_and_names_it_to_the_client() {
+        let (l, spec) = gen_setup(1);
+        commit(&l, 1, json!({"committed": true}));
+        let ran = launch(&l, spec.to_str().unwrap(), exits_7);
+        assert_eq!((ran.code, ran.started.len()), (7, 1), "{:?}", ran.err);
+        assert_eq!(gens::claim(&l.folder, 1), Evidence::Present(json!("run")));
+        assert!(
+            !gens::dir(&l.folder, 1).join("gens").exists(),
+            "no nested claim"
+        );
+        assert!(!gens::claim_path(&l.folder, 0).exists());
+        let exit = gen_file(&l, "exit");
+        assert_eq!(
+            (&exit["exitCode"], &exit["reason"]),
+            (&json!(7), &json!("exited"))
+        );
+        // G7: the client of a generation spec gets MUX_AGENTS_GEN=<n>; a folder-level launch gets none.
+        let var = |at: &Path| {
+            let all = launch_overrides(&l.w.ctx, at).unwrap();
+            all.into_iter().find(|(k, _)| *k == "MUX_AGENTS_GEN")
+        };
+        assert_eq!(var(&spec), Some(("MUX_AGENTS_GEN", "1".to_string())));
+        assert_eq!(var(&l.spec), None);
+    }
+
+    #[test]
+    fn commit_wait_absent_then_committed_executes_once() {
+        let (l, spec) = gen_setup(1);
+        commit_on_sleep(&l, 3, br#"{"committed":true}"#);
+        let ran = launch(&l, spec.to_str().unwrap(), exits_7);
+        assert_eq!(
+            (ran.code, ran.started.len(), l.w.fakes.slept().len()),
+            (7, 1, 3)
+        );
+        assert_eq!(gen_file(&l, "exit")["reason"], "exited");
+    }
+
+    #[test]
+    fn commit_wait_torn_waits_for_a_whole_read() {
+        let (l, spec) = gen_setup(1);
+        std::fs::write(gens::path(&l.folder, 1, "commit"), br#"{"comm"#).unwrap();
+        commit_on_sleep(&l, 5, br#"{"committed":true}"#);
+        let ran = launch(&l, spec.to_str().unwrap(), exits_7);
+        assert_eq!(
+            (ran.code, ran.started.len()),
+            (7, 1),
+            "a torn commit is not a decision"
+        );
+        assert_eq!(l.w.fakes.slept().len(), 5);
+    }
+
+    #[test]
+    fn commit_wait_unreadable_at_30s_exits_commit_unreadable() {
+        let (l, spec) = gen_setup(1);
+        let at = gens::path(&l.folder, 1, "commit");
+        std::fs::write(&at, b"{").unwrap();
+        let ran = launch(&l, spec.to_str().unwrap(), exits_7);
+        assert_eq!((ran.code, ran.started.len()), (1, 0));
+        assert_eq!(l.w.fakes.slept(), vec![250; 120]);
+        assert_eq!(gen_file(&l, "exit")["reason"], "commit unreadable");
+        assert_eq!(std::fs::read(&at).unwrap(), b"{", "never overwritten");
+    }
+
+    // The commit lands on the clock read at the deadline, after the last Absent: the give-up loses, the commit wins.
+    #[test]
+    fn a_commit_landing_at_the_deadline_wins_over_the_give_up() {
+        let (l, spec) = gen_setup(1);
+        let at = gens::path(&l.folder, 1, "commit");
+        let base = std::cell::Cell::new(None);
+        l.w.fakes.clock_probe(move |ms| {
+            let start = base.get().unwrap_or(ms);
+            base.set(Some(start));
+            if ms >= start + 30_000 && !at.exists() {
+                std::fs::write(&at, br#"{"committed":true}"#).unwrap();
+            }
+        });
+        let ran = launch(&l, spec.to_str().unwrap(), exits_7);
+        assert_eq!((ran.code, ran.started.len()), (7, 1));
+        assert_eq!(gen_file(&l, "commit"), json!({"committed": true}));
+        assert_eq!(gen_file(&l, "exit")["reason"], "exited");
+    }
+
+    #[test]
+    fn an_aborted_contradictory_or_invalid_commit_runs_nothing() {
+        for (body, reason) in [
+            (json!({"aborted": true}), "aborted"),
+            (json!({"committed": true, "aborted": true}), "aborted"),
+            (json!({"x": 1}), "commit invalid"),
+            (json!({"committed": "true"}), "commit invalid"),
+        ] {
+            let (l, spec) = gen_setup(1);
+            commit(&l, 1, body.clone());
+            let ran = launch(&l, spec.to_str().unwrap(), exits_7);
+            assert_eq!((ran.code, ran.started.len()), (1, 0), "{body}");
+            assert_eq!(gen_file(&l, "exit")["reason"], reason, "{body}");
+            assert!(
+                l.w.fakes.slept().is_empty(),
+                "{body}: a whole commit decides at once"
+            );
+        }
+    }
+
+    #[test]
+    fn launcher_json_is_never_rewritten_after_a_give_up() {
+        let (l, spec) = gen_setup(1);
+        let ran = launch(&l, spec.to_str().unwrap(), exits_7);
+        assert_eq!(
+            (ran.code, ran.started.len()),
+            (1, 0),
+            "absent at 30 s: its own aborted commit"
+        );
+        assert_eq!(gen_file(&l, "commit")["aborted"], true);
+        let launcher = gen_file(&l, "launcher");
+        let keys: Vec<&str> = launcher
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(keys, ["pid", "start", "startedAt"]);
+        // Fix cycle 2: the identity values, not only the keys: the fake launcher (World CALLER 4242, start 2000).
+        assert_eq!(
+            (&launcher["pid"], &launcher["start"]),
+            (&json!(4242), &json!(2000))
+        );
+        assert_eq!(gen_file(&l, "exit")["reason"], "gave up");
+    }
+
+    #[test]
+    fn launcher_json_is_unchanged_after_the_client_exits() {
+        let (l, spec) = gen_setup(1);
+        commit(&l, 1, json!({"committed": true}));
+        let at = gens::path(&l.folder, 1, "launcher");
+        let mut during = Vec::new();
+        let code = run(
+            &l.w.ctx,
+            spec.to_str().unwrap(),
+            &mut |_| {},
+            &mut |_, _, _, _| {
+                during = std::fs::read(&at).unwrap();
+                Ok(0)
+            },
+        );
+        assert_eq!(code, 0);
+        assert_eq!(
+            std::fs::read(&at).unwrap(),
+            during,
+            "the exit leaves launcher.json as the client saw it"
+        );
+        assert_eq!(gen_file(&l, "exit")["exitCode"], 0);
+    }
+
+    #[test]
+    fn a_claim_that_cannot_be_flushed_runs_nothing() {
+        let (l, spec) = gen_setup(1);
+        commit(&l, 1, json!({"committed": true}));
+        let r = seamed(&l, &spec, false, &[], &mut |_| Ok(7));
+        assert_eq!((r.code, r.started), (1, 0));
+        assert!(r.err[0].contains("could not be flushed"), "{:?}", r.err);
+        assert_eq!(gens::claim(&l.folder, 1), Evidence::Present(json!("run")));
+        assert_eq!(gen_file(&l, "exit")["reason"], "claim not flushed");
+        assert!(
+            !gens::path(&l.folder, 1, "launcher").exists(),
+            "nothing after a failed flush"
+        );
+    }
+
+    // A failed publication of launcher.json (injected) stops the launch. (A launcher.json already there is the
+    // earlier-evidence refusal below.)
+    #[test]
+    fn a_launcher_json_that_cannot_be_published_runs_nothing() {
+        let (l, spec) = gen_setup(1);
+        commit(&l, 1, json!({"committed": true}));
+        let at = gens::path(&l.folder, 1, "launcher");
+        let r = seamed(&l, &spec, true, &[(at.clone(), 1)], &mut |_| Ok(7));
+        assert_eq!((r.code, r.started), (1, 0));
+        assert!(!at.exists(), "nothing written");
+        assert_eq!(gen_file(&l, "exit")["reason"], "launcher not published");
+    }
+
+    // Final audit (PM): a won claim means no launcher ran this generation. launcher.json, client.json or exit.json
+    // already there (anything not Absent) is corrupt evidence: nothing starts, the error names the file, nothing more
+    // is published, and the file is unchanged. The exit case is the audit repro.
+    #[test]
+    fn a_generation_with_earlier_evidence_runs_nothing() {
+        // Anything but Absent refuses: whole JSON (Present) and torn bytes (Unreadable), for each file.
+        let whole = br#"{"exitCode":1,"reason":"client not started","exitedAt":"x"}"#.as_slice();
+        for (file, body) in ["exit", "launcher", "client"]
+            .into_iter()
+            .flat_map(|f| [(f, whole), (f, b"{".as_slice())])
+        {
+            let (l, spec) = gen_setup(1);
+            commit(&l, 1, json!({"committed": true}));
+            let at = gens::path(&l.folder, 1, file);
+            std::fs::write(&at, body).unwrap();
+            let before = std::fs::read(&at).unwrap();
+            let r = seamed(&l, &spec, true, &[], &mut |told: &mut dyn FnMut(u32)| {
+                told(4300);
+                Ok(7)
+            });
+            assert_eq!((r.code, r.started), (1, 0), "{file}");
+            assert!(
+                r.err[0].contains(&format!("{file}.json")),
+                "{file}: {:?}",
+                r.err
+            );
+            assert_eq!(
+                r.offered,
+                [gens::claim_path(&l.folder, 1)],
+                "{file}: nothing after the claim"
+            );
+            assert_eq!(std::fs::read(&at).unwrap(), before, "{file}: unchanged");
+        }
+    }
+
+    // Final audit: the exit.json the launcher publishes (nothing pre-seeded) carries an exitedAt timestamp.
+    #[test]
+    fn the_launcher_exit_json_has_an_exited_at() {
+        let (l, spec) = gen_setup(1);
+        commit(&l, 1, json!({"committed": true}));
+        let at = gens::path(&l.folder, 1, "exit");
+        let r = seamed(&l, &spec, true, &[], &mut |_| Ok(7));
+        assert_eq!((r.code, r.started), (7, 1));
+        assert!(
+            r.offered.contains(&at),
+            "the exit goes through publish: {:?}",
+            r.offered
+        );
+        let exit = gen_file(&l, "exit");
+        assert!(
+            exit["exitedAt"].as_str().is_some_and(|s| !s.is_empty()),
+            "exitedAt: {exit}"
+        );
+        assert_eq!(
+            (&exit["exitCode"], &exit["reason"]),
+            (&json!(7), &json!("exited"))
+        );
+    }
+
+    // G4 fence on the generation path: a claim already there, whatever it holds, ends the launch before any other
+    // file is offered; a dangling link counts as a claim and is never followed.
+    #[test]
+    fn a_claimed_generation_never_runs_again() {
+        for body in [br#""run""#.as_slice(), br#""abandoned""#, b"corrupt", b""] {
+            let (l, spec) = gen_setup(1);
+            commit(&l, 1, json!({"committed": true}));
+            let claim = gens::claim_path(&l.folder, 1);
+            std::fs::write(&claim, body).unwrap();
+            let r = seamed(&l, &spec, true, &[], &mut |_| Ok(7));
+            assert_eq!((r.code, r.started), (0, 0), "{body:?}");
+            assert_eq!(
+                r.offered,
+                std::slice::from_ref(&claim),
+                "{body:?}: nothing after the lost claim"
+            );
+            assert_eq!(std::fs::read(&claim).unwrap(), body);
+        }
+        #[cfg(unix)]
+        {
+            let (l, spec) = gen_setup(1);
+            commit(&l, 1, json!({"committed": true}));
+            let outside = crate::testing::TempDir::new();
+            let target = outside.path().join("claim");
+            std::os::unix::fs::symlink(&target, gens::claim_path(&l.folder, 1)).unwrap();
+            let r = seamed(&l, &spec, true, &[], &mut |_| Ok(7));
+            assert_eq!((r.code, r.started), (0, 0), "a dangling link is a claim");
+            assert!(!target.exists(), "never followed");
+        }
+    }
+
+    // A competing launcher while the client runs, and the same spec launched again after it exited: neither starts
+    // anything or touches a file.
+    #[test]
+    fn the_same_generation_runs_once_while_it_runs_and_after() {
+        let (l, spec) = gen_setup(1);
+        commit(&l, 1, json!({"committed": true}));
+        let s = spec.to_str().unwrap();
+        let mut inner = None;
+        let code = run(&l.w.ctx, s, &mut |_| {}, &mut |_, _, _, _| {
+            inner = Some(launch(&l, s, exits_7));
+            Ok(7)
+        });
+        let inner = inner.unwrap();
+        assert_eq!(
+            (code, inner.code, inner.started.len()),
+            (7, 0, 0),
+            "the competitor stops at the claim"
+        );
+        assert_eq!(gens::claim(&l.folder, 1), Evidence::Present(json!("run")));
+        let read = |f: &str| std::fs::read(gens::path(&l.folder, 1, f)).unwrap();
+        let (exit, launcher) = (read("exit"), read("launcher"));
+        let again = launch(&l, s, exits_7);
+        assert_eq!(
+            (again.code, again.started.len()),
+            (0, 0),
+            "launched again after the exit"
+        );
+        assert_eq!((read("exit"), read("launcher")), (exit, launcher));
+        assert_eq!(gen_file(&l, "exit")["reason"], "exited");
+    }
+
+    // launch-1 G1.2, G12: a spec in gens/<n>/ whose generation matches but which is not this member's launch n is
+    // refused before the claim; nothing is created.
+    #[test]
+    fn a_spec_that_is_not_this_members_launch_is_refused_unclaimed() {
+        for case in [
+            "spec id",
+            "spec generation",
+            "spec session",
+            "launch hcName",
+            "launch session",
+            "no launch",
+            "torn launch",
+            "pending other gen",
+            "pre-lifecycle",
+            "record id",
+            "gen-0 name at gen 1",
+            "stale active",
+            "torn record",
+        ] {
+            let (l, spec) = gen_setup(1);
+            commit(&l, 1, json!({"committed": true}));
+            let (record, at) = (
+                l.folder.join("record.json"),
+                gens::path(&l.folder, 1, "launch"),
+            );
+            match case {
+                // Another member's valid spec copied here: its own id.
+                "spec id" => edit(&spec, |v| v["id"] = json!("bbbbbbbbbbbb")),
+                "spec generation" => edit(&spec, |v| v["generation"] = json!("2")),
+                "spec session" => edit(&spec, |v| v["sessionId"] = json!("s2")),
+                "launch hcName" => edit(&at, |v| v["hcName"] = json!("m00000000")),
+                "launch session" => edit(&at, |v| v["sessionId"] = json!("s2")),
+                "no launch" => std::fs::remove_file(&at).unwrap(),
+                "torn launch" => std::fs::write(&at, b"{").unwrap(),
+                "pending other gen" => edit(&record, |r| r["pending"]["gen"] = json!(2)),
+                "pre-lifecycle" => edit(&record, |r| {
+                    r.as_object_mut().unwrap().remove("lifecycle");
+                }),
+                "record id" => edit(&record, |r| r["id"] = json!("bbbbbbbbbbbb")),
+                // G2: m<id[..8]> is generation 0's name only.
+                "gen-0 name at gen 1" => {
+                    edit(&record, |r| {
+                        r.as_object_mut().unwrap().remove("pending");
+                        r["generation"] = json!("1");
+                        r["sessionId"] = json!("s1");
+                    });
+                    edit(&at, |v| v["hcName"] = json!("maaaaaaaa"));
+                }
+                // Fix cycle 2: no pending, active generation 2 with this name and session: launch 1 is stale.
+                "stale active" => edit(&record, |r| {
+                    r.as_object_mut().unwrap().remove("pending");
+                    r["generation"] = json!("2");
+                    r["hcName"] = json!(HC);
+                    r["sessionId"] = json!("s1");
+                }),
+                _ => std::fs::write(&record, b"{").unwrap(),
+            }
+            let ran = launch(&l, spec.to_str().unwrap(), exits_7);
+            assert_eq!((ran.code, ran.started.len()), (1, 0), "{case}");
+            assert_eq!(ran.err, [FOREIGN], "{case}");
+            let made = [
+                gens::claim_path(&l.folder, 1),
+                gens::path(&l.folder, 1, "launcher"),
+                gens::path(&l.folder, 1, "exit"),
+            ];
+            for f in made {
+                assert!(!f.exists(), "{case}: {}", f.display());
+            }
+        }
+    }
+
+    #[test]
+    fn a_promoted_or_generation_zero_launch_is_its_members() {
+        // Promoted before the launcher read the record: generation 1 active, with its hcName and session.
+        let (l, spec) = gen_setup(1);
+        edit(&l.folder.join("record.json"), |r| {
+            r.as_object_mut().unwrap().remove("pending");
+            r["generation"] = json!("1");
+            r["hcName"] = json!(HC);
+            r["sessionId"] = json!("s1");
+        });
+        commit(&l, 1, json!({"committed": true}));
+        let ran = launch(&l, spec.to_str().unwrap(), exits_7);
+        assert_eq!(
+            (ran.code, ran.started.len()),
+            (7, 1),
+            "promoted: {:?}",
+            ran.err
+        );
+        assert_eq!(gens::claim(&l.folder, 1), Evidence::Present(json!("run")));
+        // Generation 0 of an existing member: no hcName; launch.json names m<id[..8]> (G2).
+        let (l, spec) = gen_setup(0);
+        edit(&l.folder.join("record.json"), |r| {
+            r.as_object_mut().unwrap().remove("pending");
+            r.as_object_mut().unwrap().remove("hcName");
+            r["generation"] = json!("0");
+            r["sessionId"] = json!("s1");
+        });
+        edit(&gens::path(&l.folder, 0, "launch"), |v| {
+            v["hcName"] = json!("maaaaaaaa")
+        });
+        commit(&l, 0, json!({"committed": true}));
+        let ran = launch(&l, spec.to_str().unwrap(), exits_7);
+        assert_eq!(
+            (ran.code, ran.started.len()),
+            (7, 1),
+            "generation 0: {:?}",
+            ran.err
+        );
+        assert_eq!(gens::claim(&l.folder, 0), Evidence::Present(json!("run")));
+    }
+
+    // state-0 S5: under the member folder the generation path reads its record and, through gens::read, only its
+    // own spec, launch and commit; never a folder-level file, never another generation's.
+    #[test]
+    fn a_generation_reads_only_its_own_evidence() {
+        let (l, spec) = gen_setup(1);
+        commit(&l, 1, json!({"committed": true}));
+        let (ran, reads) =
+            crate::state::fs::record_reads(|| launch(&l, spec.to_str().unwrap(), exits_7));
+        assert_eq!(ran.code, 7, "{:?}", ran.err);
+        let mut under: Vec<PathBuf> = reads
+            .into_iter()
+            .filter(|p| p.starts_with(&l.folder))
+            .collect();
+        under.sort();
+        under.dedup();
+        let mut want = vec![l.folder.join("record.json")];
+        want.extend(["spec", "launch", "commit"].map(|f| gens::path(&l.folder, 1, f)));
+        want.sort();
+        assert_eq!(under, want);
+    }
+
+    // G2: a name that is not `m` and 8 lowercase hex digits belongs to no launch, even where the record and launch.json agree.
+    #[test]
+    fn a_launch_whose_hc_name_is_malformed_is_refused_unclaimed() {
+        let (l, spec) = gen_setup(1);
+        commit(&l, 1, json!({"committed": true}));
+        edit(&l.folder.join("record.json"), |r| {
+            r["pending"]["hcName"] = json!("m0123abcg")
+        });
+        edit(&gens::path(&l.folder, 1, "launch"), |v| {
+            v["hcName"] = json!("m0123abcg")
+        });
+        let ran = launch(&l, spec.to_str().unwrap(), exits_7);
+        assert_eq!((ran.code, ran.started.len()), (1, 0));
+        assert_eq!(ran.err, [FOREIGN]);
+        assert!(!gens::claim_path(&l.folder, 1).exists());
+    }
+
+    // G4: a client that is not on PATH, or whose start fails, leaves exit.json `client not started`, code 1.
+    #[test]
+    fn a_generation_whose_client_cannot_start_records_why() {
+        for case in ["not on PATH", "start error"] {
+            let (l, spec) = gen_setup(1);
+            commit(&l, 1, json!({"committed": true}));
+            if case == "not on PATH" {
+                std::fs::remove_file(l.bin.join(exe_name("claude"))).unwrap();
+            }
+            let ran = launch(&l, spec.to_str().unwrap(), || {
+                Err(io::Error::other("no exec"))
+            });
+            assert_eq!(
+                (ran.code, ran.started.len()),
+                (1, usize::from(case == "start error")),
+                "{case}"
+            );
+            let exit = gen_file(&l, "exit");
+            assert_eq!(
+                (&exit["exitCode"], &exit["reason"]),
+                (&json!(1), &json!("client not started")),
+                "{case}"
+            );
+        }
+    }
+
+    // Fix cycle 2: a claim whose publication fails (Err, not Exists) runs nothing and offers nothing more.
+    #[test]
+    fn a_claim_that_cannot_be_published_runs_nothing() {
+        let (l, spec) = gen_setup(1);
+        commit(&l, 1, json!({"committed": true}));
+        let claim = gens::claim_path(&l.folder, 1);
+        let r = seamed(&l, &spec, true, &[(claim.clone(), 1)], &mut |_| Ok(7));
+        assert_eq!((r.code, r.started), (1, 0));
+        assert_eq!(
+            r.offered,
+            std::slice::from_ref(&claim),
+            "nothing after the failed claim"
+        );
+        assert!(
+            r.err[0].contains("injected publication failure"),
+            "{:?}",
+            r.err
+        );
+        assert!(!claim.exists());
+    }
+
+    // Fix cycle 2, G2: only an absent hcName derives m<id[..8]> at generation 0; null or any non-text value is refused.
+    #[test]
+    fn a_generation_zero_name_that_is_null_or_not_text_is_refused() {
+        for bad in [json!(null), json!(1), json!(["maaaaaaaa"])] {
+            let (l, spec) = gen_setup(0);
+            edit(&l.folder.join("record.json"), |r| {
+                r.as_object_mut().unwrap().remove("pending");
+                r["hcName"] = bad.clone();
+                r["generation"] = json!("0");
+                r["sessionId"] = json!("s1");
+            });
+            edit(&gens::path(&l.folder, 0, "launch"), |v| {
+                v["hcName"] = json!("maaaaaaaa")
+            });
+            commit(&l, 0, json!({"committed": true}));
+            let ran = launch(&l, spec.to_str().unwrap(), exits_7);
+            assert_eq!((ran.code, ran.started.len()), (1, 0), "{bad}");
+            assert_eq!(ran.err, [FOREIGN], "{bad}");
+            assert!(!gens::claim_path(&l.folder, 0).exists(), "{bad}");
+        }
+    }
+
+    // Point 8: a link at an evidence file is refused unopened: the spec by the canonical-path check of run_seamed
+    // (exit 2, LINK); commit, record and launch by the walk of Task 1a step 0 (gens::read, gens::record). One case
+    // per file. Unix only.
+    #[cfg(unix)]
+    #[test]
+    fn linked_generation_evidence_runs_nothing() {
+        for case in ["spec", "commit", "record", "launch"] {
+            let (l, spec) = gen_setup(1);
+            commit(&l, 2, json!({"committed": true}));
+            let out = crate::testing::TempDir::new();
+            let at = match case {
+                "spec" => spec.clone(),
+                "commit" => gens::path(&l.folder, 1, "commit"),
+                "record" => l.folder.join("record.json"),
+                _ => gens::path(&l.folder, 1, "launch"),
+            };
+            let target = if case == "commit" {
+                gens::path(&l.folder, 2, "commit")
+            } else {
+                let copy = out.path().join(format!("{case}.json"));
+                std::fs::rename(&at, &copy).unwrap();
+                copy
+            };
+            std::os::unix::fs::symlink(&target, &at).unwrap();
+            let (r, reads) =
+                crate::state::fs::record_reads(|| seamed(&l, &spec, true, &[], &mut |_| Ok(7)));
+            assert_eq!(r.started, 0, "{case}: {:?}", r.err);
+            assert!(
+                !reads.contains(&target) && !reads.contains(&at),
+                "{case}: opened {reads:?}"
+            );
+            assert!(
+                !r.offered.contains(&gens::path(&l.folder, 1, "commit")),
+                "{case}: no give-up offered"
+            );
+            match case {
+                "spec" => assert_eq!((r.code, r.err.clone()), (2, vec![LINK.to_string()])),
+                "commit" => assert_eq!(
+                    (r.code, gen_file(&l, "exit")["reason"].clone()),
+                    (1, json!("commit unreadable"))
+                ),
+                _ => assert_eq!(
+                    (r.code, r.err.clone()),
+                    (1, vec![FOREIGN.to_string()]),
+                    "{case}"
+                ),
+            }
+        }
+    }
+
+    // Point 8: a dangling commit.json during the wait reads Unreadable, never Absent: no give-up is offered over it.
+    // Unix only.
+    #[cfg(unix)]
+    #[test]
+    fn a_dangling_commit_during_the_wait_is_never_absent() {
+        let (l, spec) = gen_setup(1);
+        let at = gens::path(&l.folder, 1, "commit");
+        std::os::unix::fs::symlink(gens::path(&l.folder, 2, "commit"), &at).unwrap();
+        let r = seamed(&l, &spec, true, &[], &mut |_| Ok(7));
+        assert_eq!((r.code, r.started), (1, 0));
+        assert!(
+            !r.offered.contains(&at),
+            "no give-up offered over a dangling link: {:?}",
+            r.offered
+        );
+        assert_eq!(gen_file(&l, "exit")["reason"], "commit unreadable");
+    }
+
+    // Point 8: a FIFO at commit.json is never opened: the wait reads Unreadable until the deadline and ends
+    // `commit unreadable`. Bounded: the launch runs on a thread with a 30 s limit (the fake clock never sleeps for
+    // real), so an opened FIFO fails the test instead of hanging it. Unix only.
+    #[cfg(unix)]
+    #[test]
+    fn a_fifo_commit_ends_commit_unreadable_within_the_deadline() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let (l, spec) = gen_setup(1);
+            let at = gens::path(&l.folder, 1, "commit");
+            assert!(
+                std::process::Command::new("mkfifo")
+                    .arg(&at)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+            let r = seamed(&l, &spec, true, &[], &mut |_| Ok(7));
+            let _ = tx.send((
+                r.code,
+                r.started,
+                gen_file(&l, "exit")["reason"].clone(),
+                r.offered.contains(&at),
+            ));
+        });
+        let got = rx
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .expect("the wait blocked: the FIFO was opened");
+        assert_eq!(
+            got,
+            (1, 0, json!("commit unreadable"), false),
+            "no give-up offered over the FIFO"
+        );
+    }
+
+    // Fix cycle 2, G4: Unreadable at the deadline is `commit unreadable` and publishes nothing, even when the torn file
+    // is gone by the time a give-up would be written (removed on the clock read at the deadline).
+    #[test]
+    fn a_commit_torn_until_the_deadline_is_never_given_up() {
+        let (l, spec) = gen_setup(1);
+        let at = gens::path(&l.folder, 1, "commit");
+        std::fs::write(&at, b"{").unwrap();
+        let (base, gone) = (std::cell::Cell::new(None), at.clone());
+        l.w.fakes.clock_probe(move |ms| {
+            let start = base.get().unwrap_or(ms);
+            base.set(Some(start));
+            if ms >= start + 30_000 && gone.exists() {
+                std::fs::remove_file(&gone).unwrap();
+            }
+        });
+        let r = seamed(&l, &spec, true, &[], &mut |_| Ok(7));
+        assert_eq!((r.code, r.started), (1, 0));
+        assert_eq!(gen_file(&l, "exit")["reason"], "commit unreadable");
+        assert!(
+            !r.offered.contains(&at),
+            "no give-up offered: {:?}",
+            r.offered
+        );
+        assert!(!at.exists(), "no decision created");
+    }
+
+    // Fix cycle 2, G4: Absent at the deadline, and the give-up publication fails (Err): nothing runs, no decision.
+    #[test]
+    fn a_give_up_that_cannot_be_published_runs_nothing() {
+        let (l, spec) = gen_setup(1);
+        let at = gens::path(&l.folder, 1, "commit");
+        let r = seamed(&l, &spec, true, &[(at.clone(), 1)], &mut |_| Ok(7));
+        assert_eq!((r.code, r.started), (1, 0));
+        assert_eq!(
+            r.offered.iter().filter(|p| **p == at).count(),
+            1,
+            "one give-up offered"
+        );
+        assert!(!at.exists(), "no decision created");
+        assert_eq!(gen_file(&l, "exit")["reason"], "give-up not published");
+    }
+
+    // Fix cycle 2, G4: the give-up publication fails, and a whole commit landed meanwhile: the reread decides.
+    #[test]
+    fn a_failed_give_up_reads_the_decision_that_won() {
+        let (l, spec) = gen_setup(1);
+        let at = gens::path(&l.folder, 1, "commit");
+        let (base, land) = (std::cell::Cell::new(None), at.clone());
+        l.w.fakes.clock_probe(move |ms| {
+            let start = base.get().unwrap_or(ms);
+            base.set(Some(start));
+            if ms >= start + 30_000 && !land.exists() {
+                std::fs::write(&land, br#"{"committed":true}"#).unwrap();
+            }
+        });
+        let r = seamed(&l, &spec, true, &[(at.clone(), 1)], &mut |_| Ok(7));
+        assert_eq!((r.code, r.started), (7, 1), "{:?}", r.err);
+        assert_eq!(
+            r.offered.iter().filter(|p| **p == at).count(),
+            1,
+            "one give-up offered, and it failed"
+        );
+        assert_eq!(gen_file(&l, "exit")["reason"], "exited");
     }
 }

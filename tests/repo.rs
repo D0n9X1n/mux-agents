@@ -2702,3 +2702,23 @@ fn the_release_checklist_names_the_4b_real_client_gate() {
         "the wake turn carries no mail (PM, fix cycle 2)"
     );
 }
+
+// state-0 S5: the launcher and member proof read generation evidence only through `gens` (gens::read, gens::claim,
+// gens::committed, gens::client): no evidence::read, and no raw read of a gens:: path, in their non-test code.
+#[test]
+fn generation_evidence_is_read_only_through_gens() {
+    for path in ["src/launcher.rs", "src/agents/tree.rs"] {
+        let code = without_tests(&repo_file(path));
+        assert!(
+            !code.contains("evidence::read("),
+            "{path}: evidence::read outside gens"
+        );
+        for line in code.lines() {
+            let raw = line.contains("read_json") || line.contains("fs::read(");
+            assert!(
+                !(raw && line.contains("gens::")),
+                "{path}: a raw read of generation evidence: {line}"
+            );
+        }
+    }
+}

@@ -86,6 +86,27 @@ pub fn delivery_id(id: &str, n: u64) -> String {
     format!("exit-{id}-{n}")
 }
 
+/// Redesign 3: an id is 12 lowercase hex (`agents::agent_id`).
+pub fn plain_id(id: &str) -> bool {
+    crate::agents::agent_id(id)
+}
+
+/// A server key is 16 lowercase hex (`caller.rs`: the first 16 of a sha256).
+pub fn plain_key(key: &str) -> bool {
+    key.len() == 16
+        && key
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+/// A generation is canonical decimal: digits only, no leading zero but "0" itself, fits u64.
+pub fn plain_gen(n: &str) -> Option<u64> {
+    let digits = !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit());
+    (digits && (n == "0" || !n.starts_with('0')))
+        .then(|| n.parse().ok())
+        .flatten()
+}
+
 /// A record made by `tx.create` (`lifecycle: 1`); any other is pre-lifecycle (prelife-1c).
 pub fn lifecycle(record: &Value) -> bool {
     record.get("lifecycle").and_then(Value::as_u64) == Some(1)
@@ -485,6 +506,47 @@ mod tests {
         std::fs::create_dir_all(dir(&m, 1)).unwrap();
         std::fs::write(path(&m, 1, "commit"), br#"{"comm"#).unwrap();
         assert_eq!(committed(&m, 1).map_err(|e| e.check), Err("evidence"));
+    }
+
+    // Redesign 3, coordinator point 2: every name is a plain value before any join: `..`, `.`, uppercase, a wrong
+    // length and a leading zero are each refused (id, server key, generation).
+    #[test]
+    fn names_are_plain_values_before_any_join() {
+        assert!(plain_id("0123456789ab") && plain_key("0123456789abcdef"));
+        assert_eq!((plain_gen("0"), plain_gen("17")), (Some(0), Some(17)));
+        for bad in [
+            "..",
+            ".",
+            "AAAAAAAAAAAA",
+            "aaaaaaaaaaa",
+            "aaaaaaaaaaaag",
+            "aaaaaaa.aaaa",
+        ] {
+            assert!(!plain_id(bad), "id {bad}");
+        }
+        for bad in [
+            "..",
+            ".",
+            "0123456789ABCDEF",
+            "0123456789abcde",
+            "k",
+            "01234567./abcdef",
+        ] {
+            assert!(!plain_key(bad), "key {bad}");
+        }
+        for bad in [
+            "..",
+            ".",
+            "01",
+            "00",
+            "+1",
+            "-1",
+            "",
+            "1.",
+            "18446744073709551616",
+        ] {
+            assert_eq!(plain_gen(bad), None, "generation {bad}");
+        }
     }
 
     // S6: an unreadable record.json stops done; it never means done.
