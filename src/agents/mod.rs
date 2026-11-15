@@ -24,6 +24,7 @@ pub(crate) mod member_target;
 pub mod membership;
 pub mod message;
 pub mod placement;
+pub mod receipt;
 pub mod registry;
 pub mod resume;
 pub mod spawn;
