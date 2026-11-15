@@ -4,8 +4,11 @@
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 
+use super::membership::Snapshot;
+use crate::caller::{Caller, Kind};
+use crate::cli::Request;
 use crate::ctx::Ctx;
 use crate::error::{Res, refuse};
 use crate::util::{parse_utc, utc_o};
@@ -290,6 +293,295 @@ pub fn pick(roster: &[Member], sender: Option<&str>, t: &Target) -> Res<Pick> {
         }
         Target::Team => others(&|_| true),
     }
+}
+
+/// What `send` does: the team path ran, or the 0.2 path runs (with the snapshot already taken, if any).
+pub enum Routed {
+    Sent(Map<String, Value>),
+    Legacy(Option<Box<Snapshot>>),
+}
+
+/// The sender: a member (`id`) or a person (`id` None, `key` its pane mailbox).
+struct Sender {
+    id: Option<String>,
+    name: String,
+    key: String,
+    pane: String,
+}
+
+/// `-Re`/`-Id`: 8-32 lowercase hex digits, else 2 `usage`.
+fn flag(request: &Request, name: &str) -> Res<Option<String>> {
+    match request.value(name) {
+        None => Ok(None),
+        Some(v)
+            if (8..=32).contains(&v.len())
+                && v.bytes()
+                    .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase()) =>
+        {
+            Ok(Some(v.into()))
+        }
+        Some(_) => Err(super::usage("send")),
+    }
+}
+
+/// A team send: members (hc- or pane-proven) and persons route through the team under the team lock (M1, M2). A
+/// non-member agent pane, and a person whose name the team lacks, get `Legacy`.
+pub fn route(ctx: &Ctx, caller: &Caller, request: &Request, body: &str) -> Res<Routed> {
+    let (re, id) = (flag(request, "Re")?, flag(request, "Id")?);
+    if re.is_some() && id.is_some() {
+        return Err(super::usage("send"));
+    }
+    let word = request
+        .positional
+        .first()
+        .map(String::as_str)
+        .unwrap_or_default();
+    let team = caller.member.is_some()
+        || super::membership::locals(ctx, caller)?
+            .iter()
+            .any(|l| l.stored.record.get("hcAddress").is_some());
+    if !team {
+        return if re.is_some() || id.is_some() {
+            Err(super::usage("send"))
+        } else {
+            Ok(Routed::Legacy(None))
+        };
+    }
+    let t = target(word)?;
+    // Lock order (M2): team, then (in deliver) the agent of the sender, then each mailbox.
+    super::lock(
+        ctx,
+        &super::lock_key("spawn", caller, &caller.session),
+        || {
+            let s = Snapshot::take(ctx, caller)?;
+            if let Some(e) = &s.core_error {
+                return Err(e.clone());
+            }
+            let me = match s.reader(caller) {
+                Ok(me) => me,
+                Err(_) if caller.member.is_none() && caller.kind == Kind::Agent => {
+                    return Ok(Routed::Legacy(Some(Box::new(s))));
+                }
+                Err(e) => return Err(e),
+            };
+            let sender = match &me.record {
+                Some(r) if r.get("hcAddress").is_some() => Sender {
+                    id: Some(me.key.clone()),
+                    name: me.name.clone(),
+                    key: super::mail::member_mailbox(&me.key, r),
+                    pane: caller.pane.clone(),
+                },
+                Some(_) => return Ok(Routed::Legacy(Some(Box::new(s)))),
+                None => Sender {
+                    id: None,
+                    name: me.name.clone(),
+                    key: me.key.clone(),
+                    pane: caller.pane.clone(),
+                },
+            };
+            let root = sends_root(&super::server_dir(ctx, caller), &caller.session);
+            // A member is keyed by its id (a resumed member has a new id, so its own quota); a person by its pane mailbox.
+            let owner = sender.id.clone().unwrap_or_else(|| sender.key.clone());
+            let hash = crate::util::sha256_hex(body);
+            let intent = match &id {
+                Some(id) => match find_intent(&root, &owner, id)? {
+                    Found::Mine(i) if super::text(i.get("bodyHash")) == hash => i,
+                    Found::Mine(_) | Found::Other => {
+                        return refuse(2, "id", "that id belongs to a different send");
+                    }
+                    Found::None => return refuse(2, "id", "no send with that id"),
+                },
+                None => {
+                    let Some((recipients, hop, cast)) =
+                        plan(ctx, caller, &s, &sender, &t, re.as_deref())?
+                    else {
+                        return Ok(Routed::Legacy(Some(Box::new(s))));
+                    };
+                    charge(ctx, &root.join(&owner), sender.id.is_some())?;
+                    let i = json!({"id": fresh_id(&root, new_id)?, "sender": owner, "at": utc_o(ctx.clock.now()),
+                    "bodyHash": hash, "cast": cast, "re": re, "hop": hop, "recipients": recipients});
+                    write_intent(&root, &owner, &i)?;
+                    i
+                }
+            };
+            deliver(ctx, caller, &sender, &root, &owner, &intent, body, word).map(Routed::Sent)
+        },
+    )
+}
+
+type Plan = (Vec<Value>, u64, Option<&'static str>);
+
+const NOT_SENDER: &str = "a reply goes only to the message's sender";
+
+/// Recipients `[{name, id, box, session, pane?}]`, hop and cast; None: a person names what the team lacks (0.2).
+fn plan(
+    ctx: &Ctx,
+    caller: &Caller,
+    s: &Snapshot,
+    sender: &Sender,
+    t: &Target,
+    re: Option<&str>,
+) -> Res<Option<Plan>> {
+    if re.is_some() && matches!(t, Target::Pane(_) | Target::Team | Target::Children) {
+        return refuse(2, "re", NOT_SENDER);
+    }
+    let answered = match re {
+        Some(id) => match super::mail::find_message(ctx, caller, &sender.key, id)? {
+            Some(m) => Some(m),
+            None => return refuse(2, "re", "no message with that id in your mailbox"),
+        },
+        None => None,
+    };
+    let picked = match t {
+        // As 0.2: the one running member of that name, a lost or unknown rival refusing.
+        Target::Name(n) => match s.running_named(n) {
+            Some((id, record)) => Pick::Members(vec![Member {
+                id,
+                name: n.clone(),
+                record,
+            }]),
+            None if sender.id.is_none() && re.is_none() => return Ok(None),
+            None => return refuse(2, "target", NO_NAME),
+        },
+        _ => pick(&roster(s), sender.id.as_deref(), t)?,
+    };
+    let recipients: Vec<Value> = match picked {
+        Pick::Members(v) => v
+            .iter()
+            .map(|m| {
+                json!({"name": m.name, "id": m.id, "box": m.mailbox(),
+                    "session": claude_session(&m.record)})
+            })
+            .collect(),
+        Pick::Pane(p) => vec![pane_box(ctx, caller, &p)?],
+        Pick::Unknown => return refuse(2, "target", NO_NAME),
+    };
+    let hop = match &answered {
+        None => 0,
+        Some(m) => {
+            let from = super::text(m.get("fromBox"));
+            if recipients.len() != 1
+                || from.is_empty()
+                || super::text(recipients[0].get("box")) != from
+            {
+                return refuse(2, "re", NOT_SENDER);
+            }
+            let hop = m.get("hop").and_then(Value::as_u64).unwrap_or(0) + 1;
+            if hop >= HOP_LIMIT {
+                return refuse(2, "hop", "this reply would be hop 4; the thread is closed");
+            }
+            hop
+        }
+    };
+    let cast = match t {
+        Target::Team => Some("team"),
+        Target::Children => Some("children"),
+        _ => None,
+    };
+    Ok(Some((recipients, hop, cast)))
+}
+
+/// A Claude Code session id of a record, else null.
+fn claude_session(record: &Value) -> Value {
+    record
+        .get("sessionId")
+        .and_then(Value::as_str)
+        .filter(|s| crate::checks::session_id(s))
+        .filter(|_| record.get("client").and_then(Value::as_str) == Some("claude"))
+        .map_or(Value::Null, Value::from)
+}
+
+/// A pane target: a live pane of this session (0.2 check); its mailbox is the running agent there, else `pane-<n>`.
+fn pane_box(ctx: &Ctx, caller: &Caller, pane: &str) -> Res<Value> {
+    super::message::live_pane(ctx, caller, pane)?;
+    let snapshot = super::registry::Snapshot::take(ctx, caller)?;
+    let key = super::registry::mailbox_of(&snapshot, pane)?;
+    let agent = snapshot.at(pane);
+    Ok(
+        json!({"name": agent.as_ref().map_or(pane.to_string(), |a| a.name.clone()),
+        "id": agent.as_ref().map(|a| a.id.clone()), "box": key,
+        "session": agent.as_ref().map_or(Value::Null, |a| claude_session(&a.record)), "pane": pane}),
+    )
+}
+
+/// Delivers intent `intent` (one id) to each recipient durably (M5) under the agent lock of a member sender, then
+/// marks it done and writes `last-sent.json`; a failed save refuses 1 `mail` with `id` and `delivered`.
+#[allow(clippy::too_many_arguments)]
+fn deliver(
+    ctx: &Ctx,
+    caller: &Caller,
+    sender: &Sender,
+    root: &Path,
+    owner: &str,
+    intent: &Value,
+    body: &str,
+    word: &str,
+) -> Res<Map<String, Value>> {
+    let id = super::text(intent.get("id"));
+    let recipients = intent
+        .get("recipients")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let run = || -> Res<()> {
+        let mut delivered = Vec::new();
+        for r in &recipients {
+            let message = json!({"id": id, "from": sender.name, "pane": sender.pane, "at": intent["at"],
+                "body": body, "fromBox": sender.key, "re": intent["re"], "hop": intent["hop"],
+                "cast": intent["cast"]});
+            if super::mail::deliver_once(ctx, caller, &super::text(r.get("box")), &message).is_err()
+            {
+                return Err(refuse::<()>(
+                    1,
+                    "mail",
+                    format!("the message could not be saved; retry with -Id {id}"),
+                )
+                .unwrap_err()
+                .with("id", id.clone())
+                .with("delivered", json!(delivered)));
+            }
+            delivered.push(super::text(r.get("name")));
+        }
+        mark_done(root, owner, &id);
+        if let Some(member) = &sender.id {
+            // Best effort, inside the agent lock: last-sent.json names the last message sent; a send ends a wait.
+            let file = super::server_dir(ctx, caller)
+                .join("agents")
+                .join(member)
+                .join("last-sent.json");
+            let _ = crate::state::fs::write_json(
+                &file,
+                &json!({"line": super::mail::doing_line(body), "at": utc_o(ctx.clock.now())}),
+            );
+            if let Some(folder) = file.parent() {
+                super::message::clear_waiting(folder);
+            }
+        }
+        Ok(())
+    };
+    match &sender.id {
+        Some(m) => super::lock(ctx, &super::lock_key("agent", caller, m), run)?,
+        None => run()?,
+    }
+    let mut reply = Map::new();
+    reply.insert("to".into(), word.into());
+    reply.insert("id".into(), id.clone().into());
+    reply.insert("from".into(), sender.name.clone().into());
+    reply.insert(
+        "recipients".into(),
+        recipients
+            .iter()
+            .map(|r| json!({"name": r["name"], "id": r["id"]}))
+            .collect(),
+    );
+    reply.insert("hop".into(), intent["hop"].clone());
+    reply.insert("re".into(), intent["re"].clone());
+    if let [one] = recipients.as_slice()
+        && one["session"].is_string()
+    {
+        reply.insert("toSessionId".into(), one["session"].clone());
+    }
+    Ok(reply)
 }
 
 #[cfg(test)]

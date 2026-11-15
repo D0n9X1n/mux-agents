@@ -1143,10 +1143,10 @@ fn power_loss_after_each_record_write_leaves_a_complete_record() {
 // v11: send, read, spawn and stop stay bounded during a resume. Real threads and the real locks: a resume of X is
 // paused while it holds the spawn lock, or (spawn lock held) X's mailbox barrier. Meanwhile another thread acts on
 // another member B (a running member of another conversation): `send` to B, `read` as B, `stop` B, or `spawn` a new
-// member. Each completes, or refuses `lock` within LOCK_WAIT; none waits without bound. send, read and stop take no
-// lock the resume holds, so they finish while it is still paused; spawn waits for the spawn lock and finishes within
-// LOCK_WAIT (plus a margin) after the resume gives it back. The lock wait is the real lock's, on the real clock (the
-// seam's), and no case comes near it.
+// member. Each completes, or refuses `lock` within LOCK_WAIT; none waits without bound. read and stop take no lock
+// the resume holds, so they finish while it is still paused; spawn and send (the team lock, #103 4a) wait for the
+// spawn lock and finish within LOCK_WAIT (plus a margin) after the resume gives it back. The lock wait is the real
+// lock's, on the real clock (the seam's), and no case comes near it.
 #[test]
 fn send_read_spawn_and_stop_stay_bounded_during_a_resume() {
     use std::sync::atomic::{AtomicBool, Ordering::SeqCst};
@@ -1215,8 +1215,15 @@ fn send_read_spawn_and_stop_stay_bounded_during_a_resume() {
                 };
                 let request: Vec<&str> = match verb {
                     "send" => {
+                        // A send takes the team lock (#103 4a), so it runs after the resume: Y is committed at t1
+                        // and hc cannot read it here.
                         v.panes(&[]);
-                        look(&v);
+                        cf::online(&v);
+                        cf::listing(&v, &team, &[]);
+                        v.fakes
+                            .hc_expect(&["get", "t1", "--json"], Err(Refusal::internal("busy")));
+                        cf::get(&v, &addr(&xr), terminal(&xr, "exited"));
+                        cf::get(&v, &addr(&br), terminal(&br, "running"));
                         vec!["send", "other", "-Body", "hi"]
                     }
                     "read" => {
@@ -1257,29 +1264,30 @@ fn send_read_spawn_and_stop_stay_bounded_during_a_resume() {
                 wait(&held_rx);
                 let started = Instant::now();
                 let request = v.request(&request);
+                // spawn and send need the spawn lock the resume holds: let the resume go once it is waiting.
+                let waits = verb == "spawn" || verb == "send";
+                if waits {
+                    let go = go_tx.clone();
+                    std::thread::spawn(move || {
+                        std::thread::sleep(Duration::from_millis(300));
+                        go.send(()).unwrap();
+                    });
+                }
                 let got = match verb {
                     "send" => crate::agents::message::send(&v.ctx, &request),
                     "read" => crate::agents::message::read(&v.ctx, &request),
                     "stop" => crate::agents::message::stop_hc(&v.ctx, &request),
-                    _ => {
-                        // spawn needs the spawn lock the resume holds: let the resume go once it is waiting.
-                        let go = go_tx.clone();
-                        std::thread::spawn(move || {
-                            std::thread::sleep(Duration::from_millis(300));
-                            go.send(()).unwrap();
-                        });
-                        crate::agents::spawn::spawn(&v.ctx, &request)
-                    }
+                    _ => crate::agents::spawn::spawn(&v.ctx, &request),
                 };
                 let done = Instant::now();
-                if verb != "spawn" {
+                if !waits {
                     go_tx.send(()).unwrap();
                 }
                 let fixture = v.fakes.hc_done();
-                (got, started, done, fixture)
+                (got, started, done, fixture, waits)
             });
             let resumed = resume_of(&w, ID);
-            let (got, started, done, fixture) = worker.join().unwrap();
+            let (got, started, done, fixture, waits) = worker.join().unwrap();
             let case = format!("{verb} during the resume's {pause} lock");
             assert!(resumed.is_ok(), "{case}: the resume {resumed:?}");
             match &got {
@@ -1295,7 +1303,7 @@ fn send_read_spawn_and_stop_stay_bounded_during_a_resume() {
                 done <= released + crate::state::lock::LOCK_WAIT + margin,
                 "{case}"
             );
-            if verb == "spawn" {
+            if waits {
                 // It waited for the resume's spawn lock, then went on.
                 assert!(done >= released && started < released, "{case}");
             } else {

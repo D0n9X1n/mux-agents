@@ -1,6 +1,9 @@
 use super::*;
+use crate::agents::core_fixture as cf;
 use crate::agents::fixture::World;
+use crate::agents::fixture::{Listed, row_of};
 use crate::agents::tree::tests::{LEADER, child, leader_record};
+use crate::error::Refusal;
 use crate::util::{parse_utc, utc_o};
 use serde_json::json;
 
@@ -331,4 +334,244 @@ fn roster_is_running_committed_unnoticed() {
         roster(&s).into_iter().map(|m| m.id).collect::<Vec<_>>(),
         [LEADER, A]
     );
+}
+
+fn rows(r: &[&str]) -> Vec<Listed> {
+    r.iter().map(|x| row_of(x, &[])).collect()
+}
+
+/// Session $3 with a team record: leader > A (ma1) > B (mb2, copilot); pane rows `rows`.
+fn team_with(w: World, rows: Vec<Listed>) -> World {
+    crate::agents::tree::tests::team_record(&w, &[]);
+    cf::member(
+        &w,
+        LEADER,
+        json!({"name": "leader", "depth": 0, "upTeam": "t", "parentAgent": null, "pane": "%4", "window": "@1"}),
+    );
+    cf::member(
+        &w,
+        A,
+        json!({"name": "ma1", "depth": 1, "parentAgent": {"id": LEADER}, "pane": "%5", "window": "@1"}),
+    );
+    cf::member(
+        &w,
+        B,
+        json!({"name": "mb2", "depth": 2, "parentAgent": {"id": A}, "client": "copilot", "pane": "%6", "window": "@1"}),
+    );
+    w.pane_rows(&rows);
+    w
+}
+
+fn team_world() -> World {
+    team_with(World::human(""), Vec::new())
+}
+
+/// One snapshot: hc running every hc member of session $3 (gets in address order, as core_facts asks).
+fn online(w: &World) {
+    let mut records: Vec<Value> = std::fs::read_dir(w.state().join("agents"))
+        .unwrap()
+        .filter_map(|e| {
+            crate::state::fs::read_json(&e.unwrap().path().join("record.json"))
+                .ok()
+                .flatten()
+        })
+        .filter(|r| r.get("hcAddress").is_some() && r["session"] == "$3")
+        .collect();
+    records.sort_by_key(|r| crate::agents::text(r.get("hcAddress")));
+    cf::online(w);
+    cf::listing(w, &crate::agents::membership::team(&w.caller()), &[]);
+    for r in &records {
+        cf::get(w, r["hcAddress"].as_str().unwrap(), cf::wire(r));
+    }
+}
+
+/// `send` as member `member` (hc-proven) or, with None, as the caller the world resolves.
+fn go(w: &World, member: Option<&str>, args: &[&str]) -> Res<Value> {
+    let mut c = w.caller();
+    if member.is_some() {
+        c.member = member.map(String::from);
+    }
+    let got = crate::agents::message::send_as(&w.ctx, &c, &w.request(args));
+    // Every queued answer must be used by a send that succeeds; a refusal stops early by design, and the test's own
+    // assertion on it is the reported failure (finding 19), not the leftover fixture.
+    if got.is_ok() {
+        w.fakes.hc_done().unwrap();
+    }
+    got.map(Value::Object)
+}
+
+fn said(e: Refusal) -> String {
+    format!("{} {} {}", e.code, e.check, e.message)
+}
+
+fn inbox(w: &World, key: &str) -> Vec<Value> {
+    std::fs::read_to_string(w.state().join("mail").join(format!("{key}.jsonl")))
+        .unwrap_or_default()
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect()
+}
+
+fn a_sends(w: &World) -> usize {
+    std::fs::read_dir(sends_dir(
+        &crate::agents::server_dir(&w.ctx, &w.caller()),
+        "$3",
+        A,
+    ))
+    .map_or(0, |d| d.count())
+}
+
+#[test]
+fn a_broadcast_is_one_id_per_mailbox_none_for_the_sender() {
+    let w = team_world();
+    online(&w);
+    let r = go(&w, Some(A), &["send", "team", "-Body", "hi"]);
+    assert!(r.is_ok(), "{r:?}");
+    let r = r.unwrap();
+    let id = r["id"].as_str().unwrap().to_string();
+    assert_eq!(
+        r["recipients"],
+        json!([{"name": "mb2", "id": B}, {"name": "leader", "id": LEADER}])
+    );
+    for key in [LEADER, B] {
+        let got = inbox(&w, key);
+        assert_eq!(got.len(), 1, "{key}");
+        assert_eq!(
+            (
+                &got[0]["id"],
+                &got[0]["cast"],
+                &got[0]["fromBox"],
+                &got[0]["from"]
+            ),
+            (&json!(id), &json!("team"), &json!(A), &json!("ma1"))
+        );
+    }
+    assert!(inbox(&w, A).is_empty(), "none for the sender");
+    assert_eq!(a_sends(&w), 1, "a broadcast is one intent");
+    cf::member(
+        &w,
+        C,
+        json!({"name": "mc3", "depth": 1, "parentAgent": {"id": LEADER}, "pane": "%8", "window": "@1"}),
+    );
+    assert!(inbox(&w, C).is_empty(), "a later member gets nothing");
+}
+
+#[test]
+fn words_route_from_members_and_persons() {
+    for (member, word, want) in [
+        (Some(A), "parent", LEADER),
+        (Some(B), "parent", A),
+        (Some(B), "leader", LEADER),
+        (Some(A), "children", B),
+        (None, "children", A),
+        (None, "mb2", B),
+        (Some(B), "ma1", A),
+    ] {
+        let w = team_world();
+        online(&w);
+        let r = go(&w, member, &["send", word, "-Body", "x"]).unwrap();
+        let got: Vec<&str> = r["recipients"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|x| x["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(got, [want], "{word}");
+        assert_eq!(inbox(&w, want).len(), 1, "{word}");
+    }
+}
+
+#[test]
+fn another_team_is_refused() {
+    let w = team_world();
+    cf::member(
+        &w,
+        C,
+        json!({"name": "other", "session": "$4", "pane": "%8"}),
+    );
+    online(&w);
+    assert_eq!(
+        said(go(&w, Some(A), &["send", "other", "-Body", "x"]).unwrap_err()),
+        "2 target no agent of this team has that name"
+    );
+    online(&w);
+    let person = said(go(&w, None, &["send", "other", "-Body", "x"]).unwrap_err());
+    assert!(person.starts_with("2 target "), "{person}");
+    assert!(inbox(&w, C).is_empty());
+}
+
+#[test]
+fn without_a_team_record_the_session_members_are_the_team() {
+    let w = team_world();
+    std::fs::remove_file(crate::agents::team::path(
+        &crate::agents::server_dir(&w.ctx, &w.caller()),
+        "$3",
+    ))
+    .unwrap();
+    online(&w);
+    assert_eq!(
+        go(&w, Some(A), &["send", "team", "-Body", "x"]).unwrap()["recipients"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+}
+
+#[test]
+fn a_person_reaches_a_pane_only_agent() {
+    let w = team_with(World::human(""), rows(&["%8|@5|300|0000000000d4|pw"]));
+    w.agent_record(
+        "0000000000d4",
+        json!({"name": "pw", "pane": "%8", "window": "@5"}),
+    );
+    w.recipients_live();
+    online(&w);
+    assert_eq!(
+        go(&w, None, &["send", "pw", "-Body", "hi"]).unwrap()["pane"],
+        "%8",
+        "the 0.2 reply"
+    );
+    assert_eq!(inbox(&w, "0000000000d4").len(), 1);
+}
+
+#[test]
+fn a_non_member_agent_pane_keeps_0_2() {
+    let w = team_with(
+        World::agent("0000000000d4"),
+        rows(&["%1|@1|100|0000000000d4|pw", "%4|@1|101||"]),
+    );
+    w.agent_record(
+        "0000000000d4",
+        json!({"name": "pw", "pane": "%1", "parentPane": "%4"}),
+    );
+    w.recipients_live();
+    w.file("b.md", b"done");
+    online(&w);
+    assert_eq!(
+        go(&w, None, &["send", "parent", "-BodyFile", "b.md"]).unwrap()["pane"],
+        "%4",
+        "the 0.2 reply"
+    );
+    assert_eq!(inbox(&w, "pane-4").len(), 1);
+}
+
+#[test]
+fn a_pane_proven_member_routes_through_the_team() {
+    let mut row = row_of("%1|@1|100|0000000000a1|ma1", &[]);
+    row.command = format!("hc attach t{A}");
+    let w = team_with(World::agent(A), vec![row]);
+    cf::member(
+        &w,
+        A,
+        json!({"name": "ma1", "depth": 1, "parentAgent": {"id": LEADER}, "pane": "%1", "window": "@1"}),
+    );
+    w.file("b.md", b"hi");
+    online(&w);
+    let r = go(&w, None, &["send", "leader", "-BodyFile", "b.md"]).unwrap();
+    assert_eq!(
+        (&r["from"], &r["recipients"][0]["id"]),
+        (&json!("ma1"), &json!(LEADER))
+    );
+    assert_eq!(inbox(&w, LEADER)[0]["fromBox"], A);
 }

@@ -19,11 +19,23 @@ use crate::state::fs::{BODY_MAX, read_json, read_text, write_json};
 
 /// Appends a message to a live agent's, the parent's or a session pane's mailbox. Never types into a pane.
 pub fn send(ctx: &Ctx, request: &Request) -> Res<Map<String, Value>> {
+    if request.value("Body").is_some() == request.value("BodyFile").is_some() {
+        return Err(usage("send"));
+    }
+    let caller = resolve(ctx)?;
+    send_as(ctx, &caller, request)
+}
+
+/// `send` for a resolved caller: the team path first (#103 4a), else 0.2.
+pub fn send_as(
+    ctx: &Ctx,
+    caller: &crate::caller::Caller,
+    request: &Request,
+) -> Res<Map<String, Value>> {
     let (body, body_file) = (request.value("Body"), request.value("BodyFile"));
     if body.is_some() == body_file.is_some() {
         return Err(usage("send"));
     }
-    let caller = resolve(ctx)?;
     let body = match (body, body_file) {
         (Some(_), _) if caller.kind == Kind::Agent => return refuse(2, "usage", FILES_ONLY),
         (Some(body), _) => body.to_string(),
@@ -33,16 +45,51 @@ pub fn send(ctx: &Ctx, request: &Request) -> Res<Map<String, Value>> {
     if body.len() as u64 > BODY_MAX {
         return refuse(2, "usage", "the message is larger than 64 KB");
     }
+    match super::team_mail::route(ctx, caller, request, &body)? {
+        super::team_mail::Routed::Sent(reply) => Ok(reply),
+        super::team_mail::Routed::Legacy(members) => {
+            send_legacy(ctx, caller, request, &body, members.map(|m| *m))
+        }
+    }
+}
+
+/// The pane must be a live pane of this session (0.2): one display-message probe.
+pub(crate) fn live_pane(ctx: &Ctx, caller: &crate::caller::Caller, pane: &str) -> Res<()> {
+    let probe = native(ctx, &["display-message", "-p", "-t", pane, RECIPIENT], true)?;
+    let line = probe.stdout.trim_end_matches(['\r', '\n']);
+    let live = probe.code == 0
+        && line.split_once('|').is_some_and(|(at, session)| {
+            at == pane && session == caller.session && pane_session(session)
+        });
+    if !live {
+        return refuse(
+            2,
+            "target",
+            "the recipient is not a live pane of this session",
+        );
+    }
+    Ok(())
+}
+
+/// The 0.2 send: a non-member agent pane, or a person naming what the team lacks. `members` is the membership
+/// snapshot the team path already took, if any.
+fn send_legacy(
+    ctx: &Ctx,
+    caller: &crate::caller::Caller,
+    request: &Request,
+    body: &str,
+    members: Option<super::membership::Snapshot>,
+) -> Res<Map<String, Value>> {
     let target = first(request);
     // A malformed name refuses before any pane is listed.
     if target != "parent" && !pane_id(target) && !super::agent_name(target) {
         return refuse(2, "target", "no live agent has that name");
     }
     // One snapshot names the sender and the recipient; a tag never names either.
-    let snapshot = registry::Snapshot::take(ctx, &caller)?;
-    let me = match super::membership::proven_self(ctx, &caller) {
+    let snapshot = registry::Snapshot::take(ctx, caller)?;
+    let me = match super::membership::proven_self(ctx, caller) {
         Some(me) => me?,
-        None => self_of(&caller, &snapshot)?,
+        None => self_of(caller, &snapshot)?,
     };
     // Closing a view never stops an agent (#104): a member hc shows running is reachable by name with no live view;
     // its mailbox is its id and no pane is probed for it.
@@ -57,7 +104,10 @@ pub fn send(ctx: &Ctx, request: &Request) -> Res<Map<String, Value>> {
             .as_ref()
             .is_none_or(|a| a.record.get("hcAddress").is_some())
     {
-        let members = super::membership::Snapshot::take(ctx, &caller)?;
+        let members = match members {
+            Some(m) => m,
+            None => super::membership::Snapshot::take(ctx, caller)?,
+        };
         if let Some(error) = members.core_error {
             return Err(error);
         }
@@ -99,23 +149,7 @@ pub fn send(ctx: &Ctx, request: &Request) -> Res<Map<String, Value>> {
                 }
             };
             // The pane must be a live pane of this session; its mailbox is the running agent's there, else `pane-<n>`.
-            let probe = native(
-                ctx,
-                &["display-message", "-p", "-t", &pane, RECIPIENT],
-                true,
-            )?;
-            let line = probe.stdout.trim_end_matches(['\r', '\n']);
-            let live = probe.code == 0
-                && line.split_once('|').is_some_and(|(at, session)| {
-                    at == pane && session == caller.session && pane_session(session)
-                });
-            if !live {
-                return refuse(
-                    2,
-                    "target",
-                    "the recipient is not a live pane of this session",
-                );
-            }
+            live_pane(ctx, caller, &pane)?;
             let key = registry::mailbox_of(&snapshot, &pane)?;
             // The recipient's Claude Code session, when it is one: a running Claude agent's own, or (to `parent`) the session
             // its spawner recorded. The sender's hooks wake it with it (#92).
@@ -146,23 +180,23 @@ pub fn send(ctx: &Ctx, request: &Request) -> Res<Map<String, Value>> {
         let id = match &me.record {
             Some(_) => super::mail::add_member_mail(
                 ctx,
-                &caller,
+                caller,
                 &key,
                 &me.name,
                 &me.key,
                 &caller.pane,
-                &body,
+                body,
             )?,
-            None => add_mail(ctx, &caller, &key, &me.name, &caller.pane, &body, None)?,
+            None => add_mail(ctx, caller, &key, &me.name, &caller.pane, body, None)?,
         };
         if me.record.is_some() {
             // Best effort, inside the sender lock, so last-sent.json names the last appended message.
-            let file = server_dir(ctx, &caller)
+            let file = server_dir(ctx, caller)
                 .join("agents")
                 .join(&me.key)
                 .join("last-sent.json");
             let at = crate::util::utc_o(ctx.clock.now());
-            let _ = write_json(&file, &json!({"line": doing_line(&body), "at": at}));
+            let _ = write_json(&file, &json!({"line": doing_line(body), "at": at}));
             // A message sent is the agent's step done: it no longer waits.
             if let Some(folder) = file.parent() {
                 clear_waiting(folder);
@@ -172,7 +206,7 @@ pub fn send(ctx: &Ctx, request: &Request) -> Res<Map<String, Value>> {
     };
     // Lock order: the sender's agent lock, then (inside add_mail) the recipient's mail lock.
     let id = match me.record {
-        Some(_) => lock(ctx, &lock_key("agent", &caller, &me.key), deliver)?,
+        Some(_) => lock(ctx, &lock_key("agent", caller, &me.key), deliver)?,
         None => deliver()?,
     };
     let mut reply = Map::new();
@@ -1213,7 +1247,7 @@ mod tests {
             cf::get(&w, "tbbbbbbbbbbbb", ty);
             let got = send(&w.ctx, &w.request(&["send", "worker", "-Body", "hi"]));
             match successor {
-                "running" => assert_eq!(got.unwrap()["pane"], "%6"),
+                "running" => assert_eq!(got.unwrap()["recipients"][0]["id"], "bbbbbbbbbbbb"),
                 _ => {
                     let e = got.unwrap_err();
                     assert_eq!((e.code, e.check), (2, "target"), "{}", e.message);
@@ -1743,8 +1777,13 @@ mod tests {
         cf::listing(&w, a["team"].as_str().unwrap(), &[]);
         cf::get(&w, "taaaaaaaaaaaa", cf::wire(&a));
         cf::get(&w, "tbbbbbbbbbbbb", cf::wire(&b));
+        // A person's send to a member goes through the team (#103 4a): the reply names A by id, not by pane.
         let sent = run(&w, send, &["send", "a", "-Body", "hi"]);
-        assert!(sent.starts_with(r#"ok {"to":"a","pane":"%9""#), "{sent}");
+        assert!(sent.starts_with(r#"ok {"to":"a","id":""#), "{sent}");
+        assert!(
+            sent.contains(r#""recipients":[{"name":"a","id":"aaaaaaaaaaaa"}]"#),
+            "{sent}"
+        );
         assert_eq!(read_mail_of(&w, ID), ["hi"]);
         assert!(read_mail_of(&w, "bbbbbbbbbbbb").is_empty());
         let r = cf::member(
@@ -1775,17 +1814,30 @@ mod tests {
         cf::get(&w, "taaaaaaaaaaaa", killed);
         cf::get(&w, "tbbbbbbbbbbbb", cf::wire(&b));
         let sent = run(&w, send, &["send", "b", "-Body", "to b"]);
-        assert!(sent.starts_with(r#"ok {"to":"b","pane":"%8""#), "{sent}");
+        assert!(sent.starts_with(r#"ok {"to":"b","id":""#), "{sent}");
+        assert!(
+            sent.contains(r#""recipients":[{"name":"b","id":"bbbbbbbbbbbb"}]"#),
+            "{sent}"
+        );
         assert_eq!(read_mail_of(&w, "bbbbbbbbbbbb"), ["to b"]);
         let tmux = w.ctx.env.get("TMUX").unwrap().to_string();
         w.ctx.env = crate::ctx::Env::from_pairs([("TMUX", tmux), ("TMUX_PANE", "%8".into())]);
         let caller = w.caller();
         let s = registry::Snapshot::take(&w.ctx, &caller).unwrap();
         assert!(matches!(s.own(&caller), registry::Own::Agent(ref p) if p.id == "bbbbbbbbbbbb"));
-        // B's parent %1 carries A's tag: its mailbox is still pane-1.
+        // B's parent %1 carries A's tag: its mailbox is still pane-1. B is a member, so its send goes through the
+        // team (#103 4a): one hc look proves it, and `parent` falls back to its parentPane.
+        let mut killed = cf::wire(&r);
+        killed["state"] = json!("finished");
+        killed["reason"] = json!("killed");
+        cf::online(&w);
+        cf::listing(&w, a["team"].as_str().unwrap(), &[]);
+        cf::get(&w, "taaaaaaaaaaaa", killed);
+        cf::get(&w, "tbbbbbbbbbbbb", cf::wire(&b));
         let sent = run(&w, send, &["send", "parent", "-Body", "done"]);
+        assert!(sent.starts_with(r#"ok {"to":"parent","id":""#), "{sent}");
         assert!(
-            sent.starts_with(r#"ok {"to":"parent","pane":"%1""#),
+            sent.contains(r#""from":"b","recipients":[{"name":"%1","id":null}]"#),
             "{sent}"
         );
         assert_eq!(read_mail_of(&w, "pane-1").last().unwrap(), "done");
