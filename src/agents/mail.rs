@@ -226,6 +226,73 @@ pub fn header(message: &Value) -> String {
     line
 }
 
+/// R6: rendered UTF-8 bytes per serving, Copilot included.
+pub const BUDGET: usize = 4096;
+
+/// One rendering: its text, the ids it covers in order, those served as references.
+#[derive(Debug, Default, PartialEq)]
+pub struct Batch {
+    pub text: String,
+    pub ids: Vec<String>,
+    pub refs: Vec<String>,
+}
+
+fn entry(m: &Value) -> String {
+    format!("{}\n{}\n", header(m), super::text(m.get("body")))
+}
+
+fn reference(m: &Value) -> String {
+    let id = super::text(m.get("id"));
+    format!(
+        "message {id} from {}, {} bytes: run mux-agent read -Id {id}\n",
+        super::text(m.get("from")),
+        entry(m).len()
+    )
+}
+
+fn held_line(held: &[String]) -> String {
+    format!("{} held: run mux-agent read -Id {}\n", held.len(), held[0])
+}
+
+fn more_line(n: usize) -> String {
+    format!("+{n} more: run mux-agent read\n")
+}
+
+/// R6 over `found` (oldest first): whole entries while they fit; one larger than the budget alone is a reference;
+/// the held trailer is reserved first; what does not fit waits behind `+N more`.
+pub fn batch(found: &[Value], held: &[String]) -> Batch {
+    let reserve = if held.is_empty() {
+        0
+    } else {
+        held_line(held).len()
+    };
+    let mut b = Batch::default();
+    for (n, m) in found.iter().enumerate() {
+        let after = found.len() - n - 1;
+        let tail = if after > 0 { more_line(after).len() } else { 0 };
+        let whole = entry(m);
+        // Alone, with the trailers it needs, does the whole entry fit? Else it is a reference.
+        let piece = if whole.len() + reserve + tail <= BUDGET {
+            whole
+        } else {
+            reference(m)
+        };
+        if b.text.len() + piece.len() + reserve + tail > BUDGET {
+            b.text.push_str(&more_line(found.len() - n));
+            break;
+        }
+        if !piece.starts_with('[') {
+            b.refs.push(super::text(m.get("id")));
+        }
+        b.ids.push(super::text(m.get("id")));
+        b.text.push_str(&piece);
+    }
+    if !held.is_empty() {
+        b.text.push_str(&held_line(held));
+    }
+    b
+}
+
 fn read_or_empty(path: &Path) -> Res<Vec<u8>> {
     match std::fs::read(path) {
         Ok(bytes) => Ok(bytes),
@@ -448,6 +515,75 @@ mod tests {
 
     fn read(path: &Path) -> String {
         std::fs::read_to_string(path).unwrap()
+    }
+
+    /// A message whose rendered entry is exactly `size` UTF-8 bytes, its body ending in `tail`.
+    fn sized(id: &str, size: usize, tail: &str) -> Value {
+        let head = header(&json!({"id": id, "from": "a", "pane": "%5"})).len() + 2; // header LF ... body LF
+        json!({"id": id, "from": "a", "pane": "%5",
+            "body": format!("{}{tail}", "x".repeat(size - head - tail.len()))})
+    }
+
+    #[test]
+    fn the_budget_counts_utf8_bytes_and_trailers() {
+        for tail in ["\u{e9}", "\u{20ac}", "\u{1f600}"] {
+            for (size, whole) in [(BUDGET - 1, true), (BUDGET, true), (BUDGET + 1, false)] {
+                let b = batch(&[sized("1111111111111111", size, tail)], &[]);
+                assert_eq!(b.refs.is_empty(), whole, "{size} {tail}");
+                assert!(b.text.len() <= BUDGET, "{size} {tail}");
+            }
+        }
+        // Oversized: a reference; a later fitting message still follows.
+        let b = batch(
+            &[
+                sized("1111111111111111", 5000, "x"),
+                sized("2222222222222222", 100, "x"),
+            ],
+            &[],
+        );
+        assert_eq!(
+            (b.ids.len(), b.refs.clone()),
+            (2, vec!["1111111111111111".to_string()])
+        );
+        assert!(
+            b.text.starts_with("message 1111111111111111 from a, "),
+            "{}",
+            b.text
+        );
+        assert!(
+            b.text
+                .contains("bytes: run mux-agent read -Id 1111111111111111\n")
+        );
+        // Overflow: what does not fit waits behind one trailer.
+        let three: Vec<Value> = ["1111111111111111", "2222222222222222", "3333333333333333"]
+            .iter()
+            .map(|i| sized(i, 1500, "x"))
+            .collect();
+        let b = batch(&three, &[]);
+        assert_eq!(
+            (
+                b.ids.len(),
+                b.text.ends_with("+1 more: run mux-agent read\n")
+            ),
+            (2, true)
+        );
+        // Ten held ids: one trailer names the oldest; new mail keeps the budget less that trailer.
+        let held: Vec<String> = (0..10).map(|n| format!("{n:016x}")).collect();
+        let trailer = "10 held: run mux-agent read -Id 0000000000000000\n";
+        let fits = sized("4444444444444444", BUDGET - trailer.len(), "\u{20ac}");
+        let b = batch(std::slice::from_ref(&fits), &held);
+        assert!(
+            b.refs.is_empty() && b.text.ends_with(trailer) && b.text.len() == BUDGET,
+            "{}",
+            b.text.len()
+        );
+        let over = sized("4444444444444444", BUDGET - trailer.len() + 1, "\u{20ac}");
+        assert_eq!(batch(&[over], &held).refs, ["4444444444444444"]);
+        assert_eq!(
+            batch(&[], &held).text,
+            trailer,
+            "held only: the trailer, no ids"
+        );
     }
 
     fn msg(id: &str, re: Option<&str>, hop: u64, cast: Option<&str>) -> Value {
