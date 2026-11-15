@@ -932,6 +932,48 @@ mod tests {
         assert!(matches!(ak(&w, "b", &r2.batch).unwrap(), Acked::Done));
     }
 
+    /// QA (4b-i): a successor that has served nothing acks its predecessor's still-pending receipt in their shared
+    /// mailbox: refused `stale receipt`, the cursor unchanged. The stream and held channels, and the same member id
+    /// at another generation.
+    #[test]
+    fn a_successor_cannot_ack_its_predecessors_receipt() {
+        let as_owner =
+            |w: &World, o: &Owner, b: &str| ack(&w.ctx, &w.caller(), "pane-1", o, b, &|| true);
+        let mail = |w: &World| w.state().join("mail");
+        let check = |w: &World, batch: &str, o: &Owner, what: &str| {
+            let before = receipt::load(&mail(w), "pane-1").unwrap();
+            let e = as_owner(w, o, batch);
+            assert!(e.is_err(), "{what}: {e:?}");
+            let e = e.unwrap_err();
+            assert_eq!(
+                (e.code, e.check, e.message.as_str()),
+                (2, "ack", "stale receipt"),
+                "{what}"
+            );
+            assert_eq!(
+                receipt::load(&mail(w), "pane-1").unwrap(),
+                before,
+                "{what}: the cursor is unchanged"
+            );
+        };
+        let other_gen = Owner {
+            id: "a".into(),
+            generation: "1".into(),
+        };
+        // Stream: A's pending receipt, acked by B (new id) and by A at generation 1, neither having served.
+        let w = World::human("");
+        put(&w, H1, "one");
+        let r = sv(&w, "a").unwrap().unwrap();
+        check(&w, &r.batch, &me("b"), "stream, new id");
+        check(&w, &r.batch, &other_gen, "stream, other generation");
+        // Held: A's idPending receipt, the same.
+        let w = World::human("");
+        held_h1(&w);
+        let r = sid(&w, "a", H1).unwrap().unwrap();
+        check(&w, &r.batch, &me("b"), "held, new id");
+        check(&w, &r.batch, &other_gen, "held, other generation");
+    }
+
     #[test]
     fn a_failed_file_flush_keeps_the_old_cursor() {
         let w = World::human("");
