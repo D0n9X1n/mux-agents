@@ -627,6 +627,52 @@ mod tests {
     }
 
     #[test]
+    fn a_leader_with_a_live_lease_is_never_on_call() {
+        let w = World::human("");
+        w.clock(NOW);
+        let caller = w.caller();
+        let ids = ["0000000000a1", "0000000000b2"];
+        let folders = [
+            member(
+                &w,
+                ids[0],
+                json!({"name": "lead", "pane": "%10", "depth": 0, "upTeam": "t"}),
+            ),
+            member(&w, ids[1], json!({"name": "mb", "pane": "%11", "depth": 1})),
+        ];
+        w.panes(&["%10|@5|300|0000000000a1|lead", "%11|@5|301|0000000000b2|mb"]);
+        // W6: each holds a live lease of its own current owner.
+        for (i, (folder, id)) in folders.iter().zip(ids).enumerate() {
+            let pid = 700 + i as u32;
+            w.fakes
+                .process(crate::testing::row(pid, 300 + i as u32, 7000));
+            write(
+                &folder.join(format!("waiting-{pid}.json")),
+                json!({"pid": pid, "start": 7000, "since": "2026-10-29T11:59:30.0000000Z",
+                "owner": {"id": id, "gen": "0"}, "until": "2026-10-29T12:10:00.0000000Z"}),
+            );
+        }
+        snapshot(
+            &w,
+            &caller,
+            &ids.iter().map(|id| (*id, "running")).collect::<Vec<_>>(),
+        );
+        let reply = board(&w.ctx, &caller, false, true).unwrap();
+        w.fakes.hc_done().unwrap();
+        let activity = |name: &str| {
+            reply["agents"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|r| r["name"] == name)
+                .map(|r| r["activity"].clone())
+                .unwrap()
+        };
+        assert_eq!(activity("mb"), "on call", "the member's lease shows");
+        assert_ne!(activity("lead"), "on call", "the leader is never on call");
+    }
+
+    #[test]
     fn the_leader_shows_its_badge() {
         let w = World::human("");
         let leader = json!({"depth": 0, "upTeam": "t"});
