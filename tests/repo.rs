@@ -2617,6 +2617,10 @@ fn skill_teaches_the_wake_and_listening_on_call() {
         "run `read`, quote the nonce in your reply",
         "The wake turn carries no mail",
         r#"When the background `read -Wait 600` ends with `"timeout": true`, start it again in the background"#,
+        // 4b-i: the held cap (receipt::HELD_MAX) and a superseded generation's ack history.
+        "would push the held large messages past 1024 is refused",
+        "drain them with `read -Id <id>`, ack each one, then retry the ack",
+        "the ack history kept for its superseded generation is dropped",
     ] {
         assert!(skill.contains(want), "SKILL.md lacks {want}");
     }
