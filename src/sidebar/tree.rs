@@ -13,10 +13,6 @@ pub(super) struct Node<'a> {
 }
 
 /// Whether the board is a team's feed (#103 B1).
-#[expect(
-    dead_code,
-    reason = "shortcut: no caller until the team bar's layout (Task 11, #103); remove this then"
-)]
 pub(super) fn is_team(board: Option<&Map<String, Value>>) -> bool {
     board.and_then(|b| b.get("team")) == Some(&Value::Bool(true))
 }
@@ -120,7 +116,11 @@ struct Member {
 /// the model, the age, the name (cut with `…`, then removed); below 40 columns a live row shows only its age, at 40 and wider
 /// its word is mandatory too. `need` is the bar width the mandatory parts take, column 0 and the free last column included.
 fn member(node: &Node, width: usize, shown: Option<&str>, look: Look) -> Member {
-    let (row, cols, narrow) = (node.row, width - 2, width < MIN_WIDTH as usize);
+    let (row, cols, narrow) = (
+        node.row,
+        width.saturating_sub(2),
+        width < MIN_WIDTH as usize,
+    );
     let (target, name, age) = (
         Target::of(row),
         clean(row.get("name")),
@@ -399,8 +399,8 @@ impl Team {
 
     /// The PM narrow-width rule over the whole ordered team, before any height folding (#103 A4): a member on a branch the
     /// height folds away still counts. Too narrow: the header and the first widen line that fits (the whole line, then
-    /// `widen: <n> columns`, then `<n>`, so <n> is never cut; none fits: the header alone) and no row; keys still walk
-    /// the whole tree.
+    /// `widen: <n> columns`, then `<n>`, so <n> is never cut, then `<n>` unindented when only the margin does not fit;
+    /// nothing fits: the header alone) and no row; keys still walk the whole tree.
     fn too_narrow(&self, width: usize) -> Option<(Laid, usize)> {
         let need = self.members.iter().map(|m| m.need).max()?;
         if need <= width {
@@ -412,9 +412,14 @@ impl Team {
             need.to_string(),
         ]
         .into_iter()
-        .find(|t| paint::width(t) <= self.cols);
+        .find(|t| paint::width(t) <= self.cols)
+        .map(|n| margin(vec![span(n, PLAIN)]))
+        // No room for the margin: the whole number unindented, the last column still free; else the header alone.
+        .or_else(|| {
+            (paint::width(&need.to_string()) < width).then(|| vec![span(need.to_string(), PLAIN)])
+        });
         let mut rows = vec![self.header.clone()];
-        rows.extend(note.map(|n| margin(vec![span(n, PLAIN)])));
+        rows.extend(note);
         Some((
             Laid {
                 rows,
@@ -558,7 +563,7 @@ pub(super) fn lay_team(
     look: Look,
     focus: Focus,
 ) -> (Laid, usize) {
-    let (cols, nodes) = (size.width - 2, order(board));
+    let (cols, nodes) = (size.width.saturating_sub(2), order(board));
     let mut members: Vec<Member> = nodes
         .iter()
         .map(|n| member(n, size.width, focus.shown, look))
@@ -599,7 +604,10 @@ pub(super) fn lay_team(
         .map(|(n, s)| margin(vec![span(paint::cut(&own_glyphs(n), cols), *s)]))
         .collect();
     let team = Team {
-        header: header(&counts(board), cols),
+        header: cut_row(
+            header(&counts(board), cols),
+            size.width.saturating_sub(1).max(1),
+        ),
         members,
         roots,
         protected,

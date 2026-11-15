@@ -43,13 +43,6 @@ impl Target {
 
 /// B10 `n`/`N`: the next (`forward`) or previous agent of `walk` after `from` with a live view, wrapping; from none,
 /// the first (last) with one; none when no agent has one.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "shortcut: no caller until the team bar's keys and open (Tasks 11-12, #103); remove this then"
-    )
-)]
 pub fn step_live(walk: &[Target], from: Option<usize>, forward: bool) -> Option<usize> {
     let n = walk.len();
     (1..=n)
@@ -214,25 +207,11 @@ impl Pick {
     }
 
     /// Keys wrap at both ends: a team's bar, #103 B10.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "shortcut: no caller until the team bar's keys and open (Tasks 11-12, #103); remove this then"
-        )
-    )]
     pub fn set_wrap(&mut self, wrap: bool) {
         self.wrap = wrap;
     }
 
     /// Selects `drawn[at]` (`n`/`N` in a team), dismissing the note.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "shortcut: no caller until the team bar's keys and open (Tasks 11-12, #103); remove this then"
-        )
-    )]
     pub fn select(&mut self, drawn: &[Target], at: usize) {
         self.note = None;
         self.chosen = drawn.get(at).map(|t| (t.id.clone(), at));

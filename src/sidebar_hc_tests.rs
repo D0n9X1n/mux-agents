@@ -104,6 +104,7 @@ fn click_next_prev_enter_reopen_detached_and_select_attached() {
                 drawn: vec![(ID.to_string(), 0, "\u{25c9} worker".to_string())],
                 width: 40,
                 looking: None,
+                team: false,
             };
             let mut pick = Pick::default();
             if event == Event::Enter {
@@ -203,4 +204,99 @@ fn lifecycle_words_are_visible_in_ascii_and_unicode() {
             );
         }
     }
+}
+
+#[test]
+fn two_members_with_one_name_open_the_one_selected() {
+    let w = World::human("");
+    let c = w.caller();
+    cf::member(&w, ID, json!({"name": "twin"}));
+    cf::member(&w, "bbbbbbbbbbbb", json!({"name": "twin", "pane": "%8"}));
+    let rows: Vec<_> = [("%9", ID), ("%8", "bbbbbbbbbbbb")]
+        .iter()
+        .map(|(p, id)| {
+            let mut r = row_of(&format!("{p}|@5|300||"), &[]);
+            r.command = format!("hc attach t{id}");
+            r
+        })
+        .collect();
+    w.pane_rows(&rows);
+    w.fakes.mux_rule("#{window_active}", 0, "%8|1|1|1\n", "");
+    cf::online(&w);
+    let row = |id: &str, pane: &str, parent: Option<&str>, m: u32| {
+        json!({"id": id, "name": if parent.is_some() { "twin" } else { "lead" },
+        "parentId": parent, "leader": parent.is_none(), "createdAt": format!("2026-10-29T11:{m:02}:00.0000000Z"), "state": "running",
+        "life": "running", "pane": pane, "age": 60})
+    };
+    let board = json!({"team": true, "running": 3, "agents": [row("cccccccccccc", "%7", None, 1), row(ID, "%9", Some("cccccccccccc"), 2),
+        row("bbbbbbbbbbbb", "%8", Some("cccccccccccc"), 3)]});
+    let board = board.as_object().unwrap();
+    let walk = tree::walk(board);
+    let mut pick = Pick::default();
+    pick.set_wrap(true);
+    for _ in 0..3 {
+        pick.key(Event::Down, &walk);
+    }
+    // A redraw: the selection follows the id; its row, not its namesake's, carries the selection.
+    pick.follow(&tree::walk(board));
+    let look = Look::default();
+    let mut laid = lay_focus(
+        Some(board),
+        &[],
+        Size {
+            width: 40,
+            height: 24,
+        },
+        look,
+        tree::Focus {
+            shown: Some("%9"),
+            selected: pick.selected(),
+        },
+    )
+    .0;
+    mark(&mut laid, pick.selected().unwrap(), look);
+    let text: Vec<String> = laid.rows.iter().map(|r| render(r, false)).collect();
+    assert!(
+        text[3].starts_with("\u{25cf}  \u{25c9} twin")
+            && text[4].starts_with("\u{25b8}  \u{25c9} twin"),
+        "{text:?}"
+    );
+    let mut shown = Shown {
+        written: SystemTime::UNIX_EPOCH,
+        targets: walk.clone(),
+        drawn: drawn(&laid),
+        width: 40,
+        looking: Some("%9".into()),
+        team: true,
+    };
+    let read = keys::Read {
+        event: Event::Enter,
+        first: SystemTime::UNIX_EPOCH + Duration::from_secs(1),
+    };
+    assert!(act(&w.ctx, &c, look, read, &mut pick, &mut shown));
+    assert_eq!(
+        (shown.looking.as_deref(), pick.note()),
+        (Some("%8"), None),
+        "its id opens, not its namesake"
+    );
+    let after = lay_focus(
+        Some(board),
+        &[],
+        Size {
+            width: 40,
+            height: 24,
+        },
+        look,
+        tree::Focus {
+            shown: shown.looking.as_deref(),
+            selected: None,
+        },
+    )
+    .0;
+    assert!(
+        render(&after.rows[4], false).starts_with("\u{25cf}")
+            && render(&after.rows[3], false).starts_with(" "),
+        "the mark follows"
+    );
+    w.fakes.hc_done().unwrap();
 }

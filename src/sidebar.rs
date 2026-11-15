@@ -4,13 +4,6 @@
 pub(crate) mod input;
 mod keys;
 mod pick;
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "shortcut: the team bar draws through `lay_team` from Task 11 (#103); remove this then"
-    )
-)]
 mod tree;
 
 use std::cmp::Reverse;
@@ -968,16 +961,22 @@ fn lay(
     size: Size,
     look: Look,
 ) -> Laid {
-    lay_notes(board, notes, size, look).0
+    lay_focus(board, notes, size, look, tree::Focus::default()).0
 }
 
-/// `lay`, and how many of the notes it kept.
-fn lay_notes(
+/// `lay` with what the bar marks (#103): a team board draws as a tree; any other board as before, `focus` unused. Also
+/// how many of the notes it kept.
+fn lay_focus(
     board: Option<&Map<String, Value>>,
     notes: &[(&str, Style)],
     size: Size,
     look: Look,
+    focus: tree::Focus,
 ) -> (Laid, usize) {
+    // A team bar at any width, under 12 columns included, so it can still ask to be widened (#103 A2).
+    if let Some(team) = board.filter(|b| tree::is_team(Some(b))) {
+        return tree::lay_team(team, notes, size, look, focus);
+    }
     if size.width < 12 {
         let max = size.width.saturating_sub(1).max(1);
         let laid = Laid {
@@ -1021,16 +1020,17 @@ fn lay_notes(
 /// `lay` with `HINT` as the last note, only when it costs nothing else: the hinted rows are exactly the bare rows,
 /// then the hint's own rows (the hint alone when the bare rows end in notes, else a blank row and the hint).
 /// Otherwise the bare layout, so the hint goes before any other row or gap.
-fn with_hint(
+fn hinted(
     board: Option<&Map<String, Value>>,
     notes: &[(&str, Style)],
     size: Size,
     look: Look,
+    focus: tree::Focus,
 ) -> Laid {
-    let (bare, kept) = lay_notes(board, notes, size, look);
+    let (bare, kept) = lay_focus(board, notes, size, look, focus);
     let mut hinted_notes = notes.to_vec();
     hinted_notes.push((HINT, DIM));
-    let hinted = lay(board, &hinted_notes, size, look);
+    let hinted = lay_focus(board, &hinted_notes, size, look, focus).0;
     let hint = margin(vec![span(
         paint::cut(HINT, size.width.saturating_sub(2)),
         DIM,
@@ -1045,6 +1045,17 @@ fn with_hint(
         && hinted.rows[..n] == bare.rows[..]
         && hinted.rows[n..] == own[..];
     if fits { hinted } else { bare }
+}
+
+/// `hinted` with nothing marked, for the hint tests that predate the team bar.
+#[cfg(test)]
+fn with_hint(
+    board: Option<&Map<String, Value>>,
+    notes: &[(&str, Style)],
+    size: Size,
+    look: Look,
+) -> Laid {
+    hinted(board, notes, size, look, tree::Focus::default())
 }
 
 /// Marks member `id`'s drawn row as selected: its margin becomes `▸` (`>` in ASCII) and, with color, the rest of the
@@ -1544,11 +1555,32 @@ pub fn run_watch(
         if let Some(note) = note.as_deref() {
             notes.push((note, PLAIN));
         }
-        let bare = lay(last.as_ref(), &notes, size, look);
-        pick.follow(&targets(&bare));
-        let laid = match pick.selected() {
+        let team = tree::is_team(last.as_ref());
+        pick.set_wrap(team);
+        let focus = tree::Focus {
+            shown: viewing.pane.as_deref(),
+            selected: None,
+        };
+        let bare = lay_focus(last.as_ref(), &notes, size, look, focus).0;
+        // A team's keys walk the whole tree, folded agents included (B10); any other bar walks the rows it drew.
+        let walk = match last.as_ref().filter(|_| team) {
+            Some(board) => tree::walk(board),
+            None => targets(&bare),
+        };
+        pick.follow(&walk);
+        let selected = pick.selected().map(str::to_string);
+        let laid = match selected.as_deref() {
             Some(id) => {
-                let mut laid = with_hint(last.as_ref(), &notes, size, look);
+                let mut laid = hinted(
+                    last.as_ref(),
+                    &notes,
+                    size,
+                    look,
+                    tree::Focus {
+                        selected: Some(id),
+                        ..focus
+                    },
+                );
                 mark(&mut laid, id, look);
                 laid
             }
@@ -1559,10 +1591,11 @@ pub fn run_watch(
         }
         let mut shown = Shown {
             written: ctx.clock.now(),
-            targets: targets(&laid),
+            targets: if team { walk } else { targets(&laid) },
             drawn: drawn(&laid),
             width: size.width,
             looking: viewing.pane.clone(),
+            team,
         };
         loop {
             let since = ctx
@@ -1871,6 +1904,8 @@ struct Shown {
     width: usize,
     // The pane the session showed at this frame (herdr's next / previous start from it).
     looking: Option<String>,
+    // A team's bar: keys wrap, `n`/`N` select, ASCII takes clicks (#103).
+    team: bool,
 }
 
 fn focus_target_hc(ctx: &Ctx, caller: &Caller, target: &Target) -> Res<Focused> {
@@ -1921,6 +1956,22 @@ fn act(
         }
         Event::Press { .. } | Event::Release { .. } | Event::Interrupt => false,
         // herdr's next and previous agent (#90), from the pane the session shows, in the bar's order.
+        // A team's n/N select the next/previous agent with a live view, from the selection, else the shown agent (B10).
+        Event::Next | Event::Prev if shown.team => {
+            let from = pick
+                .chosen(&shown.targets)
+                .and_then(|t| shown.targets.iter().position(|w| w.id == t.id))
+                .or_else(|| {
+                    shown
+                        .looking
+                        .as_deref()
+                        .and_then(|p| shown.targets.iter().position(|t| t.pane == p))
+                });
+            if let Some(at) = pick::step_live(&shown.targets, from, read.event == Event::Next) {
+                pick.select(&shown.targets, at);
+            }
+            true
+        }
         Event::Next | Event::Prev => {
             let forward = read.event == Event::Next;
             if let Some(target) =
@@ -8759,6 +8810,230 @@ mod tests {
         }
         assert_eq!(w.fakes.hc_calls().len(), 8);
         w.fakes.hc_done().unwrap();
+    }
+
+    #[test]
+    fn keys_walk_the_whole_tree_and_the_layout_keeps_the_selection() {
+        let board = tree::tests::room();
+        let walk = tree::walk(&board);
+        let (mut pick, mut keys) = (Pick::default(), Decoder::default());
+        pick.set_wrap(true);
+        let mut seen = Vec::new();
+        let downs: [&[u8]; 9] = [
+            b"j", b"\x1b[B", b"j", b"\x1bOB", b"j", b"j", b"j", b"j", b"j",
+        ];
+        for bytes in downs {
+            for read in keys.push(bytes, SystemTime::UNIX_EPOCH) {
+                pick.key(read.event, &walk);
+            }
+            seen.push(pick.selected().unwrap().to_string());
+        }
+        assert_eq!(
+            seen,
+            ["L", "A", "B", "C", "C1", "C2", "D", "D1", "L"],
+            "leader, child, grandchild, next child; wraps; ended and viewless agents too"
+        );
+        let ups: [&[u8]; 2] = [b"k", b"\x1b[A"];
+        for bytes in ups {
+            for read in keys.push(bytes, SystemTime::UNIX_EPOCH) {
+                pick.key(read.event, &walk);
+            }
+        }
+        assert_eq!(pick.selected(), Some("D"), "k wraps to D1, Up goes to D");
+        let ids = |h: usize, shown: Option<&str>, selected: Option<&str>| {
+            lay_focus(
+                Some(&board),
+                &[],
+                Size {
+                    width: 40,
+                    height: h,
+                },
+                PLAIN_LOOK,
+                tree::Focus { shown, selected },
+            )
+            .0
+            .agents
+            .iter()
+            .map(|(t, _)| t.id.clone())
+            .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            ids(3, Some("%15"), Some("D1")),
+            ["L", "D1"],
+            "fallback: the selection on another branch than the shown agent"
+        );
+        assert_eq!(
+            ids(3, None, Some("D1")),
+            ["L", "D1"],
+            "fallback: no agent shown"
+        );
+        // The same through `hinted`, as `run_watch` draws a selection: the row selected on another branch stays drawn.
+        let mut seen = hinted(
+            Some(&board),
+            &[],
+            Size {
+                width: 40,
+                height: 3,
+            },
+            PLAIN_LOOK,
+            tree::Focus {
+                shown: Some("%15"),
+                selected: Some("D1"),
+            },
+        );
+        mark(&mut seen, "D1", PLAIN_LOOK);
+        assert!(
+            seen.rows
+                .iter()
+                .any(|r| render(r, false).starts_with("\u{25b8}")),
+            "through hinted: {:?}",
+            seen.rows.len()
+        );
+        assert!(
+            !ids(7, Some("%15"), None).contains(&"C2".to_string()),
+            "C2 is folded at height 7"
+        );
+        assert!(
+            ids(7, Some("%15"), Some("C2")).contains(&"C2".to_string()),
+            "a folded agent reached by the keys is shown"
+        );
+        // n/N select the next/previous agent with a live view (C2 has none), never focusing; Esc clears.
+        let w = World::human("");
+        let c = w.caller();
+        w.fakes.clear_log();
+        let mut shown = Shown {
+            written: SystemTime::UNIX_EPOCH,
+            targets: walk.clone(),
+            drawn: Vec::new(),
+            width: 40,
+            looking: Some("%15".into()),
+            team: true,
+        };
+        let mut pick = Pick::default();
+        let mut step = |event: Event, pick: &mut Pick| {
+            act(
+                &w.ctx,
+                &c,
+                PLAIN_LOOK,
+                keys::Read {
+                    event,
+                    first: SystemTime::UNIX_EPOCH,
+                },
+                pick,
+                &mut shown,
+            );
+            pick.selected().map(str::to_string)
+        };
+        let got: Vec<_> = [
+            Event::Next,
+            Event::Prev,
+            Event::Next,
+            Event::Next,
+            Event::Next,
+            Event::Prev,
+            Event::Esc,
+        ]
+        .into_iter()
+        .map(|e| step(e, &mut pick))
+        .collect();
+        let want = [
+            Some("D"),
+            Some("C1"),
+            Some("D"),
+            Some("D1"),
+            Some("L"),
+            Some("D1"),
+            None,
+        ]
+        .map(|s| s.map(str::to_string));
+        assert_eq!(got, want);
+        assert!(
+            w.fakes.mux_calls().is_empty() && w.fakes.hc_calls().is_empty(),
+            "n/N and Esc focus nothing"
+        );
+        // ASCII alike: `#` marks the shown agent, `>` the selection.
+        let ascii = Look {
+            ascii: true,
+            ..PLAIN_LOOK
+        };
+        let mut laid = lay_focus(
+            Some(&board),
+            &[],
+            Size {
+                width: 40,
+                height: 24,
+            },
+            ascii,
+            tree::Focus {
+                shown: Some("%15"),
+                selected: Some("D"),
+            },
+        )
+        .0;
+        mark(&mut laid, "D", ascii);
+        let text: Vec<String> = laid.rows.iter().map(|r| render(r, false)).collect();
+        assert!(
+            text.iter().any(|l| l.starts_with("#    * C1"))
+                && text.iter().any(|l| l.starts_with(">  * D")),
+            "{text:?}"
+        );
+    }
+
+    #[test]
+    fn a_team_bar_narrower_than_12_still_asks_to_be_widened() {
+        use tree::tests::{member, team};
+        let board = team(vec![
+            member("L", None, 1, json!({})),
+            member("A", Some("L"), 2, json!({})),
+            member("G", Some("A"), 3, json!({})),
+            member(
+                "Z",
+                Some("G"),
+                4,
+                json!({"name": "zed", "state": "exited 2147483647", "life": "ended", "exitCode": 2147483647,
+                "pane": null, "unread": 9}),
+            ),
+        ]);
+        // Z needs 34. The decorated forms keep their margin; at 3 `34` fits unindented with the last column free; at 1 the title alone.
+        for (width, note) in [
+            (33, Some(" widen the bar: needs 34 columns")),
+            (20, Some(" widen: 34 columns")),
+            (11, Some(" 34")),
+            (4, Some(" 34")),
+            (3, Some("34")),
+            (1, None),
+        ] {
+            for look in [
+                PLAIN_LOOK,
+                Look {
+                    ascii: true,
+                    ..PLAIN_LOOK
+                },
+            ] {
+                let laid = lay_focus(
+                    Some(&board),
+                    &[],
+                    Size { width, height: 24 },
+                    look,
+                    tree::Focus::default(),
+                )
+                .0;
+                let text: Vec<String> = laid.rows.iter().map(|r| render(r, false)).collect();
+                assert!(laid.agents.is_empty(), "{width}: {text:?}");
+                assert!(
+                    laid.rows.iter().all(|r| row_width(r) < width.max(2)),
+                    "{width}: the last column stays free: {text:?}"
+                );
+                assert_eq!(text.get(1).map(String::as_str), note, "{width}: {text:?}");
+                if width < 12 {
+                    let title = text[0].trim().trim_end_matches("...");
+                    assert!(
+                        "mux-agents".starts_with(title),
+                        "{width}: the cut title: {text:?}"
+                    );
+                }
+            }
+        }
     }
 }
 
