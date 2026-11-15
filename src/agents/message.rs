@@ -142,7 +142,19 @@ pub fn send(ctx: &Ctx, request: &Request) -> Res<Map<String, Value>> {
         }
     };
     let deliver = || {
-        let id = add_mail(ctx, &caller, &key, &me.name, &caller.pane, &body, None)?;
+        // A member's line names the member it came from (#103 review: a team bar counts it by identity).
+        let id = match &me.record {
+            Some(_) => super::mail::add_member_mail(
+                ctx,
+                &caller,
+                &key,
+                &me.name,
+                &me.key,
+                &caller.pane,
+                &body,
+            )?,
+            None => add_mail(ctx, &caller, &key, &me.name, &caller.pane, &body, None)?,
+        };
         if me.record.is_some() {
             // Best effort, inside the sender lock, so last-sent.json names the last appended message.
             let file = server_dir(ctx, &caller)
@@ -2117,5 +2129,19 @@ mod tests {
         w.file("b.md", b"done");
         assert!(run(&w, send, &["send", "parent", "-BodyFile", "b.md"]).starts_with("ok "));
         assert_eq!(read_mail_of(&w, "pane-4"), ["done"]);
+    }
+
+    // #103 review: a member's message names the member it came from, so a team bar counts it by identity, not by pane.
+    #[test]
+    fn a_members_message_names_its_member_id() {
+        let w = agent_world();
+        w.file("b.md", b"ok");
+        assert!(run(&w, send, &["send", "parent", "-BodyFile", "b.md"]).starts_with("ok "));
+        let mailbox = std::fs::read_to_string(w.state().join("mail").join("pane-4.jsonl")).unwrap();
+        let line: Value = serde_json::from_str(mailbox.lines().last().unwrap()).unwrap();
+        assert_eq!(
+            (&line["from"], &line["fromId"]),
+            (&json!("worker"), &json!(ID))
+        );
     }
 }

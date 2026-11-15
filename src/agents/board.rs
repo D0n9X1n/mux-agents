@@ -76,23 +76,32 @@ pub fn board(ctx: &Ctx, caller: &Caller, all: bool, watch: bool) -> Res<Map<Stri
         Some(stored) => super::mail::member_mailbox(&reader, &stored.record),
         None => reader,
     };
-    // #103 A3: in a team, a member's parent mailbox comes from `parentAgent.id` and the parent's record (an inherited
-    // `mailbox` honoured), so its unread holds whether the parent is attached, detached, Lost or Ended. Outside a team: the
-    // parent pane, as before.
-    let parents: HashMap<String, String> = if leader.is_some() {
+    // #103 A3 and review: in a team, a member's mail reaches its parent in every mailbox it can land in: the parent's own
+    // (from `parentAgent.id` and its record, an inherited `mailbox` honoured), the one `send parent` reaches on the parent
+    // pane (the running agent's there, else `pane-<n>`), and `pane-<parentPane>`, where exit notices go. A team row sums
+    // them, de-duplicated, by member identity, so its unread holds whether the parent is attached, detached, Lost or
+    // Ended, and after the member's own view reopens on another pane. Outside a team: the parent pane, as before.
+    let parents: HashMap<String, Vec<String>> = if leader.is_some() {
         members
             .iter()
-            .filter_map(|o| {
-                let parent = snapshot.records[&o.identity.id]
-                    .record
-                    .get("parentAgent")?
-                    .get("id")?
-                    .as_str()?;
-                let stored = snapshot.records.get(parent)?;
-                Some((
-                    o.identity.id.clone(),
-                    super::mail::member_mailbox(parent, &stored.record),
-                ))
+            .map(|o| {
+                let record = &snapshot.records[&o.identity.id].record;
+                let own = record
+                    .get("parentAgent")
+                    .and_then(|p| p.get("id"))
+                    .and_then(Value::as_str)
+                    .and_then(|parent| {
+                        let stored = snapshot.records.get(parent)?;
+                        Some(super::mail::member_mailbox(parent, &stored.record))
+                    });
+                let notices = mailbox_key(&super::text(record.get("parentPane")), "").ok();
+                let mut boxes: Vec<String> = [own, parent_key(record, &panes), notices]
+                    .into_iter()
+                    .flatten()
+                    .collect();
+                boxes.sort();
+                boxes.dedup();
+                (o.identity.id.clone(), boxes)
             })
             .collect()
     } else {
@@ -102,11 +111,11 @@ pub fn board(ctx: &Ctx, caller: &Caller, all: bool, watch: bool) -> Res<Map<Stri
         members
             .iter()
             .filter(|o| o.life == Life::Running || leader.is_some())
-            .filter_map(|o| {
-                parents
-                    .get(&o.identity.id)
-                    .cloned()
-                    .or_else(|| parent_key(&snapshot.records[&o.identity.id].record, &panes))
+            .flat_map(|o| match parents.get(&o.identity.id) {
+                Some(boxes) => boxes.clone(),
+                None => parent_key(&snapshot.records[&o.identity.id].record, &panes)
+                    .into_iter()
+                    .collect(),
             })
             .collect()
     } else {
@@ -265,8 +274,8 @@ struct Rows<'a> {
     watch: bool,
     // The team's leader on the bar's feed (#103 B1); none outside a team and off the bar.
     leader: Option<String>,
-    // Each team member's parent mailbox (#103 A3); empty outside a team.
-    parents: &'a HashMap<String, String>,
+    // Each team member's parent mailboxes (#103 A3 and review); empty outside a team.
+    parents: &'a HashMap<String, Vec<String>>,
 }
 
 impl Rows<'_> {
@@ -313,19 +322,30 @@ impl Rows<'_> {
             .get("createdAt")
             .and_then(Value::as_str)
             .and_then(|created| age_seconds(created, self.now));
-        let mailbox = match &self.reader {
-            Some(reader) => Some(reader.clone()),
-            None => self
-                .parents
-                .get(id)
-                .cloned()
-                .or_else(|| parent_key(record, self.running)),
+        let legacy = format!("{name}|{pane}");
+        let unread = match (&self.reader, self.parents.get(id)) {
+            (Some(reader), _) => self
+                .unread
+                .get(reader)
+                .and_then(|counts| counts.get(&legacy))
+                .copied()
+                .unwrap_or(0),
+            // A team row (#103 review): every parent mailbox, de-duplicated; the lines naming this member (`#<id>`), and
+            // the lines naming no member by name and pane (`<from>|<pane>` less those that name one, `!<from>|<pane>`).
+            (None, Some(boxes)) => boxes
+                .iter()
+                .filter_map(|key| self.unread.get(key))
+                .map(|counts| {
+                    let got = |k: &str| counts.get(k).copied().unwrap_or(0);
+                    got(&format!("#{id}")) + got(&legacy).saturating_sub(got(&format!("!{legacy}")))
+                })
+                .sum(),
+            (None, None) => parent_key(record, self.running)
+                .and_then(|key| self.unread.get(&key))
+                .and_then(|counts| counts.get(&legacy))
+                .copied()
+                .unwrap_or(0),
         };
-        let unread = mailbox
-            .and_then(|key| self.unread.get(&key))
-            .and_then(|counts| counts.get(&format!("{name}|{pane}")))
-            .copied()
-            .unwrap_or(0);
         let mut row = Map::new();
         row.insert("name".into(), field("name"));
         row.insert("client".into(), field("client"));
@@ -2046,6 +2066,69 @@ mod tests {
                 .unwrap()
                 .clone();
             assert_eq!(kid["unread"], json!(1), "{case}: the parent is {case}");
+        }
+    }
+
+    // #103 review: a team row's unread follows its member, not its pane. Real delivery (send's own mailer and the board's
+    // reaper posting the exit notice), the view closing and reopening on another pane, then the board.
+    #[test]
+    fn a_team_rows_unread_follows_its_member_across_a_reopened_view() {
+        for team in [true, false] {
+            let w = World::human("");
+            w.clock(NOW);
+            let caller = w.caller();
+            let up = if team { json!("T") } else { Value::Null };
+            member(
+                &w,
+                ID,
+                json!({"name": "lead", "pane": "%8", "parentPane": null, "parentAgent": null, "depth": 0, "upTeam": up,
+                "createdAt": "2026-10-29T11:00:00.0000000Z"}),
+            );
+            let kid = "cccccccccccc";
+            member(
+                &w,
+                kid,
+                json!({"name": "kid", "pane": "%9", "parentPane": "%8", "parentAgent": {"id": ID}, "depth": 1,
+                "createdAt": "2026-10-29T11:30:00.0000000Z"}),
+            );
+            // `send parent` from the kid on %9: the running lead on %8 gets it, through the mailer `send` uses.
+            let lead = read_json(&w.folder(ID).join("record.json"))
+                .unwrap()
+                .unwrap();
+            let to = crate::agents::mail::member_mailbox(ID, &lead);
+            crate::agents::mail::add_member_mail(&w.ctx, &caller, &to, "kid", kid, "%9", "hi")
+                .unwrap();
+            // The kid's view closed and reopened on %19, as `restore_view` records it.
+            let mut r = read_json(&w.folder(kid).join("record.json"))
+                .unwrap()
+                .unwrap();
+            r["pane"] = json!("%19");
+            r["startCommand"] = crate::agents::fixture::launch_command("%19").into();
+            write(&w.folder(kid).join("record.json"), r);
+            w.panes(&["%8|@5|300|aaaaaaaaaaaa|lead"]);
+            // The kid then stopped: the board's reaper posts its exit notice to `pane-8` (registry::add_notice).
+            snapshot(&w, &caller, &[(ID, "running"), (kid, "stopped")]);
+            let reply = board(&w.ctx, &caller, true, true).unwrap();
+            w.fakes.hc_done().unwrap();
+            let notices =
+                std::fs::read_to_string(w.state().join("mail").join("pane-8.jsonl")).unwrap();
+            assert!(
+                notices.contains("exit-cccccccccccc"),
+                "team {team}: the notice was delivered: {notices}"
+            );
+            let row = reply["agents"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|r| r["name"] == "kid")
+                .unwrap()
+                .clone();
+            // In a team the message and the notice both count; outside a team only running members' mail, as before.
+            assert_eq!(
+                row["unread"],
+                json!(if team { 2 } else { 0 }),
+                "team {team}"
+            );
         }
     }
 }

@@ -93,6 +93,24 @@ pub fn add_mail(
     Ok(id)
 }
 
+/// `add_mail` from a member: the line also names the member it came from (`fromId`), so a team bar counts it by
+/// identity, whichever pane the member's view is on now (#103 review). `read` shows the same fields as before.
+pub fn add_member_mail(
+    ctx: &Ctx,
+    caller: &Caller,
+    key: &str,
+    from: &str,
+    from_id: &str,
+    from_pane: &str,
+    body: &str,
+) -> Res<String> {
+    let id = crate::util::guid()?.replace('-', "")[..8].to_string();
+    let message = json!({"id": id, "from": from, "fromId": from_id, "pane": from_pane,
+        "at": crate::util::utc_o(ctx.clock.now()), "body": body});
+    append_message(ctx, caller, key, &message, None)?;
+    Ok(id)
+}
+
 /// Appends message `id` with `fields` after its body, unless the mailbox already holds a parsable line with that
 /// id: then nothing is added (only the LF it may lack) and that stored message is the answer.
 #[allow(clippy::too_many_arguments)]
@@ -339,6 +357,16 @@ pub fn unread_counts(ctx: &Ctx, caller: &Caller, key: &str) -> Res<HashMap<Strin
             super::text(message.get("from")),
             super::text(message.get("pane"))
         );
+        // A line naming its member (`fromId`) also counts as `#<id>`, and as `!<from>|<pane>` so a team row adds the
+        // lines without one by name and pane and never counts a line twice (#103 review).
+        if let Some(id) = message
+            .get("fromId")
+            .and_then(Value::as_str)
+            .filter(|id| !id.is_empty())
+        {
+            *counts.entry(format!("#{id}")).or_insert(0) += 1;
+            *counts.entry(format!("!{from}")).or_insert(0) += 1;
+        }
         *counts.entry(from).or_insert(0) += 1;
     }
     Ok(counts)

@@ -596,6 +596,8 @@ pub fn add_notice(
         let mut fields = Map::new();
         fields.insert("kind".into(), kind.into());
         fields.insert("exitCode".into(), code.clone());
+        // The member it is about, so a team bar counts it by identity (#103 review).
+        fields.insert("fromId".into(), id.into());
         mail::add_once(
             ctx,
             caller,
