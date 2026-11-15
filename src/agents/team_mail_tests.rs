@@ -708,3 +708,139 @@ fn an_uncertain_intent_returns_its_id_and_the_retry_settles_it() {
     );
     assert_eq!((inbox(&w, LEADER).len(), a_sends(&w)), (1, 1));
 }
+
+/// A message from A in the mailbox of B at `hop`.
+fn seed(w: &World, id: &str, hop: u64, cast: Option<&str>) {
+    crate::agents::mail::deliver_once(
+        &w.ctx,
+        &w.caller(),
+        B,
+        &json!({"id": id, "from": "ma1", "pane": "%5",
+        "at": "x", "body": "q", "fromBox": A, "re": null, "hop": hop, "cast": cast}),
+    )
+    .unwrap();
+}
+
+#[test]
+fn replies_go_to_the_sender_until_hop_4() {
+    for hop in 0..3u64 {
+        let w = team_world();
+        seed(&w, "1111111111111111", hop, None);
+        online(&w);
+        let r = go(
+            &w,
+            Some(B),
+            &["send", "parent", "-Body", "a", "-Re", "1111111111111111"],
+        )
+        .unwrap();
+        assert_eq!(
+            (&r["hop"], &r["re"]),
+            (&json!(hop + 1), &json!("1111111111111111")),
+            "hop {hop}"
+        );
+        assert_eq!(inbox(&w, A)[0]["hop"], hop + 1);
+    }
+    let w = team_world();
+    seed(&w, "1111111111111111", 3, None);
+    online(&w);
+    assert_eq!(
+        said(
+            go(
+                &w,
+                Some(B),
+                &["send", "ma1", "-Body", "a", "-Re", "1111111111111111"]
+            )
+            .unwrap_err()
+        ),
+        "2 hop this reply would be hop 4; the thread is closed"
+    );
+    let w = team_world();
+    seed(&w, "1111111111111111", 0, Some("team"));
+    let not = "2 re a reply goes only to the message's sender";
+    for word in ["team", "children", "%5"] {
+        online(&w); // routing takes its membership snapshot before it refuses a reply target (cross-family audit)
+        assert_eq!(
+            said(
+                go(
+                    &w,
+                    Some(B),
+                    &["send", word, "-Body", "a", "-Re", "1111111111111111"]
+                )
+                .unwrap_err()
+            ),
+            not,
+            "{word}"
+        );
+    }
+    online(&w);
+    assert_eq!(
+        said(
+            go(
+                &w,
+                Some(B),
+                &["send", "leader", "-Body", "a", "-Re", "1111111111111111"]
+            )
+            .unwrap_err()
+        ),
+        not
+    );
+    online(&w);
+    assert_eq!(
+        said(
+            go(
+                &w,
+                Some(B),
+                &["send", "ma1", "-Body", "a", "-Re", "2222222222222222"]
+            )
+            .unwrap_err()
+        ),
+        "2 re no message with that id in your mailbox"
+    );
+    assert_eq!(
+        go(&w, Some(B), &["send", "ma1", "-Body", "a", "-Re", "zz"])
+            .unwrap_err()
+            .check,
+        "usage"
+    );
+    assert_eq!(
+        go(
+            &w,
+            Some(B),
+            &[
+                "send",
+                "ma1",
+                "-Body",
+                "a",
+                "-Re",
+                "1111111111111111",
+                "-Id",
+                "1111111111111111"
+            ]
+        )
+        .unwrap_err()
+        .check,
+        "usage"
+    );
+}
+
+#[test]
+fn a_reply_reaches_a_since_resumed_sender() {
+    let w = team_world();
+    seed(&w, "1111111111111111", 0, None);
+    // A2 resumed A: same name, inherits the mailbox of A; A is superseded.
+    cf::member(
+        &w,
+        "0000000000a9",
+        json!({"name": "ma1", "depth": 1, "parentAgent": {"id": LEADER}, "pane": "%9",
+        "window": "@1", "resumedFrom": A, "mailbox": A}),
+    );
+    online(&w);
+    let r = go(
+        &w,
+        Some(B),
+        &["send", "ma1", "-Body", "a", "-Re", "1111111111111111"],
+    )
+    .unwrap();
+    assert_eq!(r["recipients"][0]["id"], "0000000000a9");
+    assert_eq!(inbox(&w, A).len(), 1, "the inherited mailbox of A");
+}
