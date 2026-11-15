@@ -338,7 +338,7 @@ fn claim(ctx: &Ctx, caller: &Caller) -> Res<Claim> {
                 .is_none_or(|s| s == caller.session);
         if here {
             // As `registry::own_record`: its own id is its folder's, its session the caller's (QA round 2, fix 2).
-            let valid = super::text(record.get("id")) == id
+            let valid = record.get("id").and_then(Value::as_str) == Some(id.as_str())
                 && record.get("session").and_then(Value::as_str) == Some(caller.session.as_str());
             found.push((
                 record.get("hcAddress").is_some(),
