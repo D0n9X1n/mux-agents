@@ -1023,7 +1023,7 @@ fn only_id(w: &World) -> String {
 }
 
 #[test]
-fn power_loss_after_the_intent_counts_it_and_the_retry_adds_none() {
+fn a_crash_boundary_after_the_intent_counts_it_and_the_retry_adds_none() {
     let w = team_world();
     online(&w);
     crash_after_intent(true);
@@ -1071,7 +1071,7 @@ fn a_failed_folder_flush_is_finished_by_a_duplicate_hit() {
     assert_eq!(
         inbox(&w, LEADER).len(),
         1,
-        "one copy, flushed: what a power loss now keeps"
+        "one copy, flushed: what a crash at this boundary now keeps"
     );
 }
 

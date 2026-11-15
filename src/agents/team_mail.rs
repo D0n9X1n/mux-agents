@@ -623,7 +623,7 @@ thread_local! {
     static CRASH_AFTER_INTENT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
-/// Test only: the next send stops right after its intent is durable, as a power loss there would.
+/// Test only: the next send stops right after its intent is durable, as a crash at that boundary would.
 #[cfg(test)]
 pub fn crash_after_intent(on: bool) {
     CRASH_AFTER_INTENT.with(|c| c.set(on));
