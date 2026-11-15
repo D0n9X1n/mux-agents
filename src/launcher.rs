@@ -591,9 +591,32 @@ fn run_gen(
         gen_exit(ctx, member, n, &mut *publish, Some(1), "client not started");
         return 1;
     };
-    let started = start(&client.executable, &client.args, &SCRUB, &mut |_pid| {});
+    let (mut conflicted, mut told_pid) = (false, false);
+    let started = start(&client.executable, &client.args, &SCRUB, &mut |pid| {
+        told_pid = true;
+        match publish_client(ctx, member, n, pid, &mut *publish) {
+            ClientEvidence::Recorded => {}
+            ClientEvidence::Conflict => {
+                conflicted = true;
+                err(
+                    "mux-agent: client.json names another process: client-conflict; the client runs on",
+                );
+                if !mark_conflict(ctx, member, n, &mut *publish) {
+                    err(
+                        "mux-agent: the client-conflict could not be marked; the client runs on, unproven",
+                    );
+                }
+            }
+            ClientEvidence::Unrecorded => {
+                err("mux-agent: client.json could not be published; the client runs on, unproven");
+            }
+        }
+    });
     let (code, reason) = match started {
+        Ok(code) if conflicted => (code, "client-conflict"),
         Ok(code) => (code, "exited"),
+        Err(_) if conflicted => (1, "client-conflict"),
+        Err(_) if told_pid => (1, "client wait failed"),
         Err(_) => (1, "client not started"),
     };
     gen_exit(ctx, member, n, &mut *publish, Some(code), reason);
@@ -649,9 +672,71 @@ fn wait_gen_commit(ctx: &Ctx, member: &Path, n: u64, publish: Publish) -> GenCom
 /// already there is kept (`Exists`): the first reason stands, `client-conflict` included (Task 1c). A failed
 /// publication is not retried: the launcher exits either way, and a generation without an exit stays reserved
 /// (settle-1b). `code` is None only for `client-conflict`, published while the client still runs.
-fn gen_exit(ctx: &Ctx, member: &Path, n: u64, publish: Publish, code: Option<i32>, reason: &str) {
+fn gen_exit(
+    ctx: &Ctx,
+    member: &Path,
+    n: u64,
+    publish: Publish,
+    code: Option<i32>,
+    reason: &str,
+) -> Option<Published> {
     let exit = json!({"exitCode": code, "reason": reason, "exitedAt": utc_o(ctx.clock.now())});
-    let _ = publish(&gens::path(member, n, "exit"), &exit);
+    publish(&gens::path(member, n, "exit"), &exit).ok()
+}
+
+/// proof-0b K1: a failed publication of `client.json`, or of the `client-conflict` mark, is retried once.
+const CLIENT_ATTEMPTS: usize = 2;
+
+/// What publishing the started client ends with.
+#[derive(Debug, PartialEq, Eq)]
+enum ClientEvidence {
+    /// `client.json` names this client: published now, or found naming this pid and start.
+    Recorded,
+    /// `client.json` names another process, or this pid with another start, or is torn.
+    Conflict,
+    /// Every attempt failed: no `client.json`; the client runs on, unproven and reserved.
+    Unrecorded,
+}
+
+/// The identity K1 compares: `pid` and `start`, never other fields (K1 allows `loader`).
+fn pid_start(v: &Value) -> (Option<&Value>, Option<&Value>) {
+    (v.get("pid"), v.get("start"))
+}
+
+/// proof-0b K1: publishes `gens/<n>/client.json` = `{pid, start}` of the client just started, create-once through
+/// `publish`, at most `CLIENT_ATTEMPTS` times. `Exists` is read back through `gens::read` (the walk): the same pid and
+/// start is `Recorded`; anything else is `Conflict`.
+fn publish_client(ctx: &Ctx, member: &Path, n: u64, pid: u32, publish: Publish) -> ClientEvidence {
+    let ours = json!({"pid": pid, "start": ctx.os.open(pid).map(|o| o.start)});
+    for _ in 0..CLIENT_ATTEMPTS {
+        match publish(&gens::path(member, n, "client"), &ours) {
+            Ok(Published::Published) => return ClientEvidence::Recorded,
+            Ok(Published::Exists) => {
+                let same = matches!(gens::read(member, n, "client"),
+                    Evidence::Present(c) if pid_start(&c) == pid_start(&ours));
+                return if same {
+                    ClientEvidence::Recorded
+                } else {
+                    ClientEvidence::Conflict
+                };
+            }
+            Err(_) => {}
+        }
+    }
+    ClientEvidence::Unrecorded
+}
+
+/// Fix cycle 2: the `client-conflict` mark, `exitCode` null while the client runs, retried once. True only when this
+/// launcher published it; an `exit.json` already there (any reason) is not a mark.
+fn mark_conflict(ctx: &Ctx, member: &Path, n: u64, publish: Publish) -> bool {
+    for _ in 0..CLIENT_ATTEMPTS {
+        match gen_exit(ctx, member, n, &mut *publish, None, "client-conflict") {
+            Some(Published::Published) => return true,
+            Some(Published::Exists) => return false,
+            None => {}
+        }
+    }
+    false
 }
 
 /// True once the agent is committed; false at once for abort.json. At 30 s the launcher makes commit.json itself as
@@ -2509,5 +2594,313 @@ mod tests {
             "one give-up offered, and it failed"
         );
         assert_eq!(gen_file(&l, "exit")["reason"], "exited");
+    }
+
+    // Generation 1, committed; its client 4300 (start 1600) is the one child of the fake launcher 4242.
+    fn gen_client() -> (Launch, PathBuf) {
+        let (l, spec) = gen_setup(1);
+        commit(&l, 1, json!({"committed": true}));
+        l.w.fakes
+            .process(crate::testing::row(4300, l.w.ctx.pid, 1600));
+        (l, spec)
+    }
+    fn offers(r: &Seamed, at: &Path) -> usize {
+        r.offered.iter().filter(|p| p.as_path() == at).count()
+    }
+    fn killed(l: &Launch) -> Vec<String> {
+        l.w.fakes
+            .os_calls()
+            .into_iter()
+            .filter(|c| c.starts_with("kill"))
+            .collect()
+    }
+    fn reason(e: &Evidence) -> Value {
+        match e {
+            Evidence::Present(v) => v["reason"].clone(),
+            _ => Value::Null,
+        }
+    }
+
+    // K1: client.json = {pid, start} of the started client, published after the start; while the client runs,
+    // gens::client proves it; launcher.json gains no client field.
+    #[test]
+    fn the_launcher_publishes_client_json_once_and_no_client_field() {
+        let (l, spec) = gen_client();
+        let at = gens::path(&l.folder, 1, "client");
+        let (mut during, mut proven) = (None, None);
+        let r = seamed(&l, &spec, true, &[], &mut |told: &mut dyn FnMut(u32)| {
+            assert!(!at.exists(), "client.json before the client started");
+            told(4300);
+            during = Some(gen_file(&l, "client"));
+            proven = gens::client(&l.w.ctx, &l.folder, 1);
+            Ok(7)
+        });
+        assert_eq!((r.code, r.started), (7, 1), "{:?}", r.err);
+        assert_eq!(
+            during,
+            Some(json!({"pid": 4300, "start": 1600})),
+            "while the client runs"
+        );
+        assert_eq!(
+            proven,
+            Some(gens::Proven {
+                launcher: (4242, 2000),
+                client: (4300, 1600)
+            })
+        );
+        assert_eq!(offers(&r, &at), 1);
+        let launcher = gen_file(&l, "launcher");
+        let keys: Vec<&str> = launcher
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(keys, ["pid", "start", "startedAt"]);
+        assert_eq!(gen_file(&l, "exit")["reason"], "exited");
+        assert!(matches!(
+            gens::read(&l.folder, 1, "client"),
+            Evidence::Present(_)
+        ));
+    }
+
+    // K1, fix cycle 2 (finding 4): client.json already names another process. The client is not stopped and the
+    // launcher waits for it; the mark is retried once; the final exit says client-conflict; and while the client runs,
+    // gens::client never proves a marked or mismatched foreign file (A2a's rule; redesign 4).
+    #[test]
+    fn a_client_json_naming_another_process_records_client_conflict() {
+        for (case, theirs, mark_fails, earlier) in [
+            ("other pid", (4301, 1700), 0, false),
+            ("other start", (4300, 1599), 0, false),
+            ("mark retried", (4301, 1700), 1, false),
+            ("mark fails", (4301, 1700), 2, false),
+            ("earlier exit", (4301, 1700), 0, true),
+        ] {
+            let (l, spec) = gen_client();
+            l.w.fakes
+                .process(crate::testing::row(4301, l.w.ctx.pid, 1700));
+            let at = gens::path(&l.folder, 1, "client");
+            let exit = gens::path(&l.folder, 1, "exit");
+            let foreign = json!({"pid": theirs.0, "start": theirs.1});
+            let fails = if mark_fails > 0 {
+                vec![(exit.clone(), mark_fails)]
+            } else {
+                vec![]
+            };
+            let (mut mark, mut proven) = (Evidence::Absent, None);
+            let r = seamed(&l, &spec, true, &fails, &mut |told: &mut dyn FnMut(u32)| {
+                evidence::publish(&at, &foreign).unwrap();
+                if earlier {
+                    evidence::publish(
+                        &exit,
+                        &json!({"exitCode": 3, "reason": "exited", "exitedAt": "x"}),
+                    )
+                    .unwrap();
+                }
+                told(4300);
+                mark = gens::read(&l.folder, 1, "exit");
+                proven = gens::client(&l.w.ctx, &l.folder, 1);
+                Ok(7)
+            });
+            assert_eq!(
+                (r.code, r.started),
+                (7, 1),
+                "{case}: the launcher waited for its client"
+            );
+            assert!(
+                killed(&l).is_empty(),
+                "{case}: the client is not stopped: {:?}",
+                killed(&l)
+            );
+            let want = match case {
+                "mark fails" => Value::Null,
+                "earlier exit" => json!("exited"),
+                _ => json!("client-conflict"),
+            };
+            assert_eq!(
+                reason(&mark),
+                want,
+                "{case}: exit.json while the client runs"
+            );
+            // A2a's rule vetoes through the mark or the start. A foreign live child of the launcher with no mark (mark
+            // fails, earlier exit) is outside the threat model of #103.
+            if !matches!(case, "mark fails" | "earlier exit") {
+                assert_eq!(
+                    proven, None,
+                    "{case}: a marked or mismatched client.json is never proven"
+                );
+            }
+            assert_eq!(gen_file(&l, "client"), foreign, "{case}: never replaced");
+            let last = if earlier { "exited" } else { "client-conflict" };
+            assert_eq!(
+                gen_file(&l, "exit")["reason"],
+                last,
+                "{case}: the final reason"
+            );
+            if case == "other pid" {
+                assert_eq!(
+                    gen_file(&l, "exit")["exitCode"],
+                    Value::Null,
+                    "the mark is written while the client runs"
+                );
+            }
+            assert!(
+                r.err.iter().any(|e| e.contains("client-conflict")),
+                "{case}: {:?}",
+                r.err
+            );
+            let unmarked = r.err.iter().any(|e| e.contains("could not be marked"));
+            assert_eq!(
+                unmarked,
+                matches!(case, "mark fails" | "earlier exit"),
+                "{case}: {:?}",
+                r.err
+            );
+        }
+    }
+
+    // K1: one failed publication is retried once; the second attempt records the real client.
+    #[test]
+    fn a_failed_client_publication_is_retried() {
+        let (l, spec) = gen_client();
+        let at = gens::path(&l.folder, 1, "client");
+        let r = seamed(
+            &l,
+            &spec,
+            true,
+            &[(at.clone(), 1)],
+            &mut |told: &mut dyn FnMut(u32)| {
+                told(4300);
+                Ok(7)
+            },
+        );
+        assert_eq!((r.code, r.started), (7, 1), "{:?}", r.err);
+        assert_eq!(offers(&r, &at), 2);
+        assert_eq!(gen_file(&l, "client"), json!({"pid": 4300, "start": 1600}));
+        assert_eq!(gen_file(&l, "exit")["reason"], "exited");
+    }
+
+    // K1: every attempt fails: at most CLIENT_ATTEMPTS offers and an error line. The client is not stopped and runs
+    // on, unproven and reserved (no client.json); its real exit is recorded, never "never ran".
+    #[test]
+    fn a_client_json_that_cannot_be_published_records_why() {
+        let (l, spec) = gen_client();
+        let at = gens::path(&l.folder, 1, "client");
+        let r = seamed(
+            &l,
+            &spec,
+            true,
+            &[(at.clone(), 5)],
+            &mut |told: &mut dyn FnMut(u32)| {
+                told(4300);
+                Ok(7)
+            },
+        );
+        assert_eq!((r.code, r.started), (7, 1));
+        assert_eq!(offers(&r, &at), 2, "bounded: CLIENT_ATTEMPTS");
+        assert!(!at.exists(), "unproven: no client.json");
+        assert!(
+            r.err
+                .iter()
+                .any(|e| e.contains("client.json could not be published")),
+            "{:?}",
+            r.err
+        );
+        let exit = gen_file(&l, "exit");
+        assert_eq!(
+            (&exit["exitCode"], &exit["reason"]),
+            (&json!(7), &json!("exited"))
+        );
+        assert!(killed(&l).is_empty());
+    }
+
+    // K1, fix cycle 2 (finding 5): Exists naming this pid and start is this launcher's own client, whatever other
+    // field it carries (K1 allows `loader`): success, not a conflict.
+    #[test]
+    fn the_same_client_publishing_twice_is_not_a_conflict() {
+        for ours in [
+            json!({"pid": 4300, "start": 1600}),
+            json!({"pid": 4300, "start": 1600, "loader": true}),
+        ] {
+            let (l, spec) = gen_client();
+            let at = gens::path(&l.folder, 1, "client");
+            let r = seamed(&l, &spec, true, &[], &mut |told: &mut dyn FnMut(u32)| {
+                evidence::publish(&at, &ours).unwrap();
+                told(4300);
+                Ok(7)
+            });
+            assert_eq!((r.code, r.started), (7, 1), "{ours}: {:?}", r.err);
+            assert_eq!(offers(&r, &at), 1, "{ours}");
+            assert_eq!(gen_file(&l, "client"), ours);
+            let exit = gen_file(&l, "exit");
+            assert_eq!(
+                (&exit["exitCode"], &exit["reason"]),
+                (&json!(7), &json!("exited")),
+                "{ours}"
+            );
+            assert!(r.err.is_empty(), "{ours}: {:?}", r.err);
+        }
+    }
+
+    // Redesign 5: once a conflict is seen, a wait error after the start keeps the reason `client-conflict` (both mark
+    // attempts fail here); with no conflict it is `client wait failed`. A started client is never `client not started`.
+    #[test]
+    fn a_wait_error_after_the_start_keeps_the_reason_of_a_started_client() {
+        for (conflict, want) in [(true, "client-conflict"), (false, "client wait failed")] {
+            let (l, spec) = gen_client();
+            let exit = gens::path(&l.folder, 1, "exit");
+            if conflict {
+                l.w.fakes
+                    .process(crate::testing::row(4301, l.w.ctx.pid, 1700));
+            }
+            let fails = if conflict {
+                vec![(exit.clone(), 2)]
+            } else {
+                vec![]
+            };
+            let r = seamed(&l, &spec, true, &fails, &mut |told: &mut dyn FnMut(u32)| {
+                if conflict {
+                    evidence::publish(
+                        &gens::path(&l.folder, 1, "client"),
+                        &json!({"pid": 4301, "start": 1700}),
+                    )
+                    .unwrap();
+                }
+                told(4300);
+                Err(io::Error::other("wait failed"))
+            });
+            assert_eq!((r.code, r.started), (1, 1), "{want}");
+            assert_eq!(
+                offers(&r, &exit),
+                if conflict { 3 } else { 1 },
+                "{want}: two failed marks, then the exit"
+            );
+            assert_eq!(gen_file(&l, "exit")["reason"], want);
+        }
+    }
+
+    // Point 8: client.json is read back through gens::read, the walk. A link there, even to a copy naming this pid and start,
+    // is Unreadable, so a conflict, and is never opened. Unix only.
+    #[cfg(unix)]
+    #[test]
+    fn a_linked_client_json_is_a_conflict() {
+        let (l, spec) = gen_client();
+        let at = gens::path(&l.folder, 1, "client");
+        let out = crate::testing::TempDir::new();
+        let copy = out.path().join("client.json");
+        std::fs::write(&copy, br#"{"pid":4300,"start":1600}"#).unwrap();
+        let (r, reads) = crate::state::fs::record_reads(|| {
+            seamed(&l, &spec, true, &[], &mut |told: &mut dyn FnMut(u32)| {
+                std::os::unix::fs::symlink(&copy, &at).unwrap();
+                told(4300);
+                Ok(7)
+            })
+        });
+        assert_eq!((r.code, r.started), (7, 1), "{:?}", r.err);
+        assert!(
+            !reads.contains(&copy) && !reads.contains(&at),
+            "opened {reads:?}"
+        );
+        assert_eq!(gen_file(&l, "exit")["reason"], "client-conflict");
     }
 }
