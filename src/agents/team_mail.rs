@@ -314,6 +314,53 @@ pub fn pick(roster: &[Member], sender: Option<&str>, t: &Target) -> Res<Pick> {
     }
 }
 
+/// What claims the caller's pane: no agent record (a person), a member record, one committed 0.2 agent record, or
+/// records that prove no one (uncommitted, or more than one).
+enum Claim {
+    None,
+    Member,
+    Agent,
+    Unproven,
+}
+
+/// The agent records of this session whose pane is the caller's. A pane is a person's only when none claims it.
+fn claim(ctx: &Ctx, caller: &Caller) -> Res<Claim> {
+    let entries = match std::fs::read_dir(super::server_dir(ctx, caller).join("agents")) {
+        Ok(e) => e,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Claim::None),
+        Err(e) => return Err(e.into()),
+    };
+    let mut found = Vec::new();
+    for entry in entries {
+        let folder = entry?.path();
+        let id = folder
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or_default()
+            .to_string();
+        if !super::agent_id(&id) {
+            continue;
+        }
+        let Ok(Some(record)) = crate::state::fs::read_json(&folder.join("record.json")) else {
+            continue;
+        };
+        let here = super::text(record.get("pane")) == caller.pane
+            && record
+                .get("session")
+                .and_then(Value::as_str)
+                .is_none_or(|s| s == caller.session);
+        if here {
+            found.push((record.get("hcAddress").is_some(), super::committed(&folder)));
+        }
+    }
+    Ok(match found.as_slice() {
+        [] => Claim::None,
+        f if f.iter().any(|(hc, _)| *hc) => Claim::Member,
+        [(false, true)] => Claim::Agent,
+        _ => Claim::Unproven,
+    })
+}
+
 /// What `send` does: the team path ran, or the 0.2 path runs (with the snapshot already taken, if any).
 pub enum Routed {
     Sent(Map<String, Value>),
@@ -375,6 +422,14 @@ pub fn route(ctx: &Ctx, caller: &Caller, request: &Request, body: &str) -> Res<R
             let s = Snapshot::take(ctx, caller)?;
             if let Some(e) = &s.core_error {
                 return Err(e.clone());
+            }
+            // A pane is a person's only when no agent record claims it (QA fix 1).
+            if caller.member.is_none() {
+                match claim(ctx, caller)? {
+                    Claim::Unproven => return Err(super::tree::tagged()),
+                    Claim::Agent => return Ok(Routed::Legacy(Some(Box::new(s)))),
+                    Claim::None | Claim::Member => {}
+                }
             }
             let me = match s.reader(caller) {
                 Ok(me) => me,

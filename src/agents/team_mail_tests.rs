@@ -1167,3 +1167,39 @@ fn the_reply_json_stored_fields_last_sent_and_wait_cleanup() {
         "copilot: none"
     );
 }
+
+/// QA fix 1: a pane an uncommitted agent record claims is no person; in a team it refuses 2 `tagged`.
+#[test]
+fn an_unproven_pane_in_a_team_is_refused_tagged() {
+    let w = team_world();
+    w.uncommitted("0000000000d4", json!({"name": "pw", "pane": "%1"}));
+    online(&w);
+    let r = go(&w, None, &["send", "leader", "-Body", "x"]);
+    assert!(r.is_err(), "an unproven pane sends as no one: {r:?}");
+    assert_eq!(
+        said(r.unwrap_err()),
+        "2 tagged this caller cannot be proven a member"
+    );
+    assert!(inbox(&w, LEADER).is_empty());
+}
+
+/// QA fix 1: a pane a committed 0.2 agent record claims keeps that agent's identity and 0.2 send.
+#[test]
+fn a_committed_0_2_agent_pane_sends_as_itself() {
+    let w = team_with(World::human(""), rows(&["%1|@1|100||"]));
+    w.agent_record(
+        "0000000000d4",
+        json!({"name": "pw", "pane": "%1", "window": "@1"}),
+    );
+    w.recipients_live();
+    online(&w);
+    let r = go(&w, None, &["send", "leader", "-Body", "x"]);
+    assert!(r.is_ok(), "{r:?}");
+    let r = r.unwrap();
+    assert_eq!(
+        (&r["from"], &r["pane"]),
+        (&json!("pw"), &json!("%4")),
+        "the 0.2 reply, as the agent: {r}"
+    );
+    assert_eq!(inbox(&w, LEADER)[0]["from"], "pw");
+}
