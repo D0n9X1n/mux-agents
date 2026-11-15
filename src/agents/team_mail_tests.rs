@@ -970,3 +970,95 @@ fn the_121st_send_refuses_and_persons_are_exempt() {
     go(&w, None, &["send", "leader", "-Body", "x"]).unwrap();
     assert_eq!(inbox(&w, LEADER).len(), 1, "persons are exempt");
 }
+
+fn only_id(w: &World) -> String {
+    let d = sends_dir(&crate::agents::server_dir(&w.ctx, &w.caller()), "$3", A);
+    let n = std::fs::read_dir(d)
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .file_name();
+    n.to_string_lossy().trim_end_matches(".json").to_string()
+}
+
+#[test]
+fn power_loss_after_the_intent_counts_it_and_the_retry_adds_none() {
+    let w = team_world();
+    online(&w);
+    crash_after_intent(true);
+    let e = go(&w, Some(A), &["send", "team", "-Body", "hi"]);
+    assert!(e.is_err(), "the crash hook stops the send");
+    let e = e.unwrap_err();
+    crash_after_intent(false);
+    assert_eq!((e.code, e.check), (1, "internal"));
+    assert_eq!(
+        (a_sends(&w), inbox(&w, LEADER).len(), inbox(&w, B).len()),
+        (1, 0, 0),
+        "the intent is the charge"
+    );
+    let id = only_id(&w);
+    online(&w);
+    go(&w, Some(A), &["send", "team", "-Body", "hi", "-Id", &id]).unwrap();
+    assert_eq!(
+        (a_sends(&w), inbox(&w, LEADER).len(), inbox(&w, B).len()),
+        (1, 1, 1)
+    );
+}
+
+#[test]
+fn a_failed_folder_flush_is_finished_by_a_duplicate_hit() {
+    let w = team_world();
+    online(&w);
+    let mail = w.state().join("mail");
+    std::fs::create_dir_all(&mail).unwrap();
+    crate::state::fs::fail_sync_dir(Some(&mail));
+    let e = go(&w, Some(A), &["send", "leader", "-Body", "hi"]).unwrap_err();
+    assert_eq!((e.code, e.check), (1, "mail"));
+    let id = e.details["id"].as_str().unwrap().to_string();
+    assert_eq!(inbox(&w, LEADER).len(), 1, "appended, folder not flushed");
+    online(&w);
+    assert_eq!(
+        go(&w, Some(A), &["send", "leader", "-Body", "hi", "-Id", &id])
+            .unwrap_err()
+            .check,
+        "mail",
+        "the duplicate hit flushes again"
+    );
+    crate::state::fs::fail_sync_dir(None);
+    online(&w);
+    go(&w, Some(A), &["send", "leader", "-Body", "hi", "-Id", &id]).unwrap();
+    assert_eq!(
+        inbox(&w, LEADER).len(),
+        1,
+        "one copy, flushed: what a power loss now keeps"
+    );
+}
+
+#[test]
+fn an_unfinished_send_past_a_day_stays_and_its_id_finishes_it() {
+    let w = team_world();
+    w.clock("2026-03-01T00:00:00Z");
+    online(&w);
+    let leader = w.state().join("mail").join(format!("{LEADER}.jsonl"));
+    std::fs::create_dir_all(leader.parent().unwrap()).unwrap();
+    crate::state::fs::fail_sync_file(Some(&leader));
+    let id = go(&w, Some(A), &["send", "team", "-Body", "hi"])
+        .unwrap_err()
+        .details["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    crate::state::fs::fail_sync_file(None);
+    w.fakes.advance(std::time::Duration::from_secs(2 * 86_400));
+    online(&w);
+    go(&w, Some(A), &["send", "mb2", "-Body", "other"]).unwrap();
+    assert_eq!(a_sends(&w), 2, "pruning ran; the unfinished intent stays");
+    online(&w);
+    go(&w, Some(A), &["send", "team", "-Body", "hi", "-Id", &id]).unwrap();
+    assert_eq!(
+        (inbox(&w, LEADER).len(), inbox(&w, B).len()),
+        (1, 2),
+        "no duplicate; the original recipients"
+    );
+}

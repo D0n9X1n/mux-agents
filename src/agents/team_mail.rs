@@ -549,8 +549,22 @@ fn pane_box(ctx: &Ctx, caller: &Caller, pane: &str) -> Res<Value> {
     )
 }
 
-/// A test hook after the intent is durable; task 11 gives it its test body (a crash right there).
+#[cfg(test)]
+thread_local! {
+    static CRASH_AFTER_INTENT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Test only: the next send stops right after its intent is durable, as a power loss there would.
+#[cfg(test)]
+pub fn crash_after_intent(on: bool) {
+    CRASH_AFTER_INTENT.with(|c| c.set(on));
+}
+
 fn crash_point() -> Res<()> {
+    #[cfg(test)]
+    if CRASH_AFTER_INTENT.with(|c| c.get()) {
+        return Err(crate::error::Refusal::internal("crash after intent"));
+    }
     Ok(())
 }
 
