@@ -1282,3 +1282,82 @@ fn a_non_member_agent_pane_keeps_0_2_while_hc_is_down() {
     assert_eq!(r.unwrap()["pane"], "%4", "the 0.2 reply");
     assert_eq!(inbox(&w, "pane-4").len(), 1);
 }
+
+/// One snapshot as `online`, with member `id`'s terminal unreadable, Lost, Ended or at another generation.
+fn online_but(w: &World, id: &str, case: &str) {
+    let mut records: Vec<Value> = std::fs::read_dir(w.state().join("agents"))
+        .unwrap()
+        .filter_map(|e| {
+            crate::state::fs::read_json(&e.unwrap().path().join("record.json"))
+                .ok()
+                .flatten()
+        })
+        .filter(|r| r.get("hcAddress").is_some() && r["session"] == "$3")
+        .collect();
+    records.sort_by_key(|r| crate::agents::text(r.get("hcAddress")));
+    cf::online(w);
+    cf::listing(w, &crate::agents::membership::team(&w.caller()), &[]);
+    for r in &records {
+        let address = r["hcAddress"].as_str().unwrap();
+        let mine = r["id"] == id;
+        if mine && case == "unreadable" {
+            w.fakes.hc_expect(
+                &["get", address, "--json"],
+                Err(Refusal::internal("get failed")),
+            );
+            continue;
+        }
+        let mut t = cf::wire(r);
+        if mine {
+            match case {
+                "lost" => t["argv"] = json!(["/bin/sh"]),
+                "ended" => {
+                    t["state"] = json!("finished");
+                    t["reason"] = json!("exited");
+                    t["exit_code"] = json!(0);
+                }
+                "generation" => t["labels"]["mux.gen"] = json!("1"),
+                _ => {}
+            }
+        }
+        cf::get(w, address, t);
+    }
+}
+
+/// Tech Lead (HIGH): a pane an hc member record claims never falls back to 0.2; a failed proof refuses 2 `tagged`
+/// and writes nothing: no mail, no intent, no sender state.
+#[test]
+fn a_claimed_member_whose_proof_fails_never_falls_back_to_0_2() {
+    for case in ["unreadable", "lost", "ended", "generation"] {
+        let mut row = row_of("%1|@1|100|0000000000a1|ma1", &[]);
+        row.command = format!("hc attach t{A}");
+        let w = team_with(World::agent(A), vec![row, row_of("%4|@1|101||", &[])]);
+        cf::member(
+            &w,
+            A,
+            json!({"name": "ma1", "depth": 1, "parentAgent": {"id": LEADER}, "pane": "%1",
+                "parentPane": "%4", "window": "@1"}),
+        );
+        w.recipients_live();
+        w.file("b.md", b"hi");
+        online_but(&w, A, case);
+        let r = go(&w, None, &["send", "parent", "-BodyFile", "b.md"]);
+        assert!(
+            r.is_err(),
+            "{case}: an unproven member sends as no one: {r:?}"
+        );
+        assert_eq!(
+            said(r.unwrap_err()),
+            "2 tagged this caller cannot be proven a member",
+            "{case}"
+        );
+        for key in [LEADER, "pane-4", "pane-1"] {
+            assert!(inbox(&w, key).is_empty(), "{case}: no mail in {key}");
+        }
+        assert_eq!(a_sends(&w), 0, "{case}: no intent");
+        assert!(
+            !w.folder(A).join("last-sent.json").exists(),
+            "{case}: the sender's state is unchanged"
+        );
+    }
+}

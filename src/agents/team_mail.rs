@@ -423,13 +423,16 @@ fn route_team(
     }
     // What the caller is decides 0.2 or team before any hc look (QA fix 3); a pane is a person's only when no agent
     // record claims it (QA fix 1).
-    if caller.member.is_none() {
-        match claim(ctx, caller)? {
+    // A pane an hc member record claims is that member's or no one's: its failed proof never falls back to 0.2.
+    let claimed_member = match caller.member {
+        Some(_) => false,
+        None => match claim(ctx, caller)? {
             Claim::Unproven => return Err(super::tree::tagged()),
             Claim::Agent => return Ok(Routed::Legacy(None)),
-            Claim::None | Claim::Member => {}
-        }
-    }
+            Claim::Member => true,
+            Claim::None => false,
+        },
+    };
     let t = target(word)?;
     // Lock order (M2): team, then (in deliver) the agent of the sender, then each mailbox.
     super::lock(
@@ -442,6 +445,8 @@ fn route_team(
             }
             let me = match s.reader(caller) {
                 Ok(me) => me,
+                // Unreadable, Lost, Ended or at another generation: refused, never sent as 0.2 (Tech Lead, HIGH).
+                Err(_) if claimed_member => return Err(super::tree::tagged()),
                 Err(_) if caller.member.is_none() && caller.kind == Kind::Agent => {
                     return Ok(Routed::Legacy(Some(Box::new(s))));
                 }
