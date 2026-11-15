@@ -194,13 +194,25 @@ impl Live {
     }
 
     /// Polls `ready` until it answers, for up to `WAIT`; panics naming `what` when it never does.
-    fn wait<T>(&self, what: &str, mut ready: impl FnMut() -> Option<T>) -> T {
+    fn wait<T>(&self, what: &str, ready: impl FnMut() -> Option<T>) -> T {
+        self.wait_or(what, ready, String::new)
+    }
+
+    /// `wait`, whose panic also carries what `diagnose` says at the timeout.
+    fn wait_or<T>(
+        &self,
+        what: &str,
+        mut ready: impl FnMut() -> Option<T>,
+        diagnose: impl FnOnce() -> String,
+    ) -> T {
         let end = Instant::now() + WAIT;
         loop {
             if let Some(value) = ready() {
                 return value;
             }
-            assert!(Instant::now() < end, "timed out waiting for {what}");
+            if Instant::now() >= end {
+                panic!("timed out waiting for {what}\n{}", diagnose());
+            }
             std::thread::sleep(Duration::from_millis(100));
         }
     }
@@ -1384,6 +1396,37 @@ fn post_bg(live: &Live, sent: &mut HashMap<u32, usize>, id: &str, args: &[&str])
     live.dir.join(format!("reply.{pid}.{n}.json"))
 }
 
+/// What an "on call" timeout shows: member `name`'s `list -All` entry, its folder's files with their text, and the
+/// background reply `reply` (json, err, code) so far.
+fn on_call_diagnosis(live: &Live, id: &str, name: &str, reply: &Path) -> String {
+    let list = live.run_any(&["list", "-All"]);
+    let entry = list["agents"]
+        .as_array()
+        .and_then(|a| a.iter().find(|x| x["name"] == name).cloned())
+        .unwrap_or(list);
+    let folders = std::fs::read_dir(live.dir.join("state"))
+        .map(|d| {
+            d.filter_map(Result::ok)
+                .map(|e| e.path().join("agents").join(id))
+                .filter(|p| p.is_dir())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let mut out = format!("list -All {name}: {entry}\n");
+    for folder in folders {
+        for e in std::fs::read_dir(&folder).into_iter().flatten().flatten() {
+            let text = std::fs::read_to_string(e.path()).unwrap_or_default();
+            out.push_str(&format!("{}: {}\n", e.path().display(), text.trim()));
+        }
+    }
+    for ext in ["json", "err", "code"] {
+        let file = reply.with_extension(ext);
+        let text = std::fs::read_to_string(&file).unwrap_or_else(|e| format!("<{e}>"));
+        out.push_str(&format!("{}: {}\n", file.display(), text.trim()));
+    }
+    out
+}
+
 #[test]
 fn a_copilot_member_reports_done_then_listens_on_call() {
     let Some(live) = Live::start() else { return };
@@ -1438,7 +1481,11 @@ fn a_copilot_member_reports_done_then_listens_on_call() {
         "done"
     );
     let reply = post_bg(&live, &mut sent, &b, &["read", "-Wait", "600"]);
-    live.wait("on call", || on_call(&live).then_some(()));
+    live.wait_or(
+        "on call (first wait)",
+        || on_call(&live).then_some(()),
+        || on_call_diagnosis(&live, &b, "b", &reply),
+    );
     by(&live, &mut sent, &a, &["send", "b", "-BodyFile", &body]);
     // Sender exit: A leaves before B collects; the mail is durable, the wait still returns it.
     let a_pid = client_pid(
@@ -1468,7 +1515,11 @@ fn a_copilot_member_reports_done_then_listens_on_call() {
         "{t}"
     );
     let reply = post_bg(&live, &mut sent, &b, &["read", "-Wait", "600"]);
-    live.wait("on call", || on_call(&live).then_some(()));
+    live.wait_or(
+        "on call (second wait)",
+        || on_call(&live).then_some(()),
+        || on_call_diagnosis(&live, &b, "b", &reply),
+    );
     assert_eq!(
         by(&live, &mut sent, &b, &["read", "-Cancel"])["cancelled"],
         true
