@@ -246,6 +246,18 @@ mod tests {
         }
     }
 
+    // S6: a file where generation 0's folder belongs is Unreadable, never Absent: done stops, even with an abandoned
+    // claim and a record that holds nothing.
+    #[test]
+    fn a_file_in_place_of_a_generation_folder_stops_done() {
+        let (_d, m) = member();
+        std::fs::create_dir_all(m.join("gens")).unwrap();
+        std::fs::write(dir(&m, 0), b"").unwrap();
+        publish(&claim_path(&m, 0), &json!("abandoned")).unwrap();
+        assert_eq!(read(&m, 0, "commit"), Evidence::Unreadable);
+        assert_eq!(done(&m, 0).map_err(|e| e.check), Err("evidence"));
+    }
+
     // S6: an unreadable record.json stops done; it never means done.
     #[test]
     fn an_unreadable_record_stops_done() {
