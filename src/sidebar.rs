@@ -1424,6 +1424,8 @@ pub fn run_watch(
     let mut by_hand = false;
     // The other view windows whose ensure failed, and when: each is tried again once REARM has passed.
     let mut failed_windows: Vec<(String, SystemTime)> = Vec::new();
+    // Peek files of popups that never opened, from an earlier bar (#103 review).
+    sweep_peeks(ctx, &crate::agents::server_dir(ctx, caller));
     loop {
         let probe = native(
             ctx,
@@ -2059,7 +2061,38 @@ fn peek_folder(ctx: &Ctx, caller: &Caller) -> Res<std::path::PathBuf> {
 }
 
 /// `text` for agent `name` in a private file of `folder`, paged in a popup over the session's client (see `peek`).
+/// How old the bar's own peek file must be before it is swept (#103 review, PM decision): a popup still open keeps a
+/// younger one.
+const PEEK_STALE: Duration = Duration::from_secs(600);
+
+/// Deletes this bar's own peek files (`peek-*.txt` in `folder`) last written more than `PEEK_STALE` ago: a popup queued
+/// with `run-shell -b -C` whose client went away never deletes its file. A younger file, one with a future time or one
+/// whose time cannot be read stays. Best effort: never fails the bar.
+fn sweep_peeks(ctx: &Ctx, folder: &std::path::Path) {
+    let now = ctx.clock.now();
+    let Ok(entries) = std::fs::read_dir(folder) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if !(name.starts_with("peek-") && name.ends_with(".txt")) {
+            continue;
+        }
+        let old = entry
+            .metadata()
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|at| now.duration_since(at).ok())
+            .is_some_and(|age| age > PEEK_STALE);
+        if old {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+}
+
 fn popup(ctx: &Ctx, caller: &Caller, folder: &std::path::Path, name: &str, text: &str) -> Res<()> {
+    sweep_peeks(ctx, folder);
     let file = folder.join(format!(
         "peek-{}.txt",
         crate::util::guid()?.replace('-', "")
@@ -2086,7 +2119,7 @@ fn popup(ctx: &Ctx, caller: &Caller, folder: &std::path::Path, name: &str, text:
 /// own live launch), into a private file of the state folder, shown in a popup over the session's client that pages
 /// it, deleting it as it starts. The popup is started in the background (`run-shell -b -C`), since display-popup
 /// answers only once it closes and the bar must not wait; so a popup that never opens is not seen here, and its
-/// file stays in the state folder (no sweep: age cannot tell it from a popup still queued behind another).
+/// file stays in the state folder until the bar sweeps its peek files older than `PEEK_STALE` (`sweep_peeks`).
 fn peek(ctx: &Ctx, caller: &Caller, target: &Target) -> Res<()> {
     let folder = peek_folder(ctx, caller)?;
     let drawn = (!target.pane.is_empty()).then_some(target.pane.as_str());
@@ -9159,6 +9192,61 @@ mod tests {
                 }
             }
         }
+    }
+
+    // #103 review (PM): a queued popup that never opened leaves its peek file. The bar sweeps its own peek files older
+    // than 10 minutes when it starts and when it opens a popup; a younger one may be a popup still open, so it stays.
+    #[test]
+    fn the_bar_sweeps_only_its_own_peek_files_older_than_10_minutes() {
+        let w = watch_world(&["gone"]);
+        w.fakes.advance(Duration::from_secs(3600));
+        let caller = w.caller();
+        let folder = crate::agents::server_dir(&w.ctx, &caller);
+        std::fs::create_dir_all(&folder).unwrap();
+        let now = w.ctx.clock.now();
+        let file = |name: &str, age: u64| {
+            let path = folder.join(name);
+            std::fs::write(&path, "x").unwrap();
+            std::fs::File::options()
+                .write(true)
+                .open(&path)
+                .unwrap()
+                .set_modified(now - Duration::from_secs(age))
+                .unwrap();
+            path
+        };
+        let kept =
+            |paths: &[&std::path::PathBuf]| paths.iter().map(|p| p.exists()).collect::<Vec<_>>();
+        // Directly: only a peek file older than PEEK_STALE goes.
+        let (stale, fresh, edge, other) = (
+            file("peek-a.txt", 601),
+            file("peek-b.txt", 30),
+            file("peek-c.txt", 599),
+            file("notes-d.txt", 3000),
+        );
+        sweep_peeks(&w.ctx, &folder);
+        assert_eq!(
+            kept(&[&stale, &fresh, &edge, &other]),
+            [false, true, true, true]
+        );
+        // When the bar opens a popup: the stale file goes, the young one and the popup's own new file stay.
+        let stale = file("peek-e.txt", 900);
+        popup(&w.ctx, &caller, &folder, "worker", "text").unwrap();
+        let peeks = || {
+            std::fs::read_dir(&folder)
+                .unwrap()
+                .flatten()
+                .filter(|e| e.file_name().to_string_lossy().starts_with("peek-"))
+                .count()
+        };
+        assert_eq!((stale.exists(), fresh.exists(), peeks()), (false, true, 3));
+        // When the bar starts.
+        let stale = file("peek-f.txt", 3000);
+        let ended = run_watch(&w.ctx, &caller, Box::new(NoInput), &mut |_| Ok(()));
+        assert_eq!(
+            (ended, stale.exists(), fresh.exists()),
+            ("pane-closed", false, true)
+        );
     }
 }
 
