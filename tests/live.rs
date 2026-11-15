@@ -5502,12 +5502,12 @@ hc {}:
             // The side bars are left out of the nonce check only: a bar draws each member's doing line, which for the
             // leader is the first line of the mail it last sent (`send` writes last-sent.json; board::select_doing
             // falls back status, message, task). That is the bar's own drawing, not input typed into a terminal.
-            // Each pane with its role, read in one listing: a side bar is any pane whose role is `sidebar`, whatever
-            // agent id it carries.
+            // Each pane with its role, read in one listing. A pane counts as a bar only when its role is `sidebar` AND
+            // its screen starts with the bar's own header: rmux can leave a stale `sidebar` label on another pane
+            // (sidebar.rs), and a label alone must not exempt an agent's view from the nonce check.
             for row in live.panes("#{pane_id}|#{@agent-role}") {
                 let (pane, role) = row.split_once('|').unwrap_or((row.as_str(), ""));
                 let pane = pane.to_string();
-                let is_bar = role == "sidebar";
                 // Only sender A's own view pane may close between the list and its capture; any other pane that is
                 // gone, or any other capture failure, fails the test.
                 let out = live.server.try_call(&["capture-pane", "-p", "-t", &pane]);
@@ -5519,6 +5519,11 @@ hc {}:
                 }
                 assert!(out.status.success(), "{mux:?} capture {pane}: {out:?}");
                 let screen = String::from_utf8(out.stdout).unwrap();
+                let is_bar = role == "sidebar"
+                    && screen
+                        .lines()
+                        .next()
+                        .is_some_and(|l| l.trim_start().starts_with("mux-agents"));
                 assert!(
                     (is_bar || !screen.contains("nonce-7f3a")) && !screen.contains("mail from"),
                     "{mux:?} {pane}: {screen}"
