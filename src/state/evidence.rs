@@ -116,15 +116,16 @@ pub fn publish(path: &Path, value: &Value) -> Res<Published> {
 }
 
 /// A crash test kills the process right after `step` (launch-1 crash guarantee): exit 86, no unwinding, no Drop.
-/// Only in test builds and under the test-only `live` feature (b-call 39); release builds use no features.
+/// Unit tests, and live tests through a `test-panic` build (A3c ambiguity 14) or the test-only `live` feature (b-call
+/// 39); only `MUX_AGENTS_CRASH` naming `step` stops it (PM call 8). A shipped build has none of them.
 pub fn crash_point(step: &str) {
-    #[cfg(any(test, feature = "live"))]
+    #[cfg(any(test, feature = "test-panic", feature = "live"))]
     if std::env::var("MUX_AGENTS_CRASH").as_deref() == Ok(step) {
         use std::io::Write;
         let _ = std::io::stdout().flush();
         std::process::exit(86);
     }
-    #[cfg(not(any(test, feature = "live")))]
+    #[cfg(not(any(test, feature = "test-panic", feature = "live")))]
     let _ = step;
 }
 

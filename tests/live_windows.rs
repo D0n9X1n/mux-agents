@@ -15,6 +15,10 @@ mod private_core;
 #[path = "support/bounded.rs"]
 mod bounded;
 
+// A3c Task 7: readiness barriers (PM calls 12, 26) and the fake client's own guards (PM call 27).
+#[path = "support/ready.rs"]
+mod ready;
+
 // report-2b: the shared integration fixtures (private root, 150 s wait, deny_queries); occupy-3 uses them here.
 mod native;
 
@@ -629,6 +633,7 @@ fn hc_stop_then_resume_returns_with_its_conversation() {
     };
     let w = live.spawn("w1");
     let sid = s(&w["sessionId"]);
+    ready::wait_conversation(&live.dir, &sid); // PM call 12
     let address = s(&w["hcAddress"]);
     let get = |address: &str| {
         private_core::run(live.core.command(&["get", address, "--json"]), &live.dir).unwrap()
@@ -953,39 +958,215 @@ fn hc_stopped_member_resumes_with_its_stored_options_only() {
         first.windows(2).any(|p| p[0] == "--model" && p[1] == "x"),
         "started with --model x: {first:?}"
     );
+    ready::wait_conversation(&live.dir, &sid); // PM call 12
+    let conv = live.dir.join(format!("conversation.{sid}.log"));
+    let r = member_file(&live, &s(&w["id"]), "record.json");
+    let options: Vec<String> = r["options"].as_array().unwrap().iter().map(s).collect();
+    assert_eq!(r["lifecycle"], 1, "written by forward, not seeded");
+    assert!(r["prompt"].is_array(), "{r}");
+    assert!(
+        options.windows(2).any(|p| p[0] == "--model" && p[1] == "x"),
+        "--model x stored: {options:?}"
+    );
     let get =
         |a: &str| private_core::run(live.core.command(&["get", a, "--json"]), &live.dir).unwrap();
     assert_eq!(live.run(&["stop", "w1"])["life"], "ended");
     live.wait("finished core terminal", || {
         (get(&address)["state"] == "finished").then_some(())
     });
-    // E1: the launch stored the selected model as an option; the record is read as production wrote it.
-    let r = member_file(&live, &s(&w["id"]), "record.json");
-    assert_eq!(r["lifecycle"], 1, "{r}");
-    assert!(r["prompt"].is_array(), "{r}");
-    let opts: Vec<String> = serde_json::from_value(r["options"].clone()).unwrap();
-    assert!(
-        opts.ends_with(&["--model".to_string(), "x".to_string()]),
-        "{opts:?}"
-    );
-    live.run(&["resume", "w1"]);
-    let resumed = client_where(&live, "the resumed client", |a| {
+    let resumed = live.run(&["resume", "w1"]);
+    let resumed_client = client_where(&live, "the resumed client", |a| {
         a.windows(2).any(|p| p[0] == "--resume" && p[1] == sid)
     });
-    let argv: Vec<String> = resumed["argv"].as_array().unwrap().iter().map(s).collect();
+    let y = member_file(&live, &s(&resumed["agent"]["id"]), "record.json");
+    assert_eq!(
+        s(&y["sessionId"]),
+        sid,
+        "the successor keeps the conversation"
+    );
+    let mut want = options.clone();
+    want.extend(["--resume".to_string(), sid.clone()]);
+    assert_eq!(
+        resumed_client["argv"],
+        serde_json::json!(want),
+        "the stored options only"
+    );
+    let lines: Vec<String> = std::fs::read_to_string(&conv)
+        .unwrap()
+        .lines()
+        .map(|l| l.split(' ').nth(1).unwrap_or("").to_string())
+        .collect();
+    assert_eq!(
+        lines,
+        ["start", "resume"],
+        "reloaded, not refused: an unknown resume publishes no client"
+    );
+    assert_ne!(y["hcName"], r["hcName"], "a fresh hc name");
+}
+
+/// The member folders under every server key of the state root.
+fn agents_of(live: &Live) -> Vec<PathBuf> {
+    let state = live.dir.join("state");
+    let keys = std::fs::read_dir(&state).into_iter().flatten().flatten();
+    keys.flat_map(|k| {
+        std::fs::read_dir(k.path().join("agents"))
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|e| e.path())
+    })
+    .collect()
+}
+
+// launch-1 live on rmux for Windows (ambiguity 14): a dropped `hc run` reply. One child cmd sets MUX_AGENTS_CRASH=run
+// and runs spawn, which dies after `hc run` returns. Nothing runs; the launcher gives up; a retry in the same console
+// (no variable: it never leaked) runs exactly one client.
+#[test]
+fn a_dropped_run_reply_runs_nothing_then_a_retry_runs_once() {
+    let Some(live) = Live::start() else {
+        return;
+    };
+    std::fs::write(live.dir.join("task.txt"), "say hi").unwrap();
+    let log = live.dir.join("clients.log");
+    let clients = || {
+        std::fs::read_to_string(&log)
+            .unwrap_or_default()
+            .lines()
+            .count()
+    };
+    let before = clients();
+    let (script, out, done) = (
+        live.dir.join("crash.cmd"),
+        live.dir.join("crash.out"),
+        live.dir.join("crash.done"),
+    );
+    let body = format!(
+        "@set MUX_AGENTS_CRASH=run\r\n@\"{MUX_AGENT}\" spawn -Client claude -TaskFile \"{}\" -Name w1 > \"{}\" 2>&1\r\n",
+        live.dir.join("task.txt").display(),
+        out.display()
+    );
+    std::fs::write(&script, body).unwrap();
+    live.line(
+        &live.root,
+        &format!(
+            "cmd /c \"{}\" & echo done> \"{}\"",
+            script.display(),
+            done.display()
+        ),
+    );
+    live.wait("the crashed spawn", || done.exists().then_some(()));
+    let text = std::fs::read_to_string(&out).unwrap_or_default();
     assert!(
-        argv.windows(2).any(|p| p[0] == "--model" && p[1] == "x"),
-        "{argv:?}"
+        serde_json::from_str::<Value>(&text).is_err(),
+        "no reply: the spawn died after hc run: {text:?}"
+    );
+    let ids = agents_of(&live);
+    assert_eq!(ids.len(), 1, "one member folder: {ids:?}");
+    let commit = ids[0].join("gens").join("0").join("commit.json");
+    live.wait("the launcher's give-up", || {
+        let c: Value = serde_json::from_str(&std::fs::read_to_string(&commit).ok()?).ok()?;
+        (c["aborted"] == true).then_some(())
+    });
+    assert_eq!(clients(), before, "nothing ran");
+    live.spawn("w1");
+    live.wait("the retry's client", || {
+        (clients() == before + 1).then_some(())
+    });
+    assert_eq!(clients(), before + 1, "the retry ran exactly one client");
+}
+
+// proof-0b K2 on rmux for Windows (4to6 #1, #3, #4, #19): a team, its leader spawns w2 with a brief; proof waited
+// (PM call 26); with the server killed (RMUX unset in hc clients, only rmux on PATH) the leader sends a file, w2 reads
+// and reports, focus is refused `views`; list and stop run with views down.
+#[test]
+fn members_mail_without_the_multiplexer() {
+    let Some(live) = Live::start() else {
+        return;
+    };
+    let file = |name: &str, text: &str| {
+        let p = live.dir.join(name);
+        std::fs::write(&p, text).unwrap();
+        p.display().to_string()
+    };
+    let (task, brief, note) = (
+        file("task.txt", "say hi"),
+        file("brief.md", "brief"),
+        file("note.md", "without the views"),
+    );
+    let lead = s(&live.run(&["up", "-Client", "claude"])["leader"]["id"]);
+    let mut sent = HashMap::new();
+    let args = [
+        "spawn",
+        "-Client",
+        "claude",
+        "-TaskFile",
+        &task,
+        "-BriefFile",
+        &brief,
+        "-Context",
+        "brief",
+        "-Name",
+        "w2",
+    ];
+    let w2 = by(&live, &mut sent, &lead, &args);
+    assert_eq!(w2["ok"], true, "{w2}");
+    let w2 = s(&w2["id"]);
+    for id in [&lead, &w2] {
+        let dir = member_dir(&live, id);
+        let client = ready::wait_proof(&dir, 0);
+        assert!(client["pid"].is_u64(), "{id}: {client}");
+        let launcher: Value = serde_json::from_str(
+            &std::fs::read_to_string(dir.join("gens").join("0").join("launcher.json")).unwrap(),
+        )
+        .unwrap();
+        assert!(launcher.get("client").is_none(), "{id}: no client field");
+    }
+    let sid = |id: &str| s(&member_file(&live, id, "record.json")["sessionId"]);
+    let (p1, p2) = (
+        client_pid(&live, &sid(&lead), 0),
+        client_pid(&live, &sid(&w2), 0),
+    );
+    // Checklist 12: every child here is bounded (o2 call 14's runner).
+    let _ = bounded::output(live.rmux().arg("kill-server"), bounded::LIMIT);
+    live.wait("the server gone", || {
+        let out = bounded::output(live.rmux().arg("list-sessions"), bounded::LIMIT).ok()?;
+        (!out.status.success()).then_some(())
+    });
+    let reply = by_pid(&live, &mut sent, p1, &["send", "w2", "-BodyFile", &note]);
+    assert_eq!(reply["ok"], true, "{reply}");
+    let read = by_pid(&live, &mut sent, p2, &["read"]);
+    assert!(read.to_string().contains("without the views"), "{read}");
+    assert_eq!(
+        by_pid(
+            &live,
+            &mut sent,
+            p2,
+            &["report", "blocked", "-Kind", "question"]
+        )["state"],
+        "blocked"
     );
     assert_eq!(
-        resumed["argv"],
-        serde_json::json!(
-            opts.iter()
-                .cloned()
-                .chain(["--resume".to_string(), sid.to_string()])
-                .collect::<Vec<_>>()
-        ),
-        "the stored options only"
+        by_pid(&live, &mut sent, p1, &["focus", "w2"])["check"],
+        "views"
+    );
+    let list = by_pid(&live, &mut sent, p1, &["list"]);
+    let row = list["agents"]
+        .as_array()
+        .and_then(|a| a.iter().find(|x| x["name"] == "w2"))
+        .cloned()
+        .unwrap_or_default();
+    assert_eq!(
+        list["ok"], true,
+        "list runs with views down (PM call 18): {list}"
+    );
+    assert!(
+        !row.is_null() && row["pane"].is_null() && row["window"].is_null(),
+        "w2 listed without pane fields: {list}"
+    );
+    assert_eq!(
+        by_pid(&live, &mut sent, p1, &["stop", "w2"])["life"],
+        "ended",
+        "stop needs no view (4to7re #15)"
     );
 }
 
@@ -1062,8 +1243,26 @@ fn member_file(live: &Live, id: &str, file: &str) -> Value {
         .unwrap();
     serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap()
 }
+
+/// The folder of member `id`, under whichever server key of the state root holds it.
+fn member_dir(live: &Live, id: &str) -> PathBuf {
+    let state = live.dir.join("state");
+    live.wait("member folder", || {
+        let mut keys = std::fs::read_dir(&state).ok()?.flatten();
+        keys.find_map(|k| {
+            Some(k.path().join("agents").join(id)).filter(|p| p.join("record.json").is_file())
+        })
+    })
+}
+
+/// PM call 26: waits for member `id`'s proof evidence before it is commanded.
+fn proof_of(live: &Live, id: &str) {
+    ready::wait_member(&member_dir(live, id));
+}
+
 /// mux-agent run by member `id`'s fake client (found by its record's session); its reply.
 fn by(live: &Live, sent: &mut HashMap<u32, usize>, id: &str, args: &[&str]) -> Value {
+    proof_of(live, id);
     let session = s(&member_file(live, id, "record.json")["sessionId"]);
     by_pid(live, sent, client_pid(live, &session, 0), args)
 }
@@ -1585,8 +1784,11 @@ fn an_unacked_batch_is_served_again_and_rebuilt_for_a_successor() {
     let pending = by(&live, &mut sent, &b, &["read", "-Deliver"]);
     let sid = s(&member_file(&live, &b, "record.json")["sessionId"]);
     let old = client_pid(&live, &sid, 0);
+    ready::wait_conversation(&live.dir, &sid); // PM call 12
     assert_eq!(by(&live, &mut sent, &leader, &["stop", "b"])["ok"], true);
-    assert_eq!(by(&live, &mut sent, &leader, &["resume", "b"])["ok"], true);
+    let resumed = by(&live, &mut sent, &leader, &["resume", "b"]);
+    assert_eq!(resumed["ok"], true, "{resumed}");
+    proof_of(&live, &s(&resumed["agent"]["id"]));
     // The resumed B: matched by session id or argv as on Unix, another process than its predecessor (F20).
     let new = client_pid(&live, &sid, old);
     assert_ne!(new, old, "a new process");
@@ -1597,6 +1799,7 @@ fn an_unacked_batch_is_served_again_and_rebuilt_for_a_successor() {
 
 /// Posts a background line (`@bg`) to member `id`, once its client took the previous command; the path of its reply.
 fn post_bg(live: &Live, sent: &mut HashMap<u32, usize>, id: &str, args: &[&str]) -> PathBuf {
+    proof_of(live, id);
     let pid = client_pid(
         live,
         &s(&member_file(live, id, "record.json")["sessionId"]),

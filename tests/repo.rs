@@ -1524,6 +1524,7 @@ fn ci_jobs_run_cargo_and_sh() {
             "cargo fmt --check",
             "cargo clippy --all-targets --features test-panic --locked -- -D warnings",
             "cargo test --features test-panic --locked",
+            "cargo test --locked --test crash_point",
             "cargo build --release --locked",
             "cargo test --release --features test-panic --locked --test panic",
         ],

@@ -15,6 +15,9 @@
 //!   agent) and `env` the variables in `ENV` (null when unset). `ppid` is null on Windows. Then, with a session id
 //!   (`--session-id` or `--resume`), `report -Session <sid> -Source startup` through `MUX_IT_ENTRY` on a thread, its
 //!   stdout written whole to `session.<pid>.json` (report-2b K3, as a client's hook).
+//! - `conversation.<sid>.log`: one line `<pid> start` or `<pid> resume` per client that started or reloaded that
+//!   conversation; claude exits 1, publishing nothing, on `--resume` of an unknown one (after `resume-gone`, which
+//!   refuses any resume first).
 //! - Worker mode: a worker runs each line of `worker.cmd`, if present at start, as `worker.<pid>.<n>.{json,err,code}`
 //!   (n from 1), e.g. `send\tparent\t-BodyFile\t{dir}/reply.md` or `status\t-Body\tbusy`.
 //! - Commands: the client polls `cmd.<pid>`; it takes the file (renames it to `cmd.<pid>.taken.<n>`) and runs each
@@ -107,6 +110,42 @@ fn main() {
         .ok()
         .and_then(|c| c.trim().parse().ok())
         .unwrap_or(0);
+
+    // launch-1 (4to6 #7, #9, #10): one line `<pid> start|resume` per conversation a client starts or reloads, never
+    // its argv (a task holds newlines). `--session-id <s>` starts s (a fork's `--resume <root> --session-id <s>`
+    // included); a root client with no selector starts CLAUDE_CODE_SESSION_ID (Live::agent's root); claude's lone
+    // `--resume <s>` reloads s and exits 1 when there is none; copilot's `--resume <new>` starts it (ambiguity 15).
+    let resume = argv
+        .iter()
+        .position(|a| a == "--resume")
+        .and_then(|i| argv.get(i + 1))
+        .cloned();
+    let conversation = |id: &str| dir.join(format!("conversation.{id}.log"));
+    let root = std::env::var("CLAUDE_CODE_SESSION_ID")
+        .ok()
+        .filter(|s| !s.is_empty());
+    let entry_line = match (&sid, &resume) {
+        (Some(s), _) => Some((s.clone(), "start")),
+        (None, Some(r)) if exe_name() == "claude" => {
+            if !conversation(r).is_file() {
+                eprintln!("fake-client: no conversation {r}");
+                std::process::exit(1);
+            }
+            Some((r.clone(), "resume"))
+        }
+        (None, Some(r)) => Some((
+            r.clone(),
+            if conversation(r).is_file() {
+                "resume"
+            } else {
+                "start"
+            },
+        )),
+        (None, None) => root.map(|s| (s, "start")),
+    };
+    if let Some((id, how)) = &entry_line {
+        append(&conversation(id), &format!("{pid} {how}\n"));
+    }
 
     let record = json!({
         "pid": pid,
