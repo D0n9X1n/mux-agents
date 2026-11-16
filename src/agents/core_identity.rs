@@ -119,8 +119,11 @@ impl Identity {
             launcher: Vec::new(),
         })
     }
+    /// a3c call 47: the address matches only when both are valid and equal; a held or pending identity's empty address
+    /// never matches.
     pub fn matches(&self, t: &Terminal) -> bool {
-        t.address == self.address
+        use super::ident;
+        ident::same(ident::hc_address, Some(&t.address), Some(&self.address))
             && [
                 ("mux.managed", "1"),
                 ("mux.team", self.team.as_str()),
@@ -340,5 +343,33 @@ pub(crate) mod tests {
             "m0123abcd",
             "a recorded name wins at 0 too"
         );
+    }
+
+    // a3c call 47: an identity with no address (a held or pending one, `address: ""`) never matches a terminal by an
+    // empty address, even with every label equal.
+    #[test]
+    fn an_empty_address_never_matches() {
+        let mut id = identity();
+        id.address = String::new();
+        let t = Terminal {
+            address: String::new(),
+            name: None,
+            state: crate::hc::State::Live,
+            reason: None,
+            exit_code: None,
+            argv: id.launcher.clone(),
+            foreground: None,
+            labels: [
+                ("mux.managed", "1"),
+                ("mux.team", "k:$3"),
+                ("mux.id", "aaaaaaaaaaaa"),
+                ("mux.gen", "0"),
+            ]
+            .map(|(k, v)| (k.to_owned(), v.to_owned()))
+            .into_iter()
+            .collect(),
+            pid: None,
+        };
+        assert!(!id.matches(&t));
     }
 }

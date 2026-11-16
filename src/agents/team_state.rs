@@ -111,7 +111,13 @@ impl Guard<'_> {
         if !super::gens::lifecycle(r) {
             return false;
         }
-        if r.get("id").and_then(Value::as_str) != Some(id) {
+        // a3c call 47: a match only when both ids (and, for `Pending`, both hc names) are valid and equal.
+        use super::ident;
+        if !ident::same(
+            ident::member_id,
+            r.get("id").and_then(Value::as_str),
+            Some(id),
+        ) {
             return false;
         }
         let gen_of = |k: &str| r.get(k).and_then(|v| v.get("gen")).and_then(Value::as_u64);
@@ -121,7 +127,12 @@ impl Guard<'_> {
             Guard::PendingGen { n: None } => r.get("pending").is_none(),
             Guard::PendingGen { n: Some(n) } => gen_of("pending") == Some(n),
             Guard::Pending { n, hc_name } => {
-                gen_of("pending") == Some(n) && r["pending"]["hcName"].as_str() == Some(hc_name)
+                gen_of("pending") == Some(n)
+                    && ident::same(
+                        ident::hc_name,
+                        r["pending"]["hcName"].as_str(),
+                        Some(hc_name),
+                    )
             }
             Guard::CompletingGen { n } => gen_of("completing") == Some(n),
         }

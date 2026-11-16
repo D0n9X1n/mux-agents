@@ -113,7 +113,12 @@ fn unresolved(e: Refusal) -> Res<Outcome> {
 /// Call 63: the record read from `<agents>/<id>` must name `id`; another member's record there is Unreadable
 /// evidence for this member, read before any generation evidence, publication or hc call.
 fn bound(id: &str, r: &Value) -> Res<()> {
-    if r.get("id").and_then(Value::as_str) == Some(id) {
+    // a3c call 47: both ids valid and equal.
+    if ident::same(
+        ident::member_id,
+        r.get("id").and_then(Value::as_str),
+        Some(id),
+    ) {
         Ok(())
     } else {
         Err(crate::state::evidence::unreadable())
@@ -2219,5 +2224,16 @@ mod tests {
                 "{case}: the record changed"
             );
         }
+    }
+
+    // a3c call 47: call 63's binding needs a valid member id on both sides; an empty or malformed id in the record
+    // and in the call is never bound.
+    #[test]
+    fn an_invalid_id_is_never_bound() {
+        for id in ["", "../x"] {
+            let got = bound(id, &json!({"id": id}));
+            assert_eq!(got.map_err(|e| e.check), Err("evidence"), "{id:?}");
+        }
+        assert_eq!(bound(ID, &json!({"id": ID})), Ok(()));
     }
 }

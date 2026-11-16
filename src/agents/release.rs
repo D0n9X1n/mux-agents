@@ -168,7 +168,9 @@ pub fn conclude(tx: &Tx<'_>, lazy: &Lazy<'_>, id: &str, n: u64, rel: &Value) -> 
 /// every `mux.*` key and sets `mux.kept=<team>`, `mux.keptName=<mux.name>`.
 fn relabel(core: &Core<'_>, address: &str, t: &Terminal, id: &str, n: u64, team: &str) -> Res<()> {
     let label = |k: &str| t.labels.get(k).map(String::as_str).unwrap_or_default();
-    if label("mux.id") != id {
+    // a3c call 47: a valid id on both sides; a shell with no `mux.id` is never this member's.
+    let ident_of = t.labels.get("mux.id").map(String::as_str);
+    if !super::ident::same(super::ident::member_id, ident_of, Some(id)) {
         return Err(gens::unclear("the shell is another member's"));
     }
     if label("mux.gen") != n.to_string() {
@@ -1049,6 +1051,30 @@ mod tests {
                 "{case}: the intent kept"
             );
             lf::no_effect(&w);
+        }
+    }
+
+    // a3c call 47: the relabel guard needs a valid member id; a shell with no `mux.id` label, or an empty one, is never
+    // relabelled for an empty id.
+    #[test]
+    fn an_empty_id_never_relabels_a_shell_without_one() {
+        for case in ["no mux.id", "empty mux.id"] {
+            let (w, _s) = lf::world();
+            let mut shell = lf::lost(&w, 1, lf::LOST_ARGVS[0]);
+            let labels = shell["labels"].as_object_mut().unwrap();
+            if case == "no mux.id" {
+                labels.remove("mux.id");
+            } else {
+                labels.insert("mux.id".into(), json!(""));
+            }
+            let t = lf::terminal(&w, &shell);
+            cf::online(&w);
+            let core = crate::hc::connect(&w.ctx).unwrap();
+            lf::relabel(&w, "t1");
+            let asked = lf::calls(&w).len();
+            let got = relabel(&core, "t1", &t, "", 1, &lf::team(&w));
+            assert_eq!(got.map_err(|e| e.check), Err("hc"), "{case}");
+            assert_eq!(lf::calls(&w)[asked..].len(), 0, "{case}: hc asked");
         }
     }
 }
