@@ -2,7 +2,7 @@
 use serde_json::{Value, json};
 
 use super::adopt::{Change, Journal};
-use super::cascade_fixture::{self as cx, A, B, L};
+use super::cascade_fixture::{self as cx, A, B, C, L};
 use super::fixture::World;
 use super::life_fixture as lf;
 use super::team_state::Scope;
@@ -121,4 +121,20 @@ pub fn successor(w: &World, id: &str, from: &str, parent: &str, depth: u64, kind
         Kind::Aborted => lf::seed_gen(&m, 0, Some("run"), Some(json!({"aborted": true}))),
         _ => lf::seed_gen(&m, 0, Some("run"), None),
     }
+}
+
+pub const X: &str = "999999999999";
+/// L -> E -> B -> C; E Ended.
+pub fn four_deep(w: &World) {
+    cx::member(w, L, None, 0, json!({"upTeam": "t"}));
+    cx::member(w, E, Some(L), 1, json!({}));
+    cx::member(w, B, Some(E), 2, json!({}));
+    cx::member(w, C, Some(B), 3, json!({}));
+    ended(w, E);
+}
+/// `id`'s generation-1 view at `pane` (V1: `gen`, `hcAddress`, `launch.json` `hcName`).
+pub fn view_of(w: &World, id: &str, pane: &str) {
+    let v = json!({"pane": pane, "window": "@1", "startCommand": "hc attach", "gen": 1,
+        "hcAddress": cx::addr(id), "hcName": lf::hc_name(1)});
+    crate::state::fs::write_json(&w.folder(id).join("view.json"), &v).unwrap();
 }

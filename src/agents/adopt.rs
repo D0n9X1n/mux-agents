@@ -307,9 +307,10 @@ pub fn replay(tx: &Tx<'_>) -> Res<()> {
     settle(tx)?;
     let s = committed(tx.ctx, &tx.scope)?;
     let live: Vec<u64> = l.journals.iter().copied().filter(|n| *n > s).collect();
-    let next = s.checked_add(1);
+    // Call 28 (checklist 7): a seq with no successor refuses before any stale name is removed.
+    let next = s.checked_add(1).ok_or_else(overflow)?;
     // Two live journals always include one that is not seq + 1 (the `two` case).
-    if live.iter().any(|n| Some(*n) != next) || l.tombstones.iter().any(|n| *n > s) {
+    if live.iter().any(|n| *n != next) || l.tombstones.iter().any(|n| *n > s) {
         return Err(refusal("topology", OUT_OF_ORDER));
     }
     let stale: BTreeSet<u64> = (l.journals.iter().chain(&l.tombstones))
@@ -341,6 +342,52 @@ fn finish(tx: &Tx<'_>, j: &Journal) -> Res<()> {
     super::release::halt("adopt-removed")
 }
 
+/// AD-R4, call 7: a seq or depth that would overflow (tests assert this, never io text).
+pub const OVERFLOW: &str = "an adoption seq or depth is out of range; nothing was changed";
+fn overflow() -> Refusal {
+    refusal("topology", OVERFLOW)
+}
+/// What one source's pass did (call 9: a blocked source says why; prelife-1c call 2).
+#[derive(Debug, Clone, PartialEq)]
+pub enum Adopted {
+    Moved(String),
+    Nothing,
+    Blocked(&'static str),
+}
+/// A4 for one source E: replay, then revalidate E (A2), find what moves (nothing: done, ambiguity 9), choose A (A3),
+/// plan, journal, apply, commit, remove. Every number is checked before the journal is published.
+pub fn adopt_from(tx: &Tx<'_>, from: &str) -> Res<Adopted> {
+    replay(tx)?;
+    let v = View::read(tx)?;
+    if !v.source(from)? {
+        return Ok(Adopted::Nothing);
+    }
+    let moving = v.moving(from)?;
+    if moving.is_empty() {
+        return Ok(Adopted::Nothing);
+    }
+    let to = match v.adopter(from)? {
+        Up::To(to) => to,
+        Up::Blocked(why) => return Ok(Adopted::Blocked(why)),
+    };
+    let changes = v.plan(tx, &moving, &to)?;
+    let seq = (committed(tx.ctx, &tx.scope)?.checked_add(1)).ok_or_else(overflow)?;
+    let j = Journal {
+        seq,
+        from: from.into(),
+        to: to.clone(),
+        changes,
+    };
+    publish(tx, &j)?;
+    super::release::halt("adopt-journal")?;
+    finish(tx, &j)?;
+    Ok(Adopted::Moved(to))
+}
+/// A8: opens a Tx first.
+pub fn adopt(ctx: &Ctx, scope: &Scope, from: &str) -> Res<Adopted> {
+    super::team_state::open(ctx, scope, |tx| adopt_from(tx, from))
+}
+
 #[path = "adopt_view.rs"]
 mod view;
 pub use view::{LEAVES, SEVERAL, Up, View};
@@ -352,3 +399,7 @@ mod tests;
 #[cfg(test)]
 #[path = "adopt_replay_tests.rs"]
 mod replay_tests;
+
+#[cfg(test)]
+#[path = "adopt_from_tests.rs"]
+mod from_tests;
