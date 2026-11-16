@@ -1175,10 +1175,9 @@ mod tests {
 #[cfg(test)]
 mod admission_tests {
     use super::*;
-    use crate::{
-        ctx::Env,
-        testing::{Fakes, TempDir},
-    };
+    #[cfg(feature = "test-panic")]
+    use crate::ctx::Env;
+    use crate::testing::{Fakes, TempDir};
     use std::path::PathBuf;
 
     #[test]
