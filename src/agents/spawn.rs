@@ -457,7 +457,9 @@ impl Launch<'_> {
             brief_path.as_deref(),
             transcript.as_deref(),
         )?;
-        let prompt = format!("{}\n\n{}", lines.join("\n"), self.task);
+        // notebook-7b V1: the notebook block after the header; the caller holds the team (spawn) lock.
+        let block = super::notebook::news::index(ctx, &super::notebook::anchor(self.caller));
+        let prompt = format!("{}\n{block}\n\n{}", lines.join("\n"), self.task);
         let recipe = match agent.plan.context {
             Context::Fork => Recipe::Fork {
                 parent: agent.plan.parent_session.as_deref().unwrap_or_default(),
@@ -548,7 +550,8 @@ pub enum Recipe<'a> {
         parent: &'a str,
         task: Option<&'a str>,
     },
-    Resume,
+    /// A resumed conversation; its prompt (7b V1: the notebook block) is the new turn.
+    Resume(Option<&'a str>),
 }
 
 /// Arguments after flags: the session selector, then the model, then a nonempty task (today's pane order).
@@ -560,7 +563,7 @@ pub fn client_args(
 ) -> Vec<String> {
     let (mut args, prompt) = match recipe {
         Recipe::First(task) => (vec!["--session-id".into(), session.into()], task),
-        Recipe::Resume => (vec!["--resume".into(), session.into()], None),
+        Recipe::Resume(task) => (vec!["--resume".into(), session.into()], task),
         Recipe::Fork { parent, task } => (
             match client {
                 Client::Claude => vec![
@@ -1304,7 +1307,7 @@ mod tests {
                     expected
                 );
                 assert_eq!(
-                    client_args(client, Recipe::Resume, "own", Some("sonnet")),
+                    client_args(client, Recipe::Resume(None), "own", Some("sonnet")),
                     ["--resume", "own", "--model", "sonnet"]
                 );
             }
@@ -1324,7 +1327,10 @@ mod tests {
                     expected.push(t.into());
                 }
                 assert_eq!(client_args(c, Recipe::First(task), id, None), expected);
-                assert_eq!(client_args(c, Recipe::Resume, id, None), ["--resume", id]);
+                assert_eq!(
+                    client_args(c, Recipe::Resume(None), id, None),
+                    ["--resume", id]
+                );
                 let mut modeled = expected;
                 modeled.splice(2..2, ["--model".into(), "sonnet".into()]);
                 assert_eq!(
@@ -1334,7 +1340,7 @@ mod tests {
             }
             let mut whole = vec![client_name(c).to_string()];
             whole.extend(client_flags(c).iter().map(|s| s.to_string()));
-            whole.extend(client_args(c, Recipe::Resume, id, Some("sonnet")));
+            whole.extend(client_args(c, Recipe::Resume(None), id, Some("sonnet")));
             let prefix = match c {
                 Client::Claude => vec![
                     "claude",
@@ -2209,6 +2215,8 @@ mod tests {
             prompt.as_str().unwrap().split('\n').nth(2).unwrap(),
             format!("Context: brief-only (cross-client); brief: {brief}; parent transcript: none")
         );
+        let head = crate::agents::notebook::news::HEAD;
+        assert!(prompt.as_str().unwrap().contains(head), "brief: {prompt}");
         // A human needs no brief.
         let w = human();
         empty_launch(&w);
@@ -2233,6 +2241,27 @@ mod tests {
         );
         assert!(w.fakes.locks().is_empty());
         assert!(!w.ctx.state_root.exists());
+    }
+
+    // notebook-7b V1: an unreadable notebook (a file where its folder belongs) never fails a launch; the first text
+    // names the check.
+    #[test]
+    fn an_unreadable_notebook_never_fails_a_launch() {
+        let w = human();
+        let scope = crate::agents::notebook::anchor(&w.caller());
+        let notes = crate::agents::notebook::dir(&w.ctx.state_root, &scope);
+        std::fs::create_dir_all(notes.parent().unwrap()).unwrap();
+        std::fs::write(&notes, "not a folder").unwrap();
+        empty_launch(&w);
+        let ok = reply(&run(&w, &["-Client", "claude", "-Task", "hi"]));
+        let folder = agents_dir(&w).join(ok["id"].as_str().unwrap());
+        let prompt = read_json(&gens::path(&folder, 0, "spec"))["prompt"].clone();
+        let prompt = prompt.as_str().unwrap();
+        let head = crate::agents::notebook::news::HEAD;
+        assert!(
+            prompt.contains(&format!("{head}\n(notebook unreadable: ")),
+            "{prompt}"
+        );
     }
 
     #[test]
@@ -2525,7 +2554,13 @@ mod tests {
         assert!(read_json(&spec)["deadline"].is_string());
         let prompt = read_json(&spec)["prompt"].as_str().unwrap().to_string();
         assert!(prompt.ends_with("\n\nhi"), "{prompt}");
-        assert_eq!(prompt.split('\n').count(), 7);
+        // notebook-7b V1: the five header lines, the notebook block (one line: no notebook yet), a blank, the task.
+        assert_eq!(
+            prompt.split('\n').nth(5),
+            Some(crate::agents::notebook::news::HEAD),
+            "{prompt}"
+        );
+        assert_eq!(prompt.split('\n').count(), 8);
         for split in ["h", "v"] {
             let w = human();
             empty_launch(&w);
@@ -2611,6 +2646,8 @@ mod tests {
             };
             let case = format!("{client:?} no-fork {no_fork}");
             assert_eq!(read_json(&spec)["args"], expected, "{case}");
+            let head = crate::agents::notebook::news::HEAD;
+            assert!(prompt.as_str().unwrap().contains(head), "{case}: {prompt}");
             let context = if no_fork { "brief" } else { "fork" };
             assert_eq!(ok["context"], context, "{case}");
             let window = calls(&w, "new-window");
@@ -3943,7 +3980,9 @@ impl Launch<'_> {
         let id = hex_id()?;
         let from = &resumed.record;
         let session = text(from.get("sessionId"));
-        let args = client_args(self.client, Recipe::Resume, &session, None);
+        // notebook-7b V1: the resumed turn is the notebook block (the caller holds the team lock).
+        let block = super::notebook::news::index(ctx, &super::notebook::anchor(caller));
+        let args = client_args(self.client, Recipe::Resume(Some(&block)), &session, None);
         let spec = json!({"schema": 1, "stateDirectory": utf8(&state)?, "client": client_name(self.client),
             "flags": resumed.flags, "parentPane": from.get("parentPane"), "args": args});
         let mut record = from.clone();

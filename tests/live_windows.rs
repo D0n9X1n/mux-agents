@@ -696,10 +696,15 @@ fn hc_stop_then_resume_returns_with_its_conversation() {
             })
     });
     let argv: Vec<String> = client["argv"].as_array().unwrap().iter().map(s).collect();
-    assert!(argv.len() >= 2, "{argv:?}");
+    // notebook-7b V1: the resumed turn is the notebook block.
+    assert!(argv.len() >= 3, "{argv:?}");
     assert_eq!(
-        argv[argv.len() - 2..],
-        ["--resume".to_string(), sid.clone()],
+        argv[argv.len() - 3..],
+        [
+            "--resume".to_string(),
+            sid.clone(),
+            mux_agent::agents::notebook::news::HEAD.to_string()
+        ],
         "{argv:?}"
     );
     assert!(!argv.iter().any(|a| a == "--fork-session"), "{argv:?}");
@@ -1115,7 +1120,11 @@ fn hc_stopped_member_resumes_with_its_stored_options_only() {
         "the successor keeps the conversation"
     );
     let mut want = options.clone();
-    want.extend(["--resume".to_string(), sid.clone()]);
+    want.extend([
+        "--resume".to_string(),
+        sid.clone(),
+        mux_agent::agents::notebook::news::HEAD.to_string(),
+    ]);
     assert_eq!(
         resumed_client["argv"],
         serde_json::json!(want),
@@ -1822,6 +1831,7 @@ fn notebook_and_peek_stay_in_the_team() {
     let a = spawn(&mut sent, &leader, "a");
     let b = spawn(&mut sent, &a, "b");
     let c = spawn(&mut sent, &leader, "c");
+    let mut notices = Vec::new();
     for title in ["first", "second"] {
         let r = by(
             &live,
@@ -1830,7 +1840,12 @@ fn notebook_and_peek_stay_in_the_team() {
             &["note", "-Title", title, "-BodyFile", &body],
         );
         assert_eq!(r["ok"], json!(true), "{r}");
+        notices.push(format!("note-{}", s(&r["id"])));
     }
+    // 7b V2: b's next read serves each note's notice once.
+    let got = by(&live, &mut sent, &b, &["read"]);
+    let ids: Vec<String> = got["ids"].as_array().unwrap().iter().map(s).collect();
+    assert_eq!(ids, notices, "the notices: {got}");
     let r = by(&live, &mut sent, &b, &["notes"]);
     let titles: Vec<String> = r["notes"]
         .as_array()

@@ -28,6 +28,30 @@ pub(crate) fn team() -> (World, Scope) {
 pub(crate) fn refuse_replay(_: &Tx<'_>) -> Res<()> {
     Err(refusal(2, "replay", "replay refused"))
 }
+// 7b V2: the team snapshot a member's `note` takes for its notices: hc running every hc member of the caller's
+// session, read in address order.
+pub(crate) fn notice_round(w: &World, state: &std::path::Path, caller: &crate::caller::Caller) {
+    let session = caller.session.clone();
+    let mut records: Vec<Value> = std::fs::read_dir(state.join("agents"))
+        .unwrap()
+        .filter_map(|e| {
+            crate::state::fs::read_json(&e.unwrap().path().join("record.json"))
+                .ok()
+                .flatten()
+        })
+        .filter(|r| r.get("hcAddress").is_some() && r["session"] == session.as_str())
+        .collect();
+    records.sort_by_key(|r| crate::agents::text(r.get("hcAddress")));
+    crate::agents::core_fixture::online(w);
+    crate::agents::core_fixture::listing(w, &crate::agents::membership::team(caller), &[]);
+    for r in &records {
+        crate::agents::core_fixture::get(
+            w,
+            r["hcAddress"].as_str().unwrap(),
+            crate::agents::core_fixture::wire(r),
+        );
+    }
+}
 
 #[test]
 fn a_person_and_a_member_write_as_themselves() {
@@ -44,6 +68,7 @@ fn a_person_and_a_member_write_as_themselves() {
     let mut m = member_world();
     m.hc();
     m.rounds(2, &term(&m.r, Some(150)));
+    notice_round(&m.w, &m.state, &m.c);
     let (def, request) =
         crate::cli::parse(&argv(&["note", "-Title", "plan", "-Body", "hi"])).unwrap();
     (def.handler)(&m.w.ctx, &request).unwrap();
@@ -239,6 +264,7 @@ fn an_agent_writes_with_body_and_with_body_file() {
         ["note", "-Title", "file", "-BodyFile", "note.md"],
     ] {
         m.rounds(2, &t);
+        notice_round(&m.w, &m.state, &m.c);
         let (def, request) = crate::cli::parse(&argv(&tokens)).unwrap();
         assert!((def.handler)(&m.w.ctx, &request).is_ok(), "{tokens:?}");
     }

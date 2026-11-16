@@ -4959,7 +4959,11 @@ hc {}:
         );
         let client = resumed_client(&live, &sid);
         let mut want = options.clone();
-        want.extend(["--resume".to_string(), sid.clone()]);
+        want.extend([
+            "--resume".to_string(),
+            sid.clone(),
+            mux_agent::agents::notebook::news::HEAD.to_string(),
+        ]);
         assert_eq!(
             client["argv"],
             json!(want),
@@ -5015,10 +5019,11 @@ hc {}:
         let argv = strings(&client["argv"]);
         let at = argv.iter().position(|a| *a == "--resume").unwrap();
         assert_eq!(argv[at + 1], sid, "{mux:?}");
+        // notebook-7b V1: the only task after the conversation is the notebook block.
         assert_eq!(
-            at + 2,
-            argv.len(),
-            "{mux:?}: no task after the conversation: {argv:?}"
+            argv[at + 2..],
+            [mux_agent::agents::notebook::news::HEAD],
+            "{mux:?}: only the notebook block after the conversation: {argv:?}"
         );
         assert!(!argv.contains(&"--fork-session"), "{mux:?} {argv:?}");
         assert_eq!(client["exe"], "claude", "{mux:?}");
@@ -6018,10 +6023,15 @@ hc {}:
         let a = spawn(&mut live, &leader, "a");
         let b = spawn(&mut live, &a, "b");
         let c = spawn(&mut live, &leader, "c");
+        let mut notices = Vec::new();
         for title in ["first", "second"] {
             let (code, r) = live.by(&id(&a), &["note", "-Title", title, "-BodyFile", &body]);
             assert_eq!(code, 0, "{mux:?} {r}");
+            notices.push(format!("note-{}", s(&r["id"])));
         }
+        // 7b V2: b's next read serves each note's notice once.
+        let (code, r) = live.by(&id(&b), &["read"]);
+        assert_eq!((code, ids_of(&r)), (0, notices), "{mux:?} the notices: {r}");
         let (code, r) = live.by(&id(&b), &["notes"]);
         let titles: Vec<&str> = r["notes"]
             .as_array()

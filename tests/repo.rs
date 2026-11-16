@@ -789,6 +789,16 @@ const TEST_ONLY: &[(&str, &str, &str)] = &[
     ),
     ("src/agents/board/tests.rs", "src/agents/board.rs", "tests"),
     (
+        "src/agents/notebook/news/tests.rs",
+        "src/agents/notebook/news.rs",
+        "tests",
+    ),
+    (
+        "src/agents/notebook/news/notice_tests.rs",
+        "src/agents/notebook/news.rs",
+        "notice_tests",
+    ),
+    (
         "src/agents/notebook/tests.rs",
         "src/agents/notebook.rs",
         "tests",
