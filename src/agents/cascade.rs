@@ -912,3 +912,7 @@ pub fn tick(ctx: &Ctx, caller: &Caller) -> Res<bool> {
 #[cfg(test)]
 #[path = "cascade_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "cascade_crash_tests.rs"]
+mod crash;

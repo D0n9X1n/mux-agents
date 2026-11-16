@@ -1943,9 +1943,23 @@ pub(crate) mod crash {
         root.to_path_buf()
     }
 
+    /// Every crash child is bounded: past `LIMIT` it is killed (`SIGKILL` on Unix, `TerminateProcess` on Windows).
+    pub(crate) const LIMIT: std::time::Duration = std::time::Duration::from_secs(120);
+
     /// Runs `child` again in this binary with MUX_AGENTS_CRASH=step; answers the `CRASH-<KEY> <value>` lines.
     pub(crate) fn killed_at(child: &str, step: &str) -> Vec<(String, String)> {
-        let out = std::process::Command::new(std::env::current_exe().unwrap())
+        killed_within(child, step, LIMIT)
+    }
+
+    /// Runs `child` again in this binary with MUX_AGENTS_CRASH=step, at most `limit`; answers its `CRASH-` lines.
+    pub(crate) fn killed_within(
+        child: &str,
+        step: &str,
+        limit: std::time::Duration,
+    ) -> Vec<(String, String)> {
+        use std::io::Read;
+        use std::process::{Command, Stdio};
+        let mut proc = Command::new(std::env::current_exe().unwrap())
             .args([
                 "--exact",
                 child,
@@ -1954,15 +1968,34 @@ pub(crate) mod crash {
                 "--test-threads=1",
             ])
             .env("MUX_AGENTS_CRASH", step)
-            .output()
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
             .unwrap();
-        assert_eq!(
-            out.status.code(),
-            Some(86),
-            "{step}: {}",
-            String::from_utf8_lossy(&out.stderr)
-        );
-        let text = String::from_utf8_lossy(&out.stdout).to_string();
+        // Both pipes are drained on threads, so a chatty child never blocks on a full pipe.
+        let drain = |mut r: Box<dyn Read + Send>| {
+            std::thread::spawn(move || {
+                let mut s = String::new();
+                let _ = r.read_to_string(&mut s);
+                s
+            })
+        };
+        let out = drain(Box::new(proc.stdout.take().unwrap()));
+        let err = drain(Box::new(proc.stderr.take().unwrap()));
+        let deadline = std::time::Instant::now() + limit;
+        let status = loop {
+            if let Some(s) = proc.try_wait().unwrap() {
+                break s;
+            }
+            if std::time::Instant::now() > deadline {
+                let _ = proc.kill();
+                let _ = proc.wait();
+                panic!("{step}: {child} ran past {limit:?} and was killed");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        };
+        let (text, err) = (out.join().unwrap(), err.join().unwrap());
+        assert_eq!(status.code(), Some(86), "{step}: {err}");
         text.lines()
             .filter_map(|l| l.split_once("CRASH-").map(|(_, kv)| kv))
             .filter_map(|kv| kv.split_once(char::is_whitespace))
@@ -1971,6 +2004,54 @@ pub(crate) mod crash {
     }
     pub(crate) fn printed(kv: &[(String, String)], key: &str) -> PathBuf {
         PathBuf::from(&kv.iter().find(|(k, _)| k == key).expect(key).1)
+    }
+
+    /// Appends a heartbeat to the file named by MUX_AGENTS_CRASH (the "step" `killed_within` passes) every 50 ms
+    /// for 60 s, unless killed.
+    #[test]
+    #[ignore = "a child of a_hung_child_is_killed_at_the_bound"]
+    fn child_hangs() {
+        use std::io::Write;
+        let beat = std::env::var("MUX_AGENTS_CRASH").unwrap();
+        for _ in 0..1200 {
+            let mut f = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&beat)
+                .unwrap();
+            let _ = f.write_all(b".");
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+    }
+
+    // Fix-cycle finding 12: the bound returns in time, reports the kill, and the child is gone (its heartbeat
+    // stops). Removing `proc.kill()` fails `the child is gone`; removing the deadline fails `was killed`.
+    #[test]
+    fn a_hung_child_is_killed_at_the_bound() {
+        use std::time::{Duration, Instant};
+        let beat = std::env::temp_dir().join(format!("mux-agents-beat-{}", std::process::id()));
+        let _ = std::fs::remove_file(&beat);
+        let started = Instant::now();
+        let child = "agents::core_launch::crash::child_hangs";
+        let got = std::panic::catch_unwind(|| {
+            killed_within(child, beat.to_str().unwrap(), Duration::from_secs(2))
+        });
+        let message = got
+            .unwrap_err()
+            .downcast::<String>()
+            .map(|m| *m)
+            .unwrap_or_default();
+        assert!(message.contains("was killed"), "{message}");
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "returned under the bound"
+        );
+        let len = || std::fs::metadata(&beat).map_or(0, |m| m.len());
+        let first = len();
+        std::thread::sleep(Duration::from_millis(400));
+        assert!(first > 0, "the child ran");
+        assert_eq!(len(), first, "the child is gone");
+        let _ = std::fs::remove_file(&beat);
     }
 
     #[test]
