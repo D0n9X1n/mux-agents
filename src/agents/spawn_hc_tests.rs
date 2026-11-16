@@ -800,3 +800,6 @@ fn a_resume_is_a_new_lifecycle_member_with_the_ended_session() {
     );
     assert_eq!(spec["flags"], json!(["--model", "x"]));
 }
+
+#[path = "spawn_race_tests.rs"]
+mod race;

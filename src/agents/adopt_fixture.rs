@@ -138,3 +138,24 @@ pub fn view_of(w: &World, id: &str, pane: &str) {
         "hcAddress": cx::addr(id), "hcName": lf::hc_name(1)});
     crate::state::fs::write_json(&w.folder(id).join("view.json"), &v).unwrap();
 }
+
+/// Joins `h`, failing the test after 60 s (a deadlock).
+pub fn bounded<T>(h: std::thread::JoinHandle<T>) -> T {
+    let end = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    while !h.is_finished() {
+        assert!(
+            std::time::Instant::now() < end,
+            "a thread did not finish in 60 s"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    h.join().unwrap()
+}
+/// A world on `root` with real locks in `locks`; each thread builds its own.
+pub fn twin(root: &std::path::Path, locks: &std::path::Path) -> (World, Scope) {
+    let mut t = World::human("");
+    t.ctx.state_root = root.to_path_buf();
+    t.fakes.real_locks(locks);
+    let s = Scope::of(&t.caller());
+    (t, s)
+}

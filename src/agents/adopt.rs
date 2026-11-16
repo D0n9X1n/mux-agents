@@ -403,3 +403,7 @@ mod replay_tests;
 #[cfg(test)]
 #[path = "adopt_from_tests.rs"]
 mod from_tests;
+
+#[cfg(test)]
+#[path = "adopt_order_tests.rs"]
+mod order_tests;

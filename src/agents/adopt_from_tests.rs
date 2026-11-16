@@ -9,14 +9,14 @@ use crate::agents::life_fixture as lf;
 use crate::agents::team_state::Scope;
 use serde_json::json;
 
-fn adopt_now(w: &World, id: &str) -> Adopted {
+pub(super) fn adopt_now(w: &World, id: &str) -> Adopted {
     // Hook-free: group B's hooks would settle the pending generation seeded on D.
     adopt_from(&cx::tx(w, &Scope::of(&w.caller())), id).unwrap()
 }
-fn at(w: &World, id: &str) -> (Option<String>, u64) {
+pub(super) fn at(w: &World, id: &str) -> (Option<String>, u64) {
     (ax::parent_of(w, id), ax::depth_of(w, id))
 }
-fn moved(to: &str) -> Adopted {
+pub(super) fn moved(to: &str) -> Adopted {
     Adopted::Moved(to.into())
 }
 
