@@ -10,7 +10,9 @@
 //! - On start: `client.<pid>.json` = `{"pid", "ppid", "exe", "argv", "sessionId", "worker", "cwd", "tty": {"stdin",
 //!   "stdout"}, "env": {…}}`, then `<pid>` appended to `clients.log`. `exe` is this file's name (`claude`), `argv`
 //!   the arguments after it, `sessionId` the `--session-id` value or null, `worker` whether one was given (a spawned
-//!   agent) and `env` the variables in `ENV` (null when unset). `ppid` is null on Windows.
+//!   agent) and `env` the variables in `ENV` (null when unset). `ppid` is null on Windows. Then, with a session id
+//!   (`--session-id` or `--resume`), `report -Session <sid> -Source startup` through `MUX_IT_ENTRY` on a thread, its
+//!   stdout written whole to `session.<pid>.json` (report-2b K3, as a client's hook).
 //! - Worker mode: a worker runs each line of `worker.cmd`, if present at start, as `worker.<pid>.<n>.{json,err,code}`
 //!   (n from 1), e.g. `send\tparent\t-BodyFile\t{dir}/reply.md` or `status\t-Body\tbusy`.
 //! - Commands: the client polls `cmd.<pid>`; it takes the file (renames it to `cmd.<pid>.taken.<n>`) and runs each
@@ -89,6 +91,25 @@ fn main() {
     });
     write_whole(&dir.join(format!("client.{pid}.json")), record.to_string());
     append(&dir.join("clients.log"), &format!("{pid}\n"));
+
+    // report-2b K3: a client's session-start hook. On a thread: the verb waits up to 10 s for client.json.
+    let resumed = argv
+        .iter()
+        .position(|a| a == "--resume")
+        .and_then(|i| argv.get(i + 1))
+        .cloned();
+    if let Some(sid) = sid.clone().or(resumed) {
+        let (entry, dir) = (entry.clone(), dir.clone());
+        std::thread::spawn(move || {
+            let out = Command::new(&entry)
+                .args(["report", "-Session", &sid, "-Source", "startup"])
+                .stdin(Stdio::null())
+                .output();
+            if let Ok(out) = out {
+                write_whole(&dir.join(format!("session.{pid}.json")), out.stdout);
+            }
+        });
+    }
 
     let runner = Runner {
         dir: dir.clone(),

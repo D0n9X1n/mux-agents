@@ -1132,6 +1132,79 @@ exec claude --dangerously-skip-permissions
         );
     }
 
+    /// report-2b live (PM calls 4 and 18): a new member's client.json and ready.json within 150 s. With `barrier`,
+    /// the launcher holds client.json until report.json exists, and its mark proves that order.
+    fn ready_within_150_s(mux: Mux, barrier: bool) {
+        let Some(mut live) = Live::human(mux) else {
+            return;
+        };
+        if barrier {
+            crate::native::private_root(&live.state()); // PM call 16
+            std::fs::write(live.state().join("test-client-barrier"), "").unwrap();
+        }
+        let w1 = live.spawn("w1", &[]);
+        let (id, sid) = (s(&w1["id"]).to_string(), s(&w1["sessionId"]).to_string());
+        let client = live.server.client_by_session(&sid);
+        let env = &client["env"];
+        assert!(
+            env["HC_TERMINAL_ID"]
+                .as_str()
+                .is_some_and(|v| !v.is_empty()),
+            "{mux:?}: {client}"
+        );
+        assert!(
+            env["TMUX"].is_null() && env["RMUX"].is_null(),
+            "{mux:?}: the member sees no multiplexer: {client}"
+        );
+        let read = |f: &str| {
+            let text = std::fs::read_to_string(live.gen_file(&id, f)).ok()?;
+            serde_json::from_str::<Value>(&text).ok()
+        };
+        let (c, r) = crate::native::wait_150(
+            "client.json and ready.json",
+            || Some((read("client.json")?, read("ready.json")?)),
+            || {
+                format!(
+                    "{mux:?}: client {:?} ready {:?}",
+                    read("client.json"),
+                    read("ready.json")
+                )
+            },
+        );
+        assert_eq!(
+            (&r["pid"], &r["start"]),
+            (&c["pid"], &c["start"]),
+            "{mux:?}"
+        );
+        if barrier {
+            assert_eq!(
+                barrier_marks(&live.state()),
+                ["report-first"],
+                "{mux:?}: report.json before client.json"
+            );
+        }
+    }
+
+    fn barrier_marks(state: &Path) -> Vec<String> {
+        std::fs::read_dir(state)
+            .unwrap()
+            .filter_map(|e| {
+                let e = e.ok()?;
+                let name = e.file_name().to_string_lossy().into_owned();
+                name.starts_with("test-barrier-")
+                    .then(|| std::fs::read_to_string(e.path()).unwrap())
+            })
+            .collect()
+    }
+
+    fn a_new_member_reports_ready_within_150_s(mux: Mux) {
+        ready_within_150_s(mux, false)
+    }
+
+    fn a_new_member_reports_before_its_client_json_is_published(mux: Mux) {
+        ready_within_150_s(mux, true)
+    }
+
     fn core_launcher(live: &Live, w: &Value, client: &Value) -> Value {
         let launcher = json_file(&live.gen_file(s(&w["id"]), "launcher.json"));
         assert_eq!(client["ppid"], launcher["pid"]);
@@ -5209,6 +5282,8 @@ hc {}:
                     spawn_titles_tab_and_pane,
                     unnamed_spawns_at_once_get_distinct_names,
                     spawn_tags_pane_writes_record_and_commit_runs_client,
+                    a_new_member_reports_ready_within_150_s,
+                    a_new_member_reports_before_its_client_json_is_published,
                     worker_is_path_claude_forked_own_tty,
                     state_root_reaches_pane_not_server,
                     list_send_read_name_answer,

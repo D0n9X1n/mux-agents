@@ -1827,3 +1827,84 @@ fn an_orphan_left_by_a_forward_crash_is_ended_by_terminate() {
     assert_eq!(hc_get(&live, &address)["state"], "finished");
     assert!(agent_dir(&live, &id).join("gens/0/ended.json").exists());
 }
+
+/// report-2b live on Windows (rmux), as tests/live.rs: without and with the launcher barrier (PM call 18).
+#[test]
+fn a_new_member_reports_ready_within_150_s() {
+    for barrier in [false, true] {
+        let Some(live) = Live::start() else {
+            return;
+        };
+        let state = live.dir.join("state");
+        if barrier {
+            native::private_root(&state);
+            std::fs::write(state.join("test-client-barrier"), "").unwrap();
+        }
+        let y = live.spawn("w1");
+        let (id, sid) = (s(&y["id"]), s(&y["sessionId"]));
+        let client = client_of(&live, &sid);
+        assert!(
+            client["env"]["HC_TERMINAL_ID"]
+                .as_str()
+                .is_some_and(|v| !v.is_empty()),
+            "{client}"
+        );
+        assert!(
+            client["env"]["TMUX"].is_null() && client["env"]["RMUX"].is_null(),
+            "{client}"
+        );
+        let (c, r) = native::wait_150(
+            "client.json and ready.json",
+            || {
+                Some((
+                    gen0_file(&live, &id, "client.json")?,
+                    gen0_file(&live, &id, "ready.json")?,
+                ))
+            },
+            || {
+                format!(
+                    "barrier {barrier}: client {:?} ready {:?}",
+                    gen0_file(&live, &id, "client.json"),
+                    gen0_file(&live, &id, "ready.json")
+                )
+            },
+        );
+        assert_eq!(
+            (&r["pid"], &r["start"]),
+            (&c["pid"], &c["start"]),
+            "barrier {barrier}"
+        );
+        if barrier {
+            let marks: Vec<String> = std::fs::read_dir(&state)
+                .unwrap()
+                .filter_map(|e| {
+                    let e = e.ok()?;
+                    let n = e.file_name().to_string_lossy().into_owned();
+                    n.starts_with("test-barrier-")
+                        .then(|| std::fs::read_to_string(e.path()).unwrap())
+                })
+                .collect();
+            assert_eq!(marks, ["report-first"], "report.json before client.json");
+        }
+    }
+}
+
+/// The fake client record (`client.<pid>.json`) whose `sessionId` is `sid`, through `clients.log`; waited for.
+fn client_of(live: &Live, sid: &str) -> Value {
+    live.wait("the client of the new member", || {
+        let log = std::fs::read_to_string(live.dir.join("clients.log")).ok()?;
+        log.lines().find_map(|pid| {
+            let text =
+                std::fs::read_to_string(live.dir.join(format!("client.{}.json", pid.trim())))
+                    .ok()?;
+            let v: Value = serde_json::from_str(&text).ok()?;
+            (v["sessionId"] == sid).then_some(v)
+        })
+    })
+}
+
+/// `gens/0/<file>` of member `id` (found by `agent_dir`); None until it is whole.
+fn gen0_file(live: &Live, id: &str, file: &str) -> Option<Value> {
+    let p = agent_dir(live, id).join("gens").join("0").join(file);
+    serde_json::from_str(&std::fs::read_to_string(p).ok()?).ok()
+}

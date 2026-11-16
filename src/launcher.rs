@@ -600,6 +600,8 @@ fn run_gen(
     };
     let (mut conflicted, mut told_pid) = (false, false);
     let started = start(&client.executable, &client.args, &SCRUB, &mut |pid| {
+        #[cfg(feature = "live")]
+        live_client_barrier(ctx, member, n);
         told_pid = true;
         match publish_client(ctx, member, n, pid, &mut *publish) {
             ClientEvidence::Recorded => {}
@@ -748,6 +750,31 @@ fn publish_client(ctx: &Ctx, member: &Path, n: u64, pid: u32, publish: Publish) 
         }
     }
     ClientEvidence::Unrecorded
+}
+
+/// Live tests only (report-2b, PM call 18): with `<state root>/test-client-barrier`, hold client.json until generation
+/// `n`'s report.json exists (at most 600 polls of 100 ms), then mark the order in `test-barrier-<this pid>`. Not in
+/// release builds.
+#[cfg(feature = "live")]
+fn live_client_barrier(ctx: &Ctx, member: &Path, n: u64) {
+    if !ctx.state_root.join("test-client-barrier").exists() {
+        return;
+    }
+    let mut first = false;
+    for poll in 0..=600 {
+        if matches!(gens::read(member, n, "report"), Evidence::Present(_)) {
+            first = true;
+            break;
+        }
+        if poll < 600 {
+            ctx.clock.sleep(Duration::from_millis(100));
+        }
+    }
+    let mark = if first { "report-first" } else { "timeout" };
+    let _ = std::fs::write(
+        ctx.state_root.join(format!("test-barrier-{}", ctx.pid)),
+        mark,
+    );
 }
 
 /// Fix cycle 2: the `client-conflict` mark, `exitCode` null while the client runs, retried once. True only when this
@@ -2644,6 +2671,48 @@ mod tests {
             Evidence::Present(v) => v["reason"].clone(),
             _ => Value::Null,
         }
+    }
+
+    // report-2b (PM call 18): with the barrier file, client.json waits for report.json (at most 600 polls of 100 ms)
+    // and the launcher marks the order; without it, nothing waits and nothing is marked.
+    #[cfg(feature = "live")]
+    #[test]
+    fn the_live_client_barrier_waits_for_report_json_and_records_the_order() {
+        let f = crate::testing::Fakes::default();
+        let mut ctx = f.ctx();
+        let d = crate::testing::TempDir::new();
+        ctx.state_root = d.path().to_path_buf();
+        let m = d
+            .path()
+            .join("0123456789abcdef")
+            .join("agents")
+            .join("aaaaaaaaaaaa");
+        let mark = d.path().join(format!("test-barrier-{}", ctx.pid));
+        live_client_barrier(&ctx, &m, 1);
+        assert!(
+            f.slept().is_empty() && !mark.exists(),
+            "no barrier file: no wait, no mark"
+        );
+        std::fs::write(d.path().join("test-client-barrier"), "").unwrap();
+        let m2 = m.clone();
+        f.sleep_probe(move |count| {
+            if count == 3 {
+                crate::state::evidence::publish(&gens::path(&m2, 1, "report"), &json!({})).unwrap();
+            }
+        });
+        live_client_barrier(&ctx, &m, 1);
+        let read = || std::fs::read_to_string(&mark).ok();
+        assert_eq!(
+            (f.slept().len(), read()),
+            (3, Some("report-first".to_string()))
+        );
+        std::fs::remove_file(gens::path(&m, 1, "report")).unwrap();
+        live_client_barrier(&ctx, &m, 1);
+        assert_eq!(
+            (f.slept().len(), read()),
+            (603, Some("timeout".to_string())),
+            "at most 60 s"
+        );
     }
 
     // K1: client.json = {pid, start} of the started client, published after the start; while the client runs,
