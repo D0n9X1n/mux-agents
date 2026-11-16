@@ -269,6 +269,47 @@ pub fn deny_report(child: &std::process::Child) -> String {
     )
 }
 
+/// occupy-3 Task 7: a child killed and reaped on drop, so no test leaves a process behind.
+pub struct Reap(pub std::process::Child);
+
+impl Drop for Reap {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+/// This test binary copied into a fresh `dir` as `name` (with `.exe` on Windows), run with `args`.
+pub fn copy_as(dir: &Path, name: &str, args: &[&str]) -> Reap {
+    std::fs::create_dir_all(dir).unwrap();
+    let file = dir.join(if cfg!(windows) {
+        format!("{name}.exe")
+    } else {
+        name.to_string()
+    });
+    std::fs::copy(std::env::current_exe().unwrap(), &file).unwrap();
+    let child = std::process::Command::new(&file)
+        .args(args)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    Reap(child)
+}
+
+/// Polls `ready` every 50 ms for at most 10 s.
+pub fn within_10_s<T>(what: &str, mut ready: impl FnMut() -> Option<T>) -> T {
+    let end = Instant::now() + Duration::from_secs(10);
+    loop {
+        if let Some(v) = ready() {
+            return v;
+        }
+        assert!(Instant::now() < end, "{what}: not within 10 s");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
