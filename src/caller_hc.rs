@@ -112,6 +112,7 @@ fn prove(ctx: &Ctx) -> Res<Option<Caller>> {
             member: proven.then(|| id.to_string()),
             candidate: (!proven).then(|| id.to_string()),
             presentation,
+            anchor: None,
         })
     };
     Ok(read())

@@ -84,7 +84,7 @@ pub fn board(ctx: &Ctx, caller: &Caller, all: bool, watch: bool) -> Res<Map<Stri
             let stored = &snapshot.records[&o.identity.id];
             let got = super::gens::needs_recovery(
                 ctx,
-                &caller.server_key,
+                &super::scope::state(caller).key,
                 &o.identity.id,
                 &stored.record,
                 stored.active_done,
@@ -443,7 +443,10 @@ fn team_leader(
     caller: &Caller,
     snapshot: &super::membership::Snapshot,
 ) -> Option<String> {
-    let file = super::team::path(&super::server_dir(ctx, caller), &caller.session);
+    let file = super::team::path(
+        &super::server_dir(ctx, caller),
+        &super::scope::state(caller).session,
+    );
     if let Ok(Some(team)) = super::team::read(&file) {
         return Some(team.leader);
     }

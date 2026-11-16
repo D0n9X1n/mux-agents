@@ -272,7 +272,7 @@ pub fn notify_as(
     }
     let value = if on { "on" } else { "off" };
     // Under the team lock (a send reads the option under it too): the warning first, then the setting (W7).
-    lock(ctx, &lock_key("spawn", caller, &caller.session), || {
+    lock(ctx, &super::team_lock(caller), || {
         if on {
             warn(DRAFT_WARNING);
         }

@@ -33,7 +33,7 @@ pub struct Local {
 }
 
 pub fn team(caller: &Caller) -> String {
-    format!("{}:{}", caller.server_key, caller.session)
+    super::scope::team(caller)
 }
 
 pub fn locals(ctx: &Ctx, caller: &Caller) -> Res<Vec<Local>> {
@@ -89,7 +89,7 @@ fn scan(ctx: &Ctx, caller: &Caller) -> Res<Scan> {
         if record
             .get("session")
             .and_then(Value::as_str)
-            .is_some_and(|s| s != caller.session)
+            .is_some_and(|s| s != super::scope::state(caller).session)
         {
             continue;
         }

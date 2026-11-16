@@ -1,5 +1,5 @@
 use super::*;
-use crate::agents::{core_launch, team_state};
+use crate::agents::{core_launch, lock_key, team_state};
 use crate::{
     agents::{
         core_fixture,
@@ -834,5 +834,113 @@ fn a_spawn_adopts_a_pane_that_already_attaches_its_terminal() {
     assert_eq!(
         read_json(&of(&w, &r).join("view.json")).unwrap().unwrap()["pane"],
         "%12"
+    );
+}
+
+/// Re6a calls 10, 12: the World's caller (on its own key Kw, session `$3`) anchored at K1/`$A`, with a K1
+/// `server.json` already bound; returns the caller, the binding's path and its bytes.
+fn anchored_at_k1(w: &World) -> (crate::caller::Caller, PathBuf, Vec<u8>) {
+    let server = w.ctx.state_root.join(K1).join("server.json");
+    std::fs::create_dir_all(server.parent().unwrap()).unwrap();
+    std::fs::write(
+        &server,
+        br#"{"socket":"/k1","serverPid":1,"serverStart":1}"#,
+    )
+    .unwrap();
+    let before = std::fs::read(&server).unwrap();
+    let mut c = w.caller();
+    c.anchor = Some(crate::caller::Anchor {
+        key: K1.into(),
+        session: "$A".into(),
+    });
+    (c, server, before)
+}
+const K1: &str = "a1a1a1a1a1a1a1a1";
+
+// Calls 10, 12: a launch by a caller presented on Kw/$3 and anchored at K1/$A records session $A and team K1:$A,
+// and leaves K1's `server.json` byte-identical (only a launch on the anchor's own server writes it).
+#[test]
+fn an_anchored_launch_records_the_anchor_and_keeps_its_server_proof() {
+    let w = World::human("");
+    let (c, server, before) = anchored_at_k1(&w);
+    ready(&w);
+    let r = launch_hc(&w.ctx, &c, request(&w), slot).unwrap();
+    let id = r["id"].as_str().unwrap();
+    let file = w
+        .ctx
+        .state_root
+        .join(K1)
+        .join("agents")
+        .join(id)
+        .join("record.json");
+    let rec = read_json(&file).unwrap().unwrap();
+    assert_eq!(
+        (rec["session"].as_str(), rec["team"].as_str()),
+        (Some("$A"), Some(format!("{K1}:$A").as_str())),
+        "the record at K1 names the anchor"
+    );
+    assert_eq!(
+        std::fs::read(&server).unwrap(),
+        before,
+        "call 12: K1's binding untouched"
+    );
+    let leader = crate::agents::leader::prepare_for_test(&w.ctx, &c);
+    assert_eq!(
+        leader["session"], "$A",
+        "leader.rs: the leader record's session is the anchor's"
+    );
+    assert_eq!(
+        std::fs::read(&server).unwrap(),
+        before,
+        "call 12: the leader's prepare keeps it too"
+    );
+}
+
+// Calls 10, 12: an anchored spawn that debits writes the anchor's budget, none under the shown pair.
+#[test]
+fn an_anchored_spawn_debits_the_anchor_budget() {
+    let w = World::human("");
+    let own = w.caller().server_key;
+    let (c, _, _) = anchored_at_k1(&w);
+    ready(&w);
+    let core = crate::hc::connect(&w.ctx).unwrap();
+    let debit = |_: &crate::hc::Core<'_>| {
+        Ok(CoreSlot {
+            name: "worker".into(),
+            color: "blue",
+            placed: None,
+            debit: true,
+        })
+    };
+    launch_hc_locked(&w.ctx, &c, &core, request(&w), debit).unwrap();
+    let budget = |key: &str, session: &str| {
+        crate::agents::budget::path(&w.ctx.state_root.join(key), session)
+    };
+    assert!(budget(K1, "$A").is_file(), "the anchor's budget");
+    assert!(!budget(&own, "$3").exists(), "none under the shown pair");
+}
+
+// Call 12, checklist R2: a resume by a caller anchored off its own server leaves K1's `server.json` byte-identical.
+#[test]
+fn an_anchored_resume_keeps_the_anchor_server_proof() {
+    let w = World::human("");
+    let (c, server, before) = anchored_at_k1(&w);
+    ready(&w);
+    let from = json!({"id": "bbbbbbbbbbbb", "name": "worker", "client": "claude", "sessionId": SESSION_ID,
+        "session": "$A", "directory": utf8(&w.ctx.cwd).unwrap(), "lifecycle": 1, "generation": "0",
+        "options": [], "prompt": ["old task"], "hcName": "m0123abcd", "parentPane": null});
+    let resumed = Resumed {
+        from: "bbbbbbbbbbbb".into(),
+        record: from,
+        flags: vec![],
+    };
+    let mut req = request(&w);
+    req.task = "";
+    req.resume = Some(&resumed);
+    launch_hc(&w.ctx, &c, req, slot).unwrap();
+    assert_eq!(
+        std::fs::read(&server).unwrap(),
+        before,
+        "call 12: a resume keeps K1's binding"
     );
 }

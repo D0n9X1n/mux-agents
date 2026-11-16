@@ -15,7 +15,7 @@ use serde_json::{Map, Value};
 use crate::agents::board::{ENDED_MAX, board};
 use crate::agents::spawn::{pane_env, utf8};
 use crate::agents::view::Focused;
-use crate::agents::{lock, lock_key, pane_id, text};
+use crate::agents::{lock, pane_id, scope, text};
 use crate::caller::{Caller, resolve};
 use crate::cli::Request;
 use crate::ctx::{Ctx, Env};
@@ -109,7 +109,7 @@ pub enum Bar {
 /// The bar of `window` a verb keeps open: under the session's sidebar lock, nothing when the session's option says
 /// `off`, else that window's bar, found or opened in it. A failed read or probe refuses and opens nothing.
 pub fn ensure(ctx: &Ctx, caller: &Caller, window: &str) -> Res<Bar> {
-    lock(ctx, &lock_key("sidebar", caller, &caller.session), || {
+    lock(ctx, &scope::shown_lock("sidebar", caller), || {
         let read = native(
             ctx,
             &["show-options", "-qv", "-t", &caller.session, OPTION],
@@ -2041,7 +2041,7 @@ const ALERTED: &str = "@mux-agents-alerted";
 /// `@mux-agents-alerts` says, so turning it on later replays nothing), and only then sent. News whose time does not
 /// parse, a record that cannot be read or written, or a lock not taken sends nothing: a change is told at most once.
 fn alert(ctx: &Ctx, caller: &Caller, news: &[News]) {
-    let _ = lock(ctx, &lock_key("sidebar", caller, &caller.session), || {
+    let _ = lock(ctx, &scope::shown_lock("sidebar", caller), || {
         let read = native(
             ctx,
             &["show-options", "-qv", "-t", &caller.session, ALERTED],
@@ -2637,7 +2637,7 @@ pub fn sidebar(ctx: &Ctx, request: &Request) -> Res<Map<String, Value>> {
     crate::cli::member_views(ctx, &caller)?;
     crate::agents::registry::untagged(ctx, &caller, "an agent pane cannot open the side bar")?;
     let close = request.switch("Close");
-    lock(ctx, &lock_key("sidebar", &caller, &caller.session), || {
+    lock(ctx, &scope::shown_lock("sidebar", &caller), || {
         let mut reply = Map::new();
         if !close {
             native(
@@ -2934,7 +2934,7 @@ pub(crate) fn view_windows(ctx: &Ctx, caller: &Caller) -> Option<Vec<String>> {
 /// lock not taken keeps the bar: false. Else its pane's label is removed only while the pane still runs this
 /// process, its window's record is cleared only while it still names this bar, and the bar leaves: true.
 fn leave(ctx: &Ctx, caller: &Caller) -> bool {
-    lock(ctx, &lock_key("sidebar", caller, &caller.session), || {
+    lock(ctx, &scope::shown_lock("sidebar", caller), || {
         if view_windows(ctx, caller).is_none_or(|windows| windows.contains(&caller.window)) {
             return Ok(false);
         }
@@ -3040,7 +3040,7 @@ enum SelfExit {
 /// (each bound to its pid, like `leave`) and leaves, so its pane closes with it and, dead, blocks no later bar. An
 /// unread mark or record, or a lock not taken, decides nothing.
 fn self_exit(ctx: &Ctx, caller: &Caller) -> SelfExit {
-    lock(ctx, &lock_key("sidebar", caller, &caller.session), || {
+    lock(ctx, &scope::shown_lock("sidebar", caller), || {
         let read = |args: &[&str]| native(ctx, args, true).ok().filter(|r| r.code == 0);
         let Some(mark) = read(&["display-message", "-p", "-t", &caller.pane, OWN_MARK]) else {
             return Ok(SelfExit::Unread);

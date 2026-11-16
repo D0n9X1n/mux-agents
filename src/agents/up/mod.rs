@@ -12,7 +12,7 @@ use std::{cell::Cell, path::Path};
 use serde_json::{Map, Value, json};
 
 use super::spawn::{CoreRequest, CoreSlot, client_named, launch_hc_locked, utf8};
-use super::{admit, leader::Leader, lock, lock_key, registry, text, usage};
+use super::{admit, leader::Leader, lock, registry, text, usage};
 use crate::{
     caller::{Caller, Kind},
     cli::Request,
@@ -58,7 +58,7 @@ pub fn up(ctx: &Ctx, request: &Request) -> Res<Map<String, Value>> {
         if super::cascade::waiting(ctx, &scope) {
             super::team_state::open(ctx, &scope, |tx| super::cascade::finish(tx, &caller))?;
         }
-        discover::refuse_existing(ctx, &core, &caller.server_key, &team)?;
+        discover::refuse_existing(ctx, &core, &super::scope::state(&caller).key, &team)?;
         create(
             ctx,
             &caller,
@@ -170,7 +170,7 @@ fn create(ctx: &Ctx, caller: &Caller, core: &Core<'_>, plan: &Plan<'_>) -> Res<M
         options: plan.options.to_vec(),
         prompt: plan.prompt.to_vec(),
     };
-    let record = lock(ctx, &lock_key("spawn", &dest, &dest.session), || {
+    let record = lock(ctx, &super::team_lock(&dest), || {
         server::same(ctx, &dest)?;
         let request = CoreRequest {
             client: plan.client,
@@ -256,7 +256,7 @@ fn write_team(ctx: &Ctx, dest: &Caller, plan: &Plan<'_>, name: &str, record: &Va
     use super::team;
     let made = team::Team {
         team: plan.team.into(),
-        session: dest.session.clone(),
+        session: super::scope::state(dest).session,
         name: name.into(),
         directory: utf8(plan.folder)?.into(),
         client: plan.client,
@@ -266,7 +266,10 @@ fn write_team(ctx: &Ctx, dest: &Caller, plan: &Plan<'_>, name: &str, record: &Va
         created_at: crate::util::utc_o(ctx.clock.now()),
     };
     if team::create(
-        &team::path(&super::server_dir(ctx, dest), &dest.session),
+        &team::path(
+            &super::server_dir(ctx, dest),
+            &super::scope::state(dest).session,
+        ),
         &made,
     )? {
         Ok(())

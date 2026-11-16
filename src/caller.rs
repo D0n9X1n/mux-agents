@@ -45,6 +45,9 @@ pub struct Caller {
     /// The caller's view, `(pane, window)`: a pane caller's own; a proven member's only while its active
     /// generation's view is presented and its multiplexer server is live (proof-0b K2). None: views are down.
     pub presentation: Option<(String, String)>,
+    /// reentry-6a E0: the team anchor this caller's state lives at (set by `scope::admit` for a person in a team's
+    /// proven view, by `scope::present` for a member). `None` keeps the caller's own server key and session.
+    pub anchor: Option<Anchor>,
 }
 
 /// reentry-6a E0: a team's anchor, the server key and session its state stays at.
@@ -248,6 +251,7 @@ fn resolve_as(ctx: &Ctx, tree: bool) -> Res<Caller> {
         member: None,
         candidate: None,
         presentation: Some((pane.to_string(), probe.window.to_string())),
+        anchor: None,
     })
 }
 

@@ -31,7 +31,7 @@ pub fn dir(root: &Path, scope: &Scope) -> PathBuf {
 
 /// The scope the verbs use; reentry-6a (E0) routes it to the team's anchor.
 pub fn anchor(caller: &Caller) -> Scope {
-    Scope::of(caller)
+    super::scope::state(caller)
 }
 
 /// N1: an entry's author; `key` is its logical member key (a person's is `person`).

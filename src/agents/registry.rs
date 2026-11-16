@@ -384,7 +384,8 @@ impl Snapshot {
 /// A record naming its folder's id and the caller's session.
 fn own(record: &Value, id: &str, caller: &Caller) -> bool {
     record.get("id").and_then(Value::as_str) == Some(id)
-        && record.get("session").and_then(Value::as_str) == Some(caller.session.as_str())
+        && record.get("session").and_then(Value::as_str)
+            == Some(super::scope::state(caller).session.as_str())
 }
 
 /// R1, R2, R4: one `presented`, one `status`, one notice read of the active generation. Any Unreadable skips the
@@ -882,12 +883,7 @@ pub fn reap(
         acted |= if spawn_lock_held {
             close()?
         } else {
-            super::try_lock(
-                ctx,
-                &super::lock_key("spawn", caller, &caller.session),
-                close,
-            )?
-            .unwrap_or(false)
+            super::try_lock(ctx, &super::team_lock(caller), close)?.unwrap_or(false)
         };
     }
     Ok(acted)

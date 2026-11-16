@@ -8,7 +8,7 @@ use serde_json::{Map, Value, json};
 
 use super::mail::doing_line;
 use super::placement::{DEFAULT as DEFAULT_PLACEMENT, read_placement};
-use super::{copilot, lock, lock_key, registry, state_dir, text, usage};
+use super::{copilot, lock, registry, state_dir, text, usage};
 use crate::caller::{Caller, Kind};
 use crate::checks::{Context, Plan, assert_spawn_allowed, context_plan, session_id};
 use crate::cli::Request;
@@ -154,7 +154,7 @@ pub fn spawn(ctx: &Ctx, request: &Request) -> Res<Map<String, Value>> {
         }
         registry::untagged(ctx, &caller, "an agent pane cannot spawn agents")?;
     } else {
-        lock(ctx, &lock_key("spawn", &caller, &caller.session), || {
+        lock(ctx, &super::team_lock(&caller), || {
             super::tree::team_of(ctx, &caller)
         })?;
     }
@@ -420,7 +420,7 @@ impl Launch<'_> {
         let context = context_name(agent.plan.context);
         let mut record = json!({"schema": 1, "id": agent.id, "name": agent.name, "client": client,
             "sessionId": agent.session, "context": context, "reason": agent.plan.reason,
-            "session": caller.session, "pane": new_pane, "window": window, "parentPane": caller.pane,
+            "session": super::scope::state(caller).session, "pane": new_pane, "window": window, "parentPane": caller.pane,
             "parentAgent": parent_agent, "directory": utf8(&self.directory)?,
             "taskLine": doing_line(&self.task), "createdAt": utc_o(ctx.clock.now())});
         if let Some(p) = &self.placed {
@@ -776,6 +776,7 @@ mod tests {
     use crate::agents::copilot::session_folder;
     use crate::agents::fixture::{CLAUDE, PANE, World};
     use crate::agents::gens;
+    use crate::agents::lock_key;
     use crate::checks::Context;
     use crate::ctx::Env;
     use crate::mux::{Kind as MuxKind, Output};
@@ -959,7 +960,7 @@ mod tests {
         let folder = agents_dir(w).join(&agent_folders(w)[0]);
         let spec = read_json(&gens::path(&folder, 0, "spec"));
         let id = spec["id"].as_str().unwrap();
-        let team = format!("{}:{}", caller.server_key, caller.session);
+        let team = crate::agents::scope::team(&caller);
         let mut run = vec![
             "run".into(),
             "--bg".into(),
@@ -3841,7 +3842,7 @@ pub fn launch_hc(
     reserve: impl FnOnce(&crate::hc::Core<'_>) -> Res<CoreSlot>,
 ) -> Res<Value> {
     let core = crate::hc::connect(ctx)?;
-    lock(ctx, &lock_key("spawn", caller, &caller.session), || {
+    lock(ctx, &super::team_lock(caller), || {
         launch_hc_locked(ctx, caller, &core, request, reserve)
     })
 }
@@ -3889,7 +3890,10 @@ pub fn launch_hc_locked(
             if !debit {
                 return Ok(());
             }
-            let file = super::budget::path(&super::server_dir(ctx, caller), &caller.session);
+            let file = super::budget::path(
+                &super::server_dir(ctx, caller),
+                &super::scope::state(caller).session,
+            );
             super::budget::spend(
                 &file,
                 &super::budget::rate(ctx, caller),
@@ -3934,10 +3938,13 @@ impl Launch<'_> {
     fn prepare_hc(&self, slot: CoreSlot) -> Res<super::core_launch::Launch> {
         let (ctx, caller) = (self.ctx, self.caller);
         let state = state_dir(ctx, caller)?;
-        write_json(
-            &state.join("server.json"),
-            &json!({"socket":caller.socket,"serverPid":caller.server_pid,"serverStart":caller.server_start}),
-        )?;
+        // Re6a call 12: only a launch on the anchor's own server binds the anchor's `server.json`.
+        if super::scope::on_anchor(caller) {
+            write_json(
+                &state.join("server.json"),
+                &json!({"socket":caller.socket,"serverPid":caller.server_pid,"serverStart":caller.server_start}),
+            )?;
+        }
         let agent = self.allocate(&state, slot.name, slot.color)?;
         let spec = self.prepare(&agent)?;
         let mut record = self.record(&agent, "", "", "")?;
@@ -3973,10 +3980,13 @@ impl Launch<'_> {
     ) -> Res<super::core_launch::Launch> {
         let (ctx, caller) = (self.ctx, self.caller);
         let state = state_dir(ctx, caller)?;
-        write_json(
-            &state.join("server.json"),
-            &json!({"socket":caller.socket,"serverPid":caller.server_pid,"serverStart":caller.server_start}),
-        )?;
+        // Re6a call 12: only a launch on the anchor's own server binds the anchor's `server.json`.
+        if super::scope::on_anchor(caller) {
+            write_json(
+                &state.join("server.json"),
+                &json!({"socket":caller.socket,"serverPid":caller.server_pid,"serverStart":caller.server_start}),
+            )?;
+        }
         let id = hex_id()?;
         let from = &resumed.record;
         let session = text(from.get("sessionId"));
