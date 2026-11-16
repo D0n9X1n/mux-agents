@@ -84,6 +84,8 @@ struct Log {
     unlisted: Vec<u32>,
     // What `boot` answers; none is Absolute (macOS, Windows).
     boot: Option<Boot>,
+    // What `proc_mounts` answers: none is no seam (not Linux); `Some(None)` mountinfo that cannot be read.
+    mountinfo: Option<Option<String>>,
 }
 
 /// Locks two fakes on two threads contend for, as two processes contend for the real lock: a key held by one blocks
@@ -248,6 +250,11 @@ impl Fakes {
     /// Toolhelp does, with its pid and ppid and no start.
     pub fn deny(&self, pid: u32) {
         self.0.borrow_mut().denied.push(pid);
+    }
+
+    /// The /proc seam present (as on Linux): `Some(text)` is mountinfo, `None` mountinfo that cannot be read.
+    pub fn mountinfo(&self, text: Option<&str>) {
+        self.0.borrow_mut().mountinfo = Some(text.map(String::from));
     }
 
     /// What `Os::boot` answers from now on (r2b call 27).
@@ -589,6 +596,11 @@ impl Os for Fakes {
 
     fn boot(&self) -> Boot {
         self.0.borrow().boot.clone().unwrap_or(Boot::Absolute)
+    }
+
+    fn proc_mounts(&self) -> Option<std::io::Result<String>> {
+        let mountinfo = self.0.borrow().mountinfo.clone();
+        mountinfo.map(|t| t.ok_or_else(|| std::io::Error::other("unreadable mountinfo")))
     }
 }
 

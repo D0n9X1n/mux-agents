@@ -79,6 +79,10 @@ pub trait Os {
     fn token(&self) -> Option<Token>;
     fn sandbox(&self) -> Signals;
     fn boot(&self) -> Boot;
+    /// Linux: `/proc/self/mountinfo` (`Some(Err)` when it cannot be read); None where there is no /proc.
+    fn proc_mounts(&self) -> Option<io::Result<String>> {
+        None
+    }
 }
 
 #[cfg(target_os = "macos")]

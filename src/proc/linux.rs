@@ -112,6 +112,11 @@ impl Os for Linux {
             .filter(|s| !s.is_empty())
             .map_or(Boot::Unreadable, Boot::Id)
     }
+
+    /// Calls 10, 20: occupancy reads /proc's mounts before trusting the table.
+    fn proc_mounts(&self) -> Option<io::Result<String>> {
+        Some(std::fs::read_to_string("/proc/self/mountinfo"))
+    }
 }
 
 #[cfg(test)]

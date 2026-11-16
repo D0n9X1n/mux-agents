@@ -348,7 +348,7 @@ fn session_held(ctx: &Ctx, core: &Core<'_>, x: &str, session: &str) -> Option<St
         // `/resume`, which shows no uuid.
         for row in ctx.os.table()? {
             match row.argv.as_deref() {
-                Some(argv) if occupies(argv, session) => return Ok(Some(live())),
+                Some(argv) if super::occupancy::occupies(argv, session) => return Ok(Some(live())),
                 Some(_) => {}
                 None if unreadable_client(ctx, &row) => {
                     return Ok(Some(format!(
@@ -416,30 +416,6 @@ fn unreadable_client(ctx: &Ctx, row: &crate::proc::Row) -> bool {
             .to_ascii_lowercase();
         let file = file.strip_suffix(".exe").unwrap_or(&file);
         file == "claude" || file == "copilot"
-    })
-}
-
-/// Whether a process with `argv` runs a client on `session`: the uuid follows `--session-id` (or
-/// `--session-id=`), or `--resume`, `-r` (or `--resume=`) in a command line without `--fork-session`. A Claude fork
-/// (`--resume <source> --fork-session --session-id <new>`) occupies only the new conversation; a Copilot fork resumes
-/// its own copy under the new id, so its `--resume` already names only the new one. Words after `--` are no flags.
-fn occupies(argv: &[String], session: &str) -> bool {
-    let flags: Vec<&str> = argv
-        .iter()
-        .map(String::as_str)
-        .take_while(|a| *a != "--")
-        .collect();
-    let fork = flags.contains(&"--fork-session");
-    flags.iter().enumerate().any(|(i, a)| {
-        let (name, inline) = match a.split_once('=') {
-            Some((name, value)) => (name, Some(value)),
-            None => (*a, None),
-        };
-        let resume = name == "--resume" || (name == "-r" && inline.is_none());
-        if !(name == "--session-id" || (resume && !fork)) {
-            return false;
-        }
-        inline.or_else(|| flags.get(i + 1).copied()) == Some(session)
     })
 }
 
