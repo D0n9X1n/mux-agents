@@ -31,6 +31,7 @@ pub mod options;
 pub mod placement;
 pub mod receipt;
 pub mod registry;
+pub mod release;
 pub mod resume;
 pub mod session_report;
 #[cfg(test)]

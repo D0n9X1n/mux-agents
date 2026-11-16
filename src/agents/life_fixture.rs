@@ -108,3 +108,69 @@ pub fn terminal(w: &World, wire: &Value) -> crate::hc::Terminal {
     let core = crate::hc::connect(&w.ctx).unwrap();
     core.get(wire["address"].as_str().unwrap()).unwrap()
 }
+/// The recovery shells `lifecycle::classify` calls Lost: POSIX, and Windows (hc 0.1.21). Both run on every OS.
+pub const LOST_ARGVS: [&[&str]; 2] = [
+    &["/bin/zsh", "-l"],
+    &[
+        "C:/Program Files/PowerShell/7/pwsh.exe",
+        "-NoExit",
+        "-Command",
+        "hook",
+    ],
+];
+pub fn lost(w: &World, n: u64, argv: &[&str]) -> Value {
+    wire(w, n, "live", None, argv)
+}
+/// A shell this team already released: only `mux.kept` (this team) and `mux.keptName`.
+pub fn kept(w: &World, n: u64) -> Value {
+    json!({"address": format!("t{n}"), "name": hc_name(n), "state": "live", "argv": LOST_ARGVS[0],
+        "labels": {"mux.kept": team(w), "mux.keptName": "worker"}})
+}
+/// hc forgot the terminal: `not_found`, exit 3 (hc 0.1.21).
+pub fn gone(w: &World, address: &str) {
+    let out = Out {
+        code: 3,
+        stdout: json!({"error": {"kind": "not_found"}}).to_string(),
+        stderr: String::new(),
+    };
+    w.fakes.hc_expect(&["get", address, "--json"], Ok(out));
+}
+/// release-1d R1.3's one relabel call.
+pub fn relabel_argv(w: &World, address: &str) -> Vec<String> {
+    let kept = format!("mux.kept={}", team(w));
+    [
+        "label",
+        address,
+        "mux.managed=",
+        "mux.team=",
+        "mux.id=",
+        "mux.gen=",
+        "mux.name=",
+        "mux.up=",
+        &kept,
+        "mux.keptName=worker",
+        "--json",
+    ]
+    .map(String::from)
+    .to_vec()
+}
+pub fn relabel(w: &World, address: &str) {
+    let argv = relabel_argv(w, address);
+    let argv: Vec<&str> = argv.iter().map(String::as_str).collect();
+    cf::answer(w, &argv, "{}");
+}
+pub fn calls(w: &World) -> Vec<Vec<String>> {
+    w.fakes.hc_calls().into_iter().map(|c| c.1).collect()
+}
+pub fn count(w: &World, verb: &str) -> usize {
+    calls(w).iter().filter(|c| c[0] == verb).count()
+}
+/// R1, R2: no `kill`, `send` or `keys`.
+pub fn no_effect(w: &World) {
+    for argv in calls(w) {
+        assert!(
+            !["kill", "send", "keys"].contains(&argv[0].as_str()),
+            "{argv:?}"
+        );
+    }
+}
