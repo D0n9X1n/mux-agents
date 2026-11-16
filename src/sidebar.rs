@@ -2726,7 +2726,7 @@ fn own_record(ctx: &Ctx, caller: &Caller) -> bool {
 
 /// The windows of the session that show a member's live view: each local member's record through `Identity::view`
 /// on the session's panes (a dead pane is no view). None when either read fails; no pane read without members.
-fn view_windows(ctx: &Ctx, caller: &Caller) -> Option<Vec<String>> {
+pub(crate) fn view_windows(ctx: &Ctx, caller: &Caller) -> Option<Vec<String>> {
     let locals = crate::agents::membership::locals(ctx, caller).ok()?;
     if locals.is_empty() {
         return Some(Vec::new());
@@ -2734,8 +2734,11 @@ fn view_windows(ctx: &Ctx, caller: &Caller) -> Option<Vec<String>> {
     let rows = crate::agents::registry::rows(ctx, caller).ok()?;
     let mut windows: Vec<String> = Vec::new();
     for local in &locals {
-        if let Some(view) = local.identity.view(&local.stored.record, &rows)
-            && !windows.contains(&view.window)
+        if let Some(view) = local.identity.view(
+            &local.stored.record,
+            &rows,
+            &crate::agents::core_identity::Key::of(caller),
+        ) && !windows.contains(&view.window)
         {
             windows.push(view.window);
         }

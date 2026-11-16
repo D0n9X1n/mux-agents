@@ -46,12 +46,16 @@ pub struct Core<'a> {
     bin: PathBuf,
 }
 
+/// The names hc is installed under, in `connect`'s order. A view pane's program is recognised by them, at any path
+/// (v6f call 13): a view never depends on which binary `PATH` resolves today.
+pub const INSTALL_NAMES: [&str; 2] = ["hc", "herdr-core"];
+
 pub fn connect(ctx: &Ctx) -> Res<Core<'_>> {
     let path = ctx.env.get("PATH").unwrap_or("");
     let bin = ctx
         .hc
-        .find("hc", path)
-        .or_else(|| ctx.hc.find("herdr-core", path))
+        .find(INSTALL_NAMES[0], path)
+        .or_else(|| ctx.hc.find(INSTALL_NAMES[1], path))
         .ok_or_else(|| failure(INSTALL))?;
     let core = Core {
         provider: ctx.hc.as_ref(),

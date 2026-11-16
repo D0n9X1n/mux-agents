@@ -51,7 +51,8 @@ fn a_lifecycle_reattach_writes_only_its_view() {
         "record.json untouched"
     );
     let want = json!({"serverKey": c.server_key, "session": c.session, "pane": "%19", "window": "@8",
-        "startCommand": "hc attach taaaaaaaaaaaa", "gen": 0, "hcAddress": "taaaaaaaaaaaa", "hcName": "maaaaaaaa"});
+        "startCommand": "hc attach taaaaaaaaaaaa", "attachProgram": core.binary().display().to_string(), "gen": 0,
+        "hcAddress": "taaaaaaaaaaaa", "hcName": "maaaaaaaa"});
     assert_eq!(read_json(&f.join("view.json")).unwrap().unwrap(), want);
     let m = crate::agents::lock_key("member", &c, ID);
     let held = w
@@ -214,8 +215,13 @@ fn a_reattached_lifecycle_member_lists_its_new_pane() {
     w.panes(&[]);
     w.launches_hold();
     w.fakes.mux_rule("@mux-agents-placement", 0, "tab", "");
+    // views-6f v6f call 13: the pane runs the hc program the view records, as the multiplexer renders it.
+    let attach = format!(
+        "\"{}\" attach taaaaaaaaaaaa",
+        w.fakes.hc_install("hc").display()
+    );
     w.fakes
-        .mux_rule("new-window", 0, "%19|@8|hc attach taaaaaaaaaaaa\n", "");
+        .mux_rule("new-window", 0, &format!("%19|@8|{attach}\n"), "");
     w.fakes.mux_rule("#{window_active}", 0, "%19|1|1|1\n", "");
     cf::online(&w);
     let core = hc::connect(&w.ctx).unwrap();
@@ -229,7 +235,7 @@ fn a_reattached_lifecycle_member_lists_its_new_pane() {
         window: "@8".into(),
         pid: "4000".into(),
         dead: false,
-        command: "hc attach taaaaaaaaaaaa".into(),
+        command: attach,
         tag: ID.into(),
         name: "worker".into(),
     };

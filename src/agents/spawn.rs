@@ -3887,7 +3887,8 @@ pub fn launch_hc_locked(
                 (Ok(()), Some(v)) => {
                     // Ambiguity 15, V1: the descriptor names its generation and terminal.
                     let fields = json!({"serverKey": caller.server_key, "session": caller.session,
-                        "pane": v.pane, "window": v.window, "startCommand": v.command, "gen": n,
+                        "pane": v.pane, "window": v.window, "startCommand": v.command,
+                        "attachProgram": core.binary().display().to_string(), "gen": n,
                         "hcAddress": record["hcAddress"], "hcName": record["hcName"]});
                     if let Err(e) = super::team_state::view(ctx, &scope, &id, &fields) {
                         let _ = super::attachment::clean(ctx, &v);

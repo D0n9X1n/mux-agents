@@ -826,7 +826,11 @@ fn capture_identity(
         if let Some(s) = standing {
             super::tree::authority(ctx, caller, s, &id.id, "read")?;
         }
-        let Some(pane) = id.view(&record, &registry::rows(ctx, caller)?) else {
+        let Some(pane) = id.view(
+            &record,
+            &registry::rows(ctx, caller)?,
+            &super::core_identity::Key::of(caller),
+        ) else {
             return refuse(
                 2,
                 "target",

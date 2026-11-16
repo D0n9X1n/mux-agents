@@ -50,6 +50,8 @@ pub mod tree;
 pub mod up;
 pub mod view;
 #[cfg(test)]
+mod view_bind_tests;
+#[cfg(test)]
 mod view_hc_tests;
 
 /// Main's read: commit.json there and not aborted (#97).

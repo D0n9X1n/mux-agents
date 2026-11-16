@@ -286,6 +286,14 @@ impl Tx<'_> {
 /// The presentation fields view.json carries (views-6f V1).
 pub const VIEW_FIELDS: [&str; 3] = ["pane", "window", "startCommand"];
 
+/// views-6f ambiguity 2, v6f call 13: view.json's presentation key and recorded attach program, carried on the
+/// presented record under names record.json never uses (record.json's own `session` is the team's).
+pub const VIEW_KEY: [(&str, &str); 3] = [
+    ("serverKey", "viewServerKey"),
+    ("session", "viewSession"),
+    ("attachProgram", "viewAttachProgram"),
+];
+
 /// S4: the member lock, then `view_held`; replaces the view, never another field. A view names its generation (V1,
 /// ambiguity 7).
 pub fn view(ctx: &Ctx, scope: &Scope, id: &str, v: &Value) -> Res<()> {
@@ -359,6 +367,9 @@ pub fn presented(g: &super::gens::Gen, s: &super::gens::Status) -> Res<Value> {
         for k in VIEW_FIELDS {
             r.remove(k);
         }
+        for (_, k) in VIEW_KEY {
+            r.remove(k);
+        }
     }
     if s.subject.is_none() {
         return Ok(record);
@@ -370,6 +381,11 @@ pub fn presented(g: &super::gens::Gen, s: &super::gens::Status) -> Res<Value> {
         for k in VIEW_FIELDS {
             if let Some(x) = v.get(k) {
                 record[k] = x.clone();
+            }
+        }
+        for (from, to) in VIEW_KEY {
+            if let Some(x) = v.get(from) {
+                record[to] = x.clone();
             }
         }
     }

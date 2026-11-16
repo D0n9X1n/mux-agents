@@ -322,7 +322,11 @@ fn focus_identity(
 ) -> Res<Option<Focused>> {
     lock(ctx, &lock_key("member", caller, &id.id), || {
         let record = super::member_target::current(ctx, caller, id)?;
-        let pane = id.view(&record, &registry::rows(ctx, caller)?);
+        let pane = id.view(
+            &record,
+            &registry::rows(ctx, caller)?,
+            &super::core_identity::Key::of(caller),
+        );
         if expected.is_some_and(|e| pane.as_ref().is_none_or(|p| p.pane != e)) {
             return refuse(
                 2,
@@ -371,6 +375,7 @@ fn restore_view(
         let descriptor = json!({
             "serverKey": caller.server_key, "session": caller.session,
             "pane": v.pane, "window": v.window, "startCommand": v.command,
+            "attachProgram": core.binary().display().to_string(),
             "gen": n, "hcAddress": id.address, "hcName": id.hc_name,
         });
         // S4, W1: focus_identity holds the member lock (not reentrant); the writer checks the subject generation.

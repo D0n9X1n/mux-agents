@@ -145,11 +145,17 @@ fn hc_launch_transaction() {
         assert_eq!(r["generation"], "0");
         assert_eq!(r["launcherArgv"], json!(argv));
         assert!(super::super::core_identity::Identity::read(&r, id, &team).is_some());
+        // views-6f ambiguity 2: the presented record also carries view.json's key and program (VIEW_KEY).
+        let mut presented = r.clone();
+        let view = read_json(&folder.join("view.json")).unwrap().unwrap();
+        for (from, to) in super::super::team_state::VIEW_KEY {
+            presented[to] = view[from].clone();
+        }
         assert_eq!(
             super::super::membership::locals(&w.ctx, &caller).unwrap()[0]
                 .stored
                 .record,
-            r
+            presented
         );
         assert_eq!(
             read_json(&gens::path(&folder, 0, "spec")).unwrap().unwrap()["generation"],
