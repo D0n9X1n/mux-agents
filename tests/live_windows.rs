@@ -2234,6 +2234,8 @@ fn a_cascade_stop_ends_b_before_a_and_a_second_stop_finishes() {
             &a.iter().map(String::as_str).collect::<Vec<_>>(),
         );
         assert_eq!(r["ok"], true, "{name}: {r}");
+        // o2 call 35 (integration): ready before any stop ends it, so it ends an ordinary member.
+        wait_ready(live, &s(&r["id"]));
         s(&r["id"])
     };
     let left = |live: &Live, id: &str| {

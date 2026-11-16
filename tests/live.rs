@@ -5849,6 +5849,8 @@ hc {}:
         let spawn = |live: &mut Live, by: &str, name: &str| {
             let (code, r) = live.spawn_by(by, name);
             assert_eq!(code, 0, "{mux:?} {name}: {r}");
+            // o2 call 35 (integration): ready before any stop ends it, so it ends an ordinary member.
+            live.ready(&r);
             s(&r["id"]).to_string()
         };
         // 1. The leader stops a1 by name, inside the tree: b1, then a1; every notice; no journal left.
