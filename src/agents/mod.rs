@@ -12,6 +12,7 @@ pub mod ancestry;
 pub mod attachment;
 pub mod board;
 pub mod budget;
+pub mod cascade;
 pub mod copilot;
 pub mod core_facts;
 #[cfg(test)]
