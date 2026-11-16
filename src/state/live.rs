@@ -59,6 +59,13 @@ pub fn report(
             "a negative start names no registry entry",
         ));
     }
+    // r2b call 29: where starts are boot-relative, an entry is written only with the boot it belongs to; an unreadable
+    // boot refuses before anything is written, so an existing entry keeps its boot.
+    let boot = match ctx.os.boot() {
+        crate::proc::Boot::Unreadable => return Err(evidence::unreadable()),
+        crate::proc::Boot::Id(id) => Some(id),
+        crate::proc::Boot::Absolute => None,
+    };
     let file = path(ctx, kind, pid, start);
     #[cfg(test)]
     hooks::fire_before_report_lock();
@@ -77,8 +84,8 @@ pub fn report(
         let mut entry = json!({"kind": crate::agents::spawn::client_name(kind), "pid": pid, "start": start,
             "sessionId": session, "seq": seq, "source": source, "at": at});
         // r2b call 27: where starts are boot-relative, the boot they belong to.
-        if let crate::proc::Boot::Id(boot) = ctx.os.boot() {
-            entry["boot"] = boot.into();
+        if let Some(boot) = &boot {
+            entry["boot"] = boot.clone().into();
         }
         crate::state::fs::write_json_durable(&file, &entry)?;
         Ok(seq)
@@ -120,26 +127,45 @@ pub fn alive(ctx: &Ctx, pid: u32, start: i64) -> Alive {
     }
 }
 
-/// The entry of a client process that may be live (Live or Unknown); a dead one is ignored and never read. r2b call
-/// 27: an entry recorded in another boot (its `boot` differs from this boot's id) is dead too: `Ok(None)`.
+/// The entry of a client process that may be live (Live or Unknown); a dead one is ignored and never read. Where
+/// starts are boot-relative (r2b calls 27, 29): an entry recorded in a known other boot is dead too (`Ok(None)`); an
+/// entry without `boot`, or a current boot that cannot be read, is uncertain and refuses `evidence` (`Err`), never a
+/// usable entry.
 pub fn entry(ctx: &Ctx, kind: Client, pid: u32, start: i64) -> Res<Option<Value>> {
     if !live_dir(ctx)? || alive(ctx, pid, start) == Alive::Dead {
         return Ok(None);
     }
-    let found = evidence::read(&path(ctx, kind, pid, start)).known()?;
-    Ok(found.filter(|v| !another_boot(ctx, v)))
+    let Some(found) = evidence::read(&path(ctx, kind, pid, start)).known()? else {
+        return Ok(None);
+    };
+    match boot_match(ctx, &found) {
+        BootMatch::This => Ok(Some(found)),
+        BootMatch::Another => Ok(None),
+        BootMatch::Uncertain => Err(evidence::unreadable()),
+    }
 }
 
-/// r2b call 27: whether `entry` was recorded in another boot. Only a boot-relative OS (`Boot::Id`) can tell: an entry
-/// without `boot`, an Unreadable boot, or absolute starts (macOS, Windows) decide nothing (the entry is kept).
-fn another_boot(ctx: &Ctx, entry: &Value) -> bool {
-    let crate::proc::Boot::Id(now) = ctx.os.boot() else {
-        return false;
-    };
-    entry
-        .get("boot")
-        .and_then(Value::as_str)
-        .is_some_and(|b| b != now)
+/// What an entry's recorded `boot` says against this boot (r2b calls 27, 29).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BootMatch {
+    /// Recorded in this boot, or starts are absolute (macOS, Windows), where a (pid, start) never repeats.
+    This,
+    /// Recorded in a known other boot: dead.
+    Another,
+    /// The current boot cannot be read, or the entry names no boot: decides nothing.
+    Uncertain,
+}
+
+fn boot_match(ctx: &Ctx, entry: &Value) -> BootMatch {
+    match ctx.os.boot() {
+        crate::proc::Boot::Absolute => BootMatch::This,
+        crate::proc::Boot::Unreadable => BootMatch::Uncertain,
+        crate::proc::Boot::Id(now) => match entry.get("boot").and_then(Value::as_str) {
+            Some(b) if b == now => BootMatch::This,
+            Some(_) => BootMatch::Another,
+            None => BootMatch::Uncertain,
+        },
+    }
 }
 
 /// K2: removes each regular entry whose process is Dead, rechecked under that entry's own lock. Other names, folders,
@@ -160,9 +186,11 @@ pub fn sweep(ctx: &Ctx) -> Res<usize> {
             if !regular {
                 return Ok(0);
             }
-            // Dead in the table, or recorded in another boot (r2b call 27); a torn entry decides nothing.
+            // Dead in the table, or recorded in a known other boot (r2b calls 27, 29); a torn entry, an entry without a
+            // boot, or an unreadable current boot decides nothing (kept).
             let dead = alive(ctx, pid, start) == Alive::Dead
-                || matches!(evidence::read(&file), evidence::Evidence::Present(v) if another_boot(ctx, &v));
+                || matches!(evidence::read(&file),
+                    evidence::Evidence::Present(v) if boot_match(ctx, &v) == BootMatch::Another);
             if !dead {
                 return Ok(0);
             }
@@ -543,11 +571,11 @@ mod tests {
         );
         assert_eq!(checked(sweep(&ctx)), Ok(0), "same boot: kept");
         f.set_boot(Boot::Unreadable);
-        assert!(
-            checked(entry(&ctx, Client::Claude, 150, 1500))
-                .unwrap()
-                .is_some(),
-            "unreadable boot: kept"
+        // r2b call 29: an unreadable current boot is uncertain, never usable evidence.
+        assert_eq!(
+            checked(entry(&ctx, Client::Claude, 150, 1500)),
+            Err("evidence"),
+            "unreadable boot: uncertain"
         );
         assert_eq!(
             checked(sweep(&ctx)),
@@ -575,6 +603,57 @@ mod tests {
             v.get("boot").is_none(),
             "absolute starts record no boot: {v}"
         );
+    }
+
+    // r2b call 29 (QA #143 re-review): where starts are boot-relative, a report under an unreadable boot refuses and
+    // writes nothing, so the entry keeps its boot; an entry is usable only when its boot is known to be this boot.
+    #[test]
+    fn an_unreadable_boot_or_an_entry_without_one_is_never_usable() {
+        use crate::proc::Boot;
+        // QA repro: boot-a, then a report under an unreadable boot, then boot-b with the same pid and start.
+        let (f, ctx, _d) = world();
+        f.set_boot(Boot::Id("boot-a".into()));
+        assert_eq!(put(&ctx, 150, 1500, "startup"), Ok(1), "seed");
+        let before = std::fs::read(file(&ctx)).unwrap();
+        f.set_boot(Boot::Unreadable);
+        assert_eq!(
+            put(&ctx, 150, 1500, "resume"),
+            Err("evidence"),
+            "unreadable boot: report refuses"
+        );
+        assert_eq!(
+            std::fs::read(file(&ctx)).unwrap(),
+            before,
+            "the entry keeps its boot"
+        );
+        assert_eq!(
+            checked(sweep(&ctx)),
+            Ok(0),
+            "unreadable boot: kept by sweep"
+        );
+        f.set_boot(Boot::Id("boot-b".into()));
+        assert_eq!(
+            checked(entry(&ctx, Client::Claude, 150, 1500)),
+            Ok(None),
+            "boot-a read in boot-b"
+        );
+        assert_eq!(checked(sweep(&ctx)), Ok(1), "boot-a swept in boot-b");
+        // An entry that names no boot, read where starts are boot-relative: uncertain, kept.
+        let (f, ctx, _d) = world();
+        f.set_boot(Boot::Absolute);
+        assert_eq!(
+            put(&ctx, 150, 1500, "startup"),
+            Ok(1),
+            "seed without a boot"
+        );
+        f.set_boot(Boot::Id("boot-a".into()));
+        assert_eq!(
+            checked(entry(&ctx, Client::Claude, 150, 1500)),
+            Err("evidence"),
+            "an entry without a boot: uncertain"
+        );
+        assert_eq!(checked(sweep(&ctx)), Ok(0), "an entry without a boot: kept");
+        assert!(file(&ctx).exists());
     }
 
     // (fix 2, re-audit #2) Contention proved from inside `report`: `hooks::before_report_lock` (`-8.md` Step 3) marks
