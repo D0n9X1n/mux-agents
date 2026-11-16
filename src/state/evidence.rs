@@ -94,6 +94,9 @@ pub fn publish(path: &Path, value: &Value) -> Res<Published> {
     })
 }
 
+/// A crash test kills the process right after `step` (launch-1 crash guarantee). Outside the crash tests: nothing.
+pub fn crash_point(_step: &str) {}
+
 #[cfg(test)]
 mod tests {
     use super::*;

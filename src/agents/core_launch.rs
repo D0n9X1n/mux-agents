@@ -1,9 +1,13 @@
+use super::gens;
 use super::spawn::Created;
+use super::team_state::{Guard, Tx};
 use crate::{
     ctx::Ctx,
     error::{Refusal, Res},
     hc::{self, Core, Run},
+    state::evidence::{self, Published},
     state::fs::write_json,
+    util::utc_o,
 };
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
@@ -132,6 +136,254 @@ pub fn execute_connected(
         }
     }
 }
+/// One launch of a member, built by an adapter (A3b-2). `forward` owns every file it makes.
+pub struct Launch {
+    pub id: String,
+    /// `spawn`, `resume`, `leader` (this slice); `fresh`, `restore`, `retry` come with their specs.
+    pub kind: &'static str,
+    /// G1.1: a new uuid for spawn and a new leader; the ended record session for resume.
+    pub session_id: String,
+    /// A new member record, without `generation`, `hcAddress`, `hcName`, `launcherArgv`, `team`, `sessionId`
+    /// (F4 sets them together). None: a new generation of the existing record.
+    pub create: Option<Value>,
+    /// The spec body; G1.2 adds `id`, `generation`, `kind`, `sessionId`, `deadline`.
+    pub spec: Value,
+    pub team: String,
+    pub name: String,
+    pub up_team: Option<String>,
+    pub directory: String,
+}
+
+/// outcome-2: the launch deadline of a generation.
+const DEADLINE_SECS: u64 = 150;
+
+/// Test hook (F3): a callback after every forward step. `Reset` also clears every fs fault a test may arm.
+#[cfg(test)]
+pub(crate) mod hooks {
+    use std::cell::RefCell;
+    pub(crate) type After = Box<dyn Fn(&str)>;
+    thread_local! {
+        static AFTER: RefCell<Option<After>> = const { RefCell::new(None) };
+    }
+    /// Runs `f` with the step name after every forward step.
+    pub(crate) fn after(f: Option<After>) {
+        AFTER.with(|a| *a.borrow_mut() = f);
+    }
+    pub(super) fn fire(step: &str) {
+        AFTER.with(|a| {
+            if let Some(f) = a.borrow().as_ref() {
+                f(step);
+            }
+        });
+    }
+    /// Clears the hook and every fault when the test ends.
+    pub(crate) struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            after(None);
+            crate::state::fs::fail_durable_flush(None);
+            crate::state::fs::fail_sync_dir(None);
+            crate::state::fs::fail_sync_file(None);
+        }
+    }
+}
+
+/// F3: after each durable forward step, the test hook, then the crash point.
+fn step(name: &str) {
+    #[cfg(test)]
+    hooks::fire(name);
+    evidence::crash_point(name);
+}
+
+/// A file this call must be the first to make; an earlier one is not this launch's.
+fn made(p: Res<Published>) -> Res<()> {
+    match p? {
+        Published::Published => Ok(()),
+        Published::Exists => Err(Refusal::internal("generation evidence already exists")),
+    }
+}
+
+/// Refusal 1 `launch`.
+fn refused(message: &str) -> Refusal {
+    Refusal {
+        code: 1,
+        check: "launch",
+        message: message.into(),
+        reason: None,
+        leftover: None,
+        details: Default::default(),
+    }
+}
+
+/// launch-1 G1 under the team lock `tx` holds: pending, spec, launch.json, hc run, the address, the commit claim,
+/// one promotion, the view. `debit` is the last step before hc run. `attach` opens the view after the promotion and
+/// answers its fields; they go to the reply (the adapter writes view.json), never to record.json.
+pub fn forward(
+    tx: &Tx<'_>,
+    core: &Core<'_>,
+    l: Launch,
+    debit: impl FnOnce() -> Res<()>,
+    attach: impl FnOnce(&Core<'_>, &Value) -> Res<Value>,
+) -> Res<Value> {
+    if l.directory.is_empty() {
+        return Err(Refusal::internal("the launch has no directory")); // ambiguity 10
+    }
+    let folder = tx.folder(&l.id);
+    // R5: one walk read before any write. F2: the first pending write is guarded by what it saw.
+    let (first, current) = match (gens::member_of(&folder), &l.create) {
+        (gens::Member::Unreadable(e), _) => return Err(e),
+        (gens::Member::Absent, Some(_)) => (Guard::Create, None),
+        (gens::Member::Life(g), None) => {
+            if g.status()?.pending_done == Some(false) {
+                return Err(refused("an earlier launch of this member is undecided")); // ambiguity 1
+            }
+            (
+                Guard::PendingGen { n: g.pending() },
+                Some(g.record().clone()),
+            )
+        }
+        (_, Some(_)) => return Err(Refusal::internal("the member already has a record")),
+        (_, None) => return Err(Refusal::internal("the member has no lifecycle record")),
+    };
+    let n = gens::next(&folder, current.as_ref())?;
+    let hc_name = format!("m{}", &crate::util::hex_id()?[..8]);
+    let spec_path = gens::path(&folder, n, "spec");
+    let argv = crate::launcher_scope::argv(tx.ctx, &spec_path)?;
+    step("allocated");
+    // G1.1: pending first, durably. A new member's record is the adapter body plus pending (`record_write` adds
+    // `lifecycle` and `id`); an existing record gets only the new pending.
+    let pending = json!({"gen": n, "kind": l.kind, "hcName": hc_name, "sessionId": l.session_id,
+        "launcherArgv": argv});
+    let base = l
+        .create
+        .as_ref()
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    let wrote = tx.record_write(&l.id, first, |r| {
+        r.extend(base);
+        r.insert("pending".into(), pending.clone());
+        Ok(())
+    });
+    match wrote {
+        Ok(Some(_)) => {}
+        Ok(None) => {
+            let mut e = refused("the member record changed before this launch was recorded");
+            e.message.push_str("; nothing was fenced");
+            return Err(e);
+        }
+        // F2: a failed flush after the rename may have landed; `abort` fences only what this call owns.
+        Err(e) => return Err(abort(tx, &l.id, n, &hc_name, e)),
+    }
+    step("pending");
+    // Every failure from here to the claim goes to `abort` (F1).
+    let fence = |e: Refusal| abort(tx, &l.id, n, &hc_name, e);
+    // G1.2: the spec, then launch.json, both create-once through the one publisher (R-W1).
+    let mut spec = l.spec.clone();
+    spec["id"] = json!(l.id);
+    spec["generation"] = json!(n.to_string());
+    spec["kind"] = json!(l.kind);
+    spec["sessionId"] = json!(l.session_id);
+    let deadline = tx.ctx.clock.now() + std::time::Duration::from_secs(DEADLINE_SECS);
+    spec["deadline"] = json!(utc_o(deadline));
+    made(gens::publish_once(&folder, n, "spec", &spec)).map_err(&fence)?;
+    step("spec");
+    let identity = json!({"hcName": hc_name, "launcherArgv": argv, "sessionId": l.session_id});
+    made(gens::publish_once(&folder, n, "launch", &identity)).map_err(&fence)?;
+    step("launch");
+    // G1.3: hc run starts the launcher under the new name and the generation label (G2).
+    let gen_label = n.to_string();
+    let mut labels = vec![
+        ("mux.managed", "1"),
+        ("mux.team", l.team.as_str()),
+        ("mux.id", l.id.as_str()),
+        ("mux.gen", gen_label.as_str()),
+        ("mux.name", l.name.as_str()),
+    ];
+    if let Some(up) = l.up_team.as_deref() {
+        labels.push(("mux.up", up));
+    }
+    let args: Vec<&str> = argv.iter().map(String::as_str).collect();
+    let input = Run {
+        bg: true,
+        keep: true,
+        outlive_parent: true,
+        no_notify: true,
+        name: Some(&hc_name),
+        labels: &labels,
+        cwd: Some(&l.directory),
+        argv: &args,
+    };
+    debit().map_err(&fence)?;
+    let address = attempt(|| core.run(&input)).map_err(&fence)?;
+    step("run");
+    // G1.4: the address, written only while the record still names (n, hcName) (F1, call 15).
+    let mut with_address = pending;
+    with_address["hcAddress"] = json!(address);
+    let own = Guard::Pending {
+        n,
+        hc_name: &hc_name,
+    };
+    let set_address = |r: &mut serde_json::Map<String, Value>| {
+        r.insert("pending".into(), with_address);
+        Ok(())
+    };
+    if tx
+        .record_write(&l.id, own, set_address)
+        .map_err(&fence)?
+        .is_none()
+    {
+        return Err(fence(refused("the launch no longer owns the record")));
+    }
+    step("address");
+    // The commit claim. A failed publication keeps pending and its address for settle-1b (ambiguity 6).
+    let commit = json!({"committed": true, "at": utc_o(tx.ctx.clock.now())});
+    match gens::publish_once(&folder, n, "commit", &commit)? {
+        Published::Published => {}
+        Published::Exists => return Err(lost(tx, &l.id, n, &hc_name)),
+    }
+    step("commit");
+    // G1.5, F4: one write; session id and terminal identity change together, pending gone in the same write.
+    // F1: only while `pending.gen` is still n. A failure is returned; nothing is rolled back (ambiguity 5).
+    let promote = |r: &mut serde_json::Map<String, Value>| {
+        r.insert("generation".into(), json!(n.to_string()));
+        r.insert("hcAddress".into(), json!(address));
+        r.insert("hcName".into(), json!(hc_name));
+        r.insert("launcherArgv".into(), json!(argv));
+        r.insert("sessionId".into(), json!(l.session_id));
+        r.insert("team".into(), json!(l.team));
+        r.remove("pending");
+        Ok(())
+    };
+    let record = tx
+        .record_write(&l.id, Guard::PendingGen { n: Some(n) }, promote)?
+        .ok_or_else(|| refused("the launch no longer owns the record"))?;
+    step("promote");
+    // G1.6, F4: the view, optional; nothing is rolled back. Only the view fields reach the reply.
+    let mut reply = record.clone();
+    match attempt(|| attach(core, &record)) {
+        Ok(view) => {
+            for k in super::team_state::VIEW_FIELDS {
+                if let Some(v) = view.get(k) {
+                    reply[k] = v.clone();
+                }
+            }
+        }
+        Err(e) => reply["viewError"] = json!(e.message),
+    }
+    Ok(reply)
+}
+
+/// G1 before the claim (Task 4).
+fn abort(_: &Tx<'_>, _: &str, _: u64, _: &str, e: Refusal) -> Refusal {
+    e
+}
+
+/// G1.4, the claim lost (Task 5).
+fn lost(_: &Tx<'_>, _: &str, _: u64, _: &str) -> Refusal {
+    Refusal::internal("lost claim")
+}
+
 fn attempt<T>(f: impl FnOnce() -> Res<T>) -> Res<T> {
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(f))
         .unwrap_or_else(|_| Err(Refusal::internal("launch boundary panicked")))
@@ -782,5 +1034,768 @@ mod tests {
         .unwrap();
         assert_eq!(v["kill"]["uncertain"], true);
         assert_eq!(v["viewCleanup"]["gone"], true);
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod forward_tests {
+    use super::*;
+    use crate::agents::fixture::{ID, SESSION_ID, World};
+    use crate::agents::{gens, team_state};
+    use crate::spawn::Out;
+    use std::{cell::RefCell, rc::Rc};
+
+    pub(crate) const NEW: &str = "1f11fc2f-2032-48ef-a920-4af2a8e5af51";
+
+    pub(crate) fn world() -> World {
+        let w = World::human("");
+        w.state();
+        w.fakes.hc_install("hc");
+        w
+    }
+    /// The version `hc::connect` asks.
+    pub(crate) fn version(w: &World) {
+        w.fakes.hc_answer(Ok(Out {
+            stdout: "hc 0.1.21".into(),
+            ..Out::default()
+        }));
+    }
+    /// One launch: the version, then the answer of `hc run`. An unqueued `hc run` answers
+    /// `internal`, "unexpected error (unconfigured hc fake)".
+    pub(crate) fn replies(w: &World, run: Res<Out>) {
+        version(w);
+        w.fakes.hc_answer(run);
+    }
+    pub(crate) fn address(a: &str) -> Res<Out> {
+        Ok(Out {
+            stdout: json!({"address": a}).to_string(),
+            ..Out::default()
+        })
+    }
+    pub(crate) fn launch_of(w: &World, create: bool, session: &str) -> Launch {
+        let caller = w.caller();
+        let dir = w.ctx.cwd.to_str().unwrap().to_string();
+        let state = w.state().to_str().unwrap().to_string();
+        Launch {
+            id: ID.into(),
+            kind: if create { "spawn" } else { "retry" },
+            session_id: session.into(),
+            create: create.then(|| {
+                json!({"schema": 1, "name": "worker", "client": "claude", "session": caller.session,
+                    "directory": dir, "options": ["--effort", "high"], "prompt": ["fix"]})
+            }),
+            spec: json!({"schema": 1, "stateDirectory": state, "client": "claude",
+                "flags": ["--effort", "high"], "args": ["--session-id", session], "parentPane": null,
+                "prompt": "fix"}),
+            team: crate::agents::membership::team(&caller),
+            name: "worker".into(),
+            up_team: None,
+            directory: dir,
+        }
+    }
+    pub(crate) fn go(
+        w: &World,
+        l: Launch,
+        debit: impl FnOnce() -> Res<()>,
+        attach: impl FnOnce(&Core<'_>, &Value) -> Res<Value>,
+    ) -> Res<Value> {
+        let s = team_state::Scope::of(&w.caller());
+        team_state::open(&w.ctx, &s, |tx| {
+            let core = hc::connect(tx.ctx)?;
+            forward(tx, &core, l, debit, attach)
+        })
+    }
+    pub(crate) fn free() -> Res<()> {
+        Ok(())
+    }
+    pub(crate) fn no_view(_: &Core<'_>, _: &Value) -> Res<Value> {
+        Ok(json!({}))
+    }
+    pub(crate) fn never(_: &Core<'_>, _: &Value) -> Res<Value> {
+        panic!("attach after a failed launch")
+    }
+    pub(crate) fn record(w: &World) -> Value {
+        crate::state::fs::read_json(&w.folder(ID).join("record.json"))
+            .unwrap()
+            .unwrap()
+    }
+    /// Rewrites `<member>/record.json` as another writer would: no lock, no walk.
+    pub(crate) fn edit(f: &Path, change: impl FnOnce(&mut Value)) {
+        let path = f.join("record.json");
+        let mut r = crate::state::fs::read_json(&path).unwrap().unwrap();
+        change(&mut r);
+        crate::state::fs::write_json(&path, &r).unwrap();
+    }
+    pub(crate) fn runs(w: &World) -> Vec<Vec<String>> {
+        let calls = w.fakes.hc_calls().into_iter();
+        calls
+            .filter(|(_, a, _)| a[0] == "run")
+            .map(|(_, a, _)| a)
+            .collect()
+    }
+    pub(crate) fn kills(w: &World) -> usize {
+        w.fakes
+            .hc_calls()
+            .iter()
+            .filter(|(_, a, _)| a[0] == "kill")
+            .count()
+    }
+    pub(crate) fn name_of(run: &[String]) -> String {
+        run[run.iter().position(|a| a == "--name").unwrap() + 1].clone()
+    }
+    pub(crate) fn decided(w: &World, n: u64) -> Option<gens::Decision> {
+        gens::read(&w.folder(ID), n, "commit")
+            .known()
+            .unwrap()
+            .map(|c| gens::decide(&c))
+    }
+    /// Generation 0 launched and promoted, for the tests of generation 1.
+    pub(crate) fn promoted(w: &World) {
+        replies(w, address("t1"));
+        go(w, launch_of(w, true, SESSION_ID), free, no_view).unwrap();
+    }
+    /// What the files say now (F3).
+    fn seen(f: &Path, fakes: &crate::testing::Fakes, n: u64) -> Value {
+        let r = crate::state::fs::read_json(&f.join("record.json"))
+            .ok()
+            .flatten()
+            .unwrap_or(Value::Null);
+        let file = |k: &str| gens::path(f, n, k).is_file();
+        let commit = gens::read(f, n, "commit").known().ok().flatten();
+        let runs = fakes
+            .hc_calls()
+            .iter()
+            .filter(|(_, a, _)| a[0] == "run")
+            .count();
+        json!({"pending": r["pending"]["gen"], "address": r["pending"]["hcAddress"], "session": r["sessionId"],
+            "generation": r["generation"], "spec": file("spec"), "launch": file("launch"),
+            "commit": commit.map(|c| format!("{:?}", gens::decide(&c))), "runs": runs})
+    }
+    /// Records `seen` after every forward step.
+    fn watch(w: &World, n: u64) -> Rc<RefCell<Vec<(String, Value)>>> {
+        let log = Rc::new(RefCell::new(Vec::new()));
+        let (l2, f, fakes) = (log.clone(), w.folder(ID), w.fakes.clone());
+        hooks::after(Some(Box::new(move |s: &str| {
+            l2.borrow_mut().push((s.to_string(), seen(&f, &fakes, n)))
+        })));
+        log
+    }
+    /// One expected `seen` value (call 17: a struct, not eight arguments).
+    #[derive(Clone)]
+    struct Row {
+        pending: Value,
+        address: Value,
+        session: Value,
+        generation: Value,
+        spec: bool,
+        launch: bool,
+        commit: Value,
+        runs: usize,
+    }
+    fn row(r: Row) -> Value {
+        json!({"pending": r.pending, "address": r.address, "session": r.session, "generation": r.generation,
+            "spec": r.spec, "launch": r.launch, "commit": r.commit, "runs": r.runs})
+    }
+
+    // G1, F3, F4: each step leaves exactly its files; the view sees the commit and the promotion.
+    #[test]
+    fn each_forward_step_leaves_exactly_its_files() {
+        let w = world();
+        let _reset = hooks::Reset;
+        let log = watch(&w, 0);
+        replies(&w, address("t1"));
+        let f = w.folder(ID);
+        // The view records what it saw; asserting inside it would be caught by `attempt` as a viewError.
+        let at_view = Rc::new(RefCell::new(None));
+        let v2 = at_view.clone();
+        let view = move |_: &Core<'_>, r: &Value| {
+            *v2.borrow_mut() = Some((
+                r["generation"].clone(),
+                r.get("pending").is_none(),
+                gens::committed(&f, 0).ok(),
+            ));
+            Ok(json!({"pane": "%9", "window": "@5", "startCommand": "hc attach t1", "x": 1}))
+        };
+        let r = go(&w, launch_of(&w, true, SESSION_ID), free, view).unwrap();
+        let z = Value::Null;
+        let base = Row {
+            pending: json!(0),
+            address: z.clone(),
+            session: z.clone(),
+            generation: z.clone(),
+            spec: false,
+            launch: false,
+            commit: z.clone(),
+            runs: 0,
+        };
+        let spec = Row {
+            spec: true,
+            ..base.clone()
+        };
+        let launch = Row {
+            launch: true,
+            ..spec.clone()
+        };
+        let run = Row {
+            runs: 1,
+            ..launch.clone()
+        };
+        let address = Row {
+            address: json!("t1"),
+            ..run.clone()
+        };
+        let commit = Row {
+            commit: json!("Run"),
+            ..address.clone()
+        };
+        let promote = Row {
+            pending: z.clone(),
+            address: z.clone(),
+            session: json!(SESSION_ID),
+            generation: json!("0"),
+            ..commit.clone()
+        };
+        let want = [
+            (
+                "allocated",
+                row(Row {
+                    pending: z.clone(),
+                    ..base.clone()
+                }),
+            ),
+            ("pending", row(base)),
+            ("spec", row(spec)),
+            ("launch", row(launch)),
+            ("run", row(run)),
+            ("address", row(address)),
+            ("commit", row(commit)),
+            ("promote", row(promote)),
+        ];
+        let got = log.borrow().clone();
+        assert_eq!(got.len(), want.len(), "{got:?}");
+        for ((step, seen), (name, row)) in got.iter().zip(want.iter()) {
+            assert_eq!((step.as_str(), seen), (*name, row), "after {name}");
+        }
+        let by_view = at_view.borrow().clone();
+        assert_eq!(
+            by_view,
+            Some((json!("0"), true, Some(true))),
+            "the view follows the commit and the promotion"
+        );
+        let got = (
+            &r["generation"],
+            &r["hcAddress"],
+            &r["sessionId"],
+            &r["lifecycle"],
+        );
+        assert_eq!(
+            got,
+            (&json!("0"), &json!("t1"), &json!(SESSION_ID), &json!(1))
+        );
+        assert_eq!(
+            r["team"],
+            json!(crate::agents::membership::team(&w.caller()))
+        );
+        assert_eq!(
+            (&r["pane"], r.get("x")),
+            (&json!("%9"), None),
+            "only the view fields reach the reply"
+        );
+        assert!(
+            record(&w).get("pane").is_none(),
+            "a view never reaches record.json"
+        );
+        let verbs: Vec<String> = w
+            .fakes
+            .hc_calls()
+            .into_iter()
+            .map(|(_, a, _)| a[0].clone())
+            .collect();
+        assert_eq!(verbs, ["--version", "run"], "one connection, one run");
+        assert!(runs(&w)[0].contains(&"mux.gen=0".to_string()));
+    }
+
+    // G12: the launcher accepts what forward wrote, pending and promoted; launch.json is what hc ran.
+    #[test]
+    fn the_launcher_accepts_what_forward_wrote() {
+        let w = world();
+        let _reset = hooks::Reset;
+        let f = w.folder(ID);
+        let pending = Rc::new(RefCell::new(false));
+        let (p2, f2) = (pending.clone(), f.clone());
+        hooks::after(Some(Box::new(move |s: &str| {
+            if s == "address" {
+                *p2.borrow_mut() = crate::launcher::own_spec(&f2, 0).is_some();
+            }
+        })));
+        replies(&w, address("t1"));
+        let r = go(&w, launch_of(&w, true, SESSION_ID), free, no_view).unwrap();
+        assert!(
+            *pending.borrow(),
+            "the launcher accepts the pending generation it is started for"
+        );
+        assert!(
+            crate::launcher::own_spec(&f, 0).is_some(),
+            "and the promoted one"
+        );
+        let launch = gens::read(&f, 0, "launch").known().unwrap().unwrap();
+        let run = &runs(&w)[0];
+        assert_eq!(launch["hcName"], json!(name_of(run)));
+        assert!(crate::agents::core_identity::is_hc_name(&name_of(run)));
+        assert_ne!(
+            name_of(run),
+            format!("m{}", &ID[..8]),
+            "a new generation never derives its name"
+        );
+        let promoted = (&r["hcName"], &r["launcherArgv"], &r["sessionId"]);
+        assert_eq!(
+            (
+                &launch["hcName"],
+                &launch["launcherArgv"],
+                &launch["sessionId"]
+            ),
+            promoted
+        );
+        let argv: Vec<String> = serde_json::from_value(launch["launcherArgv"].clone()).unwrap();
+        assert!(
+            run.ends_with(&argv),
+            "hc run was given exactly the recorded launcher argv"
+        );
+        let spec = gens::path(&f, 0, "spec");
+        assert!(
+            argv.iter().any(|a| a.as_str() == spec.to_str().unwrap()),
+            "the launcher runs the spec of n"
+        );
+    }
+
+    // G2, G1.5: two generations get two names and labels; the session changes only at promotion.
+    #[test]
+    fn two_generations_get_two_names_labels_and_sessions() {
+        let w = world();
+        let _reset = hooks::Reset;
+        promoted(&w);
+        let log = watch(&w, 1);
+        replies(&w, address("t2"));
+        let r = go(&w, launch_of(&w, false, NEW), free, no_view).unwrap();
+        let all = runs(&w);
+        assert_ne!(name_of(&all[0]), name_of(&all[1]));
+        assert!(all[1].contains(&"mux.gen=1".to_string()));
+        let at_commit = log
+            .borrow()
+            .iter()
+            .find(|(s, _)| s == "commit")
+            .unwrap()
+            .1
+            .clone();
+        assert_eq!(
+            at_commit["session"],
+            json!(SESSION_ID),
+            "the old session until promotion"
+        );
+        let got = (
+            &r["generation"],
+            &r["sessionId"],
+            &r["hcAddress"],
+            &r["hcName"],
+        );
+        assert_eq!(
+            got,
+            (
+                &json!("1"),
+                &json!(NEW),
+                &json!("t2"),
+                &json!(name_of(&all[1]))
+            )
+        );
+        assert_eq!(decided(&w, 1), Some(gens::Decision::Run));
+    }
+
+    // G1.1: n follows the active generation the record names, files or not.
+    #[test]
+    fn a_new_generation_follows_the_active_one() {
+        let w = world();
+        let f = w.folder(ID);
+        crate::agents::spawn::private_folder(&w.ctx, &f).unwrap();
+        let team = crate::agents::membership::team(&w.caller());
+        let r = json!({"lifecycle": 1, "id": ID, "name": "worker", "session": w.caller().session, "team": team,
+            "generation": "3", "hcAddress": "t3", "hcName": "m0123abcd", "launcherArgv": ["x"],
+            "sessionId": SESSION_ID});
+        crate::state::fs::write_json(&f.join("record.json"), &r).unwrap();
+        replies(&w, address("t4"));
+        let got = go(&w, launch_of(&w, false, NEW), free, no_view).unwrap();
+        assert_eq!(got["generation"], json!("4"), "never 0 beside an active 3");
+        assert!(!gens::dir(&f, 0).exists() && runs(&w)[0].contains(&"mux.gen=4".to_string()));
+    }
+
+    // Ambiguity 1: an undecided pending generation is never superseded.
+    #[test]
+    fn an_undecided_pending_generation_is_never_superseded() {
+        let w = world();
+        let f = w.folder(ID);
+        crate::agents::spawn::private_folder(&w.ctx, &f).unwrap();
+        let r = json!({"lifecycle": 1, "id": ID, "name": "worker", "session": w.caller().session,
+            "pending": {"gen": 0, "kind": "spawn", "hcName": "m0123abcd", "sessionId": SESSION_ID}});
+        crate::state::fs::write_json(&f.join("record.json"), &r).unwrap();
+        let before = std::fs::read(f.join("record.json")).unwrap();
+        version(&w);
+        let e = go(&w, launch_of(&w, false, NEW), free, never).unwrap_err();
+        assert_eq!((e.code, e.check), (1, "launch"), "{e:?}");
+        assert!(e.message.contains("undecided"), "{e:?}");
+        assert_eq!(
+            std::fs::read(f.join("record.json")).unwrap(),
+            before,
+            "the record is untouched"
+        );
+        assert!(
+            !f.join("gens").exists() && runs(&w).is_empty(),
+            "nothing made, nothing run"
+        );
+    }
+
+    // Ambiguity 10: kind, session and a deadline 150 s from the clock (the fake clock moves only on a sleep).
+    #[test]
+    fn the_spec_names_its_kind_session_and_150_second_deadline() {
+        let w = world();
+        let at = crate::util::utc_o(w.ctx.clock.now() + std::time::Duration::from_secs(150));
+        replies(&w, address("t1"));
+        go(&w, launch_of(&w, true, SESSION_ID), free, no_view).unwrap();
+        let spec = gens::read(&w.folder(ID), 0, "spec")
+            .known()
+            .unwrap()
+            .unwrap();
+        let got = (
+            &spec["kind"],
+            &spec["sessionId"],
+            &spec["deadline"],
+            &spec["id"],
+            &spec["generation"],
+        );
+        assert_eq!(
+            got,
+            (
+                &json!("spawn"),
+                &json!(SESSION_ID),
+                &json!(at),
+                &json!(ID),
+                &json!("0")
+            )
+        );
+        assert_eq!(
+            (&spec["client"], &spec["flags"]),
+            (&json!("claude"), &json!(["--effort", "high"]))
+        );
+    }
+
+    // Ambiguity 6, R-W3: the commit publication fails before its link (`content`), at its read (a folder there),
+    // or at a folder flush after the link. Pending and its address stay; no abort, promotion or view.
+    #[test]
+    fn a_failed_commit_publication_keeps_pending_and_runs_nothing_after() {
+        for how in ["content", "folder", "flush"] {
+            let w = world();
+            let _reset = hooks::Reset;
+            let f = w.folder(ID);
+            let (commit, n0) = (gens::path(&f, 0, "commit"), gens::dir(&f, 0));
+            hooks::after(Some(Box::new(move |s: &str| match (s, how) {
+                ("address", "content") => crate::state::fs::fail_sync_file(Some(&commit)),
+                ("address", "folder") => std::fs::create_dir_all(&commit).unwrap(),
+                ("address", _) => crate::state::fs::fail_sync_dir(Some(&n0)),
+                _ => {}
+            })));
+            replies(&w, address("t1"));
+            let e = go(&w, launch_of(&w, true, SESSION_ID), free, never).unwrap_err();
+            let got = (e.check, e.message.as_str());
+            match how {
+                "content" => assert_eq!(got, ("state", gens::NOT_PUBLISHED), "{how}"),
+                "flush" => assert_eq!(got, ("state", gens::NOT_FLUSHED), "{how}"),
+                _ => assert_eq!(e.check, "evidence", "{how}: {e:?}"),
+            }
+            let r = record(&w);
+            assert_eq!(
+                (&r["pending"]["gen"], &r["pending"]["hcAddress"]),
+                (&json!(0), &json!("t1")),
+                "{how}"
+            );
+            assert!(
+                r.get("generation").is_none() && r.get("sessionId").is_none(),
+                "{how}: no promotion"
+            );
+            if how != "folder" {
+                let want = (how == "flush").then_some(gens::Decision::Run);
+                assert_eq!(
+                    decided(&w, 0),
+                    want,
+                    "{how}: no abort; a visible unflushed commit is for settle"
+                );
+            }
+            assert_eq!(kills(&w), 0, "{how}");
+        }
+    }
+
+    // Ambiguity 5, F4: the promotion rename lands and its member-folder flush fails. One write: every promoted
+    // field together, pending gone in the same write; the commit stands; nothing is killed or attached.
+    #[test]
+    fn a_failed_promotion_flush_leaves_one_whole_promotion() {
+        let w = world();
+        let _reset = hooks::Reset;
+        let f2 = w.folder(ID);
+        hooks::after(Some(Box::new(move |s: &str| {
+            if s == "commit" {
+                crate::state::fs::fail_sync_dir(Some(&f2));
+            }
+        })));
+        replies(&w, address("t1"));
+        let e = go(&w, launch_of(&w, true, SESSION_ID), free, never).unwrap_err();
+        assert_eq!(
+            (e.check, e.message.as_str()),
+            ("state", team_state::NOT_WRITTEN),
+            "{e:?}"
+        );
+        let r = record(&w);
+        let launch = gens::read(&w.folder(ID), 0, "launch")
+            .known()
+            .unwrap()
+            .unwrap();
+        assert!(
+            r.get("pending").is_none(),
+            "pending is dropped by the promoting write itself"
+        );
+        let team = json!(crate::agents::membership::team(&w.caller()));
+        let got = (
+            &r["generation"],
+            &r["hcAddress"],
+            &r["hcName"],
+            &r["launcherArgv"],
+            &r["sessionId"],
+            &r["team"],
+        );
+        let want = (
+            &json!("0"),
+            &json!("t1"),
+            &launch["hcName"],
+            &launch["launcherArgv"],
+            &launch["sessionId"],
+            &team,
+        );
+        assert_eq!(
+            got, want,
+            "session id and terminal identity change together"
+        );
+        assert_eq!(
+            (decided(&w, 0), kills(&w)),
+            (Some(gens::Decision::Run), 0),
+            "nothing rolled back"
+        );
+    }
+
+    // Ambiguity 5: the record is unreadable at promotion. Refused evidence; the bytes are never rewritten.
+    #[test]
+    fn a_refused_promotion_rolls_nothing_back() {
+        let w = world();
+        let _reset = hooks::Reset;
+        let f = w.folder(ID);
+        let f2 = f.clone();
+        hooks::after(Some(Box::new(move |s: &str| {
+            if s == "commit" {
+                std::fs::write(f2.join("record.json"), br#"{"lifec"#).unwrap();
+            }
+        })));
+        replies(&w, address("t1"));
+        let e = go(&w, launch_of(&w, true, SESSION_ID), free, never).unwrap_err();
+        assert_eq!(e.check, "evidence", "{e:?}");
+        assert_eq!(
+            std::fs::read(f.join("record.json")).unwrap(),
+            br#"{"lifec"#.to_vec(),
+            "never rewritten"
+        );
+        assert_eq!((decided(&w, 0), kills(&w)), (Some(gens::Decision::Run), 0));
+    }
+
+    // G1.6, F4: the view is optional; its failure is viewError and nothing is rolled back.
+    #[test]
+    fn a_view_failure_after_the_commit_is_view_error() {
+        let w = world();
+        replies(&w, address("t1"));
+        let fail = |_: &Core<'_>, _: &Value| Err(Refusal::internal("no pane"));
+        let r = go(&w, launch_of(&w, true, SESSION_ID), free, fail).unwrap();
+        assert!(r["viewError"].as_str().unwrap().contains("no pane"));
+        assert_eq!(
+            (decided(&w, 0), kills(&w)),
+            (Some(gens::Decision::Run), 0),
+            "nothing rolled back"
+        );
+        assert!(
+            record(&w).get("viewError").is_none(),
+            "the reply carries it, never the record"
+        );
+    }
+
+    // R5, every OS (`testing::link_dir`): a member folder linked to another member is refused before any write.
+    #[test]
+    fn a_linked_member_folder_is_refused_before_any_write() {
+        let w = world();
+        let other = w.folder("bbbbbbbbbbbb");
+        std::fs::create_dir_all(&other).unwrap();
+        let theirs = json!({"lifecycle": 1, "id": "bbbbbbbbbbbb",
+            "pending": {"gen": 0, "hcName": "m0123abcd", "sessionId": SESSION_ID}});
+        crate::state::fs::write_json(&other.join("record.json"), &theirs).unwrap();
+        let before = std::fs::read(other.join("record.json")).unwrap();
+        crate::testing::link_dir(&other, &w.folder(ID));
+        version(&w);
+        let e = go(&w, launch_of(&w, true, SESSION_ID), free, never).unwrap_err();
+        assert_eq!(e.check, "evidence", "{e:?}");
+        assert_eq!(std::fs::read(other.join("record.json")).unwrap(), before);
+        assert!(
+            !other.join("gens").exists() && runs(&w).is_empty(),
+            "nothing written through the link"
+        );
+    }
+
+    // Ambiguity 10: an empty directory refuses before any write, any debit and any run.
+    #[test]
+    fn an_empty_directory_refuses_before_any_write() {
+        let w = world();
+        version(&w);
+        let mut l = launch_of(&w, true, SESSION_ID);
+        l.directory = String::new();
+        let debit = || -> Res<()> { panic!("no debit before the directory check") };
+        let e = go(&w, l, debit, never).unwrap_err();
+        assert_eq!(e.check, "internal", "{e:?}");
+        assert!(e.message.contains("no directory"), "{e:?}");
+        assert!(
+            !w.folder(ID).exists() && runs(&w).is_empty(),
+            "nothing made, nothing run"
+        );
+    }
+
+    // R5, every OS: a torn record refuses evidence before any write, on the create and the existing path.
+    #[test]
+    fn a_torn_record_is_refused_before_any_write() {
+        for create in [true, false] {
+            let w = world();
+            let f = w.folder(ID);
+            crate::agents::spawn::private_folder(&w.ctx, &f).unwrap();
+            std::fs::write(f.join("record.json"), br#"{"lifec"#).unwrap();
+            version(&w);
+            let e = go(&w, launch_of(&w, create, NEW), free, never).unwrap_err();
+            assert_eq!(e.check, "evidence", "{create}: {e:?}");
+            assert!(!f.join("gens").exists() && runs(&w).is_empty(), "{create}");
+        }
+    }
+    // F1, call 15 (finding 1to2-I6): the address write is `Guard::Pending { n, hc_name }`. At `spec` another writer
+    // changes the pending generation alone (name kept), or the name alone; the run succeeds, the address write
+    // refuses, nothing is committed or promoted, and that writer's pending stands.
+    #[test]
+    fn a_record_taken_before_the_address_patch_stops_the_launch() {
+        for case in ["gen", "name"] {
+            let w = world();
+            let _reset = hooks::Reset;
+            let f2 = w.folder(ID);
+            hooks::after(Some(Box::new(move |s: &str| {
+                if s == "spec" {
+                    edit(&f2, |r| match case {
+                        "gen" => r["pending"]["gen"] = json!(5),
+                        _ => r["pending"]["hcName"] = json!("m0123abcd"),
+                    });
+                }
+            })));
+            replies(&w, address("t1"));
+            let e = go(&w, launch_of(&w, true, SESSION_ID), free, never).unwrap_err();
+            assert_eq!(e.check, "launch", "{case}: {e:?}");
+            assert!(
+                e.message
+                    .starts_with("the launch no longer owns the record"),
+                "{case}: {e:?}"
+            );
+            assert_eq!(
+                runs(&w).len(),
+                1,
+                "{case}: the run happened; nothing after it"
+            );
+            let r = record(&w);
+            assert!(
+                r["pending"].get("hcAddress").is_none() && r.get("generation").is_none(),
+                "{case}"
+            );
+            assert_eq!(decided(&w, 0), None, "{case}: no commit");
+        }
+    }
+
+    // F1, call 15: the promotion is `Guard::PendingGen { n: Some(n) }`. The pending generation changes after the
+    // commit; the promotion refuses and promotes nothing.
+    #[test]
+    fn a_record_taken_before_promotion_is_not_promoted() {
+        let w = world();
+        let _reset = hooks::Reset;
+        let f2 = w.folder(ID);
+        hooks::after(Some(Box::new(move |s: &str| {
+            if s == "commit" {
+                edit(&f2, |r| r["pending"]["gen"] = json!(5));
+            }
+        })));
+        replies(&w, address("t1"));
+        let e = go(&w, launch_of(&w, true, SESSION_ID), free, never).unwrap_err();
+        assert_eq!(e.check, "launch", "{e:?}");
+        assert!(e.message.contains("no longer owns the record"), "{e:?}");
+        let r = record(&w);
+        assert!(
+            r.get("generation").is_none() && r.get("sessionId").is_none(),
+            "nothing promoted"
+        );
+        assert_eq!(r["pending"]["gen"], json!(5), "the record is left as found");
+        assert_eq!(
+            (decided(&w, 0), kills(&w)),
+            (Some(gens::Decision::Run), 0),
+            "nothing rolled back"
+        );
+    }
+
+    // F2: the first pending write is guarded by what the precheck read (`Create`; `PendingGen { n: g.pending() }`).
+    // Right after the precheck another writer makes a record (new member) or a pending generation (existing
+    // member): refused 1 `launch`, nothing written, fenced or run.
+    #[test]
+    fn the_first_pending_write_is_guarded_by_what_the_precheck_saw() {
+        for case in ["create", "existing"] {
+            let w = world();
+            let _reset = hooks::Reset;
+            let create = case == "create";
+            if !create {
+                promoted(&w);
+            }
+            let f = w.folder(ID);
+            crate::agents::spawn::private_folder(&w.ctx, &f).unwrap();
+            let f2 = f.clone();
+            hooks::after(Some(Box::new(move |s: &str| {
+                if s != "allocated" {
+                    return;
+                }
+                let theirs = json!({"gen": if create { 0 } else { 1 }, "hcName": "m0123abcd"});
+                if create {
+                    let r = json!({"lifecycle": 1, "id": ID, "pending": theirs});
+                    crate::state::fs::write_json(&f2.join("record.json"), &r).unwrap();
+                } else {
+                    edit(&f2, |r| r["pending"] = theirs);
+                }
+            })));
+            version(&w);
+            let e = go(&w, launch_of(&w, create, NEW), free, never).unwrap_err();
+            assert_eq!(e.check, "launch", "{case}: {e:?}");
+            assert!(
+                e.message
+                    .contains("changed before this launch was recorded"),
+                "{case}: {e:?}"
+            );
+            assert!(e.message.ends_with("; nothing was fenced"), "{case}: {e:?}");
+            assert_eq!(
+                record(&w)["pending"]["hcName"],
+                json!("m0123abcd"),
+                "{case}: theirs stands"
+            );
+            let n = u64::from(!create);
+            assert!(
+                !gens::dir(&f, n).exists(),
+                "{case}: no generation {n} files"
+            );
+            assert_eq!(runs(&w).len(), usize::from(!create), "{case}: nothing run");
+        }
     }
 }

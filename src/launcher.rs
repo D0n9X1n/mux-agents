@@ -462,7 +462,7 @@ fn client_command(
 /// generation 0 derives m and the first 8 of the id (G2); `null` or any non-text value is refused. The name must have
 /// the hc shape. `launch.json` must name that hcName and session, and `spec.json` this id, `generation` n as text, and
 /// that session. Anything else, a torn, missing or linked file included, is None, and nothing has been created.
-fn own_spec(member: &Path, n: u64) -> Option<Value> {
+pub(crate) fn own_spec(member: &Path, n: u64) -> Option<Value> {
     let id = member.file_name()?.to_str()?;
     let Evidence::Present(record) = gens::record(member) else {
         return None;
