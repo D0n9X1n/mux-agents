@@ -125,7 +125,7 @@ fn read_log(notes: &Path) -> Res<Vec<u8>> {
     if !leaf(&log)? {
         return Ok(Vec::new());
     }
-    std::fs::read(&log).map_err(|_| evidence::unreadable())
+    crate::state::fs::read_bytes(&log).map_err(|_| evidence::unreadable())
 }
 
 /// What `notebook.state.json` says about the log read (ambiguity 4). `Uncertain`: renamed, its folder flush not yet known.
@@ -139,7 +139,12 @@ enum Marker {
 fn marker(notes: &Path, log: &[u8]) -> Res<Marker> {
     let path = notes.join(STATE);
     if !leaf(&path)? {
-        return Ok(Marker::Absent);
+        // Call 3: no marker beside a log with content is a deleted marker: unreadable, rebuilt, never durable 0.
+        return Ok(if log.is_empty() {
+            Marker::Absent
+        } else {
+            Marker::Bad
+        });
     }
     let Ok(Some(v)) = crate::state::fs::read_json(&path) else {
         return Ok(Marker::Bad);
@@ -160,13 +165,13 @@ fn marker(notes: &Path, log: &[u8]) -> Res<Marker> {
     })
 }
 
-/// R3: the certain `durable`; absent is 0. an uncertain marker is completed first; Task 4 rebuilds a bad one.
+/// R3: the certain `durable`; absent is 0. an uncertain marker is completed first; a bad one is rebuilt.
 fn settle(notes: &Path, log: &[u8]) -> Res<u64> {
     match marker(notes, log)? {
         Marker::Absent => Ok(0),
         Marker::Certain(durable) => Ok(durable),
         Marker::Uncertain(durable) => complete(notes, durable),
-        Marker::Bad => Err(evidence::unreadable()),
+        Marker::Bad => rebuild(notes, log),
     }
 }
 
@@ -184,6 +189,21 @@ fn complete(notes: &Path, durable: u64) -> Res<u64> {
     let certain = json!({"durable": durable, "uncertain": false});
     write_json_durable(&notes.join(STATE), &certain).map_err(|_| not_on_disk())?;
     Ok(durable)
+}
+
+/// N2: an unreadable marker, rebuilt under the team lock: flush the log, then the folder, then publish the end of
+/// the last whole line (uncertain, then completed). A flush that fails refuses 1 `notes` and publishes nothing.
+fn rebuild(notes: &Path, log: &[u8]) -> Res<u64> {
+    let whole = log
+        .iter()
+        .rposition(|&b| b == b'\n')
+        .map_or(0, |i| i as u64 + 1);
+    if leaf(&notes.join(LOG))? {
+        sync_file(&notes.join(LOG)).map_err(|_| not_on_disk())?;
+    }
+    sync_dir(notes).map_err(|_| not_on_disk())?;
+    publish(notes, whole).map_err(|_| not_on_disk())?;
+    Ok(whole)
 }
 
 /// N2 (1)-(3): cuts the bytes past `durable` (an unanswered tail) and flushes, writes `line` there, then flushes the
@@ -273,3 +293,7 @@ mod tests;
 #[cfg(test)]
 #[path = "notebook_fault_tests.rs"]
 mod fault_tests;
+
+#[cfg(test)]
+#[path = "notebook_rebuild_tests.rs"]
+mod rebuild_tests;
