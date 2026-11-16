@@ -319,7 +319,8 @@ fn a_link_at_the_member_folder_refuses_every_guard() {
     }
 }
 
-// R-W2, finding 1to2-I4: record.json is read once, through the walk, and nothing else is read.
+// R-W2, finding 1to2-I4: record.json is read once, through the walk, and nothing else is read. The capture holds
+// the writer alone: `open`'s replay hooks (group B's `release::complete`) read member records before the body.
 #[test]
 fn a_write_reads_the_record_exactly_once() {
     let w = world();
@@ -330,9 +331,12 @@ fn a_write_reads_the_record_exactly_once() {
         n: 1,
         hc_name: "m1",
     };
-    let (got, reads) = crate::state::fs::record_reads(|| {
-        open(&w.ctx, &s, |tx| tx.record_write(ID, own, |_| Ok(())))
-    });
+    let (got, reads) = open(&w.ctx, &s, |tx| {
+        Ok(crate::state::fs::record_reads(|| {
+            tx.record_write(ID, own, |_| Ok(()))
+        }))
+    })
+    .unwrap();
     assert_eq!(outcome(&got), "wrote", "{got:?}");
     assert_eq!(reads, [f.join("record.json")], "one walk-checked read");
 }

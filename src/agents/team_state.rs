@@ -48,7 +48,7 @@ pub fn gen_lock_key(key: &str, id: &str, n: u64) -> String {
 
 /// A replay hook open runs before its body (adopt-3e registers its journal, release-1d gens::complete).
 pub type Hook = fn(&Tx<'_>) -> Res<()>;
-const HOOKS: &[Hook] = &[];
+const HOOKS: &[Hook] = &[super::release::complete];
 
 #[cfg(test)]
 thread_local! {
@@ -549,10 +549,15 @@ mod tests {
         }
         let (w, s) = world();
         w.fakes.clear_log();
+        crate::agents::core_fixture::online(&w);
         test_hook(Some(hook));
         let got = open(&w.ctx, &s, |_| Ok(()));
         test_hook(None);
         got.unwrap();
+        assert!(
+            w.fakes.hc_calls().is_empty(),
+            "a hook with nothing to do called hc"
+        );
         let t = s.team_lock();
         let want = [
             format!("+{t}"),

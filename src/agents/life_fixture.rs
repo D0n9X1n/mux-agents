@@ -174,3 +174,8 @@ pub fn no_effect(w: &World) {
         );
     }
 }
+/// `pending` of generation n as `forward` writes it, with its address.
+pub fn pending(n: u64) -> Value {
+    json!({"gen": n, "kind": "spawn", "hcName": hc_name(n), "sessionId": SID, "launcherArgv": ARGV,
+        "hcAddress": format!("t{n}")})
+}

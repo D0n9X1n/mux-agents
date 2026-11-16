@@ -3,7 +3,7 @@
 use serde_json::{Value, json};
 
 use super::gens;
-use super::team_state::Tx;
+use super::team_state::{Guard, Tx};
 use crate::error::{Refusal, Res};
 use crate::hc::{Core, Lazy, State, Terminal};
 use crate::state::evidence::Published;
@@ -24,6 +24,11 @@ impl Cause {
             Cause::Recovery => "recovery",
             Cause::Lost => "lost",
         }
+    }
+    pub fn parse(word: &str) -> Option<Cause> {
+        [Cause::Restore, Cause::Recovery, Cause::Lost]
+            .into_iter()
+            .find(|c| c.word() == word)
     }
 }
 
@@ -159,6 +164,66 @@ fn relabel(core: &Core<'_>, address: &str, t: &Terminal, id: &str, n: u64, team:
     core.label(address, &pairs)
         .map_err(|_| gens::unclear("hc could not relabel the shell"))?;
     halt("relabel")
+}
+
+/// R4, a `Tx::open` replay hook (state-0 S3) run before the body: finishes each `record.completing` of this
+/// session's lifecycle members and clears it. Non-fatal per member (ambiguity 10): a failure keeps `completing`,
+/// so `gens::done` stays false and the generation stays reserved. hc is connected only when a member needs it.
+pub fn complete(tx: &Tx<'_>) -> Res<()> {
+    let Ok(all) = gens::members(&tx.scope.agents(&tx.ctx.state_root)) else {
+        return Ok(());
+    };
+    let lazy = Lazy::new(tx.ctx);
+    for (id, _, member) in all {
+        let gens::Member::Life(g) = member else {
+            continue;
+        };
+        if g.record().get("session").and_then(Value::as_str) != Some(tx.scope.session.as_str()) {
+            continue;
+        }
+        if let Some(c) = g.record().get("completing") {
+            let _ = complete_one(tx, &lazy, &id, c);
+        }
+    }
+    Ok(())
+}
+
+/// R4 for one member. `release`: `finish` first (b-calls 15: a recorded `release.json` is finished from step 3,
+/// `released.json` is done, neither rereads `launch.json`); only when neither exists, R1 with the recorded cause
+/// and address. `ended`: the recorded facts through `gens::publish_end`. Then `completing` is cleared through
+/// `record_write` under `Guard::CompletingGen`, only while it still names its generation.
+pub fn complete_one(tx: &Tx<'_>, lazy: &Lazy<'_>, id: &str, c: &Value) -> Res<()> {
+    let n = c
+        .get("gen")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| Refusal::internal("invalid completing"))?;
+    match c.get("intent").and_then(Value::as_str) {
+        Some("release") => {
+            if !finish(tx, lazy, id, n)? {
+                let cause = c
+                    .get("cause")
+                    .and_then(Value::as_str)
+                    .and_then(Cause::parse)
+                    .ok_or_else(|| Refusal::internal("invalid completing cause"))?;
+                let address = c.get("address").and_then(Value::as_str).unwrap_or_default();
+                release(tx, lazy, id, n, address, cause)?;
+            }
+        }
+        Some("ended") => {
+            let facts = c
+                .get("facts")
+                .filter(|f| f.is_object())
+                .ok_or_else(|| Refusal::internal("invalid completing facts"))?;
+            gens::publish_end(&tx.folder(id), n, facts)?;
+            halt("ended")?;
+        }
+        _ => return Err(Refusal::internal("invalid completing intent")),
+    }
+    tx.record_write(id, Guard::CompletingGen { n }, |f| {
+        f.remove("completing");
+        Ok(())
+    })
+    .map(|_| ())
 }
 
 #[cfg(test)]
@@ -467,5 +532,271 @@ mod tests {
             "the recorded address"
         );
         w.fakes.hc_done().unwrap();
+    }
+
+    fn completing(w: &World, c: Value) -> PathBuf {
+        let m = lf::life(
+            w,
+            json!({"generation": "1", "hcAddress": "t1", "sessionId": lf::SID, "completing": c}),
+        );
+        lf::seed_gen(&m, 1, Some("run"), lf::committed());
+        m
+    }
+    fn release_intent() -> Value {
+        json!({"gen": 1, "intent": "release", "cause": "restore", "address": "t1"})
+    }
+    fn ended_intent(w: &World) -> Value {
+        let facts = gens::end_facts(&lf::terminal(w, &lf::ended(w, 1)), &lf::hc_name(1), "x");
+        w.fakes.clear_log();
+        json!({"gen": 1, "intent": "ended", "facts": facts})
+    }
+
+    // R4 "Promoted, not released": the next Tx::open releases once (cause restore), keeps n's session, clears
+    // completing; again with the terminal expired: released, no relabel. A second open calls no hc (B-R5).
+    #[test]
+    fn a_promoted_generation_is_released_once_by_the_next_open() {
+        for expired in [false, true] {
+            let (w, s) = lf::world();
+            let m = completing(&w, release_intent());
+            cf::online(&w);
+            if expired {
+                lf::gone(&w, "t1");
+            } else {
+                lf::get(&w, "t1", &lf::lost(&w, 1, lf::LOST_ARGVS[1]));
+                lf::relabel(&w, "t1");
+            }
+            open(&w.ctx, &s, |_| Ok(())).unwrap();
+            let r = lf::record(&m);
+            assert_eq!(
+                (r["sessionId"].as_str(), r.get("completing")),
+                (Some(lf::SID), None),
+                "{expired}"
+            );
+            assert_eq!(
+                gens::read(&m, 1, "release").known().unwrap().unwrap()["cause"],
+                "restore"
+            );
+            assert_eq!(lf::count(&w, "label"), usize::from(!expired));
+            assert!(gens::done(&m, 1).unwrap());
+            lf::no_effect(&w);
+            w.fakes.hc_done().unwrap();
+            w.fakes.clear_log();
+            open(&w.ctx, &s, |_| Ok(())).unwrap();
+            assert!(lf::calls(&w).is_empty(), "nothing left to do calls no hc");
+        }
+    }
+
+    // R4 "Marker before clear": stopped after ended.json (ended) or released.json (release), before the clear:
+    // not done, reserved; the next open clears completing once, with no second relabel or hc call.
+    #[test]
+    fn a_marker_before_the_clear_holds_the_reservation() {
+        for intent in ["ended", "release"] {
+            let (w, s) = lf::world();
+            let c = if intent == "ended" {
+                ended_intent(&w)
+            } else {
+                release_intent()
+            };
+            let m = completing(&w, c);
+            if intent == "release" {
+                cf::online(&w);
+                lf::get(&w, "t1", &lf::lost(&w, 1, lf::LOST_ARGVS[0]));
+                lf::relabel(&w, "t1");
+            }
+            halt_after(Some(if intent == "ended" {
+                "ended"
+            } else {
+                "released"
+            }));
+            let ran = std::cell::Cell::new(false);
+            open(&w.ctx, &s, |_| {
+                ran.set(true);
+                Ok(())
+            })
+            .unwrap();
+            halt_after(None);
+            assert!(ran.get(), "{intent}: the body runs");
+            assert!(
+                !gens::done(&m, 1).unwrap(),
+                "{intent}: done before the clear"
+            );
+            assert!(lf::record(&m).get("completing").is_some(), "{intent}");
+            let before = lf::calls(&w).len();
+            open(&w.ctx, &s, |_| Ok(())).unwrap();
+            assert!(lf::record(&m).get("completing").is_none(), "{intent}");
+            assert!(gens::done(&m, 1).unwrap(), "{intent}");
+            assert_eq!(lf::calls(&w).len(), before, "{intent}: no second hc call");
+            assert!(
+                !gens::path(&m, 1, "notice").exists(),
+                "{intent}: no notice from the hook"
+            );
+        }
+    }
+
+    // R4 "Straddling reader": a snapshot taken before the promotion; the writer promotes with completing,
+    // publishes ended.json and dies. done is false and the old snapshot is not finished; the next open frees n.
+    #[test]
+    fn a_straddling_reader_never_sees_done_before_the_clear() {
+        let (w, s) = lf::world();
+        let m = lf::life(&w, json!({"pending": lf::pending(1)}));
+        lf::seed_gen(&m, 1, Some("run"), lf::committed());
+        let gens::Member::Life(before) = gens::member_of(&m) else {
+            panic!("not a lifecycle member")
+        };
+        let c = ended_intent(&w);
+        let mut r = lf::record(&m);
+        r["generation"] = json!("1");
+        r["completing"] = c.clone();
+        r.as_object_mut().unwrap().remove("pending");
+        crate::state::fs::write_json(&m.join("record.json"), &r).unwrap();
+        gens::publish_end(&m, 1, &c["facts"]).unwrap();
+        assert!(!gens::done(&m, 1).unwrap(), "done before the clear");
+        assert!(
+            !before.status().unwrap().finished,
+            "the straddling snapshot"
+        );
+        open(&w.ctx, &s, |_| Ok(())).unwrap();
+        assert!(gens::done(&m, 1).unwrap());
+    }
+
+    // Ambiguity 10: a completion hc cannot finish stays (reserved) and the body runs; another session's member is
+    // never read for hc.
+    #[test]
+    fn an_unfinishable_completion_stays_and_another_session_is_untouched() {
+        let (w, s) = lf::world();
+        let m = completing(&w, release_intent());
+        cf::online(&w);
+        lf::fails(&w, &["get", "t1", "--json"]);
+        let ran = std::cell::Cell::new(false);
+        open(&w.ctx, &s, |_| {
+            ran.set(true);
+            Ok(())
+        })
+        .unwrap();
+        assert!(ran.get(), "the body runs");
+        assert!(lf::record(&m).get("completing").is_some(), "kept");
+        let mut r = lf::record(&m);
+        r["session"] = json!("$4");
+        crate::state::fs::write_json(&m.join("record.json"), &r).unwrap();
+        w.fakes.clear_log();
+        open(&w.ctx, &s, |_| Ok(())).unwrap();
+        assert!(
+            lf::calls(&w).is_empty(),
+            "another session's member was read for hc"
+        );
+        assert!(lf::record(&m).get("completing").is_some());
+    }
+
+    // b-calls 15 (B2 finding 6): a recorded release.json is finished from step 3 and released.json is done with no
+    // hc; neither rereads launch.json (torn here).
+    #[test]
+    fn a_recorded_release_finishes_without_launch_json() {
+        for case in ["release", "released"] {
+            let (w, s) = lf::world();
+            let m = completing(&w, release_intent());
+            let rel =
+                json!({"address": "t1", "hcName": lf::hc_name(1), "cause": "restore", "at": "x"});
+            gens::publish_once(&m, 1, "release", &rel).unwrap();
+            if case == "released" {
+                gens::publish_once(&m, 1, "released", &json!({"at": "x"})).unwrap();
+            } else {
+                cf::online(&w);
+                lf::gone(&w, "t1");
+            }
+            std::fs::write(gens::path(&m, 1, "launch"), b"{").unwrap();
+            open(&w.ctx, &s, |_| Ok(())).unwrap();
+            assert!(
+                lf::record(&m).get("completing").is_none(),
+                "{case}: still completing"
+            );
+            assert!(released(&m), "{case}");
+            assert_eq!(
+                lf::calls(&w).len(),
+                if case == "release" { 2 } else { 0 },
+                "{case}: hc calls"
+            );
+            w.fakes.hc_done().unwrap();
+        }
+    }
+
+    // R4 guard at the call site (B2 re-audit 5): a stale intent for generation 1 records 1's end but never clears a
+    // `completing` naming generation 2 (`Guard::CompletingGen { n }`). Another session, so the hook leaves it be.
+    #[test]
+    fn a_completion_of_another_generation_clears_nothing() {
+        let (w, s) = lf::world();
+        let c = ended_intent(&w);
+        let m = lf::life(
+            &w,
+            json!({"generation": "2", "session": "$4", "completing": {"gen": 2, "intent": "ended"}}),
+        );
+        lf::seed_gen(&m, 1, Some("run"), lf::committed());
+        open(&w.ctx, &s, |tx| {
+            complete_one(tx, &Lazy::new(tx.ctx), ID, &c)
+        })
+        .unwrap();
+        assert!(
+            matches!(gens::read(&m, 1, "ended"), Evidence::Present(_)),
+            "generation 1's end"
+        );
+        assert_eq!(
+            lf::record(&m)["completing"]["gen"],
+            2,
+            "another generation's completing cleared"
+        );
+    }
+
+    // R4 (build checklist 10): an `ended` completion publishes exactly the facts it recorded, no other body.
+    #[test]
+    fn an_ended_completion_publishes_exactly_its_recorded_facts() {
+        let (w, s) = lf::world();
+        let c = ended_intent(&w);
+        let m = completing(&w, c.clone());
+        open(&w.ctx, &s, |_| Ok(())).unwrap();
+        assert_eq!(
+            gens::read(&m, 1, "ended").known().unwrap().unwrap(),
+            c["facts"],
+            "ended.json is completing.facts"
+        );
+        assert!(lf::record(&m).get("completing").is_none());
+    }
+
+    // B-R6 (build checklist 12): a failed completion clear answers check `state`, `team_state::NOT_WRITTEN`; the
+    // recorded end stands and `completing` stays, so the generation stays reserved until the next open clears it.
+    #[test]
+    fn a_failed_completion_clear_refuses_state_and_keeps_completing() {
+        let (w, s) = lf::world();
+        let c = ended_intent(&w);
+        let m = completing(&w, c.clone());
+        let mut r = lf::record(&m);
+        r["session"] = json!("$4"); // the hook leaves it be; the direct call below is the one under test
+        crate::state::fs::write_json(&m.join("record.json"), &r).unwrap();
+        crate::state::fs::fail_sync_file(Some(&m.join("record.json")));
+        let got = open(&w.ctx, &s, |tx| {
+            complete_one(tx, &Lazy::new(tx.ctx), ID, &c)
+        });
+        crate::state::fs::fail_sync_file(None);
+        assert_eq!(
+            got.map_err(|e| (e.check, e.message)),
+            Err(("state", crate::agents::team_state::NOT_WRITTEN.to_string()))
+        );
+        assert_eq!(
+            gens::read(&m, 1, "ended").known().unwrap().unwrap(),
+            c["facts"],
+            "the end stands"
+        );
+        assert!(
+            lf::record(&m).get("completing").is_some(),
+            "completing kept"
+        );
+        assert!(!gens::done(&m, 1).unwrap(), "reserved");
+        let mut r = lf::record(&m);
+        r["session"] = json!(w.caller().session);
+        crate::state::fs::write_json(&m.join("record.json"), &r).unwrap();
+        open(&w.ctx, &s, |_| Ok(())).unwrap();
+        assert!(
+            lf::record(&m).get("completing").is_none(),
+            "the next open clears it"
+        );
+        assert!(gens::done(&m, 1).unwrap());
     }
 }
