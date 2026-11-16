@@ -390,9 +390,31 @@ pub fn marks_given(member: &Path, n: u64, ended: Option<u64>) -> Res<Marks> {
         Err(e) if e.check == "state" && e.message == NOT_FLUSHED => Ok(false),
         Err(e) => Err(e),
     };
+    // Call 57: a void marker decides done only once its own publication's folder flushes succeed (the claim's:
+    // `gens`, member, `agents`; the commit's: `gens/<n>` too). Each is still read once (b-calls 32); a Run commit is
+    // not a done marker and is read as before.
+    let flushed = |levels: &[&str]| {
+        let Some(agents) = member.parent() else {
+            return false;
+        };
+        let mut folders = vec![agents.to_path_buf(), member.to_path_buf()];
+        let mut at = member.to_path_buf();
+        for level in levels {
+            at.push(level);
+            folders.push(at.clone());
+        }
+        flush_up(&folders).is_ok()
+    };
+    let level = n.to_string();
+    let abandoned =
+        claim(member, n).known()?.is_some_and(|c| c == "abandoned") && flushed(&["gens"]);
+    let decision = match read(member, n, "commit").known()?.map(|c| decide(&c)) {
+        Some(Decision::Aborted) if !flushed(&["gens", &level]) => None,
+        d => d,
+    };
     Ok(Marks {
-        abandoned: claim(member, n).known()?.is_some_and(|c| c == "abandoned"),
-        decision: read(member, n, "commit").known()?.map(|c| decide(&c)),
+        abandoned,
+        decision,
         ended: ended == Some(n) || durable("ended")?,
         released: durable("released")?,
     })

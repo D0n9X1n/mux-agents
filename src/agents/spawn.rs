@@ -1970,6 +1970,72 @@ mod tests {
         assert_eq!(ls, 1, "one snapshot");
     }
 
+    // Call 57 (QA #142): a pending generation is done by an `aborted` commit or an `abandoned` claim only once that
+    // marker's own flushes succeed. Each marker's publication fails its folder flush (commit: gens/1; claim: gens),
+    // so it is visible but not durable: with the fault armed `spawn -Name worker` is refused, runs nothing, and
+    // generation 1 is not done; cleared, the name is admitted once.
+    #[test]
+    fn an_unflushed_void_marker_keeps_the_name() {
+        use crate::agents::{fixture::ID, gens, life_fixture as lf};
+        for case in ["aborted commit", "abandoned claim"] {
+            let w = human();
+            let f = lf::life(&w, json!({"pending": lf::pending(1)}));
+            lf::seed_gen(&f, 1, None, None);
+            let fault = if case == "aborted commit" {
+                gens::dir(&f, 1)
+            } else {
+                f.join("gens")
+            };
+            crate::state::fs::fail_sync_dir(Some(&fault));
+            let published = if case == "aborted commit" {
+                gens::publish_once(&f, 1, "commit", &json!({"aborted": true}))
+            } else {
+                gens::publish_claim_once(&f, 1, &json!("abandoned"))
+            };
+            assert_eq!(
+                published.map_err(|e| e.message),
+                Err(gens::NOT_FLUSHED.to_string()),
+                "{case}"
+            );
+            let args = [
+                "spawn", "-Client", "claude", "-Task", "Worker", "-Name", "worker",
+            ];
+            let runs = |w: &World| {
+                w.fakes
+                    .hc_calls()
+                    .iter()
+                    .filter(|(_, a, _)| a[0] == "run")
+                    .count()
+            };
+            public_snapshot(&w, &[], &[]);
+            lf::gone(&w, "t1");
+            let armed = spawn(&w.ctx, &w.request(&args)).map_err(|e| e.message);
+            let done = gens::done(&f, 1).unwrap();
+            crate::state::fs::fail_sync_dir(None);
+            assert_eq!(
+                armed.map(|_| ()),
+                Err("agent name is taken, try worker-2".to_string()),
+                "{case}"
+            );
+            assert_eq!(runs(&w), 0, "{case}: hc run under an unflushed marker");
+            assert!(!done, "{case}: done under an unflushed marker");
+            w.fakes.hc_done().unwrap();
+            assert!(gens::done(&f, 1).unwrap(), "{case}: done once flushed");
+            assert!(
+                std::fs::read_dir(f.parent().unwrap())
+                    .unwrap()
+                    .all(|e| e.unwrap().file_name() == ID),
+                "{case}: no member made"
+            );
+            public_snapshot(&w, &[], &[]);
+            public_launch(&w, "t1");
+            let ok = spawn(&w.ctx, &w.request(&args)).unwrap();
+            assert_eq!(ok["name"], "worker", "{case}");
+            assert_eq!(runs(&w), 1, "{case}: one hc run");
+            w.fakes.hc_done().unwrap();
+        }
+    }
+
     #[test]
     fn an_unreadable_record_refuses_rather_than_reuse_a_name() {
         use crate::agents::core_fixture as cf;
