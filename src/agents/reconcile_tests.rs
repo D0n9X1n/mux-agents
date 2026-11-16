@@ -206,3 +206,89 @@ pub(super) fn observed(w: &World, id: &str) -> crate::error::Res<Seen> {
         observe(tx, &lazy, &g).map(|(seen, _)| seen)
     })
 }
+
+/// R1 of release-1d as hc sees it for member `id` gen 1: the reread of the shell, then the one relabel.
+fn released_by_hc(w: &World, id: &str, argv: &[&str]) {
+    let a = format!("a{id}");
+    cf::answer(
+        w,
+        &["get", &a, "--json"],
+        &wire_of(w, id, 1, argv).to_string(),
+    );
+    lf::relabel(w, &a);
+}
+/// Member `id` released for restore through the real R1 writer (r6b call 10).
+fn released_for_restore(w: &World, id: &str) {
+    released_by_hc(w, id, lf::LOST_ARGVS[0]);
+    team_state::open(&w.ctx, &Scope::of(&w.caller()), |tx| {
+        let lazy = Lazy::new(tx.ctx);
+        super::release::release(
+            tx,
+            &lazy,
+            id,
+            1,
+            &format!("a{id}"),
+            super::release::Cause::Restore,
+        )
+    })
+    .unwrap();
+}
+
+#[test]
+fn waiting_is_a_restore_release_with_nothing_pending() {
+    let cases = [
+        ("restore", Ok(true)),
+        ("pending", Ok(false)),
+        ("recovery", Ok(false)),
+        ("half", Ok(false)),
+        ("none", Ok(false)),
+        ("torn", Err("evidence")),
+    ];
+    for (case, want) in cases {
+        let w = World::human("");
+        w.state();
+        let f = member(&w, X, json!({}));
+        let rel = super::gens::path(&f, 1, "release");
+        let body = |cause: &str| json!({"address": "a", "hcName": lf::hc_name(1), "cause": cause, "at": "t"});
+        let released = || {
+            crate::state::evidence::publish(&super::gens::path(&f, 1, "released"), &json!({}))
+                .unwrap();
+        };
+        match case {
+            "restore" => {
+                cf::online(&w);
+                released_for_restore(&w, X);
+            }
+            "pending" => {
+                // released for restore, and a pending n+1 already exists: not waiting (r6b call 11)
+                crate::state::evidence::publish(&rel, &body("restore")).unwrap();
+                released();
+                let mut r = lf::record(&f);
+                r["pending"] = json!({"gen": 2, "kind": "restore", "hcName": lf::hc_name(2), "sessionId": lf::SID,
+                    "launcherArgv": lf::ARGV});
+                crate::state::fs::write_json(&f.join("record.json"), &r).unwrap();
+            }
+            "recovery" => {
+                crate::state::evidence::publish(&rel, &body("recovery")).unwrap();
+                released();
+            }
+            "half" => {
+                crate::state::evidence::publish(&rel, &body("restore")).unwrap();
+            }
+            "torn" => std::fs::create_dir_all(&rel).unwrap(),
+            _ => {}
+        }
+        // r6b call 26: from the record the snapshot holds, never reread.
+        let got = super::reconcile::waiting(&f, &lf::record(&f));
+        assert_eq!(got.map_err(|e| e.check), want, "{case}");
+    }
+}
+
+/// Task 8 board fixture: a member released for restore, generation 1 ok.
+pub(super) fn member_for_board(w: &World) -> PathBuf {
+    let f = member(w, X, json!({}));
+    ok(&f, 1);
+    cf::online(w);
+    released_for_restore(w, X); // the real R1 writer (r6b call 10)
+    f
+}
