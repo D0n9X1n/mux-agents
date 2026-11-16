@@ -17,6 +17,38 @@ mod native;
 #[cfg(unix)]
 use support::{Dir, Mux, Server};
 
+// outcome-2 call 14 (build checklist 4): a child past its bound is killed and refused `TimedOut` well before its own
+// end; a watched child past its bound is killed by its watchdog.
+#[cfg(unix)]
+#[test]
+fn a_child_past_its_bound_is_killed_and_refused() {
+    use std::process::Command;
+    use std::time::{Duration, Instant};
+    let begun = Instant::now();
+    let got =
+        support::bounded::output(Command::new("/bin/sleep").arg("30"), Duration::from_secs(1));
+    assert_eq!(
+        got.map(|_| ()).map_err(|e| e.kind()),
+        Err(std::io::ErrorKind::TimedOut)
+    );
+    assert!(
+        begun.elapsed() < Duration::from_secs(10),
+        "{:?}",
+        begun.elapsed()
+    );
+    let mut held =
+        support::bounded::spawn(Command::new("/bin/sleep").arg("30"), Duration::from_secs(1))
+            .unwrap();
+    let end = Instant::now() + Duration::from_secs(10);
+    while held.try_wait().unwrap().is_none() {
+        assert!(
+            Instant::now() < end,
+            "the watchdog never killed the watched child"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
 // Which multiplexers this run covers: each one's `-V` and binary, or why it is skipped. MUX_AGENTS_LIVE_REQUIRE
 // (`tmux,tmux32,rmux`, any subset) turns a skip into a failure, here and in every scenario.
 #[cfg(unix)]
@@ -795,10 +827,11 @@ exec claude --dangerously-skip-permissions
 
     /// True when a `less` runs below process `root`, by ps's parent links.
     fn pagers_under(root: u64) -> bool {
-        let out = Command::new("ps")
-            .args(["-axo", "pid=,ppid=,comm="])
-            .output()
-            .unwrap();
+        let out = crate::support::bounded::output(
+            Command::new("ps").args(["-axo", "pid=,ppid=,comm="]),
+            crate::support::bounded::LIMIT,
+        )
+        .unwrap();
         let rows: Vec<(u64, u64, String)> = String::from_utf8_lossy(&out.stdout)
             .lines()
             .filter_map(|l| {
@@ -821,10 +854,11 @@ exec claude --dangerously-skip-permissions
 
     /// `/dev/<tty>` of a process, by ps.
     fn tty_of(pid: u64) -> String {
-        let out = Command::new("ps")
-            .args(["-o", "tty=", "-p", &pid.to_string()])
-            .output()
-            .unwrap();
+        let out = crate::support::bounded::output(
+            Command::new("ps").args(["-o", "tty=", "-p", &pid.to_string()]),
+            crate::support::bounded::LIMIT,
+        )
+        .unwrap();
         format!("/dev/{}", String::from_utf8_lossy(&out.stdout).trim())
     }
 
@@ -1766,12 +1800,14 @@ exec claude --dangerously-skip-permissions
             (Some(0), format!("{p2}|{}", s(&w2["id"]))),
             "{mux:?}"
         );
-        let dead = Command::new(live.server.binary())
-            .arg("-S")
-            .arg(format!("{}.none", live.server.socket().display()))
-            .args(["-N", "display-message", "-p", "-t", p2, probe])
-            .output()
-            .unwrap();
+        let dead = crate::support::bounded::output(
+            Command::new(live.server.binary())
+                .arg("-S")
+                .arg(format!("{}.none", live.server.socket().display()))
+                .args(["-N", "display-message", "-p", "-t", p2, probe]),
+            crate::support::bounded::LIMIT,
+        )
+        .unwrap();
         assert_ne!(dead.status.code(), Some(0), "{mux:?}");
         assert_detached_running(&mut live, &w1);
         assert!(exit_messages(&live, &w2).is_empty());
@@ -2110,7 +2146,12 @@ exec claude --dangerously-skip-permissions
                         vec!["get", address, "--json"],
                         vec!["read", address, "--lines", "40"],
                     ] {
-                        let out = live.server.core.as_ref().map(|c| c.command(&args).output());
+                        let out = live.server.core.as_ref().map(|c| {
+                            crate::support::bounded::output(
+                                &mut c.command(&args),
+                                crate::support::bounded::LIMIT,
+                            )
+                        });
                         core.push_str(&format!(
                             "
 hc {}:
@@ -2676,10 +2717,11 @@ hc {}:
         let before = geometry(&live);
         manual_watch(&mut live, &root);
         let shell = live.field(&root, "#{pane_pid}");
-        let found = Command::new("pgrep")
-            .args(["-P", &shell, "-f", "watch"])
-            .output()
-            .unwrap();
+        let found = crate::support::bounded::output(
+            Command::new("pgrep").args(["-P", &shell, "-f", "watch"]),
+            crate::support::bounded::LIMIT,
+        )
+        .unwrap();
         let watch: u32 = String::from_utf8_lossy(&found.stdout)
             .trim()
             .parse()
@@ -3157,20 +3199,22 @@ hc {}:
     fn release_bin() -> PathBuf {
         let manifest = env!("CARGO_MANIFEST_DIR");
         let target = Path::new(manifest).join("target/live-release");
-        let out = Command::new(env!("CARGO"))
-            .current_dir(manifest)
-            .args([
-                "build",
-                "--release",
-                "--features",
-                "test-panic",
-                "--bin",
-                "mux-agent",
-                "--target-dir",
-            ])
-            .arg(&target)
-            .output()
-            .unwrap();
+        let out = crate::support::bounded::output(
+            Command::new(env!("CARGO"))
+                .current_dir(manifest)
+                .args([
+                    "build",
+                    "--release",
+                    "--features",
+                    "test-panic",
+                    "--bin",
+                    "mux-agent",
+                    "--target-dir",
+                ])
+                .arg(&target),
+            crate::support::bounded::HELD,
+        )
+        .unwrap();
         assert!(
             out.status.success(),
             "{}",
@@ -3924,7 +3968,7 @@ hc {}:
 
     /// A real tmux client attached to a session on a 120x40 pty, the master drained by a thread; killed on drop.
     struct Client {
-        child: std::process::Child,
+        child: crate::support::bounded::Watched,
         master: std::fs::File,
         // Every byte the client's terminal was sent, as the drain thread read it.
         seen: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
@@ -3994,7 +4038,8 @@ hc {}:
                     Ok(())
                 });
             }
-            let child = attach.spawn().unwrap();
+            let child =
+                crate::support::bounded::spawn(&mut attach, crate::support::bounded::HELD).unwrap();
             let master = std::fs::File::from(master);
             let mut drain = master.try_clone().unwrap();
             let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -4935,10 +4980,12 @@ hc {}:
             let read = |live: &Live| {
                 let hc = live.server.core.as_ref().unwrap();
                 String::from_utf8(
-                    hc.command(&["read", s(&grand["hcAddress"]), "--lines", "200"])
-                        .output()
-                        .unwrap()
-                        .stdout,
+                    crate::support::bounded::output(
+                        &mut hc.command(&["read", s(&grand["hcAddress"]), "--lines", "200"]),
+                        crate::support::bounded::LIMIT,
+                    )
+                    .unwrap()
+                    .stdout,
                 )
                 .unwrap()
             };

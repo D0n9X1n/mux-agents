@@ -11,6 +11,10 @@
 #[path = "support/private_core.rs"]
 mod private_core;
 
+// outcome-2 call 14: every child this harness starts is bounded.
+#[path = "support/bounded.rs"]
+mod bounded;
+
 // report-2b: the shared integration fixtures (private root, 150 s wait, deny_queries); occupy-3 uses them here.
 mod native;
 
@@ -22,6 +26,40 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
 use serde_json::Value;
+
+// outcome-2 call 14 (build checklist 4): a child past its bound is killed and refused `TimedOut` well before its own
+// end (`cmd.exe /C ping`, about 29 s); a watched child past its bound is killed by its watchdog. Needs no rmux.
+#[test]
+fn a_child_past_its_bound_is_killed_and_refused() {
+    let begun = Instant::now();
+    let mut pinger = Command::new("cmd.exe");
+    pinger.args(["/C", "ping", "-n", "30", "127.0.0.1"]);
+    let got = bounded::output(&mut pinger, Duration::from_secs(1));
+    assert_eq!(
+        got.map(|_| ()).map_err(|e| e.kind()),
+        Err(std::io::ErrorKind::TimedOut)
+    );
+    assert!(
+        begun.elapsed() < Duration::from_secs(10),
+        "{:?}",
+        begun.elapsed()
+    );
+    let mut held = bounded::spawn(
+        Command::new("ping")
+            .args(["-n", "30", "127.0.0.1"])
+            .stdout(std::process::Stdio::null()),
+        Duration::from_secs(1),
+    )
+    .unwrap();
+    let end = Instant::now() + Duration::from_secs(10);
+    while held.try_wait().unwrap().is_none() {
+        assert!(
+            Instant::now() < end,
+            "the watchdog never killed the watched child"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
 
 // Generous for loaded runners: a wait only runs this long when something is wrong.
 const WAIT: Duration = Duration::from_secs(60);
@@ -89,7 +127,7 @@ impl Live {
             dir,
             root: String::new(),
         };
-        match live.rmux().arg("-V").output() {
+        match crate::bounded::output(live.rmux().arg("-V"), crate::bounded::LIMIT) {
             Ok(out) if out.status.success() => {
                 eprintln!("rmux: {}", String::from_utf8_lossy(&out.stdout).trim());
             }
@@ -117,7 +155,7 @@ impl Live {
             "MUX_AGENTS_STATE",
             self.dir.join("state").as_os_str(),
         ));
-        let out = start.arg("cmd.exe").output().unwrap();
+        let out = crate::bounded::output(start.arg("cmd.exe"), crate::bounded::LIMIT).unwrap();
         assert!(out.status.success(), "new-session {name}: {out:?}");
         let pane = self
             .call(&["list-panes", "-t", name, "-F", "#{pane_id}"])
@@ -137,7 +175,7 @@ impl Live {
 
     /// `rmux -L <socket> <args>`; panics unless it succeeds, and answers its stdout.
     fn call(&self, args: &[&str]) -> String {
-        let out = self.rmux().args(args).output().unwrap();
+        let out = crate::bounded::output(self.rmux().args(args), crate::bounded::LIMIT).unwrap();
         assert!(out.status.success(), "rmux {args:?}: {out:?}");
         String::from_utf8_lossy(&out.stdout).into_owned()
     }
@@ -287,7 +325,7 @@ impl Drop for Live {
         // The fake clients quit when this file appears; then the server and its panes go.
         let _ = std::fs::write(self.dir.join("quit"), "");
         std::thread::sleep(Duration::from_millis(500));
-        let _ = self.rmux().arg("kill-server").output();
+        let _ = crate::bounded::output(self.rmux().arg("kill-server"), crate::bounded::LIMIT);
         if !core_stopped {
             let message = format!(
                 "private core stop failed; fixture kept at {}",
@@ -1096,11 +1134,11 @@ fn team_bar_draws_the_tree_and_opens_any_row() {
     let file = live.dir.join("peek-probe.txt");
     std::fs::write(&file, "probe").unwrap();
     let command = mux_agent::sidebar::popup_command(&s(&up["sidebar"]), file.to_str().unwrap());
-    let probe = live
-        .rmux()
-        .args(["run-shell", "-b", "-C", &command])
-        .output()
-        .unwrap();
+    let probe = crate::bounded::output(
+        live.rmux().args(["run-shell", "-b", "-C", &command]),
+        crate::bounded::LIMIT,
+    )
+    .unwrap();
     std::thread::sleep(Duration::from_secs(1));
     assert!(
         probe.status.success() && file.exists(),
@@ -1218,11 +1256,14 @@ fn team_bar_draws_the_tree_and_opens_any_row() {
     agent(grand_pid, &["@say", &marker]);
     let read = || {
         String::from_utf8(
-            live.core
-                .command(&["read", &s(&grand["hcAddress"]), "--lines", "200"])
-                .output()
-                .unwrap()
-                .stdout,
+            crate::bounded::output(
+                &mut live
+                    .core
+                    .command(&["read", &s(&grand["hcAddress"]), "--lines", "200"]),
+                crate::bounded::LIMIT,
+            )
+            .unwrap()
+            .stdout,
         )
         .unwrap()
     };

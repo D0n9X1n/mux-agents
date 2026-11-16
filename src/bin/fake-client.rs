@@ -44,6 +44,10 @@ use serde_json::{Map, Value, json};
 
 const POLL: Duration = Duration::from_millis(50);
 
+// outcome-2 call 23: this client's own children are bounded as the live harness's are.
+#[path = "../../tests/support/bounded.rs"]
+mod bounded;
+
 // The variables a client record carries; never the whole environment.
 const ENV: [&str; 11] = [
     "MUX_AGENTS_STATE",
@@ -231,10 +235,10 @@ impl Runner {
                 Err(e) => (Vec::new(), format!("fake-client: {e}\n").into_bytes(), -1),
             }
         } else {
-            let out = Command::new(&self.entry)
-                .args(&args)
-                .stdin(Stdio::null())
-                .output();
+            let out = bounded::output(
+                Command::new(&self.entry).args(&args).stdin(Stdio::null()),
+                bounded::LIMIT,
+            );
             match out {
                 Ok(o) => (o.stdout, o.stderr, o.status.code().unwrap_or(-1)),
                 Err(e) => (Vec::new(), format!("fake-client: {e}\n").into_bytes(), -1),
@@ -268,7 +272,8 @@ fn detach() -> std::io::Result<u32> {
             Ok(())
         });
     }
-    Ok(command.spawn()?.id())
+    // Its own `sleep 600` is its end; the watchdog bounds it to the same while this client runs.
+    Ok(bounded::spawn(&mut command, Duration::from_secs(600))?.id())
 }
 
 #[cfg(not(unix))]

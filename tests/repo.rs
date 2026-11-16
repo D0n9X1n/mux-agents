@@ -928,6 +928,26 @@ fn integration_runs_cli_tests_with_fake_client() {
     }
 }
 
+// outcome-2 call 14, build checklist 4 (o2 call 23): no live-harness child runs unbounded. Every child the live
+// harnesses and the fake client start goes through `tests/support/bounded.rs` (`output` or a watched `spawn`).
+#[test]
+fn live_harness_subprocesses_are_bounded() {
+    let calls = [".output()", ".spawn()", ".status()"];
+    for file in [
+        "tests/live.rs",
+        "tests/live_windows.rs",
+        "tests/support/mod.rs",
+        "src/bin/fake-client.rs",
+    ] {
+        let text = repo_file(file);
+        let bare: Vec<&str> = text
+            .lines()
+            .filter(|l| calls.iter().any(|c| l.contains(c)))
+            .collect();
+        assert!(bare.is_empty(), "{file}: unbounded child: {bare:?}");
+    }
+}
+
 // outcome-2 Task 7: every live job runs the fake client's own tests right after the CLI tests, then its live tests.
 #[test]
 fn integration_runs_the_fake_client_tests() {
