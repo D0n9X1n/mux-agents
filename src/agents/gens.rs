@@ -486,20 +486,26 @@ impl Gen {
         self.status_given(None)
     }
 
-    /// b-calls 11, 33: every generation `named` lists that is neither active nor pending and not done by S6
-    /// (`gens::done`: a done marker, and `record.completing` not naming it). Each holds the member's name and slot
-    /// until the fence or `terminate` ends it. Unreadable is `Err` (R2).
-    pub fn orphans(&self) -> Res<Vec<u64>> {
-        let mut open = Vec::new();
+    /// Calls 11, 33, 61: every generation `named` lists that is neither active nor pending, with whether it is done
+    /// by S6 (`gens::done`). Not done: an orphan, which holds the member's name and slot; done: a done orphan, whose
+    /// listed hc terminal holds nothing. Unreadable is `Err` (R2).
+    pub fn unnamed(&self) -> Res<Vec<(u64, bool)>> {
+        let mut all = Vec::new();
         for n in named(&self.folder)? {
             if Some(n) == self.active || Some(n) == self.pending {
                 continue;
             }
-            if !done(&self.folder, n)? {
-                open.push(n);
-            }
+            all.push((n, done(&self.folder, n)?));
         }
-        Ok(open)
+        Ok(all)
+    }
+
+    /// b-calls 11, 33: every generation `named` lists that is neither active nor pending and not done by S6
+    /// (`gens::done`: a done marker, and `record.completing` not naming it). Each holds the member's name and slot
+    /// until the fence or `terminate` ends it. Unreadable is `Err` (R2).
+    pub fn orphans(&self) -> Res<Vec<u64>> {
+        let open = self.unnamed()?.into_iter().filter(|(_, done)| !done);
+        Ok(open.map(|(n, _)| n).collect())
     }
 
     /// settle-1b G5, b-calls 10, 23: no generation ran. A3a's rule (`Status::never_ran`, call 17: no active

@@ -1321,3 +1321,47 @@ fn admission_reserves_orphans_and_an_active_generation_keeps_its_slot() {
         );
     }
 }
+
+// Call 61 (TL #144 F3, QA #144 F3): a done orphan (settle aborted or abandoned it, so it is no longer pending) whose
+// terminal hc still lists Running holds no name and no slot, in `take` and in `for_spawn`.
+#[test]
+fn a_done_orphan_hc_still_lists_holds_nothing() {
+    use crate::agents::settle::{Mode, Outcome};
+    use crate::agents::team_state::Tx;
+    use crate::agents::{core_fixture as cf, fixture::ID, gens, life_fixture as lf};
+    for (case, claim) in [("aborted", Some("run")), ("abandoned", None)] {
+        for spawn in [true, false] {
+            let (w, s) = lf::world();
+            let m = lf::life(&w, json!({"pending": lf::pending(0)}));
+            lf::seed_gen(&m, 0, claim, None);
+            let got = Tx {
+                ctx: &w.ctx,
+                scope: s.clone(),
+            }
+            .settle(ID, Mode::Fence)
+            .unwrap();
+            assert_eq!(got, Outcome::Done, "{case}");
+            assert!(gens::done(&m, 0).unwrap(), "{case}: done");
+            assert!(
+                lf::record(&m).get("pending").is_none(),
+                "{case}: pending dropped"
+            );
+            cf::online(&w);
+            cf::listing(&w, &lf::team(&w), &["t0"]);
+            lf::get(&w, "t0", &lf::running(&w, 0));
+            w.panes(&[]);
+            let snap = if spawn {
+                let core = crate::hc::connect(&w.ctx).unwrap();
+                Snapshot::for_spawn(&w.ctx, &w.caller(), &core).unwrap()
+            } else {
+                Snapshot::take(&w.ctx, &w.caller()).unwrap()
+            };
+            let c = format!("{case} spawn {spawn}");
+            assert_eq!(snap.facts.count(), 0, "{c}: slots");
+            assert!(
+                !snap.facts.names().contains(&"worker".to_string()),
+                "{c}: name"
+            );
+        }
+    }
+}

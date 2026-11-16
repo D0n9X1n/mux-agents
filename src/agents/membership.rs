@@ -104,8 +104,13 @@ fn scan(ctx: &Ctx, caller: &Caller) -> Res<Scan> {
                     .get("name")
                     .and_then(Value::as_str)
                     .unwrap_or_default();
-                for n in g.orphans()? {
-                    orphans.push((id.clone(), n.to_string(), name.to_owned()));
+                // Call 61: a done orphan is skipped (its listed terminal holds nothing), never reserved.
+                for (n, done) in g.unnamed()? {
+                    if done {
+                        freed.push((id.clone(), n.to_string()));
+                    } else {
+                        orphans.push((id.clone(), n.to_string(), name.to_owned()));
+                    }
                 }
                 life_local(g, &s, &id, &team(caller))?
             }
