@@ -117,6 +117,7 @@ fn prove(ctx: &Ctx) -> Res<Option<Caller>> {
             agent_tag: id.into(),
             member: proven.then(|| id.to_string()),
             candidate: (!proven).then(|| id.to_string()),
+            presentation: Some((pane.into(), window.into())),
         })
     };
     Ok(read())

@@ -56,6 +56,11 @@ fn hc_worker_routes_without_mux_ancestry() {
         (caller::Kind::Agent, "%9", "@5", ID)
     );
     assert_eq!(
+        got.presentation,
+        Some(("%9".to_string(), "@5".to_string())),
+        "a presented member"
+    );
+    assert_eq!(
         (
             got.socket,
             got.server_pid,

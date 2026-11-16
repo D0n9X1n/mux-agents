@@ -843,6 +843,7 @@ mod tests {
             agent_tag: String::new(),
             member: None,
             candidate: None,
+            presentation: Some(("%1".into(), "@1".into())),
         }
     }
 
