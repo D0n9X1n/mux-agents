@@ -670,6 +670,8 @@ pub fn unclear(message: &str) -> Refusal {
 pub enum Found {
     One(Terminal),
     Unknown(Refusal),
+    /// Call 60: no terminal of the generation matches (the only answer a forgotten-kill replay may act on).
+    Missing(Refusal),
 }
 
 /// Ambiguity 1: the terminals labelled `mux.id=<id>, mux.gen=<n>` whose name is the recorded `hcName`; exactly
@@ -691,6 +693,9 @@ pub fn find(core: &Core<'_>, id: &str, n: u64, hc_name: &str) -> Found {
         {
             hits.push(t);
         }
+    }
+    if hits.is_empty() {
+        return Found::Missing(unclear("hc shows no terminal of the generation"));
     }
     match <[Terminal; 1]>::try_from(hits) {
         Ok([t]) => Found::One(t),
@@ -2033,12 +2038,16 @@ mod b_tests {
                     "one: {got:?}"
                 );
             } else {
-                let Found::Unknown(e) = got else {
+                // Call 60: nothing listed, or nothing listed matching the identity: no terminal matches.
+                let none = case == "none" || case.starts_with("another");
+                assert_eq!(matches!(got, Found::Missing(_)), none, "{case}: missing");
+                let (Found::Unknown(e) | Found::Missing(e)) = got else {
                     panic!("{case}: matched")
                 };
                 let want = match case {
                     "ls fails" => "cannot list",
                     "get fails" => "cannot show",
+                    _ if none => "no terminal",
                     _ => "not one",
                 };
                 assert_eq!(e.check, "hc", "{case}");

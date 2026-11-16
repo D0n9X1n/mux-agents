@@ -26,6 +26,9 @@ pub enum Outcome {
     Promoted,
     Running(Terminal),
     Unknown(Refusal),
+    /// G3 row 6: no terminal matches the generation's recorded identity (call 60), with the launch's hcName.
+    /// Reserved like Unknown; the only outcome `terminate` may take as a kill hc forgot.
+    Missing(String, Refusal),
 }
 
 impl PartialEq for Outcome {
@@ -34,6 +37,7 @@ impl PartialEq for Outcome {
             (Outcome::Done, Outcome::Done) => true,
             (Outcome::Promoted, Outcome::Promoted) => true,
             (Outcome::Running(a), Outcome::Running(b)) => a.address == b.address,
+            (Outcome::Missing(a, x), Outcome::Missing(b, y)) => a == b && x.check == y.check,
             (Outcome::Unknown(a), Outcome::Unknown(b)) => a.check == b.check,
             _ => false,
         }
@@ -275,6 +279,7 @@ fn row6(at: &At<'_, '_>, term: &Evidence, launch: &Evidence) -> Res<Outcome> {
     let t = match gens::find(core, at.id, at.n, hc_name) {
         Found::One(t) => t,
         Found::Unknown(e) => return Ok(Outcome::Unknown(e)),
+        Found::Missing(e) => return Ok(Outcome::Missing(hc_name.to_owned(), e)),
     };
     // Ambiguity 2: the team `forward` gave `hc run`, never the record's.
     let Some(team) = t.labels.get("mux.team").cloned() else {
@@ -379,7 +384,9 @@ pub fn terminate(tx: &Tx<'_>, id: &str, n: u64) -> Res<()> {
     // G11.1, G11.2: Fence never promotes. Done (rows 0, 0r, 1-5; Lost released; Ended recorded) is Ok.
     let t = match settle_gen(tx, &lazy, id, n, Mode::Fence, pending)? {
         Outcome::Done | Outcome::Promoted => return Ok(()),
-        Outcome::Unknown(e) => return forgotten(tx, &lazy, id, n, pending, e),
+        // Call 60: only "no terminal matches" may be a kill hc forgot; every other Unknown stays unresolved.
+        Outcome::Missing(hc_name, e) => return forgotten(tx, &lazy, id, n, &r, &hc_name, e),
+        Outcome::Unknown(e) => return Err(e),
         Outcome::Running(t) => t,
     };
     if pending {
@@ -435,28 +442,49 @@ fn end_by_kill(
     Ok(())
 }
 
-/// Call 54 replay: `settle_gen` was Unknown. With a recorded `kill.json` and hc answering `not_found` at its
-/// address, the kill landed and hc forgot the terminal: the same end is recorded. Otherwise `e` stands (no
-/// `kill.json`: `not_found` stays unresolved, the documented limit).
-fn forgotten(tx: &Tx<'_>, lazy: &Lazy<'_>, id: &str, n: u64, pending: bool, e: Refusal) -> Res<()> {
+/// Calls 54, 55, 60 replay: settle found no terminal of generation n (`Outcome::Missing`). Only a valid recorded
+/// attempt of this generation counts: `kill.json`'s labels carry `mux.id` `id` and `mux.gen` n, its `hcName` is the
+/// launch's, and its address is the one the record names for n (pending's, or the active one's). hc `not_found`
+/// there records the kill path's end. Anything else leaves `e`: no attempt, a foreign or invalid one, a generation
+/// the record names no address for (an orphan), or any other hc answer.
+fn forgotten(
+    tx: &Tx<'_>,
+    lazy: &Lazy<'_>,
+    id: &str,
+    n: u64,
+    r: &Value,
+    hc_name: &str,
+    e: Refusal,
+) -> Res<()> {
     let Some(k) = gens::read_flushed(&tx.folder(id), n, "kill")? else {
         return Err(e);
     };
-    let text = |f: &str| {
-        k.get(f)
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_owned()
+    let Some(labels) = k.get("labels").and_then(|l| {
+        serde_json::from_value::<std::collections::BTreeMap<String, String>>(l.clone()).ok()
+    }) else {
+        return Err(e);
     };
-    let (address, hc_name) = (text("address"), text("hcName"));
-    // Call 55: the matched terminal's labels, recorded with the attempt, so this end is the kill path's.
-    let labels: std::collections::BTreeMap<String, String> = k
-        .get("labels")
-        .and_then(|l| serde_json::from_value(l.clone()).ok())
-        .ok_or_else(|| Refusal::internal("kill.json has no labels"))?;
-    match lazy.get()?.get(&address) {
+    let pending = gens::pending(r) == Some(n);
+    let recorded = if pending {
+        r["pending"]["hcAddress"].as_str()
+    } else if gens::active(r) == Some(n) {
+        r["hcAddress"].as_str()
+    } else {
+        None
+    };
+    let text = |f: &str| k.get(f).and_then(Value::as_str);
+    let label = |l: &str| labels.get(l).map(String::as_str);
+    let generation = n.to_string();
+    let ours = !hc_name.is_empty()
+        && text("hcName") == Some(hc_name)
+        && label("mux.id") == Some(id)
+        && label("mux.gen") == Some(generation.as_str());
+    let (Some(address), true) = (recorded.filter(|a| text("address") == Some(*a)), ours) else {
+        return Err(e);
+    };
+    match lazy.get()?.get(address) {
         Err(g) if g.check == "not_found" => {
-            end_by_kill(tx, id, n, pending, &address, &hc_name, &labels)
+            end_by_kill(tx, id, n, pending, address, hc_name, &labels)
         }
         _ => Err(e),
     }
@@ -1043,7 +1071,10 @@ mod tests {
             if case == "moved exe" {
                 assert_eq!(got, Outcome::Promoted, "{case}");
             } else {
-                assert!(matches!(got, Outcome::Unknown(_)), "{case}: {got:?}");
+                assert!(
+                    matches!(got, Outcome::Unknown(_) | Outcome::Missing(..)),
+                    "{case}: {got:?}"
+                );
                 assert!(lf::record(&m).get("pending").is_some(), "{case}");
             }
         }
@@ -1233,7 +1264,7 @@ mod tests {
                         );
                     } else {
                         assert!(
-                            matches!(&got, Outcome::Unknown(e) if e.check == "hc"),
+                            matches!(&got, Outcome::Unknown(e) | Outcome::Missing(_, e) if e.check == "hc"),
                             "{c}: {got:?}"
                         );
                     }
@@ -1894,6 +1925,71 @@ mod tests {
             assert!(!g.never_ran_recorded(&st).unwrap(), "{life}: it ran");
             assert!(st.finished, "{life}");
             w.fakes.hc_done().unwrap();
+        }
+    }
+
+    // Call 60 (TL #144 F1, F2; QA #144 F1): a forgotten-kill replay acts only when settle finds no terminal of the
+    // generation and kill.json is this generation's valid attempt: its labels' mux.id and mux.gen, the launch's
+    // hcName, and the address the record names for it. A foreign attempt, an evidence refusal (torn launch.json; a
+    // torn claim beside a foreign attempt) or several live matches stay unresolved: no ended.json, pending kept, though
+    // hc would answer `not_found` at the attempt's address.
+    #[test]
+    fn a_kill_replay_acts_only_on_this_generations_attempt_with_no_match() {
+        let attempt = |w: &World, id: &str, n: u64, name: &str, address: &str| {
+            let mut labels = lf::running(w, 1)["labels"].clone();
+            labels["mux.id"] = json!(id);
+            labels["mux.gen"] = json!(n.to_string());
+            json!({"address": address, "hcName": name, "labels": labels, "at": "x"})
+        };
+        for case in [
+            "foreign member",
+            "foreign generation",
+            "foreign name",
+            "foreign address",
+            "torn launch",
+            "torn claim, foreign attempt",
+            "several matches",
+        ] {
+            let (w, s) = lf::world();
+            let m = committed_of(&w, "spawn");
+            let body = match case {
+                "foreign member" => attempt(&w, "bbbbbbbbbbbb", 1, &lf::hc_name(1), "t1"),
+                "foreign generation" | "torn claim, foreign attempt" => {
+                    attempt(&w, ID, 2, &lf::hc_name(2), "t2")
+                }
+                "foreign name" => attempt(&w, ID, 1, &lf::hc_name(9), "t1"),
+                "foreign address" => attempt(&w, ID, 1, &lf::hc_name(1), "t9"),
+                _ => attempt(&w, ID, 1, &lf::hc_name(1), "t1"),
+            };
+            gens::publish_once(&m, 1, "kill", &body).unwrap();
+            match case {
+                "torn launch" => torn(&gens::path(&m, 1, "launch")),
+                "torn claim, foreign attempt" => torn(&gens::claim_path(&m, 1)),
+                _ => {}
+            }
+            cf::online(&w);
+            match case {
+                "torn launch" | "torn claim, foreign attempt" => {}
+                "several matches" => {
+                    lf::ls(&w, 1, &["t1", "t9"]);
+                    lf::get(&w, "t1", &lf::running(&w, 1));
+                    lf::get(&w, "t9", &lf::running(&w, 1));
+                }
+                _ => lf::ls(&w, 1, &[]),
+            }
+            // What a replay would ask at the attempt's address: hc forgot it.
+            lf::gone(&w, body["address"].as_str().unwrap());
+            let got = terminate(&tx(&w, &s), ID, 1);
+            assert!(got.is_err(), "{case}: resolved");
+            assert_eq!(
+                gens::read(&m, 1, "ended"),
+                Evidence::Absent,
+                "{case}: an end recorded"
+            );
+            assert!(
+                lf::record(&m).get("pending").is_some(),
+                "{case}: pending dropped"
+            );
         }
     }
 }
