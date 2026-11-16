@@ -65,3 +65,39 @@ pub fn void(w: &World, id: &str, from: &str, parent: &str) {
     crate::state::fs::write_json(&m.join("record.json"), &r).unwrap();
     lf::seed_gen(&m, 0, Some("abandoned"), None);
 }
+
+/// The journal file of `root` in the caller's scope.
+pub fn journal_of(w: &World, root: &str) -> PathBuf {
+    super::cascade::dir_at(&w.ctx, &Scope::of(&w.caller())).join(format!("{root}.json"))
+}
+/// A journal of `root` listing `ids` deepest first, each the parent of the one before (the last is the root).
+pub fn body(root: &str, ids: &[&str], prepared: bool) -> super::cascade::Journal {
+    let entries = (ids.iter().enumerate())
+        .map(|(i, id)| super::cascade::Entry {
+            id: id.to_string(),
+            name: name(id),
+            parents: ids
+                .get(i + 1)
+                .map(|p| vec![p.to_string()])
+                .unwrap_or_default(),
+            gens: vec![1],
+        })
+        .collect();
+    super::cascade::Journal {
+        root: root.into(),
+        entries,
+        prepared,
+        removing: false,
+    }
+}
+/// `body`, published.
+pub fn seed(w: &World, root: &str, ids: &[&str], prepared: bool) -> super::cascade::Journal {
+    let j = body(root, ids, prepared);
+    let s = Scope::of(&w.caller());
+    super::cascade::publish(&tx(w, &s), &j).unwrap();
+    j
+}
+/// The next `release::halt(step)` refuses `halted` (the text is leaked: `halt_after` takes `&'static str`).
+pub fn at(step: &str) {
+    super::release::halt_after(Some(Box::leak(step.to_owned().into_boxed_str())));
+}
