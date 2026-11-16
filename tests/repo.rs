@@ -789,6 +789,36 @@ const TEST_ONLY: &[(&str, &str, &str)] = &[
     ),
     ("src/agents/board/tests.rs", "src/agents/board.rs", "tests"),
     (
+        "src/agents/notebook/tests.rs",
+        "src/agents/notebook.rs",
+        "tests",
+    ),
+    (
+        "src/agents/notebook/fault_tests.rs",
+        "src/agents/notebook.rs",
+        "fault_tests",
+    ),
+    (
+        "src/agents/notebook/rebuild_tests.rs",
+        "src/agents/notebook.rs",
+        "rebuild_tests",
+    ),
+    (
+        "src/agents/notebook/verb_tests.rs",
+        "src/agents/notebook.rs",
+        "verb_tests",
+    ),
+    (
+        "src/agents/notebook/notes_tests.rs",
+        "src/agents/notebook.rs",
+        "notes_tests",
+    ),
+    (
+        "src/agents/message/peek_tests.rs",
+        "src/agents/message.rs",
+        "peek_tests",
+    ),
+    (
         "src/agents/cascade/tests.rs",
         "src/agents/cascade.rs",
         "tests",
@@ -3402,6 +3432,26 @@ fn skill_teaches_team_messaging() {
         "hop 4",
         "120 messages",
         "-Id <id>",
+    ] {
+        assert!(skill.contains(want), "SKILL.md lacks {want}");
+    }
+}
+
+#[test]
+fn skill_teaches_the_notebook_and_peek() {
+    let skill = repo_file("skills/mux-agents/SKILL.md");
+    for want in [
+        r#""<entry>" note -Title <title> -BodyFile <body-file>"#,
+        r#""<entry>" note -Title <title> -BodyFile <body-file> -Id <id>"#,
+        r#""<entry>" notes"#,
+        r#""<entry>" notes <id>"#,
+        r#""<entry>" peek <name> -Lines <n>"#,
+        "## Team notebook",
+        "retry it with the same `-Id <id>`",
+        "the notebook is not yet on disk; retry",
+        "Listing marks nothing read",
+        "Only a person of the team or an ancestor of the member can peek",
+        "Nothing is typed into its pane",
     ] {
         assert!(skill.contains(want), "SKILL.md lacks {want}");
     }

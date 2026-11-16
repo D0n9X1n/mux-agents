@@ -10,3 +10,13 @@ a_managed_copilot_resumed_into_a_conversation_holds_it
 a_managed_member_resumed_into_a_conversation_holds_it
 # cascade-3d Task 12: restarts the private core mid-test; run alone.
 a_cascade_stop_ends_b_before_a_and_a_second_stop_finishes
+# notebook-7a (PM calls 5, 11): live tests that run `up`, as `serial_resume::every_live_up_test_is_listed` reports them.
+members_spawn_and_act_only_down_the_tree
+team_bar_draws_the_tree_and_opens_any_row
+team_messaging_stays_in_the_team
+up_creates_a_team_in_a_new_session
+up_runs_the_leader_with_options_then_session_then_prompt
+up_whose_view_panics_keeps_the_leader_under_hostile_settings
+notebook_and_peek_stay_in_the_team
+# v0.3-life integration with notebook-7a: a base live test that runs up, found by every_live_up_test_is_listed.
+members_mail_without_the_multiplexer

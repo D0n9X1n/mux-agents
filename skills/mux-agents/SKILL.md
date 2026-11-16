@@ -55,6 +55,11 @@ The commands below, and the Reply and Listen lines, run as-is in the Bash tool. 
 "<entry>" report done
 "<entry>" notify -On
 "<entry>" read <name> -Lines <n>
+"<entry>" note -Title <title> -BodyFile <body-file>
+"<entry>" note -Title <title> -BodyFile <body-file> -Id <id>
+"<entry>" notes
+"<entry>" notes <id>
+"<entry>" peek <name> -Lines <n>
 "<entry>" stop <name>
 "<entry>" resume <name>
 "<entry>" sidebar
@@ -72,6 +77,12 @@ The commands below, and the Reply and Listen lines, run as-is in the Bash tool. 
 - `team` and `children` are one message id to each recipient. Answer a message with `-Re <its id>`, to its sender only (a name, `parent` or `leader`); a reply that would be hop 4 is refused, and a broadcast cannot be answered with a broadcast.
 - At most 120 messages per hour; past that, `send` refuses with `retryAt`.
 - When `send` fails with `check` `mail`, run the same send again with `-Id <id>` from the reply: it finishes that send, never a new one.
+
+## Team notebook
+
+Every member and person of a team shares one notebook. `note -Title <title> -BodyFile <body-file>` adds an entry (title at most 80 characters, body at most 4 KB) and answers its `id`. If it answers `the note could not be saved; retry with -Id <id>`, retry it with the same `-Id <id>`: the note is then saved once, never twice. `notes` lists the newest 20 titles (`-Lines <n>`, `-Since <id>` for those after an entry); `notes <id>` prints one entry in full. Listing marks nothing read. `the notebook is not yet on disk; retry` means nothing was listed or saved: run the same command again.
+
+`peek <name>` shows the last lines of a team member's live pane (60 by default, `-Lines <n>` up to 2000). Only a person of the team or an ancestor of the member can peek it, and only inside one team. Nothing is typed into its pane and focus does not move.
 
 ## Listening
 

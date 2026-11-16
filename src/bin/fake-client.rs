@@ -38,7 +38,7 @@
 //!   exit with numeric `quit.<pid>` contents overriding `MUX_IT_EXIT`; empty, invalid or missing contents keep it.
 
 use std::ffi::OsString;
-use std::io::{BufRead, IsTerminal, Write};
+use std::io::{IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::Duration;
@@ -198,10 +198,39 @@ fn main() {
     }
 
     let input = dir.join(format!("input.{pid}.log"));
+    let raw = dir
+        .join("raw-input")
+        .exists()
+        .then(|| dir.join(format!("input.{pid}.raw")));
     std::thread::spawn(move || {
-        for line in std::io::stdin().lock().lines() {
-            let Ok(line) = line else { break };
-            append(&input, &format!("{}\n", line.trim_end_matches('\r')));
+        // With `raw-input`: keys arrive without Enter (the terminal made non-canonical), each byte is kept in
+        // `input.<pid>.raw`, and a CR ends a line as an LF does. The line log is kept either way; at EOF an
+        // unterminated last line is written, as `BufRead::lines` did (checklist 11).
+        let cooked = raw.is_none() || !uncook();
+        let mut stdin = std::io::stdin().lock();
+        let (mut buf, mut line, mut after_cr) = ([0u8; 256], Vec::new(), false);
+        while let Ok(n) = stdin.read(&mut buf) {
+            if n == 0 {
+                break;
+            }
+            if let Some(raw) = &raw {
+                append_bytes(raw, &buf[..n]);
+            }
+            for &b in &buf[..n] {
+                let ends = b == b'\n' || (!cooked && b == b'\r');
+                if ends && !(b == b'\n' && after_cr && line.is_empty() && !cooked) {
+                    let text = String::from_utf8_lossy(&line);
+                    append(&input, &format!("{}\n", text.trim_end_matches('\r')));
+                    line.clear();
+                } else if !ends {
+                    line.push(b);
+                }
+                after_cr = b == b'\r';
+            }
+        }
+        if !line.is_empty() {
+            let text = String::from_utf8_lossy(&line);
+            append(&input, &format!("{}\n", text.trim_end_matches('\r')));
         }
     });
 
@@ -357,6 +386,48 @@ fn write_whole(path: &Path, bytes: impl AsRef<[u8]>) {
     let tmp = PathBuf::from(tmp);
     if std::fs::write(&tmp, bytes).is_ok() {
         let _ = std::fs::rename(&tmp, path);
+    }
+}
+
+/// Non-canonical input on this process's terminal (keys arrive without Enter); false when that cannot be set.
+#[cfg(unix)]
+fn uncook() -> bool {
+    // SAFETY: `t` is a termios for fd 0, read before it is written.
+    unsafe {
+        let mut t: libc::termios = std::mem::zeroed();
+        if libc::tcgetattr(0, &mut t) != 0 {
+            return false;
+        }
+        t.c_lflag &= !libc::ICANON;
+        t.c_cc[libc::VMIN] = 1;
+        t.c_cc[libc::VTIME] = 0;
+        libc::tcsetattr(0, libc::TCSANOW, &t) == 0
+    }
+}
+
+/// The console's line input off (echo goes with it: Windows echoes only in line mode).
+#[cfg(windows)]
+fn uncook() -> bool {
+    use windows_sys::Win32::System::Console::{
+        ENABLE_ECHO_INPUT, ENABLE_LINE_INPUT, GetConsoleMode, GetStdHandle, STD_INPUT_HANDLE,
+        SetConsoleMode,
+    };
+    // SAFETY: the standard input handle is this process's; `mode` outlives both calls.
+    unsafe {
+        let h = GetStdHandle(STD_INPUT_HANDLE);
+        let mut mode = 0;
+        GetConsoleMode(h, &mut mode) != 0
+            && SetConsoleMode(h, mode & !(ENABLE_LINE_INPUT | ENABLE_ECHO_INPUT)) != 0
+    }
+}
+
+fn append_bytes(path: &Path, bytes: &[u8]) {
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
+        let _ = file.write_all(bytes);
     }
 }
 
