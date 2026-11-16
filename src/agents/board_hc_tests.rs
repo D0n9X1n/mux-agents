@@ -281,3 +281,245 @@ fn the_first_list_after_a_natural_exit_shows_the_recorded_end() {
         w.fakes.hc_done().unwrap();
     }
 }
+
+// outcome-2 Task 6 fixture: a lifecycle member `id` named `name` at active generation 1, claim `run`, commit, launch.json,
+// plus `extra` files; hc shows it Lost (POSIX recovery shell) or, with `ended`, finished exit 1. Answers its record and
+// its hc wire.
+fn life(w: &World, id: &str, name: &str, extra: &[(&str, Value)], ended: bool) -> (Value, Value) {
+    use crate::{agents::gens, state::evidence::publish};
+    let hc = format!("m{}", &id[4..]);
+    let r = cf::member(
+        w,
+        id,
+        json!({"lifecycle": 1, "generation": "1", "hcName": hc, "name": name}),
+    );
+    let f = w.folder(id);
+    gens::publish_claim_once(&f, 1, &json!("run")).unwrap();
+    publish(&gens::path(&f, 1, "commit"), &json!({"committed": true})).unwrap();
+    let launch =
+        json!({"hcName": hc, "launcherArgv": r["launcherArgv"], "sessionId": r["sessionId"]});
+    publish(&gens::path(&f, 1, "launch"), &launch).unwrap();
+    for (file, body) in extra {
+        publish(&gens::path(&f, 1, file), body).unwrap();
+    }
+    let mut t = cf::wire(&r);
+    t["name"] = json!(hc);
+    if ended {
+        t["state"] = json!("finished");
+        t["reason"] = json!("exited");
+        t["exit_code"] = json!(1);
+    } else {
+        t["argv"] = json!(["/bin/sh", "-l"]);
+    }
+    (r, t)
+}
+/// `ended.json` of the member `r` (first facts stand: group B's `record_end` keeps it).
+fn end_facts(r: &Value) -> Value {
+    json!({"address": r["hcAddress"], "hcName": r["hcName"], "labels": {}, "state": "finished", "reason": "exited",
+        "exitCode": 1, "at": "x"})
+}
+/// Member `id` Ended by recorded evidence (its `ended.json`), so it stays Ended past hc forgetting it.
+fn recorded_end(w: &World, id: &str, r: &Value) {
+    let at = crate::agents::gens::path(&w.folder(id), 1, "ended");
+    crate::state::evidence::publish(&at, &end_facts(r)).unwrap();
+}
+fn script(w: &World, members: &[&(Value, Value)]) {
+    cf::online(w);
+    cf::listing(w, &membership::team(&w.caller()), &[]);
+    for (r, t) in members {
+        cf::get(w, r["hcAddress"].as_str().unwrap(), t.clone());
+    }
+    w.panes(&[]);
+}
+fn row<'a>(got: &'a Map<String, Value>, name: &str) -> &'a Value {
+    got["agents"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["name"] == name)
+        .unwrap_or(&Value::Null)
+}
+fn flags(row: &Value) -> (&Value, &Value, &Value, &Value) {
+    (
+        &row["needsRecovery"],
+        &row["recoveryReason"],
+        &row["recoveryRunning"],
+        &row["recoveryError"],
+    )
+}
+fn exit_1() -> (&'static str, Value) {
+    (
+        "exit",
+        json!({"exitCode": 1, "reason": "exited", "exitedAt": "x"}),
+    )
+}
+fn outcome_ok() -> (&'static str, Value) {
+    ("outcome", json!({"outcome": "ok", "at": "x"}))
+}
+fn torn_outcome(w: &World, id: &str) {
+    let at = crate::agents::gens::path(&w.folder(id), 1, "outcome");
+    std::fs::write(at, b"{\"out").unwrap();
+}
+
+// O6, ambiguity 14, finding #12: a failed active generation is flagged with its reason and `recoveryRunning`
+// (Status.active_done); a torn outcome.json is `recoveryError: "evidence"` on that row only. The healthy sibling's row
+// carries no recovery field either way, and the board still answers.
+#[test]
+fn the_board_flags_a_failed_active_generation_for_recovery() {
+    use crate::agents::outcome::EXITED;
+    for torn in [false, true] {
+        let w = World::human("");
+        let bad = life(&w, "aaaaaaaaaaaa", "bad", &[exit_1()], false);
+        let good = life(&w, "bbbbbbbbbbbb", "good", &[outcome_ok()], false);
+        if torn {
+            torn_outcome(&w, "aaaaaaaaaaaa");
+        }
+        script(&w, &[&bad, &good]);
+        let got = board(&w.ctx, &w.caller(), false, false).unwrap();
+        let want = if torn {
+            (&Value::Null, &Value::Null, &Value::Null, &json!("evidence"))
+        } else {
+            (&json!(true), &json!(EXITED), &json!(true), &Value::Null)
+        };
+        assert_eq!(flags(row(&got, "bad")), want, "torn {torn}: bad");
+        let none = (&Value::Null, &Value::Null, &Value::Null, &Value::Null);
+        assert_eq!(
+            flags(row(&got, "good")),
+            none,
+            "torn {torn}: the healthy sibling"
+        );
+    }
+}
+
+// Ambiguity 14, finding #13: an Ended member that needs recovery, or whose recovery cannot be decided (torn
+// outcome.json → `recoveryError`), stays on the board without -All.
+#[test]
+fn an_ended_member_that_needs_recovery_or_has_an_error_stays_on_the_board() {
+    use crate::agents::outcome::EXITED;
+    for torn in [false, true] {
+        let w = World::human("");
+        let e = life(&w, "aaaaaaaaaaaa", "e", &[exit_1()], true);
+        recorded_end(&w, "aaaaaaaaaaaa", &e.0);
+        if torn {
+            torn_outcome(&w, "aaaaaaaaaaaa");
+        }
+        script(&w, &[&e]);
+        let got = board(&w.ctx, &w.caller(), false, false).unwrap();
+        assert!(
+            !row(&got, "e").is_null(),
+            "torn {torn}: listed without -All"
+        );
+        let want = if torn {
+            (&Value::Null, &Value::Null, &Value::Null, &json!("evidence"))
+        } else {
+            (&json!(true), &json!(EXITED), &json!(false), &Value::Null)
+        };
+        assert_eq!(flags(row(&got, "e")), want, "torn {torn}");
+    }
+}
+
+// Call 11, finding #3: a lifecycle record's stored `needsRecovery: true` is ignored (its active generation is ok);
+// only `needs_recovery` decides. (A pre-lifecycle record keeps the stored flag: main's board.rs test, unchanged.)
+#[test]
+fn a_stale_stored_flag_on_a_lifecycle_record_is_ignored() {
+    let w = World::human("");
+    let m = life(&w, "aaaaaaaaaaaa", "stale", &[outcome_ok()], false);
+    let at = w.folder("aaaaaaaaaaaa").join("record.json");
+    let mut r: Value = serde_json::from_slice(&std::fs::read(&at).unwrap()).unwrap();
+    r["needsRecovery"] = json!(true);
+    write(&at, r);
+    script(&w, &[&m]);
+    let got = board(&w.ctx, &w.caller(), false, true).unwrap();
+    assert_eq!(
+        row(&got, "stale")["needsRecovery"],
+        Value::Null,
+        "stale stored flag"
+    );
+}
+
+// Call 12, finding #4: active generation 1 failed, pending generation 2 unfinished and uncommitted (a held subject,
+// `Stored.committed` false): recovery comes from the active generation before the committed-subject filter, so the
+// member is listed as needing recovery.
+#[test]
+fn a_held_member_whose_active_generation_failed_is_listed() {
+    use crate::agents::outcome::EXITED;
+    let w = World::human("");
+    let (r, _) = life(&w, "aaaaaaaaaaaa", "held", &[exit_1()], false);
+    let at = w.folder("aaaaaaaaaaaa").join("record.json");
+    let mut stored: Value = serde_json::from_slice(&std::fs::read(&at).unwrap()).unwrap();
+    stored["pending"] = json!({"gen": 2, "kind": "resume", "hcName": "m00000002", "sessionId": r["sessionId"],
+        "launcherArgv": r["launcherArgv"], "hcAddress": "t2"});
+    write(&at, stored);
+    let mut t2 = cf::wire(&r);
+    t2["address"] = json!("t2");
+    t2["name"] = json!("m00000002");
+    t2["labels"]["mux.gen"] = json!("2");
+    let held = (json!({"hcAddress": "t2"}), t2);
+    script(&w, &[&held]);
+    let got = board(&w.ctx, &w.caller(), false, false).unwrap();
+    assert!(!row(&got, "held").is_null(), "held member listed");
+    let (needs, reason, running, _) = flags(row(&got, "held"));
+    assert_eq!(
+        (needs, reason, running),
+        (&json!(true), &json!(EXITED), &json!(true))
+    );
+}
+
+// Call 13, finding #5: eleven Ended members that need recovery are all listed (exempt from ENDED_MAX = 10).
+#[test]
+fn every_ended_member_that_needs_recovery_is_listed_past_ended_max() {
+    let w = World::human("");
+    let all: Vec<(Value, Value)> = (0..11)
+        .map(|k| {
+            let id = format!("{:012x}", 0xa00 + k);
+            let m = life(&w, &id, &format!("e{k}"), &[exit_1()], true);
+            recorded_end(&w, &id, &m.0);
+            m
+        })
+        .collect();
+    script(&w, &all.iter().collect::<Vec<_>>());
+    let got = board(&w.ctx, &w.caller(), false, false).unwrap();
+    let rows = got["agents"].as_array().unwrap();
+    assert_eq!(rows.len(), 11, "every member that needs recovery is listed");
+    assert!(rows.iter().all(|r| r["needsRecovery"] == true), "{rows:?}");
+}
+
+// Build checklist 7 (call 13): eleven Ended members whose recovery cannot be decided (torn outcome.json) are all
+// listed, each with `recoveryError` (errors are exempt from ENDED_MAX too, not only decided recoveries).
+#[test]
+fn every_ended_member_with_a_recovery_error_is_listed_past_ended_max() {
+    let w = World::human("");
+    let all: Vec<(Value, Value)> = (0..11)
+        .map(|k| {
+            let id = format!("{:012x}", 0xa00 + k);
+            let m = life(&w, &id, &format!("e{k}"), &[exit_1()], true);
+            recorded_end(&w, &id, &m.0);
+            torn_outcome(&w, &id);
+            m
+        })
+        .collect();
+    script(&w, &all.iter().collect::<Vec<_>>());
+    let got = board(&w.ctx, &w.caller(), false, false).unwrap();
+    let rows = got["agents"].as_array().unwrap();
+    assert_eq!(
+        rows.len(),
+        11,
+        "every member with a recovery error is listed"
+    );
+    assert!(
+        rows.iter().all(|r| r["recoveryError"] == "evidence"),
+        "{rows:?}"
+    );
+}
+
+// Ambiguity 3: the board passes the terminal it observed; generation 1's Lost recovery shell fails it (no deadline).
+#[test]
+fn the_board_passes_its_observation_as_lost_evidence() {
+    use crate::agents::outcome::LOST;
+    let w = World::human("");
+    let m = life(&w, "aaaaaaaaaaaa", "lost", &[], false);
+    script(&w, &[&m]);
+    let got = board(&w.ctx, &w.caller(), false, false).unwrap();
+    let (needs, reason, _, _) = flags(row(&got, "lost"));
+    assert_eq!((needs, reason), (&json!(true), &json!(LOST)));
+}

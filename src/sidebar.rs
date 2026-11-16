@@ -693,15 +693,31 @@ fn live_parts(row: &Map<String, Value>, look: Look) -> LiveParts {
     }
 }
 
+/// outcome-2 O6 (calls 9, 20): the flat bar's word for a member that needs recovery, running or not.
+fn recovery_word(row: &Map<String, Value>) -> Option<&'static str> {
+    (row.get("needsRecovery") == Some(&Value::Bool(true))).then(|| {
+        if row.get("recoveryRunning") == Some(&Value::Bool(true)) {
+            "recover (still running)"
+        } else {
+            "recover"
+        }
+    })
+}
+
 fn live_row(row: &Map<String, Value>, cols: usize, look: Look) -> Live {
     let p = live_parts(row, look);
     let age_style = if p.muted { DIM } else { PLAIN };
+    // Call 20: a Running member that needs recovery keeps its live row (still clickable) with the recovery word.
+    let side = match recovery_word(row) {
+        Some(word) => right(Kind::Blocked, word, &p.age, false),
+        None => right(p.kind, p.kind.word(), &p.age, p.muted),
+    };
     let line = agent_line(
         p.glyph.clone(),
         p.name.clone(),
         p.model.clone(),
         p.badge.clone(),
-        right(p.kind, p.kind.word(), &p.age, p.muted),
+        side,
         cols,
     );
     let compact = agent_line(
@@ -785,7 +801,10 @@ fn parts(
             continue;
         }
         counted += 1;
-        let (kind, word) = ended_kind(row);
+        let (kind, word) = match recovery_word(row) {
+            Some(word) => (Kind::Blocked, word.to_string()),
+            None => ended_kind(row),
+        };
         let line = agent_line(
             span(kind.glyph(look.ascii), kind.style()),
             span(own_glyphs(&clean(row.get("name"))), DIM),
@@ -2966,6 +2985,51 @@ mod tests {
     use crate::mux::Output;
     use crate::testing::Fakes;
     use serde_json::json;
+
+    // Call 9 and build checklist 1 (call 20): a member that needs recovery reads `recover` on the flat bar too
+    // (`recover (still running)` while its client runs), never its hc state word or its live activity word; a Running
+    // member stays in the live section (still clickable) with the recovery word.
+    #[test]
+    fn the_flat_bar_shows_recover_for_a_member_that_needs_recovery() {
+        for (state, running) in [("lost", false), ("lost", true), ("running", true)] {
+            let board = json!({"running": 0, "agents": [{"name": "fixer", "state": state, "life": state, "age": 60,
+                "activity": "working", "needsRecovery": true, "recoveryRunning": running}]});
+            let look = Look {
+                color: false,
+                ascii: false,
+                dumb: false,
+            };
+            let laid = lay(
+                board.as_object(),
+                &[],
+                Size {
+                    width: 60,
+                    height: 20,
+                },
+                look,
+            );
+            let text: Vec<String> = laid.rows.iter().map(|r| render(r, false)).collect();
+            let fixer = text
+                .iter()
+                .find(|l| l.contains("fixer"))
+                .cloned()
+                .unwrap_or_default();
+            let word = if running {
+                "recover (still running)"
+            } else {
+                "recover"
+            };
+            let case = format!("{state}, running {running}");
+            assert!(
+                fixer.trim_end().ends_with(&format!("{word}   1m")),
+                "{case}: {fixer:?}"
+            );
+            assert!(
+                !fixer.contains("lost") && !fixer.contains("working"),
+                "{case}: {fixer:?}"
+            );
+        }
+    }
     use std::cell::{Cell, RefCell};
     use std::collections::VecDeque;
     use std::rc::Rc;

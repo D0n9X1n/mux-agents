@@ -18,6 +18,8 @@ pub struct Stored {
     pub noticed: bool,
     /// A lifecycle member's notice, read once here (R1); the board shows it (Task 5).
     pub notice: Option<Value>,
+    /// R3: the active generation's own done (`Status.active_done`); None pre-lifecycle (outcome-2 O6).
+    pub active_done: Option<bool>,
 }
 
 #[derive(Debug)]
@@ -153,6 +155,7 @@ fn pre_local(folder: &Path, record: &Value, id: &str, caller: &Caller) -> Res<Op
             committed: super::folder_committed(folder),
             noticed: folder.join("notice.json").exists(),
             notice: None,
+            active_done: None,
         },
         held: false,
         finished: None,
@@ -180,6 +183,7 @@ fn life_local(
             committed: s.committed,
             noticed: notice.is_some(),
             notice,
+            active_done: s.active_done,
         },
         held: s.held,
         finished: Some(s.finished),

@@ -67,6 +67,29 @@ pub fn board(ctx: &Ctx, caller: &Caller, all: bool, watch: bool) -> Res<Map<Stri
     }
     // A member a committed resume superseded is its successor now: it has no row of its own.
     let superseded = snapshot.superseded();
+    // outcome-2 O6 (calls 11-13): each lifecycle member's recovery, once, from this snapshot (R1): its record, its active
+    // generation's `active_done` and the terminal observed for it, over every local before the committed-subject filter
+    // (call 12). A refusal stays on that member's row.
+    let recovery: HashMap<String, Res<Option<super::gens::Recovery>>> = snapshot
+        .facts
+        .local
+        .iter()
+        .filter(|o| !superseded.contains(&o.identity.id))
+        .filter(|o| super::gens::lifecycle(&snapshot.records[&o.identity.id].record))
+        .map(|o| {
+            let stored = &snapshot.records[&o.identity.id];
+            let got = super::gens::needs_recovery(
+                ctx,
+                &caller.server_key,
+                &o.identity.id,
+                &stored.record,
+                stored.active_done,
+                o.terminal.as_ref(),
+            );
+            (o.identity.id.clone(), got)
+        })
+        .collect();
+    let flagged = |id: &str| matches!(recovery.get(id), Some(Ok(Some(_)) | Err(_)));
     let leader = if watch {
         team_leader(ctx, caller, &snapshot)
     } else {
@@ -76,7 +99,7 @@ pub fn board(ctx: &Ctx, caller: &Caller, all: bool, watch: bool) -> Res<Map<Stri
         .facts
         .local
         .iter()
-        .filter(|o| snapshot.records[&o.identity.id].committed)
+        .filter(|o| snapshot.records[&o.identity.id].committed || flagged(&o.identity.id))
         .filter(|o| !superseded.contains(&o.identity.id))
         .collect();
     let panes: Vec<_> = snapshot
@@ -86,6 +109,8 @@ pub fn board(ctx: &Ctx, caller: &Caller, all: bool, watch: bool) -> Res<Map<Stri
             members
                 .iter()
                 .any(|o| &o.identity.id == *id && o.life == Life::Running)
+                // An uncommitted held subject listed for its recovery owns no pane.
+                && snapshot.records[*id].committed
         })
         .map(|id| snapshot.views[id].clone())
         .collect();
@@ -166,7 +191,7 @@ pub fn board(ctx: &Ctx, caller: &Caller, all: bool, watch: bool) -> Res<Map<Stri
     let mut other = Vec::new();
     let mut ended = Vec::new();
     for o in members {
-        if o.life == Life::Ended && !all {
+        if o.life == Life::Ended && !all && !flagged(&o.identity.id) {
             continue;
         }
         let id = &o.identity.id;
@@ -225,6 +250,18 @@ pub fn board(ctx: &Ctx, caller: &Caller, all: bool, watch: bool) -> Res<Map<Stri
             )?;
             // Call 18a: the selected identity's session (a held one's is its pending generation's), in place.
             row.insert("sessionId".into(), o.identity.session_id.clone().into());
+            // outcome-2 O6: the one predicate's answer, on this row only.
+            match recovery.get(id) {
+                Some(Ok(Some(r))) => {
+                    row.insert("needsRecovery".into(), true.into());
+                    row.insert("recoveryReason".into(), r.reason.clone().into());
+                    row.insert("recoveryRunning".into(), r.running.into());
+                }
+                Some(Err(e)) => {
+                    row.insert("recoveryError".into(), e.check.into());
+                }
+                _ => {}
+            }
             if !live {
                 if let Some(closed) = notice
                     .and_then(|n| n.get("closedBy"))
@@ -255,11 +292,20 @@ pub fn board(ctx: &Ctx, caller: &Caller, all: bool, watch: bool) -> Res<Map<Stri
     for (o, notice) in other {
         agents.push(make(o, notice.as_ref())?);
     }
-    for (_, o, notice) in ended.into_iter().take(if leader.is_some() {
+    // Call 13: a member that needs recovery, or whose recovery could not be decided, is always listed.
+    let cap = if leader.is_some() {
         usize::MAX
     } else {
         ENDED_MAX
-    }) {
+    };
+    let mut kept = 0;
+    for (_, o, notice) in ended {
+        if !flagged(&o.identity.id) {
+            if kept == cap {
+                continue;
+            }
+            kept += 1;
+        }
         agents.push(make(o, notice.as_ref())?);
     }
     let mut reply = Map::new();
@@ -422,7 +468,10 @@ impl Rows<'_> {
         // The bar's feed keys rows by member id (#103 B6); in a team it adds the tree (B1). `list` keeps its columns.
         if self.watch {
             row.insert("id".into(), id.into());
-            if record.get("needsRecovery") == Some(&Value::Bool(true)) {
+            // Call 11: the stored flag counts only for a pre-lifecycle record; `needs_recovery` decides the rest.
+            if !super::gens::lifecycle(record)
+                && record.get("needsRecovery") == Some(&Value::Bool(true))
+            {
                 row.insert("needsRecovery".into(), true.into());
             }
             if let Some(leader) = &self.leader {

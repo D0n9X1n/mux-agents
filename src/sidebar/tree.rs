@@ -152,6 +152,8 @@ fn member(node: &Node, width: usize, shown: Option<&str>, look: Look) -> Member 
         clean(row.get("name")),
         format_age(row.get("age")),
     );
+    // A running recovery row's bare pill (call 21), tried only after its fuller word fails even without the name.
+    let mut bare = None;
     // (glyph, name, model, badge, the sides fullest first, whether the barest side is mandatory, the doing text)
     let (glyph, label, model, badge, sides, kept, doing) =
         if row.get("needsRecovery") == Some(&Value::Bool(true)) {
@@ -159,9 +161,18 @@ fn member(node: &Node, width: usize, shown: Option<&str>, look: Look) -> Member 
                 row.get("color").and_then(Value::as_str),
                 &name,
             ));
+            let running = row.get("recoveryRunning") == Some(&Value::Bool(true));
             let pill = vec![span("recover", Kind::Blocked.word_style())];
+            // Calls 10, 21: a running row keeps `(still running)` while it can (its name cut first), then the pill.
             let sides = if narrow {
                 vec![pill]
+            } else if running {
+                let word = "recover (still running)";
+                bare = Some(pill);
+                vec![
+                    right(Kind::Blocked, word, &age, false),
+                    vec![span(word, Kind::Blocked.word_style())],
+                ]
             } else {
                 vec![right(Kind::Blocked, "recover", &age, false), pill]
             };
@@ -216,7 +227,7 @@ fn member(node: &Node, width: usize, shown: Option<&str>, look: Look) -> Member 
     let floor = 2
         + row_width(&badge)
         + if kept {
-            2 + sides.last().map_or(0, |s| row_width(s))
+            2 + bare.as_ref().or(sides.last()).map_or(0, |s| row_width(s))
         } else {
             0
         };
@@ -226,6 +237,7 @@ fn member(node: &Node, width: usize, shown: Option<&str>, look: Look) -> Member 
         model,
         badge,
         sides,
+        bare,
         kept,
         doing: paint::width(&doing),
     };
@@ -281,6 +293,9 @@ struct RowParts {
     model: Row,
     badge: Row,
     sides: Vec<Row>,
+    /// Tried after every side and the name cut and removed beside the last: a running recovery row's bare pill (call
+    /// 21), which is then also the floor.
+    bare: Option<Row>,
     kept: bool,
     doing: usize,
 }
@@ -314,11 +329,20 @@ fn fit_row(p: &RowParts, cols: usize, ascii: bool) -> (Row, bool) {
     let mut tries = vec![full];
     tries.extend(p.sides.iter().map(|s| build(&p.name.0, &[], s)));
     tries.extend([build(&cut, &[], &last), build("", &[], &last)]);
+    if let Some(bare) = &p.bare {
+        let cut = cut_name(&p.name.0, cols, &p.badge, bare, ascii);
+        tries.extend([
+            build(&p.name.0, &[], bare),
+            build(&cut, &[], bare),
+            build("", &[], bare),
+        ]);
+    }
+    let floor = p.bare.as_ref().unwrap_or(&last);
     let row = tries
         .into_iter()
         .find(|(used, _)| *used <= cols)
         .map(|(_, row)| row)
-        .unwrap_or_else(|| build("", &[], &if p.kept { last.clone() } else { Vec::new() }).1);
+        .unwrap_or_else(|| build("", &[], &if p.kept { floor.clone() } else { Vec::new() }).1);
     (row, false)
 }
 
@@ -648,6 +672,87 @@ pub(super) fn lay_team(
 pub(super) mod tests {
     use super::*;
     use serde_json::json;
+
+    // Calls 9-10, finding #2: a failed generation whose client still runs keeps "still running" on every wide team
+    // bar: `recover (still running) <age>` at 60, `recover (still running)` at the default width 40 (the name cut
+    // first), and only the narrow bar (30) shows the bare `recover` pill.
+    #[test]
+    fn a_failed_generation_still_running_says_so_on_a_wide_bar() {
+        let mut board = golden();
+        let rows = board.get_mut("agents").unwrap().as_array_mut().unwrap();
+        let fixer = rows.iter_mut().find(|r| r["id"] == "F").unwrap();
+        fixer["recoveryRunning"] = json!(true);
+        let look = || Look {
+            color: false,
+            ascii: false,
+            dumb: false,
+        };
+        let focus = || Focus {
+            shown: Some("%13"),
+            selected: None,
+        };
+        let row = |width| {
+            draw(&board, width, 20, look(), focus())
+                .into_iter()
+                .find(|l| l.contains("\u{2709} 2"))
+                .unwrap_or_default()
+        };
+        assert_eq!(
+            row(60),
+            line(
+                " ",
+                "  ! fixer  \u{2709} 2",
+                "recover (still running)   1m",
+                60
+            )
+        );
+        assert!(
+            row(40).trim_end().ends_with("recover (still running)"),
+            "40: {:?}",
+            row(40)
+        );
+        assert!(row(40).starts_with(" "), "40: {:?}", row(40));
+        assert_eq!(row(30), line(" ", "  ! fixer  \u{2709} 2", "recover", 30));
+    }
+
+    // Build checklist 2 (call 21): a deep chain at the default width 40 with a running recovery row and an unread
+    // badge: no room for `recover (still running)` even without the name, so the row falls back to the bare `recover`
+    // pill; the bar never asks to be widened for it.
+    #[test]
+    fn a_deep_running_recovery_row_falls_back_to_the_bare_pill() {
+        let board = team(vec![
+            member("L", None, 1, json!({"name": "lead"})),
+            member("A", Some("L"), 2, json!({})),
+            member("B", Some("A"), 3, json!({})),
+            member("C", Some("B"), 4, json!({})),
+            member(
+                "D",
+                Some("C"),
+                5,
+                json!({"name": "deep", "needsRecovery": true, "recoveryRunning": true, "unread": 2}),
+            ),
+        ]);
+        let look = Look {
+            color: false,
+            ascii: false,
+            dumb: false,
+        };
+        let focus = Focus {
+            shown: None,
+            selected: None,
+        };
+        let drawn = draw(&board, 40, 20, look, focus);
+        assert!(
+            !drawn.iter().any(|l| l.contains("widen the bar")),
+            "{drawn:#?}"
+        );
+        let d = drawn
+            .iter()
+            .find(|l| l.contains("\u{2709} 2"))
+            .unwrap_or_else(|| panic!("no recovery row: {drawn:#?}"));
+        assert!(d.trim_end().ends_with("recover"), "{d:?}");
+        assert!(!d.contains("still running"), "{d:?}");
+    }
 
     /// A team row: id, name, parent id, `createdAt` minute, merged with `extra`.
     pub(crate) fn member(id: &str, parent: Option<&str>, minute: u32, extra: Value) -> Value {
@@ -1162,6 +1267,7 @@ pub(super) mod tests {
                 right(Kind::Working, "working", "1m", false),
                 vec![span("working", PLAIN)],
             ],
+            bare: None,
             kept: true,
             doing: 40,
         };
