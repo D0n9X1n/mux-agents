@@ -2620,12 +2620,13 @@ mod tests {
         assert_eq!(gen_file(&l, "exit")["reason"], "exited");
     }
 
-    // Generation 1, committed; its client 4300 (start 1600) is the one child of the fake launcher 4242.
+    // Generation 1, committed; its client 4300 (start 2600) is the one child of the fake launcher 4242 (start 2000):
+    // a child starts after its parent (r2b call 26).
     fn gen_client() -> (Launch, PathBuf) {
         let (l, spec) = gen_setup(1);
         commit(&l, 1, json!({"committed": true}));
         l.w.fakes
-            .process(crate::testing::row(4300, l.w.ctx.pid, 1600));
+            .process(crate::testing::row(4300, l.w.ctx.pid, 2600));
         (l, spec)
     }
     fn offers(r: &Seamed, at: &Path) -> usize {
@@ -2662,14 +2663,14 @@ mod tests {
         assert_eq!((r.code, r.started), (7, 1), "{:?}", r.err);
         assert_eq!(
             during,
-            Some(json!({"pid": 4300, "start": 1600})),
+            Some(json!({"pid": 4300, "start": 2600})),
             "while the client runs"
         );
         assert_eq!(
             proven,
             Some(gens::Proven {
                 launcher: (4242, 2000),
-                client: (4300, 1600)
+                client: (4300, 2600)
             })
         );
         assert_eq!(offers(&r, &at), 1);
@@ -2800,7 +2801,7 @@ mod tests {
         );
         assert_eq!((r.code, r.started), (7, 1), "{:?}", r.err);
         assert_eq!(offers(&r, &at), 2);
-        assert_eq!(gen_file(&l, "client"), json!({"pid": 4300, "start": 1600}));
+        assert_eq!(gen_file(&l, "client"), json!({"pid": 4300, "start": 2600}));
         assert_eq!(gen_file(&l, "exit")["reason"], "exited");
     }
 
@@ -2843,8 +2844,8 @@ mod tests {
     #[test]
     fn the_same_client_publishing_twice_is_not_a_conflict() {
         for ours in [
-            json!({"pid": 4300, "start": 1600}),
-            json!({"pid": 4300, "start": 1600, "loader": true}),
+            json!({"pid": 4300, "start": 2600}),
+            json!({"pid": 4300, "start": 2600, "loader": true}),
         ] {
             let (l, spec) = gen_client();
             let at = gens::path(&l.folder, 1, "client");
@@ -2912,7 +2913,7 @@ mod tests {
         let at = gens::path(&l.folder, 1, "client");
         let out = crate::testing::TempDir::new();
         let copy = out.path().join("client.json");
-        std::fs::write(&copy, br#"{"pid":4300,"start":1600}"#).unwrap();
+        std::fs::write(&copy, br#"{"pid":4300,"start":2600}"#).unwrap();
         let (r, reads) = crate::state::fs::record_reads(|| {
             seamed(&l, &spec, true, &[], &mut |told: &mut dyn FnMut(u32)| {
                 std::os::unix::fs::symlink(&copy, &at).unwrap();

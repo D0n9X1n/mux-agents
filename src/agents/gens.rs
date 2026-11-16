@@ -524,8 +524,12 @@ pub fn client(ctx: &crate::ctx::Ctx, member: &Path, n: u64) -> Option<Proven> {
 }
 
 /// Both processes live, each with its recorded start both as opened and as listed, and `client` a child of
-/// `launcher` (the launcher's row is read first, as `client` always did).
+/// `launcher` (the launcher's row is read first, as `client` always did). r2b call 26: a parent is older than its
+/// child, so a client that started before its launcher is not its child (a reused pid) and is unproven.
 fn child_of(ctx: &crate::ctx::Ctx, launcher: (u32, i64), client: (u32, i64)) -> bool {
+    if client.1 < launcher.1 {
+        return false;
+    }
     let live = |(pid, start): (u32, i64)| {
         let row = ctx.os.row(pid)?;
         let opened = ctx.os.open(pid)?;

@@ -470,3 +470,27 @@ fn the_exit_evidence_is_kept_when_client_json_is_absent() {
         assert!(untouched(&at), "exit {kind:?}: nothing written through");
     }
 }
+
+// r2b call 26 (QA #143): a parent is older than its child. A client whose start is earlier than its launcher's is not
+// that launcher's child (a reused pid), so it is unproven: launcher {100, 2000}, client {150, ppid 100, 1500}.
+#[test]
+fn a_client_older_than_its_launcher_is_unproven() {
+    let (f, ctx, _d, m) = world();
+    reported(&m, 150, 1500);
+    client_json(&m);
+    f.forget(100);
+    f.process(row(100, 1, 2000));
+    std::fs::remove_file(path(&m, 1, "launcher")).unwrap();
+    publish(
+        &path(&m, 1, "launcher"),
+        &json!({"pid": 100, "start": 2000, "startedAt": "x"}),
+    )
+    .unwrap();
+    assert_eq!(
+        client_evidence(&ctx, &m, 1).map_err(|r| r.check),
+        Ok(None),
+        "client_evidence"
+    );
+    assert_eq!(promote(&ctx), Ok(Ready::Undecided), "promote_ready");
+    assert_eq!(bytes(&m, "ready"), None, "nothing written");
+}
