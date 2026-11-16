@@ -82,6 +82,18 @@ impl G {
     pub fn client(&self, n: u64) {
         self.put(n, "client", json!({"pid": 150, "start": 1500}));
     }
+    /// Moves the fake clock to T0 + `secs` (never back).
+    pub fn now(&self, secs: u64) {
+        self.w.clock(&self.at(secs));
+    }
+    /// `gens::adjudicate` of generation n, blocking, with the caller's observation `seen`.
+    pub fn judge(
+        &self,
+        n: u64,
+        seen: Option<&crate::hc::Terminal>,
+    ) -> crate::error::Res<gens::Adjudged> {
+        gens::adjudicate(&self.w.ctx, &self.key, ID, n, gens::Wait::Block, seen)
+    }
     /// A whole file, None when absent; an unreadable one fails the test.
     pub fn file(&self, n: u64, file: &str) -> Option<Value> {
         match gens::read(&self.folder, n, file) {

@@ -28,6 +28,7 @@ pub(crate) mod member_target;
 pub mod membership;
 pub mod message;
 pub mod options;
+pub mod outcome;
 #[cfg(test)]
 pub(crate) mod outcome_fixture;
 pub mod placement;
