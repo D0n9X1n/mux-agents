@@ -5513,10 +5513,11 @@ hc {}:
                 "{mux:?}"
             );
             assert!(!marker.exists(), "{mux:?}");
+            // 6b ambiguity 8 (r6b call 7): a second `up` reconciles the team; nothing is lost, nothing restored.
             let (code, again) = live.run(&["up", "-Client", "claude"]);
             assert_eq!(
-                (code, again["check"].as_str()),
-                (2, Some("leader")),
+                (code, &again["created"], &again["restored"]),
+                (0, &json!(false), &json!([])),
                 "{mux:?} {again}"
             );
         }
@@ -5566,14 +5567,16 @@ hc {}:
                     .unwrap()
                 })
                 .collect();
+            // 6b ambiguity 8 (r6b call 7): both succeed; the later one reconciles the team the first made.
             assert_eq!(
                 replies.iter().filter(|r| r["ok"] == true).count(),
-                1,
+                2,
                 "{mux:?} {replies:?}"
             );
-            assert!(
-                replies.iter().any(|r| r["check"] == "leader"),
-                "{mux:?} {replies:?}"
+            assert_eq!(
+                replies.iter().filter(|r| r["created"] == false).count(),
+                1,
+                "{mux:?}: exactly one creates"
             );
             let t = replies.iter().find(|r| r["ok"] == true).unwrap()["team"]
                 .as_str()

@@ -456,13 +456,11 @@ fn the_leader_is_rediscovered_after_each_write_and_a_failed_flush_launches_nothi
                 json!({"address": "t1", "state": "live", "argv": launcher, "labels": {}}),
             );
         }
-        let e = claude(&again).unwrap_err();
+        // 6b ambiguity 8: the rediscovered leader's team is reconciled, never made twice.
+        let reply = claude(&again).unwrap();
         assert!(
-            e.check == "leader"
-                && e.message
-                    .starts_with("the team already has a leader: leader in $7")
-                && !ran(&again),
-            "write {}",
+            reply["created"] == json!(false) && !ran(&again),
+            "write {}: {reply:?}",
             n + 1
         );
     }
@@ -492,7 +490,8 @@ fn up_holds_admission_then_spawn_once_and_two_servers_launch_one_leader() {
         "t1",
         json!({"address": "t1", "state": "live", "argv": launcher, "labels": {}}),
     );
-    assert_eq!(claude(&second).unwrap_err().check, "leader");
+    // 6b ambiguity 8: the second server's `up` reconciles the team at its anchor; it makes no second leader.
+    assert_eq!(claude(&second).unwrap()["created"], json!(false));
     assert!(!ran(&second) && second.fakes.locks().first() == Some(&format!("+up|{t}")));
 }
 

@@ -10,7 +10,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 /// Every file below `dir`, path to bytes (6b-R2: a byte-identical folder).
-fn bytes(dir: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
+pub(super) fn bytes(dir: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
     let mut all = BTreeMap::new();
     for e in std::fs::read_dir(dir).unwrap() {
         let p = e.unwrap().path();

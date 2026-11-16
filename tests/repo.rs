@@ -909,6 +909,11 @@ const TEST_ONLY: &[(&str, &str, &str)] = &[
         "reconcile_tests",
     ),
     (
+        "src/agents/reconcile_up_tests.rs",
+        "src/agents/mod.rs",
+        "reconcile_up_tests",
+    ),
+    (
         "src/agents/reconcile_verb_race_tests.rs",
         "src/agents/mod.rs",
         "reconcile_verb_race_tests",

@@ -1341,9 +1341,12 @@ fn up_creates_a_team_in_a_new_session() {
         .trim()
         == "leader|1"));
     assert!(!marker.exists());
+    // 6b ambiguity 8 (r6b call 7): a second `up` reconciles the team; nothing is lost, nothing restored.
+    let again = live.run_any(&["up", "-Client", "claude"]);
     assert_eq!(
-        live.run_any(&["up", "-Client", "claude"])["check"],
-        "leader"
+        (&again["created"], &again["restored"]),
+        (&serde_json::json!(false), &serde_json::json!([])),
+        "{again}"
     );
 }
 

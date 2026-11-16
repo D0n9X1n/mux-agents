@@ -59,7 +59,14 @@ pub fn up(ctx: &Ctx, request: &Request) -> Res<Map<String, Value>> {
         if super::cascade::waiting(ctx, &scope) {
             super::team_state::open(ctx, &scope, |tx| super::cascade::finish(tx, &caller))?;
         }
-        discover::refuse_existing(ctx, &core, &caller.server_key, &team)?;
+        // 6b ambiguities 7, 8: an existing lifecycle team is reconciled at its anchor, not refused.
+        if let Some(scope) = discover::existing(ctx, &core, &caller.server_key, &team)? {
+            let anchor = super::reconcile::anchor_caller(&caller, &scope);
+            let mut reply = super::reconcile::run(ctx, &anchor)?;
+            reply.insert("team".into(), json!(team));
+            reply.insert("created".into(), json!(false));
+            return Ok(reply);
+        }
         create(
             ctx,
             &caller,
