@@ -3005,3 +3005,238 @@ fn adoption_moves_b_and_a_resumed_successor_stops_its_child() {
         "X's mailbox after X ended"
     );
 }
+
+/// restore-6b: `member_file` that waits: None until the file exists.
+fn member_file_opt(live: &Live, id: &str, file: &str) -> Option<()> {
+    let state = live.dir.join("state");
+    std::fs::read_dir(&state)
+        .ok()?
+        .flatten()
+        .any(|e| e.path().join("agents").join(id).join(file).is_file())
+        .then_some(())
+}
+
+/// restore-6b: `up`, then A (claude) and B (copilot) spawned by the leader with markers; each first generation ready.
+fn team_of_three(live: &Live, sent: &mut HashMap<u32, usize>) -> Vec<String> {
+    let up = live.run(&["up", "-Client", "claude"]);
+    let lead = s(&up["leader"]["id"]);
+    std::fs::write(live.dir.join("brief.md"), "brief").unwrap();
+    let brief = live.dir.join("brief.md").display().to_string();
+    let mut ids = vec![lead.clone()];
+    for (client, name, marker) in [("claude", "a", "MARKER-A"), ("copilot", "b", "MARKER-B")] {
+        let task = live.dir.join(format!("task-{name}.txt"));
+        std::fs::write(&task, format!("say {marker}")).unwrap();
+        let task = task.display().to_string();
+        let args = [
+            "spawn",
+            "-Client",
+            client,
+            "-TaskFile",
+            &task,
+            "-BriefFile",
+            &brief,
+            "-Context",
+            "brief",
+            "-Name",
+            name,
+        ];
+        let r = by(live, sent, &lead, &args);
+        ids.push(s(&r["id"]));
+    }
+    for id in &ids {
+        live.wait("ready", || member_file_opt(live, id, "gens/0/ready.json"));
+    }
+    ids
+}
+
+/// restore-6b ambiguity 14: the core killed (`taskkill /F`, never `/T`); waits until hc shows every member terminal
+/// Lost. Returns the records before the kill and the predecessor client pids, captured before the kill (r6b call 9).
+fn lose(live: &mut Live, ids: &[String]) -> (Vec<Value>, Vec<u32>) {
+    let before: Vec<Value> = ids
+        .iter()
+        .map(|id| member_file(live, id, "record.json"))
+        .collect();
+    let old: Vec<u32> = before
+        .iter()
+        .map(|r| client_pid(live, &s(&r["sessionId"]), 0))
+        .collect();
+    live.core.kill_hard();
+    let live: &Live = live;
+    for r in &before {
+        let address = s(&r["hcAddress"]);
+        live.wait("lost", || {
+            let t = hc_get(live, &address);
+            (t["state"] == "live" && t["argv"] != r["launcherArgv"]).then_some(())
+        });
+    }
+    (before, old)
+}
+
+/// The ids of an `up` reply array, sorted.
+fn sorted_ids(reply: &Value, key: &str) -> Vec<String> {
+    let mut v: Vec<String> = reply[key]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| s(&e["id"]))
+        .collect();
+    v.sort();
+    v
+}
+
+/// restore-6b spec live "Abrupt loss", "Ready after restore" and "Ended" on Windows (r6b call 9). The adjudicating
+/// `list` runs as the restored leader (checklist 22).
+#[test]
+fn restore_resumes_every_lost_member_after_a_core_kill_on_windows() {
+    let Some(mut live) = Live::start() else {
+        return;
+    };
+    let mut sent = HashMap::new();
+    let ids = team_of_three(&live, &mut sent);
+    let (before, old) = lose(&mut live, &ids);
+    let up = live.run(&["up", "-Client", "claude"]);
+    assert_eq!(up["created"], json!(false), "{up}");
+    let mut want = ids.clone();
+    want.sort();
+    assert_eq!(
+        sorted_ids(&up, "restored"),
+        want,
+        "every lost member restored: {up}"
+    );
+    let mut news = Vec::new();
+    for (i, id) in ids.iter().enumerate() {
+        let r = member_file(&live, id, "record.json");
+        assert_eq!(
+            (&r["generation"], &r["sessionId"]),
+            (&json!("1"), &before[i]["sessionId"]),
+            "{id}"
+        );
+        let sid = s(&r["sessionId"]);
+        let new = client_pid(&live, &sid, old[i]); // newest first, the predecessor skipped: the successor
+        news.push(new);
+        let path = live.dir.join(format!("client.{new}.json"));
+        let c: Value = serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+        let argv = c["argv"].as_array().unwrap();
+        assert!(
+            argv.windows(2)
+                .any(|w| w[0] == "--resume" && w[1] == sid.as_str()),
+            "{c}"
+        );
+        if i > 0 {
+            let marker = if i == 1 { "MARKER-A" } else { "MARKER-B" };
+            assert!(
+                !c["argv"].to_string().contains(marker),
+                "the task is never resent"
+            );
+            assert!(
+                c["recalled"].to_string().contains(marker),
+                "the same conversation"
+            );
+        }
+        live.wait("ready again", || {
+            member_file_opt(&live, id, "gens/1/ready.json")
+        });
+        let kept = hc_get(&live, &s(&before[i]["hcAddress"]));
+        let mut keys: Vec<&String> = kept["labels"].as_object().unwrap().keys().collect();
+        keys.sort();
+        assert_eq!(keys, ["mux.kept", "mux.keptName"]);
+    }
+    // the list of the restored leader adjudicates what it shows (outcome-2; checklist 22)
+    let listed = by_pid(&live, &mut sent, news[0], &["list"]);
+    assert_eq!(listed["ok"], true, "{listed}");
+    for id in &ids {
+        assert_eq!(
+            member_file(&live, id, "gens/1/outcome.json")["outcome"],
+            "ok",
+            "{id}"
+        );
+    }
+    let again = live.run(&["up", "-Client", "claude"]);
+    assert_eq!(again["restored"], json!([]), "a second up starts nothing");
+    // Ended: the restored A quits on its own; no up brings it back.
+    std::fs::write(live.dir.join(format!("quit.{}", news[1])), "0").unwrap();
+    live.wait("A exited", || {
+        live.dir
+            .join(format!("exited.{}", news[1]))
+            .is_file()
+            .then_some(())
+    });
+    by_pid(&live, &mut sent, news[0], &["list"]); // reaps the end (registry)
+    let third = live.run(&["up", "-Client", "claude"]);
+    assert_eq!(
+        third["restored"],
+        json!([]),
+        "an ended member stays ended: {third}"
+    );
+    assert_eq!(
+        member_file(&live, &ids[1], "record.json")["generation"],
+        "1"
+    );
+}
+
+/// restore-6b spec live "Managed vs unmanaged" on Windows: an unmanaged Claude holds the Claude restores (leader, A)
+/// and names its pid; an unmanaged Copilot holds B. Each quit frees its kind; restored ids and generations asserted.
+#[test]
+fn restore_resume_is_held_by_an_unmanaged_client_until_it_quits_on_windows() {
+    let Some(mut live) = Live::start() else {
+        return;
+    };
+    let mut sent = HashMap::new();
+    let ids = team_of_three(&live, &mut sent);
+    lose(&mut live, &ids);
+    let mut strays = Vec::new();
+    let pairs = [
+        ("claude.exe", "5e55fc2f-2032-48ef-a920-4af2a8e5af55"),
+        ("copilot.exe", "6e66fc2f-2032-48ef-a920-4af2a8e5af56"),
+    ];
+    for (exe, sid) in pairs {
+        let pane = live.new_session(&format!("stray-{exe}"));
+        live.line(&pane, &format!("{exe} --session-id {sid}"));
+        strays.push(client_pid(&live, sid, 0));
+    }
+    let up = live.run(&["up", "-Client", "claude"]);
+    assert_eq!(up["restored"], json!([]), "{up}");
+    let held = up["held"].as_array().unwrap();
+    assert_eq!(held.len(), 3, "{up}");
+    for h in held {
+        assert_eq!(h["reason"], "occupied", "{h}");
+        let pid = strays[if h["id"] == json!(ids[2]) { 1 } else { 0 }];
+        assert!(h["holder"].to_string().contains(&pid.to_string()), "{h}");
+    }
+    std::fs::write(live.dir.join(format!("quit.{}", strays[0])), "0").unwrap();
+    live.wait("stray claude gone", || {
+        live.dir
+            .join(format!("exited.{}", strays[0]))
+            .is_file()
+            .then_some(())
+    });
+    let second = live.run(&["up", "-Client", "claude"]);
+    let mut claude = vec![ids[0].clone(), ids[1].clone()];
+    claude.sort();
+    assert_eq!(
+        sorted_ids(&second, "restored"),
+        claude,
+        "the restored leader client does not hold A (H2): {second}"
+    );
+    assert_eq!(
+        sorted_ids(&second, "held"),
+        [ids[2].clone()],
+        "the Copilot stray still holds B"
+    );
+    std::fs::write(live.dir.join(format!("quit.{}", strays[1])), "0").unwrap();
+    live.wait("stray copilot gone", || {
+        live.dir
+            .join(format!("exited.{}", strays[1]))
+            .is_file()
+            .then_some(())
+    });
+    let third = live.run(&["up", "-Client", "claude"]);
+    assert_eq!(sorted_ids(&third, "restored"), [ids[2].clone()], "{third}");
+    for id in &ids {
+        assert_eq!(
+            member_file(&live, id, "record.json")["generation"],
+            "1",
+            "{id}"
+        );
+    }
+}
