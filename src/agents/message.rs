@@ -778,7 +778,7 @@ pub fn capture_hc(
         return Err(usage("read"));
     }
     let id = super::member_target::named(ctx, caller, name)?;
-    capture_identity(ctx, caller, &id, expected, lines, standing)
+    capture_identity(ctx, caller, &id, expected, lines, standing, "read")
 }
 
 /// `capture_hc` for the bar (#103 B10): member `id` by id, never by name. The bar acts for the person: no standing.
@@ -793,7 +793,7 @@ pub fn capture_member(
         return Err(usage("read"));
     }
     let id = super::member_target::by_id(ctx, caller, id)?;
-    capture_identity(ctx, caller, &id, expected, lines, None)
+    capture_identity(ctx, caller, &id, expected, lines, None, "peek")
 }
 
 fn capture_identity(
@@ -803,12 +803,22 @@ fn capture_identity(
     expected: Option<&str>,
     lines: i32,
     standing: Option<&super::tree::Standing>,
+    verb: &str,
 ) -> Res<(registry::Pane, String)> {
     lock(ctx, &lock_key("member", caller, &id.id), || {
         let record = super::member_target::current(ctx, caller, id)?;
         // Phase 3: a member reads only down the tree, checked under the member lock (`read <name>`; the bar passes None).
         if let Some(s) = standing {
-            super::tree::authority(ctx, caller, s, &id.id, "read")?;
+            super::tree::authority(ctx, caller, s, &id.id, "read").map_err(|e| {
+                match (verb, e.check) {
+                    // Ambiguity 9: one message for a sibling, a child, a peer, a broken chain or a cycle.
+                    ("peek", "authority") => crate::error::Refusal {
+                        message: format!("only an ancestor or a person can peek {}", id.name),
+                        ..e
+                    },
+                    _ => e,
+                }
+            })?;
         }
         let Some(pane) = id.view(&record, &registry::rows(ctx, caller)?) else {
             return refuse(
@@ -827,6 +837,41 @@ fn capture_identity(
         let tail = capture(ctx, &pane, lines)?;
         Ok((pane, tail))
     })
+}
+
+/// `peek <name> [-Lines <n>]` (N4): same team only, a person or an ancestor, the live launch captured; nothing typed,
+/// focused or granted. Names resolve among this session's members only (`membership::locals`), so another team's
+/// member, none or an ambiguous name is one refusal.
+pub fn peek(ctx: &Ctx, request: &Request) -> Res<Map<String, Value>> {
+    let lines = match request.value("Lines") {
+        None => 60,
+        Some(v) => v
+            .parse::<i32>()
+            .ok()
+            .filter(|n| (1..=2000).contains(n))
+            .ok_or_else(|| usage("peek"))?,
+    };
+    let caller = crate::caller::resolve_tree(ctx)?;
+    let (pane, tail) = super::tree::with_standing(ctx, &caller, |standing| {
+        let Some(standing) = standing else {
+            return refuse(2, "team", "peek works only inside a team");
+        };
+        let id = super::member_target::named(ctx, &caller, first(request)).map_err(|e| match e
+            .check
+        {
+            "target" => crate::error::Refusal {
+                message: super::team_mail::NO_NAME.into(),
+                ..e
+            },
+            _ => e,
+        })?;
+        capture_identity(ctx, &caller, &id, None, lines, Some(standing), "peek")
+    })?;
+    let mut reply = Map::new();
+    reply.insert("name".into(), pane.name.into());
+    reply.insert("pane".into(), pane.pane.into());
+    reply.insert("text".into(), tail.into());
+    Ok(reply)
 }
 
 /// The output hc keeps for member `id` (#103 B6), also after it ended: `hc read`, only of a terminal that is still the
@@ -3081,3 +3126,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "peek_tests.rs"]
+mod peek_tests;

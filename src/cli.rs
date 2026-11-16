@@ -144,6 +144,16 @@ pub static VERBS: &[VerbDef] = &[
         text: json::lines,
     },
     VerbDef {
+        name: "peek",
+        values: &["Lines"],
+        switches: &[],
+        min: 1,
+        max: 1,
+        usage: "usage: mux-agent peek <name> [-Lines <n>] [-Text]",
+        handler: crate::agents::message::peek,
+        text: json::lines,
+    },
+    VerbDef {
         name: "stop",
         values: &[],
         switches: &[],
@@ -679,7 +689,7 @@ mod tests {
     // A valid argv for each verb, positionals at the verb's minimum.
     fn valid(verb: &str) -> Vec<&'static str> {
         match verb {
-            "focus" | "send" | "stop" | "resume" | "report" => vec!["a"],
+            "focus" | "send" | "stop" | "resume" | "report" | "peek" => vec!["a"],
             _ => vec![],
         }
     }
@@ -698,6 +708,7 @@ mod tests {
                 "read",
                 "note",
                 "notes",
+                "peek",
                 "stop",
                 "resume",
                 "up",
@@ -731,6 +742,7 @@ mod tests {
             ("read", 0, 1),
             ("note", 0, 0),
             ("notes", 0, 1),
+            ("peek", 1, 1),
             ("stop", 1, 1),
             ("resume", 1, 1),
             ("up", 0, 0),
@@ -841,6 +853,7 @@ mod tests {
             "read" => vec!["read"],
             "note" => vec!["note", "-Title", "t", "-Body", "b"],
             "notes" => vec!["notes"],
+            "peek" => vec!["peek", "worker"],
             "stop" => vec!["stop", "worker"],
             "resume" => vec!["resume", "worker"],
             "up" => vec!["up", "-Client", "claude"],
