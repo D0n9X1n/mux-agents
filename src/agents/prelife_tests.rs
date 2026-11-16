@@ -1,10 +1,13 @@
 //! prelife-1c Task 8: a state folder written by v0.2.8 keeps working after the upgrade (G10, ambiguities 2, 4).
 //! Task 9: the `limit` refusal names each held pre-lifecycle member and what frees it (p1c-calls 4, 10).
+//! Task 7: an unmarked folder holding gens/1 evidence is never read past its record by the orphan fence, adoption or
+//! `list`, and stays byte-identical (spec "Exclusion", p1c-calls 9).
 use serde_json::json;
 
 use crate::agents::core_fixture as cf;
 use crate::agents::fixture::World;
-use crate::agents::prelife_fixture::{self as pf, Answer, C, D, L, P};
+use crate::agents::prelife_fixture::{self as pf, A, Answer, C, D, L, P};
+use crate::agents::team_state::{Scope, open};
 
 /// Outside a team nothing changes for 0.2.x folders: scope Outside; the 0.2 cap still counts hc members only; a
 /// stop or resume of one never kills, launches or writes.
@@ -163,5 +166,138 @@ fn the_limit_refusal_names_every_holder_sorted_by_name() {
          beta (running; mux-agent stop beta stops it), \
          legacy (run mux-agent stop legacy once its client is gone)"
     );
+    w.fakes.hc_done().unwrap();
+}
+
+/// Task 7: a pre-lifecycle member whose gens/1 holds every file a wrong reader would open.
+fn unmarked(w: &World, id: &str, parent: &str, depth: u64) -> serde_json::Value {
+    let r = pf::pre(w, id, pf::fields(id, "legacy", Some(parent), depth));
+    pf::dev_evidence(w, id);
+    pf::publish(w, id, 1, "spec", json!({"sessionId": r["sessionId"]}));
+    pf::ended(w, id);
+    r
+}
+
+/// G8: `Tx::open` runs the orphan fence; nothing of the unmarked folder past its record is read.
+#[test]
+fn the_orphan_fence_never_reads_an_unmarked_folder() {
+    let w = World::human("");
+    pf::team(&w);
+    pf::life(&w, L, pf::fields(L, "leader", None, 0));
+    unmarked(&w, P, L, 1);
+    let before = pf::bytes(&w.folder(P));
+    let (got, reads) =
+        crate::state::fs::record_reads(|| open(&w.ctx, &Scope::of(&w.caller()), |_| Ok(())));
+    got.unwrap();
+    assert_eq!(
+        pf::reads_past_record(&reads, &w.folder(P)),
+        Vec::<std::path::PathBuf>::new()
+    );
+    assert_eq!(pf::bytes(&w.folder(P)), before);
+    assert!(
+        w.fakes.hc_calls().is_empty(),
+        "no lifecycle orphan, so no hc call"
+    );
+}
+
+/// adopt-3e under contracts 1-3: a pre-lifecycle member is never a source, an adopter or a moved child, nothing of
+/// it past its record is read, and a chain that leaves the tree at it adopts nothing (checklist 5: also when a live
+/// adopter sits below it). No adoption journal.
+#[test]
+fn adoption_never_reads_or_moves_a_pre_lifecycle_member() {
+    const B: &str = "b0000000000b";
+    for case in [
+        "pre child of an ended source",
+        "pre source",
+        "chain leaves the tree",
+        "leaves above a live adopter",
+    ] {
+        let w = World::human("");
+        pf::team(&w);
+        pf::life(&w, L, pf::fields(L, "leader", None, 0));
+        match case {
+            "pre child of an ended source" => {
+                pf::life(&w, A, pf::fields(A, "w-a", Some(L), 1));
+                pf::ended(&w, A);
+                unmarked(&w, P, A, 2);
+            }
+            "pre source" => {
+                unmarked(&w, P, L, 1);
+                pf::life(&w, C, pf::fields(C, "w-c", Some(P), 2));
+            }
+            "chain leaves the tree" => {
+                unmarked(&w, P, L, 1);
+                pf::life(&w, A, pf::fields(A, "w-a", Some(P), 2));
+                pf::ended(&w, A);
+                pf::life(&w, D, pf::fields(D, "w-d", Some(A), 3));
+            }
+            _ => {
+                unmarked(&w, P, L, 1);
+                pf::life(&w, B, pf::fields(B, "w-b", Some(P), 2));
+                pf::life(&w, A, pf::fields(A, "w-a", Some(B), 3));
+                pf::ended(&w, A);
+                pf::life(&w, D, pf::fields(D, "w-d", Some(A), 4));
+            }
+        }
+        let agents = w.state().join("agents");
+        let before = pf::bytes(&agents);
+        let (got, reads) = crate::state::fs::record_reads(|| {
+            open(&w.ctx, &Scope::of(&w.caller()), |tx| {
+                crate::agents::adopt::adopt_locked(tx, &w.caller()).map(|_| ())
+            })
+        });
+        got.unwrap_or_else(|e| panic!("{case}: {e:?}"));
+        assert_eq!(
+            pf::reads_past_record(&reads, &w.folder(P)),
+            Vec::<std::path::PathBuf>::new(),
+            "{case}"
+        );
+        assert_eq!(pf::bytes(&agents), before, "{case}");
+        let journals = std::fs::read_dir(w.state().join("teams")).map_or(0, |d| {
+            d.filter(|e| {
+                e.as_ref()
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .ends_with(".adopt")
+            })
+            .count()
+        });
+        assert_eq!(journals, 0, "{case}: no adoption journal folder");
+    }
+}
+
+/// Spec "mixed tree ... `list` behaves as today", through the public `list` verb: C's row (found by its emitted
+/// `hcAddress`: `list` rows carry no `id`, checklist 1) is emitted as main emits it; C's folder is byte-identical.
+#[test]
+fn list_shows_a_pre_lifecycle_child_of_a_lifecycle_member_as_today() {
+    let w = World::human("");
+    w.panes(&[]);
+    let (a, c) = pf::mixed(&w);
+    let leader: serde_json::Value = crate::state::fs::read_json(&w.folder(L).join("record.json"))
+        .unwrap()
+        .unwrap();
+    let answers = [&leader, &a, &c]
+        .iter()
+        .map(|r| {
+            (
+                r["hcAddress"].as_str().unwrap().to_string(),
+                Answer::Wire(cf::wire(r)),
+            )
+        })
+        .collect();
+    pf::script(&w, answers);
+    let before = pf::bytes(&w.folder(C));
+    let (code, out) = crate::cli::run(&["list".to_string()], || Ok(&w.ctx));
+    assert_eq!(code, 0, "{out}");
+    let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+    let row = v["agents"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["hcAddress"] == c["hcAddress"])
+        .unwrap_or_else(|| panic!("no row for C: {out}"));
+    assert_eq!(row["name"], "w-c", "{out}");
+    assert_eq!(pf::bytes(&w.folder(C)), before);
     w.fakes.hc_done().unwrap();
 }

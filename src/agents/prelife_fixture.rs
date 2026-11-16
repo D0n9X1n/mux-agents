@@ -267,6 +267,18 @@ pub fn dev_evidence(w: &World, id: &str) {
     publish(w, id, 1, "client", json!({"pid": 4242, "start": 1500}));
 }
 
+/// Lifecycle `id`'s generation 1 recorded Ended (state-0 S6); in an unmarked folder, one more file a wrong reader
+/// would open.
+pub fn ended(w: &World, id: &str) {
+    publish(
+        w,
+        id,
+        1,
+        "ended",
+        json!({"state": "finished", "reason": "exited", "at": "x"}),
+    );
+}
+
 /// Paths `record_reads` saw under `folder`, except its `record.json` (P-R1's one classifying read).
 pub fn reads_past_record(reads: &[PathBuf], folder: &Path) -> Vec<PathBuf> {
     let record = folder.join("record.json");
