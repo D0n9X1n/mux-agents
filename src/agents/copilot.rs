@@ -1,6 +1,6 @@
 //! A Copilot fork's session copy: `~/.copilot/session-state/<source>` becomes `<target>` (MuxAgents.ps1:585-639).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io;
 use std::path::{Path, PathBuf};
 
@@ -107,9 +107,10 @@ fn build(from: &Path, temp: &Path, source: &str, target: &str) -> io::Result<()>
 /// workspace.yaml without its column-0 `mc_` keys, each with its two-space children, or `None` when any line is
 /// outside this grammar (call 14). Copilot CLI 1.0.110 writes `mc_pending_repository_warning:` as such a mapping.
 /// Every line is `KEY: VALUE` or `KEY:` at column 0, or `  KEY: VALUE` (exactly two spaces) directly under a column-0
-/// `KEY:` without a value; only the text's end may follow a `\n`. KEY is `[A-Za-z0-9_-]+`; VALUE is as `scalar`
-/// says. A blank line, comment, block scalar, flow value, anchor, alias, tag, explicit or quoted key or deeper
-/// nesting refuses, so inside the grammar dropping an `mc_` key with its children is exact.
+/// `KEY:` without a value; only the text's end may follow a `\n`. KEY is as `entry` says and appears once in its
+/// mapping (the top level, or one parent's children); VALUE is as `scalar` says. A blank line, comment, block
+/// scalar, flow value, anchor, alias, tag, explicit or quoted key, deeper nesting or repeated key refuses, mc_ keys
+/// included, so inside the grammar dropping an `mc_` key with its children is exact.
 fn without_mc(text: &str) -> Option<String> {
     let mut lines: Vec<&str> = text.split('\n').collect();
     let end = (lines.last() == Some(&"")).then(|| lines.pop()).flatten();
@@ -117,13 +118,21 @@ fn without_mc(text: &str) -> Option<String> {
     // Whether the last column-0 key has no value, so two-space children may follow it.
     let mut parent = false;
     let mut dropping = false;
+    // The keys of the top-level mapping, and of the current parent's children; a repeat refuses (call 16).
+    let mut top = HashSet::new();
+    let mut children = HashSet::new();
     for line in lines {
         if let Some(child) = line.strip_prefix("  ") {
-            if !parent || entry(child)?.1.is_none() {
+            let (key, value) = entry(child)?;
+            if !parent || value.is_none() || !children.insert(key) {
                 return None;
             }
         } else {
             let (key, value) = entry(line)?;
+            if !top.insert(key) {
+                return None;
+            }
+            children.clear();
             parent = value.is_none();
             dropping = key.starts_with("mc_");
         }
@@ -135,13 +144,20 @@ fn without_mc(text: &str) -> Option<String> {
     Some(kept.join("\n"))
 }
 
-/// `line` as `KEY: VALUE` (value `Some`) or `KEY:` (value `None`); `None` outside the grammar.
+/// `line` as `KEY: VALUE` (value `Some`) or `KEY:` (value `None`); `None` outside the grammar. KEY starts with
+/// `[A-Za-z_]`, goes on with `[A-Za-z0-9_-]*`, and is no bool or null word in any case (call 16), so two keys
+/// resolve to the same YAML key only when they are spelled the same.
 fn entry(line: &str) -> Option<(&str, Option<&str>)> {
     let (key, rest) = line.split_once(':')?;
-    if key.is_empty()
-        || !key
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+    let mut bytes = key.bytes();
+    if !bytes
+        .next()
+        .is_some_and(|b| b.is_ascii_alphabetic() || b == b'_')
+        || !bytes.all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+        || matches!(
+            key.to_ascii_lowercase().as_str(),
+            "true" | "false" | "yes" | "no" | "on" | "off" | "y" | "n" | "null"
+        )
     {
         return None;
     }
@@ -497,6 +513,47 @@ mod tests {
     #[test]
     fn copilot_copy_refuses_an_explicit_mc_key() {
         assert!(refused("cwd: /work\n? mc_x\n: v\nsummary: s\n"));
+    }
+
+    #[test]
+    fn copilot_copy_refuses_a_duplicate_top_level_key() {
+        // The QA repro: Copilot would refuse the copy with "Map keys must be unique".
+        assert!(refused(
+            "cwd: /work\nsummary: one\nsummary: two\nmc_x: remove\n"
+        ));
+    }
+
+    #[test]
+    fn copilot_copy_refuses_a_duplicate_child_key() {
+        assert!(refused(
+            "cwd: /work\ngit:\n  root: /a\n  root: /b\nsummary: s\n"
+        ));
+    }
+
+    #[test]
+    fn copilot_copy_refuses_a_bool_like_key() {
+        // `True` and `true` resolve to the same bool key.
+        assert!(refused("cwd: /work\nTrue: a\nsummary: s\n"));
+    }
+
+    #[test]
+    fn copilot_copy_refuses_a_numeric_key() {
+        // `1` and `01` resolve to the same int key.
+        assert!(refused("cwd: /work\n1: a\nsummary: s\n"));
+    }
+
+    #[test]
+    fn copilot_copy_refuses_a_duplicate_mc_key() {
+        // The file is checked before it is filtered, so a duplicate that would be dropped still refuses.
+        assert!(refused("cwd: /work\nmc_x: a\nmc_x: b\nsummary: s\n"));
+    }
+
+    #[test]
+    fn copilot_copy_accepts_one_child_key_under_two_parents() {
+        assert_eq!(
+            copied_workspace("cwd: /work\ngit:\n  root: /a\nremote:\n  root: /b\nsummary: s\n"),
+            format!("id: {NEW}\ncwd: /work\ngit:\n  root: /a\nremote:\n  root: /b\nsummary: s\n")
+        );
     }
 
     #[test]
