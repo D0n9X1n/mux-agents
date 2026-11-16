@@ -4241,6 +4241,37 @@ hc {}:
         )
         .unwrap()
     }
+    // release-1d live: stop the core so hc keeps the terminal as a recovery shell (Lost), then release it: the
+    // shell stays live carrying exactly mux.kept and mux.keptName; released.json exists.
+    fn a_lost_member_is_released_and_keeps_only_its_kept_labels(mux: Mux) {
+        let Some(mut live) = Live::human(mux) else {
+            return;
+        };
+        let w = live.spawn("w1", &[]);
+        let (id, address) = (s(&w["id"]).to_string(), s(&w["hcAddress"]).to_string());
+        let (code, seeded) = live.run(&["__life", "seed", &id, "0"]);
+        assert_eq!(code, 0, "{mux:?}: {seeded}");
+        let before = core(&live, &["get", &address, "--json"])["labels"].clone();
+        let pc = live.server.core.as_mut().unwrap();
+        assert!(pc.stop(), "{mux:?}: core stop");
+        pc.start();
+        let lost = || core(&live, &["get", &address, "--json"])["argv"][1] == "-l";
+        assert!(eventually(LONG, lost), "{mux:?}: Lost");
+        let (code, out) = live.run(&["__life", "release", &id, "0"]);
+        assert_eq!(
+            (code, &out["released"]),
+            (0, &json!(true)),
+            "{mux:?}: {out}"
+        );
+        let t = core(&live, &["get", &address, "--json"]);
+        assert_eq!(t["state"], "live", "{mux:?}");
+        let want = json!({"mux.kept": before["mux.team"], "mux.keptName": before["mux.name"]});
+        assert_eq!(t["labels"], want, "{mux:?}");
+        assert!(
+            live.agent_dir(&id).join("gens/0/released.json").exists(),
+            "{mux:?}"
+        );
+    }
     fn hc_view_close_survives_focus_stop(mux: Mux) {
         let Some(mut live) = Live::human(mux) else {
             return;
@@ -5129,6 +5160,7 @@ hc {}:
                     members_spawn_and_act_only_down_the_tree,
                     team_messaging_stays_in_the_team,
                     an_unacked_batch_is_served_again_and_rebuilt_for_a_successor,
+                    a_lost_member_is_released_and_keeps_only_its_kept_labels,
                 ]
             );
         };

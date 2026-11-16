@@ -473,6 +473,33 @@ fn quiet(args: &[String]) -> bool {
     false
 }
 
+/// `__life <verb> <id> <n>` (live tests only), under `team_state::open` for the caller's scope.
+#[cfg(feature = "live")]
+pub fn run_life(args: &[String], ctx: impl FnOnce() -> Res<Ctx>) -> (u8, String) {
+    let go = || -> Res<Value> {
+        let [_, verb, id, n] = args else {
+            return Err(Refusal::internal("usage: __life <verb> <id> <n>"));
+        };
+        let n =
+            crate::agents::gens::plain_gen(n).ok_or_else(|| Refusal::internal("bad generation"))?;
+        if !crate::agents::gens::plain_id(id) {
+            return Err(Refusal::internal("bad id"));
+        }
+        let ctx = ctx()?;
+        let scope = crate::agents::team_state::Scope::of(&crate::caller::resolve(&ctx)?);
+        crate::agents::team_state::open(&ctx, &scope, |tx| {
+            crate::agents::release::live(tx, verb, id, n)
+        })
+    };
+    match go() {
+        Ok(v) => (0, v.to_string()),
+        Err(e) => (
+            e.code,
+            serde_json::json!({"ok": false, "check": e.check, "message": e.message}).to_string(),
+        ),
+    }
+}
+
 /// The spec of the hidden `launcher <spec> --state-root <abs> --path <value>` call an agent's hc terminal runs; not a
 /// verb, so absent from the usage text.
 pub fn launcher_spec(args: &[String]) -> Option<&str> {

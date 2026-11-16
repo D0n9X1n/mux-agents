@@ -226,6 +226,46 @@ pub fn complete_one(tx: &Tx<'_>, lazy: &Lazy<'_>, id: &str, c: &Value) -> Res<()
     .map(|_| ())
 }
 
+/// Live tests only (no production writer of lifecycle records yet): `seed` turns a spawned pre-lifecycle member
+/// into a lifecycle one with generation n's launch, claim and commit; `release` runs R1 at its address (cause lost).
+/// The seed is a fixture and writes through `Tx::patch` (b-calls 29). B2's `orphan` verb is dropped (b-calls 40).
+#[cfg(feature = "live")]
+pub fn live(tx: &Tx<'_>, verb: &str, id: &str, n: u64) -> Res<Value> {
+    let folder = tx.folder(id);
+    let r = gens::record(&folder)
+        .known()?
+        .ok_or_else(|| Refusal::internal("no record"))?;
+    let text = |k: &str| {
+        r.get(k)
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned()
+    };
+    match verb {
+        "seed" => {
+            let name = r
+                .get("hcName")
+                .and_then(Value::as_str)
+                .map_or_else(|| format!("m{}", &id[..8]), str::to_owned);
+            let launch = json!({"hcName": name, "launcherArgv": r["launcherArgv"], "sessionId": text("sessionId")});
+            gens::publish_once(&folder, n, "launch", &launch)?;
+            gens::publish_claim_once(&folder, n, &json!("run"))?;
+            gens::publish_once(&folder, n, "commit", &json!({"committed": true}))?;
+            tx.patch(id, &[("lifecycle", json!(1)), ("hcName", json!(name))], &[])?;
+        }
+        "release" => release(
+            tx,
+            &Lazy::new(tx.ctx),
+            id,
+            n,
+            &text("hcAddress"),
+            Cause::Lost,
+        )?,
+        _ => return Err(Refusal::internal("unknown __life verb")),
+    }
+    Ok(json!({"ok": true, "released": gens::read(&folder, n, "released").known()?.is_some()}))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

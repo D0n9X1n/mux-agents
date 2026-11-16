@@ -1732,3 +1732,47 @@ fn a_copilot_member_reports_done_then_listens_on_call() {
         "drawn on b: {b_screen}"
     );
 }
+
+/// `<state>/<server key>/agents/<id>`: the one server key folder that holds member `id`.
+fn agent_dir(live: &Live, id: &str) -> PathBuf {
+    let found: Vec<PathBuf> = std::fs::read_dir(live.dir.join("state"))
+        .unwrap()
+        .map(|e| e.unwrap().path().join("agents").join(id))
+        .filter(|p| p.is_dir())
+        .collect();
+    assert_eq!(found.len(), 1, "{found:?}");
+    found.into_iter().next().unwrap()
+}
+
+/// `hc get <address> --json` on the private core.
+fn hc_get(live: &Live, address: &str) -> Value {
+    private_core::run(live.core.command(&["get", address, "--json"]), &live.dir).unwrap()
+}
+
+/// release-1d live on rmux (Windows): stop the core so hc keeps the terminal as PowerShell's recovery shell (Lost),
+/// then release it: the shell stays live carrying exactly mux.kept and mux.keptName; released.json exists.
+#[test]
+fn a_lost_member_is_released_and_keeps_only_its_kept_labels() {
+    let Some(mut live) = Live::start() else {
+        return;
+    };
+    let w = live.spawn("w1");
+    let id = w["id"].as_str().unwrap().to_string();
+    let address = w["hcAddress"].as_str().unwrap().to_string();
+    let seeded = live.run(&["__life", "seed", &id, "0"]);
+    assert_eq!(seeded["ok"], true, "{seeded}");
+    let before = hc_get(&live, &address)["labels"].clone();
+    assert!(live.core.stop(), "core stop");
+    live.core.start();
+    live.wait("the terminal is Lost", || {
+        (hc_get(&live, &address)["argv"][1] == "-NoExit").then_some(())
+    });
+    let out = live.run(&["__life", "release", &id, "0"]);
+    assert_eq!(out["released"], true, "{out}");
+    let t = hc_get(&live, &address);
+    assert_eq!(t["state"], "live");
+    let want =
+        serde_json::json!({"mux.kept": before["mux.team"], "mux.keptName": before["mux.name"]});
+    assert_eq!(t["labels"], want);
+    assert!(agent_dir(&live, &id).join("gens/0/released.json").exists());
+}

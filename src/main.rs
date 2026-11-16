@@ -85,6 +85,12 @@ fn main() -> ExitCode {
         // The client's own exit code, which may not fit a u8 on Windows.
         std::process::exit(code);
     }
+    #[cfg(feature = "live")]
+    if args.first().map(String::as_str) == Some("__life") {
+        let (code, text) = cli::run_life(&args, || ctx(&args));
+        let _ = write!(std::io::stdout().lock(), "{text}{NL}");
+        return ExitCode::from(code);
+    }
     let (code, text) = cli::run(&args, || ctx(&args));
     // A closed stdout leaves only the exit code to report with. Nothing at all for no text (`report -Quiet`).
     if !text.is_empty() {
