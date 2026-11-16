@@ -442,6 +442,7 @@ mod tests {
                 start: Some(1130),
                 path: Some(exe.clone()),
                 argv: Some(vec![exe, "watch".into()]),
+                image: None,
             });
             w.fakes.mux_rule(
                 "show-options -wqv -t @5 @mux-agents-sidebar-id",

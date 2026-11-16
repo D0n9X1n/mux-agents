@@ -6353,6 +6353,7 @@ mod tests {
             start: Some(2000),
             path: Some(exe.clone()),
             argv: Some(vec![exe, "watch".into()]),
+            image: None,
         });
         w.fakes.mux_rule(RECORD, 0, OWN, "");
         w.fakes.mux_rule(PROOF, 0, "%7|@1|0|4242\n", "");
@@ -6888,6 +6889,7 @@ mod tests {
             start: Some(i64::from(pid) * 10),
             path: Some(exe.into()),
             argv: Some(vec![exe.into(), "watch".into()]),
+            image: None,
         }
     }
 

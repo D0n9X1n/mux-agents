@@ -110,6 +110,64 @@ fn argv(pid: u32, buf: &mut [u8]) -> Option<Vec<String>> {
     parse::procargs2(&buf[..size.min(buf.len())])
 }
 
+// The image (H1): libproc's p_name; when libproc answers nothing (o3 call 28: another user's process, such as root's
+// launchd, on a CI runner), kinfo_proc's p_comm.
+fn image(pid: u32) -> Option<String> {
+    proc_name(pid).or_else(|| comm(pid))
+}
+
+// proc_name: the process's p_name.
+fn proc_name(pid: u32) -> Option<String> {
+    let pid = c_int::try_from(pid).ok()?;
+    let mut buf = [0u8; 64];
+    // SAFETY: the buffer holds 64 writable bytes; the call writes at most that many.
+    let got = unsafe { libc::proc_name(pid, buf.as_mut_ptr().cast(), buf.len() as u32) };
+    let len = usize::try_from(got).ok().filter(|&n| n > 0)?;
+    String::from_utf8(buf.get(..len)?.to_vec()).ok()
+}
+
+// kinfo_proc (sys/sysctl.h) on 64-bit macOS: 648 bytes, opening with extern_proc (sys/proc.h), whose p_pid is at byte
+// 40 and p_comm (MAXCOMLEN + 1 bytes, NUL-terminated) at byte 243. libc declares no kinfo_proc for Apple targets.
+// Layout: XNU f6217f891ac0bb64f3d375211650a4c1ff8ca1ea, bsd/sys/sysctl.h (struct kinfo_proc) and bsd/sys/proc.h (struct
+// extern_proc), the same on aarch64 and x86_64 (golang.org/x/sys SizeofKinfoProc 0x288 agrees). The size and p_pid
+// checks below catch a wrong struct or pid, not a shifted p_comm: an offset of 244 still passes them and reads
+// `claude` as `laude`, so these three constants stay pinned to those headers.
+const KINFO_PROC_SIZE: usize = 648;
+const P_PID_AT: usize = 40;
+const P_COMM_AT: usize = 243;
+
+// sysctl KERN_PROC_PID's p_comm, which ps reads for any process; none unless a whole kinfo_proc of this very pid
+// comes back (a gone pid answers 0 bytes).
+fn comm(pid: u32) -> Option<String> {
+    let id = c_int::try_from(pid).ok()?;
+    let mut mib = [libc::CTL_KERN, libc::KERN_PROC, libc::KERN_PROC_PID, id];
+    let mut buf = [0u8; KINFO_PROC_SIZE];
+    let mut size = buf.len();
+    // SAFETY: a four-name read into `buf`, whose length `size` gives.
+    let read = unsafe {
+        libc::sysctl(
+            mib.as_mut_ptr(),
+            4,
+            buf.as_mut_ptr().cast(),
+            &mut size,
+            null_mut(),
+            0,
+        )
+    };
+    if read != 0 || size != KINFO_PROC_SIZE {
+        return None;
+    }
+    let at_pid = c_int::from_ne_bytes(buf[P_PID_AT..P_PID_AT + 4].try_into().ok()?);
+    if at_pid != id {
+        return None;
+    }
+    let name = &buf[P_COMM_AT..P_COMM_AT + libc::MAXCOMLEN + 1];
+    let len = name.iter().position(|&b| b == 0)?;
+    String::from_utf8(name[..len].to_vec())
+        .ok()
+        .filter(|s| !s.is_empty())
+}
+
 // Start re-read last, so a pid reused between the reads gives no row rather than a mixed one.
 fn row_with(pid: u32, buf: &mut [u8]) -> Option<Row> {
     seam::read_row(
@@ -120,6 +178,7 @@ fn row_with(pid: u32, buf: &mut [u8]) -> Option<Row> {
         },
         path,
         |pid| argv(pid, buf),
+        image,
     )
 }
 
@@ -151,7 +210,7 @@ impl Os for MacOs {
         row_with(pid, &mut args_buffer())
     }
 
-    /// Every process whose start is readable; one that exits mid-read is skipped.
+    /// Every listed pid; one whose start cannot be read stays unless it is proven gone (`seam::listed`).
     fn table(&self) -> io::Result<Vec<Row>> {
         // SAFETY: a null buffer asks only for the count.
         let count = unsafe { libc::proc_listallpids(null_mut(), 0) };
@@ -166,7 +225,7 @@ impl Os for MacOs {
         Ok(pids
             .into_iter()
             .filter_map(|pid| u32::try_from(pid).ok())
-            .filter_map(|pid| row_with(pid, &mut buf))
+            .filter_map(|pid| seam::listed(pid, row_with(pid, &mut buf), unix::probe, image))
             .collect())
     }
 
@@ -195,7 +254,11 @@ impl Os for MacOs {
     }
 
     fn client_of(&self, row: &Row) -> Option<Client> {
-        parse::unix_client(
+        self.client_known(row).flatten()
+    }
+
+    fn client_known(&self, row: &Row) -> Option<Option<Client>> {
+        parse::unix_client_known(
             row.path.as_deref(),
             row.argv.as_deref(),
             || self.cwd(row.pid),
@@ -291,9 +354,8 @@ mod tests {
     }
 
     // p_starttime by another road than libproc: sysctl KERN_PROC_PID's kinfo_proc, whose extern_proc opens with
-    // the union holding it (sys/proc.h): tv_sec at byte 0, tv_usec at byte 8. 648 bytes on 64-bit macOS.
+    // the union holding it (sys/proc.h): tv_sec at byte 0, tv_usec at byte 8 (KINFO_PROC_SIZE bytes in all).
     fn kinfo_start(pid: u32) -> (i64, i32) {
-        const KINFO_PROC_SIZE: usize = 648;
         let mut mib = [
             libc::CTL_KERN,
             libc::KERN_PROC,
@@ -317,6 +379,45 @@ mod tests {
         let sec = i64::from_ne_bytes(buf[0..8].try_into().unwrap());
         let usec = i32::from_ne_bytes(buf[8..12].try_into().unwrap());
         (sec, usec)
+    }
+
+    // o3 call 28: launchd (pid 1, root) is another user's process. proc_name answers nothing for it on a CI runner;
+    // kinfo_proc's p_comm, which any user may read, names it.
+    #[test]
+    fn image_of_launchd_is_read_through_kinfo_proc() {
+        assert_eq!(image(1).as_deref(), Some("launchd"));
+    }
+
+    // QA Q3 (call 31): every process the table lists names its image, whoever owns it. A row without one must be gone
+    // on a re-check (it exited between the reads); a zombie still has its kinfo_proc and so its p_comm.
+    #[test]
+    fn every_listed_process_names_its_image() {
+        let rows = MacOs.table().unwrap();
+        let missing: Vec<u32> = rows
+            .iter()
+            .filter(|r| r.image.is_none())
+            .map(|r| r.pid)
+            .filter(|&pid| image(pid).is_none() && unix::probe(pid) != libc::ESRCH)
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "no image for {missing:?} of {} rows",
+            rows.len()
+        );
+    }
+
+    // The kinfo_proc offsets checked on a process whose name is known: this test binary's p_comm is its file name,
+    // cut at MAXCOMLEN bytes. A reaped pid has no kinfo_proc (the sysctl answers 0 bytes) and so no name.
+    #[test]
+    fn comm_is_the_file_name_cut_at_maxcomlen() {
+        let exe = std::env::current_exe().unwrap();
+        let file = exe.file_name().unwrap().to_str().unwrap();
+        let want = &file[..file.len().min(libc::MAXCOMLEN)];
+        assert_eq!(comm(me()).as_deref(), Some(want));
+        let mut done = Command::new("/usr/bin/true").spawn().unwrap();
+        let pid = done.id();
+        done.wait().unwrap();
+        assert_eq!(comm(pid), None);
     }
 
     #[test]
@@ -363,6 +464,13 @@ mod tests {
         let table = MacOs.table().unwrap();
         let mine = table.iter().find(|r| r.pid == me()).unwrap();
         assert_eq!(Some(mine), MacOs.row(me()).as_ref());
+        let exe = std::env::current_exe().unwrap();
+        let file = exe.file_name().unwrap().to_str().unwrap();
+        let image = mine.image.clone().unwrap();
+        assert!(
+            !image.is_empty() && file.starts_with(&image),
+            "{image} {file}"
+        );
         let parent = std::os::unix::process::parent_id();
         assert!(table.iter().any(|r| r.pid == parent));
         assert!(table.len() > 2);

@@ -27,6 +27,7 @@ pub mod mail;
 pub(crate) mod member_target;
 pub mod membership;
 pub mod message;
+pub mod occupancy;
 pub mod options;
 pub mod outcome;
 #[cfg(test)]

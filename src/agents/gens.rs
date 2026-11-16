@@ -69,13 +69,21 @@ fn real_folders(member: &Path, names: &[&str]) -> Res<Option<PathBuf>> {
     let below = member.strip_prefix(root).unwrap_or(member).iter();
     for name in below.chain(names.iter().map(std::ffi::OsStr::new)) {
         at.push(name);
-        match std::fs::symlink_metadata(&at) {
-            Ok(m) if m.is_dir() => {}
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            _ => return Err(evidence::unreadable()),
+        if !real_dir(&at)? {
+            return Ok(None);
         }
     }
     Ok(Some(at))
+}
+
+/// One level of the walk: `Ok(true)` a real folder, `Ok(false)` absent; a link (a Windows junction too:
+/// `symlink_metadata` reports it as a link, not a folder), a file or anything unreadable refuses `evidence`.
+pub(crate) fn real_dir(at: &Path) -> Res<bool> {
+    match std::fs::symlink_metadata(at) {
+        Ok(m) if m.is_dir() => Ok(true),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        _ => Err(evidence::unreadable()),
+    }
 }
 
 /// The member record, `<member>/record.json`, through the walk.

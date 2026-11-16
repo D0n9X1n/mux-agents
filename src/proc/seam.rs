@@ -19,16 +19,19 @@ pub trait ProcSource {
 
 /// One row whose fields all belong to one process. They are read by pid in separate calls, so the start is read
 /// again last: a pid reused in between shows another start (or none), and the row is unreadable. Only the start
-/// is compared; a parent that changed is a reparent, not reuse. `head` gives (ppid, start).
+/// is compared; a parent that changed is a reparent, not reuse. `head` gives (ppid, start). The image is read
+/// before the second start read too, so a reused pid cannot lend its name (H1).
 pub fn read_row(
     pid: u32,
     head: impl Fn(u32) -> Option<(u32, i64)>,
     path: impl FnOnce(u32) -> Option<String>,
     argv: impl FnOnce(u32) -> Option<Vec<String>>,
+    image: impl FnOnce(u32) -> Option<String>,
 ) -> Option<super::Row> {
     let (ppid, start) = head(pid)?;
     let path = path(pid);
     let argv = argv(pid);
+    let image = image(pid);
     let (_, again) = head(pid)?;
     (again == start).then_some(super::Row {
         pid,
@@ -36,6 +39,32 @@ pub fn read_row(
         start: Some(start),
         path,
         argv,
+        image,
+    })
+}
+
+/// H1: a listed pid leaves the table only when `kill(pid, 0)` proves it gone (ESRCH). Any other pid whose row cannot
+/// be read stays, unbound (no start, path or argv; ppid 0 = no parent read), with the image the OS lists, read after
+/// the probe showed the pid still exists. Nothing walks `table` by parent; `Os::row` is unchanged.
+pub fn listed(
+    pid: u32,
+    row: Option<super::Row>,
+    probe: impl FnOnce(u32) -> i32,
+    image: impl FnOnce(u32) -> Option<String>,
+) -> Option<super::Row> {
+    if row.is_some() {
+        return row;
+    }
+    if probe(pid) == ESRCH {
+        return None;
+    }
+    Some(super::Row {
+        pid,
+        ppid: 0,
+        start: None,
+        path: None,
+        argv: None,
+        image: image(pid),
     })
 }
 
@@ -159,7 +188,7 @@ mod tests {
         }
     }
 
-    // Head reads answer in turn; path and argv are the replacement's when the pid was reused in between.
+    // Head reads answer in turn; path, argv and image are the replacement's when the pid was reused in between.
     fn row_reads(heads: Vec<Option<(u32, i64)>>) -> (Option<crate::proc::Row>, Vec<String>) {
         let log: Log = Rc::default();
         let round = RefCell::new(0);
@@ -179,6 +208,10 @@ mod tests {
                 log.borrow_mut().push(format!("argv {pid}"));
                 Some(vec!["sh".into()])
             },
+            |pid| {
+                log.borrow_mut().push(format!("image {pid}"));
+                Some("sh".into())
+            },
         );
         let calls = log.borrow().clone();
         (row, calls)
@@ -189,7 +222,7 @@ mod tests {
         // Start 100 read first; the path and argv came from a replacement with start 200: not one process.
         let (row, calls) = row_reads(vec![Some((1, 100)), Some((1, 200))]);
         assert_eq!(row, None);
-        assert_eq!(calls, ["head 7", "path 7", "argv 7", "head 7"]);
+        assert_eq!(calls, ["head 7", "path 7", "argv 7", "image 7", "head 7"]);
         // Gone by the second read.
         assert_eq!(row_reads(vec![Some((1, 100)), None]).0, None);
         // Gone at the first: nothing else is read.
@@ -198,10 +231,68 @@ mod tests {
         // The same start both times: one process. A parent that changed (a reparent) is not reuse.
         let row = row_reads(vec![Some((1, 100)), Some((9, 100))]).0.unwrap();
         assert_eq!(
-            (row.pid, row.ppid, row.start, row.path.as_deref()),
-            (7, 1, Some(100), Some("/bin/sh"))
+            (
+                row.pid,
+                row.ppid,
+                row.start,
+                row.path.as_deref(),
+                row.image.as_deref()
+            ),
+            (7, 1, Some(100), Some("/bin/sh"), Some("sh"))
         );
         assert_eq!(row.argv, Some(vec!["sh".to_string()]));
+    }
+
+    type Calls = Rc<RefCell<Vec<String>>>;
+
+    fn listed_with(
+        row: Option<crate::proc::Row>,
+        errno: i32,
+    ) -> (Option<crate::proc::Row>, Vec<String>) {
+        let log: Calls = Rc::default();
+        let got = listed(
+            7,
+            row,
+            |pid| {
+                log.borrow_mut().push(format!("probe {pid}"));
+                errno
+            },
+            |pid| {
+                log.borrow_mut().push(format!("image {pid}"));
+                Some("claude".into())
+            },
+        );
+        let calls = log.borrow().clone();
+        (got, calls)
+    }
+
+    #[test]
+    fn listed_drops_a_pid_only_on_esrch() {
+        // A readable row stands as read: no probe, no second image read.
+        let full = crate::testing::row(7, 1, 100);
+        assert_eq!(listed_with(Some(full.clone()), 3), (Some(full), vec![]));
+        // Unreadable and ESRCH: proven gone, dropped, nothing else read.
+        assert_eq!(
+            listed_with(None, ESRCH),
+            (None, vec!["probe 7".to_string()])
+        );
+        // Unreadable and anything else (0 alive, EPERM 1, EINVAL 22, -1): kept, unbound, with its image.
+        for errno in [0, 1, 22, -1] {
+            let (row, calls) = listed_with(None, errno);
+            assert_eq!(
+                row,
+                Some(crate::proc::Row {
+                    pid: 7,
+                    ppid: 0,
+                    start: None,
+                    path: None,
+                    argv: None,
+                    image: Some("claude".into()),
+                }),
+                "errno {errno}"
+            );
+            assert_eq!(calls, ["probe 7", "image 7"], "errno {errno}");
+        }
     }
 
     #[test]

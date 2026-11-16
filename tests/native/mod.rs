@@ -4,6 +4,12 @@
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+// o3 call 34 N4: the diagnostics bound their own children. Every test crate includes this module, and only some load
+// `support/bounded.rs` at their root, so it is loaded here too (std only; a second copy is a distinct module).
+#[allow(clippy::duplicate_mod)]
+#[path = "../support/bounded.rs"]
+mod bounded;
+
 /// PM call 16: a state root the production privacy check accepts: its parent exists; the root is mode 0700 on Unix.
 pub fn private_root(state: &Path) {
     if !state.exists() {
@@ -85,6 +91,12 @@ pub fn ctx(state: &Path) -> mux_agent::ctx::Ctx {
 #[cfg(windows)]
 pub fn deny_queries(child: &std::process::Child) {
     use std::os::windows::io::AsRawHandle;
+    deny_queries_on(child.as_raw_handle());
+}
+
+/// `deny_queries` on a process handle (o3 call 34 N4: a bounded child's, taken without its watchdog's lock).
+#[cfg(windows)]
+pub fn deny_queries_on(handle: std::os::windows::io::RawHandle) {
     use windows_sys::Win32::Foundation::LocalFree;
     use windows_sys::Win32::Security::Authorization::{
         ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
@@ -106,8 +118,7 @@ pub fn deny_queries(child: &std::process::Child) {
     };
     assert_ne!(made, 0, "SDDL");
     // SAFETY: the child's own process handle, open with WRITE_DAC; `sd` came from the call above.
-    let set =
-        unsafe { SetKernelObjectSecurity(child.as_raw_handle(), DACL_SECURITY_INFORMATION, sd) };
+    let set = unsafe { SetKernelObjectSecurity(handle, DACL_SECURITY_INFORMATION, sd) };
     // SAFETY: allocated by ConvertString...W.
     unsafe { LocalFree(sd) };
     assert_ne!(set, 0, "SetKernelObjectSecurity");
@@ -184,6 +195,12 @@ fn disable_debug_privilege() {
 #[cfg(windows)]
 pub fn deny_report(child: &std::process::Child) -> String {
     use std::os::windows::io::AsRawHandle;
+    deny_report_on(child.as_raw_handle(), child.id())
+}
+
+/// `deny_report` on a process handle and pid (o3 call 34 N4); its `whoami` runs bounded.
+#[cfg(windows)]
+pub fn deny_report_on(handle: std::os::windows::io::RawHandle, pid: u32) -> String {
     use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, LocalFree};
     use windows_sys::Win32::Security::Authorization::{
         ConvertSecurityDescriptorToStringSecurityDescriptorW, GetSecurityInfo, SDDL_REVISION_1,
@@ -191,7 +208,10 @@ pub fn deny_report(child: &std::process::Child) -> String {
     };
     use windows_sys::Win32::Security::{DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR};
     use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
-    let whoami = |arg: &str| match std::process::Command::new("whoami").arg(arg).output() {
+    let whoami = |arg: &str| match bounded::output(
+        std::process::Command::new("whoami").arg(arg),
+        bounded::LIMIT,
+    ) {
         Ok(o) => String::from_utf8_lossy(&o.stdout).into_owned(),
         Err(e) => format!("whoami {arg}: {e}"),
     };
@@ -211,7 +231,7 @@ pub fn deny_report(child: &std::process::Child) -> String {
     // freed below.
     let got = unsafe {
         GetSecurityInfo(
-            child.as_raw_handle(),
+            handle,
             SE_KERNEL_OBJECT,
             DACL_SECURITY_INFORMATION,
             std::ptr::null_mut(),
@@ -256,7 +276,7 @@ pub fn deny_report(child: &std::process::Child) -> String {
         shown
     };
     // SAFETY: a plain open; null on failure.
-    let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, child.id()) };
+    let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
     let open = if handle.is_null() {
         // SAFETY: no preconditions.
         format!("refused, error {}", unsafe { GetLastError() })
@@ -268,6 +288,108 @@ pub fn deny_report(child: &std::process::Child) -> String {
     format!(
         "privileges {privileges:?}; groups {groups:?}; child DACL {dacl}; OpenProcess(QUERY_LIMITED) {open}"
     )
+}
+
+/// occupy-3 Task 7: a child killed and reaped on drop, so no test leaves a process behind.
+pub struct Reap(pub std::process::Child);
+
+impl Drop for Reap {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+/// This test binary copied into a fresh `dir` as `name` (with `.exe` on Windows), run with `args`.
+pub fn copy_as(dir: &Path, name: &str, args: &[&str]) -> Reap {
+    std::fs::create_dir_all(dir).unwrap();
+    let file = dir.join(if cfg!(windows) {
+        format!("{name}.exe")
+    } else {
+        name.to_string()
+    });
+    std::fs::copy(std::env::current_exe().unwrap(), &file).unwrap();
+    let child = std::process::Command::new(&file)
+        .args(args)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    Reap(child)
+}
+
+/// Polls `ready` every 50 ms for at most 10 s.
+pub fn within_10_s<T>(what: &str, mut ready: impl FnMut() -> Option<T>) -> T {
+    let end = Instant::now() + Duration::from_secs(10);
+    loop {
+        if let Some(v) = ready() {
+            return v;
+        }
+        assert!(Instant::now() < end, "{what}: not within 10 s");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// occupy-3 Task 8: runs one tab-split mux-agent line through fake client `pid` (fake-client.rs protocol: `cmd.<pid>`,
+/// answered in `reply.<pid>.<n>.json`, n counting taken files from 1) and returns its JSON reply, within 60 s.
+pub fn client_cmd(dir: &Path, pid: u32, line: &str) -> serde_json::Value {
+    let taken = std::fs::read_dir(dir)
+        .unwrap()
+        .filter_map(Result::ok)
+        .filter(|e| {
+            e.file_name()
+                .to_string_lossy()
+                .starts_with(&format!("cmd.{pid}.taken."))
+        })
+        .count();
+    let tmp = dir.join(format!("cmd.{pid}.tmp"));
+    std::fs::write(&tmp, format!("{line}\n")).unwrap();
+    std::fs::rename(&tmp, dir.join(format!("cmd.{pid}"))).unwrap();
+    let reply = dir.join(format!("reply.{pid}.{}.json", taken + 1));
+    let end = Instant::now() + Duration::from_secs(60);
+    loop {
+        if let Ok(text) = std::fs::read_to_string(&reply) {
+            return serde_json::from_str(&text).unwrap();
+        }
+        assert!(Instant::now() < end, "no reply from client {pid} to {line}");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// The fake client whose `client.<pid>.json` env names `address` as its HC_TERMINAL_ID, within 60 s.
+pub fn client_at(dir: &Path, address: &str) -> u32 {
+    let end = Instant::now() + Duration::from_secs(60);
+    loop {
+        let found = std::fs::read_to_string(dir.join("clients.log"))
+            .ok()
+            .and_then(|log| {
+                log.lines().find_map(|p| {
+                    let pid: u32 = p.trim().parse().ok()?;
+                    let file = dir.join(format!("client.{pid}.json"));
+                    let r: serde_json::Value =
+                        serde_json::from_str(&std::fs::read_to_string(file).ok()?).ok()?;
+                    (r["env"]["HC_TERMINAL_ID"] == address).then_some(pid)
+                })
+            });
+        if let Some(pid) = found {
+            return pid;
+        }
+        assert!(Instant::now() < end, "no client in terminal {address}");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// report-2b Task 9: fake client `pid`'s own startup `report -Session` has finished (its reply `session.<pid>.json`
+/// exists), within 60 s. A synthetic report sent after this is the newest; sent before, the startup one could land
+/// after it and win.
+pub fn startup_report(dir: &Path, pid: u32) {
+    let file = dir.join(format!("session.{pid}.json"));
+    let end = Instant::now() + Duration::from_secs(60);
+    while !file.exists() {
+        assert!(Instant::now() < end, "client {pid} made no startup report");
+        std::thread::sleep(Duration::from_millis(50));
+    }
 }
 
 #[cfg(test)]

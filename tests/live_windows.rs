@@ -65,6 +65,29 @@ fn a_child_past_its_bound_is_killed_and_refused() {
     }
 }
 
+// o3 call 34 N4: a slow diagnostic run on a bounded child's handle never holds the watchdog off: the child, bounded at
+// 1 s, is killed while a 4 s diagnostic still runs. Needs no rmux.
+#[test]
+fn a_diagnostic_on_a_bounded_child_never_blocks_its_watchdog() {
+    use windows_sys::Win32::Foundation::WAIT_OBJECT_0;
+    use windows_sys::Win32::System::Threading::WaitForSingleObject;
+    let mut ping = Command::new("ping");
+    ping.args(["-n", "60", "127.0.0.1"])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null());
+    let mut child = bounded::spawn(&mut ping, Duration::from_secs(1)).unwrap();
+    let handle = child.handle();
+    std::thread::sleep(Duration::from_secs(4)); // the slow diagnostic
+    // SAFETY: the child's own process handle, alive while `child` is; a zero timeout only polls.
+    let exited_during = unsafe { WaitForSingleObject(handle, 0) == WAIT_OBJECT_0 };
+    let _ = child.kill();
+    let _ = child.wait();
+    assert!(
+        exited_during,
+        "the watchdog killed the child while the diagnostic ran"
+    );
+}
+
 // o2 call 29 (QA #146 F3): `bounded::output` never answers success with output it did not finish reading. The child
 // prints and exits while a descendant keeps its stdout open about 8 s: refused `TimedOut` naming stdout, within the
 // 5 s grace and the 1 s release (so the read handle was dropped, not left blocked until the descendant ends). A
@@ -941,6 +964,108 @@ fn up_runs_the_leader_with_options_then_session_then_prompt() {
         leader["argv"],
         serde_json::json!(["--model", "x", "--session-id", sid, "fix"])
     );
+}
+
+// occupy-3 H4.5 live: a claude.exe this user cannot open (an elevated client; here a fake-client copy whose queries
+// are denied, the same Toolhelp-only row) blocks `mux-agent resume` of an ended Claude member, naming its pid; once
+// it has left the Toolhelp table the resume is admitted. The deny comes before the server starts: `deny_queries`
+// drops this process's SeDebugPrivilege, and the rmux server and the pane's mux-agent copy the token as it is then.
+#[test]
+fn an_unreadable_claude_exe_blocks_resume() {
+    let elevated = std::env::temp_dir().join(format!("elevated-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&elevated);
+    std::fs::create_dir_all(elevated.join("it")).unwrap();
+    let exe = elevated.join("claude.exe");
+    std::fs::copy(env!("CARGO_BIN_EXE_fake-client"), &exe).unwrap();
+    let mut copy = std::process::Command::new(&exe);
+    copy.env("MUX_IT_DIR", elevated.join("it"))
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    // outcome-2 call 14: bounded; the watchdog kills it at 300 s if the test never does.
+    let mut child = bounded::spawn(&mut copy, Duration::from_secs(300)).unwrap();
+    let pid = child.id();
+    native::deny_queries_on(child.handle());
+    assert!(
+        mux_agent::proc::host().row(pid).is_none(),
+        "precondition, the deny took effect: {}",
+        native::deny_report_on(child.handle(), pid)
+    );
+    let Some(live) = Live::start() else {
+        return;
+    };
+    let w = live.spawn("w1");
+    let address = s(&w["hcAddress"]);
+    live.run(&["stop", "w1"]);
+    live.wait("finished core terminal", || {
+        let got = private_core::run(live.core.command(&["get", &address, "--json"]), &live.dir);
+        (got.unwrap()["state"] == "finished").then_some(())
+    });
+    let refused = live.run_any(&["resume", "w1"]);
+    assert_eq!(refused["check"], "session", "{refused}");
+    // PM call 2: this copy's pid and image, and the unbound rule.
+    let message = s(&refused["message"]);
+    assert!(
+        message.starts_with(&format!("process {pid} (claude.exe)")),
+        "{message}"
+    );
+    assert!(
+        message.contains(mux_agent::agents::occupancy::Rule::Unbound.phrase()),
+        "{message}"
+    );
+    let _ = child.kill();
+    let _ = child.wait();
+    native::within_10_s("the copy leaves Toolhelp", || {
+        (!mux_agent::proc::host()
+            .table()
+            .unwrap()
+            .iter()
+            .any(|r| r.pid == pid))
+        .then_some(())
+    });
+    live.run(&["resume", "w1"]);
+    let _ = std::fs::remove_dir_all(&elevated);
+}
+
+// occupy-3 H2 live on Windows: managed w2's newest report naming w1's ended conversation holds it. Copilot is not
+// spawned by this harness (`spawn_with` passes `-Client claude`), so the twin of the Unix Copilot move uses a Claude
+// member; the rule (the newest report of a managed client decides) is kind-independent. w1's terminal is finished
+// first, so w1's own client is not the holder named.
+#[test]
+fn a_managed_member_resumed_into_a_conversation_holds_it() {
+    let Some(live) = Live::start() else {
+        return;
+    };
+    let (w1, w2) = (live.spawn("w1"), live.spawn("w2"));
+    let (sid1, sid2) = (s(&w1["sessionId"]), s(&w2["sessionId"]));
+    let address = s(&w1["hcAddress"]);
+    live.run(&["stop", "w1"]);
+    live.wait("finished core terminal", || {
+        let got = private_core::run(live.core.command(&["get", &address, "--json"]), &live.dir);
+        (got.unwrap()["state"] == "finished").then_some(())
+    });
+    let pid = native::client_at(&live.dir, &s(&w2["hcAddress"]));
+    native::startup_report(&live.dir, pid);
+    let line = |sid: &str| format!("report\t-Session\t{sid}\t-Source\tresume");
+    let r = native::client_cmd(&live.dir, pid, &line(&sid1));
+    assert_eq!(
+        r["client"]["pid"], pid,
+        "the walk found w2's own client: {r}"
+    );
+    let refused = live.run_any(&["resume", "w1"]);
+    assert_eq!(refused["check"], "session", "{refused}");
+    // PM call 2: w2's client, its image, and the managed rule.
+    let message = s(&refused["message"]);
+    assert!(
+        message.starts_with(&format!("process {pid} (claude.exe)")),
+        "{message}"
+    );
+    assert!(
+        message.contains(mux_agent::agents::occupancy::Rule::Managed.phrase()),
+        "{message}"
+    );
+    native::client_cmd(&live.dir, pid, &line(&sid2));
+    live.run(&["resume", "w1"]);
 }
 
 // options-6e live on rmux for Windows: started with `--model x` and a task, stopped, its record seeded as in the

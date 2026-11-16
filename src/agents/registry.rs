@@ -1287,6 +1287,7 @@ mod tests {
             start: Some(start),
             path: argv.first().cloned(),
             argv: Some(argv),
+            image: None,
         });
         w
     }

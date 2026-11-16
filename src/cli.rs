@@ -1209,6 +1209,7 @@ mod tests {
             start: Some(1130),
             path: Some(exe.clone()),
             argv: Some(vec![exe, "watch".into()]),
+            image: None,
         });
         // The label read back after open's guarded label write.
         w.fakes.mux_rule(
@@ -1600,6 +1601,7 @@ mod tests {
             start: Some(2000),
             path: Some(exe.clone()),
             argv: Some(vec![exe, "watch".into()]),
+            image: None,
         });
         w.fakes
             .mux_rule("#{pane_id}|#{@agent-role}", 0, "%1|sidebar\n", "");

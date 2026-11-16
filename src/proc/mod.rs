@@ -22,6 +22,9 @@ pub struct Row {
     pub start: Option<i64>,
     pub path: Option<String>,
     pub argv: Option<Vec<String>>,
+    /// The name the OS lists without opening the process (Linux `comm`, macOS `proc_name`, Windows Toolhelp
+    /// `szExeFile`); none when unreadable, and always none from Windows `Os::row`, which has no snapshot (H1).
+    pub image: Option<String>,
 }
 
 #[cfg(unix)]
@@ -71,11 +74,20 @@ pub trait Os {
     fn kill(&self, opened: Opened) -> bool;
     fn cwd(&self, pid: u32) -> Option<String>;
     fn client_of(&self, row: &Row) -> Option<Client>;
+    /// o3 call 34 N2: `client_of` with "unknown" (None: its identity cannot be resolved) told apart from "no client"
+    /// (Some(None)).
+    fn client_known(&self, row: &Row) -> Option<Option<Client>> {
+        Some(self.client_of(row))
+    }
     fn is_shell(&self, row: &Row) -> bool;
     fn same_start(&self, opened: i64, listed: i64) -> bool;
     fn token(&self) -> Option<Token>;
     fn sandbox(&self) -> Signals;
     fn boot(&self) -> Boot;
+    /// Linux: `/proc/self/mountinfo` (`Some(Err)` when it cannot be read); None where there is no /proc.
+    fn proc_mounts(&self) -> Option<io::Result<String>> {
+        None
+    }
 }
 
 #[cfg(target_os = "macos")]

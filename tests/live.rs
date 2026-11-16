@@ -5055,6 +5055,58 @@ hc {}:
         );
     }
 
+    // occupy-3 H2 live: managed Copilot member w2 switches into w1's ended conversation (its fake client runs the
+    // `report -Session` its sessionStart hook runs after `/resume`). Resuming w1 is refused while w2's newest report
+    // names it, and admitted once w2 reports its own conversation again. w1's terminal is finished first, so w1's own
+    // client is not the holder named.
+    fn a_managed_copilot_resumed_into_a_conversation_holds_it(mux: Mux) {
+        let Some(mut live) = Live::human(mux) else {
+            return;
+        };
+        let w1 = live.spawn("w1", &[]);
+        let (code, w2) = live.try_spawn_client("copilot", "w2", &[]);
+        assert_eq!(code, 0, "{mux:?} {w2}");
+        let (sid1, sid2) = (
+            s(&w1["sessionId"]).to_string(),
+            s(&w2["sessionId"]).to_string(),
+        );
+        let address = s(&w1["hcAddress"]).to_string();
+        let (code, stop) = live.run(&["stop", "w1"]);
+        assert_eq!(code, 0, "{mux:?} {stop}");
+        assert!(
+            eventually(LONG, || core(&live, &["get", &address, "--json"])["state"]
+                == "finished"),
+            "{mux:?}"
+        );
+        let pid = crate::native::client_at(live.dir.path(), s(&w2["hcAddress"]));
+        crate::native::startup_report(live.dir.path(), pid);
+        let line = |sid: &str| format!("report\t-Session\t{sid}\t-Source\tresume");
+        let r = crate::native::client_cmd(live.dir.path(), pid, &line(&sid1));
+        assert_eq!(
+            r["client"]["pid"], pid,
+            "{mux:?} the walk found w2's own client: {r}"
+        );
+        let (code, refused) = live.run(&["resume", "w1"]);
+        assert_eq!(
+            (code, &refused["check"]),
+            (2, &json!("session")),
+            "{mux:?} {refused}"
+        );
+        // PM call 2: w2's client, its image, and the managed rule.
+        let message = s(&refused["message"]);
+        assert!(
+            message.starts_with(&format!("process {pid} (copilot)")),
+            "{mux:?} {message}"
+        );
+        assert!(
+            message.contains(mux_agent::agents::occupancy::Rule::Managed.phrase()),
+            "{mux:?} {message}"
+        );
+        crate::native::client_cmd(live.dir.path(), pid, &line(&sid2));
+        let (code, resumed) = live.run(&["resume", "w1"]);
+        assert_eq!(code, 0, "{mux:?} {resumed}");
+    }
+
     /// The hostile settings: renumbered windows, kept dead panes, and a default command that leaves a marker.
     fn hostile(live: &Live) -> PathBuf {
         let marker = live.dir.join("marker");
@@ -5590,6 +5642,7 @@ hc {}:
                     hc_view_close_survives_focus_stop,
                     hc_worker_reads_after_its_view_closes,
                     stop_then_resume_returns_with_its_conversation,
+                    a_managed_copilot_resumed_into_a_conversation_holds_it,
                     a_stopped_member_resumes_with_its_stored_options_only,
                     members_mail_without_the_multiplexer,
                     a_dropped_run_reply_runs_nothing_then_a_retry_runs_once,

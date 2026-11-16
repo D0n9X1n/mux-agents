@@ -299,27 +299,46 @@ pub fn unix_client(
     cwd: impl FnOnce() -> Option<String>,
     realpath: impl FnOnce(&str) -> Option<String>,
 ) -> Option<Client> {
-    let path = path?;
+    unix_client_known(path, argv, cwd, realpath).flatten()
+}
+
+/// o3 call 34 N2: `unix_client` with "unknown" (None) told apart from "no client" (Some(None)). Unknown: a `node`
+/// whose named script cannot be resolved (a relative script with the cwd unreadable or not absolute, or a path
+/// realpath cannot resolve). A row with no path or argv is no client here: occupancy judges it unbound by its image.
+/// A `node` running no script (`-e`, an empty name) cannot be the loader.
+pub fn unix_client_known(
+    path: Option<&str>,
+    argv: Option<&[String]>,
+    cwd: impl FnOnce() -> Option<String>,
+    realpath: impl FnOnce(&str) -> Option<String>,
+) -> Option<Option<Client>> {
+    let Some(path) = path else {
+        return Some(None);
+    };
     let file = path.rsplit('/').next().unwrap_or(path);
     if path.contains("/claude/versions/") || file == "claude" {
-        return Some(Client::Claude);
+        return Some(Some(Client::Claude));
     }
     if file == "copilot" {
-        return Some(Client::Copilot);
+        return Some(Some(Client::Copilot));
     }
-    if file != "node" {
-        return None;
-    }
-    let script = node_script(argv?).filter(|s| !s.is_empty())?;
+    let Some(argv) = argv.filter(|_| file == "node") else {
+        return Some(None);
+    };
+    let Some(script) = node_script(argv).filter(|s| !s.is_empty()) else {
+        return Some(None);
+    };
     let full = if script.starts_with('/') {
         script.to_string()
     } else {
         let cwd = cwd().filter(|c| c.starts_with('/'))?;
         format!("{}/{script}", cwd.trim_end_matches('/'))
     };
-    realpath(&full)?
-        .ends_with("/@github/copilot/npm-loader.js")
-        .then_some(Client::Copilot)
+    let real = realpath(&full)?;
+    Some(
+        real.ends_with("/@github/copilot/npm-loader.js")
+            .then_some(Client::Copilot),
+    )
 }
 
 fn windows_file_name(path: &str) -> &str {
@@ -939,6 +958,47 @@ mod tests {
         };
         assert_eq!(unix_client(node, Some(&argv), cwd, realpath), Some(Copilot));
         assert!(!read.get());
+    }
+
+    // o3 call 34 N2: a node row whose named script cannot be resolved (realpath fails; a relative script with the
+    // cwd unreadable) is unknown (None), never "no client"; a resolved unrelated script is no client; no script at all
+    // (`-e`) cannot be the loader; the loader is Copilot.
+    #[test]
+    fn unix_client_known_tells_unknown_from_no_client() {
+        let node = Some("/usr/bin/node");
+        let loader = "/l/@github/copilot/npm-loader.js";
+        let known = |argv: &[&str], cwd: Option<&str>, real: Option<&str>| {
+            let argv = strings(argv);
+            unix_client_known(
+                node,
+                Some(&argv),
+                || cwd.map(str::to_string),
+                |_| real.map(str::to_string),
+            )
+        };
+        assert_eq!(
+            known(&["node", loader], None, Some(loader)),
+            Some(Some(Client::Copilot))
+        );
+        assert_eq!(
+            known(&["node", "/srv/app.js"], None, Some("/srv/app.js")),
+            Some(None)
+        );
+        assert_eq!(known(&["node", loader], None, None), None, "realpath fails");
+        assert_eq!(
+            known(&["node", "app.js"], None, Some("/srv/app.js")),
+            None,
+            "cwd unreadable"
+        );
+        assert_eq!(
+            known(&["node", "-e", "1"], None, None),
+            Some(None),
+            "no script"
+        );
+        assert_eq!(
+            unix_client_known(Some("/usr/bin/vim"), None, || None, |_| None),
+            Some(None)
+        );
     }
 
     #[test]
