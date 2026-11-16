@@ -200,6 +200,8 @@ fn stop_uses_hc_only() {
         });
         for _ in 0..2 {
             cf::online(&w);
+            // prelife-1c P-R3: the validating get (Running) is the last hc call before the kill.
+            cf::get(&w, "taaaaaaaaaaaa", cf::wire(&r));
             cf::answer(&w, &["kill", "taaaaaaaaaaaa", "--json"], "{}");
             let mut fact = cf::wire(&r);
             match mode {
@@ -352,6 +354,8 @@ fn stop_errors_and_authorization() {
             } else {
                 Err(crate::error::Refusal::internal("timeout"))
             };
+            // prelife-1c P-R3: the validating get (Running) is the last hc call before the kill.
+            cf::get(&w, "taaaaaaaaaaaa", cf::wire(&r));
             w.fakes
                 .hc_expect(&["kill", "taaaaaaaaaaaa", "--json"], result);
         }
@@ -397,6 +401,8 @@ fn stop_ignores_view_and_launcher_process_evidence() {
             json!({"pid":300,"start":999,"exitCode":7}),
         );
         cf::online(&w);
+        // prelife-1c P-R3: the validating get (Running) is the last hc call before the kill.
+        cf::get(&w, "taaaaaaaaaaaa", cf::wire(&r));
         cf::answer(&w, &["kill", "taaaaaaaaaaaa", "--json"], "{}");
         let mut t = cf::wire(&r);
         t["state"] = json!("finished");
@@ -444,6 +450,8 @@ fn stop_notice_race_is_not_lifecycle_authority() {
         String::new()
     });
     cf::online(&w);
+    // prelife-1c P-R3: the validating get (Running) is the last hc call before the kill.
+    cf::get(&w, "taaaaaaaaaaaa", cf::wire(&r));
     cf::answer(&w, &["kill", "taaaaaaaaaaaa", "--json"], "{}");
     cf::get(&w, "taaaaaaaaaaaa", cf::wire(&r));
     assert_eq!(
@@ -486,6 +494,8 @@ fn stop_resolves_reused_name_beyond_board_history_limit() {
         cf::get(&w, "taaaaaaaaaaaa", old);
         cf::get(&w, "tbbbbbbbbbbbb", fresh);
         cf::online(&w);
+        // prelife-1c P-R3: the validating get (Running) is the last hc call before the kill.
+        cf::get(&w, "tbbbbbbbbbbbb", cf::wire(&b));
         cf::answer(&w, &["kill", "tbbbbbbbbbbbb", "--json"], "{}");
         let mut killed = cf::wire(&b);
         killed["state"] = json!("finished");
@@ -520,6 +530,8 @@ fn stopping(w: &World, lifecycle: bool) {
     cf::proven(w, ID, 31337, 150);
     w.fakes.process(crate::testing::row(150, 31337, 1500));
     cf::online(w);
+    // prelife-1c P-R3: the validating get (Running) is the last hc call before the kill.
+    cf::get(w, "taaaaaaaaaaaa", cf::wire(&r));
     cf::answer(w, &["kill", "taaaaaaaaaaaa", "--json"], "{}");
     let mut t = cf::wire(&r);
     t["state"] = json!("finished");

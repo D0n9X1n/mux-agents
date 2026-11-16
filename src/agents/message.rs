@@ -7,7 +7,7 @@ use std::time::{Duration, SystemTime};
 use serde_json::{Map, Value, json};
 
 use super::mail::{add_mail, doing_line, message_text};
-use super::registry::{self, Notice, add_notice, self_of};
+use super::registry::{self, self_of};
 use super::view::first;
 use super::{FILES_ONLY, lock, lock_key, pane_id, server_dir, text, usage};
 use crate::caller::{Caller, Kind, resolve};
@@ -1068,17 +1068,30 @@ fn stop_pre(
             Some(s) => super::tree::authority(ctx, caller, s, &id.id, "stop")?,
             None => parent_or_human(caller, &record)?,
         }
+        // prelife-1c call 12: the existing notice is read (walk-checked) before any hc call; torn refuses.
+        let prior = registry::legacy_notice(ctx, caller, &id.id)?;
         let core = crate::hc::connect(ctx)?;
-        core.kill(&id.address)?;
-        let fact = core.get(&id.address).ok().filter(|t| id.matches(t));
+        // G10c, P-R3, p1c-calls 4-5: this get is the last hc call before any kill. Exactly Running (this identity's
+        // labels, the recorded launcher argv) is killed; Lost or Ended is never killed but is noticed `stopped`, which
+        // frees its slot; Unknown (missing, unmatched, unreadable) is refused and changes nothing.
         use super::lifecycle::{Life, classify};
-        let life = match classify(fact.as_ref(), &id.launcher) {
+        let word = |l: Life| match l {
             Life::Running => "running",
             Life::Lost => "lost",
             Life::Ended => "ended",
             Life::Unknown => "unknown",
         };
-        add_notice(ctx, caller, &id.id, &record, Notice::Stopped)?;
+        let now = core.get(&id.address).ok().filter(|t| id.matches(t));
+        let life = match classify(now.as_ref(), &id.launcher) {
+            Life::Running => {
+                core.kill(&id.address)?;
+                let fact = core.get(&id.address).ok().filter(|t| id.matches(t));
+                word(classify(fact.as_ref(), &id.launcher))
+            }
+            Life::Unknown => return Err(super::prelife::not_running(&id.name)),
+            other => word(other),
+        };
+        registry::stop_notice(ctx, caller, &id.id, &record, prior.as_deref())?;
         let member = server_dir(ctx, caller).join("agents").join(&id.id);
         let client = recorded_client(&member, &record, &id.generation);
         let mut reply = Map::new();
@@ -1088,6 +1101,10 @@ fn stop_pre(
         Ok((reply, client))
     })
 }
+
+#[cfg(test)]
+#[path = "prelife_stop_tests.rs"]
+mod prelife_stop_tests;
 
 #[cfg(test)]
 mod tests {
@@ -2703,6 +2720,8 @@ mod tests {
             json!({"name":"a","startCommand":launch_command("%9")}),
         );
         cf::online(&w);
+        // prelife-1c P-R3: the validating get (Running) is the last hc call before the kill.
+        cf::get(&w, "taaaaaaaaaaaa", cf::wire(&r));
         cf::answer(&w, &["kill", "taaaaaaaaaaaa", "--json"], "{}");
         let mut t = cf::wire(&r);
         t["state"] = json!("finished");
