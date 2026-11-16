@@ -999,6 +999,47 @@ fn an_unreadable_claude_exe_blocks_resume() {
     let _ = std::fs::remove_dir_all(&elevated);
 }
 
+// occupy-3 H2 live on Windows: managed w2's newest report naming w1's ended conversation holds it. Copilot is not
+// spawned by this harness (`spawn_with` passes `-Client claude`), so the twin of the Unix Copilot move uses a Claude
+// member; the rule (the newest report of a managed client decides) is kind-independent. w1's terminal is finished
+// first, so w1's own client is not the holder named.
+#[test]
+fn a_managed_member_resumed_into_a_conversation_holds_it() {
+    let Some(live) = Live::start() else {
+        return;
+    };
+    let (w1, w2) = (live.spawn("w1"), live.spawn("w2"));
+    let (sid1, sid2) = (s(&w1["sessionId"]), s(&w2["sessionId"]));
+    let address = s(&w1["hcAddress"]);
+    live.run(&["stop", "w1"]);
+    live.wait("finished core terminal", || {
+        let got = private_core::run(live.core.command(&["get", &address, "--json"]), &live.dir);
+        (got.unwrap()["state"] == "finished").then_some(())
+    });
+    let pid = native::client_at(&live.dir, &s(&w2["hcAddress"]));
+    native::startup_report(&live.dir, pid);
+    let line = |sid: &str| format!("report\t-Session\t{sid}\t-Source\tresume");
+    let r = native::client_cmd(&live.dir, pid, &line(&sid1));
+    assert_eq!(
+        r["client"]["pid"], pid,
+        "the walk found w2's own client: {r}"
+    );
+    let refused = live.run_any(&["resume", "w1"]);
+    assert_eq!(refused["check"], "session", "{refused}");
+    // PM call 2: w2's client, its image, and the managed rule.
+    let message = s(&refused["message"]);
+    assert!(
+        message.starts_with(&format!("process {pid} (claude.exe)")),
+        "{message}"
+    );
+    assert!(
+        message.contains(mux_agent::agents::occupancy::Rule::Managed.phrase()),
+        "{message}"
+    );
+    native::client_cmd(&live.dir, pid, &line(&sid2));
+    live.run(&["resume", "w1"]);
+}
+
 // options-6e live on rmux for Windows: started with `--model x` and a task, stopped, its record seeded as in the
 // task text, resumed: argv `--model x --resume <sid>`, no task.
 #[test]

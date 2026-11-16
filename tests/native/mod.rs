@@ -310,6 +310,67 @@ pub fn within_10_s<T>(what: &str, mut ready: impl FnMut() -> Option<T>) -> T {
     }
 }
 
+/// occupy-3 Task 8: runs one tab-split mux-agent line through fake client `pid` (fake-client.rs protocol: `cmd.<pid>`,
+/// answered in `reply.<pid>.<n>.json`, n counting taken files from 1) and returns its JSON reply, within 60 s.
+pub fn client_cmd(dir: &Path, pid: u32, line: &str) -> serde_json::Value {
+    let taken = std::fs::read_dir(dir)
+        .unwrap()
+        .filter_map(Result::ok)
+        .filter(|e| {
+            e.file_name()
+                .to_string_lossy()
+                .starts_with(&format!("cmd.{pid}.taken."))
+        })
+        .count();
+    let tmp = dir.join(format!("cmd.{pid}.tmp"));
+    std::fs::write(&tmp, format!("{line}\n")).unwrap();
+    std::fs::rename(&tmp, dir.join(format!("cmd.{pid}"))).unwrap();
+    let reply = dir.join(format!("reply.{pid}.{}.json", taken + 1));
+    let end = Instant::now() + Duration::from_secs(60);
+    loop {
+        if let Ok(text) = std::fs::read_to_string(&reply) {
+            return serde_json::from_str(&text).unwrap();
+        }
+        assert!(Instant::now() < end, "no reply from client {pid} to {line}");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// The fake client whose `client.<pid>.json` env names `address` as its HC_TERMINAL_ID, within 60 s.
+pub fn client_at(dir: &Path, address: &str) -> u32 {
+    let end = Instant::now() + Duration::from_secs(60);
+    loop {
+        let found = std::fs::read_to_string(dir.join("clients.log"))
+            .ok()
+            .and_then(|log| {
+                log.lines().find_map(|p| {
+                    let pid: u32 = p.trim().parse().ok()?;
+                    let file = dir.join(format!("client.{pid}.json"));
+                    let r: serde_json::Value =
+                        serde_json::from_str(&std::fs::read_to_string(file).ok()?).ok()?;
+                    (r["env"]["HC_TERMINAL_ID"] == address).then_some(pid)
+                })
+            });
+        if let Some(pid) = found {
+            return pid;
+        }
+        assert!(Instant::now() < end, "no client in terminal {address}");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// report-2b Task 9: fake client `pid`'s own startup `report -Session` has finished (its reply `session.<pid>.json`
+/// exists), within 60 s. A synthetic report sent after this is the newest; sent before, the startup one could land
+/// after it and win.
+pub fn startup_report(dir: &Path, pid: u32) {
+    let file = dir.join(format!("session.{pid}.json"));
+    let end = Instant::now() + Duration::from_secs(60);
+    while !file.exists() {
+        assert!(Instant::now() < end, "client {pid} made no startup report");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
