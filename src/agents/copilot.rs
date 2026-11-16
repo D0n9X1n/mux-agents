@@ -11,9 +11,10 @@ pub fn session_folder(home: &Path, id: &str) -> PathBuf {
 
 /// Copies session `source` to `target` and returns whether the copy is usable. Both ids must be GUIDs. Top-level
 /// `*.jsonl` lose a final unterminated segment that does not parse (a parsable one gets its LF); `*.yaml` are never
-/// cut. In both, `source` becomes `target` and workspace.yaml loses its `mc_` lines. Subfolders are copied as they
-/// are. The copy is built and verified in a uniquely named sibling temp folder, then renamed into place without
-/// replacing anything; a failure deletes only the temp folder.
+/// cut. In both, `source` becomes `target` and workspace.yaml loses its `mc_` keys; an `mc_` value the copy cannot
+/// verify (see `without_mc`) refuses the copy. Subfolders are copied as they are. The copy is built and verified in
+/// a uniquely named sibling temp folder, then renamed into place without replacing anything; a failure deletes only
+/// the temp folder.
 pub fn copy_session(home: &Path, source: &str, target: &str) -> bool {
     if !crate::checks::session_id(source) || !crate::checks::session_id(target) {
         return false;
@@ -75,7 +76,8 @@ fn build(from: &Path, temp: &Path, source: &str, target: &str) -> io::Result<()>
         }
         text = text.replace(source, target);
         if name == "workspace.yaml" {
-            text = without_mc(&text);
+            text = without_mc(&text)
+                .ok_or_else(|| invalid("workspace.yaml has an mc_ value the copy cannot drop"))?;
         }
         std::fs::write(&path, &text)?;
         if jsonl {
@@ -107,7 +109,10 @@ fn build(from: &Path, temp: &Path, source: &str, target: &str) -> io::Result<()>
 /// leaves its children under the previous key, which Copilot then refuses to load. Only a non-blank, non-comment
 /// line without indent ends a block. A blank or comment line met inside one is held: an indented line after it
 /// drops it with the block; a top-level line or the end of the text keeps it.
-fn without_mc(text: &str) -> String {
+///
+/// `None` refuses what the filter cannot verify: an `mc_` key line that leaves a `{` or `[` open, or a first
+/// top-level line after an `mc_` key that is not a plain `key:` line (`- item`, `}`, `]`, ...).
+fn without_mc(text: &str) -> Option<String> {
     let mut kept = Vec::new();
     let mut held = Vec::new();
     let mut dropping = false;
@@ -118,15 +123,41 @@ fn without_mc(text: &str) -> String {
         } else if dropping && line.starts_with([' ', '\t']) {
             held.clear();
         } else {
+            if dropping && !plain_key(line) {
+                return None;
+            }
             kept.append(&mut held);
             dropping = line.starts_with("mc_");
+            if dropping && open_flow(line) {
+                return None;
+            }
             if !dropping {
                 kept.push(line);
             }
         }
     }
     kept.append(&mut held);
-    kept.join("\n")
+    Some(kept.join("\n"))
+}
+
+/// A top-level line that starts a plain `key:` entry: a letter, digit or `_` first, and a `:` that ends the line or
+/// is followed by a space.
+fn plain_key(line: &str) -> bool {
+    let line = line.trim_end();
+    line.starts_with(|c: char| c.is_ascii_alphanumeric() || c == '_')
+        && (line.ends_with(':') || line.contains(": "))
+}
+
+/// Whether `line` leaves a flow `{` or `[` open. shortcut: brackets inside quotes are counted too. A quoted `{` or
+/// `[` refuses a valid value; a quoted `}` or `]` can hide an open one, and a closer that then reaches column 0 is
+/// still refused by `plain_key`.
+fn open_flow(line: &str) -> bool {
+    let depth = line.chars().fold(0i32, |depth, c| match c {
+        '{' | '[' => depth + 1,
+        '}' | ']' => depth - 1,
+        _ => depth,
+    });
+    depth > 0
 }
 
 /// Folders and files below `from` into `to`. A link (or junction) refuses the copy: Copilot makes none, and
@@ -368,14 +399,57 @@ mod tests {
         );
     }
 
+    // Whether the copy of a workspace.yaml with `body` below its id line is refused, leaving no target and no temp.
+    fn refused(body: &str) -> bool {
+        let s = session();
+        std::fs::write(
+            s.source.join("workspace.yaml"),
+            format!("id: {OLD}\n{body}"),
+        )
+        .unwrap();
+        let copied = copy_session(s.home.path(), OLD, NEW);
+        !copied && !s.target.exists() && names(s.source.parent().unwrap()) == [OLD]
+    }
+
+    #[test]
+    fn copilot_copy_refuses_an_mc_sequence_at_column_0() {
+        assert!(refused(
+            "cwd: /work\nremote_steerable: false\nmc_x:\n- warning\nsummary: s\n"
+        ));
+    }
+
+    #[test]
+    fn copilot_copy_refuses_an_mc_flow_value_left_open() {
+        assert!(refused(
+            "cwd: /work\nmc_x: {\n  message: m\n}\nsummary: s\n"
+        ));
+    }
+
+    #[test]
+    fn copilot_copy_drops_a_one_line_flow_mc_value() {
+        assert_eq!(
+            copied_workspace("cwd: /work\nmc_x: { a: 1 }\nsummary: s\n"),
+            format!("id: {NEW}\ncwd: /work\nsummary: s\n")
+        );
+    }
+
+    #[test]
+    fn copilot_copy_drops_a_plain_mc_value() {
+        assert_eq!(
+            copied_workspace("cwd: /work\nmc_x: plain\nsummary: s\n"),
+            format!("id: {NEW}\ncwd: /work\nsummary: s\n")
+        );
+    }
+
     #[test]
     fn without_mc_drops_a_crlf_mc_block_whole() {
         // The filter itself: copy_session refuses a CRLF workspace.yaml at its `id:` line check.
         assert_eq!(
             without_mc(
                 "id: x\r\ncwd: /work\r\nmc_pending_repository_warning:\r\n  mc_session_id: x\r\n  message: m\r\nsummary: s\r\n"
-            ),
-            "id: x\r\ncwd: /work\r\nsummary: s\r\n"
+            )
+            .as_deref(),
+            Some("id: x\r\ncwd: /work\r\nsummary: s\r\n")
         );
     }
 
