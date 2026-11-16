@@ -1864,3 +1864,26 @@ fn a_fenced_successor_keeps_its_predecessor_taken() {
         assert_eq!(ran, want, "{case}: ran nothing");
     }
 }
+
+// Checklist 16, PM call 1: a successor whose view fails after the commit stays; resume's reply carries viewError.
+#[test]
+fn a_resume_whose_view_fails_after_the_commit_keeps_the_successor() {
+    let w = World::human("");
+    let x = member(&w, ID, json!({"pane": "%5", "window": "@1", "depth": 1}));
+    let before = folders(&w);
+    w.panes(&[]);
+    facts(&w, &[(&x, "exited")]);
+    launches(&w, "t1");
+    w.fakes.mux_first("new-window", 1, "", "no room");
+    let reply = resume_of(&w, ID).unwrap();
+    assert_eq!(reply["view"], json!("none"), "{reply:?}");
+    assert!(reply["viewError"].is_string(), "{reply:?}");
+    let y = new_folder(&w, &before);
+    assert!(gens::committed(&y, 0).unwrap(), "the successor stays");
+    assert!(!y.join("view.json").exists());
+    assert!(
+        !w.fakes.hc_calls().iter().any(|(_, a, _)| a[0] == "kill"),
+        "nothing is rolled back"
+    );
+    w.fakes.hc_done().unwrap();
+}
