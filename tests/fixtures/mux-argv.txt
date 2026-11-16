@@ -23,6 +23,8 @@
 # 0.2.1: no -Split or -Tab, so the session's placement is read, before the spawn lock
 -N show-options -qv -t $3 @mux-agents-placement
 -N list-panes -s -t $3 -F <marker>#{pane_id}<marker>#{window_id}<marker>#{pane_pid}<marker>#{pane_dead}<marker>#{pane_start_command}<marker>#{@agent-id}<marker>#{@agent-name}<marker>
+# 0.3.0 (#103, views-6f call 5): the launch finds or makes its view under the member lock; it lists the session's panes first, so a pane already attaching the new terminal is adopted, never doubled
+-N list-panes -s -t $3 -F <marker>#{pane_id}<marker>#{window_id}<marker>#{pane_pid}<marker>#{pane_dead}<marker>#{pane_start_command}<marker>#{@agent-id}<marker>#{@agent-name}<marker>
 -N new-window -d -P -F #{pane_id}|#{window_id}|#{pane_start_command} -t $3: -n hi -e MUX_AGENTS_STATE=<state> -c <cwd> <hc> attach t1
 -N if-shell -F -t %12 '#{==:#{pane_start_command},hc attach t1}' 'set-option -p -t %12 @agent-id <id> ; set-option -p -t %12 @agent-name hi ; set-option -p -t %12 @agent-parent %1 ; set-option -p -t %12 @agent-context brief:human'
 -N if-shell -F -t %12 '#{==:#{pane_start_command},hc attach t1}' 'select-pane -T hi -t %12'
@@ -61,6 +63,7 @@
 -N display-message -p -t %1 #{pid}|#{pane_pid}|#{session_id}|#{window_id}|#{@agent-id}
 -N list-panes -s -t $3 -F <marker>#{pane_id}<marker>#{window_id}<marker>#{pane_pid}<marker>#{pane_dead}<marker>#{pane_start_command}<marker>#{@agent-id}<marker>#{@agent-name}<marker>
 -N list-panes -s -t $3 -F <marker>#{pane_id}<marker>#{window_id}<marker>#{pane_pid}<marker>#{pane_dead}<marker>#{pane_start_command}<marker>#{@agent-id}<marker>#{@agent-name}<marker>
+-N list-panes -s -t $3 -F <marker>#{pane_id}<marker>#{window_id}<marker>#{pane_pid}<marker>#{pane_dead}<marker>#{pane_start_command}<marker>#{@agent-id}<marker>#{@agent-name}<marker>
 -N split-window -v -d -P -F #{pane_id}|#{window_id}|#{pane_start_command} -t %1 -e MUX_AGENTS_STATE=<state> -c <cwd> <hc> attach t1
 -N if-shell -F -t %12 '#{==:#{pane_start_command},hc attach t1}' 'set-option -p -t %12 @agent-id <id> ; set-option -p -t %12 @agent-name helper ; set-option -p -t %12 @agent-parent %1 ; set-option -p -t %12 @agent-context brief:human'
 -N if-shell -F -t %12 '#{==:#{pane_start_command},hc attach t1}' 'select-pane -T helper -t %12'
@@ -95,6 +98,7 @@
 -N show-options -qv -t $3 @mux-agents-placement
 -N list-panes -s -t $3 -F <marker>#{pane_id}<marker>#{window_id}<marker>#{pane_pid}<marker>#{pane_dead}<marker>#{pane_start_command}<marker>#{@agent-id}<marker>#{@agent-name}<marker>
 # the stored placement: a split beside the caller, as -Split h
+-N list-panes -s -t $3 -F <marker>#{pane_id}<marker>#{window_id}<marker>#{pane_pid}<marker>#{pane_dead}<marker>#{pane_start_command}<marker>#{@agent-id}<marker>#{@agent-name}<marker>
 -N split-window -h -d -P -F #{pane_id}|#{window_id}|#{pane_start_command} -t %1 -e MUX_AGENTS_STATE=<state> -c <cwd> <hc> attach t1
 -N if-shell -F -t %12 '#{==:#{pane_start_command},hc attach t1}' 'set-option -p -t %12 @agent-id <id> ; set-option -p -t %12 @agent-name hi ; set-option -p -t %12 @agent-parent %1 ; set-option -p -t %12 @agent-context brief:human'
 -N if-shell -F -t %12 '#{==:#{pane_start_command},hc attach t1}' 'select-pane -T hi -t %12'
@@ -107,6 +111,7 @@
 -N display-message -p -t %1 #{pid}|#{pane_pid}|#{session_id}|#{window_id}|#{@agent-id}
 -N list-panes -s -t $3 -F <marker>#{pane_id}<marker>#{window_id}<marker>#{pane_pid}<marker>#{pane_dead}<marker>#{pane_start_command}<marker>#{@agent-id}<marker>#{@agent-name}<marker>
 -N show-options -qv -t $3 @mux-agents-placement
+-N list-panes -s -t $3 -F <marker>#{pane_id}<marker>#{window_id}<marker>#{pane_pid}<marker>#{pane_dead}<marker>#{pane_start_command}<marker>#{@agent-id}<marker>#{@agent-name}<marker>
 -N list-panes -s -t $3 -F <marker>#{pane_id}<marker>#{window_id}<marker>#{pane_pid}<marker>#{pane_dead}<marker>#{pane_start_command}<marker>#{@agent-id}<marker>#{@agent-name}<marker>
 -N new-window -d -P -F #{pane_id}|#{window_id}|#{pane_start_command} -t $3: -n hi -e MUX_AGENTS_STATE=<state> -c <cwd> <hc> attach t1
 -N if-shell -F -t %12 '#{==:#{pane_start_command},hc attach t1}' 'set-option -p -t %12 @agent-id <id> ; set-option -p -t %12 @agent-name hi ; set-option -p -t %12 @agent-parent %1 ; set-option -p -t %12 @agent-context brief:human'

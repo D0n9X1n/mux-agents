@@ -402,7 +402,7 @@ pub fn presented(g: &super::gens::Gen, s: &super::gens::Status) -> Res<Value> {
     Ok(record)
 }
 
-/// S4 for a caller that holds the member lock (`view::restore_view`, `view`): reads the member once (R1: one
+/// S4 for a caller that holds the member lock (`view::create`, `view::adopt`, `view`): reads the member once (R1: one
 /// `member_of`, one `status`) and writes only the subject generation's view (W1, PM call 20). A lifecycle member's
 /// goes to view.json; a pre-lifecycle member's three view fields go into its record.json (ambiguity 1). Anything
 /// else refuses 2 `target` and writes nothing; an unreadable member refuses `evidence`.

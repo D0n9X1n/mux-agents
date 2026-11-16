@@ -472,3 +472,136 @@ fn a_malformed_recorded_address_is_never_adopted() {
     assert!(matches!(got, Member::NoView), "{got:?}");
     assert!(!f.join("view.json").exists(), "nothing adopted");
 }
+
+/// `new-window` answers `%19` in `@5` running `command`; from then on `list-panes` shows it (a live multiplexer).
+fn one_window(w: &World, command: String) {
+    let made = std::rc::Rc::new(std::cell::Cell::new(false));
+    let (m, c) = (made.clone(), command.clone());
+    w.fakes.mux_script("new-window", move |_| {
+        m.set(true);
+        Ok(crate::mux::Output {
+            code: 0,
+            stdout: format!("%19|@5|{c}\n"),
+            stderr: String::new(),
+        })
+    });
+    w.fakes.mux_script("list-panes", move |argv| {
+        let rows: Vec<super::fixture::Listed> = if made.get() {
+            vec![super::fixture::Listed {
+                pane: "%19".into(),
+                window: "@5".into(),
+                pid: "300".into(),
+                dead: false,
+                command: command.clone(),
+                tag: String::new(),
+                name: String::new(),
+            }]
+        } else {
+            Vec::new()
+        };
+        Ok(crate::mux::Output {
+            code: 0,
+            stdout: super::fixture::listed_rows(argv, &rows, "\n"),
+            stderr: String::new(),
+        })
+    });
+}
+
+// v6f call 5: the launch paused after its promotion; a focus runs and creates the view; the launch resumes: it adopts
+// that view. Exactly one `new-window`; view.json names its pane. Reversed: the launch creates, focus selects it.
+#[test]
+fn a_launch_and_a_focus_create_one_view_in_either_order() {
+    for focus_first in [true, false] {
+        let w = World::human("");
+        let f = promoted(&w);
+        one_window(&w, hc_attach(&w, "t1"));
+        w.launches_hold();
+        select_ok(&w);
+        super::core_fixture::online(&w);
+        let core = crate::hc::connect(&w.ctx).unwrap();
+        let record = lf::record(&f);
+        let launch =
+            || super::view::launch_view(&w.ctx, &core, &w.caller(), &record, None).unwrap();
+        let focused = || match super::view::focus_member(&w.ctx, Some(&core), &w.caller(), ID, None)
+            .unwrap()
+        {
+            Member::Focused(x) => x,
+            other => panic!("{other:?}"),
+        };
+        let (from_launch, from_focus) = if focus_first {
+            let x = focused();
+            (launch(), x)
+        } else {
+            let v = launch();
+            (v, focused())
+        };
+        assert_eq!(new_windows(&w), 1, "focus_first {focus_first}: one view");
+        assert_eq!(
+            (&from_launch["pane"], from_focus.pane.as_str()),
+            (&json!("%19"), "%19"),
+            "focus_first {focus_first}"
+        );
+        assert_eq!(
+            read(&f.join("view.json"))["pane"],
+            "%19",
+            "focus_first {focus_first}"
+        );
+        w.fakes.hc_done().unwrap();
+    }
+}
+
+// v6f call 13 (re-audit 1-3 F2): a view made with only `herdr-core` installed stays the view after `hc` is installed:
+// the recorded program decides, never what `PATH` resolves today. Focus opens no `new-window` and (checklist 7)
+// leaves view.json byte-identical: a sentinel field shows it is never rewritten by an adoption.
+#[test]
+fn a_view_stays_its_own_after_another_hc_is_installed() {
+    let w = World::human("");
+    let f = promoted(&w);
+    let herdr = w.fakes.hc_install("herdr-core").display().to_string();
+    one_window(&w, format!("\"{herdr}\" attach t1"));
+    w.launches_hold();
+    select_ok(&w);
+    super::core_fixture::answer(&w, &["--version"], "hc 0.1.21");
+    let core = crate::hc::connect(&w.ctx).unwrap();
+    let v = super::view::launch_view(&w.ctx, &core, &w.caller(), &lf::record(&f), None).unwrap();
+    assert_eq!(
+        v["attachProgram"],
+        json!(herdr),
+        "the program the launch ran"
+    );
+    let mut sentinel = read(&f.join("view.json"));
+    sentinel["probe"] = json!(1);
+    write(&f.join("view.json"), sentinel);
+    let before = std::fs::read(f.join("view.json")).unwrap();
+    w.fakes.hc_install("hc");
+    let opened = new_windows(&w);
+    let got = focus(&w);
+    assert_eq!(
+        (got.pane.as_str(), new_windows(&w) - opened),
+        ("%19", 0),
+        "the recorded program: no second view"
+    );
+    assert_eq!(
+        std::fs::read(f.join("view.json")).unwrap(),
+        before,
+        "the descriptor stands"
+    );
+}
+
+// v6f call 16 (checklist 5), the launch's path: a torn view.json beside the promoted member refuses `evidence`; the
+// launch creates nothing and leaves the file as it was.
+#[test]
+fn a_launch_beside_a_torn_view_file_creates_nothing() {
+    let w = World::human("");
+    let f = promoted(&w);
+    std::fs::write(f.join("view.json"), b"{").unwrap();
+    one_window(&w, hc_attach(&w, "t1"));
+    w.launches_hold();
+    super::core_fixture::online(&w);
+    let core = crate::hc::connect(&w.ctx).unwrap();
+    let e =
+        super::view::launch_view(&w.ctx, &core, &w.caller(), &lf::record(&f), None).unwrap_err();
+    assert_eq!((e.code, e.check), (1, "evidence"), "{e:?}");
+    assert_eq!(new_windows(&w), 0, "nothing created");
+    assert_eq!(std::fs::read(f.join("view.json")).unwrap(), b"{");
+}

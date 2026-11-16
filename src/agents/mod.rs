@@ -50,7 +50,7 @@ pub mod tree;
 pub mod up;
 pub mod view;
 #[cfg(test)]
-mod view_bind_tests;
+pub(crate) mod view_bind_tests;
 #[cfg(test)]
 mod view_hc_tests;
 

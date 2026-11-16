@@ -805,3 +805,29 @@ fn a_resume_is_a_new_lifecycle_member_with_the_ended_session() {
     );
     assert_eq!(spec["flags"], json!(["--model", "x"]));
 }
+// v6f call 5 (wiring): the adapter goes through `view_locked`, so a pane that already attaches the new terminal
+// (a focus that won the race) is the view: no `new-window`.
+#[test]
+fn a_spawn_adopts_a_pane_that_already_attaches_its_terminal() {
+    let w = World::human("");
+    let caller = w.caller();
+    ready(&w);
+    crate::agents::view_bind_tests::attach_panes(&w, &[("%12", "t1")], &[]);
+    let r = launch_hc(&w.ctx, &caller, request(&w), slot).unwrap();
+    assert_eq!(
+        (&r["pane"], r.get("viewError")),
+        (&json!("%12"), None),
+        "{r}"
+    );
+    let opened = w
+        .fakes
+        .mux_calls()
+        .into_iter()
+        .filter(|c| c.iter().any(|t| t == "new-window"))
+        .count();
+    assert_eq!(opened, 0);
+    assert_eq!(
+        read_json(&of(&w, &r).join("view.json")).unwrap().unwrap()["pane"],
+        "%12"
+    );
+}

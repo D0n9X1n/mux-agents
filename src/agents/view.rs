@@ -334,44 +334,70 @@ fn focus_identity(
     expected: Option<&str>,
 ) -> Res<Option<Focused>> {
     lock(ctx, &lock_key("member", caller, &id.id), || {
-        let record = super::member_target::current(ctx, caller, id)?;
-        let rows = registry::rows(ctx, caller)?;
-        let key = super::core_identity::Key::of(caller);
-        // 6f-R2: only here, under the member lock, is a pane adopted. Pre-lifecycle keeps main's rule.
-        let found = if super::gens::lifecycle(&record) {
-            id.search(&record, &rows, &key)
-        } else {
-            id.view(&record, &rows, &key)
-                .map(|pane| super::core_identity::Located {
-                    pane,
-                    adopted: false,
-                    duplicates: 0,
-                })
+        // The placement is read only when a pane is made, as main read it only to restore a view.
+        let split = || {
+            let placement = super::placement::read_placement(ctx, caller)
+                .ok()
+                .flatten()
+                .unwrap_or(super::placement::DEFAULT);
+            (placement != "tab").then(|| placement.to_string())
         };
-        if expected.is_some_and(|e| found.as_ref().is_none_or(|l| l.pane.pane != e)) {
-            return refuse(
-                2,
-                "target",
-                "the agent is no longer on the pane the bar drew",
-            );
-        }
-        match (found, core) {
-            (Some(l), _) => {
-                if l.adopted {
-                    adopt(ctx, caller, id, &l.pane)?;
-                }
-                let p = &l.pane;
-                select_view(ctx, &id.id, &p.name, &p.pane, &p.window, &p.launch).map(|f| {
-                    Some(Focused {
-                        duplicates: l.duplicates,
-                        ..f
-                    })
-                })
-            }
-            (None, Some(core)) => restore_view(ctx, core, caller, id, record).map(Some),
-            (None, None) => Ok(None),
-        }
+        let Some(l) = view_locked(ctx, core, caller, id, expected, split)? else {
+            return Ok(None);
+        };
+        let p = &l.pane;
+        select_view(ctx, &id.id, &p.name, &p.pane, &p.window, &p.launch).map(|f| {
+            Some(Focused {
+                duplicates: l.duplicates,
+                ..f
+            })
+        })
     })
+}
+
+/// v6f call 5, 6f-R2: the one way a view of `id` is found or made, by a holder of `member|<key>|<id>`. A valid
+/// descriptor or a pane attaching the subject address is the view (adopted once); only otherwise, with `core`, one
+/// pane is created at `split()` and its descriptor written. `expected` (the bar's drawn pane) refuses before anything
+/// is made.
+pub(crate) fn view_locked(
+    ctx: &Ctx,
+    core: Option<&crate::hc::Core<'_>>,
+    caller: &Caller,
+    id: &super::core_identity::Identity,
+    expected: Option<&str>,
+    split: impl FnOnce() -> Option<String>,
+) -> Res<Option<super::core_identity::Located>> {
+    let record = super::member_target::current(ctx, caller, id)?;
+    let rows = registry::rows(ctx, caller)?;
+    let key = super::core_identity::Key::of(caller);
+    // Pre-lifecycle keeps main's rule: its descriptor or nothing.
+    let found = if super::gens::lifecycle(&record) {
+        id.search(&record, &rows, &key)
+    } else {
+        id.view(&record, &rows, &key)
+            .map(|pane| super::core_identity::Located {
+                pane,
+                adopted: false,
+                duplicates: 0,
+            })
+    };
+    if expected.is_some_and(|e| found.as_ref().is_none_or(|l| l.pane.pane != e)) {
+        return refuse(
+            2,
+            "target",
+            "the agent is no longer on the pane the bar drew",
+        );
+    }
+    match (found, core) {
+        (Some(l), _) => {
+            if l.adopted {
+                adopt(ctx, caller, id, &l.pane)?;
+            }
+            Ok(Some(l))
+        }
+        (None, Some(core)) => create(ctx, core, caller, id, record, split().as_deref()).map(Some),
+        (None, None) => Ok(None),
+    }
 }
 
 /// v6f calls 6, 17: the hc name a lifecycle view of `id` carries, from its subject generation's evidence (A3c
@@ -388,7 +414,7 @@ fn subject_name(ctx: &Ctx, caller: &Caller, id: &str) -> Res<String> {
 }
 
 /// V2: a pane that attaches the subject address with no valid descriptor (focus died after attach) becomes the
-/// view: written once through A3c's writer, under the member lock `focus_identity` holds, recording the program the
+/// view: written once through A3c's writer, under the member lock `view_locked`'s caller holds, recording the program the
 /// pane runs (v6f call 13).
 fn adopt(
     ctx: &Ctx,
@@ -419,6 +445,33 @@ fn adopt(
     )
 }
 
+/// v6f call 5: A3b-2's attach step. Under the member lock (inside the team lock `forward` holds, S9 order), the launch
+/// finds or makes its view through `view_locked`, so a focus that ran after the promotion is adopted, never doubled.
+/// Answers the descriptor that stands, read back once through the walk.
+pub(crate) fn launch_view(
+    ctx: &Ctx,
+    core: &crate::hc::Core<'_>,
+    caller: &Caller,
+    record: &Value,
+    split: Option<&str>,
+) -> Res<Value> {
+    let id_text = record.get("id").and_then(Value::as_str).unwrap_or_default();
+    let team = super::membership::team(caller);
+    let id = super::core_identity::Identity::read(record, id_text, &team)
+        .ok_or_else(|| crate::error::Refusal::internal("a promoted record has no identity"))?;
+    let scope = super::team_state::Scope::of(caller);
+    lock(ctx, &scope.member_lock(&id.id), || {
+        view_locked(ctx, Some(core), caller, &id, None, || {
+            split.map(str::to_owned)
+        })?
+        .ok_or_else(|| crate::error::Refusal::internal("unproven new view"))?;
+        let folder = super::server_dir(ctx, caller).join("agents").join(&id.id);
+        super::gens::walk(&folder, &["view.json"])
+            .known()?
+            .ok_or_else(|| crate::error::Refusal::internal("unproven new view"))
+    })
+}
+
 /// Where a view is: its pane, window, start command and the program that command runs.
 pub(crate) struct ViewAt<'a> {
     pub pane: &'a str,
@@ -427,7 +480,7 @@ pub(crate) struct ViewAt<'a> {
     pub program: &'a str,
 }
 
-/// A3c ambiguity 3's descriptor plus the recorded attach program (v6f call 13), shared by `restore_view` and `adopt`.
+/// A3c ambiguity 3's descriptor plus the recorded attach program (v6f call 13), shared by `create` and `adopt`.
 pub(crate) fn descriptor(
     caller: &Caller,
     id: &super::core_identity::Identity,
@@ -440,41 +493,32 @@ pub(crate) fn descriptor(
         "hcAddress": id.address, "hcName": hc_name})
 }
 
-fn restore_view(
+/// The one place a view pane is made (v6f call 5), by a holder of the member lock: the subject's name is read first
+/// (re-audit 1-3 F6), then the pane is attached and its descriptor written through A3c's writer. The panic boundary
+/// sits here, around attachment, where the created pane is still in scope (v6f call 15): any failure cleans it.
+fn create(
     ctx: &Ctx,
     core: &crate::hc::Core<'_>,
     caller: &Caller,
     id: &super::core_identity::Identity,
     record: Value,
-) -> Res<Focused> {
+    split: Option<&str>,
+) -> Res<super::core_identity::Located> {
     // Ambiguity 3: the generation is checked before any pane is made.
     let n = super::gens::plain_gen(&id.generation)
         .ok_or_else(|| crate::error::Refusal::internal("invalid generation"))?;
-    // Re-audit 1-3 F6: the subject's name is read before any pane is made. v6f call 17: only a lifecycle member has
-    // a subject generation; a pre-lifecycle member keeps its record's name.
+    // v6f call 17: only a lifecycle member has a subject generation; a pre-lifecycle member keeps its record's name.
     let name = if super::gens::lifecycle(&record) {
         subject_name(ctx, caller, &id.id)?
     } else {
         id.hc_name.clone()
     };
     let program = core.binary().display().to_string();
-    let placement = super::placement::read_placement(ctx, caller)
-        .ok()
-        .flatten()
-        .unwrap_or(super::placement::DEFAULT);
     let mut created = None;
-    let result: Res<super::spawn::Created> = (|| {
-        attach_core(
-            ctx,
-            core,
-            caller,
-            &record,
-            &id.address,
-            (placement != "tab").then_some(placement),
-            &mut created,
-        )?;
+    let made = super::core_launch::attempt(|| {
+        attach_core(ctx, core, caller, &record, &id.address, split, &mut created)?;
         let v = created
-            .as_ref()
+            .clone()
             .ok_or_else(|| crate::error::Refusal::internal("unproven new view"))?;
         let at = ViewAt {
             pane: &v.pane,
@@ -482,33 +526,37 @@ fn restore_view(
             command: &v.command,
             program: &program,
         };
-        let descriptor = descriptor(caller, id, n, &name, &at);
-        // S4, W1: focus_identity holds the member lock (not reentrant); the writer checks the subject generation.
+        // S4, W1: the caller holds the member lock (not reentrant); the writer checks the subject generation.
         super::team_state::view_held(
             ctx,
             &super::team_state::Scope::of(caller),
             &id.id,
-            &descriptor,
+            &descriptor(caller, id, n, &name, &at),
         )?;
-        Ok(v.clone())
-    })();
-    if result.is_err()
+        Ok(v)
+    });
+    if made.is_err()
         && let Some(v) = &created
     {
         let _ = clean_core(ctx, v);
     }
-    let v = result?;
-    select_view(
-        ctx,
-        &id.id,
-        &id.name,
-        &v.pane,
-        &v.window,
-        &registry::Launch {
-            command: v.command,
-            pid: None,
+    let v = made?;
+    Ok(super::core_identity::Located {
+        pane: registry::Pane {
+            pane: v.pane,
+            window: v.window,
+            pid: String::new(),
+            id: id.id.clone(),
+            name: id.name.clone(),
+            record,
+            launch: registry::Launch {
+                command: v.command,
+                pid: None,
+            },
         },
-    )
+        adopted: false,
+        duplicates: 0,
+    })
 }
 
 #[cfg(test)]
