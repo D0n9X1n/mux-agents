@@ -218,7 +218,7 @@ fn released_by_hc(w: &World, id: &str, argv: &[&str]) {
     lf::relabel(w, &a);
 }
 /// Member `id` released for restore through the real R1 writer (r6b call 10).
-fn released_for_restore(w: &World, id: &str) {
+pub(super) fn released_for_restore(w: &World, id: &str) {
     released_by_hc(w, id, lf::LOST_ARGVS[0]);
     team_state::open(&w.ctx, &Scope::of(&w.caller()), |tx| {
         let lazy = Lazy::new(tx.ctx);
