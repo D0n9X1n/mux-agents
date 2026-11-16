@@ -78,6 +78,12 @@ fn pre(pending: bool) -> Value {
     r
 }
 
+/// The same record naming another member (call 35).
+fn other(mut r: Value) -> Value {
+    r["id"] = json!("bbbbbbbbbbbb");
+    r
+}
+
 /// (row, guard, planted record, answer). Planted `None`: no record; `"torn"`: torn bytes.
 type Row = (&'static str, Guard<'static>, Option<Value>, &'static str);
 fn rows() -> Vec<Row> {
@@ -189,6 +195,36 @@ fn rows() -> Vec<Row> {
             "completing, pre-lifecycle",
             done,
             Some(pre(false)),
+            "refused",
+        ),
+        (
+            "create, another id",
+            Guard::Create,
+            Some(other(life(None, None))),
+            "refused",
+        ),
+        (
+            "pending, another id",
+            own,
+            Some(other(life(p(1, "m1"), None))),
+            "refused",
+        ),
+        (
+            "pending gen none, another id",
+            none,
+            Some(other(life(None, None))),
+            "refused",
+        ),
+        (
+            "pending gen, another id",
+            one,
+            Some(other(life(p(1, "m9"), None))),
+            "refused",
+        ),
+        (
+            "completing, another id",
+            done,
+            Some(other(life(None, Some(json!({"gen": 0}))))),
             "refused",
         ),
         ("torn", own, Some(json!("torn")), "evidence"),

@@ -95,13 +95,17 @@ pub enum Guard<'a> {
 }
 
 impl Guard<'_> {
-    /// Whether the record read (None: absent) qualifies. `abort` asks this of its own read too: one definition of
-    /// ownership.
-    pub fn admits(self, record: Option<&Value>) -> bool {
+    /// Whether the record read (None: absent) qualifies for member `id`. `abort` asks this of its own read too: one
+    /// definition of ownership. Call 35: every guard but `Create` (which admits no record) needs the record's `id`
+    /// to be `id`.
+    pub fn admits(self, id: &str, record: Option<&Value>) -> bool {
         let Some(r) = record else {
             return self == Guard::Create;
         };
         if !super::gens::lifecycle(r) {
+            return false;
+        }
+        if r.get("id").and_then(Value::as_str) != Some(id) {
             return false;
         }
         let gen_of = |k: &str| r.get(k).and_then(|v| v.get("gen")).and_then(Value::as_u64);
@@ -147,7 +151,7 @@ impl Tx<'_> {
         let folder = self.folder(id);
         super::lock(self.ctx, &self.scope.member_lock(id), || {
             let read = super::gens::record(&folder).known()?;
-            if !guard.admits(read.as_ref()) {
+            if !guard.admits(id, read.as_ref()) {
                 return Ok(None);
             }
             let created = read.is_none();

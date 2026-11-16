@@ -379,7 +379,7 @@ pub fn forward(
 /// Unreadable (a link, torn bytes): not proven.
 fn owns(tx: &Tx<'_>, id: &str, n: u64, hc_name: &str) -> bool {
     match gens::record(&tx.folder(id)) {
-        Evidence::Present(r) => Guard::Pending { n, hc_name }.admits(Some(&r)),
+        Evidence::Present(r) => Guard::Pending { n, hc_name }.admits(id, Some(&r)),
         Evidence::Absent | Evidence::Unreadable => false,
     }
 }
@@ -2315,6 +2315,90 @@ pub(crate) mod forward_tests {
                 usize::from(!new),
                 "{case}: no run of generation {n}"
             );
+        }
+    }
+
+    // Call 35: a record naming another member is never written. `existing`: the promoted record's id is changed,
+    // so the first pending write refuses. `spec`: changed after the pending write, so the address write refuses and
+    // `abort` owns nothing. `commit`: changed after the commit, so the promotion refuses.
+    #[test]
+    fn a_record_naming_another_id_is_never_written() {
+        for case in ["existing", "spec", "commit"] {
+            let w = world();
+            let _reset = hooks::Reset;
+            let existing = case == "existing";
+            let f = w.folder(ID);
+            if existing {
+                promoted(&w);
+                edit(&f, |r| r["id"] = json!("bbbbbbbbbbbb"));
+                version(&w);
+            } else {
+                let f2 = f.clone();
+                hooks::after(Some(Box::new(move |s: &str| {
+                    if s == case {
+                        edit(&f2, |r| r["id"] = json!("bbbbbbbbbbbb"));
+                    }
+                })));
+                replies(&w, address("t1"));
+            }
+            let before = std::fs::read(f.join("record.json")).ok();
+            let e = go(&w, launch_of(&w, !existing, NEW), free, never).unwrap_err();
+            assert_eq!(e.check, "launch", "{case}: {e:?}");
+            let r = record(&w);
+            assert_eq!(
+                r["id"],
+                json!("bbbbbbbbbbbb"),
+                "{case}: the other id stands"
+            );
+            match case {
+                "existing" => {
+                    assert!(
+                        e.message
+                            .contains("changed before this launch was recorded"),
+                        "{e:?}"
+                    );
+                    assert!(e.message.ends_with("; nothing was fenced"), "{e:?}");
+                    assert_eq!(
+                        std::fs::read(f.join("record.json")).ok(),
+                        before,
+                        "nothing written"
+                    );
+                    assert!(
+                        !gens::dir(&f, 1).exists() && runs(&w).len() == 1,
+                        "no generation 1"
+                    );
+                }
+                "spec" => {
+                    assert!(
+                        e.message
+                            .starts_with("the launch no longer owns the record"),
+                        "{e:?}"
+                    );
+                    assert!(e.message.ends_with("; nothing was fenced"), "{e:?}");
+                    assert_eq!(
+                        decided(&w, 0),
+                        None,
+                        "spec: nothing fenced for another member"
+                    );
+                    assert!(
+                        r["pending"].get("hcAddress").is_none(),
+                        "spec: no address written"
+                    );
+                    assert!(r.get("generation").is_none(), "spec: nothing promoted");
+                }
+                _ => {
+                    assert!(e.message.contains("no longer owns the record"), "{e:?}");
+                    assert!(
+                        r.get("generation").is_none() && r.get("sessionId").is_none(),
+                        "commit: nothing promoted"
+                    );
+                    assert_eq!(
+                        (decided(&w, 0), kills(&w)),
+                        (Some(gens::Decision::Run), 0),
+                        "nothing rolled back"
+                    );
+                }
+            }
         }
     }
 
