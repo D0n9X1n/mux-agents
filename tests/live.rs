@@ -5500,6 +5500,7 @@ hc {}:
                     bar_click_after_shrinking_does_nothing,
                     members_spawn_and_act_only_down_the_tree,
                     team_messaging_stays_in_the_team,
+                    notebook_and_peek_stay_in_the_team,
                     an_unacked_batch_is_served_again_and_rebuilt_for_a_successor,
                     a_lost_member_is_released_and_keeps_only_its_kept_labels,
                     an_orphan_left_by_a_forward_crash_is_ended_by_terminate,
@@ -5678,6 +5679,240 @@ hc {}:
             (2, "quota", true),
             "{mux:?} the 121st: {r}"
         );
+    }
+
+    /// Phase 7a end to end: leader > a > b, sibling c, team T2. b lists a's notes newest first; the leader and a
+    /// person of the team peek b; c and T2's person cannot. Every pane of the server is inventoried after the bars
+    /// close (checklist 9): each member's fake client is proven raw by a canary byte (10), then receives no byte (8);
+    /// the quiet shells keep their screens; the two command panes gain only the harness's own line; panes, windows
+    /// and client selection stay as arranged (b's window has another pane active; tmux: a client is attached).
+    fn notebook_and_peek_stay_in_the_team(mux: Mux) {
+        let Some(mut live) = Live::human(mux) else {
+            return;
+        };
+        std::fs::write(live.dir.join("brief.md"), "brief").unwrap();
+        // PM call 10: every fake client of this scenario keeps the bytes it receives in `input.<pid>.raw`.
+        std::fs::write(live.dir.join("raw-input"), "").unwrap();
+        let body = live.path("note.md");
+        std::fs::write(&body, "the plan").unwrap();
+        let (code, up) = live.run(&["up", "-Client", "claude"]);
+        assert_eq!(code, 0, "{mux:?} {up}");
+        let session = s(&up["session"]).to_string();
+        let id = |w: &Value| s(&w["id"]).to_string();
+        let spawn = |live: &mut Live, by: &Value, name: &str| {
+            let (code, r) = live.spawn_by(s(&by["id"]), name);
+            assert_eq!(code, 0, "{mux:?} {name}: {r}");
+            r
+        };
+        let leader = up["leader"].clone();
+        let a = spawn(&mut live, &leader, "a");
+        let b = spawn(&mut live, &a, "b");
+        let c = spawn(&mut live, &leader, "c");
+        for title in ["first", "second"] {
+            let (code, r) = live.by(&id(&a), &["note", "-Title", title, "-BodyFile", &body]);
+            assert_eq!(code, 0, "{mux:?} {r}");
+        }
+        let (code, r) = live.by(&id(&b), &["notes"]);
+        let titles: Vec<&str> = r["notes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|n| s(&n["title"]))
+            .collect();
+        assert_eq!(
+            (code, titles),
+            (0, vec!["second", "first"]),
+            "{mux:?} newest first: {r}"
+        );
+        // Every pane, session and client exists before the snapshots: a person of the team, T2, its person.
+        let root = live.server.pane().to_string();
+        let person = live.split(&session, &["-v"]);
+        let t2 = live.session_in("t2", &live.dir.join("t2"));
+        let (code, up2) = live.run_in(&t2, &["up", "-Client", "claude"]);
+        assert_eq!(code, 0, "{mux:?} {up2}");
+        let t2_leader = up2["leader"].clone();
+        let t2_person = live.split(s(&up2["session"]), &["-v"]);
+        let members = [&leader, &a, &b, &c, &t2_leader];
+        // o2 call 35: the spawned members are ready before anything is sent to them (the canary proves each client).
+        for w in [&a, &b, &c] {
+            live.ready(w);
+        }
+        // Checklist 9: every bar closes through the public command, from a shell pane of its own session.
+        let shells = [root.clone(), t2.clone(), person.clone(), t2_person.clone()];
+        let bar_sessions: BTreeSet<String> = live
+            .panes("#{session_id}|#{@agent-role}")
+            .into_iter()
+            .filter_map(|r| r.strip_suffix("|sidebar").map(str::to_string))
+            .collect();
+        for bar_session in bar_sessions {
+            let from = shells
+                .iter()
+                .find(|p| live.field(p, "#{session_id}") == bar_session)
+                .unwrap_or_else(|| panic!("{mux:?}: no shell pane in {bar_session}"))
+                .clone();
+            let (code, close) = live.run_in(&from, &["sidebar", "-Close"]);
+            assert_eq!(code, 0, "{mux:?} {close}");
+            for bar in close["panes"].as_array().into_iter().flatten() {
+                live.wait_gone(s(bar));
+            }
+        }
+        // Checklist 14: client selection is asserted where a client can attach (tmux, as the bar scenario does).
+        let client = (!matches!(mux, Mux::Rmux)).then(|| {
+            let client = Client::attach(&live, &session);
+            live.server.wait("the client to attach", || {
+                (!live.call(&["list-clients"]).trim().is_empty()).then_some(())
+            });
+            client
+        });
+        // b's pane, then another pane of b's window made active: a peek that selects b would show.
+        let (code, seen) = live.by(&id(&leader), &["peek", "b"]);
+        assert_eq!(code, 0, "{mux:?} the leader peeks its grandchild: {seen}");
+        let pane = s(&seen["pane"]).to_string();
+        let other = live.split(&pane, &["-h"]);
+        live.call(&["select-pane", "-t", &other]);
+        // Checklist 9: every pane is a member of either team or one of the five known shells.
+        let (quiet, commands) = ([root, other, t2], [person.clone(), t2_person.clone()]);
+        let mut tagged: Vec<(String, String)> = Vec::new();
+        for row in live.panes("#{pane_id}|#{@agent-id}") {
+            let (p, agent) = row.split_once('|').unwrap();
+            if agent.is_empty() {
+                assert!(
+                    quiet.iter().chain(&commands).any(|q| q == p),
+                    "{mux:?}: pane {p} is neither a member nor a known shell"
+                );
+            } else {
+                tagged.push((agent.to_string(), p.to_string()));
+            }
+        }
+        let mut got: Vec<String> = tagged.iter().map(|(i, _)| i.clone()).collect();
+        let mut want: Vec<String> = members.iter().map(|w| id(w)).collect();
+        got.sort();
+        want.sort();
+        assert_eq!(
+            got, want,
+            "{mux:?}: the tagged panes are the members of both teams"
+        );
+        // Checklist 10: raw mode on each member's real terminal: one byte without Enter is logged before the
+        // baseline (a cooked fallback never delivers it, and the wait fails). Only an absent first log is empty.
+        let raw =
+            |live: &Live, id: &str| live.dir.join(format!("input.{}.raw", live.client_of(id)));
+        for (agent, p) in &tagged {
+            let path = raw(&live, agent);
+            let mut want = match std::fs::read(&path) {
+                Ok(bytes) => bytes,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+                Err(e) => panic!("{mux:?} {}: {e}", path.display()),
+            };
+            want.push(b'x');
+            live.call(&["send-keys", "-t", p, "-l", "x"]);
+            live.server
+                .wait(&format!("the canary byte in {}", path.display()), || {
+                    (std::fs::read(&path).ok()? == want).then_some(())
+                });
+        }
+        // Checklist 8: bytes, read strictly (every log exists now).
+        let typed = |live: &Live| -> Vec<Vec<u8>> {
+            let read = |path: PathBuf| {
+                std::fs::read(&path).unwrap_or_else(|e| panic!("{mux:?} {}: {e}", path.display()))
+            };
+            tagged
+                .iter()
+                .map(|(agent, _)| read(raw(live, agent)))
+                .collect()
+        };
+        let screen = |live: &Live, p: &str| -> Vec<String> {
+            let text = live.call(&["capture-pane", "-p", "-J", "-t", p]);
+            let mut lines: Vec<String> = text.lines().map(|l| l.trim_end().to_string()).collect();
+            while lines.last().is_some_and(|l| l.is_empty()) {
+                lines.pop();
+            }
+            lines
+        };
+        for p in quiet.iter().chain(&commands) {
+            live.server.wait(&format!("a prompt in {p}"), || {
+                screen(&live, p)
+                    .last()
+                    .is_some_and(|l| l.ends_with('$') || l.ends_with('#'))
+                    .then_some(())
+            });
+        }
+        let focus = |live: &Live| {
+            let format = "#{session_id}|#{window_id}|#{pane_id}|#{pane_active}|#{window_active}";
+            let clients = live.call(&["list-clients", "-F", "#{client_name}|#{client_session}"]);
+            (live.call(&["list-panes", "-a", "-F", format]), clients)
+        };
+        let input = typed(&live);
+        let screens: Vec<Vec<String>> = quiet
+            .iter()
+            .chain(&commands)
+            .map(|p| screen(&live, p))
+            .collect();
+        let before = focus(&live);
+        assert!(
+            before.0.contains(&format!("|{pane}|0|")),
+            "{mux:?} b's pane is not active: {}",
+            before.0
+        );
+        let (code, r) = live.by(&id(&leader), &["peek", "b"]);
+        assert_eq!(
+            (code, r["pane"].as_str()),
+            (0, Some(pane.as_str())),
+            "{mux:?} the leader again: {r}"
+        );
+        let (code, r) = live.run_in(&person, &["peek", "b", "-Lines", "5"]);
+        assert_eq!(
+            (code, r["pane"].as_str()),
+            (0, Some(pane.as_str())),
+            "{mux:?} a person of the team: {r}"
+        );
+        let (code, r) = live.by(&id(&c), &["peek", "b"]);
+        assert_eq!(
+            (code, r["check"].as_str()),
+            (2, Some("authority")),
+            "{mux:?} a sibling of b's parent: {r}"
+        );
+        let (code, r) = live.run_in(&t2_person, &["peek", "b"]);
+        assert_eq!(
+            (code, r["check"].as_str()),
+            (2, Some("target")),
+            "{mux:?} another team's person: {r}"
+        );
+        assert_eq!(
+            focus(&live),
+            before,
+            "{mux:?} panes, windows and client selection stay put"
+        );
+        assert_eq!(
+            typed(&live),
+            input,
+            "{mux:?} no member's client received a byte"
+        );
+        // A command pane gains exactly the harness's one line (`. '<dir>/line.<n>.sh'` after the prompt it showed)
+        // and the same prompt again; a quiet shell gains nothing.
+        let ours = |t: &str| {
+            t.strip_prefix(&format!(". '{}", live.path("line.")))
+                .and_then(|t| t.strip_suffix(".sh'"))
+                .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+        };
+        for (n, p) in quiet.iter().chain(&commands).enumerate() {
+            let (was, now) = (&screens[n], screen(&live, p));
+            if n < quiet.len() {
+                assert_eq!(&now, was, "{mux:?}: shell pane {p} changed");
+                continue;
+            }
+            let (keep, prompt) = (was.len() - 1, &was[was.len() - 1]);
+            let harness = now.len() == was.len() + 1
+                && now[..keep] == was[..keep]
+                && now[keep]
+                    .strip_prefix(prompt.as_str())
+                    .is_some_and(|t| ours(t.trim_start()))
+                && &now[keep + 1] == prompt;
+            assert!(
+                harness,
+                "{mux:?}: command pane {p} gained more than the harness's line:\n{was:#?}\n{now:#?}"
+            );
+        }
+        drop(client);
     }
 
     /// Receipts end to end (#103 4b-i): a sends b two messages; b's unacked batch is served again, then acked; a
