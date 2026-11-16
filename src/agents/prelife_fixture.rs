@@ -274,3 +274,72 @@ pub fn reads_past_record(reads: &[PathBuf], folder: &Path) -> Vec<PathBuf> {
         .cloned()
         .collect()
 }
+
+/// How a v0.2.8 member ended, as its writers recorded it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum End {
+    Live,
+    Exited,
+    Stopped,
+    Lost,
+}
+
+/// Member `id` exactly as v0.2.8 wrote it (call 8; checklist 2): `record.json` (v0.2.8 spawn.rs:513-520),
+/// `commit.json`, `spec.json` (spawn.rs:377-383: `schema`, `stateDirectory` = the server folder, `id`, `client`,
+/// `parentPane`, the brief launch's `args` = `--session-id <uuid>` and the prompt, `prompt` = the tagged header
+/// (spawn.rs:743-756), a blank line, the task), `startCommand` naming this member's own spec path (spawn.rs:425-427),
+/// `launcher.json` (`pid`, `start`, `startedAt`; an exit adds `exitCode`, `exitedAt`) and, once ended, the folder
+/// notice (`kind`, `exitCode` = the code for `exited` else null, `at`; Lost adds `closedBy: "pane"`). Stopped and
+/// Lost launchers were killed before writing an exit.
+pub fn v028(w: &World, id: &str, name: &str, end: End) {
+    let f = w.folder(id);
+    std::fs::create_dir_all(&f).unwrap();
+    let write = crate::agents::fixture::write;
+    let session = format!("{}-0000-4000-8000-{id}", &id[..8]);
+    let task = "build it";
+    let exe = "/bin/mux-agent";
+    let header = [
+        format!("[mux-agent] You are {name} (claude, id {id}), started in this tmux session."),
+        "Your parent is root (%1); report to it with send parent; free text only in files.".into(),
+        "Context: brief-only (human); brief: none; parent transcript: none".into(),
+        format!("Reply: \"{exe}\" send parent -BodyFile <file>"),
+        format!("Listen: \"{exe}\" read -Wait 600"),
+    ];
+    let prompt = format!("{}\n\n{task}", header.join("\n"));
+    let state = w.state().to_string_lossy().replace('\\', "/");
+    let spec = format!("{state}/agents/{id}/spec.json");
+    write(
+        &f.join("record.json"),
+        json!({"schema": 1, "id": id, "name": name, "client": "claude", "sessionId": session,
+            "context": "brief", "reason": "human", "session": "$3", "pane": "%9", "window": "@5",
+            "parentPane": "%1", "parentAgent": null, "directory": "/work", "taskLine": task,
+            "createdAt": "2026-11-01T00:00:00.0000000Z", "color": "blue",
+            "startCommand": format!("{exe} launcher {spec}")}),
+    );
+    write(
+        &f.join("commit.json"),
+        json!({"committedAt": "2026-11-01T00:00:01.0000000Z"}),
+    );
+    write(
+        &f.join("spec.json"),
+        json!({"schema": 1, "stateDirectory": state, "id": id, "client": "claude", "parentPane": "%1",
+            "args": ["--session-id", session, prompt], "prompt": prompt}),
+    );
+    let mut launcher =
+        json!({"pid": 31337, "start": 1000, "startedAt": "2026-11-01T00:00:02.0000000Z"});
+    if end == End::Exited {
+        (launcher["exitCode"], launcher["exitedAt"]) =
+            (json!(0), json!("2026-11-02T00:00:00.0000000Z"));
+    }
+    write(&f.join("launcher.json"), launcher);
+    let at = "2026-11-02T00:00:01.0000000Z";
+    let notice = match end {
+        End::Live => None,
+        End::Exited => Some(json!({"kind": "exited", "exitCode": 0, "at": at})),
+        End::Stopped => Some(json!({"kind": "stopped", "exitCode": null, "at": at})),
+        End::Lost => Some(json!({"kind": "lost", "exitCode": null, "at": at, "closedBy": "pane"})),
+    };
+    if let Some(n) = notice {
+        write(&f.join("notice.json"), n);
+    }
+}

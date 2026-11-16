@@ -45,6 +45,8 @@ pub(crate) mod prelife;
 pub(crate) mod prelife_fixture;
 #[cfg(test)]
 mod prelife_slot_tests;
+#[cfg(test)]
+mod prelife_tests;
 pub mod receipt;
 pub mod reconcile;
 #[cfg(test)]

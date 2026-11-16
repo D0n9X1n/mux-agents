@@ -904,6 +904,11 @@ const TEST_ONLY: &[(&str, &str, &str)] = &[
         "prelife_slot_tests",
     ),
     (
+        "src/agents/prelife_tests.rs",
+        "src/agents/mod.rs",
+        "prelife_tests",
+    ),
+    (
         "src/agents/reconcile_await_tests.rs",
         "src/agents/mod.rs",
         "reconcile_await_tests",
