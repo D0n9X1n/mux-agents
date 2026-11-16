@@ -75,11 +75,7 @@ fn build(from: &Path, temp: &Path, source: &str, target: &str) -> io::Result<()>
         }
         text = text.replace(source, target);
         if name == "workspace.yaml" {
-            text = text
-                .split('\n')
-                .filter(|line| !line.starts_with("mc_"))
-                .collect::<Vec<_>>()
-                .join("\n");
+            text = without_mc(&text);
         }
         std::fs::write(&path, &text)?;
         if jsonl {
@@ -104,6 +100,24 @@ fn build(from: &Path, temp: &Path, source: &str, target: &str) -> io::Result<()>
         return Err(invalid("copied events.jsonl lacks the target id"));
     }
     Ok(())
+}
+
+/// workspace.yaml without its top-level `mc_` keys, each with its whole block: the key line and every indented line
+/// after it. Copilot CLI 1.0.110 writes `mc_pending_repository_warning:` as a mapping; dropping only the key line
+/// leaves its children under the previous key, which Copilot then refuses to load.
+fn without_mc(text: &str) -> String {
+    let mut dropping = false;
+    text.split('\n')
+        .filter(|line| {
+            if line.starts_with("mc_") {
+                dropping = true;
+            } else if !line.starts_with([' ', '\t']) {
+                dropping = false;
+            }
+            !dropping
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// Folders and files below `from` into `to`. A link (or junction) refuses the copy: Copilot makes none, and
@@ -255,6 +269,76 @@ mod tests {
         }
         out.sort();
         out
+    }
+
+    #[test]
+    fn copilot_copy_drops_an_mc_block_with_its_children() {
+        // Copilot CLI 1.0.110: a nested mc_ mapping leaves with its indented lines; the next top-level key stays.
+        let s = session();
+        std::fs::write(
+            s.source.join("workspace.yaml"),
+            format!(
+                "id: {OLD}\ncwd: /work\nremote_steerable: false\nmc_pending_repository_warning:\n  mc_session_id: {OLD}\n  message: 'not linked: no repo'\nmc_task_id: x\nsummary: s\n"
+            ),
+        )
+        .unwrap();
+        assert!(copy_session(s.home.path(), OLD, NEW));
+        assert_eq!(
+            read(&s.target.join("workspace.yaml")),
+            format!("id: {NEW}\ncwd: /work\nremote_steerable: false\nsummary: s\n")
+        );
+    }
+
+    // workspace.yaml as the copy writes it, from `body` written below the source's id line.
+    fn copied_workspace(body: &str) -> String {
+        let s = session();
+        std::fs::write(
+            s.source.join("workspace.yaml"),
+            format!("id: {OLD}\n{body}"),
+        )
+        .unwrap();
+        assert!(copy_session(s.home.path(), OLD, NEW));
+        read(&s.target.join("workspace.yaml"))
+    }
+
+    #[test]
+    fn copilot_copy_drops_an_mc_block_at_the_end() {
+        assert_eq!(
+            copied_workspace(&format!(
+                "cwd: /work\nsummary: s\nmc_pending_repository_warning:\n  mc_session_id: {OLD}\n  message: m\n"
+            )),
+            format!("id: {NEW}\ncwd: /work\nsummary: s\n")
+        );
+    }
+
+    #[test]
+    fn copilot_copy_keeps_the_blank_line_after_an_mc_block() {
+        // A blank line ends the block and stays; the top-level key after it stays.
+        assert_eq!(
+            copied_workspace(&format!(
+                "cwd: /work\nmc_pending_repository_warning:\n  mc_session_id: {OLD}\n  message: m\n\nsummary: s\n"
+            )),
+            format!("id: {NEW}\ncwd: /work\n\nsummary: s\n")
+        );
+    }
+
+    #[test]
+    fn copilot_copy_keeps_an_indented_mc_line_in_another_block() {
+        assert_eq!(
+            copied_workspace("cwd: /work\ngit:\n  mc_branch: main\n  root: /work\nsummary: s\n"),
+            format!("id: {NEW}\ncwd: /work\ngit:\n  mc_branch: main\n  root: /work\nsummary: s\n")
+        );
+    }
+
+    #[test]
+    fn without_mc_drops_a_crlf_mc_block_whole() {
+        // The filter itself: copy_session refuses a CRLF workspace.yaml at its `id:` line check.
+        assert_eq!(
+            without_mc(
+                "id: x\r\ncwd: /work\r\nmc_pending_repository_warning:\r\n  mc_session_id: x\r\n  message: m\r\nsummary: s\r\n"
+            ),
+            "id: x\r\ncwd: /work\r\nsummary: s\r\n"
+        );
     }
 
     #[test]
