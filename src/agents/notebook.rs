@@ -128,10 +128,11 @@ fn read_log(notes: &Path) -> Res<Vec<u8>> {
     std::fs::read(&log).map_err(|_| evidence::unreadable())
 }
 
-/// What `notebook.state.json` says about the log read (ambiguity 4). Task 3 adds `Uncertain`.
+/// What `notebook.state.json` says about the log read (ambiguity 4). `Uncertain`: renamed, its folder flush not yet known.
 enum Marker {
     Absent,
     Certain(u64),
+    Uncertain(u64),
     Bad,
 }
 
@@ -149,25 +150,40 @@ fn marker(notes: &Path, log: &[u8]) -> Res<Marker> {
         return Ok(Marker::Bad);
     };
     let line_end = durable == 0 || log.get(durable as usize - 1) == Some(&b'\n');
-    if durable > log.len() as u64 || !line_end || uncertain {
+    if durable > log.len() as u64 || !line_end {
         return Ok(Marker::Bad);
     }
-    Ok(Marker::Certain(durable))
+    Ok(if uncertain {
+        Marker::Uncertain(durable)
+    } else {
+        Marker::Certain(durable)
+    })
 }
 
-/// R3: the certain `durable`; absent is 0. Task 3 completes an uncertain marker, Task 4 rebuilds a bad one.
+/// R3: the certain `durable`; absent is 0. an uncertain marker is completed first; Task 4 rebuilds a bad one.
 fn settle(notes: &Path, log: &[u8]) -> Res<u64> {
     match marker(notes, log)? {
         Marker::Absent => Ok(0),
         Marker::Certain(durable) => Ok(durable),
+        Marker::Uncertain(durable) => complete(notes, durable),
         Marker::Bad => Err(evidence::unreadable()),
     }
 }
 
-/// N2 (4): the marker for `durable`. Task 3 publishes it uncertain, then completes it.
+/// N2 (4): the marker for `durable`. Published uncertain, then completed.
 fn publish(notes: &Path, durable: u64) -> Res<()> {
     let path = notes.join(STATE);
-    write_json_durable(&path, &json!({"durable": durable, "uncertain": false}))
+    write_json_durable(&path, &json!({"durable": durable, "uncertain": true}))?;
+    complete(notes, durable).map(|_| ())
+}
+
+/// v5 certainty first: flush the notes folder (the uncertain rename is then on disk), then rewrite the same
+/// `durable` certain, on every call (R4). Any failure: 1 `notes`, and the caller answers nothing.
+fn complete(notes: &Path, durable: u64) -> Res<u64> {
+    sync_dir(notes).map_err(|_| not_on_disk())?;
+    let certain = json!({"durable": durable, "uncertain": false});
+    write_json_durable(&notes.join(STATE), &certain).map_err(|_| not_on_disk())?;
+    Ok(durable)
 }
 
 /// N2 (1)-(3): cuts the bytes past `durable` (an unanswered tail) and flushes, writes `line` there, then flushes the
