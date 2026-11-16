@@ -8,11 +8,13 @@ use serde_json::{Map, Value, json};
 
 use std::path::Path;
 
+use super::core_facts::Observation;
 use super::gens::{self, Member};
 use super::mail;
 use crate::caller::Caller;
 use crate::ctx::Ctx;
 use crate::error::{Res, refuse};
+use crate::hc::Terminal;
 
 /// One pane of the caller's session as one `list-panes` read it; every field as the multiplexer printed it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -593,13 +595,16 @@ pub fn add_notice(
 ) -> Res<bool> {
     let folder = super::server_dir(ctx, caller).join("agents").join(id);
     let member = gens::member_of(&folder);
-    post(ctx, caller, id, &folder, &member, record, notice)
+    post(ctx, caller, id, &folder, &member, record, notice, None)
 }
 
 /// S5, ambiguities 8, 9, 16: the generation, marker and delivery id come from `member` alone; `record` gives only
 /// the name, pane and parent pane. Under the notice lock, so its notice read decides. R3, PM call 7: a lifecycle
 /// notice waits until the active generation is done by recorded evidence (`completing.gen` holds it); until then
 /// nothing is posted and the next list or reap retries (settle-1b, A3b, writes `ended.json`).
+/// `ended`: the generation whose `ended.json` the caller has just read Present, so `status` does not read it again
+/// (R1, b-calls 32). A lifecycle notice is published through the one publisher (b-calls 31, B-R1, B-R6).
+#[allow(clippy::too_many_arguments)]
 fn post(
     ctx: &Ctx,
     caller: &Caller,
@@ -608,14 +613,15 @@ fn post(
     member: &Member,
     record: &Value,
     notice: Notice,
+    ended: Option<u64>,
 ) -> Res<bool> {
-    let (marker, delivery, once) = match member {
+    let (marker, delivery, life_gen) = match member {
         Member::Unreadable(e) => return Err(e.clone()),
         Member::Life(g) => {
             let Some(n) = g.active() else {
                 return Ok(false); // nothing to notice
             };
-            let s = g.status()?; // R2: an unreadable marker or record refuses
+            let s = g.status_given(ended)?; // R2 refuses; R1: the caller's ended.json is not read again
             if g.read(n, "notice").known()?.is_some() {
                 return Ok(false);
             }
@@ -625,7 +631,7 @@ fn post(
             (
                 gens::path(folder, n, "notice"),
                 gens::delivery_id(id, n),
-                true,
+                Some(n),
             )
         }
         Member::Pre(_) | Member::Absent => {
@@ -633,7 +639,7 @@ fn post(
             if marker.exists() {
                 return Ok(false);
             }
-            (marker, format!("exit-{id}"), false)
+            (marker, format!("exit-{id}"), None)
         }
     };
     let name = super::text(record.get("name"));
@@ -676,10 +682,12 @@ fn post(
     if kind == "lost" {
         written["closedBy"] = "pane".into();
     }
-    if once {
-        crate::state::evidence::publish(&marker, &written)?; // create-once (S5)
-    } else {
-        crate::state::fs::write_json(&marker, &written)?;
+    match life_gen {
+        // b-calls 31 (B-R1, B-R6): the one publisher; a failure answers check `state` with its phrase.
+        Some(n) => {
+            gens::publish_once(folder, n, "notice", &written)?;
+        }
+        None => crate::state::fs::write_json(&marker, &written)?,
     }
     Ok(true)
 }
@@ -929,6 +937,7 @@ pub(crate) fn post_if_gone(ctx: &Ctx, caller: &Caller, agent: &Agent) -> Res<boo
         &agent.member,
         &agent.record,
         notice,
+        None,
     )
 }
 
@@ -2490,44 +2499,132 @@ mod tests {
 #[cfg(test)]
 #[path = "registry_hc_tests.rs"]
 mod hc_tests;
-/// Reconcile supplied hc facts; never query or clean a view.
+/// Reconcile supplied hc facts; never query or clean a view. A lifecycle member's end is recorded before its
+/// notice, and a recorded end hc has since forgotten is noticed from `ended.json` (b-calls 18).
 pub fn reap_hc(ctx: &Ctx, caller: &Caller, snapshot: &super::membership::Snapshot) -> Res<bool> {
     use super::lifecycle::{Life, classify};
     let mut acted = false;
     for o in &snapshot.facts.local {
-        let Some(t) = o.terminal.as_ref().filter(|t| o.identity.matches(t)) else {
-            continue;
-        };
-        if classify(Some(t), &o.identity.launcher) != Life::Ended {
+        let id = &o.identity.id;
+        let ended = o.terminal.as_ref().filter(|t| {
+            o.identity.matches(t) && classify(Some(t), &o.identity.launcher) == Life::Ended
+        });
+        let notice = ended.and_then(hc_notice);
+        let owed = snapshot.records.get(id).is_some_and(|s| {
+            gens::lifecycle(&s.record) && !s.noticed && (ended.is_some() || o.terminal.is_none())
+        });
+        if notice.is_none() && !owed {
             continue;
         }
-        let notice = match t.reason {
-            Some(crate::hc::Reason::Exited) => {
-                Notice::Exited(t.exit_code.map_or(Value::Null, Value::from))
-            }
-            Some(crate::hc::Reason::Killed) => Notice::Stopped,
-            _ => continue,
-        };
-        let id = &o.identity.id;
         acted |= with_member_notice(ctx, caller, id, || {
-            // R1: one read; R3, ambiguity 17: hc's finished terminal never ends a lifecycle member.
             let folder = super::server_dir(ctx, caller).join("agents").join(id);
-            let member = gens::member_of(&folder);
-            let record = match &member {
-                Member::Pre(r) if r.is_object() => r.clone(),
-                Member::Unreadable(e) => return Err(e.clone()),
-                _ => return Ok(false),
-            };
-            if super::core_identity::Identity::read(&record, id, &super::membership::team(caller))
-                .as_ref()
-                != Some(&o.identity)
-            {
-                return Ok(false);
+            let member = gens::member_of(&folder); // R1: one read
+            match &member {
+                Member::Life(_) => {
+                    let seen = snapshot.records.get(id).map(|s| &s.record);
+                    reap_life(ctx, caller, o, seen, &member, ended)
+                }
+                Member::Pre(r) if r.is_object() => {
+                    let Some(notice) = notice else {
+                        return Ok(false);
+                    };
+                    // R3, ambiguity 17: only a pre-lifecycle member's own identity is noticed from hc alone.
+                    let same = super::core_identity::Identity::read(
+                        r,
+                        id,
+                        &super::membership::team(caller),
+                    );
+                    if same.as_ref() != Some(&o.identity) {
+                        return Ok(false);
+                    }
+                    post(ctx, caller, id, &folder, &member, r, notice, None)
+                }
+                Member::Unreadable(e) => Err(e.clone()),
+                _ => Ok(false),
             }
-            post(ctx, caller, id, &folder, &member, &record, notice)
         })?;
     }
     Ok(acted)
+}
+
+/// Coordinator call 6, item 2; b-calls 18, 19: generation n is the one the snapshot identity names, while the record
+/// still names it active at the identity's address. hc shows it Ended: `record_end` with the record already read.
+/// hc shows none: the recorded `ended.json`, if any. The notice comes from the facts that stand; `post` decides,
+/// taking n's `ended.json` as read (b-calls 32).
+fn reap_life(
+    ctx: &Ctx,
+    caller: &Caller,
+    o: &Observation,
+    seen: Option<&Value>,
+    member: &Member,
+    ended: Option<&Terminal>,
+) -> Res<bool> {
+    let Member::Life(g) = member else {
+        return Ok(false);
+    };
+    // b-calls 41: the snapshot saw this generation active (its record named it active); a held identity, promoted
+    // since or not, records nothing.
+    if seen
+        .and_then(gens::active)
+        .is_none_or(|n| o.identity.generation != n.to_string())
+    {
+        return Ok(false);
+    }
+    let n = g
+        .active()
+        .filter(|n| o.identity.generation == n.to_string());
+    let at = g.record().get("hcAddress").and_then(Value::as_str);
+    let Some(n) = n.filter(|_| at == Some(o.identity.address.as_str())) else {
+        return Ok(false);
+    };
+    let facts = match ended {
+        Some(t) => gens::record_end(
+            g.folder(),
+            g.record(),
+            n,
+            t,
+            &crate::util::utc_o(ctx.clock.now()),
+        )?,
+        None => match g.read(n, "ended").known()? {
+            Some(f) => f,
+            None => return Ok(false),
+        },
+    };
+    let Some(notice) = recorded_notice(&facts) else {
+        return Ok(false);
+    };
+    post(
+        ctx,
+        caller,
+        &o.identity.id,
+        g.folder(),
+        member,
+        g.record(),
+        notice,
+        Some(n),
+    )
+}
+
+/// The notice an Ended terminal gives (main's mapping): exited with its code, killed as stopped, else none.
+fn hc_notice(t: &Terminal) -> Option<Notice> {
+    match t.reason {
+        Some(crate::hc::Reason::Exited) => {
+            Some(Notice::Exited(t.exit_code.map_or(Value::Null, Value::from)))
+        }
+        Some(crate::hc::Reason::Killed) => Some(Notice::Stopped),
+        _ => None,
+    }
+}
+
+/// The same mapping from a recorded `ended.json` (S6 `reason`, `exitCode`).
+fn recorded_notice(facts: &Value) -> Option<Notice> {
+    match facts.get("reason").and_then(Value::as_str) {
+        Some("exited") => Some(Notice::Exited(
+            facts.get("exitCode").cloned().unwrap_or(Value::Null),
+        )),
+        Some("killed") => Some(Notice::Stopped),
+        _ => None,
+    }
 }
 /// Shared hc reap/B2 stop order. Caller must hold neither lock.
 pub fn with_member_notice<T>(

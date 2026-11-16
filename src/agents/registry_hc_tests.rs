@@ -588,49 +588,206 @@ fn worth_listing_reads_the_active_generation() {
     );
 }
 
-// R3 (ambiguity 17; final re-audit): hc's finished terminal posts no notice for a lifecycle member, before and after
-// its completion is recorded; the second case passes `post`'s completion gate, so only `reap_hc`'s own guard holds.
+// Coordinator call 6, item 2; b-calls 18, 19: a natural exit records its end (ended.json, the generation named),
+// then one exit notice, each evidence file read once (record.json by member_of and Status). After a crash between
+// record_end and post, hc forgetting the terminal changes nothing: the notice comes from ended.json; with hc still
+// showing it (replayed, build checklist 8), ended.json is read once. A torn ended.json or launch.json refuses before
+// any notice; a record promoted or moved after the snapshot records nothing. b-calls 31: a failed notice publication
+// answers check `state`, `gens::NOT_PUBLISHED`; the retry posts it once.
 #[test]
-fn reap_posts_nothing_for_a_lifecycle_member() {
-    use crate::agents::gens;
-    let w = World::human("");
-    let c = w.caller();
-    let r = cf::member(
-        &w,
-        ID,
-        json!({"lifecycle": 1, "generation": "1", "hcName": "m0123abcd"}),
-    );
-    crate::state::evidence::publish(
-        &gens::path(&w.folder(ID), 1, "commit"),
-        &json!({"committed": true}),
-    )
-    .unwrap();
-    let mut t = cf::wire(&r);
-    (t["state"], t["reason"], t["exit_code"]) = (json!("finished"), json!("exited"), json!(0));
-    cf::online(&w);
-    cf::listing(&w, &membership::team(&c), &[]);
-    cf::get(&w, r["hcAddress"].as_str().unwrap(), t.clone());
-    w.panes(&[]);
-    let s = membership::Snapshot::take(&w.ctx, &c).unwrap();
-    assert!(!reap_hc(&w.ctx, &c, &s).unwrap(), "nothing recorded");
-    assert!(messages(&w).is_empty() && !gens::path(&w.folder(ID), 1, "notice").exists());
-    assert!(!w.folder(ID).join("notice.json").exists());
-    crate::state::evidence::publish(
-        &gens::path(&w.folder(ID), 1, "ended"),
-        &json!({"state": "finished"}),
-    )
-    .unwrap();
-    cf::online(&w);
-    cf::listing(&w, &membership::team(&c), &[]);
-    cf::get(&w, r["hcAddress"].as_str().unwrap(), t);
-    w.panes(&[]);
-    let s = membership::Snapshot::take(&w.ctx, &c).unwrap();
-    assert!(
-        !reap_hc(&w.ctx, &c, &s).unwrap(),
-        "recorded end: reap_hc still posts no lifecycle notice"
-    );
-    assert!(
-        messages(&w).is_empty() && !gens::path(&w.folder(ID), 1, "notice").exists(),
-        "recorded end: nothing"
-    );
+fn a_natural_exit_records_its_end_then_posts_its_notice() {
+    use crate::agents::{gens, life_fixture as lf};
+    let cases = [
+        "exit",
+        "forgotten",
+        "replayed",
+        "torn ended",
+        "torn launch",
+        "promoted",
+        "moved",
+        "forgotten, none recorded",
+        "notice fails",
+    ];
+    for case in cases {
+        let w = World::human("");
+        let c = w.caller();
+        let r = cf::member(
+            &w,
+            ID,
+            json!({"lifecycle": 1, "generation": "1", "hcName": lf::hc_name(1)}),
+        );
+        let (f, address) = (w.folder(ID), r["hcAddress"].as_str().unwrap().to_string());
+        for n in [1, 2] {
+            let launch = json!({"hcName": lf::hc_name(n), "launcherArgv": r["launcherArgv"],
+                "sessionId": r["sessionId"]});
+            crate::state::evidence::publish(&gens::path(&f, n, "launch"), &launch).unwrap();
+        }
+        crate::state::evidence::publish(&gens::path(&f, 1, "commit"), &json!({"committed": true}))
+            .unwrap();
+        let mut t = cf::wire(&r);
+        (t["name"], t["state"], t["reason"], t["exit_code"]) = (
+            json!(lf::hc_name(1)),
+            json!("finished"),
+            json!("exited"),
+            json!(0),
+        );
+        if case == "forgotten" || case == "replayed" {
+            let facts = json!({"address": address, "hcName": lf::hc_name(1), "labels": t["labels"],
+                "state": "finished", "reason": "exited", "exitCode": 0, "at": "x"});
+            gens::publish_end(&f, 1, &facts).unwrap(); // record_end ran; the crash came before post
+        }
+        cf::online(&w);
+        cf::listing(&w, &membership::team(&c), &[]);
+        if case.starts_with("forgotten") {
+            lf::gone(&w, &address);
+        } else {
+            cf::get(&w, &address, t);
+        }
+        w.panes(&[]);
+        let s = membership::Snapshot::take(&w.ctx, &c).unwrap();
+        match case {
+            "torn ended" => std::fs::write(gens::path(&f, 1, "ended"), b"{").unwrap(),
+            "torn launch" => std::fs::write(gens::path(&f, 1, "launch"), b"{").unwrap(),
+            "notice fails" => crate::state::fs::fail_sync_file(Some(&gens::path(&f, 1, "notice"))),
+            "promoted" | "moved" => {
+                let mut r2 = r.clone();
+                if case == "promoted" {
+                    (r2["generation"], r2["hcName"]) = (json!("2"), json!(lf::hc_name(2)));
+                } else {
+                    r2["hcAddress"] = json!("tmoved");
+                }
+                crate::state::fs::write_json(&f.join("record.json"), &r2).unwrap();
+            }
+            _ => {}
+        }
+        let (got, reads) = crate::state::fs::record_reads(|| reap_hc(&w.ctx, &c, &s));
+        crate::state::fs::fail_sync_file(None);
+        let mine: Vec<String> = reads
+            .iter()
+            .filter_map(|p| p.strip_prefix(&f).ok())
+            .map(|p| {
+                p.iter()
+                    .map(|c| c.to_string_lossy())
+                    .collect::<Vec<_>>()
+                    .join("/")
+            })
+            .collect();
+        match case {
+            "exit" | "forgotten" | "replayed" => {
+                assert!(got.unwrap(), "{case}: posted");
+                let once: &[&str] = match case {
+                    "exit" => &[
+                        "record.json",
+                        "gens/1/launch.json",
+                        "gens/1/commit.json",
+                        "record.json",
+                    ],
+                    "forgotten" => &[
+                        "record.json",
+                        "gens/1/ended.json",
+                        "gens/1/commit.json",
+                        "record.json",
+                    ],
+                    _ => &[
+                        "record.json",
+                        "gens/1/launch.json",
+                        "gens/1/ended.json",
+                        "gens/1/commit.json",
+                        "record.json",
+                    ],
+                };
+                assert_eq!(mine, once, "{case}: evidence read once each");
+                let ended = gens::read(&f, 1, "ended").known().unwrap().unwrap();
+                assert_eq!(
+                    (&ended["hcName"], &ended["exitCode"]),
+                    (&json!(lf::hc_name(1)), &json!(0))
+                );
+                assert_eq!(messages(&w).len(), 1, "{case}: one notice");
+                assert_eq!(messages(&w)[0]["id"], "exit-aaaaaaaaaaaa-1");
+                assert!(gens::path(&f, 1, "notice").exists());
+                assert!(
+                    !reap_hc(&w.ctx, &c, &s).unwrap(),
+                    "{case}: a second reap posts nothing"
+                );
+                assert_eq!(messages(&w).len(), 1);
+            }
+            "torn ended" | "torn launch" => {
+                assert_eq!(got.map_err(|e| e.check), Err("evidence"), "{case}");
+                assert!(
+                    messages(&w).is_empty() && !gens::path(&f, 1, "notice").exists(),
+                    "{case}"
+                );
+            }
+            "notice fails" => {
+                let e = got.unwrap_err();
+                assert_eq!(
+                    (e.check, e.message.as_str()),
+                    ("state", gens::NOT_PUBLISHED),
+                    "{case}"
+                );
+                assert!(
+                    !gens::path(&f, 1, "notice").exists() && gens::path(&f, 1, "ended").exists(),
+                    "{case}"
+                );
+                assert!(reap_hc(&w.ctx, &c, &s).unwrap(), "{case}: the retry posts");
+                assert!(gens::path(&f, 1, "notice").exists(), "{case}");
+                assert_eq!(messages(&w).len(), 1, "{case}: one notice");
+            }
+            _ => {
+                assert_eq!(got.map_err(|e| e.check), Ok(false), "{case}: nothing");
+                assert!(
+                    !gens::path(&f, 1, "ended").exists() && !gens::path(&f, 2, "ended").exists(),
+                    "{case}"
+                );
+                assert!(messages(&w).is_empty(), "{case}");
+            }
+        }
+        w.fakes.hc_done().unwrap();
+    }
+}
+
+// b-calls 41 (build checklist 9): the end is recorded only for the snapshot's subject in the role the snapshot saw.
+// A held pending generation's finished terminal records nothing, also once that generation is promoted (at the same
+// address) between the snapshot and the reap: the snapshot never saw it active.
+#[test]
+fn a_held_snapshot_promoted_before_the_reap_records_nothing() {
+    use crate::agents::{gens, life_fixture as lf};
+    for case in ["held", "held, then promoted"] {
+        let w = World::human("");
+        let c = w.caller();
+        let r = cf::member(
+            &w,
+            ID,
+            json!({"lifecycle": 1, "generation": "1", "hcName": lf::hc_name(1), "pending": lf::pending(2)}),
+        );
+        let f = w.folder(ID);
+        crate::state::evidence::publish(&gens::path(&f, 1, "commit"), &json!({"committed": true}))
+            .unwrap();
+        let wire = json!({"address": "t2", "name": lf::hc_name(2), "state": "finished", "reason": "exited",
+            "exit_code": 0, "argv": lf::ARGV, "labels": {"mux.managed": "1", "mux.team": membership::team(&c),
+            "mux.id": ID, "mux.gen": "2", "mux.name": r["name"]}});
+        cf::online(&w);
+        cf::listing(&w, &membership::team(&c), &[]);
+        cf::get(&w, "t2", wire);
+        w.panes(&[]);
+        let s = membership::Snapshot::take(&w.ctx, &c).unwrap();
+        if case == "held, then promoted" {
+            let mut r2 = read_json(&f.join("record.json")).unwrap().unwrap();
+            (r2["generation"], r2["hcAddress"], r2["hcName"]) =
+                (json!("2"), json!("t2"), json!(lf::hc_name(2)));
+            r2.as_object_mut().unwrap().remove("pending");
+            crate::state::fs::write_json(&f.join("record.json"), &r2).unwrap();
+            let launch =
+                json!({"hcName": lf::hc_name(2), "launcherArgv": lf::ARGV, "sessionId": lf::SID});
+            crate::state::evidence::publish(&gens::path(&f, 2, "launch"), &launch).unwrap();
+        }
+        assert_eq!(
+            reap_hc(&w.ctx, &c, &s).map_err(|e| e.check),
+            Ok(false),
+            "{case}: recorded"
+        );
+        assert!(!gens::path(&f, 2, "ended").exists(), "{case}: ended.json");
+        assert!(messages(&w).is_empty(), "{case}: notice");
+        w.fakes.hc_done().unwrap();
+    }
 }

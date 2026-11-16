@@ -354,10 +354,16 @@ impl Marks {
 }
 
 pub fn marks(member: &Path, n: u64) -> Res<Marks> {
+    marks_given(member, n, None)
+}
+
+/// R1 (b-calls 32): `marks` with generation n's `ended.json` taken as already read Present when `ended == Some(n)`;
+/// every other file is read once, in `marks`' order.
+pub fn marks_given(member: &Path, n: u64, ended: Option<u64>) -> Res<Marks> {
     Ok(Marks {
         abandoned: claim(member, n).known()?.is_some_and(|c| c == "abandoned"),
         decision: read(member, n, "commit").known()?.map(|c| decide(&c)),
-        ended: read(member, n, "ended").known()?.is_some(),
+        ended: ended == Some(n) || read(member, n, "ended").known()?.is_some(),
         released: read(member, n, "released").known()?.is_some(),
     })
 }
@@ -408,8 +414,19 @@ impl Gen {
 
     /// R1: one `marks` per named generation; `record.json` reread at most once, for `completing` (S6).
     pub fn status(&self) -> Res<Status> {
-        let pm = self.pending.map(|n| marks(&self.folder, n)).transpose()?;
-        let am = self.active.map(|n| marks(&self.folder, n)).transpose()?;
+        self.status_given(None)
+    }
+
+    /// `status` with generation `ended`'s `ended.json` taken as already read Present (b-calls 32).
+    pub fn status_given(&self, ended: Option<u64>) -> Res<Status> {
+        let pm = self
+            .pending
+            .map(|n| marks_given(&self.folder, n, ended))
+            .transpose()?;
+        let am = self
+            .active
+            .map(|n| marks_given(&self.folder, n, ended))
+            .transpose()?;
         let marked = pm.is_some_and(|m| m.any()) || am.is_some_and(|m| m.any());
         let completing = if marked {
             let r = record(&self.folder)
