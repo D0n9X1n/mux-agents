@@ -4,6 +4,12 @@
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+// o3 call 34 N4: the diagnostics bound their own children. Every test crate includes this module, and only some load
+// `support/bounded.rs` at their root, so it is loaded here too (std only; a second copy is a distinct module).
+#[allow(clippy::duplicate_mod)]
+#[path = "../support/bounded.rs"]
+mod bounded;
+
 /// PM call 16: a state root the production privacy check accepts: its parent exists; the root is mode 0700 on Unix.
 pub fn private_root(state: &Path) {
     if !state.exists() {
@@ -84,6 +90,12 @@ pub fn ctx(state: &Path) -> mux_agent::ctx::Ctx {
 #[cfg(windows)]
 pub fn deny_queries(child: &std::process::Child) {
     use std::os::windows::io::AsRawHandle;
+    deny_queries_on(child.as_raw_handle());
+}
+
+/// `deny_queries` on a process handle (o3 call 34 N4: a bounded child's, taken without its watchdog's lock).
+#[cfg(windows)]
+pub fn deny_queries_on(handle: std::os::windows::io::RawHandle) {
     use windows_sys::Win32::Foundation::LocalFree;
     use windows_sys::Win32::Security::Authorization::{
         ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
@@ -105,8 +117,7 @@ pub fn deny_queries(child: &std::process::Child) {
     };
     assert_ne!(made, 0, "SDDL");
     // SAFETY: the child's own process handle, open with WRITE_DAC; `sd` came from the call above.
-    let set =
-        unsafe { SetKernelObjectSecurity(child.as_raw_handle(), DACL_SECURITY_INFORMATION, sd) };
+    let set = unsafe { SetKernelObjectSecurity(handle, DACL_SECURITY_INFORMATION, sd) };
     // SAFETY: allocated by ConvertString...W.
     unsafe { LocalFree(sd) };
     assert_ne!(set, 0, "SetKernelObjectSecurity");
@@ -183,6 +194,12 @@ fn disable_debug_privilege() {
 #[cfg(windows)]
 pub fn deny_report(child: &std::process::Child) -> String {
     use std::os::windows::io::AsRawHandle;
+    deny_report_on(child.as_raw_handle(), child.id())
+}
+
+/// `deny_report` on a process handle and pid (o3 call 34 N4); its `whoami` runs bounded.
+#[cfg(windows)]
+pub fn deny_report_on(handle: std::os::windows::io::RawHandle, pid: u32) -> String {
     use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, LocalFree};
     use windows_sys::Win32::Security::Authorization::{
         ConvertSecurityDescriptorToStringSecurityDescriptorW, GetSecurityInfo, SDDL_REVISION_1,
@@ -190,7 +207,10 @@ pub fn deny_report(child: &std::process::Child) -> String {
     };
     use windows_sys::Win32::Security::{DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR};
     use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
-    let whoami = |arg: &str| match std::process::Command::new("whoami").arg(arg).output() {
+    let whoami = |arg: &str| match bounded::output(
+        std::process::Command::new("whoami").arg(arg),
+        bounded::LIMIT,
+    ) {
         Ok(o) => String::from_utf8_lossy(&o.stdout).into_owned(),
         Err(e) => format!("whoami {arg}: {e}"),
     };
@@ -210,7 +230,7 @@ pub fn deny_report(child: &std::process::Child) -> String {
     // freed below.
     let got = unsafe {
         GetSecurityInfo(
-            child.as_raw_handle(),
+            handle,
             SE_KERNEL_OBJECT,
             DACL_SECURITY_INFORMATION,
             std::ptr::null_mut(),
@@ -255,7 +275,7 @@ pub fn deny_report(child: &std::process::Child) -> String {
         shown
     };
     // SAFETY: a plain open; null on failure.
-    let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, child.id()) };
+    let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
     let open = if handle.is_null() {
         // SAFETY: no preconditions.
         format!("refused, error {}", unsafe { GetLastError() })

@@ -61,6 +61,29 @@ fn a_child_past_its_bound_is_killed_and_refused() {
     }
 }
 
+// o3 call 34 N4: a slow diagnostic run on a bounded child's handle never holds the watchdog off: the child, bounded at
+// 1 s, is killed while a 4 s diagnostic still runs. Needs no rmux.
+#[test]
+fn a_diagnostic_on_a_bounded_child_never_blocks_its_watchdog() {
+    use windows_sys::Win32::Foundation::WAIT_OBJECT_0;
+    use windows_sys::Win32::System::Threading::WaitForSingleObject;
+    let mut ping = Command::new("ping");
+    ping.args(["-n", "60", "127.0.0.1"])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null());
+    let mut child = bounded::spawn(&mut ping, Duration::from_secs(1)).unwrap();
+    let handle = child.handle();
+    std::thread::sleep(Duration::from_secs(4)); // the slow diagnostic
+    // SAFETY: the child's own process handle, alive while `child` is; a zero timeout only polls.
+    let exited_during = unsafe { WaitForSingleObject(handle, 0) == WAIT_OBJECT_0 };
+    let _ = child.kill();
+    let _ = child.wait();
+    assert!(
+        exited_during,
+        "the watchdog killed the child while the diagnostic ran"
+    );
+}
+
 // o2 call 29 (QA #146 F3): `bounded::output` never answers success with output it did not finish reading. The child
 // prints and exits while a descendant keeps its stdout open about 8 s: refused `TimedOut` naming stdout, within the
 // 5 s grace and the 1 s release (so the read handle was dropped, not left blocked until the descendant ends). A
@@ -957,11 +980,11 @@ fn an_unreadable_claude_exe_blocks_resume() {
     // outcome-2 call 14: bounded; the watchdog kills it at 300 s if the test never does.
     let mut child = bounded::spawn(&mut copy, Duration::from_secs(300)).unwrap();
     let pid = child.id();
-    child.with_child(native::deny_queries);
+    native::deny_queries_on(child.handle());
     assert!(
         mux_agent::proc::host().row(pid).is_none(),
         "precondition, the deny took effect: {}",
-        child.with_child(native::deny_report)
+        native::deny_report_on(child.handle(), pid)
     );
     let Some(live) = Live::start() else {
         return;
