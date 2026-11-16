@@ -340,19 +340,15 @@ fn session_team(ctx: &Ctx, scope: &super::team_state::Scope) -> Res<Option<Strin
     Ok(None)
 }
 
-/// The person caller moved to the anchor scope (ambiguity 7): its key and session; no pane, chain or client.
+/// The person caller with its state at the anchor `scope` (re6a call 13, replacing restore-6b ambiguity 7's
+/// rewrites): only `anchor` is set; its socket, session, pane, window and server key stay its own, so every
+/// multiplexer call reaches the person's own server while every state read goes to the anchor.
 pub fn anchor_caller(person: &Caller, scope: &super::team_state::Scope) -> Caller {
     Caller {
-        kind: crate::caller::Kind::Human,
-        client: None,
-        agent: None,
-        chain: Vec::new(),
-        pane: String::new(),
-        window: String::new(),
-        session: scope.session.clone(),
-        server_key: scope.key.clone(),
-        member: None,
-        candidate: None,
+        anchor: Some(crate::caller::Anchor {
+            key: scope.key.clone(),
+            session: scope.session.clone(),
+        }),
         ..person.clone()
     }
 }

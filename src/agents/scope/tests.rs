@@ -151,5 +151,28 @@ fn registry_and_board_read_the_anchor_pair() {
     );
 }
 
-// shortcut: call 13's `anchor_caller_sets_only_the_anchor` (reconcile::anchor_caller sets only `anchor`) needs
-// restore-6b's `reconcile::anchor_caller`, not on this branch yet; it is added when origin/v0.3-life-r6b has it.
+// Call 13: `anchor_caller` sets only `anchor`; the person's socket, session, pane, window and key are kept.
+#[test]
+fn anchor_caller_sets_only_the_anchor() {
+    let w = World::human("");
+    let p = w.caller();
+    let a = crate::agents::reconcile::anchor_caller(&p, &at());
+    assert_eq!(
+        a.anchor,
+        Some(Anchor {
+            key: K1.into(),
+            session: "$A".into()
+        })
+    );
+    let kept = |c: &crate::caller::Caller| {
+        (
+            c.socket.clone(),
+            c.session.clone(),
+            c.pane.clone(),
+            c.window.clone(),
+            c.server_key.clone(),
+        )
+    };
+    assert_eq!(kept(&a), kept(&p), "presentation untouched");
+    assert_eq!(scope::state(&a), at(), "state at the anchor");
+}
