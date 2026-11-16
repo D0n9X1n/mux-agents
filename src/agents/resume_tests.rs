@@ -248,7 +248,7 @@ fn resume_refuses_and_launches_nothing() {
                 json!({"pane": "%6", "sessionId": OTHER_SESSION}),
                 "running",
             ),
-            "session" => add(Y, json!({"name": "other", "pane": "%6"}), "running"),
+            "session" => process(&w, 7001, &["claude", "--resume", SESSION_ID]),
             "cap" => {
                 for n in 1..=6 {
                     add(
@@ -280,11 +280,6 @@ fn resume_refuses_and_launches_nothing() {
         if case != "agent" {
             let refs: Vec<_> = terminals.iter().map(|(r, l)| (r, l.as_str())).collect();
             snapshot(&w, &refs);
-            // The session check asks hc about the one other record that carries X's session: Y, running.
-            if case == "session" {
-                let (y, life) = &terminals[1];
-                cf::get(&w, y["hcAddress"].as_str().unwrap(), wire(y, life));
-            }
         }
         let before = folders(&w);
         let target = if case == "missing" { "nobody" } else { ID };
@@ -296,6 +291,13 @@ fn resume_refuses_and_launches_nothing() {
             other => other,
         };
         assert_eq!((e.code, e.check), (2, want), "{case}: {}", e.message);
+        if case == "session" {
+            assert!(
+                e.message.starts_with("process 7001 (fixture)"),
+                "{}",
+                e.message
+            );
+        }
         assert_eq!(folders(&w), before, "{case}");
         assert_eq!(runs(&w), 0, "{case}");
         w.fakes.hc_done().unwrap();
@@ -566,18 +568,49 @@ fn process(w: &World, pid: u32, argv: &[&str]) {
     w.fakes.process(row);
 }
 
-// X's conversation live anywhere refuses (amendment 1 on #103), and nothing launches:
-// - any process on this machine whose argv carries X's uuid after `--resume`, `-r`, `--resume=`, `--session-id` or
-//   `--session-id=`, with no hc terminal and no record (a client someone resumed by hand), and a process table that
-//   cannot be read;
-// - a member under another server key whose record carries X's session and that hc does not prove ended, or whose
-//   terminal hc cannot read.
+// H4.4 through admission: an unmanaged live Claude on another conversation refuses resuming X; a Copilot one does not.
+#[test]
+fn an_unmanaged_client_on_any_conversation_blocks_resume() {
+    for (client, refused) in [
+        (crate::parse::Client::Claude, true),
+        (crate::parse::Client::Copilot, false),
+    ] {
+        let w = World::human("");
+        let x = member(&w, ID, json!({"pane": "%5", "window": "@1", "depth": 1}));
+        w.panes(&[]);
+        process(&w, 7001, &["claude", "--resume", OTHER_SESSION]);
+        w.fakes.client(7001, client);
+        facts(&w, &[(&x, "exited")]);
+        let before = folders(&w);
+        if refused {
+            let e = resume_of(&w, ID).unwrap_err();
+            assert_eq!((e.code, e.check), (2, "session"), "{}", e.message);
+            assert_eq!(
+                e.message,
+                "process 7001 (fixture) may hold that conversation: it is a client this team did not start; if you \
+                 just stopped it, retry in a few seconds"
+            );
+            assert_eq!((folders(&w), runs(&w)), (before, 0));
+        } else {
+            launches(&w, "t1");
+            assert_eq!(resume_of(&w, ID).unwrap()["from"], ID);
+        }
+        w.fakes.hc_done().unwrap();
+    }
+}
+
+// X's conversation live anywhere refuses (occupy-3 H3, H4.3-5), and nothing launches:
+// - any process whose argv carries X's uuid after `--resume`, `-r`, `--resume=`, `--session-id` or `--session-id=`
+//   (H4.3, whatever its kind), and a process table that cannot be read (H4.1);
+// - an unmanaged readable client of X's kind, whatever conversation its argv names (H4.4);
+// - a row with no start, path or argv whose image is unreadable or names a client of X's kind (H4.5);
+// - a member record that cannot be read (R2).
 // A fork of X (`--resume X --fork-session --session-id Z`) occupies only Z, so it does not block X; a fork into X
-// (`... --session-id X`) does. A row with no argv refuses (naming its pid) when it is a claude or copilot client,
-// known by `client_of` or its image's file name; one that is no client is skipped. The member elsewhere, proven
-// ended, does not block.
+// (`... --session-id X`) does. An unbound row whose image names no client of X's kind, a client of another kind, and
+// a pre-lifecycle record elsewhere (no reservation, prelife-1c G10) do not block.
 #[test]
 fn resume_refuses_while_the_conversation_is_live_anywhere() {
+    use crate::agents::occupancy::Rule;
     let resume_equals = format!("--resume={SESSION_ID}");
     let session_equals = format!("--session-id={SESSION_ID}");
     for (case, refused) in [
@@ -592,9 +625,11 @@ fn resume_refuses_while_the_conversation_is_live_anywhere() {
         ("unreadable", true),
         ("client-path-no-argv", true),
         ("client-of-no-argv", true),
+        ("no-image", true),
         ("fork-of-x", false),
         ("no-argv", false),
         ("other-path-no-argv", false),
+        ("copilot-no-argv", false),
         ("elsewhere-ended", false),
     ] {
         let w = World::human("");
@@ -631,7 +666,12 @@ fn resume_refuses_while_the_conversation_is_live_anywhere() {
                 ],
             ),
             "no-argv" => w.fakes.process(crate::testing::row(7001, 1, 1)),
-            // A client whose argv cannot be read, known by its image's file name or by `client_of`.
+            "no-image" => {
+                let mut row = crate::testing::row(7001, 1, 1);
+                row.image = None;
+                w.fakes.process(row);
+            }
+            // A row whose argv cannot be read, judged by its image with the host's rules (H4.5).
             "client-path-no-argv" | "other-path-no-argv" => {
                 let mut row = crate::testing::row(7001, 1, 1);
                 let file = if case == "client-path-no-argv" {
@@ -640,11 +680,25 @@ fn resume_refuses_while_the_conversation_is_live_anywhere() {
                     "sleep"
                 };
                 row.path = Some(format!("/usr/local/bin/{file}"));
+                row.image = Some(match (case, cfg!(windows)) {
+                    ("client-path-no-argv", true) => "claude.exe".into(),
+                    ("client-path-no-argv", false) => "claude".into(),
+                    _ => "sleep".into(),
+                });
                 w.fakes.process(row);
             }
-            "client-of-no-argv" => {
+            "client-of-no-argv" | "copilot-no-argv" => {
                 w.fakes.process(crate::testing::row(7001, 1, 1));
-                w.fakes.client(7001, crate::parse::Client::Copilot);
+                let client = if case == "client-of-no-argv" {
+                    crate::parse::Client::Claude
+                } else {
+                    crate::parse::Client::Copilot
+                };
+                w.fakes.client(7001, client);
+            }
+            "elsewhere" => {
+                process(&w, 7002, &["claude"]);
+                w.fakes.client(7002, crate::parse::Client::Claude);
             }
             "table" => w.fakes.table_fails(),
             _ => {}
@@ -660,36 +714,28 @@ fn resume_refuses_while_the_conversation_is_live_anywhere() {
                     "sessionId": SESSION_ID, "session": "$1", "team": "other-server:$1",
                     "generation": "0", "hcAddress": "tother", "launcherArgv": launcher}),
             );
-            // The session check's one look at hc: that member's own terminal.
             if case == "unreadable" {
-                w.fakes
-                    .hc_expect(&["get", "tother", "--json"], Err(Refusal::internal("gone")));
-            } else {
-                let mut t = json!({"address": "tother", "state": "live", "argv": launcher,
-                    "labels": {"mux.managed": "1", "mux.team": "other-server:$1", "mux.id": Y,
-                        "mux.gen": "0", "mux.name": "worker"}});
-                if case == "elsewhere-ended" {
-                    t["state"] = json!("finished");
-                    t["reason"] = json!("exited");
-                }
-                cf::get(&w, "tother", t);
+                std::fs::write(elsewhere.join("record.json"), b"{\"sch").unwrap();
             }
         }
         let before = folders(&w);
         if refused {
             let e = resume_of(&w, ID).unwrap_err();
             assert_eq!((e.code, e.check), (2, "session"), "{case}: {}", e.message);
-            if case.ends_with("-no-argv") {
-                assert!(e.message.contains("7001"), "{case}: {}", e.message);
-            } else {
-                // #137: a conversation just stopped may still be ending; the message says to retry.
-                assert_eq!(
-                    e.message,
-                    "that conversation is live in another member or terminal, or cannot be proven ended; if you \
-                     just stopped it, retry in a few seconds",
-                    "{case}"
-                );
-            }
+            let (rule, who) = match case {
+                "client-path-no-argv" | "no-image" => (Rule::Unbound, "process 7001 "),
+                "client-of-no-argv" => (Rule::Unmanaged, "process 7001 "),
+                "elsewhere" => (Rule::Unmanaged, "process 7002 "),
+                "table" => (Rule::Table, "this machine "),
+                "unreadable" => (Rule::Evidence, "member bbbbbbbbbbbb "),
+                _ => (Rule::Argv, "process 7001 "),
+            };
+            // PM call 2: the holder (pid and image, or member) and the rule.
+            assert!(
+                e.message.starts_with(who) && e.message.contains(rule.phrase()),
+                "{case}: {}",
+                e.message
+            );
             assert_eq!(folders(&w), before, "{case}");
             assert_eq!(runs(&w), 0, "{case}");
         } else {
@@ -1674,25 +1720,24 @@ fn a_lifecycle_successor_is_judged_by_its_own_generations() {
 // refuses. Each case in a fresh world, hc's finished terminal queued after the connection, so a fallback to hc
 // would answer Ended.
 #[test]
-fn a_lifecycle_member_ends_only_by_its_recorded_completion() {
+fn a_lifecycle_member_holds_until_its_recorded_completion() {
+    use crate::agents::occupancy::Rule;
     use crate::{agents::gens, state::evidence::publish};
     let end = json!({"state": "finished"});
     for (case, want) in [
-        ("hc exited, nothing recorded", Ok(false)),
-        ("generation 0 ended, 1 not", Ok(false)),
-        ("ended recorded", Ok(true)),
-        ("completing", Ok(false)),
-        ("torn ended", Err("evidence")),
-        ("never ran", Ok(true)),
-        ("pending undecided", Ok(false)),
-        ("pending aborted", Ok(true)),
-        ("pending ended", Ok(true)),
-        ("pending released", Ok(true)),
-        ("01", Err("internal")),
+        ("hc exited, nothing recorded", Some(Rule::Reserved)),
+        ("generation 0 ended, 1 not", Some(Rule::Reserved)),
+        ("ended recorded", None),
+        ("completing", Some(Rule::Reserved)),
+        ("torn ended", Some(Rule::Evidence)),
+        ("never ran", None),
+        ("pending undecided", Some(Rule::Evidence)),
+        ("pending aborted", None),
+        ("pending ended", None),
+        ("pending released", None),
+        ("01", Some(Rule::Evidence)),
     ] {
         let w = World::human("");
-        cf::online(&w);
-        let core = crate::hc::connect(&w.ctx).unwrap();
         let mut r = cf::member(
             &w,
             ID,
@@ -1733,15 +1778,14 @@ fn a_lifecycle_member_ends_only_by_its_recorded_completion() {
             _ => {}
         }
         write(&f.join("record.json"), r.clone());
-        let mut t = cf::wire(&r);
-        (t["state"], t["reason"], t["exit_code"]) = (json!("finished"), json!("exited"), json!(0));
-        cf::get(&w, r["hcAddress"].as_str().unwrap(), t);
-        let member = gens::member_of(&f);
-        assert_eq!(
-            ended(&core, &f, ID, &r, &member).map_err(|e| e.check),
-            want,
-            "{case}"
+        let held = crate::agents::occupancy::held_on(
+            &w.ctx,
+            SESSION_ID,
+            crate::parse::Client::Claude,
+            crate::state::root::OsKind::Unix,
+            None,
         );
+        assert_eq!(held.map(|h| h.rule), want, "{case}");
     }
 }
 
@@ -1754,10 +1798,16 @@ fn an_unreadable_member_holds_the_session() {
         json!({"lifecycle": 1, "generation": "01", "sessionId": SESSION_ID}),
     );
     write(&y.join("abort.json"), json!({"runUncertain": false}));
-    cf::online(&w);
-    let core = crate::hc::connect(&w.ctx).unwrap();
-    assert!(
-        session_held(&w.ctx, &core, ID, SESSION_ID).is_some(),
+    let held = crate::agents::occupancy::held_on(
+        &w.ctx,
+        SESSION_ID,
+        crate::parse::Client::Claude,
+        crate::state::root::OsKind::Unix,
+        None,
+    );
+    assert_eq!(
+        held.map(|h| h.rule),
+        Some(crate::agents::occupancy::Rule::Evidence),
         "unclear evidence is never free"
     );
 }
@@ -1778,20 +1828,30 @@ fn a_pending_conversation_is_held_until_its_generation_is_done() {
         );
         publish(&gens::path(&y, 1, "commit"), &json!({"committed": true})).unwrap();
         publish(&gens::path(&y, 2, "commit"), &json!({"committed": true})).unwrap();
-        cf::online(&w);
-        let core = crate::hc::connect(&w.ctx).unwrap();
         // [the active generation's conversation, the pending generation's]
-        let held = || [other, SESSION_ID].map(|s| session_held(&w.ctx, &core, ID, s).is_some());
+        let held = || {
+            [other, SESSION_ID].map(|s| {
+                crate::agents::occupancy::held_on(
+                    &w.ctx,
+                    s,
+                    crate::parse::Client::Claude,
+                    crate::state::root::OsKind::Unix,
+                    None,
+                )
+                .is_some()
+            })
+        };
         assert_eq!(
             held(),
             [true, true],
             "first {first}: neither generation done: both held"
         );
         publish(&gens::path(&y, first, "ended"), &end).unwrap();
+        // Call 13: each generation reserves only its own session, so the done one's is free.
         assert_eq!(
             held(),
-            [true, true],
-            "only generation {first} done: both still held"
+            [first != 1, first != 2],
+            "only generation {first} done: only the other's held"
         );
         publish(&gens::path(&y, 3 - first, "ended"), &end).unwrap();
         assert_eq!(

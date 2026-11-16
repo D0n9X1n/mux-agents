@@ -1,14 +1,12 @@
 //! resume: starts an ended member X again with its conversation (`<client> <flags> --resume <uuid>`), never
 //! resending its task, as a new member Y from spawn's launch path. X's folder is never written.
 
-use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 use serde_json::{Map, Value, json};
 
-use super::core_identity::Identity;
 use super::gens::Member;
-use super::lifecycle::{Life, classify};
+use super::lifecycle::Life;
 use super::membership::Snapshot;
 use super::placement::{DEFAULT as DEFAULT_PLACEMENT, read_placement};
 use super::spawn::{CoreRequest, CoreSlot, Resumed, client_named, keep_bar, launch_hc_locked};
@@ -18,7 +16,6 @@ use crate::caller::Kind;
 use crate::cli::Request;
 use crate::ctx::Ctx;
 use crate::error::{Refusal, Res, refuse};
-use crate::hc::{Core, Terminal};
 use crate::state::fs::read_json;
 
 pub fn resume(ctx: &Ctx, request: &Request) -> Res<Map<String, Value>> {
@@ -56,7 +53,7 @@ pub fn resume(ctx: &Ctx, request: &Request) -> Res<Map<String, Value>> {
             None => None,
         };
         let snapshot = Snapshot::for_spawn(ctx, &caller, &core)?;
-        let resumed = admit(ctx, &caller, &core, &snapshot, target, gate.as_ref())?;
+        let resumed = admit(ctx, &caller, &snapshot, target, gate.as_ref())?;
         // A member's resume takes its token as the launch's last step before `hc run` (D5).
         let debit = matches!(&gate, Some((_, super::tree::Standing::Member(_))));
         // The mailbox barrier: a reader of X's mailbox that holds its lock finishes before Y exists; one after it
@@ -110,13 +107,12 @@ pub fn resume(ctx: &Ctx, request: &Request) -> Res<Map<String, Value>> {
 
 /// X as `target` names it, checked under the spawn lock: `<id>` is that member, `<name>` the newest (by
 /// `createdAt`) of that name that no resume superseded. X must be proven ended, not taken, no leader, its session
-/// live nowhere (`session_held`) and no member of its name running. Outside a team the session stays under its cap; in
+/// live nowhere (`occupancy::held`) and no member of its name running. Outside a team the session stays under its cap; in
 /// a team the caller's authority, the tree's limit, the parent's and the team's ceiling, the name and a member's budget
 /// are checked in that order, and the budget is only checked here: the launch spends it (#103 D5).
 fn admit(
     ctx: &Ctx,
     caller: &crate::caller::Caller,
-    core: &Core<'_>,
     snapshot: &Snapshot,
     target: &str,
     gate: Option<&(super::team::Team, super::tree::Standing)>,
@@ -202,8 +198,16 @@ fn admit(
     if gate.is_none() {
         name_check()?;
     }
-    if let Some(why) = session_held(ctx, core, id, &x.identity.session_id) {
-        return refuse(2, "session", why);
+    // occupy-3 H4: any live process that may hold X's conversation refuses, named by pid, image and rule (call 2).
+    // The client caller proof established is exempt from H4.4/H4.5 (calls 1, 7): the member proof `standing` returned
+    // under this lock (a candidate's re-proof included), else a pane caller's proven agent. A record naming no known
+    // client skips this and is refused `internal` below, before any launch (ambiguity 9).
+    if let Some(kind) = client_named(&text(record.get("client"))) {
+        let own = super::occupancy::own_of(caller, gate.map(|(_, s)| s));
+        if let Some(hold) = super::occupancy::held(ctx, &x.identity.session_id, kind, own.as_ref())
+        {
+            return refuse(2, "session", hold.message());
+        }
     }
     // A leader is the depth-0 record `up` makes (leader.rs); it is never resumed.
     if record.get("depth").and_then(Value::as_u64) == Some(0) {
@@ -326,99 +330,6 @@ fn taken(ctx: &Ctx, caller: &crate::caller::Caller, id: &str) -> Res<Option<Stri
     Ok(None)
 }
 
-/// Why X's conversation may be live somewhere (amendment 1 on #103), or none when it is live nowhere:
-/// - no process on this machine occupies it (`occupies`). This covers every client hc runs (an hc terminal's client
-///   is a process of this user on this machine) and a client someone resumed by hand outside hc or the state root;
-/// - no claude or copilot process on this machine has a command line that cannot be read;
-/// - every other member record in any server folder of the state root that carries it is proven ended by hc. A
-///   member a successor names in `resumedFrom` was proven ended when that successor was admitted.
-///
-/// Unclear evidence (a process table, hc or a record that cannot be read) is never free.
-fn session_held(ctx: &Ctx, core: &Core<'_>, x: &str, session: &str) -> Option<String> {
-    let live = || {
-        "that conversation is live in another member or terminal, or cannot be proven ended; if you just stopped \
-         it, retry in a few seconds"
-            .to_string()
-    };
-    let held = || -> Res<Option<String>> {
-        // A row with no argv is one the OS will not read for this user (another user's, or one this user cannot
-        // open). When it is still known as a claude or copilot client (`client_of`, or its image's file name), it
-        // may hold the conversation, so it refuses; one neither readable nor known as a client is skipped. Known
-        // limits until slice 5: such an unknown row, and a client that switched into the conversation with
-        // `/resume`, which shows no uuid.
-        for row in ctx.os.table()? {
-            match row.argv.as_deref() {
-                Some(argv) if super::occupancy::occupies(argv, session) => return Ok(Some(live())),
-                Some(_) => {}
-                None if unreadable_client(ctx, &row) => {
-                    return Ok(Some(format!(
-                        "process {} is a claude or copilot client whose command line cannot be read, so it may \
-                         hold that conversation",
-                        row.pid
-                    )));
-                }
-                None => {}
-            }
-        }
-        let members = every_member(ctx)?; // R1: one classification per folder
-        if members
-            .iter()
-            .any(|(_, m)| matches!(m, Member::Unreadable(_)))
-        {
-            return Ok(Some(live())); // R2, R5
-        }
-        let named: BTreeSet<&str> = members
-            .iter()
-            .filter_map(|(_, m)| record_of(m)?.get("resumedFrom")?.as_str())
-            .collect();
-        for (folder, member) in &members {
-            let Some(record) = record_of(member) else {
-                continue;
-            };
-            let id = folder.file_name().and_then(|n| n.to_str()).unwrap_or("");
-            // R3 (re-audit a0586ee): every conversation the record names; a lifecycle record's pending one too.
-            let mut names = vec![text(record.get("sessionId"))];
-            if matches!(member, Member::Life(_)) {
-                names.push(text(record.get("pending").and_then(|p| p.get("sessionId"))));
-            }
-            if id == x || named.contains(id) || !names.iter().any(|s| s == session) {
-                continue;
-            }
-            if !ended(core, folder, id, record, member)? {
-                return Ok(Some(live()));
-            }
-        }
-        Ok(None)
-    };
-    held().unwrap_or_else(|_| Some(live()))
-}
-
-/// The record a classified member holds: a pre-lifecycle record, or a lifecycle member's; none otherwise.
-fn record_of(m: &Member) -> Option<&Value> {
-    match m {
-        Member::Pre(r) => Some(r),
-        Member::Life(g) => Some(g.record()),
-        Member::Absent | Member::Unreadable(_) => None,
-    }
-}
-
-/// Whether `row` (whose argv cannot be read) is a claude or copilot client: the OS says so, or its image's file
-/// name is `claude` or `copilot` (with `.exe` on Windows).
-fn unreadable_client(ctx: &Ctx, row: &crate::proc::Row) -> bool {
-    if ctx.os.client_of(row).is_some() {
-        return true;
-    }
-    row.path.as_deref().is_some_and(|path| {
-        let file = path
-            .rsplit(['/', '\\'])
-            .next()
-            .unwrap_or(path)
-            .to_ascii_lowercase();
-        let file = file.strip_suffix(".exe").unwrap_or(&file);
-        file == "claude" || file == "copilot"
-    })
-}
-
 /// R1, R5: every member folder of every server folder of the state root, classified once, links kept.
 pub(crate) fn every_member(ctx: &Ctx) -> Res<Vec<(PathBuf, super::gens::Member)>> {
     let servers = match std::fs::read_dir(&ctx.state_root) {
@@ -439,60 +350,6 @@ pub(crate) fn every_member(ctx: &Ctx) -> Res<Vec<(PathBuf, super::gens::Member)>
         );
     }
     Ok(all)
-}
-
-/// R3: a lifecycle member is ended only when every generation it names is done by recorded evidence; hc never
-/// ends it. Unreadable refuses (R2); `session_held` treats any `Err` as held. Pre-lifecycle: main (`pre_ended`).
-fn ended(core: &Core<'_>, folder: &Path, id: &str, record: &Value, member: &Member) -> Res<bool> {
-    match member {
-        Member::Life(g) => Ok(g.status()?.finished),
-        Member::Unreadable(e) => Err(e.clone()),
-        Member::Pre(_) | Member::Absent => Ok(pre_ended(core, folder, id, record)),
-    }
-}
-
-/// Whether the member recorded in `folder` is proven ended, asking hc about it alone. An hc member: its own
-/// terminal, matched by address and labels, classifies Ended. A launch whose run named no address yet: its claim was
-/// abandoned, or the one generation-0 terminal labelled with its id has finished, or it never claimed and aborted. A
-/// pre-hc record: its end notice.
-fn pre_ended(core: &Core<'_>, folder: &Path, id: &str, record: &Value) -> bool {
-    if record.get("hcAddress").is_some() {
-        let identity = record
-            .get("team")
-            .and_then(Value::as_str)
-            .and_then(|team| Identity::read(record, id, team));
-        return identity.is_some_and(|i| {
-            let t = core.get(&i.address).ok().filter(|t| i.matches(t));
-            classify(t.as_ref(), &i.launcher) == Life::Ended
-        });
-    }
-    match read_json(&folder.join("gens").join("0.claim")) {
-        Ok(Some(claim)) if claim.as_str() == Some("abandoned") => true,
-        Ok(Some(_)) => {
-            let Ok(listed) = core.ls(&[("mux.managed", "1"), ("mux.id", id), ("mux.gen", "0")])
-            else {
-                return false;
-            };
-            let listed: BTreeSet<String> = listed.into_iter().collect();
-            match listed.iter().collect::<Vec<_>>().as_slice() {
-                [address] => core.get(address).is_ok_and(|t| {
-                    t.address == **address
-                        && labelled(&t, id)
-                        && classify(Some(&t), &[]) == Life::Ended
-                }),
-                _ => false,
-            }
-        }
-        Ok(None) => folder.join("abort.json").exists() || folder.join("notice.json").exists(),
-        Err(_) => false,
-    }
-}
-
-/// Whether `t` is managed generation 0 of member `id`, as hc run labelled it.
-fn labelled(t: &Terminal, id: &str) -> bool {
-    [("mux.managed", "1"), ("mux.id", id), ("mux.gen", "0")]
-        .iter()
-        .all(|(k, v)| t.labels.get(*k).map(String::as_str) == Some(*v))
 }
 
 #[cfg(test)]

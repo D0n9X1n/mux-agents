@@ -229,10 +229,25 @@ jobs:
         run: |
           cargo test --features live,test-panic --locked --test fake_client_bg
           cargo test --features live,test-panic --locked --bin fake-client
+      # occupy-3: a fake client of a parallel live test is an unmanaged client of another state root and holds every
+      # conversation of its kind, so the tests that run `resume` (tests/serial_resume.txt) run alone.
       - name: Live tests
+        shell: bash
         env:
           MUX_AGENTS_LIVE_REQUIRE: tmux,tmux32,rmux
-        run: cargo test --features live,test-panic --locked --test live
+        run: |
+          set -euo pipefail
+          names=$(grep -v '^#' tests/serial_resume.txt)
+          skips=$(printf -- '--skip %s ' $names)
+          cargo test --features live,test-panic --locked --test live -- $skips
+      - name: Live resume tests, one at a time
+        shell: bash
+        env:
+          MUX_AGENTS_LIVE_REQUIRE: tmux,tmux32,rmux
+        run: |
+          set -euo pipefail
+          names=$(grep -v '^#' tests/serial_resume.txt)
+          cargo test --features live,test-panic --locked --test live -- --test-threads=1 $names
       - name: Release script tests
         run: sh tests/release.sh
       - name: Wiki publisher tests
@@ -306,4 +321,7 @@ jobs:
         run: |
           set -euo pipefail
           rmux -V
-          cargo test --features live,test-panic --locked --test live_windows -- --nocapture
+          names=$(grep -v '^#' tests/serial_resume.txt)
+          skips=$(printf -- '--skip %s ' $names)
+          cargo test --features live,test-panic --locked --test live_windows -- --nocapture $skips
+          cargo test --features live,test-panic --locked --test live_windows -- --nocapture --test-threads=1 $names
