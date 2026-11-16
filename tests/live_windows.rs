@@ -938,6 +938,67 @@ fn up_runs_the_leader_with_options_then_session_then_prompt() {
     );
 }
 
+// occupy-3 H4.5 live: a claude.exe this user cannot open (an elevated client; here a fake-client copy whose queries
+// are denied, the same Toolhelp-only row) blocks `mux-agent resume` of an ended Claude member, naming its pid; once
+// it has left the Toolhelp table the resume is admitted. The deny comes before the server starts: `deny_queries`
+// drops this process's SeDebugPrivilege, and the rmux server and the pane's mux-agent copy the token as it is then.
+#[test]
+fn an_unreadable_claude_exe_blocks_resume() {
+    let elevated = std::env::temp_dir().join(format!("elevated-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&elevated);
+    std::fs::create_dir_all(elevated.join("it")).unwrap();
+    let exe = elevated.join("claude.exe");
+    std::fs::copy(env!("CARGO_BIN_EXE_fake-client"), &exe).unwrap();
+    let mut copy = std::process::Command::new(&exe);
+    copy.env("MUX_IT_DIR", elevated.join("it"))
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    // outcome-2 call 14: bounded; the watchdog kills it at 300 s if the test never does.
+    let mut child = bounded::spawn(&mut copy, Duration::from_secs(300)).unwrap();
+    let pid = child.id();
+    child.with_child(native::deny_queries);
+    assert!(
+        mux_agent::proc::host().row(pid).is_none(),
+        "precondition, the deny took effect: {}",
+        child.with_child(native::deny_report)
+    );
+    let Some(live) = Live::start() else {
+        return;
+    };
+    let w = live.spawn("w1");
+    let address = s(&w["hcAddress"]);
+    live.run(&["stop", "w1"]);
+    live.wait("finished core terminal", || {
+        let got = private_core::run(live.core.command(&["get", &address, "--json"]), &live.dir);
+        (got.unwrap()["state"] == "finished").then_some(())
+    });
+    let refused = live.run_any(&["resume", "w1"]);
+    assert_eq!(refused["check"], "session", "{refused}");
+    // PM call 2: this copy's pid and image, and the unbound rule.
+    let message = s(&refused["message"]);
+    assert!(
+        message.starts_with(&format!("process {pid} (claude.exe)")),
+        "{message}"
+    );
+    assert!(
+        message.contains(mux_agent::agents::occupancy::Rule::Unbound.phrase()),
+        "{message}"
+    );
+    let _ = child.kill();
+    let _ = child.wait();
+    native::within_10_s("the copy leaves Toolhelp", || {
+        (!mux_agent::proc::host()
+            .table()
+            .unwrap()
+            .iter()
+            .any(|r| r.pid == pid))
+        .then_some(())
+    });
+    live.run(&["resume", "w1"]);
+    let _ = std::fs::remove_dir_all(&elevated);
+}
+
 // options-6e live on rmux for Windows: started with `--model x` and a task, stopped, its record seeded as in the
 // task text, resumed: argv `--model x --resume <sid>`, no task.
 #[test]

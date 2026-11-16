@@ -1007,6 +1007,11 @@ fn ci_jobs_run_cargo_and_sh() {
         &[
             "sh scripts/dev/tmux32.sh",
             "cargo test --features live,test-panic --locked --test live",
+            // occupy-3 call 24: the resume tests run alone, by their full registered names, after the runner's
+            // self-test.
+            "sh tests/serial_resume.sh check live",
+            "sh tests/serial_resume.sh parallel live",
+            "sh tests/serial_resume.sh serial live",
             "sh tests/release.sh",
             "sh tests/wiki.sh",
             "@anthropic-ai/claude-code@2.1.310",
@@ -1020,7 +1025,9 @@ fn ci_jobs_run_cargo_and_sh() {
             "git fetch -q --depth 1 https://github.com/Helvesec/rmux dfd68c774ca0f4212139a21d37d09c90f75f8bd7",
             "cargo build --locked --bin rmux",
             "cargo clippy --all-targets --features live,test-panic --locked -- -D warnings",
-            "cargo test --features live,test-panic --locked --test live_windows -- --nocapture",
+            "sh tests/serial_resume.sh check live_windows",
+            "sh tests/serial_resume.sh parallel live_windows --nocapture",
+            "sh tests/serial_resume.sh serial live_windows --nocapture",
         ],
     );
     let windows = code_lines(&ci);

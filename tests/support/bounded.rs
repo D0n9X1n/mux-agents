@@ -263,6 +263,10 @@ impl Watched {
     pub fn id(&self) -> u32 {
         self.id
     }
+    /// `f` with the child itself (occupy-3: a test sets the child's DACL through its handle).
+    pub fn with_child<T>(&self, f: impl FnOnce(&Child) -> T) -> T {
+        f(&guard(&self.child))
+    }
     pub fn kill(&mut self) -> io::Result<()> {
         guard(&self.child).kill()
     }
