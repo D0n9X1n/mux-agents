@@ -251,3 +251,144 @@ fn the_notebook_is_the_anchor_scopes_whatever_session_reaches_it() {
         "until 6a routes it"
     );
 }
+
+// Ambiguity 2 (F13): a drawn id the certain prefix already holds is drawn again.
+#[test]
+fn a_drawn_id_already_in_the_prefix_is_drawn_again() {
+    let known = vec![json!({"id": "aaaaaaaaaaaaaaaa"})];
+    let mut draws = vec!["bbbbbbbbbbbbbbbb", "aaaaaaaaaaaaaaaa"];
+    let got = fresh_id(&known, || Ok(draws.pop().unwrap().to_string())).unwrap();
+    assert_eq!((got.as_str(), draws.len()), ("bbbbbbbbbbbbbbbb", 0));
+}
+
+// R4 (F9): the line is flushed before its folder: a failing file flush leaves the notes folder unflushed.
+#[test]
+fn the_line_is_flushed_before_its_folder() {
+    let (w, s) = world();
+    add(&w, &s, "kept").unwrap();
+    let at = notes(&w, &s);
+    crate::state::fs::fail_sync_file(Some(&at.join(LOG)));
+    let (e, syncs) = crate::state::fs::record_syncs(|| add(&w, &s, "next").unwrap_err());
+    crate::state::fs::fail_sync_file(None);
+    assert_eq!(e.code, 1, "{e:?}");
+    assert!(
+        !syncs.contains(&at),
+        "the folder flushed before the file: {syncs:?}"
+    );
+}
+
+// R4 (F3): a failed flush of any folder above `notes` (`<sha16>`, `teams`, `<key>`) refuses and writes nothing.
+#[test]
+fn a_failed_parent_flush_refuses_and_writes_nothing() {
+    for level in 1..4 {
+        let (w, s) = world();
+        add(&w, &s, "kept").unwrap();
+        let at = notes(&w, &s);
+        let parent = at.ancestors().nth(level).unwrap().to_path_buf();
+        let log = std::fs::read(at.join(LOG)).unwrap();
+        crate::state::fs::fail_sync_dir(Some(&parent));
+        let e = add(&w, &s, "next").unwrap_err();
+        crate::state::fs::fail_sync_dir(None);
+        let got = (e.code, e.check, e.message.as_str());
+        assert_eq!(
+            got,
+            (1, "notes", "the notebook is not yet on disk; retry"),
+            "{parent:?}"
+        );
+        assert_eq!(
+            std::fs::read(at.join(LOG)).unwrap(),
+            log,
+            "{parent:?}: nothing written"
+        );
+    }
+}
+
+// PM call 14 (F5): a real junction at each level and at both leaves refuses `evidence` (Windows).
+#[cfg(windows)]
+#[test]
+fn a_junction_at_any_level_or_leaf_refuses_evidence() {
+    for case in 0..6 {
+        let (w, s) = world();
+        add(&w, &s, "kept").unwrap();
+        let at = notes(&w, &s);
+        let target = match case {
+            4 => at.join(LOG),
+            5 => at.join(STATE),
+            n => at.ancestors().nth(3 - n).unwrap().to_path_buf(),
+        };
+        std::fs::rename(&target, w.ctx.state_root.join("aside")).unwrap();
+        let elsewhere = w.ctx.state_root.join("elsewhere");
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        crate::testing::junction(&elsewhere, &target);
+        assert_eq!(
+            entries(&tx(&w, &s)).unwrap_err().check,
+            "evidence",
+            "case {case}: reader"
+        );
+        assert_eq!(
+            add(&w, &s, "t").unwrap_err().check,
+            "evidence",
+            "case {case}: writer"
+        );
+        assert_eq!(
+            std::fs::read_dir(&elsewhere).unwrap().count(),
+            0,
+            "case {case}: nothing made through it"
+        );
+    }
+}
+
+// PM call 14 (F6): a FIFO at either leaf refuses `evidence` without opening it. A helper opens the FIFO both ways,
+// non-blocking, until the calls return: a write-open succeeds only while a reader is blocked on it (`freed`), and a
+// read-open releases a writer blocked in its open, so a weakened check fails here instead of hanging.
+#[cfg(unix)]
+#[test]
+fn a_fifo_at_a_leaf_refuses_without_blocking() {
+    use std::os::unix::fs::OpenOptionsExt;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    for leaf in [LOG, STATE] {
+        let (w, s) = world();
+        add(&w, &s, "kept").unwrap();
+        let at = notes(&w, &s).join(leaf);
+        std::fs::remove_file(&at).unwrap();
+        let c = std::ffi::CString::new(at.to_str().unwrap()).unwrap();
+        // SAFETY: `c` is a NUL-terminated path that outlives the call.
+        assert_eq!(
+            unsafe { libc::mkfifo(c.as_ptr(), 0o600) },
+            0,
+            "{leaf}: mkfifo"
+        );
+        let (done, freed) = (AtomicBool::new(false), AtomicBool::new(false));
+        let (reader, writer) = std::thread::scope(|scope| {
+            scope.spawn(|| {
+                while !done.load(Ordering::SeqCst) {
+                    std::thread::sleep(std::time::Duration::from_millis(500));
+                    let open = |write: bool| {
+                        let mut o = std::fs::OpenOptions::new();
+                        o.read(!write)
+                            .write(write)
+                            .custom_flags(libc::O_NONBLOCK)
+                            .open(&at)
+                    };
+                    if open(true).is_ok() {
+                        freed.store(true, Ordering::SeqCst);
+                    }
+                    let _ = open(false);
+                }
+            });
+            let reader = entries(&tx(&w, &s)).map(|_| ()).map_err(|e| e.check);
+            let writer = add(&w, &s, "t").map(|_| ()).map_err(|e| e.check);
+            done.store(true, Ordering::SeqCst);
+            (reader, writer)
+        });
+        assert!(
+            !freed.load(Ordering::SeqCst),
+            "{leaf}: an open blocked on the FIFO"
+        );
+        assert_eq!(
+            (reader, writer),
+            (Err("evidence"), Err("evidence")),
+            "{leaf}"
+        );
+    }
+}

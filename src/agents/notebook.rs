@@ -184,10 +184,10 @@ fn parse(log: &[u8], durable: u64) -> Vec<Value> {
         .collect()
 }
 
-/// A 16-hex id no entry of `known` has (ambiguity 2).
-fn fresh_id(known: &[Value]) -> Res<String> {
+/// A 16-hex id no entry of `known` has (ambiguity 2), drawn from `draw` until it is new.
+fn fresh_id(known: &[Value], mut draw: impl FnMut() -> Res<String>) -> Res<String> {
     loop {
-        let id = super::team_mail::new_id()?;
+        let id = draw()?;
         if !known.iter().any(|e| super::text(e.get("id")) == id) {
             return Ok(id);
         }
@@ -208,7 +208,7 @@ pub fn append(
     let known = parse(&log, durable);
     let id = match id {
         Some(id) => id.to_string(),
-        None => fresh_id(&known)?,
+        None => fresh_id(&known, super::team_mail::new_id)?,
     };
     let entry = json!({"id": id, "author": {"name": author.name, "id": author.id, "key": author.key},
         "at": crate::util::utc_o(tx.ctx.clock.now()), "title": title, "body": body});
