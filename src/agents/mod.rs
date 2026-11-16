@@ -8,6 +8,9 @@ use crate::caller::Caller;
 use crate::ctx::Ctx;
 use crate::error::{Refusal, Res};
 
+pub mod adopt;
+#[cfg(test)]
+pub(crate) mod adopt_fixture;
 pub mod ancestry;
 pub mod attachment;
 pub mod board;

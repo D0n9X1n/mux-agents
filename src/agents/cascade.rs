@@ -345,9 +345,11 @@ pub use tree::{Shown, Tree};
 #[path = "cascade_journal.rs"]
 mod journal;
 use journal::tombstoned;
+// adopt-3e call 6: adoption walks and makes its folders with the cascade's one rule.
 pub use journal::{
     Entry, Journal, NOT_WRITTEN, dir_at, journals, mark_prepared, publish, remove, waiting,
 };
+pub(crate) use journal::{level, make};
 
 #[cfg(test)]
 #[path = "cascade_tests.rs"]

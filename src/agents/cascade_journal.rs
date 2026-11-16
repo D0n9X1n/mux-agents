@@ -120,7 +120,7 @@ pub fn dir_at(ctx: &Ctx, scope: &Scope) -> PathBuf {
 }
 
 /// Call 15, as `gens::walk`: Ok(true) a real folder, Ok(false) absent; a link, junction or anything else `evidence`.
-fn level(path: &Path) -> Res<bool> {
+pub(crate) fn level(path: &Path) -> Res<bool> {
     match std::fs::symlink_metadata(path) {
         Ok(m) if m.file_type().is_dir() => Ok(true),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
@@ -207,7 +207,7 @@ pub fn journals(tx: &Tx<'_>) -> Res<Vec<Journal>> {
 }
 
 /// Makes `dir` when absent; a present one must be a real folder (call 15).
-fn make(dir: &Path) -> Res<()> {
+pub(crate) fn make(dir: &Path) -> Res<()> {
     if !level(dir)? {
         std::fs::create_dir(dir).map_err(|_| not_written())?;
         if !level(dir)? {
