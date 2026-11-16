@@ -109,6 +109,16 @@ fn unresolved(e: Refusal) -> Res<Outcome> {
     }
 }
 
+/// Call 63: the record read from `<agents>/<id>` must name `id`; another member's record there is Unreadable
+/// evidence for this member, read before any generation evidence, publication or hc call.
+fn bound(id: &str, r: &Value) -> Res<()> {
+    if r.get("id").and_then(Value::as_str) == Some(id) {
+        Ok(())
+    } else {
+        Err(crate::state::evidence::unreadable())
+    }
+}
+
 impl Tx<'_> {
     /// G3 for the `pending` the record names now; none is Done (ambiguity 12). The record is read through
     /// `gens::record`, the walk from the state root (b-calls 34), so a linked member folder refuses `evidence`. No
@@ -117,6 +127,7 @@ impl Tx<'_> {
         let Some(r) = gens::record(&self.folder(id)).known()? else {
             return Ok(Outcome::Done);
         };
+        bound(id, &r)?;
         match gens::pending(&r) {
             None => Ok(Outcome::Done),
             Some(n) => settle_gen(self, &Lazy::new(self.ctx), id, n, mode, true),
@@ -379,6 +390,7 @@ pub fn terminate(tx: &Tx<'_>, id: &str, n: u64) -> Res<()> {
     let r = gens::record(&folder)
         .known()?
         .ok_or_else(|| Refusal::internal("the member has no record"))?;
+    bound(id, &r)?;
     let pending = gens::pending(&r) == Some(n);
     let lazy = Lazy::new(tx.ctx);
     // G11.1, G11.2: Fence never promotes. Done (rows 0, 0r, 1-5; Lost released; Ended recorded) is Ok.
@@ -513,6 +525,10 @@ pub fn fence(tx: &Tx<'_>) -> Res<()> {
             continue;
         };
         if g.record().get("session").and_then(Value::as_str) != Some(tx.scope.session.as_str()) {
+            continue;
+        }
+        // Call 63: a record naming another member is never fenced from this folder.
+        if bound(&id, g.record()).is_err() {
             continue;
         }
         let Ok(named) = gens::named(&folder) else {
@@ -1989,6 +2005,67 @@ mod tests {
             assert!(
                 lf::record(&m).get("pending").is_some(),
                 "{case}: pending dropped"
+            );
+        }
+    }
+
+    // Call 63 (QA #144 F2): every settle entry point binds the record's id to its member folder first. A's folder
+    // holding B's record: `Tx::settle` and `terminate` refuse `evidence`, the fence skips it. Nothing is published
+    // (no abandoned claim, no aborted commit, no terminating, kill or ended), the record is unchanged, hc is never asked
+    // (no kill).
+    #[test]
+    fn a_record_naming_another_member_is_never_settled() {
+        const B: &str = "bbbbbbbbbbbb";
+        for case in ["settle", "fence", "terminate"] {
+            let (w, s) = lf::world();
+            let m = match case {
+                "settle" => lf::life(&w, json!({"id": B, "pending": lf::pending(1)})),
+                "fence" => {
+                    let m = lf::life(&w, json!({"id": B, "generation": "2", "hcAddress": "t2"}));
+                    lf::seed_gen(&m, 1, Some("run"), None);
+                    m
+                }
+                _ => {
+                    let m = lf::life(&w, json!({"id": B, "pending": lf::pending(1)}));
+                    lf::seed_gen(&m, 1, Some("run"), lf::committed());
+                    cf::online(&w);
+                    lf::found(&w, 1, &lf::running(&w, 1));
+                    lf::get(&w, "t1", &lf::running(&w, 1));
+                    kill(&w, "t1");
+                    m
+                }
+            };
+            let before = std::fs::read(m.join("record.json")).unwrap();
+            let got = match case {
+                "settle" => settle(&w, &s, Mode::Normal).map(|_| ()),
+                "fence" => open(&w, &s),
+                _ => terminate(&tx(&w, &s), ID, 1),
+            };
+            if case == "fence" {
+                got.unwrap();
+            } else {
+                assert_eq!(got.map_err(|e| e.check), Err("evidence"), "{case}: bound");
+            }
+            assert!(
+                lf::calls(&w).is_empty(),
+                "{case}: hc asked {:?}",
+                lf::calls(&w)
+            );
+            assert_ne!(
+                gens::claim(&m, 1),
+                Evidence::Present(json!("abandoned")),
+                "{case}: abandoned"
+            );
+            let aborted =
+                matches!(gens::read(&m, 1, "commit"), Evidence::Present(c) if c["aborted"] == true);
+            assert!(!aborted, "{case}: aborted published");
+            for f in ["terminating", "kill", "ended"] {
+                assert_eq!(gens::read(&m, 1, f), Evidence::Absent, "{case}: {f}.json");
+            }
+            assert_eq!(
+                std::fs::read(m.join("record.json")).unwrap(),
+                before,
+                "{case}: the record changed"
             );
         }
     }
