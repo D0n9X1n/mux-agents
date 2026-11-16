@@ -5609,6 +5609,280 @@ hc {}:
         }
     }
 
+    /// Every file below `dir`, path to bytes (6b-R2: a byte-identical folder).
+    fn tree_bytes(dir: &Path) -> std::collections::BTreeMap<PathBuf, Vec<u8>> {
+        let mut all = std::collections::BTreeMap::new();
+        for e in std::fs::read_dir(dir).unwrap() {
+            let p = e.unwrap().path();
+            if p.is_dir() {
+                all.extend(tree_bytes(&p));
+            } else {
+                all.insert(p.clone(), std::fs::read(&p).unwrap());
+            }
+        }
+        all
+    }
+
+    /// restore-6b: a team made by `up`: the leader, then A (claude) and B (copilot) spawned by the leader, each told
+    /// its marker; each first generation ready. Its ids: leader, A, B.
+    fn team_of_three(live: &mut Live) -> [String; 3] {
+        let mux = live.mux();
+        let (code, up) = live.run(&["up", "-Client", "claude"]);
+        assert_eq!(code, 0, "{mux:?} {up}");
+        let lead = s(&up["leader"]["id"]).to_string();
+        std::fs::write(live.dir.join("brief.md"), "brief").unwrap();
+        let brief = live.path("brief.md");
+        let mut ids = vec![lead.clone()];
+        for (client, name, marker) in [("claude", "a", "MARKER-A"), ("copilot", "b", "MARKER-B")] {
+            let task = live.path(&format!("task-{name}.txt"));
+            std::fs::write(&task, format!("say {marker}")).unwrap();
+            let args = [
+                "spawn",
+                "-Client",
+                client,
+                "-TaskFile",
+                &task,
+                "-BriefFile",
+                &brief,
+                "-Context",
+                "brief",
+                "-Name",
+                name,
+            ];
+            let (code, r) = live.by(&lead, &args);
+            assert_eq!(code, 0, "{mux:?} spawn {name}: {r}");
+            ids.push(s(&r["id"]).to_string());
+        }
+        for id in &ids {
+            let ready = live.agent_dir(id).join("gens/0/ready.json");
+            live.server
+                .wait(&format!("{id} ready"), || ready.is_file().then_some(()));
+        }
+        [ids[0].clone(), ids[1].clone(), ids[2].clone()]
+    }
+
+    /// restore-6b ambiguity 14: kills the core (`kill -9`) and waits until hc shows every member terminal Lost (a
+    /// live shell, not its launcher argv).
+    fn lose_the_core(live: &mut Live, ids: &[String]) {
+        live.server.core.as_mut().expect("private core").kill_hard();
+        let live: &Live = live;
+        for id in ids {
+            let r = json_file(&live.agent_dir(id).join("record.json"));
+            let (address, argv) = (s(&r["hcAddress"]).to_string(), r["launcherArgv"].clone());
+            live.server.wait(&format!("{id} lost"), || {
+                let t = core(live, &["get", &address, "--json"]);
+                (t["state"] == "live" && t["argv"] != argv).then_some(())
+            });
+        }
+    }
+
+    /// restore-6b spec live "Abrupt loss", "Ready after restore", "Ended"; coordinator (p1c call 6). Public commands
+    /// only: `up`, member `spawn`, member `stop`, `list`; the loss is `kill -9` of the hc core. Predecessor client
+    /// pids are captured before the kill and every later command goes to the successors (r6b call 9).
+    #[test]
+    fn restore_resumes_every_lost_member_after_a_core_kill() {
+        for mux in Mux::ALL {
+            let Some(mut live) = Live::human(mux) else {
+                continue;
+            };
+            let ids = team_of_three(&mut live);
+            let before: Vec<Value> = ids
+                .iter()
+                .map(|id| json_file(&live.agent_dir(id).join("record.json")))
+                .collect();
+            let old: Vec<u64> = ids.iter().map(|id| live.client_of(id)).collect();
+            let pre = live.agent_dir("999999999999");
+            std::fs::create_dir_all(&pre).unwrap();
+            std::fs::write(
+                pre.join("record.json"),
+                r#"{"id":"999999999999","name":"old","hcAddress":"t9"}"#,
+            )
+            .unwrap();
+            let pre_bytes = tree_bytes(&pre);
+            lose_the_core(&mut live, &ids);
+            let (code, up) = live.run(&["up", "-Client", "claude"]);
+            assert_eq!((code, &up["created"]), (0, &json!(false)), "{mux:?} {up}");
+            let mut restored: Vec<&str> = up["restored"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|e| s(&e["id"]))
+                .collect();
+            restored.sort();
+            let mut want: Vec<&str> = ids.iter().map(String::as_str).collect();
+            want.sort();
+            assert_eq!(restored, want, "{mux:?}: every lost member restored");
+            let mut news = Vec::new();
+            for (i, id) in ids.iter().enumerate() {
+                let r = json_file(&live.agent_dir(id).join("record.json"));
+                assert_eq!(
+                    (&r["generation"], &r["sessionId"]),
+                    (&json!("1"), &before[i]["sessionId"]),
+                    "{mux:?} {id}"
+                );
+                assert_ne!(
+                    r["hcName"], before[i]["hcName"],
+                    "{mux:?} {id}: a new terminal"
+                );
+                let new = live.successor(id, s(&r["sessionId"]), old[i]);
+                news.push(new);
+                let c = live.client(new);
+                let argv: Vec<&str> = strings(&c["argv"]);
+                assert!(
+                    argv.windows(2)
+                        .any(|w| w == ["--resume", s(&r["sessionId"])]),
+                    "{mux:?} {argv:?}"
+                );
+                if i > 0 {
+                    let marker = if i == 1 { "MARKER-A" } else { "MARKER-B" };
+                    assert!(
+                        !argv.iter().any(|a| a.contains(marker)),
+                        "{mux:?}: the task is never resent"
+                    );
+                    assert!(
+                        c["recalled"].to_string().contains(marker),
+                        "{mux:?}: the same conversation"
+                    );
+                }
+                let ready = live.agent_dir(id).join("gens/1/ready.json");
+                live.server.wait(&format!("{id} ready again"), || {
+                    ready.is_file().then_some(())
+                });
+                let kept = core(&live, &["get", s(&before[i]["hcAddress"]), "--json"]);
+                let mut keys: Vec<&str> = kept["labels"]
+                    .as_object()
+                    .unwrap()
+                    .keys()
+                    .map(String::as_str)
+                    .collect();
+                keys.sort();
+                assert_eq!(
+                    keys,
+                    ["mux.kept", "mux.keptName"],
+                    "{mux:?}: the old shell keeps only kept labels"
+                );
+            }
+            let (code, listed) = live.server.command(news[0], &["list"]);
+            assert_eq!(code, 0, "{mux:?} {listed}");
+            for id in &ids {
+                let outcome = json_file(&live.agent_dir(id).join("gens/1/outcome.json"));
+                assert_eq!(outcome["outcome"], "ok", "{mux:?} {id}");
+            }
+            let clients = std::fs::read_to_string(live.dir.join("clients.log"))
+                .unwrap()
+                .lines()
+                .count();
+            let (_, again) = live.run(&["up", "-Client", "claude"]);
+            assert_eq!(
+                again["restored"],
+                json!([]),
+                "{mux:?}: a second up starts nothing"
+            );
+            let now = std::fs::read_to_string(live.dir.join("clients.log"))
+                .unwrap()
+                .lines()
+                .count();
+            assert_eq!(now, clients, "{mux:?}");
+            assert_eq!(
+                tree_bytes(&pre),
+                pre_bytes,
+                "{mux:?}: the pre-lifecycle folder is byte-identical"
+            );
+            // Ended: A quits on its own; no up brings it back.
+            let a_pid = news[1];
+            support::write_atomic(&live.dir.join(format!("quit.{a_pid}")), "0");
+            live.server.wait("A exited", || {
+                live.dir
+                    .join(format!("exited.{a_pid}"))
+                    .is_file()
+                    .then_some(())
+            });
+            live.server.command(news[0], &["list"]);
+            // Stopped: the leader stops B.
+            let (code, stopped) = live.server.command(news[0], &["stop", "b"]);
+            assert_eq!(code, 0, "{mux:?} {stopped}");
+            let (_, third) = live.run(&["up", "-Client", "claude"]);
+            assert_eq!(
+                third["restored"],
+                json!([]),
+                "{mux:?}: ended and stopped stay down"
+            );
+            for id in &ids[1..] {
+                let r = json_file(&live.agent_dir(id).join("record.json"));
+                assert_eq!(r["generation"], "1", "{mux:?}");
+            }
+        }
+    }
+
+    /// restore-6b spec live "Managed vs unmanaged" (moved from occupy-3). An unmanaged Claude on another conversation
+    /// holds the Claude restores (leader, A) and names its pid; an unmanaged Copilot holds B. Each quit frees its kind.
+    #[test]
+    fn restore_resume_is_held_by_an_unmanaged_client_until_it_quits() {
+        for mux in Mux::ALL {
+            let Some(mut live) = Live::human(mux) else {
+                continue;
+            };
+            let ids = team_of_three(&mut live);
+            lose_the_core(&mut live, &ids);
+            let mut strays = Vec::new();
+            for (client, sid) in [
+                ("claude", "5e55fc2f-2032-48ef-a920-4af2a8e5af55"),
+                ("copilot", "6e66fc2f-2032-48ef-a920-4af2a8e5af56"),
+            ] {
+                let pane = live.session_in(&format!("stray-{client}"), &live.dir.join("work"));
+                live.server
+                    .send_keys_to(&pane, &format!("exec {client} --session-id {sid}"));
+                strays.push(live.server.client_by_session(sid)["pid"].as_u64().unwrap());
+            }
+            let (code, up) = live.run(&["up", "-Client", "claude"]);
+            assert_eq!(code, 0, "{mux:?} {up}");
+            assert_eq!(up["restored"], json!([]), "{mux:?}");
+            let held = up["held"].as_array().unwrap();
+            assert_eq!(held.len(), 3, "{mux:?} {up}");
+            for h in held {
+                assert_eq!(h["reason"], "occupied", "{mux:?} {h}");
+                let by_claude = h["id"] != json!(ids[2]);
+                let pid = strays[if by_claude { 0 } else { 1 }];
+                assert!(s(&h["holder"]).contains(&pid.to_string()), "{mux:?} {h}");
+            }
+            support::write_atomic(&live.dir.join(format!("quit.{}", strays[0])), "0");
+            live.server.wait("stray claude gone", || {
+                live.dir
+                    .join(format!("exited.{}", strays[0]))
+                    .is_file()
+                    .then_some(())
+            });
+            let (_, second) = live.run(&["up", "-Client", "claude"]);
+            let mut back: Vec<&str> = second["restored"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|e| s(&e["id"]))
+                .collect();
+            back.sort();
+            let mut want = vec![ids[0].as_str(), ids[1].as_str()];
+            want.sort();
+            assert_eq!(
+                back, want,
+                "{mux:?}: the restored leader client does not hold A (H2)"
+            );
+            assert_eq!(
+                second["held"][0]["id"],
+                json!(ids[2]),
+                "{mux:?}: the Copilot stray still holds B"
+            );
+            support::write_atomic(&live.dir.join(format!("quit.{}", strays[1])), "0");
+            live.server.wait("stray copilot gone", || {
+                live.dir
+                    .join(format!("exited.{}", strays[1]))
+                    .is_file()
+                    .then_some(())
+            });
+            let (_, third) = live.run(&["up", "-Client", "claude"]);
+            assert_eq!(third["restored"][0]["id"], json!(ids[2]), "{mux:?}");
+        }
+    }
+
     #[cfg(feature = "test-panic")]
     #[test]
     fn up_whose_view_panics_keeps_the_leader_under_hostile_settings() {

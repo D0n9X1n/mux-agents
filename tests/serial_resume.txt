@@ -22,3 +22,6 @@ notebook_and_peek_stay_in_the_team
 members_mail_without_the_multiplexer
 # adopt-3e Task 12: runs `resume`; run alone.
 adoption_moves_b_and_a_resumed_successor_stops_its_child
+# restore-6b Task 10 (r6b call 8): kill the core, then up reconciles resumed conversations; run alone.
+restore_resumes_every_lost_member_after_a_core_kill
+restore_resume_is_held_by_an_unmanaged_client_until_it_quits

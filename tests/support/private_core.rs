@@ -116,6 +116,56 @@ impl PrivateCore {
         c.args(args).current_dir(&self.dir);
         c
     }
+    /// 6b ambiguity 14: the core killed outright (SIGKILL; Windows `taskkill /F`, never `/T`, so the terminals it ran
+    /// stay as recovery shells), then started again. The pid comes from `server status --json` (r6b call 2).
+    pub fn kill_hard(&mut self) {
+        let status =
+            run(self.command(&["server", "status", "--json"]), &self.dir).expect("core status");
+        let pid = status["pid"]
+            .as_u64()
+            .expect("hc server status --json names the core pid") as u32;
+        #[cfg(unix)]
+        {
+            // SAFETY: a plain signal to the pid the private core reports for itself; no memory is shared.
+            let r = unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
+            assert_eq!(r, 0, "kill -9 {pid}: {}", io::Error::last_os_error());
+        }
+        #[cfg(windows)]
+        {
+            let mut child = Command::new("taskkill")
+                .args(["/F", "/PID", &pid.to_string()])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .expect("taskkill");
+            let deadline = Instant::now() + Duration::from_secs(30);
+            let done = loop {
+                if let Some(s) = child.try_wait().expect("taskkill wait") {
+                    break s;
+                }
+                if Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    panic!("taskkill /F /PID {pid} did not finish");
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            };
+            assert!(done.success(), "taskkill /F /PID {pid}: {done:?}");
+        }
+        let end = Instant::now() + Duration::from_secs(30);
+        loop {
+            match run(self.command(&["server", "start", "--json"]), &self.dir) {
+                Ok(_) => break,
+                Err(e) if Instant::now() < end => {
+                    eprintln!("core restart: {e}");
+                    std::thread::sleep(Duration::from_millis(250));
+                }
+                Err(e) => panic!("the private core did not start again: {e}"),
+            }
+        }
+        self.owned = true;
+    }
     pub fn start(&mut self) {
         self.owned = true;
         run(self.command(&["server", "start", "--json"]), &self.dir).expect("private core start");
