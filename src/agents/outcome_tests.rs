@@ -1140,3 +1140,80 @@ fn an_active_void_or_undecided_generation_needs_no_recovery() {
         "undecided writes nothing"
     );
 }
+
+// o2 call 27 (QA #146 F1): with the gen lock busy, an outcome.json or failure.json that is visible but not yet flushed
+// decides nothing (the flush is retried and refuses `state`), so the board never shows a failure a reboot can take
+// back; once the names are gone and the client is published, the generation is ok. A flushed failure.json alone, the
+// lock busy, still shows its recovery (authoritative, as in K5).
+#[test]
+fn a_busy_lock_never_shows_an_unflushed_outcome() {
+    let g = of::world();
+    g.ran(1);
+    g.report(1, 150);
+    g.now(210);
+    crate::state::fs::fail_sync_dir(Some(&gens::dir(&g.folder, 1)));
+    assert_eq!(
+        judged(&g, None),
+        unflushed(),
+        "failure.json linked, unflushed"
+    );
+    assert_eq!(
+        judged(&g, None),
+        unflushed(),
+        "outcome.json linked, unflushed"
+    );
+    g.w.fakes.lock_timeout("gen|");
+    let busy = needs_recovery(&g.w.ctx, &g.key, ID, &rec("1"), Some(false), None)
+        .map_err(|e| (e.check, e.message));
+    crate::state::fs::fail_sync_dir(None);
+    assert_eq!(
+        busy,
+        Err(("state", gens::NOT_FLUSHED.to_string())),
+        "an unflushed outcome decides nothing"
+    );
+    // A reboot loses both unflushed names; the launcher then publishes the matching client.
+    for file in ["failure", "outcome"] {
+        std::fs::remove_file(gens::path(&g.folder, 1, file)).unwrap();
+    }
+    g.client(1);
+    // The lock is still busy for this world's fakes, so K5 itself (no lock) shows what the next holder decides.
+    let held = gens::promote_held(&g.w.ctx, &g.folder, 1).map(|h| h.ready);
+    assert_eq!(held, Ok(gens::Ready::Ok), "the generation was never failed");
+    let g = of::world();
+    g.ran(1);
+    g.put(
+        1,
+        "failure",
+        json!({"reason": NO_REPORT, "evidence": {}, "at": "x"}),
+    );
+    g.w.fakes.lock_timeout("gen|");
+    g.now(30);
+    let got = needs_recovery(&g.w.ctx, &g.key, ID, &rec("1"), Some(true), None);
+    let want = Recovery {
+        generation: 1,
+        reason: NO_REPORT.into(),
+        running: false,
+    };
+    assert_eq!(got, Ok(Some(want)), "a flushed failure.json, lock busy");
+    assert_eq!(g.file(1, "outcome"), None, "nothing written while busy");
+    // failure.json alone, linked but unflushed (outcome.json never made), the lock busy: decides nothing either.
+    let g = of::world();
+    g.ran(1);
+    exited(&g, "exited");
+    g.now(10);
+    crate::state::fs::fail_sync_dir(Some(&gens::dir(&g.folder, 1)));
+    assert_eq!(
+        judged(&g, None),
+        unflushed(),
+        "failure.json linked, unflushed"
+    );
+    g.w.fakes.lock_timeout("gen|");
+    let busy = needs_recovery(&g.w.ctx, &g.key, ID, &rec("1"), Some(false), None)
+        .map_err(|e| (e.check, e.message));
+    crate::state::fs::fail_sync_dir(None);
+    assert_eq!(
+        busy,
+        Err(("state", gens::NOT_FLUSHED.to_string())),
+        "an unflushed failure.json decides nothing"
+    );
+}

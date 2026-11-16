@@ -275,11 +275,15 @@ pub fn needs_recovery(
         Adjudged::Decided(v) => Some(v),
         Adjudged::Undecided => None,
         Adjudged::Busy => {
+            // o2 call 27: the last outcome.json, else a recorded failure.json (authoritative, K5), each only once its
+            // folders are flushed: a visible but unflushed one decides nothing (`NOT_FLUSHED`), as under the lock.
             let member = ctx.state_root.join(key).join("agents").join(id);
-            gens::read(&member, n, "outcome")
-                .known()?
-                .map(|b| Verdict::parse(&b))
-                .transpose()?
+            match gens::read_flushed(&member, n, "outcome")? {
+                Some(body) => Some(Verdict::parse(&body)?),
+                None => gens::read_flushed(&member, n, "failure")?
+                    .map(|f| reason(Some(&f)).map(Verdict::Failed))
+                    .transpose()?,
+            }
         }
     };
     Ok(match verdict {
