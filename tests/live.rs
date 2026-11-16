@@ -4255,8 +4255,16 @@ hc {}:
         let pc = live.server.core.as_mut().unwrap();
         assert!(pc.stop(), "{mux:?}: core stop");
         pc.start();
-        let lost = || core(&live, &["get", &address, "--json"])["argv"][1] == "-l";
-        assert!(eventually(LONG, lost), "{mux:?}: Lost");
+        let (started, mut last) = (Instant::now(), Value::Null);
+        let lost = eventually(LONG, || {
+            last = core(&live, &["get", &address, "--json"]);
+            last["argv"][1] == "-l"
+        });
+        assert!(
+            lost,
+            "{mux:?}: Lost not seen after {:?}; last get: {last}",
+            started.elapsed()
+        );
         let (code, out) = live.run(&["__life", "release", &id, "0"]);
         assert_eq!(
             (code, &out["released"]),
