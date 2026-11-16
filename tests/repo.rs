@@ -901,6 +901,9 @@ const TEST_ONLY: &[(&str, &str, &str)] = &[
         "views_tests",
     ),
     ("src/sidebar/hc_tests.rs", "src/sidebar.rs", "hc_tests"),
+    ("src/sidebar/kept_tests.rs", "src/sidebar.rs", "kept_tests"),
+    ("src/sidebar/keys/tests.rs", "src/sidebar/keys.rs", "tests"),
+    ("src/sidebar/pick/tests.rs", "src/sidebar/pick.rs", "tests"),
     ("src/testing.rs", "src/lib.rs", "testing"),
 ];
 
