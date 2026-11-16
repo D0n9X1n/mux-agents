@@ -344,8 +344,11 @@ fn restore_view(
     core: &crate::hc::Core<'_>,
     caller: &Caller,
     id: &super::core_identity::Identity,
-    mut record: Value,
+    record: Value,
 ) -> Res<Focused> {
+    // Ambiguity 3: the generation is checked before any pane is made.
+    let n = super::gens::plain_gen(&id.generation)
+        .ok_or_else(|| crate::error::Refusal::internal("invalid generation"))?;
     let placement = super::placement::read_placement(ctx, caller)
         .ok()
         .flatten()
@@ -364,16 +367,17 @@ fn restore_view(
         let v = created
             .as_ref()
             .ok_or_else(|| crate::error::Refusal::internal("unproven new view"))?;
-        record["pane"] = v.pane.clone().into();
-        record["window"] = v.window.clone().into();
-        record["startCommand"] = v.command.clone().into();
-        // Durable, as every rewrite of a member's record (v11): a power loss never loses `resumedFrom`.
-        crate::state::fs::write_json_durable(
-            &super::server_dir(ctx, caller)
-                .join("agents")
-                .join(&id.id)
-                .join("record.json"),
-            &record,
+        let descriptor = json!({
+            "serverKey": caller.server_key, "session": caller.session,
+            "pane": v.pane, "window": v.window, "startCommand": v.command,
+            "gen": n, "hcAddress": id.address, "hcName": id.hc_name,
+        });
+        // S4, W1: focus_identity holds the member lock (not reentrant); the writer checks the subject generation.
+        super::team_state::view_held(
+            ctx,
+            &super::team_state::Scope::of(caller),
+            &id.id,
+            &descriptor,
         )?;
         Ok(v.clone())
     })();

@@ -1674,3 +1674,45 @@ fn a_lifecycle_member_claims_the_pane_its_view_presents() {
         "a torn record"
     );
 }
+
+// Checklist 8 (a3b call 30, PM call 20): `claim` presents from its one status snapshot (`presented(g, &s)`), so a
+// held member claims the pane its pending generation's view presents, never the active generation's.
+#[test]
+fn a_held_member_claims_the_pane_its_pending_view_presents() {
+    use crate::agents::fixture::{ID, SESSION_ID};
+    use crate::agents::gens;
+    let w = World::human("");
+    let caller = w.caller();
+    let f = w.folder(ID);
+    std::fs::create_dir_all(&f).unwrap();
+    let team = crate::agents::membership::team(&caller);
+    let r = json!({"lifecycle": 1, "id": ID, "name": "worker", "session": caller.session, "team": team,
+        "generation": "0", "hcAddress": "t1", "hcName": "m0123abcd", "launcherArgv": ["x"],
+        "sessionId": SESSION_ID, "pending": {"gen": 1, "hcName": "m00000001", "hcAddress": "t2",
+        "sessionId": SESSION_ID}});
+    crate::state::fs::write_json(&f.join("record.json"), &r).unwrap();
+    let launch = json!({"hcName": "m0123abcd", "launcherArgv": ["x"], "sessionId": SESSION_ID});
+    crate::state::evidence::publish(&gens::path(&f, 0, "launch"), &launch).unwrap();
+    crate::state::evidence::publish(&gens::path(&f, 0, "commit"), &json!({"committed": true}))
+        .unwrap();
+    crate::state::evidence::publish(&gens::path(&f, 1, "commit"), &json!({"committed": true}))
+        .unwrap();
+    let active = json!({"serverKey": caller.server_key, "session": caller.session, "pane": caller.pane,
+        "window": "@1", "startCommand": "hc attach t1", "gen": 0, "hcAddress": "t1", "hcName": "m0123abcd"});
+    crate::state::fs::write_json(&f.join("view.json"), &active).unwrap();
+    assert!(
+        matches!(claim(&w.ctx, &caller).unwrap(), Claim::None),
+        "the active generation's view is not the held member's"
+    );
+    let pending = json!({"serverKey": caller.server_key, "session": caller.session, "pane": caller.pane,
+        "window": "@1", "startCommand": "hc attach t2", "gen": 1, "hcAddress": "t2", "hcName": "m00000001"});
+    crate::state::fs::write_json(&f.join("view.json"), &pending).unwrap();
+    let (got, reads) = crate::state::evidence::record_evidence_reads(|| claim(&w.ctx, &caller));
+    assert!(
+        matches!(got.unwrap(), Claim::Member),
+        "the pending view presents the pane"
+    );
+    let commit = gens::path(&f, 1, "commit");
+    let n = reads.iter().filter(|p| **p == commit).count();
+    assert_eq!(n, 1, "one status read: {reads:?}");
+}

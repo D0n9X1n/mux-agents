@@ -4,6 +4,10 @@ use super::{
     member_target,
 };
 use serde_json::json;
+
+#[cfg(test)]
+mod restore_tests;
+
 #[test]
 fn member_target_rechecks_complete_identity() {
     let w = World::human("");

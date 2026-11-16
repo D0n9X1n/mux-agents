@@ -63,10 +63,7 @@ fn prove(ctx: &Ctx) -> Res<Option<Caller>> {
                 if !s.active_committed {
                     return None;
                 }
-                (
-                    agents::team_state::presented(&folder, g.record().clone()).ok()?,
-                    true,
-                )
+                (agents::team_state::presented(&g, &s).ok()?, true)
             }
             agents::gens::Member::Pre(r) => {
                 inside(&[key, "agents", id, "commit.json"])?;

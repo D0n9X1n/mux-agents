@@ -286,50 +286,82 @@ impl Tx<'_> {
 /// The presentation fields view.json carries (views-6f V1).
 pub const VIEW_FIELDS: [&str; 3] = ["pane", "window", "startCommand"];
 
-/// S4: the member lock only; replaces view.json, never touches record.json. A view names its generation (V1,
+/// S4: the member lock, then `view_held`; replaces the view, never another field. A view names its generation (V1,
 /// ambiguity 7).
-pub fn view(ctx: &Ctx, scope: &Scope, id: &str, view: &Value) -> Res<()> {
-    if !view.get("gen").is_some_and(Value::is_u64) {
+pub fn view(ctx: &Ctx, scope: &Scope, id: &str, v: &Value) -> Res<()> {
+    if !v.get("gen").is_some_and(Value::is_u64) {
         return Err(Refusal::internal("a view names its generation"));
     }
-    let path = scope.agents(&ctx.state_root).join(id).join("view.json");
-    super::lock(ctx, &scope.member_lock(id), || write_json(&path, view))
+    super::lock(ctx, &scope.member_lock(id), || view_held(ctx, scope, id, v))
 }
 
-/// V1 (ambiguity 6; R1, R2, R4): a lifecycle record never presents its own pane, window or startCommand; view.json's
-/// do, only when `gen` is the active generation, `hcAddress` the record's, and `hcName` that generation's
-/// `launch.json` `hcName` (never the record's). view.json and launch.json are each read once; Unreadable refuses.
-/// No active generation presents nothing. A pre-lifecycle record is returned as it is.
-pub fn presented(folder: &Path, mut record: Value) -> Res<Value> {
-    use super::gens;
-    if !gens::lifecycle(&record) {
-        return Ok(record);
+/// PM call 20: the generation a member's identity stands for (`Status.subject`: pending when held, else active),
+/// with the address and hc name its view must carry. Held: `pending.hcAddress`, `pending.hcName` (what
+/// `Identity::held` reads, A3a 18a). Active: the record's `hcAddress` and `gens/<n>/launch.json`'s `hcName`, never
+/// the record's (V1); launch.json Unreadable refuses `evidence`, Absent names none.
+pub(crate) struct Subject {
+    n: u64,
+    address: Option<Value>,
+    name: Option<String>,
+}
+
+pub(crate) fn subject_gen(g: &super::gens::Gen, s: &super::gens::Status) -> Res<Option<Subject>> {
+    let Some(n) = s.subject else { return Ok(None) };
+    let text = |v: Option<&Value>| {
+        v.and_then(|v| v.get("hcName"))
+            .and_then(Value::as_str)
+            .map(String::from)
+    };
+    if s.held {
+        let p = g.record().get("pending");
+        let address = p.and_then(|p| p.get("hcAddress")).cloned();
+        return Ok(Some(Subject {
+            n,
+            address,
+            name: text(p),
+        }));
     }
+    let launch = g.read(n, "launch").known()?;
+    let address = g.record().get("hcAddress").cloned();
+    Ok(Some(Subject {
+        n,
+        address,
+        name: text(launch.as_ref()),
+    }))
+}
+
+impl Subject {
+    /// V1, W1, the one predicate: `v` is this generation's view.
+    pub(crate) fn owns(&self, v: &Value) -> bool {
+        v.get("gen").and_then(Value::as_u64) == Some(self.n)
+            && self
+                .address
+                .as_ref()
+                .is_some_and(|a| v.get("hcAddress") == Some(a))
+            && self
+                .name
+                .as_deref()
+                .is_some_and(|h| v.get("hcName").and_then(Value::as_str) == Some(h))
+    }
+}
+
+/// V1 (R1, R2, R4; PM call 20): a lifecycle record never presents its own pane, window or startCommand; view.json's
+/// do, only when the subject generation owns it. No subject presents nothing. view.json is read before launch.json
+/// (A3a: no view, no launch read); a torn launch.json refuses even beside a stale view.
+pub fn presented(g: &super::gens::Gen, s: &super::gens::Status) -> Res<Value> {
+    let mut record = g.record().clone();
     if let Some(r) = record.as_object_mut() {
         for k in VIEW_FIELDS {
             r.remove(k);
         }
     }
-    let Some(n) = record
-        .get("generation")
-        .and_then(Value::as_str)
-        .and_then(gens::plain_gen)
-    else {
+    if s.subject.is_none() {
+        return Ok(record);
+    }
+    let Some(v) = super::gens::walk(g.folder(), &["view.json"]).known()? else {
         return Ok(record);
     };
-    let Some(v) = gens::walk(folder, &["view.json"]).known()? else {
-        return Ok(record);
-    };
-    let launch = gens::read(folder, n, "launch").known()?;
-    let name = launch
-        .as_ref()
-        .and_then(|l| l.get("hcName"))
-        .and_then(Value::as_str);
-    let ours = v.get("gen").and_then(Value::as_u64) == Some(n)
-        && v.get("hcAddress")
-            .is_some_and(|a| Some(a) == record.get("hcAddress"))
-        && name.is_some_and(|h| v.get("hcName").and_then(Value::as_str) == Some(h));
-    if ours {
+    if subject_gen(g, s)?.is_some_and(|sub| sub.owns(&v)) {
         for k in VIEW_FIELDS {
             if let Some(x) = v.get(k) {
                 record[k] = x.clone();
@@ -339,19 +371,80 @@ pub fn presented(folder: &Path, mut record: Value) -> Res<Value> {
     Ok(record)
 }
 
+/// S4 for a caller that holds the member lock (`view::restore_view`, `view`): reads the member once (R1: one
+/// `member_of`, one `status`) and writes only the subject generation's view (W1, PM call 20). A lifecycle member's
+/// goes to view.json; a pre-lifecycle member's three view fields go into its record.json (ambiguity 1). Anything
+/// else refuses 2 `target` and writes nothing; an unreadable member refuses `evidence`.
+pub fn view_held(ctx: &Ctx, scope: &Scope, id: &str, v: &Value) -> Res<()> {
+    use super::gens::{Member, member_of};
+    let folder = scope.agents(&ctx.state_root).join(id);
+    let member = member_of(&folder);
+    #[cfg(test)]
+    AFTER_READ.with(|h| {
+        if let Some(h) = h.borrow_mut().as_mut() {
+            h()
+        }
+    });
+    match member {
+        Member::Life(g) => match subject_gen(&g, &g.status()?)? {
+            Some(sub) if sub.owns(v) => write_json(&folder.join("view.json"), v),
+            _ => stale(),
+        },
+        Member::Pre(mut r) => {
+            // `gen` is a reserved keyword in Rust 2024.
+            let own = r
+                .get("generation")
+                .and_then(Value::as_str)
+                .and_then(super::gens::plain_gen);
+            if own.is_none()
+                || v.get("gen").and_then(Value::as_u64) != own
+                || v.get("hcAddress") != r.get("hcAddress")
+            {
+                return stale();
+            }
+            for k in VIEW_FIELDS {
+                r[k] = v.get(k).cloned().unwrap_or(Value::Null);
+            }
+            // Durable, as every record rewrite (v11).
+            write_json_durable(&folder.join("record.json"), &r)
+        }
+        Member::Unreadable(e) => Err(e),
+        Member::Absent => stale(), // PM call 15: no member, no view
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static AFTER_READ: std::cell::RefCell<Option<Box<dyn FnMut()>>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Test seam (state-0 A-1): runs on this thread right after `view_held`'s one member read.
+#[cfg(test)]
+pub fn after_read(hook: Option<Box<dyn FnMut()>>) {
+    AFTER_READ.with(|h| *h.borrow_mut() = hook);
+}
+
+fn stale<T>() -> Res<T> {
+    crate::error::refuse(
+        2,
+        "target",
+        "the view is not the member's subject generation",
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::agents::fixture::{ID, World};
     use std::cell::Cell;
 
-    fn world() -> (World, Scope) {
+    pub(super) fn world() -> (World, Scope) {
         let w = World::human("");
         w.state();
         let s = Scope::of(&w.caller());
         (w, s)
     }
-    fn record(w: &World) -> Value {
+    pub(super) fn record(w: &World) -> Value {
         crate::state::fs::read_json(&w.folder(ID).join("record.json"))
             .unwrap()
             .unwrap()
@@ -361,7 +454,7 @@ mod tests {
     fn shown(w: &World, v: &Value) -> Res<[Option<Value>; 3]> {
         let f = w.folder(ID);
         crate::state::fs::write_json(&f.join("view.json"), v).unwrap();
-        let r = presented(&f, record(w))?;
+        let r = super::view_tests::try_present(w)?;
         Ok(VIEW_FIELDS.map(|k| r.get(k).cloned()))
     }
 
@@ -409,15 +502,15 @@ mod tests {
         assert_eq!(shown(&w, &v).unwrap(), none, "a view without gen");
         std::fs::write(gens::path(&f, 1, "launch"), b"{\"hc").unwrap();
         assert_eq!(
-            shown(&w, &good).map_err(|e| e.check).err(),
-            Some("evidence"),
+            shown(&w, &good).map_err(|e| (e.code, e.check)).err(),
+            Some((1, "evidence")),
             "torn launch.json"
         );
         std::fs::remove_file(gens::path(&f, 1, "launch")).unwrap();
         std::fs::create_dir(gens::path(&f, 1, "launch")).unwrap();
         assert_eq!(
-            shown(&w, &good).map_err(|e| e.check).err(),
-            Some("evidence"),
+            shown(&w, &good).map_err(|e| (e.code, e.check)).err(),
+            Some((1, "evidence")),
             "launch.json a folder"
         );
         std::fs::remove_dir(gens::path(&f, 1, "launch")).unwrap();
@@ -428,8 +521,10 @@ mod tests {
         );
         std::fs::write(f.join("view.json"), b"{\"pa").unwrap();
         assert_eq!(
-            presented(&f, record(&w)).map_err(|e| e.check).err(),
-            Some("evidence"),
+            super::view_tests::try_present(&w)
+                .map_err(|e| (e.code, e.check))
+                .err(),
+            Some((1, "evidence")),
             "torn view"
         );
         let mut pending = record(&w);
@@ -452,16 +547,17 @@ mod tests {
     #[test]
     fn a_view_without_gen_is_refused() {
         let (w, s) = world();
-        open(&w.ctx, &s, |tx| tx.create(ID, json!({})).map(|_| ())).unwrap();
+        let v0 = super::view_tests::at_gen(&w, &s, 0);
         for v in [json!({"pane": "P1"}), json!({"pane": "P1", "gen": "1"})] {
             let e = view(&w.ctx, &s, ID, &v).unwrap_err();
+            assert_eq!((e.code, e.check), (1, "internal"), "{v}");
             assert_eq!(
                 e.message, "unexpected error (a view names its generation)",
                 "{v}"
             );
             assert!(!w.folder(ID).join("view.json").exists(), "{v}");
         }
-        view(&w.ctx, &s, ID, &json!({"pane": "P1", "gen": 0})).unwrap();
+        view(&w.ctx, &s, ID, &v0).unwrap();
     }
 
     #[test]
@@ -488,38 +584,24 @@ mod tests {
         assert_eq!(w.fakes.locks()[0], format!("+{}", s.team_lock()));
     }
 
-    // A-1: a view writer paused after its read; a patch changes parentAgent; both survive.
+    // A patch, then a view write: both survive; the view never touches record.json.
     #[test]
     fn a_view_write_and_a_patch_both_survive() {
         let (w, s) = world();
-        open(&w.ctx, &s, |tx| {
-            tx.create(
-                ID,
-                json!({"parentAgent": null, "generation": "0", "hcAddress": "t1"}),
-            )
-        })
-        .unwrap();
+        let v = super::view_tests::at_gen(&w, &s, 0);
         let folder = w.folder(ID);
-        let name = format!("m{}", &ID[..8]);
-        crate::state::evidence::publish(
-            &crate::agents::gens::path(&folder, 0, "launch"),
-            &json!({"hcName": name}),
-        )
-        .unwrap();
         let seen = record(&w);
         let parent = json!("bbbbbbbbbbbb");
         open(&w.ctx, &s, |tx| {
             tx.patch(ID, &[("parentAgent", parent.clone())], &[])
+                .map(|_| ())
         })
         .unwrap();
         let before = std::fs::read(folder.join("record.json")).unwrap();
-        let v = json!({"pane": "P9", "window": "W5", "startCommand": "hc attach t1", "gen": 0,
-            "hcAddress": "t1", "hcName": name});
         view(&w.ctx, &s, ID, &v).unwrap();
         assert_eq!(std::fs::read(folder.join("record.json")).unwrap(), before);
-        let r = presented(&folder, record(&w)).unwrap();
-        assert_eq!(r["parentAgent"], parent);
-        assert_eq!(r["pane"], json!("P9"));
+        let r = super::view_tests::present(&w);
+        assert_eq!((&r["parentAgent"], &r["pane"]), (&parent, &json!("%9")));
         assert!(seen.get("pane").is_none());
     }
 
@@ -656,15 +738,24 @@ mod tests {
         assert_eq!(d, want, "desired");
     }
 
-    // S4: view takes the member lock only.
+    // S4 (a280e7 IMPORTANT 5): `view` takes the member lock once; `view_held` none (its caller holds it); the
+    // reattach's key (`focus_identity`) is that same lock.
     #[test]
     fn view_takes_the_member_lock_only() {
         let (w, s) = world();
-        open(&w.ctx, &s, |tx| tx.create(ID, json!({})).map(|_| ())).unwrap();
+        let v = super::view_tests::at_gen(&w, &s, 0);
         w.fakes.clear_log();
-        view(&w.ctx, &s, ID, &json!({"pane": "P1", "gen": 0})).unwrap();
+        view(&w.ctx, &s, ID, &v).unwrap();
         let m = s.member_lock(ID);
         assert_eq!(w.fakes.locks(), [format!("+{m}"), format!("-{m}")]);
+        w.fakes.clear_log();
+        view_held(&w.ctx, &s, ID, &v).unwrap();
+        assert!(w.fakes.locks().is_empty(), "view_held takes no lock");
+        assert_eq!(
+            crate::agents::lock_key("member", &w.caller(), ID),
+            m,
+            "focus_identity's key"
+        );
     }
 
     // S3: create and desired are durable; a failed flush runs nothing after them.
@@ -791,6 +882,9 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod view_tests;
 
 #[cfg(test)]
 #[path = "record_write_tests.rs"]

@@ -329,13 +329,9 @@ fn claim(ctx: &Ctx, caller: &Caller) -> Res<Claim> {
                 {
                     continue;
                 }
-                // P4 (a3c call 36): one status snapshot; its commit decides. A3c Task 1 changes the next call to
-                // `presented(g, &s)` (A3b-2 header concern 1).
+                // P4 (a3c calls 20, 36): one status snapshot; its subject presents and its commit decides.
                 let s = g.status()?;
-                (
-                    super::team_state::presented(&folder, g.record().clone())?,
-                    Some(s.committed),
-                )
+                (super::team_state::presented(g, &s)?, Some(s.committed))
             }
         };
         let here = super::text(record.get("pane")) == caller.pane

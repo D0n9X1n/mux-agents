@@ -203,20 +203,11 @@ pub(crate) fn subject_of(
     if s.held {
         let identity = Identity::held(g.record(), id, team)
             .ok_or_else(|| Refusal::internal("invalid held generation"))?;
-        let mut r = g.record().clone();
-        if let Some(o) = r.as_object_mut() {
-            for k in super::team_state::VIEW_FIELDS {
-                o.remove(k);
-            }
-        }
-        return Ok((identity, r));
+        return Ok((identity, super::team_state::presented(g, s)?));
     }
     let identity = Identity::read(g.record(), id, team)
         .ok_or_else(|| Refusal::internal("invalid local hc identity"))?;
-    Ok((
-        identity,
-        super::team_state::presented(g.folder(), g.record().clone())?,
-    ))
+    Ok((identity, super::team_state::presented(g, s)?))
 }
 
 /// R3 (ambiguity 5): a lifecycle observation is Ended exactly when every generation its record names is done;

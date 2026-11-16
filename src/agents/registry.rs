@@ -393,8 +393,8 @@ fn life_state(g: &gens::Gen, id: &str, caller: &Caller) -> Option<(Value, bool, 
     if !own(g.record(), id, caller) {
         return None;
     }
-    let record = super::team_state::presented(g.folder(), g.record().clone()).ok()?;
     let s = g.status().ok()?;
+    let record = super::team_state::presented(g, &s).ok()?;
     let noticed = match g.active() {
         Some(n) => g.read(n, "notice").known().ok()?.is_some(),
         None => false,
@@ -497,7 +497,7 @@ pub fn record(ctx: &Ctx, caller: &Caller, id: &str) -> Res<Option<Value>> {
     match gens::member_of(&folder) {
         Member::Absent => Ok(None),
         Member::Pre(r) => Ok(Some(r).filter(Value::is_object)),
-        Member::Life(g) => super::team_state::presented(&folder, g.record().clone()).map(Some),
+        Member::Life(g) => super::team_state::presented(&g, &g.status()?).map(Some),
         Member::Unreadable(e) => Err(e),
     }
 }
