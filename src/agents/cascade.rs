@@ -227,7 +227,14 @@ fn end_entry(tx: &Tx<'_>, caller: &Caller, e: &Entry) -> Res<()> {
     let Some(&last) = all.last() else {
         return Ok(());
     };
-    let r = gens::record(&folder).known()?.ok_or_else(no_record)?;
+    // Integration (#150): the notice is posted from the presented record, as `stop_life` and `list` read the member:
+    // its pane is the one view.json presents, the `<from>|<pane>` the board counts the row's unread under. An
+    // unreadable member or view refuses, as the raw read did.
+    let r = match gens::member_of(&folder) {
+        gens::Member::Life(g) => super::team_state::presented(&g, &g.status()?)?,
+        gens::Member::Unreadable(e) => return Err(e),
+        _ => return Err(no_record()),
+    };
     registry::with_member_notice(tx.ctx, caller, &e.id, || {
         registry::add_notice_gen(tx.ctx, caller, &e.id, &r, last, Notice::Stopped)
     })?;
