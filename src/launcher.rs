@@ -515,6 +515,7 @@ fn run_gen(
     sync: &mut dyn FnMut(&Path, bool) -> io::Result<()>,
     publish: Publish,
 ) -> i32 {
+    use crate::state::evidence::crash_point;
     let Some(spec) = own_spec(member, n) else {
         err(FOREIGN);
         return 1;
@@ -530,6 +531,7 @@ fn run_gen(
             return 1;
         }
     }
+    crash_point("claim");
     // Final audit (PM): a won claim means no launcher ran this generation. Earlier launcher, client or exit evidence
     // (anything not Absent by the read rule) is corrupt: nothing starts and nothing more is published. Checked right
     // after the claim is won, before the claim is flushed and before launcher.json is published.
@@ -568,6 +570,7 @@ fn run_gen(
         );
         return 1;
     }
+    crash_point("launcher");
     let stop = match wait_gen_commit(ctx, member, n, &mut *publish) {
         GenCommit::Decided(Decision::Run) => None,
         GenCommit::Decided(Decision::Aborted) => Some("aborted"),
@@ -611,6 +614,7 @@ fn run_gen(
                 err("mux-agent: client.json could not be published; the client runs on, unproven");
             }
         }
+        crash_point("client");
     });
     let (code, reason) = match started {
         Ok(code) if conflicted => (code, "client-conflict"),
@@ -620,6 +624,7 @@ fn run_gen(
         Err(_) => (1, "client not started"),
     };
     gen_exit(ctx, member, n, &mut *publish, Some(code), reason);
+    crash_point("exit");
     code
 }
 
@@ -2902,5 +2907,100 @@ mod tests {
             "opened {reads:?}"
         );
         assert_eq!(gen_file(&l, "exit")["reason"], "client-conflict");
+    }
+
+    #[test]
+    #[ignore = "a child of a_kill_after_each_launcher_step_starts_no_second_client"]
+    fn child_launcher() {
+        let (l, spec) = gen_setup(1);
+        // Finding 4-4: A3a `Identity::held` needs a valid session id, and `gen_setup` seeds "s1": one id everywhere.
+        let sid = crate::agents::fixture::SESSION_ID;
+        edit(&l.folder.join("record.json"), |r| {
+            r["pending"]["sessionId"] = json!(sid)
+        });
+        edit(&gens::path(&l.folder, 1, "spec"), |v| {
+            v["sessionId"] = json!(sid)
+        });
+        edit(&gens::path(&l.folder, 1, "launch"), |v| {
+            v["sessionId"] = json!(sid)
+        });
+        commit(&l, 1, json!({"committed": true}));
+        l.w.fakes
+            .process(crate::testing::row(4300, l.w.ctx.pid, 1600));
+        println!("CRASH-ROOT {}", l.w.ctx.state_root.display());
+        println!("CRASH-SPEC {}", spec.display());
+        run(
+            &l.w.ctx,
+            spec.to_str().unwrap(),
+            &mut |_| {},
+            &mut |_, _, _, started| {
+                started(4300);
+                Ok(0)
+            },
+        );
+        std::mem::forget(l);
+    }
+
+    // Killed after the claim, launcher.json, client.json or exit.json: a second launcher never starts a client.
+    #[test]
+    fn a_kill_after_each_launcher_step_starts_no_second_client() {
+        use crate::agents::core_launch::crash::{killed_at, printed};
+        for (i, step) in ["claim", "launcher", "client", "exit"].iter().enumerate() {
+            let kv = killed_at("launcher::tests::child_launcher", step);
+            let (root, spec) = (printed(&kv, "ROOT"), printed(&kv, "SPEC"));
+            let member = spec
+                .parent()
+                .and_then(Path::parent)
+                .and_then(Path::parent)
+                .unwrap()
+                .to_path_buf();
+            assert_eq!(
+                gens::claim(&member, 1),
+                Evidence::Present(json!("run")),
+                "{step}"
+            );
+            for (j, file) in ["launcher", "client", "exit"].iter().enumerate() {
+                assert_eq!(
+                    gens::path(&member, 1, file).is_file(),
+                    i > j,
+                    "{step}: {file}"
+                );
+            }
+            let mut w = World::human("");
+            w.ctx.state_root = root.clone();
+            // Finding 4-3: the readers classify what each kill left: pending 1 held, committed, never finished,
+            // and the member keeps its slot (exit.json is not a completion marker).
+            let gens::Member::Life(g) = gens::member_of(&member) else {
+                panic!("{step}: not a lifecycle member")
+            };
+            let st = g.status().unwrap();
+            assert_eq!(
+                (st.subject, st.held, st.committed, st.finished),
+                (Some(1), true, true, false),
+                "{step}"
+            );
+            let locals = crate::agents::membership::locals(&w.ctx, &w.caller()).unwrap();
+            assert_eq!(
+                locals.iter().filter(|l| l.held).count(),
+                1,
+                "{step}: the slot is held"
+            );
+            let mut started = 0;
+            let code = run(
+                &w.ctx,
+                spec.to_str().unwrap(),
+                &mut |_| {},
+                &mut |_, _, _, _| {
+                    started += 1;
+                    Ok(0)
+                },
+            );
+            assert_eq!(
+                (code, started),
+                (0, 0),
+                "{step}: the claim is taken, no second client"
+            );
+            let _ = std::fs::remove_dir_all(root.parent().unwrap());
+        }
     }
 }
