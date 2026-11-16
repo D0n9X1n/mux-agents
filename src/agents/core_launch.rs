@@ -5,7 +5,7 @@ use crate::{
     ctx::Ctx,
     error::{Refusal, Res},
     hc::{self, Core, Run},
-    state::evidence::{self, Published},
+    state::evidence::{self, Evidence, Published},
     state::fs::write_json,
     util::utc_o,
 };
@@ -374,9 +374,50 @@ pub fn forward(
     Ok(reply)
 }
 
-/// G1 before the claim (Task 4).
-fn abort(_: &Tx<'_>, _: &str, _: u64, _: &str, e: Refusal) -> Refusal {
-    e
+/// F1: generation n is this call's own when record.json, read once through the walk, is admitted by
+/// `Guard::Pending { n, hc_name }`, the guard every later record write of this launch uses. Absent or
+/// Unreadable (a link, torn bytes): not proven.
+fn owns(tx: &Tx<'_>, id: &str, n: u64, hc_name: &str) -> bool {
+    match gens::record(&tx.folder(id)) {
+        Evidence::Present(r) => Guard::Pending { n, hc_name }.admits(Some(&r)),
+        Evidence::Absent | Evidence::Unreadable => false,
+    }
+}
+
+/// Call 15: drops `pending` only while the record still names (n, hc_name), judged by `record_write` inside the
+/// member lock. Refused or failed, the refusal says so; the aborted commit stands either way (ambiguity 9).
+fn drop_pending(tx: &Tx<'_>, id: &str, n: u64, hc_name: &str, e: &mut Refusal) {
+    let clear = |r: &mut serde_json::Map<String, Value>| {
+        r.remove("pending");
+        Ok(())
+    };
+    match tx.record_write(id, Guard::Pending { n, hc_name }, clear) {
+        Ok(Some(_)) => {}
+        Ok(None) => e.message.push_str("; pending is not this launch's, kept"),
+        Err(_) => e.message.push_str("; pending could not be dropped"),
+    }
+}
+
+/// G1 before the claim (F1): only a generation this call still owns is fenced. Owned: commit {aborted} through the
+/// one publisher, then `drop_pending`; a commit already there decides (`lost`); a failed publication (a visible but
+/// unflushed abort included) keeps pending for settle-1b (ambiguity 8). Not owned: nothing is written.
+fn abort(tx: &Tx<'_>, id: &str, n: u64, hc_name: &str, mut e: Refusal) -> Refusal {
+    if !owns(tx, id, n, hc_name) {
+        e.message.push_str("; nothing was fenced");
+        return e;
+    }
+    let aborted = json!({"aborted": true, "at": utc_o(tx.ctx.clock.now()), "message": e.message});
+    match gens::publish_once(&tx.folder(id), n, "commit", &aborted) {
+        Ok(Published::Published) => {
+            drop_pending(tx, id, n, hc_name, &mut e);
+            e
+        }
+        Ok(Published::Exists) => lost(tx, id, n, hc_name),
+        Err(_) => {
+            e.message.push_str("; abort evidence could not be written");
+            e
+        }
+    }
 }
 
 /// G1.4, the claim lost (Task 5).
@@ -1796,6 +1837,471 @@ pub(crate) mod forward_tests {
                 "{case}: no generation {n} files"
             );
             assert_eq!(runs(&w).len(), usize::from(!create), "{case}: nothing run");
+        }
+    }
+
+    /// The fence's end state: commit {aborted}, no pending, the record still generation 0, nothing killed.
+    fn fenced(w: &World, n: u64, what: &str) {
+        assert_eq!(
+            decided(w, n),
+            Some(gens::Decision::Aborted),
+            "{what}: the generation is fenced"
+        );
+        assert!(
+            gens::done(&w.folder(ID), n).unwrap(),
+            "{what}: void, so its slot is free"
+        );
+        let r = record(w);
+        assert!(r.get("pending").is_none(), "{what}: pending dropped");
+        let kept = (&r["generation"], &r["sessionId"], &r["hcAddress"]);
+        assert_eq!(
+            kept,
+            (&json!("0"), &json!(SESSION_ID), &json!("t1")),
+            "{what}: generation 0 kept"
+        );
+        assert_eq!(kills(w), 0, "{what}");
+    }
+
+    /// Moves the member folder aside to `<agents>/real` and links its name to it (`testing::link_dir`, every OS).
+    fn linked_member(f: &Path) -> PathBuf {
+        let real = f.parent().unwrap().join("real");
+        std::fs::rename(f, &real).unwrap();
+        crate::testing::link_dir(&real, f);
+        real
+    }
+
+    // G1: each failure between pending and the claim aborts generation 1. `content` cases fail the content flush
+    // before the link (R-W3 `NOT_PUBLISHED`); `address flush` lands the address rename and fails its flush.
+    #[test]
+    fn every_failure_before_the_claim_fences_its_own_generation() {
+        let cases = [
+            "spec exists",
+            "spec folder",
+            "spec content",
+            "launch exists",
+            "launch content",
+            "debit",
+            "run error",
+            "run taken",
+            "address flush",
+        ];
+        for case in cases {
+            let w = world();
+            let _reset = hooks::Reset;
+            promoted(&w);
+            let f = w.folder(ID);
+            let f2 = f.clone();
+            hooks::after(Some(Box::new(move |s: &str| match (s, case) {
+                ("pending", "spec exists") => {
+                    crate::state::evidence::publish(&gens::path(&f2, 1, "spec"), &json!({}))
+                        .unwrap();
+                }
+                ("pending", "spec folder") => {
+                    std::fs::create_dir_all(gens::path(&f2, 1, "spec")).unwrap()
+                }
+                ("pending", "spec content") => {
+                    crate::state::fs::fail_sync_file(Some(&gens::path(&f2, 1, "spec")))
+                }
+                ("spec", "launch exists") => {
+                    crate::state::evidence::publish(&gens::path(&f2, 1, "launch"), &json!({}))
+                        .unwrap();
+                }
+                ("spec", "launch content") => {
+                    crate::state::fs::fail_sync_file(Some(&gens::path(&f2, 1, "launch")));
+                }
+                ("run", "address flush") => crate::state::fs::fail_durable_flush(Some(0)),
+                _ => {}
+            })));
+            let run = match case {
+                "run error" => Err(Refusal::internal("hc run timed out")),
+                "run taken" => Ok(Out {
+                    code: 1,
+                    stderr: "terminal name already in use".into(),
+                    ..Out::default()
+                }),
+                _ => address("t2"),
+            };
+            let ran = ["run error", "run taken", "address flush"].contains(&case);
+            if ran {
+                replies(&w, run);
+            } else {
+                version(&w);
+            }
+            let (f3, fakes) = (f.clone(), w.fakes.clone());
+            let debit = move || {
+                assert!(
+                    gens::path(&f3, 1, "launch").is_file(),
+                    "the debit follows launch.json"
+                );
+                let before = fakes
+                    .hc_calls()
+                    .iter()
+                    .filter(|(_, a, _)| a[0] == "run")
+                    .count();
+                assert_eq!(before, 1, "the debit precedes hc run");
+                if case == "debit" {
+                    Err(Refusal::internal("no token"))
+                } else {
+                    Ok(())
+                }
+            };
+            assert!(
+                go(&w, launch_of(&w, false, NEW), debit, never).is_err(),
+                "{case}"
+            );
+            assert_eq!(
+                runs(&w).len(),
+                1 + usize::from(ran),
+                "{case}: never retried, nothing run early"
+            );
+            fenced(&w, 1, case);
+            if case == "spec folder" {
+                assert!(
+                    gens::path(&f, 1, "spec").is_dir(),
+                    "the folder is never replaced"
+                );
+            }
+        }
+    }
+
+    // F1, F2: a failed first pending write fences only a record that names this call. The create landed and its
+    // folder flush failed: owned, so generation 0 is fenced. The record is torn between the precheck and the
+    // write: refused evidence, nothing fenced, the bytes untouched.
+    #[test]
+    fn a_failed_pending_write_fences_only_its_own_generation() {
+        let w = world();
+        let _reset = hooks::Reset;
+        version(&w);
+        crate::state::fs::fail_durable_flush(Some(0));
+        let e = go(&w, launch_of(&w, true, SESSION_ID), free, never).unwrap_err();
+        assert_eq!(
+            (e.check, e.message.as_str()),
+            ("state", team_state::NOT_WRITTEN),
+            "{e:?}"
+        );
+        assert_eq!(
+            decided(&w, 0),
+            Some(gens::Decision::Aborted),
+            "own create fenced"
+        );
+        let r = record(&w);
+        assert!(r.get("pending").is_none() && r.get("sessionId").is_none() && runs(&w).is_empty());
+        assert!(!gens::path(&w.folder(ID), 0, "spec").exists());
+        let w = world();
+        let _reset = hooks::Reset;
+        promoted(&w);
+        let f = w.folder(ID);
+        let f2 = f.clone();
+        hooks::after(Some(Box::new(move |s: &str| {
+            if s == "allocated" {
+                std::fs::write(f2.join("record.json"), br#"{"lifec"#).unwrap();
+            }
+        })));
+        version(&w);
+        let e = go(&w, launch_of(&w, false, NEW), free, never).unwrap_err();
+        assert_eq!(e.check, "evidence", "{e:?}");
+        assert!(e.message.ends_with("; nothing was fenced"), "{e:?}");
+        assert!(
+            !gens::dir(&f, 1).exists(),
+            "an unreadable record is never taken for this call"
+        );
+        assert_eq!(
+            std::fs::read(f.join("record.json")).unwrap(),
+            br#"{"lifec"#.to_vec(),
+            "torn bytes untouched"
+        );
+    }
+
+    // F2, R5 (finding 1to2-C3), every OS: the member folder becomes a link right after the precheck. The first
+    // pending write walks (`record_write`), refuses evidence, and nothing reaches the real record.
+    #[test]
+    fn a_member_linked_after_the_precheck_gets_no_pending() {
+        let w = world();
+        let _reset = hooks::Reset;
+        promoted(&w);
+        let f = w.folder(ID);
+        let real = f.parent().unwrap().join("real");
+        let f2 = f.clone();
+        hooks::after(Some(Box::new(move |s: &str| {
+            if s == "allocated" {
+                linked_member(&f2);
+            }
+        })));
+        version(&w);
+        let e = go(&w, launch_of(&w, false, NEW), free, never).unwrap_err();
+        assert_eq!(e.check, "evidence", "{e:?}");
+        assert!(e.message.ends_with("; nothing was fenced"), "{e:?}");
+        let r = crate::state::fs::read_json(&real.join("record.json"))
+            .unwrap()
+            .unwrap();
+        assert!(
+            r.get("pending").is_none(),
+            "no pending through the link: {r}"
+        );
+        assert!(
+            !gens::dir(&real, 1).exists() && runs(&w).len() == 1,
+            "no generation 1, no second run"
+        );
+    }
+
+    // R-W1, every OS: a linked gens/<n> is never written through, by the spec nor by the abort; pending is kept.
+    #[test]
+    fn a_linked_generation_folder_is_never_written_through() {
+        let w = world();
+        let _reset = hooks::Reset;
+        promoted(&w);
+        let elsewhere = w.ctx.cwd.join("elsewhere");
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        let (f2, e2) = (w.folder(ID), elsewhere.clone());
+        hooks::after(Some(Box::new(move |s: &str| {
+            if s == "pending" {
+                crate::testing::link_dir(&e2, &gens::dir(&f2, 1));
+            }
+        })));
+        version(&w);
+        let e = go(&w, launch_of(&w, false, NEW), free, never).unwrap_err();
+        assert_eq!(e.check, "evidence", "{e:?}");
+        assert!(
+            e.message.ends_with("; abort evidence could not be written"),
+            "{e:?}"
+        );
+        assert_eq!(
+            std::fs::read_dir(&elsewhere).unwrap().count(),
+            0,
+            "nothing written through the link"
+        );
+        assert_eq!(
+            record(&w)["pending"]["gen"],
+            json!(1),
+            "unfenced, so settle-1b decides"
+        );
+        assert_eq!(runs(&w).len(), 1, "no second run");
+    }
+
+    // Ambiguity 8: the abort cannot read the commit (a folder there): nothing published, pending kept.
+    #[test]
+    fn an_abort_that_cannot_read_the_commit_keeps_pending() {
+        let w = world();
+        let _reset = hooks::Reset;
+        promoted(&w);
+        let f2 = w.folder(ID);
+        hooks::after(Some(Box::new(move |s: &str| {
+            if s == "spec" {
+                std::fs::create_dir_all(gens::path(&f2, 1, "commit")).unwrap();
+                crate::state::fs::fail_sync_file(Some(&gens::path(&f2, 1, "launch")));
+            }
+        })));
+        version(&w);
+        let e = go(&w, launch_of(&w, false, NEW), free, never).unwrap_err();
+        let want = format!(
+            "{}; abort evidence could not be written",
+            gens::NOT_PUBLISHED
+        );
+        assert_eq!(
+            (e.check, e.message.as_str()),
+            ("state", want.as_str()),
+            "the original error, then the suffix"
+        );
+        assert_eq!(record(&w)["pending"]["gen"], json!(1));
+        assert!(
+            gens::path(&w.folder(ID), 1, "commit").is_dir(),
+            "never replaced"
+        );
+    }
+
+    // Ambiguity 9: the abort is published, then the pending drop lands its rename and fails its flush. Reported;
+    // the aborted commit stands, so the generation is done.
+    #[test]
+    fn a_failed_pending_drop_is_reported_and_the_generation_is_void() {
+        let w = world();
+        let _reset = hooks::Reset;
+        promoted(&w);
+        let f2 = w.folder(ID);
+        hooks::after(Some(Box::new(move |s: &str| {
+            if s == "spec" {
+                crate::state::fs::fail_sync_file(Some(&gens::path(&f2, 1, "launch")));
+                crate::state::fs::fail_durable_flush(Some(0));
+            }
+        })));
+        version(&w);
+        let e = go(&w, launch_of(&w, false, NEW), free, never).unwrap_err();
+        assert!(
+            e.message.ends_with("; pending could not be dropped"),
+            "{e:?}"
+        );
+        assert_eq!(decided(&w, 1), Some(gens::Decision::Aborted));
+        assert!(record(&w).get("pending").is_none(), "the rename landed");
+        assert!(
+            gens::done(&w.folder(ID), 1).unwrap(),
+            "void whatever pending says"
+        );
+        assert_eq!(runs(&w).len(), 1, "nothing ran");
+    }
+
+    // F1, call 15: one case per condition of ownership, each failing when only that condition is removed from
+    // `owns`: a readable record, the hcName, the pending generation, a present record, the lifecycle mark, the
+    // walk (a linked member folder). The launch publication fails at `spec`, so each reaches `abort`.
+    #[test]
+    fn ownership_refuses_each_condition_alone() {
+        for case in ["torn", "name", "gen", "absent", "lifecycle", "link"] {
+            let w = world();
+            let _reset = hooks::Reset;
+            promoted(&w);
+            let f = w.folder(ID);
+            let home = if case == "link" {
+                f.parent().unwrap().join("real")
+            } else {
+                f.clone()
+            };
+            let f2 = f.clone();
+            hooks::after(Some(Box::new(move |s: &str| {
+                if s != "spec" {
+                    return;
+                }
+                crate::state::fs::fail_sync_file(Some(&gens::path(&f2, 1, "launch")));
+                match case {
+                    "torn" => std::fs::write(f2.join("record.json"), br#"{"lifec"#).unwrap(),
+                    "name" => edit(&f2, |r| r["pending"]["hcName"] = json!("m0123abcd")),
+                    "gen" => edit(&f2, |r| r["pending"]["gen"] = json!(2)),
+                    "absent" => std::fs::remove_file(f2.join("record.json")).unwrap(),
+                    "lifecycle" => edit(&f2, |r| {
+                        r.as_object_mut().unwrap().remove("lifecycle");
+                    }),
+                    _ => {
+                        linked_member(&f2);
+                    }
+                }
+            })));
+            version(&w);
+            let e = go(&w, launch_of(&w, false, NEW), free, never).unwrap_err();
+            assert!(e.message.ends_with("; nothing was fenced"), "{case}: {e:?}");
+            assert!(
+                !gens::path(&home, 1, "commit").exists(),
+                "{case}: no commit for a generation not owned"
+            );
+        }
+    }
+
+    // F1, call 15: `abort` judges ownership again inside its pending drop. The record is swapped, or the member
+    // folder becomes a link, when the drop takes the member lock (after the aborted commit was published while
+    // owned). `owns` and the publication take no member lock, so the drop takes the first one after `spec`.
+    #[test]
+    fn abort_rechecks_ownership_inside_its_pending_drop() {
+        for case in ["swap", "link"] {
+            let w = world();
+            let _reset = hooks::Reset;
+            promoted(&w);
+            let f = w.folder(ID);
+            let key = format!("+{}", team_state::Scope::of(&w.caller()).member_lock(ID));
+            let (f2, fakes) = (f.clone(), w.fakes.clone());
+            hooks::after(Some(Box::new(move |s: &str| {
+                if s != "spec" {
+                    return;
+                }
+                crate::state::fs::fail_sync_file(Some(&gens::path(&f2, 1, "launch")));
+                let (f3, key2, fired) = (f2.clone(), key.clone(), std::cell::Cell::new(false));
+                fakes.lock_probe(move |event| {
+                    if event == key2 && !fired.replace(true) {
+                        if case == "swap" {
+                            edit(&f3, |r| r["pending"]["hcName"] = json!("m0123abcd"));
+                        } else {
+                            linked_member(&f3);
+                        }
+                    }
+                    String::new()
+                });
+            })));
+            version(&w);
+            let e = go(&w, launch_of(&w, false, NEW), free, never).unwrap_err();
+            let real = if case == "link" {
+                f.parent().unwrap().join("real")
+            } else {
+                f.clone()
+            };
+            let r = crate::state::fs::read_json(&real.join("record.json"))
+                .unwrap()
+                .unwrap();
+            if case == "swap" {
+                assert!(
+                    e.message.ends_with("; pending is not this launch's, kept"),
+                    "{case}: {e:?}"
+                );
+                assert_eq!(
+                    r["pending"]["hcName"],
+                    json!("m0123abcd"),
+                    "the other launch keeps its pending"
+                );
+            } else {
+                assert!(
+                    e.message.ends_with("; pending could not be dropped"),
+                    "{case}: {e:?}"
+                );
+                assert_eq!(
+                    r["pending"]["gen"],
+                    json!(1),
+                    "nothing written through the link"
+                );
+            }
+            assert!(
+                gens::path(&real, 1, "commit").is_file(),
+                "{case}: the abort was published while owned"
+            );
+        }
+    }
+
+    // R-W1 (findings 1to2-C1, C2, I1, I2, I3): a failed folder flush is a failed publication, at every pre-claim
+    // site, on every call (`Exists` included). The abort meets the same fault, so its commit is visible but
+    // unflushed: the suffix, pending kept for settle-1b (ambiguity 8). Asserted by check and stable phrase.
+    #[test]
+    fn a_failed_generation_folder_flush_is_a_failed_publication() {
+        for case in [
+            "gens at pending",
+            "gens/n at pending",
+            "member at pending, new member",
+            "gens/n at spec",
+        ] {
+            let w = world();
+            let _reset = hooks::Reset;
+            let new = case.ends_with("new member");
+            if !new {
+                promoted(&w);
+            }
+            let f = w.folder(ID);
+            let n = u64::from(!new);
+            let (at, target) = match case {
+                "gens at pending" => ("pending", f.join("gens")),
+                "member at pending, new member" => ("pending", f.clone()),
+                "gens/n at spec" => ("spec", gens::dir(&f, n)),
+                _ => ("pending", gens::dir(&f, n)),
+            };
+            hooks::after(Some(Box::new(move |s: &str| {
+                if s == at {
+                    crate::state::fs::fail_sync_dir(Some(&target));
+                }
+            })));
+            version(&w);
+            let e = go(&w, launch_of(&w, new, NEW), free, never).unwrap_err();
+            let want = format!("{}; abort evidence could not be written", gens::NOT_FLUSHED);
+            assert_eq!(
+                (e.check, e.message.as_str()),
+                ("state", want.as_str()),
+                "{case}"
+            );
+            assert_eq!(
+                record(&w)["pending"]["gen"],
+                json!(n),
+                "{case}: pending kept"
+            );
+            assert_eq!(
+                decided(&w, n),
+                Some(gens::Decision::Aborted),
+                "{case}: the abort is visible, unflushed"
+            );
+            assert_eq!(
+                runs(&w).len(),
+                usize::from(!new),
+                "{case}: no run of generation {n}"
+            );
         }
     }
 }
