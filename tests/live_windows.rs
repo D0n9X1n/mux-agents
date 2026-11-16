@@ -1329,6 +1329,8 @@ fn team_bar_draws_the_tree_and_opens_any_row() {
     live.wait("hc keeps grand's marker", || {
         read().contains(&marker).then_some(())
     });
+    // o2 call 35: grand is ready before its stop, so the bar shows `stopped`, not `recover`.
+    wait_ready(&live, &s(&grand["id"]));
     agent(child_pid, &["stop", "grand"]);
     let line = live.wait("grand stays, stopped", || {
         live.call(&["capture-pane", "-e", "-p", "-t", &bars[0]])
@@ -2004,6 +2006,22 @@ fn client_of(live: &Live, sid: &str) -> Value {
             (v["sessionId"] == sid).then_some(v)
         })
     })
+}
+
+/// o2 calls 33/35: waits for member `id`'s `ready.json` in its record's generation (its fake client's startup report
+/// promoted it), so a test that then stops it ends an ordinary member, not one failed before readiness.
+fn wait_ready(live: &Live, id: &str) {
+    let path = || {
+        let folder = agent_dir(live, id);
+        let r = member_file(live, id, "record.json");
+        let n = r["generation"].as_str().unwrap_or("0").to_string();
+        folder.join("gens").join(n).join("ready.json")
+    };
+    native::Deadline::start(native::READY).wait(
+        "ready.json",
+        || path().exists().then_some(()),
+        || format!("{id}: {}", path().display()),
+    );
 }
 
 /// `gens/0/<file>` of member `id` (found by `agent_dir`); None until it is whole.

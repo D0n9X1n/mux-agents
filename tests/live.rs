@@ -339,6 +339,19 @@ exec claude --dangerously-skip-permissions
             }
         }
 
+        /// o2 calls 33/35: waits for member `w`'s `ready.json` (its fake client's startup report promoted it), so a test
+        /// that then stops, kills or quits it ends an ordinary member, not one failed before readiness (which outcome-2
+        /// rightly flags `recover`).
+        fn ready(&self, w: &Value) {
+            let id = s(&w["id"]).to_string();
+            let path = || self.gen_file(&id, "ready.json");
+            crate::native::Deadline::start(crate::native::READY).wait(
+                "ready.json",
+                || path().exists().then_some(()),
+                || format!("{}: {}", s(&w["name"]), path().display()),
+            );
+        }
+
         /// The view a member's launch recorded (V1): `view.json`, never record.json's presentation fields.
         fn view_of(&self, id: &str) -> Value {
             json_file(&self.agent_dir(id).join("view.json"))
@@ -2828,6 +2841,9 @@ hc {}:
         let root = live.server.pane().to_string();
         let w1 = live.spawn("w1", &[]);
         let w2 = live.spawn("w2", &[]);
+        // o2 call 35: both are ready, so w2's stop ends an ordinary member.
+        live.ready(&w1);
+        live.ready(&w2);
         let (code, stop) = live.run(&["stop", "w2"]);
         assert_eq!(code, 0, "{mux:?} {stop}");
         live.wait_gone(s(&w2["pane"]));
@@ -3820,6 +3836,9 @@ hc {}:
         let pid = live.worker_pid(&w1);
         live.worker_pid(&w2);
         live.log_frames(&bar);
+        // o2 call 35: both are ready before w1's view goes and its client quits.
+        live.ready(&w1);
+        live.ready(&w2);
         live.call(&["kill-pane", "-t", s(&w1["pane"])]);
         live.wait_gone(s(&w1["pane"]));
         live.wait_tick(&bar);
@@ -4221,6 +4240,8 @@ hc {}:
         live.close_bar();
         live.call(&["set-option", "-g", "remain-on-exit", "on"]);
         let quit_dead = |live: &mut Live, w: &Value| {
+            // o2 call 35: a member that exits after readiness ends ordinarily.
+            live.ready(w);
             let pid = live.worker_pid(w);
             support::write_atomic(&live.dir.join(format!("quit.{pid}")), "5\n");
             live.server.wait_file(&format!("exited.{pid}"));
@@ -4374,6 +4395,8 @@ hc {}:
         }
 
         // stop w1 closes only w1's pane.
+        // o2 call 35: w1 is ready before its stop.
+        live.ready(&w1);
         let (code, stop) = live.run_in(&clean, &["stop", "w1"]);
         assert_eq!(code, 0);
         assert_eq!(
@@ -5038,6 +5061,8 @@ hc {}:
                 read(&live)
             );
             // Stopped, grand stays in place with its state word, dimmed where the capture carries SGR (tmux: always).
+            // o2 call 35: grand is ready before its stop, so the bar shows `stopped`, not `recover`.
+            live.ready(&grand);
             let (code, out) = live.server.command(child_pid, &["stop", "grand"]);
             assert_eq!(code, 0, "{mux:?} {out}");
             let mut line = String::new();
