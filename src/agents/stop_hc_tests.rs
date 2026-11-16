@@ -3,6 +3,8 @@ use super::{
     fixture::{ID, World},
     gens, life_fixture as lf, registry,
 };
+use crate::agents::cascade_fixture as cx;
+use crate::agents::team_state::Scope;
 use serde_json::{Value, json};
 fn call(w: &World) -> crate::error::Res<serde_json::Map<String, Value>> {
     let args = ["stop", "worker"].map(str::to_string);
@@ -61,6 +63,9 @@ fn a_lifecycle_stop_ends_and_notices_the_generation_it_stopped() {
             0
         };
         kills(&w, n, true);
+        if case == "held, active running" {
+            kills(&w, 0, true); // cascade-3d ambiguity 4: every generation, newest first
+        }
         let got = stop_of(&w, &m).unwrap();
         assert_eq!(
             (&got["life"], &got["hcAddress"]),
@@ -93,7 +98,8 @@ fn a_lifecycle_stop_ends_and_notices_the_generation_it_stopped() {
             !m.join("notice.json").exists(),
             "{case}: never the folder marker"
         );
-        assert_eq!(lf::count(&w, "kill"), 1, "{case}");
+        let want = if case == "held, active running" { 2 } else { 1 };
+        assert_eq!(lf::count(&w, "kill"), want, "{case}");
         w.fakes.hc_done().unwrap();
     }
 }
@@ -136,7 +142,11 @@ fn an_unresolved_stop_posts_no_notice() {
     let m = lf::life(&w, at0());
     lf::seed_gen(&m, 0, Some("run"), lf::committed());
     kills(&w, 0, false);
-    assert!(stop_of(&w, &m).is_err(), "unresolved");
+    let reply = stop_of(&w, &m).unwrap();
+    assert_eq!(reply["stopped"], false);
+    assert_eq!(reply["unresolved"][0]["check"], "hc");
+    assert_eq!(reply["unresolved"][0]["name"], "worker");
+    assert!(cx::journal_of(&w, ID).exists(), "kept for the next stop");
     assert!(gens::read(&m, 0, "ended").known().unwrap().is_none());
     assert!(
         gens::read(&m, 0, "notice").known().unwrap().is_none(),
@@ -544,9 +554,15 @@ fn stop_replies_once_the_recorded_client_has_exited() {
         });
         let got = Value::Object(call(&w).unwrap()).to_string();
         let at = stopped_at(lifecycle);
+        // cascade-3d C9: a lifecycle stop also replies `stopped` and `unresolved`.
+        let c9 = if lifecycle {
+            r#","stopped":true,"unresolved":[]"#
+        } else {
+            ""
+        };
         assert_eq!(
             got,
-            format!(r#"{{"name":"worker","hcAddress":"{at}","life":"ended"}}"#),
+            format!(r#"{{"name":"worker","hcAddress":"{at}","life":"ended"{c9}}}"#),
             "lifecycle {lifecycle}"
         );
         assert_eq!(w.fakes.slept(), [250, 250], "lifecycle {lifecycle}");
@@ -698,6 +714,7 @@ fn stop_of_a_held_generation_waits_for_that_generations_client() {
     let m = lf::life(&w, fields);
     lf::seed_gen(&m, 0, Some("run"), lf::committed());
     lf::seed_gen(&m, 1, Some("run"), lf::committed());
+    crate::state::evidence::publish(&gens::path(&m, 0, "ended"), &json!({"at": "x"})).unwrap();
     crate::state::evidence::publish(
         &gens::path(&m, 1, "client"),
         &json!({"pid": 160, "start": 1600}),
@@ -750,5 +767,80 @@ fn a_lifecycle_stop_inside_a_tree_terminates_under_the_held_team_lock() {
     assert_eq!(end["reason"], json!("terminated"));
     let notice = gens::read(&m, 0, "notice").known().unwrap();
     assert_eq!(notice.map(|v| v["kind"].clone()), Some(json!("stopped")));
+    w.fakes.hc_done().unwrap();
+}
+
+/// A finished one-member journal of S (stopped, ended and noticed), as a cut-short stop leaves it.
+fn kept_s(w: &World) {
+    cx::member(w, cx::S, None, 0, json!({}));
+    cx::done(w, cx::S);
+    let s = Scope::of(&w.caller());
+    crate::agents::team_state::open(&w.ctx, &s, |tx| tx.desired(cx::S, false)).unwrap();
+    cx::seed(w, cx::S, &[cx::S], true);
+}
+
+/// A lifecycle `worker` with generation 1 committed at `t1`.
+fn at1(w: &World) -> std::path::PathBuf {
+    let m = lf::life(
+        w,
+        json!({"generation": "1", "hcAddress": "t1", "hcName": lf::hc_name(1),
+        "launcherArgv": lf::ARGV}),
+    );
+    lf::seed_gen(&m, 1, Some("run"), lf::committed());
+    m
+}
+
+// cascade-3d C9: a lifecycle stop replies `stopped: true`, `unresolved: []`, and leaves no journal.
+#[test]
+fn a_lifecycle_stop_replies_stopped_and_unresolved() {
+    let (w, _) = lf::world();
+    let m = at1(&w);
+    kills(&w, 1, true);
+    let reply = stop_of(&w, &m).unwrap();
+    let got = (&reply["stopped"], &reply["unresolved"]);
+    assert_eq!(got, (&json!(true), &json!([])));
+    assert_eq!(reply["life"], "ended");
+    assert!(!cx::journal_of(&w, ID).exists());
+    w.fakes.hc_done().unwrap();
+}
+
+// cascade-3d C8: stop runs every journal of the team first, under the team lock, before it names its target: a kept
+// journal of S is finished even when the target is refused.
+#[test]
+fn stop_finishes_every_journal_before_naming_its_target() {
+    let (w, _) = lf::world();
+    kept_s(&w);
+    let got = super::message::stop_hc(&w.ctx, &w.request(&["stop", "nobody"]));
+    assert!(got.is_err(), "{got:?}");
+    assert!(
+        !cx::journal_of(&w, cx::S).exists(),
+        "S's journal finished first"
+    );
+}
+
+// state-0 S9: from the stop on (the setup's own holds excluded), the team lock comes first (`finish` before naming),
+// no team hold nests in another, and every member hold sits inside a team hold (the notice included).
+#[test]
+fn stop_takes_each_lock_once_team_first() {
+    let (w, s) = lf::world();
+    kept_s(&w);
+    let m = at1(&w);
+    kills(&w, 1, true);
+    let before = w.fakes.locks().len();
+    stop_of(&w, &m).unwrap();
+    let log = w.fakes.locks()[before..].to_vec();
+    let (take, give) = (format!("+{}", s.team_lock()), format!("-{}", s.team_lock()));
+    assert_eq!(log[0], take, "the team lock first: {log:?}");
+    let mut held = false;
+    for e in &log {
+        if *e == take {
+            assert!(!held, "no nested team hold: {log:?}");
+            held = true;
+        } else if *e == give {
+            held = false;
+        } else if e.starts_with("+member|") {
+            assert!(held, "every member hold inside a team hold: {e}: {log:?}");
+        }
+    }
     w.fakes.hc_done().unwrap();
 }

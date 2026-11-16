@@ -1061,10 +1061,14 @@ fn members_spawn_and_act_only_down_the_tree() {
         true,
         "the leader stops a grandchild"
     );
-    for name in ["c3", "c4", "c5"] {
+    // cascade-3d: stopping g1 stops its sub-tree; h1 is ended and noticed too.
+    let notice = member_file(&live, &h1, "gens/0/notice.json");
+    assert_eq!(notice["kind"], "stopped", "h1 stopped with g1");
+    // Live besides the leader: c1, c2; four more make six, a 7th refuses.
+    for name in ["c3", "c4", "c5", "c6"] {
         ok(&mut sent, &leader, name);
     }
-    assert_eq!(spawn(&mut sent, &leader, "c6")["check"], "limit");
+    assert_eq!(spawn(&mut sent, &leader, "c7")["check"], "limit");
 }
 
 /// Each named row on a bar screen: (line, column-0 mark, glyph column).

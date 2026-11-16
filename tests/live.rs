@@ -5348,11 +5348,14 @@ hc {}:
         let pid = live.client_of(&leader);
         let (code, r) = live.server.command(pid, &["stop", "g1"]);
         assert_eq!(code, 0, "{mux:?} the leader stops a grandchild: {r}");
-        // Live besides the leader: c1, c2, h1 (no cascade stop); three more make six, a 7th refuses.
-        for name in ["c3", "c4", "c5"] {
+        // cascade-3d: stopping g1 stops its sub-tree; h1 is ended and noticed too.
+        let notice = json_file(&live.gen_file(&h1, "notice.json"));
+        assert_eq!(notice["kind"], "stopped", "{mux:?} h1 stopped with g1");
+        // Live besides the leader: c1, c2; four more make six, a 7th refuses.
+        for name in ["c3", "c4", "c5", "c6"] {
             ok(&mut live, &leader, name);
         }
-        let (code, r) = live.spawn_by(&leader, "c6");
+        let (code, r) = live.spawn_by(&leader, "c7");
         assert_eq!(
             (code, r["check"].as_str()),
             (2, Some("limit")),

@@ -959,13 +959,44 @@ fn listed(os: &dyn crate::proc::Os, pid: u32, start: i64) -> bool {
 /// replies, with `clientExited: false`.
 pub fn stop_hc(ctx: &Ctx, request: &Request) -> Res<Map<String, Value>> {
     let caller = crate::caller::resolve_tree(ctx)?;
+    let scope = super::team_state::Scope::of(&caller);
     let (mut reply, client) = super::tree::with_standing(ctx, &caller, |standing| {
+        // cascade-3d C8: every journal of the team first, under the team lock, before the target is named.
+        let finish = |tx: &super::team_state::Tx<'_>| super::cascade::finish(tx, &caller);
+        let kept = match standing {
+            // Inside a tree `with_standing` holds the session spawn lock, which is the team lock (state-0 S1).
+            Some(_) => super::team_state::held(ctx, &scope, finish)?,
+            None if super::cascade::waiting(ctx, &scope) => {
+                super::team_state::open(ctx, &scope, finish)?
+            }
+            None => Vec::new(),
+        };
         let id = super::member_target::named(ctx, &caller, first(request))?;
         let folder = server_dir(ctx, &caller).join("agents").join(&id.id);
         // Dispatch only: `stop_life` revalidates through `current` (R1). An unreadable record goes to `stop_pre`,
         // whose `current` refuses it.
         match super::gens::member_of(&folder) {
-            super::gens::Member::Life(_) => stop_life(ctx, &caller, standing, &id),
+            super::gens::Member::Life(g) => match standing {
+                Some(_) => super::team_state::held(ctx, &scope, |tx| {
+                    stop_life(tx, &caller, standing, &id, &kept)
+                }),
+                // Outside a tree (a person in another pane): the member's own team scope, its journals first.
+                None => {
+                    let session = super::text(g.record().get("session"));
+                    let own = super::team_state::Scope {
+                        key: scope.key.clone(),
+                        session,
+                    };
+                    super::team_state::open(ctx, &own, |tx| {
+                        let kept = if own == scope {
+                            kept.clone()
+                        } else {
+                            super::cascade::finish(tx, &caller)?
+                        };
+                        stop_life(tx, &caller, standing, &id, &kept)
+                    })
+                }
+            },
             _ => stop_pre(ctx, &caller, standing, &id),
         }
     })?;
@@ -980,15 +1011,19 @@ pub fn stop_hc(ctx: &Ctx, request: &Request) -> Res<Map<String, Value>> {
     Ok(reply)
 }
 
-/// PM calls 9, 11, P1: a lifecycle member is stopped by ending generation n, the generation of the identity
-/// `current` revalidated, through group B's `gens::terminate` (D3: a Lost generation is released, never killed), then
-/// the Stopped notice of n. Unresolved: the error is returned and nothing is noticed.
+/// cascade-3d C4-C9: under the team lock, after `finish` (`kept`). Authority as A3b-2 (a person or an ancestor);
+/// then `cascade::stop`: a kept report of this member answers, else its sub-tree is prepared and executed (every
+/// generation through `terminate`, D3: a Lost one released, never killed; each entry noticed). `life` is the
+/// subject generation's (`ended`, `lost`), else `running` while not stopped, `unknown` once stopped. The client wait
+/// runs only once the member is stopped.
 fn stop_life(
-    ctx: &Ctx,
+    tx: &super::team_state::Tx<'_>,
     caller: &Caller,
     standing: Option<&super::tree::Standing>,
     id: &super::core_identity::Identity,
+    kept: &[super::cascade::Report],
 ) -> Res<(Map<String, Value>, Recorded)> {
+    let ctx = tx.ctx;
     let record = super::member_target::current(ctx, caller, id)?;
     match standing {
         Some(s) => super::tree::authority(ctx, caller, s, &id.id, "stop")?,
@@ -996,31 +1031,27 @@ fn stop_life(
     }
     let n = super::gens::plain_gen(&id.generation)
         .ok_or_else(|| crate::error::Refusal::internal("invalid stopped generation"))?;
-    let scope = super::team_state::Scope::of(caller);
-    let end = |tx: &super::team_state::Tx<'_>| super::gens::terminate(tx, &id.id, n);
-    // Inside a tree `with_standing` holds the session spawn lock, which is the team lock (state-0 S1).
-    match standing {
-        Some(_) => super::team_state::held(ctx, &scope, end)?,
-        None => super::team_state::open(ctx, &scope, end)?,
-    }
-    // Lock order (state-0 S9): the team lock taken here and the member lock `terminate`'s record write takes are
-    // released before the notice lock.
-    let folder = server_dir(ctx, caller).join("agents").join(&id.id);
+    let report = super::cascade::stop(tx, caller, &id.id, kept)?;
+    let folder = tx.folder(&id.id);
     let life = if super::gens::read(&folder, n, "ended").known()?.is_some() {
         "ended"
     } else if super::gens::read(&folder, n, "release").known()?.is_some() {
         "lost"
-    } else {
+    } else if report.stopped {
         "unknown"
+    } else {
+        "running"
     };
-    registry::with_member_notice(ctx, caller, &id.id, || {
-        registry::add_notice_gen(ctx, caller, &id.id, &record, n, Notice::Stopped)
-    })?;
-    let client = recorded_client(&folder, &record, &id.generation);
     let mut reply = Map::new();
     reply.insert("name".into(), id.name.clone().into());
     reply.insert("hcAddress".into(), id.address.clone().into());
     reply.insert("life".into(), life.into());
+    report.reply(&mut reply);
+    let client = if report.stopped {
+        recorded_client(&folder, &record, &id.generation)
+    } else {
+        Recorded::Absent
+    };
     Ok((reply, client))
 }
 
