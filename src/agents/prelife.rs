@@ -94,7 +94,6 @@ pub(crate) fn ended_by_notice(folder: &Path) -> bool {
 }
 
 /// Ambiguity 11: the backstop of a lifecycle-only writer, run on the record it already read.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn lifecycle_only(record: &Value) -> Res<()> {
     if gens::lifecycle(record) {
         return Ok(());
