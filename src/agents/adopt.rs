@@ -400,6 +400,10 @@ pub fn replay_held(ctx: &Ctx, caller: &crate::caller::Caller) -> Res<()> {
 mod view;
 pub use view::{LEAVES, SEVERAL, Up, View};
 
+#[path = "adopt_bar.rs"]
+mod bar;
+pub use bar::{MOVING, Swept, adopt_locked, candidates, stable, sweep, tick};
+
 #[cfg(test)]
 #[path = "adopt_tests.rs"]
 mod tests;
@@ -415,3 +419,7 @@ mod from_tests;
 #[cfg(test)]
 #[path = "adopt_order_tests.rs"]
 mod order_tests;
+
+#[cfg(test)]
+#[path = "adopt_bar_tests.rs"]
+mod bar_tests;

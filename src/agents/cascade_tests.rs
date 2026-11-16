@@ -1466,7 +1466,12 @@ fn the_bar_tick_tries_the_team_lock_once() {
     let (w, s) = lf::world();
     complete(&w);
     w.fakes.lock_timeout(&s.team_lock());
-    assert!(!tick(&w.ctx, &w.caller()).unwrap(), "busy: skipped");
+    assert!(
+        crate::agents::adopt::tick(&w.ctx, &w.caller())
+            .unwrap()
+            .is_none(),
+        "busy: skipped"
+    );
     assert!(cx::journal_of(&w, A).exists());
     assert!(
         w.fakes.locks().contains(&format!("?{}", s.team_lock())),
@@ -1474,11 +1479,17 @@ fn the_bar_tick_tries_the_team_lock_once() {
     );
     let (w, _) = lf::world();
     complete(&w);
-    assert!(tick(&w.ctx, &w.caller()).unwrap());
+    assert!(
+        crate::agents::adopt::tick(&w.ctx, &w.caller())
+            .unwrap()
+            .is_some()
+    );
     assert!(!cx::journal_of(&w, A).exists(), "finished");
     let (w, _) = lf::world();
     assert!(
-        !tick(&w.ctx, &w.caller()).unwrap(),
+        crate::agents::adopt::tick(&w.ctx, &w.caller())
+            .unwrap()
+            .is_none(),
         "no journal folder: no lock taken"
     );
     assert!(w.fakes.locks().is_empty());
@@ -1491,7 +1502,11 @@ fn stop_and_tick_never_deadlock() {
     let (w, s) = lf::world();
     w.fakes.real_locks(&w._dir.path().join("locks"));
     complete(&w);
-    assert!(tick(&w.ctx, &w.caller()).unwrap());
+    assert!(
+        crate::agents::adopt::tick(&w.ctx, &w.caller())
+            .unwrap()
+            .is_some()
+    );
     cx::member(&w, B, Some(A), 2, json!({}));
     cx::terminates(&w, B);
     let c = w.caller();
