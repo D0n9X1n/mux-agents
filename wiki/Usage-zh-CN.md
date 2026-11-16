@@ -48,6 +48,7 @@ flowchart LR
 | `focus` | `focus claude-1`、`focus -Next` | 让多路复用器切换到某个代理的窗格；`-Next` / `-Prev` 按侧边栏的顺序逐个切换 |
 | `stop` | `stop claude-1` | 关闭代理的窗格及其进程；已结束的代理回答 `ok` 并带 `already`（`exited`、`stopped` 或 `lost`） |
 | `sidebar` | `sidebar`，`sidebar -Close` | 重新打开侧边栏分屏，或在本会话剩余时间内关闭它 |
+| `kept` | `kept`、`kept -Close t7` | 列出团队保留的 shell（`restore` 之后留下的代理旧终端）；`-Close <address>` 关闭其中一个；只供人使用，在代理窗格中会被拒绝 |
 | `version` | `version`，`--version` | 二进制文件的版本，用来分辨窗格运行的是哪一个；在多路复用器之外也能用 |
 
 退出码 0 表示成功，1 表示错误，2 表示拒绝或用法错误；失败时由 `check` 指明原因。
@@ -103,6 +104,10 @@ flowchart LR
 在团队的侧边栏中（由 `up` 启动的会话），`n`/`N` 选择下一个或上一个有实时视图的代理，并会循环，但它们本身不切换；Enter 打开它。
 
 重新打开的视图（`resume`、代理的视图被关闭后的 `focus`，或在个人窗格中运行的 `sidebar`）在调用者的窗口中打开，旁边带一个侧边栏，而不是在团队负责人的窗口中：每个代理视图都有一个侧边栏。
+
+## 保留的 shell
+
+当 `restore` 或 `up` 在代理的终端丢失后把它带回来时，代理在新的终端中运行，而它的旧终端作为普通 shell 保持打开；旧窗格仍显示它。`restore` 和 `up` 不会为新终端打开视图：`focus <name>` 会打开一个。侧边栏在代理上方的 `kept shells` 下列出这些 shell：用 `j`/`k` 选中一个，按 Enter，再按 `y` 关闭它（按其他任意键则保留）。在团队会话的窗格中，`kept` 列出它们，`kept -Close <address>` 关闭其中一个；只有 hc 仍显示它处于打开状态并由本团队保留时才会关闭。关闭的 shell 不会再回来，`stop` 和 `restore` 也从不关闭它。
 
 ## 安全检查
 

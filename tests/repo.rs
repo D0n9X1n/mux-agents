@@ -2155,6 +2155,56 @@ fn the_upgrade_note_names_the_old_pane_refusal() {
 const UPGRADE_0_3: &str = "From 0.2 to 0.3: an agent pane started by 0.2 and not yet running refuses to launch (\"started by an older mux-agent\"). Run `stop <name>` to end it, or `resume <name>` to start it again.";
 const UPGRADE_0_3_ZH: &str = "从 0.2 升级到 0.3:由 0.2 启动且尚未运行的代理窗格会拒绝启动(\"started by an older mux-agent\")。运行 `stop <name>` 结束它,或运行 `resume <name>` 重新启动它。";
 
+// views-6f v6f call 4: the person's docs name kept shells; SKILL.md does not (agents never run `kept`).
+#[test]
+fn the_person_docs_name_kept_shells() {
+    let readme = repo_file("README.md");
+    for want in [
+        "**Kept shells.**",
+        "mux-agent kept -Close",
+        "then `y`",
+        "never comes back",
+    ] {
+        assert!(readme.contains(want), "README: {want}");
+    }
+    // Audit 6-10 F13: the explanation itself, not only its markers.
+    for (page, heading, wants) in [
+        (
+            "Usage",
+            "## Kept shells",
+            [
+                "| `kept` |",
+                "`kept -Close <address>`",
+                "answer `y`",
+                "`focus <name>`",
+                "never comes back",
+            ],
+        ),
+        (
+            "Usage-zh-CN",
+            "## 保留的 shell",
+            [
+                "| `kept` |",
+                "`kept -Close <address>`",
+                "再按 `y`",
+                "`focus <name>`",
+                "不会再回来",
+            ],
+        ),
+    ] {
+        let text = wiki_text(page);
+        assert!(text.lines().any(|l| l == heading), "{page}: {heading}");
+        for want in wants {
+            assert!(text.contains(want), "{page}: {want}");
+        }
+    }
+    let skill = repo_file("skills/mux-agents/SKILL.md");
+    assert!(
+        !skill.contains("mux-agent kept") && !skill.contains("`kept`"),
+        "SKILL.md names no kept verb"
+    );
+}
+
 #[test]
 fn wiki_pairs_and_links() {
     let pages = wiki_pages();

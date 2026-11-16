@@ -68,6 +68,8 @@ claude plugin marketplace update mux-agents && claude plugin update mux-agents@m
 copilot plugin marketplace update mux-agents && copilot plugin update mux-agents@mux-agents
 ```
 
+**Kept shells.** When `restore` or `up` brings an agent back after a crash, its old terminal stays open as a plain shell, so nothing you left there is lost. The side bar lists these under `kept shells` until you close one: select it, press Enter, then `y`. From a pane in the team's session, `mux-agent kept` lists them and `mux-agent kept -Close <address>` closes one. A closed shell never comes back.
+
 ## Learn more
 
 [Usage](https://github.com/D0n9X1n/mux-agents/wiki/Usage) (commands, side bar, safety checks, upgrades, troubleshooting) · [Wiki](https://github.com/D0n9X1n/mux-agents/wiki) (English · 简体中文) · [Releases](https://github.com/D0n9X1n/mux-agents/releases) · [Contributing](https://github.com/D0n9X1n/mux-agents/blob/main/CONTRIBUTING.md) · [Security](https://github.com/D0n9X1n/mux-agents/blob/main/SECURITY.md) · MIT
