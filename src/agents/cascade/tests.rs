@@ -1433,12 +1433,15 @@ fn a_reopen_cut_short_replays_only_its_own_pending() {
     }
 }
 
-// Call 11 (C2 root): a stopped root stays closed until 6c retires the team: after its whole cascade, with the
-// finished journal removed, `reopen_same(L)` refuses `closed`; L stays stopped and nothing launches.
+// Call 11 as call 35 reads it (C2 root): a stopped root takes no new members. After its whole cascade, with the
+// finished journal removed, a spawn under L and a resume of its stopped child A refuse `closed`; resuming L itself
+// reopens it: `running` before its launch.
 #[test]
-fn a_stopped_root_stays_closed() {
+fn a_stopped_root_takes_no_new_members_but_reopens_itself() {
     let (w, s) = lf::world();
     cx::member(&w, L, None, 0, json!({}));
+    cx::member(&w, A, Some(L), 1, json!({}));
+    cx::terminates(&w, A);
     cx::terminates(&w, L);
     let (tx, c) = (cx::tx(&w, &s), w.caller());
     assert!(stop(&tx, &c, L, &[]).unwrap().stopped, "stopped completely");
@@ -1446,9 +1449,17 @@ fn a_stopped_root_stays_closed() {
         journals(&tx).unwrap().is_empty(),
         "the finished journal is removed"
     );
-    let got = reopen_same(&tx, L, || -> Res<()> { panic!("launched a stopped root") });
-    assert_eq!(got.unwrap_err().check, "closed");
-    assert!(cx::stopped(&w, L), "L stays stopped");
+    assert_eq!(admit(&tx, L).unwrap_err().check, "closed", "spawn under L");
+    let got = reopen_same(&tx, A, || -> Res<()> {
+        panic!("launched under a stopped root")
+    });
+    assert_eq!(got.unwrap_err().check, "closed", "resume of A");
+    assert!(cx::stopped(&w, A), "A stays stopped");
+    reopen_same(&tx, L, || {
+        assert!(!cx::stopped(&w, L), "running before the launch");
+        Ok(())
+    })
+    .unwrap();
     w.fakes.hc_done().unwrap();
 }
 

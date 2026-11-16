@@ -300,12 +300,10 @@ pub fn admit(tx: &Tx<'_>, parent: &str) -> Res<()> {
 
 /// C3: X may be resumed, retried or freshened only when no journal (a tombstone included) lists X, a member of X's
 /// chain or a member below X (nearest first, then deepest first), and X's parent is open. X's own `stopped` does
-/// not refuse: that is the reopen.
+/// not refuse: that is the reopen, a stopped root's included (c3d call 35: call 11 closes a stopped root to new
+/// members, which its parent walk refuses here and `admit` refuses on spawn).
 pub fn reopen_check(tx: &Tx<'_>, id: &str) -> Res<()> {
     let t = Tree::read(tx)?;
-    if t.root_stopped(id) {
-        return Err(closed(&t.name(id)));
-    }
     let js = journals(tx)?;
     let listed = |x: &str| js.iter().any(|j| j.lists(x));
     let mut near = t.chain(id)?;

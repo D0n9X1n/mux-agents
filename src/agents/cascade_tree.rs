@@ -278,13 +278,6 @@ impl Tree {
         self.nodes.contains_key(id)
     }
 
-    /// Call 11: a member that records no parent (the team's root) and is desired stopped stays closed.
-    pub(super) fn root_stopped(&self, id: &str) -> bool {
-        self.nodes
-            .get(id)
-            .is_some_and(|n| n.parent.is_none() && n.stopped)
-    }
-
     pub fn name(&self, id: &str) -> String {
         self.nodes
             .get(id)
