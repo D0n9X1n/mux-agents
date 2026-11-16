@@ -390,6 +390,11 @@ const SCOPE_READS_ALLOWED: &[(&str, &str, &str)] = &[
         "admission compares the caller's own server",
     ),
     (
+        "src/agents/mail.rs",
+        "elsewhere",
+        "V3: the shown key off the anchor",
+    ),
+    (
         "src/agents/up/index.rs",
         "server_of",
         "the caller's own server tuple",

@@ -379,7 +379,7 @@ impl Snapshot {
             }
             [] if caller.agent_tag.is_empty() => Ok(registry::Me {
                 name: "root".into(),
-                key: super::mail::mailbox_key(&caller.pane, "")?,
+                key: super::mail::person_box(caller)?,
                 record: None,
             }),
             [] => crate::error::refuse(2, "parent", "this agent pane has no record"),

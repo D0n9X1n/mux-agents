@@ -644,7 +644,7 @@ fn claude_session(record: &Value) -> Value {
 fn pane_box(ctx: &Ctx, caller: &Caller, pane: &str) -> Res<Value> {
     super::message::live_pane(ctx, caller, pane)?;
     let snapshot = super::registry::Snapshot::take(ctx, caller)?;
-    let key = super::registry::mailbox_of(&snapshot, pane)?;
+    let key = super::registry::mailbox_of(&snapshot, pane, super::mail::elsewhere(caller))?;
     let agent = snapshot.at(pane);
     Ok(
         json!({"name": agent.as_ref().map_or(pane.to_string(), |a| a.name.clone()),

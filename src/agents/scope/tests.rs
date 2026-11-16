@@ -434,3 +434,154 @@ fn a_person_in_the_view_reaches_the_teams_records_and_lock_through_the_dispatche
         "none under the shown session"
     );
 }
+
+/// The World caller re-pointed at pane `pane` of its own server (Kw).
+fn from_pane(w: &mut World, pane: &str) {
+    let tmux = w.ctx.env.get("TMUX").unwrap().to_string();
+    w.ctx.env = crate::ctx::Env::from_pairs([("TMUX", tmux), ("TMUX_PANE", pane.to_string())]);
+}
+
+// Call 15: K1's `%1` and Kw's `%1` have two mailboxes; `send %1` from Kw's `%2` reaches Kw's, and `read` by Kw's
+// `%1` reads only its own, both under the anchor's mail folder.
+#[test]
+fn the_same_pane_on_two_servers_has_two_mailboxes_through_the_dispatcher() {
+    let mut w = World::human("");
+    let me = here(&w);
+    w.panes(&["%1|@1|100||", "%2|@1|101||"]);
+    // `send %1` proves the recipient a live pane of this session (finding F10).
+    w.fakes
+        .mux_rule("#{pane_id}|#{session_id}", 0, "%1|$3\n", "");
+    team_record(&w, "$A");
+    index::write(&w.ctx, &ix(T1, Some(on(me.clone(), "$3")), None, vec![])).unwrap();
+    let mail = w.ctx.state_root.join(K1).join("mail");
+    crate::agents::mail::add_mail(
+        &w.ctx,
+        &anchored(&w),
+        "pane-1",
+        "worker",
+        "%9",
+        "for K1 pane 1",
+        None,
+    )
+    .unwrap();
+    from_pane(&mut w, "%2");
+    let (code, r) = run(&w, &["send", "%1", "-Body", "for Kw pane 1"]);
+    assert_eq!(code, 0, "send: {r}");
+    assert!(
+        mail.join(format!("pane-{}-1.jsonl", me.key)).is_file(),
+        "the producer routes off the anchor"
+    );
+    from_pane(&mut w, "%1");
+    let (code, got) = run(&w, &["read"]);
+    assert_eq!(code, 0, "{got}");
+    let text = got.to_string();
+    assert!(
+        text.contains("for Kw") && !text.contains("for K1"),
+        "the reader reads its own server's box: {text}"
+    );
+}
+
+// The notice producers: a member spawned by a person off the anchor records `parentServerKey`; its notice parent
+// box, and adopt-3e's `notice_route` fallback, name that server; on the anchor no key is recorded.
+#[test]
+fn a_childs_notice_reaches_its_off_anchor_parent_box() {
+    let w = World::human("");
+    let me = here(&w);
+    let rec = json!({"parentPane": "%1", "parentServerKey": me.key});
+    assert_eq!(
+        crate::agents::mail::parent_box(&json!({"parentPane": "%1"})).unwrap(),
+        "pane-1",
+        "on the anchor"
+    );
+    assert_eq!(
+        crate::agents::mail::parent_box(&rec).unwrap(),
+        format!("pane-{}-1", me.key)
+    );
+    // shortcut: adopt-3e's `notice_route` is not on origin/v0.3-life yet; when it lands, assert
+    // `crate::agents::adopt::notice_route_fallback(&rec)` == `pane-<key>-1` here ("adopt-3e fallback", row 4.6, R11).
+    // Call 32 (finding F11): the board's parent mailbox, its `parent_key` fallback and its notice box, honour it.
+    assert_eq!(
+        crate::agents::board::parent_mailbox(&rec),
+        Some(format!("pane-{}-1", me.key)),
+        "board parent box"
+    );
+}
+
+// Finding F13: `elsewhere` is None without an anchor and on the anchor's own server, so a person there keeps `pane-<n>`.
+#[test]
+fn elsewhere_is_none_without_an_anchor_or_on_it() {
+    let w = World::human("");
+    let mut c = w.caller();
+    assert_eq!(crate::agents::mail::elsewhere(&c), None, "no anchor");
+    c.anchor = Some(Anchor {
+        key: c.server_key.clone(),
+        session: "$A".into(),
+    });
+    assert_eq!(
+        crate::agents::mail::elsewhere(&c),
+        None,
+        "anchored on its own server"
+    );
+    assert_eq!(
+        crate::agents::mail::person_box(&c).unwrap(),
+        format!("pane-{}", &c.pane[1..]),
+        "the anchor's own box"
+    );
+}
+
+// Checklist R9: a lifecycle member at K1 forces `route_team`; a person on Kw's `%2` sends to Kw's `%1`: the intent
+// names the qualified recipient box (and the sender's own qualified box), and delivery lands there.
+#[test]
+fn a_team_send_to_a_pane_off_the_anchor_names_its_qualified_box() {
+    use crate::agents::{core_fixture as cf, life_fixture as lf, team_mail};
+    let mut w = World::human("");
+    let me = here(&w);
+    w.panes(&["%1|@1|100||", "%2|@1|101||"]);
+    w.fakes
+        .mux_rule("#{pane_id}|#{session_id}", 0, "%1|$3\n", "");
+    team_record(&w, "$A");
+    record_at(&w, "aaaaaaaaaaa1", "$A");
+    index::write(&w.ctx, &ix(T1, Some(on(me.clone(), "$3")), None, vec![])).unwrap();
+    from_pane(&mut w, "%2");
+    let want = format!("pane-{}-1", me.key);
+    let sender = format!("pane-{}-2", me.key);
+    let sends = team_mail::sends_root(&w.ctx.state_root.join(K1), "$A").join(&sender);
+    for crash in [true, false] {
+        cf::online(&w);
+        cf::listing(&w, &format!("{K1}:$A"), &[]);
+        let wire = json!({"address": "t1", "name": lf::hc_name(1), "state": "live", "reason": null,
+            "argv": lf::ARGV, "exit_code": null, "labels": {"mux.managed": "1", "mux.team": format!("{K1}:$A"),
+            "mux.id": "aaaaaaaaaaa1", "mux.gen": "1", "mux.name": "m1"}});
+        cf::get(&w, "t1", wire);
+        team_mail::crash_after_intent(crash);
+        let (code, r) = run(&w, &["send", "%1", "-Body", "for Kw pane 1"]);
+        team_mail::crash_after_intent(false);
+        if crash {
+            assert_ne!(code, 0, "the send stops after its intent: {r}");
+            let intent = std::fs::read_dir(&sends)
+                .unwrap_or_else(|e| {
+                    panic!("the sender's own qualified intent folder {sends:?}: {e}")
+                })
+                .map(|e| e.unwrap().path())
+                .find(|p| p.extension().is_some_and(|x| x == "json"))
+                .expect("an intent");
+            let intent: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(intent).unwrap()).unwrap();
+            assert_eq!(
+                intent["recipients"][0]["box"],
+                json!(want),
+                "the intent's mailbox field"
+            );
+        } else {
+            assert_eq!(code, 0, "send: {r}");
+            let file = w
+                .ctx
+                .state_root
+                .join(K1)
+                .join("mail")
+                .join(format!("{want}.jsonl"));
+            assert!(file.is_file(), "delivered to the qualified box: {r}");
+        }
+    }
+    w.fakes.hc_done().unwrap();
+}

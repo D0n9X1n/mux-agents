@@ -428,6 +428,10 @@ impl Launch<'_> {
             record["parentPane"] = p.parent_pane.clone().into();
             record["depth"] = p.depth.into();
         }
+        // Re6a V3: a person off the anchor's server names its server, so notices reach its own pane mailbox.
+        if let Some(key) = super::mail::elsewhere(caller) {
+            record["parentServerKey"] = key.into();
+        }
         record["color"] = agent.color.into();
         // The exact command the pane started, as the multiplexer renders it: the agent is the pane running it (#48).
         record["startCommand"] = start_command.into();

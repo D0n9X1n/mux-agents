@@ -150,7 +150,7 @@ fn send_legacy(
             };
             // The pane must be a live pane of this session; its mailbox is the running agent's there, else `pane-<n>`.
             live_pane(ctx, caller, &pane)?;
-            let key = registry::mailbox_of(&snapshot, &pane)?;
+            let key = registry::mailbox_of(&snapshot, &pane, super::mail::elsewhere(caller))?;
             // The recipient's Claude Code session, when it is one: a running Claude agent's own, or (to `parent`) the session
             // its spawner recorded. The sender's hooks wake it with it (#92).
             let claude = |record: &Value, field: &str| {

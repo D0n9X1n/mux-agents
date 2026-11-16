@@ -232,13 +232,16 @@ use serde_json::json;
 fn reader_key_never_matches_a_member_by_pane() {
     let other = vec!["bbbbbbbbbbbb".to_string()];
     // A member counts its own id, even with another member's view on its old pane.
-    assert_eq!(reader_key(Some(ID), &other, "%1").unwrap(), ID);
-    assert_eq!(reader_key(Some(ID), &[], "%1").unwrap(), ID);
+    assert_eq!(reader_key(Some(ID), &other, "%1", None).unwrap(), ID);
+    assert_eq!(reader_key(Some(ID), &[], "%1", None).unwrap(), ID);
     // A pane-proven caller: the one agent on its pane, else the pane's mailbox.
-    assert_eq!(reader_key(None, &other, "%1").unwrap(), "bbbbbbbbbbbb");
-    assert_eq!(reader_key(None, &[], "%1").unwrap(), "pane-1");
+    assert_eq!(
+        reader_key(None, &other, "%1", None).unwrap(),
+        "bbbbbbbbbbbb"
+    );
+    assert_eq!(reader_key(None, &[], "%1", None).unwrap(), "pane-1");
     let two = vec![ID.to_string(), "bbbbbbbbbbbb".to_string()];
-    assert_eq!(reader_key(None, &two, "%1").unwrap(), "pane-1");
+    assert_eq!(reader_key(None, &two, "%1", None).unwrap(), "pane-1");
 }
 use std::path::{Path, PathBuf};
 
@@ -2012,4 +2015,56 @@ fn a_parent_loop_marks_its_members_and_the_bar_lists_the_rest() {
             ("y".to_string(), json!(x), json!(true)),
         ]
     );
+}
+
+// Re6a V3 (checklist R7, R8): a parent pane names its server through the record's `parentServerKey`. `parent_key`
+// matches a running agent on the parent pane only on the same server (R7, non-team); its fallback and the team
+// notice box are each the qualified `pane-<K2>-<n>`, never the anchor's `pane-<n>` (R8, team), read through the
+// real board unread result.
+#[test]
+fn a_parent_pane_on_another_server_counts_only_its_qualified_mailbox() {
+    const K2: &str = "0123456789abcdef";
+    for team in [false, true] {
+        let w = World::human("");
+        w.clock(NOW);
+        let caller = w.caller();
+        let up = if team { json!("T") } else { Value::Null };
+        member(
+            &w,
+            ID,
+            json!({"name": "lead", "pane": "%8", "parentPane": null, "parentAgent": null, "depth": 0, "upTeam": up,
+                "createdAt": "2026-10-29T11:00:00.0000000Z"}),
+        );
+        member(
+            &w,
+            "cccccccccccc",
+            json!({"name": "kid", "pane": "%9", "parentPane": "%8", "parentServerKey": K2,
+                "parentAgent": if team { json!({"id": ID}) } else { Value::Null }, "depth": 1,
+                "createdAt": "2026-10-29T11:30:00.0000000Z"}),
+        );
+        w.panes(&["%8|@5|300|aaaaaaaaaaaa|lead", "%9|@5|301|cccccccccccc|kid"]);
+        // The kid's mail: 1 in its parent's qualified box, 3 in the anchor's `pane-8`, and (outside a team, where
+        // the lead is no parent) 2 in the lead's own box that runs on the same pane number here.
+        let qualified = format!("pane-{K2}-8");
+        let mut boxes = vec![(qualified.as_str(), 1), ("pane-8", 3)];
+        if !team {
+            boxes.push((ID, 2));
+        }
+        for (key, n) in boxes {
+            for _ in 0..n {
+                add_mail(&w.ctx, &caller, key, "kid", "%9", "x", None).unwrap();
+            }
+        }
+        snapshot(&w, &caller, &[(ID, "running"), ("cccccccccccc", "running")]);
+        let reply = board(&w.ctx, &caller, true, true).unwrap();
+        w.fakes.hc_done().unwrap();
+        let kid = reply["agents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["name"] == "kid")
+            .unwrap()
+            .clone();
+        assert_eq!(kid["unread"], json!(1), "team {team}: only {qualified}");
+    }
 }
