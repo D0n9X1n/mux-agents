@@ -523,3 +523,56 @@ fn the_board_passes_its_observation_as_lost_evidence() {
     let (needs, reason, _, _) = flags(row(&got, "lost"));
     assert_eq!((needs, reason), (&json!(true), &json!(LOST)));
 }
+
+/// Member `id`'s `activity.json` (the live row's activity word).
+fn activity(w: &World, id: &str, state: &str) {
+    write(
+        &w.folder(id).join("activity.json"),
+        json!({"state": state, "since": "1970-01-01T00:00:00.0000000Z"}),
+    );
+}
+
+// o2 calls 28, 30 (Tech Lead #146): from the board through the flat bar's renderer. A failed Running member whose
+// activity is `working` beside a healthy `blocked` sibling (width 60, height 40: section headings) still shows
+// `recover` under its section; the failed member alone at width 30 too.
+#[test]
+fn the_flat_bar_shows_recover_from_the_board_in_every_layout() {
+    for (case, width, sibling) in [("sections", 60, true), ("narrow", 30, false)] {
+        let w = World::human("");
+        let mut bad = life(&w, "aaaaaaaaaaaa", "fixer", &[exit_1()], false);
+        bad.1["argv"] = bad.0["launcherArgv"].clone();
+        activity(&w, "aaaaaaaaaaaa", "working");
+        let mut members = vec![bad];
+        if sibling {
+            let mut good = life(&w, "bbbbbbbbbbbb", "good", &[outcome_ok()], false);
+            good.1["argv"] = good.0["launcherArgv"].clone();
+            activity(&w, "bbbbbbbbbbbb", "blocked");
+            members.push(good);
+        }
+        script(&w, &members.iter().collect::<Vec<_>>());
+        let got = board(&w.ctx, &w.caller(), false, true).unwrap();
+        let fixer = row(&got, "fixer");
+        assert_eq!(
+            (
+                &fixer["state"],
+                &fixer["needsRecovery"],
+                &fixer["recoveryRunning"]
+            ),
+            (&json!("running"), &json!(true), &json!(true)),
+            "{case}: the board flags a Running member"
+        );
+        let text = crate::sidebar::flat_text(&got, width, 40);
+        let line = text
+            .iter()
+            .find(|l| l.contains("fixer"))
+            .cloned()
+            .unwrap_or_default();
+        assert!(line.contains("recover"), "{case}: {text:#?}");
+        if sibling {
+            assert!(
+                text.iter().any(|l| l.contains("Working")),
+                "{case}: no section heading: {text:#?}"
+            );
+        }
+    }
+}

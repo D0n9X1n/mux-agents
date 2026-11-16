@@ -704,14 +704,28 @@ fn recovery_word(row: &Map<String, Value>) -> Option<&'static str> {
     })
 }
 
+/// o2 call 28: a recovery row's right side in every flat layout: its words and age when they fit beside the glyph, the
+/// badge and a cut name (`agent_line`'s own test for keeping a right side), else the bare `recover` pill, which
+/// `agent_line` keeps where it would drop the longer side (as the wide bar's `bare` floor).
+fn recovery_side(word: &str, age: &str, glyph: &Span, badge: &Row, cols: usize) -> Row {
+    let full = right(Kind::Blocked, word, age, false);
+    let fixed = paint::width(&glyph.0) + 1 + row_width(badge);
+    if fixed + 2 + row_width(&full) + 4 <= cols {
+        full
+    } else {
+        vec![span("recover", Kind::Blocked.word_style())]
+    }
+}
+
 fn live_row(row: &Map<String, Value>, cols: usize, look: Look) -> Live {
     let p = live_parts(row, look);
     let age_style = if p.muted { DIM } else { PLAIN };
     // Call 20: a Running member that needs recovery keeps its live row (still clickable) with the recovery word.
-    let side = match recovery_word(row) {
-        Some(word) => right(Kind::Blocked, word, &p.age, false),
-        None => right(p.kind, p.kind.word(), &p.age, p.muted),
-    };
+    let recovery =
+        recovery_word(row).map(|word| recovery_side(word, &p.age, &p.glyph, &p.badge, cols));
+    let side = recovery
+        .clone()
+        .unwrap_or_else(|| right(p.kind, p.kind.word(), &p.age, p.muted));
     let line = agent_line(
         p.glyph.clone(),
         p.name.clone(),
@@ -725,7 +739,8 @@ fn live_row(row: &Map<String, Value>, cols: usize, look: Look) -> Live {
         p.name,
         p.model,
         p.badge,
-        vec![span(format!("{:>4}", p.age), age_style)],
+        // o2 call 28: under a section heading a recovery row keeps `recover` in place of its bare age.
+        recovery.unwrap_or_else(|| vec![span(format!("{:>4}", p.age), age_style)]),
         cols,
     );
     Live {
@@ -805,12 +820,20 @@ fn parts(
             Some(word) => (Kind::Blocked, word.to_string()),
             None => ended_kind(row),
         };
-        let line = agent_line(
+        let (glyph, age) = (
             span(kind.glyph(look.ascii), kind.style()),
+            format_age(row.get("age")),
+        );
+        let side = match recovery_word(row) {
+            Some(word) => recovery_side(word, &age, &glyph, &Vec::new(), cols),
+            None => right(kind, &word, &age, false),
+        };
+        let line = agent_line(
+            glyph,
             span(own_glyphs(&clean(row.get("name"))), DIM),
             Vec::new(),
             Vec::new(),
-            right(kind, &word, &format_age(row.get("age")), false),
+            side,
             cols,
         );
         ended.push(margin(line));
@@ -980,6 +1003,21 @@ fn drop_one(parts: &Parts, shape: &mut Shape) -> bool {
 fn layout(board: Option<&Map<String, Value>>, notes: &[&str], size: Size, look: Look) -> Vec<Row> {
     let notes: Vec<(&str, Style)> = notes.iter().map(|note| (*note, DIM)).collect();
     lay(board, &notes, size, look).rows
+}
+
+/// Tests (o2 call 30): a board's flat bar as plain text, `width` by `height`, so a board test renders what it built.
+#[cfg(test)]
+pub(crate) fn flat_text(board: &Map<String, Value>, width: usize, height: usize) -> Vec<String> {
+    let look = Look {
+        color: false,
+        ascii: false,
+        dumb: false,
+    };
+    lay(Some(board), &[], Size { width, height }, look)
+        .rows
+        .iter()
+        .map(|r| render(r, false))
+        .collect()
 }
 
 /// `layout` with each note in its own style, and the drawn running agents with their rows.
@@ -2985,6 +3023,45 @@ mod tests {
     use crate::mux::Output;
     use crate::testing::Fakes;
     use serde_json::json;
+
+    // o2 call 28 (QA #146 F2): every flat layout keeps `recover` for a member that needs recovery: the compact row under
+    // a section heading (width 60, an idle sibling), and the narrow row (width 30), Running or Lost, running or not (the
+    // bare `recover` pill when its words and age do not fit).
+    #[test]
+    fn every_flat_layout_keeps_recover() {
+        let look = Look {
+            color: false,
+            ascii: false,
+            dumb: false,
+        };
+        let fixer = |state: &str, running: bool| {
+            json!({"name": "fixer", "state": state, "life": state, "age": 60, "activity": "working",
+                "needsRecovery": true, "recoveryRunning": running})
+        };
+        let rest = json!({"name": "rest", "state": "running", "life": "running", "age": 60, "activity": "idle"});
+        for (case, width, agents) in [
+            ("compact", 60, vec![fixer("running", true), rest.clone()]),
+            ("narrow running", 30, vec![fixer("running", true)]),
+            ("narrow lost", 30, vec![fixer("lost", true)]),
+            ("narrow lost, not running", 30, vec![fixer("lost", false)]),
+        ] {
+            let board = json!({"running": 1, "agents": agents});
+            let laid = lay(board.as_object(), &[], Size { width, height: 40 }, look);
+            let text: Vec<String> = laid.rows.iter().map(|r| render(r, false)).collect();
+            let line = text
+                .iter()
+                .find(|l| l.contains("fixer"))
+                .cloned()
+                .unwrap_or_default();
+            assert!(line.contains("recover"), "{case}: {text:#?}");
+            if case == "compact" {
+                assert!(
+                    text.iter().any(|l| l.contains("Working")),
+                    "{case}: no section heading: {text:#?}"
+                );
+            }
+        }
+    }
 
     // Call 9 and build checklist 1 (call 20): a member that needs recovery reads `recover` on the flat bar too
     // (`recover (still running)` while its client runs), never its hc state word or its live activity word; a Running
