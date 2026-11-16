@@ -20,3 +20,5 @@ up_whose_view_panics_keeps_the_leader_under_hostile_settings
 notebook_and_peek_stay_in_the_team
 # integration #150: A3c's views-down test runs `up` (notebook-7a call 11 lists every such test).
 members_mail_without_the_multiplexer
+# adopt-3e Task 12: runs `resume`; run alone.
+adoption_moves_b_and_a_resumed_successor_stops_its_child

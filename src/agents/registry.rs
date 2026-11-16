@@ -762,24 +762,29 @@ fn post(
             format!("{name} is gone: its pane closed without an exit record."),
         ),
     };
-    let parent = super::text(record.get("parentPane"));
-    let delivered = if parent.is_empty() {
-        None // spec v10 amendment (#103): a leader has no parent pane; its notice is recorded for the bar and `list`, mailed to no one
-    } else {
-        let key = mail::mailbox_key(&parent, "")?;
-        let pane = super::text(record.get("pane"));
-        let mut fields = Map::new();
-        fields.insert("kind".into(), kind.into());
-        fields.insert("exitCode".into(), code.clone());
-        // The member it is about, so a team bar counts it by identity (#103 review).
-        fields.insert("fromId".into(), id.into());
-        // cascade-3d call 9: a lifecycle notice's message is flushed before its marker is published.
-        let add = if life_gen.is_some() {
-            mail::add_once_durable
-        } else {
-            mail::add_once
-        };
-        add(ctx, caller, &key, &name, &pane, &body, &delivery, &fields)?
+    let key = match life_gen {
+        // adopt-3e call 12: decided once and recorded before the first attempt; every retry delivers there.
+        Some(n) => super::adopt::notice_route(ctx, caller, folder, id, record, n)?,
+        None => super::adopt::pane_key(record)?,
+    };
+    let delivered = match key {
+        // spec v10 amendment (#103): no parent; the notice is recorded for the bar and `list`, mailed to no one
+        None => None,
+        Some(key) => {
+            let pane = super::text(record.get("pane"));
+            let mut fields = Map::new();
+            fields.insert("kind".into(), kind.into());
+            fields.insert("exitCode".into(), code.clone());
+            // The member it is about, so a team bar counts it by identity (#103 review).
+            fields.insert("fromId".into(), id.into());
+            // cascade-3d call 9: a lifecycle notice's message is flushed before its marker is published.
+            let add = if life_gen.is_some() {
+                mail::add_once_durable
+            } else {
+                mail::add_once
+            };
+            add(ctx, caller, &key, &name, &pane, &body, &delivery, &fields)?
+        }
     };
     // cascade-3d C6 crash point: the message is delivered, its marker not yet published.
     if life_gen.is_some() {

@@ -1067,6 +1067,12 @@ const TEST_ONLY: &[(&str, &str, &str)] = &[
         "src/agents/mod.rs",
         "prelife_fixture",
     ),
+    (
+        "src/agents/adopt/route_tests.rs",
+        "src/agents/adopt.rs",
+        "route_tests",
+    ),
+    ("src/agents/adopt/crash.rs", "src/agents/adopt.rs", "crash"),
 ];
 
 #[test]

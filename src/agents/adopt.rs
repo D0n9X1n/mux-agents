@@ -403,6 +403,10 @@ pub use view::{LEAVES, SEVERAL, Up, View};
 mod bar;
 pub use bar::{MOVING, Swept, adopt_locked, candidates, stable, sweep, tick};
 
+#[path = "adopt_route.rs"]
+mod routes;
+pub use routes::{Route, notice_key, notice_route, pane_key, route};
+
 #[cfg(test)]
 mod tests;
 
@@ -417,3 +421,9 @@ mod order_tests;
 
 #[cfg(test)]
 mod bar_tests;
+
+#[cfg(test)]
+mod route_tests;
+
+#[cfg(test)]
+mod crash;

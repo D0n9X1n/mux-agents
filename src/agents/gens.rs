@@ -10,7 +10,7 @@ use crate::state::evidence::{self, Evidence, Published};
 pub use super::outcome::{Adjudged, Recovery, Verdict, Wait, adjudicate, needs_recovery};
 
 /// Every create-once file of a generation (S5); the claim lives beside the folder.
-pub const FILES: [&str; 16] = [
+pub const FILES: [&str; 17] = [
     "spec",
     "launch",
     "commit",
@@ -27,6 +27,8 @@ pub const FILES: [&str; 16] = [
     "release",
     "released",
     "notice",
+    // adopt-3e call 19: a notice's recorded destination, published before its first delivery.
+    "route",
 ];
 
 /// `gens/<n>.claim`.

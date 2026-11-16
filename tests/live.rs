@@ -5706,6 +5706,7 @@ hc {}:
                     bar_click_after_shrinking_does_nothing,
                     members_spawn_and_act_only_down_the_tree,
                     a_cascade_stop_ends_b_before_a_and_a_second_stop_finishes,
+                    adoption_moves_b_and_a_resumed_successor_stops_its_child,
                     team_messaging_stays_in_the_team,
                     notebook_and_peek_stay_in_the_team,
                     an_unacked_batch_is_served_again_and_rebuilt_for_a_successor,
@@ -5923,6 +5924,152 @@ hc {}:
         let done = a0.join("ended.json").exists() || a0.join("released.json").exists();
         assert!(done, "{mux:?}: a2 done");
         assert!(a0.join("notice.json").exists(), "{mux:?}: a2 noticed");
+    }
+
+    fn record_of(live: &Live, id: &str) -> Value {
+        json_file(&live.agent_dir(id).join("record.json"))
+    }
+    /// Quits member `id`'s fake client and waits for its exit marker (`quit.<pid>` / `exited.<pid>`).
+    fn quit_member(live: &Live, id: &str) {
+        let sid = record_of(live, id)["sessionId"].clone();
+        let pid = live.server.client_by_session(s(&sid))["pid"]
+            .as_u64()
+            .unwrap();
+        support::write_atomic(&live.dir.join(format!("quit.{pid}")), "0\n");
+        assert_eq!(live.server.wait_file(&format!("exited.{pid}")).trim(), "0");
+    }
+    fn hc_state(live: &Live, id: &str) -> Value {
+        let r = record_of(live, id);
+        core(live, &["get", s(&r["hcAddress"]), "--json"])["state"].clone()
+    }
+    fn parent_and_depth(live: &Live, id: &str) -> (Value, Value) {
+        let r = record_of(live, id);
+        (r["parentAgent"]["id"].clone(), r["depth"].clone())
+    }
+    /// The bodies in member `id`'s mailbox (an inherited `mailbox` honoured).
+    fn mail_bodies(live: &Live, id: &str) -> Vec<Value> {
+        let r = record_of(live, id);
+        let key = r
+            .get("mailbox")
+            .and_then(Value::as_str)
+            .unwrap_or(id)
+            .to_string();
+        live.mailbox(&key)
+            .iter()
+            .map(|m| m["body"].clone())
+            .collect()
+    }
+    /// `sidebar -Close` from `pane` (in the team's session), proven closed.
+    fn close_team_bar(live: &mut Live, mux: Mux, pane: &str) {
+        let (code, close) = live.run_in(pane, &["sidebar", "-Close"]);
+        assert_eq!(code, 0, "{mux:?} {close}");
+        for p in close["panes"].as_array().into_iter().flatten() {
+            live.wait_gone(s(p));
+        }
+    }
+
+    // adopt-3e live (spec "Live tests", A7, A9; calls 3, 16, 23): public commands only; a person's commands run from a
+    // shell pane in `up`'s team session, whose bar is closed. X (the leader) -> A -> B; A's client exits; `list` reaps
+    // A, the next `list` adopts B under X; B's `send parent` reaches X. X -> C -> D; C exits and is reaped; the person
+    // resumes C as C′; `stop c1` (C′) stops D. Then X exits: it stays the root, its row ended, B under it and live, and
+    // B's `send parent` still reaches X (Ended, viewless; call 5).
+    fn adoption_moves_b_and_a_resumed_successor_stops_its_child(mux: Mux) {
+        let Some(mut live) = Live::human(mux) else {
+            return;
+        };
+        std::fs::write(live.dir.join("brief.md"), "brief").unwrap();
+        std::fs::write(live.dir.join("task.txt"), "say hi").unwrap();
+        let (code, up) = live.run(&["up", "-Client", "claude"]);
+        assert_eq!(code, 0, "{mux:?} {up}");
+        let x = s(&up["leader"]["id"]).to_string();
+        let team = live.split(s(&up["session"]), &["-v"]);
+        close_team_bar(&mut live, mux, &team);
+        let spawn = |live: &mut Live, by: &str, name: &str| {
+            let (code, r) = live.spawn_by(by, name);
+            assert_eq!(code, 0, "{mux:?} {name}: {r}");
+            s(&r["id"]).to_string()
+        };
+        let list = |live: &mut Live, args: &[&str]| {
+            let (code, r) = live.run_in(&team, args);
+            assert_eq!(code, 0, "{mux:?} {args:?}: {r}");
+            r
+        };
+        let a = spawn(&mut live, &x, "a1");
+        let b = spawn(&mut live, &a, "b1");
+        quit_member(&live, &a);
+        assert!(
+            eventually(LONG, || hc_state(&live, &a) == "finished"),
+            "{mux:?}: A finished"
+        );
+        list(&mut live, &["list"]); // reaps A
+        list(&mut live, &["list"]); // sweeps: X adopts B
+        assert_eq!(
+            parent_and_depth(&live, &b),
+            (json!(x), json!(1)),
+            "{mux:?}: X adopted B"
+        );
+        std::fs::write(live.dir.join("up.md"), "from b1").unwrap();
+        let body = live.path("up.md");
+        let (code, sent) = live.by(&b, &["send", "parent", "-BodyFile", &body]);
+        assert_eq!(code, 0, "{mux:?} {sent}");
+        assert!(
+            mail_bodies(&live, &x).contains(&json!("from b1")),
+            "{mux:?}: X's mailbox"
+        );
+        assert_eq!(hc_state(&live, &b), "live", "{mux:?}: B works");
+
+        let c = spawn(&mut live, &x, "c1");
+        let d = spawn(&mut live, &c, "d1");
+        close_team_bar(&mut live, mux, &team); // nothing sweeps D under X before the resume
+        quit_member(&live, &c);
+        assert!(
+            eventually(LONG, || hc_state(&live, &c) == "finished"),
+            "{mux:?}: C finished"
+        );
+        list(&mut live, &["list"]); // records C's end (its sweep ran before the reap)
+        let resumed = list(&mut live, &["resume", "c1"]);
+        let c2 = s(&resumed["agent"]["id"]).to_string();
+        assert_ne!(c2, c, "{mux:?}: a successor");
+        assert_eq!(
+            parent_and_depth(&live, &d).0,
+            json!(c),
+            "{mux:?}: D still names C (C0 resolves it)"
+        );
+        list(&mut live, &["stop", "c1"]);
+        assert!(
+            eventually(LONG, || hc_state(&live, &d) == "finished"),
+            "{mux:?}: stop C′ stopped D"
+        );
+
+        let x_name = record_of(&live, &x)["name"].clone();
+        quit_member(&live, &x);
+        list(&mut live, &["list"]);
+        let rows = list(&mut live, &["list", "-All"]);
+        let row = rows["agents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["name"] == x_name)
+            .cloned();
+        assert_eq!(
+            row.unwrap()["life"],
+            "ended",
+            "{mux:?}: the root's row ended: {rows}"
+        );
+        assert_eq!(
+            parent_and_depth(&live, &b),
+            (json!(x), json!(1)),
+            "{mux:?}: B stays under the ended root"
+        );
+        assert_eq!(hc_state(&live, &b), "live", "{mux:?}: B still works");
+        std::fs::write(live.dir.join("up2.md"), "after x ended").unwrap();
+        let body = live.path("up2.md");
+        let (code, sent) = live.by(&b, &["send", "parent", "-BodyFile", &body]);
+        assert_eq!(code, 0, "{mux:?} {sent}");
+        assert!(
+            mail_bodies(&live, &x).contains(&json!("after x ended")),
+            "{mux:?}: X's mailbox after X ended"
+        );
     }
 
     // The ids a read served (#103 4b-i, `msg-plan-4b-i-3.md` F25).

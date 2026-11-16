@@ -1233,7 +1233,8 @@ fn a_notice_marker_never_outlives_its_message() {
     cx::member(&w, L, None, 0, json!({}));
     let a = cx::member(&w, A, Some(L), 1, json!({}));
     cx::terminates(&w, A);
-    let key = crate::agents::mail::mailbox_key(cx::PANE, "").unwrap();
+    // adopt-3e: A's notice goes to its logical parent L's member mailbox.
+    let key = crate::agents::mail::member_mailbox(L, &lf::record(&w.folder(L)));
     let mailbox = w.state().join("mail").join(format!("{key}.jsonl"));
     let (tx, c) = (cx::tx(&w, &s), w.caller());
     crate::state::fs::fail_sync_file(Some(&mailbox));
@@ -1637,7 +1638,9 @@ fn a_stopped_member_is_noticed_from_the_pane_its_view_presents() {
     let j = prepare(&tx, A).unwrap();
     let r = execute(&tx, &caller(&w), &j).unwrap();
     assert!(r.stopped && r.unresolved.is_empty(), "{r:?}");
-    let key = crate::agents::mail::mailbox_key(cx::PANE, "").unwrap();
+    // adopt-3e (be8abf4): A's notice goes where gens/1/route.json recorded (its logical parent L's mailbox).
+    let route = gens::read(&a, 1, "route").known().unwrap().unwrap();
+    let key = route["mailbox"].as_str().unwrap().to_string();
     let text =
         std::fs::read_to_string(w.state().join("mail").join(format!("{key}.jsonl"))).unwrap();
     let want = gens::delivery_id(A, 1);
