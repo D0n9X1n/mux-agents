@@ -181,11 +181,25 @@ pub fn complete(tx: &Tx<'_>) -> Res<()> {
         if g.record().get("session").and_then(Value::as_str) != Some(tx.scope.session.as_str()) {
             continue;
         }
-        if let Some(c) = g.record().get("completing") {
-            let _ = complete_one(tx, &lazy, &id, c);
-        }
+        let _ = complete_member(tx, &lazy, &id, g.record());
     }
     Ok(())
+}
+
+/// R4 for the record read in member `id`'s folder (call 44): the record is bound to `id` by call 35's rule
+/// (`Guard::admits`) before any publication or hc effect; a record naming another member refuses with nothing done.
+pub fn complete_member(tx: &Tx<'_>, lazy: &Lazy<'_>, id: &str, record: &Value) -> Res<()> {
+    let Some(c) = record.get("completing") else {
+        return Ok(());
+    };
+    let n = c
+        .get("gen")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| Refusal::internal("invalid completing"))?;
+    if !(Guard::CompletingGen { n }).admits(id, Some(record)) {
+        return Err(Refusal::internal("the record names another member"));
+    }
+    complete_one(tx, lazy, id, c)
 }
 
 /// R4 for one member. `release`: `finish` first (b-calls 15: a recorded `release.json` is finished from step 3,
@@ -783,6 +797,47 @@ mod tests {
             2,
             "another generation's completing cleared"
         );
+    }
+
+    // Call 44: another member's record (B's, with its `completing`) in A's folder under this session: the hook binds
+    // the record it read to A's id before any publication or hc effect, so A gets no evidence, hc no call, and the
+    // record stands as it was.
+    #[test]
+    fn a_record_naming_another_member_completes_nothing() {
+        for intent in ["ended", "release"] {
+            let (w, s) = lf::world();
+            let c = if intent == "ended" {
+                ended_intent(&w)
+            } else {
+                release_intent()
+            };
+            let m = completing(&w, c);
+            let mut r = lf::record(&m);
+            r["id"] = json!("bbbbbbbbbbbb");
+            crate::state::fs::write_json(&m.join("record.json"), &r).unwrap();
+            if intent == "release" {
+                cf::online(&w);
+                lf::get(&w, "t1", &lf::lost(&w, 1, lf::LOST_ARGVS[0]));
+                lf::relabel(&w, "t1");
+            }
+            w.fakes.clear_log();
+            let got = open(&w.ctx, &s, |tx| {
+                complete_member(tx, &Lazy::new(tx.ctx), ID, &r)
+            });
+            assert_eq!(
+                got.map_err(|e| (e.check, e.message)),
+                Err((
+                    "internal",
+                    "unexpected error (the record names another member)".to_string()
+                )),
+                "{intent}: reported"
+            );
+            for file in ["ended", "release", "released"] {
+                assert!(!gens::path(&m, 1, file).exists(), "{intent}: {file}.json");
+            }
+            assert!(lf::calls(&w).is_empty(), "{intent}: {:?}", lf::calls(&w));
+            assert_eq!(lf::record(&m), r, "{intent}: the record stands");
+        }
     }
 
     // R4 (build checklist 10): an `ended` completion publishes exactly the facts it recorded, no other body.
