@@ -2121,4 +2121,47 @@ mod tests {
             );
         }
     }
+
+    /// Overwrites generation n's launch.json `hcName` (None: removes it), as a torn or partly written launch leaves it.
+    fn launch_name(m: &std::path::Path, n: u64, name: Option<&str>) {
+        let mut launch = gens::read(m, n, "launch").known().unwrap().unwrap();
+        match name {
+            Some(v) => launch["hcName"] = json!(v),
+            None => {
+                launch.as_object_mut().unwrap().remove("hcName");
+            }
+        }
+        std::fs::write(gens::path(m, n, "launch"), launch.to_string()).unwrap();
+    }
+
+    // a3c call 47 (TL #149, production readiness): an empty, missing or malformed recorded hcName never matches a
+    // terminal carrying the same name. `terminate` refuses `evidence`: no kill.json, no kill, no ended.json, pending kept.
+    #[test]
+    fn an_invalid_recorded_name_is_never_killed() {
+        for (case, recorded, shown) in [
+            ("empty", Some(""), ""),
+            ("missing", None, ""),
+            ("malformed", Some("../x"), "../x"),
+        ] {
+            let (w, s) = lf::world();
+            let m = committed_of(&w, "spawn");
+            launch_name(&m, 1, recorded);
+            let mut wire = lf::running(&w, 1);
+            wire["name"] = json!(shown);
+            cf::online(&w);
+            lf::found(&w, 1, &wire);
+            lf::get(&w, "t1", &wire);
+            kill(&w, "t1");
+            let got = terminate(&tx(&w, &s), ID, 1);
+            assert_eq!(got.map_err(|e| e.check), Err("evidence"), "{case}");
+            assert_eq!(lf::count(&w, "kill"), 0, "{case}: killed");
+            for f in ["terminating", "kill", "ended"] {
+                assert_eq!(gens::read(&m, 1, f), Evidence::Absent, "{case}: {f}.json");
+            }
+            assert!(
+                lf::record(&m).get("pending").is_some(),
+                "{case}: pending dropped"
+            );
+        }
+    }
 }

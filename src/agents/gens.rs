@@ -683,8 +683,14 @@ pub enum Found {
 }
 
 /// Ambiguity 1: the terminals labelled `mux.id=<id>, mux.gen=<n>` whose name is the recorded `hcName`; exactly
-/// one is `One`. None is `Missing` (call 60); several, or any hc failure, is Unknown.
+/// one is `One`. None is `Missing` (call 60); several, or any hc failure, is Unknown. a3c call 47: an empty or
+/// malformed recorded `hcName` is Unknown `evidence` before any hc call, never `Missing`; a terminal name matches
+/// only through `ident::same`.
 pub fn find(core: &Core<'_>, id: &str, n: u64, hc_name: &str) -> Found {
+    use super::ident;
+    if !ident::hc_name(hc_name) {
+        return Found::Unknown(ident::refused("hcName"));
+    }
     let g = n.to_string();
     let Ok(listed) = core.ls(&[("mux.id", id), ("mux.gen", &g)]) else {
         return Found::Unknown(unclear("hc cannot list the generation's terminals"));
@@ -695,8 +701,8 @@ pub fn find(core: &Core<'_>, id: &str, n: u64, hc_name: &str) -> Found {
             return Found::Unknown(unclear("hc cannot show a terminal of the generation"));
         };
         let label = |k: &str| t.labels.get(k).map(String::as_str);
-        if t.name.as_deref() == Some(hc_name)
-            && label("mux.id") == Some(id)
+        if ident::same(ident::hc_name, t.name.as_deref(), Some(hc_name))
+            && ident::same(ident::member_id, label("mux.id"), Some(id))
             && label("mux.gen") == Some(&g)
         {
             hits.push(t);
