@@ -989,3 +989,154 @@ fn a_link_at_an_evidence_name_refuses_and_is_never_followed() {
         }
     }
 }
+
+fn rec(n: &str) -> serde_json::Value {
+    json!({"lifecycle": 1, "id": ID, "generation": n})
+}
+
+// Spec "newest wins": generation 1 ok, generation 2 promoted and then failed: the member needs recovery (the active
+// generation decides; 1's success does not mask it). `running` follows the caller's `active_done` (R1, R3).
+#[test]
+fn newest_wins_needs_recovery() {
+    let g = of::world();
+    g.ran(1);
+    g.report(1, 150);
+    g.client(1);
+    g.now(20);
+    assert_eq!(g.judge(1, None), decided(Verdict::Ok));
+    g.launched(2);
+    g.ran(2);
+    g.put(2, "exit", exit_body("exited"));
+    g.now(30);
+    let failed = |running| {
+        Ok(Some(Recovery {
+            generation: 2,
+            reason: EXITED.into(),
+            running,
+        }))
+    };
+    assert_eq!(
+        needs_recovery(&g.w.ctx, &g.key, ID, &rec("2"), Some(false), None),
+        failed(true)
+    );
+    assert_eq!(
+        needs_recovery(&g.w.ctx, &g.key, ID, &rec("2"), Some(true), None),
+        failed(false)
+    );
+    assert_eq!(
+        needs_recovery(&g.w.ctx, &g.key, ID, &rec("1"), Some(true), None),
+        Ok(None),
+        "an ok generation"
+    );
+}
+
+// O6: a pre-lifecycle record, or a lifecycle record with no active generation: None, no lock taken, nothing read.
+#[test]
+fn needs_recovery_reads_nothing_without_an_active_lifecycle_generation() {
+    let g = of::world();
+    g.ran(1);
+    g.put(1, "exit", exit_body("exited"));
+    g.w.fakes.clear_log();
+    let pending = json!({"lifecycle": 1, "id": ID, "pending": {"gen": 1}});
+    for record in [json!({"id": ID, "generation": "1"}), pending] {
+        let (got, reads) = crate::state::fs::record_reads(|| {
+            needs_recovery(&g.w.ctx, &g.key, ID, &record, None, None)
+        });
+        assert_eq!((got, reads), (Ok(None), Vec::new()), "{record}");
+    }
+    assert!(g.w.fakes.locks().is_empty());
+}
+
+// Ambiguity 13: the board's try-lock finds the gen lock busy: the last outcome.json, read once, decides; absent or ok
+// is no recovery; torn refuses `evidence` (R2, never "no recovery"). Nothing is adjudicated while busy.
+#[test]
+fn a_busy_lock_shows_the_last_outcome() {
+    for (case, body) in [
+        ("none", None),
+        ("ok", Some(json!({"outcome": "ok", "at": "x"}))),
+        (
+            "failed",
+            Some(json!({"outcome": "failed", "reason": NO_REPORT, "at": "x"})),
+        ),
+        ("torn", None),
+    ] {
+        let g = of::world();
+        g.ran(1);
+        g.put(1, "exit", exit_body("exited"));
+        if let Some(b) = body {
+            g.put(1, "outcome", b);
+        }
+        if case == "torn" {
+            std::fs::write(gens::path(&g.folder, 1, "outcome"), b"{\"out").unwrap();
+        }
+        g.w.fakes.lock_timeout("gen|");
+        g.now(30);
+        let at = gens::path(&g.folder, 1, "outcome");
+        let before = std::fs::read(&at).ok();
+        let (got, reads) = crate::state::fs::record_reads(|| {
+            needs_recovery(&g.w.ctx, &g.key, ID, &rec("1"), Some(true), None).map_err(|e| e.check)
+        });
+        let want = match case {
+            "failed" => Ok(Some(Recovery {
+                generation: 1,
+                reason: NO_REPORT.into(),
+                running: false,
+            })),
+            "torn" => Err("evidence"),
+            _ => Ok(None),
+        };
+        assert_eq!(got, want, "{case}");
+        // Finding 5to8-15: outcome.json opened exactly once when present (never when absent), and unchanged.
+        let opened = reads.iter().filter(|p| **p == at).count();
+        assert_eq!(
+            opened,
+            usize::from(case != "none"),
+            "{case}: outcome.json reads {reads:?}"
+        );
+        assert_eq!(
+            std::fs::read(&at).ok(),
+            before,
+            "{case}: outcome.json unchanged"
+        );
+        assert_eq!(
+            g.file(1, "failure"),
+            None,
+            "{case}: nothing adjudicated while busy"
+        );
+    }
+}
+
+// O6, finding 5to8-16: only `failed` needs recovery. An active `void` generation (claim abandoned) is adjudicated
+// void and needs none; an active undecided one (committed run, no leg fires yet) needs none and writes nothing.
+#[test]
+fn an_active_void_or_undecided_generation_needs_no_recovery() {
+    let g = of::world();
+    g.claim(1, json!("abandoned"));
+    g.now(30);
+    assert_eq!(
+        needs_recovery(&g.w.ctx, &g.key, ID, &rec("1"), Some(true), None),
+        Ok(None),
+        "void"
+    );
+    let outcome = g
+        .file(1, "outcome")
+        .map(|o| (o["outcome"].clone(), o["reason"].clone()));
+    assert_eq!(
+        outcome,
+        Some((json!("void"), json!(ABANDONED))),
+        "adjudicated void, not skipped"
+    );
+    let g = of::world();
+    g.ran(1);
+    g.now(30);
+    assert_eq!(
+        needs_recovery(&g.w.ctx, &g.key, ID, &rec("1"), Some(false), None),
+        Ok(None),
+        "undecided"
+    );
+    assert_eq!(
+        (g.file(1, "failure"), g.file(1, "outcome")),
+        (None, None),
+        "undecided writes nothing"
+    );
+}

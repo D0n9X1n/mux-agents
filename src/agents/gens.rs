@@ -7,7 +7,7 @@ use crate::error::{Refusal, Res};
 use crate::hc::{Core, Reason, State, Terminal};
 use crate::state::evidence::{self, Evidence, Published};
 
-pub use super::outcome::{Adjudged, Verdict, Wait, adjudicate};
+pub use super::outcome::{Adjudged, Recovery, Verdict, Wait, adjudicate, needs_recovery};
 
 /// Every create-once file of a generation (S5); the claim lives beside the folder.
 pub const FILES: [&str; 16] = [

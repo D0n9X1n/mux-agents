@@ -1962,6 +1962,78 @@ mod tests {
         }
     }
 
+    // outcome-2 O5 (#103; finding 5to8-14): a restore whose conversation is gone, through the launcher entry. The
+    // stand-in client knows only conversation `s1`: `--resume` of any other prints the verified claude rejection
+    // (`No conversation found with session ID: <uuid>`) on its stderr and exits 1 before readiness. The launcher records
+    // exit.json; the generation is failed and needs recovery; no task is resent (no prompt in the spec, no hc call).
+    #[test]
+    fn a_resume_of_a_gone_conversation_fails_and_needs_recovery() {
+        use crate::agents::outcome::{EXITED, Recovery};
+        const GONE: &str = "7d1c0e5a-9b1f-4d0e-8f7a-3c2b1a0e9d8c";
+        let (l, spec) = gen_setup(1);
+        edit(&spec, |s| {
+            s["args"] = json!(["--resume", GONE]);
+            s.as_object_mut().unwrap().remove("prompt");
+        });
+        commit(&l, 1, json!({"committed": true}));
+        l.w.fakes
+            .process(crate::testing::row(4300, l.w.ctx.pid, 1600));
+        let (mut argv, mut said): (Vec<String>, Option<String>) = (Vec::new(), None);
+        let code = run(
+            &l.w.ctx,
+            spec.to_str().unwrap(),
+            &mut |_| {},
+            &mut |_: &Path, args: &[String], _: &[&str], told: &mut dyn FnMut(u32)| {
+                argv = args.to_vec();
+                told(4300);
+                let asked = args
+                    .iter()
+                    .position(|a| a == "--resume")
+                    .and_then(|i| args.get(i + 1));
+                match asked {
+                    Some(id) if id != "s1" => {
+                        said = Some(format!("No conversation found with session ID: {id}"));
+                        Ok(1)
+                    }
+                    _ => Ok(0),
+                }
+            },
+        );
+        assert_eq!(code, 1);
+        let rejected = format!("No conversation found with session ID: {GONE}");
+        assert_eq!(
+            said.as_deref(),
+            Some(rejected.as_str()),
+            "the verified rejection of the unknown conversation"
+        );
+        assert_eq!(
+            argv[argv.len() - 2..],
+            ["--resume".to_string(), GONE.to_string()],
+            "{argv:?}"
+        );
+        let exit = gen_file(&l, "exit");
+        assert_eq!(
+            (&exit["exitCode"], &exit["reason"]),
+            (&json!(1), &json!("exited"))
+        );
+        // Promoted, as forward does after the commit: generation 1 is active.
+        let record = json!({"lifecycle": 1, "id": ID, "generation": "1"});
+        let key = l.w.caller().server_key;
+        let got =
+            crate::agents::gens::needs_recovery(&l.w.ctx, &key, ID, &record, Some(false), None);
+        assert_eq!(
+            got,
+            Ok(Some(Recovery {
+                generation: 1,
+                reason: EXITED.into(),
+                running: true
+            }))
+        );
+        assert_eq!(gen_file(&l, "outcome")["outcome"], "failed");
+        assert_eq!(gens::read(&l.folder, 1, "ready"), Evidence::Absent);
+        assert!(l.w.fakes.hc_calls().is_empty(), "no task resent");
+    }
+
     #[test]
     fn a_gens_spec_claims_its_generation_and_names_it_to_the_client() {
         let (l, spec) = gen_setup(1);

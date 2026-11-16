@@ -244,6 +244,54 @@ fn lost(member: &Path, n: u64, t: &Terminal) -> Res<bool> {
         && super::lifecycle::classify(Some(t), &argv) == super::lifecycle::Life::Lost)
 }
 
+/// O6: why a member needs recovery: its active generation's outcome is `failed`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Recovery {
+    pub generation: u64,
+    pub reason: String,
+    /// The failed generation is not done yet (S6): the bar says `recover (still running)`.
+    pub running: bool,
+}
+
+/// O6, the one predicate reconcile, the board, `list` and person verbs share. `record` and `active_done` are the
+/// caller's one read (R1: `Status.active_done`); `seen` is the active generation's terminal as the caller observed it.
+/// One try-lock adjudication; a busy lock shows the last `outcome.json` (O4). Pre-lifecycle or no active generation:
+/// None, nothing read.
+pub fn needs_recovery(
+    ctx: &Ctx,
+    key: &str,
+    id: &str,
+    record: &Value,
+    active_done: Option<bool>,
+    seen: Option<&Terminal>,
+) -> Res<Option<Recovery>> {
+    if !gens::lifecycle(record) {
+        return Ok(None);
+    }
+    let Some(n) = gens::active(record) else {
+        return Ok(None);
+    };
+    let verdict = match adjudicate(ctx, key, id, n, Wait::Try, seen)? {
+        Adjudged::Decided(v) => Some(v),
+        Adjudged::Undecided => None,
+        Adjudged::Busy => {
+            let member = ctx.state_root.join(key).join("agents").join(id);
+            gens::read(&member, n, "outcome")
+                .known()?
+                .map(|b| Verdict::parse(&b))
+                .transpose()?
+        }
+    };
+    Ok(match verdict {
+        Some(Verdict::Failed(reason)) => Some(Recovery {
+            generation: n,
+            reason,
+            running: active_done == Some(false),
+        }),
+        _ => None,
+    })
+}
+
 #[cfg(test)]
 #[path = "outcome_tests.rs"]
 mod tests;
