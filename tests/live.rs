@@ -4265,7 +4265,8 @@ hc {}:
                 .as_array()
                 .into_iter()
                 .flatten()
-                .any(|r| r["id"] == json!(id) && r["life"] == "lost")
+                // Call 52: an ordinary list row has no `id`; the member's row is the one at its recorded address.
+                .any(|r| r["hcAddress"] == json!(address) && r["life"] == "lost")
         });
         assert!(
             lost,
