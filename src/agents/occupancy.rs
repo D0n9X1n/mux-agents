@@ -4,6 +4,8 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use crate::agents::gens::{self, Member};
+use crate::agents::tree::Standing;
+use crate::caller::Caller;
 use crate::ctx::Ctx;
 use crate::error::Res;
 use crate::parse::Client;
@@ -114,6 +116,28 @@ pub struct Own {
     pub start: i64,
 }
 
+/// Call 7: from the proof only. A member standing (an hc member, or a candidate re-proven under the lock) gives its
+/// `tree::Member` client (pid, start); with no standing, a pane caller's proven agent; anything else nothing.
+/// `caller.chain` is never read.
+pub fn own_of(caller: &Caller, standing: Option<&Standing>) -> Option<Own> {
+    match standing {
+        Some(Standing::Member(m)) => Some(Own {
+            kind: m.client,
+            pid: m.pid,
+            start: m.start,
+        }),
+        Some(Standing::Person) => None,
+        None => {
+            let agent = caller.agent.as_ref()?;
+            Some(Own {
+                kind: caller.client?,
+                pid: agent.pid,
+                start: agent.start,
+            })
+        }
+    }
+}
+
 pub fn held(ctx: &Ctx, session: &str, kind: Client, own: Option<&Own>) -> Option<Hold> {
     held_on(ctx, session, kind, HOST, own)
 }
@@ -125,7 +149,7 @@ pub fn held_on(
     session: &str,
     kind: Client,
     os: OsKind,
-    _own: Option<&Own>,
+    own: Option<&Own>,
 ) -> Option<Hold> {
     if let Some(hold) = proc_hold(ctx) {
         return Some(hold); // calls 10, 20
@@ -138,6 +162,20 @@ pub fn held_on(
         Err(hold) => return Some(hold), // R2: names the unreadable member
     };
     let wanted = session.to_ascii_lowercase();
+    let exempted = own.and_then(|o| exempt(ctx, o, &rows, os));
+    // A managed caller is judged per row (H4.2); an unmanaged one by its own newest report, read once here (call 17).
+    let unmanaged = exempted
+        .as_ref()
+        .filter(|e| managed_of(ctx, &c, &e.proven, &rows, os).is_none());
+    if let (Some(o), Some(e)) = (own, unmanaged) {
+        let rule = match e.key {
+            None => Some(Rule::Evidence),
+            Some(key) => own_report(ctx, o.kind, key, &wanted),
+        };
+        if let Some(rule) = rule {
+            return Some(Hold::of(rule, &e.proven));
+        }
+    }
     for row in &rows {
         if let Some(m) = managed_of(ctx, &c, row, &rows, os) {
             let rule = match m.session.as_deref() {
@@ -149,6 +187,17 @@ pub fn held_on(
                 member: Some(m.id.clone()),
                 ..Hold::of(rule, row)
             });
+        }
+        if exempted.as_ref().is_some_and(|e| e.covers(ctx, row)) {
+            // Calls 1, 7: exempt from H4.4 and H4.5; still held by its argv (H4.3). Its report was read above.
+            if row
+                .argv
+                .as_deref()
+                .is_some_and(|argv| occupies(argv, session))
+            {
+                return Some(Hold::of(Rule::Argv, row));
+            }
+            continue;
         }
         if let Some(hold) = holds(ctx.os.as_ref(), row, session, kind, os) {
             return Some(hold); // H4.3-5
@@ -348,6 +397,83 @@ fn managed_of<'a>(
             .filter(|l| l.pid != row.pid)?;
         own(&loader)
     })
+}
+
+/// The one exemption match (call 7): this pid, listed with a start the OS calls the same.
+fn same(ctx: &Ctx, row: &Row, pid: u32, start: i64) -> bool {
+    row.pid == pid && row.start.is_some_and(|s| ctx.os.same_start(s, start))
+}
+
+/// The exempt rows, each (pid, start); the (pid, start) keying the caller's own entry, `None` when a proven Unix native
+/// `copilot`'s loader cannot be resolved from this table read (call 17: its report cannot be read, so `Evidence`);
+/// and the proven row, which every caller hold names (call 2).
+struct Exempt {
+    rows: Vec<(u32, i64)>,
+    key: Option<(u32, i64)>,
+    proven: Row,
+}
+
+impl Exempt {
+    fn covers(&self, ctx: &Ctx, row: &Row) -> bool {
+        self.rows
+            .iter()
+            .any(|&(pid, start)| same(ctx, row, pid, start))
+    }
+}
+
+/// The proven row, plus its Copilot partner by report-2b's rule (`ancestry::pair_parent`, call 8), every parent taken
+/// from this table read only (call 17, never a fresh `Os::row`): its loader (a parent no newer than it), or a native
+/// child whose loader it is (reverse pairing, call 19). The loader keys the entry. Not listed: nothing exempt.
+fn exempt(ctx: &Ctx, own: &Own, rows: &[Row], os: OsKind) -> Option<Exempt> {
+    let proven = rows
+        .iter()
+        .find(|r| same(ctx, r, own.pid, own.start))?
+        .clone();
+    let start = proven.start?;
+    let parent = |r: &Row| rows.iter().find(|p| p.pid == r.ppid && r.ppid != 0);
+    let paired =
+        |r: &Row| parent(r).and_then(|p| crate::agents::ancestry::pair_parent(ctx, p, r, os));
+    let native = own.kind == Client::Copilot
+        && os == OsKind::Unix
+        && proven.path.as_deref().and_then(|p| p.rsplit('/').next()) == Some("copilot");
+    let mut e = Exempt {
+        rows: vec![(proven.pid, start)],
+        key: Some((proven.pid, start)),
+        proven: proven.clone(),
+    };
+    match paired(&proven).map(|l| (l.pid, l.start)) {
+        Some((pid, Some(s))) if pid != proven.pid => {
+            e.rows.push((pid, s));
+            e.key = Some((pid, s));
+        }
+        Some((pid, None)) if pid != proven.pid => e.key = None,
+        Some(_) => {} // a parent named otherwise: the native is its own identity
+        None if native => e.key = None, // call 17: missing, startless or unrecognized saved parent
+        None => {}
+    }
+    for r in rows.iter().filter(|r| r.ppid == proven.pid) {
+        let joins = paired(r).is_some_and(|l| l.pid != r.pid && same(ctx, &l, proven.pid, start));
+        if let (true, Some(s)) = (joins, r.start) {
+            e.rows.push((r.pid, s));
+        }
+    }
+    Some(e)
+}
+
+/// The caller's own newest entry: `Caller` when it names `wanted`; `Evidence` when it cannot be read or names no valid
+/// conversation (R2); none when absent or naming another.
+fn own_report(ctx: &Ctx, kind: Client, key: (u32, i64), wanted: &str) -> Option<Rule> {
+    match live::entry(ctx, kind, key.0, key.1) {
+        Err(_) => Some(Rule::Evidence),
+        Ok(None) => None,
+        Ok(Some(entry)) => {
+            let id = crate::agents::text(entry.get("sessionId"));
+            if !crate::checks::session_id(&id) {
+                return Some(Rule::Evidence);
+            }
+            id.eq_ignore_ascii_case(wanted).then_some(Rule::Caller)
+        }
+    }
 }
 
 /// One unmanaged row: H4.3 argv, H4.4 a client of `kind`, H4.5 unbound unless its image names no client of `kind`.
