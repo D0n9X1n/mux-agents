@@ -681,11 +681,15 @@ fn a_natural_exit_records_its_end_then_posts_its_notice() {
                         "gens/1/launch.json",
                         "gens/1/commit.json",
                         "record.json",
+                        // adopt-3e call 17: the notice route's one `Tree::read` of this record.
+                        "record.json",
                     ],
                     "forgotten" => &[
                         "record.json",
                         "gens/1/ended.json",
                         "gens/1/commit.json",
+                        "record.json",
+                        // adopt-3e call 17: the notice route's one `Tree::read` of this record.
                         "record.json",
                     ],
                     _ => &[
@@ -693,6 +697,8 @@ fn a_natural_exit_records_its_end_then_posts_its_notice() {
                         "gens/1/launch.json",
                         "gens/1/ended.json",
                         "gens/1/commit.json",
+                        "record.json",
+                        // adopt-3e call 17: the notice route's one `Tree::read` of this record.
                         "record.json",
                     ],
                 };

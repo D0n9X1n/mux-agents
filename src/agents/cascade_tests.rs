@@ -1174,7 +1174,8 @@ fn a_notice_marker_never_outlives_its_message() {
     cx::member(&w, L, None, 0, json!({}));
     let a = cx::member(&w, A, Some(L), 1, json!({}));
     cx::terminates(&w, A);
-    let key = crate::agents::mail::mailbox_key(cx::PANE, "").unwrap();
+    // adopt-3e: A's notice goes to its logical parent L's member mailbox.
+    let key = crate::agents::mail::member_mailbox(L, &lf::record(&w.folder(L)));
     let mailbox = w.state().join("mail").join(format!("{key}.jsonl"));
     let (tx, c) = (cx::tx(&w, &s), w.caller());
     crate::state::fs::fail_sync_file(Some(&mailbox));
