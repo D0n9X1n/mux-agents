@@ -32,6 +32,7 @@ pub mod membership;
 pub mod message;
 pub mod options;
 pub mod placement;
+pub(crate) mod prelife;
 pub mod receipt;
 pub mod registry;
 pub mod release;
