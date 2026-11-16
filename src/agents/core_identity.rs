@@ -48,15 +48,16 @@ pub fn attach_program(command: &str, address: &str, os: OsKind) -> Option<String
         return None;
     }
     let quotes: &[char] = if unix { &['"', '\''] } else { &['"'] };
-    // #150: rmux renders the whole argv in one pair of double quotes. Its inside, holding no quote, is read as the
-    // bare form; anything else falls through to the forms below, which refuse it.
+    // #150: rmux renders the whole argv in one pair of double quotes, `\` as `\\` and `"` as `\"` inside. Its inside,
+    // unescaped and holding no quote, is read as the bare form; any other backslash, or anything else, falls through
+    // to the forms below, which refuse it.
     if let Some(inner) = command
         .strip_prefix('"')
         .and_then(|c| c.strip_suffix('"'))
-        .filter(|i| !i.contains(quotes))
-        && !inner.is_empty()
+        .and_then(rmux_unquoted)
+        .filter(|i| !i.is_empty() && !i.contains(quotes))
     {
-        return attach_program(inner, address, os);
+        return attach_program(&inner, address, os);
     }
     let first = command.chars().next()?;
     let (program, tail) = if quotes.contains(&first) {
@@ -90,6 +91,24 @@ pub fn attach_program(command: &str, address: &str, os: OsKind) -> Option<String
     crate::hc::INSTALL_NAMES
         .contains(&file.as_str())
         .then(|| program.to_string())
+}
+
+/// The inside of rmux's quoted start command with its two escapes undone (`\\` is `\`, `\"` is `"`); any other
+/// backslash is not rmux's form: none.
+fn rmux_unquoted(inner: &str) -> Option<String> {
+    let mut out = String::with_capacity(inner.len());
+    let mut chars = inner.chars();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            match chars.next()? {
+                e @ ('\\' | '"') => out.push(e),
+                _ => return None,
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    Some(out)
 }
 
 /// V2: what a holder of the member lock found: the view's pane, whether it was adopted (no valid descriptor), and
@@ -403,9 +422,10 @@ pub(crate) mod tests {
     // program from `[A-Za-z0-9_./:+-]` (and `\` on Windows) not starting with `-`; a quoted one (platform quotes) adds
     // the space; the address one unquoted token from `[A-Za-z0-9_.:-]`, then the end. The program's file name is an hc
     // install name (`hc`, `herdr-core`), any path. Everything else is "not an attach".
-    // #150 live (rmux): rmux 0.10.0 renders `#{pane_start_command}` as the whole argv in one pair of double quotes
-    // (`"/x/herdr-core attach t1"`), where tmux renders the argv bare. That one quoted token is an attach exactly when
-    // its inside, with no quote of its own, is the bare form. A space-holding program inside it is not (fail closed).
+    // #150 live (rmux): rmux 0.10.0 renders `#{pane_start_command}` as the whole argv in one pair of double quotes,
+    // `\` written `\\` and `"` written `\"` inside (rmux-server lifecycle_state.rs `quote_single_shell_command`), where
+    // tmux renders the argv bare. That one quoted token is an attach exactly when its inside, unescaped, holds no quote
+    // and is the bare form. Any other backslash is not rmux's form; a space-holding program is not one (fail closed).
     #[test]
     fn attach_program_reads_a_wholly_quoted_attach() {
         use crate::state::root::OsKind::{Unix, Windows};
@@ -415,9 +435,12 @@ pub(crate) mod tests {
             (Unix, r#""hc attach t1""#, some("hc")),
             (
                 Windows,
-                r#""C:\hc\herdr-core.exe attach t1""#,
+                r#""C:\\hc\\herdr-core.exe attach t1""#,
                 some(r"C:\hc\herdr-core.exe"),
             ),
+            (Windows, r#""C:\hc\herdr-core.exe attach t1""#, None),
+            (Windows, r#""C:\\hc\\herdr-core.exe attach t1\""#, None),
+            (Windows, r#""C:\\hc\"x\\hc.exe attach t1""#, None),
             (Unix, r#""/opt/my hc/hc attach t1""#, None),
             (Unix, r#""hc attach t1" x"#, None),
             (Unix, r#""hc attach "t1""#, None),
