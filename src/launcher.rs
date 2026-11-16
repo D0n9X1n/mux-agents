@@ -572,7 +572,11 @@ fn run_gen(
     }
     crash_point("launcher");
     let stop = match wait_gen_commit(ctx, member, n, &mut *publish) {
-        GenCommit::Decided(Decision::Run) => None,
+        // Call 34: a Run decision acts only once the commit is durable; else it is an uncommitted launch.
+        GenCommit::Decided(Decision::Run) => match commit_durable(member, n) {
+            Ok(()) => None,
+            Err(_) => Some("commit not flushed"),
+        },
         GenCommit::Decided(Decision::Aborted) => Some("aborted"),
         GenCommit::Decided(Decision::Invalid) => Some("commit invalid"),
         GenCommit::GaveUp => Some("gave up"),
@@ -639,6 +643,21 @@ enum GenCommit {
     Unreadable,
     /// Absent at 30 s, the give-up publication failed, and the reread found no decision: nothing created.
     Unpublished,
+}
+
+/// Call 34: flushes the folders of generation n's commit exactly as `gens::publish_once` does, innermost first:
+/// `gens/<n>`, `gens`, the member folder, `agents`. A publisher that crashed or failed its flush after the commit
+/// became visible leaves it unflushed; no client runs on it until these flushes succeed.
+fn commit_durable(member: &Path, n: u64) -> io::Result<()> {
+    let generation = gens::dir(member, n);
+    let all = member.join("gens");
+    let agents = member
+        .parent()
+        .ok_or_else(|| io::Error::other("the member has no agents folder"))?;
+    for dir in [generation.as_path(), all.as_path(), member, agents] {
+        crate::state::fs::sync_dir(dir)?;
+    }
+    Ok(())
 }
 
 /// launch-1 G4, state-0 S6: polls `gens::read(commit)` (the walk of Task 1a step 0) every 250 ms. A whole commit

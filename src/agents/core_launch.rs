@@ -2865,4 +2865,61 @@ pub(crate) mod crash {
             let _ = std::fs::remove_dir_all(root.parent().unwrap());
         }
     }
+
+    // Call 34: the commit is visible and its `gens/0` flush failed (forward answers NOT_FLUSHED). With the fault
+    // still armed the launcher cannot make the commit durable: it starts no client and exits as an uncommitted
+    // launch. With the fault cleared before it runs, it starts the client once, and a second launcher starts none.
+    #[test]
+    fn a_commit_the_launcher_cannot_flush_starts_no_client() {
+        for armed in [true, false] {
+            let _reset = super::hooks::Reset;
+            let mut w = World::human("");
+            w.ctx.state_root = plain(&w.ctx.state_root);
+            w.state();
+            w.fakes.hc_install("hc");
+            let f = w.folder(ID);
+            let n0 = gens::dir(&f, 0);
+            super::hooks::after(Some(Box::new(move |s: &str| {
+                if s == "address" {
+                    crate::state::fs::fail_sync_dir(Some(&n0));
+                }
+            })));
+            replies(&w, address("t1"));
+            let e = go(&w, launch_of(&w, true, SESSION_ID), free, never).unwrap_err();
+            let got = (e.check, e.message.as_str());
+            assert_eq!(got, ("state", gens::NOT_FLUSHED), "{armed}: {e:?}");
+            assert_eq!(
+                decided_at(&f),
+                Some(gens::Decision::Run),
+                "{armed}: the commit is visible"
+            );
+            super::hooks::after(None);
+            if !armed {
+                crate::state::fs::fail_sync_dir(None);
+            }
+            with_client(&mut w);
+            if armed {
+                assert_eq!(
+                    launcher_once(&w, &f),
+                    (1, 0),
+                    "an unflushed commit starts no client"
+                );
+            } else {
+                let (first, synced) = crate::state::fs::record_syncs(|| launcher_once(&w, &f));
+                assert_eq!(first, (0, 1), "a flushed commit starts the client");
+                // The commit's folders, innermost first, as `publish_once` flushes them (call 34).
+                let parent = f.parent().unwrap().to_path_buf();
+                let want = [gens::dir(&f, 0), f.join("gens"), f.clone(), parent];
+                assert!(
+                    synced.windows(4).any(|x| x == want),
+                    "the launcher flushes the commit's folders: {synced:?}"
+                );
+                assert_eq!(
+                    launcher_once(&w, &f),
+                    (0, 0),
+                    "a second launcher starts nothing"
+                );
+            }
+        }
+    }
 }
