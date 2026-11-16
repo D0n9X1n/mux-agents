@@ -31,6 +31,9 @@
 //! - The command line `@sleep\t<ms>` runs no mux-agent: it sleeps `<ms>` and answers `{"slept": <ms>}`. A line
 //!   `@bg <line>` runs `<line>` on a thread beside the loop, answering in the files of its own n (#103).
 //! - Each line read on stdin (what `send` types into the pane) is appended to `input.<pid>.log`.
+//! - `conv.<sid>.json`: the argv of the first start with `--session-id <sid>` (create-once). A start with
+//!   `--resume <sid>` records it as `recalled` in `client.<pid>.json` (null when absent): a restored client proves it
+//!   has the same conversation (#103 6b).
 //! - Quit: `quit` (all clients) or `quit.<pid>` appearing makes the client write `exited.<pid>` (its exit code) and
 //!   exit with numeric `quit.<pid>` contents overriding `MUX_IT_EXIT`; empty, invalid or missing contents keep it.
 
@@ -108,6 +111,23 @@ fn main() {
         .and_then(|c| c.trim().parse().ok())
         .unwrap_or(0);
 
+    let resumed = argv
+        .iter()
+        .position(|a| a == "--resume")
+        .and_then(|i| argv.get(i + 1))
+        .cloned();
+    // 6b: the first start of a conversation keeps its argv; a resume recalls it.
+    if let Some(s) = &sid {
+        let conv = dir.join(format!("conv.{s}.json"));
+        if !conv.exists() {
+            write_whole(&conv, json!(argv).to_string());
+        }
+    }
+    let recalled = resumed
+        .as_ref()
+        .and_then(|s| std::fs::read_to_string(dir.join(format!("conv.{s}.json"))).ok())
+        .and_then(|t| serde_json::from_str::<Value>(&t).ok())
+        .unwrap_or(Value::Null);
     let record = json!({
         "pid": pid,
         "ppid": ppid(),
@@ -115,6 +135,7 @@ fn main() {
         "argv": argv,
         "sessionId": sid,
         "worker": sid.is_some(),
+        "recalled": recalled,
         "cwd": std::env::current_dir().ok().map(|d| d.display().to_string()),
         "tty": {"stdin": std::io::stdin().is_terminal(), "stdout": std::io::stdout().is_terminal()},
         "env": ENV.iter().map(|n| (n.to_string(), std::env::var(n).map_or(Value::Null, Value::from))).collect::<Map<_, _>>(),
@@ -123,11 +144,6 @@ fn main() {
     append(&dir.join("clients.log"), &format!("{pid}\n"));
 
     // report-2b K3: a client's session-start hook. On a thread: the verb waits up to 10 s for client.json.
-    let resumed = argv
-        .iter()
-        .position(|a| a == "--resume")
-        .and_then(|i| argv.get(i + 1))
-        .cloned();
     if let Some(sid) = sid.clone().or(resumed) {
         let (entry, dir) = (entry.clone(), dir.clone());
         std::thread::spawn(move || {

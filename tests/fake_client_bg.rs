@@ -2,6 +2,9 @@
 //! The fake client runs a background line beside its loop (live harness support, #103).
 use std::time::{Duration, Instant};
 
+#[path = "support/bounded.rs"]
+mod bounded;
+
 fn wait_for(p: &std::path::Path) {
     let end = Instant::now() + Duration::from_secs(20);
     while !p.exists() {
@@ -112,4 +115,45 @@ fn start(exe: &std::path::Path, dir: &std::path::Path, id: &str) -> std::process
         }
     }
     panic!("{} stayed busy", exe.display());
+}
+
+/// The fake client keeps its first argv per session; a resume start recalls it (6b ambiguity 15).
+#[test]
+fn a_resumed_client_recalls_its_first_conversation() {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let dir = std::env::temp_dir().join(format!("fake-conv-{}-{nanos}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("quit"), "").unwrap(); // leave at once
+    let sid = "3e33fc2f-2032-48ef-a920-4af2a8e5af53";
+    let start = |args: &[&str]| -> serde_json::Value {
+        let mut c = std::process::Command::new(env!("CARGO_BIN_EXE_fake-client"));
+        // The startup report runs no real mux-agent: its entry does not exist.
+        c.args(args)
+            .env("MUX_IT_DIR", &dir)
+            .env("MUX_IT_ENTRY", dir.join("no-entry"));
+        let out = bounded::output(&mut c, bounded::LIMIT).unwrap();
+        assert!(out.status.success(), "{out:?}");
+        let log = std::fs::read_to_string(dir.join("clients.log")).unwrap();
+        let pid = log.lines().last().unwrap().trim().to_string();
+        let record = std::fs::read_to_string(dir.join(format!("client.{pid}.json"))).unwrap();
+        serde_json::from_str(&record).unwrap()
+    };
+    let first = start(&["--session-id", sid, "say MARKER-7"]);
+    start(&["--session-id", sid, "say OTHER"]); // a second first-start never replaces the stored conversation
+    let again = start(&["--resume", sid]);
+    let unknown = start(&["--resume", "4e44fc2f-2032-48ef-a920-4af2a8e5af54"]);
+    let _ = std::fs::remove_dir_all(&dir);
+    assert_eq!(first["recalled"], serde_json::Value::Null);
+    assert_eq!(
+        again["recalled"],
+        serde_json::json!(["--session-id", sid, "say MARKER-7"])
+    );
+    assert_eq!(
+        unknown["recalled"],
+        serde_json::Value::Null,
+        "an unknown conversation recalls nothing"
+    );
 }
