@@ -149,11 +149,13 @@ fn without_mc(text: &str) -> Option<String> {
 }
 
 /// Whether `c` may appear in workspace.yaml other than as the `\n` line end: YAML 1.2 c-printable without tab, `\r`,
-/// NEL or the byte-order mark (call 17). An allow-list, so every control and non-character refuses.
+/// NEL or the byte-order mark (call 17), and without U+2028 and U+2029, which YAML 1.1 reads as line breaks
+/// (call 17a). An allow-list, so every control and non-character refuses.
 fn printable(c: char) -> bool {
     matches!(c,
         '\u{20}'..='\u{7e}'
-        | '\u{a0}'..='\u{d7ff}'
+        | '\u{a0}'..='\u{2027}'
+        | '\u{202a}'..='\u{d7ff}'
         | '\u{e000}'..='\u{fefe}'
         | '\u{ff00}'..='\u{fffd}'
         | '\u{10000}'..='\u{10ffff}')
@@ -590,6 +592,13 @@ mod tests {
     #[test]
     fn copilot_copy_refuses_nel_in_a_value() {
         assert!(refused("cwd: /work\nsummary: a\u{85}b\n"));
+    }
+
+    #[test]
+    fn copilot_copy_refuses_u_2028_and_u_2029_in_a_value() {
+        // YAML 1.1 reads both as line breaks (call 17a).
+        assert!(refused("cwd: /work\nsummary: a\u{2028}b\n"));
+        assert!(refused("cwd: /work\nsummary: a\u{2029}b\n"));
     }
 
     #[test]
