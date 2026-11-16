@@ -1,6 +1,8 @@
 //! `report -Session` (#103 report-2b K3, K3a, K4): a client's own hook names its conversation. It writes that
 //! client's registry entry and, from a generation's terminal, runs the readiness handshake. It proves no member and
 //! grants nothing; it writes only the K2 entry, `report.json` and, through `gens::promote_ready`, `ready.json`.
+use std::time::Duration;
+
 use serde_json::{Map, Value, json};
 
 use super::ancestry::{self, Above};
@@ -175,16 +177,95 @@ pub(crate) fn labels(ctx: &Ctx) -> Labels {
     }
 }
 
-/// K4; Task 5 replaces this body.
+/// K4.2: `gens::client` is checked before each sleep; at most `POLLS` sleeps of `POLL` (10 s); no lock held.
+const POLLS: usize = 50;
+const POLL: Duration = Duration::from_millis(200);
+
+enum Step {
+    /// Nothing past the registry: `stale`, `session` or `closed`.
+    Stop(&'static str),
+    /// `report.json` exists (this call's or an earlier one's).
+    Reported,
+}
+
+/// K4: the reply's `handshake` and `ready`. A refusal (`evidence`, `lock`) is named by its check, and nothing more is
+/// written (ambiguity 14).
 fn exchange(
-    _: &Ctx,
-    _key: &str,
-    _id: &str,
-    _n: u64,
-    _session: &str,
-    _client: (u32, i64),
+    ctx: &Ctx,
+    key: &str,
+    id: &str,
+    n: u64,
+    session: &str,
+    client: (u32, i64),
 ) -> (Value, Value) {
-    ("none".into(), Value::Null)
+    match handshake(ctx, key, id, n, session, client) {
+        Ok(Step::Stop(word)) => (word.into(), Value::Null),
+        Ok(Step::Reported) => {
+            let ready =
+                settle(ctx, key, id, n).map_or_else(|r| Value::from(r.check), |r| r.word().into());
+            ("reported".into(), ready)
+        }
+        Err(refusal) => (refusal.check.into(), Value::Null),
+    }
+}
+
+/// K4.1. R1: the member and generation n's `spec.json` are read once; R4: n is the record's pending or active
+/// generation and the session is n's own (launch-1 G1.5). Then, under the gen lock: stop on `outcome.json`,
+/// `failure.json` or the deadline, else create `report.json` once.
+fn handshake(
+    ctx: &Ctx,
+    key: &str,
+    id: &str,
+    n: u64,
+    session: &str,
+    (pid, start): (u32, i64),
+) -> Res<Step> {
+    use super::gens::{self, Member};
+    let member = ctx.state_root.join(key).join("agents").join(id);
+    match gens::member_of(&member) {
+        Member::Life(g) if g.pending() == Some(n) || g.active() == Some(n) => {}
+        Member::Unreadable(_) => return Err(crate::state::evidence::unreadable()),
+        _ => return Ok(Step::Stop("stale")),
+    }
+    let Some(spec) = gens::read(&member, n, "spec").known()? else {
+        return Ok(Step::Stop("stale"));
+    };
+    let theirs = spec
+        .get("sessionId")
+        .and_then(Value::as_str)
+        .map(str::to_ascii_lowercase);
+    if theirs.as_deref() != Some(session) {
+        return Ok(Step::Stop("session"));
+    }
+    let deadline = spec
+        .get("deadline")
+        .and_then(Value::as_str)
+        .and_then(crate::util::parse_utc)
+        .ok_or_else(crate::state::evidence::unreadable)?;
+    super::lock(ctx, &super::team_state::gen_lock_key(key, id, n), || {
+        let closed = gens::read(&member, n, "outcome").known()?.is_some()
+            || gens::read(&member, n, "failure").known()?.is_some()
+            || ctx.clock.now() >= deadline;
+        if closed {
+            return Ok(Step::Stop("closed"));
+        }
+        let at = crate::util::utc_o(ctx.clock.now());
+        let report = json!({"sessionId": session, "pid": pid, "start": start, "at": at});
+        gens::publish_once(&member, n, "report", &report)?;
+        Ok(Step::Reported)
+    })
+}
+
+/// K4.2-3: wait for `client.json` holding no lock, then decide once through K5.
+fn settle(ctx: &Ctx, key: &str, id: &str, n: u64) -> Res<super::gens::Ready> {
+    let member = ctx.state_root.join(key).join("agents").join(id);
+    for _ in 0..POLLS {
+        if super::gens::client(ctx, &member, n).is_some() {
+            break;
+        }
+        ctx.clock.sleep(POLL);
+    }
+    super::gens::promote_ready(ctx, key, id, n)
 }
 
 #[cfg(test)]

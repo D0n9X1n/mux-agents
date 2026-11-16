@@ -1,11 +1,12 @@
 //! report-2b K3, K3a, K4 through the real CLI (`cli::run`): fake proc, clock and hc; real files.
 use super::core_fixture as cf;
 use super::fixture::World;
-use super::gens::path;
+use super::gens::{self, path};
 use super::session_report::{Input, Labels, hooks, labels, read_capped, read_input};
 use crate::parse::Client;
 use crate::state::evidence::publish;
 use crate::state::live;
+use crate::testing::{Wrong, plant, untouched};
 use serde_json::{Value, json};
 use std::path::PathBuf;
 use std::time::Duration;
@@ -13,6 +14,7 @@ use std::time::Duration;
 const KEY: &str = "0123456789abcdef";
 const ID: &str = "aaaaaaaaaaaa";
 const NEW: &str = "0f11fc2f-2032-48ef-a920-4af2a8e5af50";
+const OLD: &str = "1e22fc2f-2032-48ef-a920-4af2a8e5af51";
 const ADDR: &str = "taaaaaaaaaaaa";
 
 /// `mux-agent <args>` as the binary runs it: exit code and the parsed reply (`Null` for `-Quiet`'s empty output).
@@ -466,4 +468,449 @@ fn read_input_refuses_a_terminal_reader_on_every_os() {
     };
     assert_eq!(read_input(fake(false)), Some(body.clone()), "a pipe");
     assert_eq!(read_input(fake(true)), None, "a terminal");
+}
+
+/// One `report -Session NEW` from generation `n`'s terminal (one hc connect for the labels).
+fn report_gen(w: &World, n: &str) -> (u8, Value) {
+    terminal(w, gen_labels(n));
+    call(w, &["report", "-Session", NEW, "-Source", "startup"])
+}
+
+fn exists(w: &World, file: &str) -> bool {
+    gen_file(w, file).exists()
+}
+
+fn json_of(w: &World, file: &str) -> Value {
+    crate::state::fs::read_json(&gen_file(w, file))
+        .unwrap()
+        .unwrap()
+}
+
+// Real CLI from a pending generation's terminal with no client.json: report.json, no `tagged`; no member verb.
+#[test]
+fn a_pending_terminal_reports_without_member_proof() {
+    let w = hc_world();
+    pending(&w);
+    let (code, reply) = report_gen(&w, "1");
+    assert_eq!(
+        (code, &reply["handshake"], &reply["ready"], &reply["seq"]),
+        (0, &json!("reported"), &json!("undecided"), &json!(1)),
+        "{reply}"
+    );
+    let r = json_of(&w, "report");
+    assert_eq!(
+        (&r["sessionId"], &r["pid"], &r["start"]),
+        (&json!(NEW), &json!(150), &json!(1500))
+    );
+    assert!(!exists(&w, "ready"));
+    assert_eq!(w.fakes.slept(), vec![200; 50], "the whole 10 s poll");
+    for verb in [&["report", "idle"][..], &["read"][..]] {
+        terminal(&w, gen_labels("1"));
+        let (code, reply) = call(&w, verb);
+        assert_eq!(
+            (code, &reply["check"]),
+            (2, &json!("herdr")),
+            "{verb:?}: no member verb"
+        );
+    }
+}
+
+// launch-1 G1.5: the record keeps OLD until promotion; generation 1's spec.json says NEW, and that decides.
+#[test]
+fn the_spec_session_decides_not_the_record() {
+    let w = hc_world();
+    write_record(
+        &w,
+        json!({"lifecycle": 1, "id": ID, "generation": "0", "hcName": "m0123abcd",
+        "sessionId": OLD, "pending": {"gen": 1, "sessionId": NEW}}),
+    );
+    gen1(&w, NEW);
+    client_json(&w);
+    terminal(&w, gen_labels("1"));
+    let (_, reply) = call(&w, &["report", "-Session", OLD]);
+    assert_eq!(
+        (&reply["handshake"], &reply["ready"]),
+        (&json!("session"), &Value::Null),
+        "the record's session"
+    );
+    assert!(!exists(&w, "report") && !exists(&w, "ready"));
+    let (_, reply) = report_gen(&w, "1");
+    assert_eq!(
+        (&reply["handshake"], &reply["ready"]),
+        (&json!("reported"), &json!("ok")),
+        "{reply}"
+    );
+    // 0 is the active generation but has no spec.json; 2 is neither: both stale (ambiguity 12).
+    for n in ["0", "2"] {
+        assert_eq!(report_gen(&w, n).1["handshake"], "stale", "label {n}");
+    }
+}
+
+#[test]
+fn an_early_report_is_promoted_when_client_json_lands_within_10_s() {
+    let w = hc_world();
+    pending(&w);
+    let log = std::rc::Rc::new(std::cell::RefCell::new(Vec::<String>::new()));
+    let l = log.clone();
+    w.fakes.lock_probe(move |e| {
+        l.borrow_mut().push(e.to_string());
+        String::new()
+    });
+    let (l, m) = (log.clone(), member(&w));
+    w.fakes.sleep_probe(move |count| {
+        l.borrow_mut().push(format!("sleep {count}"));
+        if count == 3 {
+            publish(&path(&m, 1, "client"), &json!({"pid": 150, "start": 1500})).unwrap();
+        }
+    });
+    let (code, reply) = report_gen(&w, "1");
+    assert_eq!((code, &reply["ready"]), (0, &json!("ok")), "{reply}");
+    let g = crate::agents::team_state::gen_lock_key(KEY, ID, 1);
+    let (plus, minus) = (format!("+{g}"), format!("-{g}"));
+    let want = [
+        "+live|150-1500",
+        "-live|150-1500",
+        plus.as_str(),
+        minus.as_str(),
+        "sleep 1",
+        "sleep 2",
+        "sleep 3",
+        plus.as_str(),
+        minus.as_str(),
+    ];
+    assert_eq!(
+        *log.borrow(),
+        want,
+        "no lock is held while polling; the poll stops at the client"
+    );
+    let r = json_of(&w, "ready");
+    assert_eq!((&r["pid"], &r["start"]), (&json!(150), &json!(1500)));
+}
+
+#[test]
+fn a_client_json_after_the_wait_is_promoted_by_a_later_call() {
+    let w = hc_world();
+    pending(&w);
+    assert_eq!(report_gen(&w, "1").1["ready"], "undecided");
+    w.fakes.advance(Duration::from_secs(20)); // after the 10 s wait, before the 150 s deadline
+    client_json(&w);
+    assert_eq!(
+        gens::promote_ready(&w.ctx, KEY, ID, 1).unwrap(),
+        gens::Ready::Ok
+    );
+    assert!(exists(&w, "ready"));
+}
+
+#[test]
+fn a_client_json_that_never_lands_leaves_the_verdict_undecided() {
+    let w = hc_world();
+    pending(&w);
+    report_gen(&w, "1");
+    let first = std::fs::read(gen_file(&w, "report")).unwrap();
+    w.fakes.advance(Duration::from_secs(300));
+    assert_eq!(
+        gens::promote_ready(&w.ctx, KEY, ID, 1).unwrap(),
+        gens::Ready::Undecided,
+        "outcome-2's"
+    );
+    assert!(!exists(&w, "ready"));
+    assert_eq!(
+        report_gen(&w, "1").1["handshake"],
+        "closed",
+        "past the deadline"
+    );
+    assert_eq!(
+        std::fs::read(gen_file(&w, "report")).unwrap(),
+        first,
+        "report.json written once"
+    );
+}
+
+// failure.json is published under the gen lock while the verb polls; client.json lands after it.
+#[test]
+fn a_failure_published_during_the_wait_wins() {
+    let w = hc_world();
+    pending(&w);
+    let (m, g) = (
+        member(&w),
+        crate::agents::team_state::gen_lock_key(KEY, ID, 1),
+    );
+    w.fakes.sleep_probe(move |count| {
+        if count == 2 {
+            crate::testing::locked(&g, || {
+                publish(
+                    &path(&m, 1, "failure"),
+                    &json!({"reason": "no readiness report"}),
+                )
+                .map(|_| ())
+            })
+            .unwrap();
+        }
+        if count == 3 {
+            publish(&path(&m, 1, "client"), &json!({"pid": 150, "start": 1500})).unwrap();
+        }
+    });
+    let (code, reply) = report_gen(&w, "1");
+    assert_eq!((code, &reply["ready"]), (0, &json!("failed")), "{reply}");
+    assert!(exists(&w, "report") && !exists(&w, "ready"));
+}
+
+// K4.1 and ambiguities 10-12: nothing past the registry is written.
+#[test]
+fn a_closed_stale_or_unreadable_generation_gets_no_report() {
+    type Setup = fn(&World);
+    let cases: [(&str, &str, Setup); 8] = [
+        ("outcome.json", "closed", |w| {
+            publish(&gen_file(w, "outcome"), &json!({"verdict": "ok"}))
+                .map(drop)
+                .unwrap()
+        }),
+        ("failure.json", "closed", |w| {
+            publish(&gen_file(w, "failure"), &json!({"reason": "x"}))
+                .map(drop)
+                .unwrap()
+        }),
+        ("now = deadline", "closed", |w| {
+            w.fakes.advance(Duration::from_secs(150))
+        }),
+        ("torn outcome.json", "evidence", |w| {
+            std::fs::write(gen_file(w, "outcome"), b"{").unwrap()
+        }),
+        ("spec without a deadline", "evidence", |w| {
+            std::fs::remove_file(gen_file(w, "spec")).unwrap();
+            publish(&gen_file(w, "spec"), &json!({"sessionId": NEW})).unwrap();
+        }),
+        ("torn record", "evidence", |w| {
+            std::fs::write(member(w).join("record.json"), b"{").unwrap()
+        }),
+        (
+            "spec of a generation neither pending nor active",
+            "stale",
+            |w| {
+                write_record(
+                    w,
+                    json!({"lifecycle": 1, "id": ID, "pending": {"gen": 2, "sessionId": NEW}}),
+                )
+            },
+        ),
+        ("no record", "stale", |w| {
+            std::fs::remove_file(member(w).join("record.json")).unwrap()
+        }),
+    ];
+    for (case, want, setup) in cases {
+        let w = hc_world();
+        pending(&w);
+        client_json(&w);
+        setup(&w);
+        let (code, reply) = report_gen(&w, "1");
+        assert_eq!(
+            (code, &reply["handshake"], &reply["seq"]),
+            (0, &json!(want), &json!(1)),
+            "{case}: {reply}"
+        );
+        assert!(!exists(&w, "report") && !exists(&w, "ready"), "{case}");
+    }
+    let w = hc_world();
+    pending(&w);
+    terminal(&w, json!({"mux.team": format!("{KEY}:$3"), "mux.id": ID}));
+    let (_, reply) = call(&w, &["report", "-Session", NEW]);
+    assert_eq!(reply["handshake"], "evidence", "partial labels");
+    assert!(!exists(&w, "report"));
+}
+
+// Ambiguity 5: a torn registry entry is kept as it is, and readiness goes on.
+#[test]
+fn a_torn_registry_entry_does_not_stop_the_handshake() {
+    let w = hc_world();
+    pending(&w);
+    client_json(&w);
+    live::report(&w.ctx, Client::Claude, 150, 1500, NEW, "startup").unwrap();
+    std::fs::write(claude_entry(&w), b"{").unwrap();
+    let (code, reply) = report_gen(&w, "1");
+    assert_eq!(
+        (code, &reply["seq"], &reply["handshake"], &reply["ready"]),
+        (0, &json!("evidence"), &json!("reported"), &json!("ok")),
+        "{reply}"
+    );
+    assert_eq!(std::fs::read(claude_entry(&w)).unwrap(), b"{");
+}
+
+// (fix 1, audit 5-9 #3) S9: report.json is published while the gen lock is held: it exists at the lock's release.
+#[test]
+fn report_json_is_published_inside_the_gen_lock() {
+    let w = hc_world();
+    pending(&w);
+    client_json(&w);
+    let (seen, at) = (
+        std::rc::Rc::new(std::cell::RefCell::new(Vec::new())),
+        gen_file(&w, "report"),
+    );
+    let (s, release) = (
+        seen.clone(),
+        format!("-{}", crate::agents::team_state::gen_lock_key(KEY, ID, 1)),
+    );
+    w.fakes.lock_probe(move |e| {
+        if e == release {
+            s.borrow_mut().push(at.exists());
+        }
+        String::new()
+    });
+    assert_eq!(report_gen(&w, "1").1["handshake"], "reported");
+    assert_eq!(
+        seen.borrow().first(),
+        Some(&true),
+        "report.json exists at the first gen-lock release"
+    );
+}
+
+// (fix 1, audit 5-9 #4) R4: the active generation's terminal is accepted too, not only a pending one.
+#[test]
+fn the_active_generation_is_accepted_too() {
+    let w = hc_world();
+    write_record(
+        &w,
+        json!({"lifecycle": 1, "id": ID, "generation": "1", "hcName": "m0123abcd", "sessionId": NEW}),
+    );
+    gen1(&w, NEW);
+    client_json(&w);
+    let (_, reply) = report_gen(&w, "1");
+    assert_eq!(
+        (&reply["handshake"], &reply["ready"]),
+        (&json!("reported"), &json!("ok")),
+        "{reply}"
+    );
+}
+
+// (fix 1, PM call 14) A failed flush of gens/1 is a failed publication: no `reported`, no ready.json; the next call
+// flushes and goes on.
+#[test]
+fn a_report_json_that_cannot_be_flushed_is_not_reported() {
+    let w = hc_world();
+    pending(&w);
+    client_json(&w);
+    crate::state::fs::fail_sync_dir(Some(&gens::dir(&member(&w), 1)));
+    let (code, reply) = report_gen(&w, "1");
+    crate::state::fs::fail_sync_dir(None);
+    assert_eq!(code, 0, "{reply}");
+    assert_ne!(
+        reply["handshake"], "reported",
+        "a failed flush is a failed publication"
+    );
+    assert!(!exists(&w, "ready"));
+    let (_, reply) = report_gen(&w, "1");
+    assert_eq!(
+        (&reply["handshake"], &reply["ready"]),
+        (&json!("reported"), &json!("ok")),
+        "retried and flushed"
+    );
+}
+
+// (fix 2, re-audit #5) K4.1, R2 and PM call 13: a torn or wrong-type outcome.json, failure.json or spec.json refuses
+// `evidence` before report.json is published, and nothing is written through a planted link.
+#[test]
+fn unreadable_k4_evidence_refuses_before_report_json() {
+    for file in ["outcome", "failure", "spec"] {
+        let mut kinds: Vec<Option<Wrong>> = vec![None];
+        kinds.extend(Wrong::all().into_iter().map(Some));
+        for kind in kinds {
+            let w = hc_world();
+            pending(&w);
+            client_json(&w);
+            let at = gen_file(&w, file);
+            let _ = std::fs::remove_file(&at);
+            match kind {
+                None => std::fs::write(&at, b"{").unwrap(),
+                Some(k) => plant(k, &at),
+            }
+            let (code, reply) = report_gen(&w, "1");
+            assert_eq!(
+                (code, &reply["handshake"], &reply["ready"]),
+                (0, &json!("evidence"), &Value::Null),
+                "{file} {kind:?}: {reply}"
+            );
+            assert!(
+                !exists(&w, "report") && !exists(&w, "ready"),
+                "{file} {kind:?}: nothing published"
+            );
+            assert!(untouched(&at), "{file} {kind:?}: nothing written through");
+        }
+    }
+}
+
+// (fix 2, re-audit #6) R1: the handshake reads the member's record.json once and generation 1's spec.json once.
+#[test]
+fn the_handshake_reads_the_member_and_its_spec_once() {
+    let w = hc_world();
+    pending(&w);
+    client_json(&w);
+    let (record, spec) = (member(&w).join("record.json"), gen_file(&w, "spec"));
+    let ((code, reply), paths) =
+        crate::state::evidence::record_evidence_reads(|| report_gen(&w, "1"));
+    assert_eq!(
+        (code, &reply["handshake"]),
+        (0, &json!("reported")),
+        "{reply}"
+    );
+    let count = |p: &PathBuf| paths.iter().filter(|q| *q == p).count();
+    assert_eq!((count(&record), count(&spec)), (1, 1), "{paths:?}");
+}
+
+// Build checklist item 2: generation 1's spec.json may carry its session in upper case; it is lowercased and still
+// matches the verb's (lowercased) session.
+#[test]
+fn an_uppercase_spec_session_still_matches() {
+    let w = hc_world();
+    write_record(
+        &w,
+        json!({"lifecycle": 1, "id": ID, "pending": {"gen": 1, "sessionId": NEW}}),
+    );
+    gen1(&w, &NEW.to_uppercase());
+    client_json(&w);
+    let (code, reply) = report_gen(&w, "1");
+    assert_eq!(
+        (code, &reply["handshake"], &reply["ready"]),
+        (0, &json!("reported"), &json!("ok")),
+        "{reply}"
+    );
+}
+
+// Build checklist item 3: a deadline that is present but cannot be parsed refuses `evidence`; nothing is published.
+#[test]
+fn an_unparsable_deadline_refuses_evidence_and_publishes_nothing() {
+    let w = hc_world();
+    pending(&w);
+    client_json(&w);
+    std::fs::remove_file(gen_file(&w, "spec")).unwrap();
+    publish(
+        &gen_file(&w, "spec"),
+        &json!({"sessionId": NEW, "deadline": "tomorrow"}),
+    )
+    .unwrap();
+    let (code, reply) = report_gen(&w, "1");
+    assert_eq!(
+        (code, &reply["handshake"], &reply["ready"]),
+        (0, &json!("evidence"), &Value::Null),
+        "{reply}"
+    );
+    assert!(!exists(&w, "report") && !exists(&w, "ready"));
+}
+
+// Build checklist item 4: a gen lock that cannot be taken answers `handshake: "lock"`; nothing is published.
+#[test]
+fn a_gen_lock_timeout_answers_lock_and_publishes_nothing() {
+    let w = hc_world();
+    pending(&w);
+    client_json(&w);
+    w.fakes.lock_timeout("gen|");
+    let (code, reply) = report_gen(&w, "1");
+    assert_eq!(
+        (code, &reply["handshake"], &reply["ready"]),
+        (0, &json!("lock"), &Value::Null),
+        "{reply}"
+    );
+    assert!(!exists(&w, "report") && !exists(&w, "ready"));
+    assert!(
+        claude_entry(&w).is_file(),
+        "the registry entry is still written"
+    );
 }
