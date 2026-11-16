@@ -30,6 +30,9 @@ pub mod placement;
 pub mod receipt;
 pub mod registry;
 pub mod resume;
+pub mod session_report;
+#[cfg(test)]
+mod session_report_tests;
 pub mod spawn;
 #[cfg(test)]
 mod stop_hc_tests;

@@ -165,11 +165,11 @@ pub static VERBS: &[VerbDef] = &[
     },
     VerbDef {
         name: "report",
-        values: &["Kind"],
-        switches: &["Quiet"],
+        values: &["Kind", "Source"],
+        switches: &["Quiet", "Session", "Stdin"],
         min: 1,
         max: 1,
-        usage: "usage: mux-agent report <working|blocked|idle|done> [-Kind <permission|question>] [-Quiet] [-Text]",
+        usage: "usage: mux-agent report <working|blocked|idle|done> [-Kind <permission|question>] [-Quiet] [-Text] | report -Session (<sessionId> [-Source <word>] | -Stdin) [-Quiet]",
         handler: crate::agents::view::report,
         text: json::lines,
     },
@@ -290,10 +290,36 @@ pub fn parse(args: &[String]) -> Res<(&'static VerbDef, Request)> {
             request.positional.push(token.clone());
         }
     }
-    if request.positional.len() < def.min || request.positional.len() > def.max {
+    // `report -Session -Stdin` alone takes no positional; `report_form` keeps the two forms apart.
+    let min = if def.name == "report" && request.switch("Stdin") {
+        0
+    } else {
+        def.min
+    };
+    if request.positional.len() < min
+        || request.positional.len() > def.max
+        || !report_form(&request)
+    {
         return refuse(2, "usage", def.usage);
     }
     Ok((def, request))
+}
+
+/// `report`'s two forms: `<state> [-Kind]`, or `-Session (<sessionId> [-Source] | -Stdin)`. Nothing mixes them.
+fn report_form(r: &Request) -> bool {
+    if r.verb != "report" {
+        return true;
+    }
+    let (stdin, source) = (r.switch("Stdin"), r.value("Source").is_some());
+    if !r.switch("Session") {
+        return !stdin && !source;
+    }
+    r.value("Kind").is_none()
+        && if stdin {
+            r.positional.is_empty() && !source
+        } else {
+            r.positional.len() == 1
+        }
 }
 
 /// Whether `tokens` ask for `-Text` as `parse` reads them: a value flag's next token is its value (a body of
@@ -339,6 +365,12 @@ fn dispatch(def: &VerbDef, request: &Request, ctx: &Ctx) -> Res<Map<String, Valu
     #[cfg(feature = "test-panic")]
     if ctx.env.get("MUX_AGENTS_TEST_PANIC") == Some("dispatch") {
         panic!("PANIC-PAYLOAD-7f3a");
+    }
+    // K3a: a session report proves no member and grants nothing: the sandbox check, then the verb; no caller proof.
+    if def.name == "report" && request.switch("Session") {
+        crate::sandbox::assert_unsandboxed(ctx)?;
+        let data = crate::agents::session_report::run(ctx, request)?;
+        return Ok(success(def, data));
     }
     // Non-mux herdr terminals stand down; committed mux workers use their member identity.
     if crate::caller::hc::applies(ctx) {
@@ -703,6 +735,37 @@ mod tests {
             def,
             &args(&["-Text", "-Client", "claude", "--", "x"])
         ));
+    }
+
+    #[test]
+    fn report_forms_parse() {
+        let r = parsed(&["report", "-Session", "x", "-Source", "startup"]);
+        assert_eq!(
+            (
+                r.switch("Session"),
+                r.value("Source"),
+                r.positional.as_slice()
+            ),
+            (true, Some("startup"), &["x".to_string()][..])
+        );
+        let r = parsed(&["report", "-Session", "-Stdin", "-Quiet"]);
+        assert!(r.switch("Stdin") && r.switch("Quiet") && r.positional.is_empty());
+        assert_eq!(
+            parsed(&["report", "idle", "-Kind", "question"]).positional,
+            ["idle"]
+        );
+        let bad: [&[&str]; 7] = [
+            &["report", "-Session"],
+            &["report", "-Session", "-Stdin", "x"],
+            &["report", "-Session", "x", "-Kind", "question"],
+            &["report", "-Session", "-Stdin", "-Source", "a"],
+            &["report", "idle", "-Source", "a"],
+            &["report", "idle", "-Stdin"],
+            &["report", "-Stdin"],
+        ];
+        for tokens in bad {
+            assert_eq!(usage_of(tokens), (2, "usage"), "{tokens:?}");
+        }
     }
 
     use crate::agents::fixture::{CLAUDE, ID, World, list_call};
