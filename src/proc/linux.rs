@@ -42,13 +42,15 @@ impl Os for Linux {
         seam::read_row(pid, head, |pid| link(pid, "exe"), argv, image)
     }
 
-    /// Every numeric /proc entry whose stat reads; one that exits mid-read is skipped.
+    /// Every numeric /proc entry; one whose stat cannot be read stays unless it is proven gone (`seam::listed`).
     fn table(&self) -> io::Result<Vec<Row>> {
         let mut rows = Vec::new();
         for entry in std::fs::read_dir("/proc")? {
             let name = entry?.file_name();
-            let pid = name.to_str().and_then(|n| n.parse::<u32>().ok());
-            if let Some(row) = pid.and_then(|pid| self.row(pid)) {
+            let Some(pid) = name.to_str().and_then(|n| n.parse::<u32>().ok()) else {
+                continue;
+            };
+            if let Some(row) = seam::listed(pid, self.row(pid), unix::probe, image) {
                 rows.push(row);
             }
         }

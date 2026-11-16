@@ -162,7 +162,7 @@ impl Os for MacOs {
         row_with(pid, &mut args_buffer())
     }
 
-    /// Every process whose start is readable; one that exits mid-read is skipped.
+    /// Every listed pid; one whose start cannot be read stays unless it is proven gone (`seam::listed`).
     fn table(&self) -> io::Result<Vec<Row>> {
         // SAFETY: a null buffer asks only for the count.
         let count = unsafe { libc::proc_listallpids(null_mut(), 0) };
@@ -177,7 +177,7 @@ impl Os for MacOs {
         Ok(pids
             .into_iter()
             .filter_map(|pid| u32::try_from(pid).ok())
-            .filter_map(|pid| row_with(pid, &mut buf))
+            .filter_map(|pid| seam::listed(pid, row_with(pid, &mut buf), unix::probe, image))
             .collect())
     }
 

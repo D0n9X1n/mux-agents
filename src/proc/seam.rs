@@ -43,6 +43,31 @@ pub fn read_row(
     })
 }
 
+/// H1: a listed pid leaves the table only when `kill(pid, 0)` proves it gone (ESRCH). Any other pid whose row cannot
+/// be read stays, unbound (no start, path or argv; ppid 0 = no parent read), with the image the OS lists, read after
+/// the probe showed the pid still exists. Nothing walks `table` by parent; `Os::row` is unchanged.
+pub fn listed(
+    pid: u32,
+    row: Option<super::Row>,
+    probe: impl FnOnce(u32) -> i32,
+    image: impl FnOnce(u32) -> Option<String>,
+) -> Option<super::Row> {
+    if row.is_some() {
+        return row;
+    }
+    if probe(pid) == ESRCH {
+        return None;
+    }
+    Some(super::Row {
+        pid,
+        ppid: 0,
+        start: None,
+        path: None,
+        argv: None,
+        image: image(pid),
+    })
+}
+
 /// A process held for a kill. It owns its handle, so dropping it closes the handle.
 #[derive(Debug)]
 pub struct Opened<H> {
@@ -216,6 +241,58 @@ mod tests {
             (7, 1, Some(100), Some("/bin/sh"), Some("sh"))
         );
         assert_eq!(row.argv, Some(vec!["sh".to_string()]));
+    }
+
+    type Calls = Rc<RefCell<Vec<String>>>;
+
+    fn listed_with(
+        row: Option<crate::proc::Row>,
+        errno: i32,
+    ) -> (Option<crate::proc::Row>, Vec<String>) {
+        let log: Calls = Rc::default();
+        let got = listed(
+            7,
+            row,
+            |pid| {
+                log.borrow_mut().push(format!("probe {pid}"));
+                errno
+            },
+            |pid| {
+                log.borrow_mut().push(format!("image {pid}"));
+                Some("claude".into())
+            },
+        );
+        let calls = log.borrow().clone();
+        (got, calls)
+    }
+
+    #[test]
+    fn listed_drops_a_pid_only_on_esrch() {
+        // A readable row stands as read: no probe, no second image read.
+        let full = crate::testing::row(7, 1, 100);
+        assert_eq!(listed_with(Some(full.clone()), 3), (Some(full), vec![]));
+        // Unreadable and ESRCH: proven gone, dropped, nothing else read.
+        assert_eq!(
+            listed_with(None, ESRCH),
+            (None, vec!["probe 7".to_string()])
+        );
+        // Unreadable and anything else (0 alive, EPERM 1, EINVAL 22, -1): kept, unbound, with its image.
+        for errno in [0, 1, 22, -1] {
+            let (row, calls) = listed_with(None, errno);
+            assert_eq!(
+                row,
+                Some(crate::proc::Row {
+                    pid: 7,
+                    ppid: 0,
+                    start: None,
+                    path: None,
+                    argv: None,
+                    image: Some("claude".into()),
+                }),
+                "errno {errno}"
+            );
+            assert_eq!(calls, ["probe 7", "image 7"], "errno {errno}");
+        }
     }
 
     #[test]

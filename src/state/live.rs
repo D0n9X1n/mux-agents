@@ -413,6 +413,25 @@ mod tests {
         );
     }
 
+    // r2b call 5 closed by occupy-3: a Unix pid kept with no start (`seam::listed`) reads Unknown, never Dead, and
+    // sweep keeps its entry.
+    #[test]
+    fn a_kept_unix_row_without_a_start_is_unknown() {
+        let (f, ctx, _d) = world();
+        assert_eq!(put(&ctx, 150, 1500, "startup"), Ok(1), "seed");
+        f.forget(150);
+        f.process(crate::proc::Row {
+            ppid: 0,
+            start: None,
+            path: None,
+            argv: None,
+            ..row(150, 100, 0)
+        });
+        assert_eq!(alive(&ctx, 150, 1500), Alive::Unknown);
+        assert_eq!(checked(sweep(&ctx)), Ok(0));
+        assert!(file(&ctx).is_file());
+    }
+
     // PM call 10: Dead only when the pid is absent from the process table, or listed with another known start.
     // Cannot open or query (Windows' denied OpenProcess, `Fakes::deny`) is Unknown, and the entry is kept.
     #[test]
