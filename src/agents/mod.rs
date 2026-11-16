@@ -41,6 +41,9 @@ pub(crate) mod prelife_fixture;
 #[cfg(test)]
 mod prelife_slot_tests;
 pub mod receipt;
+pub mod reconcile;
+#[cfg(test)]
+mod reconcile_tests;
 pub mod registry;
 pub mod release;
 pub mod resume;
