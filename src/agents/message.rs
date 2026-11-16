@@ -1004,6 +1004,12 @@ mod tests {
         child.kill().unwrap();
         child.wait().unwrap();
         drop(child);
+        // Call 56: Windows Toolhelp can still list an exited process for a moment after `wait()`; stop's client wait
+        // polls with a bound, so the test waits up to 10 s (100 ms steps) for the table to drop it, then asserts.
+        let end = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while listed(os.as_ref(), pid, start) && std::time::Instant::now() < end {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
         assert!(
             !listed(os.as_ref(), pid, start),
             "a reaped client is not listed"
