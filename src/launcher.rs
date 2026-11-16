@@ -2941,8 +2941,10 @@ mod tests {
         edit(&gens::path(&l.folder, 1, "spec"), |v| {
             v["sessionId"] = json!(sid)
         });
+        // Checklist item 1: a launch identity whose argv `classify` can match (Running needs a nonempty one).
         edit(&gens::path(&l.folder, 1, "launch"), |v| {
-            v["sessionId"] = json!(sid)
+            v["sessionId"] = json!(sid);
+            v["launcherArgv"] = json!(["/bin/mux-agent", "launcher", spec.to_str().unwrap()]);
         });
         commit(&l, 1, json!({"committed": true}));
         l.w.fakes
@@ -2959,6 +2961,99 @@ mod tests {
             },
         );
         std::mem::forget(l);
+    }
+
+    // settle-1b "Forward crash, replayed", launcher side: the real launcher killed after its claim, launcher.json,
+    // client.json or exit.json. A Normal settle promotes generation 1 once from launch.json (Running; Ended after
+    // exit.json, whose end it records); a replay asks hc nothing; a second launcher starts no client.
+    #[test]
+    fn a_launcher_crash_after_each_step_is_settled_once_and_starts_nothing_twice() {
+        use crate::agents::core_fixture as cf;
+        use crate::agents::core_launch::crash::{killed_at, printed};
+        use crate::agents::settle::{Mode, Outcome};
+        use crate::agents::team_state::{Scope, Tx};
+        for step in ["claim", "launcher", "client", "exit"] {
+            let kv = killed_at("launcher::tests::child_launcher", step);
+            let (root, spec) = (printed(&kv, "ROOT"), printed(&kv, "SPEC"));
+            let member = spec
+                .parent()
+                .and_then(Path::parent)
+                .and_then(Path::parent)
+                .unwrap()
+                .to_path_buf();
+            let id = member.file_name().unwrap().to_str().unwrap().to_string();
+            let mut w = World::human("");
+            w.ctx.state_root = root.clone();
+            let launch = gens::read(&member, 1, "launch").known().unwrap().unwrap();
+            let team = crate::agents::membership::team(&w.caller());
+            let ended = step == "exit";
+            let (state, reason, code) = if ended {
+                ("finished", json!("exited"), json!(0))
+            } else {
+                ("live", json!(null), json!(null))
+            };
+            let wire = json!({"address": "t1", "name": launch["hcName"], "argv": launch["launcherArgv"],
+                "state": state, "reason": reason, "exit_code": code,
+                "labels": {"mux.managed": "1", "mux.team": team, "mux.id": id, "mux.gen": "1", "mux.name": "worker"}});
+            let label = format!("mux.id={id}");
+            cf::online(&w);
+            let terminals = json!({"terminals": [{"address": "t1"}]}).to_string();
+            cf::answer(
+                &w,
+                &[
+                    "ls",
+                    "--all",
+                    "--label",
+                    &label,
+                    "--label",
+                    "mux.gen=1",
+                    "--json",
+                ],
+                &terminals,
+            );
+            cf::answer(&w, &["get", "t1", "--json"], &wire.to_string());
+            let settled = |w: &World| {
+                Tx {
+                    ctx: &w.ctx,
+                    scope: Scope::of(&w.caller()),
+                }
+                .settle(&id, Mode::Normal)
+            };
+            assert_eq!(settled(&w).unwrap(), Outcome::Promoted, "{step}");
+            let r = crate::state::fs::read_json(&member.join("record.json"))
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                (&r["generation"], r.get("pending"), r.get("completing")),
+                (&json!("1"), None, None),
+                "{step}"
+            );
+            assert_eq!(
+                gens::read(&member, 1, "ended").known().unwrap().is_some(),
+                ended,
+                "{step}: ended.json"
+            );
+            w.fakes.hc_done().unwrap();
+            let asked = w.fakes.hc_calls().len();
+            assert_eq!(settled(&w).unwrap(), Outcome::Done, "{step}: replay");
+            assert_eq!(
+                w.fakes.hc_calls().len(),
+                asked,
+                "{step}: the replay asked hc"
+            );
+            let mut started = 0;
+            let code = run(
+                &w.ctx,
+                spec.to_str().unwrap(),
+                &mut |_| {},
+                &mut |_, _, _, _| {
+                    started += 1;
+                    Ok(0)
+                },
+            );
+            assert_eq!(started, 0, "{step}: exit {code}, a second client");
+            let _ = std::fs::remove_dir_all(root.parent().unwrap());
+        }
     }
 
     // Killed after the claim, launcher.json, client.json or exit.json: a second launcher never starts a client.

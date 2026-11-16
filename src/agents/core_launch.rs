@@ -2996,4 +2996,71 @@ pub(crate) mod crash {
             }
         }
     }
+
+    // settle-1b "Forward crash, replayed", on the files A3b-1's real harness leaves: a forward killed after each
+    // step, `allocated` included (b-calls 35, R8), settled once (Normal). At `allocated` there is no record: Done,
+    // nothing made, no claim. From `pending` until promotion no launcher claimed, so row 3 abandons generation 0;
+    // after promotion there is no pending. A replay changes nothing and asks no hc; a launcher woken afterwards
+    // starts the client only for the promoted generation, and a second launcher starts none: nothing runs twice.
+    #[test]
+    fn a_forward_crash_after_each_step_is_settled_once_and_runs_nothing_twice() {
+        use crate::agents::settle::{Mode, Outcome};
+        use crate::agents::team_state::{Scope, Tx};
+        for step in std::iter::once("allocated").chain(STEPS) {
+            let root = printed(
+                &killed_at("agents::core_launch::crash::child_forward", step),
+                "ROOT",
+            );
+            let mut w = World::human("");
+            w.ctx.state_root = root.clone();
+            w.fakes.hc_install("hc");
+            let f = w.folder(ID);
+            let settled = |w: &World| {
+                Tx {
+                    ctx: &w.ctx,
+                    scope: Scope::of(&w.caller()),
+                }
+                .settle(ID, Mode::Normal)
+            };
+            assert_eq!(settled(&w).unwrap(), Outcome::Done, "{step}");
+            let (allocated, promoted) = (step == "allocated", step == "promote");
+            let claim = gens::claim(&f, 0).known().unwrap();
+            let abandoned = !allocated && !promoted;
+            assert_eq!(
+                claim,
+                abandoned.then(|| json!("abandoned")),
+                "{step}: claim"
+            );
+            let r = crate::state::fs::read_json(&f.join("record.json")).unwrap();
+            assert_eq!(
+                r.is_none(),
+                allocated,
+                "{step}: a record only after allocation"
+            );
+            assert!(
+                r.as_ref().and_then(|r| r.get("pending")).is_none(),
+                "{step}: pending"
+            );
+            let before = std::fs::read(f.join("record.json")).ok();
+            assert_eq!(settled(&w).unwrap(), Outcome::Done, "{step}: replay");
+            assert_eq!(
+                std::fs::read(f.join("record.json")).ok(),
+                before,
+                "{step}: the replay wrote"
+            );
+            assert!(w.fakes.hc_calls().is_empty(), "{step}: settle asked hc");
+            with_client(&mut w);
+            assert_eq!(
+                launcher_once(&w, &f).1,
+                usize::from(promoted),
+                "{step}: clients started"
+            );
+            assert_eq!(
+                launcher_once(&w, &f).1,
+                0,
+                "{step}: a second launcher starts nothing"
+            );
+            let _ = std::fs::remove_dir_all(root.parent().unwrap());
+        }
+    }
 }

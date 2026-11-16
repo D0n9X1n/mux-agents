@@ -83,6 +83,22 @@ pub fn release(
         .get("hcName")
         .and_then(Value::as_str)
         .unwrap_or_default();
+    release_named(tx, lazy, id, n, address, hc_name, cause)
+}
+
+/// R1 for a caller that already read `launch.json`'s `hcName` (settle row 6, read once): step 1, then steps 3 and
+/// 4. An existing `release.json` stands and is the one concluded (the sanctioned lost-publication reread). No kill,
+/// send or keys.
+pub fn release_named(
+    tx: &Tx<'_>,
+    lazy: &Lazy<'_>,
+    id: &str,
+    n: u64,
+    address: &str,
+    hc_name: &str,
+    cause: Cause,
+) -> Res<()> {
+    let folder = tx.folder(id);
     let mut body = json!({"address": address, "hcName": hc_name, "cause": cause.word(),
         "at": utc_o(tx.ctx.clock.now())});
     if gens::publish_once(&folder, n, "release", &body)? == Published::Exists {

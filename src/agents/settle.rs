@@ -1,14 +1,16 @@
 //! settle-1b: the replay table (G3), the orphan fence (G8), and ending one generation (G11).
 use std::path::Path;
 
-use serde_json::json;
+use serde_json::{Value, json};
 
-use super::gens::{self, Decision};
-use super::release::{self, halt};
+use super::gens::{self, Decision, Found};
+use super::lifecycle::{Life, classify};
+use super::release::{self, Cause, halt};
 use super::team_state::{Guard, Tx};
 use crate::error::{Refusal, Res};
-use crate::hc::Lazy;
+use crate::hc::{Lazy, Terminal};
 use crate::state::evidence::{Evidence, Published};
+use crate::util::utc_o;
 
 /// G3's two modes: `Normal` promotes a committed pending generation; `Fence` (G8, G11) never does.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -21,6 +23,8 @@ pub enum Mode {
 #[derive(Debug, Clone)]
 pub enum Outcome {
     Done,
+    Promoted,
+    Running(Terminal),
     Unknown(Refusal),
 }
 
@@ -28,6 +32,8 @@ impl PartialEq for Outcome {
     fn eq(&self, o: &Outcome) -> bool {
         match (self, o) {
             (Outcome::Done, Outcome::Done) => true,
+            (Outcome::Promoted, Outcome::Promoted) => true,
+            (Outcome::Running(a), Outcome::Running(b)) => a.address == b.address,
             (Outcome::Unknown(a), Outcome::Unknown(b)) => a.check == b.check,
             _ => false,
         }
@@ -227,9 +233,122 @@ pub fn settle_gen<'c>(
     }
 }
 
-/// G3 row 6 (Task 9).
-fn row6(_: &At<'_, '_>, _: &Evidence, _: &Evidence) -> Res<Outcome> {
-    Ok(Outcome::Unknown(gens::unclear("row 6 is not settled yet")))
+/// G3 row 6: a committed generation, matched by `launch.json`'s identity only (launch-1 G12; ambiguities 1, 2, 5,
+/// 6). Every value comes from `settle_gen`'s reads (A3a R1).
+fn row6(at: &At<'_, '_>, term: &Evidence, launch: &Evidence) -> Res<Outcome> {
+    let Evidence::Present(launch) = launch else {
+        return Ok(Outcome::Unknown(Refusal::internal(
+            "a run claim without launch.json",
+        )));
+    };
+    // Ambiguity 5: terminating forbids promotion. Only `Tx::settle` passes Normal, always for pending.
+    let normal = at.mode == Mode::Normal && !matches!(term, Evidence::Present(_));
+    let hc_name = launch
+        .get("hcName")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let argv: Vec<String> = launch
+        .get("launcherArgv")
+        .and_then(Value::as_array)
+        .map(|a| {
+            a.iter()
+                .filter_map(Value::as_str)
+                .map(str::to_owned)
+                .collect()
+        })
+        .unwrap_or_default();
+    let Ok(core) = at.lazy.get() else {
+        return Ok(Outcome::Unknown(gens::unclear("hc is unreachable")));
+    };
+    let t = match gens::find(core, at.id, at.n, hc_name) {
+        Found::One(t) => t,
+        Found::Unknown(e) => return Ok(Outcome::Unknown(e)),
+    };
+    // Ambiguity 2: the team `forward` gave `hc run`, never the record's.
+    let Some(team) = t.labels.get("mux.team").cloned() else {
+        return Ok(Outcome::Unknown(gens::unclear(
+            "the terminal has no team label",
+        )));
+    };
+    let now = utc_o(at.tx.ctx.clock.now());
+    let folder = at.tx.folder(at.id);
+    // `Ok(None)`: pending no longer names n. Under the team lock nothing else writes the record, so it is internal.
+    let promote = |c: Option<Value>| -> Res<()> {
+        at.tx
+            .promote(at.id, at.n, launch, &t.address, &team, c)?
+            .ok_or_else(|| {
+                Refusal::internal("the pending generation changed under the team lock")
+            })?;
+        halt("promoted")
+    };
+    match (classify(Some(&t), &argv), normal) {
+        (Life::Running, true) => promote(None).map(|()| Outcome::Promoted),
+        (Life::Running, false) => Ok(Outcome::Running(t.clone())),
+        (Life::Lost, true) => {
+            let c =
+                json!({"gen": at.n, "intent": "release", "cause": "restore", "address": t.address});
+            promote(Some(c))?;
+            let step = release::release_named(
+                at.tx,
+                at.lazy,
+                at.id,
+                at.n,
+                &t.address,
+                hc_name,
+                Cause::Restore,
+            );
+            continued(at, step)
+        }
+        (Life::Ended, true) => {
+            let facts = gens::end_facts(&t, hc_name, &now);
+            promote(Some(
+                json!({"gen": at.n, "intent": "ended", "facts": facts}),
+            ))?;
+            continued(
+                at,
+                gens::publish_end(&folder, at.n, &facts).and_then(|_| halt("ended")),
+            )
+        }
+        (Life::Lost, false) => {
+            match release::release_named(
+                at.tx,
+                at.lazy,
+                at.id,
+                at.n,
+                &t.address,
+                hc_name,
+                Cause::Lost,
+            ) {
+                Ok(()) => at.done(),
+                Err(e) => unresolved(e),
+            }
+        }
+        // `find` checked name, mux.id, mux.gen and `classify` Ended: `record_end`'s guards, without its rereads.
+        (Life::Ended, false) => {
+            match gens::publish_end(&folder, at.n, &gens::end_facts(&t, hc_name, &now)) {
+                Ok(_) => {
+                    halt("ended")?;
+                    at.done()
+                }
+                Err(e) => unresolved(e),
+            }
+        }
+        (Life::Unknown, _) => Ok(Outcome::Unknown(gens::unclear(
+            "hc does not show the generation's life",
+        ))),
+    }
+}
+
+/// Ambiguity 6, R4: after a promotion with `completing`, the continuation's result; Ok clears `completing` while it
+/// names n. A failure keeps it, and the next `Tx::open` finishes it; the outcome stays `Promoted`. A halt stays Err.
+fn continued(at: &At<'_, '_>, step: Res<()>) -> Res<Outcome> {
+    let cleared = step
+        .and_then(|()| drop_field(at.tx, at.id, Guard::CompletingGen { n: at.n }, "completing"));
+    match cleared {
+        Ok(()) => Ok(Outcome::Promoted),
+        Err(e) if e.check == "halted" => Err(e),
+        Err(_) => Ok(Outcome::Promoted),
+    }
 }
 
 #[cfg(test)]
@@ -606,5 +725,361 @@ mod tests {
         assert!(lf::record(&m).get("pending").is_none(), "cleared: pending");
         lf::no_effect(&w);
         w.fakes.hc_done().unwrap();
+    }
+    /// Generation 1 of `kind`, committed. hc is not installed: each settle that reaches hc queues its `cf::online`.
+    fn committed_of(w: &World, kind: &str) -> std::path::PathBuf {
+        let m = pending_of(w, kind);
+        lf::seed_gen(&m, 1, Some("run"), lf::committed());
+        m
+    }
+    fn reads_of(reads: &[std::path::PathBuf], at: &std::path::Path) -> usize {
+        reads.iter().filter(|p| p.as_path() == at).count()
+    }
+
+    // Row 6 Running x each kind: Fence leaves it reserved (Running); Normal promotes from launch.json (session,
+    // identity) with the team of the matched terminal's mux.team, never the record's (F21: the record says stale).
+    #[test]
+    fn a_running_committed_generation_is_promoted_in_normal_mode_only() {
+        for kind in KINDS {
+            let (w, s) = lf::world();
+            let m = committed_of(&w, kind);
+            let mut r = lf::record(&m);
+            r["team"] = json!("stale:$3");
+            crate::state::fs::write_json(&m.join("record.json"), &r).unwrap();
+            cf::online(&w);
+            lf::found(&w, 1, &lf::running(&w, 1));
+            assert!(
+                matches!(settle(&w, &s, Mode::Fence).unwrap(), Outcome::Running(_)),
+                "{kind}: fence"
+            );
+            assert!(
+                lf::record(&m).get("pending").is_some(),
+                "{kind}: fence keeps pending"
+            );
+            cf::online(&w);
+            lf::found(&w, 1, &lf::running(&w, 1));
+            assert_eq!(
+                settle(&w, &s, Mode::Normal).unwrap(),
+                Outcome::Promoted,
+                "{kind}"
+            );
+            let r = lf::record(&m);
+            let got = (&r["generation"], &r["sessionId"], &r["hcName"]);
+            assert_eq!(
+                got,
+                (&json!("1"), &json!(lf::SID), &json!(lf::hc_name(1))),
+                "{kind}"
+            );
+            assert_eq!(
+                (&r["hcAddress"], &r["team"]),
+                (&json!("t1"), &json!(lf::team(&w))),
+                "{kind}: team"
+            );
+            assert!(r.get("pending").is_none());
+            lf::no_effect(&w);
+            w.fakes.hc_done().unwrap();
+        }
+    }
+
+    // launch-1 G12 x each kind x each mode (F13, R7): a run claim and a commit without launch.json is Unknown
+    // (`internal`); no hc.
+    #[test]
+    fn a_committed_generation_without_launch_json_stays_reserved() {
+        for kind in KINDS {
+            for mode in [Mode::Normal, Mode::Fence] {
+                let (w, s) = lf::world();
+                let m = committed_of(&w, kind);
+                std::fs::remove_file(gens::path(&m, 1, "launch")).unwrap();
+                let got = settle(&w, &s, mode).unwrap();
+                assert!(
+                    matches!(&got, Outcome::Unknown(e) if e.check == "internal"),
+                    "{kind} {mode:?}: {got:?}"
+                );
+                assert!(
+                    lf::record(&m).get("pending").is_some() && lf::calls(&w).is_empty(),
+                    "{kind} {mode:?}"
+                );
+            }
+        }
+    }
+
+    // "Recorded identity": the pending record's argv may change (a moved exe); launch.json decides. Another argv,
+    // hcName or mux.gen label never matches: Unknown, pending kept.
+    #[test]
+    fn the_recorded_identity_alone_matches() {
+        for case in [
+            "moved exe",
+            "another argv",
+            "another name",
+            "another gen label",
+        ] {
+            let (w, s) = lf::world();
+            let m = committed_of(&w, "spawn");
+            let mut r = lf::record(&m);
+            r["pending"]["launcherArgv"] = json!(["/moved/mux-agent", "launcher", "/s/spec.json"]);
+            crate::state::fs::write_json(&m.join("record.json"), &r).unwrap();
+            let mut t = lf::running(&w, 1);
+            match case {
+                "another argv" => {
+                    t["argv"] = json!(["/other/mux-agent", "launcher", "/s/spec.json"])
+                }
+                "another name" => t["name"] = json!("m00000009"),
+                "another gen label" => t["labels"]["mux.gen"] = json!("2"),
+                _ => {}
+            }
+            cf::online(&w);
+            lf::found(&w, 1, &t);
+            let got = settle(&w, &s, Mode::Normal).unwrap();
+            if case == "moved exe" {
+                assert_eq!(got, Outcome::Promoted, "{case}");
+            } else {
+                assert!(matches!(got, Outcome::Unknown(_)), "{case}: {got:?}");
+                assert!(lf::record(&m).get("pending").is_some(), "{case}");
+            }
+        }
+    }
+
+    // Row 6 Lost (R3) x each mode x each kind x both recovery shells: Normal promotes (the record names n's
+    // session), then releases with cause restore; Fence releases with cause lost, never active. ready.json stays.
+    // F8: launch.json is read once; record.json only by settle's read and each conditional patch.
+    #[test]
+    fn a_lost_committed_generation_is_promoted_then_released_or_released_only() {
+        for mode in [Mode::Normal, Mode::Fence] {
+            for kind in KINDS {
+                for argv in lf::LOST_ARGVS {
+                    let (w, s) = lf::world();
+                    let m = committed_of(&w, kind);
+                    gens::publish_once(&m, 1, "ready", &json!({})).unwrap();
+                    cf::online(&w);
+                    lf::found(&w, 1, &lf::lost(&w, 1, argv));
+                    lf::get(&w, "t1", &lf::lost(&w, 1, argv));
+                    lf::relabel(&w, "t1");
+                    let (got, reads) = crate::state::fs::record_reads(|| settle(&w, &s, mode));
+                    let got = got.unwrap();
+                    let case = format!("{mode:?} {kind}");
+                    let r = lf::record(&m);
+                    let cause =
+                        gens::read(&m, 1, "release").known().unwrap().unwrap()["cause"].clone();
+                    if mode == Mode::Normal {
+                        assert_eq!(got, Outcome::Promoted, "{case}");
+                        let want = (&json!("1"), &json!(lf::SID), &json!("restore"));
+                        assert_eq!((&r["generation"], &r["sessionId"], &cause), want, "{case}");
+                        assert!(r.get("completing").is_none(), "{case}: completing cleared");
+                    } else {
+                        assert_eq!(got, Outcome::Done, "{case}");
+                        assert_eq!(
+                            (r.get("generation"), &cause),
+                            (None, &json!("lost")),
+                            "{case}: never active"
+                        );
+                    }
+                    assert!(r.get("pending").is_none(), "{case}");
+                    assert!(
+                        gens::done(&m, 1).unwrap() && gens::path(&m, 1, "ready").exists(),
+                        "{case}"
+                    );
+                    assert_eq!(lf::count(&w, "label"), 1, "{case}");
+                    lf::no_effect(&w);
+                    w.fakes.hc_done().unwrap();
+                    assert_eq!(
+                        reads_of(&reads, &gens::path(&m, 1, "launch")),
+                        1,
+                        "{case}: launch.json reread"
+                    );
+                    let record = if mode == Mode::Normal { 3 } else { 2 };
+                    assert_eq!(
+                        reads_of(&reads, &m.join("record.json")),
+                        record,
+                        "{case}: record.json reads"
+                    );
+                }
+            }
+        }
+    }
+
+    // Row 6 Ended x each mode x each kind: Normal promotes with completing {ended, facts}, publishes ended.json,
+    // clears it; Fence publishes ended.json only and drops pending. F8: launch.json once; no record_end reread.
+    #[test]
+    fn an_ended_committed_generation_records_its_end() {
+        for mode in [Mode::Normal, Mode::Fence] {
+            for kind in KINDS {
+                let (w, s) = lf::world();
+                let m = committed_of(&w, kind);
+                cf::online(&w);
+                lf::found(&w, 1, &lf::ended(&w, 1));
+                let (got, reads) = crate::state::fs::record_reads(|| settle(&w, &s, mode));
+                let want = if mode == Mode::Normal {
+                    Outcome::Promoted
+                } else {
+                    Outcome::Done
+                };
+                let case = format!("{mode:?} {kind}");
+                assert_eq!(got.unwrap(), want, "{case}");
+                let r = lf::record(&m);
+                assert_eq!(
+                    gens::read(&m, 1, "ended").known().unwrap().unwrap()["hcName"],
+                    json!(lf::hc_name(1))
+                );
+                assert_eq!(
+                    r.get("generation").is_some(),
+                    mode == Mode::Normal,
+                    "{case}: generation"
+                );
+                assert!(
+                    r.get("pending").is_none() && r.get("completing").is_none(),
+                    "{case}"
+                );
+                assert!(gens::done(&m, 1).unwrap(), "{case}");
+                lf::no_effect(&w);
+                w.fakes.hc_done().unwrap();
+                assert_eq!(
+                    reads_of(&reads, &gens::path(&m, 1, "launch")),
+                    1,
+                    "{case}: launch.json reread"
+                );
+                let record = if mode == Mode::Normal { 3 } else { 2 };
+                assert_eq!(
+                    reads_of(&reads, &m.join("record.json")),
+                    record,
+                    "{case}: record.json reads"
+                );
+            }
+        }
+    }
+
+    // "Promotion before Ended marker": stopped after the promote patch (completing written, pending dropped), before
+    // ended.json. The next Tx::open publishes ended.json from the recorded facts and clears completing with no hc
+    // call, so hc having expired the terminal cannot matter. n is active and done; nothing is reserved.
+    #[test]
+    fn a_promotion_before_the_ended_marker_is_finished_by_the_next_open() {
+        let (w, s) = lf::world();
+        let m = committed_of(&w, "spawn");
+        cf::online(&w);
+        lf::found(&w, 1, &lf::ended(&w, 1));
+        release::halt_after(Some("promoted"));
+        let first = settle(&w, &s, Mode::Normal);
+        release::halt_after(None);
+        assert_eq!(first.map_err(|e| e.check), Err("halted"), "the halt");
+        let r = lf::record(&m);
+        assert!(r.get("completing").is_some(), "completing written");
+        assert!(r.get("pending").is_none(), "pending dropped");
+        assert!(!gens::done(&m, 1).unwrap(), "reserved before the marker");
+        let asked = lf::calls(&w).len();
+        crate::agents::team_state::open(&w.ctx, &s, |_| Ok(())).unwrap();
+        assert_eq!(lf::calls(&w).len(), asked, "hc called");
+        assert!(gens::done(&m, 1).unwrap() && lf::record(&m).get("completing").is_none());
+        assert_eq!(lf::record(&m)["generation"], "1");
+        let gens::Member::Life(g) = gens::member_of(&m) else {
+            panic!("not a lifecycle member")
+        };
+        assert!(g.status().unwrap().finished, "nothing reserved");
+    }
+
+    // Row 6 Unknown x each kind x each mode (R7): none, two, hc unreachable, or an unclear life: Unknown (`hc`),
+    // pending kept, nothing written. `terminating` Present forbids promotion (Normal: Running, reserved); torn is
+    // row 1.
+    #[test]
+    fn an_unknown_or_terminating_generation_stays_reserved() {
+        let id = format!("mux.id={ID}");
+        let ls = [
+            "ls",
+            "--all",
+            "--label",
+            id.as_str(),
+            "--label",
+            "mux.gen=1",
+            "--json",
+        ];
+        for case in ["none", "two", "unreachable", "unclear", "terminating"] {
+            for kind in KINDS {
+                for mode in [Mode::Normal, Mode::Fence] {
+                    let (w, s) = lf::world();
+                    let m = committed_of(&w, kind);
+                    cf::online(&w);
+                    match case {
+                        "none" => lf::ls(&w, 1, &[]),
+                        "two" => {
+                            lf::ls(&w, 1, &["t1", "t9"]);
+                            lf::get(&w, "t1", &lf::running(&w, 1));
+                            lf::get(&w, "t9", &lf::running(&w, 1));
+                        }
+                        "unreachable" => lf::fails(&w, &ls),
+                        "unclear" => lf::found(
+                            &w,
+                            1,
+                            &lf::wire(&w, 1, "finished", Some("server_stop"), &lf::ARGV),
+                        ),
+                        _ => {
+                            gens::publish_once(&m, 1, "terminating", &json!({})).unwrap();
+                            lf::found(&w, 1, &lf::running(&w, 1));
+                        }
+                    }
+                    let c = format!("{case} {kind} {mode:?}");
+                    let got = settle(&w, &s, mode).unwrap();
+                    if case == "terminating" {
+                        assert!(
+                            matches!(got, Outcome::Running(_)),
+                            "{c}: terminating never promotes: {got:?}"
+                        );
+                    } else {
+                        assert!(
+                            matches!(&got, Outcome::Unknown(e) if e.check == "hc"),
+                            "{c}: {got:?}"
+                        );
+                    }
+                    let r = lf::record(&m);
+                    assert!(
+                        r.get("pending").is_some() && r.get("generation").is_none(),
+                        "{c}"
+                    );
+                    assert_eq!(gens::read(&m, 1, "ended"), Evidence::Absent, "{c}");
+                    w.fakes.hc_done().unwrap();
+                }
+            }
+        }
+    }
+
+    // b-calls 36 (R9): a halt inside a continuation (row 0r's conclude; row 6's release or end, with and without a
+    // promotion) stays an error with check `halted`: `continued` and `unresolved` never turn it into an Outcome.
+    // The file written before the halt stands; nothing after it runs.
+    #[test]
+    fn a_halt_inside_a_continuation_stays_an_error() {
+        let cases = [
+            ("ended", Mode::Normal, "ended"),
+            ("ended", Mode::Fence, "ended"),
+            ("lost", Mode::Normal, "release"),
+            ("lost", Mode::Fence, "release"),
+            ("half-done", Mode::Normal, "released"),
+        ];
+        for (case, mode, step) in cases {
+            let (w, s) = lf::world();
+            let m = committed_of(&w, "spawn");
+            cf::online(&w);
+            match case {
+                "ended" => lf::found(&w, 1, &lf::ended(&w, 1)),
+                "lost" => lf::found(&w, 1, &lf::lost(&w, 1, lf::LOST_ARGVS[0])),
+                _ => {
+                    gens::publish_once(&m, 1, "release", &release_body()).unwrap();
+                    lf::get(&w, "t1", &lf::lost(&w, 1, lf::LOST_ARGVS[0]));
+                    lf::relabel(&w, "t1");
+                }
+            }
+            let c = format!("{case} {mode:?}");
+            release::halt_after(Some(step));
+            let got = settle(&w, &s, mode);
+            release::halt_after(None);
+            assert_eq!(got.map_err(|e| e.check), Err("halted"), "{c}: the halt");
+            assert!(
+                matches!(gens::read(&m, 1, step), Evidence::Present(_)),
+                "{c}: {step}.json before the halt"
+            );
+            let promoted = mode == Mode::Normal && case != "half-done";
+            assert_eq!(
+                lf::record(&m).get("completing").is_some(),
+                promoted,
+                "{c}: completing kept"
+            );
+            w.fakes.hc_done().unwrap();
+        }
     }
 }
