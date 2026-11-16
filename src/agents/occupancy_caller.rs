@@ -66,10 +66,13 @@ pub(super) fn exempt(ctx: &Ctx, own: &Own, rows: &[Row], os: OsKind) -> Option<E
 /// The caller's own newest entry: `Caller` when it names `wanted`; `Evidence` when it cannot be read or names no valid
 /// conversation (R2); none when absent or naming another.
 pub(super) fn own_report(ctx: &Ctx, kind: Client, key: (u32, i64), wanted: &str) -> Option<Rule> {
-    match live::entry(ctx, kind, key.0, key.1) {
+    match registry(ctx, kind, key.0, key.1) {
         Err(_) => Some(Rule::Evidence),
-        Ok(None) => None,
-        Ok(Some(entry)) => {
+        // Call 29: the key's process gone since the saved table, with no entry left: unknown, so it holds.
+        Ok(live::Found { entry: None, gone }) => gone.then_some(Rule::Evidence),
+        Ok(live::Found {
+            entry: Some(entry), ..
+        }) => {
             let id = crate::agents::text(entry.get("sessionId"));
             if !crate::checks::session_id(&id) {
                 return Some(Rule::Evidence);

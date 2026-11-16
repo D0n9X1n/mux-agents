@@ -145,6 +145,33 @@ pub fn entry(ctx: &Ctx, kind: Client, pid: u32, start: i64) -> Res<Option<Value>
     }
 }
 
+/// o3 call 29: an entry read whatever its process's liveness, and whether that process now reads Dead. `entry`
+/// conflates "no entry" with "its process is gone"; occupancy, which paired or exempted the process from an earlier
+/// table read, must not. Boot rules as `entry`: another boot's entry is none; an unverifiable one refuses.
+pub struct Found {
+    pub gone: bool,
+    pub entry: Option<Value>,
+}
+
+/// `entry`'s reads without its liveness shortcut (o3 call 29); `entry` itself is unchanged for its callers.
+pub fn lookup(ctx: &Ctx, kind: Client, pid: u32, start: i64) -> Res<Found> {
+    let gone = alive(ctx, pid, start) == Alive::Dead;
+    if !live_dir(ctx)? {
+        return Ok(Found { gone, entry: None });
+    }
+    let Some(found) = evidence::read(&path(ctx, kind, pid, start)).known()? else {
+        return Ok(Found { gone, entry: None });
+    };
+    match boot_match(ctx, &found) {
+        BootMatch::This => Ok(Found {
+            gone,
+            entry: Some(found),
+        }),
+        BootMatch::Another => Ok(Found { gone, entry: None }),
+        BootMatch::Uncertain => Err(evidence::unreadable()),
+    }
+}
+
 /// What an entry's recorded `boot` says against this boot (r2b calls 27, 29).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum BootMatch {

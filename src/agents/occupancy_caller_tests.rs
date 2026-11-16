@@ -247,3 +247,51 @@ fn the_skill_states_the_known_limits() {
         assert!(skill.contains(needle), "{needle}");
     }
 }
+
+// Call 29, caller path: proven native 7101, keyed by its loader 7100. The loader exits between the saved table and
+// the registry read (seam `hooks::before_entry_read`) while the child survives. Its report naming X still holds X, as
+// Caller naming 7101 (the entry is never dropped); with no entry at all the report is unknown (Evidence).
+#[test]
+fn a_callers_loader_exiting_between_reads_still_holds_its_report() {
+    let own = Own {
+        kind: Client::Copilot,
+        pid: 7101,
+        start: 2101,
+    };
+    let pair = |report: bool| {
+        let w = World::agent("");
+        copilot_pair_rows(&w, Some(2100));
+        w.state();
+        if report {
+            live::report(&w.ctx, Client::Copilot, 7100, 2100, X, "resume").unwrap();
+        }
+        w
+    };
+    let query = |w: &World| held_as(w, X, Client::Copilot, OsKind::Unix, &own);
+    let exited = |w: &World| {
+        let fakes = w.fakes.clone();
+        hooks::before_entry_read(Some(Box::new(move || fakes.forget(7100))));
+        let got = query(w);
+        hooks::before_entry_read(None);
+        got
+    };
+    for (report, live_loader, gone) in [
+        (
+            true,
+            Some((Rule::Caller, Some(7101))),
+            Some((Rule::Caller, Some(7101))),
+        ),
+        (false, None, Some((Rule::Evidence, Some(7101)))),
+    ] {
+        assert_eq!(
+            query(&pair(report)),
+            live_loader,
+            "report {report}: control"
+        );
+        assert_eq!(
+            exited(&pair(report)),
+            gone,
+            "report {report}: the loader exits"
+        );
+    }
+}

@@ -10,6 +10,8 @@ pub(super) struct Managed {
     pub(super) pid: u32,
     pub(super) start: i64,
     pub(super) session: Option<String>,
+    /// Call 29: the client read Dead at the registry read, after the saved table listed it.
+    pub(super) gone: bool,
 }
 
 /// H2, H3 from one read of every member (R1): managed clients, and each reserved conversation with the member that
@@ -94,12 +96,13 @@ pub(super) fn claim(ctx: &Ctx, rows: &[Row], id: &str, member: Member, c: &mut C
         };
         match bound(ctx, &g, n, rows) {
             Some((pid, start)) => {
-                let session = effective(ctx, &g, n, pid, start, own);
+                let (session, gone) = effective(ctx, &g, n, pid, start, own);
                 c.managed.push(Managed {
                     id: id.to_string(),
                     pid,
                     start,
                     session,
+                    gone,
                 });
             }
             None => {
@@ -150,12 +153,29 @@ pub(super) fn effective(
     pid: u32,
     start: i64,
     own: String,
+) -> (Option<String>, bool) {
+    let Some(kind) =
+        crate::agents::spawn::client_named(&crate::agents::text(g.record().get("client")))
+    else {
+        return (None, false);
+    };
+    match registry(ctx, kind, pid, start) {
+        Ok(found) => (session_of(g, n, found.entry, found.gone, own), found.gone),
+        Err(_) => (None, false),
+    }
+}
+
+/// `effective`'s session from the entry read. Call 29: a client gone since the saved table falls back to nothing
+/// (unknown, holds), never to its generation's session, when it left no entry or an ignored one.
+fn session_of(
+    g: &gens::Gen,
+    n: u64,
+    entry: Option<serde_json::Value>,
+    gone: bool,
+    own: String,
 ) -> Option<String> {
-    let kind = crate::agents::spawn::client_named(&crate::agents::text(g.record().get("client")))?;
-    let entry = match live::entry(ctx, kind, pid, start) {
-        Ok(None) => return Some(own),
-        Ok(Some(entry)) => entry,
-        Err(_) => return None,
+    let Some(entry) = entry else {
+        return (!gone).then_some(own);
     };
     let at = crate::util::parse_utc(&crate::agents::text(entry.get("at")))?;
     #[cfg(test)]
@@ -165,7 +185,7 @@ pub(super) fn effective(
     let launched = g.read(n, "launcher").known().ok()??;
     let launched = crate::util::parse_utc(&crate::agents::text(launched.get("startedAt")))?;
     if at < launched {
-        return Some(own);
+        return (!gone).then_some(own);
     }
     let id = crate::agents::text(entry.get("sessionId"));
     crate::checks::session_id(&id).then(|| id.to_ascii_lowercase())

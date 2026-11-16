@@ -176,6 +176,8 @@ pub fn held_on(
             return Some(Hold::of(rule, &e.proven));
         }
     }
+    // Call 29: a managed client gone since the saved table still holds; its surviving partner row is named first.
+    let mut gone: Option<Hold> = None;
     for row in &rows {
         if let Some(m) = managed_of(ctx, &c, row, &rows, os) {
             let rule = match m.session.as_deref() {
@@ -183,10 +185,15 @@ pub fn held_on(
                 Some(s) if s == wanted => Rule::Managed, // H4.2; its argv adds nothing
                 Some(_) => continue,
             };
-            return Some(Hold {
+            let hold = Hold {
                 member: Some(m.id.clone()),
                 ..Hold::of(rule, row)
-            });
+            };
+            if m.gone && row.pid == m.pid {
+                gone.get_or_insert(hold);
+                continue;
+            }
+            return Some(hold);
         }
         if exempted.as_ref().is_some_and(|e| e.covers(ctx, row)) {
             // Calls 1, 7: exempt from H4.4 and H4.5; still held by its argv (H4.3). Its report was read above.
@@ -203,9 +210,11 @@ pub fn held_on(
             return Some(hold); // H4.3-5
         }
     }
-    c.reserved
-        .get(&wanted)
-        .map(|id| Hold::member(Rule::Reserved, id)) // H4.6
+    gone.or_else(|| {
+        c.reserved
+            .get(&wanted)
+            .map(|id| Hold::member(Rule::Reserved, id)) // H4.6
+    })
 }
 
 /// Checklist 7 (call 16) test seam: runs in `effective` right before its second `launcher.json` read.
@@ -215,6 +224,18 @@ pub(crate) mod hooks {
     type Hook = Box<dyn Fn()>;
     thread_local! {
         static BEFORE: RefCell<Option<Hook>> = const { RefCell::new(None) };
+        static ENTRY: RefCell<Option<Hook>> = const { RefCell::new(None) };
+    }
+    /// Call 29: runs right before each registry read occupancy makes (its own table read for liveness).
+    pub fn before_entry_read(hook: Option<Hook>) {
+        ENTRY.with(|b| *b.borrow_mut() = hook);
+    }
+    pub(super) fn fire_before_entry_read() {
+        ENTRY.with(|b| {
+            if let Some(hook) = b.borrow().as_ref() {
+                hook()
+            }
+        });
     }
     pub fn before_launch_reread(hook: Option<Hook>) {
         BEFORE.with(|b| *b.borrow_mut() = hook);
@@ -226,6 +247,13 @@ pub(crate) mod hooks {
             }
         });
     }
+}
+
+/// Every registry read occupancy makes, through one seam (call 29): the entry, and whether its process is now gone.
+fn registry(ctx: &Ctx, kind: Client, pid: u32, start: i64) -> Res<live::Found> {
+    #[cfg(test)]
+    hooks::fire_before_entry_read();
+    live::lookup(ctx, kind, pid, start)
 }
 
 #[path = "occupancy_generations.rs"]

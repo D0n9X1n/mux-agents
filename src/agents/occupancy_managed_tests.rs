@@ -332,3 +332,69 @@ fn a_report_from_before_the_launch_proves_nothing() {
     );
     assert_eq!(held(&w, S, Client::Claude), None);
 }
+
+// Call 29: the saved table pairs Copilot loader 7100 with native child 7101. The loader exits between the saved table
+// and the registry read (seam `hooks::before_entry_read`) while the child survives. Its report naming X still holds X,
+// as Managed, named by the surviving child; with no entry at all the session is unknown (Evidence), never S alone.
+#[test]
+fn a_pair_whose_loader_exits_between_reads_still_holds_its_report() {
+    let pair = |report: bool| {
+        let w = World::human("");
+        let f = life(&w, "copilot", S);
+        let at = crate::util::utc_o(w.ctx.clock.now());
+        publish(
+            &gens::path(&f, 1, "launcher"),
+            &json!({"pid": 31337, "start": 1000, "startedAt": at}),
+        )
+        .unwrap();
+        publish(
+            &gens::path(&f, 1, "client"),
+            &json!({"pid": 7100, "start": 1500}),
+        )
+        .unwrap();
+        w.fakes.process(crate::testing::row(31337, 1, 1000));
+        let proc_row = |pid: u32, ppid: u32, file: &str| Row {
+            pid,
+            ppid,
+            start: Some(1500 + i64::from(pid - 7100)),
+            path: Some(format!("/usr/lib/{file}")),
+            argv: Some(vec![file.into()]),
+            image: Some(file.into()),
+        };
+        w.fakes.process(proc_row(7100, 31337, "node"));
+        w.fakes.process(proc_row(7101, 7100, "copilot"));
+        w.fakes.client(7100, Client::Copilot);
+        w.fakes.client(7101, Client::Copilot);
+        if report {
+            live::report(&w.ctx, Client::Copilot, 7100, 1500, X, "resume").unwrap();
+        }
+        w
+    };
+    let query = |w: &World| who(held_on(&w.ctx, X, Client::Copilot, OsKind::Unix, None));
+    let exited = |w: &World| {
+        let fakes = w.fakes.clone();
+        hooks::before_entry_read(Some(Box::new(move || fakes.forget(7100))));
+        let got = query(w);
+        hooks::before_entry_read(None);
+        got
+    };
+    for (report, live_loader, gone) in [
+        (
+            true,
+            Some((Rule::Managed, Some(7100))),
+            Some((Rule::Managed, Some(7101))),
+        ),
+        (false, None, Some((Rule::Evidence, Some(7101)))),
+    ] {
+        assert_eq!(
+            query(&pair(report)),
+            live_loader,
+            "report {report}: control"
+        );
+        assert_eq!(
+            exited(&pair(report)),
+            gone,
+            "report {report}: the loader exits"
+        );
+    }
+}
