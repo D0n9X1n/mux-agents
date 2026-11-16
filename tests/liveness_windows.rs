@@ -28,10 +28,12 @@ fn a_live_process_that_denies_queries_is_unknown_and_kept() {
         Ok(1)
     );
     native::deny_queries(&child);
+    let report = native::deny_report(&child);
+    eprintln!("deny: {report}");
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         assert!(
             ctx.os.row(pid).is_none(),
-            "precondition: the deny took effect (no row)"
+            "precondition: the deny took effect (no row): {report}"
         );
         let listed = ctx.os.table().unwrap().into_iter().find(|r| r.pid == pid);
         assert_eq!(

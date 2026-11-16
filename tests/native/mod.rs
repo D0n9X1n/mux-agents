@@ -83,3 +83,94 @@ pub fn deny_queries(child: &std::process::Child) {
     unsafe { LocalFree(sd) };
     assert_ne!(set, 0, "SetKernelObjectSecurity");
 }
+
+/// What a deny depends on, for a precondition that fails: this process's privileges and integrity (`whoami`), the DACL
+/// the child carries now, and what a fresh `OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION)` of it answers.
+#[cfg(windows)]
+pub fn deny_report(child: &std::process::Child) -> String {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, LocalFree};
+    use windows_sys::Win32::Security::Authorization::{
+        ConvertSecurityDescriptorToStringSecurityDescriptorW, GetSecurityInfo, SDDL_REVISION_1,
+        SE_KERNEL_OBJECT,
+    };
+    use windows_sys::Win32::Security::{DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR};
+    use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
+    let whoami = |arg: &str| match std::process::Command::new("whoami").arg(arg).output() {
+        Ok(o) => String::from_utf8_lossy(&o.stdout).into_owned(),
+        Err(e) => format!("whoami {arg}: {e}"),
+    };
+    let squeeze = |l: &str| l.split_whitespace().collect::<Vec<_>>().join(" ");
+    let privileges: Vec<String> = whoami("/priv")
+        .lines()
+        .filter(|l| l.starts_with("Se"))
+        .map(squeeze)
+        .collect();
+    let groups: Vec<String> = whoami("/groups")
+        .lines()
+        .filter(|l| l.contains("Mandatory Label") || l.contains("S-1-5-32-544"))
+        .map(squeeze)
+        .collect();
+    let mut sd: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
+    // SAFETY: the child's own handle (CreateProcess grants READ_CONTROL); the out pointers are valid or null; `sd` is
+    // freed below.
+    let got = unsafe {
+        GetSecurityInfo(
+            child.as_raw_handle(),
+            SE_KERNEL_OBJECT,
+            DACL_SECURITY_INFORMATION,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            &mut sd,
+        )
+    };
+    let dacl = if got != 0 {
+        format!("GetSecurityInfo error {got}")
+    } else {
+        let mut text: *mut u16 = std::ptr::null_mut();
+        let mut len = 0u32;
+        // SAFETY: `sd` came from GetSecurityInfo; valid out pointers; `text` is freed below.
+        let made = unsafe {
+            ConvertSecurityDescriptorToStringSecurityDescriptorW(
+                sd,
+                SDDL_REVISION_1,
+                DACL_SECURITY_INFORMATION,
+                &mut text,
+                &mut len,
+            )
+        };
+        let shown = if made == 0 {
+            // SAFETY: no preconditions.
+            format!("ConvertSecurityDescriptorToString error {}", unsafe {
+                GetLastError()
+            })
+        } else {
+            // SAFETY: `len` UTF-16 units written at `text` by the call above.
+            let units = unsafe { std::slice::from_raw_parts(text, len as usize) };
+            let s = String::from_utf16_lossy(units)
+                .trim_end_matches('\0')
+                .to_string();
+            // SAFETY: allocated by ConvertSecurityDescriptorToStringSecurityDescriptorW.
+            unsafe { LocalFree(text.cast()) };
+            s
+        };
+        // SAFETY: allocated by GetSecurityInfo.
+        unsafe { LocalFree(sd) };
+        shown
+    };
+    // SAFETY: a plain open; null on failure.
+    let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, child.id()) };
+    let open = if handle.is_null() {
+        // SAFETY: no preconditions.
+        format!("refused, error {}", unsafe { GetLastError() })
+    } else {
+        // SAFETY: the handle opened above, closed once.
+        unsafe { CloseHandle(handle) };
+        "opened".to_string()
+    };
+    format!(
+        "privileges {privileges:?}; groups {groups:?}; child DACL {dacl}; OpenProcess(QUERY_LIMITED) {open}"
+    )
+}
