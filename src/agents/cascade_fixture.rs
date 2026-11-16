@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 
 use serde_json::{Value, json};
 
+use super::core_fixture as cf;
 use super::fixture::World;
 use super::life_fixture as lf;
 use super::team_state::{Scope, Tx};
@@ -123,4 +124,71 @@ pub fn snapshot(dir: &Path) -> Vec<(PathBuf, Vec<u8>)> {
     }
     out.sort();
     out
+}
+/// hc's `get` reply for generation n's terminal of member `id`.
+pub fn wire_at(
+    w: &World,
+    id: &str,
+    n: u64,
+    state: &str,
+    reason: Option<&str>,
+    argv: &[&str],
+) -> Value {
+    json!({"address": addr_at(id, n), "name": lf::hc_name(n), "state": state, "reason": reason, "argv": argv,
+        "exit_code": if state == "finished" { json!(0) } else { Value::Null },
+        "labels": {"mux.managed": "1", "mux.team": lf::team(w), "mux.id": id, "mux.gen": n.to_string(),
+            "mux.name": "worker"}})
+}
+pub fn wire(w: &World, id: &str, state: &str, reason: Option<&str>, argv: &[&str]) -> Value {
+    wire_at(w, id, 1, state, reason, argv)
+}
+/// `gens::find` of generation n: connect, list by labels, get the one terminal.
+pub(crate) fn found_at(w: &World, id: &str, n: u64, first: &Value) {
+    cf::online(w);
+    let (label, g) = (format!("mux.id={id}"), format!("mux.gen={n}"));
+    let terminals = json!({"terminals": [{"address": addr_at(id, n)}]}).to_string();
+    cf::answer(
+        w,
+        &["ls", "--all", "--label", &label, "--label", &g, "--json"],
+        &terminals,
+    );
+    lf::get(w, &addr_at(id, n), first);
+}
+/// G11 on a Running generation n: search, the exact reread, the kill (b-calls 22, 54: no `get` after it).
+pub fn terminates_at(w: &World, id: &str, n: u64) {
+    let live = wire_at(w, id, n, "live", None, &lf::ARGV);
+    found_at(w, id, n, &live);
+    lf::get(w, &addr_at(id, n), &live);
+    cf::answer(w, &["kill", &addr_at(id, n), "--json"], "{}");
+}
+pub fn terminates(w: &World, id: &str) {
+    terminates_at(w, id, 1);
+}
+/// The kill fails: unresolved, nothing recorded but `kill.json` (b-calls 54: an attempt proves no end).
+pub fn kill_fails(w: &World, id: &str) {
+    let live = wire(w, id, "live", None, &lf::ARGV);
+    found_at(w, id, 1, &live);
+    lf::get(w, &addr(id), &live);
+    lf::fails(w, &["kill", &addr(id), "--json"]);
+}
+/// Messages with delivery id `exit-<id>-<n>` in PANE's mailbox file (`mail::read_mail` would move PANE's cursor
+/// and hide the next entry's notice).
+pub fn delivered_at(w: &World, id: &str, n: u64) -> usize {
+    let key = super::mail::mailbox_key(PANE, "").unwrap();
+    let text = std::fs::read_to_string(w.state().join("mail").join(format!("{key}.jsonl")))
+        .unwrap_or_default();
+    let want = super::gens::delivery_id(id, n);
+    let lines = text
+        .lines()
+        .filter_map(|l| serde_json::from_str::<Value>(l).ok());
+    lines.filter(|m| m["id"] == want.as_str()).count()
+}
+pub fn delivered(w: &World, id: &str) -> usize {
+    delivered_at(w, id, 1)
+}
+pub fn kills(w: &World, id: &str) -> usize {
+    lf::calls(w)
+        .iter()
+        .filter(|c| c[0] == "kill" && c[1] == addr(id))
+        .count()
 }

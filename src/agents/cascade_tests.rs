@@ -787,3 +787,162 @@ fn the_snapshot_void_rule_is_never_ran_recorded() {
         assert_eq!(t.nodes[V].void, want, "{case}");
     }
 }
+
+fn caller(w: &World) -> crate::caller::Caller {
+    w.caller()
+}
+fn kill_order(w: &World) -> Vec<String> {
+    (lf::calls(w).into_iter())
+        .filter(|c| c[0] == "kill")
+        .map(|c| c[1].clone())
+        .collect()
+}
+
+// C6, C7 ("stop A over A -> B -> C kills C, B, A"): deepest first; each complete entry gets its Stopped notice
+// (message, then marker); the journal is removed only after the last marker; L is untouched.
+#[test]
+fn execute_ends_c_then_b_then_a_and_removes_the_journal_last() {
+    let (w, s) = lf::world();
+    cx::chain(&w);
+    for id in [C, B, A] {
+        cx::terminates(&w, id);
+    }
+    let tx = cx::tx(&w, &s);
+    let j = prepare(&tx, A).unwrap();
+    let unprepared = Journal {
+        prepared: false,
+        ..j.clone()
+    };
+    let e = execute(&tx, &caller(&w), &unprepared).unwrap_err();
+    assert_eq!(e.check, "internal", "C6: prepared only");
+    let r = execute(&tx, &caller(&w), &j).unwrap();
+    assert!(r.stopped && r.unresolved.is_empty(), "{r:?}");
+    assert_eq!(r.ids, [C, B, A]);
+    assert_eq!(
+        kill_order(&w),
+        [cx::addr(C), cx::addr(B), cx::addr(A)],
+        "bottom-up"
+    );
+    for id in [C, B, A] {
+        let f = w.folder(id);
+        assert!(
+            gens::read(&f, 1, "ended").known().unwrap().is_some(),
+            "{id} ended"
+        );
+        assert!(
+            gens::read(&f, 1, "notice").known().unwrap().is_some(),
+            "{id} marker"
+        );
+        assert_eq!(cx::delivered(&w, id), 1, "{id}: one delivery");
+    }
+    assert!(!cx::journal_of(&w, A).exists() && !cx::stopped(&w, L));
+    w.fakes.hc_done().unwrap();
+}
+
+// C6 ("a failed kill keeps ancestors and journal"): C's kill fails: B and A are held (never asked of hc), the
+// sibling D under A still ends, the journal stays; the reply lists only C. The kept report answers a second stop
+// of A without a second prepare; the next finish completes it.
+#[test]
+fn a_failed_kill_keeps_its_ancestors_and_the_journal() {
+    let (w, s) = lf::world();
+    cx::chain(&w);
+    cx::member(&w, D, Some(A), 2, json!({}));
+    cx::kill_fails(&w, C);
+    cx::terminates(&w, D);
+    let tx = cx::tx(&w, &s);
+    let j = prepare(&tx, A).unwrap();
+    let r = execute(&tx, &caller(&w), &j).unwrap();
+    assert!(!r.stopped);
+    let names: Vec<(&str, &str)> = (r.unresolved.iter())
+        .map(|u| (u.name.as_str(), u.check))
+        .collect();
+    assert_eq!(names, [("w-c", "hc")]);
+    assert_eq!(
+        kill_order(&w),
+        [cx::addr(C), cx::addr(D)],
+        "B and A never killed"
+    );
+    assert!(cx::journal_of(&w, A).exists());
+    w.fakes.hc_done().unwrap();
+    cx::kill_fails(&w, C);
+    let kept = finish(&tx, &caller(&w)).unwrap();
+    assert_eq!(
+        stop(&tx, &caller(&w), A, &kept).unwrap(),
+        kept[0],
+        "the kept report; no second journal"
+    );
+    for id in [C, B, A] {
+        cx::terminates(&w, id);
+    }
+    let done = finish(&tx, &caller(&w)).unwrap();
+    assert!(done[0].stopped && !cx::journal_of(&w, A).exists());
+    assert_eq!(cx::kills(&w, D), 1, "D was ended once");
+    w.fakes.hc_done().unwrap();
+}
+
+// prelife-1c call 1 (G10): a pre-lifecycle member under A is no entry and gets no desired.json; its folder stays
+// byte-identical; A's cascade still completes.
+#[test]
+fn a_pre_lifecycle_member_under_a_is_left_byte_identical() {
+    let (w, s) = lf::world();
+    cx::member(&w, L, None, 0, json!({}));
+    cx::member(&w, A, Some(L), 1, json!({}));
+    std::fs::create_dir_all(w.folder(B)).unwrap();
+    let pre = json!({"id": B, "name": "w-b", "session": w.caller().session, "depth": 2,
+        "parentAgent": {"id": A}});
+    crate::state::fs::write_json(&w.folder(B).join("record.json"), &pre).unwrap();
+    let before = cx::snapshot(&w.folder(B));
+    cx::terminates(&w, A);
+    let tx = cx::tx(&w, &s);
+    let j = prepare(&tx, A).unwrap();
+    let ids: Vec<&str> = j.entries.iter().map(|e| e.id.as_str()).collect();
+    assert_eq!(ids, [A], "no entry for B");
+    assert!(
+        execute(&tx, &caller(&w), &j).unwrap().stopped,
+        "A's cascade completes"
+    );
+    assert_eq!(
+        cx::snapshot(&w.folder(B)),
+        before,
+        "B's folder byte-identical"
+    );
+    w.fakes.hc_done().unwrap();
+}
+
+// Checklist 26 (p1c call 19): an unprepared journal [B(pre), A] (B became pre-lifecycle between passes): the
+// replay writes nothing to B, reports it unresolved `prelife` and holds its ancestor A (no hc call); the journal stays.
+#[test]
+fn a_replayed_pre_lifecycle_entry_is_unresolved_and_left_byte_identical() {
+    let (w, s) = lf::world();
+    cx::member(&w, L, None, 0, json!({}));
+    cx::member(&w, A, Some(L), 1, json!({}));
+    std::fs::create_dir_all(w.folder(B)).unwrap();
+    let pre = json!({"id": B, "name": "w-b", "session": w.caller().session, "depth": 2,
+        "parentAgent": {"id": A}});
+    crate::state::fs::write_json(&w.folder(B).join("record.json"), &pre).unwrap();
+    cx::seed(&w, A, &[B, A], false);
+    let before = cx::snapshot(&w.folder(B));
+    let r = finish(&cx::tx(&w, &s), &caller(&w)).unwrap();
+    assert_eq!(r.len(), 1);
+    let names: Vec<(&str, &str)> = (r[0].unresolved.iter())
+        .map(|u| (u.name.as_str(), u.check))
+        .collect();
+    assert_eq!(names, [("w-b", "prelife")], "{r:?}");
+    assert!(!r[0].stopped && cx::journal_of(&w, A).exists());
+    assert_eq!(cx::snapshot(&w.folder(B)), before, "B byte-identical");
+    assert!(cx::stopped(&w, A), "A closed, held");
+    assert!(lf::calls(&w).is_empty(), "A held: never asked of hc");
+}
+
+// C7, call 14: a removal cut short after its rename leaves a tombstone; `waiting` stays true; the next `finish`
+// clears it and flushes its folder.
+#[test]
+fn finish_clears_a_tombstone_a_cut_short_removal_left() {
+    let (w, s) = lf::world();
+    cx::seed(&w, A, &[A], true);
+    let f = cx::journal_of(&w, A);
+    std::fs::rename(&f, f.with_extension("removed")).unwrap();
+    assert!(waiting(&w.ctx, &s));
+    assert!(finish(&cx::tx(&w, &s), &caller(&w)).unwrap().is_empty());
+    assert!(!f.with_extension("removed").exists() && !waiting(&w.ctx, &s));
+}
