@@ -1355,13 +1355,12 @@ fn send_read_spawn_and_stop_stay_bounded_during_a_resume() {
     }
 }
 
-// v11:25: every rewrite of a member's record is durable, focus's included. Resume X to Y, Y's view is gone, then
-// `focus worker` reopens it and rewrites Y's record with the new view. A failed flush of Y's folder after that
-// rewrite is reported (focus fails, the new view is cleaned up); the record on disk, as a power loss right after the
-// write leaves it, is whole JSON that keeps `resumedFrom`, `mailbox` and `sessionId`, and no temp file is left. With
-// the flush working, focus reopens the view.
+// v11:25, W1 (A3c Task 1, a3b call 40): Y, a resumed successor, is a lifecycle member, so `focus worker` reopens its
+// view and writes it to view.json only; Y's record.json, and with it `resumedFrom`, `mailbox` and `sessionId`, is
+// byte-identical and no temp file is left. The durable rewrite of a pre-lifecycle record is pinned by
+// `team_state::view_tests::a_pre_lifecycle_view_is_rewritten_durably`.
 #[test]
-fn focus_rewrites_a_resumed_record_durably() {
+fn focus_of_a_resumed_member_writes_only_its_view() {
     let w = World::human("");
     let x = member(&w, ID, json!({"pane": "%5", "window": "@1", "depth": 1}));
     w.panes(&[]);
@@ -1377,29 +1376,32 @@ fn focus_rewrites_a_resumed_record_durably() {
     let core = crate::hc::connect(&w.ctx).unwrap();
     let caller = w.caller();
     let folder = w.folder(&y);
-    crate::state::fs::fail_sync_dir(Some(&folder));
-    let got = crate::agents::view::focus_hc(&w.ctx, &core, &caller, "worker", None);
-    crate::state::fs::fail_sync_dir(None);
-    assert!(got.is_err(), "the failed flush is reported: {got:?}");
+    let before = std::fs::read(folder.join("record.json")).unwrap();
+    let focused = crate::agents::view::focus_hc(&w.ctx, &core, &caller, "worker", None).unwrap();
+    assert_eq!(focused.pane, "%9");
+    assert_eq!(
+        std::fs::read(folder.join("record.json")).unwrap(),
+        before,
+        "record.json untouched"
+    );
     let record = record_of(&w, &y);
     for (k, v) in [
         ("id", json!(y)),
         ("resumedFrom", json!(ID)),
         ("mailbox", json!(ID)),
         ("sessionId", json!(SESSION_ID)),
-        ("pane", json!("%9")),
     ] {
         assert_eq!(record[k], v, "{k}");
     }
+    assert!(record.get("pane").is_none(), "no pane in record.json");
+    let view = read_json(&folder.join("view.json")).unwrap().unwrap();
+    assert_eq!(view["pane"], "%9", "the new view");
     let left: Vec<_> = std::fs::read_dir(&folder)
         .unwrap()
         .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
         .filter(|n| n.ends_with(".tmp"))
         .collect();
     assert!(left.is_empty(), "{left:?}");
-    let focused = crate::agents::view::focus_hc(&w.ctx, &core, &caller, "worker", None).unwrap();
-    assert_eq!(focused.pane, "%9");
-    assert_eq!(record_of(&w, &y)["resumedFrom"], ID);
     w.fakes.hc_done().unwrap();
 }
 

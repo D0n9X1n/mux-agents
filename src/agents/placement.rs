@@ -38,6 +38,7 @@ pub fn placement(ctx: &Ctx, request: &Request) -> Res<Map<String, Value>> {
         Some(value) => Some(known(value).ok_or_else(|| usage("placement"))?),
     };
     let caller = resolve(ctx)?;
+    crate::cli::member_views(ctx, &caller)?;
     if caller.member.is_some() {
         // #137: a proven hc member is allowed only as the depth-0 leader `up` launched that its team record names,
         // proven again under the team lock (`tree::standing`), which is held while it reads or sets the option.

@@ -2423,6 +2423,7 @@ pub(crate) fn watch_on(
         );
     }
     let caller = resolve(ctx)?;
+    crate::cli::member_views(ctx, &caller)?;
     console_utf8();
     let ended = run_watch(ctx, &caller, open(), write);
     let mut reply = Map::new();
@@ -2450,6 +2451,7 @@ fn console_utf8() {}
 /// spawn's `ensure` never reopens a bar a returned -Close closed. Refused only from a tagged pane.
 pub fn sidebar(ctx: &Ctx, request: &Request) -> Res<Map<String, Value>> {
     let caller = resolve(ctx)?;
+    crate::cli::member_views(ctx, &caller)?;
     crate::agents::registry::untagged(ctx, &caller, "an agent pane cannot open the side bar")?;
     let close = request.switch("Close");
     lock(ctx, &lock_key("sidebar", &caller, &caller.session), || {
@@ -9538,5 +9540,4 @@ mod tests {
 }
 
 #[cfg(test)]
-#[path = "sidebar_hc_tests.rs"]
 mod hc_tests;

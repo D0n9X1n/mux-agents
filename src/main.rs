@@ -57,6 +57,7 @@ fn ctx(args: &[String]) -> Res<Ctx> {
         exe: exe()?,
         os: mux_agent::proc::host(),
         mux: RefCell::new(None),
+        member_mux: RefCell::new(mux_agent::mux::MemberMux::Caller),
         hc: Box::new(mux_agent::hc::NativeHc),
         clock: Box::new(SystemClock),
         admitted: false,

@@ -56,6 +56,11 @@ fn hc_worker_routes_without_mux_ancestry() {
         (caller::Kind::Agent, "%9", "@5", ID)
     );
     assert_eq!(
+        got.presentation,
+        Some(("%9".to_string(), "@5".to_string())),
+        "a presented member"
+    );
+    assert_eq!(
         (
             got.socket,
             got.server_pid,
@@ -782,3 +787,10 @@ fn a_lifecycle_proof_reads_only_its_active_generation() {
         );
     }
 }
+
+#[cfg(test)]
+mod k2_tests;
+#[cfg(test)]
+mod stop_tests;
+#[cfg(test)]
+mod views_tests;

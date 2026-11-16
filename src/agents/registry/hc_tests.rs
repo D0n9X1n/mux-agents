@@ -964,3 +964,30 @@ fn a_terminated_generation_is_noticed_once_by_an_ordinary_reap() {
         );
     }
 }
+
+// Checklist 6 (a3c call 32): `registry::record` reads the member's status; an unreadable mark beside a readable
+// lifecycle record refuses `(1, "evidence")` (R2: fails closed).
+#[test]
+fn a_lifecycle_record_beside_an_unreadable_mark_refuses_evidence() {
+    use crate::{agents::gens, state::evidence::publish};
+    let w = World::human("");
+    cf::member(&w, ID, json!({"lifecycle": 1, "hcName": "maaaaaaaa"}));
+    let f = w.folder(ID);
+    publish(
+        &gens::path(&f, 0, "launch"),
+        &json!({"hcName": "maaaaaaaa"}),
+    )
+    .unwrap();
+    let c = w.caller();
+    assert!(
+        record(&w.ctx, &c, ID).unwrap().is_some(),
+        "a readable member"
+    );
+    std::fs::create_dir_all(gens::dir(&f, 0)).unwrap();
+    std::fs::write(gens::path(&f, 0, "commit"), b"{\"co").unwrap();
+    assert_eq!(
+        record(&w.ctx, &c, ID).map_err(|e| (e.code, e.check)).err(),
+        Some((1, "evidence")),
+        "a torn commit mark"
+    );
+}

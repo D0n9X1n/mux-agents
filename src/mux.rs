@@ -28,6 +28,38 @@ pub struct Endpoint {
     pub server_pid: u32,
 }
 
+/// How a proven member's multiplexer is reached (ambiguity 16). A pane caller is `Caller`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MemberMux {
+    /// The caller's own variables, as before: `RealMux::connect`.
+    Caller,
+    /// A proven member whose view is presented: the server its proof saw, by endpoint and process start (PM call 9).
+    Live(Endpoint, i64),
+    /// A proven member whose views are down: no multiplexer; every call refuses `views`.
+    Down,
+}
+
+fn views_down<T>() -> Res<T> {
+    refuse(1, "views", crate::cli::VIEWS_DOWN)
+}
+
+/// The multiplexer, resolved on first use (4to6 #1). `Down` is checked before any cached multiplexer (PM call 10).
+pub fn ensure(ctx: &Ctx) -> Res<()> {
+    let member = ctx.member_mux.borrow().clone();
+    if member == MemberMux::Down {
+        return views_down();
+    }
+    if ctx.mux.borrow().is_some() {
+        return Ok(());
+    }
+    let mux = match member {
+        MemberMux::Live(endpoint, start) => RealMux::for_server(ctx, endpoint, start)?,
+        _ => RealMux::connect(ctx)?,
+    };
+    *ctx.mux.borrow_mut() = Some(Box::new(mux));
+    Ok(())
+}
+
 const VERSION_TIMEOUT: Duration = Duration::from_secs(5);
 const CALL_TIMEOUT: Duration = Duration::from_secs(15);
 const PIPE_PREFIX: &str = r"\\.\pipe\";
@@ -224,8 +256,31 @@ impl RealMux {
         Self::connect_endpoint(ctx, endpoint, version_timeout)
     }
 
-    pub(crate) fn for_member(ctx: &Ctx, endpoint: Endpoint) -> Res<RealMux> {
-        Self::connect_endpoint(ctx, endpoint, VERSION_TIMEOUT)
+    /// PM call 9: the multiplexer of exactly the server process `endpoint.server_pid` started at `start`, through that
+    /// process's own image. Gone, restarted, or not a multiplexer image: `views`. Never the caller's variables or PATH.
+    pub(crate) fn for_server(ctx: &Ctx, endpoint: Endpoint, start: i64) -> Res<RealMux> {
+        // PM calls 25, 29, 37: one process read gives both the start and the image (`Os::row`; on Unix
+        // `seam::read_row` rechecks the start after reading the path), so a pid reused between two reads can never
+        // lend its image. No row, or a row of another start, is no view.
+        let row = ctx.os.row(endpoint.server_pid);
+        let other = |r: &crate::proc::Row| r.start.is_none_or(|s| !ctx.os.same_start(start, s));
+        if row.as_ref().is_none_or(other) {
+            return views_down();
+        }
+        let image = row.and_then(|r| r.path);
+        let found = image
+            .and_then(|i| image_kind(&i, crate::state::root::HOST).map(|k| (PathBuf::from(i), k)));
+        let Some((bin, kind)) = found else {
+            return views_down();
+        };
+        let version = crate::spawn::captured(&bin, &["-V"], VERSION_TIMEOUT).ok();
+        gate(kind, version.as_ref())?;
+        Ok(RealMux {
+            bin,
+            socket: endpoint.socket,
+            kind,
+            timeout: CALL_TIMEOUT,
+        })
     }
 
     fn connect_endpoint(ctx: &Ctx, endpoint: Endpoint, version_timeout: Duration) -> Res<RealMux> {
@@ -267,10 +322,7 @@ impl Mux for RealMux {
 /// The only multiplexer path (MuxAgents.ps1:323-329): -N first, the multiplexer resolved on first use; a failed call
 /// refuses without echoing its stderr unless `allow_failure`.
 pub fn native(ctx: &Ctx, args: &[&str], allow_failure: bool) -> Res<Output> {
-    if ctx.mux.borrow().is_none() {
-        let mux = RealMux::connect(ctx)?;
-        *ctx.mux.borrow_mut() = Some(Box::new(mux));
-    }
+    ensure(ctx)?;
     let mut argv = vec!["-N"];
     argv.extend_from_slice(args);
     let mux = ctx.mux.borrow();
@@ -744,12 +796,13 @@ fn main() {
             let f = Fakes::default();
             let mut c = ctx_for(&f, Some(&bin), "TMUX", "");
             c.env = Env::default();
-            let m = RealMux::for_member(
+            let m = RealMux::for_server(
                 &c,
                 Endpoint {
                     socket: SOCKET.into(),
                     server_pid: 900,
                 },
+                9,
             )
             .unwrap();
             assert_eq!(m.kind().name(), name);
@@ -759,6 +812,129 @@ fn main() {
             );
             assert!(m.run(&["list-panes"]).is_err());
         }
+    }
+
+    // PM call 9: a member's multiplexer is the exact server its proof saw, from that process's own image; anything
+    // else is `views`, never a guess. PM call 10: Down refuses even with a multiplexer already built.
+    #[test]
+    fn a_member_mux_is_its_own_live_server_or_none() {
+        let fakes = Fakes::default();
+        let ctx_with = |m: MemberMux| {
+            let mut ctx = fakes.ctx();
+            ctx.env =
+                Env::from_pairs([("TMUX", format!("{SOCKET},901,0")), ("PATH", String::new())]);
+            *ctx.member_mux.borrow_mut() = m;
+            ctx
+        };
+        let views = |ctx: &Ctx| ensure(ctx).map_err(|e| (e.code, e.check)).err();
+        let ctx = ctx_with(MemberMux::Down);
+        assert!(ctx.mux.borrow().is_some(), "the fake multiplexer is built");
+        assert_eq!(views(&ctx), Some((1, "views")), "down, cached");
+        assert_eq!(
+            native(&ctx, &["list-panes"], true)
+                .map_err(|e| e.check)
+                .err(),
+            Some("views"),
+            "native too"
+        );
+        assert!(
+            fakes.mux_calls().is_empty(),
+            "the cached multiplexer is never called"
+        );
+        let live = MemberMux::Live(
+            Endpoint {
+                socket: SOCKET.into(),
+                server_pid: 900,
+            },
+            9,
+        );
+        let fresh = |row: Option<(i64, &str)>| {
+            fakes.forget(900);
+            if let Some((start, image)) = row {
+                let mut r = crate::testing::row(900, 1, start);
+                r.path = Some(image.into());
+                fakes.process(r);
+            }
+            let ctx = ctx_with(live.clone());
+            *ctx.mux.borrow_mut() = None;
+            ctx
+        };
+        let rmux = if cfg!(windows) {
+            r"C:\nowhere\rmux.exe"
+        } else {
+            "/nowhere/rmux"
+        };
+        let ctx = fresh(None);
+        assert_eq!(views(&ctx), Some((1, "views")), "server row gone");
+        assert!(ctx.mux.borrow().is_none(), "nothing built");
+        assert_eq!(
+            views(&fresh(Some((10, rmux)))),
+            Some((1, "views")),
+            "server changed (another start)"
+        );
+        let sh = if cfg!(windows) {
+            r"C:\Windows\System32\cmd.exe"
+        } else {
+            "/bin/sh"
+        };
+        assert_eq!(
+            views(&fresh(Some((9, sh)))),
+            Some((1, "views")),
+            "not a multiplexer image"
+        );
+        let e = ensure(&fresh(Some((9, rmux)))).unwrap_err();
+        assert_eq!(
+            e.message, "rmux 0.10 or later is required",
+            "its own image, gated; never PATH"
+        );
+        let ctx = ctx_with(MemberMux::Caller);
+        *ctx.mux.borrow_mut() = None;
+        assert!(
+            ensure(&ctx).unwrap_err().message.ends_with("was not found"),
+            "a pane caller's variables, as before"
+        );
+    }
+
+    // PM call 25: the start and the image come from one process read. A pid reused between two reads (open still
+    // answers the proof start 9; the row is another process, start 10, with a valid rmux image) is `views`; the
+    // server is read once, by `row`, never `open`. The same row with the proof start builds the multiplexer.
+    #[test]
+    fn a_member_mux_reads_its_server_once() {
+        let d = TempDir::new();
+        let bin = fake_mux(d.path(), "rmux", "rmux 0.10");
+        let f = Fakes::default();
+        let mut c = ctx_for(&f, None, "TMUX", "");
+        c.env = Env::default();
+        let server = |start: i64| {
+            f.forget(900);
+            let mut r = crate::testing::row(900, 1, start);
+            r.path = Some(bin.display().to_string());
+            f.process(r);
+        };
+        server(10);
+        f.opens(900, &[Some(9)]);
+        let endpoint = || Endpoint {
+            socket: SOCKET.into(),
+            server_pid: 900,
+        };
+        let before = f.os_calls().len();
+        let got = RealMux::for_server(&c, endpoint(), 9)
+            .err()
+            .map(|e| (e.code, e.check));
+        assert_eq!(got, Some((1, "views")), "a pid reused between reads");
+        let reads: Vec<String> = f
+            .os_calls()
+            .into_iter()
+            .skip(before)
+            .filter(|x| x.ends_with(" 900"))
+            .collect();
+        assert_eq!(reads, ["row 900"], "one process read");
+        server(9);
+        let built = RealMux::for_server(&c, endpoint(), 9);
+        assert!(
+            matches!(&built, Ok(m) if m.kind().name() == "rmux"),
+            "its own server"
+        );
     }
 
     #[test]

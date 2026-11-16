@@ -96,6 +96,7 @@ The commands below, and the Reply and Listen lines, run as-is in the Bash tool. 
 
 - `entry`: no usable `mux-agent` binary for this OS and architecture.
 - `herdr`: the caller runs in a herdr terminal outside tmux and rmux (`HC_TERMINAL_ID` is set); use herdr's own skills.
+- `views`: you are an agent whose team's views are down (its multiplexer server is gone): `focus`, `spawn`, `resume`, `sidebar`, `watch` and `placement` refuse until the person runs `up`; `send`, `read`, `report`, `status`, `stop` and `list` (without panes) still work.
 - `sandbox`: the caller runs in a sandbox: `SANDBOX_RUNTIME=1`, a macOS sandbox, Linux `NoNewPrivs`, or a Windows token that is unreadable, AppContainer, restricted or below Medium integrity.
 - `policy`: the caller's live policy is unreadable or is neither bypass nor allow-all. For Claude Code, `reason` says whether the transcript or the screen failed and why (for example `screen: no mode line`).
 - `flags`: a flag outside the allowlist, or an unreadable command line, on any `claude` or `copilot` process from the agent up to the pane.

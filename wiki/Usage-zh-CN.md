@@ -149,6 +149,8 @@ copilot plugin marketplace update mux-agents && copilot plugin update mux-agents
 
 对于像本插件这样的第三方插件市场，Claude Code 默认关闭后台自动更新。要开启它，打开 `/plugin`，进入 **Marketplaces**，选择 `mux-agents`，再选择 **Enable auto-update**。之后 Claude Code 会在会话中你发出第一条消息后的十分钟内刷新插件市场并更新磁盘上的插件；已在运行的窗格在你重启它们之前保留原来的二进制文件。
 
+从 0.2 升级到 0.3:由 0.2 启动且尚未运行的代理窗格会拒绝启动("started by an older mux-agent")。运行 `stop <name>` 结束它,或运行 `resume <name>` 重新启动它。
+
 ## 故障排查
 
 每次拒绝都是一行 JSON，由 `check` 指明原因：

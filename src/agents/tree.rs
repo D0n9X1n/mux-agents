@@ -306,7 +306,9 @@ pub fn standing(ctx: &Ctx, caller: &Caller, core: Option<&Core<'_>>) -> Res<Stan
             // The lifecycle commitment is proved by `prove_member` (A2b `lifecycle_client`: `gens::committed` of the
             // active generation, refusing on Unreadable), which `standing` must pass anyway.
             Some(Member::Life(g)) => (
-                super::team_state::presented(&folder, g.record().clone()).ok(),
+                g.status()
+                    .and_then(|s| super::team_state::presented(&g, &s))
+                    .ok(),
                 true,
             ),
             Some(Member::Pre(r)) => {
@@ -624,5 +626,4 @@ pub fn parent_level(
     Ok(team::policy(client, &flags))
 }
 #[cfg(test)]
-#[path = "tree_tests.rs"]
 pub(crate) mod tests;

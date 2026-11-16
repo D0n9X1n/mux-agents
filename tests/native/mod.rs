@@ -69,6 +69,7 @@ pub fn ctx(state: &Path) -> mux_agent::ctx::Ctx {
         exe: PathBuf::from(env!("CARGO_BIN_EXE_mux-agent")),
         os: mux_agent::proc::host(),
         mux: std::cell::RefCell::new(None),
+        member_mux: std::cell::RefCell::new(mux_agent::mux::MemberMux::Caller),
         hc: Box::new(mux_agent::hc::NativeHc),
         clock: Box::new(mux_agent::ctx::SystemClock),
         admitted: false,

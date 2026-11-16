@@ -42,6 +42,9 @@ pub struct Caller {
     pub member: Option<String>,
     /// A terminal identity whose D1 proof failed: never `member`; only `resolve_tree` returns it.
     pub candidate: Option<String>,
+    /// The caller's view, `(pane, window)`: a pane caller's own; a proven member's only while its active
+    /// generation's view is presented and its multiplexer server is live (proof-0b K2). None: views are down.
+    pub presentation: Option<(String, String)>,
 }
 
 const PROBE: &str = "#{pid}|#{pane_pid}|#{session_id}|#{window_id}|#{@agent-id}";
@@ -137,16 +140,17 @@ fn resolve_as(ctx: &Ctx, tree: bool) -> Res<Caller> {
         if c.candidate.is_some() && !tree {
             return Err(crate::agents::tree::tagged());
         }
-        if ctx.mux.borrow().is_none() {
-            let mux = crate::mux::RealMux::for_member(
-                ctx,
+        // 4to6 #1, PM call 9: nothing is built here; a verb that needs the multiplexer reaches exactly this server.
+        *ctx.member_mux.borrow_mut() = match c.presentation {
+            Some(_) => crate::mux::MemberMux::Live(
                 crate::mux::Endpoint {
                     socket: c.socket.clone(),
                     server_pid: c.server_pid,
                 },
-            )?;
-            *ctx.mux.borrow_mut() = Some(Box::new(mux));
-        }
+                c.server_start,
+            ),
+            None => crate::mux::MemberMux::Down,
+        };
         return Ok(c);
     }
     let not_inside = || endpoint_refusal(&crate::mux::not_inside(crate::mux::env_kind(&ctx.env)));
@@ -236,6 +240,7 @@ fn resolve_as(ctx: &Ctx, tree: bool) -> Res<Caller> {
         agent_tag: probe.tag.to_string(),
         member: None,
         candidate: None,
+        presentation: Some((pane.to_string(), probe.window.to_string())),
     })
 }
 
@@ -748,6 +753,11 @@ mod tests {
                 caller.agent_tag.as_str()
             ),
             ("%1", "@1", "$3", "")
+        );
+        assert_eq!(
+            caller.presentation,
+            Some(("%1".to_string(), "@1".to_string())),
+            "a pane caller is presented"
         );
         // A caller that is the pane process has a one-row chain.
         let fakes = human_with_probe(0, &format!("900|{CALLER}|$3|@1|\n"));

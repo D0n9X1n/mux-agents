@@ -297,5 +297,4 @@ pub fn needs_recovery(
 }
 
 #[cfg(test)]
-#[path = "outcome_tests.rs"]
 mod tests;

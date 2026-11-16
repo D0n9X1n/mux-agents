@@ -143,6 +143,7 @@ pub fn spawn(ctx: &Ctx, request: &Request) -> Res<Map<String, Value>> {
         return Err(usage("spawn"));
     };
     let caller = crate::caller::resolve_tree(ctx)?;
+    crate::cli::member_views(ctx, &caller)?;
     let outside = matches!(
         super::tree::scope(ctx, &caller)?,
         super::tree::Scope::Outside
@@ -3762,7 +3763,6 @@ mod tests {
 }
 
 #[cfg(test)]
-#[path = "spawn_hc_tests.rs"]
 mod hc_tests;
 pub struct CoreRequest<'a> {
     pub client: Client,

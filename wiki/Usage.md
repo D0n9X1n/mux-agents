@@ -149,6 +149,8 @@ Why: each agent pane and the side bar run the binary by the absolute path they s
 
 Claude Code turns background auto-update off by default for a third-party marketplace such as this one. To turn it on, open `/plugin`, go to **Marketplaces**, select `mux-agents` and select **Enable auto-update**. Claude Code then, within ten minutes of your first message in a session, refreshes the marketplace and updates the plugin on disk; panes already running keep their binary until you restart them.
 
+From 0.2 to 0.3: an agent pane started by 0.2 and not yet running refuses to launch ("started by an older mux-agent"). Run `stop <name>` to end it, or `resume <name>` to start it again.
+
 ## Troubleshooting
 
 Every refusal is one JSON line with `check` naming the cause:

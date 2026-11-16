@@ -458,6 +458,7 @@ impl Fakes {
             exe: PathBuf::from("/bin/mux-agent"),
             os: Box::new(self.clone()),
             mux: RefCell::new(Some(Box::new(self.clone()))),
+            member_mux: RefCell::new(crate::mux::MemberMux::Caller),
             hc: Box::new(self.clone()),
             clock: Box::new(self.clone()),
             admitted: false,

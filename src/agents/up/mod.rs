@@ -135,6 +135,7 @@ fn create(ctx: &Ctx, caller: &Caller, core: &Core<'_>, plan: &Plan<'_>) -> Res<M
         pane: String::new(),
         window: window.clone(),
         session: session.clone(),
+        presentation: Some((String::new(), window.clone())),
         ..caller.clone()
     };
     server::same(ctx, &dest).map_err(fail)?;
