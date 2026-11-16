@@ -114,6 +114,18 @@ pub fn fail_sync_dir(dir: Option<&Path>) {
 
 #[cfg(test)]
 thread_local! {
+    // A folder whose (n+1)th `sync_dir` on this thread fails, once.
+    static NTH_FAULT: std::cell::RefCell<Option<(PathBuf, usize)>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Makes the (n+1)th `sync_dir(dir)` on this thread fail, once (none: no failure); other folders still flush.
+#[cfg(test)]
+pub fn fail_sync_dir_nth(dir: Option<&Path>, n: usize) {
+    NTH_FAULT.with(|f| *f.borrow_mut() = dir.map(|d| (d.to_path_buf(), n)));
+}
+
+#[cfg(test)]
+thread_local! {
     // A file whose flush fails on this thread; its `.<hex>.tmp` siblings (the durable write temp file) fail too.
     static FILE_FAULT: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) };
 }
@@ -244,6 +256,27 @@ pub fn sync_dir(dir: &Path) -> io::Result<()> {
     if SYNC_FAULT.with(|fault| fault.borrow().as_deref() == Some(dir)) {
         return Err(io::Error::other("injected folder flush failure"));
     }
+    #[cfg(test)]
+    if NTH_FAULT.with(|f| {
+        let mut f = f.borrow_mut();
+        let hit = match f.as_mut() {
+            Some((d, n)) if d.as_path() == dir => {
+                if *n == 0 {
+                    true
+                } else {
+                    *n -= 1;
+                    false
+                }
+            }
+            _ => false,
+        };
+        if hit {
+            *f = None;
+        }
+        hit
+    }) {
+        return Err(io::Error::other("injected nth folder flush failure"));
+    }
     #[cfg(windows)]
     {
         use std::os::windows::fs::OpenOptionsExt;
@@ -350,6 +383,17 @@ pub fn read_json(path: &Path) -> Res<Option<Value>> {
     serde_json::from_slice(text)
         .map(Some)
         .map_err(|_| Refusal::internal("state file is not JSON"))
+}
+
+/// A file's bytes, read once; test builds record the path as `read_json`'s reads are (`record_reads`).
+pub fn read_bytes(path: &Path) -> io::Result<Vec<u8>> {
+    #[cfg(test)]
+    READS.with(|reads| {
+        if let Some(reads) = reads.borrow_mut().as_mut() {
+            reads.push(path.to_path_buf());
+        }
+    });
+    std::fs::read(path)
 }
 
 /// A task, brief or body file as strict UTF-8 without its BOM; a missing, unreadable, oversized or non-UTF-8
@@ -894,5 +938,28 @@ mod tests {
             assert_eq!(read_json(&path).unwrap(), None);
             assert!(names(dir.path()).is_empty());
         }
+    }
+
+    #[test]
+    fn the_nth_flush_of_a_folder_fails_once() {
+        let dir = TempDir::new();
+        let (a, b) = (dir.path().join("a"), dir.path().join("b"));
+        for d in [&a, &b] {
+            std::fs::create_dir(d).unwrap();
+        }
+        fail_sync_dir_nth(Some(&a), 1);
+        assert!(sync_dir(&b).is_ok(), "another folder");
+        assert!(sync_dir(&a).is_ok(), "the first flush of a");
+        assert!(sync_dir(&a).is_err(), "the second fails");
+        assert!(sync_dir(&a).is_ok(), "once");
+    }
+
+    #[test]
+    fn read_bytes_reads_and_is_recorded() {
+        let dir = TempDir::new();
+        let f = dir.path().join("f");
+        std::fs::write(&f, b"x\n").unwrap();
+        let (got, reads) = record_reads(|| read_bytes(&f).unwrap());
+        assert_eq!((got, reads), (b"x\n".to_vec(), vec![f.clone()]));
     }
 }
