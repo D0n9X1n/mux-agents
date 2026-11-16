@@ -1615,6 +1615,12 @@ fn a_lifecycle_successor_is_judged_by_its_own_generations() {
     );
     assert_eq!(got(), Some(Y.to_string()), "pending 2 undecided");
     publish(&gens::path(&y, 2, "commit"), &json!({"aborted": true})).unwrap();
+    assert_eq!(
+        got(),
+        Some(Y.to_string()),
+        "generation 1 ran, though the record no longer names it (G5)"
+    );
+    std::fs::remove_dir_all(gens::dir(&y, 1)).unwrap();
     assert_eq!(got(), None, "a void first launch takes nothing");
     std::fs::write(gens::claim_path(&y, 2), b"\"aban").unwrap();
     assert_eq!(got(), Some(Y.to_string()), "a torn claim takes it");
@@ -1773,5 +1779,68 @@ fn a_pending_conversation_is_held_until_its_generation_is_done() {
             [false, false],
             "first {first}: both generations done: both free"
         );
+    }
+}
+
+// settle-1b G5, b-calls 10: a successor whose committed generation was settled (core death: Lost, Normal promotes
+// then releases; Lost or Ended in Fence leaves a record naming no generation) ran, so its predecessor's task is
+// never eligible again: `taken` names it and `ran_nothing` (up discover, tree scope) says it ran. A torn unnamed
+// generation holds it (`taken`) and refuses (`ran_nothing`, `evidence`).
+#[test]
+fn a_fenced_successor_keeps_its_predecessor_taken() {
+    use crate::agents::settle::{Mode, Outcome};
+    use crate::agents::team_state::Tx;
+    use crate::agents::{core_fixture as cf, gens, life_fixture as lf};
+    for case in ["normal lost", "fence lost", "fence ended", "torn unnamed"] {
+        let (w, s) = lf::world();
+        let m = if case == "torn unnamed" {
+            let m = lf::life(&w, json!({"resumedFrom": Y}));
+            lf::seed_gen(&m, 0, Some("abandoned"), None);
+            std::fs::create_dir_all(gens::dir(&m, 1)).unwrap();
+            std::fs::write(gens::path(&m, 1, "commit"), b"{").unwrap();
+            m
+        } else {
+            let mut p = lf::pending(0);
+            p["kind"] = json!("resume");
+            let m = lf::life(&w, json!({"resumedFrom": Y, "pending": p}));
+            lf::seed_gen(&m, 0, Some("run"), lf::committed());
+            cf::online(&w);
+            if case == "fence ended" {
+                lf::found(&w, 0, &lf::ended(&w, 0));
+            } else {
+                lf::found(&w, 0, &lf::lost(&w, 0, lf::LOST_ARGVS[0]));
+                lf::get(&w, "t0", &lf::lost(&w, 0, lf::LOST_ARGVS[0]));
+                lf::relabel(&w, "t0");
+            }
+            let mode = if case == "normal lost" {
+                Mode::Normal
+            } else {
+                Mode::Fence
+            };
+            let got = Tx {
+                ctx: &w.ctx,
+                scope: s.clone(),
+            }
+            .settle(ID, mode)
+            .unwrap();
+            assert!(
+                matches!(got, Outcome::Promoted | Outcome::Done),
+                "{case}: {got:?}"
+            );
+            m
+        };
+        assert_eq!(
+            taken(&w.ctx, &w.caller(), Y).unwrap(),
+            Some(ID.to_string()),
+            "{case}: the task is free again"
+        );
+        let ran =
+            crate::agents::up::discover::ran_nothing(&m, &gens::member_of(&m)).map_err(|e| e.check);
+        let want = if case == "torn unnamed" {
+            Err("evidence")
+        } else {
+            Ok(false)
+        };
+        assert_eq!(ran, want, "{case}: ran nothing");
     }
 }

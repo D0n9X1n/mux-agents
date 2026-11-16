@@ -1861,4 +1861,39 @@ mod tests {
         }
         assert_eq!(lf::calls(&w).len(), 0, "hc asked about a linked member");
     }
+
+    // settle-1b G5 in fence mode (b-calls 3, 10): a committed pending generation released (Lost) or ended in Fence
+    // leaves a record that names no generation. It ran: `never_ran_recorded` is false; the member is finished.
+    #[test]
+    fn a_committed_generation_fenced_never_counts_as_never_ran() {
+        for life in ["lost", "ended"] {
+            let (w, s) = lf::world();
+            let m = committed_of(&w, "spawn");
+            cf::online(&w);
+            if life == "lost" {
+                lf::found(&w, 1, &lf::lost(&w, 1, lf::LOST_ARGVS[0]));
+                lf::get(&w, "t1", &lf::lost(&w, 1, lf::LOST_ARGVS[0]));
+                lf::relabel(&w, "t1");
+            } else {
+                lf::found(&w, 1, &lf::ended(&w, 1));
+            }
+            assert_eq!(
+                settle(&w, &s, Mode::Fence).unwrap(),
+                Outcome::Done,
+                "{life}"
+            );
+            let r = lf::record(&m);
+            assert!(
+                r.get("generation").is_none() && r.get("pending").is_none(),
+                "{life}: names nothing"
+            );
+            let gens::Member::Life(g) = gens::member_of(&m) else {
+                panic!("{life}: not a lifecycle member")
+            };
+            let st = g.status().unwrap();
+            assert!(!g.never_ran_recorded(&st).unwrap(), "{life}: it ran");
+            assert!(st.finished, "{life}");
+            w.fakes.hc_done().unwrap();
+        }
+    }
 }

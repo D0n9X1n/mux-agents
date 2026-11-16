@@ -486,6 +486,27 @@ impl Gen {
         self.status_given(None)
     }
 
+    /// settle-1b G5, b-calls 10, 23: no generation ran. A3a's rule (`Status::never_ran`, call 17: no active
+    /// generation; pending absent, or void AND done), and every other generation `named` lists has recorded void
+    /// evidence (claim `abandoned` or commit `aborted`). A committed generation released or ended in fence mode ran.
+    /// The other generations are read only when `Status::never_ran` holds; pending is never read twice. Unreadable
+    /// is `Err` (R2).
+    pub fn never_ran_recorded(&self, s: &Status) -> Res<bool> {
+        if !s.never_ran {
+            return Ok(false);
+        }
+        for n in named(&self.folder)? {
+            if Some(n) == self.pending {
+                continue;
+            }
+            let m = marks(&self.folder, n)?;
+            if !(m.abandoned || m.decision == Some(Decision::Aborted)) {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
     /// `status` with generation `ended`'s `ended.json` taken as already read Present (b-calls 32).
     pub fn status_given(&self, ended: Option<u64>) -> Res<Status> {
         let pm = self
@@ -1075,8 +1096,9 @@ mod tests {
 
     /// Seeds `files` (generation, file, value; `"claim"` is `gens/<n>.claim`; the value `"TORN"` writes torn bytes)
     /// beside `record`, then answers `status()`.
-    fn status_of(record: Value, files: &[(u64, &str, Value)]) -> Res<Status> {
-        let (_d, m) = life(record);
+    /// A member seeded with `record` and generation files (`"TORN"`: torn bytes).
+    fn seed(record: Value, files: &[(u64, &str, Value)]) -> (crate::testing::TempDir, PathBuf) {
+        let (d, m) = life(record);
         for (n, f, v) in files {
             let at = if *f == "claim" {
                 claim_path(&m, *n)
@@ -1090,7 +1112,121 @@ mod tests {
                 crate::state::fs::write_json(&at, v).unwrap();
             }
         }
+        (d, m)
+    }
+    fn status_of(record: Value, files: &[(u64, &str, Value)]) -> Res<Status> {
+        let (_d, m) = seed(record, files);
         gen_of(&m).status()
+    }
+
+    /// The status and the whole never-ran answer, from one seeded member (b-calls 10, 23).
+    fn status_ran(record: Value, files: &[(u64, &str, Value)]) -> (Res<Status>, Res<bool>) {
+        let (_d, m) = seed(record, files);
+        let g = gen_of(&m);
+        let s = g.status();
+        let ran = s
+            .as_ref()
+            .map_err(Clone::clone)
+            .and_then(|s| g.never_ran_recorded(s));
+        (s, ran)
+    }
+
+    // settle-1b G5, b-calls 10, 23 (F12): `never_ran_recorded` is true only when every generation a file names has
+    // recorded void evidence; a committed generation released or ended in fence mode ran. The other generations are
+    // read only when A3a's `Status::never_ran` holds (call 17: pending void AND done). `status` itself never reads
+    // an unnamed generation, so it stays answerable beside a torn one.
+    #[test]
+    fn never_ran_needs_recorded_void_evidence_for_every_generation() {
+        let none = || json!({"lifecycle": 1});
+        let p2 = || json!({"lifecycle": 1, "pending": {"gen": 2}});
+        let (ab, ok, end, torn) = (
+            json!({"aborted": true}),
+            json!({"committed": true}),
+            json!({"state": "finished"}),
+            json!("TORN"),
+        );
+        type Case<'a> = (
+            &'a str,
+            Value,
+            Vec<(u64, &'a str, Value)>,
+            Result<bool, &'a str>,
+        );
+        let cases: Vec<Case> = vec![
+            ("nothing", none(), vec![], Ok(true)),
+            (
+                "unnamed abandoned",
+                none(),
+                vec![(0, "claim", json!("abandoned"))],
+                Ok(true),
+            ),
+            (
+                "unnamed aborted",
+                none(),
+                vec![(0, "commit", ab.clone())],
+                Ok(true),
+            ),
+            (
+                "fence released: it ran",
+                none(),
+                vec![(0, "commit", ok.clone()), (0, "released", json!({}))],
+                Ok(false),
+            ),
+            (
+                "fence ended: it ran",
+                none(),
+                vec![(0, "commit", ok.clone()), (0, "ended", end.clone())],
+                Ok(false),
+            ),
+            (
+                "a void and a run",
+                none(),
+                vec![(0, "claim", json!("abandoned")), (1, "commit", ok.clone())],
+                Ok(false),
+            ),
+            (
+                "unnamed torn",
+                none(),
+                vec![(0, "commit", torn.clone())],
+                Err("evidence"),
+            ),
+            (
+                "pending void, unnamed ran",
+                p2(),
+                vec![(2, "commit", ab.clone()), (1, "commit", ok.clone())],
+                Ok(false),
+            ),
+            (
+                "pending void, completing holds it, unnamed torn",
+                json!({"lifecycle": 1, "pending": {"gen": 2}, "completing": {"gen": 2}}),
+                vec![(2, "commit", ab.clone()), (1, "commit", torn.clone())],
+                Ok(false),
+            ),
+            (
+                "active, unnamed torn: not read",
+                json!({"lifecycle": 1, "generation": "1", "hcName": "m0123abcd"}),
+                vec![(1, "commit", ok.clone()), (0, "commit", torn.clone())],
+                Ok(false),
+            ),
+        ];
+        for (case, record, files, want) in cases {
+            let (s, ran) = status_ran(record, &files);
+            assert!(s.is_ok(), "{case}: status reads only named generations");
+            assert_eq!(ran.map_err(|e| e.check), want, "{case}");
+        }
+        let (_d, m) = seed(p2(), &[(2, "commit", ab.clone())]);
+        let g = gen_of(&m);
+        let (got, reads) =
+            crate::state::fs::record_reads(|| g.status().and_then(|s| g.never_ran_recorded(&s)));
+        assert!(
+            got.unwrap(),
+            "a void, done pending generation alone never ran"
+        );
+        let commit = path(&m, 2, "commit");
+        assert_eq!(
+            reads.iter().filter(|p| **p == commit).count(),
+            1,
+            "the pending generation is read once"
+        );
     }
 
     // R2, R3, R4 (audit A5, C3): one read answers subject, held, finished and never_ran; an unreadable marker refuses.

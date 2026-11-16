@@ -35,7 +35,7 @@ pub fn refuse_existing(ctx: &Ctx, core: &Core<'_>, key: &str, team: &str) -> Res
         let life = match &member {
             Member::Life(g) => {
                 let s = g.status()?;
-                if s.never_ran {
+                if g.never_ran_recorded(&s)? {
                     continue;
                 }
                 if s.finished {
@@ -72,12 +72,16 @@ pub fn refuse_existing(ctx: &Ctx, core: &Core<'_>, key: &str, team: &str) -> Res
     Ok(())
 }
 
-/// Decision 1, R2: a lifecycle member ran nothing only by `Status::never_ran`; a pre-lifecycle one when its
+/// Decision 1, R2: a lifecycle member ran nothing only by `Gen::never_ran_recorded` (b-calls 10, 23); a
+/// pre-lifecycle one when its
 /// uncommitted launch's abort evidence proves nothing runs (no uncertain run, no uncertain kill). Unreadable refuses
 /// (ambiguity 15).
 pub(crate) fn ran_nothing(folder: &Path, member: &Member) -> Res<bool> {
     match member {
-        Member::Life(g) => Ok(g.status()?.never_ran),
+        Member::Life(g) => {
+            let s = g.status()?;
+            g.never_ran_recorded(&s)
+        }
         Member::Unreadable(e) => Err(e.clone()),
         Member::Pre(_) | Member::Absent => Ok(!folder.join("commit.json").exists()
             && matches!(read_json(&folder.join("abort.json")), Ok(Some(a))

@@ -306,7 +306,8 @@ fn taken(ctx: &Ctx, caller: &crate::caller::Caller, id: &str) -> Res<Option<Stri
         }
         if let Member::Life(g) = &member {
             // R1, R2: one status; only a proven void first launch frees the member.
-            if matches!(g.status(), Ok(s) if s.never_ran) {
+            // b-calls 10, 23: never ran only by recorded void evidence; an Unreadable answer takes it.
+            if let Ok(true) = g.status().and_then(|s| g.never_ran_recorded(&s)) {
                 continue;
             }
             return Ok(Some(successor));
