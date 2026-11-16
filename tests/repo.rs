@@ -934,6 +934,16 @@ const TEST_ONLY: &[(&str, &str, &str)] = &[
         "reconcile_tests",
     ),
     (
+        "src/agents/reconcile_verb_race_tests.rs",
+        "src/agents/mod.rs",
+        "reconcile_verb_race_tests",
+    ),
+    (
+        "src/agents/reconcile_verb_tests.rs",
+        "src/agents/mod.rs",
+        "reconcile_verb_tests",
+    ),
+    (
         "src/agents/session_report_tests.rs",
         "src/agents/mod.rs",
         "session_report_tests",
@@ -964,6 +974,11 @@ const TEST_ONLY: &[(&str, &str, &str)] = &[
         "view_tests",
     ),
     ("src/agents/tree/tests.rs", "src/agents/tree.rs", "tests"),
+    (
+        "src/agents/up/existing_tests.rs",
+        "src/agents/up/mod.rs",
+        "existing_tests",
+    ),
     ("src/agents/up/tests.rs", "src/agents/up/mod.rs", "tests"),
     (
         "src/agents/kept_tests.rs",

@@ -59,6 +59,10 @@ mod reconcile_restore_tests;
 mod reconcile_run_tests;
 #[cfg(test)]
 mod reconcile_tests;
+#[cfg(test)]
+mod reconcile_verb_race_tests;
+#[cfg(test)]
+mod reconcile_verb_tests;
 pub mod registry;
 pub mod release;
 pub mod resume;

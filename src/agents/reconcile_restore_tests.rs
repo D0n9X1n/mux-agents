@@ -22,7 +22,7 @@ pub(super) fn released_by_hc(w: &World, id: &str, argv: &[&str]) {
     lf::relabel(w, &a);
 }
 /// An unmanaged client of the kind (occupy-3 H4.4), on another conversation.
-fn unmanaged_claude(w: &World, pid: u32) {
+pub(super) fn unmanaged_claude(w: &World, pid: u32) {
     let (path, image) = if cfg!(windows) {
         ("C:/bin/claude.exe", "claude.exe")
     } else {
