@@ -1,7 +1,7 @@
 //! The one writer of `record.json` and `desired.json` (#103 state-0 S3), and of `view.json` (S4).
 use std::path::{Path, PathBuf};
 
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 
 use crate::caller::Caller;
 use crate::ctx::Ctx;
@@ -80,7 +80,98 @@ pub fn held<T>(ctx: &Ctx, scope: &Scope, f: impl FnOnce(&Tx<'_>) -> Res<T>) -> R
     f(&tx)
 }
 
+/// Call 18b: what a record write requires of the record it reads under the member lock. Every condition is listed
+/// here, so one table tests them all (call 19).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Guard<'a> {
+    /// No record.
+    Create,
+    /// A lifecycle record; `None`: no `pending` key; `Some(n)`: `pending.gen == n`.
+    PendingGen { n: Option<u64> },
+    /// A lifecycle record whose `pending` names generation `n` with hc name `hc_name` (this launch).
+    Pending { n: u64, hc_name: &'a str },
+    /// A lifecycle record whose `completing.gen == n` (group B clears `completing`).
+    CompletingGen { n: u64 },
+}
+
+impl Guard<'_> {
+    /// Whether the record read (None: absent) qualifies. `abort` asks this of its own read too: one definition of
+    /// ownership.
+    pub fn admits(self, record: Option<&Value>) -> bool {
+        let Some(r) = record else {
+            return self == Guard::Create;
+        };
+        if !super::gens::lifecycle(r) {
+            return false;
+        }
+        let gen_of = |k: &str| r.get(k).and_then(|v| v.get("gen")).and_then(Value::as_u64);
+        match self {
+            Guard::Create => false,
+            // A present key, `null` included, is a pending.
+            Guard::PendingGen { n: None } => r.get("pending").is_none(),
+            Guard::PendingGen { n: Some(n) } => gen_of("pending") == Some(n),
+            Guard::Pending { n, hc_name } => {
+                gen_of("pending") == Some(n) && r["pending"]["hcName"].as_str() == Some(hc_name)
+            }
+            Guard::CompletingGen { n } => gen_of("completing") == Some(n),
+        }
+    }
+}
+
+/// R-W3: a record write or one of its flushes failed.
+pub const NOT_WRITTEN: &str = "the member record could not be written";
+
+fn not_written() -> Refusal {
+    Refusal {
+        code: 1,
+        check: "state",
+        message: NOT_WRITTEN.into(),
+        reason: None,
+        leftover: None,
+        details: Default::default(),
+    }
+}
+
 impl Tx<'_> {
+    /// Call 18b, R-W2: the one lifecycle record writer. Under the member lock: one read through the walk
+    /// (`gens::record`; a link at `<id>`, torn bytes: `evidence`), `guard.admits` of that read, `patch`, one
+    /// `write_json_durable` (content, then the member folder); a created record also flushes `agents`.
+    /// `Ok(None)`: the guard refused, nothing written and the patch never called. A patch error is returned and
+    /// nothing is written; a refused or failed create makes no folder.
+    pub fn record_write(
+        &self,
+        id: &str,
+        guard: Guard<'_>,
+        patch: impl FnOnce(&mut Map<String, Value>) -> Res<()>,
+    ) -> Res<Option<Value>> {
+        let folder = self.folder(id);
+        super::lock(self.ctx, &self.scope.member_lock(id), || {
+            let read = super::gens::record(&folder).known()?;
+            if !guard.admits(read.as_ref()) {
+                return Ok(None);
+            }
+            let created = read.is_none();
+            // `admits` takes only a lifecycle record (an object) or, for `Create`, none.
+            let mut fields = match read {
+                Some(Value::Object(m)) => m,
+                _ => Map::new(),
+            };
+            patch(&mut fields)?;
+            if created {
+                fields.insert("lifecycle".into(), json!(1));
+                fields.insert("id".into(), json!(id));
+                super::spawn::private_folder(self.ctx, &folder).map_err(|_| not_written())?;
+            }
+            let record = Value::Object(fields);
+            write_json_durable(&folder.join("record.json"), &record).map_err(|_| not_written())?;
+            if created {
+                let agents = self.scope.agents(&self.ctx.state_root);
+                crate::state::fs::sync_dir(&agents).map_err(|_| not_written())?;
+            }
+            Ok(Some(record))
+        })
+    }
+
     pub fn folder(&self, id: &str) -> PathBuf {
         self.scope.agents(&self.ctx.state_root).join(id)
     }
@@ -554,3 +645,7 @@ mod tests {
         assert_eq!(std::fs::read(&at).unwrap(), b"{");
     }
 }
+
+#[cfg(test)]
+#[path = "record_write_tests.rs"]
+mod record_write_tests;
