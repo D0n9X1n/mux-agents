@@ -20,33 +20,33 @@ pub(crate) fn tx<'a>(w: &'a World, s: &Scope) -> Tx<'a> {
         scope: s.clone(),
     }
 }
-fn person() -> Author {
+pub(crate) fn person() -> Author {
     Author {
         name: "person".into(),
         id: None,
         key: "person".into(),
     }
 }
-fn add(w: &World, s: &Scope, title: &str) -> Res<Wrote> {
+pub(crate) fn add(w: &World, s: &Scope, title: &str) -> Res<Wrote> {
     append(&tx(w, s), &person(), title, "body", None)
 }
-fn titles(w: &World, s: &Scope) -> Vec<String> {
+pub(crate) fn titles(w: &World, s: &Scope) -> Vec<String> {
     entries(&tx(w, s))
         .unwrap()
         .iter()
         .map(|e| e["title"].as_str().unwrap().to_string())
         .collect()
 }
-fn notes(w: &World, s: &Scope) -> PathBuf {
+pub(crate) fn notes(w: &World, s: &Scope) -> PathBuf {
     dir(&w.ctx.state_root, s)
 }
-fn state(w: &World, s: &Scope) -> Value {
+pub(crate) fn state(w: &World, s: &Scope) -> Value {
     crate::state::fs::read_json(&notes(w, s).join(STATE))
         .unwrap()
         .unwrap()
 }
 // The bytes a process killed after its write and before its publish leaves.
-fn raw(w: &World, s: &Scope, bytes: &[u8]) {
+pub(crate) fn raw(w: &World, s: &Scope, bytes: &[u8]) {
     use std::io::Write;
     let mut f = std::fs::OpenOptions::new()
         .append(true)

@@ -57,6 +57,23 @@ fn not_on_disk() -> Refusal {
     refusal(1, "notes", "the notebook is not yet on disk; retry")
 }
 
+/// Ambiguity 6: the append drew `id`, then failed; a retry with `-Id <id>` saves it once.
+fn unsaved(id: &str) -> Refusal {
+    refusal(
+        1,
+        "notes",
+        &format!("the note could not be saved; retry with -Id {id}"),
+    )
+    .with("id", id.to_string())
+}
+
+/// Ambiguity 5: the entry `-Id` names is this author's same note.
+fn same(entry: &Value, author: &Author, title: &str, body: &str) -> bool {
+    super::text(entry.get("author").and_then(|a| a.get("key"))) == author.key
+        && super::text(entry.get("title")) == title
+        && super::text(entry.get("body")) == body
+}
+
 /// R2, R5: from the state root, `<key>`, `teams`, `<sha16>`, `notes`, each a real folder (`symlink_metadata`, never
 /// following a link or junction). `<key>` must exist. A level missing below it is `None` for a reader; a writer makes
 /// it. A writer flushes the folder holding each level below `<key>` on every call (R4). Anything else: `evidence`.
@@ -207,14 +224,19 @@ pub fn append(
     let durable = settle(&notes, &log)?;
     let known = parse(&log, durable);
     let id = match id {
-        Some(id) => id.to_string(),
+        Some(id) => match known.iter().find(|e| super::text(e.get("id")) == id) {
+            Some(e) if same(e, author, title, body) => return Ok(Wrote::Found(e.clone())),
+            Some(_) => return Err(refusal(2, "id", "that id belongs to a different note")),
+            None => id.to_string(),
+        },
         None => fresh_id(&known, super::team_mail::new_id)?,
     };
     let entry = json!({"id": id, "author": {"name": author.name, "id": author.id, "key": author.key},
         "at": crate::util::utc_o(tx.ctx.clock.now()), "title": title, "body": body});
     let line = format!("{entry}\n");
-    let end = write_line(&notes, durable, log.len() as u64, line.as_bytes())?;
-    publish(&notes, end)?;
+    let end =
+        write_line(&notes, durable, log.len() as u64, line.as_bytes()).map_err(|_| unsaved(&id))?;
+    publish(&notes, end).map_err(|_| unsaved(&id))?;
     Ok(Wrote::Added(entry))
 }
 
@@ -231,3 +253,7 @@ pub fn entries(tx: &Tx<'_>) -> Res<Vec<Value>> {
 #[cfg(test)]
 #[path = "notebook_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "notebook_fault_tests.rs"]
+mod fault_tests;
