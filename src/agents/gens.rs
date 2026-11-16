@@ -1,7 +1,7 @@
 //! The one reader of generation evidence (#103 state-0 S5-S7): `gens/<n>.claim` and `gens/<n>/<file>.json`.
 use std::path::{Path, PathBuf};
 
-use serde_json::Value;
+use serde_json::{Value, json};
 
 use crate::error::{Refusal, Res};
 use crate::state::evidence::{self, Evidence, Published};
@@ -520,6 +520,12 @@ pub fn client(ctx: &crate::ctx::Ctx, member: &Path, n: u64) -> Option<Proven> {
         return None;
     };
     let (launcher, client) = (pid_start(&l)?, pid_start(&c)?);
+    child_of(ctx, launcher, client).then_some(Proven { launcher, client })
+}
+
+/// Both processes live, each with its recorded start both as opened and as listed, and `client` a child of
+/// `launcher` (the launcher's row is read first, as `client` always did).
+fn child_of(ctx: &crate::ctx::Ctx, launcher: (u32, i64), client: (u32, i64)) -> bool {
     let live = |(pid, start): (u32, i64)| {
         let row = ctx.os.row(pid)?;
         let opened = ctx.os.open(pid)?;
@@ -527,8 +533,133 @@ pub fn client(ctx: &crate::ctx::Ctx, member: &Path, n: u64) -> Option<Proven> {
             && row.start.is_some_and(|s| ctx.os.same_start(s, start)))
         .then_some(row)
     };
-    let (l_row, c_row) = (live(launcher)?, live(client)?);
-    (c_row.ppid == l_row.pid).then_some(Proven { launcher, client })
+    live(launcher).is_some_and(|l_row| live(client).is_some_and(|c_row| c_row.ppid == l_row.pid))
+}
+
+/// report-2b K5's answer (ambiguity 8).
+#[derive(Debug, Clone, PartialEq)]
+pub enum Ready {
+    Outcome(Value),
+    Failed,
+    Ok,
+    Undecided,
+}
+
+impl Ready {
+    /// The reply word of `report -Session` (ambiguity 14).
+    pub fn word(&self) -> &'static str {
+        match self {
+            Ready::Outcome(_) => "outcome",
+            Ready::Failed => "failed",
+            Ready::Ok => "ok",
+            Ready::Undecided => "undecided",
+        }
+    }
+}
+
+/// What K5 decided for a caller that holds the gen lock, and the files it read that outcome-2 decides from, so that
+/// caller never reads them again (R1; outcome-2 call 1, o2 call 16).
+#[derive(Debug, Clone, PartialEq)]
+pub struct Held {
+    pub ready: Ready,
+    /// Step 2's `failure.json`, when `ready` is `Failed`.
+    pub failure: Option<Value>,
+    /// Step 4's `report.json`, whenever step 4 found one (also when the pair does not match).
+    pub report: Option<Value>,
+    /// The `exit.json` step 4's client proof read, when it read one.
+    pub exit: Option<Value>,
+}
+
+/// r2b call 21 (o2 call 15): the client generation `n` proved, three-valued. `client.json` Absent, a
+/// `client-conflict` exit, an Absent `launcher.json`, a malformed pid or start, or a pair that is not live parent and
+/// child is unproven (`Ok(None)`); an Unreadable `client.json`, `exit.json` or `launcher.json` refuses `evidence`.
+/// `gens::client` stays two-valued for its existing callers.
+pub fn client_evidence(ctx: &crate::ctx::Ctx, member: &Path, n: u64) -> Res<Option<(u32, i64)>> {
+    client_proof(ctx, member, n).map(|(proven, _)| proven)
+}
+
+/// The proven client (pid, start), and the `exit.json` read beside it (None when none was read or found).
+type ClientProof = (Option<(u32, i64)>, Option<Value>);
+
+/// `client_evidence` and the `exit.json` it read.
+fn client_proof(ctx: &crate::ctx::Ctx, member: &Path, n: u64) -> Res<ClientProof> {
+    let Some(c) = read(member, n, "client").known()? else {
+        return Ok((None, None));
+    };
+    let exit = read(member, n, "exit").known()?;
+    let conflict = exit
+        .as_ref()
+        .is_some_and(|e| e.get("reason").and_then(Value::as_str) == Some("client-conflict"));
+    if conflict {
+        return Ok((None, exit));
+    }
+    let Some(l) = read(member, n, "launcher").known()? else {
+        return Ok((None, exit));
+    };
+    let proven = match (pid_start(&l), pid_start(&c)) {
+        (Some(launcher), Some(client)) if child_of(ctx, launcher, client) => Some(client),
+        _ => None,
+    };
+    Ok((proven, exit))
+}
+
+/// report-2b K5 for a caller that already holds `gen_lock_key(key, id, n)` (outcome-2's adjudication). Takes no lock:
+/// a second take of one key in one process refuses on Unix. Each file is read once through the walk (R1):
+/// `outcome.json`, then `failure.json` (authoritative), then `ready.json`, then `report.json` whose pid and start equal
+/// the client `client_evidence` proves. `ready.json` is written, and an existing one confirmed, only through
+/// `publish_once` (PM call 14): no `ok` before its flushes succeed. Any Unreadable, failed publication or failed flush
+/// refuses: decide nothing (ambiguity 8).
+pub fn promote_held(ctx: &crate::ctx::Ctx, member: &Path, n: u64) -> Res<Held> {
+    let held = |ready, failure, report, exit| Held {
+        ready,
+        failure,
+        report,
+        exit,
+    };
+    if let Some(outcome) = read(member, n, "outcome").known()? {
+        return Ok(held(Ready::Outcome(outcome), None, None, None));
+    }
+    if let Some(failure) = read(member, n, "failure").known()? {
+        return Ok(held(Ready::Failed, Some(failure), None, None));
+    }
+    if let Some(ready) = read(member, n, "ready").known()? {
+        // Present: confirmed through the publisher, so a ready.json an earlier call linked but could not flush is
+        // flushed now, or this call refuses (PM call 14).
+        publish_once(member, n, "ready", &ready)?;
+        return Ok(held(Ready::Ok, None, None, None));
+    }
+    let Some(report) = read(member, n, "report").known()? else {
+        return Ok(held(Ready::Undecided, None, None, None));
+    };
+    let (proven, exit) = client_proof(ctx, member, n)?;
+    let matches = |(pid, start): (u32, i64)| {
+        pid_start(&report).is_some_and(|(p, s)| p == pid && ctx.os.same_start(s, start))
+    };
+    let Some((pid, start)) = proven.filter(|c| matches(*c)) else {
+        return Ok(held(Ready::Undecided, None, Some(report), exit));
+    };
+    let ready = json!({"pid": pid, "start": start, "at": crate::util::utc_o(ctx.clock.now())});
+    let won = match publish_once(member, n, "ready", &ready)? {
+        Published::Published => Ready::Ok,
+        // The sanctioned reread (PM call 11): someone else's ready.json landed between our read and our link.
+        Published::Exists => match read(member, n, "ready") {
+            Evidence::Present(_) => Ready::Ok,
+            _ => return Err(evidence::unreadable()),
+        },
+    };
+    Ok(held(won, None, Some(report), exit))
+}
+
+/// report-2b K5, the only writer of `ready.json`, for callers that do not hold the gen lock (the handshake, K4.3):
+/// one hold of the gen lock around `promote_held`.
+pub fn promote_ready(ctx: &crate::ctx::Ctx, key: &str, id: &str, n: u64) -> Res<Ready> {
+    if !plain_key(key) || !plain_id(id) {
+        return Err(Refusal::internal("promote_ready: not a plain member name"));
+    }
+    let member = ctx.state_root.join(key).join("agents").join(id);
+    super::lock(ctx, &super::team_state::gen_lock_key(key, id, n), || {
+        promote_held(ctx, &member, n).map(|h| h.ready)
+    })
 }
 
 #[cfg(test)]
@@ -1324,3 +1455,7 @@ mod client_tests {
 #[cfg(test)]
 #[path = "gens_publish_tests.rs"]
 mod publish_tests;
+
+#[cfg(test)]
+#[path = "gens_ready_tests.rs"]
+mod ready_tests;

@@ -1,6 +1,8 @@
 //! The one reader and the one create-once writer of generation evidence and markers (#103 state-0 S6).
 use std::io;
 use std::path::Path;
+#[cfg(test)]
+use std::path::PathBuf;
 
 use serde_json::Value;
 
@@ -27,6 +29,8 @@ pub enum Published {
 /// at the final name (a FIFO, a socket, a folder, any link, dangling or not) is `Unreadable`, unopened. A missing
 /// final name keeps the ancestor rule (`absent`).
 pub fn read(path: &Path) -> Evidence {
+    #[cfg(test)]
+    EVIDENCE_READS.with(|r| r.borrow_mut().as_mut().map(|v| v.push(path.to_path_buf())));
     match std::fs::symlink_metadata(path) {
         Ok(m) if m.is_file() => {}
         Ok(_) => return Evidence::Unreadable,
@@ -43,6 +47,23 @@ pub fn read(path: &Path) -> Evidence {
         Ok(Some(v)) => Evidence::Present(v),
         Ok(None) | Err(_) => Evidence::Unreadable,
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    // While `record_evidence_reads` runs on this thread: every path `read` was asked for, in order, Absent ones
+    // included. `state::fs::record_reads` cannot serve: it records only files opened, and an Absent file is not.
+    static EVIDENCE_READS: std::cell::RefCell<Option<Vec<PathBuf>>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) fn record_evidence_reads<T>(f: impl FnOnce() -> T) -> (T, Vec<PathBuf>) {
+    EVIDENCE_READS.with(|r| *r.borrow_mut() = Some(Vec::new()));
+    let got = f();
+    (
+        got,
+        EVIDENCE_READS.with(|r| r.borrow_mut().take().unwrap_or_default()),
+    )
 }
 
 /// Whether `read_json`'s "no such file" at `path` is a genuine absence: walking up from its parent, the first ancestor

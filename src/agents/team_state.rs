@@ -36,8 +36,14 @@ impl Scope {
     }
     /// S9: the gen lock, keyed by member id and generation.
     pub fn gen_lock(&self, id: &str, n: u64) -> String {
-        format!("gen|{}|{id}.{n}", self.key)
+        gen_lock_key(&self.key, id, n)
     }
+}
+
+/// S9 (report-2b ambiguity 9): the gen lock of member `id`'s generation `n` in the team `key`. K4, K5 and outcome-2 name
+/// this one lock.
+pub fn gen_lock_key(key: &str, id: &str, n: u64) -> String {
+    format!("gen|{key}|{id}.{n}")
 }
 
 /// A replay hook open runs before its body (adopt-3e registers its journal, release-1d gens::complete).
@@ -523,6 +529,10 @@ mod tests {
         assert_eq!(s.team_lock(), "spawn|0123456789abcdef|$3");
         assert_eq!(s.member_lock(ID), "member|0123456789abcdef|aaaaaaaaaaaa");
         assert_eq!(s.gen_lock(ID, 2), "gen|0123456789abcdef|aaaaaaaaaaaa.2");
+        assert_eq!(
+            gen_lock_key("0123456789abcdef", ID, 2),
+            "gen|0123456789abcdef|aaaaaaaaaaaa.2"
+        );
         let (w, s) = world();
         let c = w.caller();
         assert_eq!(
