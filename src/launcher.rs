@@ -753,24 +753,28 @@ fn publish_client(ctx: &Ctx, member: &Path, n: u64, pid: u32, publish: Publish) 
 }
 
 /// Live tests only (report-2b, PM call 18): with `<state root>/test-client-barrier`, hold client.json until generation
-/// `n`'s report.json exists (at most 600 polls of 100 ms), then mark the order in `test-barrier-<this pid>`. Not in
-/// release builds.
+/// `n`'s report.json exists (at most 600 polls of 100 ms), then mark the order in `test-barrier-<this pid>`:
+/// `report-first` (client.json absent as the report appeared), `client-first`, or `timeout`. Not in release builds.
 #[cfg(feature = "live")]
 fn live_client_barrier(ctx: &Ctx, member: &Path, n: u64) {
     if !ctx.state_root.join("test-client-barrier").exists() {
         return;
     }
-    let mut first = false;
+    let mut mark = "timeout";
     for poll in 0..=600 {
         if matches!(gens::read(member, n, "report"), Evidence::Present(_)) {
-            first = true;
+            // r2b call 33: report-first only when client.json was still absent as the report appeared.
+            mark = if gens::path(member, n, "client").exists() {
+                "client-first"
+            } else {
+                "report-first"
+            };
             break;
         }
         if poll < 600 {
             ctx.clock.sleep(Duration::from_millis(100));
         }
     }
-    let mark = if first { "report-first" } else { "timeout" };
     let _ = std::fs::write(
         ctx.state_root.join(format!("test-barrier-{}", ctx.pid)),
         mark,
@@ -2706,6 +2710,15 @@ mod tests {
             (f.slept().len(), read()),
             (3, Some("report-first".to_string()))
         );
+        // r2b call 33: client.json already there when the report appears is not report-first.
+        crate::state::evidence::publish(&gens::path(&m, 1, "client"), &json!({})).unwrap();
+        live_client_barrier(&ctx, &m, 1);
+        assert_eq!(
+            (f.slept().len(), read()),
+            (3, Some("client-first".to_string())),
+            "client.json before report.json"
+        );
+        std::fs::remove_file(gens::path(&m, 1, "client")).unwrap();
         std::fs::remove_file(gens::path(&m, 1, "report")).unwrap();
         live_client_barrier(&ctx, &m, 1);
         assert_eq!(
@@ -2713,6 +2726,45 @@ mod tests {
             (603, Some("timeout".to_string())),
             "at most 60 s"
         );
+    }
+
+    // r2b call 33 (review #147 F1): through run_gen's start callback, with the barrier file, client.json stays
+    // unpublished while the launcher waits for report.json, and is published once it exists; the mark is report-first.
+    #[cfg(feature = "live")]
+    #[test]
+    fn the_launcher_holds_client_json_until_report_json_exists() {
+        let (l, spec) = gen_client();
+        let root = l.w.ctx.state_root.clone();
+        std::fs::write(root.join("test-client-barrier"), "").unwrap();
+        let client = gens::path(&l.folder, 1, "client");
+        let report = gens::path(&l.folder, 1, "report");
+        let seen = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let (at, seen2) = (client.clone(), seen.clone());
+        l.w.fakes.sleep_probe(move |k| {
+            seen2.borrow_mut().push(at.exists());
+            if k == 3 {
+                evidence::publish(&report, &json!({})).unwrap();
+            }
+        });
+        let mut after = None;
+        let r = seamed(&l, &spec, true, &[], &mut |told: &mut dyn FnMut(u32)| {
+            told(4300);
+            after = Some(gen_file(&l, "client"));
+            Ok(7)
+        });
+        assert_eq!((r.code, r.started), (7, 1), "{:?}", r.err);
+        assert_eq!(
+            *seen.borrow(),
+            [false, false, false],
+            "client.json while the launcher waited for report.json"
+        );
+        assert_eq!(
+            after,
+            Some(json!({"pid": 4300, "start": 2600})),
+            "client.json once report.json exists"
+        );
+        let mark = std::fs::read_to_string(root.join(format!("test-barrier-{}", l.w.ctx.pid)));
+        assert_eq!(mark.ok().as_deref(), Some("report-first"));
     }
 
     // K1: client.json = {pid, start} of the started client, published after the start; while the client runs,
