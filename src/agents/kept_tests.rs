@@ -244,3 +244,86 @@ fn terminate_never_kills_a_kept_shell() {
     );
     w.fakes.hc_done().unwrap();
 }
+
+/// `mux-agent <args>` through the real dispatcher; exit code and JSON reply.
+fn cli(w: &World, args: &[&str]) -> (u8, Value) {
+    let args: Vec<String> = args.iter().map(|a| a.to_string()).collect();
+    let (code, out) = crate::cli::run(&args, || Ok(&w.ctx));
+    (
+        code,
+        serde_json::from_str(out.trim()).unwrap_or_else(|_| panic!("{out}")),
+    )
+}
+
+/// Every file under `dir`, path to bytes.
+fn tree(dir: &std::path::Path) -> std::collections::BTreeMap<std::path::PathBuf, Vec<u8>> {
+    let mut all = std::collections::BTreeMap::new();
+    for e in std::fs::read_dir(dir).unwrap() {
+        let p = e.unwrap().path();
+        if p.is_dir() {
+            all.extend(tree(&p));
+        } else {
+            all.insert(p.clone(), std::fs::read(&p).unwrap());
+        }
+    }
+    all
+}
+
+// Spec: `kept` refuses an agent `tagged` (agents: 2); no hc call is made.
+#[test]
+fn kept_is_a_person_verb() {
+    let w = World::agent(ID);
+    w.fakes.hc_install("hc");
+    let (code, r) = cli(&w, &["kept"]);
+    assert_eq!((code, &r["check"]), (2, &json!("tagged")), "{r}");
+    assert!(
+        r["message"]
+            .as_str()
+            .unwrap()
+            .ends_with("cannot manage kept shells"),
+        "{r}"
+    );
+    assert!(w.fakes.hc_calls().is_empty(), "refused before hc");
+}
+
+// Spec: two losses give two rows; closing one leaves the other; closing leaves the generation done. V4 (v6f call 9):
+// no kept-shell file: the whole state root's file set and bytes are unchanged (snapshot after the caller is resolved).
+#[test]
+fn closing_one_kept_shell_leaves_the_other_and_the_generation_done() {
+    let w = World::human("");
+    let team = lf::team(&w);
+    let f = lf::life(
+        &w,
+        json!({"generation": "0", "hcAddress": "t0", "hcName": lf::hc_name(0),
+        "launcherArgv": lf::ARGV}),
+    );
+    lf::seed_gen(&f, 0, None, lf::committed());
+    crate::state::evidence::publish(&super::gens::path(&f, 0, "released"), &json!({"at": "x"}))
+        .unwrap();
+    let before = tree(&w.ctx.state_root);
+    cf::online(&w);
+    cf::get(&w, "k1", kept_wire("k1", "live", Some((&team, "a"))));
+    cf::answer(&w, &["kill", "k1", "--json"], "{}");
+    cf::kept_listing(&w, &team, &["k1", "k2"]);
+    cf::get(&w, "k1", kept_wire("k1", "finished", Some((&team, "a"))));
+    cf::get(&w, "k2", kept_wire("k2", "live", Some((&team, "b"))));
+    let (code, r) = cli(&w, &["kept", "-Close", "k1"]);
+    assert_eq!(code, 0, "{r}");
+    assert_eq!(
+        (&r["closed"], &r["kept"]),
+        (&json!("k1"), &json!([{"address": "k2", "name": "b"}]))
+    );
+    assert_eq!(kills(&w), 1);
+    // Re-audit 4-10 F3: the board's entry point (`list_at`) runs inside the same snapshot window.
+    cf::online(&w);
+    cf::kept_listing(&w, &team, &["k2"]);
+    cf::get(&w, "k2", kept_wire("k2", "live", Some((&team, "b"))));
+    assert_eq!(kept::list_at(&w.ctx, &team).unwrap().len(), 1);
+    // V4, v6f call 9: list and close write no file anywhere under the state root; the generation stays released.
+    assert_eq!(
+        tree(&w.ctx.state_root),
+        before,
+        "the state root is byte-identical"
+    );
+    w.fakes.hc_done().unwrap();
+}

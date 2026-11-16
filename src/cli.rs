@@ -213,6 +213,16 @@ pub static VERBS: &[VerbDef] = &[
         handler: version,
         text: version_text,
     },
+    VerbDef {
+        name: "kept",
+        values: &["Close"],
+        switches: &[],
+        min: 0,
+        max: 0,
+        usage: "usage: mux-agent kept [-Close <address>] [-Text]",
+        handler: crate::agents::kept::kept,
+        text: json::lines,
+    },
 ];
 
 /// This binary's version. `run` answers it before any provider is built, so it reads no multiplexer, state root or
@@ -738,7 +748,8 @@ mod tests {
                 "notify",
                 "sidebar",
                 "watch",
-                "version"
+                "version",
+                "kept"
             ]
         );
         for name in names {
@@ -770,6 +781,7 @@ mod tests {
             ("sidebar", 0, 0),
             ("watch", 0, 0),
             ("version", 0, 0),
+            ("kept", 0, 0),
         ];
         assert_eq!(bounds.len(), VERBS.len());
         let pos = ["p1", "p2", "p3"];
@@ -878,6 +890,7 @@ mod tests {
             "sidebar" => vec!["sidebar"],
             "watch" => vec!["watch"],
             "version" => vec!["version"],
+            "kept" => vec!["kept"],
             other => panic!("no valid call for {other}"),
         }
     }

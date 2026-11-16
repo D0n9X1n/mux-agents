@@ -1,5 +1,9 @@
 //! views-6f V4-V6: a kept shell is only its hc labels (`mux.kept=<T>`, `mux.keptName=<name>`, group B R1.3). This
 //! module lists and closes them; it writes no file (6f-R4).
+use serde_json::{Map, Value, json};
+
+use crate::cli::Request;
+use crate::ctx::Ctx;
 use crate::error::{Res, refuse};
 use crate::hc::{Core, State, Terminal};
 
@@ -56,4 +60,33 @@ pub fn close(core: &Core<'_>, team: &str, address: &str) -> Res<()> {
         return refuse(2, "target", "that shell is not a kept shell of this team");
     }
     core.kill(address)
+}
+
+/// `list` on a new connection (the verb and the board's watch).
+pub fn list_at(ctx: &Ctx, team: &str) -> Res<Vec<Shell>> {
+    list(&crate::hc::connect(ctx)?, team)
+}
+
+/// A reply's rows, `[{address, name}]` (the verb and the board share it).
+pub fn rows(shells: &[Shell]) -> Value {
+    json!(
+        shells
+            .iter()
+            .map(|s| json!({"address": s.address, "name": s.name}))
+            .collect::<Vec<_>>()
+    )
+}
+
+/// `mux-agent kept [-Close <address>]`, a person verb (ambiguity 13): close one, then list what is left.
+pub fn kept(ctx: &Ctx, request: &Request) -> Res<Map<String, Value>> {
+    let caller = super::up::person_as(ctx, "manage kept shells")?;
+    let team = super::membership::team(&caller);
+    let core = crate::hc::connect(ctx)?;
+    let mut reply = Map::new();
+    if let Some(address) = request.value("Close") {
+        close(&core, &team, address)?;
+        reply.insert("closed".into(), address.into());
+    }
+    reply.insert("kept".into(), rows(&list(&core, &team)?));
+    Ok(reply)
 }
