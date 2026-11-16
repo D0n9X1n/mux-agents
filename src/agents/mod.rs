@@ -64,6 +64,17 @@ pub(crate) fn folder_committed(folder: &Path) -> bool {
     }
 }
 
+/// PM calls 5, 8: whether a member is committed. A lifecycle member: its subject generation's commit decides Run
+/// (A3a `Status::committed`, R4). Pre-lifecycle: main's read (`folder_committed`). Absent: no. Unreadable: refused.
+pub(crate) fn member_committed(folder: &Path, member: &gens::Member) -> Res<bool> {
+    match member {
+        gens::Member::Life(g) => Ok(g.status()?.committed),
+        gens::Member::Pre(_) => Ok(folder_committed(folder)),
+        gens::Member::Absent => Ok(false),
+        gens::Member::Unreadable(e) => Err(e.clone()),
+    }
+}
+
 pub(crate) fn server_dir(ctx: &Ctx, caller: &Caller) -> PathBuf {
     ctx.state_root.join(&caller.server_key)
 }
@@ -499,5 +510,57 @@ pub(crate) mod fixture {
 
     pub fn write(path: &std::path::Path, value: Value) {
         crate::state::fs::write_json(path, &value).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod member_committed_tests {
+    use super::fixture::{ID, World};
+    use super::gens;
+    use serde_json::json;
+
+    fn life(w: &World, record: serde_json::Value) -> std::path::PathBuf {
+        let f = w.folder(ID);
+        std::fs::create_dir_all(&f).unwrap();
+        crate::state::fs::write_json(&f.join("record.json"), &record).unwrap();
+        f
+    }
+
+    // PM call 8, R4: a lifecycle member answers its subject generation; never the folder commit.json.
+    #[test]
+    fn member_committed_answers_the_subject_generation() {
+        let w = World::human("");
+        let f = life(&w, json!({"lifecycle": 1, "id": ID, "generation": "0"}));
+        crate::state::fs::write_json(&f.join("commit.json"), &json!({"committedAt": "x"})).unwrap();
+        assert!(
+            !super::member_committed(&f, &gens::member_of(&f)).unwrap(),
+            "a folder commit is not the member's"
+        );
+        crate::state::evidence::publish(&gens::path(&f, 0, "commit"), &json!({"committed": true}))
+            .unwrap();
+        assert!(super::member_committed(&f, &gens::member_of(&f)).unwrap());
+        // A held identity answers its pending generation, not the active one (R4).
+        let held = json!({"lifecycle": 1, "id": ID, "generation": "0",
+            "pending": {"gen": 1, "hcName": "m0123abcd", "sessionId": "s"}});
+        crate::state::fs::write_json(&f.join("record.json"), &held).unwrap();
+        assert!(
+            !super::member_committed(&f, &gens::member_of(&f)).unwrap(),
+            "pending 1 has no commit"
+        );
+        // Unreadable refuses (R2); pre-lifecycle keeps main; absent is not committed.
+        std::fs::write(f.join("record.json"), br#"{"lifec"#).unwrap();
+        let e = super::member_committed(&f, &gens::member_of(&f)).unwrap_err();
+        assert_eq!(e.check, "evidence");
+        crate::state::fs::write_json(
+            &f.join("record.json"),
+            &json!({"id": ID, "generation": "0"}),
+        )
+        .unwrap();
+        assert!(
+            super::member_committed(&f, &gens::member_of(&f)).unwrap(),
+            "pre-lifecycle: the folder commit"
+        );
+        let none = w.folder("bbbbbbbbbbbb");
+        assert!(!super::member_committed(&none, &gens::member_of(&none)).unwrap());
     }
 }

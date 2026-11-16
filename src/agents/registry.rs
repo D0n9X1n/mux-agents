@@ -810,9 +810,7 @@ pub fn reap(
                 did |= super::lock(ctx, &super::lock_key("notice", caller, &agent.id), || {
                     // A commit that landed while reap waited for the locks makes it a live agent's; the age is
                     // checked again under them.
-                    if super::committed(&agents_dir.join(&agent.id))
-                        || !stale(ctx, caller, &agent.id)
-                    {
+                    if landed(&agents_dir.join(&agent.id)) || !stale(ctx, caller, &agent.id) {
                         return Ok(false);
                     }
                     let mut killed = false;
@@ -909,6 +907,12 @@ pub(crate) fn pane_gone(ctx: &Ctx, pane: &str) -> Res<bool> {
     Ok(probe.code == 0 && probe.stdout.trim_end_matches(['\r', '\n']) == "|")
 }
 
+/// The reap recheck (PM calls 5, 8; ambiguity 14): a commit that landed while reap waited for the locks makes the
+/// agent live. A lifecycle member: its subject generation's commit. Unreadable counts as landed: never reap on it.
+fn landed(folder: &Path) -> bool {
+    super::member_committed(folder, &gens::member_of(folder)).unwrap_or(true)
+}
+
 /// Under agent `id`'s notice lock: when it has no notice and a fresh probe shows its pane gone, posts `exited` with
 /// its recorded exit code, else `lost`. True when it posted. R1 (audit B2): it posts for `agent.member`, the
 /// snapshot's; `post` reads that member's status under the notice lock, so a completion recorded since is seen and a
@@ -961,6 +965,32 @@ pub(crate) fn exit_code(folder: &Path, member: &Member) -> Res<Option<Value>> {
 mod tests {
     use super::*;
     use crate::agents::fixture::{ID, Listed, World, launch_command, list_call, write};
+
+    // PM calls 5, 8, ambiguity 14: the reap recheck reads the member own commit; unreadable never reaps.
+    #[test]
+    fn a_landed_commit_is_the_members_own() {
+        let w = World::human("");
+        let f = w.folder(ID);
+        std::fs::create_dir_all(&f).unwrap();
+        crate::state::fs::write_json(&f.join("record.json"), &json!({"id": ID})).unwrap();
+        assert!(!landed(&f), "pre-lifecycle, uncommitted");
+        write(&f.join("commit.json"), json!({"committedAt": "x"}));
+        assert!(landed(&f), "pre-lifecycle: the folder commit (main)");
+        crate::state::fs::write_json(
+            &f.join("record.json"),
+            &json!({"lifecycle": 1, "id": ID, "generation": "0"}),
+        )
+        .unwrap();
+        assert!(!landed(&f), "a lifecycle member ignores the folder commit");
+        crate::state::evidence::publish(
+            &super::gens::path(&f, 0, "commit"),
+            &json!({"committed": true}),
+        )
+        .unwrap();
+        assert!(landed(&f), "its generation commit");
+        std::fs::write(f.join("record.json"), br#"{"lifec"#).unwrap();
+        assert!(landed(&f), "unreadable: never reaped");
+    }
     use crate::agents::mail::read_mail;
     use crate::agents::{lock_key, text};
     use serde_json::json;

@@ -1593,3 +1593,84 @@ fn notices_take_addresses_from_the_snapshot() {
     );
     w.fakes.hc_done().unwrap();
 }
+
+// A3a calls 5, 8; PM calls 2, 7: a lifecycle member claims the pane its view presents; its subject commit comes from
+// one status snapshot (P4), so a torn commit or record refuses instead of passing the pane to a person.
+#[test]
+fn a_lifecycle_member_claims_the_pane_its_view_presents() {
+    use crate::agents::fixture::{ID, SESSION_ID};
+    use crate::agents::gens;
+    let w = World::human("");
+    let caller = w.caller();
+    let f = w.folder(ID);
+    std::fs::create_dir_all(&f).unwrap();
+    let team = crate::agents::membership::team(&caller);
+    let r = json!({"lifecycle": 1, "id": ID, "name": "worker", "session": caller.session, "team": team,
+        "generation": "0", "hcAddress": "t1", "hcName": "m0123abcd", "launcherArgv": ["x"],
+        "sessionId": SESSION_ID});
+    crate::state::fs::write_json(&f.join("record.json"), &r).unwrap();
+    let launch = json!({"hcName": "m0123abcd", "launcherArgv": ["x"], "sessionId": SESSION_ID});
+    crate::state::evidence::publish(&gens::path(&f, 0, "launch"), &launch).unwrap();
+    crate::state::evidence::publish(&gens::path(&f, 0, "commit"), &json!({"committed": true}))
+        .unwrap();
+    let view = json!({"serverKey": caller.server_key, "session": caller.session, "pane": caller.pane,
+        "window": "@1", "startCommand": "hc attach t1", "gen": 0, "hcAddress": "t1", "hcName": "m0123abcd"});
+    crate::state::fs::write_json(&f.join("view.json"), &view).unwrap();
+    let (got, reads) = crate::state::evidence::record_evidence_reads(|| claim(&w.ctx, &caller));
+    assert!(
+        matches!(got.unwrap(), Claim::Member),
+        "the view presents the pane"
+    );
+    // Checklist item 2 (P4, a3c call 36): one status snapshot, so the subject commit is read once.
+    let commit = gens::path(&f, 0, "commit");
+    let commit_reads = reads.iter().filter(|p| **p == commit).count();
+    assert_eq!(commit_reads, 1, "one status read: {reads:?}");
+    // Another session's member with a torn view is skipped before its view is read (PM calls 2, 7).
+    let other = w.folder("bbbbbbbbbbbb");
+    std::fs::create_dir_all(&other).unwrap();
+    let mut theirs = r.clone();
+    (theirs["id"], theirs["session"]) = (json!("bbbbbbbbbbbb"), json!("$9"));
+    crate::state::fs::write_json(&other.join("record.json"), &theirs).unwrap();
+    std::fs::write(other.join("view.json"), br#"{"pa"#).unwrap();
+    assert!(
+        matches!(claim(&w.ctx, &caller).unwrap(), Claim::Member),
+        "another session never blocks"
+    );
+    // PM calls 2, 7: a readable pre-lifecycle record of another session at this pane is skipped, not counted.
+    let third = w.folder("cccccccccccc");
+    std::fs::create_dir_all(&third).unwrap();
+    let pre =
+        json!({"id": "cccccccccccc", "session": "$9", "pane": caller.pane, "hcAddress": "t9"});
+    crate::state::fs::write_json(&third.join("record.json"), &pre).unwrap();
+    assert!(
+        matches!(claim(&w.ctx, &caller).unwrap(), Claim::Member),
+        "a readable other session is skipped"
+    );
+    // A torn record under another server key is never read: claim reads only the caller own key.
+    let foreign = w
+        .ctx
+        .state_root
+        .join("ffffffffffffffff")
+        .join("agents")
+        .join("dddddddddddd");
+    std::fs::create_dir_all(&foreign).unwrap();
+    std::fs::write(foreign.join("record.json"), br#"{"lifec"#).unwrap();
+    assert!(
+        matches!(claim(&w.ctx, &caller).unwrap(), Claim::Member),
+        "another server key is never read"
+    );
+    // Torn evidence of a member of this session refuses (R2).
+    std::fs::remove_file(gens::path(&f, 0, "commit")).unwrap();
+    std::fs::write(gens::path(&f, 0, "commit"), br#"{"comm"#).unwrap();
+    assert_eq!(
+        claim(&w.ctx, &caller).err().map(|e| e.check),
+        Some("evidence"),
+        "a torn commit"
+    );
+    std::fs::write(f.join("record.json"), br#"{"lifec"#).unwrap();
+    assert_eq!(
+        claim(&w.ctx, &caller).err().map(|e| e.check),
+        Some("evidence"),
+        "a torn record"
+    );
+}

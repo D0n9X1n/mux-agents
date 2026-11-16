@@ -312,24 +312,31 @@ enum Claim {
 
 /// The agent records of this session whose pane is the caller's. A pane is a person's only when none claims it.
 fn claim(ctx: &Ctx, caller: &Caller) -> Res<Claim> {
-    let entries = match std::fs::read_dir(super::server_dir(ctx, caller).join("agents")) {
-        Ok(e) => e,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Claim::None),
-        Err(e) => return Err(e.into()),
-    };
+    use super::gens::Member;
+    let agents = super::server_dir(ctx, caller).join("agents");
     let mut found = Vec::new();
-    for entry in entries {
-        let folder = entry?.path();
-        let id = folder
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or_default()
-            .to_string();
-        if !super::agent_id(&id) {
-            continue;
-        }
-        let Ok(Some(record)) = crate::state::fs::read_json(&folder.join("record.json")) else {
-            continue;
+    // R5: one pass over `gens::members`, so links reach `member_of`.
+    for (id, folder, member) in super::gens::members(&agents)? {
+        let (record, life_committed) = match &member {
+            Member::Absent => continue,
+            // PM calls 2, 7 (A3a call 6): the caller's own server key, the only key read; session unknown.
+            Member::Unreadable(e) => return Err(e.clone()),
+            Member::Pre(r) => (r.clone(), None),
+            Member::Life(g) => {
+                // Another session is skipped before its status or view is read, so its torn files block no one.
+                if g.record().get("session").and_then(Value::as_str)
+                    != Some(caller.session.as_str())
+                {
+                    continue;
+                }
+                // P4 (a3c call 36): one status snapshot; its commit decides. A3c Task 1 changes the next call to
+                // `presented(g, &s)` (A3b-2 header concern 1).
+                let s = g.status()?;
+                (
+                    super::team_state::presented(&folder, g.record().clone())?,
+                    Some(s.committed),
+                )
+            }
         };
         let here = super::text(record.get("pane")) == caller.pane
             && record
@@ -340,11 +347,11 @@ fn claim(ctx: &Ctx, caller: &Caller) -> Res<Claim> {
             // As `registry::own_record`: its own id is its folder's, its session the caller's (QA round 2, fix 2).
             let valid = record.get("id").and_then(Value::as_str) == Some(id.as_str())
                 && record.get("session").and_then(Value::as_str) == Some(caller.session.as_str());
-            found.push((
-                record.get("hcAddress").is_some(),
-                super::committed(&folder),
-                valid,
-            ));
+            let committed = match life_committed {
+                Some(c) => c,
+                None => super::member_committed(&folder, &member)?,
+            };
+            found.push((record.get("hcAddress").is_some(), committed, valid));
         }
     }
     // Every record that claims the pane counts, hc or not: two make its owner ambiguous (QA round 2, fix 1).
