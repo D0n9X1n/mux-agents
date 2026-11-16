@@ -959,3 +959,5 @@ fn an_anchored_resume_keeps_the_anchor_server_proof() {
         "call 12: a resume keeps K1's binding"
     );
 }
+#[cfg(test)]
+mod race;

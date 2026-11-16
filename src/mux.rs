@@ -167,6 +167,30 @@ pub fn image_kind(path: &str, os: OsKind) -> Option<Kind> {
         .find_map(|(kind, name)| same(name).then_some(kind))
 }
 
+/// The client a member's server is reached with, from that server's own image: an `rmux` or `tmux` image is itself;
+/// rmux 0.10's `rmux-daemon` (`.exe`, any case, on Windows) is the `rmux` installed beside it, which the caller then
+/// gates by its version. A bare daemon name (no folder) or any other image is none: never a PATH lookup.
+fn server_client(image: &str, os: OsKind) -> Option<(PathBuf, Kind)> {
+    if let Some(kind) = image_kind(image, os) {
+        return Some((PathBuf::from(image), kind));
+    }
+    let (file, daemon, client) = match os {
+        OsKind::Unix => (image.rsplit('/').next()?, "rmux-daemon", "rmux"),
+        OsKind::Windows => (
+            image.rsplit(['/', '\\']).next()?,
+            "rmux-daemon.exe",
+            "rmux.exe",
+        ),
+    };
+    let daemon_named = match os {
+        OsKind::Unix => file == daemon,
+        OsKind::Windows => file.eq_ignore_ascii_case(daemon),
+    };
+    let folder = &image[..image.len() - file.len()];
+    (daemon_named && !folder.is_empty())
+        .then(|| (PathBuf::from(format!("{folder}{client}")), Kind::Rmux))
+}
+
 /// The first `name` in an absolute PATH entry that is an executable file. Relative and empty entries are skipped:
 /// they would resolve against the caller's cwd.
 pub fn find_on_path(name: &str, path_var: &str) -> Option<PathBuf> {
@@ -267,9 +291,9 @@ impl RealMux {
         if row.as_ref().is_none_or(other) {
             return views_down();
         }
-        let image = row.and_then(|r| r.path);
-        let found = image
-            .and_then(|i| image_kind(&i, crate::state::root::HOST).map(|k| (PathBuf::from(i), k)));
+        let found = row
+            .and_then(|r| r.path)
+            .and_then(|i| server_client(&i, crate::state::root::HOST));
         let Some((bin, kind)) = found else {
             return views_down();
         };
@@ -935,6 +959,50 @@ fn main() {
             matches!(&built, Ok(m) if m.kind().name() == "rmux"),
             "its own server"
         );
+    }
+
+    // #150 live (rmux): rmux 0.10.0's server process is `rmux-daemon`, installed beside `rmux`. A member's
+    // multiplexer is that daemon's own `rmux` sibling, gated by its version; a daemon with no runnable `rmux` beside
+    // it is `views`-down's gate refusal, never a PATH lookup. Any other image still refuses `views`.
+    #[test]
+    fn a_member_mux_of_an_rmux_daemon_is_the_rmux_beside_it() {
+        let d = TempDir::new();
+        let bin = fake_mux(d.path(), "rmux", "rmux 0.10");
+        let daemon = d.path().join(format!("rmux-daemon{EXE}"));
+        std::fs::copy(&bin, &daemon).unwrap();
+        let f = Fakes::default();
+        let mut c = ctx_for(&f, Some(&daemon), "TMUX", "");
+        c.env = Env::default();
+        let endpoint = || Endpoint {
+            socket: SOCKET.into(),
+            server_pid: 900,
+        };
+        let m = RealMux::for_server(&c, endpoint(), 9).unwrap();
+        assert_eq!(m.kind().name(), "rmux");
+        m.run(&["-N", "list-panes"]).unwrap();
+        assert_eq!(
+            calls(d.path()),
+            [argv(&["-S", SOCKET, "-N", "list-panes"])],
+            "the rmux beside the daemon ran"
+        );
+        let lone = TempDir::new();
+        let alone = lone.path().join(format!("rmux-daemon{EXE}"));
+        std::fs::copy(&bin, &alone).unwrap();
+        let f = Fakes::default();
+        let mut c = ctx_for(&f, Some(&alone), "TMUX", "");
+        c.env = Env::default();
+        let e = RealMux::for_server(&c, endpoint(), 9).err().unwrap();
+        assert_eq!(
+            e.message, "rmux 0.10 or later is required",
+            "no rmux beside it: gated, never PATH"
+        );
+        let other = lone.path().join(format!("tmux-daemon{EXE}"));
+        std::fs::copy(&bin, &other).unwrap();
+        let f = Fakes::default();
+        let mut c = ctx_for(&f, Some(&other), "TMUX", "");
+        c.env = Env::default();
+        let e = RealMux::for_server(&c, endpoint(), 9).err().unwrap();
+        assert_eq!((e.code, e.check), (1, "views"), "only rmux has a daemon");
     }
 
     #[test]

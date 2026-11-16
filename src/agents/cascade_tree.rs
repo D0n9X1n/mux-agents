@@ -24,6 +24,8 @@ pub(super) struct Node {
     completing: Option<u64>,
     /// A `resumedFrom` member's marks, read once for its void evidence and reused by `open_gens` (checklist 19).
     marks: BTreeMap<u64, gens::Marks>,
+    /// The record read once (adopt-3e call 10).
+    record: Value,
 }
 
 /// C0, C2, C-R2: the session's lifecycle members read once (record, desired state, and for a `resumedFrom`
@@ -56,6 +58,7 @@ fn node(record: &Value, void: bool, stopped: bool) -> Node {
             .and_then(|c| c.get("gen"))
             .and_then(Value::as_u64),
         marks: BTreeMap::new(),
+        record: record.clone(),
     }
 }
 
@@ -278,11 +281,15 @@ impl Tree {
         self.nodes.contains_key(id)
     }
 
-    /// Call 11: a member that records no parent (the team's root) and is desired stopped stays closed.
-    pub(super) fn root_stopped(&self, id: &str) -> bool {
-        self.nodes
-            .get(id)
-            .is_some_and(|n| n.parent.is_none() && n.stopped)
+    /// adopt-3e call 10: the members read, their records, and the marks `read` already holds for each.
+    pub fn ids(&self) -> impl Iterator<Item = &String> {
+        self.nodes.keys()
+    }
+    pub fn record(&self, id: &str) -> Option<&Value> {
+        self.nodes.get(id).map(|n| &n.record)
+    }
+    pub fn marks(&self, id: &str) -> Option<&BTreeMap<u64, gens::Marks>> {
+        self.nodes.get(id).map(|n| &n.marks)
     }
 
     pub fn name(&self, id: &str) -> String {

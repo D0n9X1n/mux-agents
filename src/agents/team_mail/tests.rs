@@ -1743,3 +1743,98 @@ fn parent_and_children_follow_a_successor() {
         assert_eq!(got, [want], "{word}");
     }
 }
+
+// adopt-3e call 5: a lifecycle sender's team-path `parent` is `adopt::route`'s member (replay first), Ended or
+// viewless included, never `parentPane`; a root is refused; a pre-lifecycle sender keeps main's pick.
+#[test]
+fn a_lifecycle_senders_parent_follows_the_route() {
+    use crate::agents::{adopt, adopt_fixture as ax, cascade_fixture as cx, life_fixture as lf};
+    let (w, s) = lf::world();
+    ax::team(&w);
+    let tx = cx::tx(&w, &s);
+    cx::at("adopt-journal");
+    assert_eq!(adopt::adopt_from(&tx, ax::E).unwrap_err().check, "halted");
+    crate::agents::release::halt_after(None);
+    let got = life_parent(&tx, cx::B, &ax::record(&w, cx::B))
+        .unwrap()
+        .unwrap();
+    let got = (got.id.clone(), got.mailbox());
+    assert_eq!(
+        got,
+        (cx::A.to_string(), cx::A.to_string()),
+        "viewless adopter, replayed"
+    );
+    let (w, s) = lf::world();
+    ax::four_deep(&w);
+    ax::ended(&w, cx::L);
+    let tx = cx::tx(&w, &s);
+    let moved = adopt::adopt_from(&tx, ax::E).unwrap();
+    assert_eq!(moved, adopt::Adopted::Moved(cx::L.into()));
+    let got = life_parent(&tx, cx::B, &ax::record(&w, cx::B))
+        .unwrap()
+        .unwrap();
+    let got = (got.id.clone(), got.mailbox());
+    assert_eq!(got, (cx::L.to_string(), cx::L.to_string()), "Ended adopter");
+    let root = life_parent(&tx, cx::L, &ax::record(&w, cx::L));
+    assert_eq!(root.unwrap_err().check, "parent", "root refused");
+    let pre = json!({"id": "pppppppppppp", "parentPane": "%5"});
+    let pre = life_parent(&tx, "pppppppppppp", &pre).unwrap();
+    assert!(pre.is_none(), "pre-lifecycle: main's pick");
+}
+
+// Integration #150: a lifecycle worker a person spawned from a pane has no logical parent and is no root; its
+// `parent` is main's pick (`parentPane`), as `Route::Legacy` says. Only the `up` leader is refused
+// (a_lifecycle_senders_parent_follows_the_route); live send_delivers_to_mailbox relies on this.
+#[test]
+fn a_person_spawned_lifecycle_sender_keeps_mains_parent_pick() {
+    use crate::agents::{adopt_fixture as ax, cascade_fixture as cx, life_fixture as lf};
+    let (w, s) = lf::world();
+    cx::member(&w, cx::A, None, 1, json!({}));
+    let tx = cx::tx(&w, &s);
+    let got = life_parent(&tx, cx::A, &ax::record(&w, cx::A)).map(|m| m.map(|m| m.id));
+    assert_eq!(got, Ok(None), "main's pick: its parentPane");
+}
+
+// adopt-3e call 5 (refinding R19, 10.9): B's real `send parent` while its parent E is Ended and not yet adopted
+// from reaches E's member mailbox (the route), never the pane's; main's roster omits E.
+#[test]
+fn a_send_parent_to_an_ended_parent_reaches_its_mailbox() {
+    use crate::agents::{adopt_fixture as ax, cascade_fixture as cx};
+    let w = World::human("");
+    crate::agents::tree::tests::team_record(&w, &[]);
+    ax::team(&w);
+    online(&w);
+    go(&w, Some(cx::B), &["send", "parent", "-Body", "up"]).unwrap();
+    let count = |key: &str| inbox(&w, key).iter().filter(|m| m["body"] == "up").count();
+    let pane = crate::agents::mail::mailbox_key(cx::PANE, "").unwrap();
+    assert_eq!((count(ax::E), count(&pane)), (1, 0), "E's mailbox");
+}
+
+// A7, call 15: B's real `send parent` races E's adoption on the real team lock: the message is in E's mailbox or
+// A's, exactly once, never neither.
+#[test]
+fn a_send_parent_racing_adoption_lands_once() {
+    use crate::agents::{adopt, adopt_fixture as ax, cascade_fixture as cx};
+    for round in 0..10 {
+        let w = World::human("");
+        crate::agents::tree::tests::team_record(&w, &[]);
+        ax::team(&w);
+        online(&w);
+        let locks = w._dir.path().join("locks");
+        w.fakes.real_locks(&locks);
+        let (root, l2) = (w.ctx.state_root.clone(), locks.clone());
+        let adopter = std::thread::spawn(move || {
+            let (t, ts) = ax::twin(&root, &l2);
+            adopt::adopt(&t.ctx, &ts, ax::E).map(drop)
+        });
+        let sent = go(&w, Some(cx::B), &["send", "parent", "-Body", "up"]);
+        ax::bounded(adopter).unwrap();
+        sent.unwrap();
+        let count = |key: &str| inbox(&w, key).iter().filter(|m| m["body"] == "up").count();
+        assert_eq!(
+            count(ax::E) + count(cx::A),
+            1,
+            "round {round}: E's or A's, once"
+        );
+    }
+}

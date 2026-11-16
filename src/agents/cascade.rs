@@ -6,9 +6,8 @@ use serde_json::{Value, json};
 
 use super::gens;
 use super::registry::{self, Notice};
-use super::team_state::{Scope, Tx};
+use super::team_state::Tx;
 use crate::caller::Caller;
-use crate::ctx::Ctx;
 use crate::error::{Refusal, Res};
 
 /// state-0 S2: `desired.json` `{desired, at}`; absent reads `running` (C1).
@@ -227,7 +226,14 @@ fn end_entry(tx: &Tx<'_>, caller: &Caller, e: &Entry) -> Res<()> {
     let Some(&last) = all.last() else {
         return Ok(());
     };
-    let r = gens::record(&folder).known()?.ok_or_else(no_record)?;
+    // Integration (#150): the notice is posted from the presented record, as `stop_life` and `list` read the member:
+    // its pane is the one view.json presents, the `<from>|<pane>` the board counts the row's unread under. An
+    // unreadable member or view refuses, as the raw read did.
+    let r = match gens::member_of(&folder) {
+        gens::Member::Life(g) => super::team_state::presented(&g, &g.status()?)?,
+        gens::Member::Unreadable(e) => return Err(e),
+        _ => return Err(no_record()),
+    };
     registry::with_member_notice(tx.ctx, caller, &e.id, || {
         registry::add_notice_gen(tx.ctx, caller, &e.id, &r, last, Notice::Stopped)
     })?;
@@ -293,12 +299,10 @@ pub fn admit(tx: &Tx<'_>, parent: &str) -> Res<()> {
 
 /// C3: X may be resumed, retried or freshened only when no journal (a tombstone included) lists X, a member of X's
 /// chain or a member below X (nearest first, then deepest first), and X's parent is open. X's own `stopped` does
-/// not refuse: that is the reopen.
+/// not refuse: that is the reopen, a stopped root's included (c3d call 35: call 11 closes a stopped root to new
+/// members, which its parent walk refuses here and `admit` refuses on spawn).
 pub fn reopen_check(tx: &Tx<'_>, id: &str) -> Res<()> {
     let t = Tree::read(tx)?;
-    if t.root_stopped(id) {
-        return Err(closed(&t.name(id)));
-    }
     let js = journals(tx)?;
     let listed = |x: &str| js.iter().any(|j| j.lists(x));
     let mut near = t.chain(id)?;
@@ -325,19 +329,6 @@ pub fn reopen_same<T>(tx: &Tx<'_>, id: &str, launch: impl FnOnce() -> Res<T>) ->
     launch()
 }
 
-/// C8, the bar: a lock-free look for the journal folder, then one try of the team lock (state-0 S9: the bar
-/// try-locks). Busy: false at once. A refusal (an `Unreadable` journal) is returned; the board ignores it.
-pub fn tick(ctx: &Ctx, caller: &Caller) -> Res<bool> {
-    let scope = Scope::of(caller);
-    if !waiting(ctx, &scope) {
-        return Ok(false);
-    }
-    let ran = super::try_lock(ctx, &scope.team_lock(), || {
-        super::team_state::held(ctx, &scope, |tx| finish(tx, caller))
-    })?;
-    Ok(ran.is_some())
-}
-
 #[path = "cascade_tree.rs"]
 mod tree;
 pub use tree::{Shown, Tree};
@@ -345,9 +336,11 @@ pub use tree::{Shown, Tree};
 #[path = "cascade_journal.rs"]
 mod journal;
 use journal::tombstoned;
+// adopt-3e call 6: adoption walks and makes its folders with the cascade's one rule.
 pub use journal::{
     Entry, Journal, NOT_WRITTEN, dir_at, journals, mark_prepared, publish, remove, waiting,
 };
+pub(crate) use journal::{level, make};
 
 #[cfg(test)]
 mod tests;

@@ -18,5 +18,7 @@ up_creates_a_team_in_a_new_session
 up_runs_the_leader_with_options_then_session_then_prompt
 up_whose_view_panics_keeps_the_leader_under_hostile_settings
 notebook_and_peek_stay_in_the_team
-# v0.3-life integration with notebook-7a: a base live test that runs up, found by every_live_up_test_is_listed.
+# integration #150: A3c's views-down test runs `up` (notebook-7a call 11 lists every such test).
 members_mail_without_the_multiplexer
+# adopt-3e Task 12: runs `resume`; run alone.
+adoption_moves_b_and_a_resumed_successor_stops_its_child

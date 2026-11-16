@@ -712,7 +712,10 @@ fn up_finishes_a_kept_cascade_first() {
     let w = ready();
     let scope = crate::agents::team_state::Scope::of(&w.caller());
     let dir = crate::agents::cascade::dir_at(&w.ctx, &scope);
-    std::fs::create_dir_all(&dir).unwrap();
+    // Integration (#150 CI): made private as the product makes it, so `up` reaches the journal; a folder left at the
+    // umask (755) or with an inherited shared ACL is refused `state` first, as it must be.
+    w.state();
+    crate::agents::spawn::private_folder(&w.ctx, &dir).unwrap();
     std::fs::write(dir.join("aaaaaaaaaaa1.json"), b"{").unwrap();
     assert_eq!(claude(&w).unwrap_err().check, "evidence");
     assert!(
@@ -723,7 +726,10 @@ fn up_finishes_a_kept_cascade_first() {
     let w = ready();
     let scope = crate::agents::team_state::Scope::of(&w.caller());
     let dir = crate::agents::cascade::dir_at(&w.ctx, &scope);
-    std::fs::create_dir_all(&dir).unwrap();
+    // Integration (#150 CI): made private as the product makes it, so `up` reaches the journal; a folder left at the
+    // umask (755) or with an inherited shared ACL is refused `state` first, as it must be.
+    w.state();
+    crate::agents::spawn::private_folder(&w.ctx, &dir).unwrap();
     let a = crate::agents::cascade_fixture::A;
     crate::agents::cascade_fixture::member(&w, a, None, 0, json!({}));
     crate::agents::cascade_fixture::done(&w, a);

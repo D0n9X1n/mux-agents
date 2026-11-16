@@ -70,6 +70,7 @@ pub(crate) fn snap(members: &[(&str, Value, Life)], reserved: usize) -> Snapshot
         view_error: None,
         held: Vec::new(),
         pre_ended: Default::default(),
+        pre: Default::default(),
     }
 }
 pub(crate) fn ids(n: usize) -> Vec<String> {
@@ -1055,7 +1056,8 @@ fn a_member_callers_exemption_ends_at_its_argv_and_other_clients() {
         rx["sessionId"] = sid.into();
         cf::member(&m.w, &x, rx);
         write(&m.folder(&x).join("spec.json"), json!({"flags": []}));
-        // prelife-1c G10d: the subject is a lifecycle member whose record proves it Ended (as resume_case).
+        // prelife-1c G10d refuses a pre-lifecycle resume `state`; the subject is a lifecycle member, as restore-6b
+        // moved its siblings, so occupancy's `session` check is the one under test.
         let rx = crate::agents::prelife_fixture::to_lifecycle(&m.w, &x, true);
         let rows: Vec<Value> = [LEADER, ID, OTHER].iter().map(|id| m.record(id)).collect();
         m.hc();
@@ -2606,4 +2608,44 @@ fn a_member_resumes_a_child_of_its_predecessor() {
         "successors: no launch"
     );
     m.w.fakes.hc_done().unwrap();
+}
+
+// adopt-3e A4, A6, call 13 (findings 2-4, 2-5): a crash after B's change of an adoption that also recomputes C's
+// depth. Under the spawn lock, the standing, the record depth and authority are read after replay: C is at 2 under
+// B (at 1), B's authority over C holds, and a child of C is admitted at 3.
+#[test]
+fn admission_reads_after_a_partial_adoption_replays() {
+    use crate::agents::{adopt, adopt_fixture as ax, cascade_fixture as cx, team_state::Scope};
+    let w = World::human("");
+    let c = w.caller();
+    team_record(&w, &[]);
+    let team = team_of(&w.ctx, &c).unwrap().unwrap();
+    cx::member(
+        &w,
+        LEADER,
+        None,
+        0,
+        json!({"upTeam": "t", "client": "claude"}),
+    );
+    cx::member(&w, ax::E, Some(LEADER), 1, json!({"client": "claude"}));
+    cx::member(&w, cx::B, Some(ax::E), 2, json!({"client": "claude"}));
+    cx::member(&w, cx::C, Some(cx::B), 3, json!({"client": "claude"}));
+    ax::ended(&w, ax::E);
+    let s = Scope::of(&c);
+    cx::at("adopt-change-bbbbbbbbbbb1");
+    let cut = adopt::adopt_from(&cx::tx(&w, &s), ax::E).unwrap_err();
+    crate::agents::release::halt_after(None);
+    assert_eq!(cut.check, "halted");
+    assert_eq!(ax::depth_of(&w, cx::C), 3, "the crash left C stale");
+    let got = with_standing(&w.ctx, &c, |_| {
+        let rc = ax::record(&w, cx::C);
+        let b = member_of(cx::B, ax::record(&w, cx::B));
+        let auth = authority(&w.ctx, &c, &b, cx::C, "stop").map_err(|e| e.check);
+        let admitted = admit(&w.ctx, &c, &team, member_of(cx::C, rc.clone()))
+            .map(|a| a.depth)
+            .map_err(|e| e.check);
+        Ok((rc["depth"].clone(), auth, admitted))
+    })
+    .unwrap();
+    assert_eq!(got, (json!(2), Ok(()), Ok(3)));
 }

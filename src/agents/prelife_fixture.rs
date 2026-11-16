@@ -12,6 +12,8 @@ pub const L: &str = "111111111111";
 pub const A: &str = "a0000000000a";
 pub const C: &str = "c0000000000c";
 pub const P: &str = "d0000000000d";
+/// Task 9: an id that sorts after `C` and `P`, so holders named against their id order show the sort.
+pub const D: &str = "e0000000000e";
 
 /// Leader `L` -> lifecycle `A` -> pre-lifecycle `C` naming `A` as parent (spec "mixed tree"); A's and C's records.
 pub fn mixed(w: &World) -> (Value, Value) {
@@ -263,6 +265,18 @@ pub fn dev_evidence(w: &World, id: &str) {
         json!({"hcName": format!("m{}", &id[..8])}),
     );
     publish(w, id, 1, "client", json!({"pid": 4242, "start": 1500}));
+}
+
+/// Lifecycle `id`'s generation 1 recorded Ended (state-0 S6); in an unmarked folder, one more file a wrong reader
+/// would open.
+pub fn ended(w: &World, id: &str) {
+    publish(
+        w,
+        id,
+        1,
+        "ended",
+        json!({"state": "finished", "reason": "exited", "at": "x"}),
+    );
 }
 
 /// Paths `record_reads` saw under `folder`, except its `record.json` (P-R1's one classifying read).

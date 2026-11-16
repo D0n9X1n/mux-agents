@@ -48,6 +48,17 @@ pub fn attach_program(command: &str, address: &str, os: OsKind) -> Option<String
         return None;
     }
     let quotes: &[char] = if unix { &['"', '\''] } else { &['"'] };
+    // #150: rmux renders the whole argv in one pair of double quotes, `\` as `\\` and `"` as `\"` inside. Its inside,
+    // unescaped and holding no quote, is read as the bare form; any other backslash, or anything else, falls through
+    // to the forms below, which refuse it.
+    if let Some(inner) = command
+        .strip_prefix('"')
+        .and_then(|c| c.strip_suffix('"'))
+        .and_then(rmux_unquoted)
+        .filter(|i| !i.is_empty() && !i.contains(quotes))
+    {
+        return attach_program(&inner, address, os);
+    }
     let first = command.chars().next()?;
     let (program, tail) = if quotes.contains(&first) {
         let end = 1 + command[1..].find(first)?;
@@ -80,6 +91,24 @@ pub fn attach_program(command: &str, address: &str, os: OsKind) -> Option<String
     crate::hc::INSTALL_NAMES
         .contains(&file.as_str())
         .then(|| program.to_string())
+}
+
+/// The inside of rmux's quoted start command with its two escapes undone (`\\` is `\`, `\"` is `"`); any other
+/// backslash is not rmux's form: none.
+fn rmux_unquoted(inner: &str) -> Option<String> {
+    let mut out = String::with_capacity(inner.len());
+    let mut chars = inner.chars();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            match chars.next()? {
+                e @ ('\\' | '"') => out.push(e),
+                _ => return None,
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    Some(out)
 }
 
 /// V2: what a holder of the member lock found: the view's pane, whether it was adopted (no valid descriptor), and
@@ -233,9 +262,10 @@ impl Identity {
         if super::gens::lifecycle(r) {
             let text = |k: &str| r.get(k).and_then(Value::as_str);
             let program = attach_program(command, &self.address, HOST)?;
+            // v6f call 24: identity is key + pane + start command + attach program; the window is where the pane is
+            // now (break-pane moves it), reported from the row, never matched.
             if text("viewServerKey") != Some(key.server.as_str())
                 || text("viewSession") != Some(key.session.as_str())
-                || text("window") != Some(row.window.as_str())
                 || text("viewAttachProgram") != Some(program.as_str())
             {
                 return None;
@@ -355,7 +385,6 @@ pub(crate) mod tests {
             ("server", "viewServerKey", json!("k2")),
             ("session", "viewSession", json!("$4")),
             ("no key", "viewServerKey", Value::Null),
-            ("window", "window", json!("@6")),
         ] {
             let mut bad = r.clone();
             if value.is_null() {
@@ -365,6 +394,16 @@ pub(crate) mod tests {
             }
             assert!(id.view(&bad, &[row9()], &key()).is_none(), "{case}");
         }
+        // v6f call 24: the window is not identity. A view moved by break-pane (descriptor @6, pane now in @5) is still
+        // the view, reported where the pane actually is.
+        let mut moved = r.clone();
+        moved["window"] = json!("@6");
+        assert_eq!(
+            id.view(&moved, &[row9()], &key())
+                .map(|p| (p.pane, p.window)),
+            Some(("%9".to_string(), "@5".to_string())),
+            "a moved window"
+        );
         let mut other = r.clone();
         other["startCommand"] = json!("hc attach t2");
         let mut row = row9();
@@ -393,6 +432,42 @@ pub(crate) mod tests {
     // program from `[A-Za-z0-9_./:+-]` (and `\` on Windows) not starting with `-`; a quoted one (platform quotes) adds
     // the space; the address one unquoted token from `[A-Za-z0-9_.:-]`, then the end. The program's file name is an hc
     // install name (`hc`, `herdr-core`), any path. Everything else is "not an attach".
+    // #150 live (rmux): rmux 0.10.0 renders `#{pane_start_command}` as the whole argv in one pair of double quotes,
+    // `\` written `\\` and `"` written `\"` inside (rmux-server lifecycle_state.rs `quote_single_shell_command`), where
+    // tmux renders the argv bare. That one quoted token is an attach exactly when its inside, unescaped, holds no quote
+    // and is the bare form. Any other backslash is not rmux's form; a space-holding program is not one (fail closed).
+    #[test]
+    fn attach_program_reads_a_wholly_quoted_attach() {
+        use crate::state::root::OsKind::{Unix, Windows};
+        let some = |p: &str| Some(p.to_string());
+        for (os, command, want) in [
+            (Unix, r#""/x/herdr-core attach t1""#, some("/x/herdr-core")),
+            (Unix, r#""hc attach t1""#, some("hc")),
+            (
+                Windows,
+                r#""C:\\hc\\herdr-core.exe attach t1""#,
+                some(r"C:\hc\herdr-core.exe"),
+            ),
+            (Windows, r#""C:\hc\herdr-core.exe attach t1""#, None),
+            (Windows, r#""C:\\hc\\herdr-core.exe attach t1\""#, None),
+            (Windows, r#""C:\\hc\"x\\hc.exe attach t1""#, None),
+            (Unix, r#""/opt/my hc/hc attach t1""#, None),
+            (Unix, r#""hc attach t1" x"#, None),
+            (Unix, r#""hc attach "t1""#, None),
+            (Unix, r#""'hc' attach t1""#, None),
+            (Unix, r#""hc attach t2""#, None),
+            (Unix, r#""/x/other attach t1""#, None),
+            (Unix, r#""""#, None),
+            (Windows, r#""C:\Program Files\hc\hc.exe attach t1""#, None),
+        ] {
+            assert_eq!(
+                attach_program(command, "t1", os),
+                want,
+                "{os:?} {command:?}"
+            );
+        }
+    }
+
     #[test]
     fn attach_program_recognizes_only_an_hc_attach() {
         use crate::state::root::OsKind::{Unix, Windows};
