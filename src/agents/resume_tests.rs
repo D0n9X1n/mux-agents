@@ -145,8 +145,8 @@ fn record_of(w: &World, id: &str) -> Value {
         .unwrap()
 }
 
-// Each client, ended by exit or by a stop: Y runs `<client> <X's recorded flags> --resume <X's session>` with no
-// task, in X's directory, keeps X's name, session, parent and depth, and X's files are never written.
+// Each client, ended by exit or by a stop: Y runs `<client> <X's recorded flags> --resume <X's session>` with only
+// the notebook block as its task (7b V1), in X's directory, keeps X's name, session, parent and depth, and X's files are never written.
 #[test]
 fn resume_starts_an_ended_member_again_with_its_conversation() {
     for client in ["claude", "copilot"] {
@@ -178,7 +178,17 @@ fn resume_starts_an_ended_member_again_with_its_conversation() {
                 spec["flags"],
                 json!(client_flags(client_named(client).unwrap()))
             );
-            assert_eq!(spec["args"], json!(["--resume", SESSION_ID]));
+            // notebook-7b V1: the resumed turn carries the notebook block (Copilot through `-i`).
+            let block = match client {
+                "copilot" => json!([
+                    "--resume",
+                    SESSION_ID,
+                    "-i",
+                    crate::agents::notebook::news::HEAD
+                ]),
+                _ => json!(["--resume", SESSION_ID, crate::agents::notebook::news::HEAD]),
+            };
+            assert_eq!(spec["args"], block, "{client} {how}");
             assert!(spec.get("prompt").is_none());
             let run = w
                 .fakes
@@ -410,7 +420,10 @@ fn an_aborted_successor_is_resumed_by_name_or_id() {
         assert_eq!(resume_of(&w, target).unwrap()["from"], Y, "{target}");
         let z = new_folder(&w, &before);
         let spec = read_json(&gens::path(&z, 0, "spec")).unwrap().unwrap();
-        assert_eq!(spec["args"], json!(["--resume", SESSION_ID]));
+        assert_eq!(
+            spec["args"],
+            json!(["--resume", SESSION_ID, crate::agents::notebook::news::HEAD])
+        );
         assert!(spec.get("prompt").is_none());
         let record = read_json(&z.join("record.json")).unwrap().unwrap();
         assert_eq!(record["resumedFrom"], Y);
@@ -448,7 +461,11 @@ fn of_two_unrelated_ended_members_a_name_resumes_the_newer() {
         let spec = read_json(&gens::path(&new_folder(&w, &before), 0, "spec"))
             .unwrap()
             .unwrap();
-        assert_eq!(spec["args"], json!(["--resume", session]), "{target}");
+        assert_eq!(
+            spec["args"],
+            json!(["--resume", session, crate::agents::notebook::news::HEAD]),
+            "{target}"
+        );
         w.fakes.hc_done().unwrap();
     }
 }
@@ -1544,7 +1561,10 @@ fn a_lifecycle_member_resumes_with_its_stored_options_only() {
     let spec = read_json(&gens::path(&y, 0, "spec")).unwrap().unwrap();
     assert_eq!(
         (&spec["flags"], &spec["args"]),
-        (&json!(["--model", "x"]), &json!(["--resume", SESSION_ID]))
+        (
+            &json!(["--model", "x"]),
+            &json!(["--resume", SESSION_ID, crate::agents::notebook::news::HEAD])
+        )
     );
     let r = record_of(&w, y.file_name().unwrap().to_str().unwrap());
     assert_eq!(

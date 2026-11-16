@@ -686,10 +686,15 @@ fn hc_stop_then_resume_returns_with_its_conversation() {
             })
     });
     let argv: Vec<String> = client["argv"].as_array().unwrap().iter().map(s).collect();
-    assert!(argv.len() >= 2, "{argv:?}");
+    // notebook-7b V1: the resumed turn is the notebook block.
+    assert!(argv.len() >= 3, "{argv:?}");
     assert_eq!(
-        argv[argv.len() - 2..],
-        ["--resume".to_string(), sid.clone()],
+        argv[argv.len() - 3..],
+        [
+            "--resume".to_string(),
+            sid.clone(),
+            mux_agent::agents::notebook::news::HEAD.to_string()
+        ],
         "{argv:?}"
     );
     assert!(!argv.iter().any(|a| a == "--fork-session"), "{argv:?}");
@@ -1107,7 +1112,11 @@ fn hc_stopped_member_resumes_with_its_stored_options_only() {
         serde_json::json!(
             opts.iter()
                 .cloned()
-                .chain(["--resume".to_string(), sid.to_string()])
+                .chain([
+                    "--resume".to_string(),
+                    sid.to_string(),
+                    mux_agent::agents::notebook::news::HEAD.to_string()
+                ])
                 .collect::<Vec<_>>()
         ),
         "the stored options only"

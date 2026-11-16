@@ -412,6 +412,10 @@ pub fn notes(ctx: &Ctx, request: &Request) -> Res<Map<String, Value>> {
     Ok(reply)
 }
 
+// notebook-7b V1: the launch index.
+#[path = "notebook_news.rs"]
+pub mod news;
+
 #[cfg(test)]
 #[path = "notebook_tests.rs"]
 mod tests;

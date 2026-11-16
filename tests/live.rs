@@ -4785,7 +4785,11 @@ hc {}:
             json!(
                 opts.iter()
                     .cloned()
-                    .chain(["--resume".to_string(), sid.clone()])
+                    .chain([
+                        "--resume".to_string(),
+                        sid.clone(),
+                        mux_agent::agents::notebook::news::HEAD.to_string()
+                    ])
                     .collect::<Vec<_>>()
             ),
             "{mux:?}: the stored options only"
@@ -4819,10 +4823,11 @@ hc {}:
         let argv = strings(&client["argv"]);
         let at = argv.iter().position(|a| *a == "--resume").unwrap();
         assert_eq!(argv[at + 1], sid, "{mux:?}");
+        // notebook-7b V1: the only task after the conversation is the notebook block.
         assert_eq!(
-            at + 2,
-            argv.len(),
-            "{mux:?}: no task after the conversation: {argv:?}"
+            argv[at + 2..],
+            [mux_agent::agents::notebook::news::HEAD],
+            "{mux:?}: only the notebook block after the conversation: {argv:?}"
         );
         assert!(!argv.contains(&"--fork-session"), "{mux:?} {argv:?}");
         assert_eq!(client["exe"], "claude", "{mux:?}");

@@ -622,8 +622,12 @@ fn a_selected_model_is_stored_and_replayed() {
     assert_eq!(spec["flags"], json!(options), "the model is replayed");
     assert_eq!(
         spec["args"],
-        json!(["--resume", on_disk["sessionId"]]),
-        "no task, no second model"
+        json!([
+            "--resume",
+            on_disk["sessionId"],
+            crate::agents::notebook::news::HEAD
+        ]),
+        "no second model; the notebook block is the only task (7b V1)"
     );
 }
 
