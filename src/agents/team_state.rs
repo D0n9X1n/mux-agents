@@ -48,7 +48,12 @@ pub fn gen_lock_key(key: &str, id: &str, n: u64) -> String {
 
 /// A replay hook open runs before its body (adopt-3e registers its journal, release-1d gens::complete).
 pub type Hook = fn(&Tx<'_>) -> Res<()>;
-const HOOKS: &[Hook] = &[super::release::complete, super::settle::fence];
+/// Replay hooks, in order (state-0 S3): adoption first (adopt-3e A6), then group B's.
+pub(crate) const HOOKS: &[Hook] = &[
+    super::adopt::replay,
+    super::release::complete,
+    super::settle::fence,
+];
 
 #[cfg(test)]
 thread_local! {

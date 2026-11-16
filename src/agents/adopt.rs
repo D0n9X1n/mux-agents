@@ -278,9 +278,73 @@ pub fn remove(tx: &Tx<'_>, seq: u64) -> Res<()> {
     if journal || tombstone {
         std::fs::remove_file(&stone).map_err(|_| not_written())?;
     }
+    // Call 26 (checklist 3): until the delete is flushed the tombstone stands, so replay repeats this flush.
+    flush(&dir).inspect_err(|_| {
+        let _ = std::fs::write(&stone, b"");
+    })
+}
+
+/// Calls 6, 14, 26: finish an unfinished publication or seq flush (`<key>`, `teams`, the seq file's content,
+/// `.adopt`) before anything is classified, applied or removed. A flush that still fails stops replay.
+fn settle(tx: &Tx<'_>) -> Res<()> {
+    let (key, teams, dir) = levels(tx.ctx, &tx.scope)?;
+    flush(&key)?;
+    flush(&teams)?;
+    let seq = seq_path(tx.ctx, &tx.scope);
+    if kept(&seq)? {
+        sync_file(&seq).map_err(|_| not_written())?;
+    }
     flush(&dir)
+}
+/// A4 replay: the first `team_state` hook; also `replay_held` (Task 8) and `adopt_from`. Names first (call 7):
+/// stale journals and tombstones are removed unparsed; the one journal at seq + 1 has its content flushed (call
+/// 26), is read strictly and finished from step 3; anything else refuses before a file is touched (ambiguity 10).
+pub fn replay(tx: &Tx<'_>) -> Res<()> {
+    let l = listing(tx.ctx, &tx.scope)?;
+    if l.journals.is_empty() && l.tombstones.is_empty() {
+        return Ok(());
+    }
+    settle(tx)?;
+    let s = committed(tx.ctx, &tx.scope)?;
+    let live: Vec<u64> = l.journals.iter().copied().filter(|n| *n > s).collect();
+    let next = s.checked_add(1);
+    // Two live journals always include one that is not seq + 1 (the `two` case).
+    if live.iter().any(|n| Some(*n) != next) || l.tombstones.iter().any(|n| *n > s) {
+        return Err(refusal("topology", OUT_OF_ORDER));
+    }
+    let stale: BTreeSet<u64> = (l.journals.iter().chain(&l.tombstones))
+        .copied()
+        .filter(|n| *n <= s)
+        .collect();
+    for n in stale {
+        remove(tx, n)?;
+        super::release::halt("adopt-stale")?;
+    }
+    let Some(n) = live.first() else {
+        return Ok(());
+    };
+    let path = dir_at(tx.ctx, &tx.scope).join(format!("{n}.json"));
+    if kept(&path)? {
+        sync_file(&path).map_err(|_| not_written())?;
+    }
+    finish(tx, &read_journal(tx.ctx, &tx.scope, *n)?)
+}
+/// A4.3-5: each change, the seq, the removal; a halt point after each (AD-R6).
+fn finish(tx: &Tx<'_>, j: &Journal) -> Res<()> {
+    for c in &j.changes {
+        apply(tx, c)?;
+        super::release::halt(&format!("adopt-change-{}", c.id))?;
+    }
+    commit(tx, j.seq)?;
+    super::release::halt("adopt-seq")?;
+    remove(tx, j.seq)?;
+    super::release::halt("adopt-removed")
 }
 
 #[cfg(test)]
 #[path = "adopt_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "adopt_replay_tests.rs"]
+mod replay_tests;

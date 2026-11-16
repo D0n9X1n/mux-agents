@@ -8,15 +8,15 @@ use crate::state::fs::{fail_sync_dir, fail_sync_file};
 use serde_json::json;
 use std::path::Path;
 
-fn world() -> (World, Scope) {
+pub(super) fn world() -> (World, Scope) {
     lf::world()
 }
-fn adopt_dir(w: &World, s: &Scope) -> PathBuf {
+pub(super) fn adopt_dir(w: &World, s: &Scope) -> PathBuf {
     let d = dir_at(&w.ctx, s);
     std::fs::create_dir_all(&d).unwrap();
     d
 }
-fn put(w: &World, s: &Scope, name: &str, body: Value) {
+pub(super) fn put(w: &World, s: &Scope, name: &str, body: Value) {
     crate::state::fs::write_json(&adopt_dir(w, s).join(name), &body).unwrap();
 }
 fn with(f: impl FnOnce(&mut Value)) -> Value {
@@ -40,7 +40,7 @@ fn read_all(w: &World, s: &Scope) -> Res<Vec<Journal>> {
         .map(|n| read_journal(&w.ctx, s, *n))
         .collect()
 }
-fn up(d: &Path, n: usize) -> PathBuf {
+pub(super) fn up(d: &Path, n: usize) -> PathBuf {
     d.ancestors().nth(n).unwrap().to_path_buf()
 }
 /// Every file below `d`, sorted.
