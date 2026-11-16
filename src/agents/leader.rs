@@ -1,20 +1,18 @@
-//! The leader `up` launches (#103): `<client> <flags> --session-id <uuid>`, depth 0, no parents, `upTeam`; its record
-//! is flushed to disk before `hc run`, so a power loss never hides a leader; a failed flush launches nothing.
+//! The leader `up` launches (#103): `<client> <flags> --session-id <uuid>`, depth 0, no parents, `upTeam`. Its folder
+//! is flushed to disk before `forward` writes its record, which `forward` flushes before `hc run`.
 
 use std::path::Path;
 
 use serde_json::json;
 
-use super::core_launch::Prepared;
-use super::spawn::{
-    CoreSlot, Recipe, abort_evidence, client_args, client_name, private_folder, utf8,
-};
+use super::core_launch::Launch;
+use super::spawn::{CoreSlot, Recipe, client_args, client_name, private_folder, utf8};
 use crate::{
     caller::Caller,
     ctx::Ctx,
     error::Res,
     parse::Client,
-    state::fs::{sync_ancestor, sync_dir, write_json, write_json_durable},
+    state::fs::{sync_ancestor, sync_dir, write_json},
     util::{guid, hex_id, utc_o},
 };
 
@@ -33,42 +31,37 @@ pub fn prepare(
     directory: &Path,
     slot: CoreSlot,
     leader: &Leader,
-) -> Res<Prepared> {
+) -> Res<Launch> {
     let state = super::state_dir(ctx, caller)?;
     write_json(
         &state.join("server.json"),
         &json!({"socket":caller.socket,"serverPid":caller.server_pid,"serverStart":caller.server_start}),
     )?;
-    let id = hex_id()?;
-    let folder = state.join("agents").join(&id);
-    let run = || {
-        private_folder(ctx, &folder)?;
-        let (session, spec) = (guid()?, folder.join("spec.json"));
-        // The prompt follows the recipe, so `--session-id <uuid>` ends any variadic option before it.
-        let mut args = client_args(client, Recipe::First(None), &session, None);
-        args.extend(leader.prompt.iter().cloned());
-        write_json(
-            &spec,
-            &json!({"schema": 1, "stateDirectory": utf8(&state)?, "id": id, "client": client_name(client),
-                "flags": leader.options, "parentPane": null,
-                "args": args, "generation": "0"}),
-        )?;
-        let mut record = json!({"schema": 1, "id": id, "name": slot.name, "color": slot.color,
-            "client": client_name(client), "sessionId": session, "context": "brief", "reason": "leader",
-            "session": caller.session, "parentPane": null, "parentAgent": null, "depth": 0, "upTeam": leader.team,
-            "options": leader.options, "prompt": leader.prompt,
-            "directory": utf8(directory)?, "taskLine": "", "createdAt": utc_o(ctx.clock.now())});
-        write_json_durable(&folder.join("record.json"), &record)?;
-        flush_to_root(&ctx.state_root, &state.join("agents"))?;
-        record["generation"] = "0".into();
-        record["team"] = super::membership::team(caller).into();
-        Ok(Prepared {
-            folder: folder.clone(),
-            record,
-            argv: crate::launcher_scope::argv(ctx, &spec)?,
-        })
-    };
-    run().map_err(|e| abort_evidence(&folder, e))
+    let (id, session) = (hex_id()?, guid()?);
+    // The member folder and every folder above it are on disk before forward creates the record (#103).
+    private_folder(ctx, &state.join("agents").join(&id))?;
+    flush_to_root(&ctx.state_root, &state.join("agents"))?;
+    // The prompt follows the recipe, so `--session-id <uuid>` ends any variadic option before it.
+    let mut args = client_args(client, Recipe::First(None), &session, None);
+    args.extend(leader.prompt.iter().cloned());
+    let spec = json!({"schema": 1, "stateDirectory": utf8(&state)?, "client": client_name(client),
+        "flags": leader.options, "parentPane": null, "args": args});
+    let record = json!({"schema": 1, "name": slot.name, "color": slot.color,
+        "client": client_name(client), "context": "brief", "reason": "leader",
+        "session": caller.session, "parentPane": null, "parentAgent": null, "depth": 0, "upTeam": leader.team,
+        "options": leader.options, "prompt": leader.prompt,
+        "directory": utf8(directory)?, "taskLine": "", "createdAt": utc_o(ctx.clock.now())});
+    Ok(Launch {
+        id,
+        kind: "leader",
+        session_id: session,
+        create: Some(record),
+        spec,
+        team: super::membership::team(caller),
+        name: slot.name,
+        up_team: Some(leader.team.clone()),
+        directory: utf8(directory)?.into(),
+    })
 }
 
 /// Flushes the folders the record's path depends on before `hc run` (#103), as the launcher's `flush_claim` does for
@@ -105,6 +98,32 @@ mod tests {
         }
     }
 
+    // The leader writes no record and no spec itself: forward does, after pending.
+    #[test]
+    fn a_leader_prepare_writes_no_record_and_no_spec() {
+        let w = World::human("");
+        let l = Leader {
+            team: "0123456789abcdef".into(),
+            options: vec![],
+            prompt: vec!["go".into()],
+        };
+        let _launch = prepare(&w.ctx, &w.caller(), Client::Claude, &w.ctx.cwd, slot(), &l).unwrap();
+        let agents = super::super::state_dir(&w.ctx, &w.caller())
+            .unwrap()
+            .join("agents");
+        let written: Vec<String> = std::fs::read_dir(&agents)
+            .unwrap()
+            .flat_map(|e| std::fs::read_dir(e.unwrap().path()).unwrap())
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            !written
+                .iter()
+                .any(|n| n == "record.json" || n == "spec.json"),
+            "{written:?}"
+        );
+    }
+
     #[test]
     fn a_leader_record_is_flushed_with_no_parent_and_depth_zero() {
         let w = World::human("");
@@ -114,9 +133,7 @@ mod tests {
             prompt: Vec::new(),
         };
         let p = prepare(&w.ctx, &w.caller(), Client::Claude, &w.ctx.cwd, slot(), &l).unwrap();
-        let r = crate::state::fs::read_json(&p.folder.join("record.json"))
-            .unwrap()
-            .unwrap();
+        let r = p.create.unwrap();
         assert_eq!(
             (
                 &r["depth"],
@@ -126,18 +143,27 @@ mod tests {
             ),
             (&json!(0), &Value::Null, &Value::Null, &json!(l.team))
         );
-        assert!(r.get("hcAddress").is_none() && !p.argv.is_empty());
-        let spec = crate::state::fs::read_json(&p.folder.join("spec.json"))
-            .unwrap()
-            .unwrap();
+        assert!(r.get("hcAddress").is_none());
         assert_eq!(
-            (&spec["flags"], &spec["args"][0]),
+            (&p.spec["flags"], &p.spec["args"][0]),
             (&json!(["--model", "a b"]), &json!("--session-id"))
         );
-        crate::state::fs::fail_durable_flush(Some(0));
+        // The member folder is on disk, private, before forward writes the record.
+        let agents = super::super::state_dir(&w.ctx, &w.caller())
+            .unwrap()
+            .join("agents");
+        let folder = agents.join(&p.id);
+        assert!(folder.is_dir());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&folder).unwrap().permissions().mode();
+            assert_eq!(mode & 0o077, 0, "private");
+        }
+        crate::state::fs::fail_sync_dir(Some(&agents));
         let failed = prepare(&w.ctx, &w.caller(), Client::Claude, &w.ctx.cwd, slot(), &l);
-        crate::state::fs::fail_durable_flush(None);
-        assert!(failed.is_err());
+        crate::state::fs::fail_sync_dir(None);
+        assert!(failed.is_err(), "a failed folder flush launches nothing");
     }
 
     #[test]
@@ -149,12 +175,7 @@ mod tests {
             prompt: vec!["fix".into()],
         };
         let p = prepare(&w.ctx, &w.caller(), Client::Claude, &w.ctx.cwd, slot(), &l).unwrap();
-        let read = |f: &str| {
-            crate::state::fs::read_json(&p.folder.join(f))
-                .unwrap()
-                .unwrap()
-        };
-        let (r, spec) = (read("record.json"), read("spec.json"));
+        let (r, spec) = (p.create.unwrap(), p.spec);
         assert_eq!(
             (&r["options"], &r["prompt"]),
             (&json!(["--model", "x"]), &json!(["fix"]))

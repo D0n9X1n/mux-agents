@@ -194,16 +194,24 @@ fn create(ctx: &Ctx, caller: &Caller, core: &Core<'_>, plan: &Plan<'_>) -> Res<M
     ] {
         reply.insert(k.into(), v);
     }
+    // PM call 10 (G1.6): a view that failed after the commit is reported. The leader, its session and the team
+    // record stay; there is no window to lay out, so `layout` is skipped.
+    let view_error = record.get("viewError").cloned();
+    if let Some(e) = &view_error {
+        reply.insert("viewError".into(), e.clone());
+    }
     // Step 5 after the commit, still under the admission lock; step 6 reports each failure; the leader and session stay.
     let team_error = write_team(ctx, &dest, plan, &name, &record).err();
-    if let Err(e) = layout(
-        ctx,
-        &dest,
-        &release,
-        &name,
-        &text(record.get("window")),
-        &mut reply,
-    ) {
+    if view_error.is_none()
+        && let Err(e) = layout(
+            ctx,
+            &dest,
+            &release,
+            &name,
+            &text(record.get("window")),
+            &mut reply,
+        )
+    {
         reply.insert("layoutError".into(), e.message.into());
     }
     if let Some(e) = team_error {

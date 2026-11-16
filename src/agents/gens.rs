@@ -681,7 +681,7 @@ pub enum Found {
 }
 
 /// Ambiguity 1: the terminals labelled `mux.id=<id>, mux.gen=<n>` whose name is the recorded `hcName`; exactly
-/// one is `One`. None, several, or any hc failure is Unknown.
+/// one is `One`. None is `Missing` (call 60); several, or any hc failure, is Unknown.
 pub fn find(core: &Core<'_>, id: &str, n: u64, hc_name: &str) -> Found {
     let g = n.to_string();
     let Ok(listed) = core.ls(&[("mux.id", id), ("mux.gen", &g)]) else {

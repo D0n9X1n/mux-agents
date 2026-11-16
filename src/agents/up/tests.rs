@@ -2,6 +2,7 @@ use super::*;
 use crate::agents::{
     core_fixture as cf,
     fixture::{SERVER, World},
+    gens,
 };
 use crate::spawn::Out;
 use std::{cell::Cell, path::PathBuf, rc::Rc};
@@ -158,7 +159,7 @@ fn up_creates_the_team_in_a_new_session() {
         (&r["depth"], &r["parentPane"], &r["upTeam"], &r["session"]),
         (&json!(0), &Value::Null, &json!(t), &json!("$7"))
     );
-    let spec = crate::state::fs::read_json(&agents(&w).join(&id).join("spec.json"))
+    let spec = crate::state::fs::read_json(&gens::path(&agents(&w).join(&id), 0, "spec"))
         .unwrap()
         .unwrap();
     assert_eq!(
@@ -203,6 +204,7 @@ fn the_record_is_flushed_before_hc_run_and_the_team_record_follows_the_commit() 
             .unwrap()
             .unwrap();
         assert!(r.get("hcAddress").is_none() && r["upTeam"].is_string());
+        assert_eq!(r["pending"]["gen"], 0, "the pending write precedes hc run");
         assert!(
             fakes
                 .mux_calls()
@@ -211,16 +213,23 @@ fn the_record_is_flushed_before_hc_run_and_the_team_record_follows_the_commit() 
         );
         s.set(s.get() + 1);
     });
-    let s = seen.clone();
-    crate::agents::spawn::commit_probe(Some(Box::new(move |folder| {
-        assert!(!folder.join("commit.json").exists() && !team.exists());
+    let (s, dir) = (seen.clone(), agents(&w));
+    w.fakes.mux_script("new-window", move |_| {
+        let folder = std::fs::read_dir(&dir)
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        assert!(gens::committed(&folder, 0).unwrap() && !team.exists());
         s.set(s.get() + 1);
-    })));
-    let reply = claude(&w);
-    crate::agents::spawn::commit_probe(None);
-    reply.unwrap();
+        out(0, "%9|@5|exact,#} attach t1\n")
+    });
+    claude(&w).unwrap();
     assert!(
-        seen.get() == 2 && team_file(&w).exists() && leader_folder(&w).join("commit.json").exists()
+        seen.get() == 2
+            && team_file(&w).exists()
+            && gens::committed(&leader_folder(&w), 0).unwrap()
     );
 }
 
@@ -249,13 +258,12 @@ fn post_commit_failures_are_reported_and_the_leader_stays() {
     assert!(claude(&switch).unwrap()["layoutError"].is_string() && !killed(&switch));
     let release = ready(); // the release write fails after the commit: `up` is then a file
     let up_dir = release.ctx.state_root.join("up");
-    crate::agents::spawn::commit_probe(Some(Box::new(move |_| {
+    release.fakes.mux_script("new-window", move |_| {
         std::fs::remove_dir_all(&up_dir).unwrap();
         std::fs::write(&up_dir, "").unwrap();
-    })));
-    let got = claude(&release);
-    crate::agents::spawn::commit_probe(None);
-    let reply = got.unwrap();
+        out(0, "%9|@5|exact,#} attach t1\n")
+    });
+    let reply = claude(&release).unwrap();
     assert!(
         reply["layoutError"].is_string()
             && reply.get("leftoverSession").is_none()
@@ -421,9 +429,14 @@ fn the_leader_is_rediscovered_after_each_write_and_a_failed_flush_launches_nothi
         s2();
         out(0, "%9|@5|exact,#} attach t1\n")
     });
-    crate::agents::spawn::commit_probe(Some(Box::new(move |_| s3())));
+    let _reset = crate::agents::core_launch::hooks::Reset;
+    crate::agents::core_launch::hooks::after(Some(Box::new(move |step| {
+        if step == "promote" {
+            s3()
+        }
+    })));
     let got = claude(&first);
-    crate::agents::spawn::commit_probe(None);
+    crate::agents::core_launch::hooks::after(None);
     got.unwrap();
     let launcher = crate::state::fs::read_json(&leader_folder(&first).join("record.json"))
         .unwrap()
@@ -489,9 +502,11 @@ fn a_custom_state_root_holds_the_release_and_the_spec() {
     w.ctx.state_root = w._dir.path().join("custom root");
     let reply = claude(&w).unwrap();
     assert!(Path::new(of(&w, "new-session")[0].last().unwrap()).starts_with(&w.ctx.state_root));
-    let spec = agents(&w)
-        .join(reply["leader"]["id"].as_str().unwrap())
-        .join("spec.json");
+    let spec = gens::path(
+        &agents(&w).join(reply["leader"]["id"].as_str().unwrap()),
+        0,
+        "spec",
+    );
     assert!(
         Path::new(
             crate::state::fs::read_json(&spec).unwrap().unwrap()["stateDirectory"]
@@ -639,12 +654,12 @@ fn up_drops_a_session_selector_and_runs_the_recipes_session() {
         .as_str()
         .unwrap()
         .to_string();
-    let read = |f: &str| {
-        crate::state::fs::read_json(&agents(&w).join(&id).join(f))
-            .unwrap()
-            .unwrap()
-    };
-    let (r, spec) = (read("record.json"), read("spec.json"));
+    let read = |f: &Path| crate::state::fs::read_json(f).unwrap().unwrap();
+    let folder = agents(&w).join(&id);
+    let (r, spec) = (
+        read(&folder.join("record.json")),
+        read(&gens::path(&folder, 0, "spec")),
+    );
     assert_eq!(
         (&r["options"], &r["prompt"]),
         (&json!(["--model", "x"]), &json!(["fix"]))
@@ -665,4 +680,27 @@ fn up_drops_a_session_selector_and_runs_the_recipes_session() {
     for seen in [r.to_string(), spec.to_string(), hc_run.join(" ")] {
         assert!(!seen.contains("SEL9") && !seen.contains("SEL8"), "{seen}");
     }
+}
+
+// PM calls 1, 10 (finding 5to8-4): the leader view fails after the commit: up succeeds with viewError, writes the
+// team record, runs no layout, and keeps the committed leader.
+#[test]
+fn a_leader_view_failure_is_reported_and_the_leader_stays() {
+    let w = ready();
+    fails(&w, "@agent-context");
+    let reply = claude(&w).unwrap();
+    assert!(reply["viewError"].is_string(), "{reply:?}");
+    assert!(
+        reply.get("layoutError").is_none() && of(&w, "select-window").is_empty(),
+        "no layout without a view"
+    );
+    assert!(team_file(&w).exists(), "the team record is written");
+    assert!(
+        gens::committed(&leader_folder(&w), 0).unwrap(),
+        "the leader is committed"
+    );
+    assert!(
+        !killed(&w) && !w.fakes.hc_calls().iter().any(|(_, a, _)| a[0] == "kill"),
+        "nothing rolled back"
+    );
 }

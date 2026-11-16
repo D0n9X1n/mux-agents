@@ -1174,7 +1174,8 @@ mod tests {
         let run = &hc[2].1;
         let id = run.iter().find_map(|s| s.strip_prefix("mux.id=")).unwrap();
         let spec = run.iter().position(|a| a == "launcher").unwrap() + 1;
-        let folder = std::path::Path::new(&run[spec]).parent().unwrap();
+        // The run's spec is `<member>/gens/0/spec.json`.
+        let folder = std::path::Path::new(&run[spec]).ancestors().nth(3).unwrap();
         let record = crate::state::fs::read_json(&folder.join("record.json"))
             .unwrap()
             .unwrap();
@@ -1188,7 +1189,7 @@ mod tests {
         ]
         .map(String::from)
         .to_vec();
-        argv.push(format!("m{}", &id[..8]));
+        argv.push(record["hcName"].as_str().unwrap().into());
         for label in [
             "mux.managed=1".into(),
             format!("mux.team={}", record["team"].as_str().unwrap()),
@@ -1205,13 +1206,16 @@ mod tests {
             "--".into(),
             w.ctx.exe.to_str().unwrap().into(),
             "launcher".into(),
-            folder.join("spec.json").to_str().unwrap().into(),
+            crate::agents::gens::path(folder, 0, "spec")
+                .to_str()
+                .unwrap()
+                .into(),
             "--state-root".into(),
             w.ctx.state_root.to_str().unwrap().into(),
             "--path".into(),
             w.ctx.env.get("PATH").unwrap_or("").into(),
         ]);
-        let mut expected = vec![
+        let expected = vec![
             vec!["--version".into()],
             vec![
                 "ls".into(),
@@ -1224,9 +1228,6 @@ mod tests {
             ],
             argv,
         ];
-        if failed {
-            expected.push(["kill", "t1", "--json"].map(String::from).to_vec());
-        }
         assert_eq!(
             hc.iter().map(|(_, a, _)| a.clone()).collect::<Vec<_>>(),
             expected
@@ -1256,10 +1257,11 @@ mod tests {
         );
         #[cfg(windows)]
         assert!(env.is_empty() && !create.iter().any(|t| t == "-e"));
-        let pane = if failed {
-            "%12"
-        } else {
-            record["pane"].as_str().unwrap()
+        // V1: the pane is in view.json, never in record.json.
+        let view = crate::state::fs::read_json(&folder.join("view.json")).unwrap();
+        let pane = match &view {
+            Some(v) if !failed => v["pane"].as_str().unwrap(),
+            _ => "%12",
         };
         let bound: Vec<_> = calls
             .iter()
@@ -1282,8 +1284,9 @@ mod tests {
                     "%12",
                     "#{pane_id}|#{@agent-id}"
                 ]));
-            assert!(!folder.join("commit.json").exists());
-            assert!(folder.join("abort.json").exists());
+            // PM call 1: the view failed after the commit; the member stays, with no view.
+            assert!(crate::agents::gens::committed(folder, 0).unwrap());
+            assert!(view.is_none());
         } else {
             assert_eq!(
                 bound[1][6],
@@ -1296,7 +1299,7 @@ mod tests {
                 bound[2][6],
                 format!("set-option -p -t {pane} allow-set-title off")
             );
-            assert!(folder.join("commit.json").exists());
+            assert!(crate::agents::gens::committed(folder, 0).unwrap());
         }
     }
 
@@ -1338,11 +1341,13 @@ mod tests {
             assert_eq!(code, want, "{scenario}: {out}");
             w.fakes.hc_done().unwrap();
             if tokens[0] == "spawn" && want != 2 {
-                assert_spawn_calls(w, want == 1);
-                if want == 1 {
-                    assert_eq!(
-                        out,
-                        r#"{"ok":false,"verb":"spawn","code":1,"check":"rmux","message":"tmux call failed"}"#
+                let failed = scenario.ends_with("tagging fails");
+                assert_spawn_calls(w, failed);
+                if failed {
+                    assert!(
+                        out.contains("\"viewError\":\"tmux call failed\"")
+                            && out.contains("\"view\":\"none\""),
+                        "{scenario}: {out}"
                     );
                 }
             }
@@ -1401,14 +1406,13 @@ mod tests {
         );
         let w = spawn_world();
         w.fakes.mux_first("set-option", 1, "", "no such pane");
-        crate::agents::core_fixture::answer(&w, &["kill", "t1", "--json"], "{}");
         w.fakes
             .mux_rule("-t %12 #{pane_id}|#{@agent-id}", 0, "|\n", "");
         record(
             &w,
             "spawn -Client claude -Task hi, tagging fails",
             &["spawn", "-Client", "claude", "-Task", "hi"],
-            1,
+            0,
         );
         let home = TempDir::new();
         record(

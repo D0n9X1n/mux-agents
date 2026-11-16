@@ -102,6 +102,7 @@ pub fn resume(ctx: &Ctx, request: &Request) -> Res<Map<String, Value>> {
         "agent".into(),
         json!({"id": record["id"], "name": record["name"], "hcAddress": record["hcAddress"]}),
     );
+    reply.extend(super::spawn::view_reply(&record));
     // Spawn's own post-commit bar step, so a change to the bar changes both verbs.
     keep_bar(ctx, &caller, &record, &mut reply);
     Ok(reply)

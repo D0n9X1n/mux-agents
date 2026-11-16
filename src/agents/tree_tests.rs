@@ -1762,7 +1762,7 @@ fn a_lifecycle_member_replays_bypass_options_under_a_bypass_team() {
     let bypass = t::permission_flags(Client::Claude, t::Policy::Bypass);
     let (w, got, _) = lifecycle_resume(&bypass, &bypass, true);
     let y = got.unwrap()["agent"]["id"].as_str().unwrap().to_string();
-    let spec = crate::state::fs::read_json(&w.folder(&y).join("spec.json"))
+    let spec = crate::state::fs::read_json(&crate::agents::gens::path(&w.folder(&y), 0, "spec"))
         .unwrap()
         .unwrap();
     assert_eq!(

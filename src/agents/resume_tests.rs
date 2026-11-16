@@ -3,7 +3,7 @@ use crate::agents::{
     core_fixture as cf,
     core_identity::Identity,
     fixture::{ID, SESSION_ID, World, write},
-    lock_key,
+    gens, lock_key,
     mail::{add_mail, member_mailbox, read_mail, read_mail_if},
     membership,
     message::current,
@@ -130,6 +130,15 @@ fn runs(w: &World) -> usize {
         .count()
 }
 
+/// A lifecycle successor's natural end, as group B's reaper records it: generation 0's `ended.json`.
+fn ended_life(w: &World, id: &str) {
+    crate::state::evidence::publish(
+        &gens::path(&w.folder(id), 0, "ended"),
+        &json!({"state": "finished", "reason": "exited", "exitCode": 0}),
+    )
+    .unwrap();
+}
+
 fn record_of(w: &World, id: &str) -> Value {
     read_json(&w.folder(id).join("record.json"))
         .unwrap()
@@ -161,10 +170,10 @@ fn resume_starts_an_ended_member_again_with_its_conversation() {
             let id = y.file_name().unwrap().to_str().unwrap().to_string();
             assert_eq!(
                 Value::Object(reply),
-                json!({"from": ID, "agent": {"id": id, "name": "worker", "hcAddress": "t1"}}),
+                json!({"from": ID, "agent": {"id": id, "name": "worker", "hcAddress": "t1"}, "view": "attached"}),
                 "{client} {how}"
             );
-            let spec = read_json(&y.join("spec.json")).unwrap().unwrap();
+            let spec = read_json(&gens::path(&y, 0, "spec")).unwrap().unwrap();
             assert_eq!(
                 spec["flags"],
                 json!(client_flags(client_named(client).unwrap()))
@@ -194,7 +203,7 @@ fn resume_starts_an_ended_member_again_with_its_conversation() {
             ] {
                 assert_eq!(record[k], v, "{client} {how} {k}");
             }
-            assert!(crate::agents::committed(&y));
+            assert!(gens::committed(&y, 0).unwrap());
             assert_eq!(files(&w.folder(ID)), kept, "{client} {how}");
             w.fakes.hc_done().unwrap();
         }
@@ -327,8 +336,7 @@ fn a_kept_claim_without_its_commit_still_takes_the_member() {
         .unwrap()
         .to_string();
     let folder = w.folder(&id);
-    std::fs::remove_file(folder.join("commit.json")).unwrap();
-    std::fs::create_dir(folder.join("gens")).unwrap();
+    std::fs::remove_file(gens::path(&folder, 0, "commit")).unwrap();
     std::fs::write(folder.join("gens/0.claim"), "\"run\"").unwrap();
     snapshot(&w, &[(&x, "exited"), (&record_of(&w, &id), "exited")]);
     let e = resume_of(&w, ID).unwrap_err();
@@ -351,7 +359,15 @@ fn a_failed_flush_before_the_run_launches_nothing() {
     crate::state::fs::fail_durable_flush(None);
     assert!(got.is_err());
     assert_eq!(runs(&w), 0);
-    assert!(new_folder(&w, &before).join("abort.json").exists());
+    let folder = new_folder(&w, &before);
+    assert_eq!(
+        gens::decide(
+            &read_json(&gens::path(&folder, 0, "commit"))
+                .unwrap()
+                .unwrap()
+        ),
+        gens::Decision::Aborted
+    );
     w.fakes.hc_done().unwrap();
     facts(&w, &[(&x, "exited")]);
     launches(&w, "t1");
@@ -391,7 +407,7 @@ fn an_aborted_successor_is_resumed_by_name_or_id() {
         let before = folders(&w);
         assert_eq!(resume_of(&w, target).unwrap()["from"], Y, "{target}");
         let z = new_folder(&w, &before);
-        let spec = read_json(&z.join("spec.json")).unwrap().unwrap();
+        let spec = read_json(&gens::path(&z, 0, "spec")).unwrap().unwrap();
         assert_eq!(spec["args"], json!(["--resume", SESSION_ID]));
         assert!(spec.get("prompt").is_none());
         let record = read_json(&z.join("record.json")).unwrap().unwrap();
@@ -427,7 +443,7 @@ fn of_two_unrelated_ended_members_a_name_resumes_the_newer() {
         launches(&w, "t1");
         let before = folders(&w);
         assert_eq!(resume_of(&w, target).unwrap()["from"], from, "{target}");
-        let spec = read_json(&new_folder(&w, &before).join("spec.json"))
+        let spec = read_json(&gens::path(&new_folder(&w, &before), 0, "spec"))
             .unwrap()
             .unwrap();
         assert_eq!(spec["args"], json!(["--resume", session]), "{target}");
@@ -451,6 +467,8 @@ fn a_resume_chain_keeps_the_first_mailbox_and_its_cursor() {
         .as_str()
         .unwrap()
         .to_string();
+    // Y is a lifecycle member: it is ended by its recorded end (R3), as the reaper records a natural exit.
+    ended_life(&w, &y_id);
     let y = record_of(&w, &y_id);
     facts(&w, &[(&x, "exited"), (&y, "exited")]);
     launches(&w, "t2");
@@ -688,83 +706,58 @@ fn resume_refuses_while_the_conversation_is_live_anywhere() {
 // is still a member: `resume <X id>` refuses as taken and names Y; `resume worker` and `resume <Y id>` resume Y with
 // no task, its life read from hc by its labels; and the new successor supersedes X through Y.
 #[test]
-fn a_successor_that_lost_its_run_reply_is_a_member() {
-    for target in ["x", "worker", "y"] {
-        let w = World::human("");
-        w.clock("2026-11-13T10:00:00Z");
-        let x = member(&w, ID, json!({"pane": "%5", "window": "@1", "depth": 1}));
-        w.panes(&[]);
-        facts(&w, &[(&x, "exited")]);
-        let before = folders(&w);
-        let agents = w.state().join("agents");
-        let known = before.clone();
-        w.fakes.hc_probe(move |a| {
-            if a[0] == "run" {
-                for entry in std::fs::read_dir(&agents).unwrap() {
-                    let folder = entry.unwrap().path();
-                    let name = folder.file_name().unwrap().to_string_lossy().into_owned();
-                    if !known.contains(&name) {
-                        std::fs::create_dir_all(folder.join("gens")).unwrap();
-                        crate::state::fs::claim_json(&folder.join("gens/0.claim"), &json!("run"))
-                            .unwrap();
-                    }
+fn a_successor_that_lost_its_run_reply_is_void() {
+    let w = World::human("");
+    w.clock("2026-11-13T10:00:00Z");
+    let x = member(&w, ID, json!({"pane": "%5", "window": "@1", "depth": 1}));
+    w.panes(&[]);
+    facts(&w, &[(&x, "exited")]);
+    let before = folders(&w);
+    let agents = w.state().join("agents");
+    let known = before.clone();
+    w.fakes.hc_probe(move |a| {
+        if a[0] == "run" {
+            for entry in std::fs::read_dir(&agents).unwrap() {
+                let folder = entry.unwrap().path();
+                let name = folder.file_name().unwrap().to_string_lossy().into_owned();
+                if !known.contains(&name) {
+                    std::fs::create_dir_all(folder.join("gens")).unwrap();
+                    crate::state::fs::claim_json(&folder.join("gens/0.claim"), &json!("run"))
+                        .unwrap();
                 }
             }
-        });
-        w.fakes
-            .hc_answer(Err(Refusal::internal("the run reply was lost")));
-        assert!(resume_of(&w, ID).is_err());
-        w.fakes.hc_done().unwrap();
-        w.fakes.hc_probe(|_| {});
-        let folder = new_folder(&w, &before);
-        let y = folder.file_name().unwrap().to_str().unwrap().to_string();
-        let pre_run = record_of(&w, &y);
-        assert_eq!(pre_run["resumedFrom"], ID);
-        assert!(pre_run.get("hcAddress").is_none());
-        assert!(!crate::agents::committed(&folder));
-        // The terminal hc started for Y, labelled by its run; its launcher found no commit and ended.
-        let t1 = json!({"address": "t1", "state": "finished", "reason": "exited", "exit_code": 1,
-            "argv": ["/bin/mux-agent", "launcher", "/spec"],
-            "labels": {"mux.managed": "1", "mux.team": membership::team(&w.caller()), "mux.id": y,
-                "mux.gen": "0", "mux.name": "worker"}});
-        w.clock("2026-11-13T10:05:00Z");
-        cf::online(&w);
-        cf::listing(&w, &membership::team(&w.caller()), &["t1"]);
-        cf::get(&w, "t1", t1.clone());
-        cf::get(&w, "taaaaaaaaaaaa", wire(&x, "exited"));
-        if target == "x" {
-            let e = resume_of(&w, ID).unwrap_err();
-            assert_eq!((e.code, e.check), (2, "taken"), "{}", e.message);
-            assert!(
-                e.message.contains(&format!("mux-agent resume {y}")),
-                "{}",
-                e.message
-            );
-            w.fakes.hc_done().unwrap();
-            continue;
         }
-        launches(&w, "t2");
-        let before = folders(&w);
-        let named = if target == "worker" { "worker" } else { &y };
-        let reply = resume_of(&w, named).unwrap();
-        assert_eq!(reply["from"], y.as_str(), "{target}");
-        let z = new_folder(&w, &before);
-        let spec = read_json(&z.join("spec.json")).unwrap().unwrap();
-        assert_eq!(spec["args"], json!(["--resume", SESSION_ID]));
-        assert!(spec.get("prompt").is_none());
-        let record = read_json(&z.join("record.json")).unwrap().unwrap();
-        assert_eq!(
-            (&record["resumedFrom"], &record["mailbox"]),
-            (&json!(y), &json!(ID))
-        );
-        let local = membership::locals(&w.ctx, &w.caller()).unwrap();
-        let superseded = membership::superseded_locals(&local);
-        assert!(
-            superseded.contains(ID) && superseded.contains(&y),
-            "{superseded:?}"
-        );
-        w.fakes.hc_done().unwrap();
-    }
+    });
+    w.fakes
+        .hc_answer(Err(Refusal::internal("the run reply was lost")));
+    assert!(resume_of(&w, ID).is_err());
+    w.fakes.hc_done().unwrap();
+    w.fakes.hc_probe(|_| {});
+    let folder = new_folder(&w, &before);
+    let y = folder.file_name().unwrap().to_str().unwrap().to_string();
+    // G1, PM call 3: the run error fenced generation 0; the successor is void, never a member.
+    assert_eq!(
+        gens::decide(
+            &read_json(&gens::path(&folder, 0, "commit"))
+                .unwrap()
+                .unwrap()
+        ),
+        gens::Decision::Aborted
+    );
+    let pre_run = record_of(&w, &y);
+    assert_eq!(pre_run["resumedFrom"], ID);
+    assert!(pre_run.get("pending").is_none() && pre_run.get("generation").is_none());
+    w.clock("2026-11-13T10:05:00Z");
+    facts(&w, &[(&x, "exited")]);
+    launches(&w, "t2");
+    let before = folders(&w);
+    assert_eq!(resume_of(&w, ID).unwrap()["from"], ID, "X is not taken");
+    let z = new_folder(&w, &before);
+    assert_eq!(
+        record_of(&w, z.file_name().unwrap().to_str().unwrap())["resumedFrom"],
+        ID
+    );
+    w.fakes.hc_done().unwrap();
 }
 
 /// The real per-user locks under one root beside the state folder, so threads whose worlds share it contend.
@@ -1043,6 +1036,8 @@ fn a_resume_chain_reads_new_mail_once_by_the_current_member() {
         .as_str()
         .unwrap()
         .to_string();
+    // Y is a lifecycle member: it is ended by its recorded end (R3), as the reaper records a natural exit.
+    ended_life(&w, &y_id);
     let y = record_of(&w, &y_id);
     facts(&w, &[(&x, "exited"), (&y, "exited")]);
     launches(&w, "t2");
@@ -1086,7 +1081,14 @@ fn a_failed_agents_folder_flush_launches_nothing() {
     assert!(got.is_err());
     assert_eq!(runs(&w), 0);
     let folder = new_folder(&w, &before);
-    assert!(folder.join("abort.json").exists());
+    assert_eq!(
+        gens::decide(
+            &read_json(&gens::path(&folder, 0, "commit"))
+                .unwrap()
+                .unwrap()
+        ),
+        gens::Decision::Aborted
+    );
     assert_eq!(
         record_of(&w, folder.file_name().unwrap().to_str().unwrap())["resumedFrom"],
         ID
@@ -1104,6 +1106,7 @@ fn a_failed_agents_folder_flush_launches_nothing() {
 // and what that write added, no temp file is left, and nothing commits. A write after hc run rolls the run back.
 #[test]
 fn power_loss_after_each_record_write_leaves_a_complete_record() {
+    // Durable writes in order, each a `record_write`: 0 the create, 1 the address patch, 2 the promotion.
     for write in 0..3 {
         let w = World::human("");
         let x = member(&w, ID, json!({"pane": "%5", "window": "@1", "depth": 1}));
@@ -1111,7 +1114,6 @@ fn power_loss_after_each_record_write_leaves_a_complete_record() {
         facts(&w, &[(&x, "exited")]);
         if write > 0 {
             launches(&w, "t1");
-            cf::answer(&w, &["kill", "t1", "--json"], "{}");
         }
         let before = folders(&w);
         crate::state::fs::fail_durable_flush(Some(write));
@@ -1125,24 +1127,40 @@ fn power_loss_after_each_record_write_leaves_a_complete_record() {
             ("id", json!(id)),
             ("resumedFrom", json!(ID)),
             ("mailbox", json!(ID)),
-            ("sessionId", json!(SESSION_ID)),
         ] {
             assert_eq!(record[k], v, "write {write} {k}");
         }
         assert_eq!(
-            record.get("hcAddress").is_some(),
-            write > 0,
-            "write {write}"
+            record.get("sessionId").is_some(),
+            write == 2,
+            "write {write}: the session arrives at promotion"
         );
-        assert_eq!(record.get("pane").is_some(), write > 1, "write {write}");
+        assert_eq!(
+            record.get("hcAddress").is_some(),
+            write == 2,
+            "write {write}: the address is in pending until promotion"
+        );
+        assert!(record.get("pending").is_none(), "write {write}");
+        assert!(record.get("pane").is_none(), "write {write}");
         let left: Vec<_> = std::fs::read_dir(&folder)
             .unwrap()
             .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
             .filter(|n| n.ends_with(".tmp"))
             .collect();
         assert!(left.is_empty(), "write {write}: {left:?}");
-        assert!(!crate::agents::committed(&folder), "write {write}");
-        assert!(folder.join("abort.json").exists(), "write {write}");
+        assert_eq!(
+            gens::decide(
+                &read_json(&gens::path(&folder, 0, "commit"))
+                    .unwrap()
+                    .unwrap()
+            ),
+            if write == 2 {
+                gens::Decision::Run
+            } else {
+                gens::Decision::Aborted
+            },
+            "write {write}"
+        );
         assert_eq!(runs(&w), usize::from(write > 0), "write {write}");
         w.fakes.hc_done().unwrap();
     }
@@ -1477,15 +1495,17 @@ fn a_lifecycle_member_resumes_with_its_stored_options_only() {
     launches(&w, "t1");
     resume_of(&w, ID).unwrap();
     let y = new_folder(&w, &before);
-    let spec = read_json(&y.join("spec.json")).unwrap().unwrap();
+    let spec = read_json(&gens::path(&y, 0, "spec")).unwrap().unwrap();
     assert_eq!(
         (&spec["flags"], &spec["args"]),
         (&json!(["--model", "x"]), &json!(["--resume", SESSION_ID]))
     );
     let r = record_of(&w, y.file_name().unwrap().to_str().unwrap());
-    for k in ["lifecycle", "options", "prompt"] {
-        assert!(r.get(k).is_none(), "{k}");
-    }
+    assert_eq!(
+        (&r["lifecycle"], &r["options"]),
+        (&json!(1), &json!(["--model", "x"]))
+    );
+    assert!(r.get("prompt").is_none(), "a resume never carries the task");
     w.fakes.hc_done().unwrap();
 }
 

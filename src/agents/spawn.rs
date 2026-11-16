@@ -1,5 +1,6 @@
 //! spawn: authenticates the caller, connects hc, then admits and launches under the session's spawn lock.
-//! Hc lifecycle facts reserve capacity and names; commit.json releases the launcher, then the sidebar is best effort.
+//! Hc lifecycle facts reserve capacity and names; the generation's commit releases the launcher, then the view and
+//! the sidebar are best effort.
 
 use std::path::{Path, PathBuf};
 
@@ -309,7 +310,7 @@ pub fn spawn(ctx: &Ctx, request: &Request) -> Res<Map<String, Value>> {
     reply.insert("placementSource".into(), source.into());
     keep_bar(ctx, &caller, &record, &mut reply);
     reply.insert("life".into(), "running".into());
-    reply.insert("view".into(), "attached".into());
+    reply.extend(view_reply(&record));
     reply.insert("hcAddress".into(), record["hcAddress"].clone());
     Ok(reply)
 }
@@ -436,8 +437,9 @@ impl Launch<'_> {
         Ok(record)
     }
 
-    /// Before any pane: header, prompt and args, the length check, then the private folder, brief.md and spec.json.
-    fn prepare(&self, agent: &Agent) -> Res<PathBuf> {
+    /// Before any pane: header, prompt and args, the length check, then the private folder and brief.md; answers the
+    /// spec body `forward` publishes.
+    fn prepare(&self, agent: &Agent) -> Res<Value> {
         let ctx = self.ctx;
         let brief_path = self.brief.as_ref().map(|_| agent.folder.join("brief.md"));
         let transcript = parent_transcript(ctx, self.caller)?;
@@ -477,51 +479,13 @@ impl Launch<'_> {
             .parent()
             .and_then(Path::parent)
             .ok_or_else(|| Refusal::internal("the agent folder has no state folder"))?;
-        let spec = agent.folder.join("spec.json");
-        write_json(
-            &spec,
-            &json!({"schema": 1, "stateDirectory": utf8(state)?, "id": agent.id,
-                "client": client_name(self.client), "flags": self.flags,
-                "parentPane": self.placed.as_ref().map_or(self.caller.pane.as_str(), |p| p.parent_pane.as_str()), "args": args,
-                "prompt": prompt}),
-        )?;
-        Ok(spec)
+        Ok(
+            json!({"schema": 1, "stateDirectory": utf8(state)?, "id": agent.id,
+            "client": client_name(self.client), "flags": self.flags,
+            "parentPane": self.placed.as_ref().map_or(self.caller.pane.as_str(), |p| p.parent_pane.as_str()), "args": args,
+            "prompt": prompt}),
+        )
     }
-}
-
-/// commit.json, the last write: from here the agent is live. It is made once, whole: a launcher that gave up waiting
-/// made it first (`"aborted": true`), and then the spawn refuses and rolls back rather than answer for an agent that
-/// will never start (#97). Nothing the spawn does after it can fail.
-fn commit(ctx: &Ctx, folder: &Path) -> Res<()> {
-    #[cfg(test)]
-    COMMIT_PROBE.with(|probe| {
-        if let Some(probe) = probe.borrow().as_ref() {
-            probe(folder);
-        }
-    });
-    let made = crate::state::fs::claim_json(
-        &folder.join("commit.json"),
-        &json!({"committedAt": utc_o(ctx.clock.now())}),
-    )?;
-    if !made {
-        return refuse(1, "launch", "the launcher gave up before the commit");
-    }
-    Ok(())
-}
-
-#[cfg(test)]
-pub(crate) type CommitProbe = Box<dyn Fn(&Path)>;
-
-#[cfg(test)]
-thread_local! {
-    // Sees the agent folder just before commit.json is written.
-    static COMMIT_PROBE: std::cell::RefCell<Option<CommitProbe>> = const { std::cell::RefCell::new(None) };
-}
-
-/// Sets (or clears) the probe that sees the agent folder at the moment commit.json is written.
-#[cfg(test)]
-pub(crate) fn commit_probe(probe: Option<CommitProbe>) {
-    COMMIT_PROBE.with(|slot| *slot.borrow_mut() = probe);
 }
 
 /// Made private like the state, agents and mail folders.
@@ -807,6 +771,7 @@ mod tests {
     use super::*;
     use crate::agents::copilot::session_folder;
     use crate::agents::fixture::{CLAUDE, PANE, World};
+    use crate::agents::gens;
     use crate::checks::Context;
     use crate::ctx::Env;
     use crate::mux::{Kind as MuxKind, Output};
@@ -954,7 +919,7 @@ mod tests {
             .mux_first("-t %9 #{pane_id}|#{@agent-id}", 0, "|\n", "");
         w
     }
-    fn hc_attempt(w: &World, client: Client, model: Option<&str>, rollback: bool) -> Res<Value> {
+    fn hc_attempt(w: &World, client: Client, model: Option<&str>) -> Res<Value> {
         use crate::agents::core_fixture as cf;
         let caller = w.caller();
         cf::online(w);
@@ -962,9 +927,6 @@ mod tests {
             stdout: r#"{"address":"t1"}"#.into(),
             ..Default::default()
         }));
-        if rollback {
-            cf::answer(w, &["kill", "t1", "--json"], "{}");
-        }
         let result = launch_hc(
             &w.ctx,
             &caller,
@@ -990,7 +952,7 @@ mod tests {
             },
         );
         let folder = agents_dir(w).join(&agent_folders(w)[0]);
-        let spec = read_json(&folder.join("spec.json"));
+        let spec = read_json(&gens::path(&folder, 0, "spec"));
         let id = spec["id"].as_str().unwrap();
         let team = format!("{}:{}", caller.server_key, caller.session);
         let mut run = vec![
@@ -1000,7 +962,10 @@ mod tests {
             "--outlive-parent".into(),
             "--no-notify".into(),
             "--name".into(),
-            format!("m{}", &id[..8]),
+            read_json(&gens::path(&folder, 0, "launch"))["hcName"]
+                .as_str()
+                .unwrap()
+                .into(),
         ];
         for label in [
             "mux.managed=1".into(),
@@ -1018,16 +983,13 @@ mod tests {
             "--".into(),
             utf8(&w.ctx.exe).unwrap().into(),
             "launcher".into(),
-            utf8(&folder.join("spec.json")).unwrap().into(),
+            utf8(&gens::path(&folder, 0, "spec")).unwrap().into(),
             "--state-root".into(),
             utf8(&w.ctx.state_root).unwrap().into(),
             "--path".into(),
             w.ctx.env.get("PATH").unwrap_or("").into(),
         ]);
-        let mut expected = vec![vec!["--version".to_string()], run];
-        if rollback {
-            expected.push(["kill", "t1", "--json"].map(String::from).to_vec());
-        }
+        let expected = vec![vec!["--version".to_string()], run];
         assert_eq!(
             w.fakes
                 .hc_calls()
@@ -1038,13 +1000,6 @@ mod tests {
         );
         w.fakes.hc_done().unwrap();
         result
-    }
-
-    struct HcCommitReset;
-    impl Drop for HcCommitReset {
-        fn drop(&mut self) {
-            commit_probe(None);
-        }
     }
 
     // Each invocation explicitly queues its one snapshot and, only if admitted, one run.
@@ -1088,7 +1043,7 @@ mod tests {
                 .join(&caller.server_key)
                 .join("agents")
                 .join(id);
-            let spec = read_json(&folder.join("spec.json"));
+            let spec = read_json(&gens::path(&folder, 0, "spec"));
             let record = read_json(&folder.join("record.json"));
             assert_eq!(spec["id"], id);
             let mut expected = vec![
@@ -1098,7 +1053,10 @@ mod tests {
                 "--outlive-parent".into(),
                 "--no-notify".into(),
                 "--name".into(),
-                format!("m{}", &id[..8]),
+                read_json(&gens::path(&folder, 0, "launch"))["hcName"]
+                    .as_str()
+                    .unwrap()
+                    .into(),
             ];
             for label in [
                 "mux.managed=1".into(),
@@ -1116,7 +1074,7 @@ mod tests {
                 "--".into(),
                 utf8(&w.ctx.exe).unwrap().into(),
                 "launcher".into(),
-                utf8(&folder.join("spec.json")).unwrap().into(),
+                utf8(&gens::path(&folder, 0, "spec")).unwrap().into(),
                 "--state-root".into(),
                 utf8(&w.ctx.state_root).unwrap().into(),
                 "--path".into(),
@@ -1147,6 +1105,14 @@ mod tests {
             .mux_calls()
             .into_iter()
             .filter(|c| c[1] == verb)
+            .collect()
+    }
+
+    /// The member locks one launch takes (forward's create, address and promotion writes, then view.json).
+    fn launch_locks(c: &Caller, id: &str) -> Vec<String> {
+        let member = lock_key("member", c, id);
+        (0..4)
+            .flat_map(|_| [format!("+{member}"), format!("-{member}")])
             .collect()
     }
 
@@ -1414,11 +1380,11 @@ mod tests {
                 &w,
                 &["-Client", "claude", "-Task", "hi", "-Model", model],
             ));
-            let spec = read_json(
-                &agents_dir(&w)
-                    .join(ok["id"].as_str().unwrap())
-                    .join("spec.json"),
-            );
+            let spec = read_json(&gens::path(
+                &agents_dir(&w).join(ok["id"].as_str().unwrap()),
+                0,
+                "spec",
+            ));
             assert_eq!(
                 spec["args"].as_array().unwrap()[..4],
                 [
@@ -1458,11 +1424,11 @@ mod tests {
             empty_launch(&w);
             let ok = reply(&run(&w, &args));
             let new = ok["sessionId"].as_str().unwrap();
-            let spec = read_json(
-                &agents_dir(&w)
-                    .join(ok["id"].as_str().unwrap())
-                    .join("spec.json"),
-            );
+            let spec = read_json(&gens::path(
+                &agents_dir(&w).join(ok["id"].as_str().unwrap()),
+                0,
+                "spec",
+            ));
             let prompt = spec["prompt"].clone();
             // Before the prompt; for Copilot before -i, which takes the prompt.
             let expected = match (client, no_fork) {
@@ -2146,10 +2112,11 @@ mod tests {
                         format!("-{mail}"),
                         format!("-{notice}"),
                         format!("-{member}"),
-                        format!("-{spawn}"),
-                        format!("+{bar}"),
-                        format!("-{bar}")
                     ]
+                    .into_iter()
+                    .chain(launch_locks(&c, ok["id"].as_str().unwrap()))
+                    .chain([format!("-{spawn}"), format!("+{bar}"), format!("-{bar}")])
+                    .collect::<Vec<_>>()
                 );
             } else {
                 assert_eq!(
@@ -2232,7 +2199,7 @@ mod tests {
             record["parentAgent"],
             json!({"client": "claude", "pid": CLAUDE, "start": 1500, "sessionId": null})
         );
-        let prompt = read_json(&folder.join("spec.json"))["prompt"].clone();
+        let prompt = read_json(&gens::path(&folder, 0, "spec"))["prompt"].clone();
         let brief = folder.join("brief.md").to_str().unwrap().replace('\\', "/");
         assert_eq!(
             prompt.as_str().unwrap().split('\n').nth(2).unwrap(),
@@ -2325,11 +2292,11 @@ mod tests {
             );
             empty_launch(&w);
             let ok = reply(&run(&w, &["-Client", "claude", "-Task", "hi"]));
-            let spec = read_json(
-                &agents_dir(&w)
-                    .join(ok["id"].as_str().unwrap())
-                    .join("spec.json"),
-            );
+            let spec = read_json(&gens::path(
+                &agents_dir(&w).join(ok["id"].as_str().unwrap()),
+                0,
+                "spec",
+            ));
             assert!(
                 spec["prompt"]
                     .as_str()
@@ -2379,10 +2346,7 @@ mod tests {
         w.ctx.exe = PathBuf::from("/x\"$(y)/mux-agent");
         w.fakes.clear_log();
         public_snapshot(&w, &[], &[]);
-        assert_eq!(
-            run(&w, &["-Client", "claude", "-Task", "hi"]),
-            format!("{ENTRY}; abort evidence could not be written")
-        );
+        assert_eq!(run(&w, &["-Client", "claude", "-Task", "hi"]), ENTRY);
         assert!(calls(&w, "new-window").is_empty());
         assert!(agent_folders(&w).is_empty());
     }
@@ -2407,11 +2371,11 @@ mod tests {
                 args.extend(model);
                 empty_launch(&w);
                 let ok = reply(&run(&w, &args));
-                let spec = read_json(
-                    &agents_dir(&w)
-                        .join(ok["id"].as_str().unwrap())
-                        .join("spec.json"),
-                );
+                let spec = read_json(&gens::path(
+                    &agents_dir(&w).join(ok["id"].as_str().unwrap()),
+                    0,
+                    "spec",
+                ));
                 let mut argv: Vec<&str> = flags.to_vec();
                 argv.extend(
                     spec["args"]
@@ -2438,8 +2402,7 @@ mod tests {
                         assert!(text.starts_with("ok "), "{client} {model:?} {}", task.len());
                     } else {
                         assert_eq!(
-                            text,
-                            "2 usage task is too long for the client command line; abort evidence could not be written",
+                            text, "2 usage task is too long for the client command line",
                             "{client} {model:?}"
                         );
                         assert!(calls(&w, "new-window").is_empty());
@@ -2463,7 +2426,7 @@ mod tests {
             let ok = reply(&run(&w, &args));
             assert_eq!(ok["name"], "hi", "{extra:?}");
             let folder = agents_dir(&w).join(ok["id"].as_str().unwrap());
-            assert!(folder.join("commit.json").is_file(), "{extra:?}");
+            assert!(gens::committed(&folder, 0).unwrap(), "{extra:?}");
             // Bound like the tags: written only while %9 still runs the command its reply named.
             let titles: Vec<Vec<String>> = calls(&w, "if-shell")
                 .into_iter()
@@ -2492,7 +2455,7 @@ mod tests {
         empty_launch(&w);
         let ok = reply(&run(&w, &["-Client", "claude", "-Task", "hi"]));
         let id = ok["id"].as_str().unwrap();
-        let spec = agents_dir(&w).join(id).join("spec.json");
+        let spec = gens::path(&agents_dir(&w).join(id), 0, "spec");
         let mut expected: Vec<String> = [
             "-N",
             "new-window",
@@ -2529,7 +2492,8 @@ mod tests {
             json!({"schema": 1, "stateDirectory": agents_dir(&w).parent().unwrap().to_str().unwrap(),
                 "id": id, "client": "claude", "flags": client_flags(Client::Claude), "parentPane": "%1",
                 "args": ["--session-id", ok["sessionId"], read_json(&spec)["prompt"]],
-                "prompt": read_json(&spec)["prompt"], "generation": "0"})
+                "prompt": read_json(&spec)["prompt"], "generation": "0", "kind": "spawn",
+                "sessionId": ok["sessionId"], "deadline": read_json(&spec)["deadline"]})
         );
         let keys: Vec<String> = read_json(&spec)
             .as_object()
@@ -2548,9 +2512,13 @@ mod tests {
                 "parentPane",
                 "args",
                 "prompt",
-                "generation"
+                "generation",
+                "kind",
+                "sessionId",
+                "deadline"
             ]
         );
+        assert!(read_json(&spec)["deadline"].is_string());
         let prompt = read_json(&spec)["prompt"].as_str().unwrap().to_string();
         assert!(prompt.ends_with("\n\nhi"), "{prompt}");
         assert_eq!(prompt.split('\n').count(), 7);
@@ -2561,9 +2529,7 @@ mod tests {
                 &w,
                 &["-Client", "copilot", "-Task", "hi", "-Split", split],
             ));
-            let spec = agents_dir(&w)
-                .join(ok["id"].as_str().unwrap())
-                .join("spec.json");
+            let spec = gens::path(&agents_dir(&w).join(ok["id"].as_str().unwrap()), 0, "spec");
             let mut expected: Vec<String> = [
                 "-N",
                 "split-window",
@@ -2622,7 +2588,7 @@ mod tests {
             let ok = reply(&run(&w, &args));
             let new = ok["sessionId"].as_str().unwrap();
             let folder = agents_dir(&w).join(ok["id"].as_str().unwrap());
-            let spec = folder.join("spec.json");
+            let spec = gens::path(&folder, 0, "spec");
             let prompt = read_json(&spec)["prompt"].clone();
             let expected = match (client, no_fork) {
                 (Client::Claude, false) => {
@@ -2881,7 +2847,7 @@ mod tests {
             // The agent is committed, and the spawn lock released, before the bar is looked for.
             let committed = std::fs::read_dir(&agents).map_or(0, |dir| {
                 dir.flatten()
-                    .filter(|e| e.path().join("commit.json").is_file())
+                    .filter(|e| gens::committed(&e.path(), 0).unwrap_or(false))
                     .count()
             });
             format!("committed {committed}")
@@ -2903,12 +2869,15 @@ mod tests {
         );
         assert_eq!(
             w.fakes.locks(),
-            [
-                format!("+spawn|{key}|$3"),
-                format!("-spawn|{key}|$3"),
-                format!("+sidebar|{key}|$3 committed 1"),
-                format!("-sidebar|{key}|$3"),
-            ]
+            [format!("+spawn|{key}|$3")]
+                .into_iter()
+                .chain(launch_locks(&w.caller(), first["id"].as_str().unwrap()))
+                .chain([
+                    format!("-spawn|{key}|$3"),
+                    format!("+sidebar|{key}|$3 committed 1"),
+                    format!("-sidebar|{key}|$3"),
+                ])
+                .collect::<Vec<_>>()
         );
         assert_eq!(bar_splits(&w), 1);
         // #103: the bar opens at the right edge of the new view's window (@5, where new-window put the agent), full
@@ -3016,7 +2985,7 @@ mod tests {
             );
             // The agent is live: committed, with its record.
             let folder = agents_dir(&w).join(ok["id"].as_str().unwrap());
-            assert!(folder.join("commit.json").is_file(), "{case}");
+            assert!(gens::committed(&folder, 0).unwrap(), "{case}");
             assert!(calls(&w, "kill-pane").is_empty(), "{case}");
             // A failed probe or read opens no bar.
             if case != "open" {
@@ -3034,19 +3003,19 @@ mod tests {
             (&Value::Null, &json!("unexpected error (panic)"))
         );
         let folder = agents_dir(&w).join(ok["id"].as_str().unwrap());
-        assert!(folder.join("commit.json").is_file());
+        assert!(gens::committed(&folder, 0).unwrap());
         let (w, _) = bar_on();
         w.fakes.lock_timeout("sidebar|");
         empty_launch(&w);
-        assert!(run(&w, &["-Client", "claude", "-Task", "hi"]).starts_with("ok "));
+        let ok = reply(&run(&w, &["-Client", "claude", "-Task", "hi"]));
         let key = w.caller().server_key;
         assert_eq!(
             w.fakes.locks(),
-            [
-                format!("+spawn|{key}|$3"),
-                format!("-spawn|{key}|$3"),
-                format!("!sidebar|{key}|$3"),
-            ]
+            [format!("+spawn|{key}|$3")]
+                .into_iter()
+                .chain(launch_locks(&w.caller(), ok["id"].as_str().unwrap()))
+                .chain([format!("-spawn|{key}|$3"), format!("!sidebar|{key}|$3")])
+                .collect::<Vec<_>>()
         );
     }
 
@@ -3124,7 +3093,7 @@ mod tests {
             ));
             assert_eq!(ok["reason"], "cross-client", "{parent:?}");
             let folder = agents_dir(&w).join(ok["id"].as_str().unwrap());
-            let prompt = read_json(&folder.join("spec.json"))["prompt"].clone();
+            let prompt = read_json(&gens::path(&folder, 0, "spec"))["prompt"].clone();
             let slashes = |p: &Path| p.to_str().unwrap().replace('\\', "/");
             assert_eq!(
                 prompt.as_str().unwrap().split('\n').nth(2).unwrap(),
@@ -3183,7 +3152,7 @@ mod tests {
         assert_eq!(names(), [OLD]);
         let new = ok["sessionId"].as_str().unwrap();
         let folder = agents_dir(&w).join(ok["id"].as_str().unwrap());
-        let spec = read_json(&folder.join("spec.json"));
+        let spec = read_json(&gens::path(&folder, 0, "spec"));
         let prompt = spec["prompt"].clone();
         assert_eq!(spec["args"], json!(["--session-id", new, "-i", prompt]));
         let tags = calls(&w, "if-shell")
@@ -3229,361 +3198,22 @@ mod tests {
     }
 
     #[test]
-    fn failure_after_launch_writes_abort_kills_pane() {
-        let kill = [
-            "-N",
-            "if-shell",
-            "-F",
-            "-t",
-            "%9",
-            "#{==:#{pane_start_command},hc attach t1}",
-            "kill-pane -t %9",
-        ]
-        .map(String::from);
-        for (gone, closed) in [("|\n", true), ("%9|\n", false), ("", false)] {
+    fn a_launcher_that_gave_up_first_makes_the_spawn_refuse() {
+        for gave_up in [true, false] {
             let w = hc_world(human());
-            w.fakes.mux_first("@agent-context", 1, "", "no pane");
-            w.fakes
-                .mux_first("-t %9 #{pane_id}|#{@agent-id}", 0, gone, "");
-            let e = hc_attempt(&w, Client::Claude, None, true).unwrap_err();
-            assert_eq!(
-                (e.code, e.check, e.message.as_str()),
-                (1, "rmux", "tmux call failed")
-            );
-            let folder = agents_dir(&w).join(&agent_folders(&w)[0]);
-            let abort = read_json(&folder.join("abort.json"));
-            let mut identity = read_json(&folder.join("record.json"));
-            for k in ["pane", "window", "startCommand"] {
-                identity.as_object_mut().unwrap().remove(k);
-            }
-            assert_eq!(
-                abort,
-                json!({"hcAddress":"t1","identity":identity,"pane":"%9","kill":"acknowledged","viewCleanup":{"gone":closed}})
-            );
-            assert!(folder.join("record.json").is_file());
-            assert!(!folder.join("commit.json").exists());
-            let kills: Vec<_> = calls(&w, "if-shell")
-                .into_iter()
-                .filter(|c| c[6].starts_with("kill-pane"))
-                .collect();
-            assert_eq!(kills, [kill.to_vec()]);
-            assert!(calls(&w, "kill-pane").is_empty());
-        }
-        for (code, out, message) in [
-            (0, "%9|@5|\n", "unexpected error (unproven new view)"),
-            (1, "%9|@5|hc attach t1\n", "tmux call failed"),
-            (0, "", "unexpected error (unproven new view)"),
-            (
-                0,
-                "%9|@5|hc attach t1\n%10|@6\n",
-                "unexpected error (unproven new view)",
-            ),
-            (0, "%9|@5\n", "unexpected error (unproven new view)"),
-            (
-                0,
-                "%9|@5;kill-server\n",
-                "unexpected error (unproven new view)",
-            ),
-            (
-                0,
-                "#{pane_id}|@5|x\n",
-                "unexpected error (unproven new view)",
-            ),
-            (0, "%9 |@5|x\n", "unexpected error (unproven new view)"),
-        ] {
-            let w = hc_world(human());
-            w.fakes.mux_first("new-window", code, out, "");
-            let e = hc_attempt(&w, Client::Claude, None, true).unwrap_err();
-            assert_eq!(
-                (e.code, e.check, e.message.as_str()),
-                (1, if code == 1 { "rmux" } else { "internal" }, message)
-            );
-            let folder = agents_dir(&w).join(&agent_folders(&w)[0]);
-            let a = read_json(&folder.join("abort.json"));
-            assert_eq!(
-                (&a["hcAddress"], &a["pane"], &a["kill"], &a["viewCleanup"]),
-                (
-                    &json!("t1"),
-                    &Value::Null,
-                    &json!("acknowledged"),
-                    &json!("unproven")
-                )
-            );
-            assert!(folder.join("record.json").is_file());
-            assert!(!folder.join("commit.json").exists());
-            assert!(calls(&w, "if-shell").is_empty());
-            assert!(calls(&w, "set-option").is_empty());
-        }
-        let w = hc_world(human());
-        w.fakes
-            .mux_first("new-window", 0, "%9|@5|/b/hc|binary attach t1\r\n", "");
-        let r = hc_attempt(&w, Client::Claude, None, false).unwrap();
-        assert_eq!(
-            (&r["pane"], &r["window"], &r["startCommand"]),
-            (&json!("%9"), &json!("@5"), &json!("/b/hc|binary attach t1"))
-        );
-        for fail in [true, false] {
-            let (w, _) = admitted(Client::Copilot, true);
-            let w = hc_world(w);
-            let source = session_folder(&w.ctx.home, OLD);
-            if fail {
-                w.fakes.mux_first("@agent-context", 1, "", "bad");
-            }
-            let got = hc_attempt(&w, Client::Copilot, None, fail);
-            assert_eq!(got.is_err(), fail);
-            let folder = agents_dir(&w).join(&agent_folders(&w)[0]);
-            let record = read_json(&folder.join("record.json"));
-            assert_eq!(
-                (&record["context"], &record["reason"]),
-                (&json!("fork"), &json!("same-client"))
-            );
-            let new = record["sessionId"].as_str().unwrap();
-            let copy = session_folder(&w.ctx.home, new);
-            assert!(copy.join("workspace.yaml").is_file());
-            assert!(copy.join("events.jsonl").is_file());
-            assert_eq!(
-                std::fs::read_dir(source.parent().unwrap()).unwrap().count(),
-                2
-            );
-            assert_eq!(
-                read_json(&folder.join("spec.json"))["args"]
-                    .as_array()
-                    .unwrap()[..3],
-                [json!("--resume"), json!(new), json!("-i")]
-            );
-            assert_eq!(crate::agents::committed(&folder), !fail);
-            assert_eq!(folder.join("abort.json").exists(), fail);
-        }
-    }
-
-    #[test]
-    fn record_then_commit_order() {
-        let w = hc_world(human());
-        let _reset = HcCommitReset;
-        let agents = agents_dir(&w);
-        let log = Rc::new(RefCell::new(Vec::new()));
-        let (seen, dir) = (log.clone(), agents.clone());
-        w.fakes.mux_script("new-window", move |_| {
-            let folder = std::fs::read_dir(&dir)
-                .unwrap()
-                .next()
-                .unwrap()
-                .unwrap()
-                .path();
-            assert!(
-                folder.join("record.json").is_file(),
-                "hc identity must precede attachment"
-            );
-            let r = read_json(&folder.join("record.json"));
-            assert_eq!(r["hcAddress"], "t1");
-            assert!(r.get("pane").is_none());
-            assert!(folder.join("spec.json").is_file());
-            assert!(!folder.join("commit.json").exists());
-            seen.borrow_mut().push("attach");
-            Ok(Output {
-                stdout: "%9|@5|hc attach t1\n".into(),
-                ..Output::default()
-            })
-        });
-        let (seen, dir) = (log.clone(), agents.clone());
-        w.fakes.mux_script("@agent-context", move |_| {
-            let folder = std::fs::read_dir(&dir)
-                .unwrap()
-                .next()
-                .unwrap()
-                .unwrap()
-                .path();
-            let r = read_json(&folder.join("record.json"));
-            assert_eq!(r["hcAddress"], "t1");
-            assert!(r.get("pane").is_none());
-            assert!(!folder.join("commit.json").exists());
-            seen.borrow_mut().push("tag");
-            Ok(Output::default())
-        });
-        let seen = log.clone();
-        w.fakes.mux_script("select-pane -T", move |_| {
-            seen.borrow_mut().push("title");
-            Ok(Output::default())
-        });
-        let seen = log.clone();
-        w.fakes.mux_script("allow-set-title", move |_| {
-            seen.borrow_mut().push("option");
-            Ok(Output::default())
-        });
-        let seen = log.clone();
-        commit_probe(Some(Box::new(move |folder| {
-            let r = read_json(&folder.join("record.json"));
-            assert_eq!(
-                (&r["pane"], &r["window"], &r["startCommand"]),
-                (&json!("%9"), &json!("@5"), &json!("hc attach t1"))
-            );
-            assert!(!folder.join("commit.json").exists());
-            seen.borrow_mut().push("commit");
-        })));
-        let r = hc_attempt(&w, Client::Claude, None, false).unwrap();
-        assert_eq!(
-            *log.borrow(),
-            ["attach", "tag", "title", "option", "commit"]
-        );
-        commit_probe(None);
-        let id = r["id"].as_str().unwrap();
-        let folder = agents.join(id);
-        let caller = w.caller();
-        let spec = folder.join("spec.json");
-        let argv = json!([
-            utf8(&w.ctx.exe).unwrap(),
-            "launcher",
-            utf8(&spec).unwrap(),
-            "--state-root",
-            utf8(&w.ctx.state_root).unwrap(),
-            "--path",
-            w.ctx.env.get("PATH").unwrap_or("")
-        ]);
-        let expected = json!({"schema":1,"id":id,"name":"hi","client":"claude","sessionId":r["sessionId"],
-            "context":"brief","reason":"human","session":"$3","team":format!("{}:$3",caller.server_key),"generation":"0","parentPane":"%1","parentAgent":null,
-            "directory":w.ctx.cwd,"taskLine":"hi","createdAt":"1970-01-01T00:00:00.0000000Z","color":"blue",
-            "hcAddress":"t1","launcherArgv":argv,"pane":"%9","window":"@5","startCommand":"hc attach t1"});
-        assert_eq!(
-            std::fs::read_to_string(folder.join("record.json")).unwrap(),
-            expected.to_string()
-        );
-        assert_eq!(r.to_string(), expected.to_string());
-        assert_eq!(read_json(&spec)["generation"], "0");
-        assert_eq!(
-            read_json(&folder.join("commit.json")),
-            json!({"committedAt":"1970-01-01T00:00:00.0000000Z"})
-        );
-        let bound = |command: String| {
-            [
-                "-N",
-                "if-shell",
-                "-F",
-                "-t",
-                "%9",
-                "#{==:#{pane_start_command},hc attach t1}",
-            ]
-            .map(String::from)
-            .into_iter()
-            .chain([command])
-            .collect::<Vec<_>>()
-        };
-        assert_eq!(
-            calls(&w, "if-shell"),
-            [
-                bound(format!(
-                    "set-option -p -t %9 @agent-id {id} ; set-option -p -t %9 @agent-name hi ; set-option -p -t %9 @agent-parent %1 ; set-option -p -t %9 @agent-context brief:human"
-                )),
-                bound("select-pane -T hi -t %9".into()),
-                bound("set-option -p -t %9 allow-set-title off".into())
-            ]
-        );
-        assert!(calls(&w, "set-option").is_empty());
-        assert!(calls(&w, "select-pane").is_empty());
-        assert!(w.fakes.mux_calls().iter().any(|a| {
-            a == &[
-                "-N",
-                "display-message",
-                "-p",
-                "-t",
-                "%9",
-                "#{pane_id}|#{==:#{pane_start_command},hc attach t1}",
-            ]
-            .map(String::from)
-        }));
-        assert!(!r.as_object().unwrap().contains_key("model"));
-        let w = hc_world(human());
-        let r = hc_attempt(&w, Client::Claude, Some("sonnet"), false).unwrap();
-        assert_eq!(r["model"], "sonnet");
-        let names: Vec<_> = r.as_object().unwrap().keys().map(String::as_str).collect();
-        assert_eq!(
-            &names[16..],
-            [
-                "model",
-                "hcAddress",
-                "launcherArgv",
-                "pane",
-                "window",
-                "startCommand"
-            ]
-        );
-        let spec = read_json(
-            &agents_dir(&w)
-                .join(r["id"].as_str().unwrap())
-                .join("spec.json"),
-        );
-        assert_eq!(
-            spec["args"].as_array().unwrap()[2..4],
-            [json!("--model"), json!("sonnet")]
-        );
-        for stage in ["before-attach", "after-tags"] {
-            let w = hc_world(human());
-            let _reset = HcCommitReset;
-            let commits = Rc::new(Cell::new(0));
-            let seen = commits.clone();
-            commit_probe(Some(Box::new(move |_| seen.set(seen.get() + 1))));
-            if stage == "before-attach" {
+            if gave_up {
+                // The launcher gives up while `hc run` starts it: its `{aborted}` claim of generation 0 is first.
                 w.fakes.hc_probe(|a| {
                     if a[0] == "run" {
                         let i = a.iter().position(|v| v == "launcher").unwrap();
-                        std::fs::create_dir(
-                            Path::new(&a[i + 1]).parent().unwrap().join("record.json"),
-                        )
-                        .unwrap();
+                        crate::agents::fixture::write(
+                            &Path::new(&a[i + 1]).with_file_name("commit.json"),
+                            json!({"aborted":true}),
+                        );
                     }
                 });
-            } else {
-                let agents = agents_dir(&w);
-                w.fakes.mux_script("@agent-context", move |_| {
-                    let path = std::fs::read_dir(&agents)
-                        .unwrap()
-                        .next()
-                        .unwrap()
-                        .unwrap()
-                        .path()
-                        .join("record.json");
-                    std::fs::remove_file(&path).unwrap();
-                    std::fs::create_dir(path).unwrap();
-                    Ok(Output::default())
-                });
             }
-            assert!(hc_attempt(&w, Client::Claude, None, true).is_err());
-            assert_eq!(commits.get(), 0);
-            let folder = agents_dir(&w).join(&agent_folders(&w)[0]);
-            assert!(!folder.join("commit.json").exists());
-            let a = read_json(&folder.join("abort.json"));
-            assert_eq!(a["kill"], "acknowledged");
-            assert_eq!(
-                a["viewCleanup"],
-                if stage == "before-attach" {
-                    json!("unproven")
-                } else {
-                    json!({"gone":true})
-                }
-            );
-            assert_eq!(
-                calls(&w, "if-shell")
-                    .iter()
-                    .filter(|a| a[6] == "kill-pane -t %9")
-                    .count(),
-                usize::from(stage == "after-tags")
-            );
-        }
-    }
-
-    #[test]
-    fn a_launcher_that_gave_up_first_makes_the_spawn_refuse_and_roll_back() {
-        for gave_up in [true, false] {
-            let _reset = HcCommitReset;
-            if gave_up {
-                commit_probe(Some(Box::new(|folder| {
-                    crate::agents::fixture::write(
-                        &folder.join("commit.json"),
-                        json!({"aborted":true}),
-                    );
-                })));
-            }
-            let w = hc_world(human());
-            let result = hc_attempt(&w, Client::Claude, None, gave_up);
+            let result = hc_attempt(&w, Client::Claude, None);
             let folder = agents_dir(&w).join(&agent_folders(&w)[0]);
             if gave_up {
                 let e = result.unwrap_err();
@@ -3592,23 +3222,22 @@ mod tests {
                     (1, "launch", "the launcher gave up before the commit")
                 );
                 assert_eq!(
-                    read_json(&folder.join("commit.json")),
+                    read_json(&gens::path(&folder, 0, "commit")),
                     json!({"aborted":true})
                 );
-                let abort = read_json(&folder.join("abort.json"));
-                assert_eq!(
-                    (&abort["kill"], &abort["viewCleanup"]),
-                    (&json!("acknowledged"), &json!({"gone":true}))
+                assert!(
+                    read_json(&folder.join("record.json"))
+                        .get("pending")
+                        .is_none()
+                );
+                assert!(
+                    calls(&w, "new-window").is_empty(),
+                    "no view without a commit"
                 );
             } else {
                 assert_eq!(result.unwrap()["hcAddress"], "t1");
-                assert_eq!(
-                    read_json(&folder.join("commit.json")),
-                    json!({"committedAt":"1970-01-01T00:00:00.0000000Z"})
-                );
-                assert!(!folder.join("abort.json").exists());
             }
-            assert_eq!(crate::agents::committed(&folder), !gave_up);
+            assert_eq!(gens::committed(&folder, 0).unwrap(), !gave_up);
         }
     }
 
@@ -3676,57 +3305,6 @@ mod tests {
     }
 
     #[test]
-    fn rollback_keeps_a_replacement_and_closes_its_own_launch_live_or_dead() {
-        for now in ["hc attach t1", "sh"] {
-            let w = hc_world(human());
-            let pane = Rc::new(RefCell::new(Some(now.to_string())));
-            let state = pane.clone();
-            w.fakes.mux_script("if-shell", move |argv| {
-                let mut current = state.borrow_mut();
-                let holds = current.as_ref().is_some_and(|command| {
-                    argv[5]
-                        == registry::Launch {
-                            command: command.clone(),
-                            pid: None,
-                        }
-                        .launched()
-                });
-                if argv[6] == "kill-pane -t %9" && (argv[5] == "1" || holds) {
-                    *current = None;
-                }
-                Ok(Output::default())
-            });
-            w.fakes.mux_first("@agent-context", 1, "", "bad");
-            let probe = pane.clone();
-            w.fakes
-                .mux_script("-t %9 #{pane_id}|#{@agent-id}", move |_| {
-                    Ok(Output {
-                        stdout: if probe.borrow().is_none() {
-                            "|\n"
-                        } else {
-                            "%9|\n"
-                        }
-                        .into(),
-                        ..Output::default()
-                    })
-                });
-            let e = hc_attempt(&w, Client::Claude, None, true).unwrap_err();
-            assert_eq!(
-                (e.code, e.check, e.message.as_str()),
-                (1, "rmux", "tmux call failed")
-            );
-            assert_eq!(pane.borrow().is_none(), now == "hc attach t1");
-            let a = read_json(
-                &agents_dir(&w)
-                    .join(&agent_folders(&w)[0])
-                    .join("abort.json"),
-            );
-            assert_eq!(a["kill"], "acknowledged");
-            assert_eq!(a["viewCleanup"], json!({"gone":now=="hc attach t1"}));
-        }
-    }
-
-    #[test]
     fn a_pane_replaced_before_it_is_tagged_is_never_written() {
         let w = hc_world(human());
         let acted = Rc::new(RefCell::new(Vec::new()));
@@ -3744,11 +3322,8 @@ mod tests {
             .mux_first("}|#{==:#{pane_start_command},", 0, "%9|0\n", "");
         w.fakes
             .mux_first("-t %9 #{pane_id}|#{@agent-id}", 0, "%9|\n", "");
-        let e = hc_attempt(&w, Client::Claude, None, true).unwrap_err();
-        assert_eq!(
-            (e.code, e.check, e.message.as_str()),
-            (1, "internal", "unexpected error (unproven new view)")
-        );
+        let r = hc_attempt(&w, Client::Claude, None).unwrap();
+        assert_eq!(r["viewError"], "unexpected error (unproven new view)");
         assert!(acted.borrow().is_empty());
         assert!(calls(&w, "set-option").is_empty());
         assert!(calls(&w, "select-pane").is_empty());
@@ -3756,44 +3331,21 @@ mod tests {
         let r = read_json(&folder.join("record.json"));
         assert_eq!(r["hcAddress"], "t1");
         assert!(r.get("pane").is_none());
-        assert!(!folder.join("commit.json").exists());
-        let a = read_json(&folder.join("abort.json"));
-        assert_eq!(
-            (&a["kill"], &a["viewCleanup"]),
-            (&json!("acknowledged"), &json!({"gone":false}))
+        assert!(
+            gens::committed(&folder, 0).unwrap(),
+            "nothing is rolled back"
         );
-    }
-
-    #[test]
-    fn rollback_whose_gone_proof_fails_to_run_claims_nothing() {
-        let w = hc_world(human());
-        w.fakes.mux_first("@agent-context", 1, "", "bad");
-        w.fakes.mux_script("-t %9 #{pane_id}|#{@agent-id}", |_| {
-            refuse(1, "endpoint", "rmux endpoint did not answer")
-        });
-        let e = hc_attempt(&w, Client::Claude, None, true).unwrap_err();
-        assert_eq!(
-            (e.code, e.check, e.message.as_str()),
-            (1, "rmux", "tmux call failed")
-        );
+        assert!(!folder.join("view.json").exists());
         assert_eq!(
             calls(&w, "if-shell")
                 .iter()
                 .filter(|c| c[6] == "kill-pane -t %9")
                 .count(),
-            1
-        );
-        let a = read_json(
-            &agents_dir(&w)
-                .join(&agent_folders(&w)[0])
-                .join("abort.json"),
-        );
-        assert_eq!(a["kill"], "acknowledged");
-        assert_eq!(
-            a["viewCleanup"],
-            json!({"failed":true,"message":"rmux endpoint did not answer"})
+            1,
+            "the pane it opened is cleaned, bound to its command"
         );
     }
+
     #[test]
     fn public_hc_spawn_contract() {
         use crate::agents::core_fixture as cf;
@@ -3894,10 +3446,11 @@ mod tests {
                         format!("-{mail}"),
                         format!("-{notice}"),
                         format!("-{member}"),
-                        format!("-{spawn}"),
-                        format!("+{bar}"),
-                        format!("-{bar}")
                     ]
+                    .into_iter()
+                    .chain(launch_locks(&c, out["id"].as_str().unwrap()))
+                    .chain([format!("-{spawn}"), format!("+{bar}"), format!("-{bar}")])
+                    .collect::<Vec<_>>()
                 );
                 assert_eq!(calls(&w, "list-panes").len(), 2);
                 assert_eq!(
@@ -4081,7 +3634,11 @@ mod tests {
             let mut args = vec!["spawn", "-Client", client, "-Task", "hi"];
             args.extend(extra);
             let r = spawn(&w.ctx, &w.request(&args)).unwrap();
-            let spec = read_json(&agents_dir(&w).join(&agent_folders(&w)[0]).join("spec.json"));
+            let spec = read_json(&gens::path(
+                &agents_dir(&w).join(&agent_folders(&w)[0]),
+                0,
+                "spec",
+            ));
             assert_eq!(
                 (&spec["flags"], &r["reason"]),
                 (&flags, &json!(reason)),
@@ -4141,7 +3698,11 @@ mod tests {
                 session_id(&new) && new != OLD,
                 "{name}: a fresh generated session"
             );
-            let spec = read_json(&agents_dir(&w).join(&agent_folders(&w)[0]).join("spec.json"));
+            let spec = read_json(&gens::path(
+                &agents_dir(&w).join(&agent_folders(&w)[0]),
+                0,
+                "spec",
+            ));
             let args: Vec<String> = serde_json::from_value(spec["args"].clone()).unwrap();
             match client {
                 Client::Claude => assert_eq!(
@@ -4187,7 +3748,11 @@ mod tests {
                 (&json!("brief"), &json!("no-fork")),
                 "{name}"
             );
-            let spec = read_json(&agents_dir(&w).join(&agent_folders(&w)[0]).join("spec.json"));
+            let spec = read_json(&gens::path(
+                &agents_dir(&w).join(&agent_folders(&w)[0]),
+                0,
+                "spec",
+            ));
             assert!(
                 !spec["args"].as_array().unwrap().iter().any(|a| a == OLD),
                 "{name}: brief never names the parent"
@@ -4268,16 +3833,18 @@ pub fn launch_hc_locked(
             .map_or_else(|| request.directory.into(), PathBuf::from),
         placed,
     };
-    super::core_launch::execute_connected(
-        core,
-        || match (request.resume, request.leader) {
-            (Some(resumed), _) => launch.prepare_resumed(slot, resumed),
-            (None, Some(leader)) => {
-                super::leader::prepare(ctx, caller, request.client, request.directory, slot, leader)
-            }
-            (None, None) => launch.prepare_hc(slot),
-        },
-        || {
+    let l = match (request.resume, request.leader) {
+        (Some(resumed), _) => launch.prepare_resumed(slot, resumed)?,
+        (None, Some(leader)) => {
+            super::leader::prepare(ctx, caller, request.client, request.directory, slot, leader)?
+        }
+        (None, None) => launch.prepare_hc(slot)?,
+    };
+    let scope = super::team_state::Scope::of(caller);
+    let id = l.id.clone();
+    // The caller holds the session spawn lock, which is the team lock (state-0 S1).
+    super::team_state::held(ctx, &scope, |tx| {
+        let spend = || {
             if !debit {
                 return Ok(());
             }
@@ -4287,23 +3854,85 @@ pub fn launch_hc_locked(
                 &super::budget::rate(ctx, caller),
                 super::budget::now_secs(ctx),
             )
-        },
-        |core, p, view| {
-            // MUX_AGENTS_TEST_PANIC=launch panics after `hc run`, inside the rollback scope (live `up` test).
+        };
+        super::core_launch::forward(tx, core, l, spend, |core, record| {
+            // MUX_AGENTS_TEST_PANIC=launch panics after the commit, inside the view step (G1.6: viewError).
             #[cfg(feature = "test-panic")]
             if ctx.env.get("MUX_AGENTS_TEST_PANIC") == Some("launch") {
                 panic!("PANIC-PAYLOAD-launch");
             }
-            // The run's own address, just recorded by `execute_connected` from `hc run`'s reply.
-            let address = p.record["hcAddress"].as_str().unwrap_or_default();
-            super::attachment::attach(ctx, core, caller, &p.record, address, request.split, view)
-        },
-        |folder| commit(ctx, folder),
-        |view| super::attachment::clean(ctx, view),
-    )
+            let n = record
+                .get("generation")
+                .and_then(Value::as_str)
+                .and_then(super::gens::plain_gen)
+                .ok_or_else(|| Refusal::internal("a promoted record has no generation"))?;
+            // Call 18a: the promoted generation's own address, validated by `promote`.
+            let address = record
+                .get("hcAddress")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let mut view = None;
+            let attached = super::core_launch::attempt(|| {
+                super::attachment::attach(
+                    ctx,
+                    core,
+                    caller,
+                    record,
+                    address,
+                    request.split,
+                    &mut view,
+                )
+            });
+            match (attached, view.filter(|v| !v.command.is_empty())) {
+                (Ok(()), Some(v)) => {
+                    // Ambiguity 15, V1: the descriptor names its generation and terminal.
+                    let fields = json!({"serverKey": caller.server_key, "session": caller.session,
+                        "pane": v.pane, "window": v.window, "startCommand": v.command, "gen": n,
+                        "hcAddress": record["hcAddress"], "hcName": record["hcName"]});
+                    if let Err(e) = super::team_state::view(ctx, &scope, &id, &fields) {
+                        let _ = super::attachment::clean(ctx, &v);
+                        return Err(e);
+                    }
+                    Ok(fields)
+                }
+                (got, v) => {
+                    if let Some(v) = v {
+                        let _ = super::attachment::clean(ctx, &v);
+                    }
+                    Err(got
+                        .err()
+                        .unwrap_or_else(|| Refusal::internal("unproven new view")))
+                }
+            }
+        })
+    })
+}
+
+/// The view fields of a launch reply: `attached`, or `none` with the `viewError` the launch answered (G1.6).
+pub(crate) fn view_reply(record: &Value) -> Map<String, Value> {
+    let mut reply = Map::new();
+    match record.get("viewError") {
+        Some(e) => {
+            reply.insert("view".into(), "none".into());
+            reply.insert("viewError".into(), e.clone());
+        }
+        None => {
+            reply.insert("view".into(), "attached".into());
+        }
+    }
+    reply
 }
 impl Launch<'_> {
-    fn prepare_hc(&self, slot: CoreSlot) -> Res<super::core_launch::Prepared> {
+    /// E1, ambiguity 10: the stored options: the flags, then the selected model, so a relaunch replays both.
+    fn options(&self) -> Vec<String> {
+        let mut options = self.flags.clone();
+        if let Some(model) = self.model {
+            options.extend(["--model".to_string(), model.to_string()]);
+        }
+        options
+    }
+
+    fn prepare_hc(&self, slot: CoreSlot) -> Res<super::core_launch::Launch> {
         let (ctx, caller) = (self.ctx, self.caller);
         let state = state_dir(ctx, caller)?;
         write_json(
@@ -4311,36 +3940,38 @@ impl Launch<'_> {
             &json!({"socket":caller.socket,"serverPid":caller.server_pid,"serverStart":caller.server_start}),
         )?;
         let agent = self.allocate(&state, slot.name, slot.color)?;
-        let prepare = || {
-            let spec = self.prepare(&agent)?;
-            let mut record = self.record(&agent, "", "", "")?;
-            let mut body = crate::state::fs::read_json(&spec)?
-                .ok_or_else(|| Refusal::internal("missing launch spec"))?;
-            body["generation"] = "0".into();
-            write_json(&spec, &body)?;
-            record["generation"] = "0".into();
-            record["team"] = super::membership::team(caller).into();
-            for k in ["pane", "window", "startCommand"] {
-                record.as_object_mut().unwrap().remove(k);
-            }
-            Ok(super::core_launch::Prepared {
-                folder: agent.folder.clone(),
-                record,
-                argv: crate::launcher_scope::argv(ctx, &spec)?,
-            })
-        };
-        prepare().map_err(|e| abort_evidence(&agent.folder, e))
+        let spec = self.prepare(&agent)?;
+        let mut record = self.record(&agent, "", "", "")?;
+        let fields = record
+            .as_object_mut()
+            .ok_or_else(|| Refusal::internal("record is not an object"))?;
+        // F4: the session and terminal identity arrive at promotion; presentation lives in view.json (V1).
+        for k in ["pane", "window", "startCommand", "sessionId"] {
+            fields.remove(k);
+        }
+        record["options"] = json!(self.options());
+        record["prompt"] = json!([self.task]);
+        Ok(super::core_launch::Launch {
+            id: agent.id.clone(),
+            kind: "spawn",
+            session_id: agent.session.clone(),
+            create: Some(record),
+            spec,
+            team: super::membership::team(caller),
+            name: agent.name.clone(),
+            up_team: None,
+            directory: utf8(&self.directory)?.into(),
+        })
     }
 
-    /// A resume: `<client> <X's recorded flags> --resume <X's session>`, no task, prompt, model or fork, in a new
-    /// folder. Its record keeps X's name, client, session, directory, parent and depth, names X in `resumedFrom`
-    /// and keeps X's mailbox. That record and the folder holding it are flushed to disk before `hc run`, so a
-    /// power loss never loses `resumedFrom`; a failed flush launches nothing.
+    /// A resume: `<client> <X's recorded flags> --resume <X's session>`, no task, prompt, model or fork, as a new
+    /// member. Its record keeps X's name, client, session, directory, parent and depth, names X in `resumedFrom`,
+    /// keeps X's mailbox and stores X's flags as its options. `forward` writes it, durably, before `hc run`.
     fn prepare_resumed(
         &self,
         slot: CoreSlot,
         resumed: &Resumed,
-    ) -> Res<super::core_launch::Prepared> {
+    ) -> Res<super::core_launch::Launch> {
         let (ctx, caller) = (self.ctx, self.caller);
         let state = state_dir(ctx, caller)?;
         write_json(
@@ -4348,70 +3979,53 @@ impl Launch<'_> {
             &json!({"socket":caller.socket,"serverPid":caller.server_pid,"serverStart":caller.server_start}),
         )?;
         let id = hex_id()?;
-        let folder = state.join("agents").join(&id);
-        let prepare = || {
-            let from = &resumed.record;
-            let session = text(from.get("sessionId"));
-            private_folder(ctx, &folder)?;
-            let args = client_args(self.client, Recipe::Resume, &session, None);
-            let spec = folder.join("spec.json");
-            write_json(
-                &spec,
-                &json!({"schema": 1, "stateDirectory": utf8(&state)?, "id": id,
-                    "client": client_name(self.client), "flags": resumed.flags,
-                    "parentPane": from.get("parentPane"), "args": args, "generation": "0"}),
-            )?;
-            let mut record = from.clone();
-            let fields = record
-                .as_object_mut()
-                .ok_or_else(|| Refusal::internal("the ended member's record is not an object"))?;
-            for k in [
-                "hcAddress",
-                "launcherArgv",
-                "pane",
-                "window",
-                "startCommand",
-                "model",
-                "generation",
-                "team",
-                // A2a: the successor is launched pre-lifecycle with folder-level files, and its spec holds the
-                // replayed options. A3 Task 10 makes it a lifecycle record through `forward`.
-                "lifecycle",
-                "options",
-                "prompt",
-            ] {
-                fields.remove(k);
-            }
-            record["id"] = id.clone().into();
-            record["name"] = slot.name.into();
-            record["color"] = slot.color.into();
-            record["createdAt"] = utc_o(ctx.clock.now()).into();
-            record["resumedFrom"] = resumed.from.clone().into();
-            record["mailbox"] = super::mail::member_mailbox(&resumed.from, from).into();
-            // Before hc run and without the hc fields, so no reader takes it for a member until the run names one.
-            crate::state::fs::write_json_durable(&folder.join("record.json"), &record)?;
-            crate::state::fs::sync_dir(&state.join("agents"))?;
-            record["generation"] = "0".into();
-            record["team"] = super::membership::team(caller).into();
-            Ok(super::core_launch::Prepared {
-                folder: folder.clone(),
-                record,
-                argv: crate::launcher_scope::argv(ctx, &spec)?,
-            })
-        };
-        prepare().map_err(|e| abort_evidence(&folder, e))
+        let from = &resumed.record;
+        let session = text(from.get("sessionId"));
+        let args = client_args(self.client, Recipe::Resume, &session, None);
+        let spec = json!({"schema": 1, "stateDirectory": utf8(&state)?, "client": client_name(self.client),
+            "flags": resumed.flags, "parentPane": from.get("parentPane"), "args": args});
+        let mut record = from.clone();
+        let fields = record
+            .as_object_mut()
+            .ok_or_else(|| Refusal::internal("the ended member's record is not an object"))?;
+        for k in [
+            "hcAddress",
+            "hcName",
+            "launcherArgv",
+            "pane",
+            "window",
+            "startCommand",
+            "model",
+            "generation",
+            "team",
+            "lifecycle",
+            "options",
+            "prompt",
+            "pending",
+            "completing",
+            "sessionId",
+        ] {
+            fields.remove(k);
+        }
+        record["name"] = slot.name.clone().into();
+        record["color"] = slot.color.into();
+        record["createdAt"] = utc_o(ctx.clock.now()).into();
+        record["resumedFrom"] = resumed.from.clone().into();
+        record["mailbox"] = super::mail::member_mailbox(&resumed.from, from).into();
+        record["options"] = json!(resumed.flags);
+        Ok(super::core_launch::Launch {
+            id,
+            kind: "resume",
+            session_id: session,
+            create: Some(record),
+            spec,
+            team: super::membership::team(caller),
+            name: slot.name,
+            up_team: from
+                .get("upTeam")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+            directory: utf8(&self.directory)?.into(),
+        })
     }
-}
-
-/// Leaves abort.json for a launch that failed before `hc run`: nothing ran, and the message says why.
-pub(crate) fn abort_evidence(folder: &Path, mut e: Refusal) -> Refusal {
-    if write_json(
-        &folder.join("abort.json"),
-        &json!({"runUncertain":false,"hcAddress":null,"message":e.message}),
-    )
-    .is_err()
-    {
-        e.message.push_str("; abort evidence could not be written");
-    }
-    e
 }

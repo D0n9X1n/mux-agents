@@ -384,6 +384,7 @@ fn hc_worker_and_view_close_survives_focus_stop() {
     )
     .unwrap();
     assert_eq!(worker["env"]["HC_TERMINAL_ID"], w["hcAddress"]);
+    assert_eq!(worker["env"]["MUX_AGENTS_GEN"], "0");
     assert!(worker["env"]["TMUX"].is_null() && worker["env"]["RMUX"].is_null());
     std::fs::write(live.dir.join("status.txt"), "checking core").unwrap();
     for (n, (command, key, want)) in [
@@ -479,6 +480,7 @@ fn hc_worker_reads_after_its_view_closes() {
     )
     .unwrap();
     assert_eq!(worker["env"]["HC_TERMINAL_ID"], w["hcAddress"]);
+    assert_eq!(worker["env"]["MUX_AGENTS_GEN"], "0");
     assert!(worker["env"]["TMUX"].is_null() && worker["env"]["RMUX"].is_null());
     live.call(&["kill-pane", "-t", &s(&w["pane"])]);
     live.wait("the view pane to close", || {
@@ -584,6 +586,8 @@ fn hc_stop_then_resume_returns_with_its_conversation() {
             serde_json::from_str(&std::fs::read_to_string(path).ok()?).ok()
         })
         .expect("Y's record");
+    // V1: Y's view is in view.json, never in its record.
+    let view = member_file(&live, &s(&y["id"]), "view.json");
     assert_eq!(record["resumedFrom"], w["id"]);
     assert_eq!(record["sessionId"], w["sessionId"]);
     // The bar kept by the resume: a live pane carrying the side-bar label, in the window of Y's view.
@@ -593,12 +597,12 @@ fn hc_stop_then_resume_returns_with_its_conversation() {
     assert_eq!(live.field(&bar, "#{@agent-role}"), "sidebar", "{resumed}");
     assert_eq!(
         live.field(&bar, "#{window_id}"),
-        s(&record["window"]),
+        s(&view["window"]),
         "{resumed}"
     );
     assert_eq!(
-        live.field(&s(&record["pane"]), "#{window_id}"),
-        s(&record["window"])
+        live.field(&s(&view["pane"]), "#{window_id}"),
+        s(&view["window"])
     );
 }
 
@@ -858,52 +862,32 @@ fn hc_stopped_member_resumes_with_its_stored_options_only() {
     live.wait("finished core terminal", || {
         (get(&address)["state"] == "finished").then_some(())
     });
-    let path = std::fs::read_dir(live.dir.join("state"))
-        .unwrap()
-        .flatten()
-        .map(|d| {
-            d.path()
-                .join("agents")
-                .join(s(&w["id"]))
-                .join("record.json")
-        })
-        .find(|p| p.is_file())
-        .unwrap();
-    let mut r: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
-    (r["lifecycle"], r["options"], r["prompt"]) = (
-        serde_json::json!(1),
-        serde_json::json!(["--model", "x"]),
-        serde_json::json!(["the task"]),
+    // E1: the launch stored the selected model as an option; the record is read as production wrote it.
+    let r = member_file(&live, &s(&w["id"]), "record.json");
+    assert_eq!(r["lifecycle"], 1, "{r}");
+    assert!(r["prompt"].is_array(), "{r}");
+    let opts: Vec<String> = serde_json::from_value(r["options"].clone()).unwrap();
+    assert!(
+        opts.ends_with(&["--model".to_string(), "x".to_string()]),
+        "{opts:?}"
     );
-    std::fs::write(&path, serde_json::to_vec(&r).unwrap()).unwrap();
-    // PM call 16 (R3): a lifecycle member is ended only by recorded evidence, so the seeded record gets generation 0's
-    // commit, recorded end and launch name (each only where the launcher wrote none). A3c Task 6 replaces this seed
-    // with a real lifecycle launch.
-    let gen0 = path.parent().unwrap().join("gens").join("0");
-    std::fs::create_dir_all(&gen0).unwrap();
-    let name = r["hcName"]
-        .as_str()
-        .map_or_else(|| format!("m{}", &s(&w["id"])[..8]), str::to_string);
-    for (file, v) in [
-        ("commit", serde_json::json!({"committed": true})),
-        (
-            "ended",
-            serde_json::json!({"state": "finished", "reason": "stopped"}),
-        ),
-        ("launch", serde_json::json!({"hcName": name})),
-    ] {
-        let at = gen0.join(format!("{file}.json"));
-        if !at.exists() {
-            std::fs::write(&at, serde_json::to_vec(&v).unwrap()).unwrap();
-        }
-    }
     live.run(&["resume", "w1"]);
     let resumed = client_where(&live, "the resumed client", |a| {
         a.windows(2).any(|p| p[0] == "--resume" && p[1] == sid)
     });
+    let argv: Vec<String> = resumed["argv"].as_array().unwrap().iter().map(s).collect();
+    assert!(
+        argv.windows(2).any(|p| p[0] == "--model" && p[1] == "x"),
+        "{argv:?}"
+    );
     assert_eq!(
         resumed["argv"],
-        serde_json::json!(["--model", "x", "--resume", sid]),
+        serde_json::json!(
+            opts.iter()
+                .cloned()
+                .chain(["--resume".to_string(), sid.to_string()])
+                .collect::<Vec<_>>()
+        ),
         "the stored options only"
     );
 }
@@ -947,7 +931,7 @@ fn up_creates_a_team_in_a_new_session() {
 
 #[cfg(feature = "test-panic")]
 #[test]
-fn up_whose_launch_panics_leaves_no_session_under_hostile_settings() {
+fn up_whose_view_panics_keeps_the_leader_under_hostile_settings() {
     let Some(live) = Live::start() else {
         return;
     };
@@ -955,16 +939,19 @@ fn up_whose_launch_panics_leaves_no_session_under_hostile_settings() {
     live.line(&live.root, "set MUX_AGENTS_TEST_PANIC=launch");
     live.prompt(&live.root);
     let reply = live.run_any(&["up", "-Client", "claude"]);
-    assert_eq!(
-        (&reply["ok"], &reply["check"]),
-        (&serde_json::json!(false), &serde_json::json!("internal")),
+    // The panic fires inside the view step, after the commit: up succeeds with viewError (PM calls 1, 10).
+    assert_eq!(reply["ok"], serde_json::json!(true), "{reply}");
+    assert!(
+        reply["viewError"]
+            .as_str()
+            .is_some_and(|e| e.contains("panicked")),
         "{reply}"
     );
     assert!(eventually(Duration::from_secs(10), || live
         .call(&["list-sessions", "-F", "#{session_name}"])
         .lines()
         .count()
-        == 1));
+        == 2));
     assert!(!marker.exists());
 }
 
@@ -1048,7 +1035,7 @@ fn members_spawn_and_act_only_down_the_tree() {
         s(&r["id"])
     };
     let c1 = ok(&mut sent, &leader, "c1");
-    let flags = member_file(&live, &c1, "spec.json")["flags"].clone();
+    let flags = member_file(&live, &c1, "gens/0/spec.json")["flags"].clone();
     assert!(
         !flags
             .as_array()
@@ -1726,7 +1713,7 @@ fn a_copilot_member_reports_done_then_listens_on_call() {
     let typed =
         std::fs::read_to_string(live.dir.join(format!("input.{b_pid}.log"))).unwrap_or_default();
     assert!(!typed.contains("nonce-7f3a"), "typed into b: {typed}");
-    let b_screen = live.screen(&s(&record["pane"]));
+    let b_screen = live.screen(&s(&member_file(&live, &b, "view.json")["pane"]));
     assert!(
         !b_screen.contains("nonce-7f3a") && !b_screen.contains("mail from"),
         "drawn on b: {b_screen}"

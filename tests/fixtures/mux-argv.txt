@@ -112,6 +112,18 @@
 -N if-shell -F -t %12 '#{==:#{pane_start_command},hc attach t1}' 'set-option -p -t %12 @agent-id <id> ; set-option -p -t %12 @agent-name hi ; set-option -p -t %12 @agent-parent %1 ; set-option -p -t %12 @agent-context brief:human'
 -N if-shell -F -t %12 '#{==:#{pane_start_command},hc attach t1}' 'kill-pane -t %12'
 -N display-message -p -t %12 #{pane_id}|#{@agent-id}
+# 0.3.0 (#103 PM call 1): the view failed after the commit, so the spawn succeeds with viewError and its bar step runs
+-N show-options -qv -t $3 @mux-agents-sidebar
+-N set-option -w -t @1 @mux-agents-viewed 1
+-N show-options -qv -t $3 @mux-agents-sidebar-id
+-N show-options -wqv -t @1 @mux-agents-sidebar-id
+-N list-panes -t @1 -F #{pane_id}|#{&&:#{==:#{@agent-role},sidebar},#{==:#{pane_dead},0}}
+-N list-panes -t @1 -F #{pane_pid}|#{pane_dead}|#{pane_id}|#{@mux-agents-bar}
+-N display-message -p -t @1 #{window_width}|#{s/[|\n\r]/x/:@mux-agents-sidebar-min}|#{s/[|\n\r]/x/:@mux-agents-sidebar-percent}
+-N split-window -d -f -h -P -F #{pane_id}|#{window_id}|#{pane_pid} -t @1 -e MUX_AGENTS_STATE=<state> -l 40 <exe> watch
+-N if-shell -F -t %13 #{==:#{pane_pid},113} 'set-option -p -t %13 @mux-agents-bar 113'
+-N if-shell -F -t %13 #{&&:#{==:#{pane_dead},0},#{==:#{pane_pid},113}} 'kill-pane -t %13'
+-N display-message -p -t %13 #{pane_id}|#{pane_pid}
 
 [spawn -Client claude -TaskFile t.md -BriefFile b.md, from a Claude agent]
 -N display-message -p -t %1 #{pid}|#{pane_pid}|#{session_id}|#{window_id}|#{@agent-id}

@@ -1,8 +1,10 @@
 use super::*;
+use crate::agents::{core_launch, team_state};
 use crate::{
     agents::{
         core_fixture,
         fixture::{SESSION_ID, World},
+        gens,
     },
     spawn::Out,
     state::fs::read_json,
@@ -79,12 +81,6 @@ fn forked() -> (World, Caller, PathBuf) {
     caller.kind = Kind::Agent;
     (w, caller, source)
 }
-struct ProbeReset;
-impl Drop for ProbeReset {
-    fn drop(&mut self) {
-        commit_probe(None);
-    }
-}
 #[test]
 fn hc_unavailable_has_no_side_effects() {
     for version in [None, Some("hc 0.1.20")] {
@@ -143,7 +139,7 @@ fn hc_launch_transaction() {
         })
         .unwrap();
         let folder = folder(&w);
-        let argv = crate::launcher_scope::argv(&w.ctx, &folder.join("spec.json")).unwrap();
+        let argv = crate::launcher_scope::argv(&w.ctx, &gens::path(&folder, 0, "spec")).unwrap();
         let id = r["id"].as_str().unwrap();
         let team = format!("{}:{}", caller.server_key, caller.session);
         assert_eq!(r["generation"], "0");
@@ -156,7 +152,7 @@ fn hc_launch_transaction() {
             r
         );
         assert_eq!(
-            read_json(&folder.join("spec.json")).unwrap().unwrap()["generation"],
+            read_json(&gens::path(&folder, 0, "spec")).unwrap().unwrap()["generation"],
             "0"
         );
         let mut expected = vec![
@@ -166,7 +162,7 @@ fn hc_launch_transaction() {
             "--outlive-parent".into(),
             "--no-notify".into(),
             "--name".into(),
-            format!("m{}", &id[..8]),
+            r["hcName"].as_str().unwrap().into(),
         ];
         for label in [
             "mux.managed=1".into(),
@@ -184,6 +180,7 @@ fn hc_launch_transaction() {
             "--".into(),
         ]);
         expected.extend(argv);
+        assert!(super::super::core_identity::is_hc_name(&expected[6]));
         let hc = w.fakes.hc_calls();
         assert_eq!(hc.len(), 2);
         assert_eq!(hc[1].1, expected);
@@ -219,12 +216,12 @@ fn hc_launch_transaction() {
                 "%9",
                 &format!("#{{pane_id}}|{}", launch.launched())
             ]));
-        assert!(super::super::committed(&folder));
+        assert!(gens::committed(&folder, 0).unwrap());
         w.fakes.hc_done().unwrap();
     }
 }
 #[test]
-fn record_then_commit_order() {
+fn commit_then_view_order() {
     let w = World::human("");
     let caller = w.caller();
     ready(&w);
@@ -239,27 +236,26 @@ fn record_then_commit_order() {
             .unwrap()
             .path();
         let r = read_json(&folder.join("record.json"))?.unwrap();
-        assert_eq!(r["hcAddress"], "t1");
-        assert!(r.get("pane").is_none());
-        assert!(!folder.join("commit.json").exists());
+        assert_eq!(
+            (&r["hcAddress"], &r["generation"]),
+            (&json!("t1"), &json!("0"))
+        );
+        assert!(r.get("pending").is_none() && r.get("pane").is_none());
+        assert!(
+            gens::committed(&folder, 0).unwrap(),
+            "the view follows the commit"
+        );
+        assert!(!folder.join("view.json").exists());
         seen.borrow_mut().push("attach");
         Ok(crate::mux::Output {
             stdout: "%9|@5|exact,#} attach t1\n".into(),
             ..Default::default()
         })
     });
-    let seen = log.clone();
-    let _reset = ProbeReset;
-    commit_probe(Some(Box::new(move |folder| {
-        let r = read_json(&folder.join("record.json")).unwrap().unwrap();
-        assert_eq!(r["pane"], "%9");
-        assert_eq!(r["window"], "@5");
-        assert_eq!(r["startCommand"], "exact,#} attach t1");
-        assert!(!folder.join("commit.json").exists());
-        seen.borrow_mut().push("commit");
-    })));
-    launch_hc(&w.ctx, &caller, request(&w), slot).unwrap();
-    assert_eq!(*log.borrow(), ["attach", "commit"]);
+    let r = launch_hc(&w.ctx, &caller, request(&w), slot).unwrap();
+    assert_eq!(*log.borrow(), ["attach"]);
+    let view = read_json(&of(&w, &r).join("view.json")).unwrap().unwrap();
+    assert_eq!((&view["pane"], &view["gen"]), (&json!("%9"), &json!(0)));
     w.fakes.hc_done().unwrap();
 }
 #[test]
@@ -288,8 +284,6 @@ fn hc_launch_fault_matrix() {
         req.client = Client::Copilot;
         req.no_fork = false;
         req.brief = Some("brief");
-        let success = ["title", "title-panic", "title-option"].contains(&stage);
-        let known = !["spec", "run-timeout", "run-malformed"].contains(&stage);
         core_fixture::online(&w);
         if stage == "run-timeout" {
             w.fakes.hc_answer(Err(Refusal::internal("timeout")));
@@ -303,36 +297,43 @@ fn hc_launch_fault_matrix() {
                 },
             );
         }
-        if known && !success {
-            core_fixture::answer(&w, &["kill", "t1", "--json"], "{}");
-        }
         w.fakes
             .mux_rule("new-window", 0, "%9|@5|exact,#} attach t1\n", "");
         w.launches_hold();
         w.fakes
             .mux_rule("-t %9 #{pane_id}|#{@agent-id}", 0, "|\n", "");
         let state = super::super::server_dir(&w.ctx, &caller);
-        let state2 = state.clone();
+        let first = move || {
+            std::fs::read_dir(state.join("agents"))
+                .unwrap()
+                .next()
+                .unwrap()
+                .unwrap()
+                .path()
+        };
+        let _reset = core_launch::hooks::Reset;
         if stage == "spec" {
-            w.fakes.clock_probe(move |_| {
-                let folder = std::fs::read_dir(state2.join("agents"))
-                    .unwrap()
-                    .next()
-                    .unwrap()
-                    .unwrap()
-                    .path();
-                let p = folder.join("spec.json");
-                if p.is_file() {
-                    std::fs::remove_file(&p).unwrap();
-                    std::fs::create_dir(p).unwrap();
+            let first = first.clone();
+            core_launch::hooks::after(Some(Box::new(move |step| {
+                if step == "pending" {
+                    crate::state::fs::fail_sync_file(Some(&gens::path(&first(), 0, "spec")));
                 }
-            });
+            })));
+        }
+        if stage == "record" {
+            // The second durable write is the address patch: its folder flush fails after `hc run`.
+            crate::state::fs::fail_durable_flush(Some(1));
         }
         w.fakes.hc_probe(move |a| {
-            if stage == "record" && a[0] == "run" {
-                let i = a.iter().position(|x| x == "launcher").unwrap();
-                std::fs::create_dir(Path::new(&a[i + 1]).parent().unwrap().join("record.json"))
-                    .unwrap();
+            if a[0] != "run" {
+                return;
+            }
+            let i = a.iter().position(|x| x == "launcher").unwrap();
+            let commit = Path::new(&a[i + 1]).with_file_name("commit.json");
+            match stage {
+                "commit-fs" => std::fs::create_dir(&commit).unwrap(),
+                "launcher-timeout" => write_json(&commit, &json!({"aborted": true})).unwrap(),
+                _ => {}
             }
         });
         match stage {
@@ -350,69 +351,88 @@ fn hc_launch_fault_matrix() {
             "timeout" => w
                 .fakes
                 .mux_script("new-window", |_| Err(Refusal::internal("timeout"))),
-            "view-record" => w.fakes.mux_script("@agent-context", move |_| {
-                let folder = std::fs::read_dir(state.join("agents"))
-                    .unwrap()
-                    .next()
-                    .unwrap()
-                    .unwrap()
-                    .path();
-                std::fs::remove_file(folder.join("record.json"))?;
-                std::fs::create_dir(folder.join("record.json"))?;
-                Ok(crate::mux::Output::default())
-            }),
+            "view-record" => {
+                let first = first.clone();
+                w.fakes.mux_script("@agent-context", move |_| {
+                    std::fs::create_dir(first().join("view.json"))?;
+                    Ok(crate::mux::Output::default())
+                })
+            }
             _ => {}
         }
-        let _reset = ProbeReset;
-        if stage == "commit-fs" {
-            commit_probe(Some(Box::new(|p| {
-                std::fs::create_dir(p.join("commit.json")).unwrap()
-            })));
-        }
-        if stage == "launcher-timeout" {
-            commit_probe(Some(Box::new(|p| {
-                write_json(&p.join("commit.json"), &json!({"aborted":true})).unwrap()
-            })));
-        }
         let got = launch_hc(&w.ctx, &caller, req, slot);
-        let folder = folder(&w);
-        let calls = w.fakes.hc_calls();
-        assert_eq!(
-            calls.iter().filter(|(_, a, _)| a[0] == "run").count(),
-            usize::from(stage != "spec"),
-            "{stage}"
+        crate::state::fs::fail_durable_flush(None);
+        crate::state::fs::fail_sync_file(None);
+        let f = folder(&w);
+        let decided = read_json(&gens::path(&f, 0, "commit"))
+            .ok()
+            .flatten()
+            .map(|c| gens::decide(&c));
+        assert!(
+            !w.fakes.hc_calls().iter().any(|(_, a, _)| a[0] == "kill"),
+            "{stage}: nothing is killed"
         );
-        assert_eq!(got.is_ok(), success, "{stage}: {got:?}");
-        let kills = calls
+        let runs = w
+            .fakes
+            .hc_calls()
             .iter()
-            .filter(|(_, a, _)| a[0] == "kill")
-            .map(|(_, a, _)| a.clone())
-            .collect::<Vec<_>>();
-        assert_eq!(
-            kills,
-            if known && !success {
-                vec![vec!["kill", "t1", "--json"]]
-            } else {
-                vec![]
-            },
-            "{stage}"
-        );
-        let proven = [
-            "tag",
-            "proof",
-            "view-record",
-            "commit-fs",
-            "launcher-timeout",
-            "panic",
-        ]
-        .contains(&stage);
+            .filter(|(_, a, _)| a[0] == "run")
+            .count();
+        assert_eq!(runs, usize::from(stage != "spec"), "{stage}");
+        match stage {
+            "spec" | "record" => {
+                let e = got.unwrap_err();
+                let phrase = if stage == "spec" {
+                    gens::NOT_PUBLISHED
+                } else {
+                    team_state::NOT_WRITTEN
+                };
+                assert_eq!(e.check, "state", "{stage}");
+                // abort may add a suffix
+                assert!(e.message.starts_with(phrase), "{stage}: {}", e.message);
+                assert_eq!(decided, Some(gens::Decision::Aborted), "{stage}: fenced");
+            }
+            "run-timeout" | "run-malformed" => {
+                assert!(got.is_err(), "{stage}");
+                assert_eq!(decided, Some(gens::Decision::Aborted), "{stage}: fenced");
+            }
+            "launcher-timeout" => {
+                assert_eq!(got.map_err(|e| e.check).unwrap_err(), "launch", "{stage}");
+                assert_eq!(decided, Some(gens::Decision::Aborted), "{stage}");
+            }
+            "commit-fs" => {
+                assert_eq!(got.map_err(|e| e.check).unwrap_err(), "evidence", "{stage}");
+                let r = read_json(&f.join("record.json")).unwrap().unwrap();
+                assert_eq!(
+                    r["pending"]["hcAddress"],
+                    json!("t1"),
+                    "{stage}: pending kept for settle-1b"
+                );
+            }
+            "title" | "title-panic" | "title-option" => {
+                assert!(got.unwrap().get("viewError").is_none(), "{stage}");
+                assert_eq!(decided, Some(gens::Decision::Run), "{stage}");
+            }
+            _ => {
+                assert!(
+                    got.unwrap()["viewError"].is_string(),
+                    "{stage}: the member stays"
+                );
+                assert_eq!(decided, Some(gens::Decision::Run), "{stage}");
+            }
+        }
         let mux = w.fakes.mux_calls();
         let clean = mux
             .iter()
             .filter(|a| a.last().is_some_and(|s| s == "kill-pane -t %9"))
             .collect::<Vec<_>>();
-        assert_eq!(clean.len(), usize::from(proven), "{stage}");
-        if proven {
+        let cleaned = ["tag", "proof", "view-record", "panic"].contains(&stage);
+        assert_eq!(
+            clean.len(),
+            usize::from(cleaned),
+            "{stage}: only a proven pane is cleaned"
+        );
+        if cleaned {
             assert_eq!(
                 clean[0][5],
                 registry::Launch {
@@ -422,27 +442,11 @@ fn hc_launch_fault_matrix() {
                 .launched()
             );
         }
-        if !success {
-            assert!(
-                folder.join("abort.json").exists(),
-                "abort evidence missing at {stage}"
-            );
-            let e = read_json(&folder.join("abort.json")).unwrap().unwrap();
-            if known {
-                assert_eq!(e["hcAddress"], "t1");
-                assert_eq!(e["kill"], "acknowledged");
-                if proven {
-                    assert_eq!(e["viewCleanup"]["gone"], true);
-                } else {
-                    assert_eq!(e["viewCleanup"], "unproven");
-                }
-            } else {
-                assert!(e["hcAddress"].is_null());
-                assert_eq!(e["runUncertain"], stage != "spec");
-            }
-            assert!(!super::super::committed(&folder));
-        }
-        assert!(folder.join("spec.json").exists());
+        assert_eq!(
+            gens::path(&f, 0, "spec").is_file(),
+            stage != "spec",
+            "{stage}"
+        );
         assert_eq!(
             std::fs::read_dir(source.parent().unwrap()).unwrap().count(),
             2,
@@ -484,7 +488,9 @@ fn a_placed_child_records_its_place_and_a_failed_launch_keeps_its_debit() {
         ),
         (&json!(2), &json!("aaaaaaaaaaaa"), &json!("%4"), &json!(d))
     );
-    let spec = read_json(&folder(&w).join("spec.json")).unwrap().unwrap();
+    let spec = read_json(&gens::path(&folder(&w), 0, "spec"))
+        .unwrap()
+        .unwrap();
     assert_eq!(
         (&spec["flags"], &spec["parentPane"]),
         (&json!(["--effort", "low"]), &json!("%4"))
@@ -519,4 +525,277 @@ fn a_placed_child_records_its_place_and_a_failed_launch_keeps_its_debit() {
         19,
         "a failed launch keeps the debit"
     );
+}
+/// The member folder named by a launch reply.
+fn of(w: &World, r: &Value) -> PathBuf {
+    w.state().join("agents").join(r["id"].as_str().unwrap())
+}
+
+// S2, E1, V1: a spawned member is a lifecycle record with options and prompt; generation 0 files; a view.json
+// that names its generation; the launcher accepts it.
+#[test]
+fn a_spawned_record_is_lifecycle_with_options_and_prompt() {
+    let w = World::human("");
+    let caller = w.caller();
+    ready(&w);
+    let r = launch_hc(&w.ctx, &caller, request(&w), slot).unwrap();
+    let f = of(&w, &r);
+    // Row 8.2 (finding 5to8-12): the reply first, so a refused view.json write fails here, not at the read.
+    assert_eq!((&r["pane"], r.get("viewError")), (&json!("%9"), None));
+    let on_disk = read_json(&f.join("record.json")).unwrap().unwrap();
+    assert_eq!(
+        (&on_disk["lifecycle"], &on_disk["generation"]),
+        (&json!(1), &json!("0"))
+    );
+    assert_eq!(on_disk["prompt"], json!(["task"]));
+    assert!(on_disk["options"].is_array() && on_disk.get("flags").is_none());
+    for k in ["pane", "window", "startCommand", "pending"] {
+        assert!(on_disk.get(k).is_none(), "{k} is not in record.json");
+    }
+    assert!(crate::agents::core_identity::is_hc_name(
+        on_disk["hcName"].as_str().unwrap()
+    ));
+    let view = read_json(&f.join("view.json")).unwrap().unwrap();
+    let got = (
+        &view["pane"],
+        &view["gen"],
+        &view["hcAddress"],
+        &view["hcName"],
+    );
+    assert_eq!(
+        got,
+        (
+            &json!("%9"),
+            &json!(0),
+            &on_disk["hcAddress"],
+            &on_disk["hcName"]
+        )
+    );
+    assert!(gens::committed(&f, 0).unwrap());
+    assert!(
+        !f.join("spec.json").exists() && !f.join("commit.json").exists(),
+        "no folder-level launch files"
+    );
+    assert!(
+        crate::launcher::own_spec(&f, 0).is_some(),
+        "the launcher accepts it"
+    );
+}
+
+// E1 (finding af434f, model): the selected model is a stored option, so a resume replays it.
+#[test]
+fn a_selected_model_is_stored_and_replayed() {
+    let w = World::human("");
+    let caller = w.caller();
+    ready(&w);
+    let mut req = request(&w);
+    req.model = Some("x");
+    let r = launch_hc(&w.ctx, &caller, req, slot).unwrap();
+    let on_disk = read_json(&of(&w, &r).join("record.json")).unwrap().unwrap();
+    let options: Vec<String> = serde_json::from_value(on_disk["options"].clone()).unwrap();
+    assert!(
+        options.ends_with(&["--model".to_string(), "x".to_string()]),
+        "{options:?}"
+    );
+    let spec = read_json(&gens::path(&of(&w, &r), 0, "spec"))
+        .unwrap()
+        .unwrap();
+    let args: Vec<String> = serde_json::from_value(spec["args"].clone()).unwrap();
+    assert!(
+        args.windows(2).any(|p| p == ["--model", "x"]),
+        "the first launch argv is main: {args:?}"
+    );
+    // resume.rs builds Resumed.flags from a lifecycle record options (A2a); replay them.
+    ready(&w);
+    let resumed = Resumed {
+        from: on_disk["id"].as_str().unwrap().into(),
+        record: on_disk.clone(),
+        flags: options.clone(),
+    };
+    let mut req = request(&w);
+    req.task = "";
+    req.resume = Some(&resumed);
+    let y = launch_hc(&w.ctx, &caller, req, slot).unwrap();
+    let spec = read_json(&gens::path(&of(&w, &y), 0, "spec"))
+        .unwrap()
+        .unwrap();
+    assert_eq!(spec["flags"], json!(options), "the model is replayed");
+    assert_eq!(
+        spec["args"],
+        json!(["--resume", on_disk["sessionId"]]),
+        "no task, no second model"
+    );
+}
+
+// G1.6, F5: a view that cannot be opened after the commit keeps the member and says why.
+#[test]
+fn a_view_failure_after_the_commit_keeps_the_member() {
+    let w = World::human("");
+    let caller = w.caller();
+    w.fakes.hc_install("herdr-core");
+    core_fixture::answer(&w, &["--version"], "hc 0.1.21");
+    answer(&w.fakes, "{\"address\":\"t1\"}");
+    for verb in ["new-window", "split-window"] {
+        w.fakes.mux_rule(verb, 1, "", "no room");
+    }
+    w.launches_hold();
+    let r = launch_hc(&w.ctx, &caller, request(&w), slot).unwrap();
+    assert!(r["viewError"].as_str().is_some(), "{r}");
+    let f = of(&w, &r);
+    assert!(gens::committed(&f, 0).unwrap());
+    assert!(
+        !w.fakes.hc_calls().iter().any(|(_, a, _)| a[0] == "kill"),
+        "nothing is rolled back"
+    );
+    assert!(!f.join("view.json").exists());
+    let reply = view_reply(&r);
+    assert_eq!(
+        (&reply["view"], &reply["viewError"]),
+        (&json!("none"), &r["viewError"])
+    );
+}
+
+// PM call 6 (finding 5to8-5), D2: a spawned member that exits on its own has its end recorded by group B (`reap_hc`,
+// `reap_life`, `gens::record_end`), then its exit notice posted. After the switch no lifecycle member is left without
+// recorded completion.
+#[test]
+fn a_natural_exit_of_a_spawned_member_is_recorded_then_noticed() {
+    let w = World::human("");
+    let caller = w.caller();
+    ready(&w);
+    let r = launch_hc(&w.ctx, &caller, request(&w), slot).unwrap();
+    let f = of(&w, &r);
+    let rec = read_json(&f.join("record.json")).unwrap().unwrap();
+    let mut t = core_fixture::wire(&rec);
+    (t["name"], t["state"], t["reason"], t["exit_code"]) = (
+        rec["hcName"].clone(),
+        json!("finished"),
+        json!("exited"),
+        json!(3),
+    );
+    core_fixture::online(&w);
+    core_fixture::listing(&w, &super::super::membership::team(&caller), &[]);
+    core_fixture::get(&w, rec["hcAddress"].as_str().unwrap_or_default(), t);
+    w.panes(&[]);
+    let s = super::super::membership::Snapshot::take(&w.ctx, &caller).unwrap();
+    let _ = super::super::registry::reap_hc(&w.ctx, &caller, &s);
+    let end = gens::read(&f, 0, "ended")
+        .known()
+        .unwrap()
+        .expect("the natural exit is recorded (D2)");
+    assert_eq!(
+        (&end["reason"], &end["exitCode"]),
+        (&json!("exited"), &json!(3))
+    );
+    assert!(
+        gens::read(&f, 0, "notice").known().unwrap().is_some(),
+        "the exit notice of generation 0 is posted"
+    );
+}
+
+// G1: a run error leaves an aborted generation 0 whose member holds no slot; nothing is killed.
+#[test]
+fn a_run_error_leaves_an_aborted_generation_and_no_member() {
+    let w = World::human("");
+    let caller = w.caller();
+    w.fakes.hc_install("herdr-core");
+    core_fixture::answer(&w, &["--version"], "hc 0.1.21");
+    w.fakes.hc_answer(Err(Refusal::internal("timeout")));
+    assert!(launch_hc(&w.ctx, &caller, request(&w), slot).is_err());
+    let f = folder(&w);
+    let c = read_json(&gens::path(&f, 0, "commit")).unwrap().unwrap();
+    assert_eq!(gens::decide(&c), gens::Decision::Aborted);
+    let r = read_json(&f.join("record.json")).unwrap().unwrap();
+    assert!(r.get("pending").is_none() && r.get("generation").is_none());
+    let locals = super::super::membership::locals(&w.ctx, &caller).unwrap();
+    assert!(
+        locals.iter().all(|l| l.finished == Some(true)),
+        "a void generation holds no slot"
+    );
+    assert!(!w.fakes.hc_calls().iter().any(|(_, a, _)| a[0] == "kill"));
+}
+
+// The leader of up: a new member with a new session, kind leader, its team label (spec kind, G1.2).
+#[test]
+fn a_leader_is_a_new_member_with_a_new_session() {
+    let w = World::human("");
+    let caller = w.caller();
+    ready(&w);
+    let leader = crate::agents::leader::Leader {
+        team: "0123456789abcdef".into(),
+        options: vec!["--model".into(), "a b".into()],
+        prompt: vec!["go".into()],
+    };
+    let mut req = request(&w);
+    req.task = "";
+    req.leader = Some(&leader);
+    let r = launch_hc(&w.ctx, &caller, req, slot).unwrap();
+    let f = of(&w, &r);
+    let on_disk = read_json(&f.join("record.json")).unwrap().unwrap();
+    let got = (&on_disk["lifecycle"], &on_disk["upTeam"], &on_disk["depth"]);
+    assert_eq!(got, (&json!(1), &json!("0123456789abcdef"), &json!(0)));
+    assert_eq!(
+        (&on_disk["options"], &on_disk["prompt"]),
+        (&json!(["--model", "a b"]), &json!(["go"]))
+    );
+    let spec = read_json(&gens::path(&f, 0, "spec")).unwrap().unwrap();
+    assert_eq!(
+        (&spec["kind"], &spec["sessionId"]),
+        (&json!("leader"), &on_disk["sessionId"])
+    );
+    assert!(crate::checks::session_id(
+        on_disk["sessionId"].as_str().unwrap()
+    ));
+    let calls = w.fakes.hc_calls();
+    let run = calls
+        .iter()
+        .map(|(_, a, _)| a)
+        .find(|a| a[0] == "run")
+        .unwrap();
+    assert!(run.contains(&"mux.up=0123456789abcdef".to_string()));
+}
+
+// options-6e: mux-agent resume makes a new lifecycle member that continues the ended conversation.
+#[test]
+fn a_resume_is_a_new_lifecycle_member_with_the_ended_session() {
+    let w = World::human("");
+    let caller = w.caller();
+    ready(&w);
+    let from = json!({"id": "bbbbbbbbbbbb", "name": "worker", "client": "claude", "sessionId": SESSION_ID,
+        "session": caller.session, "directory": utf8(&w.ctx.cwd).unwrap(), "lifecycle": 1, "generation": "0",
+        "options": ["--model", "x"], "prompt": ["old task"], "hcName": "m0123abcd", "parentPane": null});
+    let flags = vec!["--model".to_string(), "x".to_string()];
+    let resumed = Resumed {
+        from: "bbbbbbbbbbbb".into(),
+        record: from,
+        flags,
+    };
+    let mut req = request(&w);
+    req.task = "";
+    req.resume = Some(&resumed);
+    let r = launch_hc(&w.ctx, &caller, req, slot).unwrap();
+    let f = of(&w, &r);
+    let on_disk = read_json(&f.join("record.json")).unwrap().unwrap();
+    let got = (
+        &on_disk["lifecycle"],
+        &on_disk["sessionId"],
+        &on_disk["resumedFrom"],
+    );
+    assert_eq!(got, (&json!(1), &json!(SESSION_ID), &json!("bbbbbbbbbbbb")));
+    assert_eq!(on_disk["options"], json!(["--model", "x"]));
+    assert!(
+        on_disk.get("prompt").is_none(),
+        "a resume never carries the task"
+    );
+    assert_ne!(
+        on_disk["hcName"],
+        json!("m0123abcd"),
+        "a new generation never reuses a name"
+    );
+    let spec = read_json(&gens::path(&f, 0, "spec")).unwrap().unwrap();
+    assert_eq!(
+        (&spec["kind"], &spec["sessionId"]),
+        (&json!("resume"), &json!(SESSION_ID))
+    );
+    assert_eq!(spec["flags"], json!(["--model", "x"]));
 }

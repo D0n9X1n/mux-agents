@@ -41,7 +41,7 @@ use serde_json::{Map, Value, json};
 const POLL: Duration = Duration::from_millis(50);
 
 // The variables a client record carries; never the whole environment.
-const ENV: [&str; 10] = [
+const ENV: [&str; 11] = [
     "MUX_AGENTS_STATE",
     "CLAUDE_CODE_SESSION_ID",
     "CLAUDE_CODE_ENTRYPOINT",
@@ -52,6 +52,7 @@ const ENV: [&str; 10] = [
     "HOME",
     "MUX_IT_EXIT",
     "HC_TERMINAL_ID",
+    "MUX_AGENTS_GEN",
 ];
 
 fn main() {

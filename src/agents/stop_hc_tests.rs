@@ -722,3 +722,33 @@ fn stop_of_a_held_generation_waits_for_that_generations_client() {
     );
     w.fakes.hc_done().unwrap();
 }
+
+// a3b call 38: a lifecycle stop inside a tree. `with_standing` holds the session spawn lock (the team lock), so
+// `stop_life` terminates under it through `team_state::held`, never taking it a second time; generation 0 is ended and
+// noticed as outside a tree.
+#[test]
+fn a_lifecycle_stop_inside_a_tree_terminates_under_the_held_team_lock() {
+    let (w, _s) = lf::world();
+    crate::agents::tree::tests::team_record(&w, &[]);
+    let m = lf::life(&w, at0());
+    lf::seed_gen(&m, 0, Some("run"), lf::committed());
+    kills(&w, 0, true);
+    let got = stop_of(&w, &m).unwrap();
+    assert_eq!(
+        (&got["life"], &got["hcAddress"]),
+        (&json!("ended"), &json!("t0"))
+    );
+    let spawn = format!("+{}", crate::agents::lock_key("spawn", &w.caller(), "$3"));
+    let taken = w.fakes.locks().iter().filter(|l| **l == spawn).count();
+    assert_eq!(
+        taken,
+        1,
+        "the team lock is taken once, by with_standing: {:?}",
+        w.fakes.locks()
+    );
+    let end = gens::read(&m, 0, "ended").known().unwrap().unwrap();
+    assert_eq!(end["reason"], json!("terminated"));
+    let notice = gens::read(&m, 0, "notice").known().unwrap();
+    assert_eq!(notice.map(|v| v["kind"].clone()), Some(json!("stopped")));
+    w.fakes.hc_done().unwrap();
+}
