@@ -339,6 +339,12 @@ pub(crate) fn subject_gen(g: &super::gens::Gen, s: &super::gens::Status) -> Res<
 }
 
 impl Subject {
+    /// The hc name the subject generation's view carries: the pending block's when held, else the active
+    /// `launch.json`'s, never the record's (views-6f, v6f call 6).
+    pub(crate) fn name(&self) -> Option<&str> {
+        self.name.as_deref()
+    }
+
     /// V1, W1, the one predicate: `v` is this generation's view. A call 47: only a real identity owns: the address a
     /// non-empty string and the hcName an hc name (`core_identity::is_hc_name`), on both sides; an empty, null or
     /// missing value never matches another one.
@@ -377,6 +383,10 @@ pub fn presented(g: &super::gens::Gen, s: &super::gens::Status) -> Res<Value> {
     let Some(v) = super::gens::walk(g.folder(), &["view.json"]).known()? else {
         return Ok(record);
     };
+    // v6f call 16: a view.json of the wrong JSON type is as unreadable as a torn one; only an absent one is "no view".
+    if !v.is_object() {
+        return Err(crate::state::evidence::unreadable());
+    }
     if subject_gen(g, s)?.is_some_and(|sub| sub.owns(&v)) {
         for k in VIEW_FIELDS {
             if let Some(x) = v.get(k) {

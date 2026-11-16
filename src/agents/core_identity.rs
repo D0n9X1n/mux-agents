@@ -82,6 +82,22 @@ pub fn attach_program(command: &str, address: &str, os: OsKind) -> Option<String
         .then(|| program.to_string())
 }
 
+/// V2: what a holder of the member lock found: the view's pane, whether it was adopted (no valid descriptor), and
+/// how many other live panes of the caller's session attach the same address.
+#[derive(Debug)]
+pub struct Located {
+    pub pane: Pane,
+    pub adopted: bool,
+    pub duplicates: usize,
+}
+
+/// `%12` -> 12; anything else sorts last.
+fn pane_number(pane: &str) -> u64 {
+    pane.strip_prefix('%')
+        .and_then(|n| n.parse().ok())
+        .unwrap_or(u64::MAX)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Identity {
     pub id: String,
@@ -223,6 +239,38 @@ impl Identity {
             }
         }
         Some(self.pane_of(row, r))
+    }
+
+    /// V2, ambiguity 6, only under the member lock (6f-R2): the live panes `attach_program` recognises for this
+    /// address (an hc install name at any path, v6f call 13; never what `PATH` resolves today) are the candidates
+    /// (generation n's attaches n's, so never). A valid descriptor keeps its pane; else the lowest numeric id is
+    /// adopted. Every other candidate is a duplicate, counted and left alone.
+    pub fn search(&self, r: &Value, rows: &[Row], key: &Key) -> Option<Located> {
+        let mut candidates: Vec<&Row> = rows
+            .iter()
+            .filter(|row| {
+                attach_program(&row.command, &self.address, HOST).is_some()
+                    && Self::live(rows, &row.pane).is_some()
+            })
+            .collect();
+        candidates.sort_by_key(|row| pane_number(&row.pane));
+        if let Some(pane) = self.view(r, rows, key) {
+            let duplicates = candidates
+                .iter()
+                .filter(|row| row.pane != pane.pane)
+                .count();
+            return Some(Located {
+                pane,
+                adopted: false,
+                duplicates,
+            });
+        }
+        let first = candidates.first()?;
+        Some(Located {
+            pane: self.pane_of(first, r),
+            adopted: true,
+            duplicates: candidates.len() - 1,
+        })
     }
 
     /// Main's liveness: exactly one row at `pane`, not dead, a pid of at least 2, an `@` window.

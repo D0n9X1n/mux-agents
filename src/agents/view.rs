@@ -56,6 +56,20 @@ pub struct Focused {
     pub name: String,
     pub pane: String,
     pub window: String,
+    /// V2: other live panes of the caller's session attaching the same address (counted, never closed).
+    pub duplicates: usize,
+}
+
+/// The `focus` reply: name, pane, window; `duplicates` only when above 0 (views-6f ambiguity 6).
+pub(crate) fn focus_reply(f: Focused) -> Map<String, Value> {
+    let mut reply = Map::new();
+    reply.insert("name".into(), f.name.into());
+    reply.insert("pane".into(), f.pane.into());
+    reply.insert("window".into(), f.window.into());
+    if f.duplicates > 0 {
+        reply.insert("duplicates".into(), f.duplicates.into());
+    }
+    reply
 }
 
 /// The `focus` verb: `focus_hc` on the agent its positional names, with no drawn pane to check; or, with `-Next` /
@@ -76,12 +90,10 @@ pub fn focus(ctx: &Ctx, request: &Request) -> Res<Map<String, Value>> {
     };
     let core = crate::hc::connect(ctx)?;
     let focused = focus_hc(ctx, &core, &caller, &name, None)?;
-    let mut reply = Map::new();
-    reply.insert("name".into(), focused.name.into());
-    reply.insert("pane".into(), focused.pane.into());
+    let window = focused.window.clone();
+    let mut reply = focus_reply(focused);
     // The view is focused and the member lock released: the bar of its window is best effort and never fails focus.
-    reply.insert("window".into(), focused.window.clone().into());
-    crate::sidebar::keep(ctx, &caller, &focused.window, &mut reply);
+    crate::sidebar::keep(ctx, &caller, &window, &mut reply);
     Ok(reply)
 }
 
@@ -266,6 +278,7 @@ fn select_view(
         name: name.into(),
         pane: pane.into(),
         window: window.into(),
+        duplicates: 0,
     })
 }
 /// What the bar's open found for member `id` (#103 B6).
@@ -322,26 +335,109 @@ fn focus_identity(
 ) -> Res<Option<Focused>> {
     lock(ctx, &lock_key("member", caller, &id.id), || {
         let record = super::member_target::current(ctx, caller, id)?;
-        let pane = id.view(
-            &record,
-            &registry::rows(ctx, caller)?,
-            &super::core_identity::Key::of(caller),
-        );
-        if expected.is_some_and(|e| pane.as_ref().is_none_or(|p| p.pane != e)) {
+        let rows = registry::rows(ctx, caller)?;
+        let key = super::core_identity::Key::of(caller);
+        // 6f-R2: only here, under the member lock, is a pane adopted. Pre-lifecycle keeps main's rule.
+        let found = if super::gens::lifecycle(&record) {
+            id.search(&record, &rows, &key)
+        } else {
+            id.view(&record, &rows, &key)
+                .map(|pane| super::core_identity::Located {
+                    pane,
+                    adopted: false,
+                    duplicates: 0,
+                })
+        };
+        if expected.is_some_and(|e| found.as_ref().is_none_or(|l| l.pane.pane != e)) {
             return refuse(
                 2,
                 "target",
                 "the agent is no longer on the pane the bar drew",
             );
         }
-        match (pane, core) {
-            (Some(p), _) => {
-                select_view(ctx, &id.id, &p.name, &p.pane, &p.window, &p.launch).map(Some)
+        match (found, core) {
+            (Some(l), _) => {
+                if l.adopted {
+                    adopt(ctx, caller, id, &l.pane)?;
+                }
+                let p = &l.pane;
+                select_view(ctx, &id.id, &p.name, &p.pane, &p.window, &p.launch).map(|f| {
+                    Some(Focused {
+                        duplicates: l.duplicates,
+                        ..f
+                    })
+                })
             }
             (None, Some(core)) => restore_view(ctx, core, caller, id, record).map(Some),
             (None, None) => Ok(None),
         }
     })
+}
+
+/// v6f calls 6, 17: the hc name a lifecycle view of `id` carries, from its subject generation's evidence (A3c
+/// `subject_gen`), never from `record.json`. Unreadable refuses `evidence`; no subject or no name refuses `internal`.
+fn subject_name(ctx: &Ctx, caller: &Caller, id: &str) -> Res<String> {
+    let folder = super::server_dir(ctx, caller).join("agents").join(id);
+    let super::gens::Member::Life(g) = super::gens::member_of(&folder) else {
+        return Err(crate::error::Refusal::internal("not a lifecycle member"));
+    };
+    let s = g.status()?;
+    super::team_state::subject_gen(&g, &s)?
+        .and_then(|sub| sub.name().map(str::to_owned))
+        .ok_or_else(|| crate::error::Refusal::internal("the subject generation has no hc name"))
+}
+
+/// V2: a pane that attaches the subject address with no valid descriptor (focus died after attach) becomes the
+/// view: written once through A3c's writer, under the member lock `focus_identity` holds, recording the program the
+/// pane runs (v6f call 13).
+fn adopt(
+    ctx: &Ctx,
+    caller: &Caller,
+    id: &super::core_identity::Identity,
+    p: &registry::Pane,
+) -> Res<()> {
+    let n = super::gens::plain_gen(&id.generation)
+        .ok_or_else(|| crate::error::Refusal::internal("invalid generation"))?;
+    let name = subject_name(ctx, caller, &id.id)?;
+    let program = super::core_identity::attach_program(
+        &p.launch.command,
+        &id.address,
+        crate::state::root::HOST,
+    )
+    .ok_or_else(|| crate::error::Refusal::internal("unproven view"))?;
+    let at = ViewAt {
+        pane: &p.pane,
+        window: &p.window,
+        command: &p.launch.command,
+        program: &program,
+    };
+    super::team_state::view_held(
+        ctx,
+        &super::team_state::Scope::of(caller),
+        &id.id,
+        &descriptor(caller, id, n, &name, &at),
+    )
+}
+
+/// Where a view is: its pane, window, start command and the program that command runs.
+pub(crate) struct ViewAt<'a> {
+    pub pane: &'a str,
+    pub window: &'a str,
+    pub command: &'a str,
+    pub program: &'a str,
+}
+
+/// A3c ambiguity 3's descriptor plus the recorded attach program (v6f call 13), shared by `restore_view` and `adopt`.
+pub(crate) fn descriptor(
+    caller: &Caller,
+    id: &super::core_identity::Identity,
+    n: u64,
+    hc_name: &str,
+    at: &ViewAt<'_>,
+) -> Value {
+    json!({"serverKey": caller.server_key, "session": caller.session, "pane": at.pane,
+        "window": at.window, "startCommand": at.command, "attachProgram": at.program, "gen": n,
+        "hcAddress": id.address, "hcName": hc_name})
 }
 
 fn restore_view(
@@ -354,6 +450,14 @@ fn restore_view(
     // Ambiguity 3: the generation is checked before any pane is made.
     let n = super::gens::plain_gen(&id.generation)
         .ok_or_else(|| crate::error::Refusal::internal("invalid generation"))?;
+    // Re-audit 1-3 F6: the subject's name is read before any pane is made. v6f call 17: only a lifecycle member has
+    // a subject generation; a pre-lifecycle member keeps its record's name.
+    let name = if super::gens::lifecycle(&record) {
+        subject_name(ctx, caller, &id.id)?
+    } else {
+        id.hc_name.clone()
+    };
+    let program = core.binary().display().to_string();
     let placement = super::placement::read_placement(ctx, caller)
         .ok()
         .flatten()
@@ -372,12 +476,13 @@ fn restore_view(
         let v = created
             .as_ref()
             .ok_or_else(|| crate::error::Refusal::internal("unproven new view"))?;
-        let descriptor = json!({
-            "serverKey": caller.server_key, "session": caller.session,
-            "pane": v.pane, "window": v.window, "startCommand": v.command,
-            "attachProgram": core.binary().display().to_string(),
-            "gen": n, "hcAddress": id.address, "hcName": id.hc_name,
-        });
+        let at = ViewAt {
+            pane: &v.pane,
+            window: &v.window,
+            command: &v.command,
+            program: &program,
+        };
+        let descriptor = descriptor(caller, id, n, &name, &at);
         // S4, W1: focus_identity holds the member lock (not reentrant); the writer checks the subject generation.
         super::team_state::view_held(
             ctx,
