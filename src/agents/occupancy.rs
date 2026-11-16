@@ -291,17 +291,13 @@ use table::proc_hold;
 pub use table::{ProcView, client_image, holds, proc_view};
 
 #[cfg(test)]
-#[path = "occupancy_caller_tests.rs"]
 mod caller_tests;
 #[cfg(test)]
-#[path = "occupancy_managed_tests.rs"]
 mod managed_tests;
 #[cfg(test)]
-#[path = "occupancy_reserve_tests.rs"]
 mod reserve_tests;
 #[cfg(test)]
 #[path = "occupancy_test_support.rs"]
 mod support;
 #[cfg(test)]
-#[path = "occupancy_table_tests.rs"]
 mod table_tests;

@@ -803,6 +803,26 @@ const TEST_ONLY: &[(&str, &str, &str)] = &[
         "held_tests",
     ),
     (
+        "src/agents/occupancy/caller_tests.rs",
+        "src/agents/occupancy.rs",
+        "caller_tests",
+    ),
+    (
+        "src/agents/occupancy/managed_tests.rs",
+        "src/agents/occupancy.rs",
+        "managed_tests",
+    ),
+    (
+        "src/agents/occupancy/reserve_tests.rs",
+        "src/agents/occupancy.rs",
+        "reserve_tests",
+    ),
+    (
+        "src/agents/occupancy/table_tests.rs",
+        "src/agents/occupancy.rs",
+        "table_tests",
+    ),
+    (
         "src/agents/outcome/tests.rs",
         "src/agents/outcome.rs",
         "tests",

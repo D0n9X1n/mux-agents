@@ -249,7 +249,7 @@ fn a_loader_callers_native_child_is_exempt() {
 // H5: the two accepted limits are stated where agents read them.
 #[test]
 fn the_skill_states_the_known_limits() {
-    let skill = include_str!("../../skills/mux-agents/SKILL.md");
+    let skill = include_str!("../../../skills/mux-agents/SKILL.md");
     for needle in [
         "`resume` refuses while any process on this machine may hold that conversation",
         "switches conversation with `/resume` while no hook fires",
