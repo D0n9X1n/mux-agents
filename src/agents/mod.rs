@@ -36,6 +36,7 @@ pub mod resume;
 pub mod session_report;
 #[cfg(test)]
 mod session_report_tests;
+pub mod settle;
 pub mod spawn;
 #[cfg(test)]
 mod stop_hc_tests;
