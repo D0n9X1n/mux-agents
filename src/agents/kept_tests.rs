@@ -327,3 +327,119 @@ fn closing_one_kept_shell_leaves_the_other_and_the_generation_done() {
     );
     w.fakes.hc_done().unwrap();
 }
+
+// Spec: a crash after R1.3 (relabelled, no released.json); the person closes the shell; replay skips the finished
+// shell and writes released.json; the bar lists nothing. Reversed order: the same end state. A closed shell never
+// reappears: a second replay makes no hc call.
+#[test]
+fn a_close_and_a_release_replay_converge_in_either_order() {
+    for close_first in [true, false] {
+        let (w, s) = lf::world();
+        let team = lf::team(&w);
+        let f = lf::life(
+            &w,
+            json!({"generation": "0", "hcAddress": "t0", "hcName": lf::hc_name(0),
+            "launcherArgv": lf::ARGV}),
+        );
+        lf::seed_gen(&f, 0, None, lf::committed());
+        let mut member = kept_wire("t0", "live", None);
+        member["labels"] = json!({"mux.managed": "1", "mux.team": team, "mux.id": ID, "mux.gen": "0",
+            "mux.name": "worker"});
+        let kept_arg = format!("mux.kept={team}");
+        // The release, halted after its relabel (a crash before released.json).
+        cf::online(&w);
+        cf::get(&w, "t0", member);
+        cf::answer(
+            &w,
+            &[
+                "label",
+                "t0",
+                "mux.managed=",
+                "mux.team=",
+                "mux.id=",
+                "mux.gen=",
+                "mux.name=",
+                "mux.up=",
+                &kept_arg,
+                "mux.keptName=worker",
+                "--json",
+            ],
+            "{}",
+        );
+        super::release::halt_after(Some("relabel"));
+        let halted = super::team_state::open(&w.ctx, &s, |tx| {
+            super::release::release(
+                tx,
+                &crate::hc::Lazy::new(&w.ctx),
+                ID,
+                0,
+                "t0",
+                super::release::Cause::Restore,
+            )
+        });
+        super::release::halt_after(None);
+        assert_eq!(
+            halted.map_err(|e| e.check),
+            Err("halted"),
+            "close_first {close_first}"
+        );
+        assert!(!f.join("gens/0/released.json").exists());
+        let live = kept_wire("t0", "live", Some((&team, "worker")));
+        let finished = kept_wire("t0", "finished", Some((&team, "worker")));
+        let close = || {
+            cf::online(&w);
+            cf::get(&w, "t0", live.clone());
+            cf::answer(&w, &["kill", "t0", "--json"], "{}");
+            kept::close(&crate::hc::connect(&w.ctx).unwrap(), &team, "t0").unwrap();
+        };
+        let finish = |seen: &Value| {
+            cf::online(&w);
+            cf::get(&w, "t0", seen.clone());
+            let done = super::team_state::open(&w.ctx, &s, |tx| {
+                super::release::finish(tx, &crate::hc::Lazy::new(&w.ctx), ID, 0)
+            });
+            assert!(done.unwrap(), "close_first {close_first}");
+        };
+        if close_first {
+            close();
+            finish(&finished);
+        } else {
+            finish(&live);
+            close();
+        }
+        assert!(
+            f.join("gens/0/released.json").is_file(),
+            "close_first {close_first}: released"
+        );
+        assert_eq!(kills(&w), 1, "close_first {close_first}");
+        let labels = w
+            .fakes
+            .hc_calls()
+            .iter()
+            .filter(|c| c.1[0] == "label")
+            .count();
+        assert_eq!(
+            labels, 1,
+            "close_first {close_first}: no relabel after the crash"
+        );
+        cf::online(&w);
+        cf::kept_listing(&w, &team, &["t0"]);
+        cf::get(&w, "t0", finished.clone());
+        assert_eq!(
+            kept::list_at(&w.ctx, &team).unwrap(),
+            Vec::<Shell>::new(),
+            "the bar lists nothing"
+        );
+        w.fakes.hc_done().unwrap();
+        let calls = w.fakes.hc_calls().len();
+        let again = super::team_state::open(&w.ctx, &s, |tx| {
+            super::release::finish(tx, &crate::hc::Lazy::new(&w.ctx), ID, 0)
+        });
+        assert!(again.unwrap());
+        assert_eq!(
+            w.fakes.hc_calls().len(),
+            calls,
+            "close_first {close_first}: never resurrected, no hc call"
+        );
+    }
+}
