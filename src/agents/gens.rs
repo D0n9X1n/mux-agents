@@ -1928,6 +1928,10 @@ mod publish_tests;
 mod ready_tests;
 
 #[cfg(test)]
+#[path = "gens_held_tests.rs"]
+mod held_tests;
+
+#[cfg(test)]
 mod b_tests {
     use super::*;
     use crate::agents::core_fixture as cf;
