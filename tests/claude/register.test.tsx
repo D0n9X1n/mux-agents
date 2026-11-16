@@ -29,7 +29,7 @@ type Answers = { register?: object; open?: object; openHoldMs?: number; denyWrit
 type Hold = { name: string; ms: number; skip?: number }
 type Live = { surfaces: string[] | 'reject'; env: Record<string, string>; deny: string[]; holds: Hold[] }
 function world(on: any, env: Record<string, string>, runs: object[], tool: { stdout: string; text: string; isError?: boolean } = { stdout: SPAWN_JSON, text: SPAWN_JSON }, answers: Answers = {}) {
-  const seen = { registered: [] as object[], opened: [] as object[], closed: [] as string[], panes: new Set<string>(), argv: [] as string[][], init: [] as unknown[], status: [] as (string | undefined)[], settled: 0 }
+  const seen = { registered: [] as object[], opened: [] as object[], closed: [] as string[], panes: new Set<string>(), argv: [] as string[][], sessions: [] as string[][], init: [] as unknown[], status: [] as (string | undefined)[], settled: 0 }
   const live: Live = { surfaces: ['terminal'], env: { MUX_AGENTS_WAKE: '0', ...env }, deny: [], holds: [] }
   const clock = mock.clock(on)
   on('env.get', async (_: unknown, e: { name: string }) => {
@@ -60,6 +60,8 @@ function world(on: any, env: Record<string, string>, runs: object[], tool: { std
   if (denyWrites) on('state.set', (_: unknown, e: unknown, next: (e: unknown) => unknown) => (denyWrites-- > 0 ? { deny: 'disk full' } : next(e)))
   on('ui.status', (_: unknown, e: { text?: string }) => { seen.status.push(e.text); return { value: undefined } })
   on('process.run', async (_: unknown, e: { argv: string[]; init?: unknown }) => {
+    // report-2b: the session report a classic SessionStart runs is kept apart; it takes no queued answer.
+    if (e.argv.includes('-Session')) { seen.sessions.push([...e.argv]); return ran(0, '') }
     seen.argv.push([...e.argv]); seen.init.push(e.init)
     const next: any = runs.length > 1 ? runs.shift() : runs[0]
     if (next?.holdMs) { await clock.sleep(next.holdMs); seen.settled++; return next.answer }

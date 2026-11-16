@@ -1,7 +1,7 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register, Timer } from 'claude-code'
 
-import { activity } from './activity'
+import { activity, reportSession } from './activity'
 import { arm, onSubmit, run } from './deliver'
 import { EMPTY, formatAge, isSpawn, look, mail, needYou, parseList, sections } from './board'
 
@@ -160,6 +160,13 @@ async function stopRefreshIfGone($: EngineInterface) {
 export const register: Register = on => {
   // Every session in tmux or rmux reports its own activity; only an agent's pane is answered.
   activity(on)
+  // report-2b K3: session.start carries no session id; the classic SessionStart (startup, resume, clear, compact)
+  // does. Reported without waiting.
+  on('classic.SessionStart', async ($, e, next) => {
+    const input = e as { session_id?: unknown; source?: unknown }
+    reportSession($, input.session_id, input.source)
+    return next(e)
+  })
   // The skill skills/mux-agents owns /mux-agents, so the pane command has a name of its own, registered only in an
   // eligible session. A refused registration (another owner of the name) leaves the session and the open-on-spawn
   // path working.

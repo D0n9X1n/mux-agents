@@ -1,6 +1,14 @@
 {
   "version": 1,
   "hooks": {
+    "sessionStart": [
+      {
+        "type": "command",
+        "bash": "sh scripts/mux-agent report -Session -Stdin -Quiet",
+        "command": "scripts\\mux-agent.cmd report -Session -Stdin -Quiet",
+        "timeoutSec": 30
+      }
+    ],
     "userPromptSubmitted": [
       {
         "type": "command",

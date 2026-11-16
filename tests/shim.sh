@@ -154,7 +154,8 @@ if [ "$n" = 29 ] && [ -z "$why" ]; then ok skill_commands_run_through_shim; else
 
 # #84: Copilot reads the plugin root's hooks.json (Claude Code reads hooks/hooks.json only) and runs each command from
 # the plugin root. Every hook reports through the shim, never fails the turn, and maps Copilot's events as herdr's
-# agents report: a prompt works, a question blocks until answered, a stop idles.
+# agents report: a prompt works, a question blocks until answered, a stop idles. Session start names the session
+# (report-2b K3): `report -Session -Stdin` reads Copilot's JSON from stdin, with 30 s for its readiness wait.
 copilot_hooks_report_through_the_shim() {
   name=copilot_hooks_report_through_the_shim
   hooks="$repo/hooks.json"
@@ -164,7 +165,7 @@ h = json.load(open(sys.argv[1]))
 assert h["version"] == 1, h
 for event, entries in sorted(h["hooks"].items()):
     for e in entries:
-        assert e["type"] == "command" and e["timeoutSec"] <= 10, e
+        assert e["type"] == "command" and e["timeoutSec"] <= (30 if event == "sessionStart" else 10), e
         # Unix runs bash, Windows the portable command (no PowerShell in the repository, tests/repo.rs); both quiet.
         assert set(e) == {"type", "bash", "command", "timeoutSec"} | ({"matcher"} if "matcher" in e else set()), e
         assert e["bash"].startswith("sh scripts/mux-agent report ") and e["bash"].endswith(" -Quiet"), e
@@ -178,6 +179,7 @@ PY
 postToolUse:ask_user:report working -Quiet
 postToolUseFailure:ask_user:report working -Quiet
 preToolUse:ask_user:report blocked -Kind question -Quiet
+sessionStart::report -Session -Stdin -Quiet
 userPromptSubmitted::report working -Quiet"
   [ "$got" = "$want" ] || { bad "$name" "events: $got"; return; }
   # Run as Copilot runs it, from the plugin root, with a binary that records its arguments and fails loudly: the shim
@@ -192,11 +194,9 @@ userPromptSubmitted::report working -Quiet"
       (cd "$repo" && MUX_AGENTS_BIN="$fake" sh -c "$cmd") || echo "FAILED $cmd" >> "$tmp/argv"
     done
   ran=$(sort "$tmp/argv")
-  want="report blocked -Kind question -Quiet
-report idle -Quiet
-report working -Quiet
-report working -Quiet
-report working -Quiet"
+  # Sorted by the same `sort`, so the locale's collation of `-Session` cannot change the expectation.
+  want=$(printf '%s\n' "report -Session -Stdin -Quiet" "report blocked -Kind question -Quiet" "report idle -Quiet" \
+    "report working -Quiet" "report working -Quiet" "report working -Quiet" | sort)
   if [ "$ran" = "$want" ]; then ok "$name"; else bad "$name" "ran: $ran"; fi
 }
 copilot_hooks_report_through_the_shim

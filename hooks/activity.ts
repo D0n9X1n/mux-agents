@@ -13,14 +13,18 @@ type State = 'working' | 'blocked' | 'idle'
 let queue: Promise<void> = Promise.resolve()
 let agent: boolean | undefined
 
-// The entry shim's `report`. Hooks have no `process`, so the OS comes from the environment.
-async function reportArgv($: EngineInterface, state: State, kind?: string): Promise<string[]> {
+// The entry shim with `tail`. Hooks have no `process`, so the OS comes from the environment.
+async function entryArgv($: EngineInterface, tail: string[]): Promise<string[]> {
   const root = $.plugin.root
   let os
   try { os = await $.env.get('OS') } catch { os = undefined }
-  const tail = kind ? ['report', state, '-Kind', kind] : ['report', state]
   if (os === 'Windows_NT') return ['cmd.exe', '/d', '/c', `${root}\\scripts\\mux-agent.cmd`, ...tail]
   return ['sh', `${root}/scripts/mux-agent`, ...tail]
+}
+
+// The entry shim's `report`.
+async function reportArgv($: EngineInterface, state: State, kind?: string): Promise<string[]> {
+  return entryArgv($, kind ? ['report', state, '-Kind', kind] : ['report', state])
 }
 
 // Inside tmux, rmux or an hc terminal: a place that could be an agent's, as deliver.ts inTeam (#137). A plain herdr
@@ -52,6 +56,20 @@ async function send($: EngineInterface, state: State, kind?: string) {
 // Queued and not awaited: no turn or tool call waits for a report.
 function report($: EngineInterface, state: State, kind?: string) {
   queue = queue.then(() => send($, state, kind)).catch(() => {})
+}
+
+const SESSION_ID = /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/
+const SOURCE = /^[a-z]{1,32}$/
+
+// report-2b K3: this client's session, from classic.SessionStart, where a managed client can run (inMux: an hc
+// terminal, tmux or rmux). Not awaited, not queued behind the activity reports; every failure is dropped.
+export function reportSession($: EngineInterface, sessionId: unknown, source: unknown) {
+  if (typeof sessionId !== 'string' || !SESSION_ID.test(sessionId)) return
+  const word = typeof source === 'string' && SOURCE.test(source) ? source : 'unknown'
+  void (async () => {
+    if (!(await inMux($))) return
+    await $.process.run(await entryArgv($, ['report', '-Session', sessionId, '-Source', word, '-Quiet']), { timeoutMs: 30000 })
+  })().catch(() => {})
 }
 
 // The main loop only: a subagent's turns and tools (agentId) are not this agent's own.
