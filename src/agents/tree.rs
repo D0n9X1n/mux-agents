@@ -79,13 +79,40 @@ pub fn limit(snapshot: &Snapshot) -> Res<()> {
         .count();
     // prelife-1c G10a: a held pre-lifecycle folder counts, leader or not (fail closed).
     if snapshot.slots() - leaders >= MAX_MEMBERS {
-        return refuse(
-            2,
-            "limit",
-            "the team already has 6 members besides the leader",
-        );
+        let base = "the team already has 6 members besides the leader";
+        let held = holders(snapshot);
+        let message = if held.is_empty() {
+            base.to_string()
+        } else {
+            format!("{base}; held by pre-lifecycle members: {}", held.join(", "))
+        };
+        return refuse(2, "limit", message);
     }
     Ok(())
+}
+/// prelife-1c ambiguity 14: every held pre-lifecycle member, sorted, as `<name> (<what frees it>)`.
+fn holders(s: &Snapshot) -> Vec<String> {
+    use super::prelife::{HELD_LOST, HELD_RUNNING, HELD_UNKNOWN, HELD_UNREADABLE};
+    let name = |id: &str| s.pre.get(id).cloned().unwrap_or_else(|| id.to_string());
+    let mut out: Vec<String> = (s.facts.local.iter())
+        .filter(|o| s.pre.contains_key(&o.identity.id) && s.holds(o))
+        .map(|o| {
+            let n = name(&o.identity.id);
+            let hint = match o.life {
+                Life::Lost => HELD_LOST,
+                Life::Running => HELD_RUNNING,
+                _ => HELD_UNKNOWN,
+            };
+            format!("{n} ({})", hint.replace("{name}", &n))
+        })
+        .chain(
+            s.held
+                .iter()
+                .map(|id| format!("{} ({HELD_UNREADABLE})", name(id))),
+        )
+        .collect();
+    out.sort();
+    out
 }
 /// Every local record by id.
 pub fn records_of(snapshot: &Snapshot) -> BTreeMap<String, Value> {

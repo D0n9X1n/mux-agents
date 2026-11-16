@@ -12,6 +12,8 @@ pub const L: &str = "111111111111";
 pub const A: &str = "a0000000000a";
 pub const C: &str = "c0000000000c";
 pub const P: &str = "d0000000000d";
+/// Task 9: an id that sorts after `C` and `P`, so holders named against their id order show the sort.
+pub const D: &str = "e0000000000e";
 
 /// Leader `L` -> lifecycle `A` -> pre-lifecycle `C` naming `A` as parent (spec "mixed tree"); A's and C's records.
 pub fn mixed(w: &World) -> (Value, Value) {

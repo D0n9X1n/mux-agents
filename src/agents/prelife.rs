@@ -20,6 +20,11 @@ pub(crate) const PRE_LIFECYCLE: &str =
     "predates lifecycle records (pre-lifecycle) and is never resumed";
 pub(crate) const LIFECYCLE_ONLY: &str =
     "this member predates lifecycle records; lifecycle state is never read or written for it";
+/// Ambiguity 14: what frees a held pre-lifecycle member, named in the `limit` refusal (`{name}` replaced).
+pub(crate) const HELD_LOST: &str = "run mux-agent stop {name} once its client is gone";
+pub(crate) const HELD_RUNNING: &str = "running; mux-agent stop {name} stops it";
+pub(crate) const HELD_UNKNOWN: &str = "hc cannot show its terminal; it stays held";
+pub(crate) const HELD_UNREADABLE: &str = "its record names no usable hc terminal; it stays held";
 
 fn refusal(check: &'static str, message: String) -> Refusal {
     Refusal {
