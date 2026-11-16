@@ -134,14 +134,15 @@ fn create(member: &Path, n: u64, file: &str, body: &Value) -> Res<()> {
     }
 }
 
-/// O4.2 (ambiguity 8): void from its own evidence. Task 3 adds the failure legs.
+/// O4.2-O4.3: void from its own evidence; then, only for claim `run` and commit `Run`, the failure legs in the spec's
+/// order. A leg that fires creates `failure.json` before `outcome.json` (O4.3). None: undecided, nothing written.
 fn fresh(
     member: &Path,
     n: u64,
-    _now: SystemTime,
-    _seen: Option<&Terminal>,
-    _report: Option<&Value>,
-    _exit: Option<Value>,
+    now: SystemTime,
+    seen: Option<&Terminal>,
+    report: Option<&Value>,
+    exit: Option<Value>,
 ) -> Res<Option<Verdict>> {
     let claim = gens::claim(member, n).known()?;
     if claim.as_ref().and_then(Value::as_str) == Some("abandoned") {
@@ -153,7 +154,89 @@ fn fresh(
     if commit == Some(Decision::Aborted) {
         return Ok(Some(Verdict::Void(ABORTED.into())));
     }
+    if claim.as_ref().and_then(Value::as_str) != Some("run") || commit != Some(Decision::Run) {
+        return Ok(None);
+    }
+    let Some((reason, facts)) = failure(member, n, now, seen, report.is_some(), exit)? else {
+        return Ok(None);
+    };
+    let body = json!({"reason": reason, "evidence": facts, "at": utc_o(now)});
+    create(member, n, "failure", &body)?;
+    Ok(Some(Verdict::Failed(reason.into())))
+}
+
+/// The first failure leg that fires (ambiguity 7), each file read only when its leg is reached (R1).
+fn failure(
+    member: &Path,
+    n: u64,
+    now: SystemTime,
+    seen: Option<&Terminal>,
+    reported: bool,
+    exit: Option<Value>,
+) -> Res<Option<(&'static str, Value)>> {
+    // Call 16 (R1): on the report path K5 already read exit.json (`Held.exit`); only without a report is it read here.
+    let exit = if reported {
+        exit
+    } else {
+        gens::read(member, n, "exit").known()?
+    };
+    if let Some(exit) = exit {
+        return Ok(Some((EXITED, exit)));
+    }
+    if let Some(ended) = gens::read(member, n, "ended").known()? {
+        return Ok(Some((ENDED, ended)));
+    }
+    if let Some(t) = seen
+        && lost(member, n, t)?
+    {
+        return Ok(Some((LOST, json!({"address": t.address, "argv": t.argv}))));
+    }
+    let spec = gens::read(member, n, "spec")
+        .known()?
+        .ok_or_else(evidence::unreadable)?;
+    let text = spec
+        .get("deadline")
+        .and_then(Value::as_str)
+        .ok_or_else(evidence::unreadable)?;
+    let deadline = crate::util::parse_utc(text).ok_or_else(evidence::unreadable)?;
+    let facts = json!({"deadline": text, "now": utc_o(now)});
+    if !reported && now >= deadline {
+        return Ok(Some((NO_REPORT, facts)));
+    }
+    if reported && now >= deadline + GRACE {
+        return Ok(Some((NO_CLIENT, facts)));
+    }
     Ok(None)
+}
+
+/// Ambiguity 3: `t` is generation n's terminal shown Lost: its name is `launch.json hcName`, its labels name this
+/// member and n, and `classify` against `launch.json launcherArgv` is Lost. launch.json absent or torn: `evidence`.
+fn lost(member: &Path, n: u64, t: &Terminal) -> Res<bool> {
+    let launch = gens::read(member, n, "launch")
+        .known()?
+        .ok_or_else(evidence::unreadable)?;
+    let hc_name = launch
+        .get("hcName")
+        .and_then(Value::as_str)
+        .ok_or_else(evidence::unreadable)?;
+    let argv: Vec<String> = launch
+        .get("launcherArgv")
+        .and_then(Value::as_array)
+        .ok_or_else(evidence::unreadable)?
+        .iter()
+        .map(|a| {
+            a.as_str()
+                .map(str::to_owned)
+                .ok_or_else(evidence::unreadable)
+        })
+        .collect::<Res<_>>()?;
+    let id = member.file_name().and_then(|f| f.to_str());
+    let label = |k: &str| t.labels.get(k).map(String::as_str);
+    let gen_label = n.to_string();
+    Ok(t.name.as_deref() == Some(hc_name)
+        && label("mux.id") == id
+        && label("mux.gen") == Some(gen_label.as_str())
+        && super::lifecycle::classify(Some(t), &argv) == super::lifecycle::Life::Lost)
 }
 
 #[cfg(test)]

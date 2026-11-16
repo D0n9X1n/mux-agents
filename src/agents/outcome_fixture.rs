@@ -103,3 +103,22 @@ impl G {
         }
     }
 }
+
+/// Generation n's terminal as hc reports it: `name`, labels `mux.id`/`mux.gen`, live, `argv`.
+pub fn terminal(name: &str, id: &str, n: u64, argv: &[&str]) -> crate::hc::Terminal {
+    let gen_label = n.to_string();
+    crate::hc::Terminal {
+        address: "t1".into(),
+        name: Some(name.into()),
+        state: crate::hc::State::Live,
+        reason: None,
+        exit_code: None,
+        argv: argv.iter().map(|a| a.to_string()).collect(),
+        foreground: None,
+        labels: [("mux.id", id), ("mux.gen", gen_label.as_str())]
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect(),
+        pid: None,
+    }
+}
