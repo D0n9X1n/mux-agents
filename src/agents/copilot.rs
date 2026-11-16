@@ -11,8 +11,8 @@ pub fn session_folder(home: &Path, id: &str) -> PathBuf {
 
 /// Copies session `source` to `target` and returns whether the copy is usable. Both ids must be GUIDs. Top-level
 /// `*.jsonl` lose a final unterminated segment that does not parse (a parsable one gets its LF); `*.yaml` are never
-/// cut. In both, `source` becomes `target` and workspace.yaml loses its `mc_` keys; an `mc_` value the copy cannot
-/// verify (see `without_mc`) refuses the copy. Subfolders are copied as they are. The copy is built and verified in
+/// cut. In both, `source` becomes `target` and workspace.yaml loses its `mc_` keys; a workspace.yaml outside the
+/// grammar `without_mc` checks refuses the copy. Subfolders are copied as they are. The copy is built and verified in
 /// a uniquely named sibling temp folder, then renamed into place without replacing anything; a failure deletes only
 /// the temp folder.
 pub fn copy_session(home: &Path, source: &str, target: &str) -> bool {
@@ -77,7 +77,7 @@ fn build(from: &Path, temp: &Path, source: &str, target: &str) -> io::Result<()>
         text = text.replace(source, target);
         if name == "workspace.yaml" {
             text = without_mc(&text)
-                .ok_or_else(|| invalid("workspace.yaml has an mc_ value the copy cannot drop"))?;
+                .ok_or_else(|| invalid("workspace.yaml is outside the grammar the copy checks"))?;
         }
         std::fs::write(&path, &text)?;
         if jsonl {
@@ -104,65 +104,83 @@ fn build(from: &Path, temp: &Path, source: &str, target: &str) -> io::Result<()>
     Ok(())
 }
 
-/// workspace.yaml without its top-level `mc_` keys, each with its whole block: the key line and every indented line
-/// after it. Copilot CLI 1.0.110 writes `mc_pending_repository_warning:` as a mapping; dropping only the key line
-/// leaves its children under the previous key, which Copilot then refuses to load. Only a non-blank, non-comment
-/// line without indent ends a block. A blank or comment line met inside one is held: an indented line after it
-/// drops it with the block; a top-level line or the end of the text keeps it.
-///
-/// `None` refuses what the filter cannot verify: an `mc_` key line that leaves a `{` or `[` open, a first top-level
-/// line after an `mc_` key that is not a plain `key:` line (`- item`, `}`, `]`, ...), or any dropped line with a `&`.
-/// An anchor dropped with the block would leave its aliases elsewhere pointing at nothing; a `&` that is not an
-/// anchor (in quotes, say) is refused too, and the member starts fresh.
+/// workspace.yaml without its column-0 `mc_` keys, each with its two-space children, or `None` when any line is
+/// outside this grammar (call 14). Copilot CLI 1.0.110 writes `mc_pending_repository_warning:` as such a mapping.
+/// Every line is `KEY: VALUE` or `KEY:` at column 0, or `  KEY: VALUE` (exactly two spaces) directly under a column-0
+/// `KEY:` without a value; only the text's end may follow a `\n`. KEY is `[A-Za-z0-9_-]+`; VALUE is as `scalar`
+/// says. A blank line, comment, block scalar, flow value, anchor, alias, tag, explicit or quoted key or deeper
+/// nesting refuses, so inside the grammar dropping an `mc_` key with its children is exact.
 fn without_mc(text: &str) -> Option<String> {
+    let mut lines: Vec<&str> = text.split('\n').collect();
+    let end = (lines.last() == Some(&"")).then(|| lines.pop()).flatten();
     let mut kept = Vec::new();
-    let mut held = Vec::new();
+    // Whether the last column-0 key has no value, so two-space children may follow it.
+    let mut parent = false;
     let mut dropping = false;
-    for line in text.split('\n') {
-        let trimmed = line.trim();
-        if dropping && (trimmed.is_empty() || trimmed.starts_with('#')) {
-            held.push(line);
-        } else if dropping && line.starts_with([' ', '\t']) {
-            if line.contains('&') || held.iter().any(|h| h.contains('&')) {
+    for line in lines {
+        if let Some(child) = line.strip_prefix("  ") {
+            if !parent || entry(child)?.1.is_none() {
                 return None;
             }
-            held.clear();
         } else {
-            if dropping && !plain_key(line) {
-                return None;
-            }
-            kept.append(&mut held);
-            dropping = line.starts_with("mc_");
-            if dropping && (open_flow(line) || line.contains('&')) {
-                return None;
-            }
-            if !dropping {
-                kept.push(line);
-            }
+            let (key, value) = entry(line)?;
+            parent = value.is_none();
+            dropping = key.starts_with("mc_");
+        }
+        if !dropping {
+            kept.push(line);
         }
     }
-    kept.append(&mut held);
+    kept.extend(end);
     Some(kept.join("\n"))
 }
 
-/// A top-level line that starts a plain `key:` entry: a letter, digit or `_` first, and a `:` that ends the line or
-/// is followed by a space.
-fn plain_key(line: &str) -> bool {
-    let line = line.trim_end();
-    line.starts_with(|c: char| c.is_ascii_alphanumeric() || c == '_')
-        && (line.ends_with(':') || line.contains(": "))
+/// `line` as `KEY: VALUE` (value `Some`) or `KEY:` (value `None`); `None` outside the grammar.
+fn entry(line: &str) -> Option<(&str, Option<&str>)> {
+    let (key, rest) = line.split_once(':')?;
+    if key.is_empty()
+        || !key
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+    {
+        return None;
+    }
+    if rest.is_empty() {
+        return Some((key, None));
+    }
+    let value = rest.strip_prefix(' ')?;
+    scalar(value).then_some((key, Some(value)))
 }
 
-/// Whether `line` leaves a flow `{` or `[` open. shortcut: brackets inside quotes are counted too. A quoted `{` or
-/// `[` refuses a valid value; a quoted `}` or `]` can hide an open one, and a closer that then reaches column 0 is
-/// still refused by `plain_key`.
-fn open_flow(line: &str) -> bool {
-    let depth = line.chars().fold(0i32, |depth, c| match c {
-        '{' | '[' => depth + 1,
-        '}' | ']' => depth - 1,
-        _ => depth,
-    });
-    depth > 0
+/// A one-line VALUE: `'...'` whose only quotes inside are `''`; `"..."` with no `"` or `\` inside; or a plain scalar
+/// that does not start with an indicator (`- ? : , [ ] { } # & * ! | > ' " % @` or a backtick) or a space, holds
+/// neither `: ` nor ` #`, and does not end in `:`. No value holds a tab, a control character, or a character YAML
+/// reads as a line break or byte-order mark.
+fn scalar(value: &str) -> bool {
+    if value
+        .chars()
+        .any(|c| c.is_control() || matches!(c, '\u{2028}' | '\u{2029}' | '\u{feff}'))
+    {
+        return false;
+    }
+    if let Some(inner) = value.strip_prefix('\'') {
+        return inner
+            .strip_suffix('\'')
+            .is_some_and(|inner| !inner.replace("''", "").contains('\''));
+    }
+    if let Some(inner) = value.strip_prefix('"') {
+        return inner
+            .strip_suffix('"')
+            .is_some_and(|inner| !inner.contains(['"', '\\']));
+    }
+    !value.is_empty()
+        && !value.starts_with([
+            '-', '?', ':', ',', '[', ']', '{', '}', '#', '&', '*', '!', '|', '>', '\'', '"', '%',
+            '@', '`', ' ',
+        ])
+        && !value.contains(": ")
+        && !value.contains(" #")
+        && !value.ends_with(':')
 }
 
 /// Folders and files below `from` into `to`. A link (or junction) refuses the copy: Copilot makes none, and
@@ -334,6 +352,23 @@ mod tests {
         );
     }
 
+    #[test]
+    fn copilot_copy_accepts_the_copilot_1_0_110_sample() {
+        // The workspace.yaml excerpt from #137, below an id and a cwd line: only the mc_ block leaves.
+        assert_eq!(
+            copied_workspace(
+                "cwd: /work\nremote_steerable: false\nmc_pending_repository_warning:\n  mc_session_id: <id>\n  mc_task_id: <id>\n  message: 'This remote session is not linked to a repository: ...'\n"
+            ),
+            format!("id: {NEW}\ncwd: /work\nremote_steerable: false\n")
+        );
+    }
+
+    #[test]
+    fn copilot_copy_keeps_a_flat_workspace_byte_for_byte() {
+        let body = "cwd: C:\\work\\repo\nsummary: 'it''s: fine'\nbranch: \"feature/x #2\"\ncreated_at: 2026-11-15T10:00:00.000Z\nremote_steerable: false\n";
+        assert_eq!(copied_workspace(body), format!("id: {NEW}\n{body}"));
+    }
+
     // workspace.yaml as the copy writes it, from `body` written below the source's id line.
     fn copied_workspace(body: &str) -> String {
         let s = session();
@@ -357,14 +392,11 @@ mod tests {
     }
 
     #[test]
-    fn copilot_copy_keeps_the_blank_line_after_an_mc_block() {
-        // A blank line ends the block and stays; the top-level key after it stays.
-        assert_eq!(
-            copied_workspace(&format!(
-                "cwd: /work\nmc_pending_repository_warning:\n  mc_session_id: {OLD}\n  message: m\n\nsummary: s\n"
-            )),
-            format!("id: {NEW}\ncwd: /work\n\nsummary: s\n")
-        );
+    fn copilot_copy_refuses_a_blank_line_after_an_mc_block() {
+        // Outside the grammar: a blank line anywhere but the end of the file refuses.
+        assert!(refused(&format!(
+            "cwd: /work\nmc_pending_repository_warning:\n  mc_session_id: {OLD}\n  message: m\n\nsummary: s\n"
+        )));
     }
 
     #[test]
@@ -376,32 +408,22 @@ mod tests {
     }
 
     #[test]
-    fn copilot_copy_drops_a_blank_line_inside_an_mc_block() {
-        // The blank line does not end the block: it and the indented line after it leave with the block.
-        assert_eq!(
-            copied_workspace(&format!(
-                "cwd: /work\nremote_steerable: false\nmc_pending_repository_warning:\n  mc_session_id: {OLD}\n\n  message: 'not linked: no repo'\nsummary: s\n"
-            )),
-            format!("id: {NEW}\ncwd: /work\nremote_steerable: false\nsummary: s\n")
-        );
+    fn copilot_copy_refuses_a_blank_line_inside_an_mc_block() {
+        assert!(refused(&format!(
+            "cwd: /work\nremote_steerable: false\nmc_pending_repository_warning:\n  mc_session_id: {OLD}\n\n  message: 'not linked: no repo'\nsummary: s\n"
+        )));
     }
 
     #[test]
-    fn copilot_copy_drops_a_comment_inside_an_mc_block() {
-        assert_eq!(
-            copied_workspace(&format!(
-                "cwd: /work\nremote_steerable: false\nmc_pending_repository_warning:\n  mc_session_id: {OLD}\n# continued warning\n  message: 'not linked: no repo'\nsummary: s\n"
-            )),
-            format!("id: {NEW}\ncwd: /work\nremote_steerable: false\nsummary: s\n")
-        );
+    fn copilot_copy_refuses_a_comment_inside_an_mc_block() {
+        assert!(refused(&format!(
+            "cwd: /work\nremote_steerable: false\nmc_pending_repository_warning:\n  mc_session_id: {OLD}\n# continued warning\n  message: 'not linked: no repo'\nsummary: s\n"
+        )));
     }
 
     #[test]
-    fn copilot_copy_keeps_a_comment_between_two_keys() {
-        assert_eq!(
-            copied_workspace("cwd: /work\n# a note\nsummary: s\n"),
-            format!("id: {NEW}\ncwd: /work\n# a note\nsummary: s\n")
-        );
+    fn copilot_copy_refuses_a_comment_between_two_keys() {
+        assert!(refused("cwd: /work\n# a note\nsummary: s\n"));
     }
 
     // Whether the copy of a workspace.yaml with `body` below its id line is refused, leaving no target and no temp.
@@ -446,19 +468,35 @@ mod tests {
     }
 
     #[test]
-    fn copilot_copy_refuses_an_ampersand_in_a_quoted_mc_value() {
-        // Not an anchor, but the filter does not parse quotes: refused, and the member starts fresh.
+    fn copilot_copy_drops_an_ampersand_in_a_quoted_mc_value() {
+        // The grammar reads quotes exactly: a `&` inside them is no anchor.
+        assert_eq!(
+            copied_workspace("cwd: /work\nmc_x:\n  message: 'this & that'\nsummary: s\n"),
+            format!("id: {NEW}\ncwd: /work\nsummary: s\n")
+        );
+    }
+
+    #[test]
+    fn copilot_copy_refuses_a_one_line_flow_mc_value() {
+        assert!(refused("cwd: /work\nmc_x: { a: 1 }\nsummary: s\n"));
+    }
+
+    #[test]
+    fn copilot_copy_refuses_a_block_scalar_before_an_mc_key() {
+        // Dropping `mc_x: |` would fold `  # drop me` into `summary`.
         assert!(refused(
-            "cwd: /work\nmc_x:\n  message: 'this & that'\nsummary: s\n"
+            "cwd: /work\nsummary: |\n  line one\nmc_x: |\n  # drop me\n"
         ));
     }
 
     #[test]
-    fn copilot_copy_drops_a_one_line_flow_mc_value() {
-        assert_eq!(
-            copied_workspace("cwd: /work\nmc_x: { a: 1 }\nsummary: s\n"),
-            format!("id: {NEW}\ncwd: /work\nsummary: s\n")
-        );
+    fn copilot_copy_refuses_a_quoted_mc_key() {
+        assert!(refused("cwd: /work\n\"mc_x\": v\nsummary: s\n"));
+    }
+
+    #[test]
+    fn copilot_copy_refuses_an_explicit_mc_key() {
+        assert!(refused("cwd: /work\n? mc_x\n: v\nsummary: s\n"));
     }
 
     #[test]
@@ -470,15 +508,48 @@ mod tests {
     }
 
     #[test]
-    fn without_mc_drops_a_crlf_mc_block_whole() {
-        // The filter itself: copy_session refuses a CRLF workspace.yaml at its `id:` line check.
+    fn without_mc_refuses_crlf() {
+        // YAML reads a `\r` as a line break, so the grammar refuses it; copy_session also refuses CRLF at its
+        // `id:` line check.
         assert_eq!(
             without_mc(
                 "id: x\r\ncwd: /work\r\nmc_pending_repository_warning:\r\n  mc_session_id: x\r\n  message: m\r\nsummary: s\r\n"
-            )
-            .as_deref(),
-            Some("id: x\r\ncwd: /work\r\nsummary: s\r\n")
+            ),
+            None
         );
+    }
+
+    #[test]
+    fn without_mc_refuses_every_line_outside_the_grammar() {
+        for text in [
+            "a: !tag v\n",
+            "a: *alias\n",
+            "a: &anchor v\n",
+            "a: [1]\n",
+            "a: >\n  x\n",
+            "a: - item\n",
+            "a:\n  b:\n",
+            "a:\n  b:\n    c: d\n",
+            "a:\n   b: c\n",
+            "a: v\n  b: c\n",
+            "  b: c\n",
+            "a:\tv\n",
+            "a: v\t# c\n",
+            "a: v\rb: c\n",
+            "a: v # c\n",
+            "a: b: c\n",
+            "a: C:\n",
+            "a: 'it's'\n",
+            "a: 'v' x\n",
+            "a: \"x\\\"y\"\n",
+            "a:  v\n",
+            "a: \n",
+            "a b: c\n",
+            "---\na: b\n",
+            "a: v\n\n",
+        ] {
+            assert_eq!(without_mc(text), None, "{text:?}");
+        }
     }
 
     #[test]
