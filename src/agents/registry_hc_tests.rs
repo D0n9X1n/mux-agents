@@ -892,3 +892,75 @@ fn a_notice_waits_for_a_flushed_end() {
     assert!(gens::path(&f, 1, "notice").exists());
     w.fakes.hc_done().unwrap();
 }
+
+// Call 62 (TL #144 F4): `terminate` records `reason: "terminated"` and posts no notice; the process stops before the
+// stop caller posts one. An ordinary reap then posts exactly one stopped notice, whether hc forgot the terminal or
+// still shows it Finished (the recorded facts stand); a second reap posts nothing more.
+#[test]
+fn a_terminated_generation_is_noticed_once_by_an_ordinary_reap() {
+    use crate::agents::team_state::{Scope, Tx};
+    use crate::agents::{gens, life_fixture as lf};
+    for case in ["forgotten", "finished"] {
+        let w = World::human("");
+        let c = w.caller();
+        let r = cf::member(
+            &w,
+            ID,
+            json!({"lifecycle": 1, "generation": "1", "hcName": lf::hc_name(1)}),
+        );
+        let (f, address) = (w.folder(ID), r["hcAddress"].as_str().unwrap().to_string());
+        let launch = json!({"hcName": lf::hc_name(1), "launcherArgv": r["launcherArgv"],
+            "sessionId": r["sessionId"]});
+        crate::state::evidence::publish(&gens::path(&f, 1, "launch"), &launch).unwrap();
+        crate::state::evidence::publish(&gens::claim_path(&f, 1), &json!("run")).unwrap();
+        crate::state::evidence::publish(&gens::path(&f, 1, "commit"), &json!({"committed": true}))
+            .unwrap();
+        let mut live = cf::wire(&r);
+        live["name"] = json!(lf::hc_name(1));
+        cf::online(&w);
+        lf::ls(&w, 1, &[&address]);
+        cf::get(&w, &address, live.clone());
+        cf::get(&w, &address, live.clone());
+        cf::answer(&w, &["kill", &address, "--json"], "{}");
+        gens::terminate(
+            &Tx {
+                ctx: &w.ctx,
+                scope: Scope::of(&c),
+            },
+            ID,
+            1,
+        )
+        .unwrap();
+        w.fakes.hc_done().unwrap();
+        let ended = gens::read(&f, 1, "ended").known().unwrap().unwrap();
+        assert_eq!(ended["reason"], "terminated", "{case}");
+        assert!(messages(&w).is_empty(), "{case}: terminate posted a notice");
+        let mut finished = live.clone();
+        (finished["state"], finished["reason"], finished["exit_code"]) =
+            (json!("finished"), json!("killed"), Value::Null);
+        for round in [1, 2] {
+            cf::online(&w);
+            cf::listing(&w, &membership::team(&c), &[]);
+            if case == "forgotten" {
+                lf::gone(&w, &address);
+            } else {
+                cf::get(&w, &address, finished.clone());
+            }
+            w.panes(&[]);
+            let s = membership::Snapshot::take(&w.ctx, &c).unwrap();
+            let posted = reap_hc(&w.ctx, &c, &s).unwrap();
+            assert_eq!(posted, round == 1, "{case} {round}: posted");
+            let all = messages(&w);
+            assert_eq!(all.len(), 1, "{case} {round}: one notice");
+            assert!(
+                all[0].to_string().contains("stopped"),
+                "{case} {round}: {}",
+                all[0]
+            );
+        }
+        assert!(
+            gens::path(&f, 1, "notice").exists(),
+            "{case}: notice recorded"
+        );
+    }
+}

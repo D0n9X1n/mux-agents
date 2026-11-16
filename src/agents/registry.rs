@@ -2617,13 +2617,14 @@ fn hc_notice(t: &Terminal) -> Option<Notice> {
     }
 }
 
-/// The same mapping from a recorded `ended.json` (S6 `reason`, `exitCode`).
+/// The same mapping from a recorded `ended.json` (S6 `reason`, `exitCode`); `terminated` is stopped (call 62).
 fn recorded_notice(facts: &Value) -> Option<Notice> {
     match facts.get("reason").and_then(Value::as_str) {
         Some("exited") => Some(Notice::Exited(
             facts.get("exitCode").cloned().unwrap_or(Value::Null),
         )),
-        Some("killed") => Some(Notice::Stopped),
+        // Call 62: `terminate` records its own kill as `terminated` (call 54).
+        Some("killed" | "terminated") => Some(Notice::Stopped),
         _ => None,
     }
 }
