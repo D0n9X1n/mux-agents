@@ -110,8 +110,10 @@ fn build(from: &Path, temp: &Path, source: &str, target: &str) -> io::Result<()>
 /// line without indent ends a block. A blank or comment line met inside one is held: an indented line after it
 /// drops it with the block; a top-level line or the end of the text keeps it.
 ///
-/// `None` refuses what the filter cannot verify: an `mc_` key line that leaves a `{` or `[` open, or a first
-/// top-level line after an `mc_` key that is not a plain `key:` line (`- item`, `}`, `]`, ...).
+/// `None` refuses what the filter cannot verify: an `mc_` key line that leaves a `{` or `[` open, a first top-level
+/// line after an `mc_` key that is not a plain `key:` line (`- item`, `}`, `]`, ...), or any dropped line with a `&`.
+/// An anchor dropped with the block would leave its aliases elsewhere pointing at nothing; a `&` that is not an
+/// anchor (in quotes, say) is refused too, and the member starts fresh.
 fn without_mc(text: &str) -> Option<String> {
     let mut kept = Vec::new();
     let mut held = Vec::new();
@@ -121,6 +123,9 @@ fn without_mc(text: &str) -> Option<String> {
         if dropping && (trimmed.is_empty() || trimmed.starts_with('#')) {
             held.push(line);
         } else if dropping && line.starts_with([' ', '\t']) {
+            if line.contains('&') || held.iter().any(|h| h.contains('&')) {
+                return None;
+            }
             held.clear();
         } else {
             if dropping && !plain_key(line) {
@@ -128,7 +133,7 @@ fn without_mc(text: &str) -> Option<String> {
             }
             kept.append(&mut held);
             dropping = line.starts_with("mc_");
-            if dropping && open_flow(line) {
+            if dropping && (open_flow(line) || line.contains('&')) {
                 return None;
             }
             if !dropping {
@@ -422,6 +427,29 @@ mod tests {
     fn copilot_copy_refuses_an_mc_flow_value_left_open() {
         assert!(refused(
             "cwd: /work\nmc_x: {\n  message: m\n}\nsummary: s\n"
+        ));
+    }
+
+    #[test]
+    fn copilot_copy_refuses_an_anchor_inside_an_mc_block() {
+        // Dropping the anchor would leave `*shared` pointing at nothing.
+        assert!(refused(
+            "cwd: /work\nmc_x:\n  message: &shared value\nsummary: *shared\n"
+        ));
+    }
+
+    #[test]
+    fn copilot_copy_refuses_an_anchor_on_the_mc_key_line() {
+        assert!(refused(
+            "cwd: /work\nmc_x: &shared value\nsummary: *shared\n"
+        ));
+    }
+
+    #[test]
+    fn copilot_copy_refuses_an_ampersand_in_a_quoted_mc_value() {
+        // Not an anchor, but the filter does not parse quotes: refused, and the member starts fresh.
+        assert!(refused(
+            "cwd: /work\nmc_x:\n  message: 'this & that'\nsummary: s\n"
         ));
     }
 
