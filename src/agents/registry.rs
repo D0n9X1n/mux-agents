@@ -595,7 +595,34 @@ pub fn add_notice(
 ) -> Res<bool> {
     let folder = super::server_dir(ctx, caller).join("agents").join(id);
     let member = gens::member_of(&folder);
-    post(ctx, caller, id, &folder, &member, record, notice, None)
+    post(
+        ctx, caller, id, &folder, &member, record, notice, None, None,
+    )
+}
+
+/// PM call 9: the notice of generation n, the one a stop ended, never a fresh `active()`. It posts once n is done by
+/// its recorded evidence, read after `terminate` dropped `pending`. The caller holds the notice lock.
+pub fn add_notice_gen(
+    ctx: &Ctx,
+    caller: &Caller,
+    id: &str,
+    record: &Value,
+    n: u64,
+    notice: Notice,
+) -> Res<bool> {
+    let folder = super::server_dir(ctx, caller).join("agents").join(id);
+    let member = gens::member_of(&folder);
+    post(
+        ctx,
+        caller,
+        id,
+        &folder,
+        &member,
+        record,
+        notice,
+        None,
+        Some(n),
+    )
 }
 
 /// S5, ambiguities 8, 9, 16: the generation, marker and delivery id come from `member` alone; `record` gives only
@@ -604,6 +631,8 @@ pub fn add_notice(
 /// nothing is posted and the next list or reap retries (settle-1b, A3b, writes `ended.json`).
 /// `ended`: the generation whose `ended.json` the caller has just read Present, so `status` does not read it again
 /// (R1, b-calls 32). A lifecycle notice is published through the one publisher (b-calls 31, B-R1, B-R6).
+/// `subject` (PM calls 9, 12): the generation to notice (a stop's, or the snapshot's in `reap_life`); `None` is the
+/// active one (A3a).
 #[allow(clippy::too_many_arguments)]
 fn post(
     ctx: &Ctx,
@@ -614,18 +643,27 @@ fn post(
     record: &Value,
     notice: Notice,
     ended: Option<u64>,
+    subject: Option<u64>,
 ) -> Res<bool> {
     let (marker, delivery, life_gen) = match member {
         Member::Unreadable(e) => return Err(e.clone()),
         Member::Life(g) => {
-            let Some(n) = g.active() else {
+            // PM calls 9, 12: the generation the caller names, else the active one (A3a). `ended` is only the
+            // ended.json the caller already read (b-calls 32).
+            let Some(n) = subject.or(g.active()) else {
                 return Ok(false); // nothing to notice
             };
             let s = g.status_given(ended)?; // R2 refuses; R1: the caller's ended.json is not read again
             if g.read(n, "notice").known()?.is_some() {
                 return Ok(false);
             }
-            if s.active_done != Some(true) {
+            // A held stop names a generation `terminate` just dropped from `pending`: its own recorded completion.
+            let done = if Some(n) == g.active() {
+                s.active_done == Some(true)
+            } else {
+                gens::done(folder, n)?
+            };
+            if !done {
                 return Ok(false); // R3: not ended by its record yet
             }
             (
@@ -941,6 +979,7 @@ pub(crate) fn post_if_gone(ctx: &Ctx, caller: &Caller, agent: &Agent) -> Res<boo
         &agent.member,
         &agent.record,
         notice,
+        None,
         None,
     )
 }
@@ -2567,7 +2606,7 @@ pub fn reap_hc(ctx: &Ctx, caller: &Caller, snapshot: &super::membership::Snapsho
                     if same.as_ref() != Some(&o.identity) {
                         return Ok(false);
                     }
-                    post(ctx, caller, id, &folder, &member, r, notice, None)
+                    post(ctx, caller, id, &folder, &member, r, notice, None, None)
                 }
                 Member::Unreadable(e) => Err(e.clone()),
                 _ => Ok(false),
@@ -2632,6 +2671,7 @@ fn reap_life(
         member,
         g.record(),
         notice,
+        Some(n),
         Some(n),
     )
 }

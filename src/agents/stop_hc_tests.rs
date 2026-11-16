@@ -1,13 +1,166 @@
 use super::{
     core_fixture as cf,
     fixture::{ID, World},
-    registry,
+    gens, life_fixture as lf, registry,
 };
 use serde_json::{Value, json};
 fn call(w: &World) -> crate::error::Res<serde_json::Map<String, Value>> {
     let args = ["stop", "worker"].map(str::to_string);
     let (def, request) = crate::cli::parse(&args).unwrap();
     (def.handler)(&w.ctx, &request)
+}
+
+/// `stop <name>` for an `lf` member, by its record name.
+fn stop_of(w: &World, m: &std::path::Path) -> crate::error::Res<serde_json::Map<String, Value>> {
+    let name = lf::record(m)["name"].as_str().unwrap().to_string();
+    let args = ["stop".to_string(), name];
+    let (def, request) = crate::cli::parse(&args).unwrap();
+    (def.handler)(&w.ctx, &request)
+}
+
+/// Active generation 0 at `t0`, with the top-level identity `current` validates (a3c call 36).
+fn at0() -> Value {
+    json!({"generation": "0", "hcAddress": "t0", "hcName": lf::hc_name(0), "launcherArgv": lf::ARGV})
+}
+
+/// B1's merged `terminate` of a Running generation n at `t<n>` (call 13, b-call 54): `--version`, the search (`ls`,
+/// `get`), the exact reread (`get`), then `kill`, answered or refused. Nothing follows the kill.
+fn kills(w: &World, n: u64, accepted: bool) {
+    let a = format!("t{n}");
+    cf::online(w);
+    lf::found(w, n, &lf::running(w, n));
+    lf::get(w, &a, &lf::running(w, n));
+    if accepted {
+        cf::answer(w, &["kill", &a, "--json"], "{}");
+    } else {
+        lf::fails(w, &["kill", &a, "--json"]);
+    }
+}
+
+// PM calls 9, 11 (finding 5to8-3): the stop ends generation n through terminate and the notice is n. Held cases:
+// pending 1 committed and running is stopped and noticed, never the active 0, whether 0 already ended (no notice) or
+// still runs (call 32, checklist 6: `post` cannot decide generation 1 from the active generation's `done`).
+#[test]
+fn a_lifecycle_stop_ends_and_notices_the_generation_it_stopped() {
+    for case in ["active", "held, active ended", "held, active running"] {
+        let (w, _s) = lf::world();
+        let held = case != "active";
+        let mut fields = at0();
+        if held {
+            fields["pending"] = lf::pending(1);
+        }
+        let m = lf::life(&w, fields);
+        lf::seed_gen(&m, 0, Some("run"), lf::committed());
+        if case == "held, active ended" {
+            gens::publish_once(&m, 0, "ended", &json!({"state": "finished"})).unwrap();
+        }
+        let n = if held {
+            lf::seed_gen(&m, 1, Some("run"), lf::committed());
+            1
+        } else {
+            0
+        };
+        kills(&w, n, true);
+        let got = stop_of(&w, &m).unwrap();
+        assert_eq!(
+            (&got["life"], &got["hcAddress"]),
+            (&json!("ended"), &json!(format!("t{n}"))),
+            "{case}"
+        );
+        let end = gens::read(&m, n, "ended").known().unwrap().unwrap();
+        assert_eq!(
+            end["reason"],
+            json!("terminated"),
+            "{case}: the end of the stopped generation"
+        );
+        let notice = gens::read(&m, n, "notice").known().unwrap();
+        assert_eq!(
+            notice.map(|v| v["kind"].clone()),
+            Some(json!("stopped")),
+            "{case}: generation {n} is noticed"
+        );
+        if held {
+            assert!(
+                gens::read(&m, 0, "notice").known().unwrap().is_none(),
+                "{case}: the active 0 is not this stop"
+            );
+            assert!(
+                lf::record(&m).get("pending").is_none(),
+                "{case}: terminate dropped pending 1"
+            );
+        }
+        assert!(
+            !m.join("notice.json").exists(),
+            "{case}: never the folder marker"
+        );
+        assert_eq!(lf::count(&w, "kill"), 1, "{case}");
+        w.fakes.hc_done().unwrap();
+    }
+}
+
+// PM call 11, release-1d R2: a Lost generation is released, never killed; the reply says lost; the notice posts.
+#[test]
+fn a_lost_generation_is_released_by_stop_never_killed() {
+    let (w, _s) = lf::world();
+    let m = lf::life(&w, at0());
+    lf::seed_gen(&m, 0, Some("run"), lf::committed());
+    cf::online(&w);
+    lf::found(&w, 0, &lf::lost(&w, 0, lf::LOST_ARGVS[0]));
+    lf::get(&w, "t0", &lf::lost(&w, 0, lf::LOST_ARGVS[0]));
+    lf::relabel(&w, "t0");
+    let got = stop_of(&w, &m).unwrap();
+    assert_eq!(got["life"], json!("lost"));
+    assert_eq!(
+        gens::read(&m, 0, "release").known().unwrap().unwrap()["cause"],
+        "lost"
+    );
+    assert_eq!(
+        lf::count(&w, "kill"),
+        0,
+        "a Lost generation is never killed"
+    );
+    let notice = gens::read(&m, 0, "notice").known().unwrap();
+    assert_eq!(
+        notice.map(|v| v["kind"].clone()),
+        Some(json!("stopped")),
+        "the released generation is noticed"
+    );
+    w.fakes.hc_done().unwrap();
+}
+
+// D3 Err (finding 5to8-7, call site): hc refuses the kill (b-call 54: no `get` follows a kill, so an accepted kill
+// always records the end). Unresolved: the stop refuses, no end is recorded, no notice posts.
+#[test]
+fn an_unresolved_stop_posts_no_notice() {
+    let (w, _s) = lf::world();
+    let m = lf::life(&w, at0());
+    lf::seed_gen(&m, 0, Some("run"), lf::committed());
+    kills(&w, 0, false);
+    assert!(stop_of(&w, &m).is_err(), "unresolved");
+    assert!(gens::read(&m, 0, "ended").known().unwrap().is_none());
+    assert!(
+        gens::read(&m, 0, "notice").known().unwrap().is_none(),
+        "no notice before the end is recorded"
+    );
+    w.fakes.hc_done().unwrap();
+}
+
+// R2 (finding 5to8-7, call site): an unreadable ended.json refuses before any hc call; no notice.
+#[test]
+fn a_stop_with_an_unreadable_end_refuses_before_any_kill() {
+    let (w, _s) = lf::world();
+    let m = lf::life(&w, at0());
+    lf::seed_gen(&m, 0, Some("run"), lf::committed());
+    std::fs::write(gens::path(&m, 0, "ended"), b"{").unwrap();
+    w.fakes.hc_install("hc");
+    let e = stop_of(&w, &m).unwrap_err();
+    assert_eq!(e.check, "evidence", "{e:?}");
+    assert!(
+        lf::calls(&w).is_empty(),
+        "nothing asked of hc on unreadable evidence"
+    );
+    assert!(gens::read(&m, 0, "notice").known().unwrap().is_none());
+    w.fakes.hc_done().unwrap();
 }
 #[test]
 fn stop_uses_hc_only() {
@@ -57,6 +210,10 @@ fn stop_uses_hc_only() {
                 cf::get(&w, "taaaaaaaaaaaa", fact);
             }
             let got = call(&w).unwrap();
+            assert!(
+                !w.folder(ID).join("gens").exists(),
+                "{mode}: a pre-lifecycle stop writes no generation file"
+            );
             let mut cli = serde_json::Map::new();
             cli.insert("ok".into(), json!(true));
             cli.insert("verb".into(), json!("stop"));
@@ -331,35 +488,24 @@ fn stop_resolves_reused_name_beyond_board_history_limit() {
 }
 
 // #137: `stop` replies once the member's recorded client has exited, so a `resume` right after it is not refused
-// `session`. The wait is bounded and polls on the injected clock, after every lock is released.
+// `session`. The wait is bounded and polls on the injected clock, after every lock is released. Checklist 4: a
+// lifecycle member is seeded as group B builds it (claim `run`, `launch.json`, commit) and stopped through B1's
+// merged `terminate` sequence; it answers at `t0`.
 fn stopping(w: &World, lifecycle: bool) {
-    let r = cf::member(
-        w,
-        ID,
-        if lifecycle {
-            json!({"lifecycle": 1})
-        } else {
-            json!({})
-        },
-    );
     if lifecycle {
-        // A3a: a lifecycle member is targeted only through its active generation's committed evidence, seeded as
-        // member_target_tests' `a_lifecycle_target_is_its_active_generation_read_once` does.
-        use crate::state::evidence::publish;
-        let f = w.folder(ID);
-        publish(
-            &super::gens::path(&f, 0, "commit"),
-            &json!({"committed": true}),
-        )
-        .unwrap();
-        publish(
-            &super::gens::path(&f, 0, "client"),
+        let m = lf::life(w, at0());
+        lf::seed_gen(&m, 0, Some("run"), lf::committed());
+        crate::state::evidence::publish(
+            &gens::path(&m, 0, "client"),
             &json!({"pid": 150, "start": 1500}),
         )
         .unwrap();
-    } else {
-        cf::proven(w, ID, 31337, 150);
+        w.fakes.process(crate::testing::row(150, 31337, 1500));
+        kills(w, 0, true);
+        return;
     }
+    let r = cf::member(w, ID, json!({}));
+    cf::proven(w, ID, 31337, 150);
     w.fakes.process(crate::testing::row(150, 31337, 1500));
     cf::online(w);
     cf::answer(w, &["kill", "taaaaaaaaaaaa", "--json"], "{}");
@@ -367,6 +513,11 @@ fn stopping(w: &World, lifecycle: bool) {
     t["state"] = json!("finished");
     t["reason"] = json!("killed");
     cf::get(w, "taaaaaaaaaaaa", t);
+}
+
+/// The address `stopping` answers at.
+fn stopped_at(lifecycle: bool) -> &'static str {
+    if lifecycle { "t0" } else { "taaaaaaaaaaaa" }
 }
 
 #[test]
@@ -392,8 +543,10 @@ fn stop_replies_once_the_recorded_client_has_exited() {
             }
         });
         let got = Value::Object(call(&w).unwrap()).to_string();
+        let at = stopped_at(lifecycle);
         assert_eq!(
-            got, r#"{"name":"worker","hcAddress":"taaaaaaaaaaaa","life":"ended"}"#,
+            got,
+            format!(r#"{{"name":"worker","hcAddress":"{at}","life":"ended"}}"#),
             "lifecycle {lifecycle}"
         );
         assert_eq!(w.fakes.slept(), [250, 250], "lifecycle {lifecycle}");
@@ -410,6 +563,7 @@ fn stop_past_the_bound_still_replies_ok_with_client_exited_false() {
     assert_eq!(got["life"], json!("ended"));
     let slept: u64 = w.fakes.slept().iter().sum();
     assert_eq!(slept, 8000);
+    w.fakes.hc_done().unwrap();
     // A client that reappears under its pid with another start is not the recorded one: it has exited.
     let w = World::human("");
     stopping(&w, false);
@@ -417,6 +571,7 @@ fn stop_past_the_bound_still_replies_ok_with_client_exited_false() {
     w.fakes.process(crate::testing::row(150, 1, 9999));
     let got = call(&w).unwrap();
     assert_eq!((got.get("clientExited"), w.fakes.slept()), (None, vec![]));
+    w.fakes.hc_done().unwrap();
 }
 
 #[test]
@@ -428,6 +583,7 @@ fn stop_with_an_unreadable_process_table_waits_out_the_bound() {
     let got = call(&w).unwrap();
     assert_eq!(got["clientExited"], json!(false));
     assert_eq!(w.fakes.slept().iter().sum::<u64>(), 8000);
+    w.fakes.hc_done().unwrap();
 }
 
 // Call 9: the recorded client is read as typed evidence. Unreadable evidence (torn JSON, a folder in its place) cannot
@@ -531,39 +687,24 @@ fn stop_waits_out_the_bound_for_a_row_with_an_unknown_start() {
     w.fakes.hc_done().unwrap();
 }
 
-// A held identity (A3a R4): a pending generation not yet done is the one `stop` targets and kills, so its client, not
-// the active generation's, is the one `stop` waits for.
+// A held identity (A3a R4): a pending generation not yet done is the one `stop` targets and terminates, so its
+// client, not the active generation's, is the one `stop` waits for. Checklist 4: group B's seeding and B1's merged
+// `terminate` of pending 1 at `t1`.
 #[test]
 fn stop_of_a_held_generation_waits_for_that_generations_client() {
-    use crate::state::evidence::publish;
     let w = World::human("");
-    let mut r = cf::member(&w, ID, json!({"lifecycle": 1}));
-    let f = w.folder(ID);
-    r["pending"] = json!({"gen": 1, "hcName": "m4567cdef", "sessionId": "11111111-2222-4333-8444-555555555555",
-        "hcAddress": "t9"});
-    super::fixture::write(&f.join("record.json"), r.clone());
-    publish(
-        &super::gens::path(&f, 0, "commit"),
-        &json!({"committed": true}),
-    )
-    .unwrap();
-    publish(
-        &super::gens::path(&f, 1, "commit"),
-        &json!({"committed": true}),
-    )
-    .unwrap();
-    publish(
-        &super::gens::path(&f, 1, "client"),
+    let mut fields = at0();
+    fields["pending"] = lf::pending(1);
+    let m = lf::life(&w, fields);
+    lf::seed_gen(&m, 0, Some("run"), lf::committed());
+    lf::seed_gen(&m, 1, Some("run"), lf::committed());
+    crate::state::evidence::publish(
+        &gens::path(&m, 1, "client"),
         &json!({"pid": 160, "start": 1600}),
     )
     .unwrap();
     w.fakes.process(crate::testing::row(160, 31337, 1600));
-    cf::online(&w);
-    cf::answer(&w, &["kill", "t9", "--json"], "{}");
-    let mut t = cf::wire(&r);
-    (t["address"], t["labels"]["mux.gen"]) = (json!("t9"), json!("1"));
-    (t["state"], t["reason"]) = (json!("finished"), json!("killed"));
-    cf::get(&w, "t9", t);
+    kills(&w, 1, true);
     let f2 = w.fakes.clone();
     w.fakes.sleep_probe(move |n| {
         if n == 2 {
@@ -577,7 +718,7 @@ fn stop_of_a_held_generation_waits_for_that_generations_client() {
             got.get("clientExited"),
             w.fakes.slept()
         ),
-        (Some(&json!("t9")), None, vec![250, 250])
+        (Some(&json!("t1")), None, vec![250, 250])
     );
     w.fakes.hc_done().unwrap();
 }

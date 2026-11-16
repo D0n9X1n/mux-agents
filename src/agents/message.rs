@@ -10,7 +10,7 @@ use super::mail::{add_mail, doing_line, message_text};
 use super::registry::{self, Notice, add_notice, self_of};
 use super::view::first;
 use super::{FILES_ONLY, lock, lock_key, pane_id, server_dir, text, usage};
-use crate::caller::{Kind, resolve};
+use crate::caller::{Caller, Kind, resolve};
 use crate::cli::Request;
 use crate::ctx::Ctx;
 use crate::error::{Res, refuse};
@@ -936,31 +936,13 @@ pub fn stop_hc(ctx: &Ctx, request: &Request) -> Res<Map<String, Value>> {
     let caller = crate::caller::resolve_tree(ctx)?;
     let (mut reply, client) = super::tree::with_standing(ctx, &caller, |standing| {
         let id = super::member_target::named(ctx, &caller, first(request))?;
-        registry::with_member_notice(ctx, &caller, &id.id, || {
-            let record = super::member_target::current(ctx, &caller, &id)?;
-            match standing {
-                Some(s) => super::tree::authority(ctx, &caller, s, &id.id, "stop")?,
-                None => parent_or_human(&caller, &record)?,
-            }
-            let core = crate::hc::connect(ctx)?;
-            core.kill(&id.address)?;
-            let fact = core.get(&id.address).ok().filter(|t| id.matches(t));
-            use super::lifecycle::{Life, classify};
-            let life = match classify(fact.as_ref(), &id.launcher) {
-                Life::Running => "running",
-                Life::Lost => "lost",
-                Life::Ended => "ended",
-                Life::Unknown => "unknown",
-            };
-            add_notice(ctx, &caller, &id.id, &record, Notice::Stopped)?;
-            let member = server_dir(ctx, &caller).join("agents").join(&id.id);
-            let client = recorded_client(&member, &record, &id.generation);
-            let mut reply = Map::new();
-            reply.insert("name".into(), id.name.clone().into());
-            reply.insert("hcAddress".into(), id.address.clone().into());
-            reply.insert("life".into(), life.into());
-            Ok((reply, client))
-        })
+        let folder = server_dir(ctx, &caller).join("agents").join(&id.id);
+        // Dispatch only: `stop_life` revalidates through `current` (R1). An unreadable record goes to `stop_pre`,
+        // whose `current` refuses it.
+        match super::gens::member_of(&folder) {
+            super::gens::Member::Life(_) => stop_life(ctx, &caller, standing, &id),
+            _ => stop_pre(ctx, &caller, standing, &id),
+        }
     })?;
     let exited = match client {
         Recorded::Absent => true,
@@ -971,6 +953,84 @@ pub fn stop_hc(ctx: &Ctx, request: &Request) -> Res<Map<String, Value>> {
         reply.insert("clientExited".into(), false.into());
     }
     Ok(reply)
+}
+
+/// PM calls 9, 11, P1: a lifecycle member is stopped by ending generation n, the generation of the identity
+/// `current` revalidated, through group B's `gens::terminate` (D3: a Lost generation is released, never killed), then
+/// the Stopped notice of n. Unresolved: the error is returned and nothing is noticed.
+fn stop_life(
+    ctx: &Ctx,
+    caller: &Caller,
+    standing: Option<&super::tree::Standing>,
+    id: &super::core_identity::Identity,
+) -> Res<(Map<String, Value>, Recorded)> {
+    let record = super::member_target::current(ctx, caller, id)?;
+    match standing {
+        Some(s) => super::tree::authority(ctx, caller, s, &id.id, "stop")?,
+        None => parent_or_human(caller, &record)?,
+    }
+    let n = super::gens::plain_gen(&id.generation)
+        .ok_or_else(|| crate::error::Refusal::internal("invalid stopped generation"))?;
+    let scope = super::team_state::Scope::of(caller);
+    let end = |tx: &super::team_state::Tx<'_>| super::gens::terminate(tx, &id.id, n);
+    // Inside a tree `with_standing` holds the session spawn lock, which is the team lock (state-0 S1).
+    match standing {
+        Some(_) => super::team_state::held(ctx, &scope, end)?,
+        None => super::team_state::open(ctx, &scope, end)?,
+    }
+    // Lock order (state-0 S9): the team lock taken here and the member lock `terminate`'s record write takes are
+    // released before the notice lock.
+    let folder = server_dir(ctx, caller).join("agents").join(&id.id);
+    let life = if super::gens::read(&folder, n, "ended").known()?.is_some() {
+        "ended"
+    } else if super::gens::read(&folder, n, "release").known()?.is_some() {
+        "lost"
+    } else {
+        "unknown"
+    };
+    registry::with_member_notice(ctx, caller, &id.id, || {
+        registry::add_notice_gen(ctx, caller, &id.id, &record, n, Notice::Stopped)
+    })?;
+    let client = recorded_client(&folder, &record, &id.generation);
+    let mut reply = Map::new();
+    reply.insert("name".into(), id.name.clone().into());
+    reply.insert("hcAddress".into(), id.address.clone().into());
+    reply.insert("life".into(), life.into());
+    Ok((reply, client))
+}
+
+/// A pre-lifecycle member: main's stop, unchanged (kill the recorded address, classify, notice).
+fn stop_pre(
+    ctx: &Ctx,
+    caller: &Caller,
+    standing: Option<&super::tree::Standing>,
+    id: &super::core_identity::Identity,
+) -> Res<(Map<String, Value>, Recorded)> {
+    registry::with_member_notice(ctx, caller, &id.id, || {
+        let record = super::member_target::current(ctx, caller, id)?;
+        match standing {
+            Some(s) => super::tree::authority(ctx, caller, s, &id.id, "stop")?,
+            None => parent_or_human(caller, &record)?,
+        }
+        let core = crate::hc::connect(ctx)?;
+        core.kill(&id.address)?;
+        let fact = core.get(&id.address).ok().filter(|t| id.matches(t));
+        use super::lifecycle::{Life, classify};
+        let life = match classify(fact.as_ref(), &id.launcher) {
+            Life::Running => "running",
+            Life::Lost => "lost",
+            Life::Ended => "ended",
+            Life::Unknown => "unknown",
+        };
+        add_notice(ctx, caller, &id.id, &record, Notice::Stopped)?;
+        let member = server_dir(ctx, caller).join("agents").join(&id.id);
+        let client = recorded_client(&member, &record, &id.generation);
+        let mut reply = Map::new();
+        reply.insert("name".into(), id.name.clone().into());
+        reply.insert("hcAddress".into(), id.address.clone().into());
+        reply.insert("life".into(), life.into());
+        Ok((reply, client))
+    })
 }
 
 #[cfg(test)]
