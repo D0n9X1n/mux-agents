@@ -847,3 +847,48 @@ fn a_forgotten_terminal_posts_only_from_a_flushed_end() {
     assert!(gens::path(&f, 1, "notice").exists());
     w.fakes.hc_done().unwrap();
 }
+
+// Call 50 (QA #142): a notice is posted only from an end whose flushes succeed. `publish_end`'s gens/1 folder flush
+// fails, so `ended.json` is visible but not durable; with the fault still armed `add_notice` mails nothing and writes
+// no notice; cleared, it posts once.
+#[test]
+fn a_notice_waits_for_a_flushed_end() {
+    use crate::agents::{gens, life_fixture as lf};
+    let w = World::human("");
+    let c = w.caller();
+    let r = cf::member(
+        &w,
+        ID,
+        json!({"lifecycle": 1, "generation": "1", "hcName": lf::hc_name(1)}),
+    );
+    let f = w.folder(ID);
+    let launch = json!({"hcName": lf::hc_name(1), "launcherArgv": r["launcherArgv"],
+        "sessionId": r["sessionId"]});
+    crate::state::evidence::publish(&gens::path(&f, 1, "launch"), &launch).unwrap();
+    crate::state::evidence::publish(&gens::path(&f, 1, "commit"), &json!({"committed": true}))
+        .unwrap();
+    let facts = json!({"address": r["hcAddress"], "hcName": lf::hc_name(1), "state": "finished",
+        "reason": "exited", "exitCode": 7, "at": "x"});
+    crate::state::fs::fail_sync_dir(Some(&gens::dir(&f, 1)));
+    let end = gens::publish_end(&f, 1, &facts).map_err(|e| (e.check, e.message));
+    assert_eq!(end, Err(("state", gens::NOT_FLUSHED.to_string())));
+    assert!(gens::path(&f, 1, "ended").exists(), "ended.json visible");
+    let post = || {
+        crate::agents::lock(&w.ctx, &crate::agents::lock_key("notice", &c, ID), || {
+            add_notice(&w.ctx, &c, ID, &r, Notice::Exited(json!(7)))
+        })
+    };
+    let armed = post();
+    crate::state::fs::fail_sync_dir(None);
+    assert_eq!(
+        armed.map_err(|e| e.check),
+        Ok(false),
+        "posted from an unflushed end"
+    );
+    assert!(messages(&w).is_empty(), "mail from an unflushed end");
+    assert!(!gens::path(&f, 1, "notice").exists());
+    assert!(post().unwrap(), "the retry posts");
+    assert_eq!(messages(&w).len(), 1, "one notice");
+    assert!(gens::path(&f, 1, "notice").exists());
+    w.fakes.hc_done().unwrap();
+}

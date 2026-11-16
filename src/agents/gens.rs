@@ -381,13 +381,20 @@ pub fn marks(member: &Path, n: u64) -> Res<Marks> {
 }
 
 /// R1 (b-calls 32): `marks` with generation n's `ended.json` taken as already read Present when `ended == Some(n)`;
-/// every other file is read once, in `marks`' order.
+/// every other file is read once, in `marks`' order. Call 50: `ended.json` and `released.json` are read through
+/// `read_flushed`, so a visible marker whose flushes fail is not a mark (the generation is not done); other refusals
+/// stand.
 pub fn marks_given(member: &Path, n: u64, ended: Option<u64>) -> Res<Marks> {
+    let durable = |file: &str| match read_flushed(member, n, file) {
+        Ok(found) => Ok(found.is_some()),
+        Err(e) if e.check == "state" && e.message == NOT_FLUSHED => Ok(false),
+        Err(e) => Err(e),
+    };
     Ok(Marks {
         abandoned: claim(member, n).known()?.is_some_and(|c| c == "abandoned"),
         decision: read(member, n, "commit").known()?.map(|c| decide(&c)),
-        ended: ended == Some(n) || read(member, n, "ended").known()?.is_some(),
-        released: read(member, n, "released").known()?.is_some(),
+        ended: ended == Some(n) || durable("ended")?,
+        released: durable("released")?,
     })
 }
 

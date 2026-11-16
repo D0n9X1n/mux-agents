@@ -1812,6 +1812,56 @@ mod tests {
         assert!(!gens::dir(&f, 2).exists(), "no generation mixed in");
     }
 
+    // Call 50 (QA #142): a released generation frees its name only once `released.json`'s flushes succeed. With the
+    // gens/1 folder flush failing, `spawn -Name worker` is refused and runs nothing; cleared, it admits the name once.
+    #[test]
+    fn an_unflushed_release_keeps_the_name() {
+        use crate::agents::{core_fixture as cf, fixture::ID, gens, life_fixture as lf};
+        let w = human();
+        let r = cf::member(
+            &w,
+            ID,
+            json!({"lifecycle": 1, "generation": "1", "hcName": lf::hc_name(1)}),
+        );
+        let f = w.folder(ID);
+        let launch = json!({"hcName": lf::hc_name(1), "launcherArgv": r["launcherArgv"],
+            "sessionId": r["sessionId"]});
+        crate::state::evidence::publish(&gens::path(&f, 1, "launch"), &launch).unwrap();
+        crate::state::evidence::publish(&gens::path(&f, 1, "commit"), &json!({"committed": true}))
+            .unwrap();
+        let rel = json!({"address": r["hcAddress"], "hcName": lf::hc_name(1), "cause": "lost", "at": "x"});
+        gens::publish_once(&f, 1, "release", &rel).unwrap();
+        gens::publish_once(&f, 1, "released", &json!({"at": "x"})).unwrap();
+        let kept = json!({"address": r["hcAddress"], "name": lf::hc_name(1), "state": "live",
+            "argv": ["/bin/sh"], "labels": {"mux.kept": r["team"], "mux.keptName": "worker"}});
+        let args = [
+            "spawn", "-Client", "claude", "-Task", "Worker", "-Name", "worker",
+        ];
+        let runs = |w: &World| {
+            w.fakes
+                .hc_calls()
+                .iter()
+                .filter(|(_, a, _)| a[0] == "run")
+                .count()
+        };
+        public_snapshot(&w, &[], std::slice::from_ref(&kept));
+        crate::state::fs::fail_sync_dir(Some(&gens::dir(&f, 1)));
+        let armed = spawn(&w.ctx, &w.request(&args)).map_err(|e| e.message);
+        crate::state::fs::fail_sync_dir(None);
+        assert_eq!(
+            armed.map(|_| ()),
+            Err("agent name is taken, try worker-2".to_string())
+        );
+        assert_eq!(runs(&w), 0, "hc run under an unflushed release");
+        w.fakes.hc_done().unwrap();
+        public_snapshot(&w, &[], std::slice::from_ref(&kept));
+        public_launch(&w, "t1");
+        let ok = spawn(&w.ctx, &w.request(&args)).unwrap();
+        assert_eq!(ok["name"], "worker");
+        assert_eq!(runs(&w), 1, "one hc run");
+        w.fakes.hc_done().unwrap();
+    }
+
     #[test]
     fn an_unreadable_record_refuses_rather_than_reuse_a_name() {
         use crate::agents::core_fixture as cf;
