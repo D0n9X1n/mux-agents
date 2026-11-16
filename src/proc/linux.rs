@@ -70,7 +70,11 @@ impl Os for Linux {
     }
 
     fn client_of(&self, row: &Row) -> Option<Client> {
-        parse::unix_client(
+        self.client_known(row).flatten()
+    }
+
+    fn client_known(&self, row: &Row) -> Option<Option<Client>> {
+        parse::unix_client_known(
             row.path.as_deref(),
             row.argv.as_deref(),
             || self.cwd(row.pid),

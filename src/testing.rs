@@ -61,6 +61,8 @@ struct Log {
     now_ms: u64,
     clients: HashMap<u32, Client>,
     shells: Vec<u32>,
+    // o3 call 34 N2: pids whose client identity `client_known` answers as unknown.
+    unknown: Vec<u32>,
     cwds: HashMap<u32, String>,
     // Starts `open` answers in turn (none: unreadable) before it falls back to the row's own.
     opens: HashMap<u32, VecDeque<Option<i64>>>,
@@ -308,6 +310,11 @@ impl Fakes {
     /// The client `client_of` names for this pid.
     pub fn client(&self, pid: u32, client: Client) {
         self.0.borrow_mut().clients.insert(pid, client);
+    }
+
+    /// o3 call 34 N2: `client_known` answers unknown for `pid` (its client identity cannot be resolved).
+    pub fn client_unknown(&self, pid: u32) {
+        self.0.borrow_mut().unknown.push(pid);
     }
 
     /// A pid `is_shell` answers true for.
@@ -573,6 +580,11 @@ impl Os for Fakes {
     fn client_of(&self, row: &Row) -> Option<Client> {
         self.os_call(format!("client_of {}", row.pid));
         self.0.borrow().clients.get(&row.pid).copied()
+    }
+
+    fn client_known(&self, row: &Row) -> Option<Option<Client>> {
+        let unknown = self.0.borrow().unknown.contains(&row.pid);
+        (!unknown).then(|| self.client_of(row))
     }
 
     fn is_shell(&self, row: &Row) -> bool {

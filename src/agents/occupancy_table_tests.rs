@@ -440,3 +440,28 @@ fn client_image_by_os() {
         assert!(!client_image(image, kind, os), "{image} {os:?} {kind:?}");
     }
 }
+
+// o3 call 34 N2: a readable `node` whose client identity cannot be resolved (its script's realpath or its cwd
+// unreadable) is unknown: unbound, judged by its image (`node` may be Copilot). A resolved unrelated node holds nothing.
+#[test]
+fn an_unresolved_node_holds_copilot_by_its_image() {
+    let node = |w: &World| {
+        w.fakes.process(row(
+            Some(1),
+            Some("/usr/bin/node"),
+            Some(&["node", "app.js"]),
+            Some("node"),
+        ))
+    };
+    let w = World::human("");
+    node(&w);
+    assert_eq!(held(&w, X, Client::Copilot), None, "resolved: not a client");
+    let w = World::human("");
+    node(&w);
+    w.fakes.client_unknown(7001);
+    assert_eq!(
+        held(&w, X, Client::Copilot),
+        Some((Rule::Unbound, Some(7001)))
+    );
+    assert_eq!(held(&w, X, Client::Claude), None, "node is no Claude image");
+}

@@ -74,6 +74,11 @@ pub trait Os {
     fn kill(&self, opened: Opened) -> bool;
     fn cwd(&self, pid: u32) -> Option<String>;
     fn client_of(&self, row: &Row) -> Option<Client>;
+    /// o3 call 34 N2: `client_of` with "unknown" (None: its identity cannot be resolved) told apart from "no client"
+    /// (Some(None)).
+    fn client_known(&self, row: &Row) -> Option<Option<Client>> {
+        Some(self.client_of(row))
+    }
     fn is_shell(&self, row: &Row) -> bool;
     fn same_start(&self, opened: i64, listed: i64) -> bool;
     fn token(&self) -> Option<Token>;

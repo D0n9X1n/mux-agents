@@ -16,10 +16,13 @@ pub fn holds(
     {
         return Some(Hold::of(Rule::Argv, row));
     }
-    if os_calls.client_of(row) == Some(kind) {
+    // o3 call 34 N2: a client identity that cannot be resolved is unbound too, judged by its image.
+    let known = os_calls.client_known(row);
+    if known == Some(Some(kind)) {
         return Some(Hold::of(Rule::Unmanaged, row));
     }
-    let unbound = row.start.is_none() || row.path.is_none() || row.argv.is_none();
+    let unbound =
+        known.is_none() || row.start.is_none() || row.path.is_none() || row.argv.is_none();
     let cleared = row
         .image
         .as_deref()
