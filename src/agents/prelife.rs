@@ -38,9 +38,47 @@ pub(crate) fn not_running(name: &str) -> Refusal {
 }
 
 /// G10d: a pre-lifecycle member never resumes.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn pre_lifecycle(name: &str) -> Refusal {
     refusal("state", format!("{name} {PRE_LIFECYCLE}"))
+}
+
+/// G10d, calls 16, 20: refuses `resume <target>` of a pre-lifecycle member from `record.json` alone, before any hc
+/// call or snapshot. An exact id decides first, over every member: a pre-lifecycle folder of the caller's session
+/// with that id is refused, a lifecycle one passes. Else by name: refused when a same-session pre-lifecycle record
+/// has the name and no lifecycle record does (a lifecycle twin goes on to `admit`, which checks the subject it
+/// selects). Another session's records, absent and unreadable folders are left to the snapshot.
+pub(crate) fn refuse_resume(ctx: &crate::ctx::Ctx, caller: &Caller, target: &str) -> Res<()> {
+    use crate::agents::gens::Member;
+    let agents = crate::agents::server_dir(ctx, caller).join("agents");
+    let mut mine = Vec::new();
+    for (id, _, member) in gens::members(&agents)? {
+        let (record, life) = match member {
+            Member::Pre(r) => (r, false),
+            Member::Life(g) => (g.record().clone(), true),
+            Member::Absent | Member::Unreadable(_) => continue,
+        };
+        let other = record.get("session").and_then(Value::as_str);
+        if other.is_some_and(|s| s != caller.session) {
+            continue;
+        }
+        mine.push((id, record, life));
+    }
+    let name = |r: &Value| r.get("name").and_then(Value::as_str).map(str::to_owned);
+    if let Some((id, record, life)) = mine.iter().find(|(id, _, _)| id == target) {
+        return match life {
+            true => Ok(()),
+            false => Err(pre_lifecycle(&name(record).unwrap_or_else(|| id.clone()))),
+        };
+    }
+    let named: Vec<bool> = mine
+        .iter()
+        .filter(|(_, r, _)| name(r).as_deref() == Some(target))
+        .map(|(_, _, life)| *life)
+        .collect();
+    match named.is_empty() || named.contains(&true) {
+        true => Ok(()),
+        false => Err(pre_lifecycle(target)),
+    }
 }
 
 /// G10a: the folder notice, read through the walk from the state root, is whole and its kind is in `ENDED_KINDS`.
