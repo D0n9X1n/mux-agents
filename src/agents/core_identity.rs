@@ -48,6 +48,16 @@ pub fn attach_program(command: &str, address: &str, os: OsKind) -> Option<String
         return None;
     }
     let quotes: &[char] = if unix { &['"', '\''] } else { &['"'] };
+    // #150: rmux renders the whole argv in one pair of double quotes. Its inside, holding no quote, is read as the
+    // bare form; anything else falls through to the forms below, which refuse it.
+    if let Some(inner) = command
+        .strip_prefix('"')
+        .and_then(|c| c.strip_suffix('"'))
+        .filter(|i| !i.contains(quotes))
+        && !inner.is_empty()
+    {
+        return attach_program(inner, address, os);
+    }
     let first = command.chars().next()?;
     let (program, tail) = if quotes.contains(&first) {
         let end = 1 + command[1..].find(first)?;
@@ -393,6 +403,38 @@ pub(crate) mod tests {
     // program from `[A-Za-z0-9_./:+-]` (and `\` on Windows) not starting with `-`; a quoted one (platform quotes) adds
     // the space; the address one unquoted token from `[A-Za-z0-9_.:-]`, then the end. The program's file name is an hc
     // install name (`hc`, `herdr-core`), any path. Everything else is "not an attach".
+    // #150 live (rmux): rmux 0.10.0 renders `#{pane_start_command}` as the whole argv in one pair of double quotes
+    // (`"/x/herdr-core attach t1"`), where tmux renders the argv bare. That one quoted token is an attach exactly when
+    // its inside, with no quote of its own, is the bare form. A space-holding program inside it is not (fail closed).
+    #[test]
+    fn attach_program_reads_a_wholly_quoted_attach() {
+        use crate::state::root::OsKind::{Unix, Windows};
+        let some = |p: &str| Some(p.to_string());
+        for (os, command, want) in [
+            (Unix, r#""/x/herdr-core attach t1""#, some("/x/herdr-core")),
+            (Unix, r#""hc attach t1""#, some("hc")),
+            (
+                Windows,
+                r#""C:\hc\herdr-core.exe attach t1""#,
+                some(r"C:\hc\herdr-core.exe"),
+            ),
+            (Unix, r#""/opt/my hc/hc attach t1""#, None),
+            (Unix, r#""hc attach t1" x"#, None),
+            (Unix, r#""hc attach "t1""#, None),
+            (Unix, r#""'hc' attach t1""#, None),
+            (Unix, r#""hc attach t2""#, None),
+            (Unix, r#""/x/other attach t1""#, None),
+            (Unix, r#""""#, None),
+            (Windows, r#""C:\Program Files\hc\hc.exe attach t1""#, None),
+        ] {
+            assert_eq!(
+                attach_program(command, "t1", os),
+                want,
+                "{os:?} {command:?}"
+            );
+        }
+    }
+
     #[test]
     fn attach_program_recognizes_only_an_hc_attach() {
         use crate::state::root::OsKind::{Unix, Windows};
