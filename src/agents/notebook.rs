@@ -4,16 +4,24 @@
 use std::io::{Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 
 use super::team_state::{Scope, Tx};
+use super::tree::Standing;
 use crate::caller::Caller;
+use crate::cli::Request;
+use crate::ctx::Ctx;
 use crate::error::{Refusal, Res};
 use crate::state::evidence;
-use crate::state::fs::{sync_dir, sync_file, write_json_durable};
+use crate::state::fs::{read_text, sync_dir, sync_file, write_json_durable};
 
 pub const LOG: &str = "notebook.jsonl";
 pub const STATE: &str = "notebook.state.json";
+pub const TITLE_MAX: usize = 80;
+pub const BODY_LIMIT: usize = 4096;
+/// PM call 7: the `-BodyFile` read bound, never the refusal a body within `BODY_LIMIT` sees (CRLF doubles it, a
+/// BOM adds 3).
+pub const RAW_MAX: u64 = 4 * BODY_LIMIT as u64 + 3;
 
 /// `<root>/<key>/teams/<sha16(session)>/notes` (ambiguity 1).
 pub fn dir(root: &Path, scope: &Scope) -> PathBuf {
@@ -286,6 +294,77 @@ pub fn entries(tx: &Tx<'_>) -> Res<Vec<Value>> {
     Ok(parse(&log, durable))
 }
 
+/// N1, ambiguity 2: a person is `person`; a member its record name, its id and its logical mailbox key.
+pub fn author_of(standing: &Standing) -> Author {
+    match standing {
+        Standing::Person => Author {
+            name: "person".into(),
+            id: None,
+            key: "person".into(),
+        },
+        Standing::Member(m) => Author {
+            name: super::text(m.record.get("name")),
+            id: Some(m.id.clone()),
+            key: super::mail::member_mailbox(&m.id, &m.record),
+        },
+    }
+}
+
+/// N3, ambiguity 7: under the team lock (`with_standing`, phase 3 D1), the proven caller as author and the anchor
+/// scope's `Tx` (replay hooks first). Outside a team: 2 `team`.
+fn with_author<T>(ctx: &Ctx, f: impl FnOnce(&Tx<'_>, &Author) -> Res<T>) -> Res<T> {
+    let caller = crate::caller::resolve_tree(ctx)?;
+    super::tree::with_standing(ctx, &caller, |standing| {
+        let Some(standing) = standing else {
+            return Err(refusal(2, "team", "the notebook belongs to a team"));
+        };
+        let author = author_of(standing);
+        super::team_state::held(ctx, &anchor(&caller), |tx| f(tx, &author))
+    })
+}
+
+/// `-Id`/`-Since`/`notes <id>`: 8-32 lowercase hex digits.
+fn hex_id(v: &str) -> bool {
+    (8..=32).contains(&v.len()) && v.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+/// `note -Title <t> (-Body <text> | -BodyFile <p>) [-Id <id>]` (N3; ambiguity 3: every limit is 2 `usage`).
+pub fn note(ctx: &Ctx, request: &Request) -> Res<Map<String, Value>> {
+    let usage = || super::usage("note");
+    let title = super::mail::message_text(request.value("Title").unwrap_or_default());
+    let (body, file, id) = (
+        request.value("Body"),
+        request.value("BodyFile"),
+        request.value("Id"),
+    );
+    if title.is_empty()
+        || title.contains('\n')
+        || title.chars().count() > TITLE_MAX
+        || body.is_some() == file.is_some()
+        || id.is_some_and(|i| !hex_id(i))
+    {
+        return Err(usage());
+    }
+    let body = match (body, file) {
+        (Some(b), _) => b.to_string(),
+        // PM call 7: `RAW_MAX` bounds only the raw read (BOM and CRLF included); the limit applies below.
+        (None, f) => read_text(&ctx.cwd.join(f.unwrap_or_default()), RAW_MAX)?,
+    };
+    let body = super::mail::message_text(&body);
+    if body.len() > BODY_LIMIT {
+        return Err(usage());
+    }
+    let (entry, duplicate) =
+        match with_author(ctx, |tx, author| append(tx, author, &title, &body, id))? {
+            Wrote::Added(e) => (e, false),
+            Wrote::Found(e) => (e, true),
+        };
+    let mut reply = Map::new();
+    reply.insert("id".into(), entry["id"].clone());
+    reply.insert("duplicate".into(), duplicate.into());
+    Ok(reply)
+}
+
 #[cfg(test)]
 #[path = "notebook_tests.rs"]
 mod tests;
@@ -297,3 +376,7 @@ mod fault_tests;
 #[cfg(test)]
 #[path = "notebook_rebuild_tests.rs"]
 mod rebuild_tests;
+
+#[cfg(test)]
+#[path = "notebook_verb_tests.rs"]
+mod verb_tests;
