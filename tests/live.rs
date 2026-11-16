@@ -4255,14 +4255,21 @@ hc {}:
         let pc = live.server.core.as_mut().unwrap();
         assert!(pc.stop(), "{mux:?}: core stop");
         pc.start();
-        let (started, mut last) = (Instant::now(), Value::Null);
+        // Call 43: wait on the product's own classification (`list -All` row `life`, from `lifecycle::classify`),
+        // not on one OS's recovery argv; on a timeout report the terminal hc shows and the last list.
+        let (started, mut last, mut rows) = (Instant::now(), Value::Null, Value::Null);
         let lost = eventually(LONG, || {
             last = core(&live, &["get", &address, "--json"]);
-            last["argv"][1] == "-l"
+            rows = live.run(&["list", "-All"]).1;
+            rows["agents"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .any(|r| r["id"] == json!(id) && r["life"] == "lost")
         });
         assert!(
             lost,
-            "{mux:?}: Lost not seen after {:?}; last get: {last}",
+            "{mux:?}: Lost not seen after {:?}; last get: {last}; last list: {rows}",
             started.elapsed()
         );
         let (code, out) = live.run(&["__life", "release", &id, "0"]);

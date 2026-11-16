@@ -24,12 +24,17 @@ pub fn classify(fact: Option<&Terminal>, launcher: &[String]) -> Life {
     }
 }
 
-/// The shell hc's keep puts in place of a lost program: a POSIX login shell (`<shell> -l`), or on Windows PowerShell
-/// with hc's prompt hook (`<path>\pwsh.exe -NoExit -Command <hook>`, hc 0.1.21). Anything else is not proven lost.
+/// The shell hc's keep puts in place of a lost program: a POSIX login shell (`<shell> -l`, macOS), a bare POSIX
+/// shell (`<shell>`, Linux; call 43, observed `["/bin/sh"]`), or on Windows PowerShell with hc's prompt hook
+/// (`<path>\pwsh.exe -NoExit -Command <hook>`, hc 0.1.21). Anything else is not proven lost.
 fn recovery_shell(argv: &[String]) -> bool {
+    let posix = |shell: &str| {
+        ["sh", "bash", "zsh", "fish", "dash", "ksh"]
+            .contains(&shell.rsplit('/').next().unwrap_or(""))
+    };
     match argv {
-        [shell, flag] if flag == "-l" => ["sh", "bash", "zsh", "fish", "dash", "ksh"]
-            .contains(&shell.rsplit('/').next().unwrap_or("")),
+        [shell] => posix(shell),
+        [shell, flag] if flag == "-l" => posix(shell),
         [shell, no_exit, command, _hook] if no_exit == "-NoExit" && command == "-Command" => {
             let name = shell
                 .rsplit(['/', '\\'])
@@ -214,6 +219,43 @@ mod tests {
             assert_eq!(f.hc_calls().len(), 2);
             assert_eq!(f.hc_calls()[1].1, ["get", "t1", "--json"]);
         }
+        // Call 43: on Linux hc 0.1.21 keeps a lost program's terminal with a bare shell, no `-l` (observed in CI on
+        // rmux, tmux 3.2a and 3.8: `"argv":["/bin/sh"]`, live, `keep: true`, labels kept). Only a listed POSIX
+        // shell alone is Lost; a non-shell program or extra arguments are not, and the recorded launcher argv is
+        // Running first even when it is a bare shell.
+        let live = |argv: &[&str]| Terminal {
+            address: "t1".into(),
+            name: None,
+            state: State::Live,
+            reason: None,
+            exit_code: None,
+            argv: argv.iter().map(|s| s.to_string()).collect(),
+            foreground: None,
+            labels: Default::default(),
+            pid: None,
+        };
+        for (argv, want) in [
+            (&["/bin/sh"][..], Life::Lost),
+            (&["/usr/bin/bash"], Life::Lost),
+            (&["/bin/zsh"], Life::Lost),
+            (&["/usr/bin/fish"], Life::Lost),
+            (&["/bin/dash"], Life::Lost),
+            (&["/bin/ksh"], Life::Lost),
+            (&["/usr/bin/not-a-shell"], Life::Unknown),
+            (&["/bin/mux-agent"], Life::Unknown),
+            (&["/bin/sh", "extra"], Life::Unknown),
+            (&["/bin/sh", "-l", "extra"], Life::Unknown),
+            (&["/bin/sh", "-c", "x"], Life::Unknown),
+            (&[""], Life::Unknown),
+        ] {
+            assert_eq!(classify(Some(&live(argv)), &launcher), want, "{argv:?}");
+        }
+        let bare: Vec<String> = vec!["/bin/sh".into()];
+        assert_eq!(
+            classify(Some(&live(&["/bin/sh"])), &bare),
+            Life::Running,
+            "the recorded launcher argv is Running first"
+        );
         let live_with_empty_argv = Terminal {
             address: "t1".into(),
             name: None,
