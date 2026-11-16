@@ -1947,3 +1947,30 @@ fn a_resume_whose_view_fails_after_the_commit_keeps_the_successor() {
     );
     w.fakes.hc_done().unwrap();
 }
+
+// QA Q5 (call 31, M44): the kind comes from X's record. A Copilot subject is refused `session` while an unmanaged
+// Copilot client runs, whatever conversation it names (H4.4), and nothing launches.
+#[test]
+fn a_copilot_subject_is_held_by_an_unmanaged_copilot() {
+    let w = World::human("");
+    let x = member(
+        &w,
+        ID,
+        json!({"client": "copilot", "pane": "%5", "window": "@1", "depth": 1}),
+    );
+    w.panes(&[]);
+    process(&w, 7001, &["copilot", "--resume", OTHER_SESSION]);
+    w.fakes.client(7001, crate::parse::Client::Copilot);
+    facts(&w, &[(&x, "exited")]);
+    let before = folders(&w);
+    let e = resume_of(&w, ID).unwrap_err();
+    assert_eq!((e.code, e.check), (2, "session"), "{}", e.message);
+    assert!(
+        e.message
+            .starts_with("process 7001 (fixture) may hold that conversation: it is a client"),
+        "{}",
+        e.message
+    );
+    assert_eq!((folders(&w), runs(&w)), (before, 0));
+    w.fakes.hc_done().unwrap();
+}
