@@ -150,6 +150,7 @@ impl Mw {
             start: Some(1500),
             path: None,
             argv: Some(vec!["claude".into()]),
+            image: None,
         });
         self.w.fakes.process(crate::testing::row(31337, 1, 1000));
     }
@@ -311,6 +312,7 @@ fn row(pid: u32, ppid: u32, start: i64, path: &str, argv: &[&str]) -> Row {
         start: Some(start),
         path: Some(path.into()),
         argv: Some(argv.iter().map(|a| a.to_string()).collect()),
+        image: None,
     }
 }
 #[test]

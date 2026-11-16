@@ -110,6 +110,16 @@ fn argv(pid: u32, buf: &mut [u8]) -> Option<Vec<String>> {
     parse::procargs2(&buf[..size.min(buf.len())])
 }
 
+// proc_name: the process's p_name, which libproc answers for any listed pid without opening it.
+fn image(pid: u32) -> Option<String> {
+    let pid = c_int::try_from(pid).ok()?;
+    let mut buf = [0u8; 64];
+    // SAFETY: the buffer holds 64 writable bytes; the call writes at most that many.
+    let got = unsafe { libc::proc_name(pid, buf.as_mut_ptr().cast(), buf.len() as u32) };
+    let len = usize::try_from(got).ok().filter(|&n| n > 0)?;
+    String::from_utf8(buf.get(..len)?.to_vec()).ok()
+}
+
 // Start re-read last, so a pid reused between the reads gives no row rather than a mixed one.
 fn row_with(pid: u32, buf: &mut [u8]) -> Option<Row> {
     seam::read_row(
@@ -120,6 +130,7 @@ fn row_with(pid: u32, buf: &mut [u8]) -> Option<Row> {
         },
         path,
         |pid| argv(pid, buf),
+        image,
     )
 }
 
@@ -363,6 +374,13 @@ mod tests {
         let table = MacOs.table().unwrap();
         let mine = table.iter().find(|r| r.pid == me()).unwrap();
         assert_eq!(Some(mine), MacOs.row(me()).as_ref());
+        let exe = std::env::current_exe().unwrap();
+        let file = exe.file_name().unwrap().to_str().unwrap();
+        let image = mine.image.clone().unwrap();
+        assert!(
+            !image.is_empty() && file.starts_with(&image),
+            "{image} {file}"
+        );
         let parent = std::os::unix::process::parent_id();
         assert!(table.iter().any(|r| r.pid == parent));
         assert!(table.len() > 2);

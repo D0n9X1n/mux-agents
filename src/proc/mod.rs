@@ -22,6 +22,9 @@ pub struct Row {
     pub start: Option<i64>,
     pub path: Option<String>,
     pub argv: Option<Vec<String>>,
+    /// The name the OS lists without opening the process (Linux `comm`, macOS `proc_name`, Windows Toolhelp
+    /// `szExeFile`); none when unreadable, and always none from Windows `Os::row`, which has no snapshot (H1).
+    pub image: Option<String>,
 }
 
 #[cfg(unix)]

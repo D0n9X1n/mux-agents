@@ -608,6 +608,7 @@ pub fn row(pid: u32, ppid: u32, start: i64) -> Row {
         start: Some(start),
         path: None,
         argv: None,
+        image: Some("fixture".into()),
     }
 }
 

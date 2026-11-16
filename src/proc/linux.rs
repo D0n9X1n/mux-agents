@@ -23,6 +23,13 @@ fn argv(pid: u32) -> Option<Vec<String>> {
     parse::linux_cmdline(&std::fs::read(format!("/proc/{pid}/cmdline")).ok()?)
 }
 
+// /proc/<pid>/comm, readable for every process this user can list; one trailing newline is the kernel's.
+fn image(pid: u32) -> Option<String> {
+    let text = std::fs::read_to_string(format!("/proc/{pid}/comm")).ok()?;
+    let name = text.strip_suffix('\n').unwrap_or(&text);
+    (!name.is_empty()).then(|| name.to_string())
+}
+
 // (ppid, start) from /proc/<pid>/stat, which names its own pid; anything else is not this row.
 fn head(pid: u32) -> Option<(u32, i64)> {
     let stat = parse::linux_stat(&std::fs::read(format!("/proc/{pid}/stat")).ok()?)?;
@@ -32,7 +39,7 @@ fn head(pid: u32) -> Option<(u32, i64)> {
 impl Os for Linux {
     // Start re-read last, so a pid reused between the reads gives no row rather than a mixed one.
     fn row(&self, pid: u32) -> Option<Row> {
-        seam::read_row(pid, head, |pid| link(pid, "exe"), argv)
+        seam::read_row(pid, head, |pid| link(pid, "exe"), argv, image)
     }
 
     /// Every numeric /proc entry whose stat reads; one that exits mid-read is skipped.
@@ -153,6 +160,12 @@ mod tests {
         let table = Linux.table().unwrap();
         assert!(table.iter().any(|r| r.pid == me()));
         assert!(table.iter().any(|r| r.pid == row.ppid));
+        let comm = std::fs::read_to_string("/proc/self/comm").unwrap();
+        assert_eq!(row.image.as_deref(), Some(comm.strip_suffix('\n').unwrap()));
+        assert_eq!(
+            table.iter().find(|r| r.pid == me()).unwrap().image,
+            row.image
+        );
     }
 
     #[test]

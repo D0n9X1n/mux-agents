@@ -109,6 +109,7 @@ mod tests {
             start: Some(0),
             path: path.map(str::to_string),
             argv: None,
+            image: None,
         }
     }
 

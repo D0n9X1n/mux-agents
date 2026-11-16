@@ -19,16 +19,19 @@ pub trait ProcSource {
 
 /// One row whose fields all belong to one process. They are read by pid in separate calls, so the start is read
 /// again last: a pid reused in between shows another start (or none), and the row is unreadable. Only the start
-/// is compared; a parent that changed is a reparent, not reuse. `head` gives (ppid, start).
+/// is compared; a parent that changed is a reparent, not reuse. `head` gives (ppid, start). The image is read
+/// before the second start read too, so a reused pid cannot lend its name (H1).
 pub fn read_row(
     pid: u32,
     head: impl Fn(u32) -> Option<(u32, i64)>,
     path: impl FnOnce(u32) -> Option<String>,
     argv: impl FnOnce(u32) -> Option<Vec<String>>,
+    image: impl FnOnce(u32) -> Option<String>,
 ) -> Option<super::Row> {
     let (ppid, start) = head(pid)?;
     let path = path(pid);
     let argv = argv(pid);
+    let image = image(pid);
     let (_, again) = head(pid)?;
     (again == start).then_some(super::Row {
         pid,
@@ -36,6 +39,7 @@ pub fn read_row(
         start: Some(start),
         path,
         argv,
+        image,
     })
 }
 
@@ -159,7 +163,7 @@ mod tests {
         }
     }
 
-    // Head reads answer in turn; path and argv are the replacement's when the pid was reused in between.
+    // Head reads answer in turn; path, argv and image are the replacement's when the pid was reused in between.
     fn row_reads(heads: Vec<Option<(u32, i64)>>) -> (Option<crate::proc::Row>, Vec<String>) {
         let log: Log = Rc::default();
         let round = RefCell::new(0);
@@ -179,6 +183,10 @@ mod tests {
                 log.borrow_mut().push(format!("argv {pid}"));
                 Some(vec!["sh".into()])
             },
+            |pid| {
+                log.borrow_mut().push(format!("image {pid}"));
+                Some("sh".into())
+            },
         );
         let calls = log.borrow().clone();
         (row, calls)
@@ -189,7 +197,7 @@ mod tests {
         // Start 100 read first; the path and argv came from a replacement with start 200: not one process.
         let (row, calls) = row_reads(vec![Some((1, 100)), Some((1, 200))]);
         assert_eq!(row, None);
-        assert_eq!(calls, ["head 7", "path 7", "argv 7", "head 7"]);
+        assert_eq!(calls, ["head 7", "path 7", "argv 7", "image 7", "head 7"]);
         // Gone by the second read.
         assert_eq!(row_reads(vec![Some((1, 100)), None]).0, None);
         // Gone at the first: nothing else is read.
@@ -198,8 +206,14 @@ mod tests {
         // The same start both times: one process. A parent that changed (a reparent) is not reuse.
         let row = row_reads(vec![Some((1, 100)), Some((9, 100))]).0.unwrap();
         assert_eq!(
-            (row.pid, row.ppid, row.start, row.path.as_deref()),
-            (7, 1, Some(100), Some("/bin/sh"))
+            (
+                row.pid,
+                row.ppid,
+                row.start,
+                row.path.as_deref(),
+                row.image.as_deref()
+            ),
+            (7, 1, Some(100), Some("/bin/sh"), Some("sh"))
         );
         assert_eq!(row.argv, Some(vec!["sh".to_string()]));
     }

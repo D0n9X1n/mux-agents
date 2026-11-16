@@ -47,6 +47,14 @@ pub fn command_line(bytes: &[u8], base: usize) -> Option<Vec<u16>> {
 #[cfg(windows)]
 pub use win::Windows;
 
+/// Toolhelp's `szExeFile`: UTF-16 up to the first NUL; empty or invalid is none (H1).
+pub fn exe_name(units: &[u16]) -> Option<String> {
+    let end = units.iter().position(|&u| u == 0).unwrap_or(units.len());
+    String::from_utf16(&units[..end])
+        .ok()
+        .filter(|s| !s.is_empty())
+}
+
 #[cfg(windows)]
 mod win {
     use std::io;
@@ -199,6 +207,7 @@ mod win {
             start: Some(start_of(&handle)?),
             path: path_of(&handle),
             argv: argv_of(&handle),
+            image: None,
         })
     }
 
@@ -283,15 +292,19 @@ mod win {
             // SAFETY: a live snapshot and one entry with its size set.
             let mut more = unsafe { Process32FirstW(raw(&snap), &mut entry) } != 0;
             while more {
-                // A process this user cannot open keeps Toolhelp's pid and ppid with no start, so stop's walk
-                // passes through it to children it can open; with no start it is never trusted or killed.
-                rows.push(row_of(entry.th32ProcessID).unwrap_or(Row {
+                let image = super::exe_name(&entry.szExeFile);
+                // A process this user cannot open keeps Toolhelp's pid, ppid and image with no start, so stop's walk
+                // passes through it to children it can open; with no start it is never trusted or killed, and
+                // occupancy judges it by its image (H4.5).
+                let row = row_of(entry.th32ProcessID).unwrap_or(Row {
                     pid: entry.th32ProcessID,
                     ppid: entry.th32ParentProcessID,
                     start: None,
                     path: None,
                     argv: None,
-                }));
+                    image: None,
+                });
+                rows.push(Row { image, ..row });
                 // SAFETY: as above.
                 more = unsafe { Process32NextW(raw(&snap), &mut entry) } != 0;
             }
@@ -410,6 +423,15 @@ mod win {
             assert_eq!(Windows.row(0), None);
             assert!(Windows.open(0).is_none());
             assert_eq!(Windows.cwd(me()), None);
+            assert_eq!(row.image, None, "Os::row has no snapshot");
+            let file = std::env::current_exe().unwrap();
+            let file = file.file_name().unwrap().to_str().unwrap();
+            assert!(
+                listed.image.as_deref().unwrap().eq_ignore_ascii_case(file),
+                "{listed:?}"
+            );
+            let idle = table.iter().find(|r| r.pid == 0).unwrap();
+            assert_eq!(idle.image.as_deref(), Some("[System Process]"));
         }
 
         #[test]
@@ -477,6 +499,20 @@ mod win {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn exe_name_reads_up_to_the_first_nul() {
+        let wide = |s: &str| s.encode_utf16().collect::<Vec<u16>>();
+        let mut buf = wide("claude.exe");
+        buf.extend([0, b'x' as u16]);
+        assert_eq!(exe_name(&buf).as_deref(), Some("claude.exe"));
+        assert_eq!(
+            exe_name(&wide("[System Process]")).as_deref(),
+            Some("[System Process]")
+        );
+        assert_eq!(exe_name(&[0, 0]), None, "empty: unreadable");
+        assert_eq!(exe_name(&[0xD800, 0]), None, "lone surrogate: unreadable");
+    }
 
     #[test]
     fn same_start_unaligned_filetime_matches() {

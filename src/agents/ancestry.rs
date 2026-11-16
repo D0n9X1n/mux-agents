@@ -219,6 +219,7 @@ mod tests {
             start,
             path: path.map(String::from),
             argv: None,
+            image: None,
         };
         let f = Fakes::default();
         if let Some((start, path, recognized)) = loader {

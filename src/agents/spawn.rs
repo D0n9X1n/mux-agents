@@ -904,6 +904,7 @@ mod tests {
             start: Some(1500),
             path: None,
             argv: Some(argv.map(String::from).to_vec()),
+            image: None,
         });
         w.fakes.prefer_last();
         w.file("t.md", b"task");
@@ -1469,6 +1470,7 @@ mod tests {
                 start: Some(1500),
                 path: None,
                 argv: Some(argv),
+                image: None,
             });
             w.fakes.prefer_last();
             assert_eq!(
@@ -2747,6 +2749,7 @@ mod tests {
             start: Some(1130),
             path: Some(exe.clone()),
             argv: Some(vec![exe, "watch".into()]),
+            image: None,
         });
         let open = Rc::new(Cell::new(false));
         // The window the bar was split in; the caller's @1 until a split says else.
