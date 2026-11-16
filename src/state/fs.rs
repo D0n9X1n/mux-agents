@@ -109,7 +109,20 @@ thread_local! {
 /// Makes `sync_dir(dir)` fail on this thread for exactly `dir` (none: no failure); other folders still flush.
 #[cfg(test)]
 pub fn fail_sync_dir(dir: Option<&Path>) {
+    fail_sync_dir_after(dir, 0);
+}
+
+#[cfg(test)]
+thread_local! {
+    // How many flushes of the fault folder still succeed before the fault fires.
+    static SYNC_SKIP: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// `fail_sync_dir`, after `skip` flushes of `dir` have succeeded (adopt-3e checklist 3: a removal's final flush).
+#[cfg(test)]
+pub fn fail_sync_dir_after(dir: Option<&Path>, skip: u32) {
     SYNC_FAULT.with(|fault| *fault.borrow_mut() = dir.map(Path::to_path_buf));
+    SYNC_SKIP.with(|s| s.set(skip));
 }
 
 #[cfg(test)]
@@ -254,7 +267,14 @@ pub fn sync_dir(dir: &Path) -> io::Result<()> {
     });
     #[cfg(test)]
     if SYNC_FAULT.with(|fault| fault.borrow().as_deref() == Some(dir)) {
-        return Err(io::Error::other("injected folder flush failure"));
+        let skipped = SYNC_SKIP.with(|s| {
+            let n = s.get();
+            s.set(n.saturating_sub(1));
+            n > 0
+        });
+        if !skipped {
+            return Err(io::Error::other("injected folder flush failure"));
+        }
     }
     #[cfg(test)]
     if NTH_FAULT.with(|f| {

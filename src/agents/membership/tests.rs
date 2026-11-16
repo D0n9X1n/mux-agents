@@ -38,9 +38,13 @@ fn local_members_ignore_legacy_without_writes() {
     assert!(w.fakes.hc_calls().is_empty());
     assert!(w.fakes.mux_calls().is_empty());
     assert!(w.fakes.locks().is_empty());
+    // prelife-1c G10a: a record with no usable identity is held (no local member), never refused.
     for value in [json!([]), json!({"hcAddress":"t1"})] {
-        write(&folder.join("record.json"), value);
-        assert!(locals(&w.ctx, &caller).is_err());
+        write(&folder.join("record.json"), value.clone());
+        assert!(
+            locals(&w.ctx, &caller).unwrap().is_empty(),
+            "{value}: held, not refused"
+        );
     }
     std::fs::write(folder.join("record.json"), "{").unwrap();
     assert!(locals(&w.ctx, &caller).is_err());

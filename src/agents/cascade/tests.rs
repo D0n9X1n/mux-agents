@@ -911,10 +911,12 @@ fn a_pre_lifecycle_member_under_a_is_left_byte_identical() {
     w.fakes.hc_done().unwrap();
 }
 
-// Checklist 26 (p1c call 19): an unprepared journal [B(pre), A] (B became pre-lifecycle between passes): the
-// replay writes nothing to B, reports it unresolved `prelife` and holds its ancestor A (no hc call); the journal stays.
+// prelife-1c Task 5 (G10, spec "mixed tree", p1c-calls 1 and 9): an unmarked child B naming A as parent, holding a
+// desired.json and gens/1 evidence, is never read past its record by Tree::read, prepare, execute or finish; it is
+// no entry, nothing under it changes and no hc call names it.
 #[test]
-fn a_replayed_pre_lifecycle_entry_is_unresolved_and_left_byte_identical() {
+fn a_pre_lifecycle_child_is_never_listed_closed_or_ended() {
+    use crate::agents::prelife_fixture as pf;
     let (w, s) = lf::world();
     cx::member(&w, L, None, 0, json!({}));
     cx::member(&w, A, Some(L), 1, json!({}));
@@ -922,9 +924,66 @@ fn a_replayed_pre_lifecycle_entry_is_unresolved_and_left_byte_identical() {
     let pre = json!({"id": B, "name": "w-b", "session": w.caller().session, "depth": 2,
         "parentAgent": {"id": A}});
     crate::state::fs::write_json(&w.folder(B).join("record.json"), &pre).unwrap();
+    crate::state::fs::write_json(
+        &w.folder(B).join("desired.json"),
+        &json!({"desired": "running"}),
+    )
+    .unwrap();
+    pf::dev_evidence(&w, B);
+    let before = pf::bytes(&w.folder(B));
+    let tx = cx::tx(&w, &s);
+    cx::terminates(&w, A);
+    let (got, reads) = crate::state::fs::record_reads(|| -> crate::error::Res<_> {
+        let in_tree = Tree::read(&tx)?.has(B);
+        let j = prepare(&tx, A)?;
+        let r = execute(&tx, &caller(&w), &j)?;
+        Ok((in_tree, j, r, finish(&tx, &caller(&w))?))
+    });
+    let past = pf::reads_past_record(&reads, &w.folder(B));
+    assert!(past.is_empty(), "nothing of B past record.json: {past:?}");
+    let (in_tree, j, r, done) = got.unwrap();
+    assert!(!in_tree, "never read into the tree");
+    let ids: Vec<&str> = j.entries.iter().map(|e| e.id.as_str()).collect();
+    assert_eq!(ids, [A], "A only");
+    assert!(r.stopped && r.unresolved.is_empty(), "{r:?}");
+    assert!(done.iter().all(|r| r.stopped), "{done:?}");
+    assert_eq!(
+        pf::bytes(&w.folder(B)),
+        before,
+        "no desired.json write, no gens write"
+    );
+    assert!(
+        !lf::calls(&w).iter().flatten().any(|a| a.contains(B)),
+        "no hc call about B"
+    );
+    w.fakes.hc_done().unwrap();
+}
+
+// Checklist 26 (p1c call 19): an unprepared journal [B(pre), A] (B became pre-lifecycle between passes): the
+// replay writes nothing to B, reports it unresolved `prelife` and holds its ancestor A (no hc call); the journal stays.
+// prelife-1c Task 5 (checklist 3): B holds gens/1 evidence and a desired.json; the replay reads neither.
+#[test]
+fn a_replayed_pre_lifecycle_entry_is_unresolved_and_left_byte_identical() {
+    use crate::agents::prelife_fixture as pf;
+    let (w, s) = lf::world();
+    cx::member(&w, L, None, 0, json!({}));
+    cx::member(&w, A, Some(L), 1, json!({}));
+    std::fs::create_dir_all(w.folder(B)).unwrap();
+    let pre = json!({"id": B, "name": "w-b", "session": w.caller().session, "depth": 2,
+        "parentAgent": {"id": A}});
+    crate::state::fs::write_json(&w.folder(B).join("record.json"), &pre).unwrap();
+    crate::state::fs::write_json(
+        &w.folder(B).join("desired.json"),
+        &json!({"desired": "running"}),
+    )
+    .unwrap();
+    pf::dev_evidence(&w, B);
     cx::seed(&w, A, &[B, A], false);
     let before = cx::snapshot(&w.folder(B));
-    let r = finish(&cx::tx(&w, &s), &caller(&w)).unwrap();
+    let (r, reads) = crate::state::fs::record_reads(|| finish(&cx::tx(&w, &s), &caller(&w)));
+    let past = pf::reads_past_record(&reads, &w.folder(B));
+    assert!(past.is_empty(), "nothing of B past record.json: {past:?}");
+    let r = r.unwrap();
     assert_eq!(r.len(), 1);
     let names: Vec<(&str, &str)> = (r[0].unresolved.iter())
         .map(|u| (u.name.as_str(), u.check))
@@ -1477,7 +1536,12 @@ fn the_bar_tick_tries_the_team_lock_once() {
     let (w, s) = lf::world();
     complete(&w);
     w.fakes.lock_timeout(&s.team_lock());
-    assert!(!tick(&w.ctx, &w.caller()).unwrap(), "busy: skipped");
+    assert!(
+        crate::agents::adopt::tick(&w.ctx, &w.caller())
+            .unwrap()
+            .is_none(),
+        "busy: skipped"
+    );
     assert!(cx::journal_of(&w, A).exists());
     assert!(
         w.fakes.locks().contains(&format!("?{}", s.team_lock())),
@@ -1485,11 +1549,17 @@ fn the_bar_tick_tries_the_team_lock_once() {
     );
     let (w, _) = lf::world();
     complete(&w);
-    assert!(tick(&w.ctx, &w.caller()).unwrap());
+    assert!(
+        crate::agents::adopt::tick(&w.ctx, &w.caller())
+            .unwrap()
+            .is_some()
+    );
     assert!(!cx::journal_of(&w, A).exists(), "finished");
     let (w, _) = lf::world();
     assert!(
-        !tick(&w.ctx, &w.caller()).unwrap(),
+        crate::agents::adopt::tick(&w.ctx, &w.caller())
+            .unwrap()
+            .is_none(),
         "no journal folder: no lock taken"
     );
     assert!(w.fakes.locks().is_empty());
@@ -1502,7 +1572,11 @@ fn stop_and_tick_never_deadlock() {
     let (w, s) = lf::world();
     w.fakes.real_locks(&w._dir.path().join("locks"));
     complete(&w);
-    assert!(tick(&w.ctx, &w.caller()).unwrap());
+    assert!(
+        crate::agents::adopt::tick(&w.ctx, &w.caller())
+            .unwrap()
+            .is_some()
+    );
     cx::member(&w, B, Some(A), 2, json!({}));
     cx::terminates(&w, B);
     let c = w.caller();

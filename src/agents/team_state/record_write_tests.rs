@@ -304,6 +304,7 @@ fn a_link_at_the_member_folder_refuses_every_guard() {
             Some(life(None, Some(json!({"gen": 0})))),
         ),
         ("create", Guard::Create, None),
+        ("life", Guard::Life, Some(life(None, None))),
     ];
     for (case, guard, real_record) in cases {
         let w = world();

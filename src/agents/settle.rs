@@ -133,6 +133,7 @@ impl Tx<'_> {
         let Some(r) = gens::record(&self.folder(id)).known()? else {
             return Ok(Outcome::Done);
         };
+        super::prelife::lifecycle_only(&r)?; // prelife-1c G10: nothing settles a pre-lifecycle member
         bound(id, &r)?;
         match gens::pending(&r) {
             None => Ok(Outcome::Done),
@@ -396,6 +397,7 @@ pub fn terminate(tx: &Tx<'_>, id: &str, n: u64) -> Res<()> {
     let r = gens::record(&folder)
         .known()?
         .ok_or_else(|| Refusal::internal("the member has no record"))?;
+    super::prelife::lifecycle_only(&r)?; // prelife-1c G10: a cascade or stop never ends a pre-lifecycle member here
     bound(id, &r)?;
     let pending = gens::pending(&r) == Some(n);
     let lazy = Lazy::new(tx.ctx);

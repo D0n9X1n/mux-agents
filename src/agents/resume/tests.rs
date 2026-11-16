@@ -21,16 +21,17 @@ use std::rc::Rc;
 const Y: &str = "bbbbbbbbbbbb";
 const OTHER_SESSION: &str = "11111111-2222-4333-8444-555555555555";
 
-/// A committed member whose launch spec records its client's flags.
+/// A committed member whose launch spec records its client's flags. prelife-1c G10d: a lifecycle generation-0
+/// subject (`prelife_fixture::to_lifecycle`), since a pre-lifecycle member never resumes.
+/// A successor (`resumedFrom`) stays as the resume that made it wrote it, so tests that shape its claim, commit or
+/// abort by hand keep their meaning.
 fn member(w: &World, id: &str, fields: Value) -> Value {
-    let r = cf::member(w, id, fields);
-    let client = client_named(r["client"].as_str().unwrap()).unwrap();
-    write(
-        &w.folder(id).join("spec.json"),
-        json!({"schema": 1, "id": id, "client": r["client"], "flags": client_flags(client),
-            "args": ["--session-id", r["sessionId"]], "generation": "0"}),
-    );
-    r
+    let successor = fields.get("resumedFrom").is_some();
+    let r = pre_member(w, id, fields);
+    if successor {
+        return r;
+    }
+    crate::agents::prelife_fixture::to_lifecycle(w, id, false)
 }
 
 /// The member's terminal as hc shows it: running, lost, unknown, stopped (killed) or exited.
@@ -59,6 +60,20 @@ fn snapshot(w: &World, members: &[(&Value, &str)]) {
     cf::listing(w, &membership::team(&w.caller()), &[]);
     let mut members = members.to_vec();
     members.sort_by_key(|(r, _)| r["hcAddress"].as_str().unwrap().to_string());
+    for (r, life) in &members {
+        // prelife-1c: the record, not hc, decides a lifecycle member Ended (state-0 S6).
+        let ended = matches!(*life, "exited" | "stopped");
+        if ended && r.get("lifecycle") == Some(&json!(1)) {
+            let path = gens::path(&w.folder(r["id"].as_str().unwrap()), 0, "ended");
+            if !path.exists() {
+                crate::state::evidence::publish(
+                    &path,
+                    &json!({"state": "finished", "reason": "exited"}),
+                )
+                .unwrap();
+            }
+        }
+    }
     for (r, life) in members {
         cf::get(w, r["hcAddress"].as_str().unwrap(), wire(r, life));
     }
@@ -157,10 +172,11 @@ fn resume_starts_an_ended_member_again_with_its_conversation() {
                 ID,
                 json!({"client": client, "pane": "%5", "window": "@1", "depth": 1}),
             );
-            let kept = files(&w.folder(ID));
             let before = folders(&w);
             w.panes(&[]);
             facts(&w, &[(&x, how)]);
+            // prelife-1c: after `facts`, which records X's end (gens/0/ended.json) as fixture setup.
+            let kept = files(&w.folder(ID));
             launches(&w, "t1");
             let mut reply = resume_of(&w, ID).unwrap();
             // The bar's fields are spawn's, tested by `resume_reply_carries_the_bar_as_spawn_does`.
@@ -290,6 +306,8 @@ fn resume_refuses_and_launches_nothing() {
         if case != "agent" {
             let refs: Vec<_> = terminals.iter().map(|(r, l)| (r, l.as_str())).collect();
             snapshot(&w, &refs);
+            // The session check reads the one other record that carries X's session (Y, a lifecycle member with no
+            // recorded end) from its generation evidence alone; hc never ends it (R3), so it asks hc nothing more.
         }
         let before = folders(&w);
         let target = if case == "missing" { "nobody" } else { ID };
@@ -310,7 +328,9 @@ fn resume_refuses_and_launches_nothing() {
         }
         assert_eq!(folders(&w), before, "{case}");
         assert_eq!(runs(&w), 0, "{case}");
-        w.fakes.hc_done().unwrap();
+        w.fakes
+            .hc_done()
+            .unwrap_or_else(|e| panic!("{case}: {}", e.message));
     }
 }
 
@@ -388,10 +408,12 @@ fn a_failed_flush_before_the_run_launches_nothing() {
     w.fakes.hc_done().unwrap();
 }
 
-// A successor that claimed its run, failed before its commit and ended is the member its name means: `resume
-// worker` and `resume <its id>` both resume it, with no task, keeping the first mailbox.
+// A successor that claimed its run, failed before its commit and ended is the member its name means. Built by hand
+// in the pre-lifecycle layout (no `lifecycle: 1`), G10d refuses it (prelife-1c Task 4, call 20): by id, the early
+// guard refuses from its record before any hc call; by name, admission refuses the subject it selected (Y, not the
+// lifecycle X the name also names). Nothing launches and no folder is made.
 #[test]
-fn an_aborted_successor_is_resumed_by_name_or_id() {
+fn an_aborted_pre_lifecycle_successor_is_refused_by_name_or_id() {
     for target in ["worker", Y] {
         let w = World::human("");
         let x = member(
@@ -414,20 +436,25 @@ fn an_aborted_successor_is_resumed_by_name_or_id() {
             json!({"hcAddress": "tbbbbbbbbbbbb"}),
         );
         w.panes(&[]);
-        facts(&w, &[(&x, "exited"), (&y, "stopped")]);
-        launches(&w, "t1");
-        let before = folders(&w);
-        assert_eq!(resume_of(&w, target).unwrap()["from"], Y, "{target}");
-        let z = new_folder(&w, &before);
-        let spec = read_json(&gens::path(&z, 0, "spec")).unwrap().unwrap();
+        if target == "worker" {
+            facts(&w, &[(&x, "exited"), (&y, "stopped")]);
+        }
+        let before = (folders(&w), files(&folder));
+        let e = resume_of(&w, target).unwrap_err();
         assert_eq!(
-            spec["args"],
-            json!(["--resume", SESSION_ID, crate::agents::notebook::news::HEAD])
+            (e.code, e.check, e.message.as_str()),
+            (
+                2,
+                "state",
+                "worker predates lifecycle records (pre-lifecycle) and is never resumed"
+            ),
+            "{target}"
         );
-        assert!(spec.get("prompt").is_none());
-        let record = read_json(&z.join("record.json")).unwrap().unwrap();
-        assert_eq!(record["resumedFrom"], Y);
-        assert_eq!(record["mailbox"], ID);
+        assert_eq!((folders(&w), files(&folder)), before, "{target}");
+        assert_eq!(runs(&w), 0, "{target}");
+        if target == Y {
+            assert!(w.fakes.hc_calls().is_empty(), "{target}: refused before hc");
+        }
         w.fakes.hc_done().unwrap();
     }
 }
@@ -860,34 +887,34 @@ fn a_paused_reader_holds_the_barrier_and_a_stale_reader_then_reads_nothing() {
     );
     let state_root = w.ctx.state_root.clone();
     let x_record = x.clone();
-    let (reader_released, reader_mail, reader_unmail) =
-        (released.clone(), mail.clone(), unmail.clone());
+    let (reader_released, reader_unmail) = (released.clone(), unmail.clone());
     let reader = std::thread::spawn(move || {
         let mut r = World::human("");
         r.ctx.state_root = state_root;
         r.fakes.real_locks(&root);
         let caller = r.caller();
         let identity = Identity::read(&x_record, ID, &membership::team(&caller)).unwrap();
-        let paused = AtomicBool::new(false);
         r.fakes.lock_probe(move |event| {
-            if event == reader_mail && !paused.swap(true, SeqCst) {
-                held_tx.send(()).unwrap();
-                wait(&go_rx);
-            }
             if event == reader_unmail {
                 reader_released.store(true, SeqCst);
             }
             String::new()
         });
-        // X's own read, before Y exists: hc still shows X running.
+        // X's own read, before Y exists: hc still shows X running. prelife-1c: X is a lifecycle member, so the read
+        // pauses after its fence answered (under the mailbox lock), before the resume publishes X's recorded end.
         cf::online(&r);
         cf::get(
             &r,
             x_record["hcAddress"].as_str().unwrap(),
             wire(&x_record, "running"),
         );
-        let first =
-            read_mail_if(&r.ctx, &caller, ID, || current(&r.ctx, &caller, &identity)).unwrap();
+        let first = read_mail_if(&r.ctx, &caller, ID, || {
+            let now = current(&r.ctx, &caller, &identity);
+            held_tx.send(()).unwrap();
+            wait(&go_rx);
+            now
+        })
+        .unwrap();
         r.fakes.hc_done().unwrap();
         // A stale read as X once Y exists: the fence finds X superseded before it asks hc anything.
         wait(&resumed_rx);
@@ -1034,9 +1061,10 @@ fn descendants_of_a_resumed_member_stay_stopped() {
         json!({"name": "child", "pane": "%7", "window": "@1", "depth": 2, "parentPane": "%5",
             "sessionId": OTHER_SESSION}),
     );
-    let kept = files(&w.folder(C));
     w.panes(&[]);
     facts(&w, &[(&x, "exited"), (&c, "stopped")]);
+    // prelife-1c: after `facts`, which records C's end (gens/0/ended.json) as fixture setup.
+    let kept = files(&w.folder(C));
     launches(&w, "t1");
     let before = folders(&w);
     assert_eq!(resume_of(&w, ID).unwrap()["from"], ID);
@@ -1129,7 +1157,9 @@ fn a_resume_chain_reads_new_mail_once_by_the_current_member() {
 }
 
 // A failed flush of the agents folder (after Y's record and before hc run) launches nothing and leaves abort
-// evidence; a later resume launches.
+// evidence; a later resume launches. prelife-1c: X is a lifecycle member whose admission reads its recorded end
+// through a flushing read (`agents` included), so the fault is armed at the mailbox barrier, after admission and
+// before Y's create.
 #[test]
 fn a_failed_agents_folder_flush_launches_nothing() {
     let w = World::human("");
@@ -1138,9 +1168,17 @@ fn a_failed_agents_folder_flush_launches_nothing() {
     facts(&w, &[(&x, "exited")]);
     let before = folders(&w);
     let agents = w.state().join("agents");
-    crate::state::fs::fail_sync_dir(Some(&agents));
+    let barrier = format!("+{}", lock_key("mail", &w.caller(), ID));
+    let armed = agents.clone();
+    w.fakes.lock_probe(move |event| {
+        if event == barrier {
+            crate::state::fs::fail_sync_dir(Some(&armed));
+        }
+        String::new()
+    });
     let got = resume_of(&w, ID);
     crate::state::fs::fail_sync_dir(None);
+    w.fakes.lock_probe(|_| String::new());
     assert!(got.is_err());
     assert_eq!(runs(&w), 0);
     let folder = new_folder(&w, &before);
@@ -1250,7 +1288,9 @@ fn send_read_spawn_and_stop_stay_bounded_during_a_resume() {
             let root = real_locks(&w);
             let caller = w.caller();
             let x = member(&w, ID, json!({"pane": "%5", "window": "@1", "depth": 1}));
-            let b = member(
+            // B is a bystander, not a resume subject: it stays pre-lifecycle, so `stop B` is the legacy stop that
+            // takes no lock the resume holds (a lifecycle stop's cascade waits on the team lock).
+            let b = pre_member(
                 &w,
                 B,
                 json!({"name": "other", "pane": "%6", "window": "@1", "depth": 1,
@@ -1294,6 +1334,8 @@ fn send_read_spawn_and_stop_stay_bounded_during_a_resume() {
                 let terminal = |r: &Value, life: &str| {
                     let mut t = wire(r, life);
                     t["labels"]["mux.team"] = json!(team);
+                    // prelife-1c: a lifecycle member's terminal carries its generation's `launch.json` hcName.
+                    t["name"] = json!(format!("m{}", &r["id"].as_str().unwrap()[..8]));
                     t
                 };
                 let addr = |r: &Value| r["hcAddress"].as_str().unwrap().to_string();
@@ -1334,6 +1376,8 @@ fn send_read_spawn_and_stop_stay_bounded_during_a_resume() {
                     "stop" => {
                         v.panes(&[]);
                         cf::online(&v);
+                        // prelife-1c P-R3: the validating get (Running) is the last hc call before the kill.
+                        cf::get(&v, &addr(&br), terminal(&br, "running"));
                         cf::answer(&v, &["kill", &addr(&br), "--json"], "{}");
                         cf::get(&v, &addr(&br), terminal(&br, "stopped"));
                         vec!["stop", "other"]
@@ -2008,4 +2052,154 @@ fn a_resume_under_a_kept_journal_is_refused_closed() {
     let before = folders(&w);
     assert_eq!(resume_of(&w, ID).unwrap_err().check, "closed");
     assert_eq!(folders(&w), before, "nothing launched");
+}
+
+// adopt-3e A6, call 13: resume replays before its snapshot: two journals refuse `topology`; the snapshot's scripted
+// hc answers are never asked for; nothing launched.
+#[test]
+fn resume_admission_replays_first() {
+    use crate::agents::adopt_fixture as ax;
+    let w = World::human("");
+    let x = member(&w, ID, json!({}));
+    facts(&w, &[(&x, "stopped")]);
+    let s = crate::agents::team_state::Scope::of(&w.caller());
+    for n in [1, 3] {
+        ax::put_journal(&w, &s, &ax::to_a(n));
+    }
+    let before = folders(&w);
+    let got = resume_of(&w, ID).unwrap_err();
+    assert_eq!(
+        (got.check, got.message.as_str()),
+        ("topology", crate::agents::adopt::OUT_OF_ORDER)
+    );
+    assert_eq!(folders(&w), before, "nothing launched");
+    assert!(
+        w.fakes.hc_done().is_err(),
+        "the snapshot's answers were never asked for"
+    );
+}
+
+/// prelife-1c: a pre-lifecycle member as main writes one (main's `member`): its record and its folder `spec.json`.
+fn pre_member(w: &World, id: &str, fields: Value) -> Value {
+    let r = cf::member(w, id, fields);
+    let client = client_named(r["client"].as_str().unwrap()).unwrap();
+    write(
+        &w.folder(id).join("spec.json"),
+        json!({"schema": 1, "id": id, "client": r["client"], "flags": client_flags(client),
+            "args": ["--session-id", r["sessionId"]], "generation": "0"}),
+    );
+    r
+}
+
+/// G10d, call 16, through the real dispatcher with no hc installed: `resume` of a pre-lifecycle member, by name
+/// or id, Ended or not, read as an identity or not, is refused 2 `state` from its record before any hc call.
+/// Another session's folder, and a name a lifecycle member also has, are not refused here.
+#[test]
+fn a_pre_lifecycle_member_is_never_resumed_even_without_hc() {
+    use crate::agents::prelife_fixture as pf;
+    let c = "c0000000000c";
+    for case in [
+        "hc member",
+        "stopped notice",
+        "pane era",
+        "partial",
+        "other session",
+        "lifecycle twin",
+    ] {
+        for by in ["name", "id"] {
+            let w = World::human(""); // no hc installed: `hc::connect` would refuse
+            w.panes(&[]);
+            match case {
+                "pane era" => drop(w.agent_record(c, json!({"name": "legacy"}))),
+                "other session" => {
+                    drop(w.agent_record(c, json!({"name": "legacy", "session": "$4"})))
+                }
+                _ => {
+                    let r = pre_member(&w, c, json!({"name": "legacy"}));
+                    if case == "stopped notice" {
+                        write(
+                            &w.folder(c).join("notice.json"),
+                            json!({"kind": "stopped", "exitCode": null, "at": "x"}),
+                        );
+                    }
+                    if case == "partial" {
+                        let mut p = r.clone();
+                        p.as_object_mut().unwrap().remove("launcherArgv");
+                        write(&w.folder(c).join("record.json"), p);
+                    }
+                    if case == "lifecycle twin" {
+                        cf::member(&w, "e0000000000e", json!({"name": "legacy"}));
+                        pf::to_lifecycle(&w, "e0000000000e", true);
+                    }
+                }
+            }
+            let refused = !(case == "other session" || (case == "lifecycle twin" && by == "name"));
+            let before = (pf::bytes(&w.folder(c)), folders(&w));
+            let target = if by == "id" { c } else { "legacy" };
+            let (code, out) =
+                crate::cli::run(&["resume".to_string(), target.to_string()], || Ok(&w.ctx));
+            let pre =
+                code == 2 && out.contains(r#""check":"state""#) && out.contains("pre-lifecycle");
+            assert_eq!(pre, refused, "{case} by {by}: {out}");
+            if refused {
+                assert!(
+                    w.fakes.hc_calls().is_empty(),
+                    "{case} by {by}: refused before any hc call"
+                );
+            }
+            assert_eq!(runs(&w), 0, "{case} by {by}: nothing launched");
+            assert_eq!(
+                (pf::bytes(&w.folder(c)), folders(&w)),
+                before,
+                "{case} by {by}"
+            );
+        }
+    }
+}
+
+/// Call 20: admission checks the subject it selected. An older lifecycle `legacy` (Ended) passes the offline guard,
+/// but the name selects the newer pre-lifecycle `legacy` (Ended too): refused `state`, no `hc run`.
+#[test]
+fn admission_refuses_a_selected_pre_lifecycle_subject() {
+    use crate::agents::prelife_fixture as pf;
+    let w = World::human("");
+    w.panes(&[]);
+    let old = pre_member(
+        &w,
+        "b0000000000b",
+        json!({"name": "legacy", "createdAt": "2026-01-01T00:00:00.0000000Z"}),
+    );
+    pf::to_lifecycle(&w, "b0000000000b", true);
+    let new = pre_member(
+        &w,
+        "c0000000000c",
+        json!({"name": "legacy", "createdAt": "2026-06-01T00:00:00.0000000Z"}),
+    );
+    let before = folders(&w);
+    snapshot(&w, &[(&old, "exited"), (&new, "exited")]);
+    let e = resume_of(&w, "legacy").unwrap_err();
+    assert_eq!((e.code, e.check), (2, "state"), "{}", e.message);
+    assert!(e.message.contains("pre-lifecycle"), "{}", e.message);
+    assert_eq!(runs(&w), 0);
+    assert_eq!(folders(&w), before);
+    w.fakes.hc_done().unwrap();
+}
+
+/// Call 20: an exact id decides before any name. A lifecycle member whose name is the pre-lifecycle folder's id
+/// (and whose own id sorts first) does not let `resume <that id>` through.
+#[test]
+fn an_exact_id_decides_before_a_same_named_member() {
+    use crate::agents::prelife_fixture as pf;
+    let c = "c0000000000c";
+    let w = World::human(""); // no hc installed
+    w.panes(&[]);
+    cf::member(&w, "b0000000000b", json!({"name": c}));
+    pf::to_lifecycle(&w, "b0000000000b", true);
+    pre_member(&w, c, json!({"name": "legacy"}));
+    let (code, out) = crate::cli::run(&["resume".to_string(), c.to_string()], || Ok(&w.ctx));
+    assert!(
+        code == 2 && out.contains(r#""check":"state""#) && out.contains("pre-lifecycle"),
+        "{out}"
+    );
+    assert!(w.fakes.hc_calls().is_empty(), "refused before any hc call");
 }

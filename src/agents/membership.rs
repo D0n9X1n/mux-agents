@@ -8,8 +8,7 @@ use crate::{
     error::{Refusal, Res},
 };
 use serde_json::Value;
-use std::collections::BTreeMap;
-use std::path::Path;
+use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Debug)]
 pub struct Stored {
@@ -43,12 +42,21 @@ pub fn locals(ctx: &Ctx, caller: &Caller) -> Res<Vec<Local>> {
 /// The (id, generation) pairs a lifecycle record names that are done by recorded evidence (R3).
 type Freed = Vec<(String, String)>;
 
-/// One scan: the local members, the done (id, generation) pairs (R3), and each unresolved orphan (b-calls 11) as
-/// (id, generation, name).
+/// One scan: the local members, the done (id, generation) pairs (R3), each unresolved orphan (b-calls 11) as
+/// (id, generation, name), and the pre-lifecycle slots (prelife-1c G10a).
 struct Scan {
     local: Vec<Local>,
     freed: Freed,
     orphans: Vec<(String, String, String)>,
+    /// Held pre-lifecycle folders with no usable identity, one slot each.
+    held: Vec<String>,
+    /// prelife-1c calls 13, 23: the `hcAddress` of every held or freed pre-lifecycle folder; a listed terminal named
+    /// here is that folder's, never another root's reservation.
+    pre_addresses: Vec<String>,
+    /// Pre-lifecycle identities whose folder notice proves an end (prelife-1c ambiguity 6).
+    pre_ended: BTreeSet<String>,
+    /// prelife-1c ambiguity 14: every same-session pre-lifecycle folder, id to name (else its id).
+    pre: BTreeMap<String, String>,
 }
 
 impl Scan {
@@ -72,7 +80,10 @@ impl Scan {
 /// done by recorded evidence (R3), whose listed hc terminals `core_facts::take` never reserves.
 fn scan(ctx: &Ctx, caller: &Caller) -> Res<Scan> {
     use super::gens::Member;
+    use super::prelife::Slot;
     let (mut local, mut freed, mut orphans) = (Vec::new(), Vec::new(), Vec::new());
+    let (mut held, mut pre_addresses, mut pre_ended) = (Vec::new(), Vec::new(), BTreeSet::new());
+    let mut pre = BTreeMap::new();
     // R5: link entries are kept, so member_of refuses them; a regular file at an id is no member.
     for (id, folder, member) in
         super::gens::members(&super::server_dir(ctx, caller).join("agents"))?
@@ -83,9 +94,8 @@ fn scan(ctx: &Ctx, caller: &Caller) -> Res<Scan> {
             Member::Pre(r) => r,
             Member::Life(g) => g.record(),
         };
-        if !record.is_object() {
-            return Err(Refusal::internal("invalid local hc record"));
-        }
+        // prelife-1c ambiguity 5: a record naming another session is skipped; one naming none (or not an object)
+        // is the caller's (fail closed).
         if record
             .get("session")
             .and_then(Value::as_str)
@@ -116,7 +126,28 @@ fn scan(ctx: &Ctx, caller: &Caller) -> Res<Scan> {
                 }
                 life_local(g, &s, &id, &team(caller))?
             }
-            _ => pre_local(&folder, record, &id, caller)?,
+            _ => {
+                // Ambiguity 14: the `limit` refusal names each held one by this (its name, else its id).
+                let name = record.get("name").and_then(Value::as_str).unwrap_or(&id);
+                pre.insert(id.clone(), name.to_string());
+                match super::prelife::slot(&folder, record, &id, caller) {
+                    Slot::Local(l) => {
+                        if super::prelife::ended_by_notice(&folder) {
+                            pre_ended.insert(id.clone());
+                        }
+                        Some(*l)
+                    }
+                    s => {
+                        if let Some(a) = record.get("hcAddress").and_then(Value::as_str) {
+                            pre_addresses.push(a.to_string());
+                        }
+                        if matches!(s, Slot::Held) {
+                            held.push(id.clone());
+                        }
+                        None
+                    }
+                }
+            }
         };
         local.extend(one);
     }
@@ -124,42 +155,11 @@ fn scan(ctx: &Ctx, caller: &Caller) -> Res<Scan> {
         local,
         freed,
         orphans,
+        held,
+        pre_addresses,
+        pre_ended,
+        pre,
     })
-}
-
-/// Main's reading of a pre-lifecycle record, moved: its identity, the folder commit and the folder notice.
-fn pre_local(folder: &Path, record: &Value, id: &str, caller: &Caller) -> Res<Option<Local>> {
-    let hc = ["hcAddress", "generation", "team", "launcherArgv"]
-        .iter()
-        .any(|k| record.get(k).is_some());
-    let identity = if hc {
-        Identity::read(record, id, &team(caller))
-            .ok_or_else(|| Refusal::internal("invalid local hc identity"))?
-    } else {
-        // A resume's successor whose hc run reply was lost after its launcher claimed the run: a member whose
-        // life comes from hc. Without a claim (or with an abandoned one) it never ran and is no member.
-        let claimed = match crate::state::fs::read_json(&folder.join("gens").join("0.claim")) {
-            Ok(Some(claim)) => claim.as_str() != Some("abandoned"),
-            Ok(None) => false,
-            Err(_) => true,
-        };
-        match Identity::pending(record, id, &team(caller)) {
-            Some(identity) if claimed => identity,
-            _ => return Ok(None),
-        }
-    };
-    Ok(Some(Local {
-        identity,
-        stored: Stored {
-            record: record.clone(),
-            committed: super::folder_committed(folder),
-            noticed: folder.join("notice.json").exists(),
-            notice: None,
-            active_done: None,
-        },
-        held: false,
-        finished: None,
-    }))
 }
 
 /// R1-R4: one `status`, the subject generation's identity, commit and notice (each read once), and its
@@ -271,9 +271,27 @@ pub struct Snapshot {
     pub view_order: Vec<String>,
     pub core_error: Option<Refusal>,
     pub view_error: Option<Refusal>,
+    /// prelife-1c G10a: held pre-lifecycle folders (no usable identity), one team slot each.
+    pub held: Vec<String>,
+    /// prelife-1c ambiguity 6: pre-lifecycle members whose folder notice proves an end; listed, holding no slot.
+    pub pre_ended: BTreeSet<String>,
+    /// prelife-1c ambiguity 14: every same-session pre-lifecycle folder, id to name (else its id); the `limit`
+    /// refusal names the held ones from it.
+    pub pre: BTreeMap<String, String>,
 }
 
 impl Snapshot {
+    /// Whether an observed member holds a team slot: not Ended, and not a pre-lifecycle member its notice ended.
+    pub fn holds(&self, o: &core_facts::Observation) -> bool {
+        o.life != super::lifecycle::Life::Ended && !self.pre_ended.contains(&o.identity.id)
+    }
+
+    /// The team slots in use (D4, prelife-1c G10a): held observations, reservations, held pre-lifecycle folders.
+    pub fn slots(&self) -> usize {
+        let local = self.facts.local.iter().filter(|o| self.holds(o)).count();
+        local + self.facts.reserved.len() + self.held.len()
+    }
+
     /// Resolve only the mailbox reader; notices never determine current membership.
     /// The member named `name`: of every committed member with that name and no end notice that hc does not prove
     /// ended, exactly one, and hc shows it running. Its id and record; none otherwise. As in `member_target`, a
@@ -385,8 +403,9 @@ impl Snapshot {
         let sc = scan(ctx, caller)?;
         let skip = sc.skip();
         let ids: Vec<_> = sc.local.iter().map(|l| l.identity.clone()).collect();
-        let result =
-            hc::connect(ctx).and_then(|core| core_facts::take(&core, &team(caller), &ids, &skip));
+        let result = hc::connect(ctx).and_then(|core| {
+            core_facts::take(&core, &team(caller), &ids, &skip, &sc.pre_addresses)
+        });
         let (mut facts, error) = match result {
             Ok(facts) => (facts, None),
             Err(e) => (
@@ -406,16 +425,16 @@ impl Snapshot {
         };
         settle(&mut facts, &sc.local); // R3: also when hc cannot be read
         sc.reserve(&mut facts); // b-calls 11: also when hc cannot be read
-        Ok(Self::assemble(ctx, caller, sc.local, facts, error))
+        Ok(Self::assemble(ctx, caller, sc, facts, error))
     }
 
     pub fn for_spawn(ctx: &Ctx, caller: &Caller, core: &Core<'_>) -> Res<Self> {
         let sc = scan(ctx, caller)?;
         let ids: Vec<_> = sc.local.iter().map(|l| l.identity.clone()).collect();
-        let mut facts = core_facts::take(core, &team(caller), &ids, &sc.skip())?;
+        let mut facts = core_facts::take(core, &team(caller), &ids, &sc.skip(), &sc.pre_addresses)?;
         settle(&mut facts, &sc.local);
         sc.reserve(&mut facts);
-        Ok(Self::assemble(ctx, caller, sc.local, facts, None))
+        Ok(Self::assemble(ctx, caller, sc, facts, None))
     }
 
     pub fn admit_name(
@@ -455,10 +474,17 @@ impl Snapshot {
     fn assemble(
         ctx: &Ctx,
         caller: &Caller,
-        local: Vec<Local>,
+        scan: Scan,
         facts: core_facts::Snapshot,
         core_error: Option<Refusal>,
     ) -> Self {
+        let Scan {
+            local,
+            held,
+            pre_ended,
+            pre,
+            ..
+        } = scan;
         let (rows, view_error) = match registry::rows(ctx, caller) {
             Ok(rows) => (rows, None),
             Err(e) => (Vec::new(), Some(e)),
@@ -488,6 +514,9 @@ impl Snapshot {
             views,
             core_error,
             view_error,
+            held,
+            pre_ended,
+            pre,
         }
     }
 }

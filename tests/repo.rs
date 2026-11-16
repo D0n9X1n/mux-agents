@@ -996,6 +996,77 @@ const TEST_ONLY: &[(&str, &str, &str)] = &[
         "src/agents/message.rs",
         "peek_tests",
     ),
+    ("src/agents/adopt/tests.rs", "src/agents/adopt.rs", "tests"),
+    (
+        "src/agents/adopt/replay_tests.rs",
+        "src/agents/adopt.rs",
+        "replay_tests",
+    ),
+    (
+        "src/agents/adopt/from_tests.rs",
+        "src/agents/adopt.rs",
+        "from_tests",
+    ),
+    (
+        "src/agents/adopt/order_tests.rs",
+        "src/agents/adopt.rs",
+        "order_tests",
+    ),
+    (
+        "src/agents/adopt/bar_tests.rs",
+        "src/agents/adopt.rs",
+        "bar_tests",
+    ),
+    (
+        "src/agents/adopt/view/tests.rs",
+        "src/agents/adopt/view.rs",
+        "tests",
+    ),
+    (
+        "src/agents/board/adopt_tests.rs",
+        "src/agents/board.rs",
+        "adopt_tests",
+    ),
+    (
+        "src/agents/message/prelife_stop_tests.rs",
+        "src/agents/message.rs",
+        "prelife_stop_tests",
+    ),
+    (
+        "src/agents/prelife/tests.rs",
+        "src/agents/prelife.rs",
+        "tests",
+    ),
+    (
+        "src/agents/team_state/life_guard_tests.rs",
+        "src/agents/team_state.rs",
+        "life_guard_tests",
+    ),
+    (
+        "src/agents/spawn/hc_tests/race.rs",
+        "src/agents/spawn/hc_tests.rs",
+        "race",
+    ),
+    (
+        "src/agents/prelife_tests.rs",
+        "src/agents/mod.rs",
+        "prelife_tests",
+    ),
+    (
+        "src/agents/prelife_slot_tests.rs",
+        "src/agents/mod.rs",
+        "prelife_slot_tests",
+    ),
+    (
+        "src/agents/adopt_fixture.rs",
+        "src/agents/mod.rs",
+        "adopt_fixture",
+    ),
+    (
+        "src/agents/prelife_fixture.rs",
+        "src/agents/mod.rs",
+        "prelife_fixture",
+    ),
 ];
 
 #[test]
@@ -1850,6 +1921,14 @@ const SKILL_PWSH_NOTE: &str = "The commands below, and the Reply and Listen line
 
 /// The skill's other PowerShell line: the Shell shortcuts section's source line for a PowerShell profile.
 const SKILL_SHORTCUT_PWSH_LINE: &str = "- PowerShell, in `$PROFILE` (the primary shell for the shortcuts on Windows): `. \"<plugin folder>/scripts/shell/mux-agents.ps1\"`";
+
+/// prelife-1c p1c-calls 4 (Task 9): the skill's `limit` line says how a slot held by a pre-v0.3.0 member is freed.
+const SKILL_LIMIT_LINE: &str = "- `limit`: the team already has 6 members besides the leader. The message names each member made before v0.3.0 that holds a slot: `mux-agent stop <name>` frees one whose shell is lost or ended (nothing is killed) and stops one that runs; one hc cannot show stays held.";
+
+#[test]
+fn the_skill_states_how_a_pre_lifecycle_slot_is_freed() {
+    assert!(file_lines("skills/mux-agents/SKILL.md").contains(&SKILL_LIMIT_LINE.to_string()));
+}
 
 /// Hooks and their tests may name the old `mux-agent.ps1` (spawn detection keeps accepting a 0.1 command line) and
 /// Claude Code's `PowerShell` tool, whose calls the pane watches as it watches Bash.

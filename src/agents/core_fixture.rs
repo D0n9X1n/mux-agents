@@ -135,7 +135,7 @@ fn core_fixture_is_opt_in_and_scoped() {
     listing(&w, &team, &["taaaaaaaaaaaa"]);
     get(&w, "taaaaaaaaaaaa", wire(&r));
     let core = crate::hc::connect(&w.ctx).unwrap();
-    let facts = super::core_facts::take(&core, &team, &[id], &[]).unwrap();
+    let facts = super::core_facts::take(&core, &team, &[id], &[], &[]).unwrap();
     assert_eq!(facts.count(), 1);
     assert_eq!(facts.names(), ["worker"]);
     w.fakes.hc_done().unwrap();

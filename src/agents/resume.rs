@@ -40,12 +40,16 @@ pub fn resume(ctx: &Ctx, request: &Request) -> Res<Map<String, Value>> {
             super::tree::team_of(ctx, &caller)
         })?;
     }
+    // prelife-1c G10d (call 16): a pre-lifecycle subject is refused from its record, before any hc call.
+    super::prelife::refuse_resume(ctx, &caller, target)?;
     let split = match read_placement(ctx, &caller) {
         Ok(Some(stored)) if stored != DEFAULT_PLACEMENT => Some(stored),
         _ => None,
     };
     let core = crate::hc::connect(ctx)?;
     let (from, record) = lock(ctx, &lock_key("spawn", &caller, &caller.session), || {
+        // adopt-3e call 13: every input of this decision (standing, snapshot, records) is read after replay.
+        super::adopt::replay_held(ctx, &caller)?;
         let gate = match super::tree::team_of(ctx, &caller)? {
             Some(t) => Some((t, super::tree::standing(ctx, &caller, Some(&core))?)),
             None if caller.kind == Kind::Agent => {
@@ -151,6 +155,10 @@ fn admit(
         super::tree::authority(ctx, caller, s, id, "resume")?;
     }
     let record = snapshot.records[id].record.clone();
+    // prelife-1c G10d (call 20): the subject this admission selected is lifecycle, whatever the name also names.
+    if !super::gens::lifecycle(&record) {
+        return Err(super::prelife::pre_lifecycle(&x.identity.name));
+    }
     let life = match x.life {
         Life::Ended => None,
         Life::Running => Some("running"),

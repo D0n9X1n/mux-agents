@@ -517,18 +517,19 @@ fn ended_newest_first_max_10() {
     // Without -All the reply is unchanged: no endedTotal.
     assert!(plain.get("endedTotal").is_none());
 
-    // Invalid hc identities are refusals, not silently discarded rows.
+    // prelife-1c G10a (p1c-calls 4: `list` does not fail): a pre-lifecycle record with no usable hc identity is a
+    // held team slot, not a row and not a refusal.
     let bad = World::human("");
     member(
         &bad,
         "444444444444",
         json!({"id":"bbbbbbbbbbbb", "name":"foreign"}),
     );
+    let shown = board(&bad.ctx, &bad.caller(), true, false).unwrap();
     assert_eq!(
-        board(&bad.ctx, &bad.caller(), true, false)
-            .unwrap_err()
-            .check,
-        "internal"
+        shown["agents"],
+        json!([]),
+        "no row for the unidentified record"
     );
     bad.fakes.hc_done().unwrap();
     // The live row and exactly the 10 newest of 12 ended agents.

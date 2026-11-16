@@ -151,6 +151,23 @@ pub(crate) fn with_lock_at<T>(
     return with_lock_timeout(ctx, &format!("{}|{key}", root.display()), LOCK_WAIT, f);
 }
 
+/// The real try-lock for tests that contend from real threads (`try_with_lock`'s one zero wait under `root`).
+#[cfg(test)]
+pub(crate) fn try_with_lock_at<T>(
+    ctx: &Ctx,
+    root: &Path,
+    key: &str,
+    f: impl FnOnce() -> Res<T>,
+) -> Res<Option<T>> {
+    #[cfg(unix)]
+    return try_with_lock_in(ctx, root, key, f);
+    #[cfg(windows)]
+    return once(
+        |f| with_lock_timeout(ctx, &format!("{}|{key}", root.display()), Duration::ZERO, f),
+        f,
+    );
+}
+
 /// `with_lock` for a given passwd home, so tests never touch the real one.
 #[cfg(unix)]
 pub(crate) fn with_lock_under<T>(

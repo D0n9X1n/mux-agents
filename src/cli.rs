@@ -1594,6 +1594,12 @@ mod tests {
         let w = agents_world();
         let r = crate::agents::core_fixture::member(&w, ID, json!({}));
         crate::agents::core_fixture::online(&w);
+        // prelife-1c P-R3: the validating get (Running) is the last hc call before the kill.
+        crate::agents::core_fixture::get(
+            &w,
+            "taaaaaaaaaaaa",
+            crate::agents::core_fixture::wire(&r),
+        );
         crate::agents::core_fixture::answer(&w, &["kill", "taaaaaaaaaaaa", "--json"], "{}");
         crate::agents::core_fixture::get(
             &w,
@@ -2181,6 +2187,8 @@ fn stop_hc_wire_order() {
         ),
     ] {
         cf::online(&w);
+        // prelife-1c P-R3: the validating get (Running) is the last hc call before the kill.
+        cf::get(&w, "taaaaaaaaaaaa", cf::wire(&r));
         cf::answer(&w, &["kill", "taaaaaaaaaaaa", "--json"], "{}");
         cf::get(&w, "taaaaaaaaaaaa", cf::wire(&r));
         let args = tokens.into_iter().map(str::to_string).collect::<Vec<_>>();

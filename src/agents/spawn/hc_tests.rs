@@ -836,3 +836,5 @@ fn a_spawn_adopts_a_pane_that_already_attaches_its_terminal() {
         "%12"
     );
 }
+
+mod race;

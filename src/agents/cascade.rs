@@ -6,9 +6,8 @@ use serde_json::{Value, json};
 
 use super::gens;
 use super::registry::{self, Notice};
-use super::team_state::{Scope, Tx};
+use super::team_state::Tx;
 use crate::caller::Caller;
-use crate::ctx::Ctx;
 use crate::error::{Refusal, Res};
 
 /// state-0 S2: `desired.json` `{desired, at}`; absent reads `running` (C1).
@@ -330,19 +329,6 @@ pub fn reopen_same<T>(tx: &Tx<'_>, id: &str, launch: impl FnOnce() -> Res<T>) ->
     launch()
 }
 
-/// C8, the bar: a lock-free look for the journal folder, then one try of the team lock (state-0 S9: the bar
-/// try-locks). Busy: false at once. A refusal (an `Unreadable` journal) is returned; the board ignores it.
-pub fn tick(ctx: &Ctx, caller: &Caller) -> Res<bool> {
-    let scope = Scope::of(caller);
-    if !waiting(ctx, &scope) {
-        return Ok(false);
-    }
-    let ran = super::try_lock(ctx, &scope.team_lock(), || {
-        super::team_state::held(ctx, &scope, |tx| finish(tx, caller))
-    })?;
-    Ok(ran.is_some())
-}
-
 #[path = "cascade_tree.rs"]
 mod tree;
 pub use tree::{Shown, Tree};
@@ -350,9 +336,11 @@ pub use tree::{Shown, Tree};
 #[path = "cascade_journal.rs"]
 mod journal;
 use journal::tombstoned;
+// adopt-3e call 6: adoption walks and makes its folders with the cascade's one rule.
 pub use journal::{
     Entry, Journal, NOT_WRITTEN, dir_at, journals, mark_prepared, publish, remove, waiting,
 };
+pub(crate) use journal::{level, make};
 
 #[cfg(test)]
 mod tests;
