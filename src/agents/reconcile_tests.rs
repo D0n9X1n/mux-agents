@@ -163,7 +163,29 @@ pub(super) fn member_at(w: &World, key: &str, id: &str, fields: Value) -> PathBu
     }
     crate::state::fs::write_json(&folder.join("record.json"), &r).unwrap();
     lf::seed_gen(&folder, 1, Some("run"), lf::committed());
+    team_record_at(w, key, r["session"].as_str().unwrap_or_default());
     folder
+}
+/// The team record `up` writes for `session` under `key` (restore-6c checklist 9: `launch_next` requires it), once.
+/// Its flags give a `bypass` ceiling, the one a missing record used to give.
+pub(super) fn team_record_at(w: &World, key: &str, session: &str) {
+    let flags = vec!["--dangerously-skip-permissions".to_string()];
+    let team = super::team::Team {
+        team: format!("{key}:{session}"),
+        session: session.into(),
+        name: "s".into(),
+        directory: w.ctx.cwd.to_str().unwrap().into(),
+        client: crate::parse::Client::Claude,
+        policy: super::team::policy(crate::parse::Client::Claude, &flags),
+        flags,
+        leader: "cccccccccccc".into(),
+        created_at: "x".into(),
+    };
+    super::team::create(
+        &super::team::path(&w.ctx.state_root.join(key), session),
+        &team,
+    )
+    .unwrap();
 }
 pub(super) fn member(w: &World, id: &str, fields: Value) -> PathBuf {
     member_at(w, &w.caller().server_key, id, fields)

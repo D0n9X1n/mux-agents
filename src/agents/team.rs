@@ -369,7 +369,7 @@ impl Team {
 
     /// A record read back whole, or none for anything malformed or of another schema. Its `policy` is the stricter of
     /// the stored word and the one its flags give: a record is never trusted for more than either allows.
-    fn from_json(v: &Value) -> Option<Team> {
+    pub(crate) fn from_json(v: &Value) -> Option<Team> {
         let text = |k: &str| v.get(k).and_then(Value::as_str).map(String::from);
         if v.get("schema").and_then(Value::as_u64) != Some(SCHEMA) {
             return None;

@@ -64,6 +64,8 @@ mod reconcile_tests;
 mod reconcile_verb_race_tests;
 #[cfg(test)]
 mod reconcile_verb_tests;
+#[cfg(test)]
+mod recover_tests;
 pub mod registry;
 pub mod release;
 pub mod resume;

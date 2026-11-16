@@ -13,6 +13,7 @@ use serde_json::{Map, Value, json};
 
 mod restore;
 use restore::Done;
+pub(crate) use restore::{Next, launch_next};
 
 /// What one pass read of a member (6b-R1); `classify` decides from this alone.
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -93,6 +94,17 @@ pub fn classify(s: &Seen) -> Row {
 /// no hc and no second adjudication (r6b call 29); only a restore release without one is adjudicated (row 0 needs
 /// its verdict).
 pub fn observe(tx: &Tx<'_>, lazy: &Lazy<'_>, g: &Gen) -> Res<(Seen, Option<Terminal>)> {
+    look(tx, lazy, g, false)
+}
+
+/// restore-6c (call 25, checklist 1-4): recovery's one observation. A stopped member is observed past its stop
+/// (its marks, its life) and its verdict is only its recorded outcome, parsed (`Verdict::parse`), never a new
+/// adjudication. hc unreachable for a generation not done is a refusal, never "no recovery".
+pub(crate) fn observe_recovery(tx: &Tx<'_>, lazy: &Lazy<'_>, g: &Gen) -> Res<Seen> {
+    look(tx, lazy, g, true).map(|(s, _)| s)
+}
+
+fn look(tx: &Tx<'_>, lazy: &Lazy<'_>, g: &Gen, recovery: bool) -> Res<(Seen, Option<Terminal>)> {
     let mut s = Seen {
         stopped: super::cascade::desired_of(g.folder())? == super::cascade::Desired::Stopped,
         pending: g.pending().is_some(),
@@ -101,9 +113,17 @@ pub fn observe(tx: &Tx<'_>, lazy: &Lazy<'_>, g: &Gen) -> Res<(Seen, Option<Termi
     let Some(n) = g.active() else {
         return Ok((s, None));
     };
-    if s.stopped {
+    if s.stopped && !recovery {
         return Ok((s, None));
     }
+    let stopped = s.stopped;
+    let judge = |id: &str, seen: Option<&Terminal>| {
+        if stopped {
+            recorded(g.folder(), n) // a stopped member: its recorded outcome only (call 25)
+        } else {
+            judged(tx, id, n, seen)
+        }
+    };
     let marks = super::gens::marks(g.folder(), n)?; // Unreadable: Err before hc and before any release (call 14)
     let release = g.read(n, "release").known()?;
     s.cause = release
@@ -119,7 +139,7 @@ pub fn observe(tx: &Tx<'_>, lazy: &Lazy<'_>, g: &Gen) -> Res<(Seen, Option<Termi
             // row 0 resumes the conversation that ran (r6b call 15)
             s.session = session_of(g.read(n, "launch").known()?.as_ref());
             if s.verdict.is_none() {
-                s.verdict = judged(tx, &id, n, None)?;
+                s.verdict = judge(&id, None)?;
             }
         }
         return Ok((s, None));
@@ -131,7 +151,7 @@ pub fn observe(tx: &Tx<'_>, lazy: &Lazy<'_>, g: &Gen) -> Res<(Seen, Option<Termi
     s.session = session_of(launch.as_ref());
     if s.pending {
         // r6b call 24: the member stays Unknown("pending"), its active generation is still adjudicated.
-        s.verdict = judged(tx, &id, n, None)?;
+        s.verdict = judge(&id, None)?;
         return Ok((s, None));
     }
     let Ok(core) = lazy.get() else {
@@ -157,7 +177,7 @@ pub fn observe(tx: &Tx<'_>, lazy: &Lazy<'_>, g: &Gen) -> Res<(Seen, Option<Termi
         super::gens::record_end(g.folder(), g.record(), n, t, &utc_o(tx.ctx.clock.now()))?;
         s.ended = true;
     }
-    s.verdict = judged(tx, &id, n, seen.as_ref())?;
+    s.verdict = judge(&id, seen.as_ref())?;
     Ok((s, seen))
 }
 
@@ -325,10 +345,18 @@ fn no_team<T>() -> Res<T> {
 }
 
 /// The `upTeam` a lifecycle leader record of `scope` names. Whether it ran is decided by `existing` alone.
-fn session_team(ctx: &Ctx, scope: &super::team_state::Scope) -> Res<Option<String>> {
+/// restore-6c checklist 6: an unreadable member may be that leader. When no leader is found and the session has a
+/// team record (present or unreadable), the unreadable member's `evidence` is returned, never "no team".
+pub(crate) fn session_team(ctx: &Ctx, scope: &super::team_state::Scope) -> Res<Option<String>> {
+    let mut torn = None;
     for (_, _, member) in super::gens::members(&scope.agents(&ctx.state_root))? {
-        let super::gens::Member::Life(g) = member else {
-            continue;
+        let g = match member {
+            super::gens::Member::Life(g) => g,
+            super::gens::Member::Unreadable(e) => {
+                torn.get_or_insert(e);
+                continue;
+            }
+            _ => continue,
         };
         let r = g.record();
         if r.get("session").and_then(Value::as_str) == Some(scope.session.as_str())
@@ -337,7 +365,18 @@ fn session_team(ctx: &Ctx, scope: &super::team_state::Scope) -> Res<Option<Strin
             return Ok(r.get("upTeam").and_then(Value::as_str).map(str::to_owned));
         }
     }
-    Ok(None)
+    let file = super::team::path(&ctx.state_root.join(&scope.key), &scope.session);
+    match torn {
+        Some(e)
+            if !matches!(
+                crate::state::evidence::read(&file),
+                crate::state::evidence::Evidence::Absent
+            ) =>
+        {
+            Err(e)
+        }
+        _ => Ok(None),
+    }
 }
 
 /// The person caller with its state at the anchor `scope` (re6a call 13, replacing restore-6b ambiguity 7's
