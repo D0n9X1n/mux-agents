@@ -52,7 +52,7 @@ fn relaunch(tx: &Tx<'_>, core: &Core<'_>, id: &str, g: &Gen, sid: &str) -> Res<u
     let flags = super::super::options::replay(client, &stored, ceiling)?;
     let spec = json!({"schema": 1, "stateDirectory": utf8(&server)?, "client": client_name(client),
         "flags": flags, "parentPane": r.get("parentPane"),
-        "args": client_args(client, Recipe::Resume, sid, None)});
+        "args": client_args(client, Recipe::Resume(None), sid, None)});
     let launch = super::super::core_launch::Launch {
         id: id.into(),
         kind: "restore",
