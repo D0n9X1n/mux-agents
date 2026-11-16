@@ -944,6 +944,8 @@ fn resume_case(case: &str) -> (Mw, Res<Map<String, Value>>, String, Held) {
         &m.folder(&x).join("spec.json"),
         json!({"flags": if bypass { json!(["--dangerously-skip-permissions"]) } else { json!([]) }}),
     );
+    // prelife-1c G10d: the subject is a lifecycle member whose record proves it Ended (state-0 S6).
+    crate::agents::prelife_fixture::to_lifecycle(&m.w, &x, true);
     if case == "parent-bound" {
         std::fs::remove_file(t::path(&m.state, "$3")).unwrap();
         team_record(&m.w, &["--dangerously-skip-permissions"]);
@@ -1066,8 +1068,9 @@ fn a_persons_resume_is_free() {
     let x = "dddddddddddd";
     let mut rx = child(x, LEADER, 1);
     rx["sessionId"] = json!("22222222-2222-4222-8222-222222222222");
-    let rx = cf::member(&w, x, rx);
+    cf::member(&w, x, rx);
     write(&w.folder(x).join("spec.json"), json!({"flags": []}));
+    let rx = crate::agents::prelife_fixture::to_lifecycle(&w, x, true); // prelife-1c G10d
     let (rows, budget) = (
         vec![cf::member(&w, LEADER, leader_record())],
         crate::agents::budget::path(&w.state(), "$3"),
@@ -1088,11 +1091,13 @@ fn a_persons_resume_is_free() {
     );
     w.fakes.hc_done().unwrap();
 }
-/// A person's resume where limit, ceiling and name all fail: v5 order gives limit, then ceiling, then name.
+/// A person's resume where limit, ceiling and name all fail: a lifecycle subject replays its stored options against
+/// the team ceiling first (E2, p1c delivery call: fail closed), then limit, then name.
 #[test]
 fn resume_refuses_in_v5_order() {
     for (more, bypass, check) in [
-        (5, false, "limit"),
+        (5, false, "ceiling"),
+        (5, true, "limit"),
         (4, false, "ceiling"),
         (4, true, "name"),
     ] {
@@ -1111,11 +1116,12 @@ fn resume_refuses_in_v5_order() {
             json!("worker"),
             json!("22222222-2222-4222-8222-222222222222"),
         );
-        let rx = cf::member(&w, x, rx);
+        cf::member(&w, x, rx);
         write(
             &w.folder(x).join("spec.json"),
             json!({"flags": ["--dangerously-skip-permissions"]}),
         );
+        let rx = crate::agents::prelife_fixture::to_lifecycle(&w, x, true); // prelife-1c G10d
         let mut rt = child(twin, LEADER, 1);
         rt["name"] = json!("worker");
         let mut rows = vec![
@@ -1149,20 +1155,23 @@ fn resume_refuses_in_v5_order() {
         "leaderless refuses before hc"
     );
 }
-/// Through the CLI: a candidate whose proof fails refuses 2 `tagged` and makes no folder.
+/// Through the CLI: a pre-lifecycle candidate is refused 2 `state` from its record (G10d, before `tagged` and any
+/// hc call; p1c delivery call) and makes no folder.
 #[test]
 fn a_candidate_resume_is_refused_with_no_side_effects() {
-    let mut m = member_world();
-    m.w.fakes.forget(170);
+    let m = member_world();
     let before = std::fs::read_dir(m.state.join("agents")).unwrap().count();
-    m.hc();
-    m.rounds(3, &term(&m.r, Some(150)));
     let (code, out) = crate::cli::run(&["resume", "mbb"].map(String::from), || Ok(&m.w.ctx));
     assert_eq!(
-        (code, out.contains(r#""check":"tagged""#)),
-        (2, true),
+        (
+            code,
+            out.contains(r#""check":"state""#),
+            out.contains("pre-lifecycle")
+        ),
+        (2, true, true),
         "{out}"
     );
+    assert!(m.w.fakes.hc_calls().is_empty(), "refused before hc");
     assert_eq!(
         std::fs::read_dir(m.state.join("agents")).unwrap().count(),
         before
@@ -1544,8 +1553,10 @@ fn a_second_root_grants_no_authority() {
         );
     }
 }
-/// A resume reads launch specs only inside the state root (#104): the target's spec.json, or its parent's, linked to a
-/// file outside refuses, never resuming with flags read through the link.
+/// A resume reads launch specs only inside the state root (#104): a parent's spec.json linked to a file outside
+/// refuses, never resuming with flags read through the link. A target whose own spec.json is linked is a
+/// pre-lifecycle folder (the folder spec is read only on that path), so G10d refuses it `state` before any read of
+/// the link (prelife-1c Task 4: retired as written), and the link target is untouched.
 #[test]
 fn a_linked_spec_refuses_a_resume() {
     for case in ["target", "parent"] {
@@ -1563,8 +1574,11 @@ fn a_linked_spec_refuses_a_resume() {
             write(&w.folder(p).join("spec.json"), json!({"flags": []}));
         }
         rx["sessionId"] = json!("22222222-2222-4222-8222-222222222222");
-        let rx = cf::member(&w, x, rx);
+        let mut rx = cf::member(&w, x, rx);
         write(&w.folder(x).join("spec.json"), json!({"flags": []}));
+        if case == "parent" {
+            rx = crate::agents::prelife_fixture::to_lifecycle(&w, x, true); // prelife-1c G10d
+        }
         let outside = w._dir.path().join("outside");
         std::fs::create_dir(&outside).unwrap();
         let spec = w
@@ -1580,22 +1594,30 @@ fn a_linked_spec_refuses_a_resume() {
             eprintln!("{case}: skipped, no link: {e}");
             continue;
         }
-        cf::online(&w);
-        facts_of(
-            &w,
-            &crate::agents::membership::team(&w.caller()),
-            &rows,
-            &rx,
-        );
+        let outside_bytes = std::fs::read(&moved).unwrap();
+        if case == "parent" {
+            cf::online(&w);
+            facts_of(
+                &w,
+                &crate::agents::membership::team(&w.caller()),
+                &rows,
+                &rx,
+            );
+        }
         let e = crate::agents::resume::resume(&w.ctx, &w.request(&["resume", x])).unwrap_err();
         let want = match case {
             "target" => (
-                "internal",
-                "unexpected error (the ended member's launch spec names no client flags)",
+                "state",
+                "mdd predates lifecycle records (pre-lifecycle) and is never resumed",
             ),
             _ => ("authority", "the parent chain of mdd cannot be read"),
         };
         assert_eq!((e.check, e.message.as_str()), want, "{case}");
+        assert_eq!(
+            std::fs::read(&moved).unwrap(),
+            outside_bytes,
+            "{case}: link target untouched"
+        );
         assert!(
             !w.fakes
                 .hc_calls()

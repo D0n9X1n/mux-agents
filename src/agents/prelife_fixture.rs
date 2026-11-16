@@ -205,3 +205,46 @@ pub fn admit_spawn(w: &World) -> crate::error::Res<crate::agents::tree::Placed> 
         s.name_only(None, Client::Claude, "add subtract")
     })
 }
+
+/// Makes `id`'s hc record (written by `cf::member`) a lifecycle generation-0 subject: `lifecycle: 1`, `options`
+/// from its `spec.json` flags (else kept or empty), commit Run, `launch.json`, its view, and, when `ended`, the
+/// recorded end (state-0 S6), so the record decides it Ended whatever hc says.
+pub fn to_lifecycle(w: &World, id: &str, ended: bool) -> Value {
+    let f = w.folder(id);
+    let mut r: Value = crate::state::fs::read_json(&f.join("record.json"))
+        .unwrap()
+        .unwrap();
+    let flags = crate::state::fs::read_json(&f.join("spec.json"))
+        .ok()
+        .flatten()
+        .and_then(|s| s.get("flags").cloned());
+    r["lifecycle"] = json!(1);
+    if r.get("options").is_none() {
+        r["options"] = flags.unwrap_or_else(|| json!([]));
+    }
+    crate::agents::fixture::write(&f.join("record.json"), r.clone());
+    let name = format!("m{}", &id[..8]);
+    for (file, body) in [
+        ("commit", json!({"committed": true})),
+        ("launch", json!({"hcName": name})),
+    ] {
+        let path = crate::agents::gens::path(&f, 0, file);
+        if !path.exists() {
+            crate::state::evidence::publish(&path, &body).unwrap();
+        }
+    }
+    crate::agents::fixture::write(
+        &f.join("view.json"),
+        json!({"pane": r["pane"], "window": r["window"], "startCommand": r["startCommand"], "gen": 0,
+            "hcAddress": r["hcAddress"], "hcName": name}),
+    );
+    let ended_path = crate::agents::gens::path(&f, 0, "ended");
+    if ended && !ended_path.exists() {
+        crate::state::evidence::publish(
+            &ended_path,
+            &json!({"state": "finished", "reason": "exited"}),
+        )
+        .unwrap();
+    }
+    r
+}
