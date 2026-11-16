@@ -145,6 +145,33 @@ pub fn sync_file(path: &Path) -> io::Result<()> {
 
 #[cfg(test)]
 thread_local! {
+    // A folder whose `create_dir` makes it, then fails, on this thread (a3b call 27).
+    static CREATE_FAULT: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Makes `create_dir(dir)` make `dir`, then answer an error, on this thread for exactly `dir` (none: no failure).
+#[cfg(test)]
+pub fn fail_create_dir(dir: Option<&Path>) {
+    CREATE_FAULT.with(|fault| *fault.borrow_mut() = dir.map(Path::to_path_buf));
+}
+
+#[cfg(test)]
+thread_local! {
+    // While `record_syncs` runs on this thread: every folder `sync_dir` was asked to flush, in order.
+    static SYNCS: std::cell::RefCell<Option<Vec<PathBuf>>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Runs `f` and answers its result with every folder `sync_dir` was asked to flush on this thread meanwhile.
+#[cfg(test)]
+pub fn record_syncs<T>(f: impl FnOnce() -> T) -> (T, Vec<PathBuf>) {
+    SYNCS.with(|syncs| *syncs.borrow_mut() = Some(Vec::new()));
+    let got = f();
+    let syncs = SYNCS.with(|syncs| syncs.borrow_mut().take().unwrap_or_default());
+    (got, syncs)
+}
+
+#[cfg(test)]
+thread_local! {
     // While `record_reads` runs on this thread: every path `read_json` was asked to open, in order.
     static READS: std::cell::RefCell<Option<Vec<PathBuf>>> = const { std::cell::RefCell::new(None) };
 }
@@ -166,8 +193,11 @@ pub fn claim_json(path: &Path, value: &Value) -> Res<bool> {
     name.push(format!(".{}.tmp", crate::util::guid()?.replace('-', "")));
     let tmp = PathBuf::from(name);
     // The content is on disk before the name appears, so a claim seen after a crash is never empty.
-    write_new(&tmp, value.to_string().as_bytes())
-        .and_then(|()| OpenOptions::new().write(true).open(&tmp)?.sync_data())?;
+    let flushed = write_new(&tmp, value.to_string().as_bytes()).and_then(|()| sync_file(&tmp));
+    if let Err(e) = flushed {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e.into());
+    }
     let linked = std::fs::hard_link(&tmp, path);
     let _ = std::fs::remove_file(&tmp);
     match linked {
@@ -175,6 +205,16 @@ pub fn claim_json(path: &Path, value: &Value) -> Res<bool> {
         Err(e) if e.kind() == io::ErrorKind::AlreadyExists => Ok(false),
         Err(e) => Err(e.into()),
     }
+}
+
+/// Makes one folder (`std::fs::create_dir`), through the test fault point `fail_create_dir`.
+pub fn create_dir(dir: &Path) -> io::Result<()> {
+    #[cfg(test)]
+    if CREATE_FAULT.with(|fault| fault.borrow().as_deref() == Some(dir)) {
+        std::fs::create_dir(dir)?;
+        return Err(io::Error::other("injected folder creation failure"));
+    }
+    std::fs::create_dir(dir)
 }
 
 /// Makes `dir` and flushes, on every call, each folder from `dir` up to `base` into its parent, so a retry finishes
@@ -194,6 +234,12 @@ pub fn durable_dir(dir: &Path, base: &Path) -> Res<()> {
 /// with the right to add a subfolder (FILE_APPEND_DATA) and backup semantics: the least access FlushFileBuffers
 /// takes, and the right a folder made in it needed; a read-only open cannot flush there.
 pub fn sync_dir(dir: &Path) -> io::Result<()> {
+    #[cfg(test)]
+    SYNCS.with(|syncs| {
+        if let Some(syncs) = syncs.borrow_mut().as_mut() {
+            syncs.push(dir.to_path_buf());
+        }
+    });
     #[cfg(test)]
     if SYNC_FAULT.with(|fault| fault.borrow().as_deref() == Some(dir)) {
         return Err(io::Error::other("injected folder flush failure"));

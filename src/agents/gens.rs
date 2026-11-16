@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use serde_json::Value;
 
 use crate::error::{Refusal, Res};
-use crate::state::evidence::{self, Evidence};
+use crate::state::evidence::{self, Evidence, Published};
 
 /// Every create-once file of a generation (S5); the claim lives beside the folder.
 pub const FILES: [&str; 15] = [
@@ -79,6 +79,114 @@ pub fn read(member: &Path, n: u64, file: &str) -> Evidence {
 
 pub fn claim(member: &Path, n: u64) -> Evidence {
     walk(member, &["gens", &format!("{n}.claim")])
+}
+
+/// R-W3: a write or the content flush before the link failed; the name was never made.
+pub const NOT_PUBLISHED: &str = "generation evidence could not be published";
+/// R-W3: a folder flush failed after the read or the link; the name may be visible but is not durable.
+pub const NOT_FLUSHED: &str = "generation evidence could not be flushed";
+
+fn state_refusal(message: &str) -> Refusal {
+    Refusal {
+        code: 1,
+        check: "state",
+        message: message.into(),
+        reason: None,
+        leftover: None,
+        details: Default::default(),
+    }
+}
+
+/// Call 18a, the one publisher of `gens/<n>/<file>.json` (R-W1).
+pub fn publish_once(member: &Path, n: u64, file: &str, body: &Value) -> Res<Published> {
+    debug_assert!(FILES.contains(&file), "{file}");
+    let level = n.to_string();
+    publish_at(member, &["gens", &level], &format!("{file}.json"), body)
+}
+
+/// Call 18a, the one publisher of `gens/<n>.claim`: as `publish_once`, one level up (a claim sits beside `gens/<n>/`).
+pub fn publish_claim_once(member: &Path, n: u64, body: &Value) -> Res<Published> {
+    publish_at(member, &["gens"], &format!("{n}.claim"), body)
+}
+
+/// R-W1. `member` is `<root>/<key>/agents/<id>`. Walks from the state root: `<key>` and `agents` must be real folders;
+/// `<id>` and each of `levels` are made when missing, one level at a time, then must be real folders
+/// (`symlink_metadata` never follows a link; a link, a junction or a file is `evidence`). A creation error other than
+/// "already exists" is `evidence` too (call 27). Then one read of `name`: Present is `Exists` before anything is
+/// written, Unreadable refuses. Absent: `claim_json` links a body whose content was flushed first (a racer that links
+/// first makes this `Exists`). Then, on every call, the folder holding `name` and each folder above it up to
+/// `agents` is flushed; a failed flush is a failed publication.
+fn publish_at(member: &Path, levels: &[&str], name: &str, body: &Value) -> Res<Published> {
+    let Some(root) = member.ancestors().nth(3) else {
+        return Err(evidence::unreadable());
+    };
+    let names = member
+        .strip_prefix(root)
+        .map_err(|_| evidence::unreadable())?;
+    let all: Vec<&std::ffi::OsStr> = names
+        .iter()
+        .chain(levels.iter().map(std::ffi::OsStr::new))
+        .collect();
+    let mut chain: Vec<PathBuf> = Vec::new();
+    let mut at = root.to_path_buf();
+    for (i, part) in all.iter().enumerate() {
+        at.push(part);
+        // <key> (0) and agents (1) are never made here; <id> (2) and below are.
+        if i >= 2 {
+            match crate::state::fs::create_dir(&at) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(_) => return Err(evidence::unreadable()),
+            }
+        }
+        if !std::fs::symlink_metadata(&at).is_ok_and(|m| m.is_dir()) {
+            return Err(evidence::unreadable());
+        }
+        chain.push(at.clone());
+    }
+    let target = at.join(name);
+    let found = match evidence::read(&target) {
+        Evidence::Present(_) => Published::Exists,
+        Evidence::Unreadable => return Err(evidence::unreadable()),
+        Evidence::Absent => {
+            #[cfg(test)]
+            publish_hooks::fire(&target);
+            match crate::state::fs::claim_json(&target, body) {
+                Ok(true) => Published::Published,
+                Ok(false) => Published::Exists,
+                Err(_) => return Err(state_refusal(NOT_PUBLISHED)),
+            }
+        }
+    };
+    // chain: <key>, agents, <id>, levels...; flushed innermost first, down to agents (index 1). <key> holds no entry
+    // this call can have made.
+    for folder in chain[1..].iter().rev() {
+        if crate::state::fs::sync_dir(folder).is_err() {
+            return Err(state_refusal(NOT_FLUSHED));
+        }
+    }
+    Ok(found)
+}
+
+/// Test hook: runs between the read and the link, so a racer can link first.
+#[cfg(test)]
+pub(crate) mod publish_hooks {
+    use std::cell::RefCell;
+    use std::path::Path;
+    pub(crate) type Hook = Box<dyn Fn(&Path)>;
+    thread_local! {
+        static BEFORE_LINK: RefCell<Option<Hook>> = const { RefCell::new(None) };
+    }
+    pub(crate) fn before_link(hook: Option<Hook>) {
+        BEFORE_LINK.with(|h| *h.borrow_mut() = hook);
+    }
+    pub(super) fn fire(target: &Path) {
+        BEFORE_LINK.with(|h| {
+            if let Some(f) = h.borrow().as_ref() {
+                f(target);
+            }
+        });
+    }
 }
 
 /// The notice delivery id of generation `n` of member `id`.
@@ -1212,3 +1320,7 @@ mod client_tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "gens_publish_tests.rs"]
+mod publish_tests;
