@@ -61,6 +61,65 @@ fn a_child_past_its_bound_is_killed_and_refused() {
     }
 }
 
+// o2 call 29 (QA #146 F3): `bounded::output` never answers success with output it did not finish reading. The child
+// prints and exits while a descendant keeps its stdout open about 8 s: refused `TimedOut` naming stdout, within the
+// 5 s grace and the 1 s release (so the read handle was dropped, not left blocked until the descendant ends). A
+// normal child keeps its whole output, past one pipe buffer. Needs no rmux.
+#[test]
+fn bounded_output_never_answers_with_unread_output() {
+    let begun = Instant::now();
+    let mut held = Command::new("cmd.exe");
+    // The descendant (an inner cmd) holds stdout and writes nothing: only a cancelled read can drop the handle.
+    held.args([
+        "/C",
+        "echo",
+        "expected",
+        "output",
+        "&",
+        "start",
+        "/b",
+        "cmd",
+        "/c",
+        "ping -n 9 127.0.0.1 >nul",
+    ]);
+    let got = bounded::output(&mut held, bounded::LIMIT);
+    let took = begun.elapsed();
+    let err = got.map(|o| String::from_utf8_lossy(&o.stdout).into_owned());
+    let err = match err {
+        Ok(stdout) => {
+            panic!("answered success with stdout {stdout:?} while a descendant held the pipe")
+        }
+        Err(e) => e,
+    };
+    assert_eq!(err.kind(), std::io::ErrorKind::TimedOut, "{err}");
+    assert!(err.to_string().contains("stdout"), "{err}");
+    assert!(
+        !err.to_string().contains("could not be stopped"),
+        "the read handle was not dropped: {err}"
+    );
+    assert!(
+        took < Duration::from_millis(7500),
+        "the read handle was not dropped: {took:?}"
+    );
+    let mut full = Command::new("cmd.exe");
+    full.args([
+        "/C",
+        "for",
+        "/L",
+        "%i",
+        "in",
+        "(1,1,3000)",
+        "do",
+        "@echo",
+        "line-%i",
+    ]);
+    let out = bounded::output(&mut full, bounded::LIMIT).unwrap();
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "{out:?}");
+    assert_eq!(text.lines().count(), 3000, "the whole output");
+    assert_eq!(text.lines().last(), Some("line-3000"));
+}
+
 // Generous for loaded runners: a wait only runs this long when something is wrong.
 const WAIT: Duration = Duration::from_secs(60);
 const MUX_AGENT: &str = env!("CARGO_BIN_EXE_mux-agent");

@@ -49,6 +49,49 @@ fn a_child_past_its_bound_is_killed_and_refused() {
     }
 }
 
+// o2 call 29 (QA #146 F3): the Unix twin of live_windows.rs's: a descendant keeps stdout open 8 s after the child
+// exits: refused `TimedOut` naming stdout, the read handle dropped; a normal child keeps its whole output.
+#[cfg(unix)]
+#[test]
+fn bounded_output_never_answers_with_unread_output() {
+    use std::process::Command;
+    use std::time::{Duration, Instant};
+    let begun = Instant::now();
+    let got = support::bounded::output(
+        Command::new("/bin/sh").args(["-c", "echo expected output; (sleep 8; echo late) &"]),
+        support::bounded::LIMIT,
+    );
+    let took = begun.elapsed();
+    let err = match got.map(|o| String::from_utf8_lossy(&o.stdout).into_owned()) {
+        Ok(stdout) => {
+            panic!("answered success with stdout {stdout:?} while a descendant held the pipe")
+        }
+        Err(e) => e,
+    };
+    assert_eq!(err.kind(), std::io::ErrorKind::TimedOut, "{err}");
+    assert!(err.to_string().contains("stdout"), "{err}");
+    assert!(
+        !err.to_string().contains("could not be stopped"),
+        "the read handle was not dropped: {err}"
+    );
+    assert!(
+        took < Duration::from_millis(7500),
+        "the read handle was not dropped: {took:?}"
+    );
+    let out = support::bounded::output(
+        Command::new("/bin/sh").args([
+            "-c",
+            "i=1; while [ $i -le 3000 ]; do echo line-$i; i=$((i+1)); done",
+        ]),
+        support::bounded::LIMIT,
+    )
+    .unwrap();
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "{out:?}");
+    assert_eq!(text.lines().count(), 3000, "the whole output");
+    assert_eq!(text.lines().last(), Some("line-3000"));
+}
+
 // Which multiplexers this run covers: each one's `-V` and binary, or why it is skipped. MUX_AGENTS_LIVE_REQUIRE
 // (`tmux,tmux32,rmux`, any subset) turns a skip into a failure, here and in every scenario.
 #[cfg(unix)]
