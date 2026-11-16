@@ -704,3 +704,30 @@ fn a_leader_view_failure_is_reported_and_the_leader_stays() {
         "nothing rolled back"
     );
 }
+
+// cascade-3d C8: `up` finishes the caller's session's journals under `up|<team>` before anything else; an
+// unreadable journal refuses `evidence` before any hc run.
+#[test]
+fn up_finishes_a_kept_cascade_first() {
+    let w = ready();
+    let scope = crate::agents::team_state::Scope::of(&w.caller());
+    let dir = crate::agents::cascade::dir_at(&w.ctx, &scope);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("aaaaaaaaaaa1.json"), b"{").unwrap();
+    assert_eq!(claude(&w).unwrap_err().check, "evidence");
+    assert!(
+        w.fakes.hc_calls().iter().all(|c| c.1[0] != "run"),
+        "nothing launched"
+    );
+    // A fresh world: the first `up` consumed `ready()`'s version answer (fix-cycle finding 11).
+    let w = ready();
+    let scope = crate::agents::team_state::Scope::of(&w.caller());
+    let dir = crate::agents::cascade::dir_at(&w.ctx, &scope);
+    std::fs::create_dir_all(&dir).unwrap();
+    let a = crate::agents::cascade_fixture::A;
+    crate::agents::cascade_fixture::member(&w, a, None, 0, json!({}));
+    crate::agents::cascade_fixture::done(&w, a);
+    crate::agents::cascade_fixture::seed(&w, a, &[a], true);
+    let _ = claude(&w);
+    assert!(!dir.join("aaaaaaaaaaa1.json").exists(), "finished");
+}

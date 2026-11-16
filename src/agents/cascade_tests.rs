@@ -1451,3 +1451,55 @@ fn a_stopped_root_stays_closed() {
     assert!(cx::stopped(&w, L), "L stays stopped");
     w.fakes.hc_done().unwrap();
 }
+
+/// A prepared journal of A whose only entry is already ended and noticed: the next pass only removes it.
+fn complete(w: &World) {
+    cx::member(w, L, None, 0, json!({}));
+    cx::member(w, A, Some(L), 1, json!({}));
+    cx::done(w, A);
+    cx::seed(w, A, &[A], true);
+}
+
+// C8: one try of the team lock finishes a kept journal; a busy lock is skipped at once (no wait, no error).
+#[test]
+fn the_bar_tick_tries_the_team_lock_once() {
+    let (w, s) = lf::world();
+    complete(&w);
+    w.fakes.lock_timeout(&s.team_lock());
+    assert!(!tick(&w.ctx, &w.caller()).unwrap(), "busy: skipped");
+    assert!(cx::journal_of(&w, A).exists());
+    assert!(
+        w.fakes.locks().contains(&format!("?{}", s.team_lock())),
+        "one try, recorded busy"
+    );
+    let (w, _) = lf::world();
+    complete(&w);
+    assert!(tick(&w.ctx, &w.caller()).unwrap());
+    assert!(!cx::journal_of(&w, A).exists(), "finished");
+    let (w, _) = lf::world();
+    assert!(
+        !tick(&w.ctx, &w.caller()).unwrap(),
+        "no journal folder: no lock taken"
+    );
+    assert!(w.fakes.locks().is_empty());
+}
+
+// C8 "stop or a bar tick finishes it, no deadlock": real locks (Unix flock, Windows named mutex); a tick, then a
+// stop of another member, each take the team lock once and return.
+#[test]
+fn stop_and_tick_never_deadlock() {
+    let (w, s) = lf::world();
+    w.fakes.real_locks(&w._dir.path().join("locks"));
+    complete(&w);
+    assert!(tick(&w.ctx, &w.caller()).unwrap());
+    cx::member(&w, B, Some(A), 2, json!({}));
+    cx::terminates(&w, B);
+    let c = w.caller();
+    let r = crate::agents::team_state::open(&w.ctx, &s, |tx| {
+        let kept = finish(tx, &c)?;
+        stop(tx, &c, B, &kept)
+    })
+    .unwrap();
+    assert!(r.stopped);
+    w.fakes.hc_done().unwrap();
+}

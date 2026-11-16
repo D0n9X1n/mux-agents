@@ -896,6 +896,19 @@ pub fn reopen_same<T>(tx: &Tx<'_>, id: &str, launch: impl FnOnce() -> Res<T>) ->
     launch()
 }
 
+/// C8, the bar: a lock-free look for the journal folder, then one try of the team lock (state-0 S9: the bar
+/// try-locks). Busy: false at once. A refusal (an `Unreadable` journal) is returned; the board ignores it.
+pub fn tick(ctx: &Ctx, caller: &Caller) -> Res<bool> {
+    let scope = Scope::of(caller);
+    if !waiting(ctx, &scope) {
+        return Ok(false);
+    }
+    let ran = super::try_lock(ctx, &scope.team_lock(), || {
+        super::team_state::held(ctx, &scope, |tx| finish(tx, caller))
+    })?;
+    Ok(ran.is_some())
+}
+
 #[cfg(test)]
 #[path = "cascade_tests.rs"]
 mod tests;

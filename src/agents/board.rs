@@ -39,6 +39,11 @@ pub fn select_doing(
 /// locks finish before sorted mailbox reads, followed by each row's agent lock. Never refresh or reap views.
 pub fn board(ctx: &Ctx, caller: &Caller, all: bool, watch: bool) -> Res<Map<String, Value>> {
     use super::{lifecycle::Life, membership::Snapshot};
+    // cascade-3d C8: the bar's refresh finishes a cut-short cascade with one try of the team lock. It only displays,
+    // so a busy lock or a refusal changes nothing here; `stop` and `up` refuse on the same journal.
+    if watch {
+        let _ = super::cascade::tick(ctx, caller);
+    }
     let mut snapshot = Snapshot::take(ctx, caller)?;
     // a3b call 42 (as spawn, calls 45, 51): a lifecycle member this snapshot read as not Ended whose generation is done
     // after the reap (this reap recorded its end, or another did) is read again, so the first list after a natural
@@ -2349,6 +2354,21 @@ mod tests {
                 json!(if team { 2 } else { 0 }),
                 "team {team}"
             );
+        }
+    }
+
+    // cascade-3d C8: the bar's refresh (`watch`) finishes a kept cascade first; `list` (no `watch`) does not.
+    #[test]
+    fn a_watch_board_finishes_a_cascade_with_one_try() {
+        use crate::agents::cascade_fixture as cx;
+        for watch in [false, true] {
+            let w = World::human("");
+            w.state();
+            cx::member(&w, cx::A, None, 0, json!({}));
+            cx::done(&w, cx::A);
+            cx::seed(&w, cx::A, &[cx::A], true);
+            let _ = board(&w.ctx, &w.caller(), true, watch); // its own hc reads are not scripted here
+            assert_eq!(cx::journal_of(&w, cx::A).exists(), !watch, "watch {watch}");
         }
     }
 }
