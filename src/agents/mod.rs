@@ -43,6 +43,8 @@ mod prelife_slot_tests;
 pub mod receipt;
 pub mod reconcile;
 #[cfg(test)]
+mod reconcile_observe_tests;
+#[cfg(test)]
 mod reconcile_tests;
 pub mod registry;
 pub mod release;

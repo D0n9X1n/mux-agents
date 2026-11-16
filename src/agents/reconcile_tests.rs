@@ -137,3 +137,72 @@ fn every_row_in_order() {
         assert_eq!(classify(&s), want, "{name}");
     }
 }
+
+use super::core_fixture as cf;
+use super::fixture::World;
+use super::life_fixture as lf;
+use super::reconcile::observe;
+use super::team_state::{self, Scope};
+use crate::hc::Lazy;
+use serde_json::{Value, json};
+use std::path::{Path, PathBuf};
+
+pub(super) const X: &str = "bbbbbbbbbbbb";
+
+/// A lifecycle member `id` of the caller session under `key`: active generation 1 committed, `fields` over it.
+pub(super) fn member_at(w: &World, key: &str, id: &str, fields: Value) -> PathBuf {
+    let folder = w.ctx.state_root.join(key).join("agents").join(id);
+    std::fs::create_dir_all(&folder).unwrap();
+    let dir = w.ctx.cwd.to_str().unwrap().to_string();
+    let mut r = json!({"lifecycle": 1, "id": id, "name": format!("m{}", &id[..3]), "client": "claude",
+        "session": w.caller().session, "sessionId": lf::SID, "team": format!("{key}:{}", w.caller().session),
+        "directory": dir, "options": ["--effort", "high"], "prompt": ["fix"], "depth": 1, "generation": "1",
+        "hcAddress": format!("a{id}"), "hcName": lf::hc_name(1), "launcherArgv": lf::ARGV});
+    for (k, v) in fields.as_object().unwrap() {
+        r[k] = v.clone();
+    }
+    crate::state::fs::write_json(&folder.join("record.json"), &r).unwrap();
+    lf::seed_gen(&folder, 1, Some("run"), lf::committed());
+    folder
+}
+pub(super) fn member(w: &World, id: &str, fields: Value) -> PathBuf {
+    member_at(w, &w.caller().server_key, id, fields)
+}
+/// The terminal hc shows for member `id`, generation n, running `argv`.
+pub(super) fn wire_of(w: &World, id: &str, n: u64, argv: &[&str]) -> Value {
+    json!({"address": format!("a{id}"), "name": lf::hc_name(n), "state": "live", "reason": null,
+        "argv": argv, "exit_code": null, "labels": {"mux.managed": "1", "mux.team": lf::team(w),
+        "mux.id": id, "mux.gen": n.to_string(), "mux.name": "worker"}})
+}
+/// `gens::find`: one `ls` by id and generation, then one `get`.
+pub(super) fn found(w: &World, id: &str, n: u64, wire: &Value) {
+    let (by_id, by_gen) = (format!("mux.id={id}"), format!("mux.gen={n}"));
+    let a = wire["address"].as_str().unwrap();
+    cf::answer(
+        w,
+        &[
+            "ls", "--all", "--label", &by_id, "--label", &by_gen, "--json",
+        ],
+        &json!({"terminals": [{"address": a}]}).to_string(),
+    );
+    cf::answer(w, &["get", a, "--json"], &wire.to_string());
+}
+/// Generation n ready and adjudicated `ok`, as outcome-2 leaves it.
+pub(super) fn ok(folder: &Path, n: u64) {
+    for (file, body) in [
+        ("ready", json!({"at": "t"})),
+        ("outcome", json!({"outcome": "ok", "at": "t"})),
+    ] {
+        crate::state::evidence::publish(&super::gens::path(folder, n, file), &body).unwrap();
+    }
+}
+pub(super) fn observed(w: &World, id: &str) -> crate::error::Res<Seen> {
+    let s = Scope::of(&w.caller());
+    team_state::open(&w.ctx, &s, |tx| {
+        let lazy = Lazy::new(tx.ctx);
+        let super::gens::Member::Life(g) = super::gens::member_of(&tx.folder(id)) else {
+            panic!("not a lifecycle member")
+        };
+        observe(tx, &lazy, &g).map(|(seen, _)| seen)
+    })
+}
