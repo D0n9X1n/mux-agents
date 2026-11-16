@@ -488,6 +488,41 @@ fn agent_line(glyph: Span, name: Span, model: Row, badge: Row, right: Row, cols:
     cut_row(row, cols)
 }
 
+/// o2 call 34: `agent_line` for a recovery row, whose right side (`recover`) is mandatory. When it cannot keep the right
+/// side as `agent_line` does, the model goes, the name is cut, the unread badge yields, then the name goes; only a
+/// right side wider than the whole row is cut.
+fn kept_line(glyph: Span, name: Span, model: Row, badge: Row, right: Row, cols: usize) -> Row {
+    let (glyph_w, right_w) = (paint::width(&glyph.0), row_width(&right));
+    if glyph_w + 1 + row_width(&badge) + 2 + right_w + 4 <= cols {
+        return agent_line(glyph, name, model, badge, right, cols);
+    }
+    let line = |left: Row, right: Row| {
+        let pad = cols.saturating_sub(row_width(&left) + row_width(&right));
+        let mut row = left;
+        row.push(span(" ".repeat(pad), PLAIN));
+        row.extend(right);
+        row
+    };
+    for badge in [badge.clone(), Vec::new()] {
+        let used = glyph_w + 1 + row_width(&badge) + 2 + right_w;
+        if used < cols {
+            let mut left = vec![
+                glyph.clone(),
+                span(" ", PLAIN),
+                (paint::cut(&name.0, cols - used), name.1),
+            ];
+            left.extend(badge);
+            return line(left, right);
+        }
+    }
+    if glyph_w + 1 + right_w <= cols {
+        return line(vec![glyph], right);
+    }
+    let mut row = vec![glyph, span(" ", PLAIN)];
+    row.extend(right);
+    cut_row(row, cols)
+}
+
 /// The one-column margin every content row starts with.
 fn margin(mut row: Row) -> Row {
     row.insert(0, span(" ", PLAIN));
@@ -693,23 +728,60 @@ fn live_parts(row: &Map<String, Value>, look: Look) -> LiveParts {
     }
 }
 
+/// outcome-2 O6 (calls 9, 20): the flat bar's word for a member that needs recovery, running or not.
+fn recovery_word(row: &Map<String, Value>) -> Option<&'static str> {
+    (row.get("needsRecovery") == Some(&Value::Bool(true))).then(|| {
+        if row.get("recoveryRunning") == Some(&Value::Bool(true)) {
+            "recover (still running)"
+        } else {
+            "recover"
+        }
+    })
+}
+
+/// o2 call 28: a recovery row's right side in every flat layout: its words and age when they fit beside the glyph, the
+/// badge and a cut name (`agent_line`'s own test for keeping a right side), else the bare `recover` pill, which
+/// `agent_line` keeps where it would drop the longer side (as the wide bar's `bare` floor).
+fn recovery_side(word: &str, age: &str, glyph: &Span, badge: &Row, cols: usize) -> Row {
+    let full = right(Kind::Blocked, word, age, false);
+    let fixed = paint::width(&glyph.0) + 1 + row_width(badge);
+    if fixed + 2 + row_width(&full) + 4 <= cols {
+        full
+    } else {
+        vec![span("recover", Kind::Blocked.word_style())]
+    }
+}
+
 fn live_row(row: &Map<String, Value>, cols: usize, look: Look) -> Live {
     let p = live_parts(row, look);
     let age_style = if p.muted { DIM } else { PLAIN };
-    let line = agent_line(
+    // Call 20: a Running member that needs recovery keeps its live row (still clickable) with the recovery word.
+    let recovery =
+        recovery_word(row).map(|word| recovery_side(word, &p.age, &p.glyph, &p.badge, cols));
+    let side = recovery
+        .clone()
+        .unwrap_or_else(|| right(p.kind, p.kind.word(), &p.age, p.muted));
+    // o2 call 34: a recovery row never drops its pill.
+    let fit: fn(Span, Span, Row, Row, Row, usize) -> Row = if recovery.is_some() {
+        kept_line
+    } else {
+        agent_line
+    };
+    let line = fit(
         p.glyph.clone(),
         p.name.clone(),
         p.model.clone(),
         p.badge.clone(),
-        right(p.kind, p.kind.word(), &p.age, p.muted),
+        side,
         cols,
     );
-    let compact = agent_line(
+    let compact = fit(
         p.glyph,
         p.name,
         p.model,
         p.badge,
-        vec![span(format!("{:>4}", p.age), age_style)],
+        // o2 call 28: under a section heading a recovery row keeps `recover` in place of its bare age.
+        recovery.unwrap_or_else(|| vec![span(format!("{:>4}", p.age), age_style)]),
         cols,
     );
     Live {
@@ -785,13 +857,30 @@ fn parts(
             continue;
         }
         counted += 1;
-        let (kind, word) = ended_kind(row);
-        let line = agent_line(
+        let (kind, word) = match recovery_word(row) {
+            Some(word) => (Kind::Blocked, word.to_string()),
+            None => ended_kind(row),
+        };
+        let (glyph, age) = (
             span(kind.glyph(look.ascii), kind.style()),
+            format_age(row.get("age")),
+        );
+        let side = match recovery_word(row) {
+            Some(word) => recovery_side(word, &age, &glyph, &Vec::new(), cols),
+            None => right(kind, &word, &age, false),
+        };
+        // o2 call 34: a recovery row never drops its pill.
+        let fit: fn(Span, Span, Row, Row, Row, usize) -> Row = if recovery_word(row).is_some() {
+            kept_line
+        } else {
+            agent_line
+        };
+        let line = fit(
+            glyph,
             span(own_glyphs(&clean(row.get("name"))), DIM),
             Vec::new(),
             Vec::new(),
-            right(kind, &word, &format_age(row.get("age")), false),
+            side,
             cols,
         );
         ended.push(margin(line));
@@ -961,6 +1050,21 @@ fn drop_one(parts: &Parts, shape: &mut Shape) -> bool {
 fn layout(board: Option<&Map<String, Value>>, notes: &[&str], size: Size, look: Look) -> Vec<Row> {
     let notes: Vec<(&str, Style)> = notes.iter().map(|note| (*note, DIM)).collect();
     lay(board, &notes, size, look).rows
+}
+
+/// Tests (o2 call 30): a board's flat bar as plain text, `width` by `height`, so a board test renders what it built.
+#[cfg(test)]
+pub(crate) fn flat_text(board: &Map<String, Value>, width: usize, height: usize) -> Vec<String> {
+    let look = Look {
+        color: false,
+        ascii: false,
+        dumb: false,
+    };
+    lay(Some(board), &[], Size { width, height }, look)
+        .rows
+        .iter()
+        .map(|r| render(r, false))
+        .collect()
 }
 
 /// `layout` with each note in its own style, and the drawn running agents with their rows.
@@ -2966,6 +3070,146 @@ mod tests {
     use crate::mux::Output;
     use crate::testing::Fakes;
     use serde_json::json;
+
+    // o2 call 28 (QA #146 F2): every flat layout keeps `recover` for a member that needs recovery: the compact row under
+    // a section heading (width 60, an idle sibling), and the narrow row (width 30), Running or Lost, running or not (the
+    // bare `recover` pill when its words and age do not fit).
+    #[test]
+    fn every_flat_layout_keeps_recover() {
+        let look = Look {
+            color: false,
+            ascii: false,
+            dumb: false,
+        };
+        let fixer = |state: &str, running: bool, unread: u64| {
+            json!({"name": "fixer", "state": state, "life": state, "age": 60, "activity": "working",
+                "needsRecovery": true, "recoveryRunning": running, "unread": unread})
+        };
+        let rest = json!({"name": "rest", "state": "running", "life": "running", "age": 60, "activity": "idle"});
+        let badge = "\u{2709} 12";
+        // (case, width, rows, the name or its cut shown, the badge shown)
+        for (case, width, agents, name, mail) in [
+            (
+                "compact",
+                60,
+                vec![fixer("running", true, 0), rest.clone()],
+                "fixer",
+                false,
+            ),
+            (
+                "narrow running",
+                30,
+                vec![fixer("running", true, 0)],
+                "fixer",
+                false,
+            ),
+            (
+                "narrow lost",
+                30,
+                vec![fixer("lost", true, 0)],
+                "fixer",
+                false,
+            ),
+            (
+                "narrow lost, not running",
+                30,
+                vec![fixer("lost", false, 0)],
+                "fixer",
+                false,
+            ),
+            // o2 call 34: the name is cut before the pill goes.
+            (
+                "narrowest running",
+                16,
+                vec![fixer("running", true, 0)],
+                "fix",
+                false,
+            ),
+            (
+                "narrowest lost",
+                16,
+                vec![fixer("lost", true, 0)],
+                "fix",
+                false,
+            ),
+            ("unread 12", 20, vec![fixer("running", true, 12)], "f", true),
+            // The badge yields too: at 14 the pill and a cut name fit only without it.
+            (
+                "unread 12, badge yields",
+                14,
+                vec![fixer("running", true, 12)],
+                "f",
+                false,
+            ),
+        ] {
+            let board = json!({"running": 1, "agents": agents});
+            let laid = lay(board.as_object(), &[], Size { width, height: 40 }, look);
+            let text: Vec<String> = laid.rows.iter().map(|r| render(r, false)).collect();
+            let line = text
+                .iter()
+                .skip(1)
+                .find(|l| l.contains("recover"))
+                .cloned()
+                .unwrap_or_default();
+            assert!(line.contains("recover"), "{case}: {text:#?}");
+            assert!(
+                line.contains(name),
+                "{case}: the name, or its cut: {line:?}"
+            );
+            assert_eq!(line.contains(badge), mail, "{case}: the badge: {line:?}");
+            if case == "compact" {
+                assert!(
+                    text.iter().any(|l| l.contains("Working")),
+                    "{case}: no section heading: {text:#?}"
+                );
+            }
+        }
+    }
+
+    // Call 9 and build checklist 1 (call 20): a member that needs recovery reads `recover` on the flat bar too
+    // (`recover (still running)` while its client runs), never its hc state word or its live activity word; a Running
+    // member stays in the live section (still clickable) with the recovery word.
+    #[test]
+    fn the_flat_bar_shows_recover_for_a_member_that_needs_recovery() {
+        for (state, running) in [("lost", false), ("lost", true), ("running", true)] {
+            let board = json!({"running": 0, "agents": [{"name": "fixer", "state": state, "life": state, "age": 60,
+                "activity": "working", "needsRecovery": true, "recoveryRunning": running}]});
+            let look = Look {
+                color: false,
+                ascii: false,
+                dumb: false,
+            };
+            let laid = lay(
+                board.as_object(),
+                &[],
+                Size {
+                    width: 60,
+                    height: 20,
+                },
+                look,
+            );
+            let text: Vec<String> = laid.rows.iter().map(|r| render(r, false)).collect();
+            let fixer = text
+                .iter()
+                .find(|l| l.contains("fixer"))
+                .cloned()
+                .unwrap_or_default();
+            let word = if running {
+                "recover (still running)"
+            } else {
+                "recover"
+            };
+            let case = format!("{state}, running {running}");
+            assert!(
+                fixer.trim_end().ends_with(&format!("{word}   1m")),
+                "{case}: {fixer:?}"
+            );
+            assert!(
+                !fixer.contains("lost") && !fixer.contains("working"),
+                "{case}: {fixer:?}"
+            );
+        }
+    }
     use std::cell::{Cell, RefCell};
     use std::collections::VecDeque;
     use std::rc::Rc;

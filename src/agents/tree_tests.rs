@@ -54,6 +54,7 @@ pub(crate) fn snap(members: &[(&str, Value, Life)], reserved: usize) -> Snapshot
                 committed: true,
                 noticed: false,
                 notice: None,
+                active_done: None,
             },
         );
     }

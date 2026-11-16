@@ -906,12 +906,12 @@ fn integration_runs_cli_tests_with_fake_client() {
         (
             "integration",
             "- name: Live preflight",
-            "- name: Live tests",
+            "- name: Fake client tests",
         ),
         (
             "integration-windows",
             "- name: Clippy with the live tests",
-            "- name: Windows live tests",
+            "- name: Fake client tests",
         ),
     ] {
         let lines = job_lines(&ci, name);
@@ -925,6 +925,52 @@ fn integration_runs_cli_tests_with_fake_client() {
         let previous = lines[..at].iter().rfind(|line| line.starts_with("- name:"));
         assert_eq!(previous.map(String::as_str), Some(before), "{name}");
         assert_eq!(lines[at + 3], after, "{name}");
+    }
+}
+
+// outcome-2 call 14, build checklist 4 (o2 call 23): no live-harness child runs unbounded. Every child the live
+// harnesses and the fake client start goes through `tests/support/bounded.rs` (`output` or a watched `spawn`).
+#[test]
+fn live_harness_subprocesses_are_bounded() {
+    let calls = [".output()", ".spawn()", ".status()"];
+    for file in [
+        "tests/live.rs",
+        "tests/live_windows.rs",
+        "tests/support/mod.rs",
+        "src/bin/fake-client.rs",
+    ] {
+        let text = repo_file(file);
+        let bare: Vec<&str> = text
+            .lines()
+            .filter(|l| calls.iter().any(|c| l.contains(c)))
+            .collect();
+        assert!(bare.is_empty(), "{file}: unbounded child: {bare:?}");
+    }
+}
+
+// outcome-2 Task 7: every live job runs the fake client's own tests right after the CLI tests, then its live tests.
+#[test]
+fn integration_runs_the_fake_client_tests() {
+    let ci = repo_file(CI);
+    for (name, after) in [
+        ("integration", "- name: Live tests"),
+        ("integration-windows", "- name: Windows live tests"),
+    ] {
+        let lines = job_lines(&ci, name);
+        let at = line_of(&lines, "- name: Fake client tests");
+        assert_eq!(
+            lines[at - 3],
+            "- name: CLI tests that need the fake client",
+            "{name}"
+        );
+        let run = [
+            "shell: bash",
+            "run: |",
+            "cargo test --features live,test-panic --locked --test fake_client_bg",
+            "cargo test --features live,test-panic --locked --bin fake-client",
+        ];
+        assert_eq!(&lines[at + 1..at + 5], run, "{name}");
+        assert_eq!(lines[at + 5], after, "{name}");
     }
 }
 

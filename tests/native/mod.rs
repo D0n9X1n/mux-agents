@@ -1,5 +1,5 @@
 //! The binary's own providers on a test's state root, and the fixtures integration tests share.
-// Each test target uses a subset (PM call 16's root in Tasks 8-9, the 150 s wait in Task 9).
+// Each test target uses a subset (PM call 16's root in Tasks 8-9, the 150 s readiness deadline in Task 9).
 #![allow(dead_code)]
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -13,23 +13,46 @@ pub fn private_root(state: &Path) {
     std::fs::set_permissions(state, std::os::unix::fs::PermissionsExt::from_mode(0o700)).unwrap();
 }
 
-/// PM call 18: polls `ready` every 250 ms for at most 150 s on every OS; panics naming `what` and `diagnose()`.
-pub fn wait_150<T>(
-    what: &str,
-    mut ready: impl FnMut() -> Option<T>,
-    diagnose: impl Fn() -> String,
-) -> T {
-    let end = Instant::now() + Duration::from_secs(150);
-    loop {
-        if let Some(v) = ready() {
-            return v;
+/// PM call 18: a new member is ready within 150 s on every OS.
+pub const READY: Duration = Duration::from_secs(150);
+
+/// r2b call 35: one readiness deadline, started at the launch boundary (just before `spawn`). Every wait up to
+/// `ready.json` spends what is left of it; an answer found after it is a failure.
+pub struct Deadline {
+    end: Instant,
+    budget: Duration,
+}
+
+impl Deadline {
+    pub fn start(budget: Duration) -> Deadline {
+        Deadline {
+            end: Instant::now() + budget,
+            budget,
         }
-        assert!(
-            Instant::now() < end,
-            "no {what} within 150 s: {}",
-            diagnose()
-        );
-        std::thread::sleep(Duration::from_millis(250));
+    }
+
+    /// Polls `ready` every 250 ms (at most until the end); panics naming `what` and `diagnose()` once the deadline has
+    /// passed, even when the poll that took it past the end answered.
+    pub fn wait<T>(
+        &self,
+        what: &str,
+        mut ready: impl FnMut() -> Option<T>,
+        diagnose: impl Fn() -> String,
+    ) -> T {
+        loop {
+            let found = ready();
+            let now = Instant::now();
+            assert!(
+                now < self.end,
+                "no {what} within {:?} of the launch: {}",
+                self.budget,
+                diagnose()
+            );
+            if let Some(v) = found {
+                return v;
+            }
+            std::thread::sleep((self.end - now).min(Duration::from_millis(250)));
+        }
     }
 }
 
@@ -244,4 +267,52 @@ pub fn deny_report(child: &std::process::Child) -> String {
     format!(
         "privileges {privileges:?}; groups {groups:?}; child DACL {dacl}; OpenProcess(QUERY_LIMITED) {open}"
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // r2b call 35: an answer found after the deadline is a failure, not a success.
+    #[test]
+    #[should_panic(expected = "within")]
+    fn a_deadline_rejects_an_answer_found_after_it() {
+        let d = Deadline::start(Duration::from_millis(50));
+        d.wait(
+            "a late answer",
+            || {
+                std::thread::sleep(Duration::from_millis(100));
+                Some(())
+            },
+            String::new,
+        );
+    }
+
+    // r2b call 35: time spent before a wait (the spawn, an earlier wait) is charged to the one deadline.
+    #[test]
+    #[should_panic(expected = "within")]
+    fn a_deadline_charges_time_spent_before_the_wait() {
+        let d = Deadline::start(Duration::from_millis(50));
+        std::thread::sleep(Duration::from_millis(100));
+        d.wait(
+            "an answer after the budget is spent",
+            || Some(()),
+            String::new,
+        );
+    }
+
+    #[test]
+    fn a_deadline_returns_an_answer_found_within_it() {
+        let d = Deadline::start(Duration::from_secs(60));
+        let mut polls = 0;
+        let v = d.wait(
+            "the third poll",
+            || {
+                polls += 1;
+                (polls == 3).then_some(7)
+            },
+            String::new,
+        );
+        assert_eq!((v, polls), (7, 3));
+    }
 }

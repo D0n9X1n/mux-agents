@@ -151,7 +151,10 @@ impl Rows<'_> {
         // The bar's feed keys rows by member id (#103 B6); in a team it adds the tree (B1). `list` keeps its columns.
         if self.watch {
             row.insert("id".into(), id.into());
-            if record.get("needsRecovery") == Some(&Value::Bool(true)) {
+            // Call 11: the stored flag counts only for a pre-lifecycle record; `needs_recovery` decides the rest.
+            if !crate::agents::gens::lifecycle(record)
+                && record.get("needsRecovery") == Some(&Value::Bool(true))
+            {
                 row.insert("needsRecovery".into(), true.into());
             }
             if let Some(leader) = &self.leader {

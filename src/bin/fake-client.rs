@@ -5,12 +5,16 @@
 //! - `MUX_IT_DIR` (required): where every file below goes. Without it the client exits 2 at once.
 //! - `MUX_IT_ENTRY`: the mux-agent binary command lines run (default `mux-agent` on PATH).
 //! - `MUX_IT_EXIT`: the exit code on quit (default 0).
+//! - `<MUX_IT_DIR>/resume-gone` (outcome-2 O5): `--resume <id>` prints the client's own "no such conversation" line
+//!   on stderr (by this file's stem: `claude` or `copilot`) and exits 1 before anything is recorded.
 //!
 //! Protocol, all under `$MUX_IT_DIR`; every file the client writes appears whole (written aside, then renamed):
 //! - On start: `client.<pid>.json` = `{"pid", "ppid", "exe", "argv", "sessionId", "worker", "cwd", "tty": {"stdin",
 //!   "stdout"}, "env": {…}}`, then `<pid>` appended to `clients.log`. `exe` is this file's name (`claude`), `argv`
 //!   the arguments after it, `sessionId` the `--session-id` value or null, `worker` whether one was given (a spawned
-//!   agent) and `env` the variables in `ENV` (null when unset). `ppid` is null on Windows.
+//!   agent) and `env` the variables in `ENV` (null when unset). `ppid` is null on Windows. Then, with a session id
+//!   (`--session-id` or `--resume`), `report -Session <sid> -Source startup` through `MUX_IT_ENTRY` on a thread, its
+//!   stdout written whole to `session.<pid>.json` (report-2b K3, as a client's hook).
 //! - Worker mode: a worker runs each line of `worker.cmd`, if present at start, as `worker.<pid>.<n>.{json,err,code}`
 //!   (n from 1), e.g. `send\tparent\t-BodyFile\t{dir}/reply.md` or `status\t-Body\tbusy`.
 //! - Commands: the client polls `cmd.<pid>`; it takes the file (renames it to `cmd.<pid>.taken.<n>`) and runs each
@@ -40,6 +44,10 @@ use serde_json::{Map, Value, json};
 
 const POLL: Duration = Duration::from_millis(50);
 
+// outcome-2 call 23: this client's own children are bounded as the live harness's are.
+#[path = "../../tests/support/bounded.rs"]
+mod bounded;
+
 // The variables a client record carries; never the whole environment.
 const ENV: [&str; 11] = [
     "MUX_AGENTS_STATE",
@@ -55,6 +63,15 @@ const ENV: [&str; 11] = [
     "MUX_AGENTS_GEN",
 ];
 
+/// O5 (verified 2026-11-14): what the real client prints for `--resume` of a conversation it does not have.
+fn gone_message(stem: &str, id: &str) -> String {
+    if stem == "copilot" {
+        format!("Error: No session, task, or name matched '{id}'.")
+    } else {
+        format!("No conversation found with session ID: {id}")
+    }
+}
+
 fn main() {
     let Some(dir) = std::env::var_os("MUX_IT_DIR").map(PathBuf::from) else {
         eprintln!("fake-client: MUX_IT_DIR is not set");
@@ -65,6 +82,21 @@ fn main() {
         .skip(1)
         .map(|a| a.to_string_lossy().into_owned())
         .collect();
+    if dir.join("resume-gone").exists()
+        && let Some(id) = argv
+            .iter()
+            .position(|a| a == "--resume")
+            .and_then(|i| argv.get(i + 1))
+    {
+        let me = std::env::current_exe().ok();
+        let stem = me
+            .as_deref()
+            .and_then(Path::file_stem)
+            .and_then(|s| s.to_str())
+            .unwrap_or("claude");
+        eprintln!("{}", gone_message(stem, id));
+        std::process::exit(1);
+    }
     let sid = argv
         .iter()
         .position(|a| a == "--session-id")
@@ -89,6 +121,28 @@ fn main() {
     });
     write_whole(&dir.join(format!("client.{pid}.json")), record.to_string());
     append(&dir.join("clients.log"), &format!("{pid}\n"));
+
+    // report-2b K3: a client's session-start hook. On a thread: the verb waits up to 10 s for client.json.
+    let resumed = argv
+        .iter()
+        .position(|a| a == "--resume")
+        .and_then(|i| argv.get(i + 1))
+        .cloned();
+    if let Some(sid) = sid.clone().or(resumed) {
+        let (entry, dir) = (entry.clone(), dir.clone());
+        std::thread::spawn(move || {
+            // o2 call 23: this client's own children are bounded (the subprocess pin).
+            let out = bounded::output(
+                Command::new(&entry)
+                    .args(["report", "-Session", &sid, "-Source", "startup"])
+                    .stdin(Stdio::null()),
+                bounded::LIMIT,
+            );
+            if let Ok(out) = out {
+                write_whole(&dir.join(format!("session.{pid}.json")), out.stdout);
+            }
+        });
+    }
 
     let runner = Runner {
         dir: dir.clone(),
@@ -184,10 +238,10 @@ impl Runner {
                 Err(e) => (Vec::new(), format!("fake-client: {e}\n").into_bytes(), -1),
             }
         } else {
-            let out = Command::new(&self.entry)
-                .args(&args)
-                .stdin(Stdio::null())
-                .output();
+            let out = bounded::output(
+                Command::new(&self.entry).args(&args).stdin(Stdio::null()),
+                bounded::LIMIT,
+            );
             match out {
                 Ok(o) => (o.stdout, o.stderr, o.status.code().unwrap_or(-1)),
                 Err(e) => (Vec::new(), format!("fake-client: {e}\n").into_bytes(), -1),
@@ -221,7 +275,8 @@ fn detach() -> std::io::Result<u32> {
             Ok(())
         });
     }
-    Ok(command.spawn()?.id())
+    // Its own `sleep 600` is its end; the watchdog bounds it to the same while this client runs.
+    Ok(bounded::spawn(&mut command, Duration::from_secs(600))?.id())
 }
 
 #[cfg(not(unix))]
@@ -303,6 +358,20 @@ mod tests {
         assert_eq!(
             String::from_utf8(out).unwrap(),
             "grand-marker-1\nsecond line\n"
+        );
+    }
+
+    // O5 (verified 2026-11-14): each client's own words for a conversation it does not have.
+    #[test]
+    fn a_gone_conversation_has_each_clients_message() {
+        let id = "7d1c0e5a-9b1f-4d0e-8f7a-3c2b1a0e9d8c";
+        assert_eq!(
+            super::gone_message("claude", id),
+            format!("No conversation found with session ID: {id}")
+        );
+        assert_eq!(
+            super::gone_message("copilot", id),
+            format!("Error: No session, task, or name matched '{id}'.")
         );
     }
 }

@@ -17,6 +17,81 @@ mod native;
 #[cfg(unix)]
 use support::{Dir, Mux, Server};
 
+// outcome-2 call 14 (build checklist 4): a child past its bound is killed and refused `TimedOut` well before its own
+// end; a watched child past its bound is killed by its watchdog.
+#[cfg(unix)]
+#[test]
+fn a_child_past_its_bound_is_killed_and_refused() {
+    use std::process::Command;
+    use std::time::{Duration, Instant};
+    let begun = Instant::now();
+    let got =
+        support::bounded::output(Command::new("/bin/sleep").arg("30"), Duration::from_secs(1));
+    assert_eq!(
+        got.map(|_| ()).map_err(|e| e.kind()),
+        Err(std::io::ErrorKind::TimedOut)
+    );
+    assert!(
+        begun.elapsed() < Duration::from_secs(10),
+        "{:?}",
+        begun.elapsed()
+    );
+    let mut held =
+        support::bounded::spawn(Command::new("/bin/sleep").arg("30"), Duration::from_secs(1))
+            .unwrap();
+    let end = Instant::now() + Duration::from_secs(10);
+    while held.try_wait().unwrap().is_none() {
+        assert!(
+            Instant::now() < end,
+            "the watchdog never killed the watched child"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+// o2 call 29 (QA #146 F3): the Unix twin of live_windows.rs's: a descendant keeps stdout open 8 s after the child
+// exits: refused `TimedOut` naming stdout, the read handle dropped; a normal child keeps its whole output.
+#[cfg(unix)]
+#[test]
+fn bounded_output_never_answers_with_unread_output() {
+    use std::process::Command;
+    use std::time::{Duration, Instant};
+    let begun = Instant::now();
+    let got = support::bounded::output(
+        Command::new("/bin/sh").args(["-c", "echo expected output; (sleep 8; echo late) &"]),
+        support::bounded::LIMIT,
+    );
+    let took = begun.elapsed();
+    let err = match got.map(|o| String::from_utf8_lossy(&o.stdout).into_owned()) {
+        Ok(stdout) => {
+            panic!("answered success with stdout {stdout:?} while a descendant held the pipe")
+        }
+        Err(e) => e,
+    };
+    assert_eq!(err.kind(), std::io::ErrorKind::TimedOut, "{err}");
+    assert!(err.to_string().contains("stdout"), "{err}");
+    assert!(
+        !err.to_string().contains("could not be stopped"),
+        "the read handle was not dropped: {err}"
+    );
+    assert!(
+        took < Duration::from_millis(7500),
+        "the read handle was not dropped: {took:?}"
+    );
+    let out = support::bounded::output(
+        Command::new("/bin/sh").args([
+            "-c",
+            "i=1; while [ $i -le 3000 ]; do echo line-$i; i=$((i+1)); done",
+        ]),
+        support::bounded::LIMIT,
+    )
+    .unwrap();
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "{out:?}");
+    assert_eq!(text.lines().count(), 3000, "the whole output");
+    assert_eq!(text.lines().last(), Some("line-3000"));
+}
+
 // Which multiplexers this run covers: each one's `-V` and binary, or why it is skipped. MUX_AGENTS_LIVE_REQUIRE
 // (`tmux,tmux32,rmux`, any subset) turns a skip into a failure, here and in every scenario.
 #[cfg(unix)]
@@ -262,6 +337,19 @@ exec claude --dangerously-skip-permissions
                 (Some(1), Some(n)) => folder.join("gens").join(n).join(file),
                 _ => folder.join(file),
             }
+        }
+
+        /// o2 calls 33/35: waits for member `w`'s `ready.json` (its fake client's startup report promoted it), so a test
+        /// that then stops, kills or quits it ends an ordinary member, not one failed before readiness (which outcome-2
+        /// rightly flags `recover`).
+        fn ready(&self, w: &Value) {
+            let id = s(&w["id"]).to_string();
+            let path = || self.gen_file(&id, "ready.json");
+            crate::native::Deadline::start(crate::native::READY).wait(
+                "ready.json",
+                || path().exists().then_some(()),
+                || format!("{}: {}", s(&w["name"]), path().display()),
+            );
         }
 
         /// The view a member's launch recorded (V1): `view.json`, never record.json's presentation fields.
@@ -795,10 +883,11 @@ exec claude --dangerously-skip-permissions
 
     /// True when a `less` runs below process `root`, by ps's parent links.
     fn pagers_under(root: u64) -> bool {
-        let out = Command::new("ps")
-            .args(["-axo", "pid=,ppid=,comm="])
-            .output()
-            .unwrap();
+        let out = crate::support::bounded::output(
+            Command::new("ps").args(["-axo", "pid=,ppid=,comm="]),
+            crate::support::bounded::LIMIT,
+        )
+        .unwrap();
         let rows: Vec<(u64, u64, String)> = String::from_utf8_lossy(&out.stdout)
             .lines()
             .filter_map(|l| {
@@ -821,10 +910,11 @@ exec claude --dangerously-skip-permissions
 
     /// `/dev/<tty>` of a process, by ps.
     fn tty_of(pid: u64) -> String {
-        let out = Command::new("ps")
-            .args(["-o", "tty=", "-p", &pid.to_string()])
-            .output()
-            .unwrap();
+        let out = crate::support::bounded::output(
+            Command::new("ps").args(["-o", "tty=", "-p", &pid.to_string()]),
+            crate::support::bounded::LIMIT,
+        )
+        .unwrap();
         format!("/dev/{}", String::from_utf8_lossy(&out.stdout).trim())
     }
 
@@ -1130,6 +1220,82 @@ exec claude --dangerously-skip-permissions
             (0, vec!["w1".to_string()]),
             "{mux:?} {list}"
         );
+    }
+
+    /// report-2b live (PM calls 4 and 18): a new member's client.json and ready.json within 150 s. With `barrier`,
+    /// the launcher holds client.json until report.json exists, and its mark proves that order.
+    fn ready_within_150_s(mux: Mux, barrier: bool) {
+        let Some(mut live) = Live::human(mux) else {
+            return;
+        };
+        if barrier {
+            crate::native::private_root(&live.state()); // PM call 16
+            std::fs::write(live.state().join("test-client-barrier"), "").unwrap();
+        }
+        // r2b call 35: one deadline from the launch boundary; the spawn and every wait up to ready.json spend it.
+        let deadline = crate::native::Deadline::start(crate::native::READY);
+        let w1 = live.spawn("w1", &[]);
+        let (id, sid) = (s(&w1["id"]).to_string(), s(&w1["sessionId"]).to_string());
+        let read = |f: &str| {
+            let text = std::fs::read_to_string(live.gen_file(&id, f)).ok()?;
+            serde_json::from_str::<Value>(&text).ok()
+        };
+        let (c, r) = deadline.wait(
+            "client.json and ready.json",
+            || Some((read("client.json")?, read("ready.json")?)),
+            || {
+                format!(
+                    "{mux:?}: client {:?} ready {:?}",
+                    read("client.json"),
+                    read("ready.json")
+                )
+            },
+        );
+        assert_eq!(
+            (&r["pid"], &r["start"]),
+            (&c["pid"], &c["start"]),
+            "{mux:?}"
+        );
+        // After ready.json: the client lookup waits on its own, outside the readiness deadline.
+        let client = live.server.client_by_session(&sid);
+        let env = &client["env"];
+        assert!(
+            env["HC_TERMINAL_ID"]
+                .as_str()
+                .is_some_and(|v| !v.is_empty()),
+            "{mux:?}: {client}"
+        );
+        assert!(
+            env["TMUX"].is_null() && env["RMUX"].is_null(),
+            "{mux:?}: the member sees no multiplexer: {client}"
+        );
+        if barrier {
+            assert_eq!(
+                barrier_marks(&live.state()),
+                ["report-first"],
+                "{mux:?}: report.json before client.json"
+            );
+        }
+    }
+
+    fn barrier_marks(state: &Path) -> Vec<String> {
+        std::fs::read_dir(state)
+            .unwrap()
+            .filter_map(|e| {
+                let e = e.ok()?;
+                let name = e.file_name().to_string_lossy().into_owned();
+                name.starts_with("test-barrier-")
+                    .then(|| std::fs::read_to_string(e.path()).unwrap())
+            })
+            .collect()
+    }
+
+    fn a_new_member_reports_ready_within_150_s(mux: Mux) {
+        ready_within_150_s(mux, false)
+    }
+
+    fn a_new_member_reports_before_its_client_json_is_published(mux: Mux) {
+        ready_within_150_s(mux, true)
     }
 
     fn core_launcher(live: &Live, w: &Value, client: &Value) -> Value {
@@ -1690,12 +1856,14 @@ exec claude --dangerously-skip-permissions
             (Some(0), format!("{p2}|{}", s(&w2["id"]))),
             "{mux:?}"
         );
-        let dead = Command::new(live.server.binary())
-            .arg("-S")
-            .arg(format!("{}.none", live.server.socket().display()))
-            .args(["-N", "display-message", "-p", "-t", p2, probe])
-            .output()
-            .unwrap();
+        let dead = crate::support::bounded::output(
+            Command::new(live.server.binary())
+                .arg("-S")
+                .arg(format!("{}.none", live.server.socket().display()))
+                .args(["-N", "display-message", "-p", "-t", p2, probe]),
+            crate::support::bounded::LIMIT,
+        )
+        .unwrap();
         assert_ne!(dead.status.code(), Some(0), "{mux:?}");
         assert_detached_running(&mut live, &w1);
         assert!(exit_messages(&live, &w2).is_empty());
@@ -2034,7 +2202,12 @@ exec claude --dangerously-skip-permissions
                         vec!["get", address, "--json"],
                         vec!["read", address, "--lines", "40"],
                     ] {
-                        let out = live.server.core.as_ref().map(|c| c.command(&args).output());
+                        let out = live.server.core.as_ref().map(|c| {
+                            crate::support::bounded::output(
+                                &mut c.command(&args),
+                                crate::support::bounded::LIMIT,
+                            )
+                        });
                         core.push_str(&format!(
                             "
 hc {}:
@@ -2600,10 +2773,11 @@ hc {}:
         let before = geometry(&live);
         manual_watch(&mut live, &root);
         let shell = live.field(&root, "#{pane_pid}");
-        let found = Command::new("pgrep")
-            .args(["-P", &shell, "-f", "watch"])
-            .output()
-            .unwrap();
+        let found = crate::support::bounded::output(
+            Command::new("pgrep").args(["-P", &shell, "-f", "watch"]),
+            crate::support::bounded::LIMIT,
+        )
+        .unwrap();
         let watch: u32 = String::from_utf8_lossy(&found.stdout)
             .trim()
             .parse()
@@ -2667,6 +2841,9 @@ hc {}:
         let root = live.server.pane().to_string();
         let w1 = live.spawn("w1", &[]);
         let w2 = live.spawn("w2", &[]);
+        // o2 call 35: both are ready, so w2's stop ends an ordinary member.
+        live.ready(&w1);
+        live.ready(&w2);
         let (code, stop) = live.run(&["stop", "w2"]);
         assert_eq!(code, 0, "{mux:?} {stop}");
         live.wait_gone(s(&w2["pane"]));
@@ -3081,20 +3258,22 @@ hc {}:
     fn release_bin() -> PathBuf {
         let manifest = env!("CARGO_MANIFEST_DIR");
         let target = Path::new(manifest).join("target/live-release");
-        let out = Command::new(env!("CARGO"))
-            .current_dir(manifest)
-            .args([
-                "build",
-                "--release",
-                "--features",
-                "test-panic",
-                "--bin",
-                "mux-agent",
-                "--target-dir",
-            ])
-            .arg(&target)
-            .output()
-            .unwrap();
+        let out = crate::support::bounded::output(
+            Command::new(env!("CARGO"))
+                .current_dir(manifest)
+                .args([
+                    "build",
+                    "--release",
+                    "--features",
+                    "test-panic",
+                    "--bin",
+                    "mux-agent",
+                    "--target-dir",
+                ])
+                .arg(&target),
+            crate::support::bounded::HELD,
+        )
+        .unwrap();
         assert!(
             out.status.success(),
             "{}",
@@ -3657,6 +3836,9 @@ hc {}:
         let pid = live.worker_pid(&w1);
         live.worker_pid(&w2);
         live.log_frames(&bar);
+        // o2 call 35: both are ready before w1's view goes and its client quits.
+        live.ready(&w1);
+        live.ready(&w2);
         live.call(&["kill-pane", "-t", s(&w1["pane"])]);
         live.wait_gone(s(&w1["pane"]));
         live.wait_tick(&bar);
@@ -3848,7 +4030,7 @@ hc {}:
 
     /// A real tmux client attached to a session on a 120x40 pty, the master drained by a thread; killed on drop.
     struct Client {
-        child: std::process::Child,
+        child: crate::support::bounded::Watched,
         master: std::fs::File,
         // Every byte the client's terminal was sent, as the drain thread read it.
         seen: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
@@ -3918,7 +4100,8 @@ hc {}:
                     Ok(())
                 });
             }
-            let child = attach.spawn().unwrap();
+            let child =
+                crate::support::bounded::spawn(&mut attach, crate::support::bounded::HELD).unwrap();
             let master = std::fs::File::from(master);
             let mut drain = master.try_clone().unwrap();
             let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -4057,6 +4240,8 @@ hc {}:
         live.close_bar();
         live.call(&["set-option", "-g", "remain-on-exit", "on"]);
         let quit_dead = |live: &mut Live, w: &Value| {
+            // o2 call 35: a member that exits after readiness ends ordinarily.
+            live.ready(w);
             let pid = live.worker_pid(w);
             support::write_atomic(&live.dir.join(format!("quit.{pid}")), "5\n");
             live.server.wait_file(&format!("exited.{pid}"));
@@ -4210,6 +4395,8 @@ hc {}:
         }
 
         // stop w1 closes only w1's pane.
+        // o2 call 35: w1 is ready before its stop.
+        live.ready(&w1);
         let (code, stop) = live.run_in(&clean, &["stop", "w1"]);
         assert_eq!(code, 0);
         assert_eq!(
@@ -4859,10 +5046,12 @@ hc {}:
             let read = |live: &Live| {
                 let hc = live.server.core.as_ref().unwrap();
                 String::from_utf8(
-                    hc.command(&["read", s(&grand["hcAddress"]), "--lines", "200"])
-                        .output()
-                        .unwrap()
-                        .stdout,
+                    crate::support::bounded::output(
+                        &mut hc.command(&["read", s(&grand["hcAddress"]), "--lines", "200"]),
+                        crate::support::bounded::LIMIT,
+                    )
+                    .unwrap()
+                    .stdout,
                 )
                 .unwrap()
             };
@@ -4872,6 +5061,8 @@ hc {}:
                 read(&live)
             );
             // Stopped, grand stays in place with its state word, dimmed where the capture carries SGR (tmux: always).
+            // o2 call 35: grand is ready before its stop, so the bar shows `stopped`, not `recover`.
+            live.ready(&grand);
             let (code, out) = live.server.command(child_pid, &["stop", "grand"]);
             assert_eq!(code, 0, "{mux:?} {out}");
             let mut line = String::new();
@@ -5209,6 +5400,8 @@ hc {}:
                     spawn_titles_tab_and_pane,
                     unnamed_spawns_at_once_get_distinct_names,
                     spawn_tags_pane_writes_record_and_commit_runs_client,
+                    a_new_member_reports_ready_within_150_s,
+                    a_new_member_reports_before_its_client_json_is_published,
                     worker_is_path_claude_forked_own_tty,
                     state_root_reaches_pane_not_server,
                     list_send_read_name_answer,

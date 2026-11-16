@@ -115,6 +115,7 @@ fn local(folder: &Path, record: &Value, id: &str, caller: &Caller) -> Option<Loc
             committed: committed(folder),
             noticed: folder.join("notice.json").exists(),
             notice: None,
+            active_done: None,
         },
         held: false,
         finished: None,

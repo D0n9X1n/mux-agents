@@ -21,6 +21,7 @@
 //!   client renames its files into place.
 #![allow(dead_code)]
 
+pub mod bounded;
 pub mod private_core;
 
 use std::collections::{HashMap, HashSet};
@@ -81,7 +82,10 @@ impl Mux {
             }
         };
         let bin = std::fs::canonicalize(&bin).map_err(|e| format!("{}: {e}", bin.display()))?;
-        let out = Command::new(&bin).arg("-V").output();
+        let out = crate::support::bounded::output(
+            Command::new(&bin).arg("-V"),
+            crate::support::bounded::LIMIT,
+        );
         let reported = out.map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string());
         match reported {
             // A set MUX_AGENTS_TMUX32 that is not tmux 3.2a is a broken setup, not a skip.
@@ -224,7 +228,8 @@ impl Server {
             .arg(dir.join("work"))
             .arg("sh");
         core.apply(&mut start);
-        let out = start.output().unwrap();
+        let out =
+            crate::support::bounded::output(&mut start, crate::support::bounded::LIMIT).unwrap();
         let mut server = Server {
             core: Some(core),
             mux,
@@ -321,13 +326,11 @@ impl Server {
         if let Some(core) = &self.core {
             core.apply(&mut command);
         }
-        command
-            .arg("-S")
-            .arg(&self.socket)
-            .arg("-N")
-            .args(args)
-            .output()
-            .unwrap()
+        crate::support::bounded::output(
+            command.arg("-S").arg(&self.socket).arg("-N").args(args),
+            crate::support::bounded::LIMIT,
+        )
+        .unwrap()
     }
 
     /// Types `text` literally into the root pane, then Enter.
@@ -868,17 +871,22 @@ impl Drop for Sentinels {
 #[test]
 fn teardown_never_signals_a_reused_server_pid() {
     // A real start, then its process gone: the start an exited server recorded.
-    let mut gone = Command::new("/bin/sleep").arg("60").spawn().unwrap();
+    let mut gone = crate::support::bounded::spawn(
+        Command::new("/bin/sleep").arg("60"),
+        crate::support::bounded::LIMIT,
+    )
+    .unwrap();
     let gone_start = start_of(gone.id()).expect("the start of a live sleep");
     gone.kill().unwrap();
     gone.wait().unwrap();
     // Linux start times count clock ticks (10 ms): let the clock pass the gone start, so the sentinel's differs.
     std::thread::sleep(Duration::from_millis(50));
 
-    let mut sentinel = Command::new("/bin/sh")
-        .args(["-c", "/bin/sleep 60 & wait"])
-        .spawn()
-        .unwrap();
+    let mut sentinel = crate::support::bounded::spawn(
+        Command::new("/bin/sh").args(["-c", "/bin/sleep 60 & wait"]),
+        crate::support::bounded::HELD,
+    )
+    .unwrap();
     let pid = sentinel.id();
     let mut guard = Sentinels(vec![(pid, start_of(pid))]);
     let end = Instant::now() + WAIT;
@@ -953,7 +961,7 @@ pub fn required(list: &str) -> Result<Vec<Mux>, String> {
 /// no later run meets ETXTBSY.
 fn runnable(command: &mut Command) {
     for _ in 0..100 {
-        match command.output() {
+        match crate::support::bounded::output(command, crate::support::bounded::LIMIT) {
             Err(e) if e.raw_os_error() == Some(26) => std::thread::sleep(Duration::from_millis(20)),
             run => {
                 run.unwrap();

@@ -11,6 +11,10 @@
 #[path = "support/private_core.rs"]
 mod private_core;
 
+// outcome-2 call 14: every child this harness starts is bounded.
+#[path = "support/bounded.rs"]
+mod bounded;
+
 // report-2b: the shared integration fixtures (private root, 150 s wait, deny_queries); occupy-3 uses them here.
 mod native;
 
@@ -22,6 +26,99 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
 use serde_json::Value;
+
+// outcome-2 call 14 (build checklist 4): a child past its bound is killed and refused `TimedOut` well before its own
+// end (`cmd.exe /C ping`, about 29 s); a watched child past its bound is killed by its watchdog. Needs no rmux.
+#[test]
+fn a_child_past_its_bound_is_killed_and_refused() {
+    let begun = Instant::now();
+    let mut pinger = Command::new("cmd.exe");
+    pinger.args(["/C", "ping", "-n", "30", "127.0.0.1"]);
+    let got = bounded::output(&mut pinger, Duration::from_secs(1));
+    assert_eq!(
+        got.map(|_| ()).map_err(|e| e.kind()),
+        Err(std::io::ErrorKind::TimedOut)
+    );
+    assert!(
+        begun.elapsed() < Duration::from_secs(10),
+        "{:?}",
+        begun.elapsed()
+    );
+    let mut held = bounded::spawn(
+        Command::new("ping")
+            .args(["-n", "30", "127.0.0.1"])
+            .stdout(std::process::Stdio::null()),
+        Duration::from_secs(1),
+    )
+    .unwrap();
+    let end = Instant::now() + Duration::from_secs(10);
+    while held.try_wait().unwrap().is_none() {
+        assert!(
+            Instant::now() < end,
+            "the watchdog never killed the watched child"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+// o2 call 29 (QA #146 F3): `bounded::output` never answers success with output it did not finish reading. The child
+// prints and exits while a descendant keeps its stdout open about 8 s: refused `TimedOut` naming stdout, within the
+// 5 s grace and the 1 s release (so the read handle was dropped, not left blocked until the descendant ends). A
+// normal child keeps its whole output, past one pipe buffer. Needs no rmux.
+#[test]
+fn bounded_output_never_answers_with_unread_output() {
+    let begun = Instant::now();
+    let mut held = Command::new("cmd.exe");
+    // The descendant (an inner cmd) holds stdout and writes nothing: only a cancelled read can drop the handle.
+    held.args([
+        "/C",
+        "echo",
+        "expected",
+        "output",
+        "&",
+        "start",
+        "/b",
+        "cmd",
+        "/c",
+        "ping -n 9 127.0.0.1 >nul",
+    ]);
+    let got = bounded::output(&mut held, bounded::LIMIT);
+    let took = begun.elapsed();
+    let err = got.map(|o| String::from_utf8_lossy(&o.stdout).into_owned());
+    let err = match err {
+        Ok(stdout) => {
+            panic!("answered success with stdout {stdout:?} while a descendant held the pipe")
+        }
+        Err(e) => e,
+    };
+    assert_eq!(err.kind(), std::io::ErrorKind::TimedOut, "{err}");
+    assert!(err.to_string().contains("stdout"), "{err}");
+    assert!(
+        !err.to_string().contains("could not be stopped"),
+        "the read handle was not dropped: {err}"
+    );
+    assert!(
+        took < Duration::from_millis(7500),
+        "the read handle was not dropped: {took:?}"
+    );
+    let mut full = Command::new("cmd.exe");
+    full.args([
+        "/C",
+        "for",
+        "/L",
+        "%i",
+        "in",
+        "(1,1,3000)",
+        "do",
+        "@echo",
+        "line-%i",
+    ]);
+    let out = bounded::output(&mut full, bounded::LIMIT).unwrap();
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "{out:?}");
+    assert_eq!(text.lines().count(), 3000, "the whole output");
+    assert_eq!(text.lines().last(), Some("line-3000"));
+}
 
 // Generous for loaded runners: a wait only runs this long when something is wrong.
 const WAIT: Duration = Duration::from_secs(60);
@@ -89,7 +186,7 @@ impl Live {
             dir,
             root: String::new(),
         };
-        match live.rmux().arg("-V").output() {
+        match crate::bounded::output(live.rmux().arg("-V"), crate::bounded::LIMIT) {
             Ok(out) if out.status.success() => {
                 eprintln!("rmux: {}", String::from_utf8_lossy(&out.stdout).trim());
             }
@@ -117,7 +214,7 @@ impl Live {
             "MUX_AGENTS_STATE",
             self.dir.join("state").as_os_str(),
         ));
-        let out = start.arg("cmd.exe").output().unwrap();
+        let out = crate::bounded::output(start.arg("cmd.exe"), crate::bounded::LIMIT).unwrap();
         assert!(out.status.success(), "new-session {name}: {out:?}");
         let pane = self
             .call(&["list-panes", "-t", name, "-F", "#{pane_id}"])
@@ -137,7 +234,7 @@ impl Live {
 
     /// `rmux -L <socket> <args>`; panics unless it succeeds, and answers its stdout.
     fn call(&self, args: &[&str]) -> String {
-        let out = self.rmux().args(args).output().unwrap();
+        let out = crate::bounded::output(self.rmux().args(args), crate::bounded::LIMIT).unwrap();
         assert!(out.status.success(), "rmux {args:?}: {out:?}");
         String::from_utf8_lossy(&out.stdout).into_owned()
     }
@@ -292,7 +389,7 @@ impl Drop for Live {
         // The fake clients quit when this file appears; then the server and its panes go.
         let _ = std::fs::write(self.dir.join("quit"), "");
         std::thread::sleep(Duration::from_millis(500));
-        let _ = self.rmux().arg("kill-server").output();
+        let _ = crate::bounded::output(self.rmux().arg("kill-server"), crate::bounded::LIMIT);
         if !core_stopped {
             let message = format!(
                 "private core stop failed; fixture kept at {}",
@@ -1105,11 +1202,11 @@ fn team_bar_draws_the_tree_and_opens_any_row() {
     let file = live.dir.join("peek-probe.txt");
     std::fs::write(&file, "probe").unwrap();
     let command = mux_agent::sidebar::popup_command(&s(&up["sidebar"]), file.to_str().unwrap());
-    let probe = live
-        .rmux()
-        .args(["run-shell", "-b", "-C", &command])
-        .output()
-        .unwrap();
+    let probe = crate::bounded::output(
+        live.rmux().args(["run-shell", "-b", "-C", &command]),
+        crate::bounded::LIMIT,
+    )
+    .unwrap();
     std::thread::sleep(Duration::from_secs(1));
     assert!(
         probe.status.success() && file.exists(),
@@ -1227,17 +1324,22 @@ fn team_bar_draws_the_tree_and_opens_any_row() {
     agent(grand_pid, &["@say", &marker]);
     let read = || {
         String::from_utf8(
-            live.core
-                .command(&["read", &s(&grand["hcAddress"]), "--lines", "200"])
-                .output()
-                .unwrap()
-                .stdout,
+            crate::bounded::output(
+                &mut live
+                    .core
+                    .command(&["read", &s(&grand["hcAddress"]), "--lines", "200"]),
+                crate::bounded::LIMIT,
+            )
+            .unwrap()
+            .stdout,
         )
         .unwrap()
     };
     live.wait("hc keeps grand's marker", || {
         read().contains(&marker).then_some(())
     });
+    // o2 call 35: grand is ready before its stop, so the bar shows `stopped`, not `recover`.
+    wait_ready(&live, &s(&grand["id"]));
     agent(child_pid, &["stop", "grand"]);
     let line = live.wait("grand stays, stopped", || {
         live.call(&["capture-pane", "-e", "-p", "-t", &bars[0]])
@@ -1976,4 +2078,104 @@ fn an_orphan_left_by_a_forward_crash_is_ended_by_terminate() {
     });
     assert_eq!(hc_get(&live, &address)["state"], "finished");
     assert!(agent_dir(&live, &id).join("gens/0/ended.json").exists());
+}
+
+/// report-2b live on Windows (rmux), as tests/live.rs: without and with the launcher barrier (PM call 18).
+#[test]
+fn a_new_member_reports_ready_within_150_s() {
+    for barrier in [false, true] {
+        let Some(live) = Live::start() else {
+            return;
+        };
+        let state = live.dir.join("state");
+        if barrier {
+            native::private_root(&state);
+            std::fs::write(state.join("test-client-barrier"), "").unwrap();
+        }
+        // r2b call 35: one deadline from the launch boundary; the spawn and every wait up to ready.json spend it.
+        let deadline = native::Deadline::start(native::READY);
+        let y = live.spawn("w1");
+        let (id, sid) = (s(&y["id"]), s(&y["sessionId"]));
+        let (c, r) = deadline.wait(
+            "client.json and ready.json",
+            || {
+                Some((
+                    gen0_file(&live, &id, "client.json")?,
+                    gen0_file(&live, &id, "ready.json")?,
+                ))
+            },
+            || {
+                format!(
+                    "barrier {barrier}: client {:?} ready {:?}",
+                    gen0_file(&live, &id, "client.json"),
+                    gen0_file(&live, &id, "ready.json")
+                )
+            },
+        );
+        assert_eq!(
+            (&r["pid"], &r["start"]),
+            (&c["pid"], &c["start"]),
+            "barrier {barrier}"
+        );
+        // After ready.json: the client lookup waits on its own, outside the readiness deadline.
+        let client = client_of(&live, &sid);
+        assert!(
+            client["env"]["HC_TERMINAL_ID"]
+                .as_str()
+                .is_some_and(|v| !v.is_empty()),
+            "{client}"
+        );
+        assert!(
+            client["env"]["TMUX"].is_null() && client["env"]["RMUX"].is_null(),
+            "{client}"
+        );
+        if barrier {
+            let marks: Vec<String> = std::fs::read_dir(&state)
+                .unwrap()
+                .filter_map(|e| {
+                    let e = e.ok()?;
+                    let n = e.file_name().to_string_lossy().into_owned();
+                    n.starts_with("test-barrier-")
+                        .then(|| std::fs::read_to_string(e.path()).unwrap())
+                })
+                .collect();
+            assert_eq!(marks, ["report-first"], "report.json before client.json");
+        }
+    }
+}
+
+/// The fake client record (`client.<pid>.json`) whose `sessionId` is `sid`, through `clients.log`; waited for.
+fn client_of(live: &Live, sid: &str) -> Value {
+    live.wait("the client of the new member", || {
+        let log = std::fs::read_to_string(live.dir.join("clients.log")).ok()?;
+        log.lines().find_map(|pid| {
+            let text =
+                std::fs::read_to_string(live.dir.join(format!("client.{}.json", pid.trim())))
+                    .ok()?;
+            let v: Value = serde_json::from_str(&text).ok()?;
+            (v["sessionId"] == sid).then_some(v)
+        })
+    })
+}
+
+/// o2 calls 33/35: waits for member `id`'s `ready.json` in its record's generation (its fake client's startup report
+/// promoted it), so a test that then stops it ends an ordinary member, not one failed before readiness.
+fn wait_ready(live: &Live, id: &str) {
+    let path = || {
+        let folder = agent_dir(live, id);
+        let r = member_file(live, id, "record.json");
+        let n = r["generation"].as_str().unwrap_or("0").to_string();
+        folder.join("gens").join(n).join("ready.json")
+    };
+    native::Deadline::start(native::READY).wait(
+        "ready.json",
+        || path().exists().then_some(()),
+        || format!("{id}: {}", path().display()),
+    );
+}
+
+/// `gens/0/<file>` of member `id` (found by `agent_dir`); None until it is whole.
+fn gen0_file(live: &Live, id: &str, file: &str) -> Option<Value> {
+    let p = agent_dir(live, id).join("gens").join("0").join(file);
+    serde_json::from_str(&std::fs::read_to_string(p).ok()?).ok()
 }

@@ -7,6 +7,8 @@ use crate::error::{Refusal, Res};
 use crate::hc::{Core, Reason, State, Terminal};
 use crate::state::evidence::{self, Evidence, Published};
 
+pub use super::outcome::{Adjudged, Recovery, Verdict, Wait, adjudicate, needs_recovery};
+
 /// Every create-once file of a generation (S5); the claim lives beside the folder.
 pub const FILES: [&str; 16] = [
     "spec",
@@ -1926,6 +1928,10 @@ mod publish_tests;
 #[cfg(test)]
 #[path = "gens_ready_tests.rs"]
 mod ready_tests;
+
+#[cfg(test)]
+#[path = "gens_held_tests.rs"]
+mod held_tests;
 
 #[cfg(test)]
 mod b_tests {

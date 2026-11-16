@@ -600,6 +600,8 @@ fn run_gen(
     };
     let (mut conflicted, mut told_pid) = (false, false);
     let started = start(&client.executable, &client.args, &SCRUB, &mut |pid| {
+        #[cfg(feature = "live")]
+        live_client_barrier(ctx, member, n);
         told_pid = true;
         match publish_client(ctx, member, n, pid, &mut *publish) {
             ClientEvidence::Recorded => {}
@@ -748,6 +750,35 @@ fn publish_client(ctx: &Ctx, member: &Path, n: u64, pid: u32, publish: Publish) 
         }
     }
     ClientEvidence::Unrecorded
+}
+
+/// Live tests only (report-2b, PM call 18): with `<state root>/test-client-barrier`, hold client.json until generation
+/// `n`'s report.json exists (at most 600 polls of 100 ms), then mark the order in `test-barrier-<this pid>`:
+/// `report-first` (client.json absent as the report appeared), `client-first`, or `timeout`. Not in release builds.
+#[cfg(feature = "live")]
+fn live_client_barrier(ctx: &Ctx, member: &Path, n: u64) {
+    if !ctx.state_root.join("test-client-barrier").exists() {
+        return;
+    }
+    let mut mark = "timeout";
+    for poll in 0..=600 {
+        if matches!(gens::read(member, n, "report"), Evidence::Present(_)) {
+            // r2b call 33: report-first only when client.json was still absent as the report appeared.
+            mark = if gens::path(member, n, "client").exists() {
+                "client-first"
+            } else {
+                "report-first"
+            };
+            break;
+        }
+        if poll < 600 {
+            ctx.clock.sleep(Duration::from_millis(100));
+        }
+    }
+    let _ = std::fs::write(
+        ctx.state_root.join(format!("test-barrier-{}", ctx.pid)),
+        mark,
+    );
 }
 
 /// Fix cycle 2: the `client-conflict` mark, `exitCode` null while the client runs, retried once. True only when this
@@ -1931,6 +1962,78 @@ mod tests {
         }
     }
 
+    // outcome-2 O5 (#103; finding 5to8-14): a restore whose conversation is gone, through the launcher entry. The
+    // stand-in client knows only conversation `s1`: `--resume` of any other prints the verified claude rejection
+    // (`No conversation found with session ID: <uuid>`) on its stderr and exits 1 before readiness. The launcher records
+    // exit.json; the generation is failed and needs recovery; no task is resent (no prompt in the spec, no hc call).
+    #[test]
+    fn a_resume_of_a_gone_conversation_fails_and_needs_recovery() {
+        use crate::agents::outcome::{EXITED, Recovery};
+        const GONE: &str = "7d1c0e5a-9b1f-4d0e-8f7a-3c2b1a0e9d8c";
+        let (l, spec) = gen_setup(1);
+        edit(&spec, |s| {
+            s["args"] = json!(["--resume", GONE]);
+            s.as_object_mut().unwrap().remove("prompt");
+        });
+        commit(&l, 1, json!({"committed": true}));
+        l.w.fakes
+            .process(crate::testing::row(4300, l.w.ctx.pid, 1600));
+        let (mut argv, mut said): (Vec<String>, Option<String>) = (Vec::new(), None);
+        let code = run(
+            &l.w.ctx,
+            spec.to_str().unwrap(),
+            &mut |_| {},
+            &mut |_: &Path, args: &[String], _: &[&str], told: &mut dyn FnMut(u32)| {
+                argv = args.to_vec();
+                told(4300);
+                let asked = args
+                    .iter()
+                    .position(|a| a == "--resume")
+                    .and_then(|i| args.get(i + 1));
+                match asked {
+                    Some(id) if id != "s1" => {
+                        said = Some(format!("No conversation found with session ID: {id}"));
+                        Ok(1)
+                    }
+                    _ => Ok(0),
+                }
+            },
+        );
+        assert_eq!(code, 1);
+        let rejected = format!("No conversation found with session ID: {GONE}");
+        assert_eq!(
+            said.as_deref(),
+            Some(rejected.as_str()),
+            "the verified rejection of the unknown conversation"
+        );
+        assert_eq!(
+            argv[argv.len() - 2..],
+            ["--resume".to_string(), GONE.to_string()],
+            "{argv:?}"
+        );
+        let exit = gen_file(&l, "exit");
+        assert_eq!(
+            (&exit["exitCode"], &exit["reason"]),
+            (&json!(1), &json!("exited"))
+        );
+        // Promoted, as forward does after the commit: generation 1 is active.
+        let record = json!({"lifecycle": 1, "id": ID, "generation": "1"});
+        let key = l.w.caller().server_key;
+        let got =
+            crate::agents::gens::needs_recovery(&l.w.ctx, &key, ID, &record, Some(false), None);
+        assert_eq!(
+            got,
+            Ok(Some(Recovery {
+                generation: 1,
+                reason: EXITED.into(),
+                running: true
+            }))
+        );
+        assert_eq!(gen_file(&l, "outcome")["outcome"], "failed");
+        assert_eq!(gens::read(&l.folder, 1, "ready"), Evidence::Absent);
+        assert!(l.w.fakes.hc_calls().is_empty(), "no task resent");
+    }
+
     #[test]
     fn a_gens_spec_claims_its_generation_and_names_it_to_the_client() {
         let (l, spec) = gen_setup(1);
@@ -2644,6 +2747,98 @@ mod tests {
             Evidence::Present(v) => v["reason"].clone(),
             _ => Value::Null,
         }
+    }
+
+    // report-2b (PM call 18): with the barrier file, client.json waits for report.json (at most 600 polls of 100 ms)
+    // and the launcher marks the order; without it, nothing waits and nothing is marked.
+    #[cfg(feature = "live")]
+    #[test]
+    fn the_live_client_barrier_waits_for_report_json_and_records_the_order() {
+        let f = crate::testing::Fakes::default();
+        let mut ctx = f.ctx();
+        let d = crate::testing::TempDir::new();
+        ctx.state_root = d.path().to_path_buf();
+        let m = d
+            .path()
+            .join("0123456789abcdef")
+            .join("agents")
+            .join("aaaaaaaaaaaa");
+        let mark = d.path().join(format!("test-barrier-{}", ctx.pid));
+        live_client_barrier(&ctx, &m, 1);
+        assert!(
+            f.slept().is_empty() && !mark.exists(),
+            "no barrier file: no wait, no mark"
+        );
+        std::fs::write(d.path().join("test-client-barrier"), "").unwrap();
+        let m2 = m.clone();
+        f.sleep_probe(move |count| {
+            if count == 3 {
+                crate::state::evidence::publish(&gens::path(&m2, 1, "report"), &json!({})).unwrap();
+            }
+        });
+        live_client_barrier(&ctx, &m, 1);
+        let read = || std::fs::read_to_string(&mark).ok();
+        assert_eq!(
+            (f.slept().len(), read()),
+            (3, Some("report-first".to_string()))
+        );
+        // r2b call 33: client.json already there when the report appears is not report-first.
+        crate::state::evidence::publish(&gens::path(&m, 1, "client"), &json!({})).unwrap();
+        live_client_barrier(&ctx, &m, 1);
+        assert_eq!(
+            (f.slept().len(), read()),
+            (3, Some("client-first".to_string())),
+            "client.json before report.json"
+        );
+        std::fs::remove_file(gens::path(&m, 1, "client")).unwrap();
+        std::fs::remove_file(gens::path(&m, 1, "report")).unwrap();
+        live_client_barrier(&ctx, &m, 1);
+        assert_eq!(
+            (f.slept().len(), read()),
+            (603, Some("timeout".to_string())),
+            "at most 60 s"
+        );
+        // r2b call 34: every poll sleeps 100 ms, so 600 polls are 60 s.
+        assert_eq!(f.slept(), vec![100; 603], "each barrier sleep is 100 ms");
+    }
+
+    // r2b call 33 (review #147 F1): through run_gen's start callback, with the barrier file, client.json stays
+    // unpublished while the launcher waits for report.json, and is published once it exists; the mark is report-first.
+    #[cfg(feature = "live")]
+    #[test]
+    fn the_launcher_holds_client_json_until_report_json_exists() {
+        let (l, spec) = gen_client();
+        let root = l.w.ctx.state_root.clone();
+        std::fs::write(root.join("test-client-barrier"), "").unwrap();
+        let client = gens::path(&l.folder, 1, "client");
+        let report = gens::path(&l.folder, 1, "report");
+        let seen = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let (at, seen2) = (client.clone(), seen.clone());
+        l.w.fakes.sleep_probe(move |k| {
+            seen2.borrow_mut().push(at.exists());
+            if k == 3 {
+                evidence::publish(&report, &json!({})).unwrap();
+            }
+        });
+        let mut after = None;
+        let r = seamed(&l, &spec, true, &[], &mut |told: &mut dyn FnMut(u32)| {
+            told(4300);
+            after = Some(gen_file(&l, "client"));
+            Ok(7)
+        });
+        assert_eq!((r.code, r.started), (7, 1), "{:?}", r.err);
+        assert_eq!(
+            *seen.borrow(),
+            [false, false, false],
+            "client.json while the launcher waited for report.json"
+        );
+        assert_eq!(
+            after,
+            Some(json!({"pid": 4300, "start": 2600})),
+            "client.json once report.json exists"
+        );
+        let mark = std::fs::read_to_string(root.join(format!("test-barrier-{}", l.w.ctx.pid)));
+        assert_eq!(mark.ok().as_deref(), Some("report-first"));
     }
 
     // K1: client.json = {pid, start} of the started client, published after the start; while the client runs,
