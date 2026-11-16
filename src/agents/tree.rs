@@ -1,5 +1,6 @@
 //! A team's tree (#103 phase 3): whether the caller is in a team, where it stands (D1), where its child goes (D2-D6),
 //! and whom it may stop, read or resume.
+use super::cascade::Tree;
 use super::lifecycle::Life;
 use super::membership::Snapshot;
 use super::team::{self, Team};
@@ -345,48 +346,6 @@ pub fn standing(ctx: &Ctx, caller: &Caller, core: Option<&Core<'_>>) -> Res<Stan
         ),
     }
 }
-/// The ids above member `id`, nearest first, ending at `leader`, the team record's own depth-0 leader; every link
-/// readable, one deeper than its parent, no cycle. A chain that ends at any other root, even a depth-0 `upTeam` record,
-/// and anything else, refuses 2 `authority`.
-pub fn ancestors(records: &BTreeMap<String, Value>, id: &str, leader: &str) -> Res<Vec<String>> {
-    let name = records
-        .get(id)
-        .map_or(id.to_string(), |r| text(r.get("name")));
-    let broken = || {
-        refuse(
-            2,
-            "authority",
-            format!("the parent chain of {name} cannot be read"),
-        )
-    };
-    let depth = |r: &Value| r.get("depth").and_then(Value::as_u64);
-    let (mut chain, mut at) = (Vec::<String>::new(), id.to_string());
-    loop {
-        let Some(r) = records.get(&at) else {
-            return broken();
-        };
-        if is_leader(r) {
-            return if at == leader { Ok(chain) } else { broken() };
-        }
-        let parent = r
-            .get("parentAgent")
-            .and_then(|p| p.get("id"))
-            .and_then(Value::as_str);
-        let (Some(d), Some(parent)) = (depth(r), parent) else {
-            return broken();
-        };
-        let up = records.get(parent).and_then(depth);
-        if parent == id
-            || chain.iter().any(|c| c == parent)
-            || up.map(|u| u + 1) != Some(d)
-            || chain.len() > MAX_DEPTH as usize
-        {
-            return broken();
-        }
-        chain.push(parent.to_string());
-        at = parent.to_string();
-    }
-}
 /// D6: the highest level `client` expresses at or below min(parent, ceiling); `bound` still guards.
 pub fn child_flags(
     client: Client,
@@ -467,7 +426,20 @@ pub fn admit(ctx: &Ctx, caller: &Caller, found: &Team, standing: Standing) -> Re
         Standing::Member(m) => Admitted {
             team: found.clone(),
             member: true,
-            depth: ancestors(&records, &m.id, &found.leader)?.len() as u64 + 1,
+            // Call 10: the chain must hold over the forward-resolved tree; a successor keeps its predecessor's depth
+            // and `ancestors` checked every link is one shallower, so the recorded depth is the chain's length.
+            depth: {
+                Tree::all(&super::team_state::Tx {
+                    ctx,
+                    scope: super::team_state::Scope::of(caller),
+                })?
+                .ancestors(&m.id, &found.leader)?;
+                m.record
+                    .get("depth")
+                    .and_then(Value::as_u64)
+                    .ok_or_else(|| Refusal::internal("a member record has no depth"))?
+                    + 1
+            },
             level: team::policy(m.client, &m.flags),
             directory: m
                 .record
@@ -532,10 +504,10 @@ pub fn place(
         name,
     })
 }
-/// stop, read <name>, resume: a person passes; a member only when its id is in the target's chain to the leader.
-/// Records only: mail grants nothing.
+/// stop, read <name>, resume: a person passes; a member only when its id is in the target's chain to the leader
+/// (call 10: over the forward-resolved tree). Records only: mail grants nothing.
 pub fn authorize(
-    records: &BTreeMap<String, Value>,
+    tree: &Tree,
     leader: &str,
     standing: &Standing,
     target: &str,
@@ -544,16 +516,16 @@ pub fn authorize(
     let Standing::Member(m) = standing else {
         return Ok(());
     };
-    if ancestors(records, target, leader)?.contains(&m.id) {
+    if tree.ancestors(target, leader)?.contains(&m.id) {
         return Ok(());
     }
-    let name = records
-        .get(target)
-        .map_or(target.to_string(), |r| text(r.get("name")));
     refuse(
         2,
         "authority",
-        format!("only an ancestor or a person can {verb} {name}"),
+        format!(
+            "only an ancestor or a person can {verb} {}",
+            tree.name(target)
+        ),
     )
 }
 /// Runs `f` with the caller's standing under the team lock, held across the authority check and the action; None
@@ -576,7 +548,7 @@ pub fn with_standing<T>(
         || f(Some(&standing(ctx, caller, None)?)),
     )
 }
-/// `authorize` over the session's local records.
+/// `authorize` over the session's tree (call 10), read under the team lock the caller holds.
 pub fn authority(
     ctx: &Ctx,
     caller: &Caller,
@@ -592,13 +564,15 @@ pub fn authority(
     let Some(team) = team_of(ctx, caller)? else {
         return no_team();
     };
-    let records = super::membership::locals(ctx, caller)?
-        .into_iter()
-        .map(|l| (l.identity.id, l.stored.record))
-        .collect();
-    authorize(&records, &team.leader, standing, target, verb)
+    let tx = super::team_state::Tx {
+        ctx,
+        scope: super::team_state::Scope::of(caller),
+    };
+    authorize(&Tree::all(&tx)?, &team.leader, standing, target, verb)
 }
 /// The level X's parent may grant: the team's for the leader, else the parent's recorded flags (unreadable refuses).
+/// Call 10: the parent is the tree's: X's recorded parent resolved forward (C0) to the one member standing for it;
+/// a malformed parent id (call 24), a dangling one or several successors (no one policy) refuse `authority`.
 pub fn parent_level(
     ctx: &Ctx,
     caller: &Caller,
@@ -606,14 +580,6 @@ pub fn parent_level(
     records: &BTreeMap<String, Value>,
     x: &str,
 ) -> Res<team::Policy> {
-    let parent = records
-        .get(x)
-        .and_then(|r| r.get("parentAgent"))
-        .and_then(|p| p.get("id"))
-        .and_then(Value::as_str);
-    let Some(p) = parent.filter(|p| *p != found.leader) else {
-        return Ok(found.policy);
-    };
     let broken = || Refusal {
         code: 2,
         check: "authority",
@@ -622,13 +588,39 @@ pub fn parent_level(
         details: Default::default(),
         message: format!(
             "the parent chain of {} cannot be read",
-            text(records[x].get("name"))
+            records
+                .get(x)
+                .map_or(x.to_string(), |r| text(r.get("name")))
         ),
     };
-    let parent_record = records.get(p).ok_or_else(broken)?;
+    let raw = records
+        .get(x)
+        .and_then(|r| r.get("parentAgent"))
+        .and_then(|p| p.get("id"))
+        .filter(|v| !v.is_null());
+    let parent = match raw.map(|v| v.as_str().filter(|p| super::agent_id(p))) {
+        None => None,
+        Some(None) => return Err(broken()),
+        Some(Some(p)) => Some(p),
+    };
+    let Some(p) = parent.filter(|p| *p != found.leader) else {
+        return Ok(found.policy);
+    };
+    let tx = super::team_state::Tx {
+        ctx,
+        scope: super::team_state::Scope::of(caller),
+    };
+    let p = match Tree::all(&tx)?.current(p)?.as_slice() {
+        [one] => one.clone(),
+        _ => return Err(broken()),
+    };
+    if p == found.leader {
+        return Ok(found.policy);
+    }
+    let parent_record = records.get(&p).ok_or_else(broken)?;
     let client =
         super::spawn::client_named(&text(parent_record.get("client"))).ok_or_else(broken)?;
-    let flags = super::resume::member_flags(&ctx.state_root, &caller.server_key, p, parent_record)
+    let flags = super::resume::member_flags(&ctx.state_root, &caller.server_key, &p, parent_record)
         .map_err(|_| broken())?;
     Ok(team::policy(client, &flags))
 }

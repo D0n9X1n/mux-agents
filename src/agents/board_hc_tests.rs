@@ -61,6 +61,8 @@ fn hc_board_fields_append() {
                 watch,
                 leader: None,
                 parents: &HashMap::new(),
+                logical: &Default::default(),
+                marked: &[],
             };
             let mut base = rows
                 .row(

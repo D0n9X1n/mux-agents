@@ -36,7 +36,10 @@ pub fn desired_of(member: &Path) -> Res<Desired> {
 
 struct Node {
     name: String,
+    /// A malformed `parentAgent.id` is no parent here, so `ancestors` refuses it (call 24); absent is no parent.
     parent: Option<String>,
+    depth: Option<u64>,
+    leader: bool,
     from: Option<String>,
     void: bool,
     stopped: bool,
@@ -66,6 +69,8 @@ fn node(record: &Value, void: bool, stopped: bool) -> Node {
     Node {
         name: super::text(record.get("name")),
         parent: plain(record.get("parentAgent").and_then(|p| p.get("id"))),
+        depth: record.get("depth").and_then(Value::as_u64),
+        leader: super::tree::is_leader(record),
         from: plain(record.get("resumedFrom")),
         void,
         stopped,
@@ -90,33 +95,171 @@ fn looped(code: u8, check: &'static str, message: String) -> Refusal {
     }
 }
 
+/// Which members a scan keeps, and what it does with one it cannot read (calls 10, 21).
+#[derive(Clone, Copy, PartialEq)]
+enum View {
+    /// C2's closure: lifecycle members of the session, desired state read.
+    Closure,
+    /// Authority, parent policy, depth: every member (pre-lifecycle included), no desired state.
+    All,
+    /// The bar: as `All`, but a member that cannot be read is recorded, never refused.
+    Bar,
+}
+
 impl Tree {
     pub fn read(tx: &Tx<'_>) -> Res<Tree> {
+        let t = Self::scan(tx, View::Closure, &mut Vec::new())?;
+        t.check()?;
+        Ok(t)
+    }
+
+    /// Call 10: authority's view: every member of the session, pre-lifecycle included (main's authority covers them;
+    /// a pre-lifecycle successor is void by `resume::taken`'s legacy rule, call 23), successors followed forward and
+    /// validated as `read`. It reads no desired state, so it is never used for closure.
+    pub fn all(tx: &Tx<'_>) -> Res<Tree> {
+        let t = Self::scan(tx, View::All, &mut Vec::new())?;
+        t.check()?;
+        Ok(t)
+    }
+
+    /// Checklist 1 (call 21): the bar's view, which never refuses (`Shown`).
+    pub fn shown(tx: &Tx<'_>) -> Shown {
+        let mut bad = Vec::new();
+        let Ok(tree) = Self::scan(tx, View::Bar, &mut bad) else {
+            let tree = Tree {
+                nodes: BTreeMap::new(),
+            };
+            return Shown {
+                tree,
+                bad,
+                exact: false,
+            };
+        };
+        let exact = bad.is_empty();
+        let looping: Vec<String> = (tree.nodes.keys())
+            .filter(|id| tree.current(id).is_err() || tree.on_loop(id))
+            .cloned()
+            .collect();
+        bad.extend(looping);
+        Shown { tree, bad, exact }
+    }
+
+    fn scan(tx: &Tx<'_>, view: View, bad: &mut Vec<String>) -> Res<Tree> {
         let mut nodes = BTreeMap::new();
         for (id, folder, member) in gens::members(&tx.scope.agents(&tx.ctx.state_root))? {
-            // prelife-1c call 1 (G10): a pre-lifecycle member is not in the tree; nothing here reads or writes it.
-            let g = match &member {
-                gens::Member::Absent | gens::Member::Pre(_) => continue,
+            let (record, g) = match &member {
+                gens::Member::Absent => continue,
+                // prelife-1c call 1 (G10): a pre-lifecycle member is not in the closure; nothing here writes it.
+                gens::Member::Pre(_) if view == View::Closure => continue,
+                gens::Member::Unreadable(_) if view == View::Bar => {
+                    bad.push(id);
+                    continue;
+                }
                 gens::Member::Unreadable(e) => return Err(e.clone()),
-                gens::Member::Life(g) => g,
+                gens::Member::Pre(r) => (r, None),
+                gens::Member::Life(g) => (g.record(), Some(g)),
             };
-            let record = g.record();
-            if record.get("session").and_then(Value::as_str) != Some(tx.scope.session.as_str()) {
+            let session = record.get("session").and_then(Value::as_str);
+            let other = match view {
+                View::Closure => session != Some(tx.scope.session.as_str()),
+                // As `membership::locals`: a record naming another session is skipped, one naming none kept.
+                View::All | View::Bar => session.is_some_and(|s| s != tx.scope.session),
+            };
+            if other {
                 continue;
             }
             let mut n = node(record, false, false);
-            // Call 17: unreadable evidence refuses (`?`), never counts as void. Call 19: from the marks read once.
             if n.from.is_some() {
-                let mut marks = BTreeMap::new();
-                n.void = void_of(&folder, &n, &mut marks)?;
-                n.marks = marks;
+                let void = match g {
+                    // Call 17: unreadable evidence refuses, never counts as void. Call 19: the marks read once.
+                    Some(_) => {
+                        let mut marks = BTreeMap::new();
+                        let v = void_of(&folder, &n, &mut marks);
+                        n.marks = marks;
+                        v
+                    }
+                    None => Ok(super::resume::legacy_void(&folder)),
+                };
+                match void {
+                    Ok(v) => n.void = v,
+                    Err(_) if view == View::Bar => {
+                        bad.push(id);
+                        continue;
+                    }
+                    Err(e) => return Err(e),
+                }
             }
-            n.stopped = desired_of(&folder)? == Desired::Stopped;
+            if view == View::Closure {
+                n.stopped = desired_of(&folder)? == Desired::Stopped;
+            }
             nodes.insert(id, n);
         }
-        let t = Tree { nodes };
-        t.check()?;
-        Ok(t)
+        Ok(Tree { nodes })
+    }
+
+    /// The pure authority rules (`tree_tests`): records as given, nothing void, nothing validated.
+    #[cfg(test)]
+    pub fn from_records(records: &BTreeMap<String, Value>) -> Tree {
+        let nodes = (records.iter())
+            .map(|(id, r)| (id.clone(), node(r, false, false)))
+            .collect();
+        Tree { nodes }
+    }
+
+    /// Call 10: main's strict authority walk over the forward-resolved tree: every logical ancestor of `id`,
+    /// nearest first, ending only at `leader`; each link present, well formed (call 24) and one shallower than its
+    /// child; a member with no parent must be `leader`; no loop; main's length bound. Else 2 `authority` "the parent
+    /// chain of <name> cannot be read". Depth falls strictly along every link, so the walk ends on any input.
+    pub fn ancestors(&self, id: &str, leader: &str) -> Res<Vec<String>> {
+        let bad = || Err(broken(&self.name(id)));
+        let mut seen = vec![id.to_string()];
+        let mut i = 0;
+        while i < seen.len() {
+            let at = seen[i].clone();
+            i += 1;
+            let Some(n) = self.nodes.get(&at) else {
+                return bad();
+            };
+            if n.leader {
+                if at != leader {
+                    return bad();
+                }
+                continue;
+            }
+            let ps = self.parents(&at)?;
+            let deep = n.depth.is_none_or(|d| d > super::tree::MAX_DEPTH + 1);
+            if ps.is_empty() || deep {
+                return bad();
+            }
+            for p in ps {
+                let up = self.nodes.get(&p).and_then(|x| x.depth);
+                if p == id || up.map(|u| u + 1) != n.depth {
+                    return bad();
+                }
+                if !seen.contains(&p) {
+                    seen.push(p);
+                }
+            }
+        }
+        Ok(seen.split_off(1))
+    }
+
+    /// Call 21: `id` is on a parent loop (its own logical ancestors reach it). Never refuses: a `resumedFrom` loop on
+    /// the way counts as no parent there.
+    fn on_loop(&self, id: &str) -> bool {
+        let mut seen: Vec<String> = Vec::new();
+        let mut todo = self.parents(id).unwrap_or_default();
+        while let Some(p) = todo.pop() {
+            if p == id {
+                return true;
+            }
+            if seen.contains(&p) {
+                continue;
+            }
+            todo.extend(self.parents(&p).unwrap_or_default());
+            seen.push(p);
+        }
+        false
     }
 
     /// Call 17: every member's successors and parents are validated once, at read.
@@ -258,6 +401,37 @@ impl Tree {
             .chain(id)?
             .into_iter()
             .find(|c| listed(c) || stopped(c)))
+    }
+}
+
+fn broken(name: &str) -> Refusal {
+    looped(
+        2,
+        "authority",
+        format!("the parent chain of {name} cannot be read"),
+    )
+}
+
+/// Checklist 1 (call 21): the bar's view of the tree. It never refuses: a member that cannot be read, or that sits on
+/// a parent or `resumedFrom` loop, is `bad`; when any member cannot be read, no member is placed (`exact` false),
+/// because the unreadable one may be a successor that would move another's parent.
+pub struct Shown {
+    tree: Tree,
+    bad: Vec<String>,
+    exact: bool,
+}
+
+impl Shown {
+    /// The member the bar marks unreadable.
+    pub fn bad(&self, id: &str) -> bool {
+        self.bad.iter().any(|b| b == id)
+    }
+    /// `id`'s logical parents (C0); None: the bar falls back to the raw parent id.
+    pub fn placed(&self, id: &str) -> Option<Vec<String>> {
+        if !self.exact || self.bad(id) || !self.tree.has(id) {
+            return None;
+        }
+        self.tree.parents(id).ok()
     }
 }
 

@@ -1503,3 +1503,34 @@ fn stop_and_tick_never_deadlock() {
     assert!(r.stopped);
     w.fakes.hc_done().unwrap();
 }
+
+// Call 21 (checklist 1): the bar's view never refuses. A parent loop marks only its members; the rest are placed.
+// A torn record marks that member, and no member is placed (the torn one may be a successor), never "absent".
+#[test]
+fn the_bars_view_marks_a_bad_member_and_never_refuses() {
+    let (w, s) = lf::world();
+    cx::member(&w, L, None, 0, json!({}));
+    cx::member(&w, A, Some(L), 1, json!({}));
+    cx::member(&w, B, Some(C), 1, json!({}));
+    cx::member(&w, C, Some(B), 1, json!({}));
+    let tx = cx::tx(&w, &s);
+    let v = Tree::shown(&tx);
+    assert_eq!(
+        [L, A, B, C].map(|x| v.bad(x)),
+        [false, false, true, true],
+        "loop: bad"
+    );
+    assert_eq!(v.placed(A), Some(vec![L.to_string()]), "loop: A placed");
+    assert_eq!((v.placed(B), v.placed(C)), (None, None), "loop: raw");
+    let (w, s) = lf::world();
+    cx::chain(&w);
+    std::fs::write(w.folder(A).join("record.json"), b"{").unwrap();
+    let tx = cx::tx(&w, &s);
+    let v = Tree::shown(&tx);
+    assert!(v.bad(A), "torn: marked");
+    assert_eq!(
+        [L, B, C].map(|x| (v.bad(x), v.placed(x))),
+        [(false, None), (false, None), (false, None)],
+        "torn: nothing placed, nothing else marked"
+    );
+}
