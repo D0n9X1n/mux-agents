@@ -486,6 +486,22 @@ impl Gen {
         self.status_given(None)
     }
 
+    /// b-calls 11, 33: every generation `named` lists that is neither active nor pending and not done by S6
+    /// (`gens::done`: a done marker, and `record.completing` not naming it). Each holds the member's name and slot
+    /// until the fence or `terminate` ends it. Unreadable is `Err` (R2).
+    pub fn orphans(&self) -> Res<Vec<u64>> {
+        let mut open = Vec::new();
+        for n in named(&self.folder)? {
+            if Some(n) == self.active || Some(n) == self.pending {
+                continue;
+            }
+            if !done(&self.folder, n)? {
+                open.push(n);
+            }
+        }
+        Ok(open)
+    }
+
     /// settle-1b G5, b-calls 10, 23: no generation ran. A3a's rule (`Status::never_ran`, call 17: no active
     /// generation; pending absent, or void AND done), and every other generation `named` lists has recorded void
     /// evidence (claim `abandoned` or commit `aborted`). A committed generation released or ended in fence mode ran.
@@ -1129,6 +1145,40 @@ mod tests {
             .map_err(Clone::clone)
             .and_then(|s| g.never_ran_recorded(s));
         (s, ran)
+    }
+
+    // b-calls 11: the generations a file names that are neither active nor pending and not done by recorded
+    // evidence; an Unreadable one refuses.
+    #[test]
+    fn orphans_are_the_named_generations_not_done() {
+        let ok = json!({"committed": true});
+        let record = json!({"lifecycle": 1, "generation": "2", "hcName": "m0123abcd", "pending": {"gen": 3}});
+        let mut files = vec![
+            (0, "claim", json!("abandoned")),
+            (1, "commit", ok.clone()),
+            (2, "commit", ok.clone()),
+            (3, "commit", ok.clone()),
+            (4, "claim", json!("run")),
+            (5, "ended", json!({"state": "finished"})),
+        ];
+        let (_d, m) = seed(record.clone(), &files);
+        assert_eq!(gen_of(&m).orphans().unwrap(), [1, 4]);
+        files.push((6, "commit", json!("TORN")));
+        let (_d, m) = seed(record, &files);
+        assert_eq!(gen_of(&m).orphans().map_err(|e| e.check), Err("evidence"));
+        // b-calls 33 (R6): a stale `completing` naming an otherwise unnamed generation keeps it not done (S6), though
+        // its ended.json exists.
+        let stale =
+            json!({"lifecycle": 1, "completing": {"gen": 0, "intent": "ended", "facts": {}}});
+        let (_d, m) = seed(
+            stale,
+            &[
+                (0, "commit", ok.clone()),
+                (0, "ended", json!({"state": "finished"})),
+            ],
+        );
+        assert!(!done(&m, 0).unwrap(), "gens::done holds it");
+        assert_eq!(gen_of(&m).orphans().unwrap(), [0], "stale completing");
     }
 
     // settle-1b G5, b-calls 10, 23 (F12): `never_ran_recorded` is true only when every generation a file names has

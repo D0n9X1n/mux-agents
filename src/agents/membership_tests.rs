@@ -1138,3 +1138,186 @@ fn membership_reads_each_lifecycle_file_once() {
         );
     }
 }
+
+// b-calls 11 (F11): an orphan-only lifecycle member whose generation 0 is not done by recorded evidence holds its
+// name and one slot whatever hc shows: nothing listed, the fence undecided, hc unreachable, or its own terminal
+// listed Running (counted once). Done by recorded evidence: nothing held. A stale `completing` naming it beside its
+// ended.json: held (b-calls 33). Torn: the snapshot refuses `evidence`.
+#[test]
+fn an_unresolved_orphan_holds_its_name_and_slot() {
+    use crate::agents::{core_fixture as cf, fixture::ID, gens, life_fixture as lf};
+    let done = ["abandoned", "aborted", "ended", "released"];
+    for case in [
+        "nothing listed",
+        "fence undecided",
+        "listed running",
+        "hc unreachable",
+        "abandoned",
+        "aborted",
+        "ended",
+        "released",
+        "stale completing",
+        "torn",
+    ] {
+        let (w, s) = lf::world();
+        let stale = json!({"completing": {"gen": 0, "intent": "ended", "facts": {}}});
+        let m = lf::life(
+            &w,
+            if case == "stale completing" {
+                stale
+            } else {
+                json!({})
+            },
+        );
+        match case {
+            "abandoned" => lf::seed_gen(&m, 0, Some("abandoned"), None),
+            "aborted" => lf::seed_gen(&m, 0, Some("run"), Some(json!({"aborted": true}))),
+            "torn" => {
+                lf::seed_gen(&m, 0, Some("run"), None);
+                std::fs::write(gens::path(&m, 0, "commit"), b"{").unwrap();
+            }
+            _ => lf::seed_gen(&m, 0, Some("run"), lf::committed()),
+        }
+        if ["ended", "released", "stale completing"].contains(&case) {
+            let file = if case == "released" {
+                "released"
+            } else {
+                "ended"
+            };
+            gens::publish_once(&m, 0, file, &json!({})).unwrap();
+        }
+        if case == "fence undecided" {
+            cf::online(&w);
+            let id = format!("mux.id={ID}");
+            lf::fails(
+                &w,
+                &[
+                    "ls",
+                    "--all",
+                    "--label",
+                    id.as_str(),
+                    "--label",
+                    "mux.gen=0",
+                    "--json",
+                ],
+            );
+            crate::agents::team_state::open(&w.ctx, &s, |_| Ok(())).unwrap();
+            assert!(
+                !gens::path(&m, 0, "ended").exists(),
+                "the fence decided nothing"
+            );
+        }
+        if case != "hc unreachable" && case != "torn" {
+            cf::online(&w);
+            let listed: &[&str] = if case == "listed running" {
+                &["t0"]
+            } else {
+                &[]
+            };
+            cf::listing(&w, &lf::team(&w), listed);
+            if case == "listed running" {
+                lf::get(&w, "t0", &lf::running(&w, 0));
+            }
+        }
+        let got = Snapshot::take(&w.ctx, &w.caller());
+        if case == "torn" {
+            assert_eq!(
+                got.map(|_| ()).map_err(|e| e.check),
+                Err("evidence"),
+                "{case}"
+            );
+            continue;
+        }
+        let snap = got.unwrap();
+        let held = !done.contains(&case);
+        assert_eq!(snap.facts.count(), usize::from(held), "{case}: slots");
+        assert_eq!(
+            snap.facts.names().contains(&"worker".to_string()),
+            held,
+            "{case}: name"
+        );
+    }
+}
+
+// b-calls 37 (R12, R13): admission (`Snapshot::for_spawn`) reserves an unresolved orphan exactly as `take` does. A
+// live active generation 1 beside a Running orphan 0: each holds its own slot under the one name (call 24). Ending
+// the orphan (`gens::terminate`) frees its slot only; the active one keeps its slot in both readers.
+#[test]
+fn admission_reserves_orphans_and_an_active_generation_keeps_its_slot() {
+    use crate::agents::team_state::Tx;
+    use crate::agents::{core_fixture as cf, fixture::ID, gens, life_fixture as lf};
+    use serde_json::Value;
+    /// One snapshot (admission or `take`) over hc's team listing; (slots, the name is held).
+    fn slots(w: &World, spawn: bool, listed: &[&str], gets: &[(&str, Value)]) -> (usize, bool) {
+        cf::online(w);
+        cf::listing(w, &lf::team(w), listed);
+        for (a, t) in gets {
+            lf::get(w, a, t);
+        }
+        w.panes(&[]);
+        let snap = if spawn {
+            let core = crate::hc::connect(&w.ctx).unwrap();
+            Snapshot::for_spawn(&w.ctx, &w.caller(), &core).unwrap()
+        } else {
+            Snapshot::take(&w.ctx, &w.caller()).unwrap()
+        };
+        w.fakes.hc_done().unwrap();
+        (
+            snap.facts.count(),
+            snap.facts.names().contains(&"worker".to_string()),
+        )
+    }
+    let (w, _) = lf::world();
+    let m = lf::life(&w, json!({}));
+    lf::seed_gen(&m, 0, Some("run"), lf::committed());
+    assert_eq!(
+        slots(&w, true, &[], &[]),
+        (1, true),
+        "for_spawn: the orphan holds its name and slot"
+    );
+    let (w, s) = lf::world();
+    // Checklist item 2: the active record carries its launcher argv, so hc's Running terminal is this generation's.
+    let m = lf::life(
+        &w,
+        json!({"generation": "1", "hcAddress": "t1", "hcName": lf::hc_name(1), "launcherArgv": lf::ARGV}),
+    );
+    lf::seed_gen(&m, 0, Some("run"), lf::committed());
+    lf::seed_gen(&m, 1, Some("run"), lf::committed());
+    let both = [("t0", lf::running(&w, 0)), ("t1", lf::running(&w, 1))];
+    let only = [("t1", lf::running(&w, 1))];
+    for spawn in [true, false] {
+        assert_eq!(
+            slots(&w, spawn, &["t1"], &only),
+            (2, true),
+            "spawn {spawn}: an orphan hc does not list"
+        );
+        assert_eq!(
+            slots(&w, spawn, &["t0", "t1"], &both),
+            (2, true),
+            "spawn {spawn}: active and orphan"
+        );
+    }
+    cf::online(&w);
+    lf::found(&w, 0, &lf::running(&w, 0));
+    lf::get(&w, "t0", &lf::running(&w, 0));
+    cf::answer(&w, &["kill", "t0", "--json"], "{}");
+    gens::terminate(
+        &Tx {
+            ctx: &w.ctx,
+            scope: s.clone(),
+        },
+        ID,
+        0,
+    )
+    .unwrap();
+    w.fakes.hc_done().unwrap();
+    let killed = lf::wire(&w, 0, "finished", Some("killed"), &lf::ARGV);
+    let after = [("t0", killed.clone()), ("t1", lf::running(&w, 1))];
+    for spawn in [true, false] {
+        assert_eq!(
+            slots(&w, spawn, &["t0", "t1"], &after),
+            (1, true),
+            "spawn {spawn}: the active slot stays"
+        );
+    }
+}

@@ -35,17 +35,42 @@ pub fn team(caller: &Caller) -> String {
 }
 
 pub fn locals(ctx: &Ctx, caller: &Caller) -> Res<Vec<Local>> {
-    Ok(scan(ctx, caller)?.0)
+    Ok(scan(ctx, caller)?.local)
 }
 
 /// The (id, generation) pairs a lifecycle record names that are done by recorded evidence (R3).
 type Freed = Vec<(String, String)>;
 
+/// One scan: the local members, the done (id, generation) pairs (R3), and each unresolved orphan (b-calls 11) as
+/// (id, generation, name).
+struct Scan {
+    local: Vec<Local>,
+    freed: Freed,
+    orphans: Vec<(String, String, String)>,
+}
+
+impl Scan {
+    /// `freed` and each orphan's (id, generation): `core_facts::take` never reserves their listed terminals, so an
+    /// orphan's own terminal is not counted twice.
+    fn skip(&self) -> Freed {
+        let orphans = self.orphans.iter().map(|(i, n, _)| (i.clone(), n.clone()));
+        self.freed.iter().cloned().chain(orphans).collect()
+    }
+    /// b-calls 11: each unresolved orphan holds the member's name and one slot, whatever hc shows.
+    fn reserve(&self, facts: &mut core_facts::Snapshot) {
+        let held = self
+            .orphans
+            .iter()
+            .map(|(i, n, name)| (format!("{i}/{n}"), name.clone()));
+        facts.reserved.extend(held);
+    }
+}
+
 /// R1, R5: every member folder classified once; with the (id, generation) pairs a lifecycle record names that are
 /// done by recorded evidence (R3), whose listed hc terminals `core_facts::take` never reserves.
-fn scan(ctx: &Ctx, caller: &Caller) -> Res<(Vec<Local>, Freed)> {
+fn scan(ctx: &Ctx, caller: &Caller) -> Res<Scan> {
     use super::gens::Member;
-    let (mut local, mut freed) = (Vec::new(), Vec::new());
+    let (mut local, mut freed, mut orphans) = (Vec::new(), Vec::new(), Vec::new());
     // R5: link entries are kept, so member_of refuses them; a regular file at an id is no member.
     for (id, folder, member) in
         super::gens::members(&super::server_dir(ctx, caller).join("agents"))?
@@ -74,13 +99,25 @@ fn scan(ctx: &Ctx, caller: &Caller) -> Res<(Vec<Local>, Freed)> {
                         freed.push((id.clone(), n.to_string()));
                     }
                 }
+                // b-calls 11: an Unreadable orphan refuses the scan, as `status()?` does.
+                let name = record
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                for n in g.orphans()? {
+                    orphans.push((id.clone(), n.to_string(), name.to_owned()));
+                }
                 life_local(g, &s, &id, &team(caller))?
             }
             _ => pre_local(&folder, record, &id, caller)?,
         };
         local.extend(one);
     }
-    Ok((local, freed))
+    Ok(Scan {
+        local,
+        freed,
+        orphans,
+    })
 }
 
 /// Main's reading of a pre-lifecycle record, moved: its identity, the folder commit and the folder notice.
@@ -345,10 +382,11 @@ impl Snapshot {
     }
 
     pub fn take(ctx: &Ctx, caller: &Caller) -> Res<Self> {
-        let (local, freed) = scan(ctx, caller)?;
-        let ids: Vec<_> = local.iter().map(|l| l.identity.clone()).collect();
+        let sc = scan(ctx, caller)?;
+        let skip = sc.skip();
+        let ids: Vec<_> = sc.local.iter().map(|l| l.identity.clone()).collect();
         let result =
-            hc::connect(ctx).and_then(|core| core_facts::take(&core, &team(caller), &ids, &freed));
+            hc::connect(ctx).and_then(|core| core_facts::take(&core, &team(caller), &ids, &skip));
         let (mut facts, error) = match result {
             Ok(facts) => (facts, None),
             Err(e) => (
@@ -366,16 +404,18 @@ impl Snapshot {
                 Some(e),
             ),
         };
-        settle(&mut facts, &local); // R3: also when hc cannot be read
-        Ok(Self::assemble(ctx, caller, local, facts, error))
+        settle(&mut facts, &sc.local); // R3: also when hc cannot be read
+        sc.reserve(&mut facts); // b-calls 11: also when hc cannot be read
+        Ok(Self::assemble(ctx, caller, sc.local, facts, error))
     }
 
     pub fn for_spawn(ctx: &Ctx, caller: &Caller, core: &Core<'_>) -> Res<Self> {
-        let (local, freed) = scan(ctx, caller)?;
-        let ids: Vec<_> = local.iter().map(|l| l.identity.clone()).collect();
-        let mut facts = core_facts::take(core, &team(caller), &ids, &freed)?;
-        settle(&mut facts, &local);
-        Ok(Self::assemble(ctx, caller, local, facts, None))
+        let sc = scan(ctx, caller)?;
+        let ids: Vec<_> = sc.local.iter().map(|l| l.identity.clone()).collect();
+        let mut facts = core_facts::take(core, &team(caller), &ids, &sc.skip())?;
+        settle(&mut facts, &sc.local);
+        sc.reserve(&mut facts);
+        Ok(Self::assemble(ctx, caller, sc.local, facts, None))
     }
 
     pub fn admit_name(
