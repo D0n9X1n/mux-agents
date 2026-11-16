@@ -104,20 +104,29 @@ fn build(from: &Path, temp: &Path, source: &str, target: &str) -> io::Result<()>
 
 /// workspace.yaml without its top-level `mc_` keys, each with its whole block: the key line and every indented line
 /// after it. Copilot CLI 1.0.110 writes `mc_pending_repository_warning:` as a mapping; dropping only the key line
-/// leaves its children under the previous key, which Copilot then refuses to load.
+/// leaves its children under the previous key, which Copilot then refuses to load. Only a non-blank, non-comment
+/// line without indent ends a block. A blank or comment line met inside one is held: an indented line after it
+/// drops it with the block; a top-level line or the end of the text keeps it.
 fn without_mc(text: &str) -> String {
+    let mut kept = Vec::new();
+    let mut held = Vec::new();
     let mut dropping = false;
-    text.split('\n')
-        .filter(|line| {
-            if line.starts_with("mc_") {
-                dropping = true;
-            } else if !line.starts_with([' ', '\t']) {
-                dropping = false;
+    for line in text.split('\n') {
+        let trimmed = line.trim();
+        if dropping && (trimmed.is_empty() || trimmed.starts_with('#')) {
+            held.push(line);
+        } else if dropping && line.starts_with([' ', '\t']) {
+            held.clear();
+        } else {
+            kept.append(&mut held);
+            dropping = line.starts_with("mc_");
+            if !dropping {
+                kept.push(line);
             }
-            !dropping
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
+        }
+    }
+    kept.append(&mut held);
+    kept.join("\n")
 }
 
 /// Folders and files below `from` into `to`. A link (or junction) refuses the copy: Copilot makes none, and
@@ -327,6 +336,35 @@ mod tests {
         assert_eq!(
             copied_workspace("cwd: /work\ngit:\n  mc_branch: main\n  root: /work\nsummary: s\n"),
             format!("id: {NEW}\ncwd: /work\ngit:\n  mc_branch: main\n  root: /work\nsummary: s\n")
+        );
+    }
+
+    #[test]
+    fn copilot_copy_drops_a_blank_line_inside_an_mc_block() {
+        // The blank line does not end the block: it and the indented line after it leave with the block.
+        assert_eq!(
+            copied_workspace(&format!(
+                "cwd: /work\nremote_steerable: false\nmc_pending_repository_warning:\n  mc_session_id: {OLD}\n\n  message: 'not linked: no repo'\nsummary: s\n"
+            )),
+            format!("id: {NEW}\ncwd: /work\nremote_steerable: false\nsummary: s\n")
+        );
+    }
+
+    #[test]
+    fn copilot_copy_drops_a_comment_inside_an_mc_block() {
+        assert_eq!(
+            copied_workspace(&format!(
+                "cwd: /work\nremote_steerable: false\nmc_pending_repository_warning:\n  mc_session_id: {OLD}\n# continued warning\n  message: 'not linked: no repo'\nsummary: s\n"
+            )),
+            format!("id: {NEW}\ncwd: /work\nremote_steerable: false\nsummary: s\n")
+        );
+    }
+
+    #[test]
+    fn copilot_copy_keeps_a_comment_between_two_keys() {
+        assert_eq!(
+            copied_workspace("cwd: /work\n# a note\nsummary: s\n"),
+            format!("id: {NEW}\ncwd: /work\n# a note\nsummary: s\n")
         );
     }
 
