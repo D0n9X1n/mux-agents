@@ -375,6 +375,17 @@ pub(crate) fn views_required(verb: &str, caller: &crate::caller::Caller) -> Res<
     Ok(())
 }
 
+/// a3c call 47: a view verb's prerequisite against the handler's own proof (dispatch proved the caller once already;
+/// the handler proves it again, and its effects use that second proof). A proven member's multiplexer is built here,
+/// from that proof: views down (`MemberMux::Down`) or a server gone or restarted since refuse 1 `views` before the
+/// verb spends a budget, opens a transaction or runs anything. A pane caller is unchanged.
+pub(crate) fn member_views(ctx: &Ctx, caller: &crate::caller::Caller) -> Res<()> {
+    if caller.member.is_some() {
+        crate::mux::ensure(ctx)?;
+    }
+    Ok(())
+}
+
 fn dispatch(def: &VerbDef, request: &Request, ctx: &Ctx) -> Res<Map<String, Value>> {
     #[cfg(feature = "test-panic")]
     if ctx.env.get("MUX_AGENTS_TEST_PANIC") == Some("dispatch") {

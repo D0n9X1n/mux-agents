@@ -11,6 +11,8 @@ use serde_json::{Value, json};
 mod k2_tests;
 #[cfg(test)]
 mod stop_tests;
+#[cfg(test)]
+mod views_tests;
 fn worker() -> (World, caller::Caller, Value, std::path::PathBuf) {
     let mut w = World::agent("");
     let c = w.caller();

@@ -68,6 +68,7 @@ pub fn focus(ctx: &Ctx, request: &Request) -> Res<Map<String, Value>> {
         return Err(usage("focus"));
     }
     let caller = resolve(ctx)?;
+    crate::cli::member_views(ctx, &caller)?;
     let name = if named {
         first(request).to_string()
     } else {

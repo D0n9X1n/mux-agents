@@ -27,6 +27,7 @@ pub fn resume(ctx: &Ctx, request: &Request) -> Res<Map<String, Value>> {
         return Err(usage("resume"));
     }
     let caller = crate::caller::resolve_tree(ctx)?;
+    crate::cli::member_views(ctx, &caller)?;
     if matches!(
         super::tree::scope(ctx, &caller)?,
         super::tree::Scope::Outside
