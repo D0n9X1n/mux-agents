@@ -1217,3 +1217,28 @@ fn a_busy_lock_never_shows_an_unflushed_outcome() {
         "an unflushed failure.json decides nothing"
     );
 }
+
+// a3c call 47 (TL #149, production readiness): an empty or malformed launch.json hcName never matches a terminal
+// carrying the same name, even with this member's labels and a recovery shell's argv. The adjudication refuses
+// `evidence`: no Lost, no failure.json, no outcome.json.
+#[test]
+fn an_invalid_launch_name_is_never_lost() {
+    for name in ["", "../x"] {
+        let g = of::world();
+        g.ran(1);
+        let launch = json!({"hcName": name, "launcherArgv": of::LAUNCHER, "sessionId": of::SID});
+        std::fs::write(gens::path(&g.folder, 1, "launch"), launch.to_string()).unwrap();
+        g.now(10);
+        let lost = of::terminal(name, ID, 1, LOST_ARGVS[0]);
+        assert_eq!(
+            g.judge(1, Some(&lost)).map_err(|e| e.check),
+            Err("evidence"),
+            "{name:?}"
+        );
+        assert_eq!(
+            (g.file(1, "failure"), g.file(1, "outcome")),
+            (None, None),
+            "{name:?}: written"
+        );
+    }
+}
