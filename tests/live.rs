@@ -5713,10 +5713,15 @@ hc {}:
         let a = spawn(&mut live, &leader, "a");
         let b = spawn(&mut live, &a, "b");
         let c = spawn(&mut live, &leader, "c");
+        let mut notices = Vec::new();
         for title in ["first", "second"] {
             let (code, r) = live.by(&id(&a), &["note", "-Title", title, "-BodyFile", &body]);
             assert_eq!(code, 0, "{mux:?} {r}");
+            notices.push(format!("note-{}", s(&r["id"])));
         }
+        // 7b V2: b's next read serves each note's notice once.
+        let (code, r) = live.by(&id(&b), &["read"]);
+        assert_eq!((code, ids_of(&r)), (0, notices), "{mux:?} the notices: {r}");
         let (code, r) = live.by(&id(&b), &["notes"]);
         let titles: Vec<&str> = r["notes"]
             .as_array()

@@ -44,6 +44,7 @@ flowchart LR
 | `list` | `list -All` | 存活的代理、各自在做什么、未读消息；`-All` 加上已结束的，各带其 `exitCode` |
 | `status` | `status -BodyFile step.txt` | 代理报告自己当前在做什么 |
 | `send` | `send claude-1 -BodyFile note.md`，`send parent -BodyFile result.md` | 给某个代理或你的父代理发消息 |
+| `note`、`notes` | `note -Title plan -BodyFile plan.md`，`notes`，`notes <id>` | 写入或读取团队笔记本；每条新笔记会给其他每个成员发一封邮件，每次启动的第一条消息列出最新的标题 |
 | `read` | `read -Wait 600`，`read claude-1 -Lines 40` | 等待你的消息，或读取某个代理的窗格 |
 | `focus` | `focus claude-1`、`focus -Next` | 让多路复用器切换到某个代理的窗格；`-Next` / `-Prev` 按侧边栏的顺序逐个切换 |
 | `stop` | `stop claude-1` | 关闭代理的窗格及其进程；已结束的代理回答 `ok` 并带 `already`（`exited`、`stopped` 或 `lost`） |

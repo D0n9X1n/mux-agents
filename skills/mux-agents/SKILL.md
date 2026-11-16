@@ -82,6 +82,8 @@ The commands below, and the Reply and Listen lines, run as-is in the Bash tool. 
 
 Every member and person of a team shares one notebook. `note -Title <title> -BodyFile <body-file>` adds an entry (title at most 80 characters, body at most 4 KB) and answers its `id`. If it answers `the note could not be saved; retry with -Id <id>`, retry it with the same `-Id <id>`: the note is then saved once, never twice. `notes` lists the newest 20 titles (`-Lines <n>`, `-Since <id>` for those after an entry); `notes <id>` prints one entry in full. Listing marks nothing read. `the notebook is not yet on disk; retry` means nothing was listed or saved: run the same command again.
 
+Your first message names the notebook and lists its newest titles. When another member adds a note, your next `read` brings one mail `new note <id> from <author>: <title>`; run `notes <id>` to read it. A `note` reply lists the members it told in `notified` and any it could not tell in `notifyErrors`; the note is saved either way.
+
 `peek <name>` shows the last lines of a team member's live pane (60 by default, `-Lines <n>` up to 2000). Only a person of the team or an ancestor of the member can peek it, and only inside one team. Nothing is typed into its pane and focus does not move.
 
 ## Listening

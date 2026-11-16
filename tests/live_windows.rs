@@ -1623,6 +1623,7 @@ fn notebook_and_peek_stay_in_the_team() {
     let a = spawn(&mut sent, &leader, "a");
     let b = spawn(&mut sent, &a, "b");
     let c = spawn(&mut sent, &leader, "c");
+    let mut notices = Vec::new();
     for title in ["first", "second"] {
         let r = by(
             &live,
@@ -1631,7 +1632,12 @@ fn notebook_and_peek_stay_in_the_team() {
             &["note", "-Title", title, "-BodyFile", &body],
         );
         assert_eq!(r["ok"], json!(true), "{r}");
+        notices.push(format!("note-{}", s(&r["id"])));
     }
+    // 7b V2: b's next read serves each note's notice once.
+    let got = by(&live, &mut sent, &b, &["read"]);
+    let ids: Vec<String> = got["ids"].as_array().unwrap().iter().map(s).collect();
+    assert_eq!(ids, notices, "the notices: {got}");
     let r = by(&live, &mut sent, &b, &["notes"]);
     let titles: Vec<String> = r["notes"]
         .as_array()
