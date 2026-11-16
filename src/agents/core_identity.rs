@@ -262,9 +262,10 @@ impl Identity {
         if super::gens::lifecycle(r) {
             let text = |k: &str| r.get(k).and_then(Value::as_str);
             let program = attach_program(command, &self.address, HOST)?;
+            // v6f call 24: identity is key + pane + start command + attach program; the window is where the pane is
+            // now (break-pane moves it), reported from the row, never matched.
             if text("viewServerKey") != Some(key.server.as_str())
                 || text("viewSession") != Some(key.session.as_str())
-                || text("window") != Some(row.window.as_str())
                 || text("viewAttachProgram") != Some(program.as_str())
             {
                 return None;
@@ -384,7 +385,6 @@ pub(crate) mod tests {
             ("server", "viewServerKey", json!("k2")),
             ("session", "viewSession", json!("$4")),
             ("no key", "viewServerKey", Value::Null),
-            ("window", "window", json!("@6")),
         ] {
             let mut bad = r.clone();
             if value.is_null() {
@@ -394,6 +394,16 @@ pub(crate) mod tests {
             }
             assert!(id.view(&bad, &[row9()], &key()).is_none(), "{case}");
         }
+        // v6f call 24: the window is not identity. A view moved by break-pane (descriptor @6, pane now in @5) is still
+        // the view, reported where the pane actually is.
+        let mut moved = r.clone();
+        moved["window"] = json!("@6");
+        assert_eq!(
+            id.view(&moved, &[row9()], &key())
+                .map(|p| (p.pane, p.window)),
+            Some(("%9".to_string(), "@5".to_string())),
+            "a moved window"
+        );
         let mut other = r.clone();
         other["startCommand"] = json!("hc attach t2");
         let mut row = row9();
