@@ -8,7 +8,7 @@ use super::lifecycle::{Life, classify};
 use super::release::{self, Cause, halt};
 use super::team_state::{Guard, Tx};
 use crate::error::{Refusal, Res};
-use crate::hc::{Lazy, Terminal};
+use crate::hc::{Lazy, State, Terminal};
 use crate::state::evidence::{Evidence, Published};
 use crate::util::utc_o;
 
@@ -349,6 +349,115 @@ fn continued(at: &At<'_, '_>, step: Res<()>) -> Res<Outcome> {
         Err(e) if e.check == "halted" => Err(e),
         Err(_) => Ok(Outcome::Promoted),
     }
+}
+
+/// settle-1b G11: ends generation n of member `id`, under the team lock the caller holds. Never writes desired
+/// state, touches another member, or promotes. `Ok`: n is done. `Err`: unresolved (no kill; or a kill hc refused);
+/// a retry finishes it (G11.4). Callers: cascade-3d C6, restore-6c P2, A3b-2 Task 6 (stop).
+/// Call 54 (call 22), call 55: `kill.json` (`{address, hcName, labels, at}`) is published right before `hc kill`; a kill hc accepts records the end at once,
+/// with no further `hc get`; a replay that finds `kill.json` and hc `not_found` records the same end.
+pub fn terminate(tx: &Tx<'_>, id: &str, n: u64) -> Res<()> {
+    let folder = tx.folder(id);
+    // b-calls 34: the walk-checked read; a linked `<id>` refuses `evidence`.
+    let r = gens::record(&folder)
+        .known()?
+        .ok_or_else(|| Refusal::internal("the member has no record"))?;
+    let pending = gens::pending(&r) == Some(n);
+    let lazy = Lazy::new(tx.ctx);
+    // G11.1, G11.2: Fence never promotes. Done (rows 0, 0r, 1-5; Lost released; Ended recorded) is Ok.
+    let t = match settle_gen(tx, &lazy, id, n, Mode::Fence, pending)? {
+        Outcome::Done | Outcome::Promoted => return Ok(()),
+        Outcome::Unknown(e) => return forgotten(tx, &lazy, id, n, pending, e),
+        Outcome::Running(t) => t,
+    };
+    if pending {
+        gens::publish_once(
+            &folder,
+            n,
+            "terminating",
+            &json!({"at": utc_o(tx.ctx.clock.now())}),
+        )?;
+        halt("terminating")?;
+    }
+    let core = lazy.get()?;
+    // G11.3, b-calls 12: the exact terminal matched, reread immediately before the kill, nothing between them.
+    let now = core
+        .get(&t.address)
+        .map_err(|_| gens::unclear("hc cannot reread the terminal"))?;
+    if !same_running(&t, &now) {
+        return Err(gens::unclear("the terminal changed before the kill"));
+    }
+    let hc_name = t.name.clone().unwrap_or_default();
+    // Call 54: the recorded attempt, then the kill.
+    gens::publish_once(
+        &folder,
+        n,
+        "kill",
+        &json!({"address": t.address, "hcName": hc_name,
+        "labels": t.labels, "at": utc_o(tx.ctx.clock.now())}),
+    )?;
+    halt("kill")?;
+    core.kill(&t.address)
+        .map_err(|_| gens::unclear("the kill is uncertain"))?;
+    end_by_kill(tx, id, n, pending, &t.address, &hc_name, &t.labels)
+}
+
+/// Call 54: the end of a kill hc accepted (now, or by a recorded attempt hc no longer knows): `ended.json` with
+/// `reason: "terminated"`, no exit code; then `pending` dropped while it names n.
+fn end_by_kill(
+    tx: &Tx<'_>,
+    id: &str,
+    n: u64,
+    pending: bool,
+    address: &str,
+    hc_name: &str,
+    labels: &std::collections::BTreeMap<String, String>,
+) -> Res<()> {
+    let facts = json!({"address": address, "hcName": hc_name, "labels": labels, "state": "finished",
+        "reason": "terminated", "exitCode": null, "at": utc_o(tx.ctx.clock.now())});
+    gens::publish_end(&tx.folder(id), n, &facts)?;
+    halt("ended")?;
+    if pending {
+        drop_field(tx, id, Guard::PendingGen { n: Some(n) }, "pending")?;
+    }
+    Ok(())
+}
+
+/// Call 54 replay: `settle_gen` was Unknown. With a recorded `kill.json` and hc answering `not_found` at its
+/// address, the kill landed and hc forgot the terminal: the same end is recorded. Otherwise `e` stands (no
+/// `kill.json`: `not_found` stays unresolved, the documented limit).
+fn forgotten(tx: &Tx<'_>, lazy: &Lazy<'_>, id: &str, n: u64, pending: bool, e: Refusal) -> Res<()> {
+    let Some(k) = gens::read_flushed(&tx.folder(id), n, "kill")? else {
+        return Err(e);
+    };
+    let text = |f: &str| {
+        k.get(f)
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned()
+    };
+    let (address, hc_name) = (text("address"), text("hcName"));
+    // Call 55: the matched terminal's labels, recorded with the attempt, so this end is the kill path's.
+    let labels: std::collections::BTreeMap<String, String> = k
+        .get("labels")
+        .and_then(|l| serde_json::from_value(l.clone()).ok())
+        .ok_or_else(|| Refusal::internal("kill.json has no labels"))?;
+    match lazy.get()?.get(&address) {
+        Err(g) if g.check == "not_found" => {
+            end_by_kill(tx, id, n, pending, &address, &hc_name, &labels)
+        }
+        _ => Err(e),
+    }
+}
+
+/// b-calls 12: the reread shows the matched terminal unchanged: same address, Live, same argv (a recovery shell
+/// differs: Lost), same name, same labels.
+fn same_running(t: &Terminal, now: &Terminal) -> bool {
+    now.address == t.address
+        && now.state == State::Live
+        && now.argv == t.argv
+        && now.name == t.name
+        && now.labels == t.labels
 }
 
 #[cfg(test)]
@@ -1081,5 +1190,389 @@ mod tests {
             );
             w.fakes.hc_done().unwrap();
         }
+    }
+
+    fn kill(w: &World, address: &str) {
+        cf::answer(w, &["kill", address, "--json"], "{}");
+    }
+    fn killed(w: &World, n: u64) -> Value {
+        lf::wire(w, n, "finished", Some("killed"), &lf::ARGV)
+    }
+
+    // "Fence on a committed pending generation": active 1, pending 2, both Running. terminate(2): terminating,
+    // reread, kill.json, kill, ended (reason terminated), pending dropped; terminate(1): the same without
+    // terminating. Each call: its own connection, one search, the exact reread, the kill; nothing after the kill
+    // (call 54). generation stays "1"; nothing promoted.
+    #[test]
+    fn terminate_ends_a_pending_generation_then_the_active_one() {
+        let (w, s) = lf::world();
+        let m = lf::life(
+            &w,
+            json!({"generation": "1", "hcAddress": "t1", "pending": lf::pending(2)}),
+        );
+        lf::seed_gen(&m, 1, Some("run"), lf::committed());
+        lf::seed_gen(&m, 2, Some("run"), lf::committed());
+        for n in [2, 1] {
+            let a = format!("t{n}");
+            cf::online(&w);
+            lf::found(&w, n, &lf::running(&w, n));
+            lf::get(&w, &a, &lf::running(&w, n));
+            kill(&w, &a);
+            let asked = lf::calls(&w).len();
+            terminate(&tx(&w, &s), ID, n).unwrap();
+            let end = gens::read(&m, n, "ended").known().unwrap().unwrap();
+            assert_eq!(end["reason"], "terminated", "{n}");
+            assert!(
+                matches!(gens::read(&m, n, "kill"), Evidence::Present(_)),
+                "{n}: kill.json"
+            );
+            let verbs: Vec<String> = lf::calls(&w)[asked..]
+                .iter()
+                .map(|c| c[0].clone())
+                .collect();
+            assert_eq!(
+                verbs,
+                ["--version", "ls", "get", "get", "kill"],
+                "{n}: the exact reread, then the kill"
+            );
+        }
+        assert!(
+            matches!(gens::read(&m, 2, "terminating"), Evidence::Present(_)),
+            "terminating for the pending one"
+        );
+        assert_eq!(
+            gens::read(&m, 1, "terminating"),
+            Evidence::Absent,
+            "the active one is not pending"
+        );
+        let r = lf::record(&m);
+        assert_eq!((&r["generation"], r.get("pending")), (&json!("1"), None));
+        assert_eq!(lf::count(&w, "kill"), 2);
+        w.fakes.hc_done().unwrap();
+    }
+
+    // b-calls 12: the exact terminal reread right before the kill has changed: finished, Lost (the core restarted: a
+    // recovery shell), renamed, relabelled, another argv, another address, or gone. No kill, no kill.json,
+    // unresolved, pending kept. "Revalidate before kill": the Lost one is then released by the next terminate.
+    #[test]
+    fn a_terminal_changed_at_the_reread_is_never_killed() {
+        for case in [
+            "finished",
+            "lost",
+            "renamed",
+            "relabelled",
+            "argv",
+            "address",
+            "gone",
+        ] {
+            let (w, s) = lf::world();
+            let m = committed_of(&w, "spawn");
+            cf::online(&w);
+            lf::found(&w, 1, &lf::running(&w, 1));
+            let mut t = lf::running(&w, 1);
+            match case {
+                "finished" => t = killed(&w, 1),
+                "lost" => t = lf::lost(&w, 1, lf::LOST_ARGVS[1]),
+                "renamed" => t["name"] = json!("m00000009"),
+                "relabelled" => t["labels"]["mux.team"] = json!("other:$3"),
+                "argv" => t["argv"] = json!(["/other/mux-agent", "launcher", "/s/spec.json"]),
+                "address" => t["address"] = json!("t9"),
+                _ => {}
+            }
+            if case == "gone" {
+                lf::gone(&w, "t1")
+            } else {
+                lf::get(&w, "t1", &t)
+            }
+            assert!(terminate(&tx(&w, &s), ID, 1).is_err(), "{case}: refused");
+            assert_eq!(lf::count(&w, "kill"), 0, "{case}: killed");
+            assert_eq!(
+                gens::read(&m, 1, "kill"),
+                Evidence::Absent,
+                "{case}: kill.json"
+            );
+            assert!(
+                lf::record(&m).get("pending").is_some(),
+                "{case}: pending kept"
+            );
+            assert!(
+                matches!(gens::read(&m, 1, "terminating"), Evidence::Present(_)),
+                "{case}"
+            );
+            w.fakes.hc_done().unwrap();
+            if case == "lost" {
+                cf::online(&w);
+                lf::found(&w, 1, &lf::lost(&w, 1, lf::LOST_ARGVS[1]));
+                lf::get(&w, "t1", &lf::lost(&w, 1, lf::LOST_ARGVS[1]));
+                lf::relabel(&w, "t1");
+                terminate(&tx(&w, &s), ID, 1).unwrap();
+                assert_eq!(
+                    gens::read(&m, 1, "release").known().unwrap().unwrap()["cause"],
+                    "lost"
+                );
+                assert!(
+                    lf::record(&m).get("pending").is_none() && gens::done(&m, 1).unwrap(),
+                    "released"
+                );
+                lf::no_effect(&w);
+            }
+        }
+    }
+
+    // G11.4, call 54: a kill hc refuses, or a stop right after kill.json (no kill sent): unresolved, pending kept, no
+    // ended.json, and kill.json recorded before any kill. The next terminate (its own connection) kills once and
+    // records the end. A kill hc accepts records the end at once with no further hc call; a replay is Done.
+    #[test]
+    fn an_uncertain_kill_is_finished_by_the_next_terminate() {
+        for case in ["refused", "halted at kill", "kill succeeded, end recorded"] {
+            let (w, s) = lf::world();
+            let m = committed_of(&w, "spawn");
+            cf::online(&w);
+            lf::found(&w, 1, &lf::running(&w, 1));
+            lf::get(&w, "t1", &lf::running(&w, 1));
+            match case {
+                "refused" => lf::fails(&w, &["kill", "t1", "--json"]),
+                "halted at kill" => {}
+                _ => kill(&w, "t1"),
+            }
+            release::halt_after((case == "halted at kill").then_some("kill"));
+            let first = terminate(&tx(&w, &s), ID, 1);
+            release::halt_after(None);
+            assert!(
+                matches!(gens::read(&m, 1, "kill"), Evidence::Present(_)),
+                "{case}: kill.json"
+            );
+            w.fakes.hc_done().unwrap();
+            if case == "kill succeeded, end recorded" {
+                first.unwrap();
+                let end = gens::read(&m, 1, "ended").known().unwrap().unwrap();
+                let got = (&end["reason"], &end["state"], &end["exitCode"]);
+                assert_eq!(
+                    got,
+                    (&json!("terminated"), &json!("finished"), &Value::Null),
+                    "{case}"
+                );
+                assert!(
+                    lf::record(&m).get("pending").is_none(),
+                    "{case}: pending dropped"
+                );
+                let asked = lf::calls(&w).len();
+                terminate(&tx(&w, &s), ID, 1).unwrap();
+                assert_eq!(lf::calls(&w).len(), asked, "{case}: the replay asked hc");
+                continue;
+            }
+            assert!(first.is_err(), "{case}: unresolved");
+            if case == "halted at kill" {
+                assert_eq!(lf::count(&w, "kill"), 0, "{case}: a kill before kill.json");
+            }
+            assert!(
+                lf::record(&m).get("pending").is_some(),
+                "{case}: pending kept"
+            );
+            assert_eq!(gens::read(&m, 1, "ended"), Evidence::Absent, "{case}");
+            cf::online(&w);
+            lf::found(&w, 1, &lf::running(&w, 1));
+            lf::get(&w, "t1", &lf::running(&w, 1));
+            kill(&w, "t1");
+            terminate(&tx(&w, &s), ID, 1).unwrap();
+            assert!(
+                matches!(gens::read(&m, 1, "ended"), Evidence::Present(_)),
+                "{case}: ended"
+            );
+            assert!(
+                lf::record(&m).get("pending").is_none(),
+                "{case}: pending dropped"
+            );
+            let kills = lf::count(&w, "kill");
+            assert_eq!(
+                kills,
+                if case == "refused" { 2 } else { 1 },
+                "{case}: kill calls (one landed)"
+            );
+            w.fakes.hc_done().unwrap();
+        }
+    }
+
+    // Calls 22, 54, 55: hc forgets the terminal after our kill. A recorded kill.json and hc `not_found` at its
+    // address record the same end the kill path writes (field by field, `at` excepted). Without kill.json,
+    // `not_found` stays unresolved: nothing recorded, pending kept, hc not asked about the address.
+    #[test]
+    fn a_recorded_kill_hc_forgot_records_the_same_end() {
+        let (w, s) = lf::world();
+        let m = committed_of(&w, "spawn");
+        cf::online(&w);
+        lf::found(&w, 1, &lf::running(&w, 1));
+        lf::get(&w, "t1", &lf::running(&w, 1));
+        kill(&w, "t1");
+        terminate(&tx(&w, &s), ID, 1).unwrap();
+        let by_kill = gens::read(&m, 1, "ended").known().unwrap().unwrap();
+        // The kill lands but its answer is lost; then hc forgets the terminal.
+        let (w, s) = lf::world();
+        let m = committed_of(&w, "spawn");
+        cf::online(&w);
+        lf::found(&w, 1, &lf::running(&w, 1));
+        lf::get(&w, "t1", &lf::running(&w, 1));
+        lf::fails(&w, &["kill", "t1", "--json"]);
+        assert!(
+            terminate(&tx(&w, &s), ID, 1).is_err(),
+            "the kill's answer is lost"
+        );
+        assert!(
+            matches!(gens::read(&m, 1, "kill"), Evidence::Present(_)),
+            "the attempt is recorded"
+        );
+        assert_eq!(
+            gens::read(&m, 1, "ended"),
+            Evidence::Absent,
+            "no end before the replay"
+        );
+        w.fakes.hc_done().unwrap();
+        cf::online(&w);
+        lf::ls(&w, 1, &[]);
+        lf::gone(&w, "t1");
+        terminate(&tx(&w, &s), ID, 1).unwrap();
+        let replayed = gens::read(&m, 1, "ended").known().unwrap().unwrap();
+        let but_at = |v: &Value| {
+            let mut v = v.clone();
+            v.as_object_mut().unwrap().remove("at");
+            v
+        };
+        assert_eq!(
+            but_at(&replayed),
+            but_at(&by_kill),
+            "the same end, `at` excepted"
+        );
+        assert!(lf::record(&m).get("pending").is_none(), "pending dropped");
+        w.fakes.hc_done().unwrap();
+        // No recorded attempt.
+        let (w, s) = lf::world();
+        let m = committed_of(&w, "spawn");
+        cf::online(&w);
+        lf::ls(&w, 1, &[]);
+        assert!(
+            terminate(&tx(&w, &s), ID, 1).is_err(),
+            "no kill.json: unresolved"
+        );
+        assert_eq!(
+            gens::read(&m, 1, "ended"),
+            Evidence::Absent,
+            "no kill.json: an end recorded"
+        );
+        assert!(
+            lf::record(&m).get("pending").is_some(),
+            "no kill.json: pending dropped"
+        );
+        w.fakes.hc_done().unwrap();
+    }
+
+    // G11.1: a half-done release (release.json, no released.json) is finished by terminate, never killed.
+    #[test]
+    fn terminate_finishes_a_half_done_release_without_a_kill() {
+        let (w, s) = lf::world();
+        let m = committed_of(&w, "spawn");
+        gens::publish_once(&m, 1, "release", &release_body()).unwrap();
+        cf::online(&w);
+        lf::get(&w, "t1", &lf::lost(&w, 1, lf::LOST_ARGVS[0]));
+        lf::relabel(&w, "t1");
+        terminate(&tx(&w, &s), ID, 1).unwrap();
+        assert!(matches!(
+            gens::read(&m, 1, "released"),
+            Evidence::Present(_)
+        ));
+        assert!(lf::record(&m).get("pending").is_none() && gens::done(&m, 1).unwrap());
+        assert_eq!(
+            gens::read(&m, 1, "terminating"),
+            Evidence::Absent,
+            "no terminating before a release"
+        );
+        assert_eq!(gens::read(&m, 1, "kill"), Evidence::Absent, "no kill.json");
+        lf::no_effect(&w);
+        w.fakes.hc_done().unwrap();
+    }
+
+    // "Orphan stop": a Running orphan 2 beside active 1 and pending 3: only 2 ends; the record is untouched; no
+    // terminating.json (2 is not pending).
+    #[test]
+    fn an_orphan_is_ended_and_the_record_is_untouched() {
+        let (w, s) = lf::world();
+        let m = lf::life(
+            &w,
+            json!({"generation": "1", "hcAddress": "t1", "pending": lf::pending(3)}),
+        );
+        lf::seed_gen(&m, 2, Some("run"), lf::committed());
+        let before = std::fs::read(m.join("record.json")).unwrap();
+        cf::online(&w);
+        lf::found(&w, 2, &lf::running(&w, 2));
+        lf::get(&w, "t2", &lf::running(&w, 2));
+        kill(&w, "t2");
+        terminate(&tx(&w, &s), ID, 2).unwrap();
+        assert!(matches!(gens::read(&m, 2, "ended"), Evidence::Present(_)));
+        assert_eq!(gens::read(&m, 2, "terminating"), Evidence::Absent);
+        assert_eq!(
+            std::fs::read(m.join("record.json")).unwrap(),
+            before,
+            "the record is untouched"
+        );
+        w.fakes.hc_done().unwrap();
+    }
+
+    // B-R4: none or several terminals: unresolved, no kill, pending kept, no terminating.json, no kill.json.
+    #[test]
+    fn an_unresolved_generation_is_never_killed() {
+        for case in ["none", "two"] {
+            let (w, s) = lf::world();
+            let m = committed_of(&w, "spawn");
+            cf::online(&w);
+            if case == "none" {
+                lf::ls(&w, 1, &[]);
+            } else {
+                lf::ls(&w, 1, &["t1", "t9"]);
+                lf::get(&w, "t1", &lf::running(&w, 1));
+                lf::get(&w, "t9", &lf::running(&w, 1));
+            }
+            assert!(terminate(&tx(&w, &s), ID, 1).is_err(), "{case}");
+            assert_eq!(lf::count(&w, "kill"), 0, "{case}");
+            assert!(lf::record(&m).get("pending").is_some(), "{case}");
+            assert_eq!(gens::read(&m, 1, "terminating"), Evidence::Absent, "{case}");
+            assert_eq!(gens::read(&m, 1, "kill"), Evidence::Absent, "{case}");
+        }
+    }
+
+    // b-calls 37, G11.2: `terminating.json` is published before the end request. Stopped right after it: it is
+    // there, no kill.json, no `kill` sent, pending kept. The next terminate rereads, kills once, records the end.
+    #[test]
+    fn terminating_is_published_before_the_kill() {
+        let (w, s) = lf::world();
+        let m = committed_of(&w, "spawn");
+        cf::online(&w);
+        lf::found(&w, 1, &lf::running(&w, 1));
+        release::halt_after(Some("terminating"));
+        let first = terminate(&tx(&w, &s), ID, 1);
+        release::halt_after(None);
+        assert_eq!(first.map_err(|e| e.check), Err("halted"), "the halt");
+        assert!(
+            matches!(gens::read(&m, 1, "terminating"), Evidence::Present(_)),
+            "terminating.json first"
+        );
+        assert_eq!(
+            gens::read(&m, 1, "kill"),
+            Evidence::Absent,
+            "kill.json before terminating.json"
+        );
+        assert_eq!(lf::count(&w, "kill"), 0, "a kill before terminating.json");
+        assert!(lf::record(&m).get("pending").is_some(), "pending kept");
+        w.fakes.hc_done().unwrap();
+        cf::online(&w);
+        lf::found(&w, 1, &lf::running(&w, 1));
+        lf::get(&w, "t1", &lf::running(&w, 1));
+        kill(&w, "t1");
+        terminate(&tx(&w, &s), ID, 1).unwrap();
+        assert!(
+            matches!(gens::read(&m, 1, "ended"), Evidence::Present(_)),
+            "ended"
+        );
+        assert!(lf::record(&m).get("pending").is_none(), "pending dropped");
+        assert_eq!(lf::count(&w, "kill"), 1, "one kill");
+        w.fakes.hc_done().unwrap();
     }
 }

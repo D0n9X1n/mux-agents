@@ -8,7 +8,7 @@ use crate::hc::{Core, Reason, State, Terminal};
 use crate::state::evidence::{self, Evidence, Published};
 
 /// Every create-once file of a generation (S5); the claim lives beside the folder.
-pub const FILES: [&str; 15] = [
+pub const FILES: [&str; 16] = [
     "spec",
     "launch",
     "commit",
@@ -21,6 +21,7 @@ pub const FILES: [&str; 15] = [
     "outcome",
     "ended",
     "terminating",
+    "kill",
     "release",
     "released",
     "notice",
@@ -729,6 +730,9 @@ pub fn record_end(member: &Path, record: &Value, n: u64, t: &Terminal, at: &str)
         .unwrap_or_default();
     publish_end(member, n, &end_facts(t, hc_name, at))
 }
+
+/// settle-1b names G11 `gens::terminate`.
+pub use super::settle::terminate;
 
 /// The client a generation proved (proof-0b K1a): the recorded launcher and the process it started, each as
 /// (pid, start).
