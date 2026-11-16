@@ -105,7 +105,12 @@ fn decide(ctx: &Ctx, member: &Path, n: u64, seen: Option<&Terminal>) -> Res<Adju
     } = gens::promote_held(ctx, member, n)?;
     let now = ctx.clock.now();
     let verdict = match ready {
-        Ready::Outcome(body) => return Ok(Adjudged::Decided(Verdict::parse(&body)?)),
+        Ready::Outcome(body) => {
+            let verdict = Verdict::parse(&body)?;
+            // Ambiguity 11: confirmed through the publisher (its folders flushed) before it decides.
+            gens::publish_once(member, n, "outcome", &body)?;
+            return Ok(Adjudged::Decided(verdict));
+        }
         Ready::Failed => Verdict::Failed(reason(failure.as_ref())?),
         Ready::Ok => Verdict::Ok,
         Ready::Undecided => match fresh(member, n, now, seen, report.as_ref(), exit)? {

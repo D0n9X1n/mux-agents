@@ -547,3 +547,445 @@ fn an_unreadable_input_on_a_reached_path_refuses_and_writes_nothing() {
         );
     }
 }
+
+fn unpublished() -> Result<Adjudged, (&'static str, String)> {
+    Err(("state", gens::NOT_PUBLISHED.to_string()))
+}
+fn unflushed() -> Result<Adjudged, (&'static str, String)> {
+    Err(("state", gens::NOT_FLUSHED.to_string()))
+}
+fn judged(
+    g: &of::G,
+    seen: Option<&crate::hc::Terminal>,
+) -> Result<Adjudged, (&'static str, String)> {
+    g.judge(1, seen).map_err(|e| (e.check, e.message))
+}
+
+// Ambiguities 11, 12: a failed gens/1 flush leaves failure.json, then outcome.json, linked but unflushed; while the
+// flush keeps failing nothing decides (a reboot could lose the file); once it succeeds, the same verdict.
+#[test]
+fn an_unflushed_outcome_is_confirmed_before_it_decides() {
+    let g = of::world();
+    g.ran(1);
+    exited(&g, "exited");
+    g.now(10);
+    crate::state::fs::fail_sync_dir(Some(&gens::dir(&g.folder, 1)));
+    assert_eq!(
+        judged(&g, None),
+        unflushed(),
+        "call 1: failure.json linked, unflushed"
+    );
+    assert!(g.file(1, "failure").is_some() && g.file(1, "outcome").is_none());
+    assert_eq!(
+        judged(&g, None),
+        unflushed(),
+        "call 2: outcome.json linked, unflushed"
+    );
+    assert!(g.file(1, "outcome").is_some());
+    assert_eq!(
+        judged(&g, None),
+        unflushed(),
+        "call 3: an unflushed outcome.json decides nothing"
+    );
+    crate::state::fs::fail_sync_dir(None);
+    assert_eq!(g.judge(1, None), decided(Verdict::Failed(EXITED.into())));
+}
+
+// Spec "failure injection at failure.json": nothing linked; the next call reaches the same verdict.
+#[test]
+fn failure_injection_at_failure_json_gives_the_same_verdict_next_call() {
+    let g = of::world();
+    g.ran(1);
+    exited(&g, "exited");
+    g.now(10);
+    crate::state::fs::fail_sync_file(Some(&gens::path(&g.folder, 1, "failure")));
+    assert_eq!(judged(&g, None), unpublished());
+    crate::state::fs::fail_sync_file(None);
+    assert_eq!((g.file(1, "failure"), g.file(1, "outcome")), (None, None));
+    assert_eq!(g.judge(1, None), decided(Verdict::Failed(EXITED.into())));
+}
+
+// Spec "no reversal": failure.json is created, the outcome.json write fails, then the launcher publishes a matching
+// client.json; the next adjudication is still failed and no ready.json exists. The same with an earlier exit.json.
+#[test]
+fn no_reversal_after_a_lost_outcome_write() {
+    for (case, secs, want) in [("report, no client", 210, NO_CLIENT), ("exit", 10, EXITED)] {
+        let g = of::world();
+        g.ran(1);
+        g.report(1, 150);
+        if case == "exit" {
+            exited(&g, "exited");
+        }
+        g.now(secs);
+        crate::state::fs::fail_sync_file(Some(&gens::path(&g.folder, 1, "outcome")));
+        assert_eq!(judged(&g, None), unpublished(), "{case}");
+        crate::state::fs::fail_sync_file(None);
+        g.client(1);
+        assert_eq!(
+            g.judge(1, None),
+            decided(Verdict::Failed(want.into())),
+            "{case}"
+        );
+        assert_eq!(g.file(1, "ready"), None, "{case}");
+        let recorded = g.file(1, "outcome").unwrap();
+        assert_eq!(
+            gens::promote_ready(&g.w.ctx, &g.key, ID, 1),
+            Ok(gens::Ready::Outcome(recorded)),
+            "{case}"
+        );
+    }
+}
+
+// Spec "Lost then expired": the Lost observation fails the generation; its hc record then expires (no observation):
+// still failed, from failure.json.
+#[test]
+fn lost_then_expired_still_fails() {
+    let g = of::world();
+    g.ran(1);
+    g.now(10);
+    let lost = of::terminal(of::HC, ID, 1, LOST_ARGVS[1]);
+    crate::state::fs::fail_sync_file(Some(&gens::path(&g.folder, 1, "outcome")));
+    assert_eq!(judged(&g, Some(&lost)), unpublished());
+    crate::state::fs::fail_sync_file(None);
+    assert_eq!(
+        g.judge(1, None),
+        decided(Verdict::Failed(LOST.into())),
+        "no observation any more"
+    );
+}
+
+// Spec "torn evidence": a torn failure.json or outcome.json stops undecided (`evidence`), writes nothing and leaves
+// its bytes; a whole file then gives the same verdict.
+#[test]
+fn torn_failure_or_outcome_stops_undecided_and_writes_nothing() {
+    for file in ["failure", "outcome"] {
+        let g = of::world();
+        g.ran(1);
+        g.now(400);
+        let at = gens::path(&g.folder, 1, file);
+        std::fs::write(&at, b"{\"rea").unwrap();
+        assert_eq!(
+            g.judge(1, None).map_err(|e| e.check),
+            Err("evidence"),
+            "{file}"
+        );
+        assert_eq!(
+            std::fs::read(&at).unwrap(),
+            b"{\"rea",
+            "{file}: bytes untouched"
+        );
+        let other = if file == "failure" {
+            "outcome"
+        } else {
+            "failure"
+        };
+        assert_eq!(
+            (g.file(1, other), g.file(1, "ready")),
+            (None, None),
+            "{file}"
+        );
+        std::fs::remove_file(&at).unwrap();
+        let whole = if file == "failure" {
+            json!({"reason": NO_REPORT, "evidence": {}, "at": "x"})
+        } else {
+            json!({"outcome": "failed", "reason": NO_REPORT, "at": "x"})
+        };
+        g.put(1, file, whole);
+        assert_eq!(
+            g.judge(1, None),
+            decided(Verdict::Failed(NO_REPORT.into())),
+            "{file}"
+        );
+    }
+}
+
+// R2, R5 and the OS matrix: a folder at outcome.json or failure.json (every OS), gens/1 a link (testing::link_dir:
+// Unix symlink; Windows directory symlink or junction) to a folder holding a whole failure.json, and a Unix FIFO at
+// failure.json: `evidence`, nothing written anywhere, nothing opened that is not a regular file.
+#[test]
+fn wrong_file_types_refuse_and_write_nothing() {
+    for file in ["outcome", "failure"] {
+        let g = of::world();
+        g.ran(1);
+        g.now(400);
+        std::fs::create_dir(gens::path(&g.folder, 1, file)).unwrap();
+        assert_eq!(
+            g.judge(1, None).map_err(|e| e.check),
+            Err("evidence"),
+            "a folder at {file}.json"
+        );
+        let other = if file == "outcome" {
+            "failure"
+        } else {
+            "outcome"
+        };
+        assert_eq!(g.file(1, other), None, "{file}");
+    }
+    let g = of::world();
+    g.ran(1);
+    g.now(400);
+    let outside = crate::testing::TempDir::new();
+    let target = outside.path().join("1");
+    std::fs::rename(gens::dir(&g.folder, 1), &target).unwrap();
+    std::fs::write(
+        target.join("failure.json"),
+        br#"{"reason":"no readiness report","evidence":{},"at":"x"}"#,
+    )
+    .unwrap();
+    crate::testing::link_dir(&target, &gens::dir(&g.folder, 1));
+    assert_eq!(
+        g.judge(1, None).map_err(|e| e.check),
+        Err("evidence"),
+        "linked gens/1"
+    );
+    assert!(
+        !target.join("outcome.json").exists(),
+        "nothing written through the link"
+    );
+    #[cfg(unix)]
+    {
+        let g = of::world();
+        g.ran(1);
+        g.now(400);
+        let fifo = gens::path(&g.folder, 1, "failure");
+        let mkfifo = std::path::Path::new("/usr/bin/mkfifo");
+        let made = crate::spawn::captured(
+            mkfifo,
+            &[fifo.to_str().unwrap()],
+            std::time::Duration::from_secs(10),
+        );
+        assert_eq!(made.map(|o| o.code).ok(), Some(0), "mkfifo");
+        assert_eq!(
+            g.judge(1, None).map_err(|e| e.check),
+            Err("evidence"),
+            "a FIFO at failure.json"
+        );
+        assert_eq!(g.file(1, "outcome"), None);
+    }
+}
+
+// Ambiguity 10: a failure.json that lands between promote_held's read and the create (a writer outside the lock) makes
+// the create find `Exists`: decide nothing, no outcome.json; the next call decides from the file that landed.
+#[test]
+fn a_file_landing_outside_the_lock_decides_nothing_on_that_call() {
+    let g = of::world();
+    g.ran(1);
+    exited(&g, "exited");
+    g.now(10);
+    let at = gens::path(&g.folder, 1, "failure");
+    let body = json!({"reason": NO_REPORT, "evidence": {}, "at": "x"});
+    let once = std::rc::Rc::new(std::cell::Cell::new(false));
+    let (flag, file, b) = (once.clone(), at.clone(), body.clone());
+    // The first clock read under the lock is `decide`'s `now`, after promote_held and before the create.
+    g.w.fakes.clock_probe(move |_| {
+        if !flag.replace(true) {
+            crate::state::fs::write_json(&file, &b).unwrap();
+        }
+    });
+    assert_eq!(g.judge(1, None).map_err(|e| e.check), Err("evidence"));
+    assert!(once.get(), "the file landed");
+    assert_eq!(g.file(1, "outcome"), None);
+    assert_eq!(
+        g.judge(1, None),
+        decided(Verdict::Failed(NO_REPORT.into())),
+        "from the file that landed"
+    );
+}
+
+/// A second party on the same state root and the same real per-user locks, its own fakes, at T0 + `secs`.
+fn actor(
+    root: &std::path::Path,
+    locks: &std::path::Path,
+    secs: u64,
+) -> (crate::testing::Fakes, crate::ctx::Ctx) {
+    let f = crate::testing::Fakes::default();
+    f.process(crate::testing::row(100, 1, 1000));
+    f.process(crate::testing::row(150, 100, 1500));
+    f.real_locks(locks);
+    let mut ctx = f.ctx();
+    ctx.state_root = root.to_path_buf();
+    let at = crate::util::parse_utc(of::T0).unwrap() + std::time::Duration::from_secs(secs);
+    f.advance(at.duration_since(ctx.clock.now()).unwrap());
+    (f, ctx)
+}
+
+/// report-2b K4.1's stand-in: under the gen lock, `report.json` only when neither `outcome.json` nor `failure.json`
+/// exists, then K5 under the same hold.
+fn report_under_lock(ctx: &crate::ctx::Ctx, key: &str) -> Res<gens::Ready> {
+    let member = ctx.state_root.join(key).join("agents").join(ID);
+    crate::agents::lock(ctx, &gen_lock_key(key, ID, 1), || {
+        let decided = gens::read(&member, 1, "outcome").known()?.is_some()
+            || gens::read(&member, 1, "failure").known()?.is_some();
+        if !decided {
+            let r = json!({"sessionId": of::SID, "pid": 150, "start": 1500, "at": "x"});
+            gens::publish_once(&member, 1, "report", &r)?;
+        }
+        gens::promote_held(ctx, &member, 1).map(|h| h.ready)
+    })
+}
+
+// Spec races on real per-user locks, every OS (Unix `flock`, Windows named mutex) under a 0700 lock root (o2 call 18:
+// `testing::private_tree`). Report at 149 s, adjudicator at 151 s, both orders. Build checklist 11: contention is
+// proven from inside the lock: the first holder keeps the gen lock until the real lock's own wait, on the second
+// party's thread, finds it held (`state::lock::hooks::when_held`, which fires only from inside that wait), and records
+// that it saw it before it releases. The outcome follows the lock order, never ready and failed both.
+#[test]
+fn the_lock_order_decides_the_outcome_never_both() {
+    use crate::state::lock::hooks::when_held;
+    use std::sync::{Arc, Mutex, mpsc};
+    // Checklist 11: the hook is proof only because it fires inside the wait on a held lock: a free gen lock fires none.
+    {
+        let g = of::world();
+        let locks = crate::testing::TempDir::new();
+        let lp = locks.path().join("l");
+        crate::testing::private_tree(locks.path(), &lp);
+        g.w.fakes.real_locks(&lp);
+        let fired = std::rc::Rc::new(std::cell::Cell::new(false));
+        let f = fired.clone();
+        when_held(Some(Box::new(move || f.set(true))));
+        let got = g.judge(1, None);
+        when_held(None);
+        assert_eq!(
+            (got, fired.get()),
+            (Ok(Adjudged::Undecided), false),
+            "a free gen lock fires no hook"
+        );
+    }
+    for case in ["report first", "report first, client", "adjudicator first"] {
+        let g = of::world();
+        g.ran(1);
+        if case.ends_with("client") {
+            g.client(1);
+        }
+        let locks = crate::testing::TempDir::new();
+        let lp = locks.path().join("l");
+        crate::testing::private_tree(locks.path(), &lp);
+        g.w.fakes.real_locks(&lp);
+        g.now(151);
+        let (root, key) = (g.w.ctx.state_root.clone(), g.key.clone());
+        let (held_tx, held_rx) = mpsc::channel::<()>();
+        let (tried_tx, tried_rx) = mpsc::channel::<()>();
+        let contended = Arc::new(Mutex::new(false));
+        let (seen, tried_rx) = (contended.clone(), Mutex::new(tried_rx));
+        // The first holder: inside the gen lock, let the second party go, then hold until the second party's wait has
+        // found the lock held (10 s at most), and record whether it did, before releasing.
+        let holder = move |event: &str| {
+            if event.starts_with("+gen|") {
+                held_tx.send(()).unwrap();
+                let tried = tried_rx
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(std::time::Duration::from_secs(10));
+                *seen.lock().unwrap() = tried.is_ok();
+            }
+            String::new()
+        };
+        // The second party's thread: the real lock fires this from inside its wait on the held gen lock.
+        let trying = move || {
+            let _ = tried_tx.send(());
+        };
+        let (reported, judged) = std::thread::scope(|s| {
+            if case == "adjudicator first" {
+                g.w.fakes.lock_probe(holder);
+                let racer = s.spawn(move || {
+                    held_rx.recv().unwrap();
+                    let (_f, ctx) = actor(&root, &lp, 149);
+                    when_held(Some(Box::new(trying)));
+                    let got = report_under_lock(&ctx, &key);
+                    when_held(None);
+                    got
+                });
+                let judged = g.judge(1, None);
+                (racer.join().unwrap(), judged)
+            } else {
+                let racer = s.spawn(move || {
+                    let (f, ctx) = actor(&root, &lp, 149);
+                    f.lock_probe(holder);
+                    report_under_lock(&ctx, &key)
+                });
+                held_rx.recv().unwrap();
+                when_held(Some(Box::new(trying)));
+                let judged = g.judge(1, None);
+                when_held(None);
+                (racer.join().unwrap(), judged)
+            }
+        });
+        let both = g.file(1, "ready").is_some() && g.file(1, "failure").is_some();
+        assert!(!both, "{case}: ready and failed both");
+        match case {
+            "report first" => {
+                assert_eq!(
+                    (reported, judged),
+                    (Ok(gens::Ready::Undecided), Ok(Adjudged::Undecided)),
+                    "{case}"
+                );
+                assert_eq!(g.file(1, "failure"), None, "{case}: never failed");
+            }
+            "report first, client" => {
+                assert_eq!(
+                    (reported, judged),
+                    (Ok(gens::Ready::Ok), decided(Verdict::Ok)),
+                    "{case}"
+                );
+            }
+            _ => {
+                assert_eq!(judged, decided(Verdict::Failed(NO_REPORT.into())), "{case}");
+                assert!(
+                    matches!(reported, Ok(gens::Ready::Outcome(_))),
+                    "{case}: {reported:?}"
+                );
+                assert_eq!(
+                    g.file(1, "report"),
+                    None,
+                    "{case}: the report created nothing"
+                );
+            }
+        }
+        assert!(
+            *contended.lock().unwrap(),
+            "{case}: the second party never waited on the held gen lock"
+        );
+    }
+}
+
+// R5, finding 1to4-I6: a link at failure.json or outcome.json itself (testing::link_dir: Unix symlink; Windows directory
+// symlink, else junction), to a folder or dangling: `evidence`, never followed, the target untouched, nothing new.
+#[test]
+fn a_link_at_an_evidence_name_refuses_and_is_never_followed() {
+    for file in ["failure", "outcome"] {
+        for dangling in [false, true] {
+            let g = of::world();
+            g.ran(1);
+            g.now(400);
+            let outside = crate::testing::TempDir::new();
+            let target = outside.path().join("t");
+            if !dangling {
+                std::fs::create_dir(&target).unwrap();
+            }
+            crate::testing::link_dir(&target, &gens::path(&g.folder, 1, file));
+            let case = format!("{file}, dangling {dangling}");
+            assert_eq!(
+                g.judge(1, None).map_err(|e| e.check),
+                Err("evidence"),
+                "{case}"
+            );
+            assert_eq!(target.exists(), !dangling, "{case}: the target untouched");
+            if !dangling {
+                assert!(
+                    std::fs::read_dir(&target).unwrap().next().is_none(),
+                    "{case}: nothing written through it"
+                );
+            }
+            let other = if file == "failure" {
+                "outcome"
+            } else {
+                "failure"
+            };
+            assert_eq!(
+                (g.file(1, other), g.file(1, "ready")),
+                (None, None),
+                "{case}"
+            );
+        }
+    }
+}
