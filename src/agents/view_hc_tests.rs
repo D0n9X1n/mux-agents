@@ -5,9 +5,6 @@ use super::{
 };
 use serde_json::json;
 
-#[cfg(test)]
-mod restore_tests;
-
 #[test]
 fn member_target_rechecks_complete_identity() {
     let w = World::human("");
@@ -444,3 +441,6 @@ fn focus_member_attaches_the_held_generations_address() {
         }
     }
 }
+
+#[cfg(test)]
+mod restore_tests;
