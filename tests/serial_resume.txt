@@ -1,0 +1,3 @@
+# occupy-3 (call 19): live tests that run `resume`, run alone in CI (one name per line).
+# cascade-3d Task 12: restarts the private core mid-test; run alone.
+a_cascade_stop_ends_b_before_a_and_a_second_stop_finishes

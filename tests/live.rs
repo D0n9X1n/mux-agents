@@ -5253,6 +5253,7 @@ hc {}:
                     bar_keys_focus_an_agent,
                     bar_click_after_shrinking_does_nothing,
                     members_spawn_and_act_only_down_the_tree,
+                    a_cascade_stop_ends_b_before_a_and_a_second_stop_finishes,
                     team_messaging_stays_in_the_team,
                     an_unacked_batch_is_served_again_and_rebuilt_for_a_successor,
                     a_lost_member_is_released_and_keeps_only_its_kept_labels,
@@ -5361,6 +5362,112 @@ hc {}:
             (2, Some("limit")),
             "{mux:?} {r}"
         );
+    }
+
+    /// A journal of member `id` is left under its server key's `teams/<hash>.cascade/`.
+    fn journal_left(live: &Live, id: &str) -> bool {
+        let teams = live
+            .agent_dir(id)
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join("teams");
+        std::fs::read_dir(teams).is_ok_and(|d| {
+            d.flatten()
+                .any(|e| e.path().join(format!("{id}.json")).exists())
+        })
+    }
+
+    // cascade-3d live (spec "Live tests"; calls 12, 26): public paths only. A person's commands run from a shell pane
+    // in `up`'s team session, whose bar is closed (and proven closed) before the crash, so no watch tick finishes the
+    // cascade before the restart assertions.
+    fn a_cascade_stop_ends_b_before_a_and_a_second_stop_finishes(mux: Mux) {
+        let Some(mut live) = Live::human(mux) else {
+            return;
+        };
+        std::fs::write(live.dir.join("brief.md"), "brief").unwrap();
+        let (code, up) = live.run(&["up", "-Client", "claude"]);
+        assert_eq!(code, 0, "{mux:?} {up}");
+        let leader = s(&up["leader"]["id"]).to_string();
+        let team = live.split(s(&up["session"]), &["-v"]);
+        let (code, close) = live.run_in(&team, &["sidebar", "-Close"]);
+        assert_eq!(code, 0, "{mux:?} {close}");
+        for pane in close["panes"].as_array().into_iter().flatten() {
+            live.wait_gone(s(pane));
+        }
+        let (code, again) = live.run_in(&team, &["sidebar", "-Close"]);
+        let none = again["panes"].as_array().is_none_or(Vec::is_empty);
+        assert!(
+            code == 0 && none,
+            "{mux:?}: the team's bar is closed: {again}"
+        );
+        let spawn = |live: &mut Live, by: &str, name: &str| {
+            let (code, r) = live.spawn_by(by, name);
+            assert_eq!(code, 0, "{mux:?} {name}: {r}");
+            s(&r["id"]).to_string()
+        };
+        // 1. The leader stops a1 by name, inside the tree: b1, then a1; every notice; no journal left.
+        let a1 = spawn(&mut live, &leader, "a1");
+        let b1 = spawn(&mut live, &a1, "b1");
+        let (code, r) = live.by(&leader, &["stop", "a1"]);
+        let got = (code, &r["stopped"], &r["unresolved"]);
+        assert_eq!(got, (0, &json!(true), &json!([])), "{mux:?} {r}");
+        for id in [&a1, &b1] {
+            assert!(
+                live.gen_file(id, "notice.json").exists(),
+                "{mux:?} {id} noticed"
+            );
+        }
+        assert!(!journal_left(&live, &a1), "{mux:?}");
+        // 2. A person stops a2 from the team's pane, killed right after b2's notice: b2 finished, a2 still live
+        //    (bottom-up), the journal kept; a spawn under a2 is refused `closed`.
+        let a2 = spawn(&mut live, &leader, "a2");
+        let b2 = spawn(&mut live, &a2, "b2");
+        let state = live.state_text();
+        let step = format!("cascade-noticed-{b2}");
+        let vars = [
+            ("MUX_AGENTS_STATE", state.as_str()),
+            ("MUX_AGENTS_CRASH", step.as_str()),
+        ];
+        let bin = env!("CARGO_BIN_EXE_mux-agent");
+        let (code, out, err) = live
+            .server
+            .run_raw_in(&team, bin, &["stop", "a2"], &vars, &[]);
+        assert_eq!(code, 86, "{mux:?}: killed after b2's notice: {out} {err}");
+        let state_of = |live: &Live, id: &str| {
+            let r = json_file(&live.agent_dir(id).join("record.json"));
+            core(live, &["get", s(&r["hcAddress"]), "--json"])["state"].clone()
+        };
+        assert_eq!(state_of(&live, &b2), "finished", "{mux:?}: b2 ended first");
+        assert_eq!(state_of(&live, &a2), "live", "{mux:?}: a2 after b2");
+        assert!(journal_left(&live, &a2), "{mux:?}: the journal is kept");
+        let (code, r) = live.spawn_by(&a2, "c2");
+        let got = (code, r["check"].as_str());
+        assert_eq!(got, (2, Some("closed")), "{mux:?}: a spawn under a2: {r}");
+        // 3. The private core restarts; the journal is still there; a second person stop finishes it.
+        assert!(
+            live.server.core.as_mut().unwrap().stop(),
+            "{mux:?}: core stop"
+        );
+        live.server.core.as_mut().unwrap().start();
+        assert!(journal_left(&live, &a2), "{mux:?}: kept across the restart");
+        let deadline = Instant::now() + LONG;
+        loop {
+            let _ = live.run_in(&team, &["stop", "a2"]); // finishes every journal before it names a2 (C8)
+            if !journal_left(&live, &a2) {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "{mux:?}: a second stop never finished it"
+            );
+            std::thread::sleep(Duration::from_millis(500));
+        }
+        let a0 = live.agent_dir(&a2).join("gens/0");
+        let done = a0.join("ended.json").exists() || a0.join("released.json").exists();
+        assert!(done, "{mux:?}: a2 done");
+        assert!(a0.join("notice.json").exists(), "{mux:?}: a2 noticed");
     }
 
     // The ids a read served (#103 4b-i, `msg-plan-4b-i-3.md` F25).
