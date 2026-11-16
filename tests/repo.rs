@@ -875,6 +875,11 @@ const TEST_ONLY: &[(&str, &str, &str)] = &[
         "restore_tests",
     ),
     ("src/caller_hc_tests.rs", "src/lib.rs", "caller_hc_tests"),
+    (
+        "src/caller_hc_tests/k2_tests.rs",
+        "src/caller_hc_tests.rs",
+        "k2_tests",
+    ),
     ("src/sidebar/hc_tests.rs", "src/sidebar.rs", "hc_tests"),
     ("src/testing.rs", "src/lib.rs", "testing"),
 ];

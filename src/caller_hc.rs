@@ -78,24 +78,18 @@ fn prove(ctx: &Ctx) -> Res<Option<Caller>> {
         if identity.address != address || !agents::tree::launch_holds(&identity, &t, committed) {
             return None;
         }
-        let pane = r["pane"].as_str()?;
-        let window = r["window"].as_str()?;
-        if !agents::pane_id(pane) || !window.strip_prefix('@').is_some_and(super::digits) {
+        let lifecycle = agents::gens::lifecycle(&r);
+        // K2, W3: a lifecycle member is proven by hc, gens and its client; its view and live server only present it.
+        // A pre-lifecycle member still needs both, as before.
+        let (pid, start, socket) = server_of(&inside(&[key, "server.json"])?, key)?;
+        let live = ctx.os.open(pid).is_some_and(|o| o.start == start);
+        let view = view_of(&r);
+        let presentation = view.filter(|_| live);
+        if !lifecycle && presentation.is_none() {
             return None;
         }
-        let server = crate::state::fs::read_json(&inside(&[key, "server.json"])?).ok()??;
-        let pid = u32::try_from(server["serverPid"].as_u64()?).ok()?;
-        let start = server["serverStart"].as_i64()?;
-        let socket = server["socket"].as_str()?;
-        crate::mux::endpoint(
-            &crate::ctx::Env::from_pairs([("TMUX", format!("{socket},{pid},0"))]),
-            crate::state::root::HOST,
-        )?;
-        if ctx.os.open(pid)?.start != start
-            || crate::util::sha256_hex(format!("{socket}|{pid}|{start}"))[..16] != *key
-        {
-            return None;
-        }
+        // 4to6 #2: pane and window are the presentation's, empty when the views are down (ambiguity 9).
+        let (pane, window) = presentation.clone().unwrap_or_default();
         let proven = walked.is_some() && {
             // The reading the proof uses is checked as the first was: hc may name the foreground only on a later one.
             let t = agents::tree::sampled(ctx, &core, t.clone());
@@ -107,18 +101,43 @@ fn prove(ctx: &Ctx) -> Res<Option<Caller>> {
             client: Some(agents::spawn::client_named(r["client"].as_str()?)?),
             agent: None,
             chain: walked.unwrap_or_default(),
-            pane: pane.into(),
-            window: window.into(),
+            pane: pane.clone(),
+            window: window.clone(),
             session: session.into(),
             server_pid: pid,
             server_start: start,
-            socket: socket.into(),
+            socket,
             server_key: key.into(),
             agent_tag: id.into(),
             member: proven.then(|| id.to_string()),
             candidate: (!proven).then(|| id.to_string()),
-            presentation: Some((pane.into(), window.into())),
+            presentation,
         })
     };
     Ok(read())
+}
+
+/// `server.json` bound to `key` (ambiguity 11): its socket, pid and start hash to the key and the socket is an
+/// endpoint. Whether that server still runs is not asked here.
+fn server_of(at: &Path, key: &str) -> Option<(u32, i64, String)> {
+    // 4to6 #18: evidence::read opens only a regular file; a FIFO, folder or link is Unreadable, never opened.
+    let crate::state::evidence::Evidence::Present(server) = crate::state::evidence::read(at) else {
+        return None;
+    };
+    let pid = u32::try_from(server["serverPid"].as_u64()?).ok()?;
+    let start = server["serverStart"].as_i64()?;
+    let socket = server["socket"].as_str()?.to_string();
+    crate::mux::endpoint(
+        &crate::ctx::Env::from_pairs([("TMUX", format!("{socket},{pid},0"))]),
+        crate::state::root::HOST,
+    )?;
+    (crate::util::sha256_hex(format!("{socket}|{pid}|{start}"))[..16] == *key)
+        .then_some((pid, start, socket))
+}
+
+/// The presented record's pane and window, when both are well formed.
+fn view_of(r: &serde_json::Value) -> Option<(String, String)> {
+    let (pane, window) = (r["pane"].as_str()?, r["window"].as_str()?);
+    (agents::pane_id(pane) && window.strip_prefix('@').is_some_and(super::digits))
+        .then(|| (pane.to_string(), window.to_string()))
 }
