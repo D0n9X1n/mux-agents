@@ -19,6 +19,9 @@ pub(crate) mod core_fixture;
 pub mod core_identity;
 pub mod core_launch;
 pub mod gens;
+pub mod kept;
+#[cfg(test)]
+mod kept_tests;
 pub mod leader;
 #[cfg(test)]
 pub(crate) mod life_fixture;
@@ -50,6 +53,8 @@ pub mod team_state;
 pub mod tree;
 pub mod up;
 pub mod view;
+#[cfg(test)]
+pub(crate) mod view_bind_tests;
 #[cfg(test)]
 mod view_hc_tests;
 

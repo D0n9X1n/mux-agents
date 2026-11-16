@@ -463,10 +463,11 @@ impl Snapshot {
             Ok(rows) => (rows, None),
             Err(e) => (Vec::new(), Some(e)),
         };
+        let key = super::core_identity::Key::of(caller);
         let mut views = BTreeMap::new();
         let mut records = BTreeMap::new();
         for l in local {
-            if let Some(view) = l.identity.view(&l.stored.record, &rows) {
+            if let Some(view) = l.identity.view(&l.stored.record, &rows, &key) {
                 views.insert(l.identity.id.clone(), view);
             }
             records.insert(l.identity.id, l.stored);

@@ -286,6 +286,14 @@ impl Tx<'_> {
 /// The presentation fields view.json carries (views-6f V1).
 pub const VIEW_FIELDS: [&str; 3] = ["pane", "window", "startCommand"];
 
+/// views-6f ambiguity 2, v6f call 13: view.json's presentation key and recorded attach program, carried on the
+/// presented record under names record.json never uses (record.json's own `session` is the team's).
+pub const VIEW_KEY: [(&str, &str); 3] = [
+    ("serverKey", "viewServerKey"),
+    ("session", "viewSession"),
+    ("attachProgram", "viewAttachProgram"),
+];
+
 /// S4: the member lock, then `view_held`; replaces the view, never another field. A view names its generation (V1,
 /// ambiguity 7).
 pub fn view(ctx: &Ctx, scope: &Scope, id: &str, v: &Value) -> Res<()> {
@@ -331,6 +339,12 @@ pub(crate) fn subject_gen(g: &super::gens::Gen, s: &super::gens::Status) -> Res<
 }
 
 impl Subject {
+    /// The hc name the subject generation's view carries: the pending block's when held, else the active
+    /// `launch.json`'s, never the record's (views-6f, v6f call 6).
+    pub(crate) fn name(&self) -> Option<&str> {
+        self.name.as_deref()
+    }
+
     /// V1, W1, the one predicate: `v` is this generation's view. A call 47: only a real identity owns: the address a
     /// non-empty string and the hcName an hc name (`core_identity::is_hc_name`), on both sides; an empty, null or
     /// missing value never matches another one.
@@ -359,6 +373,9 @@ pub fn presented(g: &super::gens::Gen, s: &super::gens::Status) -> Res<Value> {
         for k in VIEW_FIELDS {
             r.remove(k);
         }
+        for (_, k) in VIEW_KEY {
+            r.remove(k);
+        }
     }
     if s.subject.is_none() {
         return Ok(record);
@@ -366,17 +383,26 @@ pub fn presented(g: &super::gens::Gen, s: &super::gens::Status) -> Res<Value> {
     let Some(v) = super::gens::walk(g.folder(), &["view.json"]).known()? else {
         return Ok(record);
     };
+    // v6f call 16: a view.json of the wrong JSON type is as unreadable as a torn one; only an absent one is "no view".
+    if !v.is_object() {
+        return Err(crate::state::evidence::unreadable());
+    }
     if subject_gen(g, s)?.is_some_and(|sub| sub.owns(&v)) {
         for k in VIEW_FIELDS {
             if let Some(x) = v.get(k) {
                 record[k] = x.clone();
             }
         }
+        for (from, to) in VIEW_KEY {
+            if let Some(x) = v.get(from) {
+                record[to] = x.clone();
+            }
+        }
     }
     Ok(record)
 }
 
-/// S4 for a caller that holds the member lock (`view::restore_view`, `view`): reads the member once (R1: one
+/// S4 for a caller that holds the member lock (`view::create`, `view::adopt`, `view`): reads the member once (R1: one
 /// `member_of`, one `status`) and writes only the subject generation's view (W1, PM call 20). A lifecycle member's
 /// goes to view.json; a pre-lifecycle member's three view fields go into its record.json (ambiguity 1). Anything
 /// else refuses 2 `target` and writes nothing; an unreadable member refuses `evidence`.

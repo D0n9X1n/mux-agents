@@ -46,12 +46,16 @@ pub struct Core<'a> {
     bin: PathBuf,
 }
 
+/// The names hc is installed under, in `connect`'s order. A view pane's program is recognised by them, at any path
+/// (v6f call 13): a view never depends on which binary `PATH` resolves today.
+pub const INSTALL_NAMES: [&str; 2] = ["hc", "herdr-core"];
+
 pub fn connect(ctx: &Ctx) -> Res<Core<'_>> {
     let path = ctx.env.get("PATH").unwrap_or("");
     let bin = ctx
         .hc
-        .find("hc", path)
-        .or_else(|| ctx.hc.find("herdr-core", path))
+        .find(INSTALL_NAMES[0], path)
+        .or_else(|| ctx.hc.find(INSTALL_NAMES[1], path))
         .ok_or_else(|| failure(INSTALL))?;
     let core = Core {
         provider: ctx.hc.as_ref(),
@@ -360,7 +364,19 @@ impl Core<'_> {
     }
 
     pub fn ls(&self, labels: &[(&str, &str)]) -> Res<Vec<String>> {
-        let mut a = vec!["ls".into(), "--all".into()];
+        self.listed(true, labels)
+    }
+
+    /// views-6f call 3: live terminals only (no `--all`); hc filters the labels.
+    pub fn ls_live(&self, labels: &[(&str, &str)]) -> Res<Vec<String>> {
+        self.listed(false, labels)
+    }
+
+    fn listed(&self, all: bool, labels: &[(&str, &str)]) -> Res<Vec<String>> {
+        let mut a = vec!["ls".to_string()];
+        if all {
+            a.push("--all".into());
+        }
         for (k, v) in labels {
             a.extend(["--label".into(), format!("{k}={v}")]);
         }
@@ -1010,6 +1026,26 @@ mod tests {
         answer(&f, r#"{"terminals":[]}"#);
         assert!(h.ls(&[]).unwrap().is_empty());
         assert_eq!(f.hc_calls()[2].1, ["ls", "--all", "--json"]);
+    }
+
+    // views-6f call 3: the kept listing is live-only, so finished shells cost no `get`.
+    #[test]
+    fn ls_live_lists_only_live_terminals_by_label() {
+        let f = Fakes::default();
+        f.hc_install("hc");
+        answer(&f, "hc 0.1.21");
+        answer(
+            &f,
+            r#"{"terminals":[{"address":"k1","state":"live"}],"hidden_finished":0}"#,
+        );
+        let c = f.ctx();
+        let h = connect(&c).unwrap();
+        assert_eq!(h.ls_live(&[("mux.kept", "k:$3")]).unwrap(), ["k1"]);
+        assert_eq!(
+            f.hc_calls()[1].1,
+            ["ls", "--label", "mux.kept=k:$3", "--json"],
+            "no --all"
+        );
     }
 
     #[test]
