@@ -1977,3 +1977,174 @@ fn an_orphan_left_by_a_forward_crash_is_ended_by_terminate() {
     assert_eq!(hc_get(&live, &address)["state"], "finished");
     assert!(agent_dir(&live, &id).join("gens/0/ended.json").exists());
 }
+
+/// Quits member `id`'s fake client and waits for its exit marker.
+fn quit_member(live: &Live, id: &str) {
+    let pid = client_pid(
+        live,
+        &s(&member_file(live, id, "record.json")["sessionId"]),
+        0,
+    );
+    std::fs::write(live.dir.join(format!("quit.{pid}")), "0").unwrap();
+    live.wait("client exit", || {
+        live.dir
+            .join(format!("exited.{pid}"))
+            .exists()
+            .then_some(())
+    });
+}
+fn finished(live: &Live, id: &str) -> bool {
+    let address = s(&member_file(live, id, "record.json")["hcAddress"]);
+    eventually(Duration::from_secs(60), || {
+        hc_get(live, &address)["state"] == "finished"
+    })
+}
+fn parent_and_depth(live: &Live, id: &str) -> (Value, Value) {
+    let r = member_file(live, id, "record.json");
+    (r["parentAgent"]["id"].clone(), r["depth"].clone())
+}
+/// The bodies in member `id`'s mailbox (`<state>/<key>/mail/<mailbox>.jsonl`; an inherited `mailbox` honoured).
+fn mail_bodies(live: &Live, id: &str) -> Vec<Value> {
+    let r = member_file(live, id, "record.json");
+    let key = r
+        .get("mailbox")
+        .and_then(Value::as_str)
+        .unwrap_or(id)
+        .to_string();
+    let keyed = agent_dir(live, id)
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    let text = std::fs::read_to_string(keyed.join("mail").join(format!("{key}.jsonl")))
+        .unwrap_or_default();
+    text.lines()
+        .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+        .map(|m| m["body"].clone())
+        .collect()
+}
+/// A person's command typed into the team's pane; its reply must be `ok`.
+fn team_run(live: &Live, team: &str, args: &[&str]) -> Value {
+    let v = live.run_any_in(team, args);
+    assert_eq!(v["ok"], true, "{args:?}: {v}");
+    v
+}
+
+/// adopt-3e live on rmux (Windows): the Unix scenario through the same public commands (calls 3, 16, 23). A person's
+/// commands run from a pane in `up`'s team session, whose bar is closed.
+#[test]
+fn adoption_moves_b_and_a_resumed_successor_stops_its_child() {
+    use serde_json::json;
+    let Some(live) = Live::start() else { return };
+    let (task, brief) = (live.dir.join("task.txt"), live.dir.join("brief.md"));
+    std::fs::write(&task, "say hi").unwrap();
+    std::fs::write(&brief, "brief").unwrap();
+    let (task, brief) = (task.display().to_string(), brief.display().to_string());
+    let up = live.run(&["up", "-Client", "claude"]);
+    let x = s(&up["leader"]["id"]);
+    let team = team_pane(&live, &s(&up["session"]));
+    team_run(&live, &team, &["sidebar", "-Close"]);
+    let mut sent = HashMap::new();
+    let spawn = |live: &Live, sent: &mut HashMap<u32, usize>, who: &str, name: &str| {
+        let args = [
+            "spawn",
+            "-Client",
+            "claude",
+            "-TaskFile",
+            task.as_str(),
+            "-BriefFile",
+            brief.as_str(),
+            "-Context",
+            "brief",
+            "-Name",
+            name,
+        ];
+        let r = by(live, sent, who, &args);
+        assert_eq!(r["ok"], true, "{name}: {r}");
+        s(&r["id"])
+    };
+    let a = spawn(&live, &mut sent, &x, "a1");
+    let b = spawn(&live, &mut sent, &a, "b1");
+    quit_member(&live, &a);
+    assert!(finished(&live, &a), "A finished");
+    team_run(&live, &team, &["list"]); // reaps A
+    team_run(&live, &team, &["list"]); // sweeps: X adopts B
+    assert_eq!(
+        parent_and_depth(&live, &b),
+        (json!(x), json!(1)),
+        "X adopted B"
+    );
+    let up_md = live.dir.join("up.md");
+    std::fs::write(&up_md, "from b1").unwrap();
+    let up_md = up_md.display().to_string();
+    let r = by(
+        &live,
+        &mut sent,
+        &b,
+        &["send", "parent", "-BodyFile", up_md.as_str()],
+    );
+    assert_eq!(r["ok"], true, "{r}");
+    assert!(
+        mail_bodies(&live, &x).contains(&json!("from b1")),
+        "X's mailbox"
+    );
+    let address = |id: &str| s(&member_file(&live, id, "record.json")["hcAddress"]);
+    assert_eq!(hc_get(&live, &address(&b))["state"], "live", "B works");
+
+    let c = spawn(&live, &mut sent, &x, "c1");
+    let d = spawn(&live, &mut sent, &c, "d1");
+    team_run(&live, &team, &["sidebar", "-Close"]); // nothing sweeps D under X before the resume
+    quit_member(&live, &c);
+    assert!(finished(&live, &c), "C finished");
+    team_run(&live, &team, &["list"]); // records C's end (its sweep ran before the reap)
+    let c2 = s(&team_run(&live, &team, &["resume", "c1"])["agent"]["id"]);
+    assert_ne!(c2, c, "a successor");
+    assert_eq!(
+        parent_and_depth(&live, &d).0,
+        json!(c),
+        "D still names C (C0 resolves it)"
+    );
+    team_run(&live, &team, &["stop", "c1"]);
+    assert!(finished(&live, &d), "stop C′ stopped D");
+
+    let x_name = member_file(&live, &x, "record.json")["name"].clone();
+    quit_member(&live, &x);
+    team_run(&live, &team, &["list"]);
+    let rows = team_run(&live, &team, &["list", "-All"]);
+    let row = rows["agents"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["name"] == x_name)
+        .cloned();
+    assert_eq!(
+        row.unwrap()["life"],
+        "ended",
+        "the root's row ended: {rows}"
+    );
+    assert_eq!(
+        parent_and_depth(&live, &b),
+        (json!(x), json!(1)),
+        "B under the ended root"
+    );
+    assert_eq!(
+        hc_get(&live, &address(&b))["state"],
+        "live",
+        "B still works"
+    );
+    let up2 = live.dir.join("up2.md");
+    std::fs::write(&up2, "after x ended").unwrap();
+    let up2 = up2.display().to_string();
+    let r = by(
+        &live,
+        &mut sent,
+        &b,
+        &["send", "parent", "-BodyFile", up2.as_str()],
+    );
+    assert_eq!(r["ok"], true, "{r}");
+    assert!(
+        mail_bodies(&live, &x).contains(&json!("after x ended")),
+        "X's mailbox after X ended"
+    );
+}
