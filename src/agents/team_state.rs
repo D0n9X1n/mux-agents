@@ -98,6 +98,8 @@ pub enum Guard<'a> {
     Pending { n: u64, hc_name: &'a str },
     /// A lifecycle record whose `completing.gen == n` (group B clears `completing`).
     CompletingGen { n: u64 },
+    /// adopt-3e AD-R1: any lifecycle record of the id (the topology writer).
+    Life,
 }
 
 impl Guard<'_> {
@@ -124,6 +126,8 @@ impl Guard<'_> {
                 gen_of("pending") == Some(n) && r["pending"]["hcName"].as_str() == Some(hc_name)
             }
             Guard::CompletingGen { n } => gen_of("completing") == Some(n),
+            // adopt-3e AD-R1: the lifecycle and id checks above are the whole guard.
+            Guard::Life => true,
         }
     }
 }
@@ -827,3 +831,7 @@ mod tests {
 #[cfg(test)]
 #[path = "record_write_tests.rs"]
 mod record_write_tests;
+
+#[cfg(test)]
+#[path = "life_guard_tests.rs"]
+mod life_guard_tests;
