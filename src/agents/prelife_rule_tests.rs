@@ -320,3 +320,34 @@ fn only_a_writers_abort_or_the_named_abandoned_claim_proves_never_ran() {
         assert_eq!(never_ran(&f, &record), proves, "{case}");
     }
 }
+
+/// Ambiguity 11 (Task 6): `Tx::settle` and `gens::terminate` refuse a pre-lifecycle record (even one whose v0.3-dev
+/// fields name a pending generation) with check `prelife`; no file under it changes; no hc call.
+#[test]
+fn lifecycle_only_writers_refuse_a_pre_lifecycle_record() {
+    use crate::agents::prelife_fixture as pf;
+    use crate::agents::team_state::{Scope, open};
+    for op in ["settle", "terminate"] {
+        let w = World::human("");
+        pf::team(&w);
+        let mut f = pf::fields(pf::P, "legacy", Some(pf::L), 1);
+        f["pending"] = json!({"gen": 1, "hcName": "md0000000"});
+        pf::pre(&w, pf::P, f);
+        pf::dev_evidence(&w, pf::P);
+        let before = pf::bytes(&w.folder(pf::P));
+        let got = open(&w.ctx, &Scope::of(&w.caller()), |tx| match op {
+            "settle" => tx
+                .settle(pf::P, crate::agents::settle::Mode::Normal)
+                .map(|_| ()),
+            _ => crate::agents::settle::terminate(tx, pf::P, 1),
+        });
+        let e = got.unwrap_err();
+        assert_eq!(
+            (e.code, e.check, e.message.as_str()),
+            (2, "prelife", LIFECYCLE_ONLY),
+            "{op}"
+        );
+        assert_eq!(pf::bytes(&w.folder(pf::P)), before, "{op}: no gens write");
+        assert!(w.fakes.hc_calls().is_empty(), "{op}: no hc call");
+    }
+}
