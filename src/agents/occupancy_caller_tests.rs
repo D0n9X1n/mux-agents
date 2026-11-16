@@ -295,3 +295,57 @@ fn a_callers_loader_exiting_between_reads_still_holds_its_report() {
         );
     }
 }
+
+// QA Q1, Q2 (call 31): proven Copilot caller 7101 (2101), keyed by its loader 7100 (2100), whose report names S. A
+// query of S for Claude holds `Caller(7101)`. With the saved native row's path unreadable (Q1), or its start
+// unreadable (Q2), the caller's report identity cannot be resolved from the saved table: the query holds as Evidence
+// naming 7101, never free.
+#[test]
+fn an_unresolved_caller_identity_holds_its_report_as_evidence() {
+    let own = Own {
+        kind: Client::Copilot,
+        pid: 7101,
+        start: 2101,
+    };
+    let native = |path: Option<&str>, start: Option<i64>| Row {
+        pid: 7101,
+        ppid: 7100,
+        start,
+        path: path.map(String::from),
+        argv: Some(vec!["copilot".into()]),
+        image: Some("copilot".into()),
+    };
+    for (case, path, start, want) in [
+        (
+            "control",
+            Some("/usr/lib/copilot"),
+            Some(2101),
+            (Rule::Caller, Some(7101)),
+        ),
+        (
+            "Q1 path unreadable",
+            None,
+            Some(2101),
+            (Rule::Evidence, Some(7101)),
+        ),
+        (
+            "Q2 start unreadable",
+            Some("/usr/lib/copilot"),
+            None,
+            (Rule::Evidence, Some(7101)),
+        ),
+    ] {
+        let w = World::agent("");
+        w.state();
+        w.fakes.forget(CLAUDE); // the pane's own claude would hold every Claude query
+        copilot_pair_rows(&w, Some(2100));
+        w.fakes.forget(7101);
+        w.fakes.process(native(path, start));
+        live::report(&w.ctx, Client::Copilot, 7100, 2100, S, "resume").unwrap();
+        assert_eq!(
+            held_as(&w, S, Client::Claude, OsKind::Unix, &own),
+            Some(want),
+            "{case}"
+        );
+    }
+}

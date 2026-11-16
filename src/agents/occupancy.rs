@@ -163,6 +163,13 @@ pub fn held_on(
     };
     let wanted = session.to_ascii_lowercase();
     let exempted = own.and_then(|o| exempt(ctx, o, &rows, os));
+    // QA Q2 (call 31): the caller's pid listed without a readable start: its identity, and so the key of its report,
+    // cannot be resolved from this table read. No exemption, and its report is not skipped: it holds as Evidence.
+    if let (Some(o), None) = (own, exempted.as_ref())
+        && let Some(r) = rows.iter().find(|r| r.pid == o.pid && r.start.is_none())
+    {
+        return Some(Hold::of(Rule::Evidence, r));
+    }
     // A managed caller is judged per row (H4.2); an unmanaged one by its own newest report, read once here (call 17).
     let unmanaged = exempted
         .as_ref()

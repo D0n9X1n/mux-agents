@@ -36,9 +36,13 @@ pub(super) fn exempt(ctx: &Ctx, own: &Own, rows: &[Row], os: OsKind) -> Option<E
     let parent = |r: &Row| rows.iter().find(|p| p.pid == r.ppid && r.ppid != 0);
     let paired =
         |r: &Row| parent(r).and_then(|p| crate::agents::ancestry::pair_parent(ctx, p, r, os));
+    // QA Q1 (call 31): an unreadable path may be the native `copilot`, whose loader keys the report.
     let native = own.kind == Client::Copilot
         && os == OsKind::Unix
-        && proven.path.as_deref().and_then(|p| p.rsplit('/').next()) == Some("copilot");
+        && proven
+            .path
+            .as_deref()
+            .is_none_or(|p| p.rsplit('/').next() == Some("copilot"));
     let mut e = Exempt {
         rows: vec![(proven.pid, start)],
         key: Some((proven.pid, start)),
