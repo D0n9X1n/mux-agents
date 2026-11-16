@@ -494,3 +494,54 @@ fn a_client_older_than_its_launcher_is_unproven() {
     assert_eq!(promote(&ctx), Ok(Ready::Undecided), "promote_ready");
     assert_eq!(bytes(&m, "ready"), None, "nothing written");
 }
+
+// r2b call 28 (QA #143): the decision and the ready.json publication happen while the gen lock is held, not merely
+// after a lock was taken. (a) A failure.json published the moment the gen lock is taken decides: a decision made
+// before the lock would miss it. (b) The publisher's link runs while the lock is held.
+#[test]
+fn promote_ready_decides_and_publishes_while_the_gen_lock_is_held() {
+    use std::cell::{Cell, RefCell};
+    use std::rc::Rc;
+    let key = crate::agents::team_state::gen_lock_key(KEY, ID, 1);
+    let (f, ctx, _d, m) = world();
+    reported(&m, 150, 1500);
+    client_json(&m);
+    let (taken, at) = (format!("+{key}"), path(&m, 1, "failure"));
+    f.lock_probe(move |e| {
+        if e == taken {
+            publish(&at, &json!({"reason": "no readiness report"})).unwrap();
+        }
+        String::new()
+    });
+    assert_eq!(
+        promote(&ctx),
+        Ok(Ready::Failed),
+        "a failure published as the lock is taken decides"
+    );
+    assert_eq!(bytes(&m, "ready"), None, "no ready.json beside it");
+    let (f, ctx, _d, m) = world();
+    reported(&m, 150, 1500);
+    client_json(&m);
+    let held = Rc::new(Cell::new(false));
+    let h = held.clone();
+    let (plus, minus) = (format!("+{key}"), format!("-{key}"));
+    f.lock_probe(move |e| {
+        if e == plus {
+            h.set(true);
+        } else if e == minus {
+            h.set(false);
+        }
+        String::new()
+    });
+    let seen = Rc::new(RefCell::new(Vec::new()));
+    let (s, h) = (seen.clone(), held.clone());
+    publish_hooks::before_link(Some(Box::new(move |_: &Path| s.borrow_mut().push(h.get()))));
+    let got = promote(&ctx);
+    publish_hooks::before_link(None);
+    assert_eq!(got, Ok(Ready::Ok));
+    assert_eq!(
+        *seen.borrow(),
+        [true],
+        "ready.json is linked while the gen lock is held"
+    );
+}
