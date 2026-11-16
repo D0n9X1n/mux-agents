@@ -38,6 +38,12 @@ struct Node {
     from: Option<String>,
     void: bool,
     stopped: bool,
+    /// The record's `generation`, `pending.gen` and `completing.gen` (the one snapshot, call 19).
+    active: Option<u64>,
+    pending: Option<u64>,
+    completing: Option<u64>,
+    /// A `resumedFrom` member's marks, read once for its void evidence and reused by `open_gens` (checklist 19).
+    marks: BTreeMap<u64, gens::Marks>,
 }
 
 /// C0, C2, C-R2: the session's lifecycle members read once (record, desired state, and for a `resumedFrom`
@@ -61,6 +67,13 @@ fn node(record: &Value, void: bool, stopped: bool) -> Node {
         from: plain(record.get("resumedFrom")),
         void,
         stopped,
+        active: gens::active(record),
+        pending: gens::pending(record),
+        completing: record
+            .get("completing")
+            .and_then(|c| c.get("gen"))
+            .and_then(Value::as_u64),
+        marks: BTreeMap::new(),
     }
 }
 
@@ -89,13 +102,15 @@ impl Tree {
             if record.get("session").and_then(Value::as_str) != Some(tx.scope.session.as_str()) {
                 continue;
             }
-            // Call 17: unreadable evidence refuses (`?`), never counts as void.
-            let void = match plain(record.get("resumedFrom")) {
-                Some(_) => g.never_ran_recorded(&g.status()?)?,
-                None => false,
-            };
-            let stopped = desired_of(&folder)? == Desired::Stopped;
-            nodes.insert(id, node(record, void, stopped));
+            let mut n = node(record, false, false);
+            // Call 17: unreadable evidence refuses (`?`), never counts as void. Call 19: from the marks read once.
+            if n.from.is_some() {
+                let mut marks = BTreeMap::new();
+                n.void = void_of(&folder, &n, &mut marks)?;
+                n.marks = marks;
+            }
+            n.stopped = desired_of(&folder)? == Desired::Stopped;
+            nodes.insert(id, n);
         }
         let t = Tree { nodes };
         t.check()?;
@@ -516,6 +531,133 @@ fn tombstoned(tx: &Tx<'_>, root: &str) -> Res<()> {
         Err(_) => return Err(not_written()),
     }
     flush(&dir)
+}
+
+/// Call 19, checklist 19: `Gen::never_ran_recorded` of `Gen::status`, decided from the snapshot: the record's own
+/// `generation`, `pending` and `completing`, and each generation's marks read once into `marks`, which the node
+/// keeps so `open_gens` reads them no second time. The same files in the same order as `status`, then
+/// `never_ran_recorded`; an unreadable marker refuses where they would (never void on Unreadable, call 17).
+fn void_of(folder: &Path, n: &Node, marks: &mut BTreeMap<u64, gens::Marks>) -> Res<bool> {
+    let mut mark = |g: u64| -> Res<gens::Marks> {
+        if let Some(m) = marks.get(&g) {
+            return Ok(*m);
+        }
+        let m = gens::marks(folder, g)?;
+        marks.insert(g, m);
+        Ok(m)
+    };
+    let pm = n.pending.map(&mut mark).transpose()?;
+    // `status` reads the active marks too: an unreadable one refuses here as there.
+    n.active.map(&mut mark).transpose()?;
+    let p_done = n
+        .pending
+        .zip(pm)
+        .map(|(g, m)| m.any() && n.completing != Some(g));
+    let p_void = pm.is_some_and(|m| m.abandoned || m.decision == Some(gens::Decision::Aborted));
+    let never_ran = n.active.is_none() && (n.pending.is_none() || (p_void && p_done == Some(true)));
+    if !never_ran {
+        return Ok(false);
+    }
+    for g in gens::named(folder)? {
+        if Some(g) == n.pending {
+            continue;
+        }
+        let m = mark(g)?;
+        if !(m.abandoned || m.decision == Some(gens::Decision::Aborted)) {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+impl Tree {
+    /// State-0 S6 from the snapshot (call 19): every generation the files name (`gens::named`) or the record names
+    /// (active, pending), minus those done: a decisive marker and not the record's `completing`. A successor's marks
+    /// are the ones `Tree::read` kept; any other member's are read here once. R2: a generation whose markers cannot
+    /// be read stays listed (C6's `terminate` answers it unresolved).
+    fn open_gens(&self, member: &Path, id: &str) -> Res<Vec<u64>> {
+        let n = (self.nodes.get(id)).ok_or_else(|| Refusal::internal("not in the tree"))?;
+        let mut all = gens::named(member)?;
+        all.extend(n.active);
+        all.extend(n.pending);
+        all.sort_unstable();
+        all.dedup();
+        let done = |g: u64| {
+            let m = match n.marks.get(&g) {
+                Some(m) => Ok(*m),
+                None => gens::marks(member, g),
+            };
+            m.is_ok_and(|m| m.any()) && n.completing != Some(g)
+        };
+        Ok(all.into_iter().filter(|g| !done(*g)).collect())
+    }
+}
+
+/// C4, under the team lock after the replay hooks; never waits for pending launches. C4.1 entries as they stand
+/// (one Tree, C-R2, call 19), C4.2 published, then C4.3-4.4. A failed write kills nothing (C-R4).
+pub fn prepare(tx: &Tx<'_>, root: &str) -> Res<Journal> {
+    let t = Tree::read(tx)?;
+    if !t.has(root) {
+        return Err(Refusal::internal(
+            "the stopped member is not a lifecycle member of this session",
+        ));
+    }
+    let ids = t.below(root)?;
+    let mut entries = Vec::new();
+    for id in &ids {
+        let parents = if id == root {
+            Vec::new()
+        } else {
+            (t.parents(id)?.into_iter())
+                .filter(|p| ids.contains(p))
+                .collect()
+        };
+        let gens = t.open_gens(&tx.folder(id), id)?;
+        entries.push(Entry {
+            id: id.clone(),
+            name: t.name(id),
+            parents,
+            gens,
+        });
+    }
+    let j = Journal {
+        root: root.into(),
+        entries,
+        prepared: false,
+        removing: false,
+    };
+    publish(tx, &j)?;
+    super::release::halt("cascade-journal")?;
+    close(tx, &j, &[])
+}
+
+/// C5 for an unprepared journal: C4.3-4.4 from the journal alone (C-R3). p1c call 19: each entry's record is read
+/// once first, and a pre-lifecycle entry is skipped before any write (no desired.json; Task 5 reports it).
+pub fn desire(tx: &Tx<'_>, j: &Journal) -> Res<Journal> {
+    let mut pre = Vec::new();
+    for e in &j.entries {
+        match gens::member_of(&tx.folder(&e.id)) {
+            gens::Member::Pre(_) => pre.push(e.id.clone()),
+            gens::Member::Unreadable(r) => return Err(r),
+            gens::Member::Absent | gens::Member::Life(_) => {}
+        }
+    }
+    close(tx, j, &pre)
+}
+
+/// C4.3-4.4: each entry but `skip` desired stopped (halt `cascade-desired-<id>` after each), then the journal
+/// rewritten prepared (halt `cascade-prepared`).
+fn close(tx: &Tx<'_>, j: &Journal, skip: &[String]) -> Res<Journal> {
+    for e in &j.entries {
+        if skip.contains(&e.id) {
+            continue;
+        }
+        tx.desired(&e.id, false)?;
+        super::release::halt(&format!("cascade-desired-{}", e.id))?;
+    }
+    let p = mark_prepared(tx, j)?;
+    super::release::halt("cascade-prepared")?;
+    Ok(p)
 }
 
 #[cfg(test)]

@@ -1,5 +1,5 @@
 //! cascade-3d fixtures: a team L -> A -> B -> C of lifecycle members, generation 1 committed, parent pane PANE.
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use serde_json::{Value, json};
 
@@ -11,6 +11,7 @@ pub const L: &str = "111111111111";
 pub const A: &str = "aaaaaaaaaaa1";
 pub const B: &str = "bbbbbbbbbbb1";
 pub const C: &str = "ccccccccccc1";
+pub const D: &str = "ddddddddddd1";
 pub const S: &str = "555555555555";
 pub const PANE: &str = "%5";
 
@@ -100,4 +101,26 @@ pub fn seed(w: &World, root: &str, ids: &[&str], prepared: bool) -> super::casca
 /// The next `release::halt(step)` refuses `halted` (the text is leaked: `halt_after` takes `&'static str`).
 pub fn at(step: &str) {
     super::release::halt_after(Some(Box::leak(step.to_owned().into_boxed_str())));
+}
+/// Whether member `id` is desired stopped (through `desired_of`'s walk).
+pub fn stopped(w: &World, id: &str) -> bool {
+    super::cascade::desired_of(&w.folder(id)).unwrap() == super::cascade::Desired::Stopped
+}
+/// Every file under `dir` with its bytes, sorted: a byte-identical check of a folder.
+pub fn snapshot(dir: &Path) -> Vec<(PathBuf, Vec<u8>)> {
+    let mut out = Vec::new();
+    let mut todo = vec![dir.to_path_buf()];
+    while let Some(d) = todo.pop() {
+        for e in std::fs::read_dir(&d).unwrap() {
+            let p = e.unwrap().path();
+            if p.is_dir() {
+                todo.push(p);
+            } else {
+                let bytes = std::fs::read(&p).unwrap();
+                out.push((p, bytes));
+            }
+        }
+    }
+    out.sort();
+    out
 }

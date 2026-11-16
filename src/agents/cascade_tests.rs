@@ -1,5 +1,5 @@
 use super::*;
-use crate::agents::cascade_fixture::{self as cx, A, B, C, L, S};
+use crate::agents::cascade_fixture::{self as cx, A, B, C, D, L, S};
 use crate::agents::fixture::{ID, World};
 use crate::agents::gens;
 use crate::agents::life_fixture as lf;
@@ -532,4 +532,258 @@ fn a_tombstone_is_an_unfinished_removal_until_it_is_cleared() {
     assert!(waiting(&w.ctx, &s));
     remove(&tx, A).unwrap();
     assert!(!tomb.exists() && journals(&tx).unwrap().is_empty() && !waiting(&w.ctx, &s));
+}
+
+/// L -> A -> {B -> C, D}. B: active 1, pending 2 known only from the record (no gens/2). C: active 2 known only
+/// from the record, generation 1 ended (done), generation 2's ended.json torn (unreadable completion). D: active 4
+/// known only from the record; generation 1 an orphan known only from its files.
+fn standing_tree(w: &World) {
+    cx::member(w, L, None, 0, json!({}));
+    cx::member(w, A, Some(L), 1, json!({}));
+    cx::member(w, B, Some(A), 2, json!({"pending": lf::pending(2)}));
+    let c = cx::member(
+        w,
+        C,
+        Some(B),
+        3,
+        json!({"generation": "2", "hcAddress": cx::addr_at(C, 2)}),
+    );
+    crate::state::evidence::publish(&gens::path(&c, 1, "ended"), &json!({"at": "x"})).unwrap();
+    std::fs::create_dir_all(gens::dir(&c, 2)).unwrap();
+    std::fs::write(gens::path(&c, 2, "ended"), b"{\"at").unwrap();
+    cx::member(
+        w,
+        D,
+        Some(A),
+        2,
+        json!({"generation": "4", "hcAddress": cx::addr_at(D, 4)}),
+    );
+}
+
+// C4.1-4.4, call 19: entries are every member whose chain reaches A, deepest first, each with every generation
+// not done as it stands: a pending one known only from the record (B 2), an active one known only from the record
+// (C 2, D 4), an orphan known only from files (D 1); a generation whose completion is unreadable stays listed
+// (C 2); a done one does not (C 1). Parents only inside the set; each desired stopped, then prepared; no hc call
+// (C4 never waits for pending launches). A second prepare of A refuses (C4: finish first).
+#[test]
+fn prepare_lists_the_sub_tree_as_it_stands_and_closes_it_before_any_kill() {
+    let (w, s) = lf::world();
+    standing_tree(&w);
+    let tx = cx::tx(&w, &s);
+    let j = prepare(&tx, A).unwrap();
+    let rows: Vec<(&str, Vec<u64>, Vec<String>)> = (j.entries.iter())
+        .map(|e| (e.id.as_str(), e.gens.clone(), e.parents.clone()))
+        .collect();
+    let want = [
+        (C, vec![2], vec![B.to_string()]),
+        (B, vec![1, 2], vec![A.to_string()]),
+        (D, vec![1, 4], vec![A.to_string()]),
+        (A, vec![1], vec![]),
+    ];
+    assert_eq!(rows, want);
+    assert!(j.prepared && journals(&tx).unwrap()[0].prepared, "C4.4");
+    for id in [A, B, C, D] {
+        assert!(cx::stopped(&w, id), "{id}: C4.3");
+    }
+    assert!(!cx::stopped(&w, L), "the parent stays");
+    assert!(lf::calls(&w).is_empty(), "C4 calls no hc and kills nothing");
+    assert_eq!(
+        prepare(&tx, A).unwrap_err().check,
+        "internal",
+        "one journal per root"
+    );
+    assert_eq!(
+        prepare(&tx, S).unwrap_err().check,
+        "internal",
+        "not a lifecycle member of this session"
+    );
+}
+
+// Call 19, C-R2, checklist 19: prepare decides from one snapshot. Every record.json is read once (in Tree::read),
+// also for a successor with a recorded end (T) and a running successor (S); each commit.json at most once (the
+// successors' marks read for their void evidence are the ones `open_gens` uses).
+#[test]
+fn prepare_reads_each_record_once() {
+    let (w, s) = lf::world();
+    standing_tree(&w);
+    cx::member(&w, S, Some(A), 2, json!({"resumedFrom": D}));
+    let t = cx::member(&w, T, Some(A), 2, json!({"resumedFrom": D}));
+    crate::state::evidence::publish(&gens::path(&t, 1, "ended"), &json!({"at": "x"})).unwrap();
+    let (got, reads) = crate::state::fs::record_reads(|| prepare(&cx::tx(&w, &s), A));
+    for id in [L, A, B, C, D, S, T] {
+        let n = (reads.iter())
+            .filter(|p| **p == w.folder(id).join("record.json"))
+            .count();
+        assert_eq!(n, 1, "{id}");
+    }
+    for p in reads.iter().filter(|p| p.ends_with("commit.json")) {
+        let n = reads.iter().filter(|q| *q == p).count();
+        assert_eq!(n, 1, "{}: one read", p.display());
+    }
+    assert!(reads.contains(&gens::path(&w.folder(S), 1, "commit")));
+    let j = got.unwrap();
+    assert!(j.lists(S) && j.lists(T), "both successors are entries");
+}
+
+// Checklist 24 (S6): a generation whose ended.json exists while record.completing names it is not done: listed.
+#[test]
+fn a_completing_generation_stays_listed() {
+    let (w, s) = lf::world();
+    cx::member(&w, L, None, 0, json!({}));
+    let a = cx::member(&w, A, Some(L), 1, json!({"completing": {"gen": 1}}));
+    crate::state::evidence::publish(&gens::path(&a, 1, "ended"), &json!({"at": "x"})).unwrap();
+    let j = prepare(&cx::tx(&w, &s), A).unwrap();
+    assert_eq!(j.entries.len(), 1);
+    assert_eq!(j.entries[0].gens, [1], "completing holds it");
+}
+
+// C4 "A failed write kills nothing" (C-R4): a failed journal flush stops before any desired write; a failed
+// desired write stops before the next one and before `prepared`. The unprepared journal is finished by `desire`.
+#[test]
+fn a_failed_journal_write_kills_nothing() {
+    let (w, s) = lf::world();
+    cx::chain(&w);
+    let tx = cx::tx(&w, &s);
+    crate::state::fs::fail_sync_dir(Some(&dir_at(&w.ctx, &s)));
+    let got = prepare(&tx, A).unwrap_err();
+    crate::state::fs::fail_sync_dir(None);
+    assert_eq!(
+        (got.check, got.message.as_str()),
+        ("state", NOT_WRITTEN),
+        "journal flush"
+    );
+    assert!(
+        ![A, B, C].iter().any(|id| cx::stopped(&w, id)),
+        "no desired write after a failed publication"
+    );
+    remove(&tx, A).unwrap();
+    crate::state::fs::fail_sync_dir(Some(&w.folder(B)));
+    let got = prepare(&tx, A).unwrap_err();
+    crate::state::fs::fail_sync_dir(None);
+    assert_eq!(
+        (got.check, got.message.as_str()),
+        ("state", crate::agents::team_state::NOT_WRITTEN),
+        "desired"
+    );
+    assert!(
+        cx::stopped(&w, C) && !cx::stopped(&w, A),
+        "C written, A not reached"
+    );
+    let kept = journals(&tx).unwrap();
+    assert!(
+        !kept[0].prepared,
+        "not prepared after a failed desired write"
+    );
+    assert!(desire(&tx, &kept[0]).unwrap().prepared);
+    assert!([A, B, C].iter().all(|id| cx::stopped(&w, id)));
+    assert!(lf::calls(&w).is_empty(), "nothing killed");
+}
+
+// C5, C-R3: `desire` finishes C4.3-4 from the journal alone: a member added under B after C4.2 is not added.
+#[test]
+fn desire_never_adds_members() {
+    let (w, s) = lf::world();
+    cx::chain(&w);
+    let j = cx::seed(&w, A, &[C, B, A], false);
+    cx::member(&w, S, Some(B), 3, json!({}));
+    let p = desire(&cx::tx(&w, &s), &j).unwrap();
+    assert!(p.prepared && p.entries == j.entries);
+    assert!(!cx::stopped(&w, S), "fixed at C4.2");
+}
+
+// p1c call 19, checklist 26 (Task 4 part): replaying an unprepared journal reads each entry's record once and
+// skips a pre-lifecycle entry before any write: its folder stays byte-identical; the others are stopped and the
+// journal is prepared. (Task 5 reports the skipped entry unresolved `prelife`.)
+#[test]
+fn desire_skips_a_pre_lifecycle_entry_before_any_write() {
+    let (w, s) = lf::world();
+    cx::member(&w, L, None, 0, json!({}));
+    cx::member(&w, A, Some(L), 1, json!({}));
+    std::fs::create_dir_all(w.folder(B)).unwrap();
+    let pre = json!({"id": B, "name": "w-b", "session": w.caller().session, "depth": 2,
+        "parentAgent": {"id": A}});
+    crate::state::fs::write_json(&w.folder(B).join("record.json"), &pre).unwrap();
+    let before = cx::snapshot(&w.folder(B));
+    let j = cx::seed(&w, A, &[B, A], false);
+    let (got, reads) = crate::state::fs::record_reads(|| desire(&cx::tx(&w, &s), &j));
+    assert!(got.unwrap().prepared, "the journal is prepared");
+    for id in [A, B] {
+        let n = (reads.iter())
+            .filter(|p| **p == w.folder(id).join("record.json"))
+            .count();
+        assert_eq!(n, 1, "{id}: one record read at replay");
+    }
+    assert_eq!(cx::snapshot(&w.folder(B)), before, "B byte-identical");
+    assert!(cx::stopped(&w, A));
+    // An unreadable record is never taken for a lifecycle one: desire refuses before any write.
+    std::fs::write(w.folder(B).join("record.json"), b"{\"id").unwrap();
+    let before = cx::snapshot(&w.folder(B));
+    let got = desire(&cx::tx(&w, &s), &j).unwrap_err();
+    assert_eq!(got.check, "evidence", "torn record");
+    assert_eq!(cx::snapshot(&w.folder(B)), before, "nothing written to B");
+}
+
+// Call 19: `desired_of` walks from the state root, so a linked ancestor of the member folder (`agents`) refuses
+// `evidence` and the link's target is never read.
+#[test]
+fn desired_of_refuses_through_a_linked_ancestor() {
+    let (w, _) = lf::world();
+    let target = w._dir.path().join("elsewhere");
+    std::fs::create_dir_all(target.join(A)).unwrap();
+    std::fs::write(
+        target.join(A).join("desired.json"),
+        br#"{"desired":"running"}"#,
+    )
+    .unwrap();
+    let (agents, member) = (w.state().join("agents"), w.folder(A));
+    std::fs::remove_dir_all(&agents).unwrap();
+    crate::testing::link_dir(&target, &agents);
+    assert_eq!(desired_of(&member).unwrap_err().check, "evidence");
+}
+
+// Call 19 (deviation guard): the snapshot's own void rule (`void_of`, from the marks it keeps) answers exactly as
+// group B's `never_ran_recorded` for each kind of successor.
+#[test]
+fn the_snapshot_void_rule_is_never_ran_recorded() {
+    type Seed = (&'static str, fn(&World));
+    let cases: [Seed; 5] = [
+        ("void pending", |w| cx::void(w, V, A, L)),
+        ("running", |w| {
+            cx::member(w, V, Some(L), 1, json!({"resumedFrom": A}));
+        }),
+        ("recorded end", |w| {
+            let v = cx::member(w, V, Some(L), 1, json!({"resumedFrom": A}));
+            crate::state::evidence::publish(&gens::path(&v, 1, "ended"), &json!({"at": "x"}))
+                .unwrap();
+        }),
+        ("held pending", |w| {
+            let mut p = lf::pending(0);
+            p["hcAddress"] = json!("t0");
+            let v = w.folder(V);
+            std::fs::create_dir_all(&v).unwrap();
+            let r = json!({"lifecycle": 1, "id": V, "name": "w-6", "session": w.caller().session,
+                "sessionId": lf::SID, "team": lf::team(w), "depth": 1, "parentAgent": {"id": L},
+                "resumedFrom": A, "pending": p});
+            crate::state::fs::write_json(&v.join("record.json"), &r).unwrap();
+        }),
+        ("void pending still completing", |w| {
+            cx::void(w, V, A, L);
+            let p = w.folder(V).join("record.json");
+            let mut r: Value = serde_json::from_slice(&std::fs::read(&p).unwrap()).unwrap();
+            r["completing"] = json!({"gen": 0});
+            crate::state::fs::write_json(&p, &r).unwrap();
+        }),
+    ];
+    for (case, seed) in cases {
+        let (w, s) = lf::world();
+        cx::member(&w, L, None, 0, json!({}));
+        cx::member(&w, A, Some(L), 1, json!({}));
+        seed(&w);
+        let t = Tree::read(&cx::tx(&w, &s)).unwrap();
+        let gens::Member::Life(g) = gens::member_of(&w.folder(V)) else {
+            panic!("{case}: not a lifecycle member");
+        };
+        let want = g.never_ran_recorded(&g.status().unwrap()).unwrap();
+        assert_eq!(t.nodes[V].void, want, "{case}");
+    }
 }
