@@ -267,3 +267,126 @@ fn an_overflowing_seq_or_depth_refuses_before_any_write() {
         );
     }
 }
+
+/// The pause: adoption commits B under A while the writer is stopped at its entry.
+fn adopt_in_pause(ctx: &crate::ctx::Ctx, s: &Scope) {
+    let tx = Tx {
+        ctx,
+        scope: s.clone(),
+    };
+    assert_eq!(adopt_from(&tx, ax::E).unwrap(), moved(cx::A));
+}
+/// The same, cut short after the journal; replay finishes it inside the pause.
+fn halted_in_pause(ctx: &crate::ctx::Ctx, s: &Scope) {
+    let tx = Tx {
+        ctx,
+        scope: s.clone(),
+    };
+    cx::at("adopt-journal");
+    assert_eq!(adopt_from(&tx, ax::E).unwrap_err().check, "halted");
+    crate::agents::release::halt_after(None);
+    replay(&tx).unwrap();
+}
+fn the_view() -> Value {
+    json!({"pane": "%8", "window": "@1", "startCommand": "hc attach", "gen": 1,
+        "hcAddress": cx::addr(cx::B), "hcName": lf::hc_name(1)})
+}
+fn view_write(tx: &Tx<'_>) -> Res<()> {
+    crate::agents::team_state::view(tx.ctx, &tx.scope, cx::B, &the_view())
+}
+fn promoted(tx: &Tx<'_>, completing: Option<Value>) -> Res<()> {
+    let launch = json!({"hcName": lf::hc_name(2), "launcherArgv": lf::ARGV, "sessionId": lf::SID});
+    let r = crate::agents::gens::record(&tx.folder(cx::B))
+        .known()?
+        .unwrap();
+    let team = crate::agents::text(r.get("team"));
+    let got = tx.promote(cx::B, 2, &launch, &cx::addr_at(cx::B, 2), &team, completing)?;
+    assert!(got.is_some(), "promoted");
+    Ok(())
+}
+/// Release-1d R4's write: the promotion that records `completing` (group B's `Tx::promote`).
+fn release_write(tx: &Tx<'_>) -> Res<()> {
+    promoted(tx, Some(json!({"gen": 1})))
+}
+fn promote_write(tx: &Tx<'_>) -> Res<()> {
+    promoted(tx, None)
+}
+type Writer = (&'static str, fn(&Tx<'_>) -> Res<()>);
+type Pause = (&'static str, fn(&crate::ctx::Ctx, &Scope));
+
+// A-1, A5 (findings 1-17, 1-19): each real writer is paused at its entry, after the caller read B under E; adoption
+// commits B under A inside the pause (directly, or by replay after a crash after its journal); the writer resumes.
+// B's parent is A at the recomputed depth, and the writer's own fields are kept: the view descriptor exactly and
+// presented, `completing`, the promoted generation.
+#[test]
+fn a_paused_writer_keeps_the_adopted_topology() {
+    let writers: [Writer; 3] = [
+        ("view", view_write),
+        ("release", release_write),
+        ("promote", promote_write),
+    ];
+    let pauses: [Pause; 2] = [("direct", adopt_in_pause), ("replayed", halted_in_pause)];
+    for (name, write) in writers {
+        for (how, pause) in pauses {
+            let case = format!("{name} {how}");
+            let (w, s) = world();
+            ax::team(&w);
+            if name != "view" {
+                ax::set(&w, cx::B, "pending", lf::pending(2));
+                lf::seed_gen(&w.folder(cx::B), 2, Some("run"), lf::committed());
+            }
+            let old = ax::parent_of(&w, cx::B);
+            assert_eq!(
+                old.as_deref(),
+                Some(ax::E),
+                "{case}: the caller read the old tree"
+            );
+            crate::agents::team_state::pause_writes(Some(pause));
+            write(&cx::tx(&w, &s)).unwrap();
+            crate::agents::team_state::pause_writes(None);
+            assert_eq!(at(&w, cx::B), (Some(cx::A.into()), 2), "{case}");
+            let r = ax::record(&w, cx::B);
+            match name {
+                "view" => {
+                    let v = crate::state::fs::read_json(&w.folder(cx::B).join("view.json"));
+                    assert_eq!(v.unwrap().unwrap(), the_view(), "{case}: the descriptor");
+                    let shown = crate::agents::team_state::presented(&w.folder(cx::B), r).unwrap();
+                    assert_eq!(shown["pane"], "%8", "{case}: presented");
+                }
+                "release" => assert_eq!(
+                    (&r["completing"], &r["generation"]),
+                    (&json!({"gen": 1}), &json!("2")),
+                    "{case}"
+                ),
+                _ => assert_eq!(
+                    (r.get("pending"), &r["generation"]),
+                    (None, &json!("2")),
+                    "{case}"
+                ),
+            }
+        }
+    }
+}
+
+// A5, AD-R1 (finding 1-18): release, settle and `Tx::promote` code never names a topology field.
+#[test]
+fn release_and_promote_never_name_topology_fields() {
+    let read =
+        |f: &str| std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join(f)).unwrap();
+    let state = read("src/agents/team_state.rs");
+    let start = state.find("pub fn promote(").expect("Tx::promote");
+    let promote = &state[start..start + state[start..].find("\n    }\n").unwrap()];
+    let bodies = [
+        ("release.rs", read("src/agents/release.rs")),
+        ("settle.rs", read("src/agents/settle.rs")),
+    ];
+    let mut code: Vec<(&str, String)> = (bodies.iter())
+        .map(|(n, t)| (*n, t.split("mod tests").next().unwrap().to_string()))
+        .collect();
+    code.push(("Tx::promote", promote.to_string()));
+    for (name, text) in code {
+        for field in ["\"parentAgent\"", "\"parentPane\"", "\"depth\""] {
+            assert!(!text.contains(field), "{name} names {field}");
+        }
+    }
+}

@@ -64,6 +64,25 @@ pub fn test_hook(hook: Option<Hook>) {
     TEST_HOOK.with(|h| h.set(hook));
 }
 
+/// adopt-3e A-1 (test only): a pause each writer takes at its entry, before its member lock and read, so a test
+/// can commit an adoption between the caller's read and the write. Taken once, then cleared.
+#[cfg(test)]
+type Pause = fn(&Ctx, &Scope);
+#[cfg(test)]
+thread_local! {
+    static PAUSE: std::cell::Cell<Option<Pause>> = const { std::cell::Cell::new(None) };
+}
+#[cfg(test)]
+pub fn pause_writes(p: Option<Pause>) {
+    PAUSE.with(|c| c.set(p));
+}
+fn paused(_ctx: &Ctx, _scope: &Scope) {
+    #[cfg(test)]
+    if let Some(p) = PAUSE.with(|c| c.take()) {
+        p(_ctx, _scope);
+    }
+}
+
 /// The team lock held, every hook run.
 pub struct Tx<'a> {
     pub ctx: &'a Ctx,
@@ -163,6 +182,7 @@ impl Tx<'_> {
         guard: Guard<'_>,
         patch: impl FnOnce(&mut Map<String, Value>) -> Res<()>,
     ) -> Res<Option<Value>> {
+        paused(self.ctx, &self.scope);
         let folder = self.folder(id);
         super::lock(self.ctx, &self.scope.member_lock(id), || {
             let read = super::gens::record(&folder).known()?;
@@ -299,6 +319,7 @@ pub const VIEW_FIELDS: [&str; 3] = ["pane", "window", "startCommand"];
 /// S4: the member lock only; replaces view.json, never touches record.json. A view names its generation (V1,
 /// ambiguity 7).
 pub fn view(ctx: &Ctx, scope: &Scope, id: &str, view: &Value) -> Res<()> {
+    paused(ctx, scope);
     if !view.get("gen").is_some_and(Value::is_u64) {
         return Err(Refusal::internal("a view names its generation"));
     }
