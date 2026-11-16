@@ -11,6 +11,9 @@
 #[path = "support/private_core.rs"]
 mod private_core;
 
+// report-2b: the shared integration fixtures (private root, 150 s wait, deny_queries); occupy-3 uses them here.
+mod native;
+
 use std::collections::HashMap;
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};

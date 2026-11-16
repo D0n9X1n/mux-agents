@@ -212,6 +212,9 @@ jobs:
       - name: Private core fixture tests
         shell: bash
         run: cargo test --features live,test-panic --locked --test live_core -- --nocapture
+      - name: Session registry on the real process table
+        shell: bash
+        run: cargo test --features live,test-panic --locked --test live_session -- --nocapture
       # A multiplexer the run cannot find fails the suite instead of skipping its tests (#71); the preflight prints
       # each one's version and binary.
       - name: Live preflight
@@ -279,6 +282,9 @@ jobs:
       - name: Private core fixture tests
         shell: bash
         run: cargo test --features live,test-panic --locked --test live_core -- --nocapture
+      - name: Session registry on the real process table
+        shell: bash
+        run: cargo test --features live,test-panic --locked --test live_session -- --nocapture
       - name: Clippy with the live tests
         shell: bash
         run: cargo clippy --all-targets --features live,test-panic --locked -- -D warnings

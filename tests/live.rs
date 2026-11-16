@@ -11,6 +11,9 @@ mod launch_evidence;
 #[cfg(unix)]
 mod support;
 
+// report-2b: the shared integration fixtures (private root, 150 s wait, deny_queries); occupy-3 uses them here.
+mod native;
+
 #[cfg(unix)]
 use support::{Dir, Mux, Server};
 
