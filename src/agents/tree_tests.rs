@@ -2204,3 +2204,26 @@ fn every_other_proven_member_is_still_refused_placement_tagged() {
         assert!(placement_calls(&m).is_empty(), "{case}");
     }
 }
+
+// cascade-3d C2: the gate every spawn passes refuses 2 `closed` under a stopped parent, after the depth check.
+#[test]
+fn admission_refuses_a_closed_parent() {
+    let w = World::human("");
+    let c = w.caller();
+    team_record(&w, &[]);
+    let team = team_of(&w.ctx, &c).unwrap().unwrap();
+    let i = ids(1);
+    // Lifecycle records: `Tree::read` skips pre-lifecycle members (prelife-1c call 1).
+    let fields = json!({"client": "claude", "pane": "%4", "upTeam": "t", "directory": "/work"});
+    crate::agents::cascade_fixture::member(&w, LEADER, None, 0, fields.clone());
+    let m = crate::agents::cascade_fixture::member(&w, &i[0], Some(LEADER), 1, fields);
+    let r = crate::agents::life_fixture::record(&m);
+    let s = crate::agents::team_state::Scope::of(&c);
+    crate::agents::team_state::open(&w.ctx, &s, |tx| tx.desired(&i[0], false)).unwrap();
+    let got = admit(&w.ctx, &c, &team, member_of(&i[0], r)).unwrap_err();
+    assert_eq!(got.check, "closed");
+    admit(&w.ctx, &c, &team, Standing::Person).unwrap();
+    crate::agents::team_state::open(&w.ctx, &s, |tx| tx.desired(LEADER, false)).unwrap();
+    let got = admit(&w.ctx, &c, &team, Standing::Person).unwrap_err();
+    assert_eq!(got.check, "closed");
+}

@@ -480,6 +480,15 @@ pub fn admit(ctx: &Ctx, caller: &Caller, found: &Team, standing: Standing) -> Re
         },
     };
     check_depth(a.depth)?;
+    // cascade-3d C2: the destination parent must be open (C0-resolved). The caller holds the team lock and the check
+    // only reads, so no replay hook runs here (ambiguity 11).
+    if let Some(p) = a.parent.get("id").and_then(Value::as_str) {
+        let tx = super::team_state::Tx {
+            ctx,
+            scope: super::team_state::Scope::of(caller),
+        };
+        super::cascade::admit(&tx, p)?;
+    }
     Ok(a)
 }
 /// Where an admitted child goes, and its name.

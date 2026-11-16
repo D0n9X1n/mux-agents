@@ -825,6 +825,56 @@ pub fn stop(tx: &Tx<'_>, caller: &Caller, root: &str, kept: &[Report]) -> Res<Re
     execute(tx, caller, &j)
 }
 
+/// C2's refusal: 2 `closed`, naming the stopped (or listed) member that closes the sub-tree.
+fn closed(name: &str) -> Refusal {
+    Refusal {
+        code: 2,
+        check: "closed",
+        message: format!("{name} is stopped; its sub-tree takes no new members"),
+        reason: None,
+        leftover: None,
+        details: Default::default(),
+    }
+}
+
+/// C2: a new member under `parent` (C0: each member standing for it now) needs every one open: none of their
+/// chains desired stopped or listed by a journal (a tombstone included, call 29). A parent with no lifecycle record
+/// in the session is not checked.
+pub fn admit(tx: &Tx<'_>, parent: &str) -> Res<()> {
+    let t = Tree::read(tx)?;
+    if !t.has(parent) {
+        return Ok(());
+    }
+    let js = journals(tx)?;
+    let listed = |x: &str| js.iter().any(|j| j.lists(x));
+    for p in t.current(parent)? {
+        if let Some(by) = t.closed_by(&p, &listed)? {
+            return Err(closed(&t.name(&by)));
+        }
+    }
+    Ok(())
+}
+
+/// C3: X may be resumed, retried or freshened only when no journal (a tombstone included) lists X, a member of X's
+/// chain or a member below X (nearest first, then deepest first), and X's parent is open. X's own `stopped` does
+/// not refuse: that is the reopen.
+pub fn reopen_check(tx: &Tx<'_>, id: &str) -> Res<()> {
+    let t = Tree::read(tx)?;
+    let js = journals(tx)?;
+    let listed = |x: &str| js.iter().any(|j| j.lists(x));
+    let mut near = t.chain(id)?;
+    near.extend(t.below(id)?.into_iter().filter(|b| b != id));
+    if let Some(by) = near.iter().find(|x| listed(x)) {
+        return Err(closed(&t.name(by)));
+    }
+    for p in t.parents(id)? {
+        if let Some(by) = t.closed_by(&p, &listed)? {
+            return Err(closed(&t.name(&by)));
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 #[path = "cascade_tests.rs"]
 mod tests;

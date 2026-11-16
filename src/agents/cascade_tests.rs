@@ -1297,3 +1297,67 @@ fn an_entry_without_its_marker_keeps_the_journal() {
     assert_eq!(cx::delivered(&w, A), 1);
     assert!(lf::calls(&w).is_empty(), "done by its files");
 }
+
+// Spec C2/C3: a spawn under an unprepared journal's member or after a whole-team stop: `closed`; reopening while
+// a journal lists a descendant: `closed`; after completion: admitted, descendants still stopped. C0: a stopped
+// parent with a live successor admits under the successor.
+#[test]
+fn admission_and_reopen_follow_the_closure() {
+    let (w, s) = lf::world();
+    cx::chain(&w);
+    let tx = cx::tx(&w, &s);
+    cx::seed(&w, A, &[C, B, A], false);
+    let got = admit(&tx, B).unwrap_err();
+    assert_eq!(got.check, "closed", "under an unprepared journal's member");
+    admit(&tx, L).unwrap();
+    remove(&tx, A).unwrap();
+    for id in [A, B, C] {
+        tx.desired(id, false).unwrap();
+    }
+    cx::seed(&w, B, &[C, B], true);
+    let got = reopen_check(&tx, A).unwrap_err();
+    let want = (
+        "closed",
+        "w-c is stopped; its sub-tree takes no new members",
+    );
+    assert_eq!((got.check, got.message.as_str()), want);
+    remove(&tx, B).unwrap();
+    reopen_check(&tx, A).unwrap();
+    tx.desired(A, true).unwrap();
+    let got = admit(&tx, B).unwrap_err();
+    assert_eq!(
+        got.check, "closed",
+        "B stays stopped after its parent reopens"
+    );
+    assert!(cx::stopped(&w, B) && cx::stopped(&w, C));
+    admit(&tx, A).unwrap();
+    tx.desired(L, false).unwrap();
+    let got = admit(&tx, L).unwrap_err();
+    assert_eq!(
+        got.check, "closed",
+        "a whole-team stop: the root stays closed"
+    );
+    let got = reopen_check(&tx, A).unwrap_err();
+    assert_eq!(got.check, "closed", "A's parent is closed");
+    tx.desired(L, true).unwrap();
+    tx.desired(A, false).unwrap();
+    cx::member(&w, S, Some(L), 1, json!({"resumedFrom": A}));
+    admit(&tx, A).unwrap();
+}
+
+// Call 29 (checklist 17, reopen/admission half): a `<root>.removed` tombstone is an unfinished removal; it still
+// fences its sub-tree for admission and reopen until the removal completes.
+#[test]
+fn a_tombstone_still_fences_admission_and_reopen() {
+    let (w, s) = lf::world();
+    cx::chain(&w);
+    let tx = cx::tx(&w, &s);
+    cx::seed(&w, B, &[C, B], true);
+    let f = cx::journal_of(&w, B);
+    std::fs::rename(&f, f.with_extension("removed")).unwrap();
+    assert_eq!(admit(&tx, C).unwrap_err().check, "closed", "admission");
+    assert_eq!(reopen_check(&tx, A).unwrap_err().check, "closed", "reopen");
+    remove(&tx, B).unwrap();
+    admit(&tx, C).unwrap();
+    reopen_check(&tx, A).unwrap();
+}

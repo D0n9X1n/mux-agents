@@ -184,6 +184,12 @@ fn admit(
             ),
         );
     }
+    // cascade-3d C3: no journal around X, and X's parent open. Under the spawn lock (the team lock); read only.
+    let tx = super::team_state::Tx {
+        ctx,
+        scope: super::team_state::Scope::of(caller),
+    };
+    super::cascade::reopen_check(&tx, id)?;
     let name_check = || -> Res<()> {
         let others = local
             .iter()

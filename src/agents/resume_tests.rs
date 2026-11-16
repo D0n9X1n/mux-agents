@@ -1887,3 +1887,15 @@ fn a_resume_whose_view_fails_after_the_commit_keeps_the_successor() {
     );
     w.fakes.hc_done().unwrap();
 }
+
+// cascade-3d C3: a member a kept journal lists is not resumed: 2 `closed`, nothing launched.
+#[test]
+fn a_resume_under_a_kept_journal_is_refused_closed() {
+    let w = World::human("");
+    let x = member(&w, ID, json!({}));
+    facts(&w, &[(&x, "stopped")]);
+    crate::agents::cascade_fixture::seed(&w, ID, &[ID], true);
+    let before = folders(&w);
+    assert_eq!(resume_of(&w, ID).unwrap_err().check, "closed");
+    assert_eq!(folders(&w), before, "nothing launched");
+}
