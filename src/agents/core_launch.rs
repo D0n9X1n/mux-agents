@@ -100,6 +100,7 @@ pub fn forward(
         return Err(Refusal::internal("the launch has no directory")); // ambiguity 10
     }
     let folder = tx.folder(&l.id);
+    let creates = l.create.is_some();
     // R5: one walk read before any write. F2: the first pending write is guarded by what it saw.
     let (first, current) = match (gens::member_of(&folder), &l.create) {
         (gens::Member::Unreadable(e), _) => return Err(e),
@@ -149,6 +150,12 @@ pub fn forward(
     step("pending");
     // Every failure from here to the claim goes to `abort` (F1).
     let fence = |e: Refusal| abort(tx, &l.id, n, &hc_name, e);
+    // cascade-3d C1: a new member (spawn, a resume's successor, a new leader) is desired `running` before `hc run`;
+    // absent already reads `running`, so a death before this write changes nothing. A failure is fenced (F1).
+    if creates {
+        tx.desired(&l.id, true).map_err(&fence)?;
+        step("desired");
+    }
     // G1.2: the spec, then launch.json, both create-once through the one publisher (R-W1).
     let mut spec = l.spec.clone();
     spec["id"] = json!(l.id);
@@ -306,6 +313,7 @@ pub(crate) fn attempt<T>(f: impl FnOnce() -> Res<T>) -> Res<T> {
 #[cfg(test)]
 pub(crate) mod forward_tests {
     use super::*;
+    use crate::agents::core_fixture as cf;
     use crate::agents::fixture::{ID, SESSION_ID, World};
     use crate::agents::{gens, team_state};
     use crate::hc;
@@ -435,9 +443,14 @@ pub(crate) mod forward_tests {
             .iter()
             .filter(|(_, a, _)| a[0] == "run")
             .count();
+        let desired = crate::state::fs::read_json(&f.join("desired.json"))
+            .ok()
+            .flatten()
+            .unwrap_or(Value::Null);
         json!({"pending": r["pending"]["gen"], "address": r["pending"]["hcAddress"], "session": r["sessionId"],
             "generation": r["generation"], "spec": file("spec"), "launch": file("launch"),
-            "commit": commit.map(|c| format!("{:?}", gens::decide(&c))), "runs": runs})
+            "commit": commit.map(|c| format!("{:?}", gens::decide(&c))), "runs": runs,
+            "desired": desired["desired"]})
     }
     /// Records `seen` after every forward step.
     fn watch(w: &World, n: u64) -> Rc<RefCell<Vec<(String, Value)>>> {
@@ -459,10 +472,11 @@ pub(crate) mod forward_tests {
         launch: bool,
         commit: Value,
         runs: usize,
+        desired: Value,
     }
     fn row(r: Row) -> Value {
         json!({"pending": r.pending, "address": r.address, "session": r.session, "generation": r.generation,
-            "spec": r.spec, "launch": r.launch, "commit": r.commit, "runs": r.runs})
+            "spec": r.spec, "launch": r.launch, "commit": r.commit, "runs": r.runs, "desired": r.desired})
     }
 
     // G1, F3, F4: each step leaves exactly its files; the view sees the commit and the promotion.
@@ -495,10 +509,16 @@ pub(crate) mod forward_tests {
             launch: false,
             commit: z.clone(),
             runs: 0,
+            desired: z.clone(),
+        };
+        // cascade-3d C1: a creating launch is desired `running` from step `desired` on.
+        let desired = Row {
+            desired: json!("running"),
+            ..base.clone()
         };
         let spec = Row {
             spec: true,
-            ..base.clone()
+            ..desired.clone()
         };
         let launch = Row {
             launch: true,
@@ -532,6 +552,7 @@ pub(crate) mod forward_tests {
                 }),
             ),
             ("pending", row(base)),
+            ("desired", row(desired)),
             ("spec", row(spec)),
             ("launch", row(launch)),
             ("run", row(run)),
@@ -581,6 +602,28 @@ pub(crate) mod forward_tests {
             .collect();
         assert_eq!(verbs, ["--version", "run"], "one connection, one run");
         assert!(runs(&w)[0].contains(&"mux.gen=0".to_string()));
+    }
+
+    // cascade-3d C1: a launch that creates a record writes desired `running` after `pending`, before `hc run`. A
+    // failed desired write goes to `abort` (F1): no `hc run`, the pending generation dropped.
+    #[test]
+    fn a_new_member_is_desired_running_before_hc_run() {
+        let w = World::human("");
+        w.state();
+        std::fs::create_dir_all(w.folder(ID).join("desired.json")).unwrap(); // a folder: Unreadable
+        cf::online(&w);
+        let got = go(&w, launch_of(&w, true, SESSION_ID), free, never).unwrap_err();
+        assert_eq!(got.check, "evidence");
+        assert!(
+            w.fakes.hc_calls().iter().all(|c| c.1[0] != "run"),
+            "no hc run"
+        );
+        assert!(
+            gens::record(&w.folder(ID))
+                .known()
+                .unwrap()
+                .is_none_or(|r| r.get("pending").is_none())
+        );
     }
 
     // G12: the launcher accepts what forward wrote, pending and promoted; launch.json is what hc ran.
@@ -693,6 +736,11 @@ pub(crate) mod forward_tests {
         let got = go(&w, launch_of(&w, false, NEW), free, no_view).unwrap();
         assert_eq!(got["generation"], json!("4"), "never 0 beside an active 3");
         assert!(!gens::dir(&f, 0).exists() && runs(&w)[0].contains(&"mux.gen=4".to_string()));
+        // cascade-3d C3: only a creating launch writes desired state; a retry never reopens a member by itself.
+        assert!(
+            !f.join("desired.json").exists(),
+            "a retry writes no desired state"
+        );
     }
 
     // Ambiguity 1: an undecided pending generation is never superseded.
@@ -1484,7 +1532,7 @@ pub(crate) mod forward_tests {
         for case in [
             "gens at pending",
             "gens/n at pending",
-            "member at pending, new member",
+            "member at desired, new member",
             "gens/n at spec",
         ] {
             let w = world();
@@ -1497,7 +1545,9 @@ pub(crate) mod forward_tests {
             let n = u64::from(!new);
             let (at, target) = match case {
                 "gens at pending" => ("pending", f.join("gens")),
-                "member at pending, new member" => ("pending", f.clone()),
+                // cascade-3d C1: `desired.json` is flushed into the member folder at `desired`; armed after it,
+                // the fault still meets the spec publication's member-folder flush.
+                "member at desired, new member" => ("desired", f.clone()),
                 "gens/n at spec" => ("spec", gens::dir(&f, n)),
                 _ => ("pending", gens::dir(&f, n)),
             };
@@ -1880,12 +1930,12 @@ pub(crate) mod crash {
     use serde_json::json; // finding 4-1: the glob import of forward_tests does not bring the macro
     use std::path::{Path, PathBuf};
 
-    const STEPS: [&str; 7] = [
-        "pending", "spec", "launch", "run", "address", "commit", "promote",
+    const STEPS: [&str; 8] = [
+        "pending", "desired", "spec", "launch", "run", "address", "commit", "promote",
     ];
 
     /// A root without the Windows verbatim prefix, as `launcher::tests::setup` makes it (a spec path must classify).
-    fn plain(root: &Path) -> PathBuf {
+    pub(crate) fn plain(root: &Path) -> PathBuf {
         #[cfg(windows)]
         if let Some(p) = root.to_str().and_then(|r| r.strip_prefix(r"\\?\")) {
             return PathBuf::from(p);
@@ -2016,6 +2066,14 @@ pub(crate) mod crash {
                 r.get("sessionId").is_some(),
                 at("promote"),
                 "{step}: the session only at promotion"
+            );
+            // cascade-3d C1: `running` is durable from step `desired` on; a crash at `desired` is abandoned as at
+            // `pending` (G3 row 3).
+            let desired = crate::agents::cascade::desired_of(&f).unwrap();
+            assert_eq!(
+                (f.join("desired.json").is_file(), desired),
+                (at("desired"), crate::agents::cascade::Desired::Running),
+                "{step}: desired"
             );
             assert_eq!(gens::path(&f, 0, "spec").is_file(), at("spec"), "{step}");
             assert_eq!(

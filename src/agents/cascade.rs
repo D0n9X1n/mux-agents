@@ -158,6 +158,13 @@ impl Tree {
         self.nodes.contains_key(id)
     }
 
+    /// Call 11: a member that records no parent (the team's root) and is desired stopped stays closed.
+    fn root_stopped(&self, id: &str) -> bool {
+        self.nodes
+            .get(id)
+            .is_some_and(|n| n.parent.is_none() && n.stopped)
+    }
+
     pub fn name(&self, id: &str) -> String {
         self.nodes
             .get(id)
@@ -860,6 +867,9 @@ pub fn admit(tx: &Tx<'_>, parent: &str) -> Res<()> {
 /// not refuse: that is the reopen.
 pub fn reopen_check(tx: &Tx<'_>, id: &str) -> Res<()> {
     let t = Tree::read(tx)?;
+    if t.root_stopped(id) {
+        return Err(closed(&t.name(id)));
+    }
     let js = journals(tx)?;
     let listed = |x: &str| js.iter().any(|j| j.lists(x));
     let mut near = t.chain(id)?;
@@ -873,6 +883,17 @@ pub fn reopen_check(tx: &Tx<'_>, id: &str) -> Res<()> {
         }
     }
     Ok(())
+}
+
+/// C3, same id (retry, fresh): the reopen check, `tx.desired(X, running)`, then the launch (launch-1 G1, `pending`
+/// first). Death between them: X is `running` with its old generation done or failed, so reconcile never relaunches
+/// it (restore-6b rows 5-6) and a person repeats the action. Death after `pending`: settle-1b G3 replays it.
+/// X's descendants stay stopped.
+pub fn reopen_same<T>(tx: &Tx<'_>, id: &str, launch: impl FnOnce() -> Res<T>) -> Res<T> {
+    reopen_check(tx, id)?;
+    tx.desired(id, true)?;
+    super::release::halt("reopened")?;
+    launch()
 }
 
 #[cfg(test)]

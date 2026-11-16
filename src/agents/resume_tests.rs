@@ -1106,8 +1106,9 @@ fn a_failed_agents_folder_flush_launches_nothing() {
 // and what that write added, no temp file is left, and nothing commits. A write after hc run rolls the run back.
 #[test]
 fn power_loss_after_each_record_write_leaves_a_complete_record() {
-    // Durable writes in order, each a `record_write`: 0 the create, 1 the address patch, 2 the promotion.
-    for write in 0..3 {
+    // Record writes in order: 0 the create, 1 the address patch, 2 the promotion. A creating launch also writes
+    // `desired.json` durably right after the create (cascade-3d C1), so record write k is durable write `at`.
+    for (write, at) in [(0, 0), (1, 2), (2, 3)] {
         let w = World::human("");
         let x = member(&w, ID, json!({"pane": "%5", "window": "@1", "depth": 1}));
         w.panes(&[]);
@@ -1116,7 +1117,7 @@ fn power_loss_after_each_record_write_leaves_a_complete_record() {
             launches(&w, "t1");
         }
         let before = folders(&w);
-        crate::state::fs::fail_durable_flush(Some(write));
+        crate::state::fs::fail_durable_flush(Some(at));
         let got = resume_of(&w, ID);
         crate::state::fs::fail_durable_flush(None);
         assert!(got.is_err(), "write {write}");

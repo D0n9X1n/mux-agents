@@ -4,6 +4,7 @@ use crate::agents::core_fixture as cf;
 use crate::agents::fixture::{ID, World};
 use crate::agents::gens;
 use crate::agents::life_fixture as lf;
+use crate::agents::settle::Mode;
 use crate::agents::team_state::{Scope, open};
 use serde_json::json;
 
@@ -1360,4 +1361,93 @@ fn a_tombstone_still_fences_admission_and_reopen() {
     remove(&tx, B).unwrap();
     admit(&tx, C).unwrap();
     reopen_check(&tx, A).unwrap();
+}
+
+// C3 same id: refused while a journal lists a descendant; otherwise `running` is durable before the launch runs.
+#[test]
+fn reopen_same_writes_running_before_the_launch() {
+    let (w, s) = lf::world();
+    cx::chain(&w);
+    let tx = cx::tx(&w, &s);
+    for id in [A, B, C] {
+        tx.desired(id, false).unwrap();
+    }
+    cx::seed(&w, B, &[C, B], true);
+    let got = reopen_same(&tx, A, || -> Res<()> { panic!("launched while closed") });
+    assert_eq!(got.unwrap_err().check, "closed");
+    assert!(cx::stopped(&w, A), "nothing written");
+    remove(&tx, B).unwrap();
+    reopen_same(&tx, A, || {
+        assert!(!cx::stopped(&w, A), "running before the launch");
+        Ok(())
+    })
+    .unwrap();
+}
+
+// Spec "Reopen crash boundaries", same id, in process: killed after `tx.desired`, then after `pending`. settle
+// replays only A's intended pending generation, at most once; B and C stay stopped and are never launched.
+#[test]
+fn a_reopen_cut_short_replays_only_its_own_pending() {
+    for cut in ["reopened", "pending"] {
+        let (w, s) = lf::world();
+        cx::chain(&w);
+        cx::done(&w, A);
+        let tx = cx::tx(&w, &s);
+        for id in [A, B, C] {
+            tx.desired(id, false).unwrap();
+        }
+        if cut == "reopened" {
+            cx::at("reopened");
+        }
+        let got = reopen_same(&tx, A, || {
+            let p = lf::pending(2);
+            tx.record_write(
+                A,
+                crate::agents::team_state::Guard::PendingGen { n: None },
+                |r| {
+                    r.insert("pending".into(), p);
+                    Ok(())
+                },
+            )?;
+            super::super::release::halt("pending-test")
+        });
+        if cut == "pending" {
+            assert!(got.is_ok(), "no halt set: the closure ran to its end");
+        } else {
+            assert_eq!(got.unwrap_err().check, "halted");
+        }
+        assert!(!cx::stopped(&w, A), "{cut}: running is durable");
+        for _ in 0..2 {
+            tx.settle(A, Mode::Normal).unwrap();
+            assert!(lf::record(&w.folder(A)).get("pending").is_none(), "{cut}");
+        }
+        let claim = gens::claim(&w.folder(A), 2).known().unwrap();
+        let want = if cut == "pending" {
+            Some(json!("abandoned"))
+        } else {
+            None
+        };
+        assert_eq!(claim, want, "{cut}: abandoned once, or never pending");
+        assert!(cx::stopped(&w, B) && cx::stopped(&w, C), "{cut}");
+        assert!(lf::calls(&w).is_empty(), "{cut}: nothing launched");
+    }
+}
+
+// Call 11 (C2 root): a stopped root stays closed until 6c retires the team: after its whole cascade, with the
+// finished journal removed, `reopen_same(L)` refuses `closed`; L stays stopped and nothing launches.
+#[test]
+fn a_stopped_root_stays_closed() {
+    let (w, s) = lf::world();
+    cx::member(&w, L, None, 0, json!({}));
+    cx::terminates(&w, L);
+    let (tx, c) = (cx::tx(&w, &s), w.caller());
+    assert!(stop(&tx, &c, L, &[]).unwrap().stopped, "stopped completely");
+    assert!(
+        journals(&tx).unwrap().is_empty(),
+        "the finished journal is removed"
+    );
+    let got = reopen_same(&tx, L, || -> Res<()> { panic!("launched a stopped root") });
+    assert_eq!(got.unwrap_err().check, "closed");
+    assert!(cx::stopped(&w, L), "L stays stopped");
+    w.fakes.hc_done().unwrap();
 }

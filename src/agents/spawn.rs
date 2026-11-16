@@ -1108,10 +1108,11 @@ mod tests {
             .collect()
     }
 
-    /// The member locks one launch takes (forward's create, address and promotion writes, then view.json).
+    /// The member locks one launch takes (forward's create, `desired.json` (cascade-3d C1), address and promotion
+    /// writes, then view.json).
     fn launch_locks(c: &Caller, id: &str) -> Vec<String> {
         let member = lock_key("member", c, id);
-        (0..4)
+        (0..5)
             .flat_map(|_| [format!("+{member}"), format!("-{member}")])
             .collect()
     }

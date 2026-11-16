@@ -321,8 +321,9 @@ fn hc_launch_fault_matrix() {
             })));
         }
         if stage == "record" {
-            // The second durable write is the address patch: its folder flush fails after `hc run`.
-            crate::state::fs::fail_durable_flush(Some(1));
+            // Durable writes: the create, `desired.json` (cascade-3d C1), then the address patch: its folder
+            // flush fails after `hc run`.
+            crate::state::fs::fail_durable_flush(Some(2));
         }
         w.fakes.hc_probe(move |a| {
             if a[0] != "run" {
