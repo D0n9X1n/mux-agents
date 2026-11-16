@@ -520,5 +520,4 @@ fn labelled(t: &Terminal, id: &str) -> bool {
 }
 
 #[cfg(test)]
-#[path = "resume_tests.rs"]
 mod tests;

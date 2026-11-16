@@ -272,13 +272,13 @@ impl Tx<'_> {
 
     /// desired.json holds desired and at, written as patch writes.
     pub fn desired(&self, id: &str, running: bool) -> Res<()> {
-        let path = self.folder(id).join("desired.json");
         let word = if running { "running" } else { "stopped" };
         let body = json!({"desired": word, "at": utc_o(self.ctx.clock.now())});
         super::lock(self.ctx, &self.scope.member_lock(id), || {
-            // Reread under the lock, as patch does: an unreadable file is refused, never replaced.
-            evidence::read(&path).known()?;
-            write_json_durable(&path, &body)
+            // Reread under the lock, as patch does: an unreadable file is refused, never replaced. The path is named
+            // inline in each statement, so the S3 lint (tests/repo.rs) sees desired.json written here.
+            evidence::read(&self.folder(id).join("desired.json")).known()?;
+            write_json_durable(&self.folder(id).join("desired.json"), &body)
         })
     }
 }
@@ -887,5 +887,4 @@ mod tests {
 mod view_tests;
 
 #[cfg(test)]
-#[path = "record_write_tests.rs"]
 mod record_write_tests;

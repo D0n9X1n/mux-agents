@@ -1922,15 +1922,12 @@ mod client_tests {
 }
 
 #[cfg(test)]
-#[path = "gens_publish_tests.rs"]
 mod publish_tests;
 
 #[cfg(test)]
-#[path = "gens_ready_tests.rs"]
 mod ready_tests;
 
 #[cfg(test)]
-#[path = "gens_held_tests.rs"]
 mod held_tests;
 
 #[cfg(test)]

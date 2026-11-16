@@ -2402,7 +2402,6 @@ mod tests {
     }
 }
 #[cfg(test)]
-#[path = "board_hc_tests.rs"]
 mod hc_tests;
 /// Finish an ordered legacy-schema row; view is membership's validated optional Pane. No I/O.
 pub fn hc_row(

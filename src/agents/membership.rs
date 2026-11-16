@@ -492,7 +492,6 @@ impl Snapshot {
 }
 
 #[cfg(test)]
-#[path = "membership_tests.rs"]
 mod tests;
 
 /// The caller itself when it is a member proven through its own hc terminal: that member as hc sees it now, never

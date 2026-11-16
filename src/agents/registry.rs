@@ -2566,7 +2566,6 @@ mod tests {
     }
 }
 #[cfg(test)]
-#[path = "registry_hc_tests.rs"]
 mod hc_tests;
 /// Reconcile supplied hc facts; never query or clean a view. A lifecycle member's end is recorded before its
 /// notice, and a recorded end hc has since forgotten is noticed from `ended.json` (b-calls 18).

@@ -626,5 +626,4 @@ pub fn parent_level(
     Ok(team::policy(client, &flags))
 }
 #[cfg(test)]
-#[path = "tree_tests.rs"]
 pub(crate) mod tests;

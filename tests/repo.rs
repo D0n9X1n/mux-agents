@@ -62,8 +62,9 @@ fn literal_end(b: &[u8], i: usize) -> Option<usize> {
     }
 }
 
-/// `src` with comments, strings and char literals turned to spaces (line ends kept), byte for byte.
-fn mask(src: &str) -> String {
+/// `src` with comments, and string and char literals when `strings`, turned to spaces (line ends kept), byte for
+/// byte. A literal is always stepped over whole, so a `//` or `/*` inside one never starts a comment.
+fn blanked(src: &str, strings: bool) -> String {
     let b = src.as_bytes();
     let mut out = b.to_vec();
     let blank = |out: &mut Vec<u8>, from: usize, to: usize| {
@@ -100,6 +101,10 @@ fn mask(src: &str) -> String {
             }
             k
         } else if let Some(end) = literal_end(b, i) {
+            if !strings {
+                i = end; // kept, but stepped over whole: a `//` inside it starts no comment
+                continue;
+            }
             end
         } else {
             i += 1;
@@ -111,11 +116,16 @@ fn mask(src: &str) -> String {
     String::from_utf8(out).expect("only whole literals and comments are blanked")
 }
 
-/// The code of `src` (masked) with every `#[cfg(test)]` item blanked: from the attribute to the item's first `;`
-/// or its matching `}`, outside `()` and `[]`.
-fn without_tests(src: &str) -> String {
+/// `src` with comments, strings and char literals turned to spaces (line ends kept), byte for byte.
+fn mask(src: &str) -> String {
+    blanked(src, true)
+}
+
+/// The spans of the `#[cfg(test)]` items of masked `code`: from the attribute to the item's first `;` or its
+/// matching `}`, outside `()` and `[]`. An item inside a test item is inside its span.
+fn test_spans(code: &[u8]) -> Vec<(usize, usize)> {
     const GATE: &str = "#[cfg(test)]";
-    let mut code = mask(src).into_bytes();
+    let mut spans = Vec::new();
     let mut from = 0;
     while let Some(found) = String::from_utf8_lossy(&code[from..]).find(GATE) {
         let start = from + found;
@@ -138,13 +148,27 @@ fn without_tests(src: &str) -> String {
                 _ => {}
             }
         }
-        for c in &mut code[start..end] {
+        spans.push((start, end));
+        from = end;
+    }
+    spans
+}
+
+fn blank_spans(text: &mut [u8], spans: &[(usize, usize)]) {
+    for &(start, end) in spans {
+        for c in &mut text[start..end] {
             if *c != b'\n' {
                 *c = b' ';
             }
         }
-        from = end;
     }
+}
+
+/// The code of `src` (masked) with every `#[cfg(test)]` item blanked.
+fn without_tests(src: &str) -> String {
+    let mut code = mask(src).into_bytes();
+    let spans = test_spans(&code);
+    blank_spans(&mut code, &spans);
     String::from_utf8(code).expect("only whole items are blanked")
 }
 
@@ -349,6 +373,511 @@ fn process_spawn_only_in_spawn_rs() {
     // spawn.rs itself must be found, or the scan proves nothing.
     assert_eq!(found, [ALLOWED]);
 }
+
+// state-0 S3, PM call 13: every writer token finds every member file. One shape per token, each holding only its own
+// token, so removing one entry of `WRITER_TOKENS` or `MEMBER_FILES` (slices) fails exactly its own cases.
+#[test]
+fn every_writer_of_every_member_file_is_found() {
+    let shapes = [
+        ("write", "std :: fs :: write (f.join(FILE), b)?;"),
+        ("create", "std::fs::File::create(f.join(FILE))?;"),
+        ("rename", "std::fs::rename(&tmp, f.join(FILE))?;"),
+        ("publish", "evidence::publish(&f.join(FILE), &v)?;"),
+        ("claim", "claim_json(&f.join(FILE), &v)?;"),
+        (
+            "OpenOptions",
+            "std::fs::OpenOptions::new().append(true).open(f.join(FILE))?;",
+        ),
+    ];
+    for (token, shape) in shapes {
+        for file in ["\"record.json\"", "\"desired.json\"", "\"view.json\""] {
+            let src = format!("fn live() {{ {} }}\n", shape.replace("FILE", file));
+            assert_eq!(member_writes(&src).len(), 1, "{token} {file}");
+        }
+    }
+    let spaced = "fn live() { std::fs /* c */ :: write(f.join(\"record.json\"), b)?; }\n";
+    assert_eq!(member_writes(spaced).len(), 1, "a comment inside the path");
+    let url = "fn live() { let u = \"http://x\"; write_json(&f.join(\"record.json\"), &r)?; }\n";
+    assert_eq!(member_writes(url).len(), 1, "url");
+    let helper = "fn save(f: &Path) -> Res<()> { write_json(&f.join(\"view.json\"), &v) }\n";
+    assert_eq!(member_writes(helper).len(), 1, "helper");
+}
+
+// W2: comments, literals and test items are never findings.
+#[test]
+fn the_guard_ignores_comments_literals_and_tests() {
+    for (case, src) in [
+        (
+            "read",
+            "fn read() { let r = read_json(&f.join(\"record.json\"))?; }\n",
+        ),
+        (
+            "nested",
+            "fn live() { write_json(&a, &b /* outer /* inner */ \"record.json\" */)?; }\n",
+        ),
+        (
+            "line",
+            "fn live() { write_json(&a, &b)?; // \"desired.json\"\n}\n",
+        ),
+        (
+            "quoted",
+            "fn quoted() { log(\"write_json(\", &f.join(\"desired.json\")); }\n",
+        ),
+        (
+            "lead",
+            "fn live() { #[cfg(test)] let p = \"record.json\"; write_json(&other, &r)?; }\n",
+        ),
+        (
+            "test module",
+            "#[cfg(test)]\nmod tests { fn t() { write_json(&f.join(\"record.json\"), &r); } }\n",
+        ),
+    ] {
+        assert_eq!(member_writes(src), Vec::<String>::new(), "{case}");
+    }
+}
+
+// PM call 13: the guard is conservative. A statement naming a member file and holding a writer token is a finding
+// even when it writes nothing; such findings are resolved only through `MEMBER_WRITES_ALLOWED`. PM call 21: its blind
+// spots are pinned as NOT detected.
+#[test]
+fn the_guard_is_conservative_and_misses_what_its_doc_says() {
+    for (case, src) in [
+        (
+            "read-only open",
+            "fn r() { OpenOptions::new().read(true).open(f.join(\"record.json\"))?; }\n",
+        ),
+        (
+            "can_rename",
+            "fn f() { can_rename(&f.join(\"record.json\")); }\n",
+        ),
+        (
+            "options beside a path",
+            "fn f() { let _ = (OpenOptions::new().write(true), f.join(\"record.json\")); }\n",
+        ),
+    ] {
+        assert_eq!(member_writes(src).len(), 1, "conservative: {case}");
+    }
+    for (case, src) in [
+        (
+            "bound",
+            "fn f() { let p = f.join(\"record.json\"); write_json(&p, &r)?; }\n",
+        ),
+        (
+            "built",
+            "fn f() { write_json(&f.join(format!(\"{}.json\", \"record\")), &r)?; }\n",
+        ),
+        (
+            "braces",
+            "fn f() { std::fs::write({ f.join(\"record.json\") }, b)?; }\n",
+        ),
+        (
+            "if",
+            "fn f() { std::fs::write(if c { f.join(\"record.json\") } else { f.join(\"view.json\") }, b)?; }\n",
+        ),
+    ] {
+        assert_eq!(member_writes(src).len(), 0, "blind spot: {case}");
+    }
+}
+
+// PM call 13: an allowlist entry explains only its own file and statement, must give a reason, and must still match.
+#[test]
+fn the_allowlist_explains_only_its_own_reviewed_statements() {
+    let found = vec![
+        ("src/a.rs".to_string(), "x".to_string()),
+        ("src/b.rs".to_string(), "y".to_string()),
+    ];
+    let (unexplained, bad) = reconcile(&found, &[("src/a.rs", "x", "a read-only open")]);
+    assert_eq!(
+        (unexplained.as_slice(), bad.len()),
+        (&["src/b.rs: y".to_string()][..], 0),
+        "only its own statement"
+    );
+    let (unexplained, _) = reconcile(&found, &[("src/b.rs", "x", "a read-only open")]);
+    assert_eq!(unexplained.len(), 2, "another file's statement");
+    let (_, bad) = reconcile(&found, &[("src/a.rs", "z", "stale")]);
+    assert_eq!(bad, ["src/a.rs: z"], "a stale entry");
+    let (_, bad) = reconcile(&found, &[("src/a.rs", "x", " ")]);
+    assert_eq!(bad, ["src/a.rs: x"], "no reason");
+}
+
+// PM call 14 (1to3re #4, #5): an exempt file's module is declared exactly once across src/: `#[cfg(test)] mod x;` at
+// its parent's file level, with no #[path], and no #[path] anywhere names the file. Comments and strings never count.
+#[test]
+fn each_exempt_file_is_declared_test_only() {
+    assert!(!declares("// #[cfg(test)]\nmod x;\n", "x"), "a comment");
+    assert!(
+        !declares("#[cfg(test)] mod x;\n#[cfg(not(test))] mod x;\n", "x"),
+        "two declarations (1to3re #4)"
+    );
+    let doc = "#[cfg(test)]\n#[doc = r##\"#[path=\"x.rs\"]\"##]\n#[path = \"other.rs\"]\nmod x;\n";
+    assert!(
+        !declares(doc, "x"),
+        "a path behind a doc string (1to3re #5)"
+    );
+    assert!(
+        !declares("#[cfg(test)] #[path = \"other.rs\"] mod x;\n", "x"),
+        "a path (1to3re #5)"
+    );
+    assert!(
+        !declares("mod outer { use a; #[cfg(test)] mod x; }\n", "x"),
+        "not at file level"
+    );
+    assert!(!declares("#[cfg(test)] mod amodx;\n", "x"), "a longer name");
+    assert!(
+        !declares("#[cfg(test)] mod x { }\n", "x"),
+        "an inline module"
+    );
+    assert!(!declares("mod x;\n", "x"), "ungated");
+    assert!(
+        declares("#[cfg(test)]\npub(crate) mod x;\n", "x"),
+        "a declaration"
+    );
+    assert!(
+        paths_to("#[path = \"x/hc_tests.rs\"] mod y;\n", "src/x/hc_tests.rs"),
+        "a path naming the file"
+    );
+    assert!(
+        !paths_to(
+            "const N: &str = r#\"#[path = \"hc_tests.rs\"]\"#;\n",
+            "src/x/hc_tests.rs"
+        ),
+        "a string"
+    );
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mut files = Vec::new();
+    rust_files(&root.join("src"), &mut files);
+    for (file, parent, name) in TEST_ONLY {
+        assert!(root.join(file).is_file(), "{file} is missing");
+        let src = std::fs::read_to_string(root.join(parent)).unwrap();
+        assert!(
+            declares(&src, name),
+            "{file}: {parent} does not declare `#[cfg(test)] mod {name};` once, unpathed"
+        );
+        for f in &files {
+            let text = std::fs::read_to_string(f).unwrap();
+            assert!(
+                !paths_to(&text, file),
+                "{file}: named by a #[path] in {}",
+                rel(root, f)
+            );
+        }
+    }
+}
+
+// PM call 21: what the exemption check does NOT detect, pinned so its doc and behaviour change together.
+#[test]
+fn the_exemption_check_misses_what_its_doc_says() {
+    let raw = "#[cfg(test)] mod x;\n#[cfg(not(test))] mod r#x;\n";
+    assert!(declares(raw, "x"), "blind spot: a raw identifier in mod");
+    let spaced = "#[cfg(not(test))] # [ path = \"x.rs\"] mod live;\n";
+    assert!(
+        !paths_to(spaced, "src/x.rs"),
+        "blind spot: a spaced # [ path ]"
+    );
+    // Only the parent is read for declarations: src/main.rs's inline `mod a { pub mod x; }` loads src/a/x.rs.
+    let (parent, elsewhere) = ("#[cfg(test)] mod x;\n", "mod a { pub mod x; }\n");
+    assert!(
+        declares(parent, "x") && !paths_to(elsewhere, "src/a/x.rs"),
+        "blind spot: an inline mod elsewhere"
+    );
+}
+
+// W2: no test file is scanned as production by accident, and none is exempt by its name alone.
+#[test]
+fn every_test_file_is_exempt_by_name() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mut files = Vec::new();
+    rust_files(&root.join("src"), &mut files);
+    let missing: Vec<String> = files
+        .iter()
+        .map(|f| rel(root, f))
+        .filter(|n| n.ends_with("_tests.rs") || n.ends_with("/tests.rs"))
+        .filter(|n| !TEST_ONLY.iter().any(|(f, _, _)| f == n))
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "test files missing from TEST_ONLY: {missing:?}"
+    );
+}
+
+/// state-0 S3, a regression lint (PM calls 13, 21), not a proof: only team_state writes member files because the
+/// shared writers (`Tx::record_write`, `gens::publish_once`, `team_state::view_held`) are the only writers, checked in
+/// review. Outside `src/agents/team_state.rs` and the `TEST_ONLY` files, every statement that names a member file
+/// (`MEMBER_FILES`, in the text: comments and `#[cfg(test)]` items blank) and holds a writer token (`WRITER_TOKENS`,
+/// in the code: comments and literals blank) is a finding, writing or not; one that writes nothing is resolved only
+/// by a reviewed `MEMBER_WRITES_ALLOWED` entry (file, statement, reason). It does NOT see (pinned by
+/// `the_guard_is_conservative_and_misses_what_its_doc_says` and `the_exemption_check_misses_what_its_doc_says`): a
+/// path bound in another statement; a built file name; a path inside braces or an `if`; `mod r#x`; a spaced
+/// `# [ path ]`; a declaration in another file's inline `mod a { .. }`.
+#[test]
+fn only_team_state_writes_member_records() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mut files = Vec::new();
+    rust_files(&root.join("src"), &mut files);
+    files.sort();
+    let mut found = Vec::new();
+    for file in files {
+        let name = rel(root, &file);
+        if name == TEAM_STATE || TEST_ONLY.iter().any(|(f, _, _)| *f == name) {
+            continue;
+        }
+        for s in member_writes(&std::fs::read_to_string(&file).unwrap()) {
+            found.push((name.clone(), s));
+        }
+    }
+    let (unexplained, bad) = reconcile(&found, MEMBER_WRITES_ALLOWED);
+    assert!(
+        unexplained.is_empty(),
+        "a member file written outside team_state.rs: {unexplained:#?}"
+    );
+    assert!(
+        bad.is_empty(),
+        "MEMBER_WRITES_ALLOWED entries that are stale or give no reason: {bad:#?}"
+    );
+    // The scanner sees team_state.rs write each file, or the scan above proves nothing.
+    let own = member_writes(&std::fs::read_to_string(root.join(TEAM_STATE)).unwrap()).join("\n");
+    for file in MEMBER_FILES {
+        assert!(own.contains(file), "team_state.rs writes {file}: {own}");
+    }
+}
+
+const TEAM_STATE: &str = "src/agents/team_state.rs";
+const MEMBER_FILES: &[&str] = &["\"record.json\"", "\"desired.json\"", "\"view.json\""];
+/// PM call 13: a statement whose code holds any of these is a writer. The code is masked, so whitespace and comments
+/// inside a path (`std :: fs /* c */ :: write`) never hide one.
+const WRITER_TOKENS: &[&str] = &[
+    "write",
+    "create",
+    "rename",
+    "publish",
+    "claim",
+    "OpenOptions",
+];
+/// PM call 13: reviewed false findings, (file, the statement as `member_writes` prints it, why it writes nothing).
+/// Starts empty; an entry is added only with its reason, in review.
+const MEMBER_WRITES_ALLOWED: &[(&str, &str, &str)] = &[];
+
+/// The statements of `src` that name a member file and hold a writer token (PM call 13). The token is read from the
+/// code (`mask`: comments and literals blank, test items kept, so their `;` still ends them); the file name from the
+/// text (comments and every `#[cfg(test)]` item blank, literals kept). Both keep every byte position, and every
+/// boundary is an ASCII `;`, `{` or `}`, so one slice of each is the same statement.
+fn member_writes(src: &str) -> Vec<String> {
+    let code = mask(src);
+    let mut text = blanked(src, false).into_bytes();
+    let spans = test_spans(code.as_bytes());
+    blank_spans(&mut text, &spans);
+    let text = String::from_utf8(text).expect("whole characters became spaces");
+    let mut found = Vec::new();
+    let mut start = 0;
+    for (k, c) in code.bytes().chain(std::iter::once(b';')).enumerate() {
+        if !matches!(c, b';' | b'{' | b'}') {
+            continue;
+        }
+        let end = k.min(code.len());
+        let (stmt, live) = (&code[start..end], &text[start..end]);
+        if WRITER_TOKENS.iter().any(|w| stmt.contains(w))
+            && MEMBER_FILES.iter().any(|f| live.contains(f))
+        {
+            found.push(live.split_whitespace().collect::<Vec<_>>().join(" "));
+        }
+        start = end + 1;
+    }
+    found
+}
+
+/// The findings (file, statement) no `allowed` entry explains, and the `allowed` entries that are stale (explain no
+/// finding) or give no reason.
+fn reconcile(
+    found: &[(String, String)],
+    allowed: &[(&str, &str, &str)],
+) -> (Vec<String>, Vec<String>) {
+    let unexplained = found
+        .iter()
+        .filter(|(f, s)| !allowed.iter().any(|(af, a, _)| f == af && s == a))
+        .map(|(f, s)| format!("{f}: {s}"))
+        .collect();
+    let bad = allowed
+        .iter()
+        .filter(|(af, a, why)| {
+            why.trim().is_empty() || !found.iter().any(|(f, s)| f == af && s == a)
+        })
+        .map(|(af, a, _)| format!("{af}: {a}"))
+        .collect();
+    (unexplained, bad)
+}
+
+/// `file` under `root`, with `/` separators.
+fn rel(root: &Path, file: &Path) -> String {
+    file.strip_prefix(root)
+        .unwrap()
+        .to_string_lossy()
+        .replace(std::path::MAIN_SEPARATOR, "/")
+}
+
+/// PM call 14: `parent` declares module `name` exactly once at file level, and that once is `#[cfg(test)] mod <name>;`
+/// with no `#[path]`. Read from the code (comments and literals blank): a comment or a string never declares.
+fn declares(parent: &str, name: &str) -> bool {
+    let code = mask(parent);
+    let squeeze = |s: &str| s.chars().filter(|c| !c.is_whitespace()).collect::<String>();
+    let target = format!("mod{name}");
+    let (mut depth, mut start, mut items) = (0i32, 0usize, Vec::new());
+    for (k, c) in code.bytes().enumerate() {
+        match c {
+            b'{' => {
+                if depth == 0 {
+                    items.push(squeeze(&code[start..k]) + "{");
+                }
+                depth += 1;
+            }
+            b'}' => {
+                depth -= 1;
+                if depth == 0 {
+                    start = k + 1;
+                }
+            }
+            b';' if depth == 0 => {
+                items.push(squeeze(&code[start..=k]));
+                start = k + 1;
+            }
+            _ => {}
+        }
+    }
+    let named: Vec<&String> = items
+        .iter()
+        .filter(|i| {
+            let body = i
+                .strip_suffix(';')
+                .or_else(|| i.strip_suffix('{'))
+                .unwrap_or(i);
+            let head = body.strip_suffix(&target);
+            head.is_some_and(|h| {
+                h.is_empty() || h.ends_with(']') || h.ends_with(')') || h.ends_with("pub")
+            })
+        })
+        .collect();
+    named.len() == 1
+        && named[0].ends_with(';')
+        && named[0].contains("#[cfg(test)]")
+        && !named[0].contains("#[path")
+}
+
+/// True when `src`'s code (comments and literals blank) holds a `#[path]` attribute whose literal names `file`.
+fn paths_to(src: &str, file: &str) -> bool {
+    let (code, text) = (mask(src), blanked(src, false));
+    let base = file.rsplit('/').next().unwrap_or(file);
+    code.match_indices("#[path").any(|(at, _)| {
+        let end = code[at..].find(']').map_or(code.len(), |e| at + e);
+        text[at..end]
+            .split('"')
+            .nth(1)
+            .is_some_and(|lit| lit.rsplit('/').next() == Some(base))
+    })
+}
+
+/// Files compiled only into tests (W2, PM call 14): (file, its parent, its module name). None is declared with
+/// `#[path]`: the twelve that were beside their parent live in the parent's own folder.
+const TEST_ONLY: &[(&str, &str, &str)] = &[
+    (
+        "src/agents/board/hc_tests.rs",
+        "src/agents/board.rs",
+        "hc_tests",
+    ),
+    (
+        "src/agents/core_fixture.rs",
+        "src/agents/mod.rs",
+        "core_fixture",
+    ),
+    (
+        "src/agents/gens/publish_tests.rs",
+        "src/agents/gens.rs",
+        "publish_tests",
+    ),
+    (
+        "src/agents/gens/ready_tests.rs",
+        "src/agents/gens.rs",
+        "ready_tests",
+    ),
+    (
+        "src/agents/gens/held_tests.rs",
+        "src/agents/gens.rs",
+        "held_tests",
+    ),
+    (
+        "src/agents/outcome/tests.rs",
+        "src/agents/outcome.rs",
+        "tests",
+    ),
+    (
+        "src/agents/life_fixture.rs",
+        "src/agents/mod.rs",
+        "life_fixture",
+    ),
+    (
+        "src/agents/member_target/tests.rs",
+        "src/agents/member_target.rs",
+        "tests",
+    ),
+    (
+        "src/agents/membership/tests.rs",
+        "src/agents/membership.rs",
+        "tests",
+    ),
+    (
+        "src/agents/registry/hc_tests.rs",
+        "src/agents/registry.rs",
+        "hc_tests",
+    ),
+    (
+        "src/agents/resume/tests.rs",
+        "src/agents/resume.rs",
+        "tests",
+    ),
+    (
+        "src/agents/session_report_tests.rs",
+        "src/agents/mod.rs",
+        "session_report_tests",
+    ),
+    (
+        "src/agents/spawn/hc_tests.rs",
+        "src/agents/spawn.rs",
+        "hc_tests",
+    ),
+    (
+        "src/agents/stop_hc_tests.rs",
+        "src/agents/mod.rs",
+        "stop_hc_tests",
+    ),
+    (
+        "src/agents/team_mail/tests.rs",
+        "src/agents/team_mail.rs",
+        "tests",
+    ),
+    (
+        "src/agents/team_state/record_write_tests.rs",
+        "src/agents/team_state.rs",
+        "record_write_tests",
+    ),
+    (
+        "src/agents/team_state/view_tests.rs",
+        "src/agents/team_state.rs",
+        "view_tests",
+    ),
+    ("src/agents/tree/tests.rs", "src/agents/tree.rs", "tests"),
+    ("src/agents/up/tests.rs", "src/agents/up/mod.rs", "tests"),
+    (
+        "src/agents/view_hc_tests.rs",
+        "src/agents/mod.rs",
+        "view_hc_tests",
+    ),
+    (
+        "src/agents/view_hc_tests/restore_tests.rs",
+        "src/agents/view_hc_tests.rs",
+        "restore_tests",
+    ),
+    ("src/caller_hc_tests.rs", "src/lib.rs", "caller_hc_tests"),
+    ("src/sidebar/hc_tests.rs", "src/sidebar.rs", "hc_tests"),
+    ("src/testing.rs", "src/lib.rs", "testing"),
+];
 
 #[test]
 fn windows_live_rmux_commands_share_the_private_environment() {

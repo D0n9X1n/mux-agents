@@ -9538,5 +9538,4 @@ mod tests {
 }
 
 #[cfg(test)]
-#[path = "sidebar_hc_tests.rs"]
 mod hc_tests;

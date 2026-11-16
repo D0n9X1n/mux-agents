@@ -3762,7 +3762,6 @@ mod tests {
 }
 
 #[cfg(test)]
-#[path = "spawn_hc_tests.rs"]
 mod hc_tests;
 pub struct CoreRequest<'a> {
     pub client: Client,
