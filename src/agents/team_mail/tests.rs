@@ -1782,6 +1782,19 @@ fn a_lifecycle_senders_parent_follows_the_route() {
     assert!(pre.is_none(), "pre-lifecycle: main's pick");
 }
 
+// Integration #150: a lifecycle worker a person spawned from a pane has no logical parent and is no root; its
+// `parent` is main's pick (`parentPane`), as `Route::Legacy` says. Only the `up` leader is refused
+// (a_lifecycle_senders_parent_follows_the_route); live send_delivers_to_mailbox relies on this.
+#[test]
+fn a_person_spawned_lifecycle_sender_keeps_mains_parent_pick() {
+    use crate::agents::{adopt_fixture as ax, cascade_fixture as cx, life_fixture as lf};
+    let (w, s) = lf::world();
+    cx::member(&w, cx::A, None, 1, json!({}));
+    let tx = cx::tx(&w, &s);
+    let got = life_parent(&tx, cx::A, &ax::record(&w, cx::A)).map(|m| m.map(|m| m.id));
+    assert_eq!(got, Ok(None), "main's pick: its parentPane");
+}
+
 // adopt-3e call 5 (refinding R19, 10.9): B's real `send parent` while its parent E is Ended and not yet adopted
 // from reaches E's member mailbox (the route), never the pane's; main's roster omits E.
 #[test]

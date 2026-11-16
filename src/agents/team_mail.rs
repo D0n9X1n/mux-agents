@@ -332,7 +332,12 @@ pub(crate) fn life_parent(
             id,
             record,
         })),
-        super::adopt::Route::Legacy => refuse(2, "parent", NO_PARENT),
+        // Integration #150: `Route::Legacy` is main's `parentPane`. The `up` leader (a team's root) is refused; a
+        // worker a person spawned from a pane keeps main's pick (its parentPane), as before adopt-3e.
+        super::adopt::Route::Legacy if super::tree::is_leader(record) => {
+            refuse(2, "parent", NO_PARENT)
+        }
+        super::adopt::Route::Legacy => Ok(None),
     }
 }
 
