@@ -365,6 +365,53 @@ pub fn note(ctx: &Ctx, request: &Request) -> Res<Map<String, Value>> {
     Ok(reply)
 }
 
+pub const LIST_DEFAULT: usize = 20;
+pub const LIST_MAX: usize = 1000;
+
+/// Ambiguity 8: a listing row; the body only through `notes <id>`.
+fn row(e: &Value) -> Value {
+    let author = e.get("author").and_then(|a| a.get("name"));
+    json!({"id": e.get("id"), "author": author, "at": e.get("at"), "title": e.get("title")})
+}
+
+/// `notes [-Since <id>] [-Lines <n>]` newest first, or `notes <id>` in full (N3). Reads the certain prefix under
+/// the team lock (completing an uncertain marker first); moves no cursor.
+pub fn notes(ctx: &Ctx, request: &Request) -> Res<Map<String, Value>> {
+    let usage = || super::usage("notes");
+    let one = request.positional.first().map(String::as_str);
+    let since = request.value("Since");
+    let lines = match request.value("Lines") {
+        None => LIST_DEFAULT,
+        Some(v) => v
+            .parse::<usize>()
+            .ok()
+            .filter(|n| (1..=LIST_MAX).contains(n))
+            .ok_or_else(usage)?,
+    };
+    if (one.is_some() && (since.is_some() || request.value("Lines").is_some()))
+        || one.into_iter().chain(since).any(|i| !hex_id(i))
+    {
+        return Err(usage());
+    }
+    let all = with_author(ctx, |tx, _| entries(tx))?;
+    let at = |id: &str| all.iter().position(|e| super::text(e.get("id")) == id);
+    let unknown = || refusal(2, "target", "no note with that id");
+    let mut reply = Map::new();
+    if let Some(id) = one {
+        reply.insert("note".into(), all[at(id).ok_or_else(unknown)?].clone());
+        return Ok(reply);
+    }
+    let after = match since {
+        Some(id) => at(id).ok_or_else(unknown)? + 1,
+        None => 0,
+    };
+    let eligible = &all[after..];
+    let shown: Vec<Value> = eligible.iter().rev().take(lines).map(row).collect();
+    reply.insert("older".into(), (eligible.len() - shown.len()).into());
+    reply.insert("notes".into(), shown.into());
+    Ok(reply)
+}
+
 #[cfg(test)]
 #[path = "notebook_tests.rs"]
 mod tests;
@@ -380,3 +427,7 @@ mod rebuild_tests;
 #[cfg(test)]
 #[path = "notebook_verb_tests.rs"]
 mod verb_tests;
+
+#[cfg(test)]
+#[path = "notebook_notes_tests.rs"]
+mod notes_tests;
