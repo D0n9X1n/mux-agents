@@ -1840,20 +1840,11 @@ fn a_new_member_reports_ready_within_150_s() {
             native::private_root(&state);
             std::fs::write(state.join("test-client-barrier"), "").unwrap();
         }
+        // r2b call 35: one deadline from the launch boundary; the spawn and every wait up to ready.json spend it.
+        let deadline = native::Deadline::start(native::READY);
         let y = live.spawn("w1");
         let (id, sid) = (s(&y["id"]), s(&y["sessionId"]));
-        let client = client_of(&live, &sid);
-        assert!(
-            client["env"]["HC_TERMINAL_ID"]
-                .as_str()
-                .is_some_and(|v| !v.is_empty()),
-            "{client}"
-        );
-        assert!(
-            client["env"]["TMUX"].is_null() && client["env"]["RMUX"].is_null(),
-            "{client}"
-        );
-        let (c, r) = native::wait_150(
+        let (c, r) = deadline.wait(
             "client.json and ready.json",
             || {
                 Some((
@@ -1873,6 +1864,18 @@ fn a_new_member_reports_ready_within_150_s() {
             (&r["pid"], &r["start"]),
             (&c["pid"], &c["start"]),
             "barrier {barrier}"
+        );
+        // After ready.json: the client lookup waits on its own, outside the readiness deadline.
+        let client = client_of(&live, &sid);
+        assert!(
+            client["env"]["HC_TERMINAL_ID"]
+                .as_str()
+                .is_some_and(|v| !v.is_empty()),
+            "{client}"
+        );
+        assert!(
+            client["env"]["TMUX"].is_null() && client["env"]["RMUX"].is_null(),
+            "{client}"
         );
         if barrier {
             let marks: Vec<String> = std::fs::read_dir(&state)

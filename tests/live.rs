@@ -1142,25 +1142,15 @@ exec claude --dangerously-skip-permissions
             crate::native::private_root(&live.state()); // PM call 16
             std::fs::write(live.state().join("test-client-barrier"), "").unwrap();
         }
+        // r2b call 35: one deadline from the launch boundary; the spawn and every wait up to ready.json spend it.
+        let deadline = crate::native::Deadline::start(crate::native::READY);
         let w1 = live.spawn("w1", &[]);
         let (id, sid) = (s(&w1["id"]).to_string(), s(&w1["sessionId"]).to_string());
-        let client = live.server.client_by_session(&sid);
-        let env = &client["env"];
-        assert!(
-            env["HC_TERMINAL_ID"]
-                .as_str()
-                .is_some_and(|v| !v.is_empty()),
-            "{mux:?}: {client}"
-        );
-        assert!(
-            env["TMUX"].is_null() && env["RMUX"].is_null(),
-            "{mux:?}: the member sees no multiplexer: {client}"
-        );
         let read = |f: &str| {
             let text = std::fs::read_to_string(live.gen_file(&id, f)).ok()?;
             serde_json::from_str::<Value>(&text).ok()
         };
-        let (c, r) = crate::native::wait_150(
+        let (c, r) = deadline.wait(
             "client.json and ready.json",
             || Some((read("client.json")?, read("ready.json")?)),
             || {
@@ -1175,6 +1165,19 @@ exec claude --dangerously-skip-permissions
             (&r["pid"], &r["start"]),
             (&c["pid"], &c["start"]),
             "{mux:?}"
+        );
+        // After ready.json: the client lookup waits on its own, outside the readiness deadline.
+        let client = live.server.client_by_session(&sid);
+        let env = &client["env"];
+        assert!(
+            env["HC_TERMINAL_ID"]
+                .as_str()
+                .is_some_and(|v| !v.is_empty()),
+            "{mux:?}: {client}"
+        );
+        assert!(
+            env["TMUX"].is_null() && env["RMUX"].is_null(),
+            "{mux:?}: the member sees no multiplexer: {client}"
         );
         if barrier {
             assert_eq!(
