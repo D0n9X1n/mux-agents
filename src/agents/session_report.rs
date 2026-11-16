@@ -32,6 +32,11 @@ pub fn run(ctx: &Ctx, request: &Request) -> Res<Map<String, Value>> {
         Err(refusal) => refusal.check.into(),
     };
     reply.insert("seq".into(), seq);
+    if stops("registry") {
+        reply.insert("handshake".into(), Value::Null);
+        reply.insert("ready".into(), Value::Null);
+        return Ok(reply);
+    }
     let (handshake, ready) = match labels(ctx) {
         Labels::None => ("none".into(), Value::Null),
         Labels::Unreadable => ("evidence".into(), Value::Null),
@@ -88,6 +93,16 @@ pub(crate) fn read_capped(terminal: bool, input: impl std::io::Read) -> Option<V
     let mut bytes = Vec::new();
     input.take(MAX + 1).read_to_end(&mut bytes).ok()?;
     (bytes.len() as u64 <= MAX).then_some(bytes)
+}
+
+/// Task 6's stop seam: in tests, ends the verb right after a step, as a kill there would (ambiguity 18).
+#[cfg(not(test))]
+fn stops(_: &str) -> bool {
+    false
+}
+#[cfg(test)]
+fn stops(step: &str) -> bool {
+    hooks::stops(step)
 }
 
 /// What `-Stdin` reads: its bytes, and whether they come from a terminal. `std::io::IsTerminal` is sealed, so a test
@@ -200,6 +215,7 @@ fn exchange(
 ) -> (Value, Value) {
     match handshake(ctx, key, id, n, session, client) {
         Ok(Step::Stop(word)) => (word.into(), Value::Null),
+        Ok(Step::Reported) if stops("report") => ("reported".into(), Value::Null),
         Ok(Step::Reported) => {
             let ready =
                 settle(ctx, key, id, n).map_or_else(|r| Value::from(r.check), |r| r.word().into());
@@ -296,6 +312,17 @@ pub(crate) mod hooks {
         fn is_terminal(&self) -> bool {
             self.terminal
         }
+    }
+
+    thread_local! {
+        static STOP: RefCell<Option<&'static str>> = const { RefCell::new(None) };
+    }
+    /// Ends the verb right after `step` (`registry` or `report`), as a kill there would.
+    pub fn stop_after(step: Option<&'static str>) {
+        STOP.with(|s| *s.borrow_mut() = step);
+    }
+    pub(super) fn stops(step: &str) -> bool {
+        STOP.with(|s| *s.borrow() == Some(step))
     }
 
     pub(super) fn reader() -> Seam {

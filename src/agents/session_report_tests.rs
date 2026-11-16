@@ -914,3 +914,86 @@ fn a_gen_lock_timeout_answers_lock_and_publishes_nothing() {
         "the registry entry is still written"
     );
 }
+
+#[test]
+fn killed_after_the_registry_write_leaves_no_report_and_nothing_is_replayed() {
+    let w = hc_world();
+    pending(&w);
+    hooks::stop_after(Some("registry"));
+    let (code, reply) = report_gen(&w, "1");
+    hooks::stop_after(None);
+    assert_eq!(
+        (code, &reply["seq"], &reply["handshake"]),
+        (0, &json!(1), &Value::Null),
+        "{reply}"
+    );
+    assert!(!exists(&w, "report"));
+    client_json(&w);
+    assert_eq!(
+        gens::promote_ready(&w.ctx, KEY, ID, 1).unwrap(),
+        gens::Ready::Undecided,
+        "no report.json"
+    );
+    assert!(
+        !exists(&w, "ready"),
+        "the deadline decides (outcome-2), nothing is replayed"
+    );
+}
+
+#[test]
+fn killed_after_report_json_a_later_promote_ready_promotes() {
+    let w = hc_world();
+    pending(&w);
+    hooks::stop_after(Some("report"));
+    let (_, reply) = report_gen(&w, "1");
+    hooks::stop_after(None);
+    assert_eq!(
+        (&reply["handshake"], &reply["ready"]),
+        (&json!("reported"), &Value::Null),
+        "{reply}"
+    );
+    assert!(w.fakes.slept().is_empty(), "stopped before the poll");
+    assert!(exists(&w, "report") && !exists(&w, "ready"));
+    client_json(&w);
+    assert_eq!(
+        gens::promote_ready(&w.ctx, KEY, ID, 1).unwrap(),
+        gens::Ready::Ok
+    );
+    assert!(exists(&w, "ready"));
+}
+
+// After ready.json the verdict is ok; a second run (the hook again, or a replayed one) writes nothing.
+#[test]
+fn after_ready_json_nothing_more_is_written() {
+    let w = hc_world();
+    pending(&w);
+    client_json(&w);
+    assert_eq!(report_gen(&w, "1").1["ready"], "ok");
+    let (report, ready) = (
+        std::fs::read(gen_file(&w, "report")).unwrap(),
+        std::fs::read(gen_file(&w, "ready")).unwrap(),
+    );
+    // (fix 1, audit 5-9 #2) A later time: a second write of report.json would change its bytes.
+    w.fakes.advance(Duration::from_secs(1));
+    let slept = w.fakes.slept().len();
+    let (_, reply) = report_gen(&w, "1");
+    assert_eq!(
+        (&reply["handshake"], &reply["ready"]),
+        (&json!("reported"), &json!("ok"))
+    );
+    assert_eq!(
+        std::fs::read(gen_file(&w, "report")).unwrap(),
+        report,
+        "report.json once"
+    );
+    assert_eq!(
+        std::fs::read(gen_file(&w, "ready")).unwrap(),
+        ready,
+        "ready.json once"
+    );
+    assert_eq!(
+        w.fakes.slept().len(),
+        slept,
+        "client.json is there: no sleep"
+    );
+}
