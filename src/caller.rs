@@ -47,6 +47,13 @@ pub struct Caller {
     pub presentation: Option<(String, String)>,
 }
 
+/// reentry-6a E0: a team's anchor, the server key and session its state stays at.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Anchor {
+    pub key: String,
+    pub session: String,
+}
+
 const PROBE: &str = "#{pid}|#{pane_pid}|#{session_id}|#{window_id}|#{@agent-id}";
 // Rows above the caller the walk may read before it gives up on reaching the pane.
 const MAX_PARENTS: usize = 64;

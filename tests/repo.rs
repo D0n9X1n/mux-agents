@@ -946,6 +946,11 @@ const TEST_ONLY: &[(&str, &str, &str)] = &[
     ("src/agents/tree/tests.rs", "src/agents/tree.rs", "tests"),
     ("src/agents/up/tests.rs", "src/agents/up/mod.rs", "tests"),
     (
+        "src/agents/up/index/tests.rs",
+        "src/agents/up/index.rs",
+        "tests",
+    ),
+    (
         "src/agents/kept_tests.rs",
         "src/agents/mod.rs",
         "kept_tests",

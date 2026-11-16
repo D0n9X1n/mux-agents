@@ -2,6 +2,7 @@
 
 pub mod discover;
 pub mod identity;
+pub mod index;
 pub mod server;
 #[cfg(test)]
 mod tests;
