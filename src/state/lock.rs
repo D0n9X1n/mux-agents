@@ -203,6 +203,8 @@ fn hold_lock<T>(
         match file.try_lock() {
             Ok(()) => break,
             Err(TryLockError::WouldBlock) if waited < wait => {
+                #[cfg(test)]
+                hooks::fire_when_held();
                 ctx.clock.sleep(BACK_OFF);
                 let now = ctx.clock.now();
                 waited += now.duration_since(last).unwrap_or_default().max(BACK_OFF);
@@ -433,8 +435,24 @@ pub(crate) fn with_lock_timeout<T>(
     let mutex = Handle(mutex);
     // Below INFINITE (u32::MAX), so a long wait never becomes endless.
     let ms = wait.as_millis().min(u128::from(u32::MAX - 1)) as u32;
+    // Tests only: one zero-wait attempt first, so a held mutex is seen from inside the wait (`hooks::when_held`).
+    #[cfg(test)]
     // SAFETY: a live mutex handle.
-    match unsafe { WaitForSingleObject(mutex.0, ms) } {
+    let first = match unsafe { WaitForSingleObject(mutex.0, 0) } {
+        WAIT_TIMEOUT => {
+            hooks::fire_when_held();
+            WAIT_TIMEOUT
+        }
+        other => other,
+    };
+    #[cfg(not(test))]
+    let first = WAIT_TIMEOUT;
+    let got = match first {
+        // SAFETY: a live mutex handle.
+        WAIT_TIMEOUT => unsafe { WaitForSingleObject(mutex.0, ms) },
+        other => other,
+    };
+    match got {
         WAIT_OBJECT_0 | WAIT_ABANDONED => {}
         WAIT_TIMEOUT => return timed_out(),
         _ => return Err(std::io::Error::last_os_error().into()),
@@ -443,6 +461,27 @@ pub(crate) fn with_lock_timeout<T>(
     let _held = Held(&mutex);
     test_panic(ctx);
     f()
+}
+
+/// Test seam (report-2b build checklist item 7): `when_held` runs on this thread each time a lock attempt finds the
+/// lock held by someone else, from inside the wait, so a race test proves contention rather than inferring it.
+#[cfg(test)]
+pub(crate) mod hooks {
+    use std::cell::RefCell;
+    type Hook = Box<dyn Fn()>;
+    thread_local! {
+        static HELD: RefCell<Option<Hook>> = const { RefCell::new(None) };
+    }
+    pub fn when_held(hook: Option<Hook>) {
+        HELD.with(|h| *h.borrow_mut() = hook);
+    }
+    pub(super) fn fire_when_held() {
+        HELD.with(|h| {
+            if let Some(hook) = h.borrow().as_ref() {
+                hook()
+            }
+        });
+    }
 }
 
 #[cfg(test)]

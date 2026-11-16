@@ -3,6 +3,7 @@
 pub mod acl;
 pub mod evidence;
 pub mod fs;
+pub mod live;
 pub mod lock;
 #[cfg(unix)]
 pub mod private_unix;

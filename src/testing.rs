@@ -78,6 +78,10 @@ struct Log {
     gate: Option<std::sync::Arc<Gate>>,
     // Set by `real_locks`: `locked` takes the real per-user lock under this root, with the real clock.
     real_locks: Option<PathBuf>,
+    // `deny`: OpenProcess refused; `row` and `open` answer None, `table` lists the pid with no start.
+    denied: Vec<u32>,
+    // `unlist`: gone from `table`, while `row` and `open` still answer.
+    unlisted: Vec<u32>,
 }
 
 /// Locks two fakes on two threads contend for, as two processes contend for the real lock: a key held by one blocks
@@ -236,6 +240,18 @@ impl Fakes {
     /// The process `pid` is gone: no row, no open.
     pub fn forget(&self, pid: u32) {
         self.0.borrow_mut().rows.retain(|r| r.pid != pid);
+    }
+
+    /// Windows' `OpenProcess` refused (PM call 10): `row` and `open` answer None for `pid`, and `table` lists it, as
+    /// Toolhelp does, with its pid and ppid and no start.
+    pub fn deny(&self, pid: u32) {
+        self.0.borrow_mut().denied.push(pid);
+    }
+
+    /// The process table no longer lists `pid`, while `row` and `open` still answer for it: a just-exited Windows
+    /// process whose handle still opens (PM call 17).
+    pub fn unlist(&self, pid: u32) {
+        self.0.borrow_mut().unlisted.push(pid);
     }
 
     /// The first rule whose text appears in the space-joined argv answers; anything else exits 0 with no output.
@@ -483,6 +499,9 @@ impl Fakes {
 impl Os for Fakes {
     fn row(&self, pid: u32) -> Option<Row> {
         self.os_call(format!("row {pid}"));
+        if self.0.borrow().denied.contains(&pid) {
+            return None;
+        }
         self.listed(pid)
     }
 
@@ -491,11 +510,28 @@ impl Os for Fakes {
         if self.0.borrow().table_fails {
             return Err(std::io::Error::other("unreadable process table"));
         }
-        Ok(self.0.borrow().rows.clone())
+        let log = self.0.borrow();
+        Ok(log
+            .rows
+            .iter()
+            .filter(|r| !log.unlisted.contains(&r.pid))
+            .map(|r| match log.denied.contains(&r.pid) {
+                true => Row {
+                    start: None,
+                    path: None,
+                    argv: None,
+                    ..r.clone()
+                },
+                false => r.clone(),
+            })
+            .collect())
     }
 
     fn open(&self, pid: u32) -> Option<Opened> {
         self.os_call(format!("open {pid}"));
+        if self.0.borrow().denied.contains(&pid) {
+            return None;
+        }
         let queued = self
             .0
             .borrow_mut()
@@ -688,20 +724,8 @@ pub fn link_dir(target: &Path, link: &Path) {
     #[cfg(unix)]
     let made = std::os::unix::fs::symlink(target, link).map_err(|e| e.to_string());
     #[cfg(windows)]
-    let made = std::os::windows::fs::symlink_dir(target, link).or_else(|e| {
-        // Through spawn.rs, the one place a child process starts (tests/repo.rs).
-        let shell = std::env::var_os("ComSpec").unwrap_or_else(|| "cmd".into());
-        let (l, t) = (link.to_str().unwrap(), target.to_str().unwrap());
-        match crate::spawn::captured(
-            Path::new(&shell),
-            &["/C", "mklink", "/J", l, t],
-            Duration::from_secs(10),
-        ) {
-            Ok(o) if o.code == 0 => Ok(()),
-            Ok(o) => Err(format!("{e}; mklink /J: {}{}", o.stdout, o.stderr)),
-            Err(j) => Err(format!("{e}; mklink /J: {j}")),
-        }
-    });
+    let made = std::os::windows::fs::symlink_dir(target, link)
+        .or_else(|e| mklink_junction(target, link).map_err(|j| format!("{e}; mklink /J: {j}")));
     if let Err(e) = made {
         panic!(
             "cannot link {} to {}: {e}",
@@ -714,6 +738,106 @@ pub fn link_dir(target: &Path, link: &Path) {
         "not a link: {}",
         link.display()
     );
+}
+
+/// `mklink /J link target`, through spawn.rs, the one place a child process starts (tests/repo.rs).
+#[cfg(windows)]
+fn mklink_junction(target: &Path, link: &Path) -> Result<(), String> {
+    let shell = std::env::var_os("ComSpec").unwrap_or_else(|| "cmd".into());
+    let (l, t) = (link.to_str().unwrap(), target.to_str().unwrap());
+    match crate::spawn::captured(
+        Path::new(&shell),
+        &["/C", "mklink", "/J", l, t],
+        Duration::from_secs(10),
+    ) {
+        Ok(o) if o.code == 0 => Ok(()),
+        Ok(o) => Err(format!("{}{}", o.stdout, o.stderr)),
+        Err(j) => Err(j.to_string()),
+    }
+}
+
+/// A directory junction at `link` (Windows), the link a user without symlink rights makes.
+#[cfg(windows)]
+pub fn junction(target: &Path, link: &Path) {
+    if let Err(e) = mklink_junction(target, link) {
+        panic!("cannot make the junction {}: {e}", link.display());
+    }
+}
+
+/// A wrong file type planted where a reader or writer expects a regular file or a real folder (PM call 13).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Wrong {
+    Folder,
+    /// A directory link (`link_dir`) to a folder beside it, `<name>.target`.
+    Link,
+    /// The same with its target removed.
+    Dangling,
+    #[cfg(windows)]
+    Junction,
+    #[cfg(unix)]
+    Fifo,
+}
+
+impl Wrong {
+    pub fn all() -> Vec<Wrong> {
+        let mut all = vec![Wrong::Folder, Wrong::Link, Wrong::Dangling];
+        #[cfg(windows)]
+        all.push(Wrong::Junction);
+        #[cfg(unix)]
+        all.push(Wrong::Fifo);
+        all
+    }
+}
+
+/// `kind` at `at` (its parent exists). A link's target is `at.with_extension("target")`, left empty.
+pub fn plant(kind: Wrong, at: &Path) {
+    let aside = at.with_extension("target");
+    match kind {
+        Wrong::Folder => std::fs::create_dir(at).unwrap(),
+        Wrong::Link | Wrong::Dangling => {
+            std::fs::create_dir(&aside).unwrap();
+            link_dir(&aside, at);
+            if kind == Wrong::Dangling {
+                std::fs::remove_dir(&aside).unwrap();
+            }
+        }
+        #[cfg(windows)]
+        Wrong::Junction => {
+            std::fs::create_dir(&aside).unwrap();
+            junction(&aside, at);
+        }
+        #[cfg(unix)]
+        Wrong::Fifo => {
+            let c = std::ffi::CString::new(at.to_str().unwrap()).unwrap();
+            // SAFETY: a valid C path.
+            assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+        }
+    }
+}
+
+/// Whether nothing was written through a planted link: its target is missing or empty.
+pub fn untouched(at: &Path) -> bool {
+    std::fs::read_dir(at.with_extension("target")).map_or(true, |mut d| d.next().is_none())
+}
+
+/// PM call 16: every folder from `root` down to `dir`, made one at a time, mode 0700 on Unix, as
+/// `private_unix::private_dirs` requires of an existing state root. Fixtures make state roots only through this.
+pub fn private_tree(root: &Path, dir: &Path) {
+    let rest = dir.strip_prefix(root).expect("dir is under root");
+    let make = |p: &Path| {
+        if !p.exists() {
+            std::fs::create_dir(p).unwrap();
+            #[cfg(unix)]
+            std::fs::set_permissions(p, std::os::unix::fs::PermissionsExt::from_mode(0o700))
+                .unwrap();
+        }
+    };
+    let mut at = root.to_path_buf();
+    make(&at);
+    for part in rest.components() {
+        at.push(part);
+        make(&at);
+    }
 }
 
 /// Runs `spawn` until it is not refused with "text file busy" (ETXTBSY), at most `tries` times, 20 ms apart. A
