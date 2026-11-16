@@ -216,8 +216,17 @@ pub fn spawn(ctx: &Ctx, request: &Request) -> Res<Map<String, Value>> {
                 None if caller.candidate.is_some() => return Err(super::tree::tagged()),
                 None => None,
             };
-            let snapshot = super::membership::Snapshot::for_spawn(ctx, &caller, core)?;
-            registry::reap_hc(ctx, &caller, &snapshot)?;
+            let mut snapshot = super::membership::Snapshot::for_spawn(ctx, &caller, core)?;
+            // Call 45: a member hc shows Ended whose end its record did not yet hold reads Unknown here; once reap
+            // records that end, admission would read Ended, so take it again. A pre-lifecycle notice changes nothing.
+            let unrecorded = snapshot.facts.local.iter().any(|o| {
+                o.life != super::lifecycle::Life::Ended
+                    && super::lifecycle::classify(o.terminal.as_ref(), &o.identity.launcher)
+                        == super::lifecycle::Life::Ended
+            });
+            if registry::reap_hc(ctx, &caller, &snapshot)? && unrecorded {
+                snapshot = super::membership::Snapshot::for_spawn(ctx, &caller, core)?;
+            }
             // The brief rule as far as the request decides it: after the caller's standing (the gate), before the
             // name. allocate checks it again; only a Copilot fork whose copy fails verification turns brief there.
             // Neither refusal spends a token: the launch takes it as its last step before `hc run` (#103 D5).
@@ -1751,6 +1760,56 @@ mod tests {
             reply(&run(&w, &["-Client", "claude", "-Task", "add subtract"]))["name"],
             "add-subtract"
         );
+    }
+
+    // Call 45: a committed lifecycle worker whose terminal hc shows finished, its end not yet recorded. The first
+    // snapshot reads it Unknown (hc Ended, no ended.json); `reap_hc` records the end, so spawn takes its admission
+    // snapshot again and reuses the name as an ended member's, with generation 1 left as it was.
+    #[test]
+    fn a_reaped_end_frees_the_name_spawn_admits() {
+        use crate::agents::{core_fixture as cf, fixture::ID, gens, life_fixture as lf};
+        let w = human();
+        let r = cf::member(
+            &w,
+            ID,
+            json!({"lifecycle": 1, "generation": "1", "hcName": lf::hc_name(1)}),
+        );
+        let f = w.folder(ID);
+        let launch = json!({"hcName": lf::hc_name(1), "launcherArgv": r["launcherArgv"],
+            "sessionId": r["sessionId"]});
+        crate::state::evidence::publish(&gens::path(&f, 1, "launch"), &launch).unwrap();
+        crate::state::evidence::publish(&gens::path(&f, 1, "commit"), &json!({"committed": true}))
+            .unwrap();
+        let mut t = cf::wire(&r);
+        (t["name"], t["state"], t["reason"], t["exit_code"]) = (
+            json!(lf::hc_name(1)),
+            json!("finished"),
+            json!("exited"),
+            json!(0),
+        );
+        public_snapshot(&w, &[], std::slice::from_ref(&t));
+        // The admission snapshot taken again after the reap.
+        cf::listing(&w, &super::super::membership::team(&w.caller()), &[]);
+        cf::get(&w, t["address"].as_str().unwrap(), t.clone());
+        public_launch(&w, "t1");
+        let args = [
+            "spawn", "-Client", "claude", "-Task", "Worker", "-Name", "worker",
+        ];
+        let got = spawn(&w.ctx, &w.request(&args)).map_err(|e| e.message);
+        assert!(gens::done(&f, 1).unwrap(), "the end is recorded");
+        let got = got.unwrap();
+        assert_eq!(got["name"], "worker");
+        assert_ne!(got["id"], json!(ID), "a new member");
+        w.fakes.hc_done().unwrap();
+        let old = crate::state::fs::read_json(&f.join("record.json"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            (&old["generation"], &old["hcName"]),
+            (&json!("1"), &json!(lf::hc_name(1))),
+            "generation 1 stands"
+        );
+        assert!(!gens::dir(&f, 2).exists(), "no generation mixed in");
     }
 
     #[test]
