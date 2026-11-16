@@ -537,7 +537,12 @@ fn activity(w: &World, id: &str, state: &str) {
 // `recover` under its section; the failed member alone at width 30 too.
 #[test]
 fn the_flat_bar_shows_recover_from_the_board_in_every_layout() {
-    for (case, width, sibling) in [("sections", 60, true), ("narrow", 30, false)] {
+    for (case, width, sibling) in [
+        ("sections", 60, true),
+        ("narrow", 30, false),
+        // o2 call 34: the pill outlasts the name.
+        ("narrowest", 16, false),
+    ] {
         let w = World::human("");
         let mut bad = life(&w, "aaaaaaaaaaaa", "fixer", &[exit_1()], false);
         bad.1["argv"] = bad.0["launcherArgv"].clone();
@@ -564,7 +569,8 @@ fn the_flat_bar_shows_recover_from_the_board_in_every_layout() {
         let text = crate::sidebar::flat_text(&got, width, 40);
         let line = text
             .iter()
-            .find(|l| l.contains("fixer"))
+            .skip(1)
+            .find(|l| l.contains("fi"))
             .cloned()
             .unwrap_or_default();
         assert!(line.contains("recover"), "{case}: {text:#?}");
@@ -574,5 +580,43 @@ fn the_flat_bar_shows_recover_from_the_board_in_every_layout() {
                 "{case}: no section heading: {text:#?}"
             );
         }
+    }
+}
+
+// o2 call 34: from the board through the flat bar: a Lost member that needs recovery at width 16, and a Running one
+// with 12 unread lines at width 20, each keep the `recover` pill (the name is cut, the badge yields, before it goes).
+#[test]
+fn the_flat_bar_keeps_recover_at_the_narrowest_widths() {
+    for (case, width, running, unread) in
+        [("lost", 16, false, 0), ("running, unread 12", 20, true, 12)]
+    {
+        let w = World::human("");
+        let caller = w.caller();
+        let mut bad = life(&w, "aaaaaaaaaaaa", "fixer", &[exit_1()], false);
+        if running {
+            bad.1["argv"] = bad.0["launcherArgv"].clone();
+            activity(&w, "aaaaaaaaaaaa", "working");
+        }
+        // Its row is keyed `fixer|<pane>`; with no view a lifecycle member's presented pane is empty.
+        for _ in 0..unread {
+            crate::agents::mail::add_mail(&w.ctx, &caller, "pane-1", "fixer", "", "x", None)
+                .unwrap();
+        }
+        script(&w, &[&bad]);
+        let got = board(&w.ctx, &caller, false, false).unwrap();
+        let fixer = row(&got, "fixer");
+        assert_eq!(
+            (&fixer["needsRecovery"], &fixer["unread"]),
+            (&json!(true), &json!(unread)),
+            "{case}: the board's row"
+        );
+        let text = crate::sidebar::flat_text(&got, width, 40);
+        let line = text
+            .iter()
+            .skip(1)
+            .find(|l| l.contains("recover"))
+            .cloned()
+            .unwrap_or_default();
+        assert!(line.contains("recover"), "{case}: {text:#?}");
     }
 }

@@ -488,6 +488,41 @@ fn agent_line(glyph: Span, name: Span, model: Row, badge: Row, right: Row, cols:
     cut_row(row, cols)
 }
 
+/// o2 call 34: `agent_line` for a recovery row, whose right side (`recover`) is mandatory. When it cannot keep the right
+/// side as `agent_line` does, the model goes, the name is cut, the unread badge yields, then the name goes; only a
+/// right side wider than the whole row is cut.
+fn kept_line(glyph: Span, name: Span, model: Row, badge: Row, right: Row, cols: usize) -> Row {
+    let (glyph_w, right_w) = (paint::width(&glyph.0), row_width(&right));
+    if glyph_w + 1 + row_width(&badge) + 2 + right_w + 4 <= cols {
+        return agent_line(glyph, name, model, badge, right, cols);
+    }
+    let line = |left: Row, right: Row| {
+        let pad = cols.saturating_sub(row_width(&left) + row_width(&right));
+        let mut row = left;
+        row.push(span(" ".repeat(pad), PLAIN));
+        row.extend(right);
+        row
+    };
+    for badge in [badge.clone(), Vec::new()] {
+        let used = glyph_w + 1 + row_width(&badge) + 2 + right_w;
+        if used < cols {
+            let mut left = vec![
+                glyph.clone(),
+                span(" ", PLAIN),
+                (paint::cut(&name.0, cols - used), name.1),
+            ];
+            left.extend(badge);
+            return line(left, right);
+        }
+    }
+    if glyph_w + 1 + right_w <= cols {
+        return line(vec![glyph], right);
+    }
+    let mut row = vec![glyph, span(" ", PLAIN)];
+    row.extend(right);
+    cut_row(row, cols)
+}
+
 /// The one-column margin every content row starts with.
 fn margin(mut row: Row) -> Row {
     row.insert(0, span(" ", PLAIN));
@@ -726,7 +761,13 @@ fn live_row(row: &Map<String, Value>, cols: usize, look: Look) -> Live {
     let side = recovery
         .clone()
         .unwrap_or_else(|| right(p.kind, p.kind.word(), &p.age, p.muted));
-    let line = agent_line(
+    // o2 call 34: a recovery row never drops its pill.
+    let fit: fn(Span, Span, Row, Row, Row, usize) -> Row = if recovery.is_some() {
+        kept_line
+    } else {
+        agent_line
+    };
+    let line = fit(
         p.glyph.clone(),
         p.name.clone(),
         p.model.clone(),
@@ -734,7 +775,7 @@ fn live_row(row: &Map<String, Value>, cols: usize, look: Look) -> Live {
         side,
         cols,
     );
-    let compact = agent_line(
+    let compact = fit(
         p.glyph,
         p.name,
         p.model,
@@ -828,7 +869,13 @@ fn parts(
             Some(word) => recovery_side(word, &age, &glyph, &Vec::new(), cols),
             None => right(kind, &word, &age, false),
         };
-        let line = agent_line(
+        // o2 call 34: a recovery row never drops its pill.
+        let fit: fn(Span, Span, Row, Row, Row, usize) -> Row = if recovery_word(row).is_some() {
+            kept_line
+        } else {
+            agent_line
+        };
+        let line = fit(
             glyph,
             span(own_glyphs(&clean(row.get("name"))), DIM),
             Vec::new(),
@@ -3034,26 +3081,82 @@ mod tests {
             ascii: false,
             dumb: false,
         };
-        let fixer = |state: &str, running: bool| {
+        let fixer = |state: &str, running: bool, unread: u64| {
             json!({"name": "fixer", "state": state, "life": state, "age": 60, "activity": "working",
-                "needsRecovery": true, "recoveryRunning": running})
+                "needsRecovery": true, "recoveryRunning": running, "unread": unread})
         };
         let rest = json!({"name": "rest", "state": "running", "life": "running", "age": 60, "activity": "idle"});
-        for (case, width, agents) in [
-            ("compact", 60, vec![fixer("running", true), rest.clone()]),
-            ("narrow running", 30, vec![fixer("running", true)]),
-            ("narrow lost", 30, vec![fixer("lost", true)]),
-            ("narrow lost, not running", 30, vec![fixer("lost", false)]),
+        let badge = "\u{2709} 12";
+        // (case, width, rows, the name or its cut shown, the badge shown)
+        for (case, width, agents, name, mail) in [
+            (
+                "compact",
+                60,
+                vec![fixer("running", true, 0), rest.clone()],
+                "fixer",
+                false,
+            ),
+            (
+                "narrow running",
+                30,
+                vec![fixer("running", true, 0)],
+                "fixer",
+                false,
+            ),
+            (
+                "narrow lost",
+                30,
+                vec![fixer("lost", true, 0)],
+                "fixer",
+                false,
+            ),
+            (
+                "narrow lost, not running",
+                30,
+                vec![fixer("lost", false, 0)],
+                "fixer",
+                false,
+            ),
+            // o2 call 34: the name is cut before the pill goes.
+            (
+                "narrowest running",
+                16,
+                vec![fixer("running", true, 0)],
+                "fix",
+                false,
+            ),
+            (
+                "narrowest lost",
+                16,
+                vec![fixer("lost", true, 0)],
+                "fix",
+                false,
+            ),
+            ("unread 12", 20, vec![fixer("running", true, 12)], "f", true),
+            // The badge yields too: at 14 the pill and a cut name fit only without it.
+            (
+                "unread 12, badge yields",
+                14,
+                vec![fixer("running", true, 12)],
+                "f",
+                false,
+            ),
         ] {
             let board = json!({"running": 1, "agents": agents});
             let laid = lay(board.as_object(), &[], Size { width, height: 40 }, look);
             let text: Vec<String> = laid.rows.iter().map(|r| render(r, false)).collect();
             let line = text
                 .iter()
-                .find(|l| l.contains("fixer"))
+                .skip(1)
+                .find(|l| l.contains("recover"))
                 .cloned()
                 .unwrap_or_default();
             assert!(line.contains("recover"), "{case}: {text:#?}");
+            assert!(
+                line.contains(name),
+                "{case}: the name, or its cut: {line:?}"
+            );
+            assert_eq!(line.contains(badge), mail, "{case}: the badge: {line:?}");
             if case == "compact" {
                 assert!(
                     text.iter().any(|l| l.contains("Working")),
