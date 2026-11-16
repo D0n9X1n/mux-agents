@@ -224,6 +224,11 @@ jobs:
       - name: CLI tests that need the fake client
         shell: bash
         run: cargo test --features live,test-panic --locked --test cli
+      - name: Fake client tests
+        shell: bash
+        run: |
+          cargo test --features live,test-panic --locked --test fake_client_bg
+          cargo test --features live,test-panic --locked --bin fake-client
       - name: Live tests
         env:
           MUX_AGENTS_LIVE_REQUIRE: tmux,tmux32,rmux
@@ -291,6 +296,11 @@ jobs:
       - name: CLI tests that need the fake client
         shell: bash
         run: cargo test --features live,test-panic --locked --test cli
+      - name: Fake client tests
+        shell: bash
+        run: |
+          cargo test --features live,test-panic --locked --test fake_client_bg
+          cargo test --features live,test-panic --locked --bin fake-client
       - name: Windows live tests
         shell: bash
         run: |

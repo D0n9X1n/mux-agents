@@ -906,12 +906,12 @@ fn integration_runs_cli_tests_with_fake_client() {
         (
             "integration",
             "- name: Live preflight",
-            "- name: Live tests",
+            "- name: Fake client tests",
         ),
         (
             "integration-windows",
             "- name: Clippy with the live tests",
-            "- name: Windows live tests",
+            "- name: Fake client tests",
         ),
     ] {
         let lines = job_lines(&ci, name);
@@ -925,6 +925,32 @@ fn integration_runs_cli_tests_with_fake_client() {
         let previous = lines[..at].iter().rfind(|line| line.starts_with("- name:"));
         assert_eq!(previous.map(String::as_str), Some(before), "{name}");
         assert_eq!(lines[at + 3], after, "{name}");
+    }
+}
+
+// outcome-2 Task 7: every live job runs the fake client's own tests right after the CLI tests, then its live tests.
+#[test]
+fn integration_runs_the_fake_client_tests() {
+    let ci = repo_file(CI);
+    for (name, after) in [
+        ("integration", "- name: Live tests"),
+        ("integration-windows", "- name: Windows live tests"),
+    ] {
+        let lines = job_lines(&ci, name);
+        let at = line_of(&lines, "- name: Fake client tests");
+        assert_eq!(
+            lines[at - 3],
+            "- name: CLI tests that need the fake client",
+            "{name}"
+        );
+        let run = [
+            "shell: bash",
+            "run: |",
+            "cargo test --features live,test-panic --locked --test fake_client_bg",
+            "cargo test --features live,test-panic --locked --bin fake-client",
+        ];
+        assert_eq!(&lines[at + 1..at + 5], run, "{name}");
+        assert_eq!(lines[at + 5], after, "{name}");
     }
 }
 

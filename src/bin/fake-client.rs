@@ -5,6 +5,8 @@
 //! - `MUX_IT_DIR` (required): where every file below goes. Without it the client exits 2 at once.
 //! - `MUX_IT_ENTRY`: the mux-agent binary command lines run (default `mux-agent` on PATH).
 //! - `MUX_IT_EXIT`: the exit code on quit (default 0).
+//! - `<MUX_IT_DIR>/resume-gone` (outcome-2 O5): `--resume <id>` prints the client's own "no such conversation" line
+//!   on stderr (by this file's stem: `claude` or `copilot`) and exits 1 before anything is recorded.
 //!
 //! Protocol, all under `$MUX_IT_DIR`; every file the client writes appears whole (written aside, then renamed):
 //! - On start: `client.<pid>.json` = `{"pid", "ppid", "exe", "argv", "sessionId", "worker", "cwd", "tty": {"stdin",
@@ -57,6 +59,15 @@ const ENV: [&str; 11] = [
     "MUX_AGENTS_GEN",
 ];
 
+/// O5 (verified 2026-11-14): what the real client prints for `--resume` of a conversation it does not have.
+fn gone_message(stem: &str, id: &str) -> String {
+    if stem == "copilot" {
+        format!("Error: No session, task, or name matched '{id}'.")
+    } else {
+        format!("No conversation found with session ID: {id}")
+    }
+}
+
 fn main() {
     let Some(dir) = std::env::var_os("MUX_IT_DIR").map(PathBuf::from) else {
         eprintln!("fake-client: MUX_IT_DIR is not set");
@@ -67,6 +78,21 @@ fn main() {
         .skip(1)
         .map(|a| a.to_string_lossy().into_owned())
         .collect();
+    if dir.join("resume-gone").exists()
+        && let Some(id) = argv
+            .iter()
+            .position(|a| a == "--resume")
+            .and_then(|i| argv.get(i + 1))
+    {
+        let me = std::env::current_exe().ok();
+        let stem = me
+            .as_deref()
+            .and_then(Path::file_stem)
+            .and_then(|s| s.to_str())
+            .unwrap_or("claude");
+        eprintln!("{}", gone_message(stem, id));
+        std::process::exit(1);
+    }
     let sid = argv
         .iter()
         .position(|a| a == "--session-id")
@@ -324,6 +350,20 @@ mod tests {
         assert_eq!(
             String::from_utf8(out).unwrap(),
             "grand-marker-1\nsecond line\n"
+        );
+    }
+
+    // O5 (verified 2026-11-14): each client's own words for a conversation it does not have.
+    #[test]
+    fn a_gone_conversation_has_each_clients_message() {
+        let id = "7d1c0e5a-9b1f-4d0e-8f7a-3c2b1a0e9d8c";
+        assert_eq!(
+            super::gone_message("claude", id),
+            format!("No conversation found with session ID: {id}")
+        );
+        assert_eq!(
+            super::gone_message("copilot", id),
+            format!("Error: No session, task, or name matched '{id}'.")
         );
     }
 }
