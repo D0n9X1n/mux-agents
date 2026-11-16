@@ -20,6 +20,8 @@ pub mod core_identity;
 pub mod core_launch;
 pub mod gens;
 pub mod leader;
+#[cfg(test)]
+pub(crate) mod life_fixture;
 pub mod lifecycle;
 pub mod mail;
 pub(crate) mod member_target;

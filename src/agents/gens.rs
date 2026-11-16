@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use serde_json::{Value, json};
 
 use crate::error::{Refusal, Res};
+use crate::hc::{Core, Reason, State, Terminal};
 use crate::state::evidence::{self, Evidence, Published};
 
 /// Every create-once file of a generation (S5); the claim lives beside the folder.
@@ -46,25 +47,32 @@ pub fn path(member: &Path, n: u64, file: &str) -> PathBuf {
 /// (`symlink_metadata`, never following a link): missing is `Absent`; a link, a file or anything else is `Unreadable`.
 /// The last name goes to `evidence::read`. The state root and anything above it are not walked.
 pub fn walk(member: &Path, names: &[&str]) -> Evidence {
-    let Some(root) = member.ancestors().nth(3) else {
+    let Some((last, folders)) = names.split_last() else {
         return Evidence::Unreadable;
     };
-    let mut all: Vec<&std::ffi::OsStr> =
-        member.strip_prefix(root).unwrap_or(member).iter().collect();
-    all.extend(names.iter().map(std::ffi::OsStr::new));
-    let Some((last, folders)) = all.split_last() else {
-        return Evidence::Unreadable;
-    };
+    match real_folders(member, folders) {
+        Ok(Some(at)) => evidence::read(&at.join(last)),
+        Ok(None) => Evidence::Absent,
+        Err(_) => Evidence::Unreadable,
+    }
+}
+
+/// R5, b-calls 13: from the state root (three folders above `member`), every name of `<key>/agents/<id>` and then
+/// `names` must be a real folder (`symlink_metadata`, never following a link). One missing: `Ok(None)`; a link, a
+/// file or anything else: `evidence`. `Ok(Some(folder))` otherwise. `walk` and `named` share it (one walk).
+fn real_folders(member: &Path, names: &[&str]) -> Res<Option<PathBuf>> {
+    let root = member.ancestors().nth(3).ok_or_else(evidence::unreadable)?;
     let mut at = root.to_path_buf();
-    for name in folders {
+    let below = member.strip_prefix(root).unwrap_or(member).iter();
+    for name in below.chain(names.iter().map(std::ffi::OsStr::new)) {
         at.push(name);
         match std::fs::symlink_metadata(&at) {
             Ok(m) if m.is_dir() => {}
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Evidence::Absent,
-            _ => return Evidence::Unreadable,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            _ => return Err(evidence::unreadable()),
         }
     }
-    evidence::read(&at.join(last))
+    Ok(Some(at))
 }
 
 /// The member record, `<member>/record.json`, through the walk.
@@ -99,6 +107,18 @@ fn state_refusal(message: &str) -> Refusal {
 
 /// Call 18a, the one publisher of `gens/<n>/<file>.json` (R-W1).
 pub fn publish_once(member: &Path, n: u64, file: &str, body: &Value) -> Res<Published> {
+    publish_seen(member, n, file, body).map(|(p, _)| p)
+}
+
+/// `publish_once`, also answering the body its one read found when the file was already there (A3a R1, build
+/// checklist 8: a caller that needs the standing body does not read it a second time). `None` with `Exists`: a racer
+/// linked first, between the read and the link.
+fn publish_seen(
+    member: &Path,
+    n: u64,
+    file: &str,
+    body: &Value,
+) -> Res<(Published, Option<Value>)> {
     debug_assert!(FILES.contains(&file), "{file}");
     let level = n.to_string();
     publish_at(member, &["gens", &level], &format!("{file}.json"), body)
@@ -106,7 +126,7 @@ pub fn publish_once(member: &Path, n: u64, file: &str, body: &Value) -> Res<Publ
 
 /// Call 18a, the one publisher of `gens/<n>.claim`: as `publish_once`, one level up (a claim sits beside `gens/<n>/`).
 pub fn publish_claim_once(member: &Path, n: u64, body: &Value) -> Res<Published> {
-    publish_at(member, &["gens"], &format!("{n}.claim"), body)
+    publish_at(member, &["gens"], &format!("{n}.claim"), body).map(|(p, _)| p)
 }
 
 /// R-W1. `member` is `<root>/<key>/agents/<id>`. Walks from the state root: `<key>` and `agents` must be real folders;
@@ -115,8 +135,13 @@ pub fn publish_claim_once(member: &Path, n: u64, body: &Value) -> Res<Published>
 /// "already exists" is `evidence` too (call 27). Then one read of `name`: Present is `Exists` before anything is
 /// written, Unreadable refuses. Absent: `claim_json` links a body whose content was flushed first (a racer that links
 /// first makes this `Exists`). Then, on every call, the folder holding `name` and each folder above it up to
-/// `agents` is flushed; a failed flush is a failed publication.
-fn publish_at(member: &Path, levels: &[&str], name: &str, body: &Value) -> Res<Published> {
+/// `agents` is flushed; a failed flush is a failed publication. Answers the body read when `name` was Present.
+fn publish_at(
+    member: &Path,
+    levels: &[&str],
+    name: &str,
+    body: &Value,
+) -> Res<(Published, Option<Value>)> {
     let Some(root) = member.ancestors().nth(3) else {
         return Err(evidence::unreadable());
     };
@@ -146,14 +171,14 @@ fn publish_at(member: &Path, levels: &[&str], name: &str, body: &Value) -> Res<P
     }
     let target = at.join(name);
     let found = match evidence::read(&target) {
-        Evidence::Present(_) => Published::Exists,
+        Evidence::Present(v) => (Published::Exists, Some(v)),
         Evidence::Unreadable => return Err(evidence::unreadable()),
         Evidence::Absent => {
             #[cfg(test)]
             publish_hooks::fire(&target);
             match crate::state::fs::claim_json(&target, body) {
-                Ok(true) => Published::Published,
-                Ok(false) => Published::Exists,
+                Ok(true) => (Published::Published, None),
+                Ok(false) => (Published::Exists, None),
                 Err(_) => return Err(state_refusal(NOT_PUBLISHED)),
             }
         }
@@ -484,6 +509,156 @@ pub fn committed(member: &Path, n: u64) -> Res<bool> {
     Ok(read(member, n, "commit")
         .known()?
         .is_some_and(|c| decide(&c) == Decision::Run))
+}
+
+/// settle-1b G8: every canonical generation a `gens/<n>/` folder or `gens/<n>.claim` names, ascending, once.
+/// No member folder or no `gens`: none. A link or non-folder from the state root to `gens`: `evidence` (R5).
+pub fn named(member: &Path) -> Res<Vec<u64>> {
+    let Some(gens) = real_folders(member, &["gens"])? else {
+        return Ok(Vec::new());
+    };
+    let mut all = Vec::new();
+    for e in std::fs::read_dir(&gens).map_err(|_| evidence::unreadable())? {
+        let name = e.map_err(|_| evidence::unreadable())?.file_name();
+        let name = name.to_string_lossy();
+        if let Some(n) = plain_gen(name.strip_suffix(".claim").unwrap_or(&name)) {
+            all.push(n);
+        }
+    }
+    all.sort_unstable();
+    all.dedup();
+    Ok(all)
+}
+
+/// Ambiguity 13: an hc answer that decides nothing.
+pub fn unclear(message: &str) -> Refusal {
+    Refusal {
+        code: 1,
+        check: "hc",
+        message: message.into(),
+        reason: None,
+        leftover: None,
+        details: Default::default(),
+    }
+}
+
+/// What hc shows of generation n by its recorded identity (launch-1 G12).
+#[derive(Debug, Clone)]
+pub enum Found {
+    One(Terminal),
+    Unknown(Refusal),
+}
+
+/// Ambiguity 1: the terminals labelled `mux.id=<id>, mux.gen=<n>` whose name is the recorded `hcName`; exactly
+/// one is `One`. None, several, or any hc failure is Unknown.
+pub fn find(core: &Core<'_>, id: &str, n: u64, hc_name: &str) -> Found {
+    let g = n.to_string();
+    let Ok(listed) = core.ls(&[("mux.id", id), ("mux.gen", &g)]) else {
+        return Found::Unknown(unclear("hc cannot list the generation's terminals"));
+    };
+    let mut hits = Vec::new();
+    for a in listed {
+        let Ok(t) = core.get(&a) else {
+            return Found::Unknown(unclear("hc cannot show a terminal of the generation"));
+        };
+        let label = |k: &str| t.labels.get(k).map(String::as_str);
+        if t.name.as_deref() == Some(hc_name)
+            && label("mux.id") == Some(id)
+            && label("mux.gen") == Some(&g)
+        {
+            hits.push(t);
+        }
+    }
+    match <[Terminal; 1]>::try_from(hits) {
+        Ok([t]) => Found::One(t),
+        Err(_) => Found::Unknown(unclear("hc shows not one terminal of the generation")),
+    }
+}
+
+/// S6: the one shape of `ended.json`.
+pub fn end_facts(t: &Terminal, hc_name: &str, at: &str) -> Value {
+    let reason = match &t.reason {
+        Some(Reason::Exited) => json!("exited"),
+        Some(Reason::Killed) => json!("killed"),
+        Some(Reason::ServerStop) => json!("server_stop"),
+        Some(Reason::Other(s)) => json!(s),
+        None => Value::Null,
+    };
+    let state = if t.state == State::Finished {
+        "finished"
+    } else {
+        "live"
+    };
+    json!({"address": t.address, "hcName": hc_name, "labels": t.labels, "state": state, "reason": reason,
+        "exitCode": t.exit_code, "at": at})
+}
+
+/// The one write of `ended.json` (`record_end`, `release::complete_one`): create-once through `publish_once`.
+/// Answers the facts that stand: these, or the ones already there.
+pub(crate) fn publish_end(member: &Path, n: u64, facts: &Value) -> Res<Value> {
+    match publish_seen(member, n, "ended", facts)? {
+        (Published::Published, _) => Ok(facts.clone()),
+        (Published::Exists, Some(standing)) => Ok(standing),
+        // A racer linked first: its body was never read here.
+        (Published::Exists, None) => read(member, n, "ended")
+            .known()?
+            .ok_or_else(|| Refusal::internal("ended.json vanished")),
+    }
+}
+
+/// Coordinator call 6, item 3; b-calls 20: `t` is generation n's Ended terminal. One guard each: Ended against
+/// `launch.json launcherArgv`; its name is `launch.json hcName`; its `mux.id` is `id`; its `mux.gen` is n.
+fn end_checked(t: &Terminal, launch: &Value, id: &str, n: u64) -> Res<()> {
+    use crate::agents::lifecycle::{Life, classify};
+    let argv: Vec<String> = launch
+        .get("launcherArgv")
+        .and_then(Value::as_array)
+        .map(|a| {
+            a.iter()
+                .filter_map(Value::as_str)
+                .map(str::to_owned)
+                .collect()
+        })
+        .unwrap_or_default();
+    if classify(Some(t), &argv) != Life::Ended {
+        return Err(Refusal::internal("the terminal has not ended"));
+    }
+    let hc_name = launch.get("hcName").and_then(Value::as_str);
+    if hc_name.is_none() || t.name.as_deref() != hc_name {
+        return Err(Refusal::internal(
+            "the terminal name is not this generation's",
+        ));
+    }
+    let label = |k: &str| t.labels.get(k).map(String::as_str);
+    if label("mux.id") != Some(id) {
+        return Err(Refusal::internal("the terminal is another member's"));
+    }
+    if label("mux.gen") != Some(n.to_string().as_str()) {
+        return Err(Refusal::internal("the terminal is another generation's"));
+    }
+    Ok(())
+}
+
+/// Coordinator call 6: THE end writer. Records generation n's end, the generation the caller names, never a fresh
+/// `active()` (call 9). `record` is the member record the caller already read (b-calls 19, A3a R1: no second
+/// read). Callers: `registry::reap_hc` (natural exit), A3b-2 (stop). Refuses, writing nothing: `evidence` when
+/// `launch.json` or `ended.json` is Unreadable; `internal` when `record` is not a lifecycle record, there is no
+/// `launch.json`, or `end_checked` refuses. Ok: the `ended.json` facts that stand (the first facts stand); a
+/// caller makes its notice from them, only after Ok.
+pub fn record_end(member: &Path, record: &Value, n: u64, t: &Terminal, at: &str) -> Res<Value> {
+    if !lifecycle(record) {
+        return Err(Refusal::internal("not a lifecycle member"));
+    }
+    let id = record.get("id").and_then(Value::as_str).unwrap_or_default();
+    let launch = read(member, n, "launch")
+        .known()?
+        .ok_or_else(|| Refusal::internal("the generation has no launch.json"))?;
+    end_checked(t, &launch, id, n)?;
+    let hc_name = launch
+        .get("hcName")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    publish_end(member, n, &end_facts(t, hc_name, at))
 }
 
 /// The client a generation proved (proof-0b K1a): the recorded launcher and the process it started, each as
@@ -1465,3 +1640,278 @@ mod publish_tests;
 #[cfg(test)]
 #[path = "gens_ready_tests.rs"]
 mod ready_tests;
+
+#[cfg(test)]
+mod b_tests {
+    use super::*;
+    use crate::agents::core_fixture as cf;
+    use crate::agents::fixture::ID;
+    use crate::agents::life_fixture as lf;
+    use crate::testing::link_dir;
+    use serde_json::json;
+
+    // b-calls 13, 14 (B2 findings 11-13): a link at gens/1, gens or <id>, on every OS, refuses
+    // `publish_once`, `publish_claim_once` and `named`; nothing behind it is written or listed.
+    #[test]
+    fn a_linked_folder_is_never_published_through_or_listed() {
+        for at in ["gens/1", "gens", "<id>"] {
+            let (w, _s) = lf::world();
+            let m = lf::life(&w, json!({}));
+            let other = m.with_file_name("bbbbbbbbbbbb");
+            std::fs::create_dir_all(dir(&other, 1)).unwrap();
+            match at {
+                "gens/1" => {
+                    std::fs::create_dir_all(m.join("gens")).unwrap();
+                    link_dir(&dir(&other, 1), &dir(&m, 1));
+                }
+                "gens" => link_dir(&other.join("gens"), &m.join("gens")),
+                _ => {
+                    std::fs::remove_dir_all(&m).unwrap();
+                    link_dir(&other, &m);
+                }
+            }
+            let got = publish_once(&m, 1, "ended", &json!({}));
+            assert_eq!(got.map_err(|e| e.check), Err("evidence"), "{at}");
+            assert!(!path(&other, 1, "ended").exists(), "{at}: written through");
+            if at != "gens/1" {
+                let got = publish_claim_once(&m, 1, &json!("abandoned"));
+                assert_eq!(got.map_err(|e| e.check), Err("evidence"), "{at}: claim");
+                assert!(!claim_path(&other, 1).exists(), "{at}: claimed through");
+                assert_eq!(
+                    named(&m).map_err(|e| e.check),
+                    Err("evidence"),
+                    "{at}: listed through"
+                );
+            }
+        }
+    }
+
+    // G8: canonical names only, ascending, once each; no gens is none; a file at gens refuses `evidence` through
+    // the walk (B2 finding 16: a bare `read_dir` failure would be `internal`).
+    #[test]
+    fn named_lists_canonical_generations() {
+        let (w, _s) = lf::world();
+        let m = lf::life(&w, json!({}));
+        assert_eq!(named(&m).unwrap(), Vec::<u64>::new());
+        for p in [claim_path(&m, 3), path(&m, 1, "spec"), claim_path(&m, 1)] {
+            crate::state::evidence::publish(&p, &json!({})).unwrap();
+        }
+        std::fs::create_dir_all(m.join("gens/07")).unwrap();
+        std::fs::write(m.join("gens/x.claim"), b"").unwrap();
+        assert_eq!(named(&m).unwrap(), [1, 3]);
+        std::fs::remove_dir_all(m.join("gens")).unwrap();
+        std::fs::write(m.join("gens"), b"").unwrap();
+        assert_eq!(named(&m).map_err(|e| e.check), Err("evidence"));
+    }
+
+    // Ambiguity 1: exactly one terminal with the recorded hcName and both labels; else Unknown, check `hc`.
+    #[test]
+    fn find_matches_exactly_one_recorded_identity() {
+        let cases = [
+            "one",
+            "none",
+            "another name",
+            "another gen label",
+            "another id label",
+            "two",
+            "ls fails",
+            "get fails",
+        ];
+        for case in cases {
+            let (w, _s) = lf::world();
+            cf::online(&w);
+            let mut t1 = lf::running(&w, 1);
+            match case {
+                "another name" => t1["name"] = json!("m000000ff"),
+                "another gen label" => t1["labels"]["mux.gen"] = json!("2"),
+                "another id label" => t1["labels"]["mux.id"] = json!("bbbbbbbbbbbb"),
+                _ => {}
+            }
+            let ls = [
+                "ls",
+                "--all",
+                "--label",
+                "mux.id=aaaaaaaaaaaa",
+                "--label",
+                "mux.gen=1",
+                "--json",
+            ];
+            match case {
+                "none" => lf::ls(&w, 1, &[]),
+                "two" => {
+                    lf::ls(&w, 1, &["t1", "t9"]);
+                    lf::get(&w, "t1", &t1);
+                    lf::get(&w, "t9", &t1);
+                }
+                "ls fails" => lf::fails(&w, &ls),
+                "get fails" => {
+                    lf::ls(&w, 1, &["t1"]);
+                    lf::fails(&w, &["get", "t1", "--json"]);
+                }
+                _ => lf::found(&w, 1, &t1),
+            }
+            let core = crate::hc::connect(&w.ctx).unwrap();
+            let got = find(&core, ID, 1, &lf::hc_name(1));
+            if case == "one" {
+                assert!(
+                    matches!(&got, Found::One(t) if t.address == "t1"),
+                    "one: {got:?}"
+                );
+            } else {
+                let Found::Unknown(e) = got else {
+                    panic!("{case}: matched")
+                };
+                let want = match case {
+                    "ls fails" => "cannot list",
+                    "get fails" => "cannot show",
+                    _ => "not one",
+                };
+                assert_eq!(e.check, "hc", "{case}");
+                assert!(e.message.contains(want), "{case}: {}", e.message);
+            }
+            w.fakes.hc_done().unwrap();
+        }
+    }
+
+    // Coordinator call 6, item 1; b-calls 19: the one end writer takes the record its caller read; Ended only; the
+    // generation named, never the active one (call 9); every S6 field; create-once; it answers the facts that stand.
+    #[test]
+    fn record_end_writes_the_named_generations_end_once() {
+        let (w, _s) = lf::world();
+        let m = lf::life(&w, json!({"generation": "2"}));
+        lf::seed_gen(&m, 1, Some("run"), lf::committed());
+        let r = lf::record(&m);
+        let live = lf::terminal(&w, &lf::running(&w, 1));
+        assert_eq!(
+            record_end(&m, &r, 1, &live, "x").map_err(|e| e.check),
+            Err("internal"),
+            "not Ended"
+        );
+        let t = lf::terminal(&w, &lf::ended(&w, 1));
+        let want = json!({"address": "t1", "hcName": lf::hc_name(1), "labels": t.labels, "state": "finished",
+            "reason": "exited", "exitCode": 0, "at": "2026-11-15T00:00:00Z"});
+        assert_eq!(
+            record_end(&m, &r, 1, &t, "2026-11-15T00:00:00Z").unwrap(),
+            want,
+            "the facts written"
+        );
+        assert_eq!(
+            read(&m, 1, "ended"),
+            Evidence::Present(want.clone()),
+            "generation 1, not the active 2"
+        );
+        assert_eq!(read(&m, 2, "ended"), Evidence::Absent);
+        assert_eq!(
+            record_end(&m, &r, 1, &t, "later").unwrap(),
+            want,
+            "create-once: the first facts stand"
+        );
+        let pre = json!({"id": ID});
+        assert_eq!(
+            record_end(&m, &pre, 1, &t, "x").map_err(|e| e.check),
+            Err("internal"),
+            "pre-lifecycle"
+        );
+    }
+
+    // b-calls 20: each identity guard alone (name, mux.id, mux.gen) refuses `internal` and writes nothing.
+    #[test]
+    fn record_end_refuses_another_generations_terminal_by_each_guard() {
+        for guard in ["name", "mux.id", "mux.gen"] {
+            let (w, _s) = lf::world();
+            let m = lf::life(&w, json!({"generation": "1"}));
+            lf::seed_gen(&m, 1, Some("run"), lf::committed());
+            let mut wire = lf::ended(&w, 1);
+            match guard {
+                "name" => wire["name"] = json!("m000000ff"),
+                "mux.id" => wire["labels"]["mux.id"] = json!("bbbbbbbbbbbb"),
+                _ => wire["labels"]["mux.gen"] = json!("2"),
+            }
+            let t = lf::terminal(&w, &wire);
+            let got = record_end(&m, &lf::record(&m), 1, &t, "x");
+            assert_eq!(got.map_err(|e| e.check), Err("internal"), "{guard}");
+            assert_eq!(read(&m, 1, "ended"), Evidence::Absent, "{guard}");
+        }
+    }
+
+    // A3a R2: an Unreadable launch.json or ended.json refuses `evidence` and keeps its bytes; no launch.json is
+    // `internal`; nothing is written.
+    #[test]
+    fn record_end_refuses_torn_evidence_and_writes_nothing() {
+        for torn in ["launch", "ended", "no launch"] {
+            let (w, _s) = lf::world();
+            let m = lf::life(&w, json!({"generation": "1"}));
+            let t = lf::terminal(&w, &lf::ended(&w, 1));
+            if torn == "no launch" {
+                let got = record_end(&m, &lf::record(&m), 1, &t, "x");
+                assert_eq!(got.map_err(|e| e.check), Err("internal"), "{torn}");
+                assert_eq!(read(&m, 1, "ended"), Evidence::Absent, "{torn}");
+                continue;
+            }
+            lf::seed_gen(&m, 1, Some("run"), lf::committed());
+            std::fs::write(path(&m, 1, torn), b"{").unwrap();
+            let got = record_end(&m, &lf::record(&m), 1, &t, "x");
+            assert_eq!(got.map_err(|e| e.check), Err("evidence"), "{torn}");
+            assert_eq!(std::fs::read(path(&m, 1, torn)).unwrap(), b"{", "{torn}");
+        }
+    }
+
+    // B-R1, B-R6 (build checklist 11): the end writer publishes through the one publisher, so a failed write or
+    // flush of ended.json refuses with check `state` and the publisher's phrase; a failed write leaves nothing, and
+    // the next call records the end.
+    #[test]
+    fn a_failed_end_publication_refuses_state() {
+        for case in ["content", "flush"] {
+            let (w, _s) = lf::world();
+            let m = lf::life(&w, json!({"generation": "1"}));
+            lf::seed_gen(&m, 1, Some("run"), lf::committed());
+            let t = lf::terminal(&w, &lf::ended(&w, 1));
+            if case == "content" {
+                crate::state::fs::fail_sync_file(Some(&path(&m, 1, "ended")));
+            } else {
+                crate::state::fs::fail_sync_dir(Some(&dir(&m, 1)));
+            }
+            let got = record_end(&m, &lf::record(&m), 1, &t, "x");
+            crate::state::fs::fail_sync_file(None);
+            crate::state::fs::fail_sync_dir(None);
+            let want = if case == "content" {
+                NOT_PUBLISHED
+            } else {
+                NOT_FLUSHED
+            };
+            assert_eq!(
+                got.map_err(|e| (e.check, e.message)),
+                Err(("state", want.to_string())),
+                "{case}"
+            );
+            if case == "content" {
+                assert_eq!(read(&m, 1, "ended"), Evidence::Absent, "{case}: written");
+            }
+            let again = record_end(&m, &lf::record(&m), 1, &t, "x").unwrap();
+            assert_eq!(
+                again["hcName"],
+                json!(lf::hc_name(1)),
+                "{case}: the retry records the end"
+            );
+        }
+    }
+
+    // A3a R1 (build checklist 8): a replayed end reads the recorded ended.json once; `publish_end` takes the body the
+    // publisher already read and never reads it a second time.
+    #[test]
+    fn a_replayed_end_reads_the_recorded_end_once() {
+        let (w, _s) = lf::world();
+        let m = lf::life(&w, json!({"generation": "1"}));
+        lf::seed_gen(&m, 1, Some("run"), lf::committed());
+        let t = lf::terminal(&w, &lf::ended(&w, 1));
+        let r = lf::record(&m);
+        let first = record_end(&m, &r, 1, &t, "first").unwrap();
+        let (again, reads) = crate::state::fs::record_reads(|| record_end(&m, &r, 1, &t, "later"));
+        assert_eq!(again.unwrap(), first, "the first facts stand");
+        assert_eq!(
+            reads,
+            [path(&m, 1, "launch"), path(&m, 1, "ended")],
+            "each evidence file read once"
+        );
+    }
+}
