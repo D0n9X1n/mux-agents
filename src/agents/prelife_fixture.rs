@@ -248,3 +248,29 @@ pub fn to_lifecycle(w: &World, id: &str, ended: bool) -> Value {
     }
     r
 }
+
+/// v0.3-dev generation evidence in an unmarked folder (spec "Exclusion"): claim `run`, commit, launch, client.
+pub fn dev_evidence(w: &World, id: &str) {
+    let f = w.folder(id);
+    std::fs::create_dir_all(f.join("gens")).unwrap();
+    crate::agents::fixture::write(&crate::agents::gens::claim_path(&f, 1), json!("run"));
+    publish(w, id, 1, "commit", json!({"committed": true}));
+    publish(
+        w,
+        id,
+        1,
+        "launch",
+        json!({"hcName": format!("m{}", &id[..8])}),
+    );
+    publish(w, id, 1, "client", json!({"pid": 4242, "start": 1500}));
+}
+
+/// Paths `record_reads` saw under `folder`, except its `record.json` (P-R1's one classifying read).
+pub fn reads_past_record(reads: &[PathBuf], folder: &Path) -> Vec<PathBuf> {
+    let record = folder.join("record.json");
+    reads
+        .iter()
+        .filter(|p| p.starts_with(folder) && **p != record)
+        .cloned()
+        .collect()
+}
