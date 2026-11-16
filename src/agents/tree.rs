@@ -167,20 +167,9 @@ pub fn prove_member(
             .row(row.ppid)
             .filter(|p| p.start.is_some() && p.start <= row.start)
     };
-    let mut row = ctx.os.row(ctx.pid).filter(|r| r.start.is_some())?;
-    let mut found = None;
-    for _ in 0..64 {
-        let parent = parent_of(&row)?;
-        if let Some(client) = ctx.os.client_of(&parent) {
-            found = Some((parent, client));
-            break;
-        }
-        if !ctx.os.is_shell(&parent) {
-            return None;
-        }
-        row = parent;
-    }
-    let (x, x_client) = found?;
+    let super::ancestry::Above::Client(x, x_client) = super::ancestry::first_client(ctx) else {
+        return None;
+    };
     let named = super::spawn::client_named(record.get("client")?.as_str()?)?;
     let c = if x.pid == c_pid {
         x.clone()
