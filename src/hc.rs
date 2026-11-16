@@ -268,6 +268,8 @@ pub struct Foreground {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Terminal {
     pub address: String,
+    /// hc's `--name` of the terminal (launch-1 G2: the generation's hcName).
+    pub name: Option<String>,
     pub state: State,
     pub reason: Option<Reason>,
     pub exit_code: Option<i32>,
@@ -306,6 +308,7 @@ impl Terminal {
     fn decode(v: &Value) -> Res<Self> {
         Ok(Self {
             address: address(v)?,
+            name: optional(v, "name", string)?,
             state: match v["state"].as_str() {
                 Some("live") => State::Live,
                 Some("finished") => State::Finished,
@@ -368,6 +371,38 @@ impl Core<'_> {
             .iter()
             .map(address)
             .collect()
+    }
+}
+
+impl Core<'_> {
+    /// release-1d R1.3: `hc label <t> <k=v>... --json`. One call clears (`k=`) and sets; a failure is uncertain.
+    pub fn label(&self, t: &str, pairs: &[(&str, &str)]) -> Res<()> {
+        let mut a = vec!["label".to_string(), t.to_string()];
+        a.extend(pairs.iter().map(|(k, v)| format!("{k}={v}")));
+        a.push("--json".into());
+        self.call(&a).map(|_| ())
+    }
+}
+
+/// B-R5: an hc connection made on first use, so a replay hook with nothing to do calls no hc.
+pub struct Lazy<'a> {
+    ctx: &'a Ctx,
+    core: std::cell::OnceCell<Core<'a>>,
+}
+
+impl<'a> Lazy<'a> {
+    pub fn new(ctx: &'a Ctx) -> Self {
+        Lazy {
+            ctx,
+            core: std::cell::OnceCell::new(),
+        }
+    }
+    pub fn get(&self) -> Res<&Core<'a>> {
+        if let Some(c) = self.core.get() {
+            return Ok(c);
+        }
+        let c = connect(self.ctx)?;
+        Ok(self.core.get_or_init(|| c))
     }
 }
 
@@ -1114,5 +1149,65 @@ mod tests {
             "hc",
             "no answer at all"
         );
+    }
+
+    // Contract missing 2: hc's name is the generation's hcName (launch-1 G2); absent stays None.
+    #[test]
+    fn get_decodes_the_terminal_name() {
+        let f = Fakes::default();
+        f.hc_install("hc");
+        answer(&f, "hc 0.1.21");
+        answer(
+            &f,
+            r#"{"address":"t1","name":"m0000abc1","state":"live","argv":["/bin/zsh","-l"],"labels":{}}"#,
+        );
+        answer(
+            &f,
+            r#"{"address":"t2","state":"live","argv":[],"labels":{}}"#,
+        );
+        let ctx = f.ctx();
+        let core = connect(&ctx).unwrap();
+        assert_eq!(core.get("t1").unwrap().name.as_deref(), Some("m0000abc1"));
+        assert_eq!(core.get("t2").unwrap().name, None);
+    }
+
+    // release-1d R1.3: one call clears (`k=`) and sets every key; a failed call is the uncertain `hc` refusal.
+    #[test]
+    fn label_sends_every_key_in_one_call() {
+        let f = Fakes::default();
+        f.hc_install("hc");
+        answer(&f, "hc 0.1.21");
+        answer(&f, "{}");
+        f.hc_answer(Ok(Out {
+            code: 1,
+            stdout: String::new(),
+            stderr: "no".into(),
+        }));
+        let ctx = f.ctx();
+        let core = connect(&ctx).unwrap();
+        core.label("t1", &[("mux.id", ""), ("mux.kept", "k:$3")])
+            .unwrap();
+        assert_eq!(
+            f.hc_calls()[1].1,
+            ["label", "t1", "mux.id=", "mux.kept=k:$3", "--json"]
+        );
+        assert_eq!(
+            core.label("t1", &[("mux.id", "")]).map_err(|e| e.check),
+            Err("hc")
+        );
+    }
+
+    // B-R5: nothing connects before first use; then one `--version` serves every use.
+    #[test]
+    fn lazy_connects_once_and_only_when_used() {
+        let f = Fakes::default();
+        f.hc_install("hc");
+        let ctx = f.ctx();
+        let lazy = Lazy::new(&ctx);
+        assert!(f.hc_calls().is_empty(), "connected before use");
+        answer(&f, "hc 0.1.21");
+        lazy.get().unwrap();
+        lazy.get().unwrap();
+        assert_eq!(f.hc_calls().len(), 1, "one connect");
     }
 }

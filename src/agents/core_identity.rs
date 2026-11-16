@@ -206,6 +206,7 @@ pub(crate) mod tests {
         let id = identity();
         let t = Terminal {
             address: id.address.clone(),
+            name: None,
             state: crate::hc::State::Live,
             reason: None,
             exit_code: None,

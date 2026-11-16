@@ -216,6 +216,7 @@ mod tests {
         }
         let live_with_empty_argv = Terminal {
             address: "t1".into(),
+            name: None,
             state: State::Live,
             reason: None,
             exit_code: None,
