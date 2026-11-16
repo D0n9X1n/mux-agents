@@ -1960,6 +1960,7 @@ mod tests {
         for case in [
             "foreign member",
             "foreign generation",
+            "foreign gen label",
             "foreign name",
             "foreign address",
             "torn launch",
@@ -1973,6 +1974,8 @@ mod tests {
                 "foreign generation" | "torn claim, foreign attempt" => {
                     attempt(&w, ID, 2, &lf::hc_name(2), "t2")
                 }
+                // Only mux.gen differs from a valid attempt (isolates that check).
+                "foreign gen label" => attempt(&w, ID, 2, &lf::hc_name(1), "t1"),
                 "foreign name" => attempt(&w, ID, 1, &lf::hc_name(9), "t1"),
                 "foreign address" => attempt(&w, ID, 1, &lf::hc_name(1), "t9"),
                 _ => attempt(&w, ID, 1, &lf::hc_name(1), "t1"),
