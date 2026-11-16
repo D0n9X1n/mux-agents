@@ -1482,6 +1482,8 @@ fn live_harness_subprocesses_are_bounded() {
         "tests/live_windows.rs",
         "tests/support/mod.rs",
         "src/bin/fake-client.rs",
+        // a3c call 48: the crash-point children run through the same bounded runner.
+        "tests/crash_point.rs",
     ] {
         let text = repo_file(file);
         let bare: Vec<&str> = text

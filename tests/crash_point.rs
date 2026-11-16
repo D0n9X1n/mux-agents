@@ -6,45 +6,15 @@
 
 use std::process::Command;
 
-/// Runs `c` with its output captured; kills it and fails after 60 s, so no child can hang the suite.
+// a3c call 48: the one bounded runner (o2 call 14). Its `output` drains both pipes with a deadline even after the
+// child exits, so a descendant holding them cannot stretch the bound.
+#[path = "support/bounded.rs"]
+mod bounded;
+
+/// Runs `c` with its output captured through `bounded::output`; past `bounded::LIMIT` it is killed and this fails.
 fn output_within(mut c: Command) -> std::process::Output {
-    use std::io::Read;
-    use std::process::Stdio;
-    use std::time::{Duration, Instant};
-    let mut child = c
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
-    let drain = |mut r: Box<dyn Read + Send>| {
-        std::thread::spawn(move || {
-            let mut buf = Vec::new();
-            let _ = r.read_to_end(&mut buf);
-            buf
-        })
-    };
-    let (out, err) = (
-        drain(Box::new(child.stdout.take().unwrap())),
-        drain(Box::new(child.stderr.take().unwrap())),
-    );
-    let end = Instant::now() + Duration::from_secs(60);
-    let status = loop {
-        if let Some(s) = child.try_wait().unwrap() {
-            break s;
-        }
-        if Instant::now() >= end {
-            let _ = child.kill();
-            let _ = child.wait();
-            panic!("the crash child ran past 60 s");
-        }
-        std::thread::sleep(Duration::from_millis(20));
-    };
-    std::process::Output {
-        status,
-        stdout: out.join().unwrap(),
-        stderr: err.join().unwrap(),
-    }
+    bounded::output(&mut c, bounded::LIMIT)
+        .unwrap_or_else(|e| panic!("the crash child did not finish within its bound: {e}"))
 }
 
 #[cfg(not(feature = "test-panic"))]
