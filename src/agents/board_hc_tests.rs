@@ -622,3 +622,28 @@ fn the_flat_bar_keeps_recover_at_the_narrowest_widths() {
         assert!(line.contains("recover"), "{case}: {text:#?}");
     }
 }
+
+/// restore-6b Task 8: a member released for restore is listed without -All, shows `restore: waiting` and gets no
+/// exit notice (display only, state-0 S6).
+#[test]
+fn a_member_released_for_restore_shows_waiting_and_is_never_noticed() {
+    use crate::agents::{life_fixture as lf, reconcile_tests as rt};
+    let w = World::human("");
+    w.state();
+    let f = rt::member_for_board(&w);
+    cf::online(&w);
+    cf::listing(&w, &lf::team(&w), &[]);
+    lf::gone(&w, &format!("a{}", rt::X));
+    // without -All (r6b call 11): a waiting Ended row is still listed; the list feed has no `id`, so select by name
+    let reply = board(&w.ctx, &w.caller(), false, false).unwrap();
+    let rows = reply["agents"].as_array().unwrap();
+    let row = rows.iter().find(|r| r["name"] == "mbbb").expect("listed");
+    assert_eq!(row["restore"], "waiting");
+    assert!(
+        crate::agents::gens::read(&f, 1, "notice")
+            .known()
+            .unwrap()
+            .is_none(),
+        "no exit notice"
+    );
+}

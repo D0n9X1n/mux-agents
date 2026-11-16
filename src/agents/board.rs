@@ -94,6 +94,18 @@ pub fn board(ctx: &Ctx, caller: &Caller, all: bool, watch: bool) -> Res<Map<Stri
         })
         .collect();
     let flagged = |id: &str| matches!(recovery.get(id), Some(Ok(Some(_)) | Err(_)));
+    // restore-6b: each lifecycle member released for restore and waiting (display only, state-0 S6), once, from the
+    // records this snapshot holds (r6b call 26). A refusal stays on that member's row.
+    let waiting: HashMap<String, Res<bool>> = snapshot
+        .records
+        .iter()
+        .filter(|(_, stored)| super::gens::lifecycle(&stored.record))
+        .map(|(id, stored)| {
+            let got = super::reconcile::waiting(&agents.join(id), &stored.record);
+            (id.clone(), got)
+        })
+        .collect();
+    let restoring = |id: &str| matches!(waiting.get(id), Some(Ok(true) | Err(_)));
     let leader = if watch {
         team_leader(ctx, caller, &snapshot)
     } else {
@@ -220,7 +232,7 @@ pub fn board(ctx: &Ctx, caller: &Caller, all: bool, watch: bool) -> Res<Map<Stri
     let mut other = Vec::new();
     let mut ended = Vec::new();
     for o in members {
-        if o.life == Life::Ended && !all && !flagged(&o.identity.id) {
+        if o.life == Life::Ended && !all && !flagged(&o.identity.id) && !restoring(&o.identity.id) {
             continue;
         }
         let id = &o.identity.id;
@@ -291,6 +303,15 @@ pub fn board(ctx: &Ctx, caller: &Caller, all: bool, watch: bool) -> Res<Map<Stri
                 }
                 _ => {}
             }
+            match waiting.get(id) {
+                Some(Ok(true)) => {
+                    row.insert("restore".into(), "waiting".into());
+                }
+                Some(Err(e)) => {
+                    row.insert("restoreError".into(), e.check.into());
+                }
+                _ => {}
+            }
             if !live {
                 if let Some(closed) = notice
                     .and_then(|n| n.get("closedBy"))
@@ -329,7 +350,7 @@ pub fn board(ctx: &Ctx, caller: &Caller, all: bool, watch: bool) -> Res<Map<Stri
     };
     let mut kept = 0;
     for (_, o, notice) in ended {
-        if !flagged(&o.identity.id) {
+        if !flagged(&o.identity.id) && !restoring(&o.identity.id) {
             if kept == cap {
                 continue;
             }

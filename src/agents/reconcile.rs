@@ -173,3 +173,20 @@ fn judged(tx: &Tx<'_>, id: &str, n: u64, seen: Option<&Terminal>) -> Res<Option<
         _ => None,
     })
 }
+
+/// Display only (state-0 S6; the bar and `list` never decide): the active generation of the member at `folder`, whose
+/// `record` the caller's snapshot already holds (r6b call 26: no reread), was released for restore (`cause: restore`
+/// and `released.json`) and nothing is pending, so reconcile relaunches it (row 0).
+pub fn waiting(folder: &std::path::Path, record: &Value) -> Res<bool> {
+    let Some(n) = super::gens::active(record) else {
+        return Ok(false);
+    };
+    if super::gens::pending(record).is_some() {
+        return Ok(false);
+    }
+    let cause = super::gens::read(folder, n, "release")
+        .known()?
+        .and_then(|r| r.get("cause").cloned());
+    Ok(cause == Some(Value::from("restore"))
+        && super::gens::read(folder, n, "released").known()?.is_some())
+}
