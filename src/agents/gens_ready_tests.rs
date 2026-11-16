@@ -430,3 +430,43 @@ fn promote_held_takes_no_lock_and_hands_back_what_it_read() {
     };
     assert_eq!(held, Ok(want), "the failure it read");
 }
+
+// r2b call 23 (TL #143): on the report path the exit evidence is read and kept whether or not client.json exists.
+// Report present, client absent: a whole exit.json is carried; a torn or wrong-type one refuses `evidence`.
+#[test]
+fn the_exit_evidence_is_kept_when_client_json_is_absent() {
+    let (_f, ctx, _d, m) = world();
+    reported(&m, 150, 1500);
+    let report = crate::state::fs::read_json(&path(&m, 1, "report")).unwrap();
+    let exit = json!({"exitCode": 1, "reason": "exited"});
+    publish(&path(&m, 1, "exit"), &exit).unwrap();
+    let held = promote_held(&ctx, &m, 1).map_err(|r| r.check);
+    let want = Held {
+        ready: Ready::Undecided,
+        failure: None,
+        report,
+        exit: Some(exit),
+    };
+    assert_eq!(held, Ok(want), "a whole exit.json, no client.json");
+    let mut kinds: Vec<Option<Wrong>> = vec![None];
+    kinds.extend(Wrong::all().into_iter().map(Some));
+    for kind in kinds {
+        let (_f, ctx, _d, m) = world();
+        reported(&m, 150, 1500);
+        let at = path(&m, 1, "exit");
+        match kind {
+            None => std::fs::write(&at, b"{").unwrap(),
+            Some(k) => plant(k, &at),
+        }
+        let held = promote_held(&ctx, &m, 1)
+            .map(|h| h.ready)
+            .map_err(|r| r.check);
+        assert_eq!(held, Err("evidence"), "exit {kind:?}, no client.json");
+        assert_eq!(
+            kind_of(&path(&m, 1, "ready")),
+            None,
+            "exit {kind:?}: no ready.json"
+        );
+        assert!(untouched(&at), "exit {kind:?}: nothing written through");
+    }
+}

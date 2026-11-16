@@ -581,12 +581,14 @@ pub fn client_evidence(ctx: &crate::ctx::Ctx, member: &Path, n: u64) -> Res<Opti
 /// The proven client (pid, start), and the `exit.json` read beside it (None when none was read or found).
 type ClientProof = (Option<(u32, i64)>, Option<Value>);
 
-/// `client_evidence` and the `exit.json` it read.
+/// `client_evidence` and the `exit.json` it read: read after `client.json` on every call, also when that is absent.
 fn client_proof(ctx: &crate::ctx::Ctx, member: &Path, n: u64) -> Res<ClientProof> {
-    let Some(c) = read(member, n, "client").known()? else {
-        return Ok((None, None));
-    };
+    let client = read(member, n, "client").known()?;
+    // r2b call 23: the exit evidence is read, once, whether or not client.json exists, so the report path keeps it.
     let exit = read(member, n, "exit").known()?;
+    let Some(c) = client else {
+        return Ok((None, exit));
+    };
     let conflict = exit
         .as_ref()
         .is_some_and(|e| e.get("reason").and_then(Value::as_str) == Some("client-conflict"));
