@@ -217,14 +217,32 @@ pub fn spawn(ctx: &Ctx, request: &Request) -> Res<Map<String, Value>> {
                 None => None,
             };
             let mut snapshot = super::membership::Snapshot::for_spawn(ctx, &caller, core)?;
-            // Call 45: a member hc shows Ended whose end its record did not yet hold reads Unknown here; once reap
-            // records that end, admission would read Ended, so take it again. A pre-lifecycle notice changes nothing.
-            let unrecorded = snapshot.facts.local.iter().any(|o| {
-                o.life != super::lifecycle::Life::Ended
-                    && super::lifecycle::classify(o.terminal.as_ref(), &o.identity.launcher)
-                        == super::lifecycle::Life::Ended
-            });
-            if registry::reap_hc(ctx, &caller, &snapshot)? && unrecorded {
+            // Calls 45, 51: a lifecycle member this snapshot read as not done whose generation is done after the reap
+            // (this reap or another recorded its end) reads Ended to admission now, so take the snapshot again. A
+            // pre-lifecycle notice changes nothing, so an ordinary spawn keeps one snapshot.
+            let not_done: Vec<(String, u64)> = snapshot
+                .facts
+                .local
+                .iter()
+                .filter(|o| o.life != super::lifecycle::Life::Ended)
+                .filter(|o| {
+                    snapshot
+                        .records
+                        .get(&o.identity.id)
+                        .is_some_and(|s| super::gens::lifecycle(&s.record))
+                })
+                .filter_map(|o| {
+                    let n = o.identity.generation.parse().ok()?;
+                    Some((o.identity.id.clone(), n))
+                })
+                .collect();
+            registry::reap_hc(ctx, &caller, &snapshot)?;
+            let agents = super::server_dir(ctx, &caller).join("agents");
+            let mut now_done = false;
+            for (id, n) in &not_done {
+                now_done |= super::gens::done(&agents.join(id), *n)?;
+            }
+            if now_done {
                 snapshot = super::membership::Snapshot::for_spawn(ctx, &caller, core)?;
             }
             // The brief rule as far as the request decides it: after the caller's standing (the gate), before the
@@ -1860,6 +1878,96 @@ mod tests {
         assert_eq!(ok["name"], "worker");
         assert_eq!(runs(&w), 1, "one hc run");
         w.fakes.hc_done().unwrap();
+    }
+
+    // Call 51 (QA and TL #142): spawn takes its snapshot again whenever it read a member as not done and the member's
+    // generation is done after the reap, whoever recorded the end. `concurrent`: another reaper publishes ended.json
+    // and notice.json as this reap takes the member lock, so this reap posts nothing. `stale notice`: notice.json is
+    // already there with no end marker; this reap writes the end and posts nothing. Both admit the name.
+    #[test]
+    fn a_member_done_after_the_reap_frees_the_name_whoever_recorded_it() {
+        use crate::agents::{core_fixture as cf, fixture::ID, gens, life_fixture as lf};
+        for case in ["concurrent", "stale notice"] {
+            let w = human();
+            let r = cf::member(
+                &w,
+                ID,
+                json!({"lifecycle": 1, "generation": "1", "hcName": lf::hc_name(1)}),
+            );
+            let f = w.folder(ID);
+            let launch = json!({"hcName": lf::hc_name(1), "launcherArgv": r["launcherArgv"],
+                "sessionId": r["sessionId"]});
+            crate::state::evidence::publish(&gens::path(&f, 1, "launch"), &launch).unwrap();
+            crate::state::evidence::publish(
+                &gens::path(&f, 1, "commit"),
+                &json!({"committed": true}),
+            )
+            .unwrap();
+            let mut t = cf::wire(&r);
+            (t["name"], t["state"], t["reason"], t["exit_code"]) = (
+                json!(lf::hc_name(1)),
+                json!("finished"),
+                json!("exited"),
+                json!(0),
+            );
+            let notice = json!({"kind": "exited", "exitCode": 0, "at": "x"});
+            if case == "stale notice" {
+                gens::publish_once(&f, 1, "notice", &notice).unwrap();
+            } else {
+                let facts = json!({"address": r["hcAddress"], "hcName": lf::hc_name(1),
+                    "labels": t["labels"], "state": "finished", "reason": "exited", "exitCode": 0, "at": "x"});
+                let member = format!("+{}", lock_key("member", &w.caller(), ID));
+                let folder = f.clone();
+                w.fakes.lock_probe(move |event| {
+                    if event == member {
+                        gens::publish_end(&folder, 1, &facts).unwrap();
+                        gens::publish_once(&folder, 1, "notice", &notice).unwrap();
+                    }
+                    String::new()
+                });
+            }
+            public_snapshot(&w, &[], std::slice::from_ref(&t));
+            // The admission snapshot taken again after the reap.
+            cf::listing(&w, &super::super::membership::team(&w.caller()), &[]);
+            cf::get(&w, t["address"].as_str().unwrap(), t.clone());
+            public_launch(&w, "t1");
+            let args = [
+                "spawn", "-Client", "claude", "-Task", "Worker", "-Name", "worker",
+            ];
+            let got = spawn(&w.ctx, &w.request(&args)).map_err(|e| e.message);
+            assert!(gens::done(&f, 1).unwrap(), "{case}: the end is recorded");
+            let got = got.unwrap_or_else(|e| panic!("{case}: {e}"));
+            assert_eq!(got["name"], "worker", "{case}");
+            assert_ne!(got["id"], json!(ID), "{case}: a new member");
+            w.fakes.hc_done().unwrap();
+        }
+    }
+
+    // Call 51 guard: only lifecycle members are checked after the reap. A running pre-lifecycle member whose
+    // launcher claim is torn (the launcher writes gens/0.claim for every member) never decides a spawn of another
+    // name, and the spawn takes one snapshot.
+    #[test]
+    fn a_pre_lifecycle_members_generation_evidence_never_decides_a_spawn() {
+        use crate::agents::core_fixture as cf;
+        let w = human();
+        let r = cf::member(&w, "000000000c01", json!({"name": "busy"}));
+        let gens = w.folder("000000000c01").join("gens");
+        std::fs::create_dir_all(&gens).unwrap();
+        std::fs::write(gens.join("0.claim"), b"{").unwrap();
+        public_snapshot(&w, &[], &[cf::wire(&r)]);
+        public_launch(&w, "t1");
+        let ok = reply(&run(
+            &w,
+            &["-Client", "claude", "-Task", "hi", "-Name", "other"],
+        ));
+        assert_eq!(ok["name"], "other");
+        let ls = w
+            .fakes
+            .hc_calls()
+            .iter()
+            .filter(|(_, a, _)| a[0] == "ls")
+            .count();
+        assert_eq!(ls, 1, "one snapshot");
     }
 
     #[test]
