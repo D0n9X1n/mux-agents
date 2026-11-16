@@ -11,6 +11,9 @@ use crate::hc::{Lazy, Terminal};
 use crate::util::utc_o;
 use serde_json::{Map, Value, json};
 
+mod restore;
+use restore::Done;
+
 /// What one pass read of a member (6b-R1); `classify` decides from this alone.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Seen {
@@ -269,7 +272,15 @@ pub fn run(ctx: &Ctx, anchor: &Caller) -> Res<Map<String, Value>> {
                 continue; // never ran
             }
             match observe(tx, &lazy, &g) {
-                Ok((seen, _)) => decide(&id, &g, classify(&seen), &mut reply),
+                Ok((seen, _)) => {
+                    // r6b call 16: a member that fails here is Unknown; only a crash fails the pass.
+                    if let Err(e) = decide(tx, &lazy, &id, &g, classify(&seen), &seen, &mut reply) {
+                        if e.check == "halted" {
+                            return Err(e);
+                        }
+                        reply.unknown.push(failed(&id, g.record(), &e));
+                    }
+                }
                 Err(e) if e.check == "halted" => return Err(e),
                 Err(e) => reply.unknown.push(failed(&id, g.record(), &e)),
             }
@@ -310,14 +321,45 @@ fn pass_halt(r: Res<()>) -> Res<()> {
     }
 }
 
-/// The reply of one row. Rows 0 and 4 are held here until Tasks 4 and 5.
-fn decide(id: &str, g: &Gen, row: Row, reply: &mut Reply) {
+/// The reply of one row. Row 0 is held here until Task 5.
+fn decide(
+    tx: &Tx<'_>,
+    lazy: &Lazy<'_>,
+    id: &str,
+    g: &Gen,
+    row: Row,
+    seen: &Seen,
+    reply: &mut Reply,
+) -> Res<()> {
     let r = g.record();
-    match row {
-        Row::Stopped | Row::Running | Row::Ended => {}
-        Row::Unknown(check) => reply.unknown.push(entry(id, r, "check", json!(check))),
-        Row::Recover(why) => reply.recover.push(entry(id, r, "reason", json!(why))),
-        Row::Held(why) => reply.held.push(entry(id, r, "reason", json!(why))),
-        Row::Lost | Row::Await => reply.held.push(entry(id, r, "reason", json!("restore"))),
+    let done = match row {
+        Row::Stopped | Row::Running | Row::Ended => return Ok(()),
+        Row::Unknown(check) => {
+            reply.unknown.push(entry(id, r, "check", json!(check)));
+            return Ok(());
+        }
+        Row::Recover(why) => {
+            reply.recover.push(entry(id, r, "reason", json!(why)));
+            return Ok(());
+        }
+        Row::Held(why) => Done::Held(why, None),
+        Row::Lost => restore::restore_lost(tx, lazy, id, g, seen)?,
+        Row::Await => Done::Held("restore".into(), None), // Task 5
+    };
+    match done {
+        Done::Restored(n) => {
+            let sid = restore::session(seen)?; // the conversation n resumed (the spec's --resume value)
+            reply
+                .restored
+                .push(json!({"id": id, "name": r.get("name"), "generation": n, "sessionId": sid}));
+        }
+        Done::Held(why, holder) => {
+            let mut e = entry(id, r, "reason", json!(why));
+            if let Some(h) = holder {
+                e["holder"] = json!(h);
+            }
+            reply.held.push(e);
+        }
     }
+    Ok(())
 }
