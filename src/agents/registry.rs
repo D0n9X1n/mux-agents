@@ -2585,7 +2585,8 @@ fn reap_life(
             t,
             &crate::util::utc_o(ctx.clock.now()),
         )?,
-        None => match g.read(n, "ended").known()? {
+        // Call 46: a visible end is noticed only once its flushes succeed; still one read (b-calls 32).
+        None => match gens::read_flushed(g.folder(), n, "ended")? {
             Some(f) => f,
             None => return Ok(false),
         },

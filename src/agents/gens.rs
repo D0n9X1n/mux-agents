@@ -185,12 +185,35 @@ fn publish_at(
     };
     // chain: <key>, agents, <id>, levels...; flushed innermost first, down to agents (index 1). <key> holds no entry
     // this call can have made.
-    for folder in chain[1..].iter().rev() {
+    flush_up(&chain[1..])?;
+    Ok(found)
+}
+
+/// Flushes each folder, innermost (last) first; a failure is `NOT_FLUSHED`.
+fn flush_up(folders: &[PathBuf]) -> Res<()> {
+    for folder in folders.iter().rev() {
         if crate::state::fs::sync_dir(folder).is_err() {
             return Err(state_refusal(NOT_FLUSHED));
         }
     }
-    Ok(found)
+    Ok(())
+}
+
+/// Call 46: generation n's `<file>.json` through the walk, read once (b-calls 32). Present: the body, after the
+/// folder flushes `publish_once`'s `Exists` answer makes (`gens/<n>`, `gens`, member, `agents`), so a reader acts on
+/// visible evidence only once it is durable; a failed flush is `NOT_FLUSHED`. Absent: None, nothing made or flushed.
+pub fn read_flushed(member: &Path, n: u64, file: &str) -> Res<Option<Value>> {
+    let Some(body) = read(member, n, file).known()? else {
+        return Ok(None);
+    };
+    let agents = member.parent().ok_or_else(evidence::unreadable)?;
+    flush_up(&[
+        agents.to_path_buf(),
+        member.to_path_buf(),
+        member.join("gens"),
+        dir(member, n),
+    ])?;
+    Ok(Some(body))
 }
 
 /// Test hook: runs between the read and the link, so a racer can link first.

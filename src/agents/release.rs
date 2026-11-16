@@ -99,10 +99,12 @@ pub fn release(
 /// done; a caller with an intent runs `release`.
 pub fn finish(tx: &Tx<'_>, lazy: &Lazy<'_>, id: &str, n: u64) -> Res<bool> {
     let folder = tx.folder(id);
-    if gens::read(&folder, n, "released").known()?.is_some() {
+    // Call 46: visible evidence is acted on only once its flushes succeed (`gens::read_flushed`); a flush that fails
+    // stops here with nothing done.
+    if gens::read_flushed(&folder, n, "released")?.is_some() {
         return Ok(true);
     }
-    let Some(rel) = gens::read(&folder, n, "release").known()? else {
+    let Some(rel) = gens::read_flushed(&folder, n, "release")? else {
         return Ok(false);
     };
     conclude(tx, lazy, id, n, &rel)?;
@@ -549,7 +551,13 @@ mod tests {
                 assert!(!released(&m), "{case}");
                 continue;
             }
-            assert_eq!(lf::count(&w, "label"), 1, "{case}");
+            // Call 46: the gens/1 folder fault also fails release.json's flush, so `finish` stops before the relabel;
+            // a file fault on released.json alone comes after it.
+            assert_eq!(
+                lf::count(&w, "label"),
+                usize::from(case == "released content"),
+                "{case}"
+            );
             if case == "released content" {
                 assert!(!released(&m), "{case}");
                 cf::online(&w);
@@ -837,6 +845,49 @@ mod tests {
             }
             assert!(lf::calls(&w).is_empty(), "{intent}: {:?}", lf::calls(&w));
             assert_eq!(lf::record(&m), r, "{intent}: the record stands");
+        }
+    }
+
+    // Call 46 (QA #142): `finish` acts on a visible release.json or released.json only after that file's flushes
+    // succeed (`publish_once` on the body read). With gens/1's folder flush failing across two opens: no label, no
+    // released.json, completing kept. Fault cleared: exactly one label (release.json) or none (released.json), and
+    // completing cleared.
+    #[test]
+    fn visible_release_evidence_is_acted_on_only_once_flushed() {
+        for case in ["release", "released"] {
+            let (w, s) = lf::world();
+            let m = completing(&w, release_intent());
+            let rel =
+                json!({"address": "t1", "hcName": lf::hc_name(1), "cause": "restore", "at": "x"});
+            gens::publish_once(&m, 1, "release", &rel).unwrap();
+            if case == "released" {
+                gens::publish_once(&m, 1, "released", &json!({"at": "x"})).unwrap();
+            } else {
+                cf::online(&w);
+                lf::get(&w, "t1", &lf::lost(&w, 1, lf::LOST_ARGVS[0]));
+                lf::relabel(&w, "t1");
+            }
+            w.fakes.clear_log();
+            crate::state::fs::fail_sync_dir(Some(&gens::dir(&m, 1)));
+            for attempt in 0..2 {
+                open(&w.ctx, &s, |_| Ok(())).unwrap();
+                assert_eq!(lf::count(&w, "label"), 0, "{case} {attempt}: labelled");
+                assert!(
+                    lf::record(&m).get("completing").is_some(),
+                    "{case} {attempt}: completing cleared"
+                );
+                assert_eq!(released(&m), case == "released", "{case} {attempt}");
+            }
+            crate::state::fs::fail_sync_dir(None);
+            open(&w.ctx, &s, |_| Ok(())).unwrap();
+            assert_eq!(
+                lf::count(&w, "label"),
+                usize::from(case == "release"),
+                "{case}"
+            );
+            assert!(lf::record(&m).get("completing").is_none(), "{case}");
+            assert!(released(&m), "{case}");
+            w.fakes.hc_done().unwrap();
         }
     }
 

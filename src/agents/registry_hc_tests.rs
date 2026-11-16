@@ -791,3 +791,59 @@ fn a_held_snapshot_promoted_before_the_reap_records_nothing() {
         w.fakes.hc_done().unwrap();
     }
 }
+
+// Call 46 (QA #142): a forgotten terminal is noticed from `ended.json` only once that file's flushes succeed. The
+// gens/1 folder flush fails while `record_end` publishes, so `ended.json` is visible but not durable; hc then forgets
+// the terminal. With the fault still armed the reap stops with no mail and no notice; cleared, it posts once.
+#[test]
+fn a_forgotten_terminal_posts_only_from_a_flushed_end() {
+    use crate::agents::{gens, life_fixture as lf};
+    let w = World::human("");
+    let c = w.caller();
+    let r = cf::member(
+        &w,
+        ID,
+        json!({"lifecycle": 1, "generation": "1", "hcName": lf::hc_name(1)}),
+    );
+    let (f, address) = (w.folder(ID), r["hcAddress"].as_str().unwrap().to_string());
+    let launch = json!({"hcName": lf::hc_name(1), "launcherArgv": r["launcherArgv"],
+        "sessionId": r["sessionId"]});
+    crate::state::evidence::publish(&gens::path(&f, 1, "launch"), &launch).unwrap();
+    crate::state::evidence::publish(&gens::path(&f, 1, "commit"), &json!({"committed": true}))
+        .unwrap();
+    let mut t = cf::wire(&r);
+    (t["name"], t["state"], t["reason"], t["exit_code"]) = (
+        json!(lf::hc_name(1)),
+        json!("finished"),
+        json!("exited"),
+        json!(7),
+    );
+    w.panes(&[]);
+    let snapshot = |forgotten: bool| {
+        cf::online(&w);
+        cf::listing(&w, &membership::team(&c), &[]);
+        if forgotten {
+            lf::gone(&w, &address);
+        } else {
+            cf::get(&w, &address, t.clone());
+        }
+        membership::Snapshot::take(&w.ctx, &c).unwrap()
+    };
+    let s = snapshot(false);
+    crate::state::fs::fail_sync_dir(Some(&gens::dir(&f, 1)));
+    let first = reap_hc(&w.ctx, &c, &s).map_err(|e| (e.check, e.message));
+    assert_eq!(first, Err(("state", gens::NOT_FLUSHED.to_string())));
+    assert!(gens::path(&f, 1, "ended").exists(), "ended.json visible");
+    let s = snapshot(true);
+    let second = reap_hc(&w.ctx, &c, &s).map_err(|e| (e.check, e.message));
+    crate::state::fs::fail_sync_dir(None);
+    assert_eq!(second, Err(("state", gens::NOT_FLUSHED.to_string())));
+    assert!(messages(&w).is_empty(), "mail posted from an unflushed end");
+    assert!(!gens::path(&f, 1, "notice").exists());
+    let s = snapshot(true);
+    assert!(reap_hc(&w.ctx, &c, &s).unwrap(), "the retry posts");
+    assert_eq!(messages(&w).len(), 1, "one notice");
+    assert_eq!(messages(&w)[0]["exitCode"], 7);
+    assert!(gens::path(&f, 1, "notice").exists());
+    w.fakes.hc_done().unwrap();
+}
