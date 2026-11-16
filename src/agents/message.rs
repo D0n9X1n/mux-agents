@@ -370,15 +370,8 @@ pub fn read(ctx: &Ctx, request: &Request) -> Res<Map<String, Value>> {
             .find(|o| o.identity.id == me.key)
             .map(|o| o.identity.clone())
     });
-    let owner = super::receipt::Owner {
-        id: me.key.clone(),
-        generation: me
-            .record
-            .as_ref()
-            .map(|r| text(r.get("generation")))
-            .filter(|g| !g.is_empty())
-            .unwrap_or_else(|| "0".into()),
-    };
+    // PM call 8, P2: the owner the snapshot selected, never a second read of the folder.
+    let owner = snapshot_owner(&me.key, identity.as_ref(), me.record.as_ref());
     let fence = || identity.as_ref().is_none_or(|i| current(ctx, &caller, i));
     let folder = server_dir(ctx, &caller).join("agents").join(&me.key);
     if cancel {
@@ -591,19 +584,48 @@ fn waiting_files(folder: &Path) -> Vec<(u32, PathBuf)> {
         .collect()
 }
 
-/// The current owner of the agent of `folder`: its id and the generation of its record ("0" when none).
-pub(crate) fn owner_of_folder(folder: &Path) -> Option<super::receipt::Owner> {
-    let id = folder.file_name()?.to_str()?.to_string();
-    let record = read_json(&folder.join("record.json")).ok().flatten()?;
-    let generation = text(record.get("generation"));
-    Some(super::receipt::Owner {
-        id,
-        generation: if generation.is_empty() {
-            "0".into()
-        } else {
-            generation
+/// The mailbox owner of the agent of `folder` (A3a call 13), for the readers `on_call` and `prune_leases`: for a
+/// lifecycle member, the generation its identity stands for (A3a `Status::subject`: a held pending generation, else
+/// the active one, R4); for a pre-lifecycle record, its `generation` ("0" when none). Absent, or a lifecycle member
+/// with no subject: no owner. Unreadable refuses (R2).
+pub(crate) fn owner_of_folder(folder: &Path) -> Res<Option<super::receipt::Owner>> {
+    let Some(id) = folder
+        .file_name()
+        .and_then(|n| n.to_str())
+        .map(str::to_owned)
+    else {
+        return Ok(None);
+    };
+    let generation = match super::gens::member_of(folder) {
+        super::gens::Member::Absent => return Ok(None),
+        super::gens::Member::Unreadable(e) => return Err(e),
+        super::gens::Member::Life(g) => match g.status()?.subject {
+            Some(n) => n.to_string(),
+            None => return Ok(None),
         },
-    })
+        super::gens::Member::Pre(r) => Some(text(r.get("generation")))
+            .filter(|g| !g.is_empty())
+            .unwrap_or_else(|| "0".into()),
+    };
+    Ok(Some(super::receipt::Owner { id, generation }))
+}
+
+/// PM call 8, P2: the owner a mailbox write stamps. The generation of the identity the snapshot selected (a held
+/// identity: its pending generation, R4); else the record `generation`; else "0" (a person). Reads no file.
+pub(crate) fn snapshot_owner(
+    key: &str,
+    identity: Option<&super::core_identity::Identity>,
+    record: Option<&Value>,
+) -> super::receipt::Owner {
+    let generation = identity
+        .map(|i| i.generation.clone())
+        .or_else(|| record.map(|r| text(r.get("generation"))))
+        .filter(|g| !g.is_empty())
+        .unwrap_or_else(|| "0".into());
+    super::receipt::Owner {
+        id: key.to_string(),
+        generation,
+    }
 }
 
 /// A lease naming `owner`, a live pid with its recorded start and a future `until` (W6).
@@ -623,7 +645,7 @@ fn lease_live(ctx: &Ctx, pid: u32, marker: &Value, owner: &super::receipt::Owner
 
 /// Whether the agent of `folder` is on call: a lease of its current owner is live. Reads only.
 pub(crate) fn on_call(ctx: &Ctx, folder: &Path) -> bool {
-    let Some(owner) = owner_of_folder(folder) else {
+    let Ok(Some(owner)) = owner_of_folder(folder) else {
         return false;
     };
     waiting_files(folder).into_iter().any(|(pid, f)| {
@@ -636,7 +658,10 @@ pub(crate) fn on_call(ctx: &Ctx, folder: &Path) -> bool {
 
 /// Removes only stale leases: dead or reused pids, other owners, past `until`. The caller holds the agent lock.
 pub(crate) fn prune_leases(ctx: &Ctx, folder: &Path) {
-    let owner = owner_of_folder(folder).unwrap_or_default();
+    let owner = match owner_of_folder(folder) {
+        Ok(owner) => owner.unwrap_or_default(),
+        Err(_) => return, // ambiguity 12: an unreadable record frees no lease
+    };
     for (pid, file) in waiting_files(folder) {
         if !read_json(&file)
             .ok()
@@ -2139,6 +2164,89 @@ mod tests {
             ["waiting-79.json"],
             "each wait removes only its own"
         );
+    }
+
+    // PM call 13, R4: a held identity owns its pending generation; its lease stays valid when that generation is
+    // promoted; an unreadable record names no owner and frees no lease.
+    #[test]
+    fn a_held_identity_owns_its_pending_generations_leases() {
+        let w = waiting_world();
+        let f = w.folder(ID);
+        std::fs::create_dir_all(&f).unwrap();
+        let held = json!({"lifecycle": 1, "id": ID, "generation": "0", "hcAddress": "t0", "hcName": "m0123abcd",
+            "launcherArgv": ["x"], "sessionId": "s0",
+            "pending": {"gen": 1, "kind": "retry", "hcName": "m4567cdef", "sessionId": "s1"}});
+        crate::state::fs::write_json(&f.join("record.json"), &held).unwrap();
+        let owner = owner_of_folder(&f).unwrap().unwrap();
+        assert_eq!(
+            (owner.id.as_str(), owner.generation.as_str()),
+            (ID, "1"),
+            "the subject is pending 1"
+        );
+        w.fakes.process(crate::testing::row(79, 1, 790));
+        write(
+            &f.join("waiting-79.json"),
+            json!({"pid": 79, "start": 790, "since": SINCE, "owner": {"id": ID, "gen": "1"}, "until": LATER}),
+        );
+        assert!(
+            on_call(&w.ctx, &f),
+            "the held identity is on call through its own lease"
+        );
+        let mut promoted = held.clone();
+        promoted.as_object_mut().unwrap().remove("pending");
+        (
+            promoted["generation"],
+            promoted["hcName"],
+            promoted["sessionId"],
+        ) = (json!("1"), json!("m4567cdef"), json!("s1"));
+        crate::state::fs::write_json(&f.join("record.json"), &promoted).unwrap();
+        prune_leases(&w.ctx, &f);
+        assert_eq!(
+            waiting_names(&w),
+            ["waiting-79.json"],
+            "promotion keeps the lease of generation 1"
+        );
+        std::fs::write(f.join("record.json"), br#"{"lifec"#).unwrap();
+        assert_eq!(owner_of_folder(&f).unwrap_err().check, "evidence");
+        assert!(!on_call(&w.ctx, &f), "an unknown owner is not on call");
+        prune_leases(&w.ctx, &f);
+        assert_eq!(
+            waiting_names(&w),
+            ["waiting-79.json"],
+            "an unreadable record frees no lease"
+        );
+    }
+
+    // PM call 8, P2 (finding 5to8-2): a mailbox write stamps the generation the snapshot selected: a held identity
+    // its pending generation, else the record generation, else "0". No file is read.
+    #[test]
+    fn a_mailbox_write_stamps_the_snapshot_generation() {
+        let held = crate::agents::core_identity::Identity {
+            id: ID.into(),
+            name: "worker".into(),
+            address: String::new(),
+            generation: "1".into(),
+            hc_name: "m4567cdef".into(),
+            team: "k:$3".into(),
+            session_id: crate::agents::fixture::SESSION_ID.into(),
+            launcher: Vec::new(),
+        };
+        let r = json!({"generation": "0"});
+        let got = |i: Option<&crate::agents::core_identity::Identity>, r: Option<&Value>| {
+            snapshot_owner(ID, i, r).generation
+        };
+        assert_eq!(
+            got(Some(&held), Some(&r)),
+            "1",
+            "the held identity, not the record"
+        );
+        assert_eq!(got(None, Some(&r)), "0");
+        assert_eq!(
+            got(None, Some(&json!({"generation": "4"}))),
+            "4",
+            "a record without an hc identity"
+        );
+        assert_eq!(got(None, None), "0", "a person");
     }
 
     #[test]

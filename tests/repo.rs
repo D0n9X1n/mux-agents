@@ -2812,3 +2812,22 @@ fn readme_and_wiki_name_the_herdr_core_dependency() {
         "wiki Usage-zh-CN requirements line"
     );
 }
+
+// PM call 8, P2: only the readers `on_call` and `prune_leases` read the owner from the folder; every mailbox write
+// stamps `snapshot_owner`. Counts are of the production code, comments and literals masked.
+#[test]
+fn mailbox_writers_never_reread_the_owner() {
+    let code = mask(&without_tests(
+        &std::fs::read_to_string("src/agents/message.rs").unwrap(),
+    ));
+    assert_eq!(
+        code.matches("owner_of_folder(").count(),
+        3,
+        "the definition, on_call, prune_leases"
+    );
+    assert_eq!(
+        code.matches("snapshot_owner(").count(),
+        2,
+        "the definition and the writer in read"
+    );
+}
