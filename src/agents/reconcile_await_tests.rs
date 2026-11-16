@@ -9,7 +9,7 @@ use super::reconcile_tests::{X, found, member, ok, released_for_restore, wire_of
 use serde_json::json;
 
 /// `Snapshot::for_spawn`: the team listing, then one `get` per address (`core_facts::take`), in sorted order.
-fn snapshot(w: &World, live: &[&str], gone: &[&str]) {
+pub(super) fn snapshot(w: &World, live: &[&str], gone: &[&str]) {
     cf::listing(w, &lf::team(w), live);
     let mut all: Vec<&str> = live.iter().chain(gone).copied().collect();
     all.sort();

@@ -299,6 +299,64 @@ pub fn run(ctx: &Ctx, anchor: &Caller) -> Res<Map<String, Value>> {
     })
 }
 
+/// A person verb (ambiguity 9): the team its session names, under `up|<upTeam>`; then the one discovery `up` uses
+/// (`existing`, r6b call 6) must name this session as the anchor; then the team Tx.
+pub fn restore(ctx: &Ctx, _: &crate::cli::Request) -> Res<Map<String, Value>> {
+    let person = super::up::person_as(ctx, "run restore")?;
+    let here = super::team_state::Scope::of(&person);
+    let Some(team) = session_team(ctx, &here)? else {
+        return no_team();
+    };
+    super::admit(ctx, &format!("up|{team}"), || {
+        let core = crate::hc::connect(ctx)?;
+        match super::up::discover::existing(ctx, &core, &here.key, &team)? {
+            Some(scope) if scope == here => run(ctx, &anchor_caller(&person, &scope)),
+            _ => no_team(),
+        }
+    })
+}
+
+fn no_team<T>() -> Res<T> {
+    crate::error::refuse(
+        1,
+        "team",
+        "no team in this session; run up from the team folder",
+    )
+}
+
+/// The `upTeam` a lifecycle leader record of `scope` names. Whether it ran is decided by `existing` alone.
+fn session_team(ctx: &Ctx, scope: &super::team_state::Scope) -> Res<Option<String>> {
+    for (_, _, member) in super::gens::members(&scope.agents(&ctx.state_root))? {
+        let super::gens::Member::Life(g) = member else {
+            continue;
+        };
+        let r = g.record();
+        if r.get("session").and_then(Value::as_str) == Some(scope.session.as_str())
+            && super::tree::is_leader(r)
+        {
+            return Ok(r.get("upTeam").and_then(Value::as_str).map(str::to_owned));
+        }
+    }
+    Ok(None)
+}
+
+/// The person caller moved to the anchor scope (ambiguity 7): its key and session; no pane, chain or client.
+pub fn anchor_caller(person: &Caller, scope: &super::team_state::Scope) -> Caller {
+    Caller {
+        kind: crate::caller::Kind::Human,
+        client: None,
+        agent: None,
+        chain: Vec::new(),
+        pane: String::new(),
+        window: String::new(),
+        session: scope.session.clone(),
+        server_key: scope.key.clone(),
+        member: None,
+        candidate: None,
+        ..person.clone()
+    }
+}
+
 /// L2 preamble, after `Tx::open` replayed its hooks: cascades (3d C8), every pending launch (settle-1b G3, `normal`),
 /// every half-done release of an active generation (release-1d R1 replay), then the registry sweep (report-2b K2).
 /// A member that fails here is left for `observe`, which answers it Unknown; a `halted` refusal is a crash and passes.
