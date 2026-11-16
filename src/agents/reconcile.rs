@@ -4,10 +4,12 @@ use super::gens::{Gen, Verdict};
 use super::lifecycle::Life;
 use super::team_state::Tx;
 use super::text;
-use crate::error::Res;
+use crate::caller::Caller;
+use crate::ctx::Ctx;
+use crate::error::{Refusal, Res};
 use crate::hc::{Lazy, Terminal};
 use crate::util::utc_o;
-use serde_json::Value;
+use serde_json::{Map, Value, json};
 
 /// What one pass read of a member (6b-R1); `classify` decides from this alone.
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -189,4 +191,133 @@ pub fn waiting(folder: &std::path::Path, record: &Value) -> Res<bool> {
         .and_then(|r| r.get("cause").cloned());
     Ok(cause == Some(Value::from("restore"))
         && super::gens::read(folder, n, "released").known()?.is_some())
+}
+
+/// L6: the four answers. Running, stopped and ended members are not listed.
+#[derive(Default)]
+struct Reply {
+    restored: Vec<Value>,
+    held: Vec<Value>,
+    unknown: Vec<Value>,
+    recover: Vec<Value>,
+    sweep: Option<&'static str>,
+}
+
+impl Reply {
+    fn map(self) -> Map<String, Value> {
+        let mut m = Map::new();
+        for (k, v) in [
+            ("restored", self.restored),
+            ("held", self.held),
+            ("unknown", self.unknown),
+            ("recover", self.recover),
+        ] {
+            m.insert(k.into(), Value::Array(v));
+        }
+        if let Some(check) = self.sweep {
+            m.insert("sweepError".into(), json!(check));
+        }
+        m
+    }
+}
+
+fn entry(id: &str, record: &Value, k: &str, v: Value) -> Value {
+    json!({"id": id, "name": record.get("name"), k: v})
+}
+
+/// r6b call 16: a member whose deciding or restoring failed is Unknown, named with its check and reason.
+fn failed(id: &str, record: &Value, e: &Refusal) -> Value {
+    json!({"id": id, "name": record.get("name"), "check": e.check, "reason": e.message})
+}
+
+/// The lifecycle members of the Tx's session (r6b call 31: a retired team's records at the same key are not walked).
+fn session_members(tx: &Tx<'_>) -> Res<Vec<(String, Gen)>> {
+    let mut out = Vec::new();
+    for (id, _, member) in super::gens::members(&tx.scope.agents(&tx.ctx.state_root))? {
+        if let super::gens::Member::Life(g) = member
+            && g.record().get("session").and_then(Value::as_str) == Some(tx.scope.session.as_str())
+        {
+            out.push((id, g));
+        }
+    }
+    Ok(out)
+}
+
+/// L2 for the team `anchor` names (ambiguity 7), under the team Tx; `restore` and `up` take `up|T` first.
+pub fn run(ctx: &Ctx, anchor: &Caller) -> Res<Map<String, Value>> {
+    let scope = super::team_state::Scope::of(anchor);
+    super::team_state::open(ctx, &scope, |tx| {
+        let lazy = Lazy::new(tx.ctx);
+        let mut reply = Reply::default();
+        preamble(tx, &lazy, anchor, &mut reply)?;
+        for (id, _, member) in super::gens::members(&scope.agents(&ctx.state_root))? {
+            let g = match member {
+                // 6b-R2, p1c call 6: never read past its record, never written.
+                super::gens::Member::Pre(_) | super::gens::Member::Absent => continue,
+                super::gens::Member::Unreadable(e) => {
+                    reply
+                        .unknown
+                        .push(json!({"id": id, "name": null, "check": e.check}));
+                    continue;
+                }
+                super::gens::Member::Life(g) => g,
+            };
+            if g.record().get("session").and_then(Value::as_str) != Some(scope.session.as_str()) {
+                continue; // r6b call 31
+            }
+            if g.active().is_none() && g.pending().is_none() {
+                continue; // never ran
+            }
+            match observe(tx, &lazy, &g) {
+                Ok((seen, _)) => decide(&id, &g, classify(&seen), &mut reply),
+                Err(e) if e.check == "halted" => return Err(e),
+                Err(e) => reply.unknown.push(failed(&id, g.record(), &e)),
+            }
+        }
+        // shortcut: adopt-3e's `adopt_locked(tx, anchor)` (best effort, `adoptError`, r6b call 17) is not merged yet;
+        // it is called here, once, when it lands.
+        Ok(reply.map())
+    })
+}
+
+/// L2 preamble, after `Tx::open` replayed its hooks: cascades (3d C8), every pending launch (settle-1b G3, `normal`),
+/// every half-done release of an active generation (release-1d R1 replay), then the registry sweep (report-2b K2).
+/// A member that fails here is left for `observe`, which answers it Unknown; a `halted` refusal is a crash and passes.
+fn preamble(tx: &Tx<'_>, lazy: &Lazy<'_>, anchor: &Caller, reply: &mut Reply) -> Res<()> {
+    super::cascade::finish(tx, anchor)?;
+    for (id, g) in session_members(tx)? {
+        if g.pending().is_some() {
+            pass_halt(tx.settle(&id, super::settle::Mode::Normal).map(|_| ()))?;
+        }
+        // reread: settle may have promoted (R3), making another generation active.
+        if let super::gens::Member::Life(g) = super::gens::member_of(g.folder())
+            && let Some(n) = g.active()
+        {
+            pass_halt(super::release::finish(tx, lazy, &id, n).map(|_| ()))?;
+        }
+    }
+    if let Err(e) = crate::state::live::sweep(tx.ctx) {
+        reply.sweep = Some(e.check);
+    }
+    Ok(())
+}
+
+/// Only a crash (`halted`, group B b-calls 36) stops the pass; any other refusal leaves the member to `observe`.
+fn pass_halt(r: Res<()>) -> Res<()> {
+    match r {
+        Err(e) if e.check == "halted" => Err(e),
+        _ => Ok(()),
+    }
+}
+
+/// The reply of one row. Rows 0 and 4 are held here until Tasks 4 and 5.
+fn decide(id: &str, g: &Gen, row: Row, reply: &mut Reply) {
+    let r = g.record();
+    match row {
+        Row::Stopped | Row::Running | Row::Ended => {}
+        Row::Unknown(check) => reply.unknown.push(entry(id, r, "check", json!(check))),
+        Row::Recover(why) => reply.recover.push(entry(id, r, "reason", json!(why))),
+        Row::Held(why) => reply.held.push(entry(id, r, "reason", json!(why))),
+        Row::Lost | Row::Await => reply.held.push(entry(id, r, "reason", json!("restore"))),
+    }
 }
