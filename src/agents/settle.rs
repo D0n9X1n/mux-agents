@@ -456,9 +456,9 @@ fn end_by_kill(
 
 /// Calls 54, 55, 60 replay: settle found no terminal of generation n (`Outcome::Missing`). Only a valid recorded
 /// attempt of this generation counts: `kill.json`'s labels carry `mux.id` `id` and `mux.gen` n, its `hcName` is the
-/// launch's, and its address is the one the record names for n (pending's, or the active one's). hc `not_found`
-/// there records the kill path's end. Anything else leaves `e`: no attempt, a foreign or invalid one, a generation
-/// the record names no address for (an orphan), or any other hc answer.
+/// launch's, and its address is the one the record names for n (pending's, or the active one's); an orphan, which the
+/// record names no address for, is replayed at the attempt's own address (call 64). hc `not_found` there records
+/// the kill path's end. Anything else leaves `e`: no attempt, a foreign or invalid one, or any other hc answer.
 fn forgotten(
     tx: &Tx<'_>,
     lazy: &Lazy<'_>,
@@ -477,14 +477,15 @@ fn forgotten(
         return Err(e);
     };
     let pending = gens::pending(r) == Some(n);
+    let text = |f: &str| k.get(f).and_then(Value::as_str);
     let recorded = if pending {
         r["pending"]["hcAddress"].as_str()
     } else if gens::active(r) == Some(n) {
         r["hcAddress"].as_str()
     } else {
-        None
+        // Call 64: an orphan has no recorded address: the attempt's own, bound by the identity checks below.
+        text("address").filter(|a| !a.is_empty())
     };
-    let text = |f: &str| k.get(f).and_then(Value::as_str);
     let label = |l: &str| labels.get(l).map(String::as_str);
     let generation = n.to_string();
     let ours = !hc_name.is_empty()
@@ -2064,6 +2065,54 @@ mod tests {
             assert!(!aborted, "{case}: aborted published");
             for f in ["terminating", "kill", "ended"] {
                 assert_eq!(gens::read(&m, 1, f), Evidence::Absent, "{case}: {f}.json");
+            }
+            assert_eq!(
+                std::fs::read(m.join("record.json")).unwrap(),
+                before,
+                "{case}: the record changed"
+            );
+        }
+    }
+
+    // Call 64: an orphan (neither active nor pending) has no recorded address, so its kill.json's own address is
+    // taken, only with settle's Missing and the attempt's mux.id, mux.gen and the launch's hcName. A valid attempt and
+    // hc `not_found` end it with the attempt's labels, the record untouched; a foreign id, gen or name leaves it
+    // unresolved.
+    #[test]
+    fn an_orphan_kill_hc_forgot_is_replayed_by_its_own_identity() {
+        for case in ["valid", "foreign id", "foreign gen", "foreign name"] {
+            let (w, s) = lf::world();
+            let m = lf::life(&w, json!({"generation": "2", "hcAddress": "t2"}));
+            lf::seed_gen(&m, 1, Some("run"), lf::committed());
+            let mut labels = lf::running(&w, 1)["labels"].clone();
+            let mut name = lf::hc_name(1);
+            match case {
+                "foreign id" => labels["mux.id"] = json!("bbbbbbbbbbbb"),
+                "foreign gen" => labels["mux.gen"] = json!("2"),
+                "foreign name" => name = lf::hc_name(9),
+                _ => {}
+            }
+            let body = json!({"address": "t1", "hcName": name, "labels": labels, "at": "x"});
+            gens::publish_once(&m, 1, "kill", &body).unwrap();
+            let before = std::fs::read(m.join("record.json")).unwrap();
+            cf::online(&w);
+            lf::ls(&w, 1, &[]);
+            lf::gone(&w, "t1");
+            let got = terminate(&tx(&w, &s), ID, 1);
+            let ended = gens::read(&m, 1, "ended");
+            if case == "valid" {
+                got.unwrap();
+                let end = ended.known().unwrap().unwrap();
+                let got = (&end["address"], &end["reason"], &end["labels"]);
+                assert_eq!(
+                    got,
+                    (&json!("t1"), &json!("terminated"), &labels),
+                    "{case}: the attempt's end"
+                );
+                w.fakes.hc_done().unwrap();
+            } else {
+                assert!(got.is_err(), "{case}: resolved");
+                assert_eq!(ended, Evidence::Absent, "{case}: an end recorded");
             }
             assert_eq!(
                 std::fs::read(m.join("record.json")).unwrap(),
