@@ -460,6 +460,34 @@ fn same_running(t: &Terminal, now: &Terminal) -> bool {
         && now.labels == t.labels
 }
 
+/// settle-1b G8, a `Tx::open` replay hook after `release::complete`: every generation a file or claim names that
+/// is neither active nor pending is settled in Fence mode by its own launch.json identity. Running stays reserved
+/// (orphan-running) until `terminate`. A linked or unreadable member is skipped. Non-fatal per member (ambiguity 10).
+pub fn fence(tx: &Tx<'_>) -> Res<()> {
+    let Ok(all) = gens::members(&tx.scope.agents(&tx.ctx.state_root)) else {
+        return Ok(());
+    };
+    let lazy = Lazy::new(tx.ctx);
+    for (id, folder, member) in all {
+        let gens::Member::Life(g) = member else {
+            continue;
+        };
+        if g.record().get("session").and_then(Value::as_str) != Some(tx.scope.session.as_str()) {
+            continue;
+        }
+        let Ok(named) = gens::named(&folder) else {
+            continue;
+        };
+        for n in named {
+            if Some(n) == g.active() || Some(n) == g.pending() {
+                continue;
+            }
+            let _ = settle_gen(tx, &lazy, &id, n, Mode::Fence, false);
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1574,5 +1602,190 @@ mod tests {
         assert!(lf::record(&m).get("pending").is_none(), "pending dropped");
         assert_eq!(lf::count(&w, "kill"), 1, "one kill");
         w.fakes.hc_done().unwrap();
+    }
+
+    fn open(w: &World, s: &Scope) -> Res<()> {
+        crate::agents::team_state::open(&w.ctx, s, |_| Ok(()))
+    }
+    /// The generations `gens::find` listed, from the `asked`-th hc call on.
+    fn listed(w: &World, asked: usize) -> Vec<String> {
+        lf::calls(w)[asked..]
+            .iter()
+            .filter(|c| c[0] == "ls")
+            .map(|c| c[5].clone())
+            .collect()
+    }
+
+    // G8: only orphans are settled (active 4 and pending 7 untouched): 1 has no claim (abandoned), 3 is committed
+    // and Ended (recorded), 5 is committed and Running (reserved), 6 is committed and Lost (released, cause lost).
+    // `complete` finds no completing, so it never connects; the fence connects once. A second open asks hc only
+    // about the Running orphan.
+    #[test]
+    fn the_fence_settles_only_orphans() {
+        let (w, s) = lf::world();
+        let m = lf::life(
+            &w,
+            json!({"generation": "4", "hcAddress": "t4", "pending": lf::pending(7)}),
+        );
+        lf::seed_gen(&m, 1, None, None);
+        for n in [3, 4, 5, 6, 7] {
+            lf::seed_gen(&m, n, Some("run"), lf::committed());
+        }
+        cf::online(&w);
+        lf::found(&w, 3, &lf::ended(&w, 3));
+        lf::found(&w, 5, &lf::running(&w, 5));
+        lf::found(&w, 6, &lf::lost(&w, 6, lf::LOST_ARGVS[0]));
+        lf::get(&w, "t6", &lf::lost(&w, 6, lf::LOST_ARGVS[0]));
+        lf::relabel(&w, "t6");
+        let before = std::fs::read(m.join("record.json")).unwrap();
+        open(&w, &s).unwrap();
+        assert_eq!(
+            listed(&w, 0),
+            ["mux.gen=3", "mux.gen=5", "mux.gen=6"],
+            "only orphans are asked about"
+        );
+        assert_eq!(gens::claim(&m, 1), Evidence::Present(json!("abandoned")));
+        assert!(
+            matches!(gens::read(&m, 3, "ended"), Evidence::Present(_)),
+            "orphan 3's end is recorded"
+        );
+        assert_eq!(
+            gens::read(&m, 5, "ended"),
+            Evidence::Absent,
+            "orphan-running stays reserved"
+        );
+        assert_eq!(
+            gens::read(&m, 6, "release").known().unwrap().unwrap()["cause"],
+            "lost"
+        );
+        for n in [4, 7] {
+            assert_eq!(
+                gens::read(&m, n, "ended"),
+                Evidence::Absent,
+                "{n} untouched"
+            );
+        }
+        assert_eq!(
+            std::fs::read(m.join("record.json")).unwrap(),
+            before,
+            "the record is untouched"
+        );
+        lf::no_effect(&w);
+        w.fakes.hc_done().unwrap();
+        let asked = lf::calls(&w).len();
+        cf::online(&w);
+        lf::found(&w, 5, &lf::running(&w, 5));
+        open(&w, &s).unwrap();
+        assert_eq!(listed(&w, asked), ["mux.gen=5"], "only the Running orphan");
+        w.fakes.hc_done().unwrap();
+    }
+
+    // Ambiguity 10: a fence hc cannot decide leaves the orphan reserved and the body runs; another session's
+    // member is never settled (no hc call at all: neither hook connects).
+    #[test]
+    fn an_undecidable_fence_stays_reserved_and_another_session_is_untouched() {
+        let (w, s) = lf::world();
+        let m = lf::life(&w, json!({"generation": "2", "hcAddress": "t2"}));
+        lf::seed_gen(&m, 1, Some("run"), lf::committed());
+        cf::online(&w);
+        let id = format!("mux.id={ID}");
+        lf::fails(
+            &w,
+            &[
+                "ls",
+                "--all",
+                "--label",
+                id.as_str(),
+                "--label",
+                "mux.gen=1",
+                "--json",
+            ],
+        );
+        let ran = std::cell::Cell::new(false);
+        crate::agents::team_state::open(&w.ctx, &s, |_| {
+            ran.set(true);
+            Ok(())
+        })
+        .unwrap();
+        assert!(ran.get(), "the body runs");
+        assert_eq!(gens::read(&m, 1, "ended"), Evidence::Absent);
+        w.fakes.hc_done().unwrap();
+        let mut r = lf::record(&m);
+        r["session"] = json!("$4");
+        crate::state::fs::write_json(&m.join("record.json"), &r).unwrap();
+        let asked = lf::calls(&w).len();
+        open(&w, &s).unwrap();
+        assert_eq!(
+            lf::calls(&w).len(),
+            asked,
+            "another session's orphan was settled"
+        );
+    }
+
+    // b-calls 5, release-1d R4 ("run before any classification"): `complete` runs before `fence`. Each hook opens
+    // its own lazy connection, and the fake answers in one fixed order: completion's (`--version`, `get t1`,
+    // `label t1`) and then the fence's (`--version`, `ls` and `get` of orphan 0). Reordered, the fence's `ls`
+    // meets `get t1` and completion's `--version` meets `label t1`: both refuse, `completing` stays.
+    #[test]
+    fn completion_runs_before_the_orphan_fence() {
+        let (w, s) = lf::world();
+        let c = json!({"gen": 1, "intent": "release", "cause": "restore", "address": "t1"});
+        let m = lf::life(
+            &w,
+            json!({"generation": "1", "hcAddress": "t1", "completing": c}),
+        );
+        lf::seed_gen(&m, 0, Some("run"), lf::committed());
+        lf::seed_gen(&m, 1, Some("run"), lf::committed());
+        cf::online(&w);
+        lf::get(&w, "t1", &lf::lost(&w, 1, lf::LOST_ARGVS[0]));
+        lf::relabel(&w, "t1");
+        cf::online(&w);
+        lf::found(&w, 0, &lf::running(&w, 0));
+        open(&w, &s).unwrap();
+        assert!(
+            lf::record(&m).get("completing").is_none(),
+            "completing cleared"
+        );
+        assert!(matches!(
+            gens::read(&m, 1, "released"),
+            Evidence::Present(_)
+        ));
+        assert_eq!(
+            gens::read(&m, 0, "ended"),
+            Evidence::Absent,
+            "orphan 0 is Running: reserved"
+        );
+        w.fakes.hc_done().unwrap();
+    }
+
+    // b-calls 13, 14 (F17): `<agents>/<id>` is a link (Unix symlink; Windows directory symlink or junction through
+    // A3b-1's `crate::testing::link_dir`; every OS) to a folder holding pending 1 and orphan 2, neither claimed.
+    // `settle` refuses `evidence`; `open`'s fence skips the member; nothing is published behind the link; hc is
+    // never asked.
+    #[test]
+    fn a_linked_member_is_never_settled_or_fenced() {
+        use crate::testing::link_dir;
+        let (w, s) = lf::world();
+        let m = pending_member(&w);
+        lf::seed_gen(&m, 1, None, None);
+        lf::seed_gen(&m, 2, None, None);
+        let elsewhere = w.ctx.state_root.parent().unwrap().join("elsewhere");
+        std::fs::rename(&m, &elsewhere).unwrap();
+        link_dir(&elsewhere, &m);
+        let got = settle(&w, &s, Mode::Normal);
+        assert_eq!(
+            got.map_err(|e| e.check),
+            Err("evidence"),
+            "settle through a link"
+        );
+        cf::online(&w);
+        open(&w, &s).unwrap();
+        for n in [1, 2] {
+            assert!(
+                !gens::claim_path(&elsewhere, n).exists(),
+                "{n}: published through the link"
+            );
+        }
+        assert_eq!(lf::calls(&w).len(), 0, "hc asked about a linked member");
     }
 }
