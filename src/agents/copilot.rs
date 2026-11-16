@@ -110,8 +110,12 @@ fn build(from: &Path, temp: &Path, source: &str, target: &str) -> io::Result<()>
 /// `KEY:` without a value; only the text's end may follow a `\n`. KEY is as `entry` says and appears once in its
 /// mapping (the top level, or one parent's children); VALUE is as `scalar` says. A blank line, comment, block
 /// scalar, flow value, anchor, alias, tag, explicit or quoted key, deeper nesting or repeated key refuses, mc_ keys
-/// included, so inside the grammar dropping an `mc_` key with its children is exact.
+/// included, so inside the grammar dropping an `mc_` key with its children is exact. Every character but the `\n`
+/// line ends is `printable` (call 17).
 fn without_mc(text: &str) -> Option<String> {
+    if !text.chars().all(|c| c == '\n' || printable(c)) {
+        return None;
+    }
     let mut lines: Vec<&str> = text.split('\n').collect();
     let end = (lines.last() == Some(&"")).then(|| lines.pop()).flatten();
     let mut kept = Vec::new();
@@ -144,15 +148,27 @@ fn without_mc(text: &str) -> Option<String> {
     Some(kept.join("\n"))
 }
 
-/// `line` as `KEY: VALUE` (value `Some`) or `KEY:` (value `None`); `None` outside the grammar. KEY starts with
-/// `[A-Za-z_]`, goes on with `[A-Za-z0-9_-]*`, and is no bool or null word in any case (call 16), so two keys
-/// resolve to the same YAML key only when they are spelled the same.
+/// Whether `c` may appear in workspace.yaml other than as the `\n` line end: YAML 1.2 c-printable without tab, `\r`,
+/// NEL or the byte-order mark (call 17). An allow-list, so every control and non-character refuses.
+fn printable(c: char) -> bool {
+    matches!(c,
+        '\u{20}'..='\u{7e}'
+        | '\u{a0}'..='\u{d7ff}'
+        | '\u{e000}'..='\u{fefe}'
+        | '\u{ff00}'..='\u{fffd}'
+        | '\u{10000}'..='\u{10ffff}')
+}
+
+/// `line` as `KEY: VALUE` (value `Some`) or `KEY:` (value `None`); `None` outside the grammar. KEY is at most 128
+/// characters (call 17), starts with `[A-Za-z_]`, goes on with `[A-Za-z0-9_-]*`, and is no bool or null word in any
+/// case (call 16), so two keys resolve to the same YAML key only when they are spelled the same.
 fn entry(line: &str) -> Option<(&str, Option<&str>)> {
     let (key, rest) = line.split_once(':')?;
     let mut bytes = key.bytes();
-    if !bytes
-        .next()
-        .is_some_and(|b| b.is_ascii_alphabetic() || b == b'_')
+    if key.len() > 128
+        || !bytes
+            .next()
+            .is_some_and(|b| b.is_ascii_alphabetic() || b == b'_')
         || !bytes.all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
         || matches!(
             key.to_ascii_lowercase().as_str(),
@@ -170,15 +186,8 @@ fn entry(line: &str) -> Option<(&str, Option<&str>)> {
 
 /// A one-line VALUE: `'...'` whose only quotes inside are `''`; `"..."` with no `"` or `\` inside; or a plain scalar
 /// that does not start with an indicator (`- ? : , [ ] { } # & * ! | > ' " % @` or a backtick) or a space, holds
-/// neither `: ` nor ` #`, and does not end in `:`. No value holds a tab, a control character, or a character YAML
-/// reads as a line break or byte-order mark.
+/// neither `: ` nor ` #`, and does not end in `:`. Its characters are already `printable`.
 fn scalar(value: &str) -> bool {
-    if value
-        .chars()
-        .any(|c| c.is_control() || matches!(c, '\u{2028}' | '\u{2029}' | '\u{feff}'))
-    {
-        return false;
-    }
     if let Some(inner) = value.strip_prefix('\'') {
         return inner
             .strip_suffix('\'')
@@ -554,6 +563,39 @@ mod tests {
             copied_workspace("cwd: /work\ngit:\n  root: /a\nremote:\n  root: /b\nsummary: s\n"),
             format!("id: {NEW}\ncwd: /work\ngit:\n  root: /a\nremote:\n  root: /b\nsummary: s\n")
         );
+    }
+
+    #[test]
+    fn copilot_copy_accepts_a_128_character_key() {
+        let body = format!("cwd: /work\nk{}: v\nsummary: s\n", "a".repeat(127));
+        assert_eq!(copied_workspace(&body), format!("id: {NEW}\n{body}"));
+    }
+
+    #[test]
+    fn copilot_copy_refuses_a_129_character_key() {
+        // YAML caps an implicit key at 1024 characters; call 17 caps it at 128.
+        assert!(refused(&format!(
+            "cwd: /work\nk{}: v\nsummary: s\n",
+            "a".repeat(128)
+        )));
+    }
+
+    #[test]
+    fn copilot_copy_refuses_u_fffe_and_u_ffff_in_a_value() {
+        // Not YAML-printable: js-yaml refuses "the stream contains non-printable characters".
+        assert!(refused("cwd: /work\nsummary: a\u{fffe}b\n"));
+        assert!(refused("cwd: /work\nsummary: a\u{ffff}b\n"));
+    }
+
+    #[test]
+    fn copilot_copy_refuses_nel_in_a_value() {
+        assert!(refused("cwd: /work\nsummary: a\u{85}b\n"));
+    }
+
+    #[test]
+    fn copilot_copy_keeps_non_ascii_values_unchanged() {
+        let body = "cwd: /work\nsummary: café 🚀\nnote: 'naïve ✓'\n";
+        assert_eq!(copied_workspace(body), format!("id: {NEW}\n{body}"));
     }
 
     #[test]
