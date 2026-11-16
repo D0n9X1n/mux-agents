@@ -1662,7 +1662,7 @@ exec claude --dangerously-skip-permissions
         assert_eq!(code, 0, "{mux:?} {stop}");
         assert_eq!(
             stop,
-            json!({"ok":true,"verb":"stop","name":w1["name"],"hcAddress":w1["hcAddress"],"life":"ended"})
+            json!({"ok":true,"verb":"stop","name":w1["name"],"hcAddress":w1["hcAddress"],"life":"ended","stopped":true,"unresolved":[]})
         );
         let (code, reply) = live.server.job_wait(job, LONG);
         let took = at.elapsed();
@@ -1678,7 +1678,7 @@ exec claude --dangerously-skip-permissions
         let (code, stop) = live.run(&["stop", "w2"]);
         assert_eq!(
             stop,
-            json!({"ok":true,"verb":"stop","name":w2["name"],"hcAddress":w2["hcAddress"],"life":"ended"})
+            json!({"ok":true,"verb":"stop","name":w2["name"],"hcAddress":w2["hcAddress"],"life":"ended","stopped":true,"unresolved":[]})
         );
         assert_eq!(code, 0);
         // Nothing is consumed without an ack (#103 4b-i): this read acks w1's batch, then waits for w2's.
@@ -1724,7 +1724,7 @@ exec claude --dangerously-skip-permissions
             assert_eq!(code, 0, "{stop}");
             assert_eq!(
                 stop,
-                json!({"ok":true,"verb":"stop","name":w["name"],"hcAddress":w["hcAddress"],"life":"ended"})
+                json!({"ok":true,"verb":"stop","name":w["name"],"hcAddress":w["hcAddress"],"life":"ended","stopped":true,"unresolved":[]})
             );
             assert!(eventually(LONG, || core(
                 &live,
@@ -4421,7 +4421,7 @@ hc {}:
         assert_eq!(code, 0);
         assert_eq!(
             stop,
-            json!({"ok":true,"verb":"stop","name":"w1","hcAddress":w1["hcAddress"],"life":"ended"})
+            json!({"ok":true,"verb":"stop","name":"w1","hcAddress":w1["hcAddress"],"life":"ended","stopped":true,"unresolved":[]})
         );
         assert!(eventually(LONG, || core(
             &live,
@@ -4620,13 +4620,15 @@ hc {}:
         ] {
             assert_eq!(after[k], before[k], "{k}");
         }
-        assert_eq!(after["pane"], focus["pane"]);
+        // V1 (views-6f): a lifecycle member's view is in view.json; record.json never holds its pane.
+        assert_eq!(live.view_of(s(&w["id"]))["pane"], focus["pane"]);
+        assert!(after.get("pane").is_none(), "{after}");
         assert_eq!(live.worker_pid(&w), pid);
         let (code, stop) = live.run(&["stop", "w1"]);
         assert_eq!(code, 0, "{stop}");
         assert_eq!(
             stop,
-            json!({"ok":true,"verb":"stop","name":"w1","hcAddress":address,"life":"ended"})
+            json!({"ok":true,"verb":"stop","name":"w1","hcAddress":address,"life":"ended","stopped":true,"unresolved":[]})
         );
         assert!(eventually(LONG, || core(
             &live,

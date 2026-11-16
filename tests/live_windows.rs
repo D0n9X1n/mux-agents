@@ -574,7 +574,7 @@ fn hc_worker_and_view_close_survives_focus_stop() {
     assert_eq!(get()["argv"], before["argv"]);
     assert_eq!(
         live.run(&["stop", "w1"]),
-        serde_json::json!({"ok":true,"verb":"stop","name":"w1","hcAddress":address,"life":"ended"})
+        serde_json::json!({"ok":true,"verb":"stop","name":"w1","hcAddress":address,"life":"ended","stopped":true,"unresolved":[]})
     );
     live.wait("finished core terminal", || {
         (get()["state"] == "finished").then_some(())
@@ -668,7 +668,7 @@ fn hc_stop_then_resume_returns_with_its_conversation() {
     };
     assert_eq!(
         live.run(&["stop", "w1"]),
-        serde_json::json!({"ok":true,"verb":"stop","name":"w1","hcAddress":address,"life":"ended"})
+        serde_json::json!({"ok":true,"verb":"stop","name":"w1","hcAddress":address,"life":"ended","stopped":true,"unresolved":[]})
     );
     live.wait("finished core terminal", || {
         (get(&address)["state"] == "finished").then_some(())
