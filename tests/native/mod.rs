@@ -54,6 +54,10 @@ pub fn ctx(state: &Path) -> mux_agent::ctx::Ctx {
 }
 
 /// PM call 10 (and occupy-3, o3 call 6): a DACL that denies everyone PROCESS_QUERY_INFORMATION, PROCESS_QUERY_LIMITED_INFORMATION and PROCESS_VM_READ.
+/// r2b call 24: an enabled SeDebugPrivilege lets `OpenProcess` past any DACL, and GitHub's `windows-latest` runs the
+/// tests elevated with it enabled (observed: High integrity, Administrators enabled, SeDebugPrivilege Enabled). So this
+/// process drops it first: the deny then holds for this process's reads, and for every reader it starts afterwards
+/// (a child copies the token's privilege states), as it does for a standard user.
 #[cfg(windows)]
 pub fn deny_queries(child: &std::process::Child) {
     use std::os::windows::io::AsRawHandle;
@@ -64,6 +68,7 @@ pub fn deny_queries(child: &std::process::Child) {
     use windows_sys::Win32::Security::{
         DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, SetKernelObjectSecurity,
     };
+    disable_debug_privilege();
     let sddl: Vec<u16> = "D:(D;;0x1410;;;WD)".encode_utf16().chain([0]).collect();
     let mut sd: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
     // SAFETY: a NUL-terminated SDDL string and a valid out pointer; `sd` is freed below.
@@ -82,6 +87,72 @@ pub fn deny_queries(child: &std::process::Child) {
     // SAFETY: allocated by ConvertString...W.
     unsafe { LocalFree(sd) };
     assert_ne!(set, 0, "SetKernelObjectSecurity");
+}
+
+/// Disables SeDebugPrivilege in this process's token (r2b call 24). A token without it (a standard user) is left as it
+/// is (`ERROR_NOT_ALL_ASSIGNED`); any other failure panics, so the deny never silently depends on the runner.
+#[cfg(windows)]
+fn disable_debug_privilege() {
+    use windows_sys::Win32::Foundation::{
+        CloseHandle, ERROR_NOT_ALL_ASSIGNED, ERROR_SUCCESS, GetLastError, HANDLE, LUID,
+    };
+    use windows_sys::Win32::Security::{
+        AdjustTokenPrivileges, LUID_AND_ATTRIBUTES, LookupPrivilegeValueW, TOKEN_ADJUST_PRIVILEGES,
+        TOKEN_PRIVILEGES, TOKEN_QUERY,
+    };
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+    let name: Vec<u16> = "SeDebugPrivilege".encode_utf16().chain([0]).collect();
+    let mut luid = LUID {
+        LowPart: 0,
+        HighPart: 0,
+    };
+    // SAFETY: a NUL-terminated name and a valid out pointer.
+    assert_ne!(
+        unsafe { LookupPrivilegeValueW(std::ptr::null(), name.as_ptr(), &mut luid) },
+        0,
+        "LookupPrivilegeValueW(SeDebugPrivilege)"
+    );
+    let mut token: HANDLE = std::ptr::null_mut();
+    // SAFETY: this process's pseudo handle and a valid out pointer; the token is closed below.
+    assert_ne!(
+        unsafe {
+            OpenProcessToken(
+                GetCurrentProcess(),
+                TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY,
+                &mut token,
+            )
+        },
+        0,
+        "OpenProcessToken"
+    );
+    // Attributes 0: disabled. OpenProcess honours only enabled privileges.
+    let off = TOKEN_PRIVILEGES {
+        PrivilegeCount: 1,
+        Privileges: [LUID_AND_ATTRIBUTES {
+            Luid: luid,
+            Attributes: 0,
+        }],
+    };
+    // SAFETY: an open token with TOKEN_ADJUST_PRIVILEGES and one privilege; the previous state is not asked for.
+    let adjusted = unsafe {
+        AdjustTokenPrivileges(
+            token,
+            0,
+            &off,
+            0,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        )
+    };
+    // SAFETY: no preconditions; read right after the call it describes.
+    let error = unsafe { GetLastError() };
+    // SAFETY: the token opened above, closed once.
+    unsafe { CloseHandle(token) };
+    assert_ne!(adjusted, 0, "AdjustTokenPrivileges");
+    assert!(
+        error == ERROR_SUCCESS || error == ERROR_NOT_ALL_ASSIGNED,
+        "AdjustTokenPrivileges: error {error}"
+    );
 }
 
 /// What a deny depends on, for a precondition that fails: this process's privileges and integrity (`whoami`), the DACL
