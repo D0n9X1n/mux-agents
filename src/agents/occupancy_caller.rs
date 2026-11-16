@@ -58,6 +58,13 @@ pub(super) fn exempt(ctx: &Ctx, own: &Own, rows: &[Row], os: OsKind) -> Option<E
         None if native => e.key = None, // call 17: missing, startless or unrecognized saved parent
         None => {}
     }
+    // o3 call 34 N1: the report key is the one the proof established, never re-derived from a parent that may have
+    // replaced an exited loader. A possibly-native caller whose proof established none cannot be keyed: Evidence.
+    e.key = match own.key {
+        Some(key) => Some(key),
+        None if native => None,
+        None => e.key,
+    };
     for r in rows.iter().filter(|r| r.ppid == proven.pid) {
         let joins = paired(r).is_some_and(|l| l.pid != r.pid && same(ctx, &l, proven.pid, start));
         if let (true, Some(s)) = (joins, r.start) {

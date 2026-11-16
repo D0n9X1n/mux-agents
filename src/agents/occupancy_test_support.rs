@@ -125,7 +125,7 @@ pub(super) fn held_as(w: &World, s: &str, kind: Client, os: OsKind, own: &Own) -
 
 /// `World::agent`'s pane caller, proven agent 150 (start 1500), no standing.
 pub(super) fn pane_own(w: &World) -> Own {
-    own_of(&w.caller(), None).unwrap()
+    own_of(&w.ctx, &w.caller(), None).unwrap()
 }
 
 /// Rows `node` 7100 (`loader_start`) and its native child `copilot` 7101 (start 2101), both Copilot clients.

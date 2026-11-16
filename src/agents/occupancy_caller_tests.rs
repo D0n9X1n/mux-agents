@@ -97,15 +97,20 @@ fn own_is_the_proof_never_the_chain() {
         flags: Vec::new(),
     };
     assert_eq!(
-        own_of(&hc, None),
+        own_of(&w.ctx, &hc, None),
         None,
         "no proof, no exemption; the chain is not read"
     );
     assert_eq!(
-        own_of(&hc, Some(&crate::agents::tree::Standing::Person)),
+        own_of(&w.ctx, &hc, Some(&crate::agents::tree::Standing::Person)),
         None
     );
-    let own = own_of(&hc, Some(&crate::agents::tree::Standing::Member(proof))).unwrap();
+    let own = own_of(
+        &w.ctx,
+        &hc,
+        Some(&crate::agents::tree::Standing::Member(proof)),
+    )
+    .unwrap();
     assert_eq!((own.kind, own.pid, own.start), (Client::Claude, 160, 1600));
     w.fakes.process(Row {
         argv: Some(vec!["claude".into()]),
@@ -143,10 +148,17 @@ fn a_copilot_callers_loader_joins_only_by_report_2bs_rule() {
         (OsKind::Windows, 2100),
     ] {
         let w = World::agent("");
+        // The key the proof establishes: the loader when it pairs; none for a newer loader; on Windows the client.
+        let key = match (os, loader_start) {
+            (OsKind::Windows, _) => Some((7101, 2101)),
+            (_, 2100) => Some((7100, 2100)),
+            _ => None,
+        };
         let own = Own {
             kind: Client::Copilot,
             pid: 7101,
             start: 2101,
+            key,
         };
         copilot_pair_rows(&w, Some(loader_start));
         let case = format!("{os:?} loader start {loader_start}");
@@ -180,6 +192,7 @@ fn a_startless_saved_loader_holds_and_is_never_read_again() {
         kind: Client::Copilot,
         pid: 7101,
         start: 2101,
+        key: None,
     };
     copilot_pair_rows(&w, None);
     w.state();
@@ -209,6 +222,7 @@ fn a_loader_callers_native_child_is_exempt() {
             kind: Client::Copilot,
             pid: 7100,
             start: 2100,
+            key: Some((7100, 2100)),
         };
         copilot_pair_rows(&w, Some(2100));
         if os == OsKind::Windows {
@@ -257,6 +271,7 @@ fn a_callers_loader_exiting_between_reads_still_holds_its_report() {
         kind: Client::Copilot,
         pid: 7101,
         start: 2101,
+        key: Some((7100, 2100)),
     };
     let pair = |report: bool| {
         let w = World::agent("");
@@ -306,6 +321,7 @@ fn an_unresolved_caller_identity_holds_its_report_as_evidence() {
         kind: Client::Copilot,
         pid: 7101,
         start: 2101,
+        key: None,
     };
     let native = |path: Option<&str>, start: Option<i64>| Row {
         pid: 7101,
@@ -335,6 +351,11 @@ fn an_unresolved_caller_identity_holds_its_report_as_evidence() {
             (Rule::Evidence, Some(7101)),
         ),
     ] {
+        // N1: the control and Q2 carry the proof's loader key; Q1's proof established none (its path unreadable).
+        let own = Own {
+            key: (case != "Q1 path unreadable").then_some((7100, 2100)),
+            ..own
+        };
         let w = World::agent("");
         w.state();
         w.fakes.forget(CLAUDE); // the pane's own claude would hold every Claude query
@@ -348,4 +369,71 @@ fn an_unresolved_caller_identity_holds_its_report_as_evidence() {
             "{case}"
         );
     }
+}
+
+// o3 call 34 N1: proven native 7101, whose proof established the report key (7100, 2100), its loader. The loader
+// exits before occupancy's table read and 7101 is reparented to a readable non-node parent: the report under the
+// proven key still decides (Caller naming 7101); a torn report holds as Evidence. Never re-keyed by the new parent.
+#[test]
+fn a_native_callers_proven_key_survives_its_loaders_exit() {
+    let own = Own {
+        kind: Client::Copilot,
+        pid: 7101,
+        start: 2101,
+        key: Some((7100, 2100)),
+    };
+    // (torn report, proof key): a keyless native under a non-node parent cannot be keyed either: Evidence.
+    for (torn_report, key) in [(false, own.key), (true, own.key), (false, None)] {
+        let own = Own { key, ..own };
+        let w = World::agent("");
+        w.state();
+        w.fakes.forget(CLAUDE);
+        copilot_pair_rows(&w, Some(2100));
+        live::report(&w.ctx, Client::Copilot, 7100, 2100, X, "resume").unwrap();
+        if torn_report {
+            torn(&live::path(&w.ctx, Client::Copilot, 7100, 2100));
+        }
+        w.fakes.forget(7100);
+        w.fakes.forget(7101);
+        let at = |pid: u32, ppid: u32, start: i64, file: &str| Row {
+            pid,
+            ppid,
+            start: Some(start),
+            path: Some(format!("/usr/lib/{file}")),
+            argv: Some(vec![file.into()]),
+            image: Some(file.into()),
+        };
+        w.fakes.process(at(7200, 1, 1000, "sh"));
+        w.fakes.process(at(7101, 7200, 2101, "copilot"));
+        w.fakes.client(7101, Client::Copilot);
+        let want = if torn_report || key.is_none() {
+            (Rule::Evidence, Some(7101))
+        } else {
+            (Rule::Caller, Some(7101))
+        };
+        assert_eq!(
+            held_as(&w, X, Client::Copilot, OsKind::Unix, &own),
+            Some(want),
+            "torn report {torn_report}, key {key:?}"
+        );
+    }
+}
+
+// o3 call 34 N1: the report key is fixed at proof time: a member's client.json client; a pane caller's agent through
+// report-2b's `ancestry::identity` (here the pane's claude 150 itself).
+#[test]
+fn the_proof_fixes_the_report_key() {
+    let w = World::agent("");
+    assert_eq!(pane_own(&w).key, Some((CLAUDE, 1500)));
+    let proof = crate::agents::tree::Member {
+        id: ID.into(),
+        record: json!({}),
+        client: Client::Copilot,
+        pid: 7100,
+        start: 2100,
+        flags: Vec::new(),
+    };
+    let standing = crate::agents::tree::Standing::Member(proof);
+    let own = own_of(&w.ctx, &w.caller(), Some(&standing)).unwrap();
+    assert_eq!(own.key, Some((7100, 2100)));
 }

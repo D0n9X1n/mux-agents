@@ -114,25 +114,38 @@ pub struct Own {
     pub kind: Client,
     pub pid: u32,
     pub start: i64,
+    /// o3 call 34 N1: the (pid, start) the proof established for this client's registry reports (a Copilot npm
+    /// client's loader), fixed at proof time; `None` when it could not be established.
+    pub key: Option<(u32, i64)>,
 }
 
 /// Call 7: from the proof only. A member standing (an hc member, or a candidate re-proven under the lock) gives its
 /// `tree::Member` client (pid, start); with no standing, a pane caller's proven agent; anything else nothing.
 /// `caller.chain` is never read.
-pub fn own_of(caller: &Caller, standing: Option<&Standing>) -> Option<Own> {
+pub fn own_of(ctx: &Ctx, caller: &Caller, standing: Option<&Standing>) -> Option<Own> {
     match standing {
+        // client.json names the client the launcher recorded: for a Copilot npm client, its loader (proof-0b K1a).
         Some(Standing::Member(m)) => Some(Own {
             kind: m.client,
             pid: m.pid,
             start: m.start,
+            key: Some((m.pid, m.start)),
         }),
         Some(Standing::Person) => None,
         None => {
             let agent = caller.agent.as_ref()?;
+            let kind = caller.client?;
+            // The key report-2b writes under, read now while the proof's rows are live (`ancestry::identity`).
+            let key = ctx
+                .os
+                .row(agent.pid)
+                .filter(|r| r.start.is_some_and(|s| ctx.os.same_start(s, agent.start)))
+                .and_then(|r| crate::agents::ancestry::identity(ctx, &r, kind));
             Some(Own {
-                kind: caller.client?,
+                kind,
                 pid: agent.pid,
                 start: agent.start,
+                key,
             })
         }
     }

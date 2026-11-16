@@ -203,7 +203,7 @@ fn admit(
     // under this lock (a candidate's re-proof included), else a pane caller's proven agent. A record naming no known
     // client skips this and is refused `internal` below, before any launch (ambiguity 9).
     if let Some(kind) = client_named(&text(record.get("client"))) {
-        let own = super::occupancy::own_of(caller, gate.map(|(_, s)| s));
+        let own = super::occupancy::own_of(ctx, caller, gate.map(|(_, s)| s));
         if let Some(hold) = super::occupancy::held(ctx, &x.identity.session_id, kind, own.as_ref())
         {
             return refuse(2, "session", hold.message());
