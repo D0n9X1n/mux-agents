@@ -361,6 +361,20 @@ fn failure(verb: Option<&str>, refusal: &Refusal) -> Map<String, Value> {
 pub(crate) const HERDR: &str =
     "this terminal is herdr's: use herdr's own skills (hc --skill), not mux-agents";
 
+/// K2: the refusal of a view verb, and of any multiplexer call, for a member whose views are down.
+pub(crate) const VIEWS_DOWN: &str = "the team's views are down; run up";
+
+/// proof-0b K2, ambiguity 10: the verbs that open, select or place a view.
+const VIEW_VERBS: &[&str] = &["focus", "spawn", "resume", "sidebar", "watch", "placement"];
+
+/// K2 (W3): a proven member whose views are down still sends, reads and reports; a view verb needs `up` first.
+pub(crate) fn views_required(verb: &str, caller: &crate::caller::Caller) -> Res<()> {
+    if VIEW_VERBS.contains(&verb) && caller.member.is_some() && caller.presentation.is_none() {
+        return refuse(1, "views", VIEWS_DOWN);
+    }
+    Ok(())
+}
+
 fn dispatch(def: &VerbDef, request: &Request, ctx: &Ctx) -> Res<Map<String, Value>> {
     #[cfg(feature = "test-panic")]
     if ctx.env.get("MUX_AGENTS_TEST_PANIC") == Some("dispatch") {
@@ -378,6 +392,7 @@ fn dispatch(def: &VerbDef, request: &Request, ctx: &Ctx) -> Res<Map<String, Valu
         if caller.candidate.is_some() && !crate::agents::tree::candidate_verb(def.name, request) {
             return Err(crate::agents::tree::tagged());
         }
+        views_required(def.name, &caller)?;
     }
     // Every public verb refuses a sandboxed caller before any multiplexer call (MuxAgents.ps1:94).
     crate::sandbox::assert_unsandboxed(ctx)?;
@@ -535,6 +550,34 @@ mod tests {
 
     fn parsed(tokens: &[&str]) -> Request {
         parse(&args(tokens)).unwrap().1
+    }
+
+    // proof-0b K2, ambiguity 10: only the view verbs need a presented view, and only a proven member can lack one.
+    #[test]
+    fn only_view_verbs_need_a_presented_view() {
+        let w = crate::agents::fixture::World::human("");
+        let mut c = w.caller();
+        c.member = Some(crate::agents::fixture::ID.into());
+        c.presentation = None;
+        for verb in ["focus", "spawn", "resume", "sidebar", "watch", "placement"] {
+            let e = views_required(verb, &c).unwrap_err();
+            assert_eq!(
+                (e.code, e.check, e.message.as_str()),
+                (1, "views", VIEWS_DOWN),
+                "{verb}"
+            );
+        }
+        for verb in ["send", "read", "report", "status", "list", "stop", "notify"] {
+            assert!(views_required(verb, &c).is_ok(), "{verb}");
+        }
+        c.presentation = Some(("%1".into(), "@1".into()));
+        assert!(views_required("focus", &c).is_ok(), "a presented member");
+        (c.member, c.presentation) = (None, None);
+        assert!(
+            views_required("focus", &c).is_ok(),
+            "only a member is refused here"
+        );
+        assert_eq!(VIEWS_DOWN, "the team's views are down; run up");
     }
 
     fn usage_of(tokens: &[&str]) -> (u8, &'static str) {

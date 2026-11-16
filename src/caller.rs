@@ -140,16 +140,17 @@ fn resolve_as(ctx: &Ctx, tree: bool) -> Res<Caller> {
         if c.candidate.is_some() && !tree {
             return Err(crate::agents::tree::tagged());
         }
-        if ctx.mux.borrow().is_none() {
-            let mux = crate::mux::RealMux::for_member(
-                ctx,
+        // 4to6 #1, PM call 9: nothing is built here; a verb that needs the multiplexer reaches exactly this server.
+        *ctx.member_mux.borrow_mut() = match c.presentation {
+            Some(_) => crate::mux::MemberMux::Live(
                 crate::mux::Endpoint {
                     socket: c.socket.clone(),
                     server_pid: c.server_pid,
                 },
-            )?;
-            *ctx.mux.borrow_mut() = Some(Box::new(mux));
-        }
+                c.server_start,
+            ),
+            None => crate::mux::MemberMux::Down,
+        };
         return Ok(c);
     }
     let not_inside = || endpoint_refusal(&crate::mux::not_inside(crate::mux::env_kind(&ctx.env)));

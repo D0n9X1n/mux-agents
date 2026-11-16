@@ -77,6 +77,8 @@ pub struct Ctx {
     pub os: Box<dyn Os>,
     // Resolved on first use, so verbs that never reach the multiplexer never probe for it.
     pub mux: RefCell<Option<Box<dyn Mux>>>,
+    /// How a proven member's multiplexer is reached (A3c ambiguity 16).
+    pub member_mux: RefCell<crate::mux::MemberMux>,
     pub hc: Box<dyn crate::hc::Hc>,
     pub clock: Box<dyn Clock>,
     // The launcher's pane already passed the sandbox check when it was spawned.

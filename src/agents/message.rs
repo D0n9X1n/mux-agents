@@ -891,7 +891,7 @@ const CLIENT_EXIT_POLL: Duration = Duration::from_millis(250);
 /// `client` its `launcher.json` names. Each is read as typed evidence (`gens::walk`: regular files only,
 /// never a FIFO, a folder or a link, so the read never blocks).
 #[derive(Debug, PartialEq)]
-enum Recorded {
+pub(super) enum Recorded {
     /// No such file, or a `launcher.json` that names no client: nothing to wait for.
     Absent,
     /// Torn, not a regular file, or without a plain pid and start: the exit cannot be proven.
@@ -983,7 +983,7 @@ pub fn stop_hc(ctx: &Ctx, request: &Request) -> Res<Map<String, Value>> {
 /// PM calls 9, 11, P1: a lifecycle member is stopped by ending generation n, the generation of the identity
 /// `current` revalidated, through group B's `gens::terminate` (D3: a Lost generation is released, never killed), then
 /// the Stopped notice of n. Unresolved: the error is returned and nothing is noticed.
-fn stop_life(
+pub(super) fn stop_life(
     ctx: &Ctx,
     caller: &Caller,
     standing: Option<&super::tree::Standing>,

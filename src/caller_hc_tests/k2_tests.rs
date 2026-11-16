@@ -264,3 +264,163 @@ fn a_held_member_is_presented_by_its_pending_view() {
     let got = caller::resolve(&w.ctx).expect("a held member resolves without its server");
     assert_eq!(got.presentation, None, "server gone");
 }
+
+// 4to6 #1, PM call 10, ambiguity 10 (A3c Task 6): with its server gone, a member runs status, report and read and builds
+// no multiplexer; focus and spawn are refused `views` in dispatch. (`list` runs: PM call 18, the next test.)
+#[test]
+fn a_member_whose_views_are_down_builds_no_multiplexer() {
+    for (args, field, want) in [
+        (
+            vec!["status", "-BodyFile", "body.txt"],
+            "text",
+            json!("hello"),
+        ),
+        (
+            vec!["report", "blocked", "-Kind", "question"],
+            "state",
+            json!("blocked"),
+        ),
+        (vec!["read"], "ids", json!([])),
+        (vec!["focus", "worker"], "check", json!("views")),
+        (
+            vec![
+                "spawn",
+                "-Client",
+                "claude",
+                "-TaskFile",
+                "body.txt",
+                "-BriefFile",
+                "body.txt",
+                "-Name",
+                "w9",
+            ],
+            "check",
+            json!("views"),
+        ),
+    ] {
+        let (w, r, folder) = lifecycle_worker(ok(), ok());
+        std::fs::remove_file(folder.join("view.json")).unwrap();
+        kill_server(&w, &folder);
+        *w.ctx.mux.borrow_mut() = None;
+        w.file("body.txt", b"hello");
+        let (team, address) = (
+            r["team"].as_str().unwrap(),
+            r["hcAddress"].as_str().unwrap(),
+        );
+        let refused = matches!(args[0], "focus" | "spawn");
+        proof(&w, &r);
+        if !refused {
+            proof(&w, &r); // the handler resolves again
+        }
+        if !refused {
+            cf::online(&w);
+            cf::listing(&w, team, &[address]);
+            cf::get(&w, address, wire(&r));
+            if args[0] == "read" {
+                cf::online(&w);
+                cf::get(&w, address, wire(&r));
+            }
+        }
+        let before = crate::testing::tree(&w.ctx.state_root);
+        let (code, out) = crate::cli::run(
+            &args.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+            || Ok(&w.ctx),
+        );
+        let v: Value = serde_json::from_str(&out).unwrap();
+        if refused {
+            assert_eq!((code, &v["check"]), (1, &want), "{args:?}: {out}");
+            assert_eq!(
+                crate::testing::tree(&w.ctx.state_root),
+                before,
+                "{args:?}: nothing made"
+            );
+        } else {
+            assert_eq!((code, &v[field]), (0, &want), "{args:?}: {out}");
+        }
+        assert!(
+            w.ctx.mux.borrow().is_none(),
+            "{args:?}: no multiplexer built"
+        );
+    }
+}
+
+// PM calls 18, 24: with its views down a member lists every member, from records and hc, without pane-derived fields;
+// nothing is refused and no multiplexer is built. `board` lists through `membership::Snapshot::take`, which already
+// tolerates the failed pane read; this pins it, and that `list` stays off the view verbs.
+#[test]
+fn a_member_whose_views_are_down_lists_every_member() {
+    let (w, r, folder) = lifecycle_worker(ok(), ok());
+    std::fs::remove_file(folder.join("view.json")).unwrap();
+    kill_server(&w, &folder);
+    *w.ctx.mux.borrow_mut() = None;
+    let (team, address) = (
+        r["team"].as_str().unwrap(),
+        r["hcAddress"].as_str().unwrap(),
+    );
+    proof(&w, &r);
+    proof(&w, &r); // the handler resolves again
+    cf::online(&w);
+    cf::listing(&w, team, &[address]);
+    cf::get(&w, address, wire(&r));
+    let (code, out) = crate::cli::run(&["list".to_string()], || Ok(&w.ctx));
+    let v: Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(code, 0, "list runs with views down: {out}");
+    let row = v["agents"]
+        .as_array()
+        .and_then(|a| a.iter().find(|x| x["name"] == "worker"))
+        .cloned()
+        .unwrap_or_default();
+    assert!(!row.is_null(), "the member is listed: {out}");
+    assert!(
+        ["pane", "window", "title"]
+            .iter()
+            .all(|k| row.get(*k).is_none_or(Value::is_null)),
+        "no pane fields: {row}"
+    );
+    assert!(w.ctx.mux.borrow().is_none(), "no multiplexer built");
+}
+
+// PM call 9 (4to7re #1): the server is live at proof and gone, or restarted, by the first multiplexer call: `views`,
+// nothing built, never tmux on PATH.
+#[test]
+fn a_server_gone_after_proof_refuses_views_at_first_use() {
+    for restarted in [false, true] {
+        let (w, r, folder) = lifecycle_worker(ok(), ok());
+        proof(&w, &r);
+        let c = caller::resolve(&w.ctx).unwrap();
+        assert!(
+            c.presentation.is_some(),
+            "{restarted}: proven with its view up"
+        );
+        *w.ctx.mux.borrow_mut() = None;
+        kill_server(&w, &folder);
+        if restarted {
+            w.fakes
+                .process(crate::testing::row(c.server_pid, 1, c.server_start + 1));
+        }
+        let e = crate::mux::native(&w.ctx, &["list-panes"], true).unwrap_err();
+        assert_eq!((e.code, e.check), (1, "views"), "{restarted}: {e:?}");
+        assert!(w.ctx.mux.borrow().is_none(), "{restarted}: nothing built");
+    }
+}
+
+// Ambiguity 16: a presented member's multiplexer is its proof's server (pid and start); a viewless member's is none.
+#[test]
+fn a_member_mux_follows_its_presentation() {
+    use crate::mux::{Endpoint, MemberMux};
+    let (w, r, folder) = lifecycle_worker(ok(), ok());
+    proof(&w, &r);
+    let c = caller::resolve(&w.ctx).unwrap();
+    let live = MemberMux::Live(
+        Endpoint {
+            socket: c.socket.clone(),
+            server_pid: c.server_pid,
+        },
+        c.server_start,
+    );
+    assert_eq!(*w.ctx.member_mux.borrow(), live, "views up");
+    kill_server(&w, &folder);
+    proof(&w, &r);
+    caller::resolve(&w.ctx).unwrap();
+    assert_eq!(*w.ctx.member_mux.borrow(), MemberMux::Down, "views down");
+}

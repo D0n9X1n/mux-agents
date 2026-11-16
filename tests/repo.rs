@@ -1716,6 +1716,12 @@ fn readme_line_ok(line: &str) -> bool {
 }
 
 /// The one PowerShell line the skill keeps: how a PowerShell caller runs the entry.
+// PM calls 6, 18 (A3c Task 6): the skill names the `views` refusal, the view verbs it covers and what still runs.
+#[test]
+fn the_skill_names_the_views_refusal() {
+    assert!(file_lines("skills/mux-agents/SKILL.md").contains(&SKILL_VIEWS.to_string()));
+}
+const SKILL_VIEWS: &str = "- `views`: you are an agent whose team's views are down (its multiplexer server is gone): `focus`, `spawn`, `resume`, `sidebar`, `watch` and `placement` refuse until the person runs `up`; `send`, `read`, `report`, `status`, `stop` and `list` (without panes) still work.";
 const SKILL_PWSH_NOTE: &str = "The commands below, and the Reply and Listen lines, run as-is in the Bash tool. In PowerShell, prefix `& ` (`& \"<exe>\" send parent …`).";
 
 /// The skill's other PowerShell line: the Shell shortcuts section's source line for a PowerShell profile.
