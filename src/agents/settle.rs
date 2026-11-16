@@ -4,6 +4,7 @@ use std::path::Path;
 use serde_json::{Value, json};
 
 use super::gens::{self, Decision, Found};
+use super::ident;
 use super::lifecycle::{Life, classify};
 use super::release::{self, Cause, halt};
 use super::team_state::{Guard, Tx};
@@ -484,15 +485,22 @@ fn forgotten(
         r["hcAddress"].as_str()
     } else {
         // Call 64: an orphan has no recorded address: the attempt's own, bound by the identity checks below.
-        text("address").filter(|a| !a.is_empty())
+        text("address")
     };
+    // a3c call 47: active, pending and orphan alike, a recorded or attempted address that is present but empty or
+    // malformed refuses `evidence`, before any hc call; a missing one leaves `e` below.
+    if recorded.is_some_and(|a| !ident::hc_address(a))
+        || text("address").is_some_and(|a| !ident::hc_address(a))
+    {
+        return Err(ident::refused("hcAddress"));
+    }
     let label = |l: &str| labels.get(l).map(String::as_str);
     let generation = n.to_string();
-    let ours = !hc_name.is_empty()
-        && text("hcName") == Some(hc_name)
-        && label("mux.id") == Some(id)
+    let ours = ident::same(ident::hc_name, text("hcName"), Some(hc_name))
+        && ident::same(ident::member_id, label("mux.id"), Some(id))
         && label("mux.gen") == Some(generation.as_str());
-    let (Some(address), true) = (recorded.filter(|a| text("address") == Some(*a)), ours) else {
+    let at = recorded.filter(|a| ident::same(ident::hc_address, text("address"), Some(a)));
+    let (Some(address), true) = (at, ours) else {
         return Err(e);
     };
     match lazy.get()?.get(address) {
@@ -2161,6 +2169,54 @@ mod tests {
             assert!(
                 lf::record(&m).get("pending").is_some(),
                 "{case}: pending dropped"
+            );
+        }
+    }
+
+    // a3c call 47 (TL #149, production readiness): a forgotten-kill replay needs a valid recorded address, for active
+    // and pending as for an orphan. A record address and a kill.json address both empty (or both malformed), or either
+    // one alone empty, with hc answering `not_found` there, refuse `evidence`: no ended.json, the record (pending
+    // included) unchanged.
+    #[test]
+    fn a_kill_replay_never_matches_an_invalid_address() {
+        for (case, recorded, attempted) in [
+            ("pending empty", "", ""),
+            ("pending malformed", "t 1", "t 1"),
+            ("active empty", "", ""),
+            ("active malformed", "t 1", "t 1"),
+            ("orphan malformed", "t 1", "t 1"),
+            ("pending empty record", "", "t1"),
+            ("pending empty attempt", "t1", ""),
+        ] {
+            let (w, s) = lf::world();
+            let m = match case.split(' ').next().unwrap() {
+                "pending" => {
+                    let mut p = lf::pending(1);
+                    p["hcAddress"] = json!(recorded);
+                    lf::life(&w, json!({"pending": p}))
+                }
+                "active" => lf::life(&w, json!({"generation": "1", "hcAddress": recorded})),
+                _ => lf::life(&w, json!({"generation": "2", "hcAddress": "t2"})),
+            };
+            lf::seed_gen(&m, 1, Some("run"), lf::committed());
+            let labels = lf::running(&w, 1)["labels"].clone();
+            let body = json!({"address": attempted, "hcName": lf::hc_name(1), "labels": labels, "at": "x"});
+            gens::publish_once(&m, 1, "kill", &body).unwrap();
+            let before = std::fs::read(m.join("record.json")).unwrap();
+            cf::online(&w);
+            lf::ls(&w, 1, &[]);
+            lf::gone(&w, recorded);
+            let got = terminate(&tx(&w, &s), ID, 1);
+            assert_eq!(got.map_err(|e| e.check), Err("evidence"), "{case}");
+            assert_eq!(
+                gens::read(&m, 1, "ended"),
+                Evidence::Absent,
+                "{case}: an end recorded"
+            );
+            assert_eq!(
+                std::fs::read(m.join("record.json")).unwrap(),
+                before,
+                "{case}: the record changed"
             );
         }
     }
