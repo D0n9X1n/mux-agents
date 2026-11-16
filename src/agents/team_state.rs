@@ -182,6 +182,46 @@ impl Tx<'_> {
         })
     }
 
+    /// launch-1 G1.5 and release-1d R4: one `record_write` guarded by `PendingGen { n: Some(n) }`. Sets
+    /// `generation`, `hcAddress`, `team` and `launch.json`'s `hcName`, `launcherArgv`, `sessionId`; adds
+    /// `completing` when given; drops `pending`. `Ok(Some(record))`: the record written. `Ok(None)`: pending is
+    /// not n (the guard), nothing written. `internal`: the identity is incomplete. `evidence`: the record is
+    /// Unreadable, including through a linked member folder. Neither error writes anything.
+    pub fn promote(
+        &self,
+        id: &str,
+        n: u64,
+        launch: &Value,
+        address: &str,
+        team: &str,
+        completing: Option<Value>,
+    ) -> Res<Option<Value>> {
+        let (Some(name), Some(argv), Some(sid)) = (
+            launch.get("hcName").filter(|v| v.is_string()),
+            launch.get("launcherArgv").filter(|v| v.is_array()),
+            launch.get("sessionId").filter(|v| v.is_string()),
+        ) else {
+            return Err(Refusal::internal("incomplete launch identity"));
+        };
+        self.record_write(id, Guard::PendingGen { n: Some(n) }, |f| {
+            for (k, v) in [
+                ("generation", json!(n.to_string())),
+                ("hcAddress", json!(address)),
+                ("team", json!(team)),
+                ("hcName", name.clone()),
+                ("launcherArgv", argv.clone()),
+                ("sessionId", sid.clone()),
+            ] {
+                f.insert(k.into(), v);
+            }
+            if let Some(c) = completing {
+                f.insert("completing".into(), c);
+            }
+            f.remove("pending");
+            Ok(())
+        })
+    }
+
     pub fn folder(&self, id: &str) -> PathBuf {
         self.scope.agents(&self.ctx.state_root).join(id)
     }
@@ -662,6 +702,93 @@ mod tests {
         let got = open(&w.ctx, &s, |tx| tx.desired(ID, false));
         assert_eq!(got.map_err(|e| e.check), Err("evidence"));
         assert_eq!(std::fs::read(&at).unwrap(), b"{");
+    }
+    // G1.5, B-R2: one patch sets generation, hcAddress, team and launch.json's identity, drops pending, adds
+    // completing when given; only while pending names n (exactly once; otherwise `Ok(None)`, nothing written); an
+    // incomplete identity writes nothing; the answer is the record written.
+    #[test]
+    fn promote_sets_the_identity_once_while_pending_names_n() {
+        use crate::agents::life_fixture::hc_name;
+        let (w, s) = world();
+        let launch = json!({"hcName": hc_name(2), "launcherArgv": ["/x"], "sessionId": "sid-2"});
+        let r0 = json!({"sessionId": "old", "pending": {"gen": 2}});
+        open(&w.ctx, &s, |tx| tx.create(ID, r0).map(|_| ())).unwrap();
+        let wrong = open(&w.ctx, &s, |tx| {
+            tx.promote(ID, 1, &launch, "t2", "k:$3", None)
+        });
+        assert_eq!(wrong.map_err(|e| e.check), Ok(None), "pending is not 1");
+        assert_eq!(record(&w)["sessionId"], "old", "a refused promotion wrote");
+        let c = json!({"gen": 2, "intent": "ended"});
+        let wrote = open(&w.ctx, &s, |tx| {
+            tx.promote(ID, 2, &launch, "t2", "k:$3", Some(c.clone()))
+        })
+        .unwrap();
+        let r = record(&w);
+        assert_eq!(wrote.as_ref(), Some(&r), "the answer is the record written");
+        assert_eq!(
+            (&r["generation"], &r["hcAddress"], &r["team"]),
+            (&json!("2"), &json!("t2"), &json!("k:$3"))
+        );
+        assert_eq!(
+            (&r["hcName"], &r["sessionId"], &r["completing"]),
+            (&json!(hc_name(2)), &json!("sid-2"), &c)
+        );
+        assert_eq!(r["launcherArgv"], json!(["/x"]));
+        assert!(r.get("pending").is_none());
+        let again = open(&w.ctx, &s, |tx| {
+            tx.promote(ID, 2, &launch, "t2", "k:$3", None)
+        });
+        assert_eq!(again.map_err(|e| e.check), Ok(None), "exactly once");
+        open(&w.ctx, &s, |tx| {
+            tx.patch(ID, &[("pending", json!({"gen": 3}))], &[])
+                .map(|_| ())
+        })
+        .unwrap();
+        let before = std::fs::read(w.folder(ID).join("record.json")).unwrap();
+        let bad = json!({"hcName": hc_name(3)});
+        let got = open(&w.ctx, &s, |tx| tx.promote(ID, 3, &bad, "t3", "k:$3", None));
+        assert_eq!(
+            got.map_err(|e| e.check),
+            Err("internal"),
+            "incomplete identity"
+        );
+        assert_eq!(
+            std::fs::read(w.folder(ID).join("record.json")).unwrap(),
+            before
+        );
+    }
+
+    // b-calls 13 (F9): `<agents>/<id>` is a link (`crate::testing::link_dir`: Unix symlink; Windows directory
+    // symlink or junction; every OS) to a folder whose record has pending 2. promote refuses `evidence`; the target
+    // record is byte-identical. The target sits outside `agents`, so the open hooks list only the link (Unreadable,
+    // skipped).
+    #[test]
+    fn promote_never_writes_through_a_linked_member_folder() {
+        use crate::agents::life_fixture::hc_name;
+        let (w, s) = world();
+        let launch = json!({"hcName": hc_name(2), "launcherArgv": ["/x"], "sessionId": "sid-2"});
+        open(&w.ctx, &s, |tx| {
+            tx.create(ID, json!({"pending": {"gen": 2}})).map(|_| ())
+        })
+        .unwrap();
+        let real = w.folder(ID);
+        let elsewhere = w.ctx.state_root.parent().unwrap().join("elsewhere");
+        std::fs::rename(&real, &elsewhere).unwrap();
+        crate::testing::link_dir(&elsewhere, &real);
+        let before = std::fs::read(elsewhere.join("record.json")).unwrap();
+        let got = open(&w.ctx, &s, |tx| {
+            tx.promote(ID, 2, &launch, "t2", "k:$3", None)
+        });
+        assert_eq!(
+            got.map_err(|e| e.check),
+            Err("evidence"),
+            "a linked member folder"
+        );
+        assert_eq!(
+            std::fs::read(elsewhere.join("record.json")).unwrap(),
+            before,
+            "written through the link"
+        );
     }
 }
 

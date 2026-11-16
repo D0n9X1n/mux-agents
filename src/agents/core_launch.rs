@@ -345,18 +345,8 @@ pub fn forward(
     step("commit");
     // G1.5, F4: one write; session id and terminal identity change together, pending gone in the same write.
     // F1: only while `pending.gen` is still n. A failure is returned; nothing is rolled back (ambiguity 5).
-    let promote = |r: &mut serde_json::Map<String, Value>| {
-        r.insert("generation".into(), json!(n.to_string()));
-        r.insert("hcAddress".into(), json!(address));
-        r.insert("hcName".into(), json!(hc_name));
-        r.insert("launcherArgv".into(), json!(argv));
-        r.insert("sessionId".into(), json!(l.session_id));
-        r.insert("team".into(), json!(l.team));
-        r.remove("pending");
-        Ok(())
-    };
     let record = tx
-        .record_write(&l.id, Guard::PendingGen { n: Some(n) }, promote)?
+        .promote(&l.id, n, &identity, &address, &l.team, None)?
         .ok_or_else(|| refused("the launch no longer owns the record"))?;
     step("promote");
     // G1.6, F4: the view, optional; nothing is rolled back. Only the view fields reach the reply.
