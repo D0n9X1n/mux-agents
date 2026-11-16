@@ -327,3 +327,91 @@ fn a_paused_view_writer_and_a_patch_both_survive() {
     );
     assert_eq!(gate.waited(&s.member_lock(ID)), 1);
 }
+
+/// a3c call 47 (TL #149, MEDIUM): `view.json` written directly, as a stale or forged file would be, for the reader.
+fn put_view(w: &World, v: &Value) {
+    crate::state::fs::write_json(&w.folder(ID).join("view.json"), v).unwrap();
+}
+
+// Call 47: an empty hcName on launch.json and on the view is no ownership. The writer refuses and writes nothing;
+// the reader presents nothing.
+#[test]
+fn an_empty_hc_name_owns_no_view() {
+    let (w, s) = world();
+    open(&w.ctx, &s, |tx| {
+        tx.create(
+            ID,
+            json!({"generation": "0", "hcAddress": "t0", "hcName": ""}),
+        )
+        .map(|_| ())
+    })
+    .unwrap();
+    publish(
+        &gens::path(&w.folder(ID), 0, "launch"),
+        &json!({"hcName": ""}),
+    )
+    .unwrap();
+    let v = json!({"serverKey": s.key, "session": s.session, "pane": "%9", "window": "@5",
+        "startCommand": "hc attach t0", "gen": 0, "hcAddress": "t0", "hcName": ""});
+    assert_eq!(check(&w, &s, &v), Some((2, "target")), "the writer");
+    assert!(!w.folder(ID).join("view.json").exists(), "nothing written");
+    put_view(&w, &v);
+    assert_eq!(
+        present(&w)["pane"],
+        Value::Null,
+        "the reader presents nothing"
+    );
+}
+
+// Call 47: a held pending generation and its view with the same empty, or the same null, hcAddress are no ownership.
+#[test]
+fn an_empty_or_null_held_address_owns_no_view() {
+    for address in [json!(""), Value::Null] {
+        let (w, s) = world();
+        at_gen(&w, &s, 0);
+        let pending = json!({"gen": 1, "kind": "spawn", "hcName": "m00000001", "sessionId": "s1",
+            "hcAddress": address});
+        open(&w.ctx, &s, |tx| {
+            tx.patch(ID, &[("pending", pending)], &[]).map(|_| ())
+        })
+        .unwrap();
+        let v = json!({"serverKey": s.key, "session": s.session, "pane": "%7", "window": "@3",
+            "startCommand": "hc attach t1", "gen": 1, "hcAddress": address, "hcName": "m00000001"});
+        assert_eq!(
+            check(&w, &s, &v),
+            Some((2, "target")),
+            "{address}: the writer"
+        );
+        assert!(
+            !w.folder(ID).join("view.json").exists(),
+            "{address}: nothing written"
+        );
+        put_view(&w, &v);
+        assert_eq!(
+            present(&w)["pane"],
+            Value::Null,
+            "{address}: the reader presents nothing"
+        );
+    }
+}
+
+// Call 47: a pre-lifecycle record and a descriptor that both lack hcAddress (None == None) are no ownership; the record
+// is not rewritten.
+#[test]
+fn a_pre_lifecycle_view_needs_an_address_on_both_sides() {
+    let (w, s) = world();
+    w.agent_record(ID, json!({"generation": "0"}));
+    let before = record(&w);
+    assert!(
+        before.get("hcAddress").is_none(),
+        "the record has no address"
+    );
+    let v = json!({"serverKey": s.key, "session": s.session, "pane": "%19", "window": "@8",
+        "startCommand": "hc attach x", "gen": 0, "hcName": "maaaaaaaa"});
+    assert_eq!(
+        check(&w, &s, &v),
+        Some((2, "target")),
+        "no address on either side"
+    );
+    assert_eq!(record(&w), before, "the record is not rewritten");
+}

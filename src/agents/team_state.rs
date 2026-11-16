@@ -331,16 +331,21 @@ pub(crate) fn subject_gen(g: &super::gens::Gen, s: &super::gens::Status) -> Res<
 }
 
 impl Subject {
-    /// V1, W1, the one predicate: `v` is this generation's view.
+    /// V1, W1, the one predicate: `v` is this generation's view. A call 47: only a real identity owns: the address a
+    /// non-empty string and the hcName an hc name (`core_identity::is_hc_name`), on both sides; an empty, null or
+    /// missing value never matches another one.
     pub(crate) fn owns(&self, v: &Value) -> bool {
         v.get("gen").and_then(Value::as_u64) == Some(self.n)
             && self
                 .address
                 .as_ref()
-                .is_some_and(|a| v.get("hcAddress") == Some(a))
+                .and_then(Value::as_str)
+                .filter(|a| !a.is_empty())
+                .is_some_and(|a| v.get("hcAddress").and_then(Value::as_str) == Some(a))
             && self
                 .name
                 .as_deref()
+                .filter(|h| super::core_identity::is_hc_name(h))
                 .is_some_and(|h| v.get("hcName").and_then(Value::as_str) == Some(h))
     }
 }
@@ -396,9 +401,15 @@ pub fn view_held(ctx: &Ctx, scope: &Scope, id: &str, v: &Value) -> Res<()> {
                 .get("generation")
                 .and_then(Value::as_str)
                 .and_then(super::gens::plain_gen);
+            // A call 47: the record's own address, a non-empty string, equal to the descriptor's (never None == None).
+            let address = r
+                .get("hcAddress")
+                .and_then(Value::as_str)
+                .filter(|a| !a.is_empty());
             if own.is_none()
                 || v.get("gen").and_then(Value::as_u64) != own
-                || v.get("hcAddress") != r.get("hcAddress")
+                || address.is_none()
+                || v.get("hcAddress").and_then(Value::as_str) != address
             {
                 return stale();
             }
