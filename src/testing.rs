@@ -612,6 +612,23 @@ pub fn unknown_start(pid: u32, ppid: u32) -> Row {
     }
 }
 
+/// occupy-3 H6: the client 150 (start 1500) registry entry for case `none`, `other` (names another conversation) or
+/// `torn`.
+pub fn seed_entry(ctx: &Ctx, case: &str) {
+    let entry = crate::state::live::path(ctx, Client::Claude, 150, 1500);
+    match case {
+        "other" => {
+            let other = "33333333-3333-4333-8333-333333333333";
+            crate::state::live::report(ctx, Client::Claude, 150, 1500, other, "resume").unwrap();
+        }
+        "torn" => {
+            std::fs::create_dir_all(entry.parent().unwrap()).unwrap();
+            std::fs::write(&entry, b"{\"se").unwrap();
+        }
+        _ => {}
+    }
+}
+
 /// A row with no path or argv.
 pub fn row(pid: u32, ppid: u32, start: i64) -> Row {
     Row {

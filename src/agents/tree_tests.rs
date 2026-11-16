@@ -251,6 +251,30 @@ fn prove_reads(m: &Mw, id: &str, r: &Value) -> (Option<Member>, Vec<PathBuf>) {
     let team = crate::agents::membership::team(&m.c);
     crate::state::fs::record_reads(|| prove_member(&m.w.ctx, &team, id, r, &t))
 }
+// H6: member proof rests on labels and generation evidence; no registry entry is read. With no entry, one naming
+// another conversation, and a torn one, the member is proven and no path under `live/` is read (evidence reads and
+// file opens both recorded).
+#[test]
+fn caller_proof_reads_no_registry_entry() {
+    for case in ["none", "other", "torn"] {
+        let m = lifecycle_world(1);
+        evidence(&m, 1);
+        commit(&m, 1, json!({"committed": true}));
+        crate::testing::seed_entry(&m.w.ctx, case);
+        let live = crate::state::live::dir(&m.w.ctx);
+        let ((proven, opened), asked) = crate::state::evidence::record_evidence_reads(|| {
+            crate::state::fs::record_reads(|| prove(&m, ID, Some(150)))
+        });
+        assert!(proven.is_some(), "{case}");
+        assert!(
+            !asked
+                .iter()
+                .chain(opened.iter())
+                .any(|p| p.starts_with(&live)),
+            "{case}: {asked:?} {opened:?}"
+        );
+    }
+}
 #[test]
 fn a_member_is_proven_by_its_recorded_launcher_and_client() {
     for fg in [150, 31337] {
