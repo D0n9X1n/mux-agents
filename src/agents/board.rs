@@ -39,8 +39,32 @@ pub fn select_doing(
 /// locks finish before sorted mailbox reads, followed by each row's agent lock. Never refresh or reap views.
 pub fn board(ctx: &Ctx, caller: &Caller, all: bool, watch: bool) -> Res<Map<String, Value>> {
     use super::{lifecycle::Life, membership::Snapshot};
-    let snapshot = Snapshot::take(ctx, caller)?;
+    let mut snapshot = Snapshot::take(ctx, caller)?;
+    // a3b call 42 (as spawn, calls 45, 51): a lifecycle member this snapshot read as not Ended whose generation is done
+    // after the reap (this reap recorded its end, or another did) is read again, so the first list after a natural
+    // exit renders the recorded end. Recorded completion stays the only way out; a pre-lifecycle notice changes nothing.
+    let not_done: Vec<(String, u64)> = snapshot
+        .facts
+        .local
+        .iter()
+        .filter(|o| o.life != Life::Ended)
+        .filter(|o| {
+            snapshot
+                .records
+                .get(&o.identity.id)
+                .is_some_and(|s| super::gens::lifecycle(&s.record))
+        })
+        .filter_map(|o| Some((o.identity.id.clone(), o.identity.generation.parse().ok()?)))
+        .collect();
     registry::reap_hc(ctx, caller, &snapshot)?;
+    let agents = super::server_dir(ctx, caller).join("agents");
+    let mut now_done = false;
+    for (id, n) in &not_done {
+        now_done |= super::gens::done(&agents.join(id), *n)?;
+    }
+    if now_done {
+        snapshot = Snapshot::take(ctx, caller)?;
+    }
     // A member a committed resume superseded is its successor now: it has no row of its own.
     let superseded = snapshot.superseded();
     let leader = if watch {

@@ -189,3 +189,95 @@ fn the_board_shows_the_active_generations_notice() {
         "torn notice"
     );
 }
+
+// a3b call 42 (TL #145 F1): the first `list` after a natural exit of a member launched through the production adapter
+// reaps its recorded end and renders it: no row in a plain list; one Ended row in `list -All`. No bar or reaper pass
+// runs between the exit and the list. Two snapshot rounds are queued: the reap records the end, then the board reads
+// the member again.
+#[test]
+fn the_first_list_after_a_natural_exit_shows_the_recorded_end() {
+    use crate::agents::{
+        gens,
+        spawn::{CoreRequest, CoreSlot, launch_hc},
+    };
+    for all in [false, true] {
+        let w = World::human("");
+        let c = w.caller();
+        w.fakes.hc_install("herdr-core");
+        cf::answer(&w, &["--version"], "hc 0.1.21");
+        w.fakes.hc_answer(Ok(crate::spawn::Out {
+            stdout: r#"{"address":"t1"}"#.into(),
+            ..Default::default()
+        }));
+        for verb in ["new-window", "split-window"] {
+            w.fakes.mux_rule(verb, 0, "%9|@5|exact,#} attach t1\n", "");
+        }
+        w.launches_hold();
+        w.fakes
+            .mux_rule("-t %9 #{pane_id}|#{@agent-id}", 0, "|\n", "");
+        let request = CoreRequest {
+            client: crate::parse::Client::Claude,
+            task: "task",
+            brief: None,
+            directory: &w.ctx.cwd,
+            model: None,
+            no_fork: true,
+            effort: None,
+            split: None,
+            resume: None,
+            leader: None,
+        };
+        let r = launch_hc(&w.ctx, &c, request, |_| {
+            Ok(CoreSlot {
+                name: "worker".into(),
+                color: "blue",
+                placed: None,
+                debit: false,
+            })
+        })
+        .unwrap();
+        let id = r["id"].as_str().unwrap().to_string();
+        let f = w.folder(&id);
+        let rec = crate::state::fs::read_json(&f.join("record.json"))
+            .unwrap()
+            .unwrap();
+        let mut t = cf::wire(&rec);
+        (t["name"], t["state"], t["reason"], t["exit_code"]) = (
+            rec["hcName"].clone(),
+            json!("finished"),
+            json!("exited"),
+            json!(5),
+        );
+        for _ in 0..2 {
+            cf::online(&w);
+            cf::listing(&w, &membership::team(&c), &[]);
+            cf::get(&w, "t1", t.clone());
+        }
+        w.panes(&[]);
+        let got = board(&w.ctx, &c, all, false).unwrap();
+        let rows: Vec<&Value> = got["agents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|a| a["name"] == "worker")
+            .collect();
+        if all {
+            assert_eq!(rows.len(), 1, "{all}: {got:?}");
+            assert_eq!(
+                (&rows[0]["life"], &rows[0]["state"], &rows[0]["exitCode"]),
+                (&json!("ended"), &json!("exited 5"), &json!(5)),
+                "{all}: {got:?}"
+            );
+            assert_eq!(got["endedTotal"], json!(1), "{all}: {got:?}");
+        } else {
+            assert!(
+                rows.is_empty(),
+                "{all}: a recorded end leaves the list: {got:?}"
+            );
+        }
+        assert_eq!(got["running"], json!(0), "{all}");
+        assert!(gens::read(&f, 0, "ended").known().unwrap().is_some());
+        assert!(gens::read(&f, 0, "notice").known().unwrap().is_some());
+        w.fakes.hc_done().unwrap();
+    }
+}

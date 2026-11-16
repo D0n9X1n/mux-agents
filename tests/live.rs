@@ -4782,7 +4782,8 @@ hc {}:
             let (code, up) = live.run(&["up", "-Client", "claude"]);
             assert_eq!(code, 0, "{mux:?} {up}");
             let session = s(&up["session"]).to_string();
-            let lead = json_file(&live.agent_dir(s(&up["leader"]["id"])).join("record.json"));
+            // V1: the leader's view is in view.json, never in its lifecycle record (a3b call 42, TL #145 F2).
+            let lead = live.view_of(s(&up["leader"]["id"]));
             // Members pass a brief (phase 3: a member without one is refused `brief`); `spawn_by` sends -BriefFile and -Context brief.
             std::fs::write(live.dir.join("brief.md"), "brief").unwrap();
             let spawn = |live: &mut Live, by: &str, name: &str| {
