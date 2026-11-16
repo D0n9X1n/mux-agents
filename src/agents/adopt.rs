@@ -431,3 +431,7 @@ mod bar_tests;
 #[cfg(test)]
 #[path = "adopt_route_tests.rs"]
 mod route_tests;
+
+#[cfg(test)]
+#[path = "adopt_crash_tests.rs"]
+mod crash;
