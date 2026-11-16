@@ -1,11 +1,13 @@
 //! up: a person's verb that creates a folder's team (#103, 2a-iii).
 
 pub mod discover;
+#[cfg(test)]
+mod existing_tests;
 pub mod identity;
 pub mod index;
 pub mod server;
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
 
 use std::{cell::Cell, path::Path};
 

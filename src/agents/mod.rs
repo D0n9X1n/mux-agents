@@ -41,7 +41,29 @@ pub mod outcome;
 #[cfg(test)]
 pub(crate) mod outcome_fixture;
 pub mod placement;
+pub(crate) mod prelife;
+#[cfg(test)]
+pub(crate) mod prelife_fixture;
+#[cfg(test)]
+mod prelife_slot_tests;
+#[cfg(test)]
+mod prelife_tests;
 pub mod receipt;
+pub mod reconcile;
+#[cfg(test)]
+mod reconcile_await_tests;
+#[cfg(test)]
+mod reconcile_observe_tests;
+#[cfg(test)]
+mod reconcile_restore_tests;
+#[cfg(test)]
+mod reconcile_run_tests;
+#[cfg(test)]
+mod reconcile_tests;
+#[cfg(test)]
+mod reconcile_verb_race_tests;
+#[cfg(test)]
+mod reconcile_verb_tests;
 pub mod registry;
 pub mod release;
 pub mod resume;

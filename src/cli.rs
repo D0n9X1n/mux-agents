@@ -174,6 +174,16 @@ pub static VERBS: &[VerbDef] = &[
         text: json::lines,
     },
     VerbDef {
+        name: "restore",
+        values: &[],
+        switches: &[],
+        min: 0,
+        max: 0,
+        usage: "usage: mux-agent restore [-Text]",
+        handler: crate::agents::reconcile::restore,
+        text: json::lines,
+    },
+    VerbDef {
         name: "up",
         values: &["Client", "Name"],
         switches: &[],
@@ -775,6 +785,7 @@ mod tests {
                 "peek",
                 "stop",
                 "resume",
+                "restore",
                 "up",
                 "status",
                 "report",
@@ -810,6 +821,7 @@ mod tests {
             ("peek", 1, 1),
             ("stop", 1, 1),
             ("resume", 1, 1),
+            ("restore", 0, 0),
             ("up", 0, 0),
             ("status", 0, 0),
             ("report", 1, 1),
@@ -922,6 +934,7 @@ mod tests {
             "peek" => vec!["peek", "worker"],
             "stop" => vec!["stop", "worker"],
             "resume" => vec!["resume", "worker"],
+            "restore" => vec!["restore"],
             "up" => vec!["up", "-Client", "claude"],
             "status" => vec!["status", "-BodyFile", "s.md"],
             "report" => vec!["report", "idle"],
@@ -1594,6 +1607,12 @@ mod tests {
         let w = agents_world();
         let r = crate::agents::core_fixture::member(&w, ID, json!({}));
         crate::agents::core_fixture::online(&w);
+        // prelife-1c P-R3: the validating get (Running) is the last hc call before the kill.
+        crate::agents::core_fixture::get(
+            &w,
+            "taaaaaaaaaaaa",
+            crate::agents::core_fixture::wire(&r),
+        );
         crate::agents::core_fixture::answer(&w, &["kill", "taaaaaaaaaaaa", "--json"], "{}");
         crate::agents::core_fixture::get(
             &w,
@@ -2181,6 +2200,8 @@ fn stop_hc_wire_order() {
         ),
     ] {
         cf::online(&w);
+        // prelife-1c P-R3: the validating get (Running) is the last hc call before the kill.
+        cf::get(&w, "taaaaaaaaaaaa", cf::wire(&r));
         cf::answer(&w, &["kill", "taaaaaaaaaaaa", "--json"], "{}");
         cf::get(&w, "taaaaaaaaaaaa", cf::wire(&r));
         let args = tokens.into_iter().map(str::to_string).collect::<Vec<_>>();

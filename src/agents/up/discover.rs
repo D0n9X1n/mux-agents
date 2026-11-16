@@ -8,11 +8,12 @@ use crate::agents::{
     core_identity::Identity,
     gens::Member,
     lifecycle::{Life, classify},
+    team_state::Scope,
     text,
 };
 use crate::{
     ctx::Ctx,
-    error::{Res, refuse},
+    error::{Refusal, Res, refuse},
     hc::Core,
     state::fs::read_json,
 };
@@ -48,28 +49,73 @@ pub fn refuse_existing(ctx: &Ctx, core: &Core<'_>, key: &str, team: &str) -> Res
                 }
             }
             _ => {
-                if ran_nothing(&folder, &member)? {
-                    continue;
-                }
-                life(core, &folder, record)
+                refuse_pre(core, &folder, &member, record)?;
+                continue;
             }
         };
-        let (name, session) = (text(record.get("name")), text(record.get("session")));
-        return refuse(
-            2,
-            "leader",
-            match life {
-                Life::Ended => {
-                    format!("the leader {name} ended; resuming a leader is not supported yet")
-                }
-                Life::Lost => format!("the leader {name} is lost; restore will resume it"),
-                Life::Running | Life::Unknown => {
-                    format!("the team already has a leader: {name} in {session}")
-                }
-            },
-        );
+        return refuse_by(life, record);
     }
     Ok(())
+}
+
+/// 6b ambiguity 8, r6b call 6: a lifecycle leader of T that ran (`never_ran_recorded`; torn evidence refuses) names
+/// the anchor (its folder key, its record session). A pre-lifecycle leader refuses as before (prelife-1c G10).
+pub fn existing(ctx: &Ctx, core: &Core<'_>, key: &str, team: &str) -> Res<Option<Scope>> {
+    let own = ctx.state_root.join(key);
+    for (folder, member) in crate::agents::resume::every_member(ctx)? {
+        let record = match &member {
+            Member::Absent => continue,
+            Member::Unreadable(e) if folder.starts_with(&own) => return Err(e.clone()),
+            Member::Unreadable(_) => continue,
+            Member::Pre(r) => r,
+            Member::Life(g) => g.record(),
+        };
+        if record.get("upTeam").and_then(Value::as_str) != Some(team) {
+            continue;
+        }
+        if let Member::Life(g) = &member {
+            if g.never_ran_recorded(&g.status()?)? {
+                continue;
+            }
+            let anchor = folder
+                .parent()
+                .and_then(Path::parent)
+                .and_then(Path::file_name)
+                .and_then(|k| k.to_str())
+                .ok_or_else(|| Refusal::internal("a leader folder has no server key"))?;
+            let session = text(record.get("session"));
+            return Ok(Some(Scope {
+                key: anchor.into(),
+                session,
+            }));
+        }
+        refuse_pre(core, &folder, &member, record)?;
+    }
+    Ok(None)
+}
+
+fn refuse_pre(core: &Core<'_>, folder: &Path, member: &Member, record: &Value) -> Res<()> {
+    if ran_nothing(folder, member)? {
+        return Ok(());
+    }
+    refuse_by(life(core, folder, record), record)
+}
+
+fn refuse_by(life: Life, record: &Value) -> Res<()> {
+    let (name, session) = (text(record.get("name")), text(record.get("session")));
+    refuse(
+        2,
+        "leader",
+        match life {
+            Life::Ended => {
+                format!("the leader {name} ended; resuming a leader is not supported yet")
+            }
+            Life::Lost => format!("the leader {name} is lost; restore will resume it"),
+            Life::Running | Life::Unknown => {
+                format!("the team already has a leader: {name} in {session}")
+            }
+        },
+    )
 }
 
 /// Decision 1, R2: a lifecycle member ran nothing only by `Gen::never_ran_recorded` (b-calls 10, 23); a

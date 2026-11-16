@@ -15,6 +15,7 @@ use crate::caller::Caller;
 use crate::ctx::Ctx;
 use crate::error::{Res, refuse};
 use crate::hc::Terminal;
+use crate::state::evidence::Evidence;
 
 /// One pane of the caller's session as one `list-panes` read it; every field as the multiplexer printed it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -598,6 +599,67 @@ pub fn add_notice(
     let member = gens::member_of(&folder);
     post(
         ctx, caller, id, &folder, &member, record, notice, None, None,
+    )
+}
+
+/// prelife-1c call 12: a pre-lifecycle folder's notice kind, read through the walk before any hc call. Absent: None.
+/// A whole object whose `kind` is `stopped`, `exited` or `lost`: that kind. Torn, a FIFO, a link, a folder, other JSON
+/// or another kind: refused `evidence`, so the stop changes nothing.
+pub(crate) fn legacy_notice(ctx: &Ctx, caller: &Caller, id: &str) -> Res<Option<String>> {
+    let folder = super::server_dir(ctx, caller).join("agents").join(id);
+    match gens::walk(&folder, &["notice.json"]) {
+        Evidence::Absent => Ok(None),
+        Evidence::Present(n) => match n.get("kind").and_then(Value::as_str) {
+            Some(k @ ("stopped" | "exited" | "lost")) => Ok(Some(k.to_string())),
+            _ => Err(crate::state::evidence::unreadable()),
+        },
+        Evidence::Unreadable => Err(crate::state::evidence::unreadable()),
+    }
+}
+
+/// prelife-1c calls 12, 24: a legacy stop's notice, under the caller's notice lock. `stopped` or `exited` already
+/// there: nothing. `lost` or none: the `stopped` message is appended durably under delivery id `stop-<id>` (never the
+/// Lost message's `exit-<id>`, so a stored Lost message cannot win it back), then `notice.json` is replaced with
+/// `stopped`, durably: an explicit upgrade, not `add_notice`'s first-wins. A failed flush refuses, marker unchanged.
+pub(crate) fn stop_notice(
+    ctx: &Ctx,
+    caller: &Caller,
+    id: &str,
+    record: &Value,
+    prior: Option<&str>,
+) -> Res<()> {
+    if matches!(prior, Some("stopped" | "exited")) {
+        return Ok(());
+    }
+    let name = super::text(record.get("name"));
+    let parent = super::text(record.get("parentPane"));
+    if !parent.is_empty() {
+        let key = mail::mailbox_key(&parent, "")?;
+        let mut fields = Map::new();
+        fields.insert("kind".into(), "stopped".into());
+        fields.insert("exitCode".into(), Value::Null);
+        fields.insert("fromId".into(), id.into());
+        let pane = super::text(record.get("pane"));
+        let body = format!("{name} was stopped.");
+        mail::add_once_durable(
+            ctx,
+            caller,
+            &key,
+            &name,
+            &pane,
+            &body,
+            &format!("stop-{id}"),
+            &fields,
+        )?;
+    }
+    let at = crate::util::utc_o(ctx.clock.now());
+    let marker = super::server_dir(ctx, caller)
+        .join("agents")
+        .join(id)
+        .join("notice.json");
+    crate::state::fs::write_json_durable(
+        &marker,
+        &json!({"kind": "stopped", "exitCode": null, "at": at}),
     )
 }
 

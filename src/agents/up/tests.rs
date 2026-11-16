@@ -17,7 +17,7 @@ fn out(code: i32, s: &str) -> Res<crate::mux::Output> {
 fn fails(w: &World, contains: &str) {
     w.fakes.mux_script(contains, |_| out(1, ""));
 }
-fn base() -> World {
+pub(crate) fn base() -> World {
     let mut w = World::human("");
     w.ctx.cwd = w._dir.path().join("project.v1");
     std::fs::create_dir_all(&w.ctx.cwd).unwrap();

@@ -1222,6 +1222,66 @@ const TEST_ONLY: &[(&str, &str, &str)] = &[
         "tests",
     ),
     (
+        "src/agents/message/prelife_stop_tests.rs",
+        "src/agents/message.rs",
+        "prelife_stop_tests",
+    ),
+    (
+        "src/agents/prelife/tests.rs",
+        "src/agents/prelife.rs",
+        "tests",
+    ),
+    (
+        "src/agents/prelife_fixture.rs",
+        "src/agents/mod.rs",
+        "prelife_fixture",
+    ),
+    (
+        "src/agents/prelife_slot_tests.rs",
+        "src/agents/mod.rs",
+        "prelife_slot_tests",
+    ),
+    (
+        "src/agents/prelife_tests.rs",
+        "src/agents/mod.rs",
+        "prelife_tests",
+    ),
+    (
+        "src/agents/reconcile_await_tests.rs",
+        "src/agents/mod.rs",
+        "reconcile_await_tests",
+    ),
+    (
+        "src/agents/reconcile_observe_tests.rs",
+        "src/agents/mod.rs",
+        "reconcile_observe_tests",
+    ),
+    (
+        "src/agents/reconcile_restore_tests.rs",
+        "src/agents/mod.rs",
+        "reconcile_restore_tests",
+    ),
+    (
+        "src/agents/reconcile_run_tests.rs",
+        "src/agents/mod.rs",
+        "reconcile_run_tests",
+    ),
+    (
+        "src/agents/reconcile_tests.rs",
+        "src/agents/mod.rs",
+        "reconcile_tests",
+    ),
+    (
+        "src/agents/reconcile_verb_race_tests.rs",
+        "src/agents/mod.rs",
+        "reconcile_verb_race_tests",
+    ),
+    (
+        "src/agents/reconcile_verb_tests.rs",
+        "src/agents/mod.rs",
+        "reconcile_verb_tests",
+    ),
+    (
         "src/agents/session_report_tests.rs",
         "src/agents/mod.rs",
         "session_report_tests",
@@ -1252,6 +1312,11 @@ const TEST_ONLY: &[(&str, &str, &str)] = &[
         "view_tests",
     ),
     ("src/agents/tree/tests.rs", "src/agents/tree.rs", "tests"),
+    (
+        "src/agents/up/existing_tests.rs",
+        "src/agents/up/mod.rs",
+        "existing_tests",
+    ),
     ("src/agents/up/tests.rs", "src/agents/up/mod.rs", "tests"),
     (
         "src/agents/up/index/tests.rs",

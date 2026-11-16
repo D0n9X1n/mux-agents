@@ -794,6 +794,23 @@ pub fn link_dir(target: &Path, link: &Path) {
     );
 }
 
+/// A file link at `link` naming `target`: a symlink on Unix, a file symlink on Windows. Windows has no junction for
+/// a file, so a host without symlink rights returns the error and the caller skips that case with a message.
+pub fn link_file(target: &Path, link: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    return std::os::unix::fs::symlink(target, link);
+    #[cfg(windows)]
+    return std::os::windows::fs::symlink_file(target, link);
+}
+
+/// A FIFO at `at` (Unix): opening it to read blocks until a writer comes.
+#[cfg(unix)]
+pub fn fifo(at: &Path) {
+    let c = std::ffi::CString::new(at.to_str().unwrap()).unwrap();
+    // SAFETY: a valid C path.
+    assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0, "mkfifo");
+}
+
 /// `mklink /J link target`, through spawn.rs, the one place a child process starts (tests/repo.rs).
 #[cfg(windows)]
 fn mklink_junction(target: &Path, link: &Path) -> Result<(), String> {
