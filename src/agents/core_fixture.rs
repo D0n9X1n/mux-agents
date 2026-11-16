@@ -34,6 +34,16 @@ pub fn listing(w: &World, team: &str, addresses: &[&str]) {
     );
 }
 
+/// `kept::list`'s call: the live terminals labelled `mux.kept=<team>` (no `--all`, v6f call 3).
+pub fn kept_listing(w: &World, team: &str, addresses: &[&str]) {
+    answer(
+        w,
+        &["ls", "--label", &format!("mux.kept={team}"), "--json"],
+        &json!({"terminals": addresses.iter().map(|a| json!({"address": a})).collect::<Vec<_>>()})
+            .to_string(),
+    );
+}
+
 pub fn get(w: &World, address: &str, wire: Value) {
     answer(w, &["get", address, "--json"], &wire.to_string());
 }
