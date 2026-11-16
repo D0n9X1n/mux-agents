@@ -2726,6 +2726,8 @@ mod tests {
             (603, Some("timeout".to_string())),
             "at most 60 s"
         );
+        // r2b call 34: every poll sleeps 100 ms, so 600 polls are 60 s.
+        assert_eq!(f.slept(), vec![100; 603], "each barrier sleep is 100 ms");
     }
 
     // r2b call 33 (review #147 F1): through run_gen's start callback, with the barrier file, client.json stays
