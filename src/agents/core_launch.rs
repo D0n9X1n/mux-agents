@@ -420,9 +420,22 @@ fn abort(tx: &Tx<'_>, id: &str, n: u64, hc_name: &str, mut e: Refusal) -> Refusa
     }
 }
 
-/// G1.4, the claim lost (Task 5).
-fn lost(_: &Tx<'_>, _: &str, _: u64, _: &str) -> Refusal {
-    Refusal::internal("lost claim")
+/// G1.4, ambiguity 7: the claim lost. Aborted (the launcher gave up): the generation is void (done); refusal
+/// `launch`; pending dropped by `drop_pending`, so only while this call still owns it, judged inside the member
+/// lock (F1, call 15). Run or Invalid: not this launch's; pending kept for settle-1b. Absent or Unreadable on the
+/// reread: evidence, pending kept.
+fn lost(tx: &Tx<'_>, id: &str, n: u64, hc_name: &str) -> Refusal {
+    match gens::read(&tx.folder(id), n, "commit") {
+        Evidence::Present(c) if gens::decide(&c) == gens::Decision::Aborted => {
+            let mut e = refused("the launcher gave up before the commit");
+            drop_pending(tx, id, n, hc_name, &mut e);
+            e
+        }
+        Evidence::Present(_) => Refusal::internal(&format!(
+            "the commit of generation {n} is not this launch's"
+        )),
+        Evidence::Absent | Evidence::Unreadable => evidence::unreadable(),
+    }
 }
 
 fn attempt<T>(f: impl FnOnce() -> Res<T>) -> Res<T> {
@@ -2303,5 +2316,256 @@ pub(crate) mod forward_tests {
                 "{case}: no run of generation {n}"
             );
         }
+    }
+
+    /// Another writer makes generation n commit.json right after `at`: `Some(body)` whole, `None` torn bytes.
+    fn commit_after(w: &World, at: &'static str, n: u64, body: Option<Value>) {
+        let commit = gens::path(&w.folder(ID), n, "commit");
+        hooks::after(Some(Box::new(move |s: &str| {
+            if s != at {
+                return;
+            }
+            match &body {
+                Some(v) => {
+                    crate::state::evidence::publish(&commit, v).unwrap();
+                }
+                None => {
+                    std::fs::create_dir_all(commit.parent().unwrap()).unwrap();
+                    std::fs::write(&commit, br#"{"comm"#).unwrap();
+                }
+            }
+        })));
+    }
+
+    // G1.4, ambiguity 7: Aborted drops pending; Run, Invalid and torn keep it (torn: the publisher refuses
+    // `evidence` at its read, so `lost` is never reached).
+    #[test]
+    fn a_lost_commit_claim_is_decided_by_its_winner() {
+        let cases = [
+            (
+                Some(json!({"aborted": true})),
+                "launch",
+                "gave up before the commit",
+                false,
+            ),
+            (
+                Some(json!({"committed": true})),
+                "internal",
+                "is not this launch",
+                true,
+            ),
+            (
+                Some(json!({"x": 1})),
+                "internal",
+                "is not this launch",
+                true,
+            ),
+            (None, "evidence", "", true),
+        ];
+        for (body, check, says, kept) in cases {
+            let w = world();
+            let _reset = hooks::Reset;
+            commit_after(&w, "address", 0, body.clone());
+            replies(&w, address("t1"));
+            let e = go(&w, launch_of(&w, true, SESSION_ID), free, never).unwrap_err();
+            assert_eq!((e.code, e.check), (1, check), "{body:?}: {e:?}");
+            assert!(e.message.contains(says), "{body:?}: {e:?}");
+            let r = record(&w);
+            assert_eq!(r.get("pending").is_some(), kept, "{body:?}");
+            if kept {
+                assert_eq!(
+                    r["pending"]["hcAddress"],
+                    json!("t1"),
+                    "{body:?}: the address stays for settle-1b"
+                );
+            }
+            assert!(
+                r.get("generation").is_none() && r.get("sessionId").is_none(),
+                "{body:?}: no promotion"
+            );
+            assert_eq!(kills(&w), 0, "{body:?}");
+        }
+    }
+
+    // Ambiguity 8: an abort that meets a commit already there lets that commit decide.
+    #[test]
+    fn an_abort_meeting_a_commit_lets_it_decide() {
+        for (body, check, kept) in [
+            (json!({"aborted": true}), "launch", false),
+            (json!({"committed": true}), "internal", true),
+        ] {
+            let w = world();
+            let _reset = hooks::Reset;
+            promoted(&w);
+            let f2 = w.folder(ID);
+            let winner = body.clone();
+            hooks::after(Some(Box::new(move |s: &str| {
+                if s == "spec" {
+                    // The winner lands, then the launch publication fails, so the abort meets the winner.
+                    crate::state::evidence::publish(&gens::path(&f2, 1, "commit"), &winner)
+                        .unwrap();
+                    crate::state::fs::fail_sync_file(Some(&gens::path(&f2, 1, "launch")));
+                }
+            })));
+            version(&w);
+            let e = go(&w, launch_of(&w, false, NEW), free, never).unwrap_err();
+            assert_eq!(e.check, check, "{body}: {e:?}");
+            let r = record(&w);
+            assert_eq!(r.get("pending").is_some(), kept, "{body}");
+            assert_eq!(
+                r["generation"],
+                json!("0"),
+                "{body}: generation 0 stays active"
+            );
+            assert_eq!(runs(&w).len(), 1, "{body}: no second run");
+        }
+    }
+
+    // R-W1, G1.4: a readable winner decides before any write is tried, even where the publication would fail
+    // (its content flush is armed to fail).
+    #[test]
+    fn a_readable_winner_decides_before_publication_is_tried() {
+        let w = world();
+        let _reset = hooks::Reset;
+        let commit = gens::path(&w.folder(ID), 0, "commit");
+        hooks::after(Some(Box::new(move |s: &str| {
+            if s == "address" {
+                crate::state::evidence::publish(&commit, &json!({"aborted": true})).unwrap();
+                crate::state::fs::fail_sync_file(Some(&commit));
+            }
+        })));
+        replies(&w, address("t1"));
+        let e = go(&w, launch_of(&w, true, SESSION_ID), free, never).unwrap_err();
+        assert_eq!((e.code, e.check), (1, "launch"), "{e:?}");
+        assert!(
+            record(&w).get("pending").is_none(),
+            "the aborted winner voids the generation"
+        );
+    }
+
+    // Ambiguity 9: the claim lost to Aborted, then the pending drop lands its rename and fails its flush. Reported.
+    #[test]
+    fn a_failed_pending_drop_after_a_lost_claim_is_reported() {
+        let w = world();
+        let _reset = hooks::Reset;
+        let commit = gens::path(&w.folder(ID), 0, "commit");
+        hooks::after(Some(Box::new(move |s: &str| {
+            if s == "address" {
+                crate::state::evidence::publish(&commit, &json!({"aborted": true})).unwrap();
+                crate::state::fs::fail_durable_flush(Some(0));
+            }
+        })));
+        replies(&w, address("t1"));
+        let e = go(&w, launch_of(&w, true, SESSION_ID), free, never).unwrap_err();
+        assert_eq!((e.code, e.check), (1, "launch"), "{e:?}");
+        assert!(
+            e.message.ends_with("; pending could not be dropped"),
+            "{e:?}"
+        );
+        assert!(record(&w).get("pending").is_none(), "the rename landed");
+        assert_eq!(decided(&w, 0), Some(gens::Decision::Aborted));
+    }
+
+    // Ambiguity 7: the winner vanished or tore between `Exists` and the reread inside `lost`. Evidence; pending
+    // untouched. `lost` is called directly: no forward path reaches this window deterministically.
+    #[test]
+    fn a_lost_claim_whose_winner_cannot_be_reread_keeps_pending() {
+        for how in ["absent", "torn"] {
+            let w = world();
+            let f = w.folder(ID);
+            crate::agents::spawn::private_folder(&w.ctx, &f).unwrap();
+            let r = json!({"lifecycle": 1, "id": ID, "name": "worker", "session": w.caller().session,
+                "pending": {"gen": 0, "kind": "spawn", "hcName": "m4567cdef", "sessionId": SESSION_ID,
+                    "hcAddress": "t1"}});
+            crate::state::fs::write_json(&f.join("record.json"), &r).unwrap();
+            if how == "torn" {
+                std::fs::create_dir_all(gens::dir(&f, 0)).unwrap();
+                std::fs::write(gens::path(&f, 0, "commit"), br#"{"comm"#).unwrap();
+            }
+            let before = std::fs::read(f.join("record.json")).unwrap();
+            let s = team_state::Scope::of(&w.caller());
+            let e = team_state::open(&w.ctx, &s, |tx| Ok(lost(tx, ID, 0, "m4567cdef"))).unwrap();
+            assert_eq!(e.check, "evidence", "{how}: {e:?}");
+            assert_eq!(
+                std::fs::read(f.join("record.json")).unwrap(),
+                before,
+                "{how}: pending untouched"
+            );
+        }
+    }
+
+    // F1: the claim lost to Aborted while the record already names another launch pending (changed at
+    // `address`, before `lost` runs). The refusal stands; that pending is kept.
+    #[test]
+    fn a_lost_claim_never_drops_a_pending_it_does_not_own() {
+        let w = world();
+        let _reset = hooks::Reset;
+        let f = w.folder(ID);
+        let (f2, commit) = (f.clone(), gens::path(&f, 0, "commit"));
+        hooks::after(Some(Box::new(move |s: &str| {
+            if s == "address" {
+                crate::state::evidence::publish(&commit, &json!({"aborted": true})).unwrap();
+                edit(&f2, |r| r["pending"]["hcName"] = json!("m0123abcd"));
+            }
+        })));
+        replies(&w, address("t1"));
+        let e = go(&w, launch_of(&w, true, SESSION_ID), free, never).unwrap_err();
+        assert_eq!((e.code, e.check), (1, "launch"), "{e:?}");
+        assert!(
+            e.message.ends_with("; pending is not this launch's, kept"),
+            "{e:?}"
+        );
+        assert_eq!(
+            record(&w)["pending"]["hcName"],
+            json!("m0123abcd"),
+            "the other launch keeps pending"
+        );
+    }
+
+    // Call 15, finding 3to4-I1 (the auditor's test, written out): `lost` checks ownership inside the member lock,
+    // not before taking it. At `address` the aborted winner is published and a lock probe is armed; when `lost`
+    // takes the member lock to drop pending, another launch takes the pending (same generation, new hcName). The
+    // drop is refused inside the lock; the replacement pending stands. A check before the lock followed by an
+    // unconditional drop (`owns(..)` then `tx.patch(id, &[], &["pending"])`) removes the replacement and fails here.
+    #[test]
+    fn a_lost_claim_checks_ownership_inside_the_member_lock() {
+        let w = world();
+        let _reset = hooks::Reset;
+        let f = w.folder(ID);
+        let key = format!("+{}", team_state::Scope::of(&w.caller()).member_lock(ID));
+        let (f2, commit, fakes) = (f.clone(), gens::path(&f, 0, "commit"), w.fakes.clone());
+        hooks::after(Some(Box::new(move |s: &str| {
+            if s != "address" {
+                return;
+            }
+            crate::state::evidence::publish(&commit, &json!({"aborted": true})).unwrap();
+            // Neither the commit publication nor the reread takes a member lock: the first one is the drop.
+            let (f3, key2, fired) = (f2.clone(), key.clone(), std::cell::Cell::new(false));
+            fakes.lock_probe(move |event| {
+                if event == key2 && !fired.replace(true) {
+                    edit(&f3, |r| r["pending"]["hcName"] = json!("m0123abcd"));
+                }
+                String::new()
+            });
+        })));
+        replies(&w, address("t1"));
+        let e = go(&w, launch_of(&w, true, SESSION_ID), free, never).unwrap_err();
+        assert_eq!((e.code, e.check), (1, "launch"), "{e:?}");
+        assert!(
+            e.message.ends_with("; pending is not this launch's, kept"),
+            "{e:?}"
+        );
+        let r = record(&w);
+        assert_eq!(
+            r["pending"]["hcName"],
+            json!("m0123abcd"),
+            "the replacement pending stands"
+        );
+        assert_eq!(r["pending"]["gen"], json!(0));
+        assert_eq!(
+            decided(&w, 0),
+            Some(gens::Decision::Aborted),
+            "the winner decides"
+        );
     }
 }
