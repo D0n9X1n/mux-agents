@@ -341,6 +341,10 @@ fn finish(tx: &Tx<'_>, j: &Journal) -> Res<()> {
     super::release::halt("adopt-removed")
 }
 
+#[path = "adopt_view.rs"]
+mod view;
+pub use view::{LEAVES, SEVERAL, Up, View};
+
 #[cfg(test)]
 #[path = "adopt_tests.rs"]
 mod tests;
