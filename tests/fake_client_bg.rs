@@ -113,3 +113,94 @@ fn start(exe: &std::path::Path, dir: &std::path::Path, id: &str) -> std::process
     }
     panic!("{} stayed busy", exe.display());
 }
+
+// A fake client in a fresh folder with piped stdin; `raw` writes the `raw-input` marker first.
+fn piped(name: &str, raw: bool) -> (std::path::PathBuf, std::process::Child) {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let dir = std::env::temp_dir().join(format!("fake-{name}-{}-{nanos}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    if raw {
+        std::fs::write(dir.join("raw-input"), "").unwrap();
+    }
+    let child = std::process::Command::new(env!("CARGO_BIN_EXE_fake-client"))
+        .env("MUX_IT_DIR", &dir)
+        .stdin(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    (dir, child)
+}
+
+// The bytes of `path` once they equal `want`, or what it holds after 20 s.
+fn settled(path: &std::path::Path, want: &[u8]) -> Vec<u8> {
+    let end = Instant::now() + Duration::from_secs(20);
+    loop {
+        let got = std::fs::read(path).unwrap_or_default();
+        if got == want || Instant::now() > end {
+            return got;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+// Stops the client and removes its folder, so a failure leaves nothing running.
+fn stop(dir: &std::path::Path, mut child: std::process::Child) {
+    std::fs::write(dir.join(format!("quit.{}", child.id())), "0").unwrap();
+    child.wait().unwrap();
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+// PM call 10: with `raw-input`, a key sent without Enter is recorded as the byte received.
+#[test]
+fn the_fake_client_records_raw_input_bytes() {
+    use std::io::Write;
+    let (dir, mut child) = piped("raw", true);
+    let pid = child.id();
+    let stdin = child.stdin.as_mut().unwrap();
+    stdin.write_all(b"x").unwrap();
+    stdin.flush().unwrap();
+    let got = settled(&dir.join(format!("input.{pid}.raw")), b"x");
+    stop(&dir, child);
+    assert_eq!(got, b"x", "the byte, with no Enter");
+}
+
+// Checklist 11 (F6): without the marker the line log is as before, an unterminated last line included at EOF, and no
+// raw log is kept.
+#[test]
+fn line_mode_records_an_unterminated_last_line_at_eof() {
+    use std::io::Write;
+    let (dir, mut child) = piped("line", false);
+    let pid = child.id();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(b"one\r\ntail-without-newline")
+        .unwrap();
+    let got = settled(
+        &dir.join(format!("input.{pid}.log")),
+        b"one\ntail-without-newline\n",
+    );
+    let raw = dir.join(format!("input.{pid}.raw")).exists();
+    stop(&dir, child);
+    assert_eq!(String::from_utf8_lossy(&got), "one\ntail-without-newline\n");
+    assert!(!raw, "no raw log without the marker");
+}
+
+// Checklist 11 (F6): with the marker the line log is kept beside the raw bytes, an unterminated last line included.
+#[test]
+fn raw_mode_keeps_its_line_log() {
+    use std::io::Write;
+    let (dir, mut child) = piped("both", true);
+    let pid = child.id();
+    child.stdin.take().unwrap().write_all(b"a\nb").unwrap();
+    let lines = settled(&dir.join(format!("input.{pid}.log")), b"a\nb\n");
+    let raw = settled(&dir.join(format!("input.{pid}.raw")), b"a\nb");
+    stop(&dir, child);
+    assert_eq!(
+        (lines.as_slice(), raw.as_slice()),
+        (&b"a\nb\n"[..], &b"a\nb"[..])
+    );
+}

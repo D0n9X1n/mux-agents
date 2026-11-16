@@ -44,6 +44,7 @@ You rarely type these: the skill runs them for you. Every command is `<plugin>/s
 | `list` | `list -All` | live agents, what each is doing, unread messages; `-All` adds ended ones, each with its `exitCode` |
 | `status` | `status -BodyFile step.txt` | an agent says what it is doing now |
 | `send` | `send claude-1 -BodyFile note.md`, `send parent -BodyFile result.md` | post a message to an agent or to your parent |
+| `note`, `notes` | `note -Title plan -BodyFile plan.md`, `notes`, `notes <id>` | add to or read the team notebook; every other member gets one mail per new note, and each launch's first message lists the newest titles |
 | `read` | `read -Wait 600`, `read claude-1 -Lines 40` | wait for your messages, or read an agent's pane |
 | `focus` | `focus claude-1`, `focus -Next` | switch the multiplexer to an agent's pane; `-Next` / `-Prev` step through the bar's order |
 | `stop` | `stop claude-1` | close an agent's pane and its processes; an agent that already ended answers `ok` with `already` (`exited`, `stopped` or `lost`) |

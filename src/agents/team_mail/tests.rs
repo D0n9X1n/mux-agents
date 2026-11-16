@@ -191,9 +191,9 @@ fn a_failed_entry_flush_is_finished_by_the_retry() {
     );
 }
 
-const A: &str = "0000000000a1";
-const B: &str = "0000000000b2";
-const C: &str = "0000000000c3";
+pub(crate) const A: &str = "0000000000a1";
+pub(crate) const B: &str = "0000000000b2";
+pub(crate) const C: &str = "0000000000c3";
 
 fn m(id: &str, record: Value) -> Member {
     Member {
@@ -363,12 +363,12 @@ fn team_with(w: World, rows: Vec<Listed>) -> World {
     w
 }
 
-fn team_world() -> World {
+pub(crate) fn team_world() -> World {
     team_with(World::human(""), Vec::new())
 }
 
 /// One snapshot: hc running every hc member of session $3 (gets in address order, as core_facts asks).
-fn online(w: &World) {
+pub(crate) fn online(w: &World) {
     let mut records: Vec<Value> = std::fs::read_dir(w.state().join("agents"))
         .unwrap()
         .filter_map(|e| {
@@ -405,7 +405,7 @@ fn said(e: Refusal) -> String {
     format!("{} {} {}", e.code, e.check, e.message)
 }
 
-fn inbox(w: &World, key: &str) -> Vec<Value> {
+pub(crate) fn inbox(w: &World, key: &str) -> Vec<Value> {
     std::fs::read_to_string(w.state().join("mail").join(format!("{key}.jsonl")))
         .unwrap_or_default()
         .lines()
