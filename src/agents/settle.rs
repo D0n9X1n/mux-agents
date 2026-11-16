@@ -4,6 +4,7 @@ use std::path::Path;
 use serde_json::{Value, json};
 
 use super::gens::{self, Decision, Found};
+use super::ident;
 use super::lifecycle::{Life, classify};
 use super::release::{self, Cause, halt};
 use super::team_state::{Guard, Tx};
@@ -112,7 +113,12 @@ fn unresolved(e: Refusal) -> Res<Outcome> {
 /// Call 63: the record read from `<agents>/<id>` must name `id`; another member's record there is Unreadable
 /// evidence for this member, read before any generation evidence, publication or hc call.
 fn bound(id: &str, r: &Value) -> Res<()> {
-    if r.get("id").and_then(Value::as_str) == Some(id) {
+    // a3c call 47: both ids valid and equal.
+    if ident::same(
+        ident::member_id,
+        r.get("id").and_then(Value::as_str),
+        Some(id),
+    ) {
         Ok(())
     } else {
         Err(crate::state::evidence::unreadable())
@@ -484,15 +490,22 @@ fn forgotten(
         r["hcAddress"].as_str()
     } else {
         // Call 64: an orphan has no recorded address: the attempt's own, bound by the identity checks below.
-        text("address").filter(|a| !a.is_empty())
+        text("address")
     };
+    // a3c call 47: active, pending and orphan alike, a recorded or attempted address that is present but empty or
+    // malformed refuses `evidence`, before any hc call; a missing one leaves `e` below.
+    if recorded.is_some_and(|a| !ident::hc_address(a))
+        || text("address").is_some_and(|a| !ident::hc_address(a))
+    {
+        return Err(ident::refused("hcAddress"));
+    }
     let label = |l: &str| labels.get(l).map(String::as_str);
     let generation = n.to_string();
-    let ours = !hc_name.is_empty()
-        && text("hcName") == Some(hc_name)
-        && label("mux.id") == Some(id)
+    let ours = ident::same(ident::hc_name, text("hcName"), Some(hc_name))
+        && ident::same(ident::member_id, label("mux.id"), Some(id))
         && label("mux.gen") == Some(generation.as_str());
-    let (Some(address), true) = (recorded.filter(|a| text("address") == Some(*a)), ours) else {
+    let at = recorded.filter(|a| ident::same(ident::hc_address, text("address"), Some(a)));
+    let (Some(address), true) = (at, ours) else {
         return Err(e);
     };
     match lazy.get()?.get(address) {
@@ -2120,5 +2133,107 @@ mod tests {
                 "{case}: the record changed"
             );
         }
+    }
+
+    /// Overwrites generation n's launch.json `hcName` (None: removes it), as a torn or partly written launch leaves it.
+    fn launch_name(m: &std::path::Path, n: u64, name: Option<&str>) {
+        let mut launch = gens::read(m, n, "launch").known().unwrap().unwrap();
+        match name {
+            Some(v) => launch["hcName"] = json!(v),
+            None => {
+                launch.as_object_mut().unwrap().remove("hcName");
+            }
+        }
+        std::fs::write(gens::path(m, n, "launch"), launch.to_string()).unwrap();
+    }
+
+    // a3c call 47 (TL #149, production readiness): an empty, missing or malformed recorded hcName never matches a
+    // terminal carrying the same name. `terminate` refuses `evidence`: no kill.json, no kill, no ended.json, pending kept.
+    #[test]
+    fn an_invalid_recorded_name_is_never_killed() {
+        for (case, recorded, shown) in [
+            ("empty", Some(""), ""),
+            ("missing", None, ""),
+            ("malformed", Some("../x"), "../x"),
+        ] {
+            let (w, s) = lf::world();
+            let m = committed_of(&w, "spawn");
+            launch_name(&m, 1, recorded);
+            let mut wire = lf::running(&w, 1);
+            wire["name"] = json!(shown);
+            cf::online(&w);
+            lf::found(&w, 1, &wire);
+            lf::get(&w, "t1", &wire);
+            kill(&w, "t1");
+            let got = terminate(&tx(&w, &s), ID, 1);
+            assert_eq!(got.map_err(|e| e.check), Err("evidence"), "{case}");
+            assert_eq!(lf::count(&w, "kill"), 0, "{case}: killed");
+            for f in ["terminating", "kill", "ended"] {
+                assert_eq!(gens::read(&m, 1, f), Evidence::Absent, "{case}: {f}.json");
+            }
+            assert!(
+                lf::record(&m).get("pending").is_some(),
+                "{case}: pending dropped"
+            );
+        }
+    }
+
+    // a3c call 47 (TL #149, production readiness): a forgotten-kill replay needs a valid recorded address, for active
+    // and pending as for an orphan. A record address and a kill.json address both empty (or both malformed), or either
+    // one alone empty, with hc answering `not_found` there, refuse `evidence`: no ended.json, the record (pending
+    // included) unchanged.
+    #[test]
+    fn a_kill_replay_never_matches_an_invalid_address() {
+        for (case, recorded, attempted) in [
+            ("pending empty", "", ""),
+            ("pending malformed", "t 1", "t 1"),
+            ("active empty", "", ""),
+            ("active malformed", "t 1", "t 1"),
+            ("orphan malformed", "t 1", "t 1"),
+            ("pending empty record", "", "t1"),
+            ("pending empty attempt", "t1", ""),
+        ] {
+            let (w, s) = lf::world();
+            let m = match case.split(' ').next().unwrap() {
+                "pending" => {
+                    let mut p = lf::pending(1);
+                    p["hcAddress"] = json!(recorded);
+                    lf::life(&w, json!({"pending": p}))
+                }
+                "active" => lf::life(&w, json!({"generation": "1", "hcAddress": recorded})),
+                _ => lf::life(&w, json!({"generation": "2", "hcAddress": "t2"})),
+            };
+            lf::seed_gen(&m, 1, Some("run"), lf::committed());
+            let labels = lf::running(&w, 1)["labels"].clone();
+            let body = json!({"address": attempted, "hcName": lf::hc_name(1), "labels": labels, "at": "x"});
+            gens::publish_once(&m, 1, "kill", &body).unwrap();
+            let before = std::fs::read(m.join("record.json")).unwrap();
+            cf::online(&w);
+            lf::ls(&w, 1, &[]);
+            lf::gone(&w, recorded);
+            let got = terminate(&tx(&w, &s), ID, 1);
+            assert_eq!(got.map_err(|e| e.check), Err("evidence"), "{case}");
+            assert_eq!(
+                gens::read(&m, 1, "ended"),
+                Evidence::Absent,
+                "{case}: an end recorded"
+            );
+            assert_eq!(
+                std::fs::read(m.join("record.json")).unwrap(),
+                before,
+                "{case}: the record changed"
+            );
+        }
+    }
+
+    // a3c call 47: call 63's binding needs a valid member id on both sides; an empty or malformed id in the record
+    // and in the call is never bound.
+    #[test]
+    fn an_invalid_id_is_never_bound() {
+        for id in ["", "../x"] {
+            let got = bound(id, &json!({"id": id}));
+            assert_eq!(got.map_err(|e| e.check), Err("evidence"), "{id:?}");
+        }
+        assert_eq!(bound(ID, &json!({"id": ID})), Ok(()));
     }
 }

@@ -194,20 +194,11 @@ pub(crate) fn subject_of(
     if s.held {
         let identity = Identity::held(g.record(), id, team)
             .ok_or_else(|| Refusal::internal("invalid held generation"))?;
-        let mut r = g.record().clone();
-        if let Some(o) = r.as_object_mut() {
-            for k in super::team_state::VIEW_FIELDS {
-                o.remove(k);
-            }
-        }
-        return Ok((identity, r));
+        return Ok((identity, super::team_state::presented(g, s)?));
     }
     let identity = Identity::read(g.record(), id, team)
         .ok_or_else(|| Refusal::internal("invalid local hc identity"))?;
-    Ok((
-        identity,
-        super::team_state::presented(g.folder(), g.record().clone())?,
-    ))
+    Ok((identity, super::team_state::presented(g, s)?))
 }
 
 /// R3 (ambiguity 5): a lifecycle observation is Ended exactly when every generation its record names is done;
@@ -485,10 +476,11 @@ impl Snapshot {
             Ok(rows) => (rows, None),
             Err(e) => (Vec::new(), Some(e)),
         };
+        let key = super::core_identity::Key::of(caller);
         let mut views = BTreeMap::new();
         let mut records = BTreeMap::new();
         for l in local {
-            if let Some(view) = l.identity.view(&l.stored.record, &rows) {
+            if let Some(view) = l.identity.view(&l.stored.record, &rows, &key) {
                 views.insert(l.identity.id.clone(), view);
             }
             records.insert(l.identity.id, l.stored);
@@ -516,7 +508,6 @@ impl Snapshot {
 }
 
 #[cfg(test)]
-#[path = "membership_tests.rs"]
 mod tests;
 
 /// The caller itself when it is a member proven through its own hc terminal: that member as hc sees it now, never

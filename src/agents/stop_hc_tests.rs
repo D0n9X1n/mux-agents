@@ -784,6 +784,36 @@ fn a_lifecycle_stop_inside_a_tree_terminates_under_the_held_team_lock() {
     w.fakes.hc_done().unwrap();
 }
 
+// PM calls 18, 27: a lifecycle stop by a caller whose views are down (presentation None, MemberMux::Down, no
+// multiplexer) ends the member and notices its generation; the multiplexer is never asked.
+#[test]
+fn a_viewless_lifecycle_stop_ends_the_member() {
+    let (w, _s) = lf::world();
+    let m = lf::life(&w, at0());
+    lf::seed_gen(&m, 0, Some("run"), lf::committed());
+    kills(&w, 0, true);
+    let mut caller = w.caller();
+    caller.presentation = None;
+    let id = crate::agents::member_target::named(&w.ctx, &caller, "worker").unwrap();
+    *w.ctx.member_mux.borrow_mut() = crate::mux::MemberMux::Down;
+    *w.ctx.mux.borrow_mut() = None;
+    let calls = w.fakes.mux_calls().len();
+    // cascade-3d: `stop_life` runs under the team lock with the team's kept reports (none here).
+    let scope = crate::agents::team_state::Scope::of(&caller);
+    let (got, _) = crate::agents::team_state::open(&w.ctx, &scope, |tx| {
+        super::message::stop_life(tx, &caller, None, &id, &[])
+    })
+    .expect("a viewless stop");
+    assert_eq!(got["life"], json!("ended"), "the member ended");
+    assert!(
+        gens::read(&m, 0, "notice").known().unwrap().is_some(),
+        "generation 0 is noticed"
+    );
+    assert_eq!(w.fakes.mux_calls().len(), calls, "no multiplexer call");
+    assert!(w.ctx.mux.borrow().is_none(), "no multiplexer built");
+    w.fakes.hc_done().unwrap();
+}
+
 /// A finished one-member journal of S (stopped, ended and noticed), as a cut-short stop leaves it.
 fn kept_s(w: &World) {
     cx::member(w, cx::S, None, 0, json!({}));

@@ -153,6 +153,7 @@ impl Mw {
             start: Some(1500),
             path: None,
             argv: Some(vec!["claude".into()]),
+            image: None,
         });
         self.w.fakes.process(crate::testing::row(31337, 1, 1000));
     }
@@ -253,6 +254,30 @@ fn prove_reads(m: &Mw, id: &str, r: &Value) -> (Option<Member>, Vec<PathBuf>) {
     let team = crate::agents::membership::team(&m.c);
     crate::state::fs::record_reads(|| prove_member(&m.w.ctx, &team, id, r, &t))
 }
+// H6: member proof rests on labels and generation evidence; no registry entry is read. With no entry, one naming
+// another conversation, and a torn one, the member is proven and no path under `live/` is read (evidence reads and
+// file opens both recorded).
+#[test]
+fn caller_proof_reads_no_registry_entry() {
+    for case in ["none", "other", "torn"] {
+        let m = lifecycle_world(1);
+        evidence(&m, 1);
+        commit(&m, 1, json!({"committed": true}));
+        crate::testing::seed_entry(&m.w.ctx, case);
+        let live = crate::state::live::dir(&m.w.ctx);
+        let ((proven, opened), asked) = crate::state::evidence::record_evidence_reads(|| {
+            crate::state::fs::record_reads(|| prove(&m, ID, Some(150)))
+        });
+        assert!(proven.is_some(), "{case}");
+        assert!(
+            !asked
+                .iter()
+                .chain(opened.iter())
+                .any(|p| p.starts_with(&live)),
+            "{case}: {asked:?} {opened:?}"
+        );
+    }
+}
 #[test]
 fn a_member_is_proven_by_its_recorded_launcher_and_client() {
     for fg in [150, 31337] {
@@ -314,6 +339,7 @@ fn row(pid: u32, ppid: u32, start: i64, path: &str, argv: &[&str]) -> Row {
         start: Some(start),
         path: Some(path.into()),
         argv: Some(argv.iter().map(|a| a.to_string()).collect()),
+        image: None,
     }
 }
 #[test]
@@ -1010,6 +1036,53 @@ fn resume_case(case: &str) -> (Mw, Res<Map<String, Value>>, String, Held) {
         crate::agents::resume::resume(&m.w.ctx, &m.w.request(&["resume", &x]))
     };
     (m, got, x, held)
+}
+// PM call 1 through admission: the exempt member caller still blocks X when its own argv names X's conversation, and
+// a second unmanaged Claude still blocks it. Each refusal names the pid and the rule (PM call 2).
+#[test]
+fn a_member_callers_exemption_ends_at_its_argv_and_other_clients() {
+    use crate::agents::occupancy::Rule;
+    for (case, pid, rule) in [
+        ("caller-argv", 150, Rule::Argv),
+        ("second-claude", 7001, Rule::Unmanaged),
+    ] {
+        let mut m = member_world();
+        let x = "dddddddddddd".to_string();
+        let mut rx = child(&x, ID, 2);
+        let sid = "22222222-2222-4222-8222-222222222222";
+        rx["sessionId"] = sid.into();
+        let rx = cf::member(&m.w, &x, rx);
+        write(&m.folder(&x).join("spec.json"), json!({"flags": []}));
+        let rows: Vec<Value> = [LEADER, ID, OTHER].iter().map(|id| m.record(id)).collect();
+        m.hc();
+        if case == "caller-argv" {
+            m.w.fakes.forget(150);
+            m.w.fakes.process(Row {
+                pid: 150,
+                ppid: 31337,
+                start: Some(1500),
+                path: None,
+                argv: Some(vec!["claude".into(), "--resume".into(), sid.into()]),
+                image: None,
+            });
+        } else {
+            let mut other = crate::testing::row(7001, 1, 7);
+            other.argv = Some(vec!["claude".into()]);
+            m.w.fakes.process(other);
+            m.w.fakes.client(7001, crate::parse::Client::Claude);
+        }
+        m.rounds(2, &term(&m.r, Some(150)));
+        facts_of(&m.w, &crate::agents::membership::team(&m.c), &rows, &rx);
+        let e = crate::agents::resume::resume(&m.w.ctx, &m.w.request(&["resume", &x])).unwrap_err();
+        assert_eq!(e.check, "session", "{case}: {}", e.message);
+        assert!(
+            e.message.starts_with(&format!("process {pid} ")),
+            "{case}: {}",
+            e.message
+        );
+        assert!(e.message.contains(rule.phrase()), "{case}: {}", e.message);
+        m.w.fakes.hc_done().unwrap();
+    }
 }
 #[test]
 fn a_member_resumes_only_a_descendant() {

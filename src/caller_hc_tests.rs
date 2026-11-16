@@ -56,6 +56,11 @@ fn hc_worker_routes_without_mux_ancestry() {
         (caller::Kind::Agent, "%9", "@5", ID)
     );
     assert_eq!(
+        got.presentation,
+        Some(("%9".to_string(), "@5".to_string())),
+        "a presented member"
+    );
+    assert_eq!(
         (
             got.socket,
             got.server_pid,
@@ -764,6 +769,29 @@ fn a_lifecycle_worker_stands_by_its_active_generation() {
     assert_eq!(e.check, "tagged", "unreadable under the lock");
 }
 
+// H6 through `caller::resolve`: the worker resolves as the same member whatever its registry entry says, and no path
+// under `live/` is read.
+#[test]
+fn caller_resolve_reads_no_registry_entry() {
+    for case in ["none", "other", "torn"] {
+        let (w, r, _) = lifecycle_worker(ok(), ok());
+        proof(&w, &r);
+        crate::testing::seed_entry(&w.ctx, case);
+        let live = crate::state::live::dir(&w.ctx);
+        let ((got, opened), asked) = crate::state::evidence::record_evidence_reads(|| {
+            crate::state::fs::record_reads(|| caller::resolve(&w.ctx))
+        });
+        assert_eq!(got.expect(case).member.as_deref(), Some(ID), "{case}");
+        assert!(
+            !asked
+                .iter()
+                .chain(opened.iter())
+                .any(|p| p.starts_with(&live)),
+            "{case}: {asked:?} {opened:?}"
+        );
+    }
+}
+
 // R1, R4: a lifecycle proof reads no folder-level commit or notice and nothing of generation 0.
 #[test]
 fn a_lifecycle_proof_reads_only_its_active_generation() {
@@ -782,3 +810,10 @@ fn a_lifecycle_proof_reads_only_its_active_generation() {
         );
     }
 }
+
+#[cfg(test)]
+mod k2_tests;
+#[cfg(test)]
+mod stop_tests;
+#[cfg(test)]
+mod views_tests;

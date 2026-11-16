@@ -145,6 +145,33 @@ pub fn entry(ctx: &Ctx, kind: Client, pid: u32, start: i64) -> Res<Option<Value>
     }
 }
 
+/// o3 call 29: an entry read whatever its process's liveness, and whether that process now reads Dead. `entry`
+/// conflates "no entry" with "its process is gone"; occupancy, which paired or exempted the process from an earlier
+/// table read, must not. Boot rules as `entry`: another boot's entry is none; an unverifiable one refuses.
+pub struct Found {
+    pub gone: bool,
+    pub entry: Option<Value>,
+}
+
+/// `entry`'s reads without its liveness shortcut (o3 call 29); `entry` itself is unchanged for its callers.
+pub fn lookup(ctx: &Ctx, kind: Client, pid: u32, start: i64) -> Res<Found> {
+    let gone = alive(ctx, pid, start) == Alive::Dead;
+    if !live_dir(ctx)? {
+        return Ok(Found { gone, entry: None });
+    }
+    let Some(found) = evidence::read(&path(ctx, kind, pid, start)).known()? else {
+        return Ok(Found { gone, entry: None });
+    };
+    match boot_match(ctx, &found) {
+        BootMatch::This => Ok(Found {
+            gone,
+            entry: Some(found),
+        }),
+        BootMatch::Another => Ok(Found { gone, entry: None }),
+        BootMatch::Uncertain => Err(evidence::unreadable()),
+    }
+}
+
 /// What an entry's recorded `boot` says against this boot (r2b calls 27, 29).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum BootMatch {
@@ -411,6 +438,25 @@ mod tests {
             Err("evidence"),
             "a file at live/: sweep"
         );
+    }
+
+    // r2b call 5 closed by occupy-3: a Unix pid kept with no start (`seam::listed`) reads Unknown, never Dead, and
+    // sweep keeps its entry.
+    #[test]
+    fn a_kept_unix_row_without_a_start_is_unknown() {
+        let (f, ctx, _d) = world();
+        assert_eq!(put(&ctx, 150, 1500, "startup"), Ok(1), "seed");
+        f.forget(150);
+        f.process(crate::proc::Row {
+            ppid: 0,
+            start: None,
+            path: None,
+            argv: None,
+            ..row(150, 100, 0)
+        });
+        assert_eq!(alive(&ctx, 150, 1500), Alive::Unknown);
+        assert_eq!(checked(sweep(&ctx)), Ok(0));
+        assert!(file(&ctx).is_file());
     }
 
     // PM call 10: Dead only when the pid is absent from the process table, or listed with another known start.

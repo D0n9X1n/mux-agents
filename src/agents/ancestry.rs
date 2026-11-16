@@ -79,17 +79,23 @@ pub(crate) fn identity_on(
 /// path). A `node` is the loader only when `tree::copilot_pair` recognizes the pair; a `node` it does not recognize is
 /// unresolved (None). Only a parent positively named something else leaves the native process.
 fn loader_of(ctx: &Ctx, native: &Row, os: OsKind) -> Option<Row> {
-    let parent = ctx.os.row(native.ppid)?;
+    pair_parent(ctx, &ctx.os.row(native.ppid)?, native, os)
+}
+
+/// `loader_of`'s rule on a parent row the caller already holds (occupy-3 calls 8, 17, 18: occupancy passes the row
+/// from its one table read): a start no newer than the native's; a `node` is the loader only when `copilot_pair`
+/// recognizes the pair (else unresolved, None); a parent named otherwise leaves the native process.
+pub(crate) fn pair_parent(ctx: &Ctx, parent: &Row, native: &Row, os: OsKind) -> Option<Row> {
     if parent.start.is_none() || parent.start > native.start {
         return None;
     }
-    if file(&parent)? != "node" {
+    if file(parent)? != "node" {
         return Some(native.clone());
     }
-    let pair = super::tree::copilot_pair(&parent, native, os, |r| {
+    let pair = super::tree::copilot_pair(parent, native, os, |r| {
         ctx.os.client_of(r) == Some(Client::Copilot)
     });
-    pair.then_some(parent)
+    pair.then(|| parent.clone())
 }
 
 #[cfg(test)]
@@ -219,6 +225,7 @@ mod tests {
             start,
             path: path.map(String::from),
             argv: None,
+            image: None,
         };
         let f = Fakes::default();
         if let Some((start, path, recognized)) = loader {

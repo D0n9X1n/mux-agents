@@ -177,5 +177,4 @@ fn writer_abort(a: &Map<String, Value>, folder: &Path, record: &Value) -> bool {
 }
 
 #[cfg(test)]
-#[path = "prelife_rule_tests.rs"]
 mod tests;

@@ -282,11 +282,9 @@ pub(crate) fn attempt<T>(f: impl FnOnce() -> Res<T>) -> Res<T> {
 
 /// Test hook (F3): a callback after every forward step. `Reset` also clears every fs fault a test may arm.
 #[cfg(test)]
-#[path = "core_launch_hooks.rs"]
 pub(crate) mod hooks;
 
 #[cfg(test)]
-#[path = "core_launch_forward_tests.rs"]
 pub(crate) mod forward_tests;
 
 /// Crash tests (launch-1 crash model). Call 28: A3b-1 guarantees convergence by a direct retry after `allocated`
@@ -294,5 +292,4 @@ pub(crate) mod forward_tests;
 /// void). A crash after `pending`, `spec` or an unpromoted `commit` is not converged by a retry (it is refused while
 /// the generation is undecided); group B's settle (G3) replays it.
 #[cfg(test)]
-#[path = "core_launch_crash_tests.rs"]
 pub(crate) mod crash;

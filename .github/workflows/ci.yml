@@ -85,6 +85,7 @@ jobs:
           cargo fmt --check
           cargo clippy --all-targets --features test-panic --locked -- -D warnings
           cargo test --features test-panic --locked
+          cargo test --locked --test crash_point
       - name: Release build
         shell: bash
         run: cargo build --release --locked
@@ -229,10 +230,20 @@ jobs:
         run: |
           cargo test --features live,test-panic --locked --test fake_client_bg
           cargo test --features live,test-panic --locked --bin fake-client
+      # occupy-3: a fake client of a parallel live test is an unmanaged client of another state root and holds every
+      # conversation of its kind, so the tests that run `resume` (tests/serial_resume.txt) run alone. The runner
+      # resolves each listed name to its full registered names (`e2e::<mux>::<name>`, call 24); its self-test (`check`)
+      # proves, from libtest's own --list, that every listed test is in the serial pass and none in the parallel pass.
       - name: Live tests
         env:
           MUX_AGENTS_LIVE_REQUIRE: tmux,tmux32,rmux
-        run: cargo test --features live,test-panic --locked --test live
+        run: |
+          sh tests/serial_resume.sh check live
+          sh tests/serial_resume.sh parallel live
+      - name: Live resume tests, one at a time
+        env:
+          MUX_AGENTS_LIVE_REQUIRE: tmux,tmux32,rmux
+        run: sh tests/serial_resume.sh serial live
       - name: Release script tests
         run: sh tests/release.sh
       - name: Wiki publisher tests
@@ -306,4 +317,6 @@ jobs:
         run: |
           set -euo pipefail
           rmux -V
-          cargo test --features live,test-panic --locked --test live_windows -- --nocapture
+          sh tests/serial_resume.sh check live_windows
+          sh tests/serial_resume.sh parallel live_windows --nocapture
+          sh tests/serial_resume.sh serial live_windows --nocapture

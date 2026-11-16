@@ -143,6 +143,7 @@ pub fn spawn(ctx: &Ctx, request: &Request) -> Res<Map<String, Value>> {
         return Err(usage("spawn"));
     };
     let caller = crate::caller::resolve_tree(ctx)?;
+    crate::cli::member_views(ctx, &caller)?;
     let outside = matches!(
         super::tree::scope(ctx, &caller)?,
         super::tree::Scope::Outside
@@ -904,6 +905,7 @@ mod tests {
             start: Some(1500),
             path: None,
             argv: Some(argv.map(String::from).to_vec()),
+            image: None,
         });
         w.fakes.prefer_last();
         w.file("t.md", b"task");
@@ -1470,6 +1472,7 @@ mod tests {
                 start: Some(1500),
                 path: None,
                 argv: Some(argv),
+                image: None,
             });
             w.fakes.prefer_last();
             assert_eq!(
@@ -2770,6 +2773,7 @@ mod tests {
             start: Some(1130),
             path: Some(exe.clone()),
             argv: Some(vec![exe, "watch".into()]),
+            image: None,
         });
         let open = Rc::new(Cell::new(false));
         // The window the bar was split in; the caller's @1 until a split says else.
@@ -3475,7 +3479,8 @@ mod tests {
                     .chain([format!("-{spawn}"), format!("+{bar}"), format!("-{bar}")])
                     .collect::<Vec<_>>()
                 );
-                assert_eq!(calls(&w, "list-panes").len(), 2);
+                // views-6f call 5: the launch's member-locked view search lists the session's panes once more.
+                assert_eq!(calls(&w, "list-panes").len(), 3);
                 assert_eq!(
                     w.fakes
                         .hc_calls()
@@ -3785,7 +3790,6 @@ mod tests {
 }
 
 #[cfg(test)]
-#[path = "spawn_hc_tests.rs"]
 mod hc_tests;
 pub struct CoreRequest<'a> {
     pub client: Client,
@@ -3864,7 +3868,6 @@ pub fn launch_hc_locked(
         (None, None) => launch.prepare_hc(slot)?,
     };
     let scope = super::team_state::Scope::of(caller);
-    let id = l.id.clone();
     // The caller holds the session spawn lock, which is the team lock (state-0 S1).
     super::team_state::held(ctx, &scope, |tx| {
         let spend = || {
@@ -3884,49 +3887,7 @@ pub fn launch_hc_locked(
             if ctx.env.get("MUX_AGENTS_TEST_PANIC") == Some("launch") {
                 panic!("PANIC-PAYLOAD-launch");
             }
-            let n = record
-                .get("generation")
-                .and_then(Value::as_str)
-                .and_then(super::gens::plain_gen)
-                .ok_or_else(|| Refusal::internal("a promoted record has no generation"))?;
-            // Call 18a: the promoted generation's own address, validated by `promote`.
-            let address = record
-                .get("hcAddress")
-                .and_then(Value::as_str)
-                .unwrap_or_default();
-            let mut view = None;
-            let attached = super::core_launch::attempt(|| {
-                super::attachment::attach(
-                    ctx,
-                    core,
-                    caller,
-                    record,
-                    address,
-                    request.split,
-                    &mut view,
-                )
-            });
-            match (attached, view.filter(|v| !v.command.is_empty())) {
-                (Ok(()), Some(v)) => {
-                    // Ambiguity 15, V1: the descriptor names its generation and terminal.
-                    let fields = json!({"serverKey": caller.server_key, "session": caller.session,
-                        "pane": v.pane, "window": v.window, "startCommand": v.command, "gen": n,
-                        "hcAddress": record["hcAddress"], "hcName": record["hcName"]});
-                    if let Err(e) = super::team_state::view(ctx, &scope, &id, &fields) {
-                        let _ = super::attachment::clean(ctx, &v);
-                        return Err(e);
-                    }
-                    Ok(fields)
-                }
-                (got, v) => {
-                    if let Some(v) = v {
-                        let _ = super::attachment::clean(ctx, &v);
-                    }
-                    Err(got
-                        .err()
-                        .unwrap_or_else(|| Refusal::internal("unproven new view")))
-                }
-            }
+            super::view::launch_view(ctx, core, caller, record, request.split)
         })
     })
 }

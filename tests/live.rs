@@ -8,8 +8,17 @@
 #[path = "support/launch_evidence.rs"]
 mod launch_evidence;
 
+// A3c Task 7: readiness barriers and the fake client's guards (PM calls 12, 26, 27).
+#[cfg(unix)]
+#[path = "support/ready.rs"]
+mod ready;
+
 #[cfg(unix)]
 mod support;
+
+// `ready.rs` reaches the one bounded runner as `crate::bounded`, as in tests/live_windows.rs.
+#[cfg(unix)]
+use support::bounded;
 
 // report-2b: the shared integration fixtures (private root, 150 s wait, deny_queries); occupy-3 uses them here.
 mod native;
@@ -750,12 +759,22 @@ exec claude --dangerously-skip-permissions
 
         /// The pid of the worker client of a spawn reply.
         fn worker_pid(&self, spawned: &Value) -> u64 {
+            if let Some(id) = spawned["id"].as_str() {
+                self.proof_of(id);
+            }
             self.server.client_by_session(s(&spawned["sessionId"]))["pid"]
                 .as_u64()
                 .unwrap()
         }
 
+        /// PM call 26: waits for member `id`'s proof evidence (its active generation's client.json) before it is
+        /// commanded. A pre-lifecycle member has none and is not waited for.
+        fn proof_of(&self, id: &str) {
+            crate::ready::wait_member(&self.agent_dir(id));
+        }
+
         fn client_of(&self, id: &str) -> u64 {
+            self.proof_of(id);
             let text = std::fs::read_to_string(self.agent_dir(id).join("record.json")).unwrap();
             let r: Value = serde_json::from_str(&text).unwrap();
             self.server
@@ -815,7 +834,8 @@ exec claude --dangerously-skip-permissions
 
         /// Waits for the fake client of session `sid` (started with `--session-id sid`, or resumed with `sid` in its
         /// argv) that is not `old`; its pid (`msg-plan-4b-i-3.md` F20).
-        fn successor(&self, sid: &str, old: u64) -> u64 {
+        fn successor(&self, id: &str, sid: &str, old: u64) -> u64 {
+            self.proof_of(id);
             self.server.wait(&format!("successor of {old}"), || {
                 let log = std::fs::read_to_string(self.dir.join("clients.log")).ok()?;
                 log.lines().rev().find_map(|p| {
@@ -4616,6 +4636,145 @@ hc {}:
         assert_eq!(exit_messages(&live, &w).len(), 1);
     }
 
+    // proof-0b K2 live (4to6 #3, #4, #19): a team (up), its leader spawns w2 down the tree with a brief; both are
+    // proven from client.json (`spawn_by` waits for the leader's, `wait_proof` for each; PM call 26); with the
+    // multiplexer server killed and no `up`, the leader sends (a file: agents pass free text only in files), w2 reads
+    // and reports; focus is refused `views`; list and stop run with views down.
+    fn members_mail_without_the_multiplexer(mux: Mux) {
+        let Some(mut live) = Live::human(mux) else {
+            return;
+        };
+        let (code, up) = live.run(&["up", "-Client", "claude"]);
+        assert_eq!(code, 0, "{mux:?} {up}");
+        std::fs::write(live.dir.join("brief.md"), "brief").unwrap();
+        std::fs::write(live.dir.join("note.md"), "without the views").unwrap();
+        let lead = s(&up["leader"]["id"]).to_string();
+        let (code, child) = live.spawn_by(&lead, "w2");
+        assert_eq!(code, 0, "{mux:?}: the leader spawns w2: {child}");
+        let w2 = s(&child["id"]).to_string();
+        for id in [&lead, &w2] {
+            let gen0 = live.agent_dir(id).join("gens").join("0");
+            let client = crate::ready::wait_proof(&live.agent_dir(id), 0);
+            assert!(
+                client["pid"].is_u64(),
+                "{mux:?} {id}: client.json published"
+            );
+            assert!(
+                json_file(&gen0.join("launcher.json"))
+                    .get("client")
+                    .is_none(),
+                "{mux:?} {id}: no client field"
+            );
+        }
+        let (p1, p2, note) = (
+            live.client_of(&lead),
+            live.client_of(&w2),
+            live.path("note.md"),
+        );
+        let server = live.server.pid();
+        // Checklist 12: `try_call` is a bounded child (support::bounded) with the server's own environment.
+        let _ = live.server.try_call(&["kill-server"]);
+        assert!(
+            eventually(LONG, || !support::alive(server)),
+            "{mux:?}: the server is gone"
+        );
+        let (code, sent) = live.server.command(p1, &["send", "w2", "-BodyFile", &note]);
+        assert_eq!(code, 0, "{mux:?} {sent}");
+        let (code, read) = live.server.command(p2, &["read"]);
+        assert_eq!(
+            (code, bodies(&read)),
+            (0, vec!["without the views".to_string()]),
+            "{mux:?} {read}"
+        );
+        let (code, report) = live
+            .server
+            .command(p2, &["report", "blocked", "-Kind", "question"]);
+        assert_eq!(
+            (code, &report["state"]),
+            (0, &json!("blocked")),
+            "{mux:?} {report}"
+        );
+        let (code, focus) = live.server.command(p1, &["focus", "w2"]);
+        assert_eq!(
+            (code, &focus["check"]),
+            (1, &json!("views")),
+            "{mux:?} {focus}"
+        );
+        let (code, list) = live.server.command(p1, &["list"]);
+        let row = list["agents"]
+            .as_array()
+            .and_then(|a| a.iter().find(|x| x["name"] == "w2"))
+            .cloned()
+            .unwrap_or_default();
+        assert_eq!(
+            code, 0,
+            "{mux:?}: list runs with views down (PM call 18) {list}"
+        );
+        assert!(
+            !row.is_null() && row["pane"].is_null() && row["window"].is_null(),
+            "{mux:?}: w2 listed without pane fields: {list}"
+        );
+        let (code, stop) = live.server.command(p1, &["stop", "w2"]);
+        assert_eq!(
+            (code, &stop["life"]),
+            (0, &json!("ended")),
+            "{mux:?}: stop needs no view (4to7re #15) {stop}"
+        );
+    }
+
+    // launch-1 live, a dropped `hc run` reply (ambiguity 14): spawn's process dies right after `hc run` returns; the
+    // variable is set for that one process only. Nothing runs; the launcher gives up; a retry runs once.
+    fn a_dropped_run_reply_runs_nothing_then_a_retry_runs_once(mux: Mux) {
+        let Some(mut live) = Live::human(mux) else {
+            return;
+        };
+        let log = live.dir.join("clients.log");
+        let clients = || {
+            std::fs::read_to_string(&log)
+                .unwrap_or_default()
+                .lines()
+                .count()
+        };
+        let before = clients();
+        let args = live.spawn_args("claude", "w1", &[]);
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
+        let state = live.state_text();
+        let vars = [
+            ("MUX_AGENTS_STATE", state.as_str()),
+            ("MUX_AGENTS_CRASH", "run"),
+        ];
+        let (code, _, _) = live
+            .server
+            .run_raw(env!("CARGO_BIN_EXE_mux-agent"), &args, &vars, &[]);
+        assert_eq!(code, 86, "{mux:?}: killed after hc run returned");
+        let ids: Vec<_> = std::fs::read_dir(live.keyed().join("agents"))
+            .unwrap()
+            .flatten()
+            .map(|e| e.path())
+            .collect();
+        assert_eq!(ids.len(), 1, "{mux:?}: one member folder: {ids:?}");
+        let commit = ids[0].join("gens").join("0").join("commit.json");
+        let aborted = || {
+            std::fs::read_to_string(&commit)
+                .ok()
+                .and_then(|t| serde_json::from_str::<Value>(&t).ok())
+                .is_some_and(|c| c["aborted"] == true)
+        };
+        assert!(eventually(LONG, aborted), "{mux:?}: the launcher gave up");
+        assert_eq!(clients(), before, "{mux:?}: nothing ran");
+        let (code, again) = live.try_spawn("w1", &[]);
+        assert_eq!(
+            code, 0,
+            "{mux:?}: the name is free once the generation is void, and the variable did not leak: {again}"
+        );
+        live.worker_pid(&again);
+        assert_eq!(
+            clients(),
+            before + 1,
+            "{mux:?}: the retry ran exactly one client"
+        );
+    }
+
     // A worker whose view is closed still reads its own mail (#104 phase 1c): the person sends to it after the view
     // pane is gone, and `read` run by the worker in its hc terminal, which has no TMUX or RMUX, returns that message.
     fn hc_worker_reads_after_its_view_closes(mux: Mux) {
@@ -4745,8 +4904,9 @@ hc {}:
         }
     }
 
-    // options-6e live: a member started with `--model x` and a task, stopped, its record holding the options A3 will
-    // store (seeded, see the task text), then resumed through the real CLI: argv `--model x --resume <sid>`, no task.
+    // options-6e live, unseeded: spawned with `-Model x`, its record written by `forward`; the first client is up and
+    // its conversation exists before the stop (4to6 #8); resumed: argv = the stored options, then `--resume <sid>`, no
+    // task; the successor keeps the conversation id (4to6 #11) and reloads it once (4to6 #7); a fresh hc name.
     fn a_stopped_member_resumes_with_its_stored_options_only(mux: Mux) {
         let Some(mut live) = Live::human(mux) else {
             return;
@@ -4761,6 +4921,23 @@ hc {}:
             first.contains("--model x"),
             "{mux:?}: started with --model x: {first}"
         );
+        let conv = live.dir.join(format!("conversation.{sid}.log"));
+        crate::ready::wait_conversation(live.dir.path(), &sid); // PM call 12
+        let r = json_file(&live.agent_dir(s(&w["id"])).join("record.json"));
+        let options: Vec<String> = strings(&r["options"])
+            .iter()
+            .map(|o| o.to_string())
+            .collect();
+        assert_eq!(r["lifecycle"], 1, "{mux:?}: written by forward, not seeded");
+        assert!(r["prompt"].is_array(), "{mux:?} {r}");
+        assert!(
+            options.windows(2).any(|p| p[0] == "--model" && p[1] == "x"),
+            "{mux:?}: --model x stored: {options:?}"
+        );
+        assert!(
+            !options.iter().any(|o| o.contains("say hi")),
+            "{mux:?}: the task is not an option"
+        );
         let (code, stop) = live.run(&["stop", "w1"]);
         assert_eq!(code, 0, "{mux:?} {stop}");
         assert!(
@@ -4768,28 +4945,46 @@ hc {}:
                 == "finished"),
             "{mux:?}"
         );
-        // E1: the launch stored the selected model as an option; the record is read as production wrote it.
-        let r = json_file(&live.agent_dir(s(&w["id"])).join("record.json"));
-        assert_eq!(r["lifecycle"], 1, "{mux:?}");
-        assert!(r["prompt"].is_array(), "{mux:?} {r}");
-        let opts: Vec<String> = serde_json::from_value(r["options"].clone()).unwrap();
-        assert!(
-            opts.ends_with(&["--model".to_string(), "x".to_string()]),
-            "{mux:?} {opts:?}"
-        );
         let (code, resumed) = live.run(&["resume", "w1"]);
         assert_eq!(code, 0, "{mux:?} {resumed}");
+        let y = json_file(
+            &live
+                .agent_dir(s(&resumed["agent"]["id"]))
+                .join("record.json"),
+        );
+        assert_eq!(
+            y["sessionId"],
+            sid.as_str(),
+            "{mux:?}: the successor keeps the conversation"
+        );
         let client = resumed_client(&live, &sid);
+        let mut want = options.clone();
+        want.extend(["--resume".to_string(), sid.clone()]);
         assert_eq!(
             client["argv"],
-            json!(
-                opts.iter()
-                    .cloned()
-                    .chain(["--resume".to_string(), sid.clone()])
-                    .collect::<Vec<_>>()
-            ),
+            json!(want),
             "{mux:?}: the stored options only"
         );
+        assert_eq!(
+            client["env"]["MUX_AGENTS_GEN"], "0",
+            "{mux:?}: the successor's generation 0"
+        );
+        let lines: Vec<String> = std::fs::read_to_string(&conv)
+            .unwrap()
+            .lines()
+            .map(|l| l.split(' ').nth(1).unwrap_or("").to_string())
+            .collect();
+        assert_eq!(
+            lines,
+            ["start", "resume"],
+            "{mux:?}: started once, reloaded once"
+        );
+        let name = s(&y["hcName"]);
+        let fresh = name.len() == 9
+            && name.starts_with('m')
+            && name[1..].bytes().all(|b| b.is_ascii_hexdigit());
+        assert!(fresh, "{mux:?}: an m<8 hex> name: {name}");
+        assert_ne!(y["hcName"], r["hcName"], "{mux:?}: a fresh hc name");
     }
 
     // Stop an agent, then resume it: the successor runs `claude <flags> --resume <its session>`, no task and no fork,
@@ -4802,6 +4997,7 @@ hc {}:
         let w = live.spawn("w1", &[]);
         let sid = s(&w["sessionId"]).to_string();
         let address = s(&w["hcAddress"]).to_string();
+        crate::ready::wait_conversation(live.dir.path(), &sid); // PM call 12
         let (code, stop) = live.run(&["stop", "w1"]);
         assert_eq!(code, 0, "{mux:?} {stop}");
         assert!(
@@ -4857,6 +5053,58 @@ hc {}:
             s(&view["window"]),
             "{mux:?} {resumed}"
         );
+    }
+
+    // occupy-3 H2 live: managed Copilot member w2 switches into w1's ended conversation (its fake client runs the
+    // `report -Session` its sessionStart hook runs after `/resume`). Resuming w1 is refused while w2's newest report
+    // names it, and admitted once w2 reports its own conversation again. w1's terminal is finished first, so w1's own
+    // client is not the holder named.
+    fn a_managed_copilot_resumed_into_a_conversation_holds_it(mux: Mux) {
+        let Some(mut live) = Live::human(mux) else {
+            return;
+        };
+        let w1 = live.spawn("w1", &[]);
+        let (code, w2) = live.try_spawn_client("copilot", "w2", &[]);
+        assert_eq!(code, 0, "{mux:?} {w2}");
+        let (sid1, sid2) = (
+            s(&w1["sessionId"]).to_string(),
+            s(&w2["sessionId"]).to_string(),
+        );
+        let address = s(&w1["hcAddress"]).to_string();
+        let (code, stop) = live.run(&["stop", "w1"]);
+        assert_eq!(code, 0, "{mux:?} {stop}");
+        assert!(
+            eventually(LONG, || core(&live, &["get", &address, "--json"])["state"]
+                == "finished"),
+            "{mux:?}"
+        );
+        let pid = crate::native::client_at(live.dir.path(), s(&w2["hcAddress"]));
+        crate::native::startup_report(live.dir.path(), pid);
+        let line = |sid: &str| format!("report\t-Session\t{sid}\t-Source\tresume");
+        let r = crate::native::client_cmd(live.dir.path(), pid, &line(&sid1));
+        assert_eq!(
+            r["client"]["pid"], pid,
+            "{mux:?} the walk found w2's own client: {r}"
+        );
+        let (code, refused) = live.run(&["resume", "w1"]);
+        assert_eq!(
+            (code, &refused["check"]),
+            (2, &json!("session")),
+            "{mux:?} {refused}"
+        );
+        // PM call 2: w2's client, its image, and the managed rule.
+        let message = s(&refused["message"]);
+        assert!(
+            message.starts_with(&format!("process {pid} (copilot)")),
+            "{mux:?} {message}"
+        );
+        assert!(
+            message.contains(mux_agent::agents::occupancy::Rule::Managed.phrase()),
+            "{mux:?} {message}"
+        );
+        crate::native::client_cmd(live.dir.path(), pid, &line(&sid2));
+        let (code, resumed) = live.run(&["resume", "w1"]);
+        assert_eq!(code, 0, "{mux:?} {resumed}");
     }
 
     /// The hostile settings: renumbered windows, kept dead panes, and a default command that leaves a marker.
@@ -5394,7 +5642,10 @@ hc {}:
                     hc_view_close_survives_focus_stop,
                     hc_worker_reads_after_its_view_closes,
                     stop_then_resume_returns_with_its_conversation,
+                    a_managed_copilot_resumed_into_a_conversation_holds_it,
                     a_stopped_member_resumes_with_its_stored_options_only,
+                    members_mail_without_the_multiplexer,
+                    a_dropped_run_reply_runs_nothing_then_a_retry_runs_once,
                     root_unsandboxed_terminal_driver_finished,
                     spawn_window_and_split_tagged,
                     spawn_titles_tab_and_pane,
@@ -5598,6 +5849,8 @@ hc {}:
         let spawn = |live: &mut Live, by: &str, name: &str| {
             let (code, r) = live.spawn_by(by, name);
             assert_eq!(code, 0, "{mux:?} {name}: {r}");
+            // o2 call 35 (integration): ready before any stop ends it, so it ends an ordinary member.
+            live.ready(&r);
             s(&r["id"]).to_string()
         };
         // 1. The leader stops a1 by name, inside the tree: b1, then a1; every notice; no journal left.
@@ -5779,9 +6032,11 @@ hc {}:
         let (_, pending) = live.by(&b, &["read", "-Deliver"]);
         let sid = s(&json_file(&live.agent_dir(&b).join("record.json"))["sessionId"]).to_string();
         let old = live.client_of(&b);
+        crate::ready::wait_conversation(live.dir.path(), &sid); // PM call 12
         assert_eq!(live.by(&leader, &["stop", "b"]).0, 0, "{mux:?}");
-        assert_eq!(live.by(&leader, &["resume", "b"]).0, 0, "{mux:?}");
-        let pid = live.successor(&sid, old);
+        let (code, resumed) = live.by(&leader, &["resume", "b"]);
+        assert_eq!(code, 0, "{mux:?} {resumed}");
+        let pid = live.successor(s(&resumed["agent"]["id"]), &sid, old);
         assert_ne!(pid, old, "{mux:?} a new process");
         let (_, rebuilt) = live.server.command(pid, &["read", "-Deliver"]);
         assert_eq!(
@@ -5945,9 +6200,10 @@ hc {}:
             let sid =
                 s(&json_file(&live.agent_dir(&b).join("record.json"))["sessionId"]).to_string();
             let before = live.client_of(&b);
+            crate::ready::wait_conversation(live.dir.path(), &sid); // PM call 12
             live.by(&leader, &["stop", "b"]);
-            live.by(&leader, &["resume", "b"]);
-            let b2 = live.successor(&sid, before);
+            let (_, resumed) = live.by(&leader, &["resume", "b"]);
+            let b2 = live.successor(s(&resumed["agent"]["id"]), &sid, before);
             assert_ne!(b2, before, "{mux:?} a new process");
             let (_, stale) = live.server.command(b2, &["read", "-Ack", s(&old["batch"])]);
             assert_eq!(stale["check"], "ack", "{mux:?}");

@@ -213,6 +213,16 @@ pub static VERBS: &[VerbDef] = &[
         handler: version,
         text: version_text,
     },
+    VerbDef {
+        name: "kept",
+        values: &["Close"],
+        switches: &[],
+        min: 0,
+        max: 0,
+        usage: "usage: mux-agent kept [-Close <address>] [-Text]",
+        handler: crate::agents::kept::kept,
+        text: json::lines,
+    },
 ];
 
 /// This binary's version. `run` answers it before any provider is built, so it reads no multiplexer, state root or
@@ -361,6 +371,31 @@ fn failure(verb: Option<&str>, refusal: &Refusal) -> Map<String, Value> {
 pub(crate) const HERDR: &str =
     "this terminal is herdr's: use herdr's own skills (hc --skill), not mux-agents";
 
+/// K2: the refusal of a view verb, and of any multiplexer call, for a member whose views are down.
+pub(crate) const VIEWS_DOWN: &str = "the team's views are down; run up";
+
+/// proof-0b K2, ambiguity 10: the verbs that open, select or place a view.
+const VIEW_VERBS: &[&str] = &["focus", "spawn", "resume", "sidebar", "watch", "placement"];
+
+/// K2 (W3): a proven member whose views are down still sends, reads and reports; a view verb needs `up` first.
+pub(crate) fn views_required(verb: &str, caller: &crate::caller::Caller) -> Res<()> {
+    if VIEW_VERBS.contains(&verb) && caller.member.is_some() && caller.presentation.is_none() {
+        return refuse(1, "views", VIEWS_DOWN);
+    }
+    Ok(())
+}
+
+/// a3c call 47: a view verb's prerequisite against the handler's own proof (dispatch proved the caller once already;
+/// the handler proves it again, and its effects use that second proof). A proven member's multiplexer is built here,
+/// from that proof: views down (`MemberMux::Down`) or a server gone or restarted since refuse 1 `views` before the
+/// verb spends a budget, opens a transaction or runs anything. A pane caller is unchanged.
+pub(crate) fn member_views(ctx: &Ctx, caller: &crate::caller::Caller) -> Res<()> {
+    if caller.member.is_some() {
+        crate::mux::ensure(ctx)?;
+    }
+    Ok(())
+}
+
 fn dispatch(def: &VerbDef, request: &Request, ctx: &Ctx) -> Res<Map<String, Value>> {
     #[cfg(feature = "test-panic")]
     if ctx.env.get("MUX_AGENTS_TEST_PANIC") == Some("dispatch") {
@@ -378,6 +413,7 @@ fn dispatch(def: &VerbDef, request: &Request, ctx: &Ctx) -> Res<Map<String, Valu
         if caller.candidate.is_some() && !crate::agents::tree::candidate_verb(def.name, request) {
             return Err(crate::agents::tree::tagged());
         }
+        views_required(def.name, &caller)?;
     }
     // Every public verb refuses a sandboxed caller before any multiplexer call (MuxAgents.ps1:94).
     crate::sandbox::assert_unsandboxed(ctx)?;
@@ -537,6 +573,34 @@ mod tests {
         parse(&args(tokens)).unwrap().1
     }
 
+    // proof-0b K2, ambiguity 10: only the view verbs need a presented view, and only a proven member can lack one.
+    #[test]
+    fn only_view_verbs_need_a_presented_view() {
+        let w = crate::agents::fixture::World::human("");
+        let mut c = w.caller();
+        c.member = Some(crate::agents::fixture::ID.into());
+        c.presentation = None;
+        for verb in ["focus", "spawn", "resume", "sidebar", "watch", "placement"] {
+            let e = views_required(verb, &c).unwrap_err();
+            assert_eq!(
+                (e.code, e.check, e.message.as_str()),
+                (1, "views", VIEWS_DOWN),
+                "{verb}"
+            );
+        }
+        for verb in ["send", "read", "report", "status", "list", "stop", "notify"] {
+            assert!(views_required(verb, &c).is_ok(), "{verb}");
+        }
+        c.presentation = Some(("%1".into(), "@1".into()));
+        assert!(views_required("focus", &c).is_ok(), "a presented member");
+        (c.member, c.presentation) = (None, None);
+        assert!(
+            views_required("focus", &c).is_ok(),
+            "only a member is refused here"
+        );
+        assert_eq!(VIEWS_DOWN, "the team's views are down; run up");
+    }
+
     fn usage_of(tokens: &[&str]) -> (u8, &'static str) {
         match parse(&args(tokens)) {
             Ok((_, request)) => panic!("parsed: {request:?}"),
@@ -684,7 +748,8 @@ mod tests {
                 "notify",
                 "sidebar",
                 "watch",
-                "version"
+                "version",
+                "kept"
             ]
         );
         for name in names {
@@ -716,6 +781,7 @@ mod tests {
             ("sidebar", 0, 0),
             ("watch", 0, 0),
             ("version", 0, 0),
+            ("kept", 0, 0),
         ];
         assert_eq!(bounds.len(), VERBS.len());
         let pos = ["p1", "p2", "p3"];
@@ -824,6 +890,7 @@ mod tests {
             "sidebar" => vec!["sidebar"],
             "watch" => vec!["watch"],
             "version" => vec!["version"],
+            "kept" => vec!["kept"],
             other => panic!("no valid call for {other}"),
         }
     }
@@ -1155,6 +1222,7 @@ mod tests {
             start: Some(1130),
             path: Some(exe.clone()),
             argv: Some(vec![exe, "watch".into()]),
+            image: None,
         });
         // The label read back after open's guarded label write.
         w.fakes.mux_rule(
@@ -1552,6 +1620,7 @@ mod tests {
             start: Some(2000),
             path: Some(exe.clone()),
             argv: Some(vec![exe, "watch".into()]),
+            image: None,
         });
         w.fakes
             .mux_rule("#{pane_id}|#{@agent-role}", 0, "%1|sidebar\n", "");

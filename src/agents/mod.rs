@@ -22,6 +22,10 @@ pub(crate) mod core_fixture;
 pub mod core_identity;
 pub mod core_launch;
 pub mod gens;
+pub mod ident;
+pub mod kept;
+#[cfg(test)]
+mod kept_tests;
 pub mod leader;
 #[cfg(test)]
 pub(crate) mod life_fixture;
@@ -30,6 +34,7 @@ pub mod mail;
 pub(crate) mod member_target;
 pub mod membership;
 pub mod message;
+pub mod occupancy;
 pub mod options;
 pub mod outcome;
 #[cfg(test)]
@@ -63,14 +68,9 @@ pub mod tree;
 pub mod up;
 pub mod view;
 #[cfg(test)]
+pub(crate) mod view_bind_tests;
+#[cfg(test)]
 mod view_hc_tests;
-
-/// `<root>/<serverKey>`; reads use it as is and never create it.
-/// True when the agent in `folder` is committed: commit.json is there and is no launcher's give-up (#97). Spawn and
-/// the launcher each try to make commit.json once, whole; the launcher's says `"aborted": true`.
-pub(crate) fn committed(folder: &Path) -> bool {
-    folder_committed(folder)
-}
 
 /// Main's read: commit.json there and not aborted (#97).
 pub(crate) fn folder_committed(folder: &Path) -> bool {

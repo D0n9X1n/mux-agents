@@ -73,7 +73,7 @@ const READ: &str = "usage: mux-agent read [-Wait <seconds> | -Deliver | -Id <id>
 #[test]
 fn no_args_usage_exit_2() {
     let all = usage(
-        "usage: mux-agent <focus|list|notify|placement|read|report|resume|send|sidebar|spawn|status|stop|up|version|watch> ...",
+        "usage: mux-agent <focus|kept|list|notify|placement|read|report|resume|send|sidebar|spawn|status|stop|up|version|watch> ...",
     );
     assert_eq!(mux_agent(&[]), all);
     assert_eq!(mux_agent(&["bogus", "-Text"]), all);
@@ -145,7 +145,7 @@ fn usage_refusal_keeps_verb_and_text() {
     assert_eq!(mux_agent(&["list", "-Bogus", "-Text"]), text);
     assert_eq!(mux_agent(&["LIST", "-text", "x"]), text);
     let all = usage(
-        "usage: mux-agent <focus|list|notify|placement|read|report|resume|send|sidebar|spawn|status|stop|up|version|watch> ...",
+        "usage: mux-agent <focus|kept|list|notify|placement|read|report|resume|send|sidebar|spawn|status|stop|up|version|watch> ...",
     );
     assert_eq!(mux_agent(&["bogus", "-Bogus", "-Text"]), all);
 }
@@ -328,32 +328,49 @@ fn scoped_launcher_runs_once_with_explicit_context() {
             .unwrap()
             .join(format!("mux-scope-{}", mux_agent::util::hex_id().unwrap())),
     );
-    for sub in ["bin", "work", "state/key/agents/aaaaaaaaaaaa"] {
+    // A server key is 16 lowercase hex (`gens::plain_key`); a generation spec under any other folder names no member.
+    const KEY: &str = "0123456789abcdef";
+    for sub in ["bin", "work", &format!("state/{KEY}/agents/aaaaaaaaaaaa")] {
         fs::create_dir_all(t.0.join(sub)).unwrap();
     }
     let bin = t.0.join("bin");
     let work = t.0.join("work");
     let state = t.0.join("state");
-    let folder = state.join("key/agents/aaaaaaaaaaaa");
-    let spec = folder.join("spec.json");
+    let folder = state.join(KEY).join("agents").join("aaaaaaaaaaaa");
+    // a3c call 45: only a generation's spec launches (launch-1 G7). Generation 0 pending, as Task 3's `gen_setup_of`
+    // places it: a lifecycle record naming it, and gens/0's spec, launch and commit agreeing on id, hc name and session.
+    let gen0 = folder.join("gens").join("0");
+    fs::create_dir_all(&gen0).unwrap();
+    let spec = gen0.join("spec.json");
+    let (sid, hc_name) = ("0f11fc2f-2032-48ef-a920-4af2a8e5af50", "m0123abcd");
     fs::copy(
         env!("CARGO_BIN_EXE_fake-client"),
         bin.join(format!("claude{}", std::env::consts::EXE_SUFFIX)),
     )
     .unwrap();
-    fs::write(&spec, json!({"schema":1,"generation":"0","client":"claude","flags":["--dangerously-skip-permissions","--effort","high"],"args":["--session-id","0f11fc2f-2032-48ef-a920-4af2a8e5af50"]}).to_string()).unwrap();
-    fs::write(folder.join("commit.json"), "{}").unwrap();
-    fs::write(state.join("key/server.json"), "{}").unwrap();
+    fs::write(&spec, json!({"schema":1,"id":"aaaaaaaaaaaa","generation":"0","sessionId":sid,"client":"claude","flags":["--dangerously-skip-permissions","--effort","high"],"args":["--session-id",sid]}).to_string()).unwrap();
+    fs::write(
+        gen0.join("launch.json"),
+        json!({"hcName": hc_name, "launcherArgv": [], "sessionId": sid}).to_string(),
+    )
+    .unwrap();
+    fs::write(
+        gen0.join("commit.json"),
+        json!({"committed": true}).to_string(),
+    )
+    .unwrap();
+    fs::write(state.join(KEY).join("server.json"), "{}").unwrap();
     fs::write(
         folder.join("record.json"),
-        json!({"id":"aaaaaaaaaaaa","name":"worker","session":"$3","parentPane":"%1","pane":"%9"})
+        json!({"id":"aaaaaaaaaaaa","name":"worker","session":"$3","parentPane":"%1","pane":"%9","lifecycle":1,
+            "pending":{"gen":0,"kind":"spawn","hcName":hc_name,"sessionId":sid}})
             .to_string(),
     )
     .unwrap();
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        for path in [&state, &state.join("key"), &state.join("key/agents")] {
+        for path in [&state, &state.join(KEY), &state.join(KEY).join("agents")] {
             fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
         }
     }
@@ -398,6 +415,7 @@ fn scoped_launcher_runs_once_with_explicit_context() {
     assert!(run().status.success());
     assert_eq!(fs::read_to_string(t.0.join("clients.log")).unwrap(), log);
     assert!(!folder.join("notice.json").exists());
+    assert!(!gen0.join("notice.json").exists());
 }
 
 #[test]

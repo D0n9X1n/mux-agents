@@ -752,11 +752,27 @@ impl Drop for Waiting<'_> {
 
 const POLL: Duration = Duration::from_millis(500);
 
-/// Refuses an agent caller that is not the record's parent.
+/// Refuses an agent caller that is not the record's parent (outside a team). An hc member's authority is its proven
+/// member identity matched against the record's parent member (`parentAgent.id`), never a pane: its pane is its view,
+/// empty when views are down (a3c call 42). A pane caller is the parent when its own pane is the record's
+/// `parentPane`; an empty pane matches nothing.
 fn parent_or_human(caller: &crate::caller::Caller, record: &Value) -> Res<()> {
-    if caller.kind == Kind::Agent
-        && record.get("parentPane").and_then(Value::as_str) != Some(caller.pane.as_str())
-    {
+    let parent = match &caller.member {
+        Some(member) => {
+            record
+                .get("parentAgent")
+                .and_then(|p| p.get("id"))
+                .and_then(Value::as_str)
+                == Some(member.as_str())
+        }
+        None => {
+            caller.kind != Kind::Agent
+                || (!caller.pane.is_empty()
+                    && record.get("parentPane").and_then(Value::as_str)
+                        == Some(caller.pane.as_str()))
+        }
+    };
+    if !parent {
         return refuse(
             2,
             "parent",
@@ -810,7 +826,11 @@ fn capture_identity(
         if let Some(s) = standing {
             super::tree::authority(ctx, caller, s, &id.id, "read")?;
         }
-        let Some(pane) = id.view(&record, &registry::rows(ctx, caller)?) else {
+        let Some(pane) = id.view(
+            &record,
+            &registry::rows(ctx, caller)?,
+            &super::core_identity::Key::of(caller),
+        ) else {
             return refuse(
                 2,
                 "target",
@@ -891,7 +911,7 @@ const CLIENT_EXIT_POLL: Duration = Duration::from_millis(250);
 /// `client` its `launcher.json` names. Each is read as typed evidence (`gens::walk`: regular files only,
 /// never a FIFO, a folder or a link, so the read never blocks).
 #[derive(Debug, PartialEq)]
-enum Recorded {
+pub(super) enum Recorded {
     /// No such file, or a `launcher.json` that names no client: nothing to wait for.
     Absent,
     /// Torn, not a regular file, or without a plain pid and start: the exit cannot be proven.
@@ -1016,7 +1036,7 @@ pub fn stop_hc(ctx: &Ctx, request: &Request) -> Res<Map<String, Value>> {
 /// generation through `terminate`, D3: a Lost one released, never killed; each entry noticed). `life` is the
 /// subject generation's (`ended`, `lost`), else `running` while not stopped, `unknown` once stopped. The client wait
 /// runs only once the member is stopped.
-fn stop_life(
+pub(super) fn stop_life(
     tx: &super::team_state::Tx<'_>,
     caller: &Caller,
     standing: Option<&super::tree::Standing>,
@@ -1103,7 +1123,6 @@ fn stop_pre(
 }
 
 #[cfg(test)]
-#[path = "prelife_stop_tests.rs"]
 mod prelife_stop_tests;
 
 #[cfg(test)]
@@ -3129,5 +3148,23 @@ mod tests {
             (&line["from"], &line["fromId"]),
             (&json!("worker"), &json!(ID))
         );
+    }
+
+    // a3c call 42: outside a team a pane caller is the parent only by its own, non-empty pane; an empty pane matches
+    // nothing, not even an empty `parentPane`. A person needs no parent.
+    #[test]
+    fn an_empty_pane_is_nobodys_parent() {
+        let w = crate::agents::fixture::World::agent("");
+        let mut caller = w.caller();
+        assert!(caller.member.is_none(), "a pane caller");
+        let check = |c: &crate::caller::Caller, pane: &str| {
+            parent_or_human(c, &json!({"parentPane": pane})).map_err(|e| (e.code, e.check))
+        };
+        assert_eq!(check(&caller, "%1"), Ok(()), "its own pane");
+        assert_eq!(check(&caller, "%8"), Err((2, "parent")), "another pane");
+        caller.pane = String::new();
+        assert_eq!(check(&caller, ""), Err((2, "parent")), "an empty pane");
+        caller.kind = crate::caller::Kind::Human;
+        assert_eq!(check(&caller, "%8"), Ok(()), "a person");
     }
 }

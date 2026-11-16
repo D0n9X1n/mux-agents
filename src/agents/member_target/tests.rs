@@ -153,7 +153,7 @@ fn reused_name_remains_addressable_after_reap_and_admission() {
         "tbbbbbbbbbbbb"
     );
     for id in [ID, NEW] {
-        assert!(crate::agents::committed(&w.folder(id)));
+        assert!(crate::agents::folder_committed(&w.folder(id)));
     }
     assert_eq!(
         read_json(&w.folder(ID).join("record.json"))
@@ -238,7 +238,7 @@ fn all_ended_uses_launch_time_not_notice_or_directory_order() {
                     .unwrap(),
                 r
             );
-            assert!(crate::agents::committed(&w.folder(id)));
+            assert!(crate::agents::folder_committed(&w.folder(id)));
         }
         w.fakes.hc_done().unwrap();
     }

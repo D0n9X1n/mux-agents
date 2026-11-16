@@ -95,6 +95,7 @@ fn hc_board_fields_append() {
                         tag: String::new(),
                         name: String::new(),
                     }],
+                    &crate::agents::core_identity::Key::of(&c),
                 )
                 .unwrap();
             w.fakes.clear_log();

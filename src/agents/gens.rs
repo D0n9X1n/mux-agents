@@ -69,13 +69,21 @@ fn real_folders(member: &Path, names: &[&str]) -> Res<Option<PathBuf>> {
     let below = member.strip_prefix(root).unwrap_or(member).iter();
     for name in below.chain(names.iter().map(std::ffi::OsStr::new)) {
         at.push(name);
-        match std::fs::symlink_metadata(&at) {
-            Ok(m) if m.is_dir() => {}
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            _ => return Err(evidence::unreadable()),
+        if !real_dir(&at)? {
+            return Ok(None);
         }
     }
     Ok(Some(at))
+}
+
+/// One level of the walk: `Ok(true)` a real folder, `Ok(false)` absent; a link (a Windows junction too:
+/// `symlink_metadata` reports it as a link, not a folder), a file or anything unreadable refuses `evidence`.
+pub(crate) fn real_dir(at: &Path) -> Res<bool> {
+    match std::fs::symlink_metadata(at) {
+        Ok(m) if m.is_dir() => Ok(true),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        _ => Err(evidence::unreadable()),
+    }
 }
 
 /// The member record, `<member>/record.json`, through the walk.
@@ -683,8 +691,14 @@ pub enum Found {
 }
 
 /// Ambiguity 1: the terminals labelled `mux.id=<id>, mux.gen=<n>` whose name is the recorded `hcName`; exactly
-/// one is `One`. None is `Missing` (call 60); several, or any hc failure, is Unknown.
+/// one is `One`. None is `Missing` (call 60); several, or any hc failure, is Unknown. a3c call 47: an empty or
+/// malformed recorded `hcName` is Unknown `evidence` before any hc call, never `Missing`; a terminal name matches
+/// only through `ident::same`.
 pub fn find(core: &Core<'_>, id: &str, n: u64, hc_name: &str) -> Found {
+    use super::ident;
+    if !ident::hc_name(hc_name) {
+        return Found::Unknown(ident::refused("hcName"));
+    }
     let g = n.to_string();
     let Ok(listed) = core.ls(&[("mux.id", id), ("mux.gen", &g)]) else {
         return Found::Unknown(unclear("hc cannot list the generation's terminals"));
@@ -695,8 +709,8 @@ pub fn find(core: &Core<'_>, id: &str, n: u64, hc_name: &str) -> Found {
             return Found::Unknown(unclear("hc cannot show a terminal of the generation"));
         };
         let label = |k: &str| t.labels.get(k).map(String::as_str);
-        if t.name.as_deref() == Some(hc_name)
-            && label("mux.id") == Some(id)
+        if ident::same(ident::hc_name, t.name.as_deref(), Some(hc_name))
+            && ident::same(ident::member_id, label("mux.id"), Some(id))
             && label("mux.gen") == Some(&g)
         {
             hits.push(t);
@@ -760,13 +774,13 @@ fn end_checked(t: &Terminal, launch: &Value, id: &str, n: u64) -> Res<()> {
         return Err(Refusal::internal("the terminal has not ended"));
     }
     let hc_name = launch.get("hcName").and_then(Value::as_str);
-    if hc_name.is_none() || t.name.as_deref() != hc_name {
+    if !super::ident::same(super::ident::hc_name, t.name.as_deref(), hc_name) {
         return Err(Refusal::internal(
             "the terminal name is not this generation's",
         ));
     }
     let label = |k: &str| t.labels.get(k).map(String::as_str);
-    if label("mux.id") != Some(id) {
+    if !super::ident::same(super::ident::member_id, label("mux.id"), Some(id)) {
         return Err(Refusal::internal("the terminal is another member's"));
     }
     if label("mux.gen") != Some(n.to_string().as_str()) {
@@ -780,20 +794,27 @@ fn end_checked(t: &Terminal, launch: &Value, id: &str, n: u64) -> Res<()> {
 /// read). Callers: `registry::reap_hc` (natural exit), A3b-2 (stop). Refuses, writing nothing: `evidence` when
 /// `launch.json` or `ended.json` is Unreadable; `internal` when `record` is not a lifecycle record, there is no
 /// `launch.json`, or `end_checked` refuses. Ok: the `ended.json` facts that stand (the first facts stand); a
-/// caller makes its notice from them, only after Ok.
+/// caller makes its notice from them, only after Ok. a3c call 47: `evidence`, nothing read or written, when the
+/// record's id is not a valid member id equal to the member folder's name; `evidence` when launch.json's `hcName` is
+/// empty or malformed.
 pub fn record_end(member: &Path, record: &Value, n: u64, t: &Terminal, at: &str) -> Res<Value> {
+    use super::ident;
     if !lifecycle(record) {
         return Err(Refusal::internal("not a lifecycle member"));
     }
-    let id = record.get("id").and_then(Value::as_str).unwrap_or_default();
+    let folder = member.file_name().and_then(|f| f.to_str());
+    let id = record.get("id").and_then(Value::as_str);
+    let Some(id) = id.filter(|_| ident::same(ident::member_id, id, folder)) else {
+        return Err(ident::refused("member id"));
+    };
     let launch = read(member, n, "launch")
         .known()?
         .ok_or_else(|| Refusal::internal("the generation has no launch.json"))?;
+    let hc_name = launch.get("hcName").and_then(Value::as_str);
+    let Some(hc_name) = hc_name.filter(|h| ident::hc_name(h)) else {
+        return Err(ident::refused("launch hcName"));
+    };
     end_checked(t, &launch, id, n)?;
-    let hc_name = launch
-        .get("hcName")
-        .and_then(Value::as_str)
-        .unwrap_or_default();
     publish_end(member, n, &end_facts(t, hc_name, at))
 }
 
@@ -1922,15 +1943,12 @@ mod client_tests {
 }
 
 #[cfg(test)]
-#[path = "gens_publish_tests.rs"]
 mod publish_tests;
 
 #[cfg(test)]
-#[path = "gens_ready_tests.rs"]
 mod ready_tests;
 
 #[cfg(test)]
-#[path = "gens_held_tests.rs"]
 mod held_tests;
 
 #[cfg(test)]
@@ -2209,5 +2227,45 @@ mod b_tests {
             [path(&m, 1, "launch"), path(&m, 1, "ended")],
             "each evidence file read once"
         );
+    }
+
+    // a3c call 47 (TL #149, production readiness): `record_end` binds a valid record id to its member folder and
+    // needs a valid launch.json hcName. An empty or malformed name matching a terminal of the same name, an empty
+    // record id matching an empty `mux.id`, or another member's id in this folder refuse `evidence`: no ended.json.
+    #[test]
+    fn record_end_never_matches_an_invalid_identity() {
+        for case in [
+            "empty name",
+            "malformed name",
+            "empty id",
+            "another member's id",
+        ] {
+            let (w, _s) = lf::world();
+            let m = lf::life(&w, json!({"generation": "1"}));
+            lf::seed_gen(&m, 1, Some("run"), lf::committed());
+            let mut r = lf::record(&m);
+            let mut wire = lf::ended(&w, 1);
+            match case {
+                "empty name" | "malformed name" => {
+                    let name = if case == "empty name" { "" } else { "../x" };
+                    let launch =
+                        json!({"hcName": name, "launcherArgv": lf::ARGV, "sessionId": lf::SID});
+                    std::fs::write(path(&m, 1, "launch"), launch.to_string()).unwrap();
+                    wire["name"] = json!(name);
+                }
+                "empty id" => {
+                    r["id"] = json!("");
+                    wire["labels"]["mux.id"] = json!("");
+                }
+                _ => {
+                    r["id"] = json!("bbbbbbbbbbbb");
+                    wire["labels"]["mux.id"] = json!("bbbbbbbbbbbb");
+                }
+            }
+            let t = lf::terminal(&w, &wire);
+            let got = record_end(&m, &r, 1, &t, "x");
+            assert_eq!(got.map_err(|e| e.check), Err("evidence"), "{case}");
+            assert_eq!(read(&m, 1, "ended"), Evidence::Absent, "{case}: ended.json");
+        }
     }
 }

@@ -75,8 +75,14 @@ pub fn up(ctx: &Ctx, request: &Request) -> Res<Map<String, Value>> {
 
 /// A person in a tmux or rmux pane; members and agents are refused `tagged`.
 fn person(ctx: &Ctx) -> Res<Caller> {
+    person_as(ctx, "run up")
+}
+
+/// The person gate of `up` and of every person verb that reuses it (views-6f ambiguity 13): `what` completes the
+/// refusals, so `up`'s own texts ("a member cannot run up", ..) are unchanged.
+pub(crate) fn person_as(ctx: &Ctx, what: &str) -> Res<Caller> {
     if crate::caller::hc::applies(ctx) {
-        return refuse(2, "tagged", "a member cannot run up");
+        return refuse(2, "tagged", format!("a member cannot {what}"));
     }
     let pane = ctx.env.get("TMUX_PANE").unwrap_or("");
     if crate::mux::endpoint(&ctx.env, crate::state::root::HOST).is_none() || !super::pane_id(pane) {
@@ -84,9 +90,9 @@ fn person(ctx: &Ctx) -> Res<Caller> {
     }
     let caller = crate::caller::resolve(ctx)?;
     if caller.kind == Kind::Agent || caller.member.is_some() {
-        return refuse(2, "tagged", "an agent cannot run up");
+        return refuse(2, "tagged", format!("an agent cannot {what}"));
     }
-    registry::untagged(ctx, &caller, "an agent pane cannot run up")?;
+    registry::untagged(ctx, &caller, &format!("an agent pane cannot {what}"))?;
     Ok(caller)
 }
 
@@ -140,6 +146,7 @@ fn create(ctx: &Ctx, caller: &Caller, core: &Core<'_>, plan: &Plan<'_>) -> Res<M
         pane: String::new(),
         window: window.clone(),
         session: session.clone(),
+        presentation: Some((String::new(), window.clone())),
         ..caller.clone()
     };
     server::same(ctx, &dest).map_err(fail)?;

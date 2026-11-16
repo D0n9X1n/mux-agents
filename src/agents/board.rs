@@ -370,7 +370,29 @@ pub fn board(ctx: &Ctx, caller: &Caller, all: bool, watch: bool) -> Res<Map<Stri
     if leader.is_some() {
         reply.insert("team".into(), true.into());
     }
+    let listed = lists_kept(watch, snapshot.records.values().map(|s| &s.record))
+        .then(|| super::kept::list_at(ctx, &super::membership::team(caller)));
+    add_kept(&mut reply, listed);
     Ok(reply)
+}
+
+/// views-6f ambiguity 14: a watch of a team that has a lifecycle member (only a lifecycle generation is ever kept).
+fn lists_kept<'a>(watch: bool, records: impl IntoIterator<Item = &'a Value>) -> bool {
+    watch && records.into_iter().any(super::gens::lifecycle)
+}
+
+/// The watch feed's kept shells; a failed listing is shown, never fatal (display only, state-0 S6).
+fn add_kept(reply: &mut Map<String, Value>, listed: Option<Res<Vec<super::kept::Shell>>>) {
+    match listed {
+        None => {}
+        Some(Ok(shells)) => {
+            reply.insert("kept".into(), super::kept::rows(&shells));
+        }
+        Some(Err(e)) => {
+            reply.insert("kept".into(), Value::Array(Vec::new()));
+            reply.insert("keptError".into(), e.message.into());
+        }
+    }
 }
 
 /// Ended agents a board (`list -All`) shows, newest first.
@@ -463,9 +485,7 @@ pub use rows::hc_row;
 use rows::*;
 
 #[cfg(test)]
-#[path = "board_tests.rs"]
 mod tests;
 
 #[cfg(test)]
-#[path = "board_hc_tests.rs"]
 mod hc_tests;

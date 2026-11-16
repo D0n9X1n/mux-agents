@@ -553,7 +553,8 @@ pub(crate) struct Laid {
     pub agents: Vec<(Target, usize)>,
 }
 
-/// The drawn running agents, top to bottom (for keys).
+/// The drawn running agents, top to bottom.
+#[cfg(test)]
 fn targets(laid: &Laid) -> Vec<Target> {
     laid.agents
         .iter()
@@ -1077,9 +1078,169 @@ fn lay(
     lay_focus(board, notes, size, look, tree::Focus::default()).0
 }
 
-/// `lay` with what the bar marks (#103): a team board draws as a tree; any other board as before, `focus` unused. Also
-/// how many of the notes it kept.
+/// `lay` with what the bar marks (#103), over the board's kept shells (views-6f ambiguity 15, v6f call 11): the
+/// question `close? y/n` takes the last line first, out of the notes `lay_members` may drop; the kept block gets at
+/// most half of the rest, never leaving the members fewer than 3 rows, but always a row for a selected kept shell, and
+/// none with fewer than 2 rows of room otherwise; the members get the rest. Also how many of the notes it kept, the question included. Under 12 columns, as before.
 fn lay_focus(
+    board: Option<&Map<String, Value>>,
+    notes: &[(&str, Style)],
+    size: Size,
+    look: Look,
+    focus: tree::Focus,
+) -> (Laid, usize) {
+    if size.width < 12 {
+        return lay_members(board, notes, size, look, focus);
+    }
+    let (asked, notes): (Vec<_>, Vec<_>) =
+        notes.iter().copied().partition(|(n, _)| *n == pick::ASK);
+    let asked_n = asked.len().min(size.height);
+    let rest = size.height - asked_n;
+    let cols = size.width - 2;
+    let shells = kept_targets(board);
+    let chosen = focus
+        .selected
+        .is_some_and(|s| shells.iter().any(|t| t.id == s));
+    let room = (rest / 2).min(rest.saturating_sub(3));
+    let room = if chosen {
+        room.max(rest.min(1))
+    } else if room < 2 {
+        0
+    } else {
+        room
+    };
+    let kept = lay_kept(&shells, cols, look, room, focus.selected);
+    let members = rest - kept.len();
+    let (mut laid, shown) = if members == 0 {
+        let none = Laid {
+            rows: Vec::new(),
+            agents: Vec::new(),
+        };
+        (none, 0)
+    } else {
+        let size = Size {
+            width: size.width,
+            height: members,
+        };
+        lay_members(board, &notes, size, look, focus)
+    };
+    fold_kept(&mut laid, kept);
+    for (n, style) in asked.into_iter().take(asked_n) {
+        laid.rows
+            .push(margin(vec![span(paint::cut(n, cols), style)]));
+    }
+    (laid, shown + asked_n)
+}
+
+/// The board's kept shells as targets, in its order.
+fn kept_targets(board: Option<&Map<String, Value>>) -> Vec<Target> {
+    board
+        .and_then(|b| b.get("kept"))
+        .and_then(Value::as_array)
+        .map(|a| {
+            a.iter()
+                .filter_map(Value::as_object)
+                .map(Target::kept)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Ambiguity 15, v6f call 11: `shells` in `room` rows. All fit: a dim heading `kept shells · N`, then one row each.
+/// Too many: a window of `room - 1` shells holding `selected` (else the first), then `+M more kept`; one row: the
+/// window alone. The shells left out stay in the keys' walk (`walk_of`), so each is reachable.
+fn lay_kept(
+    shells: &[Target],
+    cols: usize,
+    look: Look,
+    room: usize,
+    selected: Option<&str>,
+) -> Vec<(Row, Option<Target>)> {
+    if shells.is_empty() || room == 0 {
+        return Vec::new();
+    }
+    let line = |text: String| margin(vec![span(paint::cut(&text, cols), DIM)]);
+    let shell = |t: &Target| {
+        let row = line(format!("kept shell {}", own_glyphs(&t.name)));
+        (row, Some(t.clone()))
+    };
+    if shells.len() < room {
+        let dot = if look.ascii { "-" } else { "\u{b7}" };
+        let mut rows = vec![(line(format!("kept shells {dot} {}", shells.len())), None)];
+        rows.extend(shells.iter().map(shell));
+        return rows;
+    }
+    let shown = if room == 1 { 1 } else { room - 1 };
+    let at = selected
+        .and_then(|s| shells.iter().position(|t| t.id == s))
+        .unwrap_or(0);
+    let start = at.saturating_sub(shown - 1).min(shells.len() - shown);
+    let mut rows: Vec<(Row, Option<Target>)> =
+        shells[start..start + shown].iter().map(shell).collect();
+    if shown < shells.len() && room > 1 {
+        rows.push((line(format!("+{} more kept", shells.len() - shown)), None));
+    }
+    rows
+}
+
+/// The kept rows after the header, or first when the frame has none (a team's `last_resort` starts with an agent row,
+/// checklist 13); member rows shift by as many, so no two targets share a row.
+fn fold_kept(laid: &mut Laid, kept: Vec<(Row, Option<Target>)>) {
+    if kept.is_empty() {
+        return;
+    }
+    let headed = !laid.rows.is_empty() && !laid.agents.iter().any(|(_, at)| *at == 0);
+    let first = usize::from(headed);
+    let n = kept.len();
+    for (_, at) in laid.agents.iter_mut() {
+        *at += n;
+    }
+    let mut targets = Vec::new();
+    for (i, (row, target)) in kept.into_iter().enumerate() {
+        laid.rows.insert(first + i, row);
+        if let Some(t) = target {
+            targets.push((t, first + i));
+        }
+    }
+    targets.append(&mut laid.agents);
+    laid.agents = targets;
+}
+
+/// Kept rows take keys only, never clicks (a click hit focuses a member).
+pub(crate) fn clickable(target: &Target) -> bool {
+    target.life != pick::KEPT
+}
+
+/// The walk without kept rows: peek and herdr's next and previous act on members only.
+fn members(targets: &[Target]) -> Vec<Target> {
+    targets.iter().filter(|t| clickable(t)).cloned().collect()
+}
+
+/// Audit 6-10 F1, v6f call 11: the one walk of the keys, for `pick.follow` and `Shown.targets` alike: every kept shell
+/// of the board (drawn or behind `+N more kept`), then the team's whole tree (team) or the drawn members (any other bar).
+pub(crate) fn walk_of(board: Option<&Map<String, Value>>, laid: &Laid, team: bool) -> Vec<Target> {
+    let kept = kept_targets(board).into_iter();
+    match board.filter(|_| team) {
+        Some(b) => kept.chain(tree::walk(b)).collect(),
+        None => kept
+            .chain(laid.agents.iter().map(|(t, _)| t.clone()).filter(clickable))
+            .collect(),
+    }
+}
+
+/// `y`: `kept::close` decides (the re-read, the team, the kill); a refusal is shown.
+fn close_kept(ctx: &Ctx, caller: &Caller, target: &Target, pick: &mut Pick) {
+    let team = crate::agents::membership::team(caller);
+    let closed = crate::hc::connect(ctx)
+        .and_then(|core| crate::agents::kept::close(&core, &team, &target.id));
+    if closed.is_err() {
+        pick.close_failed(&target.name);
+    }
+}
+
+/// The members' frame: a team board draws as a tree; any other board as before, `focus` unused. Also how many of the
+/// notes it kept.
+fn lay_members(
     board: Option<&Map<String, Value>>,
     notes: &[(&str, Style)],
     size: Size,
@@ -1677,11 +1838,9 @@ pub fn run_watch(
             selected: None,
         };
         let bare = lay_focus(last.as_ref(), &notes, size, look, focus).0;
-        // A team's keys walk the whole tree, folded agents included (B10); any other bar walks the rows it drew.
-        let walk = match last.as_ref().filter(|_| team) {
-            Some(board) => tree::walk(board),
-            None => targets(&bare),
-        };
+        // The board's kept shells first, then a team's whole tree, folded agents included (B10), or the rows any other
+        // bar drew: one walk followed here and acted on below (audit 6-10 F1).
+        let walk = walk_of(last.as_ref(), &bare, team);
         pick.follow(&walk);
         let selected = pick.selected().map(str::to_string);
         let laid = match selected.as_deref() {
@@ -1706,7 +1865,7 @@ pub fn run_watch(
         }
         let mut shown = Shown {
             written: ctx.clock.now(),
-            targets: if team { walk } else { targets(&laid) },
+            targets: walk,
             drawn: drawn(&laid),
             width: size.width,
             looking: viewing.pane.clone(),
@@ -2055,6 +2214,14 @@ fn act(
     pick: &mut Pick,
     shown: &mut Shown,
 ) -> bool {
+    // A pending `close? y/n` (views-6f ambiguity 15): any event answers it; only `y` closes; nothing is focused,
+    // selected or clicked.
+    if let Some(target) = pick.confirming() {
+        if read.event == Event::Yes {
+            close_kept(ctx, caller, &target, pick);
+        }
+        return true;
+    }
     match read.event {
         Event::Press { button: 0, y, .. } => {
             pick.pressed();
@@ -2078,29 +2245,34 @@ fn act(
             }
             true
         }
-        Event::Press { .. } | Event::Release { .. } | Event::Interrupt => false,
+        Event::Press { .. }
+        | Event::Release { .. }
+        | Event::Interrupt
+        | Event::Yes
+        | Event::Other => false,
         // A team's n/N select the next/previous agent with a live view, from the selection, else the shown agent (B10).
+        // Kept rows are no agents (F9).
         Event::Next | Event::Prev if shown.team => {
+            let walk = members(&shown.targets);
             let from = pick
-                .chosen(&shown.targets)
-                .and_then(|t| shown.targets.iter().position(|w| w.id == t.id))
+                .chosen(&walk)
+                .and_then(|t| walk.iter().position(|w| w.id == t.id))
                 .or_else(|| {
                     shown
                         .looking
                         .as_deref()
-                        .and_then(|p| shown.targets.iter().position(|t| t.pane == p))
+                        .and_then(|p| walk.iter().position(|t| t.pane == p))
                 });
-            if let Some(at) = pick::step_live(&shown.targets, from, read.event == Event::Next) {
-                pick.select(&shown.targets, at);
+            if let Some(at) = pick::step_live(&walk, from, read.event == Event::Next) {
+                pick.select(&walk, at);
             }
             true
         }
         // herdr's next and previous agent (#90), from the pane the session shows, in the bar's order.
         Event::Next | Event::Prev => {
             let forward = read.event == Event::Next;
-            if let Some(target) =
-                pick::step(&shown.targets, shown.looking.as_deref(), forward).cloned()
-            {
+            let walk = members(&shown.targets);
+            if let Some(target) = pick::step(&walk, shown.looking.as_deref(), forward).cloned() {
                 match focus_target_hc(ctx, caller, &target) {
                     Ok(focused) => shown.focused(focused),
                     Err(_) => pick.failed(&target.name),
@@ -2108,13 +2280,14 @@ fn act(
             }
             true
         }
-        // A team's `p`: the selection, else the shown agent (B10).
+        // A team's `p`: the selection, else the shown agent (B10); never a kept row.
         Event::Peek if shown.team => {
-            let target = pick.chosen(&shown.targets).cloned().or_else(|| {
+            let walk = members(&shown.targets);
+            let target = pick.chosen(&walk).cloned().or_else(|| {
                 shown
                     .looking
                     .as_deref()
-                    .and_then(|p| shown.targets.iter().find(|t| t.pane == p).cloned())
+                    .and_then(|p| walk.iter().find(|t| t.pane == p).cloned())
             });
             if let Some(target) = target {
                 preview(ctx, caller, &target, pick);
@@ -2123,7 +2296,8 @@ fn act(
         }
         // herdr's peek (#91): the selected agent, else the first, over the window without switching to it.
         Event::Peek => {
-            if let Some(target) = pick.chosen(&shown.targets).or(shown.targets.first())
+            let walk = members(&shown.targets);
+            if let Some(target) = pick.chosen(&walk).or(walk.first())
                 && peek(ctx, caller, target).is_err()
             {
                 pick.failed(&target.name);
@@ -2135,6 +2309,10 @@ fn act(
                 Act::Nothing => false,
                 Act::Redraw => true,
                 Act::Focus(target) => {
+                    if !clickable(&target) {
+                        pick.ask(target);
+                        return true;
+                    }
                     if shown.team {
                         open_target(ctx, caller, &target, pick, shown);
                         return true;
@@ -2383,7 +2561,12 @@ fn click(ctx: &Ctx, caller: &Caller, y: u16, shown: &Shown) -> Option<Target> {
         .ok()
         .filter(|read| read.code == 0)?;
     let id = pick::frame_hit(&read.stdout, shown.width, y, &shown.drawn)?;
-    shown.targets.iter().find(|t| t.id == id).cloned()
+    shown
+        .targets
+        .iter()
+        .find(|t| t.id == id)
+        .filter(|t| clickable(t))
+        .cloned()
 }
 
 /// The side-bar pane's process: draws the board to stdout until its pane closes, reading its own terminal when
@@ -2423,6 +2606,7 @@ pub(crate) fn watch_on(
         );
     }
     let caller = resolve(ctx)?;
+    crate::cli::member_views(ctx, &caller)?;
     console_utf8();
     let ended = run_watch(ctx, &caller, open(), write);
     let mut reply = Map::new();
@@ -2450,6 +2634,7 @@ fn console_utf8() {}
 /// spawn's `ensure` never reopens a bar a returned -Close closed. Refused only from a tagged pane.
 pub fn sidebar(ctx: &Ctx, request: &Request) -> Res<Map<String, Value>> {
     let caller = resolve(ctx)?;
+    crate::cli::member_views(ctx, &caller)?;
     crate::agents::registry::untagged(ctx, &caller, "an agent pane cannot open the side bar")?;
     let close = request.switch("Close");
     lock(ctx, &lock_key("sidebar", &caller, &caller.session), || {
@@ -2724,7 +2909,7 @@ fn own_record(ctx: &Ctx, caller: &Caller) -> bool {
 
 /// The windows of the session that show a member's live view: each local member's record through `Identity::view`
 /// on the session's panes (a dead pane is no view). None when either read fails; no pane read without members.
-fn view_windows(ctx: &Ctx, caller: &Caller) -> Option<Vec<String>> {
+pub(crate) fn view_windows(ctx: &Ctx, caller: &Caller) -> Option<Vec<String>> {
     let locals = crate::agents::membership::locals(ctx, caller).ok()?;
     if locals.is_empty() {
         return Some(Vec::new());
@@ -2732,8 +2917,11 @@ fn view_windows(ctx: &Ctx, caller: &Caller) -> Option<Vec<String>> {
     let rows = crate::agents::registry::rows(ctx, caller).ok()?;
     let mut windows: Vec<String> = Vec::new();
     for local in &locals {
-        if let Some(view) = local.identity.view(&local.stored.record, &rows)
-            && !windows.contains(&view.window)
+        if let Some(view) = local.identity.view(
+            &local.stored.record,
+            &rows,
+            &crate::agents::core_identity::Key::of(caller),
+        ) && !windows.contains(&view.window)
         {
             windows.push(view.window);
         }
@@ -5882,6 +6070,56 @@ mod tests {
         }
     }
 
+    // Audit 6-10 F8: the real `click` on a rendered frame: a kept row takes no click; the member below it, shifted by
+    // the fold, still does. `frame_hit` counts rows from 1, so the press is the drawn row + 1.
+    #[test]
+    fn a_click_never_lands_on_a_kept_row_and_members_keep_their_rows() {
+        let board = json!({"agents": [{"name": "worker", "id": ID, "state": "running", "pane": "%9"}],
+            "kept": [{"address": "k1", "name": "a"}]});
+        let laid = lay_focus(
+            board.as_object(),
+            &[],
+            Size {
+                width: 40,
+                height: 24,
+            },
+            PLAIN_LOOK,
+            tree::Focus::default(),
+        )
+        .0;
+        let lines: Vec<String> = laid
+            .rows
+            .iter()
+            .map(|r| r.iter().map(|(t, _)| t.as_str()).collect())
+            .collect();
+        let shown = Shown {
+            written: SystemTime::UNIX_EPOCH,
+            targets: walk_of(board.as_object(), &laid, false),
+            drawn: drawn(&laid),
+            width: 40,
+            looking: None,
+            team: false,
+        };
+        let w = World::human("");
+        let screen = answer(40, &lines);
+        w.fakes
+            .mux_script("capture-pane", move |_| Ok(out(0, &screen, "")));
+        let row_of = |id: &str| {
+            let at = laid.agents.iter().find(|(t, _)| t.id == id).unwrap().1;
+            (at + 1) as u16
+        };
+        assert_eq!(
+            click(&w.ctx, &w.caller(), row_of("k1"), &shown).map(|t| t.id),
+            None,
+            "a kept row takes no click"
+        );
+        assert_eq!(
+            click(&w.ctx, &w.caller(), row_of(ID), &shown).map(|t| t.id),
+            Some(ID.to_string()),
+            "the member's shifted row"
+        );
+    }
+
     #[test]
     fn click_elsewhere_does_nothing() {
         // The header, the doing line and an ended row: each read, none focuses, each redraws at once.
@@ -6351,6 +6589,7 @@ mod tests {
             start: Some(2000),
             path: Some(exe.clone()),
             argv: Some(vec![exe, "watch".into()]),
+            image: None,
         });
         w.fakes.mux_rule(RECORD, 0, OWN, "");
         w.fakes.mux_rule(PROOF, 0, "%7|@1|0|4242\n", "");
@@ -6886,6 +7125,7 @@ mod tests {
             start: Some(i64::from(pid) * 10),
             path: Some(exe.into()),
             argv: Some(vec![exe.into(), "watch".into()]),
+            image: None,
         }
     }
 
@@ -9538,5 +9778,6 @@ mod tests {
 }
 
 #[cfg(test)]
-#[path = "sidebar_hc_tests.rs"]
 mod hc_tests;
+#[cfg(test)]
+mod kept_tests;

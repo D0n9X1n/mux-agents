@@ -1,5 +1,84 @@
 use super::*;
 
+// views-6f ambiguity 14: only a watch of a team with a lifecycle member lists kept shells; `list` and a
+// pre-lifecycle team make no new hc call.
+#[test]
+fn only_a_lifecycle_watch_lists_kept_shells() {
+    let life = serde_json::json!({"lifecycle": 1});
+    let pre = serde_json::json!({"name": "old"});
+    assert!(lists_kept(true, [&pre, &life]));
+    assert!(!lists_kept(false, [&life]), "list (no watch)");
+    assert!(!lists_kept(true, [&pre]), "a pre-lifecycle team");
+    assert!(!lists_kept(true, std::iter::empty::<&Value>()), "no member");
+}
+
+// The field: rows `[{address, name}]`; a listing failure is `kept: []` plus `keptError` (display only).
+#[test]
+fn the_kept_field_is_display_only() {
+    use crate::agents::kept::Shell;
+    let mut reply = Map::new();
+    add_kept(&mut reply, None);
+    assert!(reply.is_empty(), "nothing to list: no field");
+    add_kept(
+        &mut reply,
+        Some(Ok(vec![Shell {
+            address: "k1".into(),
+            name: "a".into(),
+        }])),
+    );
+    assert_eq!(
+        Value::Object(reply.clone()),
+        serde_json::json!({"kept": [{"address": "k1", "name": "a"}]})
+    );
+    let mut failed = Map::new();
+    add_kept(
+        &mut failed,
+        Some(Err(crate::error::Refusal::internal("boom"))),
+    );
+    assert_eq!(
+        (&failed["kept"], failed["keptError"].is_string()),
+        (&serde_json::json!([]), true)
+    );
+}
+
+// Audit 6-10 F10, row 6.3: a real lifecycle watch whose kept listing fails still answers, with `keptError`.
+// The snapshot's hc script follows the merged `Snapshot::take`; a deviation changes the script, never the asserts.
+#[test]
+fn a_lifecycle_watch_survives_a_failing_kept_listing() {
+    use crate::agents::{core_fixture as cf, life_fixture as lf};
+    let w = crate::agents::fixture::World::human("");
+    let caller = w.caller();
+    let f = lf::life(
+        &w,
+        serde_json::json!({"generation": "0", "hcAddress": "t0", "hcName": lf::hc_name(0),
+        "launcherArgv": lf::ARGV}),
+    );
+    lf::seed_gen(&f, 0, None, lf::committed());
+    cf::online(&w);
+    cf::listing(&w, &lf::team(&w), &["t0"]);
+    lf::get(&w, "t0", &lf::running(&w, 0));
+    cf::answer(&w, &["--version"], "hc 0.1.21");
+    let ls = [
+        "ls".to_string(),
+        "--label".into(),
+        format!("mux.kept={}", lf::team(&w)),
+        "--json".into(),
+    ];
+    let ls: Vec<&str> = ls.iter().map(String::as_str).collect();
+    w.fakes.hc_expect(
+        &ls,
+        Ok(crate::spawn::Out {
+            code: 1,
+            stdout: String::new(),
+            stderr: "boom".into(),
+        }),
+    );
+    let reply = board(&w.ctx, &caller, true, true).unwrap();
+    assert_eq!(reply["kept"], serde_json::json!([]), "{reply:?}");
+    assert!(reply["keptError"].is_string(), "{reply:?}");
+    w.fakes.hc_done().unwrap();
+}
+
 #[test]
 fn a_reported_done_is_done() {
     let now = crate::util::parse_utc("2026-03-01T00:01:00Z").unwrap();

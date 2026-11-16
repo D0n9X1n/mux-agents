@@ -61,6 +61,8 @@ struct Log {
     now_ms: u64,
     clients: HashMap<u32, Client>,
     shells: Vec<u32>,
+    // o3 call 34 N2: pids whose client identity `client_known` answers as unknown.
+    unknown: Vec<u32>,
     cwds: HashMap<u32, String>,
     // Starts `open` answers in turn (none: unreadable) before it falls back to the row's own.
     opens: HashMap<u32, VecDeque<Option<i64>>>,
@@ -84,6 +86,8 @@ struct Log {
     unlisted: Vec<u32>,
     // What `boot` answers; none is Absolute (macOS, Windows).
     boot: Option<Boot>,
+    // What `proc_mounts` answers: none is no seam (not Linux); `Some(None)` mountinfo that cannot be read.
+    mountinfo: Option<Option<String>>,
 }
 
 /// Locks two fakes on two threads contend for, as two processes contend for the real lock: a key held by one blocks
@@ -250,6 +254,11 @@ impl Fakes {
         self.0.borrow_mut().denied.push(pid);
     }
 
+    /// The /proc seam present (as on Linux): `Some(text)` is mountinfo, `None` mountinfo that cannot be read.
+    pub fn mountinfo(&self, text: Option<&str>) {
+        self.0.borrow_mut().mountinfo = Some(text.map(String::from));
+    }
+
     /// What `Os::boot` answers from now on (r2b call 27).
     pub fn set_boot(&self, boot: Boot) {
         self.0.borrow_mut().boot = Some(boot);
@@ -301,6 +310,11 @@ impl Fakes {
     /// The client `client_of` names for this pid.
     pub fn client(&self, pid: u32, client: Client) {
         self.0.borrow_mut().clients.insert(pid, client);
+    }
+
+    /// o3 call 34 N2: `client_known` answers unknown for `pid` (its client identity cannot be resolved).
+    pub fn client_unknown(&self, pid: u32) {
+        self.0.borrow_mut().unknown.push(pid);
     }
 
     /// A pid `is_shell` answers true for.
@@ -458,6 +472,7 @@ impl Fakes {
             exe: PathBuf::from("/bin/mux-agent"),
             os: Box::new(self.clone()),
             mux: RefCell::new(Some(Box::new(self.clone()))),
+            member_mux: RefCell::new(crate::mux::MemberMux::Caller),
             hc: Box::new(self.clone()),
             clock: Box::new(self.clone()),
             admitted: false,
@@ -568,6 +583,11 @@ impl Os for Fakes {
         self.0.borrow().clients.get(&row.pid).copied()
     }
 
+    fn client_known(&self, row: &Row) -> Option<Option<Client>> {
+        let unknown = self.0.borrow().unknown.contains(&row.pid);
+        (!unknown).then(|| self.client_of(row))
+    }
+
     fn is_shell(&self, row: &Row) -> bool {
         self.os_call(format!("is_shell {}", row.pid));
         self.0.borrow().shells.contains(&row.pid)
@@ -590,6 +610,11 @@ impl Os for Fakes {
     fn boot(&self) -> Boot {
         self.0.borrow().boot.clone().unwrap_or(Boot::Absolute)
     }
+
+    fn proc_mounts(&self) -> Option<std::io::Result<String>> {
+        let mountinfo = self.0.borrow().mountinfo.clone();
+        mountinfo.map(|t| t.ok_or_else(|| std::io::Error::other("unreadable mountinfo")))
+    }
 }
 
 /// A row whose start is unknown (Windows: listed by Toolhelp but not openable).
@@ -597,6 +622,23 @@ pub fn unknown_start(pid: u32, ppid: u32) -> Row {
     Row {
         start: None,
         ..row(pid, ppid, 0)
+    }
+}
+
+/// occupy-3 H6: the client 150 (start 1500) registry entry for case `none`, `other` (names another conversation) or
+/// `torn`.
+pub fn seed_entry(ctx: &Ctx, case: &str) {
+    let entry = crate::state::live::path(ctx, Client::Claude, 150, 1500);
+    match case {
+        "other" => {
+            let other = "33333333-3333-4333-8333-333333333333";
+            crate::state::live::report(ctx, Client::Claude, 150, 1500, other, "resume").unwrap();
+        }
+        "torn" => {
+            std::fs::create_dir_all(entry.parent().unwrap()).unwrap();
+            std::fs::write(&entry, b"{\"se").unwrap();
+        }
+        _ => {}
     }
 }
 
@@ -608,6 +650,7 @@ pub fn row(pid: u32, ppid: u32, start: i64) -> Row {
         start: Some(start),
         path: None,
         argv: None,
+        image: Some("fixture".into()),
     }
 }
 

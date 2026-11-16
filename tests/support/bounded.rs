@@ -263,6 +263,13 @@ impl Watched {
     pub fn id(&self) -> u32 {
         self.id
     }
+    /// o3 call 34 N4: the child's process handle, the lock released before it returns, so a diagnostic run on it
+    /// never holds the watchdog off. Valid while this `Watched` lives (the `Child` owning it drops only with it).
+    #[cfg(windows)]
+    pub fn handle(&self) -> std::os::windows::io::RawHandle {
+        use std::os::windows::io::AsRawHandle;
+        guard(&self.child).as_raw_handle()
+    }
     pub fn kill(&mut self) -> io::Result<()> {
         guard(&self.child).kill()
     }

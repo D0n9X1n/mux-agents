@@ -216,7 +216,10 @@ fn failure(
 
 /// Ambiguity 3: `t` is generation n's terminal shown Lost: its name is `launch.json hcName`, its labels name this
 /// member and n, and `classify` against `launch.json launcherArgv` is Lost. launch.json absent or torn: `evidence`.
+/// a3c call 47: an empty or malformed `hcName` is `evidence` too; the name and `mux.id` match only through
+/// `ident::same`, so two empty or missing sides are never Lost.
 fn lost(member: &Path, n: u64, t: &Terminal) -> Res<bool> {
+    use super::ident;
     let launch = gens::read(member, n, "launch")
         .known()?
         .ok_or_else(evidence::unreadable)?;
@@ -224,6 +227,9 @@ fn lost(member: &Path, n: u64, t: &Terminal) -> Res<bool> {
         .get("hcName")
         .and_then(Value::as_str)
         .ok_or_else(evidence::unreadable)?;
+    if !ident::hc_name(hc_name) {
+        return Err(ident::refused("launch hcName"));
+    }
     let argv: Vec<String> = launch
         .get("launcherArgv")
         .and_then(Value::as_array)
@@ -238,10 +244,12 @@ fn lost(member: &Path, n: u64, t: &Terminal) -> Res<bool> {
     let id = member.file_name().and_then(|f| f.to_str());
     let label = |k: &str| t.labels.get(k).map(String::as_str);
     let gen_label = n.to_string();
-    Ok(t.name.as_deref() == Some(hc_name)
-        && label("mux.id") == id
-        && label("mux.gen") == Some(gen_label.as_str())
-        && super::lifecycle::classify(Some(t), &argv) == super::lifecycle::Life::Lost)
+    Ok(
+        ident::same(ident::hc_name, t.name.as_deref(), Some(hc_name))
+            && ident::same(ident::member_id, label("mux.id"), id)
+            && label("mux.gen") == Some(gen_label.as_str())
+            && super::lifecycle::classify(Some(t), &argv) == super::lifecycle::Life::Lost,
+    )
 }
 
 /// O6: why a member needs recovery: its active generation's outcome is `failed`.
@@ -297,5 +305,4 @@ pub fn needs_recovery(
 }
 
 #[cfg(test)]
-#[path = "outcome_tests.rs"]
 mod tests;

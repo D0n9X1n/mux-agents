@@ -5,7 +5,7 @@ use std::io;
 use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
 
-use serde_json::{Map, Value, json};
+use serde_json::{Value, json};
 
 use crate::agents::gens::{self, Decision};
 use crate::agents::spawn::{CMDLINE_MAX, client_named};
@@ -13,7 +13,6 @@ use crate::ctx::Ctx;
 use crate::error::{Refusal, Res};
 use crate::parse::cmdline_length;
 use crate::state::evidence::{self, Evidence, Published};
-use crate::state::fs::{read_json, write_json};
 use crate::state::root::{HOST, OsKind};
 use crate::util::utc_o;
 
@@ -39,6 +38,9 @@ const OUTSIDE: &str = "mux-agent: the launch spec is outside the state folder";
 const LINK: &str = "mux-agent: the launch spec path has a junction or link";
 const GEN_PATH: &str = "mux-agent: the launch spec path names no generation of a member";
 const FOREIGN: &str = "mux-agent: the launch spec is not this member's launch";
+/// PM call 7: a folder-level spec is a pane an older build started and has not yet claimed; it names the remedy.
+const OLD_SPEC: &str = "mux-agent: this pane was started by an older mux-agent and cannot launch; \
+                        run `mux-agent stop <name>` to end it, or `mux-agent resume <name>` to start it again";
 
 /// The create-once publisher (`evidence::publish` in production): the seam for every publication of the generation
 /// path, so each publication failure is testable.
@@ -47,7 +49,7 @@ pub(crate) type Publish<'a> = &'a mut dyn FnMut(&Path, &Value) -> Res<Published>
 /// What a spec path names (launch-1 G7).
 #[derive(Debug, PartialEq, Eq)]
 enum Spec {
-    /// No `gens` below the state root: the folder-level launch (until A3 Task 14).
+    /// No `gens` below the state root: a pane an older build started; refused with `OLD_SPEC`.
     Folder,
     /// `<root>/<key>/agents/<id>/gens/<n>/spec.json`: generation n of the member folder.
     Gen(PathBuf, u64),
@@ -170,16 +172,6 @@ fn flush_claim(
     Ok(())
 }
 
-/// The exit record a launcher that claimed its generation leaves when it fails before or instead of the client, so
-/// the parent gets `exited`, never `lost`.
-fn failed_exit(ctx: &Ctx, folder: &Path) {
-    let at = utc_o(ctx.clock.now());
-    let _ = write_json(
-        &folder.join("launcher.json"),
-        &json!({"pid": ctx.pid, "exitCode": 1, "exitedAt": at}),
-    );
-}
-
 fn run_with(
     ctx: &Ctx,
     spec: &str,
@@ -214,47 +206,18 @@ fn run_seamed(
         return 2;
     }
     // On a canonical path: a link cannot make a Gen of a folder-level spec, or the reverse.
-    let folder = match classify_spec(&ctx.state_root, given) {
-        Spec::Folder => given.parent().unwrap_or(given),
-        Spec::Gen(member, n) => return run_gen(ctx, &member, n, err, start, sync, publish),
+    // launch-1 G7: only gens/<n>/spec.json launches; anything else is refused before anything is claimed.
+    match classify_spec(&ctx.state_root, given) {
+        Spec::Gen(member, n) => run_gen(ctx, &member, n, err, start, sync, publish),
+        Spec::Folder => {
+            err(OLD_SPEC);
+            2
+        }
         Spec::Malformed => {
             err(GEN_PATH);
-            return 2;
+            2
         }
-    };
-    let spec_value = match claim_spec(given, folder) {
-        Ok(Some(v)) => v,
-        Ok(None) => return 0,
-        Err(refusal) => {
-            err(&format!(
-                "mux-agent: the launcher failed: {}",
-                refusal.message
-            ));
-            return 1;
-        }
-    };
-    // A won claim is on disk before the client may run (#103): a failed flush leaves the claim `run` and an exit
-    // record, and the client never runs.
-    if let Err(e) = flush_claim(&ctx.state_root, folder, sync) {
-        err(&format!(
-            "mux-agent: the launcher failed: the generation claim could not be flushed to disk: {e}"
-        ));
-        failed_exit(ctx, folder);
-        return 1;
     }
-    let code = match launch(ctx, &spec_value, folder, err, start) {
-        Ok(code) => code,
-        Err(refusal) => {
-            err(&format!(
-                "mux-agent: the launcher failed: {}",
-                refusal.message
-            ));
-            failed_exit(ctx, folder);
-            1
-        }
-    };
-    // The exit notice is reconciliation's, from hc facts, once (#104): never the launcher's.
-    code
 }
 
 /// The client flags the launch spec records, the exact ones its spawn chose (#103: a person's `up` records its own).
@@ -322,72 +285,6 @@ fn unc(path: &str) -> bool {
     let drive =
         b.len() >= 6 && b[2] == b'?' && sep(3) && b[4].is_ascii_alphabetic() && b[5] == b':';
     !drive
-}
-
-/// Claims the spec's generation (`gens/<gen>.claim` = `run`): the spec when this launcher won it, none when another
-/// claim (or an abandonment) was there first.
-fn claim_spec(spec: &Path, folder: &Path) -> Res<Option<Value>> {
-    let v = read_json(spec)?.ok_or_else(|| Refusal::internal("the launch spec is missing"))?;
-    let gen_id = match v.get("generation") {
-        None => "0",
-        Some(Value::String(g)) if crate::agents::core_identity::generation(g) => g,
-        _ => return Err(Refusal::internal("invalid launch generation")),
-    };
-    let gens = folder.join("gens");
-    std::fs::create_dir_all(&gens)?;
-    let plain = gens
-        .to_str()
-        .ok_or_else(|| Refusal::internal("invalid generation folder"))?;
-    if !same_path(&std::fs::canonicalize(&gens)?, plain, HOST) {
-        return Err(Refusal::internal("invalid generation folder"));
-    }
-    Ok(
-        crate::state::fs::claim_json(&gens.join(format!("{gen_id}.claim")), &json!("run"))?
-            .then_some(v),
-    )
-}
-
-fn launch(
-    ctx: &Ctx,
-    launch: &Value,
-    folder: &Path,
-    err: &mut dyn FnMut(&str),
-    start: Start,
-) -> Res<i32> {
-    let exit_path = folder.join("launcher.json");
-    // pid and start name this pane's own process, so stop can tell it from a reused pid.
-    let mut record = Map::new();
-    record.insert("pid".into(), ctx.pid.into());
-    let own_start = ctx.os.open(ctx.pid).map(|opened| opened.start);
-    record.insert("start".into(), own_start.map_or(Value::Null, Value::from));
-    record.insert("startedAt".into(), utc_o(ctx.clock.now()).into());
-    write_json(&exit_path, &Value::Object(record.clone()))?;
-    if !wait_commit(ctx, folder) {
-        record.insert("aborted".into(), true.into());
-        record.insert("exitCode".into(), 1.into());
-        write_json(&exit_path, &Value::Object(record))?;
-        return Ok(1);
-    }
-    let mut code = 1;
-    if let Some(found) = client_command(ctx, launch, err)? {
-        // Attached, so the client owns the pane's console; a start that fails is exit 1.
-        let mut client = Value::Null;
-        code = start(&found.executable, &found.args, &SCRUB, &mut |pid| {
-            client = json!({"pid": pid, "start": ctx.os.open(pid).map(|o| o.start)});
-            let mut now = record.clone();
-            now.insert("client".into(), client.clone());
-            // A record that cannot be written proves no member: D1 fails closed.
-            let _ = write_json(&exit_path, &Value::Object(now));
-        })
-        .unwrap_or(1);
-        if !client.is_null() {
-            record.insert("client".into(), client);
-        }
-    }
-    record.insert("exitCode".into(), code.into());
-    record.insert("exitedAt".into(), utc_o(ctx.clock.now()).into());
-    write_json(&exit_path, &Value::Object(record))?;
-    Ok(code)
 }
 
 /// The client a spec names, found on PATH, with its full argument list.
@@ -794,29 +691,6 @@ fn mark_conflict(ctx: &Ctx, member: &Path, n: u64, publish: Publish) -> bool {
     false
 }
 
-/// True once the agent is committed; false at once for abort.json. At 30 s the launcher makes commit.json itself as
-/// its give-up (`"aborted": true`), so a spawn can no longer commit; if the spawn's commit was there first, that is
-/// the answer (#97). commit.json is made once, whole, by whichever comes first.
-fn wait_commit(ctx: &Ctx, folder: &Path) -> bool {
-    let deadline = ctx.clock.now() + COMMIT_WAIT;
-    loop {
-        if folder.join("abort.json").is_file() {
-            return false;
-        }
-        if folder.join("commit.json").is_file() {
-            return crate::agents::committed(folder);
-        }
-        if ctx.clock.now() >= deadline {
-            let gave_up = crate::state::fs::claim_json(
-                &folder.join("commit.json"),
-                &json!({"aborted": true, "at": utc_o(ctx.clock.now())}),
-            );
-            return gave_up.is_ok_and(|made| !made) && crate::agents::committed(folder);
-        }
-        ctx.clock.sleep(COMMIT_POLL);
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -825,6 +699,7 @@ mod tests {
     use crate::ctx::Env;
     use crate::parse::cmdline_length;
     use crate::state::evidence::{self, Evidence};
+    use crate::state::fs::read_json;
     use serde_json::{Value, json};
     use std::path::PathBuf;
 
@@ -932,10 +807,6 @@ mod tests {
 
     fn exits_7() -> io::Result<i32> {
         Ok(7)
-    }
-
-    fn launcher_json(l: &Launch) -> Value {
-        serde_json::from_slice(&std::fs::read(l.folder.join("launcher.json")).unwrap()).unwrap()
     }
 
     // The parent's mailbox lines.
@@ -1084,32 +955,121 @@ mod tests {
         assert!(!l.folder.join("launcher.json").exists());
     }
 
+    // launch-1 G7, PM call 7: a folder-level spec (a pane an older build started, not yet claimed) is refused exit 2
+    // with the remedy, before anything is claimed, written or started.
+    #[test]
+    fn a_folder_level_spec_names_its_remedy() {
+        let l = setup("claude", json!([]));
+        let before = crate::testing::tree(&l.w.ctx.state_root);
+        let ran = launch(&l, &spec_str(&l), exits_7);
+        assert_eq!(
+            (ran.code, ran.err.as_slice()),
+            (2, &[OLD_SPEC.to_string()][..])
+        );
+        assert!(ran.started.is_empty());
+        assert_eq!(
+            crate::testing::tree(&l.w.ctx.state_root),
+            before,
+            "nothing claimed or written"
+        );
+    }
+
+    // PM call 7: the wording is pinned; it names both remedies.
+    #[test]
+    fn the_old_spec_message_names_the_remedy() {
+        assert_eq!(
+            OLD_SPEC,
+            "mux-agent: this pane was started by an older mux-agent and cannot launch; \
+             run `mux-agent stop <name>` to end it, or `mux-agent resume <name>` to start it again"
+        );
+    }
+
+    // N2 on every OS: `gens` a regular file, or a link to a folder outside the member: refused before any read
+    // (LINK), nothing written through it, nothing started.
+    #[test]
+    fn a_gens_that_is_a_file_or_a_link_runs_nothing() {
+        for case in ["file", "link"] {
+            let l = committed_spec("claude", json!([]));
+            let outside = crate::testing::TempDir::new();
+            let moved = outside.path().join("gens");
+            std::fs::rename(l.folder.join("gens"), &moved).unwrap();
+            if case == "file" {
+                std::fs::write(l.folder.join("gens"), b"not a directory").unwrap();
+            } else {
+                crate::testing::link_dir(&moved, &l.folder.join("gens"));
+            }
+            let before = crate::testing::tree(outside.path());
+            let r = launch(&l, &spec_str(&l), exits_7);
+            assert_eq!(
+                (r.code, r.err.as_slice()),
+                (2, &[LINK.to_string()][..]),
+                "{case}"
+            );
+            assert!(r.started.is_empty() && mail(&l).is_empty(), "{case}");
+            assert_eq!(
+                crate::testing::tree(outside.path()),
+                before,
+                "{case}: nothing written through it"
+            );
+        }
+    }
+
+    // On every OS (main's `a_dangling_commit_during_the_wait_is_never_absent` is Unix-only): a commit.json that is a
+    // dangling link is never absent; the wait ends at its deadline `commit unreadable`; nothing is followed or run.
+    #[test]
+    fn a_dangling_commit_link_is_never_absent() {
+        let (l, at) = gen_setup(0);
+        let outside = crate::testing::TempDir::new();
+        let target = outside.path().join("commit");
+        crate::testing::link_dir(&target, &gens::path(&l.folder, 0, "commit"));
+        let ran = launch(&l, at.to_str().unwrap(), exits_7);
+        assert_eq!((ran.code, ran.started.len()), (1, 0));
+        assert_eq!(l.w.fakes.slept(), vec![250; 120]);
+        let exit = read_json(&gens::path(&l.folder, 0, "exit"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(exit["reason"], "commit unreadable");
+        assert!(
+            !target.exists() && std::fs::read_dir(outside.path()).unwrap().next().is_none(),
+            "never followed"
+        );
+    }
+
+    // On every OS (`spec_link_exit_2`'s linked folder is Unix-only): a spec reached through a linked member folder
+    // is refused LINK before anything is claimed.
+    #[test]
+    fn a_spec_through_a_linked_member_folder_is_refused() {
+        let (l, _) = gen_setup(0);
+        let alias = l.folder.parent().unwrap().join("cccccccccccc");
+        crate::testing::link_dir(&l.folder, &alias);
+        let spec = alias.join("gens").join("0").join("spec.json");
+        let r = launch(&l, spec.to_str().unwrap(), exits_7);
+        assert_eq!((r.code, r.err.as_slice()), (2, &[LINK.to_string()][..]));
+        assert!(r.started.is_empty() && !gens::claim_path(&l.folder, 0).exists());
+    }
+
     #[test]
     fn generation_fence() {
-        let l = setup("claude", json!([]));
+        let l = committed_spec("claude", json!([]));
         assert_eq!(launch(&l, &spec_str(&l), exits_7).started.len(), 1);
-        let record = std::fs::read(l.folder.join("launcher.json")).unwrap();
+        let record = launcher_files(&l).bytes;
         let messages = mail(&l);
         let second = launch(&l, &spec_str(&l), exits_7);
         assert!(second.started.is_empty());
         assert_eq!(second.code, 0);
-        assert_eq!(
-            std::fs::read(l.folder.join("launcher.json")).unwrap(),
-            record
-        );
+        assert_eq!(launcher_files(&l).bytes, record);
         assert_eq!(mail(&l), messages);
         assert_eq!(
             read_json(&l.folder.join("gens/0.claim")).unwrap(),
             Some(json!("run"))
         );
         for value in [b"\"abandoned\"".as_slice(), b"\"run\"", b"corrupt", b""] {
-            let l = setup("claude", json!([]));
-            std::fs::create_dir(l.folder.join("gens")).unwrap();
+            let l = committed_spec("claude", json!([]));
             std::fs::write(l.folder.join("gens/0.claim"), value).unwrap();
             let r = launch(&l, &spec_str(&l), exits_7);
             assert_eq!(r.code, 0);
             assert!(r.started.is_empty());
-            assert!(!l.folder.join("launcher.json").exists());
+            assert!(launcher_files(&l).absent);
             assert!(mail(&l).is_empty());
             assert_eq!(std::fs::read(l.folder.join("gens/0.claim")).unwrap(), value);
         }
@@ -1142,7 +1102,7 @@ mod tests {
             );
             (code, synced, started, err)
         };
-        let l = setup("claude", json!([]));
+        let l = committed_spec("claude", json!([]));
         let (code, synced, started, _) = run_flushing(&l, false);
         assert_eq!(code, 0);
         assert_eq!(started, 1);
@@ -1158,7 +1118,7 @@ mod tests {
         assert_eq!(synced, want);
         assert!(synced.contains(&root));
         assert!(synced.len() > 5);
-        let l = setup("claude", json!([]));
+        let l = committed_spec("claude", json!([]));
         let (code, synced, started, err) = run_flushing(&l, true);
         assert_eq!((code, synced.len(), started), (1, 1, 0));
         assert!(err[0].contains("could not be flushed"), "{err:?}");
@@ -1166,10 +1126,10 @@ mod tests {
             read_json(&l.folder.join("gens/0.claim")).unwrap(),
             Some(json!("run"))
         );
-        assert_eq!(launcher_json(&l)["exitCode"], 1);
+        assert_eq!(launcher_files(&l).record["exitCode"], 1);
         // A failed flush above the root stops the launch too; the sync it gets for those folders is the one that
         // skips folders the user cannot add to.
-        let l = setup("claude", json!([]));
+        let l = committed_spec("claude", json!([]));
         let depth = l.w.ctx.state_root.components().count();
         let mut err = Vec::new();
         let mut started = 0;
@@ -1196,44 +1156,51 @@ mod tests {
             },
         );
         assert_eq!((code, started), (1, 0), "{err:?}");
-        assert_eq!(launcher_json(&l)["exitCode"], 1);
+        assert_eq!(launcher_files(&l).record["exitCode"], 1);
     }
 
-    #[cfg(unix)]
+    // S12: every OS through `testing::link_dir`; on Windows also through `testing::junction`, the fallback a user
+    // without symlink rights gets (checklist 3). The claim path is joined per component, so no `/` reaches
+    // `mklink /J`; the link target is compared in canonical form (call 34, checklist 2).
     #[test]
     fn generation_fence_dangling_claim_blocks_without_following_link() {
-        let l = setup("claude", json!([]));
-        let outside = crate::testing::TempDir::new();
-        let target = outside.path().join("claim.json");
-        let claim = l.folder.join("gens/0.claim");
-        std::fs::create_dir(l.folder.join("gens")).unwrap();
-        std::os::unix::fs::symlink(&target, &claim).unwrap();
-        assert!(!claim.exists());
-        assert!(std::fs::symlink_metadata(&claim).unwrap().is_symlink());
-        let r = launch(&l, &spec_str(&l), exits_7);
-        assert!(!target.exists());
-        assert!(std::fs::read_dir(outside.path()).unwrap().next().is_none());
-        assert_eq!(r.code, 0);
-        assert!(r.started.is_empty());
-        assert!(r.err.is_empty());
-        assert!(!l.folder.join("launcher.json").exists());
-        assert!(mail(&l).is_empty());
-        assert_eq!(std::fs::read_link(&claim).unwrap(), target);
+        #[cfg(unix)]
+        let makers: [fn(&Path, &Path); 1] = [crate::testing::link_dir];
+        #[cfg(windows)]
+        let makers: [fn(&Path, &Path); 2] = [crate::testing::link_dir, crate::testing::junction];
+        for make in makers {
+            let l = committed_spec("claude", json!([]));
+            let outside = crate::testing::TempDir::new();
+            let target = outside.path().join("claim.json");
+            let claim = l.folder.join("gens").join("0.claim");
+            make(&target, &claim);
+            assert!(!claim.exists());
+            assert!(std::fs::symlink_metadata(&claim).unwrap().is_symlink());
+            let r = launch(&l, &spec_str(&l), exits_7);
+            assert!(!target.exists());
+            assert!(std::fs::read_dir(outside.path()).unwrap().next().is_none());
+            assert_eq!(r.code, 0);
+            assert!(r.started.is_empty());
+            assert!(r.err.is_empty());
+            assert!(launcher_files(&l).absent);
+            assert!(mail(&l).is_empty());
+            assert_eq!(
+                unprefixed(&std::fs::read_link(&claim).unwrap()),
+                unprefixed(&target)
+            );
+        }
     }
 
     #[test]
     fn generation_adversarial_active() {
-        let l = setup("claude", json!([]));
+        let l = committed_spec("claude", json!([]));
         let mut seen = false;
         let code = run(&l.w.ctx, &spec_str(&l), &mut |_| {}, &mut |_, _, _, _| {
             seen = true;
-            let before = std::fs::read(l.folder.join("launcher.json")).unwrap();
+            let before = launcher_files(&l).bytes;
             let duplicate = launch(&l, &spec_str(&l), exits_7);
             assert!(duplicate.started.is_empty());
-            assert_eq!(
-                std::fs::read(l.folder.join("launcher.json")).unwrap(),
-                before
-            );
+            assert_eq!(launcher_files(&l).bytes, before);
             assert!(mail(&l).is_empty());
             Ok(7)
         });
@@ -1245,7 +1212,7 @@ mod tests {
     #[test]
     fn generation_adversarial_path_syntax_refusal() {
         for gen_id in [r"..\..\x", "C:x", "a.b", r"a\b"] {
-            let l = setup("claude", json!([]));
+            let l = committed_spec("claude", json!([]));
             // A drive-relative name can replace the folder prefix on Windows.
             let claim = l.folder.join("gens").join(format!("{gen_id}.claim"));
             assert!(!claim.exists(), "{gen_id}");
@@ -1257,20 +1224,22 @@ mod tests {
             let mut v = read_json(&l.spec).unwrap().unwrap();
             v["generation"] = json!(gen_id);
             write(&l.spec, v);
+            let seeded = crate::testing::tree(&l.folder.join("gens"));
             let r = launch(&l, &spec_str(&l), exits_7);
             assert_eq!(r.code, 1, "{gen_id}");
             assert!(r.started.is_empty(), "{gen_id}");
-            assert_eq!(
-                r.err,
-                ["mux-agent: the launcher failed: unexpected error (invalid launch generation)"],
-                "{gen_id}"
-            );
-            assert!(!l.folder.join("launcher.json").exists(), "{gen_id}");
+            assert!(launcher_files(&l).absent, "{gen_id}");
             assert!(mail(&l).is_empty(), "{gen_id}");
             assert!(!claim.exists(), "{gen_id}");
-            assert!(!l.folder.join("gens").exists(), "{gen_id}");
+            assert!(launcher_files(&l).made.is_empty(), "{gen_id}");
             #[cfg(windows)]
             assert!(!escaped.exists(), "{gen_id}");
+            // Checklist 5: the seeded generation is byte-for-byte as it was (nothing overwritten).
+            assert_eq!(
+                crate::testing::tree(&l.folder.join("gens")),
+                seeded,
+                "{gen_id}"
+            );
         }
     }
 
@@ -1287,67 +1256,50 @@ mod tests {
             json!("x".repeat(65)),
             json!("中"),
         ] {
-            let l = setup("claude", json!([]));
+            let l = committed_spec("claude", json!([]));
             let mut v = read_json(&l.spec).unwrap().unwrap();
             v["generation"] = gen_id;
             write(&l.spec, v);
+            let seeded = crate::testing::tree(&l.folder.join("gens"));
             let r = launch(&l, &spec_str(&l), exits_7);
             assert_eq!(r.code, 1);
             assert!(r.started.is_empty());
-            assert!(!l.folder.join("launcher.json").exists());
+            assert!(launcher_files(&l).absent);
             assert!(mail(&l).is_empty());
-            assert!(!l.folder.join("gens").exists());
-        }
-        let l = setup("claude", json!([]));
-        std::fs::write(l.folder.join("gens"), b"not a directory").unwrap();
-        assert_eq!(launch(&l, &spec_str(&l), exits_7).code, 1);
-        assert!(!l.folder.join("launcher.json").exists());
-        assert!(mail(&l).is_empty());
-        // Unix-only: creating Windows symlinks requires privileges.
-        #[cfg(unix)]
-        {
-            let l = setup("claude", json!([]));
-            let outside = crate::testing::TempDir::new();
-            std::os::unix::fs::symlink(outside.path(), l.folder.join("gens")).unwrap();
-            let r = launch(&l, &spec_str(&l), exits_7);
-            assert_eq!(r.code, 1);
-            assert!(r.started.is_empty());
-            assert!(!l.folder.join("launcher.json").exists());
-            assert!(mail(&l).is_empty());
-            assert!(std::fs::read_dir(outside.path()).unwrap().next().is_none());
+            assert!(launcher_files(&l).made.is_empty());
+            // Checklist 5: the seeded generation is byte-for-byte as it was (nothing overwritten).
+            assert_eq!(crate::testing::tree(&l.folder.join("gens")), seeded);
         }
     }
 
     #[test]
     fn generation_adversarial_failed_start() {
-        let l = setup("claude", json!([]));
+        let l = committed_spec("claude", json!([]));
         let mut v = read_json(&l.spec).unwrap().unwrap();
-        v["generation"] = json!("g-1");
+        v["generation"] = json!("0");
         write(&l.spec, v);
         assert_eq!(
             launch(&l, &spec_str(&l), || Err(io::Error::other("uncertain"))).code,
             1
         );
         assert_eq!(
-            read_json(&l.folder.join("gens/g-1.claim")).unwrap(),
+            read_json(&l.folder.join("gens/0.claim")).unwrap(),
             Some(json!("run"))
         );
-        let record = std::fs::read(l.folder.join("launcher.json")).unwrap();
+        let record = launcher_files(&l).bytes;
         let messages = mail(&l);
         let duplicate = launch(&l, &spec_str(&l), exits_7);
         assert!(duplicate.started.is_empty());
         assert_eq!(duplicate.code, 0);
-        assert_eq!(
-            std::fs::read(l.folder.join("launcher.json")).unwrap(),
-            record
-        );
+        assert_eq!(launcher_files(&l).bytes, record);
         assert_eq!(mail(&l), messages);
     }
 
     #[test]
     fn generation_adversarial_valid() {
-        for gen_id in ["a_z-09".to_string(), "x".repeat(64), "0".to_string()] {
-            let l = setup("claude", json!([]));
+        {
+            let gen_id = "0".to_string();
+            let l = committed_spec("claude", json!([]));
             let mut v = read_json(&l.spec).unwrap().unwrap();
             v["generation"] = json!(gen_id);
             write(&l.spec, v);
@@ -1367,27 +1319,24 @@ mod tests {
 
     #[test]
     fn generation_claim_survives_commit_timeout_exit() {
-        let l = setup("claude", json!([]));
-        std::fs::remove_file(l.folder.join("commit.json")).unwrap();
+        let l = committed_spec("claude", json!([]));
+        std::fs::remove_file(gens::path(&l.folder, 0, "commit")).unwrap();
         let ran = launch(&l, &spec_str(&l), exits_7);
         assert_eq!(ran.code, 1);
         assert!(ran.started.is_empty());
         assert_eq!(l.w.fakes.slept(), vec![250; 120]);
-        assert_eq!(launcher_json(&l)["aborted"], true);
-        assert!(!crate::agents::committed(&l.folder));
+        assert_eq!(launcher_files(&l).record["aborted"], true);
+        assert!(!gens::committed(&l.folder, 0).unwrap());
         assert_eq!(
             read_json(&l.folder.join("gens/0.claim")).unwrap(),
             Some(json!("run"))
         );
-        let record = std::fs::read(l.folder.join("launcher.json")).unwrap();
+        let record = launcher_files(&l).bytes;
         let messages = mail(&l);
         let second = launch(&l, &spec_str(&l), exits_7);
         assert_eq!(second.code, 0);
         assert!(second.started.is_empty());
-        assert_eq!(
-            std::fs::read(l.folder.join("launcher.json")).unwrap(),
-            record
-        );
+        assert_eq!(launcher_files(&l).bytes, record);
         assert_eq!(mail(&l), messages);
         assert_eq!(
             read_json(&l.folder.join("gens/0.claim")).unwrap(),
@@ -1397,27 +1346,27 @@ mod tests {
 
     #[test]
     fn generation_claim_survives_abort_exit() {
-        let l = setup("claude", json!([]));
-        std::fs::remove_file(l.folder.join("commit.json")).unwrap();
-        write(&l.folder.join("abort.json"), json!({}));
+        let l = committed_spec("claude", json!([]));
+        std::fs::remove_file(gens::path(&l.folder, 0, "commit")).unwrap();
+        write(
+            &gens::path(&l.folder, 0, "commit"),
+            json!({"aborted": true}),
+        );
         let ran = launch(&l, &spec_str(&l), exits_7);
         assert_eq!(ran.code, 1);
         assert!(ran.started.is_empty());
         assert!(l.w.fakes.slept().is_empty());
-        assert_eq!(launcher_json(&l)["aborted"], true);
+        assert_eq!(launcher_files(&l).record["aborted"], true);
         assert_eq!(
             read_json(&l.folder.join("gens/0.claim")).unwrap(),
             Some(json!("run"))
         );
-        let record = std::fs::read(l.folder.join("launcher.json")).unwrap();
+        let record = launcher_files(&l).bytes;
         let messages = mail(&l);
         let second = launch(&l, &spec_str(&l), exits_7);
         assert_eq!(second.code, 0);
         assert!(second.started.is_empty());
-        assert_eq!(
-            std::fs::read(l.folder.join("launcher.json")).unwrap(),
-            record
-        );
+        assert_eq!(launcher_files(&l).bytes, record);
         assert_eq!(mail(&l), messages);
         assert_eq!(
             read_json(&l.folder.join("gens/0.claim")).unwrap(),
@@ -1427,39 +1376,42 @@ mod tests {
 
     #[test]
     fn abort_json_ends_1_without_client() {
-        let l = setup("claude", json!(["--session-id", "s", "p"]));
-        std::fs::remove_file(l.folder.join("commit.json")).unwrap();
+        let l = committed_spec("claude", json!(["--session-id", "s", "p"]));
+        std::fs::remove_file(gens::path(&l.folder, 0, "commit")).unwrap();
         write(
-            &l.folder.join("abort.json"),
-            json!({"abortedAt": "x", "pane": null}),
+            &gens::path(&l.folder, 0, "commit"),
+            json!({"aborted": true}),
         );
         let ran = launch(&l, &spec_str(&l), exits_7);
         assert_eq!(ran.code, 1);
         assert!(ran.started.is_empty() && ran.err.is_empty());
         assert_eq!(
-            launcher_json(&l),
+            launcher_files(&l).record,
             json!({"pid": CALLER, "start": 2000, "startedAt": "1970-01-01T00:00:00.0000000Z",
                 "aborted": true, "exitCode": 1})
         );
-        // abort.json wins even beside commit.json, and ends the wait at once.
-        let l = setup("claude", json!([]));
-        write(&l.folder.join("abort.json"), json!({}));
+        // An abort wins even beside a commit (`gens::decide` reads `aborted` first), and ends the wait at once.
+        let l = committed_spec("claude", json!([]));
+        write(
+            &gens::path(&l.folder, 0, "commit"),
+            json!({"aborted": true, "committed": true}),
+        );
         assert_eq!(launch(&l, &spec_str(&l), exits_7).code, 1);
         assert!(l.w.fakes.slept().is_empty());
     }
 
     #[test]
     fn commit_timeout_30s() {
-        let l = setup("claude", json!([]));
-        std::fs::remove_file(l.folder.join("commit.json")).unwrap();
+        let l = committed_spec("claude", json!([]));
+        std::fs::remove_file(gens::path(&l.folder, 0, "commit")).unwrap();
         let ran = launch(&l, &spec_str(&l), exits_7);
         assert_eq!(ran.code, 1);
         assert!(ran.started.is_empty());
         assert_eq!(l.w.fakes.slept(), vec![250; 120]);
-        assert_eq!(launcher_json(&l)["aborted"], true);
-        assert_eq!(launcher_json(&l)["exitCode"], 1);
+        assert_eq!(launcher_files(&l).record["aborted"], true);
+        assert_eq!(launcher_files(&l).record["exitCode"], 1);
         // A commit already there needs no wait.
-        let l = setup("claude", json!([]));
+        let l = committed_spec("claude", json!([]));
         assert_eq!(launch(&l, &spec_str(&l), exits_7).code, 7);
         assert!(l.w.fakes.slept().is_empty());
     }
@@ -1467,40 +1419,20 @@ mod tests {
     #[test]
     fn a_timed_out_launcher_makes_commit_json_as_its_give_up_unless_the_spawn_did() {
         // Timed out with no commit: it makes commit.json as its give-up, so a late spawn can no longer commit (#97).
-        let l = setup("claude", json!([]));
-        std::fs::remove_file(l.folder.join("commit.json")).unwrap();
+        let l = committed_spec("claude", json!([]));
+        std::fs::remove_file(gens::path(&l.folder, 0, "commit")).unwrap();
         assert_eq!(launch(&l, &spec_str(&l), exits_7).code, 1);
-        assert_eq!(launcher_json(&l)["aborted"], true);
-        assert!(!crate::agents::committed(&l.folder));
-        assert!(!crate::state::fs::claim_json(&l.folder.join("commit.json"), &json!({})).unwrap());
-        // The spawn commits after the launcher's last look but before its give-up claim: the launcher loses the
-        // claim, the spawn's commit stands, and the client starts once.
-        let l = setup("claude", json!([]));
-        std::fs::remove_file(l.folder.join("commit.json")).unwrap();
-        let folder = l.folder.clone();
-        let start_ms =
-            l.w.ctx
-                .clock
-                .now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_millis() as u64;
-        l.w.fakes.clock_probe(move |ms| {
-            let commit = folder.join("commit.json");
-            if ms >= start_ms + 30_000 && !commit.exists() {
-                crate::agents::fixture::write(&commit, json!({"committedAt": "x"}));
-            }
-        });
-        let ran = launch(&l, &spec_str(&l), exits_7);
-        assert_eq!((ran.code, ran.started.len()), (7, 1));
-        assert!(crate::agents::committed(&l.folder));
-        assert_eq!(
-            crate::state::fs::read_json(&l.folder.join("commit.json")).unwrap(),
-            Some(json!({"committedAt": "x"}))
+        assert_eq!(launcher_files(&l).record["aborted"], true);
+        assert!(!gens::committed(&l.folder, 0).unwrap());
+        assert!(
+            !crate::state::fs::claim_json(&gens::path(&l.folder, 0, "commit"), &json!({})).unwrap()
         );
         // A give-up already there (another launcher's): no client.
-        let l = setup("claude", json!([]));
-        write(&l.folder.join("commit.json"), json!({"aborted": true}));
+        let l = committed_spec("claude", json!([]));
+        write(
+            &gens::path(&l.folder, 0, "commit"),
+            json!({"aborted": true}),
+        );
         assert_eq!(launch(&l, &spec_str(&l), exits_7).code, 1);
         assert!(l.w.fakes.slept().is_empty());
     }
@@ -1524,7 +1456,7 @@ mod tests {
                 "COPILOT_CLI",
             ]
         );
-        let l = setup("copilot", json!(["-i", "p"]));
+        let l = committed_spec("copilot", json!(["-i", "p"]));
         let ran = launch(&l, &spec_str(&l), exits_7);
         assert_eq!(ran.started.len(), 1);
         assert_eq!(ran.started[0].2, SCRUB);
@@ -1539,7 +1471,7 @@ mod tests {
             ),
             ("copilot", &["--no-sandbox", "--allow-all"]),
         ] {
-            let l = setup(client, json!(["--session-id", "s", "two words"]));
+            let l = committed_spec(client, json!(["--session-id", "s", "two words"]));
             let ran = launch(&l, &spec_str(&l), exits_7);
             assert_eq!(ran.code, 7, "{client}");
             let (path, args, _) = &ran.started[0];
@@ -1547,7 +1479,7 @@ mod tests {
             let mut expected: Vec<String> = flags.iter().map(|f| f.to_string()).collect();
             expected.extend(["--session-id", "s", "two words"].map(String::from));
             assert_eq!(args, &expected);
-            let record = launcher_json(&l);
+            let record = launcher_files(&l).record;
             assert_eq!(
                 record,
                 json!({"pid": CALLER, "start": 2000, "startedAt": "1970-01-01T00:00:00.0000000Z",
@@ -1555,7 +1487,7 @@ mod tests {
             );
         }
         // An unknown client starts nothing.
-        let l = setup("Claude", json!([]));
+        let l = committed_spec("Claude", json!([]));
         let ran = launch(&l, &spec_str(&l), exits_7);
         assert_eq!(
             (ran.code, ran.err.as_slice()),
@@ -1571,16 +1503,16 @@ mod tests {
     // recorded flags starts nothing rather than fall back to a fixed list.
     #[test]
     fn the_launch_runs_the_flags_its_spec_records() {
-        let l = setup("claude", json!(["a"]));
-        let spec = l.folder.join("spec.json");
+        let l = committed_spec("claude", json!(["a"]));
+        let spec = l.spec.clone();
         let mut v: Value = read_json(&spec).unwrap().unwrap();
         v["flags"] = json!(["--model", "x y", "\u{e9}"]);
         write(&spec, v);
         let ran = launch(&l, &spec_str(&l), exits_7);
         assert_eq!(ran.started[0].1, ["--model", "x y", "\u{e9}", "a"]);
         for flags in [None, Some(json!("--x")), Some(json!(["--x", 1]))] {
-            let l = setup("claude", json!(["a"]));
-            let spec = l.folder.join("spec.json");
+            let l = committed_spec("claude", json!(["a"]));
+            let spec = l.spec.clone();
             let mut v: Value = read_json(&spec).unwrap().unwrap();
             match flags {
                 None => {
@@ -1601,7 +1533,7 @@ mod tests {
 
     #[test]
     fn client_not_on_path_exit_1_launcher_json() {
-        let l = setup("claude", json!([]));
+        let l = committed_spec("claude", json!([]));
         std::fs::remove_file(l.bin.join(exe_name("claude"))).unwrap();
         let ran = launch(&l, &spec_str(&l), exits_7);
         assert_eq!(ran.code, 1);
@@ -1610,50 +1542,46 @@ mod tests {
             [format!("mux-agent: {} is not on PATH", exe_name("claude"))]
         );
         assert!(ran.started.is_empty());
-        assert_eq!(launcher_json(&l)["exitCode"], 1);
-        assert!(!l.folder.join("notice.json").exists());
+        assert_eq!(launcher_files(&l).record["exitCode"], 1);
+        assert!(!gens::path(&l.folder, 0, "notice").exists());
         assert!(mail(&l).is_empty());
     }
 
     #[test]
     fn launcher_start_error_writes_fallback_exit_record() {
         // The client fails to start after PATH resolution.
-        let l = setup("claude", json!([]));
+        let l = committed_spec("claude", json!([]));
         let ran = launch(&l, &spec_str(&l), || Err(io::Error::other("no exec")));
         assert_eq!(ran.code, 1);
         assert_eq!(ran.started.len(), 1);
-        assert_eq!(launcher_json(&l)["exitCode"], 1);
-        assert!(!l.folder.join("notice.json").exists());
+        assert_eq!(launcher_files(&l).record["exitCode"], 1);
+        assert!(!gens::path(&l.folder, 0, "notice").exists());
         assert!(mail(&l).is_empty());
         // A failure after the claim (no args) still leaves the fallback exit record, and no notice.
-        let l = setup("claude", json!(null));
+        let l = committed_spec("claude", json!(null));
         let ran = launch(&l, &spec_str(&l), exits_7);
         assert_eq!(ran.code, 1);
         assert!(ran.started.is_empty());
-        assert_eq!(launcher_json(&l)["exitCode"], 1);
-        assert!(!l.folder.join("notice.json").exists());
+        assert_eq!(launcher_files(&l).record["exitCode"], 1);
+        assert!(!gens::path(&l.folder, 0, "notice").exists());
         assert!(mail(&l).is_empty());
         assert_eq!(
             read_json(&l.folder.join("gens/0.claim")).unwrap(),
             Some(json!("run"))
         );
         // A failure before the claim (malformed spec) writes no record and no notice.
-        let l = setup("claude", json!([]));
+        let l = committed_spec("claude", json!([]));
         std::fs::write(&l.spec, b"{not json").unwrap();
         let ran = launch(&l, &spec_str(&l), exits_7);
         assert_eq!(ran.code, 1);
         assert!(ran.started.is_empty());
-        assert_eq!(
-            ran.err,
-            ["mux-agent: the launcher failed: unexpected error (state file is not JSON)"]
-        );
-        assert!(!l.folder.join("launcher.json").exists());
+        assert!(launcher_files(&l).absent);
         assert!(mail(&l).is_empty());
     }
 
     #[test]
     fn launcher_cmdline_over_32767_with_resolved_client_path_refuses() {
-        let probe = setup("claude", json!([]));
+        let probe = committed_spec("claude", json!([]));
         let exe = probe.bin.join(exe_name("claude"));
         let exe_len = exe.to_str().unwrap().encode_utf16().count();
         let total = |n: usize| {
@@ -1664,9 +1592,9 @@ mod tests {
         };
         let fit = 32767 - total(1) + 1;
         assert_eq!(total(fit), 32767);
-        let l = setup("claude", json!(["x".repeat(fit)]));
+        let l = committed_spec("claude", json!(["x".repeat(fit)]));
         assert_eq!(launch(&l, &spec_str(&l), exits_7).started.len(), 1);
-        let l = setup("claude", json!(["x".repeat(fit + 1)]));
+        let l = committed_spec("claude", json!(["x".repeat(fit + 1)]));
         let ran = launch(&l, &spec_str(&l), exits_7);
         assert_eq!(ran.code, 1);
         assert!(ran.started.is_empty());
@@ -1674,7 +1602,7 @@ mod tests {
             ran.err,
             ["mux-agent: the client command line is too long (32768 characters)"]
         );
-        assert_eq!(launcher_json(&l)["exitCode"], 1);
+        assert_eq!(launcher_files(&l).record["exitCode"], 1);
     }
 
     #[test]
@@ -1688,7 +1616,7 @@ mod tests {
                 "abort",
                 "missing-client",
             ] {
-                let l = setup(
+                let l = committed_spec(
                     "claude",
                     if case == "no-args" {
                         Value::Null
@@ -1697,10 +1625,13 @@ mod tests {
                     },
                 );
                 if case == "timeout" {
-                    std::fs::remove_file(l.folder.join("commit.json")).unwrap();
+                    std::fs::remove_file(gens::path(&l.folder, 0, "commit")).unwrap();
                 }
                 if case == "abort" {
-                    write(&l.folder.join("abort.json"), json!({}));
+                    write(
+                        &gens::path(&l.folder, 0, "commit"),
+                        json!({"aborted": true, "committed": true}),
+                    );
                 }
                 if case == "missing-client" {
                     std::fs::remove_file(l.bin.join(exe_name("claude"))).unwrap();
@@ -1723,15 +1654,15 @@ mod tests {
                         vec![]
                     }
                 );
-                assert_eq!(launcher_json(&l)["exitCode"], code);
+                assert_eq!(launcher_files(&l).record["exitCode"], code);
                 assert_eq!(starts, usize::from(["exit", "start-error"].contains(&case)));
-                assert!(!l.folder.join("notice.json").exists());
+                assert!(!gens::path(&l.folder, 0, "notice").exists());
                 assert!(mail(&l).is_empty());
                 assert_eq!(
                     read_json(&l.folder.join("gens/0.claim")).unwrap(),
                     Some(json!("run"))
                 );
-                let before = std::fs::read(l.folder.join("launcher.json")).unwrap();
+                let before = launcher_files(&l).bytes;
                 assert_eq!(
                     run(
                         &l.w.ctx,
@@ -1741,10 +1672,7 @@ mod tests {
                     ),
                     0
                 );
-                assert_eq!(
-                    std::fs::read(l.folder.join("launcher.json")).unwrap(),
-                    before
-                );
+                assert_eq!(launcher_files(&l).bytes, before);
                 l.w.fakes.hc_done().unwrap();
             }
         }
@@ -1752,7 +1680,7 @@ mod tests {
 
     #[test]
     fn the_launcher_records_its_client_before_it_waits() {
-        let l = setup("claude", json!([]));
+        let l = committed_spec("claude", json!([]));
         l.w.fakes
             .process(crate::testing::row(4300, l.w.ctx.pid, 1600));
         let mut seen = Value::Null;
@@ -1762,7 +1690,7 @@ mod tests {
             &mut |_| {},
             &mut |_, _, _, started| {
                 started(4300);
-                seen = launcher_json(&l)["client"].clone();
+                seen = launcher_files(&l).record["client"].clone();
                 Ok(7)
             },
         );
@@ -1773,7 +1701,7 @@ mod tests {
             "on disk while the client runs"
         );
         assert_eq!(
-            launcher_json(&l)["client"],
+            launcher_files(&l).record["client"],
             json!({"pid": 4300, "start": 1600}),
             "kept after the exit"
         );
@@ -1783,8 +1711,8 @@ mod tests {
     // Generation n of the setup member, pending (launch-1 G1.1): record `lifecycle: 1`, `pending {gen, hcName, sessionId}`;
     // gens/<n>/spec.json (the folder spec plus id, generation, sessionId) and launch.json (G12). No gens/<n>/commit.json:
     // the folder-level commit.json of `setup` must never count.
-    fn gen_setup(n: u64) -> (Launch, PathBuf) {
-        let l = setup("claude", json!(["--session-id", "s1"]));
+    fn gen_setup_of(client: &str, args: Value, n: u64) -> (Launch, PathBuf) {
+        let l = setup(client, args);
         edit(&l.folder.join("record.json"), |r| {
             r["lifecycle"] = json!(1);
             r["pending"] = json!({"gen": n, "kind": "spawn", "hcName": HC, "sessionId": "s1"});
@@ -1802,6 +1730,85 @@ mod tests {
         let launch = json!({"hcName": HC, "launcherArgv": [], "sessionId": "s1"});
         evidence::publish(&gens::path(&l.folder, n, "launch"), &launch).unwrap();
         (l, at)
+    }
+    fn gen_setup(n: u64) -> (Launch, PathBuf) {
+        gen_setup_of("claude", json!(["--session-id", "s1"]), n)
+    }
+    /// PM call 22, placement: `setup(client, args)`'s member as committed generation 0. Its `spec` names
+    /// `gens/0/spec.json`, so a moved test's `spec_str(&l)`, `l.spec` reads and edits all follow it.
+    fn committed_spec(client: &str, args: Value) -> Launch {
+        let (mut l, at) = gen_setup_of(client, args, 0);
+        commit(&l, 0, json!({"committed": true}));
+        l.spec = at;
+        l
+    }
+    /// PM call 22, reading: generation 0's evidence, where a moved test read the folder's.
+    struct Files {
+        /// The folder `launcher.json` the test read: `gens/0/launcher.json`, plus `exit.json`'s `exitCode`, plus
+        /// `exitedAt` when the client exited or `aborted: true` when the launch gave up or was aborted, plus
+        /// `client.json` as `client`. `Null` when none of the three exists.
+        record: Value,
+        /// The raw bytes of `launcher.json`, `exit.json`, `client.json` (each `None` when absent): the test's
+        /// byte-for-byte `launcher.json` comparison.
+        bytes: [Option<Vec<u8>>; 3],
+        /// Checklist 4: none of `launcher.json`, `exit.json`, `client.json` exists, not even as a link (the test's
+        /// "no `launcher.json`" is nonexistence, never a null value).
+        absent: bool,
+        /// Everything under `gens` (links kept as links, never followed) except the spec, launch and commit
+        /// `committed_spec` placed: the test's "no `gens`" is this list empty.
+        made: Vec<PathBuf>,
+    }
+    fn launcher_files(l: &Launch) -> Files {
+        let files = ["launcher", "exit", "client"].map(|f| gens::path(&l.folder, 0, f));
+        let absent = files.iter().all(|p| std::fs::symlink_metadata(p).is_err());
+        let bytes = files.clone().map(|p| std::fs::read(p).ok());
+        let parse = |b: &Option<Vec<u8>>| {
+            b.as_ref()
+                .map(|b| serde_json::from_slice::<Value>(b).unwrap())
+        };
+        let (launcher, exit, client) = (parse(&bytes[0]), parse(&bytes[1]), parse(&bytes[2]));
+        let mut record = launcher.unwrap_or(Value::Null);
+        if let Some(e) = exit {
+            record["exitCode"] = e["exitCode"].clone();
+            match e["reason"].as_str() {
+                Some("exited" | "client-conflict") => record["exitedAt"] = e["exitedAt"].clone(),
+                Some("gave up" | "aborted") => record["aborted"] = json!(true),
+                _ => {}
+            }
+        }
+        if let Some(c) = client {
+            record["client"] = c;
+        }
+        let placed = ["spec", "launch", "commit"].map(|f| gens::path(&l.folder, 0, f));
+        let mut made = Vec::new();
+        under(&l.folder.join("gens"), &mut made);
+        made.retain(|p| !placed.contains(p) && *p != gens::dir(&l.folder, 0));
+        Files {
+            record,
+            bytes,
+            absent,
+            made,
+        }
+    }
+    /// Every path under `dir`, never following a link (a link or file is listed, a real folder listed and entered).
+    fn under(dir: &Path, out: &mut Vec<PathBuf>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for e in entries {
+            let p = e.unwrap().path();
+            let real_dir = std::fs::symlink_metadata(&p).unwrap().is_dir();
+            out.push(p.clone());
+            if real_dir {
+                under(&p, out);
+            }
+        }
+    }
+    /// Call 34: a path in canonical form for a link-target comparison: a drive's `\\?\` prefix dropped (Windows
+    /// `read_link` and `TempDir` may spell the same target with and without it).
+    fn unprefixed(p: &Path) -> PathBuf {
+        let s = p.to_str().unwrap();
+        PathBuf::from(s.strip_prefix(r"\\?\").unwrap_or(s))
     }
     fn edit(at: &Path, change: impl FnOnce(&mut Value)) {
         let mut v = read_json(at).unwrap().unwrap();

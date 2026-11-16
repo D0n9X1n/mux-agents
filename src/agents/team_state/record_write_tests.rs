@@ -73,7 +73,7 @@ fn p(n: u64, name: &str) -> Option<Value> {
 fn pre(pending: bool) -> Value {
     let mut r = json!({"id": ID, "name": "worker", "completing": {"gen": 0}});
     if pending {
-        r["pending"] = json!({"gen": 1, "hcName": "m1"});
+        r["pending"] = json!({"gen": 1, "hcName": "m00000001"});
     }
     r
 }
@@ -89,7 +89,7 @@ type Row = (&'static str, Guard<'static>, Option<Value>, &'static str);
 fn rows() -> Vec<Row> {
     let own = Guard::Pending {
         n: 1,
-        hc_name: "m1",
+        hc_name: "m00000001",
     };
     let none = Guard::PendingGen { n: None };
     let one = Guard::PendingGen { n: Some(1) };
@@ -103,23 +103,28 @@ fn rows() -> Vec<Row> {
             "refused",
         ),
         ("pending, no record", own, None, "refused"),
-        ("pending, owned", own, Some(life(p(1, "m1"), None)), "wrote"),
+        (
+            "pending, owned",
+            own,
+            Some(life(p(1, "m00000001"), None)),
+            "wrote",
+        ),
         (
             "pending, another generation",
             own,
-            Some(life(p(2, "m1"), None)),
+            Some(life(p(2, "m00000001"), None)),
             "refused",
         ),
         (
             "pending, another name",
             own,
-            Some(life(p(1, "m2"), None)),
+            Some(life(p(1, "m00000002"), None)),
             "refused",
         ),
         (
             "pending, no gen",
             own,
-            Some(life(Some(json!({"hcName": "m1"})), None)),
+            Some(life(Some(json!({"hcName": "m00000001"})), None)),
             "refused",
         ),
         (
@@ -138,7 +143,7 @@ fn rows() -> Vec<Row> {
         (
             "pending gen none, a pending",
             none,
-            Some(life(p(1, "m1"), None)),
+            Some(life(p(1, "m00000001"), None)),
             "refused",
         ),
         (
@@ -157,13 +162,13 @@ fn rows() -> Vec<Row> {
         (
             "pending gen, owned",
             one,
-            Some(life(p(1, "m9"), None)),
+            Some(life(p(1, "m00000009"), None)),
             "wrote",
         ),
         (
             "pending gen, another generation",
             one,
-            Some(life(p(2, "m1"), None)),
+            Some(life(p(2, "m00000001"), None)),
             "refused",
         ),
         (
@@ -206,7 +211,7 @@ fn rows() -> Vec<Row> {
         (
             "pending, another id",
             own,
-            Some(other(life(p(1, "m1"), None))),
+            Some(other(life(p(1, "m00000001"), None))),
             "refused",
         ),
         (
@@ -218,7 +223,7 @@ fn rows() -> Vec<Row> {
         (
             "pending gen, another id",
             one,
-            Some(other(life(p(1, "m9"), None))),
+            Some(other(life(p(1, "m00000009"), None))),
             "refused",
         ),
         (
@@ -279,9 +284,9 @@ fn a_link_at_the_member_folder_refuses_every_guard() {
             "pending",
             Guard::Pending {
                 n: 1,
-                hc_name: "m1",
+                hc_name: "m00000001",
             },
-            Some(life(p(1, "m1"), None)),
+            Some(life(p(1, "m00000001"), None)),
         ),
         (
             "pending gen none",
@@ -291,7 +296,7 @@ fn a_link_at_the_member_folder_refuses_every_guard() {
         (
             "pending gen",
             Guard::PendingGen { n: Some(1) },
-            Some(life(p(1, "m1"), None)),
+            Some(life(p(1, "m00000001"), None)),
         ),
         (
             "completing",
@@ -324,12 +329,12 @@ fn a_link_at_the_member_folder_refuses_every_guard() {
 #[test]
 fn a_write_reads_the_record_exactly_once() {
     let w = world();
-    plant(&w, life(p(1, "m1"), None).to_string().as_bytes());
+    plant(&w, life(p(1, "m00000001"), None).to_string().as_bytes());
     let s = Scope::of(&w.caller());
     let f = w.folder(ID);
     let own = Guard::Pending {
         n: 1,
-        hc_name: "m1",
+        hc_name: "m00000001",
     };
     let (got, reads) = open(&w.ctx, &s, |tx| {
         Ok(crate::state::fs::record_reads(|| {
@@ -347,8 +352,8 @@ fn a_write_reads_the_record_exactly_once() {
 fn the_guard_reads_inside_the_member_lock() {
     let w = world();
     let f = w.folder(ID);
-    plant(&w, life(p(1, "m1"), None).to_string().as_bytes());
-    let theirs = life(p(1, "m2"), None);
+    plant(&w, life(p(1, "m00000001"), None).to_string().as_bytes());
+    let theirs = life(p(1, "m00000002"), None);
     let key = format!("+{}", Scope::of(&w.caller()).member_lock(ID));
     let (at, body) = (f.join("record.json"), theirs.to_string());
     w.fakes.lock_probe(move |event| {
@@ -361,7 +366,7 @@ fn the_guard_reads_inside_the_member_lock() {
         &w,
         Guard::Pending {
             n: 1,
-            hc_name: "m1",
+            hc_name: "m00000001",
         },
     );
     assert_eq!(outcome(&got), "refused", "{got:?}");
@@ -384,7 +389,7 @@ fn every_flush_alone_fails_one_row() {
         let f = w.folder(ID);
         let create = at == "agents";
         if !create {
-            plant(&w, life(p(1, "m1"), None).to_string().as_bytes());
+            plant(&w, life(p(1, "m00000001"), None).to_string().as_bytes());
         }
         let record = f.join("record.json");
         let before = std::fs::read(&record).ok();
@@ -398,7 +403,7 @@ fn every_flush_alone_fails_one_row() {
         } else {
             Guard::Pending {
                 n: 1,
-                hc_name: "m1",
+                hc_name: "m00000001",
             }
         };
         let got = write(&w, guard);
@@ -418,7 +423,7 @@ fn a_patch_error_writes_nothing() {
     for create in [false, true] {
         let w = world();
         if !create {
-            plant(&w, life(p(1, "m1"), None).to_string().as_bytes());
+            plant(&w, life(p(1, "m00000001"), None).to_string().as_bytes());
         }
         let f = w.folder(ID);
         let before = std::fs::read(f.join("record.json")).ok();
@@ -427,7 +432,7 @@ fn a_patch_error_writes_nothing() {
         } else {
             Guard::Pending {
                 n: 1,
-                hc_name: "m1",
+                hc_name: "m00000001",
             }
         };
         let s = Scope::of(&w.caller());
@@ -457,14 +462,14 @@ fn a_patch_error_writes_nothing() {
 #[test]
 fn the_member_lock_is_taken_inside_the_team_lock() {
     let w = world();
-    plant(&w, life(p(1, "m1"), None).to_string().as_bytes());
+    plant(&w, life(p(1, "m00000001"), None).to_string().as_bytes());
     let s = Scope::of(&w.caller());
     let before = w.fakes.locks().len();
     let got = write(
         &w,
         Guard::Pending {
             n: 1,
-            hc_name: "m1",
+            hc_name: "m00000001",
         },
     );
     assert_eq!(outcome(&got), "wrote", "{got:?}");
@@ -479,5 +484,29 @@ fn the_member_lock_is_taken_inside_the_team_lock() {
         w.fakes.locks()[before..],
         want,
         "the member lock nests inside the team lock"
+    );
+}
+
+// a3c call 47: ownership needs a valid id on both sides and, for `Pending`, a valid hc name on both sides. An empty
+// id or hcName in the record and in the guard never admits.
+#[test]
+fn an_empty_identity_is_never_admitted() {
+    let empty_id = json!({"lifecycle": 1, "id": "", "pending": {"gen": 1, "hcName": "m00000001"}});
+    assert!(
+        !Guard::PendingGen { n: Some(1) }.admits("", Some(&empty_id)),
+        "empty id"
+    );
+    let mut r = json!({"lifecycle": 1, "id": ID, "pending": {"gen": 1, "hcName": ""}});
+    assert!(
+        !Guard::Pending { n: 1, hc_name: "" }.admits(ID, Some(&r)),
+        "empty hcName"
+    );
+    r["pending"]["hcName"] = json!("m00000001");
+    assert!(
+        Guard::Pending {
+            n: 1,
+            hc_name: "m00000001"
+        }
+        .admits(ID, Some(&r))
     );
 }

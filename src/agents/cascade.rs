@@ -350,9 +350,7 @@ pub use journal::{
 };
 
 #[cfg(test)]
-#[path = "cascade_tests.rs"]
 mod tests;
 
 #[cfg(test)]
-#[path = "cascade_crash_tests.rs"]
 mod crash;

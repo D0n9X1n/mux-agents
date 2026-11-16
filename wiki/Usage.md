@@ -48,6 +48,7 @@ You rarely type these: the skill runs them for you. Every command is `<plugin>/s
 | `focus` | `focus claude-1`, `focus -Next` | switch the multiplexer to an agent's pane; `-Next` / `-Prev` step through the bar's order |
 | `stop` | `stop claude-1` | close an agent's pane and its processes; an agent that already ended answers `ok` with `already` (`exited`, `stopped` or `lost`) |
 | `sidebar` | `sidebar`, `sidebar -Close` | reopen the side-bar split, or close it for the rest of the session |
+| `kept` | `kept`, `kept -Close t7` | list the team's kept shells (an agent's old terminal left open after `restore`); `-Close <address>` closes one; a person's command, refused in an agent pane |
 | `version` | `version`, `--version` | the binary's version, to tell which one a pane runs; works outside a multiplexer |
 
 Exit code 0 means ok, 1 an error and 2 a refusal or usage error; on failure, `check` names the cause.
@@ -104,6 +105,10 @@ In a team's bar (a session `up` started), `n`/`N` select the next or previous ag
 
 A reopened view (`resume`, `focus` after an agent's view was closed, or `sidebar` from a person pane) opens in the caller's window, with a bar beside it, not in the team's leader window: every agent view has a bar.
 
+## Kept shells
+
+When `restore` or `up` brings an agent back after its terminal was lost, the agent runs in a new terminal, and its old terminal stays open as a plain shell; its old pane keeps showing it. `restore` and `up` open no view of the new terminal: `focus <name>` opens one. The side bar lists these under `kept shells`, above the agents: select one with `j`/`k`, press Enter, and answer `y` to close it (any other key keeps it). From a pane in the team's session, `kept` lists them and `kept -Close <address>` closes one; a shell is closed only while hc still shows it open and kept by this team. A closed shell never comes back, and `stop` and `restore` never close one.
+
 ## Safety checks
 
 Agents start with permission prompts off, so mux-agents never gives an agent more than its caller already has. A `spawn` is refused, naming the check, unless:
@@ -148,6 +153,8 @@ Refresh the marketplace first: Claude Code's plugin update reads the catalog it 
 Why: each agent pane and the side bar run the binary by the absolute path they started with, so they keep the old version until restarted. From 0.1 the order matters most: the 0.1 named mutex and the 0.2 lock files do not serialize, so a 0.1 pane and a 0.2 command must never run at the same time. Within 0.2.x the state folder, the record, mail and lock file formats stay the same.
 
 Claude Code turns background auto-update off by default for a third-party marketplace such as this one. To turn it on, open `/plugin`, go to **Marketplaces**, select `mux-agents` and select **Enable auto-update**. Claude Code then, within ten minutes of your first message in a session, refreshes the marketplace and updates the plugin on disk; panes already running keep their binary until you restart them.
+
+From 0.2 to 0.3: an agent pane started by 0.2 and not yet running refuses to launch ("started by an older mux-agent"). Run `stop <name>` to end it, or `resume <name>` to start it again.
 
 ## Troubleshooting
 

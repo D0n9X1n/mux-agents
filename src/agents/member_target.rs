@@ -129,5 +129,4 @@ pub(crate) fn current(ctx: &Ctx, caller: &Caller, id: &Identity) -> Res<Value> {
 }
 
 #[cfg(test)]
-#[path = "member_target_tests.rs"]
 mod tests;

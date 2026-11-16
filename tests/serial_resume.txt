@@ -1,3 +1,12 @@
 # occupy-3 (call 19): live tests that run `resume`, run alone in CI (one name per line).
+a_stopped_member_resumes_with_its_stored_options_only
+stop_then_resume_returns_with_its_conversation
+an_unacked_batch_is_served_again_and_rebuilt_for_a_successor
+a_copilot_member_reports_done_then_listens_on_call
+hc_stop_then_resume_returns_with_its_conversation
+hc_stopped_member_resumes_with_its_stored_options_only
+an_unreadable_claude_exe_blocks_resume
+a_managed_copilot_resumed_into_a_conversation_holds_it
+a_managed_member_resumed_into_a_conversation_holds_it
 # cascade-3d Task 12: restarts the private core mid-test; run alone.
 a_cascade_stop_ends_b_before_a_and_a_second_stop_finishes
