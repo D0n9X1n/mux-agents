@@ -75,3 +75,26 @@ test('an odd source is reported as unknown', async ($, on) => {
   expect(seen.argv).toEqual([['sh', `${seen.root}/scripts/mux-agent`, 'report', '-Session', SID, '-Source', 'unknown', '-Quiet']])
 })
 
+
+// r2b call 25 (QA #143): session reports are delivered in order. The first report's HC_TERMINAL_ID lookup is held;
+// a second SessionStart (a /clear) comes meanwhile. The second report must wait for the first, so an earlier session
+// can never finish after a later one and overwrite its entry; SessionStart still waits for neither.
+test('a later session report waits for an earlier one whose lookup is held', async ($, on) => {
+  const SID2 = '1e22fc2f-2032-48ef-a920-4af2a8e5af51'
+  const seen = { argv: [] as string[][] }
+  const clock = mock.clock(on)
+  let lookups = 0
+  on('env.get', async (_: unknown, e: { name: string }) => {
+    if (e.name === 'HC_TERMINAL_ID' && lookups++ === 0) await clock.sleep(60000)
+    return { value: e.name === 'HC_TERMINAL_ID' ? 't1' : undefined }
+  })
+  on('classic.SessionStart', () => ({}))
+  on('process.run', async (_: unknown, e: { argv: string[] }) => { seen.argv.push([...e.argv]); return ran })
+  await ($ as any).classic.SessionStart({ source: 'startup', session_id: SID })
+  await ($ as any).classic.SessionStart({ source: 'clear', session_id: SID2 })
+  await clock.settle()
+  expect(seen.argv).toEqual([])
+  await clock.advance(60000)
+  await clock.settle()
+  expect(seen.argv.map(a => [a[4], a[6]])).toEqual([[SID, 'startup'], [SID2, 'clear']])
+})

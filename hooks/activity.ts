@@ -61,15 +61,20 @@ function report($: EngineInterface, state: State, kind?: string) {
 const SESSION_ID = /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/
 const SOURCE = /^[a-z]{1,32}$/
 
+// Per module load: the session reports in the order their SessionStarts came (r2b call 25), apart from the activity
+// queue, so an earlier session's report never lands after a later one's.
+let sessions: Promise<void> = Promise.resolve()
+
 // report-2b K3: this client's session, from classic.SessionStart, where a managed client can run (inMux: an hc
-// terminal, tmux or rmux). Not awaited, not queued behind the activity reports; every failure is dropped.
+// terminal, tmux or rmux). Queued after the earlier session reports, never awaited, not behind the activity reports;
+// every failure is dropped.
 export function reportSession($: EngineInterface, sessionId: unknown, source: unknown) {
   if (typeof sessionId !== 'string' || !SESSION_ID.test(sessionId)) return
   const word = typeof source === 'string' && SOURCE.test(source) ? source : 'unknown'
-  void (async () => {
+  sessions = sessions.then(async () => {
     if (!(await inMux($))) return
     await $.process.run(await entryArgv($, ['report', '-Session', sessionId, '-Source', word, '-Quiet']), { timeoutMs: 30000 })
-  })().catch(() => {})
+  }).catch(() => {})
 }
 
 // The main loop only: a subagent's turns and tools (agentId) are not this agent's own.
