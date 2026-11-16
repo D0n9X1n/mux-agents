@@ -880,6 +880,11 @@ const TEST_ONLY: &[(&str, &str, &str)] = &[
         "src/caller_hc_tests.rs",
         "k2_tests",
     ),
+    (
+        "src/caller_hc_tests/stop_tests.rs",
+        "src/caller_hc_tests.rs",
+        "stop_tests",
+    ),
     ("src/sidebar/hc_tests.rs", "src/sidebar.rs", "hc_tests"),
     ("src/testing.rs", "src/lib.rs", "testing"),
 ];

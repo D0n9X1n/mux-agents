@@ -752,11 +752,27 @@ impl Drop for Waiting<'_> {
 
 const POLL: Duration = Duration::from_millis(500);
 
-/// Refuses an agent caller that is not the record's parent.
+/// Refuses an agent caller that is not the record's parent (outside a team). An hc member's authority is its proven
+/// member identity matched against the record's parent member (`parentAgent.id`), never a pane: its pane is its view,
+/// empty when views are down (a3c call 42). A pane caller is the parent when its own pane is the record's
+/// `parentPane`; an empty pane matches nothing.
 fn parent_or_human(caller: &crate::caller::Caller, record: &Value) -> Res<()> {
-    if caller.kind == Kind::Agent
-        && record.get("parentPane").and_then(Value::as_str) != Some(caller.pane.as_str())
-    {
+    let parent = match &caller.member {
+        Some(member) => {
+            record
+                .get("parentAgent")
+                .and_then(|p| p.get("id"))
+                .and_then(Value::as_str)
+                == Some(member.as_str())
+        }
+        None => {
+            caller.kind != Kind::Agent
+                || (!caller.pane.is_empty()
+                    && record.get("parentPane").and_then(Value::as_str)
+                        == Some(caller.pane.as_str()))
+        }
+    };
+    if !parent {
         return refuse(
             2,
             "parent",
@@ -3079,5 +3095,23 @@ mod tests {
             (&line["from"], &line["fromId"]),
             (&json!("worker"), &json!(ID))
         );
+    }
+
+    // a3c call 42: outside a team a pane caller is the parent only by its own, non-empty pane; an empty pane matches
+    // nothing, not even an empty `parentPane`. A person needs no parent.
+    #[test]
+    fn an_empty_pane_is_nobodys_parent() {
+        let w = crate::agents::fixture::World::agent("");
+        let mut caller = w.caller();
+        assert!(caller.member.is_none(), "a pane caller");
+        let check = |c: &crate::caller::Caller, pane: &str| {
+            parent_or_human(c, &json!({"parentPane": pane})).map_err(|e| (e.code, e.check))
+        };
+        assert_eq!(check(&caller, "%1"), Ok(()), "its own pane");
+        assert_eq!(check(&caller, "%8"), Err((2, "parent")), "another pane");
+        caller.pane = String::new();
+        assert_eq!(check(&caller, ""), Err((2, "parent")), "an empty pane");
+        caller.kind = crate::caller::Kind::Human;
+        assert_eq!(check(&caller, "%8"), Ok(()), "a person");
     }
 }

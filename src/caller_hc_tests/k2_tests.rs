@@ -3,7 +3,7 @@
 use super::*;
 
 /// Kills the multiplexer server of the member in `folder` in the fake process table (its pid from server.json).
-fn kill_server(w: &World, folder: &std::path::Path) {
+pub(super) fn kill_server(w: &World, folder: &std::path::Path) {
     let at = folder
         .parent()
         .unwrap()

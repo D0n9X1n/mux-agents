@@ -9,6 +9,8 @@ use crate::{
 use serde_json::{Value, json};
 #[cfg(test)]
 mod k2_tests;
+#[cfg(test)]
+mod stop_tests;
 fn worker() -> (World, caller::Caller, Value, std::path::PathBuf) {
     let mut w = World::agent("");
     let c = w.caller();
