@@ -125,11 +125,42 @@ pub fn add_once(
     id: &str,
     fields: &Map<String, Value>,
 ) -> Res<Option<Value>> {
+    once(ctx, caller, key, from, from_pane, body, id, fields, false)
+}
+
+/// `add_once`, the mailbox file and folder flushed before it returns, on every call (cascade-3d call 9): a lifecycle
+/// notice's message is durable before its marker is published.
+#[allow(clippy::too_many_arguments)]
+pub fn add_once_durable(
+    ctx: &Ctx,
+    caller: &Caller,
+    key: &str,
+    from: &str,
+    from_pane: &str,
+    body: &str,
+    id: &str,
+    fields: &Map<String, Value>,
+) -> Res<Option<Value>> {
+    once(ctx, caller, key, from, from_pane, body, id, fields, true)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn once(
+    ctx: &Ctx,
+    caller: &Caller,
+    key: &str,
+    from: &str,
+    from_pane: &str,
+    body: &str,
+    id: &str,
+    fields: &Map<String, Value>,
+    durable: bool,
+) -> Res<Option<Value>> {
     let mut message = json!({"id": id, "from": from, "pane": from_pane, "at": crate::util::utc_o(ctx.clock.now()), "body": body});
     if let Some(object) = message.as_object_mut() {
         object.extend(fields.iter().map(|(k, v)| (k.clone(), v.clone())));
     }
-    append_message(ctx, caller, key, &message, Some(id), false)
+    append_message(ctx, caller, key, &message, Some(id), durable)
 }
 
 /// The append of `add_mail` and `add_once`, under the mailbox lock: seals a torn last line, then adds `message`

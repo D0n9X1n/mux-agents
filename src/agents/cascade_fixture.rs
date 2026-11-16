@@ -192,3 +192,26 @@ pub fn kills(w: &World, id: &str) -> usize {
         .filter(|c| c[0] == "kill" && c[1] == addr(id))
         .count()
 }
+/// The match, then a reread showing `now` (b-calls 12): no kill follows unless `now` is the same terminal.
+pub fn rereads(w: &World, id: &str, now: &Value) {
+    found_at(w, id, 1, &wire(w, id, "live", None, &lf::ARGV));
+    lf::get(w, &addr(id), now);
+}
+/// A Lost terminal (`argv`, a recovery shell): release-1d R2 in fence mode, the calls B1's release makes.
+pub fn releases(w: &World, id: &str, argv: &[&str]) {
+    let lost = wire(w, id, "live", None, argv);
+    found_at(w, id, 1, &lost);
+    lf::get(w, &addr(id), &lost);
+    lf::relabel(w, &addr(id));
+}
+/// Generation 1 of `id` ended and noticed before the test.
+pub fn done(w: &World, id: &str) {
+    let m = w.folder(id);
+    crate::state::evidence::publish(&super::gens::path(&m, 1, "ended"), &json!({"at": "x"}))
+        .unwrap();
+    crate::state::evidence::publish(
+        &super::gens::path(&m, 1, "notice"),
+        &json!({"kind": "stopped"}),
+    )
+    .unwrap();
+}

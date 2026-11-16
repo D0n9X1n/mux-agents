@@ -760,8 +760,9 @@ fn hold(j: &Journal, id: &str, held: &mut Vec<String>) {
 }
 
 /// C6 for one entry. p1c call 19 (checklist 26): the record is read once; a pre-lifecycle entry is unresolved
-/// `prelife` before any write or hc call. Every listed, named, active or pending generation, ascending, through
-/// `terminate` (C-R1; the first unresolved one stops the entry); then the record is read once more (the
+/// `prelife` before any write or hc call. Every listed, named, active or pending generation, newest first, through
+/// `terminate` (C-R1; ambiguity 4: the first unresolved one stops the entry, so an unresolved pending launch keeps
+/// the older generation running); then the record is read once more (the
 /// terminations changed it, C-R2) and the Stopped notice of the highest generation is posted (message, then
 /// marker; a delivered message without its marker is retried with the same id).
 fn end_entry(tx: &Tx<'_>, caller: &Caller, e: &Entry) -> Res<()> {
@@ -784,7 +785,7 @@ fn end_entry(tx: &Tx<'_>, caller: &Caller, e: &Entry) -> Res<()> {
     all.extend(gens::pending(&r));
     all.sort_unstable();
     all.dedup();
-    for n in &all {
+    for n in all.iter().rev() {
         gens::terminate(tx, &e.id, *n)?;
     }
     let Some(&last) = all.last() else {

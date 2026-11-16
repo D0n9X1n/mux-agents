@@ -1,5 +1,6 @@
 use super::*;
 use crate::agents::cascade_fixture::{self as cx, A, B, C, D, L, S};
+use crate::agents::core_fixture as cf;
 use crate::agents::fixture::{ID, World};
 use crate::agents::gens;
 use crate::agents::life_fixture as lf;
@@ -945,4 +946,354 @@ fn finish_clears_a_tombstone_a_cut_short_removal_left() {
     assert!(waiting(&w.ctx, &s));
     assert!(finish(&cx::tx(&w, &s), &caller(&w)).unwrap().is_empty());
     assert!(!f.with_extension("removed").exists() && !waiting(&w.ctx, &s));
+}
+
+/// (halt step, C ended and noticed before the test, members whose whole end runs before the halt, the member whose
+/// kill is cut short at `kill`: matched and reread, `kill.json` published, no kill sent; b-calls 54).
+type Row = (String, bool, Vec<&'static str>, Option<&'static str>);
+
+fn rows() -> Vec<Row> {
+    let mut v: Vec<Row> = vec![("cascade-journal".into(), false, vec![], None)];
+    for id in [C, B, A] {
+        v.push((format!("cascade-desired-{id}"), false, vec![], None));
+    }
+    v.push(("cascade-prepared".into(), false, vec![], None));
+    for (first, done) in [(C, false), (B, true)] {
+        v.push(("kill".into(), done, vec![], Some(first)));
+        for step in ["ended", "delivered"] {
+            v.push((step.into(), done, vec![first], None));
+        }
+        v.push((format!("cascade-noticed-{first}"), done, vec![first], None));
+    }
+    v.push((format!("cascade-noticed-{A}"), false, vec![C, B, A], None));
+    v.push(("cascade-tombstoned".into(), false, vec![C, B, A], None));
+    v.push(("cascade-removed".into(), false, vec![C, B, A], None));
+    v
+}
+
+// C5, C6, C7, spec "Crash after each prepare write" and "Execute crash boundaries": stopped after each durable
+// step, B stays closed; the next pass finishes: every entry stopped, one end, one delivery, one marker, no
+// second kill (b-calls 54: at `kill` only `kill.json` exists, so the replay kills once), the journal removed only
+// after every marker.
+#[test]
+fn a_crash_after_each_durable_step_is_finished_by_the_next_pass() {
+    for (step, c_done, first, cut) in rows() {
+        let (w, s) = lf::world();
+        cx::chain(&w);
+        if c_done {
+            cx::done(&w, C);
+        }
+        first.iter().for_each(|id| cx::terminates(&w, id));
+        if let Some(id) = cut {
+            cx::rereads(&w, id, &cx::wire(&w, id, "live", None, &lf::ARGV));
+        }
+        let (tx, c) = (cx::tx(&w, &s), w.caller());
+        cx::at(&step);
+        let e = stop(&tx, &c, A, &[]).unwrap_err();
+        assert_eq!(e.check, "halted", "{step}");
+        let gone = ["cascade-tombstoned", "cascade-removed"].contains(&step.as_str());
+        assert_eq!(
+            cx::journal_of(&w, A).exists(),
+            !gone,
+            "{step}: removed last"
+        );
+        let js = journals(&tx).unwrap();
+        let t = Tree::read(&tx).unwrap();
+        let closed = t.closed_by(B, &|x| js.iter().any(|j| j.lists(x)));
+        assert!(closed.unwrap().is_some(), "{step}: B closed");
+        w.fakes.hc_done().unwrap();
+        for id in [C, B, A] {
+            let ended = gens::read(&w.folder(id), 1, "ended").known().unwrap();
+            if ended.is_none() {
+                cx::terminates(&w, id);
+            }
+        }
+        let kept = finish(&tx, &c).unwrap();
+        assert!(stop(&tx, &c, A, &kept).unwrap().stopped, "{step}");
+        for id in [C, B, A] {
+            assert!(cx::stopped(&w, id), "{step}: {id}");
+            let marker = gens::read(&w.folder(id), 1, "notice").known().unwrap();
+            assert!(marker.is_some(), "{step}: {id} marker");
+            let want = usize::from(!(c_done && id == C));
+            let got = (cx::kills(&w, id), cx::delivered(&w, id));
+            assert_eq!(got, (want, want), "{step}: {id} once");
+        }
+        assert!(
+            !cx::journal_of(&w, A).exists() && !waiting(&w.ctx, &s),
+            "{step}"
+        );
+        w.fakes.hc_done().unwrap();
+    }
+}
+
+// Spec "Unresolved pending": L -> A -> B; B's pending generation 2 at G3 row 1 (torn launch.json), then at
+// unresolved row 6 (committed; hc finds no terminal and no kill was recorded). stop A: both stopped before any kill;
+// A not killed; journal kept; the reply lists B. Once B settles, the next pass ends B's older generation, then A,
+// and removes the journal.
+#[test]
+fn an_unresolved_pending_launch_keeps_its_ancestors_running() {
+    for row in ["row 1", "row 6"] {
+        let (w, s) = lf::world();
+        cx::member(&w, L, None, 0, json!({}));
+        cx::member(&w, A, Some(L), 1, json!({}));
+        let b = cx::member(&w, B, Some(A), 2, json!({"pending": lf::pending(2)}));
+        if row == "row 1" {
+            std::fs::create_dir_all(gens::dir(&b, 2)).unwrap();
+            std::fs::write(gens::path(&b, 2, "launch"), b"{\"hc").unwrap();
+        } else {
+            lf::seed_gen(&b, 2, Some("run"), lf::committed());
+            cf::online(&w);
+            let label = format!("mux.id={B}");
+            let argv = [
+                "ls",
+                "--all",
+                "--label",
+                label.as_str(),
+                "--label",
+                "mux.gen=2",
+                "--json",
+            ];
+            cf::answer(&w, &argv, r#"{"terminals":[]}"#);
+        }
+        let (tx, c) = (cx::tx(&w, &s), w.caller());
+        let r = stop(&tx, &c, A, &[]).unwrap();
+        let both = cx::stopped(&w, A) && cx::stopped(&w, B);
+        assert!(!r.stopped && both, "{row}: both stopped");
+        let want = if row == "row 1" { "evidence" } else { "hc" };
+        let got: Vec<(&str, &str)> = (r.unresolved.iter())
+            .map(|u| (u.name.as_str(), u.check))
+            .collect();
+        assert_eq!(got, [("w-b", want)], "{row}");
+        assert_eq!(
+            lf::count(&w, "kill"),
+            0,
+            "{row}: neither A nor B's generation 1 killed"
+        );
+        assert!(cx::journal_of(&w, A).exists(), "{row}");
+        w.fakes.hc_done().unwrap();
+        if row == "row 1" {
+            std::fs::remove_file(gens::path(&b, 2, "launch")).unwrap();
+            lf::seed_gen(&b, 2, None, None); // G3 row 3 next: abandoned, no hc
+        } else {
+            let end = json!({"at": "x"});
+            crate::state::evidence::publish(&gens::path(&b, 2, "ended"), &end).unwrap();
+        }
+        cx::terminates(&w, B);
+        cx::terminates(&w, A);
+        assert!(finish(&tx, &c).unwrap()[0].stopped, "{row}");
+        assert_eq!(
+            kill_order(&w),
+            [cx::addr(B), cx::addr(A)],
+            "{row}: B, then A"
+        );
+        let notices = (cx::delivered_at(&w, B, 2), cx::delivered(&w, A));
+        assert_eq!(notices, (1, 1), "{row}");
+        w.fakes.hc_done().unwrap();
+    }
+}
+
+// Spec "Revalidate before kill" (G11.3): the terminal turns Lost or changes argv between the match and the kill:
+// no kill, unresolved, the journal kept; the Lost one is released by the next pass, still with no kill.
+#[test]
+fn a_terminal_changed_before_the_kill_is_never_killed() {
+    for case in ["lost", "argv"] {
+        let (w, s) = lf::world();
+        cx::member(&w, L, None, 0, json!({}));
+        cx::member(&w, A, Some(L), 1, json!({}));
+        let argv: &[&str] = if case == "lost" {
+            lf::LOST_ARGVS[0]
+        } else {
+            &["/bin/other"]
+        };
+        cx::rereads(&w, A, &cx::wire(&w, A, "live", None, argv));
+        let (tx, c) = (cx::tx(&w, &s), w.caller());
+        let r = stop(&tx, &c, A, &[]).unwrap();
+        assert!(!r.stopped && r.unresolved[0].check == "hc", "{case}: {r:?}");
+        assert_eq!(lf::count(&w, "kill"), 0, "{case}");
+        assert!(cx::journal_of(&w, A).exists(), "{case}");
+        w.fakes.hc_done().unwrap();
+        if case == "lost" {
+            cx::releases(&w, A, lf::LOST_ARGVS[0]);
+            assert!(finish(&tx, &c).unwrap()[0].stopped);
+            assert_eq!(lf::count(&w, "kill"), 0, "released, never killed");
+            w.fakes.hc_done().unwrap();
+        }
+    }
+}
+
+// Spec "Released shell": A released (release-1d R1); stop A, then the team (L): both finish; the shell is never
+// asked of or touched.
+#[test]
+fn a_released_shell_is_never_touched() {
+    let (w, s) = lf::world();
+    cx::member(&w, L, None, 0, json!({}));
+    let a = cx::member(&w, A, Some(L), 1, json!({}));
+    let rel =
+        json!({"address": cx::addr(A), "hcName": lf::hc_name(1), "cause": "recovery", "at": "x"});
+    crate::state::evidence::publish(&gens::path(&a, 1, "release"), &rel).unwrap();
+    crate::state::evidence::publish(&gens::path(&a, 1, "released"), &json!({"at": "x"})).unwrap();
+    let (tx, c) = (cx::tx(&w, &s), w.caller());
+    assert!(stop(&tx, &c, A, &[]).unwrap().stopped, "stop A");
+    cx::terminates(&w, L);
+    assert!(stop(&tx, &c, L, &[]).unwrap().stopped, "stop the team");
+    let touched = lf::calls(&w).iter().any(|call| call.contains(&cx::addr(A)));
+    assert!(!touched, "the shell untouched");
+    assert_eq!(cx::delivered(&w, A), 1);
+    w.fakes.hc_done().unwrap();
+}
+
+// Spec "Lost stop" (release-1d R2, b-calls 2): A is Lost; stop A releases it (`cause: lost`), sends no kill, send
+// or keys; the cascade completes. Both recovery shells (POSIX and Windows argv) on every OS.
+#[test]
+fn a_lost_member_is_released_never_killed() {
+    for argv in lf::LOST_ARGVS {
+        let (w, s) = lf::world();
+        cx::member(&w, L, None, 0, json!({}));
+        let a = cx::member(&w, A, Some(L), 1, json!({}));
+        cx::releases(&w, A, argv);
+        let (tx, c) = (cx::tx(&w, &s), w.caller());
+        assert!(stop(&tx, &c, A, &[]).unwrap().stopped, "{argv:?}");
+        let rel = gens::read(&a, 1, "release").known().unwrap().unwrap();
+        assert_eq!(rel["cause"], "lost", "{argv:?}");
+        assert!(
+            gens::read(&a, 1, "released").known().unwrap().is_some(),
+            "{argv:?}"
+        );
+        lf::no_effect(&w);
+        assert_eq!(cx::delivered(&w, A), 1, "{argv:?}");
+        w.fakes.hc_done().unwrap();
+    }
+}
+
+// Call 9: a notice's message is flushed before its marker. The mailbox flush fails: the entry is unresolved,
+// its end recorded, no marker; once the flush lands the next pass posts it, one delivery.
+#[test]
+fn a_notice_marker_never_outlives_its_message() {
+    let (w, s) = lf::world();
+    cx::member(&w, L, None, 0, json!({}));
+    let a = cx::member(&w, A, Some(L), 1, json!({}));
+    cx::terminates(&w, A);
+    let key = crate::agents::mail::mailbox_key(cx::PANE, "").unwrap();
+    let mailbox = w.state().join("mail").join(format!("{key}.jsonl"));
+    let (tx, c) = (cx::tx(&w, &s), w.caller());
+    crate::state::fs::fail_sync_file(Some(&mailbox));
+    let r = stop(&tx, &c, A, &[]);
+    crate::state::fs::fail_sync_file(None);
+    assert!(!r.unwrap().stopped, "the delivery refused");
+    assert!(
+        gens::read(&a, 1, "ended").known().unwrap().is_some(),
+        "the end is recorded"
+    );
+    let marker = gens::read(&a, 1, "notice").known().unwrap();
+    assert!(marker.is_none(), "no marker without a flushed message");
+    assert!(finish(&tx, &c).unwrap()[0].stopped);
+    assert!(gens::read(&a, 1, "notice").known().unwrap().is_some());
+    assert_eq!(cx::delivered(&w, A), 1, "one delivery");
+    w.fakes.hc_done().unwrap();
+}
+
+// Call 22 (checklist 6): a marker already there still completes its publication's flushes before the entry counts
+// as noticed. A's newest generation 2 is void (claim `abandoned`) and already has its marker; `gens/2` cannot be
+// flushed: the entry is unresolved and the journal kept; with the fault armed the retry still refuses; cleared,
+// the next pass completes once (no delivery: the marker decided).
+#[test]
+fn a_marker_already_there_is_flushed_before_it_counts() {
+    let (w, s) = lf::world();
+    cx::member(&w, L, None, 0, json!({}));
+    let a = cx::member(&w, A, Some(L), 1, json!({}));
+    cx::done(&w, A);
+    lf::seed_gen(&a, 2, Some("abandoned"), None);
+    let marker = json!({"kind": "stopped", "exitCode": null, "at": "x"});
+    crate::state::evidence::publish(&gens::path(&a, 2, "notice"), &marker).unwrap();
+    let (tx, c) = (cx::tx(&w, &s), w.caller());
+    crate::state::fs::fail_sync_dir(Some(&gens::dir(&a, 2)));
+    let r = stop(&tx, &c, A, &[]);
+    let retry = finish(&tx, &c);
+    crate::state::fs::fail_sync_dir(None);
+    let r = r.unwrap();
+    assert!(!r.stopped, "the marker's flush failed: {r:?}");
+    assert_eq!(r.unresolved[0].check, "state", "{r:?}");
+    assert!(
+        !retry.unwrap()[0].stopped,
+        "still refused while the fault holds"
+    );
+    assert!(cx::journal_of(&w, A).exists());
+    assert!(finish(&tx, &c).unwrap()[0].stopped, "the flush landed");
+    assert!(!cx::journal_of(&w, A).exists());
+    assert_eq!(
+        cx::delivered_at(&w, A, 2),
+        0,
+        "the marker decided: no delivery"
+    );
+    assert!(
+        lf::calls(&w).is_empty(),
+        "no hc: every generation done by its files"
+    );
+}
+
+// Fix-cycle finding 13: B's committed pending generation 2 is Running; `stop A` is cut short right after
+// `terminating.json` (B1's halt `terminating`, before any kill). The replay through the stop path (`finish`, then
+// `stop` with the kept report, as `stop_hc` runs them) ends B 2, then B 1, then A; ancestors are kept until then;
+// one notice for B (its highest generation); the journal is removed last.
+#[test]
+fn a_stop_cut_short_after_terminating_is_finished_once() {
+    let (w, s) = lf::world();
+    cx::member(&w, L, None, 0, json!({}));
+    cx::member(&w, A, Some(L), 1, json!({}));
+    let mut p = lf::pending(2);
+    p["hcAddress"] = json!(cx::addr_at(B, 2));
+    let b = cx::member(&w, B, Some(A), 2, json!({"pending": p}));
+    lf::seed_gen(&b, 2, Some("run"), lf::committed());
+    cx::found_at(&w, B, 2, &cx::wire_at(&w, B, 2, "live", None, &lf::ARGV));
+    let (tx, c) = (cx::tx(&w, &s), w.caller());
+    cx::at("terminating");
+    assert_eq!(stop(&tx, &c, A, &[]).unwrap_err().check, "halted");
+    assert!(gens::read(&b, 2, "terminating").known().unwrap().is_some());
+    assert_eq!(lf::count(&w, "kill"), 0, "nothing killed before the crash");
+    let kept = cx::journal_of(&w, A).exists() && cx::stopped(&w, A);
+    assert!(kept, "ancestors kept and closed");
+    w.fakes.hc_done().unwrap();
+    for (id, n) in [(B, 2), (B, 1), (A, 1)] {
+        cx::terminates_at(&w, id, n);
+    }
+    let kept = finish(&tx, &c).unwrap();
+    assert!(stop(&tx, &c, A, &kept).unwrap().stopped);
+    let order = [cx::addr_at(B, 2), cx::addr(B), cx::addr(A)];
+    assert_eq!(kill_order(&w), order, "newest first, then A");
+    let notices = (
+        cx::delivered_at(&w, B, 2),
+        cx::delivered_at(&w, B, 1),
+        cx::delivered(&w, A),
+    );
+    assert_eq!(notices, (1, 0, 1), "one notice each");
+    assert!(
+        lf::record(&b).get("pending").is_none(),
+        "pending dropped once"
+    );
+    assert!(!cx::journal_of(&w, A).exists(), "removed last");
+    w.fakes.hc_done().unwrap();
+}
+
+// C7 (row 6.10): an entry counts complete only once its marker exists. A's generation 1 is ended but the record
+// still names it `completing` (a completion not yet finished): `terminate` answers done, `post` publishes nothing
+// (R3): the entry is unresolved `notice`, the journal kept; once the completion clears, the next pass notices it.
+#[test]
+fn an_entry_without_its_marker_keeps_the_journal() {
+    let (w, s) = lf::world();
+    cx::member(&w, L, None, 0, json!({}));
+    let a = cx::member(&w, A, Some(L), 1, json!({"completing": {"gen": 1}}));
+    crate::state::evidence::publish(&gens::path(&a, 1, "ended"), &json!({"at": "x"})).unwrap();
+    let (tx, c) = (cx::tx(&w, &s), w.caller());
+    let r = stop(&tx, &c, A, &[]).unwrap();
+    let got: Vec<(&str, &str)> = (r.unresolved.iter())
+        .map(|u| (u.check, u.reason.as_str()))
+        .collect();
+    assert_eq!(got, [("notice", NOT_NOTICED)], "{r:?}");
+    assert!(!r.stopped && cx::journal_of(&w, A).exists());
+    let mut rec = lf::record(&a);
+    rec.as_object_mut().unwrap().remove("completing");
+    crate::state::fs::write_json(&a.join("record.json"), &rec).unwrap();
+    assert!(finish(&tx, &c).unwrap()[0].stopped);
+    assert_eq!(cx::delivered(&w, A), 1);
+    assert!(lf::calls(&w).is_empty(), "done by its files");
 }
