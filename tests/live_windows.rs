@@ -346,6 +346,11 @@ impl Live {
 
     /// mux-agent typed into the root pane; its JSON reply, whatever it says.
     fn run_any(&self, args: &[&str]) -> Value {
+        self.run_any_in(&self.root, args)
+    }
+
+    /// `run_any` typed into `pane` (cascade-3d call 26: a person's command from a pane in the team's session).
+    fn run_any_in(&self, pane: &str, args: &[&str]) -> Value {
         let done = self.dir.join("call.done");
         let out = self.dir.join("call.json");
         let _ = std::fs::remove_file(&done);
@@ -355,7 +360,7 @@ impl Live {
             .collect::<Vec<_>>()
             .join(" ");
         self.line(
-            &self.root,
+            pane,
             &format!(
                 "\"{MUX_AGENT}\" {args} > \"{}\" & echo done> \"{}\"",
                 out.display(),
@@ -365,7 +370,7 @@ impl Live {
         self.wait_or(
             &format!("command reply to {args}"),
             || done.exists().then_some(()),
-            || format!("root pane:\n{}", self.screen(&self.root)),
+            || format!("pane {pane}:\n{}", self.screen(pane)),
         );
         serde_json::from_str(&std::fs::read_to_string(out).unwrap()).unwrap()
     }
@@ -1482,10 +1487,14 @@ fn members_spawn_and_act_only_down_the_tree() {
         true,
         "the leader stops a grandchild"
     );
-    for name in ["c3", "c4", "c5"] {
+    // cascade-3d: stopping g1 stops its sub-tree; h1 is ended and noticed too.
+    let notice = member_file(&live, &h1, "gens/0/notice.json");
+    assert_eq!(notice["kind"], "stopped", "h1 stopped with g1");
+    // Live besides the leader: c1, c2; four more make six, a 7th refuses.
+    for name in ["c3", "c4", "c5", "c6"] {
         ok(&mut sent, &leader, name);
     }
-    assert_eq!(spawn(&mut sent, &leader, "c6")["check"], "limit");
+    assert_eq!(spawn(&mut sent, &leader, "c7")["check"], "limit");
 }
 
 /// Each named row on a bar screen: (line, column-0 mark, glyph column).
@@ -2150,6 +2159,142 @@ fn a_copilot_member_reports_done_then_listens_on_call() {
     );
 }
 
+/// A `cmd.exe` pane split into `session` (cascade-3d call 26: `up`'s team session), with the private core's
+/// environment and this test's state root set in the pane itself (a split does not get the session's `-e` variables
+/// in rmux 0.10).
+fn team_pane(live: &Live, session: &str) -> String {
+    let pane = live
+        .call(&[
+            "split-window",
+            "-v",
+            "-t",
+            session,
+            "-P",
+            "-F",
+            "#{pane_id}",
+            "cmd.exe",
+        ])
+        .trim()
+        .to_string();
+    live.prompt(&pane);
+    for (key, value) in &live.core.env {
+        live.line(&pane, &format!("set {key}={}", value.to_string_lossy()));
+    }
+    let state = live.dir.join("state");
+    live.line(&pane, &format!("set MUX_AGENTS_STATE={}", state.display()));
+    pane
+}
+
+/// cascade-3d live on rmux (Windows): the Unix scenario through the same public paths (calls 12, 26). A person's
+/// commands run from a pane in `up`'s team session, whose bar is closed (and proven closed) before the crash.
+#[test]
+fn a_cascade_stop_ends_b_before_a_and_a_second_stop_finishes() {
+    let Some(mut live) = Live::start() else {
+        return;
+    };
+    let (task, brief) = (live.dir.join("task.txt"), live.dir.join("brief.md"));
+    std::fs::write(&task, "say hi").unwrap();
+    std::fs::write(&brief, "brief").unwrap();
+    let (task, brief) = (task.display().to_string(), brief.display().to_string());
+    let up = live.run(&["up", "-Client", "claude"]);
+    let leader = s(&up["leader"]["id"]);
+    let team = team_pane(&live, &s(&up["session"]));
+    let close = live.run_any_in(&team, &["sidebar", "-Close"]);
+    assert_eq!(close["ok"], true, "{close}");
+    let again = live.run_any_in(&team, &["sidebar", "-Close"]);
+    let none = again["panes"].as_array().is_none_or(Vec::is_empty);
+    assert!(
+        again["ok"] == true && none,
+        "the team's bar is closed: {again}"
+    );
+    let mut sent = HashMap::new();
+    let args = |name: &str| -> Vec<String> {
+        [
+            "spawn",
+            "-Client",
+            "claude",
+            "-TaskFile",
+            &task,
+            "-BriefFile",
+            &brief,
+            "-Context",
+            "brief",
+            "-Name",
+            name,
+        ]
+        .map(String::from)
+        .to_vec()
+    };
+    let spawn = |live: &Live, sent: &mut HashMap<u32, usize>, who: &str, name: &str| {
+        let a = args(name);
+        let r = by(
+            live,
+            sent,
+            who,
+            &a.iter().map(String::as_str).collect::<Vec<_>>(),
+        );
+        assert_eq!(r["ok"], true, "{name}: {r}");
+        s(&r["id"])
+    };
+    let left = |live: &Live, id: &str| {
+        let teams = agent_dir(live, id)
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join("teams");
+        std::fs::read_dir(teams).is_ok_and(|d| {
+            d.flatten()
+                .any(|e| e.path().join(format!("{id}.json")).exists())
+        })
+    };
+    // 1. The leader stops a1 by name, inside the tree: b1, then a1; every notice; no journal left.
+    let a1 = spawn(&live, &mut sent, &leader, "a1");
+    let b1 = spawn(&live, &mut sent, &a1, "b1");
+    let r = by(&live, &mut sent, &leader, &["stop", "a1"]);
+    let got = (&r["stopped"], &r["unresolved"]);
+    assert_eq!(
+        got,
+        (&serde_json::json!(true), &serde_json::json!([])),
+        "{r}"
+    );
+    assert!(agent_dir(&live, &b1).join("gens/0/notice.json").exists() && !left(&live, &a1));
+    // 2. A person stops a2 from the team's pane, killed right after b2's notice.
+    let a2 = spawn(&live, &mut sent, &leader, "a2");
+    let b2 = spawn(&live, &mut sent, &a2, "b2");
+    let step = format!("cascade-noticed-{b2}");
+    let code = run_crashed_in(&live, &team, &step, &["stop", "a2"]);
+    assert_eq!(code, 86, "killed after b2's notice");
+    let address = |id: &str| s(&member_file(&live, id, "record.json")["hcAddress"]);
+    assert_eq!(
+        hc_get(&live, &address(&b2))["state"],
+        "finished",
+        "b2 ended first"
+    );
+    assert_eq!(hc_get(&live, &address(&a2))["state"], "live", "a2 after b2");
+    assert!(left(&live, &a2), "the journal is kept");
+    let a = args("c2");
+    let r = by(
+        &live,
+        &mut sent,
+        &a2,
+        &a.iter().map(String::as_str).collect::<Vec<_>>(),
+    );
+    assert_eq!(r["check"], "closed", "a spawn under a2: {r}");
+    // 3. The private core restarts; the journal is still there; a second person stop finishes it.
+    assert!(live.core.stop(), "core stop");
+    live.core.start();
+    assert!(left(&live, &a2), "kept across the restart");
+    live.wait("a second stop finished the cascade", || {
+        let _ = live.run_any_in(&team, &["stop", "a2"]);
+        (!left(&live, &a2)).then_some(())
+    });
+    assert!(
+        agent_dir(&live, &a2).join("gens/0/notice.json").exists(),
+        "a2 noticed"
+    );
+}
+
 /// `<state>/<server key>/agents/<id>`: the one server key folder that holds member `id`.
 fn agent_dir(live: &Live, id: &str) -> PathBuf {
     let found: Vec<PathBuf> = std::fs::read_dir(live.dir.join("state"))
@@ -2196,6 +2341,11 @@ fn a_lost_member_is_released_and_keeps_only_its_kept_labels() {
 
 /// `mux-agent <args>` in the root pane with MUX_AGENTS_CRASH=<step> for that process only; its exit code.
 fn run_crashed(live: &Live, step: &str, args: &[&str]) -> i32 {
+    run_crashed_in(live, &live.root, step, args)
+}
+
+/// `run_crashed` typed into `pane` (cascade-3d call 26).
+fn run_crashed_in(live: &Live, pane: &str, step: &str, args: &[&str]) -> i32 {
     let (script, code, done) = (
         live.dir.join("crash.cmd"),
         live.dir.join("crash.code"),
@@ -2213,7 +2363,7 @@ fn run_crashed(live: &Live, step: &str, args: &[&str]) -> i32 {
         done.display()
     );
     std::fs::write(&script, body).unwrap();
-    live.line(&live.root, &format!("\"{}\"", script.display()));
+    live.line(pane, &format!("\"{}\"", script.display()));
     live.wait("the crashed command", || done.exists().then_some(()));
     std::fs::read_to_string(code)
         .unwrap()

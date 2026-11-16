@@ -787,6 +787,37 @@ const TEST_ONLY: &[(&str, &str, &str)] = &[
         "src/agents/mod.rs",
         "core_fixture",
     ),
+    ("src/agents/board/tests.rs", "src/agents/board.rs", "tests"),
+    (
+        "src/agents/cascade/tests.rs",
+        "src/agents/cascade.rs",
+        "tests",
+    ),
+    (
+        "src/agents/cascade/crash.rs",
+        "src/agents/cascade.rs",
+        "crash",
+    ),
+    (
+        "src/agents/cascade_fixture.rs",
+        "src/agents/mod.rs",
+        "cascade_fixture",
+    ),
+    (
+        "src/agents/core_launch/forward_tests.rs",
+        "src/agents/core_launch.rs",
+        "forward_tests",
+    ),
+    (
+        "src/agents/core_launch/crash.rs",
+        "src/agents/core_launch.rs",
+        "crash",
+    ),
+    (
+        "src/agents/core_launch/hooks.rs",
+        "src/agents/core_launch.rs",
+        "hooks",
+    ),
     (
         "src/agents/gens/publish_tests.rs",
         "src/agents/gens.rs",

@@ -1152,8 +1152,9 @@ fn a_failed_agents_folder_flush_launches_nothing() {
 // and what that write added, no temp file is left, and nothing commits. A write after hc run rolls the run back.
 #[test]
 fn power_loss_after_each_record_write_leaves_a_complete_record() {
-    // Durable writes in order, each a `record_write`: 0 the create, 1 the address patch, 2 the promotion.
-    for write in 0..3 {
+    // Record writes in order: 0 the create, 1 the address patch, 2 the promotion. A creating launch also writes
+    // `desired.json` durably right after the create (cascade-3d C1), so record write k is durable write `at`.
+    for (write, at) in [(0, 0), (1, 2), (2, 3)] {
         let w = World::human("");
         let x = member(&w, ID, json!({"pane": "%5", "window": "@1", "depth": 1}));
         w.panes(&[]);
@@ -1162,7 +1163,7 @@ fn power_loss_after_each_record_write_leaves_a_complete_record() {
             launches(&w, "t1");
         }
         let before = folders(&w);
-        crate::state::fs::fail_durable_flush(Some(write));
+        crate::state::fs::fail_durable_flush(Some(at));
         let got = resume_of(&w, ID);
         crate::state::fs::fail_durable_flush(None);
         assert!(got.is_err(), "write {write}");
@@ -1975,4 +1976,16 @@ fn a_copilot_subject_is_held_by_an_unmanaged_copilot() {
     );
     assert_eq!((folders(&w), runs(&w)), (before, 0));
     w.fakes.hc_done().unwrap();
+}
+
+// cascade-3d C3: a member a kept journal lists is not resumed: 2 `closed`, nothing launched.
+#[test]
+fn a_resume_under_a_kept_journal_is_refused_closed() {
+    let w = World::human("");
+    let x = member(&w, ID, json!({}));
+    facts(&w, &[(&x, "stopped")]);
+    crate::agents::cascade_fixture::seed(&w, ID, &[ID], true);
+    let before = folders(&w);
+    assert_eq!(resume_of(&w, ID).unwrap_err().check, "closed");
+    assert_eq!(folders(&w), before, "nothing launched");
 }

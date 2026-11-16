@@ -199,6 +199,7 @@ fn m(id: &str, record: Value) -> Member {
     Member {
         id: id.into(),
         name: crate::agents::text(record.get("name")),
+        parents: raw_parents(&record),
         record,
     }
 }
@@ -1715,4 +1716,30 @@ fn a_held_member_claims_the_pane_its_pending_view_presents() {
     let commit = gens::path(&f, 1, "commit");
     let n = reads.iter().filter(|p| **p == commit).count();
     assert_eq!(n, 1, "one status read: {reads:?}");
+}
+
+// Call 25 (checklist 9): S resumed A (A ended, superseded); B, A's child, reaches S with `send parent`, and S's
+// `send children` reaches B. A raw `parentAgent.id` walk falls back to B's parent pane and finds no child of S.
+#[test]
+fn parent_and_children_follow_a_successor() {
+    const S: &str = "0000000000d4";
+    for (from, word, want) in [(B, "parent", S), (S, "children", B)] {
+        let w = team_world();
+        cf::member(
+            &w,
+            S,
+            json!({"name": "ms4", "depth": 1, "parentAgent": {"id": LEADER}, "resumedFrom": A, "pane": "%7",
+                "window": "@1"}),
+        );
+        online(&w);
+        let r = go(&w, Some(from), &["send", word, "-Body", "x"]);
+        assert!(r.is_ok(), "{word}: {r:?}");
+        let got: Vec<String> = r.unwrap()["recipients"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|x| crate::agents::text(x.get("id")))
+            .collect();
+        assert_eq!(got, [want], "{word}");
+    }
 }

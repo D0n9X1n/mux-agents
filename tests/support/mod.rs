@@ -490,7 +490,20 @@ impl Server {
         vars: &[(&str, &str)],
         unset: &[&str],
     ) -> (i32, String, String) {
-        let (stdout, err) = self.shell(&Self::line(bin, args, vars, unset));
+        let pane = self.pane.clone();
+        self.run_raw_in(&pane, bin, args, vars, unset)
+    }
+
+    /// `run_raw` in `pane`'s shell (cascade-3d call 26: a person's command from a pane in the team's session).
+    pub fn run_raw_in(
+        &mut self,
+        pane: &str,
+        bin: &str,
+        args: &[&str],
+        vars: &[(&str, &str)],
+        unset: &[&str],
+    ) -> (i32, String, String) {
+        let (stdout, err) = self.shell_in(pane, &Self::line(bin, args, vars, unset));
         // The shell appended `$?` and a LF after whatever the program wrote to stderr.
         let body = err.strip_suffix('\n').unwrap_or(&err);
         let (stderr, code) = match body.rfind('\n') {

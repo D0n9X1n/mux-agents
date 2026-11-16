@@ -654,7 +654,10 @@ fn post(
                 return Ok(false); // nothing to notice
             };
             let s = g.status_given(ended)?; // R2 refuses; R1: the caller's ended.json is not read again
-            if g.read(n, "notice").known()?.is_some() {
+            // cascade-3d call 22: a marker already there still completes its publication's flushes (the `Exists` path
+            // flushes on every call) before it counts; a flush that fails refuses.
+            if let Some(marker) = g.read(n, "notice").known()? {
+                gens::publish_once(folder, n, "notice", &marker)?;
                 return Ok(false);
             }
             // A held stop names a generation `terminate` just dropped from `pending`: its own recorded completion.
@@ -708,8 +711,18 @@ fn post(
         fields.insert("exitCode".into(), code.clone());
         // The member it is about, so a team bar counts it by identity (#103 review).
         fields.insert("fromId".into(), id.into());
-        mail::add_once(ctx, caller, &key, &name, &pane, &body, &delivery, &fields)?
+        // cascade-3d call 9: a lifecycle notice's message is flushed before its marker is published.
+        let add = if life_gen.is_some() {
+            mail::add_once_durable
+        } else {
+            mail::add_once
+        };
+        add(ctx, caller, &key, &name, &pane, &body, &delivery, &fields)?
     };
+    // cascade-3d C6 crash point: the message is delivered, its marker not yet published.
+    if life_gen.is_some() {
+        super::release::halt("delivered")?;
+    }
     // The first notice wins: a message already delivered (a marker write that failed after it) decides the marker.
     let (kind, code) = match delivered {
         Some(message) => delivered_notice(&message, &name),

@@ -1,4 +1,5 @@
 use super::*;
+use crate::agents::cascade::Tree;
 use crate::agents::{
     core_facts, core_identity,
     fixture::{World, write},
@@ -581,13 +582,18 @@ fn ancestors_end_at_the_leader() {
     ]
     .into();
     assert_eq!(
-        ancestors(&r, &i[1], LEADER).unwrap(),
+        Tree::from_records(&r).ancestors(&i[1], LEADER).unwrap(),
         [i[0].clone(), LEADER.to_string()]
     );
-    assert!(ancestors(&r, LEADER, LEADER).unwrap().is_empty());
+    assert!(
+        Tree::from_records(&r)
+            .ancestors(LEADER, LEADER)
+            .unwrap()
+            .is_empty()
+    );
     r.insert(i[2].clone(), child(&i[2], "cccccccccccc", 2));
     assert_eq!(
-        ancestors(&r, &i[2], LEADER),
+        Tree::from_records(&r).ancestors(&i[2], LEADER),
         refuse(2, "authority", "the parent chain of ma2 cannot be read"),
         "broken"
     );
@@ -599,7 +605,10 @@ fn ancestors_end_at_the_leader() {
         let mut r = r.clone();
         r.insert(id.clone(), bad);
         assert_eq!(
-            ancestors(&r, &i[1], LEADER).unwrap_err().check,
+            Tree::from_records(&r)
+                .ancestors(&i[1], LEADER)
+                .unwrap_err()
+                .check,
             "authority",
             "cycle, non-leader root, depth"
         );
@@ -801,31 +810,50 @@ fn authority_runs_only_down_the_tree() {
     let m = |id: &str, r: &BTreeMap<String, Value>| member_of(id, r[id].clone());
     for who in [LEADER, i[0].as_str()] {
         assert!(
-            authorize(&r, LEADER, &m(who, &r), &i[1], "stop").is_ok(),
+            authorize(&Tree::from_records(&r), LEADER, &m(who, &r), &i[1], "stop").is_ok(),
             "{who}: an ancestor"
         );
     }
     assert!(
-        authorize(&r, LEADER, &Standing::Person, &i[1], "read").is_ok(),
+        authorize(
+            &Tree::from_records(&r),
+            LEADER,
+            &Standing::Person,
+            &i[1],
+            "read"
+        )
+        .is_ok(),
         "a person"
     );
     for who in [&i[4], &i[2], &i[3], &i[1]] {
         assert_eq!(
-            authorize(&r, LEADER, &m(who, &r), &i[1], "read"),
+            authorize(&Tree::from_records(&r), LEADER, &m(who, &r), &i[1], "read"),
             refuse(2, "authority", "only an ancestor or a person can read ma1"),
             "{who}: sibling, peer, cousin, self"
         );
     }
     assert_eq!(
-        authorize(&r, LEADER, &m(&i[1], &r), &i[0], "stop")
-            .unwrap_err()
-            .check,
+        authorize(
+            &Tree::from_records(&r),
+            LEADER,
+            &m(&i[1], &r),
+            &i[0],
+            "stop"
+        )
+        .unwrap_err()
+        .check,
         "authority",
         "a child"
     );
     r.insert(i[1].clone(), child(&i[1], "cccccccccccc", 2));
     assert_eq!(
-        authorize(&r, LEADER, &m(&i[0], &r), &i[1], "stop"),
+        authorize(
+            &Tree::from_records(&r),
+            LEADER,
+            &m(&i[0], &r),
+            &i[1],
+            "stop"
+        ),
         refuse(2, "authority", "the parent chain of ma1 cannot be read"),
         "a broken chain"
     );
@@ -902,13 +930,34 @@ fn launch_ok(w: &World) {
         .mux_rule("-t %9 #{pane_id}|#{@agent-id}", 0, "|\n", "");
 }
 type Held = std::rc::Rc<std::cell::RefCell<Vec<bool>>>;
+/// `resume_case`'s predecessor A of ID, and A's second successor.
+const PRED: &str = "eeeeeeeeeeee";
+const S2: &str = "ffffffffffff";
 /// `held`: whether the team lock was held at each `hc get` (recorded in the "candidate" case, run through the CLI).
 fn resume_case(case: &str) -> (Mw, Res<Map<String, Value>>, String, Held) {
     let mut m = member_world();
     let x = "dddddddddddd".to_string();
-    let mut rx = child(&x, if case == "non-descendant" { OTHER } else { ID }, 2);
+    // Checklist 14: "successor": ID resumed A (PRED), X is A's child; "successors": S2 resumed A too.
+    let succ = case == "successor" || case == "successors";
+    let parent = match case {
+        "non-descendant" => OTHER,
+        _ if succ => PRED,
+        _ => ID,
+    };
+    let mut rx = child(&x, parent, 2);
     rx["sessionId"] = "22222222-2222-4222-8222-222222222222".into();
     let rx = cf::member(&m.w, &x, rx);
+    let mut extra = Vec::new();
+    if succ {
+        extra.push(cf::member(&m.w, PRED, child(PRED, LEADER, 1)));
+        m.r["resumedFrom"] = json!(PRED);
+        write(&m.folder(ID).join("record.json"), m.r.clone());
+    }
+    if case == "successors" {
+        let mut s2 = child(S2, LEADER, 1);
+        s2["resumedFrom"] = json!(PRED);
+        extra.push(cf::member(&m.w, S2, s2));
+    }
     if case == "no-directory" {
         // A record whose run input cannot be built: no `directory` for `hc run --cwd`.
         let mut r = m.record(&x);
@@ -931,6 +980,7 @@ fn resume_case(case: &str) -> (Mw, Res<Map<String, Value>>, String, Held) {
         );
     }
     let mut rows: Vec<Value> = [LEADER, ID, OTHER].iter().map(|id| m.record(id)).collect();
+    rows.extend(extra);
     if case == "limit" {
         for id in ids(4) {
             rows.push(cf::member(&m.w, &id, child(&id, LEADER, 1)));
@@ -969,7 +1019,7 @@ fn resume_case(case: &str) -> (Mw, Res<Map<String, Value>>, String, Held) {
     m.hc();
     m.rounds(if cand { 3 } else { 2 }, &term(&m.r, Some(150)));
     facts_of(&m.w, &crate::agents::membership::team(&m.c), &rows, &rx);
-    if case == "ok" || cand {
+    if case == "ok" || case == "successor" || cand {
         launch_ok(&m.w);
     }
     let got = if cand {
@@ -2277,4 +2327,255 @@ fn every_other_proven_member_is_still_refused_placement_tagged() {
         }
         assert!(placement_calls(&m).is_empty(), "{case}");
     }
+}
+
+// cascade-3d C2: the gate every spawn passes refuses 2 `closed` under a stopped parent, after the depth check.
+#[test]
+fn admission_refuses_a_closed_parent() {
+    let w = World::human("");
+    let c = w.caller();
+    team_record(&w, &[]);
+    let team = team_of(&w.ctx, &c).unwrap().unwrap();
+    let i = ids(1);
+    // Lifecycle records: `Tree::read` skips pre-lifecycle members (prelife-1c call 1).
+    let fields = json!({"client": "claude", "pane": "%4", "upTeam": "t", "directory": "/work"});
+    crate::agents::cascade_fixture::member(&w, LEADER, None, 0, fields.clone());
+    let m = crate::agents::cascade_fixture::member(&w, &i[0], Some(LEADER), 1, fields);
+    let r = crate::agents::life_fixture::record(&m);
+    let s = crate::agents::team_state::Scope::of(&c);
+    crate::agents::team_state::open(&w.ctx, &s, |tx| tx.desired(&i[0], false)).unwrap();
+    let got = admit(&w.ctx, &c, &team, member_of(&i[0], r)).unwrap_err();
+    assert_eq!(got.check, "closed");
+    admit(&w.ctx, &c, &team, Standing::Person).unwrap();
+    crate::agents::team_state::open(&w.ctx, &s, |tx| tx.desired(LEADER, false)).unwrap();
+    let got = admit(&w.ctx, &c, &team, Standing::Person).unwrap_err();
+    assert_eq!(got.check, "closed");
+}
+
+// Call 10 (C0): S resumed A, so B (A's child) is under S: S may stop and resume B; A, superseded, may not.
+#[test]
+fn a_successor_stands_for_its_predecessor_in_authority() {
+    let i = ids(3);
+    let (a, s, b) = (&i[0], &i[1], &i[2]);
+    let mut successor = child(s, LEADER, 1);
+    successor["resumedFrom"] = json!(a);
+    let r: BTreeMap<String, Value> = [
+        (LEADER.to_string(), leader_record()),
+        (a.clone(), child(a, LEADER, 1)),
+        (s.clone(), successor),
+        (b.clone(), child(b, a, 2)),
+    ]
+    .into();
+    let t = Tree::from_records(&r);
+    assert_eq!(
+        t.ancestors(b, LEADER).unwrap(),
+        [s.clone(), LEADER.to_string()]
+    );
+    for verb in ["stop", "resume"] {
+        assert!(
+            authorize(&t, LEADER, &member_of(s, r[s].clone()), b, verb).is_ok(),
+            "{verb}"
+        );
+        assert_eq!(
+            authorize(&t, LEADER, &member_of(a, r[a].clone()), b, verb)
+                .unwrap_err()
+                .check,
+            "authority"
+        );
+    }
+}
+
+// Call 10 through the production readers (records on disk): `authority` and `parent_level` follow S, not A, whose
+// recorded client is unknown (a raw walk would refuse `authority` on it).
+#[test]
+fn authority_and_parent_policy_read_the_tree_from_disk() {
+    let w = World::human("");
+    let c = w.caller();
+    team_record(&w, &[]);
+    let team = team_of(&w.ctx, &c).unwrap().unwrap();
+    let i = ids(3);
+    let (a, s, b) = (&i[0], &i[1], &i[2]);
+    cf::member(&w, LEADER, leader_record());
+    let mut gone = child(a, LEADER, 1);
+    gone["client"] = json!("nonsense");
+    cf::member(&w, a, gone);
+    let mut successor = child(s, LEADER, 1);
+    successor["resumedFrom"] = json!(a);
+    let rs = cf::member(&w, s, successor);
+    write(
+        &w.folder(s).join("spec.json"),
+        json!({"flags": ["--effort", "high"]}),
+    );
+    cf::member(&w, b, child(b, a, 2));
+    assert!(
+        authority(&w.ctx, &c, &member_of(s, rs.clone()), b, "stop").is_ok(),
+        "S stops B"
+    );
+    let records: BTreeMap<String, Value> = crate::agents::membership::locals(&w.ctx, &c)
+        .unwrap()
+        .into_iter()
+        .map(|l| (l.identity.id, l.stored.record))
+        .collect();
+    assert_eq!(
+        parent_level(&w.ctx, &c, &team, &records, b),
+        Ok(t::Policy::Default),
+        "B's parent policy is S's"
+    );
+}
+
+// Call 23 (checklist 7): a pre-lifecycle successor is void exactly when `resume::taken`'s legacy rule says its claim
+// never ran (an abandoned claim, or no claim and abort.json); otherwise it stands for A.
+#[test]
+fn an_abandoned_legacy_successor_is_void() {
+    for (case, current) in [
+        ("abandoned", false),
+        ("aborted", false),
+        ("claimed", true),
+        ("torn claim", true),
+        ("no evidence", true),
+    ] {
+        let w = World::human("");
+        let c = w.caller();
+        team_record(&w, &[]);
+        let i = ids(3);
+        let (a, s, b) = (&i[0], &i[1], &i[2]);
+        cf::member(&w, LEADER, leader_record());
+        cf::member(&w, a, child(a, LEADER, 1));
+        let mut successor = child(s, LEADER, 1);
+        successor["resumedFrom"] = json!(a);
+        cf::member(&w, s, successor);
+        cf::member(&w, b, child(b, a, 2));
+        let claim = w.folder(s).join("gens").join("0.claim");
+        std::fs::create_dir_all(claim.parent().unwrap()).unwrap();
+        match case {
+            "abandoned" => write(&claim, json!("abandoned")),
+            "aborted" => write(&w.folder(s).join("abort.json"), json!({"at": "x"})),
+            "claimed" => write(&claim, json!("run")),
+            "torn claim" => std::fs::write(&claim, b"{").unwrap(),
+            _ => {}
+        }
+        let tx = crate::agents::team_state::Tx {
+            ctx: &w.ctx,
+            scope: crate::agents::team_state::Scope::of(&c),
+        };
+        let want = if current { s } else { a };
+        assert_eq!(
+            Tree::all(&tx).unwrap().ancestors(b, LEADER).unwrap(),
+            [want.clone(), LEADER.to_string()],
+            "{case}"
+        );
+    }
+}
+
+// Call 24 (checklist 8): a present but malformed `parentAgent.id` refuses `authority` in authority, the parent policy
+// and a spawn's depth; it is never read as "no parent".
+#[test]
+fn a_malformed_parent_id_refuses_authority_everywhere() {
+    for bad in [json!("../x"), json!(5), json!("")] {
+        let w = World::human("");
+        let c = w.caller();
+        team_record(&w, &[]);
+        let team = team_of(&w.ctx, &c).unwrap().unwrap();
+        let i = ids(2);
+        let (a, b) = (&i[0], &i[1]);
+        cf::member(&w, LEADER, leader_record());
+        let mut ra = child(a, LEADER, 1);
+        ra["parentAgent"] = json!({"id": bad});
+        let ra = cf::member(&w, a, ra);
+        cf::member(&w, b, child(b, a, 2));
+        let records: BTreeMap<String, Value> = crate::agents::membership::locals(&w.ctx, &c)
+            .unwrap()
+            .into_iter()
+            .map(|l| (l.identity.id, l.stored.record))
+            .collect();
+        let leader = member_of(LEADER, leader_record());
+        assert_eq!(
+            authority(&w.ctx, &c, &leader, a, "stop").unwrap_err().check,
+            "authority",
+            "{bad}: authority"
+        );
+        assert_eq!(
+            parent_level(&w.ctx, &c, &team, &records, a)
+                .unwrap_err()
+                .check,
+            "authority",
+            "{bad}: policy"
+        );
+        assert_eq!(
+            admit(&w.ctx, &c, &team, member_of(a, ra))
+                .unwrap_err()
+                .check,
+            "authority",
+            "{bad}: depth"
+        );
+    }
+}
+
+// Checklist 14: production spawn admission on a successor tree whose predecessor A has no record left, with two
+// successors S1 and S2: B is admitted under them at its own depth + 1, and each successor may stop B.
+#[test]
+fn spawn_admission_follows_several_successors() {
+    let w = World::human("");
+    let c = w.caller();
+    team_record(&w, &[]);
+    let team = team_of(&w.ctx, &c).unwrap().unwrap();
+    let i = ids(4);
+    let (a, s1, s2, b) = (&i[0], &i[1], &i[2], &i[3]);
+    cf::member(&w, LEADER, leader_record());
+    for s in [s1, s2] {
+        let mut r = child(s, LEADER, 1);
+        r["resumedFrom"] = json!(a);
+        cf::member(&w, s, r);
+    }
+    let rb = cf::member(&w, b, child(b, a, 2));
+    let got = admit(&w.ctx, &c, &team, member_of(b, rb)).unwrap();
+    assert_eq!(
+        (got.depth, &got.parent["id"]),
+        (3, &json!(b)),
+        "B admits at depth 3"
+    );
+    for s in [s1, s2] {
+        let rs = crate::state::fs::read_json(&w.folder(s).join("record.json"))
+            .unwrap()
+            .unwrap();
+        assert!(
+            authority(&w.ctx, &c, &member_of(s, rs), b, "stop").is_ok(),
+            "{s} stops B"
+        );
+    }
+}
+
+// Checklist 14: public resume admission on successor trees. ID resumed A, so X (A's child) is ID's: ID resumes X.
+// With a second successor S2 of A, X's parent policy has no one source: refused `authority`, nothing launched.
+#[test]
+fn a_member_resumes_a_child_of_its_predecessor() {
+    let (m, got, x, _) = resume_case("successor");
+    let r = m.record(got.unwrap()["agent"]["id"].as_str().unwrap());
+    assert_eq!(
+        (&r["depth"], &r["resumedFrom"]),
+        (&json!(2), &json!(x)),
+        "successor"
+    );
+    m.w.fakes.hc_done().unwrap();
+    let (m, got, _, _) = resume_case("successors");
+    assert_eq!(
+        got.unwrap_err(),
+        crate::error::Refusal {
+            code: 2,
+            check: "authority",
+            message: "the parent chain of mdd cannot be read".into(),
+            reason: None,
+            leftover: None,
+            details: Default::default(),
+        },
+        "successors"
+    );
+    assert!(
+        !m.w.fakes
+            .hc_calls()
+            .iter()
+            .any(|c| c.1.first().is_some_and(|a| a == "run")),
+        "successors: no launch"
+    );
+    m.w.fakes.hc_done().unwrap();
 }

@@ -1,0 +1,217 @@
+//! cascade-3d fixtures: a team L -> A -> B -> C of lifecycle members, generation 1 committed, parent pane PANE.
+use std::path::{Path, PathBuf};
+
+use serde_json::{Value, json};
+
+use super::core_fixture as cf;
+use super::fixture::World;
+use super::life_fixture as lf;
+use super::team_state::{Scope, Tx};
+
+pub const L: &str = "111111111111";
+pub const A: &str = "aaaaaaaaaaa1";
+pub const B: &str = "bbbbbbbbbbb1";
+pub const C: &str = "ccccccccccc1";
+pub const D: &str = "ddddddddddd1";
+pub const S: &str = "555555555555";
+pub const PANE: &str = "%5";
+
+/// Generation n's terminal address of member `id`.
+pub fn addr_at(id: &str, n: u64) -> String {
+    format!("t{n}-{id}")
+}
+pub fn addr(id: &str) -> String {
+    addr_at(id, 1)
+}
+pub fn name(id: &str) -> String {
+    format!("w-{}", &id[..1])
+}
+/// A Tx over the caller's scope with no hooks run (the cascade's own entry points are under test).
+pub fn tx<'a>(w: &'a World, s: &Scope) -> Tx<'a> {
+    Tx {
+        ctx: &w.ctx,
+        scope: s.clone(),
+    }
+}
+/// Lifecycle member `id` under `parent` (None: a leader at depth 0), `fields` over it; generation 1 committed.
+pub fn member(w: &World, id: &str, parent: Option<&str>, depth: u64, fields: Value) -> PathBuf {
+    let m = w.folder(id);
+    std::fs::create_dir_all(&m).unwrap();
+    let mut r = json!({"lifecycle": 1, "id": id, "name": name(id), "session": w.caller().session,
+        "sessionId": lf::SID, "team": lf::team(w), "depth": depth, "parentPane": PANE, "generation": "1",
+        "hcAddress": addr(id), "hcName": lf::hc_name(1), "launcherArgv": lf::ARGV});
+    if let Some(p) = parent {
+        r["parentAgent"] = json!({"id": p});
+    }
+    for (k, v) in fields.as_object().unwrap() {
+        r[k] = v.clone();
+    }
+    crate::state::fs::write_json(&m.join("record.json"), &r).unwrap();
+    lf::seed_gen(&m, 1, Some("run"), lf::committed());
+    m
+}
+/// L -> A -> B -> C.
+pub fn chain(w: &World) {
+    member(w, L, None, 0, json!({}));
+    member(w, A, Some(L), 1, json!({}));
+    member(w, B, Some(A), 2, json!({}));
+    member(w, C, Some(B), 3, json!({}));
+}
+/// A successor of `from` whose only launch is proven void (claim `abandoned`): `never_ran_recorded` is true.
+pub fn void(w: &World, id: &str, from: &str, parent: &str) {
+    let m = w.folder(id);
+    std::fs::create_dir_all(&m).unwrap();
+    let r = json!({"lifecycle": 1, "id": id, "name": name(id), "session": w.caller().session,
+        "sessionId": lf::SID, "team": lf::team(w), "depth": 1, "parentPane": PANE,
+        "parentAgent": {"id": parent}, "resumedFrom": from, "pending": lf::pending(0)});
+    crate::state::fs::write_json(&m.join("record.json"), &r).unwrap();
+    lf::seed_gen(&m, 0, Some("abandoned"), None);
+}
+
+/// The journal file of `root` in the caller's scope.
+pub fn journal_of(w: &World, root: &str) -> PathBuf {
+    super::cascade::dir_at(&w.ctx, &Scope::of(&w.caller())).join(format!("{root}.json"))
+}
+/// A journal of `root` listing `ids` deepest first, each the parent of the one before (the last is the root).
+pub fn body(root: &str, ids: &[&str], prepared: bool) -> super::cascade::Journal {
+    let entries = (ids.iter().enumerate())
+        .map(|(i, id)| super::cascade::Entry {
+            id: id.to_string(),
+            name: name(id),
+            parents: ids
+                .get(i + 1)
+                .map(|p| vec![p.to_string()])
+                .unwrap_or_default(),
+            gens: vec![1],
+        })
+        .collect();
+    super::cascade::Journal {
+        root: root.into(),
+        entries,
+        prepared,
+        removing: false,
+    }
+}
+/// `body`, published.
+pub fn seed(w: &World, root: &str, ids: &[&str], prepared: bool) -> super::cascade::Journal {
+    let j = body(root, ids, prepared);
+    let s = Scope::of(&w.caller());
+    super::cascade::publish(&tx(w, &s), &j).unwrap();
+    j
+}
+/// The next `release::halt(step)` refuses `halted` (the text is leaked: `halt_after` takes `&'static str`).
+pub fn at(step: &str) {
+    super::release::halt_after(Some(Box::leak(step.to_owned().into_boxed_str())));
+}
+/// Whether member `id` is desired stopped (through `desired_of`'s walk).
+pub fn stopped(w: &World, id: &str) -> bool {
+    super::cascade::desired_of(&w.folder(id)).unwrap() == super::cascade::Desired::Stopped
+}
+/// Every file under `dir` with its bytes, sorted: a byte-identical check of a folder.
+pub fn snapshot(dir: &Path) -> Vec<(PathBuf, Vec<u8>)> {
+    let mut out = Vec::new();
+    let mut todo = vec![dir.to_path_buf()];
+    while let Some(d) = todo.pop() {
+        for e in std::fs::read_dir(&d).unwrap() {
+            let p = e.unwrap().path();
+            if p.is_dir() {
+                todo.push(p);
+            } else {
+                let bytes = std::fs::read(&p).unwrap();
+                out.push((p, bytes));
+            }
+        }
+    }
+    out.sort();
+    out
+}
+/// hc's `get` reply for generation n's terminal of member `id`.
+pub fn wire_at(
+    w: &World,
+    id: &str,
+    n: u64,
+    state: &str,
+    reason: Option<&str>,
+    argv: &[&str],
+) -> Value {
+    json!({"address": addr_at(id, n), "name": lf::hc_name(n), "state": state, "reason": reason, "argv": argv,
+        "exit_code": if state == "finished" { json!(0) } else { Value::Null },
+        "labels": {"mux.managed": "1", "mux.team": lf::team(w), "mux.id": id, "mux.gen": n.to_string(),
+            "mux.name": "worker"}})
+}
+pub fn wire(w: &World, id: &str, state: &str, reason: Option<&str>, argv: &[&str]) -> Value {
+    wire_at(w, id, 1, state, reason, argv)
+}
+/// `gens::find` of generation n: connect, list by labels, get the one terminal.
+pub(crate) fn found_at(w: &World, id: &str, n: u64, first: &Value) {
+    cf::online(w);
+    let (label, g) = (format!("mux.id={id}"), format!("mux.gen={n}"));
+    let terminals = json!({"terminals": [{"address": addr_at(id, n)}]}).to_string();
+    cf::answer(
+        w,
+        &["ls", "--all", "--label", &label, "--label", &g, "--json"],
+        &terminals,
+    );
+    lf::get(w, &addr_at(id, n), first);
+}
+/// G11 on a Running generation n: search, the exact reread, the kill (b-calls 22, 54: no `get` after it).
+pub fn terminates_at(w: &World, id: &str, n: u64) {
+    let live = wire_at(w, id, n, "live", None, &lf::ARGV);
+    found_at(w, id, n, &live);
+    lf::get(w, &addr_at(id, n), &live);
+    cf::answer(w, &["kill", &addr_at(id, n), "--json"], "{}");
+}
+pub fn terminates(w: &World, id: &str) {
+    terminates_at(w, id, 1);
+}
+/// The kill fails: unresolved, nothing recorded but `kill.json` (b-calls 54: an attempt proves no end).
+pub fn kill_fails(w: &World, id: &str) {
+    let live = wire(w, id, "live", None, &lf::ARGV);
+    found_at(w, id, 1, &live);
+    lf::get(w, &addr(id), &live);
+    lf::fails(w, &["kill", &addr(id), "--json"]);
+}
+/// Messages with delivery id `exit-<id>-<n>` in PANE's mailbox file (`mail::read_mail` would move PANE's cursor
+/// and hide the next entry's notice).
+pub fn delivered_at(w: &World, id: &str, n: u64) -> usize {
+    let key = super::mail::mailbox_key(PANE, "").unwrap();
+    let text = std::fs::read_to_string(w.state().join("mail").join(format!("{key}.jsonl")))
+        .unwrap_or_default();
+    let want = super::gens::delivery_id(id, n);
+    let lines = text
+        .lines()
+        .filter_map(|l| serde_json::from_str::<Value>(l).ok());
+    lines.filter(|m| m["id"] == want.as_str()).count()
+}
+pub fn delivered(w: &World, id: &str) -> usize {
+    delivered_at(w, id, 1)
+}
+pub fn kills(w: &World, id: &str) -> usize {
+    lf::calls(w)
+        .iter()
+        .filter(|c| c[0] == "kill" && c[1] == addr(id))
+        .count()
+}
+/// The match, then a reread showing `now` (b-calls 12): no kill follows unless `now` is the same terminal.
+pub fn rereads(w: &World, id: &str, now: &Value) {
+    found_at(w, id, 1, &wire(w, id, "live", None, &lf::ARGV));
+    lf::get(w, &addr(id), now);
+}
+/// A Lost terminal (`argv`, a recovery shell): release-1d R2 in fence mode, the calls B1's release makes.
+pub fn releases(w: &World, id: &str, argv: &[&str]) {
+    let lost = wire(w, id, "live", None, argv);
+    found_at(w, id, 1, &lost);
+    lf::get(w, &addr(id), &lost);
+    lf::relabel(w, &addr(id));
+}
+/// Generation 1 of `id` ended and noticed before the test.
+pub fn done(w: &World, id: &str) {
+    let m = w.folder(id);
+    crate::state::evidence::publish(&super::gens::path(&m, 1, "ended"), &json!({"at": "x"}))
+        .unwrap();
+    crate::state::evidence::publish(
+        &super::gens::path(&m, 1, "notice"),
+        &json!({"kind": "stopped"}),
+    )
+    .unwrap();
+}

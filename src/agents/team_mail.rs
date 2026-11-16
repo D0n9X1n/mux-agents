@@ -179,12 +179,21 @@ pub struct Member {
     pub id: String,
     pub name: String,
     pub record: Value,
+    /// The parents `send parent` and `send children` follow: the record's `parentAgent.id`, replaced by the logical
+    /// parents (C0, call 25) for those two words.
+    pub parents: Vec<String>,
 }
 
 impl Member {
     pub fn mailbox(&self) -> String {
         super::mail::member_mailbox(&self.id, &self.record)
     }
+}
+
+/// The parent id a record names, as recorded.
+pub fn raw_parents(record: &Value) -> Vec<String> {
+    let p = super::text(record.get("parentAgent").and_then(|p| p.get("id")));
+    if p.is_empty() { Vec::new() } else { vec![p] }
 }
 
 /// The team (`membership::team(caller)`, with or without a team record: the members of the session): every committed
@@ -204,6 +213,7 @@ pub fn roster(s: &super::membership::Snapshot) -> Vec<Member> {
                 .map(|st| Member {
                     id: o.identity.id.clone(),
                     name: o.identity.name.clone(),
+                    parents: raw_parents(&st.record),
                     record: st.record.clone(),
                 })
         })
@@ -248,7 +258,6 @@ const NO_PARENT: &str = "only an agent has a parent";
 /// Who `t` names for `sender` (a member id; None for a person) on `roster`.
 pub fn pick(roster: &[Member], sender: Option<&str>, t: &Target) -> Res<Pick> {
     let leader = roster.iter().find(|m| super::tree::is_leader(&m.record));
-    let parent_of = |m: &Member| super::text(m.record.get("parentAgent").and_then(|p| p.get("id")));
     let others = |keep: &dyn Fn(&Member) -> bool| -> Res<Pick> {
         let v: Vec<Member> = roster
             .iter()
@@ -275,9 +284,12 @@ pub fn pick(roster: &[Member], sender: Option<&str>, t: &Target) -> Res<Pick> {
             let Some(me) = sender.and_then(|s| roster.iter().find(|m| m.id == s)) else {
                 return refuse(2, "parent", NO_PARENT);
             };
-            let parent = parent_of(me);
-            if let Some(p) = roster.iter().find(|m| !parent.is_empty() && m.id == parent) {
-                return Ok(Pick::Members(vec![p.clone()]));
+            let up: Vec<Member> = (roster.iter())
+                .filter(|m| me.parents.contains(&m.id))
+                .cloned()
+                .collect();
+            if !up.is_empty() {
+                return Ok(Pick::Members(up));
             }
             match me
                 .record
@@ -295,7 +307,7 @@ pub fn pick(roster: &[Member], sender: Option<&str>, t: &Target) -> Res<Pick> {
                 (None, Some(l)) => l.id.clone(),
                 (None, None) => return refuse(2, "target", NO_LEADER),
             };
-            others(&|m| parent_of(m) == parent)
+            others(&|m| m.parents.contains(&parent))
         }
         Target::Team => others(&|_| true),
     }
@@ -555,12 +567,13 @@ fn plan(
             Some((id, record)) => Pick::Members(vec![Member {
                 id,
                 name: n.clone(),
+                parents: raw_parents(&record),
                 record,
             }]),
             None if sender.id.is_none() && re.is_none() => return Ok(None),
             None => return refuse(2, "target", NO_NAME),
         },
-        _ => pick(&roster(s), sender.id.as_deref(), t)?,
+        _ => pick(&placed(ctx, caller, roster(s), t), sender.id.as_deref(), t)?,
     };
     let recipients: Vec<Value> = match picked {
         Pick::Members(v) => v
@@ -596,6 +609,25 @@ fn plan(
         _ => None,
     };
     Ok(Some((recipients, hop, cast)))
+}
+
+/// Call 25: for `parent` and `children`, each member's logical parents (C0) from the bar's view of the tree, which
+/// never refuses (a send is not blocked by a loop elsewhere); a member it does not place keeps its recorded parent.
+/// The team lock is held and the view only reads.
+fn placed(ctx: &Ctx, caller: &Caller, mut roster: Vec<Member>, t: &Target) -> Vec<Member> {
+    if !matches!(t, Target::Parent | Target::Children) {
+        return roster;
+    }
+    let shown = super::cascade::Tree::shown(&super::team_state::Tx {
+        ctx,
+        scope: super::team_state::Scope::of(caller),
+    });
+    for m in &mut roster {
+        if let Some(ps) = shown.placed(&m.id) {
+            m.parents = ps;
+        }
+    }
+    roster
 }
 
 /// A Claude Code session id of a record, else null.

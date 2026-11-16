@@ -270,15 +270,18 @@ impl Tx<'_> {
         })
     }
 
-    /// desired.json holds desired and at, written as patch writes.
+    /// desired.json holds desired and at (state-0 S2). Reread under the member lock through the walk from the state
+    /// root (A3a R5, b-calls 13): a link or a non-folder on the way, or an unreadable file, refuses and nothing is
+    /// written. A failed write is `state`, `NOT_WRITTEN` (A3b R-W3).
     pub fn desired(&self, id: &str, running: bool) -> Res<()> {
         let word = if running { "running" } else { "stopped" };
         let body = json!({"desired": word, "at": utc_o(self.ctx.clock.now())});
         super::lock(self.ctx, &self.scope.member_lock(id), || {
-            // Reread under the lock, as patch does: an unreadable file is refused, never replaced. The path is named
-            // inline in each statement, so the S3 lint (tests/repo.rs) sees desired.json written here.
-            evidence::read(&self.folder(id).join("desired.json")).known()?;
+            // Reread under the lock through the walk: a link or an unreadable file is refused, never replaced. The
+            // path is named inline in each statement, so the S3 lint (tests/repo.rs) sees desired.json written here.
+            super::gens::walk(&self.folder(id), &["desired.json"]).known()?;
             write_json_durable(&self.folder(id).join("desired.json"), &body)
+                .map_err(|_| not_written())
         })
     }
 }
@@ -830,6 +833,37 @@ mod tests {
         let got = open(&w.ctx, &s, |tx| tx.desired(ID, false));
         assert_eq!(got.map_err(|e| e.check), Err("evidence"));
         assert_eq!(std::fs::read(&at).unwrap(), b"{");
+    }
+
+    // cascade-3d C1, A3a R5, b-calls 13: desired.json is reread through the walk from the state root. A linked
+    // member folder (Unix symlink; Windows directory symlink or junction) refuses `evidence` and the link's target
+    // gains no desired.json. A failed flush is `state`, `NOT_WRITTEN`.
+    #[test]
+    fn desired_walks_from_the_state_root() {
+        let w = World::human("");
+        let s = Scope::of(&w.caller());
+        let target = w._dir.path().join("elsewhere");
+        std::fs::create_dir_all(&target).unwrap();
+        std::fs::create_dir_all(w.folder(ID).parent().unwrap()).unwrap();
+        crate::testing::link_dir(&target, &w.folder(ID));
+        let got = open(&w.ctx, &s, |tx| tx.desired(ID, false)).unwrap_err();
+        assert_eq!(got.check, "evidence", "a linked member folder");
+        assert!(
+            !target.join("desired.json").exists(),
+            "nothing written through the link"
+        );
+        std::fs::remove_dir(w.folder(ID))
+            .or_else(|_| std::fs::remove_file(w.folder(ID)))
+            .unwrap();
+        std::fs::create_dir_all(w.folder(ID)).unwrap();
+        crate::state::fs::fail_sync_dir(Some(&w.folder(ID)));
+        let got = open(&w.ctx, &s, |tx| tx.desired(ID, false)).unwrap_err();
+        crate::state::fs::fail_sync_dir(None);
+        assert_eq!(
+            (got.check, got.message.as_str()),
+            ("state", NOT_WRITTEN),
+            "a failed flush"
+        );
     }
     // G1.5, B-R2: one patch sets generation, hcAddress, team and launch.json's identity, drops pending, adds
     // completing when given; only while pending names n (exactly once; otherwise `Ok(None)`, nothing written); an

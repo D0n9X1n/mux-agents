@@ -146,14 +146,9 @@ fn admit(
             })?,
     };
     let id = &x.identity.id;
-    if let Some((team, s)) = gate {
-        super::tree::authorize(
-            &super::tree::records_of(snapshot),
-            &team.leader,
-            s,
-            id,
-            "resume",
-        )?;
+    if let Some((_, s)) = gate {
+        // Call 10: over the session's forward-resolved tree; the spawn lock (the team lock) is held.
+        super::tree::authority(ctx, caller, s, id, "resume")?;
     }
     let record = snapshot.records[id].record.clone();
     let life = match x.life {
@@ -181,6 +176,12 @@ fn admit(
             ),
         );
     }
+    // cascade-3d C3: no journal around X, and X's parent open. Under the spawn lock (the team lock); read only.
+    let tx = super::team_state::Tx {
+        ctx,
+        scope: super::team_state::Scope::of(caller),
+    };
+    super::cascade::reopen_check(&tx, id)?;
     let name_check = || -> Res<()> {
         let others = local
             .iter()
@@ -318,17 +319,25 @@ fn taken(ctx: &Ctx, caller: &crate::caller::Caller, id: &str) -> Res<Option<Stri
             }
             return Ok(Some(successor));
         }
-        let claim = match read_json(&folder.join("gens").join("0.claim")) {
-            Ok(claim) => claim,
-            Err(_) => return Ok(Some(successor)),
-        };
-        match claim.as_ref().and_then(Value::as_str) {
-            Some("abandoned") => continue,
-            None if claim.is_none() && folder.join("abort.json").exists() => continue,
-            _ => return Ok(Some(successor)),
+        if legacy_void(&folder) {
+            continue;
         }
+        return Ok(Some(successor));
     }
     Ok(None)
+}
+
+/// The legacy rule (`taken`, call 23): a pre-lifecycle successor never ran when its claim is `abandoned`, or when it
+/// has no claim and abort.json exists. An unreadable claim ran, so a name is never reused on a guess.
+pub(crate) fn legacy_void(folder: &Path) -> bool {
+    let Ok(claim) = read_json(&folder.join("gens").join("0.claim")) else {
+        return false;
+    };
+    match claim.as_ref().and_then(Value::as_str) {
+        Some("abandoned") => true,
+        None => claim.is_none() && folder.join("abort.json").exists(),
+        _ => false,
+    }
 }
 
 /// R1, R5: every member folder of every server folder of the state root, classified once, links kept.

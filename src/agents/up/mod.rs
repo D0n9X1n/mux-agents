@@ -52,6 +52,11 @@ pub fn up(ctx: &Ctx, request: &Request) -> Res<Map<String, Value>> {
     let folder = identity::folder(ctx)?;
     let team = identity::team(ctx, &folder, client, request.value("Name").unwrap_or(""))?;
     admit(ctx, &format!("up|{team}"), || {
+        // cascade-3d C8: the caller's session's journals first (lock order up|T, then the team lock).
+        let scope = super::team_state::Scope::of(&caller);
+        if super::cascade::waiting(ctx, &scope) {
+            super::team_state::open(ctx, &scope, |tx| super::cascade::finish(tx, &caller))?;
+        }
         discover::refuse_existing(ctx, &core, &caller.server_key, &team)?;
         create(
             ctx,
