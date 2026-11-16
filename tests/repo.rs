@@ -385,6 +385,11 @@ const SCOPE_READS_ALLOWED: &[(&str, &str, &str)] = &[
     ),
     ("src/agents/scope.rs", "shown", "the presentation pair"),
     (
+        "src/agents/scope.rs",
+        "admit",
+        "admission compares the caller's own server",
+    ),
+    (
         "src/agents/up/index.rs",
         "server_of",
         "the caller's own server tuple",

@@ -2,6 +2,7 @@
 use super::super::fixture::World;
 use super::super::team_state::Scope;
 use crate::agents::scope;
+use crate::agents::up::index::{self, Index, Inputs, Pending, Server, View};
 use crate::caller::Anchor;
 use serde_json::json;
 
@@ -175,4 +176,261 @@ fn anchor_caller_sets_only_the_anchor() {
     };
     assert_eq!(kept(&a), kept(&p), "presentation untouched");
     assert_eq!(scope::state(&a), at(), "state at the anchor");
+}
+
+// ---- reentry-6a E2 (Task 3): person admission ----
+
+/// An index of team `t` anchored at K1/$A with the given view, pending and aliases.
+fn ix(t: &str, view: Option<View>, pending: Option<Pending>, aliases: Vec<View>) -> Index {
+    Index {
+        team: t.into(),
+        inputs: Inputs {
+            client: "claude".into(),
+            options: vec![],
+            prompt: vec![],
+            name: String::new(),
+            folder: "/p".into(),
+        },
+        anchor: Some(Anchor {
+            key: K1.into(),
+            session: "$A".into(),
+        }),
+        view,
+        pending,
+        aliases,
+        releases: vec![],
+    }
+}
+/// The World's own server tuple, taken before any index exists (once one claims the session, resolving admits).
+fn here(w: &World) -> Server {
+    index::server_of(&w.caller())
+}
+fn on(s: Server, session: &str) -> View {
+    View {
+        server: s,
+        session: session.into(),
+        name: "p-01234567-v".into(),
+    }
+}
+fn pending_on(w: &World, s: Server, name: &str) -> Pending {
+    Pending {
+        server: s,
+        name: name.into(),
+        release: w
+            .ctx
+            .state_root
+            .join("up")
+            .join("r.release")
+            .to_str()
+            .unwrap()
+            .into(),
+    }
+}
+const T1: &str = "1111111111111111";
+const T2: &str = "2222222222222222";
+
+/// `mux-agent <args>` through the real dispatcher: (exit code, reply).
+fn run(w: &World, args: &[&str]) -> (u8, serde_json::Value) {
+    let args: Vec<String> = args.iter().map(|a| a.to_string()).collect();
+    let (code, out) = crate::cli::run(&args, || Ok(&w.ctx));
+    (code, serde_json::from_str(&out).unwrap())
+}
+
+// E2: a person in the proven view resolves to the anchor; its multiplexer stays its own.
+#[test]
+fn a_person_in_the_proven_view_reaches_the_anchor() {
+    let w = World::human("");
+    let me = here(&w);
+    index::write(&w.ctx, &ix(T1, Some(on(me, "$3")), None, vec![])).unwrap();
+    let c = crate::caller::resolve(&w.ctx).unwrap();
+    assert_eq!(
+        c.anchor.clone(),
+        Some(Anchor {
+            key: K1.into(),
+            session: "$A".into()
+        })
+    );
+    assert_eq!(
+        (scope::state(&c), c.session.as_str()),
+        (at(), "$3"),
+        "state at the anchor, multiplexer its own"
+    );
+    assert!(
+        !w.fakes
+            .mux_calls()
+            .iter()
+            .any(|a| a.join(" ").contains("#{session_name}")),
+        "no pending: no name read"
+    );
+}
+
+// Row 3.1: the caller proof sees the server; the index proof, one open later, sees it restarted: the view is not
+// proven, so the session is unclaimed, never anchored on a dead server.
+#[test]
+fn a_view_on_a_server_restarted_since_the_caller_proof_claims_nothing() {
+    let w = World::human("");
+    let me = here(&w);
+    index::write(&w.ctx, &ix(T1, Some(on(me.clone(), "$3")), None, vec![])).unwrap();
+    w.fakes.opens(me.pid, &[Some(me.start), Some(me.start + 1)]);
+    assert_eq!(crate::caller::resolve(&w.ctx).unwrap().anchor, None);
+}
+
+// E2: in a session named `pending.name` on its proven server, or at an alias: 1 `moved`, through the dispatcher.
+#[test]
+fn a_pending_session_or_an_alias_is_moved() {
+    let w = World::human("");
+    let me = here(&w);
+    w.fakes.mux_rule("#{session_name}", 0, "p-01234567-y\n", "");
+    let p = pending_on(&w, me.clone(), "p-01234567-y");
+    index::write(&w.ctx, &ix(T1, None, Some(p), vec![])).unwrap();
+    let e = crate::caller::resolve(&w.ctx).unwrap_err();
+    assert_eq!(
+        (e.code, e.check, e.message.as_str()),
+        (1, "moved", scope::MOVED)
+    );
+    let (code, reply) = run(&w, &["list"]);
+    assert_eq!(
+        (code, reply["check"].as_str()),
+        (1, Some("moved")),
+        "{reply}"
+    );
+    std::fs::remove_file(index::path(&w.ctx, T1)).unwrap();
+    index::write(
+        &w.ctx,
+        &ix(T2, Some(on(me.clone(), "$9")), None, vec![on(me, "$3")]),
+    )
+    .unwrap();
+    assert_eq!(
+        crate::caller::resolve(&w.ctx).unwrap_err().check,
+        "moved",
+        "an alias"
+    );
+}
+
+// E2: two claims, or an unreadable index: 1 `index`; a torn index of another team names its full path (call 2).
+#[test]
+fn conflicting_or_unreadable_indexes_refuse_index() {
+    let w = World::human("");
+    let me = here(&w);
+    index::write(&w.ctx, &ix(T1, Some(on(me.clone(), "$3")), None, vec![])).unwrap();
+    index::write(&w.ctx, &ix(T2, Some(on(me.clone(), "$3")), None, vec![])).unwrap();
+    assert_eq!(
+        crate::caller::resolve(&w.ctx).unwrap_err().check,
+        "index",
+        "two anchors"
+    );
+    let moved = ix(
+        T2,
+        Some(on(me.clone(), "$9")),
+        None,
+        vec![on(me.clone(), "$3")],
+    );
+    index::write(&w.ctx, &moved).unwrap();
+    assert_eq!(
+        crate::caller::resolve(&w.ctx).unwrap_err().check,
+        "index",
+        "an anchor and a moved claim"
+    );
+    index::write(&w.ctx, &ix(T2, Some(on(me, "$9")), None, vec![])).unwrap();
+    assert_eq!(
+        crate::caller::resolve(&w.ctx)
+            .unwrap()
+            .anchor
+            .map(|a| a.key),
+        Some(K1.into()),
+        "one claim"
+    );
+    let torn = index::path(&w.ctx, T2);
+    std::fs::write(&torn, b"{").unwrap();
+    let e = crate::caller::resolve(&w.ctx).unwrap_err();
+    assert_eq!(
+        (e.check, e.message),
+        (
+            "index",
+            format!(
+                "the team index cannot be read; repair or remove {}",
+                torn.display()
+            )
+        ),
+        "a torn index of another team names its path"
+    );
+}
+
+// E2, call 6 (row 3.3): a same-server pending of another name, and a view of another session, claim nothing.
+#[test]
+fn an_unclaimed_person_keeps_todays_scope() {
+    let w = World::human("");
+    let me = here(&w);
+    w.fakes.mux_first("#{session_name}", 0, "mine\n", "");
+    let p = pending_on(&w, me.clone(), "p-01234567-other");
+    index::write(&w.ctx, &ix(T1, Some(on(me, "$9")), Some(p), vec![])).unwrap();
+    let c = crate::caller::resolve(&w.ctx).unwrap();
+    assert_eq!(
+        (c.anchor.clone(), scope::state(&c).key),
+        (None, c.server_key.clone())
+    );
+}
+
+// E2: `up` needs only person proof, never the index; agents and hc members fail it.
+#[test]
+fn up_needs_only_person_proof() {
+    let w = World::human("");
+    let me = here(&w);
+    w.fakes.mux_rule("#{session_name}", 0, "p-01234567-y\n", "");
+    let p = pending_on(&w, me, "p-01234567-y");
+    index::write(&w.ctx, &ix(T1, None, Some(p), vec![])).unwrap();
+    let up = crate::agents::up::person;
+    assert_eq!(up(&w.ctx).unwrap().anchor, None, "up: person proof only");
+    std::fs::write(index::path(&w.ctx, T1), b"{").unwrap();
+    assert!(up(&w.ctx).is_ok(), "a torn index never blocks up");
+    let a = World::agent("");
+    assert_eq!(up(&a.ctx).unwrap_err().check, "tagged", "an agent pane");
+    let mut m = World::human("");
+    m.ctx.env = crate::ctx::Env::from_pairs([("HC_TERMINAL_ID", "t1".to_string())]);
+    assert_eq!(up(&m.ctx).unwrap_err().check, "tagged", "an hc member");
+}
+
+// Call 10 through the dispatcher: a person in the view lists the K1/$A team and takes its team lock; the real
+// `route_team` keeps its send journal at K1 under `$A` (call 32).
+#[test]
+fn a_person_in_the_view_reaches_the_teams_records_and_lock_through_the_dispatcher() {
+    let w = World::human("");
+    let me = here(&w);
+    team_record(&w, "$A");
+    record_at(&w, "aaaaaaaaaaa1", "$A");
+    index::write(&w.ctx, &ix(T1, Some(on(me, "$3")), None, vec![])).unwrap();
+    let (code, listed) = run(&w, &["list", "-All"]);
+    assert_eq!(code, 0, "{listed}");
+    assert!(
+        listed.to_string().contains("\"m1\""),
+        "the K1/$A member is listed: {listed}"
+    );
+    // Checklist R6: hc runs `m1` (generation 1, live), so the send is delivered through the real `route_team`.
+    use crate::agents::{core_fixture as cf, life_fixture as lf};
+    cf::online(&w);
+    cf::listing(&w, &format!("{K1}:$A"), &[]);
+    let wire = json!({"address": "t1", "name": lf::hc_name(1), "state": "live", "reason": null,
+        "argv": lf::ARGV, "exit_code": null, "labels": {"mux.managed": "1", "mux.team": format!("{K1}:$A"),
+        "mux.id": "aaaaaaaaaaa1", "mux.gen": "1", "mux.name": "m1"}});
+    cf::get(&w, "t1", wire);
+    let (sent_code, sent) = run(&w, &["send", "m1", "-Body", "x"]);
+    assert_eq!(sent_code, 0, "the send is delivered: {sent}");
+    w.fakes.hc_done().unwrap();
+    assert!(
+        w.fakes
+            .locks()
+            .iter()
+            .any(|k| k.contains(&format!("spawn|{K1}|$A"))),
+        "the anchor's team lock: {:?}",
+        w.fakes.locks()
+    );
+    let k1 = w.ctx.state_root.join(K1);
+    assert!(
+        crate::agents::team_mail::sends_root(&k1, "$A").exists(),
+        "team_mail.rs:485: the journal's session is $A ({sent_code}: {sent})"
+    );
+    assert!(
+        !crate::agents::team_mail::sends_root(&k1, "$3").exists(),
+        "none under the shown session"
+    );
 }

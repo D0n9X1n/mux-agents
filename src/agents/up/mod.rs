@@ -77,13 +77,18 @@ pub fn up(ctx: &Ctx, request: &Request) -> Res<Map<String, Value>> {
 }
 
 /// A person in a tmux or rmux pane; members and agents are refused `tagged`.
-fn person(ctx: &Ctx) -> Res<Caller> {
-    person_as(ctx, "run up")
+/// reentry-6a E2: `up` needs only person proof, never the index (`resolve_person`).
+pub(crate) fn person(ctx: &Ctx) -> Res<Caller> {
+    gate(ctx, "run up", false)
 }
 
-/// The person gate of `up` and of every person verb that reuses it (views-6f ambiguity 13): `what` completes the
-/// refusals, so `up`'s own texts ("a member cannot run up", ..) are unchanged.
+/// The person gate of every person verb that reuses `up`'s (views-6f ambiguity 13): `what` completes the
+/// refusals, so `up`'s own texts ("a member cannot run up", ..) are unchanged. These verbs are admitted (E2).
 pub(crate) fn person_as(ctx: &Ctx, what: &str) -> Res<Caller> {
+    gate(ctx, what, true)
+}
+
+fn gate(ctx: &Ctx, what: &str, admitted: bool) -> Res<Caller> {
     if crate::caller::hc::applies(ctx) {
         return refuse(2, "tagged", format!("a member cannot {what}"));
     }
@@ -91,7 +96,11 @@ pub(crate) fn person_as(ctx: &Ctx, what: &str) -> Res<Caller> {
     if crate::mux::endpoint(&ctx.env, crate::state::root::HOST).is_none() || !super::pane_id(pane) {
         return refuse(1, "endpoint", OUTSIDE);
     }
-    let caller = crate::caller::resolve(ctx)?;
+    let caller = if admitted {
+        crate::caller::resolve(ctx)?
+    } else {
+        crate::caller::resolve_person(ctx)?
+    };
     if caller.kind == Kind::Agent || caller.member.is_some() {
         return refuse(2, "tagged", format!("an agent cannot {what}"));
     }
