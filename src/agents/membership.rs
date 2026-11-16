@@ -121,6 +121,10 @@ fn scan(ctx: &Ctx, caller: &Caller) -> Res<Scan> {
                         orphans.push((id.clone(), n.to_string(), name.to_owned()));
                     }
                 }
+                // r6b call 12: a held pending n+1 stands for the member (one slot); its listed active n is skipped.
+                if let (true, Some(n)) = (s.held, g.active()) {
+                    freed.push((id.clone(), n.to_string()));
+                }
                 life_local(g, &s, &id, &team(caller))?
             }
             _ => match super::prelife::slot(&folder, record, &id, caller) {

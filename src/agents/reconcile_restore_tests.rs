@@ -8,7 +8,7 @@ use super::reconcile_tests::{X, found, member, ok, wire_of};
 use serde_json::{Value, json};
 use std::path::PathBuf;
 
-const L: &str = "cccccccccccc";
+pub(super) const L: &str = "cccccccccccc";
 const Y: &str = "dddddddddddd";
 
 /// R1 of release-1d as hc sees it for member `id` gen 1: the reread of the shell, then the one relabel.
@@ -38,11 +38,11 @@ fn unmanaged_claude(w: &World, pid: u32) {
     w.fakes.client(pid, crate::parse::Client::Claude);
 }
 /// A conversation id of member `id` alone (r6b call 11: unrelated members never share one).
-fn sid_of(id: &str) -> String {
+pub(super) fn sid_of(id: &str) -> String {
     format!("{}-2032-48ef-a920-{id}", &id[..8])
 }
 /// A member unrelated to X: its record and its generation 1 `launch.json` name `sid_of(id)`.
-fn other(w: &World, id: &str) -> PathBuf {
+pub(super) fn other(w: &World, id: &str) -> PathBuf {
     let f = member(w, id, json!({"sessionId": sid_of(id)}));
     let l = super::gens::path(&f, 1, "launch");
     std::fs::remove_file(&l).unwrap();

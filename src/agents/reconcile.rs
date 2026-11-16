@@ -115,8 +115,12 @@ pub fn observe(tx: &Tx<'_>, lazy: &Lazy<'_>, g: &Gen) -> Res<(Seen, Option<Termi
     let id = text(g.record().get("id"));
     if marks.any() {
         s.verdict = recorded(g.folder(), n)?;
-        if s.verdict.is_none() && s.cause.as_deref() == Some("restore") && s.released {
-            s.verdict = judged(tx, &id, n, None)?;
+        if s.cause.as_deref() == Some("restore") && s.released {
+            // row 0 resumes the conversation that ran (r6b call 15)
+            s.session = session_of(g.read(n, "launch").known()?.as_ref());
+            if s.verdict.is_none() {
+                s.verdict = judged(tx, &id, n, None)?;
+            }
         }
         return Ok((s, None));
     }
@@ -124,12 +128,7 @@ pub fn observe(tx: &Tx<'_>, lazy: &Lazy<'_>, g: &Gen) -> Res<(Seen, Option<Termi
         return Ok((s, None)); // half a release: row 2 Unknown("release"); the preamble finishes it first
     }
     let launch = g.read(n, "launch").known()?;
-    s.session = launch
-        .as_ref()
-        .and_then(|l| l.get("sessionId"))
-        .and_then(Value::as_str)
-        .filter(|sid| crate::checks::session_id(sid))
-        .map(str::to_owned);
+    s.session = session_of(launch.as_ref());
     if s.pending {
         // r6b call 24: the member stays Unknown("pending"), its active generation is still adjudicated.
         s.verdict = judged(tx, &id, n, None)?;
@@ -160,6 +159,15 @@ pub fn observe(tx: &Tx<'_>, lazy: &Lazy<'_>, g: &Gen) -> Res<(Seen, Option<Termi
     }
     s.verdict = judged(tx, &id, n, seen.as_ref())?;
     Ok((s, seen))
+}
+
+/// A `launch.json` `sessionId` that is a valid conversation id (`checks::session_id`).
+fn session_of(launch: Option<&Value>) -> Option<String> {
+    launch
+        .and_then(|l| l.get("sessionId"))
+        .and_then(Value::as_str)
+        .filter(|sid| crate::checks::session_id(sid))
+        .map(str::to_owned)
 }
 
 /// r6b call 29: a done generation's recorded outcome, through its publisher's flushes (`read_flushed`).
@@ -274,7 +282,7 @@ pub fn run(ctx: &Ctx, anchor: &Caller) -> Res<Map<String, Value>> {
             match observe(tx, &lazy, &g) {
                 Ok((seen, _)) => {
                     // r6b call 16: a member that fails here is Unknown; only a crash fails the pass.
-                    if let Err(e) = decide(tx, &lazy, &id, &g, classify(&seen), &seen, &mut reply) {
+                    if let Err(e) = decide(tx, &lazy, anchor, &id, &g, &seen, &mut reply) {
                         if e.check == "halted" {
                             return Err(e);
                         }
@@ -321,18 +329,18 @@ fn pass_halt(r: Res<()>) -> Res<()> {
     }
 }
 
-/// The reply of one row. Row 0 is held here until Task 5.
+/// The reply of the row `seen` classifies to (rows 0 and 4 restore at the anchor).
 fn decide(
     tx: &Tx<'_>,
     lazy: &Lazy<'_>,
+    anchor: &Caller,
     id: &str,
     g: &Gen,
-    row: Row,
     seen: &Seen,
     reply: &mut Reply,
 ) -> Res<()> {
     let r = g.record();
-    let done = match row {
+    let done = match classify(seen) {
         Row::Stopped | Row::Running | Row::Ended => return Ok(()),
         Row::Unknown(check) => {
             reply.unknown.push(entry(id, r, "check", json!(check)));
@@ -344,7 +352,7 @@ fn decide(
         }
         Row::Held(why) => Done::Held(why, None),
         Row::Lost => restore::restore_lost(tx, lazy, id, g, seen)?,
-        Row::Await => Done::Held("restore".into(), None), // Task 5
+        Row::Await => restore::restore_awaiting(tx, lazy, anchor, id, g, seen)?,
     };
     match done {
         Done::Restored(n) => {

@@ -78,6 +78,32 @@ fn occupied_or_run(tx: &Tx<'_>, core: &Core<'_>, id: &str, g: &Gen, sid: &str) -
     relaunch(tx, core, id, g, sid).map(Done::Restored)
 }
 
+/// Row 0 (L2): the conversation, gate, then the cap (L1, reacquired at the anchor; never for the leader), then
+/// occupancy and n+1 from the released generation's conversation.
+pub(super) fn restore_awaiting(
+    tx: &Tx<'_>,
+    lazy: &Lazy<'_>,
+    anchor: &crate::caller::Caller,
+    id: &str,
+    g: &Gen,
+    seen: &Seen,
+) -> Res<Done> {
+    let sid = session(seen)?; // r6b call 15: no valid conversation id, nothing launches
+    if let Some(why) = gate(tx, id, g)? {
+        return Ok(Done::Held(why, None));
+    }
+    let core = lazy.get()?;
+    if !super::super::tree::is_leader(g.record()) {
+        let snapshot = super::super::membership::Snapshot::for_spawn(tx.ctx, anchor, core)?;
+        match super::super::tree::limit(&snapshot) {
+            Ok(()) => {}
+            Err(e) if e.check == "limit" => return Ok(Done::Held("limit".into(), None)),
+            Err(e) => return Err(e),
+        }
+    }
+    occupied_or_run(tx, core, id, g, &sid)
+}
+
 /// Row 4 (L3): the conversation, gate, release n (`cause: restore`, X still reserved), then occupancy and n+1 in
 /// the same Tx. Nothing is released without a valid conversation id or with a hold of the gate.
 pub(super) fn restore_lost(
