@@ -130,15 +130,23 @@ pub fn finish(tx: &Tx<'_>, lazy: &Lazy<'_>, id: &str, n: u64) -> Res<bool> {
 /// R1 steps 3 and 4 from a `release.json` body, in R1's order (b-calls 17): `not_found` or `finished` at the
 /// recorded address is skipped before any name check; another name stops; `mux.kept=<this team>` is skipped, any
 /// other `mux.kept` stops (b-calls 16); otherwise `relabel`. Then `released.json`.
+/// a3c call 47: an empty, missing or malformed recorded address or hcName refuses `evidence` before any hc call.
 pub fn conclude(tx: &Tx<'_>, lazy: &Lazy<'_>, id: &str, n: u64, rel: &Value) -> Res<()> {
+    use super::ident;
     let text = |k: &str| rel.get(k).and_then(Value::as_str).unwrap_or_default();
     let (address, hc_name, ours) = (text("address"), text("hcName"), team(tx));
+    if !ident::hc_address(address) {
+        return Err(ident::refused("release address"));
+    }
+    if !ident::hc_name(hc_name) {
+        return Err(ident::refused("release hcName"));
+    }
     let core = lazy.get()?;
     match core.get(address) {
         Err(e) if e.check == "not_found" => {}
         Err(_) => return Err(gens::unclear("hc cannot show the released shell")),
         Ok(t) if t.state == State::Finished => {}
-        Ok(t) if t.name.as_deref() != Some(hc_name) => {
+        Ok(t) if !ident::same(ident::hc_name, t.name.as_deref(), Some(hc_name)) => {
             return Err(gens::unclear("another terminal holds the released address"));
         }
         Ok(t) => match t.labels.get("mux.kept") {
@@ -987,5 +995,60 @@ mod tests {
             "the next open clears it"
         );
         assert!(gens::done(&m, 1).unwrap());
+    }
+
+    // a3c call 47 (TL #149, production readiness): a release intent whose address or hcName is empty, missing or
+    // malformed never owns a terminal, even one carrying the same name with matching labels, nor an address hc
+    // answers `not_found` for. `finish` refuses `evidence` before any hc call: no relabel, no released.json, the
+    // intent kept.
+    #[test]
+    fn an_invalid_release_identity_owns_nothing() {
+        for case in [
+            "empty name",
+            "missing name",
+            "malformed name",
+            "empty address",
+            "missing address",
+        ] {
+            let (w, s) = lf::world();
+            let m = lost_member(&w);
+            let mut body =
+                json!({"address": "t1", "hcName": lf::hc_name(1), "cause": "lost", "at": "x"});
+            let mut shell = lf::lost(&w, 1, lf::LOST_ARGVS[0]);
+            match case {
+                "empty name" => body["hcName"] = json!(""),
+                "missing name" => {
+                    body.as_object_mut().unwrap().remove("hcName");
+                }
+                "malformed name" => body["hcName"] = json!("../x"),
+                "empty address" => body["address"] = json!(""),
+                _ => {
+                    body.as_object_mut().unwrap().remove("address");
+                }
+            }
+            shell["name"] = match case {
+                "malformed name" => json!("../x"),
+                "empty name" | "missing name" => json!(""),
+                _ => shell["name"].clone(),
+            };
+            gens::publish_once(&m, 1, "release", &body).unwrap();
+            cf::online(&w);
+            if case.ends_with("address") {
+                // What main would ask: hc does not know "" (`not_found`).
+                lf::gone(&w, "");
+            } else {
+                lf::get(&w, "t1", &shell);
+                lf::relabel(&w, "t1");
+            }
+            let got = replay(&w, &s);
+            assert_eq!(got.map_err(|e| e.check), Err("evidence"), "{case}");
+            assert_eq!(lf::count(&w, "label"), 0, "{case}: relabelled");
+            assert!(!released(&m), "{case}: released.json");
+            assert!(
+                matches!(gens::read(&m, 1, "release"), Evidence::Present(_)),
+                "{case}: the intent kept"
+            );
+            lf::no_effect(&w);
+        }
     }
 }
