@@ -774,4 +774,4 @@ fn deliver(
 
 #[cfg(test)]
 #[path = "team_mail_tests.rs"]
-mod tests;
+pub(crate) mod tests;

@@ -312,14 +312,14 @@ pub fn author_of(standing: &Standing) -> Author {
 
 /// N3, ambiguity 7: under the team lock (`with_standing`, phase 3 D1), the proven caller as author and the anchor
 /// scope's `Tx` (replay hooks first). Outside a team: 2 `team`.
-fn with_author<T>(ctx: &Ctx, f: impl FnOnce(&Tx<'_>, &Author) -> Res<T>) -> Res<T> {
+fn with_author<T>(ctx: &Ctx, f: impl FnOnce(&Tx<'_>, &Author, &Caller) -> Res<T>) -> Res<T> {
     let caller = crate::caller::resolve_tree(ctx)?;
     super::tree::with_standing(ctx, &caller, |standing| {
         let Some(standing) = standing else {
             return Err(refusal(2, "team", "the notebook belongs to a team"));
         };
         let author = author_of(standing);
-        super::team_state::held(ctx, &anchor(&caller), |tx| f(tx, &author))
+        super::team_state::held(ctx, &anchor(&caller), |tx| f(tx, &author, &caller))
     })
 }
 
@@ -354,14 +354,21 @@ pub fn note(ctx: &Ctx, request: &Request) -> Res<Map<String, Value>> {
     if body.len() > BODY_LIMIT {
         return Err(usage());
     }
-    let (entry, duplicate) =
-        match with_author(ctx, |tx, author| append(tx, author, &title, &body, id))? {
+    // 7b V2, V3: the notices follow the publish under the same team lock; a duplicate posts too (each is idempotent
+    // by `note-<id>`), so a retry finishes notices an earlier call missed. A failed notice never undoes the note.
+    let (entry, duplicate, notified, errors) = with_author(ctx, |tx, author, caller| {
+        let (entry, duplicate) = match append(tx, author, &title, &body, id)? {
             Wrote::Added(e) => (e, false),
             Wrote::Found(e) => (e, true),
         };
+        let (notified, errors) = news::notify(ctx, caller, author, &entry);
+        Ok((entry, duplicate, notified, errors))
+    })?;
     let mut reply = Map::new();
     reply.insert("id".into(), entry["id"].clone());
     reply.insert("duplicate".into(), duplicate.into());
+    reply.insert("notified".into(), notified.into());
+    reply.insert("notifyErrors".into(), errors.into());
     Ok(reply)
 }
 
@@ -393,7 +400,7 @@ pub fn notes(ctx: &Ctx, request: &Request) -> Res<Map<String, Value>> {
     {
         return Err(usage());
     }
-    let all = with_author(ctx, |tx, _| entries(tx))?;
+    let all = with_author(ctx, |tx, _, _| entries(tx))?;
     let at = |id: &str| all.iter().position(|e| super::text(e.get("id")) == id);
     let unknown = || refusal(2, "target", "no note with that id");
     let mut reply = Map::new();
