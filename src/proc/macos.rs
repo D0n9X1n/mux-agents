@@ -128,6 +128,10 @@ fn proc_name(pid: u32) -> Option<String> {
 
 // kinfo_proc (sys/sysctl.h) on 64-bit macOS: 648 bytes, opening with extern_proc (sys/proc.h), whose p_pid is at byte
 // 40 and p_comm (MAXCOMLEN + 1 bytes, NUL-terminated) at byte 243. libc declares no kinfo_proc for Apple targets.
+// Layout: XNU f6217f891ac0bb64f3d375211650a4c1ff8ca1ea, bsd/sys/sysctl.h (struct kinfo_proc) and bsd/sys/proc.h (struct
+// extern_proc), the same on aarch64 and x86_64 (golang.org/x/sys SizeofKinfoProc 0x288 agrees). The size and p_pid
+// checks below catch a wrong struct or pid, not a shifted p_comm: an offset of 244 still passes them and reads
+// `claude` as `laude`, so these three constants stay pinned to those headers.
 const KINFO_PROC_SIZE: usize = 648;
 const P_PID_AT: usize = 40;
 const P_COMM_AT: usize = 243;
