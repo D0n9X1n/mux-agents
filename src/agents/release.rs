@@ -293,9 +293,36 @@ pub fn live(tx: &Tx<'_>, verb: &str, id: &str, n: u64) -> Res<Value> {
             &text("hcAddress"),
             Cause::Lost,
         )?,
+        // settle-1b live (b-calls 38): A3b-1's real `forward` for a new generation of this member (kind `retry`,
+        // the record's session, team, name and directory); `n` is unused, `forward` allocates its own.
+        "forward" => {
+            let launch = super::core_launch::Launch {
+                id: id.to_owned(),
+                kind: "retry",
+                session_id: text("sessionId"),
+                create: None,
+                spec: json!({"schema": 1, "stateDirectory": tx.ctx.state_root, "client": text("client")}),
+                team: team(tx),
+                name: text("name"),
+                up_team: None,
+                directory: text("directory"),
+            };
+            let lazy = Lazy::new(tx.ctx);
+            super::core_launch::forward(tx, lazy.get()?, launch, || Ok(()), no_view)?;
+        }
+        "terminate" => super::settle::terminate(tx, id, n)?,
         _ => return Err(Refusal::internal("unknown __life verb")),
     }
-    Ok(json!({"ok": true, "released": gens::read(&folder, n, "released").known()?.is_some()}))
+    Ok(
+        json!({"ok": true, "released": gens::read(&folder, n, "released").known()?.is_some(),
+        "ended": gens::read(&folder, n, "ended").known()?.is_some()}),
+    )
+}
+
+/// Live tests only: `forward` attaches no view.
+#[cfg(feature = "live")]
+fn no_view(_: &Core<'_>, _: &Value) -> Res<Value> {
+    Ok(json!({}))
 }
 
 #[cfg(test)]

@@ -1776,3 +1776,67 @@ fn a_lost_member_is_released_and_keeps_only_its_kept_labels() {
     assert_eq!(t["labels"], want);
     assert!(agent_dir(&live, &id).join("gens/0/released.json").exists());
 }
+
+/// `mux-agent <args>` in the root pane with MUX_AGENTS_CRASH=<step> for that process only; its exit code.
+fn run_crashed(live: &Live, step: &str, args: &[&str]) -> i32 {
+    let (script, code, done) = (
+        live.dir.join("crash.cmd"),
+        live.dir.join("crash.code"),
+        live.dir.join("crash.done"),
+    );
+    let _ = std::fs::remove_file(&done);
+    let args = args
+        .iter()
+        .map(|s| format!("\"{s}\""))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let body = format!(
+        "@setlocal\r\n@set MUX_AGENTS_CRASH={step}\r\n@\"{MUX_AGENT}\" {args} > nul\r\n@echo %errorlevel%> \"{}\"\r\n@echo done> \"{}\"\r\n",
+        code.display(),
+        done.display()
+    );
+    std::fs::write(&script, body).unwrap();
+    live.line(&live.root, &format!("\"{}\"", script.display()));
+    live.wait("the crashed command", || done.exists().then_some(()));
+    std::fs::read_to_string(code)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap()
+}
+
+/// settle-1b live on rmux (Windows), b-calls 38: a forward killed at `promote` leaves generation 0 orphan-running;
+/// G11 ends it; hc shows it finished.
+#[test]
+fn an_orphan_left_by_a_forward_crash_is_ended_by_terminate() {
+    let Some(live) = Live::start() else {
+        return;
+    };
+    let w = live.spawn("w1");
+    let id = w["id"].as_str().unwrap().to_string();
+    let address = w["hcAddress"].as_str().unwrap().to_string();
+    let seeded = live.run(&["__life", "seed", &id, "0"]);
+    assert_eq!(seeded["ok"], true, "{seeded}");
+    assert_eq!(
+        run_crashed(&live, "promote", &["__life", "forward", &id, "1"]),
+        86,
+        "killed at promote"
+    );
+    let record = std::fs::read(agent_dir(&live, &id).join("record.json")).unwrap();
+    let record: serde_json::Value = serde_json::from_slice(&record).unwrap();
+    assert_eq!(
+        record["generation"], "1",
+        "generation 1 was promoted before the kill"
+    );
+    assert_eq!(
+        hc_get(&live, &address)["state"],
+        "live",
+        "orphan 0 still runs"
+    );
+    live.wait("terminate ended the orphan", || {
+        let out = live.run_any(&["__life", "terminate", &id, "0"]);
+        (out["ok"] == true && out["ended"] == true).then_some(())
+    });
+    assert_eq!(hc_get(&live, &address)["state"], "finished");
+    assert!(agent_dir(&live, &id).join("gens/0/ended.json").exists());
+}

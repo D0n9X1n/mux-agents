@@ -4288,6 +4288,53 @@ hc {}:
             "{mux:?}"
         );
     }
+
+    // settle-1b live, b-calls 38: a forward killed at `promote` by A3b-1's real crash harness leaves generation 0
+    // orphan-running; G11 ends it, hc shows it finished, and the record keeps naming generation 1.
+    fn an_orphan_left_by_a_forward_crash_is_ended_by_terminate(mux: Mux) {
+        let Some(mut live) = Live::human(mux) else {
+            return;
+        };
+        let w = live.spawn("w1", &[]);
+        let (id, address) = (s(&w["id"]).to_string(), s(&w["hcAddress"]).to_string());
+        let (code, seeded) = live.run(&["__life", "seed", &id, "0"]);
+        assert_eq!(code, 0, "{mux:?}: {seeded}");
+        let state = live.state_text();
+        let vars = [
+            ("MUX_AGENTS_STATE", state.as_str()),
+            ("MUX_AGENTS_CRASH", "promote"),
+        ];
+        let bin = env!("CARGO_BIN_EXE_mux-agent");
+        let (code, out, err) =
+            live.server
+                .run_raw(bin, &["__life", "forward", &id, "1"], &vars, &[]);
+        assert_eq!(code, 86, "{mux:?}: killed at promote: {out} {err}");
+        let record = std::fs::read(live.agent_dir(&id).join("record.json")).unwrap();
+        let record: Value = serde_json::from_slice(&record).unwrap();
+        assert_eq!(
+            record["generation"], "1",
+            "{mux:?}: generation 1 was promoted before the kill"
+        );
+        assert_eq!(
+            core(&live, &["get", &address, "--json"])["state"],
+            "live",
+            "{mux:?}: orphan 0 still runs"
+        );
+        let ended = || {
+            let (code, out) = live.run(&["__life", "terminate", &id, "0"]);
+            code == 0 && out["ended"] == true
+        };
+        assert!(eventually(LONG, ended), "{mux:?}: terminate never ended it");
+        assert_eq!(
+            core(&live, &["get", &address, "--json"])["state"],
+            "finished",
+            "{mux:?}"
+        );
+        assert!(
+            live.agent_dir(&id).join("gens/0/ended.json").exists(),
+            "{mux:?}"
+        );
+    }
     fn hc_view_close_survives_focus_stop(mux: Mux) {
         let Some(mut live) = Live::human(mux) else {
             return;
@@ -5177,6 +5224,7 @@ hc {}:
                     team_messaging_stays_in_the_team,
                     an_unacked_batch_is_served_again_and_rebuilt_for_a_successor,
                     a_lost_member_is_released_and_keeps_only_its_kept_labels,
+                    an_orphan_left_by_a_forward_crash_is_ended_by_terminate,
                 ]
             );
         };
