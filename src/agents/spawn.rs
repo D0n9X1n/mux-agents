@@ -2003,70 +2003,92 @@ mod tests {
         }
     }
 
+    // prelife-1c call 17: the production spawn path (`spawn`, with `reap_hc`) refuses `limit` for a held
+    // pre-lifecycle folder, and gets past `limit` once its notice proves an end. `-Name w1` is taken, so a freed case
+    // stops at the name check (after `limit`), before any launch.
+    #[test]
+    fn spawn_holds_a_pre_lifecycle_slot_through_the_real_path() {
+        use crate::agents::core_fixture as cf;
+        use crate::agents::prelife_fixture::{self as pf, Answer, L, P};
+        for (case, held) in [
+            ("partial", true),
+            ("lost", true),
+            ("missing", true),
+            ("exited notice", false),
+        ] {
+            let w = human();
+            let mut answers = pf::capacity_world(&w);
+            let f = pf::fields(P, "legacy", Some(L), 1);
+            match case {
+                "partial" => drop(pf::partial(&w, P, f)),
+                "lost" => {
+                    let mut t = cf::wire(&pf::pre(&w, P, f));
+                    t["argv"] = json!(crate::agents::life_fixture::LOST_ARGVS[0]);
+                    answers.insert(format!("t{P}"), Answer::Wire(t));
+                }
+                "missing" => {
+                    pf::pre(&w, P, f);
+                    answers.insert(format!("t{P}"), Answer::Missing);
+                }
+                _ => {
+                    pf::pre(&w, P, f);
+                    answers.insert(format!("t{P}"), Answer::Missing);
+                    crate::agents::fixture::write(
+                        &w.folder(P).join("notice.json"),
+                        json!({"kind": "exited", "exitCode": 0}),
+                    );
+                }
+            }
+            pf::script(&w, answers);
+            let got = run(
+                &w,
+                &["-Client", "claude", "-Task", "add subtract", "-Name", "w1"],
+            );
+            let want = if held {
+                "2 limit the team already has 6 members besides the leader"
+            } else {
+                "2 name agent name is taken"
+            };
+            assert!(got.starts_with(want), "{case}: {got}");
+            assert!(
+                calls(&w, "new-window").is_empty(),
+                "{case}: nothing launched"
+            );
+        }
+    }
+
     #[test]
     fn an_unreadable_record_refuses_rather_than_reuse_a_name() {
         use crate::agents::core_fixture as cf;
         let id = "000000000b07";
-        for case in [
-            "not JSON",
-            "not an object",
-            "unreadable",
-            "another id",
-            "no name",
-            "no session",
-            "non-string session",
-        ] {
+        // prelife-1c G10a: the identity cases (not an object, another id, no name, no session, non-string
+        // session) are held slots now, never refusals (`prelife_slot_tests::an_unidentified_record_holds_a_slot_and_
+        // never_refuses`); a record that cannot be read at all still refuses `evidence`.
+        for case in ["not JSON", "unreadable"] {
             let w = human();
-            let mut record = cf::member(&w, id, json!({"name": "w"}));
+            cf::member(&w, id, json!({"name": "w"}));
             let path = w.folder(id).join("record.json");
             match case {
                 "not JSON" => std::fs::write(&path, "{").unwrap(),
-                "not an object" => std::fs::write(&path, "[\"w\"]").unwrap(),
-                "unreadable" => {
+                _ => {
                     std::fs::remove_file(&path).unwrap();
                     std::fs::create_dir(&path).unwrap();
-                }
-                _ => {
-                    match case {
-                        "another id" => record["id"] = "000000000b06".into(),
-                        "no name" => record["name"] = Value::Null,
-                        "no session" => {
-                            record.as_object_mut().unwrap().remove("session");
-                        }
-                        _ => record["session"] = 3.into(),
-                    }
-                    crate::agents::fixture::write(&path, record);
                 }
             }
             for args in [
                 &["-Task", "add subtract"][..],
                 &["-Task", "hi", "-Name", "w"],
             ] {
-                // Local validation precedes ls. A record that cannot be read as JSON already refuses in the team
-                // scope check, before hc is connected (#103 D2, fail closed).
-                if case != "not JSON" && case != "unreadable" {
-                    cf::online(&w);
-                }
+                // A record that cannot be read as JSON already refuses in the team scope check, before hc is
+                // connected (#103 D2, fail closed).
                 let mut full = vec!["-Client", "claude"];
                 full.extend(args);
                 let got = run(&w, &full);
-                if case == "not JSON" || case == "unreadable" {
-                    // PM call 14 (R5): a torn record, or a folder at record.json, is Unreadable, never re-read.
-                    assert_eq!(
-                        got, "1 evidence state evidence cannot be read; retry",
-                        "{case}"
-                    );
-                } else {
-                    let message = match case {
-                        "not an object" => "invalid local hc record",
-                        _ => "invalid local hc identity",
-                    };
-                    assert_eq!(
-                        got,
-                        format!("1 internal unexpected error ({message})"),
-                        "{case}"
-                    );
-                }
+                // PM call 14 (R5): a torn record, or a folder at record.json, is Unreadable, never re-read.
+                assert_eq!(
+                    got, "1 evidence state evidence cannot be read; retry",
+                    "{case}"
+                );
                 assert!(!w.fakes.hc_calls().iter().any(|(_, a, _)| a[0] == "run"));
             }
             assert!(calls(&w, "new-window").is_empty(), "{case}");

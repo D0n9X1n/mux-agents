@@ -67,6 +67,8 @@ pub(crate) fn snap(members: &[(&str, Value, Life)], reserved: usize) -> Snapshot
         view_order: Vec::new(),
         core_error: None,
         view_error: None,
+        held: Vec::new(),
+        pre_ended: Default::default(),
     }
 }
 pub(crate) fn ids(n: usize) -> Vec<String> {

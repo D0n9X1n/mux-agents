@@ -36,6 +36,10 @@ pub mod message;
 pub mod options;
 pub mod placement;
 pub(crate) mod prelife;
+#[cfg(test)]
+pub(crate) mod prelife_fixture;
+#[cfg(test)]
+mod prelife_slot_tests;
 pub mod receipt;
 pub mod registry;
 pub mod release;
