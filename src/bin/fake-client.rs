@@ -131,10 +131,13 @@ fn main() {
     if let Some(sid) = sid.clone().or(resumed) {
         let (entry, dir) = (entry.clone(), dir.clone());
         std::thread::spawn(move || {
-            let out = Command::new(&entry)
-                .args(["report", "-Session", &sid, "-Source", "startup"])
-                .stdin(Stdio::null())
-                .output();
+            // o2 call 23: this client's own children are bounded (the subprocess pin).
+            let out = bounded::output(
+                Command::new(&entry)
+                    .args(["report", "-Session", &sid, "-Source", "startup"])
+                    .stdin(Stdio::null()),
+                bounded::LIMIT,
+            );
             if let Ok(out) = out {
                 write_whole(&dir.join(format!("session.{pid}.json")), out.stdout);
             }
