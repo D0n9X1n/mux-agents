@@ -288,6 +288,8 @@ fn stop_uses_hc_only() {
             views: Default::default(),
             core_error: None,
             view_error: None,
+            held: Vec::new(),
+            pre_ended: Default::default(),
         };
         assert!(!registry::reap_hc(&w.ctx, &c, &snapshot).unwrap());
     }

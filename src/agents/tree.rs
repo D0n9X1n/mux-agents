@@ -69,7 +69,7 @@ pub fn limit(snapshot: &Snapshot) -> Res<()> {
         .facts
         .local
         .iter()
-        .filter(|o| o.life != Life::Ended)
+        .filter(|o| snapshot.holds(o))
         .filter(|o| {
             snapshot
                 .records
@@ -77,7 +77,8 @@ pub fn limit(snapshot: &Snapshot) -> Res<()> {
                 .is_some_and(|s| is_leader(&s.record))
         })
         .count();
-    if snapshot.facts.count() - leaders >= MAX_MEMBERS {
+    // prelife-1c G10a: a held pre-lifecycle folder counts, leader or not (fail closed).
+    if snapshot.slots() - leaders >= MAX_MEMBERS {
         return refuse(
             2,
             "limit",

@@ -36,6 +36,7 @@ pub fn take(
     team: &str,
     members: &[Identity],
     freed: &[(String, String)],
+    pre: &[String],
 ) -> Res<Snapshot> {
     let known: Vec<_> = members.iter().filter(|i| !i.address.is_empty()).collect();
     let unique: BTreeSet<_> = known.iter().map(|i| i.address.as_str()).collect();
@@ -99,7 +100,9 @@ pub fn take(
         .collect();
     let mut reserved = Vec::new();
     for address in listed.into_iter().collect::<BTreeSet<_>>() {
-        if resolved.iter().any(|i| i.address == address) {
+        // prelife-1c calls 13, 23: a pre-lifecycle folder's own terminal is that folder (held or freed), never a
+        // reservation of another root.
+        if resolved.iter().any(|i| i.address == address) || pre.contains(&address) {
             continue;
         }
         let t = facts
@@ -195,7 +198,7 @@ mod tests {
             } else {
                 answer(&f, v);
             }
-            let s = take(&core, "k:$3", &[id], &[]).unwrap();
+            let s = take(&core, "k:$3", &[id], &[], &[]).unwrap();
             let want = match state {
                 "running" => Life::Running,
                 "lost" => Life::Lost,
@@ -238,18 +241,18 @@ mod tests {
             let core = hc::connect(&ctx).unwrap();
             let id = identity();
             if case == "duplicate" {
-                assert!(take(&core, "k:$3", &[id.clone(), id], &[]).is_err());
+                assert!(take(&core, "k:$3", &[id.clone(), id], &[], &[]).is_err());
                 assert_eq!(f.hc_calls().len(), 1);
                 continue;
             }
             if case == "wrong-team" {
-                assert!(take(&core, "k:$4", &[identity()], &[]).is_err());
+                assert!(take(&core, "k:$4", &[identity()], &[], &[]).is_err());
                 assert_eq!(f.hc_calls().len(), 1);
                 continue;
             }
             if case == "failed-ls" {
                 f.hc_answer(Err(crate::error::Refusal::internal("ls failed")));
-                assert!(take(&core, "k:$3", &[], &[]).is_err());
+                assert!(take(&core, "k:$3", &[], &[], &[]).is_err());
                 continue;
             }
             answer(&f, json!({"terminals":[{"address":"t1"}]}));
@@ -273,7 +276,7 @@ mod tests {
             } else {
                 answer(&f, v);
             }
-            let got = take(&core, "k:$3", &[], &[]);
+            let got = take(&core, "k:$3", &[], &[], &[]);
             if ["ended", "live"].contains(&case) {
                 let s = got.unwrap();
                 assert_eq!(s.count(), usize::from(case == "live"));
