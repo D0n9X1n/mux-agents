@@ -280,6 +280,8 @@ fn adapters_resolve_duplicates_without_running_a_core_terminal() {
         fact(&w, &b, "running");
         if verb == "stop" {
             cf::online(&w);
+            // prelife-1c P-R3: the validating get (Running) is the last hc call before the kill.
+            fact(&w, &b, "running");
             cf::answer(&w, &["kill", "tbbbbbbbbbbbb", "--json"], "{}");
             fact(&w, &b, "ended");
         }
@@ -308,7 +310,7 @@ fn adapters_resolve_duplicates_without_running_a_core_terminal() {
                 .map(|(_, a, _)| a[0].clone())
                 .collect::<Vec<_>>(),
             if verb == "stop" {
-                vec!["--version", "get", "get", "--version", "kill", "get"]
+                vec!["--version", "get", "get", "--version", "get", "kill", "get"]
             } else {
                 vec!["--version", "get", "get"]
             }

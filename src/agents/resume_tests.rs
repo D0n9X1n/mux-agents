@@ -1271,6 +1271,8 @@ fn send_read_spawn_and_stop_stay_bounded_during_a_resume() {
                     "stop" => {
                         v.panes(&[]);
                         cf::online(&v);
+                        // prelife-1c P-R3: the validating get (Running) is the last hc call before the kill.
+                        cf::get(&v, &addr(&br), terminal(&br, "running"));
                         cf::answer(&v, &["kill", &addr(&br), "--json"], "{}");
                         cf::get(&v, &addr(&br), terminal(&br, "stopped"));
                         vec!["stop", "other"]

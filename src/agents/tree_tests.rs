@@ -1620,6 +1620,8 @@ fn a_person_stops_and_reads_a_leaderless_teams_leader() {
         let a = r["hcAddress"].as_str().unwrap().to_string();
         if verb == "stop" {
             cf::online(&w);
+            // prelife-1c P-R3: the validating get (Running) is the last hc call before the kill.
+            cf::get(&w, &a, cf::wire(&r));
             cf::answer(&w, &["kill", &a, "--json"], "{}");
             cf::get(&w, &a, cf::wire(&r));
         }

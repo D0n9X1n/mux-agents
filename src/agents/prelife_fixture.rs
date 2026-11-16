@@ -1,5 +1,6 @@
 //! prelife-1c fixtures: a team of lifecycle members, and pre-lifecycle folders beside it.
 use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
 
 use serde_json::{Value, json};
 
@@ -8,7 +9,64 @@ use crate::agents::fixture::World;
 use crate::spawn::Out;
 
 pub const L: &str = "111111111111";
+pub const A: &str = "a0000000000a";
+pub const C: &str = "c0000000000c";
 pub const P: &str = "d0000000000d";
+
+/// Leader `L` -> lifecycle `A` -> pre-lifecycle `C` naming `A` as parent (spec "mixed tree"); A's and C's records.
+pub fn mixed(w: &World) -> (Value, Value) {
+    team(w);
+    life(w, L, fields(L, "leader", None, 0));
+    let a = life(w, A, fields(A, "w-a", Some(L), 1));
+    let mut f = fields(C, "w-c", Some(A), 2);
+    f["parentPane"] = json!("%6");
+    (a, pre(w, C, f))
+}
+
+/// The hc verbs called so far (`hc_calls` argv[0] is the verb; `--version` included).
+pub fn verbs(w: &World) -> Vec<String> {
+    w.fakes
+        .hc_calls()
+        .iter()
+        .map(|(_, a, _)| a[0].clone())
+        .collect()
+}
+
+/// Whether any `hc kill` was called.
+pub fn killed(w: &World) -> bool {
+    verbs(w).iter().any(|v| v == "kill")
+}
+
+/// Every file under `dir` by relative path (P-R4); `gens/` included.
+pub fn bytes(dir: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
+    let mut out = BTreeMap::new();
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        for e in std::fs::read_dir(&d).unwrap() {
+            let p = e.unwrap().path();
+            if p.is_dir() {
+                stack.push(p);
+            } else {
+                out.insert(
+                    p.strip_prefix(dir).unwrap().to_path_buf(),
+                    std::fs::read(&p).unwrap(),
+                );
+            }
+        }
+    }
+    out
+}
+
+/// Messages with delivery id `delivery` in pane `pane`'s mailbox file (read raw: `read_mail` would move a cursor).
+pub fn delivered(w: &World, pane: &str, delivery: &str) -> usize {
+    let key = crate::agents::mail::mailbox_key(pane, "").unwrap();
+    let text = std::fs::read_to_string(w.state().join("mail").join(format!("{key}.jsonl")))
+        .unwrap_or_default();
+    text.lines()
+        .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+        .filter(|m| m["id"] == delivery)
+        .count()
+}
 
 /// The team record of session $3, leader `L`.
 pub fn team(w: &World) {
