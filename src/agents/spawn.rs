@@ -3813,6 +3813,9 @@ pub fn launch_hc_locked(
     request: CoreRequest<'_>,
     reserve: impl FnOnce(&crate::hc::Core<'_>) -> Res<CoreSlot>,
 ) -> Res<Value> {
+    // adopt-3e calls 13, 21: every launch, in a team or outside one, reserves (spawn's gate and snapshot) after
+    // replay.
+    super::adopt::replay_held(ctx, caller)?;
     let mut slot = reserve(core)?;
     let placed = slot.placed.take();
     let debit = slot.debit;

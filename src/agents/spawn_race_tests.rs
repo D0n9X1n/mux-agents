@@ -117,3 +117,24 @@ fn adoption_and_resume_race_to_one_outcome() {
         }
     }
 }
+
+// adopt-3e call 21 (checklist 14): a spawn outside a team replays before its snapshot and admission: two journals
+// refuse `topology` under the spawn lock; nothing launched.
+#[test]
+fn a_spawn_outside_a_team_replays_first() {
+    use crate::agents::adopt_fixture as ax;
+    let w = World::human("");
+    ready(&w);
+    let s = team_state::Scope::of(&w.caller());
+    for n in [1, 3] {
+        ax::put_journal(&w, &s, &ax::to_a(n));
+    }
+    let got = launch_hc(&w.ctx, &w.caller(), request(&w), slot).unwrap_err();
+    assert_eq!(
+        (got.check, got.message.as_str()),
+        ("topology", crate::agents::adopt::OUT_OF_ORDER)
+    );
+    let agents = super::super::super::server_dir(&w.ctx, &w.caller()).join("agents");
+    let made = std::fs::read_dir(agents).map(|d| d.count()).unwrap_or(0);
+    assert_eq!(made, 0, "nothing launched");
+}

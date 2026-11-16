@@ -285,6 +285,8 @@ pub enum Standing {
 /// D1 under the team lock: an hc member or candidate is proven again (a failure is 2 `tagged`, never a fallback); a
 /// person is a human in an untagged pane; a tmux-pane agent keeps 2 `caller`.
 pub fn standing(ctx: &Ctx, caller: &Caller, core: Option<&Core<'_>>) -> Res<Standing> {
+    // adopt-3e call 13: the standing, the admission depth and authority are read after replay.
+    super::adopt::replay_held(ctx, caller)?;
     if let Some(id) = caller.member.as_ref().or(caller.candidate.as_ref()) {
         let connected;
         let core = match core {

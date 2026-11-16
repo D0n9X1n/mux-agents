@@ -1900,3 +1900,28 @@ fn a_resume_under_a_kept_journal_is_refused_closed() {
     assert_eq!(resume_of(&w, ID).unwrap_err().check, "closed");
     assert_eq!(folders(&w), before, "nothing launched");
 }
+
+// adopt-3e A6, call 13: resume replays before its snapshot: two journals refuse `topology`; the snapshot's scripted
+// hc answers are never asked for; nothing launched.
+#[test]
+fn resume_admission_replays_first() {
+    use crate::agents::adopt_fixture as ax;
+    let w = World::human("");
+    let x = member(&w, ID, json!({}));
+    facts(&w, &[(&x, "stopped")]);
+    let s = crate::agents::team_state::Scope::of(&w.caller());
+    for n in [1, 3] {
+        ax::put_journal(&w, &s, &ax::to_a(n));
+    }
+    let before = folders(&w);
+    let got = resume_of(&w, ID).unwrap_err();
+    assert_eq!(
+        (got.check, got.message.as_str()),
+        ("topology", crate::agents::adopt::OUT_OF_ORDER)
+    );
+    assert_eq!(folders(&w), before, "nothing launched");
+    assert!(
+        w.fakes.hc_done().is_err(),
+        "the snapshot's answers were never asked for"
+    );
+}

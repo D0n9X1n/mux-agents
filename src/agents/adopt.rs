@@ -387,6 +387,14 @@ pub fn adopt_from(tx: &Tx<'_>, from: &str) -> Res<Adopted> {
 pub fn adopt(ctx: &Ctx, scope: &Scope, from: &str) -> Res<Adopted> {
     super::team_state::open(ctx, scope, |tx| adopt_from(tx, from))
 }
+/// Call 13: for a reader that holds the team lock (the spawn lock) and decides from what it reads next: finish an
+/// outstanding adoption first (hook-free: the lock is held).
+pub fn replay_held(ctx: &Ctx, caller: &crate::caller::Caller) -> Res<()> {
+    replay(&Tx {
+        ctx,
+        scope: Scope::of(caller),
+    })
+}
 
 #[path = "adopt_view.rs"]
 mod view;

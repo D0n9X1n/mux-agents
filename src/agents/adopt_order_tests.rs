@@ -62,3 +62,67 @@ fn a_committed_released_successor_keeps_e_superseded() {
     assert_eq!(tree(&w).parents(cx::B).unwrap(), vec![ax::E2.to_string()]);
     assert_eq!(ax::seq(&w, &s), 0);
 }
+
+// A1 (C0): A resumed as A′, then E ends: A′ adopts B, live or pending; authority's walk over `Tree::all`
+// (cascade Task 13's `Tree::ancestors`; finding 2-11) reaches A′.
+#[test]
+fn a_resumed_ancestor_adopts_as_its_successor() {
+    use crate::agents::life_fixture as lf;
+    for pending in [false, true] {
+        let (w, s) = world();
+        ax::team(&w);
+        if pending {
+            ax::set(&w, cx::B, "pending", lf::pending(2));
+        }
+        ax::successor(&w, ax::A2, cx::A, cx::L, 1, ax::Kind::Committed);
+        assert_eq!(adopt_now(&w, ax::E), moved(ax::A2), "pending {pending}");
+        assert_eq!(at(&w, cx::B), (Some(ax::A2.into()), 2), "pending {pending}");
+        let t = crate::agents::cascade::Tree::all(&cx::tx(&w, &s)).unwrap();
+        let up = t.ancestors(cx::B, cx::L).unwrap();
+        assert_eq!(
+            up,
+            vec![ax::A2.to_string(), cx::L.to_string()],
+            "pending {pending}"
+        );
+    }
+}
+
+// C0 (finding 2-13): `stop A′` reaches the adopted B, live and pending, through the real cascade: B's generations
+// end newest first, then A′; E is Ended (no hc call); every scripted hc answer is used.
+#[test]
+fn the_successors_stop_reaches_the_adopted_child() {
+    use crate::agents::{gens, life_fixture as lf};
+    for pending in [false, true] {
+        let (w, s) = world();
+        ax::team(&w);
+        ax::successor(&w, ax::A2, cx::A, cx::L, 1, ax::Kind::Committed);
+        if pending {
+            let mut p = lf::pending(2);
+            p["hcAddress"] = json!(cx::addr_at(cx::B, 2));
+            ax::set(&w, cx::B, "pending", p);
+            lf::seed_gen(&w.folder(cx::B), 2, Some("run"), lf::committed());
+        }
+        assert_eq!(adopt_now(&w, ax::E), moved(ax::A2), "pending {pending}");
+        if pending {
+            cx::terminates_at(&w, cx::B, 2);
+        }
+        cx::terminates_at(&w, cx::B, 1);
+        cx::terminates_at(&w, ax::A2, 1);
+        let r = crate::agents::cascade::stop(&cx::tx(&w, &s), &w.caller(), ax::A2, &[]).unwrap();
+        assert!(r.stopped, "pending {pending}");
+        let ended = |id: &str, n: u64| {
+            gens::read(&w.folder(id), n, "ended")
+                .known()
+                .unwrap()
+                .is_some()
+        };
+        assert!(ended(cx::B, 1), "pending {pending}: B ended");
+        assert_eq!(
+            ended(cx::B, 2),
+            pending,
+            "pending {pending}: B's pending launch ended"
+        );
+        assert!(ended(ax::A2, 1), "pending {pending}: A′ ended");
+        w.fakes.hc_done().unwrap();
+    }
+}
