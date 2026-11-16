@@ -203,6 +203,22 @@ fn flush_up(folders: &[PathBuf]) -> Res<()> {
 /// Call 46: generation n's `<file>.json` through the walk, read once (b-calls 32). Present: the body, after the
 /// folder flushes `publish_once`'s `Exists` answer makes (`gens/<n>`, `gens`, member, `agents`), so a reader acts on
 /// visible evidence only once it is durable; a failed flush is `NOT_FLUSHED`. Absent: None, nothing made or flushed.
+/// Call 58 (call 57's claim read, for settle): `gens/<n>.claim` through the walk, read once. Present: the body,
+/// after the folder flushes its publication makes (`gens`, member, `agents`); a failed flush is `NOT_FLUSHED`.
+/// Absent: None, nothing flushed.
+pub fn claim_flushed(member: &Path, n: u64) -> Res<Option<Value>> {
+    let Some(body) = claim(member, n).known()? else {
+        return Ok(None);
+    };
+    let agents = member.parent().ok_or_else(evidence::unreadable)?;
+    flush_up(&[
+        agents.to_path_buf(),
+        member.to_path_buf(),
+        member.join("gens"),
+    ])?;
+    Ok(Some(body))
+}
+
 pub fn read_flushed(member: &Path, n: u64, file: &str) -> Res<Option<Value>> {
     let Some(body) = read(member, n, file).known()? else {
         return Ok(None);

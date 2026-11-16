@@ -120,11 +120,16 @@ impl Tx<'_> {
     }
 }
 
-/// Call 49 (call 46 extended to settle): `ended`, `released` or `release` read once through `gens::read_flushed`, so
+/// Calls 49, 58 (calls 46, 57 extended to settle): `ended`, `released`, `release`, the claim or the commit read once through `gens::read_flushed`, so
 /// rows 0 and 0r act on it only once its folders are durable. `Ok`: Present (flushed), Absent, or Unreadable (row 1
 /// decides). `Err`: the flush failed (check `state`, `gens::NOT_FLUSHED`).
 fn flushed(member: &Path, n: u64, file: &str) -> Res<Evidence> {
-    match gens::read_flushed(member, n, file) {
+    let read = if file == "claim" {
+        gens::claim_flushed(member, n)
+    } else {
+        gens::read_flushed(member, n, file)
+    };
+    match read {
         Ok(Some(v)) => Ok(Evidence::Present(v)),
         Ok(None) => Ok(Evidence::Absent),
         Err(e) if e.check == "evidence" => Ok(Evidence::Unreadable),
@@ -176,8 +181,15 @@ pub fn settle_gen<'c>(
             Err(e) => unresolved(e),
         };
     }
-    let claim = gens::claim(&m, n);
-    let commit = gens::read(&m, n, "commit");
+    // Call 58: rows 2 and 5 act on the claim and the commit only once they are durable.
+    let claim = match flushed(&m, n, "claim") {
+        Ok(e) => e,
+        Err(e) => return Ok(Outcome::Unknown(e)),
+    };
+    let commit = match flushed(&m, n, "commit") {
+        Ok(e) => e,
+        Err(e) => return Ok(Outcome::Unknown(e)),
+    };
     let term = gens::read(&m, n, "terminating");
     let launch = gens::read(&m, n, "launch");
     // Row 1.
@@ -818,6 +830,67 @@ mod tests {
                 "{marker} cleared: pending"
             );
         }
+    }
+
+    // Call 58, row 2: an abandoned claim settles only once its folders flush (gens, member, agents). Armed: Unknown
+    // (state, NOT_FLUSHED), the record unchanged, no hc. Cleared: Done, pending dropped once.
+    #[test]
+    fn an_abandoned_claim_settles_only_once_flushed() {
+        let (w, s) = lf::world();
+        let m = pending_member(&w);
+        lf::seed_gen(&m, 1, Some("abandoned"), None);
+        let before = std::fs::read(m.join("record.json")).unwrap();
+        crate::state::fs::fail_sync_dir(Some(&m.join("gens")));
+        let got = settle(&w, &s, Mode::Normal);
+        crate::state::fs::fail_sync_dir(None);
+        let got = got.unwrap();
+        assert!(not_flushed(&got), "armed: {got:?}");
+        assert_eq!(
+            std::fs::read(m.join("record.json")).unwrap(),
+            before,
+            "armed: the record changed"
+        );
+        assert!(lf::calls(&w).is_empty(), "armed: hc");
+        assert_eq!(
+            settle(&w, &s, Mode::Normal).unwrap(),
+            Outcome::Done,
+            "cleared"
+        );
+        assert!(lf::record(&m).get("pending").is_none(), "cleared: pending");
+        assert_eq!(
+            settle(&w, &s, Mode::Normal).unwrap(),
+            Outcome::Done,
+            "replay"
+        );
+    }
+
+    // Call 58, row 5: an aborted commit settles only once its folders flush (gens/<n>, gens, member, agents). Armed:
+    // Unknown (state, NOT_FLUSHED), the record unchanged, no hc. Cleared: Done, pending dropped once.
+    #[test]
+    fn an_aborted_commit_settles_only_once_flushed() {
+        let (w, s) = lf::world();
+        let m = pending_member(&w);
+        lf::seed_gen(&m, 1, Some("run"), Some(json!({"aborted": true})));
+        let before = std::fs::read(m.join("record.json")).unwrap();
+        let got = armed(&m, || settle(&w, &s, Mode::Normal)).unwrap();
+        assert!(not_flushed(&got), "armed: {got:?}");
+        assert_eq!(
+            std::fs::read(m.join("record.json")).unwrap(),
+            before,
+            "armed: the record changed"
+        );
+        assert!(lf::calls(&w).is_empty(), "armed: hc");
+        assert_eq!(
+            settle(&w, &s, Mode::Normal).unwrap(),
+            Outcome::Done,
+            "cleared"
+        );
+        assert!(lf::record(&m).get("pending").is_none(), "cleared: pending");
+        assert_eq!(
+            settle(&w, &s, Mode::Normal).unwrap(),
+            Outcome::Done,
+            "replay"
+        );
     }
 
     // Call 49, row 0r: release.json is concluded only once its folders flush. Armed: Unknown (`state`), no hc call,
