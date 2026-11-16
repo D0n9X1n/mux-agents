@@ -10,7 +10,7 @@ use crate::ctx::{Clock, Ctx, Env};
 use crate::error::Res;
 use crate::mux::{Kind, Mux, Output};
 use crate::parse::Client;
-use crate::proc::{Opened, Os, Row, Signals, Token};
+use crate::proc::{Boot, Opened, Os, Row, Signals, Token};
 
 // Answers a matching call from its argv: stateful fakes (a pane table, a queue of probe answers, a failure).
 type Script = Rc<dyn Fn(&[String]) -> Res<Output>>;
@@ -82,6 +82,8 @@ struct Log {
     denied: Vec<u32>,
     // `unlist`: gone from `table`, while `row` and `open` still answer.
     unlisted: Vec<u32>,
+    // What `boot` answers; none is Absolute (macOS, Windows).
+    boot: Option<Boot>,
 }
 
 /// Locks two fakes on two threads contend for, as two processes contend for the real lock: a key held by one blocks
@@ -246,6 +248,11 @@ impl Fakes {
     /// Toolhelp does, with its pid and ppid and no start.
     pub fn deny(&self, pid: u32) {
         self.0.borrow_mut().denied.push(pid);
+    }
+
+    /// What `Os::boot` answers from now on (r2b call 27).
+    pub fn set_boot(&self, boot: Boot) {
+        self.0.borrow_mut().boot = Some(boot);
     }
 
     /// The process table no longer lists `pid`, while `row` and `open` still answer for it: a just-exited Windows
@@ -578,6 +585,10 @@ impl Os for Fakes {
         self.os_call("sandbox".into());
         let signals = self.0.borrow().signals.clone();
         signals.unwrap_or(Signals::SandboxCheck(0))
+    }
+
+    fn boot(&self) -> Boot {
+        self.0.borrow().boot.clone().unwrap_or(Boot::Absolute)
     }
 }
 

@@ -51,6 +51,18 @@ pub enum Signals {
     Token(Option<Token>),
 }
 
+/// Which boot a process start belongs to (r2b call 27). Linux starts are clock ticks since boot, so one (pid, start)
+/// can come back in a later boot; macOS (µs since the epoch) and Windows (FILETIME) starts are absolute.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Boot {
+    /// Starts are absolute: a (pid, start) never repeats across boots, and no boot is recorded.
+    Absolute,
+    /// Starts are boot-relative; this boot's identity (Linux: /proc/sys/kernel/random/boot_id).
+    Id(String),
+    /// Starts are boot-relative and this boot's identity cannot be read.
+    Unreadable,
+}
+
 pub trait Os {
     fn row(&self, pid: u32) -> Option<Row>;
     fn table(&self) -> io::Result<Vec<Row>>;
@@ -63,6 +75,7 @@ pub trait Os {
     fn same_start(&self, opened: i64, listed: i64) -> bool;
     fn token(&self) -> Option<Token>;
     fn sandbox(&self) -> Signals;
+    fn boot(&self) -> Boot;
 }
 
 #[cfg(target_os = "macos")]

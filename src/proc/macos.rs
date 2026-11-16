@@ -227,6 +227,11 @@ impl Os for MacOs {
         // SAFETY: the caller's own pid, no operation and SANDBOX_FILTER_NONE, so no variadic arguments follow.
         Signals::SandboxCheck(unsafe { sandbox_check(libc::getpid(), std::ptr::null(), 0) })
     }
+
+    /// Starts are µs since the epoch: absolute, so no boot is recorded (r2b call 27).
+    fn boot(&self) -> super::Boot {
+        super::Boot::Absolute
+    }
 }
 
 #[cfg(test)]

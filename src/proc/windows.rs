@@ -352,6 +352,11 @@ mod win {
         fn sandbox(&self) -> Signals {
             Signals::Token(self.token())
         }
+
+        /// Starts are FILETIMEs (100 ns since 1601): absolute, so no boot is recorded (r2b call 27).
+        fn boot(&self) -> crate::proc::Boot {
+            crate::proc::Boot::Absolute
+        }
     }
 
     #[cfg(test)]

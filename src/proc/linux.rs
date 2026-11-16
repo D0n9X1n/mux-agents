@@ -4,7 +4,7 @@ use std::io;
 
 use super::seam;
 use super::unix::{self, PidfdSource};
-use super::{Opened, Os, Row, Signals, Token};
+use super::{Boot, Opened, Os, Row, Signals, Token};
 use crate::parse::{self, Client};
 
 pub struct Linux;
@@ -93,10 +93,29 @@ impl Os for Linux {
     fn sandbox(&self) -> Signals {
         Signals::Status(std::fs::read_to_string("/proc/self/status").ok())
     }
+
+    /// Starts are clock ticks since boot (r2b call 27), so the boot is named by the kernel's boot id; one that cannot
+    /// be read is Unreadable, never Absolute.
+    fn boot(&self) -> Boot {
+        std::fs::read_to_string("/proc/sys/kernel/random/boot_id")
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .map_or(Boot::Unreadable, Boot::Id)
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    // r2b call 27: starts here are ticks since boot, so the boot is named by the kernel's boot id.
+    #[test]
+    fn boot_is_the_kernel_boot_id() {
+        match Linux.boot() {
+            Boot::Id(id) => assert_eq!(id.len(), 36, "{id}"),
+            other => panic!("not the boot id: {other:?}"),
+        }
+    }
+
     use super::*;
     use crate::proc::Handle;
     use crate::proc::seam::{self, ProcSource};

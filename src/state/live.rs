@@ -74,8 +74,12 @@ pub fn report(
         };
         private_dir(ctx)?;
         let at = crate::util::utc_o(ctx.clock.now());
-        let entry = json!({"kind": crate::agents::spawn::client_name(kind), "pid": pid, "start": start,
+        let mut entry = json!({"kind": crate::agents::spawn::client_name(kind), "pid": pid, "start": start,
             "sessionId": session, "seq": seq, "source": source, "at": at});
+        // r2b call 27: where starts are boot-relative, the boot they belong to.
+        if let crate::proc::Boot::Id(boot) = ctx.os.boot() {
+            entry["boot"] = boot.into();
+        }
         crate::state::fs::write_json_durable(&file, &entry)?;
         Ok(seq)
     })
@@ -116,12 +120,26 @@ pub fn alive(ctx: &Ctx, pid: u32, start: i64) -> Alive {
     }
 }
 
-/// The entry of a client process that may be live (Live or Unknown); a dead one is ignored and never read.
+/// The entry of a client process that may be live (Live or Unknown); a dead one is ignored and never read. r2b call
+/// 27: an entry recorded in another boot (its `boot` differs from this boot's id) is dead too: `Ok(None)`.
 pub fn entry(ctx: &Ctx, kind: Client, pid: u32, start: i64) -> Res<Option<Value>> {
     if !live_dir(ctx)? || alive(ctx, pid, start) == Alive::Dead {
         return Ok(None);
     }
-    evidence::read(&path(ctx, kind, pid, start)).known()
+    let found = evidence::read(&path(ctx, kind, pid, start)).known()?;
+    Ok(found.filter(|v| !another_boot(ctx, v)))
+}
+
+/// r2b call 27: whether `entry` was recorded in another boot. Only a boot-relative OS (`Boot::Id`) can tell: an entry
+/// without `boot`, an Unreadable boot, or absolute starts (macOS, Windows) decide nothing (the entry is kept).
+fn another_boot(ctx: &Ctx, entry: &Value) -> bool {
+    let crate::proc::Boot::Id(now) = ctx.os.boot() else {
+        return false;
+    };
+    entry
+        .get("boot")
+        .and_then(Value::as_str)
+        .is_some_and(|b| b != now)
 }
 
 /// K2: removes each regular entry whose process is Dead, rechecked under that entry's own lock. Other names, folders,
@@ -139,7 +157,13 @@ pub fn sweep(ctx: &Ctx) -> Res<usize> {
         let file = path(ctx, kind, pid, start);
         removed += crate::agents::lock(ctx, &lock_key(pid, start), || {
             let regular = std::fs::symlink_metadata(&file).is_ok_and(|m| m.is_file());
-            if !regular || alive(ctx, pid, start) != Alive::Dead {
+            if !regular {
+                return Ok(0);
+            }
+            // Dead in the table, or recorded in another boot (r2b call 27); a torn entry decides nothing.
+            let dead = alive(ctx, pid, start) == Alive::Dead
+                || matches!(evidence::read(&file), evidence::Evidence::Present(v) if another_boot(ctx, &v));
+            if !dead {
                 return Ok(0);
             }
             match std::fs::remove_file(&file) {
@@ -494,6 +518,63 @@ mod tests {
         assert_eq!(alive(&ctx, 150, 1500), Alive::Dead);
         assert_eq!(checked(sweep(&ctx)), Ok(1), "swept");
         assert!(!file(&ctx).exists());
+    }
+
+    // r2b call 27 (QA #143): where starts are boot-relative (Linux), an entry records its boot, and an entry from
+    // another boot is dead to `entry` and `sweep` even when the table lists the same pid with the same start. An
+    // unreadable boot decides nothing (Unknown, kept). Absolute starts (macOS, Windows) record no boot.
+    #[test]
+    fn an_entry_from_another_boot_is_dead_and_an_unreadable_boot_holds() {
+        use crate::proc::Boot;
+        let (f, ctx, _d) = world();
+        f.set_boot(Boot::Id("boot-a".into()));
+        assert_eq!(put(&ctx, 150, 1500, "startup"), Ok(1), "seed");
+        let v = crate::state::fs::read_json(&file(&ctx)).unwrap().unwrap();
+        assert_eq!(
+            v["boot"],
+            json!("boot-a"),
+            "the boot is recorded where starts are boot-relative"
+        );
+        assert!(
+            checked(entry(&ctx, Client::Claude, 150, 1500))
+                .unwrap()
+                .is_some(),
+            "same boot"
+        );
+        assert_eq!(checked(sweep(&ctx)), Ok(0), "same boot: kept");
+        f.set_boot(Boot::Unreadable);
+        assert!(
+            checked(entry(&ctx, Client::Claude, 150, 1500))
+                .unwrap()
+                .is_some(),
+            "unreadable boot: kept"
+        );
+        assert_eq!(
+            checked(sweep(&ctx)),
+            Ok(0),
+            "unreadable boot: kept by sweep"
+        );
+        f.set_boot(Boot::Id("boot-b".into()));
+        assert_eq!(
+            alive(&ctx, 150, 1500),
+            Alive::Live,
+            "the table alone cannot tell the boots apart"
+        );
+        assert_eq!(
+            checked(entry(&ctx, Client::Claude, 150, 1500)),
+            Ok(None),
+            "another boot: dead to entry"
+        );
+        assert_eq!(checked(sweep(&ctx)), Ok(1), "another boot: swept");
+        assert!(!file(&ctx).exists());
+        let (f, ctx, _d) = world();
+        f.set_boot(Boot::Absolute);
+        assert_eq!(put(&ctx, 150, 1500, "startup"), Ok(1), "seed (absolute)");
+        let v = crate::state::fs::read_json(&file(&ctx)).unwrap().unwrap();
+        assert!(
+            v.get("boot").is_none(),
+            "absolute starts record no boot: {v}"
+        );
     }
 
     // (fix 2, re-audit #2) Contention proved from inside `report`: `hooks::before_report_lock` (`-8.md` Step 3) marks
