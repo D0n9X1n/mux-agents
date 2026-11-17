@@ -102,7 +102,7 @@ fn leader_folder(w: &World) -> PathBuf {
         .unwrap()
         .path()
 }
-fn team_file(w: &World) -> PathBuf {
+pub(crate) fn team_file(w: &World) -> PathBuf {
     crate::agents::team::path(&w.ctx.state_root.join(w.caller().server_key), "$7")
 }
 
