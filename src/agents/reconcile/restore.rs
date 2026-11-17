@@ -40,10 +40,11 @@ fn client_of(g: &Gen) -> Res<crate::parse::Client> {
         .ok_or_else(|| Refusal::internal("the member names no known client"))
 }
 
-/// What a next generation launches (launch-1 G1 kinds): restore and retry resume `session`.
+/// What a next generation launches (launch-1 G1 kinds): restore and retry resume `session`; fresh starts it.
 pub(crate) struct Next<'a> {
     pub kind: &'static str,
     pub session: &'a str,
+    pub fresh: bool,
 }
 
 /// L3, restore-6c P2: n+1 of member `id` through launch-1 G1: its stored options within the team ceiling, the
@@ -63,9 +64,14 @@ pub(crate) fn launch_next(
     let stored = super::super::options::stored(r)?;
     let ceiling = super::super::resume::ceiling(Some(&team));
     let flags = super::super::options::replay(client, &stored, ceiling)?;
+    let recipe = if next.fresh {
+        Recipe::First(None)
+    } else {
+        Recipe::Resume(None)
+    };
     let spec = json!({"schema": 1, "stateDirectory": utf8(&server)?, "client": client_name(client),
         "flags": flags, "parentPane": r.get("parentPane"),
-        "args": client_args(client, Recipe::Resume(None), next.session, None)});
+        "args": client_args(client, recipe, next.session, None)});
     let launch = super::super::core_launch::Launch {
         id: id.into(),
         kind: next.kind,
@@ -103,6 +109,7 @@ fn relaunch(tx: &Tx<'_>, core: &Core<'_>, id: &str, g: &Gen, sid: &str) -> Res<u
         Next {
             kind: "restore",
             session: sid,
+            fresh: false,
         },
     )
 }

@@ -60,6 +60,9 @@ pub(crate) fn gate_case(case: &str, action: Action) -> (World, PathBuf, Got) {
             failed_ended(&f, 1);
             unmanaged_claude(&w, 4321);
             both_gone(&w);
+            if action == Action::Fresh {
+                w.fakes.hc_answer(ft::address("t2")); // fresh asks no occupancy and launches
+            }
         }
         other => panic!("{other}"),
     }

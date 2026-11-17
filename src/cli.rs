@@ -166,10 +166,10 @@ pub static VERBS: &[VerbDef] = &[
     VerbDef {
         name: "resume",
         values: &[],
-        switches: &[],
+        switches: &["Fresh"],
         min: 1,
         max: 1,
-        usage: "usage: mux-agent resume <name|id> [-Text]",
+        usage: "usage: mux-agent resume <name|id> [-Fresh] [-Text]",
         handler: crate::agents::resume::resume,
         text: json::lines,
     },

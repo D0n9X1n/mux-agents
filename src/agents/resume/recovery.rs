@@ -16,12 +16,13 @@ use crate::state::evidence::unreadable;
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Action {
     Retry,
+    Fresh,
 }
 
 /// What `target` names among the anchor session's members (call 15).
 enum Subject {
     Life(String),
-    /// A pre-lifecycle record: today's resume (prelife-1c G10 refuses it there).
+    /// A pre-lifecycle record: today's resume (prelife-1c G10 refuses it there, retry or fresh).
     Pre,
     None,
 }
@@ -37,13 +38,20 @@ pub(crate) fn recover(
 ) -> Res<Option<Map<String, Value>>> {
     let here = super::super::scope::state(caller); // 6a call 10
     let Some(team) = super::super::reconcile::session_team(ctx, &here)? else {
-        return Ok(None);
+        return match action {
+            Action::Retry => Ok(None),
+            Action::Fresh => refuse(
+                1,
+                "team",
+                "no team in this session; run up from the team folder",
+            ),
+        };
     };
     super::super::admit(ctx, &format!("up|{team}"), || {
         super::super::team_state::open(ctx, &here, |tx| {
             let id = match subject(tx, target)? {
                 Subject::Life(id) => id,
-                Subject::Pre => return Ok(None),
+                Subject::Pre => return Ok(None), // prelife-1c G10d refuses it in today's resume
                 Subject::None => {
                     return refuse(2, "target", "no member of this team has that name or id");
                 }
@@ -69,16 +77,29 @@ pub(crate) fn recover(
                 };
             }
             super::super::up::person_as(ctx, "recover a member")?;
-            let session = retry_session(&g)?;
-            let (g, released) = gates(tx, &lazy, caller, &id, g, &seen, &session)?;
+            // ambiguity 5: retry resumes the failed generation's conversation; fresh takes a new one (no occupancy)
+            let (kind, session) = match action {
+                Action::Retry => ("retry", retry_session(&g)?),
+                Action::Fresh => ("fresh", fresh_session()?),
+            };
+            let (g, released) = gates(
+                tx,
+                &lazy,
+                caller,
+                &id,
+                g,
+                &seen,
+                (action == Action::Retry).then_some(session.as_str()),
+            )?;
             let n = super::super::cascade::reopen_same(tx, &id, || {
                 let next = Next {
-                    kind: "retry",
+                    kind,
                     session: &session,
+                    fresh: action == Action::Fresh,
                 };
                 launch_next(tx, lazy.get()?, &id, &g, next)
             })?;
-            let mut out = reply(&g, n, "retry", &session);
+            let mut out = reply(&g, n, kind, &session);
             if let Some(r) = released {
                 out.insert("released".into(), json!(r));
             }
@@ -97,7 +118,7 @@ fn gates(
     id: &str,
     g: Gen,
     seen: &Seen,
-    session: &str,
+    occupancy: Option<&str>,
 ) -> Res<(Gen, Option<u64>)> {
     let n = g.active().ok_or_else(unreadable)?;
     let (g, released) = if seen.life == Some(Life::Lost) && !seen.released {
@@ -134,7 +155,9 @@ fn gates(
     }
     let client = super::super::spawn::client_named(&text(g.record().get("client")))
         .ok_or_else(|| crate::error::Refusal::internal("the member names no known client"))?;
-    if let Some(hold) = super::super::occupancy::held(tx.ctx, session, client, None) {
+    if let Some(session) = occupancy
+        && let Some(hold) = super::super::occupancy::held(tx.ctx, session, client, None)
+    {
         refuse::<()>(2, "running", hold.message())?;
     }
     Ok((g, released))
@@ -177,6 +200,18 @@ fn life_of(tx: &Tx<'_>, id: &str) -> Res<Gen> {
         Member::Life(g) => Ok(g),
         Member::Unreadable(e) => Err(e),
         _ => Err(unreadable()),
+    }
+}
+
+/// Ambiguity 5: a new conversation id; it reaches `pending` and `launch.json` only through `forward`.
+fn fresh_session() -> Res<String> {
+    let id = crate::util::guid()?.to_ascii_lowercase();
+    if crate::checks::session_id(&id) {
+        Ok(id)
+    } else {
+        Err(crate::error::Refusal::internal(
+            "a new session id is not valid",
+        ))
     }
 }
 

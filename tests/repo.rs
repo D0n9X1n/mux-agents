@@ -1282,6 +1282,11 @@ const TEST_ONLY: &[(&str, &str, &str)] = &[
         "reconcile_verb_tests",
     ),
     (
+        "src/agents/recover_fresh_tests.rs",
+        "src/agents/mod.rs",
+        "recover_fresh_tests",
+    ),
+    (
         "src/agents/recover_gate_tests.rs",
         "src/agents/mod.rs",
         "recover_gate_tests",
