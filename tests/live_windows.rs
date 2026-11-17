@@ -3154,10 +3154,20 @@ fn lose(live: &mut Live, ids: &[String]) -> (Vec<Value>, Vec<u32>) {
     let live: &Live = live;
     for r in &before {
         let address = s(&r["hcAddress"]);
-        live.wait("lost", || {
-            let t = hc_get(live, &address);
-            (t["state"] == "live" && t["argv"] != r["launcherArgv"]).then_some(())
-        });
+        live.wait_or(
+            "lost",
+            || {
+                let t = hc_get(live, &address);
+                (t["state"] == "live" && t["argv"] != r["launcherArgv"]).then_some(())
+            },
+            || {
+                format!(
+                    "hc get {address}: {}\nlauncherArgv: {}",
+                    hc_get(live, &address),
+                    r["launcherArgv"]
+                )
+            },
+        );
     }
     (before, old)
 }
@@ -3564,7 +3574,7 @@ fn person_pane(live: &Live, session: &str) -> String {
     ]);
     let pane = panes
         .lines()
-        .find(|l| !l.contains(" hold "))
+        .find(|l| !l.split_once(' ').is_some_and(|(_, c)| runs(c, "hold")))
         .and_then(|l| l.split(' ').next())
         .unwrap_or_else(|| panic!("no pane to split in {session}: {panes}"))
         .to_string();
@@ -3717,11 +3727,11 @@ fn the_hold_window_outlives_the_first_view_on_windows() {
     std::thread::sleep(mux_agent::hold::POLL * 5);
     let commands = live.call(&["list-panes", "-a", "-F", "#{pane_start_command}"]);
     assert!(
-        commands.lines().any(|c| c.contains(" hold ")),
+        commands.lines().any(|c| runs(c, "hold")),
         "the hold window is still there: {commands}"
     );
     assert!(
-        commands.lines().any(|c| c.contains(" attach ")),
+        commands.lines().any(|c| runs(c, "attach")),
         "and the first view is open: {commands}"
     );
     let shell = person_pane(&live, &team_session(&live));
@@ -3729,7 +3739,52 @@ fn the_hold_window_outlives_the_first_view_on_windows() {
     assert_eq!(again["ok"], true, "{again}");
     live.wait("the hold window to end", || {
         let now = live.call(&["list-panes", "-a", "-F", "#{pane_start_command}"]);
-        (!now.lines().any(|c| c.contains(" hold "))).then_some(())
+        (!now.lines().any(|c| runs(c, "hold"))).then_some(())
     });
     wait_ready(&live, &s(&again["leader"]["id"]));
+}
+
+/// Whether a pane's start command runs `verb` as one of its words. rmux reports a start command of several
+/// arguments as its argv, each part percent-encoded and joined by 0x1F (#150), so it holds no space; a plain
+/// command is split on spaces.
+fn runs(command: &str, verb: &str) -> bool {
+    if !command.contains('\u{1f}') {
+        return command.split(' ').any(|w| w == verb);
+    }
+    command.split('\u{1f}').any(|part| {
+        let b = part.as_bytes();
+        let mut out = Vec::new();
+        let mut i = 0;
+        while i < b.len() {
+            let escaped = (b[i] == b'%' && i + 2 < b.len())
+                .then(|| std::str::from_utf8(&b[i + 1..i + 3]).ok())
+                .flatten()
+                .and_then(|h| u8::from_str_radix(h, 16).ok());
+            match escaped {
+                Some(v) => {
+                    out.push(v);
+                    i += 3;
+                }
+                None => {
+                    out.push(b[i]);
+                    i += 1;
+                }
+            }
+        }
+        out == verb.as_bytes()
+    })
+}
+
+#[test]
+fn runs_reads_a_plain_and_an_rmux_encoded_start_command() {
+    let encoded = "D:%5Cx%5Cmux-agent.exe\u{1f}hold\u{1f}D:%5Cs%5Cup%5Ct.release";
+    assert!(runs(encoded, "hold"));
+    assert!(!runs(encoded, "attach"));
+    assert!(runs(
+        "D:%5Cx%5Cherdr-core.exe\u{1f}attach\u{1f}t1",
+        "attach"
+    ));
+    assert!(runs("mux-agent hold x.release", "hold"));
+    assert!(!runs("cmd.exe", "hold"));
+    assert!(!runs("D:%5Cholder.exe\u{1f}x", "hold"));
 }
