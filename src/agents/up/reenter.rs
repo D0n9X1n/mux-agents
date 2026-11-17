@@ -44,6 +44,9 @@ pub(super) fn arm(
         session: a.session,
     };
     let mut reply = Map::new();
+    if let Some(r) = &run.retired {
+        reply.insert("retired".into(), r.clone().into()); // restore-6c P6
+    }
     let (mut created, mut replayed, mut team_error) = (run.created, run.replayed, run.team_error);
     let leader = if run.launched {
         run.record.clone()

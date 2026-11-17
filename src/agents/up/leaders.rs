@@ -103,13 +103,13 @@ pub(crate) fn leader_record(ctx: &Ctx, ix: &index::Index, id: &str) -> Res<Value
 }
 
 /// restore-6c Task 7 (call 18, ambiguity 10): reconcile's pass at the anchor for `up`, with 6a's validated leader
-/// (call 17), before `reenter::arm` (6a call 8's order), with the leader step (Task 8); Task 10 replaces the refusal.
+/// (call 17), before `reenter::arm` (6a call 8's order), with the leader step (Task 8); `None`: the leader is stopped (P6, Task 10).
 pub(crate) fn reconciled(
     ctx: &Ctx,
     caller: &Caller,
     ix: &index::Index,
     leader: Option<&str>,
-) -> Res<serde_json::Map<String, Value>> {
+) -> Res<Option<serde_json::Map<String, Value>>> {
     let a = ix
         .anchor
         .clone()
@@ -123,7 +123,7 @@ pub(crate) fn reconciled(
         step: Some(crate::agents::leader::resume_ended),
     };
     match pass(ctx, &anchor_caller(caller, &scope), who)? {
-        Pass::Done(m) => Ok(m),
-        Pass::Stopped => refuse(1, "stopping", "the team's leader is stopped"),
+        Pass::Done(m) => Ok(Some(m)),
+        Pass::Stopped => Ok(None), // P6: `drive` retires the team (Task 10)
     }
 }
