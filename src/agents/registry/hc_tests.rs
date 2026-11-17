@@ -1008,7 +1008,16 @@ fn a_stop_notice_reaches_the_off_anchor_parent_box() {
         session: "$A".into(),
     });
     let state = w.ctx.state_root.join("a1a1a1a1a1a1a1a1");
-    std::fs::create_dir_all(state.join("agents").join(ID)).unwrap();
+    // Integration #150 CI: made private as the product makes it, the state root first; a folder left at the umask
+    // (755) or with an inherited shared ACL is refused `state` before the notice under test.
+    w.state();
+    for f in [
+        state.clone(),
+        state.join("agents"),
+        state.join("agents").join(ID),
+    ] {
+        crate::agents::spawn::private_folder(&w.ctx, &f).unwrap();
+    }
     let record = json!({"name": "worker", "pane": "%9", "parentPane": "%1",
         "parentServerKey": caller.server_key});
     stop_notice(&w.ctx, &caller, ID, &record, None).unwrap();

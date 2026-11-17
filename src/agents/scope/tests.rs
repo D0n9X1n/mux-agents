@@ -23,12 +23,23 @@ fn at() -> Scope {
         session: "$A".into(),
     }
 }
+/// Integration #150 CI: `key`'s state folder and its agents and mail folders made private, as the product makes
+/// them, the state root first; a folder left at the umask (755) or with an inherited shared ACL is refused `state`
+/// before anything under test runs.
+fn private_key(w: &World, key: &str) {
+    w.state();
+    let k = w.ctx.state_root.join(key);
+    for f in [k.clone(), k.join("agents"), k.join("mail")] {
+        crate::agents::spawn::private_folder(&w.ctx, &f).unwrap();
+    }
+}
 /// A committed lifecycle member `id` at K1 in `session`: a valid hc identity and generation 1 launched, claimed
 /// `run` and committed.
 fn record_at(w: &World, id: &str, session: &str) {
     use crate::agents::life_fixture as lf;
     let f = w.ctx.state_root.join(K1).join("agents").join(id);
-    std::fs::create_dir_all(&f).unwrap();
+    private_key(w, K1);
+    crate::agents::spawn::private_folder(&w.ctx, &f).unwrap();
     crate::state::fs::write_json(
         &f.join("record.json"),
         &json!({"lifecycle": 1, "id": id, "name": format!("m{}", &id[11..]),
@@ -53,6 +64,7 @@ fn team_record(w: &World, session: &str) {
         leader: "cccccccccccc".into(),
         created_at: "2026-11-16T00:00:00.0000000Z".into(),
     };
+    private_key(w, K1);
     assert!(team::create(&team::path(&w.ctx.state_root.join(K1), session), &t).unwrap());
 }
 
@@ -132,7 +144,8 @@ fn registry_and_board_read_the_anchor_pair() {
         .join(K1)
         .join("agents")
         .join("999999999999");
-    std::fs::create_dir_all(&pre).unwrap();
+    private_key(&w, K1);
+    crate::agents::spawn::private_folder(&w.ctx, &pre).unwrap();
     crate::state::fs::write_json(
         &pre.join("record.json"),
         &json!({"id": "999999999999", "name": "old", "session": "$A"}),
@@ -622,6 +635,7 @@ fn team_record_at(w: &World, key: &str, session: &str) {
         leader: "cccccccccccc".into(),
         created_at: "2026-11-16T00:00:00.0000000Z".into(),
     };
+    private_key(w, key);
     assert!(team::create(&team::path(&w.ctx.state_root.join(key), session), &t).unwrap());
 }
 
