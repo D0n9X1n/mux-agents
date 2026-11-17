@@ -1055,7 +1055,9 @@ mod tests {
         let start = std::time::Instant::now();
         let e = sync_dir(dir.path()).unwrap_err();
         assert_eq!(e.raw_os_error(), Some(32), "{e}");
-        assert!(start.elapsed() < std::time::Duration::from_secs(5));
+        // The promise is a bounded retry (about 1 s of sleeps), not a speed: 30 s still catches an unbounded one and
+        // holds under a loaded full suite (r6c call 34).
+        assert!(start.elapsed() < std::time::Duration::from_secs(30));
     }
 
     #[cfg(windows)]
@@ -1065,6 +1067,7 @@ mod tests {
         let start = std::time::Instant::now();
         assert!(sync_dir(&dir.path().join("missing")).is_err());
         assert!(sync_file(&dir.path().join("missing")).is_err());
-        assert!(start.elapsed() < std::time::Duration::from_millis(200));
+        // Below the retry's 40 × 25 ms of sleeps, so a retry on every error still fails here, with room for load.
+        assert!(start.elapsed() < std::time::Duration::from_millis(900));
     }
 }
