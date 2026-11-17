@@ -98,30 +98,19 @@ pub(super) fn own_report(ctx: &Ctx, kind: Client, key: (u32, i64), wanted: &str)
 /// `Evidence` when it cannot be read or names no valid id (R2), its process is gone with no entry left, or its key
 /// cannot be resolved (its report could be anywhere). With no report, a row whose argv or start cannot be read may be
 /// on any conversation, so it holds as `Unbound` (H4.5); a readable one holds nothing, and a report naming another
-/// conversation holds nothing. A Unix native `copilot` keyed by itself with no report of its own may have outlived its
-/// npm loader, whose report is then an entry whose process is gone and that started no later than the native: one
-/// naming `wanted` holds it (`live::gone_naming`). A directly run native has its own report, which decides.
+/// conversation holds nothing. Known limit: a Unix native `copilot` whose npm loader was killed while it survived is
+/// keyed by itself, so the report its loader wrote is not found; holding every such native instead would block resume
+/// for every directly run `copilot`.
 pub(super) fn unmanaged_report(ctx: &Ctx, row: &Row, kind: Client, wanted: &str) -> Option<Rule> {
     let Some(key) = crate::agents::ancestry::identity(ctx, row, kind) else {
         return Some(Rule::Evidence);
     };
     let unread = row.argv.is_none() || row.start.is_none();
-    let native = kind == Client::Copilot
-        && crate::state::root::HOST == OsKind::Unix
-        && key.0 == row.pid
-        && (row.path.as_deref()).is_some_and(|p| p.rsplit('/').next() == Some("copilot"));
-    let orphaned = || match live::gone_naming(ctx, kind, key.1, wanted) {
-        Ok(true) => Some(Rule::Unmanaged),
-        Ok(false) => None,
-        Err(_) => Some(Rule::Evidence),
-    };
     match registry(ctx, kind, key.0, key.1) {
         Err(_) => Some(Rule::Evidence),
         Ok(live::Found { entry: None, gone }) => {
             if gone {
                 Some(Rule::Evidence)
-            } else if native && let Some(rule) = orphaned() {
-                Some(rule)
             } else {
                 unread.then_some(Rule::Unbound)
             }

@@ -226,67 +226,6 @@ fn an_unmanaged_native_copilot_is_judged_by_its_loaders_report() {
     }
 }
 
-// H4.4, a Unix native `copilot` whose npm loader exited while it survived: its hook reported under the loader's key,
-// so the report is found as one whose process is gone, started no later than the native. It holds X; a directly run
-// native (no such report) on another conversation holds nothing, so resume stays possible beside it.
-#[test]
-fn a_native_copilot_that_outlived_its_loader_holds_what_the_loader_reported() {
-    if HOST != OsKind::Unix {
-        return; // a Windows native is its own identity: its own report decides
-    }
-    let native = |w: &World| {
-        w.fakes.process(Row {
-            pid: 1,
-            ppid: 0,
-            start: Some(1),
-            path: Some("/sbin/launchd".into()),
-            argv: Some(vec!["launchd".into()]),
-            image: Some("launchd".into()),
-        });
-        w.fakes.process(Row {
-            pid: 7101,
-            ppid: 1,
-            start: Some(2101),
-            path: Some("/usr/lib/copilot".into()),
-            argv: Some(vec!["copilot".into()]),
-            image: Some("copilot".into()),
-        });
-        w.fakes.client(7101, Client::Copilot);
-    };
-    // Orphaned: the gone loader (7100, 2100) reported X.
-    let w = World::human("");
-    native(&w);
-    live::report(&w.ctx, Client::Copilot, 7100, 2100, X, "startup").unwrap();
-    assert_eq!(
-        who(held_on(&w.ctx, X, Client::Copilot, HOST, None)),
-        Some((Rule::Unmanaged, Some(7101))),
-        "an orphaned native holds what its loader reported"
-    );
-    assert_eq!(
-        who(held_on(&w.ctx, A, Client::Copilot, HOST, None)),
-        None,
-        "and nothing else"
-    );
-    // A report that started after the native is not its loader's.
-    let w = World::human("");
-    native(&w);
-    live::report(&w.ctx, Client::Copilot, 7300, 9000, X, "startup").unwrap();
-    assert_eq!(
-        who(held_on(&w.ctx, X, Client::Copilot, HOST, None)),
-        None,
-        "a later process's report"
-    );
-    // Directly run, its own report on another conversation: nothing held.
-    let w = World::human("");
-    native(&w);
-    live::report(&w.ctx, Client::Copilot, 7101, 2101, A, "startup").unwrap();
-    assert_eq!(
-        who(held_on(&w.ctx, X, Client::Copilot, HOST, None)),
-        None,
-        "its own report decides"
-    );
-}
-
 // H4.4 fails closed when an unmanaged client's report cannot be looked up: a key that cannot be resolved (the process
 // cannot be opened) holds as evidence, since its report could name the conversation.
 #[test]
