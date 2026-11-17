@@ -142,9 +142,21 @@ pub fn resolve_tree(ctx: &Ctx) -> Res<Caller> {
     resolve_as(ctx, true)
 }
 
+/// reentry-6a E2: `up` needs only person proof, never the index.
+pub fn resolve_person(ctx: &Ctx) -> Res<Caller> {
+    unadmitted(ctx, false)
+}
+
+/// Every resolution but `up`'s admits a person through the team indexes (reentry-6a E2).
+fn resolve_as(ctx: &Ctx, tree: bool) -> Res<Caller> {
+    let mut c = unadmitted(ctx, tree)?;
+    crate::agents::scope::admit(ctx, &mut c)?;
+    Ok(c)
+}
+
 /// `tree`: a candidate is returned for the tree verbs to prove again under the team lock; otherwise it refuses 2
 /// `tagged` before any multiplexer is made or called.
-fn resolve_as(ctx: &Ctx, tree: bool) -> Res<Caller> {
+fn unadmitted(ctx: &Ctx, tree: bool) -> Res<Caller> {
     if hc::applies(ctx) {
         let c = hc::resolve(ctx)?;
         if c.candidate.is_some() && !tree {

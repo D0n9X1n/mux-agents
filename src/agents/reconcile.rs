@@ -232,6 +232,8 @@ struct Reply {
     unknown: Vec<Value>,
     recover: Vec<Value>,
     sweep: Option<&'static str>,
+    /// adopt-3e refused (r6b call 17): reported, reconcile goes on.
+    adopt: Option<&'static str>,
 }
 
 impl Reply {
@@ -247,6 +249,9 @@ impl Reply {
         }
         if let Some(check) = self.sweep {
             m.insert("sweepError".into(), json!(check));
+        }
+        if let Some(check) = self.adopt {
+            m.insert("adoptError".into(), json!(check));
         }
         m
     }
@@ -313,8 +318,12 @@ pub fn run(ctx: &Ctx, anchor: &Caller) -> Res<Map<String, Value>> {
                 Err(e) => reply.unknown.push(failed(&id, g.record(), &e)),
             }
         }
-        // shortcut: adopt-3e's `adopt_locked(tx, anchor)` (best effort, `adoptError`, r6b call 17) is not merged yet;
-        // it is called here, once, when it lands.
+        // r6b call 17: best effort; a refusal (an unreadable member in `Tree`) is reported, never fatal.
+        match super::adopt::adopt_locked(tx, anchor) {
+            Ok(_) => {}
+            Err(e) if e.check == "halted" => return Err(e),
+            Err(e) => reply.adopt = Some(e.check),
+        }
         Ok(reply.map())
     })
 }

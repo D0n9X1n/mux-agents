@@ -1233,7 +1233,8 @@ fn a_notice_marker_never_outlives_its_message() {
     cx::member(&w, L, None, 0, json!({}));
     let a = cx::member(&w, A, Some(L), 1, json!({}));
     cx::terminates(&w, A);
-    let key = crate::agents::mail::mailbox_key(cx::PANE, "").unwrap();
+    // adopt-3e: A's notice goes to its logical parent L's member mailbox.
+    let key = crate::agents::mail::member_mailbox(L, &lf::record(&w.folder(L)));
     let mailbox = w.state().join("mail").join(format!("{key}.jsonl"));
     let (tx, c) = (cx::tx(&w, &s), w.caller());
     crate::state::fs::fail_sync_file(Some(&mailbox));
@@ -1536,7 +1537,12 @@ fn the_bar_tick_tries_the_team_lock_once() {
     let (w, s) = lf::world();
     complete(&w);
     w.fakes.lock_timeout(&s.team_lock());
-    assert!(!tick(&w.ctx, &w.caller()).unwrap(), "busy: skipped");
+    assert!(
+        crate::agents::adopt::tick(&w.ctx, &w.caller())
+            .unwrap()
+            .is_none(),
+        "busy: skipped"
+    );
     assert!(cx::journal_of(&w, A).exists());
     assert!(
         w.fakes.locks().contains(&format!("?{}", s.team_lock())),
@@ -1544,11 +1550,17 @@ fn the_bar_tick_tries_the_team_lock_once() {
     );
     let (w, _) = lf::world();
     complete(&w);
-    assert!(tick(&w.ctx, &w.caller()).unwrap());
+    assert!(
+        crate::agents::adopt::tick(&w.ctx, &w.caller())
+            .unwrap()
+            .is_some()
+    );
     assert!(!cx::journal_of(&w, A).exists(), "finished");
     let (w, _) = lf::world();
     assert!(
-        !tick(&w.ctx, &w.caller()).unwrap(),
+        crate::agents::adopt::tick(&w.ctx, &w.caller())
+            .unwrap()
+            .is_none(),
         "no journal folder: no lock taken"
     );
     assert!(w.fakes.locks().is_empty());
@@ -1561,7 +1573,11 @@ fn stop_and_tick_never_deadlock() {
     let (w, s) = lf::world();
     w.fakes.real_locks(&w._dir.path().join("locks"));
     complete(&w);
-    assert!(tick(&w.ctx, &w.caller()).unwrap());
+    assert!(
+        crate::agents::adopt::tick(&w.ctx, &w.caller())
+            .unwrap()
+            .is_some()
+    );
     cx::member(&w, B, Some(A), 2, json!({}));
     cx::terminates(&w, B);
     let c = w.caller();
@@ -1603,4 +1619,40 @@ fn the_bars_view_marks_a_bad_member_and_never_refuses() {
         [(false, None), (false, None), (false, None)],
         "torn: nothing placed, nothing else marked"
     );
+}
+
+// Integration (#150 CI, live `list_all_json_shape`): the Stopped notice is posted from the presented record, as
+// main's `stop_life` posted it, so its line carries the pane the member's own view.json presents: the `<from>|<pane>`
+// the board counts the stopped row's unread under. The raw record holds no pane (views-6f V1).
+#[test]
+fn a_stopped_member_is_noticed_from_the_pane_its_view_presents() {
+    let (w, s) = lf::world();
+    cx::member(&w, L, None, 0, json!({}));
+    let a = cx::member(&w, A, Some(L), 1, json!({}));
+    let view = json!({"gen": 1, "hcAddress": cx::addr(A), "hcName": lf::hc_name(1), "pane": "%7",
+        "window": "@1", "startCommand": format!("hc attach {}", cx::addr(A)),
+        "serverKey": w.caller().server_key, "session": w.caller().session, "attachProgram": "hc"});
+    crate::state::fs::write_json(&a.join("view.json"), &view).unwrap();
+    cx::terminates(&w, A);
+    let tx = cx::tx(&w, &s);
+    let j = prepare(&tx, A).unwrap();
+    let r = execute(&tx, &caller(&w), &j).unwrap();
+    assert!(r.stopped && r.unresolved.is_empty(), "{r:?}");
+    // adopt-3e (be8abf4): A's notice goes where gens/1/route.json recorded (its logical parent L's mailbox).
+    let route = gens::read(&a, 1, "route").known().unwrap().unwrap();
+    let key = route["mailbox"].as_str().unwrap().to_string();
+    let text =
+        std::fs::read_to_string(w.state().join("mail").join(format!("{key}.jsonl"))).unwrap();
+    let want = gens::delivery_id(A, 1);
+    let line: Vec<serde_json::Value> = (text.lines())
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .filter(|m| m["id"] == want.as_str())
+        .collect();
+    assert_eq!(line.len(), 1, "{text}");
+    assert_eq!(
+        (&line[0]["from"], &line[0]["pane"]),
+        (&json!(cx::name(A)), &json!("%7")),
+        "{text}"
+    );
+    w.fakes.hc_done().unwrap();
 }

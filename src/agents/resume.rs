@@ -61,6 +61,8 @@ pub fn resume(ctx: &Ctx, request: &Request) -> Res<Map<String, Value>> {
     };
     let core = crate::hc::connect(ctx)?;
     let (from, record) = lock(ctx, &super::team_lock(&caller), || {
+        // adopt-3e call 13: every input of this decision (standing, snapshot, records) is read after replay.
+        super::adopt::replay_held(ctx, &caller)?;
         let gate = match super::tree::team_of(ctx, &caller)? {
             Some(t) => Some((t, super::tree::standing(ctx, &caller, Some(&core))?)),
             None if caller.kind == Kind::Agent => {

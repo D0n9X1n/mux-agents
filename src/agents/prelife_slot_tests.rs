@@ -378,7 +378,13 @@ fn a_fifo_or_link_at_held_evidence_keeps_the_folder_held() {
             pf::script(&w, answers);
             let dog = Unblock::new(&at);
             let e = pf::admit_spawn(&w).unwrap_err();
-            assert!(dog.quick(), "{file} {kind}: the read blocked");
+            // The 2 s bound proves no blocking only at a FIFO (Unix). A link cannot block, so there the bound would
+            // measure only wall-clock time under load (coordinator note, restore-6b: flaky on Windows); the link
+            // case is held by `e.check` alone.
+            let quick = dog.quick();
+            if kind == "fifo" {
+                assert!(quick, "{file} {kind}: the read blocked");
+            }
             assert_eq!(e.check, "limit", "{file} {kind}: held");
             w.fakes.hc_done().unwrap();
         }

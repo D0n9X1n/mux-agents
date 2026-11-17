@@ -563,17 +563,17 @@ pub fn self_of(caller: &Caller, snapshot: &Snapshot) -> Res<Me> {
         }
         Own::None => Ok(Me {
             name: "root".into(),
-            key: mail::mailbox_key(&caller.pane, "")?,
+            key: mail::person_box(caller)?,
             record: None,
         }),
     }
 }
 
 /// The mailbox of `pane`: the running agent's there (its id, or the one it inherited), else `pane-<n>`.
-pub fn mailbox_of(snapshot: &Snapshot, pane: &str) -> Res<String> {
+pub fn mailbox_of(snapshot: &Snapshot, pane: &str, elsewhere: Option<&str>) -> Res<String> {
     match snapshot.at(pane) {
         Some(agent) => Ok(mail::member_mailbox(&agent.id, &agent.record)),
-        None => mail::mailbox_key(pane, ""),
+        None => mail::pane_box(pane, elsewhere),
     }
 }
 
@@ -634,7 +634,7 @@ pub(crate) fn stop_notice(
     let name = super::text(record.get("name"));
     let parent = super::text(record.get("parentPane"));
     if !parent.is_empty() {
-        let key = mail::mailbox_key(&parent, "")?;
+        let key = mail::parent_box(record)?;
         let mut fields = Map::new();
         fields.insert("kind".into(), "stopped".into());
         fields.insert("exitCode".into(), Value::Null);
@@ -763,24 +763,29 @@ fn post(
             format!("{name} is gone: its pane closed without an exit record."),
         ),
     };
-    let parent = super::text(record.get("parentPane"));
-    let delivered = if parent.is_empty() {
-        None // spec v10 amendment (#103): a leader has no parent pane; its notice is recorded for the bar and `list`, mailed to no one
-    } else {
-        let key = mail::mailbox_key(&parent, "")?;
-        let pane = super::text(record.get("pane"));
-        let mut fields = Map::new();
-        fields.insert("kind".into(), kind.into());
-        fields.insert("exitCode".into(), code.clone());
-        // The member it is about, so a team bar counts it by identity (#103 review).
-        fields.insert("fromId".into(), id.into());
-        // cascade-3d call 9: a lifecycle notice's message is flushed before its marker is published.
-        let add = if life_gen.is_some() {
-            mail::add_once_durable
-        } else {
-            mail::add_once
-        };
-        add(ctx, caller, &key, &name, &pane, &body, &delivery, &fields)?
+    let key = match life_gen {
+        // adopt-3e call 12: decided once and recorded before the first attempt; every retry delivers there.
+        Some(n) => super::adopt::notice_route(ctx, caller, folder, id, record, n)?,
+        None => super::adopt::pane_key(record)?,
+    };
+    let delivered = match key {
+        // spec v10 amendment (#103): no parent; the notice is recorded for the bar and `list`, mailed to no one
+        None => None,
+        Some(key) => {
+            let pane = super::text(record.get("pane"));
+            let mut fields = Map::new();
+            fields.insert("kind".into(), kind.into());
+            fields.insert("exitCode".into(), code.clone());
+            // The member it is about, so a team bar counts it by identity (#103 review).
+            fields.insert("fromId".into(), id.into());
+            // cascade-3d call 9: a lifecycle notice's message is flushed before its marker is published.
+            let add = if life_gen.is_some() {
+                mail::add_once_durable
+            } else {
+                mail::add_once
+            };
+            add(ctx, caller, &key, &name, &pane, &body, &delivery, &fields)?
+        }
     };
     // cascade-3d C6 crash point: the message is delivered, its marker not yet published.
     if life_gen.is_some() {
@@ -1530,7 +1535,7 @@ mod tests {
                 "2 parent this pane's agent cannot be proven to run here"
             );
             assert_eq!(refusal(untagged(&w.ctx, &caller, "no")), "2 tagged no");
-            assert_eq!(mailbox_of(&s, "%1").unwrap(), "pane-1");
+            assert_eq!(mailbox_of(&s, "%1", None).unwrap(), "pane-1");
         }
     }
 

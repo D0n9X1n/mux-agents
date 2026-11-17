@@ -454,6 +454,47 @@ fn s(value: &Value) -> String {
         .to_string()
 }
 
+/// `rmux -L <socket> <args>` that never panics: its stdout, or its status and stderr.
+fn rmux_try(live: &Live, args: &[&str]) -> String {
+    match crate::bounded::output(live.rmux().args(args), crate::bounded::LIMIT) {
+        Ok(out) if out.status.success() => String::from_utf8_lossy(&out.stdout).into_owned(),
+        Ok(out) => format!("{:?}: {}", out.status, String::from_utf8_lossy(&out.stderr)),
+        Err(e) => format!("not run: {e}"),
+    }
+}
+
+/// #150 diagnosis: None while `bar` is listed and alive; else what explains its exit: every pane with its dead flag
+/// and start command, the bar's last screen (its `watch` reply names `ended`), and each spawned member's view.json.
+fn bar_gone(live: &Live, bar: &str, spawned: &[&Value]) -> Option<String> {
+    let panes = rmux_try(
+        live,
+        &[
+            "list-panes",
+            "-a",
+            "-F",
+            "#{pane_id}|#{pane_dead}|#{window_id}|#{pane_start_command}",
+        ],
+    );
+    let alive = panes.lines().any(|l| l.split('|').take(2).eq([bar, "0"]));
+    if alive {
+        return None;
+    }
+    let mut report = format!("list-panes:\n{panes}\nbar screen:\n");
+    report.push_str(&rmux_try(live, &["capture-pane", "-p", "-J", "-t", bar]));
+    for reply in spawned {
+        let id = reply["id"].as_str().unwrap_or("");
+        let views: Vec<String> = std::fs::read_dir(live.dir.join("state"))
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|e| e.path().join("agents").join(id).join("view.json"))
+            .filter_map(|p| std::fs::read_to_string(p).ok())
+            .collect();
+        report.push_str(&format!("\n{id} view.json: {views:?}"));
+    }
+    Some(report)
+}
+
 /// The 1-based line of `screen` whose second token is `name`: that agent's name line (`◉`/`◌`, then the name).
 fn row_at(screen: &str, name: &str) -> Option<usize> {
     screen
@@ -574,7 +615,7 @@ fn hc_worker_and_view_close_survives_focus_stop() {
     assert_eq!(get()["argv"], before["argv"]);
     assert_eq!(
         live.run(&["stop", "w1"]),
-        serde_json::json!({"ok":true,"verb":"stop","name":"w1","hcAddress":address,"life":"ended"})
+        serde_json::json!({"ok":true,"verb":"stop","name":"w1","hcAddress":address,"life":"ended","stopped":true,"unresolved":[]})
     );
     live.wait("finished core terminal", || {
         (get()["state"] == "finished").then_some(())
@@ -668,7 +709,7 @@ fn hc_stop_then_resume_returns_with_its_conversation() {
     };
     assert_eq!(
         live.run(&["stop", "w1"]),
-        serde_json::json!({"ok":true,"verb":"stop","name":"w1","hcAddress":address,"life":"ended"})
+        serde_json::json!({"ok":true,"verb":"stop","name":"w1","hcAddress":address,"life":"ended","stopped":true,"unresolved":[]})
     );
     live.wait("finished core terminal", || {
         (get(&address)["state"] == "finished").then_some(())
@@ -788,7 +829,16 @@ fn bar_keys_and_a_click_focus_an_agent() {
     let w2 = live.spawn("w2");
     let bar = s(&w1["sidebar"]);
     let (p1, p2) = (s(&w1["pane"]), s(&w2["pane"]));
+    // #150 diagnosis (CI only: rmux's daemon is refused locally): a bar that leaves keeps its last screen, which holds
+    // its `watch` reply and so its `ended` reason; a bar gone or dead fails here with what it saw.
+    let _ = rmux_try(
+        &live,
+        &["set-option", "-w", "-t", &bar, "remain-on-exit", "on"],
+    );
     live.wait("both agents on the bar", || {
+        if let Some(report) = bar_gone(&live, &bar, &[&w1, &w2]) {
+            panic!("the bar {bar} left before both agents showed:\n{report}");
+        }
         let screen = live.screen(&bar);
         (row_at(&screen, "w1").is_some() && row_at(&screen, "w2").is_some()).then_some(())
     });
@@ -1120,6 +1170,7 @@ fn hc_stopped_member_resumes_with_its_stored_options_only() {
         "the successor keeps the conversation"
     );
     let mut want = options.clone();
+    // notebook-7b: a resumed client's first text is the notebook news block.
     want.extend([
         "--resume".to_string(),
         sid.clone(),
@@ -1340,9 +1391,17 @@ fn up_creates_a_team_in_a_new_session() {
         .trim()
         == "leader|1"));
     assert!(!marker.exists());
+    // 6b ambiguity 8 (r6b call 7): a second `up` reconciles the team; nothing is lost, nothing restored.
+    let again = live.run_any(&["up", "-Client", "claude"]);
+    // reentry-6a Task 9: it re-enters the team the index records.
     assert_eq!(
-        live.run_any(&["up", "-Client", "claude"])["check"],
-        "leader"
+        (&again["created"], &again["reentered"], &again["restored"]),
+        (
+            &serde_json::json!(false),
+            &serde_json::json!(true),
+            &serde_json::json!([])
+        ),
+        "{again}"
     );
 }
 
@@ -2829,4 +2888,410 @@ fn wait_ready(live: &Live, id: &str) {
 fn gen0_file(live: &Live, id: &str, file: &str) -> Option<Value> {
     let p = agent_dir(live, id).join("gens").join("0").join(file);
     serde_json::from_str(&std::fs::read_to_string(p).ok()?).ok()
+}
+
+/// Quits member `id`'s fake client and waits for its exit marker.
+fn quit_member(live: &Live, id: &str) {
+    let pid = client_pid(
+        live,
+        &s(&member_file(live, id, "record.json")["sessionId"]),
+        0,
+    );
+    std::fs::write(live.dir.join(format!("quit.{pid}")), "0").unwrap();
+    live.wait("client exit", || {
+        live.dir
+            .join(format!("exited.{pid}"))
+            .exists()
+            .then_some(())
+    });
+}
+fn finished(live: &Live, id: &str) -> bool {
+    let address = s(&member_file(live, id, "record.json")["hcAddress"]);
+    eventually(Duration::from_secs(60), || {
+        hc_get(live, &address)["state"] == "finished"
+    })
+}
+fn parent_and_depth(live: &Live, id: &str) -> (Value, Value) {
+    let r = member_file(live, id, "record.json");
+    (r["parentAgent"]["id"].clone(), r["depth"].clone())
+}
+/// The bodies in member `id`'s mailbox (`<state>/<key>/mail/<mailbox>.jsonl`; an inherited `mailbox` honoured).
+fn mail_bodies(live: &Live, id: &str) -> Vec<Value> {
+    let r = member_file(live, id, "record.json");
+    let key = r
+        .get("mailbox")
+        .and_then(Value::as_str)
+        .unwrap_or(id)
+        .to_string();
+    let keyed = agent_dir(live, id)
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    let text = std::fs::read_to_string(keyed.join("mail").join(format!("{key}.jsonl")))
+        .unwrap_or_default();
+    text.lines()
+        .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+        .map(|m| m["body"].clone())
+        .collect()
+}
+/// A person's command typed into the team's pane; its reply must be `ok`.
+fn team_run(live: &Live, team: &str, args: &[&str]) -> Value {
+    let v = live.run_any_in(team, args);
+    assert_eq!(v["ok"], true, "{args:?}: {v}");
+    v
+}
+
+/// adopt-3e live on rmux (Windows): the Unix scenario through the same public commands (calls 3, 16, 23). A person's
+/// commands run from a pane in `up`'s team session, whose bar is closed.
+#[test]
+fn adoption_moves_b_and_a_resumed_successor_stops_its_child() {
+    use serde_json::json;
+    let Some(live) = Live::start() else { return };
+    let (task, brief) = (live.dir.join("task.txt"), live.dir.join("brief.md"));
+    std::fs::write(&task, "say hi").unwrap();
+    std::fs::write(&brief, "brief").unwrap();
+    let (task, brief) = (task.display().to_string(), brief.display().to_string());
+    let up = live.run(&["up", "-Client", "claude"]);
+    let x = s(&up["leader"]["id"]);
+    let team = team_pane(&live, &s(&up["session"]));
+    team_run(&live, &team, &["sidebar", "-Close"]);
+    let mut sent = HashMap::new();
+    let spawn = |live: &Live, sent: &mut HashMap<u32, usize>, who: &str, name: &str| {
+        let args = [
+            "spawn",
+            "-Client",
+            "claude",
+            "-TaskFile",
+            task.as_str(),
+            "-BriefFile",
+            brief.as_str(),
+            "-Context",
+            "brief",
+            "-Name",
+            name,
+        ];
+        let r = by(live, sent, who, &args);
+        assert_eq!(r["ok"], true, "{name}: {r}");
+        s(&r["id"])
+    };
+    let a = spawn(&live, &mut sent, &x, "a1");
+    let b = spawn(&live, &mut sent, &a, "b1");
+    quit_member(&live, &a);
+    assert!(finished(&live, &a), "A finished");
+    team_run(&live, &team, &["list"]); // reaps A
+    team_run(&live, &team, &["list"]); // sweeps: X adopts B
+    assert_eq!(
+        parent_and_depth(&live, &b),
+        (json!(x), json!(1)),
+        "X adopted B"
+    );
+    let up_md = live.dir.join("up.md");
+    std::fs::write(&up_md, "from b1").unwrap();
+    let up_md = up_md.display().to_string();
+    let r = by(
+        &live,
+        &mut sent,
+        &b,
+        &["send", "parent", "-BodyFile", up_md.as_str()],
+    );
+    assert_eq!(r["ok"], true, "{r}");
+    assert!(
+        mail_bodies(&live, &x).contains(&json!("from b1")),
+        "X's mailbox"
+    );
+    let address = |id: &str| s(&member_file(&live, id, "record.json")["hcAddress"]);
+    assert_eq!(hc_get(&live, &address(&b))["state"], "live", "B works");
+
+    let c = spawn(&live, &mut sent, &x, "c1");
+    let d = spawn(&live, &mut sent, &c, "d1");
+    team_run(&live, &team, &["sidebar", "-Close"]); // nothing sweeps D under X before the resume
+    quit_member(&live, &c);
+    assert!(finished(&live, &c), "C finished");
+    team_run(&live, &team, &["list"]); // records C's end (its sweep ran before the reap)
+    let c2 = s(&team_run(&live, &team, &["resume", "c1"])["agent"]["id"]);
+    assert_ne!(c2, c, "a successor");
+    assert_eq!(
+        parent_and_depth(&live, &d).0,
+        json!(c),
+        "D still names C (C0 resolves it)"
+    );
+    team_run(&live, &team, &["stop", "c1"]);
+    assert!(finished(&live, &d), "stop C′ stopped D");
+
+    let x_name = member_file(&live, &x, "record.json")["name"].clone();
+    quit_member(&live, &x);
+    team_run(&live, &team, &["list"]);
+    let rows = team_run(&live, &team, &["list", "-All"]);
+    let row = rows["agents"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["name"] == x_name)
+        .cloned();
+    assert_eq!(
+        row.unwrap()["life"],
+        "ended",
+        "the root's row ended: {rows}"
+    );
+    assert_eq!(
+        parent_and_depth(&live, &b),
+        (json!(x), json!(1)),
+        "B under the ended root"
+    );
+    assert_eq!(
+        hc_get(&live, &address(&b))["state"],
+        "live",
+        "B still works"
+    );
+    let up2 = live.dir.join("up2.md");
+    std::fs::write(&up2, "after x ended").unwrap();
+    let up2 = up2.display().to_string();
+    let r = by(
+        &live,
+        &mut sent,
+        &b,
+        &["send", "parent", "-BodyFile", up2.as_str()],
+    );
+    assert_eq!(r["ok"], true, "{r}");
+    assert!(
+        mail_bodies(&live, &x).contains(&json!("after x ended")),
+        "X's mailbox after X ended"
+    );
+}
+
+/// restore-6b: `member_file` that waits: None until the file exists.
+fn member_file_opt(live: &Live, id: &str, file: &str) -> Option<()> {
+    let state = live.dir.join("state");
+    std::fs::read_dir(&state)
+        .ok()?
+        .flatten()
+        .any(|e| e.path().join("agents").join(id).join(file).is_file())
+        .then_some(())
+}
+
+/// restore-6b: `up`, then A (claude) and B (copilot) spawned by the leader with markers; each first generation ready.
+fn team_of_three(live: &Live, sent: &mut HashMap<u32, usize>) -> Vec<String> {
+    let up = live.run(&["up", "-Client", "claude"]);
+    let lead = s(&up["leader"]["id"]);
+    std::fs::write(live.dir.join("brief.md"), "brief").unwrap();
+    let brief = live.dir.join("brief.md").display().to_string();
+    let mut ids = vec![lead.clone()];
+    for (client, name, marker) in [("claude", "a", "MARKER-A"), ("copilot", "b", "MARKER-B")] {
+        let task = live.dir.join(format!("task-{name}.txt"));
+        std::fs::write(&task, format!("say {marker}")).unwrap();
+        let task = task.display().to_string();
+        let args = [
+            "spawn",
+            "-Client",
+            client,
+            "-TaskFile",
+            &task,
+            "-BriefFile",
+            &brief,
+            "-Context",
+            "brief",
+            "-Name",
+            name,
+        ];
+        let r = by(live, sent, &lead, &args);
+        ids.push(s(&r["id"]));
+    }
+    for id in &ids {
+        live.wait("ready", || member_file_opt(live, id, "gens/0/ready.json"));
+    }
+    ids
+}
+
+/// restore-6b ambiguity 14: the core killed (`taskkill /F`, never `/T`); waits until hc shows every member terminal
+/// Lost. Returns the records before the kill and the predecessor client pids, captured before the kill (r6b call 9).
+fn lose(live: &mut Live, ids: &[String]) -> (Vec<Value>, Vec<u32>) {
+    let before: Vec<Value> = ids
+        .iter()
+        .map(|id| member_file(live, id, "record.json"))
+        .collect();
+    let old: Vec<u32> = before
+        .iter()
+        .map(|r| client_pid(live, &s(&r["sessionId"]), 0))
+        .collect();
+    live.core.kill_hard();
+    let live: &Live = live;
+    for r in &before {
+        let address = s(&r["hcAddress"]);
+        live.wait("lost", || {
+            let t = hc_get(live, &address);
+            (t["state"] == "live" && t["argv"] != r["launcherArgv"]).then_some(())
+        });
+    }
+    (before, old)
+}
+
+/// The ids of an `up` reply array, sorted.
+fn sorted_ids(reply: &Value, key: &str) -> Vec<String> {
+    let mut v: Vec<String> = reply[key]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| s(&e["id"]))
+        .collect();
+    v.sort();
+    v
+}
+
+/// restore-6b spec live "Abrupt loss", "Ready after restore" and "Ended" on Windows (r6b call 9). The adjudicating
+/// `list` runs as the restored leader (checklist 22).
+#[test]
+fn restore_resumes_every_lost_member_after_a_core_kill_on_windows() {
+    let Some(mut live) = Live::start() else {
+        return;
+    };
+    let mut sent = HashMap::new();
+    let ids = team_of_three(&live, &mut sent);
+    let (before, old) = lose(&mut live, &ids);
+    let up = live.run(&["up", "-Client", "claude"]);
+    assert_eq!(up["created"], json!(false), "{up}");
+    let mut want = ids.clone();
+    want.sort();
+    assert_eq!(
+        sorted_ids(&up, "restored"),
+        want,
+        "every lost member restored: {up}"
+    );
+    let mut news = Vec::new();
+    for (i, id) in ids.iter().enumerate() {
+        let r = member_file(&live, id, "record.json");
+        assert_eq!(
+            (&r["generation"], &r["sessionId"]),
+            (&json!("1"), &before[i]["sessionId"]),
+            "{id}"
+        );
+        let sid = s(&r["sessionId"]);
+        let new = client_pid(&live, &sid, old[i]); // newest first, the predecessor skipped: the successor
+        news.push(new);
+        let path = live.dir.join(format!("client.{new}.json"));
+        let c: Value = serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+        let argv = c["argv"].as_array().unwrap();
+        assert!(
+            argv.windows(2)
+                .any(|w| w[0] == "--resume" && w[1] == sid.as_str()),
+            "{c}"
+        );
+        if i > 0 {
+            let marker = if i == 1 { "MARKER-A" } else { "MARKER-B" };
+            assert!(
+                !c["argv"].to_string().contains(marker),
+                "the task is never resent"
+            );
+            assert!(
+                c["recalled"].to_string().contains(marker),
+                "the same conversation"
+            );
+        }
+        live.wait("ready again", || {
+            member_file_opt(&live, id, "gens/1/ready.json")
+        });
+        let kept = hc_get(&live, &s(&before[i]["hcAddress"]));
+        let mut keys: Vec<&String> = kept["labels"].as_object().unwrap().keys().collect();
+        keys.sort();
+        assert_eq!(keys, ["mux.kept", "mux.keptName"]);
+    }
+    // the list of the restored leader adjudicates what it shows (outcome-2; checklist 22)
+    let listed = by_pid(&live, &mut sent, news[0], &["list"]);
+    assert_eq!(listed["ok"], true, "{listed}");
+    for id in &ids {
+        assert_eq!(
+            member_file(&live, id, "gens/1/outcome.json")["outcome"],
+            "ok",
+            "{id}"
+        );
+    }
+    let again = live.run(&["up", "-Client", "claude"]);
+    assert_eq!(again["restored"], json!([]), "a second up starts nothing");
+    // Ended: the restored A quits on its own; no up brings it back.
+    std::fs::write(live.dir.join(format!("quit.{}", news[1])), "0").unwrap();
+    live.wait("A exited", || {
+        live.dir
+            .join(format!("exited.{}", news[1]))
+            .is_file()
+            .then_some(())
+    });
+    by_pid(&live, &mut sent, news[0], &["list"]); // reaps the end (registry)
+    let third = live.run(&["up", "-Client", "claude"]);
+    assert_eq!(
+        third["restored"],
+        json!([]),
+        "an ended member stays ended: {third}"
+    );
+    assert_eq!(
+        member_file(&live, &ids[1], "record.json")["generation"],
+        "1"
+    );
+}
+
+/// restore-6b spec live "Managed vs unmanaged" on Windows: an unmanaged Claude holds the Claude restores (leader, A)
+/// and names its pid; an unmanaged Copilot holds B. Each quit frees its kind; restored ids and generations asserted.
+#[test]
+fn restore_resume_is_held_by_an_unmanaged_client_until_it_quits_on_windows() {
+    let Some(mut live) = Live::start() else {
+        return;
+    };
+    let mut sent = HashMap::new();
+    let ids = team_of_three(&live, &mut sent);
+    lose(&mut live, &ids);
+    let mut strays = Vec::new();
+    let pairs = [
+        ("claude.exe", "5e55fc2f-2032-48ef-a920-4af2a8e5af55"),
+        ("copilot.exe", "6e66fc2f-2032-48ef-a920-4af2a8e5af56"),
+    ];
+    for (exe, sid) in pairs {
+        let pane = live.new_session(&format!("stray-{exe}"));
+        live.line(&pane, &format!("{exe} --session-id {sid}"));
+        strays.push(client_pid(&live, sid, 0));
+    }
+    let up = live.run(&["up", "-Client", "claude"]);
+    assert_eq!(up["restored"], json!([]), "{up}");
+    let held = up["held"].as_array().unwrap();
+    assert_eq!(held.len(), 3, "{up}");
+    for h in held {
+        assert_eq!(h["reason"], "occupied", "{h}");
+        let pid = strays[if h["id"] == json!(ids[2]) { 1 } else { 0 }];
+        assert!(h["holder"].to_string().contains(&pid.to_string()), "{h}");
+    }
+    std::fs::write(live.dir.join(format!("quit.{}", strays[0])), "0").unwrap();
+    live.wait("stray claude gone", || {
+        live.dir
+            .join(format!("exited.{}", strays[0]))
+            .is_file()
+            .then_some(())
+    });
+    let second = live.run(&["up", "-Client", "claude"]);
+    let mut claude = vec![ids[0].clone(), ids[1].clone()];
+    claude.sort();
+    assert_eq!(
+        sorted_ids(&second, "restored"),
+        claude,
+        "the restored leader client does not hold A (H2): {second}"
+    );
+    assert_eq!(
+        sorted_ids(&second, "held"),
+        [ids[2].clone()],
+        "the Copilot stray still holds B"
+    );
+    std::fs::write(live.dir.join(format!("quit.{}", strays[1])), "0").unwrap();
+    live.wait("stray copilot gone", || {
+        live.dir
+            .join(format!("exited.{}", strays[1]))
+            .is_file()
+            .then_some(())
+    });
+    let third = live.run(&["up", "-Client", "claude"]);
+    assert_eq!(sorted_ids(&third, "restored"), [ids[2].clone()], "{third}");
+    for id in &ids {
+        assert_eq!(
+            member_file(&live, id, "record.json")["generation"],
+            "1",
+            "{id}"
+        );
+    }
 }

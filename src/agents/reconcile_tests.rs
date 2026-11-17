@@ -190,6 +190,50 @@ pub(super) fn team_record_at(w: &World, key: &str, session: &str) {
 pub(super) fn member(w: &World, id: &str, fields: Value) -> PathBuf {
     member_at(w, &w.caller().server_key, id, fields)
 }
+/// reentry-6a Task 9 (call 22): the index `up` writes for team `t` (up's inputs, anchored at `key`/`session`, its
+/// view on the World server) and the team record at the anchor, led by `L`: the team an earlier `up` created.
+pub(super) fn seed_index(w: &World, t: &str, key: &str, session: &str) {
+    use super::up::index;
+    let me = w.caller();
+    let folder = super::up::identity::folder(&w.ctx).unwrap();
+    let ix = index::Index {
+        team: t.into(),
+        inputs: index::Inputs {
+            client: "claude".into(),
+            options: vec![],
+            prompt: vec![],
+            name: String::new(),
+            folder: folder.to_str().unwrap().into(),
+        },
+        anchor: Some(crate::caller::Anchor {
+            key: key.into(),
+            session: session.into(),
+        }),
+        view: Some(index::View {
+            server: index::server_of(&me),
+            session: session.into(),
+            name: "seeded".into(),
+        }),
+        pending: None,
+        aliases: vec![],
+        releases: vec![],
+    };
+    index::write(&w.ctx, &ix).unwrap();
+    let client = crate::parse::Client::Claude;
+    let record = super::team::Team {
+        team: t.into(),
+        session: session.into(),
+        name: "seeded".into(),
+        directory: folder.to_str().unwrap().into(),
+        client,
+        flags: vec![],
+        policy: super::team::policy(client, &[]),
+        leader: super::reconcile_restore_tests::L.into(),
+        created_at: "2026-01-01T00:00:00.0000000Z".into(),
+    };
+    let at = super::team::path(&w.ctx.state_root.join(key), session);
+    assert!(super::team::create(&at, &record).unwrap());
+}
 /// The terminal hc shows for member `id`, generation n, running `argv`.
 pub(super) fn wire_of(w: &World, id: &str, n: u64, argv: &[&str]) -> Value {
     json!({"address": format!("a{id}"), "name": lf::hc_name(n), "state": "live", "reason": null,

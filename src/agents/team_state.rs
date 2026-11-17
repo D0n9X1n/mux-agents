@@ -46,7 +46,12 @@ pub fn gen_lock_key(key: &str, id: &str, n: u64) -> String {
 
 /// A replay hook open runs before its body (adopt-3e registers its journal, release-1d gens::complete).
 pub type Hook = fn(&Tx<'_>) -> Res<()>;
-const HOOKS: &[Hook] = &[super::release::complete, super::settle::fence];
+/// Replay hooks, in order (state-0 S3): adoption first (adopt-3e A6), then group B's.
+pub(crate) const HOOKS: &[Hook] = &[
+    super::adopt::replay,
+    super::release::complete,
+    super::settle::fence,
+];
 
 #[cfg(test)]
 thread_local! {
@@ -55,6 +60,25 @@ thread_local! {
 #[cfg(test)]
 pub fn test_hook(hook: Option<Hook>) {
     TEST_HOOK.with(|h| h.set(hook));
+}
+
+/// adopt-3e A-1 (test only): a pause each writer takes at its entry, before its member lock and read, so a test
+/// can commit an adoption between the caller's read and the write. Taken once, then cleared.
+#[cfg(test)]
+type Pause = fn(&Ctx, &Scope);
+#[cfg(test)]
+thread_local! {
+    static PAUSE: std::cell::Cell<Option<Pause>> = const { std::cell::Cell::new(None) };
+}
+#[cfg(test)]
+pub fn pause_writes(p: Option<Pause>) {
+    PAUSE.with(|c| c.set(p));
+}
+fn paused(_ctx: &Ctx, _scope: &Scope) {
+    #[cfg(test)]
+    if let Some(p) = PAUSE.with(|c| c.take()) {
+        p(_ctx, _scope);
+    }
 }
 
 /// The team lock held, every hook run.
@@ -96,6 +120,8 @@ pub enum Guard<'a> {
     Pending { n: u64, hc_name: &'a str },
     /// A lifecycle record whose `completing.gen == n` (group B clears `completing`).
     CompletingGen { n: u64 },
+    /// adopt-3e AD-R1: any lifecycle record of the id (the topology writer).
+    Life,
 }
 
 impl Guard<'_> {
@@ -133,6 +159,8 @@ impl Guard<'_> {
                     )
             }
             Guard::CompletingGen { n } => gen_of("completing") == Some(n),
+            // adopt-3e AD-R1: the lifecycle and id checks above are the whole guard.
+            Guard::Life => true,
         }
     }
 }
@@ -163,6 +191,7 @@ impl Tx<'_> {
         guard: Guard<'_>,
         patch: impl FnOnce(&mut Map<String, Value>) -> Res<()>,
     ) -> Res<Option<Value>> {
+        paused(self.ctx, &self.scope);
         let folder = self.folder(id);
         super::lock(self.ctx, &self.scope.member_lock(id), || {
             let read = super::gens::record(&folder).known()?;
@@ -309,6 +338,7 @@ pub const VIEW_KEY: [(&str, &str); 3] = [
 /// S4: the member lock, then `view_held`; replaces the view, never another field. A view names its generation (V1,
 /// ambiguity 7).
 pub fn view(ctx: &Ctx, scope: &Scope, id: &str, v: &Value) -> Res<()> {
+    paused(ctx, scope);
     if !v.get("gen").is_some_and(Value::is_u64) {
         return Err(Refusal::internal("a view names its generation"));
     }
@@ -968,3 +998,6 @@ mod view_tests;
 
 #[cfg(test)]
 mod record_write_tests;
+
+#[cfg(test)]
+mod life_guard_tests;

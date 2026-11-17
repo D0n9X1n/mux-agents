@@ -8,6 +8,9 @@ use crate::caller::Caller;
 use crate::ctx::Ctx;
 use crate::error::{Refusal, Res};
 
+pub mod adopt;
+#[cfg(test)]
+pub(crate) mod adopt_fixture;
 pub mod ancestry;
 pub mod attachment;
 pub mod board;
@@ -60,6 +63,8 @@ mod reconcile_restore_tests;
 mod reconcile_run_tests;
 #[cfg(test)]
 mod reconcile_tests;
+#[cfg(test)]
+mod reconcile_up_tests;
 #[cfg(test)]
 mod reconcile_verb_race_tests;
 #[cfg(test)]

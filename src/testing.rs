@@ -215,8 +215,28 @@ pub fn try_locked<T>(key: &str, f: impl FnOnce() -> Res<T>) -> Res<Option<T>> {
         .with(|current| current.borrow().clone())
         .expect("a lock taken before Fakes::ctx on this thread");
     let busy_here = fakes.0.borrow().timeouts.iter().any(|t| key.starts_with(t));
+    if busy_here {
+        fakes.0.borrow_mut().locks.push(format!("?{key}"));
+        return Ok(None);
+    }
+    // adopt-3e call 15: with `real_locks`, the real one zero wait under that root (as `locked`'s real branch).
+    let real = fakes.0.borrow().real_locks.clone();
+    if let Some(root) = real {
+        let mut ctx = fakes.ctx();
+        ctx.clock = Box::new(crate::ctx::SystemClock);
+        let got = crate::state::lock::try_with_lock_at(&ctx, &root, key, || {
+            fakes.lock_event('+', key);
+            let out = f();
+            fakes.lock_event('-', key);
+            out
+        })?;
+        if got.is_none() {
+            fakes.0.borrow_mut().locks.push(format!("?{key}"));
+        }
+        return Ok(got);
+    }
     let gate = fakes.0.borrow().gate.clone();
-    if busy_here || gate.as_ref().is_some_and(|gate| !gate.try_take(key)) {
+    if gate.as_ref().is_some_and(|gate| !gate.try_take(key)) {
         fakes.0.borrow_mut().locks.push(format!("?{key}"));
         return Ok(None);
     }

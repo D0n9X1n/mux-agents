@@ -55,6 +55,8 @@ struct Scan {
     pre_addresses: Vec<String>,
     /// Pre-lifecycle identities whose folder notice proves an end (prelife-1c ambiguity 6).
     pre_ended: BTreeSet<String>,
+    /// prelife-1c ambiguity 14: every same-session pre-lifecycle folder, id to name (else its id).
+    pre: BTreeMap<String, String>,
 }
 
 impl Scan {
@@ -81,6 +83,7 @@ fn scan(ctx: &Ctx, caller: &Caller) -> Res<Scan> {
     use super::prelife::Slot;
     let (mut local, mut freed, mut orphans) = (Vec::new(), Vec::new(), Vec::new());
     let (mut held, mut pre_addresses, mut pre_ended) = (Vec::new(), Vec::new(), BTreeSet::new());
+    let mut pre = BTreeMap::new();
     // R5: link entries are kept, so member_of refuses them; a regular file at an id is no member.
     for (id, folder, member) in
         super::gens::members(&super::server_dir(ctx, caller).join("agents"))?
@@ -127,23 +130,28 @@ fn scan(ctx: &Ctx, caller: &Caller) -> Res<Scan> {
                 }
                 life_local(g, &s, &id, &team(caller))?
             }
-            _ => match super::prelife::slot(&folder, record, &id, caller) {
-                Slot::Local(l) => {
-                    if super::prelife::ended_by_notice(&folder) {
-                        pre_ended.insert(id.clone());
+            _ => {
+                // Ambiguity 14: the `limit` refusal names each held one by this (its name, else its id).
+                let name = record.get("name").and_then(Value::as_str).unwrap_or(&id);
+                pre.insert(id.clone(), name.to_string());
+                match super::prelife::slot(&folder, record, &id, caller) {
+                    Slot::Local(l) => {
+                        if super::prelife::ended_by_notice(&folder) {
+                            pre_ended.insert(id.clone());
+                        }
+                        Some(*l)
                     }
-                    Some(*l)
+                    s => {
+                        if let Some(a) = record.get("hcAddress").and_then(Value::as_str) {
+                            pre_addresses.push(a.to_string());
+                        }
+                        if matches!(s, Slot::Held) {
+                            held.push(id.clone());
+                        }
+                        None
+                    }
                 }
-                s => {
-                    if let Some(a) = record.get("hcAddress").and_then(Value::as_str) {
-                        pre_addresses.push(a.to_string());
-                    }
-                    if matches!(s, Slot::Held) {
-                        held.push(id.clone());
-                    }
-                    None
-                }
-            },
+            }
         };
         local.extend(one);
     }
@@ -154,6 +162,7 @@ fn scan(ctx: &Ctx, caller: &Caller) -> Res<Scan> {
         held,
         pre_addresses,
         pre_ended,
+        pre,
     })
 }
 
@@ -270,6 +279,9 @@ pub struct Snapshot {
     pub held: Vec<String>,
     /// prelife-1c ambiguity 6: pre-lifecycle members whose folder notice proves an end; listed, holding no slot.
     pub pre_ended: BTreeSet<String>,
+    /// prelife-1c ambiguity 14: every same-session pre-lifecycle folder, id to name (else its id); the `limit`
+    /// refusal names the held ones from it.
+    pub pre: BTreeMap<String, String>,
 }
 
 impl Snapshot {
@@ -379,7 +391,7 @@ impl Snapshot {
             }
             [] if caller.agent_tag.is_empty() => Ok(registry::Me {
                 name: "root".into(),
-                key: super::mail::mailbox_key(&caller.pane, "")?,
+                key: super::mail::person_box(caller)?,
                 record: None,
             }),
             [] => crate::error::refuse(2, "parent", "this agent pane has no record"),
@@ -474,6 +486,7 @@ impl Snapshot {
             local,
             held,
             pre_ended,
+            pre,
             ..
         } = scan;
         let (rows, view_error) = match registry::rows(ctx, caller) {
@@ -507,6 +520,7 @@ impl Snapshot {
             view_error,
             held,
             pre_ended,
+            pre,
         }
     }
 }

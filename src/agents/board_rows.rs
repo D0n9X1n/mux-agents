@@ -4,7 +4,7 @@ use std::time::SystemTime;
 
 use serde_json::{Map, Value};
 
-use super::{parent_key, select_doing};
+use super::select_doing;
 use crate::agents::registry::Pane;
 use crate::caller::Caller;
 use crate::ctx::Ctx;
@@ -30,6 +30,22 @@ pub(super) struct Rows<'a> {
     pub(super) logical: &'a BTreeMap<String, Vec<String>>,
     // The members the bar marks unreadable (call 21): unreadable evidence, or on a parent loop.
     pub(super) marked: &'a [String],
+}
+
+/// V3: a member's parent pane mailbox, its recorded `parentServerKey` honoured; none for a malformed pane.
+pub(crate) fn parent_mailbox(record: &Value) -> Option<String> {
+    crate::agents::mail::parent_box(record).ok()
+}
+
+/// The mailbox of an agent's parent pane: the running agent's id there when the parent's recorded server is the
+/// caller's (`away`, V3), else its pane mailbox (as `send parent` delivers); none for a malformed pane. Never a tag.
+pub(super) fn parent_key(record: &Value, running: &[Pane], away: Option<&str>) -> Option<String> {
+    let parent = crate::agents::text(record.get("parentPane"));
+    let here = record.get("parentServerKey").and_then(Value::as_str) == away;
+    match running.iter().find(|p| here && p.pane == parent) {
+        Some(p) => Some(crate::agents::mail::member_mailbox(&p.id, &p.record)),
+        None => parent_mailbox(record),
+    }
 }
 
 impl Rows<'_> {
@@ -101,11 +117,15 @@ impl Rows<'_> {
                     got(&format!("#{id}")) + got(&legacy).saturating_sub(got(&format!("!{legacy}")))
                 })
                 .sum(),
-            (None, None) => parent_key(record, self.running)
-                .and_then(|key| self.unread.get(&key))
-                .and_then(|counts| counts.get(&legacy))
-                .copied()
-                .unwrap_or(0),
+            (None, None) => parent_key(
+                record,
+                self.running,
+                crate::agents::mail::elsewhere(self.caller),
+            )
+            .and_then(|key| self.unread.get(&key))
+            .and_then(|counts| counts.get(&legacy))
+            .copied()
+            .unwrap_or(0),
         };
         let unread = leader_badge(self.ctx, self.caller, id, record).unwrap_or(unread);
         let mut row = Map::new();

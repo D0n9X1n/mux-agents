@@ -4,8 +4,8 @@ use super::core_launch::forward_tests as ft;
 use super::life_fixture as lf;
 use super::reconcile_restore_tests::{L, released_by_hc};
 use super::reconcile_run_tests::ids;
-use super::reconcile_tests::{X, found, member, ok, wire_of};
-use super::reconcile_verb_tests::{person, restore, team};
+use super::reconcile_tests::{X, found, member, ok, released_for_restore, wire_of};
+use super::reconcile_verb_tests::{person, restore, snapshot, team};
 use serde_json::{Value, json};
 
 /// Spec abandonment gap through the real dispatcher (r6b call 10): `abandoned` published, `pending` not yet
@@ -212,4 +212,117 @@ fn a_stop_racing_a_restore_never_relaunches_the_stopped_member() {
         assert_eq!(lf::count(&w, "run"), runs, "stop_first {stop_first}");
         w.fakes.hc_done().unwrap();
     }
+}
+
+/// The team record `up` writes for the person world, naming leader `L` (spawn admits a person by it).
+fn team_record(w: &super::fixture::World) {
+    use super::team;
+    use crate::parse::Client;
+    let session = w.caller().session;
+    let t = team::Team {
+        team: "T".into(),
+        session: session.clone(),
+        name: "t".into(),
+        directory: w.ctx.cwd.to_string_lossy().into_owned(),
+        client: Client::Claude,
+        flags: vec![],
+        policy: team::policy(Client::Claude, &[]),
+        leader: L.into(),
+        created_at: "x".into(),
+    };
+    assert!(team::create(&team::path(&w.state(), &session), &t).unwrap());
+}
+
+/// Spec row 0 (b), real entry points (r6b call 10, checklist 18): X released by the real R1 writer holds no slot;
+/// five running members and a real `spawn` (by the person of the team session) fill the team; `restore` holds X
+/// `limit`; a real `stop` of the spawned member frees its slot; the next `restore` launches X once.
+#[test]
+fn a_spawn_takes_the_freed_slot_then_a_stop_frees_one_for_x() {
+    let w = person();
+    team(&w);
+    team_record(&w);
+    let fillers: Vec<String> = (1..=5).map(|n| format!("11111111111{n}")).collect();
+    for id in &fillers {
+        ok(&super::reconcile_restore_tests::other(&w, id), 1);
+    }
+    let f = member(&w, X, json!({}));
+    ok(&f, 1);
+    released_for_restore(&w, X);
+    let live: Vec<String> = fillers.iter().map(|id| format!("a{id}")).collect();
+    let live: Vec<&str> = live.iter().map(String::as_str).collect();
+    let ax = format!("a{X}");
+    // a real spawn: admission counts 5 + 0 (X released) < 6; launched through `forward`
+    cf::online(&w);
+    snapshot(&w, &live, &[&ax]);
+    w.fakes.hc_answer(ft::address("t9"));
+    for verb in ["new-window", "split-window"] {
+        w.fakes.mux_first(verb, 0, "%10|@6|hc attach t9\n", "");
+    }
+    let spawn: Vec<String> = ["spawn", "-Client", "claude", "-Name", "late", "-Task", "go"]
+        .map(String::from)
+        .to_vec();
+    let (code, out) = crate::cli::run(&spawn, || Ok(&w.ctx));
+    assert_eq!(code, 0, "{out}");
+    let late: Value = serde_json::from_str(&out).unwrap();
+    let late_id = late["id"].as_str().unwrap().to_string();
+    let late_launch = super::gens::read(&w.folder(&late_id), 0, "launch")
+        .known()
+        .unwrap()
+        .unwrap();
+    // what the launcher writes (no launcher runs in a unit test): its claim, then the commit; the next pass's
+    // settle promotes generation 0, so the stop ends a Running generation through hc
+    let lf_ = w.folder(&late_id);
+    super::gens::publish_claim_once(&lf_, 0, &json!("run")).unwrap();
+    super::gens::publish_once(&lf_, 0, "commit", &json!({"committed": true})).unwrap();
+    let mut t = wire_of(&w, &late_id, 0, &[]);
+    (t["name"], t["argv"], t["address"]) = (
+        late_launch["hcName"].clone(),
+        late_launch["launcherArgv"].clone(),
+        json!("t9"),
+    );
+    // restore: X held `limit` (six members hold a slot). The fake answers in FIFO order and the pass walks members
+    // in id order, taking X's cap snapshot on X's turn; the spawned id is random, so the scripts follow that walk.
+    cf::online(&w); // discovery
+    cf::online(&w); // the pass
+    let mut running: Vec<(String, u64, Value)> = fillers
+        .iter()
+        .map(|id| (id.clone(), 1, wire_of(&w, id, 1, &lf::ARGV)))
+        .collect();
+    running.push((late_id.clone(), 0, t.clone()));
+    running.sort_by(|a, b| a.0.cmp(&b.0));
+    for (id, n, wire) in running.iter().filter(|r| r.0.as_str() < X) {
+        found(&w, id, *n, wire);
+    }
+    let mut with_late = live.clone();
+    with_late.push("t9");
+    snapshot(&w, &with_late, &[&ax]);
+    for (id, n, wire) in running.iter().filter(|r| r.0.as_str() > X) {
+        found(&w, id, *n, wire);
+    }
+    let (_, held) = restore(&w);
+    assert_eq!(
+        held["held"],
+        json!([{"id": X, "name": "mbbb", "reason": "limit"}]),
+        "{held}"
+    );
+    // a real stop of the spawned member by the person: its generation ends (`gens::terminate`)
+    cf::online(&w);
+    found(&w, &late_id, 0, &t);
+    cf::answer(&w, &["get", "t9", "--json"], &t.to_string());
+    cf::answer(&w, &["kill", "t9", "--json"], "{}");
+    let stop: Vec<String> = ["stop", "late"].map(String::from).to_vec();
+    let (code, out) = crate::cli::run(&stop, || Ok(&w.ctx));
+    assert_eq!(code, 0, "{out}");
+    // the next restore: five slots, X launched once
+    cf::online(&w);
+    cf::online(&w);
+    for id in &fillers {
+        found(&w, id, 1, &wire_of(&w, id, 1, &lf::ARGV));
+    }
+    snapshot(&w, &live, &[&ax, "t9"]);
+    w.fakes.hc_answer(ft::address("t2"));
+    let (_, again) = restore(&w);
+    assert_eq!(ids(again.as_object().unwrap(), "restored"), [X], "{again}");
+    assert_eq!(lf::count(&w, "run"), 2, "the spawn, then X once");
+    w.fakes.hc_done().unwrap();
 }

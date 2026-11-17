@@ -681,11 +681,15 @@ fn a_natural_exit_records_its_end_then_posts_its_notice() {
                         "gens/1/launch.json",
                         "gens/1/commit.json",
                         "record.json",
+                        // adopt-3e call 17: the notice route's one `Tree::read` of this record.
+                        "record.json",
                     ],
                     "forgotten" => &[
                         "record.json",
                         "gens/1/ended.json",
                         "gens/1/commit.json",
+                        "record.json",
+                        // adopt-3e call 17: the notice route's one `Tree::read` of this record.
                         "record.json",
                     ],
                     _ => &[
@@ -693,6 +697,8 @@ fn a_natural_exit_records_its_end_then_posts_its_notice() {
                         "gens/1/launch.json",
                         "gens/1/ended.json",
                         "gens/1/commit.json",
+                        "record.json",
+                        // adopt-3e call 17: the notice route's one `Tree::read` of this record.
                         "record.json",
                     ],
                 };
@@ -989,5 +995,26 @@ fn a_lifecycle_record_beside_an_unreadable_mark_refuses_evidence() {
         record(&w.ctx, &c, ID).map_err(|e| (e.code, e.check)).err(),
         Some((1, "evidence")),
         "a torn commit mark"
+    );
+}
+
+// Re6a V3 (row 4.7a): a legacy stop's notice to a parent pane off the anchor lands in that server's pane box.
+#[test]
+fn a_stop_notice_reaches_the_off_anchor_parent_box() {
+    let w = World::human("");
+    let mut caller = w.caller();
+    caller.anchor = Some(crate::caller::Anchor {
+        key: "a1a1a1a1a1a1a1a1".into(),
+        session: "$A".into(),
+    });
+    let state = w.ctx.state_root.join("a1a1a1a1a1a1a1a1");
+    std::fs::create_dir_all(state.join("agents").join(ID)).unwrap();
+    let record = json!({"name": "worker", "pane": "%9", "parentPane": "%1",
+        "parentServerKey": caller.server_key});
+    stop_notice(&w.ctx, &caller, ID, &record, None).unwrap();
+    let qualified = format!("pane-{}-1.jsonl", caller.server_key);
+    assert!(
+        state.join("mail").join(&qualified).is_file(),
+        "the stop notice lands in {qualified}"
     );
 }

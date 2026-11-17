@@ -428,6 +428,10 @@ impl Launch<'_> {
             record["parentPane"] = p.parent_pane.clone().into();
             record["depth"] = p.depth.into();
         }
+        // Re6a V3: a person off the anchor's server names its server, so notices reach its own pane mailbox.
+        if let Some(key) = super::mail::elsewhere(caller) {
+            record["parentServerKey"] = key.into();
+        }
         record["color"] = agent.color.into();
         // The exact command the pane started, as the multiplexer renders it: the agent is the pane running it (#48).
         record["startCommand"] = start_command.into();
@@ -2273,7 +2277,10 @@ mod tests {
         let w = human();
         let scope = crate::agents::notebook::anchor(&w.caller());
         let notes = crate::agents::notebook::dir(&w.ctx.state_root, &scope);
-        std::fs::create_dir_all(notes.parent().unwrap()).unwrap();
+        // Integration #150 CI: the state folder made private first, as the product makes it, and the team folders
+        // under it one at a time at 0700; create_dir_all left the state folder 755, so spawn refused `state` before
+        // the launch this test reads.
+        crate::testing::private_tree(&w.state(), notes.parent().unwrap());
         std::fs::write(&notes, "not a folder").unwrap();
         empty_launch(&w);
         let ok = reply(&run(&w, &["-Client", "claude", "-Task", "hi"]));
@@ -3877,6 +3884,9 @@ pub fn launch_hc_locked(
     request: CoreRequest<'_>,
     reserve: impl FnOnce(&crate::hc::Core<'_>) -> Res<CoreSlot>,
 ) -> Res<Value> {
+    // adopt-3e calls 13, 21: every launch, in a team or outside one, reserves (spawn's gate and snapshot) after
+    // replay.
+    super::adopt::replay_held(ctx, caller)?;
     let mut slot = reserve(core)?;
     let placed = slot.placed.take();
     let debit = slot.debit;

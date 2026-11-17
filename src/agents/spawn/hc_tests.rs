@@ -672,11 +672,21 @@ fn a_view_failure_after_the_commit_keeps_the_member() {
 #[test]
 fn a_natural_exit_of_a_spawned_member_is_recorded_then_noticed() {
     let w = World::human("");
-    let caller = w.caller();
+    // Re6a V3 (checklist R10): a person off the anchor spawns it; its folder is the anchored caller's scope.
+    let (caller, _, _) = anchored_at_k1(&w);
     ready(&w);
     let r = launch_hc(&w.ctx, &caller, request(&w), slot).unwrap();
-    let f = of(&w, &r);
+    let state = w
+        .ctx
+        .state_root
+        .join(crate::agents::scope::state(&caller).key);
+    let f = state.join("agents").join(r["id"].as_str().unwrap());
     let rec = read_json(&f.join("record.json")).unwrap().unwrap();
+    assert_eq!(
+        rec["parentServerKey"],
+        json!(caller.server_key),
+        "the launch records its parent's server"
+    );
     let mut t = core_fixture::wire(&rec);
     (t["name"], t["state"], t["reason"], t["exit_code"]) = (
         rec["hcName"].clone(),
@@ -701,6 +711,11 @@ fn a_natural_exit_of_a_spawned_member_is_recorded_then_noticed() {
     assert!(
         gens::read(&f, 0, "notice").known().unwrap().is_some(),
         "the exit notice of generation 0 is posted"
+    );
+    let parent_box = format!("pane-{}-{}.jsonl", caller.server_key, &caller.pane[1..]);
+    assert!(
+        state.join("mail").join(&parent_box).is_file(),
+        "the notice lands in the off-anchor parent box {parent_box}"
     );
 }
 
@@ -944,3 +959,5 @@ fn an_anchored_resume_keeps_the_anchor_server_proof() {
         "call 12: a resume keeps K1's binding"
     );
 }
+#[cfg(test)]
+mod race;

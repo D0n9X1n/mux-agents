@@ -171,10 +171,21 @@ pub fn kill_fails(w: &World, id: &str) {
     lf::get(w, &addr(id), &live);
     lf::fails(w, &["kill", &addr(id), "--json"]);
 }
-/// Messages with delivery id `exit-<id>-<n>` in PANE's mailbox file (`mail::read_mail` would move PANE's cursor
-/// and hide the next entry's notice).
+/// Messages with delivery id `exit-<id>-<n>` in the mailbox file generation n's notice recorded
+/// (`gens/<n>/route.json`), else PANE's (`mail::read_mail` would move a cursor and hide the next entry's notice).
 pub fn delivered_at(w: &World, id: &str, n: u64) -> usize {
-    let key = super::mail::mailbox_key(PANE, "").unwrap();
+    // adopt-3e (contract missing 4): the mailbox generation n's notice recorded, else PANE's.
+    let route = super::gens::read(&w.folder(id), n, "route")
+        .known()
+        .unwrap();
+    let key = match route
+        .as_ref()
+        .and_then(|r| r.get("mailbox"))
+        .and_then(Value::as_str)
+    {
+        Some(k) => k.to_string(),
+        None => super::mail::mailbox_key(PANE, "").unwrap(),
+    };
     let text = std::fs::read_to_string(w.state().join("mail").join(format!("{key}.jsonl")))
         .unwrap_or_default();
     let want = super::gens::delivery_id(id, n);

@@ -4,8 +4,8 @@ use std::collections::{BTreeMap, HashMap};
 
 use serde_json::{Map, Value};
 
-use super::mail::{doing_line, mailbox_key, unread_counts};
-use super::registry::{self, Pane};
+use super::mail::{doing_line, unread_counts};
+use super::registry;
 use crate::caller::Caller;
 use crate::ctx::Ctx;
 use crate::error::Res;
@@ -38,12 +38,19 @@ pub fn select_doing(
 /// locks finish before sorted mailbox reads, followed by each row's agent lock. Never refresh or reap views.
 pub fn board(ctx: &Ctx, caller: &Caller, all: bool, watch: bool) -> Res<Map<String, Value>> {
     use super::{lifecycle::Life, membership::Snapshot};
-    // cascade-3d C8: the bar's refresh finishes a cut-short cascade with one try of the team lock. It only displays,
-    // so a busy lock or a refusal changes nothing here; `stop` and `up` refuse on the same journal.
-    if watch {
-        let _ = super::cascade::tick(ctx, caller);
-    }
-    let mut snapshot = Snapshot::take(ctx, caller)?;
+    let scope = super::team_state::Scope::of(caller);
+    // cascade-3d C8, adopt-3e call 4: the bar's one try per refresh (cascade journals, then adoption); it only
+    // displays, so a busy lock or a refusal changes nothing here. `list`: a sweep under a Tx only when a candidate
+    // exists, before this reap, so an end this reap records is adopted on the next refresh (ambiguity 12). An
+    // unreadable tree is no candidate here: the board never refuses for it.
+    let blocked = if watch {
+        (super::adopt::tick(ctx, caller).ok().flatten()).map_or_else(Vec::new, |s| s.blocked)
+    } else if !(super::adopt::candidates(ctx, &scope).unwrap_or_default()).is_empty() {
+        super::team_state::open(ctx, &scope, super::adopt::sweep)?.blocked
+    } else {
+        Vec::new()
+    };
+    let (mut snapshot, mut shown) = steady(ctx, &scope, watch, || Snapshot::take(ctx, caller))?;
     // a3b call 42 (as spawn, calls 45, 51): a lifecycle member this snapshot read as not Ended whose generation is done
     // after the reap (this reap recorded its end, or another did) is read again, so the first list after a natural
     // exit renders the recorded end. Recorded completion stays the only way out; a pre-lifecycle notice changes nothing.
@@ -67,7 +74,7 @@ pub fn board(ctx: &Ctx, caller: &Caller, all: bool, watch: bool) -> Res<Map<Stri
         now_done |= super::gens::done(&agents.join(id), *n)?;
     }
     if now_done {
-        snapshot = Snapshot::take(ctx, caller)?;
+        (snapshot, shown) = steady(ctx, &scope, watch, || Snapshot::take(ctx, caller))?;
     }
     // A member a committed resume superseded is its successor now: it has no row of its own.
     let superseded = snapshot.superseded();
@@ -135,7 +142,8 @@ pub fn board(ctx: &Ctx, caller: &Caller, all: bool, watch: bool) -> Res<Map<Stri
         .filter(|p| p.pane == caller.pane)
         .map(|p| p.id.clone())
         .collect();
-    let reader = reader_key(caller.member.as_deref(), &mine, &caller.pane)?;
+    let away = super::mail::elsewhere(caller);
+    let reader = reader_key(caller.member.as_deref(), &mine, &caller.pane, away)?;
     // A member reads the mailbox its record names (inherited by a resume), else its id.
     let reader = match snapshot.records.get(&reader) {
         Some(stored) => super::mail::member_mailbox(&reader, &stored.record),
@@ -148,12 +156,9 @@ pub fn board(ctx: &Ctx, caller: &Caller, all: bool, watch: bool) -> Res<Map<Stri
     // Ended, and after the member's own view reopens on another pane. Outside a team: the parent pane, as before.
     // Calls 10, 21, 25: in a team each member's logical parents (C0) from the bar's view of the tree, which never
     // refuses; a member it does not place (unreadable, on a loop, or any member unreadable) keeps its raw parent id.
+    // adopt-3e call 13: that view was read in the snapshot's own `stable` bracket.
     let (logical, marked) = match &leader {
         Some(_) => {
-            let shown = super::cascade::Tree::shown(&super::team_state::Tx {
-                ctx,
-                scope: super::team_state::Scope::of(caller),
-            });
             let logical: BTreeMap<String, Vec<String>> = (members.iter())
                 .filter_map(|o| Some((o.identity.id.clone(), shown.placed(&o.identity.id)?)))
                 .collect();
@@ -183,9 +188,13 @@ pub fn board(ctx: &Ctx, caller: &Caller, all: bool, watch: bool) -> Res<Map<Stri
                     let stored = snapshot.records.get(&parent)?;
                     Some(super::mail::member_mailbox(&parent, &stored.record))
                 });
-                let notices = mailbox_key(&super::text(record.get("parentPane")), "").ok();
+                let notices = parent_mailbox(record);
                 let mut boxes: Vec<String> = own
-                    .chain([parent_key(record, &panes), notices].into_iter().flatten())
+                    .chain(
+                        [parent_key(record, &panes, away), notices]
+                            .into_iter()
+                            .flatten(),
+                    )
                     .collect();
                 boxes.sort();
                 boxes.dedup();
@@ -201,7 +210,7 @@ pub fn board(ctx: &Ctx, caller: &Caller, all: bool, watch: bool) -> Res<Map<Stri
             .filter(|o| o.life == Life::Running || leader.is_some())
             .flat_map(|o| match parents.get(&o.identity.id) {
                 Some(boxes) => boxes.clone(),
-                None => parent_key(&snapshot.records[&o.identity.id].record, &panes)
+                None => parent_key(&snapshot.records[&o.identity.id].record, &panes, away)
                     .into_iter()
                     .collect(),
             })
@@ -373,6 +382,17 @@ pub fn board(ctx: &Ctx, caller: &Caller, all: bool, watch: bool) -> Res<Map<Stri
     let listed = lists_kept(watch, snapshot.records.values().map(|s| &s.record))
         .then(|| super::kept::list_at(ctx, &super::membership::team(caller)));
     add_kept(&mut reply, listed);
+    // Call 20: `list` rows carry no `id`, so each source is also found by its recorded `hcAddress`.
+    let blocked: Vec<Blocked> = (blocked.into_iter())
+        .map(|(id, why)| {
+            let address = (snapshot.records.get(&id))
+                .and_then(|s| s.record.get("hcAddress"))
+                .and_then(Value::as_str)
+                .map(String::from);
+            (id, address, why)
+        })
+        .collect();
+    note_blocked(&mut reply, &blocked);
     Ok(reply)
 }
 
@@ -395,18 +415,67 @@ fn add_kept(reply: &mut Map<String, Value>, listed: Option<Res<Vec<super::kept::
     }
 }
 
-/// Ended agents a board (`list -All`) shows, newest first.
-pub(crate) const ENDED_MAX: usize = 10;
-
-/// The mailbox of an agent's parent pane: the running agent's id there, else `pane-<n>` (as `send parent`
-/// delivers); none for a malformed pane. Never a tag.
-fn parent_key(record: &Value, running: &[Pane]) -> Option<String> {
-    let parent = super::text(record.get("parentPane"));
-    match running.iter().find(|p| p.pane == parent) {
-        Some(p) => Some(super::mail::member_mailbox(&p.id, &p.record)),
-        None => mailbox_key(&parent, "").ok(),
+/// Test only: what runs as `steady`'s bracket closes.
+#[cfg(test)]
+type AfterHook = fn(&Ctx, &super::team_state::Scope);
+#[cfg(test)]
+thread_local! {
+    static AFTER: std::cell::Cell<Option<AfterHook>> = const { std::cell::Cell::new(None) };
+}
+/// Test only: a hook run as `steady`'s bracket closes (call 13).
+#[cfg(test)]
+pub(crate) fn after_bracket(h: Option<AfterHook>) {
+    AFTER.with(|c| c.set(h));
+}
+/// A6, call 13: the snapshot and the bar's view of the tree (`Tree::shown`, which never refuses) read inside one
+/// `stable` bracket. Still moving: `list` replays under a Tx and reads once more; the bar has had its one try and
+/// errs, keeping its frame.
+fn steady<T>(
+    ctx: &Ctx,
+    scope: &super::team_state::Scope,
+    watch: bool,
+    mut take: impl FnMut() -> Res<T>,
+) -> Res<(T, super::cascade::Shown)> {
+    let tx = super::team_state::Tx {
+        ctx,
+        scope: scope.clone(),
+    };
+    let mut both = || Ok((take()?, super::cascade::Tree::shown(&tx)));
+    let got = match super::adopt::stable(ctx, scope, &mut both) {
+        Err(e) if !watch && e.check == "topology" && e.message == super::adopt::MOVING => {
+            super::team_state::open(ctx, scope, |_| Ok(()))?;
+            super::adopt::stable(ctx, scope, &mut both)
+        }
+        other => other,
+    }?;
+    #[cfg(test)]
+    if let Some(h) = AFTER.with(|c| c.get()) {
+        h(ctx, scope);
+    }
+    Ok(got)
+}
+/// A blocked source: its id, its recorded `hcAddress`, the reason.
+type Blocked = (String, Option<String>, &'static str);
+/// Call 9, call 20: each blocked source's row says why (`adoption`): the bar's rows by `id`, `list`'s by `hcAddress`.
+fn note_blocked(reply: &mut Map<String, Value>, blocked: &[Blocked]) {
+    let Some(rows) = reply.get_mut("agents").and_then(Value::as_array_mut) else {
+        return;
+    };
+    for row in rows {
+        let field = |k: &str| row.get(k).and_then(Value::as_str).map(String::from);
+        let (id, address) = (field("id"), field("hcAddress"));
+        let hit = blocked.iter().find(|(b, at, _)| {
+            id.as_deref() == Some(b.as_str())
+                || (id.is_none() && address.is_some() && *at == address)
+        });
+        if let Some((_, _, why)) = hit {
+            row["adoption"] = Value::from(*why);
+        }
     }
 }
+
+/// Ended agents a board (`list -All`) shows, newest first.
+pub(crate) const ENDED_MAX: usize = 10;
 
 /// Records the viewed done spell `changed` under the agent lock, never moving seen.json backward.
 /// Requires a unique committed attachment on `pane`; historical notices do not invalidate view proof.
@@ -449,11 +518,16 @@ fn rank(row: &Map<String, Value>) -> u8 {
 /// id, always: whichever pane shows it, and even when a later hc look cannot show it running, it is never matched by
 /// pane, so it can never count another member's mail (#104 phase 1c). Any other caller: the one running agent on its
 /// pane, else the pane's own mailbox.
-pub(crate) fn reader_key(member: Option<&str>, on_pane: &[String], pane: &str) -> Res<String> {
+pub(crate) fn reader_key(
+    member: Option<&str>,
+    on_pane: &[String],
+    pane: &str,
+    elsewhere: Option<&str>,
+) -> Res<String> {
     match (member, on_pane) {
         (Some(id), _) => Ok(id.to_string()),
         (None, [id]) => Ok(id.clone()),
-        _ => mailbox_key(pane, ""),
+        _ => super::mail::pane_box(pane, elsewhere),
     }
 }
 
@@ -485,6 +559,7 @@ fn team_leader(
 #[path = "board_rows.rs"]
 mod rows;
 pub use rows::hc_row;
+pub(crate) use rows::parent_mailbox;
 use rows::*;
 
 #[cfg(test)]
@@ -492,3 +567,6 @@ mod tests;
 
 #[cfg(test)]
 mod hc_tests;
+
+#[cfg(test)]
+mod adopt_tests;

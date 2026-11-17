@@ -313,6 +313,34 @@ pub fn pick(roster: &[Member], sender: Option<&str>, t: &Target) -> Res<Pick> {
     }
 }
 
+/// adopt-3e call 5: a lifecycle sender's `parent` is its A1-resolved parent (`adopt::route`, after replay), Ended or
+/// viewless included; a root is refused; never `parentPane`. None: not a lifecycle sender. The caller holds the team
+/// lock (`route_team`), so the Tx is hook-free.
+pub(crate) fn life_parent(
+    tx: &super::team_state::Tx<'_>,
+    sender: &str,
+    record: &Value,
+) -> Res<Option<Member>> {
+    if !super::gens::lifecycle(record) {
+        return Ok(None);
+    }
+    super::adopt::replay(tx)?;
+    match super::adopt::route(tx, sender)? {
+        super::adopt::Route::Member(id, record) => Ok(Some(Member {
+            name: super::text(record.get("name")),
+            parents: raw_parents(&record),
+            id,
+            record,
+        })),
+        // Integration #150: `Route::Legacy` is main's `parentPane`. The `up` leader (a team's root) is refused; a
+        // worker a person spawned from a pane keeps main's pick (its parentPane), as before adopt-3e.
+        super::adopt::Route::Legacy if super::tree::is_leader(record) => {
+            refuse(2, "parent", NO_PARENT)
+        }
+        super::adopt::Route::Legacy => Ok(None),
+    }
+}
+
 /// What claims the caller's pane: no agent record (a person), a member record, one committed 0.2 agent record, or
 /// records that prove no one (uncommitted, or more than one).
 enum Claim {
@@ -561,7 +589,20 @@ fn plan(
         },
         None => None,
     };
+    // adopt-3e call 5: a lifecycle sender's `parent` follows `adopt::route`, never the roster or `parentPane`.
+    let routed = match (t, &sender.id) {
+        (Target::Parent, Some(id)) => {
+            let tx = super::team_state::Tx {
+                ctx,
+                scope: super::team_state::Scope::of(caller),
+            };
+            let record = s.records.get(id).map(|st| st.record.clone());
+            life_parent(&tx, id, &record.unwrap_or(Value::Null))?
+        }
+        _ => None,
+    };
     let picked = match t {
+        Target::Parent if routed.is_some() => Pick::Members(routed.into_iter().collect()),
         // As 0.2: the one running member of that name, a lost or unknown rival refusing.
         Target::Name(n) => match s.running_named(n) {
             Some((id, record)) => Pick::Members(vec![Member {
@@ -644,7 +685,7 @@ fn claude_session(record: &Value) -> Value {
 fn pane_box(ctx: &Ctx, caller: &Caller, pane: &str) -> Res<Value> {
     super::message::live_pane(ctx, caller, pane)?;
     let snapshot = super::registry::Snapshot::take(ctx, caller)?;
-    let key = super::registry::mailbox_of(&snapshot, pane)?;
+    let key = super::registry::mailbox_of(&snapshot, pane, super::mail::elsewhere(caller))?;
     let agent = snapshot.at(pane);
     Ok(
         json!({"name": agent.as_ref().map_or(pane.to_string(), |a| a.name.clone()),
