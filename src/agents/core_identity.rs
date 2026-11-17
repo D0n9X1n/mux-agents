@@ -48,6 +48,19 @@ pub fn attach_program(command: &str, address: &str, os: OsKind) -> Option<String
         return None;
     }
     let quotes: &[char] = if unix { &['"', '\''] } else { &['"'] };
+    // #150: rmux renders a start command of several arguments as its argv, encoded (`rmux_argv`). Exactly
+    // `<program> attach <address>` is read as the quoted bare form, so the program checks below apply unchanged; a
+    // program holding a quote is not one.
+    if command.contains('\u{1f}') {
+        return match rmux_argv(command)?.as_slice() {
+            [program, verb, addr]
+                if verb == "attach" && addr == address && !program.contains(quotes) =>
+            {
+                attach_program(&format!("\"{program}\" attach {address}"), address, os)
+            }
+            _ => None,
+        };
+    }
     // #150: rmux renders the whole argv in one pair of double quotes, `\` as `\\` and `"` as `\"` inside. Its inside,
     // unescaped and holding no quote, is read as the bare form; any other backslash, or anything else, falls through
     // to the forms below, which refuse it.
@@ -91,6 +104,42 @@ pub fn attach_program(command: &str, address: &str, os: OsKind) -> Option<String
     crate::hc::INSTALL_NAMES
         .contains(&file.as_str())
         .then(|| program.to_string())
+}
+
+/// rmux's encoded argv (rmux-server lifecycle_state.rs `encode_command_field`): parts joined by 0x1F, every byte but
+/// `[A-Za-z0-9-_./: =+]` written `%XX` in upper-case hex. Only the canonical form decodes (each part re-encodes to
+/// itself, so no needless or lower-case escape, no stray `%`), to UTF-8; anything else: none.
+fn rmux_argv(command: &str) -> Option<Vec<String>> {
+    let kept = |b: u8| b.is_ascii_alphanumeric() || b"-_./: =+".contains(&b);
+    let hex = |b: u8| match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    };
+    command
+        .split('\u{1f}')
+        .map(|part| {
+            let (mut bytes, mut it) = (Vec::new(), part.bytes());
+            while let Some(b) = it.next() {
+                bytes.push(if b == b'%' {
+                    hex(it.next()?)? * 16 + hex(it.next()?)?
+                } else {
+                    b
+                });
+            }
+            let canonical: String = bytes
+                .iter()
+                .map(|&b| {
+                    if kept(b) {
+                        char::from(b).to_string()
+                    } else {
+                        format!("%{b:02X}")
+                    }
+                })
+                .collect();
+            (canonical == part).then(|| String::from_utf8(bytes).ok())?
+        })
+        .collect()
 }
 
 /// The inside of rmux's quoted start command with its two escapes undone (`\\` is `\`, `\"` is `"`); any other
@@ -459,6 +508,80 @@ pub(crate) mod tests {
             (Unix, r#""/x/other attach t1""#, None),
             (Unix, r#""""#, None),
             (Windows, r#""C:\Program Files\hc\hc.exe attach t1""#, None),
+        ] {
+            assert_eq!(
+                attach_program(command, "t1", os),
+                want,
+                "{os:?} {command:?}"
+            );
+        }
+    }
+
+    // #150 (CI integration-windows, f3c4c0a): rmux renders a start command of several arguments as each argument
+    // percent-encoded (all but `[A-Za-z0-9-_./: =+]`, upper-case hex) and joined by 0x1F (rmux-server lifecycle_state.rs
+    // `encode_command_field`). Windows spawns hc's attach as argv, so its view's start command is this form; read
+    // nowhere, the bar's view was never proven and it left `view-closed`. Exactly three canonical parts are an attach.
+    #[test]
+    fn attach_program_reads_rmux_encoded_argv() {
+        use crate::state::root::OsKind::{Unix, Windows};
+        let ci = "D:%5Ca%5C_temp%5Chc-bundle.x3qzk8%5Cherdr-core.exe\u{1f}attach\u{1f}t1";
+        let some = |p: &str| Some(p.to_string());
+        for (os, command, want) in [
+            (
+                Windows,
+                ci,
+                some(r"D:\a\_temp\hc-bundle.x3qzk8\herdr-core.exe"),
+            ),
+            (
+                Windows,
+                "C:%5CProgram Files%5Chc%5Chc.exe\u{1f}attach\u{1f}t1",
+                some(r"C:\Program Files\hc\hc.exe"),
+            ),
+            (
+                Unix,
+                "/x/herdr-core\u{1f}attach\u{1f}t1",
+                some("/x/herdr-core"),
+            ),
+            (
+                Windows,
+                "D:%5Chc%5Cherdr-core.exe\u{1f}attach\u{1f}t2",
+                None,
+            ),
+            (
+                Windows,
+                "D:%5Chc%5Cherdr-core.exe\u{1f}attach\u{1f}t1\u{1f}x",
+                None,
+            ),
+            (Windows, "D:%5Chc%5Cherdr-core.exe\u{1f}attach", None),
+            (Windows, "D:%5Chc%5Cother.exe\u{1f}attach\u{1f}t1", None),
+            (
+                Windows,
+                "D:%5Chc%5Cherdr-core.exe\u{1f}detach\u{1f}t1",
+                None,
+            ),
+            (
+                Windows,
+                "D:%5chc%5cherdr-core.exe\u{1f}attach\u{1f}t1",
+                None,
+            ),
+            (
+                Windows,
+                "D:%5Chc%5Cherdr-core.exe\u{1f}%61ttach\u{1f}t1",
+                None,
+            ),
+            (
+                Windows,
+                "D:%5Chc%5Cherdr-core.exe%5\u{1f}attach\u{1f}t1",
+                None,
+            ),
+            (
+                Windows,
+                "D:%5Chc%5Cherdr-core.exe\u{1f}attach\u{1f}t%0A1",
+                None,
+            ),
+            (Windows, "D:%22%5Chc.exe\u{1f}attach\u{1f}t1", None),
+            (Windows, "%2Dhc.exe\u{1f}attach\u{1f}t1", None),
+            (Unix, "\u{1f}attach\u{1f}t1", None),
         ] {
             assert_eq!(
                 attach_program(command, "t1", os),
