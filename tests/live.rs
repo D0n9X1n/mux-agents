@@ -6646,6 +6646,14 @@ hc {}:
         let pane = s(&seen["pane"]).to_string();
         let other = live.split(&pane, &["-h"]);
         live.call(&["select-pane", "-t", &other]);
+        // `up`'s own release hold (`mux-agent hold <state>/up/<team>.release`) runs until `up` publishes the release
+        // file, then exits. It belongs to neither team, so the census waits for it to close rather than count it.
+        for row in live.panes("#{pane_id}|#{pane_start_command}") {
+            let (p, start) = row.split_once('|').unwrap_or((row.as_str(), ""));
+            if start.contains(" hold ") && start.contains("/up/") && start.contains(".release") {
+                live.wait_gone(p);
+            }
+        }
         // Checklist 9: every pane is a member of either team or one of the five known shells.
         let (quiet, commands) = ([root, other, t2], [person.clone(), t2_person.clone()]);
         let mut tagged: Vec<(String, String)> = Vec::new();
