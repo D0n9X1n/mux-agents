@@ -1834,7 +1834,45 @@ impl Live {
         let _ = std::fs::remove_file(&done);
         self.line(pane, &self.at_line(dir, args));
         self.wait("reply in pane", || done.exists().then_some(()));
-        serde_json::from_str(&std::fs::read_to_string(out).unwrap()).unwrap()
+        let text = std::fs::read_to_string(out).unwrap();
+        serde_json::from_str(&text)
+            .unwrap_or_else(|e| panic!("{e}: {text:?}\n{}", self.no_reply(pane)))
+    }
+
+    /// #150: why `run_at` read no reply. The exit code and MUX_AGENTS_CRASH of the pane's shell (`echo` keeps
+    /// ERRORLEVEL), its screen, and every pane; each read answers its own failure rather than panicking.
+    fn no_reply(&self, pane: &str) -> String {
+        let probe = self.dir.join("at.why");
+        let _ = std::fs::remove_file(&probe);
+        let typed = format!(
+            ">\"{}\" echo code=%errorlevel% crash=[%MUX_AGENTS_CRASH%]",
+            probe.display()
+        );
+        let tried = |args: &[&str]| match crate::bounded::output(
+            self.rmux().args(args),
+            crate::bounded::LIMIT,
+        ) {
+            Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).into_owned(),
+            other => format!("rmux {args:?}: {other:?}"),
+        };
+        let sent = tried(&["send-keys", "-t", pane, "-l", &typed])
+            + &tried(&["send-keys", "-t", pane, "Enter"]);
+        let end = Instant::now() + Duration::from_secs(10);
+        while !probe.exists() && Instant::now() < end {
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        std::thread::sleep(Duration::from_millis(200));
+        format!(
+            "shell: {:?} {sent}\nscreen of {pane}:\n{}\npanes:\n{}",
+            std::fs::read_to_string(&probe),
+            tried(&["capture-pane", "-p", "-J", "-t", pane]),
+            tried(&[
+                "list-panes",
+                "-a",
+                "-F",
+                "#{pane_id} #{pane_dead} #{pane_start_command}"
+            ])
+        )
     }
 
     /// The line `run_at` types: a test comparing a pane's screen expects exactly it.
@@ -2591,6 +2629,11 @@ fn team_pane(live: &Live, session: &str) -> String {
     }
     let state = live.dir.join("state");
     live.line(&pane, &format!("set MUX_AGENTS_STATE={}", state.display()));
+    // #150 (CI d14aeb2): rmux 0.10 (dfd68c77) gives a split the base environment of the pane it splits, and a
+    // session's first panes the whole environment of the client that ran `new-session`. After `crash_up`, that
+    // client is the crashed `up`, so a pane split in its session inherits MUX_AGENTS_CRASH, and an `up` typed there
+    // halts at the same step (exit 86, no reply).
+    live.line(&pane, "set MUX_AGENTS_CRASH=");
     pane
 }
 
@@ -3152,24 +3195,66 @@ fn lose(live: &mut Live, ids: &[String]) -> (Vec<Value>, Vec<u32>) {
         .collect();
     live.core.kill_hard_with(&terminals);
     let live: &Live = live;
-    for r in &before {
-        let address = s(&r["hcAddress"]);
-        live.wait_or(
-            "lost",
-            || {
-                let t = hc_get(live, &address);
-                (t["state"] == "live" && t["argv"] != r["launcherArgv"]).then_some(())
-            },
-            || {
-                format!(
-                    "hc get {address}: {}\nlauncherArgv: {}",
-                    hc_get(live, &address),
-                    r["launcherArgv"]
-                )
-            },
-        );
-    }
+    // #150 (CI d14aeb2): the wait reads what reconcile reads (`gens::find`: the generation's labels, then each
+    // terminal) and asks for the shell `lifecycle::classify` calls Lost, for every member in one pass, twice running.
+    // "Live and not the launcher" passed while `up`'s own read of b still answered Unknown("hc"); an hc error (the
+    // restarted core still adopting, a89bacc) is "not yet".
+    let mut settled = 0;
+    live.wait_or(
+        "every member Lost",
+        || {
+            let all = before
+                .iter()
+                .all(|r| matches!(hc_view(live, r).as_deref(), Ok([t]) if lost_shell(t)));
+            settled = if all { settled + 1 } else { 0 };
+            (settled >= 2).then_some(())
+        },
+        || hc_report(live, &before),
+    );
     (before, old)
+}
+
+/// What reconcile reads of member `r`'s active generation: `hc ls --all` by its `mux.id` and `mux.gen` labels, then
+/// `hc get` of each terminal listed; an hc failure as its error text.
+fn hc_view(live: &Live, r: &Value) -> Result<Vec<Value>, String> {
+    let (id, generation) = (s(&r["id"]), s(&r["generation"]));
+    let (by_id, by_gen) = (format!("mux.id={id}"), format!("mux.gen={generation}"));
+    let ls = [
+        "ls", "--all", "--label", &by_id, "--label", &by_gen, "--json",
+    ];
+    let listed =
+        private_core::run(live.core.command(&ls), &live.dir).map_err(|e| format!("ls: {e}"))?;
+    listed["terminals"]
+        .as_array()
+        .ok_or_else(|| format!("ls: {listed}"))?
+        .iter()
+        .map(|t| {
+            let a = s(&t["address"]);
+            private_core::run(live.core.command(&["get", &a, "--json"]), &live.dir)
+                .map_err(|e| format!("get {a}: {e}"))
+        })
+        .collect()
+}
+
+/// Every member's `hc_view` and the core's `server status`, for a failure message.
+fn hc_report(live: &Live, records: &[Value]) -> String {
+    let mut out: Vec<String> = records
+        .iter()
+        .map(|r| {
+            format!(
+                "{} gen {}: {:?}",
+                r["id"],
+                r["generation"],
+                hc_view(live, r)
+            )
+        })
+        .collect();
+    let status = private_core::run(
+        live.core.command(&["server", "status", "--json"]),
+        &live.dir,
+    );
+    out.push(format!("server status: {status:?}"));
+    out.join("\n")
 }
 
 /// The ids of an `up` reply array, sorted.
@@ -3201,7 +3286,8 @@ fn restore_resumes_every_lost_member_after_a_core_kill_on_windows() {
     assert_eq!(
         sorted_ids(&up, "restored"),
         want,
-        "every lost member restored: {up}"
+        "every lost member restored: {up}\nhc now:\n{}",
+        hc_report(&live, &before)
     );
     let mut news = Vec::new();
     for (i, id) in ids.iter().enumerate() {
@@ -3773,6 +3859,46 @@ fn runs(command: &str, verb: &str) -> bool {
         }
         out == verb.as_bytes()
     })
+}
+
+/// Whether hc's `get --json` shows the shell hc 0.1.21 keeps on Windows in place of a lost program: live,
+/// `<pwsh|powershell>[.exe] -NoExit -Command <hook>` (the shape `lifecycle::classify` reads as Lost).
+fn lost_shell(t: &Value) -> bool {
+    let Some(argv) = t["argv"].as_array() else {
+        return false;
+    };
+    let name = argv
+        .first()
+        .and_then(Value::as_str)
+        .and_then(|a| a.rsplit(['/', '\\']).next())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    t["state"] == "live"
+        && argv.len() == 4
+        && argv[1] == "-NoExit"
+        && argv[2] == "-Command"
+        && ["pwsh", "pwsh.exe", "powershell", "powershell.exe"].contains(&name.as_str())
+}
+
+// #150 (CI d14aeb2): `lose` waits until hc shows what reconcile reads as Lost, not merely "not the launcher".
+#[test]
+fn lost_shell_is_only_hc_keeps_powershell_live() {
+    let pwsh = |state: &str, argv: Value| json!({"state": state, "argv": argv});
+    let kept = json!([
+        r"C:\Program Files\PowerShell\7\pwsh.exe",
+        "-NoExit",
+        "-Command",
+        "hook"
+    ]);
+    assert!(lost_shell(&pwsh("live", kept.clone())));
+    assert!(!lost_shell(&pwsh("finished", kept)));
+    assert!(!lost_shell(&pwsh("live", json!(["pwsh.exe"]))));
+    assert!(!lost_shell(&pwsh(
+        "live",
+        json!(["claude.exe", "--resume", "x"])
+    )));
+    assert!(!lost_shell(&pwsh("live", Value::Null)));
+    assert!(!lost_shell(&json!({})));
 }
 
 #[test]
