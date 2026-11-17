@@ -1297,6 +1297,26 @@ const TEST_ONLY: &[(&str, &str, &str)] = &[
         "reconcile_verb_tests",
     ),
     (
+        "src/agents/recover_crash_tests.rs",
+        "src/agents/mod.rs",
+        "recover_crash_tests",
+    ),
+    (
+        "src/agents/recover_fresh_tests.rs",
+        "src/agents/mod.rs",
+        "recover_fresh_tests",
+    ),
+    (
+        "src/agents/recover_gate_tests.rs",
+        "src/agents/mod.rs",
+        "recover_gate_tests",
+    ),
+    (
+        "src/agents/recover_tests.rs",
+        "src/agents/mod.rs",
+        "recover_tests",
+    ),
+    (
         "src/agents/session_report_tests.rs",
         "src/agents/mod.rs",
         "session_report_tests",
@@ -1328,6 +1348,16 @@ const TEST_ONLY: &[(&str, &str, &str)] = &[
     ),
     ("src/agents/tree/tests.rs", "src/agents/tree.rs", "tests"),
     (
+        "src/agents/kept_retire_tests.rs",
+        "src/agents/mod.rs",
+        "kept_retire_tests",
+    ),
+    (
+        "src/agents/up/retire_tests.rs",
+        "src/agents/up/mod.rs",
+        "retire_tests",
+    ),
+    (
         "src/agents/up/existing_tests.rs",
         "src/agents/up/mod.rs",
         "existing_tests",
@@ -1341,6 +1371,11 @@ const TEST_ONLY: &[(&str, &str, &str)] = &[
         "src/agents/up/publish_tests.rs",
         "src/agents/up/mod.rs",
         "publish_tests",
+    ),
+    (
+        "src/agents/up/leader_tests.rs",
+        "src/agents/up/mod.rs",
+        "leader_tests",
     ),
     (
         "src/agents/up/reenter_tests.rs",
@@ -1404,6 +1439,21 @@ const TEST_ONLY: &[(&str, &str, &str)] = &[
     ("src/sidebar/keys/tests.rs", "src/sidebar/keys.rs", "tests"),
     ("src/sidebar/pick/tests.rs", "src/sidebar/pick.rs", "tests"),
     ("src/testing.rs", "src/lib.rs", "testing"),
+    (
+        "src/agents/leader_resume_tests.rs",
+        "src/agents/mod.rs",
+        "leader_resume_tests",
+    ),
+    (
+        "src/agents/reconcile_pass_tests.rs",
+        "src/agents/mod.rs",
+        "reconcile_pass_tests",
+    ),
+    (
+        "src/agents/stop_gen_tests.rs",
+        "src/agents/mod.rs",
+        "stop_gen_tests",
+    ),
     (
         "src/agents/notebook/tests.rs",
         "src/agents/notebook.rs",

@@ -378,11 +378,14 @@ fn seeded(w: &World) -> (std::path::PathBuf, std::path::PathBuf) {
 fn up_after_a_killed_server_restores_both_views_and_the_bar() {
     let w = reentry_world();
     let (fl, fx) = seeded(&w);
-    for _ in 0..2 {
-        cf::online(&w); // reconcile's Lazy, then reenter's
-        rt::found(&w, X, 1, &ut::create::running_wire(&w, &fx, X, 1));
-        rt::found(&w, L, 1, &ut::create::running_wire(&w, &fl, L, 1));
-    }
+    // restore-6c Task 8 (5-9 F19, F23): the pass observes the leader once, before its step, then the member loop
+    // decides X; re-entry's own Lazy then asks in id order.
+    cf::online(&w);
+    rt::found(&w, L, 1, &ut::create::running_wire(&w, &fl, L, 1));
+    rt::found(&w, X, 1, &ut::create::running_wire(&w, &fx, X, 1));
+    cf::online(&w);
+    rt::found(&w, X, 1, &ut::create::running_wire(&w, &fx, X, 1));
+    rt::found(&w, L, 1, &ut::create::running_wire(&w, &fl, L, 1));
     let (code, r) = cli(&w, &["up", "-Client", "claude"]);
     assert_eq!(code, 0, "{r}");
     assert_eq!(
@@ -537,11 +540,14 @@ fn a_member_view_failure_is_reported_and_the_others_shown() {
     let w = reentry_world();
     w.fakes.mux_first(&format!("attach a{X}"), 1, "", "no pane");
     let (fl, fx) = seeded(&w);
-    for _ in 0..2 {
-        cf::online(&w);
-        rt::found(&w, X, 1, &ut::create::running_wire(&w, &fx, X, 1));
-        rt::found(&w, L, 1, &ut::create::running_wire(&w, &fl, L, 1));
-    }
+    // restore-6c Task 8 (5-9 F19, F23): the pass observes the leader once, before its step, then the member loop
+    // decides X; re-entry's own Lazy then asks in id order.
+    cf::online(&w);
+    rt::found(&w, L, 1, &ut::create::running_wire(&w, &fl, L, 1));
+    rt::found(&w, X, 1, &ut::create::running_wire(&w, &fx, X, 1));
+    cf::online(&w);
+    rt::found(&w, X, 1, &ut::create::running_wire(&w, &fx, X, 1));
+    rt::found(&w, L, 1, &ut::create::running_wire(&w, &fl, L, 1));
     let (code, r) = cli(&w, &["up", "-Client", "claude"]);
     assert_eq!(code, 0, "{r}");
     assert!(r["viewError"].is_string(), "{r}");
@@ -559,7 +565,7 @@ fn a_member_view_failure_is_reported_and_the_others_shown() {
 }
 
 // Task 12: a crash after any step is repaired by the next up (spec "Unit tests").
-type Made = std::rc::Rc<std::cell::RefCell<Vec<(String, String)>>>;
+pub(crate) type Made = std::rc::Rc<std::cell::RefCell<Vec<(String, String)>>>;
 /// A multiplexer that remembers the sessions `new-session` made, so `list-sessions` answers them (E3.1 by name).
 fn stateful(w: &World, made: &Made) {
     let m = made.clone();
@@ -608,7 +614,7 @@ fn crash_fixtures(w: &World, made: &Made) {
     stateful(w, made);
 }
 /// A person in `project.v1`, hc reachable for the first `up`.
-fn crash_world() -> (World, Made) {
+pub(crate) fn crash_world() -> (World, Made) {
     let mut w = World::human("");
     w.ctx.cwd = w._dir.path().join("project.v1");
     std::fs::create_dir_all(&w.ctx.cwd).unwrap();
@@ -619,7 +625,7 @@ fn crash_world() -> (World, Made) {
 }
 /// Findings A18, F7: a panic unwinds past `testing::locked`, so the crashed World keeps its fake locks. The next
 /// `up` is a new process: a fresh World over the same state root and folder, the same sessions (`made`).
-fn reopen(old: &World, made: &Made) -> World {
+pub(crate) fn reopen(old: &World, made: &Made) -> World {
     let mut w = World::human("");
     w.ctx.state_root = old.ctx.state_root.clone();
     w.ctx.cwd = old.ctx.cwd.clone();
@@ -653,7 +659,7 @@ const FORWARD: [&str; 8] = [
 ];
 /// Stops the first `up` after `step`: a `forward` step by a panic in A3b-1's callback hook (the dispatcher answers
 /// 1 `internal`; the files are what that step left), an E6 step by `halt_after`.
-fn crash_after(step: &'static str) {
+pub(crate) fn crash_after(step: &'static str) {
     if FORWARD.contains(&step) {
         crate::agents::core_launch::hooks::after(Some(Box::new(move |s: &str| {
             if s == step {
@@ -664,11 +670,11 @@ fn crash_after(step: &'static str) {
         crate::agents::up::halt_after(Some(step));
     }
 }
-fn no_crash() {
+pub(crate) fn no_crash() {
     crate::agents::core_launch::hooks::after(None);
     crate::agents::up::halt_after(None);
 }
-fn address(a: &str) -> crate::error::Res<crate::spawn::Out> {
+pub(crate) fn address(a: &str) -> crate::error::Res<crate::spawn::Out> {
     crate::agents::core_launch::forward_tests::address(a)
 }
 /// Findings A19, F8: fake `hc run` runs no launcher, so its claim is seeded as the real launcher would have left
@@ -695,7 +701,11 @@ fn seed_launcher(w: &World, key: &str, step: &str) {
 }
 /// The second `up`'s hc answers after a first `up` stopped at `step`, in real call order: its connect; settle for a
 /// committed leader; reconcile and re-entry for an active leader; a run answer when the leader is (re)launched.
-fn script_second_up(w: &World, step: &str, leader: Option<&(String, std::path::PathBuf)>) {
+pub(crate) fn script_second_up(
+    w: &World,
+    step: &str,
+    leader: Option<&(String, std::path::PathBuf)>,
+) {
     cf::online(w);
     let ran = ["commit", "promote", "team", "presented"].contains(&step);
     match leader {
@@ -1329,10 +1339,12 @@ fn torn_index_prelife_leader_and_team_record_repair() {
     std::fs::remove_file(ut::team_file(&w)).unwrap();
     cf::online(&w);
     let (code, r) = cli(&w, &["up", "-Client", "claude"]);
+    // restore-6c decision 9 (checklist 71, D23): an unreadable agent record refuses `evidence` before the replay
+    // loop, ahead of E4.2's `team`.
     assert_eq!(
         (code, r["check"].as_str()),
-        (1, Some("team")),
-        "E4.2 else 1 team: {r}"
+        (1, Some("evidence")),
+        "decision 9: {r}"
     );
     w.fakes.hc_done().unwrap();
 }

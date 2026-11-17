@@ -156,20 +156,30 @@ pub static VERBS: &[VerbDef] = &[
     VerbDef {
         name: "stop",
         values: &[],
+        switches: &["Generation"],
+        min: 1,
+        max: 1,
+        usage: "usage: mux-agent stop <name> [-Generation] [-Text]",
+        handler: crate::agents::message::stop_hc,
+        text: json::lines,
+    },
+    VerbDef {
+        name: "drop",
+        values: &[],
         switches: &[],
         min: 1,
         max: 1,
-        usage: "usage: mux-agent stop <name> [-Text]",
-        handler: crate::agents::message::stop_hc,
+        usage: "usage: mux-agent drop <name|id> [-Text]",
+        handler: crate::agents::message::drop_member,
         text: json::lines,
     },
     VerbDef {
         name: "resume",
         values: &[],
-        switches: &[],
+        switches: &["Fresh"],
         min: 1,
         max: 1,
-        usage: "usage: mux-agent resume <name|id> [-Text]",
+        usage: "usage: mux-agent resume <name|id> [-Fresh] [-Text]",
         handler: crate::agents::resume::resume,
         text: json::lines,
     },
@@ -763,7 +773,7 @@ mod tests {
     // A valid argv for each verb, positionals at the verb's minimum.
     fn valid(verb: &str) -> Vec<&'static str> {
         match verb {
-            "focus" | "send" | "stop" | "resume" | "report" | "peek" => vec!["a"],
+            "focus" | "send" | "stop" | "drop" | "resume" | "report" | "peek" => vec!["a"],
             _ => vec![],
         }
     }
@@ -784,6 +794,7 @@ mod tests {
                 "notes",
                 "peek",
                 "stop",
+                "drop",
                 "resume",
                 "restore",
                 "up",
@@ -820,6 +831,7 @@ mod tests {
             ("notes", 0, 1),
             ("peek", 1, 1),
             ("stop", 1, 1),
+            ("drop", 1, 1),
             ("resume", 1, 1),
             ("restore", 0, 0),
             ("up", 0, 0),
@@ -933,6 +945,7 @@ mod tests {
             "notes" => vec!["notes"],
             "peek" => vec!["peek", "worker"],
             "stop" => vec!["stop", "worker"],
+            "drop" => vec!["drop", "worker"],
             "resume" => vec!["resume", "worker"],
             "restore" => vec!["restore"],
             "up" => vec!["up", "-Client", "claude"],

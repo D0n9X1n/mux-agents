@@ -44,12 +44,14 @@ pub(super) fn arm(
         session: a.session,
     };
     let mut reply = Map::new();
+    if let Some(r) = &run.retired {
+        reply.insert("retired".into(), r.clone().into()); // restore-6c P6
+    }
     let (mut created, mut replayed, mut team_error) = (run.created, run.replayed, run.team_error);
     let leader = if run.launched {
         run.record.clone()
     } else {
-        let anchor = crate::agents::reconcile::anchor_caller(caller, &scope);
-        reply.extend(crate::agents::reconcile::run(ctx, &anchor)?);
+        reply.extend(run.reconciled.unwrap_or_default()); // restore-6c Task 7: the pass, run in `drive`
         let leader = leader_of(ctx, ix)?.1;
         let leader = leader
             .map(|id| leaders::leader_record(ctx, ix, &id))

@@ -50,6 +50,7 @@ fn the_list_is_this_teams_live_kept_shells() {
     let want = [("b", "k1"), ("k2", "k2")].map(|(n, a)| Shell {
         address: a.into(),
         name: n.into(),
+        team: team.clone(),
     });
     assert_eq!(got, want);
     w.fakes.hc_done().unwrap();
@@ -302,6 +303,8 @@ fn closing_one_kept_shell_leaves_the_other_and_the_generation_done() {
         .unwrap();
     let before = tree(&w.ctx.state_root);
     cf::online(&w);
+    // restore-6c Task 11: `close_any` reads the label, then `close` re-reads right before the kill (V5)
+    cf::get(&w, "k1", kept_wire("k1", "live", Some((&team, "a"))));
     cf::get(&w, "k1", kept_wire("k1", "live", Some((&team, "a"))));
     cf::answer(&w, &["kill", "k1", "--json"], "{}");
     cf::kept_listing(&w, &team, &["k1", "k2"]);
@@ -311,7 +314,10 @@ fn closing_one_kept_shell_leaves_the_other_and_the_generation_done() {
     assert_eq!(code, 0, "{r}");
     assert_eq!(
         (&r["closed"], &r["kept"]),
-        (&json!("k1"), &json!([{"address": "k2", "name": "b"}]))
+        (
+            &json!("k1"),
+            &json!([{"address": "k2", "name": "b", "team": team}])
+        )
     );
     assert_eq!(kills(&w), 1);
     // Re-audit 4-10 F3: the board's entry point (`list_at`) runs inside the same snapshot window.

@@ -5,6 +5,8 @@ pub mod discover;
 mod existing_tests;
 pub mod identity;
 pub mod index;
+#[cfg(test)]
+mod leader_tests;
 mod leaders;
 pub mod publish;
 #[cfg(test)]
@@ -13,6 +15,9 @@ pub mod reenter;
 #[cfg(test)]
 mod reenter_tests;
 pub mod replay;
+pub(crate) mod retire;
+#[cfg(test)]
+mod retire_tests;
 pub mod server;
 #[cfg(test)]
 pub(crate) mod tests;
@@ -80,7 +85,7 @@ pub fn up(ctx: &Ctx, request: &Request) -> Res<Map<String, Value>> {
                 view: None,
                 pending: None,
                 aliases: vec![],
-                releases: vec![],
+                releases: retire::carried(ctx, &team, vec![])?, // call 25: a crash after `renamed`
             };
             made.pending = Some(publish::new_pending(ctx, &caller, &made)?);
             let up_dir = ctx.state_root.join("up");
@@ -163,11 +168,12 @@ fn drive(
     caller: &Caller,
     core: &Core<'_>,
     team: &str,
-    fresh: bool,
+    mut fresh: bool,
 ) -> Res<Map<String, Value>> {
     use replay::Step;
     let mut ix = index::read(ctx, team)?.ok_or_else(|| Refusal::internal("index vanished"))?;
-    let reentered = team_exists(ctx, &ix)?;
+    let mut reentered = team_exists(ctx, &ix)?;
+    leaders::readable(ctx, &ix)?; // restore-6c decision 9
     let mut run = Run::default();
     if fresh {
         run.shown = Some(publish::start(ctx, caller, &mut ix)?);
@@ -222,7 +228,33 @@ fn drive(
                 run.created = true;
                 run.replayed |= !fresh;
             }
-            Step::Reenter => return reenter::arm(ctx, caller, core, team, &mut ix, run, reentered),
+            Step::Reenter => {
+                if !run.launched {
+                    // D22: E4.2's team record before the pass, so a restore of a leader whose first `up` died
+                    // after commit finds it (restore-6c checklist 69 refuses an absent record).
+                    if !has_team && let Some(id) = &id {
+                        let r = leaders::leader_record(ctx, &ix, id)?;
+                        match write_team(ctx, &ix, &r) {
+                            Ok(()) => (run.created, run.replayed) = (true, true),
+                            Err(e) => run.team_error = Some(e.message),
+                        }
+                    }
+                    let Some(m) = leaders::reconciled(ctx, caller, &ix, id.as_deref())? else {
+                        // P6 then E6 in the same loop (call 20): no second creation path
+                        let retired = retire::successor(ctx, caller, &mut ix)?;
+                        (fresh, reentered) = (true, false);
+                        let shown = publish::start(ctx, caller, &mut ix)?;
+                        run = Run {
+                            shown: Some(shown),
+                            retired: Some(retired),
+                            ..Run::default()
+                        };
+                        continue;
+                    };
+                    run.reconciled = Some(m);
+                }
+                return reenter::arm(ctx, caller, core, team, &mut ix, run, reentered);
+            }
         }
     }
     Err(Refusal::internal("up did not converge"))
@@ -237,6 +269,10 @@ struct Run {
     launched: bool,
     created: bool,
     replayed: bool,
+    /// restore-6c Task 7: reconcile's pass, run before this arm (call 18).
+    reconciled: Option<Map<String, Value>>,
+    /// restore-6c Task 10: the `<key>:<session>` this call retired (P6).
+    retired: Option<String>,
 }
 
 /// Calls 33, 39 (findings A1, F1-F3): the anchor key `key`'s `server.json`. On its own server it is published

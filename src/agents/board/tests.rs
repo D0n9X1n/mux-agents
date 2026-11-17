@@ -12,7 +12,7 @@ fn only_a_lifecycle_watch_lists_kept_shells() {
     assert!(!lists_kept(true, std::iter::empty::<&Value>()), "no member");
 }
 
-// The field: rows `[{address, name}]`; a listing failure is `kept: []` plus `keptError` (display only).
+// The field: rows `[{address, name, team}]`; a listing failure is `kept: []` plus `keptError` (display only).
 #[test]
 fn the_kept_field_is_display_only() {
     use crate::agents::kept::Shell;
@@ -24,11 +24,12 @@ fn the_kept_field_is_display_only() {
         Some(Ok(vec![Shell {
             address: "k1".into(),
             name: "a".into(),
+            team: "t".into(),
         }])),
     );
     assert_eq!(
         Value::Object(reply.clone()),
-        serde_json::json!({"kept": [{"address": "k1", "name": "a"}]})
+        serde_json::json!({"kept": [{"address": "k1", "name": "a", "team": "t"}]})
     );
     let mut failed = Map::new();
     add_kept(

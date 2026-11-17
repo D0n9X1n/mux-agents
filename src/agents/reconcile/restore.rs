@@ -40,23 +40,42 @@ fn client_of(g: &Gen) -> Res<crate::parse::Client> {
         .ok_or_else(|| Refusal::internal("the member names no known client"))
 }
 
-/// L3: n+1 through launch-1 G1, kind `restore`: the resume recipe (options-6e), no prompt, no task (ambiguity 13).
-fn relaunch(tx: &Tx<'_>, core: &Core<'_>, id: &str, g: &Gen, sid: &str) -> Res<u64> {
+/// What a next generation launches (launch-1 G1 kinds): restore and retry resume `session`; fresh starts it.
+pub(crate) struct Next<'a> {
+    pub kind: &'static str,
+    pub session: &'a str,
+    pub fresh: bool,
+}
+
+/// L3, restore-6c P2: n+1 of member `id` through launch-1 G1: its stored options within the team ceiling, the
+/// resume recipe, no prompt, no task (ambiguity 13, 6c-R4). One spec builder for restore and recovery.
+pub(crate) fn launch_next(
+    tx: &Tx<'_>,
+    core: &Core<'_>,
+    id: &str,
+    g: &Gen,
+    next: Next<'_>,
+) -> Res<u64> {
     use super::super::spawn::{Recipe, client_args, client_name, utf8};
     let r = g.record();
     let client = client_of(g)?;
     let server = tx.ctx.state_root.join(&tx.scope.key);
-    let team = super::super::team::read(&super::super::team::path(&server, &tx.scope.session))?;
+    let team = team_of(tx)?;
     let stored = super::super::options::stored(r)?;
-    let ceiling = super::super::resume::ceiling(team.as_ref());
+    let ceiling = super::super::resume::ceiling(Some(&team));
     let flags = super::super::options::replay(client, &stored, ceiling)?;
+    let recipe = if next.fresh {
+        Recipe::First(None)
+    } else {
+        Recipe::Resume(None)
+    };
     let spec = json!({"schema": 1, "stateDirectory": utf8(&server)?, "client": client_name(client),
         "flags": flags, "parentPane": r.get("parentPane"),
-        "args": client_args(client, Recipe::Resume(None), sid, None)});
+        "args": client_args(client, recipe, next.session, None)});
     let launch = super::super::core_launch::Launch {
         id: id.into(),
-        kind: "restore",
-        session_id: sid.into(),
+        kind: next.kind,
+        session_id: next.session.into(),
         create: None,
         spec,
         team: format!("{}:{}", tx.scope.key, tx.scope.session),
@@ -67,7 +86,32 @@ fn relaunch(tx: &Tx<'_>, core: &Core<'_>, id: &str, g: &Gen, sid: &str) -> Res<u
     let promoted =
         super::super::core_launch::forward(tx, core, launch, || Ok(()), |_, _| Ok(json!({})))?;
     super::super::gens::plain_gen(&text(promoted.get("generation")))
-        .ok_or_else(|| Refusal::internal("the restored generation is not a number"))
+        .ok_or_else(|| Refusal::internal("the next generation is not a number"))
+}
+
+/// Checklist 7, 9 (call 25): the session's team record through the evidence reader (a link, folder, FIFO or torn
+/// file is `evidence`), present, whole, and naming this session. A lifecycle member never launches without it.
+fn team_of(tx: &Tx<'_>) -> Res<super::super::team::Team> {
+    let file = super::super::team::path(&tx.ctx.state_root.join(&tx.scope.key), &tx.scope.session);
+    crate::state::evidence::read(&file)
+        .known()?
+        .and_then(|v| super::super::team::Team::from_json(&v))
+        .filter(|t| t.session == tx.scope.session)
+        .ok_or_else(crate::state::evidence::unreadable)
+}
+
+fn relaunch(tx: &Tx<'_>, core: &Core<'_>, id: &str, g: &Gen, sid: &str) -> Res<u64> {
+    launch_next(
+        tx,
+        core,
+        id,
+        g,
+        Next {
+            kind: "restore",
+            session: sid,
+            fresh: false,
+        },
+    )
 }
 
 /// L4 occupancy, asked after n is done (ambiguity 5c), then the relaunch.

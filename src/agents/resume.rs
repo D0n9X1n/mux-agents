@@ -18,12 +18,25 @@ use crate::ctx::Ctx;
 use crate::error::{Refusal, Res, refuse};
 use crate::state::fs::read_json;
 
+mod recovery;
+pub use recovery::Action;
+pub(crate) use recovery::{Subject, recover, subject};
+
 pub fn resume(ctx: &Ctx, request: &Request) -> Res<Map<String, Value>> {
     let target = first(request);
     if !super::agent_id(target) && !super::agent_name(target) {
         return Err(usage("resume"));
     }
     let caller = crate::caller::resolve_tree(ctx)?;
+    // restore-6c P2: a member that needs recovery is retried as its next generation; else today's resume.
+    let action = if request.switch("Fresh") {
+        Action::Fresh
+    } else {
+        Action::Retry
+    };
+    if let Some(reply) = recover(ctx, &caller, action, target)? {
+        return Ok(reply);
+    }
     crate::cli::member_views(ctx, &caller)?;
     if matches!(
         super::tree::scope(ctx, &caller)?,

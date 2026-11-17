@@ -17,6 +17,8 @@ pub struct Target {
     pub name: String,
     pub pane: String,
     pub life: String,
+    /// A kept row's `mux.kept` label (restore-6c Task 11); empty for a member row.
+    pub team: String,
 }
 
 impl Target {
@@ -33,6 +35,7 @@ impl Target {
             pane: super::clean(row.get("pane")),
             life,
             name,
+            team: String::new(),
         }
     }
 
@@ -52,6 +55,7 @@ impl Target {
             id: address,
             pane: String::new(),
             life: KEPT.into(),
+            team: super::clean(row.get("team")),
         }
     }
 
@@ -62,6 +66,7 @@ impl Target {
             name: name.into(),
             pane: pane.into(),
             life: "running".into(),
+            team: String::new(),
         }
     }
 }

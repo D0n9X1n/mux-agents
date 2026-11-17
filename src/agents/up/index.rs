@@ -420,5 +420,79 @@ pub fn every(ctx: &Ctx) -> Res<Vec<Index>> {
     Ok(out)
 }
 
+/// `<root>/up/retired` when it exists, a real folder; its ancestors validated as `up_dir`'s (checklist 56, final
+/// F7): a missing `retired` never bypasses that check. Another file type, or a metadata error, is 1 `index`.
+pub(crate) fn retired_dir(ctx: &Ctx) -> Res<Option<PathBuf>> {
+    let Some(up) = up_dir(ctx)? else {
+        return Ok(None);
+    };
+    let dir = up.join("retired");
+    match stat(&dir, false) {
+        Ok(m) if real_dir(&m) => Ok(Some(dir)),
+        Ok(_) => Err(bad(format!("{} is not a real folder", dir.display()))),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(_) => Err(bad(format!("{} cannot be read", dir.display()))),
+    }
+}
+
+/// The rename's destination folder: `retired_dir`, made private (and flushed into `up/`) when missing.
+pub(crate) fn retired_dir_made(ctx: &Ctx) -> Res<PathBuf> {
+    if let Some(d) = retired_dir(ctx)? {
+        return Ok(d);
+    }
+    let up = up_dir(ctx)?.ok_or_else(|| bad("this team has no index"))?;
+    let dir = up.join("retired");
+    #[cfg(unix)]
+    crate::state::private_unix::private_dirs(&ctx.state_root, &[&dir])?;
+    #[cfg(windows)]
+    crate::state::private_windows::private_dirs(&[&dir])?;
+    crate::state::fs::sync_dir(&up).map_err(|_| not_flushed())?;
+    Ok(dir)
+}
+
+/// Call 12: a retired index under `<root>/up/retired/`, validated as `read` validates (ancestors, a regular file,
+/// shape, types, a present `null`, flushes: the retired folder, then `flush_chain`); its `team` must be the T its
+/// file name begins with. Absent, torn, a link, a folder, or outside that folder: 1 `index`.
+pub(crate) fn read_retired(ctx: &Ctx, at: &Path) -> Res<Index> {
+    let cannot = || bad(format!("the retired index {} cannot be read", at.display()));
+    let dir = retired_dir(ctx)?.ok_or_else(cannot)?;
+    let name = at.file_name().and_then(|n| n.to_str()).ok_or_else(cannot)?;
+    if at.parent() != Some(dir.as_path()) || !name.ends_with(".json") {
+        return Err(cannot());
+    }
+    match stat(at, false) {
+        Ok(m) if m.is_file() && !m.file_type().is_symlink() => {}
+        _ => return Err(cannot()),
+    }
+    let Evidence::Present(v) = evidence::read(at) else {
+        return Err(cannot());
+    };
+    crate::state::fs::sync_dir(&dir).map_err(|_| not_flushed())?;
+    flush_chain(ctx)?;
+    parse(name.split('.').next().unwrap_or(""), &v).ok_or_else(cannot)
+}
+
+/// Every retired index (of team `team` when given), by file name, each through `read_retired`; an entry whose name
+/// cannot be read, or an archive that does not read, refuses (never skipped: 10-13 F13).
+pub(crate) fn every_retired(ctx: &Ctx, team: Option<&str>) -> Res<Vec<(String, Index)>> {
+    let Some(dir) = retired_dir(ctx)? else {
+        return Ok(Vec::new());
+    };
+    let listed = || bad(format!("{} cannot be listed", dir.display()));
+    let mut names = Vec::new();
+    for e in std::fs::read_dir(&dir).map_err(|_| listed())? {
+        let n = e.map_err(|_| listed())?.file_name();
+        let n = n
+            .into_string()
+            .map_err(|_| bad("a retired index name is not UTF-8"))?;
+        if n.ends_with(".json") && team.is_none_or(|t| n.starts_with(&format!("{t}."))) {
+            names.push(n);
+        }
+    }
+    names.sort();
+    let read = |n: String| Ok((n.clone(), read_retired(ctx, &dir.join(&n))?));
+    names.into_iter().map(read).collect()
+}
+
 #[cfg(test)]
 mod tests;

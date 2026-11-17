@@ -1023,6 +1023,21 @@ fn listed(os: &dyn crate::proc::Os, pid: u32, start: i64) -> bool {
 /// recorded client has exited (#137), so a `resume` right after is not refused `session`. Past the bound it still
 /// replies, with `clientExited: false`.
 pub fn stop_hc(ctx: &Ctx, request: &Request) -> Res<Map<String, Value>> {
+    if request.switch("Generation") {
+        return generations::stop_generations(ctx, request);
+    }
+    stop_with(ctx, |ctx, caller| {
+        super::member_target::stop_target(ctx, caller, first(request))
+    })
+}
+
+/// The cascade-3d stop with its target resolver passed in (restore-6c call 25, checklist 25): `stop` resolves by
+/// name, `drop` by exact id. Journals first, the target's team scope, `current` revalidation, the cascade, the
+/// notice and the client wait are the same for both.
+pub(crate) fn stop_with(
+    ctx: &Ctx,
+    pick: impl FnOnce(&Ctx, &Caller) -> Res<super::member_target::StopTarget>,
+) -> Res<Map<String, Value>> {
     let caller = crate::caller::resolve_tree(ctx)?;
     let scope = super::team_state::Scope::of(&caller);
     let (mut reply, client) = super::tree::with_standing(ctx, &caller, |standing| {
@@ -1036,7 +1051,7 @@ pub fn stop_hc(ctx: &Ctx, request: &Request) -> Res<Map<String, Value>> {
             }
             None => Vec::new(),
         };
-        let id = match super::member_target::stop_target(ctx, &caller, first(request))? {
+        let id = match pick(ctx, &caller)? {
             super::member_target::StopTarget::Member(id) => id,
             pane => return stop_pre(ctx, &caller, standing, &pane),
         };
@@ -1196,6 +1211,10 @@ fn stop_pre_hc(ctx: &Ctx, id: &super::core_identity::Identity) -> Res<&'static s
         other => word(other),
     })
 }
+
+mod drop_member;
+mod generations;
+pub use drop_member::drop_member;
 
 #[cfg(test)]
 mod prelife_stop_tests;

@@ -6174,6 +6174,10 @@ hc {}:
                     an_unacked_batch_is_served_again_and_rebuilt_for_a_successor,
                     a_lost_member_is_released_and_keeps_only_its_kept_labels,
                     an_orphan_left_by_a_forward_crash_is_ended_by_terminate,
+                    a_client_rejecting_resume_needs_recovery_and_fresh_clears_it,
+                    a_retried_member_runs_its_lifecycle,
+                    an_exited_leader_is_resumed_by_up_and_messages_its_child,
+                    stopping_the_leader_then_up_makes_a_new_team,
                 ]
             );
         };
@@ -7473,6 +7477,429 @@ hc {}:
             });
             live.ready(&json!({"id": again["leader"]["id"], "name": "leader"}));
         }
+    }
+
+    /// restore-6c Task 12: the bound on each lifecycle wait.
+    const LIFE: Duration = Duration::from_secs(150);
+
+    /// The `list -All` row of the member in `folder`, by its recorded `hcAddress` (ordinary rows have no `id`).
+    fn row(live: &mut Live, pane: &str, folder: &Path) -> Value {
+        let address = json_file(&folder.join("record.json"))["hcAddress"].clone();
+        let (_, list) = live.run_in(pane, &["list", "-All"]);
+        list["agents"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .find(|r| r["hcAddress"] == address)
+            .cloned()
+            .unwrap_or(Value::Null)
+    }
+
+    /// What a failed restore-6c assertion shows: the `list -All` reply, hc's view and the panes.
+    fn seen(live: &mut Live, pane: &str) -> String {
+        let (_, list) = live.run_in(pane, &["list", "-All"]);
+        let hc = support::private_core::run(
+            live.server
+                .core
+                .as_ref()
+                .expect("private core")
+                .command(&["ls", "--all", "--json"]),
+            live.dir.path(),
+        )
+        .map_or_else(|e| format!("hc ls: {e}"), |v| v.to_string());
+        let panes = live.call(&[
+            "list-panes",
+            "-a",
+            "-F",
+            "#{session_name} #{pane_id} #{pane_start_command}",
+        ]);
+        format!("list: {list}\nhc: {hc}\npanes:\n{panes}")
+    }
+
+    /// The member's recorded generation (a decimal string).
+    fn generation(folder: &Path) -> u64 {
+        s(&json_file(&folder.join("record.json"))["generation"])
+            .parse()
+            .unwrap()
+    }
+
+    /// Generation n's own client pid: its generation client evidence (`gens/<n>/client.json`), never a lookup by
+    /// session, which can find a dead predecessor of the same session.
+    fn gen_client(folder: &Path, n: u64) -> u64 {
+        let path = folder.join("gens").join(n.to_string()).join("client.json");
+        assert!(eventually(LIFE, || path.exists()), "{}", path.display());
+        json_file(&path)["pid"].as_u64().unwrap()
+    }
+
+    /// Call 16, call 25 (checklist 45): the same-id lifecycle of generation n of `id`, driven through n's own
+    /// client: ready, reads mail, spawns, exits. `parent` sends the mail and is told of the exit; without one (the
+    /// leader) the person's `pane` sends and no mailbox is told. Its marker `{kind, exitCode, at}` (checklist 22, 62:
+    /// a field set, not an order) is written once, bytes stable.
+    fn lifecycle(live: &mut Live, pane: &str, parent: Option<&str>, id: &str, n: u64) {
+        let mux = live.mux();
+        let folder = live.agent_dir(id);
+        let gen_dir = folder.join("gens").join(n.to_string());
+        let name = s(&json_file(&folder.join("record.json"))["name"]).to_string();
+        live.ready(&json!({"id": id, "name": name}));
+        let pid = gen_client(&folder, n);
+        let hello = format!("hello {name} generation {n}");
+        let (code, sent) = match parent {
+            Some(p) => {
+                let body = live.dir.join(format!("hello-{id}-{n}.md"));
+                std::fs::write(&body, &hello).unwrap();
+                live.by(p, &["send", &name, "-BodyFile", body.to_str().unwrap()])
+            }
+            None => live.run_in(pane, &["send", &name, "-Body", &hello]),
+        };
+        assert_eq!(code, 0, "{mux:?} {sent}");
+        let (code, mail) = live.server.command(pid, &["read"]);
+        assert!(
+            code == 0 && mail.to_string().contains(&hello),
+            "{mux:?}: generation {n} of {name} reads its mail: {mail}"
+        );
+        let (task, brief, child) = (
+            live.path("task.txt"),
+            live.path("brief.md"),
+            format!("{name}-child"),
+        );
+        let (code, made) = live.server.command(
+            pid,
+            &[
+                "spawn",
+                "-Client",
+                "claude",
+                "-TaskFile",
+                &task,
+                "-BriefFile",
+                &brief,
+                "-Context",
+                "brief",
+                "-Name",
+                &child,
+            ],
+        );
+        assert_eq!(code, 0, "{mux:?}: generation {n} of {name} spawns: {made}");
+        live.ready(&made); // o2 call 35: nothing ends while a member is still starting
+        support::write_atomic(&live.dir.join(format!("quit.{pid}")), "0");
+        let notice = gen_dir.join("notice.json");
+        let recorded = eventually(LIFE, || {
+            live.run_in(pane, &["list"]);
+            notice.exists()
+        });
+        assert!(
+            recorded,
+            "{mux:?}: {name}'s exit is recorded\n{}",
+            seen(live, pane)
+        );
+        let first = std::fs::read(&notice).unwrap();
+        let marker: Value = serde_json::from_slice(&first).unwrap();
+        let keys: BTreeSet<&str> = marker
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(
+            (keys, &marker["kind"], &marker["exitCode"]),
+            (
+                BTreeSet::from(["at", "exitCode", "kind"]),
+                &json!("exited"),
+                &json!(0)
+            ),
+            "{mux:?}: the marker's own contents: {marker}"
+        );
+        let exit = format!("exit-{id}-{n}");
+        let delivered = |live: &Live| {
+            parent.map_or(0, |p| {
+                live.mailbox(p)
+                    .iter()
+                    .filter(|m| m["id"] == exit.as_str())
+                    .count()
+            })
+        };
+        if parent.is_some() {
+            assert!(
+                eventually(LIFE, || delivered(live) >= 1),
+                "{mux:?}: the parent is told {exit}\n{}",
+                seen(live, pane)
+            );
+        }
+        live.run_in(pane, &["list"]);
+        assert_eq!(
+            std::fs::read(&notice).unwrap(),
+            first,
+            "{mux:?}: recorded once"
+        );
+        assert_eq!(
+            delivered(live),
+            usize::from(parent.is_some()),
+            "{mux:?}: delivered once, with its generation"
+        );
+    }
+
+    /// A member made by today's resume of an Ended `w` while the client rejects `--resume`: it fails before ready,
+    /// so it needs recovery. Returns its folder.
+    fn failed_member(live: &mut Live, pane: &str, leader: &str, w: &str) -> PathBuf {
+        let mux = live.mux();
+        let (code, made) = live.spawn_by(leader, w);
+        assert_eq!(code, 0, "{mux:?} {made}");
+        live.ready(&made); // #147: a member is stopped only after it reported ready
+        let (code, stopped) = live.by(leader, &["stop", w]);
+        assert_eq!(code, 0, "{mux:?} {stopped}");
+        support::write_atomic(&live.dir.join("resume-gone"), "");
+        let (code, y) = live.run_in(pane, &["resume", w]);
+        assert_eq!(code, 0, "{mux:?} {y}");
+        let folder = live.agent_dir(s(&y["agent"]["id"]));
+        let flagged = eventually(LIFE, || row(live, pane, &folder)["needsRecovery"] == true);
+        assert!(flagged, "{mux:?}: {w} needs recovery\n{}", seen(live, pane));
+        folder
+    }
+
+    /// After `up` from the root pane (in the scenario, so the serial guard sees it): the brief seeded, the leader
+    /// ready; answers (leader id, a person's pane in the team session).
+    fn team_of(live: &mut Live, code: i32, up: &Value) -> (String, String) {
+        let mux = live.mux();
+        assert_eq!(code, 0, "{mux:?} {up}");
+        std::fs::write(live.dir.join("brief.md"), "brief").unwrap();
+        let leader = s(&up["leader"]["id"]).to_string();
+        live.ready(&json!({"id": leader, "name": "leader"}));
+        (leader, team_shell(live, s(&up["session"])))
+    }
+
+    /// A recovered generation runs without a view: its view verbs (`spawn`) refuse `views` ("the team's views are
+    /// down; run up"). Once it is ready, `up` from the person's pane re-enters the team and presents it (D33).
+    fn presented(live: &mut Live, pane: &str, id: &str) {
+        let mux = live.mux();
+        let name = s(&json_file(&live.agent_dir(id).join("record.json"))["name"]).to_string();
+        live.ready(&json!({"id": id, "name": name}));
+        let (code, again) = live.run_in(pane, &["up", "-Client", "claude"]);
+        assert_eq!(
+            (code, &again["created"]),
+            (0, &json!(false)),
+            "{mux:?}: up presents the recovered {name}: {again}\n{}",
+            seen(live, pane)
+        );
+    }
+
+    /// Spec live 1, call 23: `recover` on the bar and in `list`. A retry still meets the rejecting client, and its
+    /// generation's failure is recorded. Then `-Fresh` takes a new session id, reports ready, clears recovery, and
+    /// runs the same-id lifecycle.
+    fn a_client_rejecting_resume_needs_recovery_and_fresh_clears_it(mux: Mux) {
+        let Some(mut live) = Live::human(mux) else {
+            return;
+        };
+        let (code, up) = live.run(&["up", "-Client", "claude"]);
+        let (leader, pane) = team_of(&mut live, code, &up);
+        let y = failed_member(&mut live, &pane, &leader, "w1");
+        let r = row(&mut live, &pane, &y);
+        assert_eq!(
+            r["recoveryReason"], "client exited before readiness",
+            "{mux:?}: {r}"
+        );
+        if let Some(bar) = up["sidebar"].as_str() {
+            let shown = eventually(Duration::from_secs(30), || {
+                live.call(&["capture-pane", "-p", "-t", bar])
+                    .lines()
+                    .any(|l| l.contains("w1") && l.contains("recover"))
+            });
+            let screen = live.call(&["capture-pane", "-p", "-t", bar]);
+            assert!(shown, "{mux:?}: the bar shows recover:\n{screen}");
+        }
+        let (code, retried) = live.run_in(&pane, &["resume", "w1"]);
+        assert_eq!(
+            (code, &retried["agent"]["kind"]),
+            (0, &json!("retry")),
+            "{mux:?} {retried}"
+        );
+        let n = retried["agent"]["generation"].as_u64().unwrap();
+        let outcome = y.join("gens").join(n.to_string()).join("outcome.json");
+        let recorded = eventually(LIFE, || {
+            live.run_in(&pane, &["list"]);
+            outcome.exists()
+        });
+        assert!(
+            recorded,
+            "{mux:?}: the retry's outcome is recorded\n{}",
+            seen(&mut live, &pane)
+        );
+        assert_eq!(
+            json_file(&outcome)["outcome"],
+            "failed",
+            "{mux:?}: the retry met the rejecting client"
+        );
+        let before = s(&json_file(&y.join("record.json"))["sessionId"]).to_string();
+        std::fs::remove_file(live.dir.join("resume-gone")).unwrap();
+        let (code, fresh) = live.run_in(&pane, &["resume", "w1", "-Fresh"]);
+        assert_eq!(
+            (code, &fresh["agent"]["kind"]),
+            (0, &json!("fresh")),
+            "{mux:?} {fresh}"
+        );
+        let m = fresh["agent"]["generation"].as_u64().unwrap();
+        assert_ne!(
+            s(&fresh["agent"]["sessionId"]),
+            before,
+            "{mux:?}: a new session id"
+        );
+        let cleared = eventually(LIFE, || row(&mut live, &pane, &y)["needsRecovery"] != true);
+        assert!(
+            cleared,
+            "{mux:?}: fresh clears recovery\n{}",
+            seen(&mut live, &pane)
+        );
+        assert_eq!(
+            s(&json_file(&y.join("record.json"))["sessionId"]),
+            s(&fresh["agent"]["sessionId"]),
+            "{mux:?}"
+        );
+        let id = s(&json_file(&y.join("record.json"))["id"]).to_string();
+        presented(&mut live, &pane, &id);
+        lifecycle(&mut live, &pane, Some(&leader), &id, m);
+    }
+
+    /// Call 16, retry leg: once the client accepts `--resume` again, a retry resumes the member's conversation and
+    /// that generation runs the same-id lifecycle.
+    fn a_retried_member_runs_its_lifecycle(mux: Mux) {
+        let Some(mut live) = Live::human(mux) else {
+            return;
+        };
+        let (code, up) = live.run(&["up", "-Client", "claude"]);
+        let (leader, pane) = team_of(&mut live, code, &up);
+        let y = failed_member(&mut live, &pane, &leader, "w2");
+        std::fs::remove_file(live.dir.join("resume-gone")).unwrap();
+        let sid = s(&json_file(&y.join("record.json"))["sessionId"]).to_string();
+        let (code, retried) = live.run_in(&pane, &["resume", "w2"]);
+        assert_eq!(
+            (
+                code,
+                &retried["agent"]["kind"],
+                s(&retried["agent"]["sessionId"])
+            ),
+            (0, &json!("retry"), sid.as_str()),
+            "{mux:?} {retried}"
+        );
+        let n = retried["agent"]["generation"].as_u64().unwrap();
+        let id = s(&json_file(&y.join("record.json"))["id"]).to_string();
+        presented(&mut live, &pane, &id);
+        lifecycle(&mut live, &pane, Some(&leader), &id, n);
+    }
+
+    /// Spec live 2 (checklist 45): the leader exits; its child runs on; `up` resumes the leader as n+1 of the same
+    /// id; it messages the child, then runs the whole same-id lifecycle. The parentless leader's exit is its
+    /// generation's notice, recorded once (no mailbox).
+    fn an_exited_leader_is_resumed_by_up_and_messages_its_child(mux: Mux) {
+        let Some(mut live) = Live::human(mux) else {
+            return;
+        };
+        let (code, up) = live.run(&["up", "-Client", "claude"]);
+        let (leader, pane) = team_of(&mut live, code, &up);
+        let (code, w1) = live.spawn_by(&leader, "w1");
+        assert_eq!(code, 0, "{mux:?} {w1}");
+        live.ready(&w1);
+        let lead = live.agent_dir(&leader);
+        let n = generation(&lead);
+        let old = gen_client(&lead, n);
+        support::write_atomic(&live.dir.join(format!("quit.{old}")), "0");
+        let notice = lead.join("gens").join(n.to_string()).join("notice.json");
+        let recorded = eventually(LIFE, || {
+            live.run_in(&pane, &["list"]);
+            notice.exists()
+        });
+        assert!(
+            recorded,
+            "{mux:?}: the leader's notice is recorded\n{}",
+            seen(&mut live, &pane)
+        );
+        let first = std::fs::read(&notice).unwrap();
+        let marker: Value = serde_json::from_slice(&first).unwrap();
+        assert_eq!(marker["kind"], "exited", "{mux:?}: {marker}");
+        let (code, again) = live.run_in(&pane, &["up", "-Client", "claude"]);
+        assert_eq!(
+            (
+                code,
+                &again["created"],
+                &again["leaderResume"]["resumed"]["generation"]
+            ),
+            (0, &json!(false), &json!(n + 1)),
+            "{mux:?} {again}\n{}",
+            seen(&mut live, &pane)
+        );
+        assert_eq!(
+            std::fs::read(&notice).unwrap(),
+            first,
+            "{mux:?}: recorded once"
+        );
+        let rec = json_file(&lead.join("record.json"));
+        assert_eq!(
+            (&rec["id"], &rec["depth"]),
+            (&json!(leader), &json!(0)),
+            "{mux:?}: the same root"
+        );
+        live.ready(&json!({"id": leader, "name": "leader"}));
+        let new = gen_client(&lead, n + 1); // 5-9 F16: the successor's own client, not the dead predecessor
+        assert_ne!(new, old, "{mux:?}: a new client");
+        let body = live.dir.join("to-w1.md");
+        std::fs::write(&body, "hello from the resumed leader").unwrap();
+        let (code, sent) = live
+            .server
+            .command(new, &["send", "w1", "-BodyFile", body.to_str().unwrap()]);
+        assert_eq!(code, 0, "{mux:?} {sent}");
+        let (code, mail) = live.by(s(&w1["id"]), &["read"]);
+        assert!(
+            code == 0 && mail.to_string().contains("hello from the resumed leader"),
+            "{mux:?}: {mail}"
+        );
+        lifecycle(&mut live, &pane, None, &leader, n + 1);
+    }
+
+    /// Spec live 3: stop the leader; `up` retires the team and makes a new one; old members stay stopped; the old
+    /// session's team is retired, so a person verb there answers 1 `moved` (D20, r6c call 34).
+    fn stopping_the_leader_then_up_makes_a_new_team(mux: Mux) {
+        let Some(mut live) = Live::human(mux) else {
+            return;
+        };
+        let (code, up) = live.run(&["up", "-Client", "claude"]);
+        let (leader, pane) = team_of(&mut live, code, &up);
+        let session = s(&up["session"]).to_string();
+        let (code, w1) = live.spawn_by(&leader, "w1");
+        assert_eq!(code, 0, "{mux:?} {w1}");
+        live.ready(&w1);
+        let (code, stopped) = live.run_in(&pane, &["stop", "leader"]);
+        assert_eq!(
+            (code, &stopped["stopped"]),
+            (0, &json!(true)),
+            "{mux:?} {stopped}"
+        );
+        let (code, next) = live.run_in(&pane, &["up", "-Client", "claude"]);
+        assert_eq!(
+            (code, &next["created"]),
+            (0, &json!(true)),
+            "{mux:?} {next}\n{}",
+            seen(&mut live, &pane)
+        );
+        assert_ne!(next["session"], up["session"], "{mux:?}: a new session");
+        assert_ne!(
+            next["leader"]["id"], up["leader"]["id"],
+            "{mux:?}: a new leader"
+        );
+        assert!(
+            s(&next["retired"]).ends_with(&format!(":{session}")),
+            "{mux:?} {next}"
+        );
+        for id in [leader.as_str(), s(&w1["id"])] {
+            assert_eq!(
+                json_file(&live.agent_dir(id).join("desired.json"))["desired"],
+                "stopped",
+                "{mux:?}: {id}"
+            );
+        }
+        let (code, restored) = live.run_in(&pane, &["restore"]);
+        assert_eq!(
+            (code, &restored["check"]),
+            (1, &json!("moved")),
+            "{mux:?} {restored}"
+        );
+        live.ready(&json!({"id": next["leader"]["id"], "name": "leader"}));
     }
 }
 

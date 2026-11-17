@@ -28,7 +28,7 @@ pub(super) fn snapshot(w: &World, live: &[&str], gone: &[&str]) {
 }
 /// Six running members `1..6` (ids `11111111111n`), each on its own conversation (`other`, r6b call 11: a filler
 /// never reserves the conversation being restored) and adjudicated `ok`, each observed Running by its own `find`.
-fn six_running(w: &World) -> Vec<String> {
+pub(super) fn six_running(w: &World) -> Vec<String> {
     (1..=6)
         .map(|n| {
             let id = format!("11111111111{n}");

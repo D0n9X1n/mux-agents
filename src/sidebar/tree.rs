@@ -174,7 +174,19 @@ fn member(node: &Node, width: usize, shown: Option<&str>, look: Look) -> Member 
                     vec![span(word, Kind::Blocked.word_style())],
                 ]
             } else {
-                vec![right(Kind::Blocked, "recover", &age, false), pill]
+                // restore-6c checklist 18 (P1): the reason beside `recover` while it fits, then the bare word.
+                let reason = clean(row.get("recoveryReason"));
+                let mut sides = Vec::new();
+                if !reason.is_empty() {
+                    sides.push(right(
+                        Kind::Blocked,
+                        &format!("recover: {reason}"),
+                        &age,
+                        false,
+                    ));
+                }
+                sides.extend([right(Kind::Blocked, "recover", &age, false), pill]);
+                sides
             };
             (
                 span("!", Kind::Blocked.style()),
@@ -752,6 +764,36 @@ pub(super) mod tests {
             .unwrap_or_else(|| panic!("no recovery row: {drawn:#?}"));
         assert!(d.trim_end().ends_with("recover"), "{d:?}");
         assert!(!d.contains("still running"), "{d:?}");
+    }
+
+    // restore-6c checklist 18 (P1): a member that needs recovery shows its reason beside `recover` where it fits
+    // (60); the narrow bar (30) keeps the bare `recover` pill.
+    #[test]
+    fn a_recovery_row_shows_its_reason_where_it_fits() {
+        let mut board = golden();
+        let rows = board.get_mut("agents").unwrap().as_array_mut().unwrap();
+        let fixer = rows.iter_mut().find(|r| r["id"] == "F").unwrap();
+        fixer["recoveryReason"] = json!("exited 1");
+        let look = || Look {
+            color: false,
+            ascii: false,
+            dumb: false,
+        };
+        let focus = || Focus {
+            shown: Some("%13"),
+            selected: None,
+        };
+        let row = |width| {
+            draw(&board, width, 20, look(), focus())
+                .into_iter()
+                .find(|l| l.contains("\u{2709} 2"))
+                .unwrap_or_default()
+        };
+        assert_eq!(
+            row(60),
+            line(" ", "  ! fixer  \u{2709} 2", "recover: exited 1   1m", 60)
+        );
+        assert_eq!(row(30), line(" ", "  ! fixer  \u{2709} 2", "recover", 30));
     }
 
     /// A team row: id, name, parent id, `createdAt` minute, merged with `extra`.

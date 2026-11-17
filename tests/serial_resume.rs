@@ -62,8 +62,32 @@ fn callers(src: &str, verb: &str) -> BTreeSet<String> {
         .collect()
 }
 
+/// Each function that runs `resume`, directly or by calling one that does (checklist 60: a scenario's helper).
 fn resume_callers(src: &str) -> BTreeSet<String> {
-    callers(src, "resume")
+    let bodies = bodies(src);
+    let mut found = callers(src, "resume");
+    loop {
+        let more: Vec<String> = bodies
+            .iter()
+            .filter(|(n, b)| !found.contains(n) && found.iter().any(|c| calls(b, c)))
+            .map(|(n, _)| n.clone())
+            .collect();
+        if more.is_empty() {
+            return found;
+        }
+        found.extend(more);
+    }
+}
+
+/// The resume callers no other function calls (any caller of one is itself one): each must be a registered test.
+fn unreached(src: &str) -> BTreeSet<String> {
+    let found = resume_callers(src);
+    let bodies = bodies(src);
+    found
+        .iter()
+        .filter(|c| !bodies.iter().any(|(n, b)| n != *c && calls(b, c)))
+        .cloned()
+        .collect()
 }
 
 /// Whether `body` calls `name(`: the name not preceded by an identifier character (`close(` is not `lose(`).
@@ -108,15 +132,20 @@ fn listed() -> BTreeSet<String> {
 fn every_live_resume_test_is_listed() {
     let listed = listed();
     let registered: BTreeSet<String> = SOURCES.iter().flat_map(|s| registered(s)).collect();
-    let callers: BTreeSet<String> = SOURCES
+    let roots: BTreeSet<String> = SOURCES
         .iter()
-        .flat_map(|s| resume_callers(s).into_iter().chain(reconcile_callers(s)))
+        .flat_map(|s| unreached(s).into_iter().chain(reconcile_callers(s)))
         .collect();
-    let helpers: Vec<_> = callers.difference(&registered).collect();
+    let helpers: Vec<_> = roots.difference(&registered).collect();
     assert!(
         helpers.is_empty(),
         "unregistered functions run resume (list the tests that call them): {helpers:?}"
     );
+    let callers: BTreeSet<String> = SOURCES
+        .iter()
+        .flat_map(|s| resume_callers(s).into_iter().chain(reconcile_callers(s)))
+        .filter(|n| registered.contains(n))
+        .collect();
     let missing: Vec<_> = callers.difference(&listed).collect();
     assert!(
         missing.is_empty(),
@@ -146,6 +175,21 @@ fn the_guard_parses_split_arrays_and_registrations() {
     assert!(
         !reg.contains("commented_name") && !reg.contains("field_read"),
         "{reg:?}"
+    );
+}
+
+// restore-6c checklist 60 (10-13 F11): a scenario that runs `resume` through an unregistered helper is a resume
+// caller, so it is listed, and the helper is not an unregistered caller; a helper no caller reaches still is.
+#[test]
+fn a_helper_running_resume_makes_its_callers_resume_callers() {
+    let src = "    fn helper(live: &mut Live) {\n        live.run_in(&p, &[\"resume\", \"w\"]);\n    }\n    fn scenario(mux: Mux) {\n        let y = helper(&mut live);\n    }\n    fn orphan() {\n        live.run(&[\"resume\", \"x\"]);\n    }\n    fn unrelated() {\n        other_helper(&mut live);\n    }\n";
+    assert_eq!(
+        resume_callers(src).into_iter().collect::<Vec<_>>(),
+        ["helper", "orphan", "scenario"]
+    );
+    assert_eq!(
+        unreached(src).into_iter().collect::<Vec<_>>(),
+        ["orphan", "scenario"]
     );
 }
 

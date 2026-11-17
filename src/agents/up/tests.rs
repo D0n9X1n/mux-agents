@@ -914,6 +914,7 @@ pub(crate) fn team_record_at(w: &World, t: &str, key: &str, session: &str, leade
         created_at: "2026-11-16T00:00:00.0000000Z".into(),
     };
     let at = crate::agents::team::path(&w.ctx.state_root.join(key), session);
+    let _ = std::fs::remove_file(&at); // restore-6c: `member_at` may have written its own record first
     assert!(crate::agents::team::create(&at, &made).unwrap());
 }
 /// A leader record of this folder's team at the World key in `session`: void (an abandoned claim, no active

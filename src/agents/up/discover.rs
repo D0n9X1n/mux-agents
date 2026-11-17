@@ -44,11 +44,19 @@ pub fn existing(ctx: &Ctx, core: &Core<'_>, key: &str, team: &str) -> Res<Option
                 .and_then(Path::file_name)
                 .and_then(|k| k.to_str())
                 .ok_or_else(|| Refusal::internal("a leader folder has no server key"))?;
-            let session = text(record.get("session"));
-            return Ok(Some(Scope {
+            let scope = Scope {
                 key: anchor.into(),
-                session,
-            }));
+                session: text(record.get("session")),
+            };
+            // restore-6c P6: a retired (or half retired: its marker, no live index here) team is not this one
+            use super::retire::{Retired, retired_state};
+            if matches!(
+                retired_state(ctx, &scope, team)?,
+                Retired::Yes | Retired::Half(_)
+            ) {
+                continue;
+            }
+            return Ok(Some(scope));
         }
         refuse_pre(core, &folder, &member, record)?;
     }

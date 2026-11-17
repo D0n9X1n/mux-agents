@@ -28,8 +28,12 @@ pub mod gens;
 pub mod ident;
 pub mod kept;
 #[cfg(test)]
+mod kept_retire_tests;
+#[cfg(test)]
 mod kept_tests;
 pub mod leader;
+#[cfg(test)]
+mod leader_resume_tests;
 #[cfg(test)]
 pub(crate) mod life_fixture;
 pub mod lifecycle;
@@ -58,6 +62,8 @@ mod reconcile_await_tests;
 #[cfg(test)]
 mod reconcile_observe_tests;
 #[cfg(test)]
+mod reconcile_pass_tests;
+#[cfg(test)]
 mod reconcile_restore_tests;
 #[cfg(test)]
 mod reconcile_run_tests;
@@ -69,6 +75,14 @@ mod reconcile_up_tests;
 mod reconcile_verb_race_tests;
 #[cfg(test)]
 mod reconcile_verb_tests;
+#[cfg(test)]
+mod recover_crash_tests;
+#[cfg(test)]
+mod recover_fresh_tests;
+#[cfg(test)]
+mod recover_gate_tests;
+#[cfg(test)]
+mod recover_tests;
 pub mod registry;
 pub mod release;
 pub mod resume;
@@ -78,6 +92,8 @@ pub mod session_report;
 mod session_report_tests;
 pub mod settle;
 pub mod spawn;
+#[cfg(test)]
+mod stop_gen_tests;
 #[cfg(test)]
 mod stop_hc_tests;
 pub mod team;

@@ -77,10 +77,25 @@ pub fn claim(ctx: &Ctx, all: &[Index], key: &str, id: &str, name: Option<&str>) 
         }
     }
     match found.len() {
+        0 if retired_claims(ctx, key, id)? => Ok(Claim::Moved),
         0 => Ok(Claim::Free),
         1 => Ok(found.remove(0)),
         _ => Err(index::bad("two teams claim this session")),
     }
+}
+
+/// Calls 26, 33 (D20): a session a retired team anchored, showed or aliased on this server is `moved`, never
+/// free: its team was retired, so a person verb there is told to run `up`. An unreadable archive refuses `index`.
+fn retired_claims(ctx: &Ctx, key: &str, id: &str) -> Res<bool> {
+    let here = |k: &str, s: &str| k == key && s == id;
+    Ok(index::every_retired(ctx, None)?.iter().any(|(_, ix)| {
+        ix.anchor.as_ref().is_some_and(|a| here(&a.key, &a.session))
+            || ix
+                .view
+                .iter()
+                .chain(&ix.aliases)
+                .any(|v| here(&v.server.key, &v.session))
+    }))
 }
 
 /// E2 for a person (human, no member): an anchor sets `c.anchor`; `moved` refuses; no claim keeps today's scope.

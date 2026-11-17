@@ -2,8 +2,10 @@
 use serde_json::Value;
 
 use super::{index, replay};
+use crate::agents::reconcile::{Pass, PassFor, anchor_caller, pass};
 use crate::{
     agents::gens::{self, Member},
+    caller::Caller,
     ctx::Ctx,
     error::{Refusal, Res, refuse},
 };
@@ -55,6 +57,18 @@ pub(crate) fn leader_of(ctx: &Ctx, ix: &index::Index) -> Res<(replay::Leader, Op
     }
 }
 
+/// Decision 9 (restore-6c checklist 71, 5-9 F18): before the replay loop, an unreadable agent record at the anchor
+/// (its session, so its team, unknown) is 1 `evidence`: the leader is never chosen past a record that may be it.
+pub(crate) fn readable(ctx: &Ctx, ix: &index::Index) -> Res<()> {
+    let Some(a) = &ix.anchor else { return Ok(()) };
+    for (_, _, member) in gens::members(&ctx.state_root.join(&a.key).join("agents"))? {
+        if let Member::Unreadable(e) = member {
+            return Err(e);
+        }
+    }
+    Ok(())
+}
+
 /// Ambiguity 11: settle-1b G3 `normal` on the leader; a `pending` that stays is 1 `team`.
 pub(crate) fn settle_leader(ctx: &Ctx, ix: &index::Index, id: &str) -> Res<()> {
     let a = ix
@@ -85,5 +99,31 @@ pub(crate) fn leader_record(ctx: &Ctx, ix: &index::Index, id: &str) -> Res<Value
     match gens::member_of(&ctx.state_root.join(&a.key).join("agents").join(id)) {
         Member::Life(g) if of_team(g.record(), ix, &a.session, id) => Ok(g.record().clone()),
         _ => refuse(1, "team", UNREADABLE),
+    }
+}
+
+/// restore-6c Task 7 (call 18, ambiguity 10): reconcile's pass at the anchor for `up`, with 6a's validated leader
+/// (call 17), before `reenter::arm` (6a call 8's order), with the leader step (Task 8); `None`: the leader is stopped (P6, Task 10).
+pub(crate) fn reconciled(
+    ctx: &Ctx,
+    caller: &Caller,
+    ix: &index::Index,
+    leader: Option<&str>,
+) -> Res<Option<serde_json::Map<String, Value>>> {
+    let a = ix
+        .anchor
+        .clone()
+        .ok_or_else(|| Refusal::internal("no anchor"))?;
+    let scope = crate::agents::team_state::Scope {
+        key: a.key,
+        session: a.session,
+    };
+    let who = PassFor::Up {
+        leader,
+        step: Some(crate::agents::leader::resume_ended),
+    };
+    match pass(ctx, &anchor_caller(caller, &scope), who)? {
+        Pass::Done(m) => Ok(Some(m)),
+        Pass::Stopped => Ok(None), // P6: `drive` retires the team (Task 10)
     }
 }

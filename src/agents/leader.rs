@@ -16,6 +16,13 @@ use crate::{
     util::{guid, hex_id, utc_o},
 };
 
+/// restore-6c P4.3 (call 17): the leader step `up`'s pass runs for 6a's validated leader, after its adjudication.
+pub(crate) type LeaderStep = fn(
+    &crate::agents::team_state::Tx<'_>,
+    &crate::hc::Lazy<'_>,
+    &str,
+) -> Res<Option<serde_json::Value>>;
+
 pub struct Leader {
     pub team: String,
     /// The client options of the person (options-6e E1), byte for byte; a relaunch replays only these.
@@ -102,6 +109,53 @@ fn flush_to_root(root: &Path, agents: &Path) -> std::io::Result<()> {
         sync_ancestor(dir)?;
     }
     Ok(())
+}
+
+/// restore-6c P4.3 (ambiguity 9; calls 17-19, 25): leader `id` (6a's `leader_of`), adjudicated by the pass just
+/// before. The step applies when its active generation is Ended (`ended.json`, flushed read). It runs only for a
+/// leader desired running: the pass ends at `Stopped` first, and an unreadable desired state fails the observation,
+/// so the step never runs (row 8.16); `reopen_same` checks it again. Every generation must be done (`completing`
+/// included) and the conversation free (no cap slot). Then n+1 of the same id, kind `leader-resume`, the resume
+/// recipe, no prompt. A refusal is `Err`, which the pass reports as `leaderResume.refused` (6c-R5); `halted` passes.
+pub(crate) fn resume_ended(
+    tx: &crate::agents::team_state::Tx<'_>,
+    lazy: &crate::hc::Lazy<'_>,
+    id: &str,
+) -> Res<Option<serde_json::Value>> {
+    use crate::agents::{cascade, gens, reconcile, text};
+    let folder = tx.folder(id);
+    let gens::Member::Life(g) = gens::member_of(&folder) else {
+        return Err(crate::state::evidence::unreadable());
+    };
+    let Some(n) = g.active() else { return Ok(None) };
+    if gens::read_flushed(&folder, n, "ended")?.is_none() {
+        return Ok(None);
+    }
+    // call 25 (5-9 F10): an Ended generation still `completing` is not done; the leader waits, nothing launches
+    if !gens::done(&folder, n)? {
+        return Ok(Some(json!({"held": "completing"})));
+    }
+    if g.pending().is_some() || !g.orphans()?.is_empty() {
+        return Ok(Some(json!({"held": "older"})));
+    }
+    let session = text(g.record().get("sessionId"));
+    if !crate::checks::session_id(&session) {
+        return crate::error::refuse(1, "evidence", "the leader names no valid conversation");
+    }
+    let client = super::spawn::client_named(&text(g.record().get("client")))
+        .ok_or_else(|| crate::error::Refusal::internal("the leader names no known client"))?;
+    if let Some(hold) = super::occupancy::held(tx.ctx, &session, client, None) {
+        return Ok(Some(json!({"held": "occupied", "holder": hold.message()})));
+    }
+    let n = cascade::reopen_same(tx, id, || {
+        let next = reconcile::Next {
+            kind: "leader-resume",
+            session: &session,
+            fresh: false,
+        };
+        reconcile::launch_next(tx, lazy.get()?, id, &g, next)
+    })?;
+    Ok(Some(json!({"resumed": {"generation": n}})))
 }
 
 #[cfg(test)]
