@@ -95,21 +95,32 @@ pub(super) fn own_report(ctx: &Ctx, kind: Client, key: (u32, i64), wanted: &str)
 
 /// H4.4: an unmanaged client `row` of `kind`, judged by its own newest report, keyed as its hook writes it
 /// (`ancestry::identity`: a Unix native `copilot` by its npm loader). `Unmanaged` when the report names `wanted`;
-/// `Evidence` when it cannot be read or names no valid id (R2), its process is gone with no entry left, or its key
-/// cannot be resolved (its report could be anywhere). With no report, a row whose argv or start cannot be read may be
+/// `Evidence` when it cannot be read or names no valid id (R2), its key's process is gone with no entry left while the
+/// row's own process lives (a native `copilot` whose loader quit), or its key cannot be resolved for a live process
+/// (its report could be anywhere). A row whose own process has exited since the table read holds nothing. With no report, a row whose argv or start cannot be read may be
 /// on any conversation, so it holds as `Unbound` (H4.5); a readable one holds nothing, and a report naming another
 /// conversation holds nothing. Known limit: a Unix native `copilot` whose npm loader was killed while it survived is
 /// keyed by itself, so the report its loader wrote is not found; holding every such native instead would block resume
 /// for every directly run `copilot`.
 pub(super) fn unmanaged_report(ctx: &Ctx, row: &Row, kind: Client, wanted: &str) -> Option<Rule> {
+    #[cfg(test)]
+    super::hooks::fire_before_key();
+    // A client that exited after the table read listed it holds nothing: it writes no more to any conversation. Other
+    // clients start and quit all the time on a busy machine, and one quitting mid-check must not block every resume.
+    let exited = || {
+        row.start
+            .is_some_and(|start| live::alive(ctx, row.pid, start) == live::Alive::Dead)
+    };
     let Some(key) = crate::agents::ancestry::identity(ctx, row, kind) else {
-        return Some(Rule::Evidence);
+        return (!exited()).then_some(Rule::Evidence);
     };
     let unread = row.argv.is_none() || row.start.is_none();
     match registry(ctx, kind, key.0, key.1) {
         Err(_) => Some(Rule::Evidence),
         Ok(live::Found { entry: None, gone }) => {
-            if gone {
+            if gone && exited() {
+                None
+            } else if gone {
                 Some(Rule::Evidence)
             } else {
                 unread.then_some(Rule::Unbound)

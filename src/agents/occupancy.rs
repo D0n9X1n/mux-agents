@@ -258,6 +258,18 @@ pub(crate) mod hooks {
     thread_local! {
         static BEFORE: RefCell<Option<Hook>> = const { RefCell::new(None) };
         static ENTRY: RefCell<Option<Hook>> = const { RefCell::new(None) };
+        static KEY: RefCell<Option<Hook>> = const { RefCell::new(None) };
+    }
+    /// Runs right before an unmanaged client's report key is resolved, after the table read that listed it.
+    pub fn before_key(hook: Option<Hook>) {
+        KEY.with(|b| *b.borrow_mut() = hook);
+    }
+    pub(super) fn fire_before_key() {
+        KEY.with(|b| {
+            if let Some(hook) = b.borrow().as_ref() {
+                hook()
+            }
+        });
     }
     /// Call 29: runs right before each registry read occupancy makes (its own table read for liveness).
     pub fn before_entry_read(hook: Option<Hook>) {

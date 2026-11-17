@@ -134,8 +134,9 @@ fn an_unmanaged_client_is_held_only_by_its_own_report() {
         ("names X", Some((Rule::Unmanaged, Some(7200)))),
         ("torn", Some((Rule::Evidence, Some(7200)))),
         ("no valid id", Some((Rule::Evidence, Some(7200)))),
-        ("gone, no entry", Some((Rule::Evidence, Some(7200)))),
+        ("gone, no entry", None),
         ("key unresolved", Some((Rule::Evidence, Some(7200)))),
+        ("exited, key unresolved", None),
     ];
     for (case, want) in cases {
         let w = World::human("");
@@ -159,7 +160,14 @@ fn an_unmanaged_client_is_held_only_by_its_own_report() {
             "key unresolved" => w.fakes.opens(7200, &[None]),
             _ => {}
         }
-        let got = if case == "gone, no entry" {
+        let got = if case == "exited, key unresolved" {
+            // Listed by the table read, then exits before its key is resolved: a client that has exited holds nothing.
+            let fakes = w.fakes.clone();
+            hooks::before_key(Some(Box::new(move || fakes.forget(7200))));
+            let got = held(&w, X, Client::Claude);
+            hooks::before_key(None);
+            got
+        } else if case == "gone, no entry" {
             let fakes = w.fakes.clone();
             hooks::before_entry_read(Some(Box::new(move || fakes.forget(7200))));
             let got = held(&w, X, Client::Claude);

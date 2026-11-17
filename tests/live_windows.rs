@@ -3360,8 +3360,9 @@ fn restore_resumes_every_lost_member_after_a_core_kill_on_windows() {
     );
 }
 
-/// restore-6b spec live "Managed vs unmanaged" on Windows: an unmanaged Claude holds the Claude restores (leader, A)
-/// and names its pid; an unmanaged Copilot holds B. Each quit frees its kind; restored ids and generations asserted.
+/// restore-6b spec live "Managed vs unmanaged" on Windows. Clients this team did not start hold only the conversations
+/// they are on: a Claude and a Copilot on unrelated conversations hold nothing; a Claude resumed into A's conversation
+/// holds A and names its pid, a Copilot resumed into B's holds B, and each quit frees its member.
 #[test]
 fn restore_resume_is_held_by_an_unmanaged_client_until_it_quits_on_windows() {
     let Some(mut live) = Live::start() else {
@@ -3369,25 +3370,39 @@ fn restore_resume_is_held_by_an_unmanaged_client_until_it_quits_on_windows() {
     };
     let mut sent = HashMap::new();
     let ids = team_of_three(&live, &mut sent);
-    lose(&mut live, &ids);
-    let mut strays = Vec::new();
-    let pairs = [
+    let (before, old) = lose(&mut live, &ids);
+    let (a_sid, b_sid) = (s(&before[1]["sessionId"]), s(&before[2]["sessionId"]));
+    // Unrelated clients: another Claude Code and another Copilot session on this machine hold nothing.
+    for (exe, other) in [
         ("claude.exe", "5e55fc2f-2032-48ef-a920-4af2a8e5af55"),
         ("copilot.exe", "6e66fc2f-2032-48ef-a920-4af2a8e5af56"),
-    ];
-    for (exe, sid) in pairs {
+    ] {
         // rmux reads a `.` in a target as window.pane: the session is named without the extension.
+        let pane = live.new_session(&format!("other-{}", exe.trim_end_matches(".exe")));
+        live.line(&pane, &format!("{exe} --session-id {other}"));
+        client_pid(&live, other, 0);
+    }
+    // Strays resumed into A's and B's conversations hold exactly those.
+    let mut strays = Vec::new();
+    for (exe, on, was) in [
+        ("claude.exe", &a_sid, old[1]),
+        ("copilot.exe", &b_sid, old[2]),
+    ] {
         let pane = live.new_session(&format!("stray-{}", exe.trim_end_matches(".exe")));
-        live.line(&pane, &format!("{exe} --session-id {sid}"));
-        strays.push(client_pid(&live, sid, 0));
+        live.line(&pane, &format!("{exe} --resume {on}"));
+        strays.push(client_pid(&live, on, was));
     }
     let up = live.run(&["up", "-Client", "claude"]);
-    assert_eq!(up["restored"], json!([]), "{up}");
+    assert_eq!(
+        sorted_ids(&up, "restored"),
+        [ids[0].clone()],
+        "only the leader is free: {up}"
+    );
     let held = up["held"].as_array().unwrap();
-    assert_eq!(held.len(), 3, "{up}");
+    assert_eq!(held.len(), 2, "{up}");
     for h in held {
         assert_eq!(h["reason"], "occupied", "{h}");
-        let pid = strays[if h["id"] == json!(ids[2]) { 1 } else { 0 }];
+        let pid = strays[if h["id"] == json!(ids[1]) { 0 } else { 1 }];
         assert!(h["holder"].to_string().contains(&pid.to_string()), "{h}");
     }
     std::fs::write(live.dir.join(format!("quit.{}", strays[0])), "0").unwrap();
@@ -3398,12 +3413,10 @@ fn restore_resume_is_held_by_an_unmanaged_client_until_it_quits_on_windows() {
             .then_some(())
     });
     let second = live.run(&["up", "-Client", "claude"]);
-    let mut claude = vec![ids[0].clone(), ids[1].clone()];
-    claude.sort();
     assert_eq!(
         sorted_ids(&second, "restored"),
-        claude,
-        "the restored leader client does not hold A (H2): {second}"
+        [ids[1].clone()],
+        "A is free once its stray quit: {second}"
     );
     assert_eq!(
         sorted_ids(&second, "held"),
