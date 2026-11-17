@@ -5661,10 +5661,21 @@ hc {}:
         [ids[0].clone(), ids[1].clone(), ids[2].clone()]
     }
 
-    /// restore-6b ambiguity 14: kills the core (`kill -9`) and waits until hc shows every member terminal Lost (a
-    /// live shell, not its launcher argv).
+    /// restore-6b ambiguity 14 (r6b-calls "how a live test produces a Lost member"): kills the core (`kill -9`) and each
+    /// target member's terminal (its client and its `hold`, by pid) while the core is down, restarts the core, and waits
+    /// until hc shows every member terminal Lost (a live shell, not its launcher argv). A core kill alone loses nothing:
+    /// hc's `hold` keeps the terminal and the restarted core adopts it (`a_core_kill_alone_leaves_members_running`).
     fn lose_the_core(live: &mut Live, ids: &[String]) {
-        live.server.core.as_mut().expect("private core").kill_hard();
+        let hc = live.server.core.as_ref().expect("private core");
+        let terminals: Vec<(u32, Option<i64>)> = ids
+            .iter()
+            .flat_map(|id| hc.terminal_of(live.client_of(id) as u32))
+            .collect();
+        live.server
+            .core
+            .as_mut()
+            .expect("private core")
+            .kill_hard_with(&terminals);
         let live: &Live = live;
         for id in ids {
             let r = json_file(&live.agent_dir(id).join("record.json"));
@@ -5811,6 +5822,62 @@ hc {}:
                 let r = json_file(&live.agent_dir(id).join("record.json"));
                 assert_eq!(r["generation"], "1", "{mux:?}");
             }
+        }
+    }
+
+    /// r6b-calls "how a live test produces a Lost member": a core kill alone loses no member. hc's `hold` keeps each
+    /// terminal and the restarted core adopts it live with its launcher argv; `up` and `restore` then find every member
+    /// Running, relaunch nothing, and each keeps its client and its terminal.
+    #[test]
+    fn a_core_kill_alone_leaves_members_running() {
+        let count = |live: &Live| {
+            std::fs::read_to_string(live.dir.join("clients.log"))
+                .unwrap()
+                .lines()
+                .count()
+        };
+        for mux in Mux::ALL {
+            let Some(mut live) = Live::human(mux) else {
+                continue;
+            };
+            let ids = team_of_three(&mut live);
+            let before: Vec<Value> = ids
+                .iter()
+                .map(|id| json_file(&live.agent_dir(id).join("record.json")))
+                .collect();
+            let old: Vec<u64> = ids.iter().map(|id| live.client_of(id)).collect();
+            let launched = count(&live);
+            live.server.core.as_mut().expect("private core").kill_hard();
+            for r in &before {
+                let address = s(&r["hcAddress"]).to_string();
+                live.server.wait(&format!("{address} adopted"), || {
+                    let t = core(&live, &["get", &address, "--json"]);
+                    (t["state"] == "live" && t["argv"] == r["launcherArgv"]).then_some(())
+                });
+            }
+            let (code, up) = live.run(&["up", "-Client", "claude"]);
+            assert_eq!((code, &up["created"]), (0, &json!(false)), "{mux:?} {up}");
+            let team = live.split(s(&before[0]["session"]), &["-v"]);
+            let (code, restore) = live.run_in(&team, &["restore"]);
+            assert_eq!(code, 0, "{mux:?} {restore}");
+            for reply in [&up, &restore] {
+                for key in ["restored", "held", "unknown", "recover"] {
+                    assert_eq!(reply[key], json!([]), "{mux:?} {key}: {reply}");
+                }
+            }
+            for (i, id) in ids.iter().enumerate() {
+                assert_eq!(live.client_of(id), old[i], "{mux:?} {id}: the same client");
+                let r = json_file(&live.agent_dir(id).join("record.json"));
+                assert_eq!(
+                    r["hcName"], before[i]["hcName"],
+                    "{mux:?} {id}: the same terminal"
+                );
+                assert!(
+                    !live.agent_dir(id).join("gens/1").exists(),
+                    "{mux:?} {id}: no new generation"
+                );
+            }
+            assert_eq!(count(&live), launched, "{mux:?}: nothing relaunched");
         }
     }
 
@@ -6520,12 +6587,14 @@ hc {}:
         // Checklist 9: every pane is a member of either team or one of the five known shells.
         let (quiet, commands) = ([root, other, t2], [person.clone(), t2_person.clone()]);
         let mut tagged: Vec<(String, String)> = Vec::new();
-        for row in live.panes("#{pane_id}|#{@agent-id}") {
-            let (p, agent) = row.split_once('|').unwrap();
+        for row in live.panes("#{pane_id}|#{@agent-id}|#{@agent-role}|#{pane_start_command}") {
+            let mut part = row.splitn(4, '|');
+            let (p, agent) = (part.next().unwrap(), part.next().unwrap_or(""));
+            let (role, start) = (part.next().unwrap_or(""), part.next().unwrap_or(""));
             if agent.is_empty() {
                 assert!(
                     quiet.iter().chain(&commands).any(|q| q == p),
-                    "{mux:?}: pane {p} is neither a member nor a known shell"
+                    "{mux:?}: pane {p} is neither a member nor a known shell (role {role:?}, start {start:?})"
                 );
             } else {
                 tagged.push((agent.to_string(), p.to_string()));

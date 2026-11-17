@@ -116,42 +116,58 @@ impl PrivateCore {
         c.args(args).current_dir(&self.dir);
         c
     }
-    /// 6b ambiguity 14: the core killed outright (SIGKILL; Windows `taskkill /F`, never `/T`, so the terminals it ran
-    /// stay as recovery shells), then started again. The pid comes from `server status --json` (r6b call 2).
+    /// 6b ambiguity 14: the core killed outright (SIGKILL; Windows `taskkill /F`, never `/T`), then started again. The
+    /// pid comes from `server status --json` (r6b call 2). The terminals it ran survive (hc's `hold`) and the restarted
+    /// core adopts them as live: a core kill alone loses no member (r6b-calls "how a live test produces a Lost member").
     pub fn kill_hard(&mut self) {
+        self.kill_hard_with(&[]);
+    }
+
+    /// The processes of the member terminal running client `client`, read before a kill: the client and its nearest
+    /// ancestor running this core's binary (its `hold`), each with its start, so a reused pid is never signalled.
+    pub fn terminal_of(&self, client: u32) -> Vec<(u32, Option<i64>)> {
+        let table = mux_agent::proc::host().table().expect("process table");
+        let name = |r: &mux_agent::proc::Row| {
+            let p = r
+                .path
+                .clone()
+                .or_else(|| r.argv.as_ref().and_then(|a| a.first().cloned()))?;
+            Some(p.rsplit(['/', '\\']).next()?.to_ascii_lowercase())
+        };
+        let core = self
+            .bin
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .to_ascii_lowercase();
+        let row = |pid: u32| table.iter().find(|r| r.pid == pid);
+        let me = row(client).unwrap_or_else(|| panic!("client {client} is not running"));
+        let mut found = vec![(me.pid, me.start)];
+        let mut at = me.ppid;
+        for _ in 0..8 {
+            let Some(r) = row(at) else { break };
+            if name(r).as_deref() == Some(core.as_str()) {
+                found.push((r.pid, r.start));
+                return found;
+            }
+            at = r.ppid;
+        }
+        panic!("client {client} has no {core} ancestor (its hold)");
+    }
+
+    /// `kill_hard`, killing each of `terminals` (from `terminal_of`) while the core is down, so the restarted core finds
+    /// those members' terminals gone: a Lost member (r6b-calls). Only a pid whose start is unchanged is signalled.
+    pub fn kill_hard_with(&mut self, terminals: &[(u32, Option<i64>)]) {
         let status =
             run(self.command(&["server", "status", "--json"]), &self.dir).expect("core status");
         let pid = status["pid"]
             .as_u64()
             .expect("hc server status --json names the core pid") as u32;
-        #[cfg(unix)]
-        {
-            // SAFETY: a plain signal to the pid the private core reports for itself; no memory is shared.
-            let r = unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
-            assert_eq!(r, 0, "kill -9 {pid}: {}", io::Error::last_os_error());
-        }
-        #[cfg(windows)]
-        {
-            let mut child = Command::new("taskkill")
-                .args(["/F", "/PID", &pid.to_string()])
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .spawn()
-                .expect("taskkill");
-            let deadline = Instant::now() + Duration::from_secs(30);
-            let done = loop {
-                if let Some(s) = child.try_wait().expect("taskkill wait") {
-                    break s;
-                }
-                if Instant::now() >= deadline {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    panic!("taskkill /F /PID {pid} did not finish");
-                }
-                std::thread::sleep(Duration::from_millis(20));
-            };
-            assert!(done.success(), "taskkill /F /PID {pid}: {done:?}");
+        kill_pid(pid);
+        for &(pid, start) in terminals {
+            if start.is_some() && mux_agent::proc::host().open(pid).map(|o| o.start) == start {
+                kill_pid(pid);
+            }
         }
         let end = Instant::now() + Duration::from_secs(30);
         loop {
@@ -227,4 +243,37 @@ pub fn run(mut c: Command, dir: &Path) -> io::Result<Value> {
         return Err(io::Error::other(fs::read_to_string(err)?));
     }
     serde_json::from_slice(&fs::read(out)?).map_err(io::Error::other)
+}
+
+/// SIGKILL (Windows `taskkill /F /PID`, never `/T`) of one pid this test owns, bounded to 30 s.
+fn kill_pid(pid: u32) {
+    #[cfg(unix)]
+    {
+        // SAFETY: a plain signal to a pid this test read from its own private core; no memory is shared.
+        let r = unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
+        assert_eq!(r, 0, "kill -9 {pid}: {}", io::Error::last_os_error());
+    }
+    #[cfg(windows)]
+    {
+        let mut child = Command::new("taskkill")
+            .args(["/F", "/PID", &pid.to_string()])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("taskkill");
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let done = loop {
+            if let Some(s) = child.try_wait().expect("taskkill wait") {
+                break s;
+            }
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("taskkill /F /PID {pid} did not finish");
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        assert!(done.success(), "taskkill /F /PID {pid}: {done:?}");
+    }
 }
