@@ -34,9 +34,9 @@ fn shown(targets: Vec<Target>) -> Shown {
         team: false,
     }
 }
-fn kept_target(address: &str, name: &str) -> Target {
+fn kept_target(address: &str, name: &str, team: &str) -> Target {
     Target::kept(
-        json!({"address": address, "name": name})
+        json!({"address": address, "name": name, "team": team})
             .as_object()
             .unwrap(),
     )
@@ -125,7 +125,7 @@ fn ask(w: &World, pick: &mut Pick, s: &mut Shown) {
 // Checklist 10: a kept row's identity is its address, its name is cleaned, it has no pane and its own class.
 #[test]
 fn a_kept_target_is_its_address_with_a_clean_name_and_no_pane() {
-    let t = kept_target("k1", "a\u{1b}[2Jb\nc");
+    let t = kept_target("k1", "a\u{1b}[2Jb\nc", "");
     assert_eq!(
         (t.id.as_str(), t.name.as_str(), t.pane.as_str()),
         ("k1", "a[2Jbc", "")
@@ -324,7 +324,10 @@ fn enter_asks_and_only_y_closes() {
         let w = World::human("");
         let c = w.caller();
         let team = crate::agents::membership::team(&c);
-        let mut s = shown(vec![kept_target("k1", "a"), Target::new("worker", "%9")]);
+        let mut s = shown(vec![
+            kept_target("k1", "a", &team),
+            Target::new("worker", "%9"),
+        ]);
         let mut pick = Pick::default();
         ask(&w, &mut pick, &mut s);
         pick.ticked();
@@ -391,7 +394,7 @@ fn a_failed_close_is_shown() {
     let w = World::human("");
     let c = w.caller();
     let team = crate::agents::membership::team(&c);
-    let mut s = shown(vec![kept_target("k1", "a")]);
+    let mut s = shown(vec![kept_target("k1", "a", "")]);
     let mut pick = Pick::default();
     ask(&w, &mut pick, &mut s);
     cf::online(&w);
@@ -408,7 +411,7 @@ fn a_failed_close_is_shown() {
 fn peek_and_steps_skip_kept_rows() {
     for e in [Event::Peek, Event::Next, Event::Prev] {
         let w = World::human("");
-        let mut s = shown(vec![kept_target("k1", "a")]);
+        let mut s = shown(vec![kept_target("k1", "a", "")]);
         let mut pick = Pick::default();
         let c = w.caller();
         w.fakes.clear_log();
@@ -418,7 +421,10 @@ fn peek_and_steps_skip_kept_rows() {
     }
     for e in [Event::Peek, Event::Next, Event::Prev] {
         let w = World::human("");
-        let mut s = shown(vec![kept_target("k1", "a"), Target::new("worker", "%9")]);
+        let mut s = shown(vec![
+            kept_target("k1", "a", ""),
+            Target::new("worker", "%9"),
+        ]);
         s.team = true;
         let mut pick = Pick::default();
         pick.set_wrap(true);
@@ -437,4 +443,28 @@ fn peek_and_steps_skip_kept_rows() {
             );
         }
     }
+}
+
+/// 10-13 F9: a predecessor's kept row closes with the row's own team (`<key>:$5`), not the bar's.
+#[test]
+fn enter_closes_a_predecessors_kept_shell_with_its_own_team() {
+    let w = World::human("");
+    let c = w.caller();
+    let pred = format!("{}:$5", c.server_key);
+    let mut s = shown(vec![
+        kept_target("k1", "a", &pred),
+        Target::new("worker", "%9"),
+    ]);
+    let mut pick = Pick::default();
+    ask(&w, &mut pick, &mut s);
+    cf::online(&w);
+    cf::get(&w, "k1", kept_wire(&pred, "live"));
+    cf::answer(&w, &["kill", "k1", "--json"], "{}");
+    w.fakes.clear_log();
+    let mut d = keys::Decoder::default();
+    for r in d.push(b"y", SystemTime::UNIX_EPOCH) {
+        act(&w.ctx, &c, LOOK, r, &mut pick, &mut s);
+    }
+    assert_eq!(kills(&w), 1, "closed with the predecessor's team");
+    w.fakes.hc_done().unwrap();
 }

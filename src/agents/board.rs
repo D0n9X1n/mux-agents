@@ -380,7 +380,7 @@ pub fn board(ctx: &Ctx, caller: &Caller, all: bool, watch: bool) -> Res<Map<Stri
         reply.insert("team".into(), true.into());
     }
     let listed = lists_kept(watch, snapshot.records.values().map(|s| &s.record))
-        .then(|| super::kept::list_at(ctx, &super::membership::team(caller)));
+        .then(|| super::kept::watched(ctx, caller)); // restore-6c Task 11: its predecessors' too
     add_kept(&mut reply, listed);
     // Call 20: `list` rows carry no `id`, so each source is also found by its recorded `hcAddress`.
     let blocked: Vec<Blocked> = (blocked.into_iter())

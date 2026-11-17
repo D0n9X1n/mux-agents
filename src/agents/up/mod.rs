@@ -15,7 +15,7 @@ pub mod reenter;
 #[cfg(test)]
 mod reenter_tests;
 pub mod replay;
-mod retire;
+pub(crate) mod retire;
 #[cfg(test)]
 mod retire_tests;
 pub mod server;

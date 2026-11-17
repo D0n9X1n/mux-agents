@@ -1151,7 +1151,7 @@ fn lay_focus(
 }
 
 /// The board's kept shells as targets, in its order.
-fn kept_targets(board: Option<&Map<String, Value>>) -> Vec<Target> {
+pub(crate) fn kept_targets(board: Option<&Map<String, Value>>) -> Vec<Target> {
     board
         .and_then(|b| b.get("kept"))
         .and_then(Value::as_array)
@@ -1247,10 +1247,11 @@ pub(crate) fn walk_of(board: Option<&Map<String, Value>>, laid: &Laid, team: boo
 }
 
 /// `y`: `kept::close` decides (the re-read, the team, the kill); a refusal is shown.
-fn close_kept(ctx: &Ctx, caller: &Caller, target: &Target, pick: &mut Pick) {
-    let team = crate::agents::membership::team(caller);
+/// restore-6c Task 11 (10-13 F9): with the row's own team, so a predecessor's shell closes; a row without one
+/// refuses at `close`'s label check (fail-closed).
+fn close_kept(ctx: &Ctx, target: &Target, pick: &mut Pick) {
     let closed = crate::hc::connect(ctx)
-        .and_then(|core| crate::agents::kept::close(&core, &team, &target.id));
+        .and_then(|core| crate::agents::kept::close(&core, &target.team, &target.id));
     if closed.is_err() {
         pick.close_failed(&target.name);
     }
@@ -2241,7 +2242,7 @@ fn act(
     // selected or clicked.
     if let Some(target) = pick.confirming() {
         if read.event == Event::Yes {
-            close_kept(ctx, caller, &target, pick);
+            close_kept(ctx, &target, pick);
         }
         return true;
     }

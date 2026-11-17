@@ -325,7 +325,10 @@ fn drop_is_a_person_stop_and_its_shell_stays_kept() {
         let (code, listed) = cli(&w, &["kept"]);
         assert_eq!(
             (code, &listed["kept"]),
-            (0, &json!([{"address": a, "name": "mbbb"}])),
+            (
+                0,
+                &json!([{"address": a, "name": "mbbb", "team": lf::team(&w)}])
+            ),
             "{argv:?}: {listed}"
         );
         assert!(kills(&w).is_empty(), "{argv:?}: nothing closed");

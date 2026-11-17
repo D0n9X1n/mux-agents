@@ -150,6 +150,20 @@ pub(crate) fn carried(ctx: &Ctx, team: &str, live: Vec<String>) -> Res<Vec<Strin
     Ok(all)
 }
 
+/// Ambiguity 14, call 12 (restore-6c Task 11): the kept labels a team's bar lists. Its own `<key>:<session>`, then,
+/// by archive name, each retired index of T's anchor, read through `index::read_retired`. An archive that does not
+/// read, or a name that is not UTF-8, refuses (the board shows `keptError`, display only); never a guessed T.
+pub(crate) fn kept_teams(ctx: &Ctx, scope: &Scope, team: &str) -> Res<Vec<String>> {
+    let mut all = vec![format!("{}:{}", scope.key, scope.session)];
+    for (_, ix) in index::every_retired(ctx, Some(team))? {
+        let a = ix
+            .anchor
+            .ok_or_else(|| index::bad("a retired index has no anchor"))?;
+        all.push(format!("{}:{}", a.key, a.session));
+    }
+    Ok(all)
+}
+
 /// Call 20: the stopped arm of 6a's `drive`. P6.1-3 (`retire`), then E6.1's fresh index `{team, inputs, pending}`
 /// in one durable write, the pending request built as 6a builds it and the live and archived releases carried
 /// (calls 14, 25); halt `reindexed`. Returns the retired `<key>:<session>`; `drive` continues the same loop.

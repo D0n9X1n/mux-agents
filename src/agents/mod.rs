@@ -28,6 +28,8 @@ pub mod gens;
 pub mod ident;
 pub mod kept;
 #[cfg(test)]
+mod kept_retire_tests;
+#[cfg(test)]
 mod kept_tests;
 pub mod leader;
 #[cfg(test)]
