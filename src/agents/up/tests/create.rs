@@ -7,7 +7,7 @@ pub(super) fn index_of(w: &World) -> Option<index::Index> {
 }
 
 /// Whether some release file under `up/` reads `Present`.
-pub(super) fn released(w: &World) -> bool {
+pub(crate) fn released(w: &World) -> bool {
     std::fs::read_dir(w.ctx.state_root.join("up"))
         .into_iter()
         .flatten()
@@ -186,6 +186,8 @@ fn a_second_up_reconciles_and_creates_nothing() {
     );
     cf::online(&w); // up's own hc::connect (finding A13)
     cf::online(&w); // reconcile's hc::Lazy
+    found(&w, &id, 0, &running_wire(&w, &agents(&w).join(&id), &id, 0));
+    cf::online(&w); // checklist #47 (N16): re-entry's hc::Lazy (Task 11)
     found(&w, &id, 0, &running_wire(&w, &agents(&w).join(&id), &id, 0));
     let again = claude(&w).unwrap();
     assert_eq!(

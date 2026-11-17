@@ -33,7 +33,7 @@ pub(crate) fn base() -> World {
         .mux_script("up #{pid}", |_| out(0, &format!("up {SERVER}\n")));
     w
 }
-fn ready() -> World {
+pub(crate) fn ready() -> World {
     let w = base();
     w.fakes.hc_answer(Ok(Out {
         stdout: r#"{"address":"t1"}"#.into(),
@@ -59,7 +59,7 @@ fn of(w: &World, v: &str) -> Vec<Vec<String>> {
         .filter(|c| verb(c) == v)
         .collect()
 }
-fn team_of(w: &World) -> String {
+pub(crate) fn team_of(w: &World) -> String {
     identity::team(
         &w.ctx,
         &identity::folder(&w.ctx).unwrap(),
@@ -121,8 +121,9 @@ fn up_creates_the_team_in_a_new_session() {
         reply["name"].as_str().unwrap().to_string(),
         reply["leader"]["id"].as_str().unwrap().to_string(),
     );
-    // reentry-6a F8: A3b-2's `view`, then Task 9's `replayed` and `reentered`.
-    let want = json!({"view": "attached", "team": t, "session": "$7", "name": name, "created": true, "replayed": false, "reentered": false, "leader": {"id": id, "name": "leader", "hcAddress": "t1"}, "sidebar": null});
+    // reentry-6a F8: A3b-2's `view`, then Task 9's `replayed` and `reentered`; Task 11 (finding #21): `views`,
+    // `duplicates`, `members`.
+    let want = json!({"view": "attached", "team": t, "session": "$7", "name": name, "created": true, "replayed": false, "reentered": false, "leader": {"id": id, "name": "leader", "hcAddress": "t1"}, "views": [{"id": id, "name": "leader", "pane": "%9", "window": "@5"}], "duplicates": 0, "members": [{"id": id, "name": "leader", "life": "running"}], "sidebar": null});
     assert_eq!(Value::Object(reply.clone()).to_string(), want.to_string());
     assert!(
         name.starts_with(&format!("project_v1-{}-", &t[..8]))
@@ -1059,13 +1060,15 @@ fn reconcile_runs_before_any_session_is_made() {
             out(0, "$8 @4\n")
         });
         if !refused {
-            cf::online(&w);
-            crate::agents::reconcile_tests::found(
-                &w,
-                "cccccccccccc",
-                1,
-                &create::running_wire(&w, &f, "cccccccccccc", 1),
-            );
+            for _ in 0..2 {
+                cf::online(&w); // reconcile's hc::Lazy, then re-entry's (Task 11)
+                crate::agents::reconcile_tests::found(
+                    &w,
+                    "cccccccccccc",
+                    1,
+                    &create::running_wire(&w, &f, "cccccccccccc", 1),
+                );
+            }
         }
         let got = claude(&w);
         crate::agents::team_state::test_hook(None);
@@ -1087,4 +1090,4 @@ fn reconcile_runs_before_any_session_is_made() {
 }
 
 #[cfg(test)]
-mod create;
+pub(crate) mod create;
