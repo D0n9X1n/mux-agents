@@ -607,3 +607,98 @@ fn a_team_send_to_a_pane_off_the_anchor_names_its_qualified_box() {
     }
     w.fakes.hc_done().unwrap();
 }
+
+/// The team record `up` writes at `key`/`session`, so a person there has standing (tree::with_standing).
+fn team_record_at(w: &World, key: &str, session: &str) {
+    use crate::agents::team;
+    let t = team::Team {
+        team: T1.into(),
+        session: session.into(),
+        name: "p-01234567-v".into(),
+        directory: "/p".into(),
+        client: crate::parse::Client::Claude,
+        flags: vec![],
+        policy: team::Policy::Default,
+        leader: "cccccccccccc".into(),
+        created_at: "2026-11-16T00:00:00.0000000Z".into(),
+    };
+    assert!(team::create(&team::path(&w.ctx.state_root.join(key), session), &t).unwrap());
+}
+
+// n7a call 1: a note written in the view on Kw; the server restarts (a persistent new start, so a new key K2) and
+// the index view moves to K2 (anchor still Kw/$3); from K2 `note` and `notes` reach the same notebook, newest
+// first, at the anchor; nothing is written under K2. A second team T2 whose view is on another live server with the
+// same session id `$3` claims nothing from K2 (row 6.3).
+#[test]
+fn note_and_notes_reach_the_anchor_notebook_after_a_server_restart() {
+    use crate::agents::notebook;
+    let w = World::human("");
+    let first = here(&w);
+    let k1 = first.key.clone();
+    team_record_at(&w, &k1, "$3");
+    let mut index = ix(T1, Some(on(first.clone(), "$3")), None, vec![]);
+    index.anchor = Some(Anchor {
+        key: k1.clone(),
+        session: "$3".into(),
+    });
+    index::write(&w.ctx, &index).unwrap();
+    let (code, r) = run(&w, &["note", "-Title", "before", "-Body", "b1"]);
+    assert_eq!(code, 0, "{r}");
+    w.fakes.process(crate::testing::row(
+        crate::agents::fixture::SERVER,
+        1,
+        first.start + 1,
+    ));
+    w.fakes.prefer_last(); // the restarted server: same pid and socket, a new start, persistently
+    let k2 = Server {
+        start: first.start + 1,
+        key: index::key_of(&first.socket, first.pid, first.start + 1),
+        ..first.clone()
+    };
+    index.view = Some(on(k2.clone(), "$3"));
+    index.aliases = vec![on(first, "$3")];
+    index::write(&w.ctx, &index).unwrap();
+    w.fakes.process(crate::testing::row(4244, 1, 3));
+    let other = Server {
+        socket: "/tmp/other".into(),
+        pid: 4244,
+        start: 3,
+        key: index::key_of("/tmp/other", 4244, 3),
+    };
+    let mut t2 = ix(T2, Some(on(other, "$3")), None, vec![]);
+    t2.anchor = Some(Anchor {
+        key: "b2b2b2b2b2b2b2b2".into(),
+        session: "$3".into(),
+    });
+    index::write(&w.ctx, &t2).unwrap();
+    assert_eq!(
+        w.caller().server_key,
+        k2.key,
+        "a restarted server has a new key"
+    );
+    let (code, r) = run(&w, &["note", "-Title", "after", "-Body", "b2"]);
+    assert_eq!(code, 0, "{r}");
+    let (code, listed) = run(&w, &["notes"]);
+    assert_eq!(code, 0, "{listed}");
+    let titles: Vec<&str> = listed["notes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|n| n["title"].as_str().unwrap())
+        .collect();
+    assert_eq!(titles, ["after", "before"], "one notebook, newest first");
+    let at = Scope {
+        key: k1.clone(),
+        session: "$3".into(),
+    };
+    assert!(
+        notebook::dir(&w.ctx.state_root, &at)
+            .join(notebook::LOG)
+            .is_file(),
+        "at the anchor"
+    );
+    assert!(
+        !w.ctx.state_root.join(&k2.key).join("teams").exists(),
+        "nothing under the restarted server's key"
+    );
+}
