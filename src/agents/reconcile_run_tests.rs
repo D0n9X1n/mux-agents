@@ -71,7 +71,8 @@ fn quiet_rows_answer_without_hc_and_a_prelife_folder_is_untouched() {
     assert_eq!(reply["recover"][0]["reason"], "recovery");
     assert_eq!(ids(&reply, "unknown"), ["ffffffffffff"]);
     assert_eq!(reply["unknown"][0]["check"], "evidence");
-    // shortcut: adopt-3e's `adopt_locked` is not merged yet; its `adoptError` assertion lands with it (r6b call 17).
+    // r6b call 17: adopt-3e's `Tree` refuses the unreadable member; reconcile reports it and still answers.
+    assert_eq!(reply["adoptError"], "evidence");
     assert!(ids(&reply, "restored").is_empty() && ids(&reply, "held").is_empty());
     assert!(lf::calls(&w).is_empty(), "{:?}", lf::calls(&w));
     assert_eq!(
