@@ -204,8 +204,9 @@ fn stop_and_recovery_never_reach_another_sessions_member() {
             &["stop", "-Generation"][..],
             &["resume", "-Fresh"],
             &["resume"],
+            &["drop"],
         ] {
-            if case == "twin" && verb[0] != "stop" {
+            if case == "twin" && !matches!(verb[0], "stop" | "drop") {
                 continue;
             }
             let w = person();
@@ -241,8 +242,19 @@ fn stop_and_recovery_never_reach_another_sessions_member() {
             let args: Vec<&str> = [&[verb[0], target][..], &verb[1..]].concat();
             let (code, reply) = cli(&w, &args);
             let at = format!("{case} {verb:?}");
-            let want = if local.is_some() { "state" } else { "target" };
-            assert_eq!((code, &reply["check"]), (2, &json!(want)), "{at}: {reply}");
+            if let Some(l) = &local
+                && verb[0] == "drop"
+            {
+                assert_eq!(code, 0, "{at}: the local twin is dropped: {reply}");
+                assert_eq!(
+                    super::cascade::desired_of(l).unwrap(),
+                    super::cascade::Desired::Stopped,
+                    "{at}"
+                );
+            } else {
+                let want = if local.is_some() { "state" } else { "target" };
+                assert_eq!((code, &reply["check"]), (2, &json!(want)), "{at}: {reply}");
+            }
             assert_eq!(bytes(&foreign), before, "{at}: untouched");
             assert_eq!(
                 copy.exists().then(|| bytes(&copy)),
@@ -268,4 +280,108 @@ fn stop_generation_is_a_person_action() {
     let (code, reply) = cli(&w, &["stop", X, "-Generation"]);
     assert_eq!((code, &reply["check"]), (2, &json!("tagged")), "{reply}");
     assert!(w.fakes.hc_calls().is_empty(), "nothing asked");
+}
+
+/// Spec P2 drop, checklist 25-27: `drop X` is the cascade stop (cascade-3d) for a person, on X of the anchor session
+/// by exact identity. A Lost generation is released `cause: lost`, relabelled kept (never `kill`), and views-6f's
+/// `kept` verb still lists the shell afterwards (V5). Agents: `tagged`.
+#[test]
+fn drop_is_a_person_stop_and_its_shell_stays_kept() {
+    for argv in lf::LOST_ARGVS {
+        let w = person();
+        team(&w);
+        let f = member(&w, X, json!({"parentAgent": {"id": L}}));
+        failed(&f, 1);
+        found(&w, X, 1, &wire_of(&w, X, 1, argv));
+        released_by_hc(&w, X, argv);
+        let (code, reply) = cli(&w, &["drop", "mbbb"]);
+        assert_eq!(
+            (code, &reply["stopped"]),
+            (0, &json!(true)),
+            "{argv:?}: the cascade stop: {reply}"
+        );
+        assert_eq!(
+            gens::read_flushed(&f, 1, "release").unwrap().unwrap()["cause"],
+            "lost",
+            "{argv:?}"
+        );
+        assert!(
+            gens::read_flushed(&f, 1, "released").unwrap().is_some(),
+            "{argv:?}: done"
+        );
+        assert_eq!(
+            super::cascade::desired_of(&f).unwrap(),
+            super::cascade::Desired::Stopped,
+            "{argv:?}"
+        );
+        assert!(kills(&w).is_empty(), "{argv:?}: no kill");
+        w.fakes.hc_done().unwrap();
+        let a = format!("a{X}");
+        cf::online(&w);
+        cf::kept_listing(&w, &lf::team(&w), &[&a]);
+        let kept = json!({"address": a, "name": lf::hc_name(1), "state": "live", "reason": null, "exit_code": null,
+            "argv": argv, "labels": {"mux.kept": lf::team(&w), "mux.keptName": "mbbb"}});
+        cf::answer(&w, &["get", &a, "--json"], &kept.to_string());
+        let (code, listed) = cli(&w, &["kept"]);
+        assert_eq!(
+            (code, &listed["kept"]),
+            (0, &json!([{"address": a, "name": "mbbb"}])),
+            "{argv:?}: {listed}"
+        );
+        assert!(kills(&w).is_empty(), "{argv:?}: nothing closed");
+        w.fakes.hc_done().unwrap();
+    }
+    let w = World::agent("");
+    w.state();
+    team(&w);
+    member(&w, X, json!({"parentAgent": {"id": L}}));
+    w.fakes.hc_install("hc");
+    let (code, reply) = cli(&w, &["drop", X]);
+    assert_eq!(
+        (code, &reply["check"]),
+        (2, &json!("tagged")),
+        "agent: {reply}"
+    );
+    assert!(w.fakes.hc_calls().is_empty(), "agent: nothing asked");
+}
+
+/// Call 25 (5-9 F1), checklist 27: `drop` names its subject by exact id. A member whose name is another member's id
+/// is not the one stopped; and an identity that changed between selection and the locked stop is refused (`target`)
+/// by `stop_life`'s revalidation, with nothing written.
+#[test]
+fn drop_stops_by_exact_identity_and_revalidates_under_the_lock() {
+    let w = person();
+    team(&w);
+    let x = member(&w, X, json!({"parentAgent": {"id": L}}));
+    failed_ended(&x, 1);
+    let y = member(
+        &w,
+        Y,
+        json!({"parentAgent": {"id": L}, "name": "bbbbbbbbbbbb"}),
+    );
+    failed_ended(&y, 1);
+    let y_before = bytes(&y);
+    let (code, reply) = cli(&w, &["drop", X]);
+    assert_eq!(
+        (code, &reply["name"]),
+        (0, &json!("mbbb")),
+        "the id names X: {reply}"
+    );
+    assert_eq!(
+        super::cascade::desired_of(&x).unwrap(),
+        super::cascade::Desired::Stopped,
+        "X stopped"
+    );
+    assert_eq!(bytes(&y), y_before, "Y, named like X's id, untouched");
+    let w = person();
+    team(&w);
+    let x = member(&w, X, json!({"parentAgent": {"id": L}}));
+    failed_ended(&x, 1);
+    let before = bytes(&x);
+    let caller = crate::caller::resolve_tree(&w.ctx).unwrap();
+    let mut stale = super::member_target::by_id(&w.ctx, &caller, X).unwrap();
+    stale.generation = "9".into(); // the member changed after it was selected
+    let e = super::message::stop_with(&w.ctx, |_, _| Ok(stale.clone())).unwrap_err();
+    assert_eq!((e.code, e.check), (2, "target"), "{}", e.message);
+    assert_eq!(bytes(&x), before, "nothing written");
 }

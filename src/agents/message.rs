@@ -1026,6 +1026,18 @@ pub fn stop_hc(ctx: &Ctx, request: &Request) -> Res<Map<String, Value>> {
     if request.switch("Generation") {
         return generations::stop_generations(ctx, request);
     }
+    stop_with(ctx, |ctx, caller| {
+        super::member_target::named(ctx, caller, first(request))
+    })
+}
+
+/// The cascade-3d stop with its target resolver passed in (restore-6c call 25, checklist 25): `stop` resolves by
+/// name, `drop` by exact id. Journals first, the target's team scope, `current` revalidation, the cascade, the
+/// notice and the client wait are the same for both.
+pub(crate) fn stop_with(
+    ctx: &Ctx,
+    pick: impl FnOnce(&Ctx, &Caller) -> Res<super::core_identity::Identity>,
+) -> Res<Map<String, Value>> {
     let caller = crate::caller::resolve_tree(ctx)?;
     let scope = super::team_state::Scope::of(&caller);
     let (mut reply, client) = super::tree::with_standing(ctx, &caller, |standing| {
@@ -1039,7 +1051,7 @@ pub fn stop_hc(ctx: &Ctx, request: &Request) -> Res<Map<String, Value>> {
             }
             None => Vec::new(),
         };
-        let id = super::member_target::named(ctx, &caller, first(request))?;
+        let id = pick(ctx, &caller)?;
         let folder = server_dir(ctx, &caller).join("agents").join(&id.id);
         // Dispatch only: `stop_life` revalidates through `current` (R1). An unreadable record goes to `stop_pre`,
         // whose `current` refuses it.
@@ -1170,7 +1182,9 @@ fn stop_pre(
     })
 }
 
+mod drop_member;
 mod generations;
+pub use drop_member::drop_member;
 
 #[cfg(test)]
 mod prelife_stop_tests;
