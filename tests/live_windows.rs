@@ -3234,7 +3234,8 @@ fn restore_resume_is_held_by_an_unmanaged_client_until_it_quits_on_windows() {
         ("copilot.exe", "6e66fc2f-2032-48ef-a920-4af2a8e5af56"),
     ];
     for (exe, sid) in pairs {
-        let pane = live.new_session(&format!("stray-{exe}"));
+        // rmux reads a `.` in a target as window.pane: the session is named without the extension.
+        let pane = live.new_session(&format!("stray-{}", exe.trim_end_matches(".exe")));
         live.line(&pane, &format!("{exe} --session-id {sid}"));
         strays.push(client_pid(&live, sid, 0));
     }
