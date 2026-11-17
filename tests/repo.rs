@@ -1425,6 +1425,11 @@ const TEST_ONLY: &[(&str, &str, &str)] = &[
     ("src/sidebar/pick/tests.rs", "src/sidebar/pick.rs", "tests"),
     ("src/testing.rs", "src/lib.rs", "testing"),
     (
+        "src/agents/leader_resume_tests.rs",
+        "src/agents/mod.rs",
+        "leader_resume_tests",
+    ),
+    (
         "src/agents/reconcile_pass_tests.rs",
         "src/agents/mod.rs",
         "reconcile_pass_tests",

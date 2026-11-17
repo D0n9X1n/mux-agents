@@ -31,6 +31,8 @@ pub mod kept;
 mod kept_tests;
 pub mod leader;
 #[cfg(test)]
+mod leader_resume_tests;
+#[cfg(test)]
 pub(crate) mod life_fixture;
 pub mod lifecycle;
 pub mod mail;

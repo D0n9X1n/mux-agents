@@ -378,11 +378,14 @@ fn seeded(w: &World) -> (std::path::PathBuf, std::path::PathBuf) {
 fn up_after_a_killed_server_restores_both_views_and_the_bar() {
     let w = reentry_world();
     let (fl, fx) = seeded(&w);
-    for _ in 0..2 {
-        cf::online(&w); // reconcile's Lazy, then reenter's
-        rt::found(&w, X, 1, &ut::create::running_wire(&w, &fx, X, 1));
-        rt::found(&w, L, 1, &ut::create::running_wire(&w, &fl, L, 1));
-    }
+    // restore-6c Task 8 (5-9 F19, F23): the pass observes the leader once, before its step, then the member loop
+    // decides X; re-entry's own Lazy then asks in id order.
+    cf::online(&w);
+    rt::found(&w, L, 1, &ut::create::running_wire(&w, &fl, L, 1));
+    rt::found(&w, X, 1, &ut::create::running_wire(&w, &fx, X, 1));
+    cf::online(&w);
+    rt::found(&w, X, 1, &ut::create::running_wire(&w, &fx, X, 1));
+    rt::found(&w, L, 1, &ut::create::running_wire(&w, &fl, L, 1));
     let (code, r) = cli(&w, &["up", "-Client", "claude"]);
     assert_eq!(code, 0, "{r}");
     assert_eq!(
@@ -537,11 +540,14 @@ fn a_member_view_failure_is_reported_and_the_others_shown() {
     let w = reentry_world();
     w.fakes.mux_first(&format!("attach a{X}"), 1, "", "no pane");
     let (fl, fx) = seeded(&w);
-    for _ in 0..2 {
-        cf::online(&w);
-        rt::found(&w, X, 1, &ut::create::running_wire(&w, &fx, X, 1));
-        rt::found(&w, L, 1, &ut::create::running_wire(&w, &fl, L, 1));
-    }
+    // restore-6c Task 8 (5-9 F19, F23): the pass observes the leader once, before its step, then the member loop
+    // decides X; re-entry's own Lazy then asks in id order.
+    cf::online(&w);
+    rt::found(&w, L, 1, &ut::create::running_wire(&w, &fl, L, 1));
+    rt::found(&w, X, 1, &ut::create::running_wire(&w, &fx, X, 1));
+    cf::online(&w);
+    rt::found(&w, X, 1, &ut::create::running_wire(&w, &fx, X, 1));
+    rt::found(&w, L, 1, &ut::create::running_wire(&w, &fl, L, 1));
     let (code, r) = cli(&w, &["up", "-Client", "claude"]);
     assert_eq!(code, 0, "{r}");
     assert!(r["viewError"].is_string(), "{r}");

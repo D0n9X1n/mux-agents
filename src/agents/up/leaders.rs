@@ -91,7 +91,7 @@ pub(crate) fn leader_record(ctx: &Ctx, ix: &index::Index, id: &str) -> Res<Value
 }
 
 /// restore-6c Task 7 (call 18, ambiguity 10): reconcile's pass at the anchor for `up`, with 6a's validated leader
-/// (call 17), before `reenter_arm` (6a call 8's order). Task 8 gives it the leader step; Task 10 replaces the refusal.
+/// (call 17), before `reenter::arm` (6a call 8's order), with the leader step (Task 8); Task 10 replaces the refusal.
 pub(crate) fn reconciled(
     ctx: &Ctx,
     caller: &Caller,
@@ -106,7 +106,10 @@ pub(crate) fn reconciled(
         key: a.key,
         session: a.session,
     };
-    let who = PassFor::Up { leader, step: None };
+    let who = PassFor::Up {
+        leader,
+        step: Some(crate::agents::leader::resume_ended),
+    };
     match pass(ctx, &anchor_caller(caller, &scope), who)? {
         Pass::Done(m) => Ok(m),
         Pass::Stopped => refuse(1, "stopping", "the team's leader is stopped"),

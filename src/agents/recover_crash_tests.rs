@@ -15,7 +15,12 @@ use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
 
 /// Removes a killed child's temporary folder (its own destructors never ran) on every exit path.
-struct ChildDir(PathBuf);
+pub(crate) struct ChildDir(PathBuf);
+impl ChildDir {
+    pub(crate) fn new(dir: PathBuf) -> Self {
+        Self(dir)
+    }
+}
 impl Drop for ChildDir {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.0);
@@ -24,7 +29,7 @@ impl Drop for ChildDir {
 
 /// The person world on a given state root and folder (a crash child's, or another thread's), with real locks
 /// beside the state root, so the threads and crash children of one world share them.
-fn person_at(root: &Path, cwd: &Path) -> World {
+pub(crate) fn person_at(root: &Path, cwd: &Path) -> World {
     let mut w = person();
     (w.ctx.state_root, w.ctx.cwd) = (root.into(), cwd.into());
     w.fakes.real_locks(
