@@ -172,22 +172,34 @@ fn two_concurrent_ups_restore_a_member_once() {
         String::new()
     });
     let (root, cwd) = (a.ctx.state_root.clone(), a.ctx.cwd.clone());
+    // CI #150: B's fixture never resolves its caller. A's re-entry publishes a new view, and B's session $3 is then an
+    // alias that every admitted resolution refuses `moved`; up itself resolves the person unadmitted (E2).
+    let seeded = a.caller().session;
+    let wire2 = wire_of(&a, X, 2, &[]);
     std::thread::scope(|scope| {
         let other = scope.spawn(|| {
             let mut b = super::up::tests::base(); // its cf::online serves the connect of up
             (b.ctx.state_root, b.ctx.cwd) = (root.clone(), cwd.clone()); // same folder: same team T
             b.fakes.share_locks(gate.clone());
-            let launch = super::gens::path(&b.folder(X), 2, "launch");
+            let launch = super::gens::path(&f, 2, "launch");
             let end = std::time::Instant::now() + std::time::Duration::from_secs(5);
             while !launch.is_file() {
                 assert!(std::time::Instant::now() < end, "A never launched");
                 std::thread::yield_now();
             }
-            let l = super::gens::read(&b.folder(X), 2, "launch")
-                .known()
-                .unwrap()
-                .unwrap();
-            let mut w2 = wire_of(&b, X, 2, &[]);
+            // B runs after A published its view (the order CI met), so it runs from an alias of the team. The raw
+            // file is polled: `index::read` flushes the folder chain on every call, which starves A on a loaded host.
+            let index = super::up::index::path(&b.ctx, &t);
+            let end = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while match crate::state::evidence::read(&index) {
+                crate::state::evidence::Evidence::Present(ix) => ix["view"]["session"] == seeded,
+                _ => true,
+            } {
+                assert!(std::time::Instant::now() < end, "A never published");
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            let l = super::gens::read(&f, 2, "launch").known().unwrap().unwrap();
+            let mut w2 = wire2.clone();
             (w2["name"], w2["argv"], w2["address"]) =
                 (l["hcName"].clone(), l["launcherArgv"].clone(), json!("t2"));
             cf::online(&b); // the pass of B
