@@ -2102,21 +2102,9 @@ fn notebook_and_peek_stay_in_the_team() {
             assert_eq!(&now, was, "shell pane {p} changed");
             continue;
         }
-        let (keep, prompt) = (was.len() - 1, &was[was.len() - 1]);
         let line = live.at_line(&live.dir, asked[n - quiet.len()]);
-        let rest: Vec<&String> = now
-            .get(keep + 1..)
-            .unwrap_or_default()
-            .iter()
-            .filter(|l| !l.is_empty())
-            .collect();
-        let harness = now.len() > keep + 1
-            && now[..keep] == was[..keep]
-            && now[keep] == format!("{prompt}{line}")
-            && rest.len() == 1
-            && rest[0].ends_with('>');
         assert!(
-            harness,
+            harness_only(was, &now, &line),
             "command pane {p} gained more than the harness's line:\n{was:#?}\n{now:#?}"
         );
     }
@@ -3115,7 +3103,13 @@ fn lose(live: &mut Live, ids: &[String]) -> (Vec<Value>, Vec<u32>) {
         .iter()
         .map(|r| client_pid(live, &s(&r["sessionId"]), 0))
         .collect();
-    live.core.kill_hard();
+    // r6b-calls "how a live test produces a Lost member": the core and each member's terminal (client and `hold`, by
+    // pid, `taskkill /F` never `/T`); a core kill alone loses nothing.
+    let terminals: Vec<(u32, Option<i64>)> = old
+        .iter()
+        .flat_map(|&pid| live.core.terminal_of(pid))
+        .collect();
+    live.core.kill_hard_with(&terminals);
     let live: &Live = live;
     for r in &before {
         let address = s(&r["hcAddress"]);
@@ -3245,7 +3239,8 @@ fn restore_resume_is_held_by_an_unmanaged_client_until_it_quits_on_windows() {
         ("copilot.exe", "6e66fc2f-2032-48ef-a920-4af2a8e5af56"),
     ];
     for (exe, sid) in pairs {
-        let pane = live.new_session(&format!("stray-{exe}"));
+        // rmux reads a `.` in a target as window.pane: the session is named without the extension.
+        let pane = live.new_session(&format!("stray-{}", exe.trim_end_matches(".exe")));
         live.line(&pane, &format!("{exe} --session-id {sid}"));
         strays.push(client_pid(&live, sid, 0));
     }
@@ -3294,4 +3289,57 @@ fn restore_resume_is_held_by_an_unmanaged_client_until_it_quits_on_windows() {
             "{id}"
         );
     }
+}
+
+/// Whether command pane screen `now` is `was` plus only the harness's `line` typed after `was`'s last prompt, then one
+/// prompt (blank lines aside). A full pane scrolls: `was`'s first lines may be gone from the top, so every line above
+/// the harness's line must be the end of `was` before its prompt, unchanged and in order.
+fn harness_only(was: &[String], now: &[String], line: &str) -> bool {
+    let (keep, prompt) = (was.len() - 1, &was[was.len() - 1]);
+    let typed = format!("{prompt}{line}");
+    let Some(k) = now.iter().rposition(|l| *l == typed) else {
+        return false;
+    };
+    let rest: Vec<&String> = now[k + 1..].iter().filter(|l| !l.is_empty()).collect();
+    k <= keep && now[..k] == was[keep - k..keep] && rest.len() == 1 && rest[0].ends_with('>')
+}
+
+// #150 (CI integration-windows, 0450551): the exact screens of command pane %10. The pane was full, so its first line
+// scrolled off when the peek's line and its prompt arrived; only the harness's line was added.
+#[test]
+fn a_scrolled_command_pane_gained_only_the_harness_line() {
+    let s = |v: &[&str]| v.iter().map(|l| l.to_string()).collect::<Vec<_>>();
+    let was = s(&[
+        "3674]",
+        "(c) Microsoft Corporation. All rights reserved.",
+        "",
+        "D:\\a\\mux-agents\\mux-agents>cd /d \"D:\\a\\_temp\\mxit-5496-10\" & \"D:\\a\\mux-agents\\mux-agents\\target\\debug\\mux-agent.exe\" \"sidebar\" \"-Close\" > \"D:\\a\\_temp\\mxit-5496-10\\at.json\" & echo done> \"D:\\a\\_temp\\mxit-5496-10\\at.done\"",
+        "",
+        "D:\\a\\_temp\\mxit-5496-10>",
+    ]);
+    let now = s(&[
+        "(c) Microsoft Corporation. All rights reserved.",
+        "",
+        "D:\\a\\mux-agents\\mux-agents>cd /d \"D:\\a\\_temp\\mxit-5496-10\" & \"D:\\a\\mux-agents\\mux-agents\\target\\debug\\mux-agent.exe\" \"sidebar\" \"-Close\" > \"D:\\a\\_temp\\mxit-5496-10\\at.json\" & echo done> \"D:\\a\\_temp\\mxit-5496-10\\at.done\"",
+        "",
+        "D:\\a\\_temp\\mxit-5496-10>cd /d \"D:\\a\\_temp\\mxit-5496-10\" & \"D:\\a\\mux-agents\\mux-agents\\target\\debug\\mux-agent.exe\" \"peek\" \"b\" \"-Lines\" \"5\" > \"D:\\a\\_temp\\mxit-5496-10\\at.json\" & echo done> \"D:\\a\\_temp\\mxit-5496-10\\at.done\"",
+        "",
+        "D:\\a\\_temp\\mxit-5496-10>",
+    ]);
+    let line = "cd /d \"D:\\a\\_temp\\mxit-5496-10\" & \"D:\\a\\mux-agents\\mux-agents\\target\\debug\\mux-agent.exe\" \"peek\" \"b\" \"-Lines\" \"5\" > \"D:\\a\\_temp\\mxit-5496-10\\at.json\" & echo done> \"D:\\a\\_temp\\mxit-5496-10\\at.done\"";
+    assert!(
+        harness_only(&was, &now, line),
+        "scrolled, harness line only"
+    );
+    let mut extra = now.clone();
+    extra.insert(extra.len() - 1, "typed by peek".to_string());
+    assert!(
+        !harness_only(&was, &extra, line),
+        "a line besides the harness's"
+    );
+    let mut lost = now.clone();
+    lost.remove(0);
+    lost.insert(0, "something else".to_string());
+    assert!(!harness_only(&was, &lost, line), "a changed earlier line");
+    assert!(!harness_only(&was, &was, line), "no harness line");
 }

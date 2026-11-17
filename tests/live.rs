@@ -5675,10 +5675,21 @@ hc {}:
         [ids[0].clone(), ids[1].clone(), ids[2].clone()]
     }
 
-    /// restore-6b ambiguity 14: kills the core (`kill -9`) and waits until hc shows every member terminal Lost (a
-    /// live shell, not its launcher argv).
+    /// restore-6b ambiguity 14 (r6b-calls "how a live test produces a Lost member"): kills the core (`kill -9`) and each
+    /// target member's terminal (its client and its `hold`, by pid) while the core is down, restarts the core, and waits
+    /// until hc shows every member terminal Lost (a live shell, not its launcher argv). A core kill alone loses nothing:
+    /// hc's `hold` keeps the terminal and the restarted core adopts it (`a_core_kill_alone_leaves_members_running`).
     fn lose_the_core(live: &mut Live, ids: &[String]) {
-        live.server.core.as_mut().expect("private core").kill_hard();
+        let hc = live.server.core.as_ref().expect("private core");
+        let terminals: Vec<(u32, Option<i64>)> = ids
+            .iter()
+            .flat_map(|id| hc.terminal_of(live.client_of(id) as u32))
+            .collect();
+        live.server
+            .core
+            .as_mut()
+            .expect("private core")
+            .kill_hard_with(&terminals);
         let live: &Live = live;
         for id in ids {
             let r = json_file(&live.agent_dir(id).join("record.json"));
@@ -5825,6 +5836,123 @@ hc {}:
                 let r = json_file(&live.agent_dir(id).join("record.json"));
                 assert_eq!(r["generation"], "1", "{mux:?}");
             }
+        }
+    }
+
+    /// r6b-calls "how a live test produces a Lost member": a core kill alone loses no member. hc's `hold` keeps each
+    /// terminal and the restarted core adopts it live with its launcher argv; `up`, run from the harness's own pane,
+    /// then finds every member Running and relaunches nothing; each member stays live with the same client process
+    /// and terminal. The team's view session may end with the core (all-calls call 10): reported, never asserted.
+    #[test]
+    fn a_core_kill_alone_leaves_members_running() {
+        let count = |live: &Live| {
+            std::fs::read_to_string(live.dir.join("clients.log"))
+                .unwrap()
+                .lines()
+                .count()
+        };
+        for mux in Mux::ALL {
+            let Some(mut live) = Live::human(mux) else {
+                continue;
+            };
+            let ids = team_of_three(&mut live);
+            let before: Vec<Value> = ids
+                .iter()
+                .map(|id| json_file(&live.agent_dir(id).join("record.json")))
+                .collect();
+            // Each member's client pid with its start, so a reused pid never passes for the same client.
+            let old: Vec<(u64, i64)> = ids
+                .iter()
+                .map(|id| {
+                    let pid = live.client_of(id);
+                    let start = mux_agent::proc::host()
+                        .open(pid as u32)
+                        .map(|o| o.start)
+                        .unwrap_or_else(|| panic!("{mux:?} {id}: client {pid} is not running"));
+                    (pid, start)
+                })
+                .collect();
+            let launched = count(&live);
+            live.server.core.as_mut().expect("private core").kill_hard();
+            for r in &before {
+                let address = s(&r["hcAddress"]).to_string();
+                live.server.wait(&format!("{address} adopted"), || {
+                    let t = core(&live, &["get", &address, "--json"]);
+                    (t["state"] == "live" && t["argv"] == r["launcherArgv"]).then_some(())
+                });
+            }
+            // all-calls call 10: everything below runs from the harness's own pane; the team's view session is not
+            // used (views run `hc attach` and may end with the core; `up` restoring them is reentry-6a Task 11).
+            let (code, up) = live.run(&["up", "-Client", "claude"]);
+            // all-calls call 9: what hc answered for each member right after `up`, carried by every failure below.
+            let seen: Vec<(String, Option<Value>)> = before
+                .iter()
+                .map(|r| {
+                    let address = s(&r["hcAddress"]);
+                    let core = live.server.core.as_ref().expect("private core");
+                    let got = support::private_core::run(
+                        core.command(&["get", address, "--json"]),
+                        live.dir.path(),
+                    );
+                    (format!("{} {address}: {got:?}", s(&r["id"])), got.ok())
+                })
+                .collect();
+            let evidence: Vec<&String> = seen.iter().map(|(e, _)| e).collect();
+            // A diagnostic only (call 10): whether the team's view session outlived the core kill.
+            let sid = s(&before[0]["session"]);
+            let sessions = live
+                .server
+                .try_call(&["list-sessions", "-F", "#{session_id}"]);
+            let sessions = String::from_utf8_lossy(&sessions.stdout).to_string();
+            if !sessions.lines().any(|l| l == sid) {
+                eprintln!(
+                    "{mux:?}: the team's view session {sid} ended with the core (by design): {sessions:?}"
+                );
+            }
+            assert_eq!(
+                (code, &up["created"]),
+                (0, &json!(false)),
+                "{mux:?} {up} hc: {evidence:#?}"
+            );
+            for key in ["restored", "held", "unknown", "recover"] {
+                assert_eq!(
+                    up[key],
+                    json!([]),
+                    "{mux:?} {key}: up: {up} hc: {evidence:#?}"
+                );
+            }
+            for (i, id) in ids.iter().enumerate() {
+                let t = seen[i].1.as_ref();
+                assert!(
+                    t.is_some_and(
+                        |t| t["state"] == "live" && t["argv"] == before[i]["launcherArgv"]
+                    ),
+                    "{mux:?} {id}: live with its launcher after up: {evidence:#?}"
+                );
+                assert_eq!(
+                    mux_agent::proc::host()
+                        .open(old[i].0 as u32)
+                        .map(|o| o.start),
+                    Some(old[i].1),
+                    "{mux:?} {id}: the same client process {} still runs",
+                    old[i].0
+                );
+                assert_eq!(
+                    live.client_of(id),
+                    old[i].0,
+                    "{mux:?} {id}: the same client"
+                );
+                let r = json_file(&live.agent_dir(id).join("record.json"));
+                assert_eq!(
+                    r["hcName"], before[i]["hcName"],
+                    "{mux:?} {id}: the same terminal"
+                );
+                assert!(
+                    !live.agent_dir(id).join("gens/1").exists(),
+                    "{mux:?} {id}: no new generation"
+                );
+            }
+            assert_eq!(count(&live), launched, "{mux:?}: nothing relaunched");
         }
     }
 
@@ -6440,8 +6568,9 @@ hc {}:
     /// Phase 7a end to end: leader > a > b, sibling c, team T2. b lists a's notes newest first; the leader and a
     /// person of the team peek b; c and T2's person cannot. Every pane of the server is inventoried after the bars
     /// close (checklist 9): each member's fake client is proven raw by a canary byte (10), then receives no byte (8);
-    /// the quiet shells keep their screens; the two command panes gain only the harness's own line; panes, windows
-    /// and client selection stay as arranged (b's window has another pane active; tmux: a client is attached).
+    /// every pane but the harness's two command panes (members, b among them, and the quiet shells) keeps its screen;
+    /// panes, windows and client selection stay as arranged (b's window has another pane active; tmux: a client is
+    /// attached).
     fn notebook_and_peek_stay_in_the_team(mux: Mux) {
         let Some(mut live) = Live::human(mux) else {
             return;
@@ -6531,15 +6660,27 @@ hc {}:
         let pane = s(&seen["pane"]).to_string();
         let other = live.split(&pane, &["-h"]);
         live.call(&["select-pane", "-t", &other]);
+        // `up`'s own release hold (`mux-agent hold <state>/up/<team>.release`) runs until `up` publishes the release
+        // file, then exits. It belongs to neither team, so the census waits for it to close rather than count it.
+        for row in live.panes("#{pane_id}|#{pane_start_command}") {
+            let (p, start) = row.split_once('|').unwrap_or((row.as_str(), ""));
+            if start.contains(" hold ") && start.contains("/up/") && start.contains(".release") {
+                live.wait_gone(p);
+            }
+        }
         // Checklist 9: every pane is a member of either team or one of the five known shells.
         let (quiet, commands) = ([root, other, t2], [person.clone(), t2_person.clone()]);
         let mut tagged: Vec<(String, String)> = Vec::new();
-        for row in live.panes("#{pane_id}|#{@agent-id}") {
-            let (p, agent) = row.split_once('|').unwrap();
+        let mut all: Vec<String> = Vec::new();
+        for row in live.panes("#{pane_id}|#{@agent-id}|#{@agent-role}|#{pane_start_command}") {
+            let mut part = row.splitn(4, '|');
+            let (p, agent) = (part.next().unwrap(), part.next().unwrap_or(""));
+            all.push(p.to_string());
+            let (role, start) = (part.next().unwrap_or(""), part.next().unwrap_or(""));
             if agent.is_empty() {
                 assert!(
                     quiet.iter().chain(&commands).any(|q| q == p),
-                    "{mux:?}: pane {p} is neither a member nor a known shell"
+                    "{mux:?}: pane {p} is neither a member nor a known shell (role {role:?}, start {start:?})"
                 );
             } else {
                 tagged.push((agent.to_string(), p.to_string()));
@@ -6603,11 +6744,14 @@ hc {}:
             (live.call(&["list-panes", "-a", "-F", format]), clients)
         };
         let input = typed(&live);
-        let screens: Vec<Vec<String>> = quiet
-            .iter()
-            .chain(&commands)
-            .map(|p| screen(&live, p))
-            .collect();
+        // all-calls call 9: every member pane (b, the peek target, among them) and every quiet shell keeps its screen;
+        // the harness's command panes are left out (it types there by design; a narrowed pane redraws its line).
+        let compared = super::unchanged_panes(&all, &commands);
+        assert!(
+            tagged.iter().all(|(_, p)| compared.contains(p)) && compared.contains(&pane),
+            "{mux:?}: every member pane is compared: {compared:?} {tagged:?}"
+        );
+        let screens: Vec<Vec<String>> = compared.iter().map(|p| screen(&live, p)).collect();
         let before = focus(&live);
         assert!(
             before.0.contains(&format!("|{pane}|0|")),
@@ -6648,30 +6792,8 @@ hc {}:
             input,
             "{mux:?} no member's client received a byte"
         );
-        // A command pane gains exactly the harness's one line (`. '<dir>/line.<n>.sh'` after the prompt it showed)
-        // and the same prompt again; a quiet shell gains nothing.
-        let ours = |t: &str| {
-            t.strip_prefix(&format!(". '{}", live.path("line.")))
-                .and_then(|t| t.strip_suffix(".sh'"))
-                .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
-        };
-        for (n, p) in quiet.iter().chain(&commands).enumerate() {
-            let (was, now) = (&screens[n], screen(&live, p));
-            if n < quiet.len() {
-                assert_eq!(&now, was, "{mux:?}: shell pane {p} changed");
-                continue;
-            }
-            let (keep, prompt) = (was.len() - 1, &was[was.len() - 1]);
-            let harness = now.len() == was.len() + 1
-                && now[..keep] == was[..keep]
-                && now[keep]
-                    .strip_prefix(prompt.as_str())
-                    .is_some_and(|t| ours(t.trim_start()))
-                && &now[keep + 1] == prompt;
-            assert!(
-                harness,
-                "{mux:?}: command pane {p} gained more than the harness's line:\n{was:#?}\n{now:#?}"
-            );
+        for (n, p) in compared.iter().enumerate() {
+            assert_eq!(screen(&live, p), screens[n], "{mux:?}: pane {p} changed");
         }
         drop(client);
     }
@@ -6912,6 +7034,29 @@ hc {}:
             );
         }
     }
+}
+
+/// The panes whose screens must not change while a team peeks (all-calls call 9): every pane of the server except
+/// the harness's command panes, where the harness types by design and a narrowed pane redraws its own line.
+fn unchanged_panes(all: &[String], commands: &[String]) -> Vec<String> {
+    all.iter()
+        .filter(|p| !commands.contains(p))
+        .cloned()
+        .collect()
+}
+
+// #150 (macOS CI 133755859846): a command pane redrew the harness's own line after the pane narrowed. It is left out
+// of the screen comparison; every member pane (b, the peek target, among them) and every quiet shell stays in.
+#[test]
+fn only_the_harness_command_panes_leave_the_screen_comparison() {
+    let s = |v: &[&str]| v.iter().map(|p| p.to_string()).collect::<Vec<_>>();
+    let all = s(&["%0", "%1", "%2", "%3", "%4", "%5", "%6", "%7", "%8"]);
+    let commands = s(&["%5", "%8"]);
+    assert_eq!(
+        unchanged_panes(&all, &commands),
+        s(&["%0", "%1", "%2", "%3", "%4", "%6", "%7"]),
+        "members and quiet shells compared, command panes not"
+    );
 }
 
 #[cfg(unix)]
