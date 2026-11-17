@@ -856,7 +856,10 @@ fn a_spawn_adopts_a_pane_that_already_attaches_its_terminal() {
 /// `server.json` already bound; returns the caller, the binding's path and its bytes.
 fn anchored_at_k1(w: &World) -> (crate::caller::Caller, PathBuf, Vec<u8>) {
     let server = w.ctx.state_root.join(K1).join("server.json");
-    std::fs::create_dir_all(server.parent().unwrap()).unwrap();
+    // Integration #150 CI: made private as the product makes it, the state root first; a folder left at the umask
+    // (755) or with an inherited shared ACL is refused `state` before the launch under test.
+    w.state();
+    crate::agents::spawn::private_folder(&w.ctx, server.parent().unwrap()).unwrap();
     std::fs::write(
         &server,
         br#"{"socket":"/k1","serverPid":1,"serverStart":1}"#,

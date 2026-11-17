@@ -28,3 +28,5 @@ restore_resume_is_held_by_an_unmanaged_client_until_it_quits
 # restore-6b Task 11 (r6b call 8): the Windows twins; run alone.
 restore_resumes_every_lost_member_after_a_core_kill_on_windows
 restore_resume_is_held_by_an_unmanaged_client_until_it_quits_on_windows
+# r6b-calls "how a live test produces a Lost member": kills the core; run alone.
+a_core_kill_alone_leaves_members_running
