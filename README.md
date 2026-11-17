@@ -24,6 +24,7 @@ Start Claude Code and Copilot CLI agents in tmux or rmux panes, see what each is
 
 - **Helpers in panes you can see.** Ask in your chat; choose once per session whether agents open as tabs or as panes beside you, and the side bar opens on its own.
 - **They start with your context.** A same-client agent forks your conversation; any other agent starts from a brief you write.
+- **Agents outlive their panes.** Each agent runs in its own terminal, apart from the pane you see: closing a view, killing the multiplexer server or rebooting does not end it, and `up` brings the team's views, side bar and agents back. `stop` ends an agent and everything it started; `resume` brings a stopped one back with its conversation; a failed one shows `recover` on the bar, and `resume` retries it (`-Fresh` starts a new conversation).
 - **A live side bar.** Who needs you, who just finished, who is working and who is idle, as herdr shows it, with what each is doing right now; click one to jump to it.
 - **Mailboxes, not keystrokes.** Agents report back through files; nothing ever types into another pane.
 - **A team notebook.** Members share durable notes; each new member sees the newest titles at launch, and the others get one mail per new note.
