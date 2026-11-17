@@ -210,26 +210,6 @@ impl Server {
             &path,
         );
         core.start();
-        let mut start = Command::new(&bin);
-        start
-            .arg("-S")
-            .arg(&socket)
-            .args([
-                "-f",
-                "/dev/null",
-                "new-session",
-                "-d",
-                "-x",
-                "200",
-                "-y",
-                "50",
-                "-c",
-            ])
-            .arg(dir.join("work"))
-            .arg("sh");
-        core.apply(&mut start);
-        let out =
-            crate::support::bounded::output(&mut start, crate::support::bounded::LIMIT).unwrap();
         let mut server = Server {
             core: Some(core),
             mux,
@@ -248,6 +228,36 @@ impl Server {
             start: None,
             killed: false,
         };
+        server.boot();
+        Some(server)
+    }
+
+    /// A new server on this socket whose one pane runs `sh` in `<dir>/work` with the private core's environment; sets
+    /// `pane`, `pane_pid`, `pid`, `start` and `key` from it.
+    fn boot(&mut self) {
+        let mux = self.mux;
+        let mut start = Command::new(&self.bin);
+        start
+            .arg("-S")
+            .arg(&self.socket)
+            .args([
+                "-f",
+                "/dev/null",
+                "new-session",
+                "-d",
+                "-x",
+                "200",
+                "-y",
+                "50",
+                "-c",
+            ])
+            .arg(self.dir.join("work"))
+            .arg("sh");
+        if let Some(core) = &self.core {
+            core.apply(&mut start);
+        }
+        let out =
+            crate::support::bounded::output(&mut start, crate::support::bounded::LIMIT).unwrap();
         // Seen once on rmux 0.10.0 under the parallel suite and never reproduced (5 full runs, 2 suites at once,
         // 64 threads): "failed to spawn pane shell: pty syscall failed: Unknown error: -6". Named, not retried.
         let pty =
@@ -261,19 +271,27 @@ impl Server {
                 ""
             }
         );
-        let panes = server.call(&["list-panes", "-a", "-F", "#{pane_id} #{pane_pid} #{pid}"]);
+        let panes = self.call(&["list-panes", "-a", "-F", "#{pane_id} #{pane_pid} #{pid}"]);
         let fields: Vec<&str> = panes.split_whitespace().collect();
         assert_eq!(fields.len(), 3, "{mux:?} list-panes: {panes:?}");
-        server.pane = fields[0].to_string();
-        server.pane_pid = fields[1].parse().unwrap();
-        server.pid = fields[2].parse().unwrap();
-        if let Some(opened) = mux_agent::proc::host().open(server.pid) {
+        self.pane = fields[0].to_string();
+        self.pane_pid = fields[1].parse().unwrap();
+        self.pid = fields[2].parse().unwrap();
+        if let Some(opened) = mux_agent::proc::host().open(self.pid) {
             let start = opened.start;
-            server.start = Some(start);
-            let id = format!("{}|{}|{start}", server.socket.display(), server.pid);
-            server.key = mux_agent::util::sha256_hex(id)[..16].to_string();
+            self.start = Some(start);
+            let id = format!("{}|{}|{start}", self.socket.display(), self.pid);
+            self.key = mux_agent::util::sha256_hex(id)[..16].to_string();
         }
-        Some(server)
+    }
+
+    /// reentry-6a live: `kill-server`, then a new server on the same socket and folder: a new pid and start, so a
+    /// new key. The private core keeps running, so members's terminals survive (only their views die).
+    pub fn restart(&mut self) {
+        let old = self.pid;
+        let _ = self.try_call(&["kill-server"]);
+        self.wait("the old server to exit", || (!alive(old)).then_some(()));
+        self.boot();
     }
 
     pub fn mux(&self) -> Mux {

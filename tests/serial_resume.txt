@@ -30,3 +30,9 @@ restore_resumes_every_lost_member_after_a_core_kill_on_windows
 restore_resume_is_held_by_an_unmanaged_client_until_it_quits_on_windows
 # r6b-calls "how a live test produces a Lost member": kills the core; run alone.
 a_core_kill_alone_leaves_members_running
+# reentry-6a Task 13: up after closed views, a kill-server, a core loss and a crash; run alone.
+up_restores_closed_views
+up_after_kill_server_makes_a_new_session_with_both_views_and_the_bar
+up_after_a_core_loss_restores_members_and_opens_their_views
+a_crash_after_the_index_then_up_makes_one_team
+the_hold_window_outlives_the_first_view
