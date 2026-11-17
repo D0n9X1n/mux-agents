@@ -260,6 +260,7 @@ impl Os for MacOs {
     fn client_known(&self, row: &Row) -> Option<Option<Client>> {
         parse::unix_client_known(
             row.path.as_deref(),
+            row.image.as_deref(),
             row.argv.as_deref(),
             || self.cwd(row.pid),
             // realpath(3): every link in every component resolved.

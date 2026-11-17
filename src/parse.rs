@@ -299,23 +299,29 @@ pub fn unix_client(
     cwd: impl FnOnce() -> Option<String>,
     realpath: impl FnOnce(&str) -> Option<String>,
 ) -> Option<Client> {
-    unix_client_known(path, argv, cwd, realpath).flatten()
+    unix_client_known(path, None, argv, cwd, realpath).flatten()
 }
 
 /// o3 call 34 N2: `unix_client` with "unknown" (None) told apart from "no client" (Some(None)). Unknown: a `node`
 /// whose named script cannot be resolved (a relative script with the cwd unreadable or not absolute, or a path
-/// realpath cannot resolve). A row with no path or argv is no client here: occupancy judges it unbound by its image.
-/// A `node` running no script (`-e`, an empty name) cannot be the loader.
+/// realpath cannot resolve). A row with no argv is no client here: occupancy judges it unbound by its image.
+/// A `node` running no script (`-e`, an empty name) cannot be the loader. Without a path (macOS proc_pidpath
+/// fails once an upgrade replaced the running executable), `image` stands in: a `node` is read by its script as
+/// above; any other image that may be a client, or none, is unknown; any other image is no client.
 pub fn unix_client_known(
     path: Option<&str>,
+    image: Option<&str>,
     argv: Option<&[String]>,
     cwd: impl FnOnce() -> Option<String>,
     realpath: impl FnOnce(&str) -> Option<String>,
 ) -> Option<Option<Client>> {
-    let Some(path) = path else {
-        return Some(None);
+    let file = match (path, image) {
+        (Some(path), _) => path.rsplit('/').next().unwrap_or(path),
+        (None, Some("node")) => "node",
+        (None, Some(image)) if !["claude", "copilot"].contains(&image) => return Some(None),
+        (None, _) => return None,
     };
-    let file = path.rsplit('/').next().unwrap_or(path);
+    let path = path.unwrap_or_default();
     if path.contains("/claude/versions/") || file == "claude" {
         return Some(Some(Client::Claude));
     }
@@ -971,6 +977,7 @@ mod tests {
             let argv = strings(argv);
             unix_client_known(
                 node,
+                None,
                 Some(&argv),
                 || cwd.map(str::to_string),
                 |_| real.map(str::to_string),
@@ -996,8 +1003,70 @@ mod tests {
             "no script"
         );
         assert_eq!(
-            unix_client_known(Some("/usr/bin/vim"), None, || None, |_| None),
+            unix_client_known(Some("/usr/bin/vim"), None, None, || None, |_| None),
             Some(None)
+        );
+    }
+
+    // A row whose executable path cannot be read (macOS proc_pidpath fails once a Homebrew upgrade replaced the
+    // running `node`) is judged by its image: a `node` by the script its argv names, as with a path; a `claude` or
+    // `copilot` image without a path stays unknown (occupancy holds it as unbound); any other image is no client.
+    #[test]
+    fn unix_client_known_without_a_path_reads_a_node_by_its_script() {
+        let loader = "/l/@github/copilot/npm-loader.js";
+        let mcp = "/n/.bin/playwright-mcp";
+        let known = |image: Option<&str>, argv: Option<&[&str]>, real: Option<&str>| {
+            let argv = argv.map(strings);
+            unix_client_known(
+                None,
+                image,
+                argv.as_deref(),
+                || None,
+                |_| real.map(str::to_string),
+            )
+        };
+        let node = Some("node");
+        assert_eq!(
+            known(
+                node,
+                Some(&["node", mcp]),
+                Some("/n/@playwright/mcp/cli.js")
+            ),
+            Some(None)
+        );
+        assert_eq!(
+            known(node, Some(&["node", loader]), Some(loader)),
+            Some(Some(Client::Copilot))
+        );
+        assert_eq!(
+            known(node, Some(&["node", mcp]), None),
+            None,
+            "realpath fails: unknown"
+        );
+        assert_eq!(
+            known(node, None, None),
+            Some(None),
+            "argv unreadable: occupancy holds it unbound"
+        );
+        assert_eq!(
+            known(Some("claude"), Some(&["claude"]), None),
+            None,
+            "a client image: unknown"
+        );
+        assert_eq!(
+            known(Some("copilot"), Some(&["copilot"]), None),
+            None,
+            "a client image: unknown"
+        );
+        assert_eq!(
+            known(None, Some(&["x"]), None),
+            None,
+            "image unreadable: unknown"
+        );
+        assert_eq!(
+            known(Some("sshd"), Some(&["sshd"]), None),
+            Some(None),
+            "no client"
         );
     }
 

@@ -75,6 +75,34 @@ fn a_readable_client_of_the_kind_holds_every_conversation() {
     assert_eq!(held(&w, A, Client::Copilot), Some((Rule::Argv, Some(7001))));
 }
 
+// A Unix `node` whose executable path cannot be read (a Homebrew upgrade replaced it) and whose script resolves
+// to no client holds nothing; one whose script cannot be resolved (client_known unknown) still holds as unbound.
+#[test]
+fn a_node_whose_executable_is_gone_holds_only_when_its_script_is_unknown() {
+    let mcp = ["node", "/n/.bin/playwright-mcp"];
+    let w = World::human("");
+    w.fakes
+        .process(row(Some(1), None, Some(&mcp), Some("node")));
+    assert_eq!(held(&w, X, Client::Copilot), None, "an unrelated script");
+    let w = World::human("");
+    w.fakes
+        .process(row(Some(1), None, Some(&mcp), Some("node")));
+    w.fakes.client_unknown(7001);
+    assert_eq!(
+        held(&w, X, Client::Copilot),
+        Some((Rule::Unbound, Some(7001))),
+        "script unresolved"
+    );
+    let w = World::human("");
+    w.fakes
+        .process(row(Some(1), None, Some(&["claude"]), Some("claude")));
+    assert_eq!(
+        held(&w, X, Client::Claude),
+        Some((Rule::Unbound, Some(7001))),
+        "a client image still holds"
+    );
+}
+
 /// (case, start, path, argv, image, os, kind, held as unbound)
 type Unbound<'a> = (
     &'a str,

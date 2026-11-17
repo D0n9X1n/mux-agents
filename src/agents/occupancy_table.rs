@@ -21,8 +21,15 @@ pub fn holds(
     if known == Some(Some(kind)) {
         return Some(Hold::of(Rule::Unmanaged, row));
     }
-    let unbound =
-        known.is_none() || row.start.is_none() || row.path.is_none() || row.argv.is_none();
+    // A Unix `node` without a path (its executable was replaced on disk, as a Homebrew upgrade does while it runs)
+    // is judged by its script, which `client_known` resolves from argv as with a path; an unrelated long-running
+    // `node` (an MCP server, a dev server) would otherwise hold every Copilot conversation. Any other row without a
+    // path stays unbound.
+    let resolved_node = os == OsKind::Unix && row.image.as_deref() == Some("node");
+    let unbound = known.is_none()
+        || row.start.is_none()
+        || (row.path.is_none() && !resolved_node)
+        || row.argv.is_none();
     let cleared = row
         .image
         .as_deref()
