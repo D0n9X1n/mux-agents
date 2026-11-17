@@ -219,7 +219,12 @@ fn drive(
                 run.created = true;
                 run.replayed |= !fresh;
             }
-            Step::Reenter => return reenter_arm(ctx, caller, core, team, &mut ix, run, reentered),
+            Step::Reenter => {
+                if !run.launched {
+                    run.reconciled = Some(leaders::reconciled(ctx, caller, &ix, id.as_deref())?);
+                }
+                return reenter_arm(ctx, caller, core, team, &mut ix, run, reentered);
+            }
         }
     }
     Err(Refusal::internal("up did not converge"))
@@ -234,6 +239,8 @@ struct Run {
     launched: bool,
     created: bool,
     replayed: bool,
+    /// restore-6c Task 7: reconcile's pass, run before this arm (call 18).
+    reconciled: Option<Map<String, Value>>,
 }
 
 /// E4 in call 8's order: reconcile (unless this call launched the leader; restore-6c adds leader resume here), the
@@ -249,21 +256,15 @@ fn reenter_arm(
     run: Run,
     reentered: bool,
 ) -> Res<Map<String, Value>> {
-    let a = ix
-        .anchor
-        .clone()
+    ix.anchor
+        .as_ref()
         .ok_or_else(|| Refusal::internal("no anchor"))?;
-    let scope = super::team_state::Scope {
-        key: a.key,
-        session: a.session,
-    };
     let mut reply = Map::new();
     let (mut created, mut replayed, mut team_error) = (run.created, run.replayed, run.team_error);
     let leader = if run.launched {
         run.record.clone()
     } else {
-        let anchor = super::reconcile::anchor_caller(caller, &scope);
-        reply.extend(super::reconcile::run(ctx, &anchor)?);
+        reply.extend(run.reconciled.unwrap_or_default());
         let leader = leader_of(ctx, ix)?.1;
         let leader = leader
             .map(|id| leaders::leader_record(ctx, ix, &id))

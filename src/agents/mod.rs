@@ -58,6 +58,8 @@ mod reconcile_await_tests;
 #[cfg(test)]
 mod reconcile_observe_tests;
 #[cfg(test)]
+mod reconcile_pass_tests;
+#[cfg(test)]
 mod reconcile_restore_tests;
 #[cfg(test)]
 mod reconcile_run_tests;

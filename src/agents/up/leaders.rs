@@ -2,8 +2,10 @@
 use serde_json::Value;
 
 use super::{index, replay};
+use crate::agents::reconcile::{Pass, PassFor, anchor_caller, pass};
 use crate::{
     agents::gens::{self, Member},
+    caller::Caller,
     ctx::Ctx,
     error::{Refusal, Res, refuse},
 };
@@ -85,5 +87,28 @@ pub(crate) fn leader_record(ctx: &Ctx, ix: &index::Index, id: &str) -> Res<Value
     match gens::member_of(&ctx.state_root.join(&a.key).join("agents").join(id)) {
         Member::Life(g) if of_team(g.record(), ix, &a.session, id) => Ok(g.record().clone()),
         _ => refuse(1, "team", UNREADABLE),
+    }
+}
+
+/// restore-6c Task 7 (call 18, ambiguity 10): reconcile's pass at the anchor for `up`, with 6a's validated leader
+/// (call 17), before `reenter_arm` (6a call 8's order). Task 8 gives it the leader step; Task 10 replaces the refusal.
+pub(crate) fn reconciled(
+    ctx: &Ctx,
+    caller: &Caller,
+    ix: &index::Index,
+    leader: Option<&str>,
+) -> Res<serde_json::Map<String, Value>> {
+    let a = ix
+        .anchor
+        .clone()
+        .ok_or_else(|| Refusal::internal("no anchor"))?;
+    let scope = crate::agents::team_state::Scope {
+        key: a.key,
+        session: a.session,
+    };
+    let who = PassFor::Up { leader, step: None };
+    match pass(ctx, &anchor_caller(caller, &scope), who)? {
+        Pass::Done(m) => Ok(m),
+        Pass::Stopped => refuse(1, "stopping", "the team's leader is stopped"),
     }
 }

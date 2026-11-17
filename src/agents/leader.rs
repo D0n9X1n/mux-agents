@@ -16,6 +16,13 @@ use crate::{
     util::{guid, hex_id, utc_o},
 };
 
+/// restore-6c P4.3 (call 17): the leader step `up`'s pass runs for 6a's validated leader, after its adjudication.
+pub(crate) type LeaderStep = fn(
+    &crate::agents::team_state::Tx<'_>,
+    &crate::hc::Lazy<'_>,
+    &str,
+) -> Res<Option<serde_json::Value>>;
+
 pub struct Leader {
     pub team: String,
     /// The client options of the person (options-6e E1), byte for byte; a relaunch replays only these.

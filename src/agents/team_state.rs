@@ -89,16 +89,31 @@ pub struct Tx<'a> {
 
 /// Takes the team lock, runs every replay hook, then f.
 pub fn open<T>(ctx: &Ctx, scope: &Scope, f: impl FnOnce(&Tx<'_>) -> Res<T>) -> Res<T> {
-    super::lock(ctx, &scope.team_lock(), || held(ctx, scope, f))
+    open_except(ctx, scope, false, f)
+}
+
+/// restore-6c Task 7: `open`, with adoption's replay (`HOOKS[0]`) left to `f` when `skip_adopt`, so `up` reports it.
+pub(crate) fn open_except<T>(
+    ctx: &Ctx,
+    scope: &Scope,
+    skip_adopt: bool,
+    f: impl FnOnce(&Tx<'_>) -> Res<T>,
+) -> Res<T> {
+    let from = usize::from(skip_adopt);
+    super::lock(ctx, &scope.team_lock(), || hooked(ctx, scope, from, f))
 }
 
 /// open for a caller that already holds the team lock (launch_hc_locked, resume).
 pub fn held<T>(ctx: &Ctx, scope: &Scope, f: impl FnOnce(&Tx<'_>) -> Res<T>) -> Res<T> {
+    hooked(ctx, scope, 0, f)
+}
+
+fn hooked<T>(ctx: &Ctx, scope: &Scope, from: usize, f: impl FnOnce(&Tx<'_>) -> Res<T>) -> Res<T> {
     let tx = Tx {
         ctx,
         scope: scope.clone(),
     };
-    for hook in HOOKS {
+    for hook in &HOOKS[from..] {
         hook(&tx)?;
     }
     #[cfg(test)]
