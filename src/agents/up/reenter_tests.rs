@@ -1172,7 +1172,10 @@ fn a_pending_on_another_server_is_published_or_released_never_killed() {
         };
         // Checklist #41 (N10): the originating `up` on that server published its binding.
         let bound = w.ctx.state_root.join(&s.key);
-        std::fs::create_dir_all(&bound).unwrap();
+        // Integration #150 CI: made private as the product makes it, the state root first; a folder left at the umask
+        // (755) or with an inherited shared ACL is refused `state` before the step under test.
+        w.state();
+        crate::agents::spawn::private_folder(&w.ctx, &bound).unwrap();
         crate::state::evidence::publish(
             &bound.join("server.json"),
             &json!({"socket": other, "serverPid": 5252, "serverStart": 7}),
@@ -1267,7 +1270,10 @@ fn torn_index_prelife_leader_and_team_record_repair() {
     let key = w.caller().server_key;
     let t = ut::team_of(&w);
     let at = crate::agents::up::index::path(&w.ctx, &t);
-    std::fs::create_dir_all(at.parent().unwrap()).unwrap();
+    // Integration #150 CI: made private as the product makes it, the state root first; a folder left at the umask (755)
+    // or with an inherited shared ACL is refused `state` before the step under test.
+    w.state();
+    crate::agents::spawn::private_folder(&w.ctx, at.parent().unwrap()).unwrap();
     std::fs::write(&at, b"{").unwrap();
     let (code, r) = cli(&w, &["up", "-Client", "claude"]);
     let named = format!(
@@ -1286,7 +1292,7 @@ fn torn_index_prelife_leader_and_team_record_repair() {
         .join(&key)
         .join("agents")
         .join("999999999999");
-    std::fs::create_dir_all(&pre).unwrap();
+    crate::agents::spawn::private_folder(&w.ctx, &pre).unwrap();
     crate::state::fs::write_json(
         &pre.join("record.json"),
         &json!({"id": "999999999999", "name": "leader", "upTeam": t, "session": "$1", "hcAddress": "t9"}),
