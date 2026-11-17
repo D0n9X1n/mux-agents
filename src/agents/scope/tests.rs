@@ -497,8 +497,30 @@ fn a_childs_notice_reaches_its_off_anchor_parent_box() {
         crate::agents::mail::parent_box(&rec).unwrap(),
         format!("pane-{}-1", me.key)
     );
-    // shortcut: adopt-3e's `notice_route` is not on origin/v0.3-life yet; when it lands, assert
-    // `crate::agents::adopt::notice_route_fallback(&rec)` == `pane-<key>-1` here ("adopt-3e fallback", row 4.6, R11).
+    // Row 4.6, R11: adopt-3e's no-parent fallback (`notice_route`'s and the pre-lifecycle registry path's).
+    assert_eq!(
+        crate::agents::adopt::pane_key(&rec).unwrap(),
+        Some(format!("pane-{}-1", me.key)),
+        "adopt-3e fallback"
+    );
+    // R11: a recorded qualified route reads back on retry (never refused as unreadable evidence).
+    let folder = w
+        .ctx
+        .state_root
+        .join(K1)
+        .join("agents")
+        .join("aaaaaaaaaaa1");
+    std::fs::create_dir_all(&folder).unwrap();
+    let qualified = format!("pane-{}-1", me.key);
+    crate::agents::gens::publish_once(&folder, 1, "route", &json!({ "mailbox": qualified }))
+        .unwrap();
+    let routed =
+        crate::agents::adopt::notice_route(&w.ctx, &anchored(&w), &folder, "aaaaaaaaaaa1", &rec, 1);
+    assert_eq!(
+        routed.map_err(|e| e.check),
+        Ok(Some(qualified)),
+        "a recorded qualified route"
+    );
     // Call 32 (finding F11): the board's parent mailbox, its `parent_key` fallback and its notice box, honour it.
     assert_eq!(
         crate::agents::board::parent_mailbox(&rec),
