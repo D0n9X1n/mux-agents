@@ -28,7 +28,7 @@ pub enum Scope {
 }
 pub fn scope(ctx: &Ctx, caller: &Caller) -> Res<Scope> {
     let server = server_dir(ctx, caller);
-    if let Some(found) = team::read(&team::path(&server, &caller.session))? {
+    if let Some(found) = team::read(&team::path(&server, &super::scope::state(caller).session))? {
         return Ok(Scope::Team(found));
     }
     // R1, R5: one `members` pass; an unreadable member under the caller's server key refuses (ambiguity 15).
@@ -40,7 +40,7 @@ pub fn scope(ctx: &Ctx, caller: &Caller) -> Res<Scope> {
             super::gens::Member::Life(g) => g.record(),
         };
         if is_leader(record)
-            && text(record.get("session")) == caller.session
+            && text(record.get("session")) == super::scope::state(caller).session
             && !super::up::discover::ran_nothing(&folder, &member)?
         {
             return Ok(Scope::Leaderless);
@@ -327,7 +327,8 @@ pub fn standing(ctx: &Ctx, caller: &Caller, core: Option<&Core<'_>>) -> Res<Stan
         let team = super::membership::team(caller);
         use super::gens::Member;
         let folder = super::server_dir(ctx, caller).join("agents").join(id);
-        let rel = [caller.server_key.as_str(), "agents", id, "record.json"];
+        let state = super::scope::state(caller);
+        let rel = [state.key.as_str(), "agents", id, "record.json"];
         let member = crate::caller::hc::within_root(&ctx.state_root, &rel)
             .map(|_| super::gens::member_of(&folder));
         // What dispatch proved, proved again under the lock: the launch still committed (not aborted) and its terminal
@@ -343,7 +344,7 @@ pub fn standing(ctx: &Ctx, caller: &Caller, core: Option<&Core<'_>>) -> Res<Stan
                 true,
             ),
             Some(Member::Pre(r)) => {
-                let rel = [caller.server_key.as_str(), "agents", id, "commit.json"];
+                let rel = [state.key.as_str(), "agents", id, "commit.json"];
                 let committed = crate::caller::hc::within_root(&ctx.state_root, &rel)
                     .and_then(|p| crate::state::fs::read_json(&p).ok().flatten())
                     .is_some_and(|c| c.get("aborted") != Some(&Value::Bool(true)));
@@ -520,7 +521,10 @@ pub fn place(
     let flags = child_flags(client, a.level, a.team.policy, effort)?;
     let name = name()?;
     if a.member {
-        let file = super::budget::path(&server_dir(ctx, caller), &caller.session);
+        let file = super::budget::path(
+            &server_dir(ctx, caller),
+            &super::scope::state(caller).session,
+        );
         super::budget::check(
             &file,
             &super::budget::rate(ctx, caller),
@@ -574,11 +578,9 @@ pub fn with_standing<T>(
             f(None)
         };
     }
-    super::lock(
-        ctx,
-        &super::lock_key("spawn", caller, &caller.session),
-        || f(Some(&standing(ctx, caller, None)?)),
-    )
+    super::lock(ctx, &super::team_lock(caller), || {
+        f(Some(&standing(ctx, caller, None)?))
+    })
 }
 /// `authorize` over the session's tree (call 10), read under the team lock the caller holds.
 pub fn authority(
@@ -652,8 +654,13 @@ pub fn parent_level(
     let parent_record = records.get(&p).ok_or_else(broken)?;
     let client =
         super::spawn::client_named(&text(parent_record.get("client"))).ok_or_else(broken)?;
-    let flags = super::resume::member_flags(&ctx.state_root, &caller.server_key, &p, parent_record)
-        .map_err(|_| broken())?;
+    let flags = super::resume::member_flags(
+        &ctx.state_root,
+        &super::scope::state(caller).key,
+        &p,
+        parent_record,
+    )
+    .map_err(|_| broken())?;
     Ok(team::policy(client, &flags))
 }
 #[cfg(test)]

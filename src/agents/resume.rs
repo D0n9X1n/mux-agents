@@ -36,7 +36,7 @@ pub fn resume(ctx: &Ctx, request: &Request) -> Res<Map<String, Value>> {
         registry::untagged(ctx, &caller, "an agent pane cannot resume agents")?;
     } else {
         // A leaderless team refuses before any hc call.
-        lock(ctx, &lock_key("spawn", &caller, &caller.session), || {
+        lock(ctx, &super::team_lock(&caller), || {
             super::tree::team_of(ctx, &caller)
         })?;
     }
@@ -47,7 +47,7 @@ pub fn resume(ctx: &Ctx, request: &Request) -> Res<Map<String, Value>> {
         _ => None,
     };
     let core = crate::hc::connect(ctx)?;
-    let (from, record) = lock(ctx, &lock_key("spawn", &caller, &caller.session), || {
+    let (from, record) = lock(ctx, &super::team_lock(&caller), || {
         // adopt-3e call 13: every input of this decision (standing, snapshot, records) is read after replay.
         super::adopt::replay_held(ctx, &caller)?;
         let gate = match super::tree::team_of(ctx, &caller)? {
@@ -225,7 +225,12 @@ fn admit(
     }
     let client = client_named(&text(record.get("client")))
         .ok_or_else(|| Refusal::internal("the ended member names no known client"))?;
-    let flags = member_flags(&ctx.state_root, &caller.server_key, id, &record)?;
+    let flags = member_flags(
+        &ctx.state_root,
+        &super::scope::state(caller).key,
+        id,
+        &record,
+    )?;
     // E2: a lifecycle member replays only its stored options, within the team ceiling, before any other gate.
     let flags = if super::gens::lifecycle(&record) {
         super::options::replay(client, &flags, ceiling(gate.map(|(team, _)| team)))?
@@ -249,7 +254,10 @@ fn admit(
             super::tree::bound(super::team::policy(client, &flags), level, team.policy)?;
             name_check()?;
             if matches!(s, super::tree::Standing::Member(_)) {
-                let file = super::budget::path(&server_dir(ctx, caller), &caller.session);
+                let file = super::budget::path(
+                    &server_dir(ctx, caller),
+                    &super::scope::state(caller).session,
+                );
                 super::budget::check(
                     &file,
                     &super::budget::rate(ctx, caller),

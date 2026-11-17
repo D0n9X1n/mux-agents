@@ -32,7 +32,7 @@ pub struct Local {
 }
 
 pub fn team(caller: &Caller) -> String {
-    format!("{}:{}", caller.server_key, caller.session)
+    super::scope::team(caller)
 }
 
 pub fn locals(ctx: &Ctx, caller: &Caller) -> Res<Vec<Local>> {
@@ -99,7 +99,7 @@ fn scan(ctx: &Ctx, caller: &Caller) -> Res<Scan> {
         if record
             .get("session")
             .and_then(Value::as_str)
-            .is_some_and(|s| s != caller.session)
+            .is_some_and(|s| s != super::scope::state(caller).session)
         {
             continue;
         }
@@ -391,7 +391,7 @@ impl Snapshot {
             }
             [] if caller.agent_tag.is_empty() => Ok(registry::Me {
                 name: "root".into(),
-                key: super::mail::mailbox_key(&caller.pane, "")?,
+                key: super::mail::person_box(caller)?,
                 record: None,
             }),
             [] => crate::error::refuse(2, "parent", "this agent pane has no record"),

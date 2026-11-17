@@ -24,6 +24,24 @@ pub struct Leader {
     pub prompt: Vec<String>,
 }
 
+/// Re6a call 24: the real `prepare` with a test slot and leader, returning the record it would create.
+#[cfg(test)]
+pub fn prepare_for_test(ctx: &Ctx, caller: &Caller) -> serde_json::Value {
+    let slot = CoreSlot {
+        name: "lead".into(),
+        color: "blue",
+        placed: None,
+        debit: false,
+    };
+    let leader = Leader {
+        team: "1111111111111111".into(),
+        options: vec![],
+        prompt: vec![],
+    };
+    let launch = prepare(ctx, caller, Client::Claude, &ctx.cwd, slot, &leader).unwrap();
+    launch.create.unwrap()
+}
+
 pub fn prepare(
     ctx: &Ctx,
     caller: &Caller,
@@ -33,10 +51,13 @@ pub fn prepare(
     leader: &Leader,
 ) -> Res<Launch> {
     let state = super::state_dir(ctx, caller)?;
-    write_json(
-        &state.join("server.json"),
-        &json!({"socket":caller.socket,"serverPid":caller.server_pid,"serverStart":caller.server_start}),
-    )?;
+    // Re6a call 12: only a launch on the anchor's own server binds the anchor's `server.json`.
+    if super::scope::on_anchor(caller) {
+        write_json(
+            &state.join("server.json"),
+            &json!({"socket":caller.socket,"serverPid":caller.server_pid,"serverStart":caller.server_start}),
+        )?;
+    }
     let (id, session) = (hex_id()?, guid()?);
     // The member folder and every folder above it are on disk before forward creates the record (#103).
     private_folder(ctx, &state.join("agents").join(&id))?;
@@ -48,7 +69,7 @@ pub fn prepare(
         "flags": leader.options, "parentPane": null, "args": args});
     let record = json!({"schema": 1, "name": slot.name, "color": slot.color,
         "client": client_name(client), "context": "brief", "reason": "leader",
-        "session": caller.session, "parentPane": null, "parentAgent": null, "depth": 0, "upTeam": leader.team,
+        "session": super::scope::state(caller).session, "parentPane": null, "parentAgent": null, "depth": 0, "upTeam": leader.team,
         "options": leader.options, "prompt": leader.prompt,
         "directory": utf8(directory)?, "taskLine": "", "createdAt": utc_o(ctx.clock.now())});
     Ok(Launch {

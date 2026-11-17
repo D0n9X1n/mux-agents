@@ -63,7 +63,7 @@ pub(crate) fn refuse_resume(ctx: &crate::ctx::Ctx, caller: &Caller, target: &str
             Member::Absent | Member::Unreadable(_) => continue,
         };
         let other = record.get("session").and_then(Value::as_str);
-        if other.is_some_and(|s| s != caller.session) {
+        if other.is_some_and(|s| s != super::scope::state(caller).session) {
             continue;
         }
         mine.push((id, record, life));

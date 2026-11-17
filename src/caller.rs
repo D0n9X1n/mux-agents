@@ -45,6 +45,16 @@ pub struct Caller {
     /// The caller's view, `(pane, window)`: a pane caller's own; a proven member's only while its active
     /// generation's view is presented and its multiplexer server is live (proof-0b K2). None: views are down.
     pub presentation: Option<(String, String)>,
+    /// reentry-6a E0: the team anchor this caller's state lives at (set by `scope::admit` for a person in a team's
+    /// proven view, by `scope::present` for a member). `None` keeps the caller's own server key and session.
+    pub anchor: Option<Anchor>,
+}
+
+/// reentry-6a E0: a team's anchor, the server key and session its state stays at.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Anchor {
+    pub key: String,
+    pub session: String,
 }
 
 const PROBE: &str = "#{pid}|#{pane_pid}|#{session_id}|#{window_id}|#{@agent-id}";
@@ -132,9 +142,21 @@ pub fn resolve_tree(ctx: &Ctx) -> Res<Caller> {
     resolve_as(ctx, true)
 }
 
+/// reentry-6a E2: `up` needs only person proof, never the index.
+pub fn resolve_person(ctx: &Ctx) -> Res<Caller> {
+    unadmitted(ctx, false)
+}
+
+/// Every resolution but `up`'s admits a person through the team indexes (reentry-6a E2).
+fn resolve_as(ctx: &Ctx, tree: bool) -> Res<Caller> {
+    let mut c = unadmitted(ctx, tree)?;
+    crate::agents::scope::admit(ctx, &mut c)?;
+    Ok(c)
+}
+
 /// `tree`: a candidate is returned for the tree verbs to prove again under the team lock; otherwise it refuses 2
 /// `tagged` before any multiplexer is made or called.
-fn resolve_as(ctx: &Ctx, tree: bool) -> Res<Caller> {
+fn unadmitted(ctx: &Ctx, tree: bool) -> Res<Caller> {
     if hc::applies(ctx) {
         let c = hc::resolve(ctx)?;
         if c.candidate.is_some() && !tree {
@@ -241,6 +263,7 @@ fn resolve_as(ctx: &Ctx, tree: bool) -> Res<Caller> {
         member: None,
         candidate: None,
         presentation: Some((pane.to_string(), probe.window.to_string())),
+        anchor: None,
     })
 }
 

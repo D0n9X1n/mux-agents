@@ -4,8 +4,8 @@ use std::collections::{BTreeMap, HashMap};
 
 use serde_json::{Map, Value};
 
-use super::mail::{doing_line, mailbox_key, unread_counts};
-use super::registry::{self, Pane};
+use super::mail::{doing_line, unread_counts};
+use super::registry;
 use crate::caller::Caller;
 use crate::ctx::Ctx;
 use crate::error::Res;
@@ -91,7 +91,7 @@ pub fn board(ctx: &Ctx, caller: &Caller, all: bool, watch: bool) -> Res<Map<Stri
             let stored = &snapshot.records[&o.identity.id];
             let got = super::gens::needs_recovery(
                 ctx,
-                &caller.server_key,
+                &super::scope::state(caller).key,
                 &o.identity.id,
                 &stored.record,
                 stored.active_done,
@@ -142,7 +142,8 @@ pub fn board(ctx: &Ctx, caller: &Caller, all: bool, watch: bool) -> Res<Map<Stri
         .filter(|p| p.pane == caller.pane)
         .map(|p| p.id.clone())
         .collect();
-    let reader = reader_key(caller.member.as_deref(), &mine, &caller.pane)?;
+    let away = super::mail::elsewhere(caller);
+    let reader = reader_key(caller.member.as_deref(), &mine, &caller.pane, away)?;
     // A member reads the mailbox its record names (inherited by a resume), else its id.
     let reader = match snapshot.records.get(&reader) {
         Some(stored) => super::mail::member_mailbox(&reader, &stored.record),
@@ -187,9 +188,13 @@ pub fn board(ctx: &Ctx, caller: &Caller, all: bool, watch: bool) -> Res<Map<Stri
                     let stored = snapshot.records.get(&parent)?;
                     Some(super::mail::member_mailbox(&parent, &stored.record))
                 });
-                let notices = mailbox_key(&super::text(record.get("parentPane")), "").ok();
+                let notices = parent_mailbox(record);
                 let mut boxes: Vec<String> = own
-                    .chain([parent_key(record, &panes), notices].into_iter().flatten())
+                    .chain(
+                        [parent_key(record, &panes, away), notices]
+                            .into_iter()
+                            .flatten(),
+                    )
                     .collect();
                 boxes.sort();
                 boxes.dedup();
@@ -205,7 +210,7 @@ pub fn board(ctx: &Ctx, caller: &Caller, all: bool, watch: bool) -> Res<Map<Stri
             .filter(|o| o.life == Life::Running || leader.is_some())
             .flat_map(|o| match parents.get(&o.identity.id) {
                 Some(boxes) => boxes.clone(),
-                None => parent_key(&snapshot.records[&o.identity.id].record, &panes)
+                None => parent_key(&snapshot.records[&o.identity.id].record, &panes, away)
                     .into_iter()
                     .collect(),
             })
@@ -472,16 +477,6 @@ fn note_blocked(reply: &mut Map<String, Value>, blocked: &[Blocked]) {
 /// Ended agents a board (`list -All`) shows, newest first.
 pub(crate) const ENDED_MAX: usize = 10;
 
-/// The mailbox of an agent's parent pane: the running agent's id there, else `pane-<n>` (as `send parent`
-/// delivers); none for a malformed pane. Never a tag.
-fn parent_key(record: &Value, running: &[Pane]) -> Option<String> {
-    let parent = super::text(record.get("parentPane"));
-    match running.iter().find(|p| p.pane == parent) {
-        Some(p) => Some(super::mail::member_mailbox(&p.id, &p.record)),
-        None => mailbox_key(&parent, "").ok(),
-    }
-}
-
 /// Records the viewed done spell `changed` under the agent lock, never moving seen.json backward.
 /// Requires a unique committed attachment on `pane`; historical notices do not invalidate view proof.
 pub fn mark_seen(ctx: &Ctx, caller: &Caller, pane: &str, changed: &str) -> Res<bool> {
@@ -523,11 +518,16 @@ fn rank(row: &Map<String, Value>) -> u8 {
 /// id, always: whichever pane shows it, and even when a later hc look cannot show it running, it is never matched by
 /// pane, so it can never count another member's mail (#104 phase 1c). Any other caller: the one running agent on its
 /// pane, else the pane's own mailbox.
-pub(crate) fn reader_key(member: Option<&str>, on_pane: &[String], pane: &str) -> Res<String> {
+pub(crate) fn reader_key(
+    member: Option<&str>,
+    on_pane: &[String],
+    pane: &str,
+    elsewhere: Option<&str>,
+) -> Res<String> {
     match (member, on_pane) {
         (Some(id), _) => Ok(id.to_string()),
         (None, [id]) => Ok(id.clone()),
-        _ => mailbox_key(pane, ""),
+        _ => super::mail::pane_box(pane, elsewhere),
     }
 }
 
@@ -538,7 +538,10 @@ fn team_leader(
     caller: &Caller,
     snapshot: &super::membership::Snapshot,
 ) -> Option<String> {
-    let file = super::team::path(&super::server_dir(ctx, caller), &caller.session);
+    let file = super::team::path(
+        &super::server_dir(ctx, caller),
+        &super::scope::state(caller).session,
+    );
     if let Ok(Some(team)) = super::team::read(&file) {
         return Some(team.leader);
     }
@@ -556,6 +559,7 @@ fn team_leader(
 #[path = "board_rows.rs"]
 mod rows;
 pub use rows::hc_row;
+pub(crate) use rows::parent_mailbox;
 use rows::*;
 
 #[cfg(test)]

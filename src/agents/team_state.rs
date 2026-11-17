@@ -18,11 +18,9 @@ pub struct Scope {
 }
 
 impl Scope {
+    /// The caller's state scope (reentry-6a E0): `scope::state`.
     pub fn of(caller: &Caller) -> Scope {
-        Scope {
-            key: caller.server_key.clone(),
-            session: caller.session.clone(),
-        }
+        super::scope::state(caller)
     }
     pub fn agents(&self, root: &Path) -> PathBuf {
         root.join(&self.key).join("agents")

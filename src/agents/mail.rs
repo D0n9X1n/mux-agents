@@ -18,10 +18,42 @@ pub fn mailbox_key(pane: &str, tag: &str) -> Res<String> {
     if super::agent_id(tag) {
         return Ok(tag.to_string());
     }
+    pane_box(pane, None)
+}
+
+/// views-6f V3 (moved to reentry-6a, v6f call 1): a person's pane mailbox. On the anchor's server (`None`)
+/// `pane-<n>`; elsewhere `pane-<serverKey>-<n>`. A key is 1-64 lowercase letters or digits, else 2 `target`.
+pub fn pane_box(pane: &str, elsewhere: Option<&str>) -> Res<String> {
     if !super::pane_id(pane) {
         return refuse(2, "target", "not a pane");
     }
-    Ok(format!("pane-{}", &pane[1..]))
+    match elsewhere {
+        None => Ok(format!("pane-{}", &pane[1..])),
+        Some(k)
+            if !k.is_empty()
+                && k.len() <= 64
+                && k.bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit()) =>
+        {
+            Ok(format!("pane-{k}-{}", &pane[1..]))
+        }
+        Some(_) => refuse(2, "target", "not a server key"),
+    }
+}
+/// The caller's server key when it is not the state key (a person re-attached off the anchor's server).
+pub fn elsewhere(c: &Caller) -> Option<&str> {
+    (c.server_key != super::scope::state(c).key).then_some(c.server_key.as_str())
+}
+/// The caller's own pane mailbox, its server named off the anchor.
+pub fn person_box(c: &Caller) -> Res<String> {
+    pane_box(&c.pane, elsewhere(c))
+}
+/// A member's parent pane mailbox; `parentServerKey` (recorded off the anchor) names its server.
+pub fn parent_box(record: &Value) -> Res<String> {
+    pane_box(
+        &super::text(record.get("parentPane")),
+        record.get("parentServerKey").and_then(Value::as_str),
+    )
 }
 
 /// A member's mailbox: the one its record's `mailbox` names (a resumed member keeps the mailbox it inherited),
@@ -1815,5 +1847,31 @@ mod tests {
         let c1: String = (0x80u8..=0x9f).map(char::from).collect();
         assert_eq!(doing_line(&format!("a{c1}b")), "ab");
         assert_eq!(doing_line(" \t\r\n\u{9b}\n"), "");
+    }
+
+    // V3: `%4` on the anchor's server is `pane-4`; elsewhere `pane-<key>-4`; bad keys and non-panes `2 target`.
+    #[test]
+    fn a_pane_mailbox_names_its_server_off_the_anchor() {
+        let k2 = "0123456789abcdef";
+        assert_eq!(pane_box("%4", None).unwrap(), "pane-4");
+        assert_eq!(pane_box("%4", Some(k2)).unwrap(), format!("pane-{k2}-4"));
+        let long = "a".repeat(65);
+        for bad in ["", "K2", "a/b", "a-b", long.as_str()] {
+            assert_eq!(
+                pane_box("%4", Some(bad)).map_err(|e| (e.code, e.check)),
+                Err((2, "target")),
+                "{bad:?}"
+            );
+        }
+        assert_eq!(
+            pane_box("4", None).map_err(|e| e.check),
+            Err("target"),
+            "not a pane"
+        );
+        assert_eq!(
+            mailbox_key("%4", "").unwrap(),
+            "pane-4",
+            "today's callers: the anchor's form"
+        );
     }
 }

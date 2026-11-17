@@ -72,6 +72,7 @@ mod reconcile_verb_tests;
 pub mod registry;
 pub mod release;
 pub mod resume;
+pub mod scope;
 pub mod session_report;
 #[cfg(test)]
 mod session_report_tests;
@@ -110,7 +111,7 @@ pub(crate) fn member_committed(folder: &Path, member: &gens::Member) -> Res<bool
 }
 
 pub(crate) fn server_dir(ctx: &Ctx, caller: &Caller) -> PathBuf {
-    ctx.state_root.join(&caller.server_key)
+    ctx.state_root.join(scope::state(caller).key)
 }
 
 /// `<root>/<serverKey>` with its `agents` and `mail` folders, each made or checked private (MuxAgents.ps1:478-485).
@@ -180,8 +181,16 @@ pub(crate) fn usage(verb: &str) -> Refusal {
 pub(crate) const FILES_ONLY: &str = "agents pass free text only in files: use -BodyFile";
 
 /// `<kind>|<serverKey>|<key>`.
+/// The team lock of the caller's state scope (state-0 S1; reentry-6a E0: an anchored caller's is its anchor's).
+pub(crate) fn team_lock(caller: &Caller) -> String {
+    team_state::Scope::of(caller).team_lock()
+}
+
+/// A lock of the caller's state scope (re6a call 43: `scope::state`, so an anchored caller locks at its anchor; the
+/// bar's lock is `scope::shown_lock`).
 pub(crate) fn lock_key(kind: &str, caller: &Caller, key: &str) -> String {
-    format!("{kind}|{}|{key}", caller.server_key)
+    let scope = scope::state(caller);
+    format!("{kind}|{}|{key}", scope.key)
 }
 
 /// `^[0-9a-f]{12}$`: an agent id, safe as a folder or mailbox name.

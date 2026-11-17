@@ -385,7 +385,8 @@ impl Snapshot {
 /// A record naming its folder's id and the caller's session.
 fn own(record: &Value, id: &str, caller: &Caller) -> bool {
     record.get("id").and_then(Value::as_str) == Some(id)
-        && record.get("session").and_then(Value::as_str) == Some(caller.session.as_str())
+        && record.get("session").and_then(Value::as_str)
+            == Some(super::scope::state(caller).session.as_str())
 }
 
 /// R1, R2, R4: one `presented`, one `status`, one notice read of the active generation. Any Unreadable skips the
@@ -562,17 +563,17 @@ pub fn self_of(caller: &Caller, snapshot: &Snapshot) -> Res<Me> {
         }
         Own::None => Ok(Me {
             name: "root".into(),
-            key: mail::mailbox_key(&caller.pane, "")?,
+            key: mail::person_box(caller)?,
             record: None,
         }),
     }
 }
 
 /// The mailbox of `pane`: the running agent's there (its id, or the one it inherited), else `pane-<n>`.
-pub fn mailbox_of(snapshot: &Snapshot, pane: &str) -> Res<String> {
+pub fn mailbox_of(snapshot: &Snapshot, pane: &str, elsewhere: Option<&str>) -> Res<String> {
     match snapshot.at(pane) {
         Some(agent) => Ok(mail::member_mailbox(&agent.id, &agent.record)),
-        None => mail::mailbox_key(pane, ""),
+        None => mail::pane_box(pane, elsewhere),
     }
 }
 
@@ -633,7 +634,7 @@ pub(crate) fn stop_notice(
     let name = super::text(record.get("name"));
     let parent = super::text(record.get("parentPane"));
     if !parent.is_empty() {
-        let key = mail::mailbox_key(&parent, "")?;
+        let key = mail::parent_box(record)?;
         let mut fields = Map::new();
         fields.insert("kind".into(), "stopped".into());
         fields.insert("exitCode".into(), Value::Null);
@@ -949,12 +950,7 @@ pub fn reap(
         acted |= if spawn_lock_held {
             close()?
         } else {
-            super::try_lock(
-                ctx,
-                &super::lock_key("spawn", caller, &caller.session),
-                close,
-            )?
-            .unwrap_or(false)
+            super::try_lock(ctx, &super::team_lock(caller), close)?.unwrap_or(false)
         };
     }
     Ok(acted)
@@ -1539,7 +1535,7 @@ mod tests {
                 "2 parent this pane's agent cannot be proven to run here"
             );
             assert_eq!(refusal(untagged(&w.ctx, &caller, "no")), "2 tagged no");
-            assert_eq!(mailbox_of(&s, "%1").unwrap(), "pane-1");
+            assert_eq!(mailbox_of(&s, "%1", None).unwrap(), "pane-1");
         }
     }
 

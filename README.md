@@ -64,7 +64,6 @@ claude --dangerously-skip-permissions  # or: copilot --allow-all
 ```
 
 Upgrade with one line:
-
 ```sh
 claude plugin marketplace update mux-agents && claude plugin update mux-agents@mux-agents
 copilot plugin marketplace update mux-agents && copilot plugin update mux-agents@mux-agents

@@ -374,6 +374,333 @@ fn process_spawn_only_in_spawn_rs() {
     assert_eq!(found, [ALLOWED]);
 }
 
+/// reentry-6a 6a-R1 (re6a calls 10, 30): a read of `.server_key` on anything, or of `.session` on a caller, is
+/// allowed only inside a listed (file, enclosing fn, reason). The scan is over masked tokens, so `cargo fmt` cannot
+/// break it. A later task adds its rows in the commit that adds the read.
+const SCOPE_READS_ALLOWED: &[(&str, &str, &str)] = &[
+    (
+        "src/agents/scope.rs",
+        "state",
+        "the anchor pair, else the own pair",
+    ),
+    ("src/agents/scope.rs", "shown", "the presentation pair"),
+    (
+        "src/agents/scope.rs",
+        "admit",
+        "admission compares the caller's own server",
+    ),
+    (
+        "src/agents/mail.rs",
+        "elsewhere",
+        "V3: the shown key off the anchor",
+    ),
+    (
+        "src/agents/up/index.rs",
+        "server_of",
+        "the caller's own server tuple",
+    ),
+    (
+        "src/agents/attachment.rs",
+        "attach",
+        "the view opens in the caller's session",
+    ),
+    (
+        "src/agents/budget.rs",
+        "rate",
+        "a session option of the shown session",
+    ),
+    (
+        "src/agents/placement.rs",
+        "read_placement",
+        "a session option of the shown session",
+    ),
+    (
+        "src/agents/placement.rs",
+        "choose",
+        "the shown session's windows",
+    ),
+    (
+        "src/agents/message.rs",
+        "live_pane",
+        "proves a pane of the shown session",
+    ),
+    (
+        "src/agents/message.rs",
+        "notify_as",
+        "displays in the shown session",
+    ),
+    (
+        "src/agents/registry.rs",
+        "rows",
+        "lists the shown session's panes",
+    ),
+    (
+        "src/agents/team_mail.rs",
+        "notices",
+        "displays in the shown session",
+    ),
+    (
+        "src/agents/up/publish.rs",
+        "ensure",
+        "reuse only a view on the caller's own server",
+    ),
+    (
+        "src/agents/up/publish.rs",
+        "start",
+        "a lost reply publishes only on the caller's own server",
+    ),
+    (
+        "src/agents/up/publish.rs",
+        "sessions_on",
+        "the caller's own server is listed natively",
+    ),
+    (
+        "src/agents/up/publish.rs",
+        "answered",
+        "the caller's own server is proven by server::same",
+    ),
+    (
+        "src/agents/up/mod.rs",
+        "bind_anchor_server",
+        "call 33: the anchor is bound only from its own server",
+    ),
+    ("src/agents/up/server.rs", "same", "proves the shown server"),
+    (
+        "src/agents/core_identity.rs",
+        "of",
+        "views-6f: a view is keyed by the server and session showing it",
+    ),
+    (
+        "src/agents/view.rs",
+        "descriptor",
+        "views-6f: the descriptor names the showing server and session",
+    ),
+    ("src/sidebar.rs", "sidebar", "the bar of the shown session"),
+    ("src/sidebar.rs", "ensure", "the bar of the shown session"),
+    (
+        "src/sidebar.rs",
+        "shown_pane",
+        "the bar of the shown session",
+    ),
+    ("src/sidebar.rs", "alert", "the bar of the shown session"),
+    (
+        "src/sidebar.rs",
+        "send_alert",
+        "the bar of the shown session",
+    ),
+];
+
+/// Names that hold a caller by convention, seen even when bound without a type (`let caller = resolve(ctx)?;`).
+const SCOPE_CALLER_NAMES: &[&str] = &["caller", "dest", "person", "me"];
+
+/// Masked code as tokens: identifiers whole, every other character alone, whitespace dropped (call 30).
+fn tokens(code: &str) -> Vec<&str> {
+    let word = |c: u8| c.is_ascii_alphanumeric() || c == b'_';
+    let (b, mut out, mut i) = (code.as_bytes(), Vec::new(), 0);
+    while i < b.len() {
+        let n = if word(b[i]) {
+            b[i..].iter().take_while(|&&c| word(c)).count()
+        } else {
+            code[i..].chars().next().map_or(1, char::len_utf8)
+        };
+        if !b[i].is_ascii_whitespace() {
+            out.push(&code[i..i + n]);
+        }
+        i += n;
+    }
+    out
+}
+
+/// The binding typed `Caller` that ends at token `k` (`name: &'a mut crate::caller::Caller`), if any.
+fn caller_binding<'a>(t: &[&'a str], k: usize) -> Option<&'a str> {
+    let word = |s: &str| s.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'_');
+    let mut j = k;
+    loop {
+        if j >= 3 && t[j - 1] == ":" && t[j - 2] == ":" {
+            j -= 3;
+        } else if j >= 1 && matches!(t[j - 1], "&" | "mut") {
+            j -= 1;
+        } else if j >= 2 && t[j - 2] == "'" {
+            j -= 2;
+        } else {
+            break;
+        }
+    }
+    let path = j >= 3 && t[j - 3] == ":";
+    (j >= 2 && t[j - 1] == ":" && word(t[j - 2]) && !path).then(|| t[j - 2])
+}
+
+/// Each (enclosing fn, read) of `src` outside `#[cfg(test)]` items, comments and strings. `.server_key` is a read
+/// on any receiver; `.session` only on a name bound as a `Caller` in the enclosing fn (a parameter, `let` or
+/// closure parameter), in a struct field outside any fn, or named as in `SCOPE_CALLER_NAMES`. A nested fn has its own names and the outer fn's are
+/// back after it ends (checklist R4, R5). It does not see a `Caller` bound without a type (`let a = f();`).
+fn scope_reads(src: &str) -> Vec<(String, String)> {
+    let code = without_tests(src);
+    let t = tokens(&code);
+    // Each open fn body: (name, brace depth of its body, its caller names).
+    let mut open: Vec<(String, i32, Vec<String>)> = Vec::new();
+    let mut pending: Option<(String, Vec<String>)> = None;
+    let mut file_names: Vec<String> = Vec::new();
+    let (mut depth, mut nest, mut out) = (0i32, 0i32, Vec::new());
+    for k in 0..t.len() {
+        match t[k] {
+            "fn" => {
+                if let Some(name) = t.get(k + 1) {
+                    pending = Some((name.to_string(), Vec::new()));
+                }
+            }
+            "(" | "[" => nest += 1,
+            ")" | "]" => nest -= 1,
+            "{" => {
+                depth += 1;
+                if nest == 0
+                    && let Some((name, names)) = pending.take()
+                {
+                    open.push((name, depth, names));
+                }
+            }
+            "}" => {
+                if open.last().is_some_and(|f| f.1 == depth) {
+                    open.pop();
+                }
+                depth -= 1;
+            }
+            ";" if nest == 0 => pending = None,
+            "Caller" => {
+                if let Some(name) = caller_binding(&t, k) {
+                    let names = match (&mut pending, open.last_mut()) {
+                        (Some((_, names)), _) | (None, Some((_, _, names))) => names,
+                        (None, None) => &mut file_names,
+                    };
+                    names.push(name.to_string());
+                }
+            }
+            _ => {}
+        }
+        if t[k] != "." || k == 0 {
+            continue;
+        }
+        let names = open.last().map(|f| f.2.as_slice()).unwrap_or(&[]);
+        let caller = |n: &str| {
+            SCOPE_CALLER_NAMES.contains(&n) || names.iter().chain(&file_names).any(|c| c == n)
+        };
+        let read = match t.get(k + 1) {
+            Some(&"server_key") => true,
+            Some(&"session") => caller(t[k - 1]),
+            _ => false,
+        };
+        if read {
+            let within = open.last().map_or("-", |f| f.0.as_str());
+            out.push((within.to_string(), format!("{}.{}", t[k - 1], t[k + 1])));
+        }
+    }
+    out
+}
+
+fn scope_strays(rel: &str, src: &str) -> Vec<String> {
+    scope_reads(src)
+        .into_iter()
+        .filter(|(within, _)| {
+            !SCOPE_READS_ALLOWED
+                .iter()
+                .any(|(f, fun, _)| rel == *f && within == fun)
+        })
+        .map(|(within, read)| format!("{rel}: fn {within}: {read}"))
+        .collect()
+}
+
+/// 6a-R1: no state read outside `scope::state`, in `src/agents` and `src/sidebar.rs` (the call-10 inventory's
+/// scope; `src/caller*.rs` build the caller). The `TEST_ONLY` files are compiled only into tests.
+#[test]
+fn state_reads_go_through_scope() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mut files = Vec::new();
+    rust_files(&root.join("src/agents"), &mut files);
+    files.push(root.join("src/sidebar.rs"));
+    files.sort();
+    let mut found = Vec::new();
+    for f in files {
+        let name = rel(root, &f);
+        if TEST_ONLY.iter().any(|(t, _, _)| *t == name) {
+            continue;
+        }
+        found.extend(scope_strays(&name, &std::fs::read_to_string(&f).unwrap()));
+    }
+    assert!(
+        found.is_empty(),
+        "state read outside scope::state (6a-R1): {found:#?}"
+    );
+}
+
+// Call 30 and checklist R4, R5 self-tests: a formatted allowed fn passes; a stray in another fn of an allowed file,
+// a read split across lines, a spaced read, a renamed caller, a nested fn and the code after it are caught; a test
+// module is excluded.
+#[test]
+fn the_scope_guard_catches_strays_in_allowed_files_and_split_reads() {
+    let nl = char::from(10u8);
+    let formatted = format!(
+        "pub fn shown(c: &Caller) -> Scope {{{nl}    Scope {{{nl}        key: c.server_key.clone(),{nl}        session: c.session.clone(),{nl}    }}{nl}}}"
+    );
+    assert!(
+        scope_strays("src/agents/scope.rs", &formatted).is_empty(),
+        "an allowed fn, formatted over lines"
+    );
+    let more = format!(
+        "{formatted}{nl}fn g(root: &Path, c: &Caller) -> PathBuf {{ root.join(&c.server_key) }}"
+    );
+    assert_eq!(
+        scope_strays("src/agents/scope.rs", &more),
+        vec!["src/agents/scope.rs: fn g: c.server_key".to_string()],
+        "another fn of an allowed file"
+    );
+    let split = format!("fn h(c: &Caller) {{{nl}    let _ = &c.{nl}        server_key;{nl}}}");
+    assert_eq!(
+        scope_strays("src/agents/tree.rs", &split).len(),
+        1,
+        "a read split across lines"
+    );
+    assert_eq!(
+        scope_strays(
+            "src/agents/tree.rs",
+            "fn i(caller: &Caller) { let _ = &caller . session; }"
+        ),
+        vec!["src/agents/tree.rs: fn i: caller.session".to_string()],
+        "a spaced session"
+    );
+    assert_eq!(
+        scope_strays(
+            "src/agents/tree.rs",
+            "fn i(who: &'a crate::caller::Caller, r: &Rec) { f(&who.session, &r.session); }"
+        ),
+        vec!["src/agents/tree.rs: fn i: who.session".to_string()],
+        "R5: a renamed caller is seen; another type's session is not"
+    );
+    assert_eq!(
+        scope_strays(
+            "src/agents/tree.rs",
+            "fn k() { let caller = f(); g(&caller.session); }"
+        )
+        .len(),
+        1,
+        "an untyped caller by its usual name"
+    );
+    let nested = "fn shown(c: &Caller) { fn inner(x: Caller) { x.session; } c.server_key; } fn after(c: &Caller) { c.session; }";
+    assert_eq!(
+        scope_strays("src/agents/scope.rs", nested),
+        vec![
+            "src/agents/scope.rs: fn inner: x.session".to_string(),
+            "src/agents/scope.rs: fn after: c.session".to_string()
+        ],
+        "R4: a nested fn and the fn after an allowed one"
+    );
+    let gated =
+        format!("#[cfg(test)]{nl}mod t {{ fn j(c: &Caller) {{ let _ = &c.server_key; }} }}");
+    assert!(
+        scope_strays("src/agents/tree.rs", &gated).is_empty(),
+        "a test module"
+    );
+}
+
 // state-0 S3, PM call 13: every writer token finds every member file. One shape per token, each holding only its own
 // token, so removing one entry of `WRITER_TOKENS` or `MEMBER_FILES` (slices) fails exactly its own cases.
 #[test]
@@ -777,6 +1104,12 @@ fn paths_to(src: &str, file: &str) -> bool {
 /// Files compiled only into tests (W2, PM call 14): (file, its parent, its module name). None is declared with
 /// `#[path]`: the twelve that were beside their parent live in the parent's own folder.
 const TEST_ONLY: &[(&str, &str, &str)] = &[
+    ("src/agents/scope/tests.rs", "src/agents/scope.rs", "tests"),
+    (
+        "src/agents/outcome_fixture.rs",
+        "src/agents/mod.rs",
+        "outcome_fixture",
+    ),
     (
         "src/agents/board/hc_tests.rs",
         "src/agents/board.rs",
@@ -788,6 +1121,46 @@ const TEST_ONLY: &[(&str, &str, &str)] = &[
         "core_fixture",
     ),
     ("src/agents/board/tests.rs", "src/agents/board.rs", "tests"),
+    (
+        "src/agents/notebook/news/tests.rs",
+        "src/agents/notebook/news.rs",
+        "tests",
+    ),
+    (
+        "src/agents/notebook/news/notice_tests.rs",
+        "src/agents/notebook/news.rs",
+        "notice_tests",
+    ),
+    (
+        "src/agents/notebook/tests.rs",
+        "src/agents/notebook.rs",
+        "tests",
+    ),
+    (
+        "src/agents/notebook/fault_tests.rs",
+        "src/agents/notebook.rs",
+        "fault_tests",
+    ),
+    (
+        "src/agents/notebook/rebuild_tests.rs",
+        "src/agents/notebook.rs",
+        "rebuild_tests",
+    ),
+    (
+        "src/agents/notebook/verb_tests.rs",
+        "src/agents/notebook.rs",
+        "verb_tests",
+    ),
+    (
+        "src/agents/notebook/notes_tests.rs",
+        "src/agents/notebook.rs",
+        "notes_tests",
+    ),
+    (
+        "src/agents/message/peek_tests.rs",
+        "src/agents/message.rs",
+        "peek_tests",
+    ),
     (
         "src/agents/cascade/tests.rs",
         "src/agents/cascade.rs",
@@ -959,7 +1332,32 @@ const TEST_ONLY: &[(&str, &str, &str)] = &[
         "src/agents/up/mod.rs",
         "existing_tests",
     ),
+    (
+        "src/agents/up/publish_tests/ensure.rs",
+        "src/agents/up/publish_tests.rs",
+        "ensure",
+    ),
+    (
+        "src/agents/up/publish_tests.rs",
+        "src/agents/up/mod.rs",
+        "publish_tests",
+    ),
+    (
+        "src/agents/up/reenter_tests.rs",
+        "src/agents/up/mod.rs",
+        "reenter_tests",
+    ),
+    (
+        "src/agents/up/tests/create.rs",
+        "src/agents/up/tests.rs",
+        "create",
+    ),
     ("src/agents/up/tests.rs", "src/agents/up/mod.rs", "tests"),
+    (
+        "src/agents/up/index/tests.rs",
+        "src/agents/up/index.rs",
+        "tests",
+    ),
     (
         "src/agents/kept_tests.rs",
         "src/agents/mod.rs",
@@ -985,6 +1383,11 @@ const TEST_ONLY: &[(&str, &str, &str)] = &[
         "src/caller_hc_tests/k2_tests.rs",
         "src/caller_hc_tests.rs",
         "k2_tests",
+    ),
+    (
+        "src/caller_hc_tests/present_tests.rs",
+        "src/caller_hc_tests.rs",
+        "present_tests",
     ),
     (
         "src/caller_hc_tests/stop_tests.rs",
@@ -3340,7 +3743,7 @@ fn state_and_lock_format_pinned() {
     ] {
         assert!(lock.contains(want), "src/state/lock.rs lacks {want}");
     }
-    assert!(src("src/agents/mod.rs").contains(r#"format!("{kind}|{}|{key}", caller.server_key)"#));
+    assert!(src("src/agents/mod.rs").contains(r#"format!("{kind}|{}|{key}", scope.key)"#));
     let mail = src("src/agents/mail.rs");
     assert!(mail.contains(r#"mail.join(format!("{key}.jsonl"))"#));
     assert!(src("src/agents/receipt.rs").contains(r#"mail.join(format!("{key}.offset"))"#));

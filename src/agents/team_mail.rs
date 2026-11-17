@@ -365,7 +365,7 @@ fn claim(ctx: &Ctx, caller: &Caller) -> Res<Claim> {
             Member::Life(g) => {
                 // Another session is skipped before its status or view is read, so its torn files block no one.
                 if g.record().get("session").and_then(Value::as_str)
-                    != Some(caller.session.as_str())
+                    != Some(super::scope::state(caller).session.as_str())
                 {
                     continue;
                 }
@@ -378,11 +378,12 @@ fn claim(ctx: &Ctx, caller: &Caller) -> Res<Claim> {
             && record
                 .get("session")
                 .and_then(Value::as_str)
-                .is_none_or(|s| s == caller.session);
+                .is_none_or(|s| s == super::scope::state(caller).session);
         if here {
             // As `registry::own_record`: its own id is its folder's, its session the caller's (QA round 2, fix 2).
             let valid = record.get("id").and_then(Value::as_str) == Some(id.as_str())
-                && record.get("session").and_then(Value::as_str) == Some(caller.session.as_str());
+                && record.get("session").and_then(Value::as_str)
+                    == Some(super::scope::state(caller).session.as_str());
             let committed = match life_committed {
                 Some(c) => c,
                 None => super::member_committed(&folder, &member)?,
@@ -478,92 +479,91 @@ fn route_team(
     };
     let t = target(word)?;
     // Lock order (M2): team, then (in deliver) the agent of the sender, then each mailbox.
-    super::lock(
-        ctx,
-        &super::lock_key("spawn", caller, &caller.session),
-        || {
-            let s = Snapshot::take(ctx, caller)?;
-            if let Some(e) = &s.core_error {
-                return Err(e.clone());
+    super::lock(ctx, &super::team_lock(caller), || {
+        let s = Snapshot::take(ctx, caller)?;
+        if let Some(e) = &s.core_error {
+            return Err(e.clone());
+        }
+        let me = match s.reader(caller) {
+            Ok(me) => me,
+            // Unreadable, Lost, Ended or at another generation: refused, never sent as 0.2 (Tech Lead, HIGH).
+            Err(_) if claimed_member => return Err(super::tree::tagged()),
+            Err(_) if caller.member.is_none() && caller.kind == Kind::Agent => {
+                return Ok(Routed::Legacy(Some(Box::new(s))));
             }
-            let me = match s.reader(caller) {
-                Ok(me) => me,
-                // Unreadable, Lost, Ended or at another generation: refused, never sent as 0.2 (Tech Lead, HIGH).
-                Err(_) if claimed_member => return Err(super::tree::tagged()),
-                Err(_) if caller.member.is_none() && caller.kind == Kind::Agent => {
-                    return Ok(Routed::Legacy(Some(Box::new(s))));
-                }
-                Err(e) => return Err(e),
-            };
-            let sender = match &me.record {
-                Some(r) if r.get("hcAddress").is_some() => Sender {
-                    id: Some(me.key.clone()),
-                    name: me.name.clone(),
-                    key: super::mail::member_mailbox(&me.key, r),
-                    pane: caller.pane.clone(),
-                },
-                Some(_) => return Ok(Routed::Legacy(Some(Box::new(s)))),
-                None => Sender {
-                    id: None,
-                    name: me.name.clone(),
-                    key: me.key.clone(),
-                    pane: caller.pane.clone(),
-                },
-            };
-            let root = sends_root(&super::server_dir(ctx, caller), &caller.session);
-            // A member is keyed by its id (a resumed member has a new id, so its own quota); a person by its pane mailbox.
-            let owner = sender.id.clone().unwrap_or_else(|| sender.key.clone());
-            let hash = crate::util::sha256_hex(body);
-            let tx = || -> Res<Option<Map<String, Value>>> {
-                let intent = match &id {
-                    Some(id) => match find_intent(&root, &owner, id)? {
-                        Found::Mine(i) if super::text(i.get("bodyHash")) == hash => {
-                            settle(&root, &owner, id).map_err(|_| unsaved(id, &[]))?;
-                            i
-                        }
-                        Found::Mine(_) | Found::Other => {
-                            return refuse(2, "id", "that id belongs to a different send");
-                        }
-                        Found::None => return refuse(2, "id", "no send with that id"),
-                    },
-                    None => {
-                        let Some((recipients, hop, cast)) =
-                            plan(ctx, caller, &s, &sender, &t, re.as_deref())?
-                        else {
-                            return Ok(None);
-                        };
-                        charge(ctx, &root.join(&owner), sender.id.is_some())?;
-                        let i = json!({"id": fresh_id(&root, new_id)?, "sender": owner,
-                            "at": utc_o(ctx.clock.now()), "bodyHash": hash, "cast": cast, "re": re, "hop": hop,
-                            "recipients": recipients});
-                        if let Err(e) = write_intent(&root, &owner, &i) {
-                            // Renamed but maybe not flushed: the intent may outlive a crash, and its id is the way
-                            // back.
-                            let id = super::text(i.get("id"));
-                            return Err(if root.join(&owner).join(format!("{id}.json")).exists() {
-                                unsaved(&id, &[])
-                            } else {
-                                e
-                            });
-                        }
-                        crash_point()?;
+            Err(e) => return Err(e),
+        };
+        let sender = match &me.record {
+            Some(r) if r.get("hcAddress").is_some() => Sender {
+                id: Some(me.key.clone()),
+                name: me.name.clone(),
+                key: super::mail::member_mailbox(&me.key, r),
+                pane: caller.pane.clone(),
+            },
+            Some(_) => return Ok(Routed::Legacy(Some(Box::new(s)))),
+            None => Sender {
+                id: None,
+                name: me.name.clone(),
+                key: me.key.clone(),
+                pane: caller.pane.clone(),
+            },
+        };
+        let root = sends_root(
+            &super::server_dir(ctx, caller),
+            &super::scope::state(caller).session,
+        );
+        // A member is keyed by its id (a resumed member has a new id, so its own quota); a person by its pane mailbox.
+        let owner = sender.id.clone().unwrap_or_else(|| sender.key.clone());
+        let hash = crate::util::sha256_hex(body);
+        let tx = || -> Res<Option<Map<String, Value>>> {
+            let intent = match &id {
+                Some(id) => match find_intent(&root, &owner, id)? {
+                    Found::Mine(i) if super::text(i.get("bodyHash")) == hash => {
+                        settle(&root, &owner, id).map_err(|_| unsaved(id, &[]))?;
                         i
                     }
-                };
-                deliver(ctx, caller, &s, &sender, &root, &owner, &intent, body, word).map(Some)
+                    Found::Mine(_) | Found::Other => {
+                        return refuse(2, "id", "that id belongs to a different send");
+                    }
+                    Found::None => return refuse(2, "id", "no send with that id"),
+                },
+                None => {
+                    let Some((recipients, hop, cast)) =
+                        plan(ctx, caller, &s, &sender, &t, re.as_deref())?
+                    else {
+                        return Ok(None);
+                    };
+                    charge(ctx, &root.join(&owner), sender.id.is_some())?;
+                    let i = json!({"id": fresh_id(&root, new_id)?, "sender": owner,
+                            "at": utc_o(ctx.clock.now()), "bodyHash": hash, "cast": cast, "re": re, "hop": hop,
+                            "recipients": recipients});
+                    if let Err(e) = write_intent(&root, &owner, &i) {
+                        // Renamed but maybe not flushed: the intent may outlive a crash, and its id is the way
+                        // back.
+                        let id = super::text(i.get("id"));
+                        return Err(if root.join(&owner).join(format!("{id}.json")).exists() {
+                            unsaved(&id, &[])
+                        } else {
+                            e
+                        });
+                    }
+                    crash_point()?;
+                    i
+                }
             };
-            // Team, then the agent lock of a member sender, then each mailbox: the -Re lookup and every copy inside
-            // it.
-            let sent = match &sender.id {
-                Some(m) => super::lock(ctx, &super::lock_key("agent", caller, m), tx)?,
-                None => tx()?,
-            };
-            match sent {
-                Some(reply) => Ok(Routed::Sent(reply)),
-                None => Ok(Routed::Legacy(Some(Box::new(s)))),
-            }
-        },
-    )
+            deliver(ctx, caller, &s, &sender, &root, &owner, &intent, body, word).map(Some)
+        };
+        // Team, then the agent lock of a member sender, then each mailbox: the -Re lookup and every copy inside
+        // it.
+        let sent = match &sender.id {
+            Some(m) => super::lock(ctx, &super::lock_key("agent", caller, m), tx)?,
+            None => tx()?,
+        };
+        match sent {
+            Some(reply) => Ok(Routed::Sent(reply)),
+            None => Ok(Routed::Legacy(Some(Box::new(s)))),
+        }
+    })
 }
 
 type Plan = (Vec<Value>, u64, Option<&'static str>);
@@ -685,7 +685,7 @@ fn claude_session(record: &Value) -> Value {
 fn pane_box(ctx: &Ctx, caller: &Caller, pane: &str) -> Res<Value> {
     super::message::live_pane(ctx, caller, pane)?;
     let snapshot = super::registry::Snapshot::take(ctx, caller)?;
-    let key = super::registry::mailbox_of(&snapshot, pane)?;
+    let key = super::registry::mailbox_of(&snapshot, pane, super::mail::elsewhere(caller))?;
     let agent = snapshot.at(pane);
     Ok(
         json!({"name": agent.as_ref().map_or(pane.to_string(), |a| a.name.clone()),

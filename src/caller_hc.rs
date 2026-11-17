@@ -84,7 +84,38 @@ fn prove(ctx: &Ctx) -> Res<Option<Caller>> {
         let (pid, start, socket) = server_of(&inside(&[key, "server.json"])?, key)?;
         let live = ctx.os.open(pid).is_some_and(|o| o.start == start);
         let view = view_of(&r);
-        let presentation = view.filter(|_| live);
+        // Re6a calls 18, 46: an `up` team member is presented only by its team's proven index view (its state stays at
+        // the folder pair); a plain-spawned lifecycle member keeps its own; a pre-lifecycle member needs both, as before.
+        let home = super::Anchor {
+            key: key.into(),
+            session: session.into(),
+        };
+        let shown = match lifecycle {
+            true => agents::scope::present(ctx, &home),
+            false => agents::scope::Shown::Own,
+        };
+        let (presentation, (shown_key, shown_session, socket, pid, start), anchor) = match shown {
+            agents::scope::Shown::Own => (
+                view.filter(|_| live),
+                (key.to_string(), session.to_string(), socket, pid, start),
+                None,
+            ),
+            agents::scope::Shown::Team(v) => {
+                let at = v.map(|v| {
+                    (
+                        v.server.key,
+                        v.session,
+                        v.server.socket,
+                        v.server.pid,
+                        v.server.start,
+                    )
+                });
+                let presentation = at.as_ref().and(view);
+                let at = at
+                    .unwrap_or_else(|| (key.to_string(), session.to_string(), socket, pid, start));
+                (presentation, at, Some(home))
+            }
+        };
         if !lifecycle && presentation.is_none() {
             return None;
         }
@@ -103,15 +134,16 @@ fn prove(ctx: &Ctx) -> Res<Option<Caller>> {
             chain: walked.unwrap_or_default(),
             pane: pane.clone(),
             window: window.clone(),
-            session: session.into(),
+            session: shown_session,
             server_pid: pid,
             server_start: start,
             socket,
-            server_key: key.into(),
+            server_key: shown_key,
             agent_tag: id.into(),
             member: proven.then(|| id.to_string()),
             candidate: (!proven).then(|| id.to_string()),
             presentation,
+            anchor,
         })
     };
     Ok(read())

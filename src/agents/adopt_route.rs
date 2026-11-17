@@ -73,12 +73,19 @@ pub fn notice_route(
         }
     }
 }
-/// A recorded route: exactly `{"mailbox": <mailbox key or null>}` (an agent id or `pane-<n>`), else `evidence`.
+/// A recorded route: exactly `{"mailbox": <mailbox key or null>}` (an agent id, `pane-<n>`, or re6a V3's
+/// `pane-<serverKey>-<n>`), else `evidence`.
 fn routed(v: &Value) -> Res<Option<String>> {
+    let qualified = |rest: &str| {
+        rest.split_once('-').is_some_and(|(key, d)| {
+            crate::agents::mail::pane_box(&format!("%{d}"), Some(key))
+                .is_ok_and(|b| b == format!("pane-{rest}"))
+        })
+    };
     let mailbox = |k: &str| {
         crate::agents::agent_id(k)
             || k.strip_prefix("pane-")
-                .is_some_and(|d| crate::agents::pane_id(&format!("%{d}")))
+                .is_some_and(|d| crate::agents::pane_id(&format!("%{d}")) || qualified(d))
     };
     match v
         .as_object()
@@ -90,12 +97,11 @@ fn routed(v: &Value) -> Res<Option<String>> {
         _ => Err(evidence::unreadable()),
     }
 }
-/// Main's destination: the `parentPane` mailbox, none when empty.
+/// Main's destination: the `parentPane` mailbox (its recorded `parentServerKey` honoured, re6a V3), none when empty.
 pub fn pane_key(record: &Value) -> Res<Option<String>> {
-    let parent = crate::agents::text(record.get("parentPane"));
-    if parent.is_empty() {
+    if crate::agents::text(record.get("parentPane")).is_empty() {
         Ok(None)
     } else {
-        crate::agents::mail::mailbox_key(&parent, "").map(Some)
+        crate::agents::mail::parent_box(record).map(Some)
     }
 }

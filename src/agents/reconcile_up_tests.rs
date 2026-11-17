@@ -5,7 +5,7 @@ use super::fixture::World;
 use super::life_fixture as lf;
 use super::reconcile_restore_tests::{L, released_by_hc};
 use super::reconcile_run_tests::{bytes, ids};
-use super::reconcile_tests::{X, found, member, member_at, ok, wire_of};
+use super::reconcile_tests::{X, found, member, member_at, ok, seed_index, wire_of};
 use super::reconcile_verb_tests::person;
 use serde_json::{Value, json};
 
@@ -42,23 +42,39 @@ fn leader_of(w: &World, t: &str) {
         .unwrap();
 }
 
+/// reentry-6a Task 11 (finding F18): re-entry's own pass after reconcile: one `hc::Lazy`, then member `id`'s
+/// generation `n` looked up; hc lists no terminal of it, so it is Unknown and gets no view.
+fn reentry_unlisted(w: &super::fixture::World, id: &str, n: u64) {
+    cf::online(w);
+    let (by_id, by_gen) = (format!("mux.id={id}"), format!("mux.gen={n}"));
+    cf::answer(
+        w,
+        &[
+            "ls", "--all", "--label", &by_id, "--label", &by_gen, "--json",
+        ],
+        r#"{"terminals":[]}"#,
+    );
+}
+
 /// Ambiguity 8: a second `up` of a lifecycle team reconciles it: `created: false`, the Lost ok member restored.
 #[test]
 fn up_on_an_existing_team_reconciles_instead_of_refusing() {
     let w = person();
     let t = team_t(&w);
     leader_of(&w, &t);
+    seed_index(&w, &t, &w.caller().server_key, &w.caller().session); // reentry-6a Task 9: up made it
     let f = member(&w, X, json!({"parentAgent": {"id": L}}));
     ok(&f, 1);
     cf::online(&w); // the pass (hc::Lazy); the base answer serves the connect of up (r6b call 11)
     found(&w, X, 1, &wire_of(&w, X, 1, lf::LOST_ARGVS[0]));
     released_by_hc(&w, X, lf::LOST_ARGVS[0]);
     w.fakes.hc_answer(ft::address("t2"));
+    reentry_unlisted(&w, X, 2);
     let (code, reply) = up(&w);
     assert_eq!(code, 0, "{reply}");
     assert_eq!(
-        (&reply["created"], &reply["team"]),
-        (&json!(false), &json!(t))
+        (&reply["created"], &reply["team"], &reply["reentered"]),
+        (&json!(false), &json!(t), &json!(true))
     );
     assert_eq!(ids(reply.as_object().unwrap(), "restored"), [X]);
     assert_eq!(lf::count(&w, "run"), 1, "no second leader");
@@ -86,6 +102,7 @@ fn up_from_another_server_reconciles_at_the_anchor() {
         member_at(&w, K1, id, fields)
     };
     let lead = at(L, json!({"depth": 0, "upTeam": t, "name": "leader"}));
+    seed_index(&w, &t, K1, "$4"); // reentry-6a Task 9: up made it on K1
     crate::state::evidence::publish(&super::gens::path(&lead, 1, "ended"), &json!({"at": "t"}))
         .unwrap();
     let f = at(X, json!({"parentAgent": {"id": L}}));
@@ -111,6 +128,7 @@ fn up_from_another_server_reconciles_at_the_anchor() {
     cf::answer(&w, &["get", &format!("a{X}"), "--json"], &lost.to_string());
     relabel_for(&w, &format!("a{X}"), &t1);
     w.fakes.hc_answer(ft::address("t2"));
+    reentry_unlisted(&w, X, 2);
     let (code, reply) = up(&w);
     assert_eq!((code, &reply["created"]), (0, &json!(false)), "{reply}");
     assert_eq!(ids(reply.as_object().unwrap(), "restored"), [X]);
@@ -132,6 +150,7 @@ fn two_concurrent_ups_restore_a_member_once() {
     let a = person();
     let t = team_t(&a);
     leader_of(&a, &t);
+    seed_index(&a, &t, &a.caller().server_key, &a.caller().session); // reentry-6a Task 9: up made it
     let f = member(&a, X, json!({"parentAgent": {"id": L}}));
     ok(&f, 1);
     let gate = std::sync::Arc::new(crate::testing::Gate::default());
@@ -140,6 +159,7 @@ fn two_concurrent_ups_restore_a_member_once() {
     found(&a, X, 1, &wire_of(&a, X, 1, lf::LOST_ARGVS[0]));
     released_by_hc(&a, X, lf::LOST_ARGVS[0]);
     a.fakes.hc_answer(ft::address("t2"));
+    reentry_unlisted(&a, X, 2);
     let g = gate.clone();
     a.fakes.lock_probe(move |e| {
         if let Some(k) = e.strip_prefix("-").filter(|k| k.starts_with("up|")) {
@@ -171,6 +191,8 @@ fn two_concurrent_ups_restore_a_member_once() {
             (w2["name"], w2["argv"], w2["address"]) =
                 (l["hcName"].clone(), l["launcherArgv"].clone(), json!("t2"));
             cf::online(&b); // the pass of B
+            found(&b, X, 2, &w2);
+            cf::online(&b); // re-entry's pass of B (Task 11): X Running, its view shown
             found(&b, X, 2, &w2);
             let (code, reply) = up(&b);
             assert_eq!((code, &reply["created"]), (0, &json!(false)), "{reply}");
