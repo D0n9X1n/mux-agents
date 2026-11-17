@@ -173,6 +173,17 @@ fn a_second_up_reconciles_and_creates_nothing() {
         .to_string();
     ix.releases.push(left.clone());
     index::write(&w.ctx, &ix).unwrap();
+    // F10 (checklist #22): the listing names the first session, so `ensure` reuses it.
+    let name = first["name"].as_str().unwrap().to_string();
+    w.fakes.mux_rule(
+        "list-sessions",
+        0,
+        &format!(
+            "$7 {name}
+"
+        ),
+        "",
+    );
     cf::online(&w); // up's own hc::connect (finding A13)
     cf::online(&w); // reconcile's hc::Lazy
     found(&w, &id, 0, &running_wire(&w, &agents(&w).join(&id), &id, 0));
@@ -198,22 +209,6 @@ fn a_second_up_reconciles_and_creates_nothing() {
         index_of(&w).unwrap().releases.is_empty() && Path::new(&left).is_file(),
         "call 25: a crashed up's release finished"
     );
-}
-
-// Call 22 (finding A12), F9: Task 9 never starts an existing pending-only index again; it refuses `index`. No launch
-// answer is queued (the halt precedes the launch), and every hc answer is consumed.
-#[test]
-fn a_pending_only_index_is_not_started_again() {
-    let w = base();
-    halt_after(Some("session"));
-    let first = claude(&w);
-    halt_after(None);
-    assert_eq!(first.unwrap_err().check, "halted");
-    cf::online(&w);
-    assert_eq!(claude(&w).unwrap_err().check, "index", "not started again");
-    assert_eq!(of(&w, "new-session").len(), 1, "one session made");
-    assert!(!ran(&w));
-    w.fakes.hc_done().unwrap();
 }
 
 /// A team index for this folder's T, anchored at the caller's key and `$7`.

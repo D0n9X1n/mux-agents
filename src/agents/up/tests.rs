@@ -248,9 +248,18 @@ fn the_record_is_flushed_before_hc_run_and_the_team_record_follows_the_commit() 
 #[test]
 fn post_commit_failures_are_reported_and_the_leader_stays() {
     let w = ready();
-    crate::agents::state_dir(&w.ctx, &w.caller()).unwrap(); // private, as `up` makes it
-    std::fs::create_dir_all(team_file(&w).parent().unwrap()).unwrap();
-    std::fs::write(team_file(&w), "{}").unwrap();
+    // reentry-6a Task 10: a torn team record seeded before `up` is `index` before anything is made (call 21); the
+    // post-commit case tears it after the leader committed (the view's `new-window` runs after promotion).
+    let torn = team_file(&w);
+    w.fakes.mux_script("new-window", move |_| {
+        std::fs::create_dir_all(torn.parent().unwrap()).unwrap();
+        std::fs::write(&torn, "{}").unwrap();
+        out(
+            0,
+            "%9|@5|exact,#} attach t1
+",
+        )
+    });
     fails(&w, "@mux-agents-sidebar");
     fails(&w, "select-window");
     let reply = claude(&w).unwrap();
@@ -499,11 +508,28 @@ fn the_leader_is_rediscovered_after_each_write_and_a_failed_flush_launches_nothi
     for (n, bytes) in shots.borrow().iter().enumerate() {
         std::fs::write(leader_folder(&first).join("record.json"), bytes).unwrap();
         let _ = std::fs::remove_file(leader_folder(&first).join("commit.json"));
-        // reentry-6a Task 9 (deviation D23): the team record stays, so the second `up` takes the reconcile branch at
-        // the anchor; a missing team record with a published index is Task 10's replay (E6 step 4).
+        let _ = std::fs::remove_file(team_file(&first));
+        // The fake hc runs no launcher: the `run` claim a real launcher publishes after `hc run` is seeded.
+        let _ = gens::publish_claim_once(&leader_folder(&first), 0, &json!("run"));
         let mut again = base();
         (again.ctx.state_root, again.ctx.cwd) =
             (first.ctx.state_root.clone(), first.ctx.cwd.clone());
+        let id = leader_folder(&first)
+            .file_name()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+        if n == 0 {
+            // E6 Settle (settle-1b G3 row 6): the pending generation's terminal is found, then promoted.
+            cf::online(&again);
+            crate::agents::reconcile_tests::found(
+                &again,
+                &id,
+                0,
+                &create::running_wire(&again, &leader_folder(&first), &id, 0),
+            );
+        }
         if n > 0 {
             cf::get(
                 &again,
@@ -511,10 +537,14 @@ fn the_leader_is_rediscovered_after_each_write_and_a_failed_flush_launches_nothi
                 json!({"address": "t1", "state": "live", "argv": launcher, "labels": {}}),
             );
         }
-        // 6b ambiguity 8: the rediscovered leader's team is reconciled, never made twice.
+        // 6b ambiguity 8: the rediscovered leader's team is reconciled, never made twice. reentry-6a E6 step 4 (E5):
+        // the replay writes the missing team record from the same leader, so `created` is true.
         let reply = claude(&again).unwrap();
         assert!(
-            reply["created"] == json!(false) && !ran(&again),
+            reply["created"] == json!(true)
+                && reply["leader"]["id"] == json!(id)
+                && team_file(&first).is_file()
+                && !ran(&again),
             "write {}: {reply:?}",
             n + 1
         );
@@ -815,6 +845,244 @@ fn up_finishes_a_kept_cascade_first() {
     crate::agents::cascade_fixture::seed(&w, a, &[a], true);
     let _ = claude(&w);
     assert!(!dir.join("aaaaaaaaaaa1.json").exists(), "finished");
+}
+
+/// A server no process row answers: proven gone.
+pub(crate) fn dead_server() -> index::Server {
+    index::Server {
+        socket: "/tmp/dead".into(),
+        pid: 7777,
+        start: 1,
+        key: index::key_of("/tmp/dead", 7777, 1),
+    }
+}
+/// The index `up` leaves for team `t` anchored at `key`/`session`, its view on `view`.
+pub(crate) fn seed_index_at(w: &World, t: &str, key: &str, session: &str, view: index::Server) {
+    let folder = identity::folder(&w.ctx).unwrap();
+    let ix = index::Index {
+        team: t.into(),
+        inputs: index::Inputs {
+            client: "claude".into(),
+            options: vec![],
+            prompt: vec![],
+            name: String::new(),
+            folder: folder.to_str().unwrap().into(),
+        },
+        anchor: Some(crate::caller::Anchor {
+            key: key.into(),
+            session: session.into(),
+        }),
+        view: Some(index::View {
+            server: view,
+            session: session.into(),
+            name: "p-11111111-v".into(),
+        }),
+        pending: None,
+        aliases: vec![],
+        releases: vec![],
+    };
+    index::write(&w.ctx, &ix).unwrap();
+}
+/// The team record of `t` at `key`/`session`, leader `leader`.
+pub(crate) fn team_record_at(w: &World, t: &str, key: &str, session: &str, leader: &str) {
+    let made = crate::agents::team::Team {
+        team: t.into(),
+        session: session.into(),
+        name: "p-11111111-v".into(),
+        directory: "/p".into(),
+        client: Client::Claude,
+        flags: vec![],
+        policy: crate::agents::team::Policy::Default,
+        leader: leader.into(),
+        created_at: "2026-11-16T00:00:00.0000000Z".into(),
+    };
+    let at = crate::agents::team::path(&w.ctx.state_root.join(key), session);
+    assert!(crate::agents::team::create(&at, &made).unwrap());
+}
+/// A leader record of this folder's team at the World key in `session`: void (an abandoned claim, no active
+/// generation) or active (generation 0 committed).
+fn leader_at(w: &World, id: &str, session: &str, void: bool) -> PathBuf {
+    let f = agents(w).join(id);
+    std::fs::create_dir_all(&f).unwrap();
+    let mut r = json!({"lifecycle": 1, "id": id, "name": "leader", "upTeam": team_of(w), "depth": 0,
+        "session": session});
+    if void {
+        r["pending"] = crate::agents::life_fixture::pending(0);
+    } else {
+        r["generation"] = json!("0");
+    }
+    crate::state::fs::write_json(&f.join("record.json"), &r).unwrap();
+    let (claim, commit) = if void {
+        (Some("abandoned"), None)
+    } else {
+        (Some("run"), crate::agents::life_fixture::committed())
+    };
+    crate::agents::life_fixture::seed_gen(&f, 0, claim, commit);
+    f
+}
+
+// Ambiguity 9, call 7: the leader is found at the anchor in its session; a void one is skipped and its folder kept;
+// one in another session (a retired predecessor) is invisible; two non-void: `index`.
+#[test]
+fn the_leader_is_found_at_the_anchor_and_a_void_one_is_skipped() {
+    let w = ready();
+    let (t, key) = (team_of(&w), w.caller().server_key);
+    seed_index_at(&w, &t, &key, "$7", dead_server());
+    let ix = index::read(&w.ctx, &t).unwrap().unwrap();
+    assert_eq!(
+        leader_of(&w.ctx, &ix).unwrap(),
+        (replay::Leader::Absent, None)
+    );
+    let void = leader_at(&w, "aaaaaaaaaaa1", "$7", true);
+    assert_eq!(
+        leader_of(&w.ctx, &ix).unwrap().0,
+        replay::Leader::Absent,
+        "void: no leader"
+    );
+    assert!(void.is_dir(), "its folder stays");
+    leader_at(&w, "aaaaaaaaaaa4", "$9", false);
+    assert_eq!(
+        leader_of(&w.ctx, &ix).unwrap().0,
+        replay::Leader::Absent,
+        "call 7: another session is not this team"
+    );
+    leader_at(&w, "aaaaaaaaaaa2", "$7", false);
+    assert_eq!(
+        leader_of(&w.ctx, &ix).unwrap(),
+        (replay::Leader::Active, Some("aaaaaaaaaaa2".into()))
+    );
+    // Call 36 (finding A17): a copied record naming another id under this folder is not this folder's leader.
+    let stray = leader_at(&w, "aaaaaaaaaaa5", "$7", false);
+    let mut r: Value =
+        serde_json::from_slice(&std::fs::read(stray.join("record.json")).unwrap()).unwrap();
+    r["id"] = json!("bbbbbbbbbbb2");
+    crate::state::fs::write_json(&stray.join("record.json"), &r).unwrap();
+    assert_eq!(
+        leader_of(&w.ctx, &ix).unwrap(),
+        (replay::Leader::Active, Some("aaaaaaaaaaa2".into())),
+        "a record of another id"
+    );
+    leader_at(&w, "aaaaaaaaaaa3", "$7", false);
+    assert_eq!(
+        leader_of(&w.ctx, &ix).unwrap_err().message,
+        "two leaders claim this team"
+    );
+}
+
+// F13 (checklist #25): the leader's record is revalidated at the reread: its id, `upTeam` and the anchor's session.
+#[test]
+fn the_leader_record_is_revalidated_at_the_reread() {
+    let w = ready();
+    let (t, key) = (team_of(&w), w.caller().server_key);
+    seed_index_at(&w, &t, &key, "$7", dead_server());
+    let ix = index::read(&w.ctx, &t).unwrap().unwrap();
+    let f = leader_at(&w, "aaaaaaaaaaa2", "$7", false);
+    assert_eq!(
+        leaders::leader_record(&w.ctx, &ix, "aaaaaaaaaaa2").unwrap()["id"],
+        json!("aaaaaaaaaaa2")
+    );
+    for (field, value) in [
+        ("id", json!("bbbbbbbbbbb2")),
+        ("upTeam", json!("ffffffffffffffff")),
+        ("session", json!("$9")),
+    ] {
+        let mut r = crate::agents::life_fixture::record(&f);
+        let kept = r[field].clone();
+        r[field] = value;
+        crate::state::fs::write_json(&f.join("record.json"), &r).unwrap();
+        assert_eq!(
+            leaders::leader_record(&w.ctx, &ix, "aaaaaaaaaaa2")
+                .unwrap_err()
+                .check,
+            "team",
+            "{field}"
+        );
+        r[field] = kept;
+        crate::state::fs::write_json(&f.join("record.json"), &r).unwrap();
+    }
+}
+
+// Call 21: `{}` or another team's valid record at the anchor's team path is no team record of this team: `index`.
+#[test]
+fn a_team_record_must_be_this_teams() {
+    let w = base(); // nothing launches: no launch answer queued
+    let (t, key) = (team_of(&w), w.caller().server_key);
+    seed_index_at(&w, &t, &key, "$7", dead_server());
+    let at = crate::agents::team::path(&w.ctx.state_root.join(&key), "$7");
+    std::fs::create_dir_all(at.parent().unwrap()).unwrap();
+    std::fs::write(&at, b"{}").unwrap();
+    assert_eq!(claude(&w).unwrap_err().check, "index", "{{}}");
+    std::fs::remove_file(&at).unwrap();
+    team_record_at(&w, "ffffffffffffffff", &key, "$7", "cccccccccccc");
+    cf::online(&w); // the second up's own hc::connect
+    let e = claude(&w).unwrap_err();
+    assert_eq!(e.check, "index", "another team's record: {}", e.message);
+    assert!(of(&w, "new-session").is_empty() && !ran(&w), "nothing made");
+    w.fakes.hc_done().unwrap();
+}
+
+thread_local! {
+    static OPENED: Cell<bool> = const { Cell::new(false) };
+}
+fn mark_opened(_: &crate::agents::team_state::Tx<'_>) -> Res<()> {
+    OPENED.with(|o| o.set(true));
+    Ok(())
+}
+fn refuse_open(_: &crate::agents::team_state::Tx<'_>) -> Res<()> {
+    refuse(1, "stopping", "a cascade is unresolved")
+}
+
+// Call 8, F11 (checklist #23): re-entry reconciles (opening the anchor's team Tx) before any session is made; a
+// reconcile that refuses opens no session. No launch answer is queued; every hc answer is consumed.
+#[test]
+fn reconcile_runs_before_any_session_is_made() {
+    for refused in [true, false] {
+        let w = base();
+        let (t, key) = (team_of(&w), w.caller().server_key);
+        let f = crate::agents::reconcile_tests::member_at(
+            &w,
+            &key,
+            "cccccccccccc",
+            json!({"name": "leader", "depth": 0, "upTeam": t, "session": "$A"}),
+        );
+        crate::agents::reconcile_tests::ok(&f, 1); // member_at seeds generation 1 (finding A14)
+        seed_index_at(&w, &t, &key, "$A", dead_server());
+        team_record_at(&w, &t, &key, "$A", "cccccccccccc");
+        OPENED.with(|o| o.set(false));
+        crate::agents::team_state::test_hook(Some(if refused { refuse_open } else { mark_opened }));
+        w.fakes.mux_script("new-session", |_| {
+            assert!(
+                OPENED.with(|o| o.get()),
+                "reconcile opened the team before the session was made"
+            );
+            out(0, "$8 @4\n")
+        });
+        if !refused {
+            cf::online(&w);
+            crate::agents::reconcile_tests::found(
+                &w,
+                "cccccccccccc",
+                1,
+                &create::running_wire(&w, &f, "cccccccccccc", 1),
+            );
+        }
+        let got = claude(&w);
+        crate::agents::team_state::test_hook(None);
+        if refused {
+            assert_eq!(got.unwrap_err().check, "stopping");
+            assert!(
+                of(&w, "new-session").is_empty(),
+                "a refused team opens no session"
+            );
+        } else {
+            let got = got.unwrap();
+            assert_eq!(of(&w, "new-session").len(), 1, "{got:?}");
+            assert!(got["restored"].is_array(), "the reconcile result: {got:?}");
+            assert_eq!(got["leader"]["id"], json!("cccccccccccc"));
+        }
+        assert!(!ran(&w), "nothing launched");
+        w.fakes.hc_done().unwrap();
+    }
 }
 
 #[cfg(test)]

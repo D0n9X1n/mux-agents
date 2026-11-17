@@ -5,9 +5,11 @@ pub mod discover;
 mod existing_tests;
 pub mod identity;
 pub mod index;
+mod leaders;
 pub mod publish;
 #[cfg(test)]
 mod publish_tests;
+pub mod replay;
 pub mod server;
 #[cfg(test)]
 pub(crate) mod tests;
@@ -27,6 +29,7 @@ use crate::{
     mux::native,
     parse::Client,
 };
+pub(crate) use leaders::leader_of;
 
 pub const OUTSIDE: &str = "up needs tmux or rmux for now";
 
@@ -150,8 +153,8 @@ fn team_exists(ctx: &Ctx, ix: &index::Index) -> Res<bool> {
     }
 }
 
-/// Task 9: reconcile a team whose record exists at the anchor (restore-6b, at the index's anchor); create when this
-/// `up` wrote the index (E6.1's `pending` only); anything else waits for Task 10's replay (call 22).
+/// E6 replay (calls 19, 21): every `up` resumes the first unfinished step from the index, the anchor's leader and its
+/// team record. `fresh`: this `up` wrote the index, so its `pending` is this call's and is started, not repaired.
 fn drive(
     ctx: &Ctx,
     caller: &Caller,
@@ -159,58 +162,154 @@ fn drive(
     team: &str,
     fresh: bool,
 ) -> Res<Map<String, Value>> {
+    use replay::Step;
     let mut ix = index::read(ctx, team)?.ok_or_else(|| Refusal::internal("index vanished"))?;
-    let mut reply = Map::new();
-    if team_exists(ctx, &ix)? {
-        let a = ix
-            .anchor
-            .clone()
-            .ok_or_else(|| Refusal::internal("no anchor"))?;
-        let scope = super::team_state::Scope {
-            key: a.key,
-            session: a.session,
+    let reentered = team_exists(ctx, &ix)?;
+    let mut run = Run::default();
+    if fresh {
+        run.shown = Some(publish::start(ctx, caller, &mut ix)?);
+    }
+    for _ in 0..8 {
+        let (leader, id) = leader_of(ctx, &ix)?;
+        // Finding A22: after a committed launch a team record that cannot be read never hides the launch reply.
+        let has_team = match team_exists(ctx, &ix) {
+            Ok(t) => t,
+            Err(e) if run.record.is_some() => {
+                run.team_error = Some(e.message);
+                return reenter_arm(ctx, caller, core, team, &mut ix, run, reentered);
+            }
+            Err(e) => return Err(e),
         };
-        reply.extend(super::reconcile::run(
-            ctx,
-            &super::reconcile::anchor_caller(caller, &scope),
-        )?);
-        reply.insert("team".into(), json!(team));
-        reply.insert("created".into(), json!(false));
-        reply.insert("reentered".into(), json!(true));
-        if let Err(e) = publish::release_all(ctx, &mut ix) {
-            reply.insert("releaseError".into(), e.message.into()); // call 25: a crashed up's release finished here
+        match replay::next(&ix, leader, has_team, run.launched) {
+            Step::Repair => {
+                publish::repair(ctx, caller, &mut ix)?; // its releases stay in the index for E5 (call 35)
+                halt("repaired")?;
+            }
+            Step::Session => run.shown = Some(publish::ensure(ctx, caller, &mut ix)?),
+            Step::Launch => {
+                let p = match run.shown.take() {
+                    Some(p) => p,
+                    None => publish::ensure(ctx, caller, &mut ix)?,
+                };
+                let key = ix
+                    .anchor
+                    .as_ref()
+                    .map(|a| a.key.clone())
+                    .unwrap_or_default();
+                bind_anchor_server(ctx, caller, &key)?; // calls 33, 39: absent off the anchor is `index`
+                run.record = Some(launch(ctx, caller, core, &ix, &p)?);
+                (run.shown, run.launched) = (Some(p), true);
+                run.replayed |= !fresh;
+            }
+            Step::Settle => {
+                let id = id.ok_or_else(|| Refusal::internal("no leader id"))?;
+                leaders::settle_leader(ctx, &ix, &id)?;
+                run.replayed = true;
+            }
+            Step::Team => {
+                let r = run
+                    .record
+                    .clone()
+                    .ok_or_else(|| Refusal::internal("no launch record"))?;
+                if let Err(e) = write_team(ctx, &ix, &r) {
+                    run.team_error = Some(e.message); // finding A22: soft after commit (D25)
+                    return reenter_arm(ctx, caller, core, team, &mut ix, run, reentered);
+                }
+                halt("team")?;
+                run.created = true;
+                run.replayed |= !fresh;
+            }
+            Step::Reenter => return reenter_arm(ctx, caller, core, team, &mut ix, run, reentered),
         }
-        return Ok(reply);
     }
-    if !fresh || ix.anchor.is_some() || ix.view.is_some() {
-        return Err(index::bad(
-            "an earlier up of this team did not finish; run up again with this build",
-        ));
+    Err(Refusal::internal("up did not converge"))
+}
+
+/// What the replay loop carries into the Reenter arm.
+#[derive(Default)]
+struct Run {
+    shown: Option<publish::Published>,
+    record: Option<Value>,
+    team_error: Option<String>,
+    launched: bool,
+    created: bool,
+    replayed: bool,
+}
+
+/// E4 in call 8's order: reconcile (unless this call launched the leader; restore-6c adds leader resume here), the
+/// team record create-only from the leader's current record, `publish::ensure`, views, bar and switch (Task 11),
+/// `presented`, the release. A leader this call launched is the reply's from its launch record (F15: no discovery
+/// after commit). Later groups extend this arm (call 9).
+fn reenter_arm(
+    ctx: &Ctx,
+    caller: &Caller,
+    _core: &Core<'_>,
+    team: &str,
+    ix: &mut index::Index,
+    run: Run,
+    reentered: bool,
+) -> Res<Map<String, Value>> {
+    let a = ix
+        .anchor
+        .clone()
+        .ok_or_else(|| Refusal::internal("no anchor"))?;
+    let scope = super::team_state::Scope {
+        key: a.key,
+        session: a.session,
+    };
+    let mut reply = Map::new();
+    let (mut created, mut replayed, mut team_error) = (run.created, run.replayed, run.team_error);
+    let leader = if run.launched {
+        run.record.clone()
+    } else {
+        let anchor = super::reconcile::anchor_caller(caller, &scope);
+        reply.extend(super::reconcile::run(ctx, &anchor)?);
+        let leader = leader_of(ctx, ix)?.1;
+        let leader = leader
+            .map(|id| leaders::leader_record(ctx, ix, &id))
+            .transpose()?;
+        if let Some(r) = &leader
+            && !team_exists(ctx, ix)?
+        {
+            match write_team(ctx, ix, r) {
+                Ok(()) => (created, replayed) = (true, true),
+                Err(e) => team_error = Some(e.message),
+            }
+        }
+        leader
+    };
+    let shown = match run.shown {
+        Some(p) => p,
+        None => publish::ensure(ctx, caller, ix)?,
+    };
+    if let Some(r) = &run.record {
+        reply.extend(super::spawn::view_reply(r)); // A3b-2: `attached`, or `viewError` (call 23)
     }
-    let shown = publish::start(ctx, caller, &mut ix)?;
-    let record = launch(ctx, caller, core, &ix, &shown)?;
-    let team_error = write_team(ctx, &ix, &record).err();
-    halt("team")?;
-    reply.extend(super::spawn::view_reply(&record)); // A3b-2: `attached`, or `viewError` (call 23)
+    if let Some(e) = team_error {
+        reply.insert("teamRecordError".into(), e.into());
+    }
     for (k, v) in [
         ("team", json!(team)),
         ("session", json!(shown.view.session)),
         ("name", json!(shown.view.name)),
-        ("created", json!(true)),
-        ("replayed", json!(false)),
-        ("reentered", json!(false)),
+        ("created", json!(created)),
+        ("replayed", json!(replayed)),
+        ("reentered", json!(reentered)),
     ] {
         reply.insert(k.into(), v);
     }
-    reply.insert(
-        "leader".into(),
-        json!({"id": record["id"], "name": record["name"], "hcAddress": record["hcAddress"]}),
-    );
-    if let Some(e) = team_error {
-        reply.insert("teamRecordError".into(), e.message.into());
+    if let Some(r) = &leader {
+        reply.insert(
+            "leader".into(),
+            json!({"id": r["id"], "name": r["name"], "hcAddress": r["hcAddress"]}),
+        );
     }
-    let window = text(record.get("window"));
-    present(ctx, caller, &mut ix, &shown, &window, &mut reply)?;
+    let window = run
+        .record
+        .as_ref()
+        .map(|r| text(r.get("window")))
+        .unwrap_or_default();
+    present(ctx, caller, ix, &shown, &window, &mut reply)?;
     Ok(reply)
 }
 
@@ -394,14 +493,4 @@ pub(crate) fn halt(step: &'static str) -> Res<()> {
         return refuse(1, "halted", format!("halted after {step}"));
     }
     Ok(())
-}
-
-/// `$N @M` from new-session's `-P -F`.
-fn ids(stdout: &str) -> Option<(String, String)> {
-    let (s, w) = stdout.trim_end_matches(['\r', '\n']).split_once(' ')?;
-    let id = |t: &str, p: char| {
-        t.strip_prefix(p)
-            .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
-    };
-    (id(s, '$') && id(w, '@')).then(|| (s.into(), w.into()))
 }

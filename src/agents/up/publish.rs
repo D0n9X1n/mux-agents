@@ -286,7 +286,7 @@ pub fn start(ctx: &Ctx, me: &Caller, ix: &mut Index) -> Res<Published> {
     match reply
         .ok()
         .filter(|o| o.code == 0)
-        .and_then(|o| super::ids(&o.stdout))
+        .and_then(|o| ids(&o.stdout))
     {
         Some((session, window)) => {
             answered(ctx, me, &here)?;
@@ -322,4 +322,14 @@ pub fn start(ctx: &Ctx, me: &Caller, ix: &mut Index) -> Res<Published> {
             }
         }
     }
+}
+
+/// `$N @M` from new-session's `-P -F`.
+fn ids(stdout: &str) -> Option<(String, String)> {
+    let (s, w) = stdout.trim_end_matches(['\r', '\n']).split_once(' ')?;
+    let id = |t: &str, p: char| {
+        t.strip_prefix(p)
+            .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+    };
+    (id(s, '$') && id(w, '@')).then(|| (s.into(), w.into()))
 }
