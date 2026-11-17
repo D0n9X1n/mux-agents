@@ -1232,31 +1232,6 @@ const TEST_ONLY: &[(&str, &str, &str)] = &[
         "tests",
     ),
     (
-        "src/agents/message/prelife_stop_tests.rs",
-        "src/agents/message.rs",
-        "prelife_stop_tests",
-    ),
-    (
-        "src/agents/prelife/tests.rs",
-        "src/agents/prelife.rs",
-        "tests",
-    ),
-    (
-        "src/agents/prelife_fixture.rs",
-        "src/agents/mod.rs",
-        "prelife_fixture",
-    ),
-    (
-        "src/agents/prelife_slot_tests.rs",
-        "src/agents/mod.rs",
-        "prelife_slot_tests",
-    ),
-    (
-        "src/agents/prelife_tests.rs",
-        "src/agents/mod.rs",
-        "prelife_tests",
-    ),
-    (
         "src/agents/reconcile_await_tests.rs",
         "src/agents/mod.rs",
         "reconcile_await_tests",
@@ -1280,6 +1255,11 @@ const TEST_ONLY: &[(&str, &str, &str)] = &[
         "src/agents/reconcile_tests.rs",
         "src/agents/mod.rs",
         "reconcile_tests",
+    ),
+    (
+        "src/agents/reconcile_up_tests.rs",
+        "src/agents/mod.rs",
+        "reconcile_up_tests",
     ),
     (
         "src/agents/reconcile_verb_race_tests.rs",

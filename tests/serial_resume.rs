@@ -32,10 +32,9 @@ fn registered(src: &str) -> BTreeSet<String> {
     names
 }
 
-/// Each function whose body, with all whitespace removed (so a rustfmt-split array reads as one), passes an argument
-/// array starting with `"<verb>"` (`live.run(&["resume", ..])`, `by(.., &["up", ..])`, `spawn_by`).
-fn callers(src: &str, verb: &str) -> BTreeSet<String> {
-    let needle = format!("&[\"{verb}\",");
+/// Each function's name and its text with all whitespace removed (so a rustfmt-split array reads as one), from its
+/// declaration line on (a one-line function keeps its body, checklist 21) to the next function.
+fn bodies(src: &str) -> Vec<(String, String)> {
     let mut bodies: Vec<(String, String)> = Vec::new();
     for line in src.lines() {
         let trimmed = line.trim_start();
@@ -43,15 +42,20 @@ fn callers(src: &str, verb: &str) -> BTreeSet<String> {
             .strip_prefix("fn ")
             .or_else(|| trimmed.strip_prefix("pub fn "))
         {
-            bodies.push((
-                rest.split('(').next().unwrap_or("").to_string(),
-                String::new(),
-            ));
+            let (name, tail) = rest.split_once('(').unwrap_or((rest, ""));
+            bodies.push((name.to_string(), tail.split_whitespace().collect()));
         } else if let Some((_, body)) = bodies.last_mut() {
             body.extend(line.split_whitespace());
         }
     }
     bodies
+}
+
+/// Each function that passes an argument array starting with `"<verb>"` (`live.run(&["resume", ..])`,
+/// `by(.., &["up", ..])`, `spawn_by`).
+fn callers(src: &str, verb: &str) -> BTreeSet<String> {
+    let needle = format!("&[\"{verb}\",");
+    bodies(src)
         .into_iter()
         .filter(|(_, b)| b.contains(&needle))
         .map(|(n, _)| n)
@@ -60,6 +64,34 @@ fn callers(src: &str, verb: &str) -> BTreeSet<String> {
 
 fn resume_callers(src: &str) -> BTreeSet<String> {
     callers(src, "resume")
+}
+
+/// Whether `body` calls `name(`: the name not preceded by an identifier character (`close(` is not `lose(`).
+fn calls(body: &str, name: &str) -> bool {
+    let call = format!("{name}(");
+    body.match_indices(&call).any(|(i, _)| {
+        !body[..i]
+            .chars()
+            .next_back()
+            .is_some_and(|c| c.is_ascii_alphanumeric() || c == '_')
+    })
+}
+
+/// r6b call 8: each function that runs `up` or `restore` (with or without arguments) after a core kill (`kill_hard`,
+/// directly or through a function that calls it) reconciles resumed conversations, so it runs alone too.
+fn reconcile_callers(src: &str) -> BTreeSet<String> {
+    let bodies = bodies(src);
+    let killers: Vec<&str> = bodies
+        .iter()
+        .filter(|(_, b)| b.contains(".kill_hard("))
+        .map(|(n, _)| n.as_str())
+        .collect();
+    bodies
+        .iter()
+        .filter(|(_, b)| b.contains(".kill_hard(") || killers.iter().any(|k| calls(b, k)))
+        .filter(|(_, b)| b.contains("&[\"up\"") || b.contains("&[\"restore\""))
+        .map(|(n, _)| n.clone())
+        .collect()
 }
 
 /// The names `serial_resume.txt` lists (comments and blank lines skipped).
@@ -76,7 +108,10 @@ fn listed() -> BTreeSet<String> {
 fn every_live_resume_test_is_listed() {
     let listed = listed();
     let registered: BTreeSet<String> = SOURCES.iter().flat_map(|s| registered(s)).collect();
-    let callers: BTreeSet<String> = SOURCES.iter().flat_map(|s| resume_callers(s)).collect();
+    let callers: BTreeSet<String> = SOURCES
+        .iter()
+        .flat_map(|s| resume_callers(s).into_iter().chain(reconcile_callers(s)))
+        .collect();
     let helpers: Vec<_> = callers.difference(&registered).collect();
     assert!(
         helpers.is_empty(),
@@ -85,7 +120,7 @@ fn every_live_resume_test_is_listed() {
     let missing: Vec<_> = callers.difference(&listed).collect();
     assert!(
         missing.is_empty(),
-        "registered tests running resume, not in serial_resume.txt: {missing:?}"
+        "registered tests running resume or reconciling after a core kill, not in serial_resume.txt: {missing:?}"
     );
     let stale: Vec<_> = listed.difference(&registered).collect();
     assert!(
@@ -141,4 +176,29 @@ fn t() {
 }
 "#;
     assert_eq!(callers(src, "up"), BTreeSet::from(["t".to_string()]));
+}
+
+// r6b call 8 (checklist 21): a test that runs `up` or `restore` after a core kill (`kill_hard`, directly or through a
+// function that calls it) is a reconcile caller. A one-line declaration keeps its body; `&["restore"]` with no
+// arguments counts; a name only inside a longer identifier (`close(` for `lose(`) does not.
+#[test]
+fn a_core_kill_then_up_is_a_reconcile_caller() {
+    let src = r#"
+fn lose(live: &mut Live) { live.core.kill_hard(); }
+#[test]
+fn after_kill() { lose(&mut live); live.run(&["up", "-Client", "claude"]); }
+#[test]
+fn restore_bare() {
+    live.core.kill_hard();
+    live.run(&["restore"]);
+}
+#[test]
+fn no_kill() { live.run(&["up", "-Client", "claude"]); }
+#[test]
+fn closes() { file.close(); live.run(&["up", "-Client", "claude"]); }
+"#;
+    assert_eq!(
+        reconcile_callers(src).into_iter().collect::<Vec<_>>(),
+        ["after_kill", "restore_bare"]
+    );
 }

@@ -1,4 +1,5 @@
-//! Discovery under the admission lock: any leader record of team T under the state root refuses `up`, by its life.
+//! Discovery under the admission lock: a lifecycle leader of team T that ran names the anchor `up` reconciles at;
+//! a pre-lifecycle leader refuses `up`, by its life.
 
 use std::path::Path;
 
@@ -17,46 +18,6 @@ use crate::{
     hc::Core,
     state::fs::read_json,
 };
-
-pub fn refuse_existing(ctx: &Ctx, core: &Core<'_>, key: &str, team: &str) -> Res<()> {
-    let own = ctx.state_root.join(key);
-    for (folder, member) in crate::agents::resume::every_member(ctx)? {
-        let record = match &member {
-            Member::Absent => continue,
-            // PM call 6, ambiguity 15: its session cannot be known; it blocks only the caller's own server key.
-            Member::Unreadable(e) if folder.starts_with(&own) => return Err(e.clone()),
-            Member::Unreadable(_) => continue,
-            Member::Pre(r) => r,
-            Member::Life(g) => g.record(),
-        };
-        if record.get("upTeam").and_then(Value::as_str) != Some(team) {
-            continue;
-        }
-        // R1: one status answers both questions for a lifecycle leader.
-        let life = match &member {
-            Member::Life(g) => {
-                let s = g.status()?;
-                if g.never_ran_recorded(&s)? {
-                    continue;
-                }
-                if s.finished {
-                    Life::Ended
-                } else {
-                    match hc_life(core, &folder, record) {
-                        Life::Ended => Life::Unknown, // R3: hc never ends a lifecycle leader
-                        l => l,
-                    }
-                }
-            }
-            _ => {
-                refuse_pre(core, &folder, &member, record)?;
-                continue;
-            }
-        };
-        return refuse_by(life, record);
-    }
-    Ok(())
-}
 
 /// 6b ambiguity 8, r6b call 6: a lifecycle leader of T that ran (`never_ran_recorded`; torn evidence refuses) names
 /// the anchor (its folder key, its record session). A pre-lifecycle leader refuses as before (prelife-1c G10).
@@ -247,8 +208,9 @@ mod tests {
             if !["pre-run", "aborted", "stopped"].contains(&life) {
                 cf::get(&w, r["hcAddress"].as_str().unwrap(), t);
             }
-            match refuse_existing(&w.ctx, &core, &w.caller().server_key, "T") {
-                Ok(()) => assert_eq!(want, "", "{life}"),
+            match existing(&w.ctx, &core, &w.caller().server_key, "T") {
+                Ok(None) => assert_eq!(want, "", "{life}"),
+                Ok(Some(_)) => panic!("{life}: a pre-lifecycle leader is never an anchor"),
                 Err(e) => assert!(
                     (e.code, e.check) == (2, "leader")
                         && !want.is_empty()
@@ -275,52 +237,38 @@ mod tests {
         crate::state::fs::write_json(&f.join("notice.json"), &json!({"kind": "stopped"})).unwrap();
         (r, f)
     }
-    /// One `up` admission check: connects first (its own `--version` answer), then queues `gets` and runs discovery.
-    /// The fake answers in FIFO order, so a get queued before the connection would be taken by it (re-audit a0586ee).
-    fn up(w: &World, gets: &[(&str, Value)]) -> Res<()> {
+    /// One `up` admission check: connects first (its own `--version` answer), then runs discovery. True when it
+    /// names an anchor (6b ambiguity 8: `up` reconciles it).
+    fn up(w: &World) -> Res<bool> {
         cf::online(w);
         let core = crate::hc::connect(&w.ctx).unwrap();
-        for (address, t) in gets {
-            cf::get(w, address, t.clone());
-        }
-        refuse_existing(&w.ctx, &core, &w.caller().server_key, "T")
+        existing(&w.ctx, &core, &w.caller().server_key, "T").map(|s| s.is_some())
     }
 
-    // R3 (af434f IMPORTANT 13; audits C4, C11): a lifecycle leader ends only by its recorded end; another generation's
-    // terminal is never its own; hc's finished terminal ends nothing.
+    // 6b ambiguity 8 (r6b call 7): a lifecycle leader that ran names its anchor whatever its life; hc is not
+    // asked (reconcile decides each member, the leader included).
     #[test]
-    fn a_lifecycle_leader_ends_only_by_its_recorded_end() {
+    fn a_lifecycle_leader_that_ran_is_the_anchor_whatever_its_life() {
         use crate::{agents::gens, state::evidence::publish};
-        let has = "the team already has a leader: leader in ";
         let w = World::human("");
-        let (r, f) = leader(&w, json!({"generation": "1", "hcName": "m0123abcd"}));
+        let (_, f) = leader(&w, json!({"generation": "1", "hcName": "m0123abcd"}));
         publish(&gens::path(&f, 0, "ended"), &json!({"state": "finished"})).unwrap();
         publish(&gens::path(&f, 1, "commit"), &json!({"committed": true})).unwrap();
-        let address = r["hcAddress"].as_str().unwrap().to_string();
-        let mut shell = cf::wire(&r);
-        (shell["labels"]["mux.gen"], shell["argv"]) = (json!("0"), json!(["/bin/sh", "-l"]));
-        let e = up(&w, &[(&address, shell)]).unwrap_err();
-        assert!(
-            e.message.starts_with(has),
-            "generation 0's shell is not 1's: {}",
-            e.message
-        );
-        let mut done = cf::wire(&r);
-        (done["state"], done["reason"], done["exit_code"]) =
-            (json!("finished"), json!("exited"), json!(0));
-        let e = up(&w, &[(&address, done)]).unwrap_err();
-        assert!(
-            e.message.starts_with(has),
-            "hc's finished is not its end: {}",
-            e.message
-        );
-        publish(&gens::path(&f, 1, "ended"), &json!({"state": "finished"})).unwrap();
-        let e = up(&w, &[]).unwrap_err(); // finished by its record: hc is not asked
-        assert!(
-            e.message.starts_with("the leader leader ended"),
-            "{}",
-            e.message
-        );
+        let want = Scope {
+            key: w.caller().server_key,
+            session: "$3".into(),
+        };
+        for ended in [false, true] {
+            if ended {
+                publish(&gens::path(&f, 1, "ended"), &json!({"state": "finished"})).unwrap();
+            }
+            cf::online(&w);
+            let core = crate::hc::connect(&w.ctx).unwrap();
+            let got = existing(&w.ctx, &core, &w.caller().server_key, "T").unwrap();
+            assert_eq!(got.as_ref(), Some(&want), "ended {ended}");
+        }
+        let asked: Vec<_> = w.fakes.hc_calls().into_iter().map(|c| c.1).collect();
+        assert!(asked.iter().all(|c| c[0] == "--version"), "{asked:?}");
     }
 
     // R2, R5 (af434f CRITICAL 5; audits C3, C4): an undecidable leader refuses `up`; it is never skipped or ended.
@@ -368,7 +316,7 @@ mod tests {
                 }
                 _ => {}
             }
-            assert_eq!(up(&w, &[]).map_err(|e| e.check).err(), Some(want), "{case}");
+            assert_eq!(up(&w).map_err(|e| e.check).err(), Some(want), "{case}");
         }
     }
 
@@ -405,13 +353,13 @@ mod tests {
         std::fs::create_dir_all(&other).unwrap();
         std::fs::rename(&f, other.join("cccccccccccc")).unwrap();
         assert_eq!(
-            up(&w, &[]).map_err(|e| e.check),
-            Ok(()),
+            up(&w).map_err(|e| e.check),
+            Ok(false),
             "another server key: skipped, up proceeds"
         );
         std::fs::rename(other.join("cccccccccccc"), &f).unwrap();
         assert_eq!(
-            up(&w, &[]).map_err(|e| e.check).err(),
+            up(&w).map_err(|e| e.check).err(),
             Some("internal"),
             "own server key: refused"
         );
@@ -424,8 +372,8 @@ mod tests {
         };
         let w = torn(json!({"generation": "1", "hcName": "m0123abcd", "upTeam": "U"}));
         assert_eq!(
-            up(&w, &[]).map_err(|e| e.check),
-            Ok(()),
+            up(&w).map_err(|e| e.check),
+            Ok(false),
             "another team's torn evidence: skipped"
         );
         let w = torn(json!({"generation": "1", "hcName": "m0123abcd", "session": "$9"}));
@@ -452,14 +400,14 @@ mod tests {
         crate::state::fs::write_json(&f.join("record.json"), &r).unwrap();
         publish(&gens::path(&f, 1, "commit"), &json!({"aborted": true})).unwrap();
         assert_eq!(
-            up(&w, &[]).map_err(|e| e.message),
-            Ok(()),
+            up(&w).map_err(|e| e.message),
+            Ok(false),
             "a void first launch is no leader"
         );
     }
 
     // PM call 17 (#138 QA CRITICAL): a void pending generation that `completing` still holds is not done, so the
-    // leader is held and never "ran nothing": `up` refuses it and `scope` is not Outside.
+    // leader is held and never "ran nothing": `up` reconciles it (6b ambiguity 8) and `scope` is not Outside.
     #[test]
     fn a_held_void_pending_leader_is_still_a_leader() {
         use crate::{agents::gens, state::evidence::publish};
@@ -484,13 +432,7 @@ mod tests {
             (true, false, Some(false), false),
             "held is never ran-nothing"
         );
-        let e = up(&w, &[]).unwrap_err();
-        assert_eq!(
-            (e.code, e.check),
-            (2, "leader"),
-            "up refuses: {}",
-            e.message
-        );
+        assert_eq!(up(&w).map_err(|e| e.check), Ok(true), "up reconciles it");
         let got = crate::agents::tree::scope(&w.ctx, &w.caller()).unwrap();
         assert!(
             !matches!(got, crate::agents::tree::Scope::Outside),

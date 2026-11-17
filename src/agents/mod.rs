@@ -64,6 +64,8 @@ mod reconcile_run_tests;
 #[cfg(test)]
 mod reconcile_tests;
 #[cfg(test)]
+mod reconcile_up_tests;
+#[cfg(test)]
 mod reconcile_verb_race_tests;
 #[cfg(test)]
 mod reconcile_verb_tests;

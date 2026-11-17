@@ -10,7 +10,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 /// Every file below `dir`, path to bytes (6b-R2: a byte-identical folder).
-fn bytes(dir: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
+pub(super) fn bytes(dir: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
     let mut all = BTreeMap::new();
     for e in std::fs::read_dir(dir).unwrap() {
         let p = e.unwrap().path();
@@ -71,7 +71,8 @@ fn quiet_rows_answer_without_hc_and_a_prelife_folder_is_untouched() {
     assert_eq!(reply["recover"][0]["reason"], "recovery");
     assert_eq!(ids(&reply, "unknown"), ["ffffffffffff"]);
     assert_eq!(reply["unknown"][0]["check"], "evidence");
-    // shortcut: adopt-3e's `adopt_locked` is not merged yet; its `adoptError` assertion lands with it (r6b call 17).
+    // r6b call 17: adopt-3e's `Tree` refuses the unreadable member; reconcile reports it and still answers.
+    assert_eq!(reply["adoptError"], "evidence");
     assert!(ids(&reply, "restored").is_empty() && ids(&reply, "held").is_empty());
     assert!(lf::calls(&w).is_empty(), "{:?}", lf::calls(&w));
     assert_eq!(
