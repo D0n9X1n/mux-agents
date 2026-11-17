@@ -2773,7 +2773,7 @@ fn wiki_text(page: &str) -> String {
     repo_file(&format!("wiki/{page}.md")).replace("\r\n", "\n")
 }
 
-// PM call 7: the upgrade note names the refusal and both remedies, in both languages.
+// PM call 7, all-calls 14: the upgrade note names the refusal and its remedy, in both languages.
 #[test]
 fn the_upgrade_note_names_the_old_pane_refusal() {
     for (page, line) in [
@@ -2783,8 +2783,8 @@ fn the_upgrade_note_names_the_old_pane_refusal() {
         assert!(file_lines(page).contains(&line.to_string()), "{page}");
     }
 }
-const UPGRADE_0_3: &str = "From 0.2 to 0.3: an agent pane started by 0.2 and not yet running refuses to launch (\"started by an older mux-agent\"). Run `stop <name>` to end it, or `resume <name>` to start it again.";
-const UPGRADE_0_3_ZH: &str = "从 0.2 升级到 0.3:由 0.2 启动且尚未运行的代理窗格会拒绝启动(\"started by an older mux-agent\")。运行 `stop <name>` 结束它,或运行 `resume <name>` 重新启动它。";
+const UPGRADE_0_3: &str = "From 0.2 to 0.3: an agent pane started by 0.2 and not yet running refuses to launch (\"started by an older mux-agent\"). Run `stop <name>` to end it, then start a new agent.";
+const UPGRADE_0_3_ZH: &str = "从 0.2 升级到 0.3:由 0.2 启动且尚未运行的代理窗格会拒绝启动(\"started by an older mux-agent\")。运行 `stop <name>` 结束它,然后启动一个新代理。";
 
 // views-6f v6f call 4: the person's docs name kept shells; SKILL.md does not (agents never run `kept`).
 #[test]

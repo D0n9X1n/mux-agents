@@ -424,18 +424,29 @@ fn stop_ignores_view_and_launcher_process_evidence() {
         w.fakes.hc_done().unwrap();
     }
 }
+/// All-calls 14 (F1): a pane-based legacy record (no hc fields) is stopped by its pane, never through hc: its pane
+/// gone, nothing is killed and it is noticed `stopped`.
 #[test]
-fn stop_refuses_legacy_records_without_core_calls() {
+fn stop_ends_a_legacy_pane_record_without_core_calls() {
     let w = World::human("");
     w.agent_record(ID, json!({}));
     w.fakes.hc_install("hc");
-    let e = call(&w).unwrap_err();
+    w.panes(&[]);
     assert_eq!(
-        (e.code, e.check, e.message.as_str()),
-        (2, "target", "no unique committed member has that identity")
+        Value::Object(call(&w).unwrap()).to_string(),
+        r#"{"name":"worker","pane":"%9","life":"lost"}"#
     );
-    assert!(!w.folder(ID).join("notice.json").exists());
+    let notice: Value = crate::state::fs::read_json(&w.folder(ID).join("notice.json"))
+        .unwrap()
+        .unwrap();
+    assert_eq!(notice["kind"], "stopped");
     assert!(w.fakes.hc_calls().is_empty());
+    assert!(
+        !w.fakes
+            .mux_calls()
+            .iter()
+            .any(|c| c.iter().any(|a| a.contains("kill-pane")))
+    );
     w.fakes.hc_done().unwrap();
 }
 #[test]

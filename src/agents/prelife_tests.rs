@@ -9,8 +9,9 @@ use crate::agents::fixture::World;
 use crate::agents::prelife_fixture::{self as pf, A, Answer, C, D, L, P};
 use crate::agents::team_state::{Scope, open};
 
-/// Outside a team nothing changes for 0.2.x folders: scope Outside; the 0.2 cap still counts hc members only; a
-/// stop or resume of one never kills, launches or writes.
+/// Outside a team nothing changes for 0.2.x folders: scope Outside; the 0.2 cap still counts hc members only. A
+/// stop of a live one proven its own closes its pane and notices it `stopped` (all-calls 14); a resume never kills,
+/// launches or writes.
 #[test]
 fn a_v028_state_folder_changes_nothing_outside_a_team() {
     let w = World::human("");
@@ -35,8 +36,18 @@ fn a_v028_state_folder_changes_nothing_outside_a_team() {
     s.admit_name(None, crate::parse::Client::Claude, "add subtract")
         .expect("the 0.2 cap counts hc members only");
     w.fakes.hc_done().unwrap();
+    // all-calls 14: `stop` ends a live 0.2.x pane proven its own (an identity-checked kill) and notices it `stopped`.
+    pf::v028_pane(&w, &ids[0], pf::Pane028::Live);
     let (code, out) = crate::cli::run(&["stop".to_string(), "old0".to_string()], || Ok(&w.ctx));
-    assert_eq!(code, 2, "{out}");
+    assert_eq!(code, 0, "{out}");
+    assert_eq!(pf::pane_kills(&w).len(), 1, "the pane is closed once");
+    assert_eq!(pf::notice_kind(&w, &ids[0]).as_deref(), Some("stopped"));
+    let stopped = w.folder(&ids[0]).join("notice.json");
+    let rel = stopped.strip_prefix(w.state().join("agents")).unwrap();
+    let stopped_bytes = pf::bytes(&w.state().join("agents"));
+    let mut after = stopped_bytes.clone();
+    after.remove(rel);
+    assert_eq!(after, before, "only the stopped member's notice is new");
     w.panes(&[]);
     let (code, out) = crate::cli::run(&["resume".to_string(), "old0".to_string()], || Ok(&w.ctx));
     assert_eq!(
@@ -49,7 +60,73 @@ fn a_v028_state_folder_changes_nothing_outside_a_team() {
         "{out}"
     );
     assert!(!pf::killed(&w) && !pf::verbs(&w).iter().any(|v| v == "run"));
-    assert_eq!(pf::bytes(&w.state().join("agents")), before);
+    assert_eq!(
+        pf::bytes(&w.state().join("agents")),
+        stopped_bytes,
+        "resume writes nothing"
+    );
+    w.fakes.hc_done().unwrap();
+}
+
+/// All-calls 14: a person's `stop` of a 0.2.x pane-based member whose pane is gone kills nothing and posts the
+/// `stopped` notice; one whose pane runs another command, or whose multiplexer cannot be read, is refused 2 with no
+/// kill and no notice.
+#[test]
+fn a_v028_stop_closes_only_a_proven_pane_and_fails_closed() {
+    for (pane, ok) in [
+        (pf::Pane028::Gone, true),
+        (pf::Pane028::Other, false),
+        (pf::Pane028::Unreachable, false),
+    ] {
+        let w = World::human("");
+        pf::v028(&w, P, "old", pf::End::Live);
+        pf::v028_pane(&w, P, pane);
+        let before = pf::bytes(&w.folder(P));
+        let (code, out) = crate::cli::run(&["stop".to_string(), "old".to_string()], || Ok(&w.ctx));
+        assert!(pf::pane_kills(&w).is_empty(), "{pane:?}: nothing killed");
+        if ok {
+            assert_eq!(code, 0, "{pane:?}: {out}");
+            assert_eq!(pf::notice_kind(&w, P).as_deref(), Some("stopped"));
+            assert_eq!(pf::delivered(&w, "%1", &format!("stop-{P}")), 1, "{pane:?}");
+        } else {
+            assert_eq!(code, 2, "{pane:?}: {out}");
+            assert_eq!(
+                pf::bytes(&w.folder(P)),
+                before,
+                "{pane:?}: no notice, no write"
+            );
+        }
+    }
+}
+
+/// All-calls 14, F2: in a team, a v0.2.8 member recorded `lost` holds its slot (`limit`); while the multiplexer
+/// cannot be read `stop` refuses and it stays held; once its pane is gone `stop` notices it `stopped` and the slot
+/// frees, so the spawn is admitted.
+#[test]
+fn a_lost_v028_member_in_a_team_is_freed_by_stop() {
+    let w = World::human("");
+    let answers = pf::capacity_world(&w);
+    pf::v028(&w, P, "legacy", pf::End::Lost);
+    pf::script(&w, answers.clone());
+    assert_eq!(pf::admit_spawn(&w).map(|_| ()).unwrap_err().check, "limit");
+    w.fakes.hc_done().unwrap();
+    pf::v028_pane(&w, P, pf::Pane028::Unreachable);
+    let (code, out) = crate::cli::run(&["stop".to_string(), "legacy".to_string()], || Ok(&w.ctx));
+    // Fail closed: in a team the stop is refused before it names its target (1 `rmux`); nothing is noticed.
+    assert_ne!(code, 0, "{out}");
+    assert_eq!(
+        pf::notice_kind(&w, P).as_deref(),
+        Some("lost"),
+        "still held"
+    );
+    assert!(pf::pane_kills(&w).is_empty());
+    pf::v028_pane(&w, P, pf::Pane028::Gone);
+    let (code, out) = crate::cli::run(&["stop".to_string(), "legacy".to_string()], || Ok(&w.ctx));
+    assert_eq!(code, 0, "{out}");
+    assert!(pf::pane_kills(&w).is_empty());
+    assert_eq!(pf::notice_kind(&w, P).as_deref(), Some("stopped"));
+    pf::script(&w, answers);
+    pf::admit_spawn(&w).expect("the stopped member frees its slot");
     w.fakes.hc_done().unwrap();
 }
 
