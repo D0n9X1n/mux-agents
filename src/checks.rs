@@ -737,7 +737,8 @@ fn windows_claude_directory(ctx: &Ctx, agent: &Agent) -> Option<String> {
 /// Unix: the agent's kernel cwd, read between two starts equal to the agent's. A session file proved missing
 /// leaves the kernel cwd; one that is present must be an object whose cwd equals it, and any other failure
 /// (permission, a folder, oversized, malformed) refuses (Unix.ps1:142-161). sessionId and procStart stay
-/// Windows-only (claude-code#36213).
+/// Windows-only: on Unix, Claude Code keeps the old sessionId in that file after `/clear`, which would refuse a
+/// caller falsely.
 fn unix_claude_directory(ctx: &Ctx, agent: &Agent) -> Option<String> {
     let same = || {
         ctx.os
@@ -1623,7 +1624,8 @@ mod tests {
         let cwd = work.path().to_str().unwrap();
         let session = serde_json::json!({"pid": 150, "cwd": cwd, "sessionId": OTHER_SID});
         std::fs::write(sessions(home.path()).join("150.json"), session.to_string()).unwrap();
-        // sessionId and procStart stay Windows-only (claude-code#36213); the cwd must equal the kernel's.
+        // sessionId and procStart stay Windows-only (after `/clear` Claude Code keeps an old sessionId there); the cwd must
+        // equal the kernel's.
         assert_eq!(
             unix_directory(home.path(), &[Some(1500), Some(1500)], Some(cwd)).0,
             found(work.path())

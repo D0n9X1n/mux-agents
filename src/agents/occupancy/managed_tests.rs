@@ -135,7 +135,7 @@ fn an_unmanaged_client_is_held_only_by_its_own_report() {
         ("torn", Some((Rule::Evidence, Some(7200)))),
         ("no valid id", Some((Rule::Evidence, Some(7200)))),
         ("gone, no entry", Some((Rule::Evidence, Some(7200)))),
-        ("key unresolved", None),
+        ("key unresolved", Some((Rule::Evidence, Some(7200)))),
     ];
     for (case, want) in cases {
         let w = World::human("");
@@ -224,6 +224,28 @@ fn an_unmanaged_native_copilot_is_judged_by_its_loaders_report() {
             "report under {pid}: A is free"
         );
     }
+}
+
+// H4.4 fails closed when an unmanaged client's report cannot be looked up: a key that cannot be resolved (the process
+// cannot be opened) holds as evidence, since its report could name the conversation.
+#[test]
+fn an_unmanaged_client_whose_key_cannot_be_resolved_holds() {
+    let w = World::human("");
+    w.fakes.process(Row {
+        pid: 7200,
+        ppid: 1,
+        start: Some(1200),
+        path: Some("/usr/bin/claude".into()),
+        argv: Some(vec!["claude".into()]),
+        image: Some("claude".into()),
+    });
+    w.fakes.client(7200, Client::Claude);
+    w.fakes.opens(7200, &[None]);
+    assert_eq!(
+        held(&w, X, Client::Claude),
+        Some((Rule::Evidence, Some(7200))),
+        "a key that cannot be resolved"
+    );
 }
 
 // H3, call 13: no client.json yet (pending, or the launcher paused after launcher.json): the generation reserves its

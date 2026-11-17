@@ -65,14 +65,15 @@ const SOURCE = /^[a-z]{1,32}$/
 // queue, so an earlier session's report never lands after a later one's.
 let sessions: Promise<void> = Promise.resolve()
 
-// report-2b K3: this client's session, from classic.SessionStart, where a managed client can run (inMux: an hc
-// terminal, tmux or rmux). Queued after the earlier session reports, never awaited, not behind the activity reports;
-// every failure is dropped.
+// report-2b K3: this client's session, from classic.SessionStart (start, and every in-session /resume), wherever the
+// client runs. A managed member needs it for its readiness; any other client needs it so occupancy knows which
+// conversation it is on: a person's own session that switched into a member's conversation then holds it, and one on
+// another conversation holds nothing. Queued after the earlier session reports, never awaited, not behind the activity
+// reports; every failure is dropped.
 export function reportSession($: EngineInterface, sessionId: unknown, source: unknown) {
   if (typeof sessionId !== 'string' || !SESSION_ID.test(sessionId)) return
   const word = typeof source === 'string' && SOURCE.test(source) ? source : 'unknown'
   sessions = sessions.then(async () => {
-    if (!(await inMux($))) return
     await $.process.run(await entryArgv($, ['report', '-Session', sessionId, '-Source', word, '-Quiet']), { timeoutMs: 30000 })
   }).catch(() => {})
 }

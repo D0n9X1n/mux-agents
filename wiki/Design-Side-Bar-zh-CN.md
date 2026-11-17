@@ -75,7 +75,7 @@
   - 守护：被移动的侧边栏回到原位且焦点不变，放大的窗口不受干扰，3 次失败暂停修复，窗口或选项改变时调整大小。
 - **真实环境测试（Linux、macOS）。** 真实的 tmux 3.8、tmux 3.2a 和 rmux 0.10.0 服务器：侧边栏在右边缘按其宽度打开，绘制面板，布局被破坏后回到原位，`-Close` 关闭它。
 - **Windows 控制台。** 测试二进制文件以自己的隐藏控制台再次运行自身：设置进入原始模式，写入的记录按其字节读回，单独的调整大小记录不会提前结束等待，Drop 恢复模式，设置之后或之中的 Ctrl-Break 都会使模式恢复。
-- **真实环境测试（Windows）。** `tests/live_windows.rs` 在私有的 rmux 0.10.0 服务器中运行（CI 中使用调试构建，因为发布版守护进程无法在运行器的作业对象中启动，rmux#238）：在侧边栏中按 `j` 再按 Enter 以及点击都会切换到代理，Ctrl-C 结束手动运行的 `watch` 并关闭鼠标报告。
+- **真实环境测试（Windows）。** `tests/live_windows.rs` 在私有的 rmux 0.10.0 服务器中运行（CI 中使用调试构建，因为发布版守护进程无法在运行器的作业对象中启动）：在侧边栏中按 `j` 再按 Enter 以及点击都会切换到代理，Ctrl-C 结束手动运行的 `watch` 并关闭鼠标报告。
 - **Claude Code 窗格。** `claude plugin test` 下的 `tests/claude/register.test.tsx` 和 `tests/claude/board.test.ts`：一次 spawn 工具调用打开窗格，桩化的 `list` 渲染计数和各行，刷新失败时保留上一次的面板。lint 作业安装 Claude Code 2.1.310，并运行 `claude plugin validate .` 和 `claude plugin test .`。
 
 ## 必过项

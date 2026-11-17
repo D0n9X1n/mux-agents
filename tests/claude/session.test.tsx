@@ -1,7 +1,7 @@
 import { expect, mock, test } from 'claude-code/testing'
 
 // report-2b K3: Claude names its session from classic.SessionStart, the event that carries session_id (session.start
-// carries none). Only where a managed client can run (inMux in hooks/activity.ts); never awaited.
+// carries none). Wherever the client runs; never awaited.
 const SID = '0f11fc2f-2032-48ef-a920-4af2a8e5af50'
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
 const ran = { value: { exitCode: 0, stdout: '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
@@ -54,11 +54,14 @@ test('on Windows_NT the session report runs cmd.exe /d /c <root>\\scripts\\mux-a
 })
 
 // (fix 2, re-audit 3) One classic.SessionStart per test.
-test('outside any terminal nothing runs', async ($, on) => {
+// Outside tmux, rmux and hc the session is still reported: occupancy reads it, so a person's own Claude Code that
+// switched into a member's conversation with /resume keeps that member from being resumed into it twice.
+test('outside any multiplexer the session is still reported', async ($, on) => {
   const { seen, clock } = world(on, {})
-  await ($ as any).classic.SessionStart({ source: 'startup', session_id: SID })
+  await ($ as any).classic.SessionStart({ source: 'resume', session_id: SID })
   await clock.settle()
-  expect(seen.argv).toEqual([])
+  expect(seen.argv.length).toBe(1)
+  expect(seen.argv[0].slice(-6)).toEqual(['report', '-Session', SID, '-Source', 'resume', '-Quiet'])
 })
 
 test('a malformed session id runs nothing', async ($, on) => {
@@ -76,25 +79,28 @@ test('an odd source is reported as unknown', async ($, on) => {
 })
 
 
-// r2b call 25 (QA): session reports are delivered in order. The first report's HC_TERMINAL_ID lookup is held;
-// a second SessionStart (a /clear) comes meanwhile. The second report must wait for the first, so an earlier session
+// r2b call 25 (QA): session reports are delivered in order. The first report's run is held; a second SessionStart
+// (a /clear) comes meanwhile. The second report must not start until the first has finished, so an earlier session
 // can never finish after a later one and overwrite its entry; SessionStart still waits for neither.
-test('a later session report waits for an earlier one whose lookup is held', async ($, on) => {
+test('a later session report waits for an earlier one that is still running', async ($, on) => {
   const SID2 = '1e22fc2f-2032-48ef-a920-4af2a8e5af51'
-  const seen = { argv: [] as string[][] }
+  const started: string[][] = []
+  const finished: string[] = []
   const clock = mock.clock(on)
-  let lookups = 0
-  on('env.get', async (_: unknown, e: { name: string }) => {
-    if (e.name === 'HC_TERMINAL_ID' && lookups++ === 0) await clock.sleep(60000)
-    return { value: e.name === 'HC_TERMINAL_ID' ? 't1' : undefined }
-  })
+  on('env.get', () => ({ value: undefined }))
   on('classic.SessionStart', () => ({}))
-  on('process.run', async (_: unknown, e: { argv: string[] }) => { seen.argv.push([...e.argv]); return ran })
+  on('process.run', async (_: unknown, e: { argv: string[] }) => {
+    started.push([...e.argv])
+    if (started.length === 1) await clock.sleep(60000)
+    finished.push(e.argv[e.argv.indexOf('-Session') + 1])
+    return ran
+  })
   await ($ as any).classic.SessionStart({ source: 'startup', session_id: SID })
   await ($ as any).classic.SessionStart({ source: 'clear', session_id: SID2 })
   await clock.settle()
-  expect(seen.argv).toEqual([])
+  expect(started.length).toBe(1)
   await clock.advance(60000)
   await clock.settle()
-  expect(seen.argv.map(a => [a[4], a[6]])).toEqual([[SID, 'startup'], [SID2, 'clear']])
+  expect(started.map(a => [a[4], a[6]])).toEqual([[SID, 'startup'], [SID2, 'clear']])
+  expect(finished).toEqual([SID, SID2])
 })

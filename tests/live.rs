@@ -6061,7 +6061,7 @@ hc {}:
                     .then_some(())
             });
             let (_, third) = live.run(&["up", "-Client", "claude"]);
-            assert_eq!(third["restored"][0]["id"], json!(ids[2]), "{mux:?}");
+            assert_eq!(third["restored"][0]["id"], json!(ids[2]), "{mux:?} {third}");
         }
     }
 

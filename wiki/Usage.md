@@ -123,7 +123,7 @@ Agents start with permission prompts off, so mux-agents never gives an agent mor
 - `policy`: the caller already runs with bypass or allow-all.
 - `flags`: every client command line from the agent up to the pane uses only allowlisted flags.
 - `directory`: the caller's working directory can be confirmed; the agent starts there.
-- `tagged`: the caller is not itself an agent; children cannot spawn.
+- `tagged`: the caller is not an agent outside a team. A member of an `up` team may spawn its own children, down to depth 3 (`depth`).
 - `cap`: fewer than 6 agents are live in the session.
 
 Children run `claude --dangerously-skip-permissions --effort high` or `copilot --no-sandbox --allow-all`, in the caller's directory.
@@ -173,7 +173,7 @@ Every refusal is one JSON line with `check` naming the cause:
 | `sandbox` | the caller runs in a sandbox (`SANDBOX_RUNTIME=1`, a macOS sandbox, Linux `NoNewPrivs`, a restricted Windows token) | run the client outside the sandbox |
 | `policy` | the caller is not in bypass or allow-all; for Claude Code, `reason` says which half failed: `transcript: no session id`, `transcript: not found`, `transcript: no mode`, `transcript: other mode`, `screen: unreadable`, `screen: no mode line` or `screen: other mode` | Claude Code: bypass permissions (`--dangerously-skip-permissions` or Shift+Tab), with the footer badge `⏵⏵ bypass permissions on` in the pane's last 8 rows; Copilot CLI: `--allow-all` |
 | `cap` | 6 agents already live in this session | `stop` one |
-| `tagged` | an agent tried to spawn, open the side bar or set `placement` | only the top-level chat spawns |
+| `tagged` | an agent outside a team tried to spawn, or a member tried to open the side bar or set `placement` | outside a team only the top-level chat spawns; in a team, members spawn down the tree and only the person or the leader sets placement |
 | `flags` | a `claude` or `copilot` process from the agent up to the pane has a flag outside the allowlist, or its command line cannot be read | restart the client with only allowlisted flags |
 | `directory` | the caller's launch directory cannot be confirmed from its session or process, or is not an existing absolute folder | start the client in an existing folder and stay in it |
 | `name` | `-Name` is not 1-24 lowercase letters, digits or hyphens starting with a letter, is `parent`, `root` or `all`, or is taken in this session; or an agent record cannot be read, so names cannot be checked | use the free name the message suggests, or another; for an unreadable record, check that agent's folder in the state folder |

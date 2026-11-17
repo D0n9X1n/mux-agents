@@ -75,7 +75,7 @@ In the main chat session, show a side bar with the agent count and one line per 
   - Keeper: a moved bar goes back and the focus stays, a zoomed window is left alone, 3 failures pause repair, a changed window or option resizes.
 - **Live (Linux, macOS).** Real tmux 3.8, tmux 3.2a and rmux 0.10.0 servers: the bar opens at the right edge at its width, draws the board, goes back after the layout is damaged, and `-Close` closes it.
 - **Windows console.** The test binary runs itself again with a hidden console of its own: setup takes the raw mode, typed records come back as their bytes, a resize alone never ends a wait early, Drop restores the mode, and Ctrl-Break after or during setup leaves the mode restored.
-- **Live (Windows).** `tests/live_windows.rs` in a private rmux 0.10.0 server (a debug build in CI, since the release daemon cannot start in a runner's job object, rmux#238): `j` then Enter and a click on the bar focus an agent, and Ctrl-C ends a hand-run `watch` with mouse reports off.
+- **Live (Windows).** `tests/live_windows.rs` in a private rmux 0.10.0 server (a debug build in CI, since the release daemon cannot start in a runner's job object): `j` then Enter and a click on the bar focus an agent, and Ctrl-C ends a hand-run `watch` with mouse reports off.
 - **Claude Code pane.** `tests/claude/register.test.tsx` and `tests/claude/board.test.ts` under `claude plugin test`: a spawn tool call opens the pane, a stubbed `list` renders count and rows, a failed refresh keeps the last board. The lint job installs Claude Code 2.1.310 and runs `claude plugin validate .` and `claude plugin test .`.
 
 ## Must-pass

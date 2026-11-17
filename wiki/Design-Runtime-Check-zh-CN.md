@@ -12,7 +12,7 @@
 2. 覆盖开关：`MUX_AGENTS_ALLOW_AFFECTED_DOTNET` 恰好设为 `1`。此时回复带有 `advisory`。
 3. 版本取自正在运行的运行时的 `AssemblyInformationalVersion`（持有 `[object]` 的程序集），绝不取 `$PSVersionTable`。
 4. 不检查 Windows。
-5. 已修复的运行时可能无法创建命名互斥体（没有用户数据库条目的 uid；dotnet/runtime#136236，见于 10.0.13）。创建会重试一次；第二次失败以 2 `lock` 拒绝，并指出 `XDG_RUNTIME_DIR`。
+5. 已修复的运行时可能无法创建命名互斥体（没有用户数据库条目的 uid，见于 10.0.13）。创建会重试一次；第二次失败以 2 `lock` 拒绝，并指出 `XDG_RUNTIME_DIR`。
 6. 合入 main，不打 v0.1.1 标签；v0.1.0 的 zip 早于此检查。
 
 ## 版本规则

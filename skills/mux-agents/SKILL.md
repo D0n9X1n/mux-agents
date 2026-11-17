@@ -26,7 +26,7 @@ The commands below, and the Reply and Listen lines, run as-is in the Bash tool. 
 - The first `spawn` opens a narrow side bar beside you showing how many agents run and what each is doing. `sidebar -Close` closes it for the session; `sidebar` opens it again.
 - Never type into panes.
 - Run `focus` only when the user asks.
-- Children cannot spawn.
+- In a team (started with `up`), a member may spawn its own children, down to depth 3, while the team has fewer than 6 members besides the leader and spawn budget left. Outside a team, children cannot spawn.
 
 ## Commands
 
@@ -115,7 +115,8 @@ Your first message names the notebook and lists its newest titles. When another 
 - `policy`: the caller's live policy is unreadable or is neither bypass nor allow-all. For Claude Code, `reason` says whether the transcript or the screen failed and why (for example `screen: no mode line`).
 - `flags`: a flag outside the allowlist, or an unreadable command line, on any `claude` or `copilot` process from the agent up to the pane.
 - `directory`: the caller's launch directory cannot be confirmed.
-- `tagged`: a spawn, a side bar or `placement` from an agent pane; children cannot spawn, open the side bar or choose where agents open.
+- `tagged`: a spawn, a side bar or `placement` from an agent pane outside a team, or a side bar or `placement` from a team member; only the person or the team's leader opens the side bar or chooses where agents open.
+- `depth`: a team member's child would be deeper than 3.
 - `cap`: 6 live agents in the session.
 - `limit`: the team already has 6 members besides the leader. The message names each member made before v0.3.0 that holds a slot: `mux-agent stop <name>` frees one whose shell is lost or ended (nothing is killed) and stops one that runs; one hc cannot show stays held.
 - `name`: a bad or taken name.

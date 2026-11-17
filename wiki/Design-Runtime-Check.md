@@ -12,7 +12,7 @@ On Linux and macOS, .NET 8.0.0–8.0.31, 9.0.0–9.0.20, 10.0.0–10.0.12 and 11
 2. Override: `MUX_AGENTS_ALLOW_AFFECTED_DOTNET` set to exactly `1`. Replies then carry `advisory`.
 3. The version is the running runtime's `AssemblyInformationalVersion` (of the assembly holding `[object]`), never `$PSVersionTable`.
 4. Windows is not checked.
-5. Fixed runtimes can fail to create a named mutex (a uid with no user-database entry; dotnet/runtime#136236 on 10.0.13). Creation is retried once; a second failure refuses 2 `lock` naming `XDG_RUNTIME_DIR`.
+5. Fixed runtimes can fail to create a named mutex (a uid with no user-database entry, seen on 10.0.13). Creation is retried once; a second failure refuses 2 `lock` naming `XDG_RUNTIME_DIR`.
 6. Land on main, no v0.1.1 tag; the v0.1.0 zip predates the check.
 
 ## Version rule

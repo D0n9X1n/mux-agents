@@ -123,7 +123,7 @@ flowchart LR
 - `policy`：调用者已经以绕过权限或全部允许的方式运行。
 - `flags`：从代理到窗格的每个客户端命令行都只使用允许列表中的参数。
 - `directory`：能确认调用者的工作目录；代理在该目录中启动。
-- `tagged`：调用者本身不是代理；子代理不能再启动代理。
+- `tagged`：调用者不是团队之外的代理。`up` 团队的成员可以启动自己的子代理，最深到第 3 层（`depth`）。
 - `cap`：会话中存活的代理少于 6 个。
 
 子代理以 `claude --dangerously-skip-permissions --effort high` 或 `copilot --no-sandbox --allow-all` 运行，位于调用者的目录中。
@@ -173,7 +173,7 @@ copilot plugin marketplace update mux-agents && copilot plugin update mux-agents
 | `sandbox` | 调用者在沙箱中运行（`SANDBOX_RUNTIME=1`、macOS 沙箱、Linux `NoNewPrivs`、受限的 Windows 令牌） | 在沙箱外运行客户端 |
 | `policy` | 调用者没有以绕过权限或全部允许的方式运行；对 Claude Code，`reason` 指明哪一半未通过：`transcript: no session id`、`transcript: not found`、`transcript: no mode`、`transcript: other mode`、`screen: unreadable`、`screen: no mode line` 或 `screen: other mode` | Claude Code：绕过权限（`--dangerously-skip-permissions` 或 Shift+Tab），并让页脚标记 `⏵⏵ bypass permissions on` 出现在窗格的最后 8 行内；Copilot CLI：`--allow-all` |
 | `cap` | 此会话中已有 6 个存活代理 | `stop` 其中一个 |
-| `tagged` | 代理尝试启动代理、打开侧边栏或设置 `placement` | 只有顶层聊天可以启动代理 |
+| `tagged` | 团队之外的代理尝试启动代理，或成员尝试打开侧边栏或设置 `placement` | 团队之外只有顶层聊天可以启动代理；在团队中，成员可以沿树向下启动代理，只有用户或领导者设置 placement |
 | `flags` | 从代理到窗格之间的某个 `claude` 或 `copilot` 进程带有允许列表之外的标志，或其命令行无法读取 | 只用允许列表中的标志重新启动客户端 |
 | `directory` | 无法从调用者的会话或进程确认其启动目录，或该目录不是一个存在的绝对路径文件夹 | 在一个存在的文件夹中启动客户端，并留在该文件夹 |
 | `name` | `-Name` 不是以字母开头的 1-24 个小写字母、数字或连字符，是 `parent`、`root` 或 `all`，或在此会话中已被占用；或某个代理记录无法读取，因而无法检查名字 | 使用消息建议的空闲名字或另选一个；记录无法读取时，检查状态文件夹中该代理的文件夹 |

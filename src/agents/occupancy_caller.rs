@@ -95,14 +95,17 @@ pub(super) fn own_report(ctx: &Ctx, kind: Client, key: (u32, i64), wanted: &str)
 
 /// H4.4: an unmanaged client `row` of `kind`, judged by its own newest report, keyed as its hook writes it
 /// (`ancestry::identity`: a Unix native `copilot` by its npm loader). `Unmanaged` when the report names `wanted`;
-/// `Evidence` when it cannot be read or names no valid id (R2), or its process is gone with no entry left. With no
-/// report (or a key that cannot be resolved) a row whose argv or start cannot be read may be on any conversation, so it
-/// holds as `Unbound` (H4.5); a readable one holds nothing. A report naming another conversation holds nothing.
+/// `Evidence` when it cannot be read or names no valid id (R2), its process is gone with no entry left, or its key
+/// cannot be resolved (its report could be anywhere). With no report, a row whose argv or start cannot be read may be
+/// on any conversation, so it holds as `Unbound` (H4.5); a readable one holds nothing, and a report naming another
+/// conversation holds nothing. Known limit: a Unix native `copilot` whose npm loader was killed while it survived is
+/// keyed by itself, so the report its loader wrote is not found; holding every such native instead would block resume
+/// for every directly run `copilot`.
 pub(super) fn unmanaged_report(ctx: &Ctx, row: &Row, kind: Client, wanted: &str) -> Option<Rule> {
-    let unread = row.argv.is_none() || row.start.is_none();
     let Some(key) = crate::agents::ancestry::identity(ctx, row, kind) else {
-        return unread.then_some(Rule::Unbound);
+        return Some(Rule::Evidence);
     };
+    let unread = row.argv.is_none() || row.start.is_none();
     match registry(ctx, kind, key.0, key.1) {
         Err(_) => Some(Rule::Evidence),
         Ok(live::Found { entry: None, gone }) => {

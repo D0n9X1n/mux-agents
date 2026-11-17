@@ -6,7 +6,7 @@
 //! Run with `cargo test --features live --test live_windows -- --nocapture`. Without rmux on PATH each test is
 //! skipped, unless MUX_AGENTS_LIVE_REQUIRE names `rmux`: then it fails. In CI, rmux 0.10.0 runs from a debug build
 //! with RMUX_ALLOW_INTERNAL_DAEMON_IN_CALLER_JOB=1, since a release rmux 0.10.0 cannot start its daemon inside a
-//! runner's job object (rmux#238).
+//! runner's job object (it fails with "Access is denied").
 
 #[path = "support/private_core.rs"]
 mod private_core;

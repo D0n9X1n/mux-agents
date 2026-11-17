@@ -34,7 +34,7 @@
 - **端点。** Unix 上的 `$TMUX` 必须匹配 `^(/[^,\r\n]+),(\d+),(-?\d+)$`。调用仍是 `<mux> -S <socket> -N …`；探测行照旧校验。
 - **调用链。** Unix 上调用者与代理之间允许的 shell：`sh`、`bash`、`zsh`、`fish`、`dash`、`ksh`、`tcsh`、`pwsh`。代理是最近的这样一个进程：真实路径为 `*/claude/versions/*` 或基本名为 `claude`、基本名为 `copilot`，或其脚本的 `realpath` 以 `@github/copilot/npm-loader.js` 结尾的 `node`（node 选项按失败即关闭读取：未知选项不识别为任何客户端）。启动值精确比较；100 ns/µs 的取整仍只用于 Windows。
 - **C3** 在 Unix 上从 `Processes` 读取 argv，而不是拆分字符串。允许列表不变。
-- **C5。** Unix 上的 Claude：取代理的内核 cwd，在两次相等的启动值读取之间读取；若 `~/.claude/sessions/<pid>.json` 存在，其 `cwd` 必须一致。`sessionId`/`procStart` 检查仍只用于 Windows，从而消除 `/clear` 之后的误拒（claude-code#36213）。Copilot：所有平台都用 `workspace.yaml` 的 `cwd`。
+- **C5。** Unix 上的 Claude：取代理的内核 cwd，在两次相等的启动值读取之间读取；若 `~/.claude/sessions/<pid>.json` 存在，其 `cwd` 必须一致。`sessionId`/`procStart` 检查仍只用于 Windows，从而消除 `/clear` 之后的误拒（Claude Code 在 `/clear` 之后仍保留旧的 sessionId）。Copilot：所有平台都用 `workspace.yaml` 的 `cwd`。
 - **停止。** `kill-pane` 照旧关闭窗格及其进程组。残留进程只通过上述 Linux `pidfd` 杀死；否则保留并报告（`survivors` 附 pid），从不按 PID 发信号。
 - **状态私密性。** Windows ACL 检查不变。在 Unix 上从 `/` 向下逐级检查。状态根之上每个已存在的文件夹必须属于 root 或当前用户，且除非设置了粘滞位，不得被组或其他用户写入（OpenSSH StrictModes）；在 macOS 上这些文件夹只允许 deny ACE，因为 allow ACE 优先于模式位和粘滞位。缺失的文件夹用 `mkdir(2)` 以 `0700` 创建，遇到任何已存在的条目（包括链接）都会失败，然后 `chmod 0700`。状态根及其下的每个文件夹必须：恰好为 `0700`；属于有效 uid；没有扩展 ACL（`ls -ld` 中没有 `+`，macOS 上 `ls -lde` 中没有 ACE 行，这也能发现继承的条目）；规范路径上不是链接；两次 `stat` 读取的 dev:inode 相同。`id`、`stat`、`ls` 和 `realpath` 按完全限定的 `PATH` 文件夹中的完整路径启动，从不取自当前目录。其他任何情况或检查失败，都拒绝 `state`。
 - **启动器。** 在 `PATH` 上查找不带 `.exe` 的 `claude`/`copilot`，使用 `$PSHOME/pwsh`，删除父级的客户端身份变量（删除，而不是留空），不重定向地启动客户端，使其拥有窗格的终端。

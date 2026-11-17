@@ -4214,13 +4214,23 @@ fn issue_refs(text: &str) -> Vec<String> {
     let b = text.as_bytes();
     let mut found = Vec::new();
     for (i, _) in text.match_indices('#') {
-        if i > 0 && (b[i - 1].is_ascii_alphanumeric() || b"&/#{".contains(&b[i - 1])) {
+        // A word glued to it (`repo#12`, `owner/repo#12`) is another project's issue: still a citation. A `&` or
+        // `{` before it is an HTML entity or a format, a `#` or `/` a path or a sed delimiter.
+        let glued = i > 0 && b[i - 1].is_ascii_alphabetic() && {
+            let word =
+                text[..i].rsplit(|c: char| !(c.is_ascii_alphanumeric() || "-_./".contains(c)));
+            word.clone()
+                .next()
+                .is_some_and(|w| w.len() > 1 && !w.chars().all(|c| c.is_ascii_hexdigit()))
+        };
+        if i > 0 && !glued && (b[i - 1].is_ascii_alphanumeric() || b"&/#{".contains(&b[i - 1])) {
             continue;
         }
         let digits = b[i + 1..].iter().take_while(|c| c.is_ascii_digit()).count();
         let next = b.get(i + 1 + digits).copied().unwrap_or(b' ');
-        // More than four digits is an id or a hash, never an issue number.
-        if digits == 0 || digits > 4 || next.is_ascii_alphanumeric() || next == b'#' {
+        // More than four digits is an id or a hash, never this project's issue number; another project's runs to six.
+        let most = if glued { 6 } else { 4 };
+        if digits == 0 || digits > most || next.is_ascii_alphanumeric() || next == b'#' {
             continue;
         }
         found.push(text[i..i + 1 + digits].to_string());
@@ -4234,13 +4244,17 @@ fn issue_refs_finds_issue_numbers_only() {
         issue_refs("fixed (#103), see #7 and #12:"),
         ["#103", "#7", "#12"]
     );
+    assert_eq!(
+        issue_refs("upstream claude-code#36213 and dotnet/runtime#136236; rmux#238."),
+        ["#36213", "#136236", "#238"],
+        "another project's issue, glued to its name"
+    );
     for none in [
         "#1111111111111111",
         "#1e1e1e",
         "#[cfg(test)]",
         "#{pane_id}",
         "s#<n>#20#g",
-        "a#3",
         "x/#4",
         "&#38;",
         "##5",

@@ -310,7 +310,7 @@ pub(crate) fn live_panes(
     members
         .into_iter()
         .filter_map(|(p, r)| {
-            let row = proven(ctx, caller, &p, &rows).ok()??;
+            let (row, _) = proven(ctx, caller, &p, &rows).ok()??;
             let window = row.window.clone();
             Some((p, r, window))
         })
@@ -343,12 +343,13 @@ pub(crate) fn close_pane(ctx: &crate::ctx::Ctx, caller: &Caller, p: &PaneMember)
     let unreadable = |_: Refusal| refusal("state", format!("{} {PANE_UNREADABLE}", p.name));
     let unproven = || refusal("state", format!("{} {PANE_UNPROVEN}", p.name));
     let rows = registry::rows(ctx, caller).map_err(unreadable)?;
-    let Some(row) = proven(ctx, caller, p, &rows).map_err(|()| unproven())? else {
+    let Some((row, pid)) = proven(ctx, caller, p, &rows).map_err(|()| unproven())? else {
         return Ok(false);
     };
+    // The kill is bound to the very pid the proof checked, never read again: a pane respawned in between is spared.
     let launch = Launch {
         command: p.command.clone(),
-        pid: launcher_pid(ctx, caller, &p.id),
+        pid: Some(pid),
     };
     let argv = registry::bound(&p.pane, launch.live(), format!("kill-pane -t {}", p.pane));
     let argv: Vec<&str> = argv.iter().map(String::as_str).collect();
@@ -364,21 +365,23 @@ pub(crate) fn close_pane(ctx: &crate::ctx::Ctx, caller: &Caller, p: &PaneMember)
 }
 
 /// The row at `p`'s pane in `rows`, when it is live and proven `p`'s launch: it runs exactly its `startCommand` with
-/// launcher.json's pid, which the process table lists with launcher.json's start. None: no pane there. Err: a pane
-/// there that is not proven.
+/// launcher.json's pid, which the process table lists with launcher.json's start; with that pid. None: no pane there.
+/// Err: a pane there that is not proven.
 fn proven<'a>(
     ctx: &crate::ctx::Ctx,
     caller: &Caller,
     p: &PaneMember,
     rows: &'a [crate::agents::registry::Row],
-) -> Result<Option<&'a crate::agents::registry::Row>, ()> {
+) -> Result<Option<(&'a crate::agents::registry::Row, u32)>, ()> {
     let Some(row) = rows.iter().find(|r| r.pane == p.pane) else {
         return Ok(None);
     };
-    let pid = launcher_pid(ctx, caller, &p.id);
-    let ok =
-        !row.dead && row.command == p.command && pid.is_some_and(|pid| row.pid == pid.to_string());
-    if ok { Ok(Some(row)) } else { Err(()) }
+    match launcher_pid(ctx, caller, &p.id) {
+        Some(pid) if !row.dead && row.command == p.command && row.pid == pid.to_string() => {
+            Ok(Some((row, pid)))
+        }
+        _ => Err(()),
+    }
 }
 
 /// launcher.json's pid (walk-checked), when the process table lists it with launcher.json's start.
