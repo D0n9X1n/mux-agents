@@ -38,9 +38,10 @@ const OUTSIDE: &str = "mux-agent: the launch spec is outside the state folder";
 const LINK: &str = "mux-agent: the launch spec path has a junction or link";
 const GEN_PATH: &str = "mux-agent: the launch spec path names no generation of a member";
 const FOREIGN: &str = "mux-agent: the launch spec is not this member's launch";
-/// PM call 7: a folder-level spec is a pane an older build started and has not yet claimed; it names the remedy.
+/// PM call 7, all-calls 14: a folder-level spec is a pane an older build started and has not yet claimed; it names
+/// the remedy that works (`stop` ends a 0.2.x pane; a pre-lifecycle member never resumes, G10d).
 const OLD_SPEC: &str = "mux-agent: this pane was started by an older mux-agent and cannot launch; \
-                        run `mux-agent stop <name>` to end it, or `mux-agent resume <name>` to start it again";
+                        run `mux-agent stop <name>` to end it, then start a new agent";
 
 /// The create-once publisher (`evidence::publish` in production): the seam for every publication of the generation
 /// path, so each publication failure is testable.
@@ -974,13 +975,14 @@ mod tests {
         );
     }
 
-    // PM call 7: the wording is pinned; it names both remedies.
+    // PM call 7, all-calls 14: the wording is pinned; it names the remedy that works (a pre-lifecycle member never
+    // resumes, G10d).
     #[test]
     fn the_old_spec_message_names_the_remedy() {
         assert_eq!(
             OLD_SPEC,
             "mux-agent: this pane was started by an older mux-agent and cannot launch; \
-             run `mux-agent stop <name>` to end it, or `mux-agent resume <name>` to start it again"
+             run `mux-agent stop <name>` to end it, then start a new agent"
         );
     }
 

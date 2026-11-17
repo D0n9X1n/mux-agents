@@ -289,6 +289,87 @@ pub fn reads_past_record(reads: &[PathBuf], folder: &Path) -> Vec<PathBuf> {
         .collect()
 }
 
+/// What the multiplexer shows at a v0.2.8 member's recorded pane %9 (all calls 14).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Pane028 {
+    /// Live, started by the record's `startCommand`, pid 31337 (launcher.json's pid, listed with start 1000), until a
+    /// `kill-pane` closes it.
+    Live,
+    /// Live, pid 31337, but started by another command: not proven the member's.
+    Other,
+    /// No pane at %9.
+    Gone,
+    /// `list-panes` fails: the multiplexer cannot be read.
+    Unreachable,
+}
+
+/// Scripts `list-panes` for v0.2.8 member `id` as `pane` says, and its launcher's process row.
+pub fn v028_pane(w: &World, id: &str, pane: Pane028) {
+    use std::{cell::Cell, rc::Rc};
+    w.fakes.process(crate::testing::row(
+        31337,
+        crate::agents::fixture::PANE,
+        1000,
+    ));
+    let record: Value = crate::state::fs::read_json(&w.folder(id).join("record.json"))
+        .unwrap()
+        .unwrap();
+    let command = match pane {
+        Pane028::Other => "/bin/sh".to_string(),
+        _ => record["startCommand"].as_str().unwrap().to_string(),
+    };
+    let closed = Rc::new(Cell::new(false));
+    let shut = closed.clone();
+    w.fakes.mux_script("kill-pane", move |_| {
+        shut.set(true);
+        Ok(crate::mux::Output::default())
+    });
+    let row = crate::agents::fixture::Listed {
+        pane: "%9".into(),
+        window: "@5".into(),
+        pid: "31337".into(),
+        dead: false,
+        command,
+        tag: id.into(),
+        name: super::text(record.get("name")),
+    };
+    w.fakes.mux_script("list-panes", move |argv| {
+        if pane == Pane028::Unreachable {
+            return Ok(crate::mux::Output {
+                code: 1,
+                stdout: String::new(),
+                stderr: "no server running".into(),
+            });
+        }
+        let rows = match (pane, closed.get()) {
+            (Pane028::Gone, _) | (_, true) => Vec::new(),
+            _ => vec![row.clone()],
+        };
+        Ok(crate::mux::Output {
+            code: 0,
+            stdout: crate::agents::fixture::listed_rows(argv, &rows, "\n"),
+            stderr: String::new(),
+        })
+    });
+}
+
+/// The `kill-pane` calls made so far (plain or inside a conditional `if-shell`).
+pub fn pane_kills(w: &World) -> Vec<Vec<String>> {
+    w.fakes
+        .mux_calls()
+        .into_iter()
+        .filter(|c| c.iter().any(|a| a.starts_with("kill-pane")))
+        .collect()
+}
+
+/// The kind of `id`'s folder notice, if any.
+pub fn notice_kind(w: &World, id: &str) -> Option<String> {
+    crate::state::fs::read_json(&w.folder(id).join("notice.json"))
+        .ok()
+        .flatten()
+        .and_then(|n: Value| n["kind"].as_str().map(str::to_string))
+}
+
 /// How a v0.2.8 member ended, as its writers recorded it.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum End {
