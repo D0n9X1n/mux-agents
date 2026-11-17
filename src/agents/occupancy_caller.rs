@@ -92,3 +92,34 @@ pub(super) fn own_report(ctx: &Ctx, kind: Client, key: (u32, i64), wanted: &str)
         }
     }
 }
+
+/// H4.4: an unmanaged client `row` of `kind`, judged by its own newest report, keyed as its hook writes it
+/// (`ancestry::identity`: a Unix native `copilot` by its npm loader). `Unmanaged` when the report names `wanted`;
+/// `Evidence` when it cannot be read or names no valid id (R2), or its process is gone with no entry left. With no
+/// report (or a key that cannot be resolved) a row whose argv or start cannot be read may be on any conversation, so it
+/// holds as `Unbound` (H4.5); a readable one holds nothing. A report naming another conversation holds nothing.
+pub(super) fn unmanaged_report(ctx: &Ctx, row: &Row, kind: Client, wanted: &str) -> Option<Rule> {
+    let unread = row.argv.is_none() || row.start.is_none();
+    let Some(key) = crate::agents::ancestry::identity(ctx, row, kind) else {
+        return unread.then_some(Rule::Unbound);
+    };
+    match registry(ctx, kind, key.0, key.1) {
+        Err(_) => Some(Rule::Evidence),
+        Ok(live::Found { entry: None, gone }) => {
+            if gone {
+                Some(Rule::Evidence)
+            } else {
+                unread.then_some(Rule::Unbound)
+            }
+        }
+        Ok(live::Found {
+            entry: Some(entry), ..
+        }) => {
+            let id = crate::agents::text(entry.get("sessionId"));
+            if !crate::checks::session_id(&id) {
+                return Some(Rule::Evidence);
+            }
+            id.eq_ignore_ascii_case(wanted).then_some(Rule::Unmanaged)
+        }
+    }
+}

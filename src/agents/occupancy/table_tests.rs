@@ -50,10 +50,11 @@ fn an_argv_naming_the_session_holds_whatever_its_kind() {
     assert_eq!(held(&w, X, Client::Copilot), Some((Rule::Argv, Some(7001))));
 }
 
-// H4.4: an unmanaged readable client of `kind` holds every conversation of that kind; its argv naming A proves
-// nothing about X. Another kind's client holds only what its argv names.
+// H4.4: an unmanaged readable client of `kind` holds only what its argv names (H4.3) or what its own newest hook
+// report names; its argv naming A proves nothing about X, and with no report X stays free. Once its hook reports X
+// (keyed by its own (pid, start)), X is held as `Unmanaged`. Another kind's client holds only what its argv names.
 #[test]
-fn a_readable_client_of_the_kind_holds_every_conversation() {
+fn a_readable_client_of_the_kind_holds_only_what_its_argv_or_own_report_names() {
     let w = World::human("");
     w.fakes.process(row(
         Some(1),
@@ -67,9 +68,12 @@ fn a_readable_client_of_the_kind_holds_every_conversation() {
         Some((Rule::Argv, Some(7001))),
         "argv first"
     );
+    assert_eq!(held(&w, X, Client::Claude), None, "no report: X is free");
+    live::report(&w.ctx, Client::Claude, 7001, 1, X, "resume").unwrap();
     assert_eq!(
         held(&w, X, Client::Claude),
-        Some((Rule::Unmanaged, Some(7001)))
+        Some((Rule::Unmanaged, Some(7001))),
+        "its own report names X"
     );
     assert_eq!(held(&w, X, Client::Copilot), None);
     assert_eq!(held(&w, A, Client::Copilot), Some((Rule::Argv, Some(7001))));
@@ -289,7 +293,8 @@ fn an_unbound_row_holds_unless_its_image_names_no_client() {
         let want = want.then_some((Rule::Unbound, Some(7001)));
         assert_eq!(who(held_on(&w.ctx, X, kind, os, None)), want, "{case}");
     }
-    // An unbound row the OS names a client of `kind` from its path alone holds as H4.4, whatever its image.
+    // An unbound row the OS names a client of `kind` from its path alone is judged as H4.4, whatever its image: by
+    // its own newest report (keyed by its own (pid, start)), which here names X, so it holds X as `Unmanaged`.
     let w = World::human("");
     w.fakes.process(row(
         Some(1),
@@ -298,6 +303,7 @@ fn an_unbound_row_holds_unless_its_image_names_no_client() {
         Some("sleep"),
     ));
     w.fakes.client(7001, Client::Claude);
+    live::report(&w.ctx, Client::Claude, 7001, 1, X, "startup").unwrap();
     assert_eq!(
         held(&w, X, Client::Claude),
         Some((Rule::Unmanaged, Some(7001)))

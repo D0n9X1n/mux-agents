@@ -278,7 +278,8 @@ fn the_orphan_fence_never_reads_an_unmarked_folder() {
 }
 
 /// H3, H4.4 (O3 ambiguity 11): no record reservation and no read of its evidence; its live Claude, registered as
-/// a client by the fake OS, holds as unmanaged. Checklist 4: reads are recorded around both queries.
+/// a client by the fake OS and whose own hook last reported the folder's conversation, holds as unmanaged (an
+/// unmanaged client holds only what its own report names). Checklist 4: reads are recorded around both queries.
 #[test]
 fn an_unmarked_folder_reserves_nothing_but_its_live_client_holds() {
     use crate::agents::occupancy::{Rule, held_on};
@@ -298,7 +299,9 @@ fn an_unmarked_folder_reserves_nothing_but_its_live_client_holds() {
             "{os:?}: no reservation read"
         );
         assert!(none.is_none(), "{os:?}: no reservation");
-        let mut row = crate::testing::row(4242, 1, 1500);
+        // A pid of its own: World already lists its caller at 4242 (start 2000), so a second 4242 would open as the
+        // caller and its report's key could not be resolved.
+        let mut row = crate::testing::row(7001, 1, 1500);
         let exe = if matches!(os, OsKind::Windows) {
             "claude.exe"
         } else {
@@ -310,7 +313,8 @@ fn an_unmarked_folder_reserves_nothing_but_its_live_client_holds() {
             Some(exe.into()),
         );
         w.fakes.process(row);
-        w.fakes.client(4242, Client::Claude);
+        w.fakes.client(7001, Client::Claude);
+        crate::state::live::report(&w.ctx, Client::Claude, 7001, 1500, session, "startup").unwrap();
         let (h, reads) =
             crate::state::fs::record_reads(|| held_on(&w.ctx, session, Client::Claude, os, None));
         assert_eq!(
@@ -319,7 +323,7 @@ fn an_unmarked_folder_reserves_nothing_but_its_live_client_holds() {
             "{os:?}: no read for the live client either"
         );
         let h = h.expect("its live client holds");
-        assert_eq!((h.rule, h.pid), (Rule::Unmanaged, Some(4242)), "{os:?}");
+        assert_eq!((h.rule, h.pid), (Rule::Unmanaged, Some(7001)), "{os:?}");
         assert_eq!(pf::bytes(&w.folder(P)), before, "{os:?}");
     }
 }

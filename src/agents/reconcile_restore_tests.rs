@@ -21,7 +21,9 @@ pub(super) fn released_by_hc(w: &World, id: &str, argv: &[&str]) {
     );
     lf::relabel(w, &a);
 }
-/// An unmanaged client of the kind (occupy-3 H4.4), on another conversation.
+/// An unmanaged client of the kind (occupy-3 H4.4), started on another conversation, whose own hook last reported
+/// `lf::SID` (an in-session `/resume`): every member's default conversation. Its argv does not name `lf::SID`, so the
+/// hold is H4.4's (`Unmanaged`), never H4.3's; without the report it would hold nothing.
 pub(super) fn unmanaged_claude(w: &World, pid: u32) {
     let (path, image) = if cfg!(windows) {
         ("C:/bin/claude.exe", "claude.exe")
@@ -36,6 +38,16 @@ pub(super) fn unmanaged_claude(w: &World, pid: u32) {
         ..crate::testing::row(pid, 1, 99)
     });
     w.fakes.client(pid, crate::parse::Client::Claude);
+    // Keyed as its hook writes it (`ancestry::identity`): the row's own (pid, start).
+    crate::state::live::report(
+        &w.ctx,
+        crate::parse::Client::Claude,
+        pid,
+        99,
+        lf::SID,
+        "resume",
+    )
+    .unwrap();
 }
 /// A conversation id of member `id` alone (r6b call 11: unrelated members never share one).
 pub(super) fn sid_of(id: &str) -> String {

@@ -134,8 +134,9 @@ impl PrivateCore {
                 .or_else(|| r.argv.as_ref().and_then(|a| a.first().cloned()))?;
             Some(p.rsplit(['/', '\\']).next()?.to_ascii_lowercase())
         };
-        let core = self
-            .bin
+        // The core runs as the file the install's links resolve to: `hc` is often a link to `herdr-core`.
+        let real = std::fs::canonicalize(&self.bin).unwrap_or_else(|_| self.bin.clone());
+        let core = real
             .file_name()
             .unwrap()
             .to_string_lossy()
@@ -251,7 +252,7 @@ pub fn run(mut c: Command, dir: &Path) -> io::Result<Value> {
     serde_json::from_slice(&fs::read(out)?).map_err(io::Error::other)
 }
 
-/// #150 (CI 85d70b5): `terminals` as `terminal_of` gives them, (client, hold) per member, in kill order: every hold
+/// (CI 85d70b5): `terminals` as `terminal_of` gives them, (client, hold) per member, in kill order: every hold
 /// once, then every client. One hc holder can carry every member's terminal; a client killed while its holder lives
 /// is an exit the holder records (Ended), never Lost, and a shared holder listed twice is signalled twice.
 pub fn kill_order(terminals: &[(u32, Option<i64>)]) -> Vec<(u32, Option<i64>)> {

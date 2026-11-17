@@ -1041,7 +1041,8 @@ fn resume_case(case: &str) -> (Mw, Res<Map<String, Value>>, String, Held) {
     (m, got, x, held)
 }
 // PM call 1 through admission: the exempt member caller still blocks X when its own argv names X's conversation, and
-// a second unmanaged Claude still blocks it. Each refusal names the pid and the rule (PM call 2).
+// a second unmanaged Claude whose own hook last reported X's conversation still blocks it (H4.4): the caller's
+// exemption never covers another client. Each refusal names the pid and the rule (PM call 2).
 #[test]
 fn a_member_callers_exemption_ends_at_its_argv_and_other_clients() {
     use crate::agents::occupancy::Rule;
@@ -1076,6 +1077,9 @@ fn a_member_callers_exemption_ends_at_its_argv_and_other_clients() {
             other.argv = Some(vec!["claude".into()]);
             m.w.fakes.process(other);
             m.w.fakes.client(7001, crate::parse::Client::Claude);
+            // Keyed as its hook writes it: its own (pid, start).
+            let claude = crate::parse::Client::Claude;
+            crate::state::live::report(&m.w.ctx, claude, 7001, 7, sid, "resume").unwrap();
         }
         m.rounds(2, &term(&m.r, Some(150)));
         facts_of(&m.w, &crate::agents::membership::team(&m.c), &rows, &rx);
@@ -1256,7 +1260,7 @@ fn a_candidate_resume_is_refused_with_no_side_effects() {
     );
     m.w.fakes.hc_done().unwrap();
 }
-/// A request refused by itself spends no token (#103 D5): a proven member's brief child with no -BriefFile refuses 2
+/// A request refused by itself spends no token (D5): a proven member's brief child with no -BriefFile refuses 2
 /// `brief` under the team lock, after its standing and the snapshot, before the debit and any launch.
 #[test]
 fn a_refused_request_spends_no_token() {
@@ -1336,7 +1340,7 @@ fn spawn_rounds(m: &Mw, t: &Value) {
     }
 }
 /// A request check that only the launch's own preparation can make (the escaped command line) spends no token: the
-/// debit is the last step before `hc run` (#103 D5).
+/// debit is the last step before `hc run` (D5).
 #[test]
 fn a_command_line_too_long_spends_no_token() {
     let mut m = member_world();
@@ -1500,7 +1504,7 @@ fn a_failed_launch_keeps_its_token() {
         "the run was tried"
     );
 }
-/// The run's own inputs are checked before the token (#103 D5): a member's resume of a descendant whose record has no
+/// The run's own inputs are checked before the token (D5): a member's resume of a descendant whose record has no
 /// `directory` refuses with no token spent, no `hc run`, and no abort that says a run may have happened.
 #[test]
 fn a_run_input_that_cannot_be_built_spends_no_token() {
@@ -1527,7 +1531,7 @@ fn a_run_input_that_cannot_be_built_spends_no_token() {
         assert_ne!(a["runUncertain"], true, "nothing ran: {a}");
     }
 }
-/// Under the team lock the proof is whole again (#103 D1): a terminal that no longer runs the recorded launch, or a
+/// Under the team lock the proof is whole again (D1): a terminal that no longer runs the recorded launch, or a
 /// launch aborted since dispatch, refuses 2 `tagged`, never acting on what dispatch saw.
 #[test]
 fn standing_revalidates_the_launch_under_the_lock() {
@@ -1592,7 +1596,7 @@ fn a_spawn_whose_terminal_changes_before_the_lock_refuses() {
     );
     m.w.fakes.hc_done().unwrap();
 }
-/// Ancestry ends only at the team's own leader (#103): a second depth-0 `upTeam` record R in the session, with
+/// Ancestry ends only at the team's own leader: a second depth-0 `upTeam` record R in the session, with
 /// R > A > B, gives A no team standing, so its spawn admission and its stop and read of B refuse 2 `authority`.
 #[test]
 fn a_second_root_grants_no_authority() {
@@ -1631,7 +1635,7 @@ fn a_second_root_grants_no_authority() {
         );
     }
 }
-/// A resume reads launch specs only inside the state root (#104): a parent's spec.json linked to a file outside
+/// A resume reads launch specs only inside the state root: a parent's spec.json linked to a file outside
 /// refuses, never resuming with flags read through the link. A target whose own spec.json is linked is a
 /// pre-lifecycle folder (the folder spec is read only on that path), so G10d refuses it `state` before any read of
 /// the link (prelife-1c Task 4: retired as written), and the link target is untouched.
@@ -1706,7 +1710,7 @@ fn a_linked_spec_refuses_a_resume() {
         w.fakes.hc_done().unwrap();
     }
 }
-/// A person may still stop or read a committed leader whose team record `up` never wrote (#103): authority asks a
+/// A person may still stop or read a committed leader whose team record `up` never wrote: authority asks a
 /// person for no team record; the target's identity and view are still checked.
 #[test]
 fn a_person_stops_and_reads_a_leaderless_teams_leader() {
@@ -2284,7 +2288,7 @@ fn a_lifecycle_proof_refuses_ids_and_generations_that_are_not_plain_before_readi
     m.w.fakes.hc_done().unwrap();
 }
 
-/// #137: the hc caller ID made the depth-0 `up` leader that the team record names.
+/// the hc caller ID made the depth-0 `up` leader that the team record names.
 fn leader_world() -> Mw {
     let mut m = member_world();
     let team = t::path(&m.state, "$3");

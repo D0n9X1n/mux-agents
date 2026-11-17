@@ -612,32 +612,63 @@ fn process(w: &World, pid: u32, argv: &[&str]) {
     w.fakes.process(row);
 }
 
-// H4.4 through admission: an unmanaged live Claude on another conversation refuses resuming X; a Copilot one does not.
+// H4.4 through admission: an unmanaged live Claude started on another conversation blocks resuming X only on evidence:
+// its own newest hook report names X (`Unmanaged`), or that report cannot be read (`Evidence`). No report, or one
+// naming another conversation, lets X resume: another Claude Code session open on the machine holds nothing of X. A
+// Copilot client's report is never read for a Claude subject.
 #[test]
-fn an_unmanaged_client_on_any_conversation_blocks_resume() {
-    for (client, refused) in [
-        (crate::parse::Client::Claude, true),
-        (crate::parse::Client::Copilot, false),
+fn an_unmanaged_client_blocks_resume_only_when_its_own_report_names_the_conversation() {
+    use crate::parse::Client;
+    use crate::state::live;
+    for (case, client, refused) in [
+        ("no report", Client::Claude, None),
+        ("names another", Client::Claude, None),
+        (
+            "names X",
+            Client::Claude,
+            Some("it is a client this team did not start"),
+        ),
+        ("torn", Client::Claude, Some("its evidence cannot be read")),
+        ("copilot names X", Client::Copilot, None),
     ] {
         let w = World::human("");
         let x = member(&w, ID, json!({"pane": "%5", "window": "@1", "depth": 1}));
         w.panes(&[]);
         process(&w, 7001, &["claude", "--resume", OTHER_SESSION]);
         w.fakes.client(7001, client);
+        // Keyed as its hook writes it: the row's own (pid, start), (7001, 1).
+        match case {
+            "no report" => {}
+            "names another" => {
+                live::report(&w.ctx, client, 7001, 1, OTHER_SESSION, "startup").unwrap();
+            }
+            "torn" => {
+                let p = live::path(&w.ctx, client, 7001, 1);
+                std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+                std::fs::write(&p, b"{\"se").unwrap();
+            }
+            _ => {
+                live::report(&w.ctx, client, 7001, 1, SESSION_ID, "resume").unwrap();
+            }
+        }
         facts(&w, &[(&x, "exited")]);
         let before = folders(&w);
-        if refused {
+        if let Some(phrase) = refused {
             let e = resume_of(&w, ID).unwrap_err();
-            assert_eq!((e.code, e.check), (2, "session"), "{}", e.message);
-            assert_eq!(
-                e.message,
-                "process 7001 (fixture) may hold that conversation: it is a client this team did not start; if you \
-                 just stopped it, retry in a few seconds"
+            assert_eq!((e.code, e.check), (2, "session"), "{case}: {}", e.message);
+            assert!(
+                e.message.starts_with(&format!(
+                    "process 7001 (fixture) may hold that conversation: {phrase}"
+                )) && e
+                    .message
+                    .ends_with("; if you just stopped it, retry in a few seconds"),
+                "{case}: {}",
+                e.message
             );
-            assert_eq!((folders(&w), runs(&w)), (before, 0));
+            assert_eq!((folders(&w), runs(&w)), (before, 0), "{case}");
         } else {
             launches(&w, "t1");
-            assert_eq!(resume_of(&w, ID).unwrap()["from"], ID);
+            assert_eq!(resume_of(&w, ID).unwrap()["from"], ID, "{case}");
         }
         w.fakes.hc_done().unwrap();
     }
@@ -646,7 +677,7 @@ fn an_unmanaged_client_on_any_conversation_blocks_resume() {
 // X's conversation live anywhere refuses (occupy-3 H3, H4.3-5), and nothing launches:
 // - any process whose argv carries X's uuid after `--resume`, `-r`, `--resume=`, `--session-id` or `--session-id=`
 //   (H4.3, whatever its kind), and a process table that cannot be read (H4.1);
-// - an unmanaged readable client of X's kind, whatever conversation its argv names (H4.4);
+// - an unmanaged readable client of X's kind whose own newest hook report names X, whatever its argv names (H4.4);
 // - a row with no start, path or argv whose image is unreadable or names a client of X's kind (H4.5);
 // - a member record that cannot be read (R2).
 // A fork of X (`--resume X --fork-session --session-id Z`) occupies only Z, so it does not block X; a fork into X
@@ -739,10 +770,16 @@ fn resume_refuses_while_the_conversation_is_live_anywhere() {
                     crate::parse::Client::Copilot
                 };
                 w.fakes.client(7001, client);
+                // Its argv cannot be read, so H4.3 cannot clear it; it holds on its own hook report naming X (H4.4),
+                // which a Copilot client's report never does for this Claude subject.
+                crate::state::live::report(&w.ctx, client, 7001, 1, SESSION_ID, "startup").unwrap();
             }
             "elsewhere" => {
                 process(&w, 7002, &["claude"]);
                 w.fakes.client(7002, crate::parse::Client::Claude);
+                // Its own hook last reported X (keyed by its own (pid, start)): the evidence H4.4 holds on.
+                let claude = crate::parse::Client::Claude;
+                crate::state::live::report(&w.ctx, claude, 7002, 1, SESSION_ID, "resume").unwrap();
             }
             "table" => w.fakes.table_fails(),
             _ => {}
@@ -1272,7 +1309,7 @@ fn power_loss_after_each_record_write_leaves_a_complete_record() {
 // paused while it holds the spawn lock, or (spawn lock held) X's mailbox barrier. Meanwhile another thread acts on
 // another member B (a running member of another conversation): `send` to B, `read` as B, `stop` B, or `spawn` a new
 // member. Each completes, or refuses `lock` within LOCK_WAIT; none waits without bound. read and stop take no lock
-// the resume holds, so they finish while it is still paused; spawn and send (the team lock, #103 4a) wait for the
+// the resume holds, so they finish while it is still paused; spawn and send (the team lock, 4a) wait for the
 // spawn lock and finish within LOCK_WAIT (plus a margin) after the resume gives it back. The lock wait is the real
 // lock's, on the real clock (the seam's), and no case comes near it.
 #[test]
@@ -1347,7 +1384,7 @@ fn send_read_spawn_and_stop_stay_bounded_during_a_resume() {
                 };
                 let request: Vec<&str> = match verb {
                     "send" => {
-                        // A send takes the team lock (#103 4a), so it runs after the resume: Y is committed at t1
+                        // A send takes the team lock (4a), so it runs after the resume: Y is committed at t1
                         // and hc cannot read it here.
                         v.panes(&[]);
                         cf::online(&v);
@@ -2016,7 +2053,8 @@ fn a_resume_whose_view_fails_after_the_commit_keeps_the_successor() {
 }
 
 // QA Q5 (call 31, M44): the kind comes from X's record. A Copilot subject is refused `session` while an unmanaged
-// Copilot client runs, whatever conversation it names (H4.4), and nothing launches.
+// Copilot client whose own hook last reported X's conversation runs, whatever its argv names (H4.4), and nothing
+// launches. Its report is filed under the Copilot kind, so only a Copilot query reads it.
 #[test]
 fn a_copilot_subject_is_held_by_an_unmanaged_copilot() {
     let w = World::human("");
@@ -2028,6 +2066,9 @@ fn a_copilot_subject_is_held_by_an_unmanaged_copilot() {
     w.panes(&[]);
     process(&w, 7001, &["copilot", "--resume", OTHER_SESSION]);
     w.fakes.client(7001, crate::parse::Client::Copilot);
+    // Keyed by its own (pid, start): the row has no path, so it is not a native `copilot` keyed by a loader.
+    let copilot = crate::parse::Client::Copilot;
+    crate::state::live::report(&w.ctx, copilot, 7001, 1, SESSION_ID, "resume").unwrap();
     facts(&w, &[(&x, "exited")]);
     let before = folders(&w);
     let e = resume_of(&w, ID).unwrap_err();

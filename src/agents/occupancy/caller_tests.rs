@@ -3,18 +3,26 @@ use super::support::held;
 use super::support::*;
 use super::*;
 
-// Call 1, test 1: a machine whose only client is the caller's own resumes B. Without the exemption the same row holds.
+// Call 1, test 1: a machine whose only client is the caller's own, whose hook last reported A, resumes B. Without the
+// exemption the same row is judged as any unmanaged client (H4.4): its report names A, so it holds A as `Unmanaged`
+// and B stays free. With it, the same report holds A as the caller's own (`Caller`).
 #[test]
 fn a_caller_alone_frees_every_other_conversation() {
     let w = World::agent("");
     let own = pane_own(&w);
+    live::report(&w.ctx, Client::Claude, CLAUDE, 1500, A, "startup").unwrap();
+    assert_eq!(held(&w, B, Client::Claude), None, "no exemption: H4.4");
     assert_eq!(
-        held(&w, B, Client::Claude),
+        held(&w, A, Client::Claude),
         Some((Rule::Unmanaged, Some(CLAUDE))),
         "no exemption: H4.4"
     );
     assert_eq!(held_as(&w, B, Client::Claude, OsKind::Unix, &own), None);
     assert_eq!(held_as(&w, B, Client::Copilot, OsKind::Unix, &own), None);
+    assert_eq!(
+        held_as(&w, A, Client::Claude, OsKind::Unix, &own),
+        Some((Rule::Caller, Some(CLAUDE)))
+    );
 }
 
 // Call 1, test 2: the caller whose argv names B blocks B (H4.3 still applies to it), and only B.
@@ -56,7 +64,8 @@ fn the_callers_argv_naming_the_session_in_upper_case_holds_it() {
     );
 }
 
-// Call 1, test 3: a second unmanaged Claude still blocks B, beside the exempt caller.
+// Call 1, test 3: a second unmanaged Claude whose own hook last reported B still blocks B, beside the exempt caller:
+// the caller's exemption never covers another client's report.
 #[test]
 fn a_second_unmanaged_client_still_holds_beside_the_caller() {
     let w = World::agent("");
@@ -68,6 +77,7 @@ fn a_second_unmanaged_client_still_holds_beside_the_caller() {
         Some("claude"),
     ));
     w.fakes.client(7001, Client::Claude);
+    live::report(&w.ctx, Client::Claude, 7001, 1, B, "startup").unwrap();
     assert_eq!(
         held_as(&w, B, Client::Claude, OsKind::Unix, &own),
         Some((Rule::Unmanaged, Some(7001)))
@@ -139,6 +149,8 @@ fn own_is_the_proof_never_the_chain() {
         ..crate::testing::row(160, PANE, 1600)
     });
     w.fakes.client(160, Client::Claude);
+    // The chain's client A (150) last reported B: as an unmanaged client, its own report holds B (H4.4).
+    live::report(&w.ctx, Client::Claude, CLAUDE, 1500, B, "startup").unwrap();
     assert_eq!(
         held_as(&w, B, Client::Claude, OsKind::Unix, &own),
         Some((Rule::Unmanaged, Some(CLAUDE))),
@@ -150,6 +162,9 @@ fn own_is_the_proof_never_the_chain() {
         None,
         "B alone: exempt"
     );
+    // The proven 160's own hook reports B: a reused pid (another start) is not exempt, so it is judged as any
+    // unmanaged client by that report, `Unmanaged`, never `Caller`.
+    live::report(&w.ctx, Client::Claude, 160, 1600, B, "startup").unwrap();
     let reused = Own { start: 1601, ..own };
     assert_eq!(
         held_as(&w, B, Client::Claude, OsKind::Unix, &reused),
@@ -161,7 +176,7 @@ fn own_is_the_proof_never_the_chain() {
 // Call 8: a Copilot caller proven as the native copilot 7101 under its npm loader 7100. On Unix `pair_parent` pairs
 // them: both are exempt and the loader keys the entry; a hold names the proven 7101 (call 2). A newer process at the
 // loader pid (start 9999 > 2101) is not the loader: the caller's report cannot be read, so `Evidence` on 7101. On
-// Windows there is no pair: the node row is an unmanaged Copilot and holds.
+// Windows there is no pair: the node row is an unmanaged Copilot, and its own report naming B holds B (H4.4).
 #[test]
 fn a_copilot_callers_loader_joins_only_by_report_2bs_rule() {
     for (os, loader_start) in [
@@ -183,6 +198,11 @@ fn a_copilot_callers_loader_joins_only_by_report_2bs_rule() {
             key,
         };
         copilot_pair_rows(&w, Some(loader_start));
+        if os == OsKind::Windows {
+            // The unpaired node is an unmanaged Copilot, judged by its own newest report (H4.4). A `node` is keyed
+            // by its own (pid, start) on any host, so this report is its, never the caller's (7101, 2101).
+            live::report(&w.ctx, Client::Copilot, 7100, 2100, B, "startup").unwrap();
+        }
         let case = format!("{os:?} loader start {loader_start}");
         let want = match (os, loader_start) {
             (OsKind::Windows, _) => Some((Rule::Unmanaged, Some(7100))),
@@ -234,8 +254,10 @@ fn a_startless_saved_loader_holds_and_is_never_read_again() {
 }
 
 // Call 19, reverse pairing: the proven client is the loader 7100 (2100); on Unix its native child 7101, which
-// `pair_parent` pairs back to it, is exempt too, and the loader keys the entry. On Windows nothing pairs: the native
-// child is an unmanaged Copilot and holds.
+// `pair_parent` pairs back to it, is exempt too, and the loader keys the entry. On Windows nothing pairs: only the
+// loader is exempt, and the native child is an unmanaged Copilot judged by its own report (H4.4); with none it holds
+// nothing. The exempt rows are asserted directly: a report for the child would be keyed by the host's pairing rule
+// (`ancestry::identity`), which on a Unix host is the loader's, the caller's own key.
 #[test]
 fn a_loader_callers_native_child_is_exempt() {
     for os in [OsKind::Unix, OsKind::Windows] {
@@ -247,10 +269,18 @@ fn a_loader_callers_native_child_is_exempt() {
             key: Some((7100, 2100)),
         };
         copilot_pair_rows(&w, Some(2100));
+        let rows = w.ctx.os.table().unwrap();
+        let exempted = exempt(&w.ctx, &own, &rows, os).unwrap();
+        let mut want = vec![(7100, 2100)];
+        if os == OsKind::Unix {
+            want.push((7101, 2101));
+        }
+        assert_eq!(exempted.rows, want, "{os:?}");
         if os == OsKind::Windows {
             assert_eq!(
                 held_as(&w, B, Client::Copilot, os, &own),
-                Some((Rule::Unmanaged, Some(7101)))
+                None,
+                "the unexempt child has no report"
             );
             continue;
         }
@@ -278,7 +308,7 @@ fn the_skill_states_the_known_limits() {
         "is judged by its image name",
         "Your own client is exempt",
         "mounted with `hidepid` (other than 0) or `subset=pid`",
-        "with other Claude or Copilot sessions open on this machine",
+        "a client without this plugin's hooks that switched into the conversation by hand is not seen",
     ] {
         assert!(skill.contains(needle), "{needle}");
     }

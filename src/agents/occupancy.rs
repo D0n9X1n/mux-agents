@@ -28,7 +28,7 @@ pub enum Rule {
     Argv,
     /// PM call 1: the caller's own client, whose newest registry entry names the session.
     Caller,
-    /// H4.4: an unmanaged client of the kind.
+    /// H4.4: an unmanaged client of the kind whose own newest report names the conversation.
     Unmanaged,
     /// H4.5: a process that cannot be read and may be a client.
     Unbound,
@@ -47,7 +47,9 @@ impl Rule {
             Rule::Managed => "its member's client last reported this conversation",
             Rule::Argv => "its command line names this conversation",
             Rule::Caller => "your own client last reported this conversation",
-            Rule::Unmanaged => "it is a client this team did not start",
+            Rule::Unmanaged => {
+                "it is a client this team did not start, and its hook last reported this conversation"
+            }
             Rule::Unbound => "it cannot be read and may be a client",
             Rule::Reserved => "a launch of it that has not ended reserves this conversation",
         }
@@ -226,8 +228,19 @@ pub fn held_on(
             }
             continue;
         }
-        if let Some(hold) = holds(ctx.os.as_ref(), row, session, kind, os) {
-            return Some(hold); // H4.3-5
+        match holds(ctx.os.as_ref(), row, session, kind, os) {
+            // H4.4: a live client of the kind this team did not start holds the conversation only when its own hook
+            // last reported it (`report -Session`, on start and on every in-session `/resume`), or when that report
+            // cannot be read. One that reported another conversation, or none, holds nothing: another Claude Code or
+            // Copilot session open on the machine must not block every resume. Known limit: a client without this
+            // plugin's hooks that switched into the conversation by hand is not seen.
+            Some(hold) if hold.rule == Rule::Unmanaged => {
+                if let Some(rule) = unmanaged_report(ctx, row, kind, &wanted) {
+                    return Some(Hold::of(rule, row));
+                }
+            }
+            Some(hold) => return Some(hold), // H4.3, H4.5
+            None => {}
         }
     }
     gone.or_else(|| {
