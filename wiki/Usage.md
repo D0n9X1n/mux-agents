@@ -47,7 +47,12 @@ You rarely type these: the skill runs them for you. Every command is `<plugin>/s
 | `note`, `notes` | `note -Title plan -BodyFile plan.md`, `notes`, `notes <id>` | add to or read the team notebook; every other member gets one mail per new note, and each launch's first message lists the newest titles |
 | `read` | `read -Wait 600`, `read claude-1 -Lines 40` | wait for your messages, or read an agent's pane |
 | `focus` | `focus claude-1`, `focus -Next` | switch the multiplexer to an agent's pane; `-Next` / `-Prev` step through the bar's order |
-| `stop` | `stop claude-1` | close an agent's pane and its processes; an agent that already ended answers `ok` with `already` (`exited`, `stopped` or `lost`) |
+| `peek` | `peek claude-1 -Lines 40` | read a member's live pane without typing into it |
+| `stop` | `stop claude-1`, `stop claude-1 -Generation` | end an agent and every agent it started, bottom-up; a stop cut short is finished on the next pass; `-Generation` ends only its open generations and keeps the member; an agent that already ended answers `ok` with `already` (`exited`, `stopped` or `lost`) |
+| `drop` | `drop claude-1` | a person's stop of a member of the team's session; its kept shells stay |
+| `resume` | `resume claude-1`, `resume claude-1 -Fresh` | bring a stopped agent back as a new member carrying its conversation, or retry a member the bar marks `recover`; `-Fresh` starts it on a new conversation; refused while any live process may still hold that conversation |
+| `up` | `up -Client claude -- --model opus` | start a team: its leader, side bar and views; run it again after a closed view, a killed server or a reboot to bring the views, bar and lost members back; a stopped team is retired and a new one starts |
+| `restore` | `restore` | bring every lost member of this team back as its next generation; its old terminal stays as a kept shell |
 | `sidebar` | `sidebar`, `sidebar -Close` | reopen the side-bar split, or close it for the rest of the session |
 | `kept` | `kept`, `kept -Close t7` | list the team's kept shells (an agent's old terminal left open after `restore`); `-Close <address>` closes one; a person's command, refused in an agent pane |
 | `version` | `version`, `--version` | the binary's version, to tell which one a pane runs; works outside a multiplexer |

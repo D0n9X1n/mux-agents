@@ -47,7 +47,12 @@ flowchart LR
 | `note`、`notes` | `note -Title plan -BodyFile plan.md`，`notes`，`notes <id>` | 写入或读取团队笔记本；每条新笔记会给其他每个成员发一封邮件，每次启动的第一条消息列出最新的标题 |
 | `read` | `read -Wait 600`，`read claude-1 -Lines 40` | 等待你的消息，或读取某个代理的窗格 |
 | `focus` | `focus claude-1`、`focus -Next` | 让多路复用器切换到某个代理的窗格；`-Next` / `-Prev` 按侧边栏的顺序逐个切换 |
-| `stop` | `stop claude-1` | 关闭代理的窗格及其进程；已结束的代理回答 `ok` 并带 `already`（`exited`、`stopped` 或 `lost`） |
+| `peek` | `peek claude-1 -Lines 40` | 读取成员的实时窗格，不向其中输入任何内容 |
+| `stop` | `stop claude-1`、`stop claude-1 -Generation` | 自下而上结束代理及其启动的所有代理；被中断的停止会在下一轮完成；`-Generation` 只结束它打开的各代，保留成员；已结束的代理回答 `ok` 并带 `already`（`exited`、`stopped` 或 `lost`） |
+| `drop` | `drop claude-1` | 由人停止团队会话中的成员；其保留的 shell 仍然保留 |
+| `resume` | `resume claude-1`、`resume claude-1 -Fresh` | 把已停止的代理作为带着原对话的新成员恢复，或重试侧边栏标为 `recover` 的成员；`-Fresh` 用新对话启动；只要仍有存活进程可能占用该对话就会被拒绝 |
+| `up` | `up -Client claude -- --model opus` | 启动团队：领导者、侧边栏和视图；视图关闭、服务器被杀或重启之后再次运行，可找回视图、侧边栏和丢失的成员；已停止的团队会被退役并启动新团队 |
+| `restore` | `restore` | 把本团队每个丢失的成员恢复为它的下一代；其旧终端作为保留的 shell 留下 |
 | `sidebar` | `sidebar`，`sidebar -Close` | 重新打开侧边栏分屏，或在本会话剩余时间内关闭它 |
 | `kept` | `kept`、`kept -Close t7` | 列出团队保留的 shell（`restore` 之后留下的代理旧终端）；`-Close <address>` 关闭其中一个；只供人使用，在代理窗格中会被拒绝 |
 | `version` | `version`，`--version` | 二进制文件的版本，用来分辨窗格运行的是哪一个；在多路复用器之外也能用 |
