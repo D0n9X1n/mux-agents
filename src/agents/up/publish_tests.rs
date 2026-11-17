@@ -376,4 +376,5 @@ fn release_all_publishes_each_release_and_keeps_a_torn_one() {
     );
 }
 
+#[cfg(test)]
 mod ensure;

@@ -209,6 +209,23 @@ pub const UNPROVEN: &str = "the new session could not be proven; run up again";
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Published {
     pub view: View,
+    /// The hold window `new-session` answered (`@N`); empty when the view was reused or found by a listing.
+    pub window: String,
+}
+
+/// E3.3's `pending` (Task 9: also E6.1's): the session name from `inputs.folder` and T, a fresh
+/// `<root>/up/<32 hex>.release`, the caller's server.
+pub(crate) fn new_pending(ctx: &Ctx, me: &Caller, ix: &Index) -> Res<Pending> {
+    let name = super::identity::session_name(std::path::Path::new(&ix.inputs.folder), &ix.team)?;
+    let rel = ctx
+        .state_root
+        .join("up")
+        .join(format!("{}.release", crate::util::hex32()?));
+    Ok(Pending {
+        server: index::server_of(me),
+        name,
+        release: crate::agents::spawn::utf8(&rel)?.to_string(),
+    })
 }
 
 /// E3.1, then E3.2 (a proven live view on the caller's server whose session is listed, the answering server
@@ -223,19 +240,13 @@ pub fn ensure(ctx: &Ctx, me: &Caller, ix: &mut Index) -> Res<Published> {
             .any(|s| s.0 == v.session)
     {
         answered(ctx, me, &v.server)?;
-        return Ok(Published { view: v });
+        return Ok(Published {
+            view: v,
+            window: String::new(),
+        });
     }
-    let name = super::identity::session_name(std::path::Path::new(&ix.inputs.folder), &ix.team)?;
-    let rel = ctx
-        .state_root
-        .join("up")
-        .join(format!("{}.release", crate::util::hex32()?));
-    let rel = crate::agents::spawn::utf8(&rel)?.to_string();
-    ix.pending = Some(Pending {
-        server: index::server_of(me),
-        name,
-        release: rel,
-    });
+    let p = new_pending(ctx, me, ix)?;
+    ix.pending = Some(p);
     index::write(ctx, ix)?;
     super::halt("pending")?;
     start(ctx, me, ix)
@@ -250,6 +261,10 @@ pub fn start(ctx: &Ctx, me: &Caller, ix: &mut Index) -> Res<Published> {
         .pending
         .clone()
         .ok_or_else(|| Refusal::internal("no pending session"))?;
+    // Calls 33, 39: the caller's own server is bound before any write can name it the anchor.
+    if ix.anchor.is_none() {
+        super::bind_anchor_server(ctx, me, &me.server_key)?;
+    }
     let exe = crate::agents::spawn::utf8(&ctx.exe)?;
     let args = [
         "new-session",
@@ -273,7 +288,7 @@ pub fn start(ctx: &Ctx, me: &Caller, ix: &mut Index) -> Res<Published> {
         .filter(|o| o.code == 0)
         .and_then(|o| super::ids(&o.stdout))
     {
-        Some((session, _)) => {
+        Some((session, window)) => {
             answered(ctx, me, &here)?;
             publish(
                 ix,
@@ -287,6 +302,7 @@ pub fn start(ctx: &Ctx, me: &Caller, ix: &mut Index) -> Res<Published> {
             super::halt("published")?;
             Ok(Published {
                 view: ix.view.clone().expect("published"),
+                window,
             })
         }
         None => {
@@ -297,7 +313,10 @@ pub fn start(ctx: &Ctx, me: &Caller, ix: &mut Index) -> Res<Published> {
                         && v.server.key == me.server_key
                         && v.name == p.name =>
                 {
-                    Ok(Published { view: v })
+                    Ok(Published {
+                        view: v,
+                        window: String::new(),
+                    })
                 }
                 _ => Err(index::bad(UNPROVEN)),
             }

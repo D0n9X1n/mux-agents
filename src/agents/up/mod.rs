@@ -12,7 +12,7 @@ pub mod server;
 #[cfg(test)]
 pub(crate) mod tests;
 
-use std::{cell::Cell, path::Path};
+use std::path::Path;
 
 use serde_json::{Map, Value, json};
 
@@ -30,16 +30,6 @@ use crate::{
 
 pub const OUTSIDE: &str = "up needs tmux or rmux for now";
 
-struct Plan<'a> {
-    client: Client,
-    /// The client options of the person (options-6e E1): the leader replays them, the ceiling is fixed from them.
-    options: &'a [String],
-    /// The prompt tokens of the person: run once, never replayed.
-    prompt: &'a [String],
-    folder: &'a Path,
-    team: &'a str,
-}
-
 pub fn up(ctx: &Ctx, request: &Request) -> Res<Map<String, Value>> {
     let client = request
         .value("Client")
@@ -56,37 +46,51 @@ pub fn up(ctx: &Ctx, request: &Request) -> Res<Map<String, Value>> {
     let caller = person(ctx)?;
     let core = crate::hc::connect(ctx)?;
     let folder = identity::folder(ctx)?;
-    let team = identity::team(ctx, &folder, client, request.value("Name").unwrap_or(""))?;
+    let name = request.value("Name").unwrap_or("").to_string();
+    let team = identity::team(ctx, &folder, client, &name)?;
     admit(ctx, &format!("up|{team}"), || {
         // cascade-3d C8: the caller's session's journals first (lock order up|T, then the team lock).
         let scope = super::team_state::Scope::of(&caller);
         if super::cascade::waiting(ctx, &scope) {
             super::team_state::open(ctx, &scope, |tx| super::cascade::finish(tx, &caller))?;
         }
-        // 6b ambiguities 7, 8: an existing lifecycle team is reconciled at its anchor, not refused.
-        if let Some(scope) =
-            discover::existing(ctx, &core, &super::scope::state(&caller).key, &team)?
-        {
-            let anchor = super::reconcile::anchor_caller(&caller, &scope);
-            let mut reply = super::reconcile::run(ctx, &anchor)?;
-            reply.insert("team".into(), json!(team));
-            reply.insert("created".into(), json!(false));
-            return Ok(reply);
+        let fresh = index::read(ctx, &team)?.is_none();
+        if fresh {
+            // Ambiguity 9, call 1: a lifecycle leader of T with no index was made by an earlier build.
+            if discover::existing(ctx, &core, &super::scope::state(&caller).key, &team)?.is_some() {
+                return Err(index::bad(NO_INDEX));
+            }
+            let inputs = index::Inputs {
+                client: super::spawn::client_name(client).into(),
+                options: classified.options.clone(),
+                prompt: classified.prompt.clone(),
+                name: name.clone(),
+                folder: utf8(&folder)?.into(),
+            };
+            let mut made = index::Index {
+                team: team.clone(),
+                inputs,
+                anchor: None,
+                view: None,
+                pending: None,
+                aliases: vec![],
+                releases: vec![],
+            };
+            made.pending = Some(publish::new_pending(ctx, &caller, &made)?);
+            let up_dir = ctx.state_root.join("up");
+            #[cfg(unix)]
+            crate::state::private_unix::private_dirs(&ctx.state_root, &[&up_dir])?;
+            #[cfg(windows)]
+            crate::state::private_windows::private_dirs(&[&up_dir])?;
+            index::write(ctx, &made)?; // E6.1, call 20: {team, inputs, pending}
+            halt("index")?;
         }
-        create(
-            ctx,
-            &caller,
-            &core,
-            &Plan {
-                client,
-                options: &classified.options,
-                prompt: &classified.prompt,
-                folder: &folder,
-                team: &team,
-            },
-        )
+        drive(ctx, &caller, &core, &team, fresh)
     })
 }
+
+/// Call 1.
+pub const NO_INDEX: &str = "this team has a leader but no index (a development build made it); run mux-agent stop leader in the team, then up again";
 
 /// A person in a tmux or rmux pane; members and agents are refused `tagged`.
 /// reentry-6a E2: `up` needs only person proof, never the index (`resolve_person`).
@@ -120,47 +124,132 @@ fn gate(ctx: &Ctx, what: &str, admitted: bool) -> Res<Caller> {
     Ok(caller)
 }
 
-fn create(ctx: &Ctx, caller: &Caller, core: &Core<'_>, plan: &Plan<'_>) -> Res<Map<String, Value>> {
-    let up_dir = ctx.state_root.join("up");
-    #[cfg(unix)]
-    crate::state::private_unix::private_dirs(&ctx.state_root, &[&up_dir])?;
-    #[cfg(windows)]
-    crate::state::private_windows::private_dirs(&[&up_dir])?;
-    let release = up_dir.join(format!("{}.release", crate::util::hex32()?));
-    let name = identity::session_name(plan.folder, plan.team)?;
-    // Step 1, never -A: a taken name refuses here with nothing to clean.
-    let out = native(
-        ctx,
-        &[
-            "new-session",
-            "-d",
-            "-P",
-            "-F",
-            "#{session_id} #{window_id}",
-            "-s",
-            &name,
-            "-c",
-            utf8(plan.folder)?,
-            utf8(&ctx.exe)?,
-            "hold",
-            utf8(&release)?,
-        ],
-        false,
-    )?;
-    // Before the commit every failure writes the release file, so `hold` ends. Until step 2 has succeeded, or when the
-    // write fails, the session may stay: the refusal names it.
-    let step2 = Cell::new(false);
-    let fail = |mut e: Refusal| {
-        if crate::state::evidence::publish(&release, &serde_json::json!({})).is_err()
-            || !step2.get()
-        {
-            e.leftover = Some(name.clone());
-        }
-        e
+/// The team record at the anchor, by the typed reader: this team's (T and session), absent, or 1 `index` (calls 21,
+/// 36; F7: `Team::from_json`).
+fn team_exists(ctx: &Ctx, ix: &index::Index) -> Res<bool> {
+    use crate::state::evidence::{Evidence, read};
+    let Some(a) = &ix.anchor else {
+        return Ok(false);
     };
-    let (session, window) =
-        ids(&out.stdout).ok_or_else(|| fail(Refusal::internal("unproven new session")))?;
-    let dest = Caller {
+    let at = super::team::path(&ctx.state_root.join(&a.key), &a.session);
+    let unreadable = || index::bad(format!("the team record {} cannot be read", at.display()));
+    // Call 36 (finding A7): through `evidence` (a wrong-type ancestor is `index`; a FIFO is never opened).
+    let v = match read(&at) {
+        Evidence::Absent => return Ok(false),
+        Evidence::Unreadable => return Err(unreadable()),
+        Evidence::Present(v) => v,
+    };
+    let t = super::team::Team::from_json(&v).ok_or_else(unreadable)?;
+    if t.team == ix.team && t.session == a.session {
+        Ok(true)
+    } else {
+        Err(index::bad(format!(
+            "the team record {} is another team's",
+            at.display()
+        )))
+    }
+}
+
+/// Task 9: reconcile a team whose record exists at the anchor (restore-6b, at the index's anchor); create when this
+/// `up` wrote the index (E6.1's `pending` only); anything else waits for Task 10's replay (call 22).
+fn drive(
+    ctx: &Ctx,
+    caller: &Caller,
+    core: &Core<'_>,
+    team: &str,
+    fresh: bool,
+) -> Res<Map<String, Value>> {
+    let mut ix = index::read(ctx, team)?.ok_or_else(|| Refusal::internal("index vanished"))?;
+    let mut reply = Map::new();
+    if team_exists(ctx, &ix)? {
+        let a = ix
+            .anchor
+            .clone()
+            .ok_or_else(|| Refusal::internal("no anchor"))?;
+        let scope = super::team_state::Scope {
+            key: a.key,
+            session: a.session,
+        };
+        reply.extend(super::reconcile::run(
+            ctx,
+            &super::reconcile::anchor_caller(caller, &scope),
+        )?);
+        reply.insert("team".into(), json!(team));
+        reply.insert("created".into(), json!(false));
+        reply.insert("reentered".into(), json!(true));
+        if let Err(e) = publish::release_all(ctx, &mut ix) {
+            reply.insert("releaseError".into(), e.message.into()); // call 25: a crashed up's release finished here
+        }
+        return Ok(reply);
+    }
+    if !fresh || ix.anchor.is_some() || ix.view.is_some() {
+        return Err(index::bad(
+            "an earlier up of this team did not finish; run up again with this build",
+        ));
+    }
+    let shown = publish::start(ctx, caller, &mut ix)?;
+    let record = launch(ctx, caller, core, &ix, &shown)?;
+    let team_error = write_team(ctx, &ix, &record).err();
+    halt("team")?;
+    reply.extend(super::spawn::view_reply(&record)); // A3b-2: `attached`, or `viewError` (call 23)
+    for (k, v) in [
+        ("team", json!(team)),
+        ("session", json!(shown.view.session)),
+        ("name", json!(shown.view.name)),
+        ("created", json!(true)),
+        ("replayed", json!(false)),
+        ("reentered", json!(false)),
+    ] {
+        reply.insert(k.into(), v);
+    }
+    reply.insert(
+        "leader".into(),
+        json!({"id": record["id"], "name": record["name"], "hcAddress": record["hcAddress"]}),
+    );
+    if let Some(e) = team_error {
+        reply.insert("teamRecordError".into(), e.message.into());
+    }
+    let window = text(record.get("window"));
+    present(ctx, caller, &mut ix, &shown, &window, &mut reply)?;
+    Ok(reply)
+}
+
+/// Calls 33, 39 (findings A1, F1-F3): the anchor key `key`'s `server.json`. On its own server it is published
+/// create-once in a private key folder before any index write names the anchor; elsewhere it is never invented. A
+/// binding that is absent, malformed or whose tuple does not hash to `key` is 1 `index`.
+pub(crate) fn bind_anchor_server(ctx: &Ctx, caller: &Caller, key: &str) -> Res<()> {
+    let dir = ctx.state_root.join(key);
+    let at = dir.join("server.json");
+    if key == caller.server_key {
+        super::spawn::private_folder(ctx, &dir)?;
+        let body = json!({"socket": caller.socket, "serverPid": caller.server_pid, "serverStart": caller.server_start});
+        crate::state::evidence::publish(&at, &body)?;
+    }
+    let bound = match crate::state::evidence::read(&at) {
+        crate::state::evidence::Evidence::Present(v) => {
+            let socket = v.get("socket").and_then(Value::as_str);
+            let pid = v
+                .get("serverPid")
+                .and_then(Value::as_u64)
+                .and_then(|p| u32::try_from(p).ok());
+            let start = v.get("serverStart").and_then(Value::as_i64);
+            matches!((socket, pid, start), (Some(s), Some(p), Some(t)) if index::key_of(s, p, t) == key)
+        }
+        _ => false,
+    };
+    if bound {
+        Ok(())
+    } else {
+        Err(index::bad(format!(
+            "the anchor's server binding {} is missing or not its own; run up on that server",
+            at.display()
+        )))
+    }
+}
+
+/// The caller as a person in the view's session, its state at the anchor (multiplexer calls on the view).
+fn at_view(caller: &Caller, ix: &index::Index, shown: &publish::Published) -> Caller {
+    Caller {
         kind: Kind::Human,
         client: None,
         agent: None,
@@ -168,38 +257,51 @@ fn create(ctx: &Ctx, caller: &Caller, core: &Core<'_>, plan: &Plan<'_>) -> Res<M
         candidate: None,
         chain: Vec::new(),
         pane: String::new(),
-        window: window.clone(),
-        session: session.clone(),
-        presentation: Some((String::new(), window.clone())),
+        window: shown.window.clone(),
+        session: shown.view.session.clone(),
+        presentation: Some((String::new(), shown.window.clone())),
+        anchor: ix.anchor.clone(),
         ..caller.clone()
-    };
-    server::same(ctx, &dest).map_err(fail)?;
+    }
+}
+
+/// E6.3: the leader's launch transaction at the anchor, from `inputs` (launch-1 G1 through `launch_hc_locked`).
+fn launch(
+    ctx: &Ctx,
+    caller: &Caller,
+    core: &Core<'_>,
+    ix: &index::Index,
+    shown: &publish::Published,
+) -> Res<Value> {
+    let dest = at_view(caller, ix, shown);
+    server::same(ctx, &dest)?;
+    let hold_window = format!("={}:{}", shown.view.name, shown.window);
     native(
         ctx,
         &[
             "set-option",
             "-w",
             "-t",
-            &format!("={name}:{window}"),
+            &hold_window,
             "remain-on-exit",
             "off",
         ],
         false,
-    )
-    .map_err(fail)?;
-    step2.set(true);
+    )?;
+    let client =
+        client_named(&ix.inputs.client).ok_or_else(|| Refusal::internal("index client"))?;
     let leader = Leader {
-        team: plan.team.into(),
-        options: plan.options.to_vec(),
-        prompt: plan.prompt.to_vec(),
+        team: ix.team.clone(),
+        options: ix.inputs.options.clone(),
+        prompt: ix.inputs.prompt.clone(),
     };
-    let record = lock(ctx, &super::team_lock(&dest), || {
+    lock(ctx, &super::team_lock(&dest), || {
         server::same(ctx, &dest)?;
         let request = CoreRequest {
-            client: plan.client,
+            client,
             task: "",
             brief: None,
-            directory: plan.folder,
+            directory: Path::new(&ix.inputs.folder),
             model: None,
             no_fork: true,
             effort: None,
@@ -216,89 +318,63 @@ fn create(ctx: &Ctx, caller: &Caller, core: &Core<'_>, plan: &Plan<'_>) -> Res<M
             })
         })
     })
-    .map_err(fail)?;
-    let mut reply = Map::new();
-    for (k, v) in [
-        ("team", json!(plan.team)),
-        ("session", json!(session)),
-        ("name", json!(name)),
-        (
-            "leader",
-            json!({"id": record["id"], "name": record["name"], "hcAddress": record["hcAddress"]}),
-        ),
-        ("created", json!(true)),
-    ] {
-        reply.insert(k.into(), v);
-    }
-    // PM call 10 (G1.6): a view that failed after the commit is reported. The leader, its session and the team
-    // record stay; there is no window to lay out, so `layout` is skipped.
-    let view_error = record.get("viewError").cloned();
-    if let Some(e) = &view_error {
-        reply.insert("viewError".into(), e.clone());
-    }
-    // Step 5 after the commit, still under the admission lock; step 6 reports each failure; the leader and session stay.
-    let team_error = write_team(ctx, &dest, plan, &name, &record).err();
-    if view_error.is_none()
-        && let Err(e) = layout(
-            ctx,
-            &dest,
-            &release,
-            &name,
-            &text(record.get("window")),
-            &mut reply,
-        )
-    {
-        reply.insert("layoutError".into(), e.message.into());
-    }
-    if let Some(e) = team_error {
-        reply.insert("teamRecordError".into(), e.message.into());
-    }
-    Ok(reply)
 }
 
-/// Step 6: release, the bar of the view's window (#122 sidebar::keep), the view's window by its `@id`, the client.
-fn layout(
-    ctx: &Ctx,
-    dest: &Caller,
-    release: &Path,
-    name: &str,
-    view: &str,
-    reply: &mut Map<String, Value>,
-) -> Res<()> {
-    let wrote = crate::state::evidence::publish(release, &serde_json::json!({})).map(|_| ());
-    crate::sidebar::keep(ctx, dest, view, reply);
-    wrote?;
-    server::same(ctx, dest)?;
-    native(ctx, &["select-window", "-t", view], false)?;
-    server::same(ctx, dest)?;
-    native(ctx, &["switch-client", "-t", &format!("={name}")], false).map(|_| ())
-}
-
-/// Step 5: the team record, create-only (#118 team::create).
-fn write_team(ctx: &Ctx, dest: &Caller, plan: &Plan<'_>, name: &str, record: &Value) -> Res<()> {
-    use super::team;
-    let made = team::Team {
-        team: plan.team.into(),
-        session: super::scope::state(dest).session,
-        name: name.into(),
-        directory: utf8(plan.folder)?.into(),
-        client: plan.client,
-        flags: plan.options.to_vec(),
-        policy: team::policy(plan.client, plan.options),
+/// E6.4: the team record at the anchor, create-only (#118 team::create).
+fn write_team(ctx: &Ctx, ix: &index::Index, record: &Value) -> Res<()> {
+    let a = ix
+        .anchor
+        .as_ref()
+        .ok_or_else(|| Refusal::internal("no anchor"))?;
+    let client: Client =
+        client_named(&ix.inputs.client).ok_or_else(|| Refusal::internal("index client"))?;
+    let made = super::team::Team {
+        team: ix.team.clone(),
+        session: a.session.clone(),
+        name: ix.view.as_ref().map(|v| v.name.clone()).unwrap_or_default(),
+        directory: ix.inputs.folder.clone(),
+        client,
+        flags: ix.inputs.options.clone(),
+        policy: super::team::policy(client, &ix.inputs.options),
         leader: text(record.get("id")),
         created_at: crate::util::utc_o(ctx.clock.now()),
     };
-    if team::create(
-        &team::path(
-            &super::server_dir(ctx, dest),
-            &super::scope::state(dest).session,
-        ),
-        &made,
-    )? {
+    let at = super::team::path(&ctx.state_root.join(&a.key), &a.session);
+    if super::team::create(&at, &made)? {
         Ok(())
     } else {
         refuse(1, "team", "the team record already exists")
     }
+}
+
+/// The bar of the view's window, the window, the client (skipped when the reply reports `viewError`: no layout
+/// without a view, call 23), then `halt("presented")`, then every outstanding release (ambiguity 7: last; call 5).
+fn present(
+    ctx: &Ctx,
+    caller: &Caller,
+    ix: &mut index::Index,
+    shown: &publish::Published,
+    window: &str,
+    reply: &mut Map<String, Value>,
+) -> Res<()> {
+    if !reply.contains_key("viewError") && !window.is_empty() {
+        let dest = at_view(caller, ix, shown);
+        crate::sidebar::keep(ctx, &dest, window, reply);
+        let target = format!("={}", shown.view.name);
+        let switched = server::same(ctx, &dest)
+            .and_then(|_| native(ctx, &["select-window", "-t", window], false))
+            .and_then(|_| server::same(ctx, &dest))
+            .and_then(|_| native(ctx, &["switch-client", "-t", &target], false));
+        if let Err(e) = switched {
+            reply.insert("layoutError".into(), e.message.into());
+        }
+    }
+    halt("presented")?;
+    // E5, calls 17, 25, 35 (finding A6): every outstanding release published and read back `Present`.
+    if let Err(e) = publish::release_all(ctx, ix) {
+        reply.insert("releaseError".into(), e.message.into());
+    }
+    Ok(())
 }
 
 #[cfg(test)]

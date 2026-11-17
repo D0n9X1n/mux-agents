@@ -459,6 +459,11 @@ const SCOPE_READS_ALLOWED: &[(&str, &str, &str)] = &[
         "answered",
         "the caller's own server is proven by server::same",
     ),
+    (
+        "src/agents/up/mod.rs",
+        "bind_anchor_server",
+        "call 33: the anchor is bound only from its own server",
+    ),
     ("src/agents/up/server.rs", "same", "proves the shown server"),
     (
         "src/agents/core_identity.rs",
@@ -1336,6 +1341,11 @@ const TEST_ONLY: &[(&str, &str, &str)] = &[
         "src/agents/up/publish_tests.rs",
         "src/agents/up/mod.rs",
         "publish_tests",
+    ),
+    (
+        "src/agents/up/tests/create.rs",
+        "src/agents/up/tests.rs",
+        "create",
     ),
     ("src/agents/up/tests.rs", "src/agents/up/mod.rs", "tests"),
     (

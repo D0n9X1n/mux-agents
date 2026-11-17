@@ -68,8 +68,19 @@ fn team_of(w: &World) -> String {
     )
     .unwrap()
 }
+/// The published release markers under `up/` (reentry-6a: `up/` also holds the team index `<T>.json`).
 fn releases(w: &World) -> usize {
-    std::fs::read_dir(w.ctx.state_root.join("up")).map_or(0, |d| d.count())
+    std::fs::read_dir(w.ctx.state_root.join("up")).map_or(0, |d| {
+        d.flatten()
+            .filter(|e| e.path().extension().is_some_and(|x| x == "release"))
+            .count()
+    })
+}
+/// reentry-6a call 22: the session `new-session` made is published in the index, its release kept there.
+fn kept_in_index(w: &World) -> bool {
+    create::index_of(w)
+        .is_some_and(|ix| ix.view.is_some() && ix.pending.is_none() && ix.releases.len() == 1)
+        && !create::released(w)
 }
 fn ran(w: &World) -> bool {
     w.fakes.hc_calls().iter().any(|(_, a, _)| a[0] == "run")
@@ -110,7 +121,8 @@ fn up_creates_the_team_in_a_new_session() {
         reply["name"].as_str().unwrap().to_string(),
         reply["leader"]["id"].as_str().unwrap().to_string(),
     );
-    let want = json!({"team": t, "session": "$7", "name": name, "leader": {"id": id, "name": "leader", "hcAddress": "t1"}, "created": true, "sidebar": null});
+    // reentry-6a F8: A3b-2's `view`, then Task 9's `replayed` and `reentered`.
+    let want = json!({"view": "attached", "team": t, "session": "$7", "name": name, "created": true, "replayed": false, "reentered": false, "leader": {"id": id, "name": "leader", "hcAddress": "t1"}, "sidebar": null});
     assert_eq!(Value::Object(reply.clone()).to_string(), want.to_string());
     assert!(
         name.starts_with(&format!("project_v1-{}-", &t[..8]))
@@ -264,39 +276,53 @@ fn post_commit_failures_are_reported_and_the_leader_stays() {
         out(0, "%9|@5|exact,#} attach t1\n")
     });
     let reply = claude(&release).unwrap();
+    // reentry-6a ambiguity 7: the release is published last, after the bar, the window and the client.
     assert!(
-        reply["layoutError"].is_string()
+        reply["releaseError"].is_string()
+            && reply.get("layoutError").is_none()
             && reply.get("leftoverSession").is_none()
-            && of(&release, "select-window").is_empty()
+            && !of(&release, "switch-client").is_empty(),
+        "{reply:?}"
     );
 }
 
+// reentry-6a call 22: no failure names a leftover session any more. A session `new-session` made is published in
+// the index with its release kept there (a second `up` reuses it); an unproven one keeps its release in the index.
 #[test]
-fn cleanup_kills_nothing_and_names_a_leftover_session_until_step_2() {
+fn cleanup_kills_nothing_and_keeps_a_made_session_in_the_index() {
+    let unproven = |w: &World| {
+        create::index_of(w)
+            .is_some_and(|ix| ix.view.is_none() && ix.pending.is_none() && ix.releases.len() == 1)
+    };
     let taken = ready();
     fails(&taken, "new-session");
+    let e = claude(&taken).unwrap_err();
     assert_eq!(
         (
-            claude(&taken).unwrap_err().leftover,
+            e.leftover,
+            e.message.as_str(),
             releases(&taken),
             ran(&taken)
         ),
-        (None, 0, false)
+        (None, publish::UNPROVEN, 0, false)
     );
+    assert!(unproven(&taken), "taken: its release kept in the index");
     let malformed = ready();
     malformed
         .fakes
         .mux_script("new-session", |_| out(0, "garbage\n"));
     let e = claude(&malformed).unwrap_err();
     assert!(
-        e.leftover.unwrap().starts_with("project_v1-")
-            && releases(&malformed) == 1
+        e.leftover.is_none()
+            && e.message == publish::UNPROVEN
+            && releases(&malformed) == 0
+            && unproven(&malformed)
             && of(&malformed, "set-option").is_empty()
     );
     let remain = ready();
     fails(&remain, "remain-on-exit");
     assert!(
-        claude(&remain).unwrap_err().leftover.is_some() && releases(&remain) == 1 && !ran(&remain)
+        claude(&remain).unwrap_err().leftover.is_none() && kept_in_index(&remain) && !ran(&remain)
     );
     let failed = base();
     failed
@@ -304,7 +330,11 @@ fn cleanup_kills_nothing_and_names_a_leftover_session_until_step_2() {
         .hc_answer(Err(Refusal::internal("hc run failed")));
     assert_eq!(
         (claude(&failed).unwrap_err().leftover, releases(&failed)),
-        (None, 1)
+        (None, 0)
+    );
+    assert!(
+        kept_in_index(&failed),
+        "failed: published, its release kept"
     );
     let unwritable = base();
     unwritable
@@ -316,7 +346,8 @@ fn cleanup_kills_nothing_and_names_a_leftover_session_until_step_2() {
         std::fs::write(&up_dir, "").unwrap();
         out(0, "")
     });
-    assert!(claude(&unwritable).unwrap_err().leftover.is_some());
+    let e = claude(&unwritable).unwrap_err();
+    assert!(e.leftover.is_none() && e.check == "hc", "{e:?}");
     assert!(
         [&taken, &malformed, &remain, &failed, &unwritable]
             .iter()
@@ -342,9 +373,10 @@ fn only_a_person_inside_a_multiplexer_runs_up() {
 
 #[test]
 fn a_restarted_server_stops_up_before_the_next_command() {
-    // Check 1 precedes step 2 (refusal names the session); 2 precedes the launch (refusal, released); 3-4 follow the
-    // commit.
-    for check in 1..=4 {
+    // reentry-6a Task 9: check 1 is `answered` after new-session (call 34: `index`, nothing published, `pending`
+    // kept); 2 precedes remain-on-exit and 3 the launch (refusal; the session published, its release kept in the
+    // index); 4-5 follow the commit.
+    for check in 1..=5 {
         for start_changed in [false, true] {
             let w = ready();
             let (fakes, n) = (w.fakes.clone(), Rc::new(Cell::new(0)));
@@ -377,15 +409,25 @@ fn a_restarted_server_stops_up_before_the_next_command() {
                 "{check} {start_changed}"
             );
             match got {
+                Err(e) if check == 1 => assert!(
+                    e.check == "index"
+                        && !ran(&w)
+                        && e.leftover.is_none()
+                        && releases(&w) == 0
+                        && create::index_of(&w)
+                            .is_some_and(|ix| ix.pending.is_some() && ix.view.is_none()),
+                    "{check} {start_changed} {e:?}"
+                ),
                 Err(e) => assert!(
-                    check <= 2
+                    check <= 3
                         && e.message == server::RESTARTED
                         && !ran(&w)
-                        && e.leftover.is_some() == (check == 1)
-                        && releases(&w) == 1
+                        && e.leftover.is_none()
+                        && kept_in_index(&w),
+                    "{check} {start_changed} {e:?}"
                 ),
                 Ok(reply) => assert!(
-                    check > 2 && reply["layoutError"] == server::RESTARTED,
+                    check > 3 && reply["layoutError"] == server::RESTARTED,
                     "{check}"
                 ),
             }
@@ -396,10 +438,22 @@ fn a_restarted_server_stops_up_before_the_next_command() {
 #[test]
 fn the_leader_is_rediscovered_after_each_write_and_a_failed_flush_launches_nothing() {
     let w = ready();
+    // reentry-6a Task 9: the index writes through `write_json_durable_with`, outside this counter; the first counted
+    // write is still the leader's record. The session is published in the index, its release kept there.
     crate::state::fs::fail_durable_flush(Some(0));
     let got = claude(&w);
     crate::state::fs::fail_durable_flush(None);
-    assert!(got.is_err() && !ran(&w) && releases(&w) == 1);
+    assert!(
+        got.is_err() && !ran(&w) && releases(&w) == 0 && kept_in_index(&w),
+        "{got:?} ran {} releases {} index {:?}",
+        ran(&w),
+        releases(&w),
+        create::index_of(&w)
+    );
+    assert!(
+        std::fs::read_dir(agents(&w)).is_ok_and(|mut d| d.next().is_some()),
+        "the record's write was reached"
+    );
     let first = ready();
     let shots: Rc<std::cell::RefCell<Vec<Vec<u8>>>> = Rc::default();
     let shot = |dir: PathBuf, shots: Rc<std::cell::RefCell<Vec<Vec<u8>>>>| {
@@ -445,7 +499,8 @@ fn the_leader_is_rediscovered_after_each_write_and_a_failed_flush_launches_nothi
     for (n, bytes) in shots.borrow().iter().enumerate() {
         std::fs::write(leader_folder(&first).join("record.json"), bytes).unwrap();
         let _ = std::fs::remove_file(leader_folder(&first).join("commit.json"));
-        let _ = std::fs::remove_file(team_file(&first));
+        // reentry-6a Task 9 (deviation D23): the team record stays, so the second `up` takes the reconcile branch at
+        // the anchor; a missing team record with a published index is Task 10's replay (E6 step 4).
         let mut again = base();
         (again.ctx.state_root, again.ctx.cwd) =
             (first.ctx.state_root.clone(), first.ctx.cwd.clone());
@@ -549,28 +604,49 @@ fn every_folder_above_the_leader_record_is_flushed_before_hc_run() {
             .nth(n)
             .unwrap()
             .to_path_buf();
-        crate::state::fs::fail_sync_dir(Some(&dir));
+        // reentry-6a Task 9: the index and the anchor binding flush some of these folders first. Their flushes up to
+        // publication are counted in a twin world and let through, so the fault lands on the leader's own flush.
+        let twin = ready();
+        halt_after(Some("published"));
+        let (halted, syncs) = crate::state::fs::record_syncs(|| claude(&twin));
+        halt_after(None);
+        assert_eq!(halted.unwrap_err().check, "halted");
+        let twin_dir = agents(&twin)
+            .parent()
+            .unwrap()
+            .ancestors()
+            .nth(n)
+            .unwrap()
+            .to_path_buf();
+        let before = syncs.iter().filter(|d| **d == twin_dir).count();
+        crate::state::fs::fail_sync_dir_after(Some(&dir), u32::try_from(before).unwrap());
         let got = claude(&w);
         crate::state::fs::fail_sync_dir(None);
         let e = got.err();
         assert!(
-            e.as_ref().is_some_and(|e| e.check == "internal") && !ran(&w) && releases(&w) == 1,
+            e.as_ref().is_some_and(|e| e.check == "internal")
+                && !ran(&w)
+                && releases(&w) == 0
+                && kept_in_index(&w),
             "{} {e:?}",
             dir.display()
         );
     }
 }
 
-// S6: up publishes its release marker whole, as {}, never as an empty file.
+// S6: up publishes its release marker whole, never as an empty file (reentry-6a F8: `release_all` writes
+// `{"released": true}`; `up/` also holds the team index).
 #[test]
 fn up_publishes_a_whole_release_marker() {
     let w = ready();
     claude(&w).unwrap();
     let bodies: Vec<Vec<u8>> = std::fs::read_dir(w.ctx.state_root.join("up"))
         .unwrap()
-        .map(|e| std::fs::read(e.unwrap().path()).unwrap())
+        .map(|e| e.unwrap().path())
+        .filter(|p| p.extension().is_some_and(|x| x == "release"))
+        .map(|p| std::fs::read(p).unwrap())
         .collect();
-    assert_eq!(bodies, [b"{}".to_vec()]);
+    assert_eq!(bodies, [br#"{"released":true}"#.to_vec()]);
 }
 
 // E1: an unknown client flag refuses usage before anything is made, connected or launched.
@@ -702,6 +778,10 @@ fn a_leader_view_failure_is_reported_and_the_leader_stays() {
         !killed(&w) && !w.fakes.hc_calls().iter().any(|(_, a, _)| a[0] == "kill"),
         "nothing rolled back"
     );
+    assert!(
+        create::released(&w),
+        "released once the reply reports the failure"
+    );
 }
 
 // cascade-3d C8: `up` finishes the caller's session's journals under `up|<team>` before anything else; an
@@ -736,3 +816,6 @@ fn up_finishes_a_kept_cascade_first() {
     let _ = claude(&w);
     assert!(!dir.join("aaaaaaaaaaa1.json").exists(), "finished");
 }
+
+#[cfg(test)]
+mod create;

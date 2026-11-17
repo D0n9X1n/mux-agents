@@ -1393,9 +1393,14 @@ fn up_creates_a_team_in_a_new_session() {
     assert!(!marker.exists());
     // 6b ambiguity 8 (r6b call 7): a second `up` reconciles the team; nothing is lost, nothing restored.
     let again = live.run_any(&["up", "-Client", "claude"]);
+    // reentry-6a Task 9: it re-enters the team the index records.
     assert_eq!(
-        (&again["created"], &again["restored"]),
-        (&serde_json::json!(false), &serde_json::json!([])),
+        (&again["created"], &again["reentered"], &again["restored"]),
+        (
+            &serde_json::json!(false),
+            &serde_json::json!(true),
+            &serde_json::json!([])
+        ),
         "{again}"
     );
 }
