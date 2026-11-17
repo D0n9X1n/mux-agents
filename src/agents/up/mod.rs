@@ -5,6 +5,9 @@ pub mod discover;
 mod existing_tests;
 pub mod identity;
 pub mod index;
+pub mod publish;
+#[cfg(test)]
+mod publish_tests;
 pub mod server;
 #[cfg(test)]
 pub(crate) mod tests;

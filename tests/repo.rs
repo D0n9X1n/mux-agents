@@ -439,6 +439,16 @@ const SCOPE_READS_ALLOWED: &[(&str, &str, &str)] = &[
         "notices",
         "displays in the shown session",
     ),
+    (
+        "src/agents/up/publish.rs",
+        "sessions_on",
+        "the caller's own server is listed natively",
+    ),
+    (
+        "src/agents/up/publish.rs",
+        "answered",
+        "the caller's own server is proven by server::same",
+    ),
     ("src/agents/up/server.rs", "same", "proves the shown server"),
     (
         "src/agents/core_identity.rs",
@@ -1306,6 +1316,11 @@ const TEST_ONLY: &[(&str, &str, &str)] = &[
         "src/agents/up/existing_tests.rs",
         "src/agents/up/mod.rs",
         "existing_tests",
+    ),
+    (
+        "src/agents/up/publish_tests.rs",
+        "src/agents/up/mod.rs",
+        "publish_tests",
     ),
     ("src/agents/up/tests.rs", "src/agents/up/mod.rs", "tests"),
     (
