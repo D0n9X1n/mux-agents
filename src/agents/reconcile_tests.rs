@@ -232,6 +232,7 @@ pub(super) fn seed_index(w: &World, t: &str, key: &str, session: &str) {
         created_at: "2026-01-01T00:00:00.0000000Z".into(),
     };
     let at = super::team::path(&w.ctx.state_root.join(key), session);
+    let _ = std::fs::remove_file(&at); // restore-6c: `member_at` may have written its own record first
     assert!(super::team::create(&at, &record).unwrap());
 }
 /// The terminal hc shows for member `id`, generation n, running `argv`.

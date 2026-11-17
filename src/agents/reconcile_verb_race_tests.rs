@@ -230,6 +230,7 @@ fn team_record(w: &super::fixture::World) {
         leader: L.into(),
         created_at: "x".into(),
     };
+    let _ = std::fs::remove_file(team::path(&w.state(), &session)); // restore-6c: `member_at`'s record
     assert!(team::create(&team::path(&w.state(), &session), &t).unwrap());
 }
 
