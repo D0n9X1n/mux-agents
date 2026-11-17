@@ -1384,6 +1384,11 @@ const TEST_ONLY: &[(&str, &str, &str)] = &[
     ("src/sidebar/keys/tests.rs", "src/sidebar/keys.rs", "tests"),
     ("src/sidebar/pick/tests.rs", "src/sidebar/pick.rs", "tests"),
     ("src/testing.rs", "src/lib.rs", "testing"),
+    (
+        "src/agents/stop_gen_tests.rs",
+        "src/agents/mod.rs",
+        "stop_gen_tests",
+    ),
 ];
 
 #[test]

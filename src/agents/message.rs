@@ -1023,6 +1023,9 @@ fn listed(os: &dyn crate::proc::Os, pid: u32, start: i64) -> bool {
 /// recorded client has exited (#137), so a `resume` right after is not refused `session`. Past the bound it still
 /// replies, with `clientExited: false`.
 pub fn stop_hc(ctx: &Ctx, request: &Request) -> Res<Map<String, Value>> {
+    if request.switch("Generation") {
+        return generations::stop_generations(ctx, request);
+    }
     let caller = crate::caller::resolve_tree(ctx)?;
     let scope = super::team_state::Scope::of(&caller);
     let (mut reply, client) = super::tree::with_standing(ctx, &caller, |standing| {
@@ -1166,6 +1169,8 @@ fn stop_pre(
         Ok((reply, client))
     })
 }
+
+mod generations;
 
 #[cfg(test)]
 mod prelife_stop_tests;

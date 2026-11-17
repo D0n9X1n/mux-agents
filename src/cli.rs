@@ -156,10 +156,10 @@ pub static VERBS: &[VerbDef] = &[
     VerbDef {
         name: "stop",
         values: &[],
-        switches: &[],
+        switches: &["Generation"],
         min: 1,
         max: 1,
-        usage: "usage: mux-agent stop <name> [-Text]",
+        usage: "usage: mux-agent stop <name> [-Generation] [-Text]",
         handler: crate::agents::message::stop_hc,
         text: json::lines,
     },

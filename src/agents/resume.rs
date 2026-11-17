@@ -20,7 +20,7 @@ use crate::state::fs::read_json;
 
 mod recovery;
 pub use recovery::Action;
-pub(crate) use recovery::recover;
+pub(crate) use recovery::{Subject, recover, subject};
 
 pub fn resume(ctx: &Ctx, request: &Request) -> Res<Map<String, Value>> {
     let target = first(request);

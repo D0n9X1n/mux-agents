@@ -20,7 +20,7 @@ pub enum Action {
 }
 
 /// What `target` names among the anchor session's members (call 15).
-enum Subject {
+pub(crate) enum Subject {
     Life(String),
     /// A pre-lifecycle record: today's resume (prelife-1c G10 refuses it there, retry or fresh).
     Pre,
@@ -165,7 +165,7 @@ fn gates(
 
 /// Call 15: X among the anchor session's lifecycle members only (`session` is the Tx's, `id` names its folder), by
 /// exact id, else the newest (`createdAt`) of that name. Any unreadable member may be X: `evidence` (call 25).
-fn subject(tx: &Tx<'_>, target: &str) -> Res<Subject> {
+pub(crate) fn subject(tx: &Tx<'_>, target: &str) -> Res<Subject> {
     let (mut named, mut pre) = (Vec::new(), false);
     for (id, _, m) in super::super::gens::members(&tx.scope.agents(&tx.ctx.state_root))? {
         let g = match m {

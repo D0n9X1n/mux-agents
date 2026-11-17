@@ -82,6 +82,8 @@ mod session_report_tests;
 pub mod settle;
 pub mod spawn;
 #[cfg(test)]
+mod stop_gen_tests;
+#[cfg(test)]
 mod stop_hc_tests;
 pub mod team;
 pub mod team_mail;
