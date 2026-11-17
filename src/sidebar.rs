@@ -745,10 +745,26 @@ fn recovery_word(row: &Map<String, Value>) -> Option<&'static str> {
 /// o2 call 28: a recovery row's right side in every flat layout: its words and age when they fit beside the glyph, the
 /// badge and a cut name (`agent_line`'s own test for keeping a right side), else the bare `recover` pill, which
 /// `agent_line` keeps where it would drop the longer side (as the wide bar's `bare` floor).
-fn recovery_side(word: &str, age: &str, glyph: &Span, badge: &Row, cols: usize) -> Row {
-    let full = right(Kind::Blocked, word, age, false);
+fn recovery_side(
+    row: &Map<String, Value>,
+    word: &str,
+    age: &str,
+    glyph: &Span,
+    badge: &Row,
+    cols: usize,
+) -> Row {
     let fixed = paint::width(&glyph.0) + 1 + row_width(badge);
-    if fixed + 2 + row_width(&full) + 4 <= cols {
+    let fits = |side: &Row| fixed + 2 + row_width(side) + 4 <= cols;
+    // restore-6c checklist 18 (P1): a stopped recovery row shows its reason beside `recover` while it fits.
+    let reason = clean(row.get("recoveryReason"));
+    if word == "recover" && !reason.is_empty() {
+        let with = right(Kind::Blocked, &format!("recover: {reason}"), age, false);
+        if fits(&with) {
+            return with;
+        }
+    }
+    let full = right(Kind::Blocked, word, age, false);
+    if fits(&full) {
         full
     } else {
         vec![span("recover", Kind::Blocked.word_style())]
@@ -760,7 +776,7 @@ fn live_row(row: &Map<String, Value>, cols: usize, look: Look) -> Live {
     let age_style = if p.muted { DIM } else { PLAIN };
     // Call 20: a Running member that needs recovery keeps its live row (still clickable) with the recovery word.
     let recovery =
-        recovery_word(row).map(|word| recovery_side(word, &p.age, &p.glyph, &p.badge, cols));
+        recovery_word(row).map(|word| recovery_side(row, word, &p.age, &p.glyph, &p.badge, cols));
     let side = recovery
         .clone()
         .unwrap_or_else(|| right(p.kind, p.kind.word(), &p.age, p.muted));
@@ -869,7 +885,7 @@ fn parts(
             format_age(row.get("age")),
         );
         let side = match recovery_word(row) {
-            Some(word) => recovery_side(word, &age, &glyph, &Vec::new(), cols),
+            Some(word) => recovery_side(row, word, &age, &glyph, &Vec::new(), cols),
             None => right(kind, &word, &age, false),
         };
         // o2 call 34: a recovery row never drops its pill.
@@ -3409,6 +3425,36 @@ mod tests {
                 !fixer.contains("lost") && !fixer.contains("working"),
                 "{case}: {fixer:?}"
             );
+        }
+    }
+
+    // restore-6c checklist 18 (P1): the flat bar shows the recovery reason beside `recover` where it fits (60),
+    // `recover` and the age where only that fits (24), and the bare `recover` pill below that (16).
+    #[test]
+    fn the_flat_bar_shows_the_recovery_reason_where_it_fits() {
+        let board = json!({"running": 0, "agents": [{"name": "fixer", "state": "lost", "life": "lost", "age": 60,
+            "needsRecovery": true, "recoveryReason": "exited 1"}]});
+        let look = Look {
+            color: false,
+            ascii: false,
+            dumb: false,
+        };
+        for (width, tail) in [
+            (60, "recover: exited 1   1m"),
+            (24, "recover   1m"),
+            (16, "recover"),
+        ] {
+            let laid = lay(board.as_object(), &[], Size { width, height: 20 }, look);
+            let text: Vec<String> = laid.rows.iter().map(|r| render(r, false)).collect();
+            let fixer = text
+                .iter()
+                .find(|l| l.contains("recover"))
+                .cloned()
+                .unwrap_or_default();
+            assert!(fixer.trim_end().ends_with(tail), "{width}: {fixer:?}");
+            if width < 60 {
+                assert!(!fixer.contains("exited"), "{width}: {fixer:?}");
+            }
         }
     }
     use std::cell::{Cell, RefCell};
