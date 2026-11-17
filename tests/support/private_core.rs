@@ -13,6 +13,7 @@ pub struct PrivateCore {
     dir: PathBuf,
     pub env: Vec<(&'static str, OsString)>,
     owned: bool,
+    started: bool,
 }
 impl PrivateCore {
     pub fn installed() -> PathBuf {
@@ -105,6 +106,7 @@ impl PrivateCore {
             dir: dir.into(),
             env,
             owned: false,
+            started: false,
         }
     }
     pub fn apply(&self, c: &mut Command) {
@@ -188,9 +190,11 @@ impl PrivateCore {
             }
         }
         self.owned = true;
+        self.started = true;
     }
     pub fn start(&mut self) {
         self.owned = true;
+        self.started = true;
         run(self.command(&["server", "start", "--json"]), &self.dir).expect("private core start");
     }
     pub fn stop(&mut self) -> bool {
@@ -210,9 +214,71 @@ impl PrivateCore {
         }
     }
 }
+impl PrivateCore {
+    /// The holder-socket prefixes of this fixture's core: its socket as given and, on Unix, under the dir's real path
+    /// (macOS `/tmp` is `/private/tmp`).
+    fn holder_marks(&self) -> Vec<String> {
+        let socket = self.env.iter().find(|(k, _)| *k == "HC_SOCKET");
+        let socket = socket.map(|(_, v)| PathBuf::from(v)).unwrap_or_default();
+        let mut marks = vec![holder_mark(&socket.to_string_lossy())];
+        if let (Ok(real), Some(name)) = (fs::canonicalize(&self.dir), socket.file_name()) {
+            let real = holder_mark(&real.join(name).to_string_lossy());
+            if !marks.contains(&real) {
+                marks.push(real);
+            }
+        }
+        marks
+    }
+
+    /// Ends what this fixture's core left running. `server stop` reaches only a core that answers: a holder whose
+    /// core was killed keeps its kept shells, and any hc call after the stop (a member's launcher, a client still
+    /// reporting) starts a new core on this socket. Each round stops such a core again, then kills every holder of
+    /// this fixture's socket and its descendants, checked by pid and start, and waits for them to go. A process
+    /// still running after the rounds is returned, so a failed kill is reported rather than leaked.
+    fn sweep(&mut self) -> Vec<(u32, Option<i64>)> {
+        let host = mux_agent::proc::host();
+        let marks = self.holder_marks();
+        let mut left = Vec::new();
+        for _ in 0..3 {
+            if self.started {
+                let _ = run(self.command(&["server", "stop", "--json"]), &self.dir);
+            }
+            let Ok(table) = host.table() else {
+                return left;
+            };
+            left = leftovers(&table, &marks);
+            if left.is_empty() {
+                return left;
+            }
+            for &(pid, start) in &left {
+                if let Some(opened) = host.open(pid).filter(|o| Some(o.start) == start) {
+                    host.kill(opened);
+                }
+            }
+            let gone =
+                |&(pid, start): &(u32, Option<i64>)| host.open(pid).map(|o| o.start) != start;
+            let end = Instant::now() + Duration::from_secs(10);
+            while !left.iter().all(gone) && Instant::now() < end {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            left.retain(|p| !gone(p));
+        }
+        left
+    }
+}
 impl Drop for PrivateCore {
     fn drop(&mut self) {
         let _ = self.stop();
+        let left = self.sweep();
+        if !left.is_empty() {
+            let message = format!("private core processes still running: {left:?}");
+            let _ = fs::write(self.dir.join("core-stop-failed"), &message);
+            if std::thread::panicking() {
+                eprintln!("{message}");
+            } else {
+                panic!("{message}");
+            }
+        }
     }
 }
 pub fn run(mut c: Command, dir: &Path) -> io::Result<Value> {
@@ -272,7 +338,7 @@ pub fn kill_order(terminals: &[(u32, Option<i64>)]) -> Vec<(u32, Option<i64>)> {
 }
 
 /// SIGKILL (Windows `taskkill /F /PID`, never `/T`) of one pid this test owns, bounded to 30 s; whether it succeeded.
-fn kill_pid(pid: u32) -> bool {
+pub fn kill_pid(pid: u32) -> bool {
     #[cfg(unix)]
     {
         // SAFETY: a plain signal to a pid this test read from its own private core; no memory is shared.
@@ -308,4 +374,42 @@ fn kill_pid(pid: u32) -> bool {
         }
         done.success()
     }
+}
+
+/// The prefix of every holder socket of the core at `socket`: the core names each holder's socket after its own,
+/// `<socket stem>.holder.<id>.sock` (`<dir>/h.holder.<id>.sock` beside `<dir>/h.sock`; on Windows
+/// `\\.\pipe\<session>.holder.<id>.sock`). The stem ends in this fixture's unique dir or session, so no other
+/// fixture's holder, and no core of the developer's own session, carries it.
+pub fn holder_mark(socket: &str) -> String {
+    format!("{}.holder.", socket.strip_suffix(".sock").unwrap_or(socket))
+}
+
+/// The processes this fixture's core left running, from one process table: each holder whose argv names a socket
+/// starting with one of `marks`, and every descendant of one. Each comes with its start, so a pid reused before the
+/// kill is never signalled. A row without a start is never chosen (it could not be checked again before the signal),
+/// nor is a child that started before its parent: its parent link names an earlier process that had the pid.
+pub fn leftovers(table: &[mux_agent::proc::Row], marks: &[String]) -> Vec<(u32, Option<i64>)> {
+    let holder = |r: &mux_agent::proc::Row| {
+        r.argv
+            .iter()
+            .flatten()
+            .any(|a| marks.iter().any(|m| a.starts_with(m.as_str())))
+    };
+    let mut found: Vec<(u32, Option<i64>)> = table
+        .iter()
+        .filter(|r| r.start.is_some() && holder(r))
+        .map(|r| (r.pid, r.start))
+        .collect();
+    let mut at = 0;
+    while at < found.len() {
+        let (parent, born) = found[at];
+        for r in table.iter().filter(|r| r.ppid == parent) {
+            let child = (r.pid, r.start);
+            if r.start.is_some() && r.start >= born && !found.contains(&child) {
+                found.push(child);
+            }
+        }
+        at += 1;
+    }
+    found
 }

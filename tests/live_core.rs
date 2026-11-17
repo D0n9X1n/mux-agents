@@ -141,3 +141,143 @@ fn core_drop_spares_another_fixture() {
     drop(sentinel);
     std::fs::remove_dir_all(d).unwrap();
 }
+
+// A holder is found by its socket: the core names each holder's socket after its own, `<socket stem>.holder.<id>.sock`
+// (`<dir>/h.holder.<id>.sock` beside `<dir>/h.sock`; `\.\pipe\<session>.holder.<id>.sock` on Windows). Only a holder
+// of this fixture's socket, and what descends from it, is chosen; each with a start no earlier than its parent's.
+#[test]
+fn leftovers_are_this_fixtures_holders_and_their_descendants() {
+    use mux_agent::proc::Row;
+    let row = |pid, ppid, start, argv: &[&str]| Row {
+        pid,
+        ppid,
+        start,
+        path: None,
+        argv: Some(argv.iter().map(|a| a.to_string()).collect()),
+        image: None,
+    };
+    let hold = |socket: &str| ["/opt/hc/herdr-core", "hold", "--socket", socket].map(String::from);
+    let hold = |pid, start, socket| {
+        let argv = hold(socket);
+        let argv: Vec<&str> = argv.iter().map(String::as_str).collect();
+        row(pid, 1, start, &argv)
+    };
+    let table = vec![
+        hold(100, Some(50), "/tmp/mxit-7-1/h.holder.ab12.sock"),
+        row(101, 100, Some(51), &["/bin/sh", "-l"]),
+        row(102, 101, Some(52), &["/bin/sleep", "60"]),
+        // A pid reused by a process older than the holder: its parent link names another process.
+        row(103, 100, Some(40), &["/bin/sh"]),
+        // No start: it could never be checked again before a signal.
+        row(104, 100, None, &["/bin/sh"]),
+        hold(110, None, "/tmp/mxit-7-1/h.holder.cd34.sock"),
+        // Another fixture's holders: a longer dir of the same prefix, and another run's dir.
+        hold(105, Some(60), "/tmp/mxit-7-10/h.holder.ef56.sock"),
+        row(106, 105, Some(61), &["/bin/sh", "-l"]),
+        hold(107, Some(62), "/tmp/mxit-8-1/h.holder.ab12.sock"),
+        // The developer's own core and its holder.
+        row(108, 1, Some(10), &[r"C:\hc\herdr-core.exe", "serve"]),
+        hold(
+            109,
+            Some(11),
+            r"\.\pipe\herdr-core-dotan-default.holder.76c79df3.sock",
+        ),
+        // This fixture's multiplexer: the harness ends it, not the core's teardown.
+        row(
+            111,
+            1,
+            Some(70),
+            &["tmux", "-S", "/tmp/mxit-7-1/s", "new-session"],
+        ),
+    ];
+    let marks = [private_core::holder_mark("/tmp/mxit-7-1/h.sock")];
+    assert_eq!(
+        private_core::leftovers(&table, &marks),
+        [(100, Some(50)), (101, Some(51)), (102, Some(52))]
+    );
+    assert_eq!(marks[0], "/tmp/mxit-7-1/h.holder.");
+    assert_eq!(
+        private_core::holder_mark(r"\.\pipe\mux-test-9-0123456789ab"),
+        r"\.\pipe\mux-test-9-0123456789ab.holder."
+    );
+}
+
+// A core killed outright leaves its holder and the kept shell running, and `server stop` then finds no core to ask:
+// only the fixture's own sweep ends them. Dropping the fixture must leave no process of it running.
+#[test]
+fn core_drop_ends_a_holder_whose_core_is_gone() {
+    let d = root();
+    let path = std::env::var_os("PATH").unwrap();
+    let mut core = PrivateCore::new(PrivateCore::installed(), &d, &path);
+    core.start();
+    let shell = if cfg!(windows) { "cmd.exe" } else { "/bin/sh" };
+    private_core::run(
+        core.command(&["run", "--bg", "--keep", "--json", "--", shell]),
+        &d,
+    )
+    .expect("a kept shell");
+    let status = private_core::run(core.command(&["server", "status", "--json"]), &d).unwrap();
+    let pid = status["pid"].as_u64().expect("the core pid") as u32;
+    let host = mux_agent::proc::host();
+    let start = host.open(pid).map(|o| o.start);
+    assert!(private_core::kill_pid(pid), "kill of the core {pid}");
+    let end = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while host.open(pid).map(|o| o.start) == start {
+        assert!(
+            std::time::Instant::now() < end,
+            "the core {pid} survived its kill"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    let socket = core
+        .env
+        .iter()
+        .find(|(k, _)| *k == "HC_SOCKET")
+        .unwrap()
+        .1
+        .clone();
+    let socket = socket.to_string_lossy().into_owned();
+    let mut needles = vec![d.to_string_lossy().into_owned(), socket];
+    if let Ok(real) = std::fs::canonicalize(&d) {
+        needles.push(real.to_string_lossy().into_owned());
+    }
+    let names = |r: &mux_agent::proc::Row| {
+        r.argv.iter().flatten().any(|a| {
+            needles
+                .iter()
+                .any(|n| a.contains(n.trim_end_matches(".sock")))
+        })
+    };
+    let table = host.table().unwrap();
+    let ours: Vec<_> = table
+        .iter()
+        .filter(|r| names(r))
+        .map(|r| (r.pid, r.start))
+        .collect();
+    let kept: Vec<_> = table
+        .iter()
+        .filter(|r| ours.iter().any(|&(p, _)| p == r.ppid))
+        .map(|r| (r.pid, r.start))
+        .collect();
+    assert!(!ours.is_empty(), "the holder outlived its core");
+    assert!(!kept.is_empty(), "the kept shell outlived its core");
+    drop(core);
+    let alive: Vec<_> = ours
+        .iter()
+        .chain(&kept)
+        .filter(|&&(p, s)| s.is_some() && host.open(p).map(|o| o.start) == s)
+        .collect();
+    let named: Vec<_> = host
+        .table()
+        .unwrap()
+        .into_iter()
+        .filter(|r| names(r))
+        .map(|r| (r.pid, r.argv))
+        .collect();
+    let _ = std::fs::remove_dir_all(&d);
+    assert!(alive.is_empty(), "still running after drop: {alive:?}");
+    assert!(
+        named.is_empty(),
+        "processes naming the fixture remain: {named:?}"
+    );
+}

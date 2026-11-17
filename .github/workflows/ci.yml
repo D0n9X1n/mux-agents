@@ -244,6 +244,23 @@ jobs:
         env:
           MUX_AGENTS_LIVE_REQUIRE: tmux,tmux32,rmux
         run: sh tests/serial_resume.sh serial live
+      # A private core's holder that outlives its test keeps its kept shells and their ptys; enough of them exhaust the
+      # pty limit and later tests fail to fork. Every live fixture dir is /tmp/mxit-* or /tmp/mxc-* (/private/tmp on
+      # macOS), and each holder's argv names its socket there.
+      - name: No private core holder outlives the live tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          # ps, not pgrep: macOS pgrep cannot print each match's full command line, which the failure must show.
+          # shellcheck disable=SC2009
+          left=$(ps -A -o pid=,ppid=,command= | grep -E 'hold --socket (/private)?/tmp/mx(it|c)-' || true)
+          if [ -n "$left" ]; then
+            echo "private core holders still running:"
+            printf '%s\n' "$left"
+            # shellcheck disable=SC2009
+            ps -A -o pid=,ppid=,command= | grep -E 'herdr-core|hc-launchd' || true
+            exit 1
+          fi
       - name: Release script tests
         run: sh tests/release.sh
       - name: Wiki publisher tests

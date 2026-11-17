@@ -4295,3 +4295,28 @@ fn no_issue_or_pull_request_numbers() {
         hits.join("\n")
     );
 }
+
+// A private core's holder that outlives its test keeps its kept shells and their ptys; enough of them exhaust the pty
+// limit and later tests fail to fork. The Linux and macOS integration job checks, after its last live test, that none
+// is left. Windows has no such step: reading another process's command line there needs PowerShell, which no
+// workflow uses; the fixture's own teardown fails a Windows test whose holder survives it.
+#[test]
+fn integration_fails_on_a_leftover_private_core_holder() {
+    let lines = job_lines(&repo_file(".github/workflows/ci.yml"), "integration");
+    let live = line_of(&lines, "sh tests/serial_resume.sh serial live");
+    let at = line_of(
+        &lines,
+        "- name: No private core holder outlives the live tests",
+    );
+    assert!(live < at, "the check must follow the live tests");
+    let step: Vec<_> = lines[at..]
+        .iter()
+        .skip(1)
+        .take_while(|l| !l.starts_with("- "))
+        .collect();
+    assert!(
+        step.iter().any(|l| l.contains("hold --socket")),
+        "{step:#?}"
+    );
+    assert!(step.iter().any(|l| l.contains("exit 1")), "{step:#?}");
+}
