@@ -5826,8 +5826,9 @@ hc {}:
     }
 
     /// r6b-calls "how a live test produces a Lost member": a core kill alone loses no member. hc's `hold` keeps each
-    /// terminal and the restarted core adopts it live with its launcher argv; `up` and `restore` then find every member
-    /// Running, relaunch nothing, and each keeps its client and its terminal.
+    /// terminal and the restarted core adopts it live with its launcher argv; `up`, run from the harness's own pane,
+    /// then finds every member Running and relaunches nothing; each member stays live with the same client process
+    /// and terminal. The team's view session may end with the core (all-calls call 10): reported, never asserted.
     #[test]
     fn a_core_kill_alone_leaves_members_running() {
         let count = |live: &Live| {
@@ -5845,7 +5846,18 @@ hc {}:
                 .iter()
                 .map(|id| json_file(&live.agent_dir(id).join("record.json")))
                 .collect();
-            let old: Vec<u64> = ids.iter().map(|id| live.client_of(id)).collect();
+            // Each member's client pid with its start, so a reused pid never passes for the same client.
+            let old: Vec<(u64, i64)> = ids
+                .iter()
+                .map(|id| {
+                    let pid = live.client_of(id);
+                    let start = mux_agent::proc::host()
+                        .open(pid as u32)
+                        .map(|o| o.start)
+                        .unwrap_or_else(|| panic!("{mux:?} {id}: client {pid} is not running"));
+                    (pid, start)
+                })
+                .collect();
             let launched = count(&live);
             live.server.core.as_mut().expect("private core").kill_hard();
             for r in &before {
@@ -5855,10 +5867,11 @@ hc {}:
                     (t["state"] == "live" && t["argv"] == r["launcherArgv"]).then_some(())
                 });
             }
+            // all-calls call 10: everything below runs from the harness's own pane; the team's view session is not
+            // used (views run `hc attach` and may end with the core; `up` restoring them is reentry-6a Task 11).
             let (code, up) = live.run(&["up", "-Client", "claude"]);
-            // all-calls call 9: a failure carries what hc answered for each member right after `up` (not reproduced
-            // locally; the earlier failures held every member "occupied").
-            let seen: Vec<String> = before
+            // all-calls call 9: what hc answered for each member right after `up`, carried by every failure below.
+            let seen: Vec<(String, Option<Value>)> = before
                 .iter()
                 .map(|r| {
                     let address = s(&r["hcAddress"]);
@@ -5867,39 +5880,54 @@ hc {}:
                         core.command(&["get", address, "--json"]),
                         live.dir.path(),
                     );
-                    format!("{} {address}: {got:?}", s(&r["id"]))
+                    (format!("{} {address}: {got:?}", s(&r["id"])), got.ok())
                 })
                 .collect();
+            let evidence: Vec<&String> = seen.iter().map(|(e, _)| e).collect();
+            // A diagnostic only (call 10): whether the team's view session outlived the core kill.
+            let sid = s(&before[0]["session"]);
+            let sessions = live
+                .server
+                .try_call(&["list-sessions", "-F", "#{session_id}"]);
+            let sessions = String::from_utf8_lossy(&sessions.stdout).to_string();
+            if !sessions.lines().any(|l| l == sid) {
+                eprintln!(
+                    "{mux:?}: the team's view session {sid} ended with the core (by design): {sessions:?}"
+                );
+            }
             assert_eq!(
                 (code, &up["created"]),
                 (0, &json!(false)),
-                "{mux:?} {up} hc: {seen:#?}"
+                "{mux:?} {up} hc: {evidence:#?}"
             );
-            // Seen once in WSL (session 6): the split below found no session; carry the sessions with the evidence.
-            let sid = s(&before[0]["session"]);
-            let sessions =
-                live.server
-                    .try_call(&["list-sessions", "-F", "#{session_id} #{session_name}"]);
-            assert!(
-                String::from_utf8_lossy(&sessions.stdout)
-                    .lines()
-                    .any(|l| l.split(' ').next() == Some(sid)),
-                "{mux:?} the team's session {sid} is gone after up: {sessions:?} up: {up} hc: {seen:#?}"
-            );
-            let team = live.split(sid, &["-v"]);
-            let (code, restore) = live.run_in(&team, &["restore"]);
-            assert_eq!(code, 0, "{mux:?} {restore} hc: {seen:#?}");
-            for reply in [&up, &restore] {
-                for key in ["restored", "held", "unknown", "recover"] {
-                    assert_eq!(
-                        reply[key],
-                        json!([]),
-                        "{mux:?} {key}: {reply} up: {up} hc: {seen:#?}"
-                    );
-                }
+            for key in ["restored", "held", "unknown", "recover"] {
+                assert_eq!(
+                    up[key],
+                    json!([]),
+                    "{mux:?} {key}: up: {up} hc: {evidence:#?}"
+                );
             }
             for (i, id) in ids.iter().enumerate() {
-                assert_eq!(live.client_of(id), old[i], "{mux:?} {id}: the same client");
+                let t = seen[i].1.as_ref();
+                assert!(
+                    t.is_some_and(
+                        |t| t["state"] == "live" && t["argv"] == before[i]["launcherArgv"]
+                    ),
+                    "{mux:?} {id}: live with its launcher after up: {evidence:#?}"
+                );
+                assert_eq!(
+                    mux_agent::proc::host()
+                        .open(old[i].0 as u32)
+                        .map(|o| o.start),
+                    Some(old[i].1),
+                    "{mux:?} {id}: the same client process {} still runs",
+                    old[i].0
+                );
+                assert_eq!(
+                    live.client_of(id),
+                    old[i].0,
+                    "{mux:?} {id}: the same client"
+                );
                 let r = json_file(&live.agent_dir(id).join("record.json"));
                 assert_eq!(
                     r["hcName"], before[i]["hcName"],
