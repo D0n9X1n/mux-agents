@@ -2,7 +2,9 @@
 use serde_json::{Map, Value, json};
 
 use super::super::gens::{Gen, Member, Verdict};
-use super::super::reconcile::{Next, launch_next, observe_recovery};
+use super::super::lifecycle::Life;
+use super::super::reconcile::{Next, Seen, launch_next, observe_recovery};
+use super::super::settle::{Mode, Outcome};
 use super::super::team_state::Tx;
 use super::super::text;
 use crate::caller::Caller;
@@ -46,9 +48,18 @@ pub(crate) fn recover(
                     return refuse(2, "target", "no member of this team has that name or id");
                 }
             };
-            tx.settle(&id, super::super::settle::Mode::Normal)?;
-            let g = life_of(tx, &id)?; // reread: settle may have promoted
+            // checklist 5: settle's unresolved answer is kept; torn evidence is `evidence`, never "still pending"
+            if let Outcome::Unknown(e) = tx.settle(&id, Mode::Normal)?
+                && e.check == "evidence"
+            {
+                return Err(e);
+            }
             let lazy = crate::hc::Lazy::new(tx.ctx);
+            // checklist 2: a release this member's last recovery left half done is finished first (R1 replay)
+            if let Some(n) = life_of(tx, &id)?.active() {
+                super::super::release::finish(tx, &lazy, &id, n)?;
+            }
+            let g = life_of(tx, &id)?; // reread: settle may have promoted, the replay released
             let seen = observe_recovery(tx, &lazy, &g)?; // 6c-R1: the one observation decides
             let name = text(g.record().get("name"));
             if !matches!(seen.verdict, Some(Verdict::Failed(_))) {
@@ -59,6 +70,7 @@ pub(crate) fn recover(
             }
             super::super::up::person_as(ctx, "recover a member")?;
             let session = retry_session(&g)?;
+            let (g, released) = gates(tx, &lazy, caller, &id, g, &seen, &session)?;
             let n = super::super::cascade::reopen_same(tx, &id, || {
                 let next = Next {
                     kind: "retry",
@@ -66,9 +78,66 @@ pub(crate) fn recover(
                 };
                 launch_next(tx, lazy.get()?, &id, &g, next)
             })?;
-            Ok(Some(reply(&g, n, "retry", &session)))
+            let mut out = reply(&g, n, "retry", &session);
+            if let Some(r) = released {
+                out.insert("released".into(), json!(r));
+            }
+            Ok(Some(out))
         })
     })
+}
+
+/// P2 gates (ambiguity 3), after the person check: a Lost active generation is released `cause: recovery`
+/// (release-1d R2), then every generation must be done (no pending, no orphan, the active one `gens::done`), then
+/// the cap (6b L1; never the leader), then the conversation must be free (occupy-3; o3 call 5).
+fn gates(
+    tx: &Tx<'_>,
+    lazy: &crate::hc::Lazy<'_>,
+    caller: &Caller,
+    id: &str,
+    g: Gen,
+    seen: &Seen,
+    session: &str,
+) -> Res<(Gen, Option<u64>)> {
+    let n = g.active().ok_or_else(unreadable)?;
+    let (g, released) = if seen.life == Some(Life::Lost) && !seen.released {
+        let address = text(g.record().get("hcAddress"));
+        let cause = super::super::release::Cause::Recovery;
+        super::super::release::release(tx, lazy, id, n, &address, cause)?;
+        (life_of(tx, id)?, Some(n))
+    } else {
+        (g, None)
+    };
+    let name = text(g.record().get("name"));
+    let busy = |k: u64, at: String| {
+        refuse::<()>(
+            2,
+            "running",
+            format!(
+                "generation {k} of {name} may still run{at}; run `mux-agent stop {name} -Generation` first"
+            ),
+        )
+    };
+    if let Some(p) = g.pending() {
+        busy(p, String::new())?;
+    }
+    if let Some(o) = g.orphans()?.into_iter().min() {
+        busy(o, String::new())?;
+    }
+    if !super::super::gens::done(g.folder(), n)? {
+        busy(n, format!(" at {}", text(g.record().get("hcAddress"))))?;
+    }
+    if !super::super::tree::is_leader(g.record()) {
+        let anchor = super::super::reconcile::anchor_caller(caller, &tx.scope);
+        let snapshot = super::super::membership::Snapshot::for_spawn(tx.ctx, &anchor, lazy.get()?)?;
+        super::super::tree::limit(&snapshot)?;
+    }
+    let client = super::super::spawn::client_named(&text(g.record().get("client")))
+        .ok_or_else(|| crate::error::Refusal::internal("the member names no known client"))?;
+    if let Some(hold) = super::super::occupancy::held(tx.ctx, session, client, None) {
+        refuse::<()>(2, "running", hold.message())?;
+    }
+    Ok((g, released))
 }
 
 /// Call 15: X among the anchor session's lifecycle members only (`session` is the Tx's, `id` names its folder), by

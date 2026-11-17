@@ -31,11 +31,16 @@ pub(crate) fn cli(w: &World, args: &[&str]) -> (u8, Value) {
 pub(crate) fn spec(f: &Path, n: u64) -> Option<Value> {
     gens::read_flushed(f, n, "spec").unwrap()
 }
-fn stopped(f: &Path) {
+pub(crate) fn stopped(f: &Path) {
     publish(&f.join("desired.json"), &json!({"desired": "stopped"})).unwrap();
 }
+/// The cap's `Snapshot::for_spawn` (Task 2) when X is the only member besides L: the team listing (nothing live),
+/// then one `get` per recorded address, both gone.
+pub(crate) fn both_gone(w: &World) {
+    super::reconcile_await_tests::snapshot(w, &[], &[&format!("a{L}"), &format!("a{X}")]);
+}
 /// X under L (an open parent), failed and ended.
-fn child(w: &World) -> std::path::PathBuf {
+pub(crate) fn child(w: &World) -> std::path::PathBuf {
     let f = member(w, X, json!({"parentAgent": {"id": L}}));
     failed_ended(&f, 1);
     f
@@ -48,6 +53,7 @@ fn a_retry_resumes_the_same_id_as_the_next_generation() {
     let w = person();
     team(&w);
     let f = child(&w);
+    both_gone(&w);
     w.fakes.hc_answer(ft::address("t2"));
     let (code, reply) = cli(&w, &["resume", "mbbb"]);
     assert_eq!(code, 0, "{reply}");
@@ -172,6 +178,7 @@ fn a_stopped_failed_member_recovers_from_its_recorded_outcome() {
             child(&w)
         };
         stopped(&f);
+        both_gone(&w);
         if case == "closed" {
             stopped(&w.folder(L));
             let (code, reply) = cli(&w, &["resume", X]);
@@ -181,6 +188,7 @@ fn a_stopped_failed_member_recovers_from_its_recorded_outcome() {
                 "{case}: {reply}"
             );
             assert!(spec(&f, 2).is_none(), "{case}: nothing launched");
+            w.fakes.hc_done().unwrap();
             continue;
         }
         w.fakes.hc_answer(ft::address("t2"));
@@ -284,6 +292,9 @@ fn recovery_refuses_unreadable_evidence() {
             other => panic!("{other}"),
         }
         w.fakes.hc_install("hc");
+        if case.starts_with("team-") {
+            both_gone(&w); // the cap runs before the launch reads the team record
+        }
         let (code, reply) = cli(&w, &["resume", "mbbb"]);
         assert_eq!(
             (code, &reply["check"]),
@@ -387,27 +398,20 @@ fn a_retry_resumes_only_a_valid_agreed_conversation() {
     }
 }
 
-/// Checklist 19: recovery takes X from the caller's anchor (`scope::state`), not the session it is shown in. Both
-/// pairs hold a failed X; only the anchor's advances.
+/// Checklist 19: recovery takes its subject from the caller's anchor (`scope::state`), not the session it is shown
+/// in. Both pairs hold a failed leader L (a leader takes no cap slot); only the anchor's advances.
 #[test]
 fn recovery_takes_its_subject_from_the_anchor_not_the_shown_session() {
     let w = person();
     let shown = w.caller();
-    team(&w);
-    let here = child(&w);
+    let here = member(&w, L, json!({"depth": 0, "upTeam": "T", "name": "leader"}));
+    failed_ended(&here, 1);
     let key = "00000000000000a2";
-    let lead = member_at(
+    let there = member_at(
         &w,
         key,
         L,
         json!({"depth": 0, "upTeam": "T", "name": "leader", "session": "$5"}),
-    );
-    publish(&gens::path(&lead, 1, "ended"), &json!({"at": "t"})).unwrap();
-    let there = member_at(
-        &w,
-        key,
-        X,
-        json!({"parentAgent": {"id": L}, "session": "$5"}),
     );
     team_record_at(&w, key, "$5");
     failed_ended(&there, 1);
@@ -418,15 +422,15 @@ fn recovery_takes_its_subject_from_the_anchor_not_the_shown_session() {
     };
     let anchored = super::reconcile::anchor_caller(&shown, &scope);
     w.fakes.hc_answer(ft::address("t2"));
-    let reply = recover(&w.ctx, &anchored, Action::Retry, X)
+    let reply = recover(&w.ctx, &anchored, Action::Retry, L)
         .unwrap()
         .expect("a recovery");
     assert_eq!(reply["agent"]["generation"], 2, "{reply:?}");
     assert_eq!(
         lf::record(&there)["generation"],
         json!("2"),
-        "the anchor's X advanced"
+        "the anchor's L advanced"
     );
-    assert_eq!(bytes(&here), before, "the shown session's X untouched");
+    assert_eq!(bytes(&here), before, "the shown session's L untouched");
     w.fakes.hc_done().unwrap();
 }
