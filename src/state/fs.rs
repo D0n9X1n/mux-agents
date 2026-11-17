@@ -165,7 +165,26 @@ pub fn sync_file(path: &Path) -> io::Result<()> {
             return Err(io::Error::other("injected file flush failure"));
         }
     }
-    OpenOptions::new().write(true).open(path)?.sync_data()
+    open_waiting(|| OpenOptions::new().write(true).open(path))?.sync_data()
+}
+
+/// `open`, which on Windows waits out a sharing violation (os error 32) for about a second: another process may
+/// briefly hold the folder or file open without sharing write (#103). Then the error stands, so a flush is never
+/// claimed without one. Any other error returns at once.
+fn open_waiting(open: impl Fn() -> io::Result<File>) -> io::Result<File> {
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::Foundation::ERROR_SHARING_VIOLATION;
+        for _ in 1..40 {
+            match open() {
+                Err(e) if e.raw_os_error() == Some(ERROR_SHARING_VIOLATION as i32) => {
+                    std::thread::sleep(std::time::Duration::from_millis(25));
+                }
+                done => return done,
+            }
+        }
+    }
+    open()
 }
 
 #[cfg(test)]
@@ -302,11 +321,13 @@ pub fn sync_dir(dir: &Path) -> io::Result<()> {
         use std::os::windows::fs::OpenOptionsExt;
         const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
         const FILE_APPEND_DATA: u32 = 0x0004;
-        OpenOptions::new()
-            .access_mode(FILE_APPEND_DATA)
-            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
-            .open(dir)?
-            .sync_all()
+        open_waiting(|| {
+            OpenOptions::new()
+                .access_mode(FILE_APPEND_DATA)
+                .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+                .open(dir)
+        })?
+        .sync_all()
     }
     #[cfg(not(windows))]
     {
@@ -981,5 +1002,69 @@ mod tests {
         std::fs::write(&f, b"x\n").unwrap();
         let (got, reads) = record_reads(|| read_bytes(&f).unwrap());
         assert_eq!((got, reads), (b"x\n".to_vec(), vec![f.clone()]));
+    }
+
+    // #103 (o2 call 12): another process may briefly hold a folder or file open without sharing write; the flush
+    // open waits it out (os error 32) for about a second, then still refuses.
+    #[cfg(windows)]
+    fn hold(path: &Path, mode: u32) -> File {
+        use std::os::windows::fs::OpenOptionsExt;
+        OpenOptions::new()
+            .read(true)
+            .share_mode(mode)
+            .custom_flags(0x0200_0000)
+            .open(path)
+            .unwrap()
+    }
+
+    #[cfg(windows)]
+    fn release_soon(held: File) -> std::thread::JoinHandle<()> {
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            drop(held);
+        })
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_folder_flush_waits_out_a_brief_holder_that_shares_no_write() {
+        let dir = TempDir::new();
+        for flush in [sync_dir, sync_ancestor] {
+            let held = release_soon(hold(dir.path(), SHARE_READ | SHARE_DELETE));
+            flush(dir.path()).unwrap();
+            held.join().unwrap();
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_file_flush_waits_out_a_brief_holder_that_shares_no_write() {
+        let dir = TempDir::new();
+        let f = dir.path().join("f");
+        std::fs::write(&f, b"x").unwrap();
+        let held = release_soon(hold(&f, SHARE_READ));
+        sync_file(&f).unwrap();
+        held.join().unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_folder_flush_still_refuses_a_holder_that_never_lets_go() {
+        let dir = TempDir::new();
+        let _held = hold(dir.path(), SHARE_READ);
+        let start = std::time::Instant::now();
+        let e = sync_dir(dir.path()).unwrap_err();
+        assert_eq!(e.raw_os_error(), Some(32), "{e}");
+        assert!(start.elapsed() < std::time::Duration::from_secs(5));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_flush_of_a_missing_path_refuses_at_once() {
+        let dir = TempDir::new();
+        let start = std::time::Instant::now();
+        assert!(sync_dir(&dir.path().join("missing")).is_err());
+        assert!(sync_file(&dir.path().join("missing")).is_err());
+        assert!(start.elapsed() < std::time::Duration::from_millis(200));
     }
 }
