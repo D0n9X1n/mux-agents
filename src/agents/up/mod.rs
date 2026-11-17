@@ -5,6 +5,8 @@ pub mod discover;
 mod existing_tests;
 pub mod identity;
 pub mod index;
+#[cfg(test)]
+mod leader_tests;
 mod leaders;
 pub mod publish;
 #[cfg(test)]
@@ -168,6 +170,7 @@ fn drive(
     use replay::Step;
     let mut ix = index::read(ctx, team)?.ok_or_else(|| Refusal::internal("index vanished"))?;
     let reentered = team_exists(ctx, &ix)?;
+    leaders::readable(ctx, &ix)?; // restore-6c decision 9
     let mut run = Run::default();
     if fresh {
         run.shown = Some(publish::start(ctx, caller, &mut ix)?);

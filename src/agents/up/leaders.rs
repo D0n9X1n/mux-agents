@@ -57,6 +57,18 @@ pub(crate) fn leader_of(ctx: &Ctx, ix: &index::Index) -> Res<(replay::Leader, Op
     }
 }
 
+/// Decision 9 (restore-6c checklist 71, 5-9 F18): before the replay loop, an unreadable agent record at the anchor
+/// (its session, so its team, unknown) is 1 `evidence`: the leader is never chosen past a record that may be it.
+pub(crate) fn readable(ctx: &Ctx, ix: &index::Index) -> Res<()> {
+    let Some(a) = &ix.anchor else { return Ok(()) };
+    for (_, _, member) in gens::members(&ctx.state_root.join(&a.key).join("agents"))? {
+        if let Member::Unreadable(e) = member {
+            return Err(e);
+        }
+    }
+    Ok(())
+}
+
 /// Ambiguity 11: settle-1b G3 `normal` on the leader; a `pending` that stays is 1 `team`.
 pub(crate) fn settle_leader(ctx: &Ctx, ix: &index::Index, id: &str) -> Res<()> {
     let a = ix
