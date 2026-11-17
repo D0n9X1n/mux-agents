@@ -132,7 +132,10 @@ fn each_step_of_up_halts_with_only_its_files() {
 fn a_team_without_an_index_names_stop_and_up() {
     let w = ready();
     let f = agents(&w).join("cccccccccccc");
-    std::fs::create_dir_all(&f).unwrap();
+    // Integration #150 CI: made private as the product makes it, the state root first; a folder left at the umask
+    // (755) or with an inherited shared ACL is refused `state` before the index read under test.
+    w.state();
+    crate::agents::spawn::private_folder(&w.ctx, &f).unwrap();
     crate::state::fs::write_json(
         &f.join("record.json"),
         &json!({"lifecycle": 1, "id": "cccccccccccc", "name": "leader",
