@@ -124,5 +124,30 @@ pub fn admit(ctx: &Ctx, c: &mut Caller) -> Res<()> {
     Ok(())
 }
 
+/// What presents a proven lifecycle member (E2; calls 18, 46).
+#[derive(Debug, Clone, PartialEq)]
+pub enum Shown {
+    /// No `up` index is anchored at the member's folder pair: a plain-spawned member keeps its own presentation.
+    Own,
+    /// An `up` team member: its team's index `view` when proven live, else none (view verbs refuse `views`).
+    Team(Option<index::View>),
+}
+
+/// E2, ambiguity 5, call 46: `home` is a proven member's folder pair (key, record session). A member of an `up` team
+/// (an index anchored at `home`) is presented only by the team's view, proven live. An unreadable index presents
+/// nothing and refuses nothing (member verbs need no view): it cannot tell a team member from another, so it is shut.
+pub fn present(ctx: &Ctx, home: &Anchor) -> Shown {
+    let Ok(all) = index::every(ctx) else {
+        return Shown::Team(None);
+    };
+    match all.into_iter().find(|ix| ix.anchor.as_ref() == Some(home)) {
+        None => Shown::Own,
+        Some(ix) => Shown::Team(
+            ix.view
+                .filter(|v| index::prove(ctx, &v.server).ok() == Some(Proof::Live)),
+        ),
+    }
+}
+
 #[cfg(test)]
 mod tests;

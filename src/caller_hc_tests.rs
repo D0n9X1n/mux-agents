@@ -814,6 +814,8 @@ fn a_lifecycle_proof_reads_only_its_active_generation() {
 #[cfg(test)]
 mod k2_tests;
 #[cfg(test)]
+mod present_tests;
+#[cfg(test)]
 mod stop_tests;
 #[cfg(test)]
 mod views_tests;
