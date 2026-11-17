@@ -156,17 +156,23 @@ impl PrivateCore {
     }
 
     /// `kill_hard`, killing each of `terminals` (from `terminal_of`) while the core is down, so the restarted core finds
-    /// those members' terminals gone: a Lost member (r6b-calls). Only a pid whose start is unchanged is signalled.
+    /// those members' terminals gone: a Lost member (r6b-calls). Only a pid whose start is unchanged is signalled; one
+    /// that is gone by the time the signal lands (its holder ended it) is already what the kill wanted.
     pub fn kill_hard_with(&mut self, terminals: &[(u32, Option<i64>)]) {
         let status =
             run(self.command(&["server", "status", "--json"]), &self.dir).expect("core status");
         let pid = status["pid"]
             .as_u64()
             .expect("hc server status --json names the core pid") as u32;
-        kill_pid(pid);
-        for &(pid, start) in terminals {
-            if start.is_some() && mux_agent::proc::host().open(pid).map(|o| o.start) == start {
-                kill_pid(pid);
+        assert!(kill_pid(pid), "kill of the core {pid} failed");
+        let same = |pid: u32, start| mux_agent::proc::host().open(pid).map(|o| o.start) == start;
+        for (pid, start) in kill_order(terminals) {
+            if start.is_some() && same(pid, start) && !kill_pid(pid) {
+                let end = Instant::now() + Duration::from_secs(5);
+                while same(pid, start) && Instant::now() < end {
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+                assert!(!same(pid, start), "kill of {pid} failed and it still runs");
             }
         }
         let end = Instant::now() + Duration::from_secs(30);
@@ -245,13 +251,35 @@ pub fn run(mut c: Command, dir: &Path) -> io::Result<Value> {
     serde_json::from_slice(&fs::read(out)?).map_err(io::Error::other)
 }
 
-/// SIGKILL (Windows `taskkill /F /PID`, never `/T`) of one pid this test owns, bounded to 30 s.
-fn kill_pid(pid: u32) {
+/// #150 (CI 85d70b5): `terminals` as `terminal_of` gives them, (client, hold) per member, in kill order: every hold
+/// once, then every client. One hc holder can carry every member's terminal; a client killed while its holder lives
+/// is an exit the holder records (Ended), never Lost, and a shared holder listed twice is signalled twice.
+pub fn kill_order(terminals: &[(u32, Option<i64>)]) -> Vec<(u32, Option<i64>)> {
+    assert!(
+        terminals.len().is_multiple_of(2),
+        "(client, hold) pairs: {terminals:?}"
+    );
+    let mut order = Vec::new();
+    let holds = terminals.chunks(2).map(|p| p[1]);
+    let clients = terminals.chunks(2).map(|p| p[0]);
+    for t in holds.chain(clients) {
+        if !order.contains(&t) {
+            order.push(t);
+        }
+    }
+    order
+}
+
+/// SIGKILL (Windows `taskkill /F /PID`, never `/T`) of one pid this test owns, bounded to 30 s; whether it succeeded.
+fn kill_pid(pid: u32) -> bool {
     #[cfg(unix)]
     {
         // SAFETY: a plain signal to a pid this test read from its own private core; no memory is shared.
         let r = unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
-        assert_eq!(r, 0, "kill -9 {pid}: {}", io::Error::last_os_error());
+        if r != 0 {
+            eprintln!("kill -9 {pid}: {}", io::Error::last_os_error());
+        }
+        r == 0
     }
     #[cfg(windows)]
     {
@@ -274,6 +302,9 @@ fn kill_pid(pid: u32) {
             }
             std::thread::sleep(Duration::from_millis(20));
         };
-        assert!(done.success(), "taskkill /F /PID {pid}: {done:?}");
+        if !done.success() {
+            eprintln!("taskkill /F /PID {pid}: {done:?}");
+        }
+        done.success()
     }
 }
