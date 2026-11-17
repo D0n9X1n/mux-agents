@@ -557,3 +557,776 @@ fn a_member_view_failure_is_reported_and_the_others_shown() {
         "released once the reply reports the failure"
     );
 }
+
+// Task 12: a crash after any step is repaired by the next up (spec "Unit tests").
+type Made = std::rc::Rc<std::cell::RefCell<Vec<(String, String)>>>;
+/// A multiplexer that remembers the sessions `new-session` made, so `list-sessions` answers them (E3.1 by name).
+fn stateful(w: &World, made: &Made) {
+    let m = made.clone();
+    w.fakes.mux_script("new-session", move |args| {
+        let name = args
+            .iter()
+            .skip_while(|a| *a != "-s")
+            .nth(1)
+            .cloned()
+            .unwrap_or_default();
+        let id = format!("${}", 7 + m.borrow().len());
+        m.borrow_mut().push((id.clone(), name));
+        Ok(crate::mux::Output {
+            code: 0,
+            stdout: format!("{id} @3{}", char::from(10u8)),
+            stderr: String::new(),
+        })
+    });
+    let m = made.clone();
+    w.fakes.mux_script("list-sessions", move |_| {
+        let rows: String = m
+            .borrow()
+            .iter()
+            .map(|(i, n)| format!("{i} {n}{}", char::from(10u8)))
+            .collect();
+        Ok(crate::mux::Output {
+            code: 0,
+            stdout: rows,
+            stderr: String::new(),
+        })
+    });
+}
+/// The fixtures every process of a crash scenario shares: the bar off (layout is not under test), the World server
+/// proven, every new view answered, launches holding, sessions answered from `made`.
+fn crash_fixtures(w: &World, made: &Made) {
+    w.fakes.mux_rule("@mux-agents-sidebar", 0, "off", "");
+    w.fakes.mux_script("up #{pid}", |_| {
+        Ok(crate::mux::Output {
+            code: 0,
+            stdout: format!("up {}", crate::agents::fixture::SERVER),
+            stderr: String::new(),
+        })
+    });
+    answers_views(w);
+    w.launches_hold();
+    stateful(w, made);
+}
+/// A person in `project.v1`, hc reachable for the first `up`.
+fn crash_world() -> (World, Made) {
+    let mut w = World::human("");
+    w.ctx.cwd = w._dir.path().join("project.v1");
+    std::fs::create_dir_all(&w.ctx.cwd).unwrap();
+    cf::online(&w); // the first up's connect
+    let made = Made::default();
+    crash_fixtures(&w, &made);
+    (w, made)
+}
+/// Findings A18, F7: a panic unwinds past `testing::locked`, so the crashed World keeps its fake locks. The next
+/// `up` is a new process: a fresh World over the same state root and folder, the same sessions (`made`).
+fn reopen(old: &World, made: &Made) -> World {
+    let mut w = World::human("");
+    w.ctx.state_root = old.ctx.state_root.clone();
+    w.ctx.cwd = old.ctx.cwd.clone();
+    crash_fixtures(&w, made);
+    w
+}
+/// The non-void leaders of this folder's team under `key` (group B's `never_ran_recorded`).
+fn leaders(w: &World, key: &str) -> Vec<(String, std::path::PathBuf)> {
+    let t = ut::team_of(w);
+    crate::agents::gens::members(&w.ctx.state_root.join(key).join("agents"))
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|(id, f, m)| match m {
+            crate::agents::gens::Member::Life(g) if g.record()["upTeam"] == t.as_str() => {
+                let s = g.status().unwrap();
+                (!g.never_ran_recorded(&s).unwrap()).then_some((id, f))
+            }
+            _ => None,
+        })
+        .collect()
+}
+const FORWARD: [&str; 8] = [
+    "allocated",
+    "pending",
+    "spec",
+    "launch",
+    "address",
+    "run",
+    "commit",
+    "promote",
+];
+/// Stops the first `up` after `step`: a `forward` step by a panic in A3b-1's callback hook (the dispatcher answers
+/// 1 `internal`; the files are what that step left), an E6 step by `halt_after`.
+fn crash_after(step: &'static str) {
+    if FORWARD.contains(&step) {
+        crate::agents::core_launch::hooks::after(Some(Box::new(move |s: &str| {
+            if s == step {
+                panic!("crash after {step}");
+            }
+        })));
+    } else {
+        crate::agents::up::halt_after(Some(step));
+    }
+}
+fn no_crash() {
+    crate::agents::core_launch::hooks::after(None);
+    crate::agents::up::halt_after(None);
+}
+fn address(a: &str) -> crate::error::Res<crate::spawn::Out> {
+    crate::agents::core_launch::forward_tests::address(a)
+}
+/// Findings A19, F8: fake `hc run` runs no launcher, so its claim is seeded as the real launcher would have left
+/// it: before commit (`run`, `address`) it never claimed (`abandoned`); at `commit`/`promote` it claimed `run`.
+fn seed_launcher(w: &World, key: &str, step: &str) {
+    let claim = match step {
+        "run" | "address" => "abandoned",
+        "commit" | "promote" => "run",
+        _ => return,
+    };
+    let t = ut::team_of(w);
+    for (_, f, m) in
+        crate::agents::gens::members(&w.ctx.state_root.join(key).join("agents")).unwrap_or_default()
+    {
+        if let crate::agents::gens::Member::Life(g) = m
+            && g.record()["upTeam"] == t.as_str()
+        {
+            let _ = crate::state::evidence::publish(
+                &crate::agents::gens::claim_path(&f, 0),
+                &json!(claim),
+            );
+        }
+    }
+}
+/// The second `up`'s hc answers after a first `up` stopped at `step`, in real call order: its connect; settle for a
+/// committed leader; reconcile and re-entry for an active leader; a run answer when the leader is (re)launched.
+fn script_second_up(w: &World, step: &str, leader: Option<&(String, std::path::PathBuf)>) {
+    cf::online(w);
+    let ran = ["commit", "promote", "team", "presented"].contains(&step);
+    match leader {
+        Some((id, f)) if ran => {
+            if step == "commit" {
+                cf::online(w); // settle: one Running terminal, promoted
+                rt::found(w, id, 0, &ut::create::running_wire(w, f, id, 0));
+            }
+            for _ in 0..2 {
+                cf::online(w); // reconcile, then re-entry
+                rt::found(w, id, 0, &ut::create::running_wire(w, f, id, 0));
+            }
+        }
+        _ => w.fakes.hc_answer(address("t1")),
+    }
+}
+
+// Spec "Initial team, a crash after each step" (calls 19, 20): E6 steps and every `forward` step; the next `up`,
+// with other flags, follows the replay table from `inputs` and ends with one session, one non-void leader, one
+// index, the team record and the first `up`'s options.
+#[test]
+fn a_crash_after_each_step_converges_to_one_team() {
+    let steps = [
+        "index",
+        "session",
+        "published",
+        "allocated",
+        "pending",
+        "spec",
+        "launch",
+        "run",
+        "address",
+        "commit",
+        "promote",
+        "team",
+        "presented",
+    ];
+    for step in steps {
+        let (w, made) = crash_world();
+        let key = w.caller().server_key;
+        if steps.iter().position(|s| *s == step) >= steps.iter().position(|s| *s == "run") {
+            w.fakes.hc_answer(address("t1"));
+        }
+        crash_after(step);
+        let (code, first) = cli(&w, &["up", "-Client", "claude", "--", "--model", "a"]);
+        no_crash();
+        assert_ne!(code, 0, "{step}: stopped {first}");
+        let w = reopen(&w, &made);
+        seed_launcher(&w, &key, step);
+        let ran = leaders(&w, &key).pop();
+        script_second_up(&w, step, ran.as_ref());
+        let (code, second) = cli(&w, &["up", "-Client", "claude", "--", "--model", "b"]);
+        assert_eq!(code, 0, "{step}: {second}");
+        assert_eq!(made.borrow().len(), 1, "{step}: one session");
+        let lead = leaders(&w, &key);
+        assert_eq!(lead.len(), 1, "{step}: one non-void leader");
+        let rec = lf::record(&lead[0].1);
+        let n: u64 = rec["generation"].as_str().unwrap().parse().unwrap();
+        let spec = crate::agents::gens::read(&lead[0].1, n, "spec")
+            .known()
+            .unwrap()
+            .unwrap()
+            .to_string();
+        assert!(
+            spec.contains("\"a\"") && !spec.contains("\"b\""),
+            "{step}: the first up's options: {spec}"
+        );
+        let indexes = std::fs::read_dir(w.ctx.state_root.join("up"))
+            .unwrap()
+            .filter(|e| {
+                e.as_ref()
+                    .unwrap()
+                    .path()
+                    .extension()
+                    .is_some_and(|x| x == "json")
+            })
+            .count();
+        assert_eq!(indexes, 1, "{step}: one index");
+        assert!(ut::team_file(&w).is_file(), "{step}: the team record");
+        let after_team = step == "team" || step == "presented";
+        assert_eq!(
+            (&second["replayed"], &second["reentered"]),
+            (&json!(!after_team), &json!(after_team)),
+            "{step}"
+        );
+        assert!(!crate::agents::prelife_fixture::killed(&w), "{step}");
+        w.fakes.hc_done().unwrap();
+    }
+}
+
+/// Checklist #39 (N8): release-1d R1.3 for the up leader's Lost shell `t`: conclude's own `get` of the recorded
+/// address, then the one relabel built from that terminal's labels (the anchor team, the leader's name).
+fn kept(w: &World, t: &Value) {
+    let address = t["address"].as_str().unwrap();
+    cf::answer(w, &["get", address, "--json"], &t.to_string());
+    let label = |k: &str| t["labels"][k].as_str().unwrap_or_default().to_string();
+    let (team, name) = (
+        format!("mux.kept={}", label("mux.team")),
+        format!("mux.keptName={}", label("mux.name")),
+    );
+    let argv = [
+        "label",
+        address,
+        "mux.managed=",
+        "mux.team=",
+        "mux.id=",
+        "mux.gen=",
+        "mux.name=",
+        "mux.up=",
+        &team,
+        &name,
+        "--json",
+    ];
+    cf::answer(w, &argv, "{}");
+}
+
+// Spec "Committed leader, up killed before promotion, then core loss" (and after `promote`, call 19): the next `up`
+// settles or finds it active, and reconcile restores the leader from its session: the same member id.
+#[test]
+fn a_committed_leader_killed_before_promotion_comes_back_with_its_id() {
+    for step in ["commit", "promote"] {
+        let (w, made) = crash_world();
+        let key = w.caller().server_key;
+        w.fakes.hc_answer(address("t1"));
+        crash_after(step);
+        let _ = cli(&w, &["up", "-Client", "claude"]);
+        no_crash();
+        let w = reopen(&w, &made);
+        seed_launcher(&w, &key, step);
+        let (id, f) = leaders(&w, &key).pop().expect("a committed leader");
+        // Checklist #39 (N8): a restoration-eligible outcome, as the launcher records it after the readiness report.
+        crate::state::evidence::publish(
+            &crate::agents::gens::path(&f, 0, "outcome"),
+            &json!({"outcome": "ok", "at": "t"}),
+        )
+        .unwrap();
+        let mut lost = ut::create::running_wire(&w, &f, &id, 0);
+        lost["argv"] = json!(lf::LOST_ARGVS[0]);
+        // Checklist #39 (N8): the shell carries the anchor session's team label and the leader's name.
+        let a = crate::agents::up::index::read(&w.ctx, &ut::team_of(&w))
+            .unwrap()
+            .unwrap()
+            .anchor
+            .unwrap();
+        lost["labels"]["mux.team"] = json!(format!("{}:{}", a.key, a.session));
+        lost["labels"]["mux.name"] = json!("leader");
+        cf::online(&w); // the second up's connect
+        if step == "commit" {
+            cf::online(&w); // settle: one Lost terminal: promote, then release
+            rt::found(&w, &id, 0, &lost);
+            kept(&w, &lost);
+        }
+        cf::online(&w); // reconcile's Lazy
+        if step == "promote" {
+            rt::found(&w, &id, 0, &lost); // row 4 Lost, outcome ok: release first
+            kept(&w, &lost);
+        } // commit: settle released it (cause restore): row 0 relaunches without asking hc
+        w.fakes.hc_answer(address("t2")); // the relaunch as generation 1
+        crate::agents::reconcile_up_tests::reentry_unlisted(&w, &id, 1); // re-entry: generation 1 unlisted
+        let (code, r) = cli(&w, &["up", "-Client", "claude"]);
+        let calls = lf::calls(&w);
+        assert_eq!(code, 0, "{step}: {r} {calls:?}");
+        assert_eq!(
+            leaders(&w, &key)
+                .iter()
+                .map(|l| l.0.clone())
+                .collect::<Vec<_>>(),
+            std::slice::from_ref(&id),
+            "{step}: same member id"
+        );
+        assert_eq!(
+            lf::record(&f)["generation"],
+            "1",
+            "{step}: restored as generation 1: {r} {calls:?} {:?}",
+            w.fakes.hc_done()
+        );
+        assert_eq!(
+            r["leader"]["hcAddress"], "t2",
+            "{step}: the reply names the restored address"
+        );
+        assert!(
+            r["restored"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|e| e["id"] == id.as_str()),
+            "{step}: reconcile ran"
+        );
+        assert!(ut::team_file(&w).is_file(), "{step}");
+        w.fakes.hc_done().unwrap();
+    }
+}
+
+// Spec "Repairer killed after dropping `pending`" (checklist #29 F18, #40 N9): a first `up` stops after its
+// session; the session ends; a second `up` repairs (release durable, `pending` dropped) and stops at `repaired`; the
+// third, with other flags, takes the inputs-only row and makes session and leader from the original inputs.
+#[test]
+fn a_repairer_killed_after_dropping_pending_leaves_the_inputs_row() {
+    let (w, made) = crash_world();
+    let key = w.caller().server_key;
+    crash_after("session");
+    let _ = cli(&w, &["up", "-Client", "claude", "--", "--model", "a"]);
+    let t = ut::team_of(&w);
+    let release = crate::agents::up::index::read(&w.ctx, &t)
+        .unwrap()
+        .unwrap()
+        .pending
+        .unwrap()
+        .release;
+    made.borrow_mut().clear(); // the session ended
+    crash_after("repaired");
+    cf::online(&w);
+    let (code, r) = cli(&w, &["up", "-Client", "claude"]);
+    no_crash();
+    assert_eq!((code, r["check"].as_str()), (1, Some("halted")), "{r}");
+    let ix = crate::agents::up::index::read(&w.ctx, &t).unwrap().unwrap();
+    assert!(
+        ix.pending.is_none() && ix.anchor.is_none() && ix.view.is_none(),
+        "the inputs-only row"
+    );
+    assert_eq!(
+        ix.releases,
+        std::slice::from_ref(&release),
+        "F18: the write that drops pending keeps its release durable"
+    );
+    cf::online(&w);
+    w.fakes.hc_answer(address("t1"));
+    let (code, r) = cli(&w, &["up", "-Client", "claude", "--", "--model", "b"]);
+    assert_eq!(
+        (code, &r["created"], &r["replayed"]),
+        (0, &json!(true), &json!(true)),
+        "{r}"
+    );
+    let ix = crate::agents::up::index::read(&w.ctx, &t).unwrap().unwrap();
+    assert!(
+        ix.releases.is_empty()
+            && matches!(
+                crate::state::evidence::read(std::path::Path::new(&release)),
+                crate::state::evidence::Evidence::Present(_)
+            ),
+        "F18: after the next up the release is Present and cleared: {:?}",
+        ix.releases
+    );
+    assert_eq!(made.borrow().len(), 1, "one session, from the inputs row");
+    let lead = leaders(&w, &key);
+    let spec = crate::agents::gens::read(&lead[0].1, 0, "spec")
+        .known()
+        .unwrap()
+        .unwrap()
+        .to_string();
+    assert!(
+        spec.contains("\"a\"") && !spec.contains("\"b\""),
+        "the original inputs: {spec}"
+    );
+    w.fakes.hc_done().unwrap();
+}
+
+// Ambiguity 11, checklist #28 (F16-F17), #38 (N6-N7): a first `up` killed after `commit` with the launcher's `run`
+// claim; the next `up` (a new process) finds two matching terminals: settle keeps `pending` (G3 Unknown), 1 `team`.
+#[test]
+fn an_unresolved_leader_launch_refuses_team() {
+    let (w, made) = crash_world();
+    let key = w.caller().server_key;
+    w.fakes.hc_answer(address("t1"));
+    crash_after("commit");
+    let _ = cli(&w, &["up", "-Client", "claude"]);
+    no_crash();
+    let w = reopen(&w, &made);
+    seed_launcher(&w, &key, "commit");
+    let (id, f) = leaders(&w, &key).pop().unwrap();
+    let pending = crate::agents::gens::pending(&lf::record(&f));
+    assert_eq!(pending, Some(0), "the killed up left generation 0 pending");
+    let wire = ut::create::running_wire(&w, &f, &id, 0);
+    cf::online(&w);
+    cf::online(&w); // settle
+    let by_id = format!("mux.id={id}");
+    cf::answer(
+        &w,
+        &[
+            "ls",
+            "--all",
+            "--label",
+            &by_id,
+            "--label",
+            "mux.gen=0",
+            "--json",
+        ],
+        &json!({"terminals": [{"address": "t1"}, {"address": "t9"}]}).to_string(),
+    );
+    cf::answer(&w, &["get", "t1", "--json"], &wire.to_string());
+    let mut twin = wire.clone();
+    twin["address"] = json!("t9");
+    cf::answer(&w, &["get", "t9", "--json"], &twin.to_string());
+    let (code, r) = cli(&w, &["up", "-Client", "claude"]);
+    assert_eq!(
+        (code, r["check"].as_str(), r["message"].as_str()),
+        (
+            1,
+            Some("team"),
+            Some("the leader's launch is unresolved; retry")
+        ),
+        "{r}"
+    );
+    assert_eq!(
+        crate::agents::gens::pending(&lf::record(&f)),
+        pending,
+        "pending still names the generation"
+    );
+    assert_eq!(
+        w.fakes
+            .hc_calls()
+            .iter()
+            .filter(|c| c.1[0] == "run")
+            .count(),
+        0,
+        "nothing launched again"
+    );
+    w.fakes.hc_done().unwrap();
+}
+
+// Spec: a void leader (its client failed before commit) gets a new member id; its folder stays.
+#[test]
+fn a_void_leader_is_replaced_under_a_new_member_id() {
+    let (w, _made) = crash_world();
+    let key = w.caller().server_key;
+    w.fakes.hc_answer(Ok(crate::spawn::Out {
+        code: 1,
+        stderr: "spawn failed".into(),
+        ..Default::default()
+    }));
+    let _ = cli(&w, &["up", "-Client", "claude"]);
+    let before: Vec<String> = std::fs::read_dir(w.ctx.state_root.join(&key).join("agents"))
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    assert!(
+        !before.is_empty() && leaders(&w, &key).is_empty(),
+        "void: {before:?}"
+    );
+    cf::online(&w);
+    w.fakes.hc_answer(address("t2"));
+    let (code, r) = cli(&w, &["up", "-Client", "claude"]);
+    assert_eq!(code, 0, "{r}");
+    let now = leaders(&w, &key);
+    assert_eq!(now.len(), 1);
+    assert!(!before.contains(&now[0].0), "a new member id");
+    assert!(
+        before
+            .iter()
+            .all(|id| w.ctx.state_root.join(&key).join("agents").join(id).is_dir()),
+        "the void folder stays"
+    );
+    w.fakes.hc_done().unwrap();
+}
+
+/// The caller probe answers session `session` (a later `mux_first` rule wins).
+fn in_session(w: &World, session: &str) {
+    w.fakes.mux_first(
+        "#{pid}|#{pane_pid}|#{session_id}",
+        0,
+        &format!("900|100|{session}|@1|{}", char::from(10u8)),
+        "",
+    );
+}
+/// A second `up` that re-enters a team led by `id` at generation 0: its connect, reconcile's pass, re-entry's.
+fn reenters(w: &World, id: &str, f: &std::path::Path) {
+    crate::agents::view_bind_tests::attach_panes(w, &[("%21", "t1")], &[]);
+    cf::online(w);
+    for _ in 0..2 {
+        cf::online(w);
+        rt::found(w, id, 0, &ut::create::running_wire(w, f, id, 0));
+    }
+}
+
+// Spec "up from the sessions it repairs": from a pending session (a publication crash) `send` is refused `moved`;
+// `up` there repairs (E3.1 publishes it by name) and switches to it. From an alias the same refusal; `up` from the
+// alias re-enters and switches to the view; no session is added.
+#[test]
+fn up_from_the_sessions_it_repairs_switches_there() {
+    let (w, made) = crash_world();
+    let key = w.caller().server_key;
+    crash_after("session");
+    let _ = cli(&w, &["up", "-Client", "claude"]);
+    no_crash();
+    let name = made.borrow()[0].1.clone();
+    in_session(&w, "$7");
+    w.fakes.mux_first("-t $7 #{session_name}", 0, &name, "");
+    let (code, r) = cli(&w, &["send", "leader", "-Body", "hi"]);
+    assert_eq!((code, r["check"].as_str()), (1, Some("moved")), "{r}");
+    cf::online(&w);
+    w.fakes.hc_answer(address("t1"));
+    let (code, r) = cli(&w, &["up", "-Client", "claude"]);
+    assert_eq!((code, &r["session"]), (0, &json!("$7")), "{r}");
+    assert_eq!(made.borrow().len(), 1, "repaired, not remade");
+    let target = format!("={name}");
+    assert!(
+        verbs(&w, "switch-client")
+            .iter()
+            .any(|c| c.contains(&target)),
+        "switched to the repaired session"
+    );
+    let t = ut::team_of(&w);
+    let mut ix = crate::agents::up::index::read(&w.ctx, &t).unwrap().unwrap();
+    ix.aliases.push(crate::agents::up::index::View {
+        session: "$3".into(),
+        name: "old".into(),
+        ..ix.view.clone().unwrap()
+    });
+    crate::agents::up::index::write(&w.ctx, &ix).unwrap();
+    let (id, f) = leaders(&w, &key).pop().unwrap();
+    reenters(&w, &id, &f); // queued before the caller moves to the alias: these helpers resolve the caller
+    in_session(&w, "$3");
+    let (code, r) = cli(&w, &["send", "leader", "-Body", "hi"]);
+    assert_eq!(
+        (code, r["check"].as_str()),
+        (1, Some("moved")),
+        "an alias: {r}"
+    );
+    let switched = verbs(&w, "switch-client").len();
+    let (code, r) = cli(&w, &["up", "-Client", "claude"]);
+    assert_eq!(
+        (code, &r["reentered"]),
+        (0, &json!(true)),
+        "up from the alias: {r}"
+    );
+    assert_eq!(
+        verbs(&w, "switch-client").len(),
+        switched + 1,
+        "it switches to the view"
+    );
+    assert!(verbs(&w, "switch-client").last().unwrap().contains(&target));
+    assert_eq!(made.borrow().len(), 1, "no session added");
+    w.fakes.hc_done().unwrap();
+}
+
+// Spec E3/E4, ambiguity 6, checklist #41 (N10): a `pending` on another server is published (then aliased when `up`
+// makes the view on its own server) or released when that server lists no such session; never killed. Either way
+// its release is `Present` and the outstanding list empty.
+#[test]
+fn a_pending_on_another_server_is_published_or_released_never_killed() {
+    for listed in [true, false] {
+        let (w, made) = crash_world();
+        let other = "/tmp/rmux-501/other";
+        w.fakes.process(crate::testing::row(5252, 1, 7));
+        let s = crate::agents::up::index::Server {
+            socket: other.into(),
+            pid: 5252,
+            start: 7,
+            key: crate::agents::up::index::key_of(other, 5252, 7),
+        };
+        let t = ut::team_of(&w);
+        let folder = crate::agents::up::identity::folder(&w.ctx).unwrap();
+        let release = w.ctx.state_root.join("up").join("o.release");
+        let pending = crate::agents::up::index::Pending {
+            server: s.clone(),
+            name: "p-other".into(),
+            release: release.to_str().unwrap().into(),
+        };
+        let inputs = crate::agents::up::index::Inputs {
+            client: "claude".into(),
+            options: vec![],
+            prompt: vec![],
+            name: String::new(),
+            folder: folder.to_str().unwrap().into(),
+        };
+        let ix = crate::agents::up::index::Index {
+            team: t.clone(),
+            inputs,
+            anchor: None,
+            view: None,
+            aliases: vec![],
+            releases: vec![],
+            pending: Some(pending),
+        };
+        // Checklist #41 (N10): the originating `up` on that server published its binding.
+        let bound = w.ctx.state_root.join(&s.key);
+        std::fs::create_dir_all(&bound).unwrap();
+        crate::state::evidence::publish(
+            &bound.join("server.json"),
+            &json!({"socket": other, "serverPid": 5252, "serverStart": 7}),
+        )
+        .unwrap();
+        crate::agents::up::index::write(&w.ctx, &ix).unwrap();
+        let rows = if listed {
+            format!("$5 p-other{}", char::from(10u8))
+        } else {
+            String::new()
+        };
+        crate::agents::up::publish::test_sessions(other, Some((0, rows)));
+        w.fakes.hc_answer(address("t1"));
+        let (code, r) = cli(&w, &["up", "-Client", "claude"]);
+        crate::agents::up::publish::test_sessions(other, None);
+        assert_eq!(code, 0, "{listed}: {r}");
+        let ix = crate::agents::up::index::read(&w.ctx, &t).unwrap().unwrap();
+        assert_eq!(
+            ix.view.unwrap().server.key,
+            w.caller().server_key,
+            "{listed}: the view is on the caller's server"
+        );
+        assert_eq!(
+            ix.aliases.iter().any(|a| a.server == s),
+            listed,
+            "{listed}: the published one is an alias"
+        );
+        assert!(
+            ix.releases.is_empty()
+                && matches!(
+                    crate::state::evidence::read(&release),
+                    crate::state::evidence::Evidence::Present(_)
+                ),
+            "{listed}: the foreign release done"
+        );
+        assert_eq!(made.borrow().len(), 1);
+        assert!(
+            !crate::agents::prelife_fixture::killed(&w),
+            "{listed}: never killed"
+        );
+        w.fakes.hc_done().unwrap();
+    }
+}
+
+// Spec E3/E4: a second `up` adds nothing: no session, no launch, no view, the leader in the reply.
+#[test]
+fn a_second_up_adds_nothing() {
+    let (w, made) = crash_world();
+    let key = w.caller().server_key;
+    w.fakes.hc_answer(address("t1"));
+    let (code, first) = cli(&w, &["up", "-Client", "claude"]);
+    assert_eq!(code, 0, "{first}");
+    let (id, f) = leaders(&w, &key).pop().unwrap();
+    reenters(&w, &id, &f);
+    let windows = verbs(&w, "new-window").len();
+    let (code, again) = cli(&w, &["up", "-Client", "claude"]);
+    assert_eq!(
+        (code, &again["reentered"], &again["created"]),
+        (0, &json!(true), &json!(false)),
+        "{again}"
+    );
+    assert_eq!(
+        (made.borrow().len(), verbs(&w, "new-window").len()),
+        (1, windows),
+        "nothing added"
+    );
+    assert_eq!(
+        w.fakes
+            .hc_calls()
+            .iter()
+            .filter(|c| c.1[0] == "run")
+            .count(),
+        1,
+        "one launch"
+    );
+    assert_eq!(
+        (
+            again["views"].as_array().unwrap().len(),
+            &again["leader"]["id"]
+        ),
+        (1, &json!(id))
+    );
+    w.fakes.hc_done().unwrap();
+}
+
+// E1/E2 through the dispatcher: a torn index refuses `index` naming its path (call 2); a pre-lifecycle leader keeps
+// today's refusal (prelife-1c G10). E4.2: a missing team record is repaired create-only from the leader's record;
+// an unreadable leader record refuses 1 `team`.
+#[test]
+fn torn_index_prelife_leader_and_team_record_repair() {
+    let (w, _made) = crash_world();
+    let key = w.caller().server_key;
+    let t = ut::team_of(&w);
+    let at = crate::agents::up::index::path(&w.ctx, &t);
+    std::fs::create_dir_all(at.parent().unwrap()).unwrap();
+    std::fs::write(&at, b"{").unwrap();
+    let (code, r) = cli(&w, &["up", "-Client", "claude"]);
+    let named = format!(
+        "the team index cannot be read; repair or remove {}",
+        at.display()
+    );
+    assert_eq!(
+        (code, r["check"].as_str(), r["message"].as_str()),
+        (1, Some("index"), Some(named.as_str())),
+        "torn"
+    );
+    std::fs::remove_file(&at).unwrap();
+    let pre = w
+        .ctx
+        .state_root
+        .join(&key)
+        .join("agents")
+        .join("999999999999");
+    std::fs::create_dir_all(&pre).unwrap();
+    crate::state::fs::write_json(
+        &pre.join("record.json"),
+        &json!({"id": "999999999999", "name": "leader", "upTeam": t, "session": "$1", "hcAddress": "t9"}),
+    )
+    .unwrap();
+    cf::online(&w);
+    let (code, r) = cli(&w, &["up", "-Client", "claude"]);
+    assert_eq!(
+        (code, r["check"].as_str()),
+        (2, Some("leader")),
+        "prelife-1c G10: {r}"
+    );
+    std::fs::remove_dir_all(&pre).unwrap();
+    cf::online(&w);
+    w.fakes.hc_answer(address("t1"));
+    let (code, first) = cli(&w, &["up", "-Client", "claude"]);
+    assert_eq!(code, 0, "{first}");
+    let (id, f) = leaders(&w, &key).pop().unwrap();
+    std::fs::remove_file(ut::team_file(&w)).unwrap();
+    reenters(&w, &id, &f);
+    let (code, r) = cli(&w, &["up", "-Client", "claude"]);
+    assert_eq!((code, &r["created"]), (0, &json!(true)), "{r}");
+    assert_eq!(
+        crate::agents::team::read(&ut::team_file(&w))
+            .unwrap()
+            .unwrap()
+            .leader,
+        id,
+        "repaired"
+    );
+    let rec = f.join("record.json");
+    std::fs::remove_file(&rec).unwrap();
+    std::fs::create_dir(&rec).unwrap();
+    std::fs::remove_file(ut::team_file(&w)).unwrap();
+    cf::online(&w);
+    let (code, r) = cli(&w, &["up", "-Client", "claude"]);
+    assert_eq!(
+        (code, r["check"].as_str()),
+        (1, Some("team")),
+        "E4.2 else 1 team: {r}"
+    );
+    w.fakes.hc_done().unwrap();
+}
