@@ -44,7 +44,7 @@ fn leader_of(w: &World, t: &str) {
 
 /// reentry-6a Task 11 (finding F18): re-entry's own pass after reconcile: one `hc::Lazy`, then member `id`'s
 /// generation `n` looked up; hc lists no terminal of it, so it is Unknown and gets no view.
-fn reentry_unlisted(w: &super::fixture::World, id: &str, n: u64) {
+pub(super) fn reentry_unlisted(w: &super::fixture::World, id: &str, n: u64) {
     cf::online(w);
     let (by_id, by_gen) = (format!("mux.id={id}"), format!("mux.gen={n}"));
     cf::answer(
