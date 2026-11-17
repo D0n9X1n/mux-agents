@@ -1423,12 +1423,53 @@ fn up_whose_view_panics_keeps_the_leader_under_hostile_settings() {
             .is_some_and(|e| e.contains("panicked")),
         "{reply}"
     );
-    assert!(eventually(Duration::from_secs(10), || live
-        .call(&["list-sessions", "-F", "#{session_name}"])
-        .lines()
-        .count()
-        == 2));
     assert!(!marker.exists());
+    let leader = s(&reply["leader"]["id"]);
+    assert!(
+        member_dir(&live, &leader)
+            .join("gens")
+            .join("0")
+            .join("commit.json")
+            .is_file(),
+        "the leader is committed: {reply}"
+    );
+    proof_of(&live, &leader);
+    // PM call 16 (call 10: views need not survive; up restores them): on rmux the empty team session ends once up's
+    // hold window closes. A second `up` without the panic finds the leader Running and shows its view; the hostile
+    // default-command never runs.
+    live.line(&live.root, "set MUX_AGENTS_TEST_PANIC=");
+    live.prompt(&live.root);
+    let again = live.run_any(&["up", "-Client", "claude"]);
+    assert_eq!(again["ok"], serde_json::json!(true), "{again}");
+    let life = again["members"]
+        .as_array()
+        .and_then(|m| m.iter().find(|m| s(&m["id"]) == leader))
+        .map(|m| m["life"].clone());
+    assert_eq!(
+        life,
+        Some(serde_json::json!("running")),
+        "the leader is still Running: {again}"
+    );
+    let view = again["views"]
+        .as_array()
+        .and_then(|v| v.iter().find(|v| s(&v["id"]) == leader))
+        .unwrap_or_else(|| panic!("the leader's view is shown: {again}"));
+    let pane = s(&view["pane"]);
+    assert!(
+        eventually(Duration::from_secs(10), || live
+            .call(&[
+                "list-panes",
+                "-s",
+                "-t",
+                &s(&again["session"]),
+                "-F",
+                "#{pane_id}"
+            ])
+            .lines()
+            .any(|p| p.trim() == pane)),
+        "the leader's view pane {pane} is in the team session: {again}"
+    );
+    assert!(!marker.exists(), "after the second up");
 }
 
 /// `file` of member `id`, under whichever server folder of the state root holds it.

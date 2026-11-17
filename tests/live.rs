@@ -6055,20 +6055,51 @@ hc {}:
             // The panic fires inside the view step, after the commit: up succeeds with viewError (PM calls 1, 10).
             assert_eq!(code, 0, "{mux:?} {out}");
             assert!(s(&out["viewError"]).contains("panicked"), "{mux:?} {out}");
-            assert!(
-                eventually(Duration::from_secs(10), || live
-                    .call(&["list-sessions", "-F", "#{session_name}"])
-                    .lines()
-                    .count()
-                    == 2),
-                "{mux:?}: the leader's session stays"
-            );
             assert!(!marker.exists(), "{mux:?}");
             let leader = s(&out["leader"]["id"]).to_string();
             assert!(
                 live.gen_file(&leader, "commit.json").is_file(),
                 "{mux:?}: the leader is committed"
             );
+            live.proof_of(&leader);
+            // PM call 16 (call 10: views need not survive; up restores them): the views may be gone, the leader is not.
+            // A second `up` without the panic finds it Running and shows its view; the hostile default-command never
+            // runs.
+            let (code, again) = live.server.run(
+                &["up", "-Client", "claude"],
+                &[("MUX_AGENTS_STATE", state.as_str())],
+            );
+            assert_eq!(code, 0, "{mux:?} {again}");
+            let member = |r: &Value| {
+                r["members"]
+                    .as_array()
+                    .and_then(|m| m.iter().find(|m| m["id"] == json!(leader)).cloned())
+            };
+            assert_eq!(
+                member(&again).map(|m| m["life"].clone()),
+                Some(json!("running")),
+                "{mux:?}: the leader is still Running: {again}"
+            );
+            let view = again["views"]
+                .as_array()
+                .and_then(|v| v.iter().find(|v| v["id"] == json!(leader)).cloned())
+                .unwrap_or_else(|| panic!("{mux:?}: the leader's view is shown: {again}"));
+            let pane = s(&view["pane"]).to_string();
+            assert!(
+                eventually(Duration::from_secs(10), || live
+                    .call(&[
+                        "list-panes",
+                        "-s",
+                        "-t",
+                        s(&again["session"]),
+                        "-F",
+                        "#{pane_id}"
+                    ])
+                    .lines()
+                    .any(|p| p == pane)),
+                "{mux:?}: the leader's view pane {pane} is in the team session: {again}"
+            );
+            assert!(!marker.exists(), "{mux:?}: after the second up");
         }
     }
 
