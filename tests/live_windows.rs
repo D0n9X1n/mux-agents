@@ -454,6 +454,47 @@ fn s(value: &Value) -> String {
         .to_string()
 }
 
+/// `rmux -L <socket> <args>` that never panics: its stdout, or its status and stderr.
+fn rmux_try(live: &Live, args: &[&str]) -> String {
+    match crate::bounded::output(live.rmux().args(args), crate::bounded::LIMIT) {
+        Ok(out) if out.status.success() => String::from_utf8_lossy(&out.stdout).into_owned(),
+        Ok(out) => format!("{:?}: {}", out.status, String::from_utf8_lossy(&out.stderr)),
+        Err(e) => format!("not run: {e}"),
+    }
+}
+
+/// #150 diagnosis: None while `bar` is listed and alive; else what explains its exit: every pane with its dead flag
+/// and start command, the bar's last screen (its `watch` reply names `ended`), and each spawned member's view.json.
+fn bar_gone(live: &Live, bar: &str, spawned: &[&Value]) -> Option<String> {
+    let panes = rmux_try(
+        live,
+        &[
+            "list-panes",
+            "-a",
+            "-F",
+            "#{pane_id}|#{pane_dead}|#{window_id}|#{pane_start_command}",
+        ],
+    );
+    let alive = panes.lines().any(|l| l.split('|').take(2).eq([bar, "0"]));
+    if alive {
+        return None;
+    }
+    let mut report = format!("list-panes:\n{panes}\nbar screen:\n");
+    report.push_str(&rmux_try(live, &["capture-pane", "-p", "-J", "-t", bar]));
+    for reply in spawned {
+        let id = reply["id"].as_str().unwrap_or("");
+        let views: Vec<String> = std::fs::read_dir(live.dir.join("state"))
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|e| e.path().join("agents").join(id).join("view.json"))
+            .filter_map(|p| std::fs::read_to_string(p).ok())
+            .collect();
+        report.push_str(&format!("\n{id} view.json: {views:?}"));
+    }
+    Some(report)
+}
+
 /// The 1-based line of `screen` whose second token is `name`: that agent's name line (`◉`/`◌`, then the name).
 fn row_at(screen: &str, name: &str) -> Option<usize> {
     screen
@@ -788,7 +829,16 @@ fn bar_keys_and_a_click_focus_an_agent() {
     let w2 = live.spawn("w2");
     let bar = s(&w1["sidebar"]);
     let (p1, p2) = (s(&w1["pane"]), s(&w2["pane"]));
+    // #150 diagnosis (CI only: rmux's daemon is refused locally): a bar that leaves keeps its last screen, which holds
+    // its `watch` reply and so its `ended` reason; a bar gone or dead fails here with what it saw.
+    let _ = rmux_try(
+        &live,
+        &["set-option", "-w", "-t", &bar, "remain-on-exit", "on"],
+    );
     live.wait("both agents on the bar", || {
+        if let Some(report) = bar_gone(&live, &bar, &[&w1, &w2]) {
+            panic!("the bar {bar} left before both agents showed:\n{report}");
+        }
         let screen = live.screen(&bar);
         (row_at(&screen, "w1").is_some() && row_at(&screen, "w2").is_some()).then_some(())
     });
