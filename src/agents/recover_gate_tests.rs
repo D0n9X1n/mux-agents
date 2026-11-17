@@ -1,4 +1,4 @@
-//! restore-6c Task 2 (#103): a retry's gates. Every generation done, the cap, a free conversation; a Lost failed
+//! restore-6c Task 2: a retry's gates. Every generation done, the cap, a free conversation; a Lost failed
 //! generation (or one a crash left half released) is released `cause: recovery`, never killed.
 use super::core_fixture as cf;
 use super::core_launch::forward_tests as ft;

@@ -337,7 +337,7 @@ fn capture_requires_view_and_never_reopens() {
     }
 }
 
-// Call 18a (PR #138 Tech Lead): a held identity reopens at its own generation's address, never the active record's;
+// Call 18a (Tech Lead): a held identity reopens at its own generation's address, never the active record's;
 // a pending generation without `hcAddress` refuses and attaches nothing. `record.json` keeps every generation field.
 #[test]
 fn focus_member_attaches_the_held_generations_address() {

@@ -1,4 +1,4 @@
-//! restore-6c P2 (#103): `stop X -Generation` ends every generation of X that is not done, and nothing else.
+//! restore-6c P2: `stop X -Generation` ends every generation of X that is not done, and nothing else.
 use serde_json::{Map, Value, json};
 
 use super::super::resume::Subject;

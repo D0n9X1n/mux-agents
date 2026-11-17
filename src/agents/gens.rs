@@ -1,4 +1,4 @@
-//! The one reader of generation evidence (#103 state-0 S5-S7): `gens/<n>.claim` and `gens/<n>/<file>.json`.
+//! The one reader of generation evidence (state-0 S5-S7): `gens/<n>.claim` and `gens/<n>/<file>.json`.
 use std::path::{Path, PathBuf};
 
 use serde_json::{Value, json};
@@ -2231,7 +2231,7 @@ mod b_tests {
         );
     }
 
-    // a3c call 47 (TL #149, production readiness): `record_end` binds a valid record id to its member folder and
+    // a3c call 47 (TL, production readiness): `record_end` binds a valid record id to its member folder and
     // needs a valid launch.json hcName. An empty or malformed name matching a terminal of the same name, an empty
     // record id matching an empty `mux.id`, or another member's id in this folder refuse `evidence`: no ended.json.
     #[test]

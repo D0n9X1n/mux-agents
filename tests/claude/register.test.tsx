@@ -302,7 +302,7 @@ test('/mux-agents-pane opens the pane and a stubbed list draws the count and row
   await ui.unmount()
 })
 
-// Terminal CLI only (#43): eligible only when the surfaces are exactly ['terminal'], TMUX or RMUX is set and
+// Terminal CLI only: eligible only when the surfaces are exactly ['terminal'], TMUX or RMUX is set and
 // CLAUDE_CODE_REMOTE is not true. Any refused read counts as not eligible.
 const NOT_HERE = 'mux-agents works only in a terminal CLI inside tmux or rmux.'
 const texts = async (ui: any) => (await ui.findAll({ type: 'Text' })).map((t: { text: string }) => t.text)
@@ -369,7 +369,7 @@ for (const [name, set] of FAIL_CLOSED) {
   })
 }
 
-// An hc terminal outside tmux and rmux (#137): eligible only as a team member, proven once by `read -Count`.
+// An hc terminal outside tmux and rmux: eligible only as a team member, proven once by `read -Count`.
 const COUNT_OF = (member: boolean) => JSON.stringify({ ok: true, badge: 0, wake: 0, end: 0, id: 'a1', gen: '0', leader: true, member })
 const REFUSED = (check: string) => JSON.stringify({ ok: false, verb: 'read', code: 2, check, message: 'no' })
 
@@ -479,7 +479,7 @@ for (const attach of [false, true]) {
   })
 }
 
-// A read the open or the first refresh waits on outlives the eligibility seen before it (QA #43): the surfaces turn to
+// A read the open or the first refresh waits on outlives the eligibility seen before it (QA): the surfaces turn to
 // terminal and desktop while it is held, with and without the desktop's attach event.
 async function lostDuringRead($: any, w: ReturnType<typeof world>, hold: Hold, attach: boolean) {
   await $.session.start(START)
@@ -515,7 +515,7 @@ for (const attach of [false, true]) {
   })
 }
 
-// A tick that fires while the last list still runs checks eligibility all the same (QA #43); only a second list waits.
+// A tick that fires while the last list still runs checks eligibility all the same (QA); only a second list waits.
 test('a tick during a held list, eligibility lost with no attach: retired at that tick, and no new list', async ($, on) => {
   const w = world(on, { TMUX: 'x' }, [{ holdMs: 4000, answer: ran(0, LIST) }, ran(0, LIST)])
   await $.session.start(START)

@@ -1,4 +1,4 @@
-//! restore-6c Task 11 (#103): the new team lists and closes its predecessors' kept shells (spec "kept shells across
+//! restore-6c Task 11: the new team lists and closes its predecessors' kept shells (spec "kept shells across
 //! retirement"; ambiguity 14; calls 3, 12; 10-13 F9-F13). The predecessor is session `$5`, retired; the caller stays
 //! in `$3`, so `w.caller()` stays admitted (D20 refuses only a retired session).
 use super::core_fixture as cf;

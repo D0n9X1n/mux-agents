@@ -111,7 +111,7 @@ pub(crate) fn named_with_core(
         _ => Err(changed()),
     }
 }
-/// The committed, unsuperseded member whose id is `id`: the bar opens rows by id, never by name (#103 B6).
+/// The committed, unsuperseded member whose id is `id`: the bar opens rows by id, never by name (B6).
 pub(crate) fn by_id(ctx: &Ctx, caller: &Caller, id: &str) -> Res<Identity> {
     if !super::agent_id(id) {
         return Err(changed());

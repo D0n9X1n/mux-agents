@@ -1,4 +1,4 @@
-//! notebook-7b V1 (#103): the launch index, from the certain prefix only; never a launch failure.
+//! notebook-7b V1: the launch index, from the certain prefix only; never a launch failure.
 use serde_json::{Value, json};
 
 use super::*;

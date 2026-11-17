@@ -1,4 +1,4 @@
-//! The leader `up` launches (#103): `<client> <flags> --session-id <uuid>`, depth 0, no parents, `upTeam`. Its folder
+//! The leader `up` launches: `<client> <flags> --session-id <uuid>`, depth 0, no parents, `upTeam`. Its folder
 //! is flushed to disk before `forward` writes its record, which `forward` flushes before `hc run`.
 
 use std::path::Path;
@@ -66,7 +66,7 @@ pub fn prepare(
         )?;
     }
     let (id, session) = (hex_id()?, guid()?);
-    // The member folder and every folder above it are on disk before forward creates the record (#103).
+    // The member folder and every folder above it are on disk before forward creates the record.
     private_folder(ctx, &state.join("agents").join(&id))?;
     flush_to_root(&ctx.state_root, &state.join("agents"))?;
     // The prompt follows the recipe, so `--session-id <uuid>` ends any variadic option before it.
@@ -92,7 +92,7 @@ pub fn prepare(
     })
 }
 
-/// Flushes the folders the record's path depends on before `hc run` (#103), as the launcher's `flush_claim` does for
+/// Flushes the folders the record's path depends on before `hc run`, as the launcher's `flush_claim` does for
 /// its claim: `agents`, the server folder and the state root with `sync_dir`, then every folder above the root up to
 /// the filesystem root with `sync_ancestor` (skipped only where this user cannot add an entry). Any failure is an
 /// error, so nothing launches.

@@ -1,4 +1,4 @@
-//! restore-6c Task 1 (#103): a person's retry of a member that needs recovery, its subject and its evidence.
+//! restore-6c Task 1: a person's retry of a member that needs recovery, its subject and its evidence.
 use super::core_launch::forward_tests as ft;
 use super::fixture::World;
 use super::reconcile_restore_tests::L;

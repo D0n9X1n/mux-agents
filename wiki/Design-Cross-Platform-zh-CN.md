@@ -2,7 +2,7 @@
 
 [English](Design-Cross-Platform)
 
-里程碑 v0.1.0 的子项目 B，问题 #1。以 A 为基础。
+里程碑 v0.1.0 的子项目 B。以 A 为基础。
 
 ## 目的
 

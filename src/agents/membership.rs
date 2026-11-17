@@ -233,7 +233,7 @@ fn settle(facts: &mut core_facts::Snapshot, local: &[Local]) {
 
 /// The ids a committed member names in `resumedFrom`: each is superseded by its resume, so its name means the
 /// successor and it is never the one a name, list, board, send or focus picks. Supersession follows the
-/// `resumedFrom` chain (amendment 2 to resume v11, recorded on #103): a superseded member's own `resumedFrom` is
+/// `resumedFrom` chain (amendment 2 to resume v11, recorded on): a superseded member's own `resumedFrom` is
 /// superseded too, so X -> Y -> Z supersedes X even when Y (a successor whose claim was not abandoned but which has
 /// no commit, because it may have run) never committed.
 pub fn superseded(records: &[(&str, &Value, bool)]) -> std::collections::BTreeSet<String> {
@@ -300,7 +300,7 @@ impl Snapshot {
     /// The member named `name`: of every committed member with that name and no end notice that hc does not prove
     /// ended, exactly one, and hc shows it running. Its id and record; none otherwise. As in `member_target`, a
     /// member proven ended is no rival for its name; a lost or unknown one still is, so a member hc could not read
-    /// never makes a same-name one look unique (#104 phase 1c).
+    /// never makes a same-name one look unique (phase 1c).
     pub fn running_named(&self, name: &str) -> Option<(String, Value)> {
         let superseded = self.superseded();
         let candidates: Vec<_> = self
@@ -336,7 +336,7 @@ impl Snapshot {
     }
 
     /// Member `id` as hc sees it now: running, its record committed and, unless `noticed_ok`, with no end notice.
-    /// Anything else refuses 2 `parent`; another member's id is never this caller (#104 phase 1c).
+    /// Anything else refuses 2 `parent`; another member's id is never this caller (phase 1c).
     pub fn member(&self, id: &str, noticed_ok: bool) -> Res<registry::Me> {
         let observed = self.facts.local.iter().find(|o| o.identity.id == id);
         let running = observed.is_some_and(|o| o.life == super::lifecycle::Life::Running);
@@ -355,7 +355,7 @@ impl Snapshot {
     }
 
     pub fn reader(&self, caller: &Caller) -> Res<registry::Me> {
-        // A member proven through its own hc terminal is itself by id, whichever pane shows it, or none (#104).
+        // A member proven through its own hc terminal is itself by id, whichever pane shows it, or none.
         // Notices never decide whether it may read its own mailbox.
         if let Some(id) = &caller.member {
             return self.member(id, true);
@@ -529,7 +529,7 @@ impl Snapshot {
 mod tests;
 
 /// The caller itself when it is a member proven through its own hc terminal: that member as hc sees it now, never
-/// matched by pane, refused once it ended or has an end notice. None for a pane-proven caller (#104 phase 1c).
+/// matched by pane, refused once it ended or has an end notice. None for a pane-proven caller (phase 1c).
 pub fn proven_self(ctx: &Ctx, caller: &Caller) -> Option<Res<registry::Me>> {
     let id = caller.member.as_ref()?;
     Some(Snapshot::take(ctx, caller).and_then(|s| s.member(id, false)))

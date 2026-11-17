@@ -1,4 +1,4 @@
-//! Mailbox receipts (#103 4b-i): `mail/<key>.cursor.json` = `{offset, held, pending?, idPending?, acked, uncertain?}`,
+//! Mailbox receipts (4b-i): `mail/<key>.cursor.json` = `{offset, held, pending?, idPending?, acked, uncertain?}`,
 //! read and committed whole under the mailbox lock. Shared with the notebook (phase 7b).
 use std::path::{Path, PathBuf};
 
@@ -128,7 +128,7 @@ impl Cursor {
     }
 
     /// Appends `{batch, owner}` to the history, keeping the last 16 of that owner (R4). The history of any other
-    /// owner goes unless it owns a receipt still pending: a predecessor can no longer ack (#103 4b-i).
+    /// owner goes unless it owns a receipt still pending: a predecessor can no longer ack (4b-i).
     pub fn remember(&mut self, batch: &str, owner: &Owner) {
         self.acked.push((batch.into(), owner.clone()));
         let (pending, id_pending) = (&self.pending, &self.id_pending);

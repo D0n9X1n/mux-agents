@@ -195,7 +195,7 @@ impl Server {
         for name in ["claude", "copilot"] {
             let copy = dir.join("bin").join(name);
             std::fs::copy(fake, &copy).unwrap();
-            // Without MUX_IT_DIR the fake exits 2 at once: a run that only proves the copy can run (#76).
+            // Without MUX_IT_DIR the fake exits 2 at once: a run that only proves the copy can run.
             runnable(Command::new(&copy).env_remove("MUX_IT_DIR"));
         }
         let socket = dir.join("s");
@@ -337,7 +337,7 @@ impl Server {
         String::from_utf8(out.stdout).unwrap()
     }
 
-    /// One client call to this server, run with the same cleared environment the server started with (#97): a pane
+    /// One client call to this server, run with the same cleared environment the server started with: a pane
     /// a client call creates must not take the test process's PATH, which lacks `<dir>/bin` and its fake clients.
     pub fn try_call(&self, args: &[&str]) -> Output {
         let mut command = Command::new(&self.bin);
@@ -975,7 +975,7 @@ pub fn required(list: &str) -> Result<Vec<Mux>, String> {
 }
 
 /// Runs `command` once, retrying while Linux refuses it as "text file busy" (ETXTBSY, 26): a just-copied program
-/// stays busy while a child another test forked during the copy still holds its write open (#76). Once it has run,
+/// stays busy while a child another test forked during the copy still holds its write open. Once it has run,
 /// no later run meets ETXTBSY.
 fn runnable(command: &mut Command) {
     for _ in 0..100 {
@@ -991,7 +991,7 @@ fn runnable(command: &mut Command) {
 }
 
 /// The binary and its `-V` answer, or None with a skip message. A multiplexer MUX_AGENTS_LIVE_REQUIRE names is never
-/// skipped: it fails the test instead. The gate is opt-in; CI's integration job names all three (#71).
+/// skipped: it fails the test instead. The gate is opt-in; CI's integration job names all three.
 pub fn available(mux: Mux) -> Option<(PathBuf, String)> {
     let list = std::env::var("MUX_AGENTS_LIVE_REQUIRE").unwrap_or_default();
     let gate = required(&list).unwrap_or_else(|why| panic!("{why}"));

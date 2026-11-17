@@ -1,4 +1,4 @@
-//! Task 5 (#103 phase 7a): `note`, the proven caller writing the team notebook (N1, N3; ambiguities 2, 3, 7).
+//! Task 5 (phase 7a): `note`, the proven caller writing the team notebook (N1, N3; ambiguities 2, 3, 7).
 use serde_json::{Value, json};
 
 use super::tests::{notes, titles, tx, world};

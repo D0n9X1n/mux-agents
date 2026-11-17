@@ -1,4 +1,4 @@
-//! restore-6c P2 (#103): `drop X`, a person's cascade stop of a member of the anchor session, by exact identity.
+//! restore-6c P2: `drop X`, a person's cascade stop of a member of the anchor session, by exact identity.
 use serde_json::{Map, Value};
 
 use crate::cli::Request;

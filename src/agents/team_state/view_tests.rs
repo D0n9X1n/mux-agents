@@ -328,7 +328,7 @@ fn a_paused_view_writer_and_a_patch_both_survive() {
     assert_eq!(gate.waited(&s.member_lock(ID)), 1);
 }
 
-/// a3c call 47 (TL #149, MEDIUM): `view.json` written directly, as a stale or forged file would be, for the reader.
+/// a3c call 47 (TL, MEDIUM): `view.json` written directly, as a stale or forged file would be, for the reader.
 fn put_view(w: &World, v: &Value) {
     crate::state::fs::write_json(&w.folder(ID).join("view.json"), v).unwrap();
 }

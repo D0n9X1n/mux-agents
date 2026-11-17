@@ -1,4 +1,4 @@
-//! The team notebook (#103 phase 7a, N1-N3): `<root>/<key>/teams/<sha16(session)>/notes/notebook.jsonl`, append-only
+//! The team notebook (phase 7a, N1-N3): `<root>/<key>/teams/<sha16(session)>/notes/notebook.jsonl`, append-only
 //! lines `{id, author, at, title, body}`, and `notebook.state.json` = `{durable, uncertain}`. Readers see only whole
 //! lines ending at or before a certain `durable`. Every function taking a `Tx` runs under the team lock.
 use std::io::{Seek, SeekFrom, Write};

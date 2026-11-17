@@ -1,4 +1,4 @@
-//! A team's record and its permission ceiling (#103 phase 2a-ii). Only a person's `up` creates a team; it records the
+//! A team's record and its permission ceiling (phase 2a-ii). Only a person's `up` creates a team; it records the
 //! person's own client flags and a policy word derived from those flags alone, never from settings or the
 //! environment, so the ceiling is never looser than what the person launched with. The record is written once and
 //! never replaced: a later `up` that names other flags keeps it. Every later spawn and resume is checked against it
@@ -112,7 +112,7 @@ const COPILOT_BARE: [&str; 10] = [
     "--assisted-approval",
 ];
 
-/// One run of argv tokens as the client reads it (#103 options-6e E1): a known flag with the tokens it took and the
+/// One run of argv tokens as the client reads it (options-6e E1): a known flag with the tokens it took and the
 /// values it read, a positional, or `--` and everything after it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Arg {
@@ -341,7 +341,7 @@ pub fn within(ceiling: Policy, child: Policy) -> bool {
 pub struct Team {
     pub team: String,
     pub session: String,
-    /// The session's name, as `up` made it (#103).
+    /// The session's name, as `up` made it.
     pub name: String,
     pub directory: String,
     pub client: Client,

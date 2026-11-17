@@ -2,7 +2,7 @@
 
 [English](Design-Foundation)
 
-里程碑 v0.1.0 的子项目 A：#3 改名、#6 `parentAgentId`、#2 CI、#5 发布。子项目 B（#1）、C（#4）和 D（#7–#9）以它为基础。
+里程碑 v0.1.0 的子项目 A：改名、`parentAgentId`、CI 和发布。子项目 B、C 和 D 以它为基础。
 
 ## 目的
 
@@ -18,15 +18,15 @@
 
 ## 变更
 
-**改名（#3）。** 文件：`scripts/mux-agent.ps1`、`scripts/mux-agent-launcher.ps1`、`scripts/MuxAgents.ps1`、`skills/mux-agents/`、`tests/MuxAgents*.ps1`。每个 `RmuxAgent` 标识符都变为 `MuxAgent`，测试替身也一样（`New-FakeMuxAgentProviders`）；`rmux-agent` 文本变为 `mux-agent`；`RMUX_AGENTS_STATE` 变为 `MUX_AGENTS_STATE`；状态根目录为 `%LOCALAPPDATA%\mux-agents\state`；互斥体前缀为 `Local\MuxAgents-`；清单、`[mux-agent]` 标头、错误前缀和 README 随之更改。指代多路复用器的名字保持不变：`RMUX`、`TMUX`、`TMUX_PANE`、`rmux.exe`、`Add-FakeRmuxRule`、`-N` 规则。
+**改名。** 文件：`scripts/mux-agent.ps1`、`scripts/mux-agent-launcher.ps1`、`scripts/MuxAgents.ps1`、`skills/mux-agents/`、`tests/MuxAgents*.ps1`。每个 `RmuxAgent` 标识符都变为 `MuxAgent`，测试替身也一样（`New-FakeMuxAgentProviders`）；`rmux-agent` 文本变为 `mux-agent`；`RMUX_AGENTS_STATE` 变为 `MUX_AGENTS_STATE`；状态根目录为 `%LOCALAPPDATA%\mux-agents\state`；互斥体前缀为 `Local\MuxAgents-`；清单、`[mux-agent]` 标头、错误前缀和 README 随之更改。指代多路复用器的名字保持不变：`RMUX`、`TMUX`、`TMUX_PANE`、`rmux.exe`、`Add-FakeRmuxRule`、`-N` 规则。
 
-**`parentAgentId`（#6）。** `Add-MuxAgentNotice` 不再读取没有任何代码写入的 `Record.parentAgentId`，而是始终投递到 `Record.parentPane` 的 `pane-<n>`。子代理不能派生代理，因此父级永远不是代理窗格。
+**`parentAgentId`。** `Add-MuxAgentNotice` 不再读取没有任何代码写入的 `Record.parentAgentId`，而是始终投递到 `Record.parentPane` 的 `pane-<n>`。子代理不能派生代理，因此父级永远不是代理窗格。
 
-**CI（#2）。** `.github/workflows/ci.yml`：在 `pull_request` 和 `push` 到 `main` 时运行；`contents: read`；一个并发组取消被取代的拉取请求运行；actions 按 SHA 固定并带版本注释。
+**CI。** `.github/workflows/ci.yml`：在 `pull_request` 和 `push` 到 `main` 时运行；`contents: read`；一个并发组取消被取代的拉取请求运行；actions 按 SHA 固定并带版本注释。
 - `lint`（ubuntu）：actionlint 1.7.12，按其固定的 SHA-256 校验；两个清单都能解析为 JSON。
 - `test`，矩阵 `ubuntu-latest`、`macos-latest`、`windows-latest`，`fail-fast: false`：安装 Pester 4.10.1；在 Windows 上把 `TEMP`/`TMP` 设为 `RUNNER_TEMP`（8.3 形式的 `RUNNER~1` 路径会让四个测试失败，CI 探测）；运行 `tests/Invoke-MuxAgentTests.ps1`，它在 Windows 以外的系统上排除标签 `windows`，任何测试失败都以 1 退出。
 
-**发布（#5）。** `.github/workflows/release.yml` 在标签 `v[0-9]+.[0-9]+.[0-9]+` 上运行，作业由 `needs` 串联：
+**发布。** `.github/workflows/release.yml` 在标签 `v[0-9]+.[0-9]+.[0-9]+` 上运行，作业由 `needs` 串联：
 - `validate`（只读）运行 `scripts/release/Test-MuxAgentRelease.ps1`，它接收标签、标签 SHA、`origin/main` 祖先判断结果、该 SHA 的 `ci.yml` push 运行以及清单版本，以 1 退出并指出第一个失败：不在 `main` 上、没有成功的 CI 运行，或版本不匹配。
 - `package`（`needs: validate`，只读）：用 `git archive` 把 `.claude-plugin`、`skills`、`scripts`、`hooks`（存在时）、`README.md`、`LICENSE` 打包成 `mux-agents-<tag>.zip`，作为构件上传。
 - `publish`（`needs: [validate, package]`），唯一拥有 `contents: write` 的作业：`gh release create <tag>`，附带 zip 和 `--generate-notes`，存在 `wiki/Release-<tag>.md` 时将其内容放在说明开头。

@@ -116,7 +116,7 @@ test('a pane that stops being an agent\'s stops reporting after its first refusa
   expect(w.argv.length).toBe(2)
 })
 
-test('in a herdr terminal outside tmux and rmux a member reports as in a pane (#137)', async ($, on) => {
+test('in a herdr terminal outside tmux and rmux a member reports as in a pane', async ($, on) => {
   const w = world(on, { HC_TERMINAL_ID: 't7' }, [OK])
   await $.turn.start({ text: 'go', turnId: 't1' })
   await $.turn.complete(end('t1'))
@@ -126,7 +126,7 @@ test('in a herdr terminal outside tmux and rmux a member reports as in a pane (#
 
 // A plain herdr terminal is refused `herdr`, a terminal that is not proven its member `tagged`: each is asked once.
 for (const [what, check] of [['a plain herdr terminal', 'herdr'], ['an unproven member', 'tagged']]) {
-  test(`${what} is asked once, then never again (#137)`, async ($, on) => {
+  test(`${what} is asked once, then never again`, async ($, on) => {
     const w = world(on, { HC_TERMINAL_ID: 't7' }, [ran(2, `{"ok":false,"verb":"report","code":2,"check":"${check}","message":"no"}`)])
     await $.turn.start({ text: 'go', turnId: 't1' })
     await w.until(1)

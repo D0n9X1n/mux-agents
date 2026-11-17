@@ -1,4 +1,4 @@
-//! Terminal text for the side bar and `list -Text` (#37): the color switches, the 16 named ANSI colors, display
+//! Terminal text for the side bar and `list -Text`: the color switches, the 16 named ANSI colors, display
 //! columns (from the `unicode-width` crate) and cutting to a width on whole clusters.
 
 use unicode_width::UnicodeWidthChar;

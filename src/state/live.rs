@@ -1,4 +1,4 @@
-//! The live-session registry (#103 report-2b K2): `<state root>/live/<kind>-<pid>-<start>.json` per client process,
+//! The live-session registry (report-2b K2): `<state root>/live/<kind>-<pid>-<start>.json` per client process,
 //! `{kind, pid, start, sessionId, seq, source, at}`, written under `live|<pid>-<start>`; the highest `seq` is the
 //! newest report. An entry whose pid and start name no live process is ignored, and `sweep` removes it.
 use std::path::PathBuf;
@@ -231,7 +231,7 @@ pub fn sweep(ctx: &Ctx) -> Res<usize> {
     Ok(removed)
 }
 
-/// (fix 2, re-audit #2) Test seam: runs inside `report`, right before it asks for the entry lock, so a race test can
+/// (fix 2, re-audit 2) Test seam: runs inside `report`, right before it asks for the entry lock, so a race test can
 /// mark the moment of the ask rather than the moment `report` was called.
 #[cfg(test)]
 pub(crate) mod hooks {
@@ -594,7 +594,7 @@ mod tests {
         assert!(!file(&ctx).exists());
     }
 
-    // r2b call 27 (QA #143): where starts are boot-relative (Linux), an entry records its boot, and an entry from
+    // r2b call 27 (QA): where starts are boot-relative (Linux), an entry records its boot, and an entry from
     // another boot is dead to `entry` and `sweep` even when the table lists the same pid with the same start. An
     // unreadable boot decides nothing (Unknown, kept). Absolute starts (macOS, Windows) record no boot.
     #[test]
@@ -651,7 +651,7 @@ mod tests {
         );
     }
 
-    // r2b call 29 (QA #143 re-review): where starts are boot-relative, a report under an unreadable boot refuses and
+    // r2b call 29 (QA re-review): where starts are boot-relative, a report under an unreadable boot refuses and
     // writes nothing, so the entry keeps its boot; an entry is usable only when its boot is known to be this boot.
     #[test]
     fn an_unreadable_boot_or_an_entry_without_one_is_never_usable() {
@@ -702,7 +702,7 @@ mod tests {
         assert!(file(&ctx).exists());
     }
 
-    // (fix 2, re-audit #2) Contention proved from inside `report`: `hooks::before_report_lock` (`-8.md` Step 3) marks
+    // (fix 2, re-audit 2) Contention proved from inside `report`: `hooks::before_report_lock` (`-8.md` Step 3) marks
     // the moment the writer asks for 150's lock. The sweeper holds that lock until the ask and 400 ms more. The writer
     // must ask while it is held and take it after the release and within 250 ms of it: a writer that reached the lock
     // call only after the release cannot.

@@ -1,4 +1,4 @@
-//! restore-6c Tasks 5-6 (#103): `stop X -Generation` ends a member's open generations and nothing else; `drop X`.
+//! restore-6c Tasks 5-6: `stop X -Generation` ends a member's open generations and nothing else; `drop X`.
 use super::core_fixture as cf;
 use super::core_launch::forward_tests as ft;
 use super::fixture::World;

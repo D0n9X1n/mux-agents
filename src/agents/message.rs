@@ -26,7 +26,7 @@ pub fn send(ctx: &Ctx, request: &Request) -> Res<Map<String, Value>> {
     send_as(ctx, &caller, request)
 }
 
-/// `send` for a resolved caller: the team path first (#103 4a), else 0.2.
+/// `send` for a resolved caller: the team path first (4a), else 0.2.
 pub fn send_as(
     ctx: &Ctx,
     caller: &crate::caller::Caller,
@@ -91,7 +91,7 @@ fn send_legacy(
         Some(me) => me?,
         None => self_of(caller, &snapshot)?,
     };
-    // Closing a view never stops an agent (#104): a member hc shows running is reachable by name with no live view;
+    // Closing a view never stops an agent: a member hc shows running is reachable by name with no live view;
     // its mailbox is its id and no pane is probed for it.
     // When hc cannot be read, that is the answer, never a false "no live agent".
     // A pane found by name is an hc member's only while it is the current member of that name (committed, not
@@ -152,7 +152,7 @@ fn send_legacy(
             live_pane(ctx, caller, &pane)?;
             let key = registry::mailbox_of(&snapshot, &pane, super::mail::elsewhere(caller))?;
             // The recipient's Claude Code session, when it is one: a running Claude agent's own, or (to `parent`) the session
-            // its spawner recorded. The sender's hooks wake it with it (#92).
+            // its spawner recorded. The sender's hooks wake it with it.
             let claude = |record: &Value, field: &str| {
                 let id = record.get(field).and_then(Value::as_str)?;
                 crate::checks::session_id(id).then(|| id.to_string())
@@ -176,7 +176,7 @@ fn send_legacy(
         }
     };
     let deliver = || {
-        // A member's line names the member it came from (#103 review: a team bar counts it by identity).
+        // A member's line names the member it came from (review: a team bar counts it by identity).
         let id = match &me.record {
             Some(_) => super::mail::add_member_mail(
                 ctx,
@@ -797,7 +797,7 @@ pub fn capture_hc(
     capture_identity(ctx, caller, &id, expected, lines, standing, "read")
 }
 
-/// `capture_hc` for the bar (#103 B10): member `id` by id, never by name. The bar acts for the person: no standing.
+/// `capture_hc` for the bar (B10): member `id` by id, never by name. The bar acts for the person: no standing.
 pub fn capture_member(
     ctx: &Ctx,
     caller: &crate::caller::Caller,
@@ -894,7 +894,7 @@ pub fn peek(ctx: &Ctx, request: &Request) -> Res<Map<String, Value>> {
     Ok(reply)
 }
 
-/// The output hc keeps for member `id` (#103 B6), also after it ended: `hc read`, only of a terminal that is still the
+/// The output hc keeps for member `id` (B6), also after it ended: `hc read`, only of a terminal that is still the
 /// member's own (`Identity::matches`: its address, team, id and generation labels). None when it is blank, when no
 /// committed member has that id, when hc answers `not_found` (it no longer keeps the terminal), or when the terminal at
 /// that address is another identity's (an Unknown row): its output is never shown. Any other failure is an error.
@@ -938,7 +938,7 @@ pub fn kept_member(
 }
 
 /// Whether the terminal at `id`'s address is still `id`'s own: false when hc dropped it or it carries another
-/// identity's labels (#103 review); any other hc failure is an error.
+/// identity's labels (review); any other hc failure is an error.
 fn kept(core: &crate::hc::Core<'_>, id: &super::core_identity::Identity) -> Res<bool> {
     match core.get(&id.address) {
         Ok(t) => Ok(id.matches(&t)),
@@ -947,7 +947,7 @@ fn kept(core: &crate::hc::Core<'_>, id: &super::core_identity::Identity) -> Res<
     }
 }
 
-/// How long `stop` waits for the member's recorded client to exit (#137), and how often it looks.
+/// How long `stop` waits for the member's recorded client to exit, and how often it looks.
 const CLIENT_EXIT_BOUND: Duration = Duration::from_millis(8000);
 const CLIENT_EXIT_POLL: Duration = Duration::from_millis(250);
 
@@ -1020,7 +1020,7 @@ fn listed(os: &dyn crate::proc::Os, pid: u32, start: i64) -> bool {
 }
 
 /// `stop <name>`: kills the member's hc terminal under its locks, then, with every lock released, replies only once its
-/// recorded client has exited (#137), so a `resume` right after is not refused `session`. Past the bound it still
+/// recorded client has exited, so a `resume` right after is not refused `session`. Past the bound it still
 /// replies, with `clientExited: false`.
 pub fn stop_hc(ctx: &Ctx, request: &Request) -> Res<Map<String, Value>> {
     if request.switch("Generation") {
@@ -1224,7 +1224,7 @@ mod tests {
     use super::stop_hc as stop;
     use super::*;
 
-    // #137, on the real process table of each OS (macOS, Linux, Windows): a client that was killed and reaped is no
+    //, on the real process table of each OS (macOS, Linux, Windows): a client that was killed and reaped is no
     // longer listed, so `stop`'s wait ends. On Windows a handle another process holds keeps an exited process
     // openable, so only the table (as resume's session check reads it) shows it gone.
     #[test]
@@ -1451,7 +1451,7 @@ mod tests {
             NONE
         }
     }
-    /// The entries of a served batch's `text` (#103 4b-i): each from its `[mux-agent from ` header, without its LF.
+    /// The entries of a served batch's `text` (4b-i): each from its `[mux-agent from ` header, without its LF.
     fn entries(reply: &Map<String, Value>) -> Vec<String> {
         let text = reply["text"].as_str().unwrap_or_default();
         text.split("[mux-agent from ")
@@ -1522,7 +1522,7 @@ mod tests {
                 if args[0] == "focus" {
                     cf::online(&w);
                 }
-                // send also asks hc for a running member with no view by that name (#104 phase 1c).
+                // send also asks hc for a running member with no view by that name (phase 1c).
                 if args[0] == "send" {
                     cf::online(&w);
                     cf::listing(&w, &crate::agents::membership::team(&w.caller()), &[]);
@@ -1537,7 +1537,7 @@ mod tests {
                     if args[0] == "focus" || args[0] == "stop" || args[0] == "read" {
                         vec!["display-message"]
                     } else if args[0] == "send" {
-                        // The pane snapshot misses, then the hc member lookup takes its own (#104 phase 1c).
+                        // The pane snapshot misses, then the hc member lookup takes its own (phase 1c).
                         vec![
                             "display-message",
                             "display-message",
@@ -1867,7 +1867,7 @@ mod tests {
         w
     }
 
-    // #104 phase 1c: closing a view never stops an agent, so a running member with no view is still reachable by
+    // phase 1c: closing a view never stops an agent, so a running member with no view is still reachable by
     // name; its mailbox is its id and no pane is probed for it.
     #[test]
     fn send_reaches_a_running_member_with_no_view() {
@@ -2048,7 +2048,7 @@ mod tests {
         }
     }
 
-    // #104 phase 1c review: the fallback delivers only to the one committed, unnoticed member of that name that hc
+    // phase 1c review: the fallback delivers only to the one committed, unnoticed member of that name that hc
     // shows running; an ended, uncommitted or noticed one, or a name two members share (even when hc cannot read
     // one of them), refuses and leaves every mailbox empty.
     #[test]
@@ -2635,7 +2635,7 @@ mod tests {
 
     #[test]
     fn send_names_the_sender_and_a_claude_recipients_session() {
-        // #92: the reply names who sent it and, for a Claude Code recipient, its session, so the sender's hooks can
+        // the reply names who sent it and, for a Claude Code recipient, its session, so the sender's hooks can
         // wake it (herdr delivers a message as the recipient's next input); the mailbox stays the message itself.
         const CHILD: &str = "11111111-2222-4333-8444-555555555555";
         const ROOT: &str = "66666666-7777-4888-8999-aaaaaaaaaaaa";
@@ -2739,7 +2739,7 @@ mod tests {
         assert_eq!(waiting_names(&w), Vec::<String>::new());
     }
 
-    // ---- #48: agents found by their pane and exact launch, never by their tags
+    // ---- agents found by their pane and exact launch, never by their tags
 
     // rmux rotated the window: the root %1 carries A's tag, A's pane %9 carries B's, B's pane %8 none. The caller is
     // `pane` (tagged `tag`); every pane answers live in session $3.
@@ -2818,7 +2818,7 @@ mod tests {
         cf::listing(&w, a["team"].as_str().unwrap(), &[]);
         cf::get(&w, "taaaaaaaaaaaa", cf::wire(&a));
         cf::get(&w, "tbbbbbbbbbbbb", cf::wire(&b));
-        // A person's send to a member goes through the team (#103 4a): the reply names A by id, not by pane.
+        // A person's send to a member goes through the team (4a): the reply names A by id, not by pane.
         let sent = run(&w, send, &["send", "a", "-Body", "hi"]);
         assert!(sent.starts_with(r#"ok {"to":"a","id":""#), "{sent}");
         assert!(
@@ -2847,7 +2847,7 @@ mod tests {
         assert!(pane_kills(&w).is_empty());
         w.fakes.hc_done().unwrap();
 
-        // #48 test 2: then B, tagless, is still addressable, and its own pane is B.
+        // test 2: then B, tagless, is still addressable, and its own pane is B.
         w.panes(&["%1|@1|100|aaaaaaaaaaaa|a", "%8|@5|301||", "%2|@1|102||"]);
         let mut killed = cf::wire(&r);
         killed["state"] = json!("finished");
@@ -2869,7 +2869,7 @@ mod tests {
         let s = registry::Snapshot::take(&w.ctx, &caller).unwrap();
         assert!(matches!(s.own(&caller), registry::Own::Agent(ref p) if p.id == "bbbbbbbbbbbb"));
         // B's parent %1 carries A's tag: its mailbox is still pane-1. B is a member, so its send goes through the
-        // team (#103 4a): one hc look proves it, and `parent` falls back to its parentPane.
+        // team (4a): one hc look proves it, and `parent` falls back to its parentPane.
         let mut killed = cf::wire(&r);
         killed["state"] = json!("finished");
         killed["reason"] = json!("killed");
@@ -3050,7 +3050,7 @@ mod tests {
             for round in 0..2 {
                 poll(&w, std::slice::from_ref(&t));
                 w.fakes.clear_log();
-                // Nothing is consumed without an ack (#103 4b-i): round 1 acks the batch of round 0.
+                // Nothing is consumed without an ack (4b-i): round 1 acks the batch of round 0.
                 let ack = acked.take();
                 let args: Vec<&str> = match &ack {
                     Some(b) => vec!["read", "-Deliver", "-Ack", b],
@@ -3230,7 +3230,7 @@ mod tests {
         assert_eq!(read_mail_of(&w, "pane-4"), ["done"]);
     }
 
-    // #103 review: a member's message names the member it came from, so a team bar counts it by identity, not by pane.
+    // review: a member's message names the member it came from, so a team bar counts it by identity, not by pane.
     #[test]
     fn a_members_message_names_its_member_id() {
         let w = agent_world();

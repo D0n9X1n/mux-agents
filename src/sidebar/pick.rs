@@ -85,7 +85,7 @@ pub fn step_live(walk: &[Target], from: Option<usize>, forward: bool) -> Option<
         .find(|&at| !walk[at].pane.is_empty())
 }
 
-/// The agent row a press on row `y` (1-based) hit, from the drawn frame's metadata (#103 B6): the answer of
+/// The agent row a press on row `y` (1-based) hit, from the drawn frame's metadata (B6): the answer of
 /// `display-message -p '#{pane_width}' ; capture-pane -p` must be at `width` (the frame's) and its line `y` must still show
 /// that row's text after column 0 (margin, `●` or selection). Header, doing, fold and note lines are in no `drawn`
 /// entry, so they hit nothing, whatever their text names.
@@ -239,7 +239,7 @@ impl Pick {
         self.chosen = None;
     }
 
-    /// Keys wrap at both ends: a team's bar, #103 B10.
+    /// Keys wrap at both ends: a team's bar, B10.
     pub fn set_wrap(&mut self, wrap: bool) {
         self.wrap = wrap;
     }
@@ -250,7 +250,7 @@ impl Pick {
         self.chosen = drawn.get(at).map(|t| (t.id.clone(), at));
     }
 
-    /// Opening `name` showed nothing (#103 B6).
+    /// Opening `name` showed nothing (B6).
     pub fn nothing(&mut self, name: &str) {
         self.note = Some((format!("nothing to open for {name}"), 0));
     }

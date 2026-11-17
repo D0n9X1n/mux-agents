@@ -901,7 +901,7 @@ mod tests {
         }
     }
 
-    // Call 46 (QA #142): `finish` acts on a visible release.json or released.json only after that file's flushes
+    // Call 46 (QA): `finish` acts on a visible release.json or released.json only after that file's flushes
     // succeed (`publish_once` on the body read). With gens/1's folder flush failing across two opens: no label, no
     // released.json, completing kept. Fault cleared: exactly one label (release.json) or none (released.json), and
     // completing cleared.
@@ -999,7 +999,7 @@ mod tests {
         assert!(gens::done(&m, 1).unwrap());
     }
 
-    // a3c call 47 (TL #149, production readiness): a release intent whose address or hcName is empty, missing or
+    // a3c call 47 (TL, production readiness): a release intent whose address or hcName is empty, missing or
     // malformed never owns a terminal, even one carrying the same name with matching labels, nor an address hc
     // answers `not_found` for. `finish` refuses `evidence` before any hc call: no relabel, no released.json, the
     // intent kept.

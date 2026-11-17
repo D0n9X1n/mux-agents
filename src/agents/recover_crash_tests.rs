@@ -1,4 +1,4 @@
-//! restore-6c Task 4 (#103): recovery replays its own crash files; a core loss after a fresh commit restores the
+//! restore-6c Task 4: recovery replays its own crash files; a core loss after a fresh commit restores the
 //! fresh conversation; repeated and concurrent recoveries launch one successor.
 use super::core_fixture as cf;
 use super::core_launch::crash;

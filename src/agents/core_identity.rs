@@ -48,7 +48,7 @@ pub fn attach_program(command: &str, address: &str, os: OsKind) -> Option<String
         return None;
     }
     let quotes: &[char] = if unix { &['"', '\''] } else { &['"'] };
-    // #150: rmux renders a start command of several arguments as its argv, encoded (`rmux_argv`). Exactly
+    // rmux renders a start command of several arguments as its argv, encoded (`rmux_argv`). Exactly
     // `<program> attach <address>` is read as the quoted bare form, so the program checks below apply unchanged; a
     // program holding a quote is not one.
     if command.contains('\u{1f}') {
@@ -61,7 +61,7 @@ pub fn attach_program(command: &str, address: &str, os: OsKind) -> Option<String
             _ => None,
         };
     }
-    // #150: rmux renders the whole argv in one pair of double quotes, `\` as `\\` and `"` as `\"` inside. Its inside,
+    // rmux renders the whole argv in one pair of double quotes, `\` as `\\` and `"` as `\"` inside. Its inside,
     // unescaped and holding no quote, is read as the bare form; any other backslash, or anything else, falls through
     // to the forms below, which refuse it.
     if let Some(inner) = command
@@ -481,7 +481,7 @@ pub(crate) mod tests {
     // program from `[A-Za-z0-9_./:+-]` (and `\` on Windows) not starting with `-`; a quoted one (platform quotes) adds
     // the space; the address one unquoted token from `[A-Za-z0-9_.:-]`, then the end. The program's file name is an hc
     // install name (`hc`, `herdr-core`), any path. Everything else is "not an attach".
-    // #150 live (rmux): rmux 0.10.0 renders `#{pane_start_command}` as the whole argv in one pair of double quotes,
+    // live (rmux): rmux 0.10.0 renders `#{pane_start_command}` as the whole argv in one pair of double quotes,
     // `\` written `\\` and `"` written `\"` inside (rmux-server lifecycle_state.rs `quote_single_shell_command`), where
     // tmux renders the argv bare. That one quoted token is an attach exactly when its inside, unescaped, holds no quote
     // and is the bare form. Any other backslash is not rmux's form; a space-holding program is not one (fail closed).
@@ -517,7 +517,7 @@ pub(crate) mod tests {
         }
     }
 
-    // #150 (CI integration-windows, f3c4c0a): rmux renders a start command of several arguments as each argument
+    // (CI integration-windows, f3c4c0a): rmux renders a start command of several arguments as each argument
     // percent-encoded (all but `[A-Za-z0-9-_./: =+]`, upper-case hex) and joined by 0x1F (rmux-server lifecycle_state.rs
     // `encode_command_field`). Windows spawns hc's attach as argv, so its view's start command is this form; read
     // nowhere, the bar's view was never proven and it left `view-closed`. Exactly three canonical parts are an attach.

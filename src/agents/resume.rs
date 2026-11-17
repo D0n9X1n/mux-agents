@@ -127,7 +127,7 @@ pub fn resume(ctx: &Ctx, request: &Request) -> Res<Map<String, Value>> {
 /// `createdAt`) of that name that no resume superseded. X must be proven ended, not taken, no leader, its session
 /// live nowhere (`occupancy::held`) and no member of its name running. Outside a team the session stays under its cap; in
 /// a team the caller's authority, the tree's limit, the parent's and the team's ceiling, the name and a member's budget
-/// are checked in that order, and the budget is only checked here: the launch spends it (#103 D5).
+/// are checked in that order, and the budget is only checked here: the launch spends it (D5).
 fn admit(
     ctx: &Ctx,
     caller: &crate::caller::Caller,
@@ -287,7 +287,7 @@ fn admit(
 }
 
 /// The client flags member `id`'s launch spec recorded; X never resumes with flags its spec does not name. The spec is
-/// read only inside the state root (`within_root`, #104): one reached through a link out of it names no flags.
+/// read only inside the state root (`within_root`): one reached through a link out of it names no flags.
 pub(crate) fn recorded_flags(state_root: &Path, key: &str, id: &str) -> Res<Vec<String>> {
     let spec = crate::caller::hc::within_root(state_root, &[key, "agents", id, "spec.json"]);
     spec.map(|p| read_json(&p))

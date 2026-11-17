@@ -1,4 +1,4 @@
-//! restore-6c Task 3 (#103): `resume X -Fresh` starts a new conversation on the same member.
+//! restore-6c Task 3: `resume X -Fresh` starts a new conversation on the same member.
 use super::core_launch::forward_tests as ft;
 use super::reconcile_restore_tests::{L, released_by_hc, unmanaged_claude};
 use super::reconcile_tests::{X, found, member, member_at, wire_of};

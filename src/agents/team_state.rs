@@ -1,4 +1,4 @@
-//! The one writer of `record.json` and `desired.json` (#103 state-0 S3), and of `view.json` (S4).
+//! The one writer of `record.json` and `desired.json` (state-0 S3), and of `view.json` (S4).
 use std::path::{Path, PathBuf};
 
 use serde_json::{Map, Value, json};

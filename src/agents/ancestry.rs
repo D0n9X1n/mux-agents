@@ -1,4 +1,4 @@
-//! The one walk from a process to the Claude or Copilot client above it (#103 report-2b K3; D1's caller walk).
+//! The one walk from a process to the Claude or Copilot client above it (report-2b K3; D1's caller walk).
 use crate::ctx::Ctx;
 use crate::parse::Client;
 use crate::proc::Row;
@@ -212,7 +212,7 @@ mod tests {
         assert_eq!(f.os_calls(), want);
     }
 
-    /// (fix 2, re-audit #1) The loader at 140: (start, path, recognized by `client_of`), or no row.
+    /// (fix 2, re-audit 1) The loader at 140: (start, path, recognized by `client_of`), or no row.
     type Loader = Option<(Option<i64>, Option<&'static str>, bool)>;
     /// One identity case: its name, the loader, the (pid, start) recorded (build checklist items 1 and 6).
     type Case = (&'static str, Loader, Option<(u32, i64)>);

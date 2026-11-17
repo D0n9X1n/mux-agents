@@ -30,9 +30,9 @@ async function teamMember($: EngineInterface): Promise<boolean> {
   return hcMember === true
 }
 
-// Terminal CLI only (#43), read fresh each time and never cached: the session draws on the terminal and nothing else
+// Terminal CLI only, read fresh each time and never cached: the session draws on the terminal and nothing else
 // ($.ui.open has no surface selector, so with a desktop, mobile or IDE client attached too the pane would show there as
-// an empty tab), it runs inside tmux or rmux, or in an hc terminal as a team member (#137; a plain herdr terminal stays
+// an empty tab), it runs inside tmux or rmux, or in an hc terminal as a team member (; a plain herdr terminal stays
 // without the pane), and it is not a cloud session. A refused read, or no surface at all (a headless or SDK run), is
 // not eligible. The surfaces, the reading most likely to change, are read last.
 async function eligible($: EngineInterface): Promise<boolean> {

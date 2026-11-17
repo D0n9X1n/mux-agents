@@ -1,4 +1,4 @@
-//! restore-6c P6 (#103): a stopped team is retired before `up` makes its successor (calls 12-14, 20-22, 25; D19).
+//! restore-6c P6: a stopped team is retired before `up` makes its successor (calls 12-14, 20-22, 25; D19).
 //! The marker `<key>/teams/<sha16(session)>.retired.json` binds the old scope; 6a's index is renamed under
 //! `<root>/up/retired/<T>.<digits of at>.<sha16(key:session)>.json`.
 

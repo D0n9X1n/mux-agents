@@ -101,7 +101,7 @@ jobs:
           echo "$out"
           if [ "$rc" != 1 ]; then echo "expected exit 1, got $rc"; exit 1; fi
           case $out in *'"check":"endpoint"'*) ;; *) echo 'expected check endpoint'; exit 1 ;; esac
-      # #93: on Windows Copilot runs each hook's portable command; run every one through the cmd shim to the release
+      # on Windows Copilot runs each hook's portable command; run every one through the cmd shim to the release
       # binary, which refuses outside a multiplexer: -Quiet must print nothing and exit 0.
       - name: Windows Copilot hook commands
         if: runner.os == 'Windows'
@@ -216,7 +216,7 @@ jobs:
       - name: Session registry on the real process table
         shell: bash
         run: cargo test --features live,test-panic --locked --test live_session -- --nocapture
-      # A multiplexer the run cannot find fails the suite instead of skipping its tests (#71); the preflight prints
+      # A multiplexer the run cannot find fails the suite instead of skipping its tests; the preflight prints
       # each one's version and binary.
       - name: Live preflight
         env:
@@ -230,8 +230,8 @@ jobs:
         run: |
           cargo test --features live,test-panic --locked --test fake_client_bg
           cargo test --features live,test-panic --locked --bin fake-client
-      # occupy-3: a fake client of a parallel live test is an unmanaged client of another state root and holds every
-      # conversation of its kind, so the tests that run `resume` (tests/serial_resume.txt) run alone. The runner
+      # occupy-3: a fake client of a parallel live test is an unmanaged client of another state root; one that resumes
+      # or reports a conversation holds it, so the tests that run `resume` (tests/serial_resume.txt) run alone. The runner
       # resolves each listed name to its full registered names (`e2e::<mux>::<name>`, call 24); its self-test (`check`)
       # proves, from libtest's own --list, that every listed test is in the serial pass and none in the parallel pass.
       - name: Live tests
@@ -254,10 +254,10 @@ jobs:
         run: npm install --global @anthropic-ai/claude-code@2.1.310
       - name: Upgrade tests
         run: sh tests/upgrade.sh
-  # The side bar's clicks and keys on Windows (#70), in a private rmux server. The release rmux 0.10.0 cannot start
-  # its daemon inside the runner's job object (rmux#238: "Access is denied"); its own CI runs a debug build with the
+  # The side bar's clicks and keys on Windows, in a private rmux server. The release rmux 0.10.0 cannot start
+  # its daemon inside the runner's job object (it fails with "Access is denied"); its own CI runs a debug build with the
   # debug-only RMUX_ALLOW_INTERNAL_DAEMON_IN_CALLER_JOB=1, and so does this job, from the v0.10.0 commit. Swap in the
-  # release zip, pinned by SHA-256, once a release fixes #238.
+  # release zip, pinned by SHA-256, once a release can start its daemon inside a job object.
   integration-windows:
     runs-on: windows-latest
     timeout-minutes: 30

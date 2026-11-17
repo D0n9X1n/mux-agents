@@ -127,7 +127,7 @@ pub fn add_mail(
 }
 
 /// `add_mail` from a member: the line also names the member it came from (`fromId`), so a team bar counts it by
-/// identity, whichever pane the member's view is on now (#103 review). `read` shows the same fields as before.
+/// identity, whichever pane the member's view is on now (review). `read` shows the same fields as before.
 pub fn add_member_mail(
     ctx: &Ctx,
     caller: &Caller,
@@ -231,7 +231,7 @@ fn append_message(
         if !out.is_empty() {
             append(&mailbox, out.as_bytes())?;
         }
-        // On every call, a duplicate hit included, so a retry finishes the flush of an earlier call (#103 M5).
+        // On every call, a duplicate hit included, so a retry finishes the flush of an earlier call (M5).
         if durable {
             crate::state::fs::sync_file(&mailbox)?;
             if let Some(folder) = mailbox.parent() {
@@ -245,7 +245,7 @@ fn append_message(
 }
 
 /// `message` (its own `id`) in the mailbox of `key` once, its file and folder flushed before this returns, on every
-/// call: a failed flush is an error and a retry repeats it (#103 M5).
+/// call: a failed flush is an error and a retry repeats it (M5).
 pub fn deliver_once(ctx: &Ctx, caller: &Caller, key: &str, message: &Value) -> Res<()> {
     let id = super::text(message.get("id"));
     append_message(ctx, caller, key, message, Some(&id), true).map(|_| ())
@@ -477,7 +477,7 @@ pub fn parse_mail(text: &str) -> Vec<Value> {
 }
 
 /// Every unread message of `key`'s mailbox in arrival order, as `{id, from, pane, at, text}`; the offset moves
-/// past them under the mailbox lock. Test only: a read consumes nothing without an ack (#103 4b-i).
+/// past them under the mailbox lock. Test only: a read consumes nothing without an ack (4b-i).
 #[cfg(test)]
 pub fn read_mail(ctx: &Ctx, caller: &Caller, key: &str) -> Res<Vec<Map<String, Value>>> {
     read_mail_if(ctx, caller, key, || true)
@@ -516,7 +516,7 @@ pub fn read_mail_if(
             for name in ["id", "from", "pane", "at"] {
                 out.insert(name.into(), field(name));
             }
-            // A team message (#103 4a) stores all three; a 0.2 message stores none and reads as before.
+            // A team message (4a) stores all three; a 0.2 message stores none and reads as before.
             for name in ["re", "hop", "cast"] {
                 if message.get(name).is_some() {
                     out.insert(name.into(), field(name));
@@ -577,7 +577,7 @@ pub fn unread_counts(ctx: &Ctx, caller: &Caller, key: &str) -> Res<HashMap<Strin
             super::text(message.get("pane"))
         );
         // A line naming its member (`fromId`) also counts as `#<id>`, and as `!<from>|<pane>` so a team row adds the
-        // lines without one by name and pane and never counts a line twice (#103 review).
+        // lines without one by name and pane and never counts a line twice (review).
         if let Some(id) = message
             .get("fromId")
             .and_then(Value::as_str)
@@ -1729,7 +1729,7 @@ mod tests {
             .iter()
             .map(|body| add_mail(&w.ctx, &caller, "pane-1", "worker", "%9", body, None).unwrap())
             .collect();
-        // The offset lives in the cursor (#103 4b-i); the probe reads it as the old offset file was read.
+        // The offset lives in the cursor (4b-i); the probe reads it as the old offset file was read.
         let seen = receipt::path(&mail, "pane-1");
         w.fakes.lock_probe(move |_| {
             crate::state::fs::read_json(&seen)

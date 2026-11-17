@@ -107,7 +107,7 @@ pub(crate) mod view_bind_tests;
 #[cfg(test)]
 mod view_hc_tests;
 
-/// Main's read: commit.json there and not aborted (#97).
+/// Main's read: commit.json there and not aborted.
 pub(crate) fn folder_committed(folder: &Path) -> bool {
     match crate::state::fs::read_json(&folder.join("commit.json")) {
         Ok(Some(commit)) => commit.get("aborted") != Some(&Value::Bool(true)),

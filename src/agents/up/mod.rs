@@ -1,4 +1,4 @@
-//! up: a person's verb that creates a folder's team (#103, 2a-iii).
+//! up: a person's verb that creates a folder's team (2a-iii).
 
 pub mod discover;
 #[cfg(test)]
@@ -50,7 +50,7 @@ pub fn up(ctx: &Ctx, request: &Request) -> Res<Map<String, Value>> {
     let classified = super::options::classify(client, &request.rest)?;
     // Windows accepts a relative MUX_AGENTS_STATE. `hold` and the launcher take only an absolute root, and `up` cannot
     // hand its later steps another root (they read ctx.state_root); a verb or bar run later would also resolve the same
-    // text against its own folder. So a relative root is refused before anything is made (#103).
+    // text against its own folder. So a relative root is refused before anything is made.
     if !ctx.state_root.is_absolute() {
         return refuse(1, "state", "the state folder path is not absolute");
     }
@@ -381,7 +381,7 @@ fn launch(
     })
 }
 
-/// E6.4: the team record at the anchor, create-only (#118 team::create).
+/// E6.4: the team record at the anchor, create-only (team::create).
 fn write_team(ctx: &Ctx, ix: &index::Index, record: &Value) -> Res<()> {
     let a = ix
         .anchor

@@ -1,4 +1,4 @@
-//! Readiness barriers for live tests (PM calls 12, 26) and the fake client's own guards (4to7re #10, #11).
+//! Readiness barriers for live tests (PM calls 12, 26) and the fake client's own guards (4to7re items 10, 11).
 //! `tests/live.rs` (Unix) and `tests/live_windows.rs` each include it; each reaches `support/bounded.rs` as
 //! `crate::bounded` (o2 call 14: one bounded runner).
 use serde_json::Value;
@@ -82,7 +82,7 @@ pub fn wait_member(member: &Path) -> Option<Value> {
     }
 }
 
-/// Conversation `sid` holds a whole record line, `<pid> start` or `<pid> resume` ending in a newline (final #7: the
+/// Conversation `sid` holds a whole record line, `<pid> start` or `<pid> resume` ending in a newline (final item 7: the
 /// fake creates the file before it writes the line).
 pub fn recorded(dir: &Path, sid: &str) -> bool {
     let text =
@@ -150,7 +150,7 @@ fn names(dir: &Path) -> Vec<String> {
     n
 }
 
-// 4to7re #10, PM call 27: claude's `--resume` of an unknown conversation exits 1 and publishes nothing. Bounded: a
+// 4to7re item 10, PM call 27: claude's `--resume` of an unknown conversation exits 1 and publishes nothing. Bounded: a
 // guard moved after publication leaves the fake running; it is killed at 10 s and the first assertion names it.
 #[test]
 fn the_fake_refuses_an_unknown_resume_before_publishing() {
@@ -168,7 +168,7 @@ fn the_fake_refuses_an_unknown_resume_before_publishing() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-// 4to7re #11: a root client with no selector starts CLAUDE_CODE_SESSION_ID's conversation (Live::agent's root).
+// 4to7re item 11: a root client with no selector starts CLAUDE_CODE_SESSION_ID's conversation (Live::agent's root).
 #[test]
 fn the_fake_root_starts_its_session_conversation() {
     let (dir, mut c) = fake_claude("root");
@@ -191,7 +191,7 @@ fn the_fake_root_starts_its_session_conversation() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-// final #7, PM call 26: a conversation counts only with a whole line; a created, unwritten file or a torn line does not.
+// final item 7, PM call 26: a conversation counts only with a whole line; a created, unwritten file or a torn line does not.
 #[test]
 fn a_conversation_is_recorded_only_by_a_whole_line() {
     let dir = fresh("ready-conv");

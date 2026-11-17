@@ -827,23 +827,23 @@ fn the_allowlist_explains_only_its_own_reviewed_statements() {
     assert_eq!(bad, ["src/a.rs: x"], "no reason");
 }
 
-// PM call 14 (1to3re #4, #5): an exempt file's module is declared exactly once across src/: `#[cfg(test)] mod x;` at
+// PM call 14 (1to3re items 4, 5): an exempt file's module is declared exactly once across src/: `#[cfg(test)] mod x;` at
 // its parent's file level, with no #[path], and no #[path] anywhere names the file. Comments and strings never count.
 #[test]
 fn each_exempt_file_is_declared_test_only() {
     assert!(!declares("// #[cfg(test)]\nmod x;\n", "x"), "a comment");
     assert!(
         !declares("#[cfg(test)] mod x;\n#[cfg(not(test))] mod x;\n", "x"),
-        "two declarations (1to3re #4)"
+        "two declarations (1to3re item 4)"
     );
     let doc = "#[cfg(test)]\n#[doc = r##\"#[path=\"x.rs\"]\"##]\n#[path = \"other.rs\"]\nmod x;\n";
     assert!(
         !declares(doc, "x"),
-        "a path behind a doc string (1to3re #5)"
+        "a path behind a doc string (1to3re item 5)"
     );
     assert!(
         !declares("#[cfg(test)] #[path = \"other.rs\"] mod x;\n", "x"),
-        "a path (1to3re #5)"
+        "a path (1to3re item 5)"
     );
     assert!(
         !declares("mod outer { use a; #[cfg(test)] mod x; }\n", "x"),
@@ -2605,7 +2605,7 @@ fn tracked_frontmatter_parses() {
     assert!(seen >= 1, "no frontmatter found; SKILL.md has one");
 }
 
-// Terminal CLI only (#43): the skill says where to skip it and forbids forcing it to apply; the README and both wiki
+// Terminal CLI only: the skill says where to skip it and forbids forcing it to apply; the README and both wiki
 // Usage pages state the rule and name the desktop app.
 #[test]
 fn skill_readme_and_wiki_say_terminal_cli_only() {
@@ -2663,7 +2663,7 @@ fn skill_readme_and_wiki_say_terminal_cli_only() {
     }
 }
 
-// #137: in a herdr terminal the skill decides by one deterministic answer, `read -Count`, never by judgment: a team
+// in a herdr terminal the skill decides by one deterministic answer, `read -Count`, never by judgment: a team
 // member (`"member":true`) uses the skill; any other answer uses herdr's own skills.
 #[test]
 fn skill_decides_a_herdr_terminal_by_read_count() {
@@ -3347,7 +3347,7 @@ fn readme_notes_dist_pin() {
     );
 }
 
-/// The optional PowerShell entry shim (#103).
+/// The optional PowerShell entry shim.
 const POWERSHELL_ENTRY: &str = "scripts/mux-agent.ps1";
 /// The optional PowerShell shortcuts `cc` and `gg`, dot-sourced from a profile.
 const POWERSHELL_SHORTCUTS: &str = "scripts/shell/mux-agents.ps1";
@@ -3363,7 +3363,7 @@ fn no_powershell_needed() {
                 .any(|e| p.ends_with(e))
         })
         .collect();
-    // #103: the user asked for a PowerShell entry beside sh and cmd, and for PowerShell shortcuts beside the bash and
+    // the user asked for a PowerShell entry beside sh and cmd, and for PowerShell shortcuts beside the bash and
     // zsh ones. The binary and hooks still need none; these three files are an optional entry point, the optional
     // shortcuts and their tests, and nothing else may be PowerShell.
     assert_eq!(
@@ -3570,7 +3570,7 @@ fn repo_front_page_and_community_files() {
     ] {
         assert!(files.iter().any(|f| f == path), "{path} is not tracked");
     }
-    // Release notes live only in GitHub releases (#57): no changelog, and the wiki states only what the repo is and
+    // Release notes live only in GitHub releases: no changelog, and the wiki states only what the repo is and
     // why, never one page per version.
     assert!(
         !files.iter().any(|f| f.eq_ignore_ascii_case("CHANGELOG.md")),
@@ -3859,7 +3859,7 @@ fn readme_upgrade_lifecycle() {
 
 #[test]
 fn usage_documents_side_bar_clicks() {
-    // One line of the Side bar section says how a click or a key focuses an agent (#61), and the Chinese twin's
+    // One line of the Side bar section says how a click or a key focuses an agent, and the Chinese twin's
     // section has a line with the same code spans.
     let en = section(&wiki_text("Usage"), "Side bar");
     let zh = section(&wiki_text("Usage-zh-CN"), "侧边栏");
@@ -3880,7 +3880,7 @@ fn usage_documents_side_bar_clicks() {
     );
 }
 
-// #137 (#103 B10): in a team's bar `n`/`N` select the next or previous agent with a live view and Enter opens it; the
+// (B10): in a team's bar `n`/`N` select the next or previous agent with a live view and Enter opens it; the
 // Chinese twin has a line with the same code spans.
 #[test]
 fn usage_says_a_teams_n_selects_and_enter_opens() {
@@ -3900,7 +3900,7 @@ fn usage_says_a_teams_n_selects_and_enter_opens() {
     );
 }
 
-// #137: a reopened view (`resume`, `focus` after its view closed, `sidebar` from a person pane) opens in the caller's
+// a reopened view (`resume`, `focus` after its view closed, `sidebar` from a person pane) opens in the caller's
 // window, with a bar beside it; the Chinese twin has a line with the same code spans.
 #[test]
 fn usage_says_reopened_views_open_in_the_callers_window() {
@@ -3924,7 +3924,7 @@ fn usage_says_reopened_views_open_in_the_callers_window() {
     );
 }
 
-// #71: the integration job installs rmux at a pinned version and requires all three multiplexers, so a missing
+// the integration job installs rmux at a pinned version and requires all three multiplexers, so a missing
 // one fails the live suite instead of skipping it.
 #[test]
 fn integration_runs_live_on_every_multiplexer() {
@@ -4205,5 +4205,79 @@ fn mailbox_writers_never_reread_the_owner() {
         code.matches("snapshot_owner(").count(),
         2,
         "the definition and the writer in read"
+    );
+}
+
+/// Each `#` followed by digits in `text` that reads as an issue or pull-request number: not part of a word, a path, a
+/// format (`{#`), a color or another `#`, and not followed by a letter, a digit or `#`.
+fn issue_refs(text: &str) -> Vec<String> {
+    let b = text.as_bytes();
+    let mut found = Vec::new();
+    for (i, _) in text.match_indices('#') {
+        if i > 0 && (b[i - 1].is_ascii_alphanumeric() || b"&/#{".contains(&b[i - 1])) {
+            continue;
+        }
+        let digits = b[i + 1..].iter().take_while(|c| c.is_ascii_digit()).count();
+        let next = b.get(i + 1 + digits).copied().unwrap_or(b' ');
+        // More than four digits is an id or a hash, never an issue number.
+        if digits == 0 || digits > 4 || next.is_ascii_alphanumeric() || next == b'#' {
+            continue;
+        }
+        found.push(text[i..i + 1 + digits].to_string());
+    }
+    found
+}
+
+#[test]
+fn issue_refs_finds_issue_numbers_only() {
+    assert_eq!(
+        issue_refs("fixed (#103), see #7 and #12:"),
+        ["#103", "#7", "#12"]
+    );
+    for none in [
+        "#1111111111111111",
+        "#1e1e1e",
+        "#[cfg(test)]",
+        "#{pane_id}",
+        "s#<n>#20#g",
+        "a#3",
+        "x/#4",
+        "&#38;",
+        "##5",
+    ] {
+        assert!(issue_refs(none).is_empty(), "{none}");
+    }
+}
+
+/// Code, tests, CI and the wiki never cite an issue or a pull request by number: the hosting platform can change and
+/// its numbers mean nothing outside it. A comment says why and how instead. The exemptions below are not citations.
+#[test]
+fn no_issue_or_pull_request_numbers() {
+    // Unicode annex names and a test's own sample data.
+    const NOT_CITATIONS: [&str; 2] = ["UAX #11", "feature/x #2"];
+    let mut hits = Vec::new();
+    for path in tracked() {
+        // Binary images; and this file, whose tests above spell the shapes they look for.
+        if path.starts_with("assets/") || path == "tests/repo.rs" {
+            continue;
+        }
+        let Ok(text) = std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join(&path))
+        else {
+            continue; // not UTF-8 text
+        };
+        for (n, line) in text.lines().enumerate() {
+            let mut line = line.to_string();
+            for ok in NOT_CITATIONS {
+                line = line.replace(ok, "");
+            }
+            for r in issue_refs(&line) {
+                hits.push(format!("{path}:{}: {r}", n + 1));
+            }
+        }
+    }
+    assert!(
+        hits.is_empty(),
+        "issue or pull-request numbers:\n{}",
+        hits.join("\n")
     );
 }

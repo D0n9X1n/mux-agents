@@ -237,7 +237,7 @@ fn hold_lock<T>(
     f()
 }
 
-/// The admission lock of `up` (#103): `<lock root>/<32 hex of sha256(key)>.lock`, a file lock on every OS, waited for
+/// The admission lock of `up`: `<lock root>/<32 hex of sha256(key)>.lock`, a file lock on every OS, waited for
 /// up to LOCK_WAIT then refused 2 `lock`, released on every exit, unwinding included. The root never comes from the env.
 pub fn admission<T>(ctx: &Ctx, key: &str, f: impl FnOnce() -> Res<T>) -> Res<T> {
     admission_in(ctx, &admission_root()?, key, LOCK_WAIT, f)

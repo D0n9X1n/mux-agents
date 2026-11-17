@@ -1621,7 +1621,7 @@ fn the_bars_view_marks_a_bad_member_and_never_refuses() {
     );
 }
 
-// Integration (#150 CI, live `list_all_json_shape`): the Stopped notice is posted from the presented record, as
+// Integration (CI, live `list_all_json_shape`): the Stopped notice is posted from the presented record, as
 // main's `stop_life` posted it, so its line carries the pane the member's own view.json presents: the `<from>|<pane>`
 // the board counts the stopped row's unread under. The raw record holds no pane (views-6f V1).
 #[test]

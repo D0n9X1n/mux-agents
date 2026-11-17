@@ -24,7 +24,7 @@ live = []
 [dependencies]
 serde_json = { version = "1.0.145", features = ["preserve_order"] }
 sha2 = "0.11"
-# Display columns for the side bar (#37); no dependencies of its own, not the CJK widths.
+# Display columns for the side bar; no dependencies of its own, not the CJK widths.
 unicode-width = { version = "=0.2.3", default-features = false }
 
 [target.'cfg(unix)'.dependencies]

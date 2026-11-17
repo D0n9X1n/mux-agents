@@ -6,7 +6,7 @@ mux-agents is a plugin for Claude Code and GitHub Copilot CLI. When the client r
 
 ## Status
 
-0.2.0 is one native Rust binary, `mux-agent`, on macOS, Linux and Windows, with rmux 0.10 or later on any of them or tmux 3.2 or later on macOS and Linux. It needs no PowerShell or .NET. It shows a side bar (#4): a multiplexer split for every client and a pane in Claude Code.
+0.2.0 is one native Rust binary, `mux-agent`, on macOS, Linux and Windows, with rmux 0.10 or later on any of them or tmux 3.2 or later on macOS and Linux. It needs no PowerShell or .NET. It shows a side bar: a multiplexer split for every client and a pane in Claude Code.
 
 The .NET named-mutex advisory [GHSA-2j93-m82w-73j2](https://github.com/advisories/GHSA-2j93-m82w-73j2), which affected the `lock` check of 0.1 on Linux and macOS, is fixed in 0.2.0: Unix locks are files under `~/.local/state/mux-agents/locks`, and Windows uses a named mutex `Local\MuxAgents-<hex>`.
 
@@ -19,4 +19,4 @@ The .NET named-mutex advisory [GHSA-2j93-m82w-73j2](https://github.com/advisorie
 - [Foundation](Design-Foundation) — v0.1.0 sub-project A: the rename to mux-agents, CI on Linux, macOS and Windows, and the tag-driven release; its Rust (0.2.0) section covers the binary, the locks and the `dist` branch
 - [Cross-platform](Design-Cross-Platform) — v0.1.0 sub-project B: tmux on Linux and macOS, rmux on Windows, with the same checks; its Rust (0.2.0) section adds rmux on every OS
 - [Side bar](Design-Side-Bar) — v0.1.0 sub-project C: the agent count and what each agent is doing, in a multiplexer split and in a Claude Code pane
-- [Runtime check](Design-Runtime-Check) — issue #25: on Linux and macOS, refuse a .NET affected by GHSA-2j93-m82w-73j2; 0.2.0 runs no .NET and drops the check
+- [Runtime check](Design-Runtime-Check) — on Linux and macOS, refuse a .NET affected by GHSA-2j93-m82w-73j2; 0.2.0 runs no .NET and drops the check

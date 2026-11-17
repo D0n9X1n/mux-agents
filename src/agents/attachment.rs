@@ -29,7 +29,7 @@ pub fn attach(
     if address.is_empty()
         || !super::agent_id(field("id")?)
         || !super::agent_name(field("name")?)
-        // A paneless caller (`up`'s leader, #103) may only open a window: a split needs a pane to split.
+        // A paneless caller (`up`'s leader) may only open a window: a split needs a pane to split.
         || !(super::pane_id(&caller.pane) || (caller.pane.is_empty() && split.is_none()))
     {
         return Err(Refusal::internal("invalid attachment identity"));
@@ -54,7 +54,7 @@ pub fn attach(
         args.extend(["-n", name]);
     }
     // A Unix pane gets the server's environment, not the caller's: the state root reaches the view as it does the
-    // bar (#103). Windows panes inherit it and get none.
+    // bar. Windows panes inherit it and get none.
     let env = super::spawn::pane_env(utf8(&ctx.state_root)?, crate::state::root::HOST);
     args.extend(env.iter().map(String::as_str));
     args.extend(["-c", directory, utf8(core.binary())?, "attach", address]);
@@ -106,7 +106,7 @@ fn decorate(ctx: &Ctx, caller: &Caller, record: &Value, view: &Created) -> Res<(
     };
     let context = format!("{}:{}", field("context")?, field("reason")?);
     let mut tags = vec![("@agent-id", field("id")?), ("@agent-name", field("name")?)];
-    // A leader's view has no parent pane, so no parent tag (#103).
+    // A leader's view has no parent pane, so no parent tag.
     if !caller.pane.is_empty() {
         tags.push(("@agent-parent", caller.pane.as_str()));
     }
@@ -248,7 +248,7 @@ mod tests {
     }
 
     /// A Unix pane gets the server's environment, not the caller's, so the view is given the state root as the bar is
-    /// (`-e MUX_AGENTS_STATE=<root>`, #103); a Windows pane inherits it and gets no `-e`.
+    /// (`-e MUX_AGENTS_STATE=<root>`); a Windows pane inherits it and gets no `-e`.
     #[test]
     fn the_view_carries_the_state_root_into_a_unix_pane() {
         let w = World::human("");

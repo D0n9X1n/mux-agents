@@ -1,4 +1,4 @@
-//! The one reader and the one create-once writer of generation evidence and markers (#103 state-0 S6).
+//! The one reader and the one create-once writer of generation evidence and markers (state-0 S6).
 use std::io;
 use std::path::Path;
 #[cfg(test)]

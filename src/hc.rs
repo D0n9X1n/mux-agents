@@ -177,7 +177,7 @@ impl Core<'_> {
     }
 
     /// `call` for `read` and `get`: hc's `not_found` (exit 3; observed with hc 0.1.21 on 2026-11-14) becomes the refusal check
-    /// `not_found`, so the bar tells a terminal hc dropped from a failure (#103 B6); every other failure, unreachable included,
+    /// `not_found`, so the bar tells a terminal hc dropped from a failure (B6); every other failure, unreachable included,
     /// stays `hc`.
     fn call_found(&self, args: &[String]) -> Res<Out> {
         let out = self.exec(args)?;

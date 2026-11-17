@@ -386,7 +386,7 @@ fn open_acts_by_life_never_restarts_and_always_answers() {
             0,
             None,
         ),
-        // #103 review: a Lost row with no view reattaches its recovery terminal when hc keeps it; a reattach that does not
+        // review: a Lost row with no view reattaches its recovery terminal when hc keeps it; a reattach that does not
         // take shows its retained output; hc dropping it is nothing to open; hc unreachable is a failure.
         (
             "lost kept",
@@ -544,7 +544,7 @@ fn open_acts_by_life_never_restarts_and_always_answers() {
             0,
             Some("focus failed: worker"),
         ),
-        // #103 review: an Unknown row whose terminal is labelled for another identity shows nothing of it.
+        // review: an Unknown row whose terminal is labelled for another identity shows nothing of it.
         (
             "unknown mislabeled",
             "unknown",
@@ -602,7 +602,7 @@ fn open_acts_by_life_never_restarts_and_always_answers() {
                 ["get", "taaaaaaaaaaaa", "--json"],
                 ["read", "taaaaaaaaaaaa", "--lines", "200"],
             );
-            // Every hc look first checks that the terminal is still the member's own (`hc get`, #103 review).
+            // Every hc look first checks that the terminal is still the member's own (`hc get`, review).
             let own = || cf::wire(record.as_ref().unwrap());
             match kept {
                 "" => {}
@@ -793,7 +793,7 @@ fn p_previews_the_selected_id_and_changes_nothing() {
         let get = ["get", "tbbbbbbbbbbbb", "--json"];
         match kept {
             "" => {}
-            // hc checks the terminal is still B's own first (#103 review): `not_found` (exit 3) is nothing to show; hc
+            // hc checks the terminal is still B's own first (review): `not_found` (exit 3) is nothing to show; hc
             // unreachable (exit 5) is a failure; B's own terminal is then read.
             "dropped" => {
                 cf::online(&w);

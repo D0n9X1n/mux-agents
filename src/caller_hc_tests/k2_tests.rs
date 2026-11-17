@@ -125,7 +125,7 @@ fn a_member_without_its_multiplexer_runs_status_report_and_read() {
     }
 }
 
-// 4to6 #18: a server.json that is not a regular file is never opened: a folder, or (Unix) a FIFO, proves nothing at
+// 4to6 item 18: a server.json that is not a regular file is never opened: a folder, or (Unix) a FIFO, proves nothing at
 // once. The FIFO case frees a reader blocked in open after 5 s, so a regression fails instead of hanging the suite.
 #[test]
 fn a_server_json_of_the_wrong_type_proves_nothing_at_once() {
@@ -265,7 +265,7 @@ fn a_held_member_is_presented_by_its_pending_view() {
     assert_eq!(got.presentation, None, "server gone");
 }
 
-// 4to6 #1, PM call 10, ambiguity 10 (A3c Task 6): with its server gone, a member runs status, report and read and builds
+// 4to6 item 1, PM call 10, ambiguity 10 (A3c Task 6): with its server gone, a member runs status, report and read and builds
 // no multiplexer; focus and spawn are refused `views` in dispatch. (`list` runs: PM call 18, the next test.)
 #[test]
 fn a_member_whose_views_are_down_builds_no_multiplexer() {
@@ -380,7 +380,7 @@ fn a_member_whose_views_are_down_lists_every_member() {
     assert!(w.ctx.mux.borrow().is_none(), "no multiplexer built");
 }
 
-// PM call 9 (4to7re #1): the server is live at proof and gone, or restarted, by the first multiplexer call: `views`,
+// PM call 9 (4to7re item 1): the server is live at proof and gone, or restarted, by the first multiplexer call: `views`,
 // nothing built, never tmux on PATH.
 #[test]
 fn a_server_gone_after_proof_refuses_views_at_first_use() {

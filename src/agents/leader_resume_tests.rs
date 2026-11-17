@@ -1,4 +1,4 @@
-//! restore-6c Task 8 (#103): an Ended leader resumes as the next generation of its id (P4.3; calls 17-19, 25).
+//! restore-6c Task 8: an Ended leader resumes as the next generation of its id (P4.3; calls 17-19, 25).
 use super::core_fixture as cf;
 use super::core_launch::forward_tests as ft;
 use super::fixture::World;

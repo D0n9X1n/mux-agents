@@ -58,7 +58,7 @@ fn a_child_past_its_bound_is_killed_and_refused() {
     }
 }
 
-// o2 call 29 (QA #146 F3): the Unix twin of live_windows.rs's: a descendant keeps stdout open 8 s after the child
+// o2 call 29 (QA F3): the Unix twin of live_windows.rs's: a descendant keeps stdout open 8 s after the child
 // exits: refused `TimedOut` naming stdout, the read handle dropped; a normal child keeps its whole output.
 #[cfg(unix)]
 #[test]
@@ -456,7 +456,7 @@ exec claude --dangerously-skip-permissions
                 .collect()
         }
 
-        /// The bar's width by S1 (#59): `max(min, window * percent / 100)` of the width its window reads now, with
+        /// The bar's width by S1: `max(min, window * percent / 100)` of the width its window reads now, with
         /// the width options as the bar's pane reads them.
         fn bar_width(&self, bar: &str) -> String {
             let window: u32 = self.num(bar, "#{window_width}");
@@ -713,7 +713,7 @@ exec claude --dangerously-skip-permissions
             let mail = self.keyed().join("mail");
             let key = self.root_box();
             let len = std::fs::metadata(mail.join(format!("{key}.jsonl"))).map_or(0, |m| m.len());
-            // The cursor (#103 4b-i) holds the offset; before its first commit, a legacy offset may.
+            // The cursor (4b-i) holds the offset; before its first commit, a legacy offset may.
             let cursor = std::fs::read_to_string(mail.join(format!("{key}.cursor.json")))
                 .ok()
                 .and_then(|t| serde_json::from_str::<Value>(&t).ok())
@@ -877,7 +877,7 @@ exec claude --dangerously-skip-permissions
 
     /// Each message's body: the text after its `[mux-agent from ...]` header line.
     fn bodies(reply: &Value) -> Vec<String> {
-        // A served batch (#103 4b-i) is one `text`: each entry starts at its header and ends in LF.
+        // A served batch (4b-i) is one `text`: each entry starts at its header and ends in LF.
         s(&reply["text"])
             .split("[mux-agent from ")
             .skip(1)
@@ -1448,7 +1448,7 @@ exec claude --dangerously-skip-permissions
         let body = live.path("to-w1.txt");
         let (code, sent) = live.run(&["send", "w1", "-BodyFile", &body]);
         assert_eq!(code, 0, "{mux:?} {sent}");
-        // A send in a session with hc members takes the team path (#103 4a): it names its recipients, not a pane.
+        // A send in a session with hc members takes the team path (4a): it names its recipients, not a pane.
         assert_eq!(
             (&sent["to"], sent["id"].is_string(), &sent["recipients"]),
             (&json!("w1"), true, &json!([{"name": "w1", "id": w1["id"]}])),
@@ -1505,7 +1505,7 @@ exec claude --dangerously-skip-permissions
             .server
             .command(pid, &["send", "parent", "-BodyFile", "{dir}/reply.md"]);
         assert_eq!(code, 0, "{mux:?} {sent}");
-        // The team path (#103 4a): w1 has no running parent member, so `parent` is its parentPane, the root.
+        // The team path (4a): w1 has no running parent member, so `parent` is its parentPane, the root.
         assert_eq!(
             (&sent["to"], sent["id"].is_string(), &sent["recipients"]),
             (&json!("parent"), true, &json!([{"name": root, "id": null}])),
@@ -1526,7 +1526,7 @@ exec claude --dangerously-skip-permissions
         );
         let head = format!("[mux-agent from w1 ({}) #", s(&w1["pane"]));
         assert!(s(&read["text"]).starts_with(&head), "{mux:?} {read}");
-        // Nothing is consumed without an ack (#103 4b-i): the next read acks this batch and finds nothing new.
+        // Nothing is consumed without an ack (4b-i): the next read acks this batch and finds nothing new.
         let (_, again) = live.run(&["read", "-Deliver", "-Ack", s(&read["batch"])]);
         assert_eq!(again["ids"], json!([]), "{mux:?} {again}");
     }
@@ -1540,7 +1540,7 @@ exec claude --dangerously-skip-permissions
         // The bar's watch calls the multiplexer too; without it, only the reader can grow the count armed reads.
         live.close_bar();
         let mut got = Vec::new();
-        // Nothing is consumed without an ack (#103 4b-i): each reader acks the batch the one before it was served.
+        // Nothing is consumed without an ack (4b-i): each reader acks the batch the one before it was served.
         let mut acked: Option<String> = None;
         for w in &workers {
             let sid = s(&w["sessionId"]);
@@ -1618,7 +1618,7 @@ exec claude --dangerously-skip-permissions
         let (code, focused) = live.run(&["focus", "w2"]);
         assert_eq!(code, 0, "{mux:?} {focused}");
         assert_eq!(active(&live), s(&w2["pane"]), "{mux:?}");
-        // #90: with no client attached nobody is looking at an agent, so -Next goes to the most urgent: w1, which
+        // with no client attached nobody is looking at an agent, so -Next goes to the most urgent: w1, which
         // needs the person, ranks before w2; -Prev to the last.
         let pid = live.worker_pid(&w1);
         support::write_atomic(&live.dir.join(format!("cmd.{pid}")), "report\tblocked\n");
@@ -1681,7 +1681,7 @@ exec claude --dangerously-skip-permissions
             json!({"ok":true,"verb":"stop","name":w2["name"],"hcAddress":w2["hcAddress"],"life":"ended","stopped":true,"unresolved":[]})
         );
         assert_eq!(code, 0);
-        // Nothing is consumed without an ack (#103 4b-i): this read acks w1's batch, then waits for w2's.
+        // Nothing is consumed without an ack (4b-i): this read acks w1's batch, then waits for w2's.
         let (code, read) = live.run(&["read", "-Wait", "30", "-Ack", s(&reply["batch"])]);
         assert_eq!(
             (code, bodies(&read)),
@@ -1792,7 +1792,7 @@ exec claude --dangerously-skip-permissions
                 vec![format!("{} exited with code {code}.", s(&w["name"]))]
             )
         );
-        // Nothing is consumed without an ack (#103 4b-i): acking the notice's batch leaves nothing new.
+        // Nothing is consumed without an ack (4b-i): acking the notice's batch leaves nothing new.
         let (_, again) = live.run(&["read", "-Deliver", "-Ack", s(&read["batch"])]);
         assert_eq!(again["ids"], json!([]), "{again}");
         assert_eq!(exit_messages(live, w).len(), 1);
@@ -1999,7 +1999,7 @@ exec claude --dangerously-skip-permissions
         bar_clean(&live, &bar, &screen);
     }
 
-    // S2, #82, #83: the bar draws in color at its pane's size with nothing stray; an agent in `read -Wait` with no
+    // S2, the bar draws in color at its pane's size with nothing stray; an agent in `read -Wait` with no
     // report holds a live lease, so it shows `on call` (W6) until mail wakes it, then `working` again, and its waiting
     // file is gone. An agent whose
     // client reports `blocked` comes first under herdr's `Needs you` heading, the header counting it; its next report
@@ -2043,7 +2043,7 @@ exec claude --dangerously-skip-permissions
         });
         assert!(blocked, "{mux:?}: the bar shows:\n{screen}");
         assert!(screen.contains("! w2"), "{mux:?}:\n{screen}");
-        // #83: nobody looks at w2's pane, so the bar tells the session's clients once. tmux 3.8 keeps the command in
+        // nobody looks at w2's pane, so the bar tells the session's clients once. tmux 3.8 keeps the command in
         // its message log; tmux 3.2a shows that log only to a client and rmux keeps none, so theirs is the unit tests'
         // to prove.
         if mux == Mux::Tmux38 {
@@ -2198,7 +2198,7 @@ exec claude --dangerously-skip-permissions
             let args: Vec<&str> = args.iter().map(String::as_str).collect();
             let (code, spawned) = live.run_in(&lower, &args);
             assert_eq!(code, 0, "{mux:?} {spawned}");
-            // Its watch ended, the bar is no longer provable (#47): the spawn names no bar and opens no second one.
+            // Its watch ended, the bar is no longer provable: the spawn names no bar and opens no second one.
             assert_eq!(spawned["sidebar"], Value::Null, "{mux:?} {spawned}");
             assert!(
                 s(&spawned["sidebarError"]).starts_with(&format!(
@@ -2215,7 +2215,7 @@ exec claude --dangerously-skip-permissions
                     || live.num(pane, format),
                 )
                 .unwrap_or_else(|e| {
-                    // #97: the agent's own hc terminal, as the core sees it, so a missing view names its cause.
+                    // the agent's own hc terminal, as the core sees it, so a missing view names its cause.
                     let address = s(&spawned["hcAddress"]);
                     let mut core = String::new();
                     for args in [
@@ -2374,7 +2374,7 @@ hc {}:
     }
 
     // S1 test 5: a bar dragged to 55 columns at the right edge is left so (no move, no resize) until the window's
-    // width changes; resize-window -x 300 makes it 60 within one tick (#74: by default 20% of the window, at least
+    // width changes; resize-window -x 300 makes it 60 within one tick (by default 20% of the window, at least
     // 40).
     fn bar_drag_kept_until_the_window_resizes(mux: Mux) {
         let Some(mut live) = Live::human(mux) else {
@@ -2396,7 +2396,7 @@ hc {}:
         assert_eq!(live.bar_place(&bar), "1|1|1|60", "{mux:?}");
     }
 
-    // #59, #74: by default the bar is 20% of its window, at least 40 columns; a width option changed while it runs
+    // by default the bar is 20% of its window, at least 40 columns; a width option changed while it runs
     // (on the server, then the session, the window and the bar's own pane, each overriding the one before; another
     // pane's value never counts) sets its width within one tick, and a value that is no number is its default alone.
     fn bar_width_follows_its_options(mux: Mux) {
@@ -2535,7 +2535,7 @@ hc {}:
         rows
     }
 
-    // #47 test 2: the bar's pane respawned to anything (a shell naming the old pid and `watch`, or this binary
+    // test 2: the bar's pane respawned to anything (a shell naming the old pid and `watch`, or this binary
     // `watch` again) is a new process: not proven, not killed, not reused; -Close refuses and the pane stays.
     fn replaced_bar_is_never_closed(mux: Mux) {
         let Some(mut live) = Live::human(mux) else {
@@ -2571,7 +2571,7 @@ hc {}:
         }
     }
 
-    // #47 test 4: rmux 0.10.0's rotate-window leaves the bar's label on the user's pane. sidebar -Close still closes
+    // test 4: rmux 0.10.0's rotate-window leaves the bar's label on the user's pane. sidebar -Close still closes
     // the bar, proven by its process, and the user's pane lives on.
     fn close_after_rotate_spares_the_users_pane(mux: Mux) {
         let Some(mut live) = Live::human(mux) else {
@@ -2593,8 +2593,8 @@ hc {}:
         );
     }
 
-    // #47 test 8: a pane in another window of the session carrying the label without proof (a 0.2.1 bar) refuses
-    // -Close, which closes no bar: nothing is killed. #103: a label refuses only a bar of its own window, so sidebar
+    // test 8: a pane in another window of the session carrying the label without proof (a 0.2.1 bar) refuses
+    // -Close, which closes no bar: nothing is killed. a label refuses only a bar of its own window, so sidebar
     // and a spawn's bar open in their own windows.
     fn unproven_label_in_another_window_refuses(mux: Mux) {
         let Some(mut live) = Live::human(mux) else {
@@ -2806,7 +2806,7 @@ hc {}:
             .row(watch)
             .and_then(|row| row.start)
             .unwrap();
-        // #103: the record a watch reads is its window's.
+        // the record a watch reads is its window's.
         let window = live.field(&root, "#{window_id}");
         for stamp in [1, start] {
             let record = format!("{root} {watch} {stamp}");
@@ -2910,7 +2910,7 @@ hc {}:
         {
             // An ended row ends with its exitCode: null for a stop.
             let mut want_keys = ROW.to_vec();
-            // A live row then carries its activity (#82): no report yet, so working since nothing.
+            // A live row then carries its activity: no report yet, so working since nothing.
             if state == "running" {
                 want_keys.extend(["activity", "since", "changedAt"]);
                 assert_eq!(
@@ -3406,7 +3406,7 @@ hc {}:
         assert!(!live.state().exists(), "{mux:?}");
     }
 
-    // #103: each view's window keeps its own bar. The first spawn (a tab) opens one in its new window; a split
+    // each view's window keeps its own bar. The first spawn (a tab) opens one in its new window; a split
     // beside the caller opens one in the caller's window, and a later split there answers that same bar; a tab gets
     // its own. After sidebar -Close every bar is gone and a spawn opens none; sidebar opens one in the caller's window
     // again, and each view window gets its own back.
@@ -3548,7 +3548,7 @@ hc {}:
                 .all(|w| windows.iter().any(|b| b == w))
     }
 
-    // #103: spawns at once, each a tab, open one bar in each one's window; a spawn racing sidebar -Close never leaves
+    // spawns at once, each a tab, open one bar in each one's window; a spawn racing sidebar -Close never leaves
     // a bar once the close has returned, and a later spawn opens none.
     fn spawn_races_keep_one_bar_per_window(mux: Mux) {
         let Some(mut live) = Live::human(mux) else {
@@ -3603,7 +3603,7 @@ hc {}:
         assert!(live.bars().is_empty(), "{mux:?} {:?}", live.bars());
     }
 
-    // #103: three agents in three windows each show one bar, in its own window and proven by its window's record
+    // three agents in three windows each show one bar, in its own window and proven by its window's record
     // (its pane, its pane's process, that process `<exe> watch`); closing a view closes its bar and never stops the
     // agent.
     fn three_agents_in_three_windows_each_get_one_proven_bar(mux: Mux) {
@@ -3675,7 +3675,7 @@ hc {}:
         assert_eq!(live.bars().len(), 2, "{mux:?} {:?}", live.bars());
     }
 
-    // #103 QA: break-pane moves the window's last view to a new window. The old bar, before it leaves, gives that
+    // QA: break-pane moves the window's last view to a new window. The old bar, before it leaves, gives that
     // window its own bar; nothing else would (no other bar runs). Each of `bars` is `<pane>|<window>|<width>`.
     fn break_pane_of_the_last_view_gives_its_new_window_a_bar(mux: Mux) {
         let Some(mut live) = Live::human(mux) else {
@@ -3748,7 +3748,7 @@ hc {}:
         held.unlock().unwrap();
         drop(held);
         assert_eq!(live.tagged().len(), 2, "{mux:?}");
-        // #103: w3's own window gets its own bar; w1's stays.
+        // w3's own window gets its own bar; w1's stays.
         let w3 = live.spawn("w3", &["-Tab"]);
         let bar3 = s(&w3["sidebar"]);
         assert_ne!(bar3, bar.as_str(), "{mux:?} {w3}");
@@ -3849,7 +3849,7 @@ hc {}:
         let Some(mut live) = Live::human(mux) else {
             return;
         };
-        // Both beside the caller (#103): the window keeps w2's view, and so its bar, when w1's pane goes.
+        // Both beside the caller: the window keeps w2's view, and so its bar, when w1's pane goes.
         let w1 = live.spawn("w1", &["-Split", "h"]);
         let w2 = live.spawn("w2", &["-Split", "h"]);
         let bar = s(&w1["sidebar"]).to_string();
@@ -3898,11 +3898,11 @@ hc {}:
             .map(|i| i + 1)
     }
 
-    /// #61: with clicks on (no MUX_AGENTS_ASCII), `w1` and `w2` spawned and both drawn on the bar, its frames logged
+    /// with clicks on (no MUX_AGENTS_ASCII), `w1` and `w2` spawned and both drawn on the bar, its frames logged
     /// and the root pane active; answers the bar and w1's pane.
     fn two_rows(live: &mut Live) -> (String, String) {
         live.assert_not_ascii();
-        // Both beside the caller (#103): their window, the caller's, keeps the bar a client sees.
+        // Both beside the caller: their window, the caller's, keeps the bar a client sees.
         let w1 = live.spawn("w1", &["-Split", "h"]);
         let w2 = live.spawn("w2", &["-Split", "h"]);
         let bar = s(&w1["sidebar"]).to_string();
@@ -3920,7 +3920,7 @@ hc {}:
     }
 
     /// The panes of w1 and w2 in the order the bar draws them now, top first. The bar lists running agents in the
-    /// session's pane order (#103: `-Split h` from the root puts w2 between the root and w1), so a key that takes the
+    /// session's pane order (`-Split h` from the root puts w2 between the root and w1), so a key that takes the
     /// first drawn agent takes w2 here, not the first spawned.
     fn drawn_ends(live: &Live, bar: &str) -> (String, String) {
         let screen = live.call(&["capture-pane", "-p", "-t", bar]);
@@ -3953,7 +3953,7 @@ hc {}:
         );
     }
 
-    // #61: a left click on an agent's name line focuses that agent's pane, and the bar keeps redrawing after it.
+    // a left click on an agent's name line focuses that agent's pane, and the bar keeps redrawing after it.
     fn bar_click_focuses_an_agent(mux: Mux) {
         let Some(mut live) = Live::human(mux) else {
             return;
@@ -3966,7 +3966,7 @@ hc {}:
         live.wait_tick(&bar);
     }
 
-    // #61: `j` selects the first agent drawn and Enter focuses it.
+    // `j` selects the first agent drawn and Enter focuses it.
     fn bar_keys_focus_an_agent(mux: Mux) {
         let Some(mut live) = Live::human(mux) else {
             return;
@@ -3979,7 +3979,7 @@ hc {}:
         wait_focused(&live, &top, "j then Enter");
     }
 
-    // #90: `n` (herdr's next agent) from a pane that is no agent's goes to the bar's first agent, `N` to its last.
+    // `n` (herdr's next agent) from a pane that is no agent's goes to the bar's first agent, `N` to its last.
     fn bar_n_and_shift_n_step_through_agents(mux: Mux) {
         let Some(mut live) = Live::human(mux) else {
             return;
@@ -3996,7 +3996,7 @@ hc {}:
         live.call(&["send-keys", "-t", &bar, "-l", "N"]);
         wait_focused(&live, &bottom, "N from the root pane");
         // The documented binding: a run-shell (not below any pane) sends `n` to the bar the current window records
-        // (#103: a window option, read with -w). tmux's
+        // (a window option, read with -w). tmux's
         // run-shell knows its own server; the multiplexer's binary is named by the server under test.
         if mux != Mux::Rmux {
             live.call(&["select-pane", "-t", &root]);
@@ -4011,7 +4011,7 @@ hc {}:
         }
     }
 
-    // #61: a press read after the bar shrank, before it drew at its new size, may land on a row that moved: it is
+    // a press read after the bar shrank, before it drew at its new size, may land on a row that moved: it is
     // dropped and the bar redraws at once (well before its next tick, ~1.9 s away). Nothing is focused.
     fn bar_click_after_shrinking_does_nothing(mux: Mux) {
         let Some(mut live) = Live::human(mux) else {
@@ -4166,7 +4166,7 @@ hc {}:
         }
     }
 
-    // #61 through a real client: tmux 3.8 attached on a 120x40 terminal with `mouse on` hands a click on w1's name
+    // through a real client: tmux 3.8 attached on a 120x40 terminal with `mouse on` hands a click on w1's name
     // line to the bar, which focuses w1.
     fn bar_real_client_click_focuses(mux: Mux) {
         let Some(mut live) = Live::human(mux) else {
@@ -4191,7 +4191,7 @@ hc {}:
         drop(client);
     }
 
-    // #91 through a real client: `p` in the bar opens herdr's peek, a popup over the client paging the first agent's
+    // through a real client: `p` in the bar opens herdr's peek, a popup over the client paging the first agent's
     // last lines (tmux's display-popup needs a client); `q` closes it and the peek file is gone.
     fn bar_real_client_peek(mux: Mux) {
         let Some(mut live) = Live::human(mux) else {
@@ -4205,7 +4205,7 @@ hc {}:
         });
         live.wait_place(&bar, "the bar in place at the client's size");
         live.after_redraw(&bar);
-        // A default-shell that is no POSIX shell (QA #91): the popup runs /bin/sh itself.
+        // A default-shell that is no POSIX shell (QA): the popup runs /bin/sh itself.
         if std::path::Path::new("/bin/tcsh").exists() {
             live.call(&["set-option", "-g", "default-shell", "/bin/tcsh"]);
         }
@@ -4336,7 +4336,7 @@ hc {}:
         assert!(listed(&live, &p3), "{mux:?}");
     }
 
-    // #48 test 9: two split agents, then rotate-window (rmux leaves the @agent-* tags at their places; tmux moves them
+    // test 9: two split agents, then rotate-window (rmux leaves the @agent-* tags at their places; tmux moves them
     // with the panes). From a clean pane in another window, list, read, focus and send reach each agent by its own
     // pane; stop closes only that agent's pane; the other is still reachable and the user's pane lives on.
     fn rotated_window_reaches_each_agent_by_its_pane(mux: Mux) {
@@ -4638,7 +4638,7 @@ hc {}:
         assert_eq!(exit_messages(&live, &w).len(), 1);
     }
 
-    // proof-0b K2 live (4to6 #3, #4, #19): a team (up), its leader spawns w2 down the tree with a brief; both are
+    // proof-0b K2 live (4to6 items 3, 4, 19): a team (up), its leader spawns w2 down the tree with a brief; both are
     // proven from client.json (`spawn_by` waits for the leader's, `wait_proof` for each; PM call 26); with the
     // multiplexer server killed and no `up`, the leader sends (a file: agents pass free text only in files), w2 reads
     // and reports; focus is refused `views`; list and stop run with views down.
@@ -4720,7 +4720,7 @@ hc {}:
         assert_eq!(
             (code, &stop["life"]),
             (0, &json!("ended")),
-            "{mux:?}: stop needs no view (4to7re #15) {stop}"
+            "{mux:?}: stop needs no view (4to7re item 15) {stop}"
         );
     }
 
@@ -4777,7 +4777,7 @@ hc {}:
         );
     }
 
-    // A worker whose view is closed still reads its own mail (#104 phase 1c): the person sends to it after the view
+    // A worker whose view is closed still reads its own mail (phase 1c): the person sends to it after the view
     // pane is gone, and `read` run by the worker in its hc terminal, which has no TMUX or RMUX, returns that message.
     fn hc_worker_reads_after_its_view_closes(mux: Mux) {
         let Some(mut live) = Live::human(mux) else {
@@ -4802,7 +4802,7 @@ hc {}:
             (0, vec!["after the view closed".to_string()]),
             "{mux:?} {read}"
         );
-        // Nothing is consumed without an ack (#103 4b-i): the worker acks its batch, then finds nothing new.
+        // Nothing is consumed without an ack (4b-i): the worker acks its batch, then finds nothing new.
         let (code, again) = live
             .server
             .command(pid, &["read", "-Deliver", "-Ack", s(&read["batch"])]);
@@ -4907,8 +4907,8 @@ hc {}:
     }
 
     // options-6e live, unseeded: spawned with `-Model x`, its record written by `forward`; the first client is up and
-    // its conversation exists before the stop (4to6 #8); resumed: argv = the stored options, then `--resume <sid>`, no
-    // task; the successor keeps the conversation id (4to6 #11) and reloads it once (4to6 #7); a fresh hc name.
+    // its conversation exists before the stop (4to6 item 8); resumed: argv = the stored options, then `--resume <sid>`, no
+    // task; the successor keeps the conversation id (4to6 item 11) and reloads it once (4to6 item 7); a fresh hc name.
     fn a_stopped_member_resumes_with_its_stored_options_only(mux: Mux) {
         let Some(mut live) = Live::human(mux) else {
             return;
@@ -5045,7 +5045,7 @@ hc {}:
         let view = live.view_of(s(&y["id"]));
         let pane = s(&view["pane"]);
         assert_eq!(live.field(pane, "#{@agent-id}"), s(&y["id"]), "{mux:?}");
-        // The bar is beside Y: a live bar in the window of Y's view (#122, a bar per window).
+        // The bar is beside Y: a live bar in the window of Y's view (a bar per window).
         let bar = s(&resumed["sidebar"]).to_string();
         // `bars()` answers `<pane>|<window>|<width>`: the reply's pane is a labelled bar there, in Y's window.
         assert!(
@@ -5176,7 +5176,7 @@ hc {}:
         out
     }
     /// Whether text a client was sent after a checkpoint is grand's output popup: its pager footer and grand's marker,
-    /// both drawn after the checkpoint (#103 review: grand's own view, drawn before it, never counts).
+    /// both drawn after the checkpoint (review: grand's own view, drawn before it, never counts).
     fn popup_shows(after: &str, marker: &str) -> bool {
         after.contains("--peek:grand(qcloses)--") && after.contains(marker)
     }
@@ -5225,7 +5225,7 @@ hc {}:
             let (code, up) = live.run(&["up", "-Client", "claude"]);
             assert_eq!(code, 0, "{mux:?} {up}");
             let session = s(&up["session"]).to_string();
-            // V1: the leader's view is in view.json, never in its lifecycle record (a3b call 42, TL #145 F2).
+            // V1: the leader's view is in view.json, never in its lifecycle record (a3b call 42, TL F2).
             let lead = live.view_of(s(&up["leader"]["id"]));
             // Members pass a brief (phase 3: a member without one is refused `brief`); `spawn_by` sends -BriefFile and -Context brief.
             std::fs::write(live.dir.join("brief.md"), "brief").unwrap();
@@ -5377,7 +5377,7 @@ hc {}:
                 .find(|l| !l.trim().is_empty())
                 .expect("grand kept output")
                 .replace(" ", "");
-            // #103 review: grand's own view drew the marker, so the client switches away from grand to the leader's view,
+            // review: grand's own view drew the marker, so the client switches away from grand to the leader's view,
             // waits until it has redrawn and gone quiet, and takes a checkpoint: only what it is sent after it can show
             // the popup, and before the popup opens grand's marker must not be among it.
             let from = client.as_ref().map(|client| {
@@ -5968,8 +5968,9 @@ hc {}:
         }
     }
 
-    /// restore-6b spec live "Managed vs unmanaged" (moved from occupy-3). An unmanaged Claude on another conversation
-    /// holds the Claude restores (leader, A) and names its pid; an unmanaged Copilot holds B. Each quit frees its kind.
+    /// restore-6b spec live "Managed vs unmanaged" (moved from occupy-3). Clients this team did not start hold only the
+    /// conversations they are on: a Claude and a Copilot on unrelated conversations hold nothing; a Claude resumed into
+    /// A's conversation holds A and names its pid, a Copilot resumed into B's holds B, and each quit frees its member.
     #[test]
     fn restore_resume_is_held_by_an_unmanaged_client_until_it_quits() {
         for mux in Mux::ALL {
@@ -5978,25 +5979,60 @@ hc {}:
             };
             let ids = team_of_three(&mut live);
             lose_the_core(&mut live, &ids);
-            let mut strays = Vec::new();
-            for (client, sid) in [
+            let sid = |id: &str| {
+                s(&json_file(&live.agent_dir(id).join("record.json"))["sessionId"]).to_string()
+            };
+            let (a_sid, b_sid) = (sid(&ids[1]), sid(&ids[2]));
+            // Unrelated clients: another Claude Code and another Copilot session on this machine hold nothing.
+            for (client, other) in [
                 ("claude", "5e55fc2f-2032-48ef-a920-4af2a8e5af55"),
                 ("copilot", "6e66fc2f-2032-48ef-a920-4af2a8e5af56"),
             ] {
+                let pane = live.session_in(&format!("other-{client}"), &live.dir.join("work"));
+                live.server
+                    .send_keys_to(&pane, &format!("exec {client} --session-id {other}"));
+                live.server.client_by_session(other);
+            }
+            // Strays resumed into A's and B's conversations hold exactly those.
+            let mut strays = Vec::new();
+            for (client, on) in [("claude", &a_sid), ("copilot", &b_sid)] {
                 let pane = live.session_in(&format!("stray-{client}"), &live.dir.join("work"));
                 live.server
-                    .send_keys_to(&pane, &format!("exec {client} --session-id {sid}"));
-                strays.push(live.server.client_by_session(sid)["pid"].as_u64().unwrap());
+                    .send_keys_to(&pane, &format!("exec {client} --resume {on}"));
+                let pid = live.server.wait(&format!("stray {client} on {on}"), || {
+                    let log = std::fs::read_to_string(live.dir.join("clients.log")).ok()?;
+                    log.lines().rev().find_map(|p| {
+                        let r: Value = serde_json::from_str(
+                            &std::fs::read_to_string(
+                                live.dir.join(format!("client.{}.json", p.trim())),
+                            )
+                            .ok()?,
+                        )
+                        .ok()?;
+                        (r["argv"].as_array()?.iter().any(|a| a == on.as_str()))
+                            .then(|| p.trim().parse::<u64>().ok())?
+                    })
+                });
+                strays.push(pid);
             }
             let (code, up) = live.run(&["up", "-Client", "claude"]);
             assert_eq!(code, 0, "{mux:?} {up}");
-            assert_eq!(up["restored"], json!([]), "{mux:?}");
+            let restored: Vec<&str> = up["restored"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|e| s(&e["id"]))
+                .collect();
+            assert_eq!(
+                restored,
+                [ids[0].as_str()],
+                "{mux:?}: only the leader is free {up}"
+            );
             let held = up["held"].as_array().unwrap();
-            assert_eq!(held.len(), 3, "{mux:?} {up}");
+            assert_eq!(held.len(), 2, "{mux:?} {up}");
             for h in held {
                 assert_eq!(h["reason"], "occupied", "{mux:?} {h}");
-                let by_claude = h["id"] != json!(ids[2]);
-                let pid = strays[if by_claude { 0 } else { 1 }];
+                let pid = strays[if h["id"] == json!(ids[1]) { 0 } else { 1 }];
                 assert!(s(&h["holder"]).contains(&pid.to_string()), "{mux:?} {h}");
             }
             support::write_atomic(&live.dir.join(format!("quit.{}", strays[0])), "0");
@@ -6007,18 +6043,10 @@ hc {}:
                     .then_some(())
             });
             let (_, second) = live.run(&["up", "-Client", "claude"]);
-            let mut back: Vec<&str> = second["restored"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .map(|e| s(&e["id"]))
-                .collect();
-            back.sort();
-            let mut want = vec![ids[0].as_str(), ids[1].as_str()];
-            want.sort();
             assert_eq!(
-                back, want,
-                "{mux:?}: the restored leader client does not hold A (H2)"
+                second["restored"][0]["id"],
+                json!(ids[1]),
+                "{mux:?}: A is free once its stray quit {second}"
             );
             assert_eq!(
                 second["held"][0]["id"],
@@ -6205,7 +6233,7 @@ hc {}:
         ]
     );
 
-    // tmux 3.2a's display-popup has no -T (QA #91): peek works there too.
+    // tmux 3.2a's display-popup has no -T (QA): peek works there too.
     tests_on!(tmux32_peek, Tmux32, [bar_real_client_peek]);
     // break-pane is tmux's; rmux 0.10 is not known to have it.
     tests_on!(
@@ -6538,7 +6566,7 @@ hc {}:
         );
     }
 
-    // The ids a read served (#103 4b-i, `msg-plan-4b-i-3.md` F25).
+    // The ids a read served (4b-i, `msg-plan-4b-i-3.md` F25).
     fn ids_of(reply: &Value) -> Vec<String> {
         reply["ids"]
             .as_array()
@@ -6548,7 +6576,7 @@ hc {}:
             .collect()
     }
 
-    /// Team messaging end to end (#103 4a): leader > a > b, and team T2 in another session. A broadcast is one id
+    /// Team messaging end to end (4a): leader > a > b, and team T2 in another session. A broadcast is one id
     /// each; a reply is hop 1; another team is refused; `children` is only the leader's own; the 121st send of the
     /// hour refuses with `retryAt`.
     fn team_messaging_stays_in_the_team(mux: Mux) {
@@ -6845,7 +6873,7 @@ hc {}:
         drop(client);
     }
 
-    /// Receipts end to end (#103 4b-i): a sends b two messages; b's unacked batch is served again, then acked; a
+    /// Receipts end to end (4b-i): a sends b two messages; b's unacked batch is served again, then acked; a
     /// resumed b (another process, new id, the same mailbox) gets a rebuilt batch for unacked mail, which no other
     /// member can ack.
     fn an_unacked_batch_is_served_again_and_rebuilt_for_a_successor(mux: Mux) {
@@ -7643,7 +7671,7 @@ hc {}:
         let mux = live.mux();
         let (code, made) = live.spawn_by(leader, w);
         assert_eq!(code, 0, "{mux:?} {made}");
-        live.ready(&made); // #147: a member is stopped only after it reported ready
+        live.ready(&made); // a member is stopped only after it reported ready
         let (code, stopped) = live.by(leader, &["stop", w]);
         assert_eq!(code, 0, "{mux:?} {stopped}");
         support::write_atomic(&live.dir.join("resume-gone"), "");
@@ -7912,7 +7940,7 @@ fn unchanged_panes(all: &[String], commands: &[String]) -> Vec<String> {
         .collect()
 }
 
-// #150 (macOS CI 133755859846): a command pane redrew the harness's own line after the pane narrowed. It is left out
+// (macOS CI 133755859846): a command pane redrew the harness's own line after the pane narrowed. It is left out
 // of the screen comparison; every member pane (b, the peek target, among them) and every quiet shell stays in.
 #[test]
 fn only_the_harness_command_panes_leave_the_screen_comparison() {

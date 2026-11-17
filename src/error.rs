@@ -11,9 +11,9 @@ pub struct Refusal {
     pub check: &'static str,
     pub message: String,
     pub reason: Option<&'static str>,
-    /// A session `up` created and could not remove (#103): the reply names it as `leftoverSession`.
+    /// A session `up` created and could not remove: the reply names it as `leftoverSession`.
     pub leftover: Option<String>,
-    /// Reply fields beside `message` (#103 M6): `retryAt`, `id`, `delivered`. Merged by `cli::failure`.
+    /// Reply fields beside `message` (M6): `retryAt`, `id`, `delivered`. Merged by `cli::failure`.
     pub details: Box<Map<String, Value>>,
 }
 

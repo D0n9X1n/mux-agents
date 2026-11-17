@@ -1,4 +1,4 @@
-//! a3c call 47 (TL #149, HIGH): a view verb's prerequisite holds against the handler's own proof, not only dispatch's.
+//! a3c call 47 (TL, HIGH): a view verb's prerequisite holds against the handler's own proof, not only dispatch's.
 //! Dispatch proves the member with its server live; the server goes before the handler proves it again. The verb
 //! refuses `views` and launches nothing (no `hc run`).
 use super::k2_tests::kill_server;

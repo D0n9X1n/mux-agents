@@ -495,7 +495,7 @@ fn board_view_order_preserves_enumeration_without_promoting_tags() {
     }
 }
 
-// #104 phase 1c: a worker proven through its own hc terminal is that member, whichever pane shows it now: a closed
+// phase 1c: a worker proven through its own hc terminal is that member, whichever pane shows it now: a closed
 // or moved view, or a multiplexer that does not answer, never changes whose mailbox it reads.
 #[test]
 fn reader_takes_a_hc_proven_member_by_id_not_by_its_view() {
@@ -559,7 +559,7 @@ fn reader_takes_a_hc_proven_member_by_id_not_by_its_view() {
     }
 }
 
-// #104 phase 1c review: send, status and report take a proven member by id only while hc shows it running, its
+// phase 1c review: send, status and report take a proven member by id only while hc shows it running, its
 // record committed and with no end notice; read alone accepts a noticed member. Never another member's id.
 #[test]
 fn member_is_the_proven_id_only_while_running_and_unnoticed() {
@@ -1326,7 +1326,7 @@ fn admission_reserves_orphans_and_an_active_generation_keeps_its_slot() {
     }
 }
 
-// Call 61 (TL #144 F3, QA #144 F3): a done orphan (settle aborted or abandoned it, so it is no longer pending) whose
+// Call 61 (TL F3, QA F3): a done orphan (settle aborted or abandoned it, so it is no longer pending) whose
 // terminal hc still lists Running holds no name and no slot, in `take` and in `for_spawn`.
 #[test]
 fn a_done_orphan_hc_still_lists_holds_nothing() {

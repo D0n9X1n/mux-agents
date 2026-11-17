@@ -132,7 +132,7 @@ fn each_step_of_up_halts_with_only_its_files() {
 fn a_team_without_an_index_names_stop_and_up() {
     let w = ready();
     let f = agents(&w).join("cccccccccccc");
-    // Integration #150 CI: made private as the product makes it, the state root first; a folder left at the umask
+    // Integration CI: made private as the product makes it, the state root first; a folder left at the umask
     // (755) or with an inherited shared ACL is refused `state` before the index read under test.
     w.state();
     crate::agents::spawn::private_folder(&w.ctx, &f).unwrap();
@@ -176,7 +176,7 @@ fn a_second_up_reconciles_and_creates_nothing() {
         .to_string();
     ix.releases.push(left.clone());
     index::write(&w.ctx, &ix).unwrap();
-    // F10 (checklist #22): the listing names the first session, so `ensure` reuses it.
+    // F10 (checklist 22): the listing names the first session, so `ensure` reuses it.
     let name = first["name"].as_str().unwrap().to_string();
     w.fakes.mux_rule(
         "list-sessions",
@@ -190,7 +190,7 @@ fn a_second_up_reconciles_and_creates_nothing() {
     cf::online(&w); // up's own hc::connect (finding A13)
     cf::online(&w); // reconcile's hc::Lazy
     found(&w, &id, 0, &running_wire(&w, &agents(&w).join(&id), &id, 0));
-    cf::online(&w); // checklist #47 (N16): re-entry's hc::Lazy (Task 11)
+    cf::online(&w); // checklist 47 (N16): re-entry's hc::Lazy (Task 11)
     found(&w, &id, 0, &running_wire(&w, &agents(&w).join(&id), &id, 0));
     let again = claude(&w).unwrap();
     assert_eq!(

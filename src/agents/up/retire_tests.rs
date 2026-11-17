@@ -1,4 +1,4 @@
-//! restore-6c Task 10 (#103): a stopped team is retired and `up` starts a new one through 6a's E6 (P6; calls 12-14,
+//! restore-6c Task 10: a stopped team is retired and `up` starts a new one through 6a's E6 (P6; calls 12-14,
 //! 20-22, 25, 26, 33; D19, D20). After a retirement the World caller's session is retired, so `w.caller()` (which
 //! admits) answers `moved`: these fixtures take the old scope from `resolve_person`, before retiring.
 use super::index;

@@ -4,26 +4,26 @@
 # runs only through hc, and the tagged-pane list frames each row with a fresh per-call marker.
 # Placeholders: <marker> the 32-hex marker, <state> the state root, <cwd> the caller's cwd, <exe> the binary,
 # <id> the new agent's id, <hc> the resolved core binary, <buffer> a read's private buffer (mux-agents-<32 hex>).
-# `-e MUX_AGENTS_STATE=<state>` is the Unix pane environment of the sidebar and, since 0.3.0 (#103), the view.
+# `-e MUX_AGENTS_STATE=<state>` is the Unix pane environment of the sidebar and, since 0.3.0, the view.
 # :370 caller probe; :539 tagged-pane list; :1188 gone probe of agent %8 (committed, no notice, not listed).
 # 0.2.2: the tagged-pane list also reads #{pane_dead}, so reap can close a pane remain-on-exit kept.
-# 0.2.3 (#48): agents are found by their pane and the exact command it started, never by their tags. The pane list
+# 0.2.3: agents are found by their pane and the exact command it started, never by their tags. The pane list
 # reads every pane with #{pane_start_command}, every field framed by the marker; every action on an agent's pane is
 # one `if-shell -F` that holds only while the pane is still that launch.
-# 0.2.4 (#59): the side bar is `@mux-agents-sidebar-percent` (5) of its window, at least `@mux-agents-sidebar-min` (30)
+# 0.2.4: the side bar is `@mux-agents-sidebar-percent` (5) of its window, at least `@mux-agents-sidebar-min` (30)
 # columns, both read in the window probe and the layout; `\n` and `\r` stand for those LF and CR bytes.
-# 0.2.6 (#74): the default side bar is 20% of its window, at least 40 columns
-# 0.3.0 (#104): spawn tags, title and allow-set-title are separate bound calls; failed tagging kills hc once
+# 0.2.6: the default side bar is 20% of its window, at least 40 columns
+# 0.3.0: spawn tags, title and allow-set-title are separate bound calls; failed tagging kills hc once
 # (asserted separately), then cleans the guarded view. The original rmux refusal is preserved.
 
 [spawn -Client claude -Task hi]
 -N display-message -p -t %1 #{pid}|#{pane_pid}|#{session_id}|#{window_id}|#{@agent-id}
-# 0.2.3 (#48): the caller's pane carries no agent tag and is no agent record's pane
+# 0.2.3: the caller's pane carries no agent tag and is no agent record's pane
 -N list-panes -s -t $3 -F <marker>#{pane_id}<marker>#{window_id}<marker>#{pane_pid}<marker>#{pane_dead}<marker>#{pane_start_command}<marker>#{@agent-id}<marker>#{@agent-name}<marker>
 # 0.2.1: no -Split or -Tab, so the session's placement is read, before the spawn lock
 -N show-options -qv -t $3 @mux-agents-placement
 -N list-panes -s -t $3 -F <marker>#{pane_id}<marker>#{window_id}<marker>#{pane_pid}<marker>#{pane_dead}<marker>#{pane_start_command}<marker>#{@agent-id}<marker>#{@agent-name}<marker>
-# 0.3.0 (#103, views-6f call 5): the launch finds or makes its view under the member lock; it lists the session's panes first, so a pane already attaching the new terminal is adopted, never doubled
+# 0.3.0 (views-6f call 5): the launch finds or makes its view under the member lock; it lists the session's panes first, so a pane already attaching the new terminal is adopted, never doubled
 -N list-panes -s -t $3 -F <marker>#{pane_id}<marker>#{window_id}<marker>#{pane_pid}<marker>#{pane_dead}<marker>#{pane_start_command}<marker>#{@agent-id}<marker>#{@agent-name}<marker>
 -N new-window -d -P -F #{pane_id}|#{window_id}|#{pane_start_command} -t $3: -n hi -e MUX_AGENTS_STATE=<state> -c <cwd> <hc> attach t1
 -N if-shell -F -t %12 '#{==:#{pane_start_command},hc attach t1}' 'set-option -p -t %12 @agent-id <id> ; set-option -p -t %12 @agent-name hi ; set-option -p -t %12 @agent-parent %1 ; set-option -p -t %12 @agent-context brief:human'
@@ -31,32 +31,32 @@
 -N if-shell -F -t %12 '#{==:#{pane_start_command},hc attach t1}' 'set-option -p -t %12 allow-set-title off'
 -N display-message -p -t %12 '#{pane_id}|#{==:#{pane_start_command},hc attach t1}'
 # 0.2.1: committed and the spawn lock released, the side bar is found or opened under the sidebar lock
-# 0.3.0 (#103): the bar is its window's: the record is a window option of that window, the label is looked for in
+# 0.3.0: the bar is its window's: the record is a window option of that window, the label is looked for in
 # that window, and the split, its width probe and the record target the window; the lock stays the session's
 -N show-options -qv -t $3 @mux-agents-sidebar
-# 0.3.0 (#103 QA): under the lock, the view's window is marked as one that held a view
+# 0.3.0 (QA): under the lock, the view's window is marked as one that held a view
 -N set-option -w -t @7 @mux-agents-viewed 1
-# 0.2.3 (#47): no recorded bar, and no labelled pane anywhere in the session
-# 0.3.0 (#103): first, under the lock, the 0.2.x session record: proven, it moves to its bar's window; else
+# 0.2.3: no recorded bar, and no labelled pane anywhere in the session
+# 0.3.0: first, under the lock, the 0.2.x session record: proven, it moves to its bar's window; else
 # it refuses while the session holds a label, or is unset. Nothing recorded here: nothing moves
 -N show-options -qv -t $3 @mux-agents-sidebar-id
-# 0.3.0 (#103): spawn keeps the bar of the new view's window (@7, where new-window put the agent)
+# 0.3.0: spawn keeps the bar of the new view's window (@7, where new-window put the agent)
 -N show-options -wqv -t @7 @mux-agents-sidebar-id
 -N list-panes -t @7 -F #{pane_id}|#{&&:#{==:#{@agent-role},sidebar},#{==:#{pane_dead},0}}
-# 0.3.0 (#103 QA): before a split, the window's panes with the bar's mark; none here is ours
+# 0.3.0 (QA): before a split, the window's panes with the bar's mark; none here is ours
 -N list-panes -t @7 -F #{pane_pid}|#{pane_dead}|#{pane_id}|#{@mux-agents-bar}
 # 0.2.3 (S1): the window's width sizes the bar (0.2.4: max(30, width * 5 / 100)); a full-height split at the right edge
 -N display-message -p -t @7 #{window_width}|#{s/[|\n\r]/x/:@mux-agents-sidebar-min}|#{s/[|\n\r]/x/:@mux-agents-sidebar-percent}
 -N split-window -d -f -h -P -F #{pane_id}|#{window_id}|#{pane_pid} -t @7 -e MUX_AGENTS_STATE=<state> -l 40 <exe> watch
-# 0.3.0 (#103 QA): the new pane carries the bar's mark, its own pid, from its split on
+# 0.3.0 (QA): the new pane carries the bar's mark, its own pid, from its split on
 -N if-shell -F -t %13 #{==:#{pane_pid},113} 'set-option -p -t %13 @mux-agents-bar 113'
 -N if-shell -F -t %13 #{&&:#{==:#{pane_dead},0},#{==:#{pane_pid},113}} 'set-option -p -t %13 @agent-role sidebar'
 -N display-message -p -t %13 #{@agent-role}
-# 0.2.3 (#47): pid 113 is this binary `watch`, so the bar is recorded as <pane> <pid> <start>
+# 0.2.3: pid 113 is this binary `watch`, so the bar is recorded as <pane> <pid> <start>
 -N set-option -w -t @7 @mux-agents-sidebar-id '%13 113 1130'
 # rmux ignores -l, so the bar is sized again
 -N if-shell -F -t %13 #{&&:#{==:#{pane_dead},0},#{==:#{pane_pid},113}} 'resize-pane -t %13 -x 40'
-# 0.2.3 (#47): proven last, so a pane replaced during open is never reported as the bar
+# 0.2.3: proven last, so a pane replaced during open is never reported as the bar
 -N display-message -p -t %13 #{pane_id}|#{window_id}|#{pane_dead}|#{pane_pid}
 
 [spawn -Client copilot -Task hi -Split v -Name helper]
@@ -70,26 +70,26 @@
 -N if-shell -F -t %12 '#{==:#{pane_start_command},hc attach t1}' 'set-option -p -t %12 allow-set-title off'
 -N display-message -p -t %12 '#{pane_id}|#{==:#{pane_start_command},hc attach t1}'
 -N show-options -qv -t $3 @mux-agents-sidebar
-# 0.3.0 (#103 QA): under the lock, the view's window is marked as one that held a view
+# 0.3.0 (QA): under the lock, the view's window is marked as one that held a view
 -N set-option -w -t @7 @mux-agents-viewed 1
-# 0.2.3 (#47): no recorded bar, and no labelled pane anywhere in the session
+# 0.2.3: no recorded bar, and no labelled pane anywhere in the session
 -N show-options -qv -t $3 @mux-agents-sidebar-id
 -N show-options -wqv -t @7 @mux-agents-sidebar-id
 -N list-panes -t @7 -F #{pane_id}|#{&&:#{==:#{@agent-role},sidebar},#{==:#{pane_dead},0}}
-# 0.3.0 (#103 QA): before a split, the window's panes with the bar's mark; none here is ours
+# 0.3.0 (QA): before a split, the window's panes with the bar's mark; none here is ours
 -N list-panes -t @7 -F #{pane_pid}|#{pane_dead}|#{pane_id}|#{@mux-agents-bar}
 # 0.2.3 (S1): the window's width sizes the bar (0.2.4: max(30, width * 5 / 100)); a full-height split at the right edge
 -N display-message -p -t @7 #{window_width}|#{s/[|\n\r]/x/:@mux-agents-sidebar-min}|#{s/[|\n\r]/x/:@mux-agents-sidebar-percent}
 -N split-window -d -f -h -P -F #{pane_id}|#{window_id}|#{pane_pid} -t @7 -e MUX_AGENTS_STATE=<state> -l 40 <exe> watch
-# 0.3.0 (#103 QA): the new pane carries the bar's mark, its own pid, from its split on
+# 0.3.0 (QA): the new pane carries the bar's mark, its own pid, from its split on
 -N if-shell -F -t %13 #{==:#{pane_pid},113} 'set-option -p -t %13 @mux-agents-bar 113'
 -N if-shell -F -t %13 #{&&:#{==:#{pane_dead},0},#{==:#{pane_pid},113}} 'set-option -p -t %13 @agent-role sidebar'
 -N display-message -p -t %13 #{@agent-role}
-# 0.2.3 (#47): pid 113 is this binary `watch`, so the bar is recorded as <pane> <pid> <start>
+# 0.2.3: pid 113 is this binary `watch`, so the bar is recorded as <pane> <pid> <start>
 -N set-option -w -t @7 @mux-agents-sidebar-id '%13 113 1130'
 # rmux ignores -l, so the bar is sized again
 -N if-shell -F -t %13 #{&&:#{==:#{pane_dead},0},#{==:#{pane_pid},113}} 'resize-pane -t %13 -x 40'
-# 0.2.3 (#47): proven last, so a pane replaced during open is never reported as the bar
+# 0.2.3: proven last, so a pane replaced during open is never reported as the bar
 -N display-message -p -t %13 #{pane_id}|#{window_id}|#{pane_dead}|#{pane_pid}
 
 [spawn -Client claude -Task hi, placement h, side bar off]
@@ -117,7 +117,7 @@
 -N if-shell -F -t %12 '#{==:#{pane_start_command},hc attach t1}' 'set-option -p -t %12 @agent-id <id> ; set-option -p -t %12 @agent-name hi ; set-option -p -t %12 @agent-parent %1 ; set-option -p -t %12 @agent-context brief:human'
 -N if-shell -F -t %12 '#{==:#{pane_start_command},hc attach t1}' 'kill-pane -t %12'
 -N display-message -p -t %12 #{pane_id}|#{@agent-id}
-# 0.3.0 (#103 PM call 1): the view failed after the commit, so the spawn succeeds with viewError and its bar step runs
+# 0.3.0 (PM call 1): the view failed after the commit, so the spawn succeeds with viewError and its bar step runs
 -N show-options -qv -t $3 @mux-agents-sidebar
 -N set-option -w -t @1 @mux-agents-viewed 1
 -N show-options -qv -t $3 @mux-agents-sidebar-id
@@ -163,13 +163,13 @@
 # active in the active window, live and that attachment
 -N if-shell -F -t %9 '#{&&:#{==:#{pane_dead},0},#{==:#{pane_start_command},hc attach taaaaaaaaaaaa}}' 'select-window -t %9 ; select-pane -t %9'
 -N display-message -p -t %9 '#{pane_id}|#{window_active}|#{pane_active}|#{&&:#{==:#{pane_dead},0},#{==:#{pane_start_command},hc attach taaaaaaaaaaaa}}'
-# 0.3.0 (#103): then, under the sidebar lock, the bar of the focused view's window; here the session's bar is off
+# 0.3.0: then, under the sidebar lock, the bar of the focused view's window; here the session's bar is off
 -N show-options -qv -t $3 @mux-agents-sidebar
 
 [send worker -Body hi]
 -N display-message -p -t %1 #{pid}|#{pane_pid}|#{session_id}|#{window_id}|#{@agent-id}
 -N list-panes -s -t $3 -F <marker>#{pane_id}<marker>#{window_id}<marker>#{pane_pid}<marker>#{pane_dead}<marker>#{pane_start_command}<marker>#{@agent-id}<marker>#{@agent-name}<marker>
-# :1316; 0.2.3 (#48): a live pane of this session; the mailbox is the running agent's there, never a tag's
+# :1316; 0.2.3: a live pane of this session; the mailbox is the running agent's there, never a tag's
 -N display-message -p -t %9 #{pane_id}|#{session_id}
 
 [read]
@@ -188,64 +188,64 @@
 
 [status -BodyFile s.md, from a Claude agent]
 -N display-message -p -t %1 #{pid}|#{pane_pid}|#{session_id}|#{window_id}|#{@agent-id}
-# 0.2.3 (#48): the caller's pane is a running agent's own pane
+# 0.2.3: the caller's pane is a running agent's own pane
 -N list-panes -s -t $3 -F <marker>#{pane_id}<marker>#{window_id}<marker>#{pane_pid}<marker>#{pane_dead}<marker>#{pane_start_command}<marker>#{@agent-id}<marker>#{@agent-name}<marker>
 
 [report working, from a Claude agent]
 -N display-message -p -t %1 #{pid}|#{pane_pid}|#{session_id}|#{window_id}|#{@agent-id}
-# 0.3.0 (#82): as status, the caller's pane is a running agent's own pane
+# 0.3.0: as status, the caller's pane is a running agent's own pane
 -N list-panes -s -t $3 -F <marker>#{pane_id}<marker>#{window_id}<marker>#{pane_pid}<marker>#{pane_dead}<marker>#{pane_start_command}<marker>#{@agent-id}<marker>#{@agent-name}<marker>
 
 [sidebar]
 -N display-message -p -t %1 #{pid}|#{pane_pid}|#{session_id}|#{window_id}|#{@agent-id}
-# 0.2.3 (#48): the caller's pane carries no agent tag and is no agent record's pane
+# 0.2.3: the caller's pane carries no agent tag and is no agent record's pane
 -N list-panes -s -t $3 -F <marker>#{pane_id}<marker>#{window_id}<marker>#{pane_pid}<marker>#{pane_dead}<marker>#{pane_start_command}<marker>#{@agent-id}<marker>#{@agent-name}<marker>
 # 0.2.1: sidebar turns the bar back on for the session, inside the sidebar lock
 -N set-option -u -t $3 @mux-agents-sidebar
 # :1526
-# 0.2.3 (#47): no recorded bar, and no labelled pane anywhere in the session
+# 0.2.3: no recorded bar, and no labelled pane anywhere in the session
 -N show-options -qv -t $3 @mux-agents-sidebar-id
 -N show-options -wqv -t @1 @mux-agents-sidebar-id
 -N list-panes -t @1 -F #{pane_id}|#{&&:#{==:#{@agent-role},sidebar},#{==:#{pane_dead},0}}
-# 0.3.0 (#103 QA): before a split, the window's panes with the bar's mark; none here is ours
+# 0.3.0 (QA): before a split, the window's panes with the bar's mark; none here is ours
 -N list-panes -t @1 -F #{pane_pid}|#{pane_dead}|#{pane_id}|#{@mux-agents-bar}
 # 0.2.3 (S1): the window's width, then a full-height split at the right edge (:1578-1579)
 -N display-message -p -t @1 #{window_width}|#{s/[|\n\r]/x/:@mux-agents-sidebar-min}|#{s/[|\n\r]/x/:@mux-agents-sidebar-percent}
 -N split-window -d -f -h -P -F #{pane_id}|#{window_id}|#{pane_pid} -t @1 -e MUX_AGENTS_STATE=<state> -l 40 <exe> watch
-# 0.3.0 (#103 QA): the new pane carries the bar's mark, its own pid, from its split on
+# 0.3.0 (QA): the new pane carries the bar's mark, its own pid, from its split on
 -N if-shell -F -t %13 #{==:#{pane_pid},113} 'set-option -p -t %13 @mux-agents-bar 113'
 # :1584
 -N if-shell -F -t %13 #{&&:#{==:#{pane_dead},0},#{==:#{pane_pid},113}} 'set-option -p -t %13 @agent-role sidebar'
 -N display-message -p -t %13 #{@agent-role}
-# 0.2.3 (#47): pid 113 is this binary `watch`, so the bar is recorded as <pane> <pid> <start>
+# 0.2.3: pid 113 is this binary `watch`, so the bar is recorded as <pane> <pid> <start>
 -N set-option -w -t @1 @mux-agents-sidebar-id '%13 113 1130'
 -N if-shell -F -t %13 #{&&:#{==:#{pane_dead},0},#{==:#{pane_pid},113}} 'resize-pane -t %13 -x 40'
-# 0.2.3 (#47): proven last, so a pane replaced during open is never reported as the bar
+# 0.2.3: proven last, so a pane replaced during open is never reported as the bar
 -N display-message -p -t %13 #{pane_id}|#{window_id}|#{pane_dead}|#{pane_pid}
 
 [sidebar, -l refused]
 -N display-message -p -t %1 #{pid}|#{pane_pid}|#{session_id}|#{window_id}|#{@agent-id}
 -N list-panes -s -t $3 -F <marker>#{pane_id}<marker>#{window_id}<marker>#{pane_pid}<marker>#{pane_dead}<marker>#{pane_start_command}<marker>#{@agent-id}<marker>#{@agent-name}<marker>
 -N set-option -u -t $3 @mux-agents-sidebar
-# 0.2.3 (#47): no recorded bar, and no labelled pane anywhere in the session
+# 0.2.3: no recorded bar, and no labelled pane anywhere in the session
 -N show-options -qv -t $3 @mux-agents-sidebar-id
 -N show-options -wqv -t @1 @mux-agents-sidebar-id
 -N list-panes -t @1 -F #{pane_id}|#{&&:#{==:#{@agent-role},sidebar},#{==:#{pane_dead},0}}
-# 0.3.0 (#103 QA): before a split, the window's panes with the bar's mark; none here is ours
+# 0.3.0 (QA): before a split, the window's panes with the bar's mark; none here is ours
 -N list-panes -t @1 -F #{pane_pid}|#{pane_dead}|#{pane_id}|#{@mux-agents-bar}
 -N display-message -p -t @1 #{window_width}|#{s/[|\n\r]/x/:@mux-agents-sidebar-min}|#{s/[|\n\r]/x/:@mux-agents-sidebar-percent}
 -N split-window -d -f -h -P -F #{pane_id}|#{window_id}|#{pane_pid} -t @1 -e MUX_AGENTS_STATE=<state> -l 40 <exe> watch
 # :1580
 -N split-window -d -f -h -P -F #{pane_id}|#{window_id}|#{pane_pid} -t @1 -e MUX_AGENTS_STATE=<state> <exe> watch
-# 0.3.0 (#103 QA): the new pane carries the bar's mark, its own pid, from its split on
+# 0.3.0 (QA): the new pane carries the bar's mark, its own pid, from its split on
 -N if-shell -F -t %13 #{==:#{pane_pid},113} 'set-option -p -t %13 @mux-agents-bar 113'
 -N if-shell -F -t %13 #{&&:#{==:#{pane_dead},0},#{==:#{pane_pid},113}} 'set-option -p -t %13 @agent-role sidebar'
 -N display-message -p -t %13 #{@agent-role}
-# 0.2.3 (#47): pid 113 is this binary `watch`, so the bar is recorded as <pane> <pid> <start>
+# 0.2.3: pid 113 is this binary `watch`, so the bar is recorded as <pane> <pid> <start>
 -N set-option -w -t @1 @mux-agents-sidebar-id '%13 113 1130'
 # the multiplexer chose the width, so the resize sets it
 -N if-shell -F -t %13 #{&&:#{==:#{pane_dead},0},#{==:#{pane_pid},113}} 'resize-pane -t %13 -x 40'
-# 0.2.3 (#47): proven last, so a pane replaced during open is never reported as the bar
+# 0.2.3: proven last, so a pane replaced during open is never reported as the bar
 -N display-message -p -t %13 #{pane_id}|#{window_id}|#{pane_dead}|#{pane_pid}
 
 [sidebar -Close]
@@ -253,15 +253,15 @@
 -N list-panes -s -t $3 -F <marker>#{pane_id}<marker>#{window_id}<marker>#{pane_pid}<marker>#{pane_dead}<marker>#{pane_start_command}<marker>#{@agent-id}<marker>#{@agent-name}<marker>
 # 0.2.1: off first, inside the sidebar lock, so no spawn reopens the bar
 -N set-option -t $3 @mux-agents-sidebar off
-# 0.2.3 (#47): the recorded bar, proven by one read (alive, the recorded pid) and its process (alive, the same start,
+# 0.2.3: the recorded bar, proven by one read (alive, the recorded pid) and its process (alive, the same start,
 # still this binary `watch`); a label is never trusted
 -N show-options -qv -t $3 @mux-agents-sidebar-id
-# 0.3.0 (#103): every window's bar: the window ids only (a window list's option fields fall back to the session's
+# 0.3.0: every window's bar: the window ids only (a window list's option fields fall back to the session's
 # value), then each window's own record, proven, killed and cleared
 -N list-windows -t $3 -F #{window_id}
 -N show-options -wqv -t @1 @mux-agents-sidebar-id
 -N display-message -p -t %13 #{pane_id}|#{window_id}|#{pane_dead}|#{pane_pid}
-# :1555; 0.2.3 (#47): killed only while still alive with that pid, checked by the server in the same command; the
+# :1555; 0.2.3: killed only while still alive with that pid, checked by the server in the same command; the
 # pane is read again and must be gone, then the record is cleared
 -N if-shell -F -t %13 #{&&:#{==:#{pane_dead},0},#{==:#{pane_pid},113}} 'kill-pane -t %13'
 -N display-message -p -t %13 #{pane_id}|#{pane_pid}
@@ -269,15 +269,15 @@
 
 [watch, one frame]
 -N display-message -p -t %1 #{pid}|#{pane_pid}|#{session_id}|#{window_id}|#{@agent-id}
-# :1482; S2 (#37): the probe also reads the pane's size, so each frame is laid out at its actual width and height
+# :1482; S2: the probe also reads the pane's size, so each frame is laid out at its actual width and height
 -N display-message -p -t %1 #{pane_id}|#{@agent-role}|#{pane_width}|#{pane_height}
-# 0.2.3 (S1, #47): only the watch the record names, by its own pane and process, reads its window and repairs it;
+# 0.2.3 (S1): only the watch the record names, by its own pane and process, reads its window and repairs it;
 # the record is proven like any other: its pane runs this watch's pid, and the pid is this watch with that start
 -N show-options -wqv -t @1 @mux-agents-sidebar-id
 -N display-message -p -t %1 #{pane_id}|#{window_id}|#{pane_dead}|#{pane_pid}
-# 0.3.0 (#103 QA): a bar whose window has not held a view yet reads the window's viewed mark
+# 0.3.0 (QA): a bar whose window has not held a view yet reads the window's viewed mark
 -N show-options -wqv -t @1 @mux-agents-viewed
 -N list-panes -t %1 -F #{pane_id}|#{pane_active}|#{pane_at_right}|#{pane_at_top}|#{pane_at_bottom}|#{pane_width}|#{window_width}|#{pane_left}|#{pane_top}|#{window_zoomed_flag}|#{s/[|\n\r]/x/:@mux-agents-sidebar-min}|#{s/[|\n\r]/x/:@mux-agents-sidebar-percent}
 -N list-panes -s -t $3 -F <marker>#{pane_id}<marker>#{window_id}<marker>#{pane_pid}<marker>#{pane_dead}<marker>#{pane_start_command}<marker>#{@agent-id}<marker>#{@agent-name}<marker>
-# 0.3.0 (#82): which pane the session shows to an attached client, so a done agent the person looked at is marked seen
+# 0.3.0: which pane the session shows to an attached client, so a done agent the person looked at is marked seen
 -N display-message -p -t $3 #{pane_id}|#{session_attached}

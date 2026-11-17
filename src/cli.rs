@@ -417,7 +417,7 @@ fn failure(verb: Option<&str>, refusal: &Refusal) -> Map<String, Value> {
     reply
 }
 
-/// An unproven herdr terminal refuses: herdr runs and coordinates its own agents (#85).
+/// An unproven herdr terminal refuses: herdr runs and coordinates its own agents.
 pub(crate) const HERDR: &str =
     "this terminal is herdr's: use herdr's own skills (hc --skill), not mux-agents";
 
@@ -486,7 +486,7 @@ fn success(def: &VerbDef, data: Map<String, Value>) -> Map<String, Value> {
 /// the tokens (`wants_text`); an unknown verb has neither. A panic in the verb is 1 `internal`; unwinding has already
 /// released its locks.
 pub fn run<C: Borrow<Ctx>>(args: &[String], ctx: impl FnOnce() -> Res<C>) -> (u8, String) {
-    // `report -Quiet` (a client's hook, #93): nothing printed and success whatever happens, so no hook needs a shell
+    // `report -Quiet` (a client's hook): nothing printed and success whatever happens, so no hook needs a shell
     // to discard its output or its exit code.
     let outcome = answer(args, ctx);
     if quiet(args) {
@@ -962,7 +962,7 @@ mod tests {
 
     #[test]
     fn report_quiet_prints_nothing_and_succeeds_whatever_happens() {
-        // A hook's command (#93): Copilot reads a hook's output and exit code, so -Quiet answers neither.
+        // A hook's command: Copilot reads a hook's output and exit code, so -Quiet answers neither.
         let w = World::human("");
         assert_eq!(
             call(&w, &["report", "working", "-Quiet"]),
@@ -991,7 +991,7 @@ mod tests {
 
     #[test]
     fn every_verb_stands_down_in_a_herdr_terminal() {
-        // herdr-core gives every terminal it runs its address; there herdr's own skills drive agents (#85).
+        // herdr-core gives every terminal it runs its address; there herdr's own skills drive agents.
         for def in VERBS {
             let mut w = World::human("");
             w.ctx.env = crate::ctx::Env::from_pairs([("HC_TERMINAL_ID", "t7")]);
@@ -1375,7 +1375,7 @@ mod tests {
             [hc[0].0.to_str().unwrap(), "attach", "t1"]
         );
         assert!(!calls.iter().flatten().any(|t| t == "launcher"));
-        // The view gets the state root as the bar does (#103): exactly `-e MUX_AGENTS_STATE=<root>` on Unix, none on
+        // The view gets the state root as the bar does: exactly `-e MUX_AGENTS_STATE=<root>` on Unix, none on
         // Windows, whose panes inherit it.
         let env: Vec<&String> = create
             .iter()
@@ -2291,7 +2291,7 @@ fn mailbox_hc_dispatch_keeps_json_and_text_order() {
         ),
         (
             true,
-            // No read-specific text form yet (#103 4b-i): the generic renderer prints each field.
+            // No read-specific text form yet (4b-i): the generic renderer prints each field.
             "batch: {batch}\nexit-aaaaaaaaaaaa\ntext: [mux-agent from worker (%9) #exit-aaaaaaaaaaaa]\nworker exited with code 7.\n",
         ),
     ] {
@@ -2310,7 +2310,7 @@ fn mailbox_hc_dispatch_keeps_json_and_text_order() {
         if text {
             args.push("-Text".into());
         }
-        // A receipt's batch id is fresh (#103 4b-i): the expected reply names the one it served, nothing else varies.
+        // A receipt's batch id is fresh (4b-i): the expected reply names the one it served, nothing else varies.
         let got = run(&args, || Ok(&w.ctx));
         // A person reads its pane mailbox, `pane-1`.
         let receipt = crate::agents::receipt::load(&w.state().join("mail"), "pane-1").unwrap();

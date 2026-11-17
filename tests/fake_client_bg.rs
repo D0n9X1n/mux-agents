@@ -1,5 +1,5 @@
 #![cfg(feature = "live")]
-//! The fake client runs a background line beside its loop (live harness support, #103).
+//! The fake client runs a background line beside its loop (live harness support).
 use std::time::{Duration, Instant};
 
 #[path = "support/bounded.rs"]
@@ -100,7 +100,7 @@ fn a_resume_of_a_gone_conversation_exits_1_with_the_clients_message() {
     }
 }
 
-/// Starts the copy; a copy just written can be refused "text file busy" on Linux (#76): retried 20 ms apart.
+/// Starts the copy; a copy just written can be refused "text file busy" on Linux: retried 20 ms apart.
 fn start(exe: &std::path::Path, dir: &std::path::Path, id: &str) -> std::process::Child {
     for _ in 0..50 {
         let spawned = std::process::Command::new(exe)

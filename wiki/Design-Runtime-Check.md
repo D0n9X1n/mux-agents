@@ -4,7 +4,7 @@
 
 ## Purpose
 
-On Linux and macOS, .NET 8.0.0–8.0.31, 9.0.0–9.0.20, 10.0.0–10.0.12 and 11.0 previews through RC 1 let another local user erase or replace file contents, loosen folder permissions or gain higher privileges through named mutexes and shared memory ([GHSA-2j93-m82w-73j2](https://github.com/advisories/GHSA-2j93-m82w-73j2)). Every verb, `watch` and the launcher open a named mutex there (`Use-MuxAgentLock`). Issue #25: refuse such a runtime unless the user opts in by name.
+On Linux and macOS, .NET 8.0.0–8.0.31, 9.0.0–9.0.20, 10.0.0–10.0.12 and 11.0 previews through RC 1 let another local user erase or replace file contents, loosen folder permissions or gain higher privileges through named mutexes and shared memory ([GHSA-2j93-m82w-73j2](https://github.com/advisories/GHSA-2j93-m82w-73j2)). Every verb, `watch` and the launcher open a named mutex there (`Use-MuxAgentLock`). Issue refuse such a runtime unless the user opts in by name.
 
 ## Decisions (PM's calls under the goal "address all issues")
 

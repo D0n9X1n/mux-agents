@@ -227,7 +227,7 @@ fn hc_worker_commands_keep_mail_status_activity_and_spawn_fence() {
         w.file("body.txt", b"hello");
         proof(&w, &r);
         proof(&w, &r);
-        // Every command but spawn re-checks the proven member in hc before acting as it (#104 phase 1c).
+        // Every command but spawn re-checks the proven member in hc before acting as it (phase 1c).
         if args[0] != "spawn" {
             cf::online(&w);
             cf::listing(
@@ -353,11 +353,11 @@ pub(crate) fn link(target: &std::path::Path, at: &std::path::Path) -> std::io::R
     };
 }
 // Whatever its hc terminal's labels name, and wherever a link in the state root points, the worker proof opens no
-// file outside the canonical state root (#104 phase 1c).
+// file outside the canonical state root (phase 1c).
 #[test]
 fn hc_worker_proof_reads_nothing_outside_the_state_root() {
     // The seam sees the proof's reads: a proven worker opens its record, its commit and its server's file, then the
-    // member proof (D1, #103) its launcher.json and spec.json; the record is read once.
+    // member proof (D1) its launcher.json and spec.json; the record is read once.
     let (w, _, r, _) = worker();
     proof(&w, &r);
     let (got, reads) = crate::state::fs::record_reads(|| caller::resolve(&w.ctx));
@@ -627,7 +627,7 @@ fn a_candidate_is_refused_before_any_multiplexer() {
         w.fakes.hc_done().unwrap();
     }
 }
-/// hc names a terminal's foreground only once it has sampled the terminal (#103, CI on Linux): a member that acts in
+/// hc names a terminal's foreground only once it has sampled the terminal (CI on Linux): a member that acts in
 /// that first moment is read again, on the clock, rather than refused; it is proven once hc names its foreground.
 #[test]
 fn a_member_is_proven_once_hc_names_its_foreground() {
@@ -645,7 +645,7 @@ fn a_member_is_proven_once_hc_names_its_foreground() {
     );
     w.fakes.hc_done().unwrap();
 }
-/// The terminal hc names after sampling is checked as the first reading was (#103 D1): a later reading that has
+/// The terminal hc names after sampling is checked as the first reading was (D1): a later reading that has
 /// finished, or runs other argv, proves no member, whatever its foreground.
 #[test]
 fn a_sampled_terminal_is_checked_like_the_first() {

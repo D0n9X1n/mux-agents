@@ -1960,7 +1960,7 @@ mod tests {
         }
     }
 
-    // Call 60 (TL #144 F1, F2; QA #144 F1): a forgotten-kill replay acts only when settle finds no terminal of the
+    // Call 60 (TL F1, F2; QA F1): a forgotten-kill replay acts only when settle finds no terminal of the
     // generation and kill.json is this generation's valid attempt: its labels' mux.id and mux.gen, the launch's
     // hcName, and the address the record names for it. A foreign attempt, an evidence refusal (torn launch.json; a
     // torn claim beside a foreign attempt) or several live matches stay unresolved: no ended.json, pending kept, though
@@ -2028,7 +2028,7 @@ mod tests {
         }
     }
 
-    // Call 63 (QA #144 F2): every settle entry point binds the record's id to its member folder first. A's folder
+    // Call 63 (QA F2): every settle entry point binds the record's id to its member folder first. A's folder
     // holding B's record: `Tx::settle` and `terminate` refuse `evidence`, the fence skips it. Nothing is published
     // (no abandoned claim, no aborted commit, no terminating, kill or ended), the record is unchanged, hc is never asked
     // (no kill).
@@ -2149,7 +2149,7 @@ mod tests {
         std::fs::write(gens::path(m, n, "launch"), launch.to_string()).unwrap();
     }
 
-    // a3c call 47 (TL #149, production readiness): an empty, missing or malformed recorded hcName never matches a
+    // a3c call 47 (TL, production readiness): an empty, missing or malformed recorded hcName never matches a
     // terminal carrying the same name. `terminate` refuses `evidence`: no kill.json, no kill, no ended.json, pending kept.
     #[test]
     fn an_invalid_recorded_name_is_never_killed() {
@@ -2180,7 +2180,7 @@ mod tests {
         }
     }
 
-    // a3c call 47 (TL #149, production readiness): a forgotten-kill replay needs a valid recorded address, for active
+    // a3c call 47 (TL, production readiness): a forgotten-kill replay needs a valid recorded address, for active
     // and pending as for an orphan. A record address and a kill.json address both empty (or both malformed), or either
     // one alone empty, with hc answering `not_found` there, refuse `evidence`: no ended.json, the record (pending
     // included) unchanged.

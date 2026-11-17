@@ -87,7 +87,7 @@ pub fn spend(file: &Path, rate: &Rate, now: u64) -> Res<()> {
         file,
         &json!({"schema": 1, "tokens": tokens - 1, "at": at}),
     )?;
-    // write_json_durable flushed `dir`; `dir`'s own entry, and every folder made here, live in the parents (#103 D5:
+    // write_json_durable flushed `dir`; `dir`'s own entry, and every folder made here, live in the parents (D5:
     // the debit outlives a failed launch). A failed flush is an error, so nothing launches.
     for parent in dir
         .ancestors()

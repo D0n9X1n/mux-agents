@@ -1,7 +1,7 @@
 import { expect, mock, test } from 'claude-code/testing'
 
 // report-2b K3: Claude names its session from classic.SessionStart, the event that carries session_id (session.start
-// carries none). Only where a managed client can run (#139's inMux); never awaited.
+// carries none). Only where a managed client can run (inMux in hooks/activity.ts); never awaited.
 const SID = '0f11fc2f-2032-48ef-a920-4af2a8e5af50'
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
 const ran = { value: { exitCode: 0, stdout: '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
@@ -34,7 +34,7 @@ test('classic.SessionStart carries the session id the report needs', async ($, o
   expect(argv.slice(5)).toEqual(['-Source', 'startup', '-Quiet'])
 })
 
-// (fix 1, audit 5-9 #10) SessionStart returns while the report is held; only advancing the clock settles it.
+// (fix 1, audit 5-9 item 10) SessionStart returns while the report is held; only advancing the clock settles it.
 test('an hc terminal reports its session without SessionStart waiting for it', async ($, on) => {
   const { seen, clock } = world(on, { HC_TERMINAL_ID: 't1' }, 60000)
   await ($ as any).classic.SessionStart({ source: 'resume', session_id: SID })
@@ -53,7 +53,7 @@ test('on Windows_NT the session report runs cmd.exe /d /c <root>\\scripts\\mux-a
   expect(seen.argv).toEqual([['cmd.exe', '/d', '/c', `${seen.root}\\scripts\\mux-agent.cmd`, 'report', '-Session', SID, '-Source', 'startup', '-Quiet']])
 })
 
-// (fix 2, re-audit #3) One classic.SessionStart per test.
+// (fix 2, re-audit 3) One classic.SessionStart per test.
 test('outside any terminal nothing runs', async ($, on) => {
   const { seen, clock } = world(on, {})
   await ($ as any).classic.SessionStart({ source: 'startup', session_id: SID })
@@ -76,7 +76,7 @@ test('an odd source is reported as unknown', async ($, on) => {
 })
 
 
-// r2b call 25 (QA #143): session reports are delivered in order. The first report's HC_TERMINAL_ID lookup is held;
+// r2b call 25 (QA): session reports are delivered in order. The first report's HC_TERMINAL_ID lookup is held;
 // a second SessionStart (a /clear) comes meanwhile. The second report must wait for the first, so an earlier session
 // can never finish after a later one and overwrite its entry; SessionStart still waits for neither.
 test('a later session report waits for an earlier one whose lookup is held', async ($, on) => {

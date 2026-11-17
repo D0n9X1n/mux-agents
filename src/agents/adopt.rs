@@ -1,5 +1,5 @@
 //! adopt-3e: when a member ends on its own, its nearest surviving ancestor adopts its live and pending children
-//! (#103 "Adoption", "Ended leader"). Journal `teams/<sha16>.adopt/<seq>.json`; committed `topology.json`.
+//! ("Adoption", "Ended leader"). Journal `teams/<sha16>.adopt/<seq>.json`; committed `topology.json`.
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 

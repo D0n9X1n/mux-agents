@@ -1,4 +1,4 @@
-//! A team's tree (#103 phase 3): whether the caller is in a team, where it stands (D1), where its child goes (D2-D6),
+//! A team's tree (phase 3): whether the caller is in a team, where it stands (D1), where its child goes (D2-D6),
 //! and whom it may stop, read or resume.
 use super::cascade::Tree;
 use super::lifecycle::Life;
@@ -161,7 +161,7 @@ fn lifecycle_client(
 /// `id`'s launcher.json recorded, or (Unix only) the native copilot whose parent is that C, the npm loader; C's parent is
 /// the recorded L; both pids and starts match; `t`, M's own terminal by address and labels, shows X, C or L in front.
 /// `record` is M's record as the caller already read it, inside the state root; launcher.json and spec.json are read
-/// the same way, so no file of the proof is reached through a link out of the root (#104).
+/// the same way, so no file of the proof is reached through a link out of the root.
 pub fn prove_member(
     ctx: &Ctx,
     team: &str,

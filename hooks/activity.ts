@@ -27,7 +27,7 @@ async function reportArgv($: EngineInterface, state: State, kind?: string): Prom
   return entryArgv($, kind ? ['report', state, '-Kind', kind] : ['report', state])
 }
 
-// Inside tmux, rmux or an hc terminal: a place that could be an agent's, as deliver.ts inTeam (#137). A plain herdr
+// Inside tmux, rmux or an hc terminal: a place that could be an agent's, as deliver.ts inTeam. A plain herdr
 // terminal is refused `herdr` on its first report and asks no more.
 async function inMux($: EngineInterface): Promise<boolean> {
   try {

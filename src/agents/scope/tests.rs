@@ -23,7 +23,7 @@ fn at() -> Scope {
         session: "$A".into(),
     }
 }
-/// Integration #150 CI: `key`'s state folder and its agents and mail folders made private, as the product makes
+/// Integration CI: `key`'s state folder and its agents and mail folders made private, as the product makes
 /// them, the state root first; a folder left at the umask (755) or with an inherited shared ACL is refused `state`
 /// before anything under test runs.
 fn private_key(w: &World, key: &str) {

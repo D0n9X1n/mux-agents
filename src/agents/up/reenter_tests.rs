@@ -20,7 +20,7 @@ pub(crate) fn verbs(w: &World, v: &str) -> Vec<Vec<String>> {
         .collect()
 }
 /// A lifecycle member `id` at the World key in its session: `rt::member` seeds generation 1 launched, claimed and
-/// committed; ready and `ok` (checklist #36, N4: record, evidence and hc answers all generation 1); attachment's
+/// committed; ready and `ok` (checklist 36, N4: record, evidence and hc answers all generation 1); attachment's
 /// `context` and `reason` tags set.
 fn running_member(w: &World, id: &str, name: &str) -> (std::path::PathBuf, Running) {
     let f = rt::member(
@@ -39,7 +39,7 @@ fn running_member(w: &World, id: &str, name: &str) -> (std::path::PathBuf, Runni
     )
 }
 /// Every `new-window` opens pane `%2<n>` in window `@2<n>` attaching the address it was given; only the attach
-/// proof (`#{pane_id}|#{==:..}`, checklist #35, N3) answers the new pane; caller and server probes are untouched.
+/// proof (`#{pane_id}|#{==:..}`, checklist 35, N3) answers the new pane; caller and server probes are untouched.
 pub(crate) fn answers_views(w: &World) {
     let n = std::rc::Rc::new(std::cell::Cell::new(0u32));
     w.fakes.mux_script("new-window", move |args| {
@@ -97,7 +97,7 @@ fn views_are_found_or_opened_in_the_view_session() {
     assert_eq!(
         windows,
         ["@5", "@21"],
-        "each view's own window (checklist #33, N1)"
+        "each view's own window (checklist 33, N1)"
     );
     assert_eq!(
         (got.duplicates, got.error.as_deref()),
@@ -125,7 +125,7 @@ fn views_are_found_or_opened_in_the_view_session() {
     );
 }
 
-// Finding 11-14 #13, #14: a session whose placement is `h` or `v`: re-entry has no pane to split from, so each view
+// Finding 11-14 items 13, 14: a session whose placement is `h` or `v`: re-entry has no pane to split from, so each view
 // is a new window, never a split, and never selected.
 #[test]
 fn reentry_opens_new_windows_whatever_the_session_placement() {
@@ -159,7 +159,7 @@ fn reentry_opens_new_windows_whatever_the_session_placement() {
 }
 
 // E4.5, ambiguity 13, calls 28, 40: no Running member: a status window (no command) created by id, then marked by id
-// (checklist #46, N15); a marked one is reused; an unmarked `status` (a crash between the two calls) is adopted.
+// (checklist 46, N15); a marked one is reused; an unmarked `status` (a crash between the two calls) is adopted.
 #[test]
 fn no_running_member_opens_a_status_window_once() {
     let nl = char::from(10u8);
@@ -254,7 +254,7 @@ fn the_leader_else_the_oldest_running_member_is_chosen() {
     );
 }
 
-// E4.4 input, call 7, findings #8, #9: Running is decided by hc for the anchor session's lifecycle records with an
+// E4.4 input, call 7, findings 8, 9: Running is decided by hc for the anchor session's lifecycle records with an
 // active generation; the leader this call launched is Running without hc; another session's record, a void member
 // and a pre-lifecycle folder are never asked about and never counted.
 #[test]
@@ -265,7 +265,7 @@ fn running_members_are_the_anchor_sessions_classified_by_hc() {
     running_member(&w, L, "leader");
     let other = rt::member(&w, "aaaaaaaaaaa9", json!({"name": "z", "session": "$9"}));
     rt::ok(&other, 1);
-    // Checklist #36: the void member has no active generation, only an abandoned pending one.
+    // Checklist 36: the void member has no active generation, only an abandoned pending one.
     let void = rt::member(&w, "aaaaaaaaaaa5", json!({"name": "v"}));
     let mut r = lf::record(&void);
     r.as_object_mut().unwrap().remove("generation");
@@ -312,7 +312,7 @@ fn running_members_are_the_anchor_sessions_classified_by_hc() {
         .collect();
     assert_eq!(
         lives, want,
-        "E5 members: no $9 record (call 7), no void member (finding #9)"
+        "E5 members: no $9 record (call 7), no void member (finding 9)"
     );
     assert_eq!(
         std::fs::read(pre.join("record.json")).unwrap(),
@@ -395,7 +395,7 @@ fn up_after_a_killed_server_restores_both_views_and_the_bar() {
     );
     assert_eq!(
         r["leader"]["id"], L,
-        "the reply carries the leader (finding #15)"
+        "the reply carries the leader (finding 15)"
     );
     let views = r["views"].as_array().unwrap();
     assert_eq!(views.len(), 2, "both views");
@@ -443,7 +443,7 @@ fn up_after_a_killed_server_restores_both_views_and_the_bar() {
     w.fakes.hc_done().unwrap();
 }
 
-// E4.5-6, finding #25: an Ended leader and two Running children: the oldest child (by `gens/0/launcher.json`
+// E4.5-6, finding 25: an Ended leader and two Running children: the oldest child (by `gens/0/launcher.json`
 // `startedAt`) is selected and the client switched; no status window; the Ended leader blocks nothing.
 #[test]
 fn an_ended_leader_selects_the_oldest_running_child() {
@@ -511,8 +511,8 @@ fn an_ended_leader_selects_the_oldest_running_child() {
     w.fakes.hc_done().unwrap();
 }
 
-// Call 19, finding #26: a fresh `up` never reconciles: one hc connection (the launch's), no `restored`; its exact
-// reply carries `views`, `duplicates` and `members` (finding #21).
+// Call 19, finding 26: a fresh `up` never reconciles: one hc connection (the launch's), no `restored`; its exact
+// reply carries `views`, `duplicates` and `members` (finding 21).
 #[test]
 fn a_fresh_up_never_reconciles() {
     let w = ut::ready();
@@ -533,7 +533,7 @@ fn a_fresh_up_never_reconciles() {
     assert_eq!(r["members"][0]["life"], "running");
 }
 
-// Call 23, finding #16: one member's view cannot be opened: `up` succeeds, the reply carries `viewError`, the
+// Call 23, finding 16: one member's view cannot be opened: `up` succeeds, the reply carries `viewError`, the
 // others are shown, and the release is published once the reply reports the failure.
 #[test]
 fn a_member_view_failure_is_reported_and_the_others_shown() {
@@ -796,7 +796,7 @@ fn a_crash_after_each_step_converges_to_one_team() {
     }
 }
 
-/// Checklist #39 (N8): release-1d R1.3 for the up leader's Lost shell `t`: conclude's own `get` of the recorded
+/// Checklist 39 (N8): release-1d R1.3 for the up leader's Lost shell `t`: conclude's own `get` of the recorded
 /// address, then the one relabel built from that terminal's labels (the anchor team, the leader's name).
 fn kept(w: &World, t: &Value) {
     let address = t["address"].as_str().unwrap();
@@ -836,7 +836,7 @@ fn a_committed_leader_killed_before_promotion_comes_back_with_its_id() {
         let w = reopen(&w, &made);
         seed_launcher(&w, &key, step);
         let (id, f) = leaders(&w, &key).pop().expect("a committed leader");
-        // Checklist #39 (N8): a restoration-eligible outcome, as the launcher records it after the readiness report.
+        // Checklist 39 (N8): a restoration-eligible outcome, as the launcher records it after the readiness report.
         crate::state::evidence::publish(
             &crate::agents::gens::path(&f, 0, "outcome"),
             &json!({"outcome": "ok", "at": "t"}),
@@ -844,7 +844,7 @@ fn a_committed_leader_killed_before_promotion_comes_back_with_its_id() {
         .unwrap();
         let mut lost = ut::create::running_wire(&w, &f, &id, 0);
         lost["argv"] = json!(lf::LOST_ARGVS[0]);
-        // Checklist #39 (N8): the shell carries the anchor session's team label and the leader's name.
+        // Checklist 39 (N8): the shell carries the anchor session's team label and the leader's name.
         let a = crate::agents::up::index::read(&w.ctx, &ut::team_of(&w))
             .unwrap()
             .unwrap()
@@ -899,7 +899,7 @@ fn a_committed_leader_killed_before_promotion_comes_back_with_its_id() {
     }
 }
 
-// Spec "Repairer killed after dropping `pending`" (checklist #29 F18, #40 N9): a first `up` stops after its
+// Spec "Repairer killed after dropping `pending`" (checklist 29 F18, 40 N9): a first `up` stops after its
 // session; the session ends; a second `up` repairs (release durable, `pending` dropped) and stops at `repaired`; the
 // third, with other flags, takes the inputs-only row and makes session and leader from the original inputs.
 #[test]
@@ -963,7 +963,7 @@ fn a_repairer_killed_after_dropping_pending_leaves_the_inputs_row() {
     w.fakes.hc_done().unwrap();
 }
 
-// Ambiguity 11, checklist #28 (F16-F17), #38 (N6-N7): a first `up` killed after `commit` with the launcher's `run`
+// Ambiguity 11, checklist 28 (F16-F17), 38 (N6-N7): a first `up` killed after `commit` with the launcher's `run`
 // claim; the next `up` (a new process) finds two matching terminals: settle keeps `pending` (G3 Unknown), 1 `team`.
 #[test]
 fn an_unresolved_leader_launch_refuses_team() {
@@ -1141,7 +1141,7 @@ fn up_from_the_sessions_it_repairs_switches_there() {
     w.fakes.hc_done().unwrap();
 }
 
-// Spec E3/E4, ambiguity 6, checklist #41 (N10): a `pending` on another server is published (then aliased when `up`
+// Spec E3/E4, ambiguity 6, checklist 41 (N10): a `pending` on another server is published (then aliased when `up`
 // makes the view on its own server) or released when that server lists no such session; never killed. Either way
 // its release is `Present` and the outstanding list empty.
 #[test]
@@ -1180,9 +1180,9 @@ fn a_pending_on_another_server_is_published_or_released_never_killed() {
             releases: vec![],
             pending: Some(pending),
         };
-        // Checklist #41 (N10): the originating `up` on that server published its binding.
+        // Checklist 41 (N10): the originating `up` on that server published its binding.
         let bound = w.ctx.state_root.join(&s.key);
-        // Integration #150 CI: made private as the product makes it, the state root first; a folder left at the umask
+        // Integration CI: made private as the product makes it, the state root first; a folder left at the umask
         // (755) or with an inherited shared ACL is refused `state` before the step under test.
         w.state();
         crate::agents::spawn::private_folder(&w.ctx, &bound).unwrap();
@@ -1280,7 +1280,7 @@ fn torn_index_prelife_leader_and_team_record_repair() {
     let key = w.caller().server_key;
     let t = ut::team_of(&w);
     let at = crate::agents::up::index::path(&w.ctx, &t);
-    // Integration #150 CI: made private as the product makes it, the state root first; a folder left at the umask (755)
+    // Integration CI: made private as the product makes it, the state root first; a folder left at the umask (755)
     // or with an inherited shared ACL is refused `state` before the step under test.
     w.state();
     crate::agents::spawn::private_folder(&w.ctx, at.parent().unwrap()).unwrap();

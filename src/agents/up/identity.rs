@@ -1,4 +1,4 @@
-//! T = sha16(canonical state root|canonical folder|client|name) (#103). Links and case aliases are one folder.
+//! T = sha16(canonical state root|canonical folder|client|name). Links and case aliases are one folder.
 
 use std::path::{Path, PathBuf};
 

@@ -1,4 +1,4 @@
-//! outcome-2 (#103 O2, O4): one outcome per generation, decided under the gen lock.
+//! outcome-2 (O2, O4): one outcome per generation, decided under the gen lock.
 use super::*;
 use crate::agents::fixture::ID;
 use crate::agents::life_fixture::LOST_ARGVS;
@@ -1141,7 +1141,7 @@ fn an_active_void_or_undecided_generation_needs_no_recovery() {
     );
 }
 
-// o2 call 27 (QA #146 F1): with the gen lock busy, an outcome.json or failure.json that is visible but not yet flushed
+// o2 call 27 (QA F1): with the gen lock busy, an outcome.json or failure.json that is visible but not yet flushed
 // decides nothing (the flush is retried and refuses `state`), so the board never shows a failure a reboot can take
 // back; once the names are gone and the client is published, the generation is ok. A flushed failure.json alone, the
 // lock busy, still shows its recovery (authoritative, as in K5).
@@ -1218,7 +1218,7 @@ fn a_busy_lock_never_shows_an_unflushed_outcome() {
     );
 }
 
-// a3c call 47 (TL #149, production readiness): an empty or malformed launch.json hcName never matches a terminal
+// a3c call 47 (TL, production readiness): an empty or malformed launch.json hcName never matches a terminal
 // carrying the same name, even with this member's labels and a recovery shell's argv. The adjudication refuses
 // `evidence`: no Lost, no failure.json, no outcome.json.
 #[test]

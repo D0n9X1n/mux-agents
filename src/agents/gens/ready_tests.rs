@@ -1,4 +1,4 @@
-//! K5 (#103 report-2b): `promote_ready` under the gen lock, every file read once through the walk (R1, PM call 11),
+//! K5 (report-2b): `promote_ready` under the gen lock, every file read once through the walk (R1, PM call 11),
 //! `ready.json` written only through `publish_once` (PM call 14).
 use super::*;
 use crate::state::evidence::publish;
@@ -136,7 +136,7 @@ fn promote_ready_reads_each_file_once() {
     );
 }
 
-// (fix 2, re-audit #1, #8) The sanctioned reread (PM call 11): a racer links ready.json between the publisher's read
+// (fix 2, re-audit 1, 8) The sanctioned reread (PM call 11): a racer links ready.json between the publisher's read
 // and its link, through A3b-1's own seam `publish_hooks::before_link` (`Box<dyn Fn(&Path)>`, `life-plan-A3b-2.md`);
 // the publication answers `Exists`, and K5 reads ready.json once more. A torn racer's file decides nothing.
 #[test]
@@ -431,7 +431,7 @@ fn promote_held_takes_no_lock_and_hands_back_what_it_read() {
     assert_eq!(held, Ok(want), "the failure it read");
 }
 
-// r2b call 23 (TL #143): on the report path the exit evidence is read and kept whether or not client.json exists.
+// r2b call 23 (TL): on the report path the exit evidence is read and kept whether or not client.json exists.
 // Report present, client absent: a whole exit.json is carried; a torn or wrong-type one refuses `evidence`.
 #[test]
 fn the_exit_evidence_is_kept_when_client_json_is_absent() {
@@ -471,7 +471,7 @@ fn the_exit_evidence_is_kept_when_client_json_is_absent() {
     }
 }
 
-// r2b call 26 (QA #143): a parent is older than its child. A client whose start is earlier than its launcher's is not
+// r2b call 26 (QA): a parent is older than its child. A client whose start is earlier than its launcher's is not
 // that launcher's child (a reused pid), so it is unproven: launcher {100, 2000}, client {150, ppid 100, 1500}.
 #[test]
 fn a_client_older_than_its_launcher_is_unproven() {
@@ -495,7 +495,7 @@ fn a_client_older_than_its_launcher_is_unproven() {
     assert_eq!(bytes(&m, "ready"), None, "nothing written");
 }
 
-// r2b call 28 (QA #143): the decision and the ready.json publication happen while the gen lock is held, not merely
+// r2b call 28 (QA): the decision and the ready.json publication happen while the gen lock is held, not merely
 // after a lock was taken. (a) A failure.json published the moment the gen lock is taken decides: a decision made
 // before the lock would miss it. (b) The publisher's link runs while the lock is held.
 #[test]

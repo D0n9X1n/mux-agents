@@ -23,7 +23,7 @@ pub fn argv(ctx: &Ctx, file: &Path) -> Res<Vec<String>> {
 }
 
 /// The spec from only `launcher <spec> --state-root <abs> --path <value>`, the form spawn starts every agent with.
-/// The two-argument `launcher <spec>` of a v0.2 pane agent is no longer accepted (#104 phase 1c). Matches the exact
+/// The two-argument `launcher <spec>` of a v0.2 pane agent is no longer accepted (phase 1c). Matches the exact
 /// grammar; `environment` checks that the state folder is absolute.
 pub fn spec(args: &[String]) -> Option<&str> {
     match args {

@@ -1800,7 +1800,7 @@ fn a_child_unread_follows_its_parent_record_when_the_parent_loses_its_view() {
     }
 }
 
-// #103 review: a team row's unread follows its member, not its pane. Real delivery (send's own mailer and the board's
+// review: a team row's unread follows its member, not its pane. Real delivery (send's own mailer and the board's
 // reaper posting the exit notice), the view closing and reopening on another pane, then the board.
 #[test]
 fn a_team_rows_unread_follows_its_member_across_a_reopened_view() {

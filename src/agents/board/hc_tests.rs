@@ -193,7 +193,7 @@ fn the_board_shows_the_active_generations_notice() {
     );
 }
 
-// a3b call 42 (TL #145 F1): the first `list` after a natural exit of a member launched through the production adapter
+// a3b call 42 (TL F1): the first `list` after a natural exit of a member launched through the production adapter
 // reaps its recorded end and renders it: no row in a plain list; one Ended row in `list -All`. No bar or reaper pass
 // runs between the exit and the list. Two snapshot rounds are queued: the reap records the end, then the board reads
 // the member again.
@@ -364,7 +364,7 @@ fn torn_outcome(w: &World, id: &str) {
     std::fs::write(at, b"{\"out").unwrap();
 }
 
-// O6, ambiguity 14, finding #12: a failed active generation is flagged with its reason and `recoveryRunning`
+// O6, ambiguity 14, finding 12: a failed active generation is flagged with its reason and `recoveryRunning`
 // (Status.active_done); a torn outcome.json is `recoveryError: "evidence"` on that row only. The healthy sibling's row
 // carries no recovery field either way, and the board still answers.
 #[test]
@@ -394,7 +394,7 @@ fn the_board_flags_a_failed_active_generation_for_recovery() {
     }
 }
 
-// Ambiguity 14, finding #13: an Ended member that needs recovery, or whose recovery cannot be decided (torn
+// Ambiguity 14, finding 13: an Ended member that needs recovery, or whose recovery cannot be decided (torn
 // outcome.json → `recoveryError`), stays on the board without -All.
 #[test]
 fn an_ended_member_that_needs_recovery_or_has_an_error_stays_on_the_board() {
@@ -421,7 +421,7 @@ fn an_ended_member_that_needs_recovery_or_has_an_error_stays_on_the_board() {
     }
 }
 
-// Call 11, finding #3: a lifecycle record's stored `needsRecovery: true` is ignored (its active generation is ok);
+// Call 11, finding 3: a lifecycle record's stored `needsRecovery: true` is ignored (its active generation is ok);
 // only `needs_recovery` decides. (A pre-lifecycle record keeps the stored flag: main's board.rs test, unchanged.)
 #[test]
 fn a_stale_stored_flag_on_a_lifecycle_record_is_ignored() {
@@ -440,7 +440,7 @@ fn a_stale_stored_flag_on_a_lifecycle_record_is_ignored() {
     );
 }
 
-// Call 12, finding #4: active generation 1 failed, pending generation 2 unfinished and uncommitted (a held subject,
+// Call 12, finding 4: active generation 1 failed, pending generation 2 unfinished and uncommitted (a held subject,
 // `Stored.committed` false): recovery comes from the active generation before the committed-subject filter, so the
 // member is listed as needing recovery.
 #[test]
@@ -468,7 +468,7 @@ fn a_held_member_whose_active_generation_failed_is_listed() {
     );
 }
 
-// Call 13, finding #5: eleven Ended members that need recovery are all listed (exempt from ENDED_MAX = 10).
+// Call 13, finding 5: eleven Ended members that need recovery are all listed (exempt from ENDED_MAX = 10).
 #[test]
 fn every_ended_member_that_needs_recovery_is_listed_past_ended_max() {
     let w = World::human("");
@@ -535,7 +535,7 @@ fn activity(w: &World, id: &str, state: &str) {
     );
 }
 
-// o2 calls 28, 30 (Tech Lead #146): from the board through the flat bar's renderer. A failed Running member whose
+// o2 calls 28, 30 (Tech Lead): from the board through the flat bar's renderer. A failed Running member whose
 // activity is `working` beside a healthy `blocked` sibling (width 60, height 40: section headings) still shows
 // `recover` under its section; the failed member alone at width 30 too.
 #[test]

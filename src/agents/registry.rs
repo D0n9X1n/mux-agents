@@ -1,7 +1,7 @@
 //! The session's agent panes, their records and exit notices (MuxAgents.ps1:535-546, 1014-1018, 1150-1204,
 //! 1287-1296).
 //!
-//! An agent is found by its pane and the exact command that pane started, never by its tags (#48): rmux 0.10.0's
+//! An agent is found by its pane and the exact command that pane started, never by its tags: rmux 0.10.0's
 //! rotate-window moves panes and leaves their `@agent-*` options behind, so a tag may sit on any pane.
 
 use serde_json::{Map, Value, json};
@@ -769,14 +769,14 @@ fn post(
         None => super::adopt::pane_key(record)?,
     };
     let delivered = match key {
-        // spec v10 amendment (#103): no parent; the notice is recorded for the bar and `list`, mailed to no one
+        // spec v10 amendment: no parent; the notice is recorded for the bar and `list`, mailed to no one
         None => None,
         Some(key) => {
             let pane = super::text(record.get("pane"));
             let mut fields = Map::new();
             fields.insert("kind".into(), kind.into());
             fields.insert("exitCode".into(), code.clone());
-            // The member it is about, so a team bar counts it by identity (#103 review).
+            // The member it is about, so a team bar counts it by identity (review).
             fields.insert("fromId".into(), id.into());
             // cascade-3d call 9: a lifecycle notice's message is flushed before its marker is published.
             let add = if life_gen.is_some() {

@@ -1,4 +1,4 @@
-//! restore-6c Task 9 (#103): `up` on an existing team: the cascade finished, settled, the leader resumed, held or
+//! restore-6c Task 9: `up` on an existing team: the cascade finished, settled, the leader resumed, held or
 //! refused, the team restored and shown (P4; calls 17-19, 25; checklist 31, 32).
 use crate::agents::core_fixture as cf;
 use crate::agents::core_launch::forward_tests as ft;

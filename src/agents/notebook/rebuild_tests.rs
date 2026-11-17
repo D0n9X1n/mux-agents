@@ -1,4 +1,4 @@
-//! Task 4 (#103 phase 7a): an unreadable or missing marker is rebuilt from the last whole line; R1 single read.
+//! Task 4 (phase 7a): an unreadable or missing marker is rebuilt from the last whole line; R1 single read.
 use serde_json::json;
 
 use super::fault_tests::id_of;

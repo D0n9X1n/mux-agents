@@ -1,4 +1,4 @@
-// Mail at the turn of a Claude member (#103 4b-ii). W2: an interactive prompt.submit attaches one receipt-bearing
+// Mail at the turn of a Claude member (4b-ii). W2: an interactive prompt.submit attaches one receipt-bearing
 // block, acked only when the engine itself received and returned it. W3 (fix cycle 2): an idle member is woken with a
 // fixed text and a nonce; the wake never delivers and never acks: the agent reads and acks its mail itself.
 // Two stops (fix cycle 3): the wake alone stops for the leader, a refused wake, MUX_AGENTS_WAKE=0 or a failed tick;

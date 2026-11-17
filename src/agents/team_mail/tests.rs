@@ -1782,7 +1782,7 @@ fn a_lifecycle_senders_parent_follows_the_route() {
     assert!(pre.is_none(), "pre-lifecycle: main's pick");
 }
 
-// Integration #150: a lifecycle worker a person spawned from a pane has no logical parent and is no root; its
+// Integration a lifecycle worker a person spawned from a pane has no logical parent and is no root; its
 // `parent` is main's pick (`parentPane`), as `Route::Legacy` says. Only the `up` leader is refused
 // (a_lifecycle_senders_parent_follows_the_route); live send_delivers_to_mailbox relies on this.
 #[test]

@@ -1,5 +1,5 @@
 //! `mux-agent hold <release file>`: the first window of a session `up` creates; exits 0 once the file exists
-//! (checked every 200 ms) or after 10 minutes (#103). Each check counts what the clock moved, never less than POLL.
+//! (checked every 200 ms) or after 10 minutes. Each check counts what the clock moved, never less than POLL.
 
 use std::{path::Path, time::Duration};
 

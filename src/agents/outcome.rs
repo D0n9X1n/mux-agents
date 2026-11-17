@@ -1,4 +1,4 @@
-//! outcome-2 (#103 O2, O4, O6): each generation's one outcome, decided under its gen lock from durable evidence, and
+//! outcome-2 (O2, O4, O6): each generation's one outcome, decided under its gen lock from durable evidence, and
 //! the one predicate every surface shares. The only writer of `failure.json` and `outcome.json`.
 use std::path::Path;
 use std::time::{Duration, SystemTime};

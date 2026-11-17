@@ -2,6 +2,8 @@
 
 One pull request per issue, on its own branch.
 
+Comments, tests, CI files and the wiki never cite an issue or a pull request by number or link: say why and how instead. [CLAUDE.md](CLAUDE.md) states the rule; `tests/repo.rs` enforces it.
+
 Commits are authored and committed as `D0n9X1n <D0n9x1n@outlook.com>`. A pull request lands by fast-forwarding `main` to its tested head, never through a GitHub merge, which would re-author it.
 
 ## Layout

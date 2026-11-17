@@ -145,7 +145,7 @@ pub(super) fn arm(
     Ok(reply)
 }
 
-/// E4.4 input (call 7, findings #1, #8, #9): the anchor session's lifecycle records with an active generation; a done
+/// E4.4 input (call 7, findings 1, 8, 9): the anchor session's lifecycle records with an active generation; a done
 /// one is Ended without hc; `launched` (this call's `Step::Launch`) is Running without hc; the others by `gens::find`
 /// and `classify`. Returns the Running members (by id) and every member's `{id, name, life}`.
 pub fn running(

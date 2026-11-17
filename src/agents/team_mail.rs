@@ -1,4 +1,4 @@
-//! Team messaging (#103 phase 4a): who a target names, one durable intent per send (also its quota charge), and
+//! Team messaging (phase 4a): who a target names, one durable intent per send (also its quota charge), and
 //! durable delivery of one message id to each mailbox. Intents: `teams/<sha16(session)>/sends/<sender>/<id>.json`,
 //! read and written under the team lock.
 use std::path::{Path, PathBuf};
@@ -332,7 +332,7 @@ pub(crate) fn life_parent(
             id,
             record,
         })),
-        // Integration #150: `Route::Legacy` is main's `parentPane`. The `up` leader (a team's root) is refused; a
+        // Integration `Route::Legacy` is main's `parentPane`. The `up` leader (a team's root) is refused; a
         // worker a person spawned from a pane keeps main's pick (its parentPane), as before adopt-3e.
         super::adopt::Route::Legacy if super::tree::is_leader(record) => {
             refuse(2, "parent", NO_PARENT)

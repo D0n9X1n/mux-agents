@@ -1,4 +1,4 @@
-//! Tasks 2-3 (#103 phase 7a): a failed append names its id; flush faults before and after the publish; `-Id`.
+//! Tasks 2-3 (phase 7a): a failed append names its id; flush faults before and after the publish; `-Id`.
 use serde_json::json;
 
 use super::tests::{add, notes, person, raw, state, titles, tx, world};

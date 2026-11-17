@@ -172,7 +172,7 @@ fn two_concurrent_ups_restore_a_member_once() {
         String::new()
     });
     let (root, cwd) = (a.ctx.state_root.clone(), a.ctx.cwd.clone());
-    // CI #150: B's fixture never resolves its caller. A's re-entry publishes a new view, and B's session $3 is then an
+    // CI B's fixture never resolves its caller. A's re-entry publishes a new view, and B's session $3 is then an
     // alias that every admitted resolution refuses `moved`; up itself resolves the person unadmitted (E2).
     let seeded = a.caller().session;
     let wire2 = wire_of(&a, X, 2, &[]);

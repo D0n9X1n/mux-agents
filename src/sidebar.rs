@@ -35,7 +35,7 @@ const UNKNOWN_MAX: u32 = 30;
 const WATCH_PROBE: &str = "#{pane_id}|#{@agent-role}|#{pane_width}|#{pane_height}";
 // The bar's own size, read again after the keeper moved or resized it, so the frame fits the pane as it is now.
 const SIZE_FORMAT: &str = "#{pane_id}|#{pane_width}|#{pane_height}";
-// What the bar's split answers: its pane, window and process (#47: the bar is that process, not its label).
+// What the bar's split answers: its pane, window and process (the bar is that process, not its label).
 const SPLIT_FORMAT: &str = "#{pane_id}|#{window_id}|#{pane_pid}";
 // The proof read of the recorded pane: alive, and still the recorded process.
 const PROOF_FORMAT: &str = "#{pane_id}|#{window_id}|#{pane_dead}|#{pane_pid}";
@@ -77,7 +77,7 @@ const PAUSED: &str = "layout: repair paused";
 // `off` once `sidebar -Close` ran in the session; unset again by `sidebar`.
 const OPTION: &str = "@mux-agents-sidebar";
 // `1` on a window once a verb placed or focused a member view in it (`ensure`, under the session lock), so the
-// window's bar knows it held a view even when the view is gone before the bar's first look (#103). Unset when the
+// window's bar knows it held a view even when the view is gone before the bar's first look. Unset when the
 // bar leaves. shortcut: a window viewed while the bar was on, whose view then closed with no bar left to unset it
 // (the bar closed by `sidebar -Close` first), keeps it; a bar opened there later by `sidebar` leaves at once.
 const VIEWED: &str = "@mux-agents-viewed";
@@ -86,14 +86,14 @@ pub const STATUS: &str = "@mux-agents-status";
 // The session's bar as `<pane> <pid> <start>`, written only by `open` once the split's process is this binary
 // `watch`, cleared by `sidebar -Close` once the bar is gone.
 const RECORD: &str = "@mux-agents-sidebar-id";
-// The bar's mark (#103): a pane option set to the pid of the split that made the bar, written right after the split
+// The bar's mark: a pane option set to the pid of the split that made the bar, written right after the split
 // and never cleared, so a pane an open left behind (its watch not started in time, or not labelled) is still known
 // as ours. Only a pane whose mark equals its own pid is ours: a mark rotate-window moved to another pane is not.
 const MARK: &str = "@mux-agents-bar";
 // A window's panes with their pid, whether they are dead and the bar's mark: `<pid>|<dead>|<pane>|<mark>`.
 const MARK_FORMAT: &str = "#{pane_pid}|#{pane_dead}|#{pane_id}|#{@mux-agents-bar}";
 // A watch not proven (its window's record not naming its pane) for this long, since it started or since it was last
-// proven, whose pane carries its own mark, removes its label and mark and leaves, so its pane closes with it (#103).
+// proven, whose pane carries its own mark, removes its label and mark and leaves, so its pane closes with it.
 const STARTUP: Duration = Duration::from_secs(10);
 // The watch's own pane's pid and the bar's mark.
 const OWN_MARK: &str = "#{pane_pid}|#{@mux-agents-bar}";
@@ -120,7 +120,7 @@ pub fn ensure(ctx: &Ctx, caller: &Caller, window: &str) -> Res<Bar> {
         if read.stdout.trim_end_matches(['\r', '\n']) == "off" {
             return Ok(Bar::Disabled);
         }
-        // The window held a member view (#103): a verb placed or focused one there. Best effort: the bar also sees
+        // The window held a member view: a verb placed or focused one there. Best effort: the bar also sees
         // the view itself.
         let _ = native(ctx, &["set-option", "-w", "-t", window, VIEWED, "1"], true);
         migrate(ctx, &caller.session)?;
@@ -170,7 +170,7 @@ fn find_or_open(ctx: &Ctx, window: &str) -> Res<(String, String, bool)> {
     Ok((pane, window, true))
 }
 
-/// Refuses while a pane of `window` carries the bar's mark for its own pid but is not the proven bar (#103): an open
+/// Refuses while a pane of `window` carries the bar's mark for its own pid but is not the proven bar: an open
 /// that failed after its split left it, and its watch proves itself (then `prove` adopts it) or leaves within
 /// STARTUP. Nothing is killed here: the refusal names the pane. A mark for another pid (one rotate-window moved) is
 /// no bar's, and a dead pane blocks nothing. A list that cannot be read refuses: it may hold such a pane.
@@ -625,7 +625,7 @@ fn ended_kind(row: &Map<String, Value>) -> (Kind, String) {
     }
 }
 
-/// The header's counts (#103 B7: a team board holds only the team): live agents by kind in herdr's order, on call in its
+/// The header's counts (B7: a team board holds only the team): live agents by kind in herdr's order, on call in its
 /// W6 rank (below needs-you, above done), each when not 0 (`0 running` when none lives), then `M ended` (`endedTotal`,
 /// else every row not running).
 fn counts(board: &Map<String, Value>) -> Vec<(String, Style)> {
@@ -665,7 +665,7 @@ fn counts(board: &Map<String, Value>) -> Vec<(String, Style)> {
     counts
 }
 
-/// The unread badge after a name: `✉ N` (ASCII `m N`), none at 0. Live and recovery rows share it (#103 B8).
+/// The unread badge after a name: `✉ N` (ASCII `m N`), none at 0. Live and recovery rows share it (B8).
 fn unread_badge(row: &Map<String, Value>, look: Look) -> Row {
     let unread = row.get("unread").and_then(Value::as_u64).unwrap_or(0);
     if unread == 0 {
@@ -1096,7 +1096,7 @@ fn lay(
     lay_focus(board, notes, size, look, tree::Focus::default()).0
 }
 
-/// `lay` with what the bar marks (#103), over the board's kept shells (views-6f ambiguity 15, v6f call 11): the
+/// `lay` with what the bar marks, over the board's kept shells (views-6f ambiguity 15, v6f call 11): the
 /// question `close? y/n` takes the last line first, out of the notes `lay_members` may drop; the kept block gets at
 /// most half of the rest, never leaving the members fewer than 3 rows, but always a row for a selected kept shell, and
 /// none with fewer than 2 rows of room otherwise; the members get the rest. Also how many of the notes it kept, the question included. Under 12 columns, as before.
@@ -1266,7 +1266,7 @@ fn lay_members(
     look: Look,
     focus: tree::Focus,
 ) -> (Laid, usize) {
-    // A team bar at any width, under 12 columns included, so it can still ask to be widened (#103 A2).
+    // A team bar at any width, under 12 columns included, so it can still ask to be widened (A2).
     if let Some(team) = board.filter(|b| tree::is_team(Some(b))) {
         return tree::lay_team(team, notes, size, look, focus);
     }
@@ -1719,7 +1719,7 @@ pub fn run_watch(
     let mut by_hand = false;
     // The other view windows whose ensure failed, and when: each is tried again once REARM has passed.
     let mut failed_windows: Vec<(String, SystemTime)> = Vec::new();
-    // Peek files of popups that never opened, from an earlier bar (#103 review).
+    // Peek files of popups that never opened, from an earlier bar (review).
     sweep_peeks(ctx, &crate::agents::server_dir(ctx, caller));
     loop {
         let probe = native(
@@ -1745,7 +1745,7 @@ pub fn run_watch(
         if recorded {
             proven_at = ctx.clock.now();
         }
-        // #103: a bar cleans up after itself, decided each tick from what it reads now: not proven for STARTUP, it
+        // a bar cleans up after itself, decided each tick from what it reads now: not proven for STARTUP, it
         // decides under the session lock (`self_exit`).
         if live.is_some()
             && !recorded
@@ -1764,7 +1764,7 @@ pub fn run_watch(
                 SelfExit::Unread => {}
             }
         }
-        // #103: the window held a view once a verb marked it viewed (`ensure`), or once this bar sees a live member
+        // the window held a view once a verb marked it viewed (`ensure`), or once this bar sees a live member
         // view in it, recorded or not (the first tick may run before open records the bar), whichever comes first.
         if live.is_some() && !held {
             held = native(
@@ -2052,14 +2052,14 @@ impl Alerts {
 
 /// `@mux-agents-alerts`: `off` sends none, `blocked` only who needs the person, anything else (unset) both.
 const ALERTS_OPTION: &str = "@mux-agents-alerts";
-/// The session's changes already told (#83 with a bar per window): `<name>=<changedAt>`, per agent the newest change
+/// The session's changes already told (with a bar per window): `<name>=<changedAt>`, per agent the newest change
 /// told, space-separated, so a bar that sees that change, or an older one, sends nothing.
 const ALERTED: &str = "@mux-agents-alerted";
 
 /// The tmux message for `news`, on the session's clients for 5 s, unless `@mux-agents-alerts` says otherwise. Names
 /// are `[a-z0-9-]` and the words fixed, so the text holds no format. Best effort.
 ///
-/// Once per change, monotonic (#83 with a bar per window, #103): under the session's sidebar lock, an agent's news is
+/// Once per change, monotonic (with a bar per window): under the session's sidebar lock, an agent's news is
 /// sent only when its `changedAt` is strictly newer than the newest one told for it (`@mux-agents-alerted`, by any
 /// bar of the session); an older time is never written back. The newer times are recorded as told (whatever
 /// `@mux-agents-alerts` says, so turning it on later replays nothing), and only then sent. News whose time does not
@@ -2202,7 +2202,7 @@ struct Shown {
     width: usize,
     // The pane the session showed at this frame (herdr's next / previous start from it).
     looking: Option<String>,
-    // A team's bar: keys wrap, `n`/`N` select, ASCII takes clicks (#103).
+    // A team's bar: keys wrap, `n`/`N` select, ASCII takes clicks.
     team: bool,
 }
 
@@ -2227,7 +2227,7 @@ impl Shown {
 
 /// Acts on one event read while `shown` is on screen; true when the bar must draw again at once. A left press reads
 /// the bar and opens the agent row it hit (ASCII or stale presses do nothing outside a team; a team bar takes ASCII
-/// clicks and selects the row first, #103 B6); stale is read less than `PRESS_GAP` after the frame's write, or begun
+/// clicks and selects the row first, B6); stale is read less than `PRESS_GAP` after the frame's write, or begun
 /// before it; any left press dismisses the note and draws again. Keys go to `pick`. A failed focus shows its note.
 /// Other buttons and releases do nothing.
 fn act(
@@ -2292,7 +2292,7 @@ fn act(
             }
             true
         }
-        // herdr's next and previous agent (#90), from the pane the session shows, in the bar's order.
+        // herdr's next and previous agent, from the pane the session shows, in the bar's order.
         Event::Next | Event::Prev => {
             let forward = read.event == Event::Next;
             let walk = members(&shown.targets);
@@ -2318,7 +2318,7 @@ fn act(
             }
             true
         }
-        // herdr's peek (#91): the selected agent, else the first, over the window without switching to it.
+        // herdr's peek: the selected agent, else the first, over the window without switching to it.
         Event::Peek => {
             let walk = members(&shown.targets);
             if let Some(target) = pick.chosen(&walk).or(walk.first())
@@ -2376,7 +2376,7 @@ fn peek_folder(ctx: &Ctx, caller: &Caller) -> Res<std::path::PathBuf> {
 }
 
 /// `text` for agent `name` in a private file of `folder`, paged in a popup over the session's client (see `peek`).
-/// How old the bar's own peek file must be before it is swept (#103 review, PM decision): a popup still open keeps a
+/// How old the bar's own peek file must be before it is swept (review, PM decision): a popup still open keeps a
 /// younger one.
 const PEEK_STALE: Duration = Duration::from_secs(600);
 
@@ -2446,7 +2446,7 @@ fn peek(ctx: &Ctx, caller: &Caller, target: &Target) -> Res<()> {
 /// Lines of retained output an agent's output popup shows.
 const OUTPUT_LINES: u32 = 200;
 
-/// What opening a row came to (#103 B6): shown (a view or the output), nothing to show, or a real failure.
+/// What opening a row came to (B6): shown (a view or the output), nothing to show, or a real failure.
 enum Opened {
     Shown,
     Nothing,
@@ -2467,7 +2467,7 @@ fn show_output(ctx: &Ctx, caller: &Caller, target: &Target) -> Opened {
     }
 }
 
-/// `p` in a team (#103 B10): member `target` by id in the popup: its live view captured, else its retained output, else
+/// `p` in a team (B10): member `target` by id in the popup: its live view captured, else its retained output, else
 /// the note. Nothing switches, restarts or types.
 fn preview(ctx: &Ctx, caller: &Caller, target: &Target, pick: &mut Pick) {
     if !target.pane.is_empty() && peek(ctx, caller, target).is_ok() {
@@ -2480,9 +2480,9 @@ fn preview(ctx: &Ctx, caller: &Caller, target: &Target, pick: &mut Pick) {
     }
 }
 
-/// Opens a drawn agent row by member id and life (#103 B6); nothing restarts or types. A validated view is focused
+/// Opens a drawn agent row by member id and life (B6); nothing restarts or types. A validated view is focused
 /// through the multiplexer alone, so an Unknown row's view opens without hc. Without one: Running reopens its view and
-/// Lost reattaches its recovery terminal, each only when hc keeps the member's own terminal (#103 review: a Lost row
+/// Lost reattaches its recovery terminal, each only when hc keeps the member's own terminal (review: a Lost row
 /// whose reattach does not take shows its retained output); Unknown and Ended show their output. A member gone, a
 /// terminal hc dropped or another identity's, or blank output, is `nothing to open for <name>`; a focus that did not
 /// take, or hc unreachable, is `focus failed: <name>`. A successful open clears the selection; otherwise the row stays
@@ -2953,7 +2953,7 @@ pub(crate) fn view_windows(ctx: &Ctx, caller: &Caller) -> Option<Vec<String>> {
     Some(windows)
 }
 
-/// The bar leaves its window (#103): under the session's sidebar lock, the window's views are read again, and a
+/// The bar leaves its window: under the session's sidebar lock, the window's views are read again, and a
 /// member view there again (a spawn or focus that reused the bar while this waited on the lock), an unread list or a
 /// lock not taken keeps the bar: false. Else its pane's label is removed only while the pane still runs this
 /// process, its window's record is cleared only while it still names this bar, and the bar leaves: true.
@@ -3064,7 +3064,7 @@ enum SelfExit {
     Unread,
 }
 
-/// #103: a watch not proven for STARTUP decides under the session's sidebar lock, from what it reads there. Its pane
+/// a watch not proven for STARTUP decides under the session's sidebar lock, from what it reads there. Its pane
 /// not marked for this process (run by hand) is no bar's to clean up; its window's record proving it in full (an
 /// ensure recorded or adopted it while it waited on the lock) keeps it; else it removes its pane's label and mark
 /// (each bound to its pid, like `leave`) and leaves, so its pane closes with it and, dead, blocks no later bar. An
@@ -3289,7 +3289,7 @@ mod tests {
     use crate::testing::Fakes;
     use serde_json::json;
 
-    // o2 call 28 (QA #146 F2): every flat layout keeps `recover` for a member that needs recovery: the compact row under
+    // o2 call 28 (QA F2): every flat layout keeps `recover` for a member that needs recovery: the compact row under
     // a section heading (width 60, an idle sibling), and the narrow row (width 30), Running or Lost, running or not (the
     // bare `recover` pill when its words and age do not fit).
     #[test]
@@ -3493,7 +3493,7 @@ mod tests {
     // The watch's own record: pane %7, the fake process 4242 started at 2000.
     const OWN: &str = "%7 4242 2000\n";
     const READ_OPTION: &str = "-N show-options -qv -t $3 @mux-agents-sidebar";
-    // #103 QA: ensure marks its window @1 viewed, right after it reads the session's option.
+    // QA: ensure marks its window @1 viewed, right after it reads the session's option.
     const VIEWED_ON: &str = "-N set-option -w -t @1 @mux-agents-viewed 1";
     const OFF: &str = "-N set-option -t $3 @mux-agents-sidebar off";
     const ON: &str = "-N set-option -u -t $3 @mux-agents-sidebar";
@@ -5015,7 +5015,7 @@ mod tests {
         ]})
     }
 
-    // #83 with a bar per window (#103): two bars of one session see w2 turn blocked; the session is told once. The
+    // with a bar per window: two bars of one session see w2 turn blocked; the session is told once. The
     // decision and the message are made under the session's sidebar lock.
     #[test]
     fn two_bars_of_one_session_tell_one_change_once() {
@@ -5056,7 +5056,7 @@ mod tests {
         assert_eq!(told(&w).len(), 2);
     }
 
-    // #83 with a bar per window (#103): a bar opened after the alert, whose first read still saw w2 working (a read
+    // with a bar per window: a bar opened after the alert, whose first read still saw w2 working (a read
     // racing the change), sees the same blocked change next: it was told, so nothing is sent.
     #[test]
     fn a_bar_opened_after_the_alert_tells_none_of_it() {
@@ -5084,7 +5084,7 @@ mod tests {
             .collect()
     }
 
-    // #83, monotonic (#103 redesign): bar B told w2's newer change; bar A, behind, then reports w2's older one.
+    //, monotonic (redesign): bar B told w2's newer change; bar A, behind, then reports w2's older one.
     // Nothing is sent and the record keeps the newer time: an older time is never written back.
     #[test]
     fn a_delayed_bar_replays_no_older_news() {
@@ -5102,7 +5102,7 @@ mod tests {
         assert!(alerted_writes(&w).is_empty());
     }
 
-    // #83 (#103 redesign): the session lock not taken, the record unread or not written: nothing is sent, so a change
+    // (redesign): the session lock not taken, the record unread or not written: nothing is sent, so a change
     // is told at most once.
     #[test]
     fn an_alert_whose_lock_or_record_fails_sends_nothing() {
@@ -5461,7 +5461,7 @@ mod tests {
         );
         // The board is read as the bar's pane, with the ended rows and their exit codes.
         assert_eq!(w.fakes.hc_calls().len(), 4);
-        // Corrupt local records fail before pane reads; only the middle tick lists panes: its view read (#103: a
+        // Corrupt local records fail before pane reads; only the middle tick lists panes: its view read (a
         // watch whose window never held a view looks for one each tick) and its snapshot.
         assert_eq!(
             w.fakes
@@ -5503,7 +5503,7 @@ mod tests {
         let report = w.folder(ID).join("activity.json");
         let tick = Rc::new(Cell::new(0));
         let (ticks, fakes) = (tick.clone(), w.fakes.clone());
-        // Each tick's board read sees that tick's report (the tick's view read, #103, sees the same).
+        // Each tick's board read sees that tick's report (the tick's view read sees the same).
         w.fakes.mux_script("list-panes", move |argv| {
             if !argv.iter().any(|a| a == "-s") {
                 return Ok(out(1, "", "lock"));
@@ -5686,7 +5686,7 @@ mod tests {
         watch_frames(&w, 3);
         let (ended, frames, times) = watch_with(&w, Box::new(script));
         assert_eq!((ended, frames.len()), ("pane-closed", 3));
-        // 50 ms after the ESC it counts as the key, which draws again at once (#61).
+        // 50 ms after the ESC it counts as the key, which draws again at once.
         assert_eq!(*waits.borrow(), [2000, 50, 2000, 2000]);
         assert_eq!(diffs(&times), [150, 2000]);
     }
@@ -5928,7 +5928,7 @@ mod tests {
         assert_eq!(w.fakes.slept(), [2000, 2000]);
     }
 
-    // ---- clicks and keys (#61)
+    // ---- clicks and keys
 
     // The bar's click read: its width, then its rows.
     const CLICK: &str = "-N display-message -p -t %7 #{pane_width} ; capture-pane -p -t %7";
@@ -6241,7 +6241,7 @@ mod tests {
         assert_eq!((click_reads(&w), selects(&w)), (1, 1));
     }
 
-    // A guard for the rule the live click tests wait on (#103): a press read with the clock not moved since its frame is
+    // A guard for the rule the live click tests wait on: a press read with the clock not moved since its frame is
     // dropped and only redraws; the same press read on a later frame, more than PRESS_GAP after it, focuses.
     #[test]
     fn a_press_read_at_its_frame_is_dropped_and_one_read_after_the_gap_focuses() {
@@ -7511,7 +7511,7 @@ mod tests {
         }
     }
 
-    // The agent snapshot's pane list, which proves the caller's pane is no agent's before the bar is touched (#48).
+    // The agent snapshot's pane list, which proves the caller's pane is no agent's before the bar is touched.
     fn snapshot_list(call: &[String]) -> bool {
         call[1] == "list-panes"
             && call
@@ -7607,7 +7607,7 @@ mod tests {
         ]
     }
 
-    // #103: the window's panes with their pid and the bar's mark, read before a split.
+    // the window's panes with their pid and the bar's mark, read before a split.
     const MARKS: &str =
         "-N list-panes -t @1 -F #{pane_pid}|#{pane_dead}|#{pane_id}|#{@mux-agents-bar}";
 
@@ -7632,7 +7632,7 @@ mod tests {
         )
     }
 
-    // #103 redesign: nothing outside a bar kills its pane. A failed open leaves its marked pane (%7, its watch not read
+    // redesign: nothing outside a bar kills its pane. A failed open leaves its marked pane (%7, its watch not read
     // in time); while it is unproven, ensure (so spawn and focus, through keep) and the sidebar verb open no second bar
     // beside it, kill nothing and name it. Once it proves itself (its window's record names it), it is adopted as any
     // bar is. A pane marked for another pid (%5, a mark rotate-window moved) blocks nothing.
@@ -7880,7 +7880,7 @@ mod tests {
     // this binary `watch`; anything else is not killed, not reused and refused.
     #[test]
     fn a_bar_is_proven_only_by_its_live_recorded_watch() {
-        // A dead pane (once in this list) blocks nothing since the #103 review: a_dead_bar_pane_blocks_no_later_bar.
+        // A dead pane (once in this list) blocks nothing since the review: a_dead_bar_pane_blocks_no_later_bar.
         let damage: [(&str, Damage); 9] = [
             ("respawned to the same watch", |p, f| respawn(p, f, "%7")),
             (
@@ -8524,7 +8524,7 @@ mod tests {
                            @agent-role";
     const CLEAR_OWN: &str = "-N set-option -wu -t @1 @mux-agents-sidebar-id";
 
-    // #103: the recorded bar leaves once its window, having held a member view, lost its last one (closed, or dead):
+    // the recorded bar leaves once its window, having held a member view, lost its last one (closed, or dead):
     // under the session lock it unlabels its own pane and clears its window's record, then ends `view-closed`.
     #[test]
     fn a_bar_leaves_once_its_window_lost_its_last_view() {
@@ -8561,7 +8561,7 @@ mod tests {
         }
     }
 
-    // #103: a bar stays while its window never held a view, while a view read fails, and when it is not the
+    // a bar stays while its window never held a view, while a view read fails, and when it is not the
     // recorded bar (a watch run by hand).
     #[test]
     fn a_bar_stays_unless_its_window_held_a_view_and_lost_it() {
@@ -8586,7 +8586,7 @@ mod tests {
         }
     }
 
-    // #103 step 6: each tick, the recorded bar gives every other view window of the session without a proven bar its
+    // step 6: each tick, the recorded bar gives every other view window of the session without a proven bar its
     // own (`ensure`, a view moved by break-pane); a window whose bar is proven is left alone. A window whose ensure
     // failed is not tried again by this watch, so a failing open never splits every tick.
     #[test]
@@ -8650,7 +8650,7 @@ mod tests {
         }
     }
 
-    // #103 step 6: a window whose ensure failed (a lock held elsewhere, say) is tried again once a minute has passed.
+    // step 6: a window whose ensure failed (a lock held elsewhere, say) is tried again once a minute has passed.
     #[test]
     fn a_failed_window_is_tried_again_after_a_minute() {
         let mut probes = vec!["live"; 33];
@@ -8695,7 +8695,7 @@ mod tests {
             .count()
     }
 
-    // #103 QA: break-pane moves the window's last view to @6. The bar, before it leaves, gives every other view window
+    // QA: break-pane moves the window's last view to @6. The bar, before it leaves, gives every other view window
     // without a proven bar its own (under the session lock, as a tick does), since no tick of it follows: one whose
     // ensure failed within the minute (`retried`: @6 held a third view from the first tick) is tried again then.
     #[test]
@@ -8740,13 +8740,13 @@ mod tests {
         }
     }
 
-    // #103 QA: a view seen in the bar's own window counts from the first tick that sees it, recorded or not: a view
+    // QA: a view seen in the bar's own window counts from the first tick that sees it, recorded or not: a view
     // closed before the record proves the bar (the first tick ran before open recorded it) still lets it leave.
     const OWN_MARK_READ: &str = "-N display-message -p -t %7 #{pane_pid}|#{@mux-agents-bar}";
     const UNMARK: &str = "-N if-shell -F -t %7 #{&&:#{==:#{pane_dead},0},#{==:#{pane_pid},4242}} set-option -p -u -t %7 \
                           @mux-agents-bar";
 
-    // #103 redesign: a bar cleans up after itself. A watch never proven by the startup limit (10 s on the watch's own
+    // redesign: a bar cleans up after itself. A watch never proven by the startup limit (10 s on the watch's own
     // clock: its window's record never named its pane) whose pane carries its own mark (an open that failed after the
     // split) removes the mark and ends `unproven`, so its pane closes with it. A watch run by hand (its pane not
     // marked for it) reads that once and only draws; an unread mark is read again on the next tick.
@@ -8787,7 +8787,7 @@ mod tests {
         }
     }
 
-    // #103 review: the startup limit runs from the last tick the bar was proven, not from a flag set once: a bar whose
+    // review: the startup limit runs from the last tick the bar was proven, not from a flag set once: a bar whose
     // window record is cleared after it was proven (open's last proof failed and cleared it) leaves within the limit,
     // unlabelled and unmarked, so no labelled pane is stranded beside a refusing retry.
     #[test]
@@ -8809,7 +8809,7 @@ mod tests {
         assert!(all.iter().any(|c| c == UNLABEL) && all.iter().any(|c| c == UNMARK));
     }
 
-    // #103 review: `Kept` needs the full proof the tick uses. A record naming this pane and pid with a stale start fails
+    // review: `Kept` needs the full proof the tick uses. A record naming this pane and pid with a stale start fails
     // every proof; it keeps nothing, and the bar leaves within the limit, unlabelled and unmarked.
     #[test]
     fn a_record_with_a_stale_start_keeps_no_bar() {
@@ -8827,7 +8827,7 @@ mod tests {
         assert!(all.iter().any(|c| c == UNLABEL) && all.iter().any(|c| c == UNMARK));
     }
 
-    // #103 review, fail closed: a self-exit whose session lock is not taken, or whose window record cannot be read under
+    // review, fail closed: a self-exit whose session lock is not taken, or whose window record cannot be read under
     // it, decides nothing: the bar keeps running, neither unlabelled nor unmarked, and tries again on the next tick.
     #[test]
     fn a_self_exit_without_its_lock_or_record_decides_nothing() {
@@ -8861,7 +8861,7 @@ mod tests {
         }
     }
 
-    // #103 review: the self-exit is decided under the session's sidebar lock, the record read again there: an ensure
+    // review: the self-exit is decided under the session's sidebar lock, the record read again there: an ensure
     // that recorded (adopted) the bar while the bar waited on the lock keeps it running, neither unlabelled nor
     // unmarked.
     #[test]
@@ -8892,7 +8892,7 @@ mod tests {
         assert!(!all.iter().any(|c| c == UNLABEL || c == UNMARK));
     }
 
-    // #103 QA: the window's `@mux-agents-viewed` (set by the verb that placed the view) makes it held, even when the
+    // QA: the window's `@mux-agents-viewed` (set by the verb that placed the view) makes it held, even when the
     // view is gone before the bar's first tick: the bar leaves at once, and unsets it.
     #[test]
     fn a_view_closed_before_the_first_tick_still_lets_the_bar_leave() {
@@ -8910,7 +8910,7 @@ mod tests {
         assert!(all.iter().any(|c| c == UNMARK));
     }
 
-    // reentry-6a E4.5, finding #11: a status window has no member view; its bar does not leave for want of views (it
+    // reentry-6a E4.5, finding 11: a status window has no member view; its bar does not leave for want of views (it
     // runs until its own pane goes), unlike a viewed window (`a_view_closed_before_the_first_tick_still_lets_the_bar_leave`).
     #[test]
     fn a_status_windows_bar_stays_without_views() {
@@ -8937,7 +8937,7 @@ mod tests {
         assert_eq!((ended, frames.len()), ("view-closed", 1));
     }
 
-    // #103 QA: a leave waits on the session lock, and a spawn or focus may reuse the bar meanwhile. Under the lock the
+    // QA: a leave waits on the session lock, and a spawn or focus may reuse the bar meanwhile. Under the lock the
     // window is read again: a view there again keeps the bar, which neither unlabels nor clears its record.
     #[test]
     fn a_view_back_under_the_lock_keeps_the_bar() {
@@ -9018,7 +9018,7 @@ mod tests {
         }
     }
 
-    // #103: each window keeps its own bar, found by its own window record, split in that window, under the one
+    // each window keeps its own bar, found by its own window record, split in that window, under the one
     // session lock.
     #[test]
     fn each_window_keeps_its_own_bar() {
@@ -9069,7 +9069,7 @@ mod tests {
         assert_eq!(ensure_in(&w, "@2"), "existing %8");
     }
 
-    // #103: a window's record is that window's bar only while the proven bar stands in that window.
+    // a window's record is that window's bar only while the proven bar stands in that window.
     #[test]
     fn a_record_naming_a_bar_in_another_window_is_not_that_windows_bar() {
         let (w, panes) = sidebar_world(
@@ -9091,7 +9091,7 @@ mod tests {
         assert_eq!(closes(&w), 0);
     }
 
-    // #103: an unproven label refuses a bar in its own window only.
+    // an unproven label refuses a bar in its own window only.
     #[test]
     fn an_unproven_label_refuses_only_its_own_window() {
         let (w, _) = sidebar_world(
@@ -9105,7 +9105,7 @@ mod tests {
         assert_eq!(ensure_in(&w, "@2"), "opened %8");
     }
 
-    // #103: a 0.2.x session record moves once, under the session lock, to its proven bar's window; the session's is
+    // a 0.2.x session record moves once, under the session lock, to its proven bar's window; the session's is
     // unset, so the next look reads it no more.
     #[test]
     fn a_proven_session_record_moves_to_its_bars_window() {
@@ -9170,7 +9170,7 @@ mod tests {
         assert_eq!((get(&panes, RECORD), record(&panes)), (None, None));
     }
 
-    // #103: an unproven session record refuses while any pane of the session carries the label (it may be that
+    // an unproven session record refuses while any pane of the session carries the label (it may be that
     // bar), in every window; with no label anywhere it names nothing and is cleared. An unreadable one refuses.
     #[test]
     fn an_unproven_session_record_refuses_while_the_session_holds_a_label_else_is_cleared() {
@@ -9212,7 +9212,7 @@ mod tests {
         assert_eq!(count(&w, "split-window"), 0);
     }
 
-    // #103: -Close lists the session's windows and closes the proven bar of each, clearing each window's record.
+    // -Close lists the session's windows and closes the proven bar of each, clearing each window's record.
     #[test]
     fn close_closes_the_bar_of_every_window() {
         let (w, panes) = sidebar_world("", Mux::default());
@@ -9249,7 +9249,7 @@ mod tests {
         );
     }
 
-    // #103 redesign: no open or ensure kills a pane it did not just split. In the recorded argv a kill appears only in
+    // redesign: no open or ensure kills a pane it did not just split. In the recorded argv a kill appears only in
     // `sidebar -Close` (the proven bar) and in a spawn whose tagging failed (its own new view).
     #[test]
     fn the_recorded_argv_kills_only_in_close_and_a_failed_spawn() {
@@ -9270,7 +9270,7 @@ mod tests {
         }
     }
 
-    // #103 QA: `ensure` (spawn, focus and resume keep their view's bar through it) marks the window viewed, under the
+    // QA: `ensure` (spawn, focus and resume keep their view's bar through it) marks the window viewed, under the
     // session's sidebar lock, before the bar is found or opened.
     #[test]
     fn ensure_marks_its_window_viewed_under_the_lock() {
@@ -9295,7 +9295,7 @@ mod tests {
         );
     }
 
-    // #103 review: a dead pane (remain-on-exit on, a bar that left) blocks no later bar, whatever its options: with
+    // review: a dead pane (remain-on-exit on, a bar that left) blocks no later bar, whatever its options: with
     // the side-bar label and its mark, or the mark alone, the next ensure opens a bar.
     #[test]
     fn a_dead_bar_pane_blocks_no_later_bar() {
@@ -9796,7 +9796,7 @@ mod tests {
         }
     }
 
-    // #103 review (PM): a queued popup that never opened leaves its peek file. The bar sweeps its own peek files older
+    // review (PM): a queued popup that never opened leaves its peek file. The bar sweeps its own peek files older
     // than 10 minutes when it starts and when it opens a popup; a younger one may be a popup still open, so it stays.
     #[test]
     fn the_bar_sweeps_only_its_own_peek_files_older_than_10_minutes() {

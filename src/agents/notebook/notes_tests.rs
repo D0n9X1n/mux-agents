@@ -1,4 +1,4 @@
-//! Task 6 (#103 phase 7a): `notes` lists the durable notebook newest first (N3; ambiguity 8).
+//! Task 6 (phase 7a): `notes` lists the durable notebook newest first (N3; ambiguity 8).
 use std::path::PathBuf;
 
 use serde_json::{Value, json};

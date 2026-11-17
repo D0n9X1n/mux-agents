@@ -92,7 +92,7 @@ fn classify_spec(root: &Path, spec: &Path) -> Spec {
 }
 
 /// Starts the client attached to this pane: its path, its arguments, the variables to take out, and `started`, told the
-/// client's pid from the child handle before the wait (#103 D1); its exit code.
+/// client's pid from the child handle before the wait (D1); its exit code.
 pub(crate) type Start<'a> =
     &'a mut dyn FnMut(&Path, &[String], &[&str], &mut dyn FnMut(u32)) -> io::Result<i32>;
 
@@ -146,7 +146,7 @@ pub(crate) fn run(ctx: &Ctx, spec: &str, err: &mut dyn FnMut(&str), start: Start
 
 /// Flushes the claim's folder and every folder above it, up to the filesystem root, before the client may run, so no
 /// folder entry on the claim's path can vanish in a crash or power loss, whoever made it and whether or not its maker
-/// finished (#103). Any failed flush stops the launch. Above the state root a folder this user cannot add an entry to
+/// finished. Any failed flush stops the launch. Above the state root a folder this user cannot add an entry to
 /// (`C:\Users`, `/home`) is skipped by `sync`: nothing on the path can have been made in it by this user.
 fn flush_claim(
     root: &Path,
@@ -221,7 +221,7 @@ fn run_seamed(
     }
 }
 
-/// The client flags the launch spec records, the exact ones its spawn chose (#103: a person's `up` records its own).
+/// The client flags the launch spec records, the exact ones its spawn chose (a person's `up` records its own).
 /// None when they are missing or not all text: a spec never falls back to flags it does not name.
 fn spec_flags(launch: &Value) -> Option<Vec<String>> {
     launch
@@ -1077,7 +1077,7 @@ mod tests {
         }
     }
 
-    // #103: a won claim and every folder above it are flushed to disk before the client runs. Any failed flush, at
+    // a won claim and every folder above it are flushed to disk before the client runs. Any failed flush, at
     // `gens` or above the state root, leaves the claim `run` and an exit record, and the client never runs.
     #[test]
     fn generation_claim_is_flushed_before_the_client_runs() {
@@ -1420,7 +1420,7 @@ mod tests {
 
     #[test]
     fn a_timed_out_launcher_makes_commit_json_as_its_give_up_unless_the_spawn_did() {
-        // Timed out with no commit: it makes commit.json as its give-up, so a late spawn can no longer commit (#97).
+        // Timed out with no commit: it makes commit.json as its give-up, so a late spawn can no longer commit.
         let l = committed_spec("claude", json!([]));
         std::fs::remove_file(gens::path(&l.folder, 0, "commit")).unwrap();
         assert_eq!(launch(&l, &spec_str(&l), exits_7).code, 1);
@@ -1501,7 +1501,7 @@ mod tests {
         assert!(ran.started.is_empty());
     }
 
-    // #103 phase 2a-i: the client runs with the flags its spec records, byte for byte, then its args; a spec with no
+    // phase 2a-i: the client runs with the flags its spec records, byte for byte, then its args; a spec with no
     // recorded flags starts nothing rather than fall back to a fixed list.
     #[test]
     fn the_launch_runs_the_flags_its_spec_records() {
@@ -1971,7 +1971,7 @@ mod tests {
         }
     }
 
-    // outcome-2 O5 (#103; finding 5to8-14): a restore whose conversation is gone, through the launcher entry. The
+    // outcome-2 O5 (; finding 5to8-14): a restore whose conversation is gone, through the launcher entry. The
     // stand-in client knows only conversation `s1`: `--resume` of any other prints the verified claude rejection
     // (`No conversation found with session ID: <uuid>`) on its stderr and exits 1 before readiness. The launcher records
     // exit.json; the generation is failed and needs recovery; no task is resent (no prompt in the spec, no hc call).
@@ -2811,7 +2811,7 @@ mod tests {
         assert_eq!(f.slept(), vec![100; 603], "each barrier sleep is 100 ms");
     }
 
-    // r2b call 33 (review #147 F1): through run_gen's start callback, with the barrier file, client.json stays
+    // r2b call 33 (review F1): through run_gen's start callback, with the barrier file, client.json stays
     // unpublished while the launcher waits for report.json, and is published once it exists; the mark is report-first.
     #[cfg(feature = "live")]
     #[test]
@@ -2952,7 +2952,7 @@ mod tests {
                 "{case}: exit.json while the client runs"
             );
             // A2a's rule vetoes through the mark or the start. A foreign live child of the launcher with no mark (mark
-            // fails, earlier exit) is outside the threat model of #103.
+            // fails, earlier exit) is outside the threat model: only this user's own processes run there.
             if !matches!(case, "mark fails" | "earlier exit") {
                 assert_eq!(
                     proven, None,

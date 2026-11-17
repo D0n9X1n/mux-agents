@@ -1,4 +1,4 @@
-//! notebook-7b V1 (#103): the visible notebook block of every launch's first-turn text.
+//! notebook-7b V1: the visible notebook block of every launch's first-turn text.
 use serde_json::{Value, json};
 
 use super::Author;

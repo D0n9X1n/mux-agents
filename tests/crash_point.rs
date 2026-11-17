@@ -95,7 +95,7 @@ fn child(crash: Option<&str>) -> (i32, String) {
     )
 }
 
-// PM call 8 (4to6 #6): in a test-panic build only a named step stops the process; with the variable removed, or
+// PM call 8 (4to6 item 6): in a test-panic build only a named step stops the process; with the variable removed, or
 // naming another step, every step passes.
 #[cfg(feature = "test-panic")]
 #[test]

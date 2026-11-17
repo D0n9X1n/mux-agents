@@ -226,7 +226,7 @@ fn end_entry(tx: &Tx<'_>, caller: &Caller, e: &Entry) -> Res<()> {
     let Some(&last) = all.last() else {
         return Ok(());
     };
-    // Integration (#150): the notice is posted from the presented record, as `stop_life` and `list` read the member:
+    // Integration: the notice is posted from the presented record, as `stop_life` and `list` read the member:
     // its pane is the one view.json presents, the `<from>|<pane>` the board counts the row's unread under. An
     // unreadable member or view refuses, as the raw read did.
     let r = match gens::member_of(&folder) {

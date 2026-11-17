@@ -1,5 +1,5 @@
 //! restore-6b: reconcile every lifecycle member of a team; a Lost member whose last run succeeded comes back as
-//! a new generation of the same id and conversation (#103).
+//! a new generation of the same id and conversation.
 use super::gens::{Gen, Verdict};
 use super::lifecycle::Life;
 use super::team_state::Tx;

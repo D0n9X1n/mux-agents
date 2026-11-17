@@ -12,10 +12,10 @@ pub enum Event {
     Enter,
     Esc,
     Interrupt,
-    // herdr's next and previous agent (#90): `n`, `N`.
+    // herdr's next and previous agent: `n`, `N`.
     Next,
     Prev,
-    // herdr's peek (#91): `p`.
+    // herdr's peek: `p`.
     Peek,
     // views-6f: `y` answers `close? y/n`.
     Yes,

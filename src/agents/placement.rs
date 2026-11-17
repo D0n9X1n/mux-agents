@@ -31,7 +31,7 @@ pub(crate) fn read_placement(ctx: &Ctx, caller: &Caller) -> Res<Option<&'static 
 
 /// `placement` reads the session's placement (`tab` by default); `placement <value>` sets it on the caller's
 /// multiplexer session. Refused from a tagged pane: only the top-level chat chooses, or the depth-0 leader of an `up`
-/// team for its own team session (#137).
+/// team for its own team session.
 pub fn placement(ctx: &Ctx, request: &Request) -> Res<Map<String, Value>> {
     let value = match request.positional.first() {
         None => None,
@@ -40,7 +40,7 @@ pub fn placement(ctx: &Ctx, request: &Request) -> Res<Map<String, Value>> {
     let caller = resolve(ctx)?;
     crate::cli::member_views(ctx, &caller)?;
     if caller.member.is_some() {
-        // #137: a proven hc member is allowed only as the depth-0 leader `up` launched that its team record names,
+        // a proven hc member is allowed only as the depth-0 leader `up` launched that its team record names,
         // proven again under the team lock (`tree::standing`), which is held while it reads or sets the option.
         return super::tree::with_standing(ctx, &caller, |standing| {
             let leads = match (standing, super::tree::scope(ctx, &caller)?) {

@@ -32,11 +32,11 @@
 //! - The command line `@say\t<text>` runs no mux-agent: it prints `<text>` and a newline on the client's own stdout (its
 //!   terminal, which hc keeps) and answers `{"ok": true}`. The client prints nothing else, at start or after.
 //! - The command line `@sleep\t<ms>` runs no mux-agent: it sleeps `<ms>` and answers `{"slept": <ms>}`. A line
-//!   `@bg <line>` runs `<line>` on a thread beside the loop, answering in the files of its own n (#103).
+//!   `@bg <line>` runs `<line>` on a thread beside the loop, answering in the files of its own n.
 //! - Each line read on stdin (what `send` types into the pane) is appended to `input.<pid>.log`.
 //! - `conv.<sid>.json`: the argv of the first start with `--session-id <sid>` (create-once). A start with
 //!   `--resume <sid>` records it as `recalled` in `client.<pid>.json` (null when absent): a restored client proves it
-//!   has the same conversation (#103 6b).
+//!   has the same conversation (6b).
 //! - Quit: `quit` (all clients) or `quit.<pid>` appearing makes the client write `exited.<pid>` (its exit code) and
 //!   exit with numeric `quit.<pid>` contents overriding `MUX_IT_EXIT`; empty, invalid or missing contents keep it.
 
@@ -114,7 +114,7 @@ fn main() {
         .and_then(|c| c.trim().parse().ok())
         .unwrap_or(0);
 
-    // launch-1 (4to6 #7, #9, #10): one line `<pid> start|resume` per conversation a client starts or reloads, never
+    // launch-1 (4to6 items 7, 9, 10): one line `<pid> start|resume` per conversation a client starts or reloads, never
     // its argv (a task holds newlines). `--session-id <s>` starts s (a fork's `--resume <root> --session-id <s>`
     // included); a root client with no selector starts CLAUDE_CODE_SESSION_ID (Live::agent's root); claude's lone
     // `--resume <s>` reloads s and exits 1 when there is none; copilot's `--resume <new>` starts it (ambiguity 15).
@@ -259,7 +259,7 @@ fn main() {
             let text = std::fs::read_to_string(&held).unwrap_or_default();
             for line in text.lines().filter(|l| !l.is_empty()) {
                 let base = format!("reply.{pid}.{taken}");
-                // `@bg <line>`: run beside the loop, so a long read -Wait does not block the next command (#103).
+                // `@bg <line>`: run beside the loop, so a long read -Wait does not block the next command.
                 if let Some(rest) = line.strip_prefix("@bg ") {
                     let (runner, rest) = (runner.clone(), rest.to_string());
                     std::thread::spawn(move || runner.run(&rest, &base));
@@ -307,7 +307,7 @@ impl Runner {
                 Err(e) => (Vec::new(), format!("fake-client: {e}\n").into_bytes(), -1),
             }
         } else if args.len() == 2 && args[0] == "@sleep" {
-            // Live harness support (#103): a slow command with no mux-agent, for background-line tests.
+            // Live harness support: a slow command with no mux-agent, for background-line tests.
             let ms: u64 = args[1].parse().unwrap_or(0);
             std::thread::sleep(std::time::Duration::from_millis(ms));
             (json!({"slept": ms}).to_string().into_bytes(), Vec::new(), 0)

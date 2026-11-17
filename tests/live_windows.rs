@@ -1,5 +1,5 @@
 #![cfg(all(windows, feature = "live"))]
-//! Windows live tests for the side bar's clicks and keys (#70): a private rmux server per test (`rmux -L <name>`,
+//! Windows live tests for the side bar's clicks and keys: a private rmux server per test (`rmux -L <name>`,
 //! never the user's own) whose root pane is `cmd.exe`, with `claude.exe` on PATH as the fake client. Each test
 //! drives the bar as a terminal would and checks which pane the multiplexer then has active.
 //!
@@ -88,7 +88,7 @@ fn a_diagnostic_on_a_bounded_child_never_blocks_its_watchdog() {
     );
 }
 
-// o2 call 29 (QA #146 F3): `bounded::output` never answers success with output it did not finish reading. The child
+// o2 call 29 (QA F3): `bounded::output` never answers success with output it did not finish reading. The child
 // prints and exits while a descendant keeps its stdout open about 8 s: refused `TimedOut` naming stdout, within the
 // 5 s grace and the 1 s release (so the read handle was dropped, not left blocked until the descendant ends). A
 // normal child keeps its whole output, past one pipe buffer. Needs no rmux.
@@ -463,7 +463,7 @@ fn rmux_try(live: &Live, args: &[&str]) -> String {
     }
 }
 
-/// #150 diagnosis: None while `bar` is listed and alive; else what explains its exit: every pane with its dead flag
+/// diagnosis: None while `bar` is listed and alive; else what explains its exit: every pane with its dead flag
 /// and start command, the bar's last screen (its `watch` reply names `ended`), and each spawned member's view.json.
 fn bar_gone(live: &Live, bar: &str, spawned: &[&Value]) -> Option<String> {
     let panes = rmux_try(
@@ -600,7 +600,7 @@ fn hc_worker_and_view_close_survives_focus_stop() {
     assert_eq!(row["life"], "running");
     assert_eq!(row["view"], "detached");
     assert!(row["pane"].is_null());
-    // Nothing is consumed without an ack (#103 4b-i): acking the first batch leaves nothing new.
+    // Nothing is consumed without an ack (4b-i): acking the first batch leaves nothing new.
     let batch = s(&first["batch"]);
     assert_eq!(
         live.run(&["read", "-Deliver", "-Ack", &batch])["ids"],
@@ -622,7 +622,7 @@ fn hc_worker_and_view_close_survives_focus_stop() {
     });
 }
 
-// A worker whose view is closed still reads its own mail (#104 phase 1c): the person sends to it after the view pane
+// A worker whose view is closed still reads its own mail (phase 1c): the person sends to it after the view pane
 // is gone, and `read` run by the worker in its hc terminal, which has no TMUX or RMUX, returns that message.
 #[test]
 fn hc_worker_reads_after_its_view_closes() {
@@ -673,7 +673,7 @@ fn hc_worker_reads_after_its_view_closes() {
     };
     let first = read(1, "read");
     assert_eq!(first["ok"], true, "{first}");
-    // A served batch (#103 4b-i) is one `text`: each entry starts at its header and ends in LF.
+    // A served batch (4b-i) is one `text`: each entry starts at its header and ends in LF.
     let text = s(&first["text"]);
     let bodies: Vec<&str> = text
         .split("[mux-agent from ")
@@ -691,10 +691,10 @@ fn hc_worker_reads_after_its_view_closes() {
     assert_eq!(again["ids"], serde_json::json!([]), "{again}");
 }
 
-// Stop an agent, then resume it (#103): the reply names X as `from` and the successor Y (same name, a new hc
+// Stop an agent, then resume it: the reply names X as `from` and the successor Y (same name, a new hc
 // terminal); the client in Y's hc terminal runs `--resume <X's session>` as the last arguments, with no task after
 // them; Y's record names X in `resumedFrom`; and the reply's `sidebar` is a live bar in the window of Y's view
-// (#122: a bar per window).
+// (a bar per window).
 #[test]
 fn hc_stop_then_resume_returns_with_its_conversation() {
     let Some(live) = Live::start() else {
@@ -818,7 +818,7 @@ fn a_client_renamed_by_an_update_still_calls() {
     assert_eq!(answer["ok"], true, "list: {answer} {err}");
 }
 
-// #70: on Windows the bar reads its console: it turns mouse reports on, `j` then Enter focuses the first agent, and
+// on Windows the bar reads its console: it turns mouse reports on, `j` then Enter focuses the first agent, and
 // a left click on an agent's name line focuses that agent.
 #[test]
 fn bar_keys_and_a_click_focus_an_agent() {
@@ -829,7 +829,7 @@ fn bar_keys_and_a_click_focus_an_agent() {
     let w2 = live.spawn("w2");
     let bar = s(&w1["sidebar"]);
     let (p1, p2) = (s(&w1["pane"]), s(&w2["pane"]));
-    // #150 diagnosis (CI only: rmux's daemon is refused locally): a bar that leaves keeps its last screen, which holds
+    // diagnosis (CI only: rmux's daemon is refused locally): a bar that leaves keeps its last screen, which holds
     // its `watch` reply and so its `ended` reason; a bar gone or dead fails here with what it saw.
     let _ = rmux_try(
         &live,
@@ -858,7 +858,7 @@ fn bar_keys_and_a_click_focus_an_agent() {
     // A press read within 50 ms of a frame is dropped, as the user may have aimed at the frame before it (sidebar.rs
     // PRESS_GAP). So each try presses just after a redraw, when the next frame is about 1.9 s away: the bar's text
     // changes with every frame while its agents' ages count seconds. A bar busy between frames can still read a press
-    // late, so the tries go on until WAIT (#103: the tree tests now run beside this one).
+    // late, so the tries go on until WAIT (the tree tests now run beside this one).
     let mut clicked = false;
     let deadline = Instant::now() + WAIT;
     while !clicked && Instant::now() < deadline {
@@ -881,7 +881,7 @@ fn bar_keys_and_a_click_focus_an_agent() {
     assert_eq!(live.field(&bar, MOUSE), "11", "the bar still reads clicks");
 }
 
-// #70: Ctrl-C typed into a `watch` run by hand ends it `interrupted`, turns mouse reports off, and leaves the shell
+// Ctrl-C typed into a `watch` run by hand ends it `interrupted`, turns mouse reports off, and leaves the shell
 // taking typed lines again.
 #[test]
 fn ctrl_c_ends_a_hand_run_watch_and_gives_the_console_back() {
@@ -1265,7 +1265,7 @@ fn a_dropped_run_reply_runs_nothing_then_a_retry_runs_once() {
     assert_eq!(clients(), before + 1, "the retry ran exactly one client");
 }
 
-// proof-0b K2 on rmux for Windows (4to6 #1, #3, #4, #19): a team, its leader spawns w2 with a brief; proof waited
+// proof-0b K2 on rmux for Windows (4to6 items 1, 3, 4, 19): a team, its leader spawns w2 with a brief; proof waited
 // (PM call 26); with the server killed (RMUX unset in hc clients, only rmux on PATH) the leader sends a file, w2 reads
 // and reports, focus is refused `views`; list and stop run with views down.
 #[test]
@@ -1356,7 +1356,7 @@ fn members_mail_without_the_multiplexer() {
     assert_eq!(
         by_pid(&live, &mut sent, p1, &["stop", "w2"])["life"],
         "ended",
-        "stop needs no view (4to7re #15)"
+        "stop needs no view (4to7re item 15)"
     );
 }
 
@@ -1839,7 +1839,7 @@ impl Live {
             .unwrap_or_else(|e| panic!("{e}: {text:?}\n{}", self.no_reply(pane)))
     }
 
-    /// #150: why `run_at` read no reply. The exit code and MUX_AGENTS_CRASH of the pane's shell (`echo` keeps
+    /// why `run_at` read no reply. The exit code and MUX_AGENTS_CRASH of the pane's shell (`echo` keeps
     /// ERRORLEVEL), its screen, and every pane; each read answers its own failure rather than panicking.
     fn no_reply(&self, pane: &str) -> String {
         let probe = self.dir.join("at.why");
@@ -2189,7 +2189,7 @@ fn notebook_and_peek_stay_in_the_team() {
     }
 }
 
-/// Team messaging end to end on Windows (#103 4a): leader > a > b, and team T2 in another session. A broadcast is
+/// Team messaging end to end on Windows (4a): leader > a > b, and team T2 in another session. A broadcast is
 /// one id each; a reply is hop 1; another team is refused; `children` is only the leader's own; the 121st send of
 /// the hour refuses with `retryAt`.
 #[test]
@@ -2243,7 +2243,7 @@ fn team_messaging_stays_in_the_team() {
     let id = s(&r["id"]);
     for who in [&leader, &b] {
         let got = by(&live, &mut sent, who, &["read"]);
-        // The ids a read served (#103 4b-i, `msg-plan-4b-i-3.md` F25, finding 15).
+        // The ids a read served (4b-i, `msg-plan-4b-i-3.md` F25, finding 15).
         let ids: Vec<String> = got["ids"].as_array().unwrap().iter().map(s).collect();
         assert_eq!(ids, std::slice::from_ref(&id), "one id each");
     }
@@ -2302,7 +2302,7 @@ fn team_messaging_stays_in_the_team() {
     );
 }
 
-/// Receipts end to end on Windows (#103 4b-i): b's unacked batch is served again, then acked; a resumed b (another
+/// Receipts end to end on Windows (4b-i): b's unacked batch is served again, then acked; a resumed b (another
 /// process) gets a rebuilt batch for unacked mail.
 #[test]
 fn an_unacked_batch_is_served_again_and_rebuilt_for_a_successor() {
@@ -2629,7 +2629,7 @@ fn team_pane(live: &Live, session: &str) -> String {
     }
     let state = live.dir.join("state");
     live.line(&pane, &format!("set MUX_AGENTS_STATE={}", state.display()));
-    // #150 (CI d14aeb2): rmux 0.10 (dfd68c77) gives a split the base environment of the pane it splits, and a
+    // (CI d14aeb2): rmux 0.10 (dfd68c77) gives a split the base environment of the pane it splits, and a
     // session's first panes the whole environment of the client that ran `new-session`. After `crash_up`, that
     // client is the crashed `up`, so a pane split in its session inherits MUX_AGENTS_CRASH, and an `up` typed there
     // halts at the same step (exit 86, no reply).
@@ -3195,7 +3195,7 @@ fn lose(live: &mut Live, ids: &[String]) -> (Vec<Value>, Vec<u32>) {
         .collect();
     live.core.kill_hard_with(&terminals);
     let live: &Live = live;
-    // #150 (CI d14aeb2): the wait reads what reconcile reads (`gens::find`: the generation's labels, then each
+    // (CI d14aeb2): the wait reads what reconcile reads (`gens::find`: the generation's labels, then each
     // terminal) and asks for the shell `lifecycle::classify` calls Lost, for every member in one pass, twice running.
     // "Live and not the launcher" passed while `up`'s own read of b still answered Unknown("hc"); an hc error (the
     // restarted core still adopting, a89bacc) is "not yet".
@@ -3441,7 +3441,7 @@ fn harness_only(was: &[String], now: &[String], line: &str) -> bool {
     k <= keep && now[..k] == was[keep - k..keep] && rest.len() == 1 && rest[0].ends_with('>')
 }
 
-// #150 (CI integration-windows, 0450551): the exact screens of command pane %10. The pane was full, so its first line
+// (CI integration-windows, 0450551): the exact screens of command pane %10. The pane was full, so its first line
 // scrolled off when the peek's line and its prompt arrived; only the harness's line was added.
 #[test]
 fn a_scrolled_command_pane_gained_only_the_harness_line() {
@@ -3508,7 +3508,7 @@ fn crash_up(live: &Live, step: &str) -> i32 {
     run_crashed(live, step, &["up", "-Client", "claude"])
 }
 
-/// The anchor key: the one state folder that holds `agents/<id>` (no key is hashed in the test; finding 11-14 #7).
+/// The anchor key: the one state folder that holds `agents/<id>` (no key is hashed in the test; finding 11-14 item 7).
 fn anchor_key(live: &Live, id: &str) -> String {
     let keys: Vec<String> = std::fs::read_dir(live.dir.join("state"))
         .unwrap()
@@ -3580,7 +3580,7 @@ fn bar_shown(live: &Live, reply: &Value) {
     );
 }
 
-/// Findings 11-14 #32, F19: each reply entry's own `pane` and `window` are a real pane of that window in `session`
+/// Findings 11-14 item 32, F19: each reply entry's own `pane` and `window` are a real pane of that window in `session`
 /// attaching its member's current address (`attach_program`, F11); no member is listed twice; its descriptor names
 /// the current generation. Answers how many panes of `session` attach a member address.
 fn views_are_panes(live: &Live, reply: &Value, key: &str, session: &str) -> usize {
@@ -3831,7 +3831,7 @@ fn the_hold_window_outlives_the_first_view_on_windows() {
 }
 
 /// Whether a pane's start command runs `verb` as one of its words. rmux reports a start command of several
-/// arguments as its argv, each part percent-encoded and joined by 0x1F (#150), so it holds no space; a plain
+/// arguments as its argv, each part percent-encoded and joined by 0x1F, so it holds no space; a plain
 /// command is split on spaces.
 fn runs(command: &str, verb: &str) -> bool {
     if !command.contains('\u{1f}') {
@@ -3880,7 +3880,7 @@ fn lost_shell(t: &Value) -> bool {
         && ["pwsh", "pwsh.exe", "powershell", "powershell.exe"].contains(&name.as_str())
 }
 
-// #150 (CI d14aeb2): `lose` waits until hc shows what reconcile reads as Lost, not merely "not the launcher".
+// (CI d14aeb2): `lose` waits until hc shows what reconcile reads as Lost, not merely "not the launcher".
 #[test]
 fn lost_shell_is_only_hc_keeps_powershell_live() {
     let pwsh = |state: &str, argv: Value| json!({"state": state, "argv": argv});
@@ -3901,7 +3901,7 @@ fn lost_shell_is_only_hc_keeps_powershell_live() {
     assert!(!lost_shell(&json!({})));
 }
 
-// #150 (CI 85d70b5): one hc holder carried every member's terminal. Killing a client while it lived let it record
+// (CI 85d70b5): one hc holder carried every member's terminal. Killing a client while it lived let it record
 // the launcher's exit (Ended, exit 1, never Lost), and the shared holder came up twice (taskkill 128 the second time).
 #[test]
 fn kill_order_ends_each_hold_once_before_any_client() {
@@ -3961,7 +3961,7 @@ fn member_opt(live: &Live, id: &str, file: &str) -> Option<Value> {
     serde_json::from_str(&std::fs::read_to_string(agent_dir(live, id).join(file)).ok()?).ok()
 }
 
-/// The leader spawns `name` (task, brief, `-Context brief`), then waits for ready (#147).
+/// The leader spawns `name` (task, brief, `-Context brief`), then waits for ready.
 fn child(live: &Live, sent: &mut HashMap<u32, usize>, leader: &str, name: &str) -> Value {
     let task = live.dir.join("task.txt").display().to_string();
     let brief = live.dir.join("brief.md");

@@ -152,7 +152,7 @@ set +f
 unset MUX_AGENTS_BIN
 if [ "$n" = 34 ] && [ -z "$why" ]; then ok skill_commands_run_through_shim; else bad skill_commands_run_through_shim "$n commands$why"; fi
 
-# #84: Copilot reads the plugin root's hooks.json (Claude Code reads hooks/hooks.json only) and runs each command from
+# Copilot reads the plugin root's hooks.json (Claude Code reads hooks/hooks.json only) and runs each command from
 # the plugin root. Every hook reports through the shim, never fails the turn, and maps Copilot's events as herdr's
 # agents report: a prompt works, a question blocks until answered, a stop idles. Session start names the session
 # (report-2b K3): `report -Session -Stdin` reads Copilot's JSON from stdin, with 30 s for its readiness wait.

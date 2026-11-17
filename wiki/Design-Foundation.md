@@ -2,7 +2,7 @@
 
 [简体中文](Design-Foundation-zh-CN)
 
-Sub-project A of milestone v0.1.0: #3 rename, #6 `parentAgentId`, #2 CI, #5 release. Sub-projects B (#1), C (#4) and D (#7–#9) build on it.
+Sub-project A of milestone v0.1.0: the rename, `parentAgentId`, CI and release. Sub-projects B, C and D build on it.
 
 ## Purpose
 
@@ -18,15 +18,15 @@ Fix the name before anyone installs it, and give every later pull request CI on 
 
 ## Changes
 
-**Rename (#3).** Files: `scripts/mux-agent.ps1`, `scripts/mux-agent-launcher.ps1`, `scripts/MuxAgents.ps1`, `skills/mux-agents/`, `tests/MuxAgents*.ps1`. Every `RmuxAgent` identifier becomes `MuxAgent`, test fakes included (`New-FakeMuxAgentProviders`); `rmux-agent` text becomes `mux-agent`; `RMUX_AGENTS_STATE` becomes `MUX_AGENTS_STATE`; state root `%LOCALAPPDATA%\mux-agents\state`; mutex prefix `Local\MuxAgents-`; manifests, `[mux-agent]` header, error prefixes and README follow. Names that mean the multiplexer stay: `RMUX`, `TMUX`, `TMUX_PANE`, `rmux.exe`, `Add-FakeRmuxRule`, the `-N` rule.
+**Rename.** Files: `scripts/mux-agent.ps1`, `scripts/mux-agent-launcher.ps1`, `scripts/MuxAgents.ps1`, `skills/mux-agents/`, `tests/MuxAgents*.ps1`. Every `RmuxAgent` identifier becomes `MuxAgent`, test fakes included (`New-FakeMuxAgentProviders`); `rmux-agent` text becomes `mux-agent`; `RMUX_AGENTS_STATE` becomes `MUX_AGENTS_STATE`; state root `%LOCALAPPDATA%\mux-agents\state`; mutex prefix `Local\MuxAgents-`; manifests, `[mux-agent]` header, error prefixes and README follow. Names that mean the multiplexer stay: `RMUX`, `TMUX`, `TMUX_PANE`, `rmux.exe`, `Add-FakeRmuxRule`, the `-N` rule.
 
-**`parentAgentId` (#6).** `Add-MuxAgentNotice` stops reading `Record.parentAgentId`, which nothing writes, and always posts to `pane-<n>` of `Record.parentPane`. Children cannot spawn, so a parent is never an agent pane.
+**`parentAgentId`.** `Add-MuxAgentNotice` stops reading `Record.parentAgentId`, which nothing writes, and always posts to `pane-<n>` of `Record.parentPane`. Children cannot spawn, so a parent is never an agent pane.
 
-**CI (#2).** `.github/workflows/ci.yml`: on `pull_request` and `push` to `main`; `contents: read`; a concurrency group cancels superseded pull-request runs; actions pinned by SHA with a version comment.
+**CI.** `.github/workflows/ci.yml`: on `pull_request` and `push` to `main`; `contents: read`; a concurrency group cancels superseded pull-request runs; actions pinned by SHA with a version comment.
 - `lint` (ubuntu): actionlint 1.7.12 verified against its pinned SHA-256; both manifests parse as JSON.
 - `test`, matrix `ubuntu-latest`, `macos-latest`, `windows-latest`, `fail-fast: false`: install Pester 4.10.1; on Windows set `TEMP`/`TMP` to `RUNNER_TEMP` (the 8.3 `RUNNER~1` path fails four tests, CI probe); run `tests/Invoke-MuxAgentTests.ps1`, which excludes tag `windows` off Windows and exits 1 on any failure.
 
-**Release (#5).** `.github/workflows/release.yml` on tags `v[0-9]+.[0-9]+.[0-9]+`, jobs chained by `needs`:
+**Release.** `.github/workflows/release.yml` on tags `v[0-9]+.[0-9]+.[0-9]+`, jobs chained by `needs`:
 - `validate` (read-only) runs `scripts/release/Test-MuxAgentRelease.ps1`, which takes the tag, the tag SHA, the `origin/main` ancestry answer, the `ci.yml` push runs for that SHA, and the manifest version, and exits 1 naming the first failure: not on `main`, no successful CI run, or version mismatch.
 - `package` (`needs: validate`, read-only): `git archive` of `.claude-plugin`, `skills`, `scripts`, `hooks` (when present), `README.md`, `LICENSE` into `mux-agents-<tag>.zip`, uploaded as an artifact.
 - `publish` (`needs: [validate, package]`), the only job with `contents: write`: `gh release create <tag>` with the zip, `--generate-notes`, and `wiki/Release-<tag>.md` prepended when present.

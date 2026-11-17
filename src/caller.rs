@@ -38,7 +38,7 @@ pub struct Caller {
     pub server_key: String,
     pub agent_tag: String,
     /// The member id proven through the caller's own hc terminal (its `mux.id`, labels, generation and life), none
-    /// for a caller proven by its pane. Such a member is itself whichever pane shows it (#104 phase 1c).
+    /// for a caller proven by its pane. Such a member is itself whichever pane shows it (phase 1c).
     pub member: Option<String>,
     /// A terminal identity whose D1 proof failed: never `member`; only `resolve_tree` returns it.
     pub candidate: Option<String>,
@@ -162,7 +162,7 @@ fn unadmitted(ctx: &Ctx, tree: bool) -> Res<Caller> {
         if c.candidate.is_some() && !tree {
             return Err(crate::agents::tree::tagged());
         }
-        // 4to6 #1, PM call 9: nothing is built here; a verb that needs the multiplexer reaches exactly this server.
+        // 4to6 item 1, PM call 9: nothing is built here; a verb that needs the multiplexer reaches exactly this server.
         *ctx.member_mux.borrow_mut() = match c.presentation {
             Some(_) => crate::mux::MemberMux::Live(
                 crate::mux::Endpoint {

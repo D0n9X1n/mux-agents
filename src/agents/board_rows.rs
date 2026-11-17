@@ -22,9 +22,9 @@ pub(super) struct Rows<'a> {
     pub(super) running: &'a [Pane],
     pub(super) now: SystemTime,
     pub(super) watch: bool,
-    // The team's leader on the bar's feed (#103 B1); none outside a team and off the bar.
+    // The team's leader on the bar's feed (B1); none outside a team and off the bar.
     pub(super) leader: Option<String>,
-    // Each team member's parent mailboxes (#103 A3 and review); empty outside a team.
+    // Each team member's parent mailboxes (A3 and review); empty outside a team.
     pub(super) parents: &'a HashMap<String, Vec<String>>,
     // Each team member's logical parents (call 10, C0), for the ones the tree places; empty outside a team.
     pub(super) logical: &'a BTreeMap<String, Vec<String>>,
@@ -107,7 +107,7 @@ impl Rows<'_> {
                 .and_then(|counts| counts.get(&legacy))
                 .copied()
                 .unwrap_or(0),
-            // A team row (#103 review): every parent mailbox, de-duplicated; the lines naming this member (`#<id>`), and
+            // A team row (review): every parent mailbox, de-duplicated; the lines naming this member (`#<id>`), and
             // the lines naming no member by name and pane (`<from>|<pane>` less those that name one, `!<from>|<pane>`).
             (None, Some(boxes)) => boxes
                 .iter()
@@ -168,7 +168,7 @@ impl Rows<'_> {
         if let Some(waiting) = waiting.filter(|_| self.watch) {
             row.insert("waiting".into(), waiting.into());
         }
-        // The bar's feed keys rows by member id (#103 B6); in a team it adds the tree (B1). `list` keeps its columns.
+        // The bar's feed keys rows by member id (B6); in a team it adds the tree (B1). `list` keeps its columns.
         if self.watch {
             row.insert("id".into(), id.into());
             // Call 11: the stored flag counts only for a pre-lifecycle record; `needs_recovery` decides the rest.

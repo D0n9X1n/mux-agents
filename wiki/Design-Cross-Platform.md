@@ -2,7 +2,7 @@
 
 [简体中文](Design-Cross-Platform-zh-CN)
 
-Sub-project B of milestone v0.1.0, issue #1. Builds on A.
+Sub-project B of milestone v0.1.0. Builds on A.
 
 ## Purpose
 

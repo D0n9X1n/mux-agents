@@ -1,4 +1,4 @@
-//! outcome-2 Task 1 (#103; o2 calls 15-17): what adjudication reads from report-2b's `Held`, under its own hold.
+//! outcome-2 Task 1 (; o2 calls 15-17): what adjudication reads from report-2b's `Held`, under its own hold.
 use super::*;
 use crate::agents::fixture::ID;
 use crate::agents::gens;

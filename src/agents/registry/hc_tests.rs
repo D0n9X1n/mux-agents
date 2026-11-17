@@ -798,7 +798,7 @@ fn a_held_snapshot_promoted_before_the_reap_records_nothing() {
     }
 }
 
-// Call 46 (QA #142): a forgotten terminal is noticed from `ended.json` only once that file's flushes succeed. The
+// Call 46 (QA): a forgotten terminal is noticed from `ended.json` only once that file's flushes succeed. The
 // gens/1 folder flush fails while `record_end` publishes, so `ended.json` is visible but not durable; hc then forgets
 // the terminal. With the fault still armed the reap stops with no mail and no notice; cleared, it posts once.
 #[test]
@@ -854,7 +854,7 @@ fn a_forgotten_terminal_posts_only_from_a_flushed_end() {
     w.fakes.hc_done().unwrap();
 }
 
-// Call 50 (QA #142): a notice is posted only from an end whose flushes succeed. `publish_end`'s gens/1 folder flush
+// Call 50 (QA): a notice is posted only from an end whose flushes succeed. `publish_end`'s gens/1 folder flush
 // fails, so `ended.json` is visible but not durable; with the fault still armed `add_notice` mails nothing and writes
 // no notice; cleared, it posts once.
 #[test]
@@ -899,7 +899,7 @@ fn a_notice_waits_for_a_flushed_end() {
     w.fakes.hc_done().unwrap();
 }
 
-// Call 62 (TL #144 F4): `terminate` records `reason: "terminated"` and posts no notice; the process stops before the
+// Call 62 (TL F4): `terminate` records `reason: "terminated"` and posts no notice; the process stops before the
 // stop caller posts one. An ordinary reap then posts exactly one stopped notice, whether hc forgot the terminal or
 // still shows it Finished (the recorded facts stand); a second reap posts nothing more.
 #[test]
@@ -1008,7 +1008,7 @@ fn a_stop_notice_reaches_the_off_anchor_parent_box() {
         session: "$A".into(),
     });
     let state = w.ctx.state_root.join("a1a1a1a1a1a1a1a1");
-    // Integration #150 CI: made private as the product makes it, the state root first; a folder left at the umask
+    // Integration CI: made private as the product makes it, the state root first; a folder left at the umask
     // (755) or with an inherited shared ACL is refused `state` before the notice under test.
     w.state();
     for f in [

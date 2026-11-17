@@ -169,7 +169,7 @@ pub fn sync_file(path: &Path) -> io::Result<()> {
 }
 
 /// `open`, which on Windows waits out a sharing violation (os error 32) for about a second: another process may
-/// briefly hold the folder or file open without sharing write (#103). Then the error stands, so a flush is never
+/// briefly hold the folder or file open without sharing write. Then the error stands, so a flush is never
 /// claimed without one. Any other error returns at once.
 fn open_waiting(open: impl Fn() -> io::Result<File>) -> io::Result<File> {
     #[cfg(windows)]
@@ -231,7 +231,7 @@ pub fn record_reads<T>(f: impl FnOnce() -> T) -> (T, Vec<PathBuf>) {
 
 /// Makes `path` hold `value` only if nothing is there yet: true when this call made it, false when it already
 /// existed. The JSON is written whole beside `path`, then hard-linked to it, so `path` appears with its content or
-/// not at all, and of two racers exactly one makes it (#97: spawn's commit against the launcher's give-up).
+/// not at all, and of two racers exactly one makes it (spawn's commit against the launcher's give-up).
 pub fn claim_json(path: &Path, value: &Value) -> Res<bool> {
     let mut name = path.as_os_str().to_owned();
     name.push(format!(".{}.tmp", crate::util::guid()?.replace('-', "")));
@@ -262,7 +262,7 @@ pub fn create_dir(dir: &Path) -> io::Result<()> {
 }
 
 /// Makes `dir` and flushes, on every call, each folder from `dir` up to `base` into its parent, so a retry finishes
-/// an entry flush an earlier call left undone, for folders that already existed too (#103 F3, QA fix 4).
+/// an entry flush an earlier call left undone, for folders that already existed too (F3, QA fix 4).
 pub fn durable_dir(dir: &Path, base: &Path) -> Res<()> {
     std::fs::create_dir_all(dir)?;
     let mut at = dir;
@@ -338,7 +338,7 @@ pub fn sync_dir(dir: &Path) -> io::Result<()> {
 /// Flushes a folder above the state root, which may not be this user's. A folder whose flush is refused is skipped
 /// only when this user cannot add an entry to it (`C:\Users`, `/home`, a 0100 folder): then no folder on the user's
 /// path can have been made in it by this user. Any other failure is an error, so an entry this user may have made is
-/// never left unflushed (#103). This assumes the permissions of the folders above the state root do not change
+/// never left unflushed. This assumes the permissions of the folders above the state root do not change
 /// while a launch runs: a folder whose rights are taken away after the user made an entry in it can no longer be
 /// opened, by this or any program, and cannot be flushed.
 pub fn sync_ancestor(dir: &Path) -> io::Result<()> {
@@ -617,7 +617,7 @@ mod tests {
         }
     }
 
-    // #103 (review of 67de719): on Windows an ACL that denies only SYNCHRONIZE refuses the flush open but still lets
+    // (review of 67de719): on Windows an ACL that denies only SYNCHRONIZE refuses the flush open but still lets
     // the user make a folder there; that folder is an error, never skipped.
     #[cfg(windows)]
     #[test]
@@ -694,7 +694,7 @@ mod tests {
         assert_eq!(left, ["child"], "the probe folder was left behind");
     }
 
-    // #103 (review of 5dc2ff5): only a permission or read-only refusal from access(2) means the user cannot add an
+    // (review of 5dc2ff5): only a permission or read-only refusal from access(2) means the user cannot add an
     // entry; an inconclusive failure keeps the flush error.
     #[cfg(unix)]
     #[test]
@@ -714,7 +714,7 @@ mod tests {
         assert!(!refused(None));
     }
 
-    // #103: a folder the user can add to but not open for a flush (Unix mode 0300) is an error, never skipped; one
+    // a folder the user can add to but not open for a flush (Unix mode 0300) is an error, never skipped; one
     // the user cannot add to (0100) is skipped.
     #[cfg(unix)]
     #[test]
@@ -1004,7 +1004,7 @@ mod tests {
         assert_eq!((got, reads), (b"x\n".to_vec(), vec![f.clone()]));
     }
 
-    // #103 (o2 call 12): another process may briefly hold a folder or file open without sharing write; the flush
+    // (o2 call 12): another process may briefly hold a folder or file open without sharing write; the flush
     // open waits it out (os error 32) for about a second, then still refuses.
     #[cfg(windows)]
     fn hold(path: &Path, mode: u32) -> File {

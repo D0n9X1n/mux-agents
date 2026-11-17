@@ -1,4 +1,4 @@
-//! Replay-safe client options (#103 options-6e E1, E2): a launch argv split into options, session selectors and
+//! Replay-safe client options (options-6e E1, E2): a launch argv split into options, session selectors and
 //! prompt; records keep options and prompt apart and relaunches replay options only.
 use crate::error::{Res, refuse};
 use crate::parse::Client;

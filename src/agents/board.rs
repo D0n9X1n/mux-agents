@@ -149,7 +149,7 @@ pub fn board(ctx: &Ctx, caller: &Caller, all: bool, watch: bool) -> Res<Map<Stri
         Some(stored) => super::mail::member_mailbox(&reader, &stored.record),
         None => reader,
     };
-    // #103 A3 and review: in a team, a member's mail reaches its parent in every mailbox it can land in: the parent's own
+    // A3 and review: in a team, a member's mail reaches its parent in every mailbox it can land in: the parent's own
     // (from `parentAgent.id` and its record, an inherited `mailbox` honoured), the one `send parent` reaches on the parent
     // pane (the running agent's there, else `pane-<n>`), and `pane-<parentPane>`, where exit notices go. A team row sums
     // them, de-duplicated, by member identity, so its unread holds whether the parent is attached, detached, Lost or
@@ -520,7 +520,7 @@ fn rank(row: &Map<String, Value>) -> u8 {
 
 /// The mailbox whose unread `list` counts for the caller. A member proven through its own hc terminal counts its own
 /// id, always: whichever pane shows it, and even when a later hc look cannot show it running, it is never matched by
-/// pane, so it can never count another member's mail (#104 phase 1c). Any other caller: the one running agent on its
+/// pane, so it can never count another member's mail (phase 1c). Any other caller: the one running agent on its
 /// pane, else the pane's own mailbox.
 pub(crate) fn reader_key(
     member: Option<&str>,
@@ -535,7 +535,7 @@ pub(crate) fn reader_key(
     }
 }
 
-/// The leader of the team the bar's session is (#103 B1): its team record's, else a committed depth-0 member with
+/// The leader of the team the bar's session is (B1): its team record's, else a committed depth-0 member with
 /// `upTeam` (a team whose record write failed); none outside a team. An unreadable record never fails the bar.
 fn team_leader(
     ctx: &Ctx,

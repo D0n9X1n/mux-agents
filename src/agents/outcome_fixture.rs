@@ -1,4 +1,4 @@
-//! outcome-2's fixture (#103): one lifecycle member `ID`, generation 1 launched at `T0` (spec.json deadline T0 + 150 s,
+//! outcome-2's fixture: one lifecycle member `ID`, generation 1 launched at `T0` (spec.json deadline T0 + 150 s,
 //! launch.json), launcher 100 (start 1000) and its client 150 (start 1500) in the fake process table. Every file is
 //! written through `gens::publish_once`, the A3b publisher.
 use std::path::PathBuf;

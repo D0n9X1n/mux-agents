@@ -296,7 +296,7 @@ fn each_forward_step_leaves_exactly_its_files() {
 fn a_new_member_is_desired_running_before_hc_run() {
     let w = World::human("");
     w.state();
-    // Integration (#150 CI): the member folder private, as the product makes it, so the record is written and the
+    // Integration (CI): the member folder private, as the product makes it, so the record is written and the
     // desired.json read decides; a folder left at the umask (755) is refused `state` first, as it must be.
     crate::agents::spawn::private_folder(&w.ctx, &w.folder(ID)).unwrap();
     std::fs::create_dir(w.folder(ID).join("desired.json")).unwrap(); // a folder: Unreadable

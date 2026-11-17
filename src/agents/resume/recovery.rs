@@ -1,4 +1,4 @@
-//! restore-6c P2: a person's recovery of a member that needs it, as the next generation of the same id (#103).
+//! restore-6c P2: a person's recovery of a member that needs it, as the next generation of the same id.
 use serde_json::{Map, Value, json};
 
 use super::super::gens::{Gen, Member, Verdict};

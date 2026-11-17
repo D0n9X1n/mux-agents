@@ -1,4 +1,4 @@
-//! restore-6c Task 7 (#103): reconcile's one pass at the anchor. `restore` keeps restore-6b's meaning; `up` reports
+//! restore-6c Task 7: reconcile's one pass at the anchor. `restore` keeps restore-6b's meaning; `up` reports
 //! every step refusal and takes reentry-6a's validated leader (calls 17, 18, 25).
 use super::{Reply, Seen, decide, failed, judged, observe, session_members};
 use crate::agents::gens::{self, Gen, Member};

@@ -121,7 +121,7 @@ fn up_creates_the_team_in_a_new_session() {
         reply["name"].as_str().unwrap().to_string(),
         reply["leader"]["id"].as_str().unwrap().to_string(),
     );
-    // reentry-6a F8: A3b-2's `view`, then Task 9's `replayed` and `reentered`; Task 11 (finding #21): `views`,
+    // reentry-6a F8: A3b-2's `view`, then Task 9's `replayed` and `reentered`; Task 11 (finding 21): `views`,
     // `duplicates`, `members`.
     let want = json!({"view": "attached", "team": t, "session": "$7", "name": name, "created": true, "replayed": false, "reentered": false, "leader": {"id": id, "name": "leader", "hcAddress": "t1"}, "views": [{"id": id, "name": "leader", "pane": "%9", "window": "@5"}], "duplicates": 0, "members": [{"id": id, "name": "leader", "life": "running"}], "sidebar": null});
     assert_eq!(Value::Object(reply.clone()).to_string(), want.to_string());
@@ -623,7 +623,7 @@ fn a_relative_state_root_is_refused_before_anything_is_made() {
 #[test]
 fn every_folder_above_the_leader_record_is_flushed_before_hc_run() {
     // The server folder, the state root and each folder above it, up to the filesystem root: a failed flush of any of
-    // them refuses `up` before `hc run`, so a leader that may have run is always found (#103).
+    // them refuses `up` before `hc run`, so a leader that may have run is always found.
     let depth = agents(&ready()).parent().unwrap().ancestors().count();
     assert!(depth >= 3);
     for n in 0..depth {
@@ -815,7 +815,7 @@ fn a_leader_view_failure_is_reported_and_the_leader_stays() {
     );
 }
 
-// reentry-6a E4.5 (integration #150 CI, live up_whose_view_panics_keeps_the_leader_under_hostile_settings): the
+// reentry-6a E4.5 (integration CI, live up_whose_view_panics_keeps_the_leader_under_hostile_settings): the
 // launched leader is Running, so a failed leader view opens no status window; that window runs the session's
 // default-command, which may start a client this team did not.
 #[test]
@@ -838,7 +838,7 @@ fn up_finishes_a_kept_cascade_first() {
     let w = ready();
     let scope = crate::agents::team_state::Scope::of(&w.caller());
     let dir = crate::agents::cascade::dir_at(&w.ctx, &scope);
-    // Integration (#150 CI): made private as the product makes it, so `up` reaches the journal; a folder left at the
+    // Integration (CI): made private as the product makes it, so `up` reaches the journal; a folder left at the
     // umask (755) or with an inherited shared ACL is refused `state` first, as it must be.
     w.state();
     crate::agents::spawn::private_folder(&w.ctx, &dir).unwrap();
@@ -852,7 +852,7 @@ fn up_finishes_a_kept_cascade_first() {
     let w = ready();
     let scope = crate::agents::team_state::Scope::of(&w.caller());
     let dir = crate::agents::cascade::dir_at(&w.ctx, &scope);
-    // Integration (#150 CI): made private as the product makes it, so `up` reaches the journal; a folder left at the
+    // Integration (CI): made private as the product makes it, so `up` reaches the journal; a folder left at the
     // umask (755) or with an inherited shared ACL is refused `state` first, as it must be.
     w.state();
     crate::agents::spawn::private_folder(&w.ctx, &dir).unwrap();
@@ -987,7 +987,7 @@ fn the_leader_is_found_at_the_anchor_and_a_void_one_is_skipped() {
     );
 }
 
-// F13 (checklist #25): the leader's record is revalidated at the reread: its id, `upTeam` and the anchor's session.
+// F13 (checklist 25): the leader's record is revalidated at the reread: its id, `upTeam` and the anchor's session.
 #[test]
 fn the_leader_record_is_revalidated_at_the_reread() {
     let w = ready();
@@ -1050,7 +1050,7 @@ fn refuse_open(_: &crate::agents::team_state::Tx<'_>) -> Res<()> {
     refuse(1, "stopping", "a cascade is unresolved")
 }
 
-// Call 8, F11 (checklist #23): re-entry reconciles (opening the anchor's team Tx) before any session is made; a
+// Call 8, F11 (checklist 23): re-entry reconciles (opening the anchor's team Tx) before any session is made; a
 // reconcile that refuses opens no session. No launch answer is queued; every hc answer is consumed.
 #[test]
 fn reconcile_runs_before_any_session_is_made() {

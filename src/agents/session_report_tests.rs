@@ -346,7 +346,7 @@ fn stdin_is_refused_from_a_terminal_and_capped_at_64_kib() {
     );
 }
 
-// (fix 2, re-audit #5) Through dispatch: partial or malformed labels, or an hc error, answer `handshake: "evidence"`
+// (fix 2, re-audit 5) Through dispatch: partial or malformed labels, or an hc error, answer `handshake: "evidence"`
 // (the registry entry is still written), never "none".
 #[test]
 fn unreadable_labels_answer_evidence_through_the_cli() {
@@ -370,7 +370,7 @@ fn unreadable_labels_answer_evidence_through_the_cli() {
     );
 }
 
-// (fix 2, re-audit #6) Bounded consumption: from an endless input the reader takes 64 KiB + 1 bytes and stops.
+// (fix 2, re-audit 6) Bounded consumption: from an endless input the reader takes 64 KiB + 1 bytes and stops.
 #[test]
 fn the_reader_consumes_at_most_64_kib_plus_one() {
     struct Endless(std::rc::Rc<std::cell::Cell<usize>>);
@@ -392,7 +392,7 @@ fn the_reader_consumes_at_most_64_kib_plus_one() {
     assert_eq!(count.get(), 65_537, "consumed exactly 64 KiB + 1");
 }
 
-// (fix 2, re-audit #7) The production wrapper asks its input whether it is a terminal (`read_input`, which
+// (fix 2, re-audit 7) The production wrapper asks its input whether it is a terminal (`read_input`, which
 // `read_stdin` calls with the real stdin): a file is read ...
 #[test]
 fn read_input_reads_a_file_it_is_given() {
@@ -735,7 +735,7 @@ fn a_torn_registry_entry_does_not_stop_the_handshake() {
     assert_eq!(std::fs::read(claude_entry(&w)).unwrap(), b"{");
 }
 
-// (fix 1, audit 5-9 #3) S9: report.json is published while the gen lock is held: it exists at the lock's release.
+// (fix 1, audit 5-9 item 3) S9: report.json is published while the gen lock is held: it exists at the lock's release.
 #[test]
 fn report_json_is_published_inside_the_gen_lock() {
     let w = hc_world();
@@ -763,7 +763,7 @@ fn report_json_is_published_inside_the_gen_lock() {
     );
 }
 
-// (fix 1, audit 5-9 #4) R4: the active generation's terminal is accepted too, not only a pending one.
+// (fix 1, audit 5-9 item 4) R4: the active generation's terminal is accepted too, not only a pending one.
 #[test]
 fn the_active_generation_is_accepted_too() {
     let w = hc_world();
@@ -805,7 +805,7 @@ fn a_report_json_that_cannot_be_flushed_is_not_reported() {
     );
 }
 
-// (fix 2, re-audit #5) K4.1, R2 and PM call 13: a torn or wrong-type outcome.json, failure.json or spec.json refuses
+// (fix 2, re-audit 5) K4.1, R2 and PM call 13: a torn or wrong-type outcome.json, failure.json or spec.json refuses
 // `evidence` before report.json is published, and nothing is written through a planted link.
 #[test]
 fn unreadable_k4_evidence_refuses_before_report_json() {
@@ -837,7 +837,7 @@ fn unreadable_k4_evidence_refuses_before_report_json() {
     }
 }
 
-// (fix 2, re-audit #6) R1: the handshake reads the member's record.json once and generation 1's spec.json once.
+// (fix 2, re-audit 6) R1: the handshake reads the member's record.json once and generation 1's spec.json once.
 #[test]
 fn the_handshake_reads_the_member_and_its_spec_once() {
     let w = hc_world();
@@ -973,7 +973,7 @@ fn after_ready_json_nothing_more_is_written() {
         std::fs::read(gen_file(&w, "report")).unwrap(),
         std::fs::read(gen_file(&w, "ready")).unwrap(),
     );
-    // (fix 1, audit 5-9 #2) A later time: a second write of report.json would change its bytes.
+    // (fix 1, audit 5-9 item 2) A later time: a second write of report.json would change its bytes.
     w.fakes.advance(Duration::from_secs(1));
     let slept = w.fakes.slept().len();
     let (_, reply) = report_gen(&w, "1");

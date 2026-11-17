@@ -43,7 +43,7 @@ fn views_down<T>() -> Res<T> {
     refuse(1, "views", crate::cli::VIEWS_DOWN)
 }
 
-/// The multiplexer, resolved on first use (4to6 #1). `Down` is checked before any cached multiplexer (PM call 10).
+/// The multiplexer, resolved on first use (4to6 item 1). `Down` is checked before any cached multiplexer (PM call 10).
 pub fn ensure(ctx: &Ctx) -> Res<()> {
     let member = ctx.member_mux.borrow().clone();
     if member == MemberMux::Down {
@@ -791,7 +791,7 @@ fn main() {
         let path = dir.join(format!("{name}{EXE}"));
         std::fs::copy(fake_mux_program(), &path).unwrap();
         std::fs::write(dir.join(format!("{name}.version")), version).unwrap();
-        // Run once before any test does, so no later run meets ETXTBSY (#76).
+        // Run once before any test does, so no later run meets ETXTBSY.
         crate::testing::wait_runnable(100, || std::process::Command::new(&path).arg("-V").output())
             .unwrap();
         path
@@ -961,7 +961,7 @@ fn main() {
         );
     }
 
-    // #150 live (rmux): rmux 0.10.0's server process is `rmux-daemon`, installed beside `rmux`. A member's
+    // live (rmux): rmux 0.10.0's server process is `rmux-daemon`, installed beside `rmux`. A member's
     // multiplexer is that daemon's own `rmux` sibling, gated by its version; a daemon with no runnable `rmux` beside
     // it is `views`-down's gate refusal, never a PATH lookup. Any other image still refuses `views`.
     #[test]

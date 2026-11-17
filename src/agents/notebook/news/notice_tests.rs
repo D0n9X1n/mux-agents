@@ -1,4 +1,4 @@
-//! notebook-7b V2, V3 (#103): one notice per other member when a note publishes; a failed notice never undoes it.
+//! notebook-7b V2, V3: one notice per other member when a note publishes; a failed notice never undoes it.
 use serde_json::{Value, json};
 
 use super::*;

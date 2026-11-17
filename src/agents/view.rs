@@ -190,7 +190,7 @@ pub fn status(ctx: &Ctx, request: &Request) -> Res<Map<String, Value>> {
 }
 
 /// What an agent's own client may report (herdr's OSC 7501 words; `done` is the reader's, never reported).
-// `done` is reported by a member whose task is finished, before it listens (#103 4b-ii W5).
+// `done` is reported by a member whose task is finished, before it listens (4b-ii W5).
 const REPORTED: [&str; 4] = ["working", "blocked", "idle", "done"];
 const KINDS: [&str; 2] = ["permission", "question"];
 
@@ -281,7 +281,7 @@ fn select_view(
         duplicates: 0,
     })
 }
-/// What the bar's open found for member `id` (#103 B6).
+/// What the bar's open found for member `id` (B6).
 #[derive(Debug)]
 pub enum Member {
     Focused(Focused),
@@ -303,7 +303,7 @@ pub fn focus_hc(
     }
 }
 
-/// The bar's open (#103 B6): member `id` by id, never by name. A validated view is selected through the multiplexer alone
+/// The bar's open (B6): member `id` by id, never by name. A validated view is selected through the multiplexer alone
 /// (view.rs `select_view`), so no hc is needed; a member with none is reopened (an attach: nothing restarts or types) only
 /// with `core`, else `NoView`; an id no committed member has any more is `Gone`.
 pub fn focus_member(
@@ -580,7 +580,7 @@ mod tests {
         }
     }
 
-    // #103: focus keeps the bar of the focused view's window (@5), never the caller's (@1): its proven bar is
+    // focus keeps the bar of the focused view's window (@5), never the caller's (@1): its proven bar is
     // named in the reply; with the session's bar off, the reply names none and no record is read.
     #[test]
     fn focus_keeps_the_bar_of_the_focused_views_window() {
@@ -1154,7 +1154,7 @@ mod tests {
 
     #[test]
     fn list_of_six_agents_is_one_pane_list() {
-        // #48 test 10: six running agents, their tags rotated one place: one list-panes, every row by its own pane.
+        // test 10: six running agents, their tags rotated one place: one list-panes, every row by its own pane.
         let w = World::human("");
         let mut rows = Vec::new();
         let mut records = Vec::new();

@@ -414,7 +414,7 @@ mod tests {
         );
     }
 
-    // PM call 17 (#138 QA CRITICAL): a void pending generation that `completing` still holds is not done, so the
+    // PM call 17 (QA CRITICAL): a void pending generation that `completing` still holds is not done, so the
     // leader is held and never "ran nothing": `up` reconciles it (6b ambiguity 8) and `scope` is not Outside.
     #[test]
     fn a_held_void_pending_leader_is_still_a_leader() {

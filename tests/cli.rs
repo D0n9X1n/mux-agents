@@ -232,7 +232,7 @@ fn launcher_relative_spec_exit_2() {
             "mux-agent: the launch spec is outside the state folder"
         )
     );
-    // The v0.2 two-argument form is no launch any more: it is a usage refusal like any unknown verb (#104).
+    // The v0.2 two-argument form is no launch any more: it is a usage refusal like any unknown verb.
     let (code, stdout, _) = mux_agent(&["launcher", "spec.json"]);
     assert_eq!(code, 2);
     assert!(stdout.contains(r#""check":"usage""#), "{stdout}");
@@ -294,7 +294,7 @@ fn watch_dispatches_to_watch_handler() {
     );
 }
 
-// #93: a Copilot hook runs `report -Quiet`; the binary prints nothing at all (not even a line end) and exits 0, here
+// a Copilot hook runs `report -Quiet`; the binary prints nothing at all (not even a line end) and exits 0, here
 // outside a multiplexer where report refuses.
 #[test]
 fn report_quiet_prints_no_byte() {
@@ -434,7 +434,7 @@ fn hold_runs_until_its_release_file() {
         .unwrap();
     sleep(Duration::from_millis(600));
     assert!(child.try_wait().unwrap().is_none());
-    // An empty or torn release is not a whole file: hold keeps waiting (#103 state-0 S6).
+    // An empty or torn release is not a whole file: hold keeps waiting (state-0 S6).
     std::fs::write(&release, "").unwrap();
     sleep(Duration::from_millis(600));
     assert!(

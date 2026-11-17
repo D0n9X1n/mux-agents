@@ -1,4 +1,4 @@
-//! restore-6c Task 7 (#103): reconcile's one pass: every step refusal reported, the leader from 6a (calls 17, 18, 25).
+//! restore-6c Task 7: reconcile's one pass: every step refusal reported, the leader from 6a (calls 17, 18, 25).
 use super::core_launch::forward_tests as ft;
 use super::fixture::World;
 use super::life_fixture as lf;

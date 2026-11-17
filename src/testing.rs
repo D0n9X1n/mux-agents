@@ -933,7 +933,7 @@ pub fn private_tree(root: &Path, dir: &Path) {
 
 /// Runs `spawn` until it is not refused with "text file busy" (ETXTBSY), at most `tries` times, 20 ms apart. A
 /// program a test has just copied can be refused on Linux: a child another test forks while the copy is open for
-/// writing holds that open until it runs its own program (#76). Once it has run, no write is open anywhere, so later
+/// writing holds that open until it runs its own program. Once it has run, no write is open anywhere, so later
 /// runs of it never meet ETXTBSY.
 pub fn wait_runnable<T>(
     tries: u32,

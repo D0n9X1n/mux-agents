@@ -6,8 +6,8 @@ use crate::{
 };
 use std::path::{Path, PathBuf};
 /// `state_root` joined with `rel`, only where it is itself: its canonical path is the state root's canonical path
-/// joined with the same names, so no link on the way out (#104 phase 1c). The worker proof and the member proof (D1,
-/// #103) read every file through it. shortcut: checked before the open, not by it; the state root is this user's own,
+/// joined with the same names, so no link on the way out (phase 1c). The worker proof and the member proof (D1,
+///) read every file through it. shortcut: checked before the open, not by it; the state root is this user's own,
 /// private folder.
 pub(crate) fn within_root(state_root: &Path, rel: &[&str]) -> Option<PathBuf> {
     let root = std::fs::canonicalize(state_root).ok()?;
@@ -52,7 +52,7 @@ fn prove(ctx: &Ctx) -> Res<Option<Caller>> {
         if !agents::agent_id(id) {
             return None;
         }
-        // A file is read only where it is itself, inside the state root: no link on the way out (#104 phase 1c).
+        // A file is read only where it is itself, inside the state root: no link on the way out (phase 1c).
         let inside = |rel: &[&str]| within_root(&ctx.state_root, rel);
         let folder = inside(&[key, "agents", id])?;
         inside(&[key, "agents", id, "record.json"])?; // R5: checked before anything is opened
@@ -119,7 +119,7 @@ fn prove(ctx: &Ctx) -> Res<Option<Caller>> {
         if !lifecycle && presentation.is_none() {
             return None;
         }
-        // 4to6 #2: pane and window are the presentation's, empty when the views are down (ambiguity 9).
+        // 4to6 item 2: pane and window are the presentation's, empty when the views are down (ambiguity 9).
         let (pane, window) = presentation.clone().unwrap_or_default();
         let proven = walked.is_some() && {
             // The reading the proof uses is checked as the first was: hc may name the foreground only on a later one.
@@ -152,7 +152,7 @@ fn prove(ctx: &Ctx) -> Res<Option<Caller>> {
 /// `server.json` bound to `key` (ambiguity 11): its socket, pid and start hash to the key and the socket is an
 /// endpoint. Whether that server still runs is not asked here.
 fn server_of(at: &Path, key: &str) -> Option<(u32, i64, String)> {
-    // 4to6 #18: evidence::read opens only a regular file; a FIFO, folder or link is Unreadable, never opened.
+    // 4to6 item 18: evidence::read opens only a regular file; a FIFO, folder or link is Unreadable, never opened.
     let crate::state::evidence::Evidence::Present(server) = crate::state::evidence::read(at) else {
         return None;
     };

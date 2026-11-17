@@ -381,7 +381,7 @@ mod tests {
 
     #[test]
     fn copilot_copy_accepts_the_copilot_1_0_110_sample() {
-        // The workspace.yaml excerpt from #137, below an id and a cwd line: only the mc_ block leaves.
+        // The workspace.yaml excerpt from, below an id and a cwd line: only the mc_ block leaves.
         assert_eq!(
             copied_workspace(
                 "cwd: /work\nremote_steerable: false\nmc_pending_repository_warning:\n  mc_session_id: <id>\n  mc_task_id: <id>\n  message: 'This remote session is not linked to a repository: ...'\n"

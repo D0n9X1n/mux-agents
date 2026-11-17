@@ -1,4 +1,4 @@
-//! The Copilot `sessionStart` hook exactly as hooks.json states it, with Copilot's JSON on stdin (#103 report-2b K3),
+//! The Copilot `sessionStart` hook exactly as hooks.json states it, with Copilot's JSON on stdin (report-2b K3),
 //! through each shell that may run it. Outside tmux, rmux and hc no client is above the test process (the walk stops
 //! at this test binary, neither a shell nor a client), so the reply echoes the session and nothing is written.
 use std::io::Write;
@@ -60,7 +60,7 @@ fn body() -> Vec<u8> {
         .into_bytes()
 }
 
-/// (fix 1, audit 5-9 #11) A `{sessionId, pad}` body of exactly `n` bytes.
+/// (fix 1, audit 5-9 item 11) A `{sessionId, pad}` body of exactly `n` bytes.
 fn sized(n: usize) -> Vec<u8> {
     let tail = r#""}"#;
     let mut b = format!(r#"{{"sessionId":"{SID}","pad":""#).into_bytes();
@@ -127,7 +127,7 @@ fn the_windows_hook_reads_its_session_from_stdin_through_each_shell() {
     check("mux-agent.ps1", run(ps1, "ps1", &body()));
 }
 
-// (fix 1, audit 5-9 #11) Ambiguity 17: at most 64 KiB is accepted; 64 KiB + 1 and an empty body are usage.
+// (fix 1, audit 5-9 item 11) Ambiguity 17: at most 64 KiB is accepted; 64 KiB + 1 and an empty body are usage.
 #[test]
 fn stdin_of_exactly_64_kib_is_read_and_one_byte_more_is_usage() {
     let (code, reply, _) = run(binary(), "at-cap", &sized(65_536));
@@ -147,7 +147,7 @@ fn stdin_of_exactly_64_kib_is_read_and_one_byte_more_is_usage() {
     }
 }
 
-// (fix 1, audit 5-9 #12) The production `IsTerminal` branch on a real terminal: a pty's slave as stdin is refused at
+// (fix 1, audit 5-9 item 12) The production `IsTerminal` branch on a real terminal: a pty's slave as stdin is refused at
 // once (usage), never read. Windows: CI has no console to give a child; the manual check is in Step 4.
 #[cfg(unix)]
 #[test]

@@ -521,7 +521,7 @@ fn stop_resolves_reused_name_beyond_board_history_limit() {
     }
 }
 
-// #137: `stop` replies once the member's recorded client has exited, so a `resume` right after it is not refused
+// `stop` replies once the member's recorded client has exited, so a `resume` right after it is not refused
 // `session`. The wait is bounded and polls on the injected clock, after every lock is released. Checklist 4: a
 // lifecycle member is seeded as group B builds it (claim `run`, `launch.json`, commit) and stopped through B1's
 // merged `terminate` sequence; it answers at `t0`.

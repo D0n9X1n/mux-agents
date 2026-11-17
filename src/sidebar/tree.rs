@@ -1,4 +1,4 @@
-//! A team's side bar (#103 phase 5): the team as a tree, leader first, each member's children under it.
+//! A team's side bar (phase 5): the team as a tree, leader first, each member's children under it.
 
 use serde_json::{Map, Value};
 
@@ -12,7 +12,7 @@ pub(super) struct Node<'a> {
     pub broken: bool,
 }
 
-/// Whether the board is a team's feed (#103 B1).
+/// Whether the board is a team's feed (B1).
 pub(super) fn is_team(board: Option<&Map<String, Value>>) -> bool {
     board.and_then(|b| b.get("team")) == Some(&Value::Bool(true))
 }
@@ -113,12 +113,12 @@ pub(super) fn order(board: &Map<String, Value>) -> Vec<Node<'_>> {
     out
 }
 
-/// Every agent of a team board in tree order, folded or not: what Up/Down walk (#103 B10).
+/// Every agent of a team board in tree order, folded or not: what Up/Down walk (B10).
 pub(super) fn walk(board: &Map<String, Value>) -> Vec<Target> {
     order(board).iter().map(|n| Target::of(n.row)).collect()
 }
 
-/// What the bar marks (#103 B4, B5): the pane the session shows, and the selected member id.
+/// What the bar marks (B4, B5): the pane the session shows, and the selected member id.
 #[derive(Debug, Default, Clone, Copy)]
 pub(super) struct Focus<'a> {
     pub shown: Option<&'a str>,
@@ -298,7 +298,7 @@ fn member(node: &Node, width: usize, shown: Option<&str>, look: Look) -> Member 
     }
 }
 
-/// One agent line's parts for `fit_row` (#103 A5: one argument, not eight).
+/// One agent line's parts for `fit_row` (A5: one argument, not eight).
 struct RowParts {
     glyph: Span,
     name: Span,
@@ -312,7 +312,7 @@ struct RowParts {
     doing: usize,
 }
 
-/// One agent line in exactly `cols` columns and whether its doing line stays, in the one drop order (#103 A1, the PM
+/// One agent line in exactly `cols` columns and whether its doing line stays, in the one drop order (A1, the PM
 /// narrow-width rule): everything; without the doing line; without the model; each barer side (the age, then a live row's
 /// word below 40 columns); the name cut with `…` (`.` in ASCII); the name removed; last the mandatory floor, which may be
 /// wider than `cols` (the bar then asks to be widened).
@@ -459,7 +459,7 @@ impl Team {
         ]
     }
 
-    /// The PM narrow-width rule over the whole ordered team, before any height folding (#103 A4): a member on a branch the
+    /// The PM narrow-width rule over the whole ordered team, before any height folding (A4): a member on a branch the
     /// height folds away still counts. Too narrow: the header and the first widen line that fits (the whole line, then
     /// `widen: <n> columns`, then `<n>`, so <n> is never cut, then `<n>` unindented when only the margin does not fit;
     /// nothing fits: the header alone) and no row; keys still walk the whole tree.
@@ -617,7 +617,7 @@ impl Team {
     }
 }
 
-/// A team board at `size` (#103 B2-B5, B7): the header counting only the team, the tree, the notes; and how many notes it kept.
+/// A team board at `size` (B2-B5, B7): the header counting only the team, the tree, the notes; and how many notes it kept.
 pub(super) fn lay_team(
     board: &Map<String, Value>,
     notes: &[(&str, Style)],
@@ -685,7 +685,7 @@ pub(super) mod tests {
     use super::*;
     use serde_json::json;
 
-    // Calls 9-10, finding #2: a failed generation whose client still runs keeps "still running" on every wide team
+    // Calls 9-10, finding 2: a failed generation whose client still runs keeps "still running" on every wide team
     // bar: `recover (still running) <age>` at 60, `recover (still running)` at the default width 40 (the name cut
     // first), and only the narrow bar (30) shows the bare `recover` pill.
     #[test]

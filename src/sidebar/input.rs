@@ -70,13 +70,13 @@ fn platform_setup() -> Option<Box<dyn Input>> {
     TermInput::setup(Tty::stdio()).map(|input| Box::new(input) as Box<dyn Input>)
 }
 
-/// Windows: the console on stdin and stdout, set up (#70).
+/// Windows: the console on stdin and stdout, set up.
 #[cfg(windows)]
 fn platform_setup() -> Option<Box<dyn Input>> {
     TermInput::setup(Console::stdio()).map(|input| Box::new(input) as Box<dyn Input>)
 }
 
-/// Turns the characters of console key records into UTF-8, one read at a time (#70). Under VT input the console
+/// Turns the characters of console key records into UTF-8, one read at a time. Under VT input the console
 /// reports each character of a sequence as a key-down record of its own; key-up records and records with no character
 /// are dropped. The first half of a surrogate pair is held until its second half, even across reads; a lone half is
 /// U+FFFD.
@@ -1074,7 +1074,7 @@ mod tests {
         assert_eq!(fakes.slept(), Vec::<u64>::new());
     }
 
-    // The Windows console tests (#70): each runs this test binary again as a child with CREATE_NO_WINDOW, which
+    // The Windows console tests: each runs this test binary again as a child with CREATE_NO_WINDOW, which
     // gives the child a hidden console of its own, as the unix tests use a pty. The child opens CONIN$, writes
     // records into it as a terminal's keys would arrive, and checks what `Console` reads and leaves behind.
     #[cfg(windows)]

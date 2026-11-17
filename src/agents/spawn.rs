@@ -249,7 +249,7 @@ pub fn spawn(ctx: &Ctx, request: &Request) -> Res<Map<String, Value>> {
             }
             // The brief rule as far as the request decides it: after the caller's standing (the gate), before the
             // name. allocate checks it again; only a Copilot fork whose copy fails verification turns brief there.
-            // Neither refusal spends a token: the launch takes it as its last step before `hc run` (#103 D5).
+            // Neither refusal spends a token: the launch takes it as its last step before `hc run` (D5).
             if caller.kind == Kind::Agent
                 && brief.is_none()
                 && context_plan(&caller, client, &ctx.env, no_fork).context == Context::Brief
@@ -433,7 +433,7 @@ impl Launch<'_> {
             record["parentServerKey"] = key.into();
         }
         record["color"] = agent.color.into();
-        // The exact command the pane started, as the multiplexer renders it: the agent is the pane running it (#48).
+        // The exact command the pane started, as the multiplexer renders it: the agent is the pane running it.
         record["startCommand"] = start_command.into();
         // No model is the client's own; a chosen one is the record's last field.
         if let Some(model) = self.model {
@@ -1811,7 +1811,7 @@ mod tests {
         assert!(!gens::dir(&f, 2).exists(), "no generation mixed in");
     }
 
-    // Call 50 (QA #142): a released generation frees its name only once `released.json`'s flushes succeed. With the
+    // Call 50 (QA): a released generation frees its name only once `released.json`'s flushes succeed. With the
     // gens/1 folder flush failing, `spawn -Name worker` is refused and runs nothing; cleared, it admits the name once.
     #[test]
     fn an_unflushed_release_keeps_the_name() {
@@ -1861,7 +1861,7 @@ mod tests {
         w.fakes.hc_done().unwrap();
     }
 
-    // Call 51 (QA and TL #142): spawn takes its snapshot again whenever it read a member as not done and the member's
+    // Call 51 (QA and TL): spawn takes its snapshot again whenever it read a member as not done and the member's
     // generation is done after the reap, whoever recorded the end. `concurrent`: another reaper publishes ended.json
     // and notice.json as this reap takes the member lock, so this reap posts nothing. `stale notice`: notice.json is
     // already there with no end marker; this reap writes the end and posts nothing. Both admit the name.
@@ -1951,7 +1951,7 @@ mod tests {
         assert_eq!(ls, 1, "one snapshot");
     }
 
-    // Call 57 (QA #142): a pending generation is done by an `aborted` commit or an `abandoned` claim only once that
+    // Call 57 (QA): a pending generation is done by an `aborted` commit or an `abandoned` claim only once that
     // marker's own flushes succeed. Each marker's publication fails its folder flush (commit: gens/1; claim: gens),
     // so it is visible but not durable: with the fault armed `spawn -Name worker` is refused, runs nothing, and
     // generation 1 is not done; cleared, the name is admitted once.
@@ -2094,7 +2094,7 @@ mod tests {
                 &["-Task", "hi", "-Name", "w"],
             ] {
                 // A record that cannot be read as JSON already refuses in the team scope check, before hc is
-                // connected (#103 D2, fail closed).
+                // connected (D2, fail closed).
                 let mut full = vec!["-Client", "claude"];
                 full.extend(args);
                 let got = run(&w, &full);
@@ -2277,7 +2277,7 @@ mod tests {
         let w = human();
         let scope = crate::agents::notebook::anchor(&w.caller());
         let notes = crate::agents::notebook::dir(&w.ctx.state_root, &scope);
-        // Integration #150 CI: the state folder made private first, as the product makes it, and the team folders
+        // Integration CI: the state folder made private first, as the product makes it, and the team folders
         // under it one at a time at 0700; create_dir_all left the state folder 755, so spawn refused `state` before
         // the launch this test reads.
         crate::testing::private_tree(&w.state(), notes.parent().unwrap());
@@ -2533,7 +2533,7 @@ mod tests {
         ]
         .map(String::from)
         .to_vec();
-        // The state root reaches the view as it does the bar (#103): `-e MUX_AGENTS_STATE=<root>` on Unix, none on
+        // The state root reaches the view as it does the bar: `-e MUX_AGENTS_STATE=<root>` on Unix, none on
         // Windows.
         expected.extend(pane_env(
             w.ctx.state_root.to_str().unwrap(),
@@ -2952,7 +2952,7 @@ mod tests {
                 .collect::<Vec<_>>()
         );
         assert_eq!(bar_splits(&w), 1);
-        // #103: the bar opens at the right edge of the new view's window (@5, where new-window put the agent), full
+        // the bar opens at the right edge of the new view's window (@5, where new-window put the agent), full
         // height, never the caller's.
         assert_eq!(first["window"], "@5");
         let bar = calls(&w, "split-window").pop().unwrap();
@@ -3847,7 +3847,7 @@ pub struct CoreRequest<'a> {
     pub split: Option<&'a str>,
     /// Some for a resume: the new member continues an ended one's conversation instead of starting a task.
     pub resume: Option<&'a Resumed>,
-    /// Some for `up`'s leader (#103): no parent, depth 0, its team's label.
+    /// Some for `up`'s leader: no parent, depth 0, its team's label.
     pub leader: Option<&'a super::leader::Leader>,
 }
 pub struct CoreSlot {

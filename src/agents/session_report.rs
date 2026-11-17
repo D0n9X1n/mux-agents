@@ -1,4 +1,4 @@
-//! `report -Session` (#103 report-2b K3, K3a, K4): a client's own hook names its conversation. It writes that
+//! `report -Session` (report-2b K3, K3a, K4): a client's own hook names its conversation. It writes that
 //! client's registry entry and, from a generation's terminal, runs the readiness handshake. It proves no member and
 //! grants nothing; it writes only the K2 entry, `report.json` and, through `gens::promote_ready`, `ready.json`.
 use std::time::Duration;
@@ -124,7 +124,7 @@ impl Input for std::fs::File {
     }
 }
 
-/// The production reader (fix 2, re-audit #7): the terminal check is asked of the very input that is read.
+/// The production reader (fix 2, re-audit 7): the terminal check is asked of the very input that is read.
 pub(crate) fn read_input(input: impl Input) -> Option<Vec<u8>> {
     let terminal = input.is_terminal();
     read_capped(terminal, input)
