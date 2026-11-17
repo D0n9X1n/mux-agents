@@ -20,5 +20,6 @@ pub fn drop_member(ctx: &Ctx, request: &Request) -> Res<Map<String, Value>> {
     };
     super::stop_with(ctx, |ctx, caller| {
         super::super::member_target::by_id(ctx, caller, &id)
+            .map(super::super::member_target::StopTarget::Member)
     })
 }

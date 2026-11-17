@@ -5,7 +5,7 @@ use crate::{
     error::{Refusal, Res},
 };
 use serde_json::Value;
-fn changed() -> Refusal {
+pub(crate) fn changed() -> Refusal {
     Refusal {
         code: 2,
         check: "target",
@@ -17,6 +17,30 @@ fn changed() -> Refusal {
 }
 pub(crate) fn named(ctx: &Ctx, caller: &Caller, name: &str) -> Res<Identity> {
     named_with_core(ctx, caller, name, None)
+}
+/// What `stop <name>` ends: the member `named` resolves, else (all-calls 14) the one 0.2.x pane-based member.
+pub(crate) enum StopTarget {
+    Member(Identity),
+    Pane(super::prelife::PaneMember),
+}
+/// All-calls 14 with prelife calls 16, 20: a member `named` resolves decides, and so does any local member with that
+/// name or id (its refusal stands); only when none has does the unique pane-based record of that name answer.
+pub(crate) fn stop_target(ctx: &Ctx, caller: &Caller, name: &str) -> Res<StopTarget> {
+    let e = match named(ctx, caller, name) {
+        Ok(id) => return Ok(StopTarget::Member(id)),
+        Err(e) if e.check != "target" => return Err(e),
+        Err(e) => e,
+    };
+    let local = membership::locals(ctx, caller)?;
+    if local
+        .iter()
+        .any(|l| l.identity.name == name || l.identity.id == name)
+    {
+        return Err(e);
+    }
+    super::prelife::pane_named(ctx, caller, name)?
+        .map(StopTarget::Pane)
+        .ok_or(e)
 }
 pub(crate) fn named_with_core(
     ctx: &Ctx,

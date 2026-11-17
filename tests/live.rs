@@ -5921,6 +5921,18 @@ hc {}:
                     "{mux:?} {key}: up: {up} hc: {evidence:#?}"
                 );
             }
+            // Re-added with reentry-6a (call 10): `up` brought the views back, so a person's shell in its session runs
+            // `restore`, which also finds every member Running.
+            let shell = team_shell(&live, s(&up["session"]));
+            let (code, restore) = live.run_in(&shell, &["restore"]);
+            assert_eq!(code, 0, "{mux:?} {restore} hc: {evidence:#?}");
+            for key in ["restored", "held", "unknown", "recover"] {
+                assert_eq!(
+                    restore[key],
+                    json!([]),
+                    "{mux:?} {key}: restore: {restore} up: {up} hc: {evidence:#?}"
+                );
+            }
             for (i, id) in ids.iter().enumerate() {
                 let t = seen[i].1.as_ref();
                 assert!(
@@ -6043,20 +6055,51 @@ hc {}:
             // The panic fires inside the view step, after the commit: up succeeds with viewError (PM calls 1, 10).
             assert_eq!(code, 0, "{mux:?} {out}");
             assert!(s(&out["viewError"]).contains("panicked"), "{mux:?} {out}");
-            assert!(
-                eventually(Duration::from_secs(10), || live
-                    .call(&["list-sessions", "-F", "#{session_name}"])
-                    .lines()
-                    .count()
-                    == 2),
-                "{mux:?}: the leader's session stays"
-            );
             assert!(!marker.exists(), "{mux:?}");
             let leader = s(&out["leader"]["id"]).to_string();
             assert!(
                 live.gen_file(&leader, "commit.json").is_file(),
                 "{mux:?}: the leader is committed"
             );
+            live.proof_of(&leader);
+            // PM call 16 (call 10: views need not survive; up restores them): the views may be gone, the leader is not.
+            // A second `up` without the panic finds it Running and shows its view; the hostile default-command never
+            // runs.
+            let (code, again) = live.server.run(
+                &["up", "-Client", "claude"],
+                &[("MUX_AGENTS_STATE", state.as_str())],
+            );
+            assert_eq!(code, 0, "{mux:?} {again}");
+            let member = |r: &Value| {
+                r["members"]
+                    .as_array()
+                    .and_then(|m| m.iter().find(|m| m["id"] == json!(leader)).cloned())
+            };
+            assert_eq!(
+                member(&again).map(|m| m["life"].clone()),
+                Some(json!("running")),
+                "{mux:?}: the leader is still Running: {again}"
+            );
+            let view = again["views"]
+                .as_array()
+                .and_then(|v| v.iter().find(|v| v["id"] == json!(leader)).cloned())
+                .unwrap_or_else(|| panic!("{mux:?}: the leader's view is shown: {again}"));
+            let pane = s(&view["pane"]).to_string();
+            assert!(
+                eventually(Duration::from_secs(10), || live
+                    .call(&[
+                        "list-panes",
+                        "-s",
+                        "-t",
+                        s(&again["session"]),
+                        "-F",
+                        "#{pane_id}"
+                    ])
+                    .lines()
+                    .any(|p| p == pane)),
+                "{mux:?}: the leader's view pane {pane} is in the team session: {again}"
+            );
+            assert!(!marker.exists(), "{mux:?}: after the second up");
         }
     }
 
@@ -7032,6 +7075,403 @@ hc {}:
                 !root.contains("nonce-7f3a") && !root.contains("mail from"),
                 "{mux:?} the root pane was typed into: {root}"
             );
+        }
+    }
+
+    /// reentry-6a: `up` from the root pane, then the leader spawns `a`; both ready before any test ends a member (o2
+    /// call 35). Answers (leader id, a id, session, the anchor key read before any restart).
+    fn team_of_two(live: &mut Live) -> (String, String, String, String) {
+        let mux = live.mux();
+        let (code, up) = live.run(&["up", "-Client", "claude"]);
+        assert_eq!(code, 0, "{mux:?} {up}");
+        assert!(up.get("sidebarError").is_none(), "{mux:?}: F6 {up}");
+        let (lead, session) = (
+            s(&up["leader"]["id"]).to_string(),
+            s(&up["session"]).to_string(),
+        );
+        std::fs::write(live.dir.join("brief.md"), "brief").unwrap();
+        let (task, brief) = (live.path("task.txt"), live.path("brief.md"));
+        let (code, r) = live.by(
+            &lead,
+            &[
+                "spawn",
+                "-Client",
+                "claude",
+                "-TaskFile",
+                &task,
+                "-BriefFile",
+                &brief,
+                "-Context",
+                "brief",
+                "-Name",
+                "a",
+            ],
+        );
+        assert_eq!(code, 0, "{mux:?} spawn a: {r}");
+        let a = s(&r["id"]).to_string();
+        live.ready(&json!({"id": lead, "name": "leader"}));
+        live.ready(&json!({"id": a, "name": "a"}));
+        (lead, a, session, live.server.key().to_string())
+    }
+
+    /// A person's `sh` pane in `session` (Unix twin of live_windows' `team_pane`): a split, focus kept, of the
+    /// session's first pane that is not `up`'s `hold` (its window ends with the release). It has the server's
+    /// environment, so the private core's; open it before a core loss, which ends the views.
+    fn team_shell(live: &Live, session: &str) -> String {
+        let panes = live.call(&[
+            "list-panes",
+            "-s",
+            "-t",
+            session,
+            "-F",
+            "#{pane_id} #{pane_start_command}",
+        ]);
+        let pane = panes
+            .lines()
+            .find(|l| !l.contains(" hold "))
+            .and_then(|l| l.split(' ').next())
+            .unwrap_or_else(|| panic!("{:?}: no pane to split in {session}: {panes}", live.mux()))
+            .to_string();
+        // In the root pane's folder (`<dir>/work`), so `up` from it names the same team; a split otherwise starts in
+        // the server's own cwd.
+        let work = live.dir.join("work").display().to_string();
+        live.split(&pane, &["-v", "-c", &work])
+    }
+
+    /// How many panes of `session` attach `address` (views-6f's `attach_program` on the real start command; F11).
+    fn attached(live: &Live, session: &str, address: &str) -> usize {
+        use mux_agent::agents::core_identity::attach_program;
+        use mux_agent::state::root::OsKind;
+        live.call(&[
+            "list-panes",
+            "-s",
+            "-t",
+            session,
+            "-F",
+            "#{pane_start_command}",
+        ])
+        .lines()
+        .filter(|c| attach_program(c, address, OsKind::Unix).is_some())
+        .count()
+    }
+
+    /// F6 (checklist 37): the reply's bar is opened and proven: `sidebar` is a pane of the reply's session, and no
+    /// `sidebarError`.
+    fn bar_shown(live: &Live, reply: &Value) {
+        let mux = live.mux();
+        assert!(
+            reply.get("sidebarError").is_none(),
+            "{mux:?}: no sidebarError {reply}"
+        );
+        assert!(reply["sidebar"].is_string(), "{mux:?}: the bar {reply}");
+        let panes = live.call(&[
+            "list-panes",
+            "-s",
+            "-t",
+            s(&reply["session"]),
+            "-F",
+            "#{pane_id}",
+        ]);
+        assert!(
+            panes.lines().any(|p| p == s(&reply["sidebar"])),
+            "{mux:?}: the bar is a pane of the team's session: {panes} {reply}"
+        );
+    }
+
+    /// The reply's view count (0 when the reply has no `views`).
+    fn views_of(reply: &Value) -> usize {
+        reply["views"].as_array().map_or(0, Vec::len)
+    }
+
+    /// The team indexes under `<state>/up`.
+    fn index_count(live: &Live) -> usize {
+        std::fs::read_dir(live.state().join("up")).map_or(0, |d| {
+            d.filter(|e| {
+                e.as_ref()
+                    .unwrap()
+                    .path()
+                    .extension()
+                    .is_some_and(|x| x == "json")
+            })
+            .count()
+        })
+    }
+
+    /// One `up` from the root pane with `MUX_AGENTS_CRASH=<step>` set for that command only; its exit code.
+    fn crash_up(live: &mut Live, step: &str) -> i32 {
+        let state = live.state_text();
+        let vars = [
+            ("MUX_AGENTS_STATE", state.as_str()),
+            ("MUX_AGENTS_CRASH", step),
+        ];
+        live.server
+            .run_raw(
+                env!("CARGO_BIN_EXE_mux-agent"),
+                &["up", "-Client", "claude"],
+                &vars,
+                &[],
+            )
+            .0
+    }
+
+    /// The spec: "Close both views: up restores them." A person's shell keeps the session; `up` from it re-enters:
+    /// each view back exactly once with the bar, nothing created; a second `up` adds nothing.
+    #[test]
+    fn up_restores_closed_views() {
+        for mux in Mux::ALL {
+            let Some(mut live) = Live::human(mux) else {
+                continue;
+            };
+            let (lead, a, session, key) = team_of_two(&mut live);
+            let shell = team_shell(&live, &session);
+            let mut addresses = Vec::new();
+            for id in [&lead, &a] {
+                let v = json_file(
+                    &live
+                        .state()
+                        .join(&key)
+                        .join("agents")
+                        .join(id)
+                        .join("view.json"),
+                );
+                live.call(&["kill-pane", "-t", s(&v["pane"])]);
+                addresses.push(s(&v["hcAddress"]).to_string());
+            }
+            let (code, again) = live.run_in(&shell, &["up", "-Client", "claude"]);
+            assert_eq!(code, 0, "{mux:?} {again}");
+            assert_eq!(
+                (&again["reentered"], &again["created"]),
+                (&json!(true), &json!(false)),
+                "{mux:?} {again}"
+            );
+            assert_eq!(views_of(&again), 2, "{mux:?} {again}");
+            bar_shown(&live, &again);
+            for address in &addresses {
+                assert_eq!(
+                    attached(&live, &session, address),
+                    1,
+                    "{mux:?}: one view of {address}"
+                );
+            }
+            // Row 13.1 (call 6): a second `up` from the same shell adopts what is open.
+            let (code, again2) = live.run_in(&shell, &["up", "-Client", "claude"]);
+            assert_eq!(code, 0, "{mux:?} {again2}");
+            assert_eq!(
+                (views_of(&again2), &again2["duplicates"]),
+                (2, &json!(0)),
+                "{mux:?} {again2}"
+            );
+            bar_shown(&live, &again2);
+            for address in &addresses {
+                assert_eq!(
+                    attached(&live, &session, address),
+                    1,
+                    "{mux:?}: still one view of {address}"
+                );
+            }
+        }
+    }
+
+    /// The spec: "`kill-server`; `up`: a new session, both views, the bar." The members's terminals live on in the
+    /// private core; `up` from the new server's root pane re-enters at the old anchor.
+    #[test]
+    fn up_after_kill_server_makes_a_new_session_with_both_views_and_the_bar() {
+        for mux in Mux::ALL {
+            let Some(mut live) = Live::human(mux) else {
+                continue;
+            };
+            let (lead, a, _, k1) = team_of_two(&mut live);
+            live.server.restart();
+            assert_ne!(live.server.key(), k1, "{mux:?}: a new key");
+            let (code, again) = live.run(&["up", "-Client", "claude"]);
+            assert_eq!(code, 0, "{mux:?} {again}");
+            assert_eq!(
+                (&again["reentered"], &again["created"]),
+                (&json!(true), &json!(false)),
+                "{mux:?} {again}"
+            );
+            let session = s(&again["session"]).to_string();
+            let mut shown: Vec<&str> = again["views"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|v| s(&v["id"]))
+                .collect();
+            shown.sort();
+            let mut want = vec![lead.as_str(), a.as_str()];
+            want.sort();
+            assert_eq!(shown, want, "{mux:?}: both views");
+            bar_shown(&live, &again);
+            for id in [&lead, &a] {
+                let v = json_file(
+                    &live
+                        .state()
+                        .join(&k1)
+                        .join("agents")
+                        .join(id)
+                        .join("view.json"),
+                );
+                assert_eq!(
+                    attached(&live, &session, s(&v["hcAddress"])),
+                    1,
+                    "{mux:?}: {id}"
+                );
+                assert_eq!(
+                    s(&v["serverKey"]),
+                    live.server.key(),
+                    "{mux:?}: the view is on the new server"
+                );
+            }
+            assert!(
+                !live.state().join(live.server.key()).join("agents").exists(),
+                "{mux:?}: state stays at the anchor"
+            );
+            let shell = team_shell(&live, &session);
+            let (code, listed) = live.run_in(&shell, &["list"]);
+            assert_eq!(
+                code, 0,
+                "{mux:?}: a person in the new view reaches the team {listed}"
+            );
+            assert!(listed.to_string().contains("\"a\""), "{mux:?} {listed}");
+        }
+    }
+
+    /// The spec: "Abrupt core loss: up restores members and opens their views." The person's shell is opened before
+    /// the loss (the views end with the core); each restored member is ready before teardown ends it.
+    #[test]
+    fn up_after_a_core_loss_restores_members_and_opens_their_views() {
+        for mux in Mux::ALL {
+            let Some(mut live) = Live::human(mux) else {
+                continue;
+            };
+            let (lead, a, session, key) = team_of_two(&mut live);
+            let shell = team_shell(&live, &session);
+            lose_the_core(&mut live, &[lead.clone(), a.clone()]);
+            let (code, again) = live.run_in(&shell, &["up", "-Client", "claude"]);
+            assert_eq!(code, 0, "{mux:?} {again}");
+            let mut restored: Vec<&str> = again["restored"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|e| s(&e["id"]))
+                .collect();
+            restored.sort();
+            let mut want = vec![lead.as_str(), a.as_str()];
+            want.sort();
+            assert_eq!(restored, want, "{mux:?} {again}");
+            assert_eq!(views_of(&again), 2, "{mux:?}: views opened {again}");
+            bar_shown(&live, &again);
+            for id in [&lead, &a] {
+                let v = json_file(
+                    &live
+                        .state()
+                        .join(&key)
+                        .join("agents")
+                        .join(id)
+                        .join("view.json"),
+                );
+                assert_eq!(v["gen"], 1, "{mux:?}: the view is generation 1's");
+                assert_eq!(
+                    attached(&live, &session, s(&v["hcAddress"])),
+                    1,
+                    "{mux:?}: {id}"
+                );
+                live.ready(&json!({"id": id, "name": id}));
+            }
+        }
+    }
+
+    /// The spec: "A crash after E6.1: the next up makes one team." Row 13.5 (call 6): the index is counted right after
+    /// the crash, not only after the retry.
+    #[test]
+    fn a_crash_after_the_index_then_up_makes_one_team() {
+        for mux in Mux::ALL {
+            let Some(mut live) = Live::human(mux) else {
+                continue;
+            };
+            assert_eq!(
+                crash_up(&mut live, "index"),
+                86,
+                "{mux:?}: crashed after the index"
+            );
+            assert_eq!(
+                index_count(&live),
+                1,
+                "{mux:?}: the index exists right after the crash"
+            );
+            let sessions = |live: &Live| {
+                live.call(&["list-sessions", "-F", "#{session_name}"])
+                    .lines()
+                    .count()
+            };
+            assert_eq!(sessions(&live), 1, "{mux:?}: no session yet");
+            let (code, up) = live.run(&["up", "-Client", "claude"]);
+            assert_eq!((code, &up["created"]), (0, &json!(true)), "{mux:?} {up}");
+            assert_eq!(sessions(&live), 2, "{mux:?}: one team session");
+            assert_eq!(
+                std::fs::read_dir(live.keyed().join("agents"))
+                    .unwrap()
+                    .count(),
+                1,
+                "{mux:?}: one leader folder"
+            );
+            assert_eq!(index_count(&live), 1, "{mux:?}: one index");
+            live.ready(&json!({"id": up["leader"]["id"], "name": "leader"}));
+        }
+    }
+
+    /// Call 5: the hold window still exists when the first view opens: a crash at `presented` (views, bar and switch
+    /// done, the release not yet published) leaves the `hold` window and the leader's view; the next `up`, from a
+    /// person's shell in that session (checklist 50), publishes the release and the hold window ends.
+    #[test]
+    fn the_hold_window_outlives_the_first_view() {
+        let commands =
+            |live: &Live| live.call(&["list-panes", "-a", "-F", "#{pane_start_command}"]);
+        for mux in Mux::ALL {
+            let Some(mut live) = Live::human(mux) else {
+                continue;
+            };
+            assert_eq!(
+                crash_up(&mut live, "presented"),
+                86,
+                "{mux:?}: crashed after the views, before the release"
+            );
+            // Row 13.6: five of `hold`'s polls, so a release published before the crash would have ended it by now.
+            std::thread::sleep(mux_agent::hold::POLL * 5);
+            let now = commands(&live);
+            assert!(
+                now.lines().any(|c| c.contains(" hold ")),
+                "{mux:?}: the hold window is still there: {now}"
+            );
+            assert!(
+                now.lines().any(|c| c.contains(" attach ")),
+                "{mux:?}: and the first view is open: {now}"
+            );
+            let root = live.field(live.server.pane(), "#{session_id}");
+            let listed = live.call(&["list-sessions", "-F", "#{session_id}"]);
+            let team = listed
+                .lines()
+                .find(|l| *l != root)
+                .unwrap_or_else(|| panic!("{mux:?}: no team session: {listed}"))
+                .to_string();
+            let shell = team_shell(&live, &team);
+            // rmux gives the session the crashed `up`'s environment, so a pane in it has MUX_AGENTS_CRASH: the retry
+            // unsets it (the Windows twin's `setlocal`, finding 14.5).
+            let state = live.state_text();
+            let (code, out, err) = live.server.run_raw_in(
+                &shell,
+                env!("CARGO_BIN_EXE_mux-agent"),
+                &["up", "-Client", "claude"],
+                &[("MUX_AGENTS_STATE", state.as_str())],
+                &["MUX_AGENTS_CRASH"],
+            );
+            assert_eq!(code, 0, "{mux:?} {out} {err}");
+            let again: Value =
+                serde_json::from_str(out.trim()).unwrap_or_else(|e| panic!("{mux:?} {e}: {out}"));
+            live.server.wait("the hold window to end", || {
+                (!commands(&live).lines().any(|c| c.contains(" hold "))).then_some(())
+            });
+            live.ready(&json!({"id": again["leader"]["id"], "name": "leader"}));
         }
     }
 }

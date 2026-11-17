@@ -122,6 +122,8 @@ pub(super) fn arm(
         .and_then(|id| got.shown.iter().find(|v| v["id"] == id.as_str()));
     let (window, pane) = match chosen {
         Some(v) => (text(v.get("window")), text(v.get("pane"))),
+        // E4.5: a status window only when no member is Running; a Running member whose view failed gets none.
+        None if !running.is_empty() => (String::new(), String::new()),
         None => match status_window(ctx, &view_caller) {
             Ok(w) => (w, String::new()),
             Err(e) => {

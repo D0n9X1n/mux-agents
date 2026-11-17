@@ -1027,7 +1027,7 @@ pub fn stop_hc(ctx: &Ctx, request: &Request) -> Res<Map<String, Value>> {
         return generations::stop_generations(ctx, request);
     }
     stop_with(ctx, |ctx, caller| {
-        super::member_target::named(ctx, caller, first(request))
+        super::member_target::stop_target(ctx, caller, first(request))
     })
 }
 
@@ -1036,7 +1036,7 @@ pub fn stop_hc(ctx: &Ctx, request: &Request) -> Res<Map<String, Value>> {
 /// notice and the client wait are the same for both.
 pub(crate) fn stop_with(
     ctx: &Ctx,
-    pick: impl FnOnce(&Ctx, &Caller) -> Res<super::core_identity::Identity>,
+    pick: impl FnOnce(&Ctx, &Caller) -> Res<super::member_target::StopTarget>,
 ) -> Res<Map<String, Value>> {
     let caller = crate::caller::resolve_tree(ctx)?;
     let scope = super::team_state::Scope::of(&caller);
@@ -1051,7 +1051,10 @@ pub(crate) fn stop_with(
             }
             None => Vec::new(),
         };
-        let id = pick(ctx, &caller)?;
+        let id = match pick(ctx, &caller)? {
+            super::member_target::StopTarget::Member(id) => id,
+            pane => return stop_pre(ctx, &caller, standing, &pane),
+        };
         let folder = server_dir(ctx, &caller).join("agents").join(&id.id);
         // Dispatch only: `stop_life` revalidates through `current` (R1). An unreadable record goes to `stop_pre`,
         // whose `current` refuses it.
@@ -1077,7 +1080,12 @@ pub(crate) fn stop_with(
                     })
                 }
             },
-            _ => stop_pre(ctx, &caller, standing, &id),
+            _ => stop_pre(
+                ctx,
+                &caller,
+                standing,
+                &super::member_target::StopTarget::Member(id),
+            ),
         }
     })?;
     let exited = match client {
@@ -1135,50 +1143,72 @@ pub(super) fn stop_life(
     Ok((reply, client))
 }
 
-/// A pre-lifecycle member: main's stop, unchanged (kill the recorded address, classify, notice).
+/// A pre-lifecycle member: main's stop (kill the recorded address, classify, notice); all-calls 14: a 0.2.x
+/// pane-based one closes its pane only when proven its launch (`prelife::close_pane`), then is noticed the same way.
 fn stop_pre(
     ctx: &Ctx,
     caller: &Caller,
     standing: Option<&super::tree::Standing>,
-    id: &super::core_identity::Identity,
+    target: &super::member_target::StopTarget,
 ) -> Res<(Map<String, Value>, Recorded)> {
-    registry::with_member_notice(ctx, caller, &id.id, || {
-        let record = super::member_target::current(ctx, caller, id)?;
+    use super::member_target::StopTarget;
+    let (key, name) = match target {
+        StopTarget::Member(id) => (&id.id, &id.name),
+        StopTarget::Pane(p) => (&p.id, &p.name),
+    };
+    registry::with_member_notice(ctx, caller, key, || {
+        let record = match target {
+            StopTarget::Member(id) => super::member_target::current(ctx, caller, id)?,
+            StopTarget::Pane(p) => super::prelife::pane_current(ctx, caller, p)?,
+        };
         match standing {
-            Some(s) => super::tree::authority(ctx, caller, s, &id.id, "stop")?,
+            Some(s) => super::tree::authority(ctx, caller, s, key, "stop")?,
             None => parent_or_human(caller, &record)?,
         }
         // prelife-1c call 12: the existing notice is read (walk-checked) before any hc call; torn refuses.
-        let prior = registry::legacy_notice(ctx, caller, &id.id)?;
-        let core = crate::hc::connect(ctx)?;
-        // G10c, P-R3, p1c-calls 4-5: this get is the last hc call before any kill. Exactly Running (this identity's
-        // labels, the recorded launcher argv) is killed; Lost or Ended is never killed but is noticed `stopped`, which
-        // frees its slot; Unknown (missing, unmatched, unreadable) is refused and changes nothing.
-        use super::lifecycle::{Life, classify};
-        let word = |l: Life| match l {
-            Life::Running => "running",
-            Life::Lost => "lost",
-            Life::Ended => "ended",
-            Life::Unknown => "unknown",
-        };
-        let now = core.get(&id.address).ok().filter(|t| id.matches(t));
-        let life = match classify(now.as_ref(), &id.launcher) {
-            Life::Running => {
-                core.kill(&id.address)?;
-                let fact = core.get(&id.address).ok().filter(|t| id.matches(t));
-                word(classify(fact.as_ref(), &id.launcher))
-            }
-            Life::Unknown => return Err(super::prelife::not_running(&id.name)),
-            other => word(other),
-        };
-        registry::stop_notice(ctx, caller, &id.id, &record, prior.as_deref())?;
-        let member = server_dir(ctx, caller).join("agents").join(&id.id);
-        let client = recorded_client(&member, &record, &id.generation);
+        let prior = registry::legacy_notice(ctx, caller, key)?;
         let mut reply = Map::new();
-        reply.insert("name".into(), id.name.clone().into());
-        reply.insert("hcAddress".into(), id.address.clone().into());
+        reply.insert("name".into(), name.clone().into());
+        let (life, generation) = match target {
+            StopTarget::Member(id) => {
+                reply.insert("hcAddress".into(), id.address.clone().into());
+                (stop_pre_hc(ctx, id)?, id.generation.as_str())
+            }
+            StopTarget::Pane(p) => {
+                reply.insert("pane".into(), p.pane.clone().into());
+                let closed = super::prelife::close_pane(ctx, caller, p)?;
+                (if closed { "ended" } else { "lost" }, "0")
+            }
+        };
+        registry::stop_notice(ctx, caller, key, &record, prior.as_deref())?;
+        let member = server_dir(ctx, caller).join("agents").join(key);
+        let client = recorded_client(&member, &record, generation);
         reply.insert("life".into(), life.into());
         Ok((reply, client))
+    })
+}
+
+/// G10c, P-R3, p1c-calls 4-5: the get is the last hc call before any kill. Exactly Running (this identity's labels,
+/// the recorded launcher argv) is killed; Lost or Ended is never killed but is noticed `stopped`, which frees its
+/// slot; Unknown (missing, unmatched, unreadable) is refused and changes nothing.
+fn stop_pre_hc(ctx: &Ctx, id: &super::core_identity::Identity) -> Res<&'static str> {
+    use super::lifecycle::{Life, classify};
+    let core = crate::hc::connect(ctx)?;
+    let word = |l: Life| match l {
+        Life::Running => "running",
+        Life::Lost => "lost",
+        Life::Ended => "ended",
+        Life::Unknown => "unknown",
+    };
+    let now = core.get(&id.address).ok().filter(|t| id.matches(t));
+    Ok(match classify(now.as_ref(), &id.launcher) {
+        Life::Running => {
+            core.kill(&id.address)?;
+            let fact = core.get(&id.address).ok().filter(|t| id.matches(t));
+            word(classify(fact.as_ref(), &id.launcher))
+        }
+        Life::Unknown => return Err(super::prelife::not_running(&id.name)),
+        other => word(other),
     })
 }
 

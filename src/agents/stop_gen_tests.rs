@@ -381,7 +381,10 @@ fn drop_stops_by_exact_identity_and_revalidates_under_the_lock() {
     let caller = crate::caller::resolve_tree(&w.ctx).unwrap();
     let mut stale = super::member_target::by_id(&w.ctx, &caller, X).unwrap();
     stale.generation = "9".into(); // the member changed after it was selected
-    let e = super::message::stop_with(&w.ctx, |_, _| Ok(stale.clone())).unwrap_err();
+    let e = super::message::stop_with(&w.ctx, |_, _| {
+        Ok(super::member_target::StopTarget::Member(stale.clone()))
+    })
+    .unwrap_err();
     assert_eq!((e.code, e.check), (2, "target"), "{}", e.message);
     assert_eq!(bytes(&x), before, "nothing written");
 }

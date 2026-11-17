@@ -218,5 +218,137 @@ fn writer_abort(a: &Map<String, Value>, folder: &Path, record: &Value) -> bool {
         && identity.is_some_and(|i| Some(i) == id)
 }
 
+/// All-calls 14: a 0.2.x pane-based member (its record names no hc or lifecycle field). `stop` ends it by its pane.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct PaneMember {
+    pub id: String,
+    pub name: String,
+    pub pane: String,
+    pub command: String,
+}
+
+const HC_KEYS: [&str; 5] = [
+    "hcAddress",
+    "generation",
+    "team",
+    "launcherArgv",
+    "lifecycle",
+];
+const PANE_UNREADABLE: &str = "is a 0.2.x pane and the multiplexer cannot list its panes, so nothing is closed or noticed; retry once it answers";
+const PANE_UNPROVEN: &str = "is a 0.2.x pane that cannot be proven to run its recorded launch, so nothing is closed or noticed; close its pane yourself, then stop it again";
+
+/// `record` at folder `id` as a pane-based member of the caller's session: no hc field, its name, pane and exact
+/// `startCommand`. A 0.2.0-0.2.2 record (no `startCommand`) is none: nothing proves its pane.
+fn pane_of(record: &Value, id: &str, caller: &Caller) -> Option<PaneMember> {
+    let s = |k: &str| record.get(k)?.as_str().filter(|v| !v.is_empty());
+    if HC_KEYS.iter().any(|k| record.get(k).is_some())
+        || s("id")? != id
+        || s("session")? != super::scope::state(caller).session
+    {
+        return None;
+    }
+    Some(PaneMember {
+        id: id.into(),
+        name: s("name")?.into(),
+        pane: s("pane")?.into(),
+        command: s("startCommand")?.into(),
+    })
+}
+
+/// All-calls 14: the one committed pane-based member of the caller's session named `name` that no `stopped` or
+/// `exited` notice ended; none when there is none or more than one.
+pub(crate) fn pane_named(
+    ctx: &crate::ctx::Ctx,
+    caller: &Caller,
+    name: &str,
+) -> Res<Option<PaneMember>> {
+    if !crate::agents::agent_name(name) {
+        return Ok(None);
+    }
+    let agents = crate::agents::server_dir(ctx, caller).join("agents");
+    let mut found = Vec::new();
+    for (id, folder, member) in gens::members(&agents)? {
+        let gens::Member::Pre(r) = member else {
+            continue;
+        };
+        if let Some(p) = pane_of(&r, &id, caller).filter(|p| p.name == name)
+            && committed(&folder)
+            && !ended_by_notice(&folder)
+        {
+            found.push(p);
+        }
+    }
+    Ok(if found.len() == 1 { found.pop() } else { None })
+}
+
+/// `p`'s record, read again under its locks: still that pane-based member, committed; else `target` refuses.
+pub(crate) fn pane_current(ctx: &crate::ctx::Ctx, caller: &Caller, p: &PaneMember) -> Res<Value> {
+    let folder = crate::agents::server_dir(ctx, caller)
+        .join("agents")
+        .join(&p.id);
+    match gens::member_of(&folder) {
+        gens::Member::Pre(r)
+            if pane_of(&r, &p.id, caller).as_ref() == Some(p) && committed(&folder) =>
+        {
+            Ok(r)
+        }
+        gens::Member::Unreadable(e) => Err(e),
+        _ => Err(crate::agents::member_target::changed()),
+    }
+}
+
+/// All-calls 14: closes `p`'s pane when it is live and proven its launch: the row at its pane runs exactly its
+/// `startCommand` with launcher.json's pid, which the process table lists with launcher.json's start. The kill is the
+/// server's conditional one on that command and pid (never by name), and a fresh list must no longer show the launch.
+/// True: closed; false: no pane at its pane, nothing killed. A multiplexer that cannot be read, or a pane there that is
+/// not proven, refuses 2 `state`: nothing is killed or noticed.
+pub(crate) fn close_pane(ctx: &crate::ctx::Ctx, caller: &Caller, p: &PaneMember) -> Res<bool> {
+    use crate::agents::registry::{self, Launch};
+    let unreadable = |_: Refusal| refusal("state", format!("{} {PANE_UNREADABLE}", p.name));
+    let unproven = || refusal("state", format!("{} {PANE_UNPROVEN}", p.name));
+    let rows = registry::rows(ctx, caller).map_err(unreadable)?;
+    let Some(row) = rows.iter().find(|r| r.pane == p.pane) else {
+        return Ok(false);
+    };
+    let launch = Launch {
+        command: p.command.clone(),
+        pid: launcher_pid(ctx, caller, &p.id),
+    };
+    let proven = !row.dead
+        && row.command == p.command
+        && launch.pid.is_some_and(|pid| row.pid == pid.to_string());
+    if !proven {
+        return Err(unproven());
+    }
+    let argv = registry::bound(&p.pane, launch.live(), format!("kill-pane -t {}", p.pane));
+    let argv: Vec<&str> = argv.iter().map(String::as_str).collect();
+    crate::mux::native(ctx, &argv, false).map_err(unreadable)?;
+    let after = registry::rows(ctx, caller).map_err(unreadable)?;
+    if after
+        .iter()
+        .any(|r| r.pane == p.pane && r.command == p.command && r.pid == row.pid)
+    {
+        return Err(unproven());
+    }
+    Ok(true)
+}
+
+/// launcher.json's pid (walk-checked), when the process table lists it with launcher.json's start.
+fn launcher_pid(ctx: &crate::ctx::Ctx, caller: &Caller, id: &str) -> Option<u32> {
+    let folder = crate::agents::server_dir(ctx, caller)
+        .join("agents")
+        .join(id);
+    let Evidence::Present(l) = gens::walk(&folder, &["launcher.json"]) else {
+        return None;
+    };
+    let pid = u32::try_from(l.get("pid")?.as_u64()?).ok()?;
+    let start = l.get("start")?.as_i64()?;
+    ctx.os
+        .row(pid)
+        .and_then(|r| r.start)
+        .is_some_and(|listed| ctx.os.same_start(listed, start))
+        .then_some(pid)
+}
+
 #[cfg(test)]
 mod tests;

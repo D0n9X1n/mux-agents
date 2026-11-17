@@ -1423,12 +1423,53 @@ fn up_whose_view_panics_keeps_the_leader_under_hostile_settings() {
             .is_some_and(|e| e.contains("panicked")),
         "{reply}"
     );
-    assert!(eventually(Duration::from_secs(10), || live
-        .call(&["list-sessions", "-F", "#{session_name}"])
-        .lines()
-        .count()
-        == 2));
     assert!(!marker.exists());
+    let leader = s(&reply["leader"]["id"]);
+    assert!(
+        member_dir(&live, &leader)
+            .join("gens")
+            .join("0")
+            .join("commit.json")
+            .is_file(),
+        "the leader is committed: {reply}"
+    );
+    proof_of(&live, &leader);
+    // PM call 16 (call 10: views need not survive; up restores them): on rmux the empty team session ends once up's
+    // hold window closes. A second `up` without the panic finds the leader Running and shows its view; the hostile
+    // default-command never runs.
+    live.line(&live.root, "set MUX_AGENTS_TEST_PANIC=");
+    live.prompt(&live.root);
+    let again = live.run_any(&["up", "-Client", "claude"]);
+    assert_eq!(again["ok"], serde_json::json!(true), "{again}");
+    let life = again["members"]
+        .as_array()
+        .and_then(|m| m.iter().find(|m| s(&m["id"]) == leader))
+        .map(|m| m["life"].clone());
+    assert_eq!(
+        life,
+        Some(serde_json::json!("running")),
+        "the leader is still Running: {again}"
+    );
+    let view = again["views"]
+        .as_array()
+        .and_then(|v| v.iter().find(|v| s(&v["id"]) == leader))
+        .unwrap_or_else(|| panic!("the leader's view is shown: {again}"));
+    let pane = s(&view["pane"]);
+    assert!(
+        eventually(Duration::from_secs(10), || live
+            .call(&[
+                "list-panes",
+                "-s",
+                "-t",
+                &s(&again["session"]),
+                "-F",
+                "#{pane_id}"
+            ])
+            .lines()
+            .any(|p| p.trim() == pane)),
+        "the leader's view pane {pane} is in the team session: {again}"
+    );
+    assert!(!marker.exists(), "after the second up");
 }
 
 /// `file` of member `id`, under whichever server folder of the state root holds it.
@@ -3342,4 +3383,353 @@ fn a_scrolled_command_pane_gained_only_the_harness_line() {
     lost.insert(0, "something else".to_string());
     assert!(!harness_only(&was, &lost, line), "a changed earlier line");
     assert!(!harness_only(&was, &was, line), "no harness line");
+}
+
+impl Live {
+    /// reentry-6a live (call 4): `kill-server`, then a new root session on the same pipe: a new server pid, so a new
+    /// key. The private core keeps running.
+    fn restart(&mut self) {
+        let _ = crate::bounded::output(self.rmux().arg("kill-server"), crate::bounded::LIMIT);
+        self.wait("the old server to exit", || {
+            let out =
+                crate::bounded::output(self.rmux().arg("list-sessions"), crate::bounded::LIMIT);
+            matches!(out, Ok(o) if !o.status.success()).then_some(())
+        });
+        self.root = self.new_session("it");
+    }
+}
+
+/// The one folder every `up` of a reentry test runs in (the team is the folder's).
+fn proj(live: &Live) -> PathBuf {
+    live.dir.join("proj")
+}
+
+/// `up` in `proj` with `MUX_AGENTS_CRASH=<step>` set inside one script (`run_crashed`'s `setlocal`, so the console
+/// never keeps it; A3c ambiguity 14); its exit code.
+fn crash_up(live: &Live, step: &str) -> i32 {
+    std::fs::create_dir_all(proj(live)).unwrap();
+    live.line(&live.root, &format!("cd /d \"{}\"", proj(live).display()));
+    run_crashed(live, step, &["up", "-Client", "claude"])
+}
+
+/// The anchor key: the one state folder that holds `agents/<id>` (no key is hashed in the test; finding 11-14 #7).
+fn anchor_key(live: &Live, id: &str) -> String {
+    let keys: Vec<String> = std::fs::read_dir(live.dir.join("state"))
+        .unwrap()
+        .flatten()
+        .filter(|e| e.path().join("agents").join(id).is_dir())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(keys.len(), 1, "one folder holds {id}: {keys:?}");
+    keys[0].clone()
+}
+
+/// `up` from the root pane in `proj`, then the leader spawns `a`; both ready before any test ends a member (o2 call
+/// 35): (leader, a, session, anchor key).
+fn team_of_two(live: &Live) -> (String, String, String, String) {
+    let up = live.run_at(&live.root, &proj(live), &["up", "-Client", "claude"]);
+    assert_eq!(up["ok"], true, "{up}");
+    assert!(up.get("sidebarError").is_none(), "F6: {up}");
+    let (lead, session) = (s(&up["leader"]["id"]), s(&up["session"]));
+    let (task, brief) = (live.dir.join("task.txt"), live.dir.join("brief.md"));
+    std::fs::write(&brief, "a child of the reentry test").unwrap();
+    let (task, brief) = (task.display().to_string(), brief.display().to_string());
+    let mut sent = HashMap::new();
+    // Finding F12: the fake leader has no interactive Claude environment to fork, so the child is brief-only.
+    let args = [
+        "spawn",
+        "-Client",
+        "claude",
+        "-TaskFile",
+        &task,
+        "-BriefFile",
+        &brief,
+        "-Context",
+        "brief",
+        "-Name",
+        "a",
+    ];
+    let r = by(live, &mut sent, &lead, &args);
+    assert_eq!(r["ok"], true, "spawn a: {r}");
+    let a = s(&r["id"]);
+    wait_ready(live, &lead);
+    wait_ready(live, &a);
+    let key = anchor_key(live, &lead);
+    (lead, a, session, key)
+}
+
+fn views_of(reply: &Value) -> usize {
+    reply["views"].as_array().map_or(0, Vec::len)
+}
+
+/// F6 (checklist 37): the reply's bar is opened and proven: `sidebar` is a pane of the reply's session, and no
+/// `sidebarError`.
+fn bar_shown(live: &Live, reply: &Value) {
+    assert!(
+        reply.get("sidebarError").is_none(),
+        "no sidebarError: {reply}"
+    );
+    assert!(reply["sidebar"].is_string(), "the bar: {reply}");
+    let panes = live.call(&[
+        "list-panes",
+        "-s",
+        "-t",
+        &s(&reply["session"]),
+        "-F",
+        "#{pane_id}",
+    ]);
+    assert!(
+        panes.lines().any(|p| p.trim() == s(&reply["sidebar"])),
+        "the bar is in the session: {panes} {reply}"
+    );
+}
+
+/// Findings 11-14 #32, F19: each reply entry's own `pane` and `window` are a real pane of that window in `session`
+/// attaching its member's current address (`attach_program`, F11); no member is listed twice; its descriptor names
+/// the current generation. Answers how many panes of `session` attach a member address.
+fn views_are_panes(live: &Live, reply: &Value, key: &str, session: &str) -> usize {
+    use mux_agent::agents::core_identity::attach_program;
+    use mux_agent::state::root::OsKind;
+    let panes = live.call(&[
+        "list-panes",
+        "-s",
+        "-t",
+        session,
+        "-F",
+        "#{pane_id} #{window_id} #{pane_start_command}",
+    ]);
+    let rows: Vec<(&str, &str, &str)> = panes
+        .lines()
+        .filter_map(|l| {
+            let mut f = l.splitn(3, ' ');
+            Some((f.next()?, f.next()?, f.next().unwrap_or("")))
+        })
+        .collect();
+    let views = reply["views"].as_array().expect("views");
+    let mut ids: Vec<String> = views.iter().map(|v| s(&v["id"])).collect();
+    ids.sort_unstable();
+    ids.dedup();
+    assert_eq!(ids.len(), views.len(), "each member once: {reply}");
+    let mut attaching = 0;
+    for v in views {
+        let folder = live
+            .dir
+            .join("state")
+            .join(key)
+            .join("agents")
+            .join(s(&v["id"]));
+        let rec: Value =
+            serde_json::from_slice(&std::fs::read(folder.join("record.json")).unwrap()).unwrap();
+        let desc: Value =
+            serde_json::from_slice(&std::fs::read(folder.join("view.json")).unwrap()).unwrap();
+        let (pane, window, address) = (s(&v["pane"]), s(&v["window"]), s(&rec["hcAddress"]));
+        let attaches = |c: &str| attach_program(c, &address, OsKind::Windows).is_some();
+        assert!(
+            rows.iter()
+                .any(|(p, w, c)| *p == pane && *w == window && attaches(c)),
+            "{pane} in {window} attaches {address} in {session}: {panes}"
+        );
+        attaching += rows.iter().filter(|(_, _, c)| attaches(c)).count();
+        assert_eq!(
+            desc["gen"].to_string(),
+            s(&rec["generation"]),
+            "the view is the current generation's"
+        );
+    }
+    attaching
+}
+
+/// The session that is not the root's (the team's, after a crashed `up`).
+fn team_session(live: &Live) -> String {
+    let root = live.field(&live.root, "#{session_id}");
+    let listed = live.call(&["list-sessions", "-F", "#{session_id}"]);
+    listed
+        .lines()
+        .map(str::trim)
+        .find(|l| *l != root)
+        .unwrap_or_else(|| panic!("no team session: {listed}"))
+        .to_string()
+}
+
+/// A person's `team_pane` split from `session`'s first pane that is not `up`'s `hold` (its window ends with the
+/// release; checklist 50).
+fn person_pane(live: &Live, session: &str) -> String {
+    let panes = live.call(&[
+        "list-panes",
+        "-s",
+        "-t",
+        session,
+        "-F",
+        "#{pane_id} #{pane_start_command}",
+    ]);
+    let pane = panes
+        .lines()
+        .find(|l| !l.contains(" hold "))
+        .and_then(|l| l.split(' ').next())
+        .unwrap_or_else(|| panic!("no pane to split in {session}: {panes}"))
+        .to_string();
+    team_pane(live, &pane)
+}
+
+#[test]
+fn up_restores_closed_views_on_windows() {
+    let Some(live) = Live::start() else { return };
+    let (lead, a, session, key) = team_of_two(&live);
+    let shell = person_pane(&live, &session);
+    for id in [&lead, &a] {
+        let at = live
+            .dir
+            .join("state")
+            .join(&key)
+            .join("agents")
+            .join(id)
+            .join("view.json");
+        let v: Value = serde_json::from_slice(&std::fs::read(at).unwrap()).unwrap();
+        live.call(&["kill-pane", "-t", &s(&v["pane"])]);
+    }
+    let again = live.run_at(&shell, &proj(&live), &["up", "-Client", "claude"]);
+    assert_eq!(
+        (&again["reentered"], &again["created"]),
+        (&json!(true), &json!(false)),
+        "{again}"
+    );
+    assert_eq!(views_of(&again), 2, "{again}");
+    bar_shown(&live, &again);
+    let before = views_are_panes(&live, &again, &key, &session);
+    let again2 = live.run_at(&shell, &proj(&live), &["up", "-Client", "claude"]);
+    assert_eq!(
+        (views_of(&again2), &again2["duplicates"]),
+        (2, &json!(0)),
+        "row 13.1: nothing added {again2}"
+    );
+    bar_shown(&live, &again2);
+    assert_eq!(
+        views_are_panes(&live, &again2, &key, &session),
+        before,
+        "finding F19: no attaching pane added"
+    );
+}
+
+#[test]
+fn up_after_kill_server_makes_a_new_session_with_both_views_and_the_bar_on_windows() {
+    let Some(mut live) = Live::start() else {
+        return;
+    };
+    let (lead, _, _, key) = team_of_two(&live);
+    let view = |live: &Live| -> Value {
+        let at = live
+            .dir
+            .join("state")
+            .join(&key)
+            .join("agents")
+            .join(&lead)
+            .join("view.json");
+        serde_json::from_slice(&std::fs::read(at).unwrap()).unwrap()
+    };
+    let before = view(&live)["serverKey"].clone();
+    live.restart();
+    let again = live.run_at(&live.root, &proj(&live), &["up", "-Client", "claude"]);
+    assert_eq!(
+        (&again["reentered"], &again["created"]),
+        (&json!(true), &json!(false)),
+        "{again}"
+    );
+    assert_eq!(views_of(&again), 2, "{again}");
+    bar_shown(&live, &again);
+    assert_ne!(
+        view(&live)["serverKey"],
+        before,
+        "the view is on the new server"
+    );
+    views_are_panes(&live, &again, &key, &s(&again["session"]));
+    assert_eq!(anchor_key(&live, &lead), key, "state stays at the anchor");
+}
+
+#[test]
+fn up_after_a_core_loss_restores_members_and_opens_their_views_on_windows() {
+    let Some(mut live) = Live::start() else {
+        return;
+    };
+    let (lead, a, session, key) = team_of_two(&live);
+    // Opened before the loss: the views end with the core.
+    let shell = person_pane(&live, &session);
+    lose(&mut live, &[lead.clone(), a.clone()]);
+    let again = live.run_at(&shell, &proj(&live), &["up", "-Client", "claude"]);
+    let mut want = vec![lead.clone(), a.clone()];
+    want.sort();
+    assert_eq!(sorted_ids(&again, "restored"), want, "{again}");
+    assert_eq!(views_of(&again), 2, "{again}");
+    bar_shown(&live, &again);
+    views_are_panes(&live, &again, &key, &session);
+    for id in [&lead, &a] {
+        wait_ready(&live, id);
+    }
+}
+
+#[test]
+fn a_crash_after_the_index_then_up_makes_one_team_on_windows() {
+    let Some(live) = Live::start() else { return };
+    assert_eq!(crash_up(&live, "index"), 86, "crashed after the index");
+    let indexes = || {
+        std::fs::read_dir(live.dir.join("state").join("up")).map_or(0, |d| {
+            d.filter(|e| {
+                e.as_ref()
+                    .unwrap()
+                    .path()
+                    .extension()
+                    .is_some_and(|x| x == "json")
+            })
+            .count()
+        })
+    };
+    assert_eq!(
+        indexes(),
+        1,
+        "row 13.5: the index exists right after the crash"
+    );
+    let up = live.run_at(&live.root, &proj(&live), &["up", "-Client", "claude"]);
+    assert_eq!(up["created"], json!(true), "{up}");
+    let lead = s(&up["leader"]["id"]);
+    let key = anchor_key(&live, &lead);
+    let leaders = std::fs::read_dir(live.dir.join("state").join(key).join("agents"))
+        .unwrap()
+        .count();
+    assert_eq!(leaders, 1, "one leader folder");
+    let sessions = live
+        .call(&["list-sessions", "-F", "#{session_name}"])
+        .lines()
+        .count();
+    assert_eq!((sessions, indexes()), (2, 1), "it, one team, one index");
+    wait_ready(&live, &lead);
+}
+
+// Call 5: the hold window still exists when the first view opens (a crash at `presented`); the next `up`, from a
+// person's pane in that session (checklist 50), releases it.
+#[test]
+fn the_hold_window_outlives_the_first_view_on_windows() {
+    let Some(live) = Live::start() else { return };
+    assert_eq!(
+        crash_up(&live, "presented"),
+        86,
+        "crashed after the views, before the release"
+    );
+    // Row 14.6: five of `hold`'s polls, so a release published before the crash would have ended it by now.
+    std::thread::sleep(mux_agent::hold::POLL * 5);
+    let commands = live.call(&["list-panes", "-a", "-F", "#{pane_start_command}"]);
+    assert!(
+        commands.lines().any(|c| c.contains(" hold ")),
+        "the hold window is still there: {commands}"
+    );
+    assert!(
+        commands.lines().any(|c| c.contains(" attach ")),
+        "and the first view is open: {commands}"
+    );
+    let shell = person_pane(&live, &team_session(&live));
+    let again = live.run_at(&shell, &proj(&live), &["up", "-Client", "claude"]);
+    assert_eq!(again["ok"], true, "{again}");
+    live.wait("the hold window to end", || {
+        let now = live.call(&["list-panes", "-a", "-F", "#{pane_start_command}"]);
+        (!now.lines().any(|c| c.contains(" hold "))).then_some(())
+    });
+    wait_ready(&live, &s(&again["leader"]["id"]));
 }

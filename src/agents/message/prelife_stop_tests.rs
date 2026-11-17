@@ -121,7 +121,9 @@ fn an_ancestor_agent_never_kills_a_lost_or_unknown_legacy_child() {
         flags: Vec::new(),
     });
     let team = crate::agents::membership::team(&caller);
-    let id = crate::agents::core_identity::Identity::read(&c, C, &team).unwrap();
+    let id = crate::agents::member_target::StopTarget::Member(
+        crate::agents::core_identity::Identity::read(&c, C, &team).unwrap(),
+    );
     let lost = crate::agents::life_fixture::LOST_ARGVS[0];
     let before = pf::bytes(&w.folder(C));
     for state in ["missing", "restarted"] {
