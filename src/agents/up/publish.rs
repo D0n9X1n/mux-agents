@@ -1,10 +1,10 @@
 //! reentry-6a E3, under `up|T`: repair a `pending`, reuse a proven live `view` on the caller's server, else write
 //! `pending` durably and make the session. Nothing here kills (6a-R3); an unwanted session ends by its release,
 //! which is kept in the index's `releases` until E5 publishes it (calls 25, 35).
-use super::index::{self, Index, Proof, Server, View};
+use super::index::{self, Index, Pending, Proof, Server, View};
 use crate::caller::{Anchor, Caller};
 use crate::ctx::Ctx;
-use crate::error::Res;
+use crate::error::{Refusal, Res};
 
 /// What a `list-sessions -F "#{session_id} #{session_name}"` answered: exit code and stdout.
 pub type Listing = (i32, String);
@@ -200,4 +200,107 @@ pub fn repair(ctx: &Ctx, me: &Caller, ix: &mut Index) -> Res<()> {
         index::write(ctx, ix)?;
     }
     Ok(())
+}
+
+pub const UNPROVEN: &str = "the new session could not be proven; run up again";
+
+/// What `ensure` and `start` leave: the view on the caller's server. Its hold release, if any, is in the index's
+/// `releases`, published by E5 (calls 25, 35).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Published {
+    pub view: View,
+}
+
+/// E3.1, then E3.2 (a proven live view on the caller's server whose session is listed, the answering server
+/// re-proven after the listing: F4, call 34), else E3.3: a new `pending` written durably, then `start`.
+pub fn ensure(ctx: &Ctx, me: &Caller, ix: &mut Index) -> Res<Published> {
+    repair(ctx, me, ix)?;
+    if let Some(v) = ix.view.clone()
+        && v.server.key == me.server_key
+        && index::prove(ctx, &v.server)? == Proof::Live
+        && sessions_on(ctx, me, &v.server)?
+            .iter()
+            .any(|s| s.0 == v.session)
+    {
+        answered(ctx, me, &v.server)?;
+        return Ok(Published { view: v });
+    }
+    let name = super::identity::session_name(std::path::Path::new(&ix.inputs.folder), &ix.team)?;
+    let rel = ctx
+        .state_root
+        .join("up")
+        .join(format!("{}.release", crate::util::hex32()?));
+    let rel = crate::agents::spawn::utf8(&rel)?.to_string();
+    ix.pending = Some(Pending {
+        server: index::server_of(me),
+        name,
+        release: rel,
+    });
+    index::write(ctx, ix)?;
+    super::halt("pending")?;
+    start(ctx, me, ix)
+}
+
+/// E3.3 for `ix.pending` (already durable): `new-session` running `hold <release>`; then the answering server is
+/// proven the recorded one (calls 16, 34) before anything is published; a lost or unclear reply runs E3.1 at once
+/// and ends published on this server or in 1 `index` (`pending` kept, or dropped with its release kept when the
+/// listing proves no such session).
+pub fn start(ctx: &Ctx, me: &Caller, ix: &mut Index) -> Res<Published> {
+    let p = ix
+        .pending
+        .clone()
+        .ok_or_else(|| Refusal::internal("no pending session"))?;
+    let exe = crate::agents::spawn::utf8(&ctx.exe)?;
+    let args = [
+        "new-session",
+        "-d",
+        "-P",
+        "-F",
+        "#{session_id} #{window_id}",
+        "-s",
+        &p.name,
+        "-c",
+        &ix.inputs.folder,
+        exe,
+        "hold",
+        &p.release,
+    ];
+    let reply = crate::mux::native(ctx, &args, true);
+    super::halt("session")?;
+    let here = index::server_of(me);
+    match reply
+        .ok()
+        .filter(|o| o.code == 0)
+        .and_then(|o| super::ids(&o.stdout))
+    {
+        Some((session, _)) => {
+            answered(ctx, me, &here)?;
+            publish(
+                ix,
+                View {
+                    server: here,
+                    session,
+                    name: p.name.clone(),
+                },
+            );
+            index::write(ctx, ix)?;
+            super::halt("published")?;
+            Ok(Published {
+                view: ix.view.clone().expect("published"),
+            })
+        }
+        None => {
+            repair(ctx, me, ix).map_err(|_| index::bad(UNPROVEN))?;
+            match ix.view.clone() {
+                Some(v)
+                    if ix.pending.is_none()
+                        && v.server.key == me.server_key
+                        && v.name == p.name =>
+                {
+                    Ok(Published { view: v })
+                }
+                _ => Err(index::bad(UNPROVEN)),
+            }
+        }
+    }
 }

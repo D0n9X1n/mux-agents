@@ -375,3 +375,5 @@ fn release_all_publishes_each_release_and_keeps_a_torn_one() {
         "F21: its path stays durable"
     );
 }
+
+mod ensure;

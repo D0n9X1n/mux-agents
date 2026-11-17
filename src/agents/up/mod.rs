@@ -301,6 +301,25 @@ fn write_team(ctx: &Ctx, dest: &Caller, plan: &Plan<'_>, name: &str, record: &Va
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    static HALT: std::cell::Cell<Option<&'static str>> = const { std::cell::Cell::new(None) };
+}
+/// Ambiguity 18: unit tests stop `up` after `step` (1 `halted`, "halted after <step>").
+#[cfg(test)]
+pub fn halt_after(step: Option<&'static str>) {
+    HALT.with(|h| h.set(step));
+}
+/// A durable step of `up` is done: the live crash point, and the unit-test halt.
+pub(crate) fn halt(step: &'static str) -> Res<()> {
+    crate::state::evidence::crash_point(step);
+    #[cfg(test)]
+    if HALT.with(|h| h.get()) == Some(step) {
+        return refuse(1, "halted", format!("halted after {step}"));
+    }
+    Ok(())
+}
+
 /// `$N @M` from new-session's `-P -F`.
 fn ids(stdout: &str) -> Option<(String, String)> {
     let (s, w) = stdout.trim_end_matches(['\r', '\n']).split_once(' ')?;

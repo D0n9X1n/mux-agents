@@ -441,6 +441,16 @@ const SCOPE_READS_ALLOWED: &[(&str, &str, &str)] = &[
     ),
     (
         "src/agents/up/publish.rs",
+        "ensure",
+        "reuse only a view on the caller's own server",
+    ),
+    (
+        "src/agents/up/publish.rs",
+        "start",
+        "a lost reply publishes only on the caller's own server",
+    ),
+    (
+        "src/agents/up/publish.rs",
         "sessions_on",
         "the caller's own server is listed natively",
     ),
@@ -1316,6 +1326,11 @@ const TEST_ONLY: &[(&str, &str, &str)] = &[
         "src/agents/up/existing_tests.rs",
         "src/agents/up/mod.rs",
         "existing_tests",
+    ),
+    (
+        "src/agents/up/publish_tests/ensure.rs",
+        "src/agents/up/publish_tests.rs",
+        "ensure",
     ),
     (
         "src/agents/up/publish_tests.rs",
