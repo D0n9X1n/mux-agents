@@ -120,6 +120,9 @@ pub(crate) fn occupies(argv: &[String], session: &str) -> bool {
         if !(name == "--session-id" || (resume && !fork)) {
             return false;
         }
-        inline.or_else(|| flags.get(i + 1).copied()) == Some(session)
+        // All-calls 14, F3: a session id matches in any case, as `held_on` lowers `wanted`.
+        inline
+            .or_else(|| flags.get(i + 1).copied())
+            .is_some_and(|v| v.eq_ignore_ascii_case(session))
     })
 }

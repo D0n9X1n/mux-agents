@@ -34,6 +34,28 @@ fn the_callers_argv_naming_the_session_holds_it() {
     assert_eq!(held_as(&w, X, Client::Claude, OsKind::Unix, &own), None);
 }
 
+// All-calls 14, F3: the caller's argv resuming the session in upper case still holds it (session ids match in any
+// case, as `wanted` is lowered).
+#[test]
+fn the_callers_argv_naming_the_session_in_upper_case_holds_it() {
+    let session = "abcdef12-abcd-4abc-8abc-abcdefabcdef";
+    let w = World::agent("");
+    let own = pane_own(&w);
+    w.fakes.forget(CLAUDE);
+    w.fakes.process(Row {
+        argv: Some(vec![
+            "claude".into(),
+            "--resume".into(),
+            session.to_ascii_uppercase(),
+        ]),
+        ..crate::testing::row(CLAUDE, PANE, 1500)
+    });
+    assert_eq!(
+        held_as(&w, session, Client::Claude, OsKind::Unix, &own),
+        Some((Rule::Argv, Some(CLAUDE)))
+    );
+}
+
 // Call 1, test 3: a second unmanaged Claude still blocks B, beside the exempt caller.
 #[test]
 fn a_second_unmanaged_client_still_holds_beside_the_caller() {
