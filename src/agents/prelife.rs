@@ -243,7 +243,7 @@ fn pane_of(record: &Value, id: &str, caller: &Caller) -> Option<PaneMember> {
     let s = |k: &str| record.get(k)?.as_str().filter(|v| !v.is_empty());
     if HC_KEYS.iter().any(|k| record.get(k).is_some())
         || s("id")? != id
-        || s("session")? != caller.session
+        || s("session")? != super::scope::state(caller).session
     {
         return None;
     }
