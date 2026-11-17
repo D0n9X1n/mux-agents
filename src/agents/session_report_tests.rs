@@ -176,6 +176,52 @@ fn no_client_or_an_unreadable_walk_writes_nothing_and_exits_0() {
     }
 }
 
+// A Unix native `copilot` under its npm loader: the hook's report is keyed by the loader, as occupancy reads a live
+// pair, and is written under the native's own key too, so a native that outlives its loader still names its
+// conversation. Elsewhere (Windows, or no loader) the one key is the client's own.
+#[test]
+fn a_native_copilot_reports_under_its_loader_and_its_own_key() {
+    let w = hc_world();
+    if crate::state::root::HOST != crate::state::root::OsKind::Unix {
+        return;
+    }
+    let row = |pid, ppid, start, file: &str| crate::proc::Row {
+        pid,
+        ppid,
+        start: Some(start),
+        path: Some(format!("/usr/lib/{file}")),
+        argv: Some(vec![file.into()]),
+        image: Some(file.into()),
+    };
+    // The fixture's launcher (100) and client (150) become an npm loader and its native.
+    w.fakes.forget(100);
+    w.fakes.forget(150);
+    w.fakes.process(row(100, 1, 1000, "node"));
+    w.fakes.process(row(150, 100, 1500, "copilot"));
+    w.fakes.client(100, Client::Copilot);
+    w.fakes.client(150, Client::Copilot);
+    hooks::stdin(Some(
+        format!(r#"{{"sessionId":"{NEW}","source":"resume"}}"#).as_bytes(),
+    ));
+    terminal(&w, json!({}));
+    let (code, reply) = call(&w, &["report", "-Session", "-Stdin"]);
+    assert_eq!(code, 0, "{reply}");
+    assert_eq!(
+        (&reply["client"]["pid"], &reply["client"]["start"]),
+        (&json!(100), &json!(1000)),
+        "{reply}"
+    );
+    for (pid, start) in [(100, 1000), (150, 1500)] {
+        let file = live::path(&w.ctx, Client::Copilot, pid, start);
+        let entry = crate::state::fs::read_json(&file).unwrap();
+        assert_eq!(
+            entry.as_ref().map(|e| &e["sessionId"]),
+            Some(&json!(NEW)),
+            "entry under {pid}"
+        );
+    }
+}
+
 // The Copilot hook's form: `{sessionId, source}` on stdin. Bad input is usage and writes nothing.
 #[test]
 fn the_copilot_stdin_form_reads_session_and_source() {

@@ -16,9 +16,9 @@ pub fn run(ctx: &Ctx, request: &Request) -> Res<Map<String, Value>> {
     reply.insert("sessionId".into(), session.clone().into());
     reply.insert("source".into(), source.clone().into());
     // K3 and PM call 9: no client, a walk that cannot be trusted, or an unresolved identity writes nothing, exit 0.
-    let (kind, (pid, start)) = match ancestry::first_client(ctx) {
+    let (kind, (pid, start), native) = match ancestry::first_client(ctx) {
         Above::Client(row, kind) => match ancestry::identity(ctx, &row, kind) {
-            Some(found) => (kind, found),
+            Some(found) => (kind, found, row),
             None => return Ok(nothing(reply, "unreadable".into())),
         },
         Above::None => return Ok(nothing(reply, Value::Null)),
@@ -31,6 +31,12 @@ pub fn run(ctx: &Ctx, request: &Request) -> Res<Map<String, Value>> {
         Ok(seq) => Value::from(seq),
         Err(refusal) => refusal.check.into(),
     };
+    // A Unix native `copilot` is keyed by its npm loader. Its own key gets the same entry, so a native that outlives
+    // its loader (a loader killed alone) still names its conversation to occupancy, which then keys it by itself.
+    // Best effort: the loader's entry above is the one every live pair is read by.
+    if let Some(own) = native.start.filter(|_| native.pid != pid) {
+        let _ = crate::state::live::report(ctx, kind, native.pid, own, &session, &source);
+    }
     reply.insert("seq".into(), seq);
     if stops("registry") {
         reply.insert("handshake".into(), Value::Null);
