@@ -3901,6 +3901,22 @@ fn lost_shell_is_only_hc_keeps_powershell_live() {
     assert!(!lost_shell(&json!({})));
 }
 
+// #150 (CI 85d70b5): one hc holder carried every member's terminal. Killing a client while it lived let it record
+// the launcher's exit (Ended, exit 1, never Lost), and the shared holder came up twice (taskkill 128 the second time).
+#[test]
+fn kill_order_ends_each_hold_once_before_any_client() {
+    let (c1, c2, c3, hold) = ((10, Some(1)), (20, Some(2)), (30, Some(3)), (99, Some(9)));
+    assert_eq!(
+        private_core::kill_order(&[c1, hold, c2, hold, c3, hold]),
+        [hold, c1, c2, c3]
+    );
+    let (h1, h2) = ((91, Some(7)), (92, Some(8)));
+    assert_eq!(
+        private_core::kill_order(&[c1, h1, c2, h2]),
+        [h1, h2, c1, c2]
+    );
+}
+
 #[test]
 fn runs_reads_a_plain_and_an_rmux_encoded_start_command() {
     let encoded = "D:%5Cx%5Cmux-agent.exe\u{1f}hold\u{1f}D:%5Cs%5Cup%5Ct.release";
