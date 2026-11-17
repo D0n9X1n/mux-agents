@@ -81,6 +81,8 @@ const OPTION: &str = "@mux-agents-sidebar";
 // bar leaves. shortcut: a window viewed while the bar was on, whose view then closed with no bar left to unset it
 // (the bar closed by `sidebar -Close` first), keeps it; a bar opened there later by `sidebar` leaves at once.
 const VIEWED: &str = "@mux-agents-viewed";
+/// reentry-6a E4.5: a window `up` opened because no member runs; it never holds a view, so its bar stays.
+pub const STATUS: &str = "@mux-agents-status";
 // The session's bar as `<pane> <pid> <start>`, written only by `open` once the split's process is this binary
 // `watch`, cleared by `sidebar -Close` once the bar is gone.
 const RECORD: &str = "@mux-agents-sidebar-id";
@@ -1692,6 +1694,8 @@ pub fn run_watch(
     // shortcut: the window is the one resolved when the watch started; a bar moved to another window by hand stops
     // proving itself there (own_record) and only draws.
     let mut held = false;
+    // reentry-6a E4.5: a status window never held a view, so its bar never leaves for want of one (read once).
+    let mut status: Option<bool> = None;
     // When the watch started or was last proven, and whether its pane was read as not marked for it (run by hand: a
     // mark is only ever set by the open that splits the pane), so the startup limit is checked no more.
     let mut proven_at = ctx.clock.now();
@@ -1763,7 +1767,10 @@ pub fn run_watch(
         if let Some(windows) = read {
             let here = windows.contains(&caller.window);
             held |= here;
-            let lost = recorded && held && !here;
+            let lost = recorded
+                && held
+                && !here
+                && !*status.get_or_insert_with(|| is_status(ctx, &caller.window));
             if recorded {
                 // Every other view window without a proven bar gets its own (a view moved by break-pane). One whose
                 // ensure failed waits a minute before it is tried again, so a failing open never splits every tick;
@@ -2933,6 +2940,12 @@ pub(crate) fn view_windows(ctx: &Ctx, caller: &Caller) -> Option<Vec<String>> {
 /// member view there again (a spawn or focus that reused the bar while this waited on the lock), an unread list or a
 /// lock not taken keeps the bar: false. Else its pane's label is removed only while the pane still runs this
 /// process, its window's record is cleared only while it still names this bar, and the bar leaves: true.
+/// reentry-6a E4.5: `window` carries `STATUS` (`up` opened it because no member runs).
+fn is_status(ctx: &Ctx, window: &str) -> bool {
+    native(ctx, &["show-options", "-wqv", "-t", window, STATUS], true)
+        .is_ok_and(|read| read.code == 0 && read.stdout.trim_end_matches(['\r', '\n']) == "1")
+}
+
 fn leave(ctx: &Ctx, caller: &Caller) -> bool {
     lock(ctx, &scope::shown_lock("sidebar", caller), || {
         if view_windows(ctx, caller).is_none_or(|windows| windows.contains(&caller.window)) {
@@ -8848,6 +8861,21 @@ mod tests {
         );
         // It removes its pane's mark as it leaves, so a spawn racing it is not refused.
         assert!(all.iter().any(|c| c == UNMARK));
+    }
+
+    // reentry-6a E4.5, finding #11: a status window has no member view; its bar does not leave for want of views (it
+    // runs until its own pane goes), unlike a viewed window (`a_view_closed_before_the_first_tick_still_lets_the_bar_leave`).
+    #[test]
+    fn a_status_windows_bar_stays_without_views() {
+        let (w, _) = keep_world(&["live", "live", "live", "gone"], win("%1", in_place()));
+        views_by_tick(&w, "@1", 0, "closed");
+        w.fakes.mux_first(VIEWED, 0, "1\n", "");
+        w.fakes.mux_rule(STATUS, 0, "1\n", "");
+        let (ended, _) = watch_run(&w);
+        assert_eq!(
+            ended, "pane-closed",
+            "it stayed until its own pane closed, never view-closed"
+        );
     }
 
     #[test]

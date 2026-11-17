@@ -1343,6 +1343,11 @@ const TEST_ONLY: &[(&str, &str, &str)] = &[
         "publish_tests",
     ),
     (
+        "src/agents/up/reenter_tests.rs",
+        "src/agents/up/mod.rs",
+        "reenter_tests",
+    ),
+    (
         "src/agents/up/tests/create.rs",
         "src/agents/up/tests.rs",
         "create",

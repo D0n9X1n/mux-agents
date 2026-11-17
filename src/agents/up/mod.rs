@@ -9,6 +9,9 @@ mod leaders;
 pub mod publish;
 #[cfg(test)]
 mod publish_tests;
+pub mod reenter;
+#[cfg(test)]
+mod reenter_tests;
 pub mod replay;
 pub mod server;
 #[cfg(test)]
@@ -176,7 +179,7 @@ fn drive(
             Ok(t) => t,
             Err(e) if run.record.is_some() => {
                 run.team_error = Some(e.message);
-                return reenter_arm(ctx, caller, core, team, &mut ix, run, reentered);
+                return reenter::arm(ctx, caller, core, team, &mut ix, run, reentered);
             }
             Err(e) => return Err(e),
         };
@@ -213,13 +216,13 @@ fn drive(
                     .ok_or_else(|| Refusal::internal("no launch record"))?;
                 if let Err(e) = write_team(ctx, &ix, &r) {
                     run.team_error = Some(e.message); // finding A22: soft after commit (D25)
-                    return reenter_arm(ctx, caller, core, team, &mut ix, run, reentered);
+                    return reenter::arm(ctx, caller, core, team, &mut ix, run, reentered);
                 }
                 halt("team")?;
                 run.created = true;
                 run.replayed |= !fresh;
             }
-            Step::Reenter => return reenter_arm(ctx, caller, core, team, &mut ix, run, reentered),
+            Step::Reenter => return reenter::arm(ctx, caller, core, team, &mut ix, run, reentered),
         }
     }
     Err(Refusal::internal("up did not converge"))
@@ -234,83 +237,6 @@ struct Run {
     launched: bool,
     created: bool,
     replayed: bool,
-}
-
-/// E4 in call 8's order: reconcile (unless this call launched the leader; restore-6c adds leader resume here), the
-/// team record create-only from the leader's current record, `publish::ensure`, views, bar and switch (Task 11),
-/// `presented`, the release. A leader this call launched is the reply's from its launch record (F15: no discovery
-/// after commit). Later groups extend this arm (call 9).
-fn reenter_arm(
-    ctx: &Ctx,
-    caller: &Caller,
-    _core: &Core<'_>,
-    team: &str,
-    ix: &mut index::Index,
-    run: Run,
-    reentered: bool,
-) -> Res<Map<String, Value>> {
-    let a = ix
-        .anchor
-        .clone()
-        .ok_or_else(|| Refusal::internal("no anchor"))?;
-    let scope = super::team_state::Scope {
-        key: a.key,
-        session: a.session,
-    };
-    let mut reply = Map::new();
-    let (mut created, mut replayed, mut team_error) = (run.created, run.replayed, run.team_error);
-    let leader = if run.launched {
-        run.record.clone()
-    } else {
-        let anchor = super::reconcile::anchor_caller(caller, &scope);
-        reply.extend(super::reconcile::run(ctx, &anchor)?);
-        let leader = leader_of(ctx, ix)?.1;
-        let leader = leader
-            .map(|id| leaders::leader_record(ctx, ix, &id))
-            .transpose()?;
-        if let Some(r) = &leader
-            && !team_exists(ctx, ix)?
-        {
-            match write_team(ctx, ix, r) {
-                Ok(()) => (created, replayed) = (true, true),
-                Err(e) => team_error = Some(e.message),
-            }
-        }
-        leader
-    };
-    let shown = match run.shown {
-        Some(p) => p,
-        None => publish::ensure(ctx, caller, ix)?,
-    };
-    if let Some(r) = &run.record {
-        reply.extend(super::spawn::view_reply(r)); // A3b-2: `attached`, or `viewError` (call 23)
-    }
-    if let Some(e) = team_error {
-        reply.insert("teamRecordError".into(), e.into());
-    }
-    for (k, v) in [
-        ("team", json!(team)),
-        ("session", json!(shown.view.session)),
-        ("name", json!(shown.view.name)),
-        ("created", json!(created)),
-        ("replayed", json!(replayed)),
-        ("reentered", json!(reentered)),
-    ] {
-        reply.insert(k.into(), v);
-    }
-    if let Some(r) = &leader {
-        reply.insert(
-            "leader".into(),
-            json!({"id": r["id"], "name": r["name"], "hcAddress": r["hcAddress"]}),
-        );
-    }
-    let window = run
-        .record
-        .as_ref()
-        .map(|r| text(r.get("window")))
-        .unwrap_or_default();
-    present(ctx, caller, ix, &shown, &window, &mut reply)?;
-    Ok(reply)
 }
 
 /// Calls 33, 39 (findings A1, F1-F3): the anchor key `key`'s `server.json`. On its own server it is published
@@ -444,36 +370,6 @@ fn write_team(ctx: &Ctx, ix: &index::Index, record: &Value) -> Res<()> {
     } else {
         refuse(1, "team", "the team record already exists")
     }
-}
-
-/// The bar of the view's window, the window, the client (skipped when the reply reports `viewError`: no layout
-/// without a view, call 23), then `halt("presented")`, then every outstanding release (ambiguity 7: last; call 5).
-fn present(
-    ctx: &Ctx,
-    caller: &Caller,
-    ix: &mut index::Index,
-    shown: &publish::Published,
-    window: &str,
-    reply: &mut Map<String, Value>,
-) -> Res<()> {
-    if !reply.contains_key("viewError") && !window.is_empty() {
-        let dest = at_view(caller, ix, shown);
-        crate::sidebar::keep(ctx, &dest, window, reply);
-        let target = format!("={}", shown.view.name);
-        let switched = server::same(ctx, &dest)
-            .and_then(|_| native(ctx, &["select-window", "-t", window], false))
-            .and_then(|_| server::same(ctx, &dest))
-            .and_then(|_| native(ctx, &["switch-client", "-t", &target], false));
-        if let Err(e) = switched {
-            reply.insert("layoutError".into(), e.message.into());
-        }
-    }
-    halt("presented")?;
-    // E5, calls 17, 25, 35 (finding A6): every outstanding release published and read back `Present`.
-    if let Err(e) = publish::release_all(ctx, ix) {
-        reply.insert("releaseError".into(), e.message.into());
-    }
-    Ok(())
 }
 
 #[cfg(test)]
