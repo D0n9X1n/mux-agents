@@ -5856,13 +5856,46 @@ hc {}:
                 });
             }
             let (code, up) = live.run(&["up", "-Client", "claude"]);
-            assert_eq!((code, &up["created"]), (0, &json!(false)), "{mux:?} {up}");
-            let team = live.split(s(&before[0]["session"]), &["-v"]);
+            // all-calls call 9: a failure carries what hc answered for each member right after `up` (not reproduced
+            // locally; the earlier failures held every member "occupied").
+            let seen: Vec<String> = before
+                .iter()
+                .map(|r| {
+                    let address = s(&r["hcAddress"]);
+                    let core = live.server.core.as_ref().expect("private core");
+                    let got = support::private_core::run(
+                        core.command(&["get", address, "--json"]),
+                        live.dir.path(),
+                    );
+                    format!("{} {address}: {got:?}", s(&r["id"]))
+                })
+                .collect();
+            assert_eq!(
+                (code, &up["created"]),
+                (0, &json!(false)),
+                "{mux:?} {up} hc: {seen:#?}"
+            );
+            // Seen once in WSL (session 6): the split below found no session; carry the sessions with the evidence.
+            let sid = s(&before[0]["session"]);
+            let sessions =
+                live.server
+                    .try_call(&["list-sessions", "-F", "#{session_id} #{session_name}"]);
+            assert!(
+                String::from_utf8_lossy(&sessions.stdout)
+                    .lines()
+                    .any(|l| l.split(' ').next() == Some(sid)),
+                "{mux:?} the team's session {sid} is gone after up: {sessions:?} up: {up} hc: {seen:#?}"
+            );
+            let team = live.split(sid, &["-v"]);
             let (code, restore) = live.run_in(&team, &["restore"]);
-            assert_eq!(code, 0, "{mux:?} {restore}");
+            assert_eq!(code, 0, "{mux:?} {restore} hc: {seen:#?}");
             for reply in [&up, &restore] {
                 for key in ["restored", "held", "unknown", "recover"] {
-                    assert_eq!(reply[key], json!([]), "{mux:?} {key}: {reply}");
+                    assert_eq!(
+                        reply[key],
+                        json!([]),
+                        "{mux:?} {key}: {reply} up: {up} hc: {seen:#?}"
+                    );
                 }
             }
             for (i, id) in ids.iter().enumerate() {
@@ -6493,8 +6526,9 @@ hc {}:
     /// Phase 7a end to end: leader > a > b, sibling c, team T2. b lists a's notes newest first; the leader and a
     /// person of the team peek b; c and T2's person cannot. Every pane of the server is inventoried after the bars
     /// close (checklist 9): each member's fake client is proven raw by a canary byte (10), then receives no byte (8);
-    /// the quiet shells keep their screens; the two command panes gain only the harness's own line; panes, windows
-    /// and client selection stay as arranged (b's window has another pane active; tmux: a client is attached).
+    /// every pane but the harness's two command panes (members, b among them, and the quiet shells) keeps its screen;
+    /// panes, windows and client selection stay as arranged (b's window has another pane active; tmux: a client is
+    /// attached).
     fn notebook_and_peek_stay_in_the_team(mux: Mux) {
         let Some(mut live) = Live::human(mux) else {
             return;
@@ -6587,9 +6621,11 @@ hc {}:
         // Checklist 9: every pane is a member of either team or one of the five known shells.
         let (quiet, commands) = ([root, other, t2], [person.clone(), t2_person.clone()]);
         let mut tagged: Vec<(String, String)> = Vec::new();
+        let mut all: Vec<String> = Vec::new();
         for row in live.panes("#{pane_id}|#{@agent-id}|#{@agent-role}|#{pane_start_command}") {
             let mut part = row.splitn(4, '|');
             let (p, agent) = (part.next().unwrap(), part.next().unwrap_or(""));
+            all.push(p.to_string());
             let (role, start) = (part.next().unwrap_or(""), part.next().unwrap_or(""));
             if agent.is_empty() {
                 assert!(
@@ -6658,11 +6694,14 @@ hc {}:
             (live.call(&["list-panes", "-a", "-F", format]), clients)
         };
         let input = typed(&live);
-        let screens: Vec<Vec<String>> = quiet
-            .iter()
-            .chain(&commands)
-            .map(|p| screen(&live, p))
-            .collect();
+        // all-calls call 9: every member pane (b, the peek target, among them) and every quiet shell keeps its screen;
+        // the harness's command panes are left out (it types there by design; a narrowed pane redraws its line).
+        let compared = super::unchanged_panes(&all, &commands);
+        assert!(
+            tagged.iter().all(|(_, p)| compared.contains(p)) && compared.contains(&pane),
+            "{mux:?}: every member pane is compared: {compared:?} {tagged:?}"
+        );
+        let screens: Vec<Vec<String>> = compared.iter().map(|p| screen(&live, p)).collect();
         let before = focus(&live);
         assert!(
             before.0.contains(&format!("|{pane}|0|")),
@@ -6703,30 +6742,8 @@ hc {}:
             input,
             "{mux:?} no member's client received a byte"
         );
-        // A command pane gains exactly the harness's one line (`. '<dir>/line.<n>.sh'` after the prompt it showed)
-        // and the same prompt again; a quiet shell gains nothing.
-        let ours = |t: &str| {
-            t.strip_prefix(&format!(". '{}", live.path("line.")))
-                .and_then(|t| t.strip_suffix(".sh'"))
-                .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
-        };
-        for (n, p) in quiet.iter().chain(&commands).enumerate() {
-            let (was, now) = (&screens[n], screen(&live, p));
-            if n < quiet.len() {
-                assert_eq!(&now, was, "{mux:?}: shell pane {p} changed");
-                continue;
-            }
-            let (keep, prompt) = (was.len() - 1, &was[was.len() - 1]);
-            let harness = now.len() == was.len() + 1
-                && now[..keep] == was[..keep]
-                && now[keep]
-                    .strip_prefix(prompt.as_str())
-                    .is_some_and(|t| ours(t.trim_start()))
-                && &now[keep + 1] == prompt;
-            assert!(
-                harness,
-                "{mux:?}: command pane {p} gained more than the harness's line:\n{was:#?}\n{now:#?}"
-            );
+        for (n, p) in compared.iter().enumerate() {
+            assert_eq!(screen(&live, p), screens[n], "{mux:?}: pane {p} changed");
         }
         drop(client);
     }
@@ -6967,6 +6984,29 @@ hc {}:
             );
         }
     }
+}
+
+/// The panes whose screens must not change while a team peeks (all-calls call 9): every pane of the server except
+/// the harness's command panes, where the harness types by design and a narrowed pane redraws its own line.
+fn unchanged_panes(all: &[String], commands: &[String]) -> Vec<String> {
+    all.iter()
+        .filter(|p| !commands.contains(p))
+        .cloned()
+        .collect()
+}
+
+// #150 (macOS CI 133755859846): a command pane redrew the harness's own line after the pane narrowed. It is left out
+// of the screen comparison; every member pane (b, the peek target, among them) and every quiet shell stays in.
+#[test]
+fn only_the_harness_command_panes_leave_the_screen_comparison() {
+    let s = |v: &[&str]| v.iter().map(|p| p.to_string()).collect::<Vec<_>>();
+    let all = s(&["%0", "%1", "%2", "%3", "%4", "%5", "%6", "%7", "%8"]);
+    let commands = s(&["%5", "%8"]);
+    assert_eq!(
+        unchanged_panes(&all, &commands),
+        s(&["%0", "%1", "%2", "%3", "%4", "%6", "%7"]),
+        "members and quiet shells compared, command panes not"
+    );
 }
 
 #[cfg(unix)]
