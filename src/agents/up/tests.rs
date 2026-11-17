@@ -815,6 +815,22 @@ fn a_leader_view_failure_is_reported_and_the_leader_stays() {
     );
 }
 
+// reentry-6a E4.5 (integration #150 CI, live up_whose_view_panics_keeps_the_leader_under_hostile_settings): the
+// launched leader is Running, so a failed leader view opens no status window; that window runs the session's
+// default-command, which may start a client this team did not.
+#[test]
+fn a_running_leader_whose_view_failed_opens_no_status_window() {
+    let w = ready();
+    fails(&w, "@agent-context");
+    let reply = claude(&w).unwrap();
+    assert!(reply["viewError"].is_string(), "{reply:?}");
+    let status: Vec<_> = of(&w, "new-window")
+        .into_iter()
+        .filter(|c| c.iter().any(|a| a == "status"))
+        .collect();
+    assert!(status.is_empty(), "no status window: {status:?}");
+}
+
 // cascade-3d C8: `up` finishes the caller's session's journals under `up|<team>` before anything else; an
 // unreadable journal refuses `evidence` before any hc run.
 #[test]
