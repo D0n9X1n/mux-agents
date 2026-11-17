@@ -265,20 +265,56 @@ pub(crate) fn pane_named(
     if !crate::agents::agent_name(name) {
         return Ok(None);
     }
+    let mut found: Vec<_> = (pane_members(ctx, caller)?.into_iter())
+        .map(|(p, _)| p)
+        .filter(|p| p.name == name)
+        .collect();
+    Ok(if found.len() == 1 { found.pop() } else { None })
+}
+
+/// Every committed pane-based member of the caller's session that no `stopped` or `exited` notice ended, with its record.
+fn pane_members(ctx: &crate::ctx::Ctx, caller: &Caller) -> Res<Vec<(PaneMember, Value)>> {
     let agents = crate::agents::server_dir(ctx, caller).join("agents");
     let mut found = Vec::new();
     for (id, folder, member) in gens::members(&agents)? {
         let gens::Member::Pre(r) = member else {
             continue;
         };
-        if let Some(p) = pane_of(&r, &id, caller).filter(|p| p.name == name)
+        if let Some(p) = pane_of(&r, &id, caller)
             && committed(&folder)
             && !ended_by_notice(&folder)
         {
-            found.push(p);
+            found.push((p, r));
         }
     }
-    Ok(if found.len() == 1 { found.pop() } else { None })
+    Ok(found)
+}
+
+/// The pane-based members `list` and the bar show as running, as 0.2.8 did, so a person still sees a 0.2.x agent
+/// running after the upgrade (it holds a team slot): each whose pane is proven its launch (`proven`), with its record
+/// and the window it is in now. Display only: a multiplexer that cannot be read, or
+/// a pane not proven, shows none, and nothing is killed or written.
+pub(crate) fn live_panes(
+    ctx: &crate::ctx::Ctx,
+    caller: &Caller,
+) -> Vec<(PaneMember, Value, String)> {
+    let Ok(members) = pane_members(ctx, caller) else {
+        return Vec::new();
+    };
+    if members.is_empty() {
+        return Vec::new(); // no multiplexer call without a pane-based member
+    }
+    let Ok(rows) = crate::agents::registry::rows(ctx, caller) else {
+        return Vec::new();
+    };
+    members
+        .into_iter()
+        .filter_map(|(p, r)| {
+            let row = proven(ctx, caller, &p, &rows).ok()??;
+            let window = row.window.clone();
+            Some((p, r, window))
+        })
+        .collect()
 }
 
 /// `p`'s record, read again under its locks: still that pane-based member, committed; else `target` refuses.
@@ -307,19 +343,13 @@ pub(crate) fn close_pane(ctx: &crate::ctx::Ctx, caller: &Caller, p: &PaneMember)
     let unreadable = |_: Refusal| refusal("state", format!("{} {PANE_UNREADABLE}", p.name));
     let unproven = || refusal("state", format!("{} {PANE_UNPROVEN}", p.name));
     let rows = registry::rows(ctx, caller).map_err(unreadable)?;
-    let Some(row) = rows.iter().find(|r| r.pane == p.pane) else {
+    let Some(row) = proven(ctx, caller, p, &rows).map_err(|()| unproven())? else {
         return Ok(false);
     };
     let launch = Launch {
         command: p.command.clone(),
         pid: launcher_pid(ctx, caller, &p.id),
     };
-    let proven = !row.dead
-        && row.command == p.command
-        && launch.pid.is_some_and(|pid| row.pid == pid.to_string());
-    if !proven {
-        return Err(unproven());
-    }
     let argv = registry::bound(&p.pane, launch.live(), format!("kill-pane -t {}", p.pane));
     let argv: Vec<&str> = argv.iter().map(String::as_str).collect();
     crate::mux::native(ctx, &argv, false).map_err(unreadable)?;
@@ -331,6 +361,24 @@ pub(crate) fn close_pane(ctx: &crate::ctx::Ctx, caller: &Caller, p: &PaneMember)
         return Err(unproven());
     }
     Ok(true)
+}
+
+/// The row at `p`'s pane in `rows`, when it is live and proven `p`'s launch: it runs exactly its `startCommand` with
+/// launcher.json's pid, which the process table lists with launcher.json's start. None: no pane there. Err: a pane
+/// there that is not proven.
+fn proven<'a>(
+    ctx: &crate::ctx::Ctx,
+    caller: &Caller,
+    p: &PaneMember,
+    rows: &'a [crate::agents::registry::Row],
+) -> Result<Option<&'a crate::agents::registry::Row>, ()> {
+    let Some(row) = rows.iter().find(|r| r.pane == p.pane) else {
+        return Ok(None);
+    };
+    let pid = launcher_pid(ctx, caller, &p.id);
+    let ok =
+        !row.dead && row.command == p.command && pid.is_some_and(|pid| row.pid == pid.to_string());
+    if ok { Ok(Some(row)) } else { Err(()) }
 }
 
 /// launcher.json's pid (walk-checked), when the process table lists it with launcher.json's start.

@@ -425,3 +425,60 @@ fn list_shows_a_pre_lifecycle_child_of_a_lifecycle_member_as_today() {
     assert_eq!(pf::bytes(&w.folder(C)), before);
     w.fakes.hc_done().unwrap();
 }
+
+/// After the upgrade, `list` (the bar's feed too) shows a live 0.2.x pane-based member as 0.2.8 did, from its
+/// record and its pane proven its launch; nothing is killed or written. A gone pane, or one running another command,
+/// or a multiplexer that cannot be read, shows no running row.
+#[test]
+fn a_live_v028_pane_member_is_listed_after_the_upgrade() {
+    for (pane, shown) in [
+        (pf::Pane028::Live, true),
+        (pf::Pane028::Gone, false),
+        (pf::Pane028::Other, false),
+        (pf::Pane028::Unreachable, false),
+    ] {
+        let w = World::human("");
+        pf::v028(&w, P, "old", pf::End::Live);
+        pf::v028_pane(&w, P, pane);
+        pf::script(&w, Default::default());
+        let before = pf::bytes(&w.state().join("agents"));
+        let (code, out) = crate::cli::run(&["list".to_string()], || Ok(&w.ctx));
+        assert_eq!(code, 0, "{pane:?}: {out}");
+        let reply: serde_json::Value = serde_json::from_str(&out).unwrap();
+        let names: Vec<&str> = reply["agents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|r| r["state"] == "running")
+            .map(|r| r["name"].as_str().unwrap())
+            .collect();
+        if shown {
+            assert_eq!(
+                (reply["running"].as_u64(), names),
+                (Some(1), vec!["old"]),
+                "{pane:?}: {out}"
+            );
+            let row = &reply["agents"][0];
+            assert_eq!(
+                (&row["pane"], &row["client"]),
+                (&json!("%9"), &json!("claude")),
+                "{out}"
+            );
+        } else {
+            assert_eq!(
+                (reply["running"].as_u64(), names.len()),
+                (Some(0), 0),
+                "{pane:?}: {out}"
+            );
+        }
+        assert!(
+            pf::pane_kills(&w).is_empty(),
+            "{pane:?}: list kills nothing"
+        );
+        assert_eq!(
+            pf::bytes(&w.state().join("agents")),
+            before,
+            "{pane:?}: list writes nothing"
+        );
+    }
+}
