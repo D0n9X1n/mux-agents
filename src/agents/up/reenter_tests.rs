@@ -1329,10 +1329,12 @@ fn torn_index_prelife_leader_and_team_record_repair() {
     std::fs::remove_file(ut::team_file(&w)).unwrap();
     cf::online(&w);
     let (code, r) = cli(&w, &["up", "-Client", "claude"]);
+    // restore-6c decision 9 (checklist 71, D23): an unreadable agent record refuses `evidence` before the replay
+    // loop, ahead of E4.2's `team`.
     assert_eq!(
         (code, r["check"].as_str()),
-        (1, Some("team")),
-        "E4.2 else 1 team: {r}"
+        (1, Some("evidence")),
+        "decision 9: {r}"
     );
     w.fakes.hc_done().unwrap();
 }

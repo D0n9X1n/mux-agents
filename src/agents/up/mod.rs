@@ -227,6 +227,15 @@ fn drive(
             }
             Step::Reenter => {
                 if !run.launched {
+                    // D22: E4.2's team record before the pass, so a restore of a leader whose first `up` died
+                    // after commit finds it (restore-6c checklist 69 refuses an absent record).
+                    if !has_team && let Some(id) = &id {
+                        let r = leaders::leader_record(ctx, &ix, id)?;
+                        match write_team(ctx, &ix, &r) {
+                            Ok(()) => (run.created, run.replayed) = (true, true),
+                            Err(e) => run.team_error = Some(e.message),
+                        }
+                    }
                     run.reconciled = Some(leaders::reconciled(ctx, caller, &ix, id.as_deref())?);
                 }
                 return reenter::arm(ctx, caller, core, team, &mut ix, run, reentered);
