@@ -195,6 +195,36 @@ fn boot_match(ctx: &Ctx, entry: &Value) -> BootMatch {
     }
 }
 
+/// Whether an entry of `kind` whose process is gone, started no later than `start`, names `session`: the report a
+/// Unix native `copilot`'s npm loader wrote before it exited while the native lived on (occupancy H4.4). A torn entry,
+/// or one whose boot cannot be decided, counts too (fail closed); an unreadable folder refuses.
+pub fn gone_naming(ctx: &Ctx, kind: Client, start: i64, session: &str) -> Res<bool> {
+    if !live_dir(ctx)? {
+        return Ok(false);
+    }
+    for item in std::fs::read_dir(dir(ctx)).map_err(|_| evidence::unreadable())? {
+        let name = item.map_err(|_| evidence::unreadable())?.file_name();
+        let Some((k, pid, s)) = name.to_str().and_then(parse_name) else {
+            continue;
+        };
+        if k != kind || s > start || alive(ctx, pid, s) != Alive::Dead {
+            continue;
+        }
+        match evidence::read(&path(ctx, k, pid, s)) {
+            evidence::Evidence::Present(v) if boot_match(ctx, &v) == BootMatch::Another => {}
+            evidence::Evidence::Present(v) => {
+                let id = crate::agents::text(v.get("sessionId"));
+                if !crate::checks::session_id(&id) || id.eq_ignore_ascii_case(session) {
+                    return Ok(true);
+                }
+            }
+            evidence::Evidence::Absent => {}
+            evidence::Evidence::Unreadable => return Ok(true),
+        }
+    }
+    Ok(false)
+}
+
 /// K2: removes each regular entry whose process is Dead, rechecked under that entry's own lock. Other names, folders,
 /// links and FIFOs are left (their type is read with `symlink_metadata`, never opened).
 pub fn sweep(ctx: &Ctx) -> Res<usize> {
