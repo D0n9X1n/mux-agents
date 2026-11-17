@@ -234,6 +234,33 @@ fn an_unmanaged_native_copilot_is_judged_by_its_loaders_report() {
     }
 }
 
+// H4.4, a Unix native `copilot` keyed by its npm loader, whose loader quits after the key resolved and before the
+// registry read: the loader's entry is reaped with it, yet the native lives and may be on X, so it holds as Evidence. A
+// client that exits mid-check holds nothing only when the row's own process is the one gone.
+#[test]
+fn an_unmanaged_native_copilot_whose_loader_quits_mid_check_holds() {
+    if HOST != OsKind::Unix {
+        return;
+    }
+    let w = World::human("");
+    for (pid, ppid, start, file) in [(7101, 7100, 2101, "copilot"), (7100, 1, 2100, "node")] {
+        w.fakes.process(Row {
+            pid,
+            ppid,
+            start: Some(start),
+            path: Some(format!("/usr/lib/{file}")),
+            argv: Some(vec![file.into()]),
+            image: Some(file.into()),
+        });
+        w.fakes.client(pid, Client::Copilot);
+    }
+    let fakes = w.fakes.clone();
+    hooks::before_entry_read(Some(Box::new(move || fakes.forget(7100))));
+    let got = who(held_on(&w.ctx, X, Client::Copilot, HOST, None));
+    hooks::before_entry_read(None);
+    assert_eq!(got, Some((Rule::Evidence, Some(7101))));
+}
+
 // H4.4, a Unix native `copilot` whose npm loader was killed while it lived on: keyed by itself now, it is judged by the
 // entry its hook also wrote under its own key (`report -Session`): naming X holds X; naming another frees X.
 #[test]
