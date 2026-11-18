@@ -499,3 +499,18 @@ fn an_unresolved_node_holds_copilot_by_its_image() {
     );
     assert_eq!(held(&w, X, Client::Claude), None, "node is no Claude image");
 }
+
+// A client that has exited but is not reaped yet is still listed, its argv and path gone: it would hold every
+// conversation as unbound. It runs no more code, so it holds nothing; a live unbound row still holds.
+#[test]
+fn an_ended_unbound_client_holds_nothing() {
+    let w = World::human("");
+    w.fakes.process(row(Some(1), None, None, Some("claude")));
+    assert_eq!(
+        held(&w, X, Client::Claude),
+        Some((Rule::Unbound, Some(7001))),
+        "live, it holds"
+    );
+    w.fakes.ended(7001);
+    assert_eq!(held(&w, X, Client::Claude), None, "ended, it holds nothing");
+}

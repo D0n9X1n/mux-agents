@@ -237,6 +237,16 @@ impl Os for MacOs {
         seam::kill_with(self, opened)
     }
 
+    /// libproc's bsdinfo of the row's pid, with the row's start, shows a zombie or a process in its exit. libproc
+    /// still answers for a zombie, so its start is read as for a live process.
+    fn ended(&self, row: &Row) -> bool {
+        bsdinfo(row.pid).is_some_and(|info| {
+            row.start.is_some()
+                && start_of(&info) == row.start
+                && parse::bsd_ended(info.pbi_status, info.pbi_flags)
+        })
+    }
+
     fn cwd(&self, pid: u32) -> Option<String> {
         let pid = c_int::try_from(pid).ok()?;
         let mut info = vec![0u8; parse::VNODE_INFO_SIZE];
@@ -323,6 +333,47 @@ mod tests {
             .duration_since(SystemTime::UNIX_EPOCH)
             .unwrap()
             .as_micros() as i64
+    }
+
+    // A child that exited and is not reaped yet is still listed with its start, but its argv cannot be read: occupancy
+    // reads it as unbound. `ended` shows it exited; a live process has not ended.
+    #[test]
+    fn an_unreaped_child_is_listed_unbound_and_ended() {
+        let dir = TempDir::new();
+        let mut live = sleeper(dir.path());
+        let mut gone = Command::new("/bin/sh")
+            .args(["-c", "exit 0"])
+            .spawn()
+            .unwrap();
+        let end = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let zombie = loop {
+            let row = MacOs
+                .table()
+                .unwrap()
+                .into_iter()
+                .find(|r| r.pid == gone.id());
+            if let Some(row) = row.filter(|r| r.argv.is_none()) {
+                break row;
+            }
+            assert!(std::time::Instant::now() < end, "the child never exited");
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        };
+        let live_row = MacOs.row(live.id()).unwrap();
+        let ended = (MacOs.ended(&zombie), MacOs.ended(&live_row));
+        let reused = MacOs.ended(&Row {
+            start: zombie.start.map(|s| s + 1),
+            ..zombie.clone()
+        });
+        live.kill().unwrap();
+        live.wait().unwrap();
+        gone.wait().unwrap();
+        assert!(zombie.start.is_some(), "{zombie:?}");
+        assert_eq!(
+            ended,
+            (true, false),
+            "the zombie has ended, the sleeper has not"
+        );
+        assert!(!reused, "another start is another process");
     }
 
     #[test]

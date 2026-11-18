@@ -36,6 +36,39 @@ pub fn linux_stat(text: &[u8]) -> Option<LinuxStat> {
     })
 }
 
+// PF_EXITING (include/linux/sched.h): the task is in do_exit.
+const PF_EXITING: u64 = 0x4;
+
+/// Whether a `/proc/<pid>/stat` line shows the process that started at `start` has ended: state `Z` or `X`, or
+/// PF_EXITING in its flags (field 9), as its only thread (num_threads, field 20). A thread-group leader that exited
+/// while other threads run shows `Z` too, but it is a live process. Fields are read after the last ')', as
+/// `linux_stat` reads them; a line that cannot be read, or another start, has not ended.
+pub fn linux_ended(text: &[u8], start: i64) -> bool {
+    let Some(close) = text.iter().rposition(|&b| b == b')') else {
+        return false;
+    };
+    let Ok(rest) = std::str::from_utf8(&text[close + 1..]) else {
+        return false;
+    };
+    let fields: Vec<&str> = rest.trim().split(' ').collect();
+    if fields.len() < 21 || number::<i64>(fields[19].as_bytes()) != Some(start) {
+        return false;
+    }
+    let one_thread = number::<u64>(fields[17].as_bytes()).is_some_and(|n| n <= 1);
+    let exiting = number::<u64>(fields[6].as_bytes()).is_some_and(|f| f & PF_EXITING != 0);
+    one_thread && (matches!(fields[0], "Z" | "X") || exiting)
+}
+
+// sys/proc.h p_stat SZOMB, and sys/proc_info.h PROC_FLAG_INEXIT (XNU); libc declares no PROC_FLAG_INEXIT.
+const SZOMB: u32 = 5;
+const PROC_FLAG_INEXIT: u32 = 0x4;
+
+/// Whether macOS `proc_bsdinfo` fields (`pbi_status`, `pbi_flags`) show the process has ended: a zombie, or a process
+/// in its exit. Both are per process, not per thread.
+pub fn bsd_ended(status: u32, flags: u32) -> bool {
+    status == SZOMB || flags & PROC_FLAG_INEXIT != 0
+}
+
 /// `/proc/<pid>/cmdline`: it must end in NUL and only that one is dropped, so empty last arguments survive.
 pub fn linux_cmdline(bytes: &[u8]) -> Option<Vec<String>> {
     let body = bytes.strip_suffix(b"\0")?;
@@ -418,6 +451,63 @@ mod tests {
                 start: 1 << 40
             })
         );
+    }
+
+    // A zombie (Z or X) or a process in its exit (PF_EXITING, 0x4) has ended, but only as one thread, with the start
+    // the row was read with: a leader that exited while other threads run is a live process, and another start is
+    // another process. A line that cannot be read has not ended.
+    #[test]
+    fn linux_ended_reads_state_flags_threads_and_start() {
+        let line = |state: &str, flags: u64, threads: u32, start: i64| {
+            format!(
+                "300 (claude) {state} 100 300 300 0 -1 {flags} 100 0 0 0 5 3 0 0 20 0 {threads} 0 {start} 1000000 200 0
+"
+            )
+        };
+        let live = 0x40_0100;
+        for (state, flags, threads, start, want) in [
+            ("S", live, 1, 4321, false),
+            ("R", live, 1, 4321, false),
+            ("Z", live, 1, 4321, true),
+            ("X", live, 1, 4321, true),
+            ("S", live | 0x4, 1, 4321, true),
+            ("Z", live, 3, 4321, false),
+            ("S", live | 0x4, 2, 4321, false),
+            ("Z", live, 1, 9999, false),
+            ("S", live | 0x4, 1, 9999, false),
+        ] {
+            assert_eq!(
+                linux_ended(line(state, flags, threads, start).as_bytes(), 4321),
+                want,
+                "{state} {flags:#x} {threads} {start}"
+            );
+        }
+        assert!(
+            !linux_ended(stat_line(300, "a) Z (b", 100, 4321).as_bytes(), 4321),
+            "the state is read after the last ')'"
+        );
+        let cut = line("Z", live, 1, 4321);
+        let cut = &cut[..cut.find(" 4321 ").unwrap()];
+        for bad in [cut, "", "x", "300 (claude) Z"] {
+            assert!(!linux_ended(bad.as_bytes(), 4321), "{bad:?}");
+        }
+    }
+
+    // macOS: a zombie (p_stat SZOMB, 5) or a process in its exit (PROC_FLAG_INEXIT, 0x4) has ended; every other state
+    // (SIDL 1, SRUN 2, SSLEEP 3, SSTOP 4) and other flags (PROC_FLAG_TRACED 0x2) have not.
+    #[test]
+    fn bsd_ended_reads_zombie_status_and_inexit_flag() {
+        for (status, flags, want) in [
+            (2, 0, false),
+            (3, 0x2, false),
+            (1, 0, false),
+            (4, 0x1, false),
+            (5, 0, true),
+            (3, 0x4, true),
+            (2, 0x4 | 0x2, true),
+        ] {
+            assert_eq!(bsd_ended(status, flags), want, "{status} {flags:#x}");
+        }
     }
 
     #[test]

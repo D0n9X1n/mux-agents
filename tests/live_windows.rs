@@ -268,13 +268,33 @@ impl Live {
 
     /// Types `text` literally into `pane`.
     fn keys(&self, pane: &str, text: &str) {
-        self.call(&["send-keys", "-t", pane, "-l", text]);
+        self.send_keys(&["send-keys", "-t", pane, "-l", text]);
     }
 
     /// Types `text` into `pane`, then Enter.
     fn line(&self, pane: &str, text: &str) {
         self.keys(pane, text);
-        self.call(&["send-keys", "-t", pane, "Enter"]);
+        self.send_keys(&["send-keys", "-t", pane, "Enter"]);
+    }
+
+    /// `send-keys`, retried for up to 10 s while rmux answers that the pane's index is not in its window. rmux turns
+    /// a pane id into `session:window.pane` and can read an index a sibling pane's close has just shifted; a refused
+    /// `send-keys` typed nothing, so the retry types it once. Any other refusal fails at once.
+    fn send_keys(&self, args: &[&str]) {
+        let end = Instant::now() + Duration::from_secs(10);
+        loop {
+            let out =
+                crate::bounded::output(self.rmux().args(args), crate::bounded::LIMIT).unwrap();
+            if out.status.success() {
+                return;
+            }
+            let err = String::from_utf8_lossy(&out.stderr);
+            assert!(
+                stale_pane_index(&err) && Instant::now() < end,
+                "rmux {args:?}: {out:?}"
+            );
+            std::thread::sleep(Duration::from_millis(100));
+        }
     }
 
     fn field(&self, pane: &str, format: &str) -> String {
@@ -3841,6 +3861,27 @@ fn the_hold_window_outlives_the_first_view_on_windows() {
         (!now.lines().any(|c| runs(c, "hold"))).then_some(())
     });
     wait_ready(&live, &s(&again["leader"]["id"]));
+}
+
+/// Whether an rmux refusal says the pane index it resolved is not in its window: the transient a sibling pane's
+/// close leaves, which a retried `send-keys` outlasts.
+fn stale_pane_index(stderr: &str) -> bool {
+    stderr.contains("pane index does not exist in window")
+}
+
+#[test]
+fn stale_pane_index_reads_only_that_refusal() {
+    assert!(stale_pane_index(
+        "invalid target 'mux-agents-76c1:1.1': pane index does not exist in window\n"
+    ));
+    for other in [
+        "",
+        "can't find session: s",
+        "no server running",
+        "invalid target 'x'",
+    ] {
+        assert!(!stale_pane_index(other), "{other:?}");
+    }
 }
 
 /// Whether a pane's start command runs `verb` as one of its words. rmux reports a start command of several

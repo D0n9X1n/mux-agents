@@ -122,6 +122,14 @@ impl Os for Linux {
     fn proc_mounts(&self) -> Option<io::Result<String>> {
         Some(std::fs::read_to_string("/proc/self/mountinfo"))
     }
+
+    /// /proc/<pid>/stat of the row's pid and start shows a zombie, or a process in its exit, as its only thread.
+    fn ended(&self, row: &Row) -> bool {
+        row.start.is_some_and(|start| {
+            std::fs::read(format!("/proc/{}/stat", row.pid))
+                .is_ok_and(|text| parse::linux_ended(&text, start))
+        })
+    }
 }
 
 #[cfg(test)]
@@ -178,6 +186,50 @@ mod tests {
             table.iter().find(|r| r.pid == me()).unwrap().image,
             row.image
         );
+    }
+
+    // A child that exited and is not reaped yet is still listed with its start and image, but its argv and path are
+    // gone: occupancy reads it as unbound. `ended` shows it exited; a live process has not ended.
+    #[test]
+    fn an_unreaped_child_is_listed_unbound_and_ended() {
+        let mut live = sleeper();
+        let mut gone = Command::new("/bin/sh")
+            .args(["-c", "exit 0"])
+            .spawn()
+            .unwrap();
+        let end = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let zombie = loop {
+            let row = Linux
+                .table()
+                .unwrap()
+                .into_iter()
+                .find(|r| r.pid == gone.id());
+            if let Some(row) = row.filter(|r| r.argv.is_none()) {
+                break row;
+            }
+            assert!(std::time::Instant::now() < end, "the child never exited");
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        };
+        let live_row = Linux.row(live.id()).unwrap();
+        let ended = (Linux.ended(&zombie), Linux.ended(&live_row));
+        let reused = Linux.ended(&Row {
+            start: zombie.start.map(|s| s + 1),
+            ..zombie.clone()
+        });
+        live.kill().unwrap();
+        live.wait().unwrap();
+        gone.wait().unwrap();
+        assert!(
+            zombie.start.is_some() && zombie.path.is_none(),
+            "{zombie:?}"
+        );
+        assert_eq!(zombie.image.as_deref(), Some("sh"), "{zombie:?}");
+        assert_eq!(
+            ended,
+            (true, false),
+            "the zombie has ended, the sleeper has not"
+        );
+        assert!(!reused, "another start is another process");
     }
 
     #[test]

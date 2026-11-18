@@ -155,9 +155,11 @@ fn names(dir: &Path) -> Vec<String> {
 #[test]
 fn the_fake_refuses_an_unknown_resume_before_publishing() {
     let (dir, mut c) = fake_claude("unknown");
+    // The fake refuses before any wait, so this bound only catches a hang; it is wide because a loaded CI runner can
+    // take seconds to start a freshly copied binary. "At once" is what publishing nothing proves, below.
     let code = exit_code(
         c.args(["--resume", "11111111-0000-4000-8000-000000000000"]),
-        Duration::from_secs(10),
+        Duration::from_secs(60),
     );
     assert_eq!(
         names(&dir),

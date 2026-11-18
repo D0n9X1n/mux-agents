@@ -34,7 +34,12 @@ pub fn holds(
         .image
         .as_deref()
         .is_some_and(|image| !client_image(image, kind, os));
-    (unbound && !cleared).then(|| Hold::of(Rule::Unbound, row))
+    // A client that exited but is not reaped yet is still listed with its argv and path gone, so it reads as unbound
+    // right after a `stop`. It runs no more code and holds nothing. Asked only of a row that would hold, so a table
+    // walk reads no more per row.
+    (unbound && !cleared)
+        .then(|| Hold::of(Rule::Unbound, row))
+        .filter(|_| !os_calls.ended(row))
 }
 
 /// Whether an image name may be a client of `kind` (ambiguity 3): Unix exact and case-sensitive (`claude`; `copilot`

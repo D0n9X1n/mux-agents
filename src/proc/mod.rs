@@ -88,6 +88,12 @@ pub trait Os {
     fn proc_mounts(&self) -> Option<io::Result<String>> {
         None
     }
+    /// True only when the OS shows `row`'s process (same pid and start) has ended: a zombie its parent has not reaped
+    /// yet, or a process already in its exit. Such a process runs no more code, but until it is reaped it is still
+    /// listed, with its argv and path gone. False when that cannot be read, and where an exited process leaves the table.
+    fn ended(&self, _row: &Row) -> bool {
+        false
+    }
 }
 
 #[cfg(target_os = "macos")]

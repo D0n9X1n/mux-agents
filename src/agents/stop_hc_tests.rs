@@ -900,3 +900,15 @@ fn stop_takes_each_lock_once_team_first() {
     }
     w.fakes.hc_done().unwrap();
 }
+
+// A recorded client that has exited but is not reaped yet is still listed under its pid and start. It has ended, so
+// `stop` replies at once without `clientExited: false`, as when it is gone.
+#[test]
+fn stop_counts_an_ended_client_as_exited() {
+    let w = World::human("");
+    stopping(&w, false);
+    w.fakes.ended(150);
+    let got = call(&w).unwrap();
+    assert_eq!((got.get("clientExited"), w.fakes.slept()), (None, vec![]));
+    w.fakes.hc_done().unwrap();
+}

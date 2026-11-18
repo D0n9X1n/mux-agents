@@ -63,6 +63,8 @@ struct Log {
     shells: Vec<u32>,
     // o3 call 34 N2: pids whose client identity `client_known` answers as unknown.
     unknown: Vec<u32>,
+    // Pids whose process `ended` shows has exited (a zombie not reaped yet).
+    ended: Vec<u32>,
     cwds: HashMap<u32, String>,
     // Starts `open` answers in turn (none: unreadable) before it falls back to the row's own.
     opens: HashMap<u32, VecDeque<Option<i64>>>,
@@ -335,6 +337,11 @@ impl Fakes {
     /// o3 call 34 N2: `client_known` answers unknown for `pid` (its client identity cannot be resolved).
     pub fn client_unknown(&self, pid: u32) {
         self.0.borrow_mut().unknown.push(pid);
+    }
+
+    /// `ended` answers true for `pid`: its process exited and is not reaped yet, so the table still lists it.
+    pub fn ended(&self, pid: u32) {
+        self.0.borrow_mut().ended.push(pid);
     }
 
     /// A pid `is_shell` answers true for.
@@ -634,6 +641,11 @@ impl Os for Fakes {
     fn proc_mounts(&self) -> Option<std::io::Result<String>> {
         let mountinfo = self.0.borrow().mountinfo.clone();
         mountinfo.map(|t| t.ok_or_else(|| std::io::Error::other("unreadable mountinfo")))
+    }
+
+    fn ended(&self, row: &Row) -> bool {
+        self.os_call(format!("ended {}", row.pid));
+        self.0.borrow().ended.contains(&row.pid)
     }
 }
 

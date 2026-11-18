@@ -7249,25 +7249,74 @@ hc {}:
     /// A person's `sh` pane in `session` (Unix twin of live_windows' `team_pane`): a split, focus kept, of the
     /// session's first pane that is not `up`'s `hold` (its window ends with the release). It has the server's
     /// environment, so the private core's; open it before a core loss, which ends the views.
+    ///
+    /// A view runs `hc attach` and ends when its terminal or the core does, so the pane picked from the listing can
+    /// be gone by the split ("can't find pane"). The session is then listed again and a pane still there is split,
+    /// for up to 30 s; any other refusal fails at once.
     fn team_shell(live: &Live, session: &str) -> String {
-        let panes = live.call(&[
-            "list-panes",
-            "-s",
-            "-t",
-            session,
-            "-F",
-            "#{pane_id} #{pane_start_command}",
-        ]);
-        let pane = panes
-            .lines()
-            .find(|l| !l.contains(" hold "))
-            .and_then(|l| l.split(' ').next())
-            .unwrap_or_else(|| panic!("{:?}: no pane to split in {session}: {panes}", live.mux()))
-            .to_string();
         // In the root pane's folder (`<dir>/work`), so `up` from it names the same team; a split otherwise starts in
         // the server's own cwd.
         let work = live.dir.join("work").display().to_string();
-        live.split(&pane, &["-v", "-c", &work])
+        let end = std::time::Instant::now() + Duration::from_secs(30);
+        loop {
+            let panes = live.call(&[
+                "list-panes",
+                "-s",
+                "-t",
+                session,
+                "-F",
+                "#{pane_id} #{pane_start_command}",
+            ]);
+            let pane = panes
+                .lines()
+                .find(|l| !l.contains(" hold "))
+                .and_then(|l| l.split(' ').next())
+                .unwrap_or_else(|| {
+                    panic!("{:?}: no pane to split in {session}: {panes}", live.mux())
+                })
+                .to_string();
+            let out = live.server.try_call(&[
+                "split-window",
+                "-d",
+                "-v",
+                "-c",
+                &work,
+                "-P",
+                "-F",
+                "#{pane_id}",
+                "-t",
+                &pane,
+                "sh",
+            ]);
+            if out.status.success() {
+                return String::from_utf8(out.stdout).unwrap().trim().to_string();
+            }
+            let err = String::from_utf8_lossy(&out.stderr).to_string();
+            assert!(
+                pane_gone(&err) && std::time::Instant::now() < end,
+                "{:?}: split of {pane} in {session}: {out:?}",
+                live.mux()
+            );
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+
+    /// Whether a multiplexer refusal says its target pane no longer exists (tmux and rmux word it alike).
+    fn pane_gone(stderr: &str) -> bool {
+        stderr.contains("can't find pane")
+    }
+
+    #[test]
+    fn pane_gone_reads_only_a_missing_pane() {
+        assert!(pane_gone("can't find pane: %5\n"));
+        for other in [
+            "",
+            "no server running on /tmp/x",
+            "can't find session: $1",
+            "size missing",
+        ] {
+            assert!(!pane_gone(other), "{other:?}");
+        }
     }
 
     /// How many panes of `session` attach `address` (views-6f's `attach_program` on the real start command; F11).
