@@ -1140,45 +1140,48 @@ fn lay_focus(
         room
     };
     let kept = lay_kept(&shells, cols, look, room, focus.selected);
-    // The main rows come right under the header, before ended rows, gaps and notes: they leave the members their
-    // header and one line for each running agent, and take the rest. When that is too little for the ended rows too,
-    // the members draw without them (the header still counts them), so no running agent gives way to a main row.
+    // The main rows come right under the header, never at a running agent's cost: the members are laid out without
+    // them first, and each main row is taken only while the members, laid out in what is left (from the running rows
+    // alone when the ended rows no longer fit, the header still counting them), draw every agent they drew without
+    // it. Checked on the frame itself, notes and folds included, not predicted.
     let targets = main_targets(board);
-    let running = board
-        .and_then(|b| b.get("agents"))
-        .and_then(Value::as_array)
-        .map_or(0, |a| {
-            a.iter()
-                .filter(|r| clean(r.get("state")) == "running")
-                .count()
-        });
-    let n = targets
-        .len()
-        .min((rest - kept.len()).saturating_sub(1 + running));
-    let members = rest - kept.len() - n;
-    let lay_in = |board: Option<&Map<String, Value>>| {
-        if members == 0 {
+    let lay_in = |board: Option<&Map<String, Value>>, height: usize| {
+        if height == 0 {
             (Laid::default(), 0)
         } else {
             let size = Size {
                 width: size.width,
-                height: members,
+                height,
             };
             lay_members(board, &notes, size, look, focus)
         }
     };
-    let (mut laid, mut shown) = lay_in(board);
-    let live = |laid: &Laid| laid.agents.len();
-    let trimmed = (n > 0 && live(&laid) < running)
-        .then(|| live_only(board))
-        .flatten();
-    if let Some(trimmed) = &trimmed {
-        (laid, shown) = lay_in(Some(trimmed));
-        // The header counts the whole board, ended agents included.
-        if let (Some(row), Some(b)) = (laid.rows.first_mut(), board) {
-            *row = header(&counts(b), cols);
+    let ids =
+        |laid: &Laid| -> Vec<String> { laid.agents.iter().map(|(t, _)| t.id.clone()).collect() };
+    let room = rest - kept.len();
+    let bare = lay_in(board, room);
+    let want = ids(&bare.0);
+    let trimmed = live_only(board);
+    let with = |n: usize| {
+        let full = lay_in(board, room - n);
+        if ids(&full.0) == want {
+            return Some(full);
         }
-    }
+        let (mut laid, shown) = lay_in(trimmed.as_ref(), room - n);
+        (ids(&laid) == want).then(|| {
+            // The header counts the whole board, ended agents included.
+            if let (Some(row), Some(b)) = (laid.rows.first_mut(), board) {
+                *row = header(&counts(b), cols);
+            }
+            (laid, shown)
+        })
+    };
+    // The members keep their header (the counts) whatever the main rows take.
+    let floor = usize::from(!bare.0.rows.is_empty());
+    let (n, (mut laid, shown)) = (1..=targets.len().min(room.saturating_sub(floor)))
+        .rev()
+        .find_map(|n| with(n).map(|l| (n, l)))
+        .unwrap_or((0, bare));
     let mains: Vec<(Row, Option<Target>)> = (targets.into_iter().take(n))
         .map(|t| (main_row(&t, cols, look), Some(t)))
         .collect();
@@ -4707,6 +4710,81 @@ mod tests {
                 .agents
                 .iter()
                 .all(|(t, _)| t.life != pick::MAIN)
+        );
+    }
+
+    #[test]
+    fn a_note_never_pushes_a_running_agent_out_for_a_main_row() {
+        let note: &[(&str, Style)] = &[("focus failed: worker", PLAIN)];
+        let one = json!({"running": 1, "agents": [{"id": "aaaaaaaaaaaa", "name": "worker", "state": "running",
+            "age": 1, "pane": "%2", "parent": "%1"}]});
+        for height in 2..=6 {
+            let size = Size { width: 40, height };
+            let bare_ids = |board: &Value| -> Vec<String> {
+                let (laid, _) = lay_members(
+                    board.as_object(),
+                    note,
+                    size,
+                    PLAIN_LOOK,
+                    tree::Focus::default(),
+                );
+                laid.agents.iter().map(|(t, _)| t.id.clone()).collect()
+            };
+            let laid = lay_focus(
+                one.as_object(),
+                note,
+                size,
+                PLAIN_LOOK,
+                tree::Focus::default(),
+            )
+            .0;
+            let text: Vec<String> = laid.rows.iter().map(|r| render(r, false)).collect();
+            let agents: Vec<String> = (laid.agents.iter())
+                .filter(|(t, _)| t.life != pick::MAIN)
+                .map(|(t, _)| t.id.clone())
+                .collect();
+            // Whatever agents the bar drew without main rows, it still draws with them.
+            assert_eq!(agents, bare_ids(&one), "{height}: {text:?}");
+        }
+        // The 3-row case: header, worker, note; no room for main.
+        let three = lay_focus(
+            one.as_object(),
+            note,
+            Size {
+                width: 40,
+                height: 3,
+            },
+            PLAIN_LOOK,
+            tree::Focus::default(),
+        )
+        .0;
+        let text: Vec<String> = three.rows.iter().map(|r| render(r, false)).collect();
+        assert!(text.iter().any(|t| t.contains("worker")), "{text:?}");
+        // After that redraw the keys still find the agent: `j` selects worker, not main.
+        let walk = walk_of(one.as_object(), &three, false);
+        assert_eq!(walk.first().map(|t| t.name.as_str()), Some("worker"));
+        // The ten-row bar with eight chats keeps its running agent under a note too.
+        let eight = json!({"running": 1, "endedTotal": 7, "agents": (1..=8).map(|n| json!({"id": format!("{n:0>12}"),
+            "name": format!("w{n}"), "state": if n == 1 { "running" } else { "exited" }, "exitCode": 0, "age": n,
+            "pane": format!("%{}", n + 10), "parent": format!("%{n}")})).collect::<Vec<_>>()});
+        let ten = lay_focus(
+            eight.as_object(),
+            note,
+            Size {
+                width: 40,
+                height: 10,
+            },
+            PLAIN_LOOK,
+            tree::Focus::default(),
+        )
+        .0;
+        assert!(
+            ten.agents.iter().any(|(t, _)| t.name == "w1"),
+            "{:?}",
+            ten.rows
+                .iter()
+                .map(|r| render(r, false))
+                .collect::<Vec<_>>()
         );
     }
 
