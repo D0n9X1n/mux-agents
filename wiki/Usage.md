@@ -48,7 +48,7 @@ You rarely type these: the skill runs them for you. Every command is `<plugin>/s
 | `read` | `read -Wait 600`, `read claude-1 -Lines 40` | wait for your messages, or read an agent's pane |
 | `focus` | `focus claude-1`, `focus -Next` | switch the multiplexer to an agent's pane; `-Next` / `-Prev` step through the bar's order |
 | `peek` | `peek claude-1 -Lines 40` | read a member's live pane without typing into it |
-| `stop` | `stop claude-1`, `stop claude-1 -Generation` | end an agent and every agent it started, bottom-up; a stop cut short is finished on the next pass; `-Generation` ends only its open generations and keeps the member; an agent that already ended answers `ok` with `already` (`exited`, `stopped` or `lost`) |
+| `stop` | `stop claude-1`, `stop claude-1 -Generation` | end an agent and every agent it started, bottom-up; a stop cut short is finished on the next pass; `-Generation` ends only its open generations and keeps the member; the reply's `life` says what its terminal is now: `ended`, `lost`, `unknown` or `running` |
 | `drop` | `drop claude-1` | a person's stop of a member of the team's session; its kept shells stay |
 | `resume` | `resume claude-1`, `resume claude-1 -Fresh` | bring a stopped agent back as a new member carrying its conversation, or retry a member the bar marks `recover`; `-Fresh` starts it on a new conversation; refused while any live process may still hold that conversation |
 | `up` | `up -Client claude -- --model opus` | start a team: its leader, side bar and views; run it again after a closed view, a killed server or a reboot to bring the views, bar and lost members back; a stopped team is retired and a new one starts |
@@ -191,10 +191,9 @@ Every refusal is one JSON line with `check` naming the cause:
 
 ## How it works
 
-- `spawn` opens a detached window (or, by `-Split h|v` or the session's `placement`, splits the caller's pane) running `<binary> launcher <spec.json>` by the binary's absolute path, tags the pane with `@agent-*` options, and records the agent in the state folder: `MUX_AGENTS_STATE` if set, else `%LOCALAPPDATA%\mux-agents\state` on Windows and `$XDG_STATE_HOME/mux-agents/state` or `~/.local/state/mux-agents/state` on Linux and macOS.
-- Once the agent is committed, `spawn` finds or opens the session's side bar under the side bar's own lock; a failure there is reported as `sidebarError` and never fails the spawn.
-- Messages go to per-pane mailboxes, never as keystrokes. `read -Wait` returns each message once. As herdr delivers a message as the recipient's next input, a `send` to a Claude Code session also wakes it at once: the sender's Claude Code hooks pass that session one line, `<mux-agents from="w2">You have a new mux-agents message from w2. Run your read command to get it.</mux-agents>`, never the message itself (the mailbox stays the message). Only a command that is one `send` of plain words (no variable, quoting trick, or other command) wakes anyone. A session that cannot be reached, a Copilot CLI recipient, or any other `send` still finds the mail with `read -Wait`. Every child posts exactly one exit notice to its parent: `exited`, `stopped` or `lost`.
-- An agent whose tab or pane is gone is closed on the next `list`, `read`, `spawn`, `stop` or side-bar tick: one `lost` notice (or `exited` with its code), gone from `list` and the side bar, kept in `list -All` with `closedBy: "pane"`. A pane that `remain-on-exit` keeps after its agent ended is closed too, only while it still runs the exact command that agent started.
-- Agents are found by their pane and the exact command it started, never by their `@agent-*` tags, so an rmux `rotate-window` (which leaves the tags behind) cannot make `send`, `read`, `focus` or `stop` reach the wrong pane: a pane that is no longer its agent's own launch is refused with `target`.
-- Locks are per user: on Unix, files under `~/.local/state/mux-agents/locks`; on Windows, a named mutex `Local\MuxAgents-<hex>`. This fixes the .NET named-mutex advisory [GHSA-2j93-m82w-73j2](https://github.com/advisories/GHSA-2j93-m82w-73j2) that affected 0.1 on Linux and macOS.
+- Each agent runs in its own herdr-core terminal, apart from the pane you see; the pane is a view that attaches to it. See [Architecture](Architecture) and [From Spawn to Pane](From-Spawn-to-Pane).
+- Generations, `stop`, `resume`, recover, `restore` and `up` re-entry: [Agent Lifecycle](Agent-Lifecycle).
+- The state folder, create-once writes, locks and fail-closed reads: [State and Durability](State-and-Durability).
+- Mail, receipts, hooks and the notebook: [Messaging and Notebook](Messaging-and-Notebook).
+- Spawn checks, process identity and what may hold a conversation: [Safety and Occupancy](Safety-and-Occupancy).
 - `list` with six live agents averages about 23 ms (`scripts/dev/bench-list.sh`, tmux 3.8 on an Apple silicon Mac).

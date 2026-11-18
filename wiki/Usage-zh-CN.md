@@ -48,7 +48,7 @@ flowchart LR
 | `read` | `read -Wait 600`，`read claude-1 -Lines 40` | 等待你的消息，或读取某个代理的窗格 |
 | `focus` | `focus claude-1`、`focus -Next` | 让多路复用器切换到某个代理的窗格；`-Next` / `-Prev` 按侧边栏的顺序逐个切换 |
 | `peek` | `peek claude-1 -Lines 40` | 读取成员的实时窗格，不向其中输入任何内容 |
-| `stop` | `stop claude-1`、`stop claude-1 -Generation` | 自下而上结束代理及其启动的所有代理；被中断的停止会在下一轮完成；`-Generation` 只结束它打开的各代，保留成员；已结束的代理回答 `ok` 并带 `already`（`exited`、`stopped` 或 `lost`） |
+| `stop` | `stop claude-1`、`stop claude-1 -Generation` | 自下而上结束代理及其启动的所有代理；被中断的停止会在下一轮完成；`-Generation` 只结束它打开的各代，保留成员；回复中的 `life` 说明其终端现在的状态：`ended`、`lost`、`unknown` 或 `running` |
 | `drop` | `drop claude-1` | 由人停止团队会话中的成员；其保留的 shell 仍然保留 |
 | `resume` | `resume claude-1`、`resume claude-1 -Fresh` | 把已停止的代理作为带着原对话的新成员恢复，或重试侧边栏标为 `recover` 的成员；`-Fresh` 用新对话启动；只要仍有存活进程可能占用该对话就会被拒绝 |
 | `up` | `up -Client claude -- --model opus` | 启动团队：领导者、侧边栏和视图；视图关闭、服务器被杀或重启之后再次运行，可找回视图、侧边栏和丢失的成员；已停止的团队会被退役并启动新团队 |
@@ -191,10 +191,9 @@ copilot plugin marketplace update mux-agents && copilot plugin update mux-agents
 
 ## 工作原理
 
-- `spawn` 打开一个分离的窗口（或按 `-Split h|v` 或会话的 `placement` 拆分调用者的窗格），按二进制文件的绝对路径运行 `<binary> launcher <spec.json>`，用 `@agent-*` 选项标记窗格，并在状态文件夹中记录代理：若设置了 `MUX_AGENTS_STATE` 则用它，否则 Windows 上为 `%LOCALAPPDATA%\mux-agents\state`，Linux 和 macOS 上为 `$XDG_STATE_HOME/mux-agents/state` 或 `~/.local/state/mux-agents/state`。
-- 代理提交后，`spawn` 在侧边栏自己的锁下找到或打开会话的侧边栏；那里的失败以 `sidebarError` 报告，从不让启动失败。
-- 消息进入每个窗格的邮箱，从不作为按键输入。`read -Wait` 每条消息只返回一次。就像 herdr 把消息作为接收方的下一条输入送达，发往 Claude Code 会话的 `send` 也会立即唤醒它：发送方的 Claude Code 钩子向该会话传递一行 `<mux-agents from="w2">You have a new mux-agents message from w2. Run your read command to get it.</mux-agents>`，从不传递消息本身（邮箱仍是消息所在）。只有由普通字词组成的单独一条 `send` 命令（不含变量、引号技巧或其他命令）才会唤醒对方。无法到达的会话、Copilot CLI 接收方或其他任何 `send`，仍通过 `read -Wait` 收到邮件。每个子代理恰好向父代理发送一条退出通知：`exited`、`stopped` 或 `lost`。
-- 标签页或窗格已不存在的代理，会在下一次 `list`、`read`、`spawn`、`stop` 或侧边栏刷新时被关闭：一条 `lost` 通知（或带退出码的 `exited`），从 `list` 和侧边栏中消失，在 `list -All` 中保留并带 `closedBy: "pane"`。代理结束后被 `remain-on-exit` 留下的窗格也会被关闭，但仅当它仍在运行该代理启动的那条命令时。
-- 代理按其窗格及该窗格启动的那条命令查找，从不按其 `@agent-*` 标签查找，因此 rmux 的 `rotate-window`（它把标签留在原处）无法让 `send`、`read`、`focus` 或 `stop` 作用到错误的窗格：已不再是其代理自身启动的窗格会以 `target` 拒绝。
-- 锁按用户划分：Unix 上是 `~/.local/state/mux-agents/locks` 下的文件；Windows 上是命名互斥体 `Local\MuxAgents-<hex>`。这修复了 .NET 命名互斥体公告 [GHSA-2j93-m82w-73j2](https://github.com/advisories/GHSA-2j93-m82w-73j2)，它曾影响 0.1 在 Linux 和 macOS 上的版本。
+- 每个代理都在自己的 herdr-core 终端中运行，与你看到的窗格分开；窗格只是附着到该终端的视图。见[架构](Architecture-zh-CN)和[从启动到窗格](From-Spawn-to-Pane-zh-CN)。
+- 代次、`stop`、`resume`、修复、`restore` 和 `up` 的再次进入：[代理生命周期](Agent-Lifecycle-zh-CN)。
+- 状态文件夹、只创建一次的写入、锁和失败即关闭的读取：[状态与持久性](State-and-Durability-zh-CN)。
+- 邮件、回执、钩子和笔记本：[消息与笔记本](Messaging-and-Notebook-zh-CN)。
+- 启动检查、进程身份以及什么可能占用一段对话：[安全与占用](Safety-and-Occupancy-zh-CN)。
 - 有六个存活代理时，`list` 平均约 23 ms（`scripts/dev/bench-list.sh`，Apple 芯片 Mac 上的 tmux 3.8）。

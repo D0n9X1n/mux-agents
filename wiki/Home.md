@@ -2,21 +2,38 @@
 
 [简体中文](Home-zh-CN)
 
-mux-agents is a plugin for Claude Code and GitHub Copilot CLI. When the client runs inside an rmux or tmux pane, it can start other Claude Code or Copilot CLI agents in new windows or panes of the same session, with forked context, then list, focus, message and stop them.
+mux-agents is a plugin for Claude Code and GitHub Copilot CLI. From a client running in a tmux or rmux pane, it starts a team of Claude Code and Copilot CLI agents in panes you can see, lets them message each other through files, and keeps every agent running when its pane closes, the multiplexer server dies or the machine reboots.
+It is one native Rust binary, `mux-agent`, on macOS, Linux and Windows. **Start with [Usage](Usage)** to install it and run your first team.
 
-## Status
+### User guide
 
-0.2.0 is one native Rust binary, `mux-agent`, on macOS, Linux and Windows, with rmux 0.10 or later on any of them or tmux 3.2 or later on macOS and Linux. It needs no PowerShell or .NET. It shows a side bar: a multiplexer split for every client and a pane in Claude Code.
+- [Usage](Usage) — install, commands, safety checks, requirements, upgrades and troubleshooting
+- [Teams and Lifecycle](Teams-and-Lifecycle) — start a team with `up`, spawn, stop, resume, recover, and bring a team back after a crash or reboot
+- [Side Bar](Side-Bar) — what the bar shows, its keys and mouse, and how it is drawn
+- [Messaging and Notebook](Messaging-and-Notebook) — mail between agents, how it reaches each client, and the team notebook
 
-The .NET named-mutex advisory [GHSA-2j93-m82w-73j2](https://github.com/advisories/GHSA-2j93-m82w-73j2), which affected the `lock` check of 0.1 on Linux and macOS, is fixed in 0.2.0: Unix locks are files under `~/.local/state/mux-agents/locks`, and Windows uses a named mutex `Local\MuxAgents-<hex>`.
+### How mux-agents works
 
-## Use
+Read [Architecture](Architecture) for the map, then
+[From Spawn to Pane](From-Spawn-to-Pane) for one agent's round trip.
+Use the references below for a particular subsystem.
 
-- [Usage](Usage) — install, commands, side bar, safety checks, requirements, upgrades and troubleshooting
+- [Architecture](Architecture) — the problem, the moving parts, and the design rules
+- [From Spawn to Pane](From-Spawn-to-Pane) — one `spawn`, from the request to a running agent in its pane
+- [Agent Lifecycle](Agent-Lifecycle) — generations, stop, resume, recover, restore, and `up` re-entry
+- [State and Durability](State-and-Durability) — the state root, create-once publication, locks, and fail-closed reads
+- [Safety and Occupancy](Safety-and-Occupancy) — spawn checks, process identity, and what may hold a conversation
+- [Module Reference](Module-Reference) — every source module and what it owns
 
-## Design
+### Build and contribute
 
-- [Foundation](Design-Foundation) — v0.1.0 sub-project A: the rename to mux-agents, CI on Linux, macOS and Windows, and the tag-driven release; its Rust (0.2.0) section covers the binary, the locks and the `dist` branch
-- [Cross-platform](Design-Cross-Platform) — v0.1.0 sub-project B: tmux on Linux and macOS, rmux on Windows, with the same checks; its Rust (0.2.0) section adds rmux on every OS
-- [Side bar](Design-Side-Bar) — v0.1.0 sub-project C: the agent count and what each agent is doing, in a multiplexer split and in a Claude Code pane
-- [Runtime check](Design-Runtime-Check) — on Linux and macOS, refuse a .NET affected by GHSA-2j93-m82w-73j2; 0.2.0 runs no .NET and drops the check
+- [Development and Release](Development-and-Release) — layout, must-pass checks, live tests, merging, releases, and wiki publication
+
+### Design history
+
+These pages record the v0.1.0 and 0.2.0 designs. The pages above describe the current system.
+
+- [Foundation](Design-Foundation) — the rename to mux-agents, CI on three operating systems, and the tag-driven release
+- [Cross-platform](Design-Cross-Platform) — tmux on Linux and macOS, rmux everywhere, with the same checks
+- [Side bar](Design-Side-Bar) — the first side bar: the agent count and what each agent is doing
+- [Runtime check](Design-Runtime-Check) — refusing an affected .NET, dropped in 0.2.0 when .NET went away
