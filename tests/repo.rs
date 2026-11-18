@@ -3109,17 +3109,6 @@ fn zh_twins_match_line_counts() {
         if !lines.is_empty() {
             bad.push(format!("{page}: {lines:?}"));
         }
-        // Every design page records the Rust port in a section of its own, at the same line in both languages.
-        if page.starts_with("Design-") {
-            let en: Vec<String> = wiki_text(page).lines().map(String::from).collect();
-            let zh: Vec<String> = wiki_text(&twin(page)).lines().map(String::from).collect();
-            match en.iter().position(|l| l == "## Rust (0.2.0)") {
-                Some(at) if zh.get(at).is_some_and(|l| l.starts_with("## Rust")) => {}
-                _ => bad.push(format!(
-                    "{page}: no ## Rust (0.2.0) section matched in its twin"
-                )),
-            }
-        }
     }
     assert!(bad.is_empty(), "{bad:#?}");
 }
@@ -3359,19 +3348,10 @@ fn contributing_and_pr_template_merge_sentences() {
 }
 
 #[test]
-fn old_name_absent_outside_foundation_pages() {
-    // Built from fragments, so this file does not match itself. The design record of the rename may name it.
+fn old_name_absent() {
+    // Built from fragments, so this file does not match itself.
     let old = ["r", "mux-agent|R", "muxAgent|R", "MUX_AGENTS"].concat();
-    let (found, hits) = git(&[
-        "grep",
-        "-n",
-        "-E",
-        &old,
-        "--",
-        ".",
-        ":(exclude,literal)wiki/Design-Foundation.md",
-        ":(exclude,literal)wiki/Design-Foundation-zh-CN.md",
-    ]);
+    let (found, hits) = git(&["grep", "-n", "-E", &old, "--", "."]);
     assert!(!found && hits.is_empty(), "{hits}");
 }
 

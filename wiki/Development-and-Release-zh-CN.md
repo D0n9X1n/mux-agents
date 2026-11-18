@@ -203,7 +203,7 @@ flowchart TD
 
 - 永远不要在被跟踪的文件里写 issue 或拉取请求编号、CI 运行或 issue URL：不要有读起来像这类编号的 `#` 加数字（`no_issue_or_pull_request_numbers`）。代码可能迁移到别的托管平台，那些编号随后就指向虚无；请改写为原因和做法。提交信息和拉取请求描述可以提及它们。
 - 每个 wiki 页面 `X.md` 都有孪生页 `X-zh-CN.md`，并在前五行内链接它；相对链接指向存在的页面；`Home` 和 `Home-zh-CN` 链接其语言的每个页面；`wiki/` 保持扁平（`wiki_pairs_and_links`）。
-- 孪生页逐行对应：行数相同，每行的形态、代码片段和数字相同，每个中文正文行都含中文，围栏块完全一致。每个 `Design-` 页面的 `## Rust (0.2.0)` 小节在两种语言中位于同一行（`zh_twins_match_line_counts`）。
+- 孪生页逐行对应：行数相同，每行的形态、代码片段和数字相同，每个中文正文行都含中文，围栏块完全一致。（`zh_twins_match_line_counts`）
 - 仓库不跟踪 `docs/` 路径（`tracks_no_docs_path`），`CONTRIBUTING.md` 和拉取请求模板逐字保留合并流程（`contributing_and_pr_template_merge_sentences`）。
 
 ### 源码与测试

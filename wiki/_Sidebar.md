@@ -25,13 +25,6 @@
 
 - [Development and Release](Development-and-Release)
 
-**Design history**
-
-- [Foundation](Design-Foundation)
-- [Cross-platform](Design-Cross-Platform)
-- [Side bar](Design-Side-Bar)
-- [Runtime check](Design-Runtime-Check)
-
 </details>
 
 <details>
@@ -60,12 +53,5 @@
 **构建与贡献**
 
 - [开发与发布](Development-and-Release-zh-CN)
-
-**设计历史**
-
-- [基础](Design-Foundation-zh-CN)
-- [跨平台](Design-Cross-Platform-zh-CN)
-- [侧边栏](Design-Side-Bar-zh-CN)
-- [运行时检查](Design-Runtime-Check-zh-CN)
 
 </details>

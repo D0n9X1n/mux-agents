@@ -28,12 +28,3 @@ Use the references below for a particular subsystem.
 ### Build and contribute
 
 - [Development and Release](Development-and-Release) — layout, must-pass checks, live tests, merging, releases, and wiki publication
-
-### Design history
-
-These pages record the v0.1.0 and 0.2.0 designs. The pages above describe the current system.
-
-- [Foundation](Design-Foundation) — the rename to mux-agents, CI on three operating systems, and the tag-driven release
-- [Cross-platform](Design-Cross-Platform) — tmux on Linux and macOS, rmux everywhere, with the same checks
-- [Side bar](Design-Side-Bar) — the first side bar: the agent count and what each agent is doing
-- [Runtime check](Design-Runtime-Check) — refusing an affected .NET, dropped in 0.2.0 when .NET went away

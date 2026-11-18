@@ -28,12 +28,3 @@ mux-agents 是 Claude Code 和 GitHub Copilot CLI 的插件。在 tmux 或 rmux 
 ### 构建与贡献
 
 - [开发与发布](Development-and-Release-zh-CN) — 目录结构、必须通过的检查、实时测试、合并、发布和百科发布
-
-### 设计历史
-
-这些页面记录 v0.1.0 和 0.2.0 的设计。上面的页面描述当前的系统。
-
-- [基础](Design-Foundation-zh-CN) — 改名为 mux-agents、在三个操作系统上运行 CI，以及由标签驱动的发布
-- [跨平台](Design-Cross-Platform-zh-CN) — Linux 和 macOS 上用 tmux，所有平台上用 rmux，检查相同
-- [侧边栏](Design-Side-Bar-zh-CN) — 最早的侧边栏：代理数量和每个代理正在做的事
-- [运行时检查](Design-Runtime-Check-zh-CN) — 拒绝受影响的 .NET，0.2.0 去掉 .NET 后不再需要

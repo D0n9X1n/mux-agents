@@ -203,7 +203,7 @@ A fake client of a parallel live test is an unmanaged client of another state ro
 
 - Never write an issue or pull request number, a CI run or an issue URL in a tracked file: no `#` followed by digits that reads as one (`no_issue_or_pull_request_numbers`). The code may move to another hosting platform, and those numbers then point nowhere; write why and how instead. Commit messages and pull request descriptions may name them.
 - Every wiki page `X.md` has a twin `X-zh-CN.md` and links it in its first five lines; a relative link names an existing page; `Home` and `Home-zh-CN` link every page of their language; `wiki/` stays flat (`wiki_pairs_and_links`).
-- Twins match line for line: the same line count and, per line, the same shape, code spans and numbers, Chinese in every Chinese prose line, and identical fenced blocks. Every `Design-` page has its `## Rust (0.2.0)` section at the same line in both (`zh_twins_match_line_counts`).
+- Twins match line for line: the same line count and, per line, the same shape, code spans and numbers, Chinese in every Chinese prose line, and identical fenced blocks. (`zh_twins_match_line_counts`)
 - The repository tracks no `docs/` path (`tracks_no_docs_path`), and `CONTRIBUTING.md` and the pull request template keep the merge procedure word for word (`contributing_and_pr_template_merge_sentences`).
 
 ### Source and tests

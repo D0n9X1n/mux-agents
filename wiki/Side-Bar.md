@@ -2,7 +2,7 @@
 
 [简体中文](Side-Bar-zh-CN)
 
-The side bar is a narrow split at the right edge of your window that lists every agent, what state it is in and what it is doing now, so you can see who needs you without visiting each pane. In a team it draws the team as a tree; outside a team it draws a flat list ranked by who needs you first. You drive it with keys or the mouse to open, peek at and step through agents. This page describes the bar as it is now; [Design-Side-Bar](Design-Side-Bar) keeps its design history, and [Teams and Lifecycle](Teams-and-Lifecycle) covers the verbs behind its rows.
+The side bar is a narrow split at the right edge of your window that lists every agent, what state it is in and what it is doing now, so you can see who needs you without visiting each pane. In a team it draws the team as a tree; outside a team it draws a flat list ranked by who needs you first. You drive it with keys or the mouse to open, peek at and step through agents. [Teams and Lifecycle](Teams-and-Lifecycle) covers the verbs behind its rows.
 
 ## Open and close it
 
