@@ -35,13 +35,15 @@ pub fn clean(text: &str) -> String {
         .collect()
 }
 
-/// An SGR style: bold, dim, reverse video (the side bar's selected name) and one of the 16 named colors.
+/// An SGR style: bold, dim, reverse video, one of the 16 named colors and a 256-color background (the side bar's
+/// band on the agent on screen).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Style {
     pub bold: bool,
     pub dim: bool,
     pub reverse: bool,
     pub color: Option<Color>,
+    pub bg: Option<u8>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -80,6 +82,8 @@ pub fn paint(text: &str, style: Style, color: bool) -> String {
             Color::BrightMagenta => "95",
         });
     }
+    let bg = style.bg.map(|n| format!("48;5;{n}"));
+    codes.extend(bg.as_deref());
     if !color || codes.is_empty() || text.is_empty() {
         return text.to_string();
     }
@@ -238,6 +242,23 @@ mod tests {
         assert!(!ascii(&env(&[("MUX_AGENTS_ASCII", "0")])));
         assert!(!ascii(&env(&[("MUX_AGENTS_ASCII", "")])));
         assert!(!ascii(&env(&[])));
+    }
+
+    #[test]
+    fn paint_background_after_the_foreground() {
+        let band = Style {
+            bg: Some(236),
+            ..Style::default()
+        };
+        let name = Style {
+            bold: true,
+            color: Some(Color::Blue),
+            bg: Some(236),
+            ..Style::default()
+        };
+        assert_eq!(paint("x", band, true), "\u{1b}[48;5;236mx\u{1b}[0m");
+        assert_eq!(paint("x", name, true), "\u{1b}[1;34;48;5;236mx\u{1b}[0m");
+        assert_eq!(paint("x", name, false), "x");
     }
 
     #[test]

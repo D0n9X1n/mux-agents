@@ -255,17 +255,9 @@ fn member(node: &Node, width: usize, shown: Option<&str>, look: Look) -> Member 
     };
     let (fitted, with_doing) = fit_row(&parts, cols.saturating_sub(pad), look.ascii);
     let mut line = margin(fitted);
-    let marked = shown.is_some_and(|p| !target.pane.is_empty() && p == target.pane);
-    line[0] = span(
-        if !marked {
-            " "
-        } else if look.ascii {
-            "#"
-        } else {
-            "\u{25cf}"
-        },
-        PLAIN,
-    );
+    // Column 0 is the selection's; the member on screen is banded (`sidebar::shade`), never marked here.
+    let _ = shown;
+    line[0] = span(" ", PLAIN);
     line.insert(
         1,
         span(
@@ -959,7 +951,7 @@ pub(super) mod tests {
             line(" ", "\u{25c9} lead", "working   1m", 60),
             "   plan it".into(),
             line(" ", "  \u{25cc} alpha", "idle   1m", 60),
-            line("\u{25cf}", "    ! gamma", "needs you   1m", 60),
+            line(" ", "    ! gamma", "needs you   1m", 60),
             line(" ", "  - beta", "stopped   1m", 60),
             line(" ", "  ! fixer  \u{2709} 2", "recover   1m", 60),
         ];
@@ -969,7 +961,7 @@ pub(super) mod tests {
             line(" ", "\u{25c9} lead", "  1m", 30),
             "   plan it".into(),
             line(" ", "  \u{25cc} alpha", "  1m", 30),
-            line("\u{25cf}", "    ! gamma", "  1m", 30),
+            line(" ", "    ! gamma", "  1m", 30),
             line(" ", "  - beta", "stopped   1m", 30),
             line(" ", "  ! fixer  \u{2709} 2", "recover", 30),
         ];
@@ -984,7 +976,6 @@ pub(super) mod tests {
                 .map(|l| {
                     l.replace("\u{25c9}", "*")
                         .replace("\u{25cc}", "o")
-                        .replace("\u{25cf}", "#")
                         .replace("\u{2709}", "m")
                 })
                 .collect();
@@ -1048,22 +1039,35 @@ pub(super) mod tests {
             .collect::<Vec<_>>()
         };
         assert_eq!(widths(Focus::default()), widths(shown));
-        assert!(
-            !draw(&board, 60, 24, look, Focus::default())
-                .iter()
-                .any(|r| r.starts_with("\u{25cf}"))
-        );
-        let moved = draw(
-            &board,
-            60,
-            24,
-            look,
-            Focus {
-                shown: Some("%12"),
-                selected: None,
-            },
-        );
-        assert!(moved[4].starts_with("\u{25cf}") && moved[5].starts_with(" "));
+        // In color the member on screen is banded (its name line only), and the band follows the shown pane.
+        let color = Look {
+            color: true,
+            ..look
+        };
+        let banded = |f: Focus| -> Vec<usize> {
+            let mut laid = lay_team(
+                &board,
+                &[],
+                Size {
+                    width: 60,
+                    height: 24,
+                },
+                color,
+                f,
+            )
+            .0;
+            crate::sidebar::shade(&mut laid, f.shown, 60, color);
+            (0..laid.rows.len())
+                .filter(|&at| laid.rows[at].iter().any(|(_, s)| s.bg.is_some()))
+                .collect()
+        };
+        assert_eq!(banded(shown), [5]);
+        assert_eq!(banded(Focus::default()), Vec::<usize>::new());
+        let moved = Focus {
+            shown: Some("%12"),
+            selected: None,
+        };
+        assert_eq!(banded(moved), [4]);
         let mut sel = lay_team(
             &board,
             &[],
@@ -1078,7 +1082,7 @@ pub(super) mod tests {
         mark(&mut sel, "G", look);
         assert!(
             render(&sel.rows[5], false).starts_with("\u{f054}")
-                && draw(&board, 60, 24, look, shown)[5].starts_with("\u{25cf}")
+                && draw(&board, 60, 24, look, shown)[5].starts_with(' ')
         );
         // B1/B3: an ended leader still heads its child; a missing parent and a self-loop draw at depth 1 with `^`.
         let broken = team(vec![
@@ -1149,10 +1153,10 @@ pub(super) mod tests {
                 ascii,
                 ..Look::default()
             };
-            let (mail, mark, cut) = if ascii {
-                ("m", "#", ".")
+            let (mail, cut) = if ascii {
+                ("m", ".")
             } else {
-                ("\u{2709}", "\u{25cf}", "\u{2026}")
+                ("\u{2709}", "\u{2026}")
             };
             // 25 is this board's minimum: X (depth 2, `exited 255`, a badge) needs 1 + 4 + 2 + 5 + 2 + 10 + 1 columns.
             for width in [60, 40, 30, 25] {
@@ -1204,8 +1208,8 @@ pub(super) mod tests {
                     );
                 }
                 assert!(
-                    at("G").starts_with(mark) && at("O").chars().nth(1) == Some('^'),
-                    "{width}: the mark and the caret: {rows:?}"
+                    at("G").starts_with(' ') && at("O").chars().nth(1) == Some('^'),
+                    "{width}: no mark in column 0, and the caret: {rows:?}"
                 );
                 // The name goes last of the optional parts: whole, then cut, then removed.
                 let x = at("X");
@@ -1380,7 +1384,7 @@ pub(super) mod tests {
             "- B stopped 1m",
             "\u{25c9} C working 1m",
             "build",
-            "\u{25cf} \u{25c9} C1 working 1m",
+            "\u{25c9} C1 working 1m",
             "\u{25c9} C2 working 1m",
             "\u{25c9} D working 1m",
             "\u{25c9} D1 working 1m",

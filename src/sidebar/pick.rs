@@ -260,6 +260,13 @@ impl Pick {
         self.chosen = None;
     }
 
+    /// The person left the bar: the selection clears, unless a question waits for its answer.
+    pub fn left(&mut self) {
+        if self.confirm.is_none() {
+            self.chosen = None;
+        }
+    }
+
     /// Keys wrap at both ends: a team's bar, B10.
     pub fn set_wrap(&mut self, wrap: bool) {
         self.wrap = wrap;

@@ -18,7 +18,7 @@ Start Claude Code and Copilot CLI agents in tmux or rmux panes, see what each is
   <a href="https://github.com/D0n9X1n/mux-agents#quick-start"><img src="https://img.shields.io/badge/Copilot%20CLI-plugin-24292f?logo=githubcopilot&amp;logoColor=white" alt="Copilot CLI plugin"></a>
 </p>
 
-<p align="center"><img src="https://raw.githubusercontent.com/D0n9X1n/mux-agents/main/assets/preview/mux-agents-preview.png" alt="A team in tmux: the leader's Claude Code chat on the left with its summary, three members stacked in the middle (one started by another member), and the side bar on the right showing the team tree"></p>
+<p align="center"><img src="https://raw.githubusercontent.com/D0n9X1n/mux-agents/main/assets/preview/mux-agents-preview.png" alt="tmux with your Claude Code chat on the left half, three helper agents stacked in the other half, and the side bar on the right: your chat as main, who needs you first, and a soft band on the agent you are looking at"></p>
 
 ## Features
 
@@ -35,7 +35,7 @@ Start Claude Code and Copilot CLI agents in tmux or rmux panes, see what each is
 
 <table>
   <tr>
-    <td width="50%"><img src="https://raw.githubusercontent.com/D0n9X1n/mux-agents/main/assets/preview/mux-agents-sidebar.png" alt="The side bar: the team tree with the leader, members and a member's own children, each in its own color with its state and age; a done member shows its report, and a failed one shows recover"></td>
+    <td width="50%"><img src="https://raw.githubusercontent.com/D0n9X1n/mux-agents/main/assets/preview/mux-agents-sidebar.png" alt="The side bar: the team tree with the leader, members and a member's own children, each in its own color with its state and age; a soft band marks the member on screen and a chevron the one picked with the keys"></td>
     <td width="50%"><img src="https://raw.githubusercontent.com/D0n9X1n/mux-agents/main/assets/preview/mux-agents-list.png" alt="mux-agent list answering one JSON object: each agent's client, activity and current step, and a failed agent marked needsRecovery with the reason"></td>
   </tr>
   <tr>

@@ -286,6 +286,7 @@ const PLAIN: Style = Style {
     dim: false,
     reverse: false,
     color: None,
+    bg: None,
 };
 const BOLD: Style = Style {
     bold: true,
@@ -301,6 +302,8 @@ const MAIL: &str = "\u{2709}";
 const HINT: &str = "Enter: focus  Esc: clear";
 // The selection's indicator: Nerd Font `nf-fa-chevron_right` (one column, a private-use code point).
 const SELECTED: &str = "\u{f054}";
+// The soft background of the row on screen: a 256-color dark grey, a faint band rather than a highlight.
+const BAND: u8 = 236;
 // The main chat's glyph: Nerd Font `nf-fa-terminal` (`$` in ASCII).
 const MAIN: &str = "\u{f120}";
 
@@ -1187,12 +1190,7 @@ fn lay_focus(
         .collect();
     fold_kept(&mut laid, kept);
     fold_kept(&mut laid, mains);
-    if let Some(pane) = focus.shown.filter(|p| !p.is_empty())
-        && let Some(&(_, at)) =
-            (laid.agents.iter()).find(|(t, _)| t.life == pick::MAIN && t.pane == pane)
-    {
-        laid.rows[at][0] = span(if look.ascii { "#" } else { "\u{25cf}" }, PLAIN);
-    }
+    shade(&mut laid, focus.shown, size.width, look);
     for (n, style) in asked.into_iter().take(asked_n) {
         laid.rows
             .push(margin(vec![span(paint::cut(n, cols), style)]));
@@ -1432,7 +1430,6 @@ fn lay_members(
             let kept = laid.rows.len();
             laid.agents.retain(|(_, row)| *row < kept);
             laid.more.retain(|(_, row)| *row < kept);
-            shown_mark(&mut laid, focus.shown, look);
             return (laid, shape.notes);
         }
     }
@@ -1479,14 +1476,23 @@ fn with_hint(
     hinted(board, notes, size, look, tree::Focus::default())
 }
 
-/// The flat bar's mark on the agent whose pane the session shows, as the team tree draws it: `●` (`#` in ASCII) in
-/// column 0 of that agent's name line. Nothing when the shown pane is no drawn agent's.
-fn shown_mark(laid: &mut Laid, shown: Option<&str>, look: Look) {
-    let Some(pane) = shown.filter(|p| !p.is_empty()) else {
+/// The band on the agent (or main row) whose pane the session shows: its name line on a soft background, `BAND`,
+/// across the bar's `width`, so the row reads as the one on screen without a glyph. Only with color; nothing when
+/// the shown pane is no drawn row's. The text is unchanged, so clicks hit it as before.
+pub(crate) fn shade(laid: &mut Laid, shown: Option<&str>, width: usize, look: Look) {
+    let Some(pane) = shown.filter(|p| !p.is_empty() && look.color) else {
         return;
     };
-    if let Some(&(_, at)) = laid.agents.iter().find(|(t, _)| t.pane == pane) {
-        laid.rows[at][0] = span(if look.ascii { "#" } else { "\u{25cf}" }, PLAIN);
+    let Some(&(_, at)) = laid.agents.iter().find(|(t, _)| t.pane == pane) else {
+        return;
+    };
+    let row = &mut laid.rows[at];
+    let pad = width.saturating_sub(row_width(row));
+    if pad > 0 {
+        row.push(span(" ".repeat(pad), PLAIN));
+    }
+    for (_, style) in row.iter_mut() {
+        style.bg = Some(BAND);
     }
 }
 
@@ -1496,7 +1502,12 @@ fn mark(laid: &mut Laid, id: &str, look: Look) {
     let Some(&(_, at)) = laid.agents.iter().find(|(target, _)| target.id == id) else {
         return;
     };
-    laid.rows[at][0] = span(if look.ascii { ">" } else { SELECTED }, PLAIN);
+    // On the banded row the chevron keeps the band.
+    let bg = laid.rows[at][0].1.bg;
+    laid.rows[at][0] = span(
+        if look.ascii { ">" } else { SELECTED },
+        Style { bg, ..PLAIN },
+    );
 }
 
 /// The board as text rows, SGR only when `look.color`; for tests and screenshots.
@@ -1507,6 +1518,25 @@ pub fn format_board(
     look: Look,
 ) -> Vec<String> {
     layout(board, notes, size, look)
+        .iter()
+        .map(|row| render(row, look.color))
+        .collect()
+}
+
+/// The board as the bar draws it with `shown` on screen (its row banded) and `selected` picked (its chevron), as
+/// text rows; for screenshots of the real frame.
+pub fn format_focus(
+    board: Option<&Map<String, Value>>,
+    size: Size,
+    look: Look,
+    shown: Option<&str>,
+    selected: Option<&str>,
+) -> Vec<String> {
+    let mut laid = lay_focus(board, &[], size, look, tree::Focus { shown, selected }).0;
+    if let Some(id) = selected {
+        mark(&mut laid, id, look);
+    }
+    laid.rows
         .iter()
         .map(|row| render(row, look.color))
         .collect()
@@ -1839,6 +1869,9 @@ pub fn run_watch(
     let mut unknown = 0;
     let mut pick = Pick::default();
     let mut viewing = Viewing::default();
+    // The pane whose row is banded: the last pane on screen that is not the bar; and whether the bar was on screen.
+    let mut banded: Option<String> = None;
+    let mut in_bar = false;
     let mut alerts = Alerts::default();
     // Whether this bar's window has held a member view (kept in memory only): a bar leaves only once it held one.
     // shortcut: the window is the one resolved when the watch started; a bar moved to another window by hand stops
@@ -1965,6 +1998,23 @@ pub fn run_watch(
         if let Some(looked) = looked.clone() {
             viewing.tick(looked, last.as_ref());
         }
+        // The band follows the pane on screen, but not into the bar itself: while the person works in the bar the last
+        // pane they looked at keeps it (detached: none).
+        match looked.as_ref() {
+            Some(Some(pane)) if *pane == caller.pane => {}
+            Some(seen) => banded.clone_from(seen),
+            None => {}
+        }
+        // The person left the bar (it was the pane on screen, now another is): a selection made in it no longer
+        // points anywhere they chose, so it clears; a pending question stays. Keys sent to a bar that was never on
+        // screen keep their selection; an unread probe or a detached session changes nothing.
+        if let Some(Some(pane)) = looked.as_ref() {
+            let here = *pane == caller.pane;
+            if in_bar && !here {
+                pick.left();
+            }
+            in_bar = here;
+        }
         // An agent that starts needing the person, or finishes, while they look elsewhere: one message, as herdr's
         // toast. Only when both the board and the shown pane were read now: a tick that knows neither keeps the news
         // for the next.
@@ -1991,7 +2041,7 @@ pub fn run_watch(
         let team = tree::is_team(last.as_ref());
         pick.set_wrap(team);
         let focus = tree::Focus {
-            shown: viewing.pane.as_deref(),
+            shown: banded.as_deref(),
             selected: None,
         };
         let bare = lay_focus(last.as_ref(), &notes, size, look, focus).0;
@@ -4700,9 +4750,15 @@ mod tests {
             selected: None,
         };
         let shown = lay_focus(board.as_object(), &[], W40, PLAIN_LOOK, focus).0;
-        // %3 is `main 2`, row 2.
-        assert!(render(&shown.rows[2], false).starts_with('\u{25cf}'));
-        assert!(render(&shown.rows[1], false).starts_with(' '));
+        // %3 is `main 2`, row 2: banded in color, its text unchanged.
+        let color = Look {
+            color: true,
+            ..PLAIN_LOOK
+        };
+        let lit = lay_focus(board.as_object(), &[], W40, color, focus).0;
+        assert!(lit.rows[2].iter().all(|(_, s)| s.bg.is_some()));
+        assert!(!lit.rows[1].iter().any(|(_, s)| s.bg.is_some()));
+        assert!(render(&shown.rows[2], false).starts_with(' '));
         // No parent anywhere, or a team: no main row.
         let plain = json!({"running": 1, "agents": [{"name": "w", "state": "running", "age": 1, "pane": "%1"}]});
         assert!(
@@ -4930,49 +4986,65 @@ mod tests {
     }
 
     #[test]
-    fn the_flat_bar_marks_the_agent_on_screen() {
+    fn the_agent_on_screen_gets_a_soft_band_not_a_glyph() {
         let board = json!({"running": 2, "endedTotal": 0, "agents": [
-            {"name": "worker", "state": "running", "doing": "testing", "age": 240, "pane": "%1"},
-            {"name": "writer", "state": "running", "age": 180, "pane": "%2"}
+            {"name": "worker", "state": "running", "doing": "testing", "age": 240, "pane": "%1", "parent": "%3"},
+            {"name": "writer", "state": "running", "age": 180, "pane": "%2", "parent": "%3"}
         ]});
-        let rows = |look: Look, shown: Option<&str>, selected: Option<&str>| {
+        let color = Look {
+            color: true,
+            ..PLAIN_LOOK
+        };
+        let laid = |look: Look, shown: Option<&str>, selected: Option<&str>| {
             let focus = tree::Focus { shown, selected };
             let mut laid = lay_focus(board.as_object(), &[], W40, look, focus).0;
             if let Some(id) = selected {
                 mark(&mut laid, id, look);
             }
-            laid.rows
-                .iter()
-                .map(|r| render(r, false))
-                .collect::<Vec<_>>()
+            laid
         };
-        let bare = rows(PLAIN_LOOK, None, None);
-        let marked = rows(PLAIN_LOOK, Some("%2"), None);
-        // Rows: header, gap, worker, its doing line, gap, writer.
-        let (worker, writer) = (2, 5);
-        assert!(
-            marked[writer].starts_with("\u{25cf}\u{25c9} writer"),
-            "{marked:?}"
-        );
-        for (at, (got, want)) in marked.iter().zip(&bare).enumerate() {
-            if at != writer {
-                assert_eq!(got, want, "{at}");
-            }
+        let text =
+            |laid: &Laid| -> Vec<String> { laid.rows.iter().map(|r| render(r, false)).collect() };
+        // Rows: header, main, gap, worker, its doing line, gap, writer.
+        let (main, worker, doing, writer) = (1, 3, 4, 6);
+        let banded = |laid: &Laid, at: usize| laid.rows[at].iter().all(|(_, s)| s.bg == Some(BAND));
+        let any_band = |laid: &Laid| laid.rows.iter().flatten().any(|(_, s)| s.bg.is_some());
+        let shown = laid(color, Some("%2"), None);
+        assert!(banded(&shown, writer), "{:?}", shown.rows[writer]);
+        assert_eq!(row_width(&shown.rows[writer]), 40, "the band spans the bar");
+        for at in (0..shown.rows.len()).filter(|&at| at != writer) {
+            assert!(!shown.rows[at].iter().any(|(_, s)| s.bg.is_some()), "{at}");
         }
-        let ascii = Look {
-            ascii: true,
-            ..PLAIN_LOOK
-        };
-        assert!(rows(ascii, Some("%2"), None)[writer].starts_with("#* writer"));
-        // A pane that is no drawn agent's (the bar, main, another window) marks nothing.
-        assert_eq!(rows(PLAIN_LOOK, Some("%9"), None), bare);
-        // The selection's chevron replaces the mark on the same row; on another row both show.
-        assert!(rows(PLAIN_LOOK, Some("%2"), Some("writer"))[writer].starts_with('\u{f054}'));
-        let both = rows(PLAIN_LOOK, Some("%2"), Some("worker"));
+        // No glyph: the text is the bare frame's, so clicks hit as before.
         assert!(
-            both[worker].starts_with('\u{f054}') && both[writer].starts_with('\u{25cf}'),
-            "{both:?}"
+            text(&shown)
+                .iter()
+                .all(|t| !t.contains('\u{25cf}') && !t.starts_with('#'))
         );
+        assert_eq!(
+            text(&shown)[writer].trim_end(),
+            text(&laid(color, None, None))[writer].trim_end()
+        );
+        // The doing line is not banded; the main row is when its pane is on screen.
+        assert!(!banded(&laid(color, Some("%1"), None), doing));
+        assert!(banded(&laid(color, Some("%1"), None), worker));
+        assert!(banded(&laid(color, Some("%3"), None), main));
+        // Without color, in ASCII, or for a pane no row draws: no band.
+        assert!(!any_band(&laid(PLAIN_LOOK, Some("%2"), None)));
+        assert!(!any_band(&laid(
+            Look {
+                ascii: true,
+                ..PLAIN_LOOK
+            },
+            Some("%2"),
+            None
+        )));
+        assert!(!any_band(&laid(color, Some("%9"), None)));
+        // The chevron sits on the band on the shown row, and on its own elsewhere.
+        let both = laid(color, Some("%2"), Some("writer"));
+        assert!(banded(&both, writer) && text(&both)[writer].starts_with('\u{f054}'));
+        let apart = laid(color, Some("%2"), Some("worker"));
+        assert!(text(&apart)[worker].starts_with('\u{f054}') && banded(&apart, writer));
     }
 
     #[test]
@@ -6916,6 +6988,88 @@ mod tests {
         assert_eq!(frames, [board_frame(), failed_frame(), failed_frame()]);
         assert_eq!(diffs(&times), [300, 2000]);
         assert_eq!(selects(&w), 1);
+    }
+
+    #[test]
+    fn leaving_the_bar_clears_the_selection() {
+        // `j` selects worker while the bar (%7) is the pane on screen; on a tick that shows another pane (%1, the
+        // person went back to their chat) the selection and its hint are gone, the frame bare again.
+        // (the bar was on screen and the person left it, the selection cleared): keys sent to a bar that was never on
+        // screen (the session shows %1 throughout) keep theirs.
+        for (left, never) in [(false, false), (true, false), (false, true)] {
+            let w = click_world(&["live", "live", "live", "gone"], board_answer());
+            let probes = Rc::new(Cell::new(0));
+            let seen = probes.clone();
+            w.fakes
+                .mux_script("#{pane_id}|#{session_attached}", move |_| {
+                    seen.set(seen.get() + 1);
+                    Ok(if never || (left && seen.get() > 2) {
+                        out(0, "%1|1\n", "")
+                    } else {
+                        out(0, "%7|1\n", "")
+                    })
+                });
+            let steps = vec![(300, key(b"j"))];
+            watch_frames(&w, 3);
+            let (ended, frames, _) = watch_with(&w, Box::new(Script::new(&w.fakes, steps)));
+            assert_eq!(ended, "pane-closed");
+            let last = frames.last().unwrap();
+            if left {
+                assert_eq!(last, &board_frame(), "cleared after leaving: {frames:?}");
+            } else {
+                assert_eq!(last, &marked_frame(), "kept while in the bar: {frames:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn the_band_stays_on_the_last_agent_while_the_bar_has_focus() {
+        // worker (%9) on screen, then the person clicks into the bar (%7): worker's row keeps its band.
+        let mut w = click_world(&["live", "live", "live", "gone"], board_answer());
+        // Colored frames: the watch world draws plain (NO_COLOR), so that is taken out.
+        let env: Vec<(String, String)> = (w.ctx.env.iter())
+            .filter(|(k, _)| *k != "NO_COLOR")
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        w.ctx.env = Env::from_pairs(env);
+        watch_env(&mut w, "FORCE_COLOR", "1");
+        let probes = Rc::new(Cell::new(0));
+        let seen = probes.clone();
+        w.fakes
+            .mux_script("#{pane_id}|#{session_attached}", move |_| {
+                seen.set(seen.get() + 1);
+                Ok(out(
+                    0,
+                    if seen.get() == 1 { "%9|1\n" } else { "%7|1\n" },
+                    "",
+                ))
+            });
+        watch_frames(&w, 3);
+        let (ended, frames) = watch_run(&w);
+        assert_eq!(ended, "pane-closed");
+        let band = "\u{1b}[48;5;236m";
+        assert!(frames.iter().all(|f| f.contains(band)), "{frames:?}");
+    }
+
+    #[test]
+    fn a_pending_close_question_keeps_its_selection_after_leaving() {
+        let mut p = Pick::default();
+        let kept = Target {
+            life: pick::KEPT.into(),
+            ..Target::new("k1", "")
+        };
+        p.select(std::slice::from_ref(&kept), 0);
+        p.ask(kept);
+        p.left();
+        assert_eq!(
+            p.selected(),
+            Some("k1"),
+            "the question's target stays selected"
+        );
+        let mut q = Pick::default();
+        q.select(&[Target::new("w", "%9")], 0);
+        q.left();
+        assert_eq!(q.selected(), None);
     }
 
     #[test]
@@ -10264,7 +10418,7 @@ mod tests {
         mark(&mut laid, "D", ascii);
         let text: Vec<String> = laid.rows.iter().map(|r| render(r, false)).collect();
         assert!(
-            text.iter().any(|l| l.starts_with("#    * C1"))
+            text.iter().any(|l| l.starts_with("     * C1"))
                 && text.iter().any(|l| l.starts_with(">  * D")),
             "{text:?}"
         );

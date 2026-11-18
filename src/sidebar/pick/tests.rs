@@ -270,7 +270,7 @@ fn frame_hit_needs_the_width_the_row_and_its_text() {
         ("aaaaaaaaaaaa".to_string(), 1, line.clone()),
         ("bbbbbbbbbbbb".to_string(), 2, line.clone()),
     ];
-    let screen = format!(" mux-agents\n\u{25cf}{line}\n\u{f054}{line}\n   twin is doing it\n");
+    let screen = format!(" mux-agents\n {line}\n\u{f054}{line}\n   twin is doing it\n");
     let answer = format!("40\n{screen}");
     assert_eq!(frame_hit(&answer, 40, 2, &drawn), Some("aaaaaaaaaaaa"));
     assert_eq!(

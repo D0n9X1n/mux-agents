@@ -5366,10 +5366,6 @@ hc {}:
             }
             let check = |live: &Live| {
                 let shown = live.field(&session, "#{pane_id}");
-                let marked = views
-                    .iter()
-                    .find(|(p, _)| tmux && *p == shown)
-                    .map(|(_, n)| *n);
                 for bar in &bars {
                     let mut screen = String::new();
                     let ok = eventually(Duration::from_secs(10), || {
@@ -5378,9 +5374,8 @@ hc {}:
                             r[0].0 < r[1].0
                                 && r[1].0 < r[2].0
                                 && r.iter().map(|x| x.2).eq([1, 3, 5])
-                                && r.iter()
-                                    .zip(["leader", "child", "grand"])
-                                    .all(|(x, n)| (x.1 == '\u{25cf}') == (marked == Some(n)))
+                                // Column 0 holds no mark for the shown member (it is banded, in color only).
+                                && r.iter().all(|x| x.1 == ' ')
                         })
                     });
                     assert!(ok, "{mux:?} {bar}, shown {shown}:\n{screen}");
@@ -5395,7 +5390,7 @@ hc {}:
                     == views[2].0),
                 "{mux:?}: j to grand, Enter"
             );
-            check(&live); // `●` follows to grand on tmux
+            check(&live);
             // Grand prints a marker on its own terminal (the fake client prints nothing else), and hc keeps it before grand
             // stops: the output the popup must show. One word, as `Client::text` drops blanks.
             let marker = format!("grand-said-{}", std::process::id());
