@@ -1140,36 +1140,45 @@ fn lay_focus(
         room
     };
     let kept = lay_kept(&shells, cols, look, room, focus.selected);
-    // The main rows come before ended rows, gaps and notes: as many as still leave every running agent its line
-    // that drew in the bar without them (the members lay out again, one main row fewer, until they do).
+    // The main rows come right under the header, before ended rows, gaps and notes: they leave the members their
+    // header and one line for each running agent, and take the rest. When that is too little for the ended rows too,
+    // the members draw without them (the header still counts them), so no running agent gives way to a main row.
     let targets = main_targets(board);
-    let room_for = |n: usize| rest - kept.len() - n;
-    let lay_in = |height: usize| {
-        if height == 0 {
+    let running = board
+        .and_then(|b| b.get("agents"))
+        .and_then(Value::as_array)
+        .map_or(0, |a| {
+            a.iter()
+                .filter(|r| clean(r.get("state")) == "running")
+                .count()
+        });
+    let n = targets
+        .len()
+        .min((rest - kept.len()).saturating_sub(1 + running));
+    let members = rest - kept.len() - n;
+    let lay_in = |board: Option<&Map<String, Value>>| {
+        if members == 0 {
             (Laid::default(), 0)
         } else {
             let size = Size {
                 width: size.width,
-                height,
+                height: members,
             };
             lay_members(board, &notes, size, look, focus)
         }
     };
-    // The running agents a frame draws (only they are targets in the members' frame).
-    let drawn_running = |laid: &Laid| laid.agents.len();
-    let bare = lay_in(room_for(0));
-    let want = drawn_running(&bare.0);
-    let mut n = targets.len().min(room_for(0));
-    let (mut laid, shown) = loop {
-        if n == 0 {
-            break bare;
+    let (mut laid, mut shown) = lay_in(board);
+    let live = |laid: &Laid| laid.agents.len();
+    let trimmed = (n > 0 && live(&laid) < running)
+        .then(|| live_only(board))
+        .flatten();
+    if let Some(trimmed) = &trimmed {
+        (laid, shown) = lay_in(Some(trimmed));
+        // The header counts the whole board, ended agents included.
+        if let (Some(row), Some(b)) = (laid.rows.first_mut(), board) {
+            *row = header(&counts(b), cols);
         }
-        let with = lay_in(room_for(n));
-        if drawn_running(&with.0) >= want {
-            break with;
-        }
-        n -= 1;
-    };
+    }
     let mains: Vec<(Row, Option<Target>)> = (targets.into_iter().take(n))
         .map(|t| (main_row(&t, cols, look), Some(t)))
         .collect();
@@ -1221,6 +1230,25 @@ pub(crate) fn main_targets(board: Option<&Map<String, Value>>) -> Vec<Target> {
         .enumerate()
         .map(|(n, (p, _))| Target::main(p, n))
         .collect()
+}
+
+/// The board with its running agents only and no ended count: what the members draw when main rows leave no room for
+/// the ended rows (their fold line included); the caller puts back the header with the whole board's counts.
+fn live_only(board: Option<&Map<String, Value>>) -> Option<Map<String, Value>> {
+    let board = board?;
+    let rows = board.get("agents").and_then(Value::as_array)?;
+    let mut trimmed = board.clone();
+    trimmed.insert("endedTotal".into(), 0.into());
+    trimmed.insert(
+        "agents".into(),
+        Value::Array(
+            rows.iter()
+                .filter(|r| clean(r.get("state")) == "running")
+                .cloned()
+                .collect(),
+        ),
+    );
+    Some(trimmed)
 }
 
 /// A main row: the glyph in cyan, then its name in bold.
@@ -4721,8 +4749,8 @@ mod tests {
         // A team's bar has its leader instead.
         let team = json!({"team": true, "agents": [{"id": "L", "name": "lead", "state": "running", "leader": true, "parent": "%3"}]});
         assert!(main_targets(team.as_object()).is_empty());
-        // Eight chats, one running agent and seven ended ones in an 11-row bar: every main row and the running agent
-        // fit (the ended rows and gaps give way); a 4-row bar keeps its one main row.
+        // Eight chats, one running agent and seven ended ones in a 10-row bar: the header, every main row and the
+        // running agent fit (the ended rows and gaps give way); a 3-row bar keeps its one main row.
         let eight = json!({"running": 1, "endedTotal": 7, "agents": (1..=8).map(|n| json!({"id": format!("{n:0>12}"),
             "name": format!("w{n}"), "state": if n == 1 { "running" } else { "exited" }, "exitCode": 0, "age": n,
             "pane": format!("%{}", n + 10), "parent": format!("%{n}")})).collect::<Vec<_>>()});
@@ -4731,7 +4759,7 @@ mod tests {
             &[],
             Size {
                 width: 40,
-                height: 11,
+                height: 10,
             },
             PLAIN_LOOK,
         );
@@ -4757,7 +4785,7 @@ mod tests {
             &[],
             Size {
                 width: 40,
-                height: 4,
+                height: 3,
             },
             PLAIN_LOOK,
         );
@@ -4769,6 +4797,30 @@ mod tests {
                 .iter()
                 .map(|r| render(r, false))
                 .collect::<Vec<_>>()
+        );
+        // Every agent ended, four chats, a 4-row bar: the header stays (its counts), three main rows take the rest.
+        let four = json!({"running": 0, "endedTotal": 4, "agents": (1..=4).map(|n| json!({"id": format!("{n:0>12}"),
+            "name": format!("e{n}"), "state": "exited", "exitCode": 0, "age": n, "pane": format!("%{}", n + 10),
+            "parent": format!("%{n}")})).collect::<Vec<_>>()});
+        let tight = lay(
+            four.as_object(),
+            &[],
+            Size {
+                width: 40,
+                height: 4,
+            },
+            PLAIN_LOOK,
+        );
+        let text: Vec<String> = tight.rows.iter().map(|r| render(r, false)).collect();
+        assert!(text[0].starts_with(" mux-agents"), "{text:?}");
+        assert!(text[0].ends_with("4 ended"), "{text:?}");
+        assert_eq!(
+            tight
+                .agents
+                .iter()
+                .filter(|(t, _)| t.life == pick::MAIN)
+                .count(),
+            3
         );
         // Many chats in a short bar: the agents keep their rows, the main rows take the rest.
         let many = json!({"running": 4, "agents": (1..=4).map(|n| json!({"id": format!("{n:0>12}"), "name": format!("w{n}"),

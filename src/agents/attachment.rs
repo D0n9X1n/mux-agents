@@ -91,18 +91,21 @@ pub fn attach(
             .ok_or_else(|| Refusal::internal("unproven new view"))
     };
     let mut view = create(plan.as_ref())?;
+    // Ours from here on: any failure below closes it (the caller's rollback reads `pane`).
+    *pane = Some(view.clone());
     // The split cannot be guarded where it runs (an `if-shell` drops the new pane's id), so an agent view split beside
     // is proven again after it: a pane replaced in between gets no view beside it; the new view, proven by its own
-    // command, is closed and opened as a tab instead.
+    // command, is closed and opened as a tab instead. A view that cannot be shown closed stays where it is.
     if let (Some(p), Some(views)) = (&plan, &views)
         && p.target != caller.pane
         && !super::split::still(ctx, &p.target, views)
+        && clean(ctx, &view)?
     {
-        clean(ctx, &view)?;
+        *pane = None;
         view = create(None)?;
+        *pane = Some(view.clone());
         plan = None;
     }
-    *pane = Some(view.clone());
     if let (Some(plan), Some(views), Some(dir)) = (&plan, &views, split)
         && plan.even
     {
@@ -296,7 +299,13 @@ mod tests {
     /// new view is not left beside it: it is closed and opened as a tab.
     #[test]
     fn a_view_replaced_during_the_split_gets_a_tab_instead() {
-        for replaced in [false, true] {
+        // (the target replaced after the split, the new view still there after its kill, the view kept)
+        for (replaced, stuck, kept) in [
+            (false, false, "%12"),
+            (true, false, "%13"),
+            (true, true, "%12"),
+        ] {
+            let case = format!("{replaced} {stuck}");
             let w = World::human("");
             let caller = w.caller();
             let first = core_fixture::member(&w, "bbbbbbbbbbbb", serde_json::json!({"pane":"%9"}));
@@ -328,7 +337,15 @@ mod tests {
             w.fakes
                 .mux_rule("new-window", 0, "%13|@6|hc attach t1\n", "");
             w.launches_hold();
-            w.fakes.mux_rule("#{pane_id}|#{@agent-id}", 0, "|\n", "");
+            // The gone probe after the kill: %12 still answers when its kill did not take.
+            w.fakes.mux_script("#{pane_id}|#{@agent-id}", move |argv| {
+                let there = stuck && argv.iter().any(|a| a == "%12");
+                Ok(crate::mux::Output {
+                    code: 0,
+                    stdout: if there { "%12|\n" } else { "|\n" }.into(),
+                    stderr: String::new(),
+                })
+            });
             let r = serde_json::json!({"id":"aaaaaaaaaaaa","name":"worker","hcAddress":"t1","directory":w.ctx.cwd,"context":"brief","reason":"human"});
             let mut view = None;
             attach(&w.ctx, &core, &caller, &r, "t1", Some("h"), &mut view).unwrap();
@@ -344,13 +361,54 @@ mod tests {
             let killed = calls
                 .iter()
                 .any(|c| c.last().is_some_and(|a| a == "kill-pane -t %12"));
-            assert_eq!(killed, replaced, "{replaced}");
+            assert_eq!(killed, replaced, "{case}");
+            assert_eq!(view.unwrap().pane, kept, "{case}");
+            let tabs = calls.iter().filter(|c| c[1] == "new-window").count();
             assert_eq!(
-                view.unwrap().pane,
-                if replaced { "%13" } else { "%12" },
-                "{replaced}"
+                tabs,
+                usize::from(kept == "%13"),
+                "{case}: one view, never two"
             );
         }
+    }
+
+    /// A failure after the split leaves the split in `pane`, so the caller's rollback closes it.
+    #[test]
+    fn the_split_is_owned_before_anything_after_it_can_fail() {
+        let w = World::human("");
+        let caller = w.caller();
+        let first = core_fixture::member(&w, "bbbbbbbbbbbb", serde_json::json!({"pane":"%9"}));
+        let mut row = crate::agents::fixture::row_of("%9|@1|300||", &[]);
+        row.command = first["startCommand"].as_str().unwrap().into();
+        w.pane_rows(&[row]);
+        core_fixture::online(&w);
+        let core = hc::connect(&w.ctx).unwrap();
+        w.fakes.mux_first(
+            crate::agents::split::GEOMETRY,
+            0,
+            "%1|119|60|240|||\n%9|120|60|240|||\n",
+            "",
+        );
+        // The target proves for the plan, then its re-check after the split fails as a call (the server went away).
+        let probe = "#{pane_id}|#{&&:#{==:#{pane_dead},0},#{==:#{pane_start_command},hc attach tbbbbbbbbbbbb}}";
+        let reads = std::cell::Cell::new(0);
+        w.fakes.mux_script(probe, move |_| {
+            reads.set(reads.get() + 1);
+            Ok(crate::mux::Output {
+                code: 0,
+                stdout: if reads.get() == 1 { "%9|1\n" } else { "%9|0\n" }.into(),
+                stderr: String::new(),
+            })
+        });
+        w.fakes
+            .mux_rule("split-window", 0, "%12|@1|hc attach t1\n", "");
+        w.fakes.mux_rule("kill-pane", 1, "", "no server\n");
+        w.fakes
+            .mux_rule("#{pane_id}|#{@agent-id}", 1, "", "no server\n");
+        let r = serde_json::json!({"id":"aaaaaaaaaaaa","name":"worker","hcAddress":"t1","directory":w.ctx.cwd,"context":"brief","reason":"human"});
+        let mut view = None;
+        assert!(attach(&w.ctx, &core, &caller, &r, "t1", Some("h"), &mut view).is_err());
+        assert_eq!(view.map(|v| v.pane).as_deref(), Some("%12"));
     }
 
     /// A Unix pane gets the server's environment, not the caller's, so the view is given the state root as the bar is
