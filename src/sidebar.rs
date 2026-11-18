@@ -1123,7 +1123,9 @@ fn lay_focus(
     focus: tree::Focus,
 ) -> (Laid, usize) {
     if size.width < 12 {
-        return lay_members(board, notes, size, look, focus);
+        let (mut laid, kept) = lay_members(board, notes, size, look, focus);
+        shade(&mut laid, focus.shown, size.width, look);
+        return (laid, kept);
     }
     let (asked, notes): (Vec<_>, Vec<_>) =
         notes.iter().copied().partition(|(n, _)| *n == pick::ASK);
@@ -1480,7 +1482,7 @@ fn with_hint(
 /// across the bar's `width`, so the row reads as the one on screen without a glyph. Only with color; nothing when
 /// the shown pane is no drawn row's. The text is unchanged, so clicks hit it as before.
 pub(crate) fn shade(laid: &mut Laid, shown: Option<&str>, width: usize, look: Look) {
-    let Some(pane) = shown.filter(|p| !p.is_empty() && look.color) else {
+    let Some(pane) = shown.filter(|p| !p.is_empty() && look.color && !look.ascii) else {
         return;
     };
     let Some(&(_, at)) = laid.agents.iter().find(|(t, _)| t.pane == pane) else {
@@ -5039,6 +5041,34 @@ mod tests {
             Some("%2"),
             None
         )));
+        // ASCII with color (a terminal without the symbols): no band either.
+        assert!(!any_band(&laid(
+            Look {
+                ascii: true,
+                ..color
+            },
+            Some("%2"),
+            None
+        )));
+        // A team bar narrower than 12 columns still bands its member on screen.
+        let team = json!({"team": true, "running": 1, "agents": [{"id": "L", "name": "worker", "state": "running",
+            "life": "running", "leader": true, "parentId": null, "pane": "%1", "age": 60,
+            "createdAt": "2026-11-18T10:00:00Z"}]});
+        let narrow = lay_focus(
+            team.as_object(),
+            &[],
+            Size {
+                width: 11,
+                height: 6,
+            },
+            color,
+            tree::Focus {
+                shown: Some("%1"),
+                selected: None,
+            },
+        )
+        .0;
+        assert!(any_band(&narrow), "{:?}", narrow.rows);
         assert!(!any_band(&laid(color, Some("%9"), None)));
         // The chevron sits on the band on the shown row, and on its own elsewhere.
         let both = laid(color, Some("%2"), Some("writer"));
@@ -6995,7 +7025,8 @@ mod tests {
         // `j` selects worker while the bar (%7) is the pane on screen; on a tick that shows another pane (%1, the
         // person went back to their chat) the selection and its hint are gone, the frame bare again.
         // (the bar was on screen and the person left it, the selection cleared): keys sent to a bar that was never on
-        // screen (the session shows %1 throughout) keep theirs.
+        // screen (the session shows %1 throughout) keep theirs; so does a tick whose probe is unanswered or whose
+        // session has no client attached (`unknown`).
         for (left, never) in [(false, false), (true, false), (false, true)] {
             let w = click_world(&["live", "live", "live", "gone"], board_answer());
             let probes = Rc::new(Cell::new(0));
@@ -7070,6 +7101,34 @@ mod tests {
         q.select(&[Target::new("w", "%9")], 0);
         q.left();
         assert_eq!(q.selected(), None);
+    }
+
+    #[test]
+    fn an_unanswered_or_detached_tick_keeps_the_selection() {
+        for after in ["", "%1|0\n"] {
+            let w = click_world(&["live", "live", "live", "gone"], board_answer());
+            let probes = Rc::new(Cell::new(0));
+            let seen = probes.clone();
+            let later = after.to_string();
+            w.fakes
+                .mux_script("#{pane_id}|#{session_attached}", move |_| {
+                    seen.set(seen.get() + 1);
+                    Ok(match seen.get() {
+                        1 | 2 => out(0, "%7|1\n", ""),
+                        _ if later.is_empty() => out(1, "", "no server"),
+                        _ => out(0, &later, ""),
+                    })
+                });
+            let steps = vec![(300, key(b"j"))];
+            watch_frames(&w, 3);
+            let (ended, frames, _) = watch_with(&w, Box::new(Script::new(&w.fakes, steps)));
+            assert_eq!(ended, "pane-closed");
+            assert_eq!(
+                frames.last().unwrap(),
+                &marked_frame(),
+                "{after:?}: {frames:?}"
+            );
+        }
     }
 
     #[test]
