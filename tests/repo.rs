@@ -2799,7 +2799,11 @@ fn readme_links_absolute() {
     );
 }
 
-/// The wiki pages, by name without `.md`, sorted. wiki/ is flat: the mirror publishes top-level pages only.
+/// GitHub shows one `_Sidebar` on every wiki page, so it is a single bilingual file: no twin, no switch link.
+const SIDEBAR: &str = "_Sidebar";
+
+/// The wiki pages, by name without `.md`, sorted, without the shared sidebar. wiki/ is flat: the mirror publishes
+/// top-level pages only.
 fn wiki_pages() -> Vec<String> {
     let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("wiki");
     let mut pages = Vec::new();
@@ -2811,10 +2815,52 @@ fn wiki_pages() -> Vec<String> {
             "wiki/{name} is not a file"
         );
         let page = name.strip_suffix(".md");
-        pages.push(page.unwrap_or_else(|| panic!("wiki/{name}")).to_string());
+        let page = page.unwrap_or_else(|| panic!("wiki/{name}")).to_string();
+        if page != SIDEBAR {
+            pages.push(page);
+        }
     }
     pages.sort();
     pages
+}
+
+// The sidebar is how a reader moves between pages and languages: an English and a Chinese section, each a
+// collapsible block, linking every page of its language and nothing that does not exist.
+#[test]
+fn wiki_sidebar_links_every_page_by_language() {
+    let pages = wiki_pages();
+    let text = wiki_text(SIDEBAR);
+    let mut bad = Vec::new();
+    let blocks: Vec<&str> = text.split("<details").skip(1).collect();
+    if blocks.len() != 2 {
+        bad.push(format!("{} language blocks, not 2", blocks.len()));
+    }
+    for (block, zh, label) in [(0, false, "English"), (1, true, "简体中文")] {
+        let Some(body) = blocks.get(block) else {
+            continue;
+        };
+        if !body.contains(label) {
+            bad.push(format!("block {block} is not labelled {label}"));
+        }
+        let targets = link_targets(body);
+        for page in pages.iter().filter(|p| p.ends_with("-zh-CN") == zh) {
+            if !targets.iter().any(|t| t == page) {
+                bad.push(format!("the {label} block does not link {page}"));
+            }
+        }
+        for target in &targets {
+            if !pages.contains(target) {
+                bad.push(format!(
+                    "the {label} block links {target}, which is no page"
+                ));
+            } else if target.ends_with("-zh-CN") != zh {
+                bad.push(format!(
+                    "the {label} block links {target}, a page of the other language"
+                ));
+            }
+        }
+    }
+    assert!(bad.is_empty(), "{bad:#?}");
 }
 
 fn twin(page: &str) -> String {
