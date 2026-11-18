@@ -59,14 +59,14 @@ pub fn linux_ended(text: &[u8], start: i64) -> bool {
     one_thread && (matches!(fields[0], "Z" | "X") || exiting)
 }
 
-// sys/proc.h p_stat SZOMB, and sys/proc_info.h PROC_FLAG_INEXIT (XNU); libc declares no PROC_FLAG_INEXIT.
-const SZOMB: u32 = 5;
-const PROC_FLAG_INEXIT: u32 = 0x4;
+// XNU bsd/sys/proc.h: p_stat SZOMB (5) and the p_flag bit P_WEXIT (0x2000, "working on exiting").
+const SZOMB: u8 = 5;
+const P_WEXIT: i32 = 0x2000;
 
-/// Whether macOS `proc_bsdinfo` fields (`pbi_status`, `pbi_flags`) show the process has ended: a zombie, or a process
-/// in its exit. Both are per process, not per thread.
-pub fn bsd_ended(status: u32, flags: u32) -> bool {
-    status == SZOMB || flags & PROC_FLAG_INEXIT != 0
+/// Whether macOS `kinfo_proc` fields (extern_proc's `p_stat`, `p_flag`) show the process has ended: a zombie, or a
+/// process in its exit. kinfo_proc answers for a zombie, where libproc answers nothing.
+pub fn kinfo_ended(stat: u8, flag: i32) -> bool {
+    stat == SZOMB || flag & P_WEXIT != 0
 }
 
 /// `/proc/<pid>/cmdline`: it must end in NUL and only that one is dropped, so empty last arguments survive.
@@ -493,20 +493,20 @@ mod tests {
         }
     }
 
-    // macOS: a zombie (p_stat SZOMB, 5) or a process in its exit (PROC_FLAG_INEXIT, 0x4) has ended; every other state
-    // (SIDL 1, SRUN 2, SSLEEP 3, SSTOP 4) and other flags (PROC_FLAG_TRACED 0x2) have not.
+    // macOS: a zombie (p_stat SZOMB, 5) or a process in its exit (p_flag P_WEXIT, 0x2000) has ended; every other state
+    // (SIDL 1, SRUN 2, SSLEEP 3, SSTOP 4) and other flags (P_TRACED 0x800, P_EXEC 0x4000) have not.
     #[test]
-    fn bsd_ended_reads_zombie_status_and_inexit_flag() {
-        for (status, flags, want) in [
+    fn kinfo_ended_reads_zombie_stat_and_wexit_flag() {
+        for (stat, flag, want) in [
             (2, 0, false),
-            (3, 0x2, false),
+            (3, 0x800, false),
             (1, 0, false),
-            (4, 0x1, false),
+            (4, 0x4000, false),
             (5, 0, true),
-            (3, 0x4, true),
-            (2, 0x4 | 0x2, true),
+            (3, 0x2000, true),
+            (2, 0x2000 | 0x800, true),
         ] {
-            assert_eq!(bsd_ended(status, flags), want, "{status} {flags:#x}");
+            assert_eq!(kinfo_ended(stat, flag), want, "{stat} {flag:#x}");
         }
     }
 

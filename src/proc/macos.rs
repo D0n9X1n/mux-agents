@@ -136,9 +136,13 @@ const KINFO_PROC_SIZE: usize = 648;
 const P_PID_AT: usize = 40;
 const P_COMM_AT: usize = 243;
 
-// sysctl KERN_PROC_PID's p_comm, which ps reads for any process; none unless a whole kinfo_proc of this very pid
-// comes back (a gone pid answers 0 bytes).
-fn comm(pid: u32) -> Option<String> {
+// extern_proc's p_flag (an int at byte 32) and p_stat (a char at byte 36), between its two pointers and p_pid.
+const P_FLAG_AT: usize = 32;
+const P_STAT_AT: usize = 36;
+
+// sysctl KERN_PROC_PID's kinfo_proc, which ps reads for any process, a zombie included; none unless a whole
+// kinfo_proc of this very pid comes back (a gone pid answers 0 bytes).
+fn kinfo(pid: u32) -> Option<[u8; KINFO_PROC_SIZE]> {
     let id = c_int::try_from(pid).ok()?;
     let mut mib = [libc::CTL_KERN, libc::KERN_PROC, libc::KERN_PROC_PID, id];
     let mut buf = [0u8; KINFO_PROC_SIZE];
@@ -158,9 +162,12 @@ fn comm(pid: u32) -> Option<String> {
         return None;
     }
     let at_pid = c_int::from_ne_bytes(buf[P_PID_AT..P_PID_AT + 4].try_into().ok()?);
-    if at_pid != id {
-        return None;
-    }
+    (at_pid == id).then_some(buf)
+}
+
+// kinfo_proc's p_comm.
+fn comm(pid: u32) -> Option<String> {
+    let buf = kinfo(pid)?;
     let name = &buf[P_COMM_AT..P_COMM_AT + libc::MAXCOMLEN + 1];
     let len = name.iter().position(|&b| b == 0)?;
     String::from_utf8(name[..len].to_vec())
@@ -237,13 +244,13 @@ impl Os for MacOs {
         seam::kill_with(self, opened)
     }
 
-    /// libproc's bsdinfo of the row's pid, with the row's start, shows a zombie or a process in its exit. libproc
-    /// still answers for a zombie, so its start is read as for a live process.
+    /// kinfo_proc of the row's pid shows a zombie or a process in its exit. libproc answers nothing for a zombie (so
+    /// its row has no start), which is why the state is read here. The start is not compared: while pid P is a
+    /// zombie no live process can have pid P, so whichever process the row named runs no more code.
     fn ended(&self, row: &Row) -> bool {
-        bsdinfo(row.pid).is_some_and(|info| {
-            row.start.is_some()
-                && start_of(&info) == row.start
-                && parse::bsd_ended(info.pbi_status, info.pbi_flags)
+        kinfo(row.pid).is_some_and(|k| {
+            let flag = c_int::from_ne_bytes(k[P_FLAG_AT..P_FLAG_AT + 4].try_into().unwrap());
+            parse::kinfo_ended(k[P_STAT_AT], flag)
         })
     }
 
@@ -335,8 +342,9 @@ mod tests {
             .as_micros() as i64
     }
 
-    // A child that exited and is not reaped yet is still listed with its start, but its argv cannot be read: occupancy
-    // reads it as unbound. `ended` shows it exited; a live process has not ended.
+    // A child that exited and is not reaped yet is still listed, but libproc answers nothing for it: no start, no argv,
+    // only its image (as CI shows: `start: None, path: None, argv: None`). Occupancy reads it as unbound. `ended`,
+    // through kinfo_proc, shows it exited; a live process has not ended.
     #[test]
     fn an_unreaped_child_is_listed_unbound_and_ended() {
         let dir = TempDir::new();
@@ -360,20 +368,20 @@ mod tests {
         };
         let live_row = MacOs.row(live.id()).unwrap();
         let ended = (MacOs.ended(&zombie), MacOs.ended(&live_row));
-        let reused = MacOs.ended(&Row {
-            start: zombie.start.map(|s| s + 1),
-            ..zombie.clone()
-        });
         live.kill().unwrap();
         live.wait().unwrap();
         gone.wait().unwrap();
-        assert!(zombie.start.is_some(), "{zombie:?}");
+        assert!(zombie.argv.is_none() && zombie.path.is_none(), "{zombie:?}");
         assert_eq!(
             ended,
             (true, false),
             "the zombie has ended, the sleeper has not"
         );
-        assert!(!reused, "another start is another process");
+        let reaped = MacOs.ended(&zombie);
+        assert!(
+            !reaped,
+            "a reaped pid is gone, not ended: kinfo_proc answers nothing"
+        );
     }
 
     #[test]

@@ -46,13 +46,14 @@ fn a_copy_named_claude_is_listed_with_that_image() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-// Linux: an exited, unreaped copy (a zombie) keeps its start and comm but has no exe link and an empty cmdline: an
-// unbound row judged by its image (H4.5). `claude` holds Claude; `worker` holds nothing.
+// Linux: an exited, unreaped copy (a zombie) keeps its start and comm but has no exe link and an empty cmdline, so it
+// reads as an unbound row. It runs no more code, so `ended` shows it and it holds nothing, under any image: a stopped
+// client its parent has not reaped yet never blocks a resume.
 #[cfg(target_os = "linux")]
 #[test]
 fn a_linux_zombie_is_unbound_and_judged_by_its_image() {
     let os = mux_agent::proc::host();
-    for (name, want) in [("claude", true), ("worker", false)] {
+    for name in ["claude", "worker"] {
         let dir = scratch(&format!("zombie-{name}"));
         let child = native::copy_as(&dir, name, &["--list"]);
         let pid = child.0.id();
@@ -71,12 +72,9 @@ fn a_linux_zombie_is_unbound_and_judged_by_its_image() {
             "{name}: {row:?}"
         );
         assert_eq!(row.image.as_deref(), Some(name));
+        assert!(os.ended(&row), "{name}: a zombie has ended");
         let held = holds(os.as_ref(), &row, SID, Client::Claude, HOST).map(|h| (h.rule, h.pid));
-        assert_eq!(
-            held,
-            want.then_some((mux_agent::agents::occupancy::Rule::Unbound, Some(pid))),
-            "{name}"
-        );
+        assert_eq!(held, None, "{name}");
         drop(child);
         let _ = std::fs::remove_dir_all(&dir);
     }
