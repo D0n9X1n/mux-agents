@@ -274,6 +274,12 @@ impl Server {
         let panes = self.call(&["list-panes", "-a", "-F", "#{pane_id} #{pane_pid} #{pid}"]);
         let fields: Vec<&str> = panes.split_whitespace().collect();
         assert_eq!(fields.len(), 3, "{mux:?} list-panes: {panes:?}");
+        // tmux 3.2a keeps a detached session at its default 80x24 whatever `-x`/`-y` asked; every test assumes
+        // 200x50, where a split view has room (an 80-column window opens agents as tabs). Only there: a resized
+        // window stops following the client that attaches later (`window-size manual`).
+        if mux == Mux::Tmux32 {
+            self.call(&["resize-window", "-t", fields[0], "-x", "200", "-y", "50"]);
+        }
         self.pane = fields[0].to_string();
         self.pane_pid = fields[1].parse().unwrap();
         self.pid = fields[2].parse().unwrap();
