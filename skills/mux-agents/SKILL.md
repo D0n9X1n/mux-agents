@@ -22,7 +22,7 @@ The commands below, and the Reply and Listen lines, run as-is in the Bash tool. 
 - Agent callers always pass `-BriefFile`, because a fork can fall back to brief-only.
 - Report results to your parent with `send parent`.
 - As a spawned agent, run `status -BodyFile <file>` each time you start a step of your task.
-- When the user wants agents as tabs first, run `placement tab`; as panes first, run `placement h` (or `v`). It lasts for the session.
+- When the user wants agents as tabs first, run `placement tab`; as panes first, run `placement h` (or `v`). It lasts for the session. Splits keep the user's pane the largest: three agents fit beside it, and further agents open as tabs.
 - The first `spawn` opens a narrow side bar beside you showing how many agents run and what each is doing. `sidebar -Close` closes it for the session; `sidebar` opens it again.
 - Never type into panes.
 - Run `focus` only when the user asks.

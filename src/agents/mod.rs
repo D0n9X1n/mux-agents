@@ -92,6 +92,7 @@ pub mod session_report;
 mod session_report_tests;
 pub mod settle;
 pub mod spawn;
+pub mod split;
 #[cfg(test)]
 mod stop_gen_tests;
 #[cfg(test)]
@@ -314,6 +315,8 @@ pub(crate) mod fixture {
                 &format!("900|100|$3|@1|{tag}\n"),
                 "",
             );
+            // The caller's window: %1 alone, 240x60, room for a split view.
+            fakes.mux_rule(crate::agents::split::GEOMETRY, 0, "%1|240|60|240|\n", "");
             let mut ctx = fakes.ctx();
             ctx.env = Env::from_pairs([
                 ("TMUX", format!("{},{SERVER},0", socket())),

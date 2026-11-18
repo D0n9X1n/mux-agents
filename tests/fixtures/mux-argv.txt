@@ -5,6 +5,7 @@
 # Placeholders: <marker> the 32-hex marker, <state> the state root, <cwd> the caller's cwd, <exe> the binary,
 # <id> the new agent's id, <hc> the resolved core binary, <buffer> a read's private buffer (mux-agents-<32 hex>).
 # `-e MUX_AGENTS_STATE=<state>` is the Unix pane environment of the sidebar and, since 0.3.0, the view.
+# A split view first reads the session's member views and the caller's window, then splits at 50% (since 0.3.3).
 # :370 caller probe; :539 tagged-pane list; :1188 gone probe of agent %8 (committed, no notice, not listed).
 # 0.2.2: the tagged-pane list also reads #{pane_dead}, so reap can close a pane remain-on-exit kept.
 # 0.2.3: agents are found by their pane and the exact command it started, never by their tags. The pane list
@@ -64,7 +65,9 @@
 -N list-panes -s -t $3 -F <marker>#{pane_id}<marker>#{window_id}<marker>#{pane_pid}<marker>#{pane_dead}<marker>#{pane_start_command}<marker>#{@agent-id}<marker>#{@agent-name}<marker>
 -N list-panes -s -t $3 -F <marker>#{pane_id}<marker>#{window_id}<marker>#{pane_pid}<marker>#{pane_dead}<marker>#{pane_start_command}<marker>#{@agent-id}<marker>#{@agent-name}<marker>
 -N list-panes -s -t $3 -F <marker>#{pane_id}<marker>#{window_id}<marker>#{pane_pid}<marker>#{pane_dead}<marker>#{pane_start_command}<marker>#{@agent-id}<marker>#{@agent-name}<marker>
--N split-window -v -d -P -F #{pane_id}|#{window_id}|#{pane_start_command} -t %1 -e MUX_AGENTS_STATE=<state> -c <cwd> <hc> attach t1
+-N list-panes -s -t $3 -F <marker>#{pane_id}<marker>#{window_id}<marker>#{pane_pid}<marker>#{pane_dead}<marker>#{pane_start_command}<marker>#{@agent-id}<marker>#{@agent-name}<marker>
+-N list-panes -t %1 -F #{pane_id}|#{pane_width}|#{pane_height}|#{window_width}|#{@agent-role}
+-N split-window -v -d -P -F #{pane_id}|#{window_id}|#{pane_start_command} -t %1 -l 50% -e MUX_AGENTS_STATE=<state> -c <cwd> <hc> attach t1
 -N if-shell -F -t %12 '#{==:#{pane_start_command},hc attach t1}' 'set-option -p -t %12 @agent-id <id> ; set-option -p -t %12 @agent-name helper ; set-option -p -t %12 @agent-parent %1 ; set-option -p -t %12 @agent-context brief:human'
 -N if-shell -F -t %12 '#{==:#{pane_start_command},hc attach t1}' 'select-pane -T helper -t %12'
 -N if-shell -F -t %12 '#{==:#{pane_start_command},hc attach t1}' 'set-option -p -t %12 allow-set-title off'
@@ -99,7 +102,9 @@
 -N list-panes -s -t $3 -F <marker>#{pane_id}<marker>#{window_id}<marker>#{pane_pid}<marker>#{pane_dead}<marker>#{pane_start_command}<marker>#{@agent-id}<marker>#{@agent-name}<marker>
 # the stored placement: a split beside the caller, as -Split h
 -N list-panes -s -t $3 -F <marker>#{pane_id}<marker>#{window_id}<marker>#{pane_pid}<marker>#{pane_dead}<marker>#{pane_start_command}<marker>#{@agent-id}<marker>#{@agent-name}<marker>
--N split-window -h -d -P -F #{pane_id}|#{window_id}|#{pane_start_command} -t %1 -e MUX_AGENTS_STATE=<state> -c <cwd> <hc> attach t1
+-N list-panes -s -t $3 -F <marker>#{pane_id}<marker>#{window_id}<marker>#{pane_pid}<marker>#{pane_dead}<marker>#{pane_start_command}<marker>#{@agent-id}<marker>#{@agent-name}<marker>
+-N list-panes -t %1 -F #{pane_id}|#{pane_width}|#{pane_height}|#{window_width}|#{@agent-role}
+-N split-window -h -d -P -F #{pane_id}|#{window_id}|#{pane_start_command} -t %1 -l 50% -e MUX_AGENTS_STATE=<state> -c <cwd> <hc> attach t1
 -N if-shell -F -t %12 '#{==:#{pane_start_command},hc attach t1}' 'set-option -p -t %12 @agent-id <id> ; set-option -p -t %12 @agent-name hi ; set-option -p -t %12 @agent-parent %1 ; set-option -p -t %12 @agent-context brief:human'
 -N if-shell -F -t %12 '#{==:#{pane_start_command},hc attach t1}' 'select-pane -T hi -t %12'
 -N if-shell -F -t %12 '#{==:#{pane_start_command},hc attach t1}' 'set-option -p -t %12 allow-set-title off'

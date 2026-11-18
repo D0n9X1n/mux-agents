@@ -2179,7 +2179,10 @@ exec claude --dangerously-skip-permissions
             return;
         };
         let root = live.server.pane().to_string();
-        let right = live.split(&root, &["-h"]);
+        // Wide and tall enough that the spawns below split beside `lower` (a split needs 60 columns and 10 rows a
+        // pane), not fall back to a tab.
+        live.call(&["resize-window", "-t", &root, "-x", "800", "-y", "80"]);
+        let right = live.split(&root, &["-h", "-l", "25%"]);
         let lower = live.split(&root, &["-v"]);
         let active = live.active(&root);
         let (code, open) = live.run_in(&lower, &["sidebar"]);
@@ -2258,6 +2261,58 @@ hc {}:
                 "{mux:?} placement {placement}: {place}"
             );
         }
+    }
+
+    // Split placement keeps the main chat the largest: the first agent halves it, the second and third stack evenly
+    // in the agent column (main keeps its half after the bar opens), and a fourth opens as a tab.
+    fn split_agents_keep_main_half_then_tab(mux: Mux) {
+        let Some(mut live) = Live::human(mux) else {
+            return;
+        };
+        let root = live.server.pane().to_string();
+        live.call(&["resize-window", "-t", &root, "-x", "300", "-y", "60"]);
+        let (code, set) = live.run_in(&root, &["placement", "h"]);
+        assert_eq!(code, 0, "{mux:?} {set}");
+        let mut panes = Vec::new();
+        for n in 0..4 {
+            let name = format!("s{n}");
+            let args = live.spawn_args("claude", &name, &[]);
+            let args: Vec<&str> = args.iter().map(String::as_str).collect();
+            let (code, spawned) = live.run_in(&root, &args);
+            assert_eq!(code, 0, "{mux:?} {spawned}");
+            panes.push((
+                s(&spawned["pane"]).to_string(),
+                s(&spawned["window"]).to_string(),
+            ));
+        }
+        let main_window: String =
+            live.call(&["display-message", "-p", "-t", &root, "#{window_id}"]);
+        let main_window = main_window.trim();
+        let width = |pane: &str| live.num::<u32>(pane, "#{pane_width}");
+        let height = |pane: &str| live.num::<u32>(pane, "#{pane_height}");
+        // Three views beside main, the fourth in its own window.
+        for (pane, window) in &panes[..3] {
+            assert_eq!(window, main_window, "{mux:?} {pane}");
+        }
+        assert_ne!(
+            panes[3].1, main_window,
+            "{mux:?}: the fourth opens as a tab"
+        );
+        // Main is at least as wide as each view; the column is even to a row.
+        let main = width(&root);
+        let views: Vec<(u32, u32)> = panes[..3]
+            .iter()
+            .map(|(p, _)| (width(p), height(p)))
+            .collect();
+        assert!(
+            views.iter().all(|&(w, _)| main + 1 >= w),
+            "{mux:?} main {main} views {views:?}"
+        );
+        let (lo, hi) = (
+            views.iter().map(|v| v.1).min().unwrap(),
+            views.iter().map(|v| v.1).max().unwrap(),
+        );
+        assert!(hi - lo <= 1, "{mux:?} uneven column {views:?}");
     }
 
     /// `args`, then `select-pane -t <focus>` and the bar's `<at right>|<at top>|<at bottom>`, as one command list,
@@ -6164,6 +6219,7 @@ hc {}:
                     tagged_pane_cannot_spawn_and_gone_pane_vs_dead_socket,
                     sidebar_opens_at_bar_width_and_closes,
                     bar_opens_at_right_edge_from_any_pane,
+                    split_agents_keep_main_half_then_tab,
                     bar_repaired_after_a_split_right_of_it,
                     bar_repair_keeps_focus,
                     bar_drag_kept_until_the_window_resizes,

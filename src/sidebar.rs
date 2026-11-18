@@ -299,6 +299,10 @@ const BADGE: Style = Style {
 };
 const MAIL: &str = "\u{2709}";
 const HINT: &str = "Enter: focus  Esc: clear";
+// The selection's indicator: Nerd Font `nf-fa-chevron_right` (one column, a private-use code point).
+const SELECTED: &str = "\u{f054}";
+// The main chat's glyph: Nerd Font `nf-fa-terminal` (`$` in ASCII).
+const MAIN: &str = "\u{f120}";
 
 /// Agent-supplied text as drawn: '◉', '◌' and '✦' become '•' (all one column under unicode-width 0.2.3), so only the
 /// bar's own glyph starts a name line.
@@ -549,10 +553,12 @@ struct Live {
 }
 
 /// The rows as drawn, and each drawn running agent with its name line's row, top to bottom.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Default, PartialEq, Eq)]
 pub(crate) struct Laid {
     pub rows: Vec<Row>,
     pub agents: Vec<(Target, usize)>,
+    /// The other rows a drawn agent's entry takes (its doing line), by member id: a click there opens it too.
+    pub more: Vec<(String, usize)>,
 }
 
 /// The drawn running agents, top to bottom.
@@ -564,18 +570,19 @@ fn targets(laid: &Laid) -> Vec<Target> {
         .collect()
 }
 
-/// Each drawn agent row: its member id, its row and its text after column 0, as `pick::frame_hit` compares them.
+/// Each drawn agent row: its member id, its row and its text after column 0, as `pick::frame_hit` compares them
+/// (a doing line's margin is part of its indent span, so the text is cut after its first character, not its first span).
 fn drawn(laid: &Laid) -> Vec<(String, usize, String)> {
     let text = |at: usize| {
-        laid.rows[at]
-            .iter()
-            .skip(1)
-            .map(|(t, _)| t.as_str())
-            .collect::<String>()
+        let line: String = laid.rows[at].iter().map(|(t, _)| t.as_str()).collect();
+        line.chars().skip(1).collect::<String>()
     };
+    let more = laid.more.iter().map(|(id, at)| (id, at));
     laid.agents
         .iter()
-        .map(|(t, at)| (t.id.clone(), *at, text(*at)))
+        .map(|(t, at)| (&t.id, at))
+        .chain(more)
+        .map(|(id, at)| (id.clone(), *at, text(*at)))
         .collect()
 }
 
@@ -955,10 +962,15 @@ fn assemble(parts: &Parts, shape: &Shape, cols: usize) -> Laid {
         } else {
             live.line.clone()
         });
-        if let Some(doing) = live.doing.as_ref().filter(|_| shape.doing[at]) {
-            block.push(doing.clone());
-        }
-        heads.push((blocks.len(), line_at, &live.target));
+        let doing_at = live
+            .doing
+            .as_ref()
+            .filter(|_| shape.doing[at])
+            .map(|doing| {
+                block.push(doing.clone());
+                block.len() - 1
+            });
+        heads.push((blocks.len(), line_at, doing_at, &live.target));
         blocks.push(block);
     }
     let hidden = shape.shown.iter().filter(|shown| !**shown).count();
@@ -995,18 +1007,18 @@ fn assemble(parts: &Parts, shape: &Shape, cols: usize) -> Laid {
     if shape.notes > 0 {
         blocks.push(parts.notes[..shape.notes].to_vec());
     }
-    let mut rows = Vec::new();
-    let mut agents = Vec::new();
+    let (mut rows, mut agents, mut more) = (Vec::new(), Vec::new(), Vec::new());
     for (at, block) in blocks.into_iter().enumerate() {
         if at > 0 && at <= shape.gaps {
             rows.push(Vec::new());
         }
-        if let Some((_, line_at, target)) = heads.iter().find(|(head, _, _)| *head == at) {
+        if let Some((_, line_at, doing_at, target)) = heads.iter().find(|(head, ..)| *head == at) {
             agents.push(((*target).clone(), rows.len() + line_at));
+            more.extend(doing_at.map(|d| (target.id.clone(), rows.len() + d)));
         }
         rows.extend(block);
     }
-    Laid { rows, agents }
+    Laid { rows, agents, more }
 }
 
 /// Drops the next part in S2.1's overflow order: blank lines (the lowest first), the section headings, ended rows
@@ -1128,12 +1140,15 @@ fn lay_focus(
         room
     };
     let kept = lay_kept(&shells, cols, look, room, focus.selected);
-    let members = rest - kept.len();
+    // The main rows take what the members can spare: at most one row in three.
+    let mains = main_targets(board);
+    let spare = (rest - kept.len()) / 3;
+    let mains: Vec<(Row, Option<Target>)> = (mains.into_iter().take(spare))
+        .map(|t| (main_row(&t, cols, look), Some(t)))
+        .collect();
+    let members = rest - kept.len() - mains.len();
     let (mut laid, shown) = if members == 0 {
-        let none = Laid {
-            rows: Vec::new(),
-            agents: Vec::new(),
-        };
+        let none = Laid::default();
         (none, 0)
     } else {
         let size = Size {
@@ -1143,11 +1158,57 @@ fn lay_focus(
         lay_members(board, &notes, size, look, focus)
     };
     fold_kept(&mut laid, kept);
+    fold_kept(&mut laid, mains);
+    if let Some(pane) = focus.shown.filter(|p| !p.is_empty())
+        && let Some(&(_, at)) =
+            (laid.agents.iter()).find(|(t, _)| t.life == pick::MAIN && t.pane == pane)
+    {
+        laid.rows[at][0] = span(if look.ascii { "#" } else { "\u{25cf}" }, PLAIN);
+    }
     for (n, style) in asked.into_iter().take(asked_n) {
         laid.rows
             .push(margin(vec![span(paint::cut(n, cols), style)]));
     }
     (laid, shown + asked_n)
+}
+
+/// Outside a team, the panes the board's agents were spawned from, as main rows: each distinct `parent` that is a pane
+/// id and no agent's own pane (a child's parent is an agent), in the board's order (running agents first), so the
+/// person can go back to the chat that started them, also after every agent ended. A gone pane is refused at focus.
+pub(crate) fn main_targets(board: Option<&Map<String, Value>>) -> Vec<Target> {
+    let Some(rows) = board
+        .filter(|b| !tree::is_team(Some(b)))
+        .and_then(|b| b.get("agents"))
+        .and_then(Value::as_array)
+    else {
+        return Vec::new();
+    };
+    let rows: Vec<&Map<String, Value>> = rows.iter().filter_map(Value::as_object).collect();
+    let own: Vec<String> = rows.iter().map(|r| clean(r.get("pane"))).collect();
+    let mut panes: Vec<String> = Vec::new();
+    for parent in rows.iter().map(|r| clean(r.get("parent"))) {
+        if crate::agents::pane_id(&parent) && !own.contains(&parent) && !panes.contains(&parent) {
+            panes.push(parent);
+        }
+    }
+    panes
+        .iter()
+        .enumerate()
+        .map(|(n, p)| Target::main(p, n))
+        .collect()
+}
+
+/// A main row: the glyph in cyan, then its name in bold.
+fn main_row(target: &Target, cols: usize, look: Look) -> Row {
+    let glyph = if look.ascii { "$" } else { MAIN };
+    margin(cut_row(
+        vec![
+            span(glyph, hued(Color::Cyan)),
+            span(" ", PLAIN),
+            span(target.name.clone(), BOLD),
+        ],
+        cols,
+    ))
 }
 
 /// The board's kept shells as targets, in its order.
@@ -1210,7 +1271,9 @@ fn fold_kept(laid: &mut Laid, kept: Vec<(Row, Option<Target>)>) {
     let headed = !laid.rows.is_empty() && !laid.agents.iter().any(|(_, at)| *at == 0);
     let first = usize::from(headed);
     let n = kept.len();
-    for (_, at) in laid.agents.iter_mut() {
+    for at in
+        (laid.agents.iter_mut().map(|(_, at)| at)).chain(laid.more.iter_mut().map(|(_, at)| at))
+    {
         *at += n;
     }
     let mut targets = Vec::new();
@@ -1229,9 +1292,12 @@ pub(crate) fn clickable(target: &Target) -> bool {
     target.life != pick::KEPT
 }
 
-/// The walk without kept rows: peek and herdr's next and previous act on members only.
+/// The walk without kept and main rows: peek and herdr's next and previous act on members only.
 fn members(targets: &[Target]) -> Vec<Target> {
-    targets.iter().filter(|t| clickable(t)).cloned().collect()
+    (targets.iter())
+        .filter(|t| clickable(t) && t.life != pick::MAIN)
+        .cloned()
+        .collect()
 }
 
 /// Audit 6-10 F1, v6f call 11: the one walk of the keys, for `pick.follow` and `Shown.targets` alike: every kept shell
@@ -1240,9 +1306,13 @@ pub(crate) fn walk_of(board: Option<&Map<String, Value>>, laid: &Laid, team: boo
     let kept = kept_targets(board).into_iter();
     match board.filter(|_| team) {
         Some(b) => kept.chain(tree::walk(b)).collect(),
-        None => kept
-            .chain(laid.agents.iter().map(|(t, _)| t.clone()).filter(clickable))
-            .collect(),
+        // The main rows are drawn first but walked last, so `j` from nothing still starts at the first agent.
+        None => {
+            let drawn = laid.agents.iter().map(|(t, _)| t.clone());
+            let (mains, members): (Vec<_>, Vec<_>) =
+                drawn.filter(clickable).partition(|t| t.life == pick::MAIN);
+            kept.chain(members).chain(mains).collect()
+        }
     }
 }
 
@@ -1274,7 +1344,7 @@ fn lay_members(
         let max = size.width.saturating_sub(1).max(1);
         let laid = Laid {
             rows: vec![cut_row(vec![span("mux-agents", BOLD)], max)],
-            agents: Vec::new(),
+            ..Laid::default()
         };
         return (laid, 0);
     }
@@ -1305,6 +1375,8 @@ fn lay_members(
             laid.rows.truncate(size.height.max(1));
             let kept = laid.rows.len();
             laid.agents.retain(|(_, row)| *row < kept);
+            laid.more.retain(|(_, row)| *row < kept);
+            shown_mark(&mut laid, focus.shown, look);
             return (laid, shape.notes);
         }
     }
@@ -1351,19 +1423,24 @@ fn with_hint(
     hinted(board, notes, size, look, tree::Focus::default())
 }
 
-/// Marks member `id`'s drawn row as selected: its margin becomes `▸` (`>` in ASCII) and, with color, the rest of the
-/// row is reversed. Nothing when `id` is not drawn.
+/// The flat bar's mark on the agent whose pane the session shows, as the team tree draws it: `●` (`#` in ASCII) in
+/// column 0 of that agent's name line. Nothing when the shown pane is no drawn agent's.
+fn shown_mark(laid: &mut Laid, shown: Option<&str>, look: Look) {
+    let Some(pane) = shown.filter(|p| !p.is_empty()) else {
+        return;
+    };
+    if let Some(&(_, at)) = laid.agents.iter().find(|(t, _)| t.pane == pane) {
+        laid.rows[at][0] = span(if look.ascii { "#" } else { "\u{25cf}" }, PLAIN);
+    }
+}
+
+/// Marks member `id`'s drawn row as selected with an indicator, never a highlight: its margin becomes the Nerd Font
+/// chevron `SELECTED` (`>` in ASCII) and the row keeps its own styles. Nothing when `id` is not drawn.
 fn mark(laid: &mut Laid, id: &str, look: Look) {
     let Some(&(_, at)) = laid.agents.iter().find(|(target, _)| target.id == id) else {
         return;
     };
-    let row = &mut laid.rows[at];
-    row[0] = span(if look.ascii { ">" } else { "\u{25b8}" }, PLAIN);
-    if look.color {
-        for (_, style) in &mut row[1..] {
-            style.reverse = true;
-        }
-    }
+    laid.rows[at][0] = span(if look.ascii { ">" } else { SELECTED }, PLAIN);
 }
 
 /// The board as text rows, SGR only when `look.color`; for tests and screenshots.
@@ -2207,6 +2284,9 @@ struct Shown {
 }
 
 fn focus_target_hc(ctx: &Ctx, caller: &Caller, target: &Target) -> Res<Focused> {
+    if target.life == pick::MAIN {
+        return focus_main(ctx, target);
+    }
     let core = crate::hc::connect(ctx)?;
     let drawn = (!target.pane.is_empty()).then_some(target.pane.as_str());
     match crate::agents::view::focus_member(ctx, Some(&core), caller, &target.id, drawn)? {
@@ -2214,6 +2294,36 @@ fn focus_target_hc(ctx: &Ctx, caller: &Caller, target: &Target) -> Res<Focused> 
         _ => refuse(2, "target", "no unique committed member has that identity"),
     }
 }
+/// The main chat's pane, selected only while it is alive (the multiplexer never gives a gone pane's id to another
+/// pane), then read back: that pane, active in the active window, not dead. Anything else refuses `target`.
+fn focus_main(ctx: &Ctx, target: &Target) -> Res<Focused> {
+    let pane = target.pane.as_str();
+    if !crate::agents::pane_id(pane) {
+        return refuse(2, "target", "the main pane is gone");
+    }
+    let select = crate::agents::registry::bound(
+        pane,
+        "#{==:#{pane_dead},0}".into(),
+        format!("select-window -t {pane} ; select-pane -t {pane}"),
+    );
+    let select: Vec<&str> = select.iter().map(String::as_str).collect();
+    let _ = native(ctx, &select, true);
+    let probe = "#{pane_id}|#{window_active}|#{pane_active}|#{pane_dead}";
+    let back = native(ctx, &["display-message", "-p", "-t", pane, probe], true);
+    if !back.is_ok_and(|r| {
+        r.code == 0 && r.stdout.trim_end_matches(['\r', '\n']) == format!("{pane}|1|1|0")
+    }) {
+        return refuse(2, "target", "the main pane is gone");
+    }
+    Ok(Focused {
+        id: target.id.clone(),
+        name: target.name.clone(),
+        pane: pane.into(),
+        window: String::new(),
+        duplicates: 0,
+    })
+}
+
 impl Shown {
     fn focused(&mut self, focused: Focused) {
         for target in &mut self.targets {
@@ -4358,11 +4468,10 @@ mod tests {
             let answer = format!("{width}\n{}\n", lines.join("\n"));
             let hits = drawn(&laid);
             for at in 0..lines.len() {
-                let want = laid
-                    .agents
-                    .iter()
+                let want = (laid.agents.iter().map(|(t, row)| (t.id.as_str(), *row)))
+                    .chain(laid.more.iter().map(|(id, row)| (id.as_str(), *row)))
                     .find(|(_, row)| *row == at)
-                    .map(|(t, _)| t.id.as_str());
+                    .map(|(id, _)| id);
                 let y = u16::try_from(at + 1).unwrap();
                 assert_eq!(
                     pick::frame_hit(&answer, width, y, &hits),
@@ -4371,6 +4480,35 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn a_click_on_an_agents_doing_line_hits_that_agent() {
+        // Two agents doing the same thing: each doing line still hits its own agent, by row.
+        let board = json!({"running": 2, "endedTotal": 1, "agents": [
+            {"name": "first", "state": "running", "doing": "running the tests", "age": 42, "pane": "%1"},
+            {"name": "second", "state": "running", "doing": "running the tests", "age": 50, "pane": "%2"},
+            {"name": "gone", "state": "exited", "exitCode": 0, "age": 1080}]});
+        let laid = lay(board.as_object(), &[], W40, PLAIN_LOOK);
+        let lines: Vec<String> = laid.rows.iter().map(|r| render(r, false)).collect();
+        let answer = format!("40\n{}\n", lines.join("\n"));
+        let hits = drawn(&laid);
+        let hit = |text: &str, nth: usize| {
+            let at = (lines.iter().enumerate())
+                .filter(|(_, l)| l.contains(text))
+                .nth(nth)
+                .map(|(at, _)| at)
+                .unwrap_or_else(|| panic!("{text} in {lines:?}"));
+            pick::frame_hit(&answer, 40, u16::try_from(at + 1).unwrap(), &hits)
+        };
+        assert_eq!(hit("first", 0), Some("first"));
+        assert_eq!(hit("running the tests", 0), Some("first"));
+        assert_eq!(hit("second", 0), Some("second"));
+        assert_eq!(hit("running the tests", 1), Some("second"));
+        // Header, separator and ended rows stay unclickable.
+        assert_eq!(hit("mux-agents", 0), None);
+        assert_eq!(hit("ended", 0), None);
+        assert_eq!(hit("gone", 0), None);
     }
 
     #[test]
@@ -4468,7 +4606,103 @@ mod tests {
     }
 
     #[test]
-    fn selected_row_marks_and_reverses() {
+    fn the_flat_bar_shows_the_main_chat_first_and_walks_to_it_last() {
+        // worker and writer were spawned from %3; an ended agent from %3 and one from %4.
+        let board = json!({"running": 2, "endedTotal": 2, "agents": [
+            {"id": "aaaaaaaaaaaa", "name": "worker", "state": "running", "doing": "testing", "age": 240, "pane": "%1", "parent": "%3"},
+            {"id": "bbbbbbbbbbbb", "name": "writer", "state": "running", "age": 180, "pane": "%2", "parent": "%3"},
+            {"id": "cccccccccccc", "name": "done", "state": "exited", "exitCode": 0, "age": 300, "parent": "%4"},
+            {"id": "dddddddddddd", "name": "nested", "state": "exited", "exitCode": 0, "age": 400, "parent": "%1"}
+        ]});
+        let laid = lay(board.as_object(), &[], W40, PLAIN_LOOK);
+        let text: Vec<String> = laid.rows.iter().map(|r| render(r, false)).collect();
+        // Header, then one row per main pane in the board's order, running agents first (%1 is an agent's own pane,
+        // so no main), then the agents.
+        assert_eq!(text[1], format!(" {MAIN} main"), "{text:?}");
+        assert_eq!(text[2], format!(" {MAIN} main 2"), "{text:?}");
+        assert!(text[4].starts_with(" \u{25c9} worker"), "{text:?}");
+        // The header counts agents only.
+        assert_eq!(text[0], pad("mux-agents", "2 working / 2 ended"));
+        let mains: Vec<(&str, usize)> = (laid.agents.iter())
+            .filter(|(t, _)| t.life == pick::MAIN)
+            .map(|(t, at)| (t.pane.as_str(), *at))
+            .collect();
+        assert_eq!(mains, [("%3", 1), ("%4", 2)]);
+        // A click on a main row hits it; the walk ends with the main rows, so `j` still starts at the first agent.
+        let walk = walk_of(board.as_object(), &laid, false);
+        let names: Vec<&str> = walk.iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(names, ["worker", "writer", "main", "main 2"]);
+        // ASCII draws `$`; the shown mark and the chevron land on a main row as on any other.
+        let ascii = Look {
+            ascii: true,
+            ..PLAIN_LOOK
+        };
+        let rows = lay(board.as_object(), &[], W40, ascii);
+        assert_eq!(render(&rows.rows[1], false), " $ main");
+        let focus = tree::Focus {
+            shown: Some("%3"),
+            selected: None,
+        };
+        let shown = lay_focus(board.as_object(), &[], W40, PLAIN_LOOK, focus).0;
+        assert!(render(&shown.rows[1], false).starts_with('\u{25cf}'));
+        // No parent anywhere, or a team: no main row.
+        let plain = json!({"running": 1, "agents": [{"name": "w", "state": "running", "age": 1, "pane": "%1"}]});
+        assert!(
+            lay(plain.as_object(), &[], W40, PLAIN_LOOK)
+                .agents
+                .iter()
+                .all(|(t, _)| t.life != pick::MAIN)
+        );
+    }
+
+    #[test]
+    fn the_flat_bar_marks_the_agent_on_screen() {
+        let board = json!({"running": 2, "endedTotal": 0, "agents": [
+            {"name": "worker", "state": "running", "doing": "testing", "age": 240, "pane": "%1"},
+            {"name": "writer", "state": "running", "age": 180, "pane": "%2"}
+        ]});
+        let rows = |look: Look, shown: Option<&str>, selected: Option<&str>| {
+            let focus = tree::Focus { shown, selected };
+            let mut laid = lay_focus(board.as_object(), &[], W40, look, focus).0;
+            if let Some(id) = selected {
+                mark(&mut laid, id, look);
+            }
+            laid.rows
+                .iter()
+                .map(|r| render(r, false))
+                .collect::<Vec<_>>()
+        };
+        let bare = rows(PLAIN_LOOK, None, None);
+        let marked = rows(PLAIN_LOOK, Some("%2"), None);
+        // Rows: header, gap, worker, its doing line, gap, writer.
+        let (worker, writer) = (2, 5);
+        assert!(
+            marked[writer].starts_with("\u{25cf}\u{25c9} writer"),
+            "{marked:?}"
+        );
+        for (at, (got, want)) in marked.iter().zip(&bare).enumerate() {
+            if at != writer {
+                assert_eq!(got, want, "{at}");
+            }
+        }
+        let ascii = Look {
+            ascii: true,
+            ..PLAIN_LOOK
+        };
+        assert!(rows(ascii, Some("%2"), None)[writer].starts_with("#* writer"));
+        // A pane that is no drawn agent's (the bar, main, another window) marks nothing.
+        assert_eq!(rows(PLAIN_LOOK, Some("%9"), None), bare);
+        // The selection's chevron replaces the mark on the same row; on another row both show.
+        assert!(rows(PLAIN_LOOK, Some("%2"), Some("writer"))[writer].starts_with('\u{f054}'));
+        let both = rows(PLAIN_LOOK, Some("%2"), Some("worker"));
+        assert!(
+            both[worker].starts_with('\u{f054}') && both[writer].starts_with('\u{25cf}'),
+            "{both:?}"
+        );
+    }
+
+    #[test]
+    fn selected_row_shows_the_chevron_and_never_reverses() {
         let board = json!({"running": 2, "endedTotal": 0, "agents": [
             {"name": "worker", "state": "running", "doing": "testing", "age": 240, "unread": 0, "color": "blue", "activity": "working", "pane": "%1"},
             {"name": "writer", "state": "running", "model": "sonnet", "age": 180, "unread": 2, "color": "magenta", "activity": "working", "pane": "%2"}
@@ -4494,64 +4728,24 @@ mod tests {
         let rows = drawn(PLAIN_LOOK, Some("worker"));
         assert_eq!(
             rows[2],
-            pad("\u{25c9} worker", "working   4m").replacen(' ', "\u{25b8}", 1)
-        );
-        assert!(
-            rows[2].starts_with("\u{25b8}\u{25c9} worker"),
-            "{:?}",
-            rows[2]
+            pad("\u{25c9} worker", "working   4m").replacen(' ', "\u{f054}", 1)
         );
         let rows = drawn(ascii, Some("worker"));
         assert!(rows[2].starts_with(">* worker"), "{:?}", rows[2]);
-        let rows = drawn(color, Some("worker"));
-        let bare = drawn(color, None);
-        assert!(
-            rows[2].starts_with(
-                "\u{25b8}\u{1b}[7;32m\u{25c9}\u{1b}[0m\u{1b}[7m \u{1b}[0m\u{1b}[7;34mworker\u{1b}[0m"
-            ),
-            "{:?}",
-            rows[2]
-        );
-        assert!(
-            rows[2].contains("\u{1b}[7;32mworking\u{1b}[0m"),
-            "{:?}",
-            rows[2]
-        );
-        for (at, (got, want)) in rows.iter().zip(&bare).enumerate() {
-            if at != 2 {
-                assert_eq!(got, want, "{at}");
+        // With color the row keeps its own styles: only column 0 changes, nothing is reversed.
+        for selected in ["worker", "writer"] {
+            let rows = drawn(color, Some(selected));
+            let bare = drawn(color, None);
+            let at = if selected == "worker" { 2 } else { 5 };
+            assert!(rows.iter().all(|r| !r.contains("\u{1b}[7")), "{rows:?}");
+            for (n, (got, want)) in rows.iter().zip(&bare).enumerate() {
+                if n == at {
+                    assert_eq!(got.strip_prefix('\u{f054}'), want.strip_prefix(' '), "{n}");
+                } else {
+                    assert_eq!(got, want, "{n}");
+                }
             }
         }
-        // A later agent: every span after the marker is reversed, its model, badge and age included.
-        let sgr = |codes: &str, text: &str| format!("\u{1b}[{codes}m{text}\u{1b}[0m");
-        let rows = drawn(color, Some("writer"));
-        assert_eq!(
-            rows[5],
-            [
-                "\u{25b8}".to_string(),
-                sgr("7;32", "\u{25c9}"),
-                sgr("7", " "),
-                sgr("7;35", "writer"),
-                sgr("2;7", " [sonnet]"),
-                sgr("7", "  "),
-                sgr("1;7;34", "\u{2709} 2"),
-                sgr("7", "    "),
-                sgr("7;32", "working"),
-                sgr("7", "   3m"),
-            ]
-            .concat()
-        );
-        for (at, (got, want)) in rows.iter().zip(&bare).enumerate() {
-            if at != 5 {
-                assert_eq!(got, want, "{at}");
-            }
-        }
-        let rows = drawn(PLAIN_LOOK, Some("writer"));
-        assert_eq!(
-            rows[5],
-            pad("\u{25c9} writer [sonnet]  \u{2709} 2", "working   3m")
-                .replacen(' ', "\u{25b8}", 1)
-        );
         // An unknown name marks nothing.
         let mut laid = lay(board.as_object(), &[], W40, color);
         let before = laid.rows.clone();
@@ -5304,9 +5498,11 @@ mod tests {
     }
 
     // The watch world's board at 40x24, plain.
+    // The watch world's agents were spawned from %1, so its main row heads the board.
     fn board_rows() -> Vec<String> {
         vec![
             pad("mux-agents", "1 working / 1 ended"),
+            format!(" {MAIN} main"),
             String::new(),
             pad("\u{25c9} worker", "working   4m"),
             "   testing the parser".into(),
@@ -5357,10 +5553,11 @@ mod tests {
         watch_frames(&w, 3);
         let (ended, frames) = watch_run(&w);
         assert_eq!(ended, "pane-closed");
+        // Four rows: the main row stays (the way back to the chat), the doing line goes.
         let short = [
             pad("mux-agents", "1 working / 1 ended"),
+            format!(" {MAIN} main"),
             pad("\u{25c9} worker", "working   4m"),
-            "   testing the parser".to_string(),
             "   +1 more  (list -All)".to_string(),
         ];
         assert_eq!(frames, [board_frame(), screen(&short, 4), board_frame()]);
@@ -5981,7 +6178,7 @@ mod tests {
     // The board with worker selected: the marker in its margin and the hint under the board.
     fn marked_frame() -> String {
         let mut rows = board_rows();
-        rows[2] = rows[2].replacen(' ', "\u{25b8}", 1);
+        rows[3] = rows[3].replacen(' ', "\u{f054}", 1);
         rows.push(String::new());
         rows.push(format!(" {HINT}"));
         screen(&rows, 24)
@@ -6005,7 +6202,7 @@ mod tests {
     #[test]
     fn click_focuses_through_one_read_and_guarded_select() {
         let w = click_world(&["live", "live", "live", "gone"], board_answer());
-        let script = Script::new(&w.fakes, vec![(300, press(3))]);
+        let script = Script::new(&w.fakes, vec![(300, press(4))]);
         watch_frames(&w, 1);
         crate::agents::core_fixture::online(&w);
         watch_frames(&w, 2);
@@ -6039,6 +6236,66 @@ mod tests {
             ]
         );
         assert_eq!((click_reads(&w), selects(&w)), (1, 1));
+    }
+
+    #[test]
+    fn click_on_the_doing_line_focuses_its_agent() {
+        // Row 5 is worker's doing line: the same read and guarded select as its name line.
+        let w = click_world(&["live", "live", "live", "gone"], board_answer());
+        let script = Script::new(&w.fakes, vec![(300, press(5))]);
+        watch_frames(&w, 1);
+        crate::agents::core_fixture::online(&w);
+        watch_frames(&w, 2);
+        let (ended, _, _) = watch_with(&w, Box::new(script));
+        assert_eq!(ended, "pane-closed");
+        assert_eq!((click_reads(&w), selects(&w)), (1, 1));
+    }
+
+    #[test]
+    fn main_row_click_and_enter_focus_the_main_pane() {
+        // Row 2 is the main row (the agents' parent %1): one read, a guarded select of %1, its read-back.
+        let main_select =
+            "-N if-shell -F -t %1 #{==:#{pane_dead},0} select-window -t %1 ; select-pane -t %1";
+        let main_back =
+            "-N display-message -p -t %1 #{pane_id}|#{window_active}|#{pane_active}|#{pane_dead}";
+        let w = click_world(&["live", "live", "live", "gone"], board_answer());
+        w.fakes.mux_first(main_back, 0, "%1|1|1|0\n", "");
+        let script = Script::new(&w.fakes, vec![(300, press(2))]);
+        // The main pane is no member: no hc connection.
+        watch_frames(&w, 3);
+        let (ended, frames, _) = watch_with(&w, Box::new(script));
+        assert_eq!(ended, "pane-closed");
+        let calls = mux_text(&w);
+        let at = calls.iter().position(|c| c == CLICK).expect("a click read");
+        assert_eq!(
+            calls[at + 1..at + 3],
+            [main_select.to_string(), main_back.to_string()]
+        );
+        assert!(frames.iter().all(|f| !f.contains("failed")), "{frames:?}");
+        // `k` from nothing selects the last of the walk, the main row; Enter focuses it.
+        let w = click_world(&["live", "live", "live", "live", "gone"], board_answer());
+        w.fakes.mux_first(main_back, 0, "%1|1|1|0\n", "");
+        let steps = vec![(300, key(b"k")), (100, key(b"\r"))];
+        watch_frames(&w, 4);
+        let (ended, _, _) = watch_with(&w, Box::new(Script::new(&w.fakes, steps)));
+        assert_eq!(ended, "pane-closed");
+        assert!(
+            mux_text(&w).iter().any(|c| c == main_select),
+            "{:?}",
+            mux_text(&w)
+        );
+        // A main pane that is gone: the read-back fails, the bar says so and selects nothing else.
+        let w = click_world(&["live", "live", "live", "gone"], board_answer());
+        w.fakes.mux_first(main_back, 0, "\n", "");
+        let script = Script::new(&w.fakes, vec![(300, press(2))]);
+        // The main pane is no member: no hc connection.
+        watch_frames(&w, 3);
+        let (_, frames, _) = watch_with(&w, Box::new(script));
+        assert!(
+            frames.iter().any(|f| f.contains("focus failed: main")),
+            "{frames:?}"
+        );
+        assert_eq!(selects(&w), 1, "only the guarded select of %1");
     }
 
     // The watch world with running agents writer-two and writer as well as worker.
@@ -6182,12 +6439,12 @@ mod tests {
 
     #[test]
     fn click_elsewhere_does_nothing() {
-        // The header, the doing line and an ended row: each read, none focuses, each redraws at once.
+        // The header, the blank line and an ended row: each read, none focuses, each redraws at once.
         let w = click_world(
             &["live", "live", "live", "live", "live", "gone"],
             board_answer(),
         );
-        let steps = vec![(300, press(1)), (300, press(4)), (300, press(7))];
+        let steps = vec![(300, press(1)), (300, press(3)), (300, press(8))];
         watch_frames(&w, 5);
         let (ended, frames, times) = watch_with(&w, Box::new(Script::new(&w.fakes, steps)));
         assert_eq!((ended, frames.len()), ("pane-closed", 5));
@@ -6211,7 +6468,7 @@ mod tests {
     fn press_near_or_across_a_write_is_dropped() {
         // Read 20 ms after its frame: dropped, but it still redraws at once.
         let w = click_world(&["live", "live", "live", "gone"], board_answer());
-        let script = Script::new(&w.fakes, vec![(20, press(3))]);
+        let script = Script::new(&w.fakes, vec![(20, press(4))]);
         watch_frames(&w, 3);
         let (_, _, times) = watch_with(&w, Box::new(script));
         assert_eq!(diffs(&times), [20, 2000]);
@@ -6225,14 +6482,14 @@ mod tests {
         assert_eq!((click_reads(&w), selects(&w)), (0, 0));
         // 30 ms after the second write: dropped.
         let w = click_world(&["live", "live", "live", "live", "gone"], board_answer());
-        let script = Script::new(&w.fakes, vec![(2030, press(3))]);
+        let script = Script::new(&w.fakes, vec![(2030, press(4))]);
         watch_frames(&w, 4);
         let (_, _, times) = watch_with(&w, Box::new(script));
         assert_eq!(diffs(&times), [2000, 30, 2000]);
         assert_eq!((click_reads(&w), selects(&w)), (0, 0));
         // 100 ms after it: acts.
         let w = click_world(&["live", "live", "live", "live", "gone"], board_answer());
-        let script = Script::new(&w.fakes, vec![(2100, press(3))]);
+        let script = Script::new(&w.fakes, vec![(2100, press(4))]);
         watch_frames(&w, 2);
         crate::agents::core_fixture::online(&w);
         watch_frames(&w, 2);
@@ -6246,14 +6503,14 @@ mod tests {
     #[test]
     fn a_press_read_at_its_frame_is_dropped_and_one_read_after_the_gap_focuses() {
         let w = click_world(&["live", "live", "live", "gone"], board_answer());
-        let script = Script::new(&w.fakes, vec![(0, press(3))]);
+        let script = Script::new(&w.fakes, vec![(0, press(4))]);
         watch_frames(&w, 3);
         let (_, frames, times) = watch_with(&w, Box::new(script));
         assert_eq!(diffs(&times), [0, 2000], "redrawn at once, no tick counted");
         assert_eq!(frames.len(), 3);
         assert_eq!((click_reads(&w), selects(&w)), (0, 0), "dropped: no focus");
         let w = click_world(&["live", "live", "live", "live", "gone"], board_answer());
-        let script = Script::new(&w.fakes, vec![(2060, press(3))]);
+        let script = Script::new(&w.fakes, vec![(2060, press(4))]);
         watch_frames(&w, 2);
         crate::agents::core_fixture::online(&w);
         watch_frames(&w, 2);
@@ -6293,7 +6550,7 @@ mod tests {
     fn stale_press_dismisses_the_note_and_redraws() {
         let w = click_world(&["live", "live", "live", "live", "gone"], board_answer());
         w.fakes.mux_first(READ_BACK, 0, "%9|0|1|1\n", "");
-        let steps = vec![(300, press(3)), (20, press(3))];
+        let steps = vec![(300, press(4)), (20, press(4))];
         watch_frames(&w, 1);
         crate::agents::core_fixture::online(&w);
         watch_frames(&w, 3);
@@ -6356,7 +6613,7 @@ mod tests {
                 "",
             ))
         });
-        let script = Script::new(&w.fakes, vec![(300, press(3))]);
+        let script = Script::new(&w.fakes, vec![(300, press(4))]);
         watch_frames(&w, 1);
         crate::agents::core_fixture::online(&w);
         watch_frames(&w, 2);
@@ -6376,7 +6633,7 @@ mod tests {
     fn read_back_failure_shows_note() {
         let w = click_world(&["live", "live", "live", "gone"], board_answer());
         w.fakes.mux_first(READ_BACK, 1, "", "no server");
-        let script = Script::new(&w.fakes, vec![(300, press(3))]);
+        let script = Script::new(&w.fakes, vec![(300, press(4))]);
         watch_frames(&w, 1);
         crate::agents::core_fixture::online(&w);
         watch_frames(&w, 2);
@@ -6499,14 +6756,14 @@ mod tests {
             "{:?}",
             frames[2]
         );
-        assert!(frames[2].contains("\u{25b8}"), "{:?}", frames[2]);
+        assert!(frames[2].contains("\u{f054}"), "{:?}", frames[2]);
     }
 
     #[test]
     fn note_lasts_to_second_tick_or_next_key() {
         let w = click_world(&["live", "live", "live", "live", "gone"], board_answer());
         w.fakes.mux_first(READ_BACK, 0, "%9|0|1|1\n", "");
-        let script = Script::new(&w.fakes, vec![(300, press(3))]);
+        let script = Script::new(&w.fakes, vec![(300, press(4))]);
         watch_frames(&w, 1);
         crate::agents::core_fixture::online(&w);
         watch_frames(&w, 3);
@@ -6521,7 +6778,7 @@ mod tests {
         let w = click_world(&["live", "live", "live", "gone"], board_answer());
         w.fakes.mux_first(READ_BACK, 0, "%9|0|1|1\n", "");
         let steps = vec![
-            (300, press(3)),
+            (300, press(4)),
             (100, key(b"\x1b[<0;3;3m")),
             (100, key(b"j")),
         ];
@@ -9645,7 +9902,7 @@ mod tests {
         assert!(
             seen.rows
                 .iter()
-                .any(|r| render(r, false).starts_with("\u{25b8}")),
+                .any(|r| render(r, false).starts_with("\u{f054}")),
             "through hinted: {:?}",
             seen.rows.len()
         );

@@ -325,6 +325,16 @@ pub fn keep_bar(ctx: &Ctx, caller: &Caller, record: &Value, reply: &mut Map<Stri
         .unwrap_or(&caller.window)
         .to_string();
     sidebar::keep(ctx, caller, &window, reply);
+    // A view split beside the caller: the bar may have taken its columns from the caller, so the main chat gets its
+    // half back (a no-op when it has it).
+    if let Some(agent) = record["pane"].as_str()
+        && window == caller.window
+        && !caller.pane.is_empty()
+    {
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            super::split::keep_main_half(ctx, caller, agent);
+        }));
+    }
 }
 
 /// The reply's `key: value` lines, then `sidebar <pane>`, `sidebar off` or `sidebar error: <message>`.
@@ -2609,6 +2619,8 @@ mod tests {
                 "#{pane_id}|#{window_id}|#{pane_start_command}",
                 "-t",
                 "%1",
+                "-l",
+                "50%",
             ]
             .map(String::from)
             .to_vec();
@@ -2801,6 +2813,60 @@ mod tests {
                 "{case}"
             );
         }
+    }
+
+    #[test]
+    fn a_split_keeps_main_the_largest_or_opens_a_tab() {
+        // (the caller's window, where the agent opens, the split's target): room → a 50% split of the caller;
+        // a window too narrow for two 60-column halves once the bar is counted → a tab.
+        for (geometry, place) in [
+            ("%1|240|60|240|\n", "h"),
+            ("%1|120|60|120|\n", "tab"),
+            ("%1|x|60|240|\n", "tab"),
+        ] {
+            let w = human();
+            w.fakes
+                .mux_first(crate::agents::split::GEOMETRY, 0, geometry, "");
+            empty_launch(&w);
+            let ok = reply(&run(
+                &w,
+                &["-Client", "claude", "-Task", "hi", "-Split", "h"],
+            ));
+            assert_eq!(ok["placement"], "h", "{geometry}");
+            assert_eq!(opened(&w), place, "{geometry}");
+            if place == "h" {
+                let split = &calls(&w, "split-window")[0];
+                let at = split.iter().position(|a| a == "-l").unwrap();
+                assert_eq!(split[at + 1], "50%");
+            }
+        }
+    }
+
+    #[test]
+    fn a_split_refused_its_size_splits_unsized() {
+        let w = human();
+        empty_launch(&w);
+        w.fakes.mux_script("split-window", |argv| {
+            let sized = argv.iter().any(|a| a == "-l");
+            Ok(Output {
+                code: i32::from(sized),
+                stdout: if sized { "" } else { "%9|@5|hc attach t1\n" }.into(),
+                stderr: if sized {
+                    "invalid split size '50%'\n"
+                } else {
+                    ""
+                }
+                .into(),
+            })
+        });
+        let ok = reply(&run(
+            &w,
+            &["-Client", "claude", "-Task", "hi", "-Split", "h"],
+        ));
+        assert_eq!(ok["placement"], "h");
+        let splits = calls(&w, "split-window");
+        assert_eq!(splits.len(), 2);
+        assert!(!splits[1].iter().any(|a| a == "-l"));
     }
 
     // A human caller whose session keeps its bar: the bar's split answers %13 in the window it targets, run by pid

@@ -7,6 +7,27 @@ use super::keys::Event;
 /// A kept shell's life: the bar asks before it closes one (views-6f).
 pub const KEPT: &str = "kept";
 
+/// The main chat's life: the pane the agents were spawned from, outside a team; it takes keys and clicks, never
+/// peek, stop or `n`/`N`.
+pub const MAIN: &str = "main";
+
+/// A main chat row: its pane is its identity, its name `main`, then `main 2`, `main 3` … in the board's order.
+impl Target {
+    pub fn main(pane: &str, nth: usize) -> Target {
+        Target {
+            id: format!("main:{pane}"),
+            name: if nth == 0 {
+                "main".into()
+            } else {
+                format!("main {}", nth + 1)
+            },
+            pane: pane.into(),
+            life: MAIN.into(),
+            team: String::new(),
+        }
+    }
+}
+
 /// The question Enter asks on a kept row; the next event answers it.
 pub const ASK: &str = "close? y/n";
 
@@ -106,12 +127,12 @@ pub fn frame_hit<'a>(
     (rest.trim_end() == text.trim_end()).then_some(id.as_str())
 }
 
-/// The name on a bar name line: margin (' ', '▸', '>'), a live glyph ('!', '✦', '◉', '◌'), ' ', then the name to
+/// The name on a bar name line: margin (' ', the selection chevron, '>'), a live glyph ('!', '✦', '◉', '◌'), ' ', then the name to
 /// the next space.
 #[cfg(test)]
 pub fn row_hit(line: &str) -> Option<&str> {
     let mut chars = line.chars();
-    let margin = matches!(chars.next()?, ' ' | '\u{25b8}' | '>');
+    let margin = matches!(chars.next()?, ' ' | '\u{f054}' | '>');
     let glyph = matches!(chars.next()?, '!' | '\u{2726}' | '\u{25c9}' | '\u{25cc}');
     if !margin || !glyph || chars.next()? != ' ' {
         return None;

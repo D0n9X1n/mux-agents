@@ -35,12 +35,22 @@ pub fn attach(
         return Err(Refusal::internal("invalid attachment identity"));
     }
     let (directory, name) = (field("directory")?, field("name")?);
+    if !matches!(split, None | Some("h" | "v")) {
+        return Err(Refusal::internal("invalid attachment placement"));
+    }
+    // A split goes where the main chat keeps the most room (`split::plan`); no room, or a window that cannot be read,
+    // opens a tab.
+    let views = split
+        .map(|_| super::split::views(ctx, caller))
+        .unwrap_or_default();
+    let plan = split.and_then(|dir| {
+        let window = super::split::window(ctx, caller, &views)?;
+        super::split::plan(dir, &window)
+    });
     let session = format!("{}:", caller.session);
-    let (mut args, target) = match split {
+    let (mut args, target) = match &plan {
         None => (vec!["new-window"], session.as_str()),
-        Some("h") => (vec!["split-window", "-h"], caller.pane.as_str()),
-        Some("v") => (vec!["split-window", "-v"], caller.pane.as_str()),
-        _ => return Err(Refusal::internal("invalid attachment placement")),
+        Some(p) => (vec!["split-window", p.flag], p.target.as_str()),
     };
     args.extend([
         "-d",
@@ -50,19 +60,35 @@ pub fn attach(
         "-t",
         target,
     ]);
-    if split.is_none() {
+    if plan.is_none() {
         args.extend(["-n", name]);
     }
     // A Unix pane gets the server's environment, not the caller's: the state root reaches the view as it does the
     // bar. Windows panes inherit it and get none.
     let env = super::spawn::pane_env(utf8(&ctx.state_root)?, crate::state::root::HOST);
-    args.extend(env.iter().map(String::as_str));
-    args.extend(["-c", directory, utf8(core.binary())?, "attach", address]);
-    let reply = native(ctx, &args, false)?;
+    let tail: Vec<&str> = (env.iter().map(String::as_str))
+        .chain(["-c", directory, utf8(core.binary())?, "attach", address])
+        .collect();
+    let sized: Vec<&str> = (args.iter().copied())
+        .chain(plan.as_ref().map(|_| ["-l", "50%"]).into_iter().flatten())
+        .chain(tail.iter().copied())
+        .collect();
+    // A multiplexer that refuses the size splits unsized, as the bar does.
+    let reply = match native(ctx, &sized, true)? {
+        r if r.code == 0 => r,
+        r if plan.is_some() && crate::sidebar::size_refusal(&r) => {
+            let plain: Vec<&str> = args.iter().copied().chain(tail.iter().copied()).collect();
+            native(ctx, &plain, false)?
+        }
+        _ => return crate::mux::call_failed(ctx),
+    };
     let view = created_pane(&reply.stdout)
         .filter(|v| !v.command.is_empty())
         .ok_or_else(|| Refusal::internal("unproven new view"))?;
     *pane = Some(view.clone());
+    if let Some(plan) = &plan {
+        super::split::even_out(ctx, plan, &views);
+    }
     decorate(ctx, caller, record, &view)?;
     let proof = format!("#{{pane_id}}|{}", launch(&view).launched());
     let read = native(

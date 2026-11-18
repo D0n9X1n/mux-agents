@@ -396,7 +396,7 @@ impl Team {
     fn emit(&self, cut: &Cut) -> Laid {
         let mut laid = Laid {
             rows: vec![self.header.clone()],
-            agents: Vec::new(),
+            ..Laid::default()
         };
         if cut.gap {
             laid.rows.push(Row::new());
@@ -416,6 +416,7 @@ impl Team {
         laid.agents.push((m.target.clone(), laid.rows.len()));
         laid.rows.push(m.line.clone());
         if let Some(d) = m.doing.as_ref().filter(|_| cut.doing[at]) {
+            laid.more.push((m.target.id.clone(), laid.rows.len()));
             laid.rows.push(d.clone());
         }
         let (mut ended, mut more) = (0, 0);
@@ -485,7 +486,7 @@ impl Team {
         Some((
             Laid {
                 rows,
-                agents: Vec::new(),
+                ..Laid::default()
             },
             0,
         ))
@@ -590,10 +591,7 @@ impl Team {
         leader: Option<usize>,
         ascii: bool,
     ) -> Laid {
-        let mut laid = Laid {
-            rows: Vec::new(),
-            agents: Vec::new(),
-        };
+        let mut laid = Laid::default();
         let Some(f) = focus.or(leader).or(self.roots.first().copied()) else {
             laid.rows.push(self.header.clone());
             return laid;
@@ -1079,7 +1077,7 @@ pub(super) mod tests {
         .0;
         mark(&mut sel, "G", look);
         assert!(
-            render(&sel.rows[5], false).starts_with("\u{25b8}")
+            render(&sel.rows[5], false).starts_with("\u{f054}")
                 && draw(&board, 60, 24, look, shown)[5].starts_with("\u{25cf}")
         );
         // B1/B3: an ended leader still heads its child; a missing parent and a self-loop draw at depth 1 with `^`.
@@ -1478,11 +1476,11 @@ pub(super) mod tests {
             let answer = format!("40\n{}\n", lines.join("\n"));
             let hits = crate::sidebar::drawn(&laid);
             for (at, line) in lines.iter().enumerate() {
-                let want = laid
-                    .agents
-                    .iter()
+                // A member's name line and its doing line open it; folds open nothing.
+                let want = (laid.agents.iter().map(|(t, r)| (t.id.as_str(), *r)))
+                    .chain(laid.more.iter().map(|(id, r)| (id.as_str(), *r)))
                     .find(|(_, r)| *r == at)
-                    .map(|(t, _)| t.id.as_str());
+                    .map(|(id, _)| id);
                 let got = crate::sidebar::pick::frame_hit(
                     &answer,
                     40,
@@ -1490,10 +1488,14 @@ pub(super) mod tests {
                     &hits,
                 );
                 assert_eq!(got, want, "{height} {at}: {}", line);
-                assert!(
-                    got.is_none() || !(line.contains('+') || line.contains("twin plan")),
-                    "folds and doing lines open nothing"
-                );
+                assert!(got.is_none() || !line.contains('+'), "folds open nothing");
+                if line.contains("twin plan") {
+                    assert_eq!(
+                        got,
+                        Some(laid.agents[0].0.id.as_str()),
+                        "the doing line opens its member"
+                    );
+                }
             }
             if height == 24 {
                 assert!(

@@ -96,6 +96,9 @@ fn focus_uses_current_caller() {
         w.panes(&[]);
         w.launches_hold();
         w.fakes.mux_rule("@mux-agents-placement", code, stored, "");
+        // The current caller %7 has room for a split view.
+        w.fakes
+            .mux_first(crate::agents::split::GEOMETRY, 0, "%7|240|60|240|\n", "");
         w.fakes
             .mux_rule(verb, 0, "%19|@8|hc attach taaaaaaaaaaaa\n", "");
         w.fakes.mux_rule("#{window_active}", 0, "%19|1|1|1\n", "");

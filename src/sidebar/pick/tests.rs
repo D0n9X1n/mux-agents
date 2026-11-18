@@ -20,14 +20,14 @@ fn row_hit_on_captured_lines() {
     for (line, name) in [
         (" \u{25c9} worker      working   4m", "worker"),
         (
-            "\u{25b8}\u{25cc} test-calc  \u{2709} 1  waiting  3m",
+            "\u{f054}\u{25cc} test-calc  \u{2709} 1  waiting  3m",
             "test-calc",
         ),
         (">\u{25c9} worker", "worker"),
         (" \u{25c9} work...", "work..."),
         (" ! fix-ci       needs you  12s", "fix-ci"),
         (
-            "\u{25b8}\u{2726} test-calc  \u{2709} 1  done  30s",
+            "\u{f054}\u{2726} test-calc  \u{2709} 1  done  30s",
             "test-calc",
         ),
         (" \u{25cc} idler        idle   3m", "idler"),
@@ -270,7 +270,7 @@ fn frame_hit_needs_the_width_the_row_and_its_text() {
         ("aaaaaaaaaaaa".to_string(), 1, line.clone()),
         ("bbbbbbbbbbbb".to_string(), 2, line.clone()),
     ];
-    let screen = format!(" mux-agents\n\u{25cf}{line}\n\u{25b8}{line}\n   twin is doing it\n");
+    let screen = format!(" mux-agents\n\u{25cf}{line}\n\u{f054}{line}\n   twin is doing it\n");
     let answer = format!("40\n{screen}");
     assert_eq!(frame_hit(&answer, 40, 2, &drawn), Some("aaaaaaaaaaaa"));
     assert_eq!(
