@@ -90,10 +90,14 @@ pub fn focus(ctx: &Ctx, request: &Request) -> Res<Map<String, Value>> {
     };
     let core = crate::hc::connect(ctx)?;
     let focused = focus_hc(ctx, &core, &caller, &name, None)?;
-    let window = focused.window.clone();
+    let (window, pane) = (focused.window.clone(), focused.pane.clone());
     let mut reply = focus_reply(focused);
     // The view is focused and the member lock released: the bar of its window is best effort and never fails focus.
     crate::sidebar::keep(ctx, &caller, &window, &mut reply);
+    // A view reopened beside the caller: the main chat gets its half back from a bar that opened after it.
+    if window == caller.window && !caller.pane.is_empty() {
+        super::split::keep_main_half(ctx, &caller, &pane);
+    }
     Ok(reply)
 }
 

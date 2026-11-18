@@ -40,12 +40,14 @@ pub fn attach(
     }
     // A split goes where the main chat keeps the most room (`split::plan`); no room, or a window that cannot be read,
     // opens a tab.
-    let views = split
-        .map(|_| super::split::views(ctx, caller))
-        .unwrap_or_default();
-    let plan = split.and_then(|dir| {
-        let window = super::split::window(ctx, caller, &views)?;
-        super::split::plan(dir, &window)
+    let views = split.and_then(|_| super::split::views(ctx, caller));
+    let plan = split.zip(views.as_ref()).and_then(|(dir, views)| {
+        let panes: Vec<String> = views.iter().map(|v| v.pane.clone()).collect();
+        let window = super::split::window(ctx, caller, &panes)?;
+        let plan = super::split::plan(dir, &window)?;
+        // An agent view is split only while it is still that view's launch; the caller's own pane is the caller.
+        (plan.target == caller.pane || super::split::still(ctx, &plan.target, views))
+            .then_some(plan)
     });
     let session = format!("{}:", caller.session);
     let (mut args, target) = match &plan {
@@ -86,8 +88,10 @@ pub fn attach(
         .filter(|v| !v.command.is_empty())
         .ok_or_else(|| Refusal::internal("unproven new view"))?;
     *pane = Some(view.clone());
-    if let Some(plan) = &plan {
-        super::split::even_out(ctx, plan, &views);
+    if let (Some(plan), Some(views), Some(dir)) = (&plan, &views, split)
+        && plan.even
+    {
+        super::split::even_out(ctx, caller, dir, views, (&view.pane, &view.command));
     }
     decorate(ctx, caller, record, &view)?;
     let proof = format!("#{{pane_id}}|{}", launch(&view).launched());

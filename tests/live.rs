@@ -2315,6 +2315,54 @@ hc {}:
         assert!(hi - lo <= 1, "{mux:?} uneven column {views:?}");
     }
 
+    // `v` mirrors `h`: main keeps the top half, three views share the row below it evenly, a fourth is a tab. A view
+    // dragged to a sliver is never the one split.
+    fn split_v_agents_share_the_row_and_skip_a_sliver(mux: Mux) {
+        let Some(mut live) = Live::human(mux) else {
+            return;
+        };
+        let root = live.server.pane().to_string();
+        live.call(&["resize-window", "-t", &root, "-x", "400", "-y", "60"]);
+        let (code, set) = live.run_in(&root, &["placement", "v"]);
+        assert_eq!(code, 0, "{mux:?} {set}");
+        let spawn = |live: &mut Live, name: &str| -> (String, String) {
+            let args = live.spawn_args("claude", name, &[]);
+            let args: Vec<&str> = args.iter().map(String::as_str).collect();
+            let (code, spawned) = live.run_in(&root, &args);
+            assert_eq!(code, 0, "{mux:?} {spawned}");
+            (
+                s(&spawned["pane"]).to_string(),
+                s(&spawned["window"]).to_string(),
+            )
+        };
+        let first = spawn(&mut live, "v0");
+        let second = spawn(&mut live, "v1");
+        // The person drags the second view to a sliver; the third splits the first instead, then all three even out.
+        live.call(&["resize-pane", "-t", &second.0, "-x", "2"]);
+        let third = spawn(&mut live, "v2");
+        let fourth = spawn(&mut live, "v3");
+        let main_window = live.call(&["display-message", "-p", "-t", &root, "#{window_id}"]);
+        for (pane, window) in [&first, &second, &third] {
+            assert_eq!(window, main_window.trim(), "{mux:?} {pane}");
+        }
+        assert_ne!(
+            fourth.1,
+            main_window.trim(),
+            "{mux:?}: the fourth opens as a tab"
+        );
+        let height = |pane: &str| live.num::<u32>(pane, "#{pane_height}");
+        let widths: Vec<u32> = [&first, &second, &third]
+            .iter()
+            .map(|(p, _)| live.num::<u32>(p, "#{pane_width}"))
+            .collect();
+        assert!(
+            height(&root) + 1 >= height(&first.0),
+            "{mux:?}: main keeps the top half"
+        );
+        let (lo, hi) = (*widths.iter().min().unwrap(), *widths.iter().max().unwrap());
+        assert!(hi - lo <= 1, "{mux:?} uneven row {widths:?}");
+    }
+
     /// `args`, then `select-pane -t <focus>` and the bar's `<at right>|<at top>|<at bottom>`, as one command list,
     /// so no tick of the watch runs in between. Answers the list's output lines; the last is the bar's place.
     fn damage(live: &Live, bar: &str, args: &[&str], focus: &str) -> Vec<String> {
@@ -6220,6 +6268,7 @@ hc {}:
                     sidebar_opens_at_bar_width_and_closes,
                     bar_opens_at_right_edge_from_any_pane,
                     split_agents_keep_main_half_then_tab,
+                    split_v_agents_share_the_row_and_skip_a_sliver,
                     bar_repaired_after_a_split_right_of_it,
                     bar_repair_keeps_focus,
                     bar_drag_kept_until_the_window_resizes,

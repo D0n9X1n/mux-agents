@@ -331,9 +331,7 @@ pub fn keep_bar(ctx: &Ctx, caller: &Caller, record: &Value, reply: &mut Map<Stri
         && window == caller.window
         && !caller.pane.is_empty()
     {
-        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            super::split::keep_main_half(ctx, caller, agent);
-        }));
+        super::split::keep_main_half(ctx, caller, agent);
     }
 }
 
@@ -2820,9 +2818,9 @@ mod tests {
         // (the caller's window, where the agent opens, the split's target): room → a 50% split of the caller;
         // a window too narrow for two 60-column halves once the bar is counted → a tab.
         for (geometry, place) in [
-            ("%1|240|60|240|\n", "h"),
-            ("%1|120|60|120|\n", "tab"),
-            ("%1|x|60|240|\n", "tab"),
+            ("%1|240|60|240|||\n", "h"),
+            ("%1|120|60|120|||\n", "tab"),
+            ("%1|x|60|240|||\n", "tab"),
         ] {
             let w = human();
             w.fakes

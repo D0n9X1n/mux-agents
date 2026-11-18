@@ -66,7 +66,8 @@
 -N list-panes -s -t $3 -F <marker>#{pane_id}<marker>#{window_id}<marker>#{pane_pid}<marker>#{pane_dead}<marker>#{pane_start_command}<marker>#{@agent-id}<marker>#{@agent-name}<marker>
 -N list-panes -s -t $3 -F <marker>#{pane_id}<marker>#{window_id}<marker>#{pane_pid}<marker>#{pane_dead}<marker>#{pane_start_command}<marker>#{@agent-id}<marker>#{@agent-name}<marker>
 -N list-panes -s -t $3 -F <marker>#{pane_id}<marker>#{window_id}<marker>#{pane_pid}<marker>#{pane_dead}<marker>#{pane_start_command}<marker>#{@agent-id}<marker>#{@agent-name}<marker>
--N list-panes -t %1 -F #{pane_id}|#{pane_width}|#{pane_height}|#{window_width}|#{@agent-role}
+-N list-panes -t %1 -F #{pane_id}|#{pane_width}|#{pane_height}|#{window_width}|#{s/[|\n\r]/x/:@mux-agents-sidebar-min}|#{s/[|\n\r]/x/:@mux-agents-sidebar-percent}|#{@agent-role}
+-N show-options -qv -t $3 @mux-agents-sidebar
 -N split-window -v -d -P -F #{pane_id}|#{window_id}|#{pane_start_command} -t %1 -l 50% -e MUX_AGENTS_STATE=<state> -c <cwd> <hc> attach t1
 -N if-shell -F -t %12 '#{==:#{pane_start_command},hc attach t1}' 'set-option -p -t %12 @agent-id <id> ; set-option -p -t %12 @agent-name helper ; set-option -p -t %12 @agent-parent %1 ; set-option -p -t %12 @agent-context brief:human'
 -N if-shell -F -t %12 '#{==:#{pane_start_command},hc attach t1}' 'select-pane -T helper -t %12'
@@ -103,7 +104,8 @@
 # the stored placement: a split beside the caller, as -Split h
 -N list-panes -s -t $3 -F <marker>#{pane_id}<marker>#{window_id}<marker>#{pane_pid}<marker>#{pane_dead}<marker>#{pane_start_command}<marker>#{@agent-id}<marker>#{@agent-name}<marker>
 -N list-panes -s -t $3 -F <marker>#{pane_id}<marker>#{window_id}<marker>#{pane_pid}<marker>#{pane_dead}<marker>#{pane_start_command}<marker>#{@agent-id}<marker>#{@agent-name}<marker>
--N list-panes -t %1 -F #{pane_id}|#{pane_width}|#{pane_height}|#{window_width}|#{@agent-role}
+-N list-panes -t %1 -F #{pane_id}|#{pane_width}|#{pane_height}|#{window_width}|#{s/[|\n\r]/x/:@mux-agents-sidebar-min}|#{s/[|\n\r]/x/:@mux-agents-sidebar-percent}|#{@agent-role}
+-N show-options -qv -t $3 @mux-agents-sidebar
 -N split-window -h -d -P -F #{pane_id}|#{window_id}|#{pane_start_command} -t %1 -l 50% -e MUX_AGENTS_STATE=<state> -c <cwd> <hc> attach t1
 -N if-shell -F -t %12 '#{==:#{pane_start_command},hc attach t1}' 'set-option -p -t %12 @agent-id <id> ; set-option -p -t %12 @agent-name hi ; set-option -p -t %12 @agent-parent %1 ; set-option -p -t %12 @agent-context brief:human'
 -N if-shell -F -t %12 '#{==:#{pane_start_command},hc attach t1}' 'select-pane -T hi -t %12'

@@ -415,6 +415,11 @@ const SCOPE_READS_ALLOWED: &[(&str, &str, &str)] = &[
         "a session option of the shown session",
     ),
     (
+        "src/agents/split.rs",
+        "window",
+        "a session option of the shown session (the bar closed)",
+    ),
+    (
         "src/agents/placement.rs",
         "choose",
         "the shown session's windows",

@@ -316,7 +316,7 @@ pub(crate) mod fixture {
                 "",
             );
             // The caller's window: %1 alone, 240x60, room for a split view.
-            fakes.mux_rule(crate::agents::split::GEOMETRY, 0, "%1|240|60|240|\n", "");
+            fakes.mux_rule(crate::agents::split::GEOMETRY, 0, "%1|240|60|240|||\n", "");
             let mut ctx = fakes.ctx();
             ctx.env = Env::from_pairs([
                 ("TMUX", format!("{},{SERVER},0", socket())),

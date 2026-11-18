@@ -1530,7 +1530,8 @@ mod tests {
         );
         let w = spawn_world();
         w.fakes.mux_first("@mux-agents-placement", 0, "h\n", "");
-        w.fakes.mux_first("@mux-agents-sidebar", 0, "off\n", "");
+        w.fakes
+            .mux_first("show-options -qv -t $3 @mux-agents-sidebar", 0, "off\n", "");
         record(
             &w,
             "spawn -Client claude -Task hi, placement h, side bar off",

@@ -1140,9 +1140,9 @@ fn lay_focus(
         room
     };
     let kept = lay_kept(&shells, cols, look, room, focus.selected);
-    // The main rows take what the members can spare: at most one row in three.
+    // The main rows take what the members can spare, leaving them at least 3 rows.
     let mains = main_targets(board);
-    let spare = (rest - kept.len()) / 3;
+    let spare = (rest - kept.len()).saturating_sub(3);
     let mains: Vec<(Row, Option<Target>)> = (mains.into_iter().take(spare))
         .map(|t| (main_row(&t, cols, look), Some(t)))
         .collect();
@@ -1173,8 +1173,9 @@ fn lay_focus(
 }
 
 /// Outside a team, the panes the board's agents were spawned from, as main rows: each distinct `parent` that is a pane
-/// id and no agent's own pane (a child's parent is an agent), in the board's order (running agents first), so the
-/// person can go back to the chat that started them, also after every agent ended. A gone pane is refused at focus.
+/// id and no agent's own pane (a child's parent is an agent), so the person can go back to the chat that started them,
+/// also after every agent ended. Numbered by the oldest agent each started (ties: the board's order), so `main` keeps
+/// its name while the agents' activity reorders the board. A gone pane is refused at focus.
 pub(crate) fn main_targets(board: Option<&Map<String, Value>>) -> Vec<Target> {
     let Some(rows) = board
         .filter(|b| !tree::is_team(Some(b)))
@@ -1185,16 +1186,24 @@ pub(crate) fn main_targets(board: Option<&Map<String, Value>>) -> Vec<Target> {
     };
     let rows: Vec<&Map<String, Value>> = rows.iter().filter_map(Value::as_object).collect();
     let own: Vec<String> = rows.iter().map(|r| clean(r.get("pane"))).collect();
-    let mut panes: Vec<String> = Vec::new();
-    for parent in rows.iter().map(|r| clean(r.get("parent"))) {
-        if crate::agents::pane_id(&parent) && !own.contains(&parent) && !panes.contains(&parent) {
-            panes.push(parent);
+    // Each main pane with the age of its oldest agent.
+    let mut panes: Vec<(String, i64)> = Vec::new();
+    for row in &rows {
+        let parent = clean(row.get("parent"));
+        if !crate::agents::pane_id(&parent) || own.contains(&parent) {
+            continue;
+        }
+        let age = row.get("age").and_then(Value::as_i64).unwrap_or(0);
+        match panes.iter_mut().find(|(p, _)| *p == parent) {
+            Some((_, oldest)) => *oldest = (*oldest).max(age),
+            None => panes.push((parent, age)),
         }
     }
+    panes.sort_by_key(|(_, age)| std::cmp::Reverse(*age));
     panes
         .iter()
         .enumerate()
-        .map(|(n, p)| Target::main(p, n))
+        .map(|(n, (p, _))| Target::main(p, n))
         .collect()
 }
 
@@ -4616,8 +4625,8 @@ mod tests {
         ]});
         let laid = lay(board.as_object(), &[], W40, PLAIN_LOOK);
         let text: Vec<String> = laid.rows.iter().map(|r| render(r, false)).collect();
-        // Header, then one row per main pane in the board's order, running agents first (%1 is an agent's own pane,
-        // so no main), then the agents.
+        // Header, then one row per main pane, the one whose oldest agent is oldest first (%4's `done`, 300 s, before
+        // %3's `worker`, 240 s; %1 is an agent's own pane, so no main), then the agents.
         assert_eq!(text[1], format!(" {MAIN} main"), "{text:?}");
         assert_eq!(text[2], format!(" {MAIN} main 2"), "{text:?}");
         assert!(text[4].starts_with(" \u{25c9} worker"), "{text:?}");
@@ -4627,7 +4636,7 @@ mod tests {
             .filter(|(t, _)| t.life == pick::MAIN)
             .map(|(t, at)| (t.pane.as_str(), *at))
             .collect();
-        assert_eq!(mains, [("%3", 1), ("%4", 2)]);
+        assert_eq!(mains, [("%4", 1), ("%3", 2)]);
         // A click on a main row hits it; the walk ends with the main rows, so `j` still starts at the first agent.
         let walk = walk_of(board.as_object(), &laid, false);
         let names: Vec<&str> = walk.iter().map(|t| t.name.as_str()).collect();
@@ -4644,7 +4653,9 @@ mod tests {
             selected: None,
         };
         let shown = lay_focus(board.as_object(), &[], W40, PLAIN_LOOK, focus).0;
-        assert!(render(&shown.rows[1], false).starts_with('\u{25cf}'));
+        // %3 is `main 2`, row 2.
+        assert!(render(&shown.rows[2], false).starts_with('\u{25cf}'));
+        assert!(render(&shown.rows[1], false).starts_with(' '));
         // No parent anywhere, or a team: no main row.
         let plain = json!({"running": 1, "agents": [{"name": "w", "state": "running", "age": 1, "pane": "%1"}]});
         assert!(
@@ -4652,6 +4663,74 @@ mod tests {
                 .agents
                 .iter()
                 .all(|(t, _)| t.life != pick::MAIN)
+        );
+    }
+
+    #[test]
+    fn next_and_peek_act_on_agents_only_never_main() {
+        let board = json!({"running": 2, "agents": [
+            {"id": "aaaaaaaaaaaa", "name": "worker", "state": "running", "age": 240, "pane": "%1", "parent": "%3"},
+            {"id": "bbbbbbbbbbbb", "name": "writer", "state": "running", "age": 180, "pane": "%2", "parent": "%3"}
+        ]});
+        let laid = lay(board.as_object(), &[], W40, PLAIN_LOOK);
+        let walk = walk_of(board.as_object(), &laid, false);
+        assert_eq!(walk.last().map(|t| t.life.as_str()), Some(pick::MAIN));
+        let agents = members(&walk);
+        // From the last agent `n` wraps to the first agent; from the main pane it starts at the first agent.
+        let next = |looking: &str| pick::step(&agents, Some(looking), true).map(|t| t.name.clone());
+        assert_eq!(next("%2").as_deref(), Some("worker"));
+        assert_eq!(next("%3").as_deref(), Some("worker"));
+        assert!(agents.iter().all(|t| t.life != pick::MAIN));
+        // The main row selected: peek's walk has no main, so the selection is no agent to peek.
+        let mut pick = Pick::default();
+        pick.select(&walk, walk.len() - 1);
+        assert_eq!(pick.chosen(&agents), None);
+    }
+
+    #[test]
+    fn main_rows_outlive_their_agents_and_never_name_an_agents_pane() {
+        // Every agent ended: their chat is still the way back. `nested` was spawned from `done`'s pane %5 (an agent
+        // pane, even though it ended), so %5 is no main.
+        let ended = json!({"running": 0, "endedTotal": 2, "agents": [
+            {"id": "aaaaaaaaaaaa", "name": "done", "state": "exited", "exitCode": 0, "age": 300, "pane": "%5", "parent": "%3"},
+            {"id": "bbbbbbbbbbbb", "name": "nested", "state": "exited", "exitCode": 0, "age": 200, "pane": "%6", "parent": "%5"}
+        ]});
+        let mains: Vec<String> = main_targets(ended.as_object())
+            .into_iter()
+            .map(|t| t.pane)
+            .collect();
+        assert_eq!(mains, ["%3"]);
+        let laid = lay(ended.as_object(), &[], W40, PLAIN_LOOK);
+        assert_eq!(render(&laid.rows[1], false), format!(" {MAIN} main"));
+        // A team's bar has its leader instead.
+        let team = json!({"team": true, "agents": [{"id": "L", "name": "lead", "state": "running", "leader": true, "parent": "%3"}]});
+        assert!(main_targets(team.as_object()).is_empty());
+        // Many chats in a short bar: the agents keep 3 rows, the main rows take the rest.
+        let many = json!({"running": 4, "agents": (1..=4).map(|n| json!({"id": format!("{n:0>12}"), "name": format!("w{n}"),
+            "state": "running", "age": n, "pane": format!("%{}", n + 10), "parent": format!("%{n}")})).collect::<Vec<_>>()});
+        let short = lay(
+            many.as_object(),
+            &[],
+            Size {
+                width: 40,
+                height: 10,
+            },
+            PLAIN_LOOK,
+        );
+        let shown = short
+            .agents
+            .iter()
+            .filter(|(t, _)| t.life == pick::MAIN)
+            .count();
+        assert_eq!(
+            shown,
+            4,
+            "{:?}",
+            short
+                .rows
+                .iter()
+                .map(|r| render(r, false))
+                .collect::<Vec<_>>()
         );
     }
 
