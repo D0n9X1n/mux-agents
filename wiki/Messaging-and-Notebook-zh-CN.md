@@ -56,9 +56,9 @@ flowchart LR
 
 - 名字必须是本团队中运行中且已提交的成员；其他名字以 `no agent of this team has that name` 被拒绝。
 - 人员发往 `parent` 会以 `only an agent has a parent` 被拒绝。
-- 一个被成员记录认领、但其成员无法证明的窗格以 `tagged` 被拒绝；它绝不回退到旧路径。
+- 一个被成员记录认领、但其成员无法证明的窗格以 `tagged` 被拒绝；它绝不回退到窗格邮箱路径。
 
-有两种情况仍走 0.2 路径（`src/agents/message.rs` 中的 `send_legacy`）：不是团队成员的代理窗格，以及人员指定了团队中没有的名字。该路径没有意图记录也没有回复，所以 `-Id` 和 `-Re` 在那里以 `-Id and -Re work only inside a team` 被拒绝。
+有两种情况走团队之外代理的窗格邮箱路径（`src/agents/message.rs` 中的 `send_legacy`）：不是团队成员的代理窗格，以及人员指定了团队中没有的名字。该路径没有意图记录也没有回复，所以 `-Id` 和 `-Re` 在那里以 `-Id and -Re work only inside a team` 被拒绝。
 
 `peek <name>` 显示成员存活窗格的最后几行（默认 60 行，`-Lines <n>` 最多 2000 行）。只有团队的人员或该成员的祖先可以查看，不会向窗格打字，焦点也不会移动。
 
@@ -231,7 +231,7 @@ Copilot 的钩子不带邮件。每一轮开始时，Copilot 成员运行 `read 
 | `<root>/<key>` 下的路径 | 内容 |
 |---|---|
 | `mail/<mailbox>.jsonl` | 邮箱：每个以 LF 结尾的行是一条 JSON 消息 |
-| `mail/<mailbox>.cursor.json` | 回执游标；旧的 `<mailbox>.offset` 在下次提交时迁移 |
+| `mail/<mailbox>.cursor.json` | 回执游标；旁边的 `<mailbox>.offset` 文件在下次提交时迁移到其中 |
 | `teams/<sha16>/sends/<sender>/<id>.json` | 一个发送意图：收件人、正文哈希、跳数、群发对象、`done` |
 | `teams/<sha16>/notes/notebook.jsonl` | 笔记本日志：每行一个条目 |
 | `teams/<sha16>/notes/notebook.state.json` | `{durable, uncertain}`：确知日志已在磁盘上的程度 |

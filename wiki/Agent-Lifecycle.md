@@ -34,7 +34,7 @@ A member lives at `<root>/<serverKey>/agents/<id>` (`<id>` is 12 hex characters)
 | `gens/<n>.claim` | who took generation `n`: `run` or `abandoned` |
 | `gens/<n>/*.json` | the evidence of generation `n` |
 
-A record without `lifecycle: 1` was made by an older build (a pre-lifecycle member): it is listed and can be stopped, but is never resumed, cascaded or restored (`src/agents/prelife.rs`). Every reader goes through one walk from the state root (`gens::walk`): a link, a junction or a torn file on the way is `evidence`, never a guess.
+A record without `lifecycle: 1` is a pre-lifecycle member: it is listed and can be stopped, but is never resumed, cascaded or restored (`src/agents/prelife.rs`). Every reader goes through one walk from the state root (`gens::walk`): a link, a junction or a torn file on the way is `evidence`, never a guess.
 
 ### Generations and their evidence
 

@@ -34,7 +34,7 @@ stateDiagram-v2
 | `gens/<n>.claim` | 谁取得了代次 `n`：`run` 或 `abandoned` |
 | `gens/<n>/*.json` | 代次 `n` 的证据 |
 
-没有 `lifecycle: 1` 的记录由旧版本创建（生命周期之前的成员）：它会被列出并可停止，但永远不会被恢复运行、级联或还原（`src/agents/prelife.rs`）。每个读取者都从状态根目录经同一条路径遍历（`gens::walk`）：途中遇到链接、连接点或残缺文件即为 `evidence`，绝不猜测。
+没有 `lifecycle: 1` 的记录是生命周期之前的成员：它会被列出并可停止，但永远不会被恢复运行、级联或还原（`src/agents/prelife.rs`）。每个读取者都从状态根目录经同一条路径遍历（`gens::walk`）：途中遇到链接、连接点或残缺文件即为 `evidence`，绝不猜测。
 
 ### 代次及其证据
 

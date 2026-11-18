@@ -150,15 +150,15 @@ mux-agent kept -Close <address>
 
 `kept` 列出它们，带有 `address`、`name` 和 `team`；`-Close <address>` 关闭其中一个，且只在 hc 仍显示它打开并由本团队保留时。关闭的 shell 永远不会回来。在侧边栏中，选中它，按 Enter，然后按 `y`。`kept` 由你运行：成员会以 `tagged` 被拒绝，错误的地址以 `target` 拒绝（"no such kept shell"、"the shell has already finished"、"that shell is not a kept shell of this team"）。
 
-## 从 0.2.x 窗格升级
+## 拒绝启动的窗格
 
-由 0.2.x 启动且尚未启动客户端的窗格无法在 0.3 下启动：它会打印 "this pane was started by an older mux-agent and cannot launch"。结束它，然后启动一个新智能体：
+由 0.2.x 启动且尚未启动客户端的窗格会拒绝启动：它会打印 "this pane was started by an older mux-agent and cannot launch"。结束它，然后启动一个新智能体：
 
 ```text
 mux-agent stop <name>
 ```
 
-在 0.3.0 之前创建、仍占着团队名额的成员会在 `limit` 拒绝中被点名：它的 shell 已丢失或已结束时，`stop <name>` 释放名额；它在运行时则停止它。当文件夹的团队有旧版本的领导者时，`up` 以 `leader` 拒绝（"the team has a leader from an earlier version"）；停止它，然后再次运行 `up`。
+记录中没有 `lifecycle: 1`、仍占着团队名额的成员会在 `limit` 拒绝中被点名：它的 shell 已丢失或已结束时，`stop <name>` 释放名额；它在运行时则停止它。当文件夹的团队领导者没有生命周期记录时，`up` 以 `leader` 拒绝（"the team has a leader from an earlier version"）；停止它，然后再次运行 `up`。
 
 ## 拒绝与修复
 
@@ -176,7 +176,7 @@ mux-agent stop <name>
 | `life` | `resume` 正在运行、已丢失或状态未知的成员 | 先 `stop` 它，或 `restore` 丢失的成员 |
 | `taken` | `resume` 已被恢复过的成员 | 恢复消息中点名的后继者 |
 | `session` | 某个进程可能仍持有该对话 | 结束消息中点名的进程 |
-| `leader` | `resume leader`；在旧版本领导者之上运行 `up` | 用 `up` 启动新团队；停止旧领导者 |
+| `leader` | `resume leader`；在没有生命周期记录的领导者之上运行 `up` | 用 `up` 启动新团队；停止该领导者 |
 | `state` | 对不需要恢复的成员使用 `-Fresh`；所有代都已完成时 `stop -Generation` | 使用普通的 `resume <name>`；没有需要停止的 |
 | `team` | 在没有团队的会话中使用 `-Fresh` | 在团队文件夹中运行 `up` |
 | `target` | 本团队没有该名字或 id 的成员；错误的保留 shell 地址 | 用 `list` 或 `kept` 核对 |
@@ -193,5 +193,5 @@ mux-agent stop <name>
 - `src/agents/resume.rs`、`src/agents/resume/recovery.rs`：`resume` 与恢复
 - `src/agents/reconcile.rs`：`restore` 命令
 - `src/agents/kept.rs`：保留 shell
-- `src/launcher.rs`：对 0.2.x 窗格的拒绝
+- `src/launcher.rs`：对带有文件夹级启动规格的窗格的拒绝
 - `scripts/shell/`：`cc` 和 `gg`

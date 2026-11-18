@@ -56,9 +56,9 @@ Messaging stays inside the team (`team_mail::route`). A send from a member of a 
 
 - A name must be a running, committed member of this team; any other name is refused with `no agent of this team has that name`.
 - `parent` from a person is refused with `only an agent has a parent`.
-- A pane that a member record claims but whose member cannot be proven is refused `tagged`; it never falls back to an older path.
+- A pane that a member record claims but whose member cannot be proven is refused `tagged`; it never falls back to the pane-mailbox path.
 
-Two cases still take the 0.2 path (`send_legacy` in `src/agents/message.rs`): an agent pane that is not a team member, and a person naming a name the team lacks. That path has no intents and no replies, so `-Id` and `-Re` refuse there with `-Id and -Re work only inside a team`.
+Two cases take the pane-mailbox path for agents outside a team (`send_legacy` in `src/agents/message.rs`): an agent pane that is not a team member, and a person naming a name the team lacks. That path has no intents and no replies, so `-Id` and `-Re` refuse there with `-Id and -Re work only inside a team`.
 
 `peek <name>` shows the last lines of a member's live pane (60 by default, `-Lines <n>` up to 2000). Only a person of the team or an ancestor of the member can peek, nothing is typed into the pane and focus does not move.
 
@@ -231,7 +231,7 @@ The state root is `MUX_AGENTS_STATE` when set; else `$XDG_STATE_HOME/mux-agents/
 | Path under `<root>/<key>` | What it holds |
 |---|---|
 | `mail/<mailbox>.jsonl` | the mailbox: one JSON message per LF-ended line |
-| `mail/<mailbox>.cursor.json` | the receipt cursor; a legacy `<mailbox>.offset` is migrated at the next commit |
+| `mail/<mailbox>.cursor.json` | the receipt cursor; a `<mailbox>.offset` file beside it is migrated into it at the next commit |
 | `teams/<sha16>/sends/<sender>/<id>.json` | one send intent: recipients, body hash, hop, cast, `done` |
 | `teams/<sha16>/notes/notebook.jsonl` | the notebook log: one entry per line |
 | `teams/<sha16>/notes/notebook.state.json` | `{durable, uncertain}`: how far the log is known to be on disk |

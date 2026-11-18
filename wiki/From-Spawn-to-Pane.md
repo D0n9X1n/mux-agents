@@ -124,7 +124,7 @@ The launcher's command line is `launcher_scope::argv`: the binary's absolute pat
 
 The launcher (`run_gen` in `src/launcher.rs`) runs inside the hc terminal with only `PATH` and `MUX_AGENTS_STATE` replaced from its arguments (`launcher_scope::environment`). In order:
 
-1. The spec path must lie under the state root with no link or junction and name `<root>/<key>/agents/<id>/gens/<n>/spec.json`; a folder-level spec an older build left is refused ("this pane was started by an older mux-agent").
+1. The spec path must lie under the state root with no link or junction and name `<root>/<key>/agents/<id>/gens/<n>/spec.json`; a folder-level spec, outside any generation, is refused ("this pane was started by an older mux-agent").
 2. `own_spec`: `spec.json` and `launch.json` agree on the id, the generation, the hc name and the session; else it exits 1 and creates nothing.
 3. The claim `gens/<n>.claim` is `run`, create-once. A claim already there, whatever it holds, means another launcher or `settle` decided this generation: exit 0, nothing touched.
 4. With the claim won, a `launcher.json`, `client.json` or `exit.json` already there is corrupt evidence: nothing starts.

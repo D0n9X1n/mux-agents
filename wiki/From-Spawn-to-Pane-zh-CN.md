@@ -124,7 +124,7 @@ sequenceDiagram
 
 启动器（`src/launcher.rs` 中的 `run_gen`）在 hc 终端内运行，只有 `PATH` 和 `MUX_AGENTS_STATE` 由其参数替换（`launcher_scope::environment`）。依次：
 
-1. 规格路径必须位于状态根目录之下，不经过链接或连接点，并指向 `<root>/<key>/agents/<id>/gens/<n>/spec.json`；旧版本留下的文件夹级规格会被拒绝（"this pane was started by an older mux-agent"）。
+1. 规格路径必须位于状态根目录之下，不经过链接或连接点，并指向 `<root>/<key>/agents/<id>/gens/<n>/spec.json`；不属于任何代次的文件夹级规格会被拒绝（"this pane was started by an older mux-agent"）。
 2. `own_spec`：`spec.json` 与 `launch.json` 在 id、代次、hc 名称和会话上一致；否则以 1 退出且不创建任何东西。
 3. 认领 `gens/<n>.claim` 为 `run`，只创建一次。认领已存在（无论内容为何）意味着另一个启动器或 `settle` 已决定这个代次：以 0 退出，不动任何东西。
 4. 赢得认领后，若 `launcher.json`、`client.json` 或 `exit.json` 已经存在，就是损坏的证据：什么都不启动。

@@ -2884,8 +2884,9 @@ fn the_upgrade_note_names_the_old_pane_refusal() {
         assert!(file_lines(page).contains(&line.to_string()), "{page}");
     }
 }
-const UPGRADE_0_3: &str = "From 0.2 to 0.3: an agent pane started by 0.2 and not yet running refuses to launch (\"started by an older mux-agent\"). Run `stop <name>` to end it, then start a new agent.";
-const UPGRADE_0_3_ZH: &str = "从 0.2 升级到 0.3:由 0.2 启动且尚未运行的代理窗格会拒绝启动(\"started by an older mux-agent\")。运行 `stop <name>` 结束它,然后启动一个新代理。";
+const UPGRADE_0_3: &str = "An agent pane started by 0.2.x and not yet running refuses to launch: run `stop <name>` to end it, then start a new agent.";
+const UPGRADE_0_3_ZH: &str =
+    "由 0.2.x 启动且尚未运行的代理窗格会拒绝启动：运行 `stop <name>` 结束它，然后启动一个新代理。";
 
 // views-6f v6f call 4: the person's docs name kept shells; SKILL.md does not (agents never run `kept`).
 #[test]
@@ -3806,8 +3807,8 @@ fn release_moves_dist_with_new_plugin_version() {
 
 #[test]
 fn state_and_lock_format_pinned() {
-    // 0.2.x keeps the state root, the record, launcher and mail files, and the lock names, so an upgrade within
-    // 0.2.x finds every agent and message and serializes with panes still on the older binary.
+    // The state root, the record, launcher and mail files, and the lock names stay where every reader looks for
+    // them, so a pane still on the binary it started with finds every agent and message and serializes with it.
     let src = |path: &str| repo_file(path).replace("\r\n", "\n");
     let root = src("src/state/root.rs");
     assert!(root.contains("\"{}/.local/state/mux-agents/state\","));
@@ -3832,13 +3833,6 @@ fn state_and_lock_format_pinned() {
     let registry = src("src/agents/registry.rs");
     assert!(registry.contains(r#".join("record.json")"#));
     assert!(registry.contains(r#".join("launcher.json")"#));
-    // The README promises it.
-    assert!(
-        file_lines("wiki/Usage.md")
-            .iter()
-            .any(|l| l.contains("0.2.x") && l.contains("state folder") && l.contains("lock")),
-        "wiki Usage does not say 0.2.x keeps the state and lock formats"
-    );
 }
 
 /// The lines of the `## <heading>` section of a Markdown text, without the heading.
@@ -3854,8 +3848,8 @@ fn section(text: &str, heading: &str) -> Vec<String> {
 
 #[test]
 fn readme_upgrade_lifecycle() {
-    // From 0.1: close the side bar and stop every agent first (the 0.1 mutex and the 0.2 lock files do not
-    // serialize), then update, then restart the sessions; panes keep the binary path they started with.
+    // Close the side bar and stop every agent first, then update, then restart the sessions; panes keep the binary
+    // path they started with until restarted.
     let usage = wiki_text("Usage");
     let upgrade = section(&usage, "Upgrade");
     assert!(!upgrade.is_empty(), "wiki Usage has no ## Upgrade section");
@@ -3874,7 +3868,6 @@ fn readme_upgrade_lifecycle() {
         "{upgrade:#?}"
     );
     at("absolute path");
-    at("do not serialize");
     // The Chinese twin says the same.
     for page in ["Usage-zh-CN"] {
         let text = wiki_text(page);

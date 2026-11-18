@@ -71,7 +71,7 @@ The root is `MUX_AGENTS_STATE` when set, else `%LOCALAPPDATA%\mux-agents\state` 
 
 ### One binary per platform
 
-mux-agents is one Rust crate that builds one binary, `mux-agent`. A release builds it for macOS, Linux and Windows, each `x86_64` and `aarch64`, into `scripts/bin/` on the `dist` branch, and the shim picks the one for the machine. Why: nothing to build, download or install beside the plugin; no PowerShell or .NET (0.1's PowerShell scripts were affected by a .NET named-mutex advisory on Linux and macOS); and the process layer reads the OS directly with no helper processes (`src/proc/`). A pane runs the binary by the absolute path it started with, so it keeps its version until restarted.
+mux-agents is one Rust crate that builds one binary, `mux-agent`. A release builds it for macOS, Linux and Windows, each `x86_64` and `aarch64`, into `scripts/bin/` on the `dist` branch, and the shim picks the one for the machine. Why: nothing to build, download or install beside the plugin; no PowerShell; and the process layer reads the OS directly with no helper processes (`src/proc/`). A pane runs the binary by the absolute path it started with, so it keeps its version until restarted.
 
 ### Files, not keystrokes
 

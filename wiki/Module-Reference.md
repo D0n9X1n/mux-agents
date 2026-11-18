@@ -91,7 +91,7 @@ mux-agents is one Rust crate, `mux-agent` (`Cargo.toml`), edition 2024. It build
 | `tree` | A team's tree: whether the caller is in a team, where it stands, where its child goes, whom it may stop | `scope`, `check_depth`, `limit`, `MAX_DEPTH`, `MAX_MEMBERS` |
 | `team` | A team's record and its permission ceiling, from the person's own client flags | `create`, `read`, `policy_of` |
 | `ancestry` | The one walk from a process to the Claude or Copilot client above it | `first_client`, `identity` |
-| `prelife` | Members made by 0.2.x or a v0.3 dev build: listed and stopped, never read past their record | `pre_lifecycle`, `lifecycle_only`, `close_pane` |
+| `prelife` | Members whose record has no `lifecycle: 1`: listed and stopped, never read past their record | `pre_lifecycle`, `lifecycle_only`, `close_pane` |
 
 ### Launch and generations
 

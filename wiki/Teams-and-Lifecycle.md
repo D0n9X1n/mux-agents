@@ -150,15 +150,15 @@ mux-agent kept -Close <address>
 
 `kept` lists them with `address`, `name` and `team`; `-Close <address>` closes one, only while hc still shows it open and kept by this team. A closed shell never comes back. In the bar, select it, press Enter, then `y`. `kept` is yours: a member is refused `tagged`, and a wrong address `target` ("no such kept shell", "the shell has already finished", "that shell is not a kept shell of this team").
 
-## Upgrading from 0.2.x panes
+## A pane that refuses to launch
 
-A pane that 0.2.x started and that has not launched yet cannot launch under 0.3: it prints "this pane was started by an older mux-agent and cannot launch". End it, then start a new agent:
+A pane that 0.2.x started and that has not launched its client yet refuses to launch: it prints "this pane was started by an older mux-agent and cannot launch". End it, then start a new agent:
 
 ```text
 mux-agent stop <name>
 ```
 
-A member made before 0.3.0 that still holds a team slot is named in a `limit` refusal: `stop <name>` frees the slot when its shell is lost or ended, and stops it when it runs. `up` refuses `leader` ("the team has a leader from an earlier version") when the folder's team has an older leader; stop it, then run `up` again.
+A member whose record has no `lifecycle: 1` and that still holds a team slot is named in a `limit` refusal: `stop <name>` frees the slot when its shell is lost or ended, and stops it when it runs. `up` refuses `leader` ("the team has a leader from an earlier version") when the folder's team leader has no lifecycle record; stop it, then run `up` again.
 
 ## Refusals and fixes
 
@@ -176,7 +176,7 @@ Every refusal is one JSON line and `check` names the cause; exit code 2 means a 
 | `life` | `resume` of a member that is running, lost or unknown | `stop` it first, or `restore` a lost one |
 | `taken` | `resume` of a member already resumed | resume the successor the message names |
 | `session` | a process may still hold the conversation | end the process the message names |
-| `leader` | `resume leader`; `up` over a leader from an earlier version | start a new team with `up`; stop the old leader |
+| `leader` | `resume leader`; `up` over a leader with no lifecycle record | start a new team with `up`; stop that leader |
 | `state` | `-Fresh` on a member that does not need recovery; `stop -Generation` with every generation done | plain `resume <name>`; nothing to stop |
 | `team` | `-Fresh` in a session with no team | `up` from the team folder |
 | `target` | no member of this team has that name or id; a wrong kept-shell address | check with `list` or `kept` |
@@ -193,5 +193,5 @@ The full table of checks is in [Usage](Usage).
 - `src/agents/resume.rs`, `src/agents/resume/recovery.rs`: `resume` and recovery
 - `src/agents/reconcile.rs`: `restore`
 - `src/agents/kept.rs`: kept shells
-- `src/launcher.rs`: the refusal of a 0.2.x pane
+- `src/launcher.rs`: the refusal of a pane with a folder-level launch spec
 - `scripts/shell/`: `cc` and `gg`

@@ -91,7 +91,7 @@ mux-agents 是一个 Rust crate，名为 `mux-agent`（`Cargo.toml`），edition
 | `tree` | 团队的树：调用者是否在团队里、处于哪里、它的子成员放在哪里、它可以停止谁 | `scope`、`check_depth`、`limit`、`MAX_DEPTH`、`MAX_MEMBERS` |
 | `team` | 团队的记录及其权限上限，来自人自己的客户端参数 | `create`、`read`、`policy_of` |
 | `ancestry` | 从一个进程走到它上方 Claude 或 Copilot 客户端的唯一路径 | `first_client`、`identity` |
-| `prelife` | 由 0.2.x 或 v0.3 开发版创建的成员：可以列出和停止，读取不超过它们的记录 | `pre_lifecycle`、`lifecycle_only`、`close_pane` |
+| `prelife` | 记录中没有 `lifecycle: 1` 的成员：可以列出和停止，读取不超过它们的记录 | `pre_lifecycle`、`lifecycle_only`、`close_pane` |
 
 ### 启动与代
 

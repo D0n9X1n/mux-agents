@@ -71,7 +71,7 @@ flowchart LR
 
 ### 每个平台一个二进制
 
-mux-agents 是一个 Rust crate，构建出一个二进制 `mux-agent`。发布时为 macOS、Linux 和 Windows 各构建 `x86_64` 和 `aarch64` 两种，放进 `dist` 分支的 `scripts/bin/`，由垫片挑选适合本机的那个。原因：插件之外无需构建、下载或安装任何东西；不需要 PowerShell 或 .NET（0.1 的 PowerShell 脚本在 Linux 和 macOS 上受一个 .NET 命名互斥体安全公告影响）；进程层直接读取操作系统，不启动辅助进程（`src/proc/`）。窗格按启动时的绝对路径运行二进制，所以在重启之前一直保持原来的版本。
+mux-agents 是一个 Rust crate，构建出一个二进制 `mux-agent`。发布时为 macOS、Linux 和 Windows 各构建 `x86_64` 和 `aarch64` 两种，放进 `dist` 分支的 `scripts/bin/`，由垫片挑选适合本机的那个。原因：插件之外无需构建、下载或安装任何东西；不需要 PowerShell；进程层直接读取操作系统，不启动辅助进程（`src/proc/`）。窗格按启动时的绝对路径运行二进制，所以在重启之前一直保持原来的版本。
 
 ### 用文件，不用按键
 
