@@ -41,7 +41,7 @@ pub fn attach(
     // A split goes where the main chat keeps the most room (`split::plan`); no room, or a window that cannot be read,
     // opens a tab.
     let views = split.and_then(|_| super::split::views(ctx, caller));
-    let plan = split.zip(views.as_ref()).and_then(|(dir, views)| {
+    let mut plan = split.zip(views.as_ref()).and_then(|(dir, views)| {
         let panes: Vec<String> = views.iter().map(|v| v.pane.clone()).collect();
         let window = super::split::window(ctx, caller, &panes)?;
         let plan = super::split::plan(dir, &window)?;
@@ -49,44 +49,59 @@ pub fn attach(
         (plan.target == caller.pane || super::split::still(ctx, &plan.target, views))
             .then_some(plan)
     });
-    let session = format!("{}:", caller.session);
-    let (mut args, target) = match &plan {
-        None => (vec!["new-window"], session.as_str()),
-        Some(p) => (vec!["split-window", p.flag], p.target.as_str()),
-    };
-    args.extend([
-        "-d",
-        "-P",
-        "-F",
-        "#{pane_id}|#{window_id}|#{pane_start_command}",
-        "-t",
-        target,
-    ]);
-    if plan.is_none() {
-        args.extend(["-n", name]);
-    }
     // A Unix pane gets the server's environment, not the caller's: the state root reaches the view as it does the
     // bar. Windows panes inherit it and get none.
     let env = super::spawn::pane_env(utf8(&ctx.state_root)?, crate::state::root::HOST);
-    let tail: Vec<&str> = (env.iter().map(String::as_str))
-        .chain(["-c", directory, utf8(core.binary())?, "attach", address])
-        .collect();
-    let sized: Vec<&str> = (args.iter().copied())
-        .chain(plan.as_ref().map(|_| ["-l", "50%"]).into_iter().flatten())
-        .chain(tail.iter().copied())
-        .collect();
-    // A multiplexer that refuses the size splits unsized, as the bar does.
-    let reply = match native(ctx, &sized, true)? {
-        r if r.code == 0 => r,
-        r if plan.is_some() && crate::sidebar::size_refusal(&r) => {
-            let plain: Vec<&str> = args.iter().copied().chain(tail.iter().copied()).collect();
-            native(ctx, &plain, false)?
+    let program = utf8(core.binary())?;
+    let session = format!("{}:", caller.session);
+    let create = |plan: Option<&super::split::Plan>| -> Res<Created> {
+        let (mut args, target) = match plan {
+            None => (vec!["new-window"], session.as_str()),
+            Some(p) => (vec!["split-window", p.flag], p.target.as_str()),
+        };
+        args.extend([
+            "-d",
+            "-P",
+            "-F",
+            "#{pane_id}|#{window_id}|#{pane_start_command}",
+            "-t",
+            target,
+        ]);
+        if plan.is_none() {
+            args.extend(["-n", name]);
         }
-        _ => return crate::mux::call_failed(ctx),
+        let tail: Vec<&str> = (env.iter().map(String::as_str))
+            .chain(["-c", directory, program, "attach", address])
+            .collect();
+        let sized: Vec<&str> = (args.iter().copied())
+            .chain(plan.map(|_| ["-l", "50%"]).into_iter().flatten())
+            .chain(tail.iter().copied())
+            .collect();
+        // A multiplexer that refuses the size splits unsized, as the bar does.
+        let reply = match native(ctx, &sized, true)? {
+            r if r.code == 0 => r,
+            r if plan.is_some() && crate::sidebar::size_refusal(&r) => {
+                let plain: Vec<&str> = args.iter().copied().chain(tail.iter().copied()).collect();
+                native(ctx, &plain, false)?
+            }
+            _ => return crate::mux::call_failed(ctx),
+        };
+        created_pane(&reply.stdout)
+            .filter(|v| !v.command.is_empty())
+            .ok_or_else(|| Refusal::internal("unproven new view"))
     };
-    let view = created_pane(&reply.stdout)
-        .filter(|v| !v.command.is_empty())
-        .ok_or_else(|| Refusal::internal("unproven new view"))?;
+    let mut view = create(plan.as_ref())?;
+    // The split cannot be guarded where it runs (an `if-shell` drops the new pane's id), so an agent view split beside
+    // is proven again after it: a pane replaced in between gets no view beside it; the new view, proven by its own
+    // command, is closed and opened as a tab instead.
+    if let (Some(p), Some(views)) = (&plan, &views)
+        && p.target != caller.pane
+        && !super::split::still(ctx, &p.target, views)
+    {
+        clean(ctx, &view)?;
+        view = create(None)?;
+        plan = None;
+    }
     *pane = Some(view.clone());
     if let (Some(plan), Some(views), Some(dir)) = (&plan, &views, split)
         && plan.even
@@ -275,6 +290,67 @@ mod tests {
                 .message,
             "unexpected error (invalid attachment identity)"
         );
+    }
+
+    /// A second agent splits the first agent's view; when that pane is replaced between the plan and the split, the
+    /// new view is not left beside it: it is closed and opened as a tab.
+    #[test]
+    fn a_view_replaced_during_the_split_gets_a_tab_instead() {
+        for replaced in [false, true] {
+            let w = World::human("");
+            let caller = w.caller();
+            let first = core_fixture::member(&w, "bbbbbbbbbbbb", serde_json::json!({"pane":"%9"}));
+            let mut row = crate::agents::fixture::row_of("%9|@1|300||", &[]);
+            row.command = first["startCommand"].as_str().unwrap().into();
+            w.pane_rows(&[row]);
+            core_fixture::online(&w);
+            let core = hc::connect(&w.ctx).unwrap();
+            w.fakes.mux_first(
+                crate::agents::split::GEOMETRY,
+                0,
+                "%1|119|60|240|||\n%9|120|60|240|||\n",
+                "",
+            );
+            // `still` answers 1 for the plan, then (replaced) 0 right after the split.
+            let probe = "#{pane_id}|#{&&:#{==:#{pane_dead},0},#{==:#{pane_start_command},hc attach tbbbbbbbbbbbb}}";
+            let reads = std::cell::Cell::new(0);
+            w.fakes.mux_script(probe, move |_| {
+                reads.set(reads.get() + 1);
+                let ok = !(replaced && reads.get() > 1);
+                Ok(crate::mux::Output {
+                    code: 0,
+                    stdout: format!("%9|{}\n", u8::from(ok)),
+                    stderr: String::new(),
+                })
+            });
+            w.fakes
+                .mux_rule("split-window", 0, "%12|@1|hc attach t1\n", "");
+            w.fakes
+                .mux_rule("new-window", 0, "%13|@6|hc attach t1\n", "");
+            w.launches_hold();
+            w.fakes.mux_rule("#{pane_id}|#{@agent-id}", 0, "|\n", "");
+            let r = serde_json::json!({"id":"aaaaaaaaaaaa","name":"worker","hcAddress":"t1","directory":w.ctx.cwd,"context":"brief","reason":"human"});
+            let mut view = None;
+            attach(&w.ctx, &core, &caller, &r, "t1", Some("h"), &mut view).unwrap();
+            let calls = w.fakes.mux_calls();
+            let split = calls
+                .iter()
+                .find(|c| c[1] == "split-window")
+                .expect("a split");
+            assert_eq!(
+                split[split.iter().position(|a| a == "-t").unwrap() + 1],
+                "%9"
+            );
+            let killed = calls
+                .iter()
+                .any(|c| c.last().is_some_and(|a| a == "kill-pane -t %12"));
+            assert_eq!(killed, replaced, "{replaced}");
+            assert_eq!(
+                view.unwrap().pane,
+                if replaced { "%13" } else { "%12" },
+                "{replaced}"
+            );
+        }
     }
 
     /// A Unix pane gets the server's environment, not the caller's, so the view is given the state root as the bar is

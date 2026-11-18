@@ -644,6 +644,45 @@ mod tests {
         }
     }
 
+    // A view focused beside the caller (its window @1): after the bar step, a main the bar squeezed gets its half back;
+    // a resize that fails, or panics, still focuses.
+    #[test]
+    fn focus_beside_the_caller_gives_main_its_half_back() {
+        for fault in ["none", "fails", "panics"] {
+            let w = World::human("");
+            cf::member(
+                &w,
+                ID,
+                json!({"startCommand":crate::agents::fixture::launch_command("%9")}),
+            );
+            w.panes(&["%9|@1|300|aaaaaaaaaaaa|worker"]);
+            w.fakes.mux_rule("#{window_active}", 0, "%9|1|1|1\n", "");
+            w.fakes
+                .mux_first("show-options -qv -t $3 @mux-agents-sidebar", 0, "off\n", "");
+            w.fakes.mux_first(
+                crate::agents::split::GEOMETRY,
+                0,
+                "%1|31|50|200|||\n%9|127|50|200|||\n%13|40|50|200|||sidebar\n",
+                "",
+            );
+            match fault {
+                "fails" => w.fakes.mux_rule("resize-pane", 1, "", "no space\n"),
+                "panics" => w.fakes.mux_script("resize-pane", |_| panic!("mux")),
+                _ => {}
+            }
+            cf::online(&w);
+            let reply = run(&w, focus, &["focus", "worker"]);
+            assert!(reply.starts_with("ok "), "{fault}: {reply}");
+            let resized = w
+                .fakes
+                .mux_calls()
+                .iter()
+                .any(|c| c.join(" ") == "-N resize-pane -t %1 -x 79");
+            // Tried in every case; its failure or panic stays inside the step.
+            assert!(resized, "{fault}");
+        }
+    }
+
     #[test]
     fn focus_selects_window_then_pane() {
         let w = World::human("");

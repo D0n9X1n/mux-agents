@@ -1140,23 +1140,39 @@ fn lay_focus(
         room
     };
     let kept = lay_kept(&shells, cols, look, room, focus.selected);
-    // The main rows take what the members can spare, leaving them at least 3 rows.
-    let mains = main_targets(board);
-    let spare = (rest - kept.len()).saturating_sub(3);
-    let mains: Vec<(Row, Option<Target>)> = (mains.into_iter().take(spare))
+    // The main rows come before ended rows, gaps and notes: as many as still leave every running agent its line
+    // that drew in the bar without them (the members lay out again, one main row fewer, until they do).
+    let targets = main_targets(board);
+    let room_for = |n: usize| rest - kept.len() - n;
+    let lay_in = |height: usize| {
+        if height == 0 {
+            (Laid::default(), 0)
+        } else {
+            let size = Size {
+                width: size.width,
+                height,
+            };
+            lay_members(board, &notes, size, look, focus)
+        }
+    };
+    // The running agents a frame draws (only they are targets in the members' frame).
+    let drawn_running = |laid: &Laid| laid.agents.len();
+    let bare = lay_in(room_for(0));
+    let want = drawn_running(&bare.0);
+    let mut n = targets.len().min(room_for(0));
+    let (mut laid, shown) = loop {
+        if n == 0 {
+            break bare;
+        }
+        let with = lay_in(room_for(n));
+        if drawn_running(&with.0) >= want {
+            break with;
+        }
+        n -= 1;
+    };
+    let mains: Vec<(Row, Option<Target>)> = (targets.into_iter().take(n))
         .map(|t| (main_row(&t, cols, look), Some(t)))
         .collect();
-    let members = rest - kept.len() - mains.len();
-    let (mut laid, shown) = if members == 0 {
-        let none = Laid::default();
-        (none, 0)
-    } else {
-        let size = Size {
-            width: size.width,
-            height: members,
-        };
-        lay_members(board, &notes, size, look, focus)
-    };
     fold_kept(&mut laid, kept);
     fold_kept(&mut laid, mains);
     if let Some(pane) = focus.shown.filter(|p| !p.is_empty())
@@ -4705,7 +4721,56 @@ mod tests {
         // A team's bar has its leader instead.
         let team = json!({"team": true, "agents": [{"id": "L", "name": "lead", "state": "running", "leader": true, "parent": "%3"}]});
         assert!(main_targets(team.as_object()).is_empty());
-        // Many chats in a short bar: the agents keep 3 rows, the main rows take the rest.
+        // Eight chats, one running agent and seven ended ones in an 11-row bar: every main row and the running agent
+        // fit (the ended rows and gaps give way); a 4-row bar keeps its one main row.
+        let eight = json!({"running": 1, "endedTotal": 7, "agents": (1..=8).map(|n| json!({"id": format!("{n:0>12}"),
+            "name": format!("w{n}"), "state": if n == 1 { "running" } else { "exited" }, "exitCode": 0, "age": n,
+            "pane": format!("%{}", n + 10), "parent": format!("%{n}")})).collect::<Vec<_>>()});
+        let ten = lay(
+            eight.as_object(),
+            &[],
+            Size {
+                width: 40,
+                height: 11,
+            },
+            PLAIN_LOOK,
+        );
+        assert_eq!(
+            ten.agents
+                .iter()
+                .filter(|(t, _)| t.life == pick::MAIN)
+                .count(),
+            8
+        );
+        assert!(
+            ten.agents.iter().any(|(t, _)| t.name == "w1"),
+            "the running agent stays: {:?}",
+            ten.rows
+                .iter()
+                .map(|r| render(r, false))
+                .collect::<Vec<_>>()
+        );
+        let one = json!({"running": 1, "agents": [{"id": "aaaaaaaaaaaa", "name": "w", "state": "running", "age": 1,
+            "pane": "%2", "parent": "%1"}]});
+        let three = lay(
+            one.as_object(),
+            &[],
+            Size {
+                width: 40,
+                height: 4,
+            },
+            PLAIN_LOOK,
+        );
+        assert!(
+            three.agents.iter().any(|(t, _)| t.life == pick::MAIN),
+            "{:?}",
+            three
+                .rows
+                .iter()
+                .map(|r| render(r, false))
+                .collect::<Vec<_>>()
+        );
+        // Many chats in a short bar: the agents keep their rows, the main rows take the rest.
         let many = json!({"running": 4, "agents": (1..=4).map(|n| json!({"id": format!("{n:0>12}"), "name": format!("w{n}"),
             "state": "running", "age": n, "pane": format!("%{}", n + 10), "parent": format!("%{n}")})).collect::<Vec<_>>()});
         let short = lay(
