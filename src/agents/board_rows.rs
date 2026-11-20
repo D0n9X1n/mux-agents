@@ -12,20 +12,112 @@ use crate::error::Res;
 use crate::state::fs::read_json;
 use crate::util::{age_seconds, parse_utc};
 
+/// Where a row's unread is counted from: the one rule `list`, `list -All`, the bar's ✉ badge and `m` share, for every
+/// row (running, ended, lost or unknown; in a team or not). A leader counts its own mailbox whole (`whole`); any other
+/// member the mailboxes its mail can land in, each line by `mail::badge_line`.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct Source {
+    pub keys: Vec<String>,
+    pub whole: bool,
+}
+
+/// What `Mail::source` reads from one snapshot: the running views (the agent on a parent pane), whether the session is
+/// a team, each member's logical parents as the bar's view of the tree places them, and each member's own mailbox.
+#[derive(Debug, Default)]
+pub(crate) struct Mail {
+    running: Vec<Pane>,
+    team: bool,
+    logical: BTreeMap<String, Vec<String>>,
+    own: BTreeMap<String, String>,
+    away: Option<String>,
+}
+
+impl Mail {
+    pub(crate) fn of(
+        ctx: &Ctx,
+        caller: &Caller,
+        snapshot: &crate::agents::membership::Snapshot,
+        shown: &crate::agents::cascade::Shown,
+    ) -> Mail {
+        use crate::agents::lifecycle::Life;
+        let superseded = snapshot.superseded();
+        // Only a live view of a committed member owns its pane's mail (an uncommitted held subject owns none).
+        let running = (snapshot.view_order.iter())
+            .filter(|id| {
+                snapshot.records[*id].committed
+                    && !superseded.contains(*id)
+                    && (snapshot.facts.local.iter())
+                        .any(|o| o.identity.id == **id && o.life == Life::Running)
+            })
+            .map(|id| snapshot.views[id].clone())
+            .collect();
+        let team = super::team_leader(ctx, caller, snapshot).is_some();
+        let logical = match team {
+            true => (snapshot.records.keys())
+                .filter_map(|id| Some((id.clone(), shown.placed(id)?)))
+                .collect(),
+            false => BTreeMap::new(),
+        };
+        let own = (snapshot.records.iter())
+            .map(|(id, s)| {
+                (
+                    id.clone(),
+                    crate::agents::mail::member_mailbox(id, &s.record),
+                )
+            })
+            .collect();
+        Mail {
+            running,
+            team,
+            logical,
+            own,
+            away: crate::agents::mail::elsewhere(caller).map(String::from),
+        }
+    }
+
+    /// Member `id`'s source. A3 and review: outside a team, the mailbox `send parent` reaches on its parent pane (the
+    /// running agent's there, else `pane-<n>`); in a team also its logical parents' own mailboxes (calls 10, 21, 25: as
+    /// the tree places it, else its raw `parentAgent.id`) and `pane-<parentPane>`, where exit notices go, so its unread
+    /// holds whether the parent is attached, detached, Lost or Ended, and after its own view reopens elsewhere.
+    pub(crate) fn source(&self, id: &str, record: &Value) -> Source {
+        if crate::agents::tree::is_leader(record) {
+            let keys = vec![crate::agents::mail::member_mailbox(id, record)];
+            return Source { keys, whole: true };
+        }
+        let mut keys: Vec<String> = parent_key(record, &self.running, self.away.as_deref())
+            .into_iter()
+            .collect();
+        if self.team {
+            keys.extend(parent_mailbox(record));
+            let raw = || {
+                (record.get("parentAgent"))
+                    .and_then(|p| p.get("id"))
+                    .and_then(Value::as_str)
+                    .map(String::from)
+                    .into_iter()
+                    .collect()
+            };
+            let parents: Vec<String> = self.logical.get(id).cloned().unwrap_or_else(raw);
+            keys.extend(parents.iter().filter_map(|p| self.own.get(p).cloned()));
+        }
+        keys.sort();
+        keys.dedup();
+        Source { keys, whole: false }
+    }
+}
+
 pub(super) struct Rows<'a> {
     pub(super) ctx: &'a Ctx,
     pub(super) caller: &'a Caller,
-    // Per mailbox key, its unread lines (held ones included).
-    pub(super) unread: HashMap<String, Vec<Value>>,
-    // The one mailbox every row counts in; none in watch mode, where each row counts in its parent's.
-    pub(super) reader: Option<String>,
-    pub(super) running: &'a [Pane],
+    // Per mailbox key, its unread lines (held ones included): every member's read first, in key order; any other row's
+    // on demand.
+    pub(super) unread: std::cell::RefCell<HashMap<String, Vec<Value>>>,
+    // Where each row's unread is counted from.
+    pub(super) mail: &'a Mail,
     pub(super) now: SystemTime,
     pub(super) watch: bool,
     // The team's leader on the bar's feed (B1); none outside a team and off the bar.
     pub(super) leader: Option<String>,
-    // Each team member's parent mailboxes (A3 and review); empty outside a team.
-    pub(super) parents: &'a HashMap<String, Vec<String>>,
     // Each team member's logical parents (call 10, C0), for the ones the tree places; empty outside a team.
     pub(super) logical: &'a BTreeMap<String, Vec<String>>,
     // The members the bar marks unreadable (call 21): unreadable evidence, or on a parent loop.
@@ -49,29 +141,25 @@ pub(super) fn parent_key(record: &Value, running: &[Pane], away: Option<&str>) -
 }
 
 impl Rows<'_> {
-    /// Member `id`'s unread, before a leader's own badge: `list` counts the caller's mailbox by sender (`<name>|<pane>`);
-    /// the bar counts each mailbox its row reads (a team row's parent mailboxes, else its parent pane's) by
-    /// `mail::badge_line`, the rule `m` shows, so the badge and the popup never differ.
-    pub(super) fn unread_of(&self, id: &str, record: &Value, pane: &str) -> usize {
-        let legacy = format!("{}|{pane}", crate::agents::text(record.get("name")));
-        let lines = |key: &String| self.unread.get(key).map(Vec::as_slice).unwrap_or_default();
-        let counted = |key: &String| {
-            (lines(key).iter())
-                .filter(|m| crate::agents::mail::badge_line(m, id, &legacy))
-                .count()
-        };
-        match (&self.reader, self.parents.get(id)) {
-            (Some(reader), _) => (lines(reader).iter())
-                .filter(|m| crate::agents::mail::sender(m) == legacy)
-                .count(),
-            (None, Some(boxes)) => boxes.iter().map(counted).sum(),
-            (None, None) => parent_key(
-                record,
-                self.running,
-                crate::agents::mail::elsewhere(self.caller),
-            )
-            .map_or(0, |key| counted(&key)),
+    /// Member `id`'s unread, counted from its `Mail::source`: a leader's own badge, else each line of its mailboxes
+    /// `mail::badge_line` takes, the rule `m` shows, so the badge, the popup and `list` never differ.
+    pub(super) fn unread_of(&self, id: &str, record: &Value) -> Res<usize> {
+        let source = self.mail.source(id, record);
+        if source.whole {
+            return Ok(leader_badge(self.ctx, self.caller, id, record).unwrap_or(0));
         }
+        let legacy = crate::agents::mail::legacy(record);
+        let mut n = 0;
+        for key in &source.keys {
+            if !self.unread.borrow().contains_key(key) {
+                let lines = crate::agents::mail::unread_lines(self.ctx, self.caller, key)?;
+                self.unread.borrow_mut().insert(key.clone(), lines);
+            }
+            n += (self.unread.borrow()[key].iter())
+                .filter(|m| crate::agents::mail::badge_line(m, id, &legacy))
+                .count();
+        }
+        Ok(n)
     }
 
     /// One row. status.json and last-sent.json are read under the agent lock their writers hold; an unreadable
@@ -124,8 +212,7 @@ impl Rows<'_> {
             .get("createdAt")
             .and_then(Value::as_str)
             .and_then(|created| age_seconds(created, self.now));
-        let unread = self.unread_of(id, record, &pane);
-        let unread = leader_badge(self.ctx, self.caller, id, record).unwrap_or(unread);
+        let unread = self.unread_of(id, record)?;
         let mut row = Map::new();
         row.insert("name".into(), field("name"));
         row.insert("client".into(), field("client"));

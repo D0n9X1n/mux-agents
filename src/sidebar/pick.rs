@@ -414,13 +414,15 @@ impl Pick {
         }
     }
 
-    /// `read` against the question pending. A kept shell's question is answered by any event, yes only by `y`. The
-    /// bar's is yes only by a `y` read alone at least `BAR_GAP` after it was first drawn; a `y` read sooner, or with
-    /// other keys, leaves it asked; any other event cancels it.
+    /// `read` against the question pending. A mouse release never answers one. A kept shell's question is answered by
+    /// any other event, yes only by `y`. The bar's is yes only by a `y` read alone at least `BAR_GAP` after it was first
+    /// drawn; a `y` read sooner, or with other keys, leaves it asked; any other event cancels it.
     pub fn answer(&mut self, read: &Read) -> Answer {
         let yes = read.event == Event::Yes;
         let answer = match self.question.as_ref() {
             None => return Answer::None,
+            // A mouse release is no answer: the release of the click that asked would otherwise cancel its question.
+            Some(_) if matches!(read.event, Event::Release { .. }) => return Answer::Wait,
             Some(Question::Bar(shown)) if yes => {
                 let late = shown.is_some_and(|at| read.first >= at + BAR_GAP);
                 if !(read.alone && late) {

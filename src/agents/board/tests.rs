@@ -241,21 +241,6 @@ use crate::agents::lock_key;
 use crate::agents::mail::{add_mail, read_mail};
 use serde_json::json;
 
-#[test]
-fn reader_key_never_matches_a_member_by_pane() {
-    let other = vec!["bbbbbbbbbbbb".to_string()];
-    // A member counts its own id, even with another member's view on its old pane.
-    assert_eq!(reader_key(Some(ID), &other, "%1", None).unwrap(), ID);
-    assert_eq!(reader_key(Some(ID), &[], "%1", None).unwrap(), ID);
-    // A pane-proven caller: the one agent on its pane, else the pane's mailbox.
-    assert_eq!(
-        reader_key(None, &other, "%1", None).unwrap(),
-        "bbbbbbbbbbbb"
-    );
-    assert_eq!(reader_key(None, &[], "%1", None).unwrap(), "pane-1");
-    let two = vec![ID.to_string(), "bbbbbbbbbbbb".to_string()];
-    assert_eq!(reader_key(None, &two, "%1", None).unwrap(), "pane-1");
-}
 use std::path::{Path, PathBuf};
 
 use crate::agents::core_fixture as cf;
@@ -856,6 +841,80 @@ fn an_older_ended_member_with_an_unread_report_is_never_capped_away() {
         .position(|r| r.starts_with(" Inbox"))
         .expect("an Inbox");
     assert!(text[inbox + 1].contains("e0"), "{text:?}");
+}
+
+// One unread rule for every reader: A's report, sent from %9, still counts after A's view reopens on %19, in `list`,
+// `list -All`, the bar's ✉ badge and `m` alike, and it is what `read` of that mailbox delivers.
+#[test]
+fn list_badge_and_popup_count_a_report_from_a_reopened_view() {
+    use crate::agents::mail::{add_member_mail, badge_mail, serve};
+    let w = World::human("");
+    w.clock(NOW);
+    let caller = w.caller();
+    let folder = member(&w, ID, json!({}));
+    add_member_mail(&w.ctx, &caller, "pane-1", "worker", ID, "%9", "the report").unwrap();
+    // A's view reopened on %19.
+    let mut r = read_json(&folder.join("record.json")).unwrap().unwrap();
+    r["pane"] = json!("%19");
+    r["startCommand"] = crate::agents::fixture::launch_command("%19").into();
+    write(&folder.join("record.json"), r);
+    w.panes(&["%19|@5|300|aaaaaaaaaaaa|worker"]);
+    let unread = |all: bool, watch: bool| {
+        snapshot(&w, &caller, &[(ID, "running")]);
+        let b = board(&w.ctx, &caller, all, watch).unwrap();
+        w.fakes.hc_done().unwrap();
+        b["agents"][0]["unread"].clone()
+    };
+    assert_eq!(
+        [
+            unread(false, false),
+            unread(true, false),
+            unread(true, true)
+        ],
+        [json!(1), json!(1), json!(1)],
+        "list, list -All, the badge"
+    );
+    snapshot(&w, &caller, &[(ID, "running")]);
+    assert_eq!(
+        badge_mail(&w.ctx, &caller, ID).unwrap().len(),
+        1,
+        "the popup"
+    );
+    let owner = crate::agents::receipt::Owner {
+        id: "root".into(),
+        generation: "0".into(),
+    };
+    let served = serve(&w.ctx, &caller, "pane-1", &owner, &|| true).unwrap();
+    assert!(
+        served.is_some_and(|r| r.text.contains("the report")),
+        "read delivers it"
+    );
+}
+
+// Outside a team a lone member that left a report unread is counted whatever its life: a Lost or Unknown row's badge
+// and its popup agree.
+#[test]
+fn a_lost_or_unknown_members_badge_and_popup_agree() {
+    use crate::agents::mail::{add_member_mail, badge_mail};
+    for life in ["lost", "unknown"] {
+        let w = World::human("");
+        w.clock(NOW);
+        let caller = w.caller();
+        member(&w, ID, json!({}));
+        w.panes(&[]);
+        add_member_mail(&w.ctx, &caller, "pane-1", "worker", ID, "%9", "the report").unwrap();
+        snapshot(&w, &caller, &[(ID, life)]);
+        let watch = board(&w.ctx, &caller, true, true).unwrap();
+        w.fakes.hc_done().unwrap();
+        let row = watch["agents"][0].clone();
+        snapshot(&w, &caller, &[(ID, life)]);
+        let popup = badge_mail(&w.ctx, &caller, ID).unwrap().len();
+        assert_eq!(
+            (row["state"].clone(), row["unread"].clone(), popup),
+            (json!(life), json!(1), 1),
+            "{life}"
+        );
+    }
 }
 
 #[test]
@@ -2033,10 +2092,10 @@ fn the_team_bar_counts_mail_for_every_member_it_draws() {
             .find(|r| r["name"] == "kid")
             .unwrap()
             .clone();
-        // In a team every drawn member's count is read; outside a team only running members', as before.
+        // Every drawn member's count is read, in a team or not, whatever its life (`Mail::source`).
         assert_eq!(
             (&kid["life"], &kid["unread"]),
-            (&json!("lost"), &json!(usize::from(team))),
+            (&json!("lost"), &json!(1)),
             "team {team}"
         );
     }

@@ -481,7 +481,11 @@ const SCOPE_READS_ALLOWED: &[(&str, &str, &str)] = &[
         "views-6f: the descriptor names the showing server and session",
     ),
     ("src/sidebar.rs", "sidebar", "the bar of the shown session"),
-    ("src/sidebar.rs", "ensure", "the bar of the shown session"),
+    (
+        "src/sidebar.rs",
+        "ensure_locked",
+        "the bar of the shown session",
+    ),
     (
         "src/sidebar.rs",
         "close_bar",

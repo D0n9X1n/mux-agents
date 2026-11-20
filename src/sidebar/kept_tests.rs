@@ -383,6 +383,47 @@ fn enter_asks_and_only_y_closes() {
     }
 }
 
+// A click on a kept row asks `close? y/n` as Enter does, and the click's own release (a mouse event, not an answer)
+// leaves the question asked: the `y` that follows closes the shell (here hc is not reachable, so its close fails and
+// says so).
+#[test]
+fn a_clicks_release_never_answers_the_question_it_asked() {
+    let board = json!({"agents": [{"name": "worker", "id": "worker", "state": "running", "pane": "%9"}],
+        "kept": [{"address": "k1", "name": "a"}]});
+    let laid = lay(board.as_object(), &[], 24, None, None);
+    let w = World::human("");
+    let c = w.caller();
+    clicks(&w, &laid);
+    let mut s = frame(board.as_object(), &laid, false);
+    let (mut pick, mut panel) = (Pick::default(), Panel::default());
+    let y = laid.agents.iter().find(|(t, _)| t.id == "k1").unwrap().1 as u16 + 1;
+    let report = format!("\x1b[<0;3;{y}M\x1b[<0;3;{y}m");
+    let mut d = keys::Decoder::default();
+    for mut r in d.push(report.as_bytes(), SystemTime::UNIX_EPOCH) {
+        r.first = SystemTime::UNIX_EPOCH + Duration::from_secs(1);
+        act(&w.ctx, &c, LOOK, r, &mut pick, &mut s, &mut panel);
+    }
+    assert_eq!(
+        pick.note().as_deref(),
+        Some("close? y/n"),
+        "the release leaves it asked"
+    );
+    act(
+        &w.ctx,
+        &c,
+        LOOK,
+        read(Event::Yes),
+        &mut pick,
+        &mut s,
+        &mut panel,
+    );
+    assert_eq!(
+        pick.note().as_deref(),
+        Some("close failed: a"),
+        "y closes it"
+    );
+}
+
 // Checklist 15: a press while `close? y/n` is pending answers it: over a member row or a kept row it focuses and
 // closes nothing, and a following `y` closes nothing.
 #[test]

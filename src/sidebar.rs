@@ -186,6 +186,21 @@ pub enum Bar {
 /// `off`, else that window's bar, found or opened in it. A failed read or probe refuses and opens nothing.
 pub fn ensure(ctx: &Ctx, caller: &Caller, window: &str) -> Res<Bar> {
     lock(ctx, &scope::shown_lock("sidebar", caller), || {
+        ensure_locked(ctx, caller, window)
+    })
+}
+
+/// `ensure` for the bar's own tick, which never waits on the session's sidebar lock (a resume's post-launch bar step
+/// holds it as long as its split takes): `None` when another holds it, so the tick tries again on its next pass.
+fn ensure_now(ctx: &Ctx, caller: &Caller, window: &str) -> Res<Option<Bar>> {
+    crate::agents::try_lock(ctx, &scope::shown_lock("sidebar", caller), || {
+        ensure_locked(ctx, caller, window)
+    })
+}
+
+/// `ensure`'s work, under the session's sidebar lock its caller holds.
+fn ensure_locked(ctx: &Ctx, caller: &Caller, window: &str) -> Res<Bar> {
+    {
         let read = native(
             ctx,
             &["show-options", "-qv", "-t", &caller.session, OPTION],
@@ -204,7 +219,7 @@ pub fn ensure(ctx: &Ctx, caller: &Caller, window: &str) -> Res<Bar> {
         } else {
             Bar::Existing(pane)
         })
-    })
+    }
 }
 
 /// The best-effort bar of `window` for a verb whose own work is done (spawn, focus): `ensure` under catch_unwind, so
@@ -2491,8 +2506,16 @@ pub fn run_watch(
                     {
                         continue;
                     }
-                    if ensure(ctx, caller, window).is_err() {
-                        failed_windows.push((window.clone(), now));
+                    // A live bar never waits on the sidebar lock: held elsewhere, the window waits for the next tick.
+                    // A leaving bar draws no more frames, and this is its last chance, so it waits as `ensure` does.
+                    let opened = match lost {
+                        true => ensure(ctx, caller, window).map(Some),
+                        false => ensure_now(ctx, caller, window),
+                    };
+                    match opened {
+                        Ok(Some(_)) => {}
+                        Ok(None) => since_walk = WALK_EVERY,
+                        Err(_) => failed_windows.push((window.clone(), now)),
                     }
                 }
             }
@@ -12127,6 +12150,70 @@ mod tests {
             .filter(|c| c[1] == "split-window" && c.iter().any(|a| a == "@6"))
             .count();
         assert_eq!(splits, 2);
+    }
+
+    // The tick never waits on the session's sidebar lock: a resume's post-launch bar step (`keep_bar`) holds it for
+    // as long as it takes, so with it held on another thread the walk skips the windows it would give a bar this pass
+    // (trying again on the next tick) and the bar draws its frame at once, never after the lock's 15 s wait.
+    #[test]
+    fn the_tick_draws_at_once_while_another_holds_the_sidebar_lock() {
+        use std::sync::mpsc;
+        let mut probes = vec!["live"; 2];
+        probes.push("gone");
+        let probes: &'static [&'static str] = Box::leak(probes.into_boxed_slice());
+        let (w, _) = keep_world(probes, win("%1", in_place()));
+        crate::agents::core_fixture::member(
+            &w,
+            "cccccccccccc",
+            json!({"name":"third","pane":"%10","startCommand":crate::agents::fixture::launch_command("%10")}),
+        );
+        w.fakes.mux_script("#{pane_start_command}", |argv| {
+            let rows = [
+                "%9|@1|300|aaaaaaaaaaaa|worker",
+                "%10|@6|301|cccccccccccc|third",
+            ];
+            Ok(out(
+                0,
+                &crate::agents::fixture::listed_dead(argv, &rows, "\n", &[]),
+                "",
+            ))
+        });
+        w.fakes.mux_first("#{==:#{@agent-role},sidebar}", 0, "", "");
+        let root = w.ctx.state_root.parent().unwrap().join("locks");
+        w.fakes.real_locks(&root);
+        let caller = w.caller();
+        let key = scope::shown_lock("sidebar", &caller);
+        let (held_tx, held_rx) = mpsc::channel();
+        let (go_tx, go_rx) = mpsc::channel::<()>();
+        let holder = std::thread::spawn(move || {
+            let other = World::human("");
+            let mut ctx = other.fakes.ctx();
+            ctx.clock = Box::new(crate::ctx::SystemClock);
+            crate::state::lock::with_lock_at(&ctx, &root, &key, || {
+                held_tx.send(()).unwrap();
+                let _ = go_rx.recv();
+                Ok(())
+            })
+            .unwrap();
+        });
+        held_rx.recv().unwrap();
+        let start = std::time::Instant::now();
+        let mut first = None;
+        run_watch(&w.ctx, &caller, Box::new(NoInput), &mut |_: &str| {
+            first.get_or_insert_with(|| start.elapsed());
+            Ok(())
+        });
+        go_tx.send(()).unwrap();
+        holder.join().unwrap();
+        let first = first.expect("a frame");
+        assert!(
+            first < Duration::from_millis(200),
+            "the first frame came after {first:?}"
+        );
+        let splits = (w.fakes.mux_calls().iter())
+            .filter(|c| c[1] == "split-window" && c.iter().any(|a| a == "@6"))
+            .count();
+        assert_eq!(splits, 0, "no bar opened while the lock was held");
     }
 
     // The watch probes made so far.

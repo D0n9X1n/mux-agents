@@ -590,6 +590,15 @@ pub fn unread_counts(ctx: &Ctx, caller: &Caller, key: &str) -> Res<HashMap<Strin
     Ok(counts)
 }
 
+/// A row's sender as a line without `fromId` names it: `<name>|<pane>` of its record.
+pub(crate) fn legacy(record: &Value) -> String {
+    format!(
+        "{}|{}",
+        super::text(record.get("name")),
+        super::text(record.get("pane"))
+    )
+}
+
 /// Whether unread `message` counts toward member `id`'s ✉ badge, the one rule the bar's badge and `m` share for every
 /// row but a leader's (which counts its whole mailbox): a line naming a member (`fromId`) counts for that member only,
 /// and never when it is the notice of its own exit (`registry::post`, the only lines with a `kind`); a line naming none
@@ -832,68 +841,11 @@ pub(crate) fn badge_mail(ctx: &Ctx, caller: &Caller, id: &str) -> Res<Vec<Report
         return Ok(Vec::new());
     };
     let record = &stored.record;
-    let team = super::team::read(&super::team::path(
-        &super::server_dir(ctx, caller),
-        &scope.session,
-    ))
-    .ok()
-    .flatten()
-    .is_some()
-        || snapshot.records.values().any(|s| {
-            s.committed
-                && super::tree::is_leader(&s.record)
-                && s.record.get("upTeam").and_then(Value::as_str).is_some()
-        });
-    // Match board_rows::parent_key: only a live parent view on the recorded server owns this pane mailbox.
-    let superseded = snapshot.superseded();
-    let parent = snapshot.view_order.iter().find(|p| {
-        let view = &snapshot.views[*p];
-        record.get("parentServerKey").and_then(Value::as_str) == elsewhere(caller)
-            && view.pane == super::text(record.get("parentPane"))
-            && snapshot.records[*p].committed
-            && !superseded.contains(*p)
-            && snapshot
-                .facts
-                .local
-                .iter()
-                .any(|o| o.identity.id == **p && o.life == super::lifecycle::Life::Running)
-    });
-    let parent = parent
-        .map(|p| member_mailbox(p, &snapshot.records[p].record))
-        .or_else(|| parent_box(record).ok());
-    let mut keys: Vec<String> = parent.into_iter().collect();
-    if team {
-        keys.extend(parent_box(record).ok());
-        let parents = shown.placed(id).unwrap_or_else(|| {
-            record
-                .get("parentAgent")
-                .and_then(|p| p.get("id"))
-                .and_then(Value::as_str)
-                .map(String::from)
-                .into_iter()
-                .collect()
-        });
-        for parent in parents {
-            if let Some(stored) = snapshot.records.get(&parent) {
-                keys.push(member_mailbox(&parent, &stored.record));
-            }
-        }
-    }
-    let leader = super::tree::is_leader(record);
-    if leader {
-        keys = vec![member_mailbox(id, record)];
-    }
-    keys.sort();
-    keys.dedup();
+    let source = super::board::Mail::of(ctx, caller, &snapshot, &shown).source(id, record);
+    let (leader, legacy) = (source.whole, legacy(record));
     let mail = super::server_dir(ctx, caller).join("mail");
-    // The row's sender, as the board keys it: its name and the pane its record names.
-    let legacy = format!(
-        "{}|{}",
-        super::text(record.get("name")),
-        super::text(record.get("pane"))
-    );
     let mut reports = Vec::new();
-    for key in keys {
+    for key in source.keys {
         let found = super::lock(ctx, &super::lock_key("mail", caller, &key), || {
             let c = receipt::load(&mail, &key).unwrap_or_default();
             let mailbox = mail.join(format!("{key}.jsonl"));

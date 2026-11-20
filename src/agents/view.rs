@@ -1126,8 +1126,10 @@ mod tests {
         );
     }
 
+    // `list` counts each row's unread from that row's own source (`Mail::source`), as the bar's badge and `m` do: the
+    // worker's mail to its parent pane (pane-1), whoever asks; mail in another pane's or its own mailbox is not its.
     #[test]
-    fn list_reader_counts_own_mailbox() {
+    fn list_counts_each_rows_mail_to_its_parent_whoever_asks() {
         let mut w = World::human("");
         let caller = w.caller();
         let a = crate::agents::core_fixture::member(
@@ -1161,18 +1163,17 @@ mod tests {
         assert_eq!(rows(&w, &["list"])[0]["unread"], 1);
         assert_eq!(rows(&w, &["list"]).len(), 1);
         assert_eq!(rows(&w, &["list", "-All"]).len(), 2);
-        // Another human pane reads pane-2, whatever tag it carries: a tag never names the reader.
+        // Another human pane asks, tagged or not, then the running agent's own pane: the same count.
         let tmux = w.ctx.env.get("TMUX").unwrap().to_string();
         w.ctx.env = Env::from_pairs([("TMUX", tmux.clone()), ("TMUX_PANE", "%2".into())]);
-        assert_eq!(rows(&w, &["list"])[0]["unread"], 2);
+        assert_eq!(rows(&w, &["list"])[0]["unread"], 1);
         w.fakes.mux_first(
             "#{pid}|#{pane_pid}|#{session_id}|#{window_id}|#{@agent-id}",
             0,
             "900|100|$3|@1|aaaaaaaaaaaa\n",
             "",
         );
-        assert_eq!(rows(&w, &["list"])[0]["unread"], 2);
-        // The running agent's own pane reads its id, tagged or not.
+        assert_eq!(rows(&w, &["list"])[0]["unread"], 1);
         w.ctx.env = Env::from_pairs([("TMUX", tmux), ("TMUX_PANE", "%9".into())]);
         w.fakes.mux_first(
             "#{pid}|#{pane_pid}|#{session_id}|#{window_id}|#{@agent-id}",
@@ -1180,7 +1181,7 @@ mod tests {
             "900|100|$3|@1|\n",
             "",
         );
-        assert_eq!(rows(&w, &["list"])[0]["unread"], 3);
+        assert_eq!(rows(&w, &["list"])[0]["unread"], 1);
         // Listing writes no offset.
         let offsets = std::fs::read_dir(w.state().join("mail"))
             .unwrap()

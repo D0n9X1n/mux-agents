@@ -3012,8 +3012,9 @@ hc {}:
             "model",
             "color",
         ];
-        // w2's stop notice is unread in the root's mailbox, from w2's pane.
-        for (row, (w, state, unread)) in rows.iter().zip([(&w1, "running", 0), (&w2, "stopped", 1)])
+        // w2's stop notice is unread in the root's mailbox, but it is the notice of w2's own exit, never mail w2 left:
+        // `list` counts by the bar's one rule (`Mail::source`), so neither row has unread.
+        for (row, (w, state, unread)) in rows.iter().zip([(&w1, "running", 0), (&w2, "stopped", 0)])
         {
             // An ended row ends with its exitCode: null for a stop.
             let mut want_keys = ROW.to_vec();

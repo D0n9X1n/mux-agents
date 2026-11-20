@@ -44,7 +44,7 @@ flowchart LR
 |---|---|---|
 | `spawn` | `spawn -Client copilot -Name add-tests -TaskFile task.md -BriefFile brief.md -Split h` | 按会话的 `placement` 启动代理（默认是新窗口）；`-Split h\|v` 或 `-Tab` 只决定这一次；`-Model <model>` 指定它的模型（否则用客户端的默认模型）；`-Effort low\|medium\|high` 设置它的推理强度；`-NoFork` 或 `-Context brief` 让它从简报而不是你对话的分叉开始 |
 | `placement` | `placement h`，`placement tab` | 本会话之后 `spawn` 在哪里打开代理：`tab`（新窗口，默认）、`h` 或 `v`（在你旁边分屏）；单独的 `placement` 显示当前选择 |
-| `list` | `list -All` | 存活的代理、各自在做什么、未读消息；`-All` 加上已结束的，各带其 `exitCode` |
+| `list` | `list -All` | 存活的代理、各自在做什么，以及各自的未读消息（它发出的报告，与侧边栏的 ✉ 标记计数相同，从不计入它自己结束的通知）；`-All` 加上已结束的，各带其 `exitCode` |
 | `focus` | `focus claude-1`、`focus -Next` | 切换到代理的视图，视图已关闭时重新打开它；`-Next` / `-Prev` 按侧边栏的顺序逐个切换 |
 | `send` | `send claude-1 -BodyFile note.md`，`send parent -BodyFile result.md` | 给某个代理，或给 `parent`、`leader`、`children` 或 `team` 发消息；在团队中，`-Re <id>` 回复一条消息，`-Id <id>` 完成一次失败的发送（[消息与笔记本](Messaging-and-Notebook-zh-CN)） |
 | `read` | `read -Wait 600`，`read claude-1 -Lines 40` | 等待你的消息并用 `-Ack <batch>` 确认，或读取某个代理的窗格；客户端钩子使用 `-Deliver` 和 `-Count` |

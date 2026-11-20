@@ -44,7 +44,7 @@ You rarely type these: the skill runs them for you. Every command is `<plugin>/s
 |---|---|---|
 | `spawn` | `spawn -Client copilot -Name add-tests -TaskFile task.md -BriefFile brief.md -Split h` | start an agent where the session's `placement` says (a new window by default); `-Split h\|v` or `-Tab` decides for this one; `-Model <model>` picks its model (else the client's default); `-Effort low\|medium\|high` sets its effort; `-NoFork` or `-Context brief` starts it from the brief instead of a fork of your conversation |
 | `placement` | `placement h`, `placement tab` | where `spawn` opens agents for the rest of the session: `tab` (a new window, the default), `h` or `v` (a split beside you); `placement` alone shows the choice |
-| `list` | `list -All` | live agents, what each is doing, unread messages; `-All` adds ended ones, each with its `exitCode` |
+| `list` | `list -All` | live agents, what each is doing, and each one's unread messages (the reports it sent, counted as the side bar's ✉ badge counts them, never the notice of its own exit); `-All` adds ended ones, each with its `exitCode` |
 | `focus` | `focus claude-1`, `focus -Next` | switch to an agent's view, reopening it if it was closed; `-Next` / `-Prev` step through the bar's order |
 | `send` | `send claude-1 -BodyFile note.md`, `send parent -BodyFile result.md` | post a message to an agent, or to `parent`, `leader`, `children` or `team`; in a team, `-Re <id>` answers a message and `-Id <id>` finishes a send that failed ([Messaging and Notebook](Messaging-and-Notebook)) |
 | `read` | `read -Wait 600`, `read claude-1 -Lines 40` | wait for your messages and acknowledge them with `-Ack <batch>`, or read an agent's pane; the client hooks use `-Deliver` and `-Count` |

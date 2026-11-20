@@ -33,8 +33,8 @@ pub fn select_doing(
 
 /// One reconciled hc snapshot: committed Running members ranked by activity, then Lost/Unknown by id.
 /// With `all`, append up to ten terminal-Ended rows and the uncapped `endedTotal`. Terminal facts own
-/// lifecycle and exit codes; notices supply only historical time and closure metadata. Unread belongs
-/// to the caller's mailbox, or each member's parent mailbox in watch mode. Reap's member/notice/mail
+/// lifecycle and exit codes; notices supply only historical time and closure metadata. Each row's unread
+/// is counted from its `Mail::source`, as `m` and `list` count it. Reap's member/notice/mail
 /// locks finish before sorted mailbox reads, followed by each row's agent lock. Never refresh or reap views.
 pub fn board(ctx: &Ctx, caller: &Caller, all: bool, watch: bool) -> Res<Map<String, Value>> {
     use super::{lifecycle::Life, membership::Snapshot};
@@ -125,38 +125,6 @@ pub fn board(ctx: &Ctx, caller: &Caller, all: bool, watch: bool) -> Res<Map<Stri
         .filter(|o| snapshot.records[&o.identity.id].committed || flagged(&o.identity.id))
         .filter(|o| !superseded.contains(&o.identity.id))
         .collect();
-    let panes: Vec<_> = snapshot
-        .view_order
-        .iter()
-        .filter(|id| {
-            members
-                .iter()
-                .any(|o| &o.identity.id == *id && o.life == Life::Running)
-                // An uncommitted held subject listed for its recovery owns no pane.
-                && snapshot.records[*id].committed
-        })
-        .map(|id| snapshot.views[id].clone())
-        .collect();
-    let mine: Vec<String> = panes
-        .iter()
-        .filter(|p| p.pane == caller.pane)
-        .map(|p| p.id.clone())
-        .collect();
-    let away = super::mail::elsewhere(caller);
-    let reader = reader_key(caller.member.as_deref(), &mine, &caller.pane, away)?;
-    // A member reads the mailbox its record names (inherited by a resume), else its id.
-    let reader = match snapshot.records.get(&reader) {
-        Some(stored) => super::mail::member_mailbox(&reader, &stored.record),
-        None => reader,
-    };
-    // A3 and review: in a team, a member's mail reaches its parent in every mailbox it can land in: the parent's own
-    // (from `parentAgent.id` and its record, an inherited `mailbox` honoured), the one `send parent` reaches on the parent
-    // pane (the running agent's there, else `pane-<n>`), and `pane-<parentPane>`, where exit notices go. A team row sums
-    // them, de-duplicated, by member identity, so its unread holds whether the parent is attached, detached, Lost or
-    // Ended, and after the member's own view reopens on another pane. Outside a team: the parent pane, as before.
-    // Calls 10, 21, 25: in a team each member's logical parents (C0) from the bar's view of the tree, which never
-    // refuses; a member it does not place (unreadable, on a loop, or any member unreadable) keeps its raw parent id.
-    // adopt-3e call 13: that view was read in the snapshot's own `stable` bracket.
     let (logical, marked) = match &leader {
         Some(_) => {
             let logical: BTreeMap<String, Vec<String>> = (members.iter())
@@ -170,55 +138,13 @@ pub fn board(ctx: &Ctx, caller: &Caller, all: bool, watch: bool) -> Res<Map<Stri
         }
         None => (BTreeMap::new(), Vec::new()),
     };
-    let parents: HashMap<String, Vec<String>> = if leader.is_some() {
-        members
-            .iter()
-            .map(|o| {
-                let record = &snapshot.records[&o.identity.id].record;
-                let raw = record
-                    .get("parentAgent")
-                    .and_then(|p| p.get("id"))
-                    .and_then(Value::as_str)
-                    .map(String::from);
-                let ids = match logical.get(&o.identity.id) {
-                    Some(ps) => ps.clone(),
-                    None => raw.into_iter().collect(),
-                };
-                let own = ids.into_iter().filter_map(|parent| {
-                    let stored = snapshot.records.get(&parent)?;
-                    Some(super::mail::member_mailbox(&parent, &stored.record))
-                });
-                let notices = parent_mailbox(record);
-                let mut boxes: Vec<String> = own
-                    .chain(
-                        [parent_key(record, &panes, away), notices]
-                            .into_iter()
-                            .flatten(),
-                    )
-                    .collect();
-                boxes.sort();
-                boxes.dedup();
-                (o.identity.id.clone(), boxes)
-            })
-            .collect()
-    } else {
-        HashMap::new()
-    };
-    let mut keys: Vec<_> = if watch {
-        members
-            .iter()
-            // An ended agent's too: the reports it left unread hold its row in Inbox (local mailbox reads only).
-            .filter(|o| matches!(o.life, Life::Running | Life::Ended) || leader.is_some())
-            .flat_map(|o| match parents.get(&o.identity.id) {
-                Some(boxes) => boxes.clone(),
-                None => parent_key(&snapshot.records[&o.identity.id].record, &panes, away)
-                    .into_iter()
-                    .collect(),
-            })
-            .collect()
-    } else {
-        vec![reader.clone()]
-    };
+    // Every reader counts a row's unread from its one source (`Mail::source`): `list`, `list -All`, the bar and `m`.
+    let mail = Mail::of(ctx, caller, &snapshot, &shown);
+    let mut keys: Vec<String> = (members.iter())
+        .map(|o| mail.source(&o.identity.id, &snapshot.records[&o.identity.id].record))
+        .filter(|source| !source.whole)
+        .flat_map(|source| source.keys)
+        .collect();
     keys.sort();
     keys.dedup();
     let mut unread = HashMap::new();
@@ -228,13 +154,11 @@ pub fn board(ctx: &Ctx, caller: &Caller, all: bool, watch: bool) -> Res<Map<Stri
     let rows = Rows {
         ctx,
         caller,
-        unread,
-        reader: (!watch).then_some(reader),
-        running: &panes,
+        unread: std::cell::RefCell::new(unread),
+        mail: &mail,
         now: ctx.clock.now(),
         watch,
         leader: leader.clone(),
-        parents: &parents,
         logical: &logical,
         marked: &marked,
     };
@@ -379,7 +303,7 @@ pub fn board(ctx: &Ctx, caller: &Caller, all: bool, watch: bool) -> Res<Map<Stri
         // On the bar, a member that left a report unread stands in Inbox, so the cap never drops it.
         let mailed = || {
             let record = &snapshot.records[&o.identity.id].record;
-            watch && rows.unread_of(&o.identity.id, record, &super::text(record.get("pane"))) > 0
+            watch && matches!(rows.unread_of(&o.identity.id, record), Ok(n) if n > 0)
         };
         if !flagged(&o.identity.id) && !restoring(&o.identity.id) && !recent && !mailed() {
             if kept == cap {
@@ -568,23 +492,6 @@ fn rank(row: &Map<String, Value>) -> u8 {
     }
 }
 
-/// The mailbox whose unread `list` counts for the caller. A member proven through its own hc terminal counts its own
-/// id, always: whichever pane shows it, and even when a later hc look cannot show it running, it is never matched by
-/// pane, so it can never count another member's mail (phase 1c). Any other caller: the one running agent on its
-/// pane, else the pane's own mailbox.
-pub(crate) fn reader_key(
-    member: Option<&str>,
-    on_pane: &[String],
-    pane: &str,
-    elsewhere: Option<&str>,
-) -> Res<String> {
-    match (member, on_pane) {
-        (Some(id), _) => Ok(id.to_string()),
-        (None, [id]) => Ok(id.clone()),
-        _ => super::mail::pane_box(pane, elsewhere),
-    }
-}
-
 /// The leader of the team the bar's session is (B1): its team record's, else a committed depth-0 member with
 /// `upTeam` (a team whose record write failed); none outside a team. An unreadable record never fails the bar.
 fn team_leader(
@@ -612,7 +519,9 @@ fn team_leader(
 
 #[path = "board_rows.rs"]
 mod rows;
+pub(crate) use rows::Mail;
 pub use rows::hc_row;
+#[cfg(test)]
 pub(crate) use rows::parent_mailbox;
 use rows::*;
 

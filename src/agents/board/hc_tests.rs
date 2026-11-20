@@ -54,13 +54,11 @@ fn hc_board_fields_append() {
             let rows = Rows {
                 ctx: &w.ctx,
                 caller: &c,
-                unread: HashMap::new(),
-                reader: Some("pane-1".into()),
-                running: &[],
+                unread: Default::default(),
+                mail: &Mail::default(),
                 now: w.ctx.clock.now(),
                 watch,
                 leader: None,
-                parents: &HashMap::new(),
                 logical: &Default::default(),
                 marked: &[],
             };
