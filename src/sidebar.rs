@@ -2462,6 +2462,7 @@ fn watch_loop(
     let mut last_frame: Option<(String, Size)> = None;
     let mut last_written = SystemTime::UNIX_EPOCH;
     let mut last_changed = SystemTime::UNIX_EPOCH;
+    let mut last_map: Option<(Vec<(String, usize)>, Size)> = None;
     let root = crate::agents::server_dir(ctx, caller);
     // Peek files of popups that never opened, from an earlier bar (review).
     sweep_peeks(ctx, &crate::agents::server_dir(ctx, caller));
@@ -2671,9 +2672,14 @@ fn watch_loop(
         };
         dress(&mut laid, &notes, size, look, dressed, &keymap);
         // With a poll the bar ticks often: a frame already on screen at this size is written again only every
-        // REWRITE, so the screen does not churn, and a rewrite of the same frame is no change: PRESS_GAP drops a
-        // click only after a frame that changed (`last_changed`), never after one that moved nothing under it.
+        // REWRITE, so the screen does not churn. PRESS_GAP drops a click only after a frame that moved a row under it
+        // (`last_changed`): a rewrite, or a frame whose words changed with every row where it was (each tick changes an
+        // age), hits the same agent on either frame, so a press read right after it is taken.
         let text = frame(&laid.rows, size, look);
+        let map: Vec<(String, usize)> = drawn(&laid)
+            .into_iter()
+            .map(|(id, at, _)| (id, at))
+            .collect();
         let now = ctx.clock.now();
         let same = last_frame
             .as_ref()
@@ -2684,10 +2690,14 @@ fn watch_loop(
                 return "output-closed";
             }
             last_written = ctx.clock.now();
-            if pace.poll.is_none() || !same {
+            let moved = last_map
+                .as_ref()
+                .is_none_or(|(rows, at)| *at != size || *rows != map);
+            if pace.poll.is_none() || (!same && moved) {
                 last_changed = last_written;
             }
             last_frame = Some((text, size));
+            last_map = Some((map, size));
         }
         // `close bar? y/n` is on screen from now (it is drawn from 12 columns): `BAR_GAP` runs from here.
         if size.width >= 12 {
@@ -9868,6 +9878,68 @@ mod tests {
             !frames[0].contains("reading the tests") && frames[1].contains("reading the tests"),
             "the redraw changed the frame: {frames:?}"
         );
+    }
+
+    // A frame that changes text but moves no row (an age, a doing line's words) moves nothing under the pointer:
+    // a press read right after it hits the same agent on either frame, so it is taken. With the 1 s tick every frame
+    // changes an age, so a press that landed while a tick drew was read after its write and dropped.
+    #[test]
+    fn a_press_right_after_a_frame_that_moved_no_row_is_taken() {
+        let w = click_world(&["live", "live", "live", "gone"], board_answer());
+        pace(Pace {
+            tick: Duration::from_millis(2000),
+            poll: Some(Duration::from_millis(200)),
+        });
+        let folder = crate::agents::server_dir(&w.ctx, &w.caller())
+            .join("agents")
+            .join(ID);
+        // The first wait times out at the first poll, which finds the doing line's new words (same rows) and redraws
+        // at once; the press comes 10 ms after that frame.
+        let mut script = Script::new(
+            &w.fakes,
+            vec![(200, Waited::Timeout), (0, Waited::Timeout), (10, press(6))],
+        );
+        script.on_wait = Some(Box::new(move |n| {
+            if n == 1 {
+                std::thread::sleep(Duration::from_millis(5));
+                write(
+                    &folder.join("status.json"),
+                    json!({"text": "reading the tests", "at": "x"}),
+                );
+            }
+        }));
+        // Two frames (the first and the poll's), the click's focus, then the press's redraw.
+        watch_frames(&w, 2);
+        crate::agents::core_fixture::online(&w);
+        watch_frames(&w, 1);
+        let caller = w.caller();
+        let (mut frames, mut times) = (Vec::new(), Vec::new());
+        let ended = run_watch(
+            &w.ctx,
+            &caller,
+            Origin::Hand,
+            Box::new(script),
+            &mut |frame: &str| {
+                frames.push(frame.to_string());
+                let at = w.ctx.clock.now().duration_since(SystemTime::UNIX_EPOCH);
+                times.push(at.unwrap().as_millis() as u64);
+                assert!(frames.len() <= 100, "runaway");
+                Ok(())
+            },
+        );
+        pace(Pace::default());
+        assert_eq!(ended, "pane-closed");
+        assert!(
+            !frames[0].contains("reading the tests") && frames[1].contains("reading the tests"),
+            "the redraw changed the words: {frames:?}"
+        );
+        assert_eq!(diffs(&times)[0], 200, "redrawn at the poll: {times:?}");
+        assert_eq!(
+            (click_reads(&w), selects(&w)),
+            (1, 1),
+            "the press 10 ms after a frame that moved no row focused worker"
+        );
+        w.fakes.hc_done().unwrap();
     }
 
     // A lone ESC already read when a poll finds a change keeps waiting for the rest of its sequence through the
