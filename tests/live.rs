@@ -3817,6 +3817,70 @@ hc {}:
         assert_eq!(live.bars().len(), 1, "{mux:?} {:?}", live.bars());
     }
 
+    // A watch ended while its worker opens another window's bar waits for that open, so the new bar is marked (the
+    // reviewer's repro). w1's view is broken out to its own window while w2's keeps the bar's, so the bar's walk hands
+    // w1's new window to its worker; an `after-split-window` hook holds that split until the test releases it, and
+    // Ctrl-C ends the bar meanwhile. The bar waits; once released, w1's window has one bar, marked, and keeps it so.
+    fn a_bar_ended_mid_open_waits_for_its_workers_open(mux: Mux) {
+        let Some(mut live) = Live::human(mux) else {
+            return;
+        };
+        let w1 = live.spawn("w1", &["-Split", "h"]);
+        let w2 = live.spawn("w2", &["-Split", "h"]);
+        let bar = s(&w1["sidebar"]).to_string();
+        live.worker_pid(&w1);
+        live.worker_pid(&w2);
+        let held = live.dir.join("split.held");
+        let tmux = live.server.binary().to_string_lossy().into_owned();
+        let socket = live.server.socket().to_string_lossy().into_owned();
+        let hook = format!(
+            "run-shell \"touch {} && {} -S {} wait-for hold\"",
+            support::quote(held.to_str().unwrap()),
+            support::quote(&tmux),
+            support::quote(&socket),
+        );
+        live.call(&["set-hook", "-g", "after-split-window", &hook]);
+        let pane = s(&w1["pane"]).to_string();
+        live.call(&["break-pane", "-d", "-s", &pane]);
+        let window = live.field(&pane, "#{window_id}");
+        assert!(
+            eventually(LONG, || held.exists()),
+            "{mux:?}: the walk's split for w1's window ran"
+        );
+        live.call(&["send-keys", "-t", &bar, "C-c"]);
+        // The watch waits for its worker: its pane is still there while the split is held.
+        std::thread::sleep(Duration::from_secs(2));
+        assert!(
+            live.panes("#{pane_id}").contains(&bar),
+            "{mux:?}: the bar waits for its worker"
+        );
+        live.call(&["set-hook", "-gu", "after-split-window"]);
+        live.call(&["wait-for", "-S", "hold"]);
+        live.wait_gone(&bar);
+        // w1's window: one watch, marked and labelled the bar, and still one after the 10 s a stray would show in.
+        let watches = |live: &Live| -> Vec<String> {
+            live.panes(
+                "#{pane_id}|#{window_id}|#{@mux-agents-bar}|#{@agent-role}|#{pane_start_command}",
+            )
+            .into_iter()
+            .filter(|r| r.split('|').nth(1) == Some(window.as_str()) && r.ends_with("watch"))
+            .collect()
+        };
+        assert!(
+            eventually(LONG, || watches(&live).len() == 1),
+            "{mux:?}: {:?}",
+            watches(&live)
+        );
+        std::thread::sleep(Duration::from_secs(11));
+        let found = watches(&live);
+        assert_eq!(found.len(), 1, "{mux:?}: {found:?}");
+        let fields: Vec<&str> = found[0].split('|').collect();
+        assert!(
+            !fields[2].is_empty() && fields[3] == "sidebar",
+            "{mux:?}: the bar is marked and labelled: {found:?}"
+        );
+    }
+
     // A sidebar lock held elsewhere for 15 s: the spawn still succeeds, its agent recorded and committed, with no bar
     // and the lock refusal as sidebarError; the spawn lock was already released, so a later spawn opens the bar.
     fn sidebar_lock_timeout_still_spawns(mux: Mux) {
@@ -6492,6 +6556,7 @@ hc {}:
             bar_real_client_click_focuses,
             bar_real_client_peek,
             break_pane_of_the_last_view_gives_its_new_window_a_bar,
+            a_bar_ended_mid_open_waits_for_its_workers_open,
         ]
     );
 

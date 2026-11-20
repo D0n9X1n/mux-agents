@@ -2373,8 +2373,31 @@ fn read_size(ctx: &Ctx, bar: &str) -> Option<Size> {
 pub fn run_watch(
     ctx: &Ctx,
     caller: &Caller,
+    input: Box<dyn Input>,
+    write: &mut dyn FnMut(&str) -> io::Result<()>,
+) -> &'static str {
+    let mut panel = Panel::default();
+    let ended = watch_loop(ctx, caller, input, write, &mut panel);
+    // Every way out waits for the work running off the loop first (`Jobs::finish`): another window's bar between its
+    // split and its mark, or a resume between its launch and its record, is never cut when this process exits.
+    if panel.jobs.finish(ctx, caller, JOBS_WAIT) {
+        return ended;
+    }
+    // Reported in the end reason, never waited for for ever. Leaked once: the watch's process ends right after.
+    Box::leak(format!("{ended} (a worker did not finish)").into_boxed_str())
+}
+
+/// How long a watch that ends waits for the work running off its loop: the sidebar lock's own wait, which an open of
+/// another window's bar may spend, and as long again for the work it then does under the lock.
+const JOBS_WAIT: Duration = Duration::from_secs(2 * crate::state::lock::LOCK_WAIT.as_secs());
+
+/// `run_watch`'s loop, its actions running off the loop in `panel`'s jobs.
+fn watch_loop(
+    ctx: &Ctx,
+    caller: &Caller,
     mut input: Box<dyn Input>,
     write: &mut dyn FnMut(&str) -> io::Result<()>,
+    panel: &mut Panel,
 ) -> &'static str {
     let own = format!("{}|", caller.pane);
     // watch draws only to a terminal (watch_on refuses otherwise).
@@ -2387,7 +2410,6 @@ pub fn run_watch(
     let mut size = FALLBACK;
     let mut unknown = 0;
     let mut pick = Pick::default();
-    let mut panel = Panel::default();
     let mut viewing = Viewing::default();
     // The pane whose row is banded: the last pane on screen that is not the bar; and whether the bar was on screen.
     let mut banded: Option<String> = None;
@@ -2663,7 +2685,7 @@ pub fn run_watch(
         let mut polled_at = ctx.clock.now();
         loop {
             // An action that answered off the loop (a resume) is applied, and the bar draws again at once.
-            if settle_jobs(ctx, caller, &mut pick, &mut shown, &mut panel) {
+            if settle_jobs(ctx, caller, &mut pick, &mut shown, panel) {
                 break;
             }
             // Another window's bar the worker could not open waits `REARM` before it is tried again.
@@ -2713,7 +2735,7 @@ pub fn run_watch(
                 if read.event == Event::Interrupt {
                     return "interrupted";
                 }
-                redraw |= act(ctx, caller, look, read, &mut pick, &mut shown, &mut panel);
+                redraw |= act(ctx, caller, look, read, &mut pick, &mut shown, panel);
                 if panel.closed {
                     return "closed";
                 }
@@ -12350,6 +12372,49 @@ mod tests {
         );
         let split = split_at.get().expect("the bar's split ran");
         assert!(split > first, "the split ran on a later pass");
+    }
+
+    // A watch never exits while its worker opens another window's bar: an open cut between its split and its mark
+    // would leave an unmarked watch there, which `prove` takes for one started by hand. The walk hands @6 to the
+    // worker, then the frame's write fails (`output-closed`, a way out before the loop reads the worker's answers),
+    // and the watch returns only after that open finished: split, then marked.
+    #[test]
+    fn a_watch_returns_only_after_its_workers_open() {
+        let (w, _) = keep_world(&["live", "gone"], win("%1", in_place()));
+        crate::agents::core_fixture::member(
+            &w,
+            "cccccccccccc",
+            json!({"name":"third","pane":"%10","startCommand":crate::agents::fixture::launch_command("%10")}),
+        );
+        w.fakes.mux_script("#{pane_start_command}", |argv| {
+            let rows = [
+                "%9|@1|300|aaaaaaaaaaaa|worker",
+                "%10|@6|301|cccccccccccc|third",
+            ];
+            Ok(out(
+                0,
+                &crate::agents::fixture::listed_dead(argv, &rows, "\n", &[]),
+                "",
+            ))
+        });
+        w.fakes.mux_first("#{==:#{@agent-role},sidebar}", 0, "", "");
+        w.fakes.mux_rule("split-window", 0, "%20|@6|4242\n", "");
+        let caller = w.caller();
+        let ended = run_watch(&w.ctx, &caller, Box::new(NoInput), &mut |_: &str| {
+            Err(io::Error::other("closed"))
+        });
+        assert_eq!(ended, "output-closed");
+        let calls: Vec<String> = w.fakes.mux_calls().iter().map(|c| c.join(" ")).collect();
+        let split = calls
+            .iter()
+            .position(|c| c.contains("split-window") && c.contains("@6"));
+        let mark = calls
+            .iter()
+            .position(|c| c.contains(&format!("set-option -p -t %20 {MARK}")));
+        assert!(
+            split.is_some() && mark.is_some_and(|m| Some(m) > split),
+            "split, then marked, before the watch returned: {calls:?}"
+        );
     }
 
     // The watch probes made so far.

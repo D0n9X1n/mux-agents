@@ -111,3 +111,45 @@ fn a_worker_ctx_carries_the_bars_fields() {
     assert_eq!(*host.member_mux.borrow(), *w.ctx.member_mux.borrow());
     assert!(host.mux.borrow().is_none());
 }
+
+// A watch's last step: no new work starts, and the work running is waited for, bounded: a job released before the
+// bound finishes (and the call returns true only after it ran); one still running at the bound is reported (false),
+// never waited for for ever.
+#[test]
+fn finish_waits_for_the_running_job_within_its_bound() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering::SeqCst};
+    let w = World::human("");
+    let (caller, mut jobs) = (w.caller(), Jobs::default());
+    let (gate, wait) = channel::<()>();
+    let ran = Arc::new(AtomicBool::new(false));
+    let done = ran.clone();
+    let target = Target::new("worker", "");
+    jobs.pending.insert(target.id.clone());
+    jobs.start(target.clone(), move || {
+        wait.recv().unwrap();
+        done.store(true, SeqCst);
+        Ok(Map::new())
+    });
+    let release = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(200));
+        gate.send(()).unwrap();
+    });
+    assert!(jobs.finish(&w.ctx, &caller, Duration::from_secs(5)));
+    assert!(ran.load(SeqCst), "it ran before finish returned");
+    assert!(
+        !jobs.resume(&w.ctx, &caller, &target),
+        "no new work once finishing"
+    );
+    release.join().unwrap();
+    // One that does not finish within the bound is reported, not waited for.
+    let mut jobs = Jobs::default();
+    let (gate, wait) = channel::<()>();
+    jobs.pending.insert(target.id.clone());
+    jobs.start(target, move || {
+        let _ = wait.recv();
+        Ok(Map::new())
+    });
+    assert!(!jobs.finish(&w.ctx, &caller, Duration::from_millis(100)));
+    drop(gate);
+}
