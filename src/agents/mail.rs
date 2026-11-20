@@ -837,10 +837,20 @@ pub(crate) fn badge_mail(ctx: &Ctx, caller: &Caller, id: &str) -> Res<Vec<Report
             }),
         ))
     })?;
-    let Some(stored) = snapshot.records.get(id) else {
+    // The record the row was built from, by the board's own path: a member of the snapshot, else a live 0.2.x
+    // pane-based member (`prelife::live_panes`, which the board lists by its record's id), never only the snapshot.
+    let legacy_row = || {
+        (super::prelife::live_panes(ctx, caller).into_iter())
+            .find(|(p, _, _)| p.id == id)
+            .map(|(_, record, _)| record)
+    };
+    let Some(record) = (snapshot.records.get(id))
+        .map(|stored| stored.record.clone())
+        .or_else(legacy_row)
+    else {
         return Ok(Vec::new());
     };
-    let record = &stored.record;
+    let record = &record;
     let source = super::board::Mail::of(ctx, caller, &snapshot, &shown).source(id, record);
     let (leader, legacy) = (source.whole, legacy(record));
     let mail = super::server_dir(ctx, caller).join("mail");

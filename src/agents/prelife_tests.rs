@@ -441,6 +441,35 @@ fn list_shows_a_pre_lifecycle_child_of_a_lifecycle_member_as_today() {
     w.fakes.hc_done().unwrap();
 }
 
+/// A live 0.2.x pane-based member's unread report (the reviewer's repro: the worker at %9, parent %1, one report in
+/// `pane-1`): its row comes from the legacy path, and `m` resolves it through that same path, so the bar's ✉ badge,
+/// `list` and the popup all say 1.
+#[test]
+fn a_live_v028_pane_members_badge_list_and_popup_agree() {
+    let w = World::human("");
+    pf::v028(&w, P, "old", pf::End::Live);
+    pf::v028_pane(&w, P, pf::Pane028::Live);
+    let caller = w.caller();
+    crate::agents::mail::add_mail(&w.ctx, &caller, "pane-1", "old", "%9", "the report", None)
+        .unwrap();
+    let unread = |watch: bool| {
+        pf::script(&w, Default::default());
+        let b = crate::agents::board::board(&w.ctx, &caller, true, watch).unwrap();
+        w.fakes.hc_done().unwrap();
+        let rows = b["agents"].as_array().unwrap().clone();
+        let row = rows.iter().find(|r| r["name"] == "old").cloned();
+        row.map(|r| r["unread"].clone())
+    };
+    assert_eq!(
+        (unread(false), unread(true)),
+        (Some(json!(1)), Some(json!(1))),
+        "list, the badge"
+    );
+    pf::script(&w, Default::default());
+    let popup = crate::agents::mail::badge_mail(&w.ctx, &caller, P).unwrap();
+    assert_eq!(popup.len(), 1, "the popup");
+}
+
 /// After the upgrade, `list` (the bar's feed too) shows a live 0.2.x pane-based member as 0.2.8 did, from its
 /// record and its pane proven its launch; nothing is killed or written. A gone pane, or one running another command,
 /// or a multiplexer that cannot be read, shows no running row.

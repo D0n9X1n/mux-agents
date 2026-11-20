@@ -1,5 +1,6 @@
-//! The bar's slow verbs off its loop: a resume runs on a worker thread while the bar keeps drawing, and the loop collects
-//! its answer on a later pass without ever waiting for it. One action at a time per row.
+//! The bar's slow work off its loop: a resume, and opening another view window's bar (a split that may wait on the
+//! session's sidebar lock), each run on a worker thread while the bar keeps drawing; the loop collects the answers on
+//! a later pass without ever waiting for them. One action at a time per row, one open at a time per window.
 
 use std::cell::RefCell;
 use std::collections::BTreeSet;
@@ -16,28 +17,64 @@ use crate::error::{Refusal, Res};
 /// A finished action: the row it was for, and the verb's answer.
 pub(crate) type Done = (Target, Res<Map<String, Value>>);
 
-/// The actions running (by row id) and the channel their answers come back on.
+/// A finished open of another window's bar: the window, and whether its bar is there.
+pub(crate) type Ensured = (String, Res<()>);
+
+/// The actions running (by row id) and the windows whose bar is being opened, each with the channel its answers come
+/// back on.
 #[derive(Debug)]
 pub(crate) struct Jobs {
     pending: BTreeSet<String>,
     send: Sender<Done>,
     recv: Receiver<Done>,
-    // Under test the verb runs on the bar's own thread at the next drain: the test fakes are `Rc`, so they cannot
+    windows: BTreeSet<String>,
+    opened: Sender<Ensured>,
+    answers: Receiver<Ensured>,
+    // Under test the work runs on the bar's own thread at the next drain: the test fakes are `Rc`, so they cannot
     // reach a worker. The frame drawn before that drain is the one a worker leaves the bar free to draw.
     #[cfg(test)]
     deferred: Vec<Target>,
+    #[cfg(test)]
+    deferred_windows: Vec<String>,
 }
 
 impl Default for Jobs {
     fn default() -> Self {
         let (send, recv) = channel();
+        let (opened, answers) = channel();
         Jobs {
             pending: BTreeSet::new(),
             send,
             recv,
+            windows: BTreeSet::new(),
+            opened,
+            answers,
             #[cfg(test)]
             deferred: Vec::new(),
+            #[cfg(test)]
+            deferred_windows: Vec::new(),
         }
+    }
+}
+
+/// Runs `job` on a worker thread and sends `(key, answer)` on `send`; a panic, or a thread that could not start,
+/// answers a refusal, so nothing stays pending for ever.
+fn spawn<K: Clone + Send + 'static, T: Send + 'static>(
+    send: &Sender<(K, Res<T>)>,
+    key: K,
+    job: impl FnOnce() -> Res<T> + Send + 'static,
+) {
+    let (worker, failed) = (send.clone(), (send.clone(), key.clone()));
+    let spawned = std::thread::Builder::new()
+        .name("mux-agents-bar-job".into())
+        .spawn(move || {
+            let answer = std::panic::catch_unwind(std::panic::AssertUnwindSafe(job))
+                .unwrap_or_else(|_| Err(Refusal::internal("panic")));
+            let _ = worker.send((key, answer));
+        });
+    if spawned.is_err() {
+        let (send, key) = failed;
+        let _ = send.send((key, Err(Refusal::internal("no worker thread"))));
     }
 }
 
@@ -69,18 +106,44 @@ impl Jobs {
         target: Target,
         job: impl FnOnce() -> Res<Map<String, Value>> + Send + 'static,
     ) {
-        let (send, failed) = (self.send.clone(), (self.send.clone(), target.clone()));
-        let spawned = std::thread::Builder::new()
-            .name("mux-agents-bar-job".into())
-            .spawn(move || {
-                let answer = std::panic::catch_unwind(std::panic::AssertUnwindSafe(job))
-                    .unwrap_or_else(|_| Err(Refusal::internal("panic")));
-                let _ = send.send((target, answer));
-            });
-        if spawned.is_err() {
-            let (send, target) = failed;
-            let _ = send.send((target, Err(Refusal::internal("no worker thread"))));
+        spawn(&self.send, target, job);
+    }
+
+    /// Opens another view window `window`'s bar off the loop: `sidebar::ensure`, which waits on the session's sidebar
+    /// lock as long as another holds it; false (nothing started) while one is pending for that window.
+    pub(crate) fn ensure(&mut self, ctx: &Ctx, caller: &Caller, window: &str) -> bool {
+        if !self.windows.insert(window.to_string()) {
+            return false;
         }
+        #[cfg(test)]
+        {
+            let _ = (ctx, caller);
+            self.deferred_windows.push(window.to_string());
+        }
+        #[cfg(not(test))]
+        {
+            let (seed, caller, at) = (Seed::of(ctx), caller.clone(), window.to_string());
+            spawn(&self.opened, window.to_string(), move || {
+                super::ensure(&seed.host(), &caller, &at).map(|_| ())
+            });
+        }
+        true
+    }
+
+    /// The windows whose open answered, without waiting; they are no longer pending.
+    pub(crate) fn drain_windows(&mut self, ctx: &Ctx, caller: &Caller) -> Vec<Ensured> {
+        #[cfg(test)]
+        for window in std::mem::take(&mut self.deferred_windows) {
+            let answer = super::ensure(ctx, caller, &window).map(|_| ());
+            let _ = self.opened.send((window, answer));
+        }
+        #[cfg(not(test))]
+        let _ = (ctx, caller);
+        let done: Vec<Ensured> = self.answers.try_iter().collect();
+        for (window, _) in &done {
+            self.windows.remove(window);
+        }
+        done
     }
 
     /// The answers that have come, without waiting; their rows are no longer pending.

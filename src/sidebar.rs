@@ -190,14 +190,6 @@ pub fn ensure(ctx: &Ctx, caller: &Caller, window: &str) -> Res<Bar> {
     })
 }
 
-/// `ensure` for the bar's own tick, which never waits on the session's sidebar lock (a resume's post-launch bar step
-/// holds it as long as its split takes): `None` when another holds it, so the tick tries again on its next pass.
-fn ensure_now(ctx: &Ctx, caller: &Caller, window: &str) -> Res<Option<Bar>> {
-    crate::agents::try_lock(ctx, &scope::shown_lock("sidebar", caller), || {
-        ensure_locked(ctx, caller, window)
-    })
-}
-
 /// `ensure`'s work, under the session's sidebar lock its caller holds.
 fn ensure_locked(ctx: &Ctx, caller: &Caller, window: &str) -> Res<Bar> {
     {
@@ -2508,16 +2500,13 @@ pub fn run_watch(
                     {
                         continue;
                     }
-                    // A live bar never waits on the sidebar lock: held elsewhere, the window waits for the next tick.
-                    // A leaving bar draws no more frames, and this is its last chance, so it waits as `ensure` does.
-                    let opened = match lost {
-                        true => ensure(ctx, caller, window).map(Some),
-                        false => ensure_now(ctx, caller, window),
-                    };
-                    match opened {
-                        Ok(Some(_)) => {}
-                        Ok(None) => since_walk = WALK_EVERY,
-                        Err(_) => failed_windows.push((window.clone(), now)),
+                    // The tick never opens a bar itself: it only decides which window needs one, and a worker opens it
+                    // (`Jobs::ensure`, waiting on the sidebar lock as long as another holds it), its answer drained on
+                    // a later pass. A leaving bar has no later pass, so it opens them itself.
+                    if !lost {
+                        panel.jobs.ensure(ctx, caller, window);
+                    } else if ensure(ctx, caller, window).is_err() {
+                        failed_windows.push((window.clone(), now));
                     }
                 }
             }
@@ -2676,6 +2665,12 @@ pub fn run_watch(
             // An action that answered off the loop (a resume) is applied, and the bar draws again at once.
             if settle_jobs(ctx, caller, &mut pick, &mut shown, &mut panel) {
                 break;
+            }
+            // Another window's bar the worker could not open waits `REARM` before it is tried again.
+            for (window, answer) in panel.jobs.drain_windows(ctx, caller) {
+                if answer.is_err() {
+                    failed_windows.push((window, ctx.clock.now()));
+                }
             }
             let since = ctx.clock.now().duration_since(ticked).unwrap_or(pace.tick);
             let left = pace.tick.saturating_sub(since);
@@ -12237,8 +12232,9 @@ mod tests {
     }
 
     // The tick never waits on the session's sidebar lock: a resume's post-launch bar step (`keep_bar`) holds it for
-    // as long as it takes, so with it held on another thread the walk skips the windows it would give a bar this pass
-    // (trying again on the next tick) and the bar draws its frame at once, never after the lock's 15 s wait.
+    // as long as it takes. With it held on another thread the bar draws its first frame at once, never after the
+    // lock's 15 s wait: the walk only hands the window without a bar to the worker, which opens it on a later pass,
+    // here once the lock is released after that frame.
     #[test]
     fn the_tick_draws_at_once_while_another_holds_the_sidebar_lock() {
         use std::sync::mpsc;
@@ -12281,23 +12277,79 @@ mod tests {
             .unwrap();
         });
         held_rx.recv().unwrap();
+        let split = |fakes: &Fakes| {
+            (fakes.mux_calls().iter())
+                .filter(|c| c[1] == "split-window" && c.iter().any(|a| a == "@6"))
+                .count()
+        };
         let start = std::time::Instant::now();
-        let mut first = None;
+        let (mut first, mut split_at_first) = (None, None);
+        let (mut go, mut holder, fakes) = (Some(go_tx), Some(holder), w.fakes.clone());
         run_watch(&w.ctx, &caller, Box::new(NoInput), &mut |_: &str| {
-            first.get_or_insert_with(|| start.elapsed());
+            if first.is_none() {
+                first = Some(start.elapsed());
+                split_at_first = Some(split(&fakes));
+                // The lock is released only once that frame is drawn.
+                go.take().unwrap().send(()).unwrap();
+                holder.take().unwrap().join().unwrap();
+            }
             Ok(())
         });
-        go_tx.send(()).unwrap();
-        holder.join().unwrap();
         let first = first.expect("a frame");
         assert!(
             first < Duration::from_millis(200),
             "the first frame came after {first:?}"
         );
-        let splits = (w.fakes.mux_calls().iter())
-            .filter(|c| c[1] == "split-window" && c.iter().any(|a| a == "@6"))
-            .count();
-        assert_eq!(splits, 0, "no bar opened while the lock was held");
+        assert_eq!(split_at_first, Some(0), "no bar opened by the first frame");
+        assert!(split(&w.fakes) > 0, "the worker opened it on a later pass");
+    }
+
+    // The tick never opens a bar itself (the reviewer's repro): another view window without one, the sidebar lock
+    // free, and a `split-window` that takes 350 ms. The walk hands that window to the worker, so the first frame is
+    // drawn within one poll interval, and the bar's split runs on a later pass.
+    #[test]
+    fn a_slow_split_for_another_window_never_delays_a_frame() {
+        use std::time::Instant;
+        let (w, _) = keep_world(&["live", "live", "gone"], win("%1", in_place()));
+        crate::agents::core_fixture::member(
+            &w,
+            "cccccccccccc",
+            json!({"name":"third","pane":"%10","startCommand":crate::agents::fixture::launch_command("%10")}),
+        );
+        w.fakes.mux_script("#{pane_start_command}", |argv| {
+            let rows = [
+                "%9|@1|300|aaaaaaaaaaaa|worker",
+                "%10|@6|301|cccccccccccc|third",
+            ];
+            Ok(out(
+                0,
+                &crate::agents::fixture::listed_dead(argv, &rows, "\n", &[]),
+                "",
+            ))
+        });
+        w.fakes.mux_first("#{==:#{@agent-role},sidebar}", 0, "", "");
+        let split_at = Rc::new(Cell::new(None::<Instant>));
+        let at = split_at.clone();
+        w.fakes.mux_script("split-window", move |_| {
+            std::thread::sleep(Duration::from_millis(350));
+            at.set(Some(Instant::now()));
+            Ok(out(0, "", ""))
+        });
+        let caller = w.caller();
+        let start = Instant::now();
+        let mut first = None;
+        run_watch(&w.ctx, &caller, Box::new(NoInput), &mut |_: &str| {
+            first.get_or_insert_with(Instant::now);
+            Ok(())
+        });
+        let first = first.expect("a frame");
+        let late = first - start;
+        assert!(
+            late < Duration::from_millis(200),
+            "the first frame came after {late:?}"
+        );
+        let split = split_at.get().expect("the bar's split ran");
+        assert!(split > first, "the split ran on a later pass");
     }
 
     // The watch probes made so far.
