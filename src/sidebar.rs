@@ -3287,17 +3287,21 @@ fn parse_record(text: &str) -> Option<(String, u32, i64)> {
 /// is anything else. The multiplexer starts the bar's two-item command itself, so its pane pid is the watch.
 fn watch_start(ctx: &Ctx, pid: u32) -> Option<i64> {
     let row = ctx.os.row(pid)?;
-    let exe = ctx.exe.to_str()?;
-    let path = row.path.as_deref()?;
+    is_watch(ctx, &row).then_some(row.start).flatten()
+}
+
+/// Whether `row` is this binary run as exactly `<binary> watch`: a side bar, known by its process because a leaving bar
+/// removes its own label and mark before it exits.
+pub(crate) fn is_watch(ctx: &Ctx, row: &crate::proc::Row) -> bool {
+    let (Some(exe), Some(path), Some(argv)) = (ctx.exe.to_str(), &row.path, &row.argv) else {
+        return false;
+    };
     let same = if cfg!(windows) {
         path.eq_ignore_ascii_case(exe)
     } else {
         path == exe
     };
-    let argv = row.argv.as_ref()?;
-    (same && argv.len() == 2 && argv[1] == "watch")
-        .then_some(row.start)
-        .flatten()
+    same && argv.len() == 2 && argv[1] == "watch"
 }
 
 /// `window`'s bar, proven now (T9): its window record names a pane whose one read shows it alive (`#{pane_dead}` 0)

@@ -5984,7 +5984,8 @@ hc {}:
     /// r6b-calls "how a live test produces a Lost member": a core kill alone loses no member. hc's `hold` keeps each
     /// terminal and the restarted core adopts it live with its launcher argv; `up`, run from the harness's own pane,
     /// then finds every member Running and relaunches nothing; each member stays live with the same client process
-    /// and terminal. The team's view session may end with the core (all-calls call 10): reported, never asserted.
+    /// and terminal. The team's view session may end with the core (all-calls call 10); the session `up` answers
+    /// exists.
     #[test]
     fn a_core_kill_alone_leaves_members_running() {
         let count = |live: &Live| {
@@ -6023,8 +6024,8 @@ hc {}:
                     (t["state"] == "live" && t["argv"] == r["launcherArgv"]).then_some(())
                 });
             }
-            // all-calls call 10: everything below runs from the harness's own pane; the team's view session is not
-            // used (views run `hc attach` and may end with the core; `up` restoring them is reentry-6a Task 11).
+            // all-calls call 10: `up` runs from the harness's own pane; the old view session is not used (its views run
+            // `hc attach` and end with the core). The session `up` answers holds the views it brings back.
             let (code, up) = live.run(&["up", "-Client", "claude"]);
             // all-calls call 9: what hc answered for each member right after `up`, carried by every failure below.
             let seen: Vec<(String, Option<Value>)> = before
@@ -6040,17 +6041,17 @@ hc {}:
                 })
                 .collect();
             let evidence: Vec<&String> = seen.iter().map(|(e, _)| e).collect();
-            // A diagnostic only (call 10): whether the team's view session outlived the core kill.
-            let sid = s(&before[0]["session"]);
+            // The kill ends the old view session's `hc attach` views and then its bars; `up` answers a session that
+            // holds a live view, or opens a new one, so the session it answered is still there.
+            let sid = s(&up["session"]);
             let sessions = live
                 .server
                 .try_call(&["list-sessions", "-F", "#{session_id}"]);
             let sessions = String::from_utf8_lossy(&sessions.stdout).to_string();
-            if !sessions.lines().any(|l| l == sid) {
-                eprintln!(
-                    "{mux:?}: the team's view session {sid} ended with the core (by design): {sessions:?}"
-                );
-            }
+            assert!(
+                sessions.lines().any(|l| l == sid),
+                "{mux:?}: the session {sid} up answered is gone: {sessions:?} up: {up} hc: {evidence:#?}"
+            );
             assert_eq!(
                 (code, &up["created"]),
                 (0, &json!(false)),

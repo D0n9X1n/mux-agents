@@ -22,13 +22,30 @@ fn made(w: &World) -> usize {
         .count()
 }
 
-/// E3.2: a proven live view on the caller's server whose session still exists is reused: no session, no write.
+/// What `list-panes` answers for the view session `$3`: exit code and `<dead>|<pid>` rows.
+fn panes(w: &World, code: i32, rows: &str) {
+    w.fakes.mux_rule("list-panes -s -t $3 -F", code, rows, "");
+}
+/// A process the fake table lists as this binary's side bar, `<exe> watch`.
+fn bar(w: &World, pid: u32) {
+    w.fakes.process(crate::proc::Row {
+        path: Some("/bin/mux-agent".into()),
+        argv: Some(vec!["/bin/mux-agent".into(), "watch".into()]),
+        ..crate::testing::row(pid, 1, 9)
+    });
+}
+
+/// E3.2: a proven live view on the caller's server whose session still exists and holds a live view (here one pane
+/// beside its side bar) is reused: no session, no write.
 #[test]
 fn a_live_view_on_this_server_is_reused() {
     let w = World::human("");
     let me = w.caller(); // before the index exists: after Task 3 `w.caller()` admits through it (finding A9)
     own(&w);
     listed(&w, "$3 p-11111111-v\n");
+    w.fakes.process(crate::testing::row(6000, 1, 9));
+    bar(&w, 6001);
+    panes(&w, 0, "0|6001\n0|6000\n");
     let v = View {
         server: here(&w),
         session: "$3".into(),
@@ -46,6 +63,79 @@ fn a_live_view_on_this_server_is_reused() {
     no_kills(&w);
 }
 
+/// A listed view session is reused only while it holds a live view: a pane not dead whose process the process table
+/// lists, not ended, and that is not a side bar. After a core kill its `hc attach` views end at once and its bars
+/// leave a moment later, so a session holding only those would vanish right after `up` answered it: a new session is
+/// made, the old view an alias.
+#[test]
+fn a_view_session_holding_no_live_view_is_not_reused() {
+    for case in [
+        "dead",
+        "gone",
+        "ended",
+        "unlisted",
+        "bar",
+        "empty",
+        "failed",
+        "transport",
+        "table",
+    ] {
+        let w = World::human("");
+        let me = w.caller();
+        own(&w);
+        listed(&w, "$3 p-11111111-v\n");
+        match case {
+            "dead" => w.fakes.process(crate::testing::row(6000, 1, 9)),
+            "ended" => {
+                w.fakes.process(crate::testing::row(6000, 1, 9));
+                w.fakes.ended(6000);
+            }
+            // Windows: a handle another process holds keeps an exited process openable, so `row` still answers
+            // while the process table no longer lists it.
+            "unlisted" => {
+                w.fakes.process(crate::testing::row(6000, 1, 9));
+                w.fakes.unlist(6000);
+            }
+            "bar" => bar(&w, 6000),
+            "table" => w.fakes.process(crate::testing::row(6000, 1, 9)),
+            _ => {}
+        }
+        match case {
+            "dead" => panes(&w, 0, "1|6000\n"),
+            "empty" => panes(&w, 0, ""),
+            "failed" => panes(&w, 1, ""),
+            // The pane listing does not run at all: the multiplexer cannot be reached.
+            "transport" => w.fakes.mux_script("list-panes -s -t $3 -F", |_| {
+                Err(crate::error::Refusal::internal(
+                    "the multiplexer did not answer",
+                ))
+            }),
+            _ => panes(&w, 0, "0|6000\n"),
+        }
+        w.fakes.mux_rule("new-session", 0, "$7 @3\n", "");
+        let v = View {
+            server: here(&w),
+            session: "$3".into(),
+            name: "p-11111111-v".into(),
+        };
+        let mut ix = base(Some(v.clone()), None);
+        ix.anchor = Some(Anchor {
+            key: "a1a1a1a1a1a1a1a1".into(),
+            session: "$A".into(),
+        });
+        if case == "table" {
+            // After the caller and its server are resolved: only `held`'s read of the process table fails.
+            w.fakes.table_fails();
+        }
+        let got = publish::ensure(&w.ctx, &me, &mut ix)
+            .unwrap_or_else(|e| panic!("{case}: up does not abort: {e:?}"));
+        assert_eq!(got.view.session, "$7", "{case}: a new session");
+        assert_eq!(ix.aliases, vec![v], "{case}: the old view an alias");
+        assert_eq!(made(&w), 1, "{case}: one session made");
+        no_kills(&w);
+    }
+}
+
 /// F4, call 34: a reuse whose server restarted while its sessions were listed is not reused: 1 `index`, no
 /// session made, nothing written.
 #[test]
@@ -54,6 +144,8 @@ fn a_view_whose_server_restarted_during_the_listing_is_not_reused() {
     let me = w.caller();
     listed(&w, "$3 p-11111111-v\n");
     own(&w);
+    w.fakes.process(crate::testing::row(6000, 1, 9));
+    panes(&w, 0, "0|6000\n");
     let v = View {
         server: index::server_of(&me),
         session: "$3".into(),

@@ -228,8 +228,45 @@ pub(crate) fn new_pending(ctx: &Ctx, me: &Caller, ix: &Index) -> Res<Pending> {
     })
 }
 
-/// E3.1, then E3.2 (a proven live view on the caller's server whose session is listed, the answering server
-/// re-proven after the listing: F4, call 34), else E3.3: a new `pending` written durably, then `start`.
+/// Whether `session` on the caller's server holds a live view: a pane not dead whose process the OS process table
+/// lists, not ended, and that is not a side bar. A core kill ends the session's `hc attach` views at once and its bars
+/// leave a moment later, so a session holding only those is still listed while it ends; reused, it would vanish right
+/// after `up` answered it. The table, not `Os::row`: on Windows a handle another process holds keeps an exited process
+/// openable. A pane listing or a process table that cannot be read holds nothing, so a new session is made.
+/// shortcut: an `hc attach` whose core just died but which has not exited yet still counts; the live tests saw every
+/// such view gone before `up` lists the panes.
+fn held(ctx: &Ctx, session: &str) -> bool {
+    let args = [
+        "list-panes",
+        "-s",
+        "-t",
+        session,
+        "-F",
+        "#{pane_dead}|#{pane_pid}",
+    ];
+    let Ok(out) = crate::mux::native(ctx, &args, true) else {
+        return false;
+    };
+    let pids: Vec<u32> = out
+        .stdout
+        .lines()
+        .filter_map(|l| match l.trim_end().split_once('|') {
+            Some(("0", pid)) => pid.parse().ok(),
+            _ => None,
+        })
+        .collect();
+    if out.code != 0 || pids.is_empty() {
+        return false;
+    }
+    ctx.os.table().is_ok_and(|rows| {
+        rows.iter()
+            .any(|r| pids.contains(&r.pid) && !ctx.os.ended(r) && !crate::sidebar::is_watch(ctx, r))
+    })
+}
+
+/// E3.1, then E3.2 (a proven live view on the caller's server whose session is listed and holds a live view, the
+/// answering server re-proven after the listing: F4, call 34), else E3.3: a new `pending` written durably, then
+/// `start`.
 pub fn ensure(ctx: &Ctx, me: &Caller, ix: &mut Index) -> Res<Published> {
     repair(ctx, me, ix)?;
     if let Some(v) = ix.view.clone()
@@ -238,6 +275,7 @@ pub fn ensure(ctx: &Ctx, me: &Caller, ix: &mut Index) -> Res<Published> {
         && sessions_on(ctx, me, &v.server)?
             .iter()
             .any(|s| s.0 == v.session)
+        && held(ctx, &v.session)
     {
         answered(ctx, me, &v.server)?;
         return Ok(Published {

@@ -597,6 +597,23 @@ fn stateful(w: &World, made: &Made) {
             stderr: String::new(),
         })
     });
+    // Each session it made holds a live view (the World's shell, a running process that is no side bar), so a later
+    // `up` reuses it; any other session is not found.
+    let m = made.clone();
+    w.fakes
+        .mux_script("-F #{pane_dead}|#{pane_pid}", move |args| {
+            let target = args.iter().skip_while(|a| *a != "-t").nth(1);
+            let known = target.is_some_and(|t| m.borrow().iter().any(|(i, _)| i == t));
+            Ok(crate::mux::Output {
+                code: if known { 0 } else { 1 },
+                stdout: if known {
+                    format!("0|{}{}", crate::agents::fixture::SHELL, char::from(10u8))
+                } else {
+                    String::new()
+                },
+                stderr: String::new(),
+            })
+        });
 }
 /// The fixtures every process of a crash scenario shares: the bar off (layout is not under test), the World server
 /// proven, every new view answered, launches holding, sessions answered from `made`.
@@ -1073,6 +1090,8 @@ fn in_session(w: &World, session: &str) {
 /// A second `up` that re-enters a team led by `id` at generation 0: its connect, reconcile's pass, re-entry's.
 fn reenters(w: &World, id: &str, f: &std::path::Path) {
     crate::agents::view_bind_tests::attach_panes(w, &[("%21", "t1")], &[]);
+    // The view's `hc attach` (pane pid 300) runs: the view session holds a live view, so `up` reuses it.
+    w.fakes.process(crate::testing::row(300, 1, 9));
     cf::online(w);
     for _ in 0..2 {
         cf::online(w);

@@ -23,6 +23,14 @@ pub(crate) fn base() -> World {
     std::fs::create_dir_all(&w.ctx.cwd).unwrap();
     cf::online(&w);
     w.fakes.mux_rule("new-session", 0, "$7 @3\n", "");
+    // The view session holds a live view (the World's shell, a running process that is no side bar), so a later
+    // `up` reuses it.
+    w.fakes.mux_rule(
+        "list-panes -s -t $7 -F #{pane_dead}|#{pane_pid}",
+        0,
+        &format!("0|{}\n", crate::agents::fixture::SHELL),
+        "",
+    );
     w.fakes.mux_rule("@mux-agents-sidebar", 0, "off\n", "");
     w.fakes
         .mux_rule("new-window", 0, "%9|@5|exact,#} attach t1\n", "");
