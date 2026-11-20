@@ -118,6 +118,8 @@ pub const GONE_FORMAT: &str = "#{pane_id}|#{pane_pid}";
 // Each pane of the session and whether it carries the side-bar label and is alive, compared by the server: a label
 // value with a newline or `|` cannot forge a line, and a dead pane (remain-on-exit) never counts as labelled.
 const LABEL_FORMAT: &str = "#{pane_id}|#{&&:#{==:#{@agent-role},sidebar},#{==:#{pane_dead},0}}";
+// The label as LABEL_FORMAT reads it, then the pane's pid and the bar's mark: what tells a bar still running apart.
+const LEFT_FORMAT: &str = "#{pane_id}|#{&&:#{==:#{@agent-role},sidebar},#{==:#{pane_dead},0}}|#{pane_pid}|#{@mux-agents-bar}";
 // The bar is `@mux-agents-sidebar-percent` of its window, never narrower than `@mux-agents-sidebar-min` columns,
 // both read where the bar's pane stands (pane, window, session, then `set -g`). Unset or not a whole number in
 // range: 20% of the window, at least 40 columns.
@@ -3917,8 +3919,8 @@ fn console_utf8() {}
 /// `sidebar [-Close]`: one bar per session, under the session's sidebar lock. Opens a split at the right edge of the
 /// caller's window (`bar_width` columns) running watch (again without -l only when the multiplexer refused the size),
 /// labelled @agent-role sidebar and recorded by its process; the proven bar is returned with opened false; -Close
-/// kills it only while it is still that process, and reports closed only when the pane is gone. A label is never
-/// trusted: an unproven labelled pane refuses both.
+/// kills it only while it is still that process, and reports closed only when the pane is gone and no bar it could not
+/// prove still runs. A label is never trusted: an unproven labelled pane refuses both.
 /// -Close first sets the session's @mux-agents-sidebar `off` and `sidebar` unsets it, both inside the lock, so a
 /// spawn's `ensure` never reopens a bar a returned -Close closed. Refused only from a tagged pane.
 pub fn sidebar(ctx: &Ctx, request: &Request) -> Res<Map<String, Value>> {
@@ -3977,12 +3979,19 @@ pub fn sidebar(ctx: &Ctx, request: &Request) -> Res<Map<String, Value>> {
         for window in windows(ctx, &caller.session)? {
             closed.extend(close_window(ctx, &caller.session, &window)?);
         }
+        // A watch this root's split started that no record proves (its opener died before it marked it) is killed
+        // by its process (`close_strays`).
         closed.extend(close_strays(ctx, &caller.session)?);
-        if closed.is_empty() {
-            let labelled = labelled(ctx, &["-s", "-t", &caller.session])?;
-            if !labelled.is_empty() {
-                return refuse(1, "sidebar", unproven(&labelled));
-            }
+        // Closed answers only with no bar left running. Nothing closed: any label refuses, as it may be a bar no
+        // record proves (a 0.2.1 bar). A bar closed: a label may be one its rotate-window moved onto another pane, so
+        // only a bar still running refuses (`running_bars`), such as one whose pane left a window that went.
+        let left = if closed.is_empty() {
+            labelled(ctx, &["-s", "-t", &caller.session])?
+        } else {
+            running_bars(ctx, &caller.session)?
+        };
+        if !left.is_empty() {
+            return refuse(1, "sidebar", unproven(&left));
         }
         reply.insert(
             "pane".into(),
@@ -4127,7 +4136,8 @@ fn root_key_with(ctx: &Ctx, random: &dyn Fn(&mut [u8]) -> std::io::Result<()>) -
 /// `q` then `y`: the bar closes as `sidebar -Close` closes it, for its own window only, in this process. Under the
 /// session's sidebar lock the session turns `off` (else another window's bar would open this one again on its next
 /// walk; `sidebar` turns it back on), 0.2.x's record migrates, then `close_window`. A bar this process kills ends with
-/// its pane; a bar not proven (run by hand) has nothing to kill, and the watch ends all the same.
+/// its pane; a bar not proven (run by hand, or its pane moved out of a window that went) has nothing to kill, and the
+/// watch ends all the same, so `q` never leaves its own bar running.
 fn close_bar(ctx: &Ctx, caller: &Caller) -> Res<()> {
     lock(ctx, &scope::shown_lock("sidebar", caller), || {
         native(
@@ -4367,6 +4377,37 @@ fn labelled(ctx: &Ctx, scope: &[&str]) -> Res<Vec<String>> {
         let line = line.strip_suffix('\r').unwrap_or(line);
         if let Some(pane) = line.strip_suffix("|1")
             && pane_id(pane)
+            && !panes.iter().any(|p| p == pane)
+        {
+            panes.push(pane.to_string());
+        }
+    }
+    Ok(panes)
+}
+
+/// The panes of `session` still running a side bar: labelled, alive, and marked for the pid they run (`open` marks a
+/// bar's pane only while it runs that pid). A bar whose pane left a window that went (`join-pane` of its last pane into
+/// another window) is one: its label and mark moved with its pane, its record went with the window. A label alone is
+/// not: rmux's rotate-window moves a bar's label and mark onto the pane it swaps with, which runs another pid, and a
+/// 0.2.1 bar carries no mark. An unreadable list refuses: it may hold such a pane.
+fn running_bars(ctx: &Ctx, session: &str) -> Res<Vec<String>> {
+    let listed = native(
+        ctx,
+        &["list-panes", "-s", "-t", session, "-F", LEFT_FORMAT],
+        false,
+    )?;
+    let mut panes: Vec<String> = Vec::new();
+    for line in listed.stdout.split('\n') {
+        let line = line.strip_suffix('\r').unwrap_or(line);
+        let mut fields = line.splitn(4, '|');
+        let (Some(pane), Some("1"), Some(pid), Some(mark)) =
+            (fields.next(), fields.next(), fields.next(), fields.next())
+        else {
+            continue;
+        };
+        if pane_id(pane)
+            && pid.parse::<u32>().is_ok()
+            && mark == pid
             && !panes.iter().any(|p| p == pane)
         {
             panes.push(pane.to_string());
@@ -4972,6 +5013,8 @@ mod tests {
     const SESSION_RECORD: &str = "-N show-options -qv -t $3 @mux-agents-sidebar-id";
     const CLEAR_SESSION: &str = "-N set-option -u -t $3 @mux-agents-sidebar-id";
     const SESSION_LABELS: &str = "-N list-panes -s -t $3 -F #{pane_id}|#{&&:#{==:#{@agent-role},sidebar},#{==:#{pane_dead},0}}";
+    // -Close's last read once it closed a bar: the session's panes with their label, pid and the bar's mark.
+    const SESSION_LEFT: &str = "-N list-panes -s -t $3 -F #{pane_id}|#{&&:#{==:#{@agent-role},sidebar},#{==:#{pane_dead},0}}|#{pane_pid}|#{@mux-agents-bar}";
     // -Close's list of the session's windows.
     const WINDOWS: &str = "-N list-windows -t $3 -F #{window_id}";
     const PROOF: &str = "#{pane_id}|#{window_id}|#{pane_dead}|#{pane_pid}";
@@ -10840,6 +10883,9 @@ mod tests {
                 return Ok(out(0, &format!("{role}\n"), ""));
             }
             let dead_asked = argv.last().is_some_and(|f| f.contains("pane_dead"));
+            let marks_asked = argv
+                .last()
+                .is_some_and(|f| f.ends_with("|#{pane_pid}|#{@mux-agents-bar}"));
             // `-s -t $3` lists the session; `-t @<n>` one window.
             let window = if argv[2] == "-s" {
                 assert_eq!(argv[2..6], ["-s", "-t", "$3", "-F"]);
@@ -10856,7 +10902,15 @@ mod tests {
                 .map(|(pane, v)| {
                     let role = v.split_once('|').map_or(v.as_str(), |(r, _)| r);
                     let dead = dead_asked && get(&p, &format!("dead {pane}")).is_some();
-                    format!("{pane}|{}\n", flag(role == "sidebar" && !dead))
+                    // With the pid and the mark asked: `<pid>|<mark>` after the label, each empty when unset.
+                    let tail = if marks_asked {
+                        let pid = get(&p, &format!("pid {pane}")).unwrap_or_default();
+                        let mark = get(&p, &format!("mark {pane}")).unwrap_or_default();
+                        format!("|{pid}|{mark}")
+                    } else {
+                        String::new()
+                    };
+                    format!("{pane}|{}{tail}\n", flag(role == "sidebar" && !dead))
                 })
                 .collect();
             Ok(out(0, &text, ""))
@@ -11762,6 +11816,7 @@ mod tests {
                 close_line("%7", 107),
                 CLEAR_RECORD.into(),
                 STRAYS.into(),
+                SESSION_LEFT.into(),
             ]
         );
         assert_eq!(
@@ -11824,8 +11879,21 @@ mod tests {
                 },
             ),
             ("no bar", Mux::default()),
+            (
+                "window gone",
+                Mux {
+                    open: true,
+                    ..Mux::default()
+                },
+            ),
         ] {
             let (w, panes) = sidebar_world("", mux);
+            // The bar's pane was joined into another window, and its own window @1 went with its record.
+            if case == "window gone" {
+                w.fakes
+                    .mux_first(READ_RECORD, 1, "", "can't find window: @1\n");
+                w.fakes.mux_first("list-windows", 0, "@2\n", "");
+            }
             let c = w.caller();
             let mut shown = Shown {
                 written: SystemTime::UNIX_EPOCH,
@@ -11897,6 +11965,14 @@ mod tests {
                 "refused" => {
                     assert!(!panel.closed);
                     assert_eq!(pick.note().as_deref(), Some("close failed: side bar"));
+                }
+                "window gone" => {
+                    assert_eq!(calls(&w), [OFF, SESSION_RECORD, READ_RECORD, WINDOWS]);
+                    assert_eq!(closes(&w), 0);
+                    assert!(
+                        panel.closed,
+                        "{case}: no record proves it, yet the watch ends, and its pane with it"
+                    );
                 }
                 _ => {
                     assert_eq!(calls(&w), [OFF, SESSION_RECORD, READ_RECORD]);
@@ -13565,6 +13641,7 @@ mod tests {
                 close_line("%8", 108),
                 CLEAR_RECORD.replace("@1", "@2"),
                 STRAYS.into(),
+                SESSION_LEFT.into(),
             ]
         );
         assert_eq!((record(&panes), get(&panes, &wrec("@2"))), (None, None));
@@ -13665,6 +13742,7 @@ mod tests {
                         CLEAR_RECORD.into(),
                         READ_RECORD.replace("@1", "@2"),
                         WINDOWS.into(),
+                        SESSION_LEFT.into(),
                     ],
                     "{case}"
                 );
@@ -13672,6 +13750,83 @@ mod tests {
                 assert_eq!(got, "1 rmux tmux call failed", "{case}");
             }
             assert_eq!(closes(&w), 1, "{case}");
+        }
+    }
+
+    // A window can go because its last pane moved, not died: `join-pane` of the bar into another window takes the
+    // bar's label and mark with it but not its record (a window option), so no record proves it any more. -Close
+    // closes the other bars, then finds the moved one still labelled and marked for its own pid: refused, naming it,
+    // never reported closed. The same holds for a join made before -Close ran (that window is not even listed).
+    #[test]
+    fn close_refuses_a_bar_whose_pane_left_a_window_gone_mid_close() {
+        let (w, panes) = sidebar_world("", Mux::default());
+        assert_eq!(ensure_in(&w, "@2"), "opened %7");
+        assert_eq!(ensure_in(&w, "@1"), "opened %8");
+        w.fakes.clear_log();
+        let p = panes.clone();
+        // Just before @2's record is read, its bar %7 is joined into @1: @2 is destroyed with its record.
+        w.fakes.mux_script(
+            "show-options -wqv -t @2 @mux-agents-sidebar-id",
+            move |_| {
+                set(&p, "win %7", "@1".into());
+                unset(&p, &wrec("@2"));
+                Ok(out(1, "", "can't find window: @2\n"))
+            },
+        );
+        assert_eq!(run(&w, &["-Close"]), refused(&["%7"]));
+        assert_eq!(closes(&w), 1, "only %8 was killed");
+        assert!(roles(&panes).contains("%7=sidebar|"), "{}", roles(&panes));
+        assert_eq!(calls(&w).last().map(String::as_str), Some(SESSION_LEFT));
+        // Joined before -Close ran: @2 is not listed, @1's bar %8 is closed, and %7 is refused all the same.
+        let (w, panes) = sidebar_world("", Mux::default());
+        assert_eq!(ensure_in(&w, "@2"), "opened %7");
+        assert_eq!(ensure_in(&w, "@1"), "opened %8");
+        set(&panes, "win %7", "@1".into());
+        unset(&panes, &wrec("@2"));
+        assert_eq!(run(&w, &["-Close"]), refused(&["%7"]));
+        assert_eq!(closes(&w), 1, "only %8 was killed");
+    }
+
+    // A label left by a closed bar is no bar: rmux's rotate-window moves the bar's label and its mark (the bar's pid)
+    // onto the pane it swaps with, and a 0.2.1 bar carries no mark. -Close that closed a bar refuses neither; only a
+    // pane labelled and marked for its own pid is a bar still running.
+    #[test]
+    fn close_that_closed_a_bar_is_not_refused_by_a_label_left_behind() {
+        for (case, extra) in [
+            (
+                "moved by rotate",
+                vec![("mark %2", "107".into()), ("pid %2", "102".into())],
+            ),
+            (
+                "0.2.1 bar",
+                vec![
+                    ("%9", "sidebar|".into()),
+                    ("pid %9", "109".into()),
+                    ("win %9", "@5".into()),
+                ],
+            ),
+        ] {
+            let (w, panes) = sidebar_world(
+                "",
+                Mux {
+                    open: true,
+                    extra,
+                    ..Mux::default()
+                },
+            );
+            if case == "moved by rotate" {
+                set(&panes, "%2", "sidebar|".into());
+            }
+            assert_eq!(
+                run(&w, &["-Close"]),
+                r#"ok {"pane":"%7","closed":true,"panes":["%7"]}"#,
+                "{case}"
+            );
+            assert_eq!(
+                calls(&w).last().map(String::as_str),
+                Some(SESSION_LEFT),
+                "{case}"
+            );
         }
     }
 

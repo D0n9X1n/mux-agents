@@ -345,29 +345,49 @@ pub fn kill_order(terminals: &[(u32, Option<i64>)]) -> Vec<(u32, Option<i64>)> {
     order
 }
 
-/// Waits up to `limit` until each of `processes` (pid and start, read from the table before a kill) has left the process
-/// table; panics naming those still listed after it. A row of that pid without a start is still that process (macOS
-/// lists a zombie not yet reaped without one); a row with another start is another process that took the pid.
-pub fn wait_gone(processes: &[(u32, Option<i64>)], limit: Duration) {
-    let host = mux_agent::proc::host();
-    let end = Instant::now() + limit;
-    loop {
-        let table = host.table().expect("process table");
-        let listed = |&(pid, start): &(u32, Option<i64>)| {
+/// Those of `processes` (pid and start, read from the table before a kill) that `table` still lists. A row of that pid
+/// without a start is still that process (macOS lists a zombie not yet reaped without one); a row with another start
+/// is another process that took the pid.
+pub fn still_listed(
+    table: &[mux_agent::proc::Row],
+    processes: &[(u32, Option<i64>)],
+) -> Vec<(u32, Option<i64>)> {
+    processes
+        .iter()
+        .copied()
+        .filter(|&(pid, start)| {
             table
                 .iter()
                 .any(|r| r.pid == pid && (r.start.is_none() || r.start == start))
-        };
-        let left: Vec<(u32, Option<i64>)> = processes.iter().copied().filter(listed).collect();
-        if left.is_empty() {
-            return;
+        })
+        .collect()
+}
+
+/// Reads `table` every 50 ms until it lists none of `processes` (`still_listed`), for at most `limit`: those it still
+/// lists then, none once all are gone.
+pub fn wait_gone_in(
+    mut table: impl FnMut() -> Vec<mux_agent::proc::Row>,
+    processes: &[(u32, Option<i64>)],
+    limit: Duration,
+) -> Vec<(u32, Option<i64>)> {
+    let end = Instant::now() + limit;
+    loop {
+        let left = still_listed(&table(), processes);
+        if left.is_empty() || Instant::now() >= end {
+            return left;
         }
-        assert!(
-            Instant::now() < end,
-            "killed processes still listed after {limit:?}: {left:?}"
-        );
         std::thread::sleep(Duration::from_millis(50));
     }
+}
+
+/// `wait_gone_in` on this host's process table; panics naming those still listed after `limit`.
+pub fn wait_gone(processes: &[(u32, Option<i64>)], limit: Duration) {
+    let host = mux_agent::proc::host();
+    let left = wait_gone_in(|| host.table().expect("process table"), processes, limit);
+    assert!(
+        left.is_empty(),
+        "killed processes still listed after {limit:?}: {left:?}"
+    );
 }
 
 /// SIGKILL (Windows `taskkill /F /PID`, never `/T`) of one pid this test owns, bounded to 30 s; whether it succeeded.

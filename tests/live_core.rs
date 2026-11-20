@@ -1,4 +1,6 @@
 #![cfg(feature = "live")]
+#[path = "support/bounded.rs"]
+mod bounded;
 #[path = "support/private_core.rs"]
 mod private_core;
 use private_core::PrivateCore;
@@ -282,41 +284,116 @@ fn core_drop_ends_a_holder_whose_core_is_gone() {
     );
 }
 
-// `wait_gone` returns only once a killed process has left the process table (a pid listed again with another start is
-// another process), and fails rather than wait past its limit for one that still runs.
-#[cfg(unix)]
+// `still_listed` decides by identity, (pid, start) as read before the kill: the same pid and start is still listed, and
+// so is that pid without a start (macOS lists a zombie not yet reaped without one); the pid with another start is
+// another process that took the pid, and an absent pid is gone.
 #[test]
-fn wait_gone_returns_once_the_process_left_the_table() {
-    use std::time::{Duration, Instant};
-    let host = mux_agent::proc::host();
-    let mut child = std::process::Command::new("/bin/sleep")
-        .arg("60")
-        .spawn()
-        .unwrap();
-    let pid = child.id();
-    let listed = |host: &dyn mux_agent::proc::Os| {
-        host.table()
-            .unwrap()
-            .iter()
-            .find(|r| r.pid == pid)
-            .map(|r| (r.pid, r.start))
+fn still_listed_decides_by_pid_and_start() {
+    use mux_agent::proc::Row;
+    let row = |pid, start| Row {
+        pid,
+        ppid: 1,
+        start,
+        path: None,
+        argv: None,
+        image: None,
     };
-    let me = listed(&*host).expect("the child is listed");
+    let table = [row(10, Some(100)), row(11, None), row(12, Some(999))];
+    let killed = [
+        (10, Some(100)),
+        (11, Some(110)),
+        (12, Some(120)),
+        (13, Some(130)),
+    ];
+    assert_eq!(
+        private_core::still_listed(&table, &killed),
+        [(10, Some(100)), (11, Some(110))]
+    );
+    assert!(private_core::still_listed(&[], &killed).is_empty());
+}
+
+// `wait_gone_in` reads the table again until it lists none of the processes, and returns at its bound with those it
+// still lists: never sooner, and never long after.
+#[test]
+fn wait_gone_in_polls_until_gone_or_its_bound() {
+    use mux_agent::proc::Row;
+    use std::time::{Duration, Instant};
+    let me = Row {
+        pid: 10,
+        ppid: 1,
+        start: Some(100),
+        path: None,
+        argv: None,
+        image: None,
+    };
+    let mut reads = 0;
+    let left = private_core::wait_gone_in(
+        || {
+            reads += 1;
+            if reads < 3 {
+                vec![me.clone()]
+            } else {
+                Vec::new()
+            }
+        },
+        &[(10, Some(100))],
+        Duration::from_secs(30),
+    );
+    assert_eq!((left, reads), (Vec::new(), 3));
+    let begun = Instant::now();
+    let left = private_core::wait_gone_in(
+        || vec![me.clone()],
+        &[(10, Some(100))],
+        Duration::from_millis(300),
+    );
+    let took = begun.elapsed();
+    assert_eq!(left, [(10, Some(100))]);
+    assert!(
+        took >= Duration::from_millis(300) && took < Duration::from_secs(5),
+        "{took:?}"
+    );
+}
+
+// On the real process table, on every OS: a child running this binary's `hold` is listed until it exits (its
+// release file appears), then `wait_gone` returns, not before.
+#[test]
+fn wait_gone_returns_once_a_real_child_left_the_table() {
+    use std::time::{Duration, Instant};
+    let d = root();
+    std::fs::create_dir_all(&d).unwrap();
+    let release = d.join("release.json");
+    let mut hold = std::process::Command::new(env!("CARGO_BIN_EXE_mux-agent"));
+    hold.arg("hold")
+        .arg(&release)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    let mut child = bounded::spawn(&mut hold, Duration::from_secs(120)).unwrap();
+    let host = mux_agent::proc::host();
+    let table = host.table().unwrap();
+    let me = table
+        .iter()
+        .find(|r| r.pid == child.id())
+        .map(|r| (r.pid, r.start))
+        .expect("the child is listed");
     assert!(me.1.is_some(), "the child's start: {me:?}");
     let running =
-        std::panic::catch_unwind(|| private_core::wait_gone(&[me], Duration::from_millis(300)));
-    assert!(running.is_err(), "a running process is not gone");
-    let killer = std::thread::spawn(move || {
+        private_core::wait_gone_in(|| host.table().unwrap(), &[me], Duration::from_millis(300));
+    assert_eq!(running, [me], "a running child is not gone");
+    let releaser = std::thread::spawn(move || {
         std::thread::sleep(Duration::from_millis(300));
-        child.kill().unwrap();
-        child.wait().unwrap();
+        std::fs::write(&release, "{}").unwrap();
     });
     let begun = Instant::now();
     private_core::wait_gone(&[me], Duration::from_secs(30));
     assert!(
         begun.elapsed() >= Duration::from_millis(300),
-        "returned before the kill"
+        "returned before the child exited"
     );
-    assert_ne!(listed(&*host), Some(me), "still listed");
-    killer.join().unwrap();
+    releaser.join().unwrap();
+    assert!(
+        child.wait().unwrap().success(),
+        "hold exits 0 once released"
+    );
+    std::fs::remove_dir_all(d).unwrap();
 }

@@ -2718,6 +2718,54 @@ hc {}:
         );
     }
 
+    // A bar whose pane was joined out of its window (that window's last pane, so the window went) is proven by no
+    // record any more, yet it still runs: -Close closes the other window's bar and refuses, naming the moved one,
+    // rather than answering closed with a bar left.
+    fn close_refuses_a_bar_joined_out_of_a_window_that_went(mux: Mux) {
+        let Some(mut live) = Live::human(mux) else {
+            return;
+        };
+        let root = live.server.pane().to_string();
+        let session = format!("{}:", live.field(&root, "#{session_id}"));
+        let other = live
+            .call(&[
+                "new-window",
+                "-d",
+                "-P",
+                "-F",
+                "#{pane_id}",
+                "-t",
+                &session,
+                "sh",
+            ])
+            .trim()
+            .to_string();
+        let (code, here) = live.run(&["sidebar"]);
+        assert_eq!((code, &here["opened"]), (0, &json!(true)), "{mux:?} {here}");
+        let (code, there) = live.run_in(&other, &["sidebar"]);
+        assert_eq!(
+            (code, &there["opened"]),
+            (0, &json!(true)),
+            "{mux:?} {there}"
+        );
+        let (here, moved) = (s(&here["pane"]).to_string(), s(&there["pane"]).to_string());
+        // The other window keeps only its bar, which then joins the root's window: the other window goes.
+        live.call(&["kill-pane", "-t", &other]);
+        live.call(&["join-pane", "-d", "-h", "-s", &moved, "-t", &root]);
+        let (code, close) = live.run(&["sidebar", "-Close"]);
+        assert_eq!(code, 1, "{mux:?}: a bar still runs: {close}");
+        let refused = format!("pane {moved} carries the side-bar label");
+        assert!(
+            s(&close["message"]).starts_with(&refused),
+            "{mux:?} {close}"
+        );
+        live.wait_gone(&here);
+        assert!(
+            live.panes("#{pane_id}").contains(&moved),
+            "{mux:?}: the moved bar was killed"
+        );
+    }
+
     // test 8: a pane in another window of the session carrying the label without proof (a 0.2.1 bar) refuses
     // -Close, which closes no bar: nothing is killed. a label refuses only a bar of its own window, so sidebar
     // and a spawn's bar open in their own windows.
@@ -6219,7 +6267,7 @@ hc {}:
             restored.sort();
             let mut want: Vec<&str> = ids.iter().map(String::as_str).collect();
             want.sort();
-            assert_eq!(restored, want, "{mux:?}: every lost member restored");
+            assert_eq!(restored, want, "{mux:?}: every lost member restored: {up}");
             let mut news = Vec::new();
             for (i, id) in ids.iter().enumerate() {
                 let r = json_file(&live.agent_dir(id).join("record.json"));
@@ -6284,7 +6332,7 @@ hc {}:
             assert_eq!(
                 again["restored"],
                 json!([]),
-                "{mux:?}: a second up starts nothing"
+                "{mux:?}: a second up starts nothing: {again}"
             );
             let now = std::fs::read_to_string(live.dir.join("clients.log"))
                 .unwrap()
@@ -6515,9 +6563,13 @@ hc {}:
             let held = up["held"].as_array().unwrap();
             assert_eq!(held.len(), 2, "{mux:?} {up}");
             for h in held {
-                assert_eq!(h["reason"], "occupied", "{mux:?} {h}");
+                assert_eq!(h["reason"], "occupied", "{mux:?} {h}: {up}");
                 let pid = strays[if h["id"] == json!(ids[1]) { 0 } else { 1 }];
-                assert!(s(&h["holder"]).contains(&pid.to_string()), "{mux:?} {h}");
+                assert!(
+                    s(&h["holder"]).contains(&pid.to_string()),
+                    "{mux:?}: the stray {pid} holds {}: {up}",
+                    h["id"]
+                );
             }
             support::write_atomic(&live.dir.join(format!("quit.{}", strays[0])), "0");
             live.server.wait("stray claude gone", || {
@@ -6535,7 +6587,7 @@ hc {}:
             assert_eq!(
                 second["held"][0]["id"],
                 json!(ids[2]),
-                "{mux:?}: the Copilot stray still holds B"
+                "{mux:?}: the Copilot stray still holds B: {second}"
             );
             support::write_atomic(&live.dir.join(format!("quit.{}", strays[1])), "0");
             live.server.wait("stray copilot gone", || {
@@ -6656,6 +6708,7 @@ hc {}:
                     bar_width_follows_its_options,
                     replaced_bar_is_never_closed,
                     close_after_rotate_spares_the_users_pane,
+                    close_refuses_a_bar_joined_out_of_a_window_that_went,
                     unproven_label_in_another_window_refuses,
                     manual_watch_moves_nothing,
                     manual_watch_without_a_bar_moves_nothing,
