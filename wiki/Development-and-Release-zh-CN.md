@@ -220,7 +220,7 @@ flowchart TD
 - 每次 checkout 都设置 `persist-credentials: false`（`checkout_persist_credentials_false`）；每个 `uses:` 都固定到 40 位十六进制提交并附版本注释（`action_pins_are_40_hex_with_version_comment`）；没有工作流提及 PowerShell（`no_pwsh_in_workflows`）。
 - 发布的 `publish` 依赖 `validate` 和 `build`（`publish_needs_validate_and_build`），令牌不会出现在任何命令行上（`release_token_never_in_argv`、`wiki_publish_runs_sh_with_token_off_argv`）。
 - `test` 作业按上文顺序运行其命令（`ci_jobs_run_cargo_and_sh`）；每个实时步骤都要求 `tmux,tmux32,rmux`（`integration_runs_live_on_every_multiplexer`）；`sh scripts/dev/hc.sh` 在第一个实时测试之前运行（`live_core_installer_precedes_tests`）；遗留 holder 检查步骤位于串行实时轮之后（`integration_fails_on_a_leftover_private_core_holder`）。
-- `plugin.json`、`Cargo.toml` 和 `Cargo.lock` 持有同一版本（`plugin_version_is_0_3_5_and_matches_cargo`）；`marketplace.json` 固定 ref `dist`，`.gitignore` 含 `/scripts/bin/`（`marketplace_pins_dist_ref`）；`.gitattributes` 保留其 `export-ignore` 和换行符规则（`export_ignore_rules`）。
+- `plugin.json`、`Cargo.toml` 和 `Cargo.lock` 持有同一版本（`plugin_version_is_0_3_6_and_matches_cargo`）；`marketplace.json` 固定 ref `dist`，`.gitignore` 含 `/scripts/bin/`（`marketplace_pins_dist_ref`）；`.gitattributes` 保留其 `export-ignore` 和换行符规则（`export_ignore_rules`）。
 
 ## 合并流程
 
@@ -236,7 +236,7 @@ flowchart TD
 
 `main` 只放源码：`.gitignore` 含 `/scripts/bin/`。一次发布把六个二进制构建到 `scripts/bin/<os>-<arch>/`，附一个 `SHA256SUMS`，并提交到 `dist` 分支。`.claude-plugin/marketplace.json` 固定 `"ref": "dist"`，因此市场安装的是 `dist`，用户从不需要构建或下载二进制。
 
-1. 在 `main` 上，把 `.claude-plugin/plugin.json` 和 `Cargo.toml` 设为同一版本，然后 `cargo build` 以更新 `Cargo.lock`。`tests/repo.rs` 中的 `plugin_version_is_0_3_5_and_matches_cargo` 固定了版本，因此发布提交也要更新它。
+1. 在 `main` 上，把 `.claude-plugin/plugin.json` 和 `Cargo.toml` 设为同一版本，然后 `cargo build` 以更新 `Cargo.lock`。`tests/repo.rs` 中的 `plugin_version_is_0_3_6_and_matches_cargo` 固定了版本，因此发布提交也要更新它。
 2. 等该提交的 CI 推送运行变绿后，在其上推送标签 `v<version>`。
 3. 在 GitHub 发布中撰写发布说明：`gh release edit v<version> --notes-file <file>`。发布说明只存在于那里；仓库不保留变更日志，wiki 描述代码是什么以及为什么，从不为每个版本单写一页。
 

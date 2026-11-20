@@ -220,7 +220,7 @@ A fake client of a parallel live test is an unmanaged client of another state ro
 - Every checkout sets `persist-credentials: false` (`checkout_persist_credentials_false`); every `uses:` pins a 40-hex commit with a version comment (`action_pins_are_40_hex_with_version_comment`); no workflow names PowerShell (`no_pwsh_in_workflows`).
 - The release's `publish` needs `validate` and `build` (`publish_needs_validate_and_build`), and no token reaches a command line (`release_token_never_in_argv`, `wiki_publish_runs_sh_with_token_off_argv`).
 - The `test` job runs its commands in the order above (`ci_jobs_run_cargo_and_sh`); every live step requires `tmux,tmux32,rmux` (`integration_runs_live_on_every_multiplexer`); `sh scripts/dev/hc.sh` runs before the first live test (`live_core_installer_precedes_tests`); the leftover-holder step follows the serial live pass (`integration_fails_on_a_leftover_private_core_holder`).
-- `plugin.json`, `Cargo.toml` and `Cargo.lock` hold the same version (`plugin_version_is_0_3_5_and_matches_cargo`); `marketplace.json` pins ref `dist` and `.gitignore` holds `/scripts/bin/` (`marketplace_pins_dist_ref`); `.gitattributes` keeps its `export-ignore` and line-ending rules (`export_ignore_rules`).
+- `plugin.json`, `Cargo.toml` and `Cargo.lock` hold the same version (`plugin_version_is_0_3_6_and_matches_cargo`); `marketplace.json` pins ref `dist` and `.gitignore` holds `/scripts/bin/` (`marketplace_pins_dist_ref`); `.gitattributes` keeps its `export-ignore` and line-ending rules (`export_ignore_rules`).
 
 ## Merge procedure
 
@@ -236,7 +236,7 @@ The push to `main` starts CI's push run, which a release later requires, and the
 
 `main` is source only: `.gitignore` holds `/scripts/bin/`. A release builds six binaries into `scripts/bin/<os>-<arch>/` with one `SHA256SUMS` and commits them on the `dist` branch. `.claude-plugin/marketplace.json` pins `"ref": "dist"`, so the marketplace installs `dist` and a person never builds or downloads a binary.
 
-1. On `main`, set the same version in `.claude-plugin/plugin.json` and `Cargo.toml`, then `cargo build` to update `Cargo.lock`. `plugin_version_is_0_3_5_and_matches_cargo` in `tests/repo.rs` pins the version, so the release commit updates it too.
+1. On `main`, set the same version in `.claude-plugin/plugin.json` and `Cargo.toml`, then `cargo build` to update `Cargo.lock`. `plugin_version_is_0_3_6_and_matches_cargo` in `tests/repo.rs` pins the version, so the release commit updates it too.
 2. Push tag `v<version>` on that commit once its CI push run is green.
 3. Write the release notes in the GitHub release: `gh release edit v<version> --notes-file <file>`. Release notes live only there; the repository keeps no changelog, and the wiki describes what the code is and why, never one page per version.
 
