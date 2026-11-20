@@ -4075,16 +4075,18 @@ fn close_strays(ctx: &Ctx, session: &str) -> Res<Vec<String>> {
 fn split_watch(ctx: &Ctx, pid: u32, key: &str) -> bool {
     ctx.os
         .row(pid)
-        .is_some_and(|row| managed_by(ctx, &row) == Some(Some(key)))
+        .is_some_and(|row| managed_by(ctx, &row) == Some(key))
 }
 
-/// Whose managed watch `row` is, read from that one row: `None` when it is not this binary's `watch -Managed`,
-/// `Some(key)` with the key its argv names (`Some(None)` when it names none). Judged from the row already read, so a
-/// second read that fails can never make a watch look like another root's.
-fn managed_by<'a>(ctx: &Ctx, row: &'a crate::proc::Row) -> Option<Option<&'a str>> {
+/// Whose managed watch `row` is, read from that one row: the key a `<binary> watch -Managed <key>` names, `None` for
+/// any other process (a `watch` a person ran, or a `-Managed` with no key, which `is_watch` does not take for a watch
+/// at all). Judged from the row already read, so a second read that fails can never make a watch look like another
+/// root's.
+fn managed_by<'a>(ctx: &Ctx, row: &'a crate::proc::Row) -> Option<&'a str> {
     let argv = row.argv.as_ref()?;
     (is_watch(ctx, row) && argv.get(2).is_some_and(|f| f == MANAGED))
         .then(|| argv.get(3).map(String::as_str))
+        .flatten()
 }
 
 /// The file in the state root that holds the root's key.
@@ -4443,7 +4445,7 @@ fn running_bars(ctx: &Ctx, session: &str) -> Res<Vec<String>> {
         let foreign = row
             .as_ref()
             .and_then(|row| managed_by(ctx, row))
-            .is_some_and(|owner| owner != Some(key.as_str()));
+            .is_some_and(|owner| owner != key);
         let marked = labelled == "1" && mark == pid;
         let watching = row.as_ref().is_some_and(|row| is_watch(ctx, row));
         if !foreign && (marked || watching) {
@@ -14028,6 +14030,15 @@ mod tests {
             r#"ok {"pane":"%7","closed":true,"panes":["%7"]}"#
         );
         assert_eq!(get(&panes, "pid %9").as_deref(), Some("109"));
+        // Its process is read once by the sweep and once by the final check, which judges whose it is from that
+        // read: a second read there (the one that can fail) would make three.
+        let reads = w
+            .fakes
+            .os_calls()
+            .iter()
+            .filter(|c| *c == "row 109")
+            .count();
+        assert_eq!(reads, 2, "{:?}", w.fakes.os_calls());
     }
 
     // Whose watch a pane runs is judged from one read of its process: a second read that fails (the process table
