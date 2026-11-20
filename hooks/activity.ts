@@ -76,6 +76,22 @@ export function reportSession($: EngineInterface, sessionId: unknown, source: un
   sessions = sessions.then(async () => {
     await $.process.run(await entryArgv($, ['report', '-Session', sessionId, '-Source', word, '-Quiet']), { timeoutMs: 30000 })
   }).catch(() => {})
+  // The side bar by default, after the report: a person's chat in tmux or rmux. The binary refuses an agent's pane,
+  // keeps a bar the person closed closed and skips `clear` and `compact`; failures are dropped.
+  sessions = sessions.then(async () => {
+    if (!(await barHere($))) return
+    await $.process.run(await entryArgv($, ['sidebar', '-Auto', '-Source', word, '-Quiet']), { timeoutMs: 10000 })
+  }).catch(() => {})
+}
+
+// Inside tmux or rmux, and not a cloud session: where a side bar can open. An hc terminal outside them has none.
+async function barHere($: EngineInterface): Promise<boolean> {
+  try {
+    if ((await $.env.get('CLAUDE_CODE_REMOTE')) === 'true') return false
+    return Boolean((await $.env.get('TMUX')) || (await $.env.get('RMUX')))
+  } catch {
+    return false
+  }
 }
 
 // The main loop only: a subagent's turns and tools (agentId) are not this agent's own.

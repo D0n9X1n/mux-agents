@@ -300,8 +300,6 @@ const BADGE: Style = Style {
 };
 const MAIL: &str = "\u{2709}";
 const HINT: &str = "Enter: focus  Esc: clear";
-// The selection's indicator: Nerd Font `nf-fa-chevron_right` (one column, a private-use code point).
-const SELECTED: &str = "\u{f054}";
 // The soft background of the row on screen: a 256-color dark grey, a faint band rather than a highlight.
 const BAND: u8 = 236;
 // The main chat's glyph: Nerd Font `nf-fa-terminal` (`$` in ASCII).
@@ -1192,6 +1190,17 @@ fn lay_focus(
         .collect();
     fold_kept(&mut laid, kept);
     fold_kept(&mut laid, mains);
+    // More space for the main chat at the top: a blank row between the header and the main rows, only in a row the
+    // bar has to spare, so it never costs an agent, main or ended row.
+    let headed = !laid.rows.is_empty() && !laid.agents.iter().any(|(_, at)| *at == 0);
+    if n > 0 && headed && laid.rows.len() + asked_n < size.height {
+        laid.rows.insert(1, Row::new());
+        for at in
+            (laid.agents.iter_mut().map(|(_, at)| at)).chain(laid.more.iter_mut().map(|(_, at)| at))
+        {
+            *at += 1;
+        }
+    }
     shade(&mut laid, focus.shown, size.width, look);
     for (n, style) in asked.into_iter().take(asked_n) {
         laid.rows
@@ -1498,18 +1507,28 @@ pub(crate) fn shade(laid: &mut Laid, shown: Option<&str>, width: usize, look: Lo
     }
 }
 
-/// Marks member `id`'s drawn row as selected with an indicator, never a highlight: its margin becomes the Nerd Font
-/// chevron `SELECTED` (`>` in ASCII) and the row keeps its own styles. Nothing when `id` is not drawn.
-fn mark(laid: &mut Laid, id: &str, look: Look) {
+/// Marks member `id`'s drawn row as selected. With color the band is the one mark: it leaves the shown row for this
+/// one, across `width`, so the bar never shows two marks. Without a band to draw (no color, ASCII) column 0 becomes
+/// `>`, so the keys still show what Enter opens. Nothing when `id` is not drawn.
+fn mark(laid: &mut Laid, id: &str, width: usize, look: Look) {
     let Some(&(_, at)) = laid.agents.iter().find(|(target, _)| target.id == id) else {
         return;
     };
-    // On the banded row the chevron keeps the band.
-    let bg = laid.rows[at][0].1.bg;
-    laid.rows[at][0] = span(
-        if look.ascii { ">" } else { SELECTED },
-        Style { bg, ..PLAIN },
-    );
+    if look.color && !look.ascii {
+        for (_, style) in laid.rows.iter_mut().flatten() {
+            style.bg = None;
+        }
+        let row = &mut laid.rows[at];
+        let pad = width.saturating_sub(row_width(row));
+        if pad > 0 {
+            row.push(span(" ".repeat(pad), PLAIN));
+        }
+        for (_, style) in row.iter_mut() {
+            style.bg = Some(BAND);
+        }
+        return;
+    }
+    laid.rows[at][0] = span(">", PLAIN);
 }
 
 /// The board as text rows, SGR only when `look.color`; for tests and screenshots.
@@ -1525,7 +1544,8 @@ pub fn format_board(
         .collect()
 }
 
-/// The board as the bar draws it with `shown` on screen (its row banded) and `selected` picked (its chevron), as
+/// The board as the bar draws it with `shown` on screen and `selected` picked (the band on the selection when there is
+/// one, else on the shown row), as
 /// text rows; for screenshots of the real frame.
 pub fn format_focus(
     board: Option<&Map<String, Value>>,
@@ -1536,7 +1556,7 @@ pub fn format_focus(
 ) -> Vec<String> {
     let mut laid = lay_focus(board, &[], size, look, tree::Focus { shown, selected }).0;
     if let Some(id) = selected {
-        mark(&mut laid, id, look);
+        mark(&mut laid, id, size.width, look);
     }
     laid.rows
         .iter()
@@ -2000,10 +2020,15 @@ pub fn run_watch(
         if let Some(looked) = looked.clone() {
             viewing.tick(looked, last.as_ref());
         }
-        // The band follows the pane on screen, but not into the bar itself: while the person works in the bar the last
-        // pane they looked at keeps it (detached: none).
+        // The band follows the pane on screen. With the bar itself in front (the person switched to this tab, or works
+        // in the bar) it is this window's other pane, so a tab switch moves the band to that tab's agent; a window
+        // read that names no other pane keeps the band where it was (detached: none).
         match looked.as_ref() {
-            Some(Some(pane)) if *pane == caller.pane => {}
+            Some(Some(pane)) if *pane == caller.pane => {
+                if let Some(other) = window_other(ctx, caller) {
+                    banded = Some(other);
+                }
+            }
             Some(seen) => banded.clone_from(seen),
             None => {}
         }
@@ -2064,7 +2089,7 @@ pub fn run_watch(
                         ..focus
                     },
                 );
-                mark(&mut laid, id, look);
+                mark(&mut laid, id, size.width, look);
                 laid
             }
             None => bare,
@@ -2141,6 +2166,31 @@ pub(crate) fn shown_pane(ctx: &Ctx, caller: &Caller) -> Option<Option<String>> {
 }
 
 const SHOWN_FORMAT: &str = "#{pane_id}|#{session_attached}";
+
+/// The bar's window's other pane, the one active last (else the first): what a tab shows beside its bar. None when
+/// the read fails or the bar is alone.
+fn window_other(ctx: &Ctx, caller: &Caller) -> Option<String> {
+    let read = native(
+        ctx,
+        &["list-panes", "-t", &caller.window, "-F", WINDOW_PANES],
+        true,
+    )
+    .ok()?;
+    if read.code != 0 {
+        return None;
+    }
+    let rows: Vec<(&str, bool)> = (read.stdout.lines())
+        .filter_map(|line| {
+            let mut f = line.trim_end_matches('\r').split('|');
+            let (pane, _active, last) = (f.next()?, f.next()?, f.next()?);
+            (crate::agents::pane_id(pane) && pane != caller.pane).then_some((pane, last == "1"))
+        })
+        .collect();
+    let (pane, _) = rows.iter().find(|(_, last)| *last).or(rows.first())?;
+    Some(pane.to_string())
+}
+
+const WINDOW_PANES: &str = "#{pane_id}|#{pane_active}|#{pane_last}";
 
 /// Who the person is looking at, as herdr holds a done agent while it is viewed: the shown pane, the newest done
 /// spell (a row's `changedAt`) it showed while looked at, and the spells left behind still to be marked seen.
@@ -2875,18 +2925,44 @@ fn console_utf8() {}
 /// -Close first sets the session's @mux-agents-sidebar `off` and `sidebar` unsets it, both inside the lock, so a
 /// spawn's `ensure` never reopens a bar a returned -Close closed. Refused only from a tagged pane.
 pub fn sidebar(ctx: &Ctx, request: &Request) -> Res<Map<String, Value>> {
+    let close = request.switch("Close");
+    let auto = request.switch("Auto");
+    let stdin = request.switch("Stdin");
+    let given = request.value("Source").is_some();
+    // `-Source` and `-Stdin` belong to `-Auto` only, exactly one of them; `-Close` takes neither.
+    let sources = usize::from(given) + usize::from(stdin);
+    if close && auto || if auto { sources != 1 } else { sources != 0 } {
+        return Err(crate::agents::usage("sidebar"));
+    }
+    // A chat's `clear` or `compact` is the same session going on: the person already had the bar or closed it.
+    if auto && matches!(auto_source(request).as_deref(), Some("clear" | "compact")) {
+        return Ok(skipped("source"));
+    }
     let caller = resolve(ctx)?;
     crate::cli::member_views(ctx, &caller)?;
     crate::agents::registry::untagged(ctx, &caller, "an agent pane cannot open the side bar")?;
-    let close = request.switch("Close");
     lock(ctx, &scope::shown_lock("sidebar", &caller), || {
         let mut reply = Map::new();
-        if !close {
+        if auto {
+            // The bar by default (a person's chat started or resumed): as `sidebar`, but a session whose bar the
+            // person closed (`off`) keeps it closed, and the window is not marked viewed, since a chat window holds
+            // no member view and its bar would leave at once.
+            let read = native(
+                ctx,
+                &["show-options", "-qv", "-t", &caller.session, OPTION],
+                false,
+            )?;
+            if read.stdout.trim_end_matches(['\r', '\n']) == "off" {
+                return Ok(skipped("off"));
+            }
+        } else if !close {
             native(
                 ctx,
                 &["set-option", "-u", "-t", &caller.session, OPTION],
                 false,
             )?;
+        }
+        if !close {
             migrate(ctx, &caller.session)?;
             let (pane, window, opened) = find_or_open(ctx, &caller.window)?;
             reply.insert("pane".into(), pane.into());
@@ -2943,6 +3019,27 @@ pub fn sidebar(ctx: &Ctx, request: &Request) -> Res<Map<String, Value>> {
         reply.insert("panes".into(), closed.into());
         Ok(reply)
     })
+}
+
+/// What started the chat, for `sidebar -Auto`: `-Source`, or `source` in the client's JSON on stdin (Copilot's
+/// `sessionStart`). None when stdin is a terminal, too long, not JSON or has no `source`: that still opens.
+fn auto_source(request: &Request) -> Option<String> {
+    if let Some(source) = request.value("Source") {
+        return Some(source.to_string());
+    }
+    let body: Value = serde_json::from_slice(&crate::agents::session_report::read_stdin()?).ok()?;
+    body.get("source")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+}
+
+/// `sidebar -Auto` that opened nothing, and why: `source` (`clear` or `compact`) or `off` (the person closed it).
+fn skipped(why: &str) -> Map<String, Value> {
+    let mut reply = Map::new();
+    reply.insert("pane".into(), Value::Null);
+    reply.insert("opened".into(), false.into());
+    reply.insert("skipped".into(), why.into());
+    reply
 }
 
 /// The bar's width options: at least `min` columns, `percent` of the window.
@@ -4724,18 +4821,19 @@ mod tests {
         ]});
         let laid = lay(board.as_object(), &[], W40, PLAIN_LOOK);
         let text: Vec<String> = laid.rows.iter().map(|r| render(r, false)).collect();
-        // Header, then one row per main pane, the one whose oldest agent is oldest first (%4's `done`, 300 s, before
-        // %3's `worker`, 240 s; %1 is an agent's own pane, so no main), then the agents.
-        assert_eq!(text[1], format!(" {MAIN} main"), "{text:?}");
-        assert_eq!(text[2], format!(" {MAIN} main 2"), "{text:?}");
-        assert!(text[4].starts_with(" \u{25c9} worker"), "{text:?}");
+        // Header, a blank row, then one row per main pane, the one whose oldest agent is oldest first (%4's `done`,
+        // 300 s, before %3's `worker`, 240 s; %1 is an agent's own pane, so no main), then the agents.
+        assert_eq!(text[1], "", "{text:?}");
+        assert_eq!(text[2], format!(" {MAIN} main"), "{text:?}");
+        assert_eq!(text[3], format!(" {MAIN} main 2"), "{text:?}");
+        assert!(text[5].starts_with(" \u{25c9} worker"), "{text:?}");
         // The header counts agents only.
         assert_eq!(text[0], pad("mux-agents", "2 working / 2 ended"));
         let mains: Vec<(&str, usize)> = (laid.agents.iter())
             .filter(|(t, _)| t.life == pick::MAIN)
             .map(|(t, at)| (t.pane.as_str(), *at))
             .collect();
-        assert_eq!(mains, [("%4", 1), ("%3", 2)]);
+        assert_eq!(mains, [("%4", 2), ("%3", 3)]);
         // A click on a main row hits it; the walk ends with the main rows, so `j` still starts at the first agent.
         let walk = walk_of(board.as_object(), &laid, false);
         let names: Vec<&str> = walk.iter().map(|t| t.name.as_str()).collect();
@@ -4746,21 +4844,21 @@ mod tests {
             ..PLAIN_LOOK
         };
         let rows = lay(board.as_object(), &[], W40, ascii);
-        assert_eq!(render(&rows.rows[1], false), " $ main");
+        assert_eq!(render(&rows.rows[2], false), " $ main");
         let focus = tree::Focus {
             shown: Some("%3"),
             selected: None,
         };
         let shown = lay_focus(board.as_object(), &[], W40, PLAIN_LOOK, focus).0;
-        // %3 is `main 2`, row 2: banded in color, its text unchanged.
+        // %3 is `main 2`, row 3: banded in color, its text unchanged.
         let color = Look {
             color: true,
             ..PLAIN_LOOK
         };
         let lit = lay_focus(board.as_object(), &[], W40, color, focus).0;
-        assert!(lit.rows[2].iter().all(|(_, s)| s.bg.is_some()));
-        assert!(!lit.rows[1].iter().any(|(_, s)| s.bg.is_some()));
-        assert!(render(&shown.rows[2], false).starts_with(' '));
+        assert!(lit.rows[3].iter().all(|(_, s)| s.bg.is_some()));
+        assert!(!lit.rows[2].iter().any(|(_, s)| s.bg.is_some()));
+        assert!(render(&shown.rows[3], false).starts_with(' '));
         // No parent anywhere, or a team: no main row.
         let plain = json!({"running": 1, "agents": [{"name": "w", "state": "running", "age": 1, "pane": "%1"}]});
         assert!(
@@ -4769,6 +4867,83 @@ mod tests {
                 .iter()
                 .all(|(t, _)| t.life != pick::MAIN)
         );
+    }
+
+    // More space for the main chat at the top: a blank row between the header and `main` when the bar has a row to
+    // spare. A short bar drops it before any agent, main or ended row.
+    #[test]
+    fn a_blank_row_sets_main_apart_from_the_header() {
+        let board = json!({"running": 1, "endedTotal": 0, "agents": [{"id": "aaaaaaaaaaaa", "name": "worker",
+            "state": "running", "age": 1, "pane": "%2", "parent": "%1"}]});
+        let rows = |height: usize| -> Vec<String> {
+            lay(
+                board.as_object(),
+                &[],
+                Size { width: 40, height },
+                PLAIN_LOOK,
+            )
+            .rows
+            .iter()
+            .map(|r| render(r, false))
+            .collect()
+        };
+        let tall = rows(24);
+        assert!(
+            tall[0].contains("mux-agents") && tall[1].is_empty(),
+            "{tall:?}"
+        );
+        assert_eq!(tall[2], format!(" {MAIN} main"), "{tall:?}");
+        let laid = lay(board.as_object(), &[], W40, PLAIN_LOOK);
+        let main_at = laid
+            .agents
+            .iter()
+            .find(|(t, _)| t.life == pick::MAIN)
+            .unwrap()
+            .1;
+        assert_eq!(main_at, 2, "a click on row 2 hits main");
+        // Exactly as tall as the rows without it: no blank row, every row kept.
+        let tight = rows(tall.len() - 1);
+        assert_eq!(tight[1], format!(" {MAIN} main"), "{tight:?}");
+        assert!(tight.iter().any(|r| r.contains("worker")), "{tight:?}");
+    }
+
+    // The blank row above `main` takes only a spare row: with kept shells and a pending `close? y/n`, a frame exactly
+    // as tall as its rows keeps the question on its last line and no blank row; one row more brings the blank row.
+    #[test]
+    fn the_blank_row_never_pushes_out_a_pending_question() {
+        let board = json!({"running": 1, "endedTotal": 0, "agents": [{"id": "aaaaaaaaaaaa", "name": "worker",
+            "state": "running", "age": 1, "pane": "%2", "parent": "%1"}],
+            "kept": [{"address": "t7", "name": "old", "member": "aaaaaaaaaaaa"}]});
+        let asked: &[(&str, Style)] = &[(pick::ASK, PLAIN)];
+        let rows = |height: usize| -> Vec<String> {
+            lay_focus(
+                board.as_object(),
+                asked,
+                Size { width: 40, height },
+                PLAIN_LOOK,
+                tree::Focus::default(),
+            )
+            .0
+            .rows
+            .iter()
+            .map(|r| render(r, false))
+            .collect()
+        };
+        let roomy = rows(30);
+        let at = roomy.iter().position(|r| r.contains("main")).unwrap();
+        assert!(
+            roomy[at - 1].is_empty() && roomy[0].contains("mux-agents"),
+            "{roomy:?}"
+        );
+        assert!(roomy.last().unwrap().contains(pick::ASK), "{roomy:?}");
+        let tight = rows(roomy.len() - 1);
+        assert_eq!(tight.len(), roomy.len() - 1, "{tight:?}");
+        assert!(tight.last().unwrap().contains(pick::ASK), "{tight:?}");
+        assert!(
+            !tight[1].is_empty(),
+            "no blank row in a tight frame: {tight:?}"
+        );
+        assert!(tight.iter().any(|r| r.contains("worker")), "{tight:?}");
     }
 
     #[test]
@@ -4881,7 +5056,7 @@ mod tests {
             .collect();
         assert_eq!(mains, ["%3"]);
         let laid = lay(ended.as_object(), &[], W40, PLAIN_LOOK);
-        assert_eq!(render(&laid.rows[1], false), format!(" {MAIN} main"));
+        assert_eq!(render(&laid.rows[2], false), format!(" {MAIN} main"));
         // A team's bar has its leader instead.
         let team = json!({"team": true, "agents": [{"id": "L", "name": "lead", "state": "running", "leader": true, "parent": "%3"}]});
         assert!(main_targets(team.as_object()).is_empty());
@@ -5001,14 +5176,18 @@ mod tests {
             let focus = tree::Focus { shown, selected };
             let mut laid = lay_focus(board.as_object(), &[], W40, look, focus).0;
             if let Some(id) = selected {
-                mark(&mut laid, id, look);
+                mark(&mut laid, id, 40, look);
             }
             laid
         };
         let text =
             |laid: &Laid| -> Vec<String> { laid.rows.iter().map(|r| render(r, false)).collect() };
-        // Rows: header, main, gap, worker, its doing line, gap, writer.
-        let (main, worker, doing, writer) = (1, 3, 4, 6);
+        let any_band_but = |laid: &Laid, keep: usize| {
+            (0..laid.rows.len())
+                .any(|at| at != keep && laid.rows[at].iter().any(|(_, s)| s.bg.is_some()))
+        };
+        // Rows: header, gap, main, gap, worker, its doing line, gap, writer.
+        let (main, worker, doing, writer) = (2, 4, 5, 7);
         let banded = |laid: &Laid, at: usize| laid.rows[at].iter().all(|(_, s)| s.bg == Some(BAND));
         let any_band = |laid: &Laid| laid.rows.iter().flatten().any(|(_, s)| s.bg.is_some());
         let shown = laid(color, Some("%2"), None);
@@ -5070,15 +5249,28 @@ mod tests {
         .0;
         assert!(any_band(&narrow), "{:?}", narrow.rows);
         assert!(!any_band(&laid(color, Some("%9"), None)));
-        // The chevron sits on the band on the shown row, and on its own elsewhere.
+        // One mark: a selection takes the band from the shown row; no chevron anywhere.
         let both = laid(color, Some("%2"), Some("writer"));
-        assert!(banded(&both, writer) && text(&both)[writer].starts_with('\u{f054}'));
+        assert!(banded(&both, writer) && !banded(&both, worker));
         let apart = laid(color, Some("%2"), Some("worker"));
-        assert!(text(&apart)[worker].starts_with('\u{f054}') && banded(&apart, writer));
+        assert!(
+            banded(&apart, worker) && !any_band_but(&apart, worker),
+            "{:?}",
+            text(&apart)
+        );
+        for l in [&both, &apart] {
+            assert!(
+                text(l)
+                    .iter()
+                    .all(|r| !r.contains('\u{f054}') && !r.starts_with('>')),
+                "{:?}",
+                text(l)
+            );
+        }
     }
 
     #[test]
-    fn selected_row_shows_the_chevron_and_never_reverses() {
+    fn the_selection_takes_the_band_and_shows_no_chevron() {
         let board = json!({"running": 2, "endedTotal": 0, "agents": [
             {"name": "worker", "state": "running", "doing": "testing", "age": 240, "unread": 0, "color": "blue", "activity": "working", "pane": "%1"},
             {"name": "writer", "state": "running", "model": "sonnet", "age": 180, "unread": 2, "color": "magenta", "activity": "working", "pane": "%2"}
@@ -5094,38 +5286,47 @@ mod tests {
         let drawn = |look: Look, selected: Option<&str>| {
             let mut laid = lay(board.as_object(), &[], W40, look);
             if let Some(name) = selected {
-                mark(&mut laid, name, look);
+                mark(&mut laid, name, 40, look);
             }
-            laid.rows
-                .iter()
-                .map(|row| render(row, look.color))
-                .collect::<Vec<_>>()
+            laid
         };
-        let rows = drawn(PLAIN_LOOK, Some("worker"));
-        assert_eq!(
-            rows[2],
-            pad("\u{25c9} worker", "working   4m").replacen(' ', "\u{f054}", 1)
-        );
-        let rows = drawn(ascii, Some("worker"));
-        assert!(rows[2].starts_with(">* worker"), "{:?}", rows[2]);
-        // With color the row keeps its own styles: only column 0 changes, nothing is reversed.
-        for selected in ["worker", "writer"] {
-            let rows = drawn(color, Some(selected));
+        // With color the band is the selection's only mark: the text is the bare frame's, nothing reversed.
+        for (selected, at) in [("worker", 2), ("writer", 5)] {
+            let laid = drawn(color, Some(selected));
             let bare = drawn(color, None);
-            let at = if selected == "worker" { 2 } else { 5 };
-            assert!(rows.iter().all(|r| !r.contains("\u{1b}[7")), "{rows:?}");
-            for (n, (got, want)) in rows.iter().zip(&bare).enumerate() {
-                if n == at {
-                    assert_eq!(got.strip_prefix('\u{f054}'), want.strip_prefix(' '), "{n}");
-                } else {
-                    assert_eq!(got, want, "{n}");
-                }
+            for (n, (got, want)) in laid.rows.iter().zip(&bare.rows).enumerate() {
+                let banded = got.iter().any(|(_, s)| s.bg == Some(BAND));
+                assert_eq!(banded, n == at, "{selected} {n}");
+                assert_eq!(
+                    render(got, false).trim_end(),
+                    render(want, false).trim_end(),
+                    "{n}"
+                );
+                assert!(!render(got, true).contains("\u{1b}[7"), "{n}");
             }
+        }
+        // Without a band to draw (no color, ASCII) the keys still show their row: `>` in column 0.
+        for look in [PLAIN_LOOK, ascii] {
+            let rows: Vec<String> = drawn(look, Some("worker"))
+                .rows
+                .iter()
+                .map(|r| render(r, false))
+                .collect();
+            assert!(
+                rows[2].starts_with('>') && !rows[2].contains('\u{f054}'),
+                "{rows:?}"
+            );
+            assert!(
+                rows.iter()
+                    .enumerate()
+                    .all(|(n, r)| n == 2 || !r.starts_with('>')),
+                "{rows:?}"
+            );
         }
         // An unknown name marks nothing.
         let mut laid = lay(board.as_object(), &[], W40, color);
         let before = laid.rows.clone();
-        mark(&mut laid, "nobody", color);
+        mark(&mut laid, "nobody", 40, color);
         assert_eq!(laid.rows, before);
     }
 
@@ -5722,6 +5923,90 @@ mod tests {
         assert_eq!(call[call.len() - 3..], ["-t", "$3", SHOWN_FORMAT]);
     }
 
+    // A tab switch to a window whose active pane is its bar: the row on screen is the window's other pane (the one
+    // active last), so the band moves to that tab's agent and never stays on the last pane of another tab.
+    #[test]
+    fn the_bar_in_front_shows_its_windows_other_pane() {
+        let w = World::human("");
+        let caller = w.caller();
+        let window = caller.window.clone();
+        for (listed, want) in [
+            (format!("{}|1|0\n%53|0|1\n", caller.pane), Some("%53")),
+            (
+                format!("%60|0|0\n{}|1|0\n%61|0|1\n", caller.pane),
+                Some("%61"),
+            ),
+            // No last pane: the first other pane.
+            (format!("%60|0|0\n{}|1|0\n", caller.pane), Some("%60")),
+            // The bar alone, or an unreadable list: none.
+            (format!("{}|1|0\n", caller.pane), None),
+            ("garbage".into(), None),
+        ] {
+            w.fakes.mux_first(WINDOW_PANES, 0, &listed, "");
+            assert_eq!(window_other(&w.ctx, &caller).as_deref(), want, "{listed:?}");
+            let call = w.fakes.mux_calls().pop().unwrap();
+            assert_eq!(
+                call[call.len() - 4..],
+                ["-t", window.as_str(), "-F", WINDOW_PANES],
+                "{listed:?}"
+            );
+        }
+        w.fakes.mux_first(WINDOW_PANES, 1, "%53|0|1\n", "");
+        assert_eq!(window_other(&w.ctx, &caller), None);
+    }
+
+    #[test]
+    fn a_tab_switch_moves_the_band_to_that_tabs_agent() {
+        // A pane with no row (%2, a plain shell in another tab) on screen, then the person switches to the bar's tab
+        // (%7 in front) whose other pane is worker's view (%9): worker's row takes the band.
+        let mut w = click_world(&["live", "live", "live", "gone"], board_answer());
+        let env: Vec<(String, String)> = (w.ctx.env.iter())
+            .filter(|(k, _)| *k != "NO_COLOR")
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        w.ctx.env = Env::from_pairs(env);
+        watch_env(&mut w, "FORCE_COLOR", "1");
+        let probes = Rc::new(Cell::new(0));
+        let seen = probes.clone();
+        w.fakes
+            .mux_script("#{pane_id}|#{session_attached}", move |_| {
+                seen.set(seen.get() + 1);
+                Ok(out(
+                    0,
+                    if seen.get() == 1 { "%2|1\n" } else { "%7|1\n" },
+                    "",
+                ))
+            });
+        w.fakes.mux_first(WINDOW_PANES, 0, "%9|0|1\n%7|1|0\n", "");
+        watch_frames(&w, 3);
+        let (ended, frames) = watch_run(&w);
+        assert_eq!(ended, "pane-closed");
+        let band = "\u{1b}[48;5;236m";
+        assert!(!frames[0].contains(band), "{frames:?}");
+        let last: Vec<String> = (frames.last().unwrap().split("\r\n"))
+            .filter(|l| l.contains(band))
+            .map(|l| {
+                // The text without its SGR: each band span is its own `ESC[..m`.
+                let mut out = String::new();
+                let mut esc = false;
+                for c in l.chars() {
+                    match (esc, c) {
+                        (false, '\u{1b}') => esc = true,
+                        (true, 'm') => esc = false,
+                        (false, c) => out.push(c),
+                        _ => {}
+                    }
+                }
+                out
+            })
+            .collect();
+        assert!(
+            last.len() == 1 && last[0].contains("worker"),
+            "{last:?} {:?}",
+            frames.last()
+        );
+    }
+
     #[test]
     fn format_age_units() {
         let ages: Vec<String> = [
@@ -5878,6 +6163,7 @@ mod tests {
     fn board_rows() -> Vec<String> {
         vec![
             pad("mux-agents", "1 working / 1 ended"),
+            String::new(),
             format!(" {MAIN} main"),
             String::new(),
             pad("\u{25c9} worker", "working   4m"),
@@ -6554,7 +6840,7 @@ mod tests {
     // The board with worker selected: the marker in its margin and the hint under the board.
     fn marked_frame() -> String {
         let mut rows = board_rows();
-        rows[3] = rows[3].replacen(' ', "\u{f054}", 1);
+        rows[4] = rows[4].replacen(' ', ">", 1);
         rows.push(String::new());
         rows.push(format!(" {HINT}"));
         screen(&rows, 24)
@@ -6578,7 +6864,7 @@ mod tests {
     #[test]
     fn click_focuses_through_one_read_and_guarded_select() {
         let w = click_world(&["live", "live", "live", "gone"], board_answer());
-        let script = Script::new(&w.fakes, vec![(300, press(4))]);
+        let script = Script::new(&w.fakes, vec![(300, press(5))]);
         watch_frames(&w, 1);
         crate::agents::core_fixture::online(&w);
         watch_frames(&w, 2);
@@ -6616,9 +6902,9 @@ mod tests {
 
     #[test]
     fn click_on_the_doing_line_focuses_its_agent() {
-        // Row 5 is worker's doing line: the same read and guarded select as its name line.
+        // Row 6 is worker's doing line: the same read and guarded select as its name line.
         let w = click_world(&["live", "live", "live", "gone"], board_answer());
-        let script = Script::new(&w.fakes, vec![(300, press(5))]);
+        let script = Script::new(&w.fakes, vec![(300, press(6))]);
         watch_frames(&w, 1);
         crate::agents::core_fixture::online(&w);
         watch_frames(&w, 2);
@@ -6636,7 +6922,7 @@ mod tests {
             "-N display-message -p -t %1 #{pane_id}|#{window_active}|#{pane_active}|#{pane_dead}";
         let w = click_world(&["live", "live", "live", "gone"], board_answer());
         w.fakes.mux_first(main_back, 0, "%1|1|1|0\n", "");
-        let script = Script::new(&w.fakes, vec![(300, press(2))]);
+        let script = Script::new(&w.fakes, vec![(300, press(3))]);
         // The main pane is no member: no hc connection.
         watch_frames(&w, 3);
         let (ended, frames, _) = watch_with(&w, Box::new(script));
@@ -6663,7 +6949,7 @@ mod tests {
         // A main pane that is gone: the read-back fails, the bar says so and selects nothing else.
         let w = click_world(&["live", "live", "live", "gone"], board_answer());
         w.fakes.mux_first(main_back, 0, "\n", "");
-        let script = Script::new(&w.fakes, vec![(300, press(2))]);
+        let script = Script::new(&w.fakes, vec![(300, press(3))]);
         // The main pane is no member: no hc connection.
         watch_frames(&w, 3);
         let (_, frames, _) = watch_with(&w, Box::new(script));
@@ -6820,7 +7106,7 @@ mod tests {
             &["live", "live", "live", "live", "live", "gone"],
             board_answer(),
         );
-        let steps = vec![(300, press(1)), (300, press(3)), (300, press(8))];
+        let steps = vec![(300, press(1)), (300, press(2)), (300, press(9))];
         watch_frames(&w, 5);
         let (ended, frames, times) = watch_with(&w, Box::new(Script::new(&w.fakes, steps)));
         assert_eq!((ended, frames.len()), ("pane-closed", 5));
@@ -6844,7 +7130,7 @@ mod tests {
     fn press_near_or_across_a_write_is_dropped() {
         // Read 20 ms after its frame: dropped, but it still redraws at once.
         let w = click_world(&["live", "live", "live", "gone"], board_answer());
-        let script = Script::new(&w.fakes, vec![(20, press(4))]);
+        let script = Script::new(&w.fakes, vec![(20, press(5))]);
         watch_frames(&w, 3);
         let (_, _, times) = watch_with(&w, Box::new(script));
         assert_eq!(diffs(&times), [20, 2000]);
@@ -6858,14 +7144,14 @@ mod tests {
         assert_eq!((click_reads(&w), selects(&w)), (0, 0));
         // 30 ms after the second write: dropped.
         let w = click_world(&["live", "live", "live", "live", "gone"], board_answer());
-        let script = Script::new(&w.fakes, vec![(2030, press(4))]);
+        let script = Script::new(&w.fakes, vec![(2030, press(5))]);
         watch_frames(&w, 4);
         let (_, _, times) = watch_with(&w, Box::new(script));
         assert_eq!(diffs(&times), [2000, 30, 2000]);
         assert_eq!((click_reads(&w), selects(&w)), (0, 0));
         // 100 ms after it: acts.
         let w = click_world(&["live", "live", "live", "live", "gone"], board_answer());
-        let script = Script::new(&w.fakes, vec![(2100, press(4))]);
+        let script = Script::new(&w.fakes, vec![(2100, press(5))]);
         watch_frames(&w, 2);
         crate::agents::core_fixture::online(&w);
         watch_frames(&w, 2);
@@ -6879,14 +7165,14 @@ mod tests {
     #[test]
     fn a_press_read_at_its_frame_is_dropped_and_one_read_after_the_gap_focuses() {
         let w = click_world(&["live", "live", "live", "gone"], board_answer());
-        let script = Script::new(&w.fakes, vec![(0, press(4))]);
+        let script = Script::new(&w.fakes, vec![(0, press(5))]);
         watch_frames(&w, 3);
         let (_, frames, times) = watch_with(&w, Box::new(script));
         assert_eq!(diffs(&times), [0, 2000], "redrawn at once, no tick counted");
         assert_eq!(frames.len(), 3);
         assert_eq!((click_reads(&w), selects(&w)), (0, 0), "dropped: no focus");
         let w = click_world(&["live", "live", "live", "live", "gone"], board_answer());
-        let script = Script::new(&w.fakes, vec![(2060, press(4))]);
+        let script = Script::new(&w.fakes, vec![(2060, press(5))]);
         watch_frames(&w, 2);
         crate::agents::core_fixture::online(&w);
         watch_frames(&w, 2);
@@ -6926,7 +7212,7 @@ mod tests {
     fn stale_press_dismisses_the_note_and_redraws() {
         let w = click_world(&["live", "live", "live", "live", "gone"], board_answer());
         w.fakes.mux_first(READ_BACK, 0, "%9|0|1|1\n", "");
-        let steps = vec![(300, press(4)), (20, press(4))];
+        let steps = vec![(300, press(5)), (20, press(5))];
         watch_frames(&w, 1);
         crate::agents::core_fixture::online(&w);
         watch_frames(&w, 3);
@@ -6989,7 +7275,7 @@ mod tests {
                 "",
             ))
         });
-        let script = Script::new(&w.fakes, vec![(300, press(4))]);
+        let script = Script::new(&w.fakes, vec![(300, press(5))]);
         watch_frames(&w, 1);
         crate::agents::core_fixture::online(&w);
         watch_frames(&w, 2);
@@ -7009,7 +7295,7 @@ mod tests {
     fn read_back_failure_shows_note() {
         let w = click_world(&["live", "live", "live", "gone"], board_answer());
         w.fakes.mux_first(READ_BACK, 1, "", "no server");
-        let script = Script::new(&w.fakes, vec![(300, press(4))]);
+        let script = Script::new(&w.fakes, vec![(300, press(5))]);
         watch_frames(&w, 1);
         crate::agents::core_fixture::online(&w);
         watch_frames(&w, 2);
@@ -7243,14 +7529,18 @@ mod tests {
             "{:?}",
             frames[2]
         );
-        assert!(frames[2].contains("\u{f054}"), "{:?}", frames[2]);
+        assert!(
+            frames[2].lines().any(|l| l.starts_with('>')),
+            "{:?}",
+            frames[2]
+        );
     }
 
     #[test]
     fn note_lasts_to_second_tick_or_next_key() {
         let w = click_world(&["live", "live", "live", "live", "gone"], board_answer());
         w.fakes.mux_first(READ_BACK, 0, "%9|0|1|1\n", "");
-        let script = Script::new(&w.fakes, vec![(300, press(4))]);
+        let script = Script::new(&w.fakes, vec![(300, press(5))]);
         watch_frames(&w, 1);
         crate::agents::core_fixture::online(&w);
         watch_frames(&w, 3);
@@ -7265,7 +7555,7 @@ mod tests {
         let w = click_world(&["live", "live", "live", "gone"], board_answer());
         w.fakes.mux_first(READ_BACK, 0, "%9|0|1|1\n", "");
         let steps = vec![
-            (300, press(4)),
+            (300, press(5)),
             (100, key(b"\x1b[<0;3;3m")),
             (100, key(b"j")),
         ];
@@ -9102,6 +9392,103 @@ mod tests {
         }
     }
 
+    // The bar by default: a person's chat that starts or resumes runs `sidebar -Auto -Source <word>`. It opens the
+    // bar as `sidebar` does, but never undoes `sidebar -Close` and never reopens after `clear` or `compact`.
+    #[test]
+    fn auto_opens_the_bar_then_finds_it() {
+        let (w, panes) = sidebar_world("", Mux::default());
+        assert_eq!(
+            run(&w, &["-Auto", "-Source", "startup"]),
+            r#"ok {"pane":"%7","window":"@1","opened":true}"#
+        );
+        assert_eq!(roles(&panes), "%1=|,%2=other|,%7=sidebar|");
+        // Never unsets the option, never marks the window viewed (a chat window holds no member view).
+        let lines: Vec<String> = w.fakes.mux_calls().iter().map(|c| c.join(" ")).collect();
+        assert!(!lines.iter().any(|l| l.ends_with(ON)), "{lines:?}");
+        assert!(!lines.iter().any(|l| l.contains(VIEWED)), "{lines:?}");
+        for source in ["resume", "new", "unknown"] {
+            assert_eq!(
+                run(&w, &["-Auto", "-Source", source]),
+                r#"ok {"pane":"%7","window":"@1","opened":false}"#,
+                "{source}"
+            );
+        }
+    }
+
+    #[test]
+    fn auto_keeps_a_closed_bar_closed_and_skips_clear_and_compact() {
+        let (w, panes) = sidebar_world(
+            "",
+            Mux {
+                disabled: true,
+                ..Mux::default()
+            },
+        );
+        assert_eq!(
+            run(&w, &["-Auto", "-Source", "startup"]),
+            r#"ok {"pane":null,"opened":false,"skipped":"off"}"#
+        );
+        assert_eq!(option(&panes).as_deref(), Some("off"));
+        assert_eq!(count(&w, "split-window"), 0);
+        for source in ["clear", "compact"] {
+            let (w, _) = sidebar_world("", Mux::default());
+            assert_eq!(
+                run(&w, &["-Auto", "-Source", source]),
+                r#"ok {"pane":null,"opened":false,"skipped":"source"}"#,
+                "{source}"
+            );
+            assert!(w.fakes.mux_calls().is_empty(), "{source}");
+        }
+    }
+
+    // Copilot's `sessionStart` passes its JSON on stdin, `source` among its fields.
+    #[test]
+    fn auto_reads_the_source_from_stdin() {
+        use crate::agents::session_report::hooks;
+        for (body, want) in [
+            (
+                Some(r#"{"sessionId":"x","source":"compact"}"#),
+                r#"ok {"pane":null,"opened":false,"skipped":"source"}"#,
+            ),
+            (
+                Some(r#"{"sessionId":"x","source":"new"}"#),
+                r#"ok {"pane":"%7","window":"@1","opened":true}"#,
+            ),
+            (
+                Some("not json"),
+                r#"ok {"pane":"%7","window":"@1","opened":true}"#,
+            ),
+            (None, r#"ok {"pane":"%7","window":"@1","opened":true}"#),
+        ] {
+            let (w, _) = sidebar_world("", Mux::default());
+            hooks::stdin(body.map(str::as_bytes));
+            assert_eq!(run(&w, &["-Auto", "-Stdin"]), want, "{body:?}");
+        }
+        hooks::stdin(None);
+        let (w, _) = sidebar_world("", Mux::default());
+        for args in [
+            &["-Auto"][..],
+            &["-Auto", "-Stdin", "-Source", "x"],
+            &["-Close", "-Auto", "-Source", "x"],
+            &["-Source", "x"],
+            &["-Stdin"],
+            &["-Source", "clear", "-Stdin"],
+            &["-Close", "-Stdin"],
+        ] {
+            assert!(run(&w, args).starts_with("2 usage "), "{args:?}");
+        }
+    }
+
+    #[test]
+    fn auto_from_an_agent_pane_refuses_and_opens_nothing() {
+        let (w, panes) = sidebar_world("aaaaaaaaaaaa", Mux::default());
+        assert_eq!(
+            run(&w, &["-Auto", "-Source", "startup"]),
+            "2 tagged an agent pane cannot open the side bar"
+        );
+        assert_eq!(roles(&panes), "%1=|,%2=other|");
+    }
+
     #[test]
     fn sidebar_close_tagged_refuses() {
         let (w, panes) = sidebar_world(
@@ -10385,11 +10772,9 @@ mod tests {
                 selected: Some("D1"),
             },
         );
-        mark(&mut seen, "D1", PLAIN_LOOK);
+        mark(&mut seen, "D1", 40, PLAIN_LOOK);
         assert!(
-            seen.rows
-                .iter()
-                .any(|r| render(r, false).starts_with("\u{f054}")),
+            seen.rows.iter().any(|r| render(r, false).starts_with('>')),
             "through hinted: {:?}",
             seen.rows.len()
         );
@@ -10474,7 +10859,7 @@ mod tests {
             },
         )
         .0;
-        mark(&mut laid, "D", ascii);
+        mark(&mut laid, "D", 40, ascii);
         let text: Vec<String> = laid.rows.iter().map(|r| render(r, false)).collect();
         assert!(
             text.iter().any(|l| l.starts_with("     * C1"))

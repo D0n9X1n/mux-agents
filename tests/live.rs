@@ -5391,6 +5391,26 @@ hc {}:
                 "{mux:?}: j to grand, Enter"
             );
             check(&live);
+            // The band follows the tab on screen: with grand's bar itself the active pane of grand's window (the person
+            // switched to that tab and clicked into its bar), the bar still bands grand's row, the tab's other pane, in
+            // color when the bar draws color here; and no bar draws the selection chevron.
+            // First the leader's window, so grand's bar last saw another pane on screen; then grand's bar itself.
+            live.call(&["select-window", "-t", &views[0].0]);
+            live.call(&["select-pane", "-t", &views[0].0]);
+            std::thread::sleep(Duration::from_secs(3));
+            live.call(&["select-window", "-t", &bars[2]]);
+            live.call(&["select-pane", "-t", &bars[2]]);
+            let band = "\u{1b}[48;5;236m";
+            let mut lit = String::new();
+            let banded = eventually(Duration::from_secs(10), || {
+                lit = live.call(&["capture-pane", "-p", "-e", "-t", &bars[2]]);
+                !lit.contains(band) || lit.lines().any(|l| l.contains(band) && l.contains("grand"))
+            });
+            assert!(banded, "{mux:?} grand's bar:\n{lit}");
+            for bar in &bars {
+                let screen = live.call(&["capture-pane", "-p", "-t", bar]);
+                assert!(!screen.contains('\u{f054}'), "{mux:?} {bar}:\n{screen}");
+            }
             // Grand prints a marker on its own terminal (the fake client prints nothing else), and hc keeps it before grand
             // stops: the output the popup must show. One word, as `Client::text` drops blanks.
             let marker = format!("grand-said-{}", std::process::id());

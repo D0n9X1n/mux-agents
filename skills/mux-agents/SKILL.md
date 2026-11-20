@@ -23,7 +23,7 @@ The commands below, and the Reply and Listen lines, run as-is in the Bash tool. 
 - Report results to your parent with `send parent`.
 - As a spawned agent, run `status -BodyFile <file>` each time you start a step of your task.
 - When the user wants agents as tabs first, run `placement tab`; as panes first, run `placement h` (or `v`). It lasts for the session. Splits keep the user's pane the largest: three agents fit beside it, and further agents open as tabs.
-- The first `spawn` opens a narrow side bar beside you showing how many agents run and what each is doing. `sidebar -Close` closes it for the session; `sidebar` opens it again.
+- A narrow side bar beside you shows how many agents run and what each is doing. It opens when the person's chat starts in tmux or rmux, and on the first `spawn`. `sidebar -Close` closes it for the session; `sidebar` opens it again.
 - Never type into panes.
 - Run `focus` only when the user asks.
 - In a team (started with `up`), a member may spawn its own children, down to depth 3, while the team has fewer than 6 members besides the leader and spawn budget left. Outside a team, children cannot spawn.

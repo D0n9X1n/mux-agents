@@ -50,7 +50,8 @@ test('on Windows_NT the session report runs cmd.exe /d /c <root>\\scripts\\mux-a
   const { seen, clock } = world(on, { RMUX: 'x', OS: 'Windows_NT' })
   await ($ as any).classic.SessionStart({ source: 'startup', session_id: SID })
   await clock.settle()
-  expect(seen.argv).toEqual([['cmd.exe', '/d', '/c', `${seen.root}\\scripts\\mux-agent.cmd`, 'report', '-Session', SID, '-Source', 'startup', '-Quiet']])
+  const cmd = ['cmd.exe', '/d', '/c', `${seen.root}\\scripts\\mux-agent.cmd`]
+  expect(seen.argv).toEqual([[...cmd, 'report', '-Session', SID, '-Source', 'startup', '-Quiet'], [...cmd, 'sidebar', '-Auto', '-Source', 'startup', '-Quiet']])
 })
 
 // (fix 2, re-audit 3) One classic.SessionStart per test.
@@ -104,3 +105,28 @@ test('a later session report waits for an earlier one that is still running', as
   expect(started.map(a => [a[4], a[6]])).toEqual([[SID, 'startup'], [SID2, 'clear']])
   expect(finished).toEqual([SID, SID2])
 })
+
+// The bar by default: a person's chat that starts or resumes in tmux or rmux opens the side bar, after its session
+// report and never awaited. The binary keeps a bar the person closed closed and skips `clear` and `compact`; the hook
+// passes the source on. Outside tmux and rmux (an hc terminal, no multiplexer) nothing opens it.
+for (const env of [{ TMUX: 'x' }, { RMUX: 'x' }]) {
+  test(`inside ${Object.keys(env)[0]} a SessionStart opens the side bar after the session report`, async ($, on) => {
+    const { seen, clock } = world(on, env, 60000)
+    await ($ as any).classic.SessionStart({ source: 'resume', session_id: SID })
+    await clock.settle()
+    expect(seen.argv).toEqual([['sh', `${seen.root}/scripts/mux-agent`, 'report', '-Session', SID, '-Source', 'resume', '-Quiet']])
+    await clock.advance(60000)
+    await clock.settle()
+    expect(seen.argv[1]).toEqual(['sh', `${seen.root}/scripts/mux-agent`, 'sidebar', '-Auto', '-Source', 'resume', '-Quiet'])
+    expect(seen.argv.length).toBe(2)
+  })
+}
+
+for (const env of [{}, { HC_TERMINAL_ID: 't1' }, { TMUX: 'x', CLAUDE_CODE_REMOTE: 'true' }]) {
+  test(`with ${JSON.stringify(env)} a SessionStart opens no side bar`, async ($, on) => {
+    const { seen, clock } = world(on, env)
+    await ($ as any).classic.SessionStart({ source: 'startup', session_id: SID })
+    await clock.settle()
+    expect(seen.argv.filter(a => a.includes('sidebar'))).toEqual([])
+  })
+}

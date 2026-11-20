@@ -155,7 +155,8 @@ if [ "$n" = 34 ] && [ -z "$why" ]; then ok skill_commands_run_through_shim; else
 # Copilot reads the plugin root's hooks.json (Claude Code reads hooks/hooks.json only) and runs each command from
 # the plugin root. Every hook reports through the shim, never fails the turn, and maps Copilot's events as herdr's
 # agents report: a prompt works, a question blocks until answered, a stop idles. Session start names the session
-# (report-2b K3): `report -Session -Stdin` reads Copilot's JSON from stdin, with 30 s for its readiness wait.
+# (report-2b K3): `report -Session -Stdin` reads Copilot's JSON from stdin, with 30 s for its readiness wait; then
+# `sidebar -Auto -Stdin` opens the side bar by default from the same JSON's `source`.
 copilot_hooks_report_through_the_shim() {
   name=copilot_hooks_report_through_the_shim
   hooks="$repo/hooks.json"
@@ -168,7 +169,7 @@ for event, entries in sorted(h["hooks"].items()):
         assert e["type"] == "command" and e["timeoutSec"] <= (30 if event == "sessionStart" else 10), e
         # Unix runs bash, Windows the portable command (no PowerShell in the repository, tests/repo.rs); both quiet.
         assert set(e) == {"type", "bash", "command", "timeoutSec"} | ({"matcher"} if "matcher" in e else set()), e
-        assert e["bash"].startswith("sh scripts/mux-agent report ") and e["bash"].endswith(" -Quiet"), e
+        assert e["bash"].startswith(("sh scripts/mux-agent report ", "sh scripts/mux-agent sidebar -Auto ")) and e["bash"].endswith(" -Quiet"), e
         words = e["bash"][len("sh scripts/mux-agent "):]
         assert e["command"] == "scripts\\mux-agent.cmd " + words, e
         print(f"{event}:{e.get('matcher', '')}:{words}")
@@ -180,6 +181,7 @@ postToolUse:ask_user:report working -Quiet
 postToolUseFailure:ask_user:report working -Quiet
 preToolUse:ask_user:report blocked -Kind question -Quiet
 sessionStart::report -Session -Stdin -Quiet
+sessionStart::sidebar -Auto -Stdin -Quiet
 userPromptSubmitted::report working -Quiet"
   [ "$got" = "$want" ] || { bad "$name" "events: $got"; return; }
   # Run as Copilot runs it, from the plugin root, with a binary that records its arguments and fails loudly: the shim
@@ -195,7 +197,7 @@ userPromptSubmitted::report working -Quiet"
     done
   ran=$(sort "$tmp/argv")
   # Sorted by the same `sort`, so the locale's collation of `-Session` cannot change the expectation.
-  want=$(printf '%s\n' "report -Session -Stdin -Quiet" "report blocked -Kind question -Quiet" "report idle -Quiet" \
+  want=$(printf '%s\n' "report -Session -Stdin -Quiet" "sidebar -Auto -Stdin -Quiet" "report blocked -Kind question -Quiet" "report idle -Quiet" \
     "report working -Quiet" "report working -Quiet" "report working -Quiet" | sort)
   if [ "$ran" = "$want" ]; then ok "$name"; else bad "$name" "ran: $ran"; fi
 }

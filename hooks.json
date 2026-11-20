@@ -7,6 +7,12 @@
         "bash": "sh scripts/mux-agent report -Session -Stdin -Quiet",
         "command": "scripts\\mux-agent.cmd report -Session -Stdin -Quiet",
         "timeoutSec": 30
+      },
+      {
+        "type": "command",
+        "bash": "sh scripts/mux-agent sidebar -Auto -Stdin -Quiet",
+        "command": "scripts\\mux-agent.cmd sidebar -Auto -Stdin -Quiet",
+        "timeoutSec": 10
       }
     ],
     "userPromptSubmitted": [

@@ -61,7 +61,8 @@ function world(on: any, env: Record<string, string>, runs: object[], tool: { std
   on('ui.status', (_: unknown, e: { text?: string }) => { seen.status.push(e.text); return { value: undefined } })
   on('process.run', async (_: unknown, e: { argv: string[]; init?: unknown }) => {
     // report-2b: the session report a classic SessionStart runs is kept apart; it takes no queued answer.
-    if (e.argv.includes('-Session')) { seen.sessions.push([...e.argv]); return ran(0, '') }
+    // The bar by default (sidebar -Auto) is a SessionStart's too.
+    if (e.argv.includes('-Session') || e.argv.includes('-Auto')) { seen.sessions.push([...e.argv]); return ran(0, '') }
     seen.argv.push([...e.argv]); seen.init.push(e.init)
     const next: any = runs.length > 1 ? runs.shift() : runs[0]
     if (next?.holdMs) { await clock.sleep(next.holdMs); seen.settled++; return next.answer }

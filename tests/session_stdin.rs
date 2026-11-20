@@ -199,3 +199,51 @@ fn a_terminal_stdin_is_refused_without_reading() {
     assert!(!dir.join("state").join("live").exists());
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+// The second `sessionStart` hook opens the side bar by default from the same JSON. Outside tmux and rmux the caller
+// resolves to no pane and the verb refuses `endpoint` (nothing opened); a `compact` start is skipped before any lookup.
+#[cfg(unix)]
+#[test]
+fn the_unix_sidebar_hook_reads_its_source_from_stdin() {
+    let text = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/hooks.json")).unwrap();
+    let v: Value = serde_json::from_str(&text).unwrap();
+    let cmd = v["hooks"]["sessionStart"][1]["bash"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_eq!(cmd, "sh scripts/mux-agent sidebar -Auto -Stdin -Quiet");
+    let line = cmd.trim_end_matches(" -Quiet").to_string();
+    let compact = json!({"sessionId": SID, "source": "compact"}).to_string();
+    let mut sh = Command::new("sh");
+    sh.arg("-c").arg(&line);
+    let (code, reply, _) = run(sh, "sidebar-compact", compact.as_bytes());
+    assert_eq!(
+        (code, &reply["skipped"]),
+        (Some(0), &json!("source")),
+        "{reply}"
+    );
+    let mut sh = Command::new("sh");
+    sh.arg("-c").arg(&line);
+    let (code, reply, _) = run(sh, "sidebar-startup", &body());
+    assert_eq!(
+        (code, &reply["check"]),
+        (Some(1), &json!("endpoint")),
+        "{reply}"
+    );
+    // As Copilot runs it: quiet, and success whatever happens.
+    let mut sh = Command::new("sh");
+    sh.arg("-c").arg(&cmd);
+    let dir = std::env::temp_dir().join(format!("session-stdin-{}-quiet", std::process::id()));
+    let out = sh
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .env("MUX_AGENTS_BIN", env!("CARGO_BIN_EXE_mux-agent"))
+        .env("MUX_AGENTS_STATE", dir.join("state"))
+        .env_remove("TMUX")
+        .env_remove("RMUX")
+        .env_remove("HC_TERMINAL_ID")
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+    assert_eq!((out.status.code(), out.stdout.len()), (Some(0), 0));
+}

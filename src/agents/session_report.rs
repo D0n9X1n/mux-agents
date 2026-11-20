@@ -137,7 +137,7 @@ pub(crate) fn read_input(input: impl Input) -> Option<Vec<u8>> {
 }
 
 /// `-Stdin`'s bytes: one wrapper for release and tests, so the terminal check that runs is the shipped one.
-fn read_stdin() -> Option<Vec<u8>> {
+pub(crate) fn read_stdin() -> Option<Vec<u8>> {
     read_input(stdin_source())
 }
 

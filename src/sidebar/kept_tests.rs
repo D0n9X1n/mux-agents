@@ -281,11 +281,11 @@ fn a_headerless_frame_never_shares_a_row_between_kept_and_member() {
         "{:?}",
         text(&laid.rows)
     );
-    mark(&mut laid, "L", LOOK);
+    mark(&mut laid, "L", 40, LOOK);
     let at = |id: &str| laid.agents.iter().find(|(t, _)| t.id == id).unwrap().1;
     let drawn_rows = text(&laid.rows);
     assert!(
-        drawn_rows[at("L")].starts_with('\u{f054}'),
+        drawn_rows[at("L")].starts_with('>'),
         "the mark is on L's row: {drawn_rows:?}"
     );
     assert!(

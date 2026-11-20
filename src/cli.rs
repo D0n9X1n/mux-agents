@@ -235,11 +235,11 @@ pub static VERBS: &[VerbDef] = &[
     },
     VerbDef {
         name: "sidebar",
-        values: &[],
-        switches: &["Close"],
+        values: &["Source"],
+        switches: &["Auto", "Close", "Quiet", "Stdin"],
         min: 0,
         max: 0,
-        usage: "usage: mux-agent sidebar [-Close] [-Text]",
+        usage: "usage: mux-agent sidebar [-Close] [-Text] | sidebar -Auto (-Source <word> | -Stdin) [-Quiet]",
         handler: crate::sidebar::sidebar,
         text: json::lines,
     },
@@ -486,7 +486,7 @@ fn success(def: &VerbDef, data: Map<String, Value>) -> Map<String, Value> {
 /// the tokens (`wants_text`); an unknown verb has neither. A panic in the verb is 1 `internal`; unwinding has already
 /// released its locks.
 pub fn run<C: Borrow<Ctx>>(args: &[String], ctx: impl FnOnce() -> Res<C>) -> (u8, String) {
-    // `report -Quiet` (a client's hook): nothing printed and success whatever happens, so no hook needs a shell
+    // `report -Quiet` or `sidebar -Auto -Quiet` (a client's hook): nothing printed and success whatever happens, so no hook needs a shell
     // to discard its output or its exit code.
     let outcome = answer(args, ctx);
     if quiet(args) {
@@ -545,7 +545,7 @@ fn answer<C: Borrow<Ctx>>(args: &[String], ctx: impl FnOnce() -> Res<C>) -> (u8,
 
 /// `report` with `-Quiet` among its tokens, in any case (the token a `-Kind` takes as its value excepted).
 fn quiet(args: &[String]) -> bool {
-    let Some(def) = named(args).filter(|d| d.name == "report") else {
+    let Some(def) = named(args).filter(|d| d.name == "report" || d.name == "sidebar") else {
         return false;
     };
     let mut tokens = args[1..].iter();

@@ -8,10 +8,11 @@ The side bar is a narrow split at the right edge of your window that lists every
 
 | what | when |
 |---|---|
-| the first successful `spawn` of a session | opens the bar; later spawns reuse it |
+| your Claude Code or Copilot CLI chat starts or resumes in tmux or rmux | opens the bar beside it (`sidebar -Auto`); not after `clear` or `compact`, and never once you closed it |
+| the first successful `spawn` of a session | opens the bar if it is not open; later spawns reuse it |
 | `up` | opens the bar beside the team's view |
 | `sidebar` | opens it again after `sidebar -Close`, or reopens a closed one |
-| `sidebar -Close` | closes it for the rest of the session: no later spawn reopens it |
+| `sidebar -Close` | closes it for the rest of the session: no later spawn or chat start reopens it |
 
 Only you or a team's leader opens or closes it; a member gets `tagged`, and an agent outside a team too. A spawn that cannot open the bar still succeeds and reports `sidebarError`. In tab placement the bar stays in the window you spawned from. `sidebar -Close` closes only this bar; the Claude Code `Agents` pane, which runs `list -All` every 3 seconds, is separate.
 
@@ -57,7 +58,7 @@ Outside a team the bar draws a flat list, as herdr's priority view does:
    +4 more  (list -All)
 ```
 
-- The first rows are `main` (then `main 2` …): the panes the agents were spawned from, so you can go back to the chat that started them.
+- The first rows are `main` (then `main 2` …), after a blank row that sets them apart from the header: the panes the agents were spawned from, so you can go back to the chat that started them. A short bar drops that blank row first.
 - Live agents follow, ranked by state, the most recent change first. When they are in more than one state, each state's first agent has a heading with its count (`Needs you · 1`), and rows under headings show only their glyph and age; with every agent in one state each row says its state.
 - Ended agents close the list: the 3 newest that did not end lost, then `+K more  (list -All)` when every ended agent is among the 10 `list -All` shows, else `+K more ended`.
 
@@ -77,8 +78,8 @@ Outside a team the bar draws a flat list, as herdr's priority view does:
 | `!` | `recover: <reason>` | its current generation failed; `recover (still running)` while that generation has not ended; `resume` retries it |
 | `✉ N` (`m N`) | | N unread messages from it |
 | `kept shell <name>` | | a lost member's old terminal, under the heading `kept shells · N` |
-| soft grey band | | the agent or `main` row whose pane is on screen; with color only |
-| Nerd Font chevron U+F054 (`>`) in column 0 | | the row the keys selected |
+| soft grey band | | the row the keys selected, else the agent or `main` row whose pane is on screen; with color only. When the bar itself is in front (you switched to its tab), the row of the other pane in that tab |
+| `>` in column 0 | | the row the keys selected, only without color or with `MUX_AGENTS_ASCII=1` |
 
 Each live agent's name has its own color, the one least used by the session's live agents and never a state color. The age is the time since the last change of state. `MUX_AGENTS_ASCII=1` draws the ASCII marks. Color follows `NO_COLOR` (off), `FORCE_COLOR` or `CLICOLOR_FORCE` (on), then `TERM=dumb` (off).
 

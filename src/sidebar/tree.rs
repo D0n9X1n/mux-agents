@@ -1079,11 +1079,30 @@ pub(super) mod tests {
             shown,
         )
         .0;
-        mark(&mut sel, "G", look);
+        mark(&mut sel, "G", 60, look);
         assert!(
-            render(&sel.rows[5], false).starts_with("\u{f054}")
+            render(&sel.rows[5], false).starts_with('>')
                 && draw(&board, 60, 24, look, shown)[5].starts_with(' ')
         );
+        // In color the selection takes the band from the shown member: one mark, no `>`.
+        let mut lit = lay_team(
+            &board,
+            &[],
+            Size {
+                width: 60,
+                height: 24,
+            },
+            color,
+            moved,
+        )
+        .0;
+        crate::sidebar::shade(&mut lit, moved.shown, 60, color);
+        mark(&mut lit, "G", 60, color);
+        let lit_rows: Vec<usize> = (0..lit.rows.len())
+            .filter(|&at| lit.rows[at].iter().any(|(_, s)| s.bg.is_some()))
+            .collect();
+        assert_eq!(lit_rows, [5]);
+        assert!(lit.rows.iter().all(|r| !render(r, false).starts_with('>')));
         // B1/B3: an ended leader still heads its child; a missing parent and a self-loop draw at depth 1 with `^`.
         let broken = team(vec![
             member(

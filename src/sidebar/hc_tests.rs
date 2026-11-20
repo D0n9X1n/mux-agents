@@ -253,10 +253,10 @@ fn two_members_with_one_name_open_the_one_selected() {
         },
     )
     .0;
-    mark(&mut laid, pick.selected().unwrap(), look);
+    mark(&mut laid, pick.selected().unwrap(), 40, look);
     let text: Vec<String> = laid.rows.iter().map(|r| render(r, false)).collect();
     assert!(
-        text[3].starts_with("   \u{25c9} twin") && text[4].starts_with("\u{f054}  \u{25c9} twin"),
+        text[3].starts_with("   \u{25c9} twin") && text[4].starts_with(">  \u{25c9} twin"),
         "{text:?}"
     );
     let mut shown = Shown {
