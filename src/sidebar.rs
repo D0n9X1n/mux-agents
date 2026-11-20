@@ -4059,10 +4059,12 @@ fn split_watch(ctx: &Ctx, pid: u32, key: &str) -> bool {
 }
 
 /// The state root's key a bar's split passes its watch: sha16 of the canonical root, as a team's identity hashes it
-/// (`agents::up::identity::team`); the root as resolved when it cannot be canonicalized yet. Plain hex, so it needs no
-/// quoting in a pane command on any platform, and names no path.
+/// (`agents::up::identity::team`). A root not on disk yet cannot be canonicalized: it keys by its absolute path (a
+/// relative one joined to the working directory), so the same relative name from two directories never shares a key.
+/// Plain hex, so it needs no quoting in a pane command on any platform, and names no path.
 pub(crate) fn root_key(ctx: &Ctx) -> String {
-    let root = std::fs::canonicalize(&ctx.state_root).unwrap_or_else(|_| ctx.state_root.clone());
+    let root =
+        std::fs::canonicalize(&ctx.state_root).unwrap_or_else(|_| ctx.cwd.join(&ctx.state_root));
     crate::util::sha256_hex(root.display().to_string())[..16].to_string()
 }
 
@@ -11265,6 +11267,20 @@ mod tests {
             run(&w, &[]),
             r#"ok {"pane":"%7","window":"@1","opened":true}"#
         );
+    }
+
+    // A root not on disk yet keys by its absolute path: the same relative name from two working directories names two
+    // roots, so two keys; the same root named relatively and absolutely is one key.
+    #[test]
+    fn a_relative_root_not_yet_on_disk_keys_by_its_absolute_path() {
+        let mut w = World::human("");
+        let mut key = |cwd: &str, root: &str| {
+            w.ctx.cwd = cwd.into();
+            w.ctx.state_root = root.into();
+            root_key(&w.ctx)
+        };
+        assert_ne!(key("/work/a", "state"), key("/work/b", "state"));
+        assert_eq!(key("/work/a", "state"), key("/elsewhere", "/work/a/state"));
     }
 
     // The bar's split starts its watch as `watch -Managed <key>`, the key its state root's, so the watch knows the split
