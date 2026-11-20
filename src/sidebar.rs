@@ -4058,14 +4058,26 @@ fn split_watch(ctx: &Ctx, pid: u32, key: &str) -> bool {
     })
 }
 
-/// The state root's key a bar's split passes its watch: sha16 of the canonical root, as a team's identity hashes it
-/// (`agents::up::identity::team`). A root not on disk yet cannot be canonicalized: it keys by its absolute path (a
-/// relative one joined to the working directory), so the same relative name from two directories never shares a key.
-/// Plain hex, so it needs no quoting in a pane command on any platform, and names no path.
+/// The state root's key a bar's split passes its watch: sha16 of `key_path`, as a team's identity hashes its root
+/// (`agents::up::identity::team`). Plain hex, so it needs no quoting in a pane command on any platform, and names no
+/// path.
 pub(crate) fn root_key(ctx: &Ctx) -> String {
-    let root =
-        std::fs::canonicalize(&ctx.state_root).unwrap_or_else(|_| ctx.cwd.join(&ctx.state_root));
-    crate::util::sha256_hex(root.display().to_string())[..16].to_string()
+    crate::util::sha256_hex(key_path(ctx).display().to_string())[..16].to_string()
+}
+
+/// The path a root key hashes, always one place: the canonical root; a root not on disk yet made absolute, a relative
+/// one joined to the working directory and a Windows drive-relative one (`C:state`, which `join` keeps as is) resolved
+/// by the OS against that drive's working directory. A root the OS cannot resolve keys by this process too, so no
+/// other root's `-Close` can match it: its stray is spared and cleans itself up.
+fn key_path(ctx: &Ctx) -> std::path::PathBuf {
+    std::fs::canonicalize(&ctx.state_root).unwrap_or_else(|_| {
+        let joined = ctx.cwd.join(&ctx.state_root);
+        if joined.is_absolute() {
+            return joined;
+        }
+        std::path::absolute(&joined)
+            .unwrap_or_else(|_| joined.join(format!("unresolved-{}", ctx.pid)))
+    })
 }
 
 /// `q` then `y`: the bar closes as `sidebar -Close` closes it, for its own window only, in this process. Under the
@@ -11281,6 +11293,21 @@ mod tests {
         };
         assert_ne!(key("/work/a", "state"), key("/work/b", "state"));
         assert_eq!(key("/work/a", "state"), key("/elsewhere", "/work/a/state"));
+        // Whatever the root's form, the path hashed is absolute, so it names one place: on Windows a drive-relative
+        // root (`C:state`) and a root-relative one (`\state`) too, which `join` alone leaves relative or rebases.
+        let mut roots = vec!["state", "./state", "../state"];
+        if cfg!(windows) {
+            roots.extend(["C:state", "\\state"]);
+        }
+        for root in roots {
+            w.ctx.cwd = std::env::current_dir().unwrap();
+            w.ctx.state_root = root.into();
+            assert!(
+                key_path(&w.ctx).is_absolute(),
+                "{root}: {:?}",
+                key_path(&w.ctx)
+            );
+        }
     }
 
     // The bar's split starts its watch as `watch -Managed <key>`, the key its state root's, so the watch knows the split
