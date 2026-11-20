@@ -95,6 +95,9 @@ fn stamp(root: &std::path::Path) -> Option<SystemTime> {
     }
     newest
 }
+// An idle bar under a poll writes its unchanged frame again this often: a terminal that dropped it (a clear, a
+// popup over it) gets it back, and what reads the bar's output sees it is alive.
+const REWRITE: Duration = Duration::from_secs(2);
 // The walk over the other view windows (two reads each) runs on the first tick and every this many after.
 const WALK_EVERY: u32 = 5;
 // How long a lone ESC may wait for the rest of a sequence before it counts as the Esc key.
@@ -2006,6 +2009,7 @@ pub fn run_watch(
     // The last frame written and when (`Shown::written`): an unchanged frame is not written again.
     let mut last_frame: Option<(String, Size)> = None;
     let mut last_written = SystemTime::UNIX_EPOCH;
+    let mut last_changed = SystemTime::UNIX_EPOCH;
     let root = crate::agents::server_dir(ctx, caller);
     // Peek files of popups that never opened, from an earlier bar (review).
     sweep_peeks(ctx, &crate::agents::server_dir(ctx, caller));
@@ -2200,25 +2204,29 @@ pub fn run_watch(
             }
             None => bare,
         };
-        // With a poll the bar ticks often: a frame already on screen at this size is not written again, within a
-        // minute of the last write, so the screen does not churn and PRESS_GAP drops a click only after a real change.
+        // With a poll the bar ticks often: a frame already on screen at this size is written again only every
+        // REWRITE, so the screen does not churn, and a rewrite of the same frame is no change: PRESS_GAP drops a
+        // click only after a frame that changed (`last_changed`), never after one that moved nothing under it.
         let text = frame(&laid.rows, size, look);
         let now = ctx.clock.now();
-        let fresh = now.duration_since(last_written).unwrap_or_default() < REARM;
         let same = last_frame
             .as_ref()
             .is_some_and(|(rows, at)| *at == size && *rows == text);
-        if pace.poll.is_none() || !fresh || !same {
+        let due = now.duration_since(last_written).unwrap_or_default() >= REWRITE;
+        if pace.poll.is_none() || !same || due {
             if write(&text).is_err() {
                 return "output-closed";
             }
             last_written = ctx.clock.now();
+            if pace.poll.is_none() || !same {
+                last_changed = last_written;
+            }
             last_frame = Some((text, size));
         }
         // The next tick is a tick after this one ends (after a slow write, from its end).
         let ticked = ctx.clock.now();
         let mut shown = Shown {
-            written: last_written,
+            written: last_changed,
             targets: walk,
             drawn: drawn(&laid),
             width: size.width,
@@ -6841,17 +6849,41 @@ mod tests {
     // the screen does not change, and a click is never dropped for a frame that changed nothing (PRESS_GAP measures
     // from the last write). A changed frame is written at once; a size change or a minute without a write writes anyway.
     #[test]
-    fn an_unchanged_frame_is_not_written_again() {
-        let w = watch_world(&["live", "live", "live", "live", "gone"]);
+    fn an_unchanged_frame_is_written_again_only_every_two_seconds() {
+        let w = watch_world(&["live", "live", "live", "live", "live", "gone"]);
         pace(Pace {
             tick: Duration::from_millis(1000),
             poll: Some(Duration::from_millis(200)),
         });
-        watch_frames(&w, 4);
+        watch_frames(&w, 5);
         let (ended, frames, times) = watch_with(&w, Box::new(Script::new(&w.fakes, vec![])));
         pace(Pace::default());
         assert_eq!(ended, "pane-closed");
-        assert_eq!(frames.len(), 1, "four ticks, one frame: {times:?}");
+        // Ticks at 0, 1, 2, 3, 4 s: written at 0, then again at 2 and 4.
+        assert_eq!(diffs(&times), [2000, 2000], "{} frames", frames.len());
+    }
+
+    // A rewrite of the same frame moves nothing under the pointer: a click right after it is taken, not dropped.
+    #[test]
+    fn a_click_right_after_a_rewrite_of_the_same_frame_is_taken() {
+        let w = click_world(&["live", "live", "live", "live", "gone"], board_answer());
+        pace(Pace {
+            tick: Duration::from_millis(1000),
+            poll: Some(Duration::from_millis(200)),
+        });
+        // Ticks at 0, 1, 2 s (the rewrite at 2 s); the click 10 ms after it, then its redraw and the last tick.
+        let script = Script::new(&w.fakes, vec![(2010, press(5))]);
+        watch_frames(&w, 3);
+        crate::agents::core_fixture::online(&w);
+        watch_frames(&w, 1);
+        let (ended, _, _) = watch_with(&w, Box::new(script));
+        pace(Pace::default());
+        assert_eq!(ended, "pane-closed");
+        assert_eq!(
+            (click_reads(&w), selects(&w)),
+            (1, 1),
+            "the click focused worker"
+        );
     }
 
     // A resize is always written, even when the rows come out the same (a taller pane whose rows all fit): the
