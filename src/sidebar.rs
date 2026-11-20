@@ -305,19 +305,22 @@ fn migrate(ctx: &Ctx, session: &str) -> Res<()> {
     }
     let window = parse_record(text)
         .and_then(|(pane, pid, start)| (0..2).find_map(|_| proven(ctx, &pane, pid, start)));
-    match window {
-        Some(window) => {
-            native(
-                ctx,
-                &["set-option", "-w", "-t", &window, RECORD, text],
-                false,
-            )?;
-        }
-        None => {
-            let labelled = labelled(ctx, &["-s", "-t", session])?;
-            if !labelled.is_empty() {
-                return refuse(1, "sidebar", unproven(&labelled));
-            }
+    // A window destroyed between the proof and the move took the bar with it, unless its pane moved on: as
+    // unproven as a record proven nowhere.
+    let moved = match window {
+        Some(window) => on_window(
+            ctx,
+            session,
+            &window,
+            &["set-option", "-w", "-t", &window, RECORD, text],
+        )?
+        .is_some(),
+        None => false,
+    };
+    if !moved {
+        let labelled = labelled(ctx, &["-s", "-t", session])?;
+        if !labelled.is_empty() {
+            return refuse(1, "sidebar", unproven(&labelled));
         }
     }
     native(ctx, &["set-option", "-u", "-t", session, RECORD], false)?;
@@ -2722,15 +2725,14 @@ fn watch_loop(
                 break;
             }
             // A poll is due: another pane on screen or a state change ends the wait, and the next tick draws it now.
+            let mut changed = false;
             if let Some(poll) = pace.poll
                 && ctx.clock.now().duration_since(polled_at).unwrap_or(poll) >= poll
             {
                 polled_at = ctx.clock.now();
                 let pane = shown_pane(ctx, caller);
                 let moved = pane.is_some_and(|p| p != polled_pane);
-                if moved || stamp(&root) != polled_stamp {
-                    break;
-                }
+                changed = moved || stamp(&root) != polled_stamp;
             }
             let mut wait = if keys.lone_esc() {
                 left.min(ESC_WAIT)
@@ -2742,8 +2744,16 @@ fn watch_loop(
                     poll.saturating_sub(ctx.clock.now().duration_since(polled_at).unwrap_or(poll));
                 wait = wait.min(next.max(Duration::from_millis(1)));
             }
+            // With a change found, only input already waiting is read, against the frame it was aimed at: read after
+            // the redraw, a press would be dropped as aimed at the frame before it. A click from another pane is such
+            // a change, since the multiplexer's mouse binding selects the bar's pane before it passes the press on.
+            if changed {
+                wait = Duration::ZERO;
+            }
             let reads = match input.wait(&*ctx.clock, wait) {
                 Waited::Bytes(bytes) => keys.push(&bytes, ctx.clock.now()),
+                // A lone ESC keeps its wait for the rest of its sequence: the redraw's wait gives it.
+                Waited::Timeout if changed => Vec::new(),
                 Waited::Timeout => keys.idle(),
                 // The old input is dropped here, which restores its terminal.
                 Waited::Closed => {
@@ -2751,7 +2761,7 @@ fn watch_loop(
                     Vec::new()
                 }
             };
-            let mut redraw = false;
+            let mut redraw = changed;
             for read in reads {
                 if read.event == Event::Interrupt {
                     return "interrupted";
@@ -3963,20 +3973,9 @@ pub fn sidebar(ctx: &Ctx, request: &Request) -> Res<Map<String, Value>> {
             false,
         )?;
         migrate(ctx, &caller.session)?;
-        // Each window's record is read as that window's own: a window list's option fields fall back to the
-        // session's value, so only the window ids are listed.
-        let windows = native(
-            ctx,
-            &["list-windows", "-t", &caller.session, "-F", "#{window_id}"],
-            false,
-        )?;
         let mut closed: Vec<String> = Vec::new();
-        for window in windows.stdout.split('\n') {
-            let window = window.strip_suffix('\r').unwrap_or(window);
-            if !window_id(window) {
-                continue;
-            }
-            closed.extend(close_window(ctx, window)?);
+        for window in windows(ctx, &caller.session)? {
+            closed.extend(close_window(ctx, &caller.session, &window)?);
         }
         closed.extend(close_strays(ctx, &caller.session)?);
         if closed.is_empty() {
@@ -3996,9 +3995,13 @@ pub fn sidebar(ctx: &Ctx, request: &Request) -> Res<Map<String, Value>> {
 }
 
 /// `window`'s proven bar, killed only while it is still that process, then its record cleared: the pane closed,
-/// none when the window has no proven bar. A kill that did not take refuses.
-fn close_window(ctx: &Ctx, window: &str) -> Res<Option<String>> {
-    let Some(bar) = prove(ctx, window)? else {
+/// none when the window has no proven bar or is gone from `session` (it took its bar with it). A kill that did not
+/// take refuses.
+fn close_window(ctx: &Ctx, session: &str, window: &str) -> Res<Option<String>> {
+    let read = &["show-options", "-wqv", "-t", window, RECORD];
+    let Some(bar) =
+        on_window(ctx, session, window, read)?.and_then(|read| prove_read(ctx, window, &read))
+    else {
         return Ok(None);
     };
     if !kill_bar(ctx, &bar.pane, bar.pid) {
@@ -4133,7 +4136,7 @@ fn close_bar(ctx: &Ctx, caller: &Caller) -> Res<()> {
             false,
         )?;
         migrate(ctx, &caller.session)?;
-        close_window(ctx, &caller.window).map(|_| ())
+        close_window(ctx, &caller.session, &caller.window).map(|_| ())
     })
 }
 
@@ -4282,17 +4285,51 @@ pub(crate) fn is_watch(ctx: &Ctx, row: &crate::proc::Row) -> bool {
 /// failed proof is read once more, then there is no proven bar. An unreadable record refuses: it may name the bar.
 fn prove(ctx: &Ctx, window: &str) -> Res<Option<Proven>> {
     let read = native(ctx, &["show-options", "-wqv", "-t", window, RECORD], false)?;
-    let Some((pane, pid, start)) = parse_record(read.stdout.trim_end_matches(['\r', '\n'])) else {
-        return Ok(None);
-    };
+    Ok(prove_read(ctx, window, &read))
+}
+
+/// `prove` of `window`'s record as `read` answered it.
+fn prove_read(ctx: &Ctx, window: &str, read: &Output) -> Option<Proven> {
+    let (pane, pid, start) = parse_record(read.stdout.trim_end_matches(['\r', '\n']))?;
     for _ in 0..2 {
         if let Some(at) = proven(ctx, &pane, pid, start) {
-            return Ok((at == window).then_some(Proven {
+            return (at == window).then_some(Proven {
                 pane,
                 window: at,
                 pid,
-            }));
+            });
         }
+    }
+    None
+}
+
+/// The window ids of `session`. Each window's record is read as that window's own: a window list's option fields
+/// fall back to the session's value, so only the ids are listed. An unreadable list refuses.
+fn windows(ctx: &Ctx, session: &str) -> Res<Vec<String>> {
+    let listed = native(
+        ctx,
+        &["list-windows", "-t", session, "-F", "#{window_id}"],
+        false,
+    )?;
+    Ok(listed
+        .stdout
+        .split('\n')
+        .map(|w| w.strip_suffix('\r').unwrap_or(w))
+        .filter(|w| window_id(w))
+        .map(str::to_string)
+        .collect())
+}
+
+/// `args`, a call on `window` of `session`. A call on a window destroyed since it was listed or proven (its last pane
+/// went) fails: rmux fails even a read, which tmux answers empty. A failed call answers none once `session` no longer
+/// lists the window, and refuses while it still does or when the list cannot be read.
+fn on_window(ctx: &Ctx, session: &str, window: &str, args: &[&str]) -> Res<Option<Output>> {
+    let out = native(ctx, args, true)?;
+    if out.code == 0 {
+        return Ok(Some(out));
+    }
+    if windows(ctx, session)?.iter().any(|w| w == window) {
+        return crate::mux::call_failed(ctx);
     }
     Ok(None)
 }
@@ -9595,6 +9632,98 @@ mod tests {
         );
     }
 
+    // A press already waiting when a poll finds a change is taken against the frame still on screen, before the redraw:
+    // read after the new frame, it would be dropped as aimed at the frame before it. A click from another pane makes
+    // exactly that change, since the multiplexer's mouse binding selects the bar's pane before it passes the press on.
+    #[test]
+    fn a_press_waiting_when_a_poll_redraws_is_taken_first() {
+        let w = click_world(&["live", "live", "live", "gone"], board_answer());
+        pace(Pace {
+            tick: Duration::from_millis(2000),
+            poll: Some(Duration::from_millis(200)),
+        });
+        let folder = crate::agents::server_dir(&w.ctx, &w.caller())
+            .join("agents")
+            .join(ID);
+        // The first wait times out at the first poll, which finds the status written meanwhile (the redraw changes
+        // the frame), and the press is waiting by then.
+        let mut script = Script::new(&w.fakes, vec![(200, Waited::Timeout), (0, press(6))]);
+        let waits = script.waits.clone();
+        script.on_wait = Some(Box::new(move |n| {
+            if n == 1 {
+                std::thread::sleep(Duration::from_millis(5));
+                write(
+                    &folder.join("status.json"),
+                    json!({"text": "reading the tests", "at": "x"}),
+                );
+            }
+        }));
+        watch_frames(&w, 1);
+        crate::agents::core_fixture::online(&w);
+        watch_frames(&w, 2);
+        let caller = w.caller();
+        let (mut frames, mut times) = (Vec::new(), Vec::new());
+        let ended = run_watch(&w.ctx, &caller, Box::new(script), &mut |frame: &str| {
+            frames.push(frame.to_string());
+            let at = w.ctx.clock.now().duration_since(SystemTime::UNIX_EPOCH);
+            times.push(at.unwrap().as_millis() as u64);
+            assert!(frames.len() <= 100, "runaway");
+            Ok(())
+        });
+        pace(Pace::default());
+        assert_eq!(
+            (click_reads(&w), selects(&w)),
+            (1, 1),
+            "the waiting press focused worker"
+        );
+        w.fakes.hc_done().unwrap();
+        assert_eq!(ended, "pane-closed");
+        assert_eq!(
+            waits.borrow()[..2],
+            [200, 0],
+            "the input read without a wait"
+        );
+        assert_eq!(diffs(&times), [200, 2000]);
+        assert!(
+            !frames[0].contains("reading the tests") && frames[1].contains("reading the tests"),
+            "the redraw changed the frame: {frames:?}"
+        );
+    }
+
+    // A lone ESC already read when a poll finds a change keeps waiting for the rest of its sequence through the
+    // redraw: the read of waiting input before the redraw does not make it the Esc key.
+    #[test]
+    fn a_lone_escape_waiting_when_a_poll_redraws_keeps_its_sequence() {
+        let w = click_world(&["live", "live", "live", "gone"], board_answer());
+        pace(Pace {
+            tick: Duration::from_millis(2000),
+            poll: Some(Duration::from_millis(200)),
+        });
+        let folder = crate::agents::server_dir(&w.ctx, &w.caller())
+            .join("agents")
+            .join(ID);
+        // The ESC at the first poll, which finds the status written meanwhile; the rest of a Down 30 ms later.
+        let steps = vec![(200, key(b"\x1b")), (30, key(b"[B"))];
+        let mut script = Script::new(&w.fakes, steps);
+        script.on_wait = Some(Box::new(move |n| {
+            if n == 1 {
+                std::thread::sleep(Duration::from_millis(5));
+                write(
+                    &folder.join("status.json"),
+                    json!({"text": "reading the tests", "at": "x"}),
+                );
+            }
+        }));
+        watch_frames(&w, 3);
+        let (ended, frames, _) = watch_with(&w, Box::new(script));
+        pace(Pace::default());
+        assert_eq!(ended, "pane-closed");
+        assert!(
+            frames.iter().any(|f| f.contains(">\u{25c9} worker")),
+            "the Down selected worker: {frames:?}"
+        );
+    }
+
     #[test]
     fn one_read_handles_every_event_in_order() {
         let w = click_world(&["live", "live", "live", "gone"], board_answer());
@@ -13492,6 +13621,102 @@ mod tests {
         assert_eq!(closes(&w), 1);
         assert_eq!(roles(&panes), "%1=|,%2=other|,%10=|,%11=|");
         assert_eq!(option(&panes).as_deref(), Some("off"));
+    }
+
+    // A window destroyed between -Close's list of the session's windows and the read of its record (its last pane
+    // went) took its bar with it: the read fails, a new list no longer names it, and the close goes on to the next
+    // window. A failed read of a window still listed refuses, as does a list that cannot be read again.
+    #[test]
+    fn close_skips_a_window_gone_before_its_record_is_read() {
+        for case in ["gone", "listed", "unlisted"] {
+            let (w, panes) = sidebar_world("", Mux::default());
+            assert_eq!(ensure_in(&w, "@2"), "opened %7", "{case}");
+            assert_eq!(ensure_in(&w, "@1"), "opened %8", "{case}");
+            w.fakes.clear_log();
+            let (p, fakes) = (panes.clone(), w.fakes.clone());
+            w.fakes.mux_script(
+                "show-options -wqv -t @2 @mux-agents-sidebar-id",
+                move |_| {
+                    if case != "listed" {
+                        for key in ["%7", "pid %7", "win %7"] {
+                            unset(&p, key);
+                        }
+                    }
+                    if case == "unlisted" {
+                        fakes.mux_first("list-windows", 1, "", "no server\n");
+                    }
+                    Ok(out(1, "", "can't find window: @2\n"))
+                },
+            );
+            let got = run(&w, &["-Close"]);
+            if case == "gone" {
+                assert_eq!(
+                    got, r#"ok {"pane":"%8","closed":true,"panes":["%8"]}"#,
+                    "{case}"
+                );
+                assert_eq!(
+                    calls(&w),
+                    [
+                        OFF.to_string(),
+                        SESSION_RECORD.into(),
+                        WINDOWS.into(),
+                        READ_RECORD.into(),
+                        close_line("%8", 108),
+                        CLEAR_RECORD.into(),
+                        READ_RECORD.replace("@1", "@2"),
+                        WINDOWS.into(),
+                    ],
+                    "{case}"
+                );
+            } else {
+                assert_eq!(got, "1 rmux tmux call failed", "{case}");
+            }
+            assert_eq!(closes(&w), 1, "{case}");
+        }
+    }
+
+    // 0.2.x's session record proven in a window destroyed before the record moves there (its last pane went) is as
+    // unproven as one proven nowhere: unset while no pane of the session carries the label, refused while one does
+    // (the bar's pane moved to another window). A failed move to a window still listed refuses; each refusal keeps
+    // the record.
+    #[test]
+    fn a_session_record_whose_window_went_before_the_move_is_unproven() {
+        for case in ["gone", "moved", "listed"] {
+            let (w, panes) = sidebar_world(
+                "",
+                Mux {
+                    legacy: true,
+                    extra: vec![(RECORD, "%7 107 1070".into()), ("win %7", "@5".into())],
+                    ..Mux::default()
+                },
+            );
+            let p = panes.clone();
+            w.fakes
+                .mux_script("set-option -w -t @5 @mux-agents-sidebar-id", move |_| {
+                    match case {
+                        "gone" => {
+                            for key in ["%7", "pid %7", "win %7"] {
+                                unset(&p, key);
+                            }
+                        }
+                        "moved" => set(&p, "win %7", "@1".into()),
+                        _ => {}
+                    }
+                    Ok(out(1, "", "can't find window: @5\n"))
+                });
+            let got = run(&w, &["-Close"]);
+            let (want, record) = match case {
+                "gone" => (
+                    r#"ok {"pane":null,"closed":false,"panes":[]}"#.to_string(),
+                    None,
+                ),
+                "moved" => (refused(&["%7"]), Some("%7 107 1070")),
+                _ => ("1 rmux tmux call failed".to_string(), Some("%7 107 1070")),
+            };
+            assert_eq!(got, want, "{case}");
+            assert_eq!(get(&panes, RECORD).as_deref(), record, "{case}");
+            assert_eq!(closes(&w), 0, "{case}");
+        }
     }
 
     // redesign: no open or ensure kills a pane it did not just split. In the recorded argv a kill appears only in

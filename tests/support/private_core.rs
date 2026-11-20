@@ -160,7 +160,9 @@ impl PrivateCore {
 
     /// `kill_hard`, killing each of `terminals` (from `terminal_of`) while the core is down, so the restarted core finds
     /// those members' terminals gone: a Lost member (r6b-calls). Only a pid whose start is unchanged is signalled; one
-    /// that is gone by the time the signal lands (its holder ended it) is already what the kill wanted.
+    /// that is gone by the time the signal lands (its holder ended it) is already what the kill wanted. Each client is
+    /// gone from the process table before the core starts again: a killed client still listed, its argv naming its
+    /// conversation, is what `up` would name as that conversation's holder.
     pub fn kill_hard_with(&mut self, terminals: &[(u32, Option<i64>)]) {
         let status =
             run(self.command(&["server", "status", "--json"]), &self.dir).expect("core status");
@@ -178,6 +180,12 @@ impl PrivateCore {
                 assert!(!same(pid, start), "kill of {pid} failed and it still runs");
             }
         }
+        let clients: Vec<(u32, Option<i64>)> = terminals
+            .chunks(2)
+            .map(|pair| pair[0])
+            .filter(|(_, start)| start.is_some())
+            .collect();
+        wait_gone(&clients, Duration::from_secs(30));
         let end = Instant::now() + Duration::from_secs(30);
         loop {
             match run(self.command(&["server", "start", "--json"]), &self.dir) {
@@ -335,6 +343,31 @@ pub fn kill_order(terminals: &[(u32, Option<i64>)]) -> Vec<(u32, Option<i64>)> {
         }
     }
     order
+}
+
+/// Waits up to `limit` until each of `processes` (pid and start, read from the table before a kill) has left the process
+/// table; panics naming those still listed after it. A row of that pid without a start is still that process (macOS
+/// lists a zombie not yet reaped without one); a row with another start is another process that took the pid.
+pub fn wait_gone(processes: &[(u32, Option<i64>)], limit: Duration) {
+    let host = mux_agent::proc::host();
+    let end = Instant::now() + limit;
+    loop {
+        let table = host.table().expect("process table");
+        let listed = |&(pid, start): &(u32, Option<i64>)| {
+            table
+                .iter()
+                .any(|r| r.pid == pid && (r.start.is_none() || r.start == start))
+        };
+        let left: Vec<(u32, Option<i64>)> = processes.iter().copied().filter(listed).collect();
+        if left.is_empty() {
+            return;
+        }
+        assert!(
+            Instant::now() < end,
+            "killed processes still listed after {limit:?}: {left:?}"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
 }
 
 /// SIGKILL (Windows `taskkill /F /PID`, never `/T`) of one pid this test owns, bounded to 30 s; whether it succeeded.

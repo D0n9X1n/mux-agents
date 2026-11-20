@@ -565,6 +565,24 @@ exec claude --dangerously-skip-permissions
             std::thread::sleep(Duration::from_millis(100));
         }
 
+        /// Returns once the bar drew a frame and then none for 500 ms, longer than a poll and the tick it starts
+        /// (about 200 ms each): nothing the bar shows was still changing, and its next tick is about half a second
+        /// away. A press sent now is read before that tick's frame; one sent while agents still report can land
+        /// while a tick draws, and the bar drops it as aimed at the frame before (`PRESS_GAP`).
+        fn after_quiet_redraw(&self, bar: &str) {
+            let mut seen = self.frames(bar);
+            let mut drawn: Option<Instant> = None;
+            self.server.wait("a redraw, then none for 500 ms", || {
+                let now = self.frames(bar);
+                if now != seen {
+                    (seen, drawn) = (now, Some(Instant::now()));
+                }
+                drawn
+                    .filter(|at| at.elapsed() >= Duration::from_millis(500))
+                    .map(|_| ())
+            });
+        }
+
         /// The active pane of the session's active window.
         fn focused(&self) -> String {
             self.panes("#{pane_id}|#{window_active}|#{pane_active}")
@@ -4592,7 +4610,8 @@ hc {}:
     }
 
     // through a real client: tmux 3.8 attached on a 120x40 terminal with `mouse on` hands a click on w1's name
-    // line to the bar, which focuses w1.
+    // line to the bar, which focuses w1. The click waits for the bar to be quiet at the client's size: the attach
+    // and the agents' last reports redraw it.
     fn bar_real_client_click_focuses(mux: Mux) {
         let Some(mut live) = Live::human(mux) else {
             return;
@@ -4605,7 +4624,7 @@ hc {}:
         });
         live.call(&["set-option", "-g", "mouse", "on"]);
         live.wait_place(&bar, "the bar in place at the client's size");
-        live.after_redraw(&bar);
+        live.after_quiet_redraw(&bar);
         let y = live.row_of(&bar, "w1");
         let left: usize = live.num(&bar, "#{pane_left}");
         let top: usize = live.num(&bar, "#{pane_top}");

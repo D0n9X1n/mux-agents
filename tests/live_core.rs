@@ -281,3 +281,42 @@ fn core_drop_ends_a_holder_whose_core_is_gone() {
         "processes naming the fixture remain: {named:?}"
     );
 }
+
+// `wait_gone` returns only once a killed process has left the process table (a pid listed again with another start is
+// another process), and fails rather than wait past its limit for one that still runs.
+#[cfg(unix)]
+#[test]
+fn wait_gone_returns_once_the_process_left_the_table() {
+    use std::time::{Duration, Instant};
+    let host = mux_agent::proc::host();
+    let mut child = std::process::Command::new("/bin/sleep")
+        .arg("60")
+        .spawn()
+        .unwrap();
+    let pid = child.id();
+    let listed = |host: &dyn mux_agent::proc::Os| {
+        host.table()
+            .unwrap()
+            .iter()
+            .find(|r| r.pid == pid)
+            .map(|r| (r.pid, r.start))
+    };
+    let me = listed(&*host).expect("the child is listed");
+    assert!(me.1.is_some(), "the child's start: {me:?}");
+    let running =
+        std::panic::catch_unwind(|| private_core::wait_gone(&[me], Duration::from_millis(300)));
+    assert!(running.is_err(), "a running process is not gone");
+    let killer = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(300));
+        child.kill().unwrap();
+        child.wait().unwrap();
+    });
+    let begun = Instant::now();
+    private_core::wait_gone(&[me], Duration::from_secs(30));
+    assert!(
+        begun.elapsed() >= Duration::from_millis(300),
+        "returned before the kill"
+    );
+    assert_ne!(listed(&*host), Some(me), "still listed");
+    killer.join().unwrap();
+}
