@@ -2733,7 +2733,8 @@ fn watch_loop(
                 polled_at = ctx.clock.now();
                 let pane = shown_pane(ctx, caller);
                 let moved = pane.is_some_and(|p| p != polled_pane);
-                changed = moved || stamp(&root) != polled_stamp;
+                // A poll that finds nothing new keeps a job's answer as the change it is.
+                changed |= moved || stamp(&root) != polled_stamp;
             }
             let mut wait = if keys.lone_esc() {
                 left.min(ESC_WAIT)
@@ -4427,16 +4428,23 @@ fn running_bars(ctx: &Ctx, session: &str) -> Res<Vec<String>> {
         let Ok(number) = pid.parse::<u32>() else {
             continue;
         };
-        let marked = labelled == "1" && mark == pid;
-        let watching = || {
-            ctx.os.row(number).is_some_and(|row| {
-                let managed = (row.argv.as_ref())
-                    .and_then(|a| a.get(2))
-                    .is_some_and(|f| f == MANAGED);
-                is_watch(ctx, &row) && (!managed || split_watch(ctx, number, &key))
-            })
+        if !pane_id(pane) || panes.iter().any(|p| p == pane) {
+            continue;
+        }
+        // Its process first: another root's managed watch is not this session's to answer for, however it is
+        // labelled or marked.
+        let row = ctx.os.row(number);
+        let managed = |row: &crate::proc::Row| {
+            (row.argv.as_ref())
+                .and_then(|a| a.get(2))
+                .is_some_and(|f| f == MANAGED)
         };
-        if pane_id(pane) && (marked || watching()) && !panes.iter().any(|p| p == pane) {
+        let foreign = row.as_ref().is_some_and(|row| {
+            is_watch(ctx, row) && managed(row) && !split_watch(ctx, number, &key)
+        });
+        let marked = labelled == "1" && mark == pid;
+        let watching = row.as_ref().is_some_and(|row| is_watch(ctx, row));
+        if !foreign && (marked || watching) {
             panes.push(pane.to_string());
         }
     }
@@ -8040,6 +8048,53 @@ mod tests {
             0,
             "read without a wait: {:?}",
             waits.borrow()
+        );
+    }
+
+    // The same with the bar's real pace (a 1 s tick and a 200 ms poll): a poll that finds nothing new never hides a
+    // resume's answer, so the frame that shows the refusal is drawn on that pass, not a tick later.
+    #[test]
+    fn a_resume_answer_is_drawn_at_once_though_a_poll_finds_nothing() {
+        let w = watch_world(&[
+            "live", "live", "live", "live", "live", "live", "live", "gone",
+        ]);
+        member_frames(&w, 8, &[ID, "bbbbbbbbbbbb"]);
+        pace(Pace {
+            tick: Duration::from_millis(1000),
+            poll: Some(Duration::from_millis(200)),
+        });
+        let caller = w.caller();
+        // Enter, then nothing for the rest of the tick: the resume answers just before the first poll, which finds
+        // nothing new on screen or on disk.
+        let steps = vec![(150, key(b"\t")), (150, key(b"G")), (150, key(b"\r"))];
+        let mut script = Script::new(&w.fakes, steps);
+        script.on_wait = Some(Box::new(|n| match n {
+            3 => jobs::HOLD.with(|h| h.set(true)),
+            4 => jobs::HOLD.with(|h| h.set(false)),
+            _ => {}
+        }));
+        let (mut frames, mut times) = (Vec::new(), Vec::new());
+        run_watch(
+            &w.ctx,
+            &caller,
+            Origin::Hand,
+            Box::new(script),
+            &mut |frame: &str| {
+                frames.push(frame.to_string());
+                let at = w.ctx.clock.now().duration_since(SystemTime::UNIX_EPOCH);
+                times.push(at.unwrap().as_millis() as u64);
+                assert!(frames.len() <= 100, "runaway");
+                Ok(())
+            },
+        );
+        pace(Pace::default());
+        let at = |text: &str| frames.iter().position(|f| f.contains(text));
+        let pending = at("resuming\u{2026}").expect("a frame shows the row resuming");
+        let answered = at("resume refused").expect("a later frame shows the refusal");
+        assert!(
+            times[answered] - times[pending] < 1000,
+            "the refusal waited for the next tick: {:?}",
+            diffs(&times)
         );
     }
 
@@ -13936,6 +13991,40 @@ mod tests {
         w.fakes.process(watch_row(109, &exe));
         assert_eq!(run(&w, &["-Close"]), refused(&["%9"]));
         assert_eq!(closes(&w), 1, "only the proven bar %7 was killed");
+        assert_eq!(get(&panes, "pid %9").as_deref(), Some("109"));
+    }
+
+    // Another state root's managed watch never blocks this root's -Close, even labelled and marked for its own pid
+    // (its opener labelled it, then died before recording it): it closes itself at its own STARTUP limit. Only its
+    // process says whose it is, so that is read before its label and mark count.
+    #[test]
+    fn close_is_not_refused_by_another_roots_marked_watch() {
+        let (mut w, panes) = sidebar_world(
+            "",
+            Mux {
+                open: true,
+                extra: vec![
+                    ("%9", "sidebar|".into()),
+                    ("pid %9", "109".into()),
+                    ("mark %9", "109".into()),
+                    ("win %9", "@5".into()),
+                ],
+                ..Mux::default()
+            },
+        );
+        let tmp = crate::testing::TempDir::new();
+        let (root, another) = (tmp.path().join("state"), tmp.path().join("another"));
+        w.ctx.state_root = root.clone();
+        let exe = w.ctx.exe.display().to_string();
+        let other = key_of(&mut w, &another);
+        w.fakes.process(crate::proc::Row {
+            argv: Some(vec![exe.clone(), "watch".into(), "-Managed".into(), other]),
+            ..watch_row(109, &exe)
+        });
+        assert_eq!(
+            run(&w, &["-Close"]),
+            r#"ok {"pane":"%7","closed":true,"panes":["%7"]}"#
+        );
         assert_eq!(get(&panes, "pid %9").as_deref(), Some("109"));
     }
 

@@ -41,6 +41,12 @@ pub(crate) struct Jobs {
     deferred_windows: Vec<String>,
 }
 
+#[cfg(test)]
+std::thread_local! {
+    // Under test, while true, deferred resumes are held back: a test releases them to answer at a moment it picks.
+    pub(crate) static HOLD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 impl Default for Jobs {
     fn default() -> Self {
         let (send, recv) = channel();
@@ -161,9 +167,12 @@ impl Jobs {
     /// The answers that have come, without waiting; their rows are no longer pending.
     pub(crate) fn drain(&mut self, ctx: &Ctx, caller: &Caller) -> Vec<Done> {
         #[cfg(test)]
-        for target in std::mem::take(&mut self.deferred) {
-            let answer = crate::agents::resume::resume_by_id(ctx, caller, &target.id, true, false);
-            let _ = self.send.send((target, answer));
+        if !HOLD.with(std::cell::Cell::get) {
+            for target in std::mem::take(&mut self.deferred) {
+                let answer =
+                    crate::agents::resume::resume_by_id(ctx, caller, &target.id, true, false);
+                let _ = self.send.send((target, answer));
+            }
         }
         #[cfg(not(test))]
         let _ = (ctx, caller);
