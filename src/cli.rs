@@ -1089,13 +1089,15 @@ mod tests {
                 .to_string()
         });
         let env = format!("MUX_AGENTS_STATE={state}");
-        let key = crate::sidebar::root_key(&w.ctx);
         let mut out = format!("[{scenario}]\n");
         for c in &calls {
             let marker = list_call(c).then(|| c[6][..32].to_string());
+            // The root's key follows `-Managed`: whatever the root holds, or a key of the call alone when it holds none.
+            let managed = c.iter().position(|t| t == "-Managed").map(|i| i + 1);
             let tokens: Vec<String> = c
                 .iter()
-                .map(|t| {
+                .enumerate()
+                .map(|(at, t)| {
                     if hc.as_ref().and_then(|path| path.to_str()) == Some(t.as_str()) {
                         return "<hc>".into();
                     }
@@ -1122,7 +1124,7 @@ mod tests {
                         "<exe>".into()
                     } else if *t == env {
                         "MUX_AGENTS_STATE=<state>".into()
-                    } else if *t == key {
+                    } else if Some(at) == managed {
                         "<root-key>".into()
                     } else if let Some(m) = &marker {
                         t.replace(m.as_str(), "<marker>")

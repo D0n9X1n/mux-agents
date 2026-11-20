@@ -5,7 +5,7 @@
 # runs only through hc, and the tagged-pane list frames each row with a fresh per-call marker.
 # Placeholders: <marker> the 32-hex marker, <state> the state root, <cwd> the caller's cwd, <exe> the binary,
 # <id> the new agent's id, <hc> the resolved core binary, <buffer> a read's private buffer (mux-agents-<32 hex>),
-# <root-key> the state root's key (16 hex of sha256 of the canonical root, `sidebar::root_key`).
+# <root-key> the state root's key (32 random hex stored once in the root's `bar-key`, `sidebar::root_key`).
 # `-e MUX_AGENTS_STATE=<state>` is the Unix pane environment of the sidebar and, since 0.3.0, the view.
 # A split view first reads the session's member views and the caller's window, then splits at 50% (since 0.3.3).
 # :370 caller probe; :539 tagged-pane list; :1188 gone probe of agent %8 (committed, no notice, not listed).

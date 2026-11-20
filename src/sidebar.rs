@@ -4058,26 +4058,47 @@ fn split_watch(ctx: &Ctx, pid: u32, key: &str) -> bool {
     })
 }
 
-/// The state root's key a bar's split passes its watch: sha16 of `key_path`, as a team's identity hashes its root
-/// (`agents::up::identity::team`). Plain hex, so it needs no quoting in a pane command on any platform, and names no
-/// path.
-pub(crate) fn root_key(ctx: &Ctx) -> String {
-    crate::util::sha256_hex(key_path(ctx).display().to_string())[..16].to_string()
-}
+/// The file in the state root that holds the root's key.
+const ROOT_KEY: &str = "bar-key";
 
-/// The path a root key hashes, always one place: the canonical root; a root not on disk yet made absolute, a relative
-/// one joined to the working directory and a Windows drive-relative one (`C:state`, which `join` keeps as is) resolved
-/// by the OS against that drive's working directory. A root the OS cannot resolve keys by this process too, so no
-/// other root's `-Close` can match it: its stray is spared and cleans itself up.
-fn key_path(ctx: &Ctx) -> std::path::PathBuf {
-    std::fs::canonicalize(&ctx.state_root).unwrap_or_else(|_| {
-        let joined = ctx.cwd.join(&ctx.state_root);
-        if joined.is_absolute() {
-            return joined;
-        }
-        std::path::absolute(&joined)
-            .unwrap_or_else(|_| joined.join(format!("unresolved-{}", ctx.pid)))
-    })
+/// The state root's key a bar's split passes its watch, so `-Close` sweeps only its own root's strays: 32 random hex
+/// digits stored once in the root (`ROOT_KEY`), the first writer's kept, and read back by every process, so the key
+/// never depends on how the root's path is spelled or encoded. A root that cannot hold one (not creatable, or the file
+/// holds no key) gives this call a key of its own: no other process's `-Close` matches its stray, which cleans itself
+/// up after STARTUP.
+pub(crate) fn root_key(ctx: &Ctx) -> String {
+    let file = ctx.state_root.join(ROOT_KEY);
+    let read = || {
+        std::fs::read_to_string(&file)
+            .ok()
+            .map(|k| k.trim().to_string())
+            .filter(|k| k.len() == 32 && k.bytes().all(|c| c.is_ascii_hexdigit()))
+    };
+    if let Some(key) = read() {
+        return key;
+    }
+    let fresh = || {
+        let mut bytes = [0u8; 16];
+        crate::util::random_bytes(&mut bytes)
+            .map(|()| bytes.iter().map(|b| format!("{b:02x}")).collect::<String>())
+    };
+    let Ok(mine) = fresh() else {
+        return format!("{:032x}", ctx.pid);
+    };
+    let created = std::fs::create_dir_all(&ctx.state_root).and_then(|()| {
+        use std::io::Write;
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&file)?;
+        f.write_all(mine.as_bytes())
+    });
+    match created {
+        Ok(()) => mine,
+        // Another process wrote it first: its key is the root's.
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => read().unwrap_or(mine),
+        Err(_) => mine,
+    }
 }
 
 /// `q` then `y`: the bar closes as `sidebar -Close` closes it, for its own window only, in this process. Under the
@@ -11281,33 +11302,48 @@ mod tests {
         );
     }
 
-    // A root not on disk yet keys by its absolute path: the same relative name from two working directories names two
-    // roots, so two keys; the same root named relatively and absolutely is one key.
+    // A root's key is stored in the root: whoever reads it, from any working directory and however the root is
+    // spelled, gets the same key; another root has its own; a root that cannot hold one gives each process its own key,
+    // so no -Close can match a stray of it.
     #[test]
-    fn a_relative_root_not_yet_on_disk_keys_by_its_absolute_path() {
+    fn a_roots_key_is_stored_in_it_and_shared_by_every_reader() {
+        let (a, b) = (
+            crate::testing::TempDir::new(),
+            crate::testing::TempDir::new(),
+        );
         let mut w = World::human("");
-        let mut key = |cwd: &str, root: &str| {
+        let mut key = |root: &std::path::Path, cwd: &str| {
+            w.ctx.state_root = root.to_path_buf();
             w.ctx.cwd = cwd.into();
-            w.ctx.state_root = root.into();
             root_key(&w.ctx)
         };
-        assert_ne!(key("/work/a", "state"), key("/work/b", "state"));
-        assert_eq!(key("/work/a", "state"), key("/elsewhere", "/work/a/state"));
-        // Whatever the root's form, the path hashed is absolute, so it names one place: on Windows a drive-relative
-        // root (`C:state`) and a root-relative one (`\state`) too, which `join` alone leaves relative or rebases.
-        let mut roots = vec!["state", "./state", "../state"];
-        if cfg!(windows) {
-            roots.extend(["C:state", "\\state"]);
-        }
-        for root in roots {
-            w.ctx.cwd = std::env::current_dir().unwrap();
-            w.ctx.state_root = root.into();
-            assert!(
-                key_path(&w.ctx).is_absolute(),
-                "{root}: {:?}",
-                key_path(&w.ctx)
-            );
-        }
+        let first = key(a.path(), "/work/a");
+        assert_eq!(first.len(), 32, "{first}");
+        assert!(first.bytes().all(|c| c.is_ascii_hexdigit()), "{first}");
+        // The opener and the closer each read it: the same key, whatever their working directory.
+        assert_eq!(key(a.path(), "/elsewhere"), first);
+        assert_eq!(
+            std::fs::read_to_string(a.path().join(ROOT_KEY)).unwrap(),
+            first
+        );
+        // The same root through another spelling of its path.
+        let dotted = a.path().join(".");
+        assert_eq!(key(&dotted, "/work/b"), first);
+        // Another root, its own key.
+        assert_ne!(key(b.path(), "/work/a"), first);
+        // A root that cannot hold the key (a file stands where its folder would be): a key of this call alone.
+        let blocked = a.path().join("blocked");
+        std::fs::write(&blocked, "x").unwrap();
+        let root = blocked.join("state");
+        assert_ne!(key(&root, "/work/a"), key(&root, "/work/a"));
+        // A key file that is not a key is left alone, and is no key: a key of this call alone.
+        let c = crate::testing::TempDir::new();
+        std::fs::write(c.path().join(ROOT_KEY), "not hex").unwrap();
+        assert_ne!(key(c.path(), "/work/a"), key(c.path(), "/work/a"));
+        assert_eq!(
+            std::fs::read_to_string(c.path().join(ROOT_KEY)).unwrap(),
+            "not hex"
+        );
     }
 
     // The bar's split starts its watch as `watch -Managed <key>`, the key its state root's, so the watch knows the split
@@ -11315,10 +11351,12 @@ mod tests {
     // still proven this binary's watch, recorded and labelled.
     #[test]
     fn the_bars_split_starts_its_watch_managed() {
-        let (w, panes) = sidebar_world("", Mux::default());
+        let (mut w, panes) = sidebar_world("", Mux::default());
+        let root = crate::testing::TempDir::new();
+        w.ctx.state_root = root.path().to_path_buf();
         let exe = w.ctx.exe.display().to_string();
-        let key = key_of(&w.ctx.state_root);
-        assert!(key.len() == 16 && key.bytes().all(|b| b.is_ascii_hexdigit()));
+        let key = key_of(&mut w, root.path());
+        assert!(key.len() == 32 && key.bytes().all(|b| b.is_ascii_hexdigit()));
         let want = key.clone();
         w.fakes.mux_script("-l 40", move |argv| {
             assert_eq!(
@@ -13311,9 +13349,12 @@ mod tests {
     }
 
     // The key a split under `root` passes its watch: sha16 of the canonical root, as a team's identity hashes it.
-    fn key_of(root: &std::path::Path) -> String {
-        let root = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
-        crate::util::sha256_hex(root.display().to_string())[..16].to_string()
+    /// The key `root` holds (`root_key` on a world rooted there): the same for every reader of that root.
+    fn key_of(w: &mut World, root: &std::path::Path) -> String {
+        let saved = std::mem::replace(&mut w.ctx.state_root, root.to_path_buf());
+        let key = root_key(&w.ctx);
+        w.ctx.state_root = saved;
+        key
     }
 
     // A watch the bar's split started (`watch -Managed <key>`) whose opener died before it marked, labelled or recorded
@@ -13322,13 +13363,18 @@ mod tests {
     // MUX_AGENTS_STATE=B) is spared, and closes itself at its own limit. A watch a person ran (`watch`) is never one.
     #[test]
     fn close_kills_a_watch_the_split_started_but_never_marked() {
-        let (w, panes) = sidebar_world("", Mux::default());
+        let (mut w, panes) = sidebar_world("", Mux::default());
+        let (root, another) = (
+            crate::testing::TempDir::new(),
+            crate::testing::TempDir::new(),
+        );
+        w.ctx.state_root = root.path().to_path_buf();
         let exe = w.ctx.exe.display().to_string();
         let managed = |key: &str| vec![exe.clone(), "watch".into(), "-Managed".into(), key.into()];
-        let other = key_of(std::path::Path::new("/another/state"));
-        assert_ne!(other, key_of(&w.ctx.state_root));
+        let (mine, other) = (key_of(&mut w, root.path()), key_of(&mut w, another.path()));
+        assert_ne!(other, mine);
         for (pane, pid, argv) in [
-            ("%9", 109, managed(&key_of(&w.ctx.state_root))),
+            ("%9", 109, managed(&mine)),
             ("%10", 110, vec![exe.clone(), "watch".into()]),
             ("%11", 111, managed(&other)),
         ] {
