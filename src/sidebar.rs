@@ -11369,9 +11369,7 @@ mod tests {
         std::fs::write(&blocked, "x").unwrap();
         w.ctx.state_root = blocked.join("state");
         assert_ne!(root_key(&w.ctx), root_key(&w.ctx));
-        let bad = tmp.path().join("bad");
-        crate::testing::private_tree(tmp.path(), &bad);
-        std::fs::write(bad.join(ROOT_KEY), "not hex").unwrap();
+        let bad = root_holding(&tmp, "bad", "not hex");
         w.ctx.state_root = bad.clone();
         assert_ne!(root_key(&w.ctx), root_key(&w.ctx));
         assert_eq!(
@@ -11380,8 +11378,8 @@ mod tests {
         );
         #[cfg(unix)]
         {
-            let fifo = tmp.path().join("fifo");
-            crate::testing::private_tree(tmp.path(), &fifo);
+            let fifo = root_holding(&tmp, "fifo", "");
+            std::fs::remove_file(fifo.join(ROOT_KEY)).unwrap();
             let made = std::process::Command::new("mkfifo")
                 .arg(fifo.join(ROOT_KEY))
                 .status()
@@ -11404,21 +11402,29 @@ mod tests {
         assert!(!tmp.path().join("norandom").join(ROOT_KEY).exists());
     }
 
+    /// A state root `root_key` made (private as it makes it, on every OS), its `bar-key` then holding `text`.
+    fn root_holding(tmp: &crate::testing::TempDir, name: &str, text: &str) -> std::path::PathBuf {
+        let root = tmp.path().join(name);
+        let mut w = World::human("");
+        w.ctx.state_root = root.clone();
+        root_key(&w.ctx);
+        std::fs::write(root.join(ROOT_KEY), text).unwrap();
+        root
+    }
+
     // Two processes publishing at once: each stages its own key and hard-links it to `bar-key`; the link fails for the
     // second, which reads the first's back, so both end with the same key and no reader ever sees part of one.
     #[test]
     fn a_racing_second_writer_takes_the_first_writers_key() {
         let tmp = crate::testing::TempDir::new();
-        let root = tmp.path().join("root");
-        crate::testing::private_tree(tmp.path(), &root);
+        // A root that already holds a key: it is taken as is.
         let first = "0123456789abcdef0123456789abcdef";
-        std::fs::write(root.join(ROOT_KEY), first).unwrap();
+        let root = root_holding(&tmp, "root", first);
         let mut w = World::human("");
         w.ctx.state_root = root.clone();
-        // Past the first read (an empty file, as one being published was before): the link step meets the first's.
-        let empty = tmp.path().join("empty");
-        crate::testing::private_tree(tmp.path(), &empty);
         assert_eq!(root_key(&w.ctx), first);
+        // A root with none: this call's key is published and read back.
+        let empty = tmp.path().join("empty");
         w.ctx.state_root = empty.clone();
         let mine = root_key(&w.ctx);
         assert_eq!(std::fs::read_to_string(empty.join(ROOT_KEY)).unwrap(), mine);
@@ -13444,7 +13450,6 @@ mod tests {
         );
     }
 
-    // The key a split under `root` passes its watch: sha16 of the canonical root, as a team's identity hashes it.
     /// The key `root` holds (`root_key` on a world rooted there): the same for every reader of that root.
     fn key_of(w: &mut World, root: &std::path::Path) -> String {
         let saved = std::mem::replace(&mut w.ctx.state_root, root.to_path_buf());
