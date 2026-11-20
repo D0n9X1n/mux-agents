@@ -2719,9 +2719,10 @@ hc {}:
     }
 
     // A bar whose pane was joined out of its window (that window's last pane, so the window went) is proven by no
-    // record any more, yet it still runs: -Close closes the other window's bar and refuses, naming the moved one,
-    // rather than answering closed with a bar left.
-    fn close_refuses_a_bar_joined_out_of_a_window_that_went(mux: Mux) {
+    // record any more, yet it still runs. A bar `sidebar` opened is its split's `watch -Managed <root-key>`: -Close
+    // closes it by its process too, with the other window's bar, and leaves no bar running. -Close never answers
+    // closed while one runs: a bar it cannot prove still refuses (`unproven_label_in_another_window_refuses`).
+    fn close_closes_a_bar_joined_out_of_a_window_that_went(mux: Mux) {
         let Some(mut live) = Live::human(mux) else {
             return;
         };
@@ -2753,16 +2754,22 @@ hc {}:
         live.call(&["kill-pane", "-t", &other]);
         live.call(&["join-pane", "-d", "-h", "-s", &moved, "-t", &root]);
         let (code, close) = live.run(&["sidebar", "-Close"]);
-        assert_eq!(code, 1, "{mux:?}: a bar still runs: {close}");
-        let refused = format!("pane {moved} carries the side-bar label");
-        assert!(
-            s(&close["message"]).starts_with(&refused),
-            "{mux:?} {close}"
-        );
+        assert_eq!(code, 0, "{mux:?} {close}");
+        let mut panes: Vec<&str> = close["panes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|p| s(p))
+            .collect();
+        panes.sort();
+        let mut want = [here.as_str(), moved.as_str()];
+        want.sort();
+        assert_eq!(panes, want, "{mux:?}: both bars closed: {close}");
         live.wait_gone(&here);
+        live.wait_gone(&moved);
         assert!(
-            live.panes("#{pane_id}").contains(&moved),
-            "{mux:?}: the moved bar was killed"
+            live.panes("#{pane_id}").contains(&root),
+            "{mux:?}: the user's pane was closed"
         );
     }
 
@@ -6708,7 +6715,7 @@ hc {}:
                     bar_width_follows_its_options,
                     replaced_bar_is_never_closed,
                     close_after_rotate_spares_the_users_pane,
-                    close_refuses_a_bar_joined_out_of_a_window_that_went,
+                    close_closes_a_bar_joined_out_of_a_window_that_went,
                     unproven_label_in_another_window_refuses,
                     manual_watch_moves_nothing,
                     manual_watch_without_a_bar_moves_nothing,
