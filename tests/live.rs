@@ -5402,11 +5402,35 @@ hc {}:
             live.call(&["select-pane", "-t", &bars[2]]);
             let band = "\u{1b}[48;5;236m";
             let mut lit = String::new();
+            // The bar polls every 200 ms between ticks: the tab switch shows well within a second.
+            let switched = std::time::Instant::now();
             let banded = eventually(Duration::from_secs(10), || {
                 lit = live.call(&["capture-pane", "-p", "-e", "-t", &bars[2]]);
                 !lit.contains(band) || lit.lines().any(|l| l.contains(band) && l.contains("grand"))
             });
             assert!(banded, "{mux:?} grand's bar:\n{lit}");
+            if lit.contains(band) {
+                let took = switched.elapsed();
+                assert!(
+                    took < Duration::from_millis(900),
+                    "{mux:?} the band moved after {took:?}"
+                );
+            }
+            // Idle, the 200 ms poll draws nothing new: the bar's own tick writes no state that would wake it, so it
+            // never redraws in a loop. A frame starts with the synchronized-output mark; count them over 3 s.
+            let file = live.dir.join(format!("idle-{mux:?}.log"));
+            live.call(&[
+                "pipe-pane",
+                "-t",
+                &bars[2],
+                "-O",
+                &format!("cat >> {}", file.display()),
+            ]);
+            std::thread::sleep(Duration::from_secs(3));
+            live.call(&["pipe-pane", "-t", &bars[2]]);
+            let drawn = std::fs::read(&file).unwrap_or_default();
+            let frames = drawn.windows(8).filter(|w| *w == b"\x1b[?2026h").count();
+            assert!(frames <= 5, "{mux:?} {frames} frames in 3 s idle");
             for bar in &bars {
                 let screen = live.call(&["capture-pane", "-p", "-t", bar]);
                 assert!(!screen.contains('\u{f054}'), "{mux:?} {bar}:\n{screen}");

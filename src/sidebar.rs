@@ -26,7 +26,77 @@ use input::{Input, NoInput, Waited};
 use keys::{Decoder, Event};
 use pick::{Act, Pick, Target};
 
-const TICK: Duration = Duration::from_millis(2000);
+/// How often the bar reads the board (`tick`), and how often between ticks it looks, cheaply, for a change it should
+/// show at once (`poll`): another pane on screen (a tab switch) or an agent's folder written (a report, a status, a
+/// message). A full read costs about 100 ms of calls with six agents, so it runs once a second; a poll is one
+/// multiplexer read and a few file stats, so it runs every 200 ms.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Pace {
+    pub tick: Duration,
+    pub poll: Option<Duration>,
+}
+
+impl Default for Pace {
+    #[cfg(not(test))]
+    fn default() -> Self {
+        Pace {
+            tick: Duration::from_millis(1000),
+            poll: Some(Duration::from_millis(200)),
+        }
+    }
+    // The unit tests pin the frames of a 2 s tick with no poll; `pace` sets another for one test.
+    #[cfg(test)]
+    fn default() -> Self {
+        Pace {
+            tick: Duration::from_millis(2000),
+            poll: None,
+        }
+    }
+}
+
+std::thread_local! {
+    static PACE: std::cell::Cell<Option<Pace>> = const { std::cell::Cell::new(None) };
+}
+
+/// The pace this thread's watch runs at.
+fn current_pace() -> Pace {
+    PACE.with(|p| p.get()).unwrap_or_default()
+}
+
+/// Tests: the pace for this thread's next watch runs.
+#[cfg(test)]
+fn pace(p: Pace) {
+    PACE.with(|c| c.set(Some(p)));
+}
+
+/// What a poll compares: the newest change time among the agents' folders, their generations' folders and the
+/// mailboxes. Each write is a rename into its folder (`state::fs::write_json`: an agent's own files, a generation's
+/// exit evidence under `gens/<n>/`) or an append to a mailbox file, so one of these times moves with it; no process is
+/// started. Unreadable entries are skipped.
+fn stamp(root: &std::path::Path) -> Option<SystemTime> {
+    let time = |p: &std::path::Path| std::fs::metadata(p).ok().and_then(|m| m.modified().ok());
+    let entries = |dir: &std::path::Path| -> Vec<std::fs::DirEntry> {
+        std::fs::read_dir(dir)
+            .map(|d| d.filter_map(|e| e.ok()).collect())
+            .unwrap_or_default()
+    };
+    let mut newest = time(&root.join("agents"));
+    let mut see = |t: Option<SystemTime>| newest = newest.max(t);
+    for agent in entries(&root.join("agents")) {
+        see(time(&agent.path()));
+        let gens = agent.path().join("gens");
+        see(time(&gens));
+        for generation in entries(&gens) {
+            see(time(&generation.path()));
+        }
+    }
+    for mailbox in entries(&root.join("mail")) {
+        see(time(&mailbox.path()));
+    }
+    newest
+}
+// The walk over the other view windows (two reads each) runs on the first tick and every this many after.
+const WALK_EVERY: u32 = 5;
 // How long a lone ESC may wait for the rest of a sequence before it counts as the Esc key.
 const ESC_WAIT: Duration = Duration::from_millis(50);
 // A minute of ticks with no answer from the multiplexer: a write to a pipe whose reader closed can still succeed.
@@ -1487,23 +1557,46 @@ fn with_hint(
     hinted(board, notes, size, look, tree::Focus::default())
 }
 
-/// The band on the agent (or main row) whose pane the session shows: its name line on a soft background, `BAND`,
-/// across the bar's `width`, so the row reads as the one on screen without a glyph. Only with color; nothing when
+/// The band on the agent (or main row) whose pane the session shows: its whole block (name line and doing line) on a
+/// soft background, `BAND`, across the bar's `width`, so the agent reads as the one on screen without a glyph. Only with color; nothing when
 /// the shown pane is no drawn row's. The text is unchanged, so clicks hit it as before.
 pub(crate) fn shade(laid: &mut Laid, shown: Option<&str>, width: usize, look: Look) {
     let Some(pane) = shown.filter(|p| !p.is_empty() && look.color && !look.ascii) else {
         return;
     };
-    let Some(&(_, at)) = laid.agents.iter().find(|(t, _)| t.pane == pane) else {
+    let Some(target) = laid
+        .agents
+        .iter()
+        .find(|(t, _)| t.pane == pane)
+        .map(|(t, _)| t.clone())
+    else {
         return;
     };
-    let row = &mut laid.rows[at];
-    let pad = width.saturating_sub(row_width(row));
-    if pad > 0 {
-        row.push(span(" ".repeat(pad), PLAIN));
-    }
-    for (_, style) in row.iter_mut() {
-        style.bg = Some(BAND);
+    band(laid, &target, width);
+}
+
+/// The band on `target`'s whole block: its name line and the rows it takes under it (its doing line), each across
+/// `width`.
+fn band(laid: &mut Laid, target: &Target, width: usize) {
+    let rows: Vec<usize> = (laid.agents.iter())
+        .filter(|(t, _)| t.id == target.id && t.pane == target.pane)
+        .map(|(_, at)| *at)
+        .chain(
+            laid.more
+                .iter()
+                .filter(|(id, _)| *id == target.id && !id.is_empty())
+                .map(|(_, at)| *at),
+        )
+        .collect();
+    for at in rows {
+        let row = &mut laid.rows[at];
+        let pad = width.saturating_sub(row_width(row));
+        if pad > 0 {
+            row.push(span(" ".repeat(pad), PLAIN));
+        }
+        for (_, style) in row.iter_mut() {
+            style.bg = Some(BAND);
+        }
     }
 }
 
@@ -1518,13 +1611,13 @@ fn mark(laid: &mut Laid, id: &str, width: usize, look: Look) {
         for (_, style) in laid.rows.iter_mut().flatten() {
             style.bg = None;
         }
-        let row = &mut laid.rows[at];
-        let pad = width.saturating_sub(row_width(row));
-        if pad > 0 {
-            row.push(span(" ".repeat(pad), PLAIN));
-        }
-        for (_, style) in row.iter_mut() {
-            style.bg = Some(BAND);
+        let target = laid
+            .agents
+            .iter()
+            .find(|(t, _)| t.id == id)
+            .map(|(t, _)| t.clone());
+        if let Some(target) = target {
+            band(laid, &target, width);
         }
         return;
     }
@@ -1907,6 +2000,10 @@ pub fn run_watch(
     let mut by_hand = false;
     // The other view windows whose ensure failed, and when: each is tried again once REARM has passed.
     let mut failed_windows: Vec<(String, SystemTime)> = Vec::new();
+    // Ticks since the last walk over the other view windows: the first tick walks.
+    let mut since_walk = WALK_EVERY;
+    let pace = current_pace();
+    let root = crate::agents::server_dir(ctx, caller);
     // Peek files of popups that never opened, from an earlier bar (review).
     sweep_peeks(ctx, &crate::agents::server_dir(ctx, caller));
     loop {
@@ -1976,10 +2073,13 @@ pub fn run_watch(
                 && held
                 && !here
                 && !*status.get_or_insert_with(|| is_status(ctx, &caller.window));
-            if recorded {
-                // Every other view window without a proven bar gets its own (a view moved by break-pane). One whose
-                // ensure failed waits a minute before it is tried again, so a failing open never splits every tick;
-                // a leaving bar tries each one now, since it is the last chance this watch has.
+            since_walk = since_walk.saturating_add(1);
+            if recorded && (lost || since_walk >= WALK_EVERY) {
+                since_walk = 0;
+                // Every other view window without a proven bar gets its own (a view moved by break-pane), checked
+                // every WALK_EVERY ticks so a tick stays cheap. One whose ensure failed waits a minute before it is
+                // tried again, so a failing open never splits every tick; a leaving bar tries each one now, since it
+                // is the last chance this watch has.
                 let now = ctx.clock.now();
                 failed_windows
                     .retain(|(_, at)| now.duration_since(*at).unwrap_or_default() < REARM);
@@ -2009,6 +2109,9 @@ pub fn run_watch(
                 }
             }
         }
+        // The poll's baseline, taken before the board is read: a write that lands during the read is newer, so the
+        // next poll draws it instead of taking it as drawn.
+        let polled_stamp = pace.poll.and_then(|_| stamp(&root));
         let mut failed = live.is_none();
         match board(ctx, caller, true, true) {
             Ok(board) => last = Some(board),
@@ -2105,22 +2208,42 @@ pub fn run_watch(
             looking: viewing.pane.clone(),
             team,
         };
+        // What the next polls compare against: the pane on screen as this tick drew it (the stamp is from before the
+        // read).
+        let polled_pane = looked.clone().flatten();
+        let mut polled_at = ctx.clock.now();
         loop {
             let since = ctx
                 .clock
                 .now()
                 .duration_since(shown.written)
-                .unwrap_or(TICK);
-            let left = TICK.saturating_sub(since);
+                .unwrap_or(pace.tick);
+            let left = pace.tick.saturating_sub(since);
             if left.is_zero() {
                 pick.ticked();
                 break;
             }
-            let wait = if keys.lone_esc() {
+            // A poll is due: another pane on screen or a state change ends the wait, and the next tick draws it now.
+            if let Some(poll) = pace.poll
+                && ctx.clock.now().duration_since(polled_at).unwrap_or(poll) >= poll
+            {
+                polled_at = ctx.clock.now();
+                let pane = shown_pane(ctx, caller);
+                let moved = pane.is_some_and(|p| p != polled_pane);
+                if moved || stamp(&root) != polled_stamp {
+                    break;
+                }
+            }
+            let mut wait = if keys.lone_esc() {
                 left.min(ESC_WAIT)
             } else {
                 left
             };
+            if let Some(poll) = pace.poll {
+                let next =
+                    poll.saturating_sub(ctx.clock.now().duration_since(polled_at).unwrap_or(poll));
+                wait = wait.min(next.max(Duration::from_millis(1)));
+            }
             let reads = match input.wait(&*ctx.clock, wait) {
                 Waited::Bytes(bytes) => keys.push(&bytes, ctx.clock.now()),
                 Waited::Timeout => keys.idle(),
@@ -2900,6 +3023,10 @@ pub(crate) fn watch_on(
     let caller = resolve(ctx)?;
     crate::cli::member_views(ctx, &caller)?;
     console_utf8();
+    // A bar ticks for as long as it lives: hc's version is checked once, not on each tick's read. The unit tests
+    // script hc call by call, so they keep the check per connect (`hc::tests` covers the cache).
+    #[cfg(not(test))]
+    crate::hc::remember_versions();
     let ended = run_watch(ctx, &caller, open(), write);
     let mut reply = Map::new();
     reply.insert("pane".into(), caller.pane.into());
@@ -5182,10 +5309,6 @@ mod tests {
         };
         let text =
             |laid: &Laid| -> Vec<String> { laid.rows.iter().map(|r| render(r, false)).collect() };
-        let any_band_but = |laid: &Laid, keep: usize| {
-            (0..laid.rows.len())
-                .any(|at| at != keep && laid.rows[at].iter().any(|(_, s)| s.bg.is_some()))
-        };
         // Rows: header, gap, main, gap, worker, its doing line, gap, writer.
         let (main, worker, doing, writer) = (2, 4, 5, 7);
         let banded = |laid: &Laid, at: usize| laid.rows[at].iter().all(|(_, s)| s.bg == Some(BAND));
@@ -5206,9 +5329,26 @@ mod tests {
             text(&shown)[writer].trim_end(),
             text(&laid(color, None, None))[writer].trim_end()
         );
-        // The doing line is not banded; the main row is when its pane is on screen.
-        assert!(!banded(&laid(color, Some("%1"), None), doing));
-        assert!(banded(&laid(color, Some("%1"), None), worker));
+        // The band covers the agent's whole block, its doing line too, each row across the bar; the main row is
+        // banded when its pane is on screen.
+        let block = laid(color, Some("%1"), None);
+        assert!(
+            banded(&block, worker) && banded(&block, doing),
+            "{:?}",
+            text(&block)
+        );
+        assert_eq!(
+            row_width(&block.rows[doing]),
+            40,
+            "the block's band spans the bar"
+        );
+        let lit: Vec<usize> = (0..block.rows.len())
+            .filter(|&at| block.rows[at].iter().any(|(_, s)| s.bg.is_some()))
+            .collect();
+        assert_eq!(lit, [worker, doing], "only the block");
+        // A selection takes the whole block's band too.
+        let picked = laid(color, Some("%2"), Some("worker"));
+        assert!(banded(&picked, worker) && banded(&picked, doing) && !banded(&picked, writer));
         assert!(banded(&laid(color, Some("%3"), None), main));
         // Without color, in ASCII, or for a pane no row draws: no band.
         assert!(!any_band(&laid(PLAIN_LOOK, Some("%2"), None)));
@@ -5254,7 +5394,11 @@ mod tests {
         assert!(banded(&both, writer) && !banded(&both, worker));
         let apart = laid(color, Some("%2"), Some("worker"));
         assert!(
-            banded(&apart, worker) && !any_band_but(&apart, worker),
+            banded(&apart, worker)
+                && banded(&apart, doing)
+                && !(0..apart.rows.len())
+                    .filter(|&at| at != worker && at != doing)
+                    .any(|at| apart.rows[at].iter().any(|(_, s)| s.bg.is_some())),
             "{:?}",
             text(&apart)
         );
@@ -5290,13 +5434,14 @@ mod tests {
             }
             laid
         };
-        // With color the band is the selection's only mark: the text is the bare frame's, nothing reversed.
-        for (selected, at) in [("worker", 2), ("writer", 5)] {
+        // With color the band is the selection's only mark, over its whole block (worker's name and doing lines):
+        // the text is the bare frame's, nothing reversed.
+        for (selected, block) in [("worker", &[2, 3][..]), ("writer", &[5][..])] {
             let laid = drawn(color, Some(selected));
             let bare = drawn(color, None);
             for (n, (got, want)) in laid.rows.iter().zip(&bare.rows).enumerate() {
                 let banded = got.iter().any(|(_, s)| s.bg == Some(BAND));
-                assert_eq!(banded, n == at, "{selected} {n}");
+                assert_eq!(banded, block.contains(&n), "{selected} {n}");
                 assert_eq!(
                     render(got, false).trim_end(),
                     render(want, false).trim_end(),
@@ -6000,8 +6145,9 @@ mod tests {
                 out
             })
             .collect();
+        // worker's block: its name line and its doing line.
         assert!(
-            last.len() == 1 && last[0].contains("worker"),
+            last.len() == 2 && last[0].contains("worker") && last[1].contains("testing the parser"),
             "{last:?} {:?}",
             frames.last()
         );
@@ -6455,6 +6601,8 @@ mod tests {
         fakes: Fakes,
         steps: VecDeque<(u64, Waited)>,
         waits: Rc<RefCell<Vec<u64>>>,
+        // Runs before each wait with its number (from 1): a test changes the world between polls.
+        on_wait: Option<Box<dyn FnMut(usize)>>,
     }
 
     impl Script {
@@ -6463,6 +6611,7 @@ mod tests {
                 fakes: fakes.clone(),
                 steps: steps.into(),
                 waits: Default::default(),
+                on_wait: None,
             }
         }
     }
@@ -6471,6 +6620,10 @@ mod tests {
         fn wait(&mut self, _clock: &dyn crate::ctx::Clock, timeout: Duration) -> Waited {
             let ms = timeout.as_millis() as u64;
             self.waits.borrow_mut().push(ms);
+            let n = self.waits.borrow().len();
+            if let Some(hook) = self.on_wait.as_mut() {
+                hook(n);
+            }
             match self.steps.front_mut() {
                 Some((due, _)) if *due <= ms => {
                     self.fakes.advance(Duration::from_millis(*due));
@@ -6526,6 +6679,123 @@ mod tests {
         // Each tick waits for six reads 300 ms apart, then the 200 ms left.
         assert_eq!(waits[..7], [2000, 1700, 1400, 1100, 800, 500, 200]);
         assert!(w.fakes.slept().is_empty());
+    }
+
+    // The refresh between ticks: with a 200 ms poll, a tab switch (another pane on screen) or an agent's report (its
+    // folder written) redraws within one poll, not at the next tick; a poll that sees no change redraws nothing.
+    #[test]
+    fn a_poll_redraws_a_change_before_the_tick() {
+        for change in ["tab", "report", "none"] {
+            let w = watch_world(&["live", "live", "live", "gone"]);
+            pace(Pace {
+                tick: Duration::from_millis(2000),
+                poll: Some(Duration::from_millis(200)),
+            });
+            let shown = Rc::new(Cell::new(0));
+            let seen = shown.clone();
+            let tab = change == "tab";
+            w.fakes
+                .mux_script("#{pane_id}|#{session_attached}", move |_| {
+                    seen.set(seen.get() + 1);
+                    // The tick's own read, then polls: the pane changes from the third poll on.
+                    Ok(out(
+                        0,
+                        if tab && seen.get() > 3 {
+                            "%2|1\n"
+                        } else {
+                            "%9|1\n"
+                        },
+                        "",
+                    ))
+                });
+            let folder = crate::agents::server_dir(&w.ctx, &w.caller())
+                .join("agents")
+                .join(ID);
+            let fakes = w.fakes.clone();
+            let report = change == "report";
+            let steps: Vec<(u64, Waited)> = Vec::new();
+            let mut script = Script::new(&w.fakes, steps);
+            script.on_wait = Some(Box::new(move |n| {
+                if report && n == 3 {
+                    std::thread::sleep(Duration::from_millis(5));
+                    write(
+                        &folder.join("activity.json"),
+                        json!({"state": "done", "kind": null, "since": "x"}),
+                    );
+                }
+                let _ = &fakes;
+            }));
+            watch_frames(&w, 3);
+            let (ended, frames, times) = watch_with(&w, Box::new(script));
+            pace(Pace::default());
+            assert_eq!(ended, "pane-closed", "{change}");
+            match change {
+                "none" => assert_eq!(diffs(&times), [2000, 2000], "{change}"),
+                _ => assert_eq!(
+                    diffs(&times)[0],
+                    600,
+                    "{change}: redrawn at the poll after the change, {frames:?}"
+                ),
+            }
+        }
+    }
+
+    // The stamp sees every write the board reads: an agent's own files, and a generation's under `gens/<n>/` (its
+    // exit evidence), each a rename into its folder.
+    #[test]
+    fn the_stamp_moves_with_a_generations_write() {
+        let dir = std::env::temp_dir().join(format!("ma-stamp-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let generation = dir.join("agents").join(ID).join("gens").join("0");
+        std::fs::create_dir_all(&generation).unwrap();
+        std::fs::create_dir_all(dir.join("mail")).unwrap();
+        let before = stamp(&dir);
+        std::thread::sleep(Duration::from_millis(20));
+        write(&generation.join("exit.json"), json!({"code": 0}));
+        let after = stamp(&dir);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(after > before, "{before:?} {after:?}");
+    }
+
+    // A write that lands while a tick reads the board is not taken as drawn: the poll's stamp is the one from before
+    // the read, so the next poll sees it and draws it.
+    #[test]
+    fn a_write_during_the_read_is_drawn_at_the_next_poll() {
+        let w = watch_world(&["live", "live", "live", "gone"]);
+        pace(Pace {
+            tick: Duration::from_millis(2000),
+            poll: Some(Duration::from_millis(200)),
+        });
+        let folder = crate::agents::server_dir(&w.ctx, &w.caller())
+            .join("agents")
+            .join(ID);
+        let caller = w.caller();
+        let mut frames = 0;
+        let mut times = Vec::new();
+        watch_frames(&w, 3);
+        let ended = run_watch(
+            &w.ctx,
+            &caller,
+            Box::new(Script::new(&w.fakes, vec![])),
+            &mut |_| {
+                frames += 1;
+                let at = w.ctx.clock.now().duration_since(SystemTime::UNIX_EPOCH);
+                times.push(at.unwrap().as_millis() as u64);
+                // The first frame's write: an agent reports after the board was read.
+                if frames == 1 {
+                    std::thread::sleep(Duration::from_millis(5));
+                    write(
+                        &folder.join("activity.json"),
+                        json!({"state": "done", "kind": null, "since": "x"}),
+                    );
+                }
+                Ok(())
+            },
+        );
+        pace(Pace::default());
+        w.fakes.hc_done().unwrap();
+        assert_eq!((ended, frames), ("pane-closed", 3));
+        assert_eq!(diffs(&times)[0], 200, "drawn at the first poll, {times:?}");
     }
 
     #[test]
@@ -9779,6 +10049,57 @@ mod tests {
                     .any(|c| c[1] == "split-window" && c.iter().any(|a| a == "@1"))
             );
         }
+    }
+
+    // A faster refresh: the walk over the other view windows (two reads per window) runs on the first tick and every
+    // WALK_EVERY ticks after, not on each one, so a bar's tick stays cheap.
+    #[test]
+    fn the_other_view_windows_are_walked_every_few_ticks() {
+        let mut probes = vec!["live"; 11];
+        probes.push("gone");
+        let probes: &'static [&'static str] = Box::leak(probes.into_boxed_slice());
+        let (w, _) = keep_world(probes, win("%1", in_place()));
+        crate::agents::core_fixture::member(
+            &w,
+            "cccccccccccc",
+            json!({"name":"third","pane":"%10","startCommand":crate::agents::fixture::launch_command("%10")}),
+        );
+        w.fakes.mux_script("#{pane_start_command}", |argv| {
+            let rows = [
+                "%9|@1|300|aaaaaaaaaaaa|worker",
+                "%10|@6|301|cccccccccccc|third",
+            ];
+            Ok(out(
+                0,
+                &crate::agents::fixture::listed_dead(argv, &rows, "\n", &[]),
+                "",
+            ))
+        });
+        // @6's bar is proven: the walk only reads it.
+        w.fakes.mux_first(
+            "show-options -wqv -t @6 @mux-agents-sidebar-id",
+            0,
+            "%11 4242 2000\n",
+            "",
+        );
+        w.fakes
+            .mux_first(&format!("-t %11 {PROOF}"), 0, "%11|@6|0|4242\n", "");
+        let (ended, frames) = watch_run(&w);
+        assert_eq!((ended, frames.len()), ("pane-closed", 11));
+        let walks = w
+            .fakes
+            .mux_calls()
+            .iter()
+            .filter(|c| {
+                c.join(" ")
+                    .ends_with("show-options -wqv -t @6 @mux-agents-sidebar-id")
+            })
+            .count();
+        assert_eq!(
+            walks,
+            11usize.div_ceil(WALK_EVERY as usize),
+            "ticks 1, 6, 11"
+        );
     }
 
     // step 6: a window whose ensure failed (a lock held elsewhere, say) is tried again once a minute has passed.

@@ -1039,7 +1039,8 @@ pub(super) mod tests {
             .collect::<Vec<_>>()
         };
         assert_eq!(widths(Focus::default()), widths(shown));
-        // In color the member on screen is banded (its name line only), and the band follows the shown pane.
+        // In color the member on screen is banded (its whole block: name line, and doing line when it has one), and the
+        // band follows the shown pane.
         let color = Look {
             color: true,
             ..look
@@ -1068,6 +1069,17 @@ pub(super) mod tests {
             selected: None,
         };
         assert_eq!(banded(moved), [4]);
+        // The leader's doing line is drawn under it: on screen, both of its rows are banded, and none of its children.
+        let lead_shown = Focus {
+            shown: Some(board["agents"][0]["pane"].as_str().unwrap_or("%10")),
+            selected: None,
+        };
+        let lead_rows = banded(lead_shown);
+        let drawn = draw(&board, 60, 24, look, lead_shown);
+        assert!(
+            lead_rows.len() == 2 && drawn[lead_rows[1]].contains("plan it"),
+            "{lead_rows:?} {drawn:?}"
+        );
         let mut sel = lay_team(
             &board,
             &[],

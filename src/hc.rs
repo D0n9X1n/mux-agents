@@ -50,6 +50,20 @@ pub struct Core<'a> {
 /// (v6f call 13): a view never depends on which binary `PATH` resolves today.
 pub const INSTALL_NAMES: [&str; 2] = ["hc", "herdr-core"];
 
+std::thread_local! {
+    // The side bar's watch (`remember_versions`): the hc binaries whose version already passed, so a tick that connects
+    // twice and a bar that ticks every second do not ask `hc --version` again. Off for every other verb: a short-lived
+    // command checks once anyway, and an upgrade between two commands is seen.
+    static PASSED: std::cell::RefCell<Option<Vec<PathBuf>>> = const { std::cell::RefCell::new(None) };
+}
+
+/// From now on, on this thread, `connect` checks each hc binary's version once. For the side bar's long-running watch.
+pub fn remember_versions() {
+    PASSED.with(|p| {
+        p.borrow_mut().get_or_insert_with(Vec::new);
+    })
+}
+
 pub fn connect(ctx: &Ctx) -> Res<Core<'_>> {
     let path = ctx.env.get("PATH").unwrap_or("");
     let bin = ctx
@@ -61,6 +75,9 @@ pub fn connect(ctx: &Ctx) -> Res<Core<'_>> {
         provider: ctx.hc.as_ref(),
         bin,
     };
+    if PASSED.with(|p| p.borrow().as_ref().is_some_and(|v| v.contains(&core.bin))) {
+        return Ok(core);
+    }
     let out = core
         .provider
         .captured(&core.bin, &["--version"], Duration::from_secs(5))
@@ -68,6 +85,11 @@ pub fn connect(ctx: &Ctx) -> Res<Core<'_>> {
     if out.code != 0 || !version_ok(&out.stdout) {
         return Err(failure(INSTALL));
     }
+    PASSED.with(|p| {
+        if let Some(v) = p.borrow_mut().as_mut() {
+            v.push(core.bin.clone());
+        }
+    });
     Ok(core)
 }
 
@@ -447,6 +469,36 @@ mod tests {
             assert_eq!(core.binary(), expected.as_path());
             assert_eq!(f.hc_calls().len(), 1);
         }
+    }
+
+    // The side bar's watch asks each binary's version once; a failed check is never remembered; other verbs ask each
+    // time.
+    #[test]
+    fn a_watch_checks_the_hc_version_once() {
+        let f = Fakes::default();
+        f.hc_install("hc");
+        for _ in 0..3 {
+            answer(&f, "hc 0.1.21");
+        }
+        let ctx = f.ctx();
+        connect(&ctx).unwrap();
+        connect(&ctx).unwrap();
+        assert_eq!(f.hc_calls().len(), 2, "off by default");
+        remember_versions();
+        connect(&ctx).unwrap();
+        connect(&ctx).unwrap();
+        connect(&ctx).unwrap();
+        assert_eq!(f.hc_calls().len(), 3, "asked once more, then remembered");
+        // Another binary is asked; a failed check is asked again.
+        let g = Fakes::default();
+        g.hc_install("herdr-core");
+        answer(&g, "hc 0.1.2");
+        answer(&g, "hc 0.1.2");
+        let gctx = g.ctx();
+        assert!(connect(&gctx).is_err());
+        assert!(connect(&gctx).is_err());
+        assert_eq!(g.hc_calls().len(), 2);
+        PASSED.with(|p| *p.borrow_mut() = None);
     }
 
     #[test]
