@@ -2415,6 +2415,8 @@ pub fn run_watch(
     let mut failed_windows: Vec<(String, SystemTime)> = Vec::new();
     // Ticks since the last walk over the other view windows: the first tick walks.
     let mut since_walk = WALK_EVERY;
+    // News found while the sidebar lock was held elsewhere, told on a later tick.
+    let mut pending_news: Vec<News> = Vec::new();
     let pace = current_pace();
     // The last frame written and when (`Shown::written`): an unchanged frame is not written again.
     let mut last_frame: Option<(String, Size)> = None;
@@ -2574,9 +2576,10 @@ pub fn run_watch(
         // toast. Only when both the board and the shown pane were read now: a tick that knows neither keeps the news
         // for the next.
         if looked.is_some() && !failed {
-            let news = alerts.tick(last.as_ref(), viewing.pane.as_deref());
-            if !news.is_empty() {
-                alert(ctx, caller, &news);
+            pending_news.extend(alerts.tick(last.as_ref(), viewing.pane.as_deref()));
+            // News that met the sidebar lock held elsewhere waits for a later tick, never this one.
+            if !pending_news.is_empty() && alert(ctx, caller, &pending_news) {
+                pending_news.clear();
             }
         }
         viewing.mark(|pane, changed| {
@@ -2914,9 +2917,13 @@ const ALERTED: &str = "@mux-agents-alerted";
 /// sent only when its `changedAt` is strictly newer than the newest one told for it (`@mux-agents-alerted`, by any
 /// bar of the session); an older time is never written back. The newer times are recorded as told (whatever
 /// `@mux-agents-alerts` says, so turning it on later replays nothing), and only then sent. News whose time does not
-/// parse, a record that cannot be read or written, or a lock not taken sends nothing: a change is told at most once.
-fn alert(ctx: &Ctx, caller: &Caller, news: &[News]) {
-    let _ = lock(ctx, &scope::shown_lock("sidebar", caller), || {
+/// parse, or a record that cannot be read or written, sends nothing: a change is told at most once.
+///
+/// The tick never waits on that lock (a resume's post-launch bar step holds it as long as its split takes): false when
+/// another holds it, nothing sent, and the caller keeps `news` for a later tick; the record above keeps a retried
+/// change from being told twice.
+fn alert(ctx: &Ctx, caller: &Caller, news: &[News]) -> bool {
+    let taken = crate::agents::try_lock(ctx, &scope::shown_lock("sidebar", caller), || {
         let read = native(
             ctx,
             &["show-options", "-qv", "-t", &caller.session, ALERTED],
@@ -2978,6 +2985,7 @@ fn alert(ctx: &Ctx, caller: &Caller, news: &[News]) {
         send_alert(ctx, caller, &fresh);
         Ok(())
     });
+    !matches!(taken, Ok(None))
 }
 
 /// The message itself, as `@mux-agents-alerts` says: `off` none, `blocked` only who needs the person, else both.
@@ -8271,6 +8279,82 @@ mod tests {
         // The option is read only to send that message, never on a quiet tick.
         assert_eq!(named(ALERTS_OPTION), 1, "{calls:?}");
         assert_eq!(tick.get(), 4);
+    }
+
+    // An alert never makes the tick wait on the session's sidebar lock: held on another thread when worker turns
+    // blocked (the second tick), the alert stays pending and that frame is drawn at once; the first tick after the
+    // lock is released sends it, exactly once.
+    #[test]
+    fn an_alert_waits_for_the_bar_lock_on_later_ticks_never_in_one() {
+        use std::sync::mpsc;
+        let w = watch_world(&["live", "live", "live", "live", "gone"]);
+        let report = w.folder(ID).join("activity.json");
+        let fakes = w.fakes.clone();
+        w.fakes.mux_script("list-panes", move |argv| {
+            if !argv.iter().any(|a| a == "-s") {
+                return Ok(out(1, "", "lock"));
+            }
+            let tick = probed(&fakes);
+            let state = if tick == 1 { "working" } else { "blocked" };
+            std::fs::write(
+                &report,
+                format!(
+                    r#"{{"state":"{state}","kind":null,"since":"1970-01-01T00:01:00.0000000Z"}}"#
+                ),
+            )
+            .unwrap();
+            let rows = ["%9|@5|300|aaaaaaaaaaaa|worker"];
+            Ok(out(
+                0,
+                &crate::agents::fixture::listed(argv, &rows, "\n"),
+                "",
+            ))
+        });
+        // The person looks at another pane all along.
+        w.fakes.mux_script("#{pane_id}|#{session_attached}", |_| {
+            Ok(out(0, "%1|1\n", ""))
+        });
+        watch_frames(&w, 4);
+        let root = w.ctx.state_root.parent().unwrap().join("locks");
+        w.fakes.real_locks(&root);
+        let caller = w.caller();
+        let key = scope::shown_lock("sidebar", &caller);
+        let (held_tx, held_rx) = mpsc::channel();
+        let (go_tx, go_rx) = mpsc::channel::<()>();
+        let holder = std::thread::spawn(move || {
+            let other = World::human("");
+            let mut ctx = other.fakes.ctx();
+            ctx.clock = Box::new(crate::ctx::SystemClock);
+            crate::state::lock::with_lock_at(&ctx, &root, &key, || {
+                held_tx.send(()).unwrap();
+                let _ = go_rx.recv();
+                Ok(())
+            })
+            .unwrap();
+        });
+        held_rx.recv().unwrap();
+        let (mut go, mut holder) = (Some(go_tx), Some(holder));
+        let (start, mut frames, mut sent_by_frame) = (std::time::Instant::now(), 0, Vec::new());
+        let fakes = w.fakes.clone();
+        run_watch(&w.ctx, &caller, Box::new(NoInput), &mut |_: &str| {
+            frames += 1;
+            sent_by_frame.push(sent(&fakes).len());
+            // The tick that found the news drew its frame: the lock is released only now.
+            if frames == 2 {
+                go.take().unwrap().send(()).unwrap();
+                holder.take().unwrap().join().unwrap();
+            }
+            Ok(())
+        });
+        w.fakes.hc_done().unwrap();
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "a tick waited: {:?}",
+            start.elapsed()
+        );
+        // Nothing while the lock was held; sent by the third tick (the first after the release), once.
+        assert_eq!(sent_by_frame, [0, 0, 1, 1], "sends seen at each frame");
+        assert_eq!(sent(&w.fakes), ["mux-agents: worker needs you"]);
     }
 
     #[test]
