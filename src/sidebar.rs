@@ -9706,13 +9706,19 @@ mod tests {
         watch_frames(&w, 2);
         let caller = w.caller();
         let (mut frames, mut times) = (Vec::new(), Vec::new());
-        let ended = run_watch(&w.ctx, &caller, Box::new(script), &mut |frame: &str| {
-            frames.push(frame.to_string());
-            let at = w.ctx.clock.now().duration_since(SystemTime::UNIX_EPOCH);
-            times.push(at.unwrap().as_millis() as u64);
-            assert!(frames.len() <= 100, "runaway");
-            Ok(())
-        });
+        let ended = run_watch(
+            &w.ctx,
+            &caller,
+            Origin::Hand,
+            Box::new(script),
+            &mut |frame: &str| {
+                frames.push(frame.to_string());
+                let at = w.ctx.clock.now().duration_since(SystemTime::UNIX_EPOCH);
+                times.push(at.unwrap().as_millis() as u64);
+                assert!(frames.len() <= 100, "runaway");
+                Ok(())
+            },
+        );
         pace(Pace::default());
         assert_eq!(
             (click_reads(&w), selects(&w)),
@@ -13742,6 +13748,7 @@ mod tests {
                         CLEAR_RECORD.into(),
                         READ_RECORD.replace("@1", "@2"),
                         WINDOWS.into(),
+                        STRAYS.into(),
                         SESSION_LEFT.into(),
                     ],
                     "{case}"
