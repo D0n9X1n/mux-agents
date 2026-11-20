@@ -281,7 +281,7 @@
 # a bar closed: the session's panes once more, so closed is never answered while a bar no record proves still runs
 # (labelled and marked for its own pid: its pane left a window that went); a label alone, as rotate-window moves
 # it, refuses nothing
--N list-panes -s -t $3 -F #{pane_id}|#{&&:#{==:#{@agent-role},sidebar},#{==:#{pane_dead},0}}|#{pane_pid}|#{@mux-agents-bar}
+-N list-panes -s -t $3 -F #{pane_id}|#{&&:#{==:#{@agent-role},sidebar},#{==:#{pane_dead},0}}|#{pane_pid}|#{pane_dead}|#{@mux-agents-bar}
 
 [watch, one frame]
 -N display-message -p -t %1 #{pid}|#{pane_pid}|#{session_id}|#{window_id}|#{@agent-id}

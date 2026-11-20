@@ -119,7 +119,7 @@ pub const GONE_FORMAT: &str = "#{pane_id}|#{pane_pid}";
 // value with a newline or `|` cannot forge a line, and a dead pane (remain-on-exit) never counts as labelled.
 const LABEL_FORMAT: &str = "#{pane_id}|#{&&:#{==:#{@agent-role},sidebar},#{==:#{pane_dead},0}}";
 // The label as LABEL_FORMAT reads it, then the pane's pid and the bar's mark: what tells a bar still running apart.
-const LEFT_FORMAT: &str = "#{pane_id}|#{&&:#{==:#{@agent-role},sidebar},#{==:#{pane_dead},0}}|#{pane_pid}|#{@mux-agents-bar}";
+const LEFT_FORMAT: &str = "#{pane_id}|#{&&:#{==:#{@agent-role},sidebar},#{==:#{pane_dead},0}}|#{pane_pid}|#{pane_dead}|#{@mux-agents-bar}";
 // The bar is `@mux-agents-sidebar-percent` of its window, never narrower than `@mux-agents-sidebar-min` columns,
 // both read where the bar's pane stands (pane, window, session, then `set -g`). Unset or not a whole number in
 // range: 20% of the window, at least 40 columns.
@@ -2710,10 +2710,9 @@ fn watch_loop(
         let polled_pane = looked.clone().flatten();
         let mut polled_at = ctx.clock.now();
         loop {
-            // An action that answered off the loop (a resume) is applied, and the bar draws again at once.
-            if settle_jobs(ctx, caller, &mut pick, &mut shown, panel) {
-                break;
-            }
+            // An action that answered off the loop (a resume) is applied, and the bar draws again at once: a change, as
+            // a poll's, so input already waiting is read first (below).
+            let settled = settle_jobs(ctx, caller, &mut pick, &mut shown, panel);
             // Another window's bar the worker could not open waits `REARM` before it is tried again.
             for (window, answer) in panel.jobs.drain_windows(ctx, caller) {
                 if answer.is_err() {
@@ -2722,12 +2721,12 @@ fn watch_loop(
             }
             let since = ctx.clock.now().duration_since(ticked).unwrap_or(pace.tick);
             let left = pace.tick.saturating_sub(since);
-            if left.is_zero() {
+            if left.is_zero() && !settled {
                 pick.ticked();
                 break;
             }
             // A poll is due: another pane on screen or a state change ends the wait, and the next tick draws it now.
-            let mut changed = false;
+            let mut changed = settled;
             if let Some(poll) = pace.poll
                 && ctx.clock.now().duration_since(polled_at).unwrap_or(poll) >= poll
             {
@@ -4033,7 +4032,8 @@ fn close_window(ctx: &Ctx, session: &str, window: &str) -> Res<Option<String>> {
 /// proves (it would close itself within STARTUP). A watch a person ran is never one, and another root's managed watch
 /// (MUX_AGENTS_STATE=B in the same session) is left to its own STARTUP limit. The proven bars before it are closed
 /// session-wide whatever root opened them, by design: a window has one bar. Answers the panes closed; a kill that did
-/// not take is left to the watch's own STARTUP limit. An unreadable list refuses: it may hold such a watch.
+/// not take refuses, as `close_window` does, so -Close never answers closed with that watch running. An unreadable
+/// list refuses: it may hold such a watch.
 fn close_strays(ctx: &Ctx, session: &str) -> Res<Vec<String>> {
     let key = root_key(ctx);
     let listed = native(
@@ -4052,9 +4052,19 @@ fn close_strays(ctx: &Ctx, session: &str) -> Res<Vec<String>> {
         let Ok(pid) = pid.parse::<u32>() else {
             continue;
         };
-        if pane_id(pane) && split_watch(ctx, pid, &key) && kill_bar(ctx, pane, pid) {
-            closed.push(pane.to_string());
+        if !pane_id(pane) || !split_watch(ctx, pid, &key) {
+            continue;
         }
+        if !kill_bar(ctx, pane, pid) {
+            return refuse(
+                1,
+                "sidebar",
+                format!(
+                    "the side bar {pane} did not close: the pane no longer runs this session's side bar"
+                ),
+            );
+        }
+        closed.push(pane.to_string());
     }
     Ok(closed)
 }
@@ -4385,12 +4395,17 @@ fn labelled(ctx: &Ctx, scope: &[&str]) -> Res<Vec<String>> {
     Ok(panes)
 }
 
-/// The panes of `session` still running a side bar: labelled, alive, and marked for the pid they run (`open` marks a
-/// bar's pane only while it runs that pid). A bar whose pane left a window that went (`join-pane` of its last pane into
-/// another window) is one: its label and mark moved with its pane, its record went with the window. A label alone is
-/// not: rmux's rotate-window moves a bar's label and mark onto the pane it swaps with, which runs another pid, and a
-/// 0.2.1 bar carries no mark. An unreadable list refuses: it may hold such a pane.
+/// The panes of `session` still running a side bar: a live pane labelled and marked for the pid it runs (`open` marks a
+/// bar's pane only while it runs that pid), or a live pane whose process is this binary's `watch` (read from the
+/// process, so a bar whose label and mark were moved away is found all the same: a watch a person ran, its window
+/// rotated, its shell killed and its pane joined elsewhere). Another state root's managed watch (`watch -Managed`
+/// with another key) is not one of this session's bars to answer for: it closes itself at its own STARTUP limit, so
+/// two roots sharing a session never block each other's -Close. A bar whose pane left a window that went (`join-pane`
+/// of its last pane into another window) is one. A label alone is not: rmux's rotate-window moves a bar's label and mark
+/// onto the pane it swaps with, which runs another pid, and a 0.2.1 bar carries no mark. Only refused, never killed:
+/// nothing here proves which bar it is. An unreadable list refuses: it may hold such a pane.
 fn running_bars(ctx: &Ctx, session: &str) -> Res<Vec<String>> {
+    let key = root_key(ctx);
     let listed = native(
         ctx,
         &["list-panes", "-s", "-t", session, "-F", LEFT_FORMAT],
@@ -4399,17 +4414,29 @@ fn running_bars(ctx: &Ctx, session: &str) -> Res<Vec<String>> {
     let mut panes: Vec<String> = Vec::new();
     for line in listed.stdout.split('\n') {
         let line = line.strip_suffix('\r').unwrap_or(line);
-        let mut fields = line.splitn(4, '|');
-        let (Some(pane), Some("1"), Some(pid), Some(mark)) =
-            (fields.next(), fields.next(), fields.next(), fields.next())
-        else {
+        let mut fields = line.splitn(5, '|');
+        let (Some(pane), Some(labelled), Some(pid), Some("0"), Some(mark)) = (
+            fields.next(),
+            fields.next(),
+            fields.next(),
+            fields.next(),
+            fields.next(),
+        ) else {
             continue;
         };
-        if pane_id(pane)
-            && pid.parse::<u32>().is_ok()
-            && mark == pid
-            && !panes.iter().any(|p| p == pane)
-        {
+        let Ok(number) = pid.parse::<u32>() else {
+            continue;
+        };
+        let marked = labelled == "1" && mark == pid;
+        let watching = || {
+            ctx.os.row(number).is_some_and(|row| {
+                let managed = (row.argv.as_ref())
+                    .and_then(|a| a.get(2))
+                    .is_some_and(|f| f == MANAGED);
+                is_watch(ctx, &row) && (!managed || split_watch(ctx, number, &key))
+            })
+        };
+        if pane_id(pane) && (marked || watching()) && !panes.iter().any(|p| p == pane) {
             panes.push(pane.to_string());
         }
     }
@@ -5014,7 +5041,7 @@ mod tests {
     const CLEAR_SESSION: &str = "-N set-option -u -t $3 @mux-agents-sidebar-id";
     const SESSION_LABELS: &str = "-N list-panes -s -t $3 -F #{pane_id}|#{&&:#{==:#{@agent-role},sidebar},#{==:#{pane_dead},0}}";
     // -Close's last read once it closed a bar: the session's panes with their label, pid and the bar's mark.
-    const SESSION_LEFT: &str = "-N list-panes -s -t $3 -F #{pane_id}|#{&&:#{==:#{@agent-role},sidebar},#{==:#{pane_dead},0}}|#{pane_pid}|#{@mux-agents-bar}";
+    const SESSION_LEFT: &str = "-N list-panes -s -t $3 -F #{pane_id}|#{&&:#{==:#{@agent-role},sidebar},#{==:#{pane_dead},0}}|#{pane_pid}|#{pane_dead}|#{@mux-agents-bar}";
     // -Close's list of the session's windows.
     const WINDOWS: &str = "-N list-windows -t $3 -F #{window_id}";
     const PROOF: &str = "#{pane_id}|#{window_id}|#{pane_dead}|#{pane_pid}";
@@ -7971,6 +7998,51 @@ mod tests {
         );
     }
 
+    // A resume's answer redraws the bar at once, a change as a poll's is: a key already waiting is read first, against
+    // the frame it was aimed at, never after the redraw. Here the answer (a refusal) comes on the pass after Enter, and
+    // `?` is waiting by then (a 0 ms read): the frame that shows the refusal already shows the key help.
+    #[test]
+    fn a_key_waiting_when_a_resume_answers_is_taken_before_the_redraw() {
+        let w = watch_world(&["live", "live", "live", "live", "live", "live", "gone"]);
+        member_frames(&w, 7, &[ID, "bbbbbbbbbbbb"]);
+        let caller = w.caller();
+        let steps = vec![
+            (300, key(b"\t")),
+            (300, key(b"G")),
+            (300, key(b"\r")),
+            (0, key(b"?")),
+        ];
+        let script = Script::new(&w.fakes, steps);
+        let waits = script.waits.clone();
+        let mut frames: Vec<String> = Vec::new();
+        run_watch(
+            &w.ctx,
+            &caller,
+            Origin::Hand,
+            Box::new(script),
+            &mut |frame: &str| {
+                frames.push(frame.to_string());
+                assert!(frames.len() <= 100, "runaway");
+                Ok(())
+            },
+        );
+        let answered = frames
+            .iter()
+            .position(|f| f.contains("resume refused"))
+            .expect("a frame shows the refusal");
+        assert!(
+            frames[answered].contains("? or Esc closes"),
+            "the key was read before the answer's redraw: {}",
+            frames[answered]
+        );
+        assert_eq!(
+            waits.borrow()[3],
+            0,
+            "read without a wait: {:?}",
+            waits.borrow()
+        );
+    }
+
     // `p`, `m` and `o` with nothing selected act on the agent on screen as the band shows it: with the bar itself in
     // front (%7), the window's other pane, writer's view %10, never the first row (worker, %9). Through `run_watch`, so
     // the frame's own idea of the agent on screen is what the key gets.
@@ -10891,7 +10963,7 @@ mod tests {
             let dead_asked = argv.last().is_some_and(|f| f.contains("pane_dead"));
             let marks_asked = argv
                 .last()
-                .is_some_and(|f| f.ends_with("|#{pane_pid}|#{@mux-agents-bar}"));
+                .is_some_and(|f| f.ends_with("|#{pane_pid}|#{pane_dead}|#{@mux-agents-bar}"));
             // `-s -t $3` lists the session; `-t @<n>` one window.
             let window = if argv[2] == "-s" {
                 assert_eq!(argv[2..6], ["-s", "-t", "$3", "-F"]);
@@ -10908,11 +10980,13 @@ mod tests {
                 .map(|(pane, v)| {
                     let role = v.split_once('|').map_or(v.as_str(), |(r, _)| r);
                     let dead = dead_asked && get(&p, &format!("dead {pane}")).is_some();
-                    // With the pid and the mark asked: `<pid>|<mark>` after the label, each empty when unset.
+                    // With the pid and the mark asked: `<pid>|<dead>|<mark>` after the label, each empty when
+                    // unset, `<dead>` 1 for a pane set dead.
                     let tail = if marks_asked {
                         let pid = get(&p, &format!("pid {pane}")).unwrap_or_default();
                         let mark = get(&p, &format!("mark {pane}")).unwrap_or_default();
-                        format!("|{pid}|{mark}")
+                        let gone = flag(get(&p, &format!("dead {pane}")).is_some());
+                        format!("|{pid}|{gone}|{mark}")
                     } else {
                         String::new()
                     };
@@ -13697,13 +13771,56 @@ mod tests {
                 ..watch_row(pid, &exe)
             });
         }
+        // This root's stray %9 is killed; the hand-run watch %10 still runs, so -Close refuses naming it (it kills
+        // nothing it cannot prove); another root's %11 is left to its own STARTUP limit.
+        assert_eq!(run(&w, &["-Close"]), refused(&["%10"]));
+        assert_eq!(closes(&w), 1);
+        assert_eq!(roles(&panes), "%1=|,%2=other|,%10=|,%11=|");
+        assert_eq!(option(&panes).as_deref(), Some("off"));
+        // Without the hand-run watch, the close answers closed.
+        let (mut w, panes) = sidebar_world("", Mux::default());
+        w.ctx.state_root = root.clone();
+        for (pane, pid, argv) in [("%9", 109, managed(&mine)), ("%11", 111, managed(&other))] {
+            set(&panes, pane, "|".into());
+            set(&panes, &format!("pid {pane}"), pid.to_string());
+            set(&panes, &format!("win {pane}"), "@2".into());
+            w.fakes.process(crate::proc::Row {
+                argv: Some(argv),
+                ..watch_row(pid, &exe)
+            });
+        }
         assert_eq!(
             run(&w, &["-Close"]),
             r#"ok {"pane":"%9","closed":true,"panes":["%9"]}"#
         );
-        assert_eq!(closes(&w), 1);
-        assert_eq!(roles(&panes), "%1=|,%2=other|,%10=|,%11=|");
-        assert_eq!(option(&panes).as_deref(), Some("off"));
+    }
+
+    // A stray of this root whose kill did not take (its pane still runs it) is not dropped: -Close refuses naming it,
+    // as it does a proven bar that did not close, and never answers closed with it running.
+    #[test]
+    fn close_refuses_a_stray_whose_kill_did_not_take() {
+        let (mut w, panes) = sidebar_world("", Mux::default());
+        let tmp = crate::testing::TempDir::new();
+        let root = tmp.path().join("state");
+        w.ctx.state_root = root.clone();
+        let exe = w.ctx.exe.display().to_string();
+        let key = key_of(&mut w, &root);
+        set(&panes, "%9", "|".into());
+        set(&panes, "pid %9", "109".into());
+        set(&panes, "win %9", "@2".into());
+        w.fakes.process(crate::proc::Row {
+            argv: Some(vec![exe.clone(), "watch".into(), "-Managed".into(), key]),
+            ..watch_row(109, &exe)
+        });
+        // The kill runs but the pane lives on (as a kill the server could not take).
+        w.fakes
+            .mux_script(&close_line("%9", 109)[3..], |_| Ok(out(0, "", "")));
+        let got = run(&w, &["-Close"]);
+        assert!(
+            got.starts_with("1 sidebar the side bar %9 did not close"),
+            "{got}"
+        );
+        assert_eq!(get(&panes, "pid %9").as_deref(), Some("109"));
     }
 
     // A window destroyed between -Close's list of the session's windows and the read of its record (its last pane
@@ -13792,6 +13909,34 @@ mod tests {
         unset(&panes, &wrec("@2"));
         assert_eq!(run(&w, &["-Close"]), refused(&["%7"]));
         assert_eq!(closes(&w), 1, "only %8 was killed");
+    }
+
+    // A label left by a closed bar is no bar: rmux's rotate-window moves the bar's label and its mark (the bar's pid)
+    // onto the pane it swaps with, and a 0.2.1 bar carries no mark. -Close that closed a bar refuses neither; only a
+    // pane labelled and marked for its own pid is a bar still running.
+    #[test]
+    fn close_refuses_a_hand_run_watch_left_with_no_label_or_mark() {
+        // A watch a person ran (`watch`, no -Managed) whose window was rotated, its shell killed and its pane joined
+        // elsewhere: it carries neither label nor mark any more, but its process is still this binary's watch. -Close
+        // closes the proven bar, then refuses naming it (never answers closed with a bar running), and kills nothing it
+        // cannot prove.
+        let (w, panes) = sidebar_world(
+            "",
+            Mux {
+                open: true,
+                extra: vec![
+                    ("%9", "|".into()),
+                    ("pid %9", "109".into()),
+                    ("win %9", "@1".into()),
+                ],
+                ..Mux::default()
+            },
+        );
+        let exe = w.ctx.exe.display().to_string();
+        w.fakes.process(watch_row(109, &exe));
+        assert_eq!(run(&w, &["-Close"]), refused(&["%9"]));
+        assert_eq!(closes(&w), 1, "only the proven bar %7 was killed");
+        assert_eq!(get(&panes, "pid %9").as_deref(), Some("109"));
     }
 
     // A label left by a closed bar is no bar: rmux's rotate-window moves the bar's label and its mark (the bar's pid)

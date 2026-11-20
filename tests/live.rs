@@ -2755,12 +2755,7 @@ hc {}:
         live.call(&["join-pane", "-d", "-h", "-s", &moved, "-t", &root]);
         let (code, close) = live.run(&["sidebar", "-Close"]);
         assert_eq!(code, 0, "{mux:?} {close}");
-        let mut panes: Vec<&str> = close["panes"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|p| s(p))
-            .collect();
+        let mut panes: Vec<&str> = close["panes"].as_array().unwrap().iter().map(s).collect();
         panes.sort();
         let mut want = [here.as_str(), moved.as_str()];
         want.sort();
