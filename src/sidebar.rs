@@ -4063,39 +4063,59 @@ const ROOT_KEY: &str = "bar-key";
 
 /// The state root's key a bar's split passes its watch, so `-Close` sweeps only its own root's strays: 32 random hex
 /// digits stored once in the root (`ROOT_KEY`), the first writer's kept, and read back by every process, so the key
-/// never depends on how the root's path is spelled or encoded. A root that cannot hold one (not creatable, or the file
-/// holds no key) gives this call a key of its own: no other process's `-Close` matches its stray, which cleans itself
-/// up after STARTUP.
+/// never depends on how the root's path is spelled or encoded. A root that cannot hold one gives this call a key of its
+/// own: no other process's `-Close` matches its stray, which cleans itself up after STARTUP.
 pub(crate) fn root_key(ctx: &Ctx) -> String {
+    root_key_with(ctx, &|buf| crate::util::random_bytes(buf))
+}
+
+/// `root_key` with its random source, so a test can make it fail. The root is made private as every state folder is
+/// (`agents::server_dir`), never by a plain create. Only a regular file is read, at most 64 bytes, so a FIFO or a large
+/// file named `bar-key` blocks nothing. The key is published whole: written to a file of its own, then hard-linked to
+/// `ROOT_KEY`, which fails if another process published first, so a reader never sees a part of a key. With no random
+/// source, the key is this process's id (no other live process has it).
+fn root_key_with(ctx: &Ctx, random: &dyn Fn(&mut [u8]) -> std::io::Result<()>) -> String {
     let file = ctx.state_root.join(ROOT_KEY);
-    let read = || {
-        std::fs::read_to_string(&file)
-            .ok()
-            .map(|k| k.trim().to_string())
-            .filter(|k| k.len() == 32 && k.bytes().all(|c| c.is_ascii_hexdigit()))
+    let read = || -> Option<String> {
+        use std::io::Read;
+        let meta = std::fs::symlink_metadata(&file).ok()?;
+        if !meta.file_type().is_file() {
+            return None;
+        }
+        let mut text = String::new();
+        std::fs::File::open(&file)
+            .ok()?
+            .take(64)
+            .read_to_string(&mut text)
+            .ok()?;
+        let key = text.trim();
+        (key.len() == 32 && key.bytes().all(|c| c.is_ascii_hexdigit())).then(|| key.to_string())
     };
     if let Some(key) = read() {
         return key;
     }
-    let fresh = || {
-        let mut bytes = [0u8; 16];
-        crate::util::random_bytes(&mut bytes)
-            .map(|()| bytes.iter().map(|b| format!("{b:02x}")).collect::<String>())
-    };
-    let Ok(mine) = fresh() else {
+    let mut bytes = [0u8; 16];
+    if random(&mut bytes).is_err() {
         return format!("{:032x}", ctx.pid);
+    }
+    let mine: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+    let private = {
+        #[cfg(unix)]
+        let made = crate::state::private_unix::private_dirs(&ctx.state_root, &[&ctx.state_root]);
+        #[cfg(windows)]
+        let made = crate::state::private_windows::private_dirs(&[&ctx.state_root]);
+        made
     };
-    let created = std::fs::create_dir_all(&ctx.state_root).and_then(|()| {
-        use std::io::Write;
-        let mut f = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&file)?;
-        f.write_all(mine.as_bytes())
-    });
-    match created {
+    if private.is_err() {
+        return mine;
+    }
+    let staged = ctx.state_root.join(format!("{ROOT_KEY}.{mine}.tmp"));
+    let published =
+        std::fs::write(&staged, &mine).and_then(|()| std::fs::hard_link(&staged, &file));
+    let _ = std::fs::remove_file(&staged);
+    match published {
         Ok(()) => mine,
-        // Another process wrote it first: its key is the root's.
+        // Another process published first: its key is the root's.
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => read().unwrap_or(mine),
         Err(_) => mine,
     }
@@ -11303,47 +11323,122 @@ mod tests {
     }
 
     // A root's key is stored in the root: whoever reads it, from any working directory and however the root is
-    // spelled, gets the same key; another root has its own; a root that cannot hold one gives each process its own key,
-    // so no -Close can match a stray of it.
+    // spelled, gets the same key; another root has its own. The first use makes the root private, as every state
+    // folder is, so a later `up` accepts it.
     #[test]
     fn a_roots_key_is_stored_in_it_and_shared_by_every_reader() {
-        let (a, b) = (
-            crate::testing::TempDir::new(),
-            crate::testing::TempDir::new(),
-        );
+        let tmp = crate::testing::TempDir::new();
+        let (a, b) = (tmp.path().join("a"), tmp.path().join("b"));
         let mut w = World::human("");
         let mut key = |root: &std::path::Path, cwd: &str| {
             w.ctx.state_root = root.to_path_buf();
             w.ctx.cwd = cwd.into();
             root_key(&w.ctx)
         };
-        let first = key(a.path(), "/work/a");
+        let first = key(&a, "/work/a");
         assert_eq!(first.len(), 32, "{first}");
         assert!(first.bytes().all(|c| c.is_ascii_hexdigit()), "{first}");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&a).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o700, "the root is made private");
+        }
         // The opener and the closer each read it: the same key, whatever their working directory.
-        assert_eq!(key(a.path(), "/elsewhere"), first);
-        assert_eq!(
-            std::fs::read_to_string(a.path().join(ROOT_KEY)).unwrap(),
-            first
-        );
-        // The same root through another spelling of its path.
-        let dotted = a.path().join(".");
-        assert_eq!(key(&dotted, "/work/b"), first);
+        assert_eq!(key(&a, "/elsewhere"), first);
+        assert_eq!(std::fs::read_to_string(a.join(ROOT_KEY)).unwrap(), first);
+        // The same root through another spelling of its path; no staging file is left.
+        assert_eq!(key(&a.join("."), "/work/b"), first);
+        let names: Vec<String> = std::fs::read_dir(&a)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, [ROOT_KEY], "{names:?}");
         // Another root, its own key.
-        assert_ne!(key(b.path(), "/work/a"), first);
-        // A root that cannot hold the key (a file stands where its folder would be): a key of this call alone.
-        let blocked = a.path().join("blocked");
+        assert_ne!(key(&b, "/work/a"), first);
+    }
+
+    // A root that cannot hold a key gives each call one of its own, so no -Close matches its stray: a root that cannot
+    // be made (a file stands where its folder would be), a `bar-key` that is no key (left untouched), one that is not a
+    // regular file (a FIFO: never opened, so nothing blocks), and no random source at all (the process id).
+    #[test]
+    fn a_root_that_cannot_hold_a_key_gives_each_call_its_own() {
+        let tmp = crate::testing::TempDir::new();
+        let mut w = World::human("");
+        let blocked = tmp.path().join("blocked");
         std::fs::write(&blocked, "x").unwrap();
-        let root = blocked.join("state");
-        assert_ne!(key(&root, "/work/a"), key(&root, "/work/a"));
-        // A key file that is not a key is left alone, and is no key: a key of this call alone.
-        let c = crate::testing::TempDir::new();
-        std::fs::write(c.path().join(ROOT_KEY), "not hex").unwrap();
-        assert_ne!(key(c.path(), "/work/a"), key(c.path(), "/work/a"));
+        w.ctx.state_root = blocked.join("state");
+        assert_ne!(root_key(&w.ctx), root_key(&w.ctx));
+        let bad = tmp.path().join("bad");
+        crate::testing::private_tree(tmp.path(), &bad);
+        std::fs::write(bad.join(ROOT_KEY), "not hex").unwrap();
+        w.ctx.state_root = bad.clone();
+        assert_ne!(root_key(&w.ctx), root_key(&w.ctx));
         assert_eq!(
-            std::fs::read_to_string(c.path().join(ROOT_KEY)).unwrap(),
+            std::fs::read_to_string(bad.join(ROOT_KEY)).unwrap(),
             "not hex"
         );
+        #[cfg(unix)]
+        {
+            let fifo = tmp.path().join("fifo");
+            crate::testing::private_tree(tmp.path(), &fifo);
+            let made = std::process::Command::new("mkfifo")
+                .arg(fifo.join(ROOT_KEY))
+                .status()
+                .unwrap();
+            assert!(made.success());
+            w.ctx.state_root = fifo;
+            let at = std::time::Instant::now();
+            assert_ne!(root_key(&w.ctx), root_key(&w.ctx));
+            assert!(
+                at.elapsed() < Duration::from_secs(2),
+                "a FIFO blocked the read"
+            );
+        }
+        w.ctx.state_root = tmp.path().join("norandom");
+        let failing = |_: &mut [u8]| Err(std::io::Error::other("no random source"));
+        assert_eq!(
+            root_key_with(&w.ctx, &failing),
+            format!("{:032x}", w.ctx.pid)
+        );
+        assert!(!tmp.path().join("norandom").join(ROOT_KEY).exists());
+    }
+
+    // Two processes publishing at once: each stages its own key and hard-links it to `bar-key`; the link fails for the
+    // second, which reads the first's back, so both end with the same key and no reader ever sees part of one.
+    #[test]
+    fn a_racing_second_writer_takes_the_first_writers_key() {
+        let tmp = crate::testing::TempDir::new();
+        let root = tmp.path().join("root");
+        crate::testing::private_tree(tmp.path(), &root);
+        let first = "0123456789abcdef0123456789abcdef";
+        std::fs::write(root.join(ROOT_KEY), first).unwrap();
+        let mut w = World::human("");
+        w.ctx.state_root = root.clone();
+        // Past the first read (an empty file, as one being published was before): the link step meets the first's.
+        let empty = tmp.path().join("empty");
+        crate::testing::private_tree(tmp.path(), &empty);
+        assert_eq!(root_key(&w.ctx), first);
+        w.ctx.state_root = empty.clone();
+        let mine = root_key(&w.ctx);
+        assert_eq!(std::fs::read_to_string(empty.join(ROOT_KEY)).unwrap(), mine);
+        let again = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..8)
+                .map(|_| {
+                    let root = tmp.path().join("race");
+                    scope.spawn(move || {
+                        let mut w = World::human("");
+                        w.ctx.state_root = root;
+                        root_key(&w.ctx)
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|h| h.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+        assert!(again.windows(2).all(|p| p[0] == p[1]), "{again:?}");
     }
 
     // The bar's split starts its watch as `watch -Managed <key>`, the key its state root's, so the watch knows the split
@@ -11352,10 +11447,11 @@ mod tests {
     #[test]
     fn the_bars_split_starts_its_watch_managed() {
         let (mut w, panes) = sidebar_world("", Mux::default());
-        let root = crate::testing::TempDir::new();
-        w.ctx.state_root = root.path().to_path_buf();
+        let tmp = crate::testing::TempDir::new();
+        let root = tmp.path().join("state");
+        w.ctx.state_root = root.clone();
         let exe = w.ctx.exe.display().to_string();
-        let key = key_of(&mut w, root.path());
+        let key = key_of(&mut w, &root);
         assert!(key.len() == 32 && key.bytes().all(|b| b.is_ascii_hexdigit()));
         let want = key.clone();
         w.fakes.mux_script("-l 40", move |argv| {
@@ -13364,14 +13460,12 @@ mod tests {
     #[test]
     fn close_kills_a_watch_the_split_started_but_never_marked() {
         let (mut w, panes) = sidebar_world("", Mux::default());
-        let (root, another) = (
-            crate::testing::TempDir::new(),
-            crate::testing::TempDir::new(),
-        );
-        w.ctx.state_root = root.path().to_path_buf();
+        let tmp = crate::testing::TempDir::new();
+        let (root, another) = (tmp.path().join("state"), tmp.path().join("another"));
+        w.ctx.state_root = root.clone();
         let exe = w.ctx.exe.display().to_string();
         let managed = |key: &str| vec![exe.clone(), "watch".into(), "-Managed".into(), key.into()];
-        let (mine, other) = (key_of(&mut w, root.path()), key_of(&mut w, another.path()));
+        let (mine, other) = (key_of(&mut w, &root), key_of(&mut w, &another));
         assert_ne!(other, mine);
         for (pane, pid, argv) in [
             ("%9", 109, managed(&mine)),
