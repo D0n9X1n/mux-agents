@@ -2003,6 +2003,9 @@ pub fn run_watch(
     // Ticks since the last walk over the other view windows: the first tick walks.
     let mut since_walk = WALK_EVERY;
     let pace = current_pace();
+    // The last frame written and when (`Shown::written`): an unchanged frame is not written again.
+    let mut last_frame: Option<String> = None;
+    let mut last_written = SystemTime::UNIX_EPOCH;
     let root = crate::agents::server_dir(ctx, caller);
     // Peek files of popups that never opened, from an earlier bar (review).
     sweep_peeks(ctx, &crate::agents::server_dir(ctx, caller));
@@ -2197,11 +2200,22 @@ pub fn run_watch(
             }
             None => bare,
         };
-        if write(&frame(&laid.rows, size, look)).is_err() {
-            return "output-closed";
+        // With a poll the bar ticks often: a frame already on screen at this size is not written again, within a
+        // minute of the last write, so the screen does not churn and PRESS_GAP drops a click only after a real change.
+        let text = frame(&laid.rows, size, look);
+        let now = ctx.clock.now();
+        let fresh = now.duration_since(last_written).unwrap_or_default() < REARM;
+        if pace.poll.is_none() || !fresh || last_frame.as_deref() != Some(text.as_str()) {
+            if write(&text).is_err() {
+                return "output-closed";
+            }
+            last_written = ctx.clock.now();
+            last_frame = Some(text);
         }
+        // The next tick is a tick after this one ends (after a slow write, from its end).
+        let ticked = ctx.clock.now();
         let mut shown = Shown {
-            written: ctx.clock.now(),
+            written: last_written,
             targets: walk,
             drawn: drawn(&laid),
             width: size.width,
@@ -2213,11 +2227,7 @@ pub fn run_watch(
         let polled_pane = looked.clone().flatten();
         let mut polled_at = ctx.clock.now();
         loop {
-            let since = ctx
-                .clock
-                .now()
-                .duration_since(shown.written)
-                .unwrap_or(pace.tick);
+            let since = ctx.clock.now().duration_since(ticked).unwrap_or(pace.tick);
             let left = pace.tick.saturating_sub(since);
             if left.is_zero() {
                 pick.ticked();
@@ -6662,6 +6672,32 @@ mod tests {
         times.windows(2).map(|t| t[1] - t[0]).collect()
     }
 
+    /// The fake time (ms) of each tick: each starts with the bar's probe of its own pane. Wraps the probe answers of
+    /// `watch_world`, answering each in turn from `probes`.
+    fn tick_times(w: &World, probes: &'static [&'static str]) -> Rc<RefCell<Vec<u64>>> {
+        let times: Rc<RefCell<Vec<u64>>> = Default::default();
+        let (seen, fakes) = (times.clone(), w.fakes.clone());
+        let queue = Rc::new(RefCell::new(
+            probes.iter().copied().collect::<VecDeque<_>>(),
+        ));
+        w.fakes.mux_script(WATCH_PROBE, move |_| {
+            use crate::ctx::Clock;
+            let at = fakes.now().duration_since(SystemTime::UNIX_EPOCH).unwrap();
+            seen.borrow_mut().push(at.as_millis() as u64);
+            let mut queue = queue.borrow_mut();
+            let answer = if queue.len() > 1 {
+                queue.pop_front().unwrap()
+            } else {
+                *queue.front().unwrap()
+            };
+            Ok(match answer {
+                "live" => out(0, "%7|sidebar|40|24\n", ""),
+                _ => out(0, "|||\n", ""),
+            })
+        });
+        times
+    }
+
     #[test]
     fn watch_under_constant_input_still_draws_every_2s() {
         let w = watch_world(&["live", "live", "live", "gone"]);
@@ -6725,16 +6761,17 @@ mod tests {
                 }
                 let _ = &fakes;
             }));
+            let ticks = tick_times(&w, &["live", "live", "live", "gone"]);
             watch_frames(&w, 3);
-            let (ended, frames, times) = watch_with(&w, Box::new(script));
+            let (ended, _, _) = watch_with(&w, Box::new(script));
             pace(Pace::default());
             assert_eq!(ended, "pane-closed", "{change}");
+            let ticks = diffs(&ticks.borrow());
             match change {
-                "none" => assert_eq!(diffs(&times), [2000, 2000], "{change}"),
+                "none" => assert_eq!(ticks[..2], [2000, 2000], "{change}"),
                 _ => assert_eq!(
-                    diffs(&times)[0],
-                    600,
-                    "{change}: redrawn at the poll after the change, {frames:?}"
+                    ticks[0], 600,
+                    "{change}: the next tick at the poll after the change, {ticks:?}"
                 ),
             }
         }
@@ -6771,7 +6808,7 @@ mod tests {
             .join(ID);
         let caller = w.caller();
         let mut frames = 0;
-        let mut times = Vec::new();
+        let ticks = tick_times(&w, &["live", "live", "live", "gone"]);
         watch_frames(&w, 3);
         let ended = run_watch(
             &w.ctx,
@@ -6779,8 +6816,6 @@ mod tests {
             Box::new(Script::new(&w.fakes, vec![])),
             &mut |_| {
                 frames += 1;
-                let at = w.ctx.clock.now().duration_since(SystemTime::UNIX_EPOCH);
-                times.push(at.unwrap().as_millis() as u64);
                 // The first frame's write: an agent reports after the board was read.
                 if frames == 1 {
                     std::thread::sleep(Duration::from_millis(5));
@@ -6794,8 +6829,26 @@ mod tests {
         );
         pace(Pace::default());
         w.fakes.hc_done().unwrap();
-        assert_eq!((ended, frames), ("pane-closed", 3));
-        assert_eq!(diffs(&times)[0], 200, "drawn at the first poll, {times:?}");
+        assert_eq!(ended, "pane-closed");
+        let ticks = diffs(&ticks.borrow());
+        assert_eq!(ticks[0], 200, "the next tick at the first poll, {ticks:?}");
+    }
+
+    // With the 200 ms poll a bar may tick often, so a tick whose frame is the one already on screen writes nothing:
+    // the screen does not change, and a click is never dropped for a frame that changed nothing (PRESS_GAP measures
+    // from the last write). A changed frame is written at once; a size change or a minute without a write writes anyway.
+    #[test]
+    fn an_unchanged_frame_is_not_written_again() {
+        let w = watch_world(&["live", "live", "live", "live", "gone"]);
+        pace(Pace {
+            tick: Duration::from_millis(1000),
+            poll: Some(Duration::from_millis(200)),
+        });
+        watch_frames(&w, 4);
+        let (ended, frames, times) = watch_with(&w, Box::new(Script::new(&w.fakes, vec![])));
+        pace(Pace::default());
+        assert_eq!(ended, "pane-closed");
+        assert_eq!(frames.len(), 1, "four ticks, one frame: {times:?}");
     }
 
     #[test]
