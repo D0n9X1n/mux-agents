@@ -2004,7 +2004,7 @@ pub fn run_watch(
     let mut since_walk = WALK_EVERY;
     let pace = current_pace();
     // The last frame written and when (`Shown::written`): an unchanged frame is not written again.
-    let mut last_frame: Option<String> = None;
+    let mut last_frame: Option<(String, Size)> = None;
     let mut last_written = SystemTime::UNIX_EPOCH;
     let root = crate::agents::server_dir(ctx, caller);
     // Peek files of popups that never opened, from an earlier bar (review).
@@ -2205,12 +2205,15 @@ pub fn run_watch(
         let text = frame(&laid.rows, size, look);
         let now = ctx.clock.now();
         let fresh = now.duration_since(last_written).unwrap_or_default() < REARM;
-        if pace.poll.is_none() || !fresh || last_frame.as_deref() != Some(text.as_str()) {
+        let same = last_frame
+            .as_ref()
+            .is_some_and(|(rows, at)| *at == size && *rows == text);
+        if pace.poll.is_none() || !fresh || !same {
             if write(&text).is_err() {
                 return "output-closed";
             }
             last_written = ctx.clock.now();
-            last_frame = Some(text);
+            last_frame = Some((text, size));
         }
         // The next tick is a tick after this one ends (after a slow write, from its end).
         let ticked = ctx.clock.now();
@@ -6849,6 +6852,40 @@ mod tests {
         pace(Pace::default());
         assert_eq!(ended, "pane-closed");
         assert_eq!(frames.len(), 1, "four ticks, one frame: {times:?}");
+    }
+
+    // A resize is always written, even when the rows come out the same (a taller pane whose rows all fit): the
+    // terminal may have cleared the pane, and a click aims at the new geometry.
+    #[test]
+    fn a_resize_is_written_even_with_the_same_rows() {
+        let w = watch_world(&["live", "tall", "tall", "gone"]);
+        w.fakes.mux_script(WATCH_PROBE, {
+            let queue = Rc::new(RefCell::new(VecDeque::from([
+                "live", "tall", "tall", "gone",
+            ])));
+            move |_| {
+                let mut queue = queue.borrow_mut();
+                let answer = if queue.len() > 1 {
+                    queue.pop_front().unwrap()
+                } else {
+                    *queue.front().unwrap()
+                };
+                Ok(match answer {
+                    "live" => out(0, "%7|sidebar|40|24\n", ""),
+                    "tall" => out(0, "%7|sidebar|40|30\n", ""),
+                    _ => out(0, "|||\n", ""),
+                })
+            }
+        });
+        pace(Pace {
+            tick: Duration::from_millis(1000),
+            poll: Some(Duration::from_millis(200)),
+        });
+        watch_frames(&w, 3);
+        let (ended, frames, _) = watch_with(&w, Box::new(Script::new(&w.fakes, vec![])));
+        pace(Pace::default());
+        assert_eq!(ended, "pane-closed");
+        assert_eq!(frames.len(), 2, "24 rows, then 30: written; 30 again: not");
     }
 
     #[test]
