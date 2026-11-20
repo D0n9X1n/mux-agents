@@ -16,8 +16,11 @@ use crate::state::evidence::{self, Evidence, Published};
 use crate::state::root::{HOST, OsKind};
 use crate::util::utc_o;
 
-/// The parent's client identity, taken out of the client's environment (MuxAgents.ps1:1595-1596).
-pub const SCRUB: [&str; 12] = [
+/// Taken out of the client's environment: the parent's client identity (MuxAgents.ps1:1595-1596), and the
+/// multiplexer of whoever started the launch. A member runs in its own hc terminal and finds its multiplexer from its
+/// record, never from `TMUX` or `RMUX`; a client that kept them (an `up` run from a tmux pane) would read as a person
+/// in a pane, so its session hook would skip the readiness handshake and the member would never become ready.
+pub const SCRUB: [&str; 15] = [
     "CLAUDECODE",
     "CLAUDE_CODE_SESSION_ID",
     "CLAUDE_CODE_MESSAGING_SOCKET",
@@ -30,6 +33,9 @@ pub const SCRUB: [&str; 12] = [
     "CLAUDE_EFFORT",
     "COPILOT_AGENT_SESSION_ID",
     "COPILOT_CLI",
+    "TMUX",
+    "TMUX_PANE",
+    "RMUX",
 ];
 
 const COMMIT_WAIT: Duration = Duration::from_secs(30);
@@ -1456,6 +1462,9 @@ mod tests {
                 "CLAUDE_EFFORT",
                 "COPILOT_AGENT_SESSION_ID",
                 "COPILOT_CLI",
+                "TMUX",
+                "TMUX_PANE",
+                "RMUX",
             ]
         );
         let l = committed_spec("copilot", json!(["-i", "p"]));
