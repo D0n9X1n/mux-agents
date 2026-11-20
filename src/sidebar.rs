@@ -14041,6 +14041,40 @@ mod tests {
         assert_eq!(reads, 2, "{:?}", w.fakes.os_calls());
     }
 
+    // A `-Managed` watch that names no key (only an unreleased build ever started that shape) is no watch to prove,
+    // sweep or call another root's: labelled and marked for its own pid, -Close closes the proven bar, then refuses
+    // naming it, never kills it and never answers closed while it runs.
+    #[test]
+    fn close_refuses_a_keyless_managed_watch_and_kills_nothing_of_it() {
+        let (w, panes) = sidebar_world(
+            "",
+            Mux {
+                open: true,
+                extra: vec![
+                    ("%9", "sidebar|".into()),
+                    ("pid %9", "109".into()),
+                    ("mark %9", "109".into()),
+                    ("win %9", "@5".into()),
+                ],
+                ..Mux::default()
+            },
+        );
+        let exe = w.ctx.exe.display().to_string();
+        w.fakes.process(crate::proc::Row {
+            argv: Some(vec![exe.clone(), "watch".into(), "-Managed".into()]),
+            ..watch_row(109, &exe)
+        });
+        assert_eq!(run(&w, &["-Close"]), refused(&["%9"]));
+        assert_eq!(closes(&w), 1, "only the proven bar %7 was killed");
+        let killed_9 = w
+            .fakes
+            .mux_calls()
+            .iter()
+            .any(|c| c.iter().any(|a| a.contains("kill-pane -t %9")));
+        assert!(!killed_9, "no kill targets %9");
+        assert_eq!(get(&panes, "pid %9").as_deref(), Some("109"));
+    }
+
     // Whose watch a pane runs is judged from one read of its process: a second read that fails (the process table
     // changing under the close) can never make this root's labelled, marked watch look like another root's, so -Close
     // never answers closed with it running. Here each pane's process is read once.
