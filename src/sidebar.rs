@@ -169,15 +169,15 @@ const MARK_FORMAT: &str = "#{pane_pid}|#{pane_dead}|#{pane_id}|#{@mux-agents-bar
 // A watch not proven (its window's record not naming its pane) for this long, since it started or since it was last
 // proven, whose pane carries its own mark, removes its label and mark and leaves, so its pane closes with it.
 const STARTUP: Duration = Duration::from_secs(10);
-// The switch the bar's split passes its watch, and only it (`Origin::Split`).
+// The flag the bar's split passes its watch, and only it (`Origin::Split`), followed by its state root's key.
 const MANAGED: &str = "-Managed";
 // The watch's own pane's pid and the bar's mark.
 const OWN_MARK: &str = "#{pane_pid}|#{@mux-agents-bar}";
 // A new split's process may not have exec'd yet: it is read up to this many times, 50 ms apart.
 const WATCH_TRIES: u32 = 20;
 
-/// Who started a watch: a person (`watch`), or the split of the bar's open (`watch -Managed`, `open`), which no person
-/// passes.
+/// Who started a watch: a person (`watch`), or the split of the bar's open (`watch -Managed <key>`, `open`), which no
+/// person passes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Origin {
     Hand,
@@ -3882,7 +3882,7 @@ pub(crate) fn watch_on(
     // script hc call by call, so they keep the check per connect (`hc::tests` covers the cache).
     #[cfg(not(test))]
     crate::hc::remember_versions();
-    let origin = if request.switch("Managed") {
+    let origin = if request.value("Managed").is_some() {
         Origin::Split
     } else {
         Origin::Hand
@@ -4015,12 +4015,15 @@ fn close_window(ctx: &Ctx, window: &str) -> Res<Option<String>> {
     Ok(Some(bar.pane))
 }
 
-/// The session's watches the bar's split started (`watch -Managed`, read from each live pane's process) that are left
-/// once every proven bar closed, each killed only while it is alive and still runs that process: an open whose opener
-/// died between its split and its record left one that no window's record proves (it would close itself within
-/// STARTUP). A watch a person ran is never one. Answers the panes closed; a kill that did not take is left to the
-/// watch's own STARTUP limit. An unreadable list refuses: it may hold such a watch.
+/// The session's watches this state root's bar splits started (`watch -Managed <key>` with this root's key, read from
+/// each live pane's process) that are left once every proven bar closed, each killed only while it is alive and still
+/// runs that process: an open whose opener died between its split and its record left one that no window's record
+/// proves (it would close itself within STARTUP). A watch a person ran is never one, and another root's managed watch
+/// (MUX_AGENTS_STATE=B in the same session) is left to its own STARTUP limit. The proven bars before it are closed
+/// session-wide whatever root opened them, by design: a window has one bar. Answers the panes closed; a kill that did
+/// not take is left to the watch's own STARTUP limit. An unreadable list refuses: it may hold such a watch.
 fn close_strays(ctx: &Ctx, session: &str) -> Res<Vec<String>> {
+    let key = root_key(ctx);
     let listed = native(
         ctx,
         &["list-panes", "-s", "-t", session, "-F", MARK_FORMAT],
@@ -4037,23 +4040,30 @@ fn close_strays(ctx: &Ctx, session: &str) -> Res<Vec<String>> {
         let Ok(pid) = pid.parse::<u32>() else {
             continue;
         };
-        if pane_id(pane) && split_watch(ctx, pid) && kill_bar(ctx, pane, pid) {
+        if pane_id(pane) && split_watch(ctx, pid, &key) && kill_bar(ctx, pane, pid) {
             closed.push(pane.to_string());
         }
     }
     Ok(closed)
 }
 
-/// Whether `pid` is this binary run as `<binary> watch -Managed`: a watch the bar's split started.
-fn split_watch(ctx: &Ctx, pid: u32) -> bool {
+/// Whether `pid` is this binary run as `<binary> watch -Managed <key>`: a watch a bar's split under the state root of
+/// `key` started.
+fn split_watch(ctx: &Ctx, pid: u32, key: &str) -> bool {
     ctx.os.row(pid).is_some_and(|row| {
         is_watch(ctx, &row)
-            && row
-                .argv
-                .as_ref()
-                .and_then(|a| a.get(2))
-                .is_some_and(|a| a == MANAGED)
+            && row.argv.as_ref().is_some_and(|a| {
+                a.get(2).is_some_and(|f| f == MANAGED) && a.get(3).is_some_and(|k| k == key)
+            })
     })
+}
+
+/// The state root's key a bar's split passes its watch: sha16 of the canonical root, as a team's identity hashes it
+/// (`agents::up::identity::team`); the root as resolved when it cannot be canonicalized yet. Plain hex, so it needs no
+/// quoting in a pane command on any platform, and names no path.
+pub(crate) fn root_key(ctx: &Ctx) -> String {
+    let root = std::fs::canonicalize(&ctx.state_root).unwrap_or_else(|_| ctx.state_root.clone());
+    crate::util::sha256_hex(root.display().to_string())[..16].to_string()
 }
 
 /// `q` then `y`: the bar closes as `sidebar -Close` closes it, for its own window only, in this process. Under the
@@ -4193,8 +4203,8 @@ fn watch_start(ctx: &Ctx, pid: u32) -> Option<i64> {
     is_watch(ctx, &row).then_some(row.start).flatten()
 }
 
-/// Whether `row` is this binary run as exactly `<binary> watch`, or `<binary> watch -Managed` as the bar's split starts
-/// it: a side bar, known by its process because a leaving bar removes its own label and mark before it exits.
+/// Whether `row` is this binary run as exactly `<binary> watch`, or `<binary> watch -Managed <key>` as the bar's split
+/// starts it: a side bar, known by its process because a leaving bar removes its own label and mark before it exits.
 pub(crate) fn is_watch(ctx: &Ctx, row: &crate::proc::Row) -> bool {
     let (Some(exe), Some(path), Some(argv)) = (ctx.exe.to_str(), &row.path, &row.argv) else {
         return false;
@@ -4207,7 +4217,7 @@ pub(crate) fn is_watch(ctx: &Ctx, row: &crate::proc::Row) -> bool {
     same && argv.get(1).is_some_and(|a| a == "watch")
         && match argv.len() {
             2 => true,
-            3 => argv[2] == MANAGED,
+            4 => argv[2] == MANAGED,
             _ => false,
         }
 }
@@ -4552,9 +4562,10 @@ fn open(ctx: &Ctx, target: &str) -> Res<(String, String)> {
         target,
     ];
     split.extend(env.iter().map(String::as_str));
-    // `-Managed`: the watch knows this split started it, so it cleans itself up even when this open dies before the
-    // mark below (`self_exit`), and `sidebar -Close` knows it for the bar's.
-    let command = [utf8(&ctx.exe)?, "watch", MANAGED];
+    // `-Managed <key>`: the watch knows this split started it, so it cleans itself up even when this open dies before
+    // the mark below (`self_exit`), and `sidebar -Close` under this state root knows it for the bar's.
+    let key = root_key(ctx);
+    let command = [utf8(&ctx.exe)?, "watch", MANAGED, &key];
     let mut created = native(ctx, &[&split[..], &["-l", &width], &command].concat(), true)?;
     if size_refusal(&created) {
         created = native(ctx, &[&split[..], &command].concat(), true)?;
@@ -10988,9 +10999,10 @@ mod tests {
 
     fn split_line(w: &World, sized: bool) -> String {
         format!(
-            "-N split-window -d -f -h -P -F #{{pane_id}}|#{{window_id}}|#{{pane_pid}} -t @1{}{} /bin/mux-agent watch -Managed",
+            "-N split-window -d -f -h -P -F #{{pane_id}}|#{{window_id}}|#{{pane_pid}} -t @1{}{} /bin/mux-agent watch -Managed {}",
             env_text(w),
-            if sized { " -l 40" } else { "" }
+            if sized { " -l 40" } else { "" },
+            root_key(&w.ctx)
         )
     }
 
@@ -11255,14 +11267,21 @@ mod tests {
         );
     }
 
-    // The bar's split starts its watch as `watch -Managed`, so the watch knows the split started it, whether or not its
-    // opener lives to mark it; that process is still proven this binary's watch, recorded and labelled.
+    // The bar's split starts its watch as `watch -Managed <key>`, the key its state root's, so the watch knows the split
+    // started it, whether or not its opener lives to mark it, and -Close knows which root's it is; that process is
+    // still proven this binary's watch, recorded and labelled.
     #[test]
     fn the_bars_split_starts_its_watch_managed() {
         let (w, panes) = sidebar_world("", Mux::default());
         let exe = w.ctx.exe.display().to_string();
+        let key = key_of(&w.ctx.state_root);
+        assert!(key.len() == 16 && key.bytes().all(|b| b.is_ascii_hexdigit()));
+        let want = key.clone();
         w.fakes.mux_script("-l 40", move |argv| {
-            assert_eq!(argv[argv.len() - 3..], [exe.as_str(), "watch", "-Managed"]);
+            assert_eq!(
+                argv[argv.len() - 4..],
+                [exe.as_str(), "watch", "-Managed", want.as_str()]
+            );
             Ok(out(0, "%7|@1|107\n", ""))
         });
         w.fakes.forget(107);
@@ -11271,6 +11290,7 @@ mod tests {
                 w.ctx.exe.display().to_string(),
                 "watch".into(),
                 "-Managed".into(),
+                key,
             ]),
             ..watch_row(107, &w.ctx.exe.display().to_string())
         });
@@ -12134,8 +12154,8 @@ mod tests {
         want.extend(opened(&w));
         assert_eq!(calls(&w), want);
         assert_eq!(roles(&panes), "%1=|,%2=other|,%7=sidebar|");
-        // The pane command is three arguments, the exe (spaces and all), `watch` and `-Managed`, never one joined
-        // string.
+        // The pane command is four arguments, the exe (spaces and all), `watch`, `-Managed` and the root's key, never
+        // one joined string.
         let (mut w, panes) = sidebar_world("", Mux::default());
         w.ctx.exe = std::path::PathBuf::from("/opt/mux agents/bin/mux-agent");
         set(&panes, "exe", "/opt/mux agents/bin/mux-agent".into());
@@ -12174,6 +12194,7 @@ mod tests {
             ]
             .map(String::from),
         );
+        expected.push(root_key(&w.ctx));
         assert_eq!(split, [expected]);
     }
 
@@ -12750,7 +12771,10 @@ mod tests {
         probes.push("gone");
         let probes: &'static [&'static str] = Box::leak(probes.into_boxed_slice());
         for (args, want) in [
-            (&["watch", "-Managed"][..], ("unproven", 5, true)),
+            (
+                &["watch", "-Managed", "0123456789abcdef"][..],
+                ("unproven", 5, true),
+            ),
             (&["watch"][..], ("pane-closed", 12, false)),
         ] {
             let w = watch_world(probes);
@@ -13243,20 +13267,27 @@ mod tests {
         );
     }
 
-    // A watch the bar's split started (`watch -Managed`) whose opener died before it marked, labelled or recorded it
-    // is the session's bar all the same: -Close kills it, proven by its process, so no stray outlives the close even
-    // within the startup limit. A watch a person ran (`watch`) in the same session is never one, and stays.
+    // The key a split under `root` passes its watch: sha16 of the canonical root, as a team's identity hashes it.
+    fn key_of(root: &std::path::Path) -> String {
+        let root = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+        crate::util::sha256_hex(root.display().to_string())[..16].to_string()
+    }
+
+    // A watch the bar's split started (`watch -Managed <key>`) whose opener died before it marked, labelled or recorded
+    // it is the session's bar all the same: -Close kills it, proven by its process, so no stray outlives the close even
+    // within the startup limit. Only its own state root's: a managed watch with another root's key (a bar of
+    // MUX_AGENTS_STATE=B) is spared, and closes itself at its own limit. A watch a person ran (`watch`) is never one.
     #[test]
     fn close_kills_a_watch_the_split_started_but_never_marked() {
         let (w, panes) = sidebar_world("", Mux::default());
         let exe = w.ctx.exe.display().to_string();
+        let managed = |key: &str| vec![exe.clone(), "watch".into(), "-Managed".into(), key.into()];
+        let other = key_of(std::path::Path::new("/another/state"));
+        assert_ne!(other, key_of(&w.ctx.state_root));
         for (pane, pid, argv) in [
-            (
-                "%9",
-                109,
-                vec![exe.clone(), "watch".into(), "-Managed".into()],
-            ),
+            ("%9", 109, managed(&key_of(&w.ctx.state_root))),
             ("%10", 110, vec![exe.clone(), "watch".into()]),
+            ("%11", 111, managed(&other)),
         ] {
             set(&panes, pane, "|".into());
             set(&panes, &format!("pid {pane}"), pid.to_string());
@@ -13271,7 +13302,7 @@ mod tests {
             r#"ok {"pane":"%9","closed":true,"panes":["%9"]}"#
         );
         assert_eq!(closes(&w), 1);
-        assert_eq!(roles(&panes), "%1=|,%2=other|,%10=|");
+        assert_eq!(roles(&panes), "%1=|,%2=other|,%10=|,%11=|");
         assert_eq!(option(&panes).as_deref(), Some("off"));
     }
 

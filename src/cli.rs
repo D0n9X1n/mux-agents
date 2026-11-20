@@ -245,10 +245,10 @@ pub static VERBS: &[VerbDef] = &[
     },
     VerbDef {
         name: "watch",
-        values: &[],
-        // `-Managed` is passed only by the bar's own split (`sidebar::open`), never by a person, so the usage leaves
-        // it out.
-        switches: &["Managed"],
+        // `-Managed <key>` is passed only by the bar's own split (`sidebar::open`), never by a person, so the usage
+        // leaves it out: the key is the split's state root's (`sidebar::root_key`).
+        values: &["Managed"],
+        switches: &[],
         min: 0,
         max: 0,
         usage: "usage: mux-agent watch [-Text]",
@@ -1089,6 +1089,7 @@ mod tests {
                 .to_string()
         });
         let env = format!("MUX_AGENTS_STATE={state}");
+        let key = crate::sidebar::root_key(&w.ctx);
         let mut out = format!("[{scenario}]\n");
         for c in &calls {
             let marker = list_call(c).then(|| c[6][..32].to_string());
@@ -1121,6 +1122,8 @@ mod tests {
                         "<exe>".into()
                     } else if *t == env {
                         "MUX_AGENTS_STATE=<state>".into()
+                    } else if *t == key {
+                        "<root-key>".into()
                     } else if let Some(m) = &marker {
                         t.replace(m.as_str(), "<marker>")
                     } else {

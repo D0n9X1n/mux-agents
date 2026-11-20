@@ -3987,6 +3987,41 @@ hc {}:
         }
     }
 
+    // `sidebar -Close` sweeps only the managed watches its own state root's splits started (the reviewer's repro). A bar
+    // opened under another root (MUX_AGENTS_STATE=B), its window record, label and mark cleared so no proof finds it,
+    // is spared by a close under this root within its startup limit, and closed by a close under B.
+    fn close_spares_another_roots_managed_watch(mux: Mux) {
+        let Some(mut live) = Live::human(mux) else {
+            return;
+        };
+        let state_b = live.path("state-b");
+        let vb = [("MUX_AGENTS_STATE", state_b.as_str())];
+        let (code, open) = live.server.run(&["sidebar"], &vb);
+        assert_eq!((code, &open["opened"]), (0, &json!(true)), "{mux:?} {open}");
+        let (bar, window) = (s(&open["pane"]).to_string(), s(&open["window"]).to_string());
+        assert!(
+            live.field(&bar, "#{pane_start_command}")
+                .contains(" watch -Managed"),
+            "{mux:?}: the split started a managed watch"
+        );
+        live.call(&["set-option", "-wu", "-t", &window, "@mux-agents-sidebar-id"]);
+        live.call(&["set-option", "-p", "-u", "-t", &bar, "@agent-role"]);
+        live.call(&["set-option", "-p", "-u", "-t", &bar, "@mux-agents-bar"]);
+        let (code, close) = live.run(&["sidebar", "-Close"]);
+        assert_eq!((code, &close["panes"]), (0, &json!([])), "{mux:?} {close}");
+        assert!(
+            live.panes("#{pane_id}").contains(&bar),
+            "{mux:?}: another root's watch is spared"
+        );
+        let (code, close) = live.server.run(&["sidebar", "-Close"], &vb);
+        assert_eq!(
+            (code, &close["panes"]),
+            (0, &json!([bar.clone()])),
+            "{mux:?} {close}"
+        );
+        live.wait_gone(&bar);
+    }
+
     // A sidebar lock held elsewhere for 15 s: the spawn still succeeds, its agent recorded and committed, with no bar
     // and the lock refusal as sidebarError; the spawn lock was already released, so a later spawn opens the bar.
     fn sidebar_lock_timeout_still_spawns(mux: Mux) {
@@ -6678,6 +6713,13 @@ hc {}:
         Rmux,
         [bar_enter_resumes_an_ended_agent_as_a_tab]
     );
+    // -Close's sweep of managed watches stays within its own state root, on both multiplexers.
+    tests_on!(
+        tmux38_roots,
+        Tmux38,
+        [close_spares_another_roots_managed_watch]
+    );
+    tests_on!(rmux_roots, Rmux, [close_spares_another_roots_managed_watch]);
 
     // tmux 3.2a's display-popup has no -T (QA): peek works there too.
     tests_on!(tmux32_peek, Tmux32, [bar_real_client_peek]);
