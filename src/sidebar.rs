@@ -4073,12 +4073,18 @@ fn close_strays(ctx: &Ctx, session: &str) -> Res<Vec<String>> {
 /// Whether `pid` is this binary run as `<binary> watch -Managed <key>`: a watch a bar's split under the state root of
 /// `key` started.
 fn split_watch(ctx: &Ctx, pid: u32, key: &str) -> bool {
-    ctx.os.row(pid).is_some_and(|row| {
-        is_watch(ctx, &row)
-            && row.argv.as_ref().is_some_and(|a| {
-                a.get(2).is_some_and(|f| f == MANAGED) && a.get(3).is_some_and(|k| k == key)
-            })
-    })
+    ctx.os
+        .row(pid)
+        .is_some_and(|row| managed_by(ctx, &row) == Some(Some(key)))
+}
+
+/// Whose managed watch `row` is, read from that one row: `None` when it is not this binary's `watch -Managed`,
+/// `Some(key)` with the key its argv names (`Some(None)` when it names none). Judged from the row already read, so a
+/// second read that fails can never make a watch look like another root's.
+fn managed_by<'a>(ctx: &Ctx, row: &'a crate::proc::Row) -> Option<Option<&'a str>> {
+    let argv = row.argv.as_ref()?;
+    (is_watch(ctx, row) && argv.get(2).is_some_and(|f| f == MANAGED))
+        .then(|| argv.get(3).map(String::as_str))
 }
 
 /// The file in the state root that holds the root's key.
@@ -4434,14 +4440,10 @@ fn running_bars(ctx: &Ctx, session: &str) -> Res<Vec<String>> {
         // Its process first: another root's managed watch is not this session's to answer for, however it is
         // labelled or marked.
         let row = ctx.os.row(number);
-        let managed = |row: &crate::proc::Row| {
-            (row.argv.as_ref())
-                .and_then(|a| a.get(2))
-                .is_some_and(|f| f == MANAGED)
-        };
-        let foreign = row.as_ref().is_some_and(|row| {
-            is_watch(ctx, row) && managed(row) && !split_watch(ctx, number, &key)
-        });
+        let foreign = row
+            .as_ref()
+            .and_then(|row| managed_by(ctx, row))
+            .is_some_and(|owner| owner != Some(key.as_str()));
         let marked = labelled == "1" && mark == pid;
         let watching = row.as_ref().is_some_and(|row| is_watch(ctx, row));
         if !foreign && (marked || watching) {
@@ -14026,6 +14028,52 @@ mod tests {
             r#"ok {"pane":"%7","closed":true,"panes":["%7"]}"#
         );
         assert_eq!(get(&panes, "pid %9").as_deref(), Some("109"));
+    }
+
+    // Whose watch a pane runs is judged from one read of its process: a second read that fails (the process table
+    // changing under the close) can never make this root's labelled, marked watch look like another root's, so -Close
+    // never answers closed with it running. Here each pane's process is read once.
+    #[test]
+    fn a_running_bar_is_judged_from_one_read_of_its_process() {
+        let (mut w, panes) = sidebar_world(
+            "",
+            Mux {
+                open: true,
+                extra: vec![
+                    ("%9", "sidebar|".into()),
+                    ("pid %9", "109".into()),
+                    ("mark %9", "109".into()),
+                    ("win %9", "@5".into()),
+                ],
+                ..Mux::default()
+            },
+        );
+        let tmp = crate::testing::TempDir::new();
+        let root = tmp.path().join("state");
+        w.ctx.state_root = root.clone();
+        let exe = w.ctx.exe.display().to_string();
+        let mine = key_of(&mut w, &root);
+        w.fakes.process(crate::proc::Row {
+            argv: Some(vec![exe.clone(), "watch".into(), "-Managed".into(), mine]),
+            ..watch_row(109, &exe)
+        });
+        // The sweep finds %9 this root's and kills it; a kill that does not take leaves it labelled, marked, running.
+        w.fakes
+            .mux_script(&close_line("%9", 109)[3..], |_| Ok(out(0, "", "")));
+        let got = run(&w, &["-Close"]);
+        assert!(
+            got.starts_with("1 sidebar the side bar %9 did not close"),
+            "{got}"
+        );
+        assert_eq!(get(&panes, "pid %9").as_deref(), Some("109"));
+        // Its process is read once to decide whose it is, never again (a second read is the one that can fail).
+        let reads = w
+            .fakes
+            .os_calls()
+            .iter()
+            .filter(|c| *c == "row 109")
+            .count();
+        assert_eq!(reads, 1, "{:?}", w.fakes.os_calls());
     }
 
     // A label left by a closed bar is no bar: rmux's rotate-window moves the bar's label and its mark (the bar's pid)

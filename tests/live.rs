@@ -6530,22 +6530,32 @@ hc {}:
             // Strays resumed into A's and B's conversations hold exactly those.
             let mut strays = Vec::new();
             for (client, on) in [("claude", &a_sid), ("copilot", &b_sid)] {
+                // Only a client logged after this point is the stray: an earlier one on the same conversation (a
+                // predecessor the core kill ended) is not it, though its argv names that conversation too.
+                let before = std::fs::read_to_string(live.dir.join("clients.log"))
+                    .map(|log| log.lines().count())
+                    .unwrap_or(0);
                 let pane = live.session_in(&format!("stray-{client}"), &live.dir.join("work"));
                 live.server
                     .send_keys_to(&pane, &format!("exec {client} --resume {on}"));
                 let pid = live.server.wait(&format!("stray {client} on {on}"), || {
                     let log = std::fs::read_to_string(live.dir.join("clients.log")).ok()?;
-                    log.lines().rev().find_map(|p| {
-                        let r: Value = serde_json::from_str(
-                            &std::fs::read_to_string(
-                                live.dir.join(format!("client.{}.json", p.trim())),
+                    log.lines()
+                        .skip(before)
+                        .collect::<Vec<_>>()
+                        .into_iter()
+                        .rev()
+                        .find_map(|p| {
+                            let r: Value = serde_json::from_str(
+                                &std::fs::read_to_string(
+                                    live.dir.join(format!("client.{}.json", p.trim())),
+                                )
+                                .ok()?,
                             )
-                            .ok()?,
-                        )
-                        .ok()?;
-                        (r["argv"].as_array()?.iter().any(|a| a == on.as_str()))
-                            .then(|| p.trim().parse::<u64>().ok())?
-                    })
+                            .ok()?;
+                            (r["argv"].as_array()?.iter().any(|a| a == on.as_str()))
+                                .then(|| p.trim().parse::<u64>().ok())?
+                        })
                 });
                 strays.push(pid);
             }
