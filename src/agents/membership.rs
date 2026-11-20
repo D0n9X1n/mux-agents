@@ -450,8 +450,15 @@ impl Snapshot {
         if let Some(e) = &self.core_error {
             return Err(e.clone());
         }
-        if self.facts.count() >= 6 {
-            return crate::error::refuse(2, "cap", "the session already has 6 live agents");
+        if self.facts.count() >= super::tree::MAX_MEMBERS {
+            return crate::error::refuse(
+                2,
+                "cap",
+                format!(
+                    "the session already has {} live agents",
+                    super::tree::MAX_MEMBERS
+                ),
+            );
         }
         self.name_only(requested, client, task)
     }

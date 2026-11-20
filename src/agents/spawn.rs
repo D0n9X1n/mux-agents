@@ -789,6 +789,7 @@ mod tests {
     use crate::agents::fixture::{CLAUDE, PANE, World};
     use crate::agents::gens;
     use crate::agents::lock_key;
+    use crate::agents::tree::MAX_MEMBERS;
     use crate::checks::Context;
     use crate::ctx::Env;
     use crate::mux::{Kind as MuxKind, Output};
@@ -1527,7 +1528,7 @@ mod tests {
         assert!(!w.ctx.state_root.exists());
     }
 
-    fn reservations(w: &World, count: u32, foreign: bool) -> Vec<Value> {
+    fn reservations(w: &World, count: usize, foreign: bool) -> Vec<Value> {
         (1..=count)
             .map(|n| {
                 let id = format!("{:012x}", 0xa00 + n);
@@ -1555,22 +1556,27 @@ mod tests {
     }
 
     #[test]
-    fn cap_6_counts_uncommitted() {
+    fn cap_full_counts_uncommitted() {
         for foreign in [false, true] {
             let w = human();
-            let six = reservations(&w, 6, foreign);
-            reservation_snapshot(&w, &six, foreign);
+            let full = reservations(&w, MAX_MEMBERS, foreign);
+            reservation_snapshot(&w, &full, foreign);
             assert_eq!(
                 run(&w, &["-Client", "claude", "-Task", "hi"]),
-                "2 cap the session already has 6 live agents"
+                format!("2 cap the session already has {MAX_MEMBERS} live agents")
             );
             assert!(calls(&w, "new-window").is_empty());
             assert!(!w.state().join("server.json").exists());
-            assert_eq!(agent_folders(&w).len(), if foreign { 0 } else { 6 });
-            for (task, name) in [("do it", "do"), ("just it", "claude-6")] {
+            assert_eq!(
+                agent_folders(&w).len(),
+                if foreign { 0 } else { MAX_MEMBERS }
+            );
+            // One short of the cap: admitted, and the default name is the first free `claude-<n>`.
+            let next = format!("claude-{MAX_MEMBERS}");
+            for (task, name) in [("do it", "do"), ("just it", next.as_str())] {
                 let w = human();
-                let five = reservations(&w, 5, foreign);
-                reservation_snapshot(&w, &five, foreign);
+                let short = reservations(&w, MAX_MEMBERS - 1, foreign);
+                reservation_snapshot(&w, &short, foreign);
                 public_launch(&w, "t1");
                 let ok = reply(&run(&w, &["-Client", "claude", "-Task", task]));
                 assert_eq!(ok["name"], name);
@@ -1583,9 +1589,9 @@ mod tests {
         }
         for name in ["worker6\nhidden", "worker6\r\nhidden", "worker6\rhidden"] {
             let w = human();
-            let mut six = reservations(&w, 6, true);
-            six[5]["labels"]["mux.name"] = name.into();
-            reservation_snapshot(&w, &six, true);
+            let mut full = reservations(&w, MAX_MEMBERS, true);
+            full[MAX_MEMBERS - 1]["labels"]["mux.name"] = name.into();
+            reservation_snapshot(&w, &full, true);
             assert_eq!(
                 run(&w, &["-Client", "claude", "-Task", "hi"]),
                 "1 internal unexpected error (reservation has no managed name)"
@@ -2067,11 +2073,11 @@ mod tests {
                 &["-Client", "claude", "-Task", "add subtract", "-Name", "w1"],
             );
             let want = if held {
-                "2 limit the team already has 6 members besides the leader"
+                format!("2 limit the team already has {MAX_MEMBERS} members besides the leader")
             } else {
-                "2 name agent name is taken"
+                "2 name agent name is taken".to_string()
             };
-            assert!(got.starts_with(want), "{case}: {got}");
+            assert!(got.starts_with(&want), "{case}: {got}");
             assert!(
                 calls(&w, "new-window").is_empty(),
                 "{case}: nothing launched"
@@ -2122,18 +2128,19 @@ mod tests {
         for ended in [true, false] {
             let w = human();
             w.clock("2026-10-29T12:00:00.0000000Z");
-            let mut six = reservations(&w, 6, false);
-            let id = "000000000a06";
+            let mut full = reservations(&w, MAX_MEMBERS, false);
+            // The last reservation's id, as `reservations` builds it.
+            let id = &format!("{:012x}", 0xa00 + MAX_MEMBERS);
             let folder = w.folder(id);
             let mut record = read_json(&folder.join("record.json"));
             record["createdAt"] = "2026-10-29T11:58:00.0000000Z".into();
             crate::agents::fixture::write(&folder.join("record.json"), record);
             if ended {
-                six[5]["state"] = "finished".into();
-                six[5]["reason"] = "exited".into();
-                six[5]["exit_code"] = 7.into();
+                full[MAX_MEMBERS - 1]["state"] = "finished".into();
+                full[MAX_MEMBERS - 1]["reason"] = "exited".into();
+                full[MAX_MEMBERS - 1]["exit_code"] = 7.into();
             }
-            reservation_snapshot(&w, &six, false);
+            reservation_snapshot(&w, &full, false);
             w.fakes.clear_log();
             let c = w.caller();
             w.fakes.clear_log();
@@ -2166,7 +2173,7 @@ mod tests {
             } else {
                 assert_eq!(
                     run(&w, &["-Client", "claude", "-Task", "hi"]),
-                    "2 cap the session already has 6 live agents"
+                    format!("2 cap the session already has {MAX_MEMBERS} live agents")
                 );
                 assert!(!folder.join("notice.json").exists());
                 assert_eq!(
@@ -2192,7 +2199,7 @@ mod tests {
                     .iter()
                     .filter(|(_, a, _)| a[0] == "get")
                     .count(),
-                6
+                MAX_MEMBERS
             );
             assert!(
                 calls(&w, "if-shell")
@@ -3195,11 +3202,11 @@ mod tests {
         for (code, stored) in [(1, ""), (0, "h\n")] {
             let w = human();
             w.fakes.mux_rule("show-options", code, stored, "");
-            let six = reservations(&w, 6, false);
-            reservation_snapshot(&w, &six, false);
+            let full = reservations(&w, MAX_MEMBERS, false);
+            reservation_snapshot(&w, &full, false);
             assert_eq!(
                 run(&w, &["-Client", "claude", "-Task", "hi"]),
-                "2 cap the session already has 6 live agents",
+                format!("2 cap the session already has {MAX_MEMBERS} live agents"),
                 "{stored:?}"
             );
             assert!(calls(&w, "new-window").is_empty() && calls(&w, "split-window").is_empty());
@@ -3381,7 +3388,8 @@ mod tests {
     fn reservations_count_once_and_their_names_stay_taken() {
         use crate::agents::core_fixture as cf;
         let w = human();
-        let wires = reservations(&w, 5, true);
+        // One short of the cap: a reservation listed twice counts once, so the spawn is admitted.
+        let wires = reservations(&w, MAX_MEMBERS - 1, true);
         let mut addresses: Vec<_> = wires
             .iter()
             .map(|v| v["address"].as_str().unwrap())
@@ -3407,10 +3415,11 @@ mod tests {
                 .iter()
                 .filter(|(_, a, _)| a[0] == "get")
                 .count(),
-            10
+            2 * (MAX_MEMBERS - 1)
         );
         let w = human();
-        let mut wires = reservations(&w, 5, true);
+        // The reservations and one local member fill the cap.
+        let mut wires = reservations(&w, MAX_MEMBERS - 1, true);
         let addresses: Vec<_> = wires
             .iter()
             .map(|v| v["address"].as_str().unwrap().to_string())
@@ -3425,7 +3434,7 @@ mod tests {
         );
         assert_eq!(
             run(&w, &["-Client", "claude", "-Task", "hi"]),
-            "2 cap the session already has 6 live agents"
+            format!("2 cap the session already has {MAX_MEMBERS} live agents")
         );
         let w = human();
         let mut wires = reservations(&w, 1, true);
@@ -3637,7 +3646,7 @@ mod tests {
             let c = w.caller();
             w.panes(&[]);
             let mut records = Vec::new();
-            for n in 0..6 {
+            for n in 0..MAX_MEMBERS {
                 let id = format!("{n:012x}");
                 let r = cf::member(&w, &id, json!({"name":format!("w{n}")}));
                 if foreign {
@@ -3666,12 +3675,17 @@ mod tests {
             )
             .unwrap_err();
             assert_eq!(
-                (e.code, e.check, e.message.as_str()),
-                (2, "cap", "the session already has 6 live agents")
+                (e.code, e.check, e.message),
+                (
+                    2,
+                    "cap",
+                    format!("the session already has {MAX_MEMBERS} live agents")
+                )
             );
             assert!(!w.state().join("server.json").exists());
             assert!(calls(&w, "new-window").is_empty());
-            assert_eq!(w.fakes.hc_calls().len(), 8);
+            // `--version`, `ls`, then one `get` per member.
+            assert_eq!(w.fakes.hc_calls().len(), 2 + MAX_MEMBERS);
             w.fakes.hc_done().unwrap();
         }
     }

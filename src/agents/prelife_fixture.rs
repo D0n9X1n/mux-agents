@@ -189,9 +189,9 @@ pub fn capacity_world_of(w: &World, children: u64) -> BTreeMap<String, Answer> {
     out
 }
 
-/// Five children: the team is one slot from `limit`.
+/// `MAX_MEMBERS - 1` children: the team is one slot from `limit`.
 pub fn capacity_world(w: &World) -> BTreeMap<String, Answer> {
-    capacity_world_of(w, 5)
+    capacity_world_of(w, crate::agents::tree::MAX_MEMBERS as u64 - 1)
 }
 
 /// Spawn's team admission for a person, in spawn's order (spawn.rs:209-235): connect, team, admit, snapshot, place.

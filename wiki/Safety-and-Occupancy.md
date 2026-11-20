@@ -28,9 +28,9 @@ Each refusal names its check (`code`, `check`, `message`); the user-facing table
 | `flags` | any `claude` or `copilot` process from the agent up to the pane with a flag outside the allowlist, or whose command line cannot be read | the policy and session checks only understand the allowlisted flags; a flag they cannot judge, or a command line they cannot see, is refused rather than guessed |
 | `policy` | the caller's live policy is not full bypass | a child starts with full permissions, so only a caller that already has them may start one |
 | `directory` | the caller's launch directory cannot be confirmed, or is not an existing absolute folder | children start where the caller started; a relative path would resolve against `mux-agent`'s own working directory, not the agent's |
-| `cap` | outside a team, 6 agents already live in the session | bounds a chat that has no tree |
+| `cap` | outside a team, 10 agents already live in the session | bounds a chat that has no tree |
 | `depth` | in a team, a child deeper than 3 (the leader is 0) | bounds how far a team can fan out |
-| `limit` | in a team, 6 members already besides the leader; a held pre-lifecycle folder counts | bounds a team's size, and an unclassified folder keeps its slot |
+| `limit` | in a team, 10 members already besides the leader; a held pre-lifecycle folder counts | bounds a team's size, and an unclassified folder keeps its slot |
 | `ceiling` | in a team, a child's flags above its parent's policy or the team's permission ceiling | a child never gets more permission than its parent or the team |
 | `budget` | in a team, a member's spawn when the team's token bucket is empty | bounds how fast members can start agents |
 

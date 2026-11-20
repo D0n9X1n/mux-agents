@@ -15,8 +15,8 @@ use crate::util::{age_seconds, parse_utc};
 pub(super) struct Rows<'a> {
     pub(super) ctx: &'a Ctx,
     pub(super) caller: &'a Caller,
-    // Per mailbox key, its unread counts by `<from>|<pane>`.
-    pub(super) unread: HashMap<String, HashMap<String, usize>>,
+    // Per mailbox key, its unread lines (held ones included).
+    pub(super) unread: HashMap<String, Vec<Value>>,
     // The one mailbox every row counts in; none in watch mode, where each row counts in its parent's.
     pub(super) reader: Option<String>,
     pub(super) running: &'a [Pane],
@@ -49,6 +49,31 @@ pub(super) fn parent_key(record: &Value, running: &[Pane], away: Option<&str>) -
 }
 
 impl Rows<'_> {
+    /// Member `id`'s unread, before a leader's own badge: `list` counts the caller's mailbox by sender (`<name>|<pane>`);
+    /// the bar counts each mailbox its row reads (a team row's parent mailboxes, else its parent pane's) by
+    /// `mail::badge_line`, the rule `m` shows, so the badge and the popup never differ.
+    pub(super) fn unread_of(&self, id: &str, record: &Value, pane: &str) -> usize {
+        let legacy = format!("{}|{pane}", crate::agents::text(record.get("name")));
+        let lines = |key: &String| self.unread.get(key).map(Vec::as_slice).unwrap_or_default();
+        let counted = |key: &String| {
+            (lines(key).iter())
+                .filter(|m| crate::agents::mail::badge_line(m, id, &legacy))
+                .count()
+        };
+        match (&self.reader, self.parents.get(id)) {
+            (Some(reader), _) => (lines(reader).iter())
+                .filter(|m| crate::agents::mail::sender(m) == legacy)
+                .count(),
+            (None, Some(boxes)) => boxes.iter().map(counted).sum(),
+            (None, None) => parent_key(
+                record,
+                self.running,
+                crate::agents::mail::elsewhere(self.caller),
+            )
+            .map_or(0, |key| counted(&key)),
+        }
+    }
+
     /// One row. status.json and last-sent.json are read under the agent lock their writers hold; an unreadable
     /// one is skipped. Doing never comes from the screen.
     pub(super) fn row(
@@ -99,34 +124,7 @@ impl Rows<'_> {
             .get("createdAt")
             .and_then(Value::as_str)
             .and_then(|created| age_seconds(created, self.now));
-        let legacy = format!("{name}|{pane}");
-        let unread = match (&self.reader, self.parents.get(id)) {
-            (Some(reader), _) => self
-                .unread
-                .get(reader)
-                .and_then(|counts| counts.get(&legacy))
-                .copied()
-                .unwrap_or(0),
-            // A team row (review): every parent mailbox, de-duplicated; the lines naming this member (`#<id>`), and
-            // the lines naming no member by name and pane (`<from>|<pane>` less those that name one, `!<from>|<pane>`).
-            (None, Some(boxes)) => boxes
-                .iter()
-                .filter_map(|key| self.unread.get(key))
-                .map(|counts| {
-                    let got = |k: &str| counts.get(k).copied().unwrap_or(0);
-                    got(&format!("#{id}")) + got(&legacy).saturating_sub(got(&format!("!{legacy}")))
-                })
-                .sum(),
-            (None, None) => parent_key(
-                record,
-                self.running,
-                crate::agents::mail::elsewhere(self.caller),
-            )
-            .and_then(|key| self.unread.get(&key))
-            .and_then(|counts| counts.get(&legacy))
-            .copied()
-            .unwrap_or(0),
-        };
+        let unread = self.unread_of(id, record, &pane);
         let unread = leader_badge(self.ctx, self.caller, id, record).unwrap_or(unread);
         let mut row = Map::new();
         row.insert("name".into(), field("name"));
@@ -222,9 +220,9 @@ pub(crate) fn leader_badge(ctx: &Ctx, caller: &Caller, id: &str, record: &Value)
 }
 
 /// A live agent's activity and the seconds since it last changed, as herdr names them: what its client reported in
-/// activity.json (`blocked`, `working`; `idle` is `done` until the person has looked at this very idle spell, which
-/// seen.json names by its `since`); with no readable report, `idle` while it listens in `read -Wait` and `working`
-/// otherwise, with no since.
+/// activity.json (`blocked`, `working`; `idle` and `done` read `done` until the person has seen this very spell, which
+/// seen.json names by its `since`, then `idle`); with no readable report, `idle` while it listens in `read -Wait` and
+/// `working` otherwise, with no since.
 pub(super) fn activity(
     reported: Option<&Value>,
     seen: Option<&Value>,
@@ -243,9 +241,8 @@ pub(super) fn activity(
     let since = at(reported, "since");
     let word = match (state, since) {
         (Some("blocked"), Some(_)) => "blocked",
-        (Some("done"), Some(_)) => "done",
         (Some("working"), Some(_)) => "working",
-        (Some("idle"), Some(since)) => match at(seen, "since") {
+        (Some("idle" | "done"), Some(since)) => match at(seen, "since") {
             Some(seen) if seen >= since => "idle",
             _ => "done",
         },

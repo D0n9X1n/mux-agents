@@ -19,7 +19,7 @@ use serde_json::Value;
 use serde_json::json;
 use std::collections::BTreeMap;
 pub const MAX_DEPTH: u64 = 3;
-pub const MAX_MEMBERS: usize = 6;
+pub const MAX_MEMBERS: usize = 10;
 /// Outside a team 0.2 holds; a launched leader without a team record refuses every spawn (D2).
 pub enum Scope {
     Outside,
@@ -79,10 +79,10 @@ pub fn limit(snapshot: &Snapshot) -> Res<()> {
         .count();
     // prelife-1c G10a: a held pre-lifecycle folder counts, leader or not (fail closed).
     if snapshot.slots() - leaders >= MAX_MEMBERS {
-        let base = "the team already has 6 members besides the leader";
+        let base = format!("the team already has {MAX_MEMBERS} members besides the leader");
         let held = holders(snapshot);
         let message = if held.is_empty() {
-            base.to_string()
+            base
         } else {
             format!("{base}; held by pre-lifecycle members: {}", held.join(", "))
         };

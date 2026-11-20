@@ -1,5 +1,6 @@
 use super::*;
 use serde_json::json;
+use std::time::{Duration, SystemTime};
 
 // A row of a 40-column bar: `left` after the margin, `right` ending one column short of the edge.
 fn pad(left: &str, right: &str) -> String {
@@ -202,6 +203,75 @@ fn failed_note_lasts_two_ticks_or_one_key() {
     pick.failed("worker");
     pick.pressed();
     assert_eq!(pick.note(), None);
+}
+
+// `q`: `close bar? y/n` takes only a `y` read alone at least `BAR_GAP` after the question was first drawn; a `y`
+// read with other keys, or sooner, leaves it asked. Any other event cancels it. The kept shell's question is as before.
+#[test]
+fn close_bar_takes_only_a_lone_y_read_well_after_the_question_showed() {
+    let at = |ms: u64| SystemTime::UNIX_EPOCH + Duration::from_millis(ms);
+    let read = |event, first, alone| Read {
+        event,
+        first,
+        alone,
+    };
+    let mut pick = Pick::default();
+    pick.ask_bar();
+    assert_eq!(pick.note().as_deref(), Some("close bar? y/n"));
+    assert_eq!(
+        pick.answer(&read(Event::Yes, at(5000), true)),
+        Answer::Wait,
+        "not drawn yet"
+    );
+    pick.question_shown(at(1000));
+    pick.question_shown(at(1200));
+    for r in [
+        read(Event::Yes, at(1249), true),
+        read(Event::Yes, at(1300), false),
+    ] {
+        assert_eq!(pick.answer(&r), Answer::Wait, "{r:?}");
+        assert_eq!(pick.note().as_deref(), Some(ASK_BAR), "{r:?}");
+    }
+    pick.ticked();
+    pick.ticked();
+    assert_eq!(pick.note().as_deref(), Some(ASK_BAR), "it outlives ticks");
+    assert_eq!(pick.answer(&read(Event::Yes, at(1250), true)), Answer::Bar);
+    assert_eq!(pick.note(), None);
+    assert_eq!(pick.answer(&read(Event::Yes, at(9000), true)), Answer::None);
+    for event in [
+        Event::Close,
+        Event::Other,
+        Event::Esc,
+        Event::Press {
+            button: 0,
+            x: 1,
+            y: 1,
+        },
+    ] {
+        pick.ask_bar();
+        pick.question_shown(at(0));
+        assert_eq!(
+            pick.answer(&read(event, at(5000), true)),
+            Answer::Cancel,
+            "{event:?}"
+        );
+        assert_eq!(pick.note(), None, "{event:?}");
+    }
+    let kept = Target {
+        life: KEPT.into(),
+        ..Target::new("k1", "")
+    };
+    pick.ask(kept.clone());
+    assert_eq!(
+        pick.answer(&read(Event::Yes, at(0), false)),
+        Answer::Kept(kept.clone())
+    );
+    pick.ask(kept);
+    assert_eq!(
+        pick.answer(&read(Event::Other, at(0), true)),
+        Answer::Cancel
+    );
+    assert!(asking(ASK) && asking(ASK_BAR) && !asking("no notes"));
 }
 
 #[test]

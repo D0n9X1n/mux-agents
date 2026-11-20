@@ -12,7 +12,7 @@ use super::placement::{DEFAULT as DEFAULT_PLACEMENT, read_placement};
 use super::spawn::{CoreRequest, CoreSlot, Resumed, client_named, keep_bar, launch_hc_locked};
 use super::view::first;
 use super::{lock, lock_key, registry, server_dir, text, usage};
-use crate::caller::Kind;
+use crate::caller::{Caller, Kind};
 use crate::cli::Request;
 use crate::ctx::Ctx;
 use crate::error::{Refusal, Res, refuse};
@@ -20,64 +20,140 @@ use crate::state::fs::read_json;
 
 mod recovery;
 pub use recovery::Action;
-pub(crate) use recovery::{Subject, recover, subject};
+#[cfg(test)]
+pub(crate) use recovery::recover;
+use recovery::recover_target;
+pub(crate) use recovery::{Subject, subject};
+
+/// What a resume names. The verb takes a name or an id; the side bar holds the id of the row it shows, and a name
+/// equal to another member's id must not redirect it.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum Target<'a> {
+    /// Only the member with this id, never one whose name is this text.
+    Id(&'a str),
+    /// The member with this id, else the newest member of this name.
+    NameOrId(&'a str),
+}
+
+impl<'a> Target<'a> {
+    fn text(self) -> &'a str {
+        match self {
+            Target::Id(text) | Target::NameOrId(text) => text,
+        }
+    }
+
+    /// The name matched when no member has the exact id; none for an id-only target.
+    fn name(self) -> Option<&'a str> {
+        match self {
+            Target::Id(_) => None,
+            Target::NameOrId(name) => Some(name),
+        }
+    }
+
+    fn valid(self) -> bool {
+        match self {
+            Target::Id(id) => super::agent_id(id),
+            Target::NameOrId(text) => super::agent_id(text) || super::agent_name(text),
+        }
+    }
+}
 
 pub fn resume(ctx: &Ctx, request: &Request) -> Res<Map<String, Value>> {
-    let target = first(request);
-    if !super::agent_id(target) && !super::agent_name(target) {
+    let target = Target::NameOrId(first(request));
+    if !target.valid() {
         return Err(usage("resume"));
     }
     let caller = crate::caller::resolve_tree(ctx)?;
+    resume_target(
+        ctx,
+        &caller,
+        target,
+        request.switch("Tab"),
+        request.switch("Fresh"),
+    )
+}
+
+/// `resume` of the member with agent id `id` and no other, for the side bar, which calls it in process with its own
+/// caller (a person pane). `tab` and `fresh` are the verb's `-Tab` and `-Fresh`.
+pub fn resume_by_id(
+    ctx: &Ctx,
+    caller: &Caller,
+    id: &str,
+    tab: bool,
+    fresh: bool,
+) -> Res<Map<String, Value>> {
+    let target = Target::Id(id);
+    if !target.valid() {
+        return Err(usage("resume"));
+    }
+    resume_target(ctx, caller, target, tab, fresh)
+}
+
+/// The resume of `target` for a resolved `caller`. `tab` opens the view in a new window whatever the session's stored
+/// placement; `fresh` gives a member that needs recovery a new conversation instead of its failed one.
+pub(crate) fn resume_target(
+    ctx: &Ctx,
+    caller: &Caller,
+    target: Target<'_>,
+    tab: bool,
+    fresh: bool,
+) -> Res<Map<String, Value>> {
     // restore-6c P2: a member that needs recovery is retried as its next generation; else today's resume.
-    let action = if request.switch("Fresh") {
-        Action::Fresh
-    } else {
-        Action::Retry
-    };
-    if let Some(reply) = recover(ctx, &caller, action, target)? {
+    let action = if fresh { Action::Fresh } else { Action::Retry };
+    if let Some((mut reply, promoted)) = recover_target(ctx, caller, action, target, tab)? {
+        // `-Tab` opened the recovered member's view in a new window: that window keeps its bar, as below.
+        if let Some(record) = promoted {
+            keep_bar(ctx, caller, &record, &mut reply);
+        }
         return Ok(reply);
     }
-    crate::cli::member_views(ctx, &caller)?;
+    crate::cli::member_views(ctx, caller)?;
     if matches!(
-        super::tree::scope(ctx, &caller)?,
+        super::tree::scope(ctx, caller)?,
         super::tree::Scope::Outside
     ) {
         // Outside a team, a person only: an agent never resumes a member.
         if caller.kind == Kind::Agent {
             return refuse(2, "tagged", "an agent cannot resume agents");
         }
-        registry::untagged(ctx, &caller, "an agent pane cannot resume agents")?;
+        registry::untagged(ctx, caller, "an agent pane cannot resume agents")?;
     } else {
         // A leaderless team refuses before any hc call.
-        lock(ctx, &super::team_lock(&caller), || {
-            super::tree::team_of(ctx, &caller)
+        lock(ctx, &super::team_lock(caller), || {
+            super::tree::team_of(ctx, caller)
         })?;
     }
     // prelife-1c G10d (call 16): a pre-lifecycle subject is refused from its record, before any hc call.
-    super::prelife::refuse_resume(ctx, &caller, target)?;
-    let split = match read_placement(ctx, &caller) {
-        Ok(Some(stored)) if stored != DEFAULT_PLACEMENT => Some(stored),
-        _ => None,
+    // shortcut: an id-only target is still checked here as a name when no member of this session has that id. This
+    // check only refuses, so it never redirects a resume; at worst it names the refusal `state` instead of `target`.
+    super::prelife::refuse_resume(ctx, caller, target.text())?;
+    // `-Tab` opens the view in a new window whatever the session stores, so the stored placement is not read.
+    let split = match tab {
+        true => None,
+        false => match read_placement(ctx, caller) {
+            Ok(Some(stored)) if stored != DEFAULT_PLACEMENT => Some(stored),
+            _ => None,
+        },
     };
     let core = crate::hc::connect(ctx)?;
-    let (from, record) = lock(ctx, &super::team_lock(&caller), || {
+    let (from, record) = lock(ctx, &super::team_lock(caller), || {
         // adopt-3e call 13: every input of this decision (standing, snapshot, records) is read after replay.
-        super::adopt::replay_held(ctx, &caller)?;
-        let gate = match super::tree::team_of(ctx, &caller)? {
-            Some(t) => Some((t, super::tree::standing(ctx, &caller, Some(&core))?)),
+        super::adopt::replay_held(ctx, caller)?;
+        let gate = match super::tree::team_of(ctx, caller)? {
+            Some(t) => Some((t, super::tree::standing(ctx, caller, Some(&core))?)),
             None if caller.kind == Kind::Agent => {
                 return refuse(2, "tagged", "an agent cannot resume agents");
             }
             None => None,
         };
-        let snapshot = Snapshot::for_spawn(ctx, &caller, &core)?;
-        let resumed = admit(ctx, &caller, &snapshot, target, gate.as_ref())?;
+        let snapshot = Snapshot::for_spawn(ctx, caller, &core)?;
+        let resumed = admit(ctx, caller, &snapshot, target, gate.as_ref())?;
         // A member's resume takes its token as the launch's last step before `hc run` (D5).
         let debit = matches!(&gate, Some((_, super::tree::Standing::Member(_))));
         // The mailbox barrier: a reader of X's mailbox that holds its lock finishes before Y exists; one after it
         // finds X superseded (or not yet running Y) and reads nothing. No mailbox lock is held across the launch.
         let mailbox = super::mail::member_mailbox(&resumed.from, &resumed.record);
-        lock(ctx, &lock_key("mail", &caller, &mailbox), || Ok(()))?;
+        lock(ctx, &lock_key("mail", caller, &mailbox), || Ok(()))?;
         let x = &resumed.record;
         let client = client_named(&text(x.get("client")))
             .ok_or_else(|| Refusal::internal("the ended member names no known client"))?;
@@ -86,7 +162,7 @@ pub fn resume(ctx: &Ctx, request: &Request) -> Res<Map<String, Value>> {
         let color = crate::paint::identity(x.get("color").and_then(Value::as_str), &name);
         let record = launch_hc_locked(
             ctx,
-            &caller,
+            caller,
             &core,
             CoreRequest {
                 client,
@@ -119,7 +195,7 @@ pub fn resume(ctx: &Ctx, request: &Request) -> Res<Map<String, Value>> {
     );
     reply.extend(super::spawn::view_reply(&record));
     // Spawn's own post-commit bar step, so a change to the bar changes both verbs.
-    keep_bar(ctx, &caller, &record, &mut reply);
+    keep_bar(ctx, caller, &record, &mut reply);
     Ok(reply)
 }
 
@@ -127,12 +203,13 @@ pub fn resume(ctx: &Ctx, request: &Request) -> Res<Map<String, Value>> {
 /// `createdAt`) of that name that no resume superseded. X must be proven ended, not taken, no leader, its session
 /// live nowhere (`occupancy::held`) and no member of its name running. Outside a team the session stays under its cap; in
 /// a team the caller's authority, the tree's limit, the parent's and the team's ceiling, the name and a member's budget
-/// are checked in that order, and the budget is only checked here: the launch spends it (D5).
+/// are checked in that order, and the budget is only checked here: the launch spends it (D5). An id-only target is
+/// never matched as a name.
 fn admit(
     ctx: &Ctx,
     caller: &crate::caller::Caller,
     snapshot: &Snapshot,
-    target: &str,
+    target: Target<'_>,
     gate: Option<&(super::team::Team, super::tree::Standing)>,
 ) -> Res<Resumed> {
     if let Some(e) = &snapshot.core_error {
@@ -140,11 +217,14 @@ fn admit(
     }
     let superseded = snapshot.superseded();
     let local = &snapshot.facts.local;
-    let x = match local.iter().find(|o| o.identity.id == target) {
+    let x = match local.iter().find(|o| o.identity.id == target.text()) {
         Some(o) => o,
         None => local
             .iter()
-            .filter(|o| o.identity.name == target && !superseded.contains(&o.identity.id))
+            .filter(|o| {
+                target.name() == Some(o.identity.name.as_str())
+                    && !superseded.contains(&o.identity.id)
+            })
             .max_by_key(|o| {
                 let created = snapshot.records[&o.identity.id]
                     .record
@@ -156,7 +236,11 @@ fn admit(
             .ok_or_else(|| Refusal {
                 code: 2,
                 check: "target",
-                message: "no member has that name or id".into(),
+                message: match target {
+                    Target::Id(_) => "no member has that id",
+                    Target::NameOrId(_) => "no member has that name or id",
+                }
+                .into(),
                 reason: None,
                 leftover: None,
                 details: Default::default(),
@@ -251,8 +335,15 @@ fn admit(
         flags
     };
     match gate {
-        None if snapshot.facts.count() >= 6 => {
-            return refuse(2, "cap", "the session already has 6 live agents");
+        None if snapshot.facts.count() >= super::tree::MAX_MEMBERS => {
+            return refuse(
+                2,
+                "cap",
+                format!(
+                    "the session already has {} live agents",
+                    super::tree::MAX_MEMBERS
+                ),
+            );
         }
         None => {}
         Some((team, s)) => {
@@ -392,4 +483,4 @@ pub(crate) fn every_member(ctx: &Ctx) -> Res<Vec<(PathBuf, super::gens::Member)>
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

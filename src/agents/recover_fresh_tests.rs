@@ -233,7 +233,7 @@ fn a_voided_fresh_start_keeps_the_predecessors_conversation() {
     r["pending"] = json!({"gen": 2, "kind": "fresh", "hcName": lf::hc_name(2),
         "sessionId": "0f0f0f0f-2032-48ef-a920-0f0f0f0f0f0f", "launcherArgv": lf::ARGV, "hcAddress": "t2"});
     crate::state::fs::write_json(&f.join("record.json"), &r).unwrap();
-    let live: Vec<String> = super::reconcile_await_tests::six_running(&w)
+    let live: Vec<String> = super::reconcile_await_tests::full_running(&w)
         .iter()
         .map(|id| format!("a{id}"))
         .collect();

@@ -53,7 +53,7 @@ flowchart LR
 | `peek` | `peek claude-1 -Lines 40` | 读取团队成员的实时窗格，不向其中输入任何内容 |
 | `stop` | `stop claude-1`、`stop claude-1 -Generation` | 自下而上结束代理及其启动的所有代理；被中断的停止会在下一轮完成；`-Generation` 只结束它打开的各代，保留成员；回复中的 `life` 说明其终端现在的状态：`ended`、`lost`、`unknown` 或 `running` |
 | `drop` | `drop claude-1` | 由人停止团队会话中的成员；其保留的 shell 仍然保留 |
-| `resume` | `resume claude-1`、`resume claude-1 -Fresh` | 把已停止的代理作为带着原对话的新成员恢复，或重试侧边栏标为 `recover` 的成员；`-Fresh` 用新对话启动；只要仍有存活进程可能占用该对话就会被拒绝 |
+| `resume` | `resume claude-1`、`resume claude-1 -Fresh`、`resume claude-1 -Tab` | 把已停止的代理作为带着原对话的新成员恢复，或重试侧边栏标为 `recover` 的成员；`-Fresh` 用新对话启动；`-Tab` 不管会话的 `placement` 如何，都在新窗口中打开它的视图；只要仍有存活进程可能占用该对话就会被拒绝 |
 | `restore` | `restore` | 把本团队每个丢失的成员恢复为它的下一代；其之前的终端作为保留的 shell 留下 |
 | `up` | `up -Client claude -- --model opus` | 启动团队：领导者、侧边栏和视图；视图关闭、服务器被杀或重启之后再次运行，可找回视图、侧边栏和丢失的成员；已停止的团队会被退役并启动新团队；`-Name <name>` 在同一文件夹中启动第二个团队（[团队与生命周期](Teams-and-Lifecycle-zh-CN)） |
 | `status` | `status -BodyFile step.txt` | 代理报告自己当前在做什么；侧边栏显示它 |
@@ -80,7 +80,7 @@ usage: mux-agent notes [-Since <id>] [-Lines <n>] | notes <id> [-Text]
 usage: mux-agent peek <name> [-Lines <n>] [-Text]
 usage: mux-agent stop <name> [-Generation] [-Text]
 usage: mux-agent drop <name|id> [-Text]
-usage: mux-agent resume <name|id> [-Fresh] [-Text]
+usage: mux-agent resume <name|id> [-Fresh] [-Tab] [-Text]
 usage: mux-agent restore [-Text]
 usage: mux-agent up -Client <claude|copilot> [-Name <name>] [-Text] [-- <client flags>]
 usage: mux-agent status (-Body <text> | -BodyFile <path>) [-Text]
@@ -124,9 +124,9 @@ usage: mux-agent kept [-Close <address>] [-Text]
 - `flags`：对团队之外的客户端聊天，从该聊天到窗格的每个客户端命令行都只使用允许列表中的参数。
 - `policy`：该聊天已经以绕过权限或全部允许的方式运行。
 - `directory`：能确认该聊天的启动目录；代理在该目录中启动。
-- `cap`：在团队之外，会话中存活的代理少于 6 个。
+- `cap`：在团队之外，会话中存活的代理少于 10 个。
 - `depth`：在团队中，子代理的深度不超过 3（领导者为 0）。
-- `limit`：在团队中，除领导者外的成员少于 6 个。
+- `limit`：在团队中，除领导者外的成员少于 10 个。
 - `ceiling`：在团队中，子代理的参数不超过其父代理的策略和团队的权限上限。
 - `budget`：在团队中，成员的每次启动从团队的启动预算中取一个令牌：共 20 个令牌，每 180 秒增加一个，由会话选项 `@mux-agents-spawn-budget` 和 `@mux-agents-spawn-refill` 设置。
 
@@ -181,9 +181,9 @@ copilot plugin marketplace update mux-agents && copilot plugin update mux-agents
 | `flags` | 从调用者到窗格之间的某个 `claude` 或 `copilot` 进程带有允许列表之外的标志，或其命令行无法读取 | 只用允许列表中的标志重新启动客户端 |
 | `directory` | 无法从调用者的会话或进程确认其启动目录，或该目录不是一个存在的绝对路径文件夹 | 在一个存在的文件夹中启动客户端，并留在该文件夹 |
 | `tagged` | 团队之外的代理尝试启动代理；成员尝试打开侧边栏或设置 `placement`；在代理或成员窗格中运行了 `up`、`restore`、`drop`、`kept` 或 `stop -Generation` | 团队之外只有顶层聊天可以启动代理；从你自己的窗格运行只供人使用的动词 |
-| `cap` | 在团队之外，此会话中已有 6 个存活代理 | `stop` 其中一个 |
+| `cap` | 在团队之外，此会话中已有 10 个存活代理 | `stop` 其中一个 |
 | `depth` | 在团队中，子代理的深度会超过 3 | 让更浅层的成员启动它 |
-| `limit` | 在团队中，除领导者外已有 6 个成员；消息会指出仍占用名额的成员以及释放它的方法 | `stop` 其中一个 |
+| `limit` | 在团队中，除领导者外已有 10 个成员；消息会指出仍占用名额的成员以及释放它的方法 | `stop` 其中一个 |
 | `ceiling` | 在团队中，子代理的参数会超过其父代理的策略或团队的权限上限 | 从拥有该权限的成员启动它 |
 | `budget` | 在团队中，团队的启动预算已用完；消息会说明下一个令牌何时到来 | 等待，或调高 `@mux-agents-spawn-budget`、调低 `@mux-agents-spawn-refill` |
 | `views` | 团队的视图已关闭时，成员运行 `spawn`、`focus`、`resume`、`sidebar`、`watch` 或 `placement` | 运行 `up` |

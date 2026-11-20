@@ -3,10 +3,11 @@ use serde_json::{Map, Value, json};
 
 use super::super::gens::{Gen, Member, Verdict};
 use super::super::lifecycle::Life;
-use super::super::reconcile::{Next, Seen, launch_next, observe_recovery};
+use super::super::reconcile::{Next, Seen, launch_next_viewed, observe_recovery};
 use super::super::settle::{Mode, Outcome};
 use super::super::team_state::Tx;
 use super::super::text;
+use super::Target;
 use crate::caller::Caller;
 use crate::ctx::Ctx;
 use crate::error::{Res, refuse};
@@ -27,15 +28,34 @@ pub(crate) enum Subject {
     None,
 }
 
-/// P2 (ambiguities 1-4; calls 15, 25): X of the caller's anchor session, under `up|T`, then one team Tx: settle,
-/// one observation, the decision, the person check, then n+1 of the same id. `None`: not a recovery (no lifecycle
-/// team in the session, a pre-lifecycle subject, or X Ended without a failure); `resume` keeps today's meaning.
+/// `recover_target` of a name or an id, as the verb takes it.
+#[cfg(test)]
 pub(crate) fn recover(
     ctx: &Ctx,
     caller: &Caller,
     action: Action,
     target: &str,
 ) -> Res<Option<Map<String, Value>>> {
+    recover_target(ctx, caller, action, Target::NameOrId(target), false)
+        .map(|got| got.map(|(reply, _)| reply))
+}
+
+/// A recovery's reply, and with `tab` the promoted record of the generation it launched (its view's pane and window).
+pub(crate) type Recovered = (Map<String, Value>, Option<Value>);
+
+/// P2 (ambiguities 1-4; calls 15, 25): X of the caller's anchor session, under `up|T`, then one team Tx: settle,
+/// one observation, the decision, the person check, then n+1 of the same id. `None`: not a recovery (no lifecycle
+/// team in the session, a pre-lifecycle subject, or X Ended without a failure); `resume` keeps today's meaning. An
+/// id-only target never selects a member by its name. With `tab` (`resume -Tab`, the side bar's Enter) n+1 opens its
+/// view in a new window through spawn's own view step, and the promoted record comes back beside the reply, so the
+/// caller can keep that window's bar once the locks are released.
+pub(crate) fn recover_target(
+    ctx: &Ctx,
+    caller: &Caller,
+    action: Action,
+    target: Target<'_>,
+    tab: bool,
+) -> Res<Option<Recovered>> {
     let here = super::super::scope::state(caller); // 6a call 10
     let Some(team) = super::super::reconcile::session_team(ctx, &here)? else {
         return match action {
@@ -49,7 +69,7 @@ pub(crate) fn recover(
     };
     super::super::admit(ctx, &format!("up|{team}"), || {
         super::super::team_state::open(ctx, &here, |tx| {
-            let id = match subject(tx, target)? {
+            let id = match subject_of(tx, target)? {
                 Subject::Life(id) => id,
                 Subject::Pre => return Ok(None), // prelife-1c G10d refuses it in today's resume
                 Subject::None => {
@@ -91,19 +111,26 @@ pub(crate) fn recover(
                 &seen,
                 (action == Action::Retry).then_some(session.as_str()),
             )?;
-            let n = super::super::cascade::reopen_same(tx, &id, || {
+            let (n, promoted) = super::super::cascade::reopen_same(tx, &id, || {
                 let next = Next {
                     kind,
                     session: &session,
                     fresh: action == Action::Fresh,
                 };
-                launch_next(tx, lazy.get()?, &id, &g, next)
+                launch_next_viewed(tx, lazy.get()?, &id, &g, next, |core, record| match tab {
+                    true => super::super::view::launch_view(ctx, core, caller, record, None),
+                    false => Ok(json!({})),
+                })
             })?;
             let mut out = reply(&g, n, kind, &session);
             if let Some(r) = released {
                 out.insert("released".into(), json!(r));
             }
-            Ok(Some(out))
+            if !tab {
+                return Ok(Some((out, None)));
+            }
+            out.extend(super::super::spawn::view_reply(&promoted));
+            Ok(Some((out, Some(promoted))))
         })
     })
 }
@@ -166,13 +193,19 @@ fn gates(
 /// Call 15: X among the anchor session's lifecycle members only (`session` is the Tx's, `id` names its folder), by
 /// exact id, else the newest (`createdAt`) of that name. Any unreadable member may be X: `evidence` (call 25).
 pub(crate) fn subject(tx: &Tx<'_>, target: &str) -> Res<Subject> {
+    subject_of(tx, Target::NameOrId(target))
+}
+
+/// `subject` of `target`: an id-only target is the member of that exact id, or none.
+fn subject_of(tx: &Tx<'_>, target: Target<'_>) -> Res<Subject> {
+    let (name, target) = (target.name(), target.text());
     let (mut named, mut pre) = (Vec::new(), false);
     for (id, _, m) in super::super::gens::members(&tx.scope.agents(&tx.ctx.state_root))? {
         let g = match m {
             Member::Life(g) => g,
             Member::Unreadable(e) => return Err(e),
             Member::Pre(r) => {
-                pre |= id == target || text(r.get("name")) == target;
+                pre |= id == target || name.is_some_and(|n| text(r.get("name")) == n);
                 continue;
             }
             Member::Absent => continue,
@@ -184,7 +217,7 @@ pub(crate) fn subject(tx: &Tx<'_>, target: &str) -> Res<Subject> {
         if id == target {
             return Ok(Subject::Life(id));
         }
-        if text(r.get("name")) == target {
+        if name.is_some_and(|n| text(r.get("name")) == n) {
             named.push((text(r.get("createdAt")), id));
         }
     }

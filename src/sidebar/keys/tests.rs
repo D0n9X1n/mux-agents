@@ -21,6 +21,12 @@ fn table() -> Vec<(&'static [u8], Event)> {
         (b"n", Event::Next),
         (b"N", Event::Prev),
         (b"p", Event::Peek),
+        (b"m", Event::Mail),
+        (b"q", Event::Close),
+        (b"i", Event::Notes),
+        (b"P", Event::Placement),
+        (b"o", Event::Output),
+        (b" ", Event::Ack),
         (b"\x1b[B", Event::Down),
         (b"\x1bOB", Event::Down),
         (b"y", Event::Yes),
@@ -62,7 +68,11 @@ fn decodes_every_event_whole() {
         let first = at(7);
         assert_eq!(
             decoder.push(bytes, first),
-            [Read { event, first }],
+            [Read {
+                event,
+                first,
+                alone: true
+            }],
             "{bytes:?}"
         );
         assert!(decoder.buf.is_empty(), "{bytes:?}");
@@ -81,7 +91,8 @@ fn decodes_every_event_split_at_each_byte() {
                 reads,
                 [Read {
                     event,
-                    first: at(1)
+                    first: at(1),
+                    alone: true
                 }],
                 "{a:?} {b:?}"
             );
@@ -102,11 +113,13 @@ fn first_byte_time_of_each_event_in_one_read() {
                     x: 3,
                     y: 5
                 },
-                first: at(1)
+                first: at(1),
+                alone: false
             },
             Read {
                 event: Event::Down,
-                first: at(2)
+                first: at(2),
+                alone: false
             },
         ]
     );
@@ -127,7 +140,8 @@ fn a_new_unfinished_sequence_takes_its_own_read_time() {
                 x: 4,
                 y: 6
             },
-            first: at(2)
+            first: at(2),
+            alone: true
         }]
     );
 }
@@ -162,7 +176,8 @@ fn idle_turns_a_lone_escape_into_esc() {
         decoder.idle(),
         [Read {
             event: Event::Esc,
-            first: at(1)
+            first: at(1),
+            alone: true
         }]
     );
     assert!(!decoder.lone_esc());
@@ -175,7 +190,8 @@ fn idle_turns_a_lone_escape_into_esc() {
         decoder.push(b"A", at(4)),
         [Read {
             event: Event::Up,
-            first: at(3)
+            first: at(3),
+            alone: true
         }]
     );
 }
@@ -197,8 +213,118 @@ fn escape_then_another_byte() {
 }
 
 #[test]
+fn tab_g_capital_g_and_question_mark_are_the_hub_keys() {
+    let mut decoder = Decoder::default();
+    assert_eq!(
+        events(&decoder.push(b"\tgG?", at(1))),
+        [Event::Tab, Event::First, Event::Last, Event::Help]
+    );
+}
+
+#[test]
+fn q_i_capital_p_o_and_space_are_the_hub_keys_too() {
+    let mut decoder = Decoder::default();
+    assert_eq!(
+        events(&decoder.push(b"qiPo ", at(1))),
+        [
+            Event::Close,
+            Event::Notes,
+            Event::Placement,
+            Event::Output,
+            Event::Ack
+        ]
+    );
+}
+
+// `close bar? y/n` takes a `y` only when it came alone: a paste or a key held down reads more than one event at once.
+#[test]
+fn an_event_is_alone_only_when_its_read_brought_no_other() {
+    let mut decoder = Decoder::default();
+    let alone = |reads: Vec<Read>| reads.iter().map(|r| r.alone).collect::<Vec<_>>();
+    assert_eq!(alone(decoder.push(b"y", at(1))), [true]);
+    assert_eq!(alone(decoder.push(b"qy", at(2))), [false, false]);
+    assert_eq!(alone(decoder.push(b"\x1by", at(3))), [false, false]);
+    // A sequence finished by a later read is alone in that read.
+    assert_eq!(decoder.push(b"\x1b[", at(4)), []);
+    assert_eq!(alone(decoder.push(b"A", at(5))), [true]);
+}
+
+// A `y` is alone only when its read was that one key: an unfinished sequence left buffered after it, or a dropped one
+// in the same read, is more than the key, so a paste that happens to decode to one `y` never answers `close bar?`.
+#[test]
+fn a_key_is_alone_only_when_its_read_was_that_key_and_nothing_else() {
+    let alone = |bytes: &[u8]| {
+        let reads = Decoder::default().push(bytes, at(1));
+        reads.iter().map(|r| r.alone).collect::<Vec<_>>()
+    };
+    assert_eq!(alone(b"y"), [true]);
+    assert_eq!(alone(b"yy"), [false, false]);
+    // `\e[` left unfinished after the `y`.
+    assert_eq!(alone(b"y\x1b["), [false]);
+    // A lone ESC after the `y`, which may still become a sequence.
+    assert_eq!(alone(b"y\x1b"), [false]);
+    // A sequence dropped at `BUFFER_MAX`, then the `y`: the dropped bytes were read with it.
+    let mut cut = b"\x1b[".to_vec();
+    cut.extend([b'0'; BUFFER_MAX - 2]);
+    cut.push(b'y');
+    assert_eq!(alone(&cut), [false]);
+}
+
+// `@mux-agents-keys`: each `action=key` moves that action to one printable ASCII key, which no other action keeps;
+// an unknown action, a key that is not one printable character, and `y` (the answer to a question) are ignored.
+#[test]
+fn the_keymap_moves_each_named_action_to_its_key() {
+    let map = Keymap::parse("notes=I, close = Q,stop=x,peek=ab,,help=y,mail=,=z");
+    assert_eq!(map.ignored(), ["stop", "peek", "help", "mail", "=z"]);
+    let mut decoder = Decoder::new(map.clone());
+    assert_eq!(
+        events(&decoder.push(b"IQiqpm?y", at(1))),
+        [
+            Event::Notes,
+            Event::Close,
+            Event::Other,
+            Event::Other,
+            Event::Peek,
+            Event::Mail,
+            Event::Help,
+            Event::Yes
+        ]
+    );
+    assert_eq!(
+        (map.key(Event::Notes), map.key(Event::Peek)),
+        (Some(b'I'), Some(b'p'))
+    );
+    // Taking another action's key leaves that action without one; a swap gives each the other's.
+    let map = Keymap::parse("notes=j,peek=n,next=p");
+    assert_eq!(map.key(Event::Down), None);
+    assert_eq!(
+        events(&Decoder::new(map.clone()).push(b"jnpN", at(1))),
+        [Event::Notes, Event::Peek, Event::Next, Event::Prev]
+    );
+    // Arrows still move; the fixed keys stay fixed.
+    assert_eq!(
+        events(&Decoder::new(map).push(b"\x1b[B\r\t", at(1))),
+        [Event::Down, Event::Enter, Event::Tab]
+    );
+    // Space is a key too, shown as `Space`; the default map is the keys as shipped.
+    let map = Keymap::parse("ack=., close= ");
+    assert_eq!(
+        (map.label(Event::Ack), map.label(Event::Close)),
+        (Some(".".to_string()), Some("Space".to_string()))
+    );
+    assert_eq!(Keymap::default(), Keymap::parse(""));
+    assert_eq!(
+        Keymap::default().label(Event::Ack).as_deref(),
+        Some("Space")
+    );
+}
+
+#[test]
 fn garbage_is_other_and_never_panics() {
-    let keys = [0x03, b'\r', b'\n', b'j', b'k', b'n', b'N', b'p', b'y', 0x1b];
+    let keys = [
+        0x03, b'\r', b'\n', b'j', b'k', b'n', b'N', b'p', b'm', b'y', b'\t', b'g', b'G', b'?',
+        b'q', b'i', b'P', b'o', b' ', 0x1b,
+    ];
     for byte in 0..=255u8 {
         let mut decoder = Decoder::default();
         let reads = decoder.push(&[byte], at(1));
@@ -260,7 +386,8 @@ fn overflow_drops_the_buffer() {
         decoder.push(b"j", at(2)),
         [Read {
             event: Event::Down,
-            first: at(2)
+            first: at(2),
+            alone: true
         }]
     );
     // A field past u16 makes its whole report `Other`.

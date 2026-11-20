@@ -546,9 +546,10 @@ fn kept_offset(mailbox: &Path, offset: u64, len: u64) -> Res<u64> {
     })
 }
 
-pub fn unread_counts(ctx: &Ctx, caller: &Caller, key: &str) -> Res<HashMap<String, usize>> {
+/// Mailbox `key`'s unread lines (after the kept offset) and its held ones, read under its mail lock.
+pub fn unread_lines(ctx: &Ctx, caller: &Caller, key: &str) -> Res<Vec<Value>> {
     let mail = super::server_dir(ctx, caller).join("mail");
-    let found = super::lock(ctx, &super::lock_key("mail", caller, key), || {
+    super::lock(ctx, &super::lock_key("mail", caller, key), || {
         let c = receipt::load(&mail, key).unwrap_or_default();
         let mailbox = mail.join(format!("{key}.jsonl"));
         let len = std::fs::metadata(&mailbox).map_or(0, |m| m.len());
@@ -568,27 +569,40 @@ pub fn unread_counts(ctx: &Ctx, caller: &Caller, key: &str) -> Res<HashMap<Strin
             );
         }
         Ok(found)
-    })?;
+    })
+}
+
+/// A line's sender as `<from>|<pane>`, the key `list` counts a caller's mailbox by.
+pub fn sender(message: &Value) -> String {
+    format!(
+        "{}|{}",
+        super::text(message.get("from")),
+        super::text(message.get("pane"))
+    )
+}
+
+/// Mailbox `key`'s unread lines counted by `sender`, held ones included.
+pub fn unread_counts(ctx: &Ctx, caller: &Caller, key: &str) -> Res<HashMap<String, usize>> {
     let mut counts = HashMap::new();
-    for message in found {
-        let from = format!(
-            "{}|{}",
-            super::text(message.get("from")),
-            super::text(message.get("pane"))
-        );
-        // A line naming its member (`fromId`) also counts as `#<id>`, and as `!<from>|<pane>` so a team row adds the
-        // lines without one by name and pane and never counts a line twice (review).
-        if let Some(id) = message
-            .get("fromId")
-            .and_then(Value::as_str)
-            .filter(|id| !id.is_empty())
-        {
-            *counts.entry(format!("#{id}")).or_insert(0) += 1;
-            *counts.entry(format!("!{from}")).or_insert(0) += 1;
-        }
-        *counts.entry(from).or_insert(0) += 1;
+    for message in unread_lines(ctx, caller, key)? {
+        *counts.entry(sender(&message)).or_insert(0) += 1;
     }
     Ok(counts)
+}
+
+/// Whether unread `message` counts toward member `id`'s ✉ badge, the one rule the bar's badge and `m` share for every
+/// row but a leader's (which counts its whole mailbox): a line naming a member (`fromId`) counts for that member only,
+/// and never when it is the notice of its own exit (`registry::post`, the only lines with a `kind`); a line naming none
+/// counts by its sender, `legacy` (`<name>|<pane>` of the row).
+pub(crate) fn badge_line(message: &Value, id: &str, legacy: &str) -> bool {
+    match message
+        .get("fromId")
+        .and_then(Value::as_str)
+        .filter(|from| !from.is_empty())
+    {
+        Some(from) => from == id && message.get("kind").is_none(),
+        None => sender(message) == legacy,
+    }
 }
 
 /// The held trailer alone (no receipt), for a serving with nothing new.
@@ -792,6 +806,130 @@ pub fn serve_id(
     })
 }
 
+/// A read-only message for the side bar's selected badge.
+pub(crate) struct Report {
+    pub from: String,
+    pub at: String,
+    pub body: String,
+}
+
+/// At most 50 unread messages, oldest first, from the mailboxes counted by the selected row's badge.
+/// Parent boxes filter by the row's sender; a leader reads its own mailbox from every sender. Reads only:
+/// no reap, receipt, ack, cursor migration or folder creation. Held messages (served as a reference and acked, still
+/// counted in the badge) are included, as `unread_counts` and `counts` include them.
+pub(crate) fn badge_mail(ctx: &Ctx, caller: &Caller, id: &str) -> Res<Vec<Report>> {
+    let scope = super::team_state::Scope::of(caller);
+    let (snapshot, shown) = super::adopt::stable(ctx, &scope, || {
+        Ok((
+            super::membership::Snapshot::take(ctx, caller)?,
+            super::cascade::Tree::shown(&super::team_state::Tx {
+                ctx,
+                scope: scope.clone(),
+            }),
+        ))
+    })?;
+    let Some(stored) = snapshot.records.get(id) else {
+        return Ok(Vec::new());
+    };
+    let record = &stored.record;
+    let team = super::team::read(&super::team::path(
+        &super::server_dir(ctx, caller),
+        &scope.session,
+    ))
+    .ok()
+    .flatten()
+    .is_some()
+        || snapshot.records.values().any(|s| {
+            s.committed
+                && super::tree::is_leader(&s.record)
+                && s.record.get("upTeam").and_then(Value::as_str).is_some()
+        });
+    // Match board_rows::parent_key: only a live parent view on the recorded server owns this pane mailbox.
+    let superseded = snapshot.superseded();
+    let parent = snapshot.view_order.iter().find(|p| {
+        let view = &snapshot.views[*p];
+        record.get("parentServerKey").and_then(Value::as_str) == elsewhere(caller)
+            && view.pane == super::text(record.get("parentPane"))
+            && snapshot.records[*p].committed
+            && !superseded.contains(*p)
+            && snapshot
+                .facts
+                .local
+                .iter()
+                .any(|o| o.identity.id == **p && o.life == super::lifecycle::Life::Running)
+    });
+    let parent = parent
+        .map(|p| member_mailbox(p, &snapshot.records[p].record))
+        .or_else(|| parent_box(record).ok());
+    let mut keys: Vec<String> = parent.into_iter().collect();
+    if team {
+        keys.extend(parent_box(record).ok());
+        let parents = shown.placed(id).unwrap_or_else(|| {
+            record
+                .get("parentAgent")
+                .and_then(|p| p.get("id"))
+                .and_then(Value::as_str)
+                .map(String::from)
+                .into_iter()
+                .collect()
+        });
+        for parent in parents {
+            if let Some(stored) = snapshot.records.get(&parent) {
+                keys.push(member_mailbox(&parent, &stored.record));
+            }
+        }
+    }
+    let leader = super::tree::is_leader(record);
+    if leader {
+        keys = vec![member_mailbox(id, record)];
+    }
+    keys.sort();
+    keys.dedup();
+    let mail = super::server_dir(ctx, caller).join("mail");
+    // The row's sender, as the board keys it: its name and the pane its record names.
+    let legacy = format!(
+        "{}|{}",
+        super::text(record.get("name")),
+        super::text(record.get("pane"))
+    );
+    let mut reports = Vec::new();
+    for key in keys {
+        let found = super::lock(ctx, &super::lock_key("mail", caller, &key), || {
+            let c = receipt::load(&mail, &key).unwrap_or_default();
+            let mailbox = mail.join(format!("{key}.jsonl"));
+            let offset = if leader {
+                c.offset
+            } else {
+                let len = std::fs::metadata(&mailbox).map_or(0, |m| m.len());
+                kept_offset(&mailbox, c.offset, len)?
+            };
+            let mut found = unread_after(&mailbox, offset)?.0;
+            if !c.held.is_empty() {
+                found.extend(
+                    unread_after(&mailbox, 0)?
+                        .0
+                        .into_iter()
+                        .filter(|(m, _)| c.held.contains(&super::text(m.get("id")))),
+                );
+            }
+            Ok(found)
+        })?;
+        reports.extend(
+            found
+                .into_iter()
+                .filter(|(m, _)| leader || badge_line(m, id, &legacy))
+                .map(|(m, _)| Report {
+                    from: super::text(m.get("from")),
+                    at: super::text(m.get("at")),
+                    body: super::text(m.get("body")),
+                }),
+        );
+    }
+    reports.sort_by(|a, b| a.at.cmp(&b.at));
+    reports.truncate(50);
+    Ok(reports)
+}
+
 /// R8: read-only, never creating a folder: `badge` = unread + held, `wake` = unread after `offset`, `end` = snapshot end.
 #[derive(Debug, PartialEq)]
 pub struct Counts {
@@ -819,6 +957,380 @@ mod tests {
     use crate::agents::fixture::World;
     use crate::agents::text;
     use crate::testing::TempDir;
+
+    #[test]
+    fn badge_mail_shows_the_selected_agents_report() {
+        let w = World::human("");
+        let id = crate::agents::fixture::ID;
+        crate::agents::core_fixture::member(&w, id, json!({}));
+        let caller = w.caller();
+        add_mail(&w.ctx, &caller, "pane-1", "worker", "%9", "done", None).unwrap();
+
+        let reports = badge_mail(&w.ctx, &caller, id).unwrap();
+        assert_eq!(reports.len(), 1);
+        assert_eq!(reports[0].from, "worker");
+        assert_eq!(reports[0].at, "1970-01-01T00:00:00.0000000Z");
+        assert_eq!(reports[0].body, "done");
+    }
+
+    #[test]
+    fn badge_mail_filters_unread_reports_without_consuming_or_repairing_mail() {
+        let w = World::human("");
+        let id = crate::agents::fixture::ID;
+        crate::agents::core_fixture::member(&w, id, json!({"parentPane": "%4"}));
+        let caller = w.caller();
+        let mail = w.state().join("mail");
+        add_mail(&w.ctx, &caller, "pane-4", "worker", "%9", "read", None).unwrap();
+        read_mail(&w.ctx, &caller, "pane-4").unwrap();
+        for n in 0..51 {
+            for (from, pane) in [("other", "%9"), ("worker", "%8"), ("worker", "%9")] {
+                add_mail(&w.ctx, &caller, "pane-4", from, pane, &n.to_string(), None).unwrap();
+            }
+        }
+        let reports = badge_mail(&w.ctx, &caller, id).unwrap();
+        assert_eq!(reports.len(), 50);
+        assert!(reports.iter().all(|r| r.from == "worker"));
+        assert_eq!(
+            reports.iter().map(|r| r.body.clone()).collect::<Vec<_>>(),
+            (0..50).map(|n| n.to_string()).collect::<Vec<_>>()
+        );
+        // Keep fewer than the cap here, so truncation cannot hide a mistakenly included torn line.
+        read_mail(&w.ctx, &caller, "pane-4").unwrap();
+        add_mail(&w.ctx, &caller, "pane-4", "worker", "%9", "new", None).unwrap();
+        // Both valid JSON without LF and a truncated object remain uncommitted lines.
+        for tail in [
+            line("torn", "worker", "%9", "torn"),
+            "{\"from\":\"worker\"".into(),
+        ] {
+            let file = mail.join("pane-4.jsonl");
+            let complete = std::fs::read(&file).unwrap();
+            append(&file, tail.as_bytes()).unwrap();
+            serve(&w.ctx, &caller, "pane-4", &me("parent"), &|| true).unwrap();
+            let before = crate::agents::cascade_fixture::snapshot(&w.ctx.state_root);
+            let count = unread_counts(&w.ctx, &caller, "pane-4").unwrap();
+            let reports = badge_mail(&w.ctx, &caller, id).unwrap();
+            assert_eq!(reports.len(), 1);
+            assert_eq!(reports[0].from, "worker");
+            assert_eq!(reports[0].body, "new");
+            assert_eq!(unread_counts(&w.ctx, &caller, "pane-4").unwrap(), count);
+            assert_eq!(
+                crate::agents::cascade_fixture::snapshot(&w.ctx.state_root),
+                before
+            );
+            std::fs::write(&file, complete).unwrap();
+        }
+        for parent in [json!("%7"), Value::Null] {
+            crate::agents::core_fixture::member(&w, id, json!({"parentPane": parent}));
+            let before = crate::agents::cascade_fixture::snapshot(&w.ctx.state_root);
+            assert!(badge_mail(&w.ctx, &caller, id).unwrap().is_empty());
+            assert_eq!(
+                crate::agents::cascade_fixture::snapshot(&w.ctx.state_root),
+                before
+            );
+        }
+    }
+
+    #[test]
+    fn badge_mail_follows_a_team_members_identity_into_its_parent_mailboxes() {
+        let w = World::human("");
+        let id = crate::agents::fixture::ID;
+        let lead = "bbbbbbbbbbbb";
+        let inherited = "cccccccccccc";
+        crate::agents::core_fixture::member(
+            &w,
+            lead,
+            json!({"name": "lead", "pane": "%8", "parentPane": null, "depth": 0,
+                "upTeam": "T", "mailbox": inherited}),
+        );
+        crate::agents::core_fixture::member(
+            &w,
+            id,
+            json!({"parentPane": "%8", "parentAgent": {"id": lead}, "depth": 1}),
+        );
+        let caller = w.caller();
+        add_mail(&w.ctx, &caller, "pane-8", "worker", "%9", "notice", None).unwrap();
+        w.clock("1970-01-01T00:00:01.0000000Z");
+        add_member_mail(&w.ctx, &caller, inherited, "worker", id, "%19", "report").unwrap();
+        add_member_mail(
+            &w.ctx,
+            &caller,
+            inherited,
+            "worker",
+            "dddddddddddd",
+            "%9",
+            "other member",
+        )
+        .unwrap();
+        add_mail(&w.ctx, &caller, lead, "worker", "%9", "wrong mailbox", None).unwrap();
+        let before = crate::agents::cascade_fixture::snapshot(&w.ctx.state_root);
+
+        let reports = badge_mail(&w.ctx, &caller, id).unwrap();
+        assert_eq!(
+            reports.iter().map(|r| r.body.as_str()).collect::<Vec<_>>(),
+            ["notice", "report"]
+        );
+        assert_eq!(
+            crate::agents::cascade_fixture::snapshot(&w.ctx.state_root),
+            before
+        );
+    }
+
+    #[test]
+    fn badge_mail_shows_held_mail_the_badge_counts() {
+        // A held report (too long for a batch: served as a reference and acked) still counts in the badge, so the popup
+        // lists it too: for the member whose report it is (its parent's pane mailbox) and for a leader (its own).
+        let w = World::human("");
+        let id = crate::agents::fixture::ID;
+        crate::agents::core_fixture::member(&w, id, json!({"name": "a", "pane": "%5"}));
+        let lead = "bbbbbbbbbbbb";
+        crate::agents::core_fixture::member(
+            &w,
+            lead,
+            json!({"name": "lead", "pane": "%8", "depth": 0, "upTeam": "T"}),
+        );
+        let caller = w.caller();
+        // H1 held in the member's parent pane mailbox, H2 in the leader's own.
+        held_h1(&w);
+        deliver_once(&w.ctx, &caller, lead, &sized(H2, 5000, "y")).unwrap();
+        let r = serve(&w.ctx, &caller, lead, &me("lead"), &|| true)
+            .unwrap()
+            .unwrap();
+        assert_eq!(r.refs, [H2]);
+        ack(&w.ctx, &caller, lead, &me("lead"), &r.batch, &|| true).unwrap();
+        let badge = counts(&w.ctx, &caller, lead).unwrap().badge;
+        let member = unread_counts(&w.ctx, &caller, "pane-1").unwrap();
+        assert_eq!((badge, member["a|%5"]), (1, 1), "{member:?}");
+        let before = crate::agents::cascade_fixture::snapshot(&w.ctx.state_root);
+        let leader = badge_mail(&w.ctx, &caller, lead).unwrap();
+        assert_eq!(leader.len(), badge, "the leader's popup");
+        assert!(leader[0].body.ends_with('y'), "the whole body");
+        let mine = badge_mail(&w.ctx, &caller, id).unwrap();
+        assert_eq!(mine.len(), member["a|%5"], "the member's popup");
+        assert!(mine[0].body.ends_with('x'), "the whole body");
+        // Read-only: both stay held.
+        assert_eq!(
+            crate::agents::cascade_fixture::snapshot(&w.ctx.state_root),
+            before
+        );
+        let mail = w.state().join("mail");
+        assert_eq!(receipt::load(&mail, "pane-1").unwrap().held, [H1]);
+        assert_eq!(receipt::load(&mail, lead).unwrap().held, [H2]);
+    }
+
+    #[test]
+    fn badge_mail_reads_by_id_never_by_a_name_equal_to_another_id() {
+        // An agent named as another agent's id: its popup is its own mail, and the other agent's popup is that one's.
+        let w = World::human("");
+        let (id, other) = (crate::agents::fixture::ID, "dddddddddddd");
+        crate::agents::core_fixture::member(&w, id, json!({"name": other, "pane": "%9"}));
+        crate::agents::core_fixture::member(&w, other, json!({"name": "worker2", "pane": "%7"}));
+        let caller = w.caller();
+        add_mail(&w.ctx, &caller, "pane-1", other, "%9", "mine", None).unwrap();
+        add_mail(&w.ctx, &caller, "pane-1", "worker2", "%7", "theirs", None).unwrap();
+        let bodies = |id: &str| {
+            badge_mail(&w.ctx, &caller, id)
+                .unwrap()
+                .into_iter()
+                .map(|r| r.body)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(bodies(id), ["mine"]);
+        assert_eq!(bodies(other), ["theirs"]);
+    }
+
+    #[test]
+    fn badge_mail_shows_all_senders_in_the_leaders_inherited_mailbox() {
+        let w = World::human("");
+        let id = crate::agents::fixture::ID;
+        let inherited = "cccccccccccc";
+        crate::agents::core_fixture::member(
+            &w,
+            id,
+            json!({"depth": 0, "upTeam": "T", "mailbox": inherited}),
+        );
+        let caller = w.caller();
+        add_mail(&w.ctx, &caller, inherited, "earlier", "%3", "read", None).unwrap();
+        read_mail(&w.ctx, &caller, inherited).unwrap();
+        for (from, body) in [("a", "one"), ("b", "two")] {
+            add_mail(&w.ctx, &caller, inherited, from, "%5", body, None).unwrap();
+        }
+        add_mail(&w.ctx, &caller, id, "a", "%5", "wrong mailbox", None).unwrap();
+        add_mail(&w.ctx, &caller, "pane-1", "worker", "%9", "outgoing", None).unwrap();
+        let before = crate::agents::cascade_fixture::snapshot(&w.ctx.state_root);
+        let badge = counts(&w.ctx, &caller, inherited).unwrap();
+        let reports = badge_mail(&w.ctx, &caller, id).unwrap();
+        assert_eq!(
+            reports
+                .iter()
+                .map(|r| (r.from.as_str(), r.body.as_str()))
+                .collect::<Vec<_>>(),
+            [("a", "one"), ("b", "two")]
+        );
+        assert_eq!(reports.len(), badge.badge);
+        assert_eq!(counts(&w.ctx, &caller, inherited).unwrap(), badge);
+        assert_eq!(
+            crate::agents::cascade_fixture::snapshot(&w.ctx.state_root),
+            before
+        );
+    }
+
+    #[test]
+    fn badge_mail_uses_the_running_parent_mailbox_only_on_the_recorded_server() {
+        use crate::agents::core_fixture as cf;
+        let id = crate::agents::fixture::ID;
+        let parent = "bbbbbbbbbbbb";
+        let inherited = "cccccccccccc";
+        for (team, away) in [(false, false), (false, true), (true, false)] {
+            let w = World::human("");
+            let child = cf::member(
+                &w,
+                id,
+                json!({"parentPane": "%8",
+                "parentServerKey": if away { json!("remote") } else { Value::Null },
+                "parentAgent": {"id": parent}, "depth": 1}),
+            );
+            let mut fields = json!({"pane": "%8", "mailbox": inherited, "depth": 0,
+                "startCommand": crate::agents::fixture::launch_command("%8")});
+            if team {
+                fields["upTeam"] = json!("T");
+            }
+            let lead = cf::member(&w, parent, fields);
+            let caller = w.caller();
+            w.panes(&["%8|@5|300|bbbbbbbbbbbb|worker"]);
+            add_mail(&w.ctx, &caller, inherited, "worker", "%9", "member", None).unwrap();
+            add_mail(
+                &w.ctx,
+                &caller,
+                "pane-remote-8",
+                "worker",
+                "%9",
+                "remote",
+                None,
+            )
+            .unwrap();
+            add_mail(&w.ctx, &caller, "pane-8", "worker", "%9", "pane", None).unwrap();
+            let take = || {
+                cf::online(&w);
+                cf::listing(&w, &crate::agents::membership::team(&caller), &[]);
+                for r in [&child, &lead] {
+                    cf::get(&w, r["hcAddress"].as_str().unwrap(), cf::wire(r));
+                }
+            };
+            take();
+            let reports = badge_mail(&w.ctx, &caller, id).unwrap();
+            w.fakes.hc_done().unwrap();
+            let want = if team {
+                vec!["member", "pane"]
+            } else if away {
+                vec!["remote"]
+            } else {
+                vec!["member"]
+            };
+            assert_eq!(
+                reports.iter().map(|r| r.body.as_str()).collect::<Vec<_>>(),
+                want,
+                "team={team}, away={away}"
+            );
+            take();
+            let board = crate::agents::board::board(&w.ctx, &caller, true, true).unwrap();
+            w.fakes.hc_done().unwrap();
+            let row = board["agents"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|r| r["id"] == id)
+                .unwrap();
+            assert_eq!(row["unread"], reports.len());
+        }
+    }
+
+    #[test]
+    fn badge_mail_follows_the_logical_parent_and_a_team_record_without_a_leader_row() {
+        use crate::agents::{core_fixture as cf, team};
+        let w = World::human("");
+        let id = crate::agents::fixture::ID;
+        let parent = "bbbbbbbbbbbb";
+        let successor = "cccccccccccc";
+        let caller = w.caller();
+        team::create(
+            &team::path(&w.state(), &caller.session),
+            &team::Team {
+                team: "T".into(),
+                session: caller.session.clone(),
+                name: "T".into(),
+                directory: "/work".into(),
+                client: crate::parse::Client::Claude,
+                flags: vec![],
+                policy: team::Policy::Default,
+                leader: "dddddddddddd".into(),
+                created_at: "x".into(),
+            },
+        )
+        .unwrap();
+        cf::member(&w, parent, json!({"depth": 1}));
+        cf::member(&w, successor, json!({"depth": 1, "resumedFrom": parent}));
+        cf::member(
+            &w,
+            id,
+            json!({"depth": 2, "parentPane": null, "parentAgent": {"id": parent}}),
+        );
+        add_member_mail(&w.ctx, &caller, parent, "worker", id, "%9", "old parent").unwrap();
+        add_member_mail(
+            &w.ctx,
+            &caller,
+            successor,
+            "worker",
+            id,
+            "%9",
+            "current parent",
+        )
+        .unwrap();
+        let before = crate::agents::cascade_fixture::snapshot(&w.ctx.state_root);
+
+        let reports = badge_mail(&w.ctx, &caller, id).unwrap();
+        assert_eq!(
+            reports.iter().map(|r| r.body.as_str()).collect::<Vec<_>>(),
+            ["current parent"]
+        );
+        assert_eq!(
+            crate::agents::cascade_fixture::snapshot(&w.ctx.state_root),
+            before
+        );
+    }
+
+    #[test]
+    fn badge_mail_uses_the_badges_tolerant_offset_without_migrating_it() {
+        let w = World::human("");
+        let id = crate::agents::fixture::ID;
+        crate::agents::core_fixture::member(&w, id, json!({}));
+        let caller = w.caller();
+        let mail = w.state().join("mail");
+        add_mail(&w.ctx, &caller, "pane-1", "worker", "%9", "first", None).unwrap();
+        let offset = std::fs::metadata(mail.join("pane-1.jsonl")).unwrap().len();
+        add_mail(&w.ctx, &caller, "pane-1", "worker", "%9", "second", None).unwrap();
+        for (raw, want) in [
+            ("garbage".into(), vec!["first", "second"]),
+            ("1".into(), vec!["first", "second"]),
+            ("99999".into(), vec!["first", "second"]),
+            (offset.to_string(), vec!["second"]),
+        ] {
+            std::fs::write(receipt::legacy_path(&mail, "pane-1"), raw).unwrap();
+            let before = crate::agents::cascade_fixture::snapshot(&w.ctx.state_root);
+            let reports = badge_mail(&w.ctx, &caller, id).unwrap();
+            assert_eq!(
+                reports.iter().map(|r| r.body.as_str()).collect::<Vec<_>>(),
+                want
+            );
+            assert_eq!(
+                unread_counts(&w.ctx, &caller, "pane-1").unwrap()["worker|%9"],
+                reports.len()
+            );
+            assert_eq!(
+                crate::agents::cascade_fixture::snapshot(&w.ctx.state_root),
+                before
+            );
+        }
+    }
 
     fn refusal<T: std::fmt::Debug>(result: Res<T>) -> String {
         let r = result.unwrap_err();

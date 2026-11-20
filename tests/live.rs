@@ -1899,10 +1899,10 @@ exec claude --dangerously-skip-permissions
         );
     }
 
-    // A bar's live row (S2.1): `◉ w[12] … working <n>[sm]`.
+    // A bar's working row (S2.1): `◉ w[12] … <n>[sm]`, no word, as the `Working` heading above it names the state.
     fn bar_row(line: &str) -> bool {
         let words: Vec<&str> = line.split_whitespace().collect();
-        let ["\u{25c9}", "w1" | "w2", "working", age] = words[..] else {
+        let ["\u{25c9}", "w1" | "w2", age] = words[..] else {
             return false;
         };
         age.len() >= 2
@@ -1910,25 +1910,29 @@ exec claude --dangerously-skip-permissions
             && age[..age.len() - 1].bytes().all(|b| b.is_ascii_digit())
     }
 
-    // A live row's state word, by the agent's name.
-    fn bar_word(screen: &str, name: &str) -> Option<String> {
-        screen.lines().find_map(|line| {
+    // The section heading (`Inbox`, `Working`, `Free`) an agent's row sits under, by the agent's name.
+    fn bar_section(screen: &str, name: &str) -> Option<String> {
+        let mut section = None;
+        for line in screen.lines() {
             let words: Vec<&str> = line.split_whitespace().collect();
-            (words.get(1) == Some(&name))
-                .then(|| words.get(2).map(|w| w.to_string()))
-                .flatten()
-        })
+            match words[..] {
+                [heading @ ("Inbox" | "Working" | "Free"), "\u{b7}", _] => {
+                    section = Some(heading.to_string())
+                }
+                [_, row, ..] if row == name => return section,
+                _ => {}
+            }
+        }
+        None
     }
 
     fn bar_ready(screen: &str) -> bool {
         let lines: Vec<&str> = screen.lines().map(str::trim).collect();
         let count = |f: &dyn Fn(&str) -> bool| lines.iter().filter(|l| f(l)).count();
-        // Both counts (no report yet: working), or the working count alone in a bar too narrow for both (a bar set
-        // to 30 columns).
+        // The working count (no report yet: working); the header never counts ended or free agents.
         let header = |l: &str| {
             let words: Vec<&str> = l.split_whitespace().collect();
-            words == ["mux-agents", "2", "working", "/", "0", "ended"]
-                || words == ["mux-agents", "2", "working"]
+            words == ["mux-agents", "2", "working"]
         };
         count(&header) == 1 && count(&|l| l == "checking the side bar") == 2 && count(&bar_row) == 2
     }
@@ -2000,10 +2004,9 @@ exec claude --dangerously-skip-permissions
     }
 
     // S2, the bar draws in color at its pane's size with nothing stray; an agent in `read -Wait` with no
-    // report holds a live lease, so it shows `on call` (W6) until mail wakes it, then `working` again, and its waiting
-    // file is gone. An agent whose
-    // client reports `blocked` comes first under herdr's `Needs you` heading, the header counting it; its next report
-    // moves it back.
+    // report holds a live lease, so it sits under `Free` (on call, W6) until mail wakes it, then under `Working` again,
+    // and its waiting file is gone. An agent whose client reports `blocked` comes first under the `Inbox` heading, the
+    // header counting it; its next report moves it back.
     fn bar_shows_waiting_then_working(mux: Mux) {
         let Some(mut live) = Live::human(mux) else {
             return;
@@ -2018,11 +2021,11 @@ exec claude --dangerously-skip-permissions
         let mut screen = String::new();
         let waiting = eventually(Duration::from_secs(30), || {
             screen = live.call(&["capture-pane", "-p", "-t", &bar]);
-            // Two states, so herdr's headings over compact rows: on call `◌ w1`, working `◉ w2`.
+            // The hub's headings over compact rows: on call `◌ w1` under Free, working `◉ w2` under Working.
             screen.contains("\u{25cc} w1")
                 && screen.contains("\u{25c9} w2")
-                && screen.contains("On call \u{b7} 1")
-                && screen.contains("Working \u{b7} 1")
+                && bar_section(&screen, "w1").as_deref() == Some("Free")
+                && bar_section(&screen, "w2").as_deref() == Some("Working")
         });
         assert!(waiting, "{mux:?}: the bar shows:\n{screen}");
         // w2's client asks the person: needs you, ranked first, counted in the header.
@@ -2034,11 +2037,12 @@ exec claude --dangerously-skip-permissions
         let blocked = eventually(Duration::from_secs(30), || {
             screen = live.call(&["capture-pane", "-p", "-t", &bar]);
             let rows = [row_at(&screen, "w2"), row_at(&screen, "w1")];
-            // Two states: herdr's headings, and under them the compact row (glyph, name, time).
+            // Inbox first, its row keeping the word (`needs you`); Free below; the header counts the inbox.
             screen.contains("! w2")
-                && screen.contains("Needs you \u{b7} 1")
-                && screen.contains("On call \u{b7} 1")
-                && screen.contains("1 need you")
+                && bar_section(&screen, "w2").as_deref() == Some("Inbox")
+                && bar_section(&screen, "w1").as_deref() == Some("Free")
+                && screen.contains("needs you")
+                && screen.contains("1 inbox")
                 && matches!(rows, [Some(a), Some(b)] if a < b)
         });
         assert!(blocked, "{mux:?}: the bar shows:\n{screen}");
@@ -2058,7 +2062,7 @@ exec claude --dangerously-skip-permissions
         support::write_atomic(&live.dir.join(format!("cmd.{pid2}")), "report\tworking\n");
         let unblocked = eventually(Duration::from_secs(30), || {
             screen = live.call(&["capture-pane", "-p", "-t", &bar]);
-            screen.contains("\u{25c9} w2") && !screen.contains("need you")
+            screen.contains("\u{25c9} w2") && !screen.contains("Inbox")
         });
         assert!(unblocked, "{mux:?}: the bar shows:\n{screen}");
         bar_clean(&live, &bar, &screen);
@@ -2085,7 +2089,7 @@ exec claude --dangerously-skip-permissions
         );
         let back = eventually(Duration::from_secs(30), || {
             screen = live.call(&["capture-pane", "-p", "-t", &bar]);
-            bar_word(&screen, "w1").as_deref() == Some("working")
+            bar_section(&screen, "w1").as_deref() == Some("Working")
         });
         assert!(back, "{mux:?}: the bar shows:\n{screen}");
         assert_eq!(files(), Vec::<String>::new(), "{mux:?}");
@@ -3147,7 +3151,7 @@ hc {}:
         let Some(mut live) = Live::human(mux) else {
             return;
         };
-        for n in 1..=5 {
+        for n in 1..=9 {
             live.spawn(&format!("w{n}"), &[]);
         }
         let other = live.dir.join("other");
@@ -3159,8 +3163,8 @@ hc {}:
             other.join("home").display().to_string(),
         );
         let (a, b) = (
-            live.spawn_args("claude", "w6", &[]),
-            live.spawn_args("claude", "w7", &[]),
+            live.spawn_args("claude", "w10", &[]),
+            live.spawn_args("claude", "w11", &[]),
         );
         let a: Vec<&str> = a.iter().map(String::as_str).collect();
         let b: Vec<&str> = b.iter().map(String::as_str).collect();
@@ -3177,7 +3181,7 @@ hc {}:
         results.sort_by_key(|(code, _)| *code);
         assert_eq!((results[0].0, results[1].0), (0, 2), "{mux:?} {results:?}");
         assert_eq!(results[1].1["check"], "cap", "{mux:?} {results:?}");
-        assert_eq!(live.tagged().len(), 6, "{mux:?}");
+        assert_eq!(live.tagged().len(), 10, "{mux:?}");
     }
 
     // Two `-Name w` spawns at once across state roots: one wins, the other is refused 2 `name`; one pane.
@@ -3971,17 +3975,129 @@ hc {}:
         assert!(!marker.exists());
         assert!(exit_messages(&live, &w1).is_empty());
         support::write_atomic(&live.dir.join(format!("quit.{pid}")), "7\n");
-        assert!(eventually(LONG, || {
-            let screen = live.call(&["capture-pane", "-p", "-t", &bar]);
-            marker.exists()
-                && screen.contains("1 working")
-                && screen.contains("1 ended")
-                && screen
+        // w1 leaves the live sections for the folded `Ended · 1` line.
+        let mut screen = String::new();
+        assert!(
+            eventually(LONG, || {
+                screen = live.call(&["capture-pane", "-p", "-t", &bar]);
+                marker.exists()
+                    && screen.contains("1 working")
+                    && screen.contains("Ended \u{b7} 1")
+                    && row_at(&screen, "w1").is_none()
+            }),
+            "{mux:?}: the bar shows:\n{screen}"
+        );
+        // Tab opens the fold: w1's row shows how it ended, with its exit code.
+        live.call(&["send-keys", "-t", &bar, "Tab"]);
+        assert!(
+            eventually(LONG, || {
+                screen = live.call(&["capture-pane", "-p", "-t", &bar]);
+                screen
                     .lines()
                     .any(|l| l.contains("w1") && l.contains("exited 7"))
-        }));
+            }),
+            "{mux:?}: the opened fold shows:\n{screen}"
+        );
         assert_eq!(json_file(&marker)["kind"], "exited");
         assert_eq!(exit_messages(&live, &w1).len(), 1);
+    }
+    // Enter on an ended agent's row resumes it off the bar's loop, on the bar's real worker thread: the bar keeps
+    // drawing (the row says `resuming…` while it runs, unless the board has the successor first), then w1 runs again
+    // as a new terminal, its view in a new window (a tab), and that view is the pane in front.
+    fn bar_enter_resumes_an_ended_agent_as_a_tab(mux: Mux) {
+        let Some(mut live) = Live::human(mux) else {
+            return;
+        };
+        // Both beside the caller: the window keeps w2's view, and so its bar, when w1 stops.
+        let w1 = live.spawn("w1", &["-Split", "h"]);
+        let w2 = live.spawn("w2", &["-Split", "h"]);
+        let bar = s(&w1["sidebar"]).to_string();
+        live.ready(&w1);
+        live.ready(&w2);
+        crate::ready::wait_conversation(live.dir.path(), s(&w1["sessionId"]));
+        live.log_frames(&bar);
+        let (code, stop) = live.run(&["stop", "w1"]);
+        assert_eq!(code, 0, "{mux:?} {stop}");
+        // Its terminal finished, so its conversation is free to resume (as `stop_then_resume_returns_...` waits).
+        let address = s(&w1["hcAddress"]).to_string();
+        assert!(
+            eventually(LONG, || core(&live, &["get", &address, "--json"])["state"]
+                == "finished"),
+            "{mux:?}"
+        );
+        let mut screen = String::new();
+        assert!(
+            eventually(LONG, || {
+                screen = live.call(&["capture-pane", "-p", "-t", &bar]);
+                screen.contains("Ended \u{b7} 1") && row_at(&screen, "w1").is_none()
+            }),
+            "{mux:?}: the bar shows:\n{screen}"
+        );
+        // Tab opens the fold; `G` selects its last row, w1's; Enter resumes it.
+        live.call(&["send-keys", "-t", &bar, "Tab"]);
+        assert!(
+            eventually(LONG, || {
+                screen = live.call(&["capture-pane", "-p", "-t", &bar]);
+                row_at(&screen, "w1").is_some()
+            }),
+            "{mux:?}: the opened fold shows:\n{screen}"
+        );
+        live.call(&["send-keys", "-t", &bar, "-l", "G"]);
+        live.after_redraw(&bar);
+        let before = live.frames(&bar);
+        live.call(&["send-keys", "-t", &bar, "Enter"]);
+        // The successor: w1 running again, in a new terminal.
+        let mut listed = Value::Null;
+        assert!(
+            eventually(LONG, || {
+                listed = live.run(&["list"]).1;
+                (listed["agents"].as_array().into_iter().flatten()).any(|r| {
+                    r["name"] == "w1"
+                        && r["state"] == "running"
+                        && r["hcAddress"] != w1["hcAddress"]
+                })
+            }),
+            "{mux:?}: list: {listed}\nthe bar shows:\n{}",
+            live.call(&["capture-pane", "-p", "-t", &bar])
+        );
+        let agents = live.agent_dir(s(&w1["id"])).parent().unwrap().to_path_buf();
+        let successor = std::fs::read_dir(&agents)
+            .unwrap()
+            .flatten()
+            .find_map(|e| {
+                let text = std::fs::read_to_string(e.path().join("record.json")).ok()?;
+                let r: Value = serde_json::from_str(&text).ok()?;
+                (r["resumedFrom"] == w1["id"]).then(|| s(&r["id"]).to_string())
+            })
+            .unwrap_or_else(|| panic!("{mux:?}: no member resumed from w1"));
+        // Its view is a new window, neither the caller's nor w2's, and it is the pane in front.
+        let view = live.view_of(&successor);
+        let pane = s(&view["pane"]).to_string();
+        let window = live.field(&pane, "#{window_id}");
+        assert_ne!(
+            window,
+            live.field(live.server.pane(), "#{window_id}"),
+            "{mux:?}: a new window"
+        );
+        assert_ne!(
+            window,
+            live.field(s(&w2["pane"]), "#{window_id}"),
+            "{mux:?}: not w2's window"
+        );
+        wait_focused(&live, &pane, "Enter on w1's ended row");
+        // The bar drew while the resume ran and draws on after it: `resuming…` on the row, or already the successor.
+        let frames =
+            String::from_utf8_lossy(&std::fs::read(live.frames_path(&bar)).unwrap()).into_owned();
+        assert!(
+            live.frames(&bar) > before,
+            "{mux:?}: the bar drew after Enter"
+        );
+        live.wait_tick(&bar);
+        screen = live.call(&["capture-pane", "-p", "-t", &bar]);
+        assert!(
+            frames.contains("resuming") || row_at(&screen, "w1").is_some(),
+            "{mux:?}: the bar shows:\n{screen}"
+        );
     }
     fn kill_dead_view(live: &Live, w: &Value) {
         let r = live.view_of(s(&w["id"]));
@@ -5507,7 +5623,8 @@ hc {}:
                 );
                 std::fs::remove_file(&file).unwrap();
             }
-            // Opening the ended grand shows its retained output (`hc read`, plain text); nothing restarts.
+            // `p` on the ended grand shows its retained output (`hc read`, plain text); nothing restarts. (Enter would
+            // resume it as a tab.)
             let kept = read(&live);
             assert!(
                 kept.contains(&marker),
@@ -5546,8 +5663,7 @@ hc {}:
                 );
                 from
             });
-            live.call(&["send-keys", "-t", &bars[0], "-l", "jjj"]);
-            live.call(&["send-keys", "-t", &bars[0], "Enter"]);
+            live.call(&["send-keys", "-t", &bars[0], "-l", "jjjp"]);
             match (&client, from) {
                 (Some(client), Some(from)) => {
                     let server: u64 = live.field(live.server.pane(), "#{pid}").parse().unwrap();
@@ -6378,6 +6494,18 @@ hc {}:
         ]
     );
 
+    // The bar's Enter resumes on its worker thread, against a real multiplexer and hc.
+    tests_on!(
+        tmux38_bar_resume,
+        Tmux38,
+        [bar_enter_resumes_an_ended_agent_as_a_tab]
+    );
+    tests_on!(
+        rmux_bar_resume,
+        Rmux,
+        [bar_enter_resumes_an_ended_agent_as_a_tab]
+    );
+
     // tmux 3.2a's display-popup has no -T (QA): peek works there too.
     tests_on!(tmux32_peek, Tmux32, [bar_real_client_peek]);
     // break-pane is tmux's; rmux 0.10 is not known to have it.
@@ -6445,11 +6573,11 @@ hc {}:
         // cascade-3d: stopping g1 stops its sub-tree; h1 is ended and noticed too.
         let notice = json_file(&live.gen_file(&h1, "notice.json"));
         assert_eq!(notice["kind"], "stopped", "{mux:?} h1 stopped with g1");
-        // Live besides the leader: c1, c2; four more make six, a 7th refuses.
-        for name in ["c3", "c4", "c5", "c6"] {
+        // Live besides the leader: c1, c2; eight more make ten (`MAX_MEMBERS`), an 11th refuses.
+        for name in ["c3", "c4", "c5", "c6", "c7", "c8", "c9", "c10"] {
             ok(&mut live, &leader, name);
         }
-        let (code, r) = live.spawn_by(&leader, "c7");
+        let (code, r) = live.spawn_by(&leader, "c11");
         assert_eq!(
             (code, r["check"].as_str()),
             (2, Some("limit")),

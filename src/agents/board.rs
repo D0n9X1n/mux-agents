@@ -4,7 +4,7 @@ use std::collections::{BTreeMap, HashMap};
 
 use serde_json::{Map, Value};
 
-use super::mail::{doing_line, unread_counts};
+use super::mail::{doing_line, unread_lines};
 use super::registry;
 use crate::caller::Caller;
 use crate::ctx::Ctx;
@@ -207,7 +207,8 @@ pub fn board(ctx: &Ctx, caller: &Caller, all: bool, watch: bool) -> Res<Map<Stri
     let mut keys: Vec<_> = if watch {
         members
             .iter()
-            .filter(|o| o.life == Life::Running || leader.is_some())
+            // An ended agent's too: the reports it left unread hold its row in Inbox (local mailbox reads only).
+            .filter(|o| matches!(o.life, Life::Running | Life::Ended) || leader.is_some())
             .flat_map(|o| match parents.get(&o.identity.id) {
                 Some(boxes) => boxes.clone(),
                 None => parent_key(&snapshot.records[&o.identity.id].record, &panes, away)
@@ -222,7 +223,7 @@ pub fn board(ctx: &Ctx, caller: &Caller, all: bool, watch: bool) -> Res<Map<Stri
     keys.dedup();
     let mut unread = HashMap::new();
     for key in keys {
-        unread.insert(key.clone(), unread_counts(ctx, caller, &key)?);
+        unread.insert(key.clone(), unread_lines(ctx, caller, &key)?);
     }
     let rows = Rows {
         ctx,
@@ -286,59 +287,68 @@ pub fn board(ctx: &Ctx, caller: &Caller, all: bool, watch: bool) -> Res<Map<Stri
         )
     });
     other.sort_by(|a, b| a.0.identity.id.cmp(&b.0.identity.id));
-    let make =
-        |o: &super::core_facts::Observation, notice: Option<&Value>| -> Res<Map<String, Value>> {
-            let id = &o.identity.id;
-            let record = &snapshot.records[id].record;
-            let live = o.life == Life::Running;
-            let mut row = rows.row(
-                id,
-                record,
-                super::text(record.get("pane")),
-                &super::text(record.get("window")),
-                if live { "running" } else { "unknown" },
-            )?;
-            // Call 18a: the selected identity's session (a held one's is its pending generation's), in place.
-            row.insert("sessionId".into(), o.identity.session_id.clone().into());
-            // outcome-2 O6: the one predicate's answer, on this row only.
-            match recovery.get(id) {
-                Some(Ok(Some(r))) => {
-                    row.insert("needsRecovery".into(), true.into());
-                    row.insert("recoveryReason".into(), r.reason.clone().into());
-                    row.insert("recoveryRunning".into(), r.running.into());
-                }
-                Some(Err(e)) => {
-                    row.insert("recoveryError".into(), e.check.into());
-                }
-                _ => {}
+    let now = ctx.clock.now();
+    let ago = |at: std::time::SystemTime| now.duration_since(at).map_or(0, |d| d.as_secs());
+    // `ended`: when an Ended member ended (its notice's `at`), for the bar's `endedAgo`.
+    let make = |o: &super::core_facts::Observation,
+                notice: Option<&Value>,
+                ended: Option<std::time::SystemTime>|
+     -> Res<Map<String, Value>> {
+        let id = &o.identity.id;
+        let record = &snapshot.records[id].record;
+        let live = o.life == Life::Running;
+        let mut row = rows.row(
+            id,
+            record,
+            super::text(record.get("pane")),
+            &super::text(record.get("window")),
+            if live { "running" } else { "unknown" },
+        )?;
+        // Call 18a: the selected identity's session (a held one's is its pending generation's), in place.
+        row.insert("sessionId".into(), o.identity.session_id.clone().into());
+        // outcome-2 O6: the one predicate's answer, on this row only.
+        match recovery.get(id) {
+            Some(Ok(Some(r))) => {
+                row.insert("needsRecovery".into(), true.into());
+                row.insert("recoveryReason".into(), r.reason.clone().into());
+                row.insert("recoveryRunning".into(), r.running.into());
             }
-            match waiting.get(id) {
-                Some(Ok(true)) => {
-                    row.insert("restore".into(), "waiting".into());
-                }
-                Some(Err(e)) => {
-                    row.insert("restoreError".into(), e.check.into());
-                }
-                _ => {}
+            Some(Err(e)) => {
+                row.insert("recoveryError".into(), e.check.into());
             }
-            if !live {
-                if let Some(closed) = notice
-                    .and_then(|n| n.get("closedBy"))
-                    .and_then(Value::as_str)
-                {
-                    row.insert("closedBy".into(), closed.into());
-                }
-                row.insert("exitCode".into(), Value::Null);
+            _ => {}
+        }
+        match waiting.get(id) {
+            Some(Ok(true)) => {
+                row.insert("restore".into(), "waiting".into());
             }
-            // `list -All` offers the command that starts an ended member again; the bar's feed does not.
-            if all && !watch && o.life == Life::Ended {
-                row.insert("resume".into(), format!("mux-agent resume {id}").into());
+            Some(Err(e)) => {
+                row.insert("restoreError".into(), e.check.into());
             }
-            Ok(hc_row(row, o, snapshot.views.get(id)))
-        };
+            _ => {}
+        }
+        if !live {
+            if let Some(closed) = notice
+                .and_then(|n| n.get("closedBy"))
+                .and_then(Value::as_str)
+            {
+                row.insert("closedBy".into(), closed.into());
+            }
+            row.insert("exitCode".into(), Value::Null);
+        }
+        // `list -All` offers the command that starts an ended member again; the bar's feed does not.
+        if all && !watch && o.life == Life::Ended {
+            row.insert("resume".into(), format!("mux-agent resume {id}").into());
+        }
+        // The bar's open fold judges an ended agent by when it ended, not when it started.
+        if let (true, Some(at)) = (watch, ended) {
+            row.insert("endedAgo".into(), ago(at).into());
+        }
+        Ok(hc_row(row, o, snapshot.views.get(id)))
+    };
     let mut agents = running
         .into_iter()
-        .map(|o| make(o, None))
+        .map(|o| make(o, None, None))
         .collect::<Res<Vec<_>>>()?;
     // A 0.2.x pane-based member still running after the upgrade is listed as 0.2.8 listed it, so a person sees it.
     for (p, record, window) in super::prelife::live_panes(ctx, caller) {
@@ -353,23 +363,31 @@ pub fn board(ctx: &Ctx, caller: &Caller, all: bool, watch: bool) -> Res<Map<Stri
         (rank(row), changed.is_none(), std::cmp::Reverse(changed))
     });
     for (o, notice) in other {
-        agents.push(make(o, notice.as_ref())?);
+        agents.push(make(o, notice.as_ref(), None)?);
     }
-    // Call 13: a member that needs recovery, or whose recovery could not be decided, is always listed.
+    // Call 13: a member that needs recovery, or whose recovery could not be decided, is always listed. The bar's feed
+    // also keeps every agent that ended within `ENDED_RECENT`, so each one its open fold lists can be selected; only
+    // the older ones are capped, and each ended row says how long ago it ended (`endedAgo`, from its notice's `at`).
     let cap = if leader.is_some() {
         usize::MAX
     } else {
         ENDED_MAX
     };
     let mut kept = 0;
-    for (_, o, notice) in ended {
-        if !flagged(&o.identity.id) && !restoring(&o.identity.id) {
+    for (at, o, notice) in ended {
+        let recent = watch && at.is_some_and(|at| ago(at) < ENDED_RECENT);
+        // On the bar, a member that left a report unread stands in Inbox, so the cap never drops it.
+        let mailed = || {
+            let record = &snapshot.records[&o.identity.id].record;
+            watch && rows.unread_of(&o.identity.id, record, &super::text(record.get("pane"))) > 0
+        };
+        if !flagged(&o.identity.id) && !restoring(&o.identity.id) && !recent && !mailed() {
             if kept == cap {
                 continue;
             }
             kept += 1;
         }
-        agents.push(make(o, notice.as_ref())?);
+        agents.push(make(o, notice.as_ref(), at)?);
     }
     let mut reply = Map::new();
     reply.insert("running".into(), count.into());
@@ -478,8 +496,12 @@ fn note_blocked(reply: &mut Map<String, Value>, blocked: &[Blocked]) {
     }
 }
 
-/// Ended agents a board (`list -All`) shows, newest first.
+/// Ended agents a board (`list -All`) shows, newest first; the bar's feed shows as many older than `ENDED_RECENT`.
 pub(crate) const ENDED_MAX: usize = 10;
+
+/// An agent that ended less than this many seconds ago is recent: the bar's feed always carries it, and its open
+/// ended fold lists it; the older ones fold into `+N older`.
+pub(crate) const ENDED_RECENT: u64 = 3600;
 
 /// Records the viewed done spell `changed` under the agent lock, never moving seen.json backward.
 /// Requires a unique committed attachment on `pane`; historical notices do not invalidate view proof.
@@ -491,11 +513,39 @@ pub fn mark_seen(ctx: &Ctx, caller: &Caller, pane: &str, changed: &str) -> Res<b
     let Some(agent) = snapshot.view_at(pane) else {
         return Ok(false);
     };
+    seen_at(ctx, caller, &agent.id, changed, at)
+}
+
+/// `mark_seen` of member `id` itself, for a done member with no view (the side bar's Space): no pane to resolve, so
+/// only an agent id whose member has a record here is marked. Same lock, same never-backward rule.
+pub fn mark_seen_id(ctx: &Ctx, caller: &Caller, id: &str, changed: &str) -> Res<bool> {
+    let Some(at) = parse_utc(changed) else {
+        return Ok(false);
+    };
+    if !super::agent_id(id) {
+        return Ok(false);
+    }
+    let member = super::server_dir(ctx, caller).join("agents").join(id);
+    if !member.join("record.json").is_file() {
+        return Ok(false);
+    }
+    seen_at(ctx, caller, id, changed, at)
+}
+
+/// Writes `seen.json` of member `id` as `changed` (parsed: `at`) under its agent lock, unless it already names a
+/// spell as new or newer.
+fn seen_at(
+    ctx: &Ctx,
+    caller: &Caller,
+    id: &str,
+    changed: &str,
+    at: std::time::SystemTime,
+) -> Res<bool> {
     let file = super::state_dir(ctx, caller)?
         .join("agents")
-        .join(&agent.id)
+        .join(id)
         .join("seen.json");
-    super::lock(ctx, &super::lock_key("agent", caller, &agent.id), || {
+    super::lock(ctx, &super::lock_key("agent", caller, id), || {
         let old = read_json(&file)
             .ok()
             .flatten()

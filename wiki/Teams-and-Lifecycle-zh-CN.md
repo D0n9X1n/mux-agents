@@ -70,8 +70,8 @@ mux-agent up -Client claude -- --model opus
 | 限制 | 值 | 定义位置 | 拒绝 |
 |---|---|---|---|
 | 深度 | 3 | `MAX_DEPTH`，`src/agents/tree.rs` | `depth` |
-| 领导者之外的成员 | 6 | `MAX_MEMBERS`，`src/agents/tree.rs` | `limit` |
-| 一个复用器会话中的存活智能体 | 6 | 启动上限 | `cap` |
+| 领导者之外的成员 | 10 | `MAX_MEMBERS`，`src/agents/tree.rs` | `limit` |
+| 一个复用器会话中的存活智能体 | 10 | 启动上限 | `cap` |
 | 启动预算 | 20 个令牌，每 180 秒多一个 | `src/agents/budget.rs`；会话选项 `@mux-agents-spawn-budget` 和 `@mux-agents-spawn-refill`，1-86400 | `budget`，并说明下一个令牌何时到来 |
 
 一次 `spawn` 和一次成员的 `resume` 各消耗一个预算令牌；被拒绝的请求不消耗。
@@ -113,7 +113,7 @@ mux-agent peek <name> -Lines 120
 - `name`：同名成员正在运行；
 - `leader`：领导者永远不会被恢复；
 - `session`：本机上某个进程可能仍持有该对话；消息会说出该进程（pid 和映像）或成员，以及成立的规则；
-- `cap`：会话中已有 6 个存活智能体。
+- `cap`：会话中已有 10 个存活智能体。
 
 当成员的当前代失败时，侧边栏把它标为 `recover` 并附上原因（例如 `recover: exited 1`），失败的代尚未结束时标为 `recover (still running)`，`list` 会设置 `needsRecovery`。把它作为下一代重试：
 
@@ -170,9 +170,9 @@ mux-agent stop <name>
 | `endpoint` | 在 tmux 或 rmux 窗格之外运行 `up` | 启动复用器并在其窗格中运行 |
 | `views` | 团队视图不可用时成员运行视图动词 | 运行 `up` |
 | `depth` | 深度 3 以下的子智能体 | 让更浅的成员来启动它 |
-| `limit` | 领导者之外已有 6 个成员 | `stop` 一个 |
+| `limit` | 领导者之外已有 10 个成员 | `stop` 一个 |
 | `budget` | 团队的启动预算已用完 | 等待下一个令牌，或调高 `@mux-agents-spawn-budget` |
-| `cap` | 会话中已有 6 个存活智能体 | `stop` 一个 |
+| `cap` | 会话中已有 10 个存活智能体 | `stop` 一个 |
 | `life` | `resume` 正在运行、已丢失或状态未知的成员 | 先 `stop` 它，或 `restore` 丢失的成员 |
 | `taken` | `resume` 已被恢复过的成员 | 恢复消息中点名的后继者 |
 | `session` | 某个进程可能仍持有该对话 | 结束消息中点名的进程 |

@@ -112,15 +112,19 @@ fn the_limit_counts_live_and_pending_members_besides_the_leader() {
             .collect();
         limit(&snap(&rows, reserved))
     };
-    assert!(check(5, Life::Running, 0).is_ok());
+    assert!(check(MAX_MEMBERS - 1, Life::Running, 0).is_ok());
     let full = refuse::<()>(
         2,
         "limit",
-        "the team already has 6 members besides the leader",
+        format!("the team already has {MAX_MEMBERS} members besides the leader"),
     );
-    assert_eq!(check(6, Life::Running, 0), full);
-    assert_eq!(check(5, Life::Running, 1), full, "a pending member counts");
-    assert!(check(6, Life::Ended, 0).is_ok());
+    assert_eq!(check(MAX_MEMBERS, Life::Running, 0), full);
+    assert_eq!(
+        check(MAX_MEMBERS - 1, Life::Running, 1),
+        full,
+        "a pending member counts"
+    );
+    assert!(check(MAX_MEMBERS, Life::Ended, 0).is_ok());
     assert!(check_depth(3).is_ok());
     assert_eq!(
         check_depth(4),
@@ -493,14 +497,19 @@ fn admission_runs_in_v5_order() {
     std::fs::remove_dir_all(w.folder(LEADER)).unwrap();
     team_record(&w, &[]);
     let team = team_of(&w.ctx, &c).unwrap().unwrap();
-    let i = ids(6);
-    let parents = [LEADER, i[0].as_str(), i[1].as_str(), LEADER, LEADER, LEADER];
+    // A full team: a chain leader -> i0 -> i1 -> i2 (depths 1-3), every other member a child of the leader.
+    let i = ids(MAX_MEMBERS);
     cf::member(&w, LEADER, leader_record());
     for (n, id) in i.iter().enumerate() {
+        let parent = if (1..3).contains(&n) {
+            i[n - 1].as_str()
+        } else {
+            LEADER
+        };
         cf::member(
             &w,
             id,
-            child(id, parents[n], if n < 3 { n as u64 + 1 } else { 1 }),
+            child(id, parent, if n < 3 { n as u64 + 1 } else { 1 }),
         );
     }
     let rec = |id: &str| {
@@ -528,25 +537,25 @@ fn admission_runs_in_v5_order() {
         "limit"
     );
     rows.pop();
-    let (five, budget) = (
+    let (short, budget) = (
         snap(&rows, 0),
         crate::agents::budget::path(&w.state(), "$3"),
     );
-    let taken = place(&w.ctx, &c, &a, &five, Client::Claude, None, || {
+    let taken = place(&w.ctx, &c, &a, &short, Client::Claude, None, || {
         refuse(2, "name", "taken")
     });
     assert_eq!(taken.unwrap_err().check, "name");
     assert!(!budget.exists(), "a name refusal spends no token");
     write(&budget, json!({"tokens": 0, "at": 0}));
     assert_eq!(
-        place(&w.ctx, &c, &a, &five, Client::Claude, None, kid)
+        place(&w.ctx, &c, &a, &short, Client::Claude, None, kid)
             .unwrap_err()
             .check,
         "budget",
         "budget last"
     );
     let pa = admit(&w.ctx, &c, &team, Standing::Person).unwrap();
-    let p = place(&w.ctx, &c, &pa, &five, Client::Claude, None, kid).unwrap();
+    let p = place(&w.ctx, &c, &pa, &short, Client::Claude, None, kid).unwrap();
     assert_eq!(
         (
             p.depth,
@@ -565,7 +574,7 @@ fn admission_runs_in_v5_order() {
         "a person's child: leader, free"
     );
     std::fs::remove_file(&budget).unwrap();
-    let m = place(&w.ctx, &c, &a, &five, Client::Claude, None, kid).unwrap();
+    let m = place(&w.ctx, &c, &a, &short, Client::Claude, None, kid).unwrap();
     assert_eq!(
         (m.depth, &m.parent["id"], m.directory.as_deref()),
         (3, &json!(i[1]), Some("/work"))
@@ -665,11 +674,12 @@ fn a_child_inherits_the_lower_of_its_parent_and_the_ceiling() {
     );
 }
 #[test]
-fn of_two_racing_spawns_at_six_one_wins() {
+fn of_two_racing_spawns_at_the_limit_one_wins() {
     let w = World::human("");
     team_record(&w, &[]);
     cf::member(&w, LEADER, leader_record());
-    for id in ids(5) {
+    // One slot short of the limit: the first spawn fills it, the second is refused.
+    for id in ids(MAX_MEMBERS - 1) {
         cf::member(&w, &id, child(&id, LEADER, 1));
     }
     let (state, locks) = (
@@ -987,7 +997,8 @@ fn resume_case(case: &str) -> (Mw, Res<Map<String, Value>>, String, Held) {
     let mut rows: Vec<Value> = [LEADER, ID, OTHER].iter().map(|id| m.record(id)).collect();
     rows.extend(extra);
     if case == "limit" {
-        for id in ids(4) {
+        // ID and OTHER and these fill the team besides the leader.
+        for id in ids(MAX_MEMBERS - 2) {
             rows.push(cf::member(&m.w, &id, child(&id, LEADER, 1)));
         }
     }
@@ -1177,11 +1188,12 @@ fn a_persons_resume_is_free() {
 /// the team ceiling first (E2, p1c delivery call: fail closed), then limit, then name.
 #[test]
 fn resume_refuses_in_v5_order() {
+    // The twin and `more` children are the members besides the leader: `MAX_MEMBERS - 1` more fills the team.
     for (more, bypass, check) in [
-        (5, false, "ceiling"),
-        (5, true, "limit"),
-        (4, false, "ceiling"),
-        (4, true, "name"),
+        (MAX_MEMBERS - 1, false, "ceiling"),
+        (MAX_MEMBERS - 1, true, "limit"),
+        (MAX_MEMBERS - 2, false, "ceiling"),
+        (MAX_MEMBERS - 2, true, "name"),
     ] {
         let w = World::human("");
         team_record(

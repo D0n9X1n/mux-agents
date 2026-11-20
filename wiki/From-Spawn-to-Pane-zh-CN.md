@@ -77,7 +77,7 @@ sequenceDiagram
 - 在团队中，`tree::admit` 检查调用方的身份和子智能体的深度：领导者深度为 0，子智能体深度最多为 3（`tree::MAX_DEPTH`），否则为 `depth`；子智能体的父级不能已被停止关闭。
 - 自快照以来代次已结束的成员会被回收（`registry::reap_hc` 记录结束并向父级发出通知），若因此有变化，则重新获取快照。
 - 若智能体调用方的子智能体将从简报而非其对话的分叉启动，则必须传入 `-BriefFile`，否则为 `brief`。
-- 在团队之外，当会话已有 6 个存活智能体时，`Snapshot::admit_name` 拒绝为 `cap`。在团队中，`tree::place` 依次检查 `limit`（领导者之外 6 个成员，`tree::MAX_MEMBERS`）、团队记录固定的 `ceiling`、名称，最后是该成员的启动 `budget`。
+- 在团队之外，当会话已有 10 个存活智能体时，`Snapshot::admit_name` 拒绝为 `cap`。在团队中，`tree::place` 依次检查 `limit`（领导者之外 10 个成员，`tree::MAX_MEMBERS`）、团队记录固定的 `ceiling`、名称，最后是该成员的启动 `budget`。
 - 名称为 `-Name`，或由任务推导出的名称，在会话中唯一（`checks::resolve_name`），否则为 `name`。
 - 颜色取存活智能体使用最少的调色板条目（`paint::PALETTE`）。
 

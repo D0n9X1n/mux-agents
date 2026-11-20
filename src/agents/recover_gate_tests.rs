@@ -3,7 +3,7 @@
 use super::core_fixture as cf;
 use super::core_launch::forward_tests as ft;
 use super::fixture::World;
-use super::reconcile_await_tests::{six_running, snapshot};
+use super::reconcile_await_tests::{full_running, snapshot};
 use super::reconcile_restore_tests::{L, released_by_hc, unmanaged_claude};
 use super::reconcile_tests::{X, found, member, wire_of};
 use super::reconcile_verb_tests::{person, team};
@@ -48,10 +48,10 @@ pub(crate) fn gate_case(case: &str, action: Action) -> (World, PathBuf, Got) {
                 r#"{"terminals":[]}"#,
             );
         }
-        // the cap: six Running members hold every slot
+        // the cap: Running members hold every slot
         "capped" => {
             failed_ended(&f, 1);
-            let live: Vec<String> = six_running(&w).iter().map(|id| format!("a{id}")).collect();
+            let live: Vec<String> = full_running(&w).iter().map(|id| format!("a{id}")).collect();
             let live: Vec<&str> = live.iter().map(String::as_str).collect();
             snapshot(&w, &live, &[&format!("a{L}"), &format!("a{X}")]);
         }
@@ -231,13 +231,13 @@ fn a_retry_waits_for_an_unresolved_pending_generation() {
     }
 }
 
-/// 6b L1: the leader takes no cap slot; its retry launches beside six Running members with no listing.
+/// 6b L1: the leader takes no cap slot; its retry launches beside a full team of Running members with no listing.
 #[test]
 fn the_leaders_retry_takes_no_slot() {
     let w = person();
     let lead = member(&w, L, json!({"depth": 0, "upTeam": "T", "name": "leader"}));
     failed_ended(&lead, 1);
-    six_running(&w);
+    full_running(&w);
     w.fakes.hc_answer(ft::address("t2")); // the one connection is forward's
     let reply = recover(&w.ctx, &w.caller(), Action::Retry, L)
         .unwrap()

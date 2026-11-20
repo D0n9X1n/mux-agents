@@ -26,7 +26,7 @@ The commands below, and the Reply and Listen lines, run as-is in the Bash tool. 
 - A narrow side bar beside you shows how many agents run and what each is doing. It opens when the person's chat starts in tmux or rmux, and on the first `spawn`. `sidebar -Close` closes it for the session; `sidebar` opens it again.
 - Never type into panes.
 - Run `focus` only when the user asks.
-- In a team (started with `up`), a member may spawn its own children, down to depth 3, while the team has fewer than 6 members besides the leader and spawn budget left. Outside a team, children cannot spawn.
+- In a team (started with `up`), a member may spawn its own children, down to depth 3, while the team has fewer than 10 members besides the leader and spawn budget left. Outside a team, children cannot spawn.
 
 ## Commands
 
@@ -62,6 +62,7 @@ The commands below, and the Reply and Listen lines, run as-is in the Bash tool. 
 "<entry>" peek <name> -Lines <n>
 "<entry>" stop <name>
 "<entry>" resume <name>
+"<entry>" resume <name> -Tab
 "<entry>" sidebar
 "<entry>" sidebar -Close
 "<entry>" version
@@ -117,8 +118,8 @@ Your first message names the notebook and lists its newest titles. When another 
 - `directory`: the caller's launch directory cannot be confirmed.
 - `tagged`: a spawn, a side bar or `placement` from an agent pane outside a team, or a side bar or `placement` from a team member; only the person or the team's leader opens the side bar or chooses where agents open.
 - `depth`: a team member's child would be deeper than 3.
-- `cap`: 6 live agents in the session.
-- `limit`: the team already has 6 members besides the leader. The message names each member made before v0.3.0 that holds a slot: `mux-agent stop <name>` frees one whose shell is lost or ended (nothing is killed) and stops one that runs; one hc cannot show stays held.
+- `cap`: 10 live agents in the session.
+- `limit`: the team already has 10 members besides the leader. The message names each member made before v0.3.0 that holds a slot: `mux-agent stop <name>` frees one whose shell is lost or ended (nothing is killed) and stops one that runs; one hc cannot show stays held.
 - `name`: a bad or taken name.
 - Other check names: `brief`, `target`, `parent`, `endpoint`, `state`, `lock`, `caller`, `launch`, `rmux`, `sidebar`, `usage` and `internal`.
 

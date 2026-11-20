@@ -85,6 +85,18 @@ fn a_reported_done_is_done() {
     let now = crate::util::parse_utc("2026-03-01T00:01:00Z").unwrap();
     let r = json!({"state": "done", "kind": null, "since": "2026-03-01T00:00:00.0000000Z"});
     assert_eq!(activity(Some(&r), None, None, now), ("done", Some(60)));
+    // Seen (the bar's Space, or the person looked at it): the spell reads idle, so the row leaves the Inbox; a seen
+    // mark older than the spell does not count.
+    let seen = json!({"since": "2026-03-01T00:00:00.0000000Z"});
+    assert_eq!(
+        activity(Some(&r), Some(&seen), None, now),
+        ("idle", Some(60))
+    );
+    let older = json!({"since": "2026-02-28T23:59:00.0000000Z"});
+    assert_eq!(
+        activity(Some(&r), Some(&older), None, now),
+        ("done", Some(60))
+    );
 }
 
 #[test]
@@ -664,6 +676,186 @@ fn ended_rows_carry_exit_code_in_list_and_watch() {
             "watch={watch}"
         );
     }
+}
+
+// An ended agent's row counts the reports it left unread (outside a team, in its parent pane's mailbox), never the
+// exit notice the reaper posts for it: with only that notice it stays in the Ended fold; one unread report puts it in
+// Inbox; once the report is read it goes back.
+#[test]
+fn an_ended_agents_unread_counts_its_reports_never_its_exit_notice() {
+    let w = World::human("");
+    w.clock(NOW);
+    let caller = w.caller();
+    member(&w, ID, json!({"pane": null}));
+    w.panes(&[]);
+    let unread = || {
+        snapshot(&w, &caller, &[(ID, "stopped")]);
+        let watch = board(&w.ctx, &caller, true, true).unwrap();
+        w.fakes.hc_done().unwrap();
+        watch["agents"][0]["unread"].clone()
+    };
+    assert_eq!(unread(), json!(0), "the exit notice alone");
+    let mailbox = std::fs::read_to_string(w.state().join("mail").join("pane-1.jsonl")).unwrap();
+    assert!(
+        mailbox.contains(r#""kind":"stopped""#),
+        "the notice was posted: {mailbox}"
+    );
+    crate::agents::mail::add_member_mail(
+        &w.ctx,
+        &caller,
+        "pane-1",
+        "worker",
+        ID,
+        "%9",
+        "done: 3 fixed",
+    )
+    .unwrap();
+    assert_eq!(unread(), json!(1), "one unread report");
+    crate::agents::mail::read_mail(&w.ctx, &caller, "pane-1").unwrap();
+    assert_eq!(unread(), json!(0), "the report read");
+}
+
+// `m` shows exactly what the badge counts, by the same rule for every row: an ended viewless member's one unread report
+// (matched by the id it names, the record keeping no pane) is badge 1 and popup 1; a team member whose only line is the
+// notice of its own exit is badge 0 and popup 0.
+#[test]
+fn the_mail_popup_shows_exactly_what_the_badge_counts() {
+    use crate::agents::mail::{add_member_mail, badge_mail};
+    let w = World::human("");
+    w.clock(NOW);
+    let caller = w.caller();
+    member(&w, ID, json!({"pane": null}));
+    w.panes(&[]);
+    let both = |facts: &[(&str, &str)], id: &str| {
+        snapshot(&w, &caller, facts);
+        let watch = board(&w.ctx, &caller, true, true).unwrap();
+        w.fakes.hc_done().unwrap();
+        let row = watch["agents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["id"] == id)
+            .cloned()
+            .unwrap();
+        snapshot(&w, &caller, facts);
+        let popup = badge_mail(&w.ctx, &caller, id).unwrap().len();
+        (row["unread"].clone(), popup)
+    };
+    assert_eq!(
+        both(&[(ID, "stopped")], ID),
+        (json!(0), 0),
+        "the exit notice alone"
+    );
+    add_member_mail(
+        &w.ctx,
+        &caller,
+        "pane-1",
+        "worker",
+        ID,
+        "%9",
+        "done: 3 fixed",
+    )
+    .unwrap();
+    assert_eq!(
+        both(&[(ID, "stopped")], ID),
+        (json!(1), 1),
+        "one unread report"
+    );
+
+    let w = World::human("");
+    w.clock(NOW);
+    let caller = w.caller();
+    member(
+        &w,
+        ID,
+        json!({"name": "lead", "pane": "%8", "parentPane": null, "parentAgent": null, "depth": 0, "upTeam": "T",
+            "createdAt": "2026-10-29T11:00:00.0000000Z"}),
+    );
+    let kid = "cccccccccccc";
+    member(
+        &w,
+        kid,
+        json!({"name": "kid", "pane": "%9", "parentPane": "%8", "parentAgent": {"id": ID}, "depth": 1,
+            "createdAt": "2026-10-29T11:30:00.0000000Z"}),
+    );
+    w.panes(&["%8|@5|300|aaaaaaaaaaaa|lead"]);
+    let facts = [(ID, "running"), (kid, "stopped")];
+    let (unread, popup) = {
+        snapshot(&w, &caller, &facts);
+        let watch = board(&w.ctx, &caller, true, true).unwrap();
+        w.fakes.hc_done().unwrap();
+        assert_eq!(watch.get("team"), Some(&json!(true)));
+        let row = watch["agents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["id"] == kid)
+            .cloned()
+            .unwrap();
+        snapshot(&w, &caller, &facts);
+        (
+            row["unread"].clone(),
+            badge_mail(&w.ctx, &caller, kid).unwrap().len(),
+        )
+    };
+    let notices = std::fs::read_to_string(w.state().join("mail").join("pane-8.jsonl")).unwrap();
+    assert!(
+        notices.contains(r#""kind":"stopped""#),
+        "the exit notice was posted: {notices}"
+    );
+    assert_eq!(
+        (unread, popup),
+        (json!(0), 0),
+        "a team member's own exit notice"
+    );
+}
+
+// The bar's cap on older ends never drops a member with an unread report: of 11 members that ended more than an hour
+// ago, the oldest (past the 10 kept) left one report unread; it is listed, and stands in Inbox.
+#[test]
+fn an_older_ended_member_with_an_unread_report_is_never_capped_away() {
+    let w = World::human("");
+    w.clock(NOW);
+    let caller = w.caller();
+    let mut facts = Vec::new();
+    let ids: Vec<String> = (0..11u32).map(|n| format!("{:012x}", n + 1)).collect();
+    for (n, id) in ids.iter().enumerate() {
+        let folder = member(&w, id, json!({"name": format!("e{n}"), "pane": null}));
+        // e0 ended first, e10 last, all more than an hour ago; the notice is already posted, so no new one lands.
+        write(
+            &folder.join("notice.json"),
+            json!({"kind": "stopped", "exitCode": null, "at": format!("2026-10-29T10:{:02}:00.0000000Z", 10 + n)}),
+        );
+        crate::state::evidence::publish(
+            &crate::agents::gens::path(&folder, 0, "notice"),
+            &json!({"kind": "stopped", "exitCode": null, "at": format!("2026-10-29T10:{:02}:00.0000000Z", 10 + n)}),
+        )
+        .unwrap();
+        facts.push((id.as_str(), "stopped"));
+    }
+    w.panes(&[]);
+    crate::agents::mail::add_member_mail(
+        &w.ctx,
+        &caller,
+        "pane-1",
+        "e0",
+        &ids[0],
+        "",
+        "the report",
+    )
+    .unwrap();
+    snapshot(&w, &caller, &facts);
+    let watch = board(&w.ctx, &caller, true, true).unwrap();
+    w.fakes.hc_done().unwrap();
+    let rows = watch["agents"].as_array().unwrap();
+    let e0 = rows.iter().find(|r| r["name"] == "e0");
+    assert_eq!(e0.map(|r| r["unread"].clone()), Some(json!(1)), "{rows:?}");
+    let text = crate::sidebar::flat_text(&watch, 40, 30);
+    let inbox = text
+        .iter()
+        .position(|r| r.starts_with(" Inbox"))
+        .expect("an Inbox");
+    assert!(text[inbox + 1].contains("e0"), "{text:?}");
 }
 
 #[test]
@@ -1480,6 +1672,43 @@ fn mark_seen_is_view_proof_not_notice_lifecycle() {
     assert!(w.fakes.hc_calls().is_empty());
     w.fakes.hc_done().unwrap();
 }
+// The side bar's Space on a done member with no view: marked by its id, under the same agent lock and never backward,
+// with no pane read. An id no member has, or one that is no agent id, marks nothing.
+#[test]
+fn mark_seen_id_marks_a_member_without_a_view() {
+    let w = World::human("");
+    let c = w.caller();
+    let folder = w.agent_record(ID, json!({}));
+    let file = folder.join("seen.json");
+    let seen = file.clone();
+    w.fakes
+        .lock_probe(move |_| format!("exists={}", seen.exists()));
+    w.fakes.clear_log();
+    assert!(mark_seen_id(&w.ctx, &c, ID, "2026-10-29T11:58:00.0000000Z").unwrap());
+    let agent = lock_key("agent", &c, ID);
+    assert_eq!(
+        w.fakes.locks(),
+        [
+            format!("+{agent} exists=false"),
+            format!("-{agent} exists=true")
+        ]
+    );
+    assert!(w.fakes.mux_calls().is_empty(), "no pane read");
+    let body = || std::fs::read_to_string(&file).unwrap();
+    assert_eq!(body(), r#"{"since":"2026-10-29T11:58:00.0000000Z"}"#);
+    mark_seen_id(&w.ctx, &c, ID, "2026-10-29T11:50:00.0000000Z").unwrap();
+    assert_eq!(body(), r#"{"since":"2026-10-29T11:58:00.0000000Z"}"#);
+    assert!(!mark_seen_id(&w.ctx, &c, ID, "soon").unwrap());
+    for id in ["bbbbbbbbbbbb", "../x", ""] {
+        assert!(
+            !mark_seen_id(&w.ctx, &c, id, "2026-10-29T12:00:00.0000000Z").unwrap(),
+            "{id:?}"
+        );
+    }
+    assert!(!w.folder("bbbbbbbbbbbb").exists());
+    assert!(w.fakes.hc_calls().is_empty());
+    w.fakes.hc_done().unwrap();
+}
 #[test]
 fn board_hc_rank_and_terminal_limit() {
     use crate::agents::core_fixture as cf;
@@ -1583,6 +1812,66 @@ fn a_parentless_ended_leader_shows_in_list_and_the_bar() {
     );
 }
 
+// The bar's feed keeps every agent that ended in the last hour, however many, then the newest `ENDED_MAX` older ones,
+// so each recent end can be selected; each ended row carries `endedAgo`, the seconds since its end, which the fold
+// judges by (an agent created 2 h ago that ended 10 s ago is recent). `list -All` keeps its 10 rows and no `endedAgo`.
+#[test]
+fn the_bar_keeps_every_recent_end_and_says_when_each_ended() {
+    let w = World::human("");
+    w.clock(NOW);
+    let caller = w.caller();
+    member(&w, ID, json!({}));
+    w.panes(&["%9|@5|300|aaaaaaaaaaaa|worker"]);
+    let mut ids = Vec::new();
+    for n in 0..22u32 {
+        let id = format!("{:012x}", n + 1);
+        let folder = member(
+            &w,
+            &id,
+            json!({"name": format!("e{n}"), "pane": format!("%{}", 20 + n),
+                "createdAt": "2026-10-29T10:00:00.0000000Z"}),
+        );
+        // e0..e10 ended in the last minute (e0 10 s ago), e11..e21 more than an hour ago.
+        let at = match n {
+            0..=10 => format!("2026-10-29T11:59:{:02}.0000000Z", 50 - n),
+            _ => format!("2026-10-29T10:{:02}:00.0000000Z", 10 + n),
+        };
+        write(
+            &folder.join("notice.json"),
+            json!({"kind": "stopped", "exitCode": null, "at": at}),
+        );
+        ids.push(id);
+    }
+    let mut facts: Vec<_> = ids.iter().map(|id| (id.as_str(), "stopped")).collect();
+    facts.push((ID, "running"));
+    snapshot(&w, &caller, &facts);
+    let watch = board(&w.ctx, &caller, true, true).unwrap();
+    w.fakes.hc_done().unwrap();
+    let rows = watch["agents"].as_array().unwrap();
+    let ended: Vec<&Value> = rows.iter().filter(|r| r["name"] != "worker").collect();
+    assert_eq!(
+        ended.len(),
+        11 + ENDED_MAX,
+        "every recent end, then 10 older"
+    );
+    assert_eq!(watch["endedTotal"], 22);
+    assert_eq!(
+        (&ended[0]["name"], &ended[0]["endedAgo"]),
+        (&json!("e0"), &json!(10))
+    );
+    assert_eq!(ended[10]["name"], "e10");
+    assert!(ended.iter().all(|r| r["endedAgo"].is_u64()), "{ended:?}");
+    snapshot(&w, &caller, &facts);
+    let list = board(&w.ctx, &caller, true, false).unwrap();
+    w.fakes.hc_done().unwrap();
+    let rows = list["agents"].as_array().unwrap();
+    assert_eq!(
+        (rows.len(), &list["endedTotal"]),
+        (1 + ENDED_MAX, &json!(22))
+    );
+    assert!(rows.iter().all(|r| r.get("endedAgo").is_none()));
+}
+
 #[test]
 fn the_bar_reads_a_whole_team_as_a_tree_and_nothing_else_changes() {
     use crate::agents::team;
@@ -1650,14 +1939,11 @@ fn the_bar_reads_a_whole_team_as_a_tree_and_nothing_else_changes() {
         let rows = watch["agents"].as_array().unwrap();
         let row = |name: &str| rows.iter().find(|r| r["name"] == name);
         assert_eq!(watch.get("team"), team.then_some(&json!(true)), "{source}");
-        // Outside a team: kid and the newest 10 ended (the leader's and e0's notices are oldest). In a team all 13:
-        // the ended leader and the ended parent e0, older than 10 ended rows, still come and head their children.
-        assert_eq!(rows.len(), if team { 13 } else { 11 }, "{source}");
-        assert_eq!(
-            (row("lead").is_some(), row("e0").is_some()),
-            (team, team),
-            "{source}"
-        );
+        // All 13 either way: every agent here ended in the last hour, which the bar's feed always keeps (the cap on
+        // older ends is `the_bar_keeps_every_recent_end_and_says_when_each_ended`). In a team the ended leader and the
+        // ended parent e0 head their children.
+        assert_eq!(rows.len(), 13, "{source}");
+        assert!(row("lead").is_some() && row("e0").is_some(), "{source}");
         let kid = row("kid").unwrap();
         assert_eq!(
             (&kid["id"], &kid["needsRecovery"], &kid["view"]),
@@ -1852,12 +2138,8 @@ fn a_team_rows_unread_follows_its_member_across_a_reopened_view() {
             .find(|r| r["name"] == "kid")
             .unwrap()
             .clone();
-        // In a team the message and the notice both count; outside a team only running members' mail, as before.
-        assert_eq!(
-            row["unread"],
-            json!(if team { 2 } else { 0 }),
-            "team {team}"
-        );
+        // The kid's message counts, in a team or not; the notice of its own exit never does.
+        assert_eq!(row["unread"], json!(1), "team {team}");
     }
 }
 

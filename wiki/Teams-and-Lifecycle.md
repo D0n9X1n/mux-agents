@@ -70,8 +70,8 @@ The leader is depth 0. You talk to it in its view; it spawns members with the sk
 | limit | value | set in | refusal |
 |---|---|---|---|
 | depth | 3 | `MAX_DEPTH`, `src/agents/tree.rs` | `depth` |
-| members besides the leader | 6 | `MAX_MEMBERS`, `src/agents/tree.rs` | `limit` |
-| live agents in one multiplexer session | 6 | the spawn cap | `cap` |
+| members besides the leader | 10 | `MAX_MEMBERS`, `src/agents/tree.rs` | `limit` |
+| live agents in one multiplexer session | 10 | the spawn cap | `cap` |
 | spawn budget | 20 tokens, one more every 180 s | `src/agents/budget.rs`; session options `@mux-agents-spawn-budget` and `@mux-agents-spawn-refill`, 1-86400 | `budget`, naming when the next token arrives |
 
 A `spawn` and a member's `resume` each take one budget token; a refused request takes none.
@@ -113,7 +113,7 @@ mux-agent peek <name> -Lines 120
 - `name`: a member of that name is running;
 - `leader`: a leader is never resumed;
 - `session`: a process on this machine may still hold that conversation; the message names the process (pid and image) or member and the rule that held;
-- `cap`: the session already has 6 live agents.
+- `cap`: the session already has 10 live agents.
 
 When a member's current generation fails, the bar marks it `recover` with the reason (for example `recover: exited 1`), or `recover (still running)` while the failed generation has not finished, and `list` sets `needsRecovery`. Retry it as its next generation:
 
@@ -170,9 +170,9 @@ Every refusal is one JSON line and `check` names the cause; exit code 2 means a 
 | `endpoint` | `up` outside a tmux or rmux pane | start a multiplexer and run it in a pane |
 | `views` | a member's view verb while the team's views are down | run `up` |
 | `depth` | a child below depth 3 | let a shallower member spawn it |
-| `limit` | 6 members besides the leader | `stop` one |
+| `limit` | 10 members besides the leader | `stop` one |
 | `budget` | the team's spawn budget is spent | wait for the next token, or raise `@mux-agents-spawn-budget` |
-| `cap` | 6 live agents in the session | `stop` one |
+| `cap` | 10 live agents in the session | `stop` one |
 | `life` | `resume` of a member that is running, lost or unknown | `stop` it first, or `restore` a lost one |
 | `taken` | `resume` of a member already resumed | resume the successor the message names |
 | `session` | a process may still hold the conversation | end the process the message names |

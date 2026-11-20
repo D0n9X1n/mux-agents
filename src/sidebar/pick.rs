@@ -1,8 +1,10 @@
 //! What a click or a key in the side bar picks: the agent on the clicked row, and the keyboard selection.
 
+use std::time::{Duration, SystemTime};
+
 use serde_json::{Map, Value};
 
-use super::keys::Event;
+use super::keys::{Event, Read};
 
 /// A kept shell's life: the bar asks before it closes one (views-6f).
 pub const KEPT: &str = "kept";
@@ -10,6 +12,22 @@ pub const KEPT: &str = "kept";
 /// The main chat's life: the pane the agents were spawned from, outside a team; it takes keys and clicks, never
 /// peek, stop or `n`/`N`.
 pub const MAIN: &str = "main";
+
+/// The flat bar's ended fold line: Enter and Tab open and close it; it takes keys, never clicks, peek or `n`/`N`.
+pub const FOLD: &str = "fold";
+
+impl Target {
+    /// The ended fold line's target: an id no member id or pane can take.
+    pub fn fold() -> Target {
+        Target {
+            id: "fold:ended".into(),
+            name: "Ended".into(),
+            pane: String::new(),
+            life: FOLD.into(),
+            team: String::new(),
+        }
+    }
+}
 
 /// A main chat row: its pane is its identity, its name `main`, then `main 2`, `main 3` … in the board's order.
 impl Target {
@@ -30,6 +48,36 @@ impl Target {
 
 /// The question Enter asks on a kept row; the next event answers it.
 pub const ASK: &str = "close? y/n";
+
+/// The question `q` asks; only a `y` read alone, `BAR_GAP` after the question showed, closes the bar.
+pub const ASK_BAR: &str = "close bar? y/n";
+
+/// How long `close bar? y/n` is on screen before a `y` counts: a `q` typed into the bar by mistake, then a `y`
+/// typed fast for something else, never closes it.
+pub const BAR_GAP: Duration = Duration::from_millis(250);
+
+/// Whether `note` is a question waiting for its answer: it keeps the last line, and no hint takes it.
+pub fn asking(note: &str) -> bool {
+    note == ASK || note == ASK_BAR
+}
+
+/// The question pending: close a kept shell, or close the bar (with when the question was first drawn).
+#[derive(Debug)]
+enum Question {
+    Kept(Target),
+    Bar(Option<SystemTime>),
+}
+
+/// What an event made of the question pending: none was, it waits on, it was cancelled, or yes to closing the kept
+/// shell or the bar.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Answer {
+    None,
+    Wait,
+    Cancel,
+    Kept(Target),
+    Bar,
+}
 
 /// An agent row the bar can open: its member id (its name on a feed without ids), name, pane and life.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -142,6 +190,25 @@ pub fn row_hit(line: &str) -> Option<&str> {
     (!name.is_empty()).then_some(name)
 }
 
+/// `g` / `G`: the index in `walk` of the target drawn highest (`first`) or lowest on the bar, by `rows` (each drawn
+/// target's row); with none of them drawn, the walk's first or last. None for an empty walk.
+pub fn edge(walk: &[Target], rows: &[(Target, usize)], first: bool) -> Option<usize> {
+    let row = |t: &Target| rows.iter().find(|(d, _)| d.id == t.id).map(|(_, at)| *at);
+    let drawn = (0..walk.len()).filter_map(|at| row(&walk[at]).map(|r| (r, at)));
+    let picked = if first {
+        drawn.min().map(|(_, at)| at)
+    } else {
+        drawn.max().map(|(_, at)| at)
+    };
+    picked.or_else(|| {
+        if first {
+            (!walk.is_empty()).then_some(0)
+        } else {
+            walk.len().checked_sub(1)
+        }
+    })
+}
+
 /// herdr's next (`forward`) or previous agent: the drawn agent after (before) the one on `looking` (the pane the
 /// session shows), wrapping; from a pane that is no drawn agent's, the first (last). None with none drawn.
 pub fn step<'a>(drawn: &'a [Target], looking: Option<&str>, forward: bool) -> Option<&'a Target> {
@@ -167,14 +234,15 @@ pub enum Act {
     Focus(Target),
 }
 
-/// The keyboard selection (a member id and its ordinal among the drawn agents), the note (its text and the ticks it has
-/// been shown) and whether keys wrap.
+/// The keyboard selection (a member id and its ordinal among the drawn agents), whether `follow` put it on a row the
+/// person never chose, the note (its text and the ticks it has been shown) and whether keys wrap.
 #[derive(Debug, Default)]
 pub struct Pick {
     chosen: Option<(String, usize)>,
+    fell: bool,
     note: Option<(String, u8)>,
     wrap: bool,
-    confirm: Option<Target>,
+    question: Option<Question>,
 }
 
 impl Pick {
@@ -207,10 +275,20 @@ impl Pick {
                 Event::Press { .. }
                 | Event::Release { .. }
                 | Event::Interrupt
+                | Event::Mail
                 | Event::Next
                 | Event::Prev
                 | Event::Peek
                 | Event::Yes
+                | Event::Tab
+                | Event::First
+                | Event::Last
+                | Event::Help
+                | Event::Close
+                | Event::Notes
+                | Event::Placement
+                | Event::Output
+                | Event::Ack
                 | Event::Other,
                 _,
                 _,
@@ -220,6 +298,7 @@ impl Pick {
         };
         self.note = None;
         self.chosen = next.map(|at| (drawn[at].id.clone(), at));
+        self.fell = false;
         match (event, at.and_then(|at| drawn.get(at))) {
             (Event::Enter, Some(target)) => Act::Focus(target.clone()),
             _ => Act::Redraw,
@@ -232,22 +311,29 @@ impl Pick {
         drawn.iter().find(|t| t.id == *id)
     }
 
+    /// `chosen`, only when the person chose it (a key, a click, `n`/`N`): a row the selection fell to when the one they
+    /// chose left is none, so a key that marks or closes never acts on a row they did not pick.
+    pub fn own<'a>(&self, drawn: &'a [Target]) -> Option<&'a Target> {
+        self.chosen(drawn).filter(|_| !self.fell)
+    }
+
     /// A mouse press: it dismisses the note.
     pub fn pressed(&mut self) {
         self.note = None;
     }
 
     /// The selection against the agents drawn now: the same member id where it is now, else the agent at its former
-    /// ordinal, else the last; with none drawn it clears.
+    /// ordinal, else the last, which the person did not choose (`own`); with none drawn it clears.
     pub fn follow(&mut self, drawn: &[Target]) {
         let Some((id, at)) = self.chosen.take() else {
             return;
         };
-        let at = drawn
-            .iter()
-            .position(|target| target.id == id)
-            .or_else(|| drawn.len().checked_sub(1).map(|last| at.min(last)));
+        let (at, fell) = match drawn.iter().position(|target| target.id == id) {
+            Some(at) => (Some(at), self.fell),
+            None => (drawn.len().checked_sub(1).map(|last| at.min(last)), true),
+        };
         self.chosen = at.map(|at| (drawn[at].id.clone(), at));
+        self.fell = fell && self.chosen.is_some();
     }
 
     /// The selected agent's member id.
@@ -258,12 +344,14 @@ impl Pick {
     /// The selected agent was focused: the selection clears.
     pub fn focused(&mut self) {
         self.chosen = None;
+        self.fell = false;
     }
 
     /// The person left the bar: the selection clears, unless a question waits for its answer.
     pub fn left(&mut self) {
-        if self.confirm.is_none() {
+        if self.question.is_none() {
             self.chosen = None;
+            self.fell = false;
         }
     }
 
@@ -276,11 +364,17 @@ impl Pick {
     pub fn select(&mut self, drawn: &[Target], at: usize) {
         self.note = None;
         self.chosen = drawn.get(at).map(|t| (t.id.clone(), at));
+        self.fell = false;
     }
 
     /// Opening `name` showed nothing (B6).
     pub fn nothing(&mut self, name: &str) {
         self.note = Some((format!("nothing to open for {name}"), 0));
+    }
+
+    /// A note of the bar's own (a refused resume's reason, say), shown as `failed` is.
+    pub fn say(&mut self, text: String) {
+        self.note = Some((text, 0));
     }
 
     /// Focusing `name` failed: the note shows it until a key, a press or its second tick.
@@ -290,7 +384,7 @@ impl Pick {
 
     /// One tick of the bar: the note clears at its second; a pending question stays until it is answered.
     pub fn ticked(&mut self) {
-        if self.confirm.is_some() {
+        if self.question.is_some() {
             return;
         }
         if let Some((_, ticks)) = self.note.as_mut() {
@@ -304,17 +398,45 @@ impl Pick {
     /// Enter on a kept row asks first (views-6f ambiguity 15); the next event answers.
     pub fn ask(&mut self, target: Target) {
         self.note = Some((ASK.into(), 0));
-        self.confirm = Some(target);
+        self.question = Some(Question::Kept(target));
     }
 
-    /// The question pending, taken: whatever the next event is, it answers it.
-    pub fn confirming(&mut self) -> Option<Target> {
-        let target = self.confirm.take()?;
+    /// `q` asks before the bar closes.
+    pub fn ask_bar(&mut self) {
+        self.note = Some((ASK_BAR.into(), 0));
+        self.question = Some(Question::Bar(None));
+    }
+
+    /// A frame showing the question was written at `at`: the first such frame starts `BAR_GAP`.
+    pub fn question_shown(&mut self, at: SystemTime) {
+        if let Some(Question::Bar(shown @ None)) = self.question.as_mut() {
+            *shown = Some(at);
+        }
+    }
+
+    /// `read` against the question pending. A kept shell's question is answered by any event, yes only by `y`. The
+    /// bar's is yes only by a `y` read alone at least `BAR_GAP` after it was first drawn; a `y` read sooner, or with
+    /// other keys, leaves it asked; any other event cancels it.
+    pub fn answer(&mut self, read: &Read) -> Answer {
+        let yes = read.event == Event::Yes;
+        let answer = match self.question.as_ref() {
+            None => return Answer::None,
+            Some(Question::Bar(shown)) if yes => {
+                let late = shown.is_some_and(|at| read.first >= at + BAR_GAP);
+                if !(read.alone && late) {
+                    return Answer::Wait;
+                }
+                Answer::Bar
+            }
+            Some(Question::Kept(target)) if yes => Answer::Kept(target.clone()),
+            Some(_) => Answer::Cancel,
+        };
+        self.question = None;
         self.note = None;
-        Some(target)
+        answer
     }
 
-    /// Closing kept shell `name` was refused.
+    /// Closing kept shell (or the bar) `name` was refused.
     pub fn close_failed(&mut self, name: &str) {
         self.note = Some((format!("close failed: {name}"), 0));
     }

@@ -276,6 +276,8 @@
 
 [watch, one frame]
 -N display-message -p -t %1 #{pid}|#{pane_pid}|#{session_id}|#{window_id}|#{@agent-id}
+# the hub: the bar reads its keys (@mux-agents-keys) once, as the pane sees the option, when it starts; no tick reads them
+-N display-message -p -t %1 #{@mux-agents-keys}
 # :1482; S2: the probe also reads the pane's size, so each frame is laid out at its actual width and height
 -N display-message -p -t %1 #{pane_id}|#{@agent-role}|#{pane_width}|#{pane_height}
 # 0.2.3 (S1): only the watch the record names, by its own pane and process, reads its window and repairs it;

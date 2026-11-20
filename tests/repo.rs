@@ -484,6 +484,11 @@ const SCOPE_READS_ALLOWED: &[(&str, &str, &str)] = &[
     ("src/sidebar.rs", "ensure", "the bar of the shown session"),
     (
         "src/sidebar.rs",
+        "close_bar",
+        "the bar of the shown session",
+    ),
+    (
+        "src/sidebar.rs",
         "shown_pane",
         "the bar of the shown session",
     ),
@@ -1441,6 +1446,7 @@ const TEST_ONLY: &[(&str, &str, &str)] = &[
     ),
     ("src/sidebar/hc_tests.rs", "src/sidebar.rs", "hc_tests"),
     ("src/sidebar/kept_tests.rs", "src/sidebar.rs", "kept_tests"),
+    ("src/sidebar/jobs/tests.rs", "src/sidebar/jobs.rs", "tests"),
     ("src/sidebar/keys/tests.rs", "src/sidebar/keys.rs", "tests"),
     ("src/sidebar/pick/tests.rs", "src/sidebar/pick.rs", "tests"),
     ("src/testing.rs", "src/lib.rs", "testing"),
@@ -2432,7 +2438,7 @@ const SKILL_PWSH_NOTE: &str = "The commands below, and the Reply and Listen line
 const SKILL_SHORTCUT_PWSH_LINE: &str = "- PowerShell, in `$PROFILE` (the primary shell for the shortcuts on Windows): `. \"<plugin folder>/scripts/shell/mux-agents.ps1\"`";
 
 /// prelife-1c p1c-calls 4 (Task 9): the skill's `limit` line says how a slot held by a pre-v0.3.0 member is freed.
-const SKILL_LIMIT_LINE: &str = "- `limit`: the team already has 6 members besides the leader. The message names each member made before v0.3.0 that holds a slot: `mux-agent stop <name>` frees one whose shell is lost or ended (nothing is killed) and stops one that runs; one hc cannot show stays held.";
+const SKILL_LIMIT_LINE: &str = "- `limit`: the team already has 10 members besides the leader. The message names each member made before v0.3.0 that holds a slot: `mux-agent stop <name>` frees one whose shell is lost or ended (nothing is killed) and stops one that runs; one hc cannot show stays held.";
 
 #[test]
 fn the_skill_states_how_a_pre_lifecycle_slot_is_freed() {

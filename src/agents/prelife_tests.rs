@@ -8,6 +8,7 @@ use crate::agents::core_fixture as cf;
 use crate::agents::fixture::World;
 use crate::agents::prelife_fixture::{self as pf, A, Answer, C, D, L, P};
 use crate::agents::team_state::{Scope, open};
+use crate::agents::tree::MAX_MEMBERS;
 
 /// Outside a team nothing changes for 0.2.x folders: scope Outside; the 0.2 cap still counts hc members only. A
 /// stop of a live one proven its own closes its pane and notices it `stopped` (all-calls 14); a resume never kills,
@@ -15,7 +16,10 @@ use crate::agents::team_state::{Scope, open};
 #[test]
 fn a_v028_state_folder_changes_nothing_outside_a_team() {
     let w = World::human("");
-    let ids: Vec<String> = (1..=6).map(|n| format!("b{n}000000000{n}")).collect();
+    // Hex digits keep each id 12 characters and sorted for every n up to 15.
+    let ids: Vec<String> = (1..=MAX_MEMBERS)
+        .map(|n| format!("b{n:x}000000000{n:x}"))
+        .collect();
     for (n, id) in ids.iter().enumerate() {
         pf::v028(&w, id, &format!("old{n}"), pf::End::Live);
     }
@@ -31,7 +35,7 @@ fn a_v028_state_folder_changes_nothing_outside_a_team() {
     let s = crate::agents::membership::Snapshot::for_spawn(&w.ctx, &caller, &core).unwrap();
     assert_eq!(
         s.held, ids,
-        "the six live ones hold team slots (none is in a team)"
+        "the live ones, as many as the cap, hold team slots (none is in a team)"
     );
     s.admit_name(None, crate::parse::Client::Claude, "add subtract")
         .expect("the 0.2 cap counts hc members only");
@@ -158,7 +162,7 @@ fn a_v028_member_in_a_team_holds_its_slot_until_its_notice_proves_an_end() {
 /// held it is main's message.
 #[test]
 fn the_limit_refusal_names_each_held_pre_lifecycle_member() {
-    let base = "the team already has 6 members besides the leader";
+    let base = format!("the team already has {MAX_MEMBERS} members besides the leader");
     for (case, hint) in [
         (
             "lost",
@@ -178,8 +182,13 @@ fn the_limit_refusal_names_each_held_pre_lifecycle_member() {
         let w = World::human("");
         let mut answers = pf::capacity_world(&w);
         if case == "none" {
-            let id = "a60000000006".to_string();
-            let r = pf::life(&w, &id, pf::fields(&id, "w6", Some(L), 1));
+            // The last child; `capacity_world`'s id pattern holds only up to nine children.
+            let id = "f0000000000f".to_string();
+            let r = pf::life(
+                &w,
+                &id,
+                pf::fields(&id, &format!("w{MAX_MEMBERS}"), Some(L), 1),
+            );
             answers.insert(format!("t{id}"), Answer::Wire(cf::wire(&r)));
         } else {
             let p = pf::pre(&w, P, pf::fields(P, "legacy", Some(L), 1));
@@ -207,7 +216,7 @@ fn the_limit_refusal_names_each_held_pre_lifecycle_member() {
         let e = pf::admit_spawn(&w).unwrap_err();
         let want = match hint {
             Some(h) => format!("{base}; held by pre-lifecycle members: legacy ({h})"),
-            None => base.to_string(),
+            None => base.clone(),
         };
         assert_eq!(
             (e.check, e.message.as_str()),
@@ -238,10 +247,12 @@ fn the_limit_refusal_names_every_holder_sorted_by_name() {
     let e = pf::admit_spawn(&w).unwrap_err();
     assert_eq!(
         e.message,
-        "the team already has 6 members besides the leader; held by pre-lifecycle members: \
-         alpha (its record names no usable hc terminal; it stays held), \
-         beta (running; mux-agent stop beta stops it), \
-         legacy (run mux-agent stop legacy once its client is gone)"
+        format!(
+            "the team already has {MAX_MEMBERS} members besides the leader; held by pre-lifecycle members: \
+             alpha (its record names no usable hc terminal; it stays held), \
+             beta (running; mux-agent stop beta stops it), \
+             legacy (run mux-agent stop legacy once its client is gone)"
+        )
     );
     w.fakes.hc_done().unwrap();
 }

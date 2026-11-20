@@ -39,11 +39,31 @@ pub fn placement(ctx: &Ctx, request: &Request) -> Res<Map<String, Value>> {
     };
     let caller = resolve(ctx)?;
     crate::cli::member_views(ctx, &caller)?;
+    gated(ctx, &caller, || choose(ctx, &caller, value))
+}
+
+/// The side bar's `P`, in the bar's own process as its caller: the session's placement (`tab` when unset), then the
+/// next of tab → h → v → tab, set on the session as `placement <value>` sets it, under the same gate.
+pub(crate) fn cycle(ctx: &Ctx, caller: &Caller) -> Res<&'static str> {
+    gated(ctx, caller, || {
+        let next = match read_placement(ctx, caller)?.unwrap_or(DEFAULT) {
+            "tab" => "h",
+            "h" => "v",
+            _ => "tab",
+        };
+        choose(ctx, caller, Some(next))?;
+        Ok(next)
+    })
+}
+
+/// Runs `f` only for a caller that may choose: an untagged pane that is no agent's own, or the depth-0 leader of an
+/// `up` team. Refused `tagged` otherwise.
+fn gated<T>(ctx: &Ctx, caller: &Caller, f: impl FnOnce() -> Res<T>) -> Res<T> {
     if caller.member.is_some() {
         // a proven hc member is allowed only as the depth-0 leader `up` launched that its team record names,
         // proven again under the team lock (`tree::standing`), which is held while it reads or sets the option.
-        return super::tree::with_standing(ctx, &caller, |standing| {
-            let leads = match (standing, super::tree::scope(ctx, &caller)?) {
+        return super::tree::with_standing(ctx, caller, |standing| {
+            let leads = match (standing, super::tree::scope(ctx, caller)?) {
                 (Some(super::tree::Standing::Member(m)), super::tree::Scope::Team(team)) => {
                     super::tree::is_leader(&m.record) && team.leader == m.id
                 }
@@ -52,11 +72,11 @@ pub fn placement(ctx: &Ctx, request: &Request) -> Res<Map<String, Value>> {
             if !leads {
                 return crate::error::refuse(2, "tagged", NOT_HERE);
             }
-            choose(ctx, &caller, value)
+            f()
         });
     }
-    super::registry::untagged(ctx, &caller, NOT_HERE)?;
-    choose(ctx, &caller, value)
+    super::registry::untagged(ctx, caller, NOT_HERE)?;
+    f()
 }
 
 const NOT_HERE: &str = "an agent pane cannot choose where agents open";
@@ -239,6 +259,42 @@ mod tests {
             assert_eq!(call(&w, args).0, 2, "{args:?}");
             assert!(calls(&w).is_empty(), "{args:?}");
         }
+    }
+
+    // The side bar's `P`, in its own process: the session's placement, then the next of tab → h → v → tab, set as
+    // `placement <value>` sets it, under the same gate.
+    #[test]
+    fn cycle_sets_the_next_placement() {
+        for (stored, next) in [
+            ("", "h"),
+            ("tabs\n", "h"),
+            ("tab\n", "h"),
+            ("h\n", "v"),
+            ("v\n", "tab"),
+        ] {
+            let w = World::human("");
+            w.fakes.mux_rule("show-options", 0, stored, "");
+            assert_eq!(
+                super::cycle(&w.ctx, &w.caller()).unwrap(),
+                next,
+                "{stored:?}"
+            );
+            assert_eq!(
+                calls(&w),
+                [
+                    READ.to_string(),
+                    format!("-N set-option -t $3 @mux-agents-placement {next}")
+                ],
+                "{stored:?}"
+            );
+        }
+        let w = World::human(ID);
+        let refused = super::cycle(&w.ctx, &w.caller()).unwrap_err();
+        assert_eq!(
+            (refused.check, refused.message.as_str()),
+            ("tagged", super::NOT_HERE)
+        );
+        assert!(calls(&w).is_empty());
     }
 
     #[test]

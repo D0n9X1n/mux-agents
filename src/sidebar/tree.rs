@@ -123,6 +123,8 @@ pub(super) fn walk(board: &Map<String, Value>) -> Vec<Target> {
 pub(super) struct Focus<'a> {
     pub shown: Option<&'a str>,
     pub selected: Option<&'a str>,
+    /// The flat bar's ended section is open (Tab): its newest rows are drawn and selectable.
+    pub ended_open: bool,
 }
 
 struct Member {
@@ -221,10 +223,14 @@ fn member(node: &Node, width: usize, shown: Option<&str>, look: Look) -> Member 
             (p.glyph, p.name, p.model, p.badge, sides, !narrow, p.doing)
         } else {
             let (kind, word) = ended_kind(row);
-            let sides = vec![
-                right(kind, &word, &age, false),
-                vec![span(word.clone(), kind.word_style())],
-            ];
+            // A resume running for it: `resuming…` until the board catches up.
+            let sides = match resuming(row, look) {
+                Some(side) => vec![side],
+                None => vec![
+                    right(kind, &word, &age, false),
+                    vec![span(word.clone(), kind.word_style())],
+                ],
+            };
             (
                 span(kind.glyph(look.ascii), kind.style()),
                 span(own_glyphs(&name), DIM),
@@ -657,7 +663,7 @@ pub(super) fn lay_team(
         .collect();
     let team = Team {
         header: cut_row(
-            header(&counts(board), cols),
+            header(&counts(board), dot(look), cols),
             size.width.saturating_sub(1).max(1),
         ),
         members,
@@ -692,6 +698,7 @@ pub(super) mod tests {
         let focus = || Focus {
             shown: Some("%13"),
             selected: None,
+            ended_open: false,
         };
         let row = |width| {
             draw(&board, width, 20, look(), focus())
@@ -742,6 +749,7 @@ pub(super) mod tests {
         let focus = Focus {
             shown: None,
             selected: None,
+            ended_open: false,
         };
         let drawn = draw(&board, 40, 20, look, focus);
         assert!(
@@ -772,6 +780,7 @@ pub(super) mod tests {
         let focus = || Focus {
             shown: Some("%13"),
             selected: None,
+            ended_open: false,
         };
         let row = |width| {
             draw(&board, width, 20, look(), focus())
@@ -938,15 +947,11 @@ pub(super) mod tests {
             Focus {
                 shown: Some("%13"),
                 selected: None,
+                ended_open: false,
             },
         );
         let wide = [
-            line(
-                " ",
-                "mux-agents",
-                "1 need you / 1 working / 1 idle / 2 ended",
-                60,
-            ),
+            line(" ", "mux-agents", "2 inbox \u{b7} 1 working", 60),
             String::new(),
             line(" ", "\u{25c9} lead", "working   1m", 60),
             "   plan it".into(),
@@ -956,7 +961,7 @@ pub(super) mod tests {
             line(" ", "  ! fixer  \u{2709} 2", "recover   1m", 60),
         ];
         let narrow = [
-            line(" ", "mux-agents", "1 need you", 30),
+            line(" ", "mux-agents", "2 inbox", 30),
             String::new(),
             line(" ", "\u{25c9} lead", "  1m", 30),
             "   plan it".into(),
@@ -977,6 +982,7 @@ pub(super) mod tests {
                     l.replace("\u{25c9}", "*")
                         .replace("\u{25cc}", "o")
                         .replace("\u{2709}", "m")
+                        .replace("\u{b7}", "-")
                 })
                 .collect();
             assert_eq!(
@@ -1067,12 +1073,14 @@ pub(super) mod tests {
         let moved = Focus {
             shown: Some("%12"),
             selected: None,
+            ended_open: false,
         };
         assert_eq!(banded(moved), [4]);
         // The leader's doing line is drawn under it: on screen, both of its rows are banded, and none of its children.
         let lead_shown = Focus {
             shown: Some(board["agents"][0]["pane"].as_str().unwrap_or("%10")),
             selected: None,
+            ended_open: false,
         };
         let lead_rows = banded(lead_shown);
         let drawn = draw(&board, 60, 24, look, lead_shown);
@@ -1199,6 +1207,7 @@ pub(super) mod tests {
                     Focus {
                         shown: Some("%13"),
                         selected: None,
+                        ended_open: false,
                     },
                 )
                 .0;
@@ -1405,9 +1414,10 @@ pub(super) mod tests {
         let c1 = Focus {
             shown: Some("%15"),
             selected: None,
+            ended_open: false,
         };
         let full = [
-            "mux-agents 6 working / 2 ended",
+            "mux-agents 6 working",
             "",
             "\u{25c9} L working 1m",
             "plan",
@@ -1481,7 +1491,8 @@ pub(super) mod tests {
                 3,
                 Focus {
                     shown: None,
-                    selected: Some("D1")
+                    selected: Some("D1"),
+                    ended_open: false,
                 }
             ),
             tail(6, full[11]),
@@ -1504,6 +1515,7 @@ pub(super) mod tests {
                 Focus {
                     shown: Some("%15"),
                     selected: None,
+                    ended_open: false,
                 },
             )
             .0;

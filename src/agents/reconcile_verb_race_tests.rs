@@ -235,14 +235,16 @@ fn team_record(w: &super::fixture::World) {
 }
 
 /// Spec row 0 (b), real entry points (r6b call 10, checklist 18): X released by the real R1 writer holds no slot;
-/// five running members and a real `spawn` (by the person of the team session) fill the team; `restore` holds X
+/// `MAX_MEMBERS - 1` running members and a real `spawn` (by the person of the team session) fill the team; `restore` holds X
 /// `limit`; a real `stop` of the spawned member frees its slot; the next `restore` launches X once.
 #[test]
 fn a_spawn_takes_the_freed_slot_then_a_stop_frees_one_for_x() {
     let w = person();
     team(&w);
     team_record(&w);
-    let fillers: Vec<String> = (1..=5).map(|n| format!("11111111111{n}")).collect();
+    let fillers: Vec<String> = (1..crate::agents::tree::MAX_MEMBERS)
+        .map(|n| format!("1111111111{n:02x}"))
+        .collect();
     for id in &fillers {
         ok(&super::reconcile_restore_tests::other(&w, id), 1);
     }
@@ -252,7 +254,7 @@ fn a_spawn_takes_the_freed_slot_then_a_stop_frees_one_for_x() {
     let live: Vec<String> = fillers.iter().map(|id| format!("a{id}")).collect();
     let live: Vec<&str> = live.iter().map(String::as_str).collect();
     let ax = format!("a{X}");
-    // a real spawn: admission counts 5 + 0 (X released) < 6; launched through `forward`
+    // a real spawn: admission counts `MAX_MEMBERS - 1` + 0 (X released), under the limit; launched through `forward`
     cf::online(&w);
     snapshot(&w, &live, &[&ax]);
     w.fakes.hc_answer(ft::address("t9"));
@@ -281,7 +283,7 @@ fn a_spawn_takes_the_freed_slot_then_a_stop_frees_one_for_x() {
         late_launch["launcherArgv"].clone(),
         json!("t9"),
     );
-    // restore: X held `limit` (six members hold a slot). The fake answers in FIFO order and the pass walks members
+    // restore: X held `limit` (`MAX_MEMBERS` members hold a slot). The fake answers in FIFO order and the pass walks members
     // in id order, taking X's cap snapshot on X's turn; the spawned id is random, so the scripts follow that walk.
     cf::online(&w); // discovery
     cf::online(&w); // the pass
@@ -314,7 +316,7 @@ fn a_spawn_takes_the_freed_slot_then_a_stop_frees_one_for_x() {
     let stop: Vec<String> = ["stop", "late"].map(String::from).to_vec();
     let (code, out) = crate::cli::run(&stop, || Ok(&w.ctx));
     assert_eq!(code, 0, "{out}");
-    // the next restore: five slots, X launched once
+    // the next restore: one slot free, X launched once
     cf::online(&w);
     cf::online(&w);
     for id in &fillers {

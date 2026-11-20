@@ -253,12 +253,22 @@ fn spawn_snapshot_refuses_unverified_reservations() {
 
 #[test]
 fn only_ended_releases_name_and_capacity() {
+    use crate::agents::tree::MAX_MEMBERS;
+    // `MAX_MEMBERS - 1` foreign reservations `x1`..: hc lists them out of order and `x1` twice, then ID's terminal.
+    let others = MAX_MEMBERS - 1;
+    let mut listed: Vec<String> = std::iter::once(others)
+        .chain(1..others)
+        .chain([1])
+        .map(|n| format!("x{n}"))
+        .collect();
+    listed.push("taaaaaaaaaaaa".into());
+    let listed: Vec<&str> = listed.iter().map(String::as_str).collect();
     for (mode, count) in [
-        ("running", 6),
-        ("lost", 6),
-        ("unknown", 6),
-        ("ended", 5),
-        ("uncommitted", 6),
+        ("running", MAX_MEMBERS),
+        ("lost", MAX_MEMBERS),
+        ("unknown", MAX_MEMBERS),
+        ("ended", MAX_MEMBERS - 1),
+        ("uncommitted", MAX_MEMBERS),
     ] {
         let w = World::human("");
         let caller = w.caller();
@@ -268,15 +278,7 @@ fn only_ended_releases_name_and_capacity() {
         }
         for foreign in [false, true] {
             f::online(&w);
-            f::listing(
-                &w,
-                &team(&caller),
-                if foreign {
-                    &["x5", "x1", "x2", "x3", "x4", "x1", "taaaaaaaaaaaa"]
-                } else {
-                    &[]
-                },
-            );
+            f::listing(&w, &team(&caller), if foreign { &listed } else { &[] });
             let mut t = f::wire(&r);
             match mode {
                 "lost" => t["argv"] = json!(["/bin/zsh", "-l"]),
@@ -289,7 +291,7 @@ fn only_ended_releases_name_and_capacity() {
             }
             f::get(&w, "taaaaaaaaaaaa", t);
             if foreign {
-                for n in 1..=5 {
+                for n in 1..=others {
                     let mut t = f::wire(&r);
                     let a = format!("x{n}");
                     t["address"] = json!(a);
@@ -302,7 +304,7 @@ fn only_ended_releases_name_and_capacity() {
             let s = Snapshot::take(&w.ctx, &caller).unwrap();
             assert_eq!(
                 s.facts.count(),
-                if foreign { count } else { count - 5 },
+                if foreign { count } else { count - others },
                 "{mode}"
             );
             let got = s.admit_name(Some("worker"), crate::parse::Client::Claude, "task");
@@ -320,9 +322,9 @@ fn only_ended_releases_name_and_capacity() {
                 assert_eq!(
                     got.unwrap_err().message,
                     if foreign {
-                        "the session already has 6 live agents"
+                        format!("the session already has {MAX_MEMBERS} live agents")
                     } else {
-                        "agent name is taken, try worker-2"
+                        "agent name is taken, try worker-2".to_string()
                     }
                 );
             }
@@ -332,7 +334,7 @@ fn only_ended_releases_name_and_capacity() {
                     .iter()
                     .filter(|(_, a, _)| a[0] == "get")
                     .count(),
-                if foreign { 6 } else { 1 }
+                if foreign { MAX_MEMBERS } else { 1 }
             );
             w.fakes.hc_done().unwrap();
         }

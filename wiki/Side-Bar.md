@@ -21,7 +21,7 @@ Only you or a team's leader opens or closes it; a member gets `tagged`, and an a
 In a session `up` started, the bar draws the team as a tree. It looks roughly like this:
 
 ```text
- mux-agents       1 need you / 2 working / 1 ended
+ mux-agents                1 inbox · 2 working
 
  ◉ leader                         working   2m
    Planning the parser split
@@ -30,7 +30,7 @@ In a session `up` started, the bar draws the team as a tree. It looks roughly li
      ✓ lexer-bench                   done  10m
 ```
 
-- The header counts the team's live members by state, then `M ended`; a narrow bar drops counts from the end, and the title stays.
+- The header counts `N inbox` (yellow) and `N working`, as the flat list's header does; a narrow bar drops counts from the end, and the title stays. The hint row is the last row here too.
 - The leader comes first; each member's children are drawn under it, indented 2 columns per level (`src/sidebar/tree.rs`).
 - Siblings are oldest first, with the running ones ranked needs you, on call, done, working, idle in the places running rows hold, so an ended member's sub-tree never moves.
 - A row whose parent is not in the team, or whose chain does not reach the leader, is drawn at depth 1 with `^` first.
@@ -40,27 +40,36 @@ When the pane is too short, the bar drops, in order: the blank line, the doing l
 
 ## The flat list
 
-Outside a team the bar draws a flat list, as herdr's priority view does:
+Outside a team the bar groups the agents by what they ask of you (40 columns; `$` is the cyan `main` glyph):
 
 ```text
- mux-agents        1 need you / 1 done
+ mux-agents         2 inbox · 1 working
 
- Needs you · 1
- ! add-subtract [sonnet]            12s
-   Adding subtract(a, b) under add i...
+ $ main
 
- Done · 1
- ✦ test-calc  ✉ 1                   30s
-   Done: test_calc.py passed, exit 0
+ Inbox · 2
+ ! qa-spec-audit         needs you  12s
+   Allow edit to src/lexer.rs?
+ ✦ fc-research  ✉ 1           done   3m
 
- ended -------------------------------
- ✓ docs-usage                 done  18m
-   +4 more  (list -All)
+ Working · 1
+ ◉ dev-fix-l2                        4m
+   Splitting parse.rs into modules
+
+ Free · 1
+ ◌ docs-usage                       20m
+
+ ▸ Ended · 48
+
+ ⏎ open  p peek  m mail  ? keys
 ```
 
-- The first rows are `main` (then `main 2` …), after a blank row that sets them apart from the header: the panes the agents were spawned from, so you can go back to the chat that started them. A short bar drops that blank row first.
-- Live agents follow, ranked by state, the most recent change first. When they are in more than one state, each state's first agent has a heading with its count (`Needs you · 1`), and rows under headings show only their glyph and age; with every agent in one state each row says its state.
-- Ended agents close the list: the 3 newest that did not end lost, then `+K more  (list -All)` when every ended agent is among the 10 `list -All` shows, else `+K more ended`.
+- The header counts `N inbox` (yellow) and `N working`, each only when not 0, joined by ` · `; `0 running` when no agent lives. Free and ended agents are not counted there: their heading and the fold line count them.
+- The first rows are `main` (then `main 2` …), after a blank row that sets them apart from the header: the panes the agents were spawned from, so you can go back to the chat that started them. A short bar drops that blank row first. `main` stays as the header does, while the pane has a row for it beside the header: the agents give way first.
+- Live agents follow in sections, each under its heading with its count and a blank row above it, in the board's order. **Inbox** (bold yellow): needs you, done and not yet seen, unread mail, or a member that needs recovery, running or not; its rows keep their word, since their reasons differ. **Working** (bold green), then **Free** (bold dim: idle or on call): their rows show only the glyph and the age.
+- The ended agents are one dim line, `▸ Ended · N`, which the keys select. Tab, or Enter on it, opens it (`▾`): the agents that ended in the last hour (by when each ended, not when it started), the newest end first, each selectable, then `+N older` for the rest. An ended agent with unread mail is not folded away: it stands in Inbox with its ended glyph and word and `✉ N` and the time since it ended, and the header counts it, until its mail is read. Its mail is the reports it sent; the notice of its own exit never counts, on any bar.
+- The last row is the hint row, after a blank row: `⏎ open  p peek  m mail  ? keys` (`enter` in ASCII; `⏎ resume` on a selected ended row, and `resuming…` alone while its resume runs), keys plain and words dim, each key as `@mux-agents-keys` sets it. A narrow bar drops `m mail`, then `p peek`. It shows only when it costs no other row.
+- A short bar drops, in order: the blank rows (the lowest first), the headings (each row then says its state), the open fold's rows (the oldest first, into `+N older`) and that line, the doing lines of the oldest agents, the oldest agents (into `+J more running`), then the fold line.
 
 ## What each mark means
 
@@ -78,12 +87,15 @@ Outside a team the bar draws a flat list, as herdr's priority view does:
 | `!` | `recover: <reason>` | its current generation failed; `recover (still running)` while that generation has not ended; `resume` retries it |
 | `✉ N` (`m N`) | | N unread messages from it |
 | `kept shell <name>` | | a lost member's old terminal, under the heading `kept shells · N` |
+| `Inbox · N` bold yellow, `Working · N` bold green, `Free · N` bold dim | | a section of the flat list, with its count |
+| `▸ Ended · N` (`>`) dim, open `▾` (`v`) | | the ended agents, folded; Tab, or Enter on it, opens or closes it |
+| `[model]` dim | | the agent's model, only when the live agents' models differ |
 | soft grey band | | the agent the keys selected, else the agent or `main` row whose pane is on screen, over the agent's whole block (its name line and doing line); with color only. When the bar itself is in front (you switched to its tab), the row of the other pane in that tab |
 | `>` in column 0 | | the row the keys selected, only without color or with `MUX_AGENTS_ASCII=1` |
 
-Each live agent's name has its own color, the one least used by the session's live agents and never a state color. The age is the time since the last change of state. `MUX_AGENTS_ASCII=1` draws the ASCII marks. Color follows `NO_COLOR` (off), `FORCE_COLOR` or `CLICOLOR_FORCE` (on), then `TERM=dumb` (off).
+Each live agent's name has its own color, the one least used by the session's live agents and never a state color. The age is the time since the last change of state. `MUX_AGENTS_ASCII=1` draws the ASCII marks. Color follows `NO_COLOR` (off), `FORCE_COLOR` or `CLICOLOR_FORCE` (on), then `TERM=dumb` (off). In the open fold an ended row is its glyph, its dim name and the time since it ended: only `exit N` keeps its word, in red; a lost or unknown row, which has not ended, shows its age.
 
-Notes at the bottom of the bar: `refresh failed` (the last board, shown when a read failed), `layout: repair paused`, `focus failed: <name>`, `nothing to open for <name>`, and the question `close? y/n`.
+Notes at the bottom of the bar: `refresh failed` (the last board, shown when a read failed), `layout: repair paused`, `focus failed: <name>`, `nothing to open for <name>`, `no notes`, `notes failed`, `opens in: tab|split h|split v`, `placement refused: <reason>`, `close failed: <name>`, and the questions `close? y/n` and `close bar? y/n`.
 
 ## Keys
 
@@ -92,19 +104,32 @@ The keys act only while the bar pane is active.
 | key | in a team | outside a team |
 |---|---|---|
 | `j` / `k`, Down / Up | select the next or previous row, wrapping | select the next or previous row |
-| Enter | open the selected row; with none selected, select the first | switch to the selected agent or `main`; with none selected, select the first |
-| `n` / `N` | select the next or previous member with a live view, wrapping; Enter opens it | switch to the next or previous agent in the bar's order, from the one on screen |
-| `p` | a popup of the selected member, else the one on screen: its live view, else its retained output | a popup of the selected agent, else the first: its last 200 lines, ending `-- peek: <name> (q closes) --` |
+| Enter | open the selected row; on an ended member, resume it (see below); with none selected, select the first | switch to the selected agent or `main`; on an ended agent, resume it in a new window and switch to it (see below); on the fold line, open or close it; with none selected, select the first |
+| `g` / `G` | select the first or last row as drawn | select the first or last row as drawn |
+| Tab | nothing: the tree has no fold | open or close the ended fold; closed from one of its rows, the fold line is selected |
+| `n` / `N` | select the next or previous member with a live view, wrapping; Enter opens it | switch to the next or previous running agent in the bar's order, from the one on screen |
+| `p` | a popup of the selected member, else the one on screen: its live view, else its retained output | a popup of the selected agent, else the one on screen, else the first running one: its last 200 lines, ending `-- peek: <name> (q closes) --`; a selected ended agent shows its retained output |
+| `o` | a popup of the selected member's retained output, else the one on screen's, else the first running one's; never its live view | the same, for the selected agent |
+| `m` | a popup of the selected member's unread mail, else the one on screen's, else the first running one's; nothing is marked read | the same, for the selected agent |
+| `i` | a popup of the team's notes, newest first: each title, then `author · at · id` | `no notes`: the notebook belongs to a team |
+| `P` | where new agents open, as `placement` sets it: tab, then split h, then split v, then tab again; the bottom line says `opens in: <place>`, or `placement refused: <reason>` | the same |
+| Space | the agent you selected, done and not yet seen, is marked seen, as leaving its pane marks it, with a view or without; any other row, none selected, or a row the selection fell to when yours left: nothing | the same; it leaves Inbox |
+| `q` | asks `close bar? y/n` | the same |
+| `?` | the keys, in the bar's last rows, as `@mux-agents-keys` sets them: `?` or Esc closes them; any other key closes them and does its action | the same |
 | Esc | clear the selection | clear the selection |
 | Ctrl-C | end the bar (`interrupted`) | end the bar (`interrupted`) |
 
-Enter on a team row opens it without restarting or typing anything: a running member's view, a lost member's recovery terminal, an ended member's output. Enter on a kept shell asks `close? y/n`: `y` closes it, and any other key keeps it.
+Enter on a team row opens it without restarting or typing anything: a running member's view, a lost member's recovery terminal. Enter on an ended member resumes it, as on the flat bar: a new window, switched to, and the hint row says `⏎ resume`. On either bar the resume runs while the bar keeps drawing: its row says `resuming…` (`resuming...` in ASCII) until the board shows the agent again, and a second Enter on it does nothing meanwhile; a resume that is refused says why on the bottom line, `resume refused: <reason>`, and `o` still shows its retained output. Enter on a kept shell asks `close? y/n`: `y` closes it, and any other key keeps it. On a kept shell the selection fell to when your row left, Enter first takes it as yours and asks nothing.
+
+`q` asks `close bar? y/n`. Only a `y` typed on its own, at least 250 ms after the question shows, closes the bar, as `sidebar -Close` closes it but for this window only: the session's bar is turned off, so no other window's bar opens it again, until you run `sidebar`. A `y` typed sooner, or read with other bytes (a paste, or part of another key's sequence), leaves the question; any other key keeps the bar.
+
+`@mux-agents-keys` moves keys: `action=key` pairs, comma-separated, each key one printable character, for example `tmux set -g @mux-agents-keys 'notes=I,close=Q'`. The actions are `down`, `up`, `first`, `last`, `next`, `prev`, `peek`, `output`, `mail`, `notes`, `placement`, `ack` (Space), `close` and `help`. A key another action had is taken from it. Enter, Tab, Esc, the arrows, Ctrl-C and `y` stay. An unknown action, or a key that is not one printable character or is `y`, is ignored, and `?` lists it as `ignored: <name>`. The bar reads the option once when it starts: a change applies to the next bar.
 
 `focus -Next` and `focus -Prev` do what `n` and `N` do from any pane. A key bound in `~/.tmux.conf` can send keys to the bar from anywhere, for example `bind ] run-shell 'tmux send-keys -t "$(tmux show -qv @mux-agents-sidebar-id | cut -d" " -f1)" n'`.
 
 ## Mouse
 
-Clicks reach the bar only with `mouse on` (`set -g mouse on`); Shift-drag then selects text. A left click on an agent's name line or doing line opens it as Enter does; in a team the clicked row is selected first, so `p` and Enter act on it after. Outside a team clicks are off with `MUX_AGENTS_ASCII=1`. A click on a kept shell, a heading, a fold line or a note does nothing, and a click made while the bar is being resized only redraws it.
+Clicks reach the bar only with `mouse on` (`set -g mouse on`); Shift-drag then selects text. A left click on a row selects it and does what Enter on it does: an agent's name line or doing line opens it, an ended agent resumes, the fold line opens or closes, a kept shell asks `close? y/n`. The row stays selected, so `p` and Enter act on it after. Outside a team clicks are off with `MUX_AGENTS_ASCII=1`. A click on a heading or a note does nothing, and a click made while the bar is being resized only redraws it.
 
 ## Width and alerts
 
@@ -129,7 +154,7 @@ flowchart LR
 - **What it reads.** Each tick, every second (`Pace` in `src/sidebar.rs`) and at once after a key or a left press, it reads its own pane's id, label and size, then the board in-process (`src/agents/board.rs`, `src/agents/board_rows.rs`): each agent's record, the activity its client reported, its status or last message, its unread mail, whether it needs recovery, the team's kept shells and the pane the session shows. Between ticks it polls every 200 ms, cheaply: the pane on screen (one multiplexer read) and the newest change time of the agents' folders and mailboxes (file times, no process). Another pane on screen (a tab switch) or a change there (a report, a status, a message) draws a new frame at once, so the bar shows it within 200 ms. The walk that gives other view windows their bar runs every 5 ticks.
 - **Redraw.** The board is laid out at the pane's actual size and never wraps; each frame is written in place inside synchronized output, with no full clear, so it does not flicker. With `TERM=dumb` it prints plain frames and takes no keys or clicks.
 - **The keeper.** When a split, a layout change, `swap-pane` or `rotate-window` moves the bar, the next tick puts it back at the right edge and selects your pane again. A zoomed window is left alone. After 3 failed repairs in a row it shows `layout: repair paused` until the layout changes or a minute passes.
-- **The end.** `watch` ends `pane-closed` when its pane is gone, `output-closed` when a write fails, `probe-failed` after 30 unanswered probes in a row, and `interrupted` on Ctrl-C; it puts the terminal back on every exit.
+- **The end.** `watch` ends `pane-closed` when its pane is gone, `output-closed` when a write fails, `probe-failed` after 30 unanswered probes in a row, `interrupted` on Ctrl-C, and `closed` after `q` and `y`; it puts the terminal back on every exit.
 
 ## Where it lives
 

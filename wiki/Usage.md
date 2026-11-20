@@ -53,7 +53,7 @@ You rarely type these: the skill runs them for you. Every command is `<plugin>/s
 | `peek` | `peek claude-1 -Lines 40` | read a team member's live pane without typing into it |
 | `stop` | `stop claude-1`, `stop claude-1 -Generation` | end an agent and every agent it started, bottom-up; a stop cut short is finished on the next pass; `-Generation` ends only its open generations and keeps the member; the reply's `life` says what its terminal is now: `ended`, `lost`, `unknown` or `running` |
 | `drop` | `drop claude-1` | a person's stop of a member of the team's session; its kept shells stay |
-| `resume` | `resume claude-1`, `resume claude-1 -Fresh` | bring a stopped agent back as a new member carrying its conversation, or retry a member the bar marks `recover`; `-Fresh` starts it on a new conversation; refused while any live process may still hold that conversation |
+| `resume` | `resume claude-1`, `resume claude-1 -Fresh`, `resume claude-1 -Tab` | bring a stopped agent back as a new member carrying its conversation, or retry a member the bar marks `recover`; `-Fresh` starts it on a new conversation; `-Tab` opens its view in a new window whatever the session's `placement` says; refused while any live process may still hold that conversation |
 | `restore` | `restore` | bring every lost member of this team back as its next generation; its previous terminal stays as a kept shell |
 | `up` | `up -Client claude -- --model opus` | start a team: its leader, side bar and views; run it again after a closed view, a killed server or a reboot to bring the views, bar and lost members back; a stopped team is retired and a new one starts; `-Name <name>` starts a second team in the same folder ([Teams and Lifecycle](Teams-and-Lifecycle)) |
 | `status` | `status -BodyFile step.txt` | an agent says what it is doing now; the bar shows it |
@@ -80,7 +80,7 @@ usage: mux-agent notes [-Since <id>] [-Lines <n>] | notes <id> [-Text]
 usage: mux-agent peek <name> [-Lines <n>] [-Text]
 usage: mux-agent stop <name> [-Generation] [-Text]
 usage: mux-agent drop <name|id> [-Text]
-usage: mux-agent resume <name|id> [-Fresh] [-Text]
+usage: mux-agent resume <name|id> [-Fresh] [-Tab] [-Text]
 usage: mux-agent restore [-Text]
 usage: mux-agent up -Client <claude|copilot> [-Name <name>] [-Text] [-- <client flags>]
 usage: mux-agent status (-Body <text> | -BodyFile <path>) [-Text]
@@ -124,9 +124,9 @@ Agents start with permission prompts off, so mux-agents never gives an agent mor
 - `flags`: for a client chat outside a team, every client command line from the chat up to the pane uses only allowlisted flags.
 - `policy`: that chat already runs with bypass permissions or allow-all.
 - `directory`: that chat's launch directory can be confirmed; the agent starts there.
-- `cap`: outside a team, fewer than 6 agents are live in the session.
+- `cap`: outside a team, fewer than 10 agents are live in the session.
 - `depth`: in a team, the child is at depth 3 or less (the leader is 0).
-- `limit`: in a team, fewer than 6 members are there besides the leader.
+- `limit`: in a team, fewer than 10 members are there besides the leader.
 - `ceiling`: in a team, the child's flags stay within its parent's policy and the team's permission ceiling.
 - `budget`: in a team, a member's spawn takes one token from the team's spawn budget: 20 tokens, one more every 180 seconds, set by the session options `@mux-agents-spawn-budget` and `@mux-agents-spawn-refill`.
 
@@ -181,9 +181,9 @@ Every refusal is one JSON line with `check` naming the cause:
 | `flags` | a `claude` or `copilot` process from the caller up to the pane has a flag outside the allowlist, or its command line cannot be read | restart the client with only allowlisted flags |
 | `directory` | the caller's launch directory cannot be confirmed from its session or process, or is not an existing absolute folder | start the client in an existing folder and stay in it |
 | `tagged` | an agent outside a team tried to spawn; a member tried to open the side bar or set `placement`; `up`, `restore`, `drop`, `kept` or `stop -Generation` ran from an agent or member pane | outside a team only the top-level chat spawns; run a person's verbs from your own pane |
-| `cap` | outside a team, 6 agents already live in this session | `stop` one |
+| `cap` | outside a team, 10 agents already live in this session | `stop` one |
 | `depth` | in a team, the child would be deeper than 3 | let a shallower member spawn it |
-| `limit` | in a team, 6 members already besides the leader; the message names any member still holding a slot and what frees it | `stop` one |
+| `limit` | in a team, 10 members already besides the leader; the message names any member still holding a slot and what frees it | `stop` one |
 | `ceiling` | in a team, the child's flags would exceed its parent's policy or the team's permission ceiling | spawn it from a member that has that permission |
 | `budget` | in a team, the team's spawn budget is spent; the message says when the next token arrives | wait, or raise `@mux-agents-spawn-budget` or lower `@mux-agents-spawn-refill` |
 | `views` | a member's `spawn`, `focus`, `resume`, `sidebar`, `watch` or `placement` while the team's views are down | run `up` |

@@ -176,10 +176,10 @@ pub static VERBS: &[VerbDef] = &[
     VerbDef {
         name: "resume",
         values: &[],
-        switches: &["Fresh"],
+        switches: &["Fresh", "Tab"],
         min: 1,
         max: 1,
-        usage: "usage: mux-agent resume <name|id> [-Fresh] [-Text]",
+        usage: "usage: mux-agent resume <name|id> [-Fresh] [-Tab] [-Text]",
         handler: crate::agents::resume::resume,
         text: json::lines,
     },
@@ -2033,7 +2033,11 @@ mod tests {
                 dumb: false,
             },
         );
-        assert!(bar[2].contains("\u{1b}[35mworker\u{1b}[0m"), "{bar:?}");
+        // The worker's name line, wherever its section puts it, is painted in its hue.
+        assert!(
+            bar.iter().any(|l| l.contains("\u{1b}[35mworker\u{1b}[0m")),
+            "{bar:?}"
+        );
         // JSON is never colored.
         w.ctx.tty = true;
         board_snapshot(&w, &records, Some("bbbbbbbbbbbb"));

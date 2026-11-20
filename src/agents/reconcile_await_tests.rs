@@ -6,6 +6,7 @@ use super::life_fixture as lf;
 use super::reconcile_restore_tests::{L, other, sid_of};
 use super::reconcile_run_tests::{ids, pass};
 use super::reconcile_tests::{X, found, member, ok, released_for_restore, wire_of};
+use super::tree::MAX_MEMBERS;
 use serde_json::json;
 
 /// `Snapshot::for_spawn`: the team listing, then one `get` per address (`core_facts::take`), in sorted order.
@@ -26,12 +27,13 @@ pub(super) fn snapshot(w: &World, live: &[&str], gone: &[&str]) {
         }
     }
 }
-/// Six running members `1..6` (ids `11111111111n`), each on its own conversation (`other`, r6b call 11: a filler
-/// never reserves the conversation being restored) and adjudicated `ok`, each observed Running by its own `find`.
-pub(super) fn six_running(w: &World) -> Vec<String> {
-    (1..=6)
+/// `MAX_MEMBERS` running members (ids `1111111111nn`, `nn` in hex), each on its own conversation (`other`, r6b
+/// call 11: a filler never reserves the conversation being restored) and adjudicated `ok`, each observed Running by
+/// its own `find`.
+pub(super) fn full_running(w: &World) -> Vec<String> {
+    (1..=MAX_MEMBERS)
         .map(|n| {
-            let id = format!("11111111111{n}");
+            let id = format!("1111111111{n:02x}");
             ok(&other(w, &id), 1);
             id
         })
@@ -74,12 +76,12 @@ fn a_released_member_is_relaunched_once() {
     w.fakes.hc_done().unwrap();
 }
 
-/// L1: X released for restore holds no slot; six running members fill the team: held `limit`. One ends: launched once.
+/// L1: X released for restore holds no slot; running members fill the team: held `limit`. One ends: launched once.
 #[test]
 fn a_full_team_holds_a_released_member_until_a_slot_frees() {
     let w = World::human("");
     w.state();
-    let fillers = six_running(&w);
+    let fillers = full_running(&w);
     let f = member(&w, X, json!({}));
     ok(&f, 1);
     cf::online(&w);
@@ -118,7 +120,7 @@ fn a_full_team_holds_a_released_member_until_a_slot_frees() {
 fn a_released_leader_takes_no_slot() {
     let w = World::human("");
     w.state();
-    let fillers = six_running(&w);
+    let fillers = full_running(&w);
     let f = member(&w, L, json!({"depth": 0, "upTeam": "T"}));
     ok(&f, 1);
     cf::online(&w);
@@ -138,14 +140,15 @@ fn a_released_leader_takes_no_slot() {
     w.fakes.hc_done().unwrap();
 }
 
-/// L1 pin (r6b call 12): a member with an active generation and a pending n+1 is one reservation (4 others + X = 5).
+/// L1 pin (r6b call 12): a member with an active generation and a pending n+1 is one reservation (`MAX_MEMBERS - 2`
+/// others + X is one short of the limit; X counted twice would reach it).
 #[test]
 fn a_pending_next_generation_counts_once() {
     let w = World::human("");
     w.state();
-    let others: Vec<String> = (1..=4)
+    let others: Vec<String> = (1..=MAX_MEMBERS - 2)
         .map(|n| {
-            let id = format!("11111111111{n}");
+            let id = format!("1111111111{n:02x}");
             member(&w, &id, json!({}));
             id
         })

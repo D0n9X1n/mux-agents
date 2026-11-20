@@ -79,6 +79,50 @@ fn a_retry_resumes_the_same_id_as_the_next_generation() {
     w.fakes.hc_done().unwrap();
 }
 
+/// The new windows a test world opened, each as its argv joined.
+fn new_windows(w: &World) -> Vec<String> {
+    (w.fakes.mux_calls().into_iter())
+        .filter(|c| c.iter().any(|a| a == "new-window"))
+        .map(|c| c.join(" "))
+        .collect()
+}
+
+/// `-Tab` on a member that needs recovery (the CLI's `resume <name> -Tab`, and the side bar's `resume_by_id` with
+/// `tab`): its next generation opens its view in a new window, as an ordinary resume's `-Tab` does, and the reply says
+/// so.
+#[test]
+fn a_recovery_with_tab_opens_the_next_generation_as_a_tab() {
+    for how in ["cli", "by id"] {
+        let w = person();
+        team(&w);
+        // As spawn records it: the view's tags read `context` and `reason`.
+        let f = member(
+            &w,
+            X,
+            json!({"parentAgent": {"id": L}, "context": "brief", "reason": "human"}),
+        );
+        failed_ended(&f, 1);
+        both_gone(&w);
+        w.fakes.hc_answer(ft::address("t2"));
+        let reply = match how {
+            "cli" => {
+                let (code, reply) = cli(&w, &["resume", "mbbb", "-Tab"]);
+                assert_eq!(code, 0, "{how}: {reply}");
+                reply
+            }
+            _ => Value::Object(
+                super::resume::resume_by_id(&w.ctx, &w.caller(), X, true, false).unwrap(),
+            ),
+        };
+        assert_eq!(reply["agent"]["id"], json!(X), "{how}: {reply}");
+        let opened = new_windows(&w);
+        assert_eq!(opened.len(), 1, "{how}: {opened:?}");
+        assert!(opened[0].ends_with("attach t2"), "{how}: {opened:?}");
+        assert_eq!(reply["view"], json!("attached"), "{how}: {reply}");
+        w.fakes.hc_done().unwrap();
+    }
+}
+
 /// 6c-R3: a member caller (hc environment) is refused 2 `tagged` with nothing written; an agent pane through the
 /// dispatcher likewise, with no hc call.
 #[test]

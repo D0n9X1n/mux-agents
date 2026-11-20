@@ -3,7 +3,7 @@ use super::keys::{self, Event};
 use super::pick::{Pick, Target};
 use super::tree::tests::{member, team};
 use super::{
-    Laid, Look, PLAIN, Shown, Size, Style, act, click, drawn, lay_focus, mark, tree, walk_of,
+    Laid, Look, PLAIN, Panel, Shown, Size, Style, act, click, drawn, lay_focus, mark, tree, walk_of,
 };
 use crate::agents::core_fixture as cf;
 use crate::agents::fixture::World;
@@ -22,6 +22,7 @@ fn read(event: Event) -> keys::Read {
     keys::Read {
         event,
         first: SystemTime::UNIX_EPOCH,
+        alone: true,
     }
 }
 fn shown(targets: Vec<Target>) -> Shown {
@@ -32,6 +33,7 @@ fn shown(targets: Vec<Target>) -> Shown {
         width: 40,
         looking: None,
         team: false,
+        done: Vec::new(),
     }
 }
 fn kept_target(address: &str, name: &str, team: &str) -> Target {
@@ -87,7 +89,11 @@ fn lay(
         notes,
         Size { width: 40, height },
         LOOK,
-        tree::Focus { shown, selected },
+        tree::Focus {
+            shown,
+            selected,
+            ended_open: false,
+        },
     )
     .0
 }
@@ -112,12 +118,21 @@ fn frame(board: Option<&Map<String, Value>>, laid: &Laid, team: bool) -> Shown {
         width: 40,
         looking: None,
         team,
+        done: Vec::new(),
     }
 }
 /// Ask the question on `k1`: the first Enter selects it, the second asks.
 fn ask(w: &World, pick: &mut Pick, s: &mut Shown) {
     for _ in 0..2 {
-        act(&w.ctx, &w.caller(), LOOK, read(Event::Enter), pick, s);
+        act(
+            &w.ctx,
+            &w.caller(),
+            LOOK,
+            read(Event::Enter),
+            pick,
+            s,
+            &mut Panel::default(),
+        );
     }
     assert_eq!(pick.note().as_deref(), Some("close? y/n"));
 }
@@ -130,9 +145,9 @@ fn a_kept_target_is_its_address_with_a_clean_name_and_no_pane() {
         (t.id.as_str(), t.name.as_str(), t.pane.as_str()),
         ("k1", "a[2Jbc", "")
     );
-    assert!(!super::clickable(&t), "a kept row takes no click");
+    assert!(!super::member_row(&t), "a kept row is no member row");
     assert!(
-        super::clickable(&Target::new("worker", "%9")),
+        super::member_row(&Target::new("worker", "%9")),
         "a member does"
     );
 }
@@ -296,10 +311,11 @@ fn a_headerless_frame_never_shares_a_row_between_kept_and_member() {
     let w = World::human("");
     clicks(&w, &laid);
     let y = |id: &str| (at(id) + 1) as u16;
+    // A click hits the kept row on its own row (Enter on it asks `close? y/n`), never a member's.
     assert_eq!(
         click(&w.ctx, &w.caller(), y("k1"), &s).map(|t| t.id),
-        None,
-        "the kept row takes no click"
+        Some("k1".to_string()),
+        "the kept row is hit on its own row"
     );
     assert_eq!(
         click(&w.ctx, &w.caller(), y("L"), &s).map(|t| t.id),
@@ -345,7 +361,15 @@ fn enter_asks_and_only_y_closes() {
         w.fakes.clear_log();
         let mut d = keys::Decoder::default();
         for r in d.push(bytes, SystemTime::UNIX_EPOCH) {
-            act(&w.ctx, &c, LOOK, r, &mut pick, &mut s);
+            act(
+                &w.ctx,
+                &c,
+                LOOK,
+                r,
+                &mut pick,
+                &mut s,
+                &mut Panel::default(),
+            );
         }
         assert_eq!(pick.note(), None, "{bytes:?}: the question is answered");
         assert_eq!(kills(&w), usize::from(closes), "{bytes:?}");
@@ -379,10 +403,26 @@ fn a_press_while_asked_cancels_and_a_later_y_closes_nothing() {
         let mut d = keys::Decoder::default();
         for mut r in d.push(report.as_bytes(), SystemTime::UNIX_EPOCH) {
             r.first = SystemTime::UNIX_EPOCH + Duration::from_secs(1);
-            act(&w.ctx, &c, LOOK, r, &mut pick, &mut s);
+            act(
+                &w.ctx,
+                &c,
+                LOOK,
+                r,
+                &mut pick,
+                &mut s,
+                &mut Panel::default(),
+            );
         }
         assert_eq!(pick.note(), None, "{over}: the press answers the question");
-        act(&w.ctx, &c, LOOK, read(Event::Yes), &mut pick, &mut s);
+        act(
+            &w.ctx,
+            &c,
+            LOOK,
+            read(Event::Yes),
+            &mut pick,
+            &mut s,
+            &mut Panel::default(),
+        );
         assert_eq!(pick.note(), None, "{over}");
         assert!(quiet(&w), "{over}: nothing focused or closed");
     }
@@ -399,7 +439,15 @@ fn a_failed_close_is_shown() {
     ask(&w, &mut pick, &mut s);
     cf::online(&w);
     cf::get(&w, "k1", kept_wire(&team, "finished"));
-    act(&w.ctx, &c, LOOK, read(Event::Yes), &mut pick, &mut s);
+    act(
+        &w.ctx,
+        &c,
+        LOOK,
+        read(Event::Yes),
+        &mut pick,
+        &mut s,
+        &mut Panel::default(),
+    );
     assert_eq!(pick.note().as_deref(), Some("close failed: a"));
     assert_eq!(kills(&w), 0);
 }
@@ -415,7 +463,15 @@ fn peek_and_steps_skip_kept_rows() {
         let mut pick = Pick::default();
         let c = w.caller();
         w.fakes.clear_log();
-        act(&w.ctx, &c, LOOK, read(e), &mut pick, &mut s);
+        act(
+            &w.ctx,
+            &c,
+            LOOK,
+            read(e),
+            &mut pick,
+            &mut s,
+            &mut Panel::default(),
+        );
         assert_eq!(pick.note(), None, "{e:?}");
         assert!(quiet(&w), "{e:?}");
     }
@@ -432,7 +488,15 @@ fn peek_and_steps_skip_kept_rows() {
         assert_eq!(pick.selected(), Some("k1"));
         let c = w.caller();
         w.fakes.clear_log();
-        act(&w.ctx, &c, LOOK, read(e), &mut pick, &mut s);
+        act(
+            &w.ctx,
+            &c,
+            LOOK,
+            read(e),
+            &mut pick,
+            &mut s,
+            &mut Panel::default(),
+        );
         assert_eq!(pick.note(), None, "team {e:?}");
         assert!(quiet(&w), "team {e:?}");
         if e != Event::Peek {
@@ -463,7 +527,15 @@ fn enter_closes_a_predecessors_kept_shell_with_its_own_team() {
     w.fakes.clear_log();
     let mut d = keys::Decoder::default();
     for r in d.push(b"y", SystemTime::UNIX_EPOCH) {
-        act(&w.ctx, &c, LOOK, r, &mut pick, &mut s);
+        act(
+            &w.ctx,
+            &c,
+            LOOK,
+            r,
+            &mut pick,
+            &mut s,
+            &mut Panel::default(),
+        );
     }
     assert_eq!(kills(&w), 1, "closed with the predecessor's team");
     w.fakes.hc_done().unwrap();

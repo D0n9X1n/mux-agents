@@ -239,8 +239,10 @@ fn a_pre_lifecycle_folder_holds_its_slot_until_it_is_proven_ended() {
             let e = got.unwrap_err();
             assert!(
                 e.check == "limit"
-                    && e.message
-                        .starts_with("the team already has 6 members besides the leader"),
+                    && e.message.starts_with(&format!(
+                        "the team already has {} members besides the leader",
+                        crate::agents::tree::MAX_MEMBERS
+                    )),
                 "{case}: {e:?}"
             );
         } else {
@@ -301,12 +303,13 @@ fn an_unidentified_record_holds_a_slot_and_never_refuses() {
 }
 
 /// Call 13: a held folder whose record names an `hcAddress` hc lists counts once (the folder, not also a
-/// reservation), with a good or a failing `get` of that terminal. Four children + the folder = 5: admitted.
+/// reservation), with a good or a failing `get` of that terminal. `MAX_MEMBERS - 2` children + the folder is one
+/// short of the limit: admitted; counted twice it would reach the limit and be refused.
 #[test]
 fn a_held_folder_whose_terminal_hc_lists_counts_once() {
     for good in [true, false] {
         let w = World::human("");
-        let mut answers = pf::capacity_world_of(&w, 4);
+        let mut answers = pf::capacity_world_of(&w, crate::agents::tree::MAX_MEMBERS as u64 - 2);
         let r = pf::partial(&w, P, pf::fields(P, "legacy", Some(L), 1));
         let address = format!("t{P}");
         answers.insert(
@@ -324,7 +327,7 @@ fn a_held_folder_whose_terminal_hc_lists_counts_once() {
 }
 
 /// Call 23: a pre-lifecycle folder freed by its `stopped` notice still names its address, so its listed (Lost)
-/// terminal is never counted as another root's reservation. Five children + nothing = admitted.
+/// terminal is never counted as another root's reservation. `MAX_MEMBERS - 1` children + nothing = admitted.
 #[test]
 fn a_freed_pre_lifecycle_folder_still_suppresses_its_address() {
     let w = World::human("");

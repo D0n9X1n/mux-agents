@@ -56,6 +56,19 @@ pub(crate) fn launch_next(
     g: &Gen,
     next: Next<'_>,
 ) -> Res<u64> {
+    launch_next_viewed(tx, core, id, g, next, |_, _| Ok(json!({}))).map(|(n, _)| n)
+}
+
+/// `launch_next` whose launch opens a view with `attach` after the promotion, as spawn's does (G1.6): the generation
+/// and the promoted record, which carries the view's fields, or `viewError` when it did not open.
+pub(crate) fn launch_next_viewed(
+    tx: &Tx<'_>,
+    core: &Core<'_>,
+    id: &str,
+    g: &Gen,
+    next: Next<'_>,
+    attach: impl FnOnce(&Core<'_>, &Value) -> Res<Value>,
+) -> Res<(u64, Value)> {
     use super::super::spawn::{Recipe, client_args, client_name, utf8};
     let r = g.record();
     let client = client_of(g)?;
@@ -83,10 +96,10 @@ pub(crate) fn launch_next(
         up_team: r.get("upTeam").and_then(Value::as_str).map(str::to_owned),
         directory: text(r.get("directory")),
     };
-    let promoted =
-        super::super::core_launch::forward(tx, core, launch, || Ok(()), |_, _| Ok(json!({})))?;
-    super::super::gens::plain_gen(&text(promoted.get("generation")))
-        .ok_or_else(|| Refusal::internal("the next generation is not a number"))
+    let promoted = super::super::core_launch::forward(tx, core, launch, || Ok(()), attach)?;
+    let n = super::super::gens::plain_gen(&text(promoted.get("generation")))
+        .ok_or_else(|| Refusal::internal("the next generation is not a number"))?;
+    Ok((n, promoted))
 }
 
 /// Checklist 7, 9 (call 25): the session's team record through the evidence reader (a link, folder, FIFO or torn

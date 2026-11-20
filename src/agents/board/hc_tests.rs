@@ -577,9 +577,10 @@ fn the_flat_bar_shows_recover_from_the_board_in_every_layout() {
             .cloned()
             .unwrap_or_default();
         assert!(line.contains("recover"), "{case}: {text:#?}");
+        // A member that needs recovery is the person's to act on: it is under the Inbox heading (the hub's sections).
         if sibling {
             assert!(
-                text.iter().any(|l| l.contains("Working")),
+                text.iter().any(|l| l.contains("Inbox")),
                 "{case}: no section heading: {text:#?}"
             );
         }

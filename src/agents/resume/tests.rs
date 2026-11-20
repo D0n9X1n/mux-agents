@@ -25,7 +25,7 @@ const OTHER_SESSION: &str = "11111111-2222-4333-8444-555555555555";
 /// subject (`prelife_fixture::to_lifecycle`), since a pre-lifecycle member never resumes.
 /// A successor (`resumedFrom`) stays as the resume that made it wrote it, so tests that shape its claim, commit or
 /// abort by hand keep their meaning.
-fn member(w: &World, id: &str, fields: Value) -> Value {
+pub(crate) fn member(w: &World, id: &str, fields: Value) -> Value {
     let successor = fields.get("resumedFrom").is_some();
     let r = pre_member(w, id, fields);
     if successor {
@@ -81,12 +81,12 @@ fn snapshot(w: &World, members: &[(&Value, &str)]) {
 
 /// hc as an admitted resume reads it: the snapshot. The session check asks hc only about a record that carries X's
 /// session (none here).
-fn facts(w: &World, members: &[(&Value, &str)]) {
+pub(crate) fn facts(w: &World, members: &[(&Value, &str)]) {
     snapshot(w, members);
 }
 
 /// The launch after the checks: hc run answers `address`, and the new view attaches as %9.
-fn launches(w: &World, address: &str) {
+pub(crate) fn launches(w: &World, address: &str) {
     w.fakes.hc_answer(Ok(Out {
         stdout: format!(r#"{{"address":"{address}"}}"#),
         ..Out::default()
@@ -276,9 +276,10 @@ fn resume_refuses_and_launches_nothing() {
             ),
             "session" => process(&w, 7001, &["claude", "--resume", SESSION_ID]),
             "cap" => {
-                for n in 1..=6 {
+                // As many running members as the cap; `{:012x}` keeps every id 12 characters and apart from ID and Y.
+                for n in 1..=crate::agents::tree::MAX_MEMBERS {
                     add(
-                        &n.to_string().repeat(12),
+                        &format!("{:012x}", 0xc00 + n),
                         json!({"name": format!("w{n}"), "pane": format!("%{}", 20 + n),
                             "sessionId": OTHER_SESSION}),
                         "running",
@@ -2243,4 +2244,127 @@ fn an_exact_id_decides_before_a_same_named_member() {
         "{out}"
     );
     assert!(w.fakes.hc_calls().is_empty(), "refused before any hc call");
+}
+
+/// Where the resumed view opened, by its launch call: `tab` for a new window, else the split's `h` or `v`.
+fn opened(w: &World) -> String {
+    let launch = w
+        .fakes
+        .mux_calls()
+        .into_iter()
+        .find(|c| c.iter().any(|a| a == "attach"))
+        .expect("a launch call");
+    match launch[1].as_str() {
+        "new-window" => "tab".into(),
+        _ => launch[2].trim_start_matches('-').into(),
+    }
+}
+
+// The session's stored split places a resumed view beside the caller; `-Tab` opens it in a new window instead, and
+// then the stored placement is never read.
+#[test]
+fn tab_opens_the_resumed_view_in_a_window_whatever_the_stored_placement() {
+    for (args, place, reads) in [
+        (&["resume", ID][..], "h", 1),
+        (&["resume", ID, "-Tab"], "tab", 0),
+        (&["resume", ID, "-tab"], "tab", 0),
+    ] {
+        let w = World::human("");
+        let x = member(&w, ID, json!({"pane": "%5", "window": "@1", "depth": 1}));
+        w.panes(&[]);
+        facts(&w, &[(&x, "exited")]);
+        launches(&w, "t1");
+        w.fakes.mux_first("@mux-agents-placement", 0, "h\n", "");
+        // The caller's window has room for a split view (the pane list `panes` answers would say otherwise).
+        w.fakes
+            .mux_first(crate::agents::split::GEOMETRY, 0, "%1|240|60|240|||\n", "");
+        resume(&w.ctx, &w.request(args)).unwrap();
+        assert_eq!(opened(&w), place, "{args:?}");
+        let read = w
+            .fakes
+            .mux_calls()
+            .iter()
+            .filter(|c| c.iter().any(|a| a == "@mux-agents-placement"))
+            .count();
+        assert_eq!(read, reads, "{args:?}");
+        w.fakes.hc_done().unwrap();
+    }
+}
+
+// A switch resume does not know is refused with its usage line, which names every switch it takes.
+#[test]
+fn an_unknown_switch_is_refused_with_resumes_usage() {
+    let w = World::human("");
+    let (code, out) = crate::cli::run(
+        &["resume".to_string(), ID.to_string(), "-Split".to_string()],
+        || Ok(&w.ctx),
+    );
+    assert_eq!(code, 2, "{out}");
+    assert!(
+        out.contains(r#""check":"usage""#)
+            && out.contains("usage: mux-agent resume <name|id> [-Fresh] [-Tab] [-Text]"),
+        "{out}"
+    );
+    assert!(w.fakes.hc_calls().is_empty());
+}
+
+// The side bar resumes by agent id only: the member of that id, even when a newer member is named that id, and never
+// a member whose name merely equals an id no member has.
+#[test]
+fn resume_by_id_never_reads_its_id_as_a_name() {
+    const C: &str = "cccccccccccc";
+    // (the id asked and the newer member's name, the member resumed or none: refused `target`)
+    for (asked, from) in [(ID, Some(ID)), (C, None)] {
+        let w = World::human("");
+        let x = member(
+            &w,
+            ID,
+            json!({"pane": "%5", "depth": 1, "createdAt": "2026-11-13T10:00:00Z"}),
+        );
+        let y = member(
+            &w,
+            Y,
+            json!({"name": asked, "pane": "%7", "depth": 1, "createdAt": "2026-11-13T10:01:00Z",
+                "sessionId": OTHER_SESSION}),
+        );
+        w.panes(&[]);
+        facts(&w, &[(&x, "exited"), (&y, "exited")]);
+        let before = folders(&w);
+        let got = match from {
+            Some(_) => {
+                launches(&w, "t1");
+                resume_by_id(&w.ctx, &w.caller(), asked, false, false)
+            }
+            None => resume_by_id(&w.ctx, &w.caller(), asked, false, false),
+        };
+        match from {
+            Some(id) => assert_eq!(got.unwrap()["from"], id, "{asked}"),
+            None => {
+                let e = got.unwrap_err();
+                assert_eq!((e.code, e.check), (2, "target"), "{asked}: {}", e.message);
+                assert_eq!(folders(&w), before, "{asked}");
+                assert_eq!(runs(&w), 0, "{asked}");
+            }
+        }
+        w.fakes.hc_done().unwrap();
+    }
+}
+
+// In a team, a failed member named like an id no member has is not recovered by that id: refused `target`, untouched.
+#[test]
+fn resume_by_id_never_recovers_a_member_named_like_its_id() {
+    use crate::agents::{
+        life_fixture as lf, prelife_fixture::bytes, reconcile_restore_tests::L,
+        reconcile_tests as rc, reconcile_verb_tests as rv, recover_tests as rt,
+    };
+    const D: &str = "dddddddddddd";
+    let w = rv::person();
+    rv::team(&w);
+    let f = rc::member(&w, rc::X, json!({"name": D, "parentAgent": {"id": L}}));
+    rt::failed_ended(&f, 1);
+    let before = bytes(&f);
+    let e = resume_by_id(&w.ctx, &w.caller(), D, false, false).unwrap_err();
+    assert_eq!((e.code, e.check), (2, "target"), "{}", e.message);
+    assert_eq!(bytes(&f), before);
+    assert_eq!(lf::count(&w, "run"), 0);
 }

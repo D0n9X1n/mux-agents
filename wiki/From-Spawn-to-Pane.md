@@ -77,7 +77,7 @@ The `reserve` closure `spawn` passes in decides whether the child gets a slot, f
 - In a team, `tree::admit` checks the caller's standing and the child's depth: the leader is depth 0 and a child is at most depth 3 (`tree::MAX_DEPTH`), else `depth`; the child's parent must not be closed by a stop.
 - Members whose generation ended since the snapshot are reaped (`registry::reap_hc` records the end and posts the parent's notice), and the snapshot is taken again when that changed anything.
 - An agent caller whose child would start from a brief, not a fork of its conversation, must pass `-BriefFile`, else `brief`.
-- Outside a team, `Snapshot::admit_name` refuses `cap` when the session already has 6 live agents. In a team, `tree::place` checks `limit` (6 members besides the leader, `tree::MAX_MEMBERS`), the `ceiling` the team's record fixed, the name, then the member's spawn `budget`, in that order.
+- Outside a team, `Snapshot::admit_name` refuses `cap` when the session already has 10 live agents. In a team, `tree::place` checks `limit` (10 members besides the leader, `tree::MAX_MEMBERS`), the `ceiling` the team's record fixed, the name, then the member's spawn `budget`, in that order.
 - The name is `-Name` or one derived from the task, unique in the session (`checks::resolve_name`), else `name`.
 - The color is the palette entry (`paint::PALETTE`) the fewest live agents use.
 
