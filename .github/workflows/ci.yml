@@ -116,7 +116,7 @@ jobs:
             out=$(cmd //d //c "$hook" < /dev/null 2>&1) || rc=$?
             if [ "$rc" != 0 ] || [ -n "$out" ]; then echo "$hook: exit $rc, printed: $out"; exit 1; fi
           done < <(python3 -c 'import json; [print(e["command"]) for es in json.load(open("hooks.json"))["hooks"].values() for e in es]')
-          [ "$n" = 6 ] || { echo "expected 6 hook commands, ran $n"; exit 1; }
+          [ "$n" = 7 ] || { echo "expected 7 hook commands, ran $n"; exit 1; }
       - name: Release panic test
         shell: bash
         run: cargo test --release --features test-panic --locked --test panic
