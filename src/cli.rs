@@ -246,7 +246,9 @@ pub static VERBS: &[VerbDef] = &[
     VerbDef {
         name: "watch",
         values: &[],
-        switches: &[],
+        // `-Managed` is passed only by the bar's own split (`sidebar::open`), never by a person, so the usage leaves
+        // it out.
+        switches: &["Managed"],
         min: 0,
         max: 0,
         usage: "usage: mux-agent watch [-Text]",

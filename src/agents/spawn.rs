@@ -2896,7 +2896,7 @@ mod tests {
         let bar_window = Rc::new(RefCell::new("@1".to_string()));
         let (seen, at) = (open.clone(), bar_window.clone());
         w.fakes.mux_script("split-window", move |argv| {
-            let bar = argv.last().is_some_and(|a| a == "watch");
+            let bar = argv.iter().any(|a| a == "watch");
             let stdout = if bar {
                 seen.set(true);
                 let target = argv.iter().position(|a| a == "-t").unwrap() + 1;
@@ -2970,7 +2970,7 @@ mod tests {
     fn bar_splits(w: &World) -> usize {
         calls(w, "split-window")
             .iter()
-            .filter(|c| c.last().is_some_and(|a| a == "watch"))
+            .filter(|c| c.iter().any(|a| a == "watch"))
             .count()
     }
 
@@ -3097,7 +3097,7 @@ mod tests {
                         .mux_first("#{pane_dead}|#{pane_pid}", 1, "", "no server");
                 }
                 _ => w.fakes.mux_script("split-window", |argv| {
-                    let bar = argv.last().is_some_and(|a| a == "watch");
+                    let bar = argv.iter().any(|a| a == "watch");
                     Ok(Output {
                         code: i32::from(bar),
                         stdout: if bar { "" } else { "%9|@5|hc attach t1\n" }.into(),

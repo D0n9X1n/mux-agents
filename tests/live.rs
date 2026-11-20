@@ -3820,7 +3820,9 @@ hc {}:
     // A watch ended while its worker opens another window's bar waits for that open, so the new bar is marked (the
     // reviewer's repro). w1's view is broken out to its own window while w2's keeps the bar's, so the bar's walk hands
     // w1's new window to its worker; an `after-split-window` hook holds that split until the test releases it, and
-    // Ctrl-C ends the bar meanwhile. The bar waits; once released, w1's window has one bar, marked, and keeps it so.
+    // Ctrl-C ends the bar meanwhile, then a second Ctrl-C a second later: the terminal stays raw until the worker is
+    // done, so the second is a byte no one reads, not a signal that kills the waiting bar. The bar waits; once
+    // released, w1's window has one bar, marked, and keeps it so.
     fn a_bar_ended_mid_open_waits_for_its_workers_open(mux: Mux) {
         let Some(mut live) = Live::human(mux) else {
             return;
@@ -3848,6 +3850,8 @@ hc {}:
             "{mux:?}: the walk's split for w1's window ran"
         );
         live.call(&["send-keys", "-t", &bar, "C-c"]);
+        std::thread::sleep(Duration::from_secs(1));
+        live.call(&["send-keys", "-t", &bar, "C-c"]);
         // The watch waits for its worker: its pane is still there while the split is held.
         std::thread::sleep(Duration::from_secs(2));
         assert!(
@@ -3863,7 +3867,7 @@ hc {}:
                 "#{pane_id}|#{window_id}|#{@mux-agents-bar}|#{@agent-role}|#{pane_start_command}",
             )
             .into_iter()
-            .filter(|r| r.split('|').nth(1) == Some(window.as_str()) && r.ends_with("watch"))
+            .filter(|r| r.split('|').nth(1) == Some(window.as_str()) && r.contains(" watch"))
             .collect()
         };
         assert!(
@@ -3879,6 +3883,108 @@ hc {}:
             !fields[2].is_empty() && fields[3] == "sidebar",
             "{mux:?}: the bar is marked and labelled: {found:?}"
         );
+    }
+
+    // A bar killed while its worker opens another window's bar (kill-pane: nothing it runs on its way out helps)
+    // leaves that split's watch unmarked, unlabelled and unrecorded (the reviewer's repro). The split started it as
+    // `watch -Managed`, so it is no watch a person ran: within the startup limit `sidebar -Close` closes it, and past
+    // the limit it has closed itself, so `focus w1` opens the window's one bar, marked, and no second beside it.
+    fn a_bar_killed_mid_open_leaves_no_stray_bar(mux: Mux) {
+        for close_early in [true, false] {
+            let Some(mut live) = Live::human(mux) else {
+                return;
+            };
+            let w1 = live.spawn("w1", &["-Split", "h"]);
+            let w2 = live.spawn("w2", &["-Split", "h"]);
+            let bar = s(&w1["sidebar"]).to_string();
+            live.worker_pid(&w1);
+            live.worker_pid(&w2);
+            let held = live.dir.join("split.held");
+            let tmux = live.server.binary().to_string_lossy().into_owned();
+            let socket = live.server.socket().to_string_lossy().into_owned();
+            let hook = format!(
+                "run-shell \"touch {} && {} -S {} wait-for hold\"",
+                support::quote(held.to_str().unwrap()),
+                support::quote(&tmux),
+                support::quote(&socket),
+            );
+            live.call(&["set-hook", "-g", "after-split-window", &hook]);
+            let pane = s(&w1["pane"]).to_string();
+            live.call(&["break-pane", "-d", "-s", &pane]);
+            let window = live.field(&pane, "#{window_id}");
+            assert!(
+                eventually(LONG, || held.exists()),
+                "{mux:?}: the walk's split for w1's window ran"
+            );
+            live.call(&["kill-pane", "-t", &bar]);
+            live.wait_gone(&bar);
+            live.call(&["set-hook", "-gu", "after-split-window"]);
+            live.call(&["wait-for", "-S", "hold"]);
+            // Every watch of the server, and those of w1's window, as `<pane>|<window>|<mark>|<label>|<command>`.
+            let all = |live: &Live| -> Vec<String> {
+                live.panes(
+                    "#{pane_id}|#{window_id}|#{@mux-agents-bar}|#{@agent-role}|#{pane_start_command}",
+                )
+                .into_iter()
+                .filter(|r| r.contains(" watch"))
+                .collect()
+            };
+            let watches = |live: &Live| -> Vec<String> {
+                all(live)
+                    .into_iter()
+                    .filter(|r| r.split('|').nth(1) == Some(window.as_str()))
+                    .collect()
+            };
+            // The split's watch runs, its opener gone before it marked it.
+            assert!(
+                eventually(LONG, || watches(&live).len() == 1),
+                "{mux:?}: {:?}",
+                watches(&live)
+            );
+            let stray = watches(&live);
+            assert!(
+                stray[0].split('|').nth(2) == Some(""),
+                "{mux:?}: the stray is unmarked: {stray:?}"
+            );
+            if close_early {
+                let (code, close) = live.run(&["sidebar", "-Close"]);
+                assert_eq!(code, 0, "{mux:?} {close}");
+                assert!(
+                    eventually(LONG, || all(&live).is_empty()),
+                    "{mux:?}: -Close within the limit leaves no watch: {:?} {close}",
+                    all(&live)
+                );
+                continue;
+            }
+            // Past the startup limit (10 s from its start, and a tick), the stray has closed itself.
+            assert!(
+                eventually(Duration::from_secs(20), || watches(&live).is_empty()),
+                "{mux:?}: the stray closed itself: {:?}",
+                watches(&live)
+            );
+            let (code, focused) = live.run(&["focus", "w1"]);
+            assert_eq!(code, 0, "{mux:?} {focused}");
+            assert!(
+                eventually(LONG, || watches(&live).len() == 1),
+                "{mux:?}: {:?}",
+                watches(&live)
+            );
+            std::thread::sleep(Duration::from_secs(11));
+            let found = watches(&live);
+            assert_eq!(found.len(), 1, "{mux:?}: one bar: {found:?}");
+            let fields: Vec<&str> = found[0].split('|').collect();
+            assert!(
+                !fields[2].is_empty() && fields[3] == "sidebar",
+                "{mux:?}: the bar is marked and labelled: {found:?}"
+            );
+            let (code, close) = live.run(&["sidebar", "-Close"]);
+            assert_eq!(code, 0, "{mux:?} {close}");
+            assert!(
+                eventually(LONG, || all(&live).is_empty()),
+                "{mux:?}: -Close leaves no watch: {:?} {close}",
+                all(&live)
+            );
+        }
     }
 
     // A sidebar lock held elsewhere for 15 s: the spawn still succeeds, its agent recorded and committed, with no bar
@@ -6557,6 +6663,7 @@ hc {}:
             bar_real_client_peek,
             break_pane_of_the_last_view_gives_its_new_window_a_bar,
             a_bar_ended_mid_open_waits_for_its_workers_open,
+            a_bar_killed_mid_open_leaves_no_stray_bar,
         ]
     );
 

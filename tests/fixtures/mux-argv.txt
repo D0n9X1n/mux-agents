@@ -1,6 +1,7 @@
 # Multiplexer argv per verb, after `<mux> -S <socket>`: one call per line, tokens joined by one space.
 # Written by hand from scripts/MuxAgents.ps1 at a96b866 (lines per call below), adapted only where the spec
-# changed: a spawn pane runs `<hc> attach <address>`; the sidebar still runs `<exe> watch`. The scoped launcher
+# changed: a spawn pane runs `<hc> attach <address>`; the sidebar runs `<exe> watch -Managed`, the switch only its own
+# split passes, so the watch cleans itself up even when its opener dies before marking it. The scoped launcher
 # runs only through hc, and the tagged-pane list frames each row with a fresh per-call marker.
 # Placeholders: <marker> the 32-hex marker, <state> the state root, <cwd> the caller's cwd, <exe> the binary,
 # <id> the new agent's id, <hc> the resolved core binary, <buffer> a read's private buffer (mux-agents-<32 hex>).
@@ -48,7 +49,7 @@
 -N list-panes -t @7 -F #{pane_pid}|#{pane_dead}|#{pane_id}|#{@mux-agents-bar}
 # 0.2.3 (S1): the window's width sizes the bar (0.2.4: max(30, width * 5 / 100)); a full-height split at the right edge
 -N display-message -p -t @7 #{window_width}|#{s/[|\n\r]/x/:@mux-agents-sidebar-min}|#{s/[|\n\r]/x/:@mux-agents-sidebar-percent}
--N split-window -d -f -h -P -F #{pane_id}|#{window_id}|#{pane_pid} -t @7 -e MUX_AGENTS_STATE=<state> -l 40 <exe> watch
+-N split-window -d -f -h -P -F #{pane_id}|#{window_id}|#{pane_pid} -t @7 -e MUX_AGENTS_STATE=<state> -l 40 <exe> watch -Managed
 # 0.3.0 (QA): the new pane carries the bar's mark, its own pid, from its split on
 -N if-shell -F -t %13 #{==:#{pane_pid},113} 'set-option -p -t %13 @mux-agents-bar 113'
 -N if-shell -F -t %13 #{&&:#{==:#{pane_dead},0},#{==:#{pane_pid},113}} 'set-option -p -t %13 @agent-role sidebar'
@@ -84,7 +85,7 @@
 -N list-panes -t @7 -F #{pane_pid}|#{pane_dead}|#{pane_id}|#{@mux-agents-bar}
 # 0.2.3 (S1): the window's width sizes the bar (0.2.4: max(30, width * 5 / 100)); a full-height split at the right edge
 -N display-message -p -t @7 #{window_width}|#{s/[|\n\r]/x/:@mux-agents-sidebar-min}|#{s/[|\n\r]/x/:@mux-agents-sidebar-percent}
--N split-window -d -f -h -P -F #{pane_id}|#{window_id}|#{pane_pid} -t @7 -e MUX_AGENTS_STATE=<state> -l 40 <exe> watch
+-N split-window -d -f -h -P -F #{pane_id}|#{window_id}|#{pane_pid} -t @7 -e MUX_AGENTS_STATE=<state> -l 40 <exe> watch -Managed
 # 0.3.0 (QA): the new pane carries the bar's mark, its own pid, from its split on
 -N if-shell -F -t %13 #{==:#{pane_pid},113} 'set-option -p -t %13 @mux-agents-bar 113'
 -N if-shell -F -t %13 #{&&:#{==:#{pane_dead},0},#{==:#{pane_pid},113}} 'set-option -p -t %13 @agent-role sidebar'
@@ -132,7 +133,7 @@
 -N list-panes -t @1 -F #{pane_id}|#{&&:#{==:#{@agent-role},sidebar},#{==:#{pane_dead},0}}
 -N list-panes -t @1 -F #{pane_pid}|#{pane_dead}|#{pane_id}|#{@mux-agents-bar}
 -N display-message -p -t @1 #{window_width}|#{s/[|\n\r]/x/:@mux-agents-sidebar-min}|#{s/[|\n\r]/x/:@mux-agents-sidebar-percent}
--N split-window -d -f -h -P -F #{pane_id}|#{window_id}|#{pane_pid} -t @1 -e MUX_AGENTS_STATE=<state> -l 40 <exe> watch
+-N split-window -d -f -h -P -F #{pane_id}|#{window_id}|#{pane_pid} -t @1 -e MUX_AGENTS_STATE=<state> -l 40 <exe> watch -Managed
 -N if-shell -F -t %13 #{==:#{pane_pid},113} 'set-option -p -t %13 @mux-agents-bar 113'
 -N if-shell -F -t %13 #{&&:#{==:#{pane_dead},0},#{==:#{pane_pid},113}} 'kill-pane -t %13'
 -N display-message -p -t %13 #{pane_id}|#{pane_pid}
@@ -218,7 +219,7 @@
 -N list-panes -t @1 -F #{pane_pid}|#{pane_dead}|#{pane_id}|#{@mux-agents-bar}
 # 0.2.3 (S1): the window's width, then a full-height split at the right edge (:1578-1579)
 -N display-message -p -t @1 #{window_width}|#{s/[|\n\r]/x/:@mux-agents-sidebar-min}|#{s/[|\n\r]/x/:@mux-agents-sidebar-percent}
--N split-window -d -f -h -P -F #{pane_id}|#{window_id}|#{pane_pid} -t @1 -e MUX_AGENTS_STATE=<state> -l 40 <exe> watch
+-N split-window -d -f -h -P -F #{pane_id}|#{window_id}|#{pane_pid} -t @1 -e MUX_AGENTS_STATE=<state> -l 40 <exe> watch -Managed
 # 0.3.0 (QA): the new pane carries the bar's mark, its own pid, from its split on
 -N if-shell -F -t %13 #{==:#{pane_pid},113} 'set-option -p -t %13 @mux-agents-bar 113'
 # :1584
@@ -241,9 +242,9 @@
 # 0.3.0 (QA): before a split, the window's panes with the bar's mark; none here is ours
 -N list-panes -t @1 -F #{pane_pid}|#{pane_dead}|#{pane_id}|#{@mux-agents-bar}
 -N display-message -p -t @1 #{window_width}|#{s/[|\n\r]/x/:@mux-agents-sidebar-min}|#{s/[|\n\r]/x/:@mux-agents-sidebar-percent}
--N split-window -d -f -h -P -F #{pane_id}|#{window_id}|#{pane_pid} -t @1 -e MUX_AGENTS_STATE=<state> -l 40 <exe> watch
+-N split-window -d -f -h -P -F #{pane_id}|#{window_id}|#{pane_pid} -t @1 -e MUX_AGENTS_STATE=<state> -l 40 <exe> watch -Managed
 # :1580
--N split-window -d -f -h -P -F #{pane_id}|#{window_id}|#{pane_pid} -t @1 -e MUX_AGENTS_STATE=<state> <exe> watch
+-N split-window -d -f -h -P -F #{pane_id}|#{window_id}|#{pane_pid} -t @1 -e MUX_AGENTS_STATE=<state> <exe> watch -Managed
 # 0.3.0 (QA): the new pane carries the bar's mark, its own pid, from its split on
 -N if-shell -F -t %13 #{==:#{pane_pid},113} 'set-option -p -t %13 @mux-agents-bar 113'
 -N if-shell -F -t %13 #{&&:#{==:#{pane_dead},0},#{==:#{pane_pid},113}} 'set-option -p -t %13 @agent-role sidebar'
@@ -273,6 +274,9 @@
 -N if-shell -F -t %13 #{&&:#{==:#{pane_dead},0},#{==:#{pane_pid},113}} 'kill-pane -t %13'
 -N display-message -p -t %13 #{pane_id}|#{pane_pid}
 -N set-option -wu -t @1 @mux-agents-sidebar-id
+# the hub: then the session's panes, so a watch the bar's split started (`watch -Managed`, read from its process)
+# that no window's record proves, its opener gone before it marked it, is killed too
+-N list-panes -s -t $3 -F #{pane_pid}|#{pane_dead}|#{pane_id}|#{@mux-agents-bar}
 
 [watch, one frame]
 -N display-message -p -t %1 #{pid}|#{pane_pid}|#{session_id}|#{window_id}|#{@agent-id}

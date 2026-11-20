@@ -169,10 +169,20 @@ const MARK_FORMAT: &str = "#{pane_pid}|#{pane_dead}|#{pane_id}|#{@mux-agents-bar
 // A watch not proven (its window's record not naming its pane) for this long, since it started or since it was last
 // proven, whose pane carries its own mark, removes its label and mark and leaves, so its pane closes with it.
 const STARTUP: Duration = Duration::from_secs(10);
+// The switch the bar's split passes its watch, and only it (`Origin::Split`).
+const MANAGED: &str = "-Managed";
 // The watch's own pane's pid and the bar's mark.
 const OWN_MARK: &str = "#{pane_pid}|#{@mux-agents-bar}";
 // A new split's process may not have exec'd yet: it is read up to this many times, 50 ms apart.
 const WATCH_TRIES: u32 = 20;
+
+/// Who started a watch: a person (`watch`), or the split of the bar's open (`watch -Managed`, `open`), which no person
+/// passes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Origin {
+    Hand,
+    Split,
+}
 
 /// What `ensure` found: a bar it opened, the session's bar, or none because the session turned it off.
 #[derive(Debug, PartialEq, Eq)]
@@ -255,6 +265,9 @@ fn find_or_open(ctx: &Ctx, window: &str) -> Res<(String, String, bool)> {
 /// that failed after its split left it, and its watch proves itself (then `prove` adopts it) or leaves within
 /// STARTUP. Nothing is killed here: the refusal names the pane. A mark for another pid (one rotate-window moved) is
 /// no bar's, and a dead pane blocks nothing. A list that cannot be read refuses: it may hold such a pane.
+/// shortcut: a watch the bar's split started whose opener died before the mark carries none, so it blocks nothing
+/// here; an ensure within its STARTUP opens a second bar beside it, and the stray closes itself at STARTUP
+/// (`self_exit`, `Origin::Split`). Reading each pane's process here would cost every ensure a process read per pane.
 fn stuck(ctx: &Ctx, window: &str) -> Res<()> {
     let listed = native(ctx, &["list-panes", "-t", window, "-F", MARK_FORMAT], false)?;
     for line in listed.stdout.split('\n') {
@@ -2369,18 +2382,24 @@ fn read_size(ctx: &Ctx, bar: &str) -> Option<Size> {
 /// a write fails, `probe-failed` after 30 unknown probes in a row and `interrupted` on Ctrl-C. A failed board read
 /// still draws the last board marked `refresh failed`, so a dead terminal is found even when nothing else answers.
 /// An input that can no longer be read is dropped, which restores its terminal, and the loop goes on without it;
-/// `input` is owned here, so it is dropped, and its terminal restored, on every return and every unwind.
+/// `input` is owned here, so it is dropped, and its terminal restored, on every return (once the jobs finished) and
+/// every unwind.
 pub fn run_watch(
     ctx: &Ctx,
     caller: &Caller,
-    input: Box<dyn Input>,
+    origin: Origin,
+    mut input: Box<dyn Input>,
     write: &mut dyn FnMut(&str) -> io::Result<()>,
 ) -> &'static str {
     let mut panel = Panel::default();
-    let ended = watch_loop(ctx, caller, input, write, &mut panel);
+    let ended = watch_loop(ctx, caller, origin, &mut input, write, &mut panel);
     // Every way out waits for the work running off the loop first (`Jobs::finish`): another window's bar between its
-    // split and its mark, or a resume between its launch and its record, is never cut when this process exits.
-    if panel.jobs.finish(ctx, caller, JOBS_WAIT) {
+    // split and its mark, or a resume between its launch and its record, is never cut when this process exits. The
+    // input is kept until then, so the terminal stays as the loop had it: a second Ctrl-C while this waits is a byte
+    // no one reads, not a signal that ends the process mid-open.
+    let finished = panel.jobs.finish(ctx, caller, JOBS_WAIT);
+    drop(input);
+    if finished {
         return ended;
     }
     // Reported in the end reason, never waited for for ever. Leaked once: the watch's process ends right after.
@@ -2395,7 +2414,8 @@ const JOBS_WAIT: Duration = Duration::from_secs(2 * crate::state::lock::LOCK_WAI
 fn watch_loop(
     ctx: &Ctx,
     caller: &Caller,
-    mut input: Box<dyn Input>,
+    origin: Origin,
+    input: &mut Box<dyn Input>,
     write: &mut dyn FnMut(&str) -> io::Result<()>,
     panel: &mut Panel,
 ) -> &'static str {
@@ -2422,7 +2442,8 @@ fn watch_loop(
     // reentry-6a E4.5: a status window never held a view, so its bar never leaves for want of one (read once).
     let mut status: Option<bool> = None;
     // When the watch started or was last proven, and whether its pane was read as not marked for it (run by hand: a
-    // mark is only ever set by the open that splits the pane), so the startup limit is checked no more.
+    // mark is only ever set by the open that splits the pane, and a watch that split started is never run by hand),
+    // so the startup limit is checked no more.
     let mut proven_at = ctx.clock.now();
     let mut by_hand = false;
     // The other view windows whose ensure failed, and when: each is tried again once REARM has passed.
@@ -2475,7 +2496,7 @@ fn watch_loop(
                 .unwrap_or_default()
                 >= STARTUP
         {
-            match self_exit(ctx, caller) {
+            match self_exit(ctx, caller, origin) {
                 SelfExit::Left => return "unproven",
                 SelfExit::ByHand => by_hand = true,
                 SelfExit::Kept => proven_at = ctx.clock.now(),
@@ -2726,7 +2747,7 @@ fn watch_loop(
                 Waited::Timeout => keys.idle(),
                 // The old input is dropped here, which restores its terminal.
                 Waited::Closed => {
-                    input = Box::new(NoInput);
+                    *input = Box::new(NoInput);
                     Vec::new()
                 }
             };
@@ -3842,7 +3863,7 @@ pub fn watch(ctx: &Ctx, request: &Request) -> Res<Map<String, Value>> {
 /// a refusal leaves the terminal as it was.
 pub(crate) fn watch_on(
     ctx: &Ctx,
-    _request: &Request,
+    request: &Request,
     terminal: bool,
     open: &dyn Fn() -> Box<dyn Input>,
     write: &mut dyn FnMut(&str) -> io::Result<()>,
@@ -3861,7 +3882,12 @@ pub(crate) fn watch_on(
     // script hc call by call, so they keep the check per connect (`hc::tests` covers the cache).
     #[cfg(not(test))]
     crate::hc::remember_versions();
-    let ended = run_watch(ctx, &caller, open(), write);
+    let origin = if request.switch("Managed") {
+        Origin::Split
+    } else {
+        Origin::Hand
+    };
+    let ended = run_watch(ctx, &caller, origin, open(), write);
     let mut reply = Map::new();
     reply.insert("pane".into(), caller.pane.into());
     reply.insert("ended".into(), ended.into());
@@ -3952,6 +3978,7 @@ pub fn sidebar(ctx: &Ctx, request: &Request) -> Res<Map<String, Value>> {
             }
             closed.extend(close_window(ctx, window)?);
         }
+        closed.extend(close_strays(ctx, &caller.session)?);
         if closed.is_empty() {
             let labelled = labelled(ctx, &["-s", "-t", &caller.session])?;
             if !labelled.is_empty() {
@@ -3986,6 +4013,47 @@ fn close_window(ctx: &Ctx, window: &str) -> Res<Option<String>> {
     }
     let _ = native(ctx, &["set-option", "-wu", "-t", &bar.window, RECORD], true);
     Ok(Some(bar.pane))
+}
+
+/// The session's watches the bar's split started (`watch -Managed`, read from each live pane's process) that are left
+/// once every proven bar closed, each killed only while it is alive and still runs that process: an open whose opener
+/// died between its split and its record left one that no window's record proves (it would close itself within
+/// STARTUP). A watch a person ran is never one. Answers the panes closed; a kill that did not take is left to the
+/// watch's own STARTUP limit. An unreadable list refuses: it may hold such a watch.
+fn close_strays(ctx: &Ctx, session: &str) -> Res<Vec<String>> {
+    let listed = native(
+        ctx,
+        &["list-panes", "-s", "-t", session, "-F", MARK_FORMAT],
+        false,
+    )?;
+    let mut closed: Vec<String> = Vec::new();
+    for line in listed.stdout.split('\n') {
+        let line = line.strip_suffix('\r').unwrap_or(line);
+        let mut fields = line.splitn(4, '|');
+        let (Some(pid), Some("0"), Some(pane)) = (fields.next(), fields.next(), fields.next())
+        else {
+            continue;
+        };
+        let Ok(pid) = pid.parse::<u32>() else {
+            continue;
+        };
+        if pane_id(pane) && split_watch(ctx, pid) && kill_bar(ctx, pane, pid) {
+            closed.push(pane.to_string());
+        }
+    }
+    Ok(closed)
+}
+
+/// Whether `pid` is this binary run as `<binary> watch -Managed`: a watch the bar's split started.
+fn split_watch(ctx: &Ctx, pid: u32) -> bool {
+    ctx.os.row(pid).is_some_and(|row| {
+        is_watch(ctx, &row)
+            && row
+                .argv
+                .as_ref()
+                .and_then(|a| a.get(2))
+                .is_some_and(|a| a == MANAGED)
+    })
 }
 
 /// `q` then `y`: the bar closes as `sidebar -Close` closes it, for its own window only, in this process. Under the
@@ -4125,8 +4193,8 @@ fn watch_start(ctx: &Ctx, pid: u32) -> Option<i64> {
     is_watch(ctx, &row).then_some(row.start).flatten()
 }
 
-/// Whether `row` is this binary run as exactly `<binary> watch`: a side bar, known by its process because a leaving bar
-/// removes its own label and mark before it exits.
+/// Whether `row` is this binary run as exactly `<binary> watch`, or `<binary> watch -Managed` as the bar's split starts
+/// it: a side bar, known by its process because a leaving bar removes its own label and mark before it exits.
 pub(crate) fn is_watch(ctx: &Ctx, row: &crate::proc::Row) -> bool {
     let (Some(exe), Some(path), Some(argv)) = (ctx.exe.to_str(), &row.path, &row.argv) else {
         return false;
@@ -4136,7 +4204,12 @@ pub(crate) fn is_watch(ctx: &Ctx, row: &crate::proc::Row) -> bool {
     } else {
         path == exe
     };
-    same && argv.len() == 2 && argv[1] == "watch"
+    same && argv.get(1).is_some_and(|a| a == "watch")
+        && match argv.len() {
+            2 => true,
+            3 => argv[2] == MANAGED,
+            _ => false,
+        }
 }
 
 /// `window`'s bar, proven now (T9): its window record names a pane whose one read shows it alive (`#{pane_dead}` 0)
@@ -4366,20 +4439,24 @@ enum SelfExit {
     Unread,
 }
 
-/// a watch not proven for STARTUP decides under the session's sidebar lock, from what it reads there. Its pane
-/// not marked for this process (run by hand) is no bar's to clean up; its window's record proving it in full (an
-/// ensure recorded or adopted it while it waited on the lock) keeps it; else it removes its pane's label and mark
-/// (each bound to its pid, like `leave`) and leaves, so its pane closes with it and, dead, blocks no later bar. An
-/// unread mark or record, or a lock not taken, decides nothing.
-fn self_exit(ctx: &Ctx, caller: &Caller) -> SelfExit {
+/// a watch not proven for STARTUP decides under the session's sidebar lock, from what it reads there. A watch a
+/// person ran (`Origin::Hand`) whose pane is not marked for this process is no bar's to clean up; one the bar's split
+/// started (`Origin::Split`) is the bar's marked or not, since its opener may have died before it marked the pane.
+/// Its window's record proving it in full (an ensure recorded or adopted it while it waited on the lock) keeps it;
+/// else it removes its pane's label and mark (each bound to its pid, like `leave`; a no-op when neither is set) and
+/// leaves, so its pane closes with it and, dead, blocks no later bar. An unread mark or record, or a lock not taken,
+/// decides nothing.
+fn self_exit(ctx: &Ctx, caller: &Caller, origin: Origin) -> SelfExit {
     lock(ctx, &scope::shown_lock("sidebar", caller), || {
         let read = |args: &[&str]| native(ctx, args, true).ok().filter(|r| r.code == 0);
-        let Some(mark) = read(&["display-message", "-p", "-t", &caller.pane, OWN_MARK]) else {
-            return Ok(SelfExit::Unread);
-        };
-        let own = ctx.pid.to_string();
-        if mark.stdout.trim_end_matches(['\r', '\n']) != format!("{own}|{own}") {
-            return Ok(SelfExit::ByHand);
+        if origin == Origin::Hand {
+            let Some(mark) = read(&["display-message", "-p", "-t", &caller.pane, OWN_MARK]) else {
+                return Ok(SelfExit::Unread);
+            };
+            let own = ctx.pid.to_string();
+            if mark.stdout.trim_end_matches(['\r', '\n']) != format!("{own}|{own}") {
+                return Ok(SelfExit::ByHand);
+            }
         }
         let Some(record) = read(&["show-options", "-wqv", "-t", &caller.window, RECORD]) else {
             return Ok(SelfExit::Unread);
@@ -4475,7 +4552,9 @@ fn open(ctx: &Ctx, target: &str) -> Res<(String, String)> {
         target,
     ];
     split.extend(env.iter().map(String::as_str));
-    let command = [utf8(&ctx.exe)?, "watch"];
+    // `-Managed`: the watch knows this split started it, so it cleans itself up even when this open dies before the
+    // mark below (`self_exit`), and `sidebar -Close` knows it for the bar's.
+    let command = [utf8(&ctx.exe)?, "watch", MANAGED];
     let mut created = native(ctx, &[&split[..], &["-l", &width], &command].concat(), true)?;
     if size_refusal(&created) {
         created = native(ctx, &[&split[..], &command].concat(), true)?;
@@ -7713,6 +7792,7 @@ mod tests {
         run_watch(
             &w.ctx,
             &caller,
+            Origin::Hand,
             Box::new(Script::new(&w.fakes, steps)),
             &mut |frame: &str| {
                 frames.push(frame.to_string());
@@ -7771,6 +7851,7 @@ mod tests {
             run_watch(
                 &w.ctx,
                 &caller,
+                Origin::Hand,
                 Box::new(Script::new(&w.fakes, steps)),
                 &mut |frame: &str| {
                     frames.push(frame.to_string());
@@ -8008,11 +8089,17 @@ mod tests {
     fn watch_run(w: &World) -> (&'static str, Vec<String>) {
         let caller = w.caller();
         let mut frames = Vec::new();
-        let ended = run_watch(&w.ctx, &caller, Box::new(NoInput), &mut |frame: &str| {
-            frames.push(frame.to_string());
-            assert!(frames.len() <= 100, "runaway");
-            Ok(())
-        });
+        let ended = run_watch(
+            &w.ctx,
+            &caller,
+            Origin::Hand,
+            Box::new(NoInput),
+            &mut |frame: &str| {
+                frames.push(frame.to_string());
+                assert!(frames.len() <= 100, "runaway");
+                Ok(())
+            },
+        );
         w.fakes.hc_done().unwrap();
         (ended, frames)
     }
@@ -8147,9 +8234,13 @@ mod tests {
         let w = watch_world(&["live", "live", "gone"]);
         let caller = w.caller();
         watch_frames(&w, 1);
-        let ended = run_watch(&w.ctx, &caller, Box::new(NoInput), &mut |_| {
-            Err(io::Error::other("EIO"))
-        });
+        let ended = run_watch(
+            &w.ctx,
+            &caller,
+            Origin::Hand,
+            Box::new(NoInput),
+            &mut |_| Err(io::Error::other("EIO")),
+        );
         w.fakes.hc_done().unwrap();
         assert_eq!(ended, "output-closed");
         assert_eq!(probes(&w), 1);
@@ -8159,9 +8250,13 @@ mod tests {
         w.fakes.mux_first("list-panes", 1, "", "lock");
         let caller = w.caller();
         watch_frames(&w, 1);
-        let ended = run_watch(&w.ctx, &caller, Box::new(NoInput), &mut |_| {
-            Err(io::Error::other("EIO"))
-        });
+        let ended = run_watch(
+            &w.ctx,
+            &caller,
+            Origin::Hand,
+            Box::new(NoInput),
+            &mut |_| Err(io::Error::other("EIO")),
+        );
         w.fakes.hc_done().unwrap();
         assert_eq!((ended, probes(&w)), ("output-closed", 1));
     }
@@ -8353,16 +8448,22 @@ mod tests {
         let (mut go, mut holder) = (Some(go_tx), Some(holder));
         let (start, mut frames, mut sent_by_frame) = (std::time::Instant::now(), 0, Vec::new());
         let fakes = w.fakes.clone();
-        run_watch(&w.ctx, &caller, Box::new(NoInput), &mut |_: &str| {
-            frames += 1;
-            sent_by_frame.push(sent(&fakes).len());
-            // The tick that found the news drew its frame: the lock is released only now.
-            if frames == 2 {
-                go.take().unwrap().send(()).unwrap();
-                holder.take().unwrap().join().unwrap();
-            }
-            Ok(())
-        });
+        run_watch(
+            &w.ctx,
+            &caller,
+            Origin::Hand,
+            Box::new(NoInput),
+            &mut |_: &str| {
+                frames += 1;
+                sent_by_frame.push(sent(&fakes).len());
+                // The tick that found the news drew its frame: the lock is released only now.
+                if frames == 2 {
+                    go.take().unwrap().send(()).unwrap();
+                    holder.take().unwrap().join().unwrap();
+                }
+                Ok(())
+            },
+        );
         w.fakes.hc_done().unwrap();
         assert!(
             start.elapsed() < Duration::from_secs(5),
@@ -8459,7 +8560,7 @@ mod tests {
         let caller = w.caller();
         let mut frames = Vec::new();
         let mut times = Vec::new();
-        let ended = run_watch(&w.ctx, &caller, input, &mut |frame: &str| {
+        let ended = run_watch(&w.ctx, &caller, Origin::Hand, input, &mut |frame: &str| {
             frames.push(frame.to_string());
             let at = w.ctx.clock.now().duration_since(SystemTime::UNIX_EPOCH);
             times.push(at.unwrap().as_millis() as u64);
@@ -8615,6 +8716,7 @@ mod tests {
         let ended = run_watch(
             &w.ctx,
             &caller,
+            Origin::Hand,
             Box::new(Script::new(&w.fakes, vec![])),
             &mut |_| {
                 frames += 1;
@@ -8807,7 +8909,7 @@ mod tests {
         let caller = w.caller();
         let mut frames = 0;
         watch_frames(&w, 2);
-        let ended = run_watch(&w.ctx, &caller, Box::new(script), &mut |_| {
+        let ended = run_watch(&w.ctx, &caller, Origin::Hand, Box::new(script), &mut |_| {
             frames += 1;
             assert!(frames <= 100, "runaway");
             // The terminal takes 250 ms to take the frame.
@@ -8877,7 +8979,7 @@ mod tests {
             let caller = w.caller();
             let mut frames = 0;
             watch_frames(&w, if want == "probe-failed" { 29 } else { 1 });
-            let ended = run_watch(&w.ctx, &caller, input, &mut |frame| {
+            let ended = run_watch(&w.ctx, &caller, Origin::Hand, input, &mut |frame| {
                 frames += 1;
                 assert!(frames <= 100, "runaway");
                 write(frame)
@@ -8895,7 +8997,9 @@ mod tests {
         let caller = w.caller();
         watch_frames(&w, 1);
         let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            run_watch(&w.ctx, &caller, input, &mut |_| panic!("write"))
+            run_watch(&w.ctx, &caller, Origin::Hand, input, &mut |_| {
+                panic!("write")
+            })
         }));
         assert!(panicked.is_err());
         w.fakes.hc_done().unwrap();
@@ -8998,7 +9102,7 @@ mod tests {
         let (input, log) = term_input(vec![Err(io::Error::other("EIO"))]);
         let caller = w.caller();
         watch_frames(&w, 2);
-        let ended = run_watch(&w.ctx, &caller, input, &mut |_| {
+        let ended = run_watch(&w.ctx, &caller, Origin::Hand, input, &mut |_| {
             log.borrow_mut().push("frame".into());
             Ok(())
         });
@@ -10707,12 +10811,21 @@ mod tests {
         let p = panes.clone();
         w.fakes
             .mux_script("#{pane_id}|#{@mux-agents-bar}", move |argv| {
-                assert_eq!((argv[2].as_str(), argv[4].as_str()), ("-t", "-F"));
-                let dead_asked = argv[5].contains("pane_dead");
+                // `-s -t $3` lists the session (-Close's strays); `-t @<n>` one window.
+                let window = if argv[2] == "-s" {
+                    assert_eq!(argv[2..6], ["-s", "-t", "$3", "-F"]);
+                    None
+                } else {
+                    assert_eq!((argv[2].as_str(), argv[4].as_str()), ("-t", "-F"));
+                    Some(argv[3].clone())
+                };
+                let dead_asked = argv.last().unwrap().contains("pane_dead");
                 let text: String = p
                     .borrow()
                     .iter()
-                    .filter(|(k, _)| k.starts_with('%') && window_of(&p, k) == argv[3])
+                    .filter(|(k, _)| {
+                        k.starts_with('%') && window.as_ref().is_none_or(|w| *w == window_of(&p, k))
+                    })
                     .map(|(pane, _)| {
                         let pid = get(&p, &format!("pid {pane}")).unwrap_or_default();
                         let mark = get(&p, &format!("mark {pane}")).unwrap_or_default();
@@ -10875,7 +10988,7 @@ mod tests {
 
     fn split_line(w: &World, sized: bool) -> String {
         format!(
-            "-N split-window -d -f -h -P -F #{{pane_id}}|#{{window_id}}|#{{pane_pid}} -t @1{}{} /bin/mux-agent watch",
+            "-N split-window -d -f -h -P -F #{{pane_id}}|#{{window_id}}|#{{pane_pid}} -t @1{}{} /bin/mux-agent watch -Managed",
             env_text(w),
             if sized { " -l 40" } else { "" }
         )
@@ -10916,6 +11029,9 @@ mod tests {
     // the window's panes with their pid and the bar's mark, read before a split.
     const MARKS: &str =
         "-N list-panes -t @1 -F #{pane_pid}|#{pane_dead}|#{pane_id}|#{@mux-agents-bar}";
+    // -Close's last read: the session's panes with their pid, for a watch the bar's split started that no record proves.
+    const STRAYS: &str =
+        "-N list-panes -s -t $3 -F #{pane_pid}|#{pane_dead}|#{pane_id}|#{@mux-agents-bar}";
 
     /// open's mark of the new bar, as the multiplexer receives it: only while the pane runs `pid`.
     fn mark_line(pane: &str, pid: u32) -> String {
@@ -11139,6 +11255,35 @@ mod tests {
         );
     }
 
+    // The bar's split starts its watch as `watch -Managed`, so the watch knows the split started it, whether or not its
+    // opener lives to mark it; that process is still proven this binary's watch, recorded and labelled.
+    #[test]
+    fn the_bars_split_starts_its_watch_managed() {
+        let (w, panes) = sidebar_world("", Mux::default());
+        let exe = w.ctx.exe.display().to_string();
+        w.fakes.mux_script("-l 40", move |argv| {
+            assert_eq!(argv[argv.len() - 3..], [exe.as_str(), "watch", "-Managed"]);
+            Ok(out(0, "%7|@1|107\n", ""))
+        });
+        w.fakes.forget(107);
+        w.fakes.process(crate::proc::Row {
+            argv: Some(vec![
+                w.ctx.exe.display().to_string(),
+                "watch".into(),
+                "-Managed".into(),
+            ]),
+            ..watch_row(107, &w.ctx.exe.display().to_string())
+        });
+        set(&panes, "%7", "|".into());
+        set(&panes, "pid %7", "107".into());
+        assert_eq!(
+            run(&w, &[]),
+            r#"ok {"pane":"%7","window":"@1","opened":true}"#
+        );
+        assert_eq!(record(&panes).as_deref(), Some("%7 107 1070"));
+        assert_eq!(roles(&panes), "%1=|,%2=other|,%7=sidebar|");
+    }
+
     // T9 test 1: the record is written after the process check, before open returns.
     #[test]
     fn open_records_the_bar_once_its_process_is_this_watch() {
@@ -11283,7 +11428,8 @@ mod tests {
                 WINDOWS.into(),
                 READ_RECORD.into(),
                 close_line("%7", 107),
-                CLEAR_RECORD.into()
+                CLEAR_RECORD.into(),
+                STRAYS.into(),
             ]
         );
         assert_eq!(
@@ -11298,7 +11444,14 @@ mod tests {
         );
         assert_eq!(
             calls(&w),
-            [OFF, SESSION_RECORD, WINDOWS, READ_RECORD, SESSION_LABELS]
+            [
+                OFF,
+                SESSION_RECORD,
+                WINDOWS,
+                READ_RECORD,
+                STRAYS,
+                SESSION_LABELS
+            ]
         );
         assert_eq!(
             run(&w, &[]),
@@ -11981,7 +12134,8 @@ mod tests {
         want.extend(opened(&w));
         assert_eq!(calls(&w), want);
         assert_eq!(roles(&panes), "%1=|,%2=other|,%7=sidebar|");
-        // The pane command is two arguments, the exe (spaces and all) then `watch`, never one joined string.
+        // The pane command is three arguments, the exe (spaces and all), `watch` and `-Managed`, never one joined
+        // string.
         let (mut w, panes) = sidebar_world("", Mux::default());
         w.ctx.exe = std::path::PathBuf::from("/opt/mux agents/bin/mux-agent");
         set(&panes, "exe", "/opt/mux agents/bin/mux-agent".into());
@@ -12010,7 +12164,16 @@ mod tests {
             w.ctx.state_root.to_str().unwrap(),
             crate::state::root::HOST,
         ));
-        expected.extend(["-l", "40", "/opt/mux agents/bin/mux-agent", "watch"].map(String::from));
+        expected.extend(
+            [
+                "-l",
+                "40",
+                "/opt/mux agents/bin/mux-agent",
+                "watch",
+                "-Managed",
+            ]
+            .map(String::from),
+        );
         assert_eq!(split, [expected]);
     }
 
@@ -12307,16 +12470,22 @@ mod tests {
         let start = std::time::Instant::now();
         let (mut first, mut split_at_first) = (None, None);
         let (mut go, mut holder, fakes) = (Some(go_tx), Some(holder), w.fakes.clone());
-        run_watch(&w.ctx, &caller, Box::new(NoInput), &mut |_: &str| {
-            if first.is_none() {
-                first = Some(start.elapsed());
-                split_at_first = Some(split(&fakes));
-                // The lock is released only once that frame is drawn.
-                go.take().unwrap().send(()).unwrap();
-                holder.take().unwrap().join().unwrap();
-            }
-            Ok(())
-        });
+        run_watch(
+            &w.ctx,
+            &caller,
+            Origin::Hand,
+            Box::new(NoInput),
+            &mut |_: &str| {
+                if first.is_none() {
+                    first = Some(start.elapsed());
+                    split_at_first = Some(split(&fakes));
+                    // The lock is released only once that frame is drawn.
+                    go.take().unwrap().send(()).unwrap();
+                    holder.take().unwrap().join().unwrap();
+                }
+                Ok(())
+            },
+        );
         let first = first.expect("a frame");
         assert!(
             first < Duration::from_millis(200),
@@ -12360,10 +12529,16 @@ mod tests {
         let caller = w.caller();
         let start = Instant::now();
         let mut first = None;
-        run_watch(&w.ctx, &caller, Box::new(NoInput), &mut |_: &str| {
-            first.get_or_insert_with(Instant::now);
-            Ok(())
-        });
+        run_watch(
+            &w.ctx,
+            &caller,
+            Origin::Hand,
+            Box::new(NoInput),
+            &mut |_: &str| {
+                first.get_or_insert_with(Instant::now);
+                Ok(())
+            },
+        );
         let first = first.expect("a frame");
         let late = first - start;
         assert!(
@@ -12400,9 +12575,13 @@ mod tests {
         w.fakes.mux_first("#{==:#{@agent-role},sidebar}", 0, "", "");
         w.fakes.mux_rule("split-window", 0, "%20|@6|4242\n", "");
         let caller = w.caller();
-        let ended = run_watch(&w.ctx, &caller, Box::new(NoInput), &mut |_: &str| {
-            Err(io::Error::other("closed"))
-        });
+        let ended = run_watch(
+            &w.ctx,
+            &caller,
+            Origin::Hand,
+            Box::new(NoInput),
+            &mut |_: &str| Err(io::Error::other("closed")),
+        );
         assert_eq!(ended, "output-closed");
         let calls: Vec<String> = w.fakes.mux_calls().iter().map(|c| c.join(" ")).collect();
         let split = calls
@@ -12414,6 +12593,49 @@ mod tests {
         assert!(
             split.is_some() && mark.is_some_and(|m| Some(m) > split),
             "split, then marked, before the watch returned: {calls:?}"
+        );
+    }
+
+    // A watch that ends while its worker opens another window's bar keeps its terminal as the loop had it (raw, its
+    // signal handlers armed) until that open is done: a second Ctrl-C meanwhile is a byte no one reads, never a
+    // signal that kills the waiting watch before its worker marks the new bar.
+    #[test]
+    fn a_watch_keeps_its_terminal_until_its_workers_finish() {
+        let (w, _) = keep_world(&["live", "gone"], win("%1", in_place()));
+        crate::agents::core_fixture::member(
+            &w,
+            "cccccccccccc",
+            json!({"name":"third","pane":"%10","startCommand":crate::agents::fixture::launch_command("%10")}),
+        );
+        w.fakes.mux_script("#{pane_start_command}", |argv| {
+            let rows = [
+                "%9|@1|300|aaaaaaaaaaaa|worker",
+                "%10|@6|301|cccccccccccc|third",
+            ];
+            Ok(out(
+                0,
+                &crate::agents::fixture::listed_dead(argv, &rows, "\n", &[]),
+                "",
+            ))
+        });
+        w.fakes.mux_first("#{==:#{@agent-role},sidebar}", 0, "", "");
+        let (input, log) = term_input(vec![]);
+        let opened = log.clone();
+        w.fakes.mux_script("split-window", move |_| {
+            opened.borrow_mut().push("split".into());
+            Ok(out(0, "%20|@6|4242\n", ""))
+        });
+        let caller = w.caller();
+        let ended = run_watch(&w.ctx, &caller, Origin::Hand, input, &mut |_: &str| {
+            Err(io::Error::other("closed"))
+        });
+        assert_eq!(ended, "output-closed");
+        let log = log.borrow();
+        let split = log.iter().position(|e| e == "split");
+        let restore = log.iter().position(|e| e == "restore");
+        assert!(
+            split.is_some() && restore.is_some_and(|r| Some(r) > split),
+            "the worker's split, then the terminal restored: {log:?}"
         );
     }
 
@@ -12515,6 +12737,46 @@ mod tests {
             };
             assert_eq!((ended, frames.len(), reads, unmarked), want, "{case}");
             assert_eq!(all.iter().any(|c| c == UNLABEL), want.3, "{case}");
+        }
+    }
+
+    // A watch the bar's split started (`watch -Managed`) is the bar's whether or not its pane was marked: its opener
+    // may have died between the split and the mark (killed, or ended before its worker's open). Never proven by the
+    // startup limit, it unlabels and unmarks its pane (a no-op when neither is set) and ends `unproven`, so its pane
+    // closes with it. The same watch run by a person (`watch`) reads the missing mark as run by hand and only draws.
+    #[test]
+    fn a_watch_the_split_started_leaves_unproven_though_never_marked() {
+        let mut probes = vec!["live"; 12];
+        probes.push("gone");
+        let probes: &'static [&'static str] = Box::leak(probes.into_boxed_slice());
+        for (args, want) in [
+            (&["watch", "-Managed"][..], ("unproven", 5, true)),
+            (&["watch"][..], ("pane-closed", 12, false)),
+        ] {
+            let w = watch_world(probes);
+            w.fakes.mux_rule(OWN_MARK, 0, "4242|\n", "");
+            let request = w.request(args);
+            let mut frames = 0;
+            let reply = watch_on(
+                &w.ctx,
+                &request,
+                true,
+                &|| Box::new(NoInput) as Box<dyn Input>,
+                &mut |_| {
+                    frames += 1;
+                    assert!(frames <= 100, "runaway");
+                    Ok(())
+                },
+            )
+            .unwrap();
+            w.fakes.hc_done().unwrap();
+            let all: Vec<String> = w.fakes.mux_calls().iter().map(|c| c.join(" ")).collect();
+            let cleaned = all.iter().any(|c| c == UNLABEL) && all.iter().any(|c| c == UNMARK);
+            assert_eq!(
+                (reply["ended"].as_str().unwrap(), frames, cleaned),
+                want,
+                "{args:?}"
+            );
         }
     }
 
@@ -12966,6 +13228,7 @@ mod tests {
                 READ_RECORD.replace("@1", "@2"),
                 close_line("%8", 108),
                 CLEAR_RECORD.replace("@1", "@2"),
+                STRAYS.into(),
             ]
         );
         assert_eq!((record(&panes), get(&panes, &wrec("@2"))), (None, None));
@@ -12978,6 +13241,38 @@ mod tests {
             run(&w, &["-Close"]),
             r#"ok {"pane":"%7","closed":true,"panes":["%7"]}"#
         );
+    }
+
+    // A watch the bar's split started (`watch -Managed`) whose opener died before it marked, labelled or recorded it
+    // is the session's bar all the same: -Close kills it, proven by its process, so no stray outlives the close even
+    // within the startup limit. A watch a person ran (`watch`) in the same session is never one, and stays.
+    #[test]
+    fn close_kills_a_watch_the_split_started_but_never_marked() {
+        let (w, panes) = sidebar_world("", Mux::default());
+        let exe = w.ctx.exe.display().to_string();
+        for (pane, pid, argv) in [
+            (
+                "%9",
+                109,
+                vec![exe.clone(), "watch".into(), "-Managed".into()],
+            ),
+            ("%10", 110, vec![exe.clone(), "watch".into()]),
+        ] {
+            set(&panes, pane, "|".into());
+            set(&panes, &format!("pid {pane}"), pid.to_string());
+            set(&panes, &format!("win {pane}"), "@2".into());
+            w.fakes.process(crate::proc::Row {
+                argv: Some(argv),
+                ..watch_row(pid, &exe)
+            });
+        }
+        assert_eq!(
+            run(&w, &["-Close"]),
+            r#"ok {"pane":"%9","closed":true,"panes":["%9"]}"#
+        );
+        assert_eq!(closes(&w), 1);
+        assert_eq!(roles(&panes), "%1=|,%2=other|,%10=|");
+        assert_eq!(option(&panes).as_deref(), Some("off"));
     }
 
     // redesign: no open or ensure kills a pane it did not just split. In the recorded argv a kill appears only in
@@ -13587,7 +13882,13 @@ mod tests {
         assert_eq!((stale.exists(), fresh.exists(), peeks()), (false, true, 3));
         // When the bar starts.
         let stale = file("peek-f.txt", 3000);
-        let ended = run_watch(&w.ctx, &caller, Box::new(NoInput), &mut |_| Ok(()));
+        let ended = run_watch(
+            &w.ctx,
+            &caller,
+            Origin::Hand,
+            Box::new(NoInput),
+            &mut |_| Ok(()),
+        );
         assert_eq!(
             (ended, stale.exists(), fresh.exists()),
             ("pane-closed", false, true)
