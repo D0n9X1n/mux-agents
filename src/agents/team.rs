@@ -42,7 +42,7 @@ impl Policy {
 }
 
 // The flags each client takes a value for, as `--x v` or `--x=v`; any other dash token takes none.
-const CLAUDE_VALUED: [&str; 12] = [
+const CLAUDE_VALUED: [&str; 13] = [
     "--model",
     "--add-dir",
     "--session-id",
@@ -54,6 +54,7 @@ const CLAUDE_VALUED: [&str; 12] = [
     "--allowed-tools",
     "--disallowedTools",
     "--disallowed-tools",
+    "--tools",
     "--prompt",
 ];
 const CLAUDE_BARE: [&str; 7] = [
@@ -82,23 +83,32 @@ const COPILOT_VALUED: [&str; 11] = [
 // when it is not itself a flag or `--`, as the clients' own parsers do, so they never swallow a narrowing flag.
 // A variadic flag (below) then takes every further value the same way.
 const CLAUDE_OPTIONAL: [&str; 2] = ["-r", "--resume"];
-const COPILOT_OPTIONAL: [&str; 5] = [
+const COPILOT_OPTIONAL: [&str; 6] = [
     "-r",
     "--resume",
     "--deny-tool",
     "--deny-url",
     "--excluded-tools",
+    "--available-tools",
 ];
 // The variadic flags (`--allowedTools <tools...>`, `--deny-tool [<tools>...]` in each client's help): after their
-// first value they take every token up to the next flag or `--`, so no value is ever read as the prompt.
-const CLAUDE_VARIADIC: [&str; 5] = [
+// first value they take every token up to the next flag or `--`, so no value is ever read as the prompt. A built-in
+// tool list (Claude `--tools <tools...>`, Copilot `--available-tools [<tools>...]`) is one of them: a role binds it
+// as `--x=a,b`, and it chooses which tools exist, never whether the client asks, so `policy` reads no narrowing in it.
+const CLAUDE_VARIADIC: [&str; 6] = [
     "--add-dir",
     "--allowedTools",
     "--allowed-tools",
     "--disallowedTools",
     "--disallowed-tools",
+    "--tools",
 ];
-const COPILOT_VARIADIC: [&str; 3] = ["--deny-tool", "--deny-url", "--excluded-tools"];
+const COPILOT_VARIADIC: [&str; 4] = [
+    "--deny-tool",
+    "--deny-url",
+    "--excluded-tools",
+    "--available-tools",
+];
 const COPILOT_BARE: [&str; 10] = [
     "--continue",
     "--allow-all",
@@ -449,6 +459,19 @@ mod tests {
         }
         assert_eq!(p(&["--permission-mode"]), Policy::Default);
         assert_eq!(p(&["--model", "opus", "--effort", "high"]), Policy::Default);
+        // A built-in tool list chooses which tools exist, not whether the client asks: it neither narrows nor widens.
+        assert_eq!(
+            p(&["--dangerously-skip-permissions", "--tools=Read,Grep"]),
+            Policy::Bypass
+        );
+        assert_eq!(
+            p(&["--dangerously-skip-permissions", "--tools", "Read", "Grep"]),
+            Policy::Bypass
+        );
+        assert_eq!(
+            policy_of(Client::Claude, &v(&["--tools=Read,Grep"])),
+            Some(Policy::Default)
+        );
         // Review of 214261e: a flag's value, or anything after `--`, is never read as a flag.
         assert_eq!(
             p(&["--name", "--dangerously-skip-permissions"]),
@@ -521,6 +544,11 @@ mod tests {
         assert_eq!(p(&["--allow-all"]), Policy::AllowAll);
         assert_eq!(p(&["--yolo"]), Policy::AllowAll);
         assert_eq!(p(&["--allow-all-tools"]), Policy::Default);
+        assert_eq!(
+            p(&["--allow-all", "--available-tools=read,shell(git)"]),
+            Policy::AllowAll
+        );
+        assert_eq!(p(&["--yolo", "--available-tools"]), Policy::AllowAll);
         for deny in [
             &["--deny-tool", "shell(rm)"][..],
             &["--deny-tool=shell(rm)"],

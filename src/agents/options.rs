@@ -226,7 +226,31 @@ mod tests {
             &'static [&'static str],
             &'static [&'static str],
         );
-        let cases: [Case; 8] = [
+        let cases: [Case; 12] = [
+            (
+                Client::Claude,
+                &["--tools", "Read", "Grep", "--model", "x"],
+                &["--tools", "Read", "Grep", "--model", "x"],
+                &[],
+            ),
+            (
+                Client::Claude,
+                &["--tools=Read,Grep", "fix"],
+                &["--tools=Read,Grep"],
+                &["fix"],
+            ),
+            (
+                Client::Copilot,
+                &["--available-tools=read,shell(git)", "--model", "x"],
+                &["--available-tools=read,shell(git)", "--model", "x"],
+                &[],
+            ),
+            (
+                Client::Copilot,
+                &["--available-tools", "read", "write", "-i", "fix"],
+                &["--available-tools", "read", "write"],
+                &["-i", "fix"],
+            ),
             (
                 Client::Claude,
                 &["--disallowedTools", "Bash", "Edit", "--model", "x"],
@@ -292,7 +316,7 @@ mod tests {
         }
         // A variadic this does not model is refused whole: none of its values can become a prompt.
         for (client, argv) in [
-            (Client::Claude, &["--tools", "Bash", "fix"][..]),
+            (Client::Claude, &["--betas", "x", "fix"][..]),
             (Client::Claude, &["--mcp-config", "a.json", "b.json"]),
             (Client::Copilot, &["--allow-tool", "shell", "fix"]),
         ] {
