@@ -292,8 +292,9 @@ thread_local! {
     static CRASH_AFTER: std::cell::Cell<Option<&'static str>> = const { std::cell::Cell::new(None) };
 }
 
-/// Test only: the next ping on this thread stops right after `point` (`published`: the record is durable, no notice
-/// sent; `notified`: the notice is delivered, the record not yet `sent`), as a crash at that boundary would.
+/// Test only: until reset with `None`, every ping on this thread stops right after `point` (`published`: the record is
+/// durable, no notice sent; `notified`: the notice is delivered, the record not yet `sent`), as a crash at that boundary
+/// would.
 #[cfg(test)]
 pub fn crash_after(point: Option<&'static str>) {
     CRASH_AFTER.with(|c| c.set(point));
