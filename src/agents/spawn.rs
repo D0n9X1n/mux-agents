@@ -194,6 +194,9 @@ pub fn spawn(ctx: &Ctx, request: &Request) -> Res<Map<String, Value>> {
         })
         .transpose()?
         .map(|snapshot| snapshot.bind(model.is_some()));
+    if let Some(r) = &role {
+        super::role::preflight(client, effort, model, &r.tokens)?;
+    }
     // After every check of the caller, before the lock: a read that fails is the default, never a refusal.
     let (placement, source) = match (split, tab) {
         (Some(split), _) => (split, "flag"),
@@ -331,6 +334,60 @@ pub fn spawn(ctx: &Ctx, request: &Request) -> Res<Map<String, Value>> {
     reply.extend(view_reply(&record));
     reply.insert("hcAddress".into(), record["hcAddress"].clone());
     Ok(reply)
+}
+
+/// An hc member's `spawn -Role`, run by the dispatcher before it proves the member through hc: a role the member
+/// cannot use refuses from local files alone, before any hc call. The member's folder is its record's `directory`;
+/// with no single record naming this terminal, spawn checks the role after the proof, as for any other caller.
+pub(crate) fn role_precheck(ctx: &Ctx, request: &Request) -> Res<()> {
+    let (Some(name), Some(client)) = (
+        request.value("Role"),
+        request.value("Client").and_then(client_named),
+    ) else {
+        return Ok(());
+    };
+    let model = request.value("Model");
+    if !super::role::valid_name(name) {
+        return Err(usage("spawn"));
+    }
+    let Some(folder) = hc_member_folder(ctx).filter(|_| model.is_none_or(model_name)) else {
+        return Ok(());
+    };
+    let bound = super::role::resolve(&ctx.home, &folder, client, name)?.bind(model.is_some());
+    super::role::preflight(client, request.value("Effort"), model, &bound.tokens)
+}
+
+/// The `directory` of the one member record, under any server key of the state root, whose `hcAddress` is this
+/// terminal's `HC_TERMINAL_ID`; none when no record, or records with different folders, name it.
+fn hc_member_folder(ctx: &Ctx) -> Option<PathBuf> {
+    let address = ctx.env.get("HC_TERMINAL_ID").filter(|a| !a.is_empty())?;
+    let mut found: Vec<PathBuf> = Vec::new();
+    for key in std::fs::read_dir(&ctx.state_root).ok()?.flatten() {
+        let Ok(key) = key.file_name().into_string() else {
+            continue;
+        };
+        let Ok(agents) = std::fs::read_dir(ctx.state_root.join(&key).join("agents")) else {
+            continue;
+        };
+        for agent in agents.flatten() {
+            let Ok(id) = agent.file_name().into_string() else {
+                continue;
+            };
+            let rel = [key.as_str(), "agents", id.as_str(), "record.json"];
+            let record = crate::caller::hc::within_root(&ctx.state_root, &rel)
+                .and_then(|p| crate::state::fs::read_json(&p).ok().flatten());
+            let Some(record) = record else {
+                continue;
+            };
+            if record.get("hcAddress").and_then(Value::as_str) == Some(address)
+                && let Some(dir) = record.get("directory").and_then(Value::as_str)
+                && !found.iter().any(|f| f == Path::new(dir))
+            {
+                found.push(dir.into());
+            }
+        }
+    }
+    (found.len() == 1).then(|| found.remove(0))
 }
 
 /// The folder the child starts in, as admission places it: a member's child where the member started (its record's
@@ -516,11 +573,7 @@ impl Launch<'_> {
         // A role's body is the standing brief, as -BriefFile's is: named in the first turn, ahead of the task.
         let role_path = self.role.map(|_| agent.folder.join("role.md"));
         if let (Some(path), Some(role)) = (&role_path, self.role) {
-            lines.push(format!(
-                "Role: {}; your standing brief is {}; read it before the task.",
-                role.snapshot.name,
-                path.to_string_lossy().replace('\\', "/")
-            ));
+            lines.push(super::role::brief_line(&role.snapshot.name, path));
         }
         // notebook-7b V1: the notebook block after the header; the caller holds the team (spawn) lock.
         let block = super::notebook::news::index(ctx, &super::notebook::anchor(self.caller));
@@ -533,14 +586,8 @@ impl Launch<'_> {
             Context::Brief => Recipe::First(Some(&prompt)),
         };
         let args = client_args(self.client, recipe, &agent.session, self.model);
+        // `check_role` ran before anything was made; this reads the exact argv once more.
         if let Some(role) = self.role {
-            if role.snapshot.folder != self.directory {
-                return refuse(
-                    2,
-                    "role",
-                    "the child starts in another folder than the role was read from",
-                );
-            }
             super::role::admit(self.client, &self.flags, &role.tokens, &args)?;
         }
         let flags = self.all_flags();
@@ -867,7 +914,7 @@ mod tests {
     use std::path::PathBuf;
     use std::rc::Rc;
 
-    const OLD: &str = "11111111-2222-4333-8444-555555555555";
+    pub(super) const OLD: &str = "11111111-2222-4333-8444-555555555555";
     const ENTRY: &str =
         "1 entry mux-agent entry path may hold only letters, digits, spaces and _ \\ / : . ( ) -";
 
@@ -928,7 +975,7 @@ mod tests {
     // An agent caller (session OLD) that passes C3, C2 and C5 for real, launched in `<temp>/launch`, not its cwd. A
     // Claude agent runs in bypass mode with a transcript and a session file; a Copilot agent was launched with
     // --allow-all and its session has workspace.yaml (with its id line only when `id_line`) and events.jsonl.
-    fn admitted(client: Client, id_line: bool) -> (World, PathBuf) {
+    pub(super) fn admitted(client: Client, id_line: bool) -> (World, PathBuf) {
         let mut w = ready(World::agent(""));
         let base = w.ctx.cwd.parent().unwrap().to_path_buf();
         let launch = base.join("launch");
@@ -4129,7 +4176,24 @@ impl Launch<'_> {
         options
     }
 
+    /// Before anything is written, allocated or copied (a Copilot fork's session copy included): the child starts in
+    /// the folder its role was read from, and the role's tokens keep the policy of the flags this launch emits.
+    fn check_role(&self) -> Res<()> {
+        let Some(role) = self.role else {
+            return Ok(());
+        };
+        if role.snapshot.folder != self.directory {
+            return refuse(
+                2,
+                "role",
+                "the child starts in another folder than the role was read from",
+            );
+        }
+        super::role::admit_flags(self.client, &self.flags, self.model, &role.tokens)
+    }
+
     fn prepare_hc(&self, slot: CoreSlot) -> Res<super::core_launch::Launch> {
+        self.check_role()?;
         let (ctx, caller) = (self.ctx, self.caller);
         let state = state_dir(ctx, caller)?;
         // Re6a call 12: only a launch on the anchor's own server binds the anchor's `server.json`.
@@ -4183,6 +4247,13 @@ impl Launch<'_> {
         }
         let id = hex_id()?;
         let from = &resumed.record;
+        // A role's standing brief goes with the conversation, so a later fresh start of the successor still has it.
+        let brief = state.join("agents").join(&resumed.from).join("role.md");
+        if from.get("role").is_some() && brief.is_file() {
+            let folder = state.join("agents").join(&id);
+            private_folder(ctx, &folder)?;
+            std::fs::copy(&brief, folder.join("role.md"))?;
+        }
         let session = text(from.get("sessionId"));
         // notebook-7b V1: the resumed turn is the notebook block (the caller holds the team lock).
         let block = super::notebook::news::index(ctx, &super::notebook::anchor(caller));

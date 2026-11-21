@@ -1,5 +1,7 @@
 //! `spawn -Role` by a person outside a team, through `spawn` itself.
-use super::tests::{agent_folders, agents_dir, calls, empty_launch, human, read_json, reply, run};
+use super::tests::{
+    OLD, admitted, agent_folders, agents_dir, calls, empty_launch, human, read_json, reply, run,
+};
 use super::*;
 use crate::agents::{fixture::World, gens};
 
@@ -220,4 +222,52 @@ fn a_copilot_role_binds_its_tool_list_as_available_tools() {
         std::fs::read_to_string(folder.join("role.md")).unwrap(),
         "You test.\n"
     );
+}
+
+/// The launch checks the role before anything is written, allocated or copied: a Copilot fork whose role was read
+/// from another folder than the child starts in refuses 2 `role` and leaves no copied session and no agent folder.
+#[test]
+fn a_role_read_from_another_folder_refuses_before_the_session_copy() {
+    let (w, launch) = admitted(Client::Copilot, true);
+    let caller = w.caller();
+    let snapshot = crate::agents::role::Snapshot {
+        name: "x".into(),
+        body: "b".into(),
+        model: None,
+        tools: Some(vec!["read".into()]),
+        ignored: Vec::new(),
+        path: w.ctx.cwd.join("x.md"),
+        folder: w.ctx.cwd.clone(),
+        client: Client::Copilot,
+    };
+    let bound = snapshot.bind(false);
+    let l = Launch {
+        ctx: &w.ctx,
+        caller: &caller,
+        client: Client::Copilot,
+        model: None,
+        no_fork: false,
+        flags: launch_flags(Client::Copilot, None, None),
+        task: "task".into(),
+        brief: Some("brief".into()),
+        directory: launch.clone(),
+        placed: None,
+        role: Some(&bound),
+    };
+    let slot = CoreSlot {
+        name: "x".into(),
+        color: "blue",
+        placed: None,
+        debit: false,
+    };
+    let e = l.prepare_hc(slot).err().expect("a refusal");
+    assert_eq!((e.code, e.check), (2, "role"), "{}", e.message);
+    let sessions = w.ctx.home.join(".copilot").join("session-state");
+    let mut names: Vec<String> = std::fs::read_dir(&sessions)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    assert_eq!(names, [OLD], "no copied session");
+    assert!(agent_folders(&w).is_empty(), "no agent folder");
 }

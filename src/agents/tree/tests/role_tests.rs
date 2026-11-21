@@ -87,3 +87,32 @@ fn a_members_child_takes_its_role_from_where_the_member_started() {
     );
     m.w.fakes.hc_done().unwrap();
 }
+
+/// A member's spawn of a role it cannot use refuses 2 `role` from local files alone: no hc call is made first.
+#[test]
+fn a_members_missing_role_refuses_before_any_hc_call() {
+    let mut m = member_world();
+    m.w.ctx.home = m.w.ctx.cwd.parent().unwrap().join("home");
+    m.w.file("t.md", b"task");
+    m.w.file("b.md", b"brief");
+    m.hc();
+    let before = m.w.fakes.hc_calls().len();
+    let args = [
+        "spawn",
+        "-Client",
+        "claude",
+        "-TaskFile",
+        "t.md",
+        "-BriefFile",
+        "b.md",
+        "-Context",
+        "brief",
+        "-Role",
+        "nope",
+    ]
+    .map(String::from);
+    let (code, out) = crate::cli::run(&args, || Ok(&m.w.ctx));
+    assert_eq!(code, 2, "{out}");
+    assert!(out.contains(r#""check":"role""#), "{out}");
+    assert_eq!(m.w.fakes.hc_calls().len(), before, "no hc call: {out}");
+}

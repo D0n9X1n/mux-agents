@@ -236,6 +236,60 @@ fn resume_starts_an_ended_member_again_with_its_conversation() {
     }
 }
 
+/// An ended member spawned with -Role resumes as a successor with its stored options (the role's tokens included) and
+/// its role fields, and its role.md is copied into the successor's folder, so a later fresh start still has its
+/// standing brief; the role file is never read again.
+#[test]
+fn resume_of_a_roles_member_keeps_its_options_and_its_role_md() {
+    for client in ["claude", "copilot"] {
+        let options = match client {
+            "claude" => json!([
+                "--dangerously-skip-permissions",
+                "--effort",
+                "high",
+                "--model=haiku",
+                "--tools=Read,Grep"
+            ]),
+            _ => json!([
+                "--no-sandbox",
+                "--allow-all",
+                "--model=haiku",
+                "--available-tools=read,shell(git)"
+            ]),
+        };
+        let w = World::human("");
+        let x = member(
+            &w,
+            ID,
+            json!({"client": client, "pane": "%5", "window": "@1", "depth": 1, "options": options,
+                "role": "x", "roleFile": "/gone/x.md", "roleClient": client}),
+        );
+        std::fs::write(w.folder(ID).join("role.md"), "brief\n").unwrap();
+        let before = folders(&w);
+        w.panes(&[]);
+        facts(&w, &[(&x, "exited")]);
+        launches(&w, "t1");
+        resume_of(&w, ID).unwrap();
+        let y = new_folder(&w, &before);
+        let spec = read_json(&gens::path(&y, 0, "spec")).unwrap().unwrap();
+        assert_eq!(spec["flags"], options, "{client}");
+        let record = read_json(&y.join("record.json")).unwrap().unwrap();
+        for (k, v) in [
+            ("role", json!("x")),
+            ("roleClient", json!(client)),
+            ("options", options.clone()),
+        ] {
+            assert_eq!(record[k], v, "{client} {k}");
+        }
+        assert_eq!(
+            std::fs::read_to_string(y.join("role.md")).ok().as_deref(),
+            Some("brief\n"),
+            "{client}: role.md in the successor's folder"
+        );
+        w.fakes.hc_done().unwrap();
+    }
+}
+
 // Every refusal launches nothing and makes no folder.
 #[test]
 fn resume_refuses_and_launches_nothing() {

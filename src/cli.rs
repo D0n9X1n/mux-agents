@@ -462,6 +462,10 @@ fn dispatch(def: &VerbDef, request: &Request, ctx: &Ctx) -> Res<Map<String, Valu
     }
     // Non-mux herdr terminals stand down; committed mux workers use their member identity.
     if crate::caller::hc::applies(ctx) {
+        // A member's `spawn -Role` refuses a role it cannot use from local files, before the hc calls that prove it.
+        if def.name == "spawn" {
+            crate::agents::spawn::role_precheck(ctx, request)?;
+        }
         let caller = crate::caller::hc::resolve(ctx)?;
         if caller.candidate.is_some() && !crate::agents::tree::candidate_verb(def.name, request) {
             return Err(crate::agents::tree::tagged());

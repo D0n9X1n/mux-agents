@@ -175,6 +175,68 @@ pub fn admit(client: Client, flags: &[String], tokens: &[String], args: &[String
     Ok(())
 }
 
+/// The first-turn line that names a role's standing brief: spawn's header and a fresh start of a role's member say
+/// the same.
+pub fn brief_line(name: &str, path: &Path) -> String {
+    format!(
+        "Role: {name}; your standing brief is {}; read it first.",
+        show(path)
+    )
+}
+
+// A first turn the team grammar reads as a positional, as every turn mux-agents sends does.
+const PROBE_SESSION: &str = "00000000-0000-4000-8000-000000000000";
+const PROBE_TURN: &str = "[mux-agent] probe";
+
+/// Before any hc call: the role's tokens keep the policy of every flag set a launch may emit (outside a team, each
+/// team level), so a role the launch would refuse is refused before anything is asked of hc.
+pub fn preflight(
+    client: Client,
+    effort: Option<&str>,
+    model: Option<&str>,
+    tokens: &[String],
+) -> Res<()> {
+    use super::team::Policy;
+    let mut sets = vec![crate::agents::spawn::launch_flags(client, None, effort)];
+    for level in [Policy::Default, Policy::AllowAll, Policy::Bypass] {
+        sets.push(crate::agents::spawn::launch_flags(
+            client,
+            Some(level),
+            effort,
+        ));
+    }
+    for flags in sets {
+        admit_flags(client, &flags, model, tokens)?;
+    }
+    Ok(())
+}
+
+/// `admit` over both first turns a launch with `flags` may emit, a new conversation and a fork.
+pub fn admit_flags(
+    client: Client,
+    flags: &[String],
+    model: Option<&str>,
+    tokens: &[String],
+) -> Res<()> {
+    use crate::agents::spawn::{Recipe, client_args};
+    let turn = Some(PROBE_TURN);
+    for recipe in [
+        Recipe::First(turn),
+        Recipe::Fork {
+            parent: PROBE_SESSION,
+            task: turn,
+        },
+    ] {
+        admit(
+            client,
+            flags,
+            tokens,
+            &client_args(client, recipe, PROBE_SESSION, model),
+        )?;
+    }
+    Ok(())
+}
+
 /// One folder group searched together: two matches in it are ambiguous.
 struct Level {
     folders: Vec<PathBuf>,
@@ -1246,6 +1308,36 @@ mod tests {
                 e.message.contains(&shown) && e.message.contains(&format!("line {line}")),
                 "{front}: {}",
                 e.message
+            );
+        }
+    }
+
+    #[test]
+    fn the_brief_line_names_role_md_with_forward_slashes() {
+        assert_eq!(
+            brief_line("x", Path::new("C:\\s\\agents\\a\\role.md")),
+            "Role: x; your standing brief is C:/s/agents/a/role.md; read it first."
+        );
+    }
+
+    // Before any hc call, the role's tokens are read with every flag set a launch may emit (outside a team, each team
+    // level), with and without -Model and -Effort, for a new conversation and a fork.
+    #[test]
+    fn preflight_reads_every_flag_set_a_launch_may_emit() {
+        let ok = v(&["--model=haiku", "--tools=Read,Grep"]);
+        assert!(preflight(Client::Claude, None, None, &ok).is_ok());
+        assert!(preflight(Client::Claude, Some("low"), Some("opus"), &ok).is_ok());
+        let copilot = v(&["--available-tools=read,shell(git)"]);
+        assert!(preflight(Client::Copilot, Some("high"), None, &copilot).is_ok());
+        for (client, bad) in [
+            (Client::Claude, "--permission-mode=plan"),
+            (Client::Claude, "--frobnicate"),
+            (Client::Copilot, "--deny-tool=shell"),
+        ] {
+            assert_eq!(
+                check(preflight(client, None, None, &v(&[bad]))),
+                (2, "role"),
+                "{bad}"
             );
         }
     }
