@@ -36,7 +36,7 @@ fn launched(w: &World, ok: &Value) -> (PathBuf, Value) {
     (folder, spec)
 }
 
-const ROLE: &str = "---\nname: x\ndescription: reviews\nmodel: haiku\ntools: Read, Grep\npermissionMode: bypassPermissions\nhooks:\n  Stop:\n    - command: x\nmcpServers:\n  - fs\n---\nYou review code.\n";
+const ROLE: &str = "---\nname: x\ndescription: reviews\nmodel: haiku\ntools: Read, Grep\npermissionMode: bypassPermissions\nhooks:\n  - audit\nmcpServers:\n  - fs\n---\nYou review code.\n";
 
 #[test]
 fn a_role_binds_its_model_and_tools_and_its_body_is_the_standing_brief() {

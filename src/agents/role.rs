@@ -356,19 +356,33 @@ fn read_head(path: &Path) -> Option<Vec<u8>> {
     Some(bytes)
 }
 
-/// The frontmatter `name` of a Claude role file, read from its head.
+/// The frontmatter `name` of a Claude role file, read from its head. The file is skipped for matching (None) only
+/// when its `name` line itself cannot be read: absent, repeated, continued by an indented line, outside the subset,
+/// or not one exact scalar, or a frontmatter that never closes. A line outside the subset elsewhere does not hide the
+/// name: the file is still matched by it and refused only if it is the one selected, so a bad file never changes
+/// another role's resolution.
 fn declared_name(bytes: &[u8]) -> Option<String> {
     let text = String::from_utf8_lossy(bytes);
-    let (lines, _) = split(&text)?;
-    fields(&lines)?
-        .into_iter()
-        .find_map(|(key, value)| match (key.as_str(), value) {
-            ("name", Field::Text(name)) => Some(name),
-            _ => None,
-        })
+    let front = front(&text)?;
+    let mut names = front.entries.iter().filter(|e| e.key == "name");
+    match (names.next(), names.next()) {
+        (
+            Some(Entry {
+                value: Field::Text { text, exact: true },
+                bad: false,
+                ..
+            }),
+            None,
+        ) => Some(text.clone()),
+        _ => None,
+    }
 }
 
-/// The matched file as spawn uses it: whole (at most 64 KiB), UTF-8, its frontmatter readable.
+const OUTSIDE: &str = "this line is outside what mux-agents reads in a frontmatter: `key: value` lines whose value \
+                       is one plain or quoted scalar, a `[a, b]` list or `- item` lines of them, and # comments";
+
+/// The matched file as spawn uses it: whole (at most 64 KiB), UTF-8, its frontmatter in the subset `front` reads,
+/// and `name`, `model` and `tools`, when present, each a value this can use. Anything else refuses, naming the line.
 fn load(path: &Path, bytes: Vec<u8>, name: &str, folder: &Path, client: Client) -> Res<Snapshot> {
     let shown = show(path);
     if bytes.len() as u64 > FILE_MAX {
@@ -381,44 +395,54 @@ fn load(path: &Path, bytes: Vec<u8>, name: &str, folder: &Path, client: Client) 
     let (Ok(text), Some(_)) = (String::from_utf8(bytes), path.to_str()) else {
         return refuse(2, "role", format!("the role file {shown} is not UTF-8"));
     };
-    let malformed = || {
+    let at = |line: usize, why: &str| -> Res<Snapshot> {
         refuse(
             2,
             "role",
-            format!("the role file {shown} has a frontmatter this cannot read"),
+            format!("the role file {shown} line {line}: {why}"),
         )
     };
-    let Some((lines, body)) = split(&text) else {
-        return malformed();
+    let Some(front) = front(&text) else {
+        return refuse(
+            2,
+            "role",
+            format!("the role file {shown} opens a frontmatter that no --- line closes"),
+        );
     };
-    let Some(fields) = fields(&lines) else {
-        return malformed();
-    };
+    if let Some(line) = front.bad {
+        return at(line, OUTSIDE);
+    }
     let (mut model, mut tools, mut ignored) = (None, None, Vec::new());
-    for (key, value) in fields {
-        match (key.as_str(), value) {
+    for e in front.entries {
+        let text = match &e.value {
+            Field::Text { text, exact: true } if !text.is_empty() => Some(text.clone()),
+            _ => None,
+        };
+        match e.key.as_str() {
+            "name" if text.is_none() => return at(e.line, "name is not one plain or quoted name"),
             // What names and describes the role, not what the member does.
-            ("name" | "description", _) | ("model" | "tools", Field::Empty) => {}
-            ("model", Field::Text(m)) => model = Some(m),
-            ("tools", value) => {
-                let Some(names) = tool_list(value) else {
-                    return refuse(
-                        2,
-                        "role",
-                        format!(
-                            "the role file {shown} names a tool this never passes on: at most {TOOLS_MAX} names, \
-                             each a letter then letters, digits and _ * ( ) . :"
+            "name" | "description" => {}
+            "model" => match text {
+                Some(m) => model = Some(m),
+                None => return at(e.line, "model is not one plain or quoted model name"),
+            },
+            "tools" => match tool_list(&e.value) {
+                Some(names) => tools = Some(names),
+                None => {
+                    return at(
+                        e.line,
+                        &format!(
+                            "tools must be 1-{TOOLS_MAX} names, each a letter then letters, digits and _ * ( ) . :"
                         ),
                     );
-                };
-                tools = Some(names);
-            }
-            _ => ignored.push(key),
+                }
+            },
+            _ => ignored.push(e.key),
         }
     }
     Ok(Snapshot {
         name: name.into(),
-        body: body.into(),
+        body: front.body.into(),
         model,
         tools,
         ignored,
@@ -428,11 +452,13 @@ fn load(path: &Path, bytes: Vec<u8>, name: &str, folder: &Path, client: Client) 
     })
 }
 
-/// `tools` as a comma-separated string or a list: 1-64 names, each one tool and never a flag or a second argument.
-fn tool_list(value: Field) -> Option<Vec<String>> {
+/// `tools` as a comma-separated scalar or a list: 1-64 names, each one tool and never a flag or a second argument.
+fn tool_list(value: &Field) -> Option<Vec<String>> {
     let names: Vec<String> = match value {
-        Field::Text(text) => text.split(',').map(|n| n.trim().to_string()).collect(),
-        Field::List(list) => list,
+        Field::Text { text, exact: true } => {
+            text.split(',').map(|n| n.trim().to_string()).collect()
+        }
+        Field::List(list) => list.clone(),
         _ => return None,
     };
     let ok = !names.is_empty() && names.len() <= TOOLS_MAX && names.iter().all(|n| tool_name(n));
@@ -446,109 +472,255 @@ fn tool_name(name: &str) -> bool {
         && bytes.all(|b| b.is_ascii_alphanumeric() || b"_*().:".contains(&b))
 }
 
-/// A frontmatter value, as far as this minimal reader goes: nothing, text, a list of text, or anything else (a map, a
-/// block, a list of maps), which nothing here uses.
+/// A frontmatter value in the subset `front` reads.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Field {
+    /// Nothing after the key (YAML's null) and no `- item` line below it.
     Empty,
-    Text(String),
+    /// A plain or quoted scalar. `exact` is false for a double-quoted one with a `\` escape, whose text this does not
+    /// decode: a key this uses refuses it.
+    Text { text: String, exact: bool },
+    /// A one-level `[a, 'b']` list, or `- item` lines, of exact scalars.
     List(Vec<String>),
-    Other,
 }
 
-/// A `---` frontmatter's lines and the body after its closing `---`; a file that does not open with `---` is all
-/// body. None for a frontmatter that never closes. CRLF reads like LF.
-fn split(text: &str) -> Option<(Vec<&str>, &str)> {
+/// One top-level key, the line it is on, and whether a line outside the subset belongs to it.
+struct Entry {
+    key: String,
+    value: Field,
+    line: usize,
+    bad: bool,
+}
+
+/// A frontmatter as `front` reads it.
+struct Front<'a> {
+    entries: Vec<Entry>,
+    /// The first line outside the subset.
+    bad: Option<usize>,
+    /// The indent of the `- item` lines under the last key, once its first item is read.
+    block: Option<usize>,
+    body: &'a str,
+}
+
+/// The `---` frontmatter of `text` in a strict subset of YAML, read line by line with no recursion, so a value nested
+/// any depth costs one pass over its line: top-level `key: value` lines with a plain (`[A-Za-z_][A-Za-z0-9_.-]*`) or
+/// quoted key; a value that is nothing, one plain or quoted scalar, a one-level `[a, 'b']` list of scalars, or nothing
+/// followed by `- item` lines of scalars at one indent; `#` comments outside quotes; a leading BOM and CRLF. Every
+/// other line is outside the subset: `bad` names the first, and one that continues a key (an indented line, a repeated
+/// key) spoils that key too. A file that does not open with `---` is all body, with no frontmatter; None for a
+/// frontmatter that never closes. Only a `---` line closes it, so a `---` in the body stays in the body.
+fn front(text: &str) -> Option<Front<'_>> {
     let text = text.strip_prefix('\u{feff}').unwrap_or(text);
-    let line_end = |s: &str| s.find('\n').map_or(s.len(), |i| i + 1);
-    let first = &text[..line_end(text)];
-    if first.trim_end_matches(['\r', '\n']) != "---" {
-        return Some((Vec::new(), text));
+    let bare = |line: &str| -> String {
+        let line = line.strip_suffix('\n').unwrap_or(line);
+        line.strip_suffix('\r').unwrap_or(line).to_string()
+    };
+    let mut lines = text.split_inclusive('\n');
+    let first = lines.next().unwrap_or("");
+    let mut out = Front {
+        entries: Vec::new(),
+        bad: None,
+        block: None,
+        body: text,
+    };
+    if bare(first) != "---" {
+        return Some(out);
     }
     let mut at = first.len();
-    let mut lines = Vec::new();
-    while at < text.len() {
-        let end = at + line_end(&text[at..]);
-        let line = text[at..end].trim_end_matches(['\r', '\n']);
+    for (n, raw) in lines.enumerate() {
+        at += raw.len();
+        let line = bare(raw);
         if line == "---" {
-            return Some((lines, &text[end..]));
+            out.body = &text[at..];
+            return Some(out);
         }
-        lines.push(line);
-        at = end;
+        out.take(n + 2, &line);
     }
     None
 }
 
-/// Top-level `key: value` lines, each with its indented or `- ` lines below it: a value is text, a `[a, b]` or `- a`
-/// list of text, or `Other`. A later key replaces an earlier one. None when the first line holds no key.
-fn fields(lines: &[&str]) -> Option<Vec<(String, Field)>> {
-    let mut out: Vec<(String, Field)> = Vec::new();
-    for line in lines {
-        let bare = line.trim();
-        if bare.is_empty() || bare.starts_with('#') {
-            continue;
-        }
-        let key_value = line
-            .split_once(':')
-            .filter(|_| !line.starts_with([' ', '\t', '-']));
-        let Some((key, value)) = key_value else {
-            // A line under the last key: a `- item` extends its list; anything else makes it a value not used here.
-            let (_, last) = out.last_mut()?;
-            let item = bare
-                .strip_prefix('-')
-                .filter(|rest| rest.is_empty() || rest.starts_with([' ', '\t']))
-                .map(|rest| scalar(rest.trim()));
-            *last = match (std::mem::replace(last, Field::Other), item) {
-                (Field::Empty, Some(Field::Text(t))) => Field::List(vec![t]),
-                (Field::List(mut list), Some(Field::Text(t))) => {
-                    list.push(t);
-                    Field::List(list)
-                }
-                _ => Field::Other,
-            };
-            continue;
-        };
-        let key = key.trim();
-        if key.is_empty() {
-            return None;
-        }
-        let value = scalar(value.trim());
-        match out.iter_mut().find(|(k, _)| k == key) {
-            Some((_, v)) => *v = value,
-            None => out.push((key.into(), value)),
+impl Front<'_> {
+    fn fail(&mut self, line: usize, spoils_last: bool) {
+        self.bad.get_or_insert(line);
+        if spoils_last && let Some(e) = self.entries.last_mut() {
+            e.bad = true;
         }
     }
-    Some(out)
+
+    /// One frontmatter line, numbered from the opening `---` as line 1.
+    fn take(&mut self, number: usize, line: &str) {
+        let content = line.trim_start_matches(' ');
+        if content.is_empty() || content.starts_with('#') {
+            return;
+        }
+        if line.starts_with(' ') || line.starts_with('-') {
+            // An indented line or a `- item`: an item of the list under the last key, else outside the subset.
+            let indent = line.len() - content.len();
+            let item = content
+                .strip_prefix("- ")
+                .and_then(|rest| scalar(rest.trim_start_matches(' ')));
+            let fits = match (self.entries.last(), self.block) {
+                (Some(e), None) => e.value == Field::Empty,
+                (Some(_), Some(i)) => i == indent,
+                (None, _) => false,
+            };
+            match (item, fits, self.entries.last_mut()) {
+                (Some((text, true)), true, Some(e)) => {
+                    match &mut e.value {
+                        Field::List(list) => list.push(text),
+                        value => *value = Field::List(vec![text]),
+                    }
+                    self.block = Some(indent);
+                }
+                _ => self.fail(number, true),
+            }
+            return;
+        }
+        self.block = None;
+        let Some((key, rest)) = key_of(line) else {
+            return self.fail(number, false);
+        };
+        let value = value_of(rest);
+        // A repeated key: YAML refuses it, so neither is read.
+        let repeated = self.entries.iter_mut().find(|e| e.key == key);
+        let bad = value.is_none() || repeated.is_some();
+        if let Some(e) = repeated {
+            e.bad = true;
+        }
+        if bad {
+            self.bad.get_or_insert(number);
+        }
+        self.entries.push(Entry {
+            key,
+            value: value.unwrap_or(Field::Empty),
+            line: number,
+            bad,
+        });
+    }
 }
 
-/// One value: quotes are taken off; `[a, b]` is a list of such values; a map, block or anchor is `Other`.
-fn scalar(value: &str) -> Field {
-    if value.is_empty() {
-        return Field::Empty;
-    }
-    if let Some(inner) = value.strip_prefix('[').and_then(|v| v.strip_suffix(']')) {
-        if inner.trim().is_empty() {
-            return Field::List(Vec::new());
+/// A top-level `key:` and the rest of its line: a plain key, or a quoted one with no escape, then `:` and a space, a
+/// tab or the end of the line.
+fn key_of(line: &str) -> Option<(String, &str)> {
+    let (key, rest) = match line.chars().next()? {
+        '"' | '\'' => {
+            let (key, exact, rest) = quoted(line)?;
+            (exact.then_some(key)?, rest)
         }
-        let items: Option<Vec<String>> = inner
-            .split(',')
-            .map(|item| match scalar(item.trim()) {
-                Field::Text(t) => Some(t),
-                Field::Empty => Some(String::new()),
-                _ => None,
-            })
-            .collect();
-        return items.map_or(Field::Other, Field::List);
+        c if c.is_ascii_alphabetic() || c == '_' => {
+            let end = line
+                .find(|c: char| !(c.is_ascii_alphanumeric() || "_.-".contains(c)))
+                .unwrap_or(line.len());
+            (line[..end].to_string(), &line[end..])
+        }
+        _ => return None,
+    };
+    let rest = rest.strip_prefix(':')?;
+    (rest.is_empty() || rest.starts_with([' ', '\t'])).then_some((key, rest))
+}
+
+/// The value after a key: nothing (or only a comment), a `[ ]` list, or one scalar.
+fn value_of(rest: &str) -> Option<Field> {
+    let v = rest.trim_start_matches([' ', '\t']);
+    if v.is_empty() || v.starts_with('#') {
+        return Some(Field::Empty);
     }
-    for quote in ['"', '\''] {
-        if value.len() >= 2 && value.starts_with(quote) && value.ends_with(quote) {
-            return Field::Text(value[1..value.len() - 1].into());
+    if let Some(inner) = v.strip_prefix('[') {
+        return flow(inner).map(Field::List);
+    }
+    scalar(v).map(|(text, exact)| Field::Text { text, exact })
+}
+
+/// One scalar and any `#` comment after it on the rest of its line: quoted, else plain. None outside the subset.
+fn scalar(v: &str) -> Option<(String, bool)> {
+    if v.starts_with(['"', '\'']) {
+        let (text, exact, rest) = quoted(v)?;
+        return comment_only(rest).then_some((text, exact));
+    }
+    plain(cut_comment(v)).map(|t| (t.to_string(), true))
+}
+
+/// A quoted scalar at the start of `v`, closed on its line: its text, whether that text is exact (no `\` escape in a
+/// double-quoted one; a single-quoted `''` is one `'`), and the rest of the line.
+fn quoted(v: &str) -> Option<(String, bool, &str)> {
+    let q = v.chars().next()?;
+    let (mut text, mut exact) = (String::new(), true);
+    let mut chars = v.char_indices().skip(1);
+    while let Some((i, c)) = chars.next() {
+        match (q, c) {
+            ('"', '\\') => {
+                exact = false;
+                chars.next()?;
+            }
+            ('"', '"') => return Some((text, exact, &v[i + 1..])),
+            ('\'', '\'') if v[i + 1..].starts_with('\'') => {
+                text.push('\'');
+                chars.next();
+            }
+            ('\'', '\'') => return Some((text, exact, &v[i + 1..])),
+            _ => text.push(c),
         }
     }
-    if value.starts_with(['[', '{', '|', '>', '&', '*', '!']) || value.contains(": ") {
-        return Field::Other;
+    None
+}
+
+/// Whether the rest of a line after a value holds nothing but a `#` comment.
+fn comment_only(rest: &str) -> bool {
+    let t = rest.trim_start_matches([' ', '\t']);
+    t.is_empty() || (t.len() < rest.len() && t.starts_with('#'))
+}
+
+/// A plain value without its comment: from the first `#` after a space or a tab.
+fn cut_comment(v: &str) -> &str {
+    let at = v
+        .char_indices()
+        .find(|&(i, c)| c == '#' && v[..i].ends_with([' ', '\t']))
+        .map_or(v.len(), |(i, _)| i);
+    v[..at].trim_end_matches([' ', '\t'])
+}
+
+/// A plain scalar: not empty, not opening with an indicator (`[`, `{`, `&`, `|`, a `- ` …), not a `key: value`.
+fn plain(t: &str) -> Option<&str> {
+    let first = t.chars().next()?;
+    // `-`, `?` and `:` are indicators only before a space, a tab or the end: `--yolo` is a plain scalar.
+    let indicator = "[]{},#&*!|>'\"%@`".contains(first)
+        || (matches!(first, '-' | '?' | ':')
+            && t[1..].chars().next().is_none_or(|c| c == ' ' || c == '\t'));
+    let mapping = t.contains(": ") || t.contains(":\t") || t.ends_with(':');
+    (!indicator && !mapping).then_some(t)
+}
+
+/// A one-level flow list after its `[`: plain or exact quoted scalars, `,` between them, `]` and only a comment after.
+fn flow(inner: &str) -> Option<Vec<String>> {
+    let mut items = Vec::new();
+    let mut rest = inner.trim_start_matches([' ', '\t']);
+    if let Some(after) = rest.strip_prefix(']') {
+        return comment_only(after).then_some(items);
     }
-    Field::Text(value.into())
+    loop {
+        rest = rest.trim_start_matches([' ', '\t']);
+        if rest.starts_with(['"', '\'']) {
+            let (text, exact, after) = quoted(rest)?;
+            if !exact {
+                return None;
+            }
+            items.push(text);
+            rest = after.trim_start_matches([' ', '\t']);
+        } else {
+            let stop = rest.find([',', ']'])?;
+            let item = rest[..stop].trim_end_matches([' ', '\t']);
+            if item.contains(['[', '{', '}', '#']) || plain(item).is_none() {
+                return None;
+            }
+            items.push(item.to_string());
+            rest = &rest[stop..];
+        }
+        match rest.chars().next()? {
+            ',' => rest = &rest[1..],
+            ']' => return comment_only(&rest[1..]).then_some(items),
+            _ => return None,
+        }
+    }
 }
 
 /// A path as messages show it, with forward slashes.
@@ -600,7 +772,7 @@ mod tests {
         (e.code, e.check)
     }
 
-    const X: &str = "---\nname: x\nmodel: haiku\ntools: Read, Grep\npermissionMode: bypassPermissions\nhooks:\n  PreToolUse:\n    - matcher: Bash\nmcpServers:\n  - fs\n---\nYou review code.\n";
+    const X: &str = "---\nname: x\nmodel: haiku\ntools: Read, Grep\npermissionMode: bypassPermissions\nhooks:\n  - audit\nmcpServers:\n  - fs\n---\nYou review code.\n";
 
     #[test]
     fn a_role_name_is_a_plain_token_with_at_most_one_colon() {
@@ -939,6 +1111,143 @@ mod tests {
         fx.put(&path, "---\r\ntools: Read\r\n---\r\nbody\r\n");
         let s = fx.get(Client::Copilot, &fx.work(), "big").unwrap();
         assert_eq!((s.body.as_str(), s.tools), ("body\r\n", Some(v(&["Read"]))));
+    }
+
+    // A frontmatter is read line by line with no recursion: a value nested 30000 deep in another file neither crashes
+    // the search nor changes another role's resolution; the file that would be selected refuses, naming its line.
+    #[test]
+    fn a_deep_value_neither_crashes_nor_changes_another_roles_resolution() {
+        let fx = Fx::new();
+        let deep = format!("{}x{}", "[".repeat(30000), "]".repeat(30000));
+        let agents = fx.work().join(".claude").join("agents");
+        fx.put(
+            &agents.join("a.md"),
+            &format!("---\nname: other\nignored: {deep}\n---\nother\n"),
+        );
+        fx.put(
+            &agents.join("b.md"),
+            &format!("---\nname: {deep}\n---\nunnamed\n"),
+        );
+        fx.put(&agents.join("x.md"), "---\nname: x\n---\nmine\n");
+        assert_eq!(
+            fx.get(Client::Claude, &fx.work(), "x").unwrap().body,
+            "mine\n"
+        );
+        let e = fx.get(Client::Claude, &fx.work(), "other").unwrap_err();
+        assert_eq!((e.code, e.check), (2, "role"));
+        let shown = show(&agents.join("a.md"));
+        assert!(
+            e.message.contains(&shown) && e.message.contains("line 3"),
+            "{}",
+            e.message
+        );
+        let github = fx.work().join(".github").join("agents");
+        fx.put(
+            &github.join("y.agent.md"),
+            &format!("---\ntools: {deep}\n---\ny\n"),
+        );
+        fx.put(&github.join("z.agent.md"), "---\ntools: read\n---\nz\n");
+        assert_eq!(
+            fx.get(Client::Copilot, &fx.work(), "z").unwrap().body,
+            "z\n"
+        );
+        let e = fx.get(Client::Copilot, &fx.work(), "y").unwrap_err();
+        assert_eq!((e.code, e.check), (2, "role"));
+        assert!(e.message.contains("line 2"), "{}", e.message);
+        // A list inside a `- item` list is as deep as this reads.
+        fx.put(
+            &github.join("y.agent.md"),
+            "---\ntools:\n  - [read]\n---\ny\n",
+        );
+        let e = fx.get(Client::Copilot, &fx.work(), "y").unwrap_err();
+        assert!(e.message.contains("line 3"), "{}", e.message);
+    }
+
+    #[test]
+    fn quoted_keys_and_comments_read_as_yaml_reads_them() {
+        let fx = Fx::new();
+        let path = fx.work().join(".claude").join("agents").join("x.md");
+        fx.put(
+            &path,
+            "---\n# a reviewer\n\"name\": x # the reviewer\n'model': haiku # fast\n\"tools\": [Read, \"Grep\"] # two\ndescription: \"say \\\"hi\\\" # not a comment\"\n---\nbody\n",
+        );
+        let s = fx.get(Client::Claude, &fx.work(), "x").unwrap();
+        assert_eq!(
+            (s.model.as_deref(), s.tools.clone()),
+            (Some("haiku"), Some(v(&["Read", "Grep"])))
+        );
+        assert!(s.ignored.is_empty(), "{:?}", s.ignored);
+        fx.put(
+            &path,
+            "---\nname: 'x'\ntools:\n  # read only\n  - Read # first\n  - 'Grep'\n---\nbody\n",
+        );
+        assert_eq!(
+            fx.get(Client::Claude, &fx.work(), "x").unwrap().tools,
+            Some(v(&["Read", "Grep"]))
+        );
+        // A `#` with no space before it is part of the value.
+        fx.put(&path, "---\nname: x\nmodel: a#b\n---\nbody\n");
+        assert_eq!(
+            fx.get(Client::Claude, &fx.work(), "x")
+                .unwrap()
+                .model
+                .as_deref(),
+            Some("a#b")
+        );
+    }
+
+    #[test]
+    fn a_bom_crlf_and_dashes_in_the_body_read_alike() {
+        let fx = Fx::new();
+        let path = fx.work().join(".claude").join("agents").join("x.md");
+        fx.put(
+            &path,
+            "\u{feff}---\r\nname: x\r\ntools: [Read] # one\r\n---\r\nintro\r\n---\r\nmore: [[x]]\r\n",
+        );
+        let s = fx.get(Client::Claude, &fx.work(), "x").unwrap();
+        assert_eq!(s.tools, Some(v(&["Read"])));
+        assert_eq!(s.body, "intro\r\n---\r\nmore: [[x]]\r\n");
+    }
+
+    // Fail closed: the selected file refuses, naming its line, for any line outside the subset, and for a key this
+    // uses (`model`, `tools`) whose value it cannot use; nothing is quietly ignored.
+    #[test]
+    fn a_line_outside_the_subset_refuses_its_file_naming_the_line() {
+        let fx = Fx::new();
+        let path = fx.work().join(".claude").join("agents").join("x.md");
+        let shown = show(&path);
+        for (front, line) in [
+            ("tools: [[Read]]", 3),
+            ("tools: [Read, [Grep]]", 3),
+            ("tools: [Read, {a: b}]", 3),
+            ("tools:\n  - - Read", 4),
+            ("tools:\n  - a: b", 4),
+            ("tools:\n  Read: yes", 4),
+            ("tools: Read\n  Grep", 4),
+            ("tools: |\n  Read", 3),
+            ("tools: \"Read\\u0041\"", 3),
+            ("tools:", 3),
+            ("model:", 3),
+            ("model: [haiku]", 3),
+            ("model: {a: b}", 3),
+            ("model: &m haiku", 3),
+            ("description: a: b", 3),
+            ("tools: Read\ntools: Grep", 4),
+            ("hooks:\n  Stop:\n    - command: x", 4),
+            ("? tools", 3),
+            ("\ttools: Read", 3),
+            ("tools : Read", 3),
+            ("...", 3),
+        ] {
+            fx.put(&path, &format!("---\nname: x\n{front}\n---\nbody\n"));
+            let e = fx.get(Client::Claude, &fx.work(), "x").unwrap_err();
+            assert_eq!((e.code, e.check), (2, "role"), "{front}");
+            assert!(
+                e.message.contains(&shown) && e.message.contains(&format!("line {line}")),
+                "{front}: {}",
+                e.message
+            );
+        }
     }
 
     /// The complete argv a launch emits: the policy the team grammar reads from it is the role-less child's.
