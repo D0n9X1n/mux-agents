@@ -42,7 +42,7 @@ flowchart LR
 
 | 动词 | 示例 | 作用 |
 |---|---|---|
-| `spawn` | `spawn -Client copilot -Name add-tests -TaskFile task.md -BriefFile brief.md -Split h` | 按会话的 `placement` 启动代理（默认是新窗口）；`-Split h\|v` 或 `-Tab` 只决定这一次；`-Model <model>` 指定它的模型（否则用客户端的默认模型）；`-Effort low\|medium\|high` 设置它的推理强度；`-NoFork` 或 `-Context brief` 让它从简报而不是你对话的分叉开始 |
+| `spawn` | `spawn -Client copilot -Name add-tests -TaskFile task.md -BriefFile brief.md -Split h` | 按会话的 `placement` 启动代理（默认是新窗口）；`-Split h\|v` 或 `-Tab` 只决定这一次；`-Model <model>` 指定它的模型（否则用客户端的默认模型）；`-Effort low\|medium\|high` 设置它的推理强度；`-NoFork` 或 `-Context brief` 让它从简报而不是你对话的分叉开始；`-Role <name>` 让它从你客户端自己的一个代理定义启动（见下文关于角色的段落） |
 | `placement` | `placement h`，`placement tab` | 本会话之后 `spawn` 在哪里打开代理：`tab`（新窗口，默认）、`h` 或 `v`（在你旁边分屏）；单独的 `placement` 显示当前选择 |
 | `list` | `list -All` | 存活的代理、各自在做什么，以及各自的未读消息（它发出的报告，与侧边栏的 ✉ 标记计数相同，从不计入它自己结束的通知）；`-All` 加上已结束的，各带其 `exitCode` |
 | `focus` | `focus claude-1`、`focus -Next` | 切换到代理的视图，视图已关闭时重新打开它；`-Next` / `-Prev` 按侧边栏的顺序逐个切换 |
@@ -69,7 +69,7 @@ flowchart LR
 动词、标志或值有误时会以 `usage` 拒绝，并给出该动词的用法行：
 
 ```text
-usage: mux-agent spawn -Client <claude|copilot> [-Task <text>] [-TaskFile <path>] [-BriefFile <path>] [-Name <name>] [-Model <model>] [-Split <value>] [-Tab] [-NoFork] [-Context <fork|brief>] [-Effort <low|medium|high>] [-Text]
+usage: mux-agent spawn -Client <claude|copilot> [-Task <text>] [-TaskFile <path>] [-BriefFile <path>] [-Name <name>] [-Model <model>] [-Split <value>] [-Tab] [-NoFork] [-Context <fork|brief>] [-Effort <low|medium|high>] [-Role <name>] [-Text]
 usage: mux-agent placement [tab|h|v] [-Text]
 usage: mux-agent list [-All] [-Text]
 usage: mux-agent focus (<name> | -Next | -Prev) [-Text]
@@ -95,6 +95,8 @@ usage: mux-agent kept [-Close <address>] [-Text]
 每个会话选一次代理在哪里打开：`placement h`（或 `v`）让之后每次 `spawn` 都拆分你的窗格，`placement tab` 改回新窗口，单独的 `placement` 显示当前选择。它保存在多路复用器会话上，随会话结束，不写入磁盘；单次 `spawn` 上的 `-Split h|v` 或 `-Tab` 会覆盖它。 分屏时你的窗格始终最大：第一个代理占它的一半，第二、第三个在那一半里均分堆叠；第四个，或分屏后会小于 60 列或 10 行的代理，改为在标签页中打开；侧边栏打开后，你的窗格会恢复一半宽度。
 
 每个代理的名字说明它做什么，也是它的标签页名或窗格标题。技能总是传 `-Name <short-kebab-name>`（1-24 个小写字母、数字或连字符，以字母开头；`parent`、`root`、`all`、`leader`、`children` 和 `team` 是保留名）。不传 `-Name` 时，名字取自任务的前几个词："Please add a subtract function to calc.py" 变成 `add-subtract-function`，没有可用词的任务得到 `claude-1` 或 `copilot-1`。名字在其会话中永不复用，即使代理已结束：被占用的派生名加上 `-2`、`-3`……（在词边界截断以保持在 24 以内），被占用的 `-Name` 会被拒绝，并给出一个可用的名字。即使代理的客户端自己设置标题，窗格标题仍保持为该名字；tmux 3.2a 除外，它无法阻止客户端改写窗格标题（标签页名仍然保持）。
+
+`spawn -Role <name>` 让代理从一个角色启动：角色是你客户端自己的代理定义，从代理启动所在的文件夹查找（团队成员的子代理从该成员启动的文件夹查找）。Claude Code 的角色按 frontmatter 的 `name` 匹配：先找该文件夹及其每一级父文件夹直到仓库根目录中的 `.claude/agents/**/*.md`（由近及远），再找 `~/.claude/agents/`，最后是已安装插件的 `agents/`（`<plugin>:<name>` 指定某个插件的角色）。Copilot CLI 的角色按文件名匹配：先找 `~/.copilot/agents/`，再找直到仓库根目录的 `.github/agents/`（`<name>.agent.md`，否则 `<name>.md`），最后是已安装的插件。第一个有匹配的位置胜出；同一位置有两个匹配，或没有匹配，都以 `role` 拒绝。文件只在启动时读取一次：正文成为代理的常驻简报（其文件夹中的 `role.md`，在第一条消息中排在任务之前点名），`model` 在你未传 `-Model` 时成为 `--model=`，`tools` 成为 Claude Code 的 `--tools=` 或 Copilot CLI 的 `--available-tools=`。其他所有字段（`permissionMode`、`hooks`、`mcpServers`、`skills`、`initialPrompt` 及其他）都被忽略，并列在回复的 `roleIgnored` 中。角色从不提高权限：代理得到与不带角色时相同的权限标志，mux-agents 也从不传客户端的 `--agent`。恢复、修复和还原重用启动时保存的内容，从不再读角色文件；`list` 在每个代理的 `model` 之后显示其 `role`。
 
 ## 侧边栏
 
@@ -189,6 +191,7 @@ copilot plugin marketplace update mux-agents && copilot plugin update mux-agents
 | `views` | 团队的视图已关闭时，成员运行 `spawn`、`focus`、`resume`、`sidebar`、`watch` 或 `placement` | 运行 `up` |
 | `name` | `-Name` 不是以字母开头的 1-24 个小写字母、数字或连字符，是保留名（`parent`、`root`、`all`、`leader`、`children`、`team`），或在此会话中已被占用；或某个代理记录无法读取，因而无法检查名字 | 使用消息建议的空闲名字或另选一个；记录无法读取时，检查状态文件夹中该代理的文件夹 |
 | `brief` | 代理调用者启动的子代理从简报而不是对话分叉开始（`-NoFork`、另一种客户端、没有会话 id、非交互式的 Claude Code，或 Copilot CLI 会话复制失败），却没有传 `-BriefFile` | 传入 `-BriefFile`，写明子代理需要的上下文 |
+| `role` | `-Role` 指定的角色在启动方客户端中不存在或在同一位置有两个，或角色文件超过 64 KiB、不是 UTF-8、frontmatter 无法读取，或列出的工具不是单个普通名字（字母开头，后接字母、数字和 `_*().:`；最多 64 个） | 修改角色文件，以 `<plugin>:<name>` 指定角色，或换一个角色；消息会列出查找过的文件夹 |
 | `target` | 没有存活代理叫这个名字、接收者不是此会话的存活窗格、代理的窗格已不再运行它自己的启动命令、`status` 来自一个不是代理的窗格，或保留 shell 的地址或笔记 id 有误 | 用 `list` 核对名字，用 `kept` 核对地址；只有代理报告 `status` |
 | `parent` | 从不是代理的窗格执行 `send parent`、代理停止不是它启动的代理，或代理窗格的记录缺失或无法证明在此运行 | 按名字发送给代理；只有父代理或人类可以停止代理 |
 | `authority` | 成员对不在其团队下级中的代理运行 `stop`、`read <name>` 或 `resume`，或由人以外的调用者运行 `notify` | 请该代理的祖先或一个人来做 |

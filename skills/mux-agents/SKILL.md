@@ -32,6 +32,7 @@ The commands below, and the Reply and Listen lines, run as-is in the Bash tool. 
 
 ```
 "<entry>" spawn -Client <client> -Name <name> -TaskFile <task-file> -BriefFile <brief-file>
+"<entry>" spawn -Client <client> -Name <name> -TaskFile <task-file> -BriefFile <brief-file> -Role <role>
 "<entry>" placement tab
 "<entry>" placement h
 "<entry>" placement
@@ -69,6 +70,8 @@ The commands below, and the Reply and Listen lines, run as-is in the Bash tool. 
 ```
 
 `spawn` opens where `placement` says (a new window by default), titled with the agent's name. It also takes `-Split h|v` or `-Tab` (this spawn only, over the placement) and `-NoFork`. Pass `-Model <model>` (for example `sonnet`, `opus` or `sonnet[1m]`) only when the user names a model; without it the agent uses its client's default.
+
+Pass `-Role <role>` only when the user names a role. A role is one of the spawning client's own agent definitions, found from the folder the agent starts in: Claude Code's `.claude/agents/` (up to the repository root), `~/.claude/agents/` and installed plugins, by frontmatter `name` (`<plugin>:<name>` for one plugin's); Copilot CLI's `~/.copilot/agents/`, `.github/agents/` and installed plugins, by file name. Only its body (the agent's standing brief, `role.md`), its `model` and its `tools` are used; every other field is ignored and listed in the reply's `roleIgnored`. A role never raises the agent's permissions.
 
 `list` shows each live agent's state, what it is doing and its unread count; `list -All` adds the ended agents (at most 10, newest first), each with its `exitCode` (null for a stop) and the `resume` command that starts it again with its conversation (a person only; never its task again).
 
@@ -121,6 +124,7 @@ Your first message names the notebook and lists its newest titles. When another 
 - `cap`: 10 live agents in the session.
 - `limit`: the team already has 10 members besides the leader. The message names each member made before v0.3.0 that holds a slot: `mux-agent stop <name>` frees one whose shell is lost or ended (nothing is killed) and stops one that runs; one hc cannot show stays held.
 - `name`: a bad or taken name.
+- `role`: `-Role` names no role of the spawning client, two in one place, or a role file it cannot use (over 64 KiB, not UTF-8, an unreadable frontmatter, or a tool that is not one plain name); the message names the folders searched.
 - Other check names: `brief`, `target`, `parent`, `endpoint`, `state`, `lock`, `caller`, `launch`, `rmux`, `sidebar`, `usage` and `internal`.
 
 ## Shell shortcuts
