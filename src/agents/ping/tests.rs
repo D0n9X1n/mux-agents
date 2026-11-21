@@ -587,3 +587,58 @@ fn the_notice_is_sent_with_the_members_agent_lock_free() {
         "publish, the notice's send; publish, then sent"
     );
 }
+
+/// At the first hold of member `id`'s member or agent lock, runs `f` once: a change that lands after a check made
+/// before that hold and before the write after it.
+fn at_first_hold(w: &World, id: &str, f: impl Fn() + 'static) {
+    let (agent, member) = (
+        format!("+{}", crate::agents::lock_key("agent", &w.caller(), id)),
+        format!("+{}", crate::agents::lock_key("member", &w.caller(), id)),
+    );
+    let done = std::rc::Rc::new(std::cell::Cell::new(false));
+    w.fakes.lock_probe(move |event| {
+        if !done.get() && (event == agent || event == member) {
+            done.set(true);
+            f();
+        }
+        String::new()
+    });
+}
+
+/// The member in `folder` resumed into generation 1 (a new hc name), as resume and recovery rewrite its record.
+fn next_generation(folder: &std::path::Path) {
+    let mut r = file(folder, "record.json");
+    (r["generation"], r["hcName"]) = (json!("1"), json!("m0123abcd"));
+    crate::state::fs::write_json(&folder.join("record.json"), &r).unwrap();
+}
+
+// The generation `answer` checks and the files it writes belong to one hold of the member's locks. A member resumed
+// into generation 1 after `answer` proved it at generation 0, but before it takes the locks, is a new generation:
+// generation 0's ping is no ping of it, so the answer is refused and generation 1's status stays.
+#[test]
+fn an_answer_racing_a_new_generation_is_refused_and_writes_nothing() {
+    let w = team_world();
+    online(&w);
+    online(&w);
+    let id = ping(&w, "ma1")["id"].as_str().unwrap().to_string();
+    w.file("a.md", b"generation 0's answer");
+    let folder = w.folder(A);
+    let (f, at) = (folder.clone(), utc_o(w.ctx.clock.now()));
+    at_first_hold(&w, A, move || {
+        next_generation(&f);
+        crate::state::fs::write_json(
+            &f.join("status.json"),
+            &json!({"text": "generation 1 at work", "at": at}),
+        )
+        .unwrap();
+    });
+    online(&w);
+    let got = answer_as(&w.ctx, &as_member(&w, A), &id, "a.md");
+    w.fakes.hc_done().unwrap();
+    assert_eq!(
+        got.map_err(said).err().as_deref(),
+        Some("2 ping no open ping with that id")
+    );
+    assert!(!folder.join("answer.json").exists(), "no answer written");
+    assert_eq!(file(&folder, "status.json")["text"], "generation 1 at work");
+}

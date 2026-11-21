@@ -105,6 +105,27 @@ pub(crate) fn open(folder: &Path, generation: &Value) -> Option<Open> {
     })
 }
 
+/// Runs `f` with member `id`'s current `generation` (null when its record has none) under one hold of its member lock,
+/// then its agent lock. Resume and recovery change `generation` only under the member lock
+/// (`team_state::Tx::record_write`), so the generation `f` checks stays the member's until `f` returns; `status`,
+/// `report` and the board read and write the files `f` writes under the agent lock. The order is the team lock (when
+/// held), the member lock, then the agent lock; nothing takes them the other way round.
+fn held<T>(ctx: &Ctx, caller: &Caller, id: &str, f: impl FnOnce(&Value) -> Res<T>) -> Res<T> {
+    let folder = super::server_dir(ctx, caller).join("agents").join(id);
+    super::lock(ctx, &super::lock_key("member", caller, id), || {
+        let generation = match super::gens::member_of(&folder) {
+            super::gens::Member::Pre(r) => r.get("generation").cloned(),
+            super::gens::Member::Life(g) => g.record().get("generation").cloned(),
+            super::gens::Member::Unreadable(e) => return Err(e),
+            super::gens::Member::Absent => None,
+        };
+        let generation = generation.unwrap_or(Value::Null);
+        super::lock(ctx, &super::lock_key("agent", caller, id), || {
+            f(&generation)
+        })
+    })
+}
+
 /// What `ping` published (or found open) for one member.
 struct Published {
     name: String,
@@ -224,8 +245,9 @@ pub fn answer(ctx: &Ctx, request: &Request) -> Res<Map<String, Value>> {
 }
 
 /// `answer` for a resolved caller: only a running member itself (as `status` proves it), and only for the open ping
-/// its own folder holds. Under its agent lock it writes `status.json` (the doing line shows the answer), then
-/// `answer.json {ping, text, at}`, which closes the ping; a retry after a crash between the two finds it still open.
+/// its own folder holds at its current generation. In one hold of its member, then agent lock (`held`) it checks that
+/// ping, writes `status.json` (the doing line shows the answer), then `answer.json {ping, text, at}`, which closes the
+/// ping; a retry after a crash between the two finds it still open.
 pub(crate) fn answer_as(
     ctx: &Ctx,
     caller: &Caller,
@@ -240,14 +262,11 @@ pub(crate) fn answer_as(
     if text.is_empty() {
         return refuse(2, "usage", "the answer is empty");
     }
-    let generation = (me.record.as_ref())
-        .and_then(|r| r.get("generation"))
-        .cloned()
-        .unwrap_or(Value::Null);
     let folder = super::state_dir(ctx, caller)?.join("agents").join(&me.key);
     let at = utc_o(ctx.clock.now());
-    super::lock(ctx, &super::lock_key("agent", caller, &me.key), || {
-        if open(&folder, &generation).is_none_or(|o| o.id != id) {
+    // The generation is read again here, under the locks: the one `own_agent` proved may have changed since.
+    held(ctx, caller, &me.key, |generation| {
+        if open(&folder, generation).is_none_or(|o| o.id != id) {
             return refuse(2, "ping", "no open ping with that id");
         }
         crate::state::fs::write_json(
