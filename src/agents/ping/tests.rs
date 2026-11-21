@@ -346,18 +346,25 @@ fn status_report_sends_and_reading_the_notice_never_answer() {
         w.fakes.hc_done().unwrap();
     }
     assert!(!batch.is_empty(), "the notice was read");
-    // In a team: sends to the leader and to another member, and a reply to the leader's message.
+    // In a team: sends to the leader, to w1's child, to a sibling (mc3, also under the leader), and a reply to the
+    // leader's message.
     let w = team_world();
+    let leader = crate::agents::tree::tests::LEADER;
+    crate::agents::core_fixture::member(
+        &w,
+        crate::agents::team_mail::tests::C,
+        json!({"name": "mc3", "depth": 1, "parentAgent": {"id": leader}, "pane": "%8", "window": "@1"}),
+    );
     online(&w);
     online(&w);
     let id = ping(&w, "ma1")["id"].as_str().unwrap().to_string();
-    let leader = crate::agents::tree::tests::LEADER;
     crate::agents::mail::deliver_once(&w.ctx, &w.caller(), A, &json!({"id": "2222222222222222", "from": "leader",
         "fromId": leader, "pane": "%4", "at": "x", "body": "q", "fromBox": leader, "re": null, "hop": 0, "cast": null}))
     .unwrap();
     for args in [
         &["send", "leader", "-Body", "x"][..],
         &["send", "mb2", "-Body", "x"],
+        &["send", "mc3", "-Body", "x"],
         &["send", "leader", "-Body", "x", "-Re", "2222222222222222"],
     ] {
         online(&w);
