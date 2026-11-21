@@ -86,6 +86,7 @@ mod recover_tests;
 pub mod registry;
 pub mod release;
 pub mod resume;
+pub mod role;
 pub mod scope;
 pub mod session_report;
 #[cfg(test)]

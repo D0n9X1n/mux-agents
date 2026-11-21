@@ -105,7 +105,7 @@ fn context_name(context: Context) -> &'static str {
 
 /// `^[A-Za-z0-9][A-Za-z0-9._\[\]-]{0,63}$`: a model name or alias (`sonnet`, `sonnet[1m]`), never a flag or a
 /// second argument.
-fn model_name(model: &str) -> bool {
+pub(crate) fn model_name(model: &str) -> bool {
     let mut bytes = model.bytes();
     bytes.next().is_some_and(|b| b.is_ascii_alphanumeric())
         && bytes.all(|b| b.is_ascii_alphanumeric() || b".-_[]".contains(&b))
