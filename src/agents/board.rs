@@ -285,7 +285,7 @@ pub(crate) fn timed(ctx: &Ctx, caller: &Caller, all: bool, watch: bool) -> Res<T
         if let (true, Some(at)) = (watch, ended) {
             row.insert("endedAgo".into(), ago(at).into());
         }
-        Ok(hc_row(row, o, snapshot.views.get(id)))
+        Ok(super::ping::last(hc_row(row, o, snapshot.views.get(id))))
     };
     let mut agents = running
         .into_iter()
@@ -293,7 +293,9 @@ pub(crate) fn timed(ctx: &Ctx, caller: &Caller, all: bool, watch: bool) -> Res<T
         .collect::<Res<Vec<_>>>()?;
     // A 0.2.x pane-based member still running after the upgrade is listed as 0.2.8 listed it, so a person sees it.
     for (p, record, window) in super::prelife::live_panes(ctx, caller) {
-        agents.push(rows.row(&p.id, &record, p.pane, &window, "running")?);
+        agents.push(super::ping::last(
+            rows.row(&p.id, &record, p.pane, &window, "running")?,
+        ));
     }
     let count = agents.len();
     agents.sort_by_key(|row| {

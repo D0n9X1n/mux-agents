@@ -3107,7 +3107,15 @@ hc {}:
                     "{mux:?} {row}"
                 );
             }
-            want_keys.extend(["life", "view", "hcAddress"]);
+            // The shown status's time and the ping fields come after every other field.
+            want_keys.extend([
+                "life",
+                "view",
+                "hcAddress",
+                "statusAt",
+                "pingedAt",
+                "noAnswer",
+            ]);
             assert_eq!(keys(row), want_keys, "{mux:?}");
             let want = json!({
                 "name": w["name"], "client": "claude", "pane": if state=="running" {w["pane"].clone()} else {Value::Null}, "window": if state=="running" {w["window"].clone()} else {Value::Null}, "context": "brief",
@@ -3115,6 +3123,7 @@ hc {}:
                 "life": if state=="running" {"running"} else {"ended"},
                 "view": if state=="running" {"attached"} else {"detached"}, "hcAddress": w["hcAddress"],
                 "doing": "say hi", "doingFrom": "task", "unread": unread, "model": null, "role": null,
+                "statusAt": null, "pingedAt": null, "noAnswer": false,
             });
             for (field, value) in want.as_object().unwrap() {
                 assert_eq!(&row[field], value, "{mux:?} {row}");

@@ -176,7 +176,7 @@ impl Rows<'_> {
             .join("agents")
             .join(id);
         let live = state == "running";
-        let (status, sent, waiting, reported, seen, on) = crate::agents::lock(
+        let (status, sent, waiting, reported, seen, on, pinged) = crate::agents::lock(
             self.ctx,
             &crate::agents::lock_key("agent", self.caller, id),
             || {
@@ -198,7 +198,20 @@ impl Rows<'_> {
                 let on = live
                     && !crate::agents::tree::is_leader(record)
                     && crate::agents::message::on_call(self.ctx, &folder);
-                Ok((status, read("last-sent.json"), waiting, reported, seen, on))
+                // Only a live member answers: an ended one's ping is none. Read beside the answer that closes it.
+                let generation = record.get("generation").unwrap_or(&Value::Null);
+                let pinged = live
+                    .then(|| crate::agents::ping::open(&folder, generation))
+                    .flatten();
+                Ok((
+                    status,
+                    read("last-sent.json"),
+                    waiting,
+                    reported,
+                    seen,
+                    on,
+                    pinged,
+                ))
             },
         )?;
         let (doing, from) = select_doing(
@@ -206,6 +219,15 @@ impl Rows<'_> {
             sent.as_ref().and_then(|s| s.get("line")),
             record.get("taskLine"),
         );
+        // The shown doing line's own time: its status's, or its message's; none for the task line.
+        let shown = match from.as_str() {
+            Some("status") => status.as_ref(),
+            Some("message") => sent.as_ref(),
+            _ => None,
+        };
+        let status_at = (shown.and_then(|s| s.get("at")))
+            .filter(|at| at.as_str().and_then(parse_utc).is_some())
+            .cloned();
         let field = |name: &str| record.get(name).cloned().unwrap_or(Value::Null);
         let name = crate::agents::text(record.get("name"));
         let age = record
@@ -250,6 +272,24 @@ impl Rows<'_> {
                 .filter(|_| since.is_some())
                 .cloned();
             row.insert("changedAt".into(), changed.unwrap_or(Value::Null));
+        }
+        // After every field `list` had, so its -Text columns keep their places (`ping::last` keeps them last).
+        row.insert("statusAt".into(), status_at.unwrap_or(Value::Null));
+        row.insert(
+            "pingedAt".into(),
+            pinged
+                .as_ref()
+                .map_or(Value::Null, |p| p.asked_at.clone().into()),
+        );
+        let late =
+            (pinged.as_ref()).is_some_and(|p| crate::agents::ping::late(&p.asked_at, self.now));
+        row.insert("noAnswer".into(), late.into());
+        // The bar's feed has the open ping's age, as it has `endedAgo`: the bar draws with no clock of its own.
+        if let Some(p) = pinged.as_ref().filter(|_| self.watch) {
+            row.insert(
+                "pingedAgo".into(),
+                crate::agents::ping::age(&p.asked_at, self.now).into(),
+            );
         }
         // Only the bar's feed shows the waiting flag itself.
         if let Some(waiting) = waiting.filter(|_| self.watch) {

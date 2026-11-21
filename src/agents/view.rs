@@ -17,7 +17,12 @@ use crate::state::fs::{BODY_MAX, read_json, read_text, write_json};
 /// The board as the caller's pane sees it: unread from its own mailbox (a running agent's id, else `pane-<n>`).
 pub fn list(ctx: &Ctx, request: &Request) -> Res<Map<String, Value>> {
     let caller = resolve(ctx)?;
-    board(ctx, &caller, request.switch("All"), false)
+    let mut reply = board(ctx, &caller, request.switch("All"), false)?;
+    // `-Text` has no clock: an open ping's time becomes its age here, by this call's clock.
+    if request.text {
+        super::ping::label(&mut reply, ctx.clock.now());
+    }
+    Ok(reply)
 }
 
 /// `list -Text`: the rows as `json::to_text` prints them, without the `color` column. With `color`, a live agent's

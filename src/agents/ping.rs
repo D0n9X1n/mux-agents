@@ -5,6 +5,7 @@
 //! no clock decides it. A record of another generation than the member's current one is no ping of this member: a
 //! resumed or respawned member never inherits it.
 use std::path::Path;
+use std::time::{Duration, SystemTime};
 
 use serde_json::{Map, Value, json};
 
@@ -13,6 +14,60 @@ use crate::cli::Request;
 use crate::ctx::Ctx;
 use crate::error::{Res, refuse};
 use crate::util::{parse_utc, utc_o};
+
+/// How long an open ping waits before the views flag `noAnswer`. The board's clock decides only when the flag shows,
+/// never whether the ping was answered.
+pub(crate) const PING_DEADLINE: Duration = Duration::from_secs(600);
+
+/// The row fields `list` adds after every field it had before, in this order.
+const LAST: [&str; 3] = ["statusAt", "pingedAt", "noAnswer"];
+
+/// Whole seconds from `asked_at` to `now`; 0 when the clock is behind it (it moved backward).
+pub(crate) fn age(asked_at: &str, now: SystemTime) -> u64 {
+    parse_utc(asked_at)
+        .and_then(|at| now.duration_since(at).ok())
+        .map_or(0, |d| d.as_secs())
+}
+
+/// Whether an open ping asked at `asked_at` has waited `PING_DEADLINE` by `now`.
+pub(crate) fn late(asked_at: &str, now: SystemTime) -> bool {
+    age(asked_at, now) >= PING_DEADLINE.as_secs()
+}
+
+/// `row` with `statusAt`, `pingedAt` and `noAnswer` moved to its end, so every field before them keeps its place
+/// (and its `-Text` column) whatever a later step added.
+pub(crate) fn last(mut row: Map<String, Value>) -> Map<String, Value> {
+    for key in LAST {
+        if let Some(value) = row.shift_remove(key) {
+            row.insert(key.into(), value);
+        }
+    }
+    row
+}
+
+/// `list -Text`: each open ping's `pingedAt` as `pinged 4m`, or as `no answer 12m` once its row has `noAnswer`, aged
+/// by `now`. The text renderer has no clock, so the age is put in here; the JSON keeps the time.
+pub(crate) fn label(reply: &mut Map<String, Value>, now: SystemTime) {
+    let Some(Value::Array(rows)) = reply.get_mut("agents") else {
+        return;
+    };
+    for row in rows.iter_mut().filter_map(Value::as_object_mut) {
+        let Some(at) = row
+            .get("pingedAt")
+            .and_then(Value::as_str)
+            .map(String::from)
+        else {
+            continue;
+        };
+        let word = if row.get("noAnswer") == Some(&Value::Bool(true)) {
+            "no answer"
+        } else {
+            "pinged"
+        };
+        let age = crate::sidebar::format_age(Some(&Value::from(age(&at, now))));
+        row.insert("pingedAt".into(), format!("{word} {age}").into());
+    }
+}
 
 /// A member's open ping: its `ping.json` at the member's current `generation`, unless its `answer.json` names that
 /// ping. An unreadable or malformed record is none: the views never fail for it, and `ping` publishes a new one.

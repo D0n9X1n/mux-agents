@@ -415,7 +415,8 @@ fn board_row_field_order() {
         json!({"name": name, "client": client, "pane": pane, "window": window, "context": "brief",
                 "parent": "%1", "sessionId": SESSION_ID, "directory": "/work", "createdAt": created,
                 "state": "running", "doing": doing, "doingFrom": from, "age": age, "unread": unread,
-                "model": model, "role": role, "color": color, "activity": "working", "since": null, "changedAt": null, "life":"running", "view":"attached", "hcAddress":address})
+                "model": model, "role": role, "color": color, "activity": "working", "since": null, "changedAt": null, "life":"running", "view":"attached", "hcAddress":address,
+                "statusAt": null, "pingedAt": null, "noAnswer": false})
     };
     // A record without a model (the client's own) or a role lists null; one without a color gets its name's hue.
     let want = json!({"running": 2, "agents": [
@@ -617,8 +618,17 @@ fn lost_row_says_closed_by_pane() {
         assert_eq!(lost["exitCode"], Value::Null);
         let keys: Vec<&str> = lost.keys().map(String::as_str).collect();
         assert_eq!(
-            keys[keys.len() - 5..],
-            ["closedBy", "exitCode", "life", "view", "hcAddress"]
+            keys[keys.len() - 8..],
+            [
+                "closedBy",
+                "exitCode",
+                "life",
+                "view",
+                "hcAddress",
+                "statusAt",
+                "pingedAt",
+                "noAnswer"
+            ]
         );
         assert!(rows[1].get("closedBy").is_none(), "{}", rows[1]);
     }
@@ -639,9 +649,10 @@ fn ended_rows_carry_exit_code_in_list_and_watch() {
             .map(|row| {
                 let row = row.as_object().unwrap();
                 match row.get("exitCode") {
-                    // hc suffix follows the terminal fields.
+                    // hc suffix follows the terminal fields; the status and ping fields come last of all.
                     Some(code) => {
-                        assert_eq!(row.keys().next_back().unwrap(), "hcAddress");
+                        let tail: Vec<&String> = row.keys().rev().take(4).collect();
+                        assert_eq!(tail, ["noAnswer", "pingedAt", "statusAt", "hcAddress"]);
                         format!("{}={code}", row["name"].as_str().unwrap())
                     }
                     None => format!("{}=none", row["name"].as_str().unwrap()),
@@ -1632,7 +1643,17 @@ fn board_hc_route_orders_counts_and_never_refreshes() {
                     .keys()
                     .map(String::as_str)
                     .collect::<Vec<_>>();
-                assert_eq!(&keys[keys.len() - 3..], ["life", "view", "hcAddress"]);
+                assert_eq!(
+                    &keys[keys.len() - 6..],
+                    [
+                        "life",
+                        "view",
+                        "hcAddress",
+                        "statusAt",
+                        "pingedAt",
+                        "noAnswer"
+                    ]
+                );
             }
             if all {
                 assert_eq!(rows[4]["state"], "exited 7");
@@ -2410,4 +2431,192 @@ fn a_parent_pane_on_another_server_counts_only_its_qualified_mailbox() {
             .clone();
         assert_eq!(kid["unread"], json!(1), "team {team}: only {qualified}");
     }
+}
+
+const PING: &str = "0123456789abcdef";
+
+/// The worker running since 11:00, working since 11:20 (`since` 2400 at NOW), its status of 11:57, and an open ping
+/// asked at 11:50:01 (599 s at NOW).
+fn pinged_world() -> (World, Caller, PathBuf) {
+    let w = World::human("");
+    w.clock(NOW);
+    let caller = w.caller();
+    let folder = member(&w, ID, json!({"createdAt": "2026-10-29T11:00:00.0000000Z"}));
+    w.panes(&["%9|@5|300|aaaaaaaaaaaa|worker"]);
+    write(
+        &folder.join("activity.json"),
+        json!({"state": "working", "kind": null, "since": "2026-10-29T11:20:00.0000000Z"}),
+    );
+    write(
+        &folder.join("status.json"),
+        json!({"text": "wiring the bar", "at": "2026-10-29T11:57:00.0000000Z"}),
+    );
+    write(
+        &folder.join("ping.json"),
+        json!({"id": PING, "askedAt": "2026-10-29T11:50:01.0000000Z", "by": null, "generation": "0", "sent": true}),
+    );
+    (w, caller, folder)
+}
+
+fn row_of(w: &World, caller: &Caller, watch: bool) -> Map<String, Value> {
+    snapshot(w, caller, &[(ID, "running")]);
+    let reply = board(&w.ctx, caller, false, watch).unwrap();
+    w.fakes.hc_done().unwrap();
+    reply["agents"][0].as_object().unwrap().clone()
+}
+
+// Behaviours 4, 5, 6: an open ping shows its time (`pingedAt`; the bar's feed its age, `pingedAgo`) and, from 10
+// minutes by the board's clock, `noAnswer`; the member's own answer closes it, and a ping of another generation is
+// none. `statusAt` is the shown status's own time (3 min), not the activity's `since` (40 min).
+#[test]
+fn an_open_ping_shows_its_time_and_no_answer_from_ten_minutes() {
+    let (w, caller, folder) = pinged_world();
+    let fields = |row: &Map<String, Value>| {
+        (
+            row["statusAt"].clone(),
+            row["pingedAt"].clone(),
+            row["noAnswer"].clone(),
+        )
+    };
+    let asked = json!("2026-10-29T11:50:01.0000000Z");
+    let status = json!("2026-10-29T11:57:00.0000000Z");
+    let row = row_of(&w, &caller, false);
+    assert_eq!(
+        fields(&row),
+        (status.clone(), asked.clone(), json!(false)),
+        "9:59"
+    );
+    assert_eq!(
+        (row["since"].clone(), row.get("pingedAgo")),
+        (json!(2400), None)
+    );
+    assert_eq!(row_of(&w, &caller, true)["pingedAgo"], json!(599));
+    w.fakes.advance(std::time::Duration::from_secs(1));
+    assert_eq!(
+        fields(&row_of(&w, &caller, false)),
+        (status.clone(), asked.clone(), json!(true)),
+        "10:00"
+    );
+    assert_eq!(row_of(&w, &caller, true)["pingedAgo"], json!(600));
+    // Answered later: no ping shows.
+    write(
+        &folder.join("answer.json"),
+        json!({"ping": PING, "text": "done", "at": NOW}),
+    );
+    assert_eq!(
+        fields(&row_of(&w, &caller, false)),
+        (status.clone(), Value::Null, json!(false))
+    );
+    assert_eq!(row_of(&w, &caller, true).get("pingedAgo"), None);
+    // A ping of an older generation is ignored.
+    std::fs::remove_file(folder.join("answer.json")).unwrap();
+    write(
+        &folder.join("ping.json"),
+        json!({"id": PING, "askedAt": "2026-10-29T11:50:01.0000000Z", "by": null, "generation": "7", "sent": true}),
+    );
+    assert_eq!(
+        fields(&row_of(&w, &caller, false)),
+        (status, Value::Null, json!(false))
+    );
+    // `statusAt` follows the doing line's source: the last message's time, and none for the task line.
+    std::fs::remove_file(folder.join("status.json")).unwrap();
+    write(
+        &folder.join("last-sent.json"),
+        json!({"line": "sent the plan", "at": "2026-10-29T11:58:00.0000000Z"}),
+    );
+    let row = row_of(&w, &caller, false);
+    assert_eq!(
+        (row["doingFrom"].clone(), row["statusAt"].clone()),
+        (json!("message"), json!("2026-10-29T11:58:00.0000000Z"))
+    );
+    std::fs::remove_file(folder.join("last-sent.json")).unwrap();
+    let row = row_of(&w, &caller, false);
+    assert_eq!(
+        (row["doingFrom"].clone(), row["statusAt"].clone()),
+        (json!("task"), Value::Null)
+    );
+}
+
+// Behaviour 7: `list -All` and `list -All -Text` for a running and an ended row: every existing field keeps its place
+// and `statusAt`, `pingedAt`, `noAnswer` come last. `-Text` shows the open ping as `pinged 9m`, at 10 minutes as
+// `no answer 10m`; an ended member's ping is none.
+#[test]
+fn list_puts_the_status_and_ping_fields_last_of_a_running_and_an_ended_row() {
+    let (w, caller, _) = pinged_world();
+    let done = member(
+        &w,
+        "bbbbbbbbbbbb",
+        json!({"name": "done", "pane": "%7", "createdAt": "2026-10-29T11:00:00.0000000Z"}),
+    );
+    write(
+        &done.join("notice.json"),
+        json!({"kind": "exited", "exitCode": 3, "at": "2026-10-29T11:59:00.0000000Z"}),
+    );
+    write(
+        &done.join("status.json"),
+        json!({"text": "finished the tests", "at": "2026-10-29T11:58:30.0000000Z"}),
+    );
+    write(
+        &done.join("ping.json"),
+        json!({"id": PING, "askedAt": "2026-10-29T11:50:01.0000000Z", "by": null, "generation": "0", "sent": true}),
+    );
+    let facts = [(ID, "running"), ("bbbbbbbbbbbb", "3")];
+    let list = |args: &[&str]| {
+        snapshot(&w, &caller, &facts);
+        let argv: Vec<String> = args.iter().map(|a| a.to_string()).collect();
+        let (code, out) = crate::cli::run(&argv, || Ok(&w.ctx));
+        w.fakes.hc_done().unwrap();
+        assert_eq!(code, 0, "{out}");
+        out
+    };
+    let reply: Value = serde_json::from_str(&list(&["list", "-All"])).unwrap();
+    let want = json!([
+        {"name": "worker", "client": "claude", "pane": "%9", "window": "@5", "context": "brief", "parent": "%1",
+         "sessionId": SESSION_ID, "directory": "/work", "createdAt": "2026-10-29T11:00:00.0000000Z",
+         "state": "running", "doing": "wiring the bar", "doingFrom": "status", "age": 3600, "unread": 0,
+         "model": null, "role": null, "color": crate::paint::identity(None, "worker"), "activity": "working",
+         "since": 2400, "changedAt": "2026-10-29T11:20:00.0000000Z", "life": "running", "view": "attached",
+         "hcAddress": "taaaaaaaaaaaa", "statusAt": "2026-10-29T11:57:00.0000000Z",
+         "pingedAt": "2026-10-29T11:50:01.0000000Z", "noAnswer": false},
+        {"name": "done", "client": "claude", "pane": null, "window": null, "context": "brief", "parent": "%1",
+         "sessionId": SESSION_ID, "directory": "/work", "createdAt": "2026-10-29T11:00:00.0000000Z",
+         "state": "exited 3", "doing": "finished the tests", "doingFrom": "status", "age": 3600, "unread": 0,
+         "model": null, "role": null, "color": crate::paint::identity(None, "done"), "exitCode": 3,
+         "resume": "mux-agent resume bbbbbbbbbbbb", "life": "ended", "view": "detached",
+         "hcAddress": "tbbbbbbbbbbbb", "statusAt": "2026-10-29T11:58:30.0000000Z", "pingedAt": null,
+         "noAnswer": false}
+    ]);
+    // Compared as text: the order of keys is part of the reply.
+    assert_eq!(reply["agents"].to_string(), want.to_string());
+    let running = |age: u64, since: u64| {
+        format!(
+            "worker  claude  %9  @5  brief  %1  {SESSION_ID}  /work  2026-10-29T11:00:00.0000000Z  running  wiring the bar  \
+             status  {age}  0      working  {since}  2026-10-29T11:20:00.0000000Z  running  attached  taaaaaaaaaaaa  \
+             2026-10-29T11:57:00.0000000Z  "
+        )
+    };
+    let ended = |age: u64| {
+        format!(
+            "done  claude      brief  %1  {SESSION_ID}  /work  2026-10-29T11:00:00.0000000Z  exited 3  finished the tests  \
+             status  {age}  0      3  mux-agent resume bbbbbbbbbbbb  ended  detached  tbbbbbbbbbbbb  \
+             2026-10-29T11:58:30.0000000Z    False"
+        )
+    };
+    let text = list(&["list", "-All", "-Text"]);
+    assert_eq!(
+        text.lines().collect::<Vec<_>>(),
+        [
+            "running: 1".to_string(),
+            "endedTotal: 1".to_string(),
+            format!("{}pinged 9m  False", running(3600, 2400)),
+            ended(3600)
+        ]
+    );
+    w.fakes.advance(std::time::Duration::from_secs(1));
+    let text = list(&["list", "-All", "-Text"]);
+    assert_eq!(
+        text.lines().nth(2).unwrap(),
+        format!("{}no answer 10m  True", running(3601, 2401))
+    );
+    assert_eq!(text.lines().nth(3).unwrap(), ended(3601));
 }
