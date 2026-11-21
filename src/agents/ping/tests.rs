@@ -546,46 +546,72 @@ fn a_new_generation_ignores_the_old_ping() {
     w.fakes.hc_done().unwrap();
 }
 
-// Behaviour 3a: the ping holds no lock across its notice. It takes the team lock, then the member's agent lock, to
-// publish; the notice's own send takes the team lock again with the member's agent lock free. A ping that held the
-// agent lock into its send would take team after agent, the reverse of a send of the member (team, then agent).
+// Behaviour 3a, and the one lock order: the team lock, then the member's member lock, then its agent lock, never the
+// other way round. Resume and recovery change the generation under the member lock (inside the team lock), so a ping or
+// an answer that took them the other way could each wait for a lock the other holds. The ping holds none of them
+// across its notice: the notice's send takes the team lock with the member's locks free.
 #[test]
-fn the_notice_is_sent_with_the_members_agent_lock_free() {
+fn the_notice_is_sent_with_the_members_locks_free_and_in_one_order() {
     let w = team_world();
     let c = w.caller();
+    let (team, member, agent) = (
+        crate::agents::team_lock(&c),
+        crate::agents::lock_key("member", &c, A),
+        crate::agents::lock_key("agent", &c, A),
+    );
+    // Each event checked against the locks held at that moment; the holds of the team, member and agent locks.
+    let order = |events: Vec<String>| {
+        let (mut held, mut holds) = (Vec::<String>::new(), [0; 3]);
+        for e in events {
+            let (sign, key) = e.split_at(1);
+            match sign {
+                "-" => held.retain(|k| k != key),
+                "+" => {
+                    if key == team {
+                        holds[0] += 1;
+                        assert!(
+                            !held.contains(&member) && !held.contains(&agent),
+                            "the team lock taken under a member's lock"
+                        );
+                    } else if key == member {
+                        holds[1] += 1;
+                        assert!(
+                            !held.contains(&agent),
+                            "the member lock taken under the agent lock"
+                        );
+                    } else if key == agent {
+                        holds[2] += 1;
+                        assert!(
+                            held.contains(&member),
+                            "the agent lock taken without the member lock"
+                        );
+                    }
+                    held.push(key.into());
+                }
+                _ => {}
+            }
+        }
+        holds
+    };
     online(&w);
     online(&w);
     w.fakes.clear_log();
-    ping(&w, "ma1");
-    let (team, agent) = (
-        crate::agents::team_lock(&c),
-        crate::agents::lock_key("agent", &c, A),
-    );
-    let (mut held, mut teams, mut agents) = (Vec::<String>::new(), 0, 0);
-    for e in w.fakes.locks() {
-        let (sign, key) = e.split_at(1);
-        match sign {
-            "+" if key == team => {
-                teams += 1;
-                assert!(
-                    !held.contains(&agent),
-                    "the team lock taken under the agent lock"
-                );
-                held.push(key.into());
-            }
-            "+" => {
-                agents += usize::from(key == agent);
-                held.push(key.into());
-            }
-            "-" => held.retain(|k| k != key),
-            _ => {}
-        }
-    }
+    let id = ping(&w, "ma1")["id"].as_str().unwrap().to_string();
     assert_eq!(
-        (teams, agents),
-        (2, 2),
-        "publish, the notice's send; publish, then sent"
+        order(w.fakes.locks()),
+        [2, 2, 2],
+        "the team lock for publish and for the notice's send; the member's locks for publish, then sent"
     );
+    w.file("a.md", b"ok");
+    online(&w);
+    w.fakes.clear_log();
+    answer_as(&w.ctx, &as_member(&w, A), &id, "a.md").unwrap();
+    assert_eq!(
+        order(w.fakes.locks()),
+        [0, 1, 1],
+        "answer: the member lock, then the agent lock"
+    );
+    w.fakes.hc_done().unwrap();
 }
 
 /// At the first hold of member `id`'s member or agent lock, runs `f` once: a change that lands after a check made
