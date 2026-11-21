@@ -52,6 +52,14 @@ pub fn scope(ctx: &Ctx, caller: &Caller) -> Res<Scope> {
 pub fn is_leader(record: &Value) -> bool {
     record.get("depth").and_then(Value::as_u64) == Some(0) && record.get("upTeam").is_some()
 }
+/// Whether proven member `m` is the depth-0 leader `up` launched that the session's team record names: the one member
+/// the leader-only verbs (`placement`, `ping`) admit besides a person. The caller holds the team lock.
+pub fn leads(ctx: &Ctx, caller: &Caller, m: &Member) -> Res<bool> {
+    Ok(match scope(ctx, caller)? {
+        Scope::Team(team) => is_leader(&m.record) && team.leader == m.id,
+        _ => false,
+    })
+}
 /// D3: leader 0, a child at its parent's depth + 1, at most 3.
 pub fn check_depth(child: u64) -> Res<()> {
     if child > MAX_DEPTH {

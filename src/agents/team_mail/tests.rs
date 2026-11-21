@@ -1286,7 +1286,7 @@ fn a_non_member_agent_pane_keeps_0_2_while_hc_is_down() {
 }
 
 /// One snapshot as `online`, with member `id`'s terminal unreadable, Lost, Ended or at another generation.
-fn online_but(w: &World, id: &str, case: &str) {
+pub(crate) fn online_but(w: &World, id: &str, case: &str) {
     let mut records: Vec<Value> = std::fs::read_dir(w.state().join("agents"))
         .unwrap()
         .filter_map(|e| {

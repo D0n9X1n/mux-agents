@@ -63,10 +63,8 @@ fn gated<T>(ctx: &Ctx, caller: &Caller, f: impl FnOnce() -> Res<T>) -> Res<T> {
         // a proven hc member is allowed only as the depth-0 leader `up` launched that its team record names,
         // proven again under the team lock (`tree::standing`), which is held while it reads or sets the option.
         return super::tree::with_standing(ctx, caller, |standing| {
-            let leads = match (standing, super::tree::scope(ctx, caller)?) {
-                (Some(super::tree::Standing::Member(m)), super::tree::Scope::Team(team)) => {
-                    super::tree::is_leader(&m.record) && team.leader == m.id
-                }
+            let leads = match standing {
+                Some(super::tree::Standing::Member(m)) => super::tree::leads(ctx, caller, m)?,
                 _ => false,
             };
             if !leads {

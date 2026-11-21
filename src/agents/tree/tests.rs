@@ -2303,7 +2303,7 @@ fn a_lifecycle_proof_refuses_ids_and_generations_that_are_not_plain_before_readi
 }
 
 /// the hc caller ID made the depth-0 `up` leader that the team record names.
-fn leader_world() -> Mw {
+pub(crate) fn leader_world() -> Mw {
     let mut m = member_world();
     let team = t::path(&m.state, "$3");
     let mut found = t::read(&team).unwrap().unwrap();

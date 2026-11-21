@@ -87,6 +87,19 @@ fn publish(ctx: &Ctx, caller: &Caller, name: &str) -> Res<Published> {
         let Some(standing) = standing else {
             return refuse(2, "team", "ping works only inside a team");
         };
+        let by = match standing {
+            super::tree::Standing::Member(m) if super::tree::leads(ctx, caller, m)? => {
+                Value::from(m.id.clone())
+            }
+            super::tree::Standing::Member(_) => {
+                return refuse(
+                    2,
+                    "authority",
+                    format!("only the team's leader or a person can ping {name}"),
+                );
+            }
+            super::tree::Standing::Person => Value::Null,
+        };
         let s = super::membership::Snapshot::take(ctx, caller)?;
         if let Some(e) = &s.core_error {
             return Err(e.clone());
@@ -96,10 +109,6 @@ fn publish(ctx: &Ctx, caller: &Caller, name: &str) -> Res<Published> {
         };
         let generation = record.get("generation").cloned().unwrap_or(Value::Null);
         let folder = super::server_dir(ctx, caller).join("agents").join(&id);
-        let by = match standing {
-            super::tree::Standing::Member(m) => Value::from(m.id.clone()),
-            super::tree::Standing::Person => Value::Null,
-        };
         let open = super::lock(ctx, &super::lock_key("agent", caller, &id), || {
             if let Some(open) = open(&folder, &generation) {
                 return Ok(open);
