@@ -1545,8 +1545,9 @@ fn client_pid(live: &Live, session: &str, skip: u32) -> u32 {
 }
 
 /// An open handle to process `pid`, so Windows cannot give its pid to another process until this is dropped: a
-/// resumed member's new client is told from its stopped predecessor by pid alone (`client_pid`'s `skip`), and a
-/// predecessor whose pid were reused by its successor would hide the successor until the wait ran out.
+/// resumed or restored member's new client is told from its stopped or killed predecessor by pid alone
+/// (`client_pid`'s `skip`), and a predecessor whose pid were reused by its successor would hide the successor until
+/// the wait ran out. Open it while the predecessor still runs and keep it until every successor is found.
 struct Pinned(windows_sys::Win32::Foundation::HANDLE);
 
 impl Pinned {
@@ -3223,7 +3224,7 @@ fn team_of_three(live: &Live, sent: &mut HashMap<u32, usize>) -> Vec<String> {
 
 /// restore-6b ambiguity 14: the core killed (`taskkill /F`, never `/T`); waits until hc shows every member terminal
 /// Lost. Returns the records before the kill and the predecessor client pids, captured before the kill (r6b call 9).
-fn lose(live: &mut Live, ids: &[String]) -> (Vec<Value>, Vec<u32>) {
+fn lose(live: &mut Live, ids: &[String]) -> (Vec<Value>, Vec<u32>, Vec<Pinned>) {
     let before: Vec<Value> = ids
         .iter()
         .map(|id| member_file(live, id, "record.json"))
@@ -3232,6 +3233,9 @@ fn lose(live: &mut Live, ids: &[String]) -> (Vec<Value>, Vec<u32>) {
         .iter()
         .map(|r| client_pid(live, &s(&r["sessionId"]), 0))
         .collect();
+    // Opened before the kill and returned, so a caller finding each successor by `client_pid(.., old)` cannot meet a
+    // successor that Windows gave its predecessor's pid.
+    let pinned: Vec<Pinned> = old.iter().map(|&pid| Pinned::pid(pid)).collect();
     // r6b-calls "how a live test produces a Lost member": the core and each member's terminal (client and `hold`, by
     // pid, `taskkill /F` never `/T`); a core kill alone loses nothing.
     let terminals: Vec<(u32, Option<i64>)> = old
@@ -3256,7 +3260,7 @@ fn lose(live: &mut Live, ids: &[String]) -> (Vec<Value>, Vec<u32>) {
         },
         || hc_report(live, &before),
     );
-    (before, old)
+    (before, old, pinned)
 }
 
 /// What reconcile reads of member `r`'s active generation: `hc ls --all` by its `mux.id` and `mux.gen` labels, then
@@ -3323,7 +3327,7 @@ fn restore_resumes_every_lost_member_after_a_core_kill_on_windows() {
     };
     let mut sent = HashMap::new();
     let ids = team_of_three(&live, &mut sent);
-    let (before, old) = lose(&mut live, &ids);
+    let (before, old, _pinned) = lose(&mut live, &ids);
     let up = live.run(&["up", "-Client", "claude"]);
     assert_eq!(up["created"], json!(false), "{up}");
     let mut want = ids.clone();
@@ -3415,7 +3419,7 @@ fn restore_resume_is_held_by_an_unmanaged_client_until_it_quits_on_windows() {
     };
     let mut sent = HashMap::new();
     let ids = team_of_three(&live, &mut sent);
-    let (before, old) = lose(&mut live, &ids);
+    let (before, old, _pinned) = lose(&mut live, &ids);
     let (a_sid, b_sid) = (s(&before[1]["sessionId"]), s(&before[2]["sessionId"]));
     // Unrelated clients: another Claude Code and another Copilot session on this machine hold nothing.
     for (exe, other) in [
