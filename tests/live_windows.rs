@@ -1544,6 +1544,28 @@ fn client_pid(live: &Live, session: &str, skip: u32) -> u32 {
     })
 }
 
+/// An open handle to process `pid`, so Windows cannot give its pid to another process until this is dropped: a
+/// resumed member's new client is told from its stopped predecessor by pid alone (`client_pid`'s `skip`), and a
+/// predecessor whose pid were reused by its successor would hide the successor until the wait ran out.
+struct Pinned(windows_sys::Win32::Foundation::HANDLE);
+
+impl Pinned {
+    fn pid(pid: u32) -> Pinned {
+        use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_SYNCHRONIZE};
+        // SAFETY: OpenProcess only reads its arguments; a null handle is checked below.
+        let handle = unsafe { OpenProcess(PROCESS_SYNCHRONIZE, 0, pid) };
+        assert!(!handle.is_null(), "open process {pid}");
+        Pinned(handle)
+    }
+}
+
+impl Drop for Pinned {
+    fn drop(&mut self) {
+        // SAFETY: a handle this value opened and owns.
+        unsafe { windows_sys::Win32::Foundation::CloseHandle(self.0) };
+    }
+}
+
 /// `by` for a known client pid.
 fn by_pid(live: &Live, sent: &mut HashMap<u32, usize>, pid: u32, args: &[&str]) -> Value {
     let n = sent.entry(pid).or_default();
@@ -2385,6 +2407,8 @@ fn an_unacked_batch_is_served_again_and_rebuilt_for_a_successor() {
     let pending = by(&live, &mut sent, &b, &["read", "-Deliver"]);
     let sid = s(&member_file(&live, &b, "record.json")["sessionId"]);
     let old = client_pid(&live, &sid, 0);
+    // Held across the stop until the successor is found: its pid cannot be the predecessor's.
+    let pinned = Pinned::pid(old);
     ready::wait_conversation(&live.dir, &sid); // PM call 12
     assert_eq!(by(&live, &mut sent, &leader, &["stop", "b"])["ok"], true);
     let resumed = by(&live, &mut sent, &leader, &["resume", "b"]);
@@ -2392,6 +2416,7 @@ fn an_unacked_batch_is_served_again_and_rebuilt_for_a_successor() {
     proof_of(&live, &s(&resumed["agent"]["id"]));
     // The resumed B: matched by session id or argv as on Unix, another process than its predecessor (F20).
     let new = client_pid(&live, &sid, old);
+    drop(pinned);
     assert_ne!(new, old, "a new process");
     let rebuilt = by_pid(&live, &mut sent, new, &["read", "-Deliver"]);
     assert_eq!(rebuilt["ids"], pending["ids"]);
