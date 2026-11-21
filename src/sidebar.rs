@@ -2445,8 +2445,15 @@ fn watch_loop(
     // `@mux-agents-keys`, read once: a tick never reads it (a changed value applies to the next bar).
     let keymap = read_keys(ctx, caller);
     let mut keys = Decoder::new(keymap.clone());
+    let mut idle_at = None;
     let mut keeper = Keeper::default();
     let mut last: Option<Map<String, Value>> = None;
+    let mut first = true;
+    let mut read_failed = false;
+    let mut done = Vec::new();
+    let mut asked_at = ctx.clock.now();
+    let mut answers = Vec::new();
+    let mut polled_stamp = None;
     let mut size = FALLBACK;
     let mut unknown = 0;
     let mut pick = Pick::default();
@@ -2591,12 +2598,36 @@ fn watch_loop(
         }
         // The poll's baseline, taken before the board is read: a write that lands during the read is newer, so the
         // next poll draws it instead of taking it as drawn.
-        let polled_stamp = pace.poll.and_then(|_| stamp(&root));
-        let mut failed = live.is_none();
-        match board(ctx, caller, true, true) {
-            Ok(board) => last = Some(board),
-            Err(_) => failed = true,
+        if first {
+            polled_stamp = pace.poll.and_then(|_| stamp(&root));
+            answers.push(jobs::Answer::Read(0, board(ctx, caller, true, true)));
+            first = false;
+        } else if answers.is_empty() && !panel.jobs.reading() {
+            polled_stamp = pace.poll.and_then(|_| stamp(&root));
+            asked_at = ctx.clock.now();
+            panel.jobs.read(ctx, caller);
+            panel.refresh = false;
+            answers.extend(panel.jobs.drain_reader());
         }
+        let mut fresh = false;
+        for answer in answers.drain(..) {
+            match answer {
+                jobs::Answer::Read(generation, answer) => {
+                    read_failed = !panel.accept_read(&mut last, generation, answer);
+                    if !read_failed {
+                        fresh = true;
+                        done = done_spells(last.as_ref());
+                    }
+                }
+                jobs::Answer::Seen(seen, ok) => {
+                    viewing.marked(panel, &seen, ok);
+                }
+            }
+        }
+        let stale = panel.jobs.reading()
+            && ctx.clock.now().duration_since(asked_at).unwrap_or_default()
+                >= crate::state::lock::LOCK_WAIT;
+        let failed = live.is_none() || read_failed || stale;
         // The pane the person looks at (an unanswered probe changes nothing), then the done spell they leave behind:
         // seen. A spell not marked is kept and marked again on the next tick.
         let looked = shown_pane(ctx, caller);
@@ -2628,16 +2659,24 @@ fn watch_loop(
         // An agent that starts needing the person, or finishes, while they look elsewhere: one message, as herdr's
         // toast. Only when both the board and the shown pane were read now: a tick that knows neither keeps the news
         // for the next.
-        if looked.is_some() && !failed {
+        if fresh && looked.is_some() && !failed {
             pending_news.extend(alerts.tick(last.as_ref(), viewing.pane.as_deref()));
             // News that met the sidebar lock held elsewhere waits for a later tick, never this one.
             if !pending_news.is_empty() && alert(ctx, caller, &pending_news) {
                 pending_news.clear();
             }
         }
-        viewing.mark(|pane, changed| {
-            crate::agents::board::mark_seen(ctx, caller, pane, changed).is_ok()
-        });
+        for seen in &viewing.left {
+            panel.jobs.seen(ctx, caller, seen);
+        }
+        for answer in panel.jobs.drain_reader() {
+            match answer {
+                jobs::Answer::Seen(seen, ok) => {
+                    viewing.marked(panel, &seen, ok);
+                }
+                answer => answers.push(answer),
+            }
+        }
         let note = pick.note();
         let mut notes = Vec::new();
         if failed {
@@ -2657,8 +2696,10 @@ fn watch_loop(
             ended_open: panel.ended_open,
         };
         // A row whose resume runs is drawn `resuming…` from memory until the board catches up.
-        let marked = panel.jobs.mark(last.as_ref());
-        let drawn_board = marked.as_ref().or(last.as_ref());
+        let seen = panel.seen_board(last.as_ref());
+        let seen_board = seen.as_ref().or(last.as_ref());
+        let marked = panel.jobs.mark(seen_board);
+        let drawn_board = marked.as_ref().or(seen_board);
         let bare = lay_hinted(drawn_board, &notes, size, look, focus);
         // The board's kept shells first, then a team's whole tree, folded agents included (B10), or the rows any other
         // bar drew: one walk followed here and acted on below (audit 6-10 F1).
@@ -2728,7 +2769,16 @@ fn watch_loop(
             // The agent on screen as the band shows it: with the bar itself in front, its window's other pane.
             looking: banded.clone(),
             team,
-            done: done_spells(last.as_ref()),
+            done: done
+                .iter()
+                .filter(|(id, changed)| {
+                    !panel
+                        .acked
+                        .iter()
+                        .any(|(acked, spell, _)| acked == id && spell == changed)
+                })
+                .cloned()
+                .collect(),
         };
         // What the next polls compare against: the pane on screen as this tick drew it (the stamp is from before the
         // read).
@@ -2737,7 +2787,15 @@ fn watch_loop(
         loop {
             // An action that answered off the loop (a resume) is applied, and the bar draws again at once: a change, as
             // a poll's, so input already waiting is read first (below).
-            let settled = settle_jobs(ctx, caller, &mut pick, &mut shown, panel);
+            answers.extend(panel.jobs.drain_reader());
+            let became_stale = !stale
+                && panel.jobs.reading()
+                && ctx.clock.now().duration_since(asked_at).unwrap_or_default()
+                    >= crate::state::lock::LOCK_WAIT;
+            let settled = settle_jobs(ctx, caller, &mut pick, &mut shown, panel)
+                || !answers.is_empty()
+                || became_stale
+                || (panel.refresh && !panel.jobs.reading());
             // Another window's bar the worker could not open waits `REARM` before it is tried again.
             for (window, answer) in panel.jobs.drain_windows(ctx, caller) {
                 if answer.is_err() {
@@ -2759,13 +2817,16 @@ fn watch_loop(
                 let pane = shown_pane(ctx, caller);
                 let moved = pane.is_some_and(|p| p != polled_pane);
                 // A poll that finds nothing new keeps a job's answer as the change it is.
-                changed |= moved || stamp(&root) != polled_stamp;
+                changed |= moved || (!panel.jobs.reading() && stamp(&root) != polled_stamp);
             }
-            let mut wait = if keys.lone_esc() {
+            let now = ctx.clock.now();
+            let unsliced = if keys.lone_esc() {
                 left.min(ESC_WAIT)
             } else {
                 left
             };
+            let deadline = *idle_at.get_or_insert(now + unsliced);
+            let mut wait = unsliced.min(deadline.duration_since(now).unwrap_or_default());
             if let Some(poll) = pace.poll {
                 let next =
                     poll.saturating_sub(ctx.clock.now().duration_since(polled_at).unwrap_or(poll));
@@ -2776,12 +2837,20 @@ fn watch_loop(
             // a change, since the multiplexer's mouse binding selects the bar's pane before it passes the press on.
             if changed {
                 wait = Duration::ZERO;
+            } else if panel.jobs.reading() {
+                wait = wait.min(Duration::from_millis(10));
             }
             let reads = match input.wait(&*ctx.clock, wait) {
-                Waited::Bytes(bytes) => keys.push(&bytes, ctx.clock.now()),
-                // A lone ESC keeps its wait for the rest of its sequence: the redraw's wait gives it.
-                Waited::Timeout if changed => Vec::new(),
-                Waited::Timeout => keys.idle(),
+                Waited::Bytes(bytes) => {
+                    idle_at = None;
+                    keys.push(&bytes, ctx.clock.now())
+                }
+                // A slice and a change keep a lone ESC's original deadline; only the whole wait makes it Esc.
+                Waited::Timeout if changed || ctx.clock.now() < deadline => Vec::new(),
+                Waited::Timeout => {
+                    idle_at = None;
+                    keys.idle()
+                }
                 // The old input is dropped here, which restores its terminal.
                 Waited::Closed => {
                     *input = Box::new(NoInput);
@@ -2799,6 +2868,9 @@ fn watch_loop(
                 }
             }
             if redraw {
+                if !keys.lone_esc() {
+                    idle_at = None;
+                }
                 break;
             }
         }
@@ -2875,18 +2947,29 @@ const WINDOW_PANES: &str = "#{pane_id}|#{pane_active}|#{pane_last}";
 #[derive(Debug, Default, PartialEq, Eq)]
 struct Viewing {
     pane: Option<String>,
-    done: Option<String>,
-    left: Vec<(String, String)>,
+    done: Option<jobs::Seen>,
+    left: Vec<jobs::Seen>,
 }
 
 impl Viewing {
+    fn marked(&mut self, panel: &mut Panel, seen: &jobs::Seen, ok: bool) {
+        if !ok {
+            return;
+        }
+        self.left.retain(|left| left != seen);
+        let refresh = panel.refresh;
+        panel.ack(&seen.id, &seen.changed);
+        // Only Space asks an extra read; a Seen precedes the next ordinary read in the FIFO.
+        panel.refresh = refresh;
+    }
+
     /// One tick with the pane shown now (`None`: none, no client attached) and the board. Leaving a pane queues the
     /// done spell it showed to be marked seen; while the same pane stays shown, a done row on it is remembered.
     fn tick(&mut self, shown: Option<String>, board: Option<&Map<String, Value>>) {
         if shown != self.pane {
-            if let (Some(pane), Some(done)) = (self.pane.take(), self.done.take()) {
-                self.left.retain(|(p, _)| *p != pane);
-                self.left.push((pane, done));
+            if let Some(done) = self.done.take() {
+                self.left.retain(|seen| seen.id != done.id);
+                self.left.push(done);
             }
             self.pane = shown;
         }
@@ -2904,17 +2987,21 @@ impl Viewing {
                     && field("pane") == self.pane.as_deref()
                     && field("activity") == Some("done")
             });
-        if let Some(changed) = done
-            .and_then(|row| row.get("changedAt"))
-            .and_then(Value::as_str)
+        if let Some(row) = done
+            && let Some(changed) = row.get("changedAt").and_then(Value::as_str)
         {
-            self.done = Some(changed.to_string());
+            self.done = Some(jobs::Seen {
+                id: Target::of(row).id,
+                pane: clean(row.get("pane")),
+                changed: changed.to_string(),
+            });
         }
     }
 
     /// Marks each spell left behind with `seen`; one it could not mark stays for the next tick.
+    #[cfg(test)]
     fn mark(&mut self, mut seen: impl FnMut(&str, &str) -> bool) {
-        self.left.retain(|(pane, changed)| !seen(pane, changed));
+        self.left.retain(|spell| !seen(&spell.pane, &spell.changed));
     }
 }
 
@@ -3135,6 +3222,55 @@ pub(crate) struct Panel {
     pub help: bool,
     pub closed: bool,
     pub jobs: jobs::Jobs,
+    // A mark must mask answers from reads already asked; only a later successful read retires it.
+    acked: Vec<(String, String, u64)>,
+    refresh: bool,
+}
+
+impl Panel {
+    /// Retire only marks older than the successful read that replaces the displayed board.
+    fn accept_read(
+        &mut self,
+        last: &mut Option<Map<String, Value>>,
+        generation: u64,
+        answer: Res<Map<String, Value>>,
+    ) -> bool {
+        let Ok(board) = answer else {
+            return false;
+        };
+        *last = Some(board);
+        self.acked.retain(|(_, _, asked)| *asked >= generation);
+        true
+    }
+
+    fn ack(&mut self, id: &str, changed: &str) {
+        self.acked
+            .retain(|(old, spell, _)| old != id || spell != changed);
+        self.acked
+            .push((id.to_string(), changed.to_string(), self.jobs.generation()));
+        self.refresh = true;
+    }
+
+    fn seen_board(&self, board: Option<&Map<String, Value>>) -> Option<Map<String, Value>> {
+        let mut board = board.filter(|_| !self.acked.is_empty())?.clone();
+        for row in board
+            .get_mut("agents")
+            .and_then(Value::as_array_mut)
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_object_mut)
+        {
+            if clean(row.get("state")) == "running"
+                && clean(row.get("activity")) == "done"
+                && self.acked.iter().any(|(id, changed, _)| {
+                    *id == Target::of(row).id && *changed == clean(row.get("changedAt"))
+                })
+            {
+                row.insert("activity".into(), "idle".into());
+            }
+        }
+        Some(board)
+    }
 }
 
 /// The frame on screen: when it was written, the running agents it drew (top to bottom) and its width.
@@ -3323,7 +3459,12 @@ fn act(
             // By the member's id, not its pane: a done member with no view has none to resolve.
             let spell = (shown.done.iter()).find(|(id, _)| *id == target.id);
             spell.is_some_and(|(id, changed)| {
-                crate::agents::board::mark_seen_id(ctx, caller, id, changed).is_ok_and(|m| m)
+                if crate::agents::board::mark_seen_id(ctx, caller, id, changed).is_ok_and(|m| m) {
+                    panel.ack(id, changed);
+                    true
+                } else {
+                    false
+                }
             })
         }
         // A team's n/N select the next/previous agent with a live view, from the selection, else the shown agent (B10).
@@ -8901,6 +9042,832 @@ mod tests {
             })
         });
         times
+    }
+
+    #[test]
+    fn a_pending_board_read_keeps_the_drawn_board_and_keys_live_until_its_answer() {
+        let w = watch_world(&["live"]);
+        watch_frames(&w, 2);
+        let mut script = Script::new(
+            &w.fakes,
+            vec![
+                (2100, Waited::Bytes(b"j".to_vec())),
+                (100, Waited::Bytes(b"?".to_vec())),
+                (100, Waited::Bytes(vec![3])),
+            ],
+        );
+        let fakes = w.fakes.clone();
+        let start = w.ctx.clock.now();
+        script.on_wait = Some(Box::new(move |_| {
+            use crate::ctx::Clock;
+            if fakes.now().duration_since(start).unwrap() >= Duration::from_millis(2220) {
+                jobs::HOLD_READ.set(false);
+            }
+        }));
+        let mut frames = Vec::new();
+        let mut times = Vec::new();
+        let ended = run_watch(
+            &w.ctx,
+            &w.caller(),
+            Origin::Hand,
+            Box::new(script),
+            &mut |frame| {
+                frames.push(frame.to_string());
+                times.push(w.ctx.clock.now().duration_since(start).unwrap().as_millis());
+                if frames.len() == 1 {
+                    jobs::HOLD_READ.set(true);
+                    write(
+                        &w.folder(ID).join("status.json"),
+                        json!({"text":"new answer", "at":"x"}),
+                    );
+                }
+                assert!(frames.len() < 20);
+                Ok(())
+            },
+        );
+        jobs::HOLD_READ.set(false);
+        assert_eq!(ended, "interrupted");
+        assert!(
+            frames[0].contains("testing the parser"),
+            "first frame is inline"
+        );
+        for (frame, at) in frames.iter().zip(&times).filter(|(_, at)| **at <= 2200) {
+            assert!(frame.contains("testing the parser"), "old board at {at}");
+            assert!(!frame.contains("new answer"));
+        }
+        assert!(
+            times.contains(&2100),
+            "navigation draws while pending: {times:?}"
+        );
+        assert!(times.contains(&2200), "help draws while pending: {times:?}");
+        assert!(
+            frames
+                .iter()
+                .zip(&times)
+                .any(|(frame, at)| frame.contains("new answer") && *at <= 2240)
+        );
+        w.fakes.hc_done().unwrap();
+    }
+
+    #[test]
+    fn a_pending_read_slices_input_without_shortening_escape_sequences() {
+        for sequence in [true, false] {
+            let w = watch_world(&["live"]);
+            watch_frames(&w, 2);
+            let mut steps = vec![
+                (2100, Waited::Bytes(b"j".to_vec())),
+                (100, Waited::Bytes(b"\x1b".to_vec())),
+            ];
+            if sequence {
+                steps.push((30, Waited::Bytes(b"[B".to_vec())));
+            }
+            steps.push((100, Waited::Bytes(vec![3])));
+            let mut times = Vec::new();
+            let start = w.ctx.clock.now();
+            let ended = run_watch(
+                &w.ctx,
+                &w.caller(),
+                Origin::Hand,
+                Box::new(Script::new(&w.fakes, steps)),
+                &mut |_| {
+                    times.push(w.ctx.clock.now().duration_since(start).unwrap().as_millis());
+                    jobs::HOLD_READ.set(true);
+                    Ok(())
+                },
+            );
+            jobs::HOLD_READ.set(false);
+            assert_eq!(ended, "interrupted");
+            assert_eq!(times, [0, 2000, 2100, if sequence { 2230 } else { 2250 }]);
+            w.fakes.hc_done().unwrap();
+        }
+    }
+
+    #[test]
+    fn a_read_held_past_the_lock_wait_shows_refresh_failed_until_it_answers() {
+        let w = watch_world(&["live"]);
+        watch_frames(&w, 2);
+        let start = w.ctx.clock.now();
+        let mut script = Script::new(
+            &w.fakes,
+            vec![
+                (17100, Waited::Bytes(b"j".to_vec())),
+                (100, Waited::Bytes(vec![3])),
+            ],
+        );
+        let fakes = w.fakes.clone();
+        script.on_wait = Some(Box::new(move |_| {
+            use crate::ctx::Clock;
+            if fakes.now().duration_since(start).unwrap() >= Duration::from_millis(17120) {
+                jobs::HOLD_READ.set(false);
+            }
+        }));
+        let mut frames = Vec::new();
+        let ended = run_watch(
+            &w.ctx,
+            &w.caller(),
+            Origin::Hand,
+            Box::new(script),
+            &mut |frame| {
+                frames.push((
+                    w.ctx.clock.now().duration_since(start).unwrap().as_millis(),
+                    frame.to_string(),
+                ));
+                if frames.len() == 1 {
+                    jobs::HOLD_READ.set(true);
+                }
+                Ok(())
+            },
+        );
+        jobs::HOLD_READ.set(false);
+        assert_eq!(ended, "interrupted");
+        assert!(
+            frames
+                .iter()
+                .filter(|(at, _)| *at < 17000)
+                .all(|(_, frame)| !frame.contains("refresh failed"))
+        );
+        assert!(
+            frames
+                .iter()
+                .any(|(at, frame)| *at == 17100 && frame.contains("refresh failed"))
+        );
+        assert!(
+            frames
+                .iter()
+                .any(|(at, frame)| *at >= 17120 && !frame.contains("refresh failed"))
+        );
+        w.fakes.hc_done().unwrap();
+    }
+
+    #[test]
+    fn an_ack_stays_idle_through_a_held_answer_navigation_and_a_failed_fresh_read() {
+        let w = watch_world(&["live"]);
+        write(
+            &w.folder(ID).join("activity.json"),
+            json!({"state":"done", "since":"1970-01-01T00:03:00Z"}),
+        );
+        watch_frames(&w, 2);
+        // The read requested after Ack refuses; its refusal must not uncover the old unseen spell.
+        let record = w.folder(ID).join("record.json");
+        let start = w.ctx.clock.now();
+        let mut script = Script::new(
+            &w.fakes,
+            vec![
+                (2100, Waited::Bytes(b"j".to_vec())),
+                (100, Waited::Bytes(b" ".to_vec())),
+                (100, Waited::Bytes(b"j".to_vec())),
+                (4900, Waited::Bytes(vec![3])),
+            ],
+        );
+        let fakes = w.fakes.clone();
+        script.on_wait = Some(Box::new(move |_| {
+            use crate::ctx::Clock;
+            if fakes.now().duration_since(start).unwrap() >= Duration::from_millis(7000) {
+                std::fs::write(&record, "{").unwrap();
+                jobs::HOLD_READ.set(false);
+            }
+        }));
+        let mut frames = Vec::new();
+        let ended = run_watch(
+            &w.ctx,
+            &w.caller(),
+            Origin::Hand,
+            Box::new(script),
+            &mut |frame| {
+                frames.push((
+                    w.ctx.clock.now().duration_since(start).unwrap().as_millis(),
+                    frame.to_string(),
+                ));
+                if frames.len() == 1 {
+                    jobs::HOLD_READ.set(true);
+                }
+                assert!(frames.len() < 30);
+                Ok(())
+            },
+        );
+        jobs::HOLD_READ.set(false);
+        assert_eq!(ended, "interrupted");
+        assert!(
+            w.folder(ID).join("seen.json").exists(),
+            "Space marked worker"
+        );
+        assert!(frames[0].1.contains("Inbox"));
+        for (at, frame) in frames.iter().filter(|(at, _)| *at >= 2200) {
+            assert!(
+                !frame.contains("Inbox"),
+                "Ack must stay idle at {at}: {frame}"
+            );
+        }
+        assert!(
+            frames
+                .iter()
+                .any(|(at, frame)| *at >= 7000 && frame.contains("refresh failed")),
+            "Ack requests a fresh read after the held one"
+        );
+        w.fakes.hc_done().unwrap();
+    }
+
+    #[test]
+    fn leaving_a_done_pane_marks_it_on_the_reader_and_immediately_draws_idle() {
+        let w = watch_world(&["live", "live", "gone"]);
+        write(
+            &w.folder(ID).join("activity.json"),
+            json!({"state":"done", "since":"1970-01-01T00:03:00Z"}),
+        );
+        let fakes = w.fakes.clone();
+        w.fakes.mux_script(SHOWN_FORMAT, move |_| {
+            Ok(out(
+                0,
+                if probed(&fakes) == 1 {
+                    "%9|1\n"
+                } else {
+                    "%1|1\n"
+                },
+                "",
+            ))
+        });
+        watch_frames(&w, 2);
+        let (ended, frames) = watch_run(&w);
+        assert_eq!(ended, "pane-closed");
+        assert!(frames[0].contains("Inbox"));
+        assert!(w.folder(ID).join("seen.json").exists());
+        assert!(
+            !frames[1].contains("Inbox"),
+            "the mark's frame is already idle"
+        );
+    }
+
+    #[test]
+    fn a_cached_board_does_not_turn_a_pane_change_into_a_new_alert() {
+        let w = watch_world(&["live"]);
+        write(
+            &w.folder(ID).join("activity.json"),
+            json!({"state":"working", "since":"1970-01-01T00:03:00Z"}),
+        );
+        let fakes = w.fakes.clone();
+        let start = w.ctx.clock.now();
+        w.fakes.mux_script(SHOWN_FORMAT, move |_| {
+            use crate::ctx::Clock;
+            let elapsed = fakes.now().duration_since(start).unwrap().as_millis();
+            Ok(out(
+                0,
+                if (2000..2200).contains(&elapsed) {
+                    "unread\n"
+                } else {
+                    "%1|1\n"
+                },
+                "",
+            ))
+        });
+        watch_frames(&w, 3);
+        let script = Script::new(
+            &w.fakes,
+            vec![(2100, key(b"j")), (100, key(b"?")), (100, key(&[3]))],
+        );
+        let mut frames = 0;
+        run_watch(
+            &w.ctx,
+            &w.caller(),
+            Origin::Hand,
+            Box::new(script),
+            &mut |_| {
+                frames += 1;
+                if frames == 1 {
+                    write(
+                        &w.folder(ID).join("activity.json"),
+                        json!({"state":"blocked", "since":"1970-01-01T00:03:01Z"}),
+                    );
+                } else if frames == 2 {
+                    jobs::HOLD_READ.set(true);
+                }
+                Ok(())
+            },
+        );
+        jobs::HOLD_READ.set(false);
+        assert!(sent(&w.fakes).is_empty(), "a held answer is not fresh news");
+        w.fakes.hc_done().unwrap();
+    }
+
+    #[test]
+    fn ctrl_c_waits_for_a_real_read_but_never_claims_its_queued_seen() {
+        use std::sync::mpsc::channel;
+        for queued_seen in [false, true] {
+            let (claimed, claim) = channel();
+            let (release, read_gate) = channel();
+            let (read_ended, ended_read) = channel();
+            let (next, next_claim) = channel();
+            let stopped = jobs::test_reader(move || {
+                move |request: &jobs::Request| {
+                    assert!(
+                        matches!(request, jobs::Request::Read(_)),
+                        "queued Seen never claims its lock"
+                    );
+                    claimed.send(()).unwrap();
+                    read_gate.recv().unwrap();
+                    read_ended.send(()).unwrap();
+                    next_claim.recv().unwrap();
+                    let jobs::Request::Read(generation) = request else {
+                        unreachable!()
+                    };
+                    jobs::Answer::Read(*generation, Ok(Map::new()))
+                }
+            });
+            let (watch_ready, ready) = channel();
+            let controller = std::thread::spawn(move || {
+                ready.recv_timeout(Duration::from_secs(5)).unwrap();
+                let (lock, ready) = &*stopped;
+                let state = lock.lock().unwrap();
+                let (state, timed) = ready
+                    .wait_timeout_while(state, Duration::from_secs(5), |state| !state.1)
+                    .unwrap();
+                assert!(
+                    !timed.timed_out(),
+                    "Ctrl-C must stop while the read is held"
+                );
+                assert!(state.0.is_empty(), "finish discarded the queued Seen");
+                drop(state);
+                release.send(()).unwrap();
+                ended_read.recv_timeout(Duration::from_secs(5)).unwrap();
+                next.send(()).unwrap();
+            });
+            let w = watch_world(&["live"]);
+            watch_frames(&w, 1);
+            write(
+                &w.folder(ID).join("activity.json"),
+                json!({"state":"done", "since":"1970-01-01T00:03:00Z"}),
+            );
+            let fakes = w.fakes.clone();
+            w.fakes.mux_script(SHOWN_FORMAT, move |_| {
+                Ok(out(
+                    0,
+                    if !queued_seen || probed(&fakes) == 1 {
+                        "%9|1\n"
+                    } else {
+                        "%1|1\n"
+                    },
+                    "",
+                ))
+            });
+            let mut frames = 0;
+            let ended = run_watch(
+                &w.ctx,
+                &w.caller(),
+                Origin::Hand,
+                Box::new(Script::new(&w.fakes, vec![(2100, key(&[3]))])),
+                &mut |_| {
+                    frames += 1;
+                    if frames == 2 {
+                        claim.recv_timeout(Duration::from_secs(5)).unwrap();
+                        watch_ready.send(()).unwrap();
+                    }
+                    Ok(())
+                },
+            );
+            controller.join().unwrap();
+            assert_eq!(ended, "interrupted");
+            assert!(!w.folder(ID).join("seen.json").exists());
+            w.fakes.hc_done().unwrap();
+        }
+    }
+
+    #[test]
+    fn ctrl_c_between_a_read_answer_and_the_next_claim_drops_the_seen_lock_wait() {
+        use std::sync::mpsc::channel;
+        let (claimed, claim) = channel();
+        let (release, read_gate) = channel();
+        let (between, at_claim) = channel();
+        let (next, next_gate) = channel();
+        let w = watch_world(&["live"]);
+        let root = w.ctx.state_root.parent().unwrap().join("seen-locks");
+        let lock_key = crate::agents::lock_key("agent", &w.caller(), ID);
+        let (held, holding) = channel();
+        let (unlock, hold) = channel();
+        let (held_root, held_key) = (root.clone(), lock_key.clone());
+        let holder = std::thread::spawn(move || {
+            let world = World::human("");
+            let ctx = jobs::Seed::of(&world.ctx).host();
+            crate::state::lock::with_lock_at(&ctx, &held_root, &held_key, || {
+                held.send(()).unwrap();
+                hold.recv().unwrap();
+                Ok(())
+            })
+            .unwrap();
+        });
+        holding.recv_timeout(Duration::from_secs(5)).unwrap();
+        let (marked, mark) = channel();
+        let queue = jobs::test_reader_between(
+            move || {
+                let world = World::human("");
+                let ctx = jobs::Seed::of(&world.ctx).host();
+                move |request: &jobs::Request| match request {
+                    jobs::Request::Read(generation) => {
+                        claimed.send(()).unwrap();
+                        read_gate.recv().unwrap();
+                        jobs::Answer::Read(*generation, Ok(Map::new()))
+                    }
+                    jobs::Request::Seen(seen) => {
+                        marked.send(()).unwrap();
+                        let ok =
+                            crate::state::lock::with_lock_at(&ctx, &root, &lock_key, || Ok(()))
+                                .is_ok();
+                        jobs::Answer::Seen(seen.clone(), ok)
+                    }
+                }
+            },
+            move || {
+                between.send(()).unwrap();
+                next_gate.recv().unwrap();
+            },
+        );
+        write(
+            &w.folder(ID).join("activity.json"),
+            json!({"state":"done", "since":"1970-01-01T00:03:00Z"}),
+        );
+        watch_frames(&w, 1);
+        let fakes = w.fakes.clone();
+        w.fakes.mux_script(SHOWN_FORMAT, move |_| {
+            Ok(out(
+                0,
+                if probed(&fakes) == 1 {
+                    "%9|1\n"
+                } else {
+                    "%1|1\n"
+                },
+                "",
+            ))
+        });
+        let queued = queue.clone();
+        let controller = std::thread::spawn(move || {
+            at_claim.recv_timeout(Duration::from_secs(5)).unwrap();
+            let state = queue.0.lock().unwrap();
+            let (state, _) = queue
+                .1
+                .wait_timeout_while(state, Duration::from_secs(5), |state| !state.1)
+                .unwrap();
+            assert!(state.1, "Ctrl-C stops before the next claim");
+            assert!(state.0.is_empty());
+            next.send(()).unwrap();
+        });
+        let mut frames = 0;
+        let ended = run_watch(
+            &w.ctx,
+            &w.caller(),
+            Origin::Hand,
+            Box::new(Script::new(&w.fakes, vec![(2100, key(&[3]))])),
+            &mut |_| {
+                frames += 1;
+                if frames == 2 {
+                    claim.recv_timeout(Duration::from_secs(5)).unwrap();
+                    assert!(
+                        queued
+                            .0
+                            .lock()
+                            .unwrap()
+                            .0
+                            .iter()
+                            .any(|r| matches!(r, jobs::Request::Seen(_)))
+                    );
+                    release.send(()).unwrap();
+                }
+                Ok(())
+            },
+        );
+        controller.join().unwrap();
+        assert!(
+            mark.try_recv().is_err(),
+            "Seen never entered its held member lock"
+        );
+        unlock.send(()).unwrap();
+        holder.join().unwrap();
+        assert_eq!(ended, "interrupted");
+        assert!(!w.folder(ID).join("seen.json").exists());
+        w.fakes.hc_done().unwrap();
+    }
+
+    #[test]
+    fn a_member_lock_blocks_the_reader_and_enter_but_not_navigation_help_or_ctrl_c() {
+        use std::sync::mpsc::channel;
+        for enter in [false, true] {
+            let w = click_world(&["live"], board_answer());
+            watch_frames(&w, 1);
+            if enter {
+                crate::agents::core_fixture::online(&w);
+            }
+            let root = w.ctx.state_root.parent().unwrap().join("reader-locks");
+            let lock_key = crate::agents::lock_key("agent", &w.caller(), ID);
+            let (release, gate) = channel();
+            let (held, holding) = channel();
+            let (held_root, held_key) = (root.clone(), lock_key.clone());
+            let member_key = crate::agents::lock_key("member", &w.caller(), ID);
+            let holder = std::thread::spawn(move || {
+                let world = World::human("");
+                let ctx = jobs::Seed::of(&world.ctx).host();
+                crate::state::lock::with_lock_at(&ctx, &held_root, &held_key, || {
+                    // Focus serializes on member; board-row status reads serialize on agent.
+                    crate::state::lock::with_lock_at(&ctx, &held_root, &member_key, || {
+                        held.send(()).unwrap();
+                        gate.recv().unwrap();
+                        Ok(())
+                    })
+                })
+                .unwrap();
+            });
+            holding.recv_timeout(Duration::from_secs(5)).unwrap();
+            let (claimed, claim) = channel();
+            let (got_lock, acquired) = channel();
+            let stopped = jobs::test_reader(move || {
+                let world = World::human("");
+                let ctx = jobs::Seed::of(&world.ctx).host();
+                move |request: &jobs::Request| {
+                    let jobs::Request::Read(generation) = request else {
+                        panic!("no Seen")
+                    };
+                    claimed.send(()).unwrap();
+                    let board = crate::state::lock::with_lock_at(&ctx, &root, &lock_key, || {
+                        let _ = got_lock.send(());
+                        Ok(Map::new())
+                    });
+                    jobs::Answer::Read(*generation, board)
+                }
+            });
+            let (watch_ready, ready) = channel();
+            let (enter_started, entering) = channel();
+            let (waited, wait_checked) = channel();
+            let (focused, focus_done) = channel();
+            let release_thread = std::thread::spawn(move || {
+                ready.recv_timeout(Duration::from_secs(5)).unwrap();
+                if enter {
+                    entering.recv_timeout(Duration::from_secs(5)).unwrap();
+                    assert!(
+                        acquired.recv_timeout(Duration::from_millis(100)).is_err(),
+                        "reader still waits on the held member lock"
+                    );
+                    assert!(
+                        focus_done.try_recv().is_err(),
+                        "Enter has not focused while its member lock is held"
+                    );
+                    waited.send(()).unwrap();
+                } else {
+                    let state = stopped.0.lock().unwrap();
+                    let (state, _) = stopped
+                        .1
+                        .wait_timeout_while(state, Duration::from_secs(5), |s| !s.1)
+                        .unwrap();
+                    assert!(state.1, "Ctrl-C stops while the member lock is held");
+                }
+                release.send(()).unwrap();
+                holder.join().unwrap();
+            });
+            let root = w.ctx.state_root.parent().unwrap().join("reader-locks");
+            let mut script = Script::new(
+                &w.fakes,
+                vec![
+                    (2100, key(b"j")),
+                    (100, key(b"k")),
+                    (100, key(b"?")),
+                    (100, key(if enter { b"\r" } else { &[3] })),
+                    (200, key(&[3])),
+                ],
+            );
+            let fakes = w.fakes.clone();
+            let start = w.ctx.clock.now();
+            let mut enter_signal = Some(enter_started);
+            script.on_wait = Some(Box::new(move |_| {
+                use crate::ctx::Clock;
+                if enter
+                    && fakes.now().duration_since(start).unwrap() >= Duration::from_millis(2390)
+                    && let Some(send) = enter_signal.take()
+                {
+                    send.send(()).unwrap();
+                }
+            }));
+            let mut frames = Vec::new();
+            let mut focused = Some(focused);
+            let ended = run_watch(
+                &w.ctx,
+                &w.caller(),
+                Origin::Hand,
+                Box::new(script),
+                &mut |frame| {
+                    frames.push(frame.to_string());
+                    if enter
+                        && selects(&w) > 0
+                        && let Some(sent) = focused.take()
+                    {
+                        let _ = sent.send(());
+                    }
+                    if frames.len() == 1 {
+                        w.fakes.real_locks(&root);
+                        jobs::HOLD_READ.set(true);
+                    }
+                    if frames.len() == 2 {
+                        claim.recv_timeout(Duration::from_secs(5)).unwrap();
+                        watch_ready.send(()).unwrap();
+                    }
+                    Ok(())
+                },
+            );
+            jobs::HOLD_READ.set(false);
+            release_thread.join().unwrap();
+            if enter {
+                wait_checked.try_recv().unwrap();
+            }
+            assert_eq!(ended, "interrupted");
+            assert!(
+                frames.iter().any(|frame| frame.contains("mark seen")),
+                "help acted while the reader waited"
+            );
+            assert_eq!(selects(&w), usize::from(enter));
+            w.fakes.hc_done().unwrap();
+        }
+    }
+
+    #[test]
+    fn enter_during_a_held_read_focuses_the_selected_row_before_the_answer_draws() {
+        let w = click_world(&["live"], board_answer());
+        watch_frames(&w, 2);
+        crate::agents::core_fixture::online(&w);
+        let start = w.ctx.clock.now();
+        let mut script = Script::new(
+            &w.fakes,
+            vec![(2100, key(b"j")), (100, key(b"\r")), (100, key(&[3]))],
+        );
+        let fakes = w.fakes.clone();
+        script.on_wait = Some(Box::new(move |_| {
+            use crate::ctx::Clock;
+            if fakes.now().duration_since(start).unwrap() >= Duration::from_millis(2250) {
+                jobs::HOLD_READ.set(false);
+            }
+        }));
+        let mut frames = Vec::new();
+        let ended = run_watch(
+            &w.ctx,
+            &w.caller(),
+            Origin::Hand,
+            Box::new(script),
+            &mut |frame| {
+                let at = w.ctx.clock.now().duration_since(start).unwrap().as_millis();
+                frames.push((at, frame.to_string(), selects(&w)));
+                if frames.len() == 1 {
+                    jobs::HOLD_READ.set(true);
+                    write(
+                        &w.folder(ID).join("status.json"),
+                        json!({"text":"held answer", "at":"x"}),
+                    );
+                }
+                Ok(())
+            },
+        );
+        jobs::HOLD_READ.set(false);
+        assert_eq!(ended, "interrupted");
+        assert!(
+            frames
+                .iter()
+                .any(|(at, frame, count)| *at == 2100 && frame.contains(">") && *count == 0)
+        );
+        assert!(frames.iter().any(|(at, frame, count)| *at == 2200
+            && !frame.contains("held answer")
+            && *count == 1));
+        assert!(
+            frames.iter().any(|(at, frame, count)| *at <= 2270
+                && frame.contains("held answer")
+                && *count == 1)
+        );
+        assert!(
+            w.fakes
+                .mux_calls()
+                .iter()
+                .any(|args| args[1] == "if-shell" && args[4] == "%9")
+        );
+        w.fakes.hc_done().unwrap();
+    }
+
+    #[test]
+    fn real_reader_failures_show_refresh_failed_retry_and_fall_back_after_three() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        for start_failure in [false, true] {
+            let starts = Arc::new(AtomicUsize::new(0));
+            let count = starts.clone();
+            jobs::test_reader_failures(start_failure, move || {
+                count.fetch_add(1, Ordering::SeqCst);
+            });
+            let w = watch_world(&["live"]);
+            watch_frames(&w, 2);
+            let mut frames = Vec::new();
+            let mut script = Script::new(&w.fakes, vec![(9000, key(&[3]))]);
+            // Real workers must get CPU before a fake-clock timeout consumes another slice.
+            script.on_wait = Some(Box::new(|_| std::thread::sleep(Duration::from_millis(1))));
+            let ended = run_watch(
+                &w.ctx,
+                &w.caller(),
+                Origin::Hand,
+                Box::new(script),
+                &mut |frame| {
+                    frames.push(frame.to_string());
+                    Ok(())
+                },
+            );
+            jobs::clear_test_reader_factory();
+            assert_eq!(ended, "interrupted");
+            assert_eq!(starts.load(Ordering::SeqCst), 3);
+            assert!(frames.iter().any(|frame| frame.contains("refresh failed")));
+            assert!(
+                !frames.last().unwrap().contains("refresh failed"),
+                "inline fallback succeeds: {} frames, hc {:?}",
+                frames.len(),
+                w.fakes.hc_calls()
+            );
+            w.fakes.hc_done().unwrap();
+        }
+    }
+
+    #[test]
+    fn ctrl_c_wakes_an_idle_real_reader_without_claiming_any_work() {
+        let idle = jobs::test_idle_reader();
+        let w = watch_world(&["live"]);
+        watch_frames(&w, 1);
+        let start = std::time::Instant::now();
+        let (ended, _, _) = watch_with(&w, Box::new(Script::new(&w.fakes, vec![(100, key(&[3]))])));
+        assert_eq!(ended, "interrupted");
+        assert!(start.elapsed() < Duration::from_secs(1));
+        assert!(idle.0.lock().unwrap().1);
+    }
+
+    #[test]
+    fn ack_retirement_requires_a_later_successful_read_becoming_last() {
+        let mut panel = Panel::default();
+        let unseen =
+            json!({"agents":[{"id":ID,"state":"running","activity":"done","changedAt":"spell"}]})
+                .as_object()
+                .unwrap()
+                .clone();
+        let mut last = Some(unseen.clone());
+        panel.ack(ID, "spell");
+        assert!(!panel.accept_read(&mut last, 1, refuse(1, "state", "unread")));
+        assert_eq!(last, Some(unseen.clone()));
+        assert_eq!(panel.acked.len(), 1, "a newer failed read retires nothing");
+        assert!(panel.accept_read(&mut last, 0, Ok(unseen.clone())));
+        assert_eq!(
+            panel.acked.len(),
+            1,
+            "an older successful answer retires nothing"
+        );
+        assert_eq!(
+            panel.seen_board(last.as_ref()).unwrap()["agents"][0]["activity"],
+            "idle"
+        );
+        let mut fresh = unseen;
+        fresh.get_mut("agents").unwrap()[0]["activity"] = json!("idle");
+        assert!(panel.accept_read(&mut last, 2, Ok(fresh.clone())));
+        assert_eq!(last, Some(fresh));
+        assert!(panel.acked.is_empty());
+        assert!(
+            panel.seen_board(last.as_ref()).is_none(),
+            "the accepted board itself is idle"
+        );
+    }
+
+    #[test]
+    fn a_seen_answer_keeps_its_member_id_after_the_row_disappears() {
+        let mut viewing = Viewing::default();
+        let mut panel = Panel::default();
+        let board = json!({"agents":[{"id":ID,"pane":"%9","state":"running","activity":"done","changedAt":"spell"}]});
+        viewing.tick(Some("%9".into()), board.as_object());
+        viewing.tick(None, None);
+        let seen = viewing.left[0].clone();
+        assert_eq!(seen.id, ID);
+        viewing.marked(&mut panel, &seen, true);
+        assert_eq!(panel.acked, [(ID.to_string(), "spell".to_string(), 0)]);
+        assert!(viewing.left.is_empty());
+        let mut moved = board.as_object().unwrap().clone();
+        moved.get_mut("agents").unwrap()[0]["pane"] = json!("%19");
+        assert_eq!(
+            panel.seen_board(Some(&moved)).unwrap()["agents"][0]["activity"],
+            "idle"
+        );
+    }
+
+    #[test]
+    fn a_seen_answer_does_not_cancel_a_spaces_requested_refresh() {
+        let mut panel = Panel::default();
+        panel.ack(ID, "spell-a");
+        let mut viewing = Viewing::default();
+        viewing.marked(
+            &mut panel,
+            &jobs::Seen {
+                id: "bbbbbbbbbbbb".into(),
+                pane: "%9".into(),
+                changed: "spell-b".into(),
+            },
+            true,
+        );
+        assert!(
+            panel.refresh,
+            "Seen must keep the read that Space requested"
+        );
     }
 
     #[test]

@@ -1,11 +1,12 @@
-//! The bar's slow work off its loop: a resume, and opening another view window's bar (a split that may wait on the
-//! session's sidebar lock), each run on a worker thread while the bar keeps drawing; the loop collects the answers on
-//! a later pass without ever waiting for them. One action at a time per row, one open at a time per window.
+//! The bar's slow work off its loop: one serial reader for boards and seen marks, plus resumes and opening other
+//! windows' bars. The loop collects answers without waiting: one board read in flight, one action per row, one open
+//! per window. Shutdown discards unclaimed reader work and joins its claimed request before restoring input.
 
 use std::cell::RefCell;
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::mpsc::{Receiver, Sender, channel};
+use std::sync::{Arc, Condvar, Mutex};
 
 use serde_json::{Map, Value};
 
@@ -13,6 +14,160 @@ use super::pick::Target;
 use crate::caller::Caller;
 use crate::ctx::{Ctx, Env};
 use crate::error::{Refusal, Res};
+
+/// The identity of a viewed spell survives a moved or missing row while its mark runs.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct Seen {
+    pub id: String,
+    pub pane: String,
+    pub changed: String,
+}
+
+/// Work for the one serial board reader. Seen writes queued before a read finish before it starts.
+#[derive(Debug)]
+pub(crate) enum Request {
+    Read(u64),
+    Seen(Seen),
+}
+
+impl Request {
+    fn refused(&self) -> Answer {
+        match self {
+            Self::Read(generation) => {
+                Answer::Read(*generation, Err(Refusal::internal("board reader failed")))
+            }
+            Self::Seen(seen) => Answer::Seen(seen.clone(), false),
+        }
+    }
+}
+
+#[derive(Debug)]
+pub(crate) enum Answer {
+    Read(u64, Res<Map<String, Value>>),
+    Seen(Seen, bool),
+}
+
+type Queue = Arc<(Mutex<(VecDeque<Request>, bool)>, Condvar)>;
+
+/// Claiming work and stopping share a lock: closing a bar never starts a queued seen write.
+#[derive(Debug)]
+struct Reader {
+    queue: Queue,
+    answers: Receiver<(Answer, bool)>,
+    send: Sender<(Answer, bool)>,
+    failed: Arc<std::sync::atomic::AtomicBool>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Reader {
+    fn start<F: FnMut(&Request) -> Answer + 'static>(
+        make: impl FnOnce() -> F + Send + 'static,
+    ) -> Self {
+        Self::start_with(make, |run| {
+            std::thread::Builder::new()
+                .name("mux-agents-bar-reader".into())
+                .spawn(run)
+        })
+    }
+
+    fn start_with<F: FnMut(&Request) -> Answer + 'static>(
+        make: impl FnOnce() -> F + Send + 'static,
+        spawn: impl FnOnce(Box<dyn FnOnce() + Send>) -> std::io::Result<std::thread::JoinHandle<()>>,
+    ) -> Self {
+        Self::start_between(make, spawn, || {})
+    }
+
+    fn start_between<F: FnMut(&Request) -> Answer + 'static>(
+        make: impl FnOnce() -> F + Send + 'static,
+        spawn: impl FnOnce(Box<dyn FnOnce() + Send>) -> std::io::Result<std::thread::JoinHandle<()>>,
+        mut between: impl FnMut() + Send + 'static,
+    ) -> Self {
+        let queue: Queue = Arc::new((Mutex::new((VecDeque::new(), false)), Condvar::new()));
+        let work = queue.clone();
+        let (send, answers) = channel();
+        let worker = send.clone();
+        let failed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let broken = failed.clone();
+        let handle = spawn(Box::new(move || {
+            let mut run = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(make)) {
+                Ok(run) => run,
+                Err(_) => {
+                    let mut state = work.0.lock().unwrap();
+                    broken.store(true, std::sync::atomic::Ordering::SeqCst);
+                    for queued in state.0.drain(..) {
+                        let _ = worker.send((queued.refused(), true));
+                    }
+                    return;
+                }
+            };
+            loop {
+                let request = {
+                    let (lock, ready) = &*work;
+                    let mut state = lock.lock().unwrap();
+                    while state.0.is_empty() && !state.1 {
+                        state = ready.wait(state).unwrap();
+                    }
+                    if state.1 {
+                        return;
+                    }
+                    state.0.pop_front().unwrap()
+                };
+                match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run(&request))) {
+                    Ok(answer) => {
+                        let _ = worker.send((answer, false));
+                        between();
+                    }
+                    Err(_) => {
+                        let mut state = work.0.lock().unwrap();
+                        broken.store(true, std::sync::atomic::Ordering::SeqCst);
+                        let _ = worker.send((request.refused(), true));
+                        for queued in state.0.drain(..) {
+                            let _ = worker.send((queued.refused(), true));
+                        }
+                        return;
+                    }
+                }
+            }
+        }))
+        .ok();
+        if handle.is_none() {
+            failed.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+        Self {
+            queue,
+            answers,
+            send,
+            failed,
+            handle,
+        }
+    }
+
+    fn ask(&mut self, request: Request) {
+        let (lock, ready) = &*self.queue;
+        let mut state = lock.lock().unwrap();
+        if !state.1 {
+            if self.failed.load(std::sync::atomic::Ordering::SeqCst) {
+                let _ = self.send.send((request.refused(), true));
+            } else {
+                state.0.push_back(request);
+                ready.notify_one();
+            }
+        }
+    }
+
+    fn finish(&mut self) {
+        let (lock, ready) = &*self.queue;
+        {
+            let mut state = lock.lock().unwrap();
+            state.1 = true;
+            state.0.clear();
+            ready.notify_all();
+        }
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
 
 /// A finished action: the row it was for, and the verb's answer.
 pub(crate) type Done = (Target, Res<Map<String, Value>>);
@@ -33,6 +188,12 @@ pub(crate) struct Jobs {
     // Each worker still to be waited for, and whether the watch has stopped taking new work (`finish`).
     handles: Vec<std::thread::JoinHandle<()>>,
     closed: bool,
+    reader: Option<Reader>,
+    reader_failures: u64,
+    reading: bool,
+    seeing: BTreeSet<Seen>,
+    generation: u64,
+    ready: VecDeque<(Answer, bool)>,
     // Under test the work runs on the bar's own thread at the next drain: the test fakes are `Rc`, so they cannot
     // reach a worker. The frame drawn before that drain is the one a worker leaves the bar free to draw.
     #[cfg(test)]
@@ -45,6 +206,66 @@ pub(crate) struct Jobs {
 std::thread_local! {
     // Under test, while true, deferred resumes are held back: a test releases them to answer at a moment it picks.
     pub(crate) static HOLD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    // A read executes immediately on the fake-provider thread, but its answer can remain in flight.
+    pub(crate) static HOLD_READ: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static TEST_READER: RefCell<Option<Reader>> = const { RefCell::new(None) };
+    static TEST_FACTORY: RefCell<Option<Box<dyn FnMut() -> Reader>>> = const { RefCell::new(None) };
+}
+
+/// A real worker for a watch test; only its closures leave the fake providers' thread.
+#[cfg(test)]
+pub(super) fn test_reader<F: FnMut(&Request) -> Answer + 'static>(
+    make: impl FnOnce() -> F + Send + 'static,
+) -> Queue {
+    let reader = Reader::start(make);
+    let queue = reader.queue.clone();
+    TEST_READER.with(|slot| *slot.borrow_mut() = Some(reader));
+    queue
+}
+
+#[cfg(test)]
+pub(super) fn test_idle_reader() -> Queue {
+    let (ready, idle) = channel();
+    let queue = test_reader(move || {
+        ready.send(()).unwrap();
+        |_: &Request| panic!("idle reader must claim nothing")
+    });
+    idle.recv_timeout(std::time::Duration::from_secs(5))
+        .unwrap();
+    queue
+}
+
+#[cfg(test)]
+pub(super) fn test_reader_between<F: FnMut(&Request) -> Answer + 'static>(
+    make: impl FnOnce() -> F + Send + 'static,
+    between: impl FnMut() + Send + 'static,
+) -> Queue {
+    let reader = Reader::start_between(make, |run| std::thread::Builder::new().spawn(run), between);
+    let queue = reader.queue.clone();
+    TEST_READER.with(|slot| *slot.borrow_mut() = Some(reader));
+    queue
+}
+
+#[cfg(test)]
+pub(super) fn test_reader_failures(start_failure: bool, mut started: impl FnMut() + 'static) {
+    TEST_FACTORY.with(|slot| {
+        *slot.borrow_mut() = Some(Box::new(move || {
+            started();
+            if start_failure {
+                Reader::start_with(
+                    || |_: &Request| panic!("no thread"),
+                    |_| Err(std::io::Error::other("no reader thread")),
+                )
+            } else {
+                Reader::start(|| |_: &Request| panic!("reader request panic"))
+            }
+        }))
+    });
+}
+
+#[cfg(test)]
+pub(super) fn clear_test_reader_factory() {
+    TEST_FACTORY.with(|slot| *slot.borrow_mut() = None);
 }
 
 impl Default for Jobs {
@@ -60,6 +281,15 @@ impl Default for Jobs {
             answers,
             handles: Vec::new(),
             closed: false,
+            #[cfg(not(test))]
+            reader: None,
+            #[cfg(test)]
+            reader: TEST_READER.with(|slot| slot.borrow_mut().take()),
+            reader_failures: 0,
+            reading: false,
+            seeing: BTreeSet::new(),
+            generation: 0,
+            ready: VecDeque::new(),
             #[cfg(test)]
             deferred: Vec::new(),
             #[cfg(test)]
@@ -94,6 +324,122 @@ fn spawn<K: Clone + Send + 'static, T: Send + 'static>(
 }
 
 impl Jobs {
+    /// The newest requested read, so a mark can reject older answers.
+    pub(crate) fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    pub(crate) fn reading(&self) -> bool {
+        self.reading
+    }
+
+    /// Ask once; fake-provider tests run here, production uses its one long-lived worker.
+    pub(crate) fn read(&mut self, ctx: &Ctx, caller: &Caller) {
+        if self.closed || self.reading {
+            return;
+        }
+        self.generation += 1;
+        self.reading = true;
+        #[cfg(test)]
+        if self.reader.is_none() && self.reader_failures < 3 {
+            self.reader = TEST_FACTORY.with(|slot| slot.borrow_mut().as_mut().map(|make| make()));
+        }
+        if self.reader_failures >= 3 || (cfg!(test) && self.reader.is_none()) {
+            self.ready.push_back((
+                Answer::Read(
+                    self.generation,
+                    crate::agents::board::board(ctx, caller, true, true),
+                ),
+                false,
+            ));
+            return;
+        }
+        self.start_reader(ctx, caller);
+        self.reader
+            .as_mut()
+            .unwrap()
+            .ask(Request::Read(self.generation));
+    }
+
+    fn start_reader(&mut self, ctx: &Ctx, caller: &Caller) {
+        if self.reader.is_none() {
+            let (seed, caller) = (Seed::of(ctx), caller.clone());
+            self.reader = Some(Reader::start(move || {
+                let ctx = seed.host();
+                crate::hc::remember_versions();
+                move |request: &Request| match request {
+                    Request::Read(generation) => Answer::Read(
+                        *generation,
+                        crate::agents::board::board(&ctx, &caller, true, true),
+                    ),
+                    Request::Seen(seen) => Answer::Seen(
+                        seen.clone(),
+                        crate::agents::board::mark_seen(&ctx, &caller, &seen.pane, &seen.changed)
+                            .is_ok_and(|ok| ok),
+                    ),
+                }
+            }));
+        }
+    }
+
+    /// Queue each viewed spell once until it answers; false marks can be retried next tick.
+    pub(crate) fn seen(&mut self, ctx: &Ctx, caller: &Caller, seen: &Seen) {
+        if self.closed || !self.seeing.insert(seen.clone()) {
+            return;
+        }
+        if self.reader_failures >= 3 || (cfg!(test) && self.reader.is_none()) {
+            self.ready.push_back((
+                Answer::Seen(
+                    seen.clone(),
+                    crate::agents::board::mark_seen(ctx, caller, &seen.pane, &seen.changed)
+                        .is_ok_and(|ok| ok),
+                ),
+                false,
+            ));
+        } else {
+            self.start_reader(ctx, caller);
+            self.reader
+                .as_mut()
+                .unwrap()
+                .ask(Request::Seen(seen.clone()));
+        }
+    }
+
+    /// Collect answers without waiting for a request; a failed worker has only refusals left to join.
+    pub(crate) fn drain_reader(&mut self) -> Vec<Answer> {
+        if let Some(reader) = &self.reader {
+            self.ready.extend(reader.answers.try_iter());
+        }
+        let mut done = Vec::new();
+        let mut broken = false;
+        for (answer, failed) in std::mem::take(&mut self.ready) {
+            #[cfg(test)]
+            if HOLD_READ.get() && matches!(answer, Answer::Read(_, _)) {
+                self.ready.push_back((answer, failed));
+                continue;
+            }
+            broken |= failed;
+            if let Answer::Seen(seen, _) = &answer {
+                self.seeing.remove(seen);
+            }
+            if matches!(answer, Answer::Read(_, _)) {
+                self.reading = false;
+                if !failed && self.reader_failures < 3 {
+                    self.reader_failures = 0;
+                }
+            }
+            done.push(answer);
+        }
+        if broken && let Some(mut reader) = self.reader.take() {
+            self.reader_failures = (self.reader_failures + 1).min(3);
+            reader.finish();
+            self.ready.extend(reader.answers.try_iter());
+            // The worker may have sent queued refusals after the first drain but before the join ended.
+            done.extend(self.drain_reader());
+        }
+        done
+    }
+
     /// Resumes ended member `target` by id, as a tab, off the loop; false (nothing started) while one is pending for it.
     pub(crate) fn resume(&mut self, ctx: &Ctx, caller: &Caller, target: &Target) -> bool {
         if self.closed || !self.pending.insert(target.id.clone()) {
@@ -194,6 +540,11 @@ impl Jobs {
         bound: std::time::Duration,
     ) -> bool {
         self.closed = true;
+        if let Some(reader) = &mut self.reader {
+            reader.finish();
+        }
+        self.ready.clear();
+        self.reading = false;
         let end = std::time::Instant::now() + bound;
         // Under test the deferred work runs here, on this thread, as `drain` runs it.
         let _ = (self.drain(ctx, caller), self.drain_windows(ctx, caller));
