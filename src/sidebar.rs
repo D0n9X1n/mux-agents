@@ -486,7 +486,7 @@ impl Section {
     /// A row's section: the board reports `done` only until the person has seen that done spell.
     fn of(row: &Map<String, Value>, kind: Kind) -> Section {
         match kind {
-            _ if has_mail(row) || recovery_word(row).is_some() => Section::Inbox,
+            _ if has_mail(row) || recovery_word(row).is_some() || no_answer(row) => Section::Inbox,
             Kind::Blocked | Kind::Done => Section::Inbox,
             Kind::Working => Section::Working,
             _ => Section::Free,
@@ -515,6 +515,12 @@ impl Section {
             Section::Free => Style { bold: true, ..DIM },
         }
     }
+}
+
+/// Whether `row`'s open ping has waited past the deadline (the feed's `noAnswer`): it stands in Inbox until the member
+/// answers. Only a live row carries it.
+fn no_answer(row: &Map<String, Value>) -> bool {
+    row.get("noAnswer") == Some(&Value::Bool(true))
 }
 
 /// Whether `row` has unread mail: it stands in Inbox, an ended agent's row too, until the mail is read.
@@ -848,6 +854,8 @@ struct LiveParts {
     badge: Row,
     age: String,
     doing: String,
+    /// A late ping's age: the row's word is `no answer` with it.
+    late: Option<String>,
 }
 
 fn live_parts(row: &Map<String, Value>, look: Look) -> LiveParts {
@@ -870,6 +878,8 @@ fn live_parts(row: &Map<String, Value>, look: Look) -> LiveParts {
         .get("since")
         .filter(|since| !since.is_null())
         .or_else(|| row.get("age"));
+    let doing = own_glyphs(&clean(row.get("doing"))).trim().to_string();
+    let (doing, late) = ping_mark(row, kind, doing, look);
     LiveParts {
         kind,
         muted,
@@ -885,7 +895,52 @@ fn live_parts(row: &Map<String, Value>, look: Look) -> LiveParts {
         model,
         badge: unread_badge(row, look),
         age: format_age(since),
-        doing: own_glyphs(&clean(row.get("doing"))).trim().to_string(),
+        doing,
+        late,
+    }
+}
+
+/// An open ping on a live row (the feed's `pingedAgo`): `pinged 4m` leads the doing line. Late (`noAnswer`), the row's
+/// word becomes `no answer` with the ping's age, but a blocked row keeps `needs you`, which the person must act on, and
+/// its doing line says `no answer 12m` instead.
+fn ping_mark(
+    row: &Map<String, Value>,
+    kind: Kind,
+    doing: String,
+    look: Look,
+) -> (String, Option<String>) {
+    let Some(ago) = row.get("pingedAgo").filter(|a| a.is_u64()) else {
+        return (doing, None);
+    };
+    let age = format_age(Some(ago));
+    let mark = match (no_answer(row), kind) {
+        (true, Kind::Blocked) => format!("no answer {age}"),
+        (true, _) => return (doing, Some(age)),
+        (false, _) => format!("pinged {age}"),
+    };
+    if doing.is_empty() {
+        (mark, None)
+    } else {
+        (format!("{mark} {} {doing}", dot(look)), None)
+    }
+}
+
+/// A live row's right side: its word and age, or `no answer` and the ping's age once its ping is late.
+fn live_side(p: &LiveParts) -> Row {
+    match &p.late {
+        Some(age) => vec![
+            span("no answer", Kind::Blocked.style()),
+            span(format!(" {age:>4}"), PLAIN),
+        ],
+        None => right(p.kind, p.kind.word(), &p.age, p.muted),
+    }
+}
+
+/// `live_side` without the age.
+fn live_word(p: &LiveParts) -> Row {
+    match &p.late {
+        Some(_) => vec![span("no answer", Kind::Blocked.style())],
+        None => vec![span(p.kind.word(), p.kind.word_style())],
     }
 }
 
@@ -940,9 +995,7 @@ fn live_row(row: &Map<String, Value>, cols: usize, look: Look, models: bool) -> 
     // Call 20: a Running member that needs recovery keeps its live row (still clickable) with the recovery word.
     let recovery =
         recovery_word(row).map(|word| recovery_side(row, word, &p.age, &p.glyph, &p.badge, cols));
-    let side = recovery
-        .clone()
-        .unwrap_or_else(|| right(p.kind, p.kind.word(), &p.age, p.muted));
+    let side = recovery.clone().unwrap_or_else(|| live_side(&p));
     // o2 call 34: a recovery row never drops its pill.
     let fit: fn(Span, Span, Row, Row, Row, usize) -> Row = if recovery.is_some() {
         kept_line
@@ -5492,6 +5545,93 @@ mod tests {
                 String::new(),
                 " \u{25b8} Ended \u{b7} 7".to_string(),
             ]
+        );
+    }
+
+    // One live agent with an open ping `ago` seconds old, flagged `late` (the feed's `noAnswer`).
+    fn pinged(activity: &str, since: u64, ago: u64, late: bool, doing: Value) -> Value {
+        json!({"running": 1, "agents": [
+            {"name": "w1", "state": "running", "doing": doing, "age": 900, "unread": 0, "color": "blue",
+             "activity": activity, "since": since, "life": "running", "view": "attached", "hcAddress": "t-w1",
+             "statusAt": null, "pingedAt": "2026-10-29T11:50:00.0000000Z", "noAnswer": late, "pingedAgo": ago}
+        ]})
+    }
+
+    // Behaviour 8: an open ping leads the doing line, dim (`pinged 4m`), and the row stays where its activity puts it;
+    // from 10 minutes without an answer it stands in Inbox as `no answer 12m`. A blocked row keeps `needs you` (the
+    // person must act on it) and its doing line says `no answer`. Answered, the mark is gone.
+    #[test]
+    fn an_open_ping_is_on_the_doing_line_and_no_answer_is_in_inbox() {
+        let build = || json!("build it");
+        assert_eq!(
+            body(&pinged("working", 600, 240, false, build()), W40),
+            [
+                pad("mux-agents", "1 working"),
+                String::new(),
+                " Working \u{b7} 1".to_string(),
+                pad("\u{25c9} w1", "10m"),
+                "   pinged 4m \u{b7} build it".to_string(),
+            ]
+        );
+        let rows = body(&pinged("working", 600, 599, false, build()), W40);
+        assert_eq!(
+            (rows[2].as_str(), rows[4].as_str()),
+            (" Working \u{b7} 1", "   pinged 9m \u{b7} build it"),
+            "9:59"
+        );
+        assert_eq!(
+            body(&pinged("working", 600, 600, true, build()), W40),
+            [
+                pad("mux-agents", "1 inbox"),
+                String::new(),
+                " Inbox \u{b7} 1".to_string(),
+                pad("\u{25c9} w1", "no answer  10m"),
+                "   build it".to_string(),
+            ],
+            "10:00"
+        );
+        assert_eq!(
+            body(&pinged("working", 600, 720, true, build()), W40)[3],
+            pad("\u{25c9} w1", "no answer  12m")
+        );
+        let mut answered = pinged("working", 600, 0, false, build());
+        answered["agents"][0]["pingedAt"] = Value::Null;
+        answered["agents"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("pingedAgo");
+        assert_eq!(
+            body(&answered, W40)[2..],
+            [
+                " Working \u{b7} 1".to_string(),
+                pad("\u{25c9} w1", "10m"),
+                "   build it".to_string()
+            ]
+        );
+        assert_eq!(
+            body(&pinged("blocked", 12, 720, true, build()), W40)[2..],
+            [
+                " Inbox \u{b7} 1".to_string(),
+                pad("! w1", "needs you  12s"),
+                "   no answer 12m \u{b7} build it".to_string()
+            ]
+        );
+        assert_eq!(
+            body(&pinged("working", 600, 240, false, Value::Null), W40)[4],
+            "   pinged 4m"
+        );
+        let board = pinged("working", 600, 240, false, build());
+        let ascii = Look {
+            ascii: true,
+            ..PLAIN_LOOK
+        };
+        let rows = lay(board.as_object(), &[], W40, ascii).rows;
+        assert_eq!(render(&rows[4], false), "   pinged 4m - build it");
+        let rows = lay(board.as_object(), &[], W40, PLAIN_LOOK).rows;
+        assert_eq!(
+            rows[4][1],
+            ("pinged 4m \u{b7} build it".to_string(), DIM),
+            "the mark is dim, as the doing line"
         );
     }
 

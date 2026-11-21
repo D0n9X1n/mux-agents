@@ -214,10 +214,7 @@ fn member(node: &Node, width: usize, shown: Option<&str>, look: Look) -> Member 
             let sides = if narrow {
                 vec![bare, Vec::new()]
             } else {
-                vec![
-                    right(p.kind, p.kind.word(), &p.age, p.muted),
-                    vec![span(p.kind.word(), p.kind.word_style())],
-                ]
+                vec![live_side(&p), live_word(&p)]
             };
             // B5: a live row's word is optional only below 40 columns; at 40 and wider it is mandatory.
             (p.glyph, p.name, p.model, p.badge, sides, !narrow, p.doing)
@@ -883,6 +880,44 @@ pub(super) mod tests {
         ]);
         let ids: Vec<_> = walk(&board).into_iter().map(|t| t.id).collect();
         assert_eq!(ids, ["L", "E", "N", "O", "P", "D", "W", "b", "c", "I"]);
+    }
+
+    // Behaviour 8 on a team's tree: an open ping leads the member's doing line; one with no answer says so in place of
+    // its word, with the ping's age, and counts in Inbox.
+    #[test]
+    fn a_pinged_member_shows_the_ping_on_the_tree() {
+        let board = team(vec![
+            member("L", None, 1, json!({"name": "lead", "activity": "working"})),
+            member(
+                "A",
+                Some("L"),
+                2,
+                json!({"name": "alpha", "activity": "working", "doing": "build it", "pingedAgo": 240, "noAnswer": false}),
+            ),
+            member(
+                "B",
+                Some("L"),
+                3,
+                json!({"name": "beta", "activity": "working", "pingedAgo": 720, "noAnswer": true}),
+            ),
+        ]);
+        let look = Look {
+            color: false,
+            ascii: false,
+            dumb: false,
+        };
+        let rows = draw(&board, 60, 20, look, Focus::default());
+        assert_eq!(
+            rows[..6],
+            [
+                line(" ", "mux-agents", "1 inbox \u{b7} 2 working", 60),
+                String::new(),
+                line(" ", "\u{25c9} lead", "working   1m", 60),
+                line(" ", "  \u{25c9} alpha", "working   1m", 60),
+                "     pinged 4m \u{b7} build it".to_string(),
+                line(" ", "  \u{25c9} beta", "no answer  12m", 60),
+            ]
+        );
     }
 
     fn golden() -> Map<String, Value> {
