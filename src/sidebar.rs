@@ -723,6 +723,21 @@ fn drawn(laid: &Laid) -> Vec<(String, usize, String)> {
         .collect()
 }
 
+/// What a click on the bar can hit: each drawn agent row's member id and row (`drawn`), at the bar's size.
+#[derive(Debug, PartialEq, Eq)]
+struct ClickMap {
+    rows: Vec<(String, usize)>,
+    size: Size,
+}
+
+impl ClickMap {
+    /// True when a press aimed at `last` may hit something else on this frame: the first frame, a new size, or any
+    /// agent row that appeared, left or moved. A frame whose words changed (an age, a doing line) moves nothing.
+    fn moved(&self, last: Option<&ClickMap>) -> bool {
+        last != Some(self)
+    }
+}
+
 /// The rows a board can draw, before the height decides which are kept.
 struct Parts {
     // Between a section's name and its count: `·`, or `-` in ASCII.
@@ -2462,7 +2477,7 @@ fn watch_loop(
     let mut last_frame: Option<(String, Size)> = None;
     let mut last_written = SystemTime::UNIX_EPOCH;
     let mut last_changed = SystemTime::UNIX_EPOCH;
-    let mut last_map: Option<(Vec<(String, usize)>, Size)> = None;
+    let mut last_map: Option<ClickMap> = None;
     let root = crate::agents::server_dir(ctx, caller);
     // Peek files of popups that never opened, from an earlier bar (review).
     sweep_peeks(ctx, &crate::agents::server_dir(ctx, caller));
@@ -2676,10 +2691,13 @@ fn watch_loop(
         // (`last_changed`): a rewrite, or a frame whose words changed with every row where it was (each tick changes an
         // age), hits the same agent on either frame, so a press read right after it is taken.
         let text = frame(&laid.rows, size, look);
-        let map: Vec<(String, usize)> = drawn(&laid)
-            .into_iter()
-            .map(|(id, at, _)| (id, at))
-            .collect();
+        let map = ClickMap {
+            rows: drawn(&laid)
+                .into_iter()
+                .map(|(id, at, _)| (id, at))
+                .collect(),
+            size,
+        };
         let now = ctx.clock.now();
         let same = last_frame
             .as_ref()
@@ -2690,14 +2708,11 @@ fn watch_loop(
                 return "output-closed";
             }
             last_written = ctx.clock.now();
-            let moved = last_map
-                .as_ref()
-                .is_none_or(|(rows, at)| *at != size || *rows != map);
-            if pace.poll.is_none() || (!same && moved) {
+            if pace.poll.is_none() || (!same && map.moved(last_map.as_ref())) {
                 last_changed = last_written;
             }
             last_frame = Some((text, size));
-            last_map = Some((map, size));
+            last_map = Some(map);
         }
         // `close bar? y/n` is on screen from now (it is drawn from 12 columns): `BAR_GAP` runs from here.
         if size.width >= 12 {
@@ -9984,6 +9999,43 @@ mod tests {
             "the press 10 ms after a frame that moved no row focused worker"
         );
         w.fakes.hc_done().unwrap();
+    }
+
+    // The click map moves with any agent row that appears, leaves or moves, and with the size; only words changing
+    // moves nothing.
+    #[test]
+    fn a_click_map_moves_with_a_row_or_the_size_not_with_words() {
+        let size = |height| Size { width: 40, height };
+        let map = |rows: &[(&str, usize)], height| ClickMap {
+            rows: rows.iter().map(|(id, at)| (id.to_string(), *at)).collect(),
+            size: size(height),
+        };
+        let shown = map(&[("a", 5), ("a", 6), ("b", 8)], 24);
+        assert!(shown.moved(None), "the first frame");
+        assert!(
+            !map(&[("a", 5), ("a", 6), ("b", 8)], 24).moved(Some(&shown)),
+            "same rows, same size"
+        );
+        assert!(
+            map(&[("a", 5), ("a", 6), ("b", 8)], 30).moved(Some(&shown)),
+            "a new size"
+        );
+        assert!(
+            map(&[("a", 5), ("a", 6), ("b", 7)], 24).moved(Some(&shown)),
+            "a row moved"
+        );
+        assert!(
+            map(&[("a", 5), ("b", 6), ("a", 8)], 24).moved(Some(&shown)),
+            "agents swapped rows"
+        );
+        assert!(
+            map(&[("a", 5), ("b", 7)], 24).moved(Some(&shown)),
+            "a doing line left, the next row moved up"
+        );
+        assert!(
+            map(&[("a", 5), ("a", 6), ("b", 8), ("c", 10)], 24).moved(Some(&shown)),
+            "an agent appeared"
+        );
     }
 
     // A lone ESC already read when a poll finds a change keeps waiting for the rest of its sequence through the
