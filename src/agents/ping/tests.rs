@@ -642,3 +642,86 @@ fn an_answer_racing_a_new_generation_is_refused_and_writes_nothing() {
     assert!(!folder.join("answer.json").exists(), "no answer written");
     assert_eq!(file(&folder, "status.json")["text"], "generation 1 at work");
 }
+
+// The generation `ping` records and the record it publishes belong to one hold of the member's locks: a member
+// resumed into generation 1 after the snapshot named it, but before `ping` takes its locks, gets a ping of generation 1.
+#[test]
+fn a_ping_racing_a_new_generation_records_the_new_one() {
+    let w = team_world();
+    let f = w.folder(A);
+    at_first_hold(&w, A, move || next_generation(&f));
+    online(&w);
+    let p = publish(&w.ctx, &w.caller(), "ma1").unwrap();
+    w.fakes.hc_done().unwrap();
+    let r = record(&w, A);
+    assert_eq!(
+        (
+            r["id"].clone(),
+            r["generation"].clone(),
+            p.generation.clone()
+        ),
+        (json!(p.open.id), json!("1"), json!("1"))
+    );
+    assert_eq!(
+        open(&w.folder(A), &json!("1")).map(|o| o.id),
+        Some(p.open.id)
+    );
+}
+
+// The reviewer's interleaving: ping publishes at generation 0 and pauses; the member is resumed into generation 1;
+// the original notice and confirm then go on. The old id cannot be answered, generation 1 inherits no ping, the late
+// confirm alters nothing, and the next ping creates and delivers a new id that generation 1 answers.
+#[test]
+fn a_ping_paused_across_a_resume_leaves_the_new_generation_unpinged() {
+    let w = team_world();
+    let c = w.caller();
+    let folder = w.folder(A);
+    online(&w);
+    let old = publish(&w.ctx, &c, "ma1").unwrap();
+    assert_eq!(old.generation, json!("0"));
+    next_generation(&folder);
+    online(&w);
+    notify(&w.ctx, &c, &old).unwrap();
+    let before = record(&w, A);
+    confirm(&w.ctx, &c, &old).unwrap();
+    assert_eq!(record(&w, A), before, "the late confirm alters nothing");
+    assert_eq!(before["sent"], json!(false));
+    assert_eq!(
+        open(&folder, &json!("1")),
+        None,
+        "generation 1 inherits no ping"
+    );
+    w.file("a.md", b"ok");
+    online(&w);
+    let e = answer_as(&w.ctx, &as_member(&w, A), &old.open.id, "a.md").unwrap_err();
+    assert_eq!(said(e), "2 ping no open ping with that id");
+    online(&w);
+    online(&w);
+    let new = ping(&w, "ma1");
+    let id = new["id"].as_str().unwrap().to_string();
+    assert_ne!(id, old.open.id);
+    assert_eq!(
+        (
+            new["notified"].clone(),
+            record(&w, A)["generation"].clone(),
+            record(&w, A)["sent"].clone()
+        ),
+        (json!(true), json!("1"), json!(true))
+    );
+    let mail = inbox(&w, A);
+    assert_eq!(mail.len(), 2, "the old notice, then the new one");
+    assert!(
+        mail[1]["body"]
+            .as_str()
+            .unwrap()
+            .contains(&format!("mux-agent answer {id} "))
+    );
+    online(&w);
+    answer_as(&w.ctx, &as_member(&w, A), &id, "a.md").unwrap();
+    assert_eq!(
+        open(&folder, &json!("1")),
+        None,
+        "generation 1 answered its own ping"
+    );
+    w.fakes.hc_done().unwrap();
+}

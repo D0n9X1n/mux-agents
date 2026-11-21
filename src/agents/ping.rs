@@ -141,8 +141,9 @@ pub fn ping(ctx: &Ctx, request: &Request) -> Res<Map<String, Value>> {
     ping_as(ctx, &caller, super::view::first(request))
 }
 
-/// `ping <name>` for a resolved caller: publish (or find) the record under the team and then the member's agent lock;
-/// with no lock held, send the notice when the record is not yet `sent`; then mark it `sent` under the agent lock.
+/// `ping <name>` for a resolved caller: publish (or find) the record under the team lock, then one hold of the member's
+/// member and agent locks; with no lock held, send the notice when the record is not yet `sent`; then mark it `sent`
+/// in one hold of the member's locks.
 pub(crate) fn ping_as(ctx: &Ctx, caller: &Caller, name: &str) -> Res<Map<String, Value>> {
     let p = publish(ctx, caller, name)?;
     crash_point("published")?;
@@ -182,14 +183,15 @@ fn publish(ctx: &Ctx, caller: &Caller, name: &str) -> Res<Published> {
         if let Some(e) = &s.core_error {
             return Err(e.clone());
         }
-        let Some((id, record)) = s.running_named(name) else {
+        let Some((id, _)) = s.running_named(name) else {
             return refuse(2, "target", super::team_mail::NO_NAME);
         };
-        let generation = record.get("generation").cloned().unwrap_or(Value::Null);
         let folder = super::server_dir(ctx, caller).join("agents").join(&id);
-        let open = super::lock(ctx, &super::lock_key("agent", caller, &id), || {
-            if let Some(open) = open(&folder, &generation) {
-                return Ok(open);
+        // The generation is the member's as its record holds it under the locks, never the snapshot's: a resume since
+        // the snapshot is a new generation, and its ping is that generation's.
+        let (open, generation) = held(ctx, caller, &id, |generation| {
+            if let Some(open) = open(&folder, generation) {
+                return Ok((open, generation.clone()));
             }
             let open = Open {
                 id: super::team_mail::new_id()?,
@@ -201,7 +203,7 @@ fn publish(ctx: &Ctx, caller: &Caller, name: &str) -> Res<Published> {
                 &json!({"id": open.id, "askedAt": open.asked_at, "by": by, "generation": generation,
                     "sent": false}),
             )?;
-            Ok(open)
+            Ok((open, generation.clone()))
         })?;
         Ok(Published {
             name: name.into(),
@@ -288,16 +290,18 @@ pub(crate) fn answer_as(
     Ok(reply)
 }
 
-/// Marks the record `sent` only while it is still this ping of this generation: one replaced meanwhile (a newer ping,
-/// a new generation) is left as it is.
+/// Marks the record `sent` only while it is still this ping of this generation and that generation is still the
+/// member's, all in one hold of its member, then agent lock (`held`): one replaced meanwhile (a newer ping), or a
+/// member resumed into a new generation meanwhile, is left as it is.
 fn confirm(ctx: &Ctx, caller: &Caller, p: &Published) -> Res<()> {
-    super::lock(ctx, &super::lock_key("agent", caller, &p.member), || {
+    held(ctx, caller, &p.member, |generation| {
         let file = p.folder.join("ping.json");
         let Some(mut record) = crate::state::fs::read_json(&file).ok().flatten() else {
             return Ok(());
         };
         let own = record.get("id").and_then(Value::as_str) == Some(p.open.id.as_str())
-            && record.get("generation").unwrap_or(&Value::Null) == &p.generation;
+            && record.get("generation").unwrap_or(&Value::Null) == &p.generation
+            && generation == &p.generation;
         if own {
             record["sent"] = true.into();
             crate::state::fs::write_json_durable(&file, &record)?;
