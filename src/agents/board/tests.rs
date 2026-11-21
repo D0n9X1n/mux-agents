@@ -374,7 +374,7 @@ fn board_row_field_order() {
     member(
         &w,
         ID,
-        json!({"createdAt": "2026-10-29T11:56:00.0000000Z", "model": "sonnet", "color": "magenta"}),
+        json!({"createdAt": "2026-10-29T11:56:00.0000000Z", "model": "sonnet", "role": "x", "color": "magenta"}),
     );
     member(
         &w,
@@ -409,17 +409,18 @@ fn board_row_field_order() {
                age,
                unread,
                model: Value,
+               role: Value,
                color: &str,
                address: &str| {
         json!({"name": name, "client": client, "pane": pane, "window": window, "context": "brief",
                 "parent": "%1", "sessionId": SESSION_ID, "directory": "/work", "createdAt": created,
                 "state": "running", "doing": doing, "doingFrom": from, "age": age, "unread": unread,
-                "model": model, "color": color, "activity": "working", "since": null, "changedAt": null, "life":"running", "view":"attached", "hcAddress":address})
+                "model": model, "role": role, "color": color, "activity": "working", "since": null, "changedAt": null, "life":"running", "view":"attached", "hcAddress":address})
     };
-    // A record without a model (the client's own) lists null; one without a color gets its name's hue.
+    // A record without a model (the client's own) or a role lists null; one without a color gets its name's hue.
     let want = json!({"running": 2, "agents": [
-        row("worker", "claude", "%9", "@6", "2026-10-29T11:56:00.0000000Z", json!("build it"), json!("task"), 240, 2, json!("sonnet"), "magenta", "taaaaaaaaaaaa"),
-        row("idle", "copilot", "%8", "@7", "2026-10-29T11:59:55.0000000Z", Value::Null, Value::Null, 5, 1, Value::Null, crate::paint::identity(None, "idle"), "tbbbbbbbbbbbb")
+        row("worker", "claude", "%9", "@6", "2026-10-29T11:56:00.0000000Z", json!("build it"), json!("task"), 240, 2, json!("sonnet"), json!("x"), "magenta", "taaaaaaaaaaaa"),
+        row("idle", "copilot", "%8", "@7", "2026-10-29T11:59:55.0000000Z", Value::Null, Value::Null, 5, 1, Value::Null, Value::Null, crate::paint::identity(None, "idle"), "tbbbbbbbbbbbb")
     ]});
     // Compared as text: the order of keys is part of the reply.
     assert_eq!(Value::Object(reply).to_string(), want.to_string());

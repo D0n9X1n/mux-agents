@@ -230,6 +230,8 @@ impl Rows<'_> {
         row.insert("unread".into(), unread.into());
         // Last, so the -Text columns before it keep their places; null is the client's own model.
         row.insert("model".into(), field("model"));
+        // After the model, so the -Text columns before it keep their places; null when spawned with no -Role.
+        row.insert("role".into(), field("role"));
         // The identity hue: the recorded one, else the name's.
         let recorded = record.get("color").and_then(Value::as_str);
         row.insert(

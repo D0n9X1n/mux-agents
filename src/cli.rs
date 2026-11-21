@@ -1939,10 +1939,11 @@ mod tests {
         let (code, out) = call(&w, &["list", "-Text"]);
         w.fakes.hc_done().unwrap();
         assert_eq!(code, 0, "{out}");
+        // The role column follows the model; a member spawned with no -Role leaves it empty.
         assert_eq!(
             out,
             format!(
-                "running: 1\nworker  claude  %9  @5  brief  %1  {}  /work  1970-01-01T00:00:00.0000000Z  running  build it  task  0  0  sonnet  working      running  attached  taaaaaaaaaaaa",
+                "running: 1\nworker  claude  %9  @5  brief  %1  {}  /work  1970-01-01T00:00:00.0000000Z  running  build it  task  0  0  sonnet    working      running  attached  taaaaaaaaaaaa",
                 crate::agents::fixture::SESSION_ID
             )
         );
