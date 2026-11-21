@@ -79,6 +79,66 @@ fn a_retry_resumes_the_same_id_as_the_next_generation() {
     w.fakes.hc_done().unwrap();
 }
 
+/// A member spawned with -Role stores the role's bound tokens in its options and its body in role.md. After the role
+/// file is changed or deleted, retry and fresh relaunch with exactly the stored options: the file is never read again.
+#[test]
+fn a_roles_member_recovers_with_its_stored_options_whatever_became_of_the_role_file() {
+    let options = json!([
+        "--dangerously-skip-permissions",
+        "--effort",
+        "high",
+        "--model=haiku",
+        "--tools=Read,Grep"
+    ]);
+    for action in ["retry", "fresh"] {
+        for changed in [true, false] {
+            let w = person();
+            team(&w);
+            let file = w.ctx.cwd.join(".claude").join("agents").join("x.md");
+            let f = member(
+                &w,
+                X,
+                json!({"parentAgent": {"id": L}, "options": options, "role": "x", "roleFile": file,
+                    "roleClient": "claude", "model": "haiku"}),
+            );
+            failed_ended(&f, 1);
+            std::fs::write(f.join("role.md"), "You review code.\n").unwrap();
+            if changed {
+                std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+                std::fs::write(
+                    &file,
+                    "---\nname: x\nmodel: opus\ntools: Bash\n---\nother\n",
+                )
+                .unwrap();
+            }
+            both_gone(&w);
+            w.fakes.hc_answer(ft::address("t2"));
+            let mut args = vec!["resume", "mbbb"];
+            if action == "fresh" {
+                args.push("-Fresh");
+            }
+            let (code, reply) = cli(&w, &args);
+            assert_eq!(code, 0, "{action} {changed}: {reply}");
+            let s = spec(&f, 2).expect("spec.json");
+            assert_eq!(
+                s["flags"], options,
+                "{action} {changed}: the stored options"
+            );
+            assert_eq!(
+                std::fs::read_to_string(f.join("role.md")).unwrap(),
+                "You review code.\n",
+                "{action} {changed}: role.md kept"
+            );
+            let r = lf::record(&f);
+            for k in ["options", "role", "roleFile", "roleClient"] {
+                assert_ne!(r[k], Value::Null, "{action} {changed}: {k} kept");
+            }
+            assert_eq!(r["options"], options);
+            w.fakes.hc_done().unwrap();
+        }
+    }
+}
+
 /// The new windows a test world opened, each as its argv joined.
 fn new_windows(w: &World) -> Vec<String> {
     (w.fakes.mux_calls().into_iter())
