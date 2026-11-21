@@ -16,7 +16,7 @@ fn a_members_child_takes_its_role_from_where_the_member_started() {
     std::fs::create_dir_all(root.join(".git")).unwrap();
     let role = |body: &str| {
         format!(
-            "---\nname: x\nmodel: haiku\ntools: Read, Grep\npermissionMode: bypassPermissions\nhooks:\n  - audit\nmcpServers:\n  - fs\n---\n{body}\n"
+            "---\nname: x\nmodel: haiku\ntools: Read, Grep\npermissionMode: bypassPermissions\nhooks:\n  PreToolUse:\n    - matcher: Bash\n      hooks:\n        - type: command\n          command: ./check.sh\nmcpServers:\n  github:\n    command: npx\n    args: [\"-y\", \"@x/server\"]\n---\n{body}\n"
         )
     };
     put(

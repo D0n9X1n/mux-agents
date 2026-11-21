@@ -440,8 +440,8 @@ fn declared_name(bytes: &[u8]) -> Option<String> {
     }
 }
 
-const OUTSIDE: &str = "this line is outside what mux-agents reads in a frontmatter: `key: value` lines whose value \
-                       is one plain or quoted scalar, a `[a, b]` list or `- item` lines of them, and # comments";
+const OUTSIDE: &str = "this line is outside what mux-agents reads in a frontmatter: top-level `key:` lines, # comments, \
+                       and for name, model and tools one plain or quoted scalar, a `[a, b]` list or `- item` lines of them";
 
 /// The matched file as spawn uses it: whole (at most 64 KiB), UTF-8, its frontmatter in the subset `front` reads,
 /// and `name`, `model` and `tools`, when present, each a value this can use. Anything else refuses, naming the line.
@@ -561,15 +561,22 @@ struct Front<'a> {
     bad: Option<usize>,
     /// The indent of the `- item` lines under the last key, once its first item is read.
     block: Option<usize>,
+    /// The last key is one this does not use: its block is skipped, never read.
+    skip: bool,
     body: &'a str,
 }
 
-/// The `---` frontmatter of `text` in a strict subset of YAML, read line by line with no recursion, so a value nested
-/// any depth costs one pass over its line: top-level `key: value` lines with a plain (`[A-Za-z_][A-Za-z0-9_.-]*`) or
-/// quoted key; a value that is nothing, one plain or quoted scalar, a one-level `[a, 'b']` list of scalars, or nothing
-/// followed by `- item` lines of scalars at one indent; `#` comments outside quotes; a leading BOM and CRLF. Every
-/// other line is outside the subset: `bad` names the first, and one that continues a key (an indented line, a repeated
-/// key) spoils that key too. A file that does not open with `---` is all body, with no frontmatter; None for a
+/// The keys whose values a role uses; every other key is skipped with its block and listed as ignored.
+const USED: [&str; 3] = ["name", "model", "tools"];
+
+/// The `---` frontmatter of `text`, read line by line with no recursion: top-level `key:` lines with a plain
+/// (`[A-Za-z_][A-Za-z0-9_.-]*`) or quoted key, `#` comments outside quotes, a leading BOM and CRLF. Only the values of
+/// `name`, `model` and `tools` are read, in a strict subset of YAML: nothing, one plain or quoted scalar, a one-level
+/// `[a, 'b']` list of scalars, or nothing followed by `- item` lines of scalars at one indent. Any other key is skipped
+/// with its value and every line after it that is indented (space or tab), a `- item`, blank or a comment, so a nested
+/// map such as `hooks:` is never parsed and a line in it is never read as a key. Every other line is outside the subset:
+/// `bad` names the first, and one that continues a used key (an indented line, a repeated key) spoils that key too; a
+/// repeated key of any kind is outside it, as YAML refuses one. A file that does not open with `---` is all body, with no frontmatter; None for a
 /// frontmatter that never closes. Only a `---` line closes it, so a `---` in the body stays in the body.
 fn front(text: &str) -> Option<Front<'_>> {
     let text = text.strip_prefix('\u{feff}').unwrap_or(text);
@@ -583,6 +590,7 @@ fn front(text: &str) -> Option<Front<'_>> {
         entries: Vec::new(),
         bad: None,
         block: None,
+        skip: false,
         body: text,
     };
     if bare(first) != "---" {
@@ -615,6 +623,11 @@ impl Front<'_> {
         if content.is_empty() || content.starts_with('#') {
             return;
         }
+        // Inside a skipped block: an indented line (space or tab) or a `- item` at column 0 belongs to the key this
+        // does not use, so it is never read, whatever it looks like (`  tools: [Bash]` included).
+        if self.skip && line.starts_with([' ', '\t', '-']) {
+            return;
+        }
         if line.starts_with(' ') || line.starts_with('-') {
             // An indented line or a `- item`: an item of the list under the last key, else outside the subset.
             let indent = line.len() - content.len();
@@ -639,10 +652,18 @@ impl Front<'_> {
             return;
         }
         self.block = None;
+        self.skip = false;
         let Some((key, rest)) = key_of(line) else {
             return self.fail(number, false);
         };
-        let value = value_of(rest);
+        // A key this does not use: its value and its block are skipped, never parsed.
+        let used = USED.contains(&key.as_str());
+        self.skip = !used;
+        let value = if used {
+            value_of(rest)
+        } else {
+            Some(Field::Empty)
+        };
         // A repeated key: YAML refuses it, so neither is read.
         let repeated = self.entries.iter_mut().find(|e| e.key == key);
         let bad = value.is_none() || repeated.is_some();
@@ -834,7 +855,7 @@ mod tests {
         (e.code, e.check)
     }
 
-    const X: &str = "---\nname: x\nmodel: haiku\ntools: Read, Grep\npermissionMode: bypassPermissions\nhooks:\n  - audit\nmcpServers:\n  - fs\n---\nYou review code.\n";
+    const X: &str = "---\nname: x\nmodel: haiku\ntools: Read, Grep\npermissionMode: bypassPermissions\nhooks:\n  PreToolUse:\n    - matcher: Bash\n      hooks:\n        - type: command\n          command: ./check.sh\nmcpServers:\n  github:\n    command: npx\n    args: [\"-y\", \"@x/server\"]\n---\nYou review code.\n";
 
     #[test]
     fn a_role_name_is_a_plain_token_with_at_most_one_colon() {
@@ -1195,6 +1216,17 @@ mod tests {
             fx.get(Client::Claude, &fx.work(), "x").unwrap().body,
             "mine\n"
         );
+        // A key this does not use is skipped with its block and never read: `other` resolves.
+        let other = fx.get(Client::Claude, &fx.work(), "other").unwrap();
+        assert_eq!(
+            (other.body.as_str(), other.ignored.clone()),
+            ("other\n", v(&["ignored"]))
+        );
+        // Under `tools`, which is read, the same value refuses, naming its line.
+        fx.put(
+            &agents.join("a.md"),
+            &format!("---\nname: other\ntools: {deep}\n---\nother\n"),
+        );
         let e = fx.get(Client::Claude, &fx.work(), "other").unwrap_err();
         assert_eq!((e.code, e.check), (2, "role"));
         let shown = show(&agents.join("a.md"));
@@ -1293,9 +1325,10 @@ mod tests {
             ("model: [haiku]", 3),
             ("model: {a: b}", 3),
             ("model: &m haiku", 3),
-            ("description: a: b", 3),
+            ("model:\n  a: b", 4),
+            ("tools:\n  a:\n    - b", 4),
             ("tools: Read\ntools: Grep", 4),
-            ("hooks:\n  Stop:\n    - command: x", 4),
+            ("hooks:\n  a: b\nhooks:\n  c: d", 5),
             ("? tools", 3),
             ("\ttools: Read", 3),
             ("tools : Read", 3),
@@ -1339,6 +1372,49 @@ mod tests {
                 (2, "role"),
                 "{bad}"
             );
+        }
+    }
+
+    // A key this does not use is skipped with every line indented under it, never read: a real agent file with nested
+    // `hooks` and `mcpServers` maps resolves, and both are listed as ignored.
+    #[test]
+    fn a_real_agent_file_with_nested_maps_resolves() {
+        let fx = Fx::new();
+        fx.put(
+            &fx.work().join(".claude").join("agents").join("x.md"),
+            "---\nname: x\ndescription: Use when: reviewing code. <example>a: b</example>\nmodel: sonnet\ntools: Read, Grep, Bash(git:*)\nhooks:\n  PreToolUse:\n    - matcher: Bash\n      hooks:\n        - type: command\n          command: \"./check.sh\"\n\n  Stop: [{type: command, command: x}]\nmcpServers:\n  github:\n    command: npx\n    args: [\"-y\", \"@x/server\"]\n    env: {TOKEN: \"${T}\"}\nskills:\n- review\npermissionMode: bypassPermissions\n---\nYou review code.\n",
+        );
+        let s = fx.get(Client::Claude, &fx.work(), "x").unwrap();
+        assert_eq!(s.model.as_deref(), Some("sonnet"));
+        assert_eq!(s.tools, Some(v(&["Read", "Grep", "Bash(git:*)"])));
+        assert_eq!(
+            s.ignored,
+            v(&["hooks", "mcpServers", "skills", "permissionMode"])
+        );
+        assert_eq!(s.body, "You review code.\n");
+    }
+
+    // A line inside a skipped block is never read as a key: an indented `tools:` or `model:` under `hooks` changes
+    // nothing, whatever its indent.
+    #[test]
+    fn a_skipped_block_never_sets_the_roles_tools_or_model() {
+        let fx = Fx::new();
+        let path = fx.work().join(".claude").join("agents").join("x.md");
+        for (front, tools) in [
+            (
+                "hooks:\n  tools: [Bash]\n  model: opus\ntools: Read",
+                Some(v(&["Read"])),
+            ),
+            (
+                "tools: Read\nhooks:\n  tools: [Bash]\n\t- Bash\n-  tools: Bash",
+                Some(v(&["Read"])),
+            ),
+            ("hooks:\n    tools: [Bash]\n  - model: opus", None),
+        ] {
+            fx.put(&path, &format!("---\nname: x\n{front}\n---\nbody\n"));
+            let s = fx.get(Client::Claude, &fx.work(), "x").unwrap();
+            assert_eq!((s.tools, s.model), (tools, None), "{front}");
+            assert_eq!(s.ignored, v(&["hooks"]), "{front}");
         }
     }
 
