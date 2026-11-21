@@ -369,6 +369,7 @@ fn launch(
             split: None,
             resume: None,
             leader: Some(&leader),
+            role: None,
         };
         launch_hc_locked(ctx, &dest, core, request, |_| {
             Ok(CoreSlot {

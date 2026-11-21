@@ -128,6 +128,7 @@ pub fn spawn(ctx: &Ctx, request: &Request) -> Res<Map<String, Value>> {
     let split = request.value("Split");
     let tab = request.switch("Tab");
     let model = request.value("Model");
+    let role = request.value("Role");
     let one_task = request.value("Task").is_some() != request.value("TaskFile").is_some();
     let Some(client) = request.value("Client").and_then(client_named) else {
         return Err(usage("spawn"));
@@ -136,6 +137,7 @@ pub fn spawn(ctx: &Ctx, request: &Request) -> Res<Map<String, Value>> {
         || !split.is_none_or(|s| s == "h" || s == "v")
         || (tab && split.is_some())
         || !model.is_none_or(model_name)
+        || !role.is_none_or(super::role::valid_name)
     {
         return Err(usage("spawn"));
     }
@@ -183,6 +185,15 @@ pub fn spawn(ctx: &Ctx, request: &Request) -> Res<Map<String, Value>> {
     } else {
         ctx.cwd.clone()
     };
+    // A role is read once, from the folder the child starts in, before any hc call, pane or record: what it cannot
+    // give refuses here, and resume, recovery and restore replay the stored options, never the file.
+    let role = role
+        .map(|name| {
+            let folder = launch_folder(ctx, &caller, outside, &directory);
+            super::role::resolve(&ctx.home, &folder, client, name)
+        })
+        .transpose()?
+        .map(|snapshot| snapshot.bind(model.is_some()));
     // After every check of the caller, before the lock: a read that fails is the default, never a refusal.
     let (placement, source) = match (split, tab) {
         (Some(split), _) => (split, "flag"),
@@ -206,6 +217,7 @@ pub fn spawn(ctx: &Ctx, request: &Request) -> Res<Map<String, Value>> {
             split: (placement != DEFAULT_PLACEMENT).then_some(placement),
             resume: None,
             leader: None,
+            role: role.as_ref(),
         },
         |core| {
             let gate = match super::tree::team_of(ctx, &caller)? {
@@ -306,7 +318,12 @@ pub fn spawn(ctx: &Ctx, request: &Request) -> Res<Map<String, Value>> {
     ] {
         reply.insert(key.into(), record[key].clone());
     }
+    let model = model.or(role.as_ref().and_then(|r| r.model.as_deref()));
     reply.insert("model".into(), model.unwrap_or("inherited").into());
+    if let Some(role) = &role {
+        reply.insert("role".into(), role.snapshot.name.clone().into());
+        reply.insert("roleIgnored".into(), json!(role.ignored));
+    }
     reply.insert("placement".into(), placement.into());
     reply.insert("placementSource".into(), source.into());
     keep_bar(ctx, &caller, &record, &mut reply);
@@ -314,6 +331,26 @@ pub fn spawn(ctx: &Ctx, request: &Request) -> Res<Map<String, Value>> {
     reply.extend(view_reply(&record));
     reply.insert("hcAddress".into(), record["hcAddress"].clone());
     Ok(reply)
+}
+
+/// The folder the child starts in, as admission places it: a member's child where the member started (its record's
+/// `directory`), any other child in `directory`. Local records only, so a role resolves before any hc call; the
+/// launch checks the folder again.
+fn launch_folder(ctx: &Ctx, caller: &Caller, outside: bool, directory: &Path) -> PathBuf {
+    let key = super::scope::state(caller).key.clone();
+    let recorded = (caller.member.as_ref())
+        .or(caller.candidate.as_ref())
+        .filter(|_| !outside)
+        .and_then(|id| {
+            crate::caller::hc::within_root(&ctx.state_root, &[&key, "agents", id, "record.json"])
+        })
+        .and_then(|p| crate::state::fs::read_json(&p).ok().flatten())
+        .and_then(|r| {
+            r.get("directory")
+                .and_then(Value::as_str)
+                .map(PathBuf::from)
+        });
+    recorded.unwrap_or_else(|| directory.to_path_buf())
 }
 
 /// The post-commit bar step spawn and resume share: the agent is committed and the spawn lock released, so the bar
@@ -363,6 +400,8 @@ struct Launch<'a> {
     brief: Option<String>,
     directory: PathBuf,
     placed: Option<super::tree::Placed>,
+    // A role's snapshot and the tokens it binds after `flags`.
+    role: Option<&'a super::role::Bound>,
 }
 
 /// The agent being started.
@@ -443,8 +482,13 @@ impl Launch<'_> {
         record["color"] = agent.color.into();
         // The exact command the pane started, as the multiplexer renders it: the agent is the pane running it.
         record["startCommand"] = start_command.into();
-        // No model is the client's own; a chosen one is the record's last field.
-        if let Some(model) = self.model {
+        if let Some(role) = self.role {
+            record["role"] = role.snapshot.name.clone().into();
+            record["roleFile"] = utf8(&role.snapshot.path)?.into();
+            record["roleClient"] = client_name(role.snapshot.client).into();
+        }
+        // No model is the client's own; a chosen one (-Model, else the role's) is the record's last field.
+        if let Some(model) = self.model.or(self.role.and_then(|r| r.model.as_deref())) {
             record["model"] = model.into();
         }
         Ok(record)
@@ -461,7 +505,7 @@ impl Launch<'_> {
             id: &agent.id,
             client: self.client,
         };
-        let lines = header(
+        let mut lines = header(
             ctx,
             self.caller,
             &me,
@@ -469,6 +513,15 @@ impl Launch<'_> {
             brief_path.as_deref(),
             transcript.as_deref(),
         )?;
+        // A role's body is the standing brief, as -BriefFile's is: named in the first turn, ahead of the task.
+        let role_path = self.role.map(|_| agent.folder.join("role.md"));
+        if let (Some(path), Some(role)) = (&role_path, self.role) {
+            lines.push(format!(
+                "Role: {}; your standing brief is {}; read it before the task.",
+                role.snapshot.name,
+                path.to_string_lossy().replace('\\', "/")
+            ));
+        }
         // notebook-7b V1: the notebook block after the header; the caller holds the team (spawn) lock.
         let block = super::notebook::news::index(ctx, &super::notebook::anchor(self.caller));
         let prompt = format!("{}\n{block}\n\n{}", lines.join("\n"), self.task);
@@ -480,7 +533,18 @@ impl Launch<'_> {
             Context::Brief => Recipe::First(Some(&prompt)),
         };
         let args = client_args(self.client, recipe, &agent.session, self.model);
-        let mut argv: Vec<&str> = self.flags.iter().map(String::as_str).collect();
+        if let Some(role) = self.role {
+            if role.snapshot.folder != self.directory {
+                return refuse(
+                    2,
+                    "role",
+                    "the child starts in another folder than the role was read from",
+                );
+            }
+            super::role::admit(self.client, &self.flags, &role.tokens, &args)?;
+        }
+        let flags = self.all_flags();
+        let mut argv: Vec<&str> = flags.iter().map(String::as_str).collect();
         argv.extend(args.iter().map(String::as_str));
         if EXE_RESERVE + cmdline_length(&argv) > CMDLINE_MAX {
             return refuse(2, "usage", "task is too long for the client command line");
@@ -489,6 +553,9 @@ impl Launch<'_> {
         if let (Some(path), Some(brief)) = (&brief_path, &self.brief) {
             std::fs::write(path, brief)?;
         }
+        if let (Some(path), Some(role)) = (&role_path, self.role) {
+            std::fs::write(path, &role.snapshot.body)?;
+        }
         let state = agent
             .folder
             .parent()
@@ -496,7 +563,7 @@ impl Launch<'_> {
             .ok_or_else(|| Refusal::internal("the agent folder has no state folder"))?;
         Ok(
             json!({"schema": 1, "stateDirectory": utf8(state)?, "id": agent.id,
-            "client": client_name(self.client), "flags": self.flags,
+            "client": client_name(self.client), "flags": flags,
             "parentPane": self.placed.as_ref().map_or(self.caller.pane.as_str(), |p| p.parent_pane.as_str()), "args": args,
             "prompt": prompt}),
         )
@@ -815,7 +882,7 @@ mod tests {
         w
     }
 
-    fn human() -> World {
+    pub(super) fn human() -> World {
         ready(World::human(""))
     }
 
@@ -834,6 +901,7 @@ mod tests {
             brief: None,
             directory: w.ctx.cwd.clone(),
             placed: None,
+            role: None,
         };
         let a = launch
             .allocate(&w.state(), "worker".into(), "blue")
@@ -960,6 +1028,7 @@ mod tests {
                 split: None,
                 resume: None,
                 leader: None,
+                role: None,
             },
             |_| {
                 Ok(CoreSlot {
@@ -1047,7 +1116,7 @@ mod tests {
         }
     }
 
-    fn empty_launch(w: &World) {
+    pub(super) fn empty_launch(w: &World) {
         public_snapshot(w, &[], &[]);
         public_launch(w, "t1");
     }
@@ -1103,7 +1172,7 @@ mod tests {
         }
     }
 
-    fn run(w: &World, args: &[&str]) -> String {
+    pub(super) fn run(w: &World, args: &[&str]) -> String {
         let mut full = vec!["spawn"];
         full.extend(args);
         let result = spawn(&w.ctx, &w.request(&full));
@@ -1119,7 +1188,7 @@ mod tests {
         w.fakes.mux_calls().iter().map(|c| c[1].clone()).collect()
     }
 
-    fn calls(w: &World, verb: &str) -> Vec<Vec<String>> {
+    pub(super) fn calls(w: &World, verb: &str) -> Vec<Vec<String>> {
         w.fakes
             .mux_calls()
             .into_iter()
@@ -1137,11 +1206,11 @@ mod tests {
     }
 
     // `<root>/<serverKey>/agents`; asking for the key probes the caller once more.
-    fn agents_dir(w: &World) -> PathBuf {
+    pub(super) fn agents_dir(w: &World) -> PathBuf {
         w.ctx.state_root.join(w.caller().server_key).join("agents")
     }
 
-    fn agent_folders(w: &World) -> Vec<String> {
+    pub(super) fn agent_folders(w: &World) -> Vec<String> {
         match std::fs::read_dir(agents_dir(w)) {
             Ok(entries) => entries
                 .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
@@ -1150,11 +1219,11 @@ mod tests {
         }
     }
 
-    fn reply(text: &str) -> Value {
+    pub(super) fn reply(text: &str) -> Value {
         serde_json::from_str(text.strip_prefix("ok ").expect(text)).unwrap()
     }
 
-    fn read_json(path: &Path) -> Value {
+    pub(super) fn read_json(path: &Path) -> Value {
         serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap()
     }
 
@@ -3914,6 +3983,8 @@ mod tests {
 
 #[cfg(test)]
 mod hc_tests;
+#[cfg(test)]
+mod role_tests;
 pub struct CoreRequest<'a> {
     pub client: Client,
     pub task: &'a str,
@@ -3927,6 +3998,8 @@ pub struct CoreRequest<'a> {
     pub resume: Option<&'a Resumed>,
     /// Some for `up`'s leader: no parent, depth 0, its team's label.
     pub leader: Option<&'a super::leader::Leader>,
+    /// Some for `spawn -Role`: the snapshot read before the launch and the tokens it binds.
+    pub role: Option<&'a super::role::Bound>,
 }
 pub struct CoreSlot {
     pub name: String,
@@ -3985,6 +4058,7 @@ pub fn launch_hc_locked(
             .and_then(|p| p.directory.as_deref())
             .map_or_else(|| request.directory.into(), PathBuf::from),
         placed,
+        role: request.role,
     };
     let l = match (request.resume, request.leader) {
         (Some(resumed), _) => launch.prepare_resumed(slot, resumed)?,
@@ -4036,9 +4110,19 @@ pub(crate) fn view_reply(record: &Value) -> Map<String, Value> {
     reply
 }
 impl Launch<'_> {
-    /// E1, ambiguity 10: the stored options: the flags, then the selected model, so a relaunch replays both.
+    /// The launch flags, then a role's bound tokens: what the child runs with.
+    fn all_flags(&self) -> Vec<String> {
+        let mut flags = self.flags.clone();
+        if let Some(role) = self.role {
+            flags.extend(role.tokens.iter().cloned());
+        }
+        flags
+    }
+
+    /// E1, ambiguity 10: the stored options: the flags (with a role's tokens), then the selected model, so a
+    /// relaunch replays both.
     fn options(&self) -> Vec<String> {
-        let mut options = self.flags.clone();
+        let mut options = self.all_flags();
         if let Some(model) = self.model {
             options.extend(["--model".to_string(), model.to_string()]);
         }

@@ -29,6 +29,7 @@ fn request(w: &World) -> CoreRequest<'_> {
         split: None,
         resume: None,
         leader: None,
+        role: None,
     }
 }
 fn slot(_: &crate::hc::Core<'_>) -> Res<CoreSlot> {

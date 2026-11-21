@@ -227,6 +227,7 @@ fn the_first_list_after_a_natural_exit_shows_the_recorded_end() {
             split: None,
             resume: None,
             leader: None,
+            role: None,
         };
         let r = launch_hc(&w.ctx, &c, request, |_| {
             Ok(CoreSlot {

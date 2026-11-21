@@ -103,7 +103,7 @@ pub fn resolve(home: &Path, folder: &Path, client: Client, name: &str) -> Res<Sn
             0 => continue,
             1 => {
                 let (path, bytes) = found.remove(0);
-                return load(&path, bytes, bare, folder, client);
+                return load(&path, bytes, name, folder, client);
             }
             _ => {
                 let files: Vec<String> = found.iter().map(|(p, _)| show(p)).collect();
@@ -320,11 +320,7 @@ fn markdown(dir: &Path, deep: bool) -> Vec<PathBuf> {
     for e in entries {
         let path = e.path();
         match e.file_type() {
-            Ok(kind) if kind.is_dir() => {
-                if deep {
-                    out.extend(markdown(&path, true));
-                }
-            }
+            Ok(kind) if kind.is_dir() && deep => out.extend(markdown(&path, true)),
             Ok(_) if path.extension().is_some_and(|x| x == "md") && path.is_file() => {
                 out.push(path)
             }

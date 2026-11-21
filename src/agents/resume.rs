@@ -175,6 +175,7 @@ pub(crate) fn resume_target(
                 split,
                 resume: Some(&resumed),
                 leader: None,
+                role: None,
             },
             |_| {
                 Ok(CoreSlot {

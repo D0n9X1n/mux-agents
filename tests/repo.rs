@@ -1556,6 +1556,16 @@ const TEST_ONLY: &[(&str, &str, &str)] = &[
         "life_guard_tests",
     ),
     (
+        "src/agents/spawn/role_tests.rs",
+        "src/agents/spawn.rs",
+        "role_tests",
+    ),
+    (
+        "src/agents/tree/tests/role_tests.rs",
+        "src/agents/tree/tests.rs",
+        "role_tests",
+    ),
+    (
         "src/agents/spawn/hc_tests/race.rs",
         "src/agents/spawn/hc_tests.rs",
         "race",

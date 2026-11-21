@@ -13,6 +13,8 @@ use crate::proc::Row;
 use serde_json::Map;
 use serde_json::json;
 use std::path::PathBuf;
+#[cfg(test)]
+mod role_tests;
 pub(crate) const LEADER: &str = "111111111111";
 pub(crate) fn team_record(w: &World, flags: &[&str]) {
     let flags: Vec<String> = flags.iter().map(|f| f.to_string()).collect();
