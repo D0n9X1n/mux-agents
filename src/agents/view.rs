@@ -138,7 +138,7 @@ pub(crate) fn first(request: &Request) -> &str {
 /// The running agent the caller is, for `status` and `report`: a member proven through its own hc terminal by its id
 /// (refused once it ended or has an end notice), else a running agent's own pane as one snapshot shows it, never its
 /// tag; none for a human.
-fn own_agent(ctx: &Ctx, caller: &Caller) -> Res<Option<registry::Me>> {
+pub(crate) fn own_agent(ctx: &Ctx, caller: &Caller) -> Res<Option<registry::Me>> {
     if let Some(me) = super::membership::proven_self(ctx, caller) {
         return me.map(Some);
     }

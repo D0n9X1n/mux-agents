@@ -7,7 +7,7 @@ use crate::{
     ctx::Env,
 };
 use serde_json::{Value, json};
-fn worker() -> (World, caller::Caller, Value, std::path::PathBuf) {
+pub(crate) fn worker() -> (World, caller::Caller, Value, std::path::PathBuf) {
     let mut w = World::agent("");
     let c = w.caller();
     let r = cf::member(
@@ -31,13 +31,13 @@ fn worker() -> (World, caller::Caller, Value, std::path::PathBuf) {
     w.fakes.clear_log();
     (w, c, r, folder)
 }
-fn wire(r: &Value) -> Value {
+pub(crate) fn wire(r: &Value) -> Value {
     let mut t = cf::wire(r);
     t["pid"] = 31337.into();
     t["foreground"] = json!({"argv": ["claude"], "pid": 150});
     t
 }
-fn proof(w: &World, r: &Value) {
+pub(crate) fn proof(w: &World, r: &Value) {
     cf::online(w);
     cf::get(w, r["hcAddress"].as_str().unwrap(), wire(r));
 }

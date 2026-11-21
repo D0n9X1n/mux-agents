@@ -156,6 +156,62 @@ fn notify(ctx: &Ctx, caller: &Caller, p: &Published) -> Res<()> {
     }
 }
 
+/// `answer <pingId> -BodyFile <path>`: the pinged member's own reply, never mail (a reply by `send -Re` cannot reach a
+/// person and names no ping).
+pub fn answer(ctx: &Ctx, request: &Request) -> Res<Map<String, Value>> {
+    let Some(body_file) = request.value("BodyFile") else {
+        return Err(super::usage("answer"));
+    };
+    let caller = crate::caller::resolve(ctx)?;
+    answer_as(ctx, &caller, super::view::first(request), body_file)
+}
+
+/// `answer` for a resolved caller: only a running member itself (as `status` proves it), and only for the open ping
+/// its own folder holds. Under its agent lock it writes `status.json` (the doing line shows the answer), then
+/// `answer.json {ping, text, at}`, which closes the ping; a retry after a crash between the two finds it still open.
+pub(crate) fn answer_as(
+    ctx: &Ctx,
+    caller: &Caller,
+    id: &str,
+    body_file: &str,
+) -> Res<Map<String, Value>> {
+    let Some(me) = super::view::own_agent(ctx, caller)? else {
+        return refuse(2, "target", "only a member answers a ping");
+    };
+    let raw = crate::state::fs::read_text(&ctx.cwd.join(body_file), crate::state::fs::BODY_MAX)?;
+    let text = super::mail::doing_line(&raw);
+    if text.is_empty() {
+        return refuse(2, "usage", "the answer is empty");
+    }
+    let generation = (me.record.as_ref())
+        .and_then(|r| r.get("generation"))
+        .cloned()
+        .unwrap_or(Value::Null);
+    let folder = super::state_dir(ctx, caller)?.join("agents").join(&me.key);
+    let at = utc_o(ctx.clock.now());
+    super::lock(ctx, &super::lock_key("agent", caller, &me.key), || {
+        if open(&folder, &generation).is_none_or(|o| o.id != id) {
+            return refuse(2, "ping", "no open ping with that id");
+        }
+        crate::state::fs::write_json(
+            &folder.join("status.json"),
+            &json!({"text": text, "at": at}),
+        )?;
+        crate::state::fs::write_json_durable(
+            &folder.join("answer.json"),
+            &json!({"ping": id, "text": text, "at": at}),
+        )?;
+        // An answer is work, as a status is: the member no longer waits.
+        super::message::prune_leases(ctx, &folder);
+        Ok(())
+    })?;
+    let mut reply = Map::new();
+    reply.insert("name".into(), me.name.into());
+    reply.insert("ping".into(), id.into());
+    reply.insert("text".into(), text.into());
+    Ok(reply)
+}
+
 /// Marks the record `sent` only while it is still this ping of this generation: one replaced meanwhile (a newer ping,
 /// a new generation) is left as it is.
 fn confirm(ctx: &Ctx, caller: &Caller, p: &Published) -> Res<()> {

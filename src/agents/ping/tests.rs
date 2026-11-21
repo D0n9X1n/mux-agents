@@ -161,3 +161,212 @@ fn a_non_leader_member_an_unknown_and_an_ended_name_are_refused() {
         assert!(inbox(&w, A).is_empty(), "{name}");
     }
 }
+
+fn as_member(w: &World, id: &str) -> crate::caller::Caller {
+    let mut c = w.caller();
+    c.member = Some(id.into());
+    c
+}
+
+fn file(folder: &std::path::Path, name: &str) -> Value {
+    crate::state::fs::read_json(&folder.join(name))
+        .unwrap()
+        .unwrap()
+}
+
+fn said(e: crate::error::Refusal) -> String {
+    format!("{} {} {}", e.code, e.check, e.message)
+}
+
+// Behaviour 3: the member's own `answer <id>` closes the ping, and its text is the member's status; an older ping's id
+// answers nothing. Answered is the id match, never a clock: at the ping's own instant and with its `askedAt` ahead of
+// the clock (the clock moved backward) alike.
+#[test]
+fn the_members_answer_closes_the_ping_and_an_older_id_does_not() {
+    let w = team_world();
+    online(&w);
+    online(&w);
+    let first = ping(&w, "ma1")["id"].as_str().unwrap().to_string();
+    w.file("a.md", b"tests green; opening the PR\nmore\n");
+    online(&w);
+    let got = answer_as(&w.ctx, &as_member(&w, A), &first, "a.md").unwrap();
+    w.fakes.hc_done().unwrap();
+    assert_eq!(
+        (
+            got["name"].clone(),
+            got["ping"].clone(),
+            got["text"].clone()
+        ),
+        (
+            json!("ma1"),
+            json!(first),
+            json!("tests green; opening the PR")
+        )
+    );
+    let folder = w.folder(A);
+    assert_eq!(file(&folder, "answer.json")["ping"], json!(first));
+    assert_eq!(
+        file(&folder, "answer.json")["text"],
+        "tests green; opening the PR"
+    );
+    assert_eq!(
+        file(&folder, "status.json")["text"],
+        "tests green; opening the PR"
+    );
+    assert_eq!(
+        open(&folder, &json!("0")),
+        None,
+        "answered at the ping's own instant"
+    );
+    // A new ping after the answer is a new id; the old id answers nothing and leaves it open.
+    online(&w);
+    online(&w);
+    let second = ping(&w, "ma1")["id"].as_str().unwrap().to_string();
+    assert_ne!(second, first);
+    online(&w);
+    let e = answer_as(&w.ctx, &as_member(&w, A), &first, "a.md").unwrap_err();
+    assert_eq!(said(e), "2 ping no open ping with that id");
+    assert_eq!(
+        open(&folder, &json!("0")).map(|o| o.id),
+        Some(second.clone())
+    );
+    // Its askedAt an hour ahead of the clock (the clock moved backward): its own id still closes it.
+    let mut r = file(&folder, "ping.json");
+    r["askedAt"] = json!(utc_o(
+        w.ctx.clock.now() + std::time::Duration::from_secs(3600)
+    ));
+    crate::state::fs::write_json(&folder.join("ping.json"), &r).unwrap();
+    online(&w);
+    answer_as(&w.ctx, &as_member(&w, A), &second, "a.md").unwrap();
+    assert_eq!(
+        open(&folder, &json!("0")),
+        None,
+        "answered with the clock behind it"
+    );
+    w.fakes.hc_done().unwrap();
+}
+
+// Behaviour 2: another member, an unknown id, a person and `-Body` cannot answer; the ping stays open.
+#[test]
+fn another_member_an_unknown_id_a_person_and_body_cannot_answer() {
+    use crate::agents::team_mail::tests::B;
+    let w = team_world();
+    online(&w);
+    online(&w);
+    let id = ping(&w, "ma1")["id"].as_str().unwrap().to_string();
+    w.file("a.md", b"done");
+    online(&w);
+    let e = answer_as(&w.ctx, &as_member(&w, B), &id, "a.md").unwrap_err();
+    assert_eq!(
+        said(e),
+        "2 ping no open ping with that id",
+        "another member"
+    );
+    online(&w);
+    let e = answer_as(&w.ctx, &as_member(&w, A), "ffffffffffffffff", "a.md").unwrap_err();
+    assert_eq!(said(e), "2 ping no open ping with that id", "an unknown id");
+    let e = answer_as(&w.ctx, &w.caller(), &id, "a.md").unwrap_err();
+    assert_eq!(said(e), "2 target only a member answers a ping", "a person");
+    let (code, got) = run(&w, &["answer", &id, "-Body", "done"]);
+    assert_eq!(
+        (code, got["check"].clone(), got["message"].clone()),
+        (
+            2,
+            json!("usage"),
+            json!("usage: mux-agent answer <pingId> -BodyFile <path> [-Text]")
+        )
+    );
+    let (code, got) = run(&w, &["answer", &id]);
+    assert_eq!(
+        (code, got["check"].clone()),
+        (2, json!("usage")),
+        "no -BodyFile"
+    );
+    assert_eq!(open(&w.folder(A), &json!("0")).map(|o| o.id), Some(id));
+    assert!(!w.folder(A).join("answer.json").exists());
+    assert!(!w.folder(B).join("answer.json").exists());
+    w.fakes.hc_done().unwrap();
+}
+
+// Behaviour 3: the member's status, its `report idle`, its sends (to the person, with and without -Re; to the leader
+// and a sibling in a team) and its reading and acking the notice never answer the ping.
+#[test]
+fn status_report_sends_and_reading_the_notice_never_answer() {
+    use crate::caller_hc_tests::{proof, wire, worker};
+    let (w, c, r, folder) = worker();
+    w.file("body.txt", b"hello");
+    let generation = r["generation"].clone();
+    let asked = "0123456789abcdef";
+    crate::state::fs::write_json(
+        &folder.join("ping.json"),
+        &json!({"id": asked, "askedAt": utc_o(w.ctx.clock.now()), "by": null, "generation": generation, "sent": true}),
+    )
+    .unwrap();
+    let notice = "1111111111111111";
+    crate::agents::mail::deliver_once(
+        &w.ctx,
+        &c,
+        &crate::agents::mail::member_mailbox(crate::agents::fixture::ID, &r),
+        &json!({"id": notice, "from": "root", "pane": "%1", "at": "x",
+            "body": format!("Status? Answer with: mux-agent answer {asked} -BodyFile <file>"),
+            "fromBox": "pane-1", "re": null, "hop": 0, "cast": null}),
+    )
+    .unwrap();
+    let address = r["hcAddress"].as_str().unwrap();
+    let mut batch = String::new();
+    for args in [
+        vec!["status", "-BodyFile", "body.txt"],
+        vec!["report", "idle"],
+        vec!["send", "parent", "-BodyFile", "body.txt"],
+        vec!["send", "parent", "-BodyFile", "body.txt", "-Re", notice],
+        vec!["read"],
+        vec!["read", "-Ack", "<batch>"],
+    ] {
+        proof(&w, &r);
+        proof(&w, &r);
+        crate::agents::core_fixture::online(&w);
+        crate::agents::core_fixture::listing(&w, &crate::agents::membership::team(&c), &[address]);
+        crate::agents::core_fixture::get(&w, address, wire(&r));
+        if args[0] == "read" {
+            crate::agents::core_fixture::online(&w);
+            crate::agents::core_fixture::get(&w, address, wire(&r));
+        }
+        let args: Vec<String> = args.iter().map(|a| a.replace("<batch>", &batch)).collect();
+        let (code, out) = crate::cli::run(&args, || Ok(&w.ctx));
+        assert_eq!(code, 0, "{args:?}: {out}");
+        let out: Value = serde_json::from_str(&out).unwrap();
+        if let Some(b) = out.get("batch").and_then(Value::as_str) {
+            batch = b.into();
+        }
+        assert_eq!(
+            open(&folder, &generation).map(|o| o.id),
+            Some(asked.into()),
+            "{args:?}"
+        );
+        w.fakes.hc_done().unwrap();
+    }
+    assert!(!batch.is_empty(), "the notice was read");
+    // In a team: sends to the leader and to another member, and a reply to the leader's message.
+    let w = team_world();
+    online(&w);
+    online(&w);
+    let id = ping(&w, "ma1")["id"].as_str().unwrap().to_string();
+    let leader = crate::agents::tree::tests::LEADER;
+    crate::agents::mail::deliver_once(&w.ctx, &w.caller(), A, &json!({"id": "2222222222222222", "from": "leader",
+        "fromId": leader, "pane": "%4", "at": "x", "body": "q", "fromBox": leader, "re": null, "hop": 0, "cast": null}))
+    .unwrap();
+    for args in [
+        &["send", "leader", "-Body", "x"][..],
+        &["send", "mb2", "-Body", "x"],
+        &["send", "leader", "-Body", "x", "-Re", "2222222222222222"],
+    ] {
+        online(&w);
+        crate::agents::message::send_as(&w.ctx, &as_member(&w, A), &w.request(args)).unwrap();
+        w.fakes.hc_done().unwrap();
+        assert_eq!(
+            open(&w.folder(A), &json!("0")).map(|o| o.id),
+            Some(id.clone()),
+            "{args:?}"
+        );
+    }
+}
