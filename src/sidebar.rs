@@ -2507,6 +2507,7 @@ impl Elapsed {
                 ("age", "createdAt"),
                 ("since", "changedAt"),
                 ("endedAgo", ""),
+                ("pingedAgo", "pingedAt"),
             ] {
                 let Some(seconds) = row.get(field).and_then(Value::as_u64) else {
                     continue;
@@ -10191,6 +10192,35 @@ mod tests {
             "end rounding agrees with an inline read at the frame clock"
         );
         w.fakes.hc_done().unwrap();
+    }
+
+    // An open ping's age is an elapsed value like the others: drawn on the tick's frame clock from its own `pingedAt`,
+    // so a reader answer between ticks cannot move `pinged 4m` and write a frame of its own.
+    #[test]
+    fn a_pings_age_is_drawn_on_the_frame_clock_from_its_pinged_at() {
+        let at = SystemTime::UNIX_EPOCH + Duration::from_millis(10900);
+        let board = json!({"running":1,"agents":[
+            {"id":ID,"pingedAgo":3,"pingedAt":"1970-01-01T00:00:07.100Z"},
+            {"id":"untimed","pingedAgo":3}
+        ]})
+        .as_object()
+        .unwrap()
+        .clone();
+        let elapsed = Elapsed {
+            at,
+            ended: Default::default(),
+        };
+        let later = elapsed.at_frame(&board, at + Duration::from_millis(400));
+        assert_eq!(
+            later["agents"][0]["pingedAgo"], 4,
+            "counted from pingedAt, its fraction kept"
+        );
+        assert_eq!(
+            later["agents"][1]["pingedAgo"], 3,
+            "without pingedAt, shifted by the whole seconds since the read"
+        );
+        let much_later = elapsed.at_frame(&board, at + Duration::from_secs(5));
+        assert_eq!(much_later["agents"][0]["pingedAgo"], 8);
     }
 
     #[test]
