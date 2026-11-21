@@ -27,14 +27,15 @@ const RELEASE: Duration = Duration::from_secs(1);
 /// every start under this lock, no harness child starts inside another harness call's pipe window.
 static SPAWNING: Mutex<()> = Mutex::new(());
 
-/// `command.spawn()` under `SPAWNING`. Every child a harness starts goes through here, so no start lands inside
-/// another's pipe window. The lock is held only for the start itself, never while the child runs.
+/// `command.spawn()` under `SPAWNING`, so no start lands inside another's pipe window. The lock is held for the start
+/// itself, never while the child runs.
 pub fn start(command: &mut Command) -> io::Result<Child> {
     let _alone = spawning();
     command.spawn()
 }
 
-/// The lock `start` holds, for a test that proves a start waits for it.
+/// The lock `start` holds. A start that does not go through `start` holds it itself: `PrivateCore::installed` holds it
+/// across its library `hc --version` probe, its two tries included. A test holds it to prove a start waits for it.
 pub fn spawning() -> MutexGuard<'static, ()> {
     SPAWNING
         .lock()
