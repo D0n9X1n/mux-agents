@@ -4285,6 +4285,13 @@ hc {}:
         assert_eq!(json_file(&marker)["kind"], "exited");
         assert_eq!(exit_messages(&live, &w1).len(), 1);
     }
+    /// Enter on the bar's selected ended row: the bar runs `resume` for it. A test that resumes this way calls this
+    /// helper, so `serial_resume` lists it to run alone: a parallel test's short-lived fake client would otherwise be
+    /// taken for a holder of the resumed conversation and refuse it.
+    fn resume_through_bar(live: &Live, bar: &str) {
+        live.call(&["send-keys", "-t", bar, "Enter"]);
+    }
+
     // Enter on an ended agent's row resumes it off the bar's loop, on the bar's real worker thread: the bar keeps
     // drawing (the row says `resuming…` while it runs, unless the board has the successor first), then w1 runs again
     // as a new terminal, its view in a new window (a tab), and that view is the pane in front.
@@ -4329,7 +4336,7 @@ hc {}:
         live.call(&["send-keys", "-t", &bar, "-l", "G"]);
         live.after_redraw(&bar);
         let before = live.frames(&bar);
-        live.call(&["send-keys", "-t", &bar, "Enter"]);
+        resume_through_bar(&live, &bar);
         // The successor: w1 running again, in a new terminal.
         let mut listed = Value::Null;
         assert!(

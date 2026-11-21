@@ -62,10 +62,18 @@ fn callers(src: &str, verb: &str) -> BTreeSet<String> {
         .collect()
 }
 
-/// Each function that runs `resume`, directly or by calling one that does (checklist 60: a scenario's helper).
+/// Each function that runs `resume`, directly or by calling one that does (checklist 60: a scenario's helper). The
+/// side bar's own resume (Enter on an ended row) names no argument array, so its tests call `resume_through_bar`,
+/// which counts as running `resume`.
 fn resume_callers(src: &str) -> BTreeSet<String> {
     let bodies = bodies(src);
     let mut found = callers(src, "resume");
+    found.extend(
+        bodies
+            .iter()
+            .filter(|(n, _)| n == "resume_through_bar")
+            .map(|(n, _)| n.clone()),
+    );
     loop {
         let more: Vec<String> = bodies
             .iter()
@@ -156,6 +164,21 @@ fn every_live_resume_test_is_listed() {
         stale.is_empty(),
         "listed but not a registered test: {stale:?}"
     );
+}
+
+// A resume the side bar starts (Enter on an ended row) runs `resume` as surely as `live.run(&["resume", ..])`, but no
+// argument array names it: such a test calls `resume_through_bar`, and the guard counts that as running resume. A
+// parallel test's fake client then cannot be taken for the resumed conversation's holder and refuse it.
+#[test]
+fn a_resume_through_the_bar_runs_alone() {
+    let src = "    fn resume_through_bar(live: &Live, bar: &str) {\n        live.call(&[\"send-keys\", \"-t\", bar, \"Enter\"]);\n    }\n    #[test]\n    fn by_the_bar() {\n        resume_through_bar(&live, &bar);\n    }\n";
+    assert!(resume_callers(src).contains("by_the_bar"));
+    let live = include_str!("live.rs");
+    assert!(
+        resume_callers(live).contains("bar_enter_resumes_an_ended_agent_as_a_tab"),
+        "the bar's Enter-resume test resumes through the bar"
+    );
+    assert!(listed().contains("bar_enter_resumes_an_ended_agent_as_a_tab"));
 }
 
 // The parser: a rustfmt-split array is found; a scenario registered only through the macro list is registered; a

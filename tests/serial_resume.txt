@@ -8,6 +8,8 @@ hc_stopped_member_resumes_with_its_stored_options_only
 an_unreadable_claude_exe_blocks_resume
 a_managed_copilot_resumed_into_a_conversation_holds_it
 a_managed_member_resumed_into_a_conversation_holds_it
+# The side bar's Enter on an ended row runs `resume` (its tests call `resume_through_bar`).
+bar_enter_resumes_an_ended_agent_as_a_tab
 # cascade-3d Task 12: restarts the private core mid-test; run alone.
 a_cascade_stop_ends_b_before_a_and_a_second_stop_finishes
 # notebook-7a (PM calls 5, 11): live tests that run `up`, as `serial_resume::every_live_up_test_is_listed` reports them.
