@@ -3062,7 +3062,7 @@ hc {}:
         );
         let rows = all["agents"].as_array().unwrap();
         assert_eq!(rows.len(), 2, "{mux:?} {all}");
-        const ROW: [&str; 16] = [
+        const ROW: [&str; 17] = [
             "name",
             "client",
             "pane",
@@ -3078,6 +3078,7 @@ hc {}:
             "age",
             "unread",
             "model",
+            "role",
             "color",
         ];
         // w2's stop notice is unread in the root's mailbox, but it is the notice of w2's own exit, never mail w2 left:
@@ -3113,7 +3114,7 @@ hc {}:
                 "parent": root, "sessionId": w["sessionId"], "directory": live.path("work"), "state": state,
                 "life": if state=="running" {"running"} else {"ended"},
                 "view": if state=="running" {"attached"} else {"detached"}, "hcAddress": w["hcAddress"],
-                "doing": "say hi", "doingFrom": "task", "unread": unread, "model": null,
+                "doing": "say hi", "doingFrom": "task", "unread": unread, "model": null, "role": null,
             });
             for (field, value) in want.as_object().unwrap() {
                 assert_eq!(&row[field], value, "{mux:?} {row}");
