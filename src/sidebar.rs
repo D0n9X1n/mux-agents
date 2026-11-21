@@ -9066,6 +9066,50 @@ mod tests {
         );
     }
 
+    // With the poll a frame that moved nothing is no change, but a frame at a new size is: a press read right after a
+    // resize may be aimed at the geometry before it, so it is dropped (the same press after the gap would act).
+    #[test]
+    fn a_press_right_after_a_resize_is_dropped_with_the_poll() {
+        let w = click_world(&["live", "live", "tall", "tall", "gone"], board_answer());
+        w.fakes.mux_script(WATCH_PROBE, {
+            let queue = Rc::new(RefCell::new(VecDeque::from([
+                "live", "live", "tall", "tall", "gone",
+            ])));
+            move |_| {
+                let mut queue = queue.borrow_mut();
+                let answer = if queue.len() > 1 {
+                    queue.pop_front().unwrap()
+                } else {
+                    *queue.front().unwrap()
+                };
+                Ok(match answer {
+                    "live" => out(0, "%7|sidebar|40|24\n", ""),
+                    "tall" => out(0, "%7|sidebar|40|30\n", ""),
+                    _ => out(0, "|||\n", ""),
+                })
+            }
+        });
+        pace(Pace {
+            tick: Duration::from_millis(1000),
+            poll: Some(Duration::from_millis(200)),
+        });
+        // Ticks at 0 and 1 s (24 rows), 2 s (30 rows); the press 10 ms after the resize, then its redraw.
+        let script = Script::new(&w.fakes, vec![(2010, press(6))]);
+        watch_frames(&w, 4);
+        let caller = w.caller();
+        let ended = run_watch(&w.ctx, &caller, Origin::Hand, Box::new(script), &mut |_| {
+            Ok(())
+        });
+        pace(Pace::default());
+        assert_eq!(
+            (click_reads(&w), selects(&w)),
+            (0, 0),
+            "dropped: the press may be aimed at the 24-row frame"
+        );
+        assert_eq!(ended, "pane-closed");
+        w.fakes.hc_done().unwrap();
+    }
+
     // A resize is always written, even when the rows come out the same (a taller pane whose rows all fit): the
     // terminal may have cleared the pane, and a click aims at the new geometry.
     #[test]
