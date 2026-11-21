@@ -47,6 +47,7 @@ pub mod options;
 pub mod outcome;
 #[cfg(test)]
 pub(crate) mod outcome_fixture;
+pub mod ping;
 pub mod placement;
 pub(crate) mod prelife;
 #[cfg(test)]

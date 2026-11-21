@@ -225,6 +225,16 @@ pub static VERBS: &[VerbDef] = &[
         text: json::lines,
     },
     VerbDef {
+        name: "ping",
+        values: &[],
+        switches: &[],
+        min: 1,
+        max: 1,
+        usage: "usage: mux-agent ping <name> [-Text]",
+        handler: crate::agents::ping::ping,
+        text: json::lines,
+    },
+    VerbDef {
         name: "notify",
         values: &[],
         switches: &["On", "Off"],
@@ -785,7 +795,7 @@ mod tests {
     // A valid argv for each verb, positionals at the verb's minimum.
     fn valid(verb: &str) -> Vec<&'static str> {
         match verb {
-            "focus" | "send" | "stop" | "drop" | "resume" | "report" | "peek" => vec!["a"],
+            "focus" | "send" | "stop" | "drop" | "resume" | "report" | "peek" | "ping" => vec!["a"],
             _ => vec![],
         }
     }
@@ -812,6 +822,7 @@ mod tests {
                 "up",
                 "status",
                 "report",
+                "ping",
                 "notify",
                 "sidebar",
                 "watch",
@@ -849,6 +860,7 @@ mod tests {
             ("up", 0, 0),
             ("status", 0, 0),
             ("report", 1, 1),
+            ("ping", 1, 1),
             ("notify", 0, 0),
             ("sidebar", 0, 0),
             ("watch", 0, 0),
@@ -963,6 +975,7 @@ mod tests {
             "up" => vec!["up", "-Client", "claude"],
             "status" => vec!["status", "-BodyFile", "s.md"],
             "report" => vec!["report", "idle"],
+            "ping" => vec!["ping", "worker"],
             "notify" => vec!["notify", "-On"],
             "sidebar" => vec!["sidebar"],
             "watch" => vec!["watch"],
