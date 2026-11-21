@@ -34,7 +34,7 @@ In a session `up` started, the bar draws the team as a tree. It looks roughly li
 - The leader comes first; each member's children are drawn under it, indented 2 columns per level (`src/sidebar/tree.rs`).
 - Siblings are oldest first, with the running ones ranked needs you, on call, done, working, idle in the places running rows hold, so an ended member's sub-tree never moves.
 - A row whose parent is not in the team, or whose chain does not reach the leader, is drawn at depth 1 with `^` first.
-- Under a member's name line its doing line says what it is doing: its last `status`, else the first line of its last message, else its task.
+- Under a member's name line its doing line says what it is doing: its last `status`, else the first line of its last message, else its task. An open `ping` leads it, dim: `pinged 4m`, then what it is doing.
 
 When the pane is too short, the bar drops, in order: the blank line, the doing lines from the bottom up, each parent's ended children (folded into `+N ended`), then the deepest sub-trees that hold neither the leader nor the selection (folded into `+N more`). When it is too narrow for a row's mandatory parts, it shows `widen the bar: needs <n> columns` and draws no rows; keys still walk the whole tree.
 
@@ -66,7 +66,7 @@ Outside a team the bar groups the agents by what they ask of you (40 columns; `$
 
 - The header counts `N inbox` (yellow) and `N working`, each only when not 0, joined by ` · `; `0 running` when no agent lives. Free and ended agents are not counted there: their heading and the fold line count them.
 - The first rows are `main` (then `main 2` …), after a blank row that sets them apart from the header: the panes the agents were spawned from, so you can go back to the chat that started them. A short bar drops that blank row first. `main` stays as the header does, while the pane has a row for it beside the header: the agents give way first.
-- Live agents follow in sections, each under its heading with its count and a blank row above it, in the board's order. **Inbox** (bold yellow): needs you, done and not yet seen, unread mail, or a member that needs recovery, running or not; its rows keep their word, since their reasons differ. **Working** (bold green), then **Free** (bold dim: idle or on call): their rows show only the glyph and the age.
+- Live agents follow in sections, each under its heading with its count and a blank row above it, in the board's order. **Inbox** (bold yellow): needs you, done and not yet seen, unread mail, a member that needs recovery, running or not, or one that has not answered a `ping` for 10 minutes (its word `no answer` with the ping's age; a blocked one keeps `needs you` and its doing line says `no answer 12m`); its rows keep their word, since their reasons differ. **Working** (bold green), then **Free** (bold dim: idle or on call): their rows show only the glyph and the age.
 - The ended agents are one dim line, `▸ Ended · N`, which the keys select. Tab, or Enter on it, opens it (`▾`): the agents that ended in the last hour (by when each ended, not when it started), the newest end first, each selectable, then `+N older` for the rest. An ended agent with unread mail is not folded away: it stands in Inbox with its ended glyph and word and `✉ N` and the time since it ended, and the header counts it, until its mail is read. Its mail is the reports it sent; the notice of its own exit never counts, on any bar.
 - The last row is the hint row, after a blank row: `⏎ open  p peek  m mail  ? keys` (`enter` in ASCII; `⏎ resume` on a selected ended row, and `resuming…` alone while its resume runs), keys plain and words dim, each key as `@mux-agents-keys` sets it. A narrow bar drops `m mail`, then `p peek`. It shows only when it costs no other row.
 - A short bar drops, in order: the blank rows (the lowest first), the headings (each row then says its state), the open fold's rows (the oldest first, into `+N older`) and that line, the doing lines of the oldest agents, the oldest agents (into `+J more running`), then the fold line.
@@ -85,6 +85,8 @@ Outside a team the bar groups the agents by what they ask of you (40 columns; `$
 | `-` yellow | `stopped` | ended by `stop` or `drop` |
 | `-` | `lost`, `unknown` | its terminal is gone, or its life cannot be told |
 | `!` | `recover: <reason>` | its current generation failed; `recover (still running)` while that generation has not ended; `resume` retries it |
+| `pinged 4m` dim, on the doing line | | an open `ping`, not yet answered |
+| bold yellow | `no answer 12m` | a `ping` it has not answered for 10 minutes; in Inbox until it runs `answer` |
 | `✉ N` (`m N`) | | N unread messages from it |
 | `kept shell <name>` | | a lost member's old terminal, under the heading `kept shells · N` |
 | `Inbox · N` bold yellow, `Working · N` bold green, `Free · N` bold dim | | a section of the flat list, with its count |

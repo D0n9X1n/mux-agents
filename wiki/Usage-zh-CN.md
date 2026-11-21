@@ -44,7 +44,7 @@ flowchart LR
 |---|---|---|
 | `spawn` | `spawn -Client copilot -Name add-tests -TaskFile task.md -BriefFile brief.md -Split h` | 按会话的 `placement` 启动代理（默认是新窗口）；`-Split h\|v` 或 `-Tab` 只决定这一次；`-Model <model>` 指定它的模型（否则用客户端的默认模型）；`-Effort low\|medium\|high` 设置它的推理强度；`-NoFork` 或 `-Context brief` 让它从简报而不是你对话的分叉开始；`-Role <name>` 让它从你客户端自己的一个代理定义启动（见下文关于角色的段落） |
 | `placement` | `placement h`，`placement tab` | 本会话之后 `spawn` 在哪里打开代理：`tab`（新窗口，默认）、`h` 或 `v`（在你旁边分屏）；单独的 `placement` 显示当前选择 |
-| `list` | `list -All` | 存活的代理、各自在做什么，以及各自的未读消息（它发出的报告，与侧边栏的 ✉ 标记计数相同，从不计入它自己结束的通知）；`-All` 加上已结束的，各带其 `exitCode` |
+| `list` | `list -All` | 存活的代理、各自在做什么，以及各自的未读消息（它发出的报告，与侧边栏的 ✉ 标记计数相同，从不计入它自己结束的通知）；`-All` 加上已结束的，各带其 `exitCode`；每行最后是 `statusAt`（所显示状态的时间）、`pingedAt` 和 `noAnswer`（见 `ping`） |
 | `focus` | `focus claude-1`、`focus -Next` | 切换到代理的视图，视图已关闭时重新打开它；`-Next` / `-Prev` 按侧边栏的顺序逐个切换 |
 | `send` | `send claude-1 -BodyFile note.md`，`send parent -BodyFile result.md` | 给某个代理，或给 `parent`、`leader`、`children` 或 `team` 发消息；在团队中，`-Re <id>` 回复一条消息，`-Id <id>` 完成一次失败的发送（[消息与笔记本](Messaging-and-Notebook-zh-CN)） |
 | `read` | `read -Wait 600`，`read claude-1 -Lines 40` | 等待你的消息并用 `-Ack <batch>` 确认，或读取某个代理的窗格；客户端钩子使用 `-Deliver` 和 `-Count` |
@@ -58,6 +58,8 @@ flowchart LR
 | `up` | `up -Client claude -- --model opus` | 启动团队：领导者、侧边栏和视图；视图关闭、服务器被杀或重启之后再次运行，可找回视图、侧边栏和丢失的成员；已停止的团队会被退役并启动新团队；`-Name <name>` 在同一文件夹中启动第二个团队（[团队与生命周期](Teams-and-Lifecycle-zh-CN)） |
 | `status` | `status -BodyFile step.txt` | 代理报告自己当前在做什么；侧边栏显示它 |
 | `report` | `report working -Quiet` | 客户端钩子为侧边栏报告代理的状态（`working`、`blocked`、`idle`、`done`）；你从不需要运行它 |
+| `ping` | `ping claude-1` | 团队的领导者或人向一个存活的成员询问状态：一封邮件写明 ping 的 id，`list` 和侧边栏显示这个未答复的 ping，直到成员答复 |
+| `answer` | `answer <id> -BodyFile status.md` | 成员答复邮件中写明的 ping；文本成为它的状态；只有它能答复 ping |
 | `notify` | `notify -On`，`notify -Off` | 由人选择开启：开启期间，每次团队发送还会把一行通知粘贴到每个接收者的终端 |
 | `sidebar` | `sidebar`，`sidebar -Close` | 重新打开侧边栏分屏，或在本会话剩余时间内关闭它 |
 | `watch` | `watch` | 在此终端中绘制面板；侧边栏运行的就是它 |
@@ -85,6 +87,8 @@ usage: mux-agent restore [-Text]
 usage: mux-agent up -Client <claude|copilot> [-Name <name>] [-Text] [-- <client flags>]
 usage: mux-agent status (-Body <text> | -BodyFile <path>) [-Text]
 usage: mux-agent report <working|blocked|idle|done> [-Kind <permission|question>] [-Quiet] [-Text] | report -Session (<sessionId> [-Source <word>] | -Stdin) [-Quiet]
+usage: mux-agent ping <name> [-Text]
+usage: mux-agent answer <pingId> -BodyFile <path> [-Text]
 usage: mux-agent notify (-On | -Off) [-Text]
 usage: mux-agent sidebar [-Close] [-Text]
 usage: mux-agent watch [-Text]
@@ -97,6 +101,8 @@ usage: mux-agent kept [-Close <address>] [-Text]
 每个代理的名字说明它做什么，也是它的标签页名或窗格标题。技能总是传 `-Name <short-kebab-name>`（1-24 个小写字母、数字或连字符，以字母开头；`parent`、`root`、`all`、`leader`、`children` 和 `team` 是保留名）。不传 `-Name` 时，名字取自任务的前几个词："Please add a subtract function to calc.py" 变成 `add-subtract-function`，没有可用词的任务得到 `claude-1` 或 `copilot-1`。名字在其会话中永不复用，即使代理已结束：被占用的派生名加上 `-2`、`-3`……（在词边界截断以保持在 24 以内），被占用的 `-Name` 会被拒绝，并给出一个可用的名字。即使代理的客户端自己设置标题，窗格标题仍保持为该名字；tmux 3.2a 除外，它无法阻止客户端改写窗格标题（标签页名仍然保持）。
 
 `spawn -Role <name>` 让代理从一个角色启动：角色是你客户端自己的代理定义，从代理启动所在的文件夹查找（团队成员的子代理从该成员启动的文件夹查找）。Claude Code 的角色按 frontmatter 的 `name` 匹配：先找该文件夹及其每一级父文件夹直到仓库根目录中的 `.claude/agents/**/*.md`（由近及远），再找 `~/.claude/agents/`，最后是已安装插件的 `agents/`（`<plugin>:<name>` 指定某个插件的角色）。Copilot CLI 的角色按文件名匹配：先找 `~/.copilot/agents/`，再找直到仓库根目录的 `.github/agents/`（`<name>.agent.md`，否则 `<name>.md`），最后是已安装的插件。第一个有匹配的位置胜出；同一位置有两个匹配，或没有匹配，都以 `role` 拒绝。文件只在启动时读取一次：正文成为代理的常驻简报（其文件夹中的 `role.md`，在第一条消息中排在任务之前点名），`model` 在你未传 `-Model` 时成为 `--model=`，`tools` 成为 Claude Code 的 `--tools=` 或 Copilot CLI 的 `--available-tools=`。其他所有字段（`permissionMode`、`hooks`、`mcpServers`、`skills`、`initialPrompt` 及其他）都被忽略，并列在回复的 `roleIgnored` 中。角色从不提高权限：代理得到与不带角色时相同的权限标志，mux-agents 也从不传客户端的 `--agent`。恢复、修复和还原重用启动时保存的内容，从不再读角色文件；`list` 在每个代理的 `model` 之后显示其 `role`。
+
+`ping <name>` 向你团队的一个成员询问状态；只有团队的领导者或人可以 ping。它把 ping 作为记录保存在成员的文件夹中，并给成员发一封普通邮件：`Status? Answer with: mux-agent answer <id> -BodyFile <file: doing / done / blocked on what>`。答复之前再次 `ping` 返回同一个 id，不再发送。只有成员自己的 `answer <id> -BodyFile <file>` 才能答复它：`status`、`report`、任何 `send` 和读取这封邮件都不能，恢复后的成员也从不继承它。`list` 显示每行状态的时间（`statusAt`）、未答复的 ping（`pingedAt`），以及 10 分钟没有答复后的 `noAnswer`；`list -Text` 显示 `pinged 4m` 或 `no answer 12m`。不答复的成员出现在侧边栏的 Inbox 中；没有任何东西会停止它。
 
 ## 侧边栏
 
