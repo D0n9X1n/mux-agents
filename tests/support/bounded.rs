@@ -21,17 +21,38 @@ const GRACE: Duration = Duration::from_secs(5);
 /// How long a stopped reader has to drop its pipe (o2 call 29).
 const RELEASE: Duration = Duration::from_secs(1);
 
+/// Held across every start a harness makes. macOS has no atomic `pipe2(O_CLOEXEC)`: std makes a pipe, then marks it
+/// close-on-exec, and a child another thread starts between the two keeps the pipe's write end. When that child lives
+/// on (a multiplexer server, a core), the pipe stays open after its own child exits and `output` refuses it. With
+/// every start under this lock, no harness child starts inside another harness call's pipe window.
+static SPAWNING: Mutex<()> = Mutex::new(());
+
+/// `command.spawn()` under `SPAWNING`. Every child a harness starts goes through here, so no start lands inside
+/// another's pipe window. The lock is held only for the start itself, never while the child runs.
+pub fn start(command: &mut Command) -> io::Result<Child> {
+    let _alone = spawning();
+    command.spawn()
+}
+
+/// The lock `start` holds, for a test that proves a start waits for it.
+pub fn spawning() -> MutexGuard<'static, ()> {
+    SPAWNING
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 /// `command.output()`, bounded: stdin null (as `output()`), both pipes drained on threads (a full pipe never stalls
 /// the child), the child killed and reaped at `limit` and refused `TimedOut`. o2 call 29: never success with output it
 /// did not finish reading: a pipe a descendant still holds open `GRACE` after the child's exit is refused `TimedOut`
 /// naming that pipe, and its reader is stopped and drops its read handle.
 pub fn output(command: &mut Command, limit: Duration) -> io::Result<Output> {
     let what = format!("{command:?}");
-    let mut child = command
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()?;
+    let mut child = start(
+        command
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped()),
+    )?;
     let mut out = Drain::start(child.stdout.take().map(file_of));
     let mut err = Drain::start(child.stderr.take().map(file_of));
     let end = Instant::now() + limit;
@@ -228,7 +249,7 @@ pub struct Watched {
 
 /// `command.spawn()`, its stdio as the caller set it, with a watchdog that kills the child at `limit`.
 pub fn spawn(command: &mut Command, limit: Duration) -> io::Result<Watched> {
-    let child = command.spawn()?;
+    let child = start(command)?;
     let id = child.id();
     let child = Arc::new(Mutex::new(child));
     let dog = child.clone();

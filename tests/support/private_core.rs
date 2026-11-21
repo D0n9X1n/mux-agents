@@ -301,11 +301,12 @@ pub fn run(mut c: Command, dir: &Path) -> io::Result<Value> {
     let n = N.fetch_add(1, Ordering::Relaxed);
     let out = dir.join(format!("core-{n}.out"));
     let err = dir.join(format!("core-{n}.err"));
-    let mut child = c
-        .stdin(Stdio::null())
-        .stdout(fs::File::create(&out)?)
-        .stderr(fs::File::create(&err)?)
-        .spawn()?;
+    // Under the harness's start lock: the core's supervisor lives on, so it must not start inside a pipe window.
+    let mut child = super::bounded::start(
+        c.stdin(Stdio::null())
+            .stdout(fs::File::create(&out)?)
+            .stderr(fs::File::create(&err)?),
+    )?;
     let deadline = Instant::now() + Duration::from_secs(30);
     let status = loop {
         match child.try_wait() {
@@ -417,13 +418,14 @@ pub fn kill_pid(pid: u32) -> bool {
     }
     #[cfg(windows)]
     {
-        let mut child = Command::new("taskkill")
-            .args(["/F", "/PID", &pid.to_string()])
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("taskkill");
+        let mut child = super::bounded::start(
+            Command::new("taskkill")
+                .args(["/F", "/PID", &pid.to_string()])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null()),
+        )
+        .expect("taskkill");
         let deadline = Instant::now() + Duration::from_secs(30);
         let done = loop {
             if let Some(s) = child.try_wait().expect("taskkill wait") {

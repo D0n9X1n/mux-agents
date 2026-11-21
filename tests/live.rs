@@ -58,6 +58,53 @@ fn a_child_past_its_bound_is_killed_and_refused() {
     }
 }
 
+// macOS has no atomic close-on-exec pipe: a child started while another call's pipe is not yet close-on-exec keeps
+// its write end, and a child that lives on holds that call's output open. So every harness start waits for the one
+// start lock: none runs while it is held, and each runs once it is released.
+#[cfg(unix)]
+#[test]
+fn a_harness_start_waits_for_the_start_lock() {
+    use std::process::Command;
+    use std::time::Duration;
+    let held = support::bounded::spawning();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let run = std::thread::spawn(move || {
+        let out = support::bounded::output(
+            Command::new("/bin/sh").args(["-c", "echo started"]),
+            support::bounded::LIMIT,
+        );
+        tx.send(out).unwrap();
+    });
+    assert!(
+        rx.recv_timeout(Duration::from_millis(500)).is_err(),
+        "a harness start ran while the start lock was held"
+    );
+    drop(held);
+    let out = rx
+        .recv_timeout(Duration::from_secs(30))
+        .expect("the start never ran")
+        .unwrap();
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "started\n");
+    run.join().unwrap();
+    let held = support::bounded::spawning();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let watch = std::thread::spawn(move || {
+        let child =
+            support::bounded::spawn(&mut Command::new("/usr/bin/true"), support::bounded::LIMIT);
+        tx.send(child.map(|mut c| c.wait())).unwrap();
+    });
+    assert!(
+        rx.recv_timeout(Duration::from_millis(500)).is_err(),
+        "a watched start ran while the start lock was held"
+    );
+    drop(held);
+    let status = rx
+        .recv_timeout(Duration::from_secs(30))
+        .expect("the watched start never ran");
+    assert!(status.unwrap().unwrap().success());
+    watch.join().unwrap();
+}
+
 // o2 call 29 (QA F3): the Unix twin of live_windows.rs's: a descendant keeps stdout open 8 s after the child
 // exits: refused `TimedOut` naming stdout, the read handle dropped; a normal child keeps its whole output.
 #[cfg(unix)]

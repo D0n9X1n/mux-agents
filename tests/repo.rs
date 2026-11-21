@@ -2186,6 +2186,8 @@ fn live_harness_subprocesses_are_bounded() {
         "tests/live.rs",
         "tests/live_windows.rs",
         "tests/support/mod.rs",
+        // The core's supervisor lives on, so the core is started under bounded's start lock too.
+        "tests/support/private_core.rs",
         "src/bin/fake-client.rs",
         // a3c call 48: the crash-point children run through the same bounded runner.
         "tests/crash_point.rs",
