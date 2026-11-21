@@ -2458,6 +2458,8 @@ fn watch_loop(
     let mut unknown = 0;
     let mut pick = Pick::default();
     let mut viewing = Viewing::default();
+    // Answer-driven redraws are not retries: a false Seen waits one ordinary tick before another attempt.
+    let mut seen_attempts: Vec<(jobs::Seen, SystemTime)> = Vec::new();
     // The pane whose row is banded: the last pane on screen that is not the bar; and whether the bar was on screen.
     let mut banded: Option<String> = None;
     let mut in_bar = false;
@@ -2666,8 +2668,15 @@ fn watch_loop(
                 pending_news.clear();
             }
         }
+        let now = ctx.clock.now();
+        seen_attempts.retain(|(seen, at)| {
+            viewing.left.contains(seen) && now.duration_since(*at).unwrap_or_default() < pace.tick
+        });
         for seen in &viewing.left {
-            panel.jobs.seen(ctx, caller, seen);
+            if !seen_attempts.iter().any(|(asked, _)| asked == seen) {
+                panel.jobs.seen(ctx, caller, seen);
+                seen_attempts.push((seen.clone(), now));
+            }
         }
         for answer in panel.jobs.drain_reader() {
             match answer {
@@ -2787,7 +2796,13 @@ fn watch_loop(
         loop {
             // An action that answered off the loop (a resume) is applied, and the bar draws again at once: a change, as
             // a poll's, so input already waiting is read first (below).
-            answers.extend(panel.jobs.drain_reader());
+            answers.extend(
+                panel
+                    .jobs
+                    .drain_reader()
+                    .into_iter()
+                    .filter(|answer| !matches!(answer, jobs::Answer::Seen(_, false))),
+            );
             let became_stale = !stale
                 && panel.jobs.reading()
                 && ctx.clock.now().duration_since(asked_at).unwrap_or_default()
@@ -9782,6 +9797,78 @@ mod tests {
             );
             w.fakes.hc_done().unwrap();
         }
+    }
+
+    #[test]
+    fn a_false_seen_answer_waits_for_the_next_tick_instead_of_spinning_redraws() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        let marks = Arc::new(AtomicUsize::new(0));
+        let counted = marks.clone();
+        let (marked, answer) = std::sync::mpsc::channel();
+        jobs::test_reader_between(
+            move || {
+                move |request: &jobs::Request| match request {
+                    jobs::Request::Read(generation) => {
+                        jobs::Answer::Read(*generation, Ok(Map::new()))
+                    }
+                    jobs::Request::Seen(seen) => {
+                        counted.fetch_add(1, Ordering::SeqCst);
+                        jobs::Answer::Seen(seen.clone(), false)
+                    }
+                }
+            },
+            move || {
+                let _ = marked.send(());
+            },
+        );
+        let w = watch_world(&["live"]);
+        write(
+            &w.folder(ID).join("activity.json"),
+            json!({"state":"done", "since":"1970-01-01T00:03:00Z"}),
+        );
+        watch_frames(&w, 1);
+        let fakes = w.fakes.clone();
+        w.fakes.mux_script(SHOWN_FORMAT, move |_| {
+            Ok(out(
+                0,
+                if probed(&fakes) == 1 {
+                    "%9|1\n"
+                } else {
+                    "%1|1\n"
+                },
+                "",
+            ))
+        });
+        let mut script = Script::new(&w.fakes, vec![(3000, key(&[3]))]);
+        script.on_wait = Some(Box::new(move |_| {
+            std::thread::sleep(Duration::from_millis(1));
+        }));
+        let mut frames = 0;
+        let ended = run_watch(
+            &w.ctx,
+            &w.caller(),
+            Origin::Hand,
+            Box::new(script),
+            &mut |_| {
+                frames += 1;
+                if frames == 2 {
+                    answer.recv_timeout(Duration::from_secs(5)).unwrap();
+                    answer.recv_timeout(Duration::from_secs(5)).unwrap();
+                }
+                assert!(frames < 10, "false Seen is no frame change");
+                Ok(())
+            },
+        );
+        assert_eq!(ended, "interrupted");
+        assert_eq!(
+            marks.load(Ordering::SeqCst),
+            1,
+            "retry belongs to the next tick"
+        );
+        w.fakes.hc_done().unwrap();
     }
 
     #[test]
