@@ -17,7 +17,7 @@ mod restore;
 pub(crate) use pass::faults;
 pub(crate) use pass::{Pass, PassFor, pass};
 use restore::Done;
-pub(crate) use restore::{Next, launch_next, launch_next_viewed};
+pub(crate) use restore::{Next, fresh_brief, launch_next, launch_next_viewed};
 
 /// What one pass read of a member (6b-R1); `classify` decides from this alone.
 #[derive(Debug, Clone, Default, PartialEq)]

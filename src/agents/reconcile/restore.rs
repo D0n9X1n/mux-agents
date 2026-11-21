@@ -77,8 +77,14 @@ pub(crate) fn launch_next_viewed(
     let stored = super::super::options::stored(r)?;
     let ceiling = super::super::resume::ceiling(Some(&team));
     let flags = super::super::options::replay(client, &stored, ceiling)?;
+    // A new conversation of a role's member gets its standing brief as spawn gave it; a resumed one already has it.
+    let brief = if next.fresh {
+        fresh_brief(g.folder(), r)?
+    } else {
+        None
+    };
     let recipe = if next.fresh {
-        Recipe::First(None)
+        Recipe::First(brief.as_deref())
     } else {
         Recipe::Resume(None)
     };
@@ -100,6 +106,27 @@ pub(crate) fn launch_next_viewed(
     let n = super::super::gens::plain_gen(&text(promoted.get("generation")))
         .ok_or_else(|| Refusal::internal("the next generation is not a number"))?;
     Ok((n, promoted))
+}
+
+/// The first turn of a new conversation of member `record` in `folder`: none without a role; for a role's member the
+/// line that names its standing brief, the role.md spawn wrote (and resume copied), never the role file. A role's
+/// member whose role.md is gone refuses 2 `role`: it never starts without its brief.
+pub(crate) fn fresh_brief(folder: &std::path::Path, record: &Value) -> Res<Option<String>> {
+    let Some(name) = record.get("role").and_then(Value::as_str) else {
+        return Ok(None);
+    };
+    let path = folder.join("role.md");
+    if !path.is_file() {
+        return crate::error::refuse(
+            2,
+            "role",
+            format!(
+                "{} has no role.md, the standing brief a new conversation of its role starts from",
+                text(record.get("name"))
+            ),
+        );
+    }
+    Ok(Some(super::super::role::brief_line(name, &path)))
 }
 
 /// Checklist 7, 9 (call 25): the session's team record through the evidence reader (a link, folder, FIFO or torn

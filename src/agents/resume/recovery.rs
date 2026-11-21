@@ -76,6 +76,11 @@ pub(crate) fn recover_target(
                     return refuse(2, "target", "no member of this team has that name or id");
                 }
             };
+            // A fresh start delivers a role's standing brief: without it, refuse before anything is asked of hc.
+            if action == Action::Fresh {
+                let g = life_of(tx, &id)?;
+                super::super::reconcile::fresh_brief(g.folder(), g.record())?;
+            }
             // checklist 5: settle's unresolved answer is kept; torn evidence is `evidence`, never "still pending"
             if let Outcome::Unknown(e) = tx.settle(&id, Mode::Normal)?
                 && e.check == "evidence"

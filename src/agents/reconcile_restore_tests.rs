@@ -102,6 +102,47 @@ fn a_lost_ok_member_comes_back_as_the_next_generation_of_its_conversation() {
     }
 }
 
+/// A Lost member spawned with -Role comes back from its stored options and keeps its role.md, whatever became of the
+/// role file: the restore resumes its conversation and never reads the file.
+#[test]
+fn a_lost_roles_member_is_restored_from_its_stored_options() {
+    let options = json!(["--effort", "high", "--model=haiku", "--tools=Read,Grep"]);
+    for changed in [true, false] {
+        let argv = lf::LOST_ARGVS[0];
+        let w = World::human("");
+        w.state();
+        let file = w.ctx.cwd.join(".claude").join("agents").join("x.md");
+        let f = member(
+            &w,
+            X,
+            json!({"options": options, "role": "x", "roleFile": file, "roleClient": "claude"}),
+        );
+        std::fs::write(f.join("role.md"), "brief\n").unwrap();
+        if changed {
+            std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+            std::fs::write(&file, "---\nname: x\ntools: Bash\n---\nother\n").unwrap();
+        }
+        ok(&f, 1);
+        cf::online(&w);
+        found(&w, X, 1, &wire_of(&w, X, 1, argv));
+        released_by_hc(&w, X, argv);
+        w.fakes.hc_answer(ft::address("t2"));
+        let reply = pass(&w);
+        assert_eq!(
+            reply["restored"][0]["generation"], 2,
+            "{changed}: {reply:?}"
+        );
+        let spec = gen_file(&f, 2, "spec").unwrap();
+        assert_eq!(spec["flags"], options, "{changed}");
+        assert_eq!(spec["args"], json!(["--resume", lf::SID]), "{changed}");
+        assert_eq!(
+            std::fs::read_to_string(f.join("role.md")).unwrap(),
+            "brief\n"
+        );
+        w.fakes.hc_done().unwrap();
+    }
+}
+
 #[test]
 fn a_closed_member_is_held_and_nothing_is_released() {
     let w = World::human("");
