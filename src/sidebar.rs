@@ -879,7 +879,10 @@ fn live_parts(row: &Map<String, Value>, look: Look) -> LiveParts {
         .filter(|since| !since.is_null())
         .or_else(|| row.get("age"));
     let doing = own_glyphs(&clean(row.get("doing"))).trim().to_string();
-    let (doing, late) = ping_mark(row, kind, doing, look);
+    // A blocked row and a recovery row keep their word, which the person must act on: a late ping goes to the doing
+    // line instead.
+    let keeps_word = kind == Kind::Blocked || recovery_word(row).is_some();
+    let (doing, late) = ping_mark(row, keeps_word, doing, look);
     LiveParts {
         kind,
         muted,
@@ -901,11 +904,11 @@ fn live_parts(row: &Map<String, Value>, look: Look) -> LiveParts {
 }
 
 /// An open ping on a live row (the feed's `pingedAgo`): `pinged 4m` leads the doing line. Late (`noAnswer`), the row's
-/// word becomes `no answer` with the ping's age, but a blocked row keeps `needs you`, which the person must act on, and
-/// its doing line says `no answer 12m` instead.
+/// word becomes `no answer` with the ping's age, but a row that `keeps_word` (blocked: `needs you`; needing recovery:
+/// its recovery word), which the person must act on, keeps it, and its doing line says `no answer 12m` instead.
 fn ping_mark(
     row: &Map<String, Value>,
-    kind: Kind,
+    keeps_word: bool,
     doing: String,
     look: Look,
 ) -> (String, Option<String>) {
@@ -913,9 +916,9 @@ fn ping_mark(
         return (doing, None);
     };
     let age = format_age(Some(ago));
-    let mark = match (no_answer(row), kind) {
-        (true, Kind::Blocked) => format!("no answer {age}"),
-        (true, _) => return (doing, Some(age)),
+    let mark = match (no_answer(row), keeps_word) {
+        (true, true) => format!("no answer {age}"),
+        (true, false) => return (doing, Some(age)),
         (false, _) => format!("pinged {age}"),
     };
     if doing.is_empty() {
@@ -5633,6 +5636,37 @@ mod tests {
             ("pinged 4m \u{b7} build it".to_string(), DIM),
             "the mark is dim, as the doing line"
         );
+    }
+
+    // A member that needs recovery and still runs keeps its recovery word, and its ping still shows: `pinged 4m`, and
+    // once late `no answer 12m`, lead its doing line; the word on its line stays `recover (still running)`.
+    #[test]
+    fn a_running_recovery_row_keeps_its_word_and_shows_its_ping() {
+        let size = Size {
+            width: 60,
+            height: 40,
+        };
+        for (ago, late, mark) in [(240, false, "pinged 4m"), (720, true, "no answer 12m")] {
+            let mut board = pinged("working", 600, ago, late, json!("build it"));
+            let row = board["agents"][0].as_object_mut().unwrap();
+            row.insert("needsRecovery".into(), json!(true));
+            row.insert("recoveryRunning".into(), json!(true));
+            let rows = body(&board, size);
+            let at = rows.iter().position(|r| r.contains(" w1")).unwrap();
+            assert!(
+                rows[at].contains("recover (still running)") && !rows[at].contains("no answer"),
+                "{ago}: {rows:?}"
+            );
+            assert_eq!(
+                rows[at + 1],
+                format!("   {mark} \u{b7} build it"),
+                "{ago}: {rows:?}"
+            );
+            assert!(
+                rows.iter().any(|r| r == " Inbox \u{b7} 1"),
+                "{ago}: {rows:?}"
+            );
+        }
     }
 
     #[test]

@@ -203,7 +203,8 @@ fn member(node: &Node, width: usize, shown: Option<&str>, look: Look) -> Member 
                 unread_badge(row, look),
                 sides,
                 true,
-                String::new(),
+                // Its recovery word stays; an open ping (only a running row has one) is its doing line.
+                ping_mark(row, true, String::new(), look).0,
             )
         } else if clean(row.get("state")) == "running" {
             let p = live_parts(row, look);
@@ -918,6 +919,39 @@ pub(super) mod tests {
                 line(" ", "  \u{25c9} beta", "no answer  12m", 60),
             ]
         );
+    }
+
+    // A member that needs recovery and still runs keeps its recovery word on the tree, and its ping still shows on
+    // its doing line: `pinged 4m`, then `no answer 12m` once late.
+    #[test]
+    fn a_running_recovery_member_keeps_its_word_and_shows_its_ping_on_the_tree() {
+        for (ago, late, mark) in [(240, false, "pinged 4m"), (720, true, "no answer 12m")] {
+            let board = team(vec![
+                member("L", None, 1, json!({"name": "lead", "activity": "working"})),
+                member(
+                    "F",
+                    Some("L"),
+                    2,
+                    json!({"name": "fixer", "activity": "working", "needsRecovery": true,
+                        "recoveryRunning": true, "pingedAgo": ago, "noAnswer": late}),
+                ),
+            ]);
+            let look = Look {
+                color: false,
+                ascii: false,
+                dumb: false,
+            };
+            let rows = draw(&board, 60, 20, look, Focus::default());
+            let at = rows.iter().position(|r| r.contains("fixer")).unwrap();
+            assert_eq!(
+                rows[at..at + 2],
+                [
+                    line(" ", "  ! fixer", "recover (still running)   1m", 60),
+                    format!("     {mark}"),
+                ],
+                "{ago}: {rows:?}"
+            );
+        }
     }
 
     fn golden() -> Map<String, Value> {
