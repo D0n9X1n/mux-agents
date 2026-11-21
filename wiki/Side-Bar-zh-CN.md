@@ -95,7 +95,7 @@
 
 每个存活智能体的名字有自己的颜色，取会话中存活智能体用得最少的那种，且永远不是状态颜色。时长是自上次状态变化以来的时间。`MUX_AGENTS_ASCII=1` 画出 ASCII 标记。颜色遵循 `NO_COLOR`（关闭）、`FORCE_COLOR` 或 `CLICOLOR_FORCE`（开启），然后是 `TERM=dumb`（关闭）。在展开的折叠中，已结束的行是它的图标、暗色的名字和它结束以来的时间：只有 `exit N` 保留文字，为红色；丢失或未知的行尚未结束，显示它的时长。
 
-侧边栏底部的提示：`refresh failed`（读取失败时显示的上一个画面）、`layout: repair paused`、`focus failed: <name>`、`nothing to open for <name>`、`no notes`、`notes failed`、`opens in: tab|split h|split v`、`placement refused: <reason>`、`close failed: <name>`，以及问题 `close? y/n` 和 `close bar? y/n`。
+侧边栏底部的提示：`refresh failed`（读取失败或等待读取超过 15 秒时，保留上一次的面板数据）、`layout: repair paused`、`focus failed: <name>`、`nothing to open for <name>`、`no notes`、`notes failed`、`opens in: tab|split h|split v`、`placement refused: <reason>`、`close failed: <name>`，以及问题 `close? y/n` 和 `close bar? y/n`。
 
 ## 按键
 
@@ -144,17 +144,18 @@ flowchart LR
   open["spawn, up or sidebar"] --> split["split-window at the right edge"]
   split --> watch["mux-agent watch"]
   watch -- "each tick" --> probe["own pane: id, label, size"]
-  watch -- "each tick" --> board["board: records, reports, mail, hc"]
-  board --> lay["tree or flat layout"]
+  watch -- "one read pending" --> reader["reader thread: board and seen FIFO"]
+  reader -- "answer" --> lay["latest board: tree or flat layout"]
   lay --> frame["frame written in place"]
   keys["keys and clicks"] --> watch
 ```
 
 - **拆分中的一个进程。** `sidebar`、第一次启动或 `up` 在调用者窗口的右边缘运行 `split-window`，占满高度，按二进制文件的绝对路径运行 `<binary> watch -Managed <key>`，`<key>` 是只在该状态根的 `bar-key` 文件中存一次的 32 位随机十六进制，因此同一状态根下的每个进程无论路径如何书写都读到同一个键；你的窗格保持活动。`-Managed` 是只有这个拆分才会传入的标志：打开者在记录它之前就已死亡（打开途中被杀死）的侧边栏会在 10 s 内自行关闭，在同一状态根下运行的 `sidebar -Close` 会立即关闭它；你手动运行的 `watch` 不受影响。侧边栏是这个进程，而不是它的 `@agent-role sidebar` 标签：会话选项 `@mux-agents-sidebar-id` 记录 `<pane> <pid> <start>`，每一步都会证明该窗格仍在运行它。带有该标签却不是这个进程的窗格会被点名，且永远不会被关闭。
-- **它读取什么。** 每一拍，即每秒（`src/sidebar.rs` 中的 `Pace`）以及按键或左键按下之后立即，它读取自己窗格的 id、标签和大小，然后在进程内读取面板数据（`src/agents/board.rs`、`src/agents/board_rows.rs`）：每个智能体的记录、其客户端报告的活动、它的状态或最后一条消息、它的未读邮件、它是否需要恢复、团队的保留 shell，以及会话正在显示的窗格。两拍之间它每 200 毫秒做一次低开销的轮询：屏幕上的窗格（一次多路复用器读取），以及智能体文件夹和邮箱的最新修改时间（文件时间，不启动进程）。屏幕上换了窗格（切换标签页）或那里有变化（报告、状态、消息）时立即重绘，所以侧边栏在 200 毫秒内显示它。为其他视图窗口补上侧边栏的遍历每 5 拍运行一次。
+- **它读取什么。** 第一帧同步读取面板。之后每一拍（每秒以及输入之后）仅在没有待完成读取时向一个长驻读取线程请求面板；等待期间，循环绘制上一次的结果。读取线程拥有自己的上下文，串行处理面板读取和已看标记。读取未完成时，输入等待切成最多 10 ms 的片段，但不缩短 50 ms 的 Escape 等待。结果到达会结束等待：先按旧画面处理已在等待的输入，再重绘。每 200 ms 的轮询检查显示中的窗格和状态文件时间；读取期间窗格变化仍会重绘，文件时间变化则不会启动另一读取。每拍的其他多路复用器调用仍在循环中。读取等待 15 s 后显示 `refresh failed`；请求恐慌或线程启动失败会拒绝待处理工作并在下一拍重试，连续三次读取线程失败后改为同步执行。
+- **已看标记。** 离开看过的已完成一轮时，把成员 id、窗格和变化时间交给读取线程；成功前一直保留，并在下一次读取前执行。Space 仍同步标记，并在当前读取之后请求一次新读取。每个成功标记都会把此轮在后续所有画面上覆盖为 `idle`，包括延迟到达的结果；只有标记成功后请求且成功成为当前面板的读取才能移除覆盖。Enter、点击和 Space 仍可能等待它们自身操作需要的成员锁。
 - **重绘。** 面板按窗格的实际大小布局，从不换行；每一帧都在同步输出中原地写入，不整屏清除，因此不会闪烁。`TERM=dumb` 时它输出普通帧，且不接受按键或点击。
 - **保位器。** 当拆分、布局变化、`swap-pane` 或 `rotate-window` 移动了侧边栏，下一拍会把它放回右边缘并重新选中你的窗格。缩放的窗口不受影响。连续 3 次修复失败后，它显示 `layout: repair paused`，直到布局变化或过了一分钟。
-- **结束。** `watch` 在其窗格消失时以 `pane-closed` 结束，写入失败时以 `output-closed` 结束，连续 30 次探测无应答后以 `probe-failed` 结束，按 Ctrl-C 时以 `interrupted` 结束，按 `q` 和 `y` 之后以 `closed` 结束；每次退出时它都会恢复终端。
+- **结束。** `watch` 在窗格消失时以 `pane-closed` 结束，写入失败时以 `output-closed` 结束，连续 30 次探测无应答后以 `probe-failed` 结束，Ctrl-C 为 `interrupted`，`q` 后确认 `y` 为 `closed`。退出先停止读取队列、丢弃尚未领取的工作并唤醒空闲读取线程，再不另设期限地等待线程结束；只有已领取的请求会完成，由它原有调用的超时限制。工作线程结束后恢复终端。停止之后不会再执行排队中的已看标记。
 
 ## 代码位置
 
@@ -162,5 +163,6 @@ flowchart LR
 - `src/sidebar/tree.rs`：团队树及其折叠
 - `src/sidebar/keys.rs`、`src/sidebar/input.rs`：按键和鼠标报告
 - `src/sidebar/pick.rs`：选中、保留行和 main 行
+- `src/sidebar/jobs.rs`：串行面板读取线程、已看请求、后台动作和退出处理
 - `src/agents/board.rs`、`src/agents/board_rows.rs`：侧边栏绘制的数据
 - `src/paint.rs`：颜色和显示宽度

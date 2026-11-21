@@ -95,7 +95,7 @@ Outside a team the bar groups the agents by what they ask of you (40 columns; `$
 
 Each live agent's name has its own color, the one least used by the session's live agents and never a state color. The age is the time since the last change of state. `MUX_AGENTS_ASCII=1` draws the ASCII marks. Color follows `NO_COLOR` (off), `FORCE_COLOR` or `CLICOLOR_FORCE` (on), then `TERM=dumb` (off). In the open fold an ended row is its glyph, its dim name and the time since it ended: only `exit N` keeps its word, in red; a lost or unknown row, which has not ended, shows its age.
 
-Notes at the bottom of the bar: `refresh failed` (the last board, shown when a read failed), `layout: repair paused`, `focus failed: <name>`, `nothing to open for <name>`, `no notes`, `notes failed`, `opens in: tab|split h|split v`, `placement refused: <reason>`, `close failed: <name>`, and the questions `close? y/n` and `close bar? y/n`.
+Notes at the bottom of the bar: `refresh failed` (the last board, shown when a read failed or has been pending for 15 seconds), `layout: repair paused`, `focus failed: <name>`, `nothing to open for <name>`, `no notes`, `notes failed`, `opens in: tab|split h|split v`, `placement refused: <reason>`, `close failed: <name>`, and the questions `close? y/n` and `close bar? y/n`.
 
 ## Keys
 
@@ -144,17 +144,18 @@ flowchart LR
   open["spawn, up or sidebar"] --> split["split-window at the right edge"]
   split --> watch["mux-agent watch"]
   watch -- "each tick" --> probe["own pane: id, label, size"]
-  watch -- "each tick" --> board["board: records, reports, mail, hc"]
-  board --> lay["tree or flat layout"]
+  watch -- "one read pending" --> reader["reader thread: board and seen FIFO"]
+  reader -- "answer" --> lay["latest board: tree or flat layout"]
   lay --> frame["frame written in place"]
   keys["keys and clicks"] --> watch
 ```
 
 - **A process in a split.** `sidebar`, the first spawn or `up` runs `split-window` at the right edge of the caller's window, full height, running `<binary> watch -Managed <key>` by the binary's absolute path, `<key>` 32 random hex stored once in that state root's `bar-key` file, so every process under the same root reads the same key however its path is spelled; your pane stays active. `-Managed` is a flag only that split passes: a bar whose opener died before it was recorded (killed mid-open) closes itself within 10 s, and `sidebar -Close` under the same state root closes it at once; a `watch` you run by hand is left alone. The bar is that process, not its `@agent-role sidebar` label: the session option `@mux-agents-sidebar-id` records `<pane> <pid> <start>`, and every step proves the pane still runs it. A pane that carries the label without being that process is named and never closed.
-- **What it reads.** Each tick, every second (`Pace` in `src/sidebar.rs`) and at once after a key or a left press, it reads its own pane's id, label and size, then the board in-process (`src/agents/board.rs`, `src/agents/board_rows.rs`): each agent's record, the activity its client reported, its status or last message, its unread mail, whether it needs recovery, the team's kept shells and the pane the session shows. Between ticks it polls every 200 ms, cheaply: the pane on screen (one multiplexer read) and the newest change time of the agents' folders and mailboxes (file times, no process). Another pane on screen (a tab switch) or a change there (a report, a status, a message) draws a new frame at once, so the bar shows it within 200 ms. The walk that gives other view windows their bar runs every 5 ticks.
+- **What it reads.** The first frame reads the board inline. Later ticks (every second, and after input) ask one long-lived reader thread for a board only when no read is pending; the loop draws the last answer meanwhile. The reader owns its context and serializes board reads and seen marks. Input waits are sliced to at most 10 ms while a read is pending, without shortening the 50 ms Escape wait. An answer ends the wait: input already waiting acts on the frame it targeted, then the bar redraws. Every 200 ms a poll checks the shown pane and state-file stamps; a moved pane still redraws during a read, but a moved stamp does not start another read. Other tick-time multiplexer calls stay on the loop. A read pending 15 s shows `refresh failed`; a panic or thread-start failure refuses pending work and retries next tick, with inline fallback after three consecutive reader failures.
+- **Seen marks.** Leaving a viewed done spell queues its member id, pane and change time on the reader. It stays queued until marking succeeds, before the next read. Space still marks synchronously and requests a fresh read after any read in flight. Every successful mark overlays that same spell as `idle` on all later frames, even a delayed answer; only a successful read requested after the mark and accepted as the displayed board retires the overlay. Enter, clicks and Space can still wait for the member lock they themselves need.
 - **Redraw.** The board is laid out at the pane's actual size and never wraps; each frame is written in place inside synchronized output, with no full clear, so it does not flicker. With `TERM=dumb` it prints plain frames and takes no keys or clicks.
 - **The keeper.** When a split, a layout change, `swap-pane` or `rotate-window` moves the bar, the next tick puts it back at the right edge and selects your pane again. A zoomed window is left alone. After 3 failed repairs in a row it shows `layout: repair paused` until the layout changes or a minute passes.
-- **The end.** `watch` ends `pane-closed` when its pane is gone, `output-closed` when a write fails, `probe-failed` after 30 unanswered probes in a row, `interrupted` on Ctrl-C, and `closed` after `q` and `y`; it puts the terminal back on every exit.
+- **The end.** `watch` ends `pane-closed` when its pane is gone, `output-closed` when a write fails, `probe-failed` after 30 unanswered probes in a row, `interrupted` on Ctrl-C, and `closed` after `q` and `y`. Exit stops the reader queue, drops unclaimed work and wakes an idle reader, then joins it without an added deadline; only its claimed request finishes, bounded by the calls it already uses. The terminal is restored after workers finish. No queued seen mark runs after shutdown starts.
 
 ## Where it lives
 
@@ -162,5 +163,6 @@ flowchart LR
 - `src/sidebar/tree.rs`: the team tree and its folds
 - `src/sidebar/keys.rs`, `src/sidebar/input.rs`: keys and mouse reports
 - `src/sidebar/pick.rs`: selection, kept and main rows
+- `src/sidebar/jobs.rs`: the serial board reader, seen requests, background actions and shutdown
 - `src/agents/board.rs`, `src/agents/board_rows.rs`: the feed the bar draws
 - `src/paint.rs`: colors and display widths
