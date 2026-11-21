@@ -2528,6 +2528,12 @@ impl Elapsed {
                 };
                 row.insert(field.into(), value.into());
             }
+            // An open ping (only an open one carries `pingedAgo`) is late by its age on this frame's clock, so a row
+            // joins Inbox at the deadline on the tick, not on the next answer; whether it was answered stays the read's.
+            if let Some(ago) = row.get("pingedAgo").and_then(Value::as_u64) {
+                let late = ago >= crate::agents::ping::PING_DEADLINE.as_secs();
+                row.insert("noAnswer".into(), late.into());
+            }
         }
         aged
     }
@@ -10221,6 +10227,34 @@ mod tests {
         );
         let much_later = elapsed.at_frame(&board, at + Duration::from_secs(5));
         assert_eq!(much_later["agents"][0]["pingedAgo"], 8);
+    }
+
+    // `noAnswer` follows the ping's age on the frame clock: a row read at 9:59 whose ping crosses the deadline before the
+    // next answer (a slow or failing reader) joins Inbox at 10:00 on the tick, as a fresh read would show it.
+    #[test]
+    fn a_pings_deadline_is_crossed_on_the_frame_clock() {
+        let at = SystemTime::UNIX_EPOCH + Duration::from_secs(1000);
+        let pinged = crate::util::utc_o(at - Duration::from_secs(599));
+        let board = json!({"running":1,"agents":[
+            {"id":ID,"name":"worker","activity":"working","pingedAgo":599,"pingedAt":pinged,"noAnswer":false},
+            {"id":"answered","name":"done","activity":"working","noAnswer":false}
+        ]}).as_object().unwrap().clone();
+        let elapsed = Elapsed {
+            at,
+            ended: Default::default(),
+        };
+        let before = elapsed.at_frame(&board, at);
+        assert_eq!(before["agents"][0]["noAnswer"], false);
+        let after = elapsed.at_frame(&board, at + Duration::from_secs(1));
+        assert_eq!(after["agents"][0]["pingedAgo"], 600);
+        assert_eq!(
+            after["agents"][0]["noAnswer"], true,
+            "the deadline crossed on the frame clock"
+        );
+        assert_eq!(
+            after["agents"][1]["noAnswer"], false,
+            "a row with no open ping never becomes late"
+        );
     }
 
     #[test]
