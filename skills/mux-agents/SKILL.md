@@ -61,6 +61,8 @@ The commands below, and the Reply and Listen lines, run as-is in the Bash tool. 
 "<entry>" notes
 "<entry>" notes <id>
 "<entry>" peek <name> -Lines <n>
+"<entry>" ping <name>
+"<entry>" answer <id> -BodyFile <body-file>
 "<entry>" stop <name>
 "<entry>" resume <name>
 "<entry>" resume <name> -Tab
@@ -81,6 +83,8 @@ Pass `-Role <role>` only when the user names a role. A role is one of the spawni
 - `team` and `children` are one message id to each recipient. Answer a message with `-Re <its id>`, to its sender only (a name, `parent` or `leader`); a reply that would be hop 4 is refused, and a broadcast cannot be answered with a broadcast.
 - At most 120 messages per hour; past that, `send` refuses with `retryAt`.
 - When `send` fails with `check` `mail`, run the same send again with `-Id <id>` from the reply: it finishes that send, never a new one.
+- As the leader, when you have not heard from a member for a while, run `ping <name>`. `list` keeps each member's last status in view with its time (`statusAt`), an open ping (`pingedAt`) and, after 10 minutes without an answer, `noAnswer`. Never stop a member for silence: long work is quiet.
+- When a message asks `Status? Answer with: mux-agent answer <id> -BodyFile <file>`, write what you are doing, what is done or what blocks you to a file and run `answer <id> -BodyFile <file>`. Only that answers the ping; a `send`, a `status` or reading the message does not.
 
 ## Team notebook
 
