@@ -6886,6 +6886,7 @@ hc {}:
                     adoption_moves_b_and_a_resumed_successor_stops_its_child,
                     team_messaging_stays_in_the_team,
                     notebook_and_peek_stay_in_the_team,
+                    a_pinged_member_answers_and_the_bar_clears_its_mark,
                     an_unacked_batch_is_served_again_and_rebuilt_for_a_successor,
                     a_lost_member_is_released_and_keeps_only_its_kept_labels,
                     an_orphan_left_by_a_forward_crash_is_ended_by_terminate,
@@ -7354,6 +7355,81 @@ hc {}:
     /// every pane but the harness's two command panes (members, b among them, and the quiet shells) keeps its screen;
     /// panes, windows and client selection stay as arranged (b's window has another pane active; tmux: a client is
     /// attached).
+    // Behaviour 9 of ping: the leader of an `up` team pings a member; the notice names the ping id and reading it answers
+    // nothing; the member's `answer <id> -BodyFile` clears the bar's `pinged` mark within one tick of the bar, and its
+    // doing line shows the answer.
+    fn a_pinged_member_answers_and_the_bar_clears_its_mark(mux: Mux) {
+        let Some(mut live) = Live::human(mux) else {
+            return;
+        };
+        std::fs::write(live.dir.join("brief.md"), "brief").unwrap();
+        let answer = live.path("answer.md");
+        std::fs::write(&answer, "checked in").unwrap();
+        let (code, up) = live.run(&["up", "-Client", "claude"]);
+        assert_eq!(code, 0, "{mux:?} {up}");
+        let (leader, bar) = (
+            s(&up["leader"]["id"]).to_string(),
+            s(&up["sidebar"]).to_string(),
+        );
+        let (code, c1) = live.spawn_by(&leader, "c1");
+        assert_eq!(code, 0, "{mux:?} {c1}");
+        let c1 = s(&c1["id"]).to_string();
+        let (code, ping) = live.by(&leader, &["ping", "c1"]);
+        assert_eq!(code, 0, "{mux:?} {ping}");
+        let id = s(&ping["id"]).to_string();
+        let mut screen = String::new();
+        let marked = eventually(Duration::from_secs(30), || {
+            screen = live.call(&["capture-pane", "-p", "-t", &bar]);
+            screen.contains("pinged")
+        });
+        assert!(marked, "{mux:?}: the bar shows:\n{screen}");
+        // The notice names the id; reading it answers nothing.
+        let (code, read) = live.by(&c1, &["read"]);
+        assert_eq!(code, 0, "{mux:?} {read}");
+        assert!(
+            read.to_string()
+                .contains(&format!("mux-agent answer {id} -BodyFile")),
+            "{mux:?} {read}"
+        );
+        let (code, listed) = live.by(&leader, &["list"]);
+        let row = |listed: &Value| {
+            listed["agents"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|r| r["name"] == "c1")
+                .cloned()
+                .unwrap()
+        };
+        assert_eq!(code, 0, "{mux:?} {listed}");
+        assert!(
+            row(&listed)["pingedAt"].is_string(),
+            "{mux:?} still open after the read: {listed}"
+        );
+        live.log_frames(&bar);
+        let (code, answered) = live.by(&c1, &["answer", &id, "-BodyFile", &answer]);
+        assert_eq!(
+            (code, s(&answered["text"])),
+            (0, "checked in"),
+            "{mux:?} {answered}"
+        );
+        // One whole tick of the bar that started after the answer.
+        live.wait_tick(&bar);
+        screen = live.call(&["capture-pane", "-p", "-t", &bar]);
+        assert!(
+            !screen.contains("pinged") && screen.contains("checked in"),
+            "{mux:?}: one tick after the answer the bar shows:\n{screen}"
+        );
+        let (code, listed) = live.by(&leader, &["list"]);
+        assert_eq!(code, 0, "{mux:?} {listed}");
+        let c1_row = row(&listed);
+        assert_eq!(
+            (&c1_row["pingedAt"], &c1_row["noAnswer"], &c1_row["doing"]),
+            (&Value::Null, &json!(false), &json!("checked in")),
+            "{mux:?} {listed}"
+        );
+    }
+
     fn notebook_and_peek_stay_in_the_team(mux: Mux) {
         let Some(mut live) = Live::human(mux) else {
             return;

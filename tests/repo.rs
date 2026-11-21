@@ -1245,11 +1245,7 @@ const TEST_ONLY: &[(&str, &str, &str)] = &[
         "src/agents/outcome.rs",
         "tests",
     ),
-    (
-        "src/agents/ping/tests.rs",
-        "src/agents/ping.rs",
-        "tests",
-    ),
+    ("src/agents/ping/tests.rs", "src/agents/ping.rs", "tests"),
     (
         "src/agents/life_fixture.rs",
         "src/agents/mod.rs",
