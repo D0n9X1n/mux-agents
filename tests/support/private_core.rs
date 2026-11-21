@@ -170,15 +170,21 @@ impl PrivateCore {
             .as_u64()
             .expect("hc server status --json names the core pid") as u32;
         assert!(kill_pid(pid), "kill of the core {pid} failed");
-        // The process table, not whether the pid opens: a held handle keeps a killed process openable.
-        let same = |pid: u32, start: Option<i64>| start.is_some() && listed(pid, start);
+        // Signalled only when the pid opens with its recorded start: never a reused pid, nor one whose start cannot
+        // be read.
+        let same = |pid: u32, start| mux_agent::proc::host().open(pid).map(|o| o.start) == start;
         for (pid, start) in kill_order(terminals) {
             if start.is_some() && same(pid, start) && !kill_pid(pid) {
+                // A failed kill is waited out on the process table, not on whether the pid opens: a held handle keeps a
+                // process that already exited openable.
                 let end = Instant::now() + Duration::from_secs(5);
-                while same(pid, start) && Instant::now() < end {
+                while listed(pid, start) && Instant::now() < end {
                     std::thread::sleep(Duration::from_millis(50));
                 }
-                assert!(!same(pid, start), "kill of {pid} failed and it still runs");
+                assert!(
+                    !listed(pid, start),
+                    "kill of {pid} failed and it still runs"
+                );
             }
         }
         let clients: Vec<(u32, Option<i64>)> = terminals

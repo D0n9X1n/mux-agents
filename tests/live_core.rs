@@ -387,6 +387,11 @@ fn an_exited_child_still_held_is_not_listed() {
         assert!(Instant::now() < end, "the child did not exit");
         std::thread::sleep(Duration::from_millis(50));
     }
+    // The table may list an exited process for a moment after its exit is seen: waited for, with the child held.
+    let end = Instant::now() + Duration::from_secs(10);
+    while private_core::listed(me.0, me.1) && Instant::now() < end {
+        std::thread::sleep(Duration::from_millis(50));
+    }
     assert!(
         !private_core::listed(me.0, me.1),
         "an exited child is not listed while it is still held"
