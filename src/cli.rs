@@ -461,10 +461,12 @@ fn dispatch(def: &VerbDef, request: &Request, ctx: &Ctx) -> Res<Map<String, Valu
         return Ok(success(def, data));
     }
     // Non-mux herdr terminals stand down; committed mux workers use their member identity.
+    let mut prechecked = None;
     if crate::caller::hc::applies(ctx) {
-        // A member's `spawn -Role` refuses a role it cannot use from local files, before the hc calls that prove it.
+        // A member's `spawn -Role` refuses a role it cannot use from local files, before the hc calls that prove it;
+        // the snapshot it read goes to spawn, which never reads the role file again.
         if def.name == "spawn" {
-            crate::agents::spawn::role_precheck(ctx, request)?;
+            prechecked = crate::agents::spawn::role_precheck(ctx, request)?;
         }
         let caller = crate::caller::hc::resolve(ctx)?;
         if caller.candidate.is_some() && !crate::agents::tree::candidate_verb(def.name, request) {
@@ -474,7 +476,10 @@ fn dispatch(def: &VerbDef, request: &Request, ctx: &Ctx) -> Res<Map<String, Valu
     }
     // Every public verb refuses a sandboxed caller before any multiplexer call (MuxAgents.ps1:94).
     crate::sandbox::assert_unsandboxed(ctx)?;
-    let data = (def.handler)(ctx, request)?;
+    let data = match prechecked {
+        Some(role) => crate::agents::spawn::spawn_with(ctx, request, Some(role))?,
+        None => (def.handler)(ctx, request)?,
+    };
     Ok(success(def, data))
 }
 

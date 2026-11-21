@@ -406,6 +406,12 @@ fn by_id(dir: &Path, id: &str) -> Option<PathBuf> {
 /// A regular file's first bytes, at most one past the cap; None when it cannot be read.
 fn read_head(path: &Path) -> Option<Vec<u8>> {
     use std::io::Read;
+    #[cfg(test)]
+    READS.with(|reads| {
+        if let Some(reads) = reads.borrow_mut().as_mut() {
+            reads.push(path.to_path_buf());
+        }
+    });
     if !path.is_file() {
         return None;
     }
@@ -804,6 +810,21 @@ fn flow(inner: &str) -> Option<Vec<String>> {
             _ => return None,
         }
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    // While `record_reads` runs on this thread: every role file a search opened, in order.
+    static READS: std::cell::RefCell<Option<Vec<PathBuf>>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Runs `f` and answers its result with every role file opened on this thread meanwhile.
+#[cfg(test)]
+pub fn record_reads<T>(f: impl FnOnce() -> T) -> (T, Vec<PathBuf>) {
+    READS.with(|reads| *reads.borrow_mut() = Some(Vec::new()));
+    let got = f();
+    let reads = READS.with(|reads| reads.borrow_mut().take().unwrap_or_default());
+    (got, reads)
 }
 
 /// A path as messages show it, with forward slashes.

@@ -116,3 +116,101 @@ fn a_members_missing_role_refuses_before_any_hc_call() {
     assert!(out.contains(r#""check":"role""#), "{out}");
     assert_eq!(m.w.fakes.hc_calls().len(), before, "no hc call: {out}");
 }
+
+/// A member recorded in `<temp>/w` calling from `<temp>/w/sub`, with role `x` in `/w` only; the role file's path.
+fn rooted(m: &mut Mw) -> std::path::PathBuf {
+    let temp = m.w.ctx.cwd.parent().unwrap().to_path_buf();
+    let (root, sub) = (temp.join("w"), temp.join("w").join("sub"));
+    std::fs::create_dir_all(root.join(".git")).unwrap();
+    std::fs::create_dir_all(&sub).unwrap();
+    let role = root.join(".claude").join("agents").join("x.md");
+    put(&role, "---\nname: x\ntools: Read\n---\nfrom w\n");
+    let file = m.folder(ID).join("record.json");
+    let mut r = crate::state::fs::read_json(&file).unwrap().unwrap();
+    r["directory"] = json!(root);
+    write(&file, r.clone());
+    m.r = r;
+    m.w.ctx.home = temp.join("home");
+    m.w.ctx.cwd = sub;
+    m.w.file("t.md", b"task");
+    m.w.file("b.md", b"brief");
+    role
+}
+
+fn spawn_x() -> [String; 13] {
+    [
+        "spawn",
+        "-Client",
+        "claude",
+        "-TaskFile",
+        "t.md",
+        "-BriefFile",
+        "b.md",
+        "-Context",
+        "brief",
+        "-Name",
+        "child",
+        "-Role",
+        "x",
+    ]
+    .map(String::from)
+}
+
+/// The dispatcher's check reads the role once, before any hc call, and spawn uses that snapshot: a role file deleted
+/// on the first hc call still spawns from it, and the definition is read exactly once per spawn.
+#[test]
+fn a_members_spawn_uses_the_snapshot_read_before_the_proof() {
+    let mut m = member_world();
+    let role = rooted(&mut m);
+    m.hc();
+    spawn_rounds(&m, &term(&m.r, Some(150)));
+    launch_ok(&m.w);
+    let gone = role.clone();
+    m.w.fakes.hc_probe(move |_| {
+        let _ = std::fs::remove_file(&gone);
+    });
+    let ((code, out), reads) =
+        crate::agents::role::record_reads(|| crate::cli::run(&spawn_x(), || Ok(&m.w.ctx)));
+    assert_eq!(code, 0, "{out}");
+    assert_eq!(reads, vec![role.clone()], "the role file is read once");
+    let ok: Value = serde_json::from_str(out.trim()).unwrap();
+    let child = m.folder(ok["id"].as_str().unwrap());
+    assert_eq!(
+        std::fs::read_to_string(child.join("role.md")).unwrap(),
+        "from w\n"
+    );
+    m.w.fakes.hc_done().unwrap();
+}
+
+/// Once hc proves the member, the launch folder it gives must be the one the snapshot was read from: a record whose
+/// folder changed in between refuses 2 `role` before anything is allocated.
+#[test]
+fn a_snapshot_from_another_folder_than_the_proven_members_refuses_before_allocate() {
+    let mut m = member_world();
+    rooted(&mut m);
+    m.hc();
+    spawn_rounds(&m, &term(&m.r, Some(150)));
+    launch_ok(&m.w);
+    let (file, sub) = (m.folder(ID).join("record.json"), m.w.ctx.cwd.clone());
+    let moved = std::cell::Cell::new(false);
+    m.w.fakes.hc_probe(move |_| {
+        if !moved.replace(true) {
+            let mut r = crate::state::fs::read_json(&file).unwrap().unwrap();
+            r["directory"] = json!(sub);
+            write(&file, r);
+        }
+    });
+    let before: Vec<_> = std::fs::read_dir(m.state.join("agents")).unwrap().collect();
+    let (code, out) = crate::cli::run(&spawn_x(), || Ok(&m.w.ctx));
+    assert_eq!(code, 2, "{out}");
+    assert!(out.contains(r#""check":"role""#), "{out}");
+    let after: Vec<_> = std::fs::read_dir(m.state.join("agents")).unwrap().collect();
+    assert_eq!(after.len(), before.len(), "nothing allocated: {out}");
+    assert!(
+        !m.w.fakes
+            .hc_calls()
+            .iter()
+            .any(|(_, a, _)| a.first().is_some_and(|a| a == "run")),
+        "no launch"
+    );
+}

@@ -125,6 +125,16 @@ pub struct Identity<'a> {
 }
 
 pub fn spawn(ctx: &Ctx, request: &Request) -> Res<Map<String, Value>> {
+    spawn_with(ctx, request, None)
+}
+
+/// `spawn` with the role snapshot the dispatcher's `role_precheck` read before the hc proof, if any: it is used as
+/// read, never read again, once the proven caller's launch folder is the one it was read from.
+pub(crate) fn spawn_with(
+    ctx: &Ctx,
+    request: &Request,
+    prechecked: Option<super::role::Bound>,
+) -> Res<Map<String, Value>> {
     let split = request.value("Split");
     let tab = request.switch("Tab");
     let model = request.value("Model");
@@ -185,15 +195,27 @@ pub fn spawn(ctx: &Ctx, request: &Request) -> Res<Map<String, Value>> {
     } else {
         ctx.cwd.clone()
     };
-    // A role is read once, from the folder the child starts in, before any hc call, pane or record: what it cannot
-    // give refuses here, and resume, recovery and restore replay the stored options, never the file.
-    let role = role
-        .map(|name| {
+    // A role is read once, from the folder the child starts in, before any pane or record: what it cannot give
+    // refuses here, and resume, recovery and restore replay the stored options, never the file. An hc member's was
+    // read by the dispatcher before the proof; now that the proof gives the member's launch folder, it must be the
+    // folder that snapshot was read from (before anything is allocated), and the file is not read again.
+    let role = match (role, prechecked) {
+        (None, _) => None,
+        (Some(_), Some(bound)) => {
+            if bound.snapshot.folder != launch_folder(ctx, &caller, outside, &directory) {
+                return refuse(
+                    2,
+                    "role",
+                    "the proven member starts in another folder than its role was read from",
+                );
+            }
+            Some(bound)
+        }
+        (Some(name), None) => {
             let folder = launch_folder(ctx, &caller, outside, &directory);
-            super::role::resolve(&ctx.home, &folder, client, name)
-        })
-        .transpose()?
-        .map(|snapshot| snapshot.bind(model.is_some()));
+            Some(super::role::resolve(&ctx.home, &folder, client, name)?.bind(model.is_some()))
+        }
+    };
     if let Some(r) = &role {
         super::role::preflight(client, effort, model, &r.tokens)?;
     }
@@ -337,24 +359,26 @@ pub fn spawn(ctx: &Ctx, request: &Request) -> Res<Map<String, Value>> {
 }
 
 /// An hc member's `spawn -Role`, run by the dispatcher before it proves the member through hc: a role the member
-/// cannot use refuses from local files alone, before any hc call. The member's folder is its record's `directory`;
-/// with no single record naming this terminal, spawn checks the role after the proof, as for any other caller.
-pub(crate) fn role_precheck(ctx: &Ctx, request: &Request) -> Res<()> {
+/// cannot use refuses from local files alone, before any hc call. The member's folder is its record's `directory`.
+/// The snapshot it read is what `spawn_with` uses, so the role file is read once per spawn; with no single record
+/// naming this terminal it answers none, and spawn reads the role after the proof, as for any other caller.
+pub(crate) fn role_precheck(ctx: &Ctx, request: &Request) -> Res<Option<super::role::Bound>> {
     let (Some(name), Some(client)) = (
         request.value("Role"),
         request.value("Client").and_then(client_named),
     ) else {
-        return Ok(());
+        return Ok(None);
     };
     let model = request.value("Model");
     if !super::role::valid_name(name) {
         return Err(usage("spawn"));
     }
     let Some(folder) = hc_member_folder(ctx).filter(|_| model.is_none_or(model_name)) else {
-        return Ok(());
+        return Ok(None);
     };
     let bound = super::role::resolve(&ctx.home, &folder, client, name)?.bind(model.is_some());
-    super::role::preflight(client, request.value("Effort"), model, &bound.tokens)
+    super::role::preflight(client, request.value("Effort"), model, &bound.tokens)?;
+    Ok(Some(bound))
 }
 
 /// The `directory` of the one member record, under any server key of the state root, whose `hcAddress` is this
