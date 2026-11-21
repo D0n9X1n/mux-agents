@@ -45,7 +45,7 @@ impl Request {
 
 #[derive(Debug)]
 pub(crate) enum Answer {
-    Read(u64, Res<Map<String, Value>>),
+    Read(u64, Res<crate::agents::board::Timed>),
     Seen(Seen, Res<bool>),
 }
 
@@ -325,6 +325,24 @@ fn spawn<K: Clone + Send + 'static, T: Send + 'static>(
     }
 }
 
+/// Slow-runner reproduction is compiled only into the test-enabled binary, never a release build.
+fn delay_read_answer(
+    ctx: &Ctx,
+    answer: Res<crate::agents::board::Timed>,
+) -> Res<crate::agents::board::Timed> {
+    #[cfg(feature = "test-panic")]
+    if let Some(ms) = ctx
+        .env
+        .get("MUX_AGENTS_TEST_READER_DELAY_MS")
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|ms| (300..=600).contains(ms))
+    {
+        ctx.clock.sleep(std::time::Duration::from_millis(ms));
+    }
+    let _ = ctx;
+    answer
+}
+
 impl Jobs {
     /// The newest requested read, so a mark can reject older answers.
     pub(crate) fn generation(&self) -> u64 {
@@ -355,7 +373,7 @@ impl Jobs {
             self.ready.push_back((
                 Answer::Read(
                     self.generation,
-                    crate::agents::board::board(ctx, caller, true, true),
+                    crate::agents::board::timed(ctx, caller, true, true),
                 ),
                 false,
             ));
@@ -377,7 +395,10 @@ impl Jobs {
                 move |request: &Request| match request {
                     Request::Read(generation) => Answer::Read(
                         *generation,
-                        crate::agents::board::board(&ctx, &caller, true, true),
+                        delay_read_answer(
+                            &ctx,
+                            crate::agents::board::timed(&ctx, &caller, true, true),
+                        ),
                     ),
                     Request::Seen(seen) => Answer::Seen(
                         seen.clone(),

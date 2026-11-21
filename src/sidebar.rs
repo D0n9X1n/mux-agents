@@ -13,6 +13,7 @@ use std::time::{Duration, SystemTime};
 
 use serde_json::{Map, Value};
 
+#[cfg(test)]
 use crate::agents::board::board;
 use crate::agents::spawn::{pane_env, utf8};
 use crate::agents::view::Focused;
@@ -2430,6 +2431,60 @@ pub fn run_watch(
 /// another window's bar may spend, and as long again for the work it then does under the lock.
 const JOBS_WAIT: Duration = Duration::from_secs(2 * crate::state::lock::LOCK_WAIT.as_secs());
 
+/// A board's elapsed values share this read clock. Absolute origins retain fractional seconds where known.
+struct Elapsed {
+    at: SystemTime,
+    ended: std::collections::BTreeMap<String, SystemTime>,
+}
+
+impl Elapsed {
+    fn at_frame(&self, board: &Map<String, Value>, frame_at: SystemTime) -> Map<String, Value> {
+        let mut aged = board.clone();
+        for row in aged
+            .get_mut("agents")
+            .and_then(Value::as_array_mut)
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_object_mut)
+        {
+            for (field, origin) in [
+                ("age", "createdAt"),
+                ("since", "changedAt"),
+                ("endedAgo", ""),
+            ] {
+                let Some(seconds) = row.get(field).and_then(Value::as_u64) else {
+                    continue;
+                };
+                let at = if field == "endedAgo" {
+                    self.ended.get(&Target::of(row).id).copied()
+                } else {
+                    row.get(origin)
+                        .and_then(Value::as_str)
+                        .and_then(crate::util::parse_utc)
+                };
+                let value = match at {
+                    Some(at) => frame_at.duration_since(at).unwrap_or_default().as_secs(),
+                    None => match frame_at.duration_since(self.at) {
+                        Ok(delta) => seconds.saturating_add(delta.as_secs()),
+                        Err(back) => seconds.saturating_sub(back.duration().as_secs()),
+                    },
+                };
+                row.insert(field.into(), value.into());
+            }
+        }
+        aged
+    }
+}
+
+#[cfg(test)]
+fn timed_test_board(board: Map<String, Value>) -> crate::agents::board::Timed {
+    crate::agents::board::Timed {
+        board,
+        at: SystemTime::UNIX_EPOCH,
+        ended: Default::default(),
+    }
+}
+
 /// `run_watch`'s loop, its actions running off the loop in `panel`'s jobs.
 fn watch_loop(
     ctx: &Ctx,
@@ -2449,6 +2504,8 @@ fn watch_loop(
     let mut keeper = Keeper::default();
     let mut last: Option<Map<String, Value>> = None;
     let mut first = true;
+    let mut elapsed: Option<Elapsed> = None;
+    let mut frame_at = ctx.clock.now();
     let mut read_failed = false;
     let mut done = Vec::new();
     let mut asked_at = ctx.clock.now();
@@ -2612,7 +2669,10 @@ fn watch_loop(
             // next poll draws it instead of taking it as drawn.
             if first {
                 polled_stamp = pace.poll.and_then(|_| stamp(&root));
-                answers.push(jobs::Answer::Read(0, board(ctx, caller, true, true)));
+                answers.push(jobs::Answer::Read(
+                    0,
+                    crate::agents::board::timed(ctx, caller, true, true),
+                ));
                 first = false;
             } else if answers.is_empty() && !panel.jobs.reading() {
                 polled_stamp = pace.poll.and_then(|_| stamp(&root));
@@ -2626,6 +2686,13 @@ fn watch_loop(
         for answer in answers.drain(..) {
             match answer {
                 jobs::Answer::Read(generation, answer) => {
+                    let answer = answer.map(|read| {
+                        elapsed = Some(Elapsed {
+                            at: read.at,
+                            ended: read.ended,
+                        });
+                        read.board
+                    });
                     read_failed = !panel.accept_read(&mut last, generation, answer);
                     if !read_failed {
                         fresh = true;
@@ -2728,8 +2795,16 @@ fn watch_loop(
             ended_open: panel.ended_open,
         };
         // A row whose resume runs is drawn `resuming…` from memory until the board catches up.
-        let seen = panel.seen_board(last.as_ref());
-        let seen_board = seen.as_ref().or(last.as_ref());
+        if tick {
+            frame_at = ctx.clock.now();
+        }
+        let aged = elapsed
+            .as_ref()
+            .zip(last.as_ref())
+            .map(|(elapsed, board)| elapsed.at_frame(board, frame_at));
+        let aged_board = aged.as_ref().or(last.as_ref());
+        let seen = panel.seen_board(aged_board);
+        let seen_board = seen.as_ref().or(aged_board);
         let marked = panel.jobs.mark(seen_board);
         let drawn_board = marked.as_ref().or(seen_board);
         let bare = lay_hinted(drawn_board, &notes, size, look, focus);
@@ -9420,7 +9495,7 @@ mod tests {
                     let jobs::Request::Read(generation) = request else {
                         unreachable!()
                     };
-                    jobs::Answer::Read(*generation, Ok(Map::new()))
+                    jobs::Answer::Read(*generation, Ok(timed_test_board(Map::new())))
                 }
             });
             let (watch_ready, ready) = channel();
@@ -9514,7 +9589,7 @@ mod tests {
                     jobs::Request::Read(generation) => {
                         claimed.send(()).unwrap();
                         read_gate.recv().unwrap();
-                        jobs::Answer::Read(*generation, Ok(Map::new()))
+                        jobs::Answer::Read(*generation, Ok(timed_test_board(Map::new())))
                     }
                     jobs::Request::Seen(seen) => {
                         marked.send(()).unwrap();
@@ -9639,7 +9714,7 @@ mod tests {
                         let _ = got_lock.send(());
                         Ok(Map::new())
                     });
-                    jobs::Answer::Read(*generation, board)
+                    jobs::Answer::Read(*generation, board.map(timed_test_board))
                 }
             });
             let (watch_ready, ready) = channel();
@@ -9858,7 +9933,7 @@ mod tests {
             move || {
                 move |request: &jobs::Request| match request {
                     jobs::Request::Read(generation) => {
-                        jobs::Answer::Read(*generation, Ok(board.clone()))
+                        jobs::Answer::Read(*generation, Ok(timed_test_board(board.clone())))
                     }
                     jobs::Request::Seen(seen) => {
                         gate.recv_timeout(Duration::from_secs(5)).unwrap();
@@ -9906,6 +9981,214 @@ mod tests {
         );
         assert!(frames[0].contains("Inbox"));
         assert!(!frames.last().unwrap().contains("Inbox"));
+    }
+
+    #[test]
+    fn timed_board_keeps_the_row_clock_and_fractional_end_origin_outside_the_json() {
+        let w = watch_world(&["live"]);
+        write(
+            &w.folder("bbbbbbbbbbbb").join("notice.json"),
+            json!({"kind":"exited","exitCode":0,"at":"1970-01-01T00:03:00.250Z"}),
+        );
+        watch_frames(&w, 1);
+        let read = crate::agents::board::timed(&w.ctx, &w.caller(), true, true).unwrap();
+        assert_eq!(read.at, w.ctx.clock.now());
+        assert_eq!(
+            read.ended["bbbbbbbbbbbb"],
+            SystemTime::UNIX_EPOCH + Duration::from_millis(180250)
+        );
+        assert!(
+            read.board.get("readAt").is_none(),
+            "private clock metadata is not a list column"
+        );
+        let elapsed = Elapsed {
+            at: read.at,
+            ended: read.ended,
+        };
+        let frame = elapsed.at_frame(&read.board, read.at + Duration::from_millis(300));
+        let ended = frame["agents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["id"] == "bbbbbbbbbbbb")
+            .unwrap();
+        assert_eq!(
+            ended["endedAgo"], 60,
+            "end rounding agrees with an inline read at the frame clock"
+        );
+        w.fakes.hc_done().unwrap();
+    }
+
+    #[test]
+    fn frame_elapsed_values_cover_activity_and_ended_ages_without_touching_other_numbers() {
+        let at = SystemTime::UNIX_EPOCH + Duration::from_millis(10900);
+        let board = json!({"running":1,"agents":[
+            {"id":ID,"age":5,"since":3,"createdAt":"1970-01-01T00:00:05.200Z","changedAt":"1970-01-01T00:00:07.100Z","unread":8},
+            {"id":"ended","age":9,"endedAgo":2},
+            {"id":"nulls","age":null,"since":null,"endedAgo":"untimed"},
+            {"id":"fallback","age":0,"since":1,"endedAgo":u64::MAX}
+        ]}).as_object().unwrap().clone();
+        let elapsed = Elapsed {
+            at,
+            ended: [(
+                "ended".into(),
+                SystemTime::UNIX_EPOCH + Duration::from_millis(8100),
+            )]
+            .into(),
+        };
+        let later = elapsed.at_frame(&board, at + Duration::from_millis(400));
+        assert_eq!(later["agents"][0]["age"], 6);
+        assert_eq!(
+            later["agents"][0]["since"], 4,
+            "fractional activity origin is preserved"
+        );
+        assert_eq!(
+            later["agents"][1]["endedAgo"], 3,
+            "fractional end origin is preserved"
+        );
+        assert_eq!(later["agents"][0]["unread"], 8);
+        assert_eq!(later["running"], 1);
+        assert_eq!(
+            later["agents"][2], board["agents"][2],
+            "null and nonnumeric fields stay as read"
+        );
+        let earlier = elapsed.at_frame(&board, at - Duration::from_secs(3));
+        assert_eq!(earlier["agents"][0]["since"], 0);
+        assert_eq!(earlier["agents"][1]["endedAgo"], 0);
+        assert_eq!(
+            earlier["agents"][3]["since"], 0,
+            "backdating saturates at zero"
+        );
+        let much_later = elapsed.at_frame(&board, at + Duration::from_secs(5));
+        assert_eq!(much_later["agents"][3]["since"], 6);
+        assert_eq!(much_later["agents"][3]["endedAgo"], json!(u64::MAX));
+        assert_eq!(
+            board["agents"][0]["age"], 5,
+            "never mutate the cached board"
+        );
+    }
+
+    #[test]
+    fn real_state_changes_redraw_at_once_but_keep_the_ticks_elapsed_clock() {
+        let w = watch_world(&["live"]);
+        pace(Pace {
+            tick: Duration::from_secs(1),
+            poll: None,
+        });
+        let file = w.folder(ID).join("record.json");
+        let mut record = crate::state::fs::read_json(&file).unwrap().unwrap();
+        record["createdAt"] = json!("1970-01-01T00:03:55.200Z");
+        write(&file, record);
+        watch_frames(&w, 2);
+        let start = w.ctx.clock.now();
+        let fakes = w.fakes.clone();
+        let mut script = Script::new(&w.fakes, vec![(1600, key(&[3]))]);
+        script.on_wait = Some(Box::new(move |_| {
+            use crate::ctx::Clock;
+            if fakes.now().duration_since(start).unwrap() >= Duration::from_millis(1400) {
+                jobs::HOLD_READ.set(false);
+            }
+        }));
+        let mut frames = Vec::new();
+        let ended = run_watch(
+            &w.ctx,
+            &w.caller(),
+            Origin::Hand,
+            Box::new(script),
+            &mut |frame| {
+                frames.push((
+                    w.ctx.clock.now().duration_since(start).unwrap().as_millis(),
+                    frame.to_string(),
+                ));
+                if frames.len() == 1 {
+                    jobs::HOLD_READ.set(true);
+                    write(
+                        &w.folder(ID).join("status.json"),
+                        json!({"text":"actual new state","at":"x"}),
+                    );
+                }
+                Ok(())
+            },
+        );
+        jobs::HOLD_READ.set(false);
+        pace(Pace::default());
+        assert_eq!(ended, "interrupted");
+        let (_, answer) = frames
+            .iter()
+            .find(|(at, frame)| (1400..=1420).contains(at) && frame.contains("actual new state"))
+            .expect("state redraw does not wait for the next tick");
+        assert!(
+            answer
+                .lines()
+                .any(|line| line.contains("worker") && line.contains("5s")),
+            "use the tick at 1s, not the answer at 1.4s: {answer}"
+        );
+        w.fakes.hc_done().unwrap();
+    }
+
+    #[test]
+    fn age_only_answers_between_ticks_write_once_per_tick_with_current_ages() {
+        let mut runs = Vec::new();
+        for delayed in [false, true] {
+            let w = watch_world(&["live"]);
+            pace(Pace {
+                tick: Duration::from_secs(1),
+                poll: None,
+            });
+            let file = w.folder(ID).join("record.json");
+            let mut record = crate::state::fs::read_json(&file).unwrap().unwrap();
+            record["createdAt"] = json!("1970-01-01T00:03:55Z");
+            write(&file, record);
+            watch_frames(&w, 5);
+            let start = w.ctx.clock.now();
+            let fakes = w.fakes.clone();
+            let mut script = Script::new(&w.fakes, vec![(4500, key(&[3]))]);
+            script.on_wait = Some(Box::new(move |_| {
+                use crate::ctx::Clock;
+                jobs::HOLD_READ.set(
+                    delayed && fakes.now().duration_since(start).unwrap().as_millis() % 1000 < 400,
+                );
+            }));
+            let mut frames = Vec::new();
+            let ended = run_watch(
+                &w.ctx,
+                &w.caller(),
+                Origin::Hand,
+                Box::new(script),
+                &mut |frame| {
+                    frames.push((
+                        w.ctx.clock.now().duration_since(start).unwrap().as_millis(),
+                        frame.to_string(),
+                    ));
+                    if frames.len() == 1 {
+                        jobs::HOLD_READ.set(delayed);
+                    }
+                    Ok(())
+                },
+            );
+            jobs::HOLD_READ.set(false);
+            pace(Pace::default());
+            assert_eq!(ended, "interrupted");
+            w.fakes.hc_done().unwrap();
+            runs.push(frames);
+        }
+        assert_eq!(
+            runs[1].iter().map(|(at, _)| *at).collect::<Vec<_>>(),
+            [0, 1000, 2000, 3000, 4000],
+            "age-only answers are not new frames"
+        );
+        assert_eq!(
+            runs[1], runs[0],
+            "cached ages at every tick match an inline board read"
+        );
+        for (n, (_, frame)) in runs[1].iter().enumerate() {
+            assert!(
+                frame
+                    .lines()
+                    .any(|line| line.contains("worker") && line.contains(&format!("{}s", 5 + n))),
+                "tick {n}: {frame}"
+            );
+        }
     }
 
     #[test]
@@ -10163,7 +10446,7 @@ mod tests {
             move || {
                 move |request: &jobs::Request| match request {
                     jobs::Request::Read(generation) => {
-                        jobs::Answer::Read(*generation, Ok(Map::new()))
+                        jobs::Answer::Read(*generation, Ok(timed_test_board(Map::new())))
                     }
                     jobs::Request::Seen(seen) => {
                         counted.fetch_add(1, Ordering::SeqCst);

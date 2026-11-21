@@ -37,6 +37,19 @@ pub fn select_doing(
 /// is counted from its `Mail::source`, as `m` and `list` count it. Reap's member/notice/mail
 /// locks finish before sorted mailbox reads, followed by each row's agent lock. Never refresh or reap views.
 pub fn board(ctx: &Ctx, caller: &Caller, all: bool, watch: bool) -> Res<Map<String, Value>> {
+    timed(ctx, caller, all, watch).map(|read| read.board)
+}
+
+/// The feed's elapsed-seconds origin is captured where rows calculate their ages, not when slow I/O returns.
+/// End timestamps are kept outside the public board shape so the bar can preserve subsecond rounding too.
+#[derive(Debug)]
+pub(crate) struct Timed {
+    pub board: Map<String, Value>,
+    pub at: std::time::SystemTime,
+    pub ended: BTreeMap<String, std::time::SystemTime>,
+}
+
+pub(crate) fn timed(ctx: &Ctx, caller: &Caller, all: bool, watch: bool) -> Res<Timed> {
     use super::{lifecycle::Life, membership::Snapshot};
     let scope = super::team_state::Scope::of(caller);
     // cascade-3d C8, adopt-3e call 4: the bar's one try per refresh (cascade journals, then adoption); it only
@@ -212,6 +225,10 @@ pub fn board(ctx: &Ctx, caller: &Caller, all: bool, watch: bool) -> Res<Map<Stri
     });
     other.sort_by(|a, b| a.0.identity.id.cmp(&b.0.identity.id));
     let now = ctx.clock.now();
+    let ended_at = ended
+        .iter()
+        .filter_map(|(at, o, _)| at.map(|at| (o.identity.id.clone(), at)))
+        .collect();
     let ago = |at: std::time::SystemTime| now.duration_since(at).map_or(0, |d| d.as_secs());
     // `ended`: when an Ended member ended (its notice's `at`), for the bar's `endedAgo`.
     let make = |o: &super::core_facts::Observation,
@@ -339,7 +356,11 @@ pub fn board(ctx: &Ctx, caller: &Caller, all: bool, watch: bool) -> Res<Map<Stri
         })
         .collect();
     note_blocked(&mut reply, &blocked);
-    Ok(reply)
+    Ok(Timed {
+        board: reply,
+        at: rows.now,
+        ended: ended_at,
+    })
 }
 
 /// views-6f ambiguity 14: a watch of a team that has a lifecycle member (only a lifecycle generation is ever kept).

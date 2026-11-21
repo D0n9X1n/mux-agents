@@ -3,6 +3,25 @@ use crate::agents::fixture::{ID, World};
 use serde_json::json;
 use std::time::Duration;
 
+#[test]
+#[cfg(feature = "test-panic")]
+fn reader_answer_delay_is_test_only_and_preserves_the_board_read_time() {
+    let mut w = World::human("");
+    w.ctx.env = crate::ctx::Env::from_pairs([("MUX_AGENTS_TEST_READER_DELAY_MS", "450")]);
+    let at = w.ctx.clock.now();
+    let read = super::super::timed_test_board(Map::new());
+    let original = read.at;
+    let delayed = delay_read_answer(&w.ctx, Ok(read)).unwrap();
+    assert_eq!(
+        w.ctx.clock.now().duration_since(at).unwrap(),
+        Duration::from_millis(450)
+    );
+    assert_eq!(
+        delayed.at, original,
+        "delay must not restamp the age origin"
+    );
+}
+
 fn spell(changed: &str) -> Seen {
     Seen {
         id: ID.into(),
@@ -22,7 +41,9 @@ fn reader_runs_off_the_loop_and_answers_seen_before_the_next_read() {
                 gate.recv().unwrap();
                 Answer::Seen(seen.clone(), Ok(true))
             }
-            Request::Read(generation) => Answer::Read(*generation, Ok(Map::new())),
+            Request::Read(generation) => {
+                Answer::Read(*generation, Ok(super::super::timed_test_board(Map::new())))
+            }
         }
     });
     reader.ask(Request::Seen(spell("done-at")));
@@ -51,7 +72,7 @@ fn finish_stops_claims_and_waits_without_a_bound_for_the_claimed_read() {
             );
             started.send(()).unwrap();
             gate.recv().unwrap();
-            Answer::Read(1, Ok(Map::new()))
+            Answer::Read(1, Ok(super::super::timed_test_board(Map::new())))
         }
     });
     reader.ask(Request::Read(1));
@@ -204,8 +225,10 @@ fn a_first_tick_seen_request_starts_its_reader_before_any_background_read() {
 #[test]
 fn hold_read_holds_only_the_read_answer_not_a_successful_seen() {
     let mut jobs = Jobs::default();
-    jobs.ready
-        .push_back((Answer::Read(1, Ok(Map::new())), false));
+    jobs.ready.push_back((
+        Answer::Read(1, Ok(super::super::timed_test_board(Map::new()))),
+        false,
+    ));
     jobs.ready
         .push_back((Answer::Seen(spell("spell"), Ok(true)), false));
     HOLD_READ.set(true);

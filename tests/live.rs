@@ -4625,6 +4625,17 @@ hc {}:
         let Some(mut live) = Live::human(mux) else {
             return;
         };
+        // The worker's artificial latency reproduces an answer landing between a resize and its press.
+        // Only this private server receives the test-enabled binary's delay hook; production ignores it.
+        if let Ok(delay) = std::env::var("MUX_AGENTS_TEST_READER_DELAY_MS") {
+            live.call(&[
+                "set-environment",
+                "-g",
+                "MUX_AGENTS_TEST_READER_DELAY_MS",
+                &delay,
+            ]);
+            eprintln!("{mux:?}: reader answers delayed {delay} ms");
+        }
         let (bar, _) = two_rows(&mut live);
         let root = live.server.pane().to_string();
         let width = live.field(&bar, "#{pane_width}");
