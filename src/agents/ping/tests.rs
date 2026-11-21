@@ -370,3 +370,213 @@ fn status_report_sends_and_reading_the_notice_never_answer() {
         );
     }
 }
+
+// Behaviour 3a: a crash after the record and before the notice, or after the notice and before `sent`: the next ping
+// keeps the same id and ends `sent: true` (at worst two notices naming that one id), and the member's answer to that
+// id closes it.
+#[test]
+fn a_crash_on_either_side_of_the_notice_keeps_the_ping_id() {
+    for (point, mails) in [("published", 0), ("notified", 1)] {
+        let w = team_world();
+        online(&w);
+        if point == "notified" {
+            online(&w);
+        }
+        crash_after(Some(point));
+        let e = ping_as(&w.ctx, &w.caller(), "ma1").unwrap_err();
+        crash_after(None);
+        w.fakes.hc_done().unwrap();
+        assert_eq!((e.code, e.check), (1, "internal"), "{point}");
+        let r = record(&w, A);
+        assert_eq!(
+            (r["sent"].clone(), inbox(&w, A).len()),
+            (json!(false), mails),
+            "{point}"
+        );
+        let id = r["id"].as_str().unwrap().to_string();
+        online(&w);
+        online(&w);
+        let again = ping(&w, "ma1");
+        assert_eq!(
+            (again["id"].clone(), again["notified"].clone()),
+            (json!(id), json!(true)),
+            "{point}"
+        );
+        assert_eq!(record(&w, A)["sent"], json!(true), "{point}");
+        let mail = inbox(&w, A);
+        assert_eq!(mail.len(), mails + 1, "{point}");
+        assert!(
+            mail.iter()
+                .all(|m| m["body"].as_str().unwrap().contains(&id)),
+            "{point}: every notice names the one id"
+        );
+        w.file("a.md", b"ok");
+        online(&w);
+        answer_as(&w.ctx, &as_member(&w, A), &id, "a.md").unwrap();
+        assert_eq!(open(&w.folder(A), &json!("0")), None, "{point}");
+        w.fakes.hc_done().unwrap();
+    }
+}
+
+// Behaviour 3a: ping A is delivered and paused before `sent`; the member answers A; ping B publishes and stops before
+// its notice; A resumes: B's record is left as it is (`sent: false`), and B's next ping sends B's notice.
+#[test]
+fn a_late_confirm_never_marks_a_newer_ping_sent() {
+    let w = team_world();
+    let c = w.caller();
+    online(&w);
+    online(&w);
+    let a = publish(&w.ctx, &c, "ma1").unwrap();
+    notify(&w.ctx, &c, &a).unwrap();
+    w.file("a.md", b"ok");
+    online(&w);
+    answer_as(&w.ctx, &as_member(&w, A), &a.open.id, "a.md").unwrap();
+    online(&w);
+    crash_after(Some("published"));
+    ping_as(&w.ctx, &c, "ma1").unwrap_err();
+    crash_after(None);
+    let b = record(&w, A);
+    assert_ne!(b["id"], json!(a.open.id));
+    confirm(&w.ctx, &c, &a).unwrap();
+    assert_eq!(record(&w, A), b, "B's record is untouched");
+    assert_eq!(b["sent"], json!(false));
+    online(&w);
+    online(&w);
+    let again = ping(&w, "ma1");
+    assert_eq!(
+        (again["id"].clone(), again["notified"].clone()),
+        (b["id"].clone(), json!(true))
+    );
+    let mail = inbox(&w, A);
+    assert_eq!(mail.len(), 2, "A's notice, then B's");
+    assert!(
+        mail[1]["body"]
+            .as_str()
+            .unwrap()
+            .contains(b["id"].as_str().unwrap())
+    );
+    w.fakes.hc_done().unwrap();
+}
+
+// Behaviour 3a: a ping of w1 and w1's own send, at once on the real locks, both finish: the ping holds no lock across
+// its notice, and each takes the team lock, then the agent lock.
+#[test]
+fn a_ping_and_the_members_own_send_both_finish() {
+    use crate::agents::tree::tests::LEADER;
+    let w = team_world();
+    let (locks, state) = (
+        w.ctx.state_root.parent().unwrap().join("locks"),
+        w.ctx.state_root.clone(),
+    );
+    let world = move || {
+        let mut v = World::human("");
+        v.ctx.state_root = state.clone();
+        v.fakes.real_locks(&locks);
+        v.pane_rows(&[]);
+        v
+    };
+    let pinger = {
+        let world = world.clone();
+        std::thread::spawn(move || {
+            let v = world();
+            (0..5)
+                .map(|_| {
+                    online(&v);
+                    online(&v);
+                    ping_as(&v.ctx, &v.caller(), "ma1").map(|r| r["id"].clone())
+                })
+                .collect::<Vec<_>>()
+        })
+    };
+    let sender = std::thread::spawn(move || {
+        let v = world();
+        (0..5)
+            .map(|_| {
+                online(&v);
+                let request = v.request(&["send", "leader", "-Body", "x"]);
+                crate::agents::message::send_as(&v.ctx, &as_member(&v, A), &request).map(|_| ())
+            })
+            .collect::<Vec<_>>()
+    });
+    let pings = pinger.join().unwrap();
+    let sends = sender.join().unwrap();
+    assert!(sends.iter().all(Result::is_ok), "{sends:?}");
+    let ids: Vec<Value> = pings.into_iter().map(Result::unwrap).collect();
+    assert!(ids.iter().all(|id| *id == ids[0]), "one open ping: {ids:?}");
+    assert_eq!(record(&w, A)["sent"], json!(true));
+    assert_eq!(inbox(&w, A).len(), 1, "one notice");
+    assert_eq!(
+        inbox(&w, LEADER).len(),
+        5,
+        "every send of the member landed"
+    );
+}
+
+// Behaviour 5: a member resumed into a new generation after a ping never inherits it: the old record is no open
+// ping, its id answers nothing, and the next ping is a new one at the new generation.
+#[test]
+fn a_new_generation_ignores_the_old_ping() {
+    let w = team_world();
+    online(&w);
+    online(&w);
+    let old = ping(&w, "ma1")["id"].as_str().unwrap().to_string();
+    let mut r = file(&w.folder(A), "record.json");
+    (r["generation"], r["hcName"]) = (json!("1"), json!("m0123abcd"));
+    crate::state::fs::write_json(&w.folder(A).join("record.json"), &r).unwrap();
+    assert_eq!(open(&w.folder(A), &json!("1")), None);
+    w.file("a.md", b"ok");
+    online(&w);
+    let e = answer_as(&w.ctx, &as_member(&w, A), &old, "a.md").unwrap_err();
+    assert_eq!(said(e), "2 ping no open ping with that id");
+    online(&w);
+    online(&w);
+    let new = ping(&w, "ma1");
+    assert_ne!(new["id"], json!(old));
+    assert_eq!(
+        (new["notified"].clone(), record(&w, A)["generation"].clone()),
+        (json!(true), json!("1"))
+    );
+    w.fakes.hc_done().unwrap();
+}
+
+// Behaviour 3a: the ping holds no lock across its notice. It takes the team lock, then the member's agent lock, to
+// publish; the notice's own send takes the team lock again with the member's agent lock free. A ping that held the
+// agent lock into its send would take team after agent, the reverse of a send of the member (team, then agent).
+#[test]
+fn the_notice_is_sent_with_the_members_agent_lock_free() {
+    let w = team_world();
+    let c = w.caller();
+    online(&w);
+    online(&w);
+    w.fakes.clear_log();
+    ping(&w, "ma1");
+    let (team, agent) = (
+        crate::agents::team_lock(&c),
+        crate::agents::lock_key("agent", &c, A),
+    );
+    let (mut held, mut teams, mut agents) = (Vec::<String>::new(), 0, 0);
+    for e in w.fakes.locks() {
+        let (sign, key) = e.split_at(1);
+        match sign {
+            "+" if key == team => {
+                teams += 1;
+                assert!(
+                    !held.contains(&agent),
+                    "the team lock taken under the agent lock"
+                );
+                held.push(key.into());
+            }
+            "+" => {
+                agents += usize::from(key == agent);
+                held.push(key.into());
+            }
+            "-" => held.retain(|k| k != key),
+            _ => {}
+        }
+    }
+    assert_eq!(
+        (teams, agents),
+        (2, 2),
+        "publish, the notice's send; publish, then sent"
+    );
+}

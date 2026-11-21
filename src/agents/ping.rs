@@ -69,9 +69,11 @@ pub fn ping(ctx: &Ctx, request: &Request) -> Res<Map<String, Value>> {
 /// with no lock held, send the notice when the record is not yet `sent`; then mark it `sent` under the agent lock.
 pub(crate) fn ping_as(ctx: &Ctx, caller: &Caller, name: &str) -> Res<Map<String, Value>> {
     let p = publish(ctx, caller, name)?;
+    crash_point("published")?;
     let notified = !p.open.sent;
     if notified {
         notify(ctx, caller, &p)?;
+        crash_point("notified")?;
         confirm(ctx, caller, &p)?;
     }
     let mut reply = Map::new();
@@ -228,6 +230,27 @@ fn confirm(ctx: &Ctx, caller: &Caller, p: &Published) -> Res<()> {
         }
         Ok(())
     })
+}
+
+#[cfg(test)]
+thread_local! {
+    static CRASH_AFTER: std::cell::Cell<Option<&'static str>> = const { std::cell::Cell::new(None) };
+}
+
+/// Test only: the next ping on this thread stops right after `point` (`published`: the record is durable, no notice
+/// sent; `notified`: the notice is delivered, the record not yet `sent`), as a crash at that boundary would.
+#[cfg(test)]
+pub fn crash_after(point: Option<&'static str>) {
+    CRASH_AFTER.with(|c| c.set(point));
+}
+
+#[cfg_attr(not(test), allow(unused_variables))]
+fn crash_point(point: &str) -> Res<()> {
+    #[cfg(test)]
+    if CRASH_AFTER.with(|c| c.get()) == Some(point) {
+        return Err(crate::error::Refusal::internal("crash after a ping step"));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
