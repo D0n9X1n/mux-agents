@@ -9518,10 +9518,11 @@ mod tests {
                     }
                     jobs::Request::Seen(seen) => {
                         marked.send(()).unwrap();
-                        let ok =
+                        // A lock wait that times out is a refusal (retried later), not "no view to mark".
+                        let answer =
                             crate::state::lock::with_lock_at(&ctx, &root, &lock_key, || Ok(()))
-                                .is_ok();
-                        jobs::Answer::Seen(seen.clone(), Ok(ok))
+                                .map(|()| true);
+                        jobs::Answer::Seen(seen.clone(), answer)
                     }
                 }
             },
