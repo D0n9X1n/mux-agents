@@ -128,12 +128,12 @@ A wait longer than `LOCK_WAIT` (15 s) refuses 2 `lock`. `try_with_lock` makes on
 The keys in use:
 
 - `spawn|<serverKey>|<session>`, the team lock (`team_state::Scope::team_lock`): launches, `resume`, authority checks, replay hooks, the spawn budget, team mail and the notebook.
-- `member|<serverKey>|<id>`, the member lock: each write of `record.json`, `desired.json` and `view.json`; `ping` and `answer` hold it around the member's agent lock while they check its `generation`.
+- `member|<serverKey>|<id>`, the member lock: each write of `record.json`, `desired.json` and `view.json`; `ping` and `answer` take it inside the member's agent lock while they check its `generation`.
 - `gen|<serverKey>|<id>.<n>`, the generation lock: a generation's outcome, its client's session reports and its ready promotion.
 - `mail|...`, `agent|...`, `notice|...` and `sidebar|...`, built by `agents::lock_key` as `<kind>|<serverKey>|<key>` in the caller's state scope.
 - `live|<pid>-<start>`, one entry of the live-session registry (`src/state/live.rs`).
 
-Order is fixed: the team lock before a member lock, a member lock before that member's agent lock, and the session lock before a mailbox lock. Every command takes them in the same order, so no two commands can each wait for a lock the other holds. In unit tests `agents::lock` records each hold instead of taking the real lock, and tests such as `patch_and_desired_take_the_member_lock_inside_the_team_lock` assert the order.
+Order is fixed: the team lock before a member lock, a member's agent lock before its member lock (`send` takes them so when it replays an adoption for `send parent`, and `ping` and `answer` follow it), and the session lock before a mailbox lock. Every command takes them in the same order, so no two commands can each wait for a lock the other holds. In unit tests `agents::lock` records each hold instead of taking the real lock, and tests such as `patch_and_desired_take_the_member_lock_inside_the_team_lock` assert the order.
 
 ## Private folders
 

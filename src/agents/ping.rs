@@ -105,23 +105,23 @@ pub(crate) fn open(folder: &Path, generation: &Value) -> Option<Open> {
     })
 }
 
-/// Runs `f` with member `id`'s current `generation` (null when its record has none) under one hold of its member lock,
-/// then its agent lock. Resume and recovery change `generation` only under the member lock
+/// Runs `f` with member `id`'s current `generation` (null when its record has none) under one hold of its agent lock,
+/// then its member lock. Resume and recovery change `generation` only under the member lock
 /// (`team_state::Tx::record_write`), so the generation `f` checks stays the member's until `f` returns; `status`,
 /// `report` and the board read and write the files `f` writes under the agent lock. The order is the team lock (when
-/// held), the member lock, then the agent lock; nothing takes them the other way round.
+/// held), the agent lock, then the member lock, as `send` takes them (its agent lock, then the member lock when it
+/// replays an adoption for `send parent`); the other way round would deadlock against it.
 fn held<T>(ctx: &Ctx, caller: &Caller, id: &str, f: impl FnOnce(&Value) -> Res<T>) -> Res<T> {
     let folder = super::server_dir(ctx, caller).join("agents").join(id);
-    super::lock(ctx, &super::lock_key("member", caller, id), || {
-        let generation = match super::gens::member_of(&folder) {
-            super::gens::Member::Pre(r) => r.get("generation").cloned(),
-            super::gens::Member::Life(g) => g.record().get("generation").cloned(),
-            super::gens::Member::Unreadable(e) => return Err(e),
-            super::gens::Member::Absent => None,
-        };
-        let generation = generation.unwrap_or(Value::Null);
-        super::lock(ctx, &super::lock_key("agent", caller, id), || {
-            f(&generation)
+    super::lock(ctx, &super::lock_key("agent", caller, id), || {
+        super::lock(ctx, &super::lock_key("member", caller, id), || {
+            let generation = match super::gens::member_of(&folder) {
+                super::gens::Member::Pre(r) => r.get("generation").cloned(),
+                super::gens::Member::Life(g) => g.record().get("generation").cloned(),
+                super::gens::Member::Unreadable(e) => return Err(e),
+                super::gens::Member::Absent => None,
+            };
+            f(&generation.unwrap_or(Value::Null))
         })
     })
 }
@@ -247,7 +247,7 @@ pub fn answer(ctx: &Ctx, request: &Request) -> Res<Map<String, Value>> {
 }
 
 /// `answer` for a resolved caller: only a running member itself (as `status` proves it), and only for the open ping
-/// its own folder holds at its current generation. In one hold of its member, then agent lock (`held`) it checks that
+/// its own folder holds at its current generation. In one hold of its agent, then member lock (`held`) it checks that
 /// ping, writes `status.json` (the doing line shows the answer), then `answer.json {ping, text, at}`, which closes the
 /// ping; a retry after a crash between the two finds it still open.
 pub(crate) fn answer_as(
@@ -291,7 +291,7 @@ pub(crate) fn answer_as(
 }
 
 /// Marks the record `sent` only while it is still this ping of this generation and that generation is still the
-/// member's, all in one hold of its member, then agent lock (`held`): one replaced meanwhile (a newer ping), or a
+/// member's, all in one hold of its agent, then member lock (`held`): one replaced meanwhile (a newer ping), or a
 /// member resumed into a new generation meanwhile, is left as it is.
 fn confirm(ctx: &Ctx, caller: &Caller, p: &Published) -> Res<()> {
     held(ctx, caller, &p.member, |generation| {

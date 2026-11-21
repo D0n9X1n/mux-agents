@@ -559,7 +559,9 @@ fn the_notice_is_sent_with_the_members_locks_free_and_in_one_order() {
         crate::agents::lock_key("member", &c, A),
         crate::agents::lock_key("agent", &c, A),
     );
-    // Each event checked against the locks held at that moment; the holds of the team, member and agent locks.
+    // Each event checked against the locks held at that moment; the holds of the team, member and agent locks. The order
+    // is the team lock, the agent lock, then the member lock: `send` takes a member's agent lock and, replaying an
+    // adoption for `send parent`, its member lock inside it, so taking them the other way round deadlocks against it.
     let order = |events: Vec<String>| {
         let (mut held, mut holds) = (Vec::<String>::new(), [0; 3]);
         for e in events {
@@ -576,14 +578,14 @@ fn the_notice_is_sent_with_the_members_locks_free_and_in_one_order() {
                     } else if key == member {
                         holds[1] += 1;
                         assert!(
-                            !held.contains(&agent),
-                            "the member lock taken under the agent lock"
+                            held.contains(&agent),
+                            "the member lock taken without the agent lock"
                         );
                     } else if key == agent {
                         holds[2] += 1;
                         assert!(
-                            held.contains(&member),
-                            "the agent lock taken without the member lock"
+                            !held.contains(&member),
+                            "the agent lock taken under the member lock"
                         );
                     }
                     held.push(key.into());
@@ -609,7 +611,7 @@ fn the_notice_is_sent_with_the_members_locks_free_and_in_one_order() {
     assert_eq!(
         order(w.fakes.locks()),
         [0, 1, 1],
-        "answer: the member lock, then the agent lock"
+        "answer: the agent lock, then the member lock"
     );
     w.fakes.hc_done().unwrap();
 }

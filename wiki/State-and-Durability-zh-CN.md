@@ -128,12 +128,12 @@ flowchart TD
 使用中的键：
 
 - `spawn|<serverKey>|<session>`，团队锁（`team_state::Scope::team_lock`）：启动、`resume`、权限检查、重放钩子、启动预算、团队邮件和笔记本。
-- `member|<serverKey>|<id>`，成员锁：每次写入 `record.json`、`desired.json` 和 `view.json`；`ping` 和 `answer` 在检查成员的 `generation` 时，持有它并在其中获取该成员的代理锁。
+- `member|<serverKey>|<id>`，成员锁：每次写入 `record.json`、`desired.json` 和 `view.json`；`ping` 和 `answer` 在检查成员的 `generation` 时，在该成员的代理锁之内获取它。
 - `gen|<serverKey>|<id>.<n>`，代锁：一代的结果、其客户端的会话报告以及就绪提升。
 - `mail|...`、`agent|...`、`notice|...` 和 `sidebar|...`，由 `agents::lock_key` 在调用方的状态范围内构造为 `<kind>|<serverKey>|<key>`。
 - `live|<pid>-<start>`，实时会话登记表中的一个条目（`src/state/live.rs`）。
 
-顺序是固定的：先团队锁再成员锁，先成员锁再该成员的代理锁，先会话锁再邮箱锁。每个命令都按同一顺序获取，因此不会有两个命令各自等待对方持有的锁。在单元测试中 `agents::lock` 记录每次持有而不获取真实的锁，`patch_and_desired_take_the_member_lock_inside_the_team_lock` 等测试断言这一顺序。
+顺序是固定的：先团队锁再成员锁，先成员的代理锁再它的成员锁（`send` 为 `send parent` 重放收养时就是这样获取的，`ping` 和 `answer` 也照此获取），先会话锁再邮箱锁。每个命令都按同一顺序获取，因此不会有两个命令各自等待对方持有的锁。在单元测试中 `agents::lock` 记录每次持有而不获取真实的锁，`patch_and_desired_take_the_member_lock_inside_the_team_lock` 等测试断言这一顺序。
 
 ## 私有文件夹
 
