@@ -354,6 +354,46 @@ fn wait_gone_in_polls_until_gone_or_its_bound() {
     );
 }
 
+// A child that exited is not listed, even while this test still holds it (on Windows a `Child` keeps its process
+// handle, and a pid still opens while any handle to its process is held): `listed`, which a kill's recovery uses, reads
+// the process table, not whether the pid opens.
+#[test]
+fn an_exited_child_still_held_is_not_listed() {
+    use std::time::{Duration, Instant};
+    let d = root();
+    std::fs::create_dir_all(&d).unwrap();
+    let release = d.join("release-held.json");
+    let mut hold = std::process::Command::new(env!("CARGO_BIN_EXE_mux-agent"));
+    hold.arg("hold")
+        .arg(&release)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    let mut child = bounded::spawn(&mut hold, Duration::from_secs(120)).unwrap();
+    let me = mux_agent::proc::host()
+        .table()
+        .unwrap()
+        .iter()
+        .find(|r| r.pid == child.id())
+        .map(|r| (r.pid, r.start))
+        .expect("the child is listed");
+    assert!(
+        private_core::listed(me.0, me.1),
+        "a running child is listed"
+    );
+    std::fs::write(&release, "{}").unwrap();
+    let end = Instant::now() + Duration::from_secs(30);
+    while child.try_wait().unwrap().is_none() {
+        assert!(Instant::now() < end, "the child did not exit");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        !private_core::listed(me.0, me.1),
+        "an exited child is not listed while it is still held"
+    );
+    drop(child);
+}
+
 // On the real process table, on every OS: a child running this binary's `hold` is listed until it exits (its
 // release file appears), then `wait_gone` returns, not before.
 #[test]

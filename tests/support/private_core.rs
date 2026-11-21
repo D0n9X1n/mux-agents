@@ -170,7 +170,8 @@ impl PrivateCore {
             .as_u64()
             .expect("hc server status --json names the core pid") as u32;
         assert!(kill_pid(pid), "kill of the core {pid} failed");
-        let same = |pid: u32, start| mux_agent::proc::host().open(pid).map(|o| o.start) == start;
+        // The process table, not whether the pid opens: a held handle keeps a killed process openable.
+        let same = |pid: u32, start: Option<i64>| start.is_some() && listed(pid, start);
         for (pid, start) in kill_order(terminals) {
             if start.is_some() && same(pid, start) && !kill_pid(pid) {
                 let end = Instant::now() + Duration::from_secs(5);
@@ -361,6 +362,13 @@ pub fn still_listed(
                 .any(|r| r.pid == pid && (r.start.is_none() || r.start == start))
         })
         .collect()
+}
+
+/// Whether `pid` with `start` is in the process table now. Not whether the pid opens: on Windows a process that
+/// exited still opens, with its start, while any handle to it is held (a test holds one so its pid is not reused).
+pub fn listed(pid: u32, start: Option<i64>) -> bool {
+    let table = mux_agent::proc::host().table().unwrap_or_default();
+    !still_listed(&table, &[(pid, start)]).is_empty()
 }
 
 /// Reads `table` every 50 ms until it lists none of `processes` (`still_listed`), for at most `limit`: those it still
