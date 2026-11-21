@@ -78,10 +78,19 @@ pub fn connect(ctx: &Ctx) -> Res<Core<'_>> {
     if PASSED.with(|p| p.borrow().as_ref().is_some_and(|v| v.contains(&core.bin))) {
         return Ok(core);
     }
-    let out = core
-        .provider
-        .captured(&core.bin, &["--version"], Duration::from_secs(5))
-        .map_err(|_| failure(INSTALL))?;
+    // A `--version` that could not run (a fork refused on a loaded machine, a timeout) says nothing about which hc is
+    // installed: it is asked once more, and still unanswered it is named as such, never as a missing or old hc.
+    let ask = || {
+        core.provider
+            .captured(&core.bin, &["--version"], Duration::from_secs(5))
+    };
+    // Its error text is not shown: what a failed run printed is no business of the refusal.
+    let out = ask().or_else(|_| ask()).map_err(|_| {
+        failure(&format!(
+            "{} --version did not answer; try again, or check that it runs",
+            core.bin.display()
+        ))
+    })?;
     if out.code != 0 || !version_ok(&out.stdout) {
         return Err(failure(INSTALL));
     }
@@ -577,16 +586,28 @@ mod tests {
         assert!(f.hc_calls().is_empty());
         f.hc_install("hc");
         f.hc_install("herdr-core");
+        // A version check that could not run is asked again, and named as not answering, never as a missing hc; what
+        // the failed run said is never shown.
         f.hc_answer(Err(Refusal::internal("SECRET")));
-        assert_eq!(connect(&f.ctx()).err().unwrap().message, INSTALL);
-        assert_eq!(f.hc_calls().len(), 1);
+        f.hc_answer(Err(Refusal::internal("SECRET")));
+        let e = connect(&f.ctx()).err().unwrap();
+        assert!(
+            e.message
+                .ends_with("--version did not answer; try again, or check that it runs")
+        );
+        assert!(!e.message.contains("SECRET"));
+        assert_eq!(f.hc_calls().len(), 2);
         f.hc_answer(Ok(Out {
             code: 1,
             stdout: "hc 0.1.21".into(),
             stderr: "SECRET".into(),
         }));
         assert_eq!(connect(&f.ctx()).err().unwrap().message, INSTALL);
-        assert_eq!(f.hc_calls().len(), 2);
+        assert_eq!(
+            f.hc_calls().len(),
+            3,
+            "a version that answered is asked once"
+        );
     }
 
     #[test]
@@ -1157,6 +1178,38 @@ mod tests {
             (t.pid, t.foreground, t.exit_code, t.reason),
             (None, None, None, None)
         );
+    }
+
+    // A `--version` that could not run (a fork that failed, a timeout on a loaded machine) is not a missing or old hc:
+    // it is asked once more, and if it still cannot run the refusal says so instead of asking to install hc.
+    #[test]
+    fn a_version_check_that_could_not_run_is_retried_then_named() {
+        let f = Fakes::default();
+        f.hc_install("hc");
+        f.hc_answer(Err(Refusal::internal("hc call failed")));
+        answer(&f, "hc 0.1.21");
+        let ctx = f.ctx();
+        assert!(connect(&ctx).is_ok(), "the second ask answers");
+        assert_eq!(f.hc_calls().len(), 2);
+        let f = Fakes::default();
+        f.hc_install("hc");
+        f.hc_answer(Err(Refusal::internal("hc call failed")));
+        f.hc_answer(Err(Refusal::internal("hc call failed")));
+        let ctx = f.ctx();
+        let refused = connect(&ctx).err().expect("never answered");
+        assert_eq!(refused.check, "hc");
+        assert!(
+            refused.message.contains("did not answer") && !refused.message.contains("install"),
+            "{}",
+            refused.message
+        );
+        // A version that answered but is old, or a missing binary, still asks to install or upgrade, once.
+        let f = Fakes::default();
+        f.hc_install("hc");
+        answer(&f, "hc 0.1.0");
+        let ctx = f.ctx();
+        assert_eq!(connect(&ctx).err().unwrap().message, INSTALL);
+        assert_eq!(f.hc_calls().len(), 1);
     }
 
     #[test]
