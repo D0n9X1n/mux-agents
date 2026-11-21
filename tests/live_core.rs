@@ -12,6 +12,25 @@ fn root() -> std::path::PathBuf {
     };
     base.join(format!("mxc-{}", mux_agent::util::hex_id().unwrap()))
 }
+// The hc version probe `installed` runs through the library is a start too: it waits for the harness's start lock,
+// so its pipe is never open while a child that lives on starts.
+#[test]
+fn the_installed_probe_waits_for_the_start_lock() {
+    let held = bounded::spawning();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let probe = std::thread::spawn(move || tx.send(PrivateCore::installed()).unwrap());
+    assert!(
+        rx.recv_timeout(std::time::Duration::from_millis(500))
+            .is_err(),
+        "the hc probe ran while the start lock was held"
+    );
+    drop(held);
+    let bin = rx
+        .recv_timeout(std::time::Duration::from_secs(30))
+        .expect("the hc probe never ran");
+    assert!(bin.is_file(), "{bin:?}");
+    probe.join().unwrap();
+}
 #[test]
 fn core_environment_is_private() {
     let d = root();

@@ -32,7 +32,13 @@ impl PrivateCore {
             admitted: false,
             tty: false,
         };
-        mux_agent::hc::connect(&c)
+        // `connect` starts `hc --version` through the library, past bounded's `start`: it runs under the same lock, so
+        // the probe's pipe is never inside a window where a harness child that lives on starts.
+        let connected = {
+            let _alone = super::bounded::spawning();
+            mux_agent::hc::connect(&c)
+        };
+        connected
             .expect("live tests require hc >=0.1.21")
             .binary()
             .to_path_buf()
