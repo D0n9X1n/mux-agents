@@ -4473,6 +4473,120 @@ hc {}:
         wait_focused(&live, &top, "j then Enter");
     }
 
+    // A member lock held elsewhere stalls the board, not the bar's keys; its answer redraws as soon as it is free.
+    #[test]
+    #[ignore = "child process that holds one test-owned member lock"]
+    fn bar_member_lock_holder() {
+        let path = std::env::var_os("MUX_TEST_BAR_LOCK").expect("child lock path");
+        let signal =
+            PathBuf::from(std::env::var_os("MUX_TEST_BAR_SIGNAL").expect("child signal path"));
+        let held = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)
+            .unwrap();
+        held.lock().unwrap();
+        std::fs::write(signal.with_extension("held"), "").unwrap();
+        std::thread::sleep(Duration::from_secs(5));
+        held.unlock().unwrap();
+        std::fs::write(signal.with_extension("released"), "").unwrap();
+    }
+
+    fn bar_reader_keeps_keys_live_while_another_process_holds_a_member_lock(mux: Mux) {
+        let Some(mut live) = Live::human(mux) else {
+            return;
+        };
+        let (bar, pane) = two_rows(&mut live);
+        let id = live.field(&pane, "#{@agent-id}");
+        let path = support::lock_file(
+            &support::lock_root().unwrap(),
+            &format!("agent|{}|{id}", live.server.key()),
+        );
+        live.after_quiet_redraw(&bar);
+        let roundtrip = || {
+            let offset = std::fs::metadata(live.frames_path(&bar)).map_or(0, |m| m.len() as usize);
+            let start = Instant::now();
+            live.call(&["send-keys", "-t", &bar, "-l", "?"]);
+            loop {
+                let bytes = std::fs::read(live.frames_path(&bar)).unwrap_or_default();
+                let fresh = String::from_utf8_lossy(bytes.get(offset..).unwrap_or_default());
+                if fresh.contains("mark seen") {
+                    return start.elapsed();
+                }
+                assert!(
+                    start.elapsed() < Duration::from_secs(1),
+                    "{mux:?}: key did not act in one second"
+                );
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        };
+        let close_help = || {
+            live.call(&["send-keys", "-t", &bar, "Escape"]);
+            assert!(eventually(Duration::from_secs(2), || !live
+                .call(&["capture-pane", "-p", "-t", &bar])
+                .contains("mark seen")));
+        };
+        let mut floor = Vec::new();
+        for _ in 0..5 {
+            floor.push(roundtrip());
+            close_help();
+        }
+        floor.sort();
+        let signal = live.dir.join("reader-lock");
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command
+            .args([
+                "--exact",
+                "e2e::bar_member_lock_holder",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env("MUX_TEST_BAR_LOCK", path)
+            .env("MUX_TEST_BAR_SIGNAL", &signal);
+        let mut holder = support::bounded::spawn(&mut command, Duration::from_secs(15)).unwrap();
+        assert!(eventually(Duration::from_secs(2), || signal
+            .with_extension("held")
+            .exists()));
+        // Let a normal read reach the lock owned by the child process.
+        std::thread::sleep(Duration::from_secs(2));
+        let key_time = roundtrip();
+        assert!(
+            !signal.with_extension("released").exists(),
+            "key acted while the child still owned the lock"
+        );
+        support::write_atomic(
+            &live.agent_dir(&id).join("status.json"),
+            br#"{"text":"reader lock released","at":"2026-11-20T00:00:00Z"}"#,
+        );
+        while !signal.with_extension("released").exists() {
+            assert!(
+                holder.try_wait().unwrap().is_none(),
+                "lock child ended without release signal"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let released = Instant::now();
+        loop {
+            let screen = std::fs::read_to_string(live.frames_path(&bar)).unwrap_or_default();
+            if screen.contains("reader lock released") {
+                break;
+            }
+            assert!(
+                released.elapsed() < Duration::from_secs(1),
+                "{mux:?}: no answer within one second of release"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let answer_time = released.elapsed();
+        assert!(holder.wait().unwrap().success());
+        eprintln!(
+            "{mux:?}: no-lock median of five {:?}; locked key {key_time:?}; release-to-frame {answer_time:?}",
+            floor[2]
+        );
+        assert!(key_time <= Duration::from_secs(1));
+        assert!(answer_time <= Duration::from_secs(1));
+    }
+
     // `n` (herdr's next agent) from a pane that is no agent's goes to the bar's first agent, `N` to its last.
     fn bar_n_and_shift_n_step_through_agents(mux: Mux) {
         let Some(mut live) = Live::human(mux) else {
@@ -6745,6 +6859,7 @@ hc {}:
                     bar_click_focuses_an_agent,
                     bar_n_and_shift_n_step_through_agents,
                     bar_keys_focus_an_agent,
+                    bar_reader_keeps_keys_live_while_another_process_holds_a_member_lock,
                     bar_click_after_shrinking_does_nothing,
                     members_spawn_and_act_only_down_the_tree,
                     a_cascade_stop_ends_b_before_a_and_a_second_stop_finishes,
