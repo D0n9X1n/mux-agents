@@ -2456,9 +2456,15 @@ fn watch_loop(
     let mut polled_stamp = None;
     let mut size = FALLBACK;
     let mut unknown = 0;
+    // Reader answers redraw the cached tick state, without probing or moving the tick deadline.
+    let mut tick = true;
+    let mut live = false;
+    let mut looked = None;
+    let mut ticked = ctx.clock.now();
+    let mut polled_at = ticked;
     let mut pick = Pick::default();
     let mut viewing = Viewing::default();
-    // Answer-driven redraws are not retries: a false Seen waits one ordinary tick before another attempt.
+    // Answer-driven redraws are not retries: a refused Seen waits one ordinary tick before another attempt.
     let mut seen_attempts: Vec<(jobs::Seen, SystemTime)> = Vec::new();
     // The pane whose row is banded: the last pane on screen that is not the bar; and whether the bar was on screen.
     let mut banded: Option<String> = None;
@@ -2491,125 +2497,130 @@ fn watch_loop(
     // Peek files of popups that never opened, from an earlier bar (review).
     sweep_peeks(ctx, &crate::agents::server_dir(ctx, caller));
     loop {
-        let probe = native(
-            ctx,
-            &["display-message", "-p", "-t", &caller.pane, WATCH_PROBE],
-            true,
-        )
-        .ok();
-        if probe.as_ref().is_some_and(watch_gone) {
-            return "pane-closed";
-        }
-        let live = probe
-            .as_ref()
-            .filter(|p| p.code == 0 && p.stdout.starts_with(&own));
-        unknown = if live.is_some() { 0 } else { unknown + 1 };
-        if unknown >= UNKNOWN_MAX {
-            return "probe-failed";
-        }
-        if let Some(read) = live.and_then(probe_size) {
-            size = read;
-        }
-        let recorded = live.is_some() && own_record(ctx, caller);
-        if recorded {
-            proven_at = ctx.clock.now();
-        }
-        // a bar cleans up after itself, decided each tick from what it reads now: not proven for STARTUP, it
-        // decides under the session lock (`self_exit`).
-        if live.is_some()
-            && !recorded
-            && !by_hand
-            && ctx
-                .clock
-                .now()
-                .duration_since(proven_at)
-                .unwrap_or_default()
-                >= STARTUP
-        {
-            match self_exit(ctx, caller, origin) {
-                SelfExit::Left => return "unproven",
-                SelfExit::ByHand => by_hand = true,
-                SelfExit::Kept => proven_at = ctx.clock.now(),
-                SelfExit::Unread => {}
-            }
-        }
-        // the window held a view once a verb marked it viewed (`ensure`), or once this bar sees a live member
-        // view in it, recorded or not (the first tick may run before open records the bar), whichever comes first.
-        if live.is_some() && !held {
-            held = native(
+        if tick {
+            let probe = native(
                 ctx,
-                &["show-options", "-wqv", "-t", &caller.window, VIEWED],
+                &["display-message", "-p", "-t", &caller.pane, WATCH_PROBE],
                 true,
             )
-            .is_ok_and(|read| read.code == 0 && read.stdout.trim_end_matches(['\r', '\n']) == "1");
-        }
-        // Only the recorded bar acts: once its window held a view and has none now, it first gives the other view
-        // windows their bar (no tick of it follows), then leaves. An unread view list changes nothing.
-        let read = if recorded || (live.is_some() && !held) {
-            view_windows(ctx, caller)
-        } else {
-            None
-        };
-        if let Some(windows) = read {
-            let here = windows.contains(&caller.window);
-            held |= here;
-            let lost = recorded
-                && held
-                && !here
-                && !*status.get_or_insert_with(|| is_status(ctx, &caller.window));
-            since_walk = since_walk.saturating_add(1);
-            if recorded && (lost || since_walk >= WALK_EVERY) {
-                since_walk = 0;
-                // Every other view window without a proven bar gets its own (a view moved by break-pane), checked
-                // every WALK_EVERY ticks so a tick stays cheap. One whose ensure failed waits a minute before it is
-                // tried again, so a failing open never splits every tick; a leaving bar tries each one now, since it
-                // is the last chance this watch has.
-                let now = ctx.clock.now();
-                failed_windows
-                    .retain(|(_, at)| now.duration_since(*at).unwrap_or_default() < REARM);
-                for window in windows.iter().filter(|w| **w != caller.window) {
-                    if (!lost && failed_windows.iter().any(|(w, _)| w == window))
-                        || matches!(prove(ctx, window), Ok(Some(_)))
-                    {
-                        continue;
+            .ok();
+            if probe.as_ref().is_some_and(watch_gone) {
+                return "pane-closed";
+            }
+            let proven = probe
+                .as_ref()
+                .filter(|p| p.code == 0 && p.stdout.starts_with(&own));
+            live = proven.is_some();
+            unknown = if proven.is_some() { 0 } else { unknown + 1 };
+            if unknown >= UNKNOWN_MAX {
+                return "probe-failed";
+            }
+            if let Some(read) = proven.and_then(probe_size) {
+                size = read;
+            }
+            let recorded = proven.is_some() && own_record(ctx, caller);
+            if recorded {
+                proven_at = ctx.clock.now();
+            }
+            // a bar cleans up after itself, decided each tick from what it reads now: not proven for STARTUP, it
+            // decides under the session lock (`self_exit`).
+            if proven.is_some()
+                && !recorded
+                && !by_hand
+                && ctx
+                    .clock
+                    .now()
+                    .duration_since(proven_at)
+                    .unwrap_or_default()
+                    >= STARTUP
+            {
+                match self_exit(ctx, caller, origin) {
+                    SelfExit::Left => return "unproven",
+                    SelfExit::ByHand => by_hand = true,
+                    SelfExit::Kept => proven_at = ctx.clock.now(),
+                    SelfExit::Unread => {}
+                }
+            }
+            // the window held a view once a verb marked it viewed (`ensure`), or once this bar sees a live member
+            // view in it, recorded or not (the first tick may run before open records the bar), whichever comes first.
+            if proven.is_some() && !held {
+                held = native(
+                    ctx,
+                    &["show-options", "-wqv", "-t", &caller.window, VIEWED],
+                    true,
+                )
+                .is_ok_and(|read| {
+                    read.code == 0 && read.stdout.trim_end_matches(['\r', '\n']) == "1"
+                });
+            }
+            // Only the recorded bar acts: once its window held a view and has none now, it first gives the other view
+            // windows their bar (no tick of it follows), then leaves. An unread view list changes nothing.
+            let read = if recorded || (proven.is_some() && !held) {
+                view_windows(ctx, caller)
+            } else {
+                None
+            };
+            if let Some(windows) = read {
+                let here = windows.contains(&caller.window);
+                held |= here;
+                let lost = recorded
+                    && held
+                    && !here
+                    && !*status.get_or_insert_with(|| is_status(ctx, &caller.window));
+                since_walk = since_walk.saturating_add(1);
+                if recorded && (lost || since_walk >= WALK_EVERY) {
+                    since_walk = 0;
+                    // Every other view window without a proven bar gets its own (a view moved by break-pane), checked
+                    // every WALK_EVERY ticks so a tick stays cheap. One whose ensure failed waits a minute before it is
+                    // tried again, so a failing open never splits every tick; a leaving bar tries each one now, since it
+                    // is the last chance this watch has.
+                    let now = ctx.clock.now();
+                    failed_windows
+                        .retain(|(_, at)| now.duration_since(*at).unwrap_or_default() < REARM);
+                    for window in windows.iter().filter(|w| **w != caller.window) {
+                        if (!lost && failed_windows.iter().any(|(w, _)| w == window))
+                            || matches!(prove(ctx, window), Ok(Some(_)))
+                        {
+                            continue;
+                        }
+                        // The tick never opens a bar itself: it only decides which window needs one, and a worker opens it
+                        // (`Jobs::ensure`, waiting on the sidebar lock as long as another holds it), its answer drained on
+                        // a later pass. A leaving bar has no later pass, so it opens them itself.
+                        if !lost {
+                            panel.jobs.ensure(ctx, caller, window);
+                        } else if ensure(ctx, caller, window).is_err() {
+                            failed_windows.push((window.clone(), now));
+                        }
                     }
-                    // The tick never opens a bar itself: it only decides which window needs one, and a worker opens it
-                    // (`Jobs::ensure`, waiting on the sidebar lock as long as another holds it), its answer drained on
-                    // a later pass. A leaving bar has no later pass, so it opens them itself.
-                    if !lost {
-                        panel.jobs.ensure(ctx, caller, window);
-                    } else if ensure(ctx, caller, window).is_err() {
-                        failed_windows.push((window.clone(), now));
+                }
+                if lost && leave(ctx, caller) {
+                    return "view-closed";
+                }
+            }
+            if recorded && keeper.tick(ctx, &caller.pane) {
+                // The keeper resized or moved the bar: lay out at its size now, else at the width it set.
+                match read_size(ctx, &caller.pane) {
+                    Some(read) => size = read,
+                    None => {
+                        if let Some(width) = keeper.width() {
+                            size.width = width;
+                        }
                     }
                 }
             }
-            if lost && leave(ctx, caller) {
-                return "view-closed";
+            // The poll's baseline, taken before the board is read: a write that lands during the read is newer, so the
+            // next poll draws it instead of taking it as drawn.
+            if first {
+                polled_stamp = pace.poll.and_then(|_| stamp(&root));
+                answers.push(jobs::Answer::Read(0, board(ctx, caller, true, true)));
+                first = false;
+            } else if answers.is_empty() && !panel.jobs.reading() {
+                polled_stamp = pace.poll.and_then(|_| stamp(&root));
+                asked_at = ctx.clock.now();
+                panel.jobs.read(ctx, caller);
+                panel.refresh = false;
+                answers.extend(panel.jobs.drain_reader());
             }
-        }
-        if recorded && keeper.tick(ctx, &caller.pane) {
-            // The keeper resized or moved the bar: lay out at its size now, else at the width it set.
-            match read_size(ctx, &caller.pane) {
-                Some(read) => size = read,
-                None => {
-                    if let Some(width) = keeper.width() {
-                        size.width = width;
-                    }
-                }
-            }
-        }
-        // The poll's baseline, taken before the board is read: a write that lands during the read is newer, so the
-        // next poll draws it instead of taking it as drawn.
-        if first {
-            polled_stamp = pace.poll.and_then(|_| stamp(&root));
-            answers.push(jobs::Answer::Read(0, board(ctx, caller, true, true)));
-            first = false;
-        } else if answers.is_empty() && !panel.jobs.reading() {
-            polled_stamp = pace.poll.and_then(|_| stamp(&root));
-            asked_at = ctx.clock.now();
-            panel.jobs.read(ctx, caller);
-            panel.refresh = false;
-            answers.extend(panel.jobs.drain_reader());
         }
         let mut fresh = false;
         for answer in answers.drain(..) {
@@ -2629,61 +2640,73 @@ fn watch_loop(
         let stale = panel.jobs.reading()
             && ctx.clock.now().duration_since(asked_at).unwrap_or_default()
                 >= crate::state::lock::LOCK_WAIT;
-        let failed = live.is_none() || read_failed || stale;
+        let failed = !live || read_failed || stale;
         // The pane the person looks at (an unanswered probe changes nothing), then the done spell they leave behind:
         // seen. A spell not marked is kept and marked again on the next tick.
-        let looked = shown_pane(ctx, caller);
+        if tick {
+            looked = shown_pane(ctx, caller);
+        }
         if let Some(looked) = looked.clone() {
             viewing.tick(looked, last.as_ref());
         }
-        // The band follows the pane on screen. With the bar itself in front (the person switched to this tab, or works
-        // in the bar) it is this window's other pane, so a tab switch moves the band to that tab's agent; a window
-        // read that names no other pane keeps the band where it was (detached: none).
-        match looked.as_ref() {
-            Some(Some(pane)) if *pane == caller.pane => {
-                if let Some(other) = window_other(ctx, caller) {
-                    banded = Some(other);
+        if tick {
+            // The band follows the pane on screen. With the bar itself in front (the person switched to this tab, or works
+            // in the bar) it is this window's other pane, so a tab switch moves the band to that tab's agent; a window
+            // read that names no other pane keeps the band where it was (detached: none).
+            match looked.as_ref() {
+                Some(Some(pane)) if *pane == caller.pane => {
+                    if let Some(other) = window_other(ctx, caller) {
+                        banded = Some(other);
+                    }
                 }
+                Some(seen) => banded.clone_from(seen),
+                None => {}
             }
-            Some(seen) => banded.clone_from(seen),
-            None => {}
-        }
-        // The person left the bar (it was the pane on screen, now another is): a selection made in it no longer
-        // points anywhere they chose, so it clears; a pending question stays. Keys sent to a bar that was never on
-        // screen keep their selection; an unread probe or a detached session changes nothing.
-        if let Some(Some(pane)) = looked.as_ref() {
-            let here = *pane == caller.pane;
-            if in_bar && !here {
-                pick.left();
+            // The person left the bar (it was the pane on screen, now another is): a selection made in it no longer
+            // points anywhere they chose, so it clears; a pending question stays. Keys sent to a bar that was never on
+            // screen keep their selection; an unread probe or a detached session changes nothing.
+            if let Some(Some(pane)) = looked.as_ref() {
+                let here = *pane == caller.pane;
+                if in_bar && !here {
+                    pick.left();
+                }
+                in_bar = here;
             }
-            in_bar = here;
         }
         // An agent that starts needing the person, or finishes, while they look elsewhere: one message, as herdr's
         // toast. Only when both the board and the shown pane were read now: a tick that knows neither keeps the news
         // for the next.
         if fresh && looked.is_some() && !failed {
             pending_news.extend(alerts.tick(last.as_ref(), viewing.pane.as_deref()));
-            // News that met the sidebar lock held elsewhere waits for a later tick, never this one.
-            if !pending_news.is_empty() && alert(ctx, caller, &pending_news) {
-                pending_news.clear();
-            }
         }
-        let now = ctx.clock.now();
-        seen_attempts.retain(|(seen, at)| {
-            viewing.left.contains(seen) && now.duration_since(*at).unwrap_or_default() < pace.tick
-        });
-        for seen in &viewing.left {
-            if !seen_attempts.iter().any(|(asked, _)| asked == seen) {
-                panel.jobs.seen(ctx, caller, seen);
-                seen_attempts.push((seen.clone(), now));
-            }
+        // Reader answers collect news without any tick calls; the next tick delivers it.
+        if tick
+            && looked.is_some()
+            && !failed
+            && !pending_news.is_empty()
+            && alert(ctx, caller, &pending_news)
+        {
+            pending_news.clear();
         }
-        for answer in panel.jobs.drain_reader() {
-            match answer {
-                jobs::Answer::Seen(seen, ok) => {
-                    viewing.marked(panel, &seen, ok);
+        if tick {
+            let now = ctx.clock.now();
+            seen_attempts.retain(|(seen, at)| {
+                viewing.left.contains(seen)
+                    && now.duration_since(*at).unwrap_or_default() < pace.tick
+            });
+            for seen in &viewing.left {
+                if !seen_attempts.iter().any(|(asked, _)| asked == seen) {
+                    panel.jobs.seen(ctx, caller, seen);
+                    seen_attempts.push((seen.clone(), now));
                 }
-                answer => answers.push(answer),
+            }
+            for answer in panel.jobs.drain_reader() {
+                match answer {
+                    jobs::Answer::Seen(seen, ok) => {
+                        viewing.marked(panel, &seen, ok);
+                    }
+                    answer => answers.push(answer),
+                }
             }
         }
         let note = pick.note();
@@ -2753,7 +2776,7 @@ fn watch_loop(
             .as_ref()
             .is_some_and(|(rows, at)| *at == size && *rows == text);
         let due = now.duration_since(last_written).unwrap_or_default() >= REWRITE;
-        if pace.poll.is_none() || !same || due {
+        if (tick && pace.poll.is_none()) || !same || due {
             if write(&text).is_err() {
                 return "output-closed";
             }
@@ -2769,7 +2792,10 @@ fn watch_loop(
             pick.question_shown(ctx.clock.now());
         }
         // The next tick is a tick after this one ends (after a slow write, from its end).
-        let ticked = ctx.clock.now();
+        if tick {
+            ticked = ctx.clock.now();
+            polled_at = ticked;
+        }
         let mut shown = Shown {
             written: last_changed,
             targets: walk,
@@ -2792,25 +2818,25 @@ fn watch_loop(
         // What the next polls compare against: the pane on screen as this tick drew it (the stamp is from before the
         // read).
         let polled_pane = looked.clone().flatten();
-        let mut polled_at = ctx.clock.now();
+
         loop {
             // An action that answered off the loop (a resume) is applied, and the bar draws again at once: a change, as
             // a poll's, so input already waiting is read first (below).
-            answers.extend(
-                panel
-                    .jobs
-                    .drain_reader()
-                    .into_iter()
-                    .filter(|answer| !matches!(answer, jobs::Answer::Seen(_, false))),
-            );
+            for answer in panel.jobs.drain_reader() {
+                match answer {
+                    jobs::Answer::Seen(seen, answer @ (Ok(false) | Err(_))) => {
+                        viewing.marked(panel, &seen, answer);
+                    }
+                    answer => answers.push(answer),
+                }
+            }
             let became_stale = !stale
                 && panel.jobs.reading()
                 && ctx.clock.now().duration_since(asked_at).unwrap_or_default()
                     >= crate::state::lock::LOCK_WAIT;
-            let settled = settle_jobs(ctx, caller, &mut pick, &mut shown, panel)
-                || !answers.is_empty()
-                || became_stale
+            let mut full_tick = settle_jobs(ctx, caller, &mut pick, &mut shown, panel)
                 || (panel.refresh && !panel.jobs.reading());
+            let settled = full_tick || !answers.is_empty() || became_stale;
             // Another window's bar the worker could not open waits `REARM` before it is tried again.
             for (window, answer) in panel.jobs.drain_windows(ctx, caller) {
                 if answer.is_err() {
@@ -2821,18 +2847,22 @@ fn watch_loop(
             let left = pace.tick.saturating_sub(since);
             if left.is_zero() && !settled {
                 pick.ticked();
+                tick = true;
+                idle_at = None;
                 break;
             }
             // A poll is due: another pane on screen or a state change ends the wait, and the next tick draws it now.
             let mut changed = settled;
-            if let Some(poll) = pace.poll
+            if answers.is_empty()
+                && let Some(poll) = pace.poll
                 && ctx.clock.now().duration_since(polled_at).unwrap_or(poll) >= poll
             {
                 polled_at = ctx.clock.now();
                 let pane = shown_pane(ctx, caller);
                 let moved = pane.is_some_and(|p| p != polled_pane);
                 // A poll that finds nothing new keeps a job's answer as the change it is.
-                changed |= moved || (!panel.jobs.reading() && stamp(&root) != polled_stamp);
+                full_tick |= moved || (!panel.jobs.reading() && stamp(&root) != polled_stamp);
+                changed |= full_tick;
             }
             let now = ctx.clock.now();
             let unsliced = if keys.lone_esc() {
@@ -2852,7 +2882,7 @@ fn watch_loop(
             // a change, since the multiplexer's mouse binding selects the bar's pane before it passes the press on.
             if changed {
                 wait = Duration::ZERO;
-            } else if panel.jobs.reading() {
+            } else if panel.jobs.waiting() {
                 wait = wait.min(Duration::from_millis(10));
             }
             let reads = match input.wait(&*ctx.clock, wait) {
@@ -2877,12 +2907,15 @@ fn watch_loop(
                 if read.event == Event::Interrupt {
                     return "interrupted";
                 }
-                redraw |= act(ctx, caller, look, read, &mut pick, &mut shown, panel);
+                let acted = act(ctx, caller, look, read, &mut pick, &mut shown, panel);
+                full_tick |= acted;
+                redraw |= acted;
                 if panel.closed {
                     return "closed";
                 }
             }
             if redraw {
+                tick = full_tick || left.is_zero();
                 if !keys.lone_esc() {
                     idle_at = None;
                 }
@@ -2967,11 +3000,14 @@ struct Viewing {
 }
 
 impl Viewing {
-    fn marked(&mut self, panel: &mut Panel, seen: &jobs::Seen, ok: bool) {
-        if !ok {
+    fn marked(&mut self, panel: &mut Panel, seen: &jobs::Seen, answer: Res<bool>) {
+        let Ok(marked) = answer else {
+            return;
+        };
+        self.left.retain(|left| left != seen);
+        if !marked {
             return;
         }
-        self.left.retain(|left| left != seen);
         let refresh = panel.refresh;
         panel.ack(&seen.id, &seen.changed);
         // Only Space asks an extra read; a Seen precedes the next ordinary read in the FIFO.
@@ -9485,7 +9521,7 @@ mod tests {
                         let ok =
                             crate::state::lock::with_lock_at(&ctx, &root, &lock_key, || Ok(()))
                                 .is_ok();
-                        jobs::Answer::Seen(seen.clone(), ok)
+                        jobs::Answer::Seen(seen.clone(), Ok(ok))
                     }
                 }
             },
@@ -9800,7 +9836,321 @@ mod tests {
     }
 
     #[test]
-    fn a_false_seen_answer_waits_for_the_next_tick_instead_of_spinning_redraws() {
+    fn seen_answers_retire_without_running_an_extra_tick() {
+        use std::sync::mpsc::channel;
+        let w = watch_world(&["live"]);
+        pace(Pace {
+            tick: Duration::from_secs(1),
+            poll: None,
+        });
+        write(
+            &w.folder(ID).join("activity.json"),
+            json!({"state":"done","since":"1970-01-01T00:03:00Z"}),
+        );
+        watch_frames(&w, 1);
+        let caller = w.caller();
+        let board = board(&w.ctx, &caller, true, true).unwrap();
+        watch_frames(&w, 1);
+        let (release, gate) = channel();
+        let (sent, received) = channel();
+        jobs::test_reader_between(
+            move || {
+                move |request: &jobs::Request| match request {
+                    jobs::Request::Read(generation) => {
+                        jobs::Answer::Read(*generation, Ok(board.clone()))
+                    }
+                    jobs::Request::Seen(seen) => {
+                        gate.recv_timeout(Duration::from_secs(5)).unwrap();
+                        jobs::Answer::Seen(seen.clone(), Ok(true))
+                    }
+                }
+            },
+            move || {
+                let _ = sent.send(());
+            },
+        );
+        let fakes = w.fakes.clone();
+        w.fakes.mux_script(SHOWN_FORMAT, move |_| {
+            Ok(out(
+                0,
+                if probed(&fakes) == 1 {
+                    "%9|1\n"
+                } else {
+                    "%1|1\n"
+                },
+                "",
+            ))
+        });
+        let start = w.ctx.clock.now();
+        let fakes = w.fakes.clone();
+        let mut release = Some(release);
+        let mut script = Script::new(&w.fakes, vec![(1250, key(b"x")), (250, key(&[3]))]);
+        script.on_wait = Some(Box::new(move |_| {
+            use crate::ctx::Clock;
+            if fakes.now().duration_since(start).unwrap() >= Duration::from_millis(1250)
+                && let Some(send) = release.take()
+            {
+                send.send(()).unwrap();
+                received.recv_timeout(Duration::from_secs(5)).unwrap();
+                received.recv_timeout(Duration::from_secs(5)).unwrap();
+            }
+        }));
+        let (ended, frames, _) = watch_with(&w, Box::new(script));
+        pace(Pace::default());
+        assert_eq!(ended, "interrupted");
+        assert_eq!(
+            probes(&w),
+            2,
+            "neither the read nor the Seen answer runs a tick"
+        );
+        assert!(frames[0].contains("Inbox"));
+        assert!(!frames.last().unwrap().contains("Inbox"));
+    }
+
+    #[test]
+    fn unchanged_answers_write_no_frame_and_keep_the_size_from_the_last_tick() {
+        let w = watch_world(&["live", "live", "short", "gone"]);
+        pace(Pace {
+            tick: Duration::from_secs(1),
+            poll: None,
+        });
+        watch_frames(&w, 3);
+        let start = w.ctx.clock.now();
+        let fakes = w.fakes.clone();
+        let mut script = Script::new(&w.fakes, vec![]);
+        script.on_wait = Some(Box::new(move |_| {
+            use crate::ctx::Clock;
+            jobs::HOLD_READ
+                .set(fakes.now().duration_since(start).unwrap().as_millis() % 1000 < 250);
+        }));
+        let mut frames = Vec::new();
+        let ended = run_watch(
+            &w.ctx,
+            &w.caller(),
+            Origin::Hand,
+            Box::new(script),
+            &mut |frame| {
+                frames.push((
+                    w.ctx.clock.now().duration_since(start).unwrap().as_millis(),
+                    frame.to_string(),
+                ));
+                if frames.len() == 1 {
+                    jobs::HOLD_READ.set(true);
+                }
+                Ok(())
+            },
+        );
+        jobs::HOLD_READ.set(false);
+        pace(Pace::default());
+        assert_eq!(ended, "pane-closed");
+        assert_eq!(
+            frames.iter().map(|(at, _)| *at).collect::<Vec<_>>(),
+            [0, 1000, 2000],
+            "unchanged answers are never written, even without a poll"
+        );
+        assert_eq!(
+            frames[0].1, frames[1].1,
+            "the shorter size is not read before its tick"
+        );
+        assert_eq!(
+            frames[2].1.matches('\n').count(),
+            3,
+            "the next tick alone lays out the new height"
+        );
+        w.fakes.hc_done().unwrap();
+    }
+
+    #[test]
+    fn mid_tick_reader_answers_redraw_without_extra_probes_or_mux_calls() {
+        let w = watch_world(&["live"]);
+        pace(Pace {
+            tick: Duration::from_secs(1),
+            poll: None,
+        });
+        watch_frames(&w, 6);
+        let ticks = tick_times(&w, &["live"]);
+        let start = w.ctx.clock.now();
+        let fakes = w.fakes.clone();
+        let mut script = Script::new(&w.fakes, vec![(5500, key(&[3]))]);
+        script.on_wait = Some(Box::new(move |_| {
+            use crate::ctx::Clock;
+            let elapsed = fakes.now().duration_since(start).unwrap().as_millis();
+            jobs::HOLD_READ.set(elapsed % 1000 < 250);
+        }));
+        let mut frames = Vec::new();
+        let ended = run_watch(
+            &w.ctx,
+            &w.caller(),
+            Origin::Hand,
+            Box::new(script),
+            &mut |frame| {
+                let at = w.ctx.clock.now().duration_since(start).unwrap().as_millis();
+                frames.push((at, w.fakes.mux_calls().len(), frame.to_string()));
+                if frames.len() == 1 {
+                    write(
+                        &w.folder(ID).join("status.json"),
+                        json!({"text":"new answer", "at":"x"}),
+                    );
+                    jobs::HOLD_READ.set(true);
+                }
+                Ok(())
+            },
+        );
+        jobs::HOLD_READ.set(false);
+        pace(Pace::default());
+        assert_eq!(ended, "interrupted");
+        let times: Vec<_> = ticks
+            .borrow()
+            .iter()
+            .map(|at| {
+                at - start
+                    .duration_since(SystemTime::UNIX_EPOCH)
+                    .unwrap()
+                    .as_millis() as u64
+            })
+            .collect();
+        assert_eq!(
+            times,
+            [0, 1000, 2000, 3000, 4000, 5000],
+            "answers are redraws, not ticks"
+        );
+        let tick = frames.iter().find(|(at, _, _)| *at == 1000).unwrap();
+        let answer = frames
+            .iter()
+            .find(|(at, _, frame)| (1250..=1270).contains(at) && frame.contains("new answer"))
+            .unwrap();
+        assert_eq!(
+            answer.1, tick.1,
+            "answer redraw makes no tick multiplexer calls"
+        );
+        w.fakes.hc_done().unwrap();
+    }
+
+    #[test]
+    fn unknown_probes_still_require_thirty_scheduled_ticks_with_mid_tick_answers() {
+        let w = watch_world(&["fail"]);
+        pace(Pace {
+            tick: Duration::from_secs(1),
+            poll: None,
+        });
+        watch_frames(&w, 29);
+        let start = w.ctx.clock.now();
+        let fakes = w.fakes.clone();
+        let mut script = Script::new(&w.fakes, vec![]);
+        script.on_wait = Some(Box::new(move |_| {
+            use crate::ctx::Clock;
+            jobs::HOLD_READ
+                .set(fakes.now().duration_since(start).unwrap().as_millis() % 1000 < 250);
+        }));
+        let ended = run_watch(
+            &w.ctx,
+            &w.caller(),
+            Origin::Hand,
+            Box::new(script),
+            &mut |_| {
+                if probes(&w) == 1 {
+                    jobs::HOLD_READ.set(true);
+                }
+                Ok(())
+            },
+        );
+        jobs::HOLD_READ.set(false);
+        pace(Pace::default());
+        assert_eq!(ended, "probe-failed");
+        assert_eq!(probes(&w), 30);
+        assert_eq!(
+            w.ctx.clock.now().duration_since(start).unwrap(),
+            Duration::from_secs(29),
+            "one unknown probe per scheduled tick"
+        );
+        w.fakes.hc_done().unwrap();
+    }
+
+    #[test]
+    fn a_refused_mark_retries_next_tick_then_a_no_view_answer_retires_it_without_ack() {
+        let mut viewing = Viewing::default();
+        let mut panel = Panel::default();
+        let seen = jobs::Seen {
+            id: ID.into(),
+            pane: "%9".into(),
+            changed: "spell".into(),
+        };
+        viewing.left.push(seen.clone());
+        viewing.marked(&mut panel, &seen, refuse(2, "lock", "held"));
+        assert_eq!(
+            viewing.left.as_slice(),
+            std::slice::from_ref(&seen),
+            "refusal keeps the spell for a later tick"
+        );
+        viewing.marked(&mut panel, &seen, Ok(false));
+        assert!(viewing.left.is_empty(), "no view is final, not a refusal");
+        assert!(panel.acked.is_empty(), "no write means no idle overlay");
+        assert!(!panel.refresh);
+    }
+
+    #[test]
+    fn a_gone_viewed_pane_is_marked_once_not_on_every_tick_for_ten_seconds() {
+        let mut snapshots = Vec::new();
+        for activity in ["working", "done"] {
+            let w = watch_world(&["live"]);
+            pace(Pace {
+                tick: Duration::from_secs(1),
+                poll: None,
+            });
+            write(
+                &w.folder(ID).join("activity.json"),
+                json!({"state":activity,"since":"1970-01-01T00:03:00Z"}),
+            );
+            let fakes = w.fakes.clone();
+            w.fakes.mux_script("list-panes", move |args| {
+                let rows = if probed(&fakes) == 1 {
+                    vec!["%9|@5|300|aaaaaaaaaaaa|worker"]
+                } else {
+                    Vec::new()
+                };
+                Ok(out(
+                    0,
+                    &crate::agents::fixture::listed(args, &rows, "\n"),
+                    "",
+                ))
+            });
+            let fakes = w.fakes.clone();
+            w.fakes.mux_script(SHOWN_FORMAT, move |_| {
+                Ok(out(
+                    0,
+                    if probed(&fakes) == 1 {
+                        "%9|1\n"
+                    } else {
+                        "%1|1\n"
+                    },
+                    "",
+                ))
+            });
+            watch_frames(&w, 11);
+            let (ended, _, _) = watch_with(
+                &w,
+                Box::new(Script::new(&w.fakes, vec![(10100, key(&[3]))])),
+            );
+            pace(Pace::default());
+            assert_eq!(ended, "interrupted");
+            assert!(!w.folder(ID).join("seen.json").exists());
+            snapshots.push(
+                w.fakes
+                    .mux_calls()
+                    .iter()
+                    .filter(|args| snapshot_list(args))
+                    .count(),
+            );
+        }
+        assert_eq!(
+            snapshots[1],
+            snapshots[0] + 1,
+            "a gone done view adds one mark snapshot, not ten"
+        );
+    }
+
+    #[test]
+    fn a_refused_seen_answer_waits_for_the_next_tick_instead_of_spinning_redraws() {
         use std::sync::{
             Arc,
             atomic::{AtomicUsize, Ordering},
@@ -9816,7 +10166,7 @@ mod tests {
                     }
                     jobs::Request::Seen(seen) => {
                         counted.fetch_add(1, Ordering::SeqCst);
-                        jobs::Answer::Seen(seen.clone(), false)
+                        jobs::Answer::Seen(seen.clone(), refuse(2, "lock", "held"))
                     }
                 }
             },
@@ -9842,7 +10192,7 @@ mod tests {
                 "",
             ))
         });
-        let mut script = Script::new(&w.fakes, vec![(3000, key(&[3]))]);
+        let mut script = Script::new(&w.fakes, vec![(5100, key(&[3]))]);
         script.on_wait = Some(Box::new(move |_| {
             std::thread::sleep(Duration::from_millis(1));
         }));
@@ -9858,15 +10208,15 @@ mod tests {
                     answer.recv_timeout(Duration::from_secs(5)).unwrap();
                     answer.recv_timeout(Duration::from_secs(5)).unwrap();
                 }
-                assert!(frames < 10, "false Seen is no frame change");
+                assert!(frames < 10, "refused Seen is no frame change");
                 Ok(())
             },
         );
         assert_eq!(ended, "interrupted");
         assert_eq!(
             marks.load(Ordering::SeqCst),
-            1,
-            "retry belongs to the next tick"
+            2,
+            "one initial attempt and one retry on a later tick"
         );
         w.fakes.hc_done().unwrap();
     }
@@ -9926,7 +10276,7 @@ mod tests {
         viewing.tick(None, None);
         let seen = viewing.left[0].clone();
         assert_eq!(seen.id, ID);
-        viewing.marked(&mut panel, &seen, true);
+        viewing.marked(&mut panel, &seen, Ok(true));
         assert_eq!(panel.acked, [(ID.to_string(), "spell".to_string(), 0)]);
         assert!(viewing.left.is_empty());
         let mut moved = board.as_object().unwrap().clone();
@@ -9949,7 +10299,7 @@ mod tests {
                 pane: "%9".into(),
                 changed: "spell-b".into(),
             },
-            true,
+            Ok(true),
         );
         assert!(
             panel.refresh,

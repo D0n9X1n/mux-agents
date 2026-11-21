@@ -36,7 +36,9 @@ impl Request {
             Self::Read(generation) => {
                 Answer::Read(*generation, Err(Refusal::internal("board reader failed")))
             }
-            Self::Seen(seen) => Answer::Seen(seen.clone(), false),
+            Self::Seen(seen) => {
+                Answer::Seen(seen.clone(), Err(Refusal::internal("board reader failed")))
+            }
         }
     }
 }
@@ -44,7 +46,7 @@ impl Request {
 #[derive(Debug)]
 pub(crate) enum Answer {
     Read(u64, Res<Map<String, Value>>),
-    Seen(Seen, bool),
+    Seen(Seen, Res<bool>),
 }
 
 type Queue = Arc<(Mutex<(VecDeque<Request>, bool)>, Condvar)>;
@@ -333,6 +335,11 @@ impl Jobs {
         self.reading
     }
 
+    /// Either kind of reader answer can change the frame before the next tick.
+    pub(crate) fn waiting(&self) -> bool {
+        self.reading || !self.seeing.is_empty()
+    }
+
     /// Ask once; fake-provider tests run here, production uses its one long-lived worker.
     pub(crate) fn read(&mut self, ctx: &Ctx, caller: &Caller) {
         if self.closed || self.reading {
@@ -374,15 +381,14 @@ impl Jobs {
                     ),
                     Request::Seen(seen) => Answer::Seen(
                         seen.clone(),
-                        crate::agents::board::mark_seen(&ctx, &caller, &seen.pane, &seen.changed)
-                            .is_ok_and(|ok| ok),
+                        crate::agents::board::mark_seen(&ctx, &caller, &seen.pane, &seen.changed),
                     ),
                 }
             }));
         }
     }
 
-    /// Queue each viewed spell once until it answers; false marks can be retried next tick.
+    /// Queue each viewed spell once until it answers; refused marks can be retried next tick.
     pub(crate) fn seen(&mut self, ctx: &Ctx, caller: &Caller, seen: &Seen) {
         if self.closed || !self.seeing.insert(seen.clone()) {
             return;
@@ -391,8 +397,7 @@ impl Jobs {
             self.ready.push_back((
                 Answer::Seen(
                     seen.clone(),
-                    crate::agents::board::mark_seen(ctx, caller, &seen.pane, &seen.changed)
-                        .is_ok_and(|ok| ok),
+                    crate::agents::board::mark_seen(ctx, caller, &seen.pane, &seen.changed),
                 ),
                 false,
             ));

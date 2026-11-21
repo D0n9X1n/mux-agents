@@ -20,7 +20,7 @@ fn reader_runs_off_the_loop_and_answers_seen_before_the_next_read() {
             Request::Seen(seen) => {
                 started.send(()).unwrap();
                 gate.recv().unwrap();
-                Answer::Seen(seen.clone(), true)
+                Answer::Seen(seen.clone(), Ok(true))
             }
             Request::Read(generation) => Answer::Read(*generation, Ok(Map::new())),
         }
@@ -31,7 +31,7 @@ fn reader_runs_off_the_loop_and_answers_seen_before_the_next_read() {
     assert!(reader.answers.try_recv().is_err(), "the loop never waits");
     release.send(()).unwrap();
     let (seen, failed) = reader.answers.recv_timeout(Duration::from_secs(5)).unwrap();
-    assert!(matches!(seen, Answer::Seen(seen, true) if seen == spell("done-at")));
+    assert!(matches!(seen, Answer::Seen(seen, Ok(true)) if seen == spell("done-at")));
     assert!(!failed);
     let (read, failed) = reader.answers.recv_timeout(Duration::from_secs(5)).unwrap();
     assert!(matches!(read, Answer::Read(1, Ok(_))));
@@ -156,17 +156,19 @@ fn seen_requests_use_the_reader_and_keep_the_spell_until_a_true_answer() {
     starting.recv_timeout(Duration::from_secs(5)).unwrap();
     assert!(jobs.drain_reader().is_empty());
     assert_eq!(viewing.left.len(), 1);
-    release.send(false).unwrap();
+    release
+        .send(Err(Refusal::internal("seen refused")))
+        .unwrap();
     answers.recv_timeout(Duration::from_secs(5)).unwrap();
     reader = jobs.reader.take().unwrap();
     reader.finish();
     jobs.reader = Some(reader);
     assert!(matches!(
         jobs.drain_reader().as_slice(),
-        [Answer::Seen(_, false)]
+        [Answer::Seen(_, Err(_))]
     ));
     assert_eq!(viewing.left.len(), 1);
-    assert!(jobs.seeing.is_empty(), "a false answer allows retry");
+    assert!(jobs.seeing.is_empty(), "a refusal allows retry");
 }
 
 #[test]
@@ -182,7 +184,7 @@ fn a_reader_panic_in_seen_counts_toward_inline_fallback() {
     jobs.ready.push_back(answer);
     assert!(matches!(
         jobs.drain_reader().as_slice(),
-        [Answer::Seen(_, false)]
+        [Answer::Seen(_, Err(_))]
     ));
     assert_eq!(jobs.reader_failures, 1);
     assert!(jobs.reader.is_none());
@@ -205,11 +207,11 @@ fn hold_read_holds_only_the_read_answer_not_a_successful_seen() {
     jobs.ready
         .push_back((Answer::Read(1, Ok(Map::new())), false));
     jobs.ready
-        .push_back((Answer::Seen(spell("spell"), true), false));
+        .push_back((Answer::Seen(spell("spell"), Ok(true)), false));
     HOLD_READ.set(true);
     let answers = jobs.drain_reader();
     HOLD_READ.set(false);
-    assert!(matches!(answers.as_slice(), [Answer::Seen(_, true)]));
+    assert!(matches!(answers.as_slice(), [Answer::Seen(_, Ok(true))]));
     assert!(matches!(
         jobs.drain_reader().as_slice(),
         [Answer::Read(1, Ok(_))]
@@ -245,8 +247,10 @@ fn failure_collection_keeps_answers_sent_while_the_failed_reader_is_joined() {
         ..Jobs::default()
     };
     // Model a failure answer already drained when the worker is still sending its queued refusals.
-    jobs.ready
-        .push_back((Answer::Seen(spell("spell"), false), true));
+    jobs.ready.push_back((
+        Answer::Seen(spell("spell"), Err(Refusal::internal("reader failed"))),
+        true,
+    ));
     let answers = jobs.drain_reader();
     unlock.join().unwrap();
     assert!(
@@ -269,7 +273,7 @@ fn a_reader_factory_panic_refuses_work_instead_of_leaving_it_pending() {
     reader.ask(Request::Seen(spell("done-at")));
     assert!(matches!(
         reader.answers.recv_timeout(Duration::from_secs(1)).unwrap(),
-        (Answer::Seen(_, false), true)
+        (Answer::Seen(_, Err(_)), true)
     ));
     reader.finish();
 }
@@ -288,7 +292,7 @@ fn reader_start_failure_refuses_every_request() {
     ));
     assert!(matches!(
         reader.answers.recv_timeout(Duration::from_secs(5)).unwrap(),
-        (Answer::Seen(_, false), true)
+        (Answer::Seen(_, Err(_)), true)
     ));
     reader.finish();
 }
@@ -312,7 +316,7 @@ fn reader_panic_refuses_the_request_and_every_queued_request() {
     assert!(matches!(answer, Answer::Read(1, Err(_))));
     assert!(failed);
     let (answer, failed) = reader.answers.recv_timeout(Duration::from_secs(5)).unwrap();
-    assert!(matches!(answer, Answer::Seen(_, false)));
+    assert!(matches!(answer, Answer::Seen(_, Err(_))));
     assert!(failed);
     reader.ask(Request::Read(2));
     assert!(matches!(
